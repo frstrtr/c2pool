@@ -2059,6 +2059,111 @@ TEST(DashSupersetSpecialTx, Type8LockCreditPoolFromSelectedBody) {
         << "the unpriced pending lock (777000) must NOT accrue — body, not snapshot";
 }
 
+// H0 hotfix (design B9): a type-8 lock the CbTx fold refuses must never ride
+// the body. Before the selection gate, the mask admitted ANY type-8 once
+// allow_locks was armed, while pending_asset_lock_fold refused version 2 (and,
+// with the Dash Core v24 CheckAssetLockTx port, non-P2PKH credit outputs). The
+// block then carried an invalid tx (pre-v24), or committed a creditPoolBalance
+// that excluded a lock in its own body (post-v24). Both shapes are priced and
+// final here, so only the validity gate keeps them out.
+//
+// NEUTER PROOF (executed): with the mempool.hpp type-8 check_asset_lock_tx
+// gate removed, this test FAILS at both "must not ride" assertions.
+TEST(DashSupersetSpecialTx, H0InvalidType8LocksNeverRideTheBody) {
+    ::core::coin::UTXOViewCache utxo(nullptr);
+    Mempool mp; mp.set_utxo(&utxo);
+    const int64_t LOCK = 50'000, FEE = 10'000;
+    auto fund = [&](uint8_t seed) {
+        uint256 pv = mint_hash(seed);
+        utxo.add_coin(::core::coin::Outpoint(pv, 0),
+                      ::core::coin::Coin(LOCK + FEE, {}, 1, false));
+        return pv;
+    };
+    auto set_payload = [](MutableTransaction& tx, const dash::coin::vendor::CAssetLockPayload& pl) {
+        auto ps = ::pack(pl); auto sp = ps.get_span();
+        tx.extra_payload.assign(
+            reinterpret_cast<const unsigned char*>(sp.data()),
+            reinterpret_cast<const unsigned char*>(sp.data()) + sp.size());
+    };
+    // (a) version 2 (valid only after Dash Core v24, nonstandard in v24).
+    auto v2_lock = make_asset_lock_tx(fund(0xB1), LOCK, /*salt=*/201);
+    {
+        dash::coin::vendor::CAssetLockPayload pl; pl.nVersion = 2;
+        TxOut credit; credit.value = LOCK; credit.scriptPubKey.m_data = p2pkh_script(0x30);
+        pl.creditOutputs.push_back(credit);
+        set_payload(v2_lock, pl);
+    }
+    // (b) version 1 whose credit output is P2SH (v1 must be P2PKH).
+    auto p2sh_lock = make_asset_lock_tx(fund(0xB2), LOCK, /*salt=*/202);
+    {
+        dash::coin::vendor::CAssetLockPayload pl; pl.nVersion = 1;
+        TxOut credit; credit.value = LOCK;
+        credit.scriptPubKey.m_data = {0xa9, 0x14};
+        for (int i = 0; i < 20; ++i) credit.scriptPubKey.m_data.push_back(static_cast<unsigned char>(i));
+        credit.scriptPubKey.m_data.push_back(0x87);
+        pl.creditOutputs.push_back(credit);
+        set_payload(p2sh_lock, pl);
+    }
+    // (c) control: a valid v1 lock.
+    auto good_lock = make_asset_lock_tx(fund(0xB3), LOCK, /*salt=*/203);
+    ASSERT_TRUE(mp.add_tx(v2_lock));
+    ASSERT_TRUE(mp.add_tx(p2sh_lock));
+    ASSERT_TRUE(mp.add_tx(good_lock));
+
+    auto mnstates = single_mn(p2pkh_script(0x30));
+    CSimplifiedMNListEntry e;
+    e.proRegTxHash = raw256(0x01); e.confirmedHash = raw256(0x77); e.isValid = true;
+    CSimplifiedMNList sml(std::vector<CSimplifiedMNListEntry>{e});
+    QuorumManager qmgr;
+    const int64_t SEED = 3'000'000'000LL;
+    auto w = build_embedded_workdata(
+        H - 1, raw256(0xAB), mnstates, mp, 0x1b104be3u, 1'700'000'000u,
+        DASH_PUBKEY_VER, DASH_P2SH_VER, 1'700'000'123u, 0x20000000u,
+        nullptr, &sml, &qmgr, 0, dash::coin::k_zero_cl_sig, SEED,
+        nullptr, nullptr, dash::coin::DASH_MN_RR_HEIGHT_MAINNET, nullptr,
+        dash::coin::DASH_MN_MIN_CONFIRMATIONS_MAINNET,
+        false, "utxo-immature-serving", nullptr, /*accrue_pending_asset_locks=*/true);
+
+    auto rides = [&](const MutableTransaction& tx) {
+        for (const auto& h : w.m_tx_hashes)
+            if (h == dash::coin::dash_txid(tx)) return true;
+        return false;
+    };
+    EXPECT_FALSE(rides(v2_lock)) << "a version-2 asset lock must not ride the body";
+    EXPECT_FALSE(rides(p2sh_lock)) << "a v1 lock with a non-P2PKH credit output must not ride the body";
+    EXPECT_TRUE(rides(good_lock)) << "control: the valid v1 lock still rides";
+
+    // The committed pool counts exactly the lock that rides.
+    CCbTx cb; ASSERT_TRUE(parse_cbtx(w.m_coinbase_payload, cb));
+    const int64_t platform = compute_dash_platform_reward_post_v20_mn_rr(H);
+    EXPECT_EQ(cb.creditPoolBalance, SEED + platform + LOCK);
+}
+
+// H0 hotfix (design §4 item 2): curtime is clamped to at least mintime, as
+// Dash Core's UpdateTime does (nTime = max(MTP(prev) + 1, now)). A clock at or
+// past mintime is unchanged (the G1 golden above pins that side).
+//
+// NEUTER PROOF (executed): with the std::max clamp reverted to
+// `w.m_curtime = curtime`, the three below-mintime cases FAIL.
+TEST(DashEmbeddedGbt, H0CurtimeClampedToMintime) {
+    UTXOViewCache utxo(nullptr);
+    Mempool mp;
+    mp.set_utxo(&utxo);
+    auto mnstates = single_mn(p2pkh_script(0x55));
+    const uint32_t mtp = 1'700'000'000u;
+    auto build = [&](uint32_t curtime) {
+        return build_embedded_workdata(H - 1, raw256(0xC3), mnstates, mp,
+                                       0x1b104be3u, mtp, DASH_PUBKEY_VER, DASH_P2SH_VER, curtime);
+    };
+    EXPECT_EQ(build(mtp - 3600).m_curtime, mtp + 1) << "slow clock: raised to MTP+1";
+    EXPECT_EQ(build(mtp).m_curtime, mtp + 1);
+    EXPECT_EQ(build(1).m_curtime, mtp + 1);
+    EXPECT_EQ(build(mtp + 1).m_curtime, mtp + 1);
+    EXPECT_EQ(build(mtp + 2).m_curtime, mtp + 2) << "a clock past mintime is unchanged";
+    EXPECT_EQ(build(mtp + 777).m_curtime, mtp + 777);
+    EXPECT_EQ(build(mtp - 3600).m_mintime, mtp + 1) << "mintime itself is unchanged";
+}
+
 // PROOF (3, MN-root fold leg): a type-4 ProUpRevTx folded over a projected SML
 // COPY bans the MN and yields a DIFFERENT, independently-reproducible
 // merkleRootMNList — so a template including it commits the right root.

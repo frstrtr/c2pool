@@ -597,12 +597,16 @@ inline DashWorkData build_embedded_workdata(
     w.m_height          = prev_height + 1;
     w.m_previous_block  = prev_hash;
     w.m_bits            = bits_for_next;
-    w.m_curtime         = curtime;
     // Step 8: real median-time-past from header_chain. dashcore
     // requires curtime > MTP for the candidate block to be valid;
     // GBT returns MTP+1 as mintime so miners don't accidentally
     // produce stale-time blocks.
     w.m_mintime         = mtp_at_tip + 1;
+    // curtime is never below mintime: Dash Core's miner sets
+    // nTime = max(MTP(prev) + 1, adjusted time) (node/miner.cpp
+    // UpdateTime). A clock behind the tip MTP would otherwise give a
+    // time-too-old header. A clock at or past mintime is unchanged.
+    w.m_curtime         = std::max(curtime, w.m_mintime);
     w.m_version         = version;              // seam: default 0x20000000 (BIP9 baseline)
 
     // Subsidy + tx selection.

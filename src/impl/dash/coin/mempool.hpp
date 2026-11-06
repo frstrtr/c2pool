@@ -59,6 +59,7 @@
 #include "vendor/providertx.hpp"  // B.8: ProTx payloads for block-connect eviction
 #include "sigops.hpp"             // G2: bad-blk-sigops accounting during selection
 #include "vendor/assetlock.hpp"   // DIP-0027 CAssetUnlockPayload (type-9 fee source)
+#include "asset_lock_fold.hpp"    // check_asset_lock_tx: type-8 selection gate
 
 #include <core/uint256.hpp>
 #include <core/pack.hpp>
@@ -1939,7 +1940,9 @@ public:
     //     when allow_mn_types (the template folds them into merkleRootMNList,
     //     sml_special_fold.hpp);
     //   * type 8 (AssetLock) — admitted when allow_locks (the template accrues
-    //     the credit-pool lock term from the SELECTED body, asset_lock_fold.hpp);
+    //     the credit-pool lock term from the SELECTED body, asset_lock_fold.hpp)
+    //     AND the lock passes check_asset_lock_tx (applied in selection, on
+    //     every path, so a lock the fold refuses never rides the body);
     //   * types 5/6/7/9 — NEVER admitted through selection: type-5 is the
     //     coinbase itself, type-6 quorum commitments are builder-generated
     //     (dkg_commitments), type-9 AssetUnlock is admission-path-only
@@ -2266,6 +2269,17 @@ public:
                 // for every type!=0; the partial embedded mask admits types
                 // 1-4 and/or 8 only, and 5/6/7/9 are never selected.
                 if (!special_mask.admits(e->tx.type)) { ok = false; break; }
+                // A type-8 lock rides only when it is a valid block member:
+                // the CheckAssetLockTx port of asset_lock_fold.hpp (version 1,
+                // P2PKH credit outputs, one `6a 00` marker equal to the
+                // credits). The CbTx creditPoolBalance fold applies the same
+                // check, so before this gate a lock it refused (a version-2
+                // lock, a non-P2PKH credit output) still rode the body: an
+                // invalid block before Dash Core v24, a wrong committed
+                // creditPoolBalance after it. Dropping the member drops its
+                // package, and any descendant fails the parent check.
+                if (e->tx.type == vendor::CAssetLockPayload::SPECIALTX_TYPE
+                    && !check_asset_lock_tx(e->tx)) { ok = false; break; }
                 // Belt for the admission gate (add_tx_locked): a pool entry
                 // that predates it (or any future seam that bypasses it) must
                 // never ride — dashd rejects the block (bad-txns-version /

@@ -754,19 +754,31 @@ TxOut op_return_out(int64_t v) {
     return o;
 }
 
+// A P2PKH credit output (OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG):
+// CheckAssetLockTx requires every version-1 credit output to be P2PKH.
+TxOut p2pkh_credit(int64_t v, uint8_t tag = 0x42) {
+    TxOut o;
+    o.value = v;
+    o.scriptPubKey.m_data = { 0x76, 0xa9, 0x14 };
+    for (int i = 0; i < 20; ++i) o.scriptPubKey.m_data.push_back(static_cast<unsigned char>(tag + i));
+    o.scriptPubKey.m_data.push_back(0x88);
+    o.scriptPubKey.m_data.push_back(0xac);
+    return o;
+}
+
 // A VALID mainnet-shaped type-8: exactly one 2-byte OP_RETURN output of value
-// `amount`, and payload.creditOutputs summing to the SAME amount (the
-// CheckAssetLockTx invariant, assetlocktx.cpp:90-92). Splits the credit across
+// `amount`, and payload.creditOutputs (P2PKH, as on mainnet) summing to the
+// SAME amount (the CheckAssetLockTx invariant). Splits the credit across
 // `n_credit_outputs` outputs to exercise the sum, defaulting to one.
 dash::coin::MutableTransaction make_valid_lock(int64_t amount,
                                                unsigned n_credit_outputs = 1) {
     dash::coin::vendor::CAssetLockPayload pl;
     int64_t remaining = amount;
     for (unsigned i = 0; i + 1 < n_credit_outputs; ++i) {
-        pl.creditOutputs.push_back(out_of(1));
+        pl.creditOutputs.push_back(p2pkh_credit(1));
         --remaining;
     }
-    pl.creditOutputs.push_back(out_of(remaining));   // last carries the rest
+    pl.creditOutputs.push_back(p2pkh_credit(remaining));   // last carries the rest
 
     dash::coin::MutableTransaction tx;
     tx.version = 3;
@@ -895,4 +907,150 @@ TEST(DashAssetLockFold, MempoolAccessorFeedsTheFold)
     const auto f = dash::coin::pending_asset_lock_fold(pending);
     EXPECT_EQ(f.count, 1u);
     EXPECT_EQ(f.accrued, kLock);
+}
+
+// ─── CheckAssetLockTx, Dash Core v24 (src/evo/assetlocktx.cpp:28-87) ─────────
+// asset_lock_refusal() returns Core's reject reason for the first failing
+// check. The earlier port had no P2PKH rule, did not require the `6a 00`
+// marker byte and accepted zero values, so a lock dashd rejects could still be
+// folded into our creditPoolBalance (and, through selection, ride the body).
+//
+// NEUTER PROOF (executed): with the P2PKH branch removed from
+// asset_lock_refusal, V1NonP2pkhCreditIsRefused FAILS (nullopt != "bad-
+// assetlocktx-pubKeyHash"), and with the version-2 rule removed,
+// V2LockRefusedBeforeV24AcceptedAfter FAILS on its first EXPECT.
+namespace {
+
+dash::coin::MutableTransaction lock_with(const dash::coin::vendor::CAssetLockPayload& pl,
+                                         int64_t marker_value,
+                                         std::vector<unsigned char> marker = { 0x6a, 0x00 }) {
+    dash::coin::MutableTransaction tx;
+    tx.version = 3;
+    tx.type    = dash::coin::vendor::CAssetLockPayload::SPECIALTX_TYPE;
+    TxOut m; m.value = marker_value; m.scriptPubKey.m_data = std::move(marker);
+    tx.vout.push_back(m);
+    tx.extra_payload = pack_payload(pl);
+    return tx;
+}
+
+TxOut p2sh_credit(int64_t v) {
+    TxOut o;
+    o.value = v;
+    o.scriptPubKey.m_data = { 0xa9, 0x14 };
+    for (int i = 0; i < 20; ++i) o.scriptPubKey.m_data.push_back(static_cast<unsigned char>(0x10 + i));
+    o.scriptPubKey.m_data.push_back(0x87);
+    return o;
+}
+
+std::vector<unsigned char> unhex(const std::string& h) {
+    std::vector<unsigned char> out;
+    for (size_t i = 0; i + 1 < h.size(); i += 2)
+        out.push_back(static_cast<unsigned char>(std::stoul(h.substr(i, 2), nullptr, 16)));
+    return out;
+}
+
+} // namespace
+
+// Real testnet lock: tx 0d54bc93e1b320955941c27d568a966df24069eea35005b84741c8e97ce45390
+// at height 1,578,003 (the first post-v24 asset lock). Version 1, one P2PKH
+// credit output of 10164140 duff, one `6a 00` marker of the same value.
+TEST(DashAssetLockCheck, RealTestnetLockPasses)
+{
+    dash::coin::MutableTransaction tx;
+    tx.version = 3;
+    tx.type    = 8;
+    TxOut m; m.value = 10'164'140; m.scriptPubKey.m_data = { 0x6a, 0x00 };
+    tx.vout.push_back(m);
+    tx.extra_payload = unhex("0101ac179b00000000001976a914dfee093da074734e4f20f5c48727bbade1e772e288ac");
+    EXPECT_EQ(dash::coin::asset_lock_refusal(tx), std::nullopt);
+    EXPECT_EQ(dash::coin::asset_lock_refusal(tx, /*v24_active=*/true), std::nullopt);
+    EXPECT_TRUE(dash::coin::check_asset_lock_tx(tx));
+    const auto f = dash::coin::pending_asset_lock_fold(std::vector<dash::coin::MutableTransaction>{ tx });
+    EXPECT_EQ(f.count, 1u);
+    EXPECT_EQ(f.accrued, 10'164'140);
+}
+
+TEST(DashAssetLockCheck, V1NonP2pkhCreditIsRefused)
+{
+    dash::coin::vendor::CAssetLockPayload pl;
+    pl.nVersion = 1;
+    pl.creditOutputs.push_back(p2sh_credit(5'000));
+    auto tx = lock_with(pl, 5'000);
+    EXPECT_EQ(dash::coin::asset_lock_refusal(tx), std::optional<std::string>("bad-assetlocktx-pubKeyHash"));
+    EXPECT_EQ(dash::coin::asset_lock_refusal(tx, true), std::optional<std::string>("bad-assetlocktx-pubKeyHash"))
+        << "version 1 stays P2PKH-only after v24";
+    // An empty credit script is not P2PKH either (the old port accepted it).
+    pl.creditOutputs = { out_of(5'000) };
+    EXPECT_EQ(dash::coin::asset_lock_refusal(lock_with(pl, 5'000)),
+              std::optional<std::string>("bad-assetlocktx-pubKeyHash"));
+    EXPECT_FALSE(dash::coin::check_asset_lock_tx(lock_with(pl, 5'000)));
+    const auto f = dash::coin::pending_asset_lock_fold(
+        std::vector<dash::coin::MutableTransaction>{ lock_with(pl, 5'000) });
+    EXPECT_EQ(f.count, 0u);
+    EXPECT_EQ(f.rejected, 1u);
+    EXPECT_EQ(f.accrued, 0);
+}
+
+TEST(DashAssetLockCheck, V2LockRefusedBeforeV24AcceptedAfter)
+{
+    dash::coin::vendor::CAssetLockPayload pl;
+    pl.nVersion = 2;
+    pl.creditOutputs.push_back(p2pkh_credit(3'000));
+    pl.creditOutputs.push_back(p2sh_credit(4'000));
+    auto tx = lock_with(pl, 7'000);
+    EXPECT_EQ(dash::coin::asset_lock_refusal(tx), std::optional<std::string>("bad-assetlocktx-version-2"));
+    EXPECT_EQ(dash::coin::asset_lock_refusal(tx, /*v24_active=*/true), std::nullopt)
+        << "v2 may carry P2SH credit outputs once v24 is active";
+    // The template-facing check is the pre-v24 rule at every height (v2 is
+    // nonstandard in Dash Core v24): refused, folds nothing.
+    EXPECT_FALSE(dash::coin::check_asset_lock_tx(tx));
+    // Version 3 is unknown under any rules.
+    pl.nVersion = 3;
+    EXPECT_EQ(dash::coin::asset_lock_refusal(lock_with(pl, 7'000), true),
+              std::optional<std::string>("bad-assetlocktx-version"));
+    pl.nVersion = 0;
+    EXPECT_EQ(dash::coin::asset_lock_refusal(lock_with(pl, 7'000), true),
+              std::optional<std::string>("bad-assetlocktx-version"));
+}
+
+TEST(DashAssetLockCheck, MarkerAndValueRulesInCoreOrder)
+{
+    using R = std::optional<std::string>;
+    dash::coin::vendor::CAssetLockPayload pl;
+    pl.nVersion = 1;
+    pl.creditOutputs.push_back(p2pkh_credit(9'000));
+    // OP_RETURN must be exactly `6a 00`.
+    EXPECT_EQ(dash::coin::asset_lock_refusal(lock_with(pl, 9'000, { 0x6a, 0x51 })),
+              R("bad-assetlocktx-non-empty-return"));
+    EXPECT_EQ(dash::coin::asset_lock_refusal(lock_with(pl, 9'000, { 0x6a, 0x00, 0x00 })),
+              R("bad-assetlocktx-non-empty-return"));
+    // Zero marker value.
+    EXPECT_EQ(dash::coin::asset_lock_refusal(lock_with(pl, 0)), R("bad-assetlocktx-opreturn-outofrange"));
+    // Two markers.
+    auto two = lock_with(pl, 9'000);
+    two.vout.push_back(two.vout[0]);
+    EXPECT_EQ(dash::coin::asset_lock_refusal(two), R("bad-assetlocktx-multiple-return"));
+    // No marker.
+    auto none = lock_with(pl, 9'000);
+    none.vout.clear();
+    EXPECT_EQ(dash::coin::asset_lock_refusal(none), R("bad-assetlocktx-no-return"));
+    // Payload.
+    auto junk = lock_with(pl, 9'000);
+    junk.extra_payload = { 0x01, 0xff };
+    EXPECT_EQ(dash::coin::asset_lock_refusal(junk), R("bad-assetlocktx-payload"));
+    // Empty credits; zero credit value; credit sum mismatch.
+    dash::coin::vendor::CAssetLockPayload empty;
+    empty.nVersion = 1;
+    EXPECT_EQ(dash::coin::asset_lock_refusal(lock_with(empty, 9'000)), R("bad-assetlocktx-emptycreditoutputs"));
+    dash::coin::vendor::CAssetLockPayload zero;
+    zero.nVersion = 1;
+    zero.creditOutputs.push_back(p2pkh_credit(0));
+    EXPECT_EQ(dash::coin::asset_lock_refusal(lock_with(zero, 9'000)), R("bad-assetlocktx-credit-outofrange"));
+    EXPECT_EQ(dash::coin::asset_lock_refusal(lock_with(pl, 9'001)), R("bad-assetlocktx-creditamount"));
+    // Wrong type.
+    auto t0 = lock_with(pl, 9'000);
+    t0.type = 0;
+    EXPECT_EQ(dash::coin::asset_lock_refusal(t0), R("bad-assetlocktx-type"));
+    // Control: the same lock with a matching marker passes.
+    EXPECT_EQ(dash::coin::asset_lock_refusal(lock_with(pl, 9'000)), std::nullopt);
 }
