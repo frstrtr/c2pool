@@ -42,6 +42,8 @@
 /// these rules refuse. These checks are also the reference for the S3
 /// transitions and the S9 regtest KATs.
 
+#include <impl/dash/coin/dash_deployments.hpp>    // DashNetwork
+#include <impl/dash/coin/deployment_status.hpp>   // v24_active(net, h): the S0 switch
 #include <impl/dash/coin/tx_version_rules.hpp>
 #include <impl/dash/coin/vendor/netinfo.hpp>
 #include <impl/dash/coin/vendor/providertx.hpp>
@@ -56,29 +58,17 @@
 namespace dash {
 namespace coin {
 
-enum class DashNetwork : uint8_t { MAINNET, TESTNET, DEVNET, REGTEST };
+// DashNetwork and v24_active(net, height) come from the S0 deployment
+// tracking (dash_deployments.hpp, deployment_status.hpp): DeploymentActiveAfter
+// (pindexPrev, DEPLOYMENT_V24), true only when ACTIVE is proven (EHF signal
+// tracker + versionbits, the testnet buried height, or the operator pin).
 
 namespace v24 {
 /// First block that carried CbTx version 4 on testnet, i.e. the first block
-/// with DEPLOYMENT_V24 active (measured from chain data; design §5.1).
+/// with DEPLOYMENT_V24 active (measured from chain data; design §5.1). The
+/// same value as dash_deployment_params(TESTNET).v24_buried_height.
 inline constexpr uint32_t kTestnetActivationHeight = 1'578'000;
 } // namespace v24
-
-/// DeploymentActiveAfter(pindexPrev, DEPLOYMENT_V24) for the block at
-/// `height`. THIS IS THE S0 SEAM: slice S0 replaces the body with the EHF
-/// signal tracker + versionbits state machine. Until then: never on mainnet
-/// (not locked in), the measured height on testnet, and unknown (false) on
-/// devnet and regtest.
-inline bool v24_active(DashNetwork net, uint32_t height)
-{
-    switch (net) {
-    case DashNetwork::TESTNET: return height >= v24::kTestnetActivationHeight;
-    case DashNetwork::MAINNET:
-    case DashNetwork::DEVNET:
-    case DashNetwork::REGTEST: return false;
-    }
-    return false;
-}
 
 /// DEPLOYMENT_V19 (basic BLS scheme) buried heights, chainparams.cpp.
 inline bool v19_active(DashNetwork net, uint32_t height)
