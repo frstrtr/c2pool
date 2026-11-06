@@ -1169,3 +1169,27 @@ TEST(DashV24Payees, PortedRewardSplitAndMultiplicityMatchCore) {
     ASSERT_EQ(vout.size(), 1u);
     EXPECT_EQ(vout[0], pay::CTxOut(375, {0x6a}));
 }
+
+// The emit gate checks the payout set as (payee, amount) pairs: an output
+// moved to another script at the same amount (a same-duff superblock entry,
+// a wrong payout script) refuses emission, not only a missing amount.
+TEST(DashV24Payees, EmitGateRejectsAPayoutAtTheWrongScript) {
+    NodeCoinState st;
+    st.mnstates().load(std::vector<std::pair<uint256, MNState>>{{raw256(0x01), v3_mn(false)}});
+    arm_emit_gate(st, raw256(0xAB));
+    st.set_tip(H - 1, raw256(0xAB), 0x1b104be3u, 1'700'000'000u, DASH_PUBKEY_VER, DASH_P2SH_VER);
+    UTXOViewCache utxo(nullptr);
+    Mempool mp;
+    mp.set_utxo(&utxo);
+    auto w = build_embedded_workdata(H - 1, raw256(0xAB), st.mnstates(), mp,
+                                     0x1b104be3u, 1'700'000'000u, DASH_PUBKEY_VER, DASH_P2SH_VER);
+    DashWorkData moved = w;
+    int mn_seen = 0;
+    for (auto& p : moved.m_packed_payments)
+        if (p.payee != "!6a" && mn_seen++ == 0) p.payee = token(v24_pkh(0x99));   // same amount, other script
+    dash::coin::DeclineReport why;
+    EXPECT_FALSE(st.embedded_template_emit_ok(moved, &why));
+    EXPECT_EQ(why.cause, std::string("emit-mn-payout-split-drift"));
+    EXPECT_NE(why.value.find("payout0="), std::string::npos) << why.value;
+    EXPECT_EQ(why.threshold, std::string("every-payout-set-output-in-template"));
+}

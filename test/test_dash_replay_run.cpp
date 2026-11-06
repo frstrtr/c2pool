@@ -25,6 +25,14 @@
 //   C2POOL_REPLAY_GBT       optional dashd getblocktemplate JSON taken at the
 //                           corpus tip: its masternode[] must equal our
 //                           payout set for the next block's payee (S4)
+//   C2POOL_REPLAY_PROJECTION_SEED
+//                           optional dashd `protx list registered true <anchor>`
+//                           JSON: also run the PAYEE PROJECTION (the state the
+//                           live producer reads), seeded from it and kept
+//                           reconciled from this fold's SML after every block
+//                           as the live lane does from mnlistdiffs, and
+//                           match ITS payee's payout set against every mined
+//                           coinbase and the GBT (S4 nit N-S4-1)
 //   C2POOL_REPLAY_DUMP      optional path: the final list, one line per MN
 //                           (proTxHash nVersion payouts shares early-terms),
 //                           to compare with dashd's `protx list` -- the v24
@@ -58,6 +66,8 @@
 #include <impl/dash/coin/replay_prestate.hpp>
 #include <impl/dash/coin/block.hpp>
 #include <impl/dash/coin/v24_state.hpp>
+#include <impl/dash/coin/mn_state_machine.hpp>
+#include <impl/dash/coin/mn_seed.hpp>
 
 #include <nlohmann/json.hpp>
 
@@ -211,6 +221,38 @@ TEST(DashReplayRun, AnchorToTipRootChain)
     // multiplicity, exact amounts) -- v1/v2 payees included.
     uint64_t n_port_exact = 0, n_port_mismatch = 0;
     std::string first_port_mismatch;
+    // The payee projection (MnStateMachine), when a dashd seed is given.
+    // The fold's list as sync_validity_from_sml() reads it: proRegTxHash and
+    // isValid (= !IsBanned(), as to_sml_entry() sets it). The full leaf is not
+    // needed and its operator-key re-encode costs a BLS point per entry.
+    auto validity_sml = [&engine] {
+        std::vector<dash::coin::vendor::CSimplifiedMNListEntry> ents;
+        ents.reserve(engine.entries().size());
+        for (const auto& [protx, st] : engine.entries()) {
+            dash::coin::vendor::CSimplifiedMNListEntry e;
+            e.proRegTxHash = protx;
+            e.isValid      = !st.IsBanned();
+            ents.push_back(std::move(e));
+        }
+        return dash::coin::vendor::CSimplifiedMNList(std::move(ents));
+    };
+    std::optional<dash::coin::MnStateMachine> proj;
+    uint64_t n_proj_exact = 0, n_proj_mismatch = 0, n_proj_refused = 0, n_proj_desync = 0,
+             n_proj_same_payee = 0;
+    std::string first_proj_mismatch;
+    if (const char* sp = env_or_null("C2POOL_REPLAY_PROJECTION_SEED")) {
+        std::ifstream sf(sp);
+        ASSERT_TRUE(sf.good()) << "cannot open " << sp;
+        const bool tn = ps.network == "testnet";
+        auto seed = dash::coin::parse_protx_list_seed(nlohmann::json::parse(sf), tn ? 140 : 76, tn ? 19 : 16);
+        ASSERT_FALSE(seed.empty()) << "projection seed refused";
+        proj.emplace();
+        proj->load(std::move(seed), ps.height);
+        proj->set_dip0003_height(static_cast<uint32_t>(cfg.gates.dip0003_height));
+        proj->set_v24_height(static_cast<uint32_t>(cfg.gates.v24_height));
+        proj->set_netinfo_rules(cfg.gates.netinfo_rules);
+        proj->sync_validity_from_sml(validity_sml(), ps.height);
+    }
     uint32_t first_h = 0, last_h = 0;
     uint32_t diverged_at = 0;
     std::string diverge_reason, diverge_computed, diverge_committed;
@@ -239,10 +281,35 @@ TEST(DashReplayRun, AnchorToTipRootChain)
             FAIL() << "unparseable block at h=" << h << ": " << ex.what();
         }
 
+        std::optional<dash::coin::MNState> proj_payee_pre;
+        std::optional<uint256> proj_payee;
+        if (proj) {
+            proj_payee = proj->find_expected_payee();
+            if (proj_payee) proj_payee_pre = proj->entries().at(*proj_payee);
+        }
         std::optional<dash::coin::replay::ReplayMNState> payee_pre;
-        if (const auto pp = engine.project_payee(static_cast<int32_t>(h)))
+        std::optional<uint256> fold_payee;
+        if (const auto pp = engine.project_payee(static_cast<int32_t>(h))) {
+            fold_payee = *pp;
             if (const auto* st = engine.find(*pp)) payee_pre = *st;
+        }
         const auto r = engine.fold_block(block, h);
+        if (r.ok && proj) {
+            if (fold_payee && proj_payee && *proj_payee == *fold_payee) ++n_proj_same_payee;
+            const auto pr = proj->apply_block(block, h);
+            n_proj_refused += !pr.refused.empty();
+            n_proj_desync += pr.payee_desync;
+            // The live lane reconciles validity from the network's SML; this
+            // fold's SML is root-checked against the block, so it IS that SML.
+            proj->sync_validity_from_sml(validity_sml(), h);
+            if (proj_payee_pre && !block.m_txs.empty()
+                && dash::coin::v24::match_mn_payment(*proj_payee_pre, block.m_txs[0].vout)) {
+                ++n_proj_exact;
+            } else {
+                ++n_proj_mismatch;
+                if (first_proj_mismatch.empty()) first_proj_mismatch = std::to_string(h);
+            }
+        }
         if (r.ok && payee_pre && !block.m_txs.empty()) {
             if (dash::coin::v24::match_mn_payment(*payee_pre, block.m_txs[0].vout)) {
                 ++n_port_exact;
@@ -280,7 +347,7 @@ TEST(DashReplayRun, AnchorToTipRootChain)
             std::cout << "[replay] h=" << h << " matched=" << matched
                       << " mns=" << engine.size()
                       << " (" << secs << "s, " << (folded / std::max(secs, 1e-9))
-                      << " blk/s)\n";
+                      << " blk/s)" << std::endl;
         }
     }
 
@@ -307,6 +374,11 @@ TEST(DashReplayRun, AnchorToTipRootChain)
               << " (exact v24 payout set: " << n_payee_exact << ")\n"
               << "  port payout set   exact=" << n_port_exact << " mismatch=" << n_port_mismatch
               << (first_port_mismatch.empty() ? std::string() : " first=" + first_port_mismatch) << "\n";
+    if (proj)
+        std::cout << "  projection        payout set exact=" << n_proj_exact << " mismatch=" << n_proj_mismatch
+                  << (first_proj_mismatch.empty() ? std::string() : " first=" + first_proj_mismatch)
+                  << " | same payee as the fold " << n_proj_same_payee << "/" << folded
+                  << " | refused=" << n_proj_refused << " desync=" << n_proj_desync << "\n";
     if (diverged_at)
         std::cout << "  *** FIRST DIVERGENCE at h=" << diverged_at << "\n"
                   << "      computed  " << diverge_computed << "\n"
@@ -345,6 +417,12 @@ TEST(DashReplayRun, AnchorToTipRootChain)
 
     EXPECT_EQ(n_port_mismatch, 0u) << "a mined coinbase does not carry the ported payout set (first h="
                                    << first_port_mismatch << ")";
+    if (proj) {
+        EXPECT_EQ(n_proj_mismatch, 0u) << "a mined coinbase does not carry the PROJECTION's payout set (first h="
+                                       << first_proj_mismatch << ")";
+        EXPECT_EQ(n_proj_refused, 0u);
+        EXPECT_EQ(n_proj_desync, 0u);
+    }
 
     // S4 differential against dashd's own template for the next block.
     if (const char* gp = env_or_null("C2POOL_REPLAY_GBT"); gp && !diverged_at) {
@@ -372,6 +450,14 @@ TEST(DashReplayRun, AnchorToTipRootChain)
                   << " outputs dashd=" << theirs.size() << " ours=" << ours.size()
                   << (ours == theirs ? " IDENTICAL" : " DIFFER") << "\n";
         EXPECT_EQ(ours, theirs) << "our payout set differs from dashd's getblocktemplate masternode[]";
+        if (proj) {
+            const auto ppay = proj->find_expected_payee();
+            ASSERT_TRUE(ppay.has_value());
+            const auto pours = dash::coin::v24::expected_mn_outputs(proj->entries().at(*ppay), reward);
+            std::cout << "  GBT (projection)  h=" << last_h + 1 << " payee=" << ppay->GetHex().substr(0, 16)
+                      << (pours == theirs ? " IDENTICAL" : " DIFFER") << "\n";
+            EXPECT_EQ(pours, theirs) << "the projection's payout set differs from dashd's getblocktemplate";
+        }
     }
 
     EXPECT_EQ(diverged_at, 0u)
