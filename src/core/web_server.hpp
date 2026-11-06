@@ -74,14 +74,33 @@ class HttpSession : public std::enable_shared_from_this<HttpSession>
     beast::flat_buffer buffer_;
     http::request<http::string_body> request_;
     std::shared_ptr<MiningInterface> mining_interface_;
+    // Reading the request: the parser (beast's default limits, as
+    // http::async_read: an 8 KB head, a 1 MB body) and its deadlines. The
+    // connection is closed when no byte arrives for idle_timeout_, or when
+    // the request is not complete within request_timeout_ of the accept
+    // (0: none). Neither applies once the request is read: a response being
+    // written, or the event stream (/sharechain/stream) handed off.
+    std::optional<http::request_parser<http::string_body>> parser_;
+    net::steady_timer deadline_;
+    std::chrono::steady_clock::time_point read_started_{};
+    bool reading_{false};
+    std::chrono::milliseconds idle_timeout_;
+    std::chrono::milliseconds request_timeout_;
 
 public:
+    static constexpr std::chrono::milliseconds kIdleTimeout{30000};
+    static constexpr std::chrono::milliseconds kRequestTimeout{120000};
+
     explicit HttpSession(tcp::socket socket, std::shared_ptr<MiningInterface> mining_interface,
-                         std::shared_ptr<void> slot = {});
+                         std::shared_ptr<void> slot = {},
+                         std::chrono::milliseconds idle_timeout = kIdleTimeout,
+                         std::chrono::milliseconds request_timeout = kRequestTimeout);
     void run();
 
 private:
     void read_request();
+    void arm_deadline();
+    void end_reading();
     void process_request();
     void send_response(http::response<http::string_body> response);
     void handle_error(beast::error_code ec, char const* what);
@@ -2597,6 +2616,9 @@ class WebServer
     // plan: an accept beyond it is closed at once.
     std::shared_ptr<std::atomic<size_t>> http_live_ = std::make_shared<std::atomic<size_t>>(0);
     std::atomic<size_t> max_http_connections_{0};
+    // An HTTP session's request-read deadlines (HttpSession), in ms.
+    std::atomic<int64_t> http_idle_timeout_ms_{HttpSession::kIdleTimeout.count()};
+    std::atomic<int64_t> http_request_timeout_ms_{HttpSession::kRequestTimeout.count()};
     std::thread server_thread_;
     std::unique_ptr<StratumServer> stratum_server_;
 
@@ -2665,6 +2687,13 @@ public:
     /// At most n HTTP sessions at once (0: unlimited); one beyond is closed
     /// on accept.
     void set_max_http_connections(size_t n) { max_http_connections_ = n; }
+    /// A session's request-read deadlines (defaults 30 s without a byte, 120 s
+    /// for the whole request; 0 disables either), for sessions accepted after.
+    void set_http_timeouts(std::chrono::milliseconds idle, std::chrono::milliseconds request)
+    {
+        http_idle_timeout_ms_ = idle.count();
+        http_request_timeout_ms_ = request.count();
+    }
     size_t http_sessions() const { return http_live_->load(); }
 
     // Dashboard directory for static file serving

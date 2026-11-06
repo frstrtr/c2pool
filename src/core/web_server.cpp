@@ -11950,7 +11950,10 @@ void WebServer::handle_accept(beast::error_code ec, tcp::socket socket)
             };
             auto slot = std::make_shared<Slot>(http_live_);
             // Create and run HTTP session
-            std::make_shared<HttpSession>(std::move(socket), mining_interface_, std::move(slot))->run();
+            std::make_shared<HttpSession>(std::move(socket), mining_interface_, std::move(slot),
+                                          std::chrono::milliseconds(http_idle_timeout_ms_.load()),
+                                          std::chrono::milliseconds(http_request_timeout_ms_.load()))
+                ->run();
         }
     } else {
         LOG_ERROR << "HTTP accept error: " << ec.message();

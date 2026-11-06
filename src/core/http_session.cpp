@@ -21,6 +21,8 @@
 #include "p2p_message_stats.hpp"
 #include "inject_ledger_obs.hpp"   // S4: /api/tx-inject/ledger
 
+#include <algorithm>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -312,16 +314,54 @@ static bool is_valid_graph_param(const std::string& s)
 
 /// HttpSession Implementation
 HttpSession::HttpSession(tcp::socket socket, std::shared_ptr<MiningInterface> mining_interface,
-                         std::shared_ptr<void> slot)
+                         std::shared_ptr<void> slot, std::chrono::milliseconds idle_timeout,
+                         std::chrono::milliseconds request_timeout)
     : slot_(std::move(slot))
     , socket_(std::move(socket))
     , mining_interface_(mining_interface)
+    , deadline_(socket_.get_executor())
+    , idle_timeout_(idle_timeout)
+    , request_timeout_(request_timeout)
 {
 }
 
 void HttpSession::run()
 {
+    parser_.emplace();
+    read_started_ = std::chrono::steady_clock::now();
+    arm_deadline();
     read_request();
+}
+
+void HttpSession::arm_deadline()
+{
+    // The next instant the request read gives up: idle_timeout_ after the
+    // last byte, and no later than request_timeout_ after the accept.
+    using clock = std::chrono::steady_clock;
+    const bool idle = idle_timeout_.count() > 0, whole = request_timeout_.count() > 0;
+    if (!idle && !whole)
+        return;
+    clock::time_point at = idle ? clock::now() + idle_timeout_ : read_started_ + request_timeout_;
+    if (idle && whole)
+        at = std::min(at, read_started_ + request_timeout_);
+    reading_ = true;
+    deadline_.expires_at(at);   // cancels the wait armed before
+    deadline_.async_wait([self = shared_from_this()](beast::error_code ec) {
+        // Cancelled (re-armed, or the request was read); or it expired just
+        // as the deadline moved, or as the request completed.
+        if (ec || !self->reading_ || self->deadline_.expiry() > clock::now())
+            return;
+        // Closing cancels the pending read; its handler ends the session.
+        beast::error_code ignore;
+        self->socket_.shutdown(tcp::socket::shutdown_both, ignore);
+        self->socket_.close(ignore);
+    });
+}
+
+void HttpSession::end_reading()
+{
+    reading_ = false;
+    deadline_.cancel();
 }
 
 bool is_direct_local_request(const boost::asio::ip::address& peer,
@@ -352,18 +392,43 @@ bool HttpSession::is_direct_local() const
 void HttpSession::read_request()
 {
     auto self = shared_from_this();
-    
-    http::async_read(socket_, buffer_, request_,
+
+    // Read what has arrived and parse it, so that every byte received
+    // restarts the idle deadline (http::async_read completes only on the
+    // whole message, and beast's parser takes the head only once complete).
+    socket_.async_read_some(buffer_.prepare(4096),
         [self](beast::error_code ec, std::size_t bytes_transferred)
         {
-            boost::ignore_unused(bytes_transferred);
-            
-            if(ec == http::error::end_of_stream)
+            if (ec) {
+                self->end_reading();
+                if (ec == net::error::eof)
+                    ec = http::error::end_of_stream;
                 return self->handle_error(ec, "read_request");
-                
-            if(ec)
-                return self->handle_error(ec, "read_request");
-                
+            }
+            self->buffer_.commit(bytes_transferred);
+            beast::error_code pec;
+            while (self->buffer_.size() > 0 && !self->parser_->is_done()) {
+                const std::size_t used = self->parser_->put(self->buffer_.data(), pec);
+                self->buffer_.consume(used);
+                if (pec == http::error::need_more) {
+                    pec = {};
+                    break;
+                }
+                if (pec || used == 0)
+                    break;
+            }
+            if (pec) {
+                self->end_reading();
+                return self->handle_error(pec, "read_request");
+            }
+            if (!self->parser_->is_done()) {
+                if (bytes_transferred > 0)
+                    self->arm_deadline();   // bytes arrived: the idle window restarts
+                return self->read_request();
+            }
+            self->end_reading();
+            self->request_ = self->parser_->release();
+            self->parser_.reset();
             self->process_request();
         });
 }
@@ -536,7 +601,19 @@ void HttpSession::process_request()
                         "data: {\"connected\":true}\n\n";
                     auto buf = std::make_shared<std::string>(sse_headers);
                     auto self = shared_from_this();
-                    auto sock_ptr = std::make_shared<tcp::socket>(std::move(socket_));
+                    // The stream is long-lived: no read deadline follows it
+                    // (end_reading() ran when the request was read), and it
+                    // keeps this session's place under the HTTP cap until the
+                    // stream's socket is dropped (declared first: released
+                    // after the socket closes).
+                    struct StreamSocket {
+                        std::shared_ptr<void> slot;
+                        tcp::socket sock;
+                        StreamSocket(std::shared_ptr<void> s, tcp::socket&& k)
+                            : slot(std::move(s)), sock(std::move(k)) {}
+                    };
+                    auto hold = std::make_shared<StreamSocket>(slot_, std::move(socket_));
+                    std::shared_ptr<tcp::socket> sock_ptr(hold, &hold->sock);
                     boost::asio::async_write(*sock_ptr, boost::asio::buffer(*buf),
                         [buf, sock_ptr, mi = mining_interface_](beast::error_code ec, std::size_t) {
                             if (!ec) mi->sse_register(sock_ptr);
