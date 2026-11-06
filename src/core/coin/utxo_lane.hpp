@@ -55,6 +55,7 @@
 /// thread.
 
 #include <impl/ltc/coin/block.hpp>
+#include <impl/ltc/coin/mempool.hpp>      // compute_txid
 #include <impl/ltc/coin/transaction.hpp>
 #include <impl/ltc/coin/utxo_order.hpp>
 

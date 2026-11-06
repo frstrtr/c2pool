@@ -467,6 +467,13 @@ public:
     /// Dynamically seed a checkpoint at runtime (e.g., from RPC getblockhash).
     /// Only applied if the chain is still at or below the hardcoded checkpoint.
     /// This allows an accessible daemon to provide a more recent starting point.
+    /// Pin a checkpoint without seeding the chain from it (a header chain
+    /// from genesis, the full UTXO set's): a header at its height must be it.
+    void pin_checkpoint(uint32_t height, const uint256& hash) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        pin_checkpoint_locked(height, hash);
+    }
+
     /// The checkpoint is pinned whether or not it seeds the chain: a header
     /// at its height must be it (pin_checkpoint_locked).
     void set_dynamic_checkpoint(uint32_t height, const uint256& hash) {
@@ -511,18 +518,23 @@ public:
             if (m_headers.count(last_hash))
                 return 0;
         }
-        // Every header's PoW is verified (scrypt, under the lock): batches of
-        // HEADER_BATCH, a 1 ms yield between them for the readers.
+        // Every header's PoW is verified. The scrypt hashes of a batch are
+        // computed on the caller's thread before the lock is taken (a pure
+        // function of each header), so the lock is held for the index work
+        // only; batches of HEADER_BATCH, a 1 ms yield between them.
         const size_t BATCH_SIZE = HEADER_BATCH;
         int accepted = 0;
         PendingTipChange last_ptc;
+        std::vector<uint256> pow(BATCH_SIZE);
         for (size_t offset = 0; offset < headers.size(); offset += BATCH_SIZE) {
             int sub_accepted = 0;
+            const size_t end = std::min(offset + BATCH_SIZE, headers.size());
+            for (size_t i = offset; i < end; ++i)
+                pow[i - offset] = pow_hash(headers[i], m_params.pow_func);
             {
                 std::lock_guard<std::mutex> lock(m_mutex);
-                size_t end = std::min(offset + BATCH_SIZE, headers.size());
                 for (size_t i = offset; i < end; ++i) {
-                    if (add_header_internal(headers[i]))
+                    if (add_header_internal(headers[i], &pow[i - offset]))
                         ++sub_accepted;
                 }
                 accepted += sub_accepted;
@@ -606,7 +618,9 @@ public:
 
 private:
     /// Add a single header (caller holds mutex).
-    bool add_header_internal(const BlockHeaderType& header) {
+    /// `pow_precomputed`: the header's scrypt hash, computed before the lock
+    /// (add_headers); null: computed here.
+    bool add_header_internal(const BlockHeaderType& header, const uint256* pow_precomputed = nullptr) {
         // Compute hashes
         uint256 bhash = block_hash(header);
         
@@ -667,7 +681,7 @@ private:
 
         // PoW (scrypt) for every header above the checkpoint, whatever
         // height a peer reported.
-        const uint256 pow_hash_val = pow_hash(header, m_params.pow_func);
+        const uint256 pow_hash_val = pow_precomputed ? *pow_precomputed : pow_hash(header, m_params.pow_func);
         if (!check_pow(pow_hash_val, header.m_bits, m_params.pow_limit)) {
             LOG_WARNING << "[EMB-LTC] PoW FAIL at height=" << new_height
                         << " hash=" << bhash.GetHex().substr(0, 16)

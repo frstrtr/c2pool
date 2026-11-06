@@ -17,7 +17,12 @@
 //     directory holding blocks.hex (one block per line, heights 0..N, from
 //     getblock <hash> 0) and gettxoutsetinfo.json (litecoind's at N), the
 //     set the full lane builds from those blocks has litecoind's figures.
-//     Skipped without it.
+//     Skipped without it;
+//   - full mode's header chain starts at genesis with the checkpoint pinned,
+//     not seeded: the chain grows from genesis and the header at the
+//     checkpoint height must be the checkpoint's;
+//   - the LTC full set's fd share keeps DOGE's two stores and it within half
+//     the soft limit (mapped tables, which keep no fd, at a 256 limit).
 // ---------------------------------------------------------------------------
 
 #define C2_LANE_KEEP core::coin::LTC_MIN_BLOCKS_TO_KEEP
@@ -27,6 +32,9 @@
 #include "doge_utxo_lane_harness.hpp"
 
 #include <core/coin/utxo_stats.hpp>
+#include <impl/doge/coin/store_fds.hpp>
+#include <impl/ltc/coin/header_chain.hpp>
+#include <impl/ltc/test/ltc_mined_headers.hpp>
 #include <core/coin/coin_compressor.hpp>
 #include <btclibs/util/strencodings.h>
 
@@ -315,4 +323,61 @@ TEST(LtcFullView, LtcUtxoStatsMatchesLitecoindOnItsChain)
     std::cout << "[ltc-regtest] h=" << n << " transactions=" << st.transactions << " txouts=" << st.txouts
               << " bogosize=" << st.bogosize << " hash_serialized_2=" << st.hash_serialized.GetHex()
               << " total_amount=" << total << std::endl;
+}
+
+namespace {
+uint256 header_hash(const BlockHeaderType& h) { return Hash(pack(h).get_span()); }
+} // namespace
+
+TEST(LtcFullView, TheCheckpointIsPinnedNotSeeded)
+{
+    const auto p = ltc_test::easy_testnet_params();
+    std::vector<BlockHeaderType> c;
+    uint256 prev = header_hash(ltc_test::easy_testnet_genesis());
+    for (uint32_t h = 1; h <= 3; ++h) {
+        BlockHeaderType x;
+        x.m_version = 0x20000000;
+        x.m_previous_block = prev;
+        x.m_merkle_root.SetHex(std::to_string(8100 + h));
+        x.m_timestamp = 1486949366 + 150 * h;
+        x.m_bits = ltc_test::kEasyBits;
+        x.m_nonce = h << 16;
+        ltc_test::mine(x, p);
+        prev = header_hash(x);
+        c.push_back(x);
+    }
+    HeaderChain chain(p);
+    ASSERT_TRUE(chain.init());
+    ASSERT_TRUE(chain.add_header(ltc_test::easy_testnet_genesis()));
+    chain.pin_checkpoint(2, header_hash(c[1]));
+    EXPECT_EQ(chain.height(), 0u) << "not seeded";
+    EXPECT_TRUE(chain.get_header_by_height(0).has_value()) << "from genesis";
+    EXPECT_TRUE(chain.add_header(c[0]));
+    BlockHeaderType sibling = c[1];
+    sibling.m_merkle_root.SetHex("feed");
+    ltc_test::mine(sibling, p);
+    EXPECT_FALSE(chain.add_header(sibling)) << "another block at the checkpoint height";
+    EXPECT_EQ(chain.add_headers({c[1], c[2]}), 2);
+    EXPECT_EQ(chain.height(), 3u);
+}
+
+TEST(LtcFullView, TheLtcFullSetsFdShareKeepsTheStoresUnderHalfTheLimit)
+{
+    using doge::coin::StoreFds;
+    for (const uint64_t nofile : {256ull, 384ull, 512ull, 1024ull, 4096ull, 65536ull}) {
+        const auto s = StoreFds::ltc_full_set(nofile);
+        const uint64_t ltc = s.mmap_reads ? 0 : StoreFds::tables(s.max_open_files);
+        EXPECT_LE(StoreFds::tables(StoreFds::header_store(nofile)) + StoreFds::tables(StoreFds::full_set(nofile)) + ltc,
+                  nofile / 2) << "soft limit " << nofile;
+        if (!s.mmap_reads)
+            EXPECT_GE(StoreFds::tables(s.max_open_files), 64u) << nofile;
+    }
+    EXPECT_TRUE(StoreFds::ltc_full_set(256).mmap_reads) << "macOS's 256: no table budget left";
+    EXPECT_TRUE(StoreFds::ltc_full_set(384).mmap_reads);
+    EXPECT_FALSE(StoreFds::ltc_full_set(512).mmap_reads);
+    EXPECT_EQ(StoreFds::ltc_full_set(512).max_open_files, 84);
+    EXPECT_EQ(StoreFds::ltc_full_set(1024).max_open_files, 158);
+    EXPECT_EQ(StoreFds::ltc_full_set(65536).max_open_files, 512);
+    EXPECT_FALSE(StoreFds::ltc_full_set(65536).mmap_reads);
+    EXPECT_EQ(StoreFds::ltc_full_set(0).max_open_files, 512);
 }

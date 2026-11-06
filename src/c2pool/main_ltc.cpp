@@ -2544,10 +2544,21 @@ int main(int argc, char* argv[]) {
                 constexpr uint32_t LTC_BLOCK_PERIOD = 150; // seconds
                 uint32_t score_backlog = 5 * ltc::PoolConfig::share_period()
                     * ltc::PoolConfig::chain_length() / LTC_BLOCK_PERIOD;
-                if (ltc_utxo_full && !header_checkpoint_str.empty())
-                    LOG_INFO << "[EMB-LTC] Full UTXO set: the header chain starts at genesis"
-                             << " (--header-checkpoint " << header_checkpoint_str.substr(0, header_checkpoint_str.find(':'))
-                             << " not applied)";
+                // Full mode: the header chain starts at genesis (every header's
+                // PoW verified, on the header threads) and the checkpoint is
+                // pinned, not seeded: the header at its height must be it.
+                if (ltc_utxo_full && !header_checkpoint_str.empty()) {
+                    const auto colon = header_checkpoint_str.find(':');
+                    uint256 cp_hash;
+                    if (colon != std::string::npos)
+                        cp_hash.SetHex(header_checkpoint_str.substr(colon + 1));
+                    if (!cp_hash.IsNull()) {
+                        const uint32_t cp_height = static_cast<uint32_t>(std::stoul(header_checkpoint_str.substr(0, colon)));
+                        embedded_chain->pin_checkpoint(cp_height, cp_hash);
+                        LOG_INFO << "[EMB-LTC] Full UTXO set: the header chain starts at genesis; checkpoint "
+                                 << cp_height << " pinned (not seeded)";
+                    }
+                }
                 if (!header_checkpoint_str.empty() && !ltc_utxo_full) {
                     auto colon = header_checkpoint_str.find(':');
                     if (colon != std::string::npos) {
@@ -2668,9 +2679,16 @@ int main(int argc, char* argv[]) {
                     core::LevelDBOptions full_opts;
                     full_opts.write_buffer_size = 64 * 1024 * 1024;
                     full_opts.block_cache_size = 128 * 1024 * 1024;
-                    full_opts.max_open_files = doge::coin::StoreFds::full_set(core::raise_nofile_limit(65536));
+                    // Its own share of the fd budget beside DOGE's header store and
+                    // full set (StoreFds::ltc_full_set): pread while it fits in
+                    // half the limit, else mapped tables (no fd kept per table).
+                    const auto fd_share = doge::coin::StoreFds::ltc_full_set(core::raise_nofile_limit(65536));
+                    full_opts.max_open_files = fd_share.max_open_files;
                     full_opts.max_file_size = 32 * 1024 * 1024;
-                    full_opts.mmap_reads = false;
+                    full_opts.mmap_reads = fd_share.mmap_reads;
+                    if (fd_share.mmap_reads)
+                        LOG_WARNING << "[EMB-LTC] Full UTXO set: the fd limit leaves no table budget beside DOGE's"
+                                    << " stores; its tables are mapped (no fd kept per table, more resident memory)";
                     doge::coin::ProcessMemory::limit_arenas();
                     // A set another c2pool holds is waited for, 5 x 2 s; still
                     // held, this node exits (the templates would otherwise price
