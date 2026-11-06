@@ -309,12 +309,19 @@ if (BUILD_TESTING AND GTest_FOUND)
     # ThreadSanitizer-clean; the weights and the merged coinbase are pinned
     # to the pre-fix bytes; every tracker copy takes the cache lock. Same
     # folding rule.
+    #
+    # best_share_hash_lock_test.cpp: NodeImpl::best_share_hash() reads the
+    # tracker under the reader discipline (direct on the compute thread, a
+    # shared try-lock elsewhere, the published verified best while busy, the
+    # caller's guard when it holds one), driven on a REAL ltc::NodeImpl against
+    # a compute thread moving the best share. Same folding rule.
     # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
     add_executable(share_test
         auto_ratchet_blocked_by_test.cpp
         auto_ratchet_sim_test.cpp
         auto_ratchet_tail_guard_test.cpp
         auxpow_tree_slot_test.cpp
+        best_share_hash_lock_test.cpp
         broadcast_lock_discipline_test.cpp
         broadcast_tx_completeness_test.cpp
         build_stops_test.cpp

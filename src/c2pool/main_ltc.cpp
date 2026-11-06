@@ -5310,7 +5310,9 @@ int main(int argc, char* argv[]) {
                     }
                     return rh;
                 };
-                uint256 verified_best_stat = p2p_node->best_share_hash();
+                // The guard above holds the tracker lock: elect under it
+                // (best_share_hash() would take the shared lock again).
+                uint256 verified_best_stat = p2p_node->best_share_hash(guard);
                 sharechain::PoolRateHead stat_vhead;
                 bool stat_vpresent = false;
                 if (!verified_best_stat.IsNull() && chain.contains(verified_best_stat)) {
