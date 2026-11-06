@@ -3057,6 +3057,30 @@ TEST(DashReplayFoldV24, MinedBlockFoldNeverRunsTheBlsPayloadRules)
     EXPECT_EQ(r.registered, 1u);
 }
 
+// CheckProDisTxForList: a ProDisTx must name an existing SHARED masternode
+// (bad-prodis-hash / bad-prodis-not-shared): a block carrying one that does
+// not is invalid, so the fold refuses it (VERIFY-S3 nit 2).
+TEST(DashReplayFoldV24, ProDisTxOfANonSharedOrUnknownMasternodeIsRefused)
+{
+    using namespace v24_fold_kat;
+    for (const bool known : {true, false}) {
+        SCOPED_TRACE(known ? "non-shared" : "unknown");
+        DmlFoldEngine eng(v24_cfg());
+        const uint256 pro = raw256(0x1c);
+        const auto st = v2_mn(12);
+        eng.seed({{pro, st}}, 1, 100, raw256(9));
+        vv::CProDisTx d;
+        d.proTxHash = known ? pro : raw256(0x7d);
+        d.vchSigs.resize(1);
+        auto tx = make_special_tx(vv::CProDisTx::SPECIALTX_TYPE, d, 1);
+        tx.vin[0].prevout = st.collateralOutpoint;
+        const auto r = fold_at(eng, 101, root_of({}), {tx});
+        EXPECT_FALSE(r.ok);
+        EXPECT_NE(r.error.find(known ? "bad-prodis-not-shared" : "bad-prodis-hash"), std::string::npos)
+            << r.error;
+    }
+}
+
 TEST(DashReplayFoldV24, SharedRegistrationWithTemplateCollateral)
 {
     using namespace v24_fold_kat;

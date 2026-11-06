@@ -5991,6 +5991,22 @@ TEST(DashMnBridgeCursor, AFormatV2RecordWithMixedOperatorKeysIsRefusedAndReplaye
     EXPECT_EQ(after[24], static_cast<uint8_t>(MnBridgeCursorStore::kFormatVersion));
 }
 
+// ── 6d. A v3 record is REFUSED (Dash Core v24): MNState rows with nVersion
+//     >= 3 now carry the v24 state block, which a v3 record never wrote.
+TEST(DashMnBridgeCursor, AFormatV3RecordFromBeforeTheV24StateIsRefused)
+{
+    EXPECT_GE(MnBridgeCursorStore::kFormatVersion, 4u);
+    TempCursorStore cs("fmtv3");
+    { CursorRun a(&cs.store, 1519545); a.run(); ASSERT_TRUE(a.h.published); }
+    auto b = cs.raw();
+    ASSERT_GT(b.size(), 28u);
+    b[24] = 3; b[25] = 0; b[26] = 0; b[27] = 0;
+    cs.write_raw(b);
+    std::string why;
+    EXPECT_FALSE(cs.store.load(why).has_value()) << why;
+    EXPECT_NE(why.find("format v3"), std::string::npos) << why;
+}
+
 // ── 7. A fail-closed bridge must not be resumable ──────────────────────────
 TEST(DashMnBridgeCursor, FailClosedErasesTheRecordSoARestartCannotResumeIntoIt)
 {

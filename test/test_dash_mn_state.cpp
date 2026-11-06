@@ -1211,6 +1211,78 @@ TEST(DashMnState, V24MinedBlockFoldNeverRunsTheBlsPayloadRules) {
     EXPECT_EQ(m.entries().at(h).v24.extNetInfo, up.extNetInfo);
 }
 
+// MF-1 of VERIFY-S3 on the v24 path: a legacy-seeded key and a ProUpRegTx
+// carrying the same point (v2 payload, basic bytes; v1 payload, legacy
+// bytes) is no operator change at v24 either; the version follows the
+// payload (target max(state, tx)).
+#ifdef C2POOL_DASH_BLS
+TEST(DashMnState, V24LegacySeededKeySamePointIsNoOperatorChange) {
+    // The dashd seed stores the v1 key canonical basic (P-3); a ProUpRegTx
+    // carrying the same point (v2 payload: basic bytes; v1 payload: legacy
+    // bytes) is no operator change at v24, and the version follows the
+    // payload (target max(state, tx)).
+    const auto stored = p3::seeded_key(p3::K8L);
+    ASSERT_TRUE(stored.has_value());
+    struct Case { uint16_t v; const char* key; };
+    const Case cases[] = {{ProTxVersion::BASIC_BLS, p3::K8B}, {ProTxVersion::LEGACY_BLS, p3::K8L}};
+    for (const auto& c : cases) {
+        SCOPED_TRACE(c.v);
+        MnStateMachine m;
+        const uint256 pro = raw256(0x31);
+        m.load({{pro, p3::v1_mn(*stored)}}, 2400110);
+        m.set_v24_height(2400111);
+        CProUpRegTx ur;
+        ur.nVersion = c.v;
+        ur.proTxHash = pro;
+        ur.pubKeyOperator = p3::kh48(c.key);
+        ur.keyIDVoting = raw160(0x51);
+        ur.scriptPayout.m_data = script_bytes(0x63);
+        BlockType b;
+        b.m_txs.push_back(coinbase_tx({script_bytes(0xC9)}));
+        b.m_txs.push_back(special_tx(CProUpRegTx::SPECIALTX_TYPE, protx_payload(ur)));
+        const auto r = m.apply_block(b, 2400111);
+        ASSERT_TRUE(r.refused.empty()) << r.refused;
+        const auto& e = m.entries().at(pro);
+        EXPECT_EQ(e.nPoSeBanHeight, 0u);
+        EXPECT_TRUE(e.isValid);
+        EXPECT_EQ(e.scriptOperatorPayout.m_data, script_bytes(0x62));
+        EXPECT_EQ(e.netInfo, p3::v1_mn(*stored).netInfo);
+        EXPECT_EQ(e.nVersion, c.v);
+    }
+}
+#endif
+
+// VERIFY-S3 should-fix 1 / nit 2: at v24 the projection refuses (fail
+// closed, before any mutation) an update naming a masternode its set does
+// not hold, and a ProDisTx whose target is unknown or not shared.
+TEST(DashMnState, V24UnknownTargetAndNonSharedProDisTxRefuse) {
+    uint256 h;
+    MnStateMachine m = v2319_one_regular_mn(h, 2400110);
+    m.set_v24_height(2400111);
+    const MNState before = m.entries().at(h);
+    auto expect = [&](MutableTransaction tx, const char* why) {
+        const auto r = m.apply_block(block_of({std::move(tx)}), 2400111);
+        EXPECT_NE(r.refused.find(why), std::string::npos) << r.refused;
+        EXPECT_EQ(m.last_applied_height(), 2400110u);
+        EXPECT_EQ(m.entries().at(h), before);
+    };
+    CProUpRegTx ur;
+    ur.nVersion = ProTxVersion::BASIC_BLS;
+    ur.proTxHash = raw256(0x7e);                 // not in the set
+    ur.keyIDVoting = raw160(0x51);
+    expect(special_tx(CProUpRegTx::SPECIALTX_TYPE, protx_payload(ur)), "this set does not hold");
+    CProUpRevTx rv;
+    rv.nVersion = ProTxVersion::BASIC_BLS;
+    rv.proTxHash = raw256(0x7e);
+    expect(special_tx(CProUpRevTx::SPECIALTX_TYPE, protx_payload(rv)), "this set does not hold");
+    vv::CProDisTx dis;
+    dis.proTxHash = h;                           // a regular, non-shared MN
+    dis.vchSigs.resize(1);
+    expect(special_tx(10, protx_payload(dis)), "bad-prodis-not-shared");
+    dis.proTxHash = raw256(0x7e);
+    expect(special_tx(10, protx_payload(dis)), "bad-prodis-hash");
+}
+
 TEST(DashMnState, V24RefusalsBeforeAnyMutation) {
     MnStateMachine m;
     m.set_v24_height(2400120);
