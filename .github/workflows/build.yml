@@ -966,10 +966,10 @@ jobs:
       # bump cannot gate. DISTINCT from the RAM heavy-leg lock (SLOTS=2, linux-asan
       # + CodeQL), which stays 2-up: this governs ONLY {linux-asan, coin-bch-asan}
       # at SLOTS=1. Per-host (/tmp flock), so heavy pairs on DIFFERENT hosts still
-      # run in parallel. The disowned holder auto-frees when the runner-worker dies
-      # at job end -- i.e. AFTER Prune runner workspace has dropped the 44G tree,
-      # which is exactly when the disk pressure clears (an earlier release would
-      # free the slot while the tree is still on disk). Reap-guard identical to the
+      # run in parallel. Released by the explicit always() step AFTER Prune runner
+      # workspace has dropped the 44G tree, which is exactly when the disk pressure
+      # clears (an earlier release would free the slot while the tree is still on
+      # disk); the holder's worker-death watch is the backstop. Reap-guard identical to the
       # RAM lock; honesty-gated at SLOTS=1 in heavy-leg-lock/test.sh. A host with
       # room for more trees raises it for itself only, via the runner-host file
       # $HOME/.config/c2pool-ci/c2pool-heavy-disk.lock.slots (see the action).
@@ -1136,19 +1136,72 @@ jobs:
         if: always()
         uses: ./.github/actions/prune-runner-workspace
 
+      # Release runs after Prune runner workspace has dropped the checkout, so it
+      # is inline shell: no repo script survives the prune. One body serves every
+      # lock; the step env names the lock, its holder markers and the GITHUB_ENV
+      # var acquire.sh exported the holder pid into. The log line names the lock
+      # and holder it released. heavy-leg-lock/test.sh CASE 12 runs these bodies.
       - name: Release per-host heavy-leg lock
         if: always() && runner.environment != 'github-hosted'
         shell: bash
+        env:
+          RELEASE_LOCK: /tmp/c2pool-heavy-leg.lock
+          RELEASE_HOLDERFILE: /tmp/c2pool-heavy-leg.holder
+          RELEASE_HOLDER_ENV: HEAVY_LEG_LOCK_HOLDER
         run: |
-          H="${HEAVY_LEG_LOCK_HOLDER:-}"
-          if [ -n "$H" ]; then
-            kill "$H" 2>/dev/null || true
-            # drop whichever per-slot marker this holder owns
-            for MF in "${HEAVY_LEG_HOLDERFILE:-/tmp/c2pool-heavy-leg.holder}".*; do
-              [ -f "$MF" ] || continue
-              read -r _mh _ < "$MF" 2>/dev/null || true
-              [ "${_mh:-}" = "$H" ] && rm -f "$MF" || true
-            done
+          alive() { case "$(ps -o stat= -p "$1" 2>/dev/null | tr -d ' ')" in ''|Z*) return 1 ;; esac; }
+          H=""
+          if [ -n "${RELEASE_HOLDER_ENV:-}" ]; then H="${!RELEASE_HOLDER_ENV:-}"; fi
+          if [ -z "$H" ]; then
+            echo "no ${RELEASE_LOCK} holder recorded in this job, nothing to release"
+            exit 0
+          fi
+          note=""
+          kill "$H" 2>/dev/null || note=" (holder had already exited)"
+          for _i in 1 2 3 4 5 6 7 8 9 10; do alive "$H" || break; sleep 0.5; done
+          # drop whichever per-slot marker this holder owns
+          for MF in "${RELEASE_HOLDERFILE}".*; do
+            [ -f "$MF" ] || continue
+            read -r _mh _ < "$MF" 2>/dev/null || true
+            [ "${_mh:-}" = "$H" ] && rm -f "$MF" || true
+          done
+          if alive "$H"; then
+            echo "::warning::${RELEASE_LOCK} holder ${H} still alive after SIGTERM; its worker-death watch frees the slot at job end"
+          else
+            echo "released ${RELEASE_LOCK}, holder ${H}${note}"
+          fi
+
+      # Until this step the heavy-disk holder had no release step: it was freed
+      # only at job end and no log line named it. It runs after Prune runner
+      # workspace, so the 44G tree is already gone when the slot frees.
+      - name: Release per-host heavy-disk semaphore
+        if: always() && runner.environment != 'github-hosted'
+        shell: bash
+        env:
+          RELEASE_LOCK: /tmp/c2pool-heavy-disk.lock
+          RELEASE_HOLDERFILE: /tmp/c2pool-heavy-disk.holder
+          RELEASE_HOLDER_ENV: HEAVY_DISK_LOCK_HOLDER
+        run: |
+          alive() { case "$(ps -o stat= -p "$1" 2>/dev/null | tr -d ' ')" in ''|Z*) return 1 ;; esac; }
+          H=""
+          if [ -n "${RELEASE_HOLDER_ENV:-}" ]; then H="${!RELEASE_HOLDER_ENV:-}"; fi
+          if [ -z "$H" ]; then
+            echo "no ${RELEASE_LOCK} holder recorded in this job, nothing to release"
+            exit 0
+          fi
+          note=""
+          kill "$H" 2>/dev/null || note=" (holder had already exited)"
+          for _i in 1 2 3 4 5 6 7 8 9 10; do alive "$H" || break; sleep 0.5; done
+          # drop whichever per-slot marker this holder owns
+          for MF in "${RELEASE_HOLDERFILE}".*; do
+            [ -f "$MF" ] || continue
+            read -r _mh _ < "$MF" 2>/dev/null || true
+            [ "${_mh:-}" = "$H" ] && rm -f "$MF" || true
+          done
+          if alive "$H"; then
+            echo "::warning::${RELEASE_LOCK} holder ${H} still alive after SIGTERM; its worker-death watch frees the slot at job end"
+          else
+            echo "released ${RELEASE_LOCK}, holder ${H}${note}"
           fi
   # ════════════════════════════════════════════════════════════════════════════
   # COIN_BCH leg — Bitcoin Cash (SHA256d standalone parent, V36)

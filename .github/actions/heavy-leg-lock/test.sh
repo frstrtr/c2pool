@@ -352,10 +352,111 @@ else
 fi
 drop_all "$L11"
 
+# ----------------------------------------------------------------------------
+# CASE 12: the release steps. linux-asan and CodeQL c-cpp must release EVERY
+# lock they take (RAM heavy-leg AND heavy-disk) in an if: always() step that
+# runs after Prune runner workspace, all with one shared body, and that body
+# must log "released <lock>, holder <pid>" only once the holder is gone. The
+# ACTUAL run: body from the workflows runs here against a real acquire.sh holder.
+# ----------------------------------------------------------------------------
+echo; echo "### CASE 12 RELEASE: linux-asan/CodeQL release every lock they take, by name"
+REL_BODY="$TMP/release-body.sh"
+if python3 - "$ROOT" "$REL_BODY" > "$TMP/c12-manifest" <<'PY'
+import sys, yaml
+root, out = sys.argv[1], sys.argv[2]
+DEF = (("lock-file", "/tmp/c2pool-heavy-leg.lock"),
+       ("holder-file", "/tmp/c2pool-heavy-leg.holder"),
+       ("holder-env", "HEAVY_LEG_LOCK_HOLDER"))
+RK = ("RELEASE_LOCK", "RELEASE_HOLDERFILE", "RELEASE_HOLDER_ENV")
+legs = (("build.yml", "linux-asan"), ("codeql-analysis.yml", "analyze"))
+bad, bodies, configs = [], set(), []
+for wf, jn in legs:
+    steps = yaml.safe_load(open(f"{root}/.github/workflows/{wf}"))["jobs"][jn]["steps"]
+    names = [s.get("name") for s in steps]
+    if "Prune runner workspace" not in names:
+        bad.append(f"{wf}:{jn} has no Prune runner workspace step"); continue
+    prune = names.index("Prune runner workspace")
+    for i, s in enumerate(steps):
+        if s.get("uses") != "./.github/actions/heavy-leg-lock":
+            continue
+        w = s.get("with") or {}
+        want = tuple(str(w.get(k, d)) for k, d in DEF)
+        rel = [j for j, r in enumerate(steps) if j > i
+               and tuple(str((r.get("env") or {}).get(k, "")) for k in RK) == want]
+        if len(rel) != 1:
+            bad.append(f"{wf}:{jn} {want[0]}: {len(rel)} release steps, want 1"); continue
+        r = steps[rel[0]]
+        if "always()" not in str(r.get("if", "")):
+            bad.append(f"{wf}:{jn} {want[0]}: release step is not if: always()")
+        if rel[0] < prune:
+            bad.append(f"{wf}:{jn} {want[0]}: release runs before Prune runner workspace")
+        if r.get("shell") != "bash":
+            bad.append(f"{wf}:{jn} {want[0]}: release step is not shell: bash")
+        bodies.add(r.get("run", ""))
+        if want not in configs:
+            configs.append(want)
+        print(f"  {wf}:{jn} takes {want[0]} -> released by '{r.get('name')}'", file=sys.stderr)
+locks = {c[0] for c in configs}
+for need in ("/tmp/c2pool-heavy-leg.lock", "/tmp/c2pool-heavy-disk.lock"):
+    if need not in locks:
+        bad.append(f"no lock-taking step for {need} found in the legs")
+if len(bodies) != 1:
+    bad.append(f"release bodies differ across steps ({len(bodies)} variants)")
+for b in bad:
+    print("  " + b, file=sys.stderr)
+if bodies:
+    open(out, "w").write(sorted(bodies)[0])
+for c in configs:
+    print("\t".join(c))
+raise SystemExit(1 if bad else 0)
+PY
+then
+  ok "CASE 12: every lock the two legs take has one always() release after the prune, one shared body"
+else
+  bad "CASE 12: release steps missing, misplaced or diverged (see above)"
+fi
+alive() { case "$(ps -o stat= -p "$1" 2>/dev/null | tr -d ' ')" in ''|Z*) return 1 ;; esac; }
+run_release() {  # $1 lock-base $2 marker-base $3 holder-env name $4 holder pid
+  env RELEASE_LOCK="$1" RELEASE_HOLDERFILE="$2" RELEASE_HOLDER_ENV="$3" "$3=$4" \
+    bash -eo pipefail "$REL_BODY"
+}
+n12=0
+if [ -s "$REL_BODY" ]; then
+  while IFS="$(printf '\t')" read -r _lk _hf _ev; do
+    n12=$((n12+1))
+    L12="$TMP/case12-$n12.lock"; H12="$TMP/case12-$n12.holder"; G12="$TMP/g12-$n12"
+    rm -f "$G12"
+    if ! HEAVY_LEG_LOCK="$L12" HEAVY_LEG_HOLDERFILE="$H12" HEAVY_LEG_WAIT=10 HEAVY_LEG_TTL=90 \
+         HEAVY_LEG_SWEEP=1 HEAVY_LEG_SLOTS=1 HEAVY_LEG_HOLDER_ENV="$_ev" \
+         RUNNER_NAME="honesty-test-release" GITHUB_ENV="$G12" bash "$ACQ_SH" > "$TMP/c12a-$n12.log" 2>&1; then
+      bad "CASE 12 ($_lk): acquire failed: $(tail -1 "$TMP/c12a-$n12.log")"; continue
+    fi
+    p12="$(sed -n "s/^${_ev}=//p" "$G12" | tail -1)"
+    out12="$(run_release "$L12" "$H12" "$_ev" "$p12" 2>&1)" || { bad "CASE 12 ($_lk): release body exited non-zero: $out12"; continue; }
+    if printf '%s\n' "$out12" | grep -qxF "released $L12, holder $p12" \
+       && ! alive "$p12" && [ ! -e "$H12.1" ] && flock -n "$L12.1" -c true; then
+      ok "CASE 12 ($_lk via $_ev): logged 'released <lock>, holder $p12'; holder gone, marker gone, slot free"
+    else
+      bad "CASE 12 ($_lk via $_ev): release did not free and name the lock: $out12"
+      [ -n "$p12" ] && kill "$p12" 2>/dev/null || true
+    fi
+    out12="$(run_release "$L12" "$H12" "$_ev" "$p12" 2>&1)" || true
+    printf '%s\n' "$out12" | grep -qxF "released $L12, holder $p12 (holder had already exited)" \
+      && ok "CASE 12 ($_lk): a second release says the holder had already exited" \
+      || bad "CASE 12 ($_lk): second release mislabelled: $out12"
+    drop_all "$L12"
+  done < "$TMP/c12-manifest"
+  out12="$(run_release "$TMP/case12-none.lock" "$TMP/case12-none.holder" HEAVY_LEG_LOCK_HOLDER "" 2>&1)" \
+    && printf '%s\n' "$out12" | grep -qxF "no $TMP/case12-none.lock holder recorded in this job, nothing to release" \
+    && ok "CASE 12: a job that never took the lock releases nothing and stays green" \
+    || bad "CASE 12: no-holder release failed or claimed a release: $out12"
+fi
+[ "$n12" -ge 2 ] || bad "CASE 12: exercised $n12 lock config(s), want at least 2 (RAM + disk)"
+
 echo
 echo "RESULT: ${npass} passed, ${nfail} failed"
 if [ "$fail" = 0 ]; then
-  echo "HONESTY GATE PASSED: perturb -> reaped -> green ; restore leak -> red ; slot override honoured/ignored as specified ; RAM clamp load-bearing ; RAM lock callers agree"
+  echo "HONESTY GATE PASSED: perturb -> reaped -> green ; restore leak -> red ; slot override honoured/ignored as specified ; RAM clamp load-bearing ; RAM lock callers agree ; release steps free and name every lock"
 else
   echo "HONESTY GATE FAILED"
 fi
