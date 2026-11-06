@@ -1082,6 +1082,181 @@ TEST(DashMnState, NegatedKeyRotationIsAnOperatorChange) {
 }
 #endif
 
+// ── Dash Core v24 (slice S3): the payee projection's v24 transitions ──
+// Gated on set_v24_height; below it every path is the pre-v24 one (the
+// whole suite above runs with the default "never").
+namespace {
+namespace vv = dash::coin::vendor;
+MutableTransaction shared_reg_tx(MNState* want = nullptr)
+{
+    CProRegTx p;
+    p.nVersion = ProTxVersion::EXT_ADDR;
+    p.collateralOutpoint.index = 0;
+    p.extNetInfo.set(vv::NetInfoPurpose::CORE_P2P, {vv::NetInfoEntry{vv::NetService::ipv4(1, 2, 3, 9, 9999)}});
+    p.pubKeyOperator = seq_array<48>(0x41);
+    p.keyIDVoting = raw160(0x42);
+    vv::CCollateralShare a, b;
+    a.amount = 600 * vv::CCollateralShare::COIN;
+    a.scriptRefund.m_data = script_bytes(0xa1);
+    a.keyIDOwner = raw160(0xb1);
+    b.amount = 400 * vv::CCollateralShare::COIN;
+    b.scriptRefund.m_data = script_bytes(0xa2);
+    b.keyIDOwner = raw160(0xb2);
+    p.shares = {a, b};
+    p.vchJoinSigs.resize(2);
+    auto tx = special_tx(CProRegTx::SPECIALTX_TYPE, protx_payload(p));
+    TxOut coll;
+    coll.value = 1000 * vv::CCollateralShare::COIN;
+    coll.scriptPubKey.m_data = dash::coin::v24::shared_collateral_script();
+    tx.vout = {coll};
+    if (want) want->v24.shares = p.shares;
+    return tx;
+}
+BlockType block_of(std::vector<MutableTransaction> txs)
+{
+    BlockType b;
+    b.m_txs.push_back(coinbase_tx({script_bytes(0xD6)}));
+    for (auto& t : txs) b.m_txs.push_back(std::move(t));
+    return b;
+}
+} // namespace
+
+TEST(DashMnState, V24SharedMasternodeLifecycle) {
+    MnStateMachine m;
+    m.set_v24_height(2400100);
+    MNState want;
+    const auto reg = shared_reg_tx(&want);
+    const uint256 pro = tx_hash(reg);
+    auto r = m.apply_block(block_of({reg}), 2400100);
+    ASSERT_TRUE(r.refused.empty()) << r.refused;
+    ASSERT_EQ(r.registered, 1u);
+    const auto& e = m.entries().at(pro);
+    EXPECT_EQ(e.nVersion, ProTxVersion::EXT_ADDR);
+    EXPECT_EQ(e.v24.shares, want.v24.shares);
+    EXPECT_TRUE(e.keyIDOwner.IsNull());
+    EXPECT_EQ(e.collateralOutpoint.hash, pro);
+
+    vv::CProUpShareTx us;
+    us.proTxHash = pro;
+    us.shareIndex = 1;
+    us.scriptReward.m_data = script_bytes(0xc3);
+    r = m.apply_block(block_of({special_tx(11, protx_payload(us))}), 2400101);
+    ASSERT_TRUE(r.refused.empty()) << r.refused;
+    EXPECT_EQ(m.entries().at(pro).v24.shares[1].scriptReward.m_data, script_bytes(0xc3));
+
+    vv::CProUpSharedRegTx sr;
+    sr.proTxHash = pro;
+    sr.pubKeyOperator = seq_array<48>(0x51);
+    sr.keyIDVoting = raw160(0x52);
+    sr.vchSigs.resize(2);
+    r = m.apply_block(block_of({special_tx(12, protx_payload(sr))}), 2400102);
+    ASSERT_TRUE(r.refused.empty()) << r.refused;
+    EXPECT_EQ(m.entries().at(pro).nPoSeBanHeight, 2400102u) << "operator change bans";
+    EXPECT_FALSE(m.entries().at(pro).isValid);
+    EXPECT_EQ(m.entries().at(pro).nVersion, ProTxVersion::EXT_ADDR);
+
+    vv::CProDisTx dis;
+    dis.proTxHash = pro;
+    dis.vchSigs.resize(2);
+    auto dtx = special_tx(10, protx_payload(dis));
+    dtx.vin[0].prevout.hash = pro;
+    dtx.vin[0].prevout.index = 0;
+    r = m.apply_block(block_of({dtx}), 2400103);
+    ASSERT_TRUE(r.refused.empty()) << r.refused;
+    EXPECT_EQ(m.entries().count(pro), 0u) << "dissolved: the collateral spend removes it";
+}
+
+TEST(DashMnState, V24ServiceUpdateRaisesAndMigratesThePayout) {
+    uint256 h;
+    MnStateMachine m = v2319_one_regular_mn(h, 2400110);
+    m.set_v24_height(2400111);
+    const auto old_payout = m.entries().at(h).scriptPayout;
+    CProUpServTx up;
+    up.nVersion = ProTxVersion::EXT_ADDR;
+    up.proTxHash = h;
+    up.extNetInfo.set(vv::NetInfoPurpose::CORE_P2P, {vv::NetInfoEntry{vv::NetService::ipv4(5, 6, 7, 8, 9999)}});
+    const auto r = m.apply_block(block_of({special_tx(CProUpServTx::SPECIALTX_TYPE, protx_payload(up))}), 2400111);
+    ASSERT_TRUE(r.refused.empty()) << r.refused;
+    const auto& e = m.entries().at(h);
+    EXPECT_EQ(e.nVersion, ProTxVersion::EXT_ADDR);
+    ASSERT_EQ(e.v24.payouts.size(), 1u);
+    EXPECT_EQ(e.v24.payouts[0].scriptPayout, old_payout);
+    EXPECT_EQ(e.v24.payouts[0].reward, 10000);
+    EXPECT_TRUE(e.scriptPayout.m_data.empty());
+    EXPECT_EQ(e.v24.extNetInfo, up.extNetInfo);
+}
+
+// The payload rules (v24_rules.hpp) are template-selection only: the payee
+// projection folds a mined ProUpServTx whose signature the rules refuse
+// (BLS build: bad-protx-payload, Core cannot decode it; stub build:
+// unverifiable). See DashReplayFoldV24.MinedBlockFoldNeverRunsTheBlsPayloadRules.
+TEST(DashMnState, V24MinedBlockFoldNeverRunsTheBlsPayloadRules) {
+    uint256 h;
+    MnStateMachine m = v2319_one_regular_mn(h, 2400110);
+    m.set_v24_height(2400111);
+    CProUpServTx up;
+    up.nVersion = ProTxVersion::EXT_ADDR;
+    up.proTxHash = h;
+    up.extNetInfo.set(vv::NetInfoPurpose::CORE_P2P, {vv::NetInfoEntry{vv::NetService::ipv4(5, 6, 7, 8, 9999)}});
+    up.sig.fill(0xff);
+    const auto payload = protx_payload(up);
+    auto rules = dash::coin::ProviderTxRules::for_block(dash::coin::DashNetwork::MAINNET, 2400111);
+    rules.v24_active = true;
+    const auto why = dash::coin::provider_payload_refusal(CProUpServTx::SPECIALTX_TYPE, payload, rules);
+    ASSERT_TRUE(why.has_value()) << "the rules must refuse this payload";
+    EXPECT_TRUE(*why == "bad-protx-payload" || why->rfind("unverifiable-", 0) == 0) << *why;
+    const auto r = m.apply_block(block_of({special_tx(CProUpServTx::SPECIALTX_TYPE, payload)}), 2400111);
+    ASSERT_TRUE(r.refused.empty()) << r.refused;
+    EXPECT_EQ(r.updated, 1u);
+    EXPECT_EQ(m.entries().at(h).v24.extNetInfo, up.extNetInfo);
+}
+
+TEST(DashMnState, V24RefusalsBeforeAnyMutation) {
+    MnStateMachine m;
+    m.set_v24_height(2400120);
+    const auto reg = shared_reg_tx();
+    const uint256 pro = tx_hash(reg);
+    ASSERT_TRUE(m.apply_block(block_of({reg}), 2400120).refused.empty());
+    auto expect_refused = [&](MutableTransaction tx, const char* why) {
+        const MNState before = m.entries().at(pro);
+        const uint32_t cursor = m.last_applied_height();
+        const auto r = m.apply_block(block_of({std::move(tx)}), cursor + 1);
+        EXPECT_NE(r.refused.find(why), std::string::npos) << r.refused;
+        EXPECT_EQ(m.last_applied_height(), cursor);
+        EXPECT_EQ(m.entries().at(pro), before);
+    };
+    // A shared collateral spent by a normal tx.
+    MutableTransaction spend;
+    TxIn in;
+    in.prevout.hash = pro;
+    in.prevout.index = 0;
+    in.sequence = 0xFFFFFFFF;
+    spend.vin.push_back(in);
+    expect_refused(spend, "bad-shared-collateral-spend");
+    // ProUpRegTx for a shared masternode (dry run of the transition).
+    CProUpRegTx up;
+    up.nVersion = ProTxVersion::EXT_ADDR;
+    up.proTxHash = pro;
+    up.pubKeyOperator = seq_array<48>(0x41);
+    up.keyIDVoting = raw160(0x42);
+    vv::MasternodePayoutShare po;
+    po.scriptPayout.m_data = script_bytes(0x77);
+    up.payouts = {po};
+    expect_refused(special_tx(CProUpRegTx::SPECIALTX_TYPE, protx_payload(up)), "bad-protx-shared-mn");
+    // A legacy-scheme registration after DEPLOYMENT_V24.
+    auto legacy = make_proreg(ProTxVersion::LEGACY_BLS, MnType::REGULAR);
+    expect_refused(special_tx(CProRegTx::SPECIALTX_TYPE, protx_payload(legacy)), "bad-protx-version-disallowed");
+    // A template output outside a shared registration.
+    MutableTransaction t;
+    t.vin.push_back(in);
+    t.vin[0].prevout.hash = raw256(0x5a);
+    TxOut o;
+    o.value = 1;
+    o.scriptPubKey.m_data = dash::coin::v24::shared_collateral_script();
+    t.vout.push_back(o);
+    expect_refused(t, "bad-shared-collateral-create");
+}
+
 TEST(DashMnState, CollateralSpendRemovesMN) {
     auto reg = make_proreg(ProTxVersion::BASIC_BLS, MnType::REGULAR);
     // external collateral (non-null hash) so we can spend it precisely.

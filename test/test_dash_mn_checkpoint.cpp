@@ -612,12 +612,19 @@ TEST(DashMnCheckpoint, NetworkMismatchRefuses)
 
 TEST(DashMnCheckpoint, BadMagicRefuses)
 {
+    // /2 is the Dash Core v24 format now; an unknown future format still
+    // refuses by name.
     std::string p = mutate(kRealCheckpoint1519543,
                            "c2pool-dash-mn-checkpoint/1",
-                           "c2pool-dash-mn-checkpoint/2");
+                           "c2pool-dash-mn-checkpoint/3");
     auto cp = parse_mn_checkpoint(p, "testnet");
     EXPECT_FALSE(cp.ok);
     EXPECT_NE(cp.error.find("bad magic"), std::string::npos) << cp.error;
+    // A /1 file relabelled /2 has the wrong column count for /2 and refuses.
+    std::string p2 = mutate(kRealCheckpoint1519543,
+                            "c2pool-dash-mn-checkpoint/1",
+                            "c2pool-dash-mn-checkpoint/2");
+    EXPECT_FALSE(parse_mn_checkpoint(p2, "testnet").ok);
 }
 
 TEST(DashMnCheckpoint, UnknownKeyRefusesRatherThanIgnoring)
