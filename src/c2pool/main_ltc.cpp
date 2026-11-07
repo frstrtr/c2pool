@@ -330,6 +330,7 @@ static void segfault_handler(int sig) {
 #include <nlohmann/json.hpp>
 #include <yaml-cpp/yaml.h>
 #include <btclibs/util/strencodings.h>
+#include <c2pool/ltc_doge_chain_net.hpp>
 
 // Bring the address validation types into scope
 using Blockchain = c2pool::address::Blockchain;
@@ -593,6 +594,7 @@ void print_help() {
     std::cout << "  --embedded-ltc            Use embedded LTC SPV node (no daemon needed)\n";
     std::cout << "  --embedded-doge           Use embedded DOGE SPV node for merged mining\n";
     std::cout << "  --doge-testnet4alpha      Use DOGE testnet4alpha (default: testnet3)\n";
+    std::cout << "  --regtest                 LTC/DOGE daemons on regtest (P2P magic fabfb5da, ports 19444/18444; implies --testnet)\n";
     std::cout << "  --doge-p2p-address HOST   Direct DOGE P2P peer address (e.g. your dogecoind)\n";
     std::cout << "  --doge-p2p-port PORT      Direct DOGE P2P peer port (overrides auto-detect)\n";
     std::cout << "  --header-checkpoint H:HASH  LTC header chain starting point\n";
@@ -895,6 +897,7 @@ int main(int argc, char* argv[]) {
     bool embedded_ltc    = true;     // Default: embedded LTC SPV (no daemon needed)
     bool embedded_doge   = true;     // Default: embedded DOGE SPV for merged mining
     bool doge_testnet4alpha = false;  // Use DOGE testnet4alpha instead of standard testnet3
+    bool coin_regtest = false;        // --regtest: LTC/DOGE daemons on regtest (magic fabfb5da)
     // Embedded SPV bootstrap checkpoints (mainnet defaults, skip millions of old headers)
     // Override with --header-checkpoint / --doge-header-checkpoint or config YAML.
     // Testnet: set via CLI or config (no hardcoded default).
@@ -1055,9 +1058,9 @@ int main(int argc, char* argv[]) {
     };
 
     // Well-known P2P ports for coin daemons (same machine as RPC by default)
-    auto get_coin_p2p_port = [&doge_testnet4alpha](const std::string& symbol, bool testnet) -> int {
-        if (symbol == "LTC"   || symbol == "ltc")   return testnet ? 19335 : 9333;
-        if (symbol == "DOGE"  || symbol == "doge")  return (testnet && !doge_testnet4alpha) ? 44556 : 22556;  // t4a uses mainnet-style 22556
+    auto get_coin_p2p_port = [&doge_testnet4alpha, &coin_regtest](const std::string& symbol, bool testnet) -> int {
+        // LTC/DOGE (incl. regtest + t4a): SSOT src/c2pool/ltc_doge_chain_net.hpp
+        if (int p = c2pool::ltc_doge::p2p_port(symbol, testnet, doge_testnet4alpha, coin_regtest)) return p;
         if (symbol == "NMC"   || symbol == "nmc")   return testnet ? 18334 : 8334;   // SSOT: src/impl/nmc/coin/chain_seeds.hpp (namecoind addrman)
         if (symbol == "BTC"   || symbol == "btc")   return testnet ? 18333 : 8333;
         if (symbol == "DGB"   || symbol == "dgb")   return testnet ? 12026 : 12024;
@@ -1081,14 +1084,12 @@ int main(int argc, char* argv[]) {
         }
     };
     // Known P2P magic prefixes for common chains
-    auto get_chain_p2p_prefix = [&doge_testnet4alpha](const std::string& symbol, bool testnet) -> std::vector<std::byte> {
-        if (symbol == "DOGE" || symbol == "doge") {
-            if (!testnet) return ParseHexBytes("c0c0c0c0");
-            // --testnet = testnet3 (fcc1b7dc), --doge-testnet4alpha = testnet4alpha (d4a1f4a1)
-            return doge_testnet4alpha ? ParseHexBytes("d4a1f4a1") : ParseHexBytes("fcc1b7dc");
-        }
-        if (symbol == "LTC" || symbol == "ltc") {
-            return testnet ? ParseHexBytes("fdd2c8f1") : ParseHexBytes("fbc0b6db");
+    auto get_chain_p2p_prefix = [&doge_testnet4alpha, &coin_regtest](const std::string& symbol, bool testnet) -> std::vector<std::byte> {
+        // LTC/DOGE (mainnet / testnet / DOGE t4a / regtest fabfb5da):
+        // SSOT src/c2pool/ltc_doge_chain_net.hpp (KAT ltc_doge_regtest_net_kat).
+        {
+            auto hex = c2pool::ltc_doge::p2p_magic_hex(symbol, testnet, doge_testnet4alpha, coin_regtest);
+            if (!hex.empty()) return ParseHexBytes(hex);
         }
         if (symbol == "BTC" || symbol == "btc") {
             return testnet ? ParseHexBytes("0b110907") : ParseHexBytes("f9beb4d9");
@@ -1142,6 +1143,14 @@ int main(int argc, char* argv[]) {
             core::filesystem::set_data_dir(argv[++i]);
         }
         else if (arg == "--testnet") {
+            settings->m_testnet = true;
+            cli_explicit.insert("testnet");
+        }
+        else if (arg == "--regtest") {
+            // LTC/DOGE coin daemons on regtest. Implies --testnet: the
+            // sharechain + address params stay testnet; only the coin-daemon
+            // P2P magic (fabfb5da) and default P2P ports (19444/18444) change.
+            coin_regtest = true;
             settings->m_testnet = true;
             cli_explicit.insert("testnet");
         }
@@ -7717,10 +7726,9 @@ int main(int argc, char* argv[]) {
                     // Fallback payout address for createauxblock RPC.
                     // Used when no per-miner address is available for a chain.
                     // PPLNS payouts override this in multiaddress mode.
-                    if (cfg.symbol == "DOGE" && settings->m_testnet)
-                        cfg.aux_payout_address = "nUCAGGgZEPN1QyknmQe1oAku817bQAFKFt";
-                    else if (cfg.symbol == "DOGE")
-                        cfg.aux_payout_address = "DDogepartyxxxxxxxxxxxxxxxxxxw1dfzr";
+                    if (cfg.symbol == "DOGE")
+                        cfg.aux_payout_address = c2pool::ltc_doge::doge_aux_fallback_address(
+                            settings->m_testnet, coin_regtest);
                     else if (cfg.symbol == "PEP")
                         cfg.aux_payout_address = "PSimbaxxxxxxxxxxxxxxxxxxxxUMbTDw";
                     else if (cfg.symbol == "BELLS")
@@ -7734,8 +7742,24 @@ int main(int argc, char* argv[]) {
                     else if (cfg.symbol == "DINGO")
                         cfg.aux_payout_address = solo_address;
 
-                    // P2P port: explicit (7th field) or auto-detected from symbol
-                    if (parts.size() >= 7 && !parts[6].empty()) {
+                    // P2P port: explicit (7th field) or auto-detected from symbol.
+                    // DOGE goes through doge_aux_p2p_port(): --no-embedded-doge
+                    // no longer picks up the auto-detected port (see the helper).
+                    if (cfg.symbol == "DOGE") {
+                        int spec_port = (parts.size() >= 7 && !parts[6].empty())
+                            ? static_cast<int>(std::stoul(parts[6])) : -1;
+                        int auto_port = get_coin_p2p_port(cfg.symbol, settings->m_testnet);
+                        int port = c2pool::ltc_doge::doge_aux_p2p_port(
+                            doge_p2p_port, spec_port, auto_port, embedded_doge);
+                        cfg.p2p_port = static_cast<uint16_t>(port);
+                        if (doge_p2p_port > 0)
+                            LOG_INFO << "DOGE P2P port overridden via --doge-p2p-port: " << doge_p2p_port;
+                        else if (spec_port < 0 && port > 0)
+                            LOG_INFO << "Auto-detected P2P port for DOGE: " << port;
+                        else if (spec_port < 0)
+                            LOG_INFO << "DOGE P2P off: embedded DOGE disabled and no explicit"
+                                     << " P2P port (RPC-only aux: createauxblock/submitauxblock)";
+                    } else if (parts.size() >= 7 && !parts[6].empty()) {
                         cfg.p2p_port = static_cast<uint16_t>(std::stoul(parts[6]));
                     } else {
                         int auto_port = get_coin_p2p_port(cfg.symbol, settings->m_testnet);
@@ -7751,11 +7775,6 @@ int main(int argc, char* argv[]) {
                         cfg.p2p_address = merged_coind_p2p_address;
                     } else {
                         cfg.p2p_address = cfg.rpc_host;
-                    }
-                    // --doge-p2p-port overrides auto-detected port
-                    if (cfg.symbol == "DOGE" && doge_p2p_port > 0) {
-                        cfg.p2p_port = static_cast<uint16_t>(doge_p2p_port);
-                        LOG_INFO << "DOGE P2P port overridden via --doge-p2p-port: " << doge_p2p_port;
                     }
 
                     // Create DOGE HeaderChain when embedded OR P2P is available.
