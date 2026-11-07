@@ -4,6 +4,7 @@
 #include <nlohmann/json.hpp>
 
 #include <core/web_server.hpp>
+#include <core/coin/node_iface.hpp>
 
 // ---------------------------------------------------------------------------
 // KATs for core::MiningInterface::rest_local_stats -> local_hashps (#919).
@@ -81,4 +82,83 @@ TEST(NodeRoleSeam, IdleStratumAcceptorIsStillMining) {
     ASSERT_TRUE(r.contains("node_role"));
     EXPECT_EQ(r["node_role"], "mining")
         << "an acceptor with zero miners is an idle mining node, not a relay";
+}
+
+// ---------------------------------------------------------------------------
+// #942 residual, daemonless basis: a Stratum acceptor with no template source
+// cannot hand out work, so the node is a relay. "none" is asserted only when
+// a coin node is attached and reports neither source; with no coin node the
+// source is unknown (null) and the Stratum basis stands.
+// FAIL WITHOUT THE FIX: rest_local_stats emitted no template_source or
+// node_role_basis, and a daemonless node with an acceptor read "mining".
+// ---------------------------------------------------------------------------
+
+namespace {
+struct RoleFakeCoinNode : public core::coin::ICoinNode {
+    bool embedded = false;
+    bool rpc = false;
+    core::coin::WorkView get_work_view() override { core::coin::WorkView v; return v; }
+    bool submit_block_hex(const std::string&, bool) override { return false; }
+    bool is_embedded() const override { return embedded; }
+    bool has_rpc() const override { return rpc; }
+};
+} // namespace
+
+TEST(NodeRoleSeam, NoStratumBasisIsNamed) {
+    core::MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                             c2pool::address::Blockchain::LITECOIN);
+    auto r = mi.rest_local_stats();
+    EXPECT_EQ(r["node_role"], "relay");
+    EXPECT_EQ(r["node_role_basis"], "no_stratum");
+}
+
+TEST(NodeRoleSeam, NoCoinNodeLeavesTemplateSourceUnknown) {
+    core::MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                             c2pool::address::Blockchain::LITECOIN);
+    mi.set_stratum_hashrate_fn([]() { return 0.0; });
+    auto r = mi.rest_local_stats();
+    ASSERT_TRUE(r.contains("template_source"));
+    EXPECT_TRUE(r["template_source"].is_null())
+        << "no coin node attached is unknown, not evidence of no daemon";
+    EXPECT_EQ(r["node_role"], "mining");
+    EXPECT_EQ(r["node_role_basis"], "stratum");
+}
+
+TEST(NodeRoleSeam, AttachedDaemonlessCoinNodeIsRelay) {
+    core::MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                             c2pool::address::Blockchain::LITECOIN);
+    RoleFakeCoinNode coin;  // attached, neither embedded nor RPC
+    mi.set_coin_node(&coin);
+    mi.set_stratum_hashrate_fn([]() { return 0.0; });
+    auto r = mi.rest_local_stats();
+    EXPECT_EQ(r["template_source"], "none");
+    EXPECT_EQ(r["node_role"], "relay")
+        << "an acceptor with no template source cannot hand miners work";
+    EXPECT_EQ(r["node_role_basis"], "no_template_source");
+    mi.set_coin_node(nullptr);
+}
+
+TEST(NodeRoleSeam, EmbeddedCoinNodeKeepsMining) {
+    core::MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                             c2pool::address::Blockchain::LITECOIN);
+    RoleFakeCoinNode coin;
+    coin.embedded = true;
+    coin.rpc = true;
+    mi.set_coin_node(&coin);
+    mi.set_stratum_hashrate_fn([]() { return 0.0; });
+    auto r = mi.rest_local_stats();
+    EXPECT_EQ(r["template_source"], "embedded+rpc");
+    EXPECT_EQ(r["node_role"], "mining");
+    mi.set_coin_node(nullptr);
+}
+
+TEST(NodeRoleSeam, RpcFlagWithoutCoinNodeIsRpc) {
+    // c2pool-dash with dashd: an external NodeRPC arm, no ICoinNode.
+    core::MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                             c2pool::address::Blockchain::LITECOIN);
+    mi.set_coin_rpc_available(true);
+    mi.set_stratum_hashrate_fn([]() { return 0.0; });
+    auto r = mi.rest_local_stats();
+    EXPECT_EQ(r["template_source"], "rpc");
+    EXPECT_EQ(r["node_role"], "mining");
 }

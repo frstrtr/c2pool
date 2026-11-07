@@ -5467,7 +5467,36 @@ nlohmann::json MiningInterface::rest_local_stats()
     // set_stratum_hashrate_fn only once it is actually listening. Display
     // only; reads a std::function set at startup, no tracker or peer state,
     // so no new lock surface.
-    result["node_role"] = m_stratum_hashrate_fn ? "mining" : "relay";
+    //
+    // Daemonless basis (#942 residual): an acceptor with no template source
+    // cannot hand a miner any work, so that node is a relay too. "none" is
+    // asserted ONLY when a coin node is attached and reports neither an
+    // embedded template source nor an RPC client. Lanes that never attach one
+    // (btc, dgb, bch, dash without dashd) emit template_source null, meaning
+    // unknown, and keep the Stratum basis: a missing signal is not evidence
+    // that there is no daemon. Same flags /api/node_topology reads on this
+    // thread; no tracker or peer state, so no new lock surface.
+    const bool ts_embedded = m_embedded_display_override.value_or(
+        m_coin_node && m_coin_node->is_embedded());
+    const bool ts_rpc = (m_coin_node && m_coin_node->has_rpc())
+                        || m_coin_rpc_available.load(std::memory_order_relaxed);
+    const char* template_source = nullptr;
+    if (ts_embedded && ts_rpc) template_source = "embedded+rpc";
+    else if (ts_embedded)      template_source = "embedded";
+    else if (ts_rpc)           template_source = "rpc";
+    else if (m_coin_node)      template_source = "none";
+    if (template_source)
+        result["template_source"] = template_source;
+    else
+        result["template_source"] = nullptr;
+
+    const bool has_acceptor = static_cast<bool>(m_stratum_hashrate_fn);
+    const bool no_template  = template_source
+                              && std::string(template_source) == "none";
+    result["node_role"] = (has_acceptor && !no_template) ? "mining" : "relay";
+    result["node_role_basis"] = !has_acceptor ? "no_stratum"
+                              : no_template   ? "no_template_source"
+                                              : "stratum";
 
     // #959 active/total: a session count alone hides dead rigs that stay
     // authorized, so the headline splits live contributors from SILENT
