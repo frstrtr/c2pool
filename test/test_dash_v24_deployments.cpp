@@ -1391,3 +1391,40 @@ TEST(DashV24VerifyFold, StatusDecidedAnswersMatchTheReferenceUnderTrackerLag)
     EXPECT_EQ(wrong, 0);
     EXPECT_GT(decided, 1000);
 }
+
+// VERIFY-H0-S0-S1 N6: the cross-check latch survives a restart.
+TEST(DashV24Deployments, CrossCheckLatchSurvivesARestart)
+{
+    LatchFixture f(false);
+    const uint64_t v0 = f.st->latch_version();
+    ASSERT_EQ(f.st->cross_check_cbtx_version(55, f.c.at(55)->hash, 4), V24CrossCheck::CONTRADICTS);
+    EXPECT_GT(f.st->latch_version(), v0);
+    const std::string rec = f.st->serialize_latch();
+    // A fresh status (a restarted node) loads it and stays fail closed.
+    DashDeploymentStatus again(f.p, f.c.fn(), [&f] { return std::optional<uint32_t>(f.tip); }, f.t);
+    ASSERT_TRUE(again.deserialize_latch(rec));
+    EXPECT_EQ(again.latch(), f.st->latch());
+    EXPECT_EQ(again.v24_state(55), V24State::UNKNOWN);
+    EXPECT_EQ(again.contradictions(), f.st->contradictions());
+    // Another network's record, or garbage, is refused.
+    DashDeploymentStatus testnet(DashNetwork::TESTNET, f.c.fn(), [&f] { return std::optional<uint32_t>(f.tip); }, f.t);
+    EXPECT_FALSE(testnet.deserialize_latch(rec));
+    EXPECT_FALSE(again.deserialize_latch("v24_latch v1 x"));
+    // A refuted pin stays refuted only for the same pin.
+    SynthChain c; c.tip = 120; c.signal_range(30, 39);
+    auto p = fast_params(0);
+    uint32_t tip = 120;
+    DashDeploymentStatus s1(p, c.fn(), [&tip] { return std::optional<uint32_t>(tip); }, nullptr);
+    s1.set_v24_activation_override(60);
+    ASSERT_EQ(s1.cross_check_cbtx_version(60, c.at(60)->hash, 3), V24CrossCheck::CONTRADICTS);
+    ASSERT_TRUE(s1.pin_refuted());
+    const std::string prec = s1.serialize_latch();
+    DashDeploymentStatus same(p, c.fn(), [&tip] { return std::optional<uint32_t>(tip); }, nullptr);
+    same.set_v24_activation_override(60);
+    ASSERT_TRUE(same.deserialize_latch(prec));
+    EXPECT_TRUE(same.pin_refuted());
+    DashDeploymentStatus other(p, c.fn(), [&tip] { return std::optional<uint32_t>(tip); }, nullptr);
+    other.set_v24_activation_override(70);
+    ASSERT_TRUE(other.deserialize_latch(prec));
+    EXPECT_FALSE(other.pin_refuted()) << "a different pin is a new operator decision";
+}

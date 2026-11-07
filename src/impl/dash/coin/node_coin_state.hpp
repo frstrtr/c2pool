@@ -477,6 +477,14 @@ public:
     using V24StateFn = std::function<V24State(uint32_t height)>;
     void set_v24_state_fn(V24StateFn fn) { m_v24_state_fn = std::move(fn); }
     void set_v24_network(DashNetwork net) { m_v24_net = net; }
+
+    /// #143 / Dash Core v24: type-9 admission for the template at `height`
+    /// on `prev_hash` (credit_pool_lane.hpp admit). Null result => every
+    /// unlock is excluded. Unset => never called.
+    using AssetUnlockAdmitFn = std::function<std::shared_ptr<const AssetUnlockAdmission>(
+        uint32_t height, const uint256& prev_hash,
+        const std::vector<MutableTransaction>& candidates, const QuorumManager& qmgr)>;
+    void set_asset_unlock_admit_fn(AssetUnlockAdmitFn fn) { m_asset_unlock_admit_fn = std::move(fn); }
     V24State v24_state_for(uint32_t height) const
     {
         return m_v24_state_fn ? m_v24_state_fn(height) : dash::coin::v24_state(m_v24_net, height);
@@ -2105,6 +2113,13 @@ public:
                 e.has_state         = false;
             }
         }
+        // #143 / Dash Core v24: the credit-pool follower admits type-9 unlocks
+        // for this template (only when the pool holds any; null => excluded).
+        if (e.has_state && m_asset_unlock_admit_fn) {
+            auto cands = m_mempool.asset_unlock_candidates();
+            if (!cands.empty())
+                e.asset_unlocks = m_asset_unlock_admit_fn(m_prev_height + 1, m_prev_hash, cands, m_qmgr);
+        }
         // NAME THE STATE: while the UTXO lane is immature under the OPT-IN
         // serving policy we DO serve, but only a coinbase-only body. The
         // builder marks the template (m_txset_empty_cause) and logs the
@@ -2789,6 +2804,7 @@ private:
     int      m_mn_rr_height{DASH_MN_RR_HEIGHT_MAINNET}; // network MN_RR activation height (platform-share gate)
     V24StateFn m_v24_state_fn;   // Dash Core v24 deployment state (unset => registry for m_v24_net)
     DashNetwork m_v24_net{DashNetwork::MAINNET};
+    AssetUnlockAdmitFn m_asset_unlock_admit_fn;   // #143 credit-pool follower admission
     int      m_mn_min_confirmations{DASH_MN_MIN_CONFIRMATIONS_MAINNET}; // network nMasternodeMinimumConfirmations (rollover projection)
     uint256  m_credit_pool_current_hash;     // block hash the credit-pool seed is current at
     int32_t  m_credit_pool_height{-1};       // seed cbTx's OWN height (-1 = never seeded)

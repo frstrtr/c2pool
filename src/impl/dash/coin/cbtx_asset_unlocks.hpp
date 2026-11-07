@@ -24,6 +24,7 @@
 /// A version-1 unlock is not a leaf (testnet block 1,578,005 carries one and
 /// commits a null root).
 
+#include <impl/dash/coin/dash_txid.hpp>          // IsAssetUnlockWithStableTxid, GetInstanceHash
 #include <impl/dash/coin/quorum_root.hpp>        // compute_merkle_root_local (ComputeMerkleRoot)
 #include <impl/dash/coin/transaction.hpp>
 #include <impl/dash/coin/tx_version_rules.hpp>
@@ -40,31 +41,11 @@
 namespace dash {
 namespace coin {
 
-/// ASSET_UNLOCK_QUORUM_INFO_SIZE / ASSET_UNLOCK_PAYLOAD_SIZE /
-/// ASSET_UNLOCK_STABLE_TXID_VERSION.
-inline constexpr size_t  kAssetUnlockQuorumInfoSize = 4 + 32 + 96;
-inline constexpr size_t  kAssetUnlockPayloadSize    = 1 + 8 + 4 + kAssetUnlockQuorumInfoSize;
-inline constexpr uint8_t kAssetUnlockStableTxidVersion = 2;
-
-template <typename Tx>
-inline bool is_asset_unlock_with_stable_txid(const Tx& tx)
-{
-    return tx_is_special_version(tx.version) && tx.type == tx_type::ASSET_UNLOCK
-        && tx.extra_payload.size() == kAssetUnlockPayloadSize
-        && tx.extra_payload[0] >= kAssetUnlockStableTxidVersion;
-}
-
-/// CTransaction::GetInstanceHash for a stable-txid unlock: SHA256d of the
-/// full serialization.
+/// CTransaction::GetInstanceHash (dash_txid.hpp); the name the CbTx code and
+/// its KATs use.
 inline uint256 tx_full_serialization_hash(const MutableTransaction& tx)
 {
-    auto ps = ::pack(tx);
-    auto sp = ps.get_span();
-    uint256 h;
-    CHash256()
-        .Write(std::span<const unsigned char>(reinterpret_cast<const unsigned char*>(sp.data()), sp.size()))
-        .Finalize(std::span<unsigned char>(h.data(), 32));
-    return h;
+    return dash_instance_hash(tx);
 }
 
 namespace cbtx_detail {

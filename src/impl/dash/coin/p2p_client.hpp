@@ -80,6 +80,7 @@
 //
 // Header-only to match the sibling dash coin leaves.
 
+#include <impl/dash/coin/dash_txid.hpp>
 #include "p2p_messages.hpp"
 #include "p2p_connection.hpp"
 #include "node_interface.hpp"
@@ -4134,17 +4135,12 @@ private:
         // body; computing it here (rather than trusting the announcement we
         // asked for) means an unsolicited or substituted body cannot free a
         // slot it never occupied.
-        {
-            ::PackStream ps;
-            ps << msg->m_tx;
-            auto sp = ps.get_span();
-            uint256 txid;
-            CHash256()
-                .Write(std::span<const unsigned char>(
-                    reinterpret_cast<const unsigned char*>(sp.data()), sp.size()))
-                .Finalize(std::span<unsigned char>(txid.data(), 32));
-            m_tx_pull_inflight.erase(txid);
-        }
+        // A version-2 asset unlock is announced by its STABLE txid to peers
+        // below protocol 70242 (ours), by instance hash (MSG_ASSET_UNLOCK) to
+        // newer ones (Dash Core v24 GetTxAnnouncement): free either slot.
+        m_tx_pull_inflight.erase(dash_txid(msg->m_tx));
+        if (is_asset_unlock_with_stable_txid(msg->m_tx))
+            m_tx_pull_inflight.erase(dash_instance_hash(msg->m_tx));
         m_coin->new_tx.happened(Transaction(msg->m_tx));
     }
 
