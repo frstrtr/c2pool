@@ -383,11 +383,12 @@ TEST(DashSpork, HandshakeSendsGetSporks)
     ASSERT_TRUE(rig.client.is_handshake_complete());
     const auto* p = rig.client.peer_session(SporkRig::peer_key(1));
     ASSERT_NE(p, nullptr);
-    // Exactly three writes this session: our version on attach, the verack
-    // ack, and the getsporks pull on handshake completion. (promote_primary
-    // writes nothing; no discovery consumer is registered.)
-    EXPECT_EQ(p->msgs_sent, 3u)
-        << "expected version + verack + getsporks by handshake completion";
+    // Exactly four writes this session: our version on attach, the verack
+    // ack, then the getsporks pull and the #968a sendcmpct(false, 1) on
+    // handshake completion (the rig peer speaks 70230 >= 70209).
+    // (promote_primary writes nothing; no discovery consumer is registered.)
+    EXPECT_EQ(p->msgs_sent, 4u)
+        << "expected version + verack + getsporks + sendcmpct by handshake completion";
 }
 
 TEST(DashSpork, VerifiedSporkRefinesClientStateAndBadSigDoesNot)

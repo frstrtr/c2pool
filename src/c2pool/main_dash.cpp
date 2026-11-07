@@ -65,6 +65,7 @@
 #include <impl/dash/coin/rpc_conf.hpp>     // dash.conf creds resolution (rpcpassword off argv)
 #include <impl/dash/coin/node_interface.hpp>
 #include <impl/dash/coin/p2p_client.hpp>   // dash::coin::p2p::CoinClient — OPT-IN coin-network dial (E1, --coin-p2p-connect)
+#include <impl/dash/coin/compact_mempool_provider.hpp> // dash::coin::CompactMempoolBinding — #968a cmpctblock short ids vs the embedded mempool
 #include <impl/dash/coin/coin_peer_manager.hpp> // dash::coin::DashCoinPeerManager — DASH-ISOLATED scored/diverse peer discovery (--coin-p2p-discover; network-standalone gate)
 #include <impl/dash/coin/chain_seeds.hpp>  // dash::coin::dash_dns_seeds / dash_fixed_seeds — DASH mainnet/testnet seed bootstrap
 #include <impl/dash/coin/won_block_dispatch.hpp> // dash::coin::broadcast_won_block — S8 dual-path won-block dispatcher (embedded P2P primary + submitblock RPC backup)
@@ -3420,6 +3421,20 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         arm_is_hold();   // seed posture now (mainnet seed: both active)
         coin_p2p->set_spork_change_callback(arm_is_hold);
     }
+    // #968a slice 3b: BIP 152 cmpctblock short ids are matched against THIS
+    // node's embedded Mempool (compact_mempool_provider.hpp), so a compact
+    // block whose txs we already hold completes without a getblocktxn round
+    // trip. A wrong tx that matches by short id is caught by the receiver's
+    // merkle bind, and the full block is fetched. Declared AFTER
+    // node_coin_state, so it is destroyed BEFORE it: the destructor takes the
+    // provider out of coin_p2p while the Mempool is still alive. coin_p2p is
+    // declared earlier and can outlive this scope (set_lifetime pins it per
+    // async op), so without this it would keep a provider pointing into a
+    // freed Mempool. No coin-P2P arm => nothing is bound.
+    dash::coin::CompactMempoolBinding<dash::coin::p2p::CoinClient<dash::Config>>
+        cmpct_mempool_binding;
+    if (coin_p2p)
+        cmpct_mempool_binding.bind(coin_p2p, node_coin_state.mempool());
     // #107 PHASE 2 (--embedded-accrue-asset-locks): DEFAULT OFF. When ON the
     // embedded CbTx creditPoolBalance accrues the pending type-8 asset-lock term
     // dashd commits, so the gbt-xcheck-modulo-special-explained swap stops

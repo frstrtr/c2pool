@@ -255,6 +255,7 @@ if (BUILD_TESTING AND GTest_FOUND)
     # fixture — the [BULK] MERKLE-BIND FAIL livelock the bulk-replay lane
     # wedged on. DASH_FIXTURE_DIR feeds its fixture loader.
     add_executable(test_dash_block_replay test_dash_block_replay.cpp
+                   test_dash_compact_block_receive.cpp
                    test_dash_tx_version_gate.cpp)
     target_compile_definitions(test_dash_block_replay PRIVATE
         DASH_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
