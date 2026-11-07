@@ -1096,6 +1096,9 @@ if (BUILD_TESTING AND GTest_FOUND)
                    test_dash_replay_payee_publish.cpp
                    test_dash_replay_mnlist_seed.cpp
                    test_dash_replay_prestate_empty_dip3.cpp
+                   # Dash Core v24 (S3): state transitions, the shared-collateral
+                   # and ProDisTx rules, and the v24 persistence formats.
+                   test_dash_v24_mn_state.cpp
                    # Differential KAT (Dash Core v23.1.9 PR-1 verify, M1/M2): the
                    # template fold must commit the root the root-proven DML fold
                    # computes and refuse what it refuses (real dashbls keys).

@@ -89,6 +89,7 @@
 #include <impl/dash/coin/block.hpp>
 #include <impl/dash/coin/mn_state_db.hpp>
 #include <impl/dash/coin/tx_version_rules.hpp>      // ContextualCheckTransaction (v23.1.9)
+#include <impl/dash/coin/v24_state.hpp>             // Dash Core v24 state transitions
 #include <impl/dash/coin/vendor/providertx.hpp>
 #include <impl/dash/coin/vendor/bls_verify.hpp>   // opkey_to_basic — canonical-BASIC store contract (#154 legacy<->basic ProUpReg)
 #include <impl/dash/coin/vendor/simplifiedmns.hpp>
@@ -490,6 +491,11 @@ public:
     /// MAINNET value (1028160); a smaller real value on another network only
     /// leaves blocks in between unchecked, never refuses a valid one.
     void set_dip0003_height(uint32_t h) { m_dip0003_height = h; }
+    /// DEPLOYMENT_V24 activation height (first block with the v24 rules) and
+    /// the chain's netInfo rules (SetStateVersion conversions).
+    void set_v24_height(uint32_t h) { m_v24_height = h; }
+    void set_netinfo_rules(const vendor::NetInfoRules& r) { m_netinfo_rules = r; }
+    uint32_t v24_height() const { return m_v24_height; }
 
     /// The height a wholesale masternode-list fold last reconciled this set's
     /// PoSe ban state at (0 = never). Set by sync_validity_from_sml(), which
@@ -1379,8 +1385,18 @@ public:
         // Walk all non-coinbase txs (i=1+). The order of types within
         // a block is whatever the miner included; dashcore handles
         // them in tx-list order via the if/else-if chain.
+        const bool v24_on = v24_at(height);
         for (size_t i = 1; i < block.m_txs.size(); ++i) {
             const auto& tx = block.m_txs[i];
+            if (v24_on) {
+                // Dash Core v24: every provider type, v3 payloads and
+                // shared masternodes (v24_state.hpp). The pre-scan has
+                // already dry-run each transition.
+                if ((tx.type >= 1 && tx.type <= 4) || tx_type_is_v24_provider(tx.type)) {
+                    if (!tx.extra_payload.empty()) apply_provider_tx_v24(tx, height, r);
+                }
+                continue;
+            }
             if (tx.type < 1 || tx.type > 4) continue;
             if (tx.extra_payload.empty()) continue;
             switch (tx.type) {
@@ -2208,6 +2224,12 @@ private:
     // ContextualCheckTransaction gate (set_dip0003_height). Mainnet default.
     uint32_t m_dip0003_height{1028160};
 
+    // DEPLOYMENT_V24 (set_v24_height): never by default (mainnet not locked
+    // in); S0's tracker sets it, testnet is 1,578,000. Below it every path is
+    // the pre-v24 one, unchanged.
+    uint32_t m_v24_height{std::numeric_limits<uint32_t>::max()};
+    vendor::NetInfoRules m_netinfo_rules{vendor::NetInfoRules::mainnet()};
+
     /// The block-level rejects apply_block mirrors, as dashd's reject reason
     /// ("tx[i]: <reason>"), or nullopt. Pure: reads the pre-block set only.
     ///   * ContextualCheckTransaction (validation.cpp:317-349 @ v23.1.9) on
@@ -2222,12 +2244,31 @@ private:
     {
         for (size_t i = 0; i < block.m_txs.size(); ++i) {
             const auto& tx = block.m_txs[i];
+            const bool v24_on = v24_at(height);
             if (height >= m_dip0003_height) {
-                if (auto why = contextual_tx_check(tx, i == 0))
+                if (auto why = v24::contextual_tx_check_at(tx, i == 0, v24_on))
                     return "tx[" + std::to_string(i) + "]: " + std::string(*why);
             }
+            if (v24_on) {
+                // Dash Core v24 shared-collateral covenant: the template
+                // script only as a shared registration's collateral (every
+                // tx, coinbase too), and a shared masternode's collateral
+                // spent only by a ProDisTx.
+                if (auto why = v24::shared_collateral_create_refusal(tx))
+                    return "tx[" + std::to_string(i) + "]: " + *why;
+                if (i != 0 && !(tx_is_special_version(tx.version)
+                                && tx.type == tx_type::PROVIDER_DISSOLVE)) {
+                    for (const auto& in : tx.vin) {
+                        auto ci = m_collateral_index.find(in.prevout);
+                        if (ci == m_collateral_index.end()) continue;
+                        auto ei = m_entries.find(ci->second);
+                        if (ei != m_entries.end() && ei->second.v24.IsShared())
+                            return "tx[" + std::to_string(i) + "]: bad-shared-collateral-spend";
+                    }
+                }
+            }
             if (i != 0) {
-                if (auto why = provider_tx_unfoldable(tx))
+                if (auto why = provider_tx_unfoldable(tx, height))
                     return "tx[" + std::to_string(i) + "]: " + *why;
             }
             if (i == 0 || tx.type != vendor::CProUpServTx::SPECIALTX_TYPE
@@ -2247,6 +2288,141 @@ private:
         return std::nullopt;
     }
 
+    /// BanIfNotBanned in this state's convention (0 = not banned).
+    static void ban_if_not_banned(MNState& e, uint32_t height)
+    {
+        if (e.nPoSeBanHeight == 0) e.nPoSeBanHeight = height;
+        e.isValid = false;
+    }
+
+    /// Pass 1 for one provider tx of a DEPLOYMENT_V24 block: Dash Core v24
+    /// ApplyTxToList (specialtxman.cpp:346-697) through v24_state.hpp. The
+    /// payee-model extras of the pre-v24 cases (operator-split provenance,
+    /// the measured/unmeasured revive bookkeeping, the unknown-MN counter)
+    /// are kept as they are there.
+    void apply_provider_tx_v24(const MutableTransaction& tx, uint32_t height, ApplyResult& r)
+    {
+        auto log_error = [&](const char* what, const v24::Transition& t) {
+            if (t.error)
+                LOG_WARNING << "[MNS-SM] v24 " << what << " h=" << height << ": " << *t.error
+                            << " (the pre-scan dry run accepted it: same-block interaction)";
+        };
+        switch (tx.type) {
+        case 1: {
+            vendor::CProRegTx p;
+            if (!vendor::parse_protx_payload(tx.extra_payload, p)) return;
+            const uint256 pro = compute_tx_hash(tx);
+            MNState st;
+            st.nType = p.nType;
+            st.nRegisteredHeight = height;
+            st.nLastPaidHeight = 0;
+            st.isValid = true;
+            if (p.collateralOutpoint.hash.IsNull()) {
+                st.collateralOutpoint.hash = pro;
+                st.collateralOutpoint.index = p.collateralOutpoint.index;
+            } else {
+                st.collateralOutpoint = p.collateralOutpoint;
+            }
+            v24::state_from_proreg(st, p, vendor::opkey_to_basic(
+                p.pubKeyOperator, p.nVersion < vendor::ProTxVersion::BASIC_BLS));
+            st.nOperatorReward = p.nOperatorReward;
+            st.payoutSplitProvenance = MNState::SPLIT_KNOWN;
+            if (v24::netinfo_empty(st)) ban_if_not_banned(st, height);
+            auto coll_it = m_collateral_index.find(st.collateralOutpoint);
+            if (coll_it != m_collateral_index.end()) {
+                m_entries.erase(coll_it->second);
+                m_collateral_index.erase(coll_it);
+            }
+            m_collateral_index[st.collateralOutpoint] = pro;
+            m_entries[pro] = std::move(st);
+            ++r.registered;
+            return;
+        }
+        case 2: {
+            vendor::CProUpServTx p;
+            if (!vendor::parse_protx_payload(tx.extra_payload, p)) return;
+            auto it = m_entries.find(p.proTxHash);
+            if (it == m_entries.end()) {
+                ++r.revive_dropped_unknown;
+                LOG_WARNING << "[MNS-SM] ProUpServTx h=" << height << " for proTx "
+                            << p.proTxHash.GetHex().substr(0, 16)
+                            << " DROPPED: no entry in this masternode set (see the pre-v24 case)";
+                return;
+            }
+            auto& e = it->second;
+            const auto t = v24::apply_proupserv(e, p, e.nType, m_netinfo_rules);
+            log_error("ProUpServTx", t);
+            if (!p.scriptOperatorPayout.m_data.empty() && e.nOperatorReward == 0
+                && e.payoutSplitProvenance == MNState::SPLIT_KNOWN)
+                e.payoutSplitProvenance = MNState::SPLIT_UNKNOWN;
+            if (e.nPoSeBanHeight != 0) {
+                if (v24::revive_allowed(e)) {
+                    e.nPoSeBanHeight = 0;
+                    e.nPoSeRevivedHeight = height;
+                    e.isValid = true;
+                    ++r.revived;
+                }
+            } else if (ban_state_measured_for(height)) {
+                ++r.revive_declined_measured;
+            } else {
+                ++r.revive_unmeasured;
+                r.revive_unmeasured_protx.push_back(p.proTxHash);
+                m_unmeasured_revive_at[p.proTxHash] = height;
+            }
+            ++r.updated;
+            return;
+        }
+        case 3: {
+            vendor::CProUpRegTx p;
+            if (!vendor::parse_protx_payload(tx.extra_payload, p)) return;
+            auto it = m_entries.find(p.proTxHash);
+            if (it == m_entries.end()) return;
+            auto& e = it->second;
+            const auto in = vendor::opkey_to_basic(p.pubKeyOperator, p.nVersion < vendor::ProTxVersion::BASIC_BLS);
+            const auto t = v24::apply_proupreg(e, p, e.nType, !stored_opkey_is_point(e, in), in, m_netinfo_rules);
+            log_error("ProUpRegTx", t);
+            if (t.ban) ban_if_not_banned(e, height);
+            ++r.updated;
+            return;
+        }
+        case 4: {
+            vendor::CProUpRevTx p;
+            if (!vendor::parse_protx_payload(tx.extra_payload, p)) return;
+            auto it = m_entries.find(p.proTxHash);
+            if (it == m_entries.end()) return;
+            const auto t = v24::apply_prouprev(it->second, p, it->second.nType, m_netinfo_rules);
+            log_error("ProUpRevTx", t);
+            ban_if_not_banned(it->second, height);
+            ++r.revoked;
+            return;
+        }
+        case tx_type::PROVIDER_DISSOLVE:
+            return;   // no list action: removal is the collateral spend (pass 2)
+        case tx_type::PROVIDER_UPDATE_SHARE: {
+            vendor::CProUpShareTx p;
+            if (!vendor::parse_protx_payload(tx.extra_payload, p)) return;
+            auto it = m_entries.find(p.proTxHash);
+            if (it == m_entries.end()) return;
+            log_error("ProUpShareTx", v24::apply_proupshare(it->second, p));
+            ++r.updated;
+            return;
+        }
+        case tx_type::PROVIDER_UPDATE_SHARED_REGISTRAR: {
+            vendor::CProUpSharedRegTx p;
+            if (!vendor::parse_protx_payload(tx.extra_payload, p)) return;
+            auto it = m_entries.find(p.proTxHash);
+            if (it == m_entries.end()) return;
+            auto& e = it->second;
+            const auto in = vendor::opkey_to_basic(p.pubKeyOperator, false);
+            const auto t = v24::apply_proupsharedreg(e, p, e.nType, !stored_opkey_is_point(e, in), in, m_netinfo_rules);
+            log_error("ProUpSharedRegTx", t);
+            if (t.ban) ban_if_not_banned(e, height);
+            ++r.updated;
+            return;
+        }
+        }
+    }
+
     /// FAIL-CLOSED RULE for provider txs (Dash Core v24; the B4 hotfix of the
     /// v24 design). Before this rule a ProTx payload that failed to parse was
     /// logged and SKIPPED by apply_block, so the payee set silently drifted
@@ -2264,8 +2440,9 @@ private:
     ///     these at DIP3 heights as bad-txns-type; this covers every height).
     /// Before DEPLOYMENT_V24 none of these can occur in a block dashd
     /// accepts, so a valid pre-v24 block folds exactly as before.
-    std::optional<std::string> provider_tx_unfoldable(const MutableTransaction& tx) const
+    std::optional<std::string> provider_tx_unfoldable(const MutableTransaction& tx, uint32_t height) const
     {
+        if (v24_at(height)) return provider_tx_unfoldable_v24(tx);
         if (tx_type_is_v24_provider(tx.type))
             return "unfoldable: v24 provider tx type " + std::to_string(tx.type)
                  + " (shared-masternode transitions are not ported) - fail closed";
@@ -2305,6 +2482,101 @@ private:
         }
         return std::nullopt;
     }
+
+    /// The v24 form of the rule: every provider type folds, so only a
+    /// payload that does not parse (or has an unknown version), a legacy
+    /// registration, or a transition Core would reject refuses. The
+    /// transitions are dry-run on a copy of the pre-block state so the
+    /// refusal still happens before any mutation.
+    std::optional<std::string> provider_tx_unfoldable_v24(const MutableTransaction& tx) const
+    {
+        const bool provider = (tx.type >= 1 && tx.type <= 4) || tx_type_is_v24_provider(tx.type);
+        if (!provider) return std::nullopt;
+        if (!tx_has_extra_payload(tx.version, tx.type) && tx.extra_payload.empty()) return std::nullopt;
+        auto unparsed = [&](const char* what) {
+            return std::optional<std::string>{std::string("unfoldable: ") + what
+                                              + " payload does not parse - fail closed, never skipped"};
+        };
+        // `refuse_unknown`: Core rejects an update naming a masternode the
+        // pre-block list does not hold (bad-protx-hash), so on a mined block
+        // that means OUR set drifted -- refuse (fail closed) instead of
+        // silently skipping. A ProUpServTx keeps the pre-v24 tolerance (the
+        // apply counts it as revive_dropped_unknown).
+        auto dry = [&](const uint256& pro, auto&& run, bool refuse_unknown = true) -> std::optional<std::string> {
+            auto it = m_entries.find(pro);
+            if (it == m_entries.end()) {
+                if (!refuse_unknown) return std::nullopt;
+                const char* name = tx.type == 3 ? "ProUpRegTx" : tx.type == 4 ? "ProUpRevTx"
+                                 : tx.type == tx_type::PROVIDER_UPDATE_SHARE ? "ProUpShareTx"
+                                 : tx.type == tx_type::PROVIDER_UPDATE_SHARED_REGISTRAR ? "ProUpSharedRegTx"
+                                 : "provider tx";
+                return std::string("unfoldable: ") + name + " names masternode "
+                     + pro.GetHex().substr(0, 16)
+                     + " this set does not hold (Core: bad-protx-hash) - fail closed, never skipped";
+            }
+            MNState copy = it->second;
+            const v24::Transition t = run(copy);
+            if (t.error) return "unfoldable: " + *t.error;
+            return std::nullopt;
+        };
+        switch (tx.type) {
+        case 1: {
+            vendor::CProRegTx p;
+            if (!vendor::parse_protx_payload(tx.extra_payload, p)) return unparsed("ProRegTx");
+            if (p.nVersion < vendor::ProTxVersion::BASIC_BLS)
+                return std::string("bad-protx-version-disallowed (legacy ProRegTx after DEPLOYMENT_V24)");
+            return std::nullopt;
+        }
+        case 2: {
+            vendor::CProUpServTx p;
+            if (!vendor::parse_protx_payload(tx.extra_payload, p)) return unparsed("ProUpServTx");
+            return dry(p.proTxHash, [&](MNState& c) { return v24::apply_proupserv(c, p, c.nType, m_netinfo_rules); },
+                       /*refuse_unknown=*/false);
+        }
+        case 3: {
+            vendor::CProUpRegTx p;
+            if (!vendor::parse_protx_payload(tx.extra_payload, p)) return unparsed("ProUpRegTx");
+            return dry(p.proTxHash, [&](MNState& c) {
+                const auto in = vendor::opkey_to_basic(p.pubKeyOperator, p.nVersion < vendor::ProTxVersion::BASIC_BLS);
+                return v24::apply_proupreg(c, p, c.nType, !stored_opkey_is_point(c, in), in, m_netinfo_rules);
+            });
+        }
+        case 4: {
+            vendor::CProUpRevTx p;
+            if (!vendor::parse_protx_payload(tx.extra_payload, p)) return unparsed("ProUpRevTx");
+            return dry(p.proTxHash, [&](MNState& c) { return v24::apply_prouprev(c, p, c.nType, m_netinfo_rules); });
+        }
+        case tx_type::PROVIDER_DISSOLVE: {
+            vendor::CProDisTx p;
+            if (!vendor::parse_protx_payload(tx.extra_payload, p)) return unparsed("ProDisTx");
+            // CheckProDisTxForList: an existing, shared masternode.
+            auto it = m_entries.find(p.proTxHash);
+            if (it == m_entries.end())
+                return "bad-prodis-hash (ProDisTx names masternode "
+                     + p.proTxHash.GetHex().substr(0, 16) + " this set does not hold)";
+            if (it->second.v24.shares.empty())
+                return "bad-prodis-not-shared (ProDisTx names masternode "
+                     + p.proTxHash.GetHex().substr(0, 16) + ")";
+            return std::nullopt;
+        }
+        case tx_type::PROVIDER_UPDATE_SHARE: {
+            vendor::CProUpShareTx p;
+            if (!vendor::parse_protx_payload(tx.extra_payload, p)) return unparsed("ProUpShareTx");
+            return dry(p.proTxHash, [&](MNState& c) { return v24::apply_proupshare(c, p); });
+        }
+        case tx_type::PROVIDER_UPDATE_SHARED_REGISTRAR: {
+            vendor::CProUpSharedRegTx p;
+            if (!vendor::parse_protx_payload(tx.extra_payload, p)) return unparsed("ProUpSharedRegTx");
+            return dry(p.proTxHash, [&](MNState& c) {
+                const auto in = vendor::opkey_to_basic(p.pubKeyOperator, false);
+                return v24::apply_proupsharedreg(c, p, c.nType, !stored_opkey_is_point(c, in), in, m_netinfo_rules);
+            });
+        }
+        }
+        return std::nullopt;
+    }
+
+    bool v24_at(uint32_t height) const { return height >= m_v24_height; }
 
     // Height of the last wholesale ban-state reconcile (sync_validity_from_sml).
     // 0 = the ban state in this set has NEVER been measured against a dated
