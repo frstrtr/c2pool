@@ -145,6 +145,15 @@ public:
     void update_stratum_worker(const std::string& session_id,
                                double hashrate, double dead_hashrate, double difficulty,
                                uint64_t accepted, uint64_t rejected, uint64_t stale) override;
+    /// Refresh the session's TCP round-trip latency (ms). The stratum session
+    /// samples it from the kernel on every accepted submit; without this
+    /// override the base no-op kept the value sampled at authorize, so the
+    /// dashboard's Latency column froze at the connect-time reading.
+    void update_stratum_worker_rtt(const std::string& session_id, double rtt_ms) override;
+
+    /// Thread-safe snapshot of the per-connection worker registry
+    /// (session_id -> WorkerInfo), taken under workers_mutex_. Display only.
+    std::map<std::string, core::stratum::WorkerInfo> get_stratum_workers() const;
 
     // ── IWorkSource: work generation ─────────────────────────────────────
     nlohmann::json                       get_current_work_template() const override;
