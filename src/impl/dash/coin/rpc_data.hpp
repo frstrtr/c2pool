@@ -136,6 +136,15 @@ struct DashWorkData {
     // block reward that miners do NOT receive (masternode+treasury share).
     uint64_t m_payment_amount{0};
 
+    // The superblock (governance treasury) entries of m_packed_payments, in
+    // coinbase order. A copy, kept so an observer can say which treasury payees
+    // this template's coinbase pays without re-deriving them from
+    // m_packed_payments, which interleaves them with the platform burn and the
+    // masternode payee. Empty on every ordinary block and on an unfunded
+    // superblock height. NON-CONSENSUS: nothing that builds or validates the
+    // coinbase reads it; m_packed_payments stays the single source of truth.
+    std::vector<PackedPayment> m_superblock_payments;
+
     // DIP3/DIP4 coinbase extra payload (raw bytes, hex-decoded from GBT).
     // Empty if the daemon did not return one.
     std::vector<uint8_t> m_coinbase_payload;

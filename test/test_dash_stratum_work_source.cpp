@@ -385,6 +385,60 @@ TEST(DashStratumWorkSource, TemplateServesFixtureFieldsWithCorrectEncodings)
     EXPECT_EQ(ws->get_current_gbt_prevhash(), std::string(kPrevHashHex));
 }
 
+// ── /embedded_template superblock field ─────────────────────────────────────
+// The field reports the treasury payees the served coinbase actually pays. It
+// was a hardcoded {active:false, payouts:[]} placeholder, so at mainnet
+// superblock 2558864 the node served all six treasury payees while the field
+// said none.
+
+static std::string fixture_script_payee(unsigned char fill)
+{
+    std::vector<unsigned char> s = {0x76, 0xa9, 0x14};
+    s.insert(s.end(), 20, fill);
+    s.push_back(0x88);
+    s.push_back(0xac);
+    return "!" + HexStr(std::span<const unsigned char>(s.data(), s.size()));
+}
+
+TEST(DashStratumWorkSource, EmbeddedTemplateJsonReportsServedSuperblockPayees)
+{
+    Fixture fx(true);
+    dash::coin::PackedPayment t1, t2;
+    t1.payee = fixture_script_payee(0x33); t1.amount = 6'000'000'000ULL;
+    t2.payee = fixture_script_payee(0x44); t2.amount =   100'000'000ULL;
+    for (const auto& t : {t1, t2}) {
+        fx.fallback_work.m_packed_payments.push_back(t);
+        fx.fallback_work.m_superblock_payments.push_back(t);
+        fx.fallback_work.m_payment_amount += t.amount;
+        fx.fallback_work.m_coinbase_value += t.amount;
+    }
+    auto ws = fx.make();
+    ASSERT_FALSE(ws->get_current_work_template().empty());
+
+    const auto j = ws->embedded_template_json();
+    ASSERT_EQ(j.value("state", ""), "ok");
+    const auto& sb = j.at("superblock");
+    EXPECT_TRUE(sb.at("active").get<bool>());
+    ASSERT_EQ(sb.at("payouts").size(), 2u);
+    EXPECT_EQ(sb["payouts"][0].at("payee").get<std::string>(), t1.payee);
+    EXPECT_EQ(sb["payouts"][0].at("amount_duffs").get<uint64_t>(), t1.amount);
+    EXPECT_EQ(sb["payouts"][1].at("payee").get<std::string>(), t2.payee);
+    EXPECT_EQ(sb["payouts"][1].at("amount_duffs").get<uint64_t>(), t2.amount);
+    EXPECT_EQ(sb.at("total_duffs").get<uint64_t>(), t1.amount + t2.amount);
+}
+
+TEST(DashStratumWorkSource, EmbeddedTemplateJsonOrdinaryBlockReportsNoSuperblock)
+{
+    Fixture fx(true);   // masternode payee only -- it must not read as treasury
+    auto ws = fx.make();
+    ASSERT_FALSE(ws->get_current_work_template().empty());
+
+    const auto sb = ws->embedded_template_json().at("superblock");
+    EXPECT_FALSE(sb.at("active").get<bool>());
+    EXPECT_TRUE(sb.at("payouts").empty());
+    EXPECT_EQ(sb.at("total_duffs").get<uint64_t>(), 0u);
+}
+
 TEST(DashStratumWorkSource, MerkleBranchesFoldToTheBlockMerkleRoot)
 {
     Fixture fx(true);
