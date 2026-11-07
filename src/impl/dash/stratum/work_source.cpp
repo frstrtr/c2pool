@@ -1724,6 +1724,9 @@ void DASHWorkSource::note_arm_decision(coin::ServeGateJournal::Served served,
                 : coin::ServeGateLedger::Arm::Fallback;
         serve_gate_ledger_.bank_serve(ledger_arm, why.cause, d, now_sec);
         last_decline_      = served_embedded ? coin::DeclineReport{} : why;
+        pose_pass_decline_height_.store(
+            (!served_embedded && why.cause == "qc-real-pose-unfolded") ? height : 0,
+            std::memory_order_relaxed);
         last_arm_embedded_ = served_embedded;
         arm_ever_observed_ = true;
         // Cumulative roll-up on its own slow cadence, INDEPENDENT of whether
@@ -1923,6 +1926,7 @@ bool DASHWorkSource::note_ready_idle(uint32_t height) const
     {
         std::lock_guard<std::mutex> lk(serve_gate_mutex_);
         d = serve_gate_journal_.observe_ready_idle(now_sec);
+        pose_pass_decline_height_.store(0, std::memory_order_relaxed);
         if (!d.emit()) return false;
         serve_gate_ledger_.bank_ready_idle(d, now_sec);
         last_decline_ = coin::DeclineReport{};
