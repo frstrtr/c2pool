@@ -19,7 +19,9 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <cstdint>
+#include <optional>
 #include <string>
 
 #include "../coin/tip_reconcile_gate.hpp"
@@ -165,4 +167,114 @@ TEST(TipReconcileGate, NoRepollAfterPendingClears)
                   Action::Skip);
     }
     EXPECT_EQ(sim.getheaders_sent, settled);
+}
+
+// ===========================================================================
+// Unknown-block resync KATs -- the second HeaderChain stall shape (.234 G3b
+// testnet3 rig 2026-10-25): after a < 2000 batch marks sync caught up, bitcoind
+// fell back to block INVs (min-diff storm reorg). Every INV'd block had an
+// unknown header, full_block dropped it, and no getheaders was ever re-sent,
+// so HeaderChain sat ~50k behind for 5 days (47097 dropped blocks).
+// ===========================================================================
+
+namespace {
+
+using Clock = std::chrono::steady_clock;
+
+// Deterministic model: bitcoind advances by INV only; HeaderChain advances
+// ONLY when a getheaders is issued (the environmental fact behind the stall).
+struct InvOnlyStallSim {
+    uint32_t bitcoind_tip    = 5199630;
+    uint32_t local_tip       = 5199630;
+    int      getheaders_sent = 0;
+    int      dropped_blocks  = 0;
+    std::optional<Clock::duration> last_resync;  // sim-time of last resync
+
+    bool header_known(uint32_t h) const { return h <= local_tip; }
+
+    // One INV for a new bitcoind tip at sim-time t. use_gate=false is the
+    // pre-fix behaviour (log + getdata only).
+    void announce(Clock::duration t, bool use_gate) {
+        ++bitcoind_tip;
+        const bool known = header_known(bitcoind_tip);
+        if (use_gate &&
+            TipReconcileGate::on_block_announce(
+                known, /*handshake_complete=*/true, last_resync.has_value(),
+                last_resync ? t - *last_resync : Clock::duration::zero())
+                == Action::Poll) {
+            last_resync = t;
+            ++getheaders_sent;
+            local_tip = bitcoind_tip;  // Core answers up to its active tip
+        }
+        if (!header_known(bitcoind_tip))
+            ++dropped_blocks;          // full_block: header unknown -> drop
+    }
+};
+
+}  // namespace
+
+TEST(TipReconcileGate, UnknownBlockResyncMinGapIsTwoSeconds)
+{
+    EXPECT_EQ(TipReconcileGate::kUnknownBlockResyncMinGap, std::chrono::seconds(2));
+}
+
+TEST(TipReconcileGate, KnownHeaderAnnounceNeverResyncs)
+{
+    // Normal sendheaders flow: header already landed before the INV/block.
+    EXPECT_EQ(TipReconcileGate::on_block_announce(true, true, false, Clock::duration::zero()),
+              Action::Skip);
+    EXPECT_EQ(TipReconcileGate::on_block_announce(true, true, true, std::chrono::hours(1)),
+              Action::Skip);
+}
+
+TEST(TipReconcileGate, UnknownHeaderAnnounceResyncs)
+{
+    EXPECT_EQ(TipReconcileGate::on_block_announce(false, true, false, Clock::duration::zero()),
+              Action::Poll);
+    EXPECT_EQ(TipReconcileGate::on_block_announce(false, true, true, std::chrono::seconds(2)),
+              Action::Poll);
+}
+
+TEST(TipReconcileGate, UnknownHeaderWithoutHandshakeStaysQuiet)
+{
+    EXPECT_EQ(TipReconcileGate::on_block_announce(false, false, false, Clock::duration::zero()),
+              Action::Skip);
+}
+
+TEST(TipReconcileGate, SiblingInvBurstCostsOneGetheaders)
+{
+    // 288 unknown-block INVs inside one throttle window -> exactly 1 resync.
+    int polls = 0;
+    std::optional<Clock::duration> last;
+    for (int i = 0; i < 288; ++i) {
+        const auto t = std::chrono::milliseconds(i);  // all within 288ms
+        if (TipReconcileGate::on_block_announce(
+                false, true, last.has_value(),
+                last ? t - *last : Clock::duration::zero()) == Action::Poll) {
+            ++polls;
+            last = t;
+        }
+    }
+    EXPECT_EQ(polls, 1);
+}
+
+TEST(TipReconcileGate, InvOnlyStallReproducesWithoutResync)
+{
+    // Pre-fix: 1000 INV'd tips at 10s spacing, zero getheaders, zero progress.
+    InvOnlyStallSim sim;
+    for (int i = 0; i < 1000; ++i)
+        sim.announce(std::chrono::seconds(10 * i), /*use_gate=*/false);
+    EXPECT_EQ(sim.getheaders_sent, 0);
+    EXPECT_EQ(sim.local_tip, 5199630u);   // pinned -- the observed stall
+    EXPECT_EQ(sim.dropped_blocks, 1000);
+}
+
+TEST(TipReconcileGate, InvOnlyStallBrokenByResync)
+{
+    InvOnlyStallSim sim;
+    for (int i = 0; i < 1000; ++i)
+        sim.announce(std::chrono::seconds(10 * i), /*use_gate=*/true);
+    EXPECT_EQ(sim.local_tip, sim.bitcoind_tip);  // tracks bitcoind
+    EXPECT_EQ(sim.dropped_blocks, 0);
+    EXPECT_EQ(sim.getheaders_sent, 1000);        // one per new tip, no burst
 }
