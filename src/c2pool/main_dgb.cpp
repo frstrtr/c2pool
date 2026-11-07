@@ -2476,17 +2476,23 @@ int run_node(const core::CoinParams& params, bool testnet,
 
             // Found blocks — is_block_solution flag above, plus persisted share
             // hashes for blocks found before restart.
+            // `blocks`: 16-hex short hashes (display, older dashboards);
+            // `block_hashes`: the full ones the explorer matches H against.
             nlohmann::json blocks_arr = nlohmann::json::array();
+            nlohmann::json block_hashes_arr = nlohmann::json::array();
             if (mi) {
                 for (const auto& fb : mi->get_found_blocks()) {
-                    if (!fb.share_hash.empty())
+                    if (!fb.share_hash.empty()) {
                         blocks_arr.push_back(fb.share_hash.substr(0, 16));
+                        block_hashes_arr.push_back(fb.share_hash);
+                    }
                 }
             }
 
             result["shares"] = std::move(shares_arr);
             result["heads"] = std::move(heads_arr);
             result["blocks"] = std::move(blocks_arr);
+            result["block_hashes"] = std::move(block_hashes_arr);
             result["total"] = static_cast<int>(chain.size());
 
             // Per-share PPLNS + current as fallback.

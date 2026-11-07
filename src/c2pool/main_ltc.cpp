@@ -6277,11 +6277,18 @@ int main(int argc, char* argv[]) {
 
                 // LTC found blocks — use is_block_solution flag (above), but also keep
                 // share hashes from persistence for blocks found before restart
+                // `blocks` keeps the 16-hex short hashes (display, older
+                // dashboards); `block_hashes` the full ones, which the explorer
+                // matches a share's full hash H against (a short hash says
+                // little where share hashes are PoW hashes with leading zeros).
                 nlohmann::json blocks_arr = nlohmann::json::array();
+                nlohmann::json block_hashes_arr = nlohmann::json::array();
                 if (mi) {
                     for (const auto& fb : mi->get_found_blocks()) {
-                        if (!fb.share_hash.empty())
+                        if (!fb.share_hash.empty()) {
                             blocks_arr.push_back(fb.share_hash.substr(0, 16));
+                            block_hashes_arr.push_back(fb.share_hash);
+                        }
                     }
                 }
 
@@ -6304,6 +6311,7 @@ int main(int argc, char* argv[]) {
                 result["shares"] = std::move(shares_arr);
                 result["heads"] = std::move(heads_arr);
                 result["blocks"] = std::move(blocks_arr);
+                result["block_hashes"] = std::move(block_hashes_arr);
                 result["doge_blocks"] = std::move(doge_arr);
                 result["doge_blocks_detail"] = std::move(doge_detail);
                 result["total"] = static_cast<int>(chain.size());
@@ -6457,9 +6465,13 @@ int main(int argc, char* argv[]) {
                     heads_arr.push_back(hh.GetHex().substr(0, 16));
 
                 nlohmann::json blocks_arr = nlohmann::json::array();
+                nlohmann::json block_hashes_arr = nlohmann::json::array();   // full (see the window)
                 if (mi) {
                     for (const auto& fb : mi->get_found_blocks())
-                        if (!fb.share_hash.empty()) blocks_arr.push_back(fb.share_hash.substr(0, 16));
+                        if (!fb.share_hash.empty()) {
+                            blocks_arr.push_back(fb.share_hash.substr(0, 16));
+                            block_hashes_arr.push_back(fb.share_hash);
+                        }
                 }
                 nlohmann::json doge_arr = nlohmann::json::array();
                 nlohmann::json doge_detail = nlohmann::json::array();
@@ -6476,6 +6488,7 @@ int main(int argc, char* argv[]) {
                 result["tip"] = best.IsNull() ? "" : best.GetHex().substr(0, 16);
                 result["heads"] = std::move(heads_arr);
                 result["blocks"] = std::move(blocks_arr);
+                result["block_hashes"] = std::move(block_hashes_arr);
                 result["doge_blocks"] = std::move(doge_arr);
                 result["doge_blocks_detail"] = std::move(doge_detail);
 

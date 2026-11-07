@@ -2375,8 +2375,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                         ctx.fee_hash160 = mi->get_node_fee_hash160();
                         for (const auto& fb : mi->get_found_blocks())
                             if (!fb.share_hash.empty())
-                                ctx.found_block_short_hashes.push_back(
-                                    fb.share_hash.substr(0, 16));
+                                ctx.found_block_hashes.push_back(fb.share_hash);
                     }
                     return ctx;
                 };

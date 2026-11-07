@@ -203,6 +203,7 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
         packet_test.cpp
         payout_manager_rules_test.cpp
         random_choice_guard_test.cpp
+        reloaded_block_flag_test.cpp
         socket_write_queue_test.cpp
         socket_read_empty_prefix_test.cpp
         template_refresh_on_tx_test.cpp
