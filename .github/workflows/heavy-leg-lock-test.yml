@@ -1,6 +1,6 @@
 # Honesty gate for the per-host heavy-leg reap-guard used by build.yml and
-# codeql-analysis.yml. Runs the ACTUAL acquire script (extracted from build.yml)
-# against a planted orphan and asserts: with the sweep it recovers (green),
+# codeql-analysis.yml. Runs the ACTUAL acquire script (the composite action's
+# acquire.sh, which every heavy-leg lock now calls) against a planted orphan and asserts: with the sweep it recovers (green),
 # without the sweep the orphan blocks (red). Pure shell on a gh-hosted runner --
 # no self-hosted host, no build. See .github/actions/heavy-leg-lock/test.sh.
 name: heavy-leg-lock-test
