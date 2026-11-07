@@ -1,0 +1,601 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+#pragma once
+
+/// Dash Core's full provider-tx checks, for template selection.
+///
+/// Before a provider tx (types 1-4) rides a template we build, it must pass
+/// what Dash Core v24 runs on it in TestPackageTransactions / ConnectBlock:
+///
+///   CheckProRegTx, CheckProUpServTx, CheckProUpRegTx, CheckProUpRevTx
+///   (src/evo/specialtxman.cpp), with GetValidatedPayload, every
+///   IsTriviallyValid, IsPayoutListTriviallyValid, IsPayoutListKeySafe,
+///   CheckProviderNetworkFields / MnNetInfo::ValidateService
+///   (src/evo/providertx.cpp, src/evo/netinfo.cpp), CheckInputsHash
+///   (src/evo/providertx.h), and the three signature checks: the collateral
+///   key's message signature over MakeSignString (ProRegTx with an external
+///   collateral), the owner key's hash signature (ProUpRegTx), and the
+///   operator's BLS signature (ProUpServTx / ProUpRevTx; that one stays in
+///   the template fold, sml_special_fold.hpp, which already verifies it).
+///
+/// The duplicate-key / duplicate-address / platformNodeID uniqueness rules and
+/// the "update names a listed masternode" rules also stay in the template
+/// fold, which sees the in-body changes as well as the pre-block list.
+///
+/// Scope of this port: payload versions 1 (LegacyBLS) and 2 (BasicBLS), the
+/// only ones the vendored codec reads (vendor/providertx.hpp). A version-3
+/// payload, and the v24 provider types 10-12, never reach a template: the fold
+/// refuses ExtAddr and the selection mask admits types 1-4 only. With the S2
+/// codecs (v24_rules.hpp provider_payload_refusal) the payload-only part of
+/// this file is the v1/v2 subset of that one.
+///
+/// FAIL CLOSED. A check that cannot be decided refuses the tx: an external
+/// collateral the UTXO view cannot prove, a missing signature verifier, a
+/// BLS build without the backend (operator keys cannot be validated), a
+/// network address whose emptiness Core and the fold would judge differently.
+/// The caller excludes the tx; nothing else changes.
+
+#include <impl/dash/coin/dash_deployments.hpp>      // DashNetwork
+#include <impl/dash/coin/mn_state_machine.hpp>
+#include <impl/dash/coin/transaction.hpp>
+#include <impl/dash/coin/vendor/bls_verify.hpp>     // opkey_valid_canonical, opkey_to_basic
+#include <impl/dash/coin/vendor/providertx.hpp>
+
+#include <core/address_utils.hpp>                   // script_to_address (EncodeDestination)
+#include <core/hash.hpp>
+#include <core/pack.hpp>
+#include <core/uint256.hpp>
+
+#include <array>
+#include <cstdint>
+#include <functional>
+#include <optional>
+#include <string>
+#include <vector>
+
+namespace dash {
+namespace coin {
+
+/// SpecialTxRules for the block being built, plus the chain parameters the
+/// network-field rules read.
+struct ProTxCheckRules
+{
+    DashNetwork net{DashNetwork::MAINNET};
+    bool v19_active{true};
+    bool v24_active{false};
+
+    bool mainnet() const { return net == DashNetwork::MAINNET; }
+    /// DEPLOYMENT_IPV4_OPTIONAL: height 0 on testnet and devnet, never on
+    /// mainnet; regtest only through -testactivationheight.
+    bool ipv4_optional() const { return net == DashNetwork::TESTNET || net == DashNetwork::DEVNET; }
+    /// CChainParams::RequireRoutableExternalIP: all but regtest.
+    bool require_routable() const { return net != DashNetwork::REGTEST; }
+    uint8_t pkh_version() const
+    {
+        return (net == DashNetwork::MAINNET) ? 76 : 140;
+    }
+    uint8_t p2sh_version() const
+    {
+        return (net == DashNetwork::MAINNET) ? 16 : 19;
+    }
+};
+
+/// What the chain UTXO set (at the tip) proves about a coin.
+enum class ProTxCoinProof : uint8_t { Unknown, Unspent, Absent };
+using ProTxCoinFn = std::function<ProTxCoinProof(const bitcoin_family::coin::TxPrevOut&,
+                                                 int64_t& value, std::vector<uint8_t>& script)>;
+
+/// CHashSigner::VerifyHash: recover the signer of a 65-byte compact ECDSA
+/// signature over `hash` and compare its key ID.
+using ProTxEcdsaVerifyFn = std::function<bool(const uint256& hash, const std::vector<uint8_t>& sig,
+                                              const uint160& key_id)>;
+
+/// What the node wires once (main_dash): the network and the ECDSA verifier.
+/// Unset ecdsa => txs that need it (an external-collateral ProRegTx, every
+/// ProUpRegTx) are refused.
+struct ProTxCheckEnv
+{
+    DashNetwork        net{DashNetwork::MAINNET};
+    ProTxEcdsaVerifyFn ecdsa;
+    /// Replaces protx_core_refusal entirely. Only for unit tests of the
+    /// fold's own rules (ordering, replacement) with synthetic provider txs;
+    /// c2pool-dash never sets it.
+    std::function<std::optional<std::string>(const MutableTransaction&)> check_override;
+};
+
+/// DEPLOYMENT_V19 buried heights (chainparams.cpp).
+inline bool protx_v19_active_at(DashNetwork net, uint32_t height)
+{
+    switch (net) {
+    case DashNetwork::MAINNET: return height >= 1'899'072;
+    case DashNetwork::TESTNET: return height >= 850'100;
+    case DashNetwork::DEVNET:  return height >= 2;
+    case DashNetwork::REGTEST: return height >= 1;
+    }
+    return false;
+}
+
+inline ProTxCheckRules protx_rules_for(const ProTxCheckEnv& env, uint32_t height, bool v24_active)
+{
+    ProTxCheckRules r;
+    r.net = env.net;
+    r.v19_active = protx_v19_active_at(env.net, height);
+    r.v24_active = v24_active;
+    return r;
+}
+
+namespace protx_check_detail {
+
+inline constexpr int64_t kCollateralRegular = 1000LL * 100'000'000LL;
+inline constexpr int64_t kCollateralEvo     = 4000LL * 100'000'000LL;
+inline constexpr uint16_t kMainnetPort      = 9999;
+inline constexpr uint16_t kMainnetPlatformP2PPort  = 26656;
+inline constexpr uint16_t kMainnetPlatformHTTPPort = 443;
+
+using Refusal = std::optional<std::string>;
+inline Refusal no(std::string why) { return Refusal{std::move(why)}; }
+
+// ── scripts and destinations ────────────────────────────────────────────────
+
+inline bool is_p2pkh(const std::vector<uint8_t>& s)
+{
+    return s.size() == 25 && s[0] == 0x76 && s[1] == 0xa9 && s[2] == 0x14 && s[23] == 0x88 && s[24] == 0xac;
+}
+inline bool is_p2sh(const std::vector<uint8_t>& s)
+{
+    return s.size() == 23 && s[0] == 0xa9 && s[1] == 0x14 && s[22] == 0x87;
+}
+
+/// CTxDestination for the script forms ExtractDestination answers and the
+/// ProTx rules compare (PKHash / ScriptHash). P2PK yields PKHash of the key.
+struct Dest
+{
+    enum Kind : uint8_t { PKH, SH } kind{PKH};
+    uint160 hash;
+    bool operator==(const Dest& o) const { return kind == o.kind && hash == o.hash; }
+};
+
+inline uint160 hash160(const uint8_t* p, size_t n)
+{
+    uint160 h;
+    CHash160().Write(std::span<const unsigned char>(p, n)).Finalize(std::span<unsigned char>(h.data(), 20));
+    return h;
+}
+
+inline std::optional<Dest> extract_dest(const std::vector<uint8_t>& s)
+{
+    Dest d;
+    if (is_p2pkh(s)) {
+        d.kind = Dest::PKH;
+        std::copy(s.begin() + 3, s.begin() + 23, d.hash.data());
+        return d;
+    }
+    if (is_p2sh(s)) {
+        d.kind = Dest::SH;
+        std::copy(s.begin() + 2, s.begin() + 22, d.hash.data());
+        return d;
+    }
+    // P2PK: <33-byte compressed or 65-byte uncompressed key> OP_CHECKSIG.
+    if (s.size() == 35 && s[0] == 33 && (s[1] == 0x02 || s[1] == 0x03) && s[34] == 0xac) {
+        d.kind = Dest::PKH;
+        d.hash = hash160(s.data() + 1, 33);
+        return d;
+    }
+    if (s.size() == 67 && s[0] == 65 && s[1] == 0x04 && s[66] == 0xac) {
+        d.kind = Dest::PKH;
+        d.hash = hash160(s.data() + 1, 65);
+        return d;
+    }
+    return std::nullopt;
+}
+
+inline Dest pkh(const uint160& k) { return Dest{Dest::PKH, k}; }
+
+/// EncodeDestination for MakeSignString.
+inline std::string encode_pkh(const uint160& k, uint8_t ver)
+{
+    std::vector<uint8_t> s = {0x76, 0xa9, 0x14};
+    s.insert(s.end(), k.data(), k.data() + 20);
+    s.push_back(0x88);
+    s.push_back(0xac);
+    return core::script_to_address(s, "", ver, 0);
+}
+
+// ── hashes ──────────────────────────────────────────────────────────────────
+
+inline uint256 sha256d(const uint8_t* p, size_t n)
+{
+    uint256 h;
+    CHash256().Write(std::span<const unsigned char>(p, n)).Finalize(std::span<unsigned char>(h.data(), 32));
+    return h;
+}
+
+/// CalcTxInputsHash: SHA256d over every input's prevout (hash, n LE).
+template <typename Tx>
+inline uint256 inputs_hash(const Tx& tx)
+{
+    std::vector<uint8_t> buf;
+    buf.reserve(tx.vin.size() * 36);
+    for (const auto& in : tx.vin) {
+        buf.insert(buf.end(), in.prevout.hash.data(), in.prevout.hash.data() + 32);
+        const uint32_t n = in.prevout.index;
+        for (int i = 0; i < 4; ++i) buf.push_back(static_cast<uint8_t>(n >> (8 * i)));
+    }
+    return sha256d(buf.data(), buf.size());
+}
+
+inline size_t compact_size_len(size_t n)
+{
+    return n < 253 ? 1 : n <= 0xffff ? 3 : n <= 0xffffffffu ? 5 : 9;
+}
+
+/// ::SerializeHash(proTx) for a payload whose LAST field is the vchSig byte
+/// vector (ProRegTx, ProUpRegTx): SER_GETHASH drops that field.
+inline std::optional<uint256> hash_without_trailing_vchsig(const std::vector<uint8_t>& payload,
+                                                           size_t sig_len)
+{
+    const size_t tail = compact_size_len(sig_len) + sig_len;
+    if (payload.size() < tail) return std::nullopt;
+    return sha256d(payload.data(), payload.size() - tail);
+}
+
+inline void write_varstr(std::vector<uint8_t>& out, const std::string& s)
+{
+    const size_t n = s.size();
+    if (n < 253) {
+        out.push_back(static_cast<uint8_t>(n));
+    } else if (n <= 0xffff) {
+        out.push_back(253);
+        out.push_back(static_cast<uint8_t>(n & 0xff));
+        out.push_back(static_cast<uint8_t>(n >> 8));
+    } else {
+        out.push_back(254);
+        for (int i = 0; i < 4; ++i) out.push_back(static_cast<uint8_t>(n >> (8 * i)));
+    }
+    out.insert(out.end(), s.begin(), s.end());
+}
+
+/// util/message.cpp MessageHash: SHA256d(varstr(MESSAGE_MAGIC) || varstr(msg)).
+inline uint256 message_hash(const std::string& msg)
+{
+    std::vector<uint8_t> buf;
+    write_varstr(buf, "DarkCoin Signed Message:\n");
+    write_varstr(buf, msg);
+    return sha256d(buf.data(), buf.size());
+}
+
+// ── network fields (MnNetInfo, the 18-byte legacy CService) ─────────────────
+
+/// How Core reads a legacy service. Core's MnNetInfo::Unserialize keeps the
+/// CService only when CNetAddr::IsValid, so a non-zero but invalid address is
+/// an empty netInfo. The folds read it the same way since #2147
+/// (LegacyNetService::IsEmpty). Selection still leaves such a provider tx out
+/// (Ambiguous): stricter than Core, never an invalid block.
+enum class ServiceKind : uint8_t { Empty, IPv4, Ambiguous };
+
+struct Ipv4 { uint8_t a, b, c, d; };
+
+inline ServiceKind classify_service(const vendor::LegacyNetService& n, Ipv4& out)
+{
+    bool all_zero = n.port_be == 0;
+    for (uint8_t x : n.ip) if (x != 0) { all_zero = false; break; }
+    if (all_zero) return ServiceKind::Empty;
+    for (int i = 0; i < 10; ++i)
+        if (n.ip[i] != 0) return ServiceKind::Ambiguous;   // not IPv4-mapped
+    if (n.ip[10] != 0xff || n.ip[11] != 0xff) return ServiceKind::Ambiguous;
+    out = Ipv4{n.ip[12], n.ip[13], n.ip[14], n.ip[15]};
+    const bool any  = out.a == 0 && out.b == 0 && out.c == 0 && out.d == 0;
+    const bool none = out.a == 255 && out.b == 255 && out.c == 255 && out.d == 255;
+    if (any || none) return ServiceKind::Ambiguous;          // !IsValid: empty for Core only
+    return ServiceKind::IPv4;
+}
+
+/// CNetAddr::IsRoutable for an IPv4 address (IsValid already holds).
+inline bool ipv4_routable(const Ipv4& ip)
+{
+    if (ip.a == 10) return false;                                          // RFC1918
+    if (ip.a == 192 && ip.b == 168) return false;                          // RFC1918
+    if (ip.a == 172 && ip.b >= 16 && ip.b <= 31) return false;             // RFC1918
+    if (ip.a == 198 && (ip.b == 18 || ip.b == 19)) return false;           // RFC2544
+    if (ip.a == 169 && ip.b == 254) return false;                          // RFC3927
+    if (ip.a == 100 && (ip.b & 0xc0) == 64) return false;                  // RFC6598
+    if (ip.a == 192 && ip.b == 0 && ip.c == 2) return false;               // RFC5737
+    if (ip.a == 198 && ip.b == 51 && ip.c == 100) return false;            // RFC5737
+    if (ip.a == 203 && ip.b == 0 && ip.c == 113) return false;             // RFC5737
+    if (ip.a == 127 || ip.a == 0) return false;                            // IsLocal
+    return true;
+}
+
+/// CheckProviderNetworkFields for a version 1/2 payload (MnNetInfo).
+inline Refusal network_fields_refusal(const vendor::LegacyNetService& net, uint8_t nType,
+                                      const uint160& platform_node_id, uint16_t platform_p2p_port,
+                                      uint16_t platform_http_port, bool allow_empty,
+                                      const ProTxCheckRules& rules)
+{
+    Ipv4 ip{};
+    const ServiceKind kind = classify_service(net, ip);
+    if (kind == ServiceKind::Ambiguous)
+        return no("bad-protx-netinfo-addr (invalid address the fold and Core would read differently)");
+    if (kind == ServiceKind::Empty) {
+        if (!allow_empty) return no("bad-protx-netinfo-empty");
+    } else {
+        // MnNetInfo::ValidateService: IsValid and IsIPv4 hold here.
+        if (rules.require_routable() && !ipv4_routable(ip)) return no("bad-protx-netinfo-addr-unroutable");
+        if (rules.mainnet() != (net.port_be == kMainnetPort)) return no("bad-protx-netinfo-port");
+        // CheckIPv4Primaries: the primary is IPv4.
+    }
+    if (nType != vendor::MnType::EVO) return std::nullopt;
+    if (platform_node_id.IsNull()) return no("bad-protx-platform-nodeid");
+    if (rules.mainnet()) {
+        if (platform_p2p_port != kMainnetPlatformP2PPort) return no("bad-protx-platform-p2p-port");
+        if (platform_http_port != kMainnetPlatformHTTPPort) return no("bad-protx-platform-http-port");
+    }
+    if (platform_p2p_port == kMainnetPort) return no("bad-protx-platform-p2p-port");
+    if (platform_http_port == kMainnetPort) return no("bad-protx-platform-http-port");
+    const uint16_t core_port = kind == ServiceKind::Empty ? 0 : net.port_be;
+    if (platform_p2p_port == platform_http_port || platform_p2p_port == core_port
+        || platform_http_port == core_port)
+        return no("bad-protx-platform-dup-ports");
+    return std::nullopt;
+}
+
+/// IsPayoutListTriviallyValid for a v1/v2 payload's [scriptPayout, 10000].
+inline Refusal payout_refusal(const std::vector<uint8_t>& script, const uint160& owner,
+                              const uint160& voting)
+{
+    if (!is_p2pkh(script) && !is_p2sh(script)) return no("bad-protx-payee");
+    const auto dest = extract_dest(script);
+    if (!dest) return no("bad-protx-payee-dest");
+    if ((!owner.IsNull() && *dest == pkh(owner)) || *dest == pkh(voting))
+        return no("bad-protx-payee-reuse");
+    return std::nullopt;
+}
+
+/// ProTxVersion::GetMax.
+inline uint16_t max_version(const ProTxCheckRules& r)
+{
+    if (!r.v19_active) return vendor::ProTxVersion::LEGACY_BLS;
+    return r.v24_active ? vendor::ProTxVersion::EXT_ADDR : vendor::ProTxVersion::BASIC_BLS;
+}
+
+/// The codec this check is defined over reads versions 1 and 2 only.
+inline Refusal codec_version_refusal(uint16_t v)
+{
+    if (v == 0 || v > vendor::ProTxVersion::EXT_ADDR) return no("bad-protx-version");
+    if (v >= vendor::ProTxVersion::EXT_ADDR)
+        return no("bad-protx-version (ExtAddr payload: not checkable by this codec, excluded)");
+    return std::nullopt;
+}
+
+/// IsVersionChangeValid (v24 only).
+inline Refusal version_change_refusal(uint16_t state_version, uint16_t tx_version, const ProTxCheckRules& r)
+{
+    if (!r.v24_active) return std::nullopt;
+    if (state_version >= vendor::ProTxVersion::BASIC_BLS && tx_version == vendor::ProTxVersion::LEGACY_BLS)
+        return no("bad-protx-version-downgrade");
+    return std::nullopt;
+}
+
+/// CDeterministicMNList::HasOperatorKeyUnderAnyScheme: the store keeps every
+/// operator key canonically in the basic scheme, so one point is one byte
+/// string here.
+inline bool operator_key_held_by_other(const MnStateMachine& pre,
+                                       const std::array<uint8_t, vendor::BLS_PUBKEY_SIZE>& basic,
+                                       const uint256& self)
+{
+    for (const auto& [pro, st] : pre.entries())
+        if (pro != self && st.pubKeyOperator == basic) return true;
+    return false;
+}
+
+template <typename T>
+inline bool parse(const std::vector<uint8_t>& payload, T& out)
+{
+    return vendor::parse_protx_payload(payload, out);
+}
+
+inline const MNState* find_mn(const MnStateMachine& pre, const uint256& pro)
+{
+    auto it = pre.entries().find(pro);
+    return it == pre.entries().end() ? nullptr : &it->second;
+}
+
+} // namespace protx_check_detail
+
+/// The first reason Dash Core v24 refuses this provider tx for a block built
+/// on `pre` (the masternode list at the tip), or nullopt when every rule this
+/// file ports passes. Non-provider txs pass (nullopt).
+template <typename Tx>
+inline std::optional<std::string>
+protx_core_refusal(const Tx& tx_in, const MnStateMachine& pre, const ProTxCheckRules& rules,
+                   const ProTxCoinFn& coin, const ProTxEcdsaVerifyFn& ecdsa)
+{
+    using namespace protx_check_detail;
+    namespace pv = vendor::ProTxVersion;
+    const MutableTransaction tx(tx_in);
+    if (tx.type < 1 || tx.type > 4) return std::nullopt;
+
+    switch (tx.type) {
+    case vendor::CProRegTx::SPECIALTX_TYPE: {
+        vendor::CProRegTx p;
+        if (!parse(tx.extra_payload, p)) return no("bad-protx-payload");
+        if (auto r = codec_version_refusal(p.nVersion)) return r;
+        if (p.nVersion > max_version(rules)) return no("bad-protx-version");
+        // CProRegTx::IsTriviallyValid
+        if (p.nVersion < pv::BASIC_BLS && p.nType == vendor::MnType::EVO) return no("bad-protx-evo-version");
+        if (p.nType != vendor::MnType::REGULAR && p.nType != vendor::MnType::EVO) return no("bad-protx-type");
+        if (p.nMode != 0) return no("bad-protx-mode");
+        if (p.keyIDOwner.IsNull()) return no("bad-protx-key-null");
+        if (!vendor::opkey_valid_canonical(p.pubKeyOperator, p.nVersion == pv::LEGACY_BLS)
+            || p.keyIDVoting.IsNull())
+            return no("bad-protx-key-null");
+        if (auto r = payout_refusal(p.scriptPayout.m_data, p.keyIDOwner, p.keyIDVoting)) return r;
+        if (p.nOperatorReward > 10000) return no("bad-protx-operator-reward");
+        // CheckProRegTx
+        if (rules.v24_active && p.nVersion < pv::BASIC_BLS) return no("bad-protx-version-disallowed");
+        if (auto r = network_fields_refusal(p.netInfo, p.nType, p.platformNodeID, p.platformP2PPort,
+                                            p.platformHTTPPort, /*allow_empty=*/true, rules))
+            return r;
+        const int64_t want = p.nType == vendor::MnType::EVO ? kCollateralEvo : kCollateralRegular;
+        std::optional<Dest> collateral_dest;
+        bool external = !p.collateralOutpoint.hash.IsNull();
+        if (external) {
+            if (!coin) return no("bad-protx-collateral (no UTXO view to prove the coin)");
+            int64_t value = 0;
+            std::vector<uint8_t> script;
+            const auto proof = coin(p.collateralOutpoint, value, script);
+            if (proof == ProTxCoinProof::Unknown)
+                return no("bad-protx-collateral (the UTXO view cannot prove the coin)");
+            if (proof == ProTxCoinProof::Absent || value != want) return no("bad-protx-collateral");
+            collateral_dest = extract_dest(script);
+            if (!collateral_dest) return no("bad-protx-collateral-dest");
+            if (collateral_dest->kind != Dest::PKH) return no("bad-protx-collateral-pkh");
+        } else {
+            if (p.collateralOutpoint.index >= tx.vout.size()) return no("bad-protx-collateral-index");
+            const auto& out = tx.vout[p.collateralOutpoint.index];
+            if (out.value != want) return no("bad-protx-collateral");
+            collateral_dest = extract_dest(out.scriptPubKey.m_data);
+            if (!collateral_dest) return no("bad-protx-collateral-dest");
+        }
+        // IsPayoutListKeySafe (payout reuse of the collateral is v3 only).
+        if (*collateral_dest == pkh(p.keyIDOwner) || *collateral_dest == pkh(p.keyIDVoting))
+            return no("bad-protx-collateral-reuse");
+        if (rules.v24_active
+            && operator_key_held_by_other(pre, vendor::opkey_to_basic(p.pubKeyOperator,
+                                                                      p.nVersion == pv::LEGACY_BLS),
+                                          uint256{}))
+            return no("bad-protx-dup-key (operator key under another scheme)");
+        if (inputs_hash(tx) != p.inputsHash) return no("bad-protx-inputs-hash");
+        if (external) {
+            if (!ecdsa) return no("bad-protx-sig (no ECDSA verifier wired)");
+            const auto h = hash_without_trailing_vchsig(tx.extra_payload, p.vchSig.size());
+            if (!h) return no("bad-protx-sig");
+            const std::string sign_string =
+                core::script_to_address(p.scriptPayout.m_data, "", rules.pkh_version(), rules.p2sh_version())
+                + "|" + std::to_string(p.nOperatorReward)
+                + "|" + encode_pkh(p.keyIDOwner, rules.pkh_version())
+                + "|" + encode_pkh(p.keyIDVoting, rules.pkh_version())
+                + "|" + h->GetHex();
+            if (!ecdsa(message_hash(sign_string), p.vchSig, collateral_dest->hash))
+                return no("bad-protx-sig");
+        } else if (!p.vchSig.empty()) {
+            return no("bad-protx-sig");
+        }
+        return std::nullopt;
+    }
+
+    case vendor::CProUpServTx::SPECIALTX_TYPE: {
+        vendor::CProUpServTx p;
+        if (!parse(tx.extra_payload, p)) return no("bad-protx-payload");
+        if (!vendor::blssig_parses_canonical(p.sig, p.nVersion == pv::LEGACY_BLS))
+            return no("bad-protx-payload (malleable BLS signature)");
+        if (auto r = codec_version_refusal(p.nVersion)) return r;
+        if (p.nVersion > max_version(rules)) return no("bad-protx-version");
+        // CProUpServTx::IsTriviallyValid
+        if (p.nVersion < pv::BASIC_BLS && p.nType == vendor::MnType::EVO) return no("bad-protx-evo-version");
+        if (p.nType != vendor::MnType::REGULAR && p.nType != vendor::MnType::EVO) return no("bad-protx-type");
+        {
+            Ipv4 ip{};
+            if (classify_service(p.netInfo, ip) == ServiceKind::Empty) return no("bad-protx-netinfo-empty");
+        }
+        // CheckProUpServTx
+        if (auto r = network_fields_refusal(p.netInfo, p.nType, p.platformNodeID, p.platformP2PPort,
+                                            p.platformHTTPPort, /*allow_empty=*/false, rules))
+            return r;
+        const MNState* mn = find_mn(pre, p.proTxHash);
+        if (!mn) return no("bad-protx-hash");
+        if (p.nType != mn->nType) return no("bad-protx-type-mismatch");
+        if (mn->nVersion >= pv::EXT_ADDR)
+            return no("bad-protx-version (ExtAddr state: not checkable by this codec, excluded)");
+        if (auto r = version_change_refusal(mn->nVersion, p.nVersion, rules)) return r;
+        if (rules.v24_active && p.nType == vendor::MnType::EVO && p.nVersion < pv::EXT_ADDR)
+            return no("bad-protx-version-disallowed");
+        // v24: a legacy -> basic migration re-keys the stored operator key.
+        if (rules.v24_active && mn->nVersion == pv::LEGACY_BLS && p.nVersion >= pv::BASIC_BLS
+            && operator_key_held_by_other(pre, mn->pubKeyOperator, p.proTxHash))
+            return no("bad-protx-dup-key");
+        if (!p.scriptOperatorPayout.m_data.empty()) {
+            if (mn->nOperatorReward == 0) return no("bad-protx-operator-payee");
+            if (!is_p2pkh(p.scriptOperatorPayout.m_data) && !is_p2sh(p.scriptOperatorPayout.m_data))
+                return no("bad-protx-operator-payee");
+        }
+        if (inputs_hash(tx) != p.inputsHash) return no("bad-protx-inputs-hash");
+        return std::nullopt;   // the BLS operator signature: the template fold
+    }
+
+    case vendor::CProUpRegTx::SPECIALTX_TYPE: {
+        vendor::CProUpRegTx p;
+        if (!parse(tx.extra_payload, p)) return no("bad-protx-payload");
+        if (auto r = codec_version_refusal(p.nVersion)) return r;
+        if (p.nVersion > max_version(rules)) return no("bad-protx-version");
+        // CProUpRegTx::IsTriviallyValid
+        if (p.nMode != 0) return no("bad-protx-mode");
+        if (!vendor::opkey_valid_canonical(p.pubKeyOperator, p.nVersion == pv::LEGACY_BLS)
+            || p.keyIDVoting.IsNull())
+            return no("bad-protx-key-null");
+        if (auto r = payout_refusal(p.scriptPayout.m_data, uint160{}, p.keyIDVoting)) return r;
+        // CheckProUpRegTx
+        const MNState* mn = find_mn(pre, p.proTxHash);
+        if (!mn) return no("bad-protx-hash");
+        if (mn->nVersion >= pv::EXT_ADDR)
+            return no("bad-protx-version (ExtAddr state: not checkable by this codec, excluded)");
+        if (auto r = version_change_refusal(mn->nVersion, p.nVersion, rules)) return r;
+        if (rules.v24_active) {
+            const auto new_basic = vendor::opkey_to_basic(p.pubKeyOperator, p.nVersion == pv::LEGACY_BLS);
+            const bool key_changed = new_basic != mn->pubKeyOperator;
+            const bool migrating = mn->nVersion == pv::LEGACY_BLS && p.nVersion >= pv::BASIC_BLS;
+            if ((key_changed || migrating) && operator_key_held_by_other(pre, new_basic, p.proTxHash))
+                return no("bad-protx-dup-key");
+            // Dash Core v24 CheckProUpRegTx: without a key change the stored
+            // addresses are carried into max(state, tx) version
+            // (SetStateVersion -> AddNetInfoEntries -> ValidateService). A
+            // legacy -> basic migration re-validates the STORED core service
+            // and refuses the tx if it no longer validates (an empty service
+            // has no entry to add). Only a version-1 state migrates here: a
+            // version-3 state is refused above.
+            if (!key_changed && migrating) {
+                if (auto r = network_fields_refusal(mn->netInfo, vendor::MnType::REGULAR, uint160{}, 0, 0,
+                                                    /*allow_empty=*/true, rules))
+                    return r;
+            }
+        }
+        if (auto r = payout_refusal(p.scriptPayout.m_data, mn->keyIDOwner, p.keyIDVoting)) return r;
+        if (!coin) return no("bad-protx-collateral (no UTXO view to prove the coin)");
+        int64_t value = 0;
+        std::vector<uint8_t> script;
+        const auto proof = coin(mn->collateralOutpoint, value, script);
+        if (proof == ProTxCoinProof::Unknown)
+            return no("bad-protx-collateral (the UTXO view cannot prove the coin)");
+        if (proof == ProTxCoinProof::Absent) return no("bad-protx-collateral");
+        const auto collateral_dest = extract_dest(script);
+        if (!collateral_dest) return no("bad-protx-collateral-dest");
+        if (*collateral_dest == pkh(mn->keyIDOwner) || *collateral_dest == pkh(p.keyIDVoting))
+            return no("bad-protx-collateral-reuse");
+        if (inputs_hash(tx) != p.inputsHash) return no("bad-protx-inputs-hash");
+        if (!ecdsa) return no("bad-protx-sig (no ECDSA verifier wired)");
+        const auto h = hash_without_trailing_vchsig(tx.extra_payload, p.vchSig.size());
+        if (!h || !ecdsa(*h, p.vchSig, mn->keyIDOwner)) return no("bad-protx-sig");
+        return std::nullopt;
+    }
+
+    case vendor::CProUpRevTx::SPECIALTX_TYPE: {
+        vendor::CProUpRevTx p;
+        if (!parse(tx.extra_payload, p)) return no("bad-protx-payload");
+        if (!vendor::blssig_parses_canonical(p.sig, p.nVersion == pv::LEGACY_BLS))
+            return no("bad-protx-payload (malleable BLS signature)");
+        if (auto r = codec_version_refusal(p.nVersion)) return r;
+        if (p.nVersion > max_version(rules)) return no("bad-protx-version");
+        if (p.nReason > vendor::CProUpRevTx::REASON_CHANGE_OF_KEYS) return no("bad-protx-reason");
+        const MNState* mn = find_mn(pre, p.proTxHash);
+        if (!mn) return no("bad-protx-hash");
+        if (mn->nVersion >= pv::EXT_ADDR)
+            return no("bad-protx-version (ExtAddr state: not checkable by this codec, excluded)");
+        if (auto r = version_change_refusal(mn->nVersion, p.nVersion, rules)) return r;
+        if (inputs_hash(tx) != p.inputsHash) return no("bad-protx-inputs-hash");
+        return std::nullopt;   // the BLS operator signature: the template fold
+    }
+    }
+    return std::nullopt;
+}
+
+} // namespace coin
+} // namespace dash

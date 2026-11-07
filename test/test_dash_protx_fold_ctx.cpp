@@ -473,8 +473,14 @@ TEST(DashSupersetSpecialTx, ExternalCollateralSpentByARecentBlockIsRefused)
     auto reg = proreg(1);
     auto regtx = special(1, reg, 0x01);
     const auto verifier = accept_all();
+    // S6: without a ProTxCheckEnv the serving context checks nothing, so no
+    // provider tx rides. This KAT is about the fold's own collateral proof, so
+    // it stands in an env whose Core check accepts everything.
+    EXPECT_EQ(fold(w, {regtx}, dash::coin::make_template_fold_context(w.sm, mp, &verifier)).applied, 0u);
+    dash::coin::ProTxCheckEnv env;
+    env.check_override = [](const MutableTransaction&) { return std::optional<std::string>{}; };
     auto fold_now = [&] {
-        return fold(w, {regtx}, dash::coin::make_template_fold_context(w.sm, mp, &verifier));
+        return fold(w, {regtx}, dash::coin::make_template_fold_context(w.sm, mp, &verifier, &env));
     };
     EXPECT_EQ(fold_now().applied, 1u) << "nothing proves the collateral spent yet";
 
