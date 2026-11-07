@@ -9364,8 +9364,33 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                                  uint32_t /*anchor_h*/) { po->on_anchor_sml(asml); });
                         coin_feed_subs.push_back(
                             coin_state.block_connected.subscribe(
-                                [po](const dash::interfaces::BlockConnected& bc) {
+                                [po, ws = work_source.get(), &stratum_server](
+                                    const dash::interfaces::BlockConnected& bc) {
                                     po->on_block(bc.block, bc.height);
+                                    // The header tip change already re-sourced
+                                    // the next template, usually before this
+                                    // body arrived; a punishing commitment was
+                                    // then refused (oracle-not-at-tip). Now the
+                                    // oracle stands on this block, so re-source
+                                    // that height instead of leaving it to an
+                                    // unrelated event.
+                                    const auto cur = po->cursor();
+                                    if (ws && cur && cur->first == bc.height
+                                        && dash::stratum::DASHWorkSource::
+                                               pose_oracle_refresh_due(
+                                                   ws->pose_pass_decline_height(),
+                                                   bc.height)) {
+                                        LOG_INFO << "[POSE-ORACLE] at tip h="
+                                                 << bc.height
+                                                 << ": re-sourcing h="
+                                                 << bc.height + 1
+                                                 << " (refused before the fold)";
+                                        ws->invalidate_template_cache(
+                                            "PoSe oracle reached the tip");
+                                        ws->bump_work_generation();
+                                        if (stratum_server)
+                                            stratum_server->notify_all();
+                                    }
                                 }));
                         coin_feed_subs.push_back(
                             coin_state.new_headers.subscribe(

@@ -4580,3 +4580,92 @@ TEST(DashStratumDashboardSeams, MainDashWiresLocalRatesFromItsStratumServer)
     EXPECT_LT(local_seam - hashrate_seam, 2000u)
         << "wired in the same block as the other stratum dashboard seams";
 }
+
+// ── PoSe oracle re-source (race after a tip change) ─────────────────────────
+//
+// On the hotel reserve (mainnet, daemonless) every stage=oracle-not-at-tip
+// refusal of a punishing quorum commitment came 37-60 ms before the oracle
+// folded the parent: the header tip change re-sourced the template first. The
+// height was then served only when something unrelated re-sourced it, once
+// as late as the next block (h=2566523). The oracle's block handler now
+// re-sources the refused height as soon as it stands on the parent.
+
+namespace {
+std::string code_without_comments(const char* path)
+{
+    std::ifstream in(path);
+    EXPECT_TRUE(in.good()) << "cannot open " << path;
+    std::stringstream buf; buf << in.rdbuf();
+    std::string src = buf.str();
+    for (auto b = src.find("/*"); b != std::string::npos; b = src.find("/*", b)) {
+        const auto e = src.find("*/", b + 2);
+        src.erase(b, e == std::string::npos ? std::string::npos : e + 2 - b);
+    }
+    std::string code;
+    std::istringstream lines(src);
+    for (std::string line; std::getline(lines, line);) {
+        const auto c = line.find("//");
+        code += (c == std::string::npos ? line : line.substr(0, c)) + "\n";
+    }
+    return code;
+}
+} // namespace
+
+TEST(DashPoseOracleRefresh, DueOnlyWhenTheOracleFoldedTheRefusedHeightsParent)
+{
+    using WS = dash::stratum::DASHWorkSource;
+    constexpr uint32_t H = 2'566'523;
+    EXPECT_TRUE(WS::pose_oracle_refresh_due(H, H - 1))
+        << "the oracle now stands on the parent of the refused template";
+    EXPECT_FALSE(WS::pose_oracle_refresh_due(0, H - 1)) << "no PoSe refusal open";
+    EXPECT_FALSE(WS::pose_oracle_refresh_due(H, H))
+        << "the refused height itself connected: the tip change re-sources";
+    EXPECT_FALSE(WS::pose_oracle_refresh_due(H, H - 2))
+        << "a catch-up fold below the parent is not the tip the template needs";
+    static_assert(WS::pose_oracle_refresh_due(5, 4), "usable at compile time");
+}
+
+TEST(DashPoseOracleRefresh, FreshWorkSourceHasNoPosePassRefusal)
+{
+    dash::coin::NodeCoinState cs;
+    dash::stratum::DASHWorkSource ws(cs, [] { return dash::coin::DashWorkData{}; });
+    EXPECT_EQ(ws.pose_pass_decline_height(), 0u);
+}
+
+TEST(DashPoseOracleRefresh, ArmDecisionRecordsOnlyAPosePassRefusal)
+{
+    const std::string code = code_without_comments(DASH_WORK_SOURCE_SRC);
+    const auto set = code.find("last_decline_      = served_embedded ?");
+    ASSERT_NE(set, std::string::npos);
+    const auto rec = code.find("pose_pass_decline_height_.store(", set);
+    ASSERT_NE(rec, std::string::npos);
+    EXPECT_LT(rec - set, 200u) << "recorded from the same decision as last_decline_";
+    const auto cond = code.find("why.cause == \"qc-real-pose-unfolded\"", rec);
+    ASSERT_NE(cond, std::string::npos);
+    EXPECT_LT(cond - rec, 200u) << "only the PoSe-pass cause records a height";
+    const auto idle = code.find("observe_ready_idle(now_sec);");
+    ASSERT_NE(idle, std::string::npos);
+    const auto clr = code.find("pose_pass_decline_height_.store(0,", idle);
+    ASSERT_NE(clr, std::string::npos);
+    EXPECT_LT(clr - idle, 200u) << "a ready-idle arm clears it";
+}
+
+TEST(DashPoseOracleRefresh, MainDashReSourcesFromTheOracleBlockHandler)
+{
+    const std::string code = code_without_comments(DASH_MAIN_SRC);
+    const auto fold = code.find("po->on_block(bc.block, bc.height);");
+    ASSERT_NE(fold, std::string::npos);
+    const auto due = code.find("pose_oracle_refresh_due(", fold);
+    ASSERT_NE(due, std::string::npos);
+    EXPECT_LT(due - fold, 600u) << "decided right after the oracle folds";
+    const auto at_tip = code.find("cur->first == bc.height", fold);
+    ASSERT_NE(at_tip, std::string::npos);
+    EXPECT_LT(at_tip, due) << "only when the fold actually advanced the oracle";
+    const auto inv = code.find("ws->invalidate_template_cache(", due);
+    const auto gen = code.find("ws->bump_work_generation();", due);
+    const auto ntf = code.find("stratum_server->notify_all();", due);
+    ASSERT_NE(inv, std::string::npos);
+    ASSERT_NE(gen, std::string::npos);
+    ASSERT_NE(ntf, std::string::npos);
+    EXPECT_LT(ntf - due, 900u) << "the same invalidate + bump + notify as a tip change";
+}
