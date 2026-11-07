@@ -85,6 +85,7 @@
 /// snapshot path; subsequent on_full_block calls re-apply forward
 /// from snapshot height.
 
+#include <impl/dash/coin/dash_txid.hpp>
 #include <impl/dash/coin/block.hpp>
 #include <impl/dash/coin/mn_state_db.hpp>
 #include <impl/dash/coin/tx_version_rules.hpp>      // ContextualCheckTransaction (v23.1.9)
@@ -2271,15 +2272,7 @@ private:
     // Dash has no segwit so there's no witness/non-witness distinction.
     static uint256 compute_tx_hash(const MutableTransaction& tx)
     {
-        ::PackStream s;
-        s << tx;
-        auto sp = s.get_span();
-        uint256 h;
-        CHash256()
-            .Write(std::span<const unsigned char>(
-                reinterpret_cast<const unsigned char*>(sp.data()), sp.size()))
-            .Finalize(std::span<unsigned char>(h.data(), 32));
-        return h;
+        return dash_txid(tx);   // dash_txid.hpp (stable txid of v2 asset unlocks)
     }
 };
 

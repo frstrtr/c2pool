@@ -28,6 +28,7 @@
 // order hash_x11 already consumes in the X11 KATs).
 // ---------------------------------------------------------------------------
 
+#include <impl/dash/coin/dash_txid.hpp>
 #include "rpc_data.hpp"                       // dash::coin::DashWorkData
 #include "block.hpp"                          // dash::coin::BlockType (body↔header binding)
 #include <impl/dash/crypto/hash_x11.hpp>      // dash::crypto::hash_x11
@@ -97,10 +98,8 @@ inline bool block_body_binds_to_header(const BlockType& block)
     if (block.m_txs.empty()) return false;   // a real block always carries a coinbase
     std::vector<uint256> layer;
     layer.reserve(block.m_txs.size());
-    for (const auto& tx : block.m_txs) {
-        auto packed = ::pack(tx);
-        layer.push_back(::Hash(packed.get_span()));
-    }
+    for (const auto& tx : block.m_txs)
+        layer.push_back(dash_txid(tx));   // stable txid for v2 asset unlocks
     bool mutated = false;
     while (layer.size() > 1) {
         // dashcore mutation check: equal adjacent children (before odd-padding)

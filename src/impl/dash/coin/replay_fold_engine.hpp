@@ -173,6 +173,7 @@
 /// anchor+1, so a wrong anchor desyncs in ONE block (§4.5 Phase 1). Phase 2
 /// (genesis replay, W2/W4/W5) retires the anchor entirely.
 
+#include <impl/dash/coin/dash_txid.hpp>
 #include <impl/dash/coin/block.hpp>
 #include <impl/dash/coin/pose_penalty.hpp>
 #include <impl/dash/coin/transaction.hpp>
@@ -1579,15 +1580,7 @@ private:
     // CTransaction::GetHash() = SHA256d(serialized tx); Dash has no segwit.
     static uint256 compute_tx_hash(const MutableTransaction& tx)
     {
-        ::PackStream s;
-        s << tx;
-        auto sp = s.get_span();
-        uint256 h;
-        CHash256()
-            .Write(std::span<const unsigned char>(
-                reinterpret_cast<const unsigned char*>(sp.data()), sp.size()))
-            .Finalize(std::span<unsigned char>(h.data(), 32));
-        return h;
+        return dash_txid(tx);   // dash_txid.hpp (stable txid of v2 asset unlocks)
     }
 
     // ── Special-tx folds. Return "" on success, an error sentence on the ─

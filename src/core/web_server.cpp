@@ -5726,6 +5726,12 @@ nlohmann::json MiningInterface::rest_local_stats()
             // The coin's UTXO set (DASH: full / accrual, assumeutxo state).
             if (css.is_object() && css.contains("utxo") && css["utxo"].is_object())
                 result["utxo"] = css["utxo"];
+            // DASH: the Dash Core v24 deployment state of the next block (and
+            // the cross-check latch), and the credit-pool follower (balance
+            // history, the next block's unlock limit). Passed through as-is.
+            for (const char* k : {"v24", "credit_pool"})
+                if (css.is_object() && css.contains(k) && css[k].is_object())
+                    result[k] = css[k];
         }
 
         // 1. Coin block-source contact check (issue #1482).
