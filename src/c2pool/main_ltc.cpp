@@ -29,6 +29,7 @@
 #include <sstream>
 
 // Core includes
+#include <core/view_block_hashes.hpp>   // core::found_block_hashes_in (block_hashes of a view)
 #include <core/settings.hpp>
 #include <core/fileconfig.hpp>
 #include <core/core_util.hpp>
@@ -6278,19 +6279,20 @@ int main(int argc, char* argv[]) {
                 // LTC found blocks — use is_block_solution flag (above), but also keep
                 // share hashes from persistence for blocks found before restart
                 // `blocks` keeps the 16-hex short hashes (display, older
-                // dashboards); `block_hashes` the full ones, which the explorer
-                // matches a share's full hash H against (a short hash says
-                // little where share hashes are PoW hashes with leading zeros).
+                // dashboards); `block_hashes` the full ones of the blocks whose
+                // shares are in this window (core::found_block_hashes_in), which
+                // the explorer matches a share's full hash H against.
                 nlohmann::json blocks_arr = nlohmann::json::array();
-                nlohmann::json block_hashes_arr = nlohmann::json::array();
+                std::vector<std::string> found_full;
                 if (mi) {
                     for (const auto& fb : mi->get_found_blocks()) {
                         if (!fb.share_hash.empty()) {
                             blocks_arr.push_back(fb.share_hash.substr(0, 16));
-                            block_hashes_arr.push_back(fb.share_hash);
+                            found_full.push_back(fb.share_hash);
                         }
                     }
                 }
+                nlohmann::json block_hashes_arr = core::found_block_hashes_in(shares_arr, found_full);
 
                 // DOGE discovered blocks — keyed by parent (LTC) block hash.
                 // doge_arr keeps the legacy 16-char marker strings; doge_detail
@@ -6465,14 +6467,17 @@ int main(int argc, char* argv[]) {
                     heads_arr.push_back(hh.GetHex().substr(0, 16));
 
                 nlohmann::json blocks_arr = nlohmann::json::array();
-                nlohmann::json block_hashes_arr = nlohmann::json::array();   // full (see the window)
+                std::vector<std::string> found_full;
                 if (mi) {
                     for (const auto& fb : mi->get_found_blocks())
                         if (!fb.share_hash.empty()) {
                             blocks_arr.push_back(fb.share_hash.substr(0, 16));
-                            block_hashes_arr.push_back(fb.share_hash);
+                            found_full.push_back(fb.share_hash);
                         }
                 }
+                // Only the found blocks among this delta's new shares; omitted
+                // when there are none (the client accumulates them).
+                nlohmann::json block_hashes_arr = core::found_block_hashes_in(shares_arr, found_full);
                 nlohmann::json doge_arr = nlohmann::json::array();
                 nlohmann::json doge_detail = nlohmann::json::array();
                 if (mi) {
@@ -6488,7 +6493,8 @@ int main(int argc, char* argv[]) {
                 result["tip"] = best.IsNull() ? "" : best.GetHex().substr(0, 16);
                 result["heads"] = std::move(heads_arr);
                 result["blocks"] = std::move(blocks_arr);
-                result["block_hashes"] = std::move(block_hashes_arr);
+                if (!block_hashes_arr.empty())
+                    result["block_hashes"] = std::move(block_hashes_arr);
                 result["doge_blocks"] = std::move(doge_arr);
                 result["doge_blocks_detail"] = std::move(doge_detail);
 

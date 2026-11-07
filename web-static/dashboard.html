@@ -5708,19 +5708,24 @@
         // full share hashes (block_hashes). A 16-hex short hash is for display
         // only: DASH (and BTC) share hashes are PoW hashes with ~14 leading
         // zero hex digits, so a short hash says almost nothing and ordinary
-        // shares collided with block prefixes. A node older than block_hashes
-        // sends only the short `blocks`, matched on the short hash as before.
+        // shares collided with block prefixes.
+        // The window sends the block_hashes of its own shares, a delta those
+        // of its new shares (omitted when none): they accumulate into `set`.
+        // `full` says the node sends block_hashes (its window did); a node
+        // older than that sends only the short `blocks`, matched on the short
+        // hash as before. Returns `full` for the next call.
         function c2pShareKey(s) { return s.H || s.h; }
-        function c2pMarkBlocks(set, data, shares) {
+        function c2pMarkBlocks(set, data, shares, full) {
             if (data && Array.isArray(data.block_hashes)) {
+                full = true;
                 data.block_hashes.forEach(function(h) { if (h) set[h] = true; });
-            } else if (data && Array.isArray(data.blocks)) {
+            } else if (!full && data && Array.isArray(data.blocks)) {
                 var legacy = {};
                 data.blocks.forEach(function(h) { legacy[h] = true; });
                 shares.forEach(function(s) { if (legacy[s.h]) set[c2pShareKey(s)] = true; });
             }
             shares.forEach(function(s) { if (s.blk) set[c2pShareKey(s)] = true; });
-            return set;
+            return !!full;
         }
         function c2pIsBlockShare(set, s) { return !!set[c2pShareKey(s)]; }
         // END c2pBlockMarks
@@ -5754,6 +5759,7 @@
             tooltip: null,
             shares: [],
             blockSet: {},      // FULL hashes of block-solution shares (c2pMarkBlocks)
+            blockHashesFull: false,   // the node sends block_hashes (c2pMarkBlocks)
             dogeSet: {},       // short hashes of DOGE block solutions (parent hash)
             headSet: {},       // short hashes of chain heads
             myAddress: '',
@@ -5887,7 +5893,8 @@
 
                     // Block solutions: the tracker's blk flag and the ledger's
                     // full hashes, matched on the share's full hash.
-                    self.blockSet = c2pMarkBlocks({}, data, self.shares);
+                    self.blockSet = {};
+                    self.blockHashesFull = c2pMarkBlocks(self.blockSet, data, self.shares, false);
 
                     self.dogeSet = {};
                     if (data.doge_blocks) {
@@ -6162,7 +6169,8 @@
                         });
                     }
                     self.windowSize = data.window_size || 8640;
-                    self.blockSet = c2pMarkBlocks({}, data, self.shares);
+                    self.blockSet = {};
+                    self.blockHashesFull = c2pMarkBlocks(self.blockSet, data, self.shares, false);
                     self.dogeSet = {};
                     if (data.doge_blocks) data.doge_blocks.forEach(function(h) { self.dogeSet[h] = true; });
                     self.headSet = {};
@@ -10021,7 +10029,7 @@
                     defrag.headSet = {};
                     delta.heads.forEach(function(h) { defrag.headSet[h] = true; });
                 }
-                c2pMarkBlocks(defrag.blockSet, delta, defrag.shares);
+                defrag.blockHashesFull = c2pMarkBlocks(defrag.blockSet, delta, defrag.shares, defrag.blockHashesFull);
                 if (delta.doge_blocks) delta.doge_blocks.forEach(function(h) { defrag.dogeSet[h] = true; });
                 defrag.computeMinerHashrates();
 

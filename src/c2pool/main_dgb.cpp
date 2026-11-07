@@ -37,6 +37,7 @@
 
 #include <impl/dgb/node.hpp>
 #include <impl/dgb/params.hpp>          // dgb::address_acceptance (#961 cross-lane payout publish)
+#include <core/view_block_hashes.hpp>   // core::found_block_hashes_in (block_hashes of a view)
 #include <core/settings_cli.hpp>          // M0b control-plane wiring
 #include <core/config_endpoint.hpp>       // M1 control-plane READ-ONLY endpoints
 #include <impl/dgb/catalog_defaults.hpp>  // M0b L0 compiled defaults
@@ -2477,17 +2478,19 @@ int run_node(const core::CoinParams& params, bool testnet,
             // Found blocks — is_block_solution flag above, plus persisted share
             // hashes for blocks found before restart.
             // `blocks`: 16-hex short hashes (display, older dashboards);
-            // `block_hashes`: the full ones the explorer matches H against.
+            // `block_hashes`: the full ones of the blocks whose shares are in
+            // this window, which the explorer matches H against.
             nlohmann::json blocks_arr = nlohmann::json::array();
-            nlohmann::json block_hashes_arr = nlohmann::json::array();
+            std::vector<std::string> found_full;
             if (mi) {
                 for (const auto& fb : mi->get_found_blocks()) {
                     if (!fb.share_hash.empty()) {
                         blocks_arr.push_back(fb.share_hash.substr(0, 16));
-                        block_hashes_arr.push_back(fb.share_hash);
+                        found_full.push_back(fb.share_hash);
                     }
                 }
             }
+            nlohmann::json block_hashes_arr = core::found_block_hashes_in(shares_arr, found_full);
 
             result["shares"] = std::move(shares_arr);
             result["heads"] = std::move(heads_arr);

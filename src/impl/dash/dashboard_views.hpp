@@ -33,6 +33,7 @@
 #include "share_check.hpp"     // dash::get_share_script, pubkey_hash_to_script2
 #include "config_pool.hpp"     // dash::SharechainConfig
 
+#include <core/view_block_hashes.hpp>   // core::found_block_hashes_in (block_hashes of a view)
 #include <core/address_utils.hpp>
 #include <core/target_utils.hpp>
 #include <core/uint256.hpp>
@@ -60,10 +61,11 @@ struct ViewContext
     std::string my_address;            ///< local payout address ("mine" marking)
     std::string fee_hash160;           ///< node-fee hash160 (fee-share marking)
     /// Full hashes of shares known to have solved a DASH block, from the
-    /// found-block store (survives restart). Sent as `block_hashes`, which the
-    /// explorer matches a share's full hash against, and as 16-hex `blocks`
-    /// for display and older dashboards: a DASH share hash is its X11 PoW hash
-    /// (~14 leading zero hex digits), so 16 hex do not tell shares apart.
+    /// found-block store (survives restart). A view sends as `block_hashes`
+    /// those whose shares it carries, which the explorer matches a share's
+    /// full hash against, and all as 16-hex `blocks` for display and older
+    /// dashboards: a DASH share hash is its X11 PoW hash (~14 leading zero hex
+    /// digits), so 16 hex do not tell shares apart.
     std::vector<std::string> found_block_hashes;
     /// Hard cap on the delta walk, matching main_ltc.cpp:4029.
     int delta_max_shares{200};
@@ -234,11 +236,11 @@ inline nlohmann::json build_window(TrackerT& tracker, const ViewContext& ctx)
     }
 
     nlohmann::json blocks_arr = nlohmann::json::array();
-    nlohmann::json block_hashes_arr = nlohmann::json::array();
-    for (const auto& fh : ctx.found_block_hashes) {
+    for (const auto& fh : ctx.found_block_hashes)
         blocks_arr.push_back(fh.substr(0, 16));
-        block_hashes_arr.push_back(fh);
-    }
+    // Only the found blocks whose shares this view carries (the ledger is
+    // uncapped): the window's own, a delta's new ones.
+    nlohmann::json block_hashes_arr = core::found_block_hashes_in(shares_arr, ctx.found_block_hashes);
 
     result["shares"] = std::move(shares_arr);
     result["heads"]  = heads_array(chain);
@@ -346,18 +348,19 @@ inline nlohmann::json build_delta(TrackerT& tracker, const std::string& since_ha
         !since_hash.empty() && !best.IsNull() && !found_since;
 
     nlohmann::json blocks_arr = nlohmann::json::array();
-    nlohmann::json block_hashes_arr = nlohmann::json::array();
-    for (const auto& fh : ctx.found_block_hashes) {
+    for (const auto& fh : ctx.found_block_hashes)
         blocks_arr.push_back(fh.substr(0, 16));
-        block_hashes_arr.push_back(fh);
-    }
+    // Only the found blocks whose shares this view carries (the ledger is
+    // uncapped): the window's own, a delta's new ones.
+    nlohmann::json block_hashes_arr = core::found_block_hashes_in(shares_arr, ctx.found_block_hashes);
 
     result["shares"]      = std::move(shares_arr);
     result["count"]       = count;
     result["tip"]         = best.IsNull() ? "" : best.GetHex().substr(0, 16);
     result["heads"]       = heads_array(chain);
     result["blocks"]      = std::move(blocks_arr);
-    result["block_hashes"] = std::move(block_hashes_arr);
+    if (!block_hashes_arr.empty())   // a delta omits them when it has none
+        result["block_hashes"] = std::move(block_hashes_arr);
     result["fork_switch"] = fork_switch;
     return result;
 }
