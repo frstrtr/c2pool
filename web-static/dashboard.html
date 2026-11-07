@@ -5702,6 +5702,43 @@
             child:   { ring: '#00e5ff', core: '#001a1d' },
             twin:    { ring: '#ffaa00', core: '#1d0e00' }
         };
+        // BEGIN c2pBlockMarks (tested by sharechain-explorer/tests/unit/dashboard-block-marks.test.ts)
+        // Which window shares solved a block, keyed by the share's FULL hash
+        // H: the tracker's per-share flag (blk) and the found-block ledger's
+        // full share hashes (block_hashes). A 16-hex short hash is for display
+        // only: DASH (and BTC) share hashes are PoW hashes with ~14 leading
+        // zero hex digits, so a short hash says almost nothing and ordinary
+        // shares collided with block prefixes.
+        // The window sends the block_hashes of its own shares, a delta those
+        // of its new shares (omitted when none): they accumulate into `set`.
+        // `full` says the node sends block_hashes (its window did); a node
+        // older than that sends only the short `blocks`, matched on the short
+        // hash as before. Returns `full` for the next call.
+        function c2pShareKey(s) { return s.H || s.h; }
+        function c2pMarkBlocks(set, data, shares, full) {
+            if (data && Array.isArray(data.block_hashes)) {
+                full = true;
+                data.block_hashes.forEach(function(h) { if (h) set[h] = true; });
+            } else if (!full && data && Array.isArray(data.blocks)) {
+                var legacy = {};
+                data.blocks.forEach(function(h) { legacy[h] = true; });
+                shares.forEach(function(s) { if (legacy[s.h]) set[c2pShareKey(s)] = true; });
+            }
+            shares.forEach(function(s) { if (s.blk) set[c2pShareKey(s)] = true; });
+            return !!full;
+        }
+        function c2pIsBlockShare(set, s) { return !!set[c2pShareKey(s)]; }
+        // The /sharechain/delta cursor (`since`): the full hash of the
+        // client's tip when the node takes it (a node sending block_hashes
+        // does; it matches `since` on the short or the full hash). A DASH
+        // share sharing the tip's 16-hex short hash would otherwise end the
+        // delta's walk early. An older node gets the short hash, as before.
+        function c2pDeltaCursor(tipShort, tipFull, serverFull) {
+            if (serverFull && tipFull && tipShort && tipFull.substr(0, 16) === tipShort)
+                return tipFull;
+            return tipShort || '';
+        }
+        // END c2pBlockMarks
         function blockMarkKind(isPrimary, isChild) {
             if (isPrimary && isChild) return 'twin';
             if (isPrimary) return 'primary';
@@ -5731,7 +5768,8 @@
             ctx: null,
             tooltip: null,
             shares: [],
-            blockSet: {},      // short hashes of LTC block solutions
+            blockSet: {},      // FULL hashes of block-solution shares (c2pMarkBlocks)
+            blockHashesFull: false,   // the node sends block_hashes (c2pMarkBlocks)
             dogeSet: {},       // short hashes of DOGE block solutions (parent hash)
             headSet: {},       // short hashes of chain heads
             myAddress: '',
@@ -5863,14 +5901,10 @@
                     }
                     self.windowSize = data.window_size || 8640;
 
+                    // Block solutions: the tracker's blk flag and the ledger's
+                    // full hashes, matched on the share's full hash.
                     self.blockSet = {};
-                    if (data.blocks) {
-                        data.blocks.forEach(function(h) { self.blockSet[h] = true; });
-                    }
-                    // Also mark shares that have blk=1 flag from tracker index
-                    self.shares.forEach(function(s) {
-                        if (s.blk) self.blockSet[s.h] = true;
-                    });
+                    self.blockHashesFull = c2pMarkBlocks(self.blockSet, data, self.shares, false);
 
                     self.dogeSet = {};
                     if (data.doge_blocks) {
@@ -6060,7 +6094,7 @@
                     ctx.fillStyle = this.getColor(share);
                     ctx.fillRect(x, y, cs, cs);
 
-                    var isLtcBlock = !!this.blockSet[share.h];
+                    var isLtcBlock = c2pIsBlockShare(this.blockSet, share);
                     var isDogeBlock = !!this.dogeSet[share.h];
                     var isHead = !!this.headSet[share.h];
 
@@ -6146,8 +6180,7 @@
                     }
                     self.windowSize = data.window_size || 8640;
                     self.blockSet = {};
-                    if (data.blocks) data.blocks.forEach(function(h) { self.blockSet[h] = true; });
-                    self.shares.forEach(function(s) { if (s.blk) self.blockSet[s.h] = true; });
+                    self.blockHashesFull = c2pMarkBlocks(self.blockSet, data, self.shares, false);
                     self.dogeSet = {};
                     if (data.doge_blocks) data.doge_blocks.forEach(function(h) { self.dogeSet[h] = true; });
                     self.headSet = {};
@@ -6581,7 +6614,7 @@
                         ctx.fillStyle = animColors[i];
                         ctx.fillRect(sx, sy, sw, sw);
 
-                        var isLtc = !!animBlockSet[share.h];
+                        var isLtc = c2pIsBlockShare(animBlockSet, share);
                         var isDoge = !!animDogeSet[share.h];
                         var animMarkKind = blockMarkKind(isLtc, isDoge);
                         if (animMarkKind) drawBlockMark(ctx, sx, sy, sw, animMarkKind);
@@ -6776,7 +6809,8 @@
                             self._deltaQueue = [];
                             _rtPendingSince = null;
                             if (typeof _rtTipHash !== 'undefined' && _rtTipHash) {
-                                var curTip = self.shares.length > 0 ? self.shares[0].h : '';
+                                var curTip = self.shares.length > 0
+                                    ? c2pDeltaCursor(self.shares[0].h, self.shares[0].H, self.blockHashesFull) : '';
                                 _rtFetchDelta(curTip);
                             } else {
                                 self.liveRefresh();
@@ -6887,7 +6921,7 @@
             showTooltip: function(share, e) {
                 var tip = this.tooltip;
                 var isMine = this.isMine(share.m);
-                var isLtcBlock = !!this.blockSet[share.h];
+                var isLtcBlock = c2pIsBlockShare(this.blockSet, share);
                 var isDogeBlock = !!this.dogeSet[share.h];
                 var age = Math.floor(Date.now() / 1000 - share.t);
                 var difficulty = this.bitsToDifficulty(share.b);
@@ -6983,7 +7017,7 @@
                 hc.style.boxShadow = 'none';
 
                 // Block solution / head borders on the overlay
-                var isLtc = this.blockSet[share.h];
+                var isLtc = c2pIsBlockShare(this.blockSet, share);
                 var isDoge = this.dogeSet[share.h];
                 var hcMark = blockMarkKind(isLtc, isDoge);
                 if (hcMark) {
@@ -7298,7 +7332,7 @@
                     if (s.fee) fee++;
                     if (s.V >= vthr) v36native++;
                     else if (s.dv && s.dv >= vthr) v36sig++;
-                    if (s.blk || self.blockSet[s.h]) ltcBlocks++;
+                    if (c2pIsBlockShare(self.blockSet, s)) ltcBlocks++;
                     if (self.dogeSet[s.h]) dogeBlocks++;
                 });
 
@@ -7470,7 +7504,7 @@
         function loadShares() {
             // Use delta if shares already cached (auto-refresh / manual)
             if (defrag.shares && defrag.shares.length > 0 && _rtTipHash) {
-                _rtFetchDelta(_rtTipHash);
+                _rtFetchDelta(c2pDeltaCursor(_rtTipHash, _rtTipFull, defrag.blockHashesFull));
             } else if (defrag.shares && defrag.shares.length > 0) {
                 defrag.liveRefresh();
             } else {
@@ -7778,7 +7812,7 @@
 
             // Block borders / legendary treatment
             if (share) {
-                var isLtc = defrag.blockSet[share.h];
+                var isLtc = c2pIsBlockShare(defrag.blockSet, share);
                 var isDoge = defrag.dogeSet[share.h];
                 var cellMark = blockMarkKind(isLtc, isDoge);
                 if (cellMark) {
@@ -9844,6 +9878,7 @@
         var _rtEventSource = null;
         var _rtFallbackInterval = null;
         var _rtTipHash = null;
+        var _rtTipFull = '';   // the full hash of _rtTipHash, when known (c2pDeltaCursor)
         var _rtActive = false;
 
         function toggleRealTime() {
@@ -9861,15 +9896,17 @@
             } else {
                 // Turn ON
                 _rtActive = true;
-                if (defrag.shares && defrag.shares.length > 0)
+                if (defrag.shares && defrag.shares.length > 0) {
                     _rtTipHash = defrag.shares[0].h;
+                    _rtTipFull = defrag.shares[0].H || '';
+                }
                 btn.textContent = 'RealTime: SSE';
                 btn.style.background = '#28a745';
                 btn.style.color = '#fff';
                 btn.style.borderColor = '#28a745';
                 _rtStartSSE();
                 // Immediate first update — don't wait for SSE push
-                _rtFetchDelta(_rtTipHash || '');
+                _rtFetchDelta(c2pDeltaCursor(_rtTipHash, _rtTipFull, defrag.blockHashesFull));
             }
         }
 
@@ -9881,7 +9918,7 @@
                     try {
                         var tip = JSON.parse(event.data);
                         if (tip.hash && tip.hash !== _rtTipHash) {
-                            var since = _rtTipHash || '';
+                            var since = c2pDeltaCursor(_rtTipHash, _rtTipFull, defrag.blockHashesFull);
                             _rtTipHash = tip.hash;
                             _rtFetchDelta(since);
                         }
@@ -9910,7 +9947,7 @@
             d3.json('../sharechain/tip', function(tip) {
                 if (!tip || !tip.hash) return;
                 if (tip.hash === _rtTipHash) return;
-                var since = _rtTipHash || '';
+                var since = c2pDeltaCursor(_rtTipHash, _rtTipFull, defrag.blockHashesFull);
                 _rtTipHash = tip.hash;
                 _rtFetchDelta(since);
             });
@@ -10006,9 +10043,8 @@
                     defrag.headSet = {};
                     delta.heads.forEach(function(h) { defrag.headSet[h] = true; });
                 }
-                if (delta.blocks) delta.blocks.forEach(function(h) { defrag.blockSet[h] = true; });
+                defrag.blockHashesFull = c2pMarkBlocks(defrag.blockSet, delta, defrag.shares, defrag.blockHashesFull);
                 if (delta.doge_blocks) delta.doge_blocks.forEach(function(h) { defrag.dogeSet[h] = true; });
-                defrag.shares.forEach(function(s) { if (s.blk) defrag.blockSet[s.h] = true; });
                 defrag.computeMinerHashrates();
 
                 // Cache per-share PPLNS from delta
@@ -10037,6 +10073,10 @@
                 // genuinely new shares).
                 if (delta.tip) _rtTipHash = delta.tip;
                 else if (defrag.shares.length > 0) _rtTipHash = defrag.shares[0].h;
+                // Its full hash: the newest share fetched (delta.tip is its
+                // short hash), else the newest one held.
+                var _tipSrc = (delta.shares && delta.shares.length > 0) ? delta.shares : defrag.shares;
+                _rtTipFull = (_tipSrc.length > 0 && _tipSrc[0].h === _rtTipHash) ? (_tipSrc[0].H || '') : '';
 
                 // Animate
                 var newCount = newShares.length;
@@ -10063,7 +10103,8 @@
                     // Use current tip as since — we already have everything up to here
                     var curTip = defrag.shares.length > 0 ? defrag.shares[0].h : next;
                     if (curTip !== _rtTipHash) {
-                        _rtFetchDelta(curTip);
+                        _rtFetchDelta(defrag.shares.length > 0
+                            ? c2pDeltaCursor(curTip, defrag.shares[0].H, defrag.blockHashesFull) : curTip);
                     }
                 }
             });
