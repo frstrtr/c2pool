@@ -145,8 +145,9 @@ C2P_PARAM("network.testnet", Network, BOOL, MONEY_RESTART, C_DASH|C_LTC|C_BTC|C_
   C2P_ALIAS("network.testnet", BIN_BTC, "--testnet", FLAG)
   C2P_ALIAS("network.testnet", BIN_BCH, "--testnet", FLAG)
 
-C2P_PARAM("network.regtest", Network, BOOL, MONEY_RESTART, C_DASH|C_BTC|C_DGB|C_BCH, LIT, "false", NONE, "regtest network identity")
+C2P_PARAM("network.regtest", Network, BOOL, MONEY_RESTART, C_DASH|C_LTC|C_BTC|C_DGB|C_BCH, LIT, "false", NONE, "regtest network identity")
   C2P_ALIAS("network.regtest", BIN_DASH, "--regtest", FLAG)
+  C2P_ALIAS("network.regtest", BIN_LTC, "--regtest", FLAG)
   C2P_ALIAS("network.regtest", BIN_BTC, "--regtest", FLAG)
   C2P_ALIAS("network.regtest", BIN_DGB, "--regtest", FLAG)
   C2P_ALIAS("network.regtest", BIN_BCH, "--regtest", FLAG)
