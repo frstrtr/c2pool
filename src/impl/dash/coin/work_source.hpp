@@ -196,6 +196,9 @@ struct EmbeddedWorkInputs {
     // ProUpServTx / ProUpRevTx with. Points into NodeCoinState; nullptr =>
     // those two types are refused (fail closed).
     const MnFoldContext::OperatorSigFn* protx_sig_verifier{nullptr};
+    /// Dash Core's CheckPro*Tx environment (NodeCoinState::set_protx_check_env).
+    /// nullptr => no provider tx is checkable, so none rides the template.
+    const ProTxCheckEnv* protx_check_env{nullptr};
 
     bool viable() const {
         return has_state && mnstates != nullptr && mempool != nullptr;
@@ -344,7 +347,9 @@ inline WorkSelection select_dash_work(
                 // (null => those types are refused by the fold).
                 emb.protx_sig_verifier,
                 // Dash Core v24: CbTx version 4 when v24 is active for the block.
-                emb.v24_active);
+                emb.v24_active,
+                // Dash Core's full provider-tx checks (null => none rides).
+                emb.protx_check_env);
         },
         dashd_fallback);
 }

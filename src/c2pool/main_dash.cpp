@@ -108,6 +108,7 @@
 #include <impl/dash/coin/mempool_ingest.hpp>     // wire_mempool_ingest (leg 1)
 #include <impl/dash/coin/tip_ingest.hpp>         // wire_tip_ingest (leg 2)
 #include <impl/dash/coin/deployment_status.hpp>  // Dash Core v24 deployment tracking (EHF + versionbits)
+#include <impl/dash/coin/protx_ecdsa.hpp>        // CHashSigner::VerifyHash for the provider-tx checks
 #include <impl/dash/coin/embedded_oracle_shadow.hpp> // dash::coin::EmbeddedOracleShadow — per-block dashd cross-check (OBSERVE-only)
 #include <impl/dash/coin/embedded_shadow_compare.hpp> // dash::coin::EmbeddedShadowCompare — serve-vs-dashd template diff (OBSERVE-only, NOT a gate)
 #include <impl/dash/coin/mempool_validity_gate.hpp>   // dash::coin::MempoolValidityGate — THE --embedded-serve-mempool-txs arming condition
@@ -3432,14 +3433,16 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // the pre-hold include-immediately behaviour instead of holding every
     // young tx for 10 minutes. No coin-P2P arm => no isdlock feed => the
     // arm-bit below is never set and the hold stays OFF.
+    //
+    // Dash Core v24 (#7278) removed SPORK_3 and treats it as always on, and a
+    // v24 network no longer relays it, so the arm-bit follows SPORK_2 alone
+    // (IsInstantSendEnabled). A stale "SPORK_3 off" can no longer disarm it.
     if (coin_p2p) {
         auto arm_is_hold = [&cp = *coin_p2p, &ncs = node_coin_state]() {
             const int64_t now = static_cast<int64_t>(std::time(nullptr));
             const auto& ss = cp.spork_state();
             ncs.mempool().set_instantsend_mining_hold(
-                ss.is_active(dash::coin::SPORK_2_INSTANTSEND_ENABLED, now)
-                && ss.is_active(dash::coin::SPORK_3_INSTANTSEND_BLOCK_FILTERING,
-                                now));
+                ss.is_active(dash::coin::SPORK_2_INSTANTSEND_ENABLED, now));
         };
         arm_is_hold();   // seed posture now (mainnet seed: both active)
         coin_p2p->set_spork_change_callback(arm_is_hold);
@@ -3458,6 +3461,9 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // builder drops any special tx the SML fold cannot apply exactly and the
     // emit gate re-folds and rejects on root drift.
     node_coin_state.set_include_mn_special_txs(embedded_include_mn_special_txs);
+    // Dash Core v24 MIN_STANDARD_TX_SIZE (65 bytes, CVE-2017-12842 shape):
+    // never admitted, never mined. Policy; Core refuses these too.
+    node_coin_state.mempool().set_min_standard_tx_size(65);
     // B.9 (Dash Core v23.1.8 delta): the types 1-4 fold verifies the BLS
     // operator signature of every ProUpServTx / ProUpRevTx against the
     // pre-block operator key (dashd CheckProUpServTx / CheckProUpRevTx ->
@@ -3467,6 +3473,16 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     node_coin_state.set_protx_operator_sig_verifier(
         dash::coin::memoize_operator_sig_fn(
             &dash::coin::vendor::verify_protx_operator_sig));
+    // Dash Core's full CheckPro*Tx before a provider tx rides a template
+    // (protx_check.hpp): payload rules, network fields, collateral, inputsHash
+    // and the collateral / owner ECDSA signatures. Without it the builder and
+    // the emit gate fold no provider tx at all (VERIFY-S2 P-2).
+    {
+        dash::coin::ProTxCheckEnv env;
+        env.net = testnet ? dash::coin::DashNetwork::TESTNET : dash::coin::DashNetwork::MAINNET;
+        env.ecdsa = &dash::coin::protx_ecdsa_verify_hash;
+        node_coin_state.set_protx_check_env(std::move(env));
+    }
     std::cout << "[run] embedded special-tx superset (DIP types 1-4): "
               << (embedded_include_mn_special_txs
                       ? "ON (--embedded-include-mn-special-txs: SML-folded "

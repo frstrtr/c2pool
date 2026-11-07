@@ -60,6 +60,7 @@
 #include "sigops.hpp"             // G2: bad-blk-sigops accounting during selection
 #include "vendor/assetlock.hpp"   // DIP-0027 CAssetUnlockPayload (type-9 fee source)
 #include "asset_lock_fold.hpp"    // check_asset_lock_tx: type-8 selection gate
+#include "shared_collateral.hpp"  // Dash Core v24 shared-collateral template script
 
 #include <core/uint256.hpp>
 #include <core/pack.hpp>
@@ -362,6 +363,22 @@ public:
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         return m_block_min_tx_fee;
+    }
+
+    /// Dash Core v24 MIN_STANDARD_TX_SIZE (policy/policy.h, 65 bytes): a tx
+    /// whose serialization is shorter is "tx-size-small" (CVE-2017-12842
+    /// shape) and never accepted, relayed or mined by Core. 0 (default, unit
+    /// tests) disables the rule; c2pool-dash arms 65. Applied at admission and
+    /// again at selection (an entry that predates the knob never rides).
+    void set_min_standard_tx_size(uint32_t bytes)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_min_standard_tx_size = bytes;
+    }
+    uint32_t min_standard_tx_size() const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_min_standard_tx_size;
     }
 
     /// Arm/disarm the IS/CL mining-safety hold. The caller (main_dash, off the
@@ -1105,6 +1122,14 @@ private:
                          << " (an output with value 0 and an empty script)";
                 return false;
             }
+        }
+        if (m_min_standard_tx_size != 0
+            && ::pack(tx).get_span().size() < m_min_standard_tx_size) {
+            LOG_INFO << "[MEMPOOL] reject tx-size-small txid="
+                     << dash_txid(tx).GetHex().substr(0, 16)
+                     << " (below Dash Core's MIN_STANDARD_TX_SIZE "
+                     << m_min_standard_tx_size << ")";
+            return false;
         }
         uint256 txid = dash_txid(tx);
         if (m_pool.count(txid)) return false;
@@ -2298,6 +2323,27 @@ public:
                 // package, and any descendant fails the parent check.
                 if (e->tx.type == vendor::CAssetLockPayload::SPECIALTX_TYPE
                     && !check_asset_lock_tx(e->tx)) { ok = false; break; }
+                // Dash Core v24 IsStandardSpecialTx: a lock with more than 100
+                // inputs, larger than 20480 bytes or of payload version 2 is
+                // nonstandard; Core never mines one from its mempool, and
+                // Platform cannot fund from it (good citizen).
+                if (e->tx.type == vendor::CAssetLockPayload::SPECIALTX_TYPE
+                    && asset_lock_standard_refusal(e->tx)) { ok = false; break; }
+                // MIN_STANDARD_TX_SIZE, for entries that predate the knob.
+                if (m_min_standard_tx_size != 0 && e->base_size < m_min_standard_tx_size) {
+                    ok = false;
+                    break;
+                }
+                // Dash Core v24 shared-collateral template (04445348437551):
+                // a tx paying it never rides, at any height
+                // (shared_collateral.hpp). A tx spending it is caught where
+                // the stale-input guard resolves each input's coin below.
+                {
+                    bool pays_template = false;
+                    for (const auto& out : e->tx.vout)
+                        if (is_shared_collateral_script(out.scriptPubKey.m_data)) { pays_template = true; break; }
+                    if (pays_template) { ok = false; break; }
+                }
                 // Belt for the admission gate (add_tx_locked): a pool entry
                 // that predates it (or any future seam that bypasses it) must
                 // never ride — dashd rejects the block (bad-txns-version /
@@ -2391,6 +2437,9 @@ public:
                         }
                         const auto& pscript = parent->second.tx
                             .vout[vin.prevout.index].scriptPubKey.m_data;
+                        // Shared-collateral template spend (unreachable: a
+                        // parent paying it never rides), kept for symmetry.
+                        if (is_shared_collateral_script(pscript)) { ok = false; break; }
                         if (is_p2sh_script(pscript)) {
                             tx_sigops += count_p2sh_sigops(
                                 vin.scriptSig.m_data);
@@ -2433,6 +2482,12 @@ public:
                         if (!have) {
                             // Stale input: not a selected parent, and neither the
                             // forward UTXO view nor (when armed) either fold has it.
+                            ok = false;
+                            break;
+                        }
+                        // Dash Core v24: only a ProDisTx may spend a coin locked
+                        // to the shared-collateral template, and none rides.
+                        if (is_shared_collateral_script(coin.scriptPubKey.m_data)) {
                             ok = false;
                             break;
                         }
@@ -2620,6 +2675,7 @@ private:
     // DEFAULT_BLOCK_MIN_TX_FEE. Read under m_mutex (selector holds it); written
     // via set_block_min_tx_fee (also under the lock).
     int64_t                                            m_block_min_tx_fee{DEFAULT_BLOCK_MIN_TX_FEE};
+    uint32_t                                           m_min_standard_tx_size{0};   // 0 = off; c2pool-dash: 65
     std::atomic<::core::coin::UTXOViewCache*>          m_utxo{nullptr};
     // Second-source coin lookup for the PINNED-TX gate only (see
     // set_external_coin_lookup). Set once at wiring time, before any template

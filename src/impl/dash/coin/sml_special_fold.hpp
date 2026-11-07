@@ -346,6 +346,17 @@ struct MnFoldContext
     CollateralCoinFn      collateral_coin;
     OperatorSigFn         verify_operator_sig;
 
+    /// Dash Core's full CheckPro*Tx for the block being built (protx_check.hpp):
+    /// payload rules, network fields, collateral, inputsHash and the ECDSA
+    /// signatures. Returns the reject reason, nullopt to pass.
+    using CoreCheckFn = std::function<std::optional<std::string>(const MutableTransaction&)>;
+    CoreCheckFn core_check;
+    /// The serving folds (template builder and emit gate) set this: every
+    /// provider tx must then pass core_check, and a missing core_check refuses
+    /// it (fail closed). The service-update ordering rule of Dash Core's miner
+    /// applies as well. Unset (the plain context fold) => unchanged.
+    bool require_core_check{false};
+
     static MnFoldContext from(const MnStateMachine& m,
                               CollateralCoinFn coin = {},
                               OperatorSigFn sig = {})
@@ -475,6 +486,11 @@ struct MnFoldOverlay
         return *base_opkeys_idx;
     }
     std::map<MnFoldContext::Service, uint256>    added_services;
+    /// Masternodes whose operator key a body tx changed or revoked (a
+    /// ProUpRegTx with a new key, a ProUpRevTx): Dash Core's miner never puts a
+    /// ProUpServTx for one of them after that tx (node/miner.cpp, the
+    /// keyChangedMNs rule).
+    std::set<uint256> key_changed;
 
     /// GetMNByCollateral on the evolving list.
     std::optional<uint256> collateral_owner(const MnFoldContext& ctx,
@@ -607,6 +623,12 @@ inline FoldVerdict fold_one_with_ctx(vendor::CSimplifiedMNList& folded,
     if (tx.type < 1 || tx.type > 4) return {};
     if (auto why = contextual_tx_check(tx, /*is_coinbase=*/false))
         return refuse(std::string(*why));
+    if (ctx.require_core_check) {
+        if (!ctx.core_check)
+            return refuse("provider tx not checkable (no Dash Core check wired) - excluded");
+        if (auto why = ctx.core_check(::dash::coin::MutableTransaction(tx)))
+            return refuse(*why);
+    }
 
     switch (tx.type) {
     case vendor::CProRegTx::SPECIALTX_TYPE: {
@@ -708,6 +730,10 @@ inline FoldVerdict fold_one_with_ctx(vendor::CSimplifiedMNList& folded,
         const vendor::CSimplifiedMNListEntry* be = nullptr;
         if (auto why = update_target_refusal(base, list, ov, pl.proTxHash, be))
             return refuse(*why);
+        if (ctx.require_core_check && ov.key_changed.count(pl.proTxHash))
+            return refuse("service update follows a key change of masternode "
+                          + pl.proTxHash.GetHex().substr(0, 16)
+                          + " in this block (Dash Core miner rule) - excluded");
         // #7488: nType must equal the registered MN's nType.
         if (pl.nType != be->nType)
             return refuse("bad-protx-type-mismatch (payload nType=" + std::to_string(pl.nType)
@@ -757,6 +783,7 @@ inline FoldVerdict fold_one_with_ctx(vendor::CSimplifiedMNList& folded,
         if (apply_mn_special_tx_to_sml(list, tx) != MnFoldOutcome::Applied)
             return refuse("bad-protx-hash (leaf apply)");   // unreachable: checked above
         if (key_changes && !opkey_is_null(op_wire)) ov.added_opkeys[op_wire] = pl.proTxHash;
+        if (key_changes) ov.key_changed.insert(pl.proTxHash);
         return {MnFoldOutcome::Applied, {}};
     }
 
@@ -772,6 +799,7 @@ inline FoldVerdict fold_one_with_ctx(vendor::CSimplifiedMNList& folded,
             return refuse(*why);
         if (apply_mn_special_tx_to_sml(list, tx) != MnFoldOutcome::Applied)
             return refuse("bad-protx-hash (leaf apply)");   // unreachable: checked above
+        ov.key_changed.insert(pl.proTxHash);   // a revocation resets the operator key
         return {MnFoldOutcome::Applied, {}};
     }
 
