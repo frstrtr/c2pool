@@ -1283,6 +1283,33 @@ TEST(DashMnState, V24UnknownTargetAndNonSharedProDisTxRefuse) {
     expect(special_tx(10, protx_payload(dis)), "bad-prodis-hash");
 }
 
+// S4: a v3 payee is paid at its payout list, which the projection's paid
+// check must recognise. After the v3 raise the state has no scriptPayout;
+// the pre-S4 check read scriptPayout and raised a false payee desync.
+TEST(DashMnState, V24ProjectionRecognisesAV3PayeePaidAtItsPayoutList) {
+    uint256 h;
+    MnStateMachine m = v2319_one_regular_mn(h, 2400110);
+    m.set_v24_height(2400111);
+    const auto old_payout = m.entries().at(h).scriptPayout.m_data;
+    CProUpServTx up;
+    up.nVersion = ProTxVersion::EXT_ADDR;
+    up.proTxHash = h;
+    up.extNetInfo.set(vv::NetInfoPurpose::CORE_P2P, {vv::NetInfoEntry{vv::NetService::ipv4(5, 6, 7, 8, 9999)}});
+    BlockType b1;
+    b1.m_txs.push_back(coinbase_tx({old_payout}));   // pays the pre-block (v2) script
+    b1.m_txs.push_back(special_tx(CProUpServTx::SPECIALTX_TYPE, protx_payload(up)));
+    const auto r1 = m.apply_block(b1, 2400111);
+    ASSERT_TRUE(r1.refused.empty()) << r1.refused;
+    ASSERT_FALSE(r1.payee_desync);
+    ASSERT_TRUE(m.entries().at(h).scriptPayout.m_data.empty());
+    ASSERT_EQ(m.find_expected_payee(), std::optional<uint256>{h});
+    BlockType b;
+    b.m_txs.push_back(coinbase_tx({script_bytes(0xC7), old_payout}));   // miner, then the payout
+    const auto r = m.apply_block(b, 2400112);
+    EXPECT_FALSE(r.payee_desync);
+    EXPECT_EQ(m.entries().at(h).nLastPaidHeight, 2400112u);
+}
+
 TEST(DashMnState, V24RefusalsBeforeAnyMutation) {
     MnStateMachine m;
     m.set_v24_height(2400120);

@@ -282,12 +282,11 @@ struct ReplayMNState
     /// operator script set leaves the owner remainder at 0, so the ONLY MN
     /// output goes to scriptOperatorPayout; otherwise the owner output
     /// (scriptPayout) is always present.
+    /// Dash Core v24: a v3 state's first payout entry, a shared state's first
+    /// share (v24::guaranteed_payout_script, shared with MNState).
     const std::vector<unsigned char>& first_payout_script() const
     {
-        return (nOperatorReward == 10000
-                && !scriptOperatorPayout.m_data.empty())
-            ? scriptOperatorPayout.m_data
-            : scriptPayout.m_data;
+        return v24::guaranteed_payout_script(*this);
     }
 
     void BanIfNotBanned(int32_t height)
@@ -572,6 +571,10 @@ struct FoldResult
     // a projection that is NOT paid fails the fold closed, it never leaves
     // this flag quietly clear.
     bool        payee_paid_verified{false};
+    // Dash Core v24: for a v3 or shared payee the check above is the exact
+    // multiset form (every payout-set output, distinct outputs, exact
+    // amounts of GetBlockTxOuts's split of their sum).
+    bool        payee_amounts_verified{false};
     // True when the payee cross-check was SKIPPED because this height is below
     // DIP3 enforcement (dashd does not commit the det payee to the coinbase
     // there either). The SET self-check (merkleRootMNList) still ran; only the
@@ -1076,6 +1079,10 @@ public:
         // with a genuinely broken payload still reports ITS OWN blocking
         // condition rather than this one.
         std::vector<unsigned char> payee_script_pre;
+        // Dash Core v24: a v3 or shared payee is paid a payout SET (list
+        // entries or share splits, plus the operator); keep its pre-block
+        // state for the exact multiset check below.
+        std::optional<ReplayMNState> payee_state_pre;
         if (r.payee) {
             const ReplayMNState* pst = find(*r.payee);
             if (pst == nullptr) {
@@ -1091,6 +1098,8 @@ public:
             // operator's for a full (bps == 10000) operator split, else the
             // owner's (dashd masternode/payments.cpp:65-79).
             payee_script_pre = pst->first_payout_script();
+            if (pst->nVersion >= vendor::ProTxVersion::EXT_ADDR || !pst->v24.shares.empty())
+                payee_state_pre = *pst;
         }
 
         // task #154 delta driver: this block's SML mutations start empty.
@@ -1328,7 +1337,28 @@ public:
             && !m_cfg.gates.dip0003_enforced(H)) {
             r.payee_check_preenforcement_skipped = true;
         }
-        if (r.payee && !payee_script_pre.empty()
+        if (r.payee && payee_state_pre && m_cfg.gates.dip0003_enforced(H)) {
+            // Dash Core v24 (strict multiplicity, payments.cpp
+            // FindUnmatchedMasternodePayment): every expected output of this
+            // payee consumes a DISTINCT coinbase output, and the amounts are
+            // exactly GetBlockTxOuts's split of their sum.
+            const auto R = block.m_txs.empty()
+                ? std::nullopt
+                : v24::match_mn_payment(*payee_state_pre, block.m_txs[0].vout);
+            if (!R) {
+                r.error = "DML FOLD PAYEE MISMATCH at h=" + std::to_string(height)
+                        + ": this block's coinbase does not carry the v24 payout set"
+                          " (payout list / share split / operator, distinct outputs,"
+                          " exact amounts) of the projected masternode "
+                        + r.payee->GetHex()
+                        + " -- HARD STOP, engine poisoned, re-seed required";
+                poison(r.error);
+                LOG_ERROR << "[DML-FOLD] " << r.error;
+                return r;
+            }
+            r.payee_paid_verified = true;
+            r.payee_amounts_verified = true;
+        } else if (r.payee && !payee_script_pre.empty()
             && m_cfg.gates.dip0003_enforced(H)) {
             bool paid = false;
             if (!block.m_txs.empty()) {

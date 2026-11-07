@@ -54,6 +54,7 @@
 #include <impl/dash/coin/vendor/providertx.hpp>
 #include <impl/dash/coin/embedded_oracle_shadow.hpp>
 
+#include <core/address_utils.hpp>
 #include <core/uint256.hpp>
 #include <core/pack.hpp>
 
@@ -1042,4 +1043,153 @@ TEST(DashOperatorSplit, ShadowSplitShapeIsFeeInvariant) {
     owner_all.amount = static_cast<uint64_t>(K_MN_SHARE);
     defect.push_back(owner_all);
     EXPECT_NE(mn_payout_split_shape_str(defect), a);
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// Dash Core v24 (S4): the builder pays a v3 payout list and a shared
+// masternode's share split -- one packed payment per output, in Core's
+// order -- and the emit gate re-derives the whole set.
+// ════════════════════════════════════════════════════════════════════════
+
+static std::vector<unsigned char> v24_pkh(uint8_t b) {
+    std::vector<unsigned char> s = {0x76, 0xa9, 0x14};
+    for (int i = 0; i < 20; ++i) s.push_back(static_cast<uint8_t>(b + i));
+    s.push_back(0x88); s.push_back(0xac);
+    return s;
+}
+
+static MNState v3_mn(bool shared) {
+    MNState s = split_mn(1000, {}, v24_pkh(0x3f));
+    s.nVersion = 3;
+    if (shared) {
+        dash::coin::vendor::CCollateralShare a, b, c;
+        a.amount = 500 * a.COIN; a.scriptRefund.m_data = v24_pkh(0x61);
+        b.amount = 300 * b.COIN; b.scriptRefund.m_data = v24_pkh(0x62); b.scriptReward.m_data = v24_pkh(0x72);
+        c.amount = 200 * c.COIN; c.scriptRefund.m_data = v24_pkh(0x63);
+        s.v24.shares = {a, b, c};
+    } else {
+        dash::coin::vendor::MasternodePayoutShare x, y, z;
+        x.scriptPayout.m_data = v24_pkh(0x31); x.reward = 5000;
+        y.scriptPayout.m_data = v24_pkh(0x32); y.reward = 3000;
+        z.scriptPayout.m_data = v24_pkh(0x33); z.reward = 2000;
+        s.v24.payouts = {x, y, z};
+    }
+    return s;
+}
+
+static std::string token(const std::vector<unsigned char>& script) {
+    return ::core::script_to_address(script, /*bech32_hrp=*/"", DASH_PUBKEY_VER, DASH_P2SH_VER);
+}
+
+TEST(DashV24Payees, BuilderPaysTheV3PayoutListAndTheSharedSplit) {
+    for (const bool shared : {false, true}) {
+        SCOPED_TRACE(shared ? "shared masternode" : "v3 payout list");
+        UTXOViewCache utxo(nullptr);
+        Mempool mp;
+        mp.set_utxo(&utxo);
+        const MNState s = v3_mn(shared);
+        auto mnstates = machine_with(s);
+        auto w = build_embedded_workdata(H - 1, raw256(0xAB), mnstates, mp,
+                                         0x1b104be3u, 1'700'000'000u, DASH_PUBKEY_VER, DASH_P2SH_VER);
+        const int64_t reward = compute_dash_block_reward_post_v20(H);
+        const int64_t mn_payment = compute_dash_mn_payment_post_v20(reward)
+                                 - compute_dash_platform_reward_post_v20_mn_rr(H);
+        const auto due = dash::coin::v24::expected_mn_outputs(s, mn_payment);
+        ASSERT_EQ(due.size(), 4u) << "three owner outputs plus the operator";
+        const auto mn_outs = mn_payments(w);
+        ASSERT_EQ(mn_outs.size(), due.size());
+        uint64_t sum = 0;
+        for (size_t i = 0; i < due.size(); ++i) {
+            EXPECT_EQ(mn_outs[i].payee, token(due[i].script)) << i;
+            EXPECT_EQ(mn_outs[i].amount, static_cast<uint64_t>(due[i].amount)) << i;
+            sum += mn_outs[i].amount;
+        }
+        EXPECT_EQ(sum, static_cast<uint64_t>(mn_payment)) << "a split, not a duplication";
+        EXPECT_EQ(w.m_payment_amount, static_cast<uint64_t>(mn_payment));
+        if (shared) {
+            EXPECT_EQ(mn_outs[0].payee, token(v24_pkh(0x61))) << "no reward script: the refund script";
+            EXPECT_EQ(mn_outs[1].payee, token(v24_pkh(0x72))) << "the reward script";
+        }
+        EXPECT_EQ(mn_outs.back().payee, token(v24_pkh(0x3f))) << "the operator comes last";
+    }
+}
+
+TEST(DashV24Payees, EmitGateRejectsADroppedPayoutEntry) {
+    NodeCoinState st;
+    st.mnstates().load(std::vector<std::pair<uint256, MNState>>{{raw256(0x01), v3_mn(false)}});
+    arm_emit_gate(st, raw256(0xAB));
+    st.set_tip(H - 1, raw256(0xAB), 0x1b104be3u, 1'700'000'000u, DASH_PUBKEY_VER, DASH_P2SH_VER);
+    UTXOViewCache utxo(nullptr);
+    Mempool mp;
+    mp.set_utxo(&utxo);
+    auto w = build_embedded_workdata(H - 1, raw256(0xAB), st.mnstates(), mp,
+                                     0x1b104be3u, 1'700'000'000u, DASH_PUBKEY_VER, DASH_P2SH_VER);
+    dash::coin::DeclineReport why;
+    DashWorkData dropped = w;
+    std::vector<PackedPayment> keep;
+    int mn_seen = 0;
+    for (const auto& p : w.m_packed_payments) {
+        if (p.payee != "!6a" && mn_seen++ == 1) continue;   // drop payout #1
+        keep.push_back(p);
+    }
+    dropped.m_packed_payments = keep;
+    EXPECT_FALSE(st.embedded_template_emit_ok(dropped, &why));
+    EXPECT_EQ(why.cause, std::string("emit-mn-payout-split-drift"));
+    EXPECT_NE(why.value.find("payout1="), std::string::npos) << why.value;
+    EXPECT_NE(why.value.find("-MISSING"), std::string::npos) << why.value;
+    // The builder's own template carries the whole set.
+    dash::coin::DeclineReport why2;
+    st.embedded_template_emit_ok(w, &why2);
+    EXPECT_NE(why2.cause, std::string("emit-mn-payout-split-drift")) << why2.value;
+}
+
+// The Core port (vendor/masternode_payments.hpp) against the reward helpers
+// the producer already used: PlatformShare(GetMasternodePayment(h, subsidy))
+// and GetMasternodePayment(h, blockValue) in the EvoReward era, across
+// halvings; and FindUnmatchedMasternodePayment's two modes.
+TEST(DashV24Payees, PortedRewardSplitAndMultiplicityMatchCore) {
+    namespace pay = dash::coin::vendor::payments;
+    for (uint32_t h : {2'128'896u, 2'400'000u, 2'580'480u, 3'000'000u, 4'000'000u}) {
+        const int64_t subsidy = compute_dash_block_reward_post_v20(h);
+        EXPECT_EQ(pay::PlatformShare(pay::GetMasternodePaymentEvoReward(subsidy)),
+                  compute_dash_platform_reward_post_v20_mn_rr(h)) << h;
+        EXPECT_EQ(pay::GetMasternodePaymentEvoReward(subsidy + 12'345),
+                  compute_dash_mn_payment_post_v20(subsidy + 12'345)) << h;
+    }
+    // Two equal expected outputs and ONE matching coinbase output: valid
+    // before v24 (any match), invalid from v24 (each consumes its own).
+    const pay::CTxOut o(50, v24_pkh(0x31));
+    const std::vector<pay::CTxOut> expected = {o, o};
+    EXPECT_EQ(pay::FindUnmatchedMasternodePayment(expected, {o}, /*strict=*/false), -1);
+    EXPECT_EQ(pay::FindUnmatchedMasternodePayment(expected, {o}, /*strict=*/true), 1);
+    EXPECT_EQ(pay::FindUnmatchedMasternodePayment(expected, {o, o}, /*strict=*/true), -1);
+    // GetBlockTxOuts with no payee (an empty list): the burn alone.
+    std::vector<pay::CTxOut> vout;
+    pay::GetBlockTxOutsForPayee(nullptr, 1000, 375, /*evo_reward_era=*/true, vout);
+    ASSERT_EQ(vout.size(), 1u);
+    EXPECT_EQ(vout[0], pay::CTxOut(375, {0x6a}));
+}
+
+// The emit gate checks the payout set as (payee, amount) pairs: an output
+// moved to another script at the same amount (a same-duff superblock entry,
+// a wrong payout script) refuses emission, not only a missing amount.
+TEST(DashV24Payees, EmitGateRejectsAPayoutAtTheWrongScript) {
+    NodeCoinState st;
+    st.mnstates().load(std::vector<std::pair<uint256, MNState>>{{raw256(0x01), v3_mn(false)}});
+    arm_emit_gate(st, raw256(0xAB));
+    st.set_tip(H - 1, raw256(0xAB), 0x1b104be3u, 1'700'000'000u, DASH_PUBKEY_VER, DASH_P2SH_VER);
+    UTXOViewCache utxo(nullptr);
+    Mempool mp;
+    mp.set_utxo(&utxo);
+    auto w = build_embedded_workdata(H - 1, raw256(0xAB), st.mnstates(), mp,
+                                     0x1b104be3u, 1'700'000'000u, DASH_PUBKEY_VER, DASH_P2SH_VER);
+    DashWorkData moved = w;
+    int mn_seen = 0;
+    for (auto& p : moved.m_packed_payments)
+        if (p.payee != "!6a" && mn_seen++ == 0) p.payee = token(v24_pkh(0x99));   // same amount, other script
+    dash::coin::DeclineReport why;
+    EXPECT_FALSE(st.embedded_template_emit_ok(moved, &why));
+    EXPECT_EQ(why.cause, std::string("emit-mn-payout-split-drift"));
+    EXPECT_NE(why.value.find("payout0="), std::string::npos) << why.value;
+    EXPECT_EQ(why.threshold, std::string("every-payout-set-output-in-template"));
 }
