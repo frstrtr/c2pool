@@ -64,4 +64,23 @@ inline const char* doge_aux_fallback_address(bool testnet, bool regtest)
     return "DDogepartyxxxxxxxxxxxxxxxxxxw1dfzr";
 }
 
+// DOGE P2P port for a --merged DOGE spec. 0 = no DOGE P2P: no embedded
+// HeaderChain, no broadcaster, no seed dials (RPC-only aux leg).
+//   flag_port    --doge-p2p-port, 0 if not given
+//   spec_port    the spec's 7th field, -1 if absent (an explicit 0 = off)
+//   default_port the network default (p2p_port() above)
+// Explicit ports win, as before: --doge-p2p-port, then the 7th field. The
+// change: with no explicit port, the network default is used ONLY when the
+// embedded DOGE node is on. Before, --no-embedded-doge (also --standalone,
+// or embedded_doge: false in the config) still got the default port, and that
+// port alone built the embedded HeaderChain plus a seed-dialing broadcaster
+// the operator had turned off. Default embedded_doge=true: unchanged.
+inline int doge_aux_p2p_port(int flag_port, int spec_port, int default_port,
+                             bool embedded_doge)
+{
+    if (flag_port > 0) return flag_port;
+    if (spec_port >= 0) return spec_port;
+    return embedded_doge ? default_port : 0;
+}
+
 } // namespace c2pool::ltc_doge

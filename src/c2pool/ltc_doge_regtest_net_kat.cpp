@@ -48,6 +48,22 @@ int main()
     CHECK(std::string(doge_aux_fallback_address(true,  true))  == "mfWxJ45yp2SFn7UciZyNpvDKrzbhyfKrY8");
     CHECK(std::string(doge_aux_fallback_address(false, true))  == "mfWxJ45yp2SFn7UciZyNpvDKrzbhyfKrY8");
 
+    // DOGE aux P2P port policy (--merged DOGE spec).
+    // Embedded on (the default): unchanged, the network default is used.
+    CHECK(doge_aux_p2p_port(0, -1, 22556, true) == 22556);
+    CHECK(doge_aux_p2p_port(0, -1, 18444, true) == 18444);
+    // THE FIX: embedded off + no explicit port -> 0 (was the default port).
+    CHECK(doge_aux_p2p_port(0, -1, 44556, false) == 0);
+    CHECK(doge_aux_p2p_port(0, -1, 18444, false) == 0);
+    // Explicit ports still win, embedded on or off.
+    for (bool emb : {false, true}) {
+        CHECK(doge_aux_p2p_port(0, 18444, 44556, emb) == 18444);  // 7th field
+        CHECK(doge_aux_p2p_port(0, 0, 44556, emb) == 0);          // 7th field ":0" = off
+        CHECK(doge_aux_p2p_port(22556, -1, 44556, emb) == 22556); // --doge-p2p-port
+        CHECK(doge_aux_p2p_port(22556, 0, 44556, emb) == 22556);  // flag beats ":0"
+        CHECK(doge_aux_p2p_port(22556, 18444, 44556, emb) == 22556);
+    }
+
     if (g_fail) { std::printf("ltc_doge_regtest_net_kat: %d FAIL\n", g_fail); return 1; }
     std::printf("ltc_doge_regtest_net_kat: ALL PASS\n");
     return 0;

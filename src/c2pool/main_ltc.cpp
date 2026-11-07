@@ -6537,8 +6537,24 @@ int main(int argc, char* argv[]) {
                     else if (cfg.symbol == "DINGO")
                         cfg.aux_payout_address = solo_address;
 
-                    // P2P port: explicit (7th field) or auto-detected from symbol
-                    if (parts.size() >= 7 && !parts[6].empty()) {
+                    // P2P port: explicit (7th field) or auto-detected from symbol.
+                    // DOGE goes through doge_aux_p2p_port(): --no-embedded-doge
+                    // no longer picks up the auto-detected port (see the helper).
+                    if (cfg.symbol == "DOGE") {
+                        int spec_port = (parts.size() >= 7 && !parts[6].empty())
+                            ? static_cast<int>(std::stoul(parts[6])) : -1;
+                        int auto_port = get_coin_p2p_port(cfg.symbol, settings->m_testnet);
+                        int port = c2pool::ltc_doge::doge_aux_p2p_port(
+                            doge_p2p_port, spec_port, auto_port, embedded_doge);
+                        cfg.p2p_port = static_cast<uint16_t>(port);
+                        if (doge_p2p_port > 0)
+                            LOG_INFO << "DOGE P2P port overridden via --doge-p2p-port: " << doge_p2p_port;
+                        else if (spec_port < 0 && port > 0)
+                            LOG_INFO << "Auto-detected P2P port for DOGE: " << port;
+                        else if (spec_port < 0)
+                            LOG_INFO << "DOGE P2P off: embedded DOGE disabled and no explicit"
+                                     << " P2P port (RPC-only aux: createauxblock/submitauxblock)";
+                    } else if (parts.size() >= 7 && !parts[6].empty()) {
                         cfg.p2p_port = static_cast<uint16_t>(std::stoul(parts[6]));
                     } else {
                         int auto_port = get_coin_p2p_port(cfg.symbol, settings->m_testnet);
@@ -6554,11 +6570,6 @@ int main(int argc, char* argv[]) {
                         cfg.p2p_address = merged_coind_p2p_address;
                     } else {
                         cfg.p2p_address = cfg.rpc_host;
-                    }
-                    // --doge-p2p-port overrides auto-detected port
-                    if (cfg.symbol == "DOGE" && doge_p2p_port > 0) {
-                        cfg.p2p_port = static_cast<uint16_t>(doge_p2p_port);
-                        LOG_INFO << "DOGE P2P port overridden via --doge-p2p-port: " << doge_p2p_port;
                     }
 
                     // Create DOGE HeaderChain when embedded OR P2P is available.
