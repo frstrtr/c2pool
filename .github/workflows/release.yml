@@ -782,23 +782,60 @@ jobs:
       # SECOND draft with the same tag_name, so repeated runs pile up duplicate
       # "vX.Y.Z" drafts. Refresh ONE canonical draft instead: upload --clobber
       # if the release exists, else create it fresh.
-      - name: Assemble draft release (idempotent)
+      #
+      # Signed-checksums gate. The operator signs SHA256SUMS off CI with the
+      # release key (50AB1379285EFE76, published at github.com/frstrtr.gpg) and
+      # attaches SHA256SUMS.asc to the draft. A re-run that clobbers SHA256SUMS
+      # or a package with different bytes orphans that signature, and the
+      # published release then fails the README's `gpg --verify`. So once the
+      # draft carries SHA256SUMS.asc, the signature must verify against the
+      # pinned fingerprint and the regenerated SHA256SUMS must match the signed
+      # one byte for byte, or this step fails before uploading anything. A
+      # draft with no .asc yet is marked UNSIGNED in its notes and a warning.
+      - name: Assemble draft release (idempotent, signed-checksums gate)
         if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_KEY_FPR: 99556F8DE6AD66057A1A10EC50AB1379285EFE76
+          RELEASE_KEY_URL: https://github.com/frstrtr.gpg
         run: |
           TAG="${GITHUB_REF_NAME}"
           REPO="${{ github.repository }}"
           if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
-            echo "Draft $TAG already exists -- refreshing assets in place (--clobber)."
+            if gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets[].name' | grep -qx 'SHA256SUMS.asc'; then
+              echo "Draft $TAG carries SHA256SUMS.asc -- checking the signature and the regenerated sums before touching assets."
+              SIGNED="$(mktemp -d)"
+              gh release download "$TAG" --repo "$REPO" -p SHA256SUMS -p SHA256SUMS.asc -D "$SIGNED"
+              export GNUPGHOME="$(mktemp -d)"
+              curl -fsSL "$RELEASE_KEY_URL" | gpg --batch --quiet --import
+              if ! gpg --batch --status-fd 1 --verify "$SIGNED/SHA256SUMS.asc" "$SIGNED/SHA256SUMS" > "$SIGNED/gpg-status" 2>/dev/null; then
+                cat "$SIGNED/gpg-status"
+                echo "::error::SIGNED-CHECKSUMS FAIL: SHA256SUMS.asc on draft $TAG does not verify against its SHA256SUMS. Re-sign with key $RELEASE_KEY_FPR or delete the stale .asc; nothing was uploaded."
+                exit 1
+              fi
+              if ! grep -E "^\[GNUPG:\] VALIDSIG .*${RELEASE_KEY_FPR}( |\$)" "$SIGNED/gpg-status" >/dev/null; then
+                cat "$SIGNED/gpg-status"
+                echo "::error::SIGNED-CHECKSUMS FAIL: SHA256SUMS.asc on draft $TAG is a valid signature but not by release key $RELEASE_KEY_FPR; nothing was uploaded."
+                exit 1
+              fi
+              if ! cmp -s "$SIGNED/SHA256SUMS" dist/SHA256SUMS; then
+                diff "$SIGNED/SHA256SUMS" dist/SHA256SUMS || true
+                echo "::error::SIGNED-CHECKSUMS FAIL: this run's SHA256SUMS differs from the signed one on draft $TAG. Uploading would orphan SHA256SUMS.asc. Either a package rebuilt with different bytes or a coin cell is missing from this run. To replace the packages on purpose, delete SHA256SUMS.asc from the draft, re-run, and re-sign."
+                exit 1
+              fi
+              echo "Signature good (key $RELEASE_KEY_FPR) and SHA256SUMS unchanged -- refreshing assets in place."
+            else
+              echo "::warning::Draft $TAG has no SHA256SUMS.asc yet. Sign SHA256SUMS with key $RELEASE_KEY_FPR and attach SHA256SUMS.asc before publishing."
+            fi
             gh release upload "$TAG" dist/* --clobber --repo "$REPO"
           else
             echo "No release for $TAG -- creating fresh draft."
+            echo "::warning::Draft $TAG is created UNSIGNED. Sign SHA256SUMS with key $RELEASE_KEY_FPR and attach SHA256SUMS.asc before publishing."
             gh release create "$TAG" \
               --repo "$REPO" \
               --draft \
               --title "c2pool $TAG" \
-              --notes "Draft assembled by release.yml -- operator reviews and publishes manually." \
+              --notes "Draft assembled by release.yml -- operator reviews and publishes manually. UNSIGNED: attach SHA256SUMS.asc (gpg --detach-sign --armor SHA256SUMS with release key $RELEASE_KEY_FPR) before publishing." \
               dist/*
           fi
 
