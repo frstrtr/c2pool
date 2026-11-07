@@ -4,8 +4,10 @@
 // short hash is display only: DASH share hashes are X11 PoW hashes with ~14
 // leading zero hex digits, so an ordinary share's short hash can equal a
 // block's. The window sends the block_hashes of its own shares and a delta
-// those of its new shares (omitted when none); they accumulate. Runs the
-// functions extracted from dashboard.html itself.
+// those of its new shares (omitted when none); they accumulate. The delta
+// cursor is the client's full tip hash, so a newer share sharing the tip's
+// short hash cannot end a delta early. Runs the functions extracted from
+// dashboard.html itself.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -16,6 +18,7 @@ interface Marks {
   c2pShareKey(s: WindowShare): string;
   c2pMarkBlocks(set: Record<string, boolean>, data: unknown, shares: WindowShare[], full: boolean): boolean;
   c2pIsBlockShare(set: Record<string, boolean>, s: WindowShare): boolean;
+  c2pDeltaCursor(tipShort: string | null, tipFull: string | undefined, serverFull: boolean): string;
 }
 
 function loadMarks(): Marks {
@@ -25,7 +28,7 @@ function loadMarks(): Marks {
   assert.ok(begin >= 0 && end > begin, 'the c2pBlockMarks block is in dashboard.html');
   const src = html.slice(begin, end);
   // eslint-disable-next-line @typescript-eslint/no-implied-eval
-  return new Function(src + '\nreturn { c2pShareKey, c2pMarkBlocks, c2pIsBlockShare };')() as Marks;
+  return new Function(src + '\nreturn { c2pShareKey, c2pMarkBlocks, c2pIsBlockShare, c2pDeltaCursor };')() as Marks;
 }
 
 const m = loadMarks();
@@ -111,4 +114,41 @@ test('a node without block_hashes: the short hashes match as before', () => {
   const legacy = { h: 'abcdabcdabcdabcd' };
   const { set: set2 } = marksOf({ blocks: [legacy.h] }, [legacy]);
   assert.equal(m.c2pIsBlockShare(set2, legacy), true);
+});
+
+// /sharechain/delta walks back from the best share and stops at the first
+// share matching `since` on its short or its full hash (main_ltc.cpp,
+// dashboard_views.hpp build_delta, main_bip110.cpp). Newest first.
+function serverDelta(chain: WindowShare[], since: string): WindowShare[] {
+  const out: WindowShare[] = [];
+  for (const s of chain) {
+    if (s.h === since || s.H === since) break;
+    out.push(s);
+  }
+  return out;
+}
+
+test('the delta cursor is the full tip hash: a newer share sharing its short hash does not end the delta', () => {
+  const tip = dashShare('21' + 'a'.repeat(48));
+  const older = dashShare('07' + 'b'.repeat(48));
+  const n1 = dashShare('09' + 'c'.repeat(48));
+  const n2 = dashShare('21' + 'd'.repeat(48));   // the tip's short hash
+  const n3 = dashShare('33' + 'e'.repeat(48));
+  assert.equal(n2.h, tip.h);
+  const chain = [n3, n2, n1, tip, older];
+
+  const since = m.c2pDeltaCursor(tip.h, tip.H, true);
+  assert.equal(since, tip.H);
+  assert.deepEqual(serverDelta(chain, since).map((s) => s.H), [n3.H, n2.H, n1.H]);
+  // The short cursor ends the walk at n2: n2 and n1 never reach the client.
+  assert.deepEqual(serverDelta(chain, tip.h).map((s) => s.H), [n3.H]);
+});
+
+test('the delta cursor stays the short hash for an older node or an unknown full hash', () => {
+  const tip = dashShare('21' + 'a'.repeat(48));
+  assert.equal(m.c2pDeltaCursor(tip.h, tip.H, false), tip.h, 'a node without block_hashes');
+  assert.equal(m.c2pDeltaCursor(tip.h, '', true), tip.h, 'full hash not known');
+  assert.equal(m.c2pDeltaCursor(tip.h, dashShare('22' + 'a'.repeat(48)).H, true), tip.h,
+               'a full hash of another tip is not used');
+  assert.equal(m.c2pDeltaCursor(null, undefined, true), '');
 });

@@ -5728,6 +5728,16 @@
             return !!full;
         }
         function c2pIsBlockShare(set, s) { return !!set[c2pShareKey(s)]; }
+        // The /sharechain/delta cursor (`since`): the full hash of the
+        // client's tip when the node takes it (a node sending block_hashes
+        // does; it matches `since` on the short or the full hash). A DASH
+        // share sharing the tip's 16-hex short hash would otherwise end the
+        // delta's walk early. An older node gets the short hash, as before.
+        function c2pDeltaCursor(tipShort, tipFull, serverFull) {
+            if (serverFull && tipFull && tipShort && tipFull.substr(0, 16) === tipShort)
+                return tipFull;
+            return tipShort || '';
+        }
         // END c2pBlockMarks
         function blockMarkKind(isPrimary, isChild) {
             if (isPrimary && isChild) return 'twin';
@@ -6799,7 +6809,8 @@
                             self._deltaQueue = [];
                             _rtPendingSince = null;
                             if (typeof _rtTipHash !== 'undefined' && _rtTipHash) {
-                                var curTip = self.shares.length > 0 ? self.shares[0].h : '';
+                                var curTip = self.shares.length > 0
+                                    ? c2pDeltaCursor(self.shares[0].h, self.shares[0].H, self.blockHashesFull) : '';
                                 _rtFetchDelta(curTip);
                             } else {
                                 self.liveRefresh();
@@ -7493,7 +7504,7 @@
         function loadShares() {
             // Use delta if shares already cached (auto-refresh / manual)
             if (defrag.shares && defrag.shares.length > 0 && _rtTipHash) {
-                _rtFetchDelta(_rtTipHash);
+                _rtFetchDelta(c2pDeltaCursor(_rtTipHash, _rtTipFull, defrag.blockHashesFull));
             } else if (defrag.shares && defrag.shares.length > 0) {
                 defrag.liveRefresh();
             } else {
@@ -9867,6 +9878,7 @@
         var _rtEventSource = null;
         var _rtFallbackInterval = null;
         var _rtTipHash = null;
+        var _rtTipFull = '';   // the full hash of _rtTipHash, when known (c2pDeltaCursor)
         var _rtActive = false;
 
         function toggleRealTime() {
@@ -9884,15 +9896,17 @@
             } else {
                 // Turn ON
                 _rtActive = true;
-                if (defrag.shares && defrag.shares.length > 0)
+                if (defrag.shares && defrag.shares.length > 0) {
                     _rtTipHash = defrag.shares[0].h;
+                    _rtTipFull = defrag.shares[0].H || '';
+                }
                 btn.textContent = 'RealTime: SSE';
                 btn.style.background = '#28a745';
                 btn.style.color = '#fff';
                 btn.style.borderColor = '#28a745';
                 _rtStartSSE();
                 // Immediate first update — don't wait for SSE push
-                _rtFetchDelta(_rtTipHash || '');
+                _rtFetchDelta(c2pDeltaCursor(_rtTipHash, _rtTipFull, defrag.blockHashesFull));
             }
         }
 
@@ -9904,7 +9918,7 @@
                     try {
                         var tip = JSON.parse(event.data);
                         if (tip.hash && tip.hash !== _rtTipHash) {
-                            var since = _rtTipHash || '';
+                            var since = c2pDeltaCursor(_rtTipHash, _rtTipFull, defrag.blockHashesFull);
                             _rtTipHash = tip.hash;
                             _rtFetchDelta(since);
                         }
@@ -9933,7 +9947,7 @@
             d3.json('../sharechain/tip', function(tip) {
                 if (!tip || !tip.hash) return;
                 if (tip.hash === _rtTipHash) return;
-                var since = _rtTipHash || '';
+                var since = c2pDeltaCursor(_rtTipHash, _rtTipFull, defrag.blockHashesFull);
                 _rtTipHash = tip.hash;
                 _rtFetchDelta(since);
             });
@@ -10059,6 +10073,10 @@
                 // genuinely new shares).
                 if (delta.tip) _rtTipHash = delta.tip;
                 else if (defrag.shares.length > 0) _rtTipHash = defrag.shares[0].h;
+                // Its full hash: the newest share fetched (delta.tip is its
+                // short hash), else the newest one held.
+                var _tipSrc = (delta.shares && delta.shares.length > 0) ? delta.shares : defrag.shares;
+                _rtTipFull = (_tipSrc.length > 0 && _tipSrc[0].h === _rtTipHash) ? (_tipSrc[0].H || '') : '';
 
                 // Animate
                 var newCount = newShares.length;
@@ -10085,7 +10103,8 @@
                     // Use current tip as since — we already have everything up to here
                     var curTip = defrag.shares.length > 0 ? defrag.shares[0].h : next;
                     if (curTip !== _rtTipHash) {
-                        _rtFetchDelta(curTip);
+                        _rtFetchDelta(defrag.shares.length > 0
+                            ? c2pDeltaCursor(curTip, defrag.shares[0].H, defrag.blockHashesFull) : curTip);
                     }
                 }
             });
