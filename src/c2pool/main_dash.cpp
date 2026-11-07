@@ -5983,7 +5983,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             web_server->get_mining_interface()->set_coin_sync_status_fn(
                 [hc = header_chain.get(), cp = coin_p2p.get(),
                  lanes = dml_lanes, &utxo_lane, &utxo_full_refusal,
-                 &utxo_import_seconds, &v24_status, &ehf_tracker, &cp_lane]() -> nlohmann::json {
+                 &utxo_import_seconds, &v24_status, &ehf_tracker, &cp_lane,
+                 &node_coin_state]() -> nlohmann::json {
                     nlohmann::json s = nlohmann::json::object();
                     const uint32_t hh = hc ? hc->height() : 0;
                     uint32_t th = cp ? cp->best_peer_height() : 0;
@@ -6061,6 +6062,11 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                                                                                      : "bound-refuted"},
                             {"pin_refuted", v24_status->pin_refuted()},
                             {"contradictions", v24_status->contradictions()},
+                            // Heights the embedded arm declined because the
+                            // scheduled payee is paid through a v24 payout
+                            // list (cause mn-payee-v24-payout-list; S4).
+                            {"payee_payout_list_declines", node_coin_state.v24_payout_list_declines()},
+                            {"payee_payout_list_last_height", node_coin_state.v24_payout_list_last_height()},
                         };
                     }
                     // Credit-pool follower: the balance history and the limit
@@ -8199,6 +8205,15 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             node_coin_state.set_v24_state_fn(
                 [st = v24_status](uint32_t h) { return st->v24_state(h); });
             node_coin_state.set_v24_network(v24_net);
+            // Testnet min-difficulty rules (Dash Core DarkGravityWave with
+            // fPowAllowMinDifficultyBlocks): bits follow the template's time.
+            if (testnet)
+                node_coin_state.set_bits_at_time_fn(
+                    [hc = header_chain.get()](const uint256& prev, uint32_t t) -> std::optional<uint32_t> {
+                        const uint32_t b = hc->next_work_required_at(prev, t);
+                        if (b == 0) return std::nullopt;
+                        return b;
+                    });
             const auto scanned = ehf_tracker->scanned_to();
             std::cout << "[run] Dash Core v24 deployment tracking: EHF anchor h="
                       << ehf_tracker->anchor() << ", bodies scanned to "

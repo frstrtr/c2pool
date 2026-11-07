@@ -438,6 +438,49 @@ TEST(DashNodeCoinState, UnresolvablePayeeFailsClosedToDashd) {
         << "#996 guard must NOT refuse when the due payee resolves";
 }
 
+// Dash Core v24 (testnet shadow h=1586594): the scheduled payee is an
+// ExtAddr masternode paid through its payout list, so its scriptPayout is
+// empty. The builder would pay an empty script (bad-cb-payee): the embedded
+// arm must refuse the height until the v24 payee builder can pay the list.
+TEST(DashNodeCoinState, PayeeWithoutABuildableScriptFailsClosed) {
+    NodeCoinState st;
+    MNState ext;
+    ext.isValid = true;
+    ext.nRegisteredHeight = 2'300'000;
+    ext.payoutSplitProvenance = MNState::SPLIT_KNOWN;
+    // scriptPayout left empty, as the seed leaves it for a v3 payout list.
+    st.mnstates().load(std::vector<std::pair<uint256, MNState>>{{raw256(0x01), ext}});
+    st.set_tip(H - 1, raw256(0xAB), 0x1b104be3u, 1'700'000'000u,
+               DASH_PUBKEY_VER, DASH_P2SH_VER);
+    ASSERT_TRUE(st.populated());
+    ASSERT_TRUE(st.mnstates().find_expected_payee().has_value());
+    const auto e = st.make_embedded_work_inputs();
+    EXPECT_FALSE(e.viable());
+    EXPECT_EQ(e.decline.cause, "mn-payee-v24-payout-list");
+    EXPECT_EQ(e.decline.value, "protx=" + raw256(0x01).GetHex().substr(0, 12));
+    // Counted once per height, however many templates rebuild it.
+    st.make_embedded_work_inputs();
+    EXPECT_EQ(st.v24_payout_list_declines(), 1u);
+    EXPECT_EQ(st.v24_payout_list_last_height(), H);
+    // With the v24 payee builder a v3 masternode is paid through its payout
+    // list: the same empty scriptPayout with a v3 list serves.
+    {
+        MNState v3 = ext;
+        v3.nVersion = dash::coin::vendor::ProTxVersion::EXT_ADDR;
+        dash::coin::vendor::MasternodePayoutShare po;
+        po.scriptPayout.m_data = p2pkh_script(0x31);
+        po.reward = 10000;
+        v3.v24.payouts.push_back(po);
+        st.mnstates().load(std::vector<std::pair<uint256, MNState>>{{raw256(0x01), v3}});
+        const auto e3 = st.make_embedded_work_inputs();
+        EXPECT_NE(e3.decline.cause, "mn-payee-v24-payout-list") << e3.decline.cause;
+    }
+    // Control: the same masternode with a payout script serves.
+    seed_single_mn(st, p2pkh_script(0x30));
+    EXPECT_TRUE(st.make_embedded_work_inputs().viable());
+    EXPECT_EQ(st.v24_payout_list_declines(), 1u);
+}
+
 // #996 rescope: an EMPTY payee queue must NOT trip the guard (default ON).
 // No-masternode-set is not a resolution failure: a network that genuinely
 // has none serves normally (the builder emits no MN output and dashd expects
