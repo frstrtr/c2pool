@@ -1003,7 +1003,9 @@ nlohmann::json StratumSession::handle_configure(const nlohmann::json& params, co
             }
 
             // Negotiated mask = intersection of pool and miner masks
-            version_rolling_mask_ = POOL_VERSION_MASK & miner_mask;
+            const uint32_t pool_mask =
+                mining_interface_->get_stratum_config().version_rolling_pool_mask;
+            version_rolling_mask_ = pool_mask & miner_mask;
             version_rolling_enabled_ = true;
 
             std::ostringstream mask_ss;
@@ -1013,7 +1015,7 @@ nlohmann::json StratumSession::handle_configure(const nlohmann::json& params, co
             result["version-rolling.mask"] = mask_ss.str();
 
             LOG_INFO << "[Stratum] Version-rolling enabled, negotiated mask: " << mask_ss.str()
-                     << " (pool=" << std::hex << POOL_VERSION_MASK
+                     << " (pool=" << std::hex << pool_mask
                      << ", miner=" << miner_mask << ")" << std::dec;
 
         } else if (ext_name == "subscribe-extranonce") {

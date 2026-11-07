@@ -137,6 +137,10 @@ DASHWorkSource::DASHWorkSource(const coin::NodeCoinState& coin_state,
     // (WorkSnapshot::has_header) and suppresses the job otherwise. This also
     // makes the core's legacy stub-coinbase fallback unreachable for DASH.
     config_.require_job_snapshot = true;
+    // Dash Core v24 deploys v24 on version bit 13 and evo_shares on bit 14;
+    // a rolled version must not clear or set them (BIP320's 0x1fffe000 would
+    // let it). Bits 15..28 stay rollable.
+    config_.version_rolling_pool_mask = 0x1fff8000u;
     // Vardiff target share rate: adopt p2pool-dash's FIELD-TUNED default of 10s
     // per pseudoshare (p2pool-dash/p2pool/main.py:1153 default=10., dest='share_rate'),
     // not the 3s jtoomim/BTC default (stratum_types.hpp:40). DASH's variable X11

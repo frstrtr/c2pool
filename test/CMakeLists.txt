@@ -1136,6 +1136,7 @@ if (BUILD_TESTING AND GTest_FOUND)
     add_executable(test_dash_embedded_gbt
         test_dash_embedded_gbt.cpp
         test_dash_embedded_cbtx_byte_parity.cpp
+        test_dash_v24_cbtx.cpp            # Dash Core v24 CbTx version 4 (S1)
         test_dash_mnlistdiff_root_parity.cpp
         test_dash_qrinfo.cpp
         test_dash_rotated_quorum_members.cpp
@@ -1284,7 +1285,12 @@ if (BUILD_TESTING AND GTest_FOUND)
     # retained-fallback KAT; harness-free (embedded builder injected as a stub,
     # oracle-parity already pinned by test_dash_embedded_gbt). Same link set as
     # the embedded_gbt capstone (work_source.hpp includes embedded_gbt.hpp).
-    add_executable(test_dash_work_source test_dash_work_source.cpp)
+    # Second TU: test_dash_v24_deployments.cpp -- Dash Core v24 deployment
+    # tracking (versionbits port, EHF signal tracker, deployment status, the
+    # testnet replay of the 1,578,000 switch). Header-only; folded into this
+    # allowlisted target (a standalone one would be a NOT_BUILT sentinel, #769).
+    add_executable(test_dash_work_source test_dash_work_source.cpp
+        test_dash_v24_deployments.cpp)
     target_link_libraries(test_dash_work_source PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core

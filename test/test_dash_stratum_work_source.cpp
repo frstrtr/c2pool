@@ -229,6 +229,12 @@ TEST(DashStratumWorkSource, ConfigDefaultsMatchStratumConfigWithX11Overrides)
     EXPECT_DOUBLE_EQ(cfg.set_difficulty_multiplier, 1.0);
     // Runtime coin tag for the coin-agnostic core log lines (#732).
     EXPECT_EQ(cfg.coin_symbol, "DASH");
+    // Dash Core v24: version bits 13 (v24) and 14 (evo_shares) are never
+    // rollable; BIP320's default 0x1fffe000 would let a miner flip them.
+    EXPECT_EQ(cfg.version_rolling_pool_mask, 0x1fff8000u);
+    EXPECT_EQ(cfg.version_rolling_pool_mask & 0x6000u, 0u);
+    EXPECT_EQ(core::stratum::StratumConfig{}.version_rolling_pool_mask, 0x1fffe000u)
+        << "every other coin keeps the BIP320 default";
 }
 
 TEST(DashStratumWorkSource, WorkGenerationStartsZeroAndBumps)
