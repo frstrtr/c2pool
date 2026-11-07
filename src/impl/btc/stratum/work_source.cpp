@@ -289,7 +289,8 @@ nlohmann::json BTCWorkSource::get_current_work_template() const
     auto wd = cached_template();
     if (!wd) return nlohmann::json::object();
     nlohmann::json data = wd->m_data;
-    data["curtime"] = static_cast<int64_t>(std::time(nullptr));
+    data["curtime"] = static_cast<int64_t>(btc::coin::restamp_curtime(
+        data, static_cast<uint32_t>(std::time(nullptr))));
     return data;
 }
 
@@ -400,7 +401,8 @@ core::stratum::CoinbaseResult BTCWorkSource::build_connection_coinbase(
     uint32_t block_bits = 0;
     if (auto it = wd->m_data.find("bits"); it != wd->m_data.end() && it->is_string())
         block_bits = parse_be_hex_u32(it->get<std::string>());
-    const uint32_t curtime = static_cast<uint32_t>(std::time(nullptr));
+    const uint32_t curtime = btc::coin::restamp_curtime(
+        wd->m_data, static_cast<uint32_t>(std::time(nullptr)));
 
     // Detect segwit activation. GBT exposes this in two redundant ways:
     // a "rules" array containing "!segwit" or "segwit", or the presence of
