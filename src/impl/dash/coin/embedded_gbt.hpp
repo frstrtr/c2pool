@@ -44,6 +44,7 @@
 #include <impl/dash/coin/quorum_manager.hpp>
 #include <impl/dash/coin/dkg_commitments.hpp>   // E1: build_qc_tx (mandatory type-6 txs)
 #include <impl/dash/coin/vendor/cbtx.hpp>
+#include <impl/dash/coin/cbtx_asset_unlocks.hpp>  // Dash Core v24: CbTx v4 + merkleRootAssetUnlocks
 #include <impl/dash/coin/vendor/simplifiedmns.hpp>
 
 #include <btclibs/util/strencodings.h>          // HexStr (m_tx_data_hex fill)
@@ -104,7 +105,8 @@ inline bool underfill_guard_trips(uint64_t selected_bytes,
 inline vendor::CCbTx build_embedded_cbtx(
     uint32_t, const vendor::CSimplifiedMNList&, const QuorumManager&,
     int32_t, const std::array<uint8_t, 96>&, int64_t,
-    const uint256* quorum_root_override);
+    const uint256* quorum_root_override,
+    bool v24_active, const uint256& asset_unlock_root);
 inline std::vector<unsigned char> encode_cbtx(const vendor::CCbTx&);
 // Zero CLSIG default for the E2d best_cl_sig seam (no temporary-bound ref).
 inline const std::array<uint8_t, 96> k_zero_cl_sig{};
@@ -591,7 +593,11 @@ inline DashWorkData build_embedded_workdata(
     // c2pool-dash). nullptr => those two types are REFUSED (fail closed): a
     // stale-key ProUpServTx is bad-protx-sig on every block that carries it.
     // Only consulted when include_mn_special_txs admitted types 1-4.
-    const MnFoldContext::OperatorSigFn* protx_sig_verifier = nullptr)
+    const MnFoldContext::OperatorSigFn* protx_sig_verifier = nullptr,
+    // Dash Core v24: DEPLOYMENT_V24 is active for this block, so the CbTx is
+    // version 4 and commits merkleRootAssetUnlocks over this body. Default
+    // false => version 3, byte-identical for every existing caller.
+    bool v24_active = false)
 {
     DashWorkData w;
     w.m_height          = prev_height + 1;
@@ -1347,9 +1353,14 @@ inline DashWorkData build_embedded_workdata(
         // BuildNewListFromBlock). Otherwise commit the projected root.
         const vendor::CSimplifiedMNList& cbtx_sml =
             mn_folded_sml.has_value() ? *mn_folded_sml : proj.sml;
+        // Dash Core v24 CalcCbTxMerkleRootAssetUnlocks over the body this
+        // template carries (null until a stable-txid unlock rides it, which
+        // selection does not admit today).
+        const uint256 asset_unlock_root = compute_merkle_root_asset_unlocks(w.m_txs);
         vendor::CCbTx cb = build_embedded_cbtx(
             prev_height, cbtx_sml, *qmgr, best_cl_height, best_cl_sig,
-            accrued_credit_pool, quorum_root_override);
+            accrued_credit_pool, quorum_root_override,
+            v24_active, asset_unlock_root);
         w.m_coinbase_payload = encode_cbtx(cb);
     } else {
         w.m_coinbase_payload.clear();
@@ -1460,10 +1471,17 @@ inline vendor::CCbTx build_embedded_cbtx(
     // type-6 commitments over the active set). nullptr (default) => the
     // plain PROVEN active-set root — byte-identical for every pre-E1 caller
     // AND for all-null commitment sets.
-    const uint256* quorum_root_override = nullptr)
+    const uint256* quorum_root_override = nullptr,
+    // Dash Core v24 (CheckCbTx): version 4 exactly when DEPLOYMENT_V24 is
+    // active for the block (V20 is active for every block we build), with
+    // merkleRootAssetUnlocks (CalcCbTxMerkleRootAssetUnlocks over the body).
+    // false => version 3, byte-identical.
+    bool v24_active = false,
+    const uint256& asset_unlock_root = uint256::ZERO)
 {
     vendor::CCbTx c;
-    c.nVersion           = vendor::CCbTx::VERSION_CLSIG_AND_BALANCE;
+    c.nVersion           = required_cbtx_version(/*v20_active=*/true, v24_active);
+    if (v24_active) c.merkleRootAssetUnlocks = asset_unlock_root;
     c.nHeight            = static_cast<int32_t>(prev_height + 1);
     // CalcMerkleRoot() is const and does NOT cache — every call hashes the
     // full list (~2000 x SHA256d on mainnet). A prior comment here claimed
@@ -1552,6 +1570,17 @@ inline bool cbtx_xcheck(const vendor::CCbTx& embedded,
         LOG_WARNING << "[CBTX-XCHECK] merkleRootQuorums MISMATCH "
                     << "embedded=" << embedded.merkleRootQuorums.GetHex().substr(0, 16)
                     << " rpc="     << rpc_cbtx.merkleRootQuorums.GetHex().substr(0, 16);
+        roots_ok = false;
+    }
+
+    // Dash Core v24 (CbTx version 4): the asset-unlock root is derived from
+    // the block's own txs, so any difference is real drift.
+    if (embedded.nVersion >= vendor::CCbTx::VERSION_MERKLE_ROOT_ASSETUNLOCKS
+        && rpc_cbtx.nVersion >= vendor::CCbTx::VERSION_MERKLE_ROOT_ASSETUNLOCKS
+        && embedded.merkleRootAssetUnlocks != rpc_cbtx.merkleRootAssetUnlocks) {
+        LOG_WARNING << "[CBTX-XCHECK] merkleRootAssetUnlocks MISMATCH "
+                    << "embedded=" << embedded.merkleRootAssetUnlocks.GetHex().substr(0, 16)
+                    << " rpc="     << rpc_cbtx.merkleRootAssetUnlocks.GetHex().substr(0, 16);
         roots_ok = false;
     }
 

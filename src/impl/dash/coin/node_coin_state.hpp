@@ -33,9 +33,11 @@
 #include <impl/dash/coin/vendor/simplifiedmns.hpp> // vendor::CSimplifiedMNList (merkleRootMNList source)
 #include <impl/dash/coin/sml_projection.hpp>     // confirmedHash rollover projection + collateral-spend predicate
 #include <impl/dash/coin/vendor/cbtx.hpp>        // vendor::parse_cbtx (pre-emit CbTx self-check)
+#include <impl/dash/coin/cbtx_asset_unlocks.hpp> // Dash Core v24: required CbTx version + unlock root
 #include <impl/dash/coin/subsidy.hpp>            // compute_dash_platform_reward_post_v20_mn_rr (creditPool re-check)
 
 #include <impl/dash/coin/governance_object.hpp>  // SuperblockPayment (daemonless superblock schedule)
+#include <impl/dash/coin/deployment_status.hpp> // V24State (Dash Core v24 deployment state)
 
 #include <core/uint256.hpp>
 #include <core/p2p_message_stats.hpp>    // core::obs::inject_status (#157 read-only status mirror)
@@ -457,6 +459,22 @@ public:
     /// exactly one block's platform reward (constant 66,966,830 duffs).
     void set_mn_rr_height(int h) { m_mn_rr_height = h; }
     int mn_rr_height() const { return m_mn_rr_height; }
+
+    /// Dash Core v24: DeploymentActiveAfter(prev, DEPLOYMENT_V24) for the
+    /// block at a height (deployment_status.hpp). Unset => the process-wide
+    /// answer for the network (dash::coin::v24_state(net, h): the installed
+    /// status, else INACTIVE only below the earliest possible activation and
+    /// UNKNOWN from it on), so an unwired caller fails closed past the
+    /// earliest v24 height instead of building pre-v24 blocks. UNKNOWN
+    /// refuses the embedded template (cause v24-state-unknown): every v24 rule
+    /// of the block being built depends on it.
+    using V24StateFn = std::function<V24State(uint32_t height)>;
+    void set_v24_state_fn(V24StateFn fn) { m_v24_state_fn = std::move(fn); }
+    void set_v24_network(DashNetwork net) { m_v24_net = net; }
+    V24State v24_state_for(uint32_t height) const
+    {
+        return m_v24_state_fn ? m_v24_state_fn(height) : dash::coin::v24_state(m_v24_net, height);
+    }
 
     /// Network nMasternodeMinimumConfirmations (dashcore Params().GetConsensus()
     /// .nMasternodeMinimumConfirmations — per-chainparams: mainnet 15, testnet/
@@ -1796,6 +1814,27 @@ public:
         if (cb.nHeight != static_cast<int32_t>(next_h))
             return reject("emit-cbtx-height-drift", std::to_string(cb.nHeight),
                           std::to_string(next_h));
+        // Dash Core v24 CheckCbTx: version 4 exactly when v24 is active for
+        // this block (bad-cbtx-version otherwise), committing the asset-unlock
+        // root of THIS body (bad-cbtx-assetunlockmerkleroot).
+        {
+            const V24State v24 = v24_state_for(next_h);
+            if (v24 == V24State::UNKNOWN)
+                return reject("emit-v24-state-unknown", "h=" + std::to_string(next_h),
+                              "ehf-scan-or-pin");
+            const uint16_t want = required_cbtx_version(/*v20_active=*/true,
+                                                        v24 == V24State::ACTIVE);
+            if (cb.nVersion != want)
+                return reject("emit-cbtx-version", std::to_string(cb.nVersion),
+                              std::to_string(want));
+            if (cb.nVersion >= vendor::CCbTx::VERSION_MERKLE_ROOT_ASSETUNLOCKS) {
+                const uint256 root = compute_merkle_root_asset_unlocks(w.m_txs);
+                if (cb.merkleRootAssetUnlocks != root)
+                    return reject("emit-asset-unlock-root-drift",
+                                  cb.merkleRootAssetUnlocks.GetHex().substr(0, 16),
+                                  root.GetHex().substr(0, 16));
+            }
+        }
         // FINDING-1: the root block next_h must commit is the tip SML with the
         // verifier's height-driven confirmation pass applied (specialtxman.cpp
         // :206-215 — see sml_projection.hpp). Comparing against the RAW tip
@@ -2044,6 +2083,20 @@ public:
                                          utxo_immature,
                                          qc_pose ? &*qc_pose : nullptr);
         e.has_state = e.decline.viable;
+        // Dash Core v24: decided for the block being built (its parent is our
+        // tip). Never served on UNKNOWN; the dashd fallback (a v24 dashd)
+        // serves instead.
+        {
+            const V24State v24 = v24_state_for(m_prev_height + 1);
+            e.v24_active = v24 == V24State::ACTIVE;
+            if (e.has_state && v24 == V24State::UNKNOWN) {
+                e.decline.viable    = false;
+                e.decline.cause     = "v24-state-unknown";
+                e.decline.value     = "h=" + std::to_string(m_prev_height + 1);
+                e.decline.threshold = "ehf-scan-or-pin";
+                e.has_state         = false;
+            }
+        }
         // NAME THE STATE: while the UTXO lane is immature under the OPT-IN
         // serving policy we DO serve, but only a coinbase-only body. The
         // builder marks the template (m_txset_empty_cause) and logs the
@@ -2724,6 +2777,8 @@ private:
     bool     m_require_resolvable_payee{true};   // refuse embedded when a due MN payee is unresolvable (#996)
     bool     m_require_provable_payout_split{true}; // refuse embedded when the scheduled MN's operator-reward split is unproven (h=2516595 bad-cb-payee)
     int      m_mn_rr_height{DASH_MN_RR_HEIGHT_MAINNET}; // network MN_RR activation height (platform-share gate)
+    V24StateFn m_v24_state_fn;   // Dash Core v24 deployment state (unset => registry for m_v24_net)
+    DashNetwork m_v24_net{DashNetwork::MAINNET};
     int      m_mn_min_confirmations{DASH_MN_MIN_CONFIRMATIONS_MAINNET}; // network nMasternodeMinimumConfirmations (rollover projection)
     uint256  m_credit_pool_current_hash;     // block hash the credit-pool seed is current at
     int32_t  m_credit_pool_height{-1};       // seed cbTx's OWN height (-1 = never seeded)

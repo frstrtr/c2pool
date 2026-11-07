@@ -91,6 +91,14 @@ struct StratumConfig {
     // Default false: every other coin negotiates version-rolling as before.
     bool disable_version_rolling{false};
 
+    // ── Pool side of the BIP310 version-rolling mask ──────────────────────────
+    // The negotiated mask is this AND the miner's. The BIP320 default
+    // 0x1fffe000 (bits 13..28) suits coins whose versionbits deployments sit
+    // below bit 13. Dash Core v24 deploys on bits 13 (v24) and 14 (evo_shares),
+    // so the DASH lane narrows it to keep those two under the template's
+    // control. Default: every other coin byte-identical.
+    uint32_t version_rolling_pool_mask{0x1fffe000};
+
     // ── Live-session hygiene (production ZOMBIE-SESSION LEAK fix) ──────────
     // A NAT-dropped miner's TCP connection is frequently never FIN/RST'd, so
     // StratumSession::is_connected() (socket_.is_open()) stays true FOREVER and

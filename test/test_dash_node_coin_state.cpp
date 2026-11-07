@@ -2492,3 +2492,82 @@ TEST(DashNodeCoinState, TxInjectStatusPublishMirrorsArmFlag) {
     st.set_tx_inject_enabled(false);        // disarm mirrors too
     EXPECT_FALSE(core::obs::inject_status().enabled.load());
 }
+
+// ── Dash Core v24: the deployment-state seam (slice S0) ─────────────────────
+// The embedded template is decided for the block it builds: v24_active is
+// the state of prev+1, and an UNKNOWN state refuses the embedded arm with a
+// named cause (the dashd fallback serves). Unset, the seam is INACTIVE and
+// the template is byte-identical to before.
+TEST(DashNodeCoinState, V24StateSeamDecidesForTheBlockBeingBuilt) {
+    using dash::coin::V24State;
+    UTXOViewCache utxo(nullptr);
+    NodeCoinState st;
+    seed_single_mn(st, p2pkh_script(0x30));
+    st.mempool().set_utxo(&utxo);
+    const uint32_t bits = 0x1b104be3u, mtp = 1'700'000'000u;
+    st.set_tip(H - 2, raw256(0xA1), bits, mtp, DASH_PUBKEY_VER, DASH_P2SH_VER, mtp + 60, 0x20000000u);
+    ASSERT_TRUE(st.populated());
+    {
+        auto e = st.make_embedded_work_inputs();
+        EXPECT_TRUE(e.viable());
+        EXPECT_FALSE(e.v24_active) << "unset seam = pre-v24";
+    }
+    st.set_v24_state_fn([](uint32_t h) { return h >= H ? V24State::ACTIVE : V24State::INACTIVE; });
+    {
+        auto e = st.make_embedded_work_inputs();   // builds H-1
+        EXPECT_TRUE(e.viable());
+        EXPECT_FALSE(e.v24_active);
+    }
+    st.set_tip(H - 1, raw256(0xA2), bits, mtp, DASH_PUBKEY_VER, DASH_P2SH_VER, mtp + 60, 0x20002000u);
+    {
+        auto e = st.make_embedded_work_inputs();   // builds H
+        EXPECT_TRUE(e.viable());
+        EXPECT_TRUE(e.v24_active);
+        EXPECT_EQ(e.version, 0x20002000u) << "the tip advance's block version rides through";
+    }
+    st.set_v24_state_fn([](uint32_t) { return V24State::UNKNOWN; });
+    {
+        auto e = st.make_embedded_work_inputs();
+        EXPECT_FALSE(e.viable());
+        EXPECT_EQ(e.decline.cause, "v24-state-unknown");
+        EXPECT_EQ(e.decline.value, "h=" + std::to_string(H));
+        bool fallback_called = false;
+        auto sel = st.select_work([&]() { fallback_called = true; return DashWorkData{}; });
+        EXPECT_EQ(sel.source, WorkSource::DashdFallback);
+        EXPECT_TRUE(fallback_called);
+        EXPECT_EQ(sel.decline.cause, "v24-state-unknown");
+    }
+}
+
+// VERIFY-H0-S0-S1 N2: an unwired seam does not mean "pre-v24". It falls back
+// to the process-wide answer for the network: mainnet without an installed
+// status is INACTIVE only below the earliest possible activation (2,580,480)
+// and UNKNOWN from it on, so the arm fails closed instead of building a
+// pre-v24 block on a chain that may be v24.
+TEST(DashNodeCoinState, V24UnsetSeamFallsBackToTheNetworkAnswer) {
+    UTXOViewCache utxo(nullptr);
+    NodeCoinState st;
+    seed_single_mn(st, p2pkh_script(0x30));
+    st.mempool().set_utxo(&utxo);
+    const uint32_t bits = 0x1b104be3u, mtp = 1'700'000'000u;
+    st.set_tip(2'580'478, raw256(0xB1), bits, mtp, DASH_PUBKEY_VER, DASH_P2SH_VER, mtp + 60, 0x20000000u);
+    ASSERT_TRUE(st.populated());
+    {
+        auto e = st.make_embedded_work_inputs();   // builds 2,580,479
+        EXPECT_TRUE(e.viable());
+        EXPECT_FALSE(e.v24_active);
+    }
+    st.set_tip(2'580'479, raw256(0xB2), bits, mtp, DASH_PUBKEY_VER, DASH_P2SH_VER, mtp + 60, 0x20000000u);
+    {
+        auto e = st.make_embedded_work_inputs();   // builds 2,580,480
+        EXPECT_FALSE(e.viable());
+        EXPECT_EQ(e.decline.cause, "v24-state-unknown");
+    }
+    // Testnet: the buried height (1,578,000) decides.
+    st.set_v24_network(dash::coin::DashNetwork::TESTNET);
+    {
+        auto e = st.make_embedded_work_inputs();
+        EXPECT_TRUE(e.viable());
+        EXPECT_TRUE(e.v24_active);
+    }
+}

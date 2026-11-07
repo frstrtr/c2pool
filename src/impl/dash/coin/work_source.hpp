@@ -106,6 +106,10 @@ struct EmbeddedWorkInputs {
     // defaults (std::time(nullptr) / 0x20000000 BIP9 baseline).
     uint32_t              curtime{0};
     uint32_t              version{0};
+    // Dash Core v24: DEPLOYMENT_V24 is active for the block being built
+    // (NodeCoinState::set_v24_state_fn; UNKNOWN never reaches the builder).
+    // false => the pre-v24 template, byte-identical.
+    bool                  v24_active{false};
 
     // CCbTx (DIP-0004 type-5 extra_payload) seams. When sml AND qmgr are both
     // non-null, build_embedded_workdata folds the real type-5 payload
@@ -338,7 +342,9 @@ inline WorkSelection select_dash_work(
                 emb.qc_pose_members, emb.qc_pose_oracle,
                 // B.9: ProUpServTx / ProUpRevTx operator-signature verifier
                 // (null => those types are refused by the fold).
-                emb.protx_sig_verifier);
+                emb.protx_sig_verifier,
+                // Dash Core v24: CbTx version 4 when v24 is active for the block.
+                emb.v24_active);
         },
         dashd_fallback);
 }
