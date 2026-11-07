@@ -169,6 +169,9 @@ inline MnFoldOutcome apply_mn_special_tx_to_sml(
         vendor::CProRegTx pl;
         if (!vendor::parse_protx_payload(tx.extra_payload, pl))
             return MnFoldOutcome::Refused;
+        // A v3 (ExtAddr, Dash Core v24) leaf carries an ExtNetInfo this fold
+        // does not build yet: refuse rather than emit a v2-shaped v3 leaf.
+        if (pl.nVersion >= vendor::ProTxVersion::EXT_ADDR) return MnFoldOutcome::Refused;
 
         // The new registration's proRegTxHash is the ProRegTx's own txid
         // (dashd: newState->proTxHash = tx.GetHash()).
@@ -207,8 +210,10 @@ inline MnFoldOutcome apply_mn_special_tx_to_sml(
         vendor::CProUpServTx pl;
         if (!vendor::parse_protx_payload(tx.extra_payload, pl))
             return MnFoldOutcome::Refused;
+        if (pl.nVersion >= vendor::ProTxVersion::EXT_ADDR) return MnFoldOutcome::Refused;
         auto* e = detail::find_entry(list, pl.proTxHash);
         if (e == nullptr) return MnFoldOutcome::Refused;
+        if (e->has_ext_netinfo()) return MnFoldOutcome::Refused;   // v24 SetStateVersion not ported
         e->netAddress = pl.netInfo.canonical().ip;
         e->netPort    = pl.netInfo.canonical().port_be;
         if (e->nType == vendor::CSimplifiedMNListEntry::TYPE_EVO) {
@@ -228,8 +233,10 @@ inline MnFoldOutcome apply_mn_special_tx_to_sml(
         vendor::CProUpRegTx pl;
         if (!vendor::parse_protx_payload(tx.extra_payload, pl))
             return MnFoldOutcome::Refused;
+        if (pl.nVersion >= vendor::ProTxVersion::EXT_ADDR) return MnFoldOutcome::Refused;
         auto* e = detail::find_entry(list, pl.proTxHash);
         if (e == nullptr) return MnFoldOutcome::Refused;
+        if (e->has_ext_netinfo()) return MnFoldOutcome::Refused;   // v24 SetStateVersion not ported
         e->keyIDVoting = pl.keyIDVoting;
         // Operator-key change (dashd compares the keys as CBLSLazyPublicKey —
         // bytes under one scheme, points across schemes) ⇒ ResetOperatorFields
@@ -255,8 +262,11 @@ inline MnFoldOutcome apply_mn_special_tx_to_sml(
         vendor::CProUpRevTx pl;
         if (!vendor::parse_protx_payload(tx.extra_payload, pl))
             return MnFoldOutcome::Refused;
+        if (pl.nVersion >= vendor::ProTxVersion::EXT_ADDR) return MnFoldOutcome::Refused;
         auto* e = detail::find_entry(list, pl.proTxHash);
         if (e == nullptr) return MnFoldOutcome::Refused;
+        // After v24 a revocation keeps a v3 state's version; not ported.
+        if (e->has_ext_netinfo()) return MnFoldOutcome::Refused;
         // ResetOperatorFields + ban (nVersion back to LegacyBLS): invalid
         // until a fresh ProUpRegTx(new key) + ProUpServTx pair.
         detail::reset_operator_fields(*e);
@@ -591,8 +601,16 @@ update_target_refusal(const vendor::CSimplifiedMNList& base,
     if (ov.removed.count(pro))
         return "bad-protx-hash (" + pro.GetHex().substr(0, 16)
              + " was removed earlier in this block)";
-    for (const auto& e : list)
-        if (e.proRegTxHash == pro) return std::nullopt;
+    for (const auto& e : list) {
+        if (e.proRegTxHash != pro) continue;
+        // Dash Core v24: an update of a version-3 (ExtAddr) state goes
+        // through SetStateVersion (target max(state, tx), netInfo
+        // conversion), which this fold does not implement: refuse by name.
+        if (be_out->has_ext_netinfo() || e.has_ext_netinfo())
+            return "bad-protx-version (target entry " + pro.GetHex().substr(0, 16)
+                 + " is nVersion=3, ExtAddr — DEPLOYMENT_V24 transitions are not ported)";
+        return std::nullopt;
+    }
     return "bad-protx-hash (" + pro.GetHex().substr(0, 16) + " not in the folded list)";
 }
 

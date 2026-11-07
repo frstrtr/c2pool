@@ -278,6 +278,15 @@ public:
         // mutation and the cursor did not move — the held set is still exactly
         // the post-state of the cursor block. The caller must not serve on
         // this block (demote); the valid block at this height still folds.
+        //
+        // Also set, with the same no-mutation guarantee, when the block
+        // carries a provider tx this machine cannot fold exactly (Dash Core
+        // v24 fail-closed rule, see provider_tx_unfoldable): a ProTx payload
+        // that does not parse or has a version this state model cannot
+        // represent (ExtAddr v3 or unknown), a v24 provider type 10-12, or a
+        // ProTx naming a masternode whose state is version 3. Those reasons
+        // start with "unfoldable:" -- the block may be valid for dashd; the
+        // projection just refuses to guess its effect.
         std::string refused;
     };
 
@@ -2217,6 +2226,10 @@ private:
                 if (auto why = contextual_tx_check(tx, i == 0))
                     return "tx[" + std::to_string(i) + "]: " + std::string(*why);
             }
+            if (i != 0) {
+                if (auto why = provider_tx_unfoldable(tx))
+                    return "tx[" + std::to_string(i) + "]: " + *why;
+            }
             if (i == 0 || tx.type != vendor::CProUpServTx::SPECIALTX_TYPE
                 || tx.extra_payload.empty())
                 continue;
@@ -2230,6 +2243,65 @@ private:
                 return "tx[" + std::to_string(i) + "]: bad-protx-type-mismatch (ProUpServTx nType="
                      + std::to_string(ptx.nType) + ", registered nType="
                      + std::to_string(it->second.nType) + ")";
+        }
+        return std::nullopt;
+    }
+
+    /// FAIL-CLOSED RULE for provider txs (Dash Core v24; the B4 hotfix of the
+    /// v24 design). Before this rule a ProTx payload that failed to parse was
+    /// logged and SKIPPED by apply_block, so the payee set silently drifted
+    /// from dashd's. Now the whole block is refused before any mutation when
+    /// it carries a provider tx whose effect this machine cannot fold
+    /// exactly:
+    ///   * a type 1-4 payload that does not parse, or whose version is not
+    ///     one the codec knows (vendor::parse_protx_payload);
+    ///   * a version-3 (ExtAddr) payload: MNState has no payout list, share
+    ///     table or extended netInfo yet (the v24 state transitions are
+    ///     slice S3);
+    ///   * a type 2-4 payload naming a held masternode whose state is
+    ///     version 3, for the same reason;
+    ///   * a v24 provider type 10-12 (contextual_tx_check already refuses
+    ///     these at DIP3 heights as bad-txns-type; this covers every height).
+    /// Before DEPLOYMENT_V24 none of these can occur in a block dashd
+    /// accepts, so a valid pre-v24 block folds exactly as before.
+    std::optional<std::string> provider_tx_unfoldable(const MutableTransaction& tx) const
+    {
+        if (tx_type_is_v24_provider(tx.type))
+            return "unfoldable: v24 provider tx type " + std::to_string(tx.type)
+                 + " (shared-masternode transitions are not ported) - fail closed";
+        if (tx.type < 1 || tx.type > 4) return std::nullopt;
+        if (!tx_has_extra_payload(tx.version, tx.type) && tx.extra_payload.empty()) return std::nullopt;
+
+        uint16_t version{0};
+        const uint256* target{nullptr};
+        bool parsed{false};
+        vendor::CProRegTx reg;
+        vendor::CProUpServTx serv;
+        vendor::CProUpRegTx upreg;
+        vendor::CProUpRevTx rev;
+        switch (tx.type) {
+        case 1: parsed = vendor::parse_protx_payload(tx.extra_payload, reg);   version = reg.nVersion; break;
+        case 2: parsed = vendor::parse_protx_payload(tx.extra_payload, serv);  version = serv.nVersion;
+                target = &serv.proTxHash;  break;
+        case 3: parsed = vendor::parse_protx_payload(tx.extra_payload, upreg); version = upreg.nVersion;
+                target = &upreg.proTxHash; break;
+        case 4: parsed = vendor::parse_protx_payload(tx.extra_payload, rev);   version = rev.nVersion;
+                target = &rev.proTxHash;   break;
+        }
+        static constexpr const char* kNames[] = {"", "ProRegTx", "ProUpServTx", "ProUpRegTx", "ProUpRevTx"};
+        if (!parsed)
+            return std::string("unfoldable: ") + kNames[tx.type] + " payload does not parse (nVersion="
+                 + std::to_string(version) + ") - fail closed, never skipped";
+        if (version >= vendor::ProTxVersion::EXT_ADDR)
+            return std::string("unfoldable: ") + kNames[tx.type] + " nVersion="
+                 + std::to_string(version)
+                 + " (ExtAddr, Dash Core v24): no payout-list / extended-netInfo state yet - fail closed";
+        if (target) {
+            auto it = m_entries.find(*target);
+            if (it != m_entries.end() && it->second.nVersion >= vendor::ProTxVersion::EXT_ADDR)
+                return std::string("unfoldable: ") + kNames[tx.type] + " for masternode "
+                     + target->GetHex().substr(0, 16) + " whose state is nVersion="
+                     + std::to_string(it->second.nVersion) + " (ExtAddr) - fail closed";
         }
         return std::nullopt;
     }
