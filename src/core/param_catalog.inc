@@ -825,5 +825,8 @@ C2P_PARAM("utility.max_nonce", Meta, INT64, RESTART, C_DASH, LIT, "4294967295", 
 C2P_PARAM("bls.allow_stub", Gate, BOOL, RESTART, C_DASH, LIT, "false", NONE, "knowingly run a bls=stub (BLS-dark) build in a BLS-relying config")
   C2P_ALIAS("bls.allow_stub", BIN_DASH, "--allow-stub-bls", FLAG)
 
+C2P_PARAM("dash.v24_activation_height", Embedded, INT64, RESTART, C_DASH, NONE, "", NONE, "pin the Dash Core v24 activation height once locked in (unset: follow the EHF signals)")
+  C2P_ALIAS("dash.v24_activation_height", BIN_DASH, "--dash-v24-activation-height", VALUE)
+
 #undef C2P_PARAM
 #undef C2P_ALIAS
