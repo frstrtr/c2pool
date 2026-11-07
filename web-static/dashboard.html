@@ -2856,6 +2856,7 @@
                     // Update count badge: active count (/ total if showing historical)
                     var activeCount = allMiners.filter(function(m) { return m.totalConnections > 0 || m.nonStratum; }).length;
                     d3.select('#active_miners_count').text(showHistorical ? activeCount + ' / ' + allMiners.length : activeCount);
+                    if (window._relayGateMinerCounts) window._relayGateMinerCounts();
                 
                     // Show top 10 active, or all historical
                     var display = showHistorical ? filtered : filtered.slice(0, 10);
@@ -2867,7 +2868,7 @@
                     d3.select('#active_miners tbody').append('tr').append('td')
                         .attr('colspan', '10')
                         .attr('style', 'text-align: center; color: #888;')
-                        .text(showHistorical ? 'No miners found' : 'No miners currently connected via stratum');
+                        .text(showHistorical ? 'No miners found' : (window._c2poolRelayNode ? 'Not applicable: relay node' : 'No miners currently connected via stratum'));
                     return;
                 }
                 
@@ -3721,6 +3722,24 @@
             }
         }
 
+        // #942 residual: on a relay node the miner-count cards are not
+        // applicable, so a zero there is not a measurement and reads "n/a".
+        // A non-zero count is still a real reading and is left alone. Called
+        // after every writer of these cards, whichever renders first.
+        window._relayGateMinerCounts = function () {
+            if (!window._c2poolRelayNode) return;
+            var NA_TITLE = 'Relay node: no local miners are possible here';
+            var badge = document.getElementById('active_miners_count');
+            if (badge && badge.textContent === '0') { badge.textContent = 'n/a'; badge.title = NA_TITLE; }
+            ['graph-miners', 'fs-graph-miners'].forEach(function (id) {
+                var el = document.getElementById(id);
+                if (el && el.textContent === '0/0') { el.textContent = 'n/a'; el.title = NA_TITLE; }
+            });
+            var cells = document.querySelectorAll('#active_miners tbody td');
+            if (cells.length === 1 && cells[0].textContent === 'No miners currently connected via stratum')
+                cells[0].textContent = 'Not applicable: relay node';
+        };
+
         function renderLocalStats(local_stats) {
                 d3.select('#peers_in').text(local_stats.peers.incoming);
                 d3.select('#peers_out').text(local_stats.peers.outgoing);
@@ -3735,6 +3754,13 @@
                 d3.select('#local_rate').text(_relayNode ? 'n/a (relay node)' : format_hashrate(local));
                 d3.select('#local_doa').text(_relayNode ? 'n/a' : (local > 0 ? d3.format('.2p')(local_dead/local) : '0%'));
                 d3.select('#node_role_note').style('display', _relayNode ? null : 'none');
+                window._c2poolRelayNode = _relayNode;
+                if (_relayNode) {
+                    d3.select('#node_role_note').text(local_stats.node_role_basis === 'no_template_source'
+                        ? 'Relay node: no coin daemon or embedded template source is attached, so miners cannot get work here. An empty list is expected on this node, not a fault.'
+                        : 'Relay node: no Stratum acceptor runs here, so no miners can connect to it. An empty list is expected on this node, not a fault.');
+                    window._relayGateMinerCounts();
+                }
 
                 // #959: an authorized session that stops sharing is SILENT. Nodes
                 // are peers, so a rig may keep a failover (standby) connection
@@ -8647,6 +8673,7 @@
             var currentUniqueMinerCount = uniqueMiners.length > 0 ? uniqueMiners[uniqueMiners.length - 1][1] : 0;
             currentUniqueMinerCount = (currentUniqueMinerCount === null || currentUniqueMinerCount === undefined) ? 0 : Math.round(currentUniqueMinerCount);
             document.getElementById('graph-miners').textContent = currentWorkerCount + '/' + currentUniqueMinerCount;
+            if (window._relayGateMinerCounts) window._relayGateMinerCounts();
             
             // luckTrendData empty => no observed block AND no live-extrapolation
             // input: render the honest "accumulating" state, not a bare "-".
@@ -9381,6 +9408,7 @@
             var fsUniqueMinerCount = uniqueMinerCount.length > 0 ? uniqueMinerCount[uniqueMinerCount.length - 1][1] : 0;
             fsUniqueMinerCount = (fsUniqueMinerCount === null || fsUniqueMinerCount === undefined) ? 0 : Math.round(fsUniqueMinerCount);
             document.getElementById('fs-graph-miners').textContent = fsWorkerCount + '/' + fsUniqueMinerCount;
+            if (window._relayGateMinerCounts) window._relayGateMinerCounts();
             
             // Same honest empty-state as the compact chart, scoped to the
             // fullscreen legend/stat.
