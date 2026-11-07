@@ -116,6 +116,7 @@ private:
     std::string worker_name_;  // worker suffix from "ADDRESS.worker" (e.g. "alpha")
     bool subscribed_ = false;
     bool authorized_ = false;
+    bool empty_script_warned_ = false;  // empty-script guard: WARNING once per session
     bool need_initial_setup_ = false;
     static std::atomic<uint64_t> job_counter_;
 
