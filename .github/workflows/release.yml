@@ -744,6 +744,81 @@ jobs:
           if-no-files-found: warn
 
   # ════════════════════════════════════════════════════════════════════════════
+  # Bare-start smoke: unpack each Linux tarball in a pristine ubuntu:24.04
+  # container -- no build deps, no LD_LIBRARY_PATH, no start.sh -- and start
+  # the binary the way a new user does. The build host has every -dev package
+  # installed, so the package-time --help smoke there cannot see a missing
+  # bundle; the v0.2.8 tarball needed LD_LIBRARY_PATH=./lib on a pristine host
+  # (#1906 repro). GitHub-hosted on purpose: a fresh VM per run is the
+  # pristine host. Fails closed on an unresolved library, a loader error, or a
+  # crash; a cell whose package job produced nothing is skipped (its red or
+  # skip is already on the run).
+  # ════════════════════════════════════════════════════════════════════════════
+  linux-bare-start:
+    name: ${{ matrix.coin }} bare-start smoke (pristine ubuntu:24.04)
+    runs-on: ubuntu-24.04
+    needs: [linux]
+    if: always()
+    container: ubuntu:24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        coin: ${{ fromJSON(github.event.inputs.coins || '["btc","ltc","dgb","dash","bch","bip110"]') }}
+    steps:
+      - name: Download package
+        id: dl
+        continue-on-error: true
+        uses: actions/download-artifact@v7
+        with:
+          name: pkg-linux-${{ matrix.coin }}
+          path: pkg
+
+      - name: Bare start
+        if: steps.dl.outcome == 'success'
+        shell: bash
+        env:
+          COIN: ${{ matrix.coin }}
+        run: |
+          set -euo pipefail
+          unset LD_LIBRARY_PATH
+          cd pkg
+          tar xzf c2pool-"${COIN}"-*-linux-x86_64.tar.gz
+          cd c2pool-"${COIN}"-*-linux-x86_64/
+          BIN="./c2pool-${COIN}"
+          echo "== ldd (no LD_LIBRARY_PATH)"
+          ldd "$BIN"
+          if ldd "$BIN" | grep -q 'not found'; then
+            echo "BARE-START FAIL: $BIN has unresolved libraries on pristine ubuntu:24.04 without LD_LIBRARY_PATH"
+            exit 1
+          fi
+          echo "== $BIN --help"
+          set +e
+          "$BIN" --help > help.log 2>&1
+          rc=$?
+          set -e
+          head -20 help.log
+          if grep -q 'error while loading shared libraries' help.log || [ "$rc" -ge 126 ]; then
+            echo "BARE-START FAIL: $BIN --help exited $rc"
+            exit 1
+          fi
+          # Liveness: start the node with defaults and require it to still be
+          # running after 30s. rc 124 is timeout firing on a live process (137
+          # if it ignored SIGINT and needed the -k KILL); anything else means
+          # it exited or crashed on a bare start.
+          echo "== $BIN --run (30s liveness)"
+          set +e
+          timeout -k 10 -s INT 30 "$BIN" --run > run.log 2>&1
+          rc=$?
+          set -e
+          tail -40 run.log
+          if [ "$rc" -ne 124 ] && [ "$rc" -ne 137 ]; then
+            echo "BARE-START FAIL: $BIN --run exited $rc within 30s on a bare start"
+            exit 1
+          fi
+          echo "Bare-start smoke passed for c2pool-${COIN}"
+
+  # ════════════════════════════════════════════════════════════════════════════
   # Aggregate: single SHA256SUMS over every produced package; on tags,
   # attach everything to a DRAFT release (operator publishes manually).
   # if: always() — runs even when some coin cells are red or skipped, so a
