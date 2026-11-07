@@ -68,6 +68,39 @@ TEST(WebHonestyRegression, GetInfoSourcesLiveHooksNotZeroStubs) {
         << "difficulty must come from the live sharechain stats hook";
 }
 
+// #891 coin-side: the DASH path never fills m_cached_template, so getinfo
+// reported blocks=0 on a node synced to the mainnet tip (contabo :8082 /
+// :8087, 2026-10-30) while networkhashps was already live. blocks must fall
+// back to the coin-work summary height.
+TEST(WebHonestyRegression, GetInfoBlocksFallsBackToCoinWorkHeight) {
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr);
+    mi.set_coin_work_fn([] {
+        MiningInterface::CoinWorkInfo cw;
+        cw.valid = true;
+        cw.height = 2563570;
+        cw.network_difficulty = 97544222.37;
+        return cw;
+    });
+
+    json r = mi.getinfo("kat");
+    EXPECT_EQ(r["blocks"].get<uint64_t>(), 2563570u)
+        << "blocks must come from the coin-work summary when no template is cached";
+}
+
+// An invalid (not yet sourced) coin-work summary must not leak its height.
+TEST(WebHonestyRegression, GetInfoBlocksIgnoresInvalidCoinWork) {
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr);
+    mi.set_coin_work_fn([] {
+        MiningInterface::CoinWorkInfo cw;
+        cw.valid = false;
+        cw.height = 12345;
+        return cw;
+    });
+
+    json r = mi.getinfo("kat");
+    EXPECT_EQ(r["blocks"].get<uint64_t>(), 0u);
+}
+
 // Belt-and-braces: a nodeless interface with NO hooks still returns a
 // well-formed object whose un-stub keys are STRUCTURALLY present (value 0).
 // Absent telemetry reporting a structural 0 ("not instrumented") is honest --
