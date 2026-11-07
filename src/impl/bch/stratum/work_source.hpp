@@ -171,6 +171,18 @@ public:
     void update_stratum_worker(const std::string& session_id,
                                double hashrate, double dead_hashrate, double difficulty,
                                uint64_t accepted, uint64_t rejected, uint64_t stale) override;
+    /// Refresh the session's TCP round-trip latency (ms). The stratum session
+    /// samples it from the kernel on every accepted submit; without this
+    /// override the base no-op kept the value sampled at authorize, so the
+    /// dashboard's Latency column froze at the connect-time reading. An
+    /// update for an unregistered session is dropped, never inserted.
+    void update_stratum_worker_rtt(const std::string& session_id, double rtt_ms) override;
+
+    /// Thread-safe snapshot of the per-connection worker registry
+    /// (session_id -> WorkerInfo). The BCH stratum acceptor runs against this
+    /// work source, not the web MiningInterface, so this registry is the
+    /// ground truth the dashboard reads through set_stratum_workers_fn.
+    std::map<std::string, core::stratum::WorkerInfo> get_stratum_workers() const;
 
     // ── IWorkSource: work generation ─────────────────────────────────────
     nlohmann::json                       get_current_work_template() const override;

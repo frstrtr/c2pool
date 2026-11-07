@@ -798,6 +798,15 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
         // web-static so "/" resolves. Display-only — no share/reward/consensus.
         // src/impl/bch only (PER-COIN ISOLATION); zero src/core edits.
         mi->set_dashboard_always_ready(true);
+        // Bridge the stratum worker registry: sessions register on
+        // BCHWorkSource (the acceptor's IWorkSource), not on the web
+        // MiningInterface, so without this provider stratum.html and
+        // /local_stats listed no BCH workers at all. Mirrors main_btc.cpp /
+        // main_dash.cpp. Display-only.
+        mi->set_stratum_workers_fn([ws = work_source.get()]() {
+            return ws ? ws->get_stratum_workers()
+                      : std::map<std::string, core::stratum::WorkerInfo>{};
+        });
         web_server->set_dashboard_dir("web-static");
 
         // D-BCH dashboard feeds (integrator 2026-08-03): wire the live BCH
