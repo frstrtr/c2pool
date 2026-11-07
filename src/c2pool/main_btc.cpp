@@ -35,6 +35,7 @@
 #include <impl/btc/coin/header_chain.hpp>
 #include <impl/btc/coin/template_builder.hpp> // btc::coin::get_block_subsidy — zero-rig block-value projection (dashboard cards)
 #include <impl/btc/coin/tip_reconcile_gate.hpp> // B5b: TipReconcileGate SSOT (10s re-poll cadence + fire predicate) shared with tip_reconcile_test.cpp
+#include <impl/btc/coin/stale_submit_classifier.hpp> // B5: stale-submit sibling-aware verdict SSOT shared with stale_submit_classifier_test.cpp
 #include <impl/btc/coin/mempool.hpp>
 #include <impl/btc/coin/node.hpp>
 #include <impl/btc/coin/coin_peer_manager.hpp> // btc::coin::BtcCoinPeerManager -- BTC-ISOLATED scored/diverse coin-network peer discovery (--coin-p2p-discover)
@@ -1382,36 +1383,63 @@ int main(int argc, char* argv[])
                 BTC_PROTOCOL_VERSION, {locator}, uint256::ZERO);
         });
 
-    // B5: stale-submit warning timer. Every 30s, scan pending_submits for
-    // entries older than 60s and log [BTC-SUBMIT] STALE — typically means
-    // bitcoind rejected the block (consensus failure / dup hash / wrong
-    // chain) since an accepted submission should appear in HeaderChain
-    // within seconds. The recursive scheduler uses weak_ptr to itself to
-    // avoid a self-referencing shared_ptr cycle.
+    // B5: stale-submit warning timer. Every 30s, classify pending_submits
+    // older than kStaleSubmitAfter (60s) against HeaderChain's best chain at
+    // the submit's height (btc::coin::classify_pending_submit SSOT):
+    //   Confirmed     -> our block is there (late roundtrip), info log
+    //   SiblingFilled -> a different block (typically one of our own same-height
+    //                    siblings) holds the height; Core silently ignores a
+    //                    same-work second-seen sibling, so this is a lost race,
+    //                    not a reject: info log, no warning
+    //   Stale         -> HeaderChain has nothing at that height: warn as before
+    // The recursive scheduler uses weak_ptr to itself to avoid a
+    // self-referencing shared_ptr cycle.
     auto warn_timer    = std::make_shared<boost::asio::steady_timer>(ioc);
     auto schedule_warn = std::make_shared<std::function<void()>>();
     std::weak_ptr<std::function<void()>> weak_warn = schedule_warn;
-    *schedule_warn = [warn_timer, pending_mu, pending_submits, weak_warn]() {
+    *schedule_warn = [warn_timer, pending_mu, pending_submits, weak_warn, &header_chain]() {
         warn_timer->expires_after(std::chrono::seconds(30));
-        warn_timer->async_wait([warn_timer, pending_mu, pending_submits, weak_warn]
+        warn_timer->async_wait([warn_timer, pending_mu, pending_submits, weak_warn, &header_chain]
                                (const boost::system::error_code& ec) {
             if (ec) return;
             {
+                using btc::coin::PendingSubmitVerdict;
                 std::lock_guard<std::mutex> lk(*pending_mu);
                 auto now = std::chrono::steady_clock::now();
                 for (auto it = pending_submits->begin(); it != pending_submits->end(); ) {
-                    auto age_s = std::chrono::duration_cast<std::chrono::seconds>(
-                        now - it->second.submitted_at).count();
-                    if (age_s >= 60) {
+                    auto age = std::chrono::duration_cast<std::chrono::seconds>(
+                        now - it->second.submitted_at);
+                    std::optional<uint256> best_at_height;
+                    if (age >= btc::coin::kStaleSubmitAfter) {
+                        if (auto e = header_chain.get_header_by_height(it->second.height))
+                            best_at_height = e->block_hash;
+                    }
+                    switch (btc::coin::classify_pending_submit(age, it->first, best_at_height)) {
+                    case PendingSubmitVerdict::Pending:
+                        ++it;
+                        continue;
+                    case PendingSubmitVerdict::Confirmed:
+                        LOG_INFO << "[BTC-SUBMIT] roundtrip CONFIRMED (late): block "
+                                 << it->first.GetHex().substr(0, 16)
+                                 << " height=" << it->second.height
+                                 << " pending " << age.count() << "s";
+                        break;
+                    case PendingSubmitVerdict::SiblingFilled:
+                        LOG_INFO << "[BTC-SUBMIT] SIBLING: block "
+                                 << it->first.GetHex().substr(0, 16)
+                                 << " height=" << it->second.height
+                                 << " lost to " << best_at_height->GetHex().substr(0, 16)
+                                 << " at the same height (not a reject)";
+                        break;
+                    case PendingSubmitVerdict::Stale:
                         LOG_WARNING << "[BTC-SUBMIT] STALE: block "
                                     << it->first.GetHex().substr(0, 16)
                                     << " height=" << it->second.height
-                                    << " pending " << age_s
-                                    << "s — bitcoind likely rejected";
-                        it = pending_submits->erase(it);
-                    } else {
-                        ++it;
+                                    << " pending " << age.count()
+                                    << "s, height not on HeaderChain — bitcoind likely rejected";
+                        break;
                     }
+                    it = pending_submits->erase(it);
                 }
             }
             if (auto self = weak_warn.lock()) (*self)();
