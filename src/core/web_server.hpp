@@ -2610,6 +2610,9 @@ class WebServer
     uint16_t port_;
     uint16_t stratum_port_;  // Explicit Stratum port configuration
     bool running_;
+    // Set once the template refresh (one-shot fetch + no-embedded GBT poll)
+    // is armed, so start() and set_coin_node() never arm it twice.
+    std::atomic<bool> rpc_work_armed_{false};
     bool testnet_;
     Blockchain blockchain_;
     // Live HTTP sessions and their cap (0: unlimited), from the node's fd
@@ -2756,6 +2759,8 @@ private:
     void execute_debounced_work_refresh(core::RefreshCause cause);
     // Arm the transaction-triggered refresh timer for `at`.
     void arm_tx_refresh_timer(core::TxRefreshPacer::clock::time_point at);
+    // Arm the one-shot template fetch + the no-embedded GBT poll (once).
+    void arm_rpc_work_refresh();
 };
 
 // StratumSession and StratumServer — see stratum_server.hpp

@@ -11492,57 +11492,9 @@ bool WebServer::start()
             start_stratum_server();
         }
 
-        // One-shot initial template fetch: populate the cache before any events fire.
-        // After this, all template updates are event-driven (bestblock, best_share_changed).
-        // p2pool has no recurring refresh timer — Twisted reactor events handle everything.
-        if (m_coin_node_ && m_coin_node_->has_rpc()) {
-            auto timer = std::make_shared<net::steady_timer>(ioc_);
-            timer->expires_after(std::chrono::milliseconds(500));
-            timer->async_wait([this, timer](beast::error_code ec) {
-                if (ec || !running_) return;
-                try { mining_interface_->refresh_work(); }
-                catch (const std::exception& e) { LOG_WARNING << "initial refresh_work failed: " << e.what(); }
-                catch (...) { LOG_WARNING << "initial refresh_work failed: unknown error"; }
-                LOG_INFO << "Initial block template fetched";
-            });
-        }
-
-        // ── No-embedded RPC mode: recurring getblocktemplate poll ─────────────
-        // The one-shot fetch above is the ONLY template refresh in --no-embedded
-        // mode: there is no embedded header-sync on_new_headers callback and no
-        // ZMQ/longpoll subscription to fire "bestblock" events (embedded mode drives
-        // refresh via on_new_headers → trigger_work_refresh). If the daemon was still
-        // in IBD at the 500ms one-shot, m_work_valid stayed false and never recovered
-        // because nothing polls again. Add a recurring poll that (a) bootstraps the
-        // cache once the daemon leaves IBD and (b) re-notifies miners when the network
-        // tip advances — replacing the event source embedded mode gets for free.
-        if (m_coin_node_ && m_coin_node_->has_rpc() && !m_coin_node_->is_embedded()) {
-            auto poll = std::make_shared<net::steady_timer>(ioc_);
-            auto prev_hash = std::make_shared<std::string>();
-            auto poll_fn = std::make_shared<std::function<void(beast::error_code)>>();
-            *poll_fn = [this, poll, prev_hash, poll_fn](beast::error_code ec) {
-                if (ec || !running_) return;
-                poll->expires_after(std::chrono::seconds(2));
-                poll->async_wait(*poll_fn);
-                try {
-                    mining_interface_->refresh_work();
-                    std::string tip = mining_interface_->get_current_gbt_prevhash();
-                    if (!tip.empty() && tip != *prev_hash) {
-                        bool first = prev_hash->empty();
-                        *prev_hash = tip;
-                        if (stratum_server_) stratum_server_->notify_all();
-                        LOG_INFO << "[LTC] no-embed GBT poll: "
-                                 << (first ? "first template " : "new tip ")
-                                 << tip.substr(0, 16) << "... — miners notified";
-                    }
-                } catch (const std::exception& e) {
-                    LOG_WARNING << "[LTC] no-embed GBT poll failed: " << e.what();
-                }
-            };
-            poll->expires_after(std::chrono::seconds(2));
-            poll->async_wait(*poll_fn);
-            LOG_INFO << "[LTC] no-embedded RPC mode: recurring GBT poll scheduled (2s)";
-        }
+        // Template refresh for a coin node attached before start(); a node
+        // attached later arms the same timers from set_coin_node().
+        arm_rpc_work_refresh();
 
         // Schedule stat_log timer (every 60 seconds for graph data)
         {
@@ -11767,6 +11719,75 @@ void WebServer::set_coin_node(core::coin::ICoinNode* node)
     m_coin_node_ = node;
     mining_interface_->set_coin_node(node);
     LOG_INFO << "WebServer: coin node " << (node ? "attached" : "detached");
+    // main_ltc starts the web server early (the loading page is served
+    // during sync) and attaches the coin node afterwards, so start() saw
+    // no node and armed nothing: an RPC-only node (--no-embedded-ltc) never
+    // got a template. Arm here for an RPC-only node attached after start().
+    // An embedded node keeps its event-driven refresh (on_new_headers);
+    // nothing new is armed for it.
+    if (running_ && node && node->has_rpc() && !node->is_embedded())
+        arm_rpc_work_refresh();
+}
+
+// The one-shot initial template fetch + the no-embedded GBT poll, armed at
+// most once per WebServer: from start() for a node attached before it, or
+// from set_coin_node() for an RPC-only node attached after it.
+void WebServer::arm_rpc_work_refresh()
+{
+    if (!m_coin_node_ || !m_coin_node_->has_rpc()) return;
+    if (rpc_work_armed_.exchange(true)) return;
+
+    // One-shot initial template fetch: populate the cache before any events fire.
+    // After this, all template updates are event-driven (bestblock, best_share_changed).
+    // p2pool has no recurring refresh timer — Twisted reactor events handle everything.
+    if (m_coin_node_ && m_coin_node_->has_rpc()) {
+        auto timer = std::make_shared<net::steady_timer>(ioc_);
+        timer->expires_after(std::chrono::milliseconds(500));
+        timer->async_wait([this, timer](beast::error_code ec) {
+            if (ec || !running_) return;
+            try { mining_interface_->refresh_work(); }
+            catch (const std::exception& e) { LOG_WARNING << "initial refresh_work failed: " << e.what(); }
+            catch (...) { LOG_WARNING << "initial refresh_work failed: unknown error"; }
+            LOG_INFO << "Initial block template fetched";
+        });
+    }
+
+    // ── No-embedded RPC mode: recurring getblocktemplate poll ─────────────
+    // The one-shot fetch above is the ONLY template refresh in --no-embedded
+    // mode: there is no embedded header-sync on_new_headers callback and no
+    // ZMQ/longpoll subscription to fire "bestblock" events (embedded mode drives
+    // refresh via on_new_headers → trigger_work_refresh). If the daemon was still
+    // in IBD at the 500ms one-shot, m_work_valid stayed false and never recovered
+    // because nothing polls again. Add a recurring poll that (a) bootstraps the
+    // cache once the daemon leaves IBD and (b) re-notifies miners when the network
+    // tip advances — replacing the event source embedded mode gets for free.
+    if (m_coin_node_ && m_coin_node_->has_rpc() && !m_coin_node_->is_embedded()) {
+        auto poll = std::make_shared<net::steady_timer>(ioc_);
+        auto prev_hash = std::make_shared<std::string>();
+        auto poll_fn = std::make_shared<std::function<void(beast::error_code)>>();
+        *poll_fn = [this, poll, prev_hash, poll_fn](beast::error_code ec) {
+            if (ec || !running_) return;
+            poll->expires_after(std::chrono::seconds(2));
+            poll->async_wait(*poll_fn);
+            try {
+                mining_interface_->refresh_work();
+                std::string tip = mining_interface_->get_current_gbt_prevhash();
+                if (!tip.empty() && tip != *prev_hash) {
+                    bool first = prev_hash->empty();
+                    *prev_hash = tip;
+                    if (stratum_server_) stratum_server_->notify_all();
+                    LOG_INFO << "[LTC] no-embed GBT poll: "
+                             << (first ? "first template " : "new tip ")
+                             << tip.substr(0, 16) << "... — miners notified";
+                }
+            } catch (const std::exception& e) {
+                LOG_WARNING << "[LTC] no-embed GBT poll failed: " << e.what();
+            }
+        };
+        poll->expires_after(std::chrono::seconds(2));
+        poll->async_wait(*poll_fn);
+        LOG_INFO << "[LTC] no-embedded RPC mode: recurring GBT poll scheduled (2s)";
+    }
 }
 
 void WebServer::set_best_share_hash_fn(std::function<uint256()> fn)
