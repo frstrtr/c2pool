@@ -14,6 +14,7 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdio>
 #include <memory>
 #include <string>
 #include <vector>
@@ -21,6 +22,7 @@
 #include <boost/asio/io_context.hpp>
 #include <nlohmann/json.hpp>
 
+#include <core/target_utils.hpp>
 #include <core/uint256.hpp>
 #include <btclibs/util/strencodings.h>
 #include <c2pool/merged/merged_mining.hpp>
@@ -32,6 +34,7 @@ struct DogeBackend : c2pool::merged::IAuxChainBackend {
     std::string tip = std::string(62, '0') + "c1";
     int height = 5'000'001;
     int submits = 0;
+    uint32_t bits = 0x1a01d2c3;
     DogeBackend()
     {
         cfg.symbol = "DOGE";
@@ -45,15 +48,21 @@ struct DogeBackend : c2pool::merged::IAuxChainBackend {
         w.height = height;
         w.coinbase_value = 1000000000000ULL + static_cast<uint64_t>(height);
         w.block_hash.SetHex(tip);
-        w.target.SetHex(std::string(8, '0') + std::string(56, 'f'));
+        w.target = chain::bits_to_target(bits);
         w.prev_block_hash = tip;
         w.block_template = {
-            {"previousblockhash", tip}, {"height", height}, {"bits", "1a01d2c3"},
+            {"previousblockhash", tip}, {"height", height}, {"bits", bits_hex()},
             {"curtime", 1793210000 + height}, {"version", 0x620004},
             {"coinbasevalue", 1000000000000LL + height},
             {"transactions", nlohmann::json::array()},
         };
         return w;
+    }
+    std::string bits_hex() const
+    {
+        char buf[9];
+        std::snprintf(buf, sizeof buf, "%08x", bits);
+        return buf;
     }
     c2pool::merged::AuxWork create_aux_block(const std::string&) override { return get_work_template(); }
     bool connect() override { return true; }
@@ -86,10 +95,12 @@ TEST(MergedMining, StaleJobFindRecordsTheCommittedBlock)
         s.push_back(0xac);
         return std::vector<std::pair<std::vector<unsigned char>, uint64_t>>{{s, value}};
     });
-    struct Found { std::string symbol; int height; std::string hash; };
+    struct Found { std::string symbol; int height; std::string hash; double difficulty; };
     std::vector<Found> found;
     mm.set_on_merged_block_found([&found](const std::string& sym, int h, const std::string& hash,
-                                          bool, uint64_t, double) { found.push_back({sym, h, hash}); });
+                                          bool, uint64_t, double difficulty) {
+        found.push_back({sym, h, hash, difficulty});
+    });
 
     // Job A: the DOGE block at 5,000,001; the share's LTC coinbase commits to it.
     mm.refresh_aux_work();
@@ -117,4 +128,55 @@ TEST(MergedMining, StaleJobFindRecordsTheCommittedBlock)
     ASSERT_EQ(rec.size(), 1u);
     EXPECT_EQ(rec[0].block_hash, a_hash.GetHex());
     EXPECT_EQ(rec[0].height, 5'000'001);
+}
+
+// #1738: the stale-job find is priced at the target of the job it solved. The
+// snapshot's bits give that target; current_work has moved on to another one.
+TEST(MergedMining, StaleJobFindIsPricedAtItsOwnTarget)
+{
+    boost::asio::io_context ioc;
+    c2pool::merged::MergedMiningManager mm(ioc);
+    auto backend = std::make_unique<DogeBackend>();
+    auto* b = backend.get();
+    mm.add_chain(b->cfg, std::move(backend));
+    mm.set_payout_provider([](uint32_t, uint64_t value) {
+        std::vector<unsigned char> s{0x76, 0xa9, 0x14};
+        s.insert(s.end(), 20, 0x5b);
+        s.push_back(0x88);
+        s.push_back(0xac);
+        return std::vector<std::pair<std::vector<unsigned char>, uint64_t>>{{s, value}};
+    });
+    std::vector<double> priced;
+    mm.set_on_merged_block_found([&priced](const std::string&, int, const std::string&, bool,
+                                           uint64_t, double difficulty) {
+        priced.push_back(difficulty);
+    });
+
+    // Job A at bits A; the share's LTC coinbase commits to it.
+    const uint32_t bits_a = 0x1a01d2c3;
+    b->bits = bits_a;
+    mm.refresh_aux_work();
+    const std::string parent_cb = std::string(20, 'a') + hex_of(mm.get_auxpow_commitment())
+                                  + std::string(20, 'b');
+
+    // The DOGE tip moves on and retargets before the share comes in.
+    const uint32_t bits_b = 0x1a00e161;
+    b->tip = std::string(62, '0') + "c2";
+    b->height = 5'000'002;
+    b->bits = bits_b;
+    mm.refresh_aux_work();
+    ASSERT_EQ(mm.get_current_work().at(98).target, chain::bits_to_target(bits_b));
+
+    const double diff_a = chain::target_to_difficulty(chain::bits_to_target(bits_a));
+    const double diff_b = chain::target_to_difficulty(chain::bits_to_target(bits_b));
+    ASSERT_NE(diff_a, diff_b);
+
+    uint256 parent_hash;
+    parent_hash.SetHex("01");
+    mm.try_submit_merged_blocks(std::string(160, 'd'), parent_cb, {}, 0, parent_hash);
+
+    ASSERT_EQ(b->submits, 1);
+    ASSERT_EQ(priced.size(), 1u);
+    EXPECT_DOUBLE_EQ(priced[0], diff_a) << "priced at the job the share solved";
+    EXPECT_NE(priced[0], diff_b) << "not at current_work's target";
 }
