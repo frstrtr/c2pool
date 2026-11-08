@@ -553,6 +553,14 @@ public:
                            uint64_t subsidy)>;
     void set_on_found_block_fn(FoundBlockFn fn);
 
+    /// Called on every sourced template with the same two facts the
+    /// "[DASH-STRATUM-GBT] template sourced: arm=" line prints. main_dash.cpp
+    /// binds this to MiningInterface::set_embedded_display through
+    /// dash::publish_served_arm. Display only and invoked under its own short
+    /// mutex, so the callee must not block. While unbound this is a no-op.
+    using ServedArmFn = std::function<void(bool embedded_arm_selected, bool no_work)>;
+    void set_on_served_arm_fn(ServedArmFn fn);
+
     /// Wire the CUMULATIVE cross-restart serve-gate ledger to its persisted
     /// backing file (<data-dir>/<net_subdir>/serve_gate_ledger.json). Loads any
     /// existing blob (folding the previous process's carry, bumping epochs) and
@@ -997,6 +1005,8 @@ private:
     // Found-block reporter (dashboard recent-blocks card). Empty until wired.
     mutable std::mutex          found_block_mutex_;
     FoundBlockFn                on_found_block_fn_;
+    mutable std::mutex          served_arm_mutex_;
+    ServedArmFn                 on_served_arm_fn_;
 
     // Sharechain mint dispatch (stage 4d). Empty until wired.
     mutable std::mutex          mint_share_mutex_;

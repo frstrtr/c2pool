@@ -924,7 +924,13 @@ public:
     // whose bip110::coin::Node is NOT a core::coin::ICoinNode) have no m_coin_node
     // yet ARE embedded. Mirrors the m_coin_rpc_available precedent: additive,
     // consulted only when set, byte-identical on every lane that never calls it.
-    void set_embedded_display(bool v) { m_embedded_display_override = v; }
+    // Atomic because c2pool-dash republishes it from the stratum thread on every
+    // sourced template while the HTTP thread reads it. An atomic store touches no
+    // lock, so the serve path gains no lock ordering.
+    void set_embedded_display(bool v)
+    {
+        m_embedded_display_override.store(v ? 1 : 0, std::memory_order_relaxed);
+    }
 
     // Current PPLNS outputs for payout display
     // Coin targets (c2pool-dash) that compute PPLNS outside the
@@ -2594,7 +2600,12 @@ private:
     address_activity_fn_t m_address_activity_fn;                              // failback evidence (coin targets)
     std::function<CoinWorkInfo()> m_coin_work_fn;                             // live template summary (coin targets)
     std::atomic<bool> m_coin_rpc_available{false};                           // external daemon RPC present
-    std::optional<bool> m_embedded_display_override;                          // display-only embedded flag (NULL-node lanes)
+    std::atomic<int8_t> m_embedded_display_override{-1};                      // display-only embedded flag (NULL-node lanes): -1 unset, 0 false, 1 true
+    bool embedded_display_or(bool fallback) const
+    {
+        const int8_t v = m_embedded_display_override.load(std::memory_order_relaxed);
+        return v < 0 ? fallback : v != 0;
+    }
     std::chrono::steady_clock::time_point m_stratum_start_time{std::chrono::steady_clock::now()};
 };
 
