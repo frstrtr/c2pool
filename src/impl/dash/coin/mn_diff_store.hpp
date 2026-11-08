@@ -130,8 +130,14 @@ struct MnStateDiff
         Field_platformNodeID                = 0x10000,
         Field_platformP2PPort               = 0x20000,
         Field_platformHTTPPort              = 0x40000,
+        // Dash Core v24 (dmnstate.h): the payout list, share table and
+        // early-exit terms. netInfo keeps its bit; its form follows nVersion.
+        Field_payouts                       = 0x80000,
+        Field_shares                        = 0x100000,
+        Field_nEarlyPeriodBlocks            = 0x200000,
+        Field_nEarlyPenalty                 = 0x400000,
     };
-    static constexpr uint32_t kAllFields = 0x7FFFF;
+    static constexpr uint32_t kAllFields = 0x7FFFFF;
 
     uint32_t      fields{0};
     /// Only the members named by `fields` are valid — dashd reuses the state
@@ -163,8 +169,13 @@ struct MnStateDiff
         take(Field_keyIDOwner,        [](const ReplayMNState& s) { return s.keyIDOwner; });
         take(Field_pubKeyOperator,    [](const ReplayMNState& s) { return s.pubKeyOperator; });
         take(Field_keyIDVoting,       [](const ReplayMNState& s) { return s.keyIDVoting; });
-        if (a.netInfo.ip != b.netInfo.ip || a.netInfo.port_be != b.netInfo.port_be)
+        if (a.netInfo.ip != b.netInfo.ip || a.netInfo.port_be != b.netInfo.port_be
+            || a.v24.extNetInfo != b.v24.extNetInfo)
             fields |= Field_netInfo;
+        if (a.v24.payouts != b.v24.payouts)                       fields |= Field_payouts;
+        if (a.v24.shares != b.v24.shares)                         fields |= Field_shares;
+        if (a.v24.nEarlyPeriodBlocks != b.v24.nEarlyPeriodBlocks) fields |= Field_nEarlyPeriodBlocks;
+        if (a.v24.nEarlyPenalty != b.v24.nEarlyPenalty)           fields |= Field_nEarlyPenalty;
         if (a.scriptPayout.m_data != b.scriptPayout.m_data)
             fields |= Field_scriptPayout;
         if (a.scriptOperatorPayout.m_data != b.scriptOperatorPayout.m_data)
@@ -199,13 +210,20 @@ struct MnStateDiff
         if (fields & Field_keyIDOwner)                    t.keyIDOwner = state.keyIDOwner;
         if (fields & Field_pubKeyOperator)                t.pubKeyOperator = state.pubKeyOperator;
         if (fields & Field_keyIDVoting)                   t.keyIDVoting = state.keyIDVoting;
-        if (fields & Field_netInfo)                       t.netInfo = state.netInfo;
+        if (fields & Field_netInfo) {
+            t.netInfo = state.netInfo;
+            t.v24.extNetInfo = state.v24.extNetInfo;
+        }
         if (fields & Field_scriptPayout)                  t.scriptPayout = state.scriptPayout;
         if (fields & Field_scriptOperatorPayout)          t.scriptOperatorPayout = state.scriptOperatorPayout;
         if (fields & Field_nConsecutivePayments)          t.nConsecutivePayments = state.nConsecutivePayments;
         if (fields & Field_platformNodeID)                t.platformNodeID = state.platformNodeID;
         if (fields & Field_platformP2PPort)               t.platformP2PPort = state.platformP2PPort;
         if (fields & Field_platformHTTPPort)              t.platformHTTPPort = state.platformHTTPPort;
+        if (fields & Field_payouts)                       t.v24.payouts = state.v24.payouts;
+        if (fields & Field_shares)                        t.v24.shares = state.v24.shares;
+        if (fields & Field_nEarlyPeriodBlocks)            t.v24.nEarlyPeriodBlocks = state.v24.nEarlyPeriodBlocks;
+        if (fields & Field_nEarlyPenalty)                 t.v24.nEarlyPenalty = state.v24.nEarlyPenalty;
     }
 
     /// Masked serialization, member order = dashd's tuple order, nVersion
@@ -227,13 +245,22 @@ struct MnStateDiff
         if (fields & Field_pubKeyOperator)
             s.write(std::as_bytes(std::span{state.pubKeyOperator}));
         if (fields & Field_keyIDVoting)                   s << state.keyIDVoting;
-        if (fields & Field_netInfo)                       s << state.netInfo;
+        if (fields & Field_netInfo) {
+            // NetInfoSerWrapper(netInfo, nVersion >= ExtAddr): the nVersion
+            // bit is always set with netInfo (the rule above).
+            if (v24::state_has_ext(state.nVersion)) s << state.v24.extNetInfo;
+            else                                    s << state.netInfo;
+        }
         if (fields & Field_scriptPayout)                  s << state.scriptPayout;
         if (fields & Field_scriptOperatorPayout)          s << state.scriptOperatorPayout;
         if (fields & Field_nConsecutivePayments)          s << state.nConsecutivePayments;
         if (fields & Field_platformNodeID)                s << state.platformNodeID;
         if (fields & Field_platformP2PPort)               s << state.platformP2PPort;
         if (fields & Field_platformHTTPPort)              s << state.platformHTTPPort;
+        if (fields & Field_payouts)                       s << state.v24.payouts;
+        if (fields & Field_shares)                        s << state.v24.shares;
+        if (fields & Field_nEarlyPeriodBlocks)            s << state.v24.nEarlyPeriodBlocks;
+        if (fields & Field_nEarlyPenalty)                 s << state.v24.nEarlyPenalty;
     }
 
     /// Throws std::ios_base::failure on malformed data (unknown bits, the
@@ -261,13 +288,20 @@ struct MnStateDiff
         if (fields & Field_pubKeyOperator)
             s.read(std::as_writable_bytes(std::span{state.pubKeyOperator}));
         if (fields & Field_keyIDVoting)                   s >> state.keyIDVoting;
-        if (fields & Field_netInfo)                       s >> state.netInfo;
+        if (fields & Field_netInfo) {
+            if (v24::state_has_ext(state.nVersion)) s >> state.v24.extNetInfo;
+            else                                    s >> state.netInfo;
+        }
         if (fields & Field_scriptPayout)                  s >> state.scriptPayout;
         if (fields & Field_scriptOperatorPayout)          s >> state.scriptOperatorPayout;
         if (fields & Field_nConsecutivePayments)          s >> state.nConsecutivePayments;
         if (fields & Field_platformNodeID)                s >> state.platformNodeID;
         if (fields & Field_platformP2PPort)               s >> state.platformP2PPort;
         if (fields & Field_platformHTTPPort)              s >> state.platformHTTPPort;
+        if (fields & Field_payouts)                       s >> state.v24.payouts;
+        if (fields & Field_shares)                        s >> state.v24.shares;
+        if (fields & Field_nEarlyPeriodBlocks)            s >> state.v24.nEarlyPeriodBlocks;
+        if (fields & Field_nEarlyPenalty)                 s >> state.v24.nEarlyPenalty;
     }
 };
 
@@ -544,7 +578,15 @@ public:
     /// Store format version ('F'). Mismatch clears the WHOLE store — the
     /// MnStateDb open() idiom (mn_state_db.hpp:207-230), never per-entry
     /// migration.
-    static constexpr uint32_t kFormatVersion = 1;
+    ///
+    /// v2 (Dash Core v24): diff records may carry the v24 field bits and a
+    /// v3 state's ExtNetInfo; `added` rows of v3 states carry their
+    /// MnStateV24Ext (ReplayMNState codec). Every v1 record encodes exactly
+    /// as in v2, so a v1 store is read in place and only its format key is
+    /// rewritten. (An older binary opening a v2 store clears it, the safe
+    /// direction.)
+    static constexpr uint32_t kFormatVersion = 2;
+    static constexpr uint32_t kFormatVersionPreV24 = 1;
 
     /// PoW-validated header-chain lookup: hash -> (height, prev_hash).
     /// nullopt = the hash is not on OUR chain; the walk refuses. The record's
@@ -560,7 +602,13 @@ public:
     bool open()
     {
         if (!m_store.open()) return false;
-        const uint32_t stored = load_u32(make_format_key());
+        uint32_t stored = load_u32(make_format_key());
+        if (stored == kFormatVersionPreV24) {
+            LOG_INFO << "[MN-DIFF-DB] format v1 -> v2: records read in place"
+                        " (identical encoding for pre-v24 states)";
+            store_u32(make_format_key(), kFormatVersion);
+            stored = kFormatVersion;
+        }
         if (stored != kFormatVersion) {
             if (stored != 0 || !m_store.list_keys("D", /*limit=*/1).empty()
                 || !m_store.list_keys("S", /*limit=*/1).empty()) {

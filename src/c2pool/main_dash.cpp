@@ -3208,6 +3208,13 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     std::unique_ptr<dash::coin::replay::ReplayUtxoFold> fold_fee_fold;
     std::unique_ptr<dash::coin::FoldFeeSource>          fold_fee_source;
     dash::coin::NodeCoinState node_coin_state;
+    // Dash Core v24 (DEPLOYMENT_V24): the payee projection's v24 rules and
+    // netInfo chain parameters. Testnet activated at 1,578,000; on mainnet
+    // the height stays "never" until S0's versionbits tracker supplies it.
+    if (dash::SharechainConfig::is_testnet) {
+        node_coin_state.mnstates().set_v24_height(dash::coin::v24::kTestnetActivationHeight);
+        node_coin_state.mnstates().set_netinfo_rules(dash::coin::vendor::NetInfoRules::testnet());
+    }
     if (!fold_live_db.empty()) {
         fold_live = std::make_shared<dash::coin::replay::ReplayUtxoFold>();
         if (!fold_live->open(fold_live_db)) {
@@ -9434,6 +9441,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     // through unchanged (reward-safe: a wrong seed can never mint).
                     dash::coin::replay::FoldConfig fcfg;
                     fcfg.enabled = true;
+                    if (dash::SharechainConfig::is_testnet)   // testnet heights incl. Dash Core v24 (1,578,000)
+                        fcfg.gates = rp::FoldGates::testnet();
                     mn_bridge_fold_engine =
                         std::make_unique<rp::DmlFoldEngine>(fcfg);
                     mn_diff_writer = std::make_unique<rp::MnDiffWriter>(
@@ -9610,6 +9619,9 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                                     st.keyIDVoting      = e.keyIDVoting;
                                     st.netInfo.ip       = e.netAddress;
                                     st.netInfo.port_be  = e.netPort;
+                                    // Dash Core v24: a v3 leaf carries ExtNetInfo
+                                    // (also root-committing).
+                                    st.v24.extNetInfo   = e.extNetInfo;
                                     st.platformHTTPPort = e.platformHTTPPort;
                                     st.platformNodeID   = e.platformNodeID;
                                     if (!e.confirmedHash.IsNull())
@@ -9633,6 +9645,12 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                                         st.scriptPayout         = mn.scriptPayout;
                                         st.scriptOperatorPayout = mn.scriptOperatorPayout;
                                         st.platformP2PPort      = mn.platformP2PPort;
+                                        // Dash Core v24 payout list / share table /
+                                        // early-exit terms (checkpoint /2).
+                                        st.v24.payouts            = mn.v24.payouts;
+                                        st.v24.shares             = mn.v24.shares;
+                                        st.v24.nEarlyPeriodBlocks = mn.v24.nEarlyPeriodBlocks;
+                                        st.v24.nEarlyPenalty      = mn.v24.nEarlyPenalty;
                                         ++with_facets;
                                     } else {
                                         ++without_facets;
@@ -9959,6 +9977,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 }
                 dash::coin::replay::FoldConfig fcfg;
                 fcfg.enabled = true;   // W1 feature flag, explicit opt-in
+                if (dash::SharechainConfig::is_testnet)   // testnet heights incl. Dash Core v24 (1,578,000)
+                    fcfg.gates = dash::coin::replay::FoldGates::testnet();
                 replay_fold_engine =
                     std::make_unique<rp::DmlFoldEngine>(fcfg);
                 const std::string serr =

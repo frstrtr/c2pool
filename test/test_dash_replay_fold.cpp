@@ -843,15 +843,18 @@ TEST(DashReplayFoldSynthetic, FeatureFlagOffRefusesEveryFold)
     EXPECT_NE(r.error.find("not enabled"), std::string::npos);
 }
 
-TEST(DashReplayFoldSynthetic, V24ActiveFailsClosed)
+// Dash Core v24: the blanket "refuse every fold once V24 is active" guard is
+// gone now that the v24 transitions are ported; a block at the activation
+// height folds and self-checks like any other.
+TEST(DashReplayFoldSynthetic, V24ActiveFoldsAndSelfChecks)
 {
     auto cfg = synth_cfg();
-    cfg.gates.v24_active = true;
+    cfg.gates.v24_height = 101;
     DmlFoldEngine eng(cfg);
     eng.seed({}, 0, 100, raw256(9));
     auto r = eng.fold_block(make_block(101, raw256(9), uint256{}), 101);
-    ASSERT_FALSE(r.ok);
-    EXPECT_NE(r.error.find("V24"), std::string::npos);
+    EXPECT_TRUE(r.ok) << r.error;
+    EXPECT_FALSE(eng.poisoned());
 }
 
 TEST(DashReplayFoldSynthetic, ForwardContiguousCursorOnly)
@@ -2701,18 +2704,35 @@ TEST(DashPoSeBounds, OracleAccessorAnswersOnlyAtItsOwnTip)
     EXPECT_FALSE(ch.eng.pose_bounds_at(101, tip, ch.a).has_value());
 }
 
-// v4 round trip carries both bounds and is byte-stable.
+// The current snapshot (v5 since Dash Core v24; a pre-v24 list encodes as in
+// v4) round trip carries both bounds and is byte-stable, and the same list
+// written as a v4 file still loads.
 TEST(DashPoSeBounds, SnapshotV4RoundTripCarriesTheBounds)
 {
     BoundsChain ch(SeedPenalties::Unknown);
     ASSERT_TRUE(ch.next({ch.qc_marking(ch.a)}).ok);
     const auto bytes = ch.eng.save_snapshot();
-    ASSERT_EQ(std::memcmp(bytes.data(), "C2POOL-DASH-DML-SNAP/v04", 24), 0);
+    ASSERT_EQ(std::memcmp(bytes.data(), "C2POOL-DASH-DML-SNAP/v05", 24), 0);
+    {
+        // v4 = the same payload under the v4 magic and version, re-digested.
+        std::vector<uint8_t> v4(bytes.begin(), bytes.end() - 32);
+        std::memcpy(v4.data(), "C2POOL-DASH-DML-SNAP/v04", 24);
+        v4[24] = 4; v4[25] = 0; v4[26] = 0; v4[27] = 0;
+        uint256 d;
+        CHash256().Write(std::span<const unsigned char>(v4.data(), v4.size()))
+                  .Finalize(std::span<unsigned char>(d.data(), 32));
+        v4.insert(v4.end(), d.data(), d.data() + 32);
+        DmlFoldEngine e4(synth_cfg());
+        std::string err4;
+        ASSERT_TRUE(e4.load_snapshot(v4, err4)) << err4;
+        EXPECT_EQ(e4.loaded_snapshot_version(), 4u);
+        EXPECT_EQ(e4.save_snapshot(), bytes) << "a pre-v24 list re-saves identically as v5";
+    }
 
     DmlFoldEngine e2(synth_cfg());
     std::string err;
     ASSERT_TRUE(e2.load_snapshot(bytes, err)) << err;
-    EXPECT_EQ(e2.loaded_snapshot_version(), 4u);
+    EXPECT_EQ(e2.loaded_snapshot_version(), 5u);
     for (const auto& p : {ch.a, ch.b, ch.c}) {
         EXPECT_EQ(e2.find(p)->nPoSePenalty, ch.eng.find(p)->nPoSePenalty);
         EXPECT_EQ(e2.find(p)->nPoSePenaltyHi, ch.eng.find(p)->nPoSePenaltyHi);
@@ -2764,8 +2784,8 @@ TEST(DashPoSeBounds, SnapshotV3LoadsWithTheUpperBoundAtTheCeiling)
     EXPECT_EQ(e.find(raw256(0xE1))->nPoSePenaltyHi, 200);
     EXPECT_EQ(e.find(raw256(0xE2))->nPoSePenalty, 150);
     EXPECT_EQ(e.find(raw256(0xE2))->nPoSePenaltyHi, 200);
-    // Re-saved as v4.
-    EXPECT_EQ(std::memcmp(e.save_snapshot().data(), "C2POOL-DASH-DML-SNAP/v04", 24), 0);
+    // Re-saved as the current version (v5).
+    EXPECT_EQ(std::memcmp(e.save_snapshot().data(), "C2POOL-DASH-DML-SNAP/v05", 24), 0);
 
     DmlFoldEngine e2(synth_cfg());
     EXPECT_FALSE(e2.load_snapshot(v3_bytes("C2POOL-DASH-DML-SNAP/v03", 4, es), err));
@@ -2846,5 +2866,576 @@ TEST(DashPoSeBoundsReal, UnknownSeedBracketsDashdAndTheRootResolvesCaseD2516412)
         EXPECT_LE(bs->nPoSePenalty, st.nPoSePenalty) << p.GetHex();
         EXPECT_GE(bs->nPoSePenaltyHi, st.nPoSePenalty) << p.GetHex();
         EXPECT_EQ(st.nPoSePenalty, st.nPoSePenaltyHi) << "exact seed drifted";
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Dash Core v24 (slice S3): every transition, root self-checked
+// ═══════════════════════════════════════════════════════════════════════════
+// Each fold commits the merkleRootMNList built from an EXPECTED state written
+// out by hand from Core v24's ApplyTxToList / SetStateVersion rules; the
+// engine folds only if its own list hashes to that root (its per-block self
+// check), and the non-SML fields (payout list, shares) are compared directly.
+namespace v24_fold_kat {
+
+namespace vv = dash::coin::vendor;
+
+FoldConfig v24_cfg()
+{
+    auto c = synth_cfg();
+    c.gates.v24_height = 1;
+    return c;
+}
+
+vv::LegacyNetService svc4(uint8_t a, uint8_t b, uint8_t c, uint8_t d, uint16_t port)
+{
+    vv::LegacyNetService l;
+    l.ip[10] = 0xff; l.ip[11] = 0xff;
+    l.ip[12] = a; l.ip[13] = b; l.ip[14] = c; l.ip[15] = d;
+    l.port_be = port;
+    return l;
+}
+
+vv::ExtNetInfo core4(uint8_t a, uint8_t b, uint8_t c, uint8_t d, uint16_t port)
+{
+    vv::ExtNetInfo e;
+    e.set(vv::NetInfoPurpose::CORE_P2P, {vv::NetInfoEntry{vv::NetService::ipv4(a, b, c, d, port)}});
+    return e;
+}
+
+OPScript pkh(uint8_t tag)
+{
+    OPScript s;
+    s.m_data = {0x76, 0xa9, 0x14};
+    for (int i = 0; i < 20; ++i) s.m_data.push_back(static_cast<uint8_t>(tag + i));
+    s.m_data.push_back(0x88);
+    s.m_data.push_back(0xac);
+    return s;
+}
+
+ReplayMNState v2_mn(uint8_t tag)
+{
+    ReplayMNState st;
+    st.nVersion = ProTxVersion::BASIC_BLS;
+    st.keyIDOwner = raw160(static_cast<uint8_t>(0x20 + tag));
+    st.keyIDVoting = raw160(static_cast<uint8_t>(0x50 + tag));
+    st.pubKeyOperator = seq_array<48>(static_cast<uint8_t>(0x30 + tag));
+    st.netInfo = svc4(1, 2, 3, tag, 9999);
+    st.scriptPayout = pkh(static_cast<uint8_t>(0x70 + tag));
+    st.collateralOutpoint.hash = raw256(static_cast<uint8_t>(0x40 + tag));
+    st.collateralOutpoint.index = 1;
+    st.nRegisteredHeight = 50;
+    // Already confirmed, so the fold's confirmation pass leaves it alone.
+    st.confirmedHash = raw256(static_cast<uint8_t>(0x90 + tag));
+    return st;
+}
+
+ReplayMNState v3_mn(uint8_t tag)
+{
+    auto st = v2_mn(tag);
+    st.nVersion = ProTxVersion::EXT_ADDR;
+    st.netInfo = {};
+    st.v24.extNetInfo = core4(1, 2, 3, tag, 9999);
+    st.v24.payouts = vv::legacy_payout_as_list(st.scriptPayout);
+    st.scriptPayout = OPScript{};
+    return st;
+}
+
+vv::CollateralShares shares2()
+{
+    vv::CCollateralShare a, b;
+    a.amount = 600 * vv::CCollateralShare::COIN;
+    a.scriptRefund = pkh(0xa1);
+    a.keyIDOwner = raw160(0xb1);
+    b.amount = 400 * vv::CCollateralShare::COIN;
+    b.scriptRefund = pkh(0xa2);
+    b.keyIDOwner = raw160(0xb2);
+    return {a, b};
+}
+
+uint256 txid(const MutableTransaction& tx)
+{
+    auto ps = ::pack(tx);
+    auto sp = ps.get_span();
+    uint256 h;
+    CHash256().Write(std::span<const unsigned char>(reinterpret_cast<const unsigned char*>(sp.data()), sp.size()))
+              .Finalize(std::span<unsigned char>(h.data(), 32));
+    return h;
+}
+
+uint256 root_states(const std::vector<std::pair<uint256, ReplayMNState>>& states)
+{
+    std::vector<CSimplifiedMNListEntry> leaves;
+    for (const auto& [p, st] : states) leaves.push_back(st.to_sml_entry(p));
+    return root_of(std::move(leaves));
+}
+
+FoldResult fold_at(DmlFoldEngine& eng, uint32_t h, const uint256& root, std::vector<MutableTransaction> txs)
+{
+    return eng.fold_block(make_block(h, eng.block_hash(), root, std::move(txs), &eng), h);
+}
+
+} // namespace v24_fold_kat
+
+TEST(DashReplayFoldV24, ProRegTxV3MultiPayoutRegisters)
+{
+    using namespace v24_fold_kat;
+    DmlFoldEngine eng(v24_cfg());
+    eng.seed({}, 0, 100, raw256(9));
+    CProRegTx p;
+    p.nVersion = ProTxVersion::EXT_ADDR;
+    p.collateralOutpoint.hash = raw256(0x61);
+    p.collateralOutpoint.index = 0;
+    p.extNetInfo = core4(5, 6, 7, 8, 9999);
+    p.keyIDOwner = raw160(0x62);
+    p.pubKeyOperator = seq_array<48>(0x63);
+    p.keyIDVoting = raw160(0x64);
+    vv::MasternodePayoutShare a, b;
+    a.scriptPayout = pkh(0x65); a.reward = 6000;
+    b.scriptPayout = pkh(0x66); b.reward = 4000;
+    p.payouts = {a, b};
+    const auto tx = make_special_tx(1, p, 1);
+    ReplayMNState want;
+    want.nVersion = 3;
+    want.nRegisteredHeight = 101;
+    want.collateralOutpoint = p.collateralOutpoint;
+    want.keyIDOwner = p.keyIDOwner;
+    want.pubKeyOperator = p.pubKeyOperator;
+    want.keyIDVoting = p.keyIDVoting;
+    want.v24.extNetInfo = p.extNetInfo;
+    want.v24.payouts = p.payouts;
+    const auto r = fold_at(eng, 101, root_states({{txid(tx), want}}), {tx});
+    ASSERT_TRUE(r.ok) << r.error;
+    const auto* st = eng.find(txid(tx));
+    ASSERT_NE(st, nullptr);
+    EXPECT_EQ(st->v24.payouts, p.payouts);
+    EXPECT_TRUE(st->scriptPayout.m_data.empty());
+    EXPECT_EQ(st->v24.extNetInfo, p.extNetInfo);
+}
+
+// The payload rules (v24_rules.hpp) decode BLS keys and signatures as Core
+// does and, in a build without the dashbls backend, refuse every operator
+// key as unverifiable. They are TEMPLATE-SELECTION ONLY: the fold of a mined
+// block reads payloads structurally and must accept them in any build. Here
+// the rules refuse the payload (BLS build: Core's bad-protx-key-null; stub
+// build: unverifiable) and the fold folds it anyway, root self-checked.
+TEST(DashReplayFoldV24, MinedBlockFoldNeverRunsTheBlsPayloadRules)
+{
+    using namespace v24_fold_kat;
+    DmlFoldEngine eng(v24_cfg());
+    eng.seed({}, 0, 100, raw256(9));
+    CProRegTx p;
+    p.nVersion = ProTxVersion::EXT_ADDR;
+    p.collateralOutpoint.hash = raw256(0x61);
+    p.collateralOutpoint.index = 0;
+    p.extNetInfo = core4(5, 6, 7, 8, 9999);
+    p.keyIDOwner = raw160(0x62);
+    p.pubKeyOperator.fill(0x01);              // not a point: Core-invalid
+    p.keyIDVoting = raw160(0x64);
+    vv::MasternodePayoutShare a;
+    a.scriptPayout = pkh(0x65);
+    p.payouts = {a};
+    const auto tx = make_special_tx(1, p, 1);
+    const std::vector<unsigned char> payload(tx.extra_payload.begin(), tx.extra_payload.end());
+    const auto why = dash::coin::provider_payload_refusal(
+        CProRegTx::SPECIALTX_TYPE, payload,
+        dash::coin::ProviderTxRules::for_block(dash::coin::DashNetwork::TESTNET, 1'600'000));
+    ASSERT_TRUE(why.has_value()) << "the rules must refuse this payload";
+    EXPECT_TRUE(*why == "bad-protx-key-null" || why->rfind("unverifiable-", 0) == 0) << *why;
+
+    ReplayMNState want;
+    want.nVersion = 3;
+    want.nRegisteredHeight = 101;
+    want.collateralOutpoint = p.collateralOutpoint;
+    want.keyIDOwner = p.keyIDOwner;
+    want.pubKeyOperator = p.pubKeyOperator;
+    want.keyIDVoting = p.keyIDVoting;
+    want.v24.extNetInfo = p.extNetInfo;
+    want.v24.payouts = p.payouts;
+    const auto r = fold_at(eng, 101, root_states({{txid(tx), want}}), {tx});
+    ASSERT_TRUE(r.ok) << r.error;
+    EXPECT_EQ(r.registered, 1u);
+}
+
+// CheckProDisTxForList: a ProDisTx must name an existing SHARED masternode
+// (bad-prodis-hash / bad-prodis-not-shared): a block carrying one that does
+// not is invalid, so the fold refuses it (VERIFY-S3 nit 2).
+TEST(DashReplayFoldV24, ProDisTxOfANonSharedOrUnknownMasternodeIsRefused)
+{
+    using namespace v24_fold_kat;
+    for (const bool known : {true, false}) {
+        SCOPED_TRACE(known ? "non-shared" : "unknown");
+        DmlFoldEngine eng(v24_cfg());
+        const uint256 pro = raw256(0x1c);
+        const auto st = v2_mn(12);
+        eng.seed({{pro, st}}, 1, 100, raw256(9));
+        vv::CProDisTx d;
+        d.proTxHash = known ? pro : raw256(0x7d);
+        d.vchSigs.resize(1);
+        auto tx = make_special_tx(vv::CProDisTx::SPECIALTX_TYPE, d, 1);
+        tx.vin[0].prevout = st.collateralOutpoint;
+        const auto r = fold_at(eng, 101, root_of({}), {tx});
+        EXPECT_FALSE(r.ok);
+        EXPECT_NE(r.error.find(known ? "bad-prodis-not-shared" : "bad-prodis-hash"), std::string::npos)
+            << r.error;
+    }
+}
+
+TEST(DashReplayFoldV24, SharedRegistrationWithTemplateCollateral)
+{
+    using namespace v24_fold_kat;
+    DmlFoldEngine eng(v24_cfg());
+    eng.seed({}, 0, 100, raw256(9));
+    CProRegTx p;
+    p.nVersion = ProTxVersion::EXT_ADDR;
+    p.collateralOutpoint.index = 0;   // internal: this tx's output 0
+    p.extNetInfo = core4(5, 6, 7, 9, 9999);
+    p.pubKeyOperator = seq_array<48>(0x73);
+    p.keyIDVoting = raw160(0x74);
+    p.shares = shares2();
+    p.vchJoinSigs.resize(2);
+    p.nEarlyPeriodBlocks = 100;
+    p.nEarlyPenalty = 5 * vv::CCollateralShare::COIN;
+    auto tx = make_special_tx(1, p, 2);
+    TxOut coll;
+    coll.value = 1000 * vv::CCollateralShare::COIN;
+    coll.scriptPubKey.m_data = dash::coin::v24::shared_collateral_script();
+    tx.vout = {coll};
+    const uint256 pro = txid(tx);
+    ReplayMNState want;
+    want.nVersion = 3;
+    want.nRegisteredHeight = 101;
+    want.collateralOutpoint.hash = pro;
+    want.collateralOutpoint.index = 0;
+    want.pubKeyOperator = p.pubKeyOperator;
+    want.keyIDVoting = p.keyIDVoting;
+    want.v24.extNetInfo = p.extNetInfo;
+    want.v24.shares = p.shares;
+    want.v24.nEarlyPeriodBlocks = 100;
+    want.v24.nEarlyPenalty = p.nEarlyPenalty;
+    const auto r = fold_at(eng, 101, root_states({{pro, want}}), {tx});
+    ASSERT_TRUE(r.ok) << r.error;
+    EXPECT_EQ(eng.find(pro)->v24.shares, p.shares);
+    EXPECT_TRUE(eng.find(pro)->keyIDOwner.IsNull());
+}
+
+TEST(DashReplayFoldV24, ProUpServTxRaisesAndConvertsBack)
+{
+    using namespace v24_fold_kat;
+    const uint256 mn = raw256(0xE1);
+    // (a) v2 state + ProUpServTx v3: payouts migrated, the payload's ExtNetInfo.
+    {
+        DmlFoldEngine eng(v24_cfg());
+        eng.seed({{mn, v2_mn(1)}}, 1, 100, raw256(9));
+        CProUpServTx up;
+        up.nVersion = 3;
+        up.proTxHash = mn;
+        up.extNetInfo = core4(5, 6, 7, 8, 9999);
+        auto want = v2_mn(1);
+        want.nVersion = 3;
+        want.v24.payouts = vv::legacy_payout_as_list(want.scriptPayout);
+        want.scriptPayout = OPScript{};
+        want.netInfo = {};
+        want.v24.extNetInfo = up.extNetInfo;
+        const auto r = fold_at(eng, 101, root_states({{mn, want}}), {make_special_tx(2, up, 1)});
+        ASSERT_TRUE(r.ok) << r.error;
+        EXPECT_EQ(eng.find(mn)->nVersion, 3);
+        EXPECT_EQ(eng.find(mn)->v24.payouts, want.v24.payouts);
+    }
+    // (b) v3 state + ProUpServTx v2: target stays 3, the service converted back.
+    {
+        DmlFoldEngine eng(v24_cfg());
+        eng.seed({{mn, v3_mn(1)}}, 1, 100, raw256(9));
+        CProUpServTx up;
+        up.nVersion = 2;
+        up.proTxHash = mn;
+        up.netInfo = svc4(9, 9, 9, 9, 9999);
+        auto want = v3_mn(1);
+        want.v24.extNetInfo = core4(9, 9, 9, 9, 9999);
+        const auto r = fold_at(eng, 101, root_states({{mn, want}}), {make_special_tx(2, up, 1)});
+        ASSERT_TRUE(r.ok) << r.error;
+        EXPECT_EQ(eng.find(mn)->v24.extNetInfo, want.v24.extNetInfo);
+    }
+}
+
+TEST(DashReplayFoldV24, ProUpRegTxV3KeyChangeResetsAndBans)
+{
+    using namespace v24_fold_kat;
+    const uint256 mn = raw256(0xE2);
+    DmlFoldEngine eng(v24_cfg());
+    eng.seed({{mn, v2_mn(2)}}, 1, 100, raw256(9));
+    CProUpRegTx up;
+    up.nVersion = 3;
+    up.proTxHash = mn;
+    up.pubKeyOperator = seq_array<48>(0x99);
+    up.keyIDVoting = raw160(0x98);
+    vv::MasternodePayoutShare a;
+    a.scriptPayout = pkh(0x97);
+    up.payouts = {a};
+    auto want = v2_mn(2);
+    want.nVersion = 3;
+    want.pubKeyOperator = up.pubKeyOperator;
+    want.keyIDVoting = up.keyIDVoting;
+    want.netInfo = {};
+    want.v24.extNetInfo = {};   // reset: an empty ExtNetInfo
+    want.v24.payouts = up.payouts;
+    want.scriptPayout = OPScript{};
+    want.BanIfNotBanned(101);
+    const auto r = fold_at(eng, 101, root_states({{mn, want}}), {make_special_tx(3, up, 1)});
+    ASSERT_TRUE(r.ok) << r.error;
+    EXPECT_TRUE(eng.find(mn)->IsBanned());
+    EXPECT_EQ(eng.find(mn)->v24.payouts, up.payouts);
+}
+
+TEST(DashReplayFoldV24, ProUpRevTxKeepsTheVersionOnlyAfterV24)
+{
+    using namespace v24_fold_kat;
+    const uint256 mn = raw256(0xE3);
+    CProUpRevTx rv;
+    rv.nVersion = 2;
+    rv.proTxHash = mn;
+    rv.nReason = 1;
+    auto revoked = [&](uint16_t version) {
+        auto w = v2_mn(3);
+        w.nVersion = version;
+        w.pubKeyOperator = {};
+        w.netInfo = {};
+        w.nRevocationReason = 1;
+        w.BanIfNotBanned(101);
+        return w;
+    };
+    {
+        DmlFoldEngine eng(v24_cfg());
+        eng.seed({{mn, v2_mn(3)}}, 1, 100, raw256(9));
+        const auto r = fold_at(eng, 101, root_states({{mn, revoked(2)}}), {make_special_tx(4, rv, 1)});
+        ASSERT_TRUE(r.ok) << r.error;
+        EXPECT_EQ(eng.find(mn)->nVersion, 2);
+    }
+    {   // pre-v24: the historical reset to LegacyBLS (byte-identical behaviour)
+        DmlFoldEngine eng(synth_cfg());
+        eng.seed({{mn, v2_mn(3)}}, 1, 100, raw256(9));
+        const auto r = fold_at(eng, 101, root_states({{mn, revoked(1)}}), {make_special_tx(4, rv, 1)});
+        ASSERT_TRUE(r.ok) << r.error;
+        EXPECT_EQ(eng.find(mn)->nVersion, 1);
+    }
+}
+
+TEST(DashReplayFoldV24, LegacyMnMigratesInPlaceOnAServiceUpdate)
+{
+    using namespace v24_fold_kat;
+    const uint256 mn = raw256(0xE4);
+    auto legacy = v2_mn(4);
+    legacy.nVersion = 1;
+    CProUpServTx up;
+    up.nVersion = 2;
+    up.proTxHash = mn;
+    up.netInfo = svc4(4, 4, 4, 4, 9999);
+    {
+        DmlFoldEngine eng(v24_cfg());
+        eng.seed({{mn, legacy}}, 1, 100, raw256(9));
+        auto want = legacy;
+        want.nVersion = 2;   // legacy -> basic: the version is the migration
+        want.netInfo = up.netInfo;
+        const auto r = fold_at(eng, 101, root_states({{mn, want}}), {make_special_tx(2, up, 1)});
+        ASSERT_TRUE(r.ok) << r.error;
+        EXPECT_EQ(eng.find(mn)->nVersion, 2);
+        EXPECT_EQ(eng.find(mn)->pubKeyOperator, legacy.pubKeyOperator) << "store key unchanged";
+    }
+    {   // pre-v24: the version stays 1
+        DmlFoldEngine eng(synth_cfg());
+        eng.seed({{mn, legacy}}, 1, 100, raw256(9));
+        auto want = legacy;
+        want.netInfo = up.netInfo;
+        const auto r = fold_at(eng, 101, root_states({{mn, want}}), {make_special_tx(2, up, 1)});
+        ASSERT_TRUE(r.ok) << r.error;
+        EXPECT_EQ(eng.find(mn)->nVersion, 1);
+    }
+}
+
+TEST(DashReplayFoldV24, SharedMasternodeUpdatesAndDissolution)
+{
+    using namespace v24_fold_kat;
+    const uint256 mn = raw256(0xE5);
+    auto shared = v3_mn(5);
+    shared.keyIDOwner = uint160{};
+    shared.v24.payouts.clear();
+    shared.v24.shares = shares2();
+    shared.collateralOutpoint.hash = mn;
+    shared.collateralOutpoint.index = 0;
+    DmlFoldEngine eng(v24_cfg());
+    eng.seed({{mn, shared}}, 1, 100, raw256(9));
+    // ProUpShareTx: not an SML field, the root does not move.
+    dash::coin::vendor::CProUpShareTx us;
+    us.proTxHash = mn;
+    us.shareIndex = 1;
+    us.scriptReward = pkh(0xc3);
+    auto want = shared;
+    auto r = fold_at(eng, 101, root_states({{mn, want}}), {make_special_tx(11, us, 1)});
+    ASSERT_TRUE(r.ok) << r.error;
+    EXPECT_EQ(eng.find(mn)->v24.shares[1].scriptReward, pkh(0xc3));
+    // ProUpSharedRegTx with a new operator key: reset, ban, version kept at 3.
+    dash::coin::vendor::CProUpSharedRegTx sr;
+    sr.proTxHash = mn;
+    sr.pubKeyOperator = seq_array<48>(0xd0);
+    sr.keyIDVoting = raw160(0xd1);
+    sr.vchSigs.resize(2);
+    want = *eng.find(mn);
+    want.pubKeyOperator = sr.pubKeyOperator;
+    want.keyIDVoting = sr.keyIDVoting;
+    want.v24.extNetInfo = {};
+    want.BanIfNotBanned(102);
+    r = fold_at(eng, 102, root_states({{mn, want}}), {make_special_tx(12, sr, 2)});
+    ASSERT_TRUE(r.ok) << r.error;
+    EXPECT_EQ(eng.find(mn)->nVersion, 3);
+    // ProDisTx spending the collateral: removed in the collateral-spend pass.
+    dash::coin::vendor::CProDisTx dis;
+    dis.proTxHash = mn;
+    dis.vchSigs.resize(2);
+    auto dtx = make_special_tx(10, dis, 3);
+    dtx.vin[0].prevout.hash = mn;
+    dtx.vin[0].prevout.index = 0;
+    r = fold_at(eng, 103, uint256{}, {dtx});
+    ASSERT_TRUE(r.ok) << r.error;
+    EXPECT_EQ(eng.find(mn), nullptr);
+}
+
+TEST(DashReplayFoldV24, RejectCodesFailClosed)
+{
+    using namespace v24_fold_kat;
+    const uint256 mn = raw256(0xE6);
+    auto shared = v3_mn(6);
+    shared.keyIDOwner = uint160{};
+    shared.v24.payouts.clear();
+    shared.v24.shares = shares2();
+    shared.collateralOutpoint.hash = mn;
+    shared.collateralOutpoint.index = 0;
+    auto expect_fail = [&](FoldConfig cfg, std::vector<std::pair<uint256, ReplayMNState>> seed,
+                           MutableTransaction tx, const char* code) {
+        DmlFoldEngine eng(cfg);
+        eng.seed(std::move(seed), 1, 100, raw256(9));
+        const auto r = fold_at(eng, 101, uint256{}, {std::move(tx)});
+        EXPECT_FALSE(r.ok) << code;
+        EXPECT_NE(r.error.find(code), std::string::npos) << r.error;
+    };
+    // A shared collateral spent by a normal tx.
+    {
+        MutableTransaction spend;
+        TxIn in;
+        in.prevout.hash = mn;
+        in.prevout.index = 0;
+        spend.vin.push_back(in);
+        expect_fail(v24_cfg(), {{mn, shared}}, spend, "bad-shared-collateral-spend");
+    }
+    // A template output outside a shared registration (refused before folding).
+    {
+        MutableTransaction t;
+        TxIn in;
+        in.prevout.hash = raw256(0x11);
+        t.vin.push_back(in);
+        TxOut o;
+        o.value = 1;
+        o.scriptPubKey.m_data = dash::coin::v24::shared_collateral_script();
+        t.vout.push_back(o);
+        expect_fail(v24_cfg(), {}, t, "bad-shared-collateral-create");
+    }
+    // ProUpRegTx for a shared masternode.
+    {
+        CProUpRegTx up;
+        up.nVersion = 3;
+        up.proTxHash = mn;
+        up.pubKeyOperator = shared.pubKeyOperator;
+        up.keyIDVoting = shared.keyIDVoting;
+        expect_fail(v24_cfg(), {{mn, shared}}, make_special_tx(3, up, 1), "bad-protx-shared-mn");
+    }
+    // ProUpShareTx: index out of range; reward paying the voting key.
+    {
+        dash::coin::vendor::CProUpShareTx us;
+        us.proTxHash = mn;
+        us.shareIndex = 2;
+        us.scriptReward = pkh(0xc3);
+        expect_fail(v24_cfg(), {{mn, shared}}, make_special_tx(11, us, 1), "bad-proupshare-index");
+        us.shareIndex = 0;
+        us.scriptReward.m_data = {0x76, 0xa9, 0x14};
+        us.scriptReward.m_data.insert(us.scriptReward.m_data.end(), shared.keyIDVoting.data(),
+                                      shared.keyIDVoting.data() + 20);
+        us.scriptReward.m_data.push_back(0x88);
+        us.scriptReward.m_data.push_back(0xac);
+        expect_fail(v24_cfg(), {{mn, shared}}, make_special_tx(11, us, 1), "bad-proupshare-payee-reuse");
+    }
+    // ProUpSharedRegTx for a regular masternode.
+    {
+        dash::coin::vendor::CProUpSharedRegTx sr;
+        sr.proTxHash = mn;
+        sr.pubKeyOperator = seq_array<48>(0xd0);
+        sr.keyIDVoting = raw160(0xd1);
+        sr.vchSigs.resize(1);
+        expect_fail(v24_cfg(), {{mn, v2_mn(6)}}, make_special_tx(12, sr, 1), "bad-proupsharedreg-not-shared");
+    }
+    // A legacy-scheme update of a basic state; a legacy registration.
+    {
+        CProUpRegTx up;
+        up.nVersion = 1;
+        up.proTxHash = mn;
+        up.pubKeyOperator = v2_mn(6).pubKeyOperator;
+        up.keyIDVoting = v2_mn(6).keyIDVoting;
+        expect_fail(v24_cfg(), {{mn, v2_mn(6)}}, make_special_tx(3, up, 1), "bad-protx-version-downgrade");
+        CProRegTx reg;
+        reg.nVersion = 1;
+        reg.collateralOutpoint.hash = raw256(0x13);
+        reg.netInfo = svc4(7, 7, 7, 7, 9999);
+        reg.keyIDOwner = raw160(0x14);
+        reg.pubKeyOperator = seq_array<48>(0x15);
+        reg.keyIDVoting = raw160(0x16);
+        reg.scriptPayout = pkh(0x17);
+        expect_fail(v24_cfg(), {}, make_special_tx(1, reg, 1), "bad-protx-version-disallowed");
+    }
+    // Operator-key uniqueness: a registration reusing another MN's key.
+    {
+        CProRegTx reg;
+        reg.nVersion = 3;
+        reg.collateralOutpoint.hash = raw256(0x13);
+        reg.extNetInfo = core4(7, 7, 7, 7, 9999);
+        reg.keyIDOwner = raw160(0x14);
+        reg.pubKeyOperator = v2_mn(6).pubKeyOperator;
+        reg.keyIDVoting = raw160(0x16);
+        vv::MasternodePayoutShare po;
+        po.scriptPayout = pkh(0x17);
+        reg.payouts = {po};
+        expect_fail(v24_cfg(), {{mn, v2_mn(6)}}, make_special_tx(1, reg, 1), "bad-protx-dup-key");
+        // ... and a share owner key reusing an MN's owner key.
+        CProRegTx sh;
+        sh.nVersion = 3;
+        sh.collateralOutpoint.hash = raw256(0x18);
+        sh.extNetInfo = core4(7, 7, 7, 8, 9999);
+        sh.pubKeyOperator = seq_array<48>(0x19);
+        sh.keyIDVoting = raw160(0x1a);
+        sh.shares = shares2();
+        sh.shares[0].keyIDOwner = v2_mn(6).keyIDOwner;
+        sh.vchJoinSigs.resize(2);
+        expect_fail(v24_cfg(), {{mn, v2_mn(6)}}, make_special_tx(1, sh, 1), "bad-protx-dup-key");
+    }
+    // An EvoNode with a legacy service cannot be raised by a registrar update.
+    {
+        auto evo = v2_mn(6);
+        evo.nType = MnType::EVO;
+        evo.platformNodeID = raw160(0x31);
+        evo.platformP2PPort = 26656;
+        evo.platformHTTPPort = 443;
+        CProUpRegTx up;
+        up.nVersion = 3;
+        up.proTxHash = mn;
+        up.pubKeyOperator = evo.pubKeyOperator;
+        up.keyIDVoting = evo.keyIDVoting;
+        vv::MasternodePayoutShare po;
+        po.scriptPayout = pkh(0x17);
+        up.payouts = {po};
+        expect_fail(v24_cfg(), {{mn, evo}}, make_special_tx(3, up, 1), "bad-protx-netinfo-version");
+    }
+    // Types 10-12 before DEPLOYMENT_V24: the v23.1.9 type list refuses them.
+    {
+        dash::coin::vendor::CProDisTx dis;
+        dis.proTxHash = mn;
+        dis.vchSigs.resize(1);
+        expect_fail(synth_cfg(), {}, make_special_tx(10, dis, 1), "bad-txns-type");
     }
 }

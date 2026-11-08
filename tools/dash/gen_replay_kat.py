@@ -67,6 +67,11 @@ from gen_mn_checkpoint import (  # noqa: E402
 # Dash MAINNET base58 version bytes (chainparams.cpp): P2PKH 76 ('X'), P2SH 16.
 MAINNET_PUBKEY_VER = 76
 MAINNET_P2SH_VER = 16
+# Dash Core testnet base58 prefixes (chainparams.cpp CTestNetParams).
+TESTNET_PUBKEY_VER = 140
+TESTNET_P2SH_VER = 19
+ADDRESS_VERSIONS = {"mainnet": (MAINNET_PUBKEY_VER, MAINNET_P2SH_VER),
+                    "testnet": (TESTNET_PUBKEY_VER, TESTNET_P2SH_VER)}
 
 EVO_STRINGS = ("Evo", "HighPerformance")
 
@@ -170,6 +175,27 @@ def write_inc(path, symbol, lines, preamble):
         f.write("    ;\n")
 
 
+def _first_endpoint(state, purpose):
+    eps = (state.get("addresses") or {}).get(purpose) or []
+    return eps[0] if eps else ""
+
+
+def _legacy_service(state):
+    """The 18-byte CService of a v1/v2 state: dashd v23 prints `service`,
+    v24 prints only `addresses` (core_p2p; {} for an empty netInfo)."""
+    return state.get("service") or _first_endpoint(state, "core_p2p")
+
+
+def _platform_http_port(diff_entry, state):
+    """platformHTTPPort (under the v2 SML leaf): v23 prints it; v24 prints
+    the addresses.platform_https endpoint instead."""
+    v = diff_entry.get("platformHTTPPort", state.get("platformHTTPPort"))
+    if v is None:
+        ep = _first_endpoint(diff_entry, "platform_https") or _first_endpoint(state, "platform_https")
+        v = int(ep.rsplit(":", 1)[1]) if ep else 0
+    return v or 0
+
+
 def _platform_p2p_port(state):
     eps = (state.get("addresses") or {}).get("platform_p2p") or []
     if not eps:
@@ -210,7 +236,7 @@ def cmd_prestate(args):
         if d.get("nType", 0) != ntype:
             die("proTx %s: list type %d != diff nType %r"
                 % (protx, ntype, d.get("nType", 0)))
-        ip, port = service_to_ip_port(s.get("service", ""))
+        ip, port = service_to_ip_port(_legacy_service(s))
         pubkey = (s.get("pubKeyOperator") or "").lower()
         if not is_hex_n(pubkey, 96):
             die("proTx %s: bad pubKeyOperator" % protx)
@@ -218,11 +244,10 @@ def cmd_prestate(args):
             die("proTx %s: list/diff pubKeyOperator disagree" % protx)
         voting = address_to_keyid_hex(s["votingAddress"])
         owner = address_to_keyid_hex(s["ownerAddress"])
-        payout = address_to_script(s["payoutAddress"], MAINNET_PUBKEY_VER,
-                                   MAINNET_P2SH_VER).hex()
+        pubkey_ver, p2sh_ver = ADDRESS_VERSIONS[args.network]
+        payout = address_to_script(s["payoutAddress"], pubkey_ver, p2sh_ver).hex()
         op_addr = s.get("operatorPayoutAddress", "")
-        script_op = (address_to_script(op_addr, MAINNET_PUBKEY_VER,
-                                       MAINNET_P2SH_VER).hex()
+        script_op = (address_to_script(op_addr, pubkey_ver, p2sh_ver).hex()
                      if op_addr else "-")
         node_id = d.get("platformNodeID", "")
         rec = {
@@ -241,8 +266,7 @@ def cmd_prestate(args):
             # addresses.platform_p2p endpoint. Not under the SML root — only
             # carried so ProUpServTx folds have a faithful baseline.
             "platformP2PPort": _platform_p2p_port(s),
-            "platformHTTPPort": (d.get("platformHTTPPort",
-                                       s.get("platformHTTPPort", 0)) or 0),
+            "platformHTTPPort": _platform_http_port(d, s),
             "operatorRewardBps": operator_reward_bp(e.get("operatorReward")),
             "scriptPayout": payout,
             "scriptOperatorPayout": script_op,
@@ -280,7 +304,7 @@ def cmd_prestate(args):
 
     lines = [
         "c2pool-dash-replay-prestate/1",
-        "network mainnet",
+        "network %s" % args.network,
         "height %d" % height,
         "blockhash %s" % blockhash.lower(),
         "mnroot %s" % mnroot.lower(),
@@ -315,8 +339,13 @@ def cmd_prestate(args):
             r["collateralIndex"],
             r["internalId"],
         ]))
+    if args.text:   # the plain prestate file test_dash_replay_run.cpp reads
+        with open(args.out, "w") as f:
+            f.write("\n".join(lines) + "\n")
+        print("wrote %s (%d MNs, root %s ✓)" % (args.out, len(records), got[:16]))
+        return
     write_inc(args.out, args.symbol, lines, [
-        "Full-state DML pre-list at mainnet h=%d." % height,
+        "Full-state DML pre-list at %s h=%d." % (args.network, height),
         "Root parity vs the committed cbTx merkleRootMNList was verified at",
         "generation time; the KAT re-verifies it before every fold.",
     ])
@@ -485,8 +514,11 @@ def main():
     p.add_argument("--list", required=True)
     p.add_argument("--diff", required=True)
     p.add_argument("--height", type=int, required=True)
-    p.add_argument("--symbol", required=True)
+    p.add_argument("--symbol", default="kDashReplayPrestate")
     p.add_argument("--out", required=True)
+    p.add_argument("--network", choices=sorted(ADDRESS_VERSIONS), default="mainnet")
+    p.add_argument("--text", action="store_true",
+                   help="write the plain prestate file (C2POOL_REPLAY_PRESTATE), not an .inc")
     p.set_defaults(fn=cmd_prestate)
 
     p = sub.add_parser("block")

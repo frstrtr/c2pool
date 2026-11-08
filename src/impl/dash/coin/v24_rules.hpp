@@ -26,13 +26,24 @@
 /// as Core decodes them (vendor/bls_canonical.hpp); a build without the
 /// backend refuses such payloads as unverifiable instead of accepting them.
 ///
-/// Wiring. The folds trust chainlocked blocks for ProTx validity (design
-/// §3.3.4); nothing here is called by a fold yet. The fold-side rule S2 does
-/// enforce is fail-closed parsing (vendor::parse_protx_payload and the
-/// refusals in mn_state_machine.hpp, replay_fold_engine.hpp and
-/// sml_special_fold.hpp). These checks are the reference for the S3
+/// Wiring: TEMPLATE SELECTION ONLY. These rules may refuse a tx we would
+/// otherwise put in a block; they must never sit on a path that has to
+/// ACCEPT a mined (chainlocked) block. Two reasons: a build without the BLS
+/// backend refuses every real operator key and type-2/4 signature here as
+/// unverifiable, and a mined block is valid by Core's verdict, not ours. The
+/// folds of mined blocks -- the replay fold (replay_fold_engine.hpp), the
+/// payee projection (mn_state_machine.hpp) and the v24 transitions
+/// (v24_state.hpp) -- read payloads structurally (vendor::parse_protx_payload,
+/// no BLS math) and prove themselves against the committed merkleRootMNList.
+/// v24_state.hpp's shared-collateral check calls decode_special_payload for
+/// type 1 only, which carries no signature rule. KATs:
+/// DashReplayFoldV24.MinedBlockFoldNeverRunsTheBlsPayloadRules and
+/// DashMnState.V24MinedBlockFoldNeverRunsTheBlsPayloadRules fold payloads
+/// these rules refuse. These checks are also the reference for the S3
 /// transitions and the S9 regtest KATs.
 
+#include <impl/dash/coin/dash_deployments.hpp>    // DashNetwork
+#include <impl/dash/coin/deployment_status.hpp>   // v24_active(net, h): the S0 switch
 #include <impl/dash/coin/tx_version_rules.hpp>
 #include <impl/dash/coin/vendor/netinfo.hpp>
 #include <impl/dash/coin/vendor/providertx.hpp>
@@ -47,29 +58,17 @@
 namespace dash {
 namespace coin {
 
-enum class DashNetwork : uint8_t { MAINNET, TESTNET, DEVNET, REGTEST };
+// DashNetwork and v24_active(net, height) come from the S0 deployment
+// tracking (dash_deployments.hpp, deployment_status.hpp): DeploymentActiveAfter
+// (pindexPrev, DEPLOYMENT_V24), true only when ACTIVE is proven (EHF signal
+// tracker + versionbits, the testnet buried height, or the operator pin).
 
 namespace v24 {
 /// First block that carried CbTx version 4 on testnet, i.e. the first block
-/// with DEPLOYMENT_V24 active (measured from chain data; design §5.1).
+/// with DEPLOYMENT_V24 active (measured from chain data; design §5.1). The
+/// same value as dash_deployment_params(TESTNET).v24_buried_height.
 inline constexpr uint32_t kTestnetActivationHeight = 1'578'000;
 } // namespace v24
-
-/// DeploymentActiveAfter(pindexPrev, DEPLOYMENT_V24) for the block at
-/// `height`. THIS IS THE S0 SEAM: slice S0 replaces the body with the EHF
-/// signal tracker + versionbits state machine. Until then: never on mainnet
-/// (not locked in), the measured height on testnet, and unknown (false) on
-/// devnet and regtest.
-inline bool v24_active(DashNetwork net, uint32_t height)
-{
-    switch (net) {
-    case DashNetwork::TESTNET: return height >= v24::kTestnetActivationHeight;
-    case DashNetwork::MAINNET:
-    case DashNetwork::DEVNET:
-    case DashNetwork::REGTEST: return false;
-    }
-    return false;
-}
 
 /// DEPLOYMENT_V19 (basic BLS scheme) buried heights, chainparams.cpp.
 inline bool v19_active(DashNetwork net, uint32_t height)
