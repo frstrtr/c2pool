@@ -814,18 +814,15 @@ jobs:
           $out | Select-Object -First 5 | Write-Host
           exit 0
 
-      # The startup line names the backend, and the BLS-crypto KATs run through
-      # the very DLL that ships (real testnet quorum signature, tamper
-      # rejection, aggregate VerifySecure round-trip, scheme-faithful key
-      # compare) -- the same KATs build.yml's linux-dash-bls leg runs.
-      - name: BLS backend line + KATs (DASH only)
+      # The BLS-crypto KATs run through the very DLL that ships (real testnet
+      # quorum signature, tamper rejection, aggregate VerifySecure round-trip,
+      # scheme-faithful key compare) -- the same KATs build.yml's
+      # linux-dash-bls leg runs. The startup line is checked on the packaged
+      # exe below, where every DLL it needs sits next to it.
+      - name: BLS KATs (DASH only)
         if: steps.presence.outputs.exists == '1' && matrix.coin == 'dash'
         run: |
           $ErrorActionPreference = 'Continue'
-          $out = (& build_ci/src/c2pool/Release/c2pool-dash.exe --help 2>&1 | Out-String)
-          $line = ($out -split "`r?`n" | Where-Object { $_ -match 'DASH BLS backend:' } | Select-Object -First 1)
-          Write-Host "windows x86_64: $line"
-          if ($line -notmatch 'DASH BLS backend: REAL') { Write-Host "::error::c2pool-dash.exe does not report a REAL BLS backend"; exit 1 }
           cmake --build build_ci --target test_dash_bls_verify --config Release -j 8
           if ($LASTEXITCODE -ne 0) { Write-Host "::error::test_dash_bls_verify failed to build"; exit 1 }
           $tdir = "build_ci/test/Release"
@@ -880,9 +877,10 @@ jobs:
           Compress-Archive -Path "${PKG}" -DestinationPath "${PKG}.zip"
 
       # On the packaged files: the exe imports the BLS verify entry points from
-      # c2pool_dashbls.dll, the DLL next to it carries the ciphersuite, loads,
-      # and reports the pinned tag with ARITH=GMP.
-      - name: BLS link guard (DASH, packaged artefact)
+      # c2pool_dashbls.dll by name, the DLL next to it carries the ciphersuite,
+      # loads, and reports the pinned tag with ARITH=GMP; then the packaged exe
+      # itself starts and names a REAL backend.
+      - name: BLS link guard + backend line (DASH, packaged artefact)
         if: steps.presence.outputs.exists == '1' && matrix.coin == 'dash'
         run: |
           $PKG = "c2pool-dash-${{ steps.ver.outputs.version }}-windows-x86_64"
@@ -890,6 +888,21 @@ jobs:
           & powershell -NoProfile -ExecutionPolicy Bypass -File scripts/ci/dash_bls_linked_guard.ps1 -Exe "${PKG}/c2pool-dash.exe" -Pin $pin
           if ($LASTEXITCODE -ne 0) { exit 1 }
           Get-ChildItem "${PKG}" -Filter *.dll | ForEach-Object { Write-Host ("  bundled {0} ({1:N0} bytes)" -f $_.Name, $_.Length) }
+          # The packaged exe starts and names a REAL backend. [string] + Contains,
+          # not -match: an empty pipeline result is AutomationNull, and
+          # "AutomationNull -notmatch x" is an empty (false) array, which once let
+          # a missing line through.
+          $ErrorActionPreference = 'Continue'
+          $out = [string](& "${PKG}/c2pool-dash.exe" --help 2>&1 | Out-String)
+          $rc = $LASTEXITCODE
+          $line = [string]($out -split "`r?`n" | Where-Object { $_.Contains('DASH BLS backend:') } | Select-Object -First 1)
+          Write-Host ("windows x86_64 (packaged, exit 0x{0:X8}): {1}" -f $rc, $line)
+          if (-not $line.Contains('DASH BLS backend: REAL')) {
+            Write-Host "--- output ---"; Write-Host $out
+            Write-Host "::error::packaged c2pool-dash.exe does not report a REAL BLS backend"
+            exit 1
+          }
+          exit 0
 
       - name: Upload package
         if: steps.presence.outputs.exists == '1'
