@@ -141,7 +141,66 @@ endif()
 option(C2POOL_DASH_BLS "Link dashbls (BLS12-381) for E1 Phase-L real quorum-commitment verify" OFF)
 option(C2POOL_DASH_BLS_OPTIONAL "Downgrade a missing dashbls under C2POOL_DASH_BLS=ON from FATAL_ERROR to a warning (local probe builds only)" OFF)
 set(C2POOL_DASH_BLS_AVAILABLE OFF)
-if(C2POOL_DASH_BLS)
+if(C2POOL_DASH_BLS AND MSVC)
+    # Windows/MSVC. dashd builds src/dashbls with autotools + mingw-w64 GCC;
+    # that C++ library cannot be linked by MSVC, and an MSVC build of the
+    # subtree would not be dashd's configuration (relic's 64-bit word needs
+    # __int128, MULTI=PTHREAD needs pthreads). scripts/build_dashbls_win64.sh
+    # therefore builds it exactly like dashd (MSYS2 MINGW64, same tag,
+    # ARITH=GMP) into c2pool_dashbls.dll, which exports only the C ABI in
+    # src/impl/dash/coin/vendor/dashbls_abi/c2pool_dashbls_abi.h. Here we turn
+    # the DLL's export list into an MSVC import library and point the dashbls
+    # includes at the facade headers that wrap that ABI in the dashbls class
+    # names, so bls_verify.{hpp,cpp} compile unchanged. The DLL must ship next
+    # to c2pool-dash.exe (release.yml bundles it).
+    find_file(DASHBLS_ABI_DLL NAMES c2pool_dashbls.dll
+        HINTS ${DASHBLS_ROOT} ENV DASHBLS_ROOT PATH_SUFFIXES bin NO_DEFAULT_PATH)
+    find_file(DASHBLS_ABI_DEF NAMES c2pool_dashbls.def
+        HINTS ${DASHBLS_ROOT} ENV DASHBLS_ROOT PATH_SUFFIXES lib NO_DEFAULT_PATH)
+    set(_dashbls_implib "${CMAKE_BINARY_DIR}/dashbls_abi/c2pool_dashbls.lib")
+    if(DASHBLS_ABI_DLL AND DASHBLS_ABI_DEF AND CMAKE_SIZEOF_VOID_P EQUAL 8)
+        file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/dashbls_abi")
+        # lib.exe (CMAKE_AR on MSVC); `link /LIB` is the same tool.
+        if(CMAKE_AR AND EXISTS "${CMAKE_AR}")
+            set(_dashbls_libtool "${CMAKE_AR}")
+        else()
+            set(_dashbls_libtool "${CMAKE_LINKER}" /LIB)
+        endif()
+        execute_process(
+            COMMAND ${_dashbls_libtool} /NOLOGO /MACHINE:X64
+                    "/DEF:${DASHBLS_ABI_DEF}" /NAME:c2pool_dashbls.dll
+                    "/OUT:${_dashbls_implib}"
+            RESULT_VARIABLE _dashbls_implib_rc
+            OUTPUT_VARIABLE _dashbls_implib_out
+            ERROR_VARIABLE _dashbls_implib_out)
+        if(_dashbls_implib_rc EQUAL 0 AND EXISTS "${_dashbls_implib}")
+            add_library(c2pool_dashbls SHARED IMPORTED GLOBAL)
+            set_target_properties(c2pool_dashbls PROPERTIES
+                IMPORTED_IMPLIB "${_dashbls_implib}"
+                IMPORTED_LOCATION "${DASHBLS_ABI_DLL}")
+            set(C2POOL_DASH_BLS_AVAILABLE ON)
+            set(DASHBLS_LIBRARIES c2pool_dashbls)
+            set(DASHBLS_INCLUDE_DIRS
+                "${CMAKE_SOURCE_DIR}/src/impl/dash/coin/vendor/dashbls_abi/facade")
+            message(STATUS "dashbls found (E1 Phase-L BLS verify ENABLED): ${DASHBLS_ABI_DLL} (C ABI, import library ${_dashbls_implib})")
+        else()
+            message(STATUS "dashbls: building the import library failed (${_dashbls_implib_rc}): ${_dashbls_implib_out}")
+        endif()
+    endif()
+    if(NOT C2POOL_DASH_BLS_AVAILABLE)
+        set(_dashbls_miss
+            "C2POOL_DASH_BLS=ON but the Windows dashbls backend was NOT found, so "
+            "dash_bls_verify would compile the fail-closed stub and the binary "
+            "would ship BLS-dark while the build stayed green.\n"
+            "  c2pool_dashbls.dll : ${DASHBLS_ABI_DLL}\n"
+            "  c2pool_dashbls.def : ${DASHBLS_ABI_DEF}\n"
+            "  64-bit target      : ${CMAKE_SIZEOF_VOID_P}\n"
+            "Build it with scripts/build_dashbls_win64.sh <prefix> in an MSYS2 "
+            "MINGW64 shell (or .github/actions/provision-dashbls-win64) and "
+            "re-configure with -DDASHBLS_ROOT=<prefix>, or build with "
+            "C2POOL_DASH_BLS=OFF (the default).")
+    endif()
+elseif(C2POOL_DASH_BLS)
     # Honour a DASHBLS_ROOT hint (the build-factory install prefix), else search
     # the system paths. dashbls installs: include/dashbls/*.hpp,
     # lib/libdashbls.a, lib/librelic_s.a, lib/mimalloc-2.0/libmimalloc-secure.a.
@@ -168,8 +227,17 @@ if(C2POOL_DASH_BLS)
             list(APPEND DASHBLS_LIBRARIES ${DASHBLS_MIMALLOC_LIB})
         endif()
         list(APPEND DASHBLS_LIBRARIES ${DASHBLS_GMP_LIB})
+        set(DASHBLS_INCLUDE_DIRS ${DASHBLS_INCLUDE_DIR})
+        # relic's headers #include <gmp.h> (ARITH=GMP). Linux has it on the
+        # default include path; Homebrew's /opt/homebrew on Apple Silicon is not.
+        if(APPLE)
+            find_path(DASHBLS_GMP_INCLUDE_DIR gmp.h)
+            if(DASHBLS_GMP_INCLUDE_DIR)
+                list(APPEND DASHBLS_INCLUDE_DIRS ${DASHBLS_GMP_INCLUDE_DIR})
+            endif()
+        endif()
         message(STATUS "dashbls found (E1 Phase-L BLS verify ENABLED): ${DASHBLS_LIB}")
-        message(STATUS "dashbls includes: ${DASHBLS_INCLUDE_DIR}")
+        message(STATUS "dashbls includes: ${DASHBLS_INCLUDE_DIRS}")
     else()
         set(_dashbls_miss
             "C2POOL_DASH_BLS=ON but the dashbls backend was NOT found, so "
@@ -182,11 +250,13 @@ if(C2POOL_DASH_BLS)
             "autoconf/automake/libtool/libgmp-dev) and re-configure with "
             "-DDASHBLS_ROOT=<prefix>, or build with C2POOL_DASH_BLS=OFF (the "
             "default) to keep the documented null-serve posture.")
-        if(C2POOL_DASH_BLS_OPTIONAL)
-            message(WARNING ${_dashbls_miss})
-        else()
-            message(FATAL_ERROR ${_dashbls_miss})
-        endif()
+    endif()
+endif()
+if(C2POOL_DASH_BLS AND NOT C2POOL_DASH_BLS_AVAILABLE)
+    if(C2POOL_DASH_BLS_OPTIONAL)
+        message(WARNING ${_dashbls_miss})
+    else()
+        message(FATAL_ERROR ${_dashbls_miss})
     endif()
 endif()
 
