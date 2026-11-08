@@ -876,3 +876,34 @@ TEST(DashDaemonlessBlockData, NoSuccessfulAnswerCarriesTheRefusalDiscriminator) 
                 << "an ANSWER must never carry the refusal discriminator: " << r.dump(2);
     }
 }
+
+// Dash Core pow.cpp DarkGravityWave with fPowAllowMinDifficultyBlocks
+// (testnet): the bits depend on the block's own time. Real testnet data from
+// the VM504 shadow (dashd 24.0.0): block 1,586,762 has bits 1e00a6e0 and time
+// 1793992483; block 1,586,763 came 605 s later (more than 4 x 150 s) and
+// carries 1e0684c0, ten times the parent's target. Our template had served
+// the DGW bits 1e009fe7 at a curtime past that mark: a block from it would
+// have been bad-diffbits. Mainnet has no such rule.
+TEST(DashHeaderChain, TestnetMinDifficultyBitsFollowTheBlockTime)
+{
+    const auto tn = dash::coin::make_dash_chain_params_testnet();
+    const auto mn = dash::coin::make_dash_chain_params_mainnet();
+    ASSERT_TRUE(tn.allow_min_difficulty);
+    ASSERT_FALSE(mn.allow_min_difficulty);
+    const uint32_t dgw = 0x1e009fe7, prev_bits = 0x1e00a6e0;
+    const int64_t prev_time = 1793992483;
+    using dash::coin::dgw_bits_for_block_time;
+    EXPECT_EQ(dgw_bits_for_block_time(dgw, prev_bits, prev_time, prev_time + 605, tn), 0x1e0684c0u)
+        << "the chain's own block 1,586,763";
+    EXPECT_EQ(dgw_bits_for_block_time(dgw, prev_bits, prev_time, prev_time + 600, tn), dgw)
+        << "exactly 4 x spacing is not more than it";
+    EXPECT_EQ(dgw_bits_for_block_time(dgw, prev_bits, prev_time, prev_time + 601, tn), 0x1e0684c0u);
+    EXPECT_EQ(dgw_bits_for_block_time(dgw, prev_bits, prev_time, prev_time + 7201, tn),
+              tn.pow_limit.GetCompact()) << "more than two hours: powLimit";
+    // Ten times a target already near powLimit is capped at powLimit.
+    EXPECT_EQ(dgw_bits_for_block_time(dgw, tn.pow_limit.GetCompact(), prev_time, prev_time + 900, tn),
+              tn.pow_limit.GetCompact());
+    // Mainnet: always the DGW bits, whatever the time.
+    EXPECT_EQ(dgw_bits_for_block_time(dgw, prev_bits, prev_time, prev_time + 7201, mn), dgw);
+    EXPECT_EQ(dgw_bits_for_block_time(dgw, prev_bits, prev_time, prev_time + 605, mn), dgw);
+}

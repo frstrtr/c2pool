@@ -250,6 +250,27 @@ inline uint32_t dark_gravity_wave(
     return bn_new.GetCompact();
 }
 
+/// Dash Core pow.cpp DarkGravityWave, the fPowAllowMinDifficultyBlocks rules
+/// (testnet): the next block's bits depend on ITS OWN time. More than two hours
+/// after its parent it may be mined at powLimit; more than 4 x nPowTargetSpacing
+/// (10 minutes) after, at ten times the parent's target (capped at powLimit);
+/// otherwise the DGW bits. Mainnet has no such rule (allow_min_difficulty is
+/// false), so this returns dgw_bits there.
+inline uint32_t dgw_bits_for_block_time(uint32_t dgw_bits, uint32_t prev_bits, int64_t prev_time,
+                                        int64_t block_time, const DashChainParams& params)
+{
+    if (!params.allow_min_difficulty) return dgw_bits;
+    const uint256 pow_limit = params.pow_limit;
+    if (block_time > prev_time + 2 * 60 * 60) return pow_limit.GetCompact();
+    if (block_time > prev_time + params.target_spacing * 4) {
+        uint256 bn = target_from_bits(prev_bits);
+        bn *= 10u;
+        if (bn > pow_limit) return pow_limit.GetCompact();
+        return bn.GetCompact();
+    }
+    return dgw_bits;
+}
+
 // ─── HeaderChain ────────────────────────────────────────────────────────────
 
 class HeaderChain {
@@ -398,6 +419,23 @@ public:
             return this->get_header_by_height_internal(h);
         };
         return dark_gravity_wave(get_ancestor, m_tip_height, m_params);
+    }
+
+    /// The bits the next block must carry when its time is `block_time`, on
+    /// top of the tip `prev_hash` (Dash Core GetNextWorkRequired(pindexLast,
+    /// pblock)). Only testnet's min-difficulty rules make the time matter.
+    /// 0 when the tip is not `prev_hash` or there are too few headers.
+    uint32_t next_work_required_at(const uint256& prev_hash, int64_t block_time) const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_tip.IsNull() || m_tip != prev_hash || m_tip_height < DGW_PAST_BLOCKS) return 0;
+        auto get_ancestor = [this](uint32_t h) -> std::optional<IndexEntry> {
+            return this->get_header_by_height_internal(h);
+        };
+        const uint32_t dgw = dark_gravity_wave(get_ancestor, m_tip_height, m_params);
+        const auto tip = get_header_by_height_internal(m_tip_height);
+        if (!tip) return 0;
+        return dgw_bits_for_block_time(dgw, tip->header.m_bits, tip->header.m_timestamp,
+                                       block_time, m_params);
     }
 
     size_t size() const {
