@@ -606,9 +606,14 @@ jobs:
             lipo "$lib" -verify_arch arm64 x86_64 || { echo "::error::$lib is not universal"; exit 1; }
           done
           [ "$found" -eq 1 ] || { echo "::error::no libgmp in ${PKG}/lib"; exit 1; }
+          # Prints the backend line; on a miss, the exit status and the output.
           run_line() {
-            "$@" --help > help.log 2>&1 || true
-            grep -m1 'DASH BLS backend:' help.log || true
+            rc=0
+            "$@" --help > help.log 2>&1 || rc=$?
+            if ! grep -m1 'DASH BLS backend:' help.log; then
+              echo "(no backend line; exit status $rc; output follows)"
+              tail -n 20 help.log
+            fi
           }
           line="$(run_line "$BIN")"
           echo "arm64 (native): $line"
