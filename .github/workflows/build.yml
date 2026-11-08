@@ -44,6 +44,7 @@ jobs:
     outputs:
       web: ${{ steps.filter.outputs.web }}
       qt: ${{ steps.filter.outputs.qt }}
+      v37: ${{ steps.filter.outputs.v37 }}
     steps:
       - uses: actions/checkout@v6
       - uses: dorny/paths-filter@v3
@@ -59,6 +60,10 @@ jobs:
               - 'CMakeLists.txt'
               - 'conanfile*'
               - 'cmake/**'
+              - '.github/workflows/build.yml'
+            v37:
+              - 'src/c2pool/v37/**'
+              - 'src/sharechain/v37/**'
               - '.github/workflows/build.yml'
   # ════════════════════════════════════════════════════════════════════════════
   # Test-allowlist drift-guard (fast, no build): every per-coin test executable
@@ -798,6 +803,7 @@ jobs:
     # pending entries, so a shared repo-global group self-cancels sibling
     # jobs of the same run and serializes/starves all heavy legs repo-wide.
     name: Linux x86_64 (AsAN+UBSan)
+    needs: changes   # v37 path filter for the #1905 safety pin, see "Run tests under sanitizers"
     # dash bring-up slices may opt out of sanitizers via dash-skip-sanitizers; KEEP for consensus/payout slices (default = on)
     if: ${{ !(github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'dash-skip-sanitizers')) }}
     # RUNS ON c2pool-heavy — and CodeQL analyze deliberately does NOT.
@@ -1247,7 +1253,18 @@ jobs:
         # --no-tests=error: per-binary zero-test floor. If the exclude ever
         # swallows every case (or the tests fail to register), ctest REDs
         # instead of greening over an empty run.
-        run: ctest --output-on-failure --no-tests=error -j8 --exclude-regex "LiveTest\."
+        # v37_convergence_soak is the #1905 SK-A1 safety pin: it fails under ASan
+        # without a known cause and is deliberately never retried. It runs here on
+        # pushes and on PRs that touch v37 code. Other PRs skip it, so the open
+        # v37 bug does not block unrelated work; the non-sanitizer Linux leg still
+        # runs it on every PR.
+        run: |
+          EXCL='LiveTest\.'
+          if [ "${{ github.event_name }}" = "pull_request" ] && [ "${{ needs.changes.outputs.v37 }}" != "true" ]; then
+            EXCL="${EXCL}|^v37_convergence_soak\$"
+            echo "::notice::v37_convergence_soak (#1905 safety pin) skipped under ASan: this PR does not touch v37 code"
+          fi
+          ctest --output-on-failure --no-tests=error -j8 --exclude-regex "${EXCL}"
 
       # cmake/RetryTest.cmake writes its attempt / RETRY lines only into the
       # CTest log of a passing test: report them and keep the log on every run.

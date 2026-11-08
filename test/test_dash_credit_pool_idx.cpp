@@ -492,7 +492,12 @@ TEST(DashCreditPoolIdx, V24EraUnknownFailsClosed) {
     EXPECT_TRUE(adm.empty());
     // An explicit activation height decides it.
     f.set_v24_height(HH - 1000);
+#ifdef C2POOL_DASH_BLS
     EXPECT_TRUE(f.try_admit_unlocks(true, HH, tip_hash, {}, {}, kLlmq100_67, adm));
+#else
+    // Stub build: conjunct (b) refuses every admission before the era is read.
+    EXPECT_FALSE(f.try_admit_unlocks(true, HH, tip_hash, {}, {}, kLlmq100_67, adm));
+#endif
 }
 
 
