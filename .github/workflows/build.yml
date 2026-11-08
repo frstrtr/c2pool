@@ -2251,11 +2251,25 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      # Per-job Conan home under $RUNNER_TEMP so concurrent jobs never tear each
-      # other's cache. Export via $GITHUB_ENV (job-level env fails to parse).
+      # github-hosted: ephemeral per-job home, warmed by actions/cache below.
+      # self-hosted:   PERSISTENT home keyed on the runner instance, as in the
+      # Linux job. A runner executes one job at a time, so it is never contended,
+      # and an actions/cache miss no longer re-fetches every source from GitHub.
+      # Anchored at the runner root (two levels above RUNNER_TEMP, outside _work):
+      # the service account's profile path can be long, and MSVC source builds
+      # under a Conan home are sensitive to the 260-character path limit.
+      # Export via $GITHUB_ENV (job-level env fails to parse).
       # PowerShell form (inherits the job's ExecutionPolicy-Bypass shell).
       - name: Set per-job Conan home
-        run: echo "CONAN_HOME=$env:RUNNER_TEMP/conan2" | Out-File -FilePath $env:GITHUB_ENV -Append
+        run: |
+          if ("${{ runner.environment }}" -eq "github-hosted") {
+            $conanHome = "$env:RUNNER_TEMP/conan2"
+          } else {
+            $runnerRoot = Split-Path -Parent (Split-Path -Parent $env:RUNNER_TEMP)
+            $conanHome = "$runnerRoot/.conan2-ci/$env:RUNNER_NAME"
+          }
+          Write-Host "Conan home: $conanHome"
+          echo "CONAN_HOME=$conanHome" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - uses: actions/setup-python@v6
         if: ${{ runner.environment == 'github-hosted' }}
@@ -2300,11 +2314,30 @@ jobs:
           $profile = conan profile path default
           (Get-Content $profile) -replace 'compiler.cppstd=14','compiler.cppstd=20' | Set-Content $profile
 
-      - name: Restore Conan cache
+      - name: Restore Conan cache (github-hosted only)
+        if: runner.environment == 'github-hosted'
         uses: actions/cache@v5
         with:
           path: ${{ runner.temp }}/conan2
           key: conan2-windows-msvc194-${{ hashFiles('conanfile.txt') }}
+
+      # Written after the cache restore so a restored global.conf cannot undo it.
+      # tools.files.download:* governs recipe source() downloads (the step that
+      # failed on 504/503 bursts, at its defaults of 2 retries, 5s apart);
+      # core.download:* governs fetches from Conan remotes. retry_wait is a fixed
+      # interval, so 10 x 30s rides out about 5 minutes of errors per file.
+      # There is no core.net.http:retry_wait: Conan rejects unknown core.* keys
+      # at startup, which would fail every install.
+      - name: Raise Conan download retries
+        run: |
+          @(
+            'core.net.http:max_retries=4',
+            'core.download:retry=10',
+            'core.download:retry_wait=30',
+            'tools.files.download:retry=10',
+            'tools.files.download:retry_wait=30'
+          ) | Set-Content -Path "$env:CONAN_HOME/global.conf" -Encoding ascii
+          conan config show "*retry*"
 
       - name: Conan install
         run: conan install . --build=missing --output-folder=build_ci
