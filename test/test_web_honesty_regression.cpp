@@ -20,6 +20,7 @@
 #include <core/web_server.hpp>
 #include <impl/dash/config_pool.hpp>   // dash::SharechainConfig SHARE_PERIOD / TARGET_LOOKBEHIND
 #include <impl/ltc/config_pool.hpp>    // ltc::PoolConfig  SHARE_PERIOD / TARGET_LOOKBEHIND
+#include <c2pool/ltc/mweb_topology_state.hpp>
 
 #include <chrono>
 #include <cmath>
@@ -2108,4 +2109,72 @@ TEST(DashboardSessionStates, FailbackReadsStandbyHashingElsewhere) {
         << "the standby chip does not say the rigs hash on another node";
     // The stalled warning still lists stalled only (failback rows are standby).
     EXPECT_NE(html.find("return sw.state === 'stalled';"), std::string::npos);
+}
+
+// D-LTC MWEB flag, backend: the LTC row carries the template's MWEB state, and
+// a node with no template yet says nothing instead of claiming MWEB is off.
+TEST(LtcMwebTopologyState, ColdStartWritesNoFlag) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr);
+    json coins = json::array({json{{"coin", "LTC"}}});
+    c2pool::ltc::add_mweb_topology_state(coins, mi.get_work_snapshot());
+    EXPECT_FALSE(coins[0].contains("mweb_active"));
+    EXPECT_FALSE(coins[0].contains("mweb_degraded"));
+}
+
+TEST(LtcMwebTopologyState, ReportsStateOnLtcRowOnly) {
+    MiningInterface::WorkSnapshot work;
+    work.subsidy = 625000000;
+    work.mweb_active = true;
+    work.degraded = true;
+    json coins = json::array({json{{"coin", "LTC"}}, json{{"coin", "DOGE"}}});
+    c2pool::ltc::add_mweb_topology_state(coins, work);
+    EXPECT_TRUE(coins[0].at("mweb_active").get<bool>());
+    EXPECT_TRUE(coins[0].at("mweb_degraded").get<bool>());
+    EXPECT_FALSE(coins[1].contains("mweb_active"));
+    EXPECT_FALSE(coins[1].contains("mweb_degraded"));
+
+    work.mweb_active = false;
+    work.degraded = false;
+    c2pool::ltc::add_mweb_topology_state(coins, work);
+    EXPECT_FALSE(coins[0].at("mweb_active").get<bool>());
+    EXPECT_FALSE(coins[0].at("mweb_degraded").get<bool>());
+}
+
+// The LTC topology hook is a lambda inside main(), so pin that it calls the
+// helper with the live snapshot.
+TEST(LtcMwebTopologyState, MainLtcTopologyHookFeedsTheFlag) {
+    std::ifstream f(std::string(WEB_STATIC_DIR) + "/../src/c2pool/main_ltc.cpp");
+    ASSERT_TRUE(f.is_open());
+    std::stringstream ss;
+    ss << f.rdbuf();
+    const std::string src = ss.str();
+    const auto hook = src.find("set_node_topology_fn(");
+    ASSERT_NE(hook, std::string::npos);
+    const auto end = src.find("set_sharechain_window_fn(", hook);
+    ASSERT_NE(end, std::string::npos);
+    const std::string body = src.substr(hook, end - hook);
+    EXPECT_NE(body.find("add_mweb_topology_state(coins, work_mi->get_work_snapshot())"),
+              std::string::npos)
+        << "/api/node_topology no longer reports LTC MWEB state";
+}
+
+// D-LTC MWEB flag, frontend: the node card shows the state, gated on the field
+// being present so other coins and a cold start stay silent.
+TEST(LtcMwebTopologyState, DashboardRendersGatedMwebState) {
+    std::ifstream f(DASHBOARD_HTML_PATH);
+    ASSERT_TRUE(f.is_open());
+    std::stringstream ss;
+    ss << f.rdbuf();
+    const std::string html = ss.str();
+    const auto start = html.find("function renderNodeTopology(t)");
+    ASSERT_NE(start, std::string::npos);
+    const auto end = html.find("\n        function ", start + 1);
+    ASSERT_NE(end, std::string::npos);
+    const std::string fn = html.substr(start, end - start);
+    EXPECT_NE(fn.find("typeof c.mweb_active === 'boolean'"), std::string::npos)
+        << "the MWEB chip must be gated on the backend reporting it";
+    for (const char* label : {"MWEB active", "MWEB inactive", "MWEB degraded"})
+        EXPECT_NE(fn.find(label), std::string::npos) << "missing label: " << label;
+    EXPECT_NE(fn.find("tip + mweb + nowork"), std::string::npos)
+        << "the MWEB chip is computed but never rendered";
 }
