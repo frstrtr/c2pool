@@ -448,14 +448,27 @@ jobs:
             cp "$src" "${PKG}/lib/${base}"
             install_name_tool -change "$ref" "@executable_path/lib/${base}" "${PKG}/c2pool-${COIN}"
           done
-          for lib in "${PKG}"/lib/*.dylib; do
-            for ref in $(otool -L "$lib" | grep "${BREW_PREFIX}" | awk '{print $1}'); do
-              base=$(basename "$ref")
-              [ -f "${PKG}/lib/${base}" ] && install_name_tool -change "$ref" "@executable_path/lib/${base}" "$lib"
+          # Bundle what the bundled dylibs need in turn (libleveldb -> libsnappy,
+          # ...), repeating until no brew reference is left. A dependency that is
+          # only present on the build runner makes the package fail on a clean Mac.
+          changed=1
+          while [ "$changed" -eq 1 ]; do
+            changed=0
+            for lib in "${PKG}"/lib/*.dylib; do
+              for ref in $(otool -L "$lib" | tail -n +2 | grep "${BREW_PREFIX}" | awk '{print $1}'); do
+                base=$(basename "$ref")
+                if [ ! -f "${PKG}/lib/${base}" ]; then
+                  cp "$ref" "${PKG}/lib/${base}" && chmod u+w "${PKG}/lib/${base}"
+                  changed=1
+                fi
+                install_name_tool -change "$ref" "@executable_path/lib/${base}" "$lib"
+              done
             done
+          done
+          for lib in "${PKG}"/lib/*.dylib; do
             install_name_tool -id "@executable_path/lib/$(basename $lib)" "$lib"
           done
-          if otool -L "${PKG}/c2pool-${COIN}" "${PKG}"/lib/*.dylib | grep -E "@rpath/|/actions-runner/"; then
+          if otool -L "${PKG}/c2pool-${COIN}" "${PKG}"/lib/*.dylib | tail -n +1 | grep -vE "^${PKG}/" | grep -E "@rpath/|/actions-runner/|${BREW_PREFIX}/|/opt/homebrew/|/usr/local/"; then
             echo "PKG-ASSERT FAIL: a dylib reference points outside the package"; exit 1
           fi
           # DASH: libdashbls.a is static, but relic's ARITH=GMP backend links
