@@ -1507,6 +1507,54 @@ TEST(DashReplayFoldSynthetic, ExtAddrPayloadFailsClosed)
     EXPECT_TRUE(eng.poisoned()); // a skipped mutation would be silent desync
 }
 
+// Dash Core v24: a ProUpRegTx v3 (payout list), a ProUpRevTx v3 (the state
+// version is kept after v24) and a v2 update of a v3 (ExtAddr) state each
+// fail closed (poison) instead of folding with the pre-v24 semantics.
+TEST(DashReplayFoldSynthetic, ExtAddrRegistrarRevokeAndV3StateFailClosed)
+{
+    for (int which = 0; which < 3; ++which) {
+        DmlFoldEngine eng(synth_cfg());
+        ReplayMNState st;
+        st.nVersion = which == 2 ? ProTxVersion::EXT_ADDR : ProTxVersion::BASIC_BLS;
+        st.keyIDOwner = raw160(0x21);
+        st.keyIDVoting = raw160(0x51);
+        st.pubKeyOperator = seq_array<48>(0x31);
+        st.collateralOutpoint.hash = raw256(0x41);
+        st.collateralOutpoint.index = 1;
+        st.nRegisteredHeight = 50;
+        const uint256 mn = raw256(0xE1);
+        eng.seed({{mn, st}}, 1, 100, raw256(9));
+
+        MutableTransaction tx;
+        if (which == 0) {
+            CProUpRegTx up;
+            up.nVersion = ProTxVersion::EXT_ADDR;
+            up.proTxHash = mn;
+            up.pubKeyOperator = st.pubKeyOperator;
+            up.keyIDVoting = st.keyIDVoting;
+            dash::coin::vendor::MasternodePayoutShare po;
+            po.scriptPayout.m_data = {0x76, 0xa9, 0x14, 0x01, 0x88, 0xac};
+            up.payouts = {po};
+            tx = make_special_tx(3, up, 1);
+        } else if (which == 1) {
+            CProUpRevTx rv;
+            rv.nVersion = ProTxVersion::EXT_ADDR;
+            rv.proTxHash = mn;
+            tx = make_special_tx(4, rv, 1);
+        } else {
+            CProUpServTx up;
+            up.nVersion = ProTxVersion::BASIC_BLS;
+            up.nType = MnType::REGULAR;
+            up.proTxHash = mn;
+            tx = make_special_tx(2, up, 1);
+        }
+        auto r = eng.fold_block(make_block(101, raw256(9), uint256{}, {tx}, &eng), 101);
+        ASSERT_FALSE(r.ok) << which;
+        EXPECT_NE(r.error.find("ExtAddr"), std::string::npos) << r.error;
+        EXPECT_TRUE(eng.poisoned()) << which;
+    }
+}
+
 TEST(DashReplayFoldSynthetic, UnknownProTxHashFailsClosed)
 {
     DmlFoldEngine eng(synth_cfg());

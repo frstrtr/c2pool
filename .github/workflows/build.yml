@@ -2615,6 +2615,7 @@ jobs:
                      test_dash_bls_verify test_dash_quorum_members \
                      test_dash_quorum_member_source test_dash_govvote_bls \
                      test_dash_chainlock_verify test_dash_isdlock test_dash_dstx \
+                     test_dash_simplifiedmns \
             -j"${BUILD_J:-8}"
 
       # LEG 2: the artefact itself carries the dashbls backend.
@@ -2637,6 +2638,13 @@ jobs:
         # -- RED here, belt to the explicit per-name assertion in the next step.
         run: ctest --output-on-failure --no-tests=error -j8 -R 'DashBlsVerify|DashQuorumMembers|DashQuorumMemberSource|DashGovVoteBLS|DashChainLockVerify|DashIsdlockBls'
 
+      # The Dash Core v24 provider-payload rules with the real backend: Core's
+      # BLS operator-key and signature decoding (stub lanes run the same
+      # tables against dashd-confirmed answers instead).
+      - name: Run v24 payload KATs (real BLS)
+        working-directory: build_dash_bls
+        run: ./test/test_dash_simplifiedmns --gtest_filter='DashV24*'
+
       # LEG 3: the BLS-ONLY cases actually ran. Each of these is inside
       # #ifdef C2POOL_DASH_BLS, so on a stub build they do not fail -- they
       # cease to exist, and a bare ctest invocation reports green over an empty
@@ -2652,6 +2660,7 @@ jobs:
           ./test/test_dash_chainlock_verify  >> bls_kat.log 2>&1 || true
           ./test/test_dash_isdlock           >> bls_kat.log 2>&1 || true
           ./test/test_dash_dstx              >> bls_kat.log 2>&1 || true
+          ./test/test_dash_simplifiedmns     >> bls_kat.log 2>&1 || true
           log="$(cat bls_kat.log)"
           missing=0
           for t in \
@@ -2669,7 +2678,10 @@ jobs:
             DashChainLockVerify.RejectedWhenSigningQuorumIsMissingFromTheSet \
             DashIsdlockBls.RealSignatureVerifiesEndToEnd \
             DashIsdlockBls.TamperedSignatureIsRejectedAndNeverReachesMempool \
-            DashDstxFailClosed.BadBlsSignatureIsRejected
+            DashDstxFailClosed.BadBlsSignatureIsRejected \
+            DashV24Bls.BackendMatchesDashdOnEveryFact \
+            DashV24Bls.GeneratedSignaturesVerifyAgainstTheirKeys \
+            DashV24Bls.ProductionRulesUseTheBackend
           do
             # Pure-shell match, not `grep -q` in a pipeline: under pipefail a
             # `grep -q` that matches SIGPIPEs its producer and the pipeline
