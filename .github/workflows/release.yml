@@ -493,6 +493,24 @@ jobs:
             fi
           done
           chmod +x "${PKG}/start.sh" 2>/dev/null || true
+          # Ad-hoc re-sign. The per-arch step's strip and install_name_tool
+          # invalidate the ad-hoc signatures the linker and Homebrew put on the
+          # binary and the bundled dylibs ("changes being made to the file will
+          # invalidate the code signature"), and Apple Silicon kills a process
+          # that maps code with an invalid signature. Report what arrived
+          # broken, then sign every Mach-O in the package ad hoc (each slice of
+          # a universal file is signed). This is not a Developer ID signature.
+          bad=0
+          for f in "${PKG}"/lib/*.dylib "${PKG}/c2pool-${COIN}"; do
+            codesign --verify "$f" 2>/dev/null || bad=$((bad + 1))
+          done
+          echo "Mach-O files with an invalid signature before re-signing: $bad"
+          for f in "${PKG}"/lib/*.dylib "${PKG}/c2pool-${COIN}"; do
+            codesign --force --sign - "$f"
+          done
+          for f in "${PKG}"/lib/*.dylib "${PKG}/c2pool-${COIN}"; do
+            codesign --verify --strict "$f" || { echo "::error::$f still fails codesign --verify"; exit 1; }
+          done
           file "${PKG}/c2pool-${COIN}"
           lipo -info "${PKG}/c2pool-${COIN}"
           zip -r "${PKG}.zip" "${PKG}/"
