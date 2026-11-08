@@ -2635,7 +2635,11 @@ jobs:
         # --no-tests=error: per-binary zero-test floor. These KATs live behind
         # #ifdef C2POOL_DASH_BLS, so a stub build makes the selector match zero
         # -- RED here, belt to the explicit per-name assertion in the next step.
-        run: ctest --output-on-failure --no-tests=error -j8 -R 'DashBlsVerify|DashQuorumMembers|DashQuorumMemberSource|DashGovVoteBLS|DashChainLockVerify|DashIsdlockBls'
+        # DashCreditPool: the credit-pool follower cases (DashCreditPoolIdx,
+        # DashCreditPoolIdxDb, DashCreditPoolLane) are folded into the
+        # test_dash_chainlock_verify binary, but no name above matched them, so
+        # ctest never ran them here.
+        run: ctest --output-on-failure --no-tests=error -j8 -R 'DashBlsVerify|DashQuorumMembers|DashQuorumMemberSource|DashGovVoteBLS|DashChainLockVerify|DashIsdlockBls|DashCreditPool'
 
       # LEG 3: the BLS-ONLY cases actually ran. Each of these is inside
       # #ifdef C2POOL_DASH_BLS, so on a stub build they do not fail -- they
@@ -2669,7 +2673,12 @@ jobs:
             DashChainLockVerify.RejectedWhenSigningQuorumIsMissingFromTheSet \
             DashIsdlockBls.RealSignatureVerifiesEndToEnd \
             DashIsdlockBls.TamperedSignatureIsRejectedAndNeverReachesMempool \
-            DashDstxFailClosed.BadBlsSignatureIsRejected
+            DashDstxFailClosed.BadBlsSignatureIsRejected \
+            DashCreditPoolIdx.Kat4_VerifiedUnlockIncludedAndBalanceCommitsExactly \
+            DashCreditPoolIdx.Kat5_TamperedQuorumSigRejected \
+            DashCreditPoolIdx.Kat4b_LimitBindsEvenWithValidSig \
+            DashCreditPoolIdx.V2UnlockNeedsV24ForTheBlock \
+            DashCreditPoolLane.AdmitNeedsACompleteFreshFollower
           do
             # Pure-shell match, not `grep -q` in a pipeline: under pipefail a
             # `grep -q` that matches SIGPIPEs its producer and the pipeline
