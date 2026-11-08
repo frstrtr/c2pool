@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+### DASH: compiled masternode anchor re-pinned to h=2563800
+- The compiled masternode anchor and the header fast-start move from h=2549400
+  to h=2563800 (blockhash 0000000000000016a129aa626ea761e0…, 3005 registered, 2249
+  valid). The old anchor reaches the 20000-block bridge limit at tip 2569400, past
+  which a cold start on default flags fails closed. The set is self-derived by
+  the replay fold (every block root-checked against its committed cbTx root) and
+  matches Dash Core 24.0.0 `protx list registered true 2563800` on every column.
+- The height stays at or below the pinned UTXO snapshot (2564044), the v24
+  versionbits walk-back (2564341) and the EHF scan anchor (2568000).
+- A running node keeps its header chain, its PoSe oracle snapshot and its full
+  UTXO set. Its persisted masternode bridge cursor descends from the old anchor
+  and is refused once at the first restart (rule R2): the bridge replays from
+  the new anchor to the tip and persists a cursor of the new lineage.
+
 ### DOGE: the embedded UTXO set is built from genesis (templates no longer underfill)
 - The embedded DOGE UTXO set was a partial view born from the last 1,440 blocks:
   a tx spending any older coin (e.g. the 499-input consolidations the network
