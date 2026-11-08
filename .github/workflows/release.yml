@@ -379,6 +379,16 @@ jobs:
             cp "$dylib" "${PKG}/lib/${base}"
             install_name_tool -change "$dylib" "@executable_path/lib/${base}" "${PKG}/c2pool-${COIN}"
           done
+          # In-tree shared objects linked via @rpath (DASH: libdash_scriptcheck, the
+          # hidden-visibility script interpreter, src/impl/dash/CMakeLists.txt) are not
+          # under the brew prefix; bundle them the same way.
+          for ref in $(otool -L "${PKG}/c2pool-${COIN}" | awk '/@rpath\//{print $1}'); do
+            base=$(basename "$ref")
+            src=$(find build -name "$base" -type f | head -1)
+            [ -n "$src" ] || { echo "PKG-ASSERT FAIL: $ref not found under build/"; exit 1; }
+            cp "$src" "${PKG}/lib/${base}"
+            install_name_tool -change "$ref" "@executable_path/lib/${base}" "${PKG}/c2pool-${COIN}"
+          done
           for lib in "${PKG}"/lib/*.dylib; do
             for ref in $(otool -L "$lib" | grep "${BREW_PREFIX}" | awk '{print $1}'); do
               base=$(basename "$ref")
@@ -386,6 +396,9 @@ jobs:
             done
             install_name_tool -id "@executable_path/lib/$(basename $lib)" "$lib"
           done
+          if otool -L "${PKG}/c2pool-${COIN}" "${PKG}"/lib/*.dylib | grep -E "@rpath/|/actions-runner/"; then
+            echo "PKG-ASSERT FAIL: a dylib reference points outside the package"; exit 1
+          fi
           cp start.sh "${PKG}/" && chmod +x "${PKG}/start.sh"
           cp "config/${COIN}/c2pool_mainnet.yaml" "${PKG}/config/c2pool_mainnet.yaml.example"
           cp "config/${COIN}/c2pool_testnet.yaml" "${PKG}/config/c2pool_testnet.yaml"
@@ -675,6 +688,13 @@ jobs:
           # SONAME-agnostic glob: upstream bumps libsecp256k1-N.dll (6->7 etc). Do NOT re-pin a number.
           Copy-Item "${env:GITHUB_WORKSPACE}/secp256k1/bin/libsecp256k1-*.dll" "${PKG}/"
           Copy-Item "${env:GITHUB_WORKSPACE}/secp256k1/bin/libsecp256k1-*.dll" "${PKG}/lib/"
+          # In-tree shared libraries the exe links (DASH: the dash_scriptcheck script
+          # interpreter, a SHARED target in src/impl/dash/CMakeLists.txt) sit in the
+          # build tree, not in the secp256k1 prefix; bundle them next to the exe (portable zip) and in lib/ (the installer packs lib\*).
+          Get-ChildItem -Recurse -Path build_ci -Filter "*scriptcheck*.dll" | ForEach-Object { Copy-Item $_.FullName "${PKG}/"; Copy-Item $_.FullName "${PKG}/lib/" }
+          if ($COIN -eq "dash" -and -not (Get-ChildItem -Path "${PKG}" -Filter "*scriptcheck*.dll")) {
+            Write-Error "PKG-ASSERT FAIL: dash_scriptcheck DLL not bundled in ${PKG}"; exit 1
+          }
           Copy-Item start.bat "${PKG}/"
           Copy-Item -Recurse web-static/* "${PKG}/web-static/"
           Copy-Item explorer/explorer.py "${PKG}/explorer/"

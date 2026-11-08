@@ -610,6 +610,9 @@ C2P_PARAM("embedded.accrue_asset_locks", Embedded, BOOL, RESTART, C_DASH, LIT, "
 C2P_PARAM("embedded.accrue_asset_unlocks", Embedded, BOOL, RESTART, C_DASH, LIT, "false", NONE, "type-9 asset-unlock fold")
   C2P_ALIAS("embedded.accrue_asset_unlocks", BIN_DASH, "--embedded-accrue-asset-unlocks", FLAG)
 
+C2P_PARAM("embedded.credit_pool_seed", Embedded, BOOL, RESTART, C_DASH, LIT, "false", NONE, "seed the credit-pool follower from the v20 floor (needed to admit asset unlocks)")
+  C2P_ALIAS("embedded.credit_pool_seed", BIN_DASH, "--embedded-credit-pool-seed", FLAG)
+
 C2P_PARAM("embedded.null_arm", Embedded, TRISTATE_BOOL, MONEY_RESTART, C_DASH, NONE, "", NONE, "optimistic null commitment (money/consensus)")
   C2P_ALIAS("embedded.null_arm", BIN_DASH, "--embedded-null-arm", FLAG_OPT_EQFALSE)
 
@@ -824,6 +827,9 @@ C2P_PARAM("utility.max_nonce", Meta, INT64, RESTART, C_DASH, LIT, "4294967295", 
 
 C2P_PARAM("bls.allow_stub", Gate, BOOL, RESTART, C_DASH, LIT, "false", NONE, "knowingly run a bls=stub (BLS-dark) build in a BLS-relying config")
   C2P_ALIAS("bls.allow_stub", BIN_DASH, "--allow-stub-bls", FLAG)
+
+C2P_PARAM("dash.v24_activation_height", Embedded, INT64, RESTART, C_DASH, NONE, "", NONE, "pin the Dash Core v24 activation height once locked in (unset: follow the EHF signals)")
+  C2P_ALIAS("dash.v24_activation_height", BIN_DASH, "--dash-v24-activation-height", VALUE)
 
 #undef C2P_PARAM
 #undef C2P_ALIAS
