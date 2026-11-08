@@ -9993,79 +9993,83 @@ int main(int argc, char* argv[]) {
                             }
                         });
 
-                    // Wire merged block found → unified verification via FoundBlock
-                    auto* mi_ptr = web_server.get_mining_interface();
-                    // #946: miner, subsidy and parent_* come from the stratum
-                    // submit (MergedSubmitScope) via record_merged_found_block.
-                    mm_manager->set_on_merged_block_found(
-                        [mi_ptr](const std::string& symbol, int height,
-                                 const std::string& block_hash, bool accepted,
-                                 uint64_t coinbase_value, double difficulty) {
-                            mi_ptr->record_merged_found_block(
-                                symbol, height, block_hash, accepted, coinbase_value,
-                                difficulty);
-                        });
-
                     // When merged mining aux work changes (new DOGE block),
                     // push fresh stratum work so miners get the new commitment.
                     mm_manager->set_on_work_changed([&web_server]() {
                         web_server.trigger_work_refresh_debounced();
                     });
+                }
 
-                    // Wire the merged found-block verifiers: our block against
-                    // the aux chain's best chain at the height it was mined at
-                    // (aux_verdict). DOGE and NMC read their embedded header
-                    // chains when present; any other chain its daemon's best
-                    // chain (getblockcount / getblockhash / getblockheader):
-                    // a daemon that merely answers is not a confirmation, and
-                    // a block it took as "inconclusive" is confirmed only if
-                    // its chain ends up with it.
-                    auto header_view = [](const auto* hc) {
-                        ltc::coin::found_block::ChainView view;
-                        view.height_of = [hc](const uint256& hh) -> std::optional<uint32_t> {
-                            auto e = hc->get_header(hh);
-                            if (!e)
-                                return std::nullopt;
-                            return e->height;
-                        };
-                        view.hash_at = [hc](uint32_t hh) -> std::optional<uint256> {
-                            auto e = hc->get_header_by_height(hh);
-                            if (!e)
-                                return std::nullopt;
-                            return e->block_hash;
-                        };
-                        view.tip_height = [hc]() { return hc->height(); };
-                        view.has_tip = [hc]() { return hc->tip().has_value(); };
-                        return view;
+                // Registered whether or not the chain has a P2P broadcaster: an RPC-only
+                // aux chain (--no-embedded-doge, no P2P port) still finds blocks, and they
+                // must reach FoundBlock. Without its own verifier a DOGE row would fall
+                // through to the parent-chain verifier.
+                // Wire merged block found → unified verification via FoundBlock
+                auto* mi_ptr = web_server.get_mining_interface();
+                // #946: miner, subsidy and parent_* come from the stratum
+                // submit (MergedSubmitScope) via record_merged_found_block.
+                mm_manager->set_on_merged_block_found(
+                    [mi_ptr](const std::string& symbol, int height,
+                             const std::string& block_hash, bool accepted,
+                             uint64_t coinbase_value, double difficulty) {
+                        mi_ptr->record_merged_found_block(
+                            symbol, height, block_hash, accepted, coinbase_value,
+                            difficulty);
+                    });
+
+                // Wire the merged found-block verifiers: our block against
+                // the aux chain's best chain at the height it was mined at
+                // (aux_verdict). DOGE and NMC read their embedded header
+                // chains when present; any other chain its daemon's best
+                // chain (getblockcount / getblockhash / getblockheader):
+                // a daemon that merely answers is not a confirmation, and
+                // a block it took as "inconclusive" is confirmed only if
+                // its chain ends up with it.
+                auto header_view = [](const auto* hc) {
+                    ltc::coin::found_block::ChainView view;
+                    view.height_of = [hc](const uint256& hh) -> std::optional<uint32_t> {
+                        auto e = hc->get_header(hh);
+                        if (!e)
+                            return std::nullopt;
+                        return e->height;
                     };
-                    for (auto& chain : merged_chain_specs) {
-                        auto parts_check = std::vector<std::string>();
-                        { std::istringstream ss(chain); std::string t;
-                          while (std::getline(ss, t, ':')) parts_check.push_back(t); }
-                        if (parts_check.size() >= 2) {
-                            std::string sym = parts_check[0];
-                            uint32_t cid = static_cast<uint32_t>(std::stoul(parts_check[1]));
-                            auto* rpc_backend = mm_manager->get_chain_rpc(cid);
-                            if (rpc_backend) {
-                                std::optional<ltc::coin::found_block::ChainView> embedded_view;
-                                if (cid == 98 && doge_chain)
-                                    embedded_view = header_view(doge_chain.get());
-                                else if (cid == 1 && nmc_chain)
-                                    embedded_view = header_view(nmc_chain.get());
-                                mi_ptr->add_chain_verify_fn(sym,
-                                    [rpc_backend, mi_ptr, embedded_view](const std::string& hash_hex) -> int {
-                                        uint256 h;
-                                        h.SetHex(hash_hex);
-                                        const auto found_height = found_block_height(*mi_ptr, hash_hex);
-                                        if (embedded_view)
-                                            return ltc::coin::found_block::aux_verdict(*embedded_view, h, found_height);
-                                        try {
-                                            return c2pool::merged::aux_backend_verdict(*rpc_backend, h, found_height);
-                                        } catch (...) {
-                                            return 0;  // cannot tell: pending
-                                        }
-                                    });
-                            }
+                    view.hash_at = [hc](uint32_t hh) -> std::optional<uint256> {
+                        auto e = hc->get_header_by_height(hh);
+                        if (!e)
+                            return std::nullopt;
+                        return e->block_hash;
+                    };
+                    view.tip_height = [hc]() { return hc->height(); };
+                    view.has_tip = [hc]() { return hc->tip().has_value(); };
+                    return view;
+                };
+                for (auto& chain : merged_chain_specs) {
+                    auto parts_check = std::vector<std::string>();
+                    { std::istringstream ss(chain); std::string t;
+                      while (std::getline(ss, t, ':')) parts_check.push_back(t); }
+                    if (parts_check.size() >= 2) {
+                        std::string sym = parts_check[0];
+                        uint32_t cid = static_cast<uint32_t>(std::stoul(parts_check[1]));
+                        auto* rpc_backend = mm_manager->get_chain_rpc(cid);
+                        if (rpc_backend) {
+                            std::optional<ltc::coin::found_block::ChainView> embedded_view;
+                            if (cid == 98 && doge_chain)
+                                embedded_view = header_view(doge_chain.get());
+                            else if (cid == 1 && nmc_chain)
+                                embedded_view = header_view(nmc_chain.get());
+                            mi_ptr->add_chain_verify_fn(sym,
+                                [rpc_backend, mi_ptr, embedded_view](const std::string& hash_hex) -> int {
+                                    uint256 h;
+                                    h.SetHex(hash_hex);
+                                    const auto found_height = found_block_height(*mi_ptr, hash_hex);
+                                    if (embedded_view)
+                                        return ltc::coin::found_block::aux_verdict(*embedded_view, h, found_height);
+                                    try {
+                                        return c2pool::merged::aux_backend_verdict(*rpc_backend, h, found_height);
+                                    } catch (...) {
+                                        return 0;  // cannot tell: pending
+                                    }
+                                });
                         }
                     }
                 }
