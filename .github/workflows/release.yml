@@ -348,7 +348,8 @@ jobs:
         run: brew install cmake boost leveldb secp256k1 nlohmann-json yaml-cpp
 
       # DASH cell only: build/reuse dash's own src/dashbls at the pinned tag for
-      # THIS arch (native, Homebrew gmp, ARITH=GMP as dashd) and export
+      # THIS arch (native, Homebrew gmp; dashbls's configure picks ARITH=GMP on arm64
+      # and ARITH=EASY on x86_64 Darwin, the same split as dashd's builds) and export
       # DASHBLS_ROOT, so the package links the REAL BLS12-381 verifier like the
       # Linux one. googletest is only for the BLS KATs run below.
       - name: Provision dashbls (DASH only)

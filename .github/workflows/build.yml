@@ -2639,7 +2639,7 @@ jobs:
         # DashCreditPoolIdxDb, DashCreditPoolLane) are folded into the
         # test_dash_chainlock_verify binary, but no name above matched them, so
         # ctest never ran them here.
-        run: ctest --output-on-failure --no-tests=error -j8 -R 'DashBlsVerify|DashQuorumMembers|DashQuorumMemberSource|DashGovVoteBLS|DashChainLockVerify|DashIsdlockBls|DashCreditPool'
+        run: ctest --output-on-failure --no-tests=error -j8 -R 'DashBlsVerify|DashQuorumMembers|DashQuorumMemberSource|DashGovVoteBLS|DashChainLockVerify|DashIsdlockBls|DashCreditPoolIdx|DashCreditPoolLane'
 
       # LEG 3: the BLS-ONLY cases actually ran. Each of these is inside
       # #ifdef C2POOL_DASH_BLS, so on a stub build they do not fail -- they

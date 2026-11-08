@@ -94,7 +94,9 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        # relic's ARITH=GMP backend, exactly as dashd (which hard-requires gmp).
+        # gmp for relic, as dashd (which hard-requires gmp). dashbls's configure uses
+        # ARITH=GMP where it knows the gmp version check and ARITH=EASY on x86_64
+        # Darwin; dashd's own builds have the same split.
         # The dylib is what c2pool links and the release bundles into lib/.
         gp="$(brew --prefix gmp 2>/dev/null || true)"
         for f in "$gp/include/gmp.h" "$gp/lib/libgmp.dylib"; do
