@@ -56,12 +56,12 @@ using dash::coin::make_dash_chain_params_mainnet;
 
 namespace {
 
-// The real hashMerkleRoot of mainnet block 2549400 (big-endian display), as
+// The real hashMerkleRoot of mainnet block 2563800 (big-endian display), as
 // reported by two independent chain sources and, decisively, as recomputed by
 // X11 over the pinned 80-byte header inside the product itself.
 constexpr const char* kAnchorMerkleRoot =
-    "935359e1a2d29fca27dc6ac1d6eea422f24301616bda26e087ac67f81b42790c";
-constexpr uint32_t kAnchorHeight = 2549400;
+    "ca996896c66729694de8ec1bf488011b7105e50ada2b965ab982e7023bc76197";
+constexpr uint32_t kAnchorHeight = 2563800;
 
 } // namespace
 
