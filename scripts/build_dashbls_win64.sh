@@ -18,8 +18,8 @@
 #
 # Output in <prefix>:
 #   bin/c2pool_dashbls.dll   the DLL that ships next to c2pool-dash.exe
-#   lib/c2pool_dashbls.def   its export list; cmake turns it into an MSVC
-#                            import library
+#   lib/c2pool_dashbls.def   its export list, by name only; cmake turns it
+#                            into an MSVC import library
 #   lib/libdashbls.a, include/   the dashbls install from build_dashbls.sh
 #
 # Before installing, it checks that relic really was configured for GMP, that
@@ -73,7 +73,7 @@ g++ -std=c++17 -O2 -DNDEBUG -shared \
     "$PREFIX/lib/libdashbls.a" -lgmp \
     -static -static-libgcc -static-libstdc++ \
     -lbcrypt -ladvapi32 -lpsapi -luser32 -lshell32 \
-    -Wl,--output-def,"$stage/c2pool_dashbls.def" \
+    -Wl,--output-def,"$stage/ld-exports.def" \
     -o "$stage/c2pool_dashbls.dll"
 
 # 3. Checks on the artefact.
@@ -87,12 +87,23 @@ while read -r dll; do
     esac
 done <<< "$imports"
 
-exports="$(sed -n 's/^[[:space:]]*\(c2dbls_[a-z0-9_]*\).*/\1/p' "$stage/c2pool_dashbls.def" | sort -u)"
+exports="$(sed -n 's/^[[:space:]]*\(c2dbls_[a-z0-9_]*\).*/\1/p' "$stage/ld-exports.def" | sort -u)"
 wanted="$(sed -n 's/^C2DBLS_API[^(]*[ *]\(c2dbls_[a-z0-9_]*\)(.*/\1/p' "$ABI_DIR/c2pool_dashbls_abi.h" | sort -u)"
 [ -n "$wanted" ] || die "could not read the export list from c2pool_dashbls_abi.h"
 missing="$(comm -13 <(echo "$exports") <(echo "$wanted"))"
 [ -z "$missing" ] || die "DLL is missing exports: $missing"
 echo "[build_dashbls_win64] exports: $(echo "$wanted" | wc -l) C ABI functions"
+
+# The export list cmake turns into the MSVC import library. Names only: ld's
+# own --output-def numbers every entry ("name @N"), and an import library made
+# from that binds the exe to ORDINALS, so a rebuilt DLL whose numbering moved
+# would be called at the wrong functions without any load error. By name, a
+# mismatch fails at load instead.
+{
+    echo "LIBRARY c2pool_dashbls.dll"
+    echo "EXPORTS"
+    echo "$wanted" | sed 's/^/    /'
+} > "$stage/c2pool_dashbls.def"
 
 grep -a -q -E 'BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_(NUL|AUG|POP)_' "$stage/c2pool_dashbls.dll" \
     || die "no BLS12-381 ciphersuite ID in the DLL"
