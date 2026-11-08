@@ -30,6 +30,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -191,6 +192,12 @@ struct EmbeddedWorkInputs {
     // Set by NodeCoinState::make_embedded_work_inputs from its admit hook.
     std::shared_ptr<const AssetUnlockAdmission> asset_unlocks;
 
+    // Testnet (Dash Core fPowAllowMinDifficultyBlocks): the bits of the block
+    // depend on its own time, so they are re-derived for the template's final
+    // curtime (Core's UpdateTime recomputes nBits the same way). Returns
+    // nullopt to keep bits_for_next. Unset on mainnet.
+    std::function<std::optional<uint32_t>(const uint256& prev_hash, uint32_t block_time)> bits_at_time;
+
     // PoSe pass seams (sml_pose_fold.hpp): the member proTxHash source and
     // the penalty oracle for the builder's own HandleQuorumCommitment pass
     // over qc_commitments. Point into NodeCoinState (same lifetime discipline
@@ -306,7 +313,7 @@ inline WorkSelection select_dash_work(
     return select_dash_work(
         emb,
         [&emb]() {
-            return build_embedded_workdata(
+            auto w = build_embedded_workdata(
                 emb.prev_height, emb.prev_hash, *emb.mnstates, *emb.mempool,
                 emb.bits_for_next, emb.mtp_at_tip,
                 emb.address_version, emb.address_p2sh_version,
@@ -357,6 +364,10 @@ inline WorkSelection select_dash_work(
                 emb.v24_active,
                 // Dash Core's full provider-tx checks (null => none rides).
                 emb.protx_check_env);
+            // Testnet min-difficulty: bits for the template's own curtime.
+            if (emb.bits_at_time)
+                if (auto b = emb.bits_at_time(w.m_previous_block, w.m_curtime)) w.m_bits = *b;
+            return w;
         },
         dashd_fallback);
 }

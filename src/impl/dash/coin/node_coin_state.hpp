@@ -20,6 +20,7 @@
 /// == false always routes there, and it remains the [GBT-XCHECK] cross-check.
 
 #include <impl/dash/coin/work_source.hpp>        // EmbeddedWorkInputs, select_dash_work, WorkSelection
+#include <core/address_utils.hpp>                // script_to_address (emit gate payee tokens)
 #include <impl/dash/coin/mn_state_machine.hpp>   // MnStateMachine
 #include <impl/dash/coin/mempool.hpp>            // Mempool
 #include <impl/dash/coin/tx_inject_pool.hpp>     // TxInjectPool (#157 miner/user tx-injection)
@@ -43,9 +44,11 @@
 #include <core/p2p_message_stats.hpp>    // core::obs::inject_status (#157 read-only status mirror)
 #include <core/inject_ledger_obs.hpp>    // core::obs::inject_ledger (S4 per-inject read-only mirror)
 
+#include <algorithm>
 #include <ctime>
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <limits>
@@ -485,6 +488,18 @@ public:
         uint32_t height, const uint256& prev_hash,
         const std::vector<MutableTransaction>& candidates, const QuorumManager& qmgr)>;
     void set_asset_unlock_admit_fn(AssetUnlockAdmitFn fn) { m_asset_unlock_admit_fn = std::move(fn); }
+
+    /// Testnet (Dash Core fPowAllowMinDifficultyBlocks): bits for a block at a
+    /// given time on top of a given parent (HeaderChain::next_work_required_at).
+    /// Passed to the work source, which applies it at the template's curtime.
+    using BitsAtTimeFn = std::function<std::optional<uint32_t>(const uint256& prev_hash, uint32_t block_time)>;
+    void set_bits_at_time_fn(BitsAtTimeFn fn) { m_bits_at_time_fn = std::move(fn); }
+
+    /// Heights the embedded arm declined because the scheduled payee is paid
+    /// through a v24 payout list (cause mn-payee-v24-payout-list), and the
+    /// last such height. Counted once per height (templates rebuild).
+    uint64_t v24_payout_list_declines() const { return m_v24_payout_list_declines.load(); }
+    uint32_t v24_payout_list_last_height() const { return m_v24_payout_list_last_h.load(); }
     V24State v24_state_for(uint32_t height) const
     {
         return m_v24_state_fn ? m_v24_state_fn(height) : dash::coin::v24_state(m_v24_net, height);
@@ -1764,44 +1779,59 @@ public:
                 if (it != m_mnstates.entries().end()) {
                     const int64_t mn_payment =
                         static_cast<int64_t>(w.m_payment_amount);
-                    const int64_t op_due =
-                        it->second.operator_payment_of(mn_payment);
-                    if (op_due > 0) {
-                        // Occurrence-counted so a 50/50 split (owner amount
-                        // == operator amount) needs TWO outputs, not one
-                        // double-matched.
-                        //
-                        // dashd masternode/payments.cpp:74-79 emits each
-                        // output only when its amount is > 0. The operator
-                        // amount is > 0 here by construction, so it is always
-                        // required; the owner amount is 0 exactly when
-                        // bps == 10000 (the whole share goes to the operator)
-                        // and then dashd emits NO owner output — requiring one
-                        // rejected every correct full-operator template
-                        // (owner=0-MISSING, 2026-10-28).
-                        const uint64_t own_amt =
-                            static_cast<uint64_t>(mn_payment - op_due);
-                        const uint64_t op_amt = static_cast<uint64_t>(op_due);
-                        size_t own_n = 0, op_n = 0;
-                        for (const auto& p : w.m_packed_payments) {
-                            if (p.payee == "!6a") continue;
-                            if (p.amount == own_amt) ++own_n;
-                            if (p.amount == op_amt)  ++op_n;
+                    // The payout SET dashd's GetBlockTxOuts derives for this
+                    // payee (v24::expected_mn_outputs, the Core v24 port:
+                    // owner payouts / share split, then the operator; each
+                    // only when > 0; a full 10000-bps operator share has NO
+                    // owner output). Checked whenever more than one output,
+                    // or an operator output, is due -- the h=2516595 class
+                    // and every v24 multi-output payee -- as (payee, amount)
+                    // pairs: the template must carry each due output at its
+                    // script (as the packed-payment token the builder
+                    // writes) AND amount, occurrence-counted (Dash Core v24
+                    // strict multiplicity: each expected output consumes a
+                    // distinct coinbase output), so a 50/50 split needs two
+                    // outputs and a same-amount payment at another script
+                    // (a superblock entry) cannot stand in for a missing one.
+                    const auto due = v24::expected_mn_outputs(it->second, mn_payment);
+                    const bool op_due = it->second.operator_payment_of(mn_payment) > 0;
+                    if (due.size() >= 2 || op_due) {
+                        auto token_of = [&](const std::vector<unsigned char>& script) {
+                            std::string addr = ::core::script_to_address(
+                                script, /*bech32_hrp=*/"", m_address_version, m_address_p2sh_version);
+                            if (!addr.empty()) return addr;
+                            static const char* digits = "0123456789abcdef";
+                            std::string hx = "!";
+                            for (uint8_t b : script) { hx += digits[b >> 4]; hx += digits[b & 0xF]; }
+                            return hx;
+                        };
+                        std::vector<std::pair<std::string, uint64_t>> have;
+                        for (const auto& p : w.m_packed_payments)
+                            if (p.payee != "!6a") have.emplace_back(p.payee, p.amount);
+                        const auto& st = it->second;
+                        const bool multi = !st.v24.shares.empty()
+                            || st.nVersion >= vendor::ProTxVersion::EXT_ADDR;
+                        const char* owner_role = !st.v24.shares.empty() ? "share" : "payout";
+                        std::string report;
+                        bool all_present = true;
+                        for (size_t i = 0; i < due.size(); ++i) {
+                            const bool is_op = op_due && i + 1 == due.size();
+                            const std::string role = is_op ? std::string("operator")
+                                : multi ? owner_role + std::to_string(i)
+                                        : std::string("owner");
+                            const std::pair<std::string, uint64_t> want{
+                                token_of(due[i].script), static_cast<uint64_t>(due[i].amount)};
+                            auto f = std::find(have.begin(), have.end(), want);
+                            const bool present = f != have.end();
+                            if (present) have.erase(f);
+                            all_present = all_present && present;
+                            report += (report.empty() ? "" : ",") + role + "="
+                                    + std::to_string(due[i].amount)
+                                    + (present ? "-present" : "-MISSING");
                         }
-                        const bool owner_ok =
-                            own_amt == 0
-                                ? true
-                                : (own_amt == op_amt ? own_n >= 2 : own_n >= 1);
-                        const bool op_ok =
-                            own_amt == op_amt ? op_n >= 2 : op_n >= 1;
-                        if (!owner_ok || !op_ok)
-                            return reject(
-                                "emit-mn-payout-split-drift",
-                                "owner=" + std::to_string(mn_payment - op_due)
-                                    + (owner_ok ? "-present" : "-MISSING")
-                                    + ",operator=" + std::to_string(op_due)
-                                    + (op_ok ? "-present" : "-MISSING"),
-                                "both-split-amounts-in-template");
+                        if (!all_present)
+                            return reject("emit-mn-payout-split-drift", report,
+                                          "every-payout-set-output-in-template");
                     }
                 }
             }
@@ -2171,6 +2201,7 @@ public:
         e.mnstates             = &m_mnstates;
         e.mempool              = &m_mempool;
         e.bits_for_next        = m_bits_for_next;
+        e.bits_at_time         = m_bits_at_time_fn;
         e.mtp_at_tip           = m_mtp_at_tip;
         e.address_version      = m_address_version;
         e.address_p2sh_version = m_address_p2sh_version;
@@ -2495,6 +2526,17 @@ private:
                            "protx=" + protx->GetHex().substr(0, 12),
                            "payout-set-known");
         }
+        // Dash Core v24: a payee paid through a payout list the builder
+        // cannot build yet (S4). Explicit, and counted per height.
+        if (d.viable && m_require_resolvable_payee) {
+            if (auto protx = mn_payee_unpayable_at_tip()) {
+                d = refuse("mn-payee-v24-payout-list",
+                           "protx=" + protx->GetHex().substr(0, 12),
+                           "v24-payee-builder");
+                if (m_v24_payout_list_last_h.exchange(next_h) != next_h)
+                    m_v24_payout_list_declines.fetch_add(1);
+            }
+        }
 
         if (d.viable) return d;
 
@@ -2607,6 +2649,36 @@ private:
         if (!expected) return false;              // #996: nullopt while payment due
         return m_mnstates.entries().find(*expected) != m_mnstates.entries().end();
     }
+
+    /// The safety net for the masternode payee builder: the scheduled payee
+    /// must be payable, i.e. every output Dash Core's GetBlockTxOuts expects
+    /// for it (v24::expected_mn_outputs: the v3 payout list, a shared
+    /// masternode's share split, or scriptPayout, then the operator) has a
+    /// script. A payee with no payout data at all would be paid to an empty
+    /// script (bad-cb-payee). Returns the scheduled proRegTxHash when the
+    /// height must be REFUSED (cause=mn-payee-v24-payout-list), nullopt when
+    /// serving is safe. Same no-payment-due carve-outs as
+    /// mn_payee_resolvable_at_tip(). (Testnet shadow h=1586594, VM504 dashd
+    /// 24.0.0: before the v24 payee builder, an Evo masternode with a v3
+    /// payout list was paid to an empty scriptPayout.)
+    std::optional<uint256> mn_payee_unpayable_at_tip() const {
+        if (m_mnstates.entries().empty()) return std::nullopt;
+        const uint32_t next_h = m_prev_height + 1;
+        const int64_t reward = compute_dash_block_reward_post_v20(next_h);
+        const int64_t platform_reward =
+            compute_dash_platform_reward_post_v20_mn_rr(next_h, m_mn_rr_height);
+        if (compute_dash_mn_payment_post_v20(reward) - platform_reward <= 0) return std::nullopt;
+        const auto expected = m_mnstates.find_expected_payee();
+        if (!expected) return std::nullopt;   // payee-unresolvable owns this
+        const auto it = m_mnstates.entries().find(*expected);
+        if (it == m_mnstates.entries().end()) return std::nullopt;
+        const auto due = v24::expected_mn_outputs(it->second, int64_t{1'000'000'000'000});
+        bool payable = !due.empty();
+        for (const auto& o : due) payable = payable && !o.script.empty();
+        if (payable) return std::nullopt;
+        return *expected;
+    }
+
 
     // Incident h=2516595 (bad-cb-payee): the scheduled payee's operator-
     // reward split must be PROVEN before the embedded arm may build the
@@ -2805,6 +2877,9 @@ private:
     V24StateFn m_v24_state_fn;   // Dash Core v24 deployment state (unset => registry for m_v24_net)
     DashNetwork m_v24_net{DashNetwork::MAINNET};
     AssetUnlockAdmitFn m_asset_unlock_admit_fn;   // #143 credit-pool follower admission
+    BitsAtTimeFn m_bits_at_time_fn;               // testnet min-difficulty bits (unset on mainnet)
+    mutable std::atomic<uint64_t> m_v24_payout_list_declines{0};
+    mutable std::atomic<uint32_t> m_v24_payout_list_last_h{0};
     int      m_mn_min_confirmations{DASH_MN_MIN_CONFIRMATIONS_MAINNET}; // network nMasternodeMinimumConfirmations (rollover projection)
     uint256  m_credit_pool_current_hash;     // block hash the credit-pool seed is current at
     int32_t  m_credit_pool_height{-1};       // seed cbTx's OWN height (-1 = never seeded)

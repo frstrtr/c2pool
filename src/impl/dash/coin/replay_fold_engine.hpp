@@ -181,6 +181,7 @@
 #include <impl/dash/coin/vendor/cbtx.hpp>
 #include <impl/dash/coin/vendor/llmq_commitment.hpp>
 #include <impl/dash/coin/vendor/providertx.hpp>
+#include <impl/dash/coin/v24_state.hpp>
 #include <impl/dash/coin/vendor/simplifiedmns.hpp>
 #include <impl/dash/coin/vendor/bls_verify.hpp>
 #include <impl/dash/coin/vendor/incremental_sml_merkle.hpp>
@@ -269,6 +270,9 @@ struct ReplayMNState
     uint160                                      platformNodeID;
     uint16_t                                     platformP2PPort{0};
     uint16_t                                     platformHTTPPort{0};
+    // Dash Core v24 (nVersion >= 3): payout list, share table, early-exit
+    // terms and the ExtNetInfo that replaces `netInfo`. Empty below v3.
+    MnStateV24Ext                                v24;
 
     bool IsBanned() const { return nPoSeBanHeight != NEVER; }
 
@@ -278,12 +282,11 @@ struct ReplayMNState
     /// operator script set leaves the owner remainder at 0, so the ONLY MN
     /// output goes to scriptOperatorPayout; otherwise the owner output
     /// (scriptPayout) is always present.
+    /// Dash Core v24: a v3 state's first payout entry, a shared state's first
+    /// share (v24::guaranteed_payout_script, shared with MNState).
     const std::vector<unsigned char>& first_payout_script() const
     {
-        return (nOperatorReward == 10000
-                && !scriptOperatorPayout.m_data.empty())
-            ? scriptOperatorPayout.m_data
-            : scriptPayout.m_data;
+        return v24::guaranteed_payout_script(*this);
     }
 
     void BanIfNotBanned(int32_t height)
@@ -312,6 +315,7 @@ struct ReplayMNState
         nVersion             = vendor::ProTxVersion::LEGACY_BLS;
         pubKeyOperator       = {};
         netInfo              = vendor::LegacyNetService{};
+        v24.extNetInfo       = vendor::ExtNetInfo{};
         scriptOperatorPayout = OPScript{};
         nRevocationReason    = vendor::CProUpRevTx::REASON_NOT_SPECIFIED;
         platformNodeID       = uint160{};
@@ -335,9 +339,9 @@ struct ReplayMNState
         return true;
     }
 
-    /// Dash Core's MnNetInfo::IsEmpty(): an address that is not valid,
-    /// whatever its port (LegacyNetService::IsEmpty).
-    bool netinfo_empty() const { return netInfo.IsEmpty(); }
+    /// Dash Core's MnNetInfo::IsEmpty() / ExtNetInfo::IsEmpty(): for a legacy
+    /// service, an address that is not valid, whatever its port (NetInfoRef).
+    bool netinfo_empty() const { return v24::netinfo_empty(*this); }
 
     /// dashd CDeterministicMN::to_sml_entry (deterministicmns.cpp:45-52):
     /// the DIP-4 entry whose CalcHash feeds the committed merkleRootMNList.
@@ -352,6 +356,13 @@ struct ReplayMNState
         // An empty MnNetInfo is hashed as CService{}: 16 zero bytes, port 0.
         e.netAddress       = netInfo.canonical().ip;
         e.netPort          = netInfo.canonical().port_be;
+        // Dash Core v24: a v3 leaf carries the ExtNetInfo (and no
+        // platformHTTPPort; the leaf codec skips it at v3).
+        if (v24::state_has_ext(nVersion)) {
+            e.netAddress = {};
+            e.netPort    = 0;
+            e.extNetInfo = v24.extNetInfo;
+        }
         // dashd serializes the SML leaf's operator key in the scheme the entry
         // nVersion dictates (legacy iff nVersion < BasicBLS). We store canonical
         // BASIC, so re-encode per nVersion here (opkey_for_leaf) — otherwise a
@@ -372,7 +383,29 @@ struct ReplayMNState
     // nPoSePenaltyHi is deliberately NOT here: this codec is also the MN diff
     // store's row format (mn_diff_store.hpp `added` entries), which must not
     // change; the v4 snapshot container writes hi beside each entry instead.
-    C2POOL_SERIALIZE_METHODS(ReplayMNState)
+    //
+    // Dash Core v24: a state with nVersion >= 3 appends its MnStateV24Ext
+    // after these fields; a v1/v2 state encodes exactly as before, so diff
+    // store rows and v3/v4 snapshots of pre-v24 lists stay readable and
+    // their digests unchanged.
+    template <typename Stream>
+    void Serialize(Stream& s) const
+    {
+        Base::Write(s, *this);
+        if (v24::state_has_ext(nVersion)) s << v24;
+    }
+    template <typename Stream>
+    void Unserialize(Stream& s)
+    {
+        Base::Read(s, *this);
+        if (v24::state_has_ext(nVersion)) s >> v24;
+    }
+    /// The pre-v24 layout only (snapshot v3/v4 containers).
+    template <typename Stream>
+    void unserialize_pre_v24(Stream& s) { Base::Read(s, *this); }
+
+    struct Base {
+    FORMAT_METHODS(ReplayMNState)
     {
         READWRITE(obj.nType,
                   obj.internalId,
@@ -398,6 +431,7 @@ struct ReplayMNState
                   obj.platformP2PPort,
                   obj.platformHTTPPort);
     }
+    };
 
     /// dashd-state equality. nPoSePenaltyHi is excluded on purpose (model
     /// metadata, not CDeterministicMNState) — the MN diff store's newest-pair
@@ -429,7 +463,8 @@ struct ReplayMNState
             && scriptOperatorPayout.m_data == r.scriptOperatorPayout.m_data
             && platformNodeID == r.platformNodeID
             && platformP2PPort == r.platformP2PPort
-            && platformHTTPPort == r.platformHTTPPort;
+            && platformHTTPPort == r.platformHTTPPort
+            && v24 == r.v24;
     }
 };
 
@@ -447,12 +482,32 @@ struct FoldGates
     int32_t v19_height{1899072};       // basic BLS (per-entry nVersion wrapper)
     int32_t mn_rr_height{2128896};     // MN reward reallocation (Evo 4-in-a-row OFF)
     int32_t masternode_min_confirmations{15};
-    // DEPLOYMENT_V24 / ExtAddr is NEVER_ACTIVE on mainnet
-    // (chainparams.cpp:212-214). The branch is NOT implemented; setting this
-    // true makes every fold refuse — fail closed, never drift (§3).
-    bool    v24_active{false};
+    // DEPLOYMENT_V24: the first height with the v24 rules (Dash Core v24
+    // state transitions, type list 0..12, shared-collateral covenant). Never
+    // by default (mainnet is not locked in); S0's versionbits tracker sets
+    // it, testnet is 1,578,000 (v24_rules.hpp v24_active).
+    int32_t v24_height{std::numeric_limits<int32_t>::max()};
+    // Chain parameters for the netInfo conversions SetStateVersion performs.
+    vendor::NetInfoRules netinfo_rules{vendor::NetInfoRules::mainnet()};
+
+    /// Dash Core testnet (chainparams.cpp CTestNetParams; the heights
+    /// getdeploymentinfo reports on testnet): DIP3 7,000 / enforced 7,300,
+    /// V19 850,100, MN_RR 1,066,900, V24 1,578,000, one confirmation.
+    static FoldGates testnet()
+    {
+        FoldGates g;
+        g.dip0003_height = 7000;
+        g.dip0003_enforcement_height = 7300;
+        g.v19_height = 850100;
+        g.mn_rr_height = 1066900;
+        g.masternode_min_confirmations = 1;
+        g.v24_height = static_cast<int32_t>(v24::kTestnetActivationHeight);
+        g.netinfo_rules = vendor::NetInfoRules::testnet();
+        return g;
+    }
 
     bool v19_active(int32_t h) const   { return h >= v19_height; }
+    bool v24_active(int32_t h) const   { return h >= v24_height; }
     bool mn_rr_active(int32_t h) const { return h >= mn_rr_height; }
     // dashd deploymentstatus.h:53 DeploymentDIP0003Enforced(h) == h >= EnfHeight.
     // Gates the coinbase payee cross-check: below this dashd's own consensus
@@ -516,6 +571,10 @@ struct FoldResult
     // a projection that is NOT paid fails the fold closed, it never leaves
     // this flag quietly clear.
     bool        payee_paid_verified{false};
+    // Dash Core v24: for a v3 or shared payee the check above is the exact
+    // multiset form (every payout-set output, distinct outputs, exact
+    // amounts of GetBlockTxOuts's split of their sum).
+    bool        payee_amounts_verified{false};
     // True when the payee cross-check was SKIPPED because this height is below
     // DIP3 enforcement (dashd does not commit the det payee to the coinbase
     // there either). The SET self-check (merkleRootMNList) still ran; only the
@@ -568,9 +627,15 @@ public:
     using MembersFn = std::function<std::optional<std::vector<uint256>>(
         uint8_t llmqType, const uint256& quorumHash)>;
 
-    static constexpr uint32_t    kSnapshotVersion = 4;
-    static constexpr const char* kSnapshotMagic   = "C2POOL-DASH-DML-SNAP/v04";
+    // v5 (Dash Core v24): an entry with nVersion >= 3 carries its
+    // MnStateV24Ext (ReplayMNState codec). v4 and v3 still load; an entry of
+    // theirs that claims nVersion >= 3 has no payout list or ExtNetInfo and
+    // is refused.
+    static constexpr uint32_t    kSnapshotVersion = 5;
+    static constexpr const char* kSnapshotMagic   = "C2POOL-DASH-DML-SNAP/v05";
     static constexpr size_t      kSnapshotMagicLen = 24;
+    static constexpr uint32_t    kSnapshotVersionV4 = 4;
+    static constexpr const char* kSnapshotMagicV4   = "C2POOL-DASH-DML-SNAP/v04";
     // The previous format, still LOADED (never written): no upper bound per
     // entry, so it loads with hi widened to the seed ceiling.
     static constexpr uint32_t    kSnapshotVersionV3 = 3;
@@ -904,13 +969,6 @@ public:
                     + ") — re-seed required";
             return false;
         }
-        if (m_cfg.gates.v24_active) {
-            r.error = "fold refused at h=" + std::to_string(height)
-                    + ": DEPLOYMENT_V24/ExtAddr is active but the ExtAddr "
-                      "fold branch is not implemented (fail closed, never "
-                      "drift — design doc §3)";
-            return false;
-        }
         if (static_cast<int32_t>(height) < m_cfg.gates.dip0003_height) {
             r.error = "fold refused at h=" + std::to_string(height)
                     + ": below DIP0003 activation h="
@@ -975,7 +1033,15 @@ public:
         // block, and the caller re-anchors on the best chain.
         if (H >= m_cfg.gates.dip0003_height) {
             for (size_t i = 0; i < block.m_txs.size(); ++i) {
-                if (auto why = contextual_tx_check(block.m_txs[i], i == 0)) {
+                // Dash Core v24: the type list is 0..12 once DEPLOYMENT_V24
+                // is active for this block (types 10-12 fold below).
+                std::optional<std::string> why_s;
+                if (auto why = v24::contextual_tx_check_at(block.m_txs[i], i == 0,
+                                                           m_cfg.gates.v24_active(H)))
+                    why_s = std::string(*why);
+                else if (m_cfg.gates.v24_active(H))
+                    why_s = v24::shared_collateral_create_refusal(block.m_txs[i]);
+                if (const auto& why = why_s) {
                     r.refused_unchanged = true;
                     r.error = "fold refused at h=" + std::to_string(height)
                             + " tx[" + std::to_string(i) + "]: "
@@ -1013,6 +1079,10 @@ public:
         // with a genuinely broken payload still reports ITS OWN blocking
         // condition rather than this one.
         std::vector<unsigned char> payee_script_pre;
+        // Dash Core v24: a v3 or shared payee is paid a payout SET (list
+        // entries or share splits, plus the operator); keep its pre-block
+        // state for the exact multiset check below.
+        std::optional<ReplayMNState> payee_state_pre;
         if (r.payee) {
             const ReplayMNState* pst = find(*r.payee);
             if (pst == nullptr) {
@@ -1028,6 +1098,8 @@ public:
             // operator's for a full (bps == 10000) operator split, else the
             // owner's (dashd masternode/payments.cpp:65-79).
             payee_script_pre = pst->first_payout_script();
+            if (pst->nVersion >= vendor::ProTxVersion::EXT_ADDR || !pst->v24.shares.empty())
+                payee_state_pre = *pst;
         }
 
         // task #154 delta driver: this block's SML mutations start empty.
@@ -1093,6 +1165,31 @@ public:
             case 6: // TRANSACTION_QUORUM_COMMITMENT
                 err = fold_qfcommit(tx, H, r);
                 break;
+            // Dash Core v24 (reachable only when DEPLOYMENT_V24 is active:
+            // the contextual pre-scan refuses types 10-12 before it).
+            case vendor::CProDisTx::SPECIALTX_TYPE: {
+                // No list action (ApplyTxToList): the masternode leaves the
+                // list when its collateral is spent, in pass 4.
+                vendor::CProDisTx dp;
+                if (!vendor::parse_protx_payload(tx.extra_payload, dp)) {
+                    err = "unparseable ProDisTx payload";
+                } else if (const ReplayMNState* t = find(dp.proTxHash); t == nullptr) {
+                    // CheckProDisTxForList: the masternode must exist ...
+                    err = "ProDisTx names masternode " + dp.proTxHash.GetHex().substr(0, 16)
+                        + " this list does not hold (bad-prodis-hash)";
+                } else if (t->v24.shares.empty()) {
+                    // ... and be a shared masternode.
+                    err = "ProDisTx names masternode " + dp.proTxHash.GetHex().substr(0, 16)
+                        + " which is not shared (bad-prodis-not-shared)";
+                }
+                break;
+            }
+            case vendor::CProUpShareTx::SPECIALTX_TYPE:
+                err = fold_proupshare(tx, H, r);
+                break;
+            case vendor::CProUpSharedRegTx::SPECIALTX_TYPE:
+                err = fold_proupsharedreg(tx, H, r);
+                break;
             default:
                 // Types 5 (cbTx, coinbase-only), 8/9 (asset lock/unlock —
                 // credit-pool lane, not DML), MNHF: no DML effect.
@@ -1118,10 +1215,26 @@ public:
         // Pure vin-vs-known-outpoint scan over every non-coinbase tx —
         // AFTER pass 3, so a same-block registration can be spent by a
         // later tx of the same block (dashd order).
+        const bool v24_block = m_cfg.gates.v24_active(H);
         for (size_t i = 1; i < block.m_txs.size(); ++i) {
             for (const auto& in : block.m_txs[i].vin) {
                 auto ci = m_collateral_index.find(in.prevout);
                 if (ci == m_collateral_index.end()) continue;
+                // Dash Core v24 FinishListForBlock: a shared masternode's
+                // collateral may only be spent by a ProDisTx.
+                if (v24_block) {
+                    auto mi = m_entries.find(ci->second);
+                    if (mi != m_entries.end() && mi->second.v24.IsShared()
+                        && !(tx_is_special_version(block.m_txs[i].version)
+                             && block.m_txs[i].type == tx_type::PROVIDER_DISSOLVE)) {
+                        r.error = "fold FAILED at h=" + std::to_string(height) + " tx["
+                                + std::to_string(i) + "]: shared collateral of MN "
+                                + ci->second.GetHex().substr(0, 16)
+                                + " spent by a non-ProDisTx (bad-shared-collateral-spend)";
+                        poison(r.error);
+                        return r;
+                    }
+                }
                 remove_mn(ci->second);
                 ++r.collateral_spent;
             }
@@ -1224,7 +1337,28 @@ public:
             && !m_cfg.gates.dip0003_enforced(H)) {
             r.payee_check_preenforcement_skipped = true;
         }
-        if (r.payee && !payee_script_pre.empty()
+        if (r.payee && payee_state_pre && m_cfg.gates.dip0003_enforced(H)) {
+            // Dash Core v24 (strict multiplicity, payments.cpp
+            // FindUnmatchedMasternodePayment): every expected output of this
+            // payee consumes a DISTINCT coinbase output, and the amounts are
+            // exactly GetBlockTxOuts's split of their sum.
+            const auto R = block.m_txs.empty()
+                ? std::nullopt
+                : v24::match_mn_payment(*payee_state_pre, block.m_txs[0].vout);
+            if (!R) {
+                r.error = "DML FOLD PAYEE MISMATCH at h=" + std::to_string(height)
+                        + ": this block's coinbase does not carry the v24 payout set"
+                          " (payout list / share split / operator, distinct outputs,"
+                          " exact amounts) of the projected masternode "
+                        + r.payee->GetHex()
+                        + " -- HARD STOP, engine poisoned, re-seed required";
+                poison(r.error);
+                LOG_ERROR << "[DML-FOLD] " << r.error;
+                return r;
+            }
+            r.payee_paid_verified = true;
+            r.payee_amounts_verified = true;
+        } else if (r.payee && !payee_script_pre.empty()
             && m_cfg.gates.dip0003_enforced(H)) {
             bool paid = false;
             if (!block.m_txs.empty()) {
@@ -1259,7 +1393,7 @@ public:
     }
 
     // ─────────────────────────────────────────────────────────────────────
-    // Snapshot v4 (v3 still loads) — save / load / resume
+    // Snapshot v5 (v4 and v3 still load) — save / load / resume
     // ─────────────────────────────────────────────────────────────────────
     std::vector<uint8_t> save_snapshot() const
     {
@@ -1313,6 +1447,8 @@ public:
         uint32_t magic_version = 0;
         if (std::memcmp(bytes.data(), kSnapshotMagic, kSnapshotMagicLen) == 0)
             magic_version = kSnapshotVersion;
+        else if (std::memcmp(bytes.data(), kSnapshotMagicV4, kSnapshotMagicLen) == 0)
+            magic_version = kSnapshotVersionV4;
         else if (std::memcmp(bytes.data(), kSnapshotMagicV3,
                              kSnapshotMagicLen) == 0)
             magic_version = kSnapshotVersionV3;
@@ -1342,7 +1478,8 @@ public:
             if (version != magic_version) {
                 error = "snapshot format v" + std::to_string(version)
                       + " != supported v" + std::to_string(kSnapshotVersion)
-                      + " (or v" + std::to_string(kSnapshotVersionV3)
+                      + " (or v" + std::to_string(kSnapshotVersionV4) + "/v"
+                      + std::to_string(kSnapshotVersionV3)
                       + " under its own magic) — refusing to load"
                         " (versioned fail-loud, no silent migration)";
                 return false;
@@ -1358,7 +1495,20 @@ public:
             for (uint64_t i = 0; i < count; ++i) {
                 uint256 protx;
                 ReplayMNState st;
-                s >> protx >> st;
+                s >> protx;
+                if (version >= kSnapshotVersion) {
+                    s >> st;
+                } else {
+                    st.unserialize_pre_v24(s);
+                    if (v24::state_has_ext(st.nVersion)) {
+                        error = "snapshot v" + std::to_string(version) + " entry "
+                              + protx.GetHex().substr(0, 16) + " claims nVersion="
+                              + std::to_string(st.nVersion)
+                              + " but the format predates Dash Core v24 state (no payout"
+                                " list / ExtNetInfo) — refusing to load";
+                        return false;
+                    }
+                }
                 if (version >= 4) {
                     s >> st.nPoSePenaltyHi;
                     if (st.nPoSePenaltyHi < st.nPoSePenalty) {
@@ -1524,6 +1674,33 @@ private:
             if (protx == self) continue;
             if (st.keyIDOwner == id) return &protx;
             if (st.nType == vendor::MnType::EVO && st.platformNodeID == id) return &protx;
+            // Dash Core v24: share owner keys take keyIDOwner's place in the
+            // same uniqueness namespace (AddMN), so owner-key reuse between
+            // shared and non-shared masternodes is impossible both ways.
+            for (const auto& sh : st.v24.shares)
+                if (sh.keyIDOwner == id) return &protx;
+        }
+        return nullptr;
+    }
+
+    /// dashd CDeterministicMNList::HasOperatorKeyUnderAnyScheme (Dash Core
+    /// v24): the MN other than `self` whose operator-key property equals the
+    /// key's legacy OR basic encoding. A holder's property is its key bytes
+    /// under its own scheme (legacy iff nVersion < BasicBLS); the store keeps
+    /// canonical basic, so legacy holders are re-encoded for the compare.
+    const uint256* opkey_any_scheme_holder(const std::array<uint8_t, vendor::BLS_PUBKEY_SIZE>& basic,
+                                           const uint256& self) const
+    {
+        bool null_key = true;
+        for (uint8_t b : basic) if (b != 0) { null_key = false; break; }
+        if (null_key) return nullptr;
+        const auto cand_legacy = vendor::opkey_for_leaf(basic, /*want_legacy=*/true);
+        for (const auto& [protx, st] : m_entries) {
+            if (protx == self || st.operator_pubkey_null()) continue;
+            const bool holder_legacy = st.nVersion < vendor::ProTxVersion::BASIC_BLS;
+            const auto held = holder_legacy ? vendor::opkey_for_leaf(st.pubKeyOperator, true)
+                                            : st.pubKeyOperator;
+            if (held == basic || held == cand_legacy) return &protx;
         }
         return nullptr;
     }
@@ -1586,6 +1763,19 @@ private:
     // ── Special-tx folds. Return "" on success, an error sentence on the ─
     // ── fail-closed paths (unparseable payload, ExtAddr, missing MN).    ─
 
+    /// A held state at version 3 (ExtAddr, e.g. seeded from a v24 SML
+    /// anchor) cannot take a v1/v2 update the way Core does after v24
+    /// (target version max(state, tx) with SetStateVersion netInfo
+    /// conversion); that transition is not implemented, so fail closed.
+    static std::optional<std::string> ext_addr_state_refusal(const char* what, const uint256& pro,
+                                                             const ReplayMNState& st)
+    {
+        if (st.nVersion < vendor::ProTxVersion::EXT_ADDR) return std::nullopt;
+        return std::string(what) + " for MN " + pro.GetHex().substr(0, 16)
+             + " whose state is nVersion=" + std::to_string(st.nVersion)
+             + " (ExtAddr) — v24 transition not implemented, failing closed";
+    }
+
     std::string fold_proreg(const MutableTransaction& tx, int32_t H,
                             FoldResult& r)
     {
@@ -1593,9 +1783,10 @@ private:
         if (!vendor::parse_protx_payload(tx.extra_payload, p))
             return "unparseable ProRegTx payload (replay folds byte-exact "
                    "or not at all)";
+        if (m_cfg.gates.v24_active(H)) return fold_proreg_v24(tx, p, H, r);
         if (p.nVersion >= vendor::ProTxVersion::EXT_ADDR)
             return "ProRegTx nVersion=" + std::to_string(p.nVersion)
-                 + " (ExtAddr) — branch not implemented, failing closed";
+                 + " (ExtAddr) before DEPLOYMENT_V24 (bad-protx-version)";
 
         const uint256 proTxHash = compute_tx_hash(tx);
 
@@ -1682,9 +1873,10 @@ private:
         vendor::CProUpServTx p;
         if (!vendor::parse_protx_payload(tx.extra_payload, p))
             return "unparseable ProUpServTx payload";
-        if (p.nVersion >= vendor::ProTxVersion::EXT_ADDR)
+        const bool v24_on = m_cfg.gates.v24_active(H);
+        if (!v24_on && p.nVersion >= vendor::ProTxVersion::EXT_ADDR)
             return "ProUpServTx nVersion=" + std::to_string(p.nVersion)
-                 + " (ExtAddr) — branch not implemented, failing closed";
+                 + " (ExtAddr) before DEPLOYMENT_V24 (bad-protx-version)";
         // RebuildListFromBlock (#7488 moved it ahead of the lookup):
         // IsValidMnType(nType) else bad-protx-type.
         if (p.nType != vendor::MnType::REGULAR && p.nType != vendor::MnType::EVO)
@@ -1698,6 +1890,8 @@ private:
                  + " this list does not hold — state divergence "
                    "(an accepted block cannot reference a missing MN)";
         auto& st = it->second;
+        if (!v24_on)
+            if (auto why = ext_addr_state_refusal("ProUpServTx", p.proTxHash, st)) return *why;
         if (p.nType != st.nType)
             return "ProUpServTx nType mismatch for "
                  + p.proTxHash.GetHex().substr(0, 16);
@@ -1710,14 +1904,27 @@ private:
                      + " (bad-protx-dup-platformnodeid)";
         }
 
-        // v24-only: nVersion update from the payload — DEAD on mainnet
-        // (fold refuses when v24_active; branch kept for the record).
-        st.netInfo              = p.netInfo.canonical();
+        if (v24_on) {
+            // Dash Core v24 ApplyProUpServTx + SetStateVersion: target version
+            // max(state, tx), payout migration and netInfo conversion on a
+            // raise to 3. A legacy -> basic raise re-keys the operator key;
+            // another MN holding it under either scheme invalidates the block.
+            const uint16_t current = st.nVersion;
+            const uint16_t target = std::max<uint16_t>(current, p.nVersion);
+            if (current == vendor::ProTxVersion::LEGACY_BLS && target > current)
+                if (const uint256* h = opkey_any_scheme_holder(st.pubKeyOperator, p.proTxHash))
+                    return "ProUpServTx scheme migration: operator key held by MN "
+                         + h->GetHex().substr(0, 16) + " under either scheme (bad-protx-dup-key)";
+            const auto t = v24::apply_proupserv(st, p, st.nType, m_cfg.gates.netinfo_rules);
+            if (t.error) return "ProUpServTx v24 transition: " + *t.error;
+        } else {
+        st.netInfo              = p.netInfo.canonical();   // Core holds an empty MnNetInfo
         st.scriptOperatorPayout = p.scriptOperatorPayout;
         if (p.nType == vendor::MnType::EVO) {
             st.platformNodeID   = p.platformNodeID;
             st.platformP2PPort  = p.platformP2PPort;
             st.platformHTTPPort = p.platformHTTPPort;
+        }
         }
         // PoSe certainty (ban + revive in ONE block). If this MN was punished
         // earlier in THIS block into the ambiguous band (lo < max <= hi), dashd
@@ -1746,8 +1953,9 @@ private:
         // The h=2516756 transition (specialtxman.cpp:368-377): revive only
         // when banned AND all keys set.
         if (st.IsBanned()) {
-            if (!st.operator_pubkey_null() && !st.keyIDVoting.IsNull()
-                && !st.keyIDOwner.IsNull()) {
+            if (v24_on ? v24::revive_allowed(st)
+                    : (!st.operator_pubkey_null() && !st.keyIDVoting.IsNull()
+                       && !st.keyIDOwner.IsNull())) {
                 st.Revive(H);
                 ++r.revived;
                 if (m_cfg.debug_logs) {
@@ -1769,6 +1977,10 @@ private:
         vendor::CProUpRegTx p;
         if (!vendor::parse_protx_payload(tx.extra_payload, p))
             return "unparseable ProUpRegTx payload";
+        if (m_cfg.gates.v24_active(H)) return fold_proupreg_v24(p, H, r);
+        if (p.nVersion >= vendor::ProTxVersion::EXT_ADDR)
+            return "ProUpRegTx nVersion=" + std::to_string(p.nVersion)
+                 + " (ExtAddr) before DEPLOYMENT_V24 (bad-protx-version)";
 
         auto it = m_entries.find(p.proTxHash);
         if (it == m_entries.end())
@@ -1776,6 +1988,7 @@ private:
                  + p.proTxHash.GetHex().substr(0, 16)
                  + " this list does not hold — state divergence";
         auto& st = it->second;
+        if (auto why = ext_addr_state_refusal("ProUpRegTx", p.proTxHash, st)) return *why;
         // UpdateMN -> UpdateUniqueProperty(pubKeyOperator): a key another MN
         // holds makes the update throw (bad-protx-dup-key).
         if (const uint256* h = opkey_holder(p.pubKeyOperator, p.proTxHash))
@@ -1827,6 +2040,12 @@ private:
         vendor::CProUpRevTx p;
         if (!vendor::parse_protx_payload(tx.extra_payload, p))
             return "unparseable ProUpRevTx payload";
+        if (m_cfg.gates.v24_active(H)) return fold_prouprev_v24(p, H, r);
+        // v3 has the v2 layout, but after DEPLOYMENT_V24 a revocation keeps
+        // the state version (SetStateVersion) instead of dropping it to 1.
+        if (p.nVersion >= vendor::ProTxVersion::EXT_ADDR)
+            return "ProUpRevTx nVersion=" + std::to_string(p.nVersion)
+                 + " (ExtAddr) before DEPLOYMENT_V24 (bad-protx-version)";
 
         auto it = m_entries.find(p.proTxHash);
         if (it == m_entries.end())
@@ -1834,6 +2053,7 @@ private:
                  + p.proTxHash.GetHex().substr(0, 16)
                  + " this list does not hold — state divergence";
         auto& st = it->second;
+        if (auto why = ext_addr_state_refusal("ProUpRevTx", p.proTxHash, st)) return *why;
         const bool was_banned = st.IsBanned();
         st.ResetOperatorFields();
         st.BanIfNotBanned(H);
@@ -1842,6 +2062,174 @@ private:
         // Ban flips isValid + reset clears pubKeyOperator/netInfo — SML fields.
         sml_touch(p.proTxHash);
         ++r.revoked;
+        return {};
+    }
+
+    // ── Dash Core v24 transitions (DEPLOYMENT_V24 active for the block) ──
+    // specialtxman.cpp ApplyTxToList :346-697 with SetStateVersion; the
+    // shared state code is v24_state.hpp. Validity rules the fold can decide
+    // from the list (version downgrade, legacy registration, duplicate keys
+    // under either scheme) fail closed like the pre-v24 duplicate checks.
+
+    std::string fold_proreg_v24(const MutableTransaction& tx, const vendor::CProRegTx& p,
+                                int32_t H, FoldResult& r)
+    {
+        // No new legacy-scheme registrations (CheckProRegTx, v24).
+        if (p.nVersion < vendor::ProTxVersion::BASIC_BLS)
+            return "ProRegTx nVersion=" + std::to_string(p.nVersion)
+                 + " after DEPLOYMENT_V24 (bad-protx-version-disallowed)";
+        const uint256 proTxHash = compute_tx_hash(tx);
+        ReplayMNState st;
+        st.nType      = p.nType;
+        st.internalId = m_total_registered_count;
+        if (p.collateralOutpoint.hash.IsNull()) {
+            st.collateralOutpoint.hash  = proTxHash;
+            st.collateralOutpoint.index = p.collateralOutpoint.index;
+        } else {
+            st.collateralOutpoint = p.collateralOutpoint;
+        }
+        auto rep = m_collateral_index.find(st.collateralOutpoint);
+        if (rep != m_collateral_index.end()) {
+            remove_mn(rep->second);
+            ++r.collateral_replaced;
+        }
+        const auto op_basic = vendor::opkey_to_basic(
+            p.pubKeyOperator, p.nVersion < vendor::ProTxVersion::BASIC_BLS);
+        if (p.IsShared()) {
+            for (const auto& sh : p.shares)
+                if (const uint256* h = id_holder(sh.keyIDOwner, proTxHash))
+                    return "ProRegTx share owner key is already held by MN "
+                         + h->GetHex().substr(0, 16) + " (bad-protx-dup-key)";
+            if (const uint256* h = opkey_holder(p.pubKeyOperator, proTxHash))
+                return "ProRegTx pubKeyOperator is already held by MN "
+                     + h->GetHex().substr(0, 16) + " (bad-protx-dup-key)";
+        } else {
+            if (const uint256* h = id_holder(p.keyIDOwner, proTxHash))
+                return "ProRegTx keyIDOwner is already an owner key or platformNodeID of MN "
+                     + h->GetHex().substr(0, 16) + " (bad-protx-dup-key)";
+            if (const uint256* h = opkey_holder(p.pubKeyOperator, proTxHash))
+                return "ProRegTx pubKeyOperator is already held by MN "
+                     + h->GetHex().substr(0, 16) + " (bad-protx-dup-key)";
+        }
+        if (const uint256* h = opkey_any_scheme_holder(op_basic, uint256{}))
+            return "ProRegTx pubKeyOperator is held by MN " + h->GetHex().substr(0, 16)
+                 + " under the other scheme (bad-protx-dup-key)";
+        if (p.nType == vendor::MnType::EVO) {
+            if (const uint256* h = id_holder(p.platformNodeID, proTxHash))
+                return "ProRegTx platformNodeID is already an owner key or platformNodeID"
+                       " of MN " + h->GetHex().substr(0, 16)
+                     + " (bad-protx-dup-platformnodeid)";
+        }
+        v24::state_from_proreg(st, p, op_basic);
+        st.nOperatorReward   = p.nOperatorReward;
+        st.nRegisteredHeight = H;
+        if (v24::netinfo_empty(st)) {
+            st.BanIfNotBanned(H);
+            ++r.banned;
+        }
+        m_collateral_index[st.collateralOutpoint] = proTxHash;
+        m_entries[proTxHash] = std::move(st);
+        m_sml_structural = true;
+        ++m_total_registered_count;
+        ++r.registered;
+        return {};
+    }
+
+    /// IsVersionChangeValid (v24): no legacy-scheme tx once the state is basic.
+    static std::optional<std::string> version_downgrade_refusal(const char* what, const ReplayMNState& st,
+                                                                uint16_t tx_version)
+    {
+        if (st.nVersion >= vendor::ProTxVersion::BASIC_BLS && tx_version == vendor::ProTxVersion::LEGACY_BLS)
+            return std::string(what) + " nVersion=1 for a basic-scheme state (bad-protx-version-downgrade)";
+        return std::nullopt;
+    }
+
+    std::string fold_proupreg_v24(const vendor::CProUpRegTx& p, int32_t H, FoldResult& r)
+    {
+        auto it = m_entries.find(p.proTxHash);
+        if (it == m_entries.end())
+            return "ProUpRegTx names proTxHash " + p.proTxHash.GetHex().substr(0, 16)
+                 + " this list does not hold — state divergence";
+        auto& st = it->second;
+        if (auto why = version_downgrade_refusal("ProUpRegTx", st, p.nVersion)) return *why;
+        const auto incoming = vendor::opkey_to_basic(p.pubKeyOperator,
+                                                     p.nVersion < vendor::ProTxVersion::BASIC_BLS);
+        // Core compares points. Equal canonical-basic bytes are the same point
+        // (the encoding is injective); otherwise ask the backend.
+        const bool changed = st.pubKeyOperator != incoming
+            && !vendor::opkey_point_eq(st.pubKeyOperator, /*a_legacy=*/false, p.pubKeyOperator,
+                                       /*b_legacy=*/p.nVersion < vendor::ProTxVersion::BASIC_BLS);
+        const uint16_t target = std::max<uint16_t>(st.nVersion, p.nVersion);
+        const bool migrating = st.nVersion == vendor::ProTxVersion::LEGACY_BLS && target > st.nVersion;
+        if ((changed || migrating) && opkey_any_scheme_holder(incoming, p.proTxHash))
+            return "ProUpRegTx pubKeyOperator is held by another MN under either scheme (bad-protx-dup-key)";
+        const bool was_banned = st.IsBanned();
+        const auto t = v24::apply_proupreg(st, p, st.nType, changed, incoming, m_cfg.gates.netinfo_rules);
+        if (t.error) return "ProUpRegTx v24 transition: " + *t.error;
+        if (t.ban) {
+            st.BanIfNotBanned(H);
+            if (!was_banned) ++r.banned;
+        }
+        sml_touch(p.proTxHash);
+        ++r.updated;
+        return {};
+    }
+
+    std::string fold_prouprev_v24(const vendor::CProUpRevTx& p, int32_t H, FoldResult& r)
+    {
+        auto it = m_entries.find(p.proTxHash);
+        if (it == m_entries.end())
+            return "ProUpRevTx names proTxHash " + p.proTxHash.GetHex().substr(0, 16)
+                 + " this list does not hold — state divergence";
+        auto& st = it->second;
+        if (auto why = version_downgrade_refusal("ProUpRevTx", st, p.nVersion)) return *why;
+        const bool was_banned = st.IsBanned();
+        const auto t = v24::apply_prouprev(st, p, st.nType, m_cfg.gates.netinfo_rules);
+        if (t.error) return "ProUpRevTx v24 transition: " + *t.error;
+        st.BanIfNotBanned(H);
+        if (!was_banned) ++r.banned;
+        sml_touch(p.proTxHash);
+        ++r.revoked;
+        return {};
+    }
+
+    std::string fold_proupshare(const MutableTransaction& tx, int32_t /*H*/, FoldResult& r)
+    {
+        vendor::CProUpShareTx p;
+        if (!vendor::parse_protx_payload(tx.extra_payload, p)) return "unparseable ProUpShareTx payload";
+        auto it = m_entries.find(p.proTxHash);
+        if (it == m_entries.end())
+            return "ProUpShareTx names proTxHash " + p.proTxHash.GetHex().substr(0, 16)
+                 + " this list does not hold (bad-protx-hash)";
+        const auto t = v24::apply_proupshare(it->second, p);
+        if (t.error) return "ProUpShareTx: " + *t.error;
+        ++r.updated;   // share reward scripts are not SML fields
+        return {};
+    }
+
+    std::string fold_proupsharedreg(const MutableTransaction& tx, int32_t H, FoldResult& r)
+    {
+        vendor::CProUpSharedRegTx p;
+        if (!vendor::parse_protx_payload(tx.extra_payload, p)) return "unparseable ProUpSharedRegTx payload";
+        auto it = m_entries.find(p.proTxHash);
+        if (it == m_entries.end())
+            return "ProUpSharedRegTx names proTxHash " + p.proTxHash.GetHex().substr(0, 16)
+                 + " this list does not hold (bad-protx-hash)";
+        auto& st = it->second;
+        const auto incoming = vendor::opkey_to_basic(p.pubKeyOperator, /*wire_legacy=*/false);
+        const bool changed = st.pubKeyOperator != incoming
+            && !vendor::opkey_point_eq(st.pubKeyOperator, false, p.pubKeyOperator, false);
+        if (changed && opkey_any_scheme_holder(incoming, p.proTxHash))
+            return "ProUpSharedRegTx pubKeyOperator is held by another MN under either scheme (bad-protx-dup-key)";
+        const bool was_banned = st.IsBanned();
+        const auto t = v24::apply_proupsharedreg(st, p, st.nType, changed, incoming, m_cfg.gates.netinfo_rules);
+        if (t.error) return "ProUpSharedRegTx: " + *t.error;
+        if (t.ban) {
+            st.BanIfNotBanned(H);
+            if (!was_banned) ++r.banned;
+        }
+        sml_touch(p.proTxHash);
+        ++r.updated;
         return {};
     }
 

@@ -782,14 +782,27 @@ if (BUILD_TESTING AND GTest_FOUND)
     # CSimplifiedMNList wire + CalcHash (SER_GETHASH) + memcmp sort + merkle root.
     # Header-only over core/uint256 + core/pack + core/hash; no ltc/pool SCC
     # dependency. Base leaf of the embedded_gbt dependency chain (S7 main).
-    add_executable(test_dash_simplifiedmns test_dash_simplifiedmns.cpp)
+    #
+    # Second TU: test_dash_v24_protx_codecs.cpp -- Dash Core v24 provider
+    # payload codecs (ProTx v3, ExtNetInfo, types 10-12, SML entry v3): testnet
+    # captures, synthetic Core-layout vectors (dash_v24_s2_vectors.inc), the
+    # reject-reason table and the pre-v24 golden vs a frozen copy of the
+    # master codecs. Header-only over the same vendor leaves; folded into this
+    # allowlisted target (a standalone one would be a NOT_BUILT sentinel, #769).
+    # DASH_FIXTURE_DIR: the golden reads the real testnet mnlistdiff captures.
+    add_executable(test_dash_simplifiedmns test_dash_simplifiedmns.cpp
+        test_dash_v24_protx_codecs.cpp)
+    # dash_bls_verify: Core's BLS key / signature decoding in the v24 payload
+    # rules (vendor/bls_canonical.hpp; a fail-closed stub without dashbls).
     target_link_libraries(test_dash_simplifiedmns PRIVATE
         GTest::gtest_main GTest::gtest
-        dash_x11 core
+        dash_bls_verify dash_x11 core
         nlohmann_json::nlohmann_json
         ${Boost_LIBRARIES}
     )
     target_link_libraries(test_dash_simplifiedmns PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
+    target_compile_definitions(test_dash_simplifiedmns PRIVATE
+        DASH_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
     gtest_add_tests(test_dash_simplifiedmns "" AUTO)
 
     # DASH daemonless-fold SIMD-SHA256 reward-safety KAT (dashd-cut replay
@@ -1083,6 +1096,9 @@ if (BUILD_TESTING AND GTest_FOUND)
                    test_dash_replay_payee_publish.cpp
                    test_dash_replay_mnlist_seed.cpp
                    test_dash_replay_prestate_empty_dip3.cpp
+                   # Dash Core v24 (S3): state transitions, the shared-collateral
+                   # and ProDisTx rules, and the v24 persistence formats.
+                   test_dash_v24_mn_state.cpp
                    # Differential KAT (Dash Core v23.1.9 PR-1 verify, M1/M2): the
                    # template fold must commit the root the root-proven DML fold
                    # computes and refuse what it refuses (real dashbls keys).

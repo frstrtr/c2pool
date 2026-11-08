@@ -91,7 +91,7 @@ inline DashChainParams make_dash_chain_params_mainnet() {
     p.block_hash_func = p.pow_func;
 
     // Fast-start checkpoint: PINNED TO COINCIDE WITH THE MN-SET BRIDGE
-    // ANCHOR (dash_mn_checkpoint_mainnet.inc, height 2549400). Cold start
+    // ANCHOR (dash_mn_checkpoint_mainnet.inc, height 2563800). Cold start
     // seeds the header tip AT the anchor, skipping ~2.5M headers of
     // validation from genesis.
     //
@@ -113,10 +113,10 @@ inline DashChainParams make_dash_chain_params_mainnet() {
     // verify). The coincidence is machine-enforced by that KAT, so the two
     // pins can never silently drift apart again.
     p.fast_start_checkpoint = DashChainParams::Checkpoint{};
-    p.fast_start_checkpoint->height = 2549400;
+    p.fast_start_checkpoint->height = 2563800;
     p.fast_start_checkpoint->hash.SetHex(
-        "00000000000000134ce084ad3dac4b93069fc40f32cb8d24a446754112b5010f");
-    // The FULL header of the anchor block (mainnet 2549400), so the cold seed
+        "0000000000000016a129aa626ea761e08a389af18b4a64a2f8556596edd08e22");
+    // The FULL header of the anchor block (mainnet 2563800), so the cold seed
     // populates entry.header — not just entry.hash. Without it the seeded
     // IndexEntry carries a default (all-zero) hashMerkleRoot, and the DIP-4
     // historical-snapshot authentication in the MN-set bridge fails closed at
@@ -132,12 +132,12 @@ inline DashChainParams make_dash_chain_params_mainnet() {
     p.fast_start_checkpoint->has_header = true;
     p.fast_start_checkpoint->hdr_version = 536870912u;   // 0x20000000
     p.fast_start_checkpoint->hdr_prev_block.SetHex(
-        "000000000000000a5e49a9455f31b8b878ea3a31101a10da83dcdefb3795f9e9");
+        "000000000000001152bacae0c99708a0d092fb289b7aef9d605845ef5fbf8cb7");
     p.fast_start_checkpoint->hdr_merkle_root.SetHex(
-        "935359e1a2d29fca27dc6ac1d6eea422f24301616bda26e087ac67f81b42790c");
-    p.fast_start_checkpoint->hdr_time  = 1791075943u;
-    p.fast_start_checkpoint->hdr_bits  = 0x191f4884u;
-    p.fast_start_checkpoint->hdr_nonce = 3249420384u;
+        "ca996896c66729694de8ec1bf488011b7105e50ada2b965ab982e7023bc76197");
+    p.fast_start_checkpoint->hdr_time  = 1793344433u;
+    p.fast_start_checkpoint->hdr_bits  = 0x191f7d6cu;
+    p.fast_start_checkpoint->hdr_nonce = 1038440354u;
     return p;
 }
 
@@ -248,6 +248,27 @@ inline uint32_t dark_gravity_wave(
         bn_new = pow_limit;
 
     return bn_new.GetCompact();
+}
+
+/// Dash Core pow.cpp DarkGravityWave, the fPowAllowMinDifficultyBlocks rules
+/// (testnet): the next block's bits depend on ITS OWN time. More than two hours
+/// after its parent it may be mined at powLimit; more than 4 x nPowTargetSpacing
+/// (10 minutes) after, at ten times the parent's target (capped at powLimit);
+/// otherwise the DGW bits. Mainnet has no such rule (allow_min_difficulty is
+/// false), so this returns dgw_bits there.
+inline uint32_t dgw_bits_for_block_time(uint32_t dgw_bits, uint32_t prev_bits, int64_t prev_time,
+                                        int64_t block_time, const DashChainParams& params)
+{
+    if (!params.allow_min_difficulty) return dgw_bits;
+    const uint256 pow_limit = params.pow_limit;
+    if (block_time > prev_time + 2 * 60 * 60) return pow_limit.GetCompact();
+    if (block_time > prev_time + params.target_spacing * 4) {
+        uint256 bn = target_from_bits(prev_bits);
+        bn *= 10u;
+        if (bn > pow_limit) return pow_limit.GetCompact();
+        return bn.GetCompact();
+    }
+    return dgw_bits;
 }
 
 // ─── HeaderChain ────────────────────────────────────────────────────────────
@@ -398,6 +419,23 @@ public:
             return this->get_header_by_height_internal(h);
         };
         return dark_gravity_wave(get_ancestor, m_tip_height, m_params);
+    }
+
+    /// The bits the next block must carry when its time is `block_time`, on
+    /// top of the tip `prev_hash` (Dash Core GetNextWorkRequired(pindexLast,
+    /// pblock)). Only testnet's min-difficulty rules make the time matter.
+    /// 0 when the tip is not `prev_hash` or there are too few headers.
+    uint32_t next_work_required_at(const uint256& prev_hash, int64_t block_time) const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_tip.IsNull() || m_tip != prev_hash || m_tip_height < DGW_PAST_BLOCKS) return 0;
+        auto get_ancestor = [this](uint32_t h) -> std::optional<IndexEntry> {
+            return this->get_header_by_height_internal(h);
+        };
+        const uint32_t dgw = dark_gravity_wave(get_ancestor, m_tip_height, m_params);
+        const auto tip = get_header_by_height_internal(m_tip_height);
+        if (!tip) return 0;
+        return dgw_bits_for_block_time(dgw, tip->header.m_bits, tip->header.m_timestamp,
+                                       block_time, m_params);
     }
 
     size_t size() const {
