@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <set>
 #include <sstream>
 #include <fstream>
 #include <iomanip>
@@ -92,8 +93,12 @@ AuxPowTree AuxPowTree::build(const std::vector<uint32_t>& chain_ids)
         return tree;
     }
 
+    // One slot per distinct chain id: a repeated id would collide with itself
+    // at every size and the doubling below would never end.
+    const std::set<uint32_t> distinct_ids(chain_ids.begin(), chain_ids.end());
+
     // Tree size = smallest power of 2 >= chain count
-    uint32_t n = static_cast<uint32_t>(chain_ids.size());
+    uint32_t n = static_cast<uint32_t>(distinct_ids.size());
     tree.size = 1;
     while (tree.size < n) tree.size <<= 1;
 
@@ -114,7 +119,7 @@ AuxPowTree AuxPowTree::build(const std::vector<uint32_t>& chain_ids)
         tree.slot_map.clear();
         bool collision = false;
         std::vector<bool> used(tree.size, false);
-        for (uint32_t cid : chain_ids) {
+        for (uint32_t cid : distinct_ids) {
             const uint32_t slot =
                 nmc::coin::aux_expected_index(0, static_cast<int32_t>(cid), height);
             if (used[slot]) {
@@ -125,6 +130,14 @@ AuxPowTree AuxPowTree::build(const std::vector<uint32_t>& chain_ids)
             tree.slot_map[cid] = slot;
         }
         if (!collision) break;
+        // CAuxPow::check refuses a branch longer than 30: no tree to offer.
+        if (height >= 30) {
+            LOG_ERROR << "[MM] chain ids cannot be placed in a chain merkle tree of "
+                         "height 30: no merged-mining commitment";
+            tree.size = 0;
+            tree.slot_map.clear();
+            return tree;
+        }
         tree.size <<= 1;
     }
 
@@ -587,6 +600,15 @@ void MergedMiningManager::add_chain(const AuxChainConfig& config, std::unique_pt
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
 
+    // Two chains cannot share a chain id: a daemon finds its chain's slot
+    // from the id alone (CAuxPow::getExpectedIndex). The first one stays.
+    for (const auto& c : m_chains)
+        if (c.config.chain_id == config.chain_id) {
+            LOG_ERROR << "[MM] Refusing aux chain " << config.symbol << ": chain_id "
+                      << config.chain_id << " is already registered as " << c.config.symbol;
+            return;
+        }
+
     ChainState state;
     state.config = config;
     state.rpc = std::move(backend);
@@ -598,9 +620,11 @@ void MergedMiningManager::add_chain(const AuxChainConfig& config, std::unique_pt
         ids.push_back(c.config.chain_id);
     m_tree = AuxPowTree::build(ids);
 
+    const auto slot_it = m_tree.slot_map.find(config.chain_id);
     LOG_INFO << "[MM] Registered aux chain: " << config.symbol
              << " (chain_id=" << config.chain_id << ", slot="
-             << m_tree.slot_map[config.chain_id] << "/" << m_tree.size << ")";
+             << (slot_it != m_tree.slot_map.end() ? std::to_string(slot_it->second) : "none")
+             << "/" << m_tree.size << ")";
 }
 
 void MergedMiningManager::set_fallback_backend(uint32_t chain_id, std::unique_ptr<IAuxChainBackend> fallback)
@@ -995,21 +1019,6 @@ void MergedMiningManager::try_submit_merged_blocks(
 
         uint32_t slot = it->second;
 
-        // Build all slot hashes using FROZEN block hashes (from commit time).
-        // The LTC coinbase commitment was built from frozen hashes — the AuxPoW
-        // proof must reference the same hashes or dogecoind rejects with
-        // "Aux POW missing chain merkle root in parent coinbase".
-        std::map<uint32_t, uint256> slot_hashes;
-        for (const auto& c : m_chains) {
-            auto hash = !c.frozen_block_hash.IsNull() ? c.frozen_block_hash
-                                                       : c.current_work.block_hash;
-            if (!hash.IsNull()) {
-                auto sit = m_tree.slot_map.find(c.config.chain_id);
-                if (sit != m_tree.slot_map.end())
-                    slot_hashes[sit->second] = hash;
-            }
-        }
-
         // Check if parent hash meets aux target
         // Parent hash (scrypt for LTC) must be ≤ aux target
         static int mm_check_count = 0;
@@ -1047,19 +1056,6 @@ void MergedMiningManager::try_submit_merged_blocks(
                  << "  Parent PoW:  " << parent_hash.GetHex() << "\n"
                  << "######################################################################";
 
-        // Build aux merkle proof for this chain's slot
-        auto proof = m_tree.compute_root(slot_hashes, slot);
-
-        // Build auxpow proof
-        std::string auxpow = build_auxpow_proof(
-            parent_coinbase_hex,
-            parent_hash,
-            parent_merkle_branch,
-            parent_merkle_index,
-            proof.branch,
-            proof.index,
-            parent_header_hex);
-
         // ── Extract committed root from parent coinbase ──
         // The LTC coinbase was built at stratum job time and may contain an OLDER
         // DOGE block hash than the current chain.frozen_* fields (which get
@@ -1091,10 +1087,49 @@ void MergedMiningManager::try_submit_merged_blocks(
                 dst[i] = parent_cb_bytes[magic_offset + 4 + 31 - i];
         }
 
-        // For tree_size=1, committed_root IS the DOGE block hash.
-        // For larger trees, walk the chain merkle branch to get the leaf hash.
-        // (Currently only DOGE → tree_size=1, so committed_root = doge_block_hash.)
+        // What this chain's block hash in the commitment is, and the leaves of
+        // the chain merkle tree the root was built from (the proof's branch must
+        // be taken from THESE, not from the chains' current hashes: the job's
+        // coinbase may be older than the current commitment).
+        // For tree_size=1 the committed root IS the chain's block hash. With
+        // several chains the root commits to all of them: the leaves were
+        // recorded when the root was built, keyed by the root
+        // (remember_committed_root_locked); a root not recorded cannot be
+        // submitted, nor can a chain missing from it.
         uint256 committed_block_hash = committed_root;
+        std::map<uint32_t, uint256> committed_leaves{{slot, committed_root}};
+        if (m_tree.size > 1) {
+            const auto refuse = [&](const char* code, const std::string& why) {
+                ++m_block_refusals_by_code[chain.config.symbol + ":" + code];
+                LOG_WARNING << "[MM:" << chain.config.symbol << "] Merged block refused: " << why
+                            << " — committed root " << committed_root.GetHex().substr(0, 16)
+                            << ", not submitted";
+            };
+            if (magic_offset + 4 + 32 + 8 > parent_cb_bytes.size()) {
+                refuse("no_commitment", "no tree size and nonce after the merged-mining root");
+                continue;
+            }
+            uint32_t committed_tree_size = 0, committed_nonce = 0;
+            std::memcpy(&committed_tree_size, &parent_cb_bytes[magic_offset + 4 + 32], 4);
+            std::memcpy(&committed_nonce, &parent_cb_bytes[magic_offset + 4 + 32 + 4], 4);
+            const auto committed = m_committed_roots.find(committed_root);
+            if (committed == m_committed_roots.end()
+                || committed_tree_size != committed->second.tree_size
+                || committed_nonce != 0) {
+                refuse("no_commitment",
+                       "the parent coinbase does not carry a commitment this node built (tree size "
+                           + std::to_string(committed_tree_size) + ", nonce "
+                           + std::to_string(committed_nonce) + ", tree " + std::to_string(m_tree.size) + ")");
+                continue;
+            }
+            const auto leaf = committed->second.slot_hashes.find(slot);
+            if (leaf == committed->second.slot_hashes.end() || leaf->second.IsNull()) {
+                refuse("not_committed", "this chain has no block in that commitment");
+                continue;
+            }
+            committed_block_hash = leaf->second;
+            committed_leaves = committed->second.slot_hashes;
+        }
 
         LOG_INFO << "[MM:" << chain.config.symbol
                  << "] committed_root=" << committed_root.GetHex().substr(0, 16)
@@ -1129,6 +1164,7 @@ void MergedMiningManager::try_submit_merged_blocks(
         }
 
         if (!use_tmpl || !use_coinbase || use_coinbase->empty() || use_tmpl->is_null()) {
+            ++m_block_refusals_by_code[chain.config.symbol + ":no_snapshot"];
             LOG_WARNING << "[MM:" << chain.config.symbol
                         << "] No matching snapshot for committed hash "
                         << committed_block_hash.GetHex().substr(0, 16)
@@ -1136,6 +1172,28 @@ void MergedMiningManager::try_submit_merged_blocks(
                         << ", skipping submission to avoid ban";
             continue;
         }
+
+        // The chain merkle proof for this chain's slot, over the leaves the
+        // committed root was built from.
+        auto proof = m_tree.compute_root(committed_leaves, slot);
+        if (proof.root != committed_root) {
+            ++m_block_refusals_by_code[chain.config.symbol + ":root_mismatch"];
+            LOG_ERROR << "[MM:" << chain.config.symbol
+                      << "] BUG: recomputed chain merkle root " << proof.root.GetHex().substr(0, 16)
+                      << " != committed " << committed_root.GetHex().substr(0, 16)
+                      << " — skipping to avoid ban";
+            continue;
+        }
+
+        // Build auxpow proof
+        std::string auxpow = build_auxpow_proof(
+            parent_coinbase_hex,
+            parent_hash,
+            parent_merkle_branch,
+            parent_merkle_index,
+            proof.branch,
+            proof.index,
+            parent_header_hex);
 
         // Build DOGE block from the matching snapshot
         {
@@ -1226,7 +1284,12 @@ void MergedMiningManager::try_submit_merged_blocks(
                     // cpp/path-injection, and the state that matters for
                     // co-located isolation (LevelDB, addrs, logs) is already
                     // re-rooted via config_path(). See #722.
-                    std::string path = "/tmp/c2pool_doge_block_" + std::to_string(chain.current_work.height) + ".hex";
+                    // Chain id in the name for any chain but DOGE: two aux
+                    // chains can solve at the same height.
+                    std::string path = (chain.config.chain_id == 98
+                                            ? std::string("/tmp/c2pool_doge_block_")
+                                            : "/tmp/c2pool_aux" + std::to_string(chain.config.chain_id) + "_block_")
+                                       + std::to_string(chain.current_work.height) + ".hex";
                     std::ofstream f(path);
                     if (f.is_open()) { f << block_hex; f.close(); }
                 }
@@ -1402,6 +1465,38 @@ std::map<uint32_t, AuxWork> MergedMiningManager::get_current_work() const
         result[c.config.chain_id] = c.current_work;
     }
     return result;
+}
+
+// ─── Committed roots ─────────────────────────────────────────────────────────
+// With a chain merkle tree of more than one slot a parent coinbase carries the
+// root over all the chains' block hashes: a find has to recover which block
+// of its chain the root commits to and the chain merkle branch for it from
+// the leaves the root was built from, even when the job is older than the
+// current commitment (the frozen snapshots live per chain, a job's root
+// commits to one of each at once). Aged and capped like frozen_history.
+void MergedMiningManager::remember_committed_root_locked(const uint256& root,
+                                                         const std::map<uint32_t, uint256>& slot_hashes,
+                                                         int64_t now)
+{
+    auto& rec = m_committed_roots[root];
+    rec.slot_hashes = slot_hashes;
+    rec.tree_size = m_tree.size;
+    // Jobs may keep committing to the same root: it ages from now.
+    rec.timestamp = now;
+    rec.seq = ++m_frozen_seq;
+    for (auto it = m_committed_roots.begin(); it != m_committed_roots.end(); ) {
+        if (now - it->second.timestamp > ChainState::FROZEN_EXPIRY_SEC)
+            it = m_committed_roots.erase(it);
+        else
+            ++it;
+    }
+    while (m_committed_roots.size() > kMaxCommittedRoots) {
+        auto oldest = m_committed_roots.begin();
+        for (auto it = m_committed_roots.begin(); it != m_committed_roots.end(); ++it)
+            if (it->second.seq < oldest->second.seq)
+                oldest = it;
+        m_committed_roots.erase(oldest);
+    }
 }
 
 // ─── rebuild_cached_blocks ──────────────────────────────────────────────────
@@ -1686,6 +1781,10 @@ bool MergedMiningManager::rebuild_cached_blocks()
     if (!slot_hashes.empty()) {
         auto proof = m_tree.compute_root(slot_hashes, 0);
         commitment = build_auxpow_commitment(proof.root, m_tree.size);
+        // With several chains the root alone does not say which block of a
+        // chain it commits to: keep its leaves for the shares of this job.
+        if (m_tree.size > 1)
+            remember_committed_root_locked(proof.root, slot_hashes, now_sec);
     }   // else nothing buildable to commit to
 
     // What the miners' work carries: the commitment, and the header infos

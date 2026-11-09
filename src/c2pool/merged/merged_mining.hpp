@@ -254,7 +254,10 @@ public:
     // The reserve the chain's next template leaves (see aux_block_reserve_bytes).
     uint32_t block_size_reserve(uint32_t chain_id) const;
 
-    // Aux blocks refused at assembly, by "<symbol>:<code>" (oversize).
+    // Aux blocks refused at assembly, by "<symbol>:<code>": oversize,
+    // no_snapshot (no frozen block for the committed hash), root_mismatch and,
+    // with several chains, no_commitment (the coinbase root was not built
+    // here or has expired) and not_committed (no block of this chain in it).
     nlohmann::json get_block_refusals_json() const;
 
     // V36: Build merged block header info for share_info.merged_coinbase_info.
@@ -542,6 +545,23 @@ private:
 
     // Cached commitment (44 bytes: magic + mm_root + tree_size + nonce)
     std::vector<uint8_t> m_cached_commitment;
+
+    // Multi-chain commitments: the leaves each root in a parent coinbase was
+    // built from (remember_committed_root_locked), keyed by the root. Unused
+    // with one chain, where the root is the chain's block hash.
+    struct CommittedRoot {
+        std::map<uint32_t, uint256> slot_hashes;  // slot -> committed block hash
+        uint32_t tree_size{0};
+        int64_t  timestamp{0};   // same clock as FrozenSnapshot::timestamp
+        uint64_t seq{0};         // insertion order: the cap drops the oldest
+    };
+    std::map<uint256, CommittedRoot> m_committed_roots;
+    // Commitments per chain can move independently: room for every chain's
+    // frozen window.
+    static constexpr size_t kMaxCommittedRoots = 256;
+    void remember_committed_root_locked(const uint256& root,
+                                        const std::map<uint32_t, uint256>& slot_hashes,
+                                        int64_t now);
 
     // Cached header_infos — built once per work cycle, read by all stratum sessions.
     // Protected by m_mutex (writes in rebuild_cached_blocks, reads via getter).
