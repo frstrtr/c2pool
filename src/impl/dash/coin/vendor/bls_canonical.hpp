@@ -16,6 +16,8 @@
 #include <optional>
 #include <vector>
 
+#include <impl/dash/coin/vendor/bls_mode_guard.hpp>   // one BLS mode per binary
+
 #ifdef C2POOL_DASH_BLS
 #include <dashbls/bls.hpp>
 #include <dashbls/elements.hpp>

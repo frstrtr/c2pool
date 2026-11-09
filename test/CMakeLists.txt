@@ -1307,8 +1307,14 @@ if (BUILD_TESTING AND GTest_FOUND)
     # tracking (versionbits port, EHF signal tracker, deployment status, the
     # testnet replay of the 1,578,000 switch). Header-only; folded into this
     # allowlisted target (a standalone one would be a NOT_BUILT sentinel, #769).
+    # Third TU: test_dash_bls_mode_probe.cpp -- the one-BLS-mode guard
+    # (vendor/bls_mode_guard.hpp): compiled with C2POOL_DASH_BLS forced on
+    # while the rest of this target is not, so the binary is mixed on purpose
+    # and the guard must detect it (it includes nothing else).
     add_executable(test_dash_work_source test_dash_work_source.cpp
-        test_dash_v24_deployments.cpp)
+        test_dash_v24_deployments.cpp
+        test_dash_bls_mode_probe.cpp)
+    set_source_files_properties(test_dash_bls_mode_probe.cpp PROPERTIES COMPILE_DEFINITIONS C2POOL_DASH_BLS)
     target_link_libraries(test_dash_work_source PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core
@@ -1408,6 +1414,12 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_compile_definitions(test_dash_stratum_work_source PRIVATE
         DASH_WORK_SOURCE_SRC="${CMAKE_CURRENT_SOURCE_DIR}/../src/impl/dash/stratum/work_source.cpp"
         DASH_MAIN_SRC="${CMAKE_CURRENT_SOURCE_DIR}/../src/c2pool/main_dash.cpp")
+    # One BLS mode per binary: with the backend in the build, work_source.cpp
+    # (dash_stratum) and this target's own TUs must all be backend-mode
+    # (DashBlsModeGuard.StratumObjectsShareTheBuildsBlsMode).
+    if(C2POOL_DASH_BLS_AVAILABLE)
+        target_compile_definitions(test_dash_stratum_work_source PRIVATE C2POOL_DASH_BLS_EXPECTED=1)
+    endif()
     gtest_add_tests(test_dash_stratum_work_source "" AUTO)
 
     # CoinStateMaintainer: drives NodeCoinState off async tip/MN/mempool update

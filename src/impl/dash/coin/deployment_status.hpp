@@ -616,21 +616,7 @@ inline void set_dash_v24_activation_pin(DashNetwork net, std::optional<uint32_t>
     r.pin[static_cast<int>(net)] = pin;
 }
 
-/// Earliest height at which V24 can be ACTIVE when nothing has been measured:
-/// the first period that can be STARTED, plus two periods. Mainnet: the
-/// period end 2,568,383 precedes the start time by about two days, so
-/// STARTED is at the earliest 2,572,416, LOCKED_IN 2,576,448, ACTIVE
-/// 2,580,480 (design §0).
-inline uint32_t v24_earliest_unmeasured_activation(DashNetwork net)
-{
-    switch (net) {
-    case DashNetwork::MAINNET: return 2'580'480;
-    case DashNetwork::TESTNET: return 1'578'000;   // buried
-    case DashNetwork::DEVNET:
-    case DashNetwork::REGTEST: return 0;
-    }
-    return 0;
-}
+// v24_earliest_unmeasured_activation: dash_deployments.hpp.
 
 /// DeploymentActiveAfter(pindexPrev, DEPLOYMENT_V24) for the block at
 /// `height`, tri-state. Fail closed on UNKNOWN.

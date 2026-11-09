@@ -2064,6 +2064,60 @@ TEST(DashV24AllTx, EmitGateRechecksEveryMnhfSignalWithTheNodeEnvironment)
     n.tracker->signals[13] = 1'565'000;   // the node's tracker: already staged
     EXPECT_FALSE(st.embedded_template_emit_ok(with, &why));
     EXPECT_EQ(why.cause, "emit-mnhf-refused");
+    n.tracker->signals.clear();
+    // The EHF coverage drops after the build: the staged state at the parent
+    // is no longer known, so the cached template is refused (the serve path
+    // re-sources it; the rebuilt template leaves out only the signal,
+    // BuilderDropsOnlyTheSignalWhenTheEhfCoverageDrops).
+    n.tracker->verified = kTnMnhfPrev - 1;
+    EXPECT_FALSE(st.embedded_template_emit_ok(with, &why));
+    EXPECT_EQ(why.cause, "emit-mnhf-refused");
+    EXPECT_EQ(st.embedded_template_emit_ok(w, &why), plain_ok) << "the same body without the signal";
+}
+
+TEST(DashV24AllTx, BuilderDropsOnlyTheSignalWhenTheEhfCoverageDrops)
+{
+    V24World w;
+    ::core::coin::UTXOViewCache utxo(nullptr);
+    dash::coin::Mempool mp;
+    mp.set_utxo(&utxo);
+    const auto sig = tx_from_hex(kTnMnhf);
+    ASSERT_TRUE(mp.add_tx(sig));
+    auto plain = tx_with_inputs(0, {{h256(0x90), 0}});
+    plain.vout.push_back(txout(5 * kCoin, p2pkh(ec_key(0x91).id)));
+    utxo.add_coin(::core::coin::Outpoint(h256(0x90), 0), ::core::coin::Coin(5 * kCoin + 10'000, {}, 1, false));
+    ASSERT_TRUE(mp.add_tx(plain));
+    const auto sml = w.base_sml();
+    dash::coin::QuorumManager qmgr;
+    NodeMnhf n;
+    const auto env = n.env();
+    dash::coin::ProTxCheckEnv penv;
+    penv.net = dash::coin::DashNetwork::MAINNET;
+    penv.ecdsa = &dash::coin::protx_ecdsa_verify_hash;
+    const dash::coin::MnFoldContext::OperatorSigFn sigfn = &v::verify_protx_operator_sig;
+    auto build = [&] {
+        return dash::coin::build_embedded_workdata(
+            kTnMnhfPrev, h256(0xAB), w.sm, mp, 0x1b104be3u, static_cast<uint32_t>(kTnMnhfMtp), 140, 19,
+            static_cast<uint32_t>(kTnMnhfMtp + 100), 0x20000000u, nullptr, &sml, &qmgr, 0,
+            dash::coin::k_zero_cl_sig, 0, nullptr, nullptr, dash::coin::DASH_MN_RR_HEIGHT_MAINNET, nullptr,
+            dash::coin::DASH_MN_MIN_CONFIRMATIONS_MAINNET, /*suppress=*/false, "utxo-immature-serving", nullptr,
+            false, nullptr, /*include_mn_special_txs=*/true, nullptr, nullptr, &sigfn, /*v24_active=*/false,
+            &penv, &env);
+    };
+    auto has = [](const dash::coin::DashWorkData& wd, const MutableTransaction& t) {
+        for (const auto& h : wd.m_tx_hashes)
+            if (h == txid(t)) return true;
+        return false;
+    };
+    const auto before = build();
+    ASSERT_TRUE(has(before, sig));
+    ASSERT_TRUE(has(before, plain));
+    n.tracker->verified = kTnMnhfPrev - 1;   // the coverage drops
+    const auto after = build();
+    EXPECT_FALSE(has(after, sig)) << "the signal is left out";
+    EXPECT_TRUE(has(after, plain)) << "the rest of the body stays";
+    EXPECT_EQ(after.m_tx_hashes.size() + 1, before.m_tx_hashes.size());
+    EXPECT_EQ(after.m_coinbase_value, before.m_coinbase_value) << "a signal pays no fee";
 }
 
 TEST(DashV24AllTx, EmitGateFoldsAProDisTxInsteadOfRefusingItsCollateralSpend)
@@ -2599,6 +2653,81 @@ TEST(DashV24AllTx, BuilderCarriesARealSharedRegistrationOnlyAtV24)
     const auto c = w.connect(body, cb.merkleRootMNList);
     EXPECT_TRUE(c.ok) << c.error;
     EXPECT_FALSE(rides(build(false))) << "before v24 a tx paying the template never rides";
+}
+
+// The service-update order runs before activation too (mainnet at deploy):
+// the served order must commit the root the pre-v24 block-connect fold
+// computes for it (independent verifier's KAT).
+TEST(DashV24AllTx, PreActivationServiceUpdateReorderMatchesPreV24BlockConnect)
+{
+    for (int variant = 0; variant < 2; ++variant) {
+        V24World w;
+        ::core::coin::UTXOViewCache utxo(nullptr);
+        dash::coin::Mempool mp;
+        mp.set_utxo(&utxo);
+        const auto key_change = w.upreg_r(w.rop2.pub);
+        // variant 1: the service update spends the key change's change output
+        // (a descendant of the key change): it must be left out.
+        const auto serv = variant == 0 ? servtx_r(w)
+                                       : servtx_r(w, 0, std::make_pair(txid(key_change), 0u));
+        utxo.add_coin(::core::coin::Outpoint(key_change.vin[0].prevout.hash, key_change.vin[0].prevout.index),
+                      ::core::coin::Coin(1'000'000, script_of(p2pkh(ec_key(0x58).id)), 1, false));
+        if (variant == 0)
+            utxo.add_coin(::core::coin::Outpoint(serv.vin[0].prevout.hash, serv.vin[0].prevout.index),
+                          ::core::coin::Coin(10'000, script_of(p2pkh(ec_key(0x59).id)), 1, false));
+        utxo.add_coin(::core::coin::Outpoint(w.regular.collateralOutpoint.hash, w.regular.collateralOutpoint.index),
+                      ::core::coin::Coin(kColl, script_of(p2pkh(w.rcollat.id)), 1, false));
+        ASSERT_TRUE(mp.add_tx(key_change));
+        mp.add_tx(serv);   // variant 1 may be refused or dropped later: either way it never rides
+        const auto sml = w.base_sml();
+        dash::coin::QuorumManager qmgr;
+        dash::coin::ProTxCheckEnv env;
+        env.net = dash::coin::DashNetwork::MAINNET;
+        env.ecdsa = &dash::coin::protx_ecdsa_verify_hash;
+        const dash::coin::MnFoldContext::OperatorSigFn sigfn = &v::verify_protx_operator_sig;
+        const auto wd = dash::coin::build_embedded_workdata(
+            V24World::H - 1, h256(0xAB), w.sm, mp, 0x1b104be3u, 1'800'000'000u, 76, 16, 1'800'000'100u,
+            0x20000000u, nullptr, &sml, &qmgr, 0, dash::coin::k_zero_cl_sig, 0, nullptr, nullptr,
+            dash::coin::DASH_MN_RR_HEIGHT_MAINNET, nullptr, dash::coin::DASH_MN_MIN_CONFIRMATIONS_MAINNET,
+            /*suppress=*/false, "utxo-immature-serving", nullptr, false, nullptr,
+            /*include_mn_special_txs=*/true, nullptr, nullptr, &sigfn, /*v24_active=*/false, &env, nullptr);
+        std::optional<size_t> at_serv, at_change;
+        for (size_t i = 0; i < wd.m_tx_hashes.size(); ++i) {
+            if (wd.m_tx_hashes[i] == txid(serv)) at_serv = i;
+            if (wd.m_tx_hashes[i] == txid(key_change)) at_change = i;
+        }
+        ASSERT_TRUE(at_change.has_value());
+        if (variant == 0) {
+            ASSERT_TRUE(at_serv.has_value());
+            EXPECT_LT(*at_serv, *at_change);
+        } else {
+            EXPECT_FALSE(at_serv.has_value()) << "a service update descending from the key change is left out";
+        }
+        v::CCbTx cb;
+        ASSERT_TRUE(v::parse_cbtx(wd.m_coinbase_payload, cb));
+        EXPECT_EQ(cb.nVersion, v::CCbTx::VERSION_CLSIG_AND_BALANCE) << "pre-activation: CbTx v3";
+        std::vector<MutableTransaction> body;
+        for (const auto& t : wd.m_txs) body.emplace_back(t);
+        FoldConfig cfg;
+        cfg.enabled = true;
+        cfg.gates.dip0003_height = 1;
+        cfg.gates.dip0003_enforcement_height = std::numeric_limits<int32_t>::max();
+        cfg.gates.v19_height = 1;
+        cfg.gates.mn_rr_height = 1;
+        // v24 unknown (mainnet before lock-in)
+        DmlFoldEngine eng(cfg);
+        eng.seed(w.replay_states(), 2, V24World::H - 1, h256(0x70));
+        const auto r = eng.fold_block(block_of(V24World::H, eng.block_hash(), cb.merkleRootMNList, body), V24World::H);
+        EXPECT_TRUE(r.ok) << r.error;
+    }
+}
+
+// One BLS mode per binary: this target links dash_bls_verify, so every TU
+// of it is backend-mode (vendor/bls_mode_guard.hpp).
+TEST(DashV24AllTx, TheBinaryIsOneBlsMode)
+{
+    EXPECT_FALSE(v::bls_mode_mixed()) << "modes seen: " << v::bls_modes();
+    EXPECT_EQ(v::bls_modes(), v::kBlsModeBackend);
 }
 
 #endif  // C2POOL_DASH_BLS

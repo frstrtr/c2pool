@@ -52,6 +52,8 @@
 #include <vector>
 #include <algorithm>
 
+#include <impl/dash/coin/vendor/bls_mode_guard.hpp>   // one BLS mode per binary
+
 #ifdef C2POOL_DASH_BLS
 // Pulled ONLY under the BLS backend (which already links dashbls): the opkey
 // scheme helpers below are inline so a BLS-OFF translation unit that includes

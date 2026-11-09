@@ -470,13 +470,15 @@ struct FoldGates
     int32_t v19_height{1899072};       // basic BLS (per-entry nVersion wrapper)
     int32_t mn_rr_height{2128896};     // MN reward reallocation (Evo 4-in-a-row OFF)
     int32_t masternode_min_confirmations{15};
-    // DEPLOYMENT_V24: the first height with the v24 rules (Dash Core v24
-    // state transitions, type list 0..12, shared-collateral covenant).
-    // Unknown by default; the node's deployment tracking pushes it
-    // (V24ActivationWire, DmlFoldEngine::set_v24_height), testnet's is
-    // 1,578,000, and a block's CbTx version 4 sets it when nothing was pushed
-    // (fold_block; v24_activation.hpp).
+    // DEPLOYMENT_V24: the activation height as the deployment tracking
+    // derives it (V24ActivationWire, DmlFoldEngine::set_v24_height; testnet's
+    // 1,578,000). A cross-check only: every block folds as its own CbTx
+    // version states (v24_activation.hpp). Unknown by default.
     int32_t v24_height{std::numeric_limits<int32_t>::max()};
+    // The earliest height v24 can be active on the network
+    // (v24_earliest_unmeasured_activation): a block stating v24 below it is
+    // refused (dashd rejects it). 0: not checked.
+    uint32_t v24_earliest{0};
 
     /// v24_height in the v24_activation.hpp convention.
     uint32_t v24_height_u32() const
@@ -499,6 +501,7 @@ struct FoldGates
         g.mn_rr_height = 1066900;
         g.masternode_min_confirmations = 1;
         g.v24_height = static_cast<int32_t>(v24::kTestnetActivationHeight);
+        g.v24_earliest = v24::kTestnetActivationHeight;
         g.netinfo_rules = vendor::NetInfoRules::testnet();
         return g;
     }
@@ -702,6 +705,9 @@ public:
                                                                       ? std::numeric_limits<int32_t>::max()
                                                                       : static_cast<int32_t>(h); }
     int32_t v24_height() const { return m_cfg.gates.v24_height; }
+    void    set_v24_earliest(uint32_t h) { m_cfg.gates.v24_earliest = h; }
+    /// Blocks whose CbTx statement disagreed with the pushed height.
+    uint64_t v24_contradictions() const { return m_v24_contradictions; }
     uint64_t           total_registered_count() const { return m_total_registered_count; }
     const std::string& network() const                { return m_network; }
     bool               poisoned() const               { return m_poisoned; }
@@ -1024,15 +1030,16 @@ public:
 
         const int32_t H = static_cast<int32_t>(height);
 
-        // Dash Core v24 switch for THIS block (v24_activation.hpp): the pushed
-        // activation height against the CbTx version the block states. A
-        // contradiction is not ours to fold under either rule set; with no
-        // height pushed, the block decides (fold_block adopts its height).
-        const auto v24_sw = v24_block_switch(height, m_cfg.gates.v24_height_u32(), cbtx.nVersion);
-        if (v24_sw.contradiction) {
+        // Dash Core v24 switch for THIS block (v24_activation.hpp): the CbTx
+        // version the block states decides how it folds; the pushed height
+        // only cross-checks it. A v24 statement below the earliest possible
+        // activation is a block dashd rejects.
+        const auto v24_sw = v24_block_switch(height, m_cfg.gates.v24_height_u32(), cbtx.nVersion,
+                                             m_cfg.gates.v24_earliest);
+        if (v24_sw.invalid) {
             r.refused_unchanged = true;
-            r.error = "fold refused at h=" + std::to_string(height) + ": " + *v24_sw.contradiction
-                    + " (the held list is unchanged)";
+            r.error = "fold refused at h=" + std::to_string(height) + ": " + *v24_sw.invalid
+                    + " (dashd rejects this block; the held list is unchanged)";
             return false;
         }
         const bool v24_here = v24_sw.active;
@@ -1078,15 +1085,22 @@ public:
         r.height = height;
         if (!check_before_fold(block, height, r)) return r;
 
+        // This block's v24 switch, from its own CbTx version (the same
+        // decision check_before_fold took); a disagreement with the pushed
+        // height is logged and counted, never refused (v24_activation.hpp).
+        {
+            const auto sw = v24_block_switch(height, m_cfg.gates.v24_height_u32(), block_cbtx_version(block),
+                                             m_cfg.gates.v24_earliest);
+            if (sw.contradiction) {
+                const uint64_t n = ++m_v24_contradictions;
+                if (n <= 3 || n % 100 == 0)
+                    LOG_ERROR << "[DML-FOLD] " << *sw.contradiction << " (contradictions=" << n << ")";
+            }
+            m_block_v24 = std::make_pair(static_cast<int32_t>(height), sw.active);
+        }
+
         const int32_t H = static_cast<int32_t>(height);
         const uint256 prev_hash = block.m_previous_block;
-
-        // No activation height pushed and the block states v24: adopt it.
-        if (v24_block_switch(height, m_cfg.gates.v24_height_u32(), block_cbtx_version(block)).learned) {
-            m_cfg.gates.v24_height = H;
-            LOG_INFO << "[DML-FOLD] Dash Core v24 is active from h=" << height
-                     << " (the block's CbTx version 4; no activation height was pushed)";
-        }
 
         // ── Pass 0: payee, from the PRE-block list ──────────────────────
         r.payee = project_payee(H);
@@ -1236,7 +1250,7 @@ public:
         // Pure vin-vs-known-outpoint scan over every non-coinbase tx —
         // AFTER pass 3, so a same-block registration can be spent by a
         // later tx of the same block (dashd order).
-        const bool v24_block = m_cfg.gates.v24_active(H);
+        const bool v24_block = v24_for(H);
         for (size_t i = 1; i < block.m_txs.size(); ++i) {
             for (const auto& in : block.m_txs[i].vin) {
                 auto ci = m_collateral_index.find(in.prevout);
@@ -1627,6 +1641,18 @@ private:
     static constexpr int32_t kEvoVotingWeight = 4;
 
     FoldConfig m_cfg;
+    // The v24 switch of the block fold_block is folding, from its CbTx
+    // version (check_before_fold; v24_activation.hpp), and the count of
+    // blocks whose statement disagreed with the pushed height.
+    std::optional<std::pair<int32_t, bool>> m_block_v24;
+    uint64_t m_v24_contradictions{0};
+    /// DEPLOYMENT_V24 for the block at H: its own statement while it folds,
+    /// else the pushed height.
+    bool v24_for(int32_t H) const
+    {
+        if (m_block_v24 && m_block_v24->first == H) return m_block_v24->second;
+        return m_cfg.gates.v24_active(H);
+    }
     MembersFn  m_members_fn;
 
     Entries m_entries;
@@ -1804,7 +1830,7 @@ private:
         if (!vendor::parse_protx_payload(tx.extra_payload, p))
             return "unparseable ProRegTx payload (replay folds byte-exact "
                    "or not at all)";
-        if (m_cfg.gates.v24_active(H)) return fold_proreg_v24(tx, p, H, r);
+        if (v24_for(H)) return fold_proreg_v24(tx, p, H, r);
         if (p.nVersion >= vendor::ProTxVersion::EXT_ADDR)
             return "ProRegTx nVersion=" + std::to_string(p.nVersion)
                  + " (ExtAddr) before DEPLOYMENT_V24 (bad-protx-version)";
@@ -1894,7 +1920,7 @@ private:
         vendor::CProUpServTx p;
         if (!vendor::parse_protx_payload(tx.extra_payload, p))
             return "unparseable ProUpServTx payload";
-        const bool v24_on = m_cfg.gates.v24_active(H);
+        const bool v24_on = v24_for(H);
         if (!v24_on && p.nVersion >= vendor::ProTxVersion::EXT_ADDR)
             return "ProUpServTx nVersion=" + std::to_string(p.nVersion)
                  + " (ExtAddr) before DEPLOYMENT_V24 (bad-protx-version)";
@@ -1998,7 +2024,7 @@ private:
         vendor::CProUpRegTx p;
         if (!vendor::parse_protx_payload(tx.extra_payload, p))
             return "unparseable ProUpRegTx payload";
-        if (m_cfg.gates.v24_active(H)) return fold_proupreg_v24(p, H, r);
+        if (v24_for(H)) return fold_proupreg_v24(p, H, r);
         if (p.nVersion >= vendor::ProTxVersion::EXT_ADDR)
             return "ProUpRegTx nVersion=" + std::to_string(p.nVersion)
                  + " (ExtAddr) before DEPLOYMENT_V24 (bad-protx-version)";
@@ -2061,7 +2087,7 @@ private:
         vendor::CProUpRevTx p;
         if (!vendor::parse_protx_payload(tx.extra_payload, p))
             return "unparseable ProUpRevTx payload";
-        if (m_cfg.gates.v24_active(H)) return fold_prouprev_v24(p, H, r);
+        if (v24_for(H)) return fold_prouprev_v24(p, H, r);
         // v3 has the v2 layout, but after DEPLOYMENT_V24 a revocation keeps
         // the state version (SetStateVersion) instead of dropping it to 1.
         if (p.nVersion >= vendor::ProTxVersion::EXT_ADDR)
