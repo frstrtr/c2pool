@@ -878,7 +878,12 @@ inline FoldVerdict fold_one_with_ctx(vendor::CSimplifiedMNList& folded,
 /// In-body changes to the pre-block list under the v24 rules.
 struct MnFoldOverlayV24
 {
-    using Service = std::tuple<uint8_t, std::vector<uint8_t>, uint16_t>;   ///< (net, addr, port)
+    /// A netInfo entry as a unique property: (network id, address bytes,
+    /// port) for a service (Core hashes the CService, ADDRv2 for the
+    /// networks ADDRv1 cannot carry), (kDomain, name bytes, port) for a
+    /// domain entry.
+    using Service = std::tuple<uint8_t, std::vector<uint8_t>, uint16_t>;
+    static constexpr uint8_t kDomain = 0xff;
 
     /// The evolving state of every masternode a body tx registered or
     /// changed (newList for those entries).
@@ -891,10 +896,9 @@ struct MnFoldOverlayV24
     /// prevList unique-property indexes (dashd mnUniquePropertyMap), built on
     /// first use: operator keys (the store is canonical basic, so a point is
     /// one byte string and this is HasOperatorKeyUnderAnyScheme), keyIDOwner
-    /// ∪ Evo platformNodeID ∪ share owner keys (one namespace), and every IP
-    /// service of a netInfo (legacy CService or ExtNetInfo entries). Domain
-    /// entries are not indexed: only a version-3 payload can carry one, and
-    /// those are refused by the Core checks before this fold.
+    /// ∪ Evo platformNodeID ∪ share owner keys (one namespace), and every
+    /// netInfo entry (the legacy CService, or each ExtNetInfo service and
+    /// domain entry of every purpose).
     struct PreIndex {
         std::multimap<MnFoldContext::OpKey, uint256> opkeys;
         std::multimap<uint160, uint256>              ids;
@@ -902,22 +906,28 @@ struct MnFoldOverlayV24
     };
     std::optional<PreIndex> pre;
 
-    static std::vector<Service> services_of(const MNState& st)
+    /// The unique-property entries of a netInfo: ExtNetInfo when `ext`,
+    /// else the legacy service (none when empty).
+    static std::vector<Service> entries_of(bool ext, const vendor::LegacyNetService& legacy,
+                                           const vendor::ExtNetInfo& extinfo)
     {
         std::vector<Service> out;
-        auto add = [&](const vendor::NetService& s) {
-            if (s.IsValid() && (s.IsIPv4() || s.IsIPv6()))
-                out.emplace_back(static_cast<uint8_t>(s.net), s.addr, s.port);
-        };
-        if (v24::state_has_ext(st.nVersion)) {
-            for (uint8_t purpose : {vendor::NetInfoPurpose::CORE_P2P, vendor::NetInfoPurpose::PLATFORM_P2P,
-                                    vendor::NetInfoPurpose::PLATFORM_HTTPS})
-                for (const auto& e : st.v24.extNetInfo.GetEntries(purpose))
-                    if (const auto* s = e.service()) add(*s);
-        } else if (!net_service_empty(st.netInfo)) {
-            add(vendor::NetService::from_legacy(st.netInfo));
+        if (ext) {
+            for (const auto& e : extinfo.GetAllEntries()) {
+                if (const auto* s = e.service(); s && s->IsValid())
+                    out.emplace_back(static_cast<uint8_t>(s->net), s->addr, s->port);
+                else if (const auto* d = e.domain())
+                    out.emplace_back(kDomain, std::vector<uint8_t>(d->addr.begin(), d->addr.end()), d->port);
+            }
+        } else if (!net_service_empty(legacy)) {
+            const auto s = vendor::NetService::from_legacy(legacy);
+            out.emplace_back(static_cast<uint8_t>(s.net), s.addr, s.port);
         }
         return out;
+    }
+    static std::vector<Service> services_of(const MNState& st)
+    {
+        return entries_of(v24::state_has_ext(st.nVersion), st.netInfo, st.v24.extNetInfo);
     }
     static std::vector<uint160> ids_of(const MNState& st)
     {
@@ -1130,13 +1140,8 @@ inline FoldVerdict fold_one_v24(vendor::CSimplifiedMNList& folded, const vendor:
             return refuse("bad-protx-dup-key (pubKeyOperator under either scheme)");
         if (p.nType == vendor::MnType::EVO && ov.id_held_by_other(ctx, p.platformNodeID, none))
             return refuse("bad-protx-dup-platformnodeid");
-        if (!net_service_empty(p.netInfo)) {
-            const auto svc_list = MnFoldOverlayV24::services_of([&] {
-                MNState tmp;
-                tmp.nVersion = p.nVersion;
-                tmp.netInfo = p.netInfo.canonical();
-                return tmp;
-            }());
+        {
+            const auto svc_list = MnFoldOverlayV24::entries_of(false, p.netInfo.canonical(), vendor::ExtNetInfo{});
             for (const auto& svc : svc_list) {
                 // prevList: only the masternode this collateral replaces may hold it.
                 const auto& pm = ov.pre_index(ctx).services;
@@ -1172,8 +1177,6 @@ inline FoldVerdict fold_one_v24(vendor::CSimplifiedMNList& folded, const vendor:
     case vendor::CProUpServTx::SPECIALTX_TYPE: {
         vendor::CProUpServTx p;
         if (!vendor::parse_protx_payload(tx.extra_payload, p)) return refuse("bad-protx-payload");
-        if (p.nVersion >= vendor::ProTxVersion::EXT_ADDR)
-            return refuse("bad-protx-version (ExtAddr ProUpServTx: its Dash Core checks are not ported) - excluded");
         const vendor::CSimplifiedMNListEntry* be = base_entry(base, p.proTxHash);
         if (be == nullptr) return refuse("bad-protx-hash (not in the pre-block list)");
         MNState* cur = touch_v24(folded, ctx, ov, p.proTxHash, "bad-protx-hash", why);
@@ -1182,14 +1185,10 @@ inline FoldVerdict fold_one_v24(vendor::CSimplifiedMNList& folded, const vendor:
             return refuse("service update follows a key change of masternode "
                           + p.proTxHash.GetHex().substr(0, 16) + " in this block (Dash Core miner rule) - excluded");
         if (p.nType != cur->nType) return refuse("bad-protx-type-mismatch");
-        if (!net_service_empty(p.netInfo)) {
-            MNState tmp;
-            tmp.nVersion = p.nVersion;
-            tmp.netInfo = p.netInfo.canonical();
-            for (const auto& svc : MnFoldOverlayV24::services_of(tmp))
-                if (ov.service_held_by_other(ctx, svc, p.proTxHash))
-                    return refuse("bad-protx-dup-netinfo-entry (service held by another MN)");
-        }
+        for (const auto& svc : MnFoldOverlayV24::entries_of(v24::state_has_ext(p.nVersion), p.netInfo.canonical(),
+                                                            p.extNetInfo))
+            if (ov.service_held_by_other(ctx, svc, p.proTxHash))
+                return refuse("bad-protx-dup-netinfo-entry (an entry held by another MN)");
         if (p.nType == vendor::MnType::EVO && ov.id_held_by_other(ctx, p.platformNodeID, p.proTxHash))
             return refuse("bad-protx-dup-platformnodeid");
         if (auto w = operator_sig_refusal(ctx, *be, tx.extra_payload, p)) return refuse(*w);
@@ -1214,8 +1213,6 @@ inline FoldVerdict fold_one_v24(vendor::CSimplifiedMNList& folded, const vendor:
     case vendor::CProUpRegTx::SPECIALTX_TYPE: {
         vendor::CProUpRegTx p;
         if (!vendor::parse_protx_payload(tx.extra_payload, p)) return refuse("bad-protx-payload");
-        if (p.nVersion >= vendor::ProTxVersion::EXT_ADDR)
-            return refuse("bad-protx-version (ExtAddr ProUpRegTx: its Dash Core checks are not ported) - excluded");
         if (base_entry(base, p.proTxHash) == nullptr) return refuse("bad-protx-hash (not in the pre-block list)");
         MNState* cur = touch_v24(folded, ctx, ov, p.proTxHash, "bad-protx-hash", why);
         if (cur == nullptr) return refuse(why);

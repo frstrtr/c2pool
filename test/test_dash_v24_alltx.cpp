@@ -619,6 +619,114 @@ MNState tn_evo_state()
     return st;
 }
 
+// ProUpServTx v3 1,579,049 of Regular masternode a356adb8... (state at
+// 1,579,048: version 2, banned) and ProUpServTx v3 1,578,496 of EvoNode
+// 763ca29f... (version 2, banned, Platform ports): Core raises both to
+// version 3 with the payload's ExtNetInfo, migrates the payout script into
+// the payout list and revives them (protx info at the next block).
+const char* kTnServA356 =
+    "03000200018e8b4dea67509df4c39c4697f6bfb8e68bbb460d3d8b32c9cab16543a82fd720000000006a4730440220349f96398d"
+    "556fbaec3ed9e0b37eb0a6a202bcbf012354034062b11d503bca7402205e6ff7820151321953ceffb95256cd4086b75328e5b5c1"
+    "90f3fd42683de5d13f012102325e83cb1285c92eee0ab95a95e51ec81431bf8311384fbbb3bc2fd5ff63424afeffffff014aa10e"
+    "00000000001976a914dbe0812a19d7e3e8e168fd060e8680fc6a05d2f288ac00000000b203000000b27541f9766ea980fa9df7c3"
+    "b41808530509cdba5f2d52238628df32b8ad56a3010100010101044e1146af4dbb0098b86264de16a59ad62d848a7e953c5a6a68"
+    "a523e4d1eadbd68a42745ab60dcfa0e0459b98edb459d9431da6e8f84b7eefa4ee6736d97f2ff0708f3d0800b036ad27cdab33bb"
+    "031762a9fb09a433d68b13d713d8f0e0f0a046bdeba3831c8228c549614374d5bc78ffd74973b923e3848883a5feee3f4ced04d6"
+    "0471ea207b7f";
+const char* kTnServA356Pro = "a356adb832df288623522d5fbacd0905530818b4c3f79dfa80a96e76f94175b2";
+const char* kTnServEvo =
+    "0300020001164941f480ccf7c14794cd957f724ceae4ef7f0fb0b18a7fb9814abf6285e3c6000000006a47304402205e379d1294"
+    "5f77970d713bf7169fa1527216f0982ad4c0a05fea1e9a012b7b5502204dd4971f7ffe6e5c3d3ba95c63c24e00b090237f17f598"
+    "8cc1b2a1d3585d54eb01210216a3c19bb2333bc4c3addaa1f1118c42fd060d3e47fe6fd4932b437363f54f2cfeffffff015eea0e"
+    "00000000001976a914000888b285fe4aba88b8bed38e9ce5a4a856ad2488ac00000000dc03000100800b5c82dde5ef1694b17d0a"
+    "93dfd03ca8a49c1c31512457e78396f79fa23c7601030001010104a223f3554e1d0101010104a223f3558f300201010104a223f3"
+    "5505a300e1e72e7b664391a00b68f6dfc6a9e20ee49cdb3f353c360e94027e74c21e25dfc92e0ebc2cf6df05de73b3a9821e9c59"
+    "0420d033997ab3a46cdcaf52d48e9eb601e05430f11f678d04678dc0790fdb8702d7ddf8834c786178264e6e90d07df8e3bbddc3"
+    "1212a0eb020103e35c60edce0aeeb8bb214a05fad022df5dd267d280043a8ef02810d0a9267a95aae2df21a3a754b056";
+const char* kTnServEvoPro = "763ca29ff79683e7572451311c9ca4a83cd0df930a7db19416efe5dd825c0b80";
+
+MNState tn_a356_state()
+{
+    MNState st;
+    st.nVersion = v::ProTxVersion::BASIC_BLS;
+    st.nType = v::MnType::REGULAR;
+    st.collateralOutpoint.hash = u256("5c20c6b1cde0dc0517d799a482edf51359662cc2f06e120739e08ccefa233beb");
+    st.collateralOutpoint.index = 0;
+    st.nRegisteredHeight = 1'573'098;
+    st.nPoSeBanHeight = 1'578'755;
+    st.isValid = false;
+    st.keyIDOwner = u160_from_p2pkh("76a914441af17f3a9019dcc1a9052ec9f04d35229c27e088ac");
+    st.keyIDVoting = u160_from_p2pkh("76a91456ae25b378bfedb83c9ec80d560df5ca475f898488ac");
+    st.pubKeyOperator = arr_hex<48>(
+        "adad41e17d64581f58fcbc8dff2845a9a10c2e57db782dc5fd41a175729e59048dc3fb82d9f0620eeaac3eacadced01a");
+    st.netInfo = ipv4(78, 17, 70, 175, 19899);
+    st.scriptPayout = script_of(unhex("76a9140dcd5182b7ec23f747af4113adf39404934f7b8788ac"));
+    return st;
+}
+MNState tn_evo763c_state()
+{
+    MNState st;
+    st.nVersion = v::ProTxVersion::BASIC_BLS;
+    st.nType = v::MnType::EVO;
+    st.collateralOutpoint.hash = u256(kTnServEvoPro);
+    st.collateralOutpoint.index = 1;
+    st.nRegisteredHeight = 1'545'893;
+    st.nPoSeBanHeight = 1'573'164;
+    st.isValid = false;
+    st.keyIDOwner = u160_from_p2pkh("76a914d2f68ed8684606fe777711f469fa91d1be8a040e88ac");
+    st.keyIDVoting = u160_from_p2pkh("76a9146fc8eacf785fce62cb493c3ce335a12ff0596ff188ac");
+    st.pubKeyOperator = arr_hex<48>(
+        "ad99da4a07542b221fa6f2335ab2a1071cad6f2dbae230fe82a619b07d039b6270632272ea7269dc5c8241eef139f57c");
+    st.netInfo = ipv4(162, 35, 243, 85, 19997);
+    st.platformNodeID.SetHex("33d02004599c1e82a9b373de05dff62cbc0e2ec9");
+    st.platformP2PPort = 36656;
+    st.platformHTTPPort = 1443;
+    st.scriptPayout = script_of(unhex("76a91418d05f474a776383ac3aebbfb978ae29da144ed088ac"));
+    return st;
+}
+
+/// Fold one real testnet provider tx over a list holding only `pro` (its
+/// state at `height - 1`), with Core's checks for that height, and connect
+/// the same block through the replay fold on testnet gates.
+struct RealFold {
+    dash::coin::SmlSpecialFold fold;
+    v::CSimplifiedMNList base;
+    dash::coin::replay::FoldResult connect;
+    std::optional<std::string> core_check;
+};
+RealFold real_fold(const uint256& pro, const MNState& pre, const MutableTransaction& tx, uint32_t height,
+                   const std::function<void(const DmlFoldEngine&)>& inspect = {})
+{
+    RealFold out;
+    MnStateMachine sm;
+    sm.load({{pro, pre}}, height - 1);
+    const std::vector<std::pair<uint256, ReplayMNState>> states = {{pro, to_replay(pro, pre, h256(0x63))}};
+    out.base = v::CSimplifiedMNList(std::vector<v::CSimplifiedMNListEntry>{states[0].second.to_sml_entry(pro)});
+    dash::coin::ProTxCheckEnv env;
+    env.net = dash::coin::DashNetwork::TESTNET;
+    const auto rules = dash::coin::protx_rules_for(env, height, true);
+    const auto check = [&sm, rules](const MutableTransaction& t) {
+        return protx_core_refusal(t, sm, rules, {}, &dash::coin::protx_ecdsa_verify_hash);
+    };
+    out.core_check = check(tx);
+    auto ctx = dash::coin::MnFoldContext::from(sm, {}, &v::verify_protx_operator_sig);
+    ctx.require_core_check = true;
+    ctx.core_check = check;
+    ctx.v24_rules = true;
+    ctx.height = height;
+    ctx.netinfo_rules = v::NetInfoRules::testnet();
+    out.fold = dash::coin::fold_mn_special_txs(out.base, std::vector<MutableTransaction>{tx}, &txid, ctx);
+    FoldConfig cfg;
+    cfg.enabled = true;
+    cfg.gates = dash::coin::replay::FoldGates::testnet();
+    cfg.gates.dip0003_enforcement_height = std::numeric_limits<int32_t>::max();
+    DmlFoldEngine eng(cfg);
+    eng.seed(states, 1, height - 1, h256(0x70), "testnet");
+    out.connect = eng.fold_block(block_of(height, eng.block_hash(), out.fold.sml.CalcMerkleRoot(), {tx}), height);
+    if (inspect) inspect(eng);
+    return out;
+}
+
 dash::coin::MnhfCheckEnv tn_mnhf_env(std::optional<bool> staged = false)
 {
     dash::coin::MnhfCheckEnv env;
@@ -1180,6 +1288,115 @@ TEST(DashV24AllTx, RealTestnetProUpRevTxV3OfAnEvoNodeFoldsToCoresState)
     EXPECT_EQ(st->v24.payouts[0].scriptPayout.m_data, evo.scriptPayout.m_data);
     EXPECT_EQ(st->v24.payouts[0].reward, 10000);
     EXPECT_EQ(st->nRevocationReason, 1);
+}
+
+TEST(DashV24AllTx, RealTestnetProUpServTxV3RaisesAndRevivesLikeCore)
+{
+    for (const bool evo : {false, true}) {
+        SCOPED_TRACE(evo ? "EvoNode 763ca29f at 1,578,496" : "Regular a356adb8 at 1,579,049");
+        const auto tx = tx_from_hex(evo ? kTnServEvo : kTnServA356);
+        const uint256 pro = u256(evo ? kTnServEvoPro : kTnServA356Pro);
+        const MNState pre = evo ? tn_evo763c_state() : tn_a356_state();
+        const uint32_t height = evo ? 1'578'496 : 1'579'049;
+        v::CProUpServTx p;
+        ASSERT_TRUE(v::parse_protx_payload(tx.extra_payload, p));
+        ASSERT_EQ(p.nVersion, 3);
+        const auto r = real_fold(pro, pre, tx, height, [&](const DmlFoldEngine& eng) {
+            const auto* st = eng.find(pro);
+            ASSERT_NE(st, nullptr);
+            EXPECT_EQ(st->nVersion, 3);
+            EXPECT_FALSE(st->IsBanned());
+            ASSERT_EQ(st->v24.payouts.size(), 1u);
+            EXPECT_EQ(st->v24.payouts[0].scriptPayout.m_data, pre.scriptPayout.m_data);
+        });
+        ASSERT_EQ(r.core_check, std::nullopt) << *r.core_check;
+        ASSERT_EQ(r.fold.refused, 0u) << r.fold.refused_reasons.front();
+        // Dash Core's post-state as a leaf, built by hand: version 3, the
+        // payload's ExtNetInfo, the operator key in the basic scheme, revived.
+        v::CSimplifiedMNListEntry want;
+        want.nVersion = v::CSimplifiedMNListEntry::VER_EXT_ADDR;
+        want.proRegTxHash = pro;
+        want.confirmedHash = r.base.mnList[0].confirmedHash;
+        want.extNetInfo = p.extNetInfo;
+        want.pubKeyOperator = pre.pubKeyOperator;
+        want.keyIDVoting = pre.keyIDVoting;
+        want.isValid = true;
+        want.nType = pre.nType;
+        want.platformNodeID = evo ? p.platformNodeID : uint160{};
+        ASSERT_EQ(r.fold.sml.mnList.size(), 1u);
+        EXPECT_EQ(r.fold.sml.mnList[0].CalcHash(), want.CalcHash());
+        EXPECT_TRUE(r.connect.ok) << r.connect.error;
+    }
+    // An EvoNode must spell its Platform entries out at version 3: the same
+    // masternode's v2-shaped update is refused under v24.
+    {
+        MnStateMachine sm;
+        sm.load({{u256(kTnServEvoPro), tn_evo763c_state()}}, 1'578'495);
+        auto tx = tx_from_hex(kTnServEvo);
+        v::CProUpServTx p;
+        ASSERT_TRUE(v::parse_protx_payload(tx.extra_payload, p));
+        dash::coin::ProTxCheckEnv env;
+        env.net = dash::coin::DashNetwork::TESTNET;
+        // Before v24 a version-3 payload is out of range.
+        EXPECT_CODE(protx_core_refusal(tx, sm, dash::coin::protx_rules_for(env, 1'578'496, false), {},
+                                       &dash::coin::protx_ecdsa_verify_hash),
+                    "bad-protx-version");
+    }
+}
+
+TEST(DashV24AllTx, ProUpRegTxV3PayoutListFoldsAndMatchesBlockConnect)
+{
+    V24World w;
+    auto make = [&](std::vector<std::pair<uint160, uint16_t>> payouts, const std::array<uint8_t, 48>& key) {
+        MutableTransaction tx = tx_with_inputs(3, {{h256(0x84), 0}});
+        v::CProUpRegTx p;
+        p.nVersion = v::ProTxVersion::EXT_ADDR;
+        p.proTxHash = w.R;
+        p.pubKeyOperator = key;
+        p.keyIDVoting = w.rvoting.id;
+        for (const auto& [id, reward] : payouts) {
+            v::MasternodePayoutShare s;
+            s.scriptPayout = script_of(p2pkh(id));
+            s.reward = reward;
+            p.payouts.push_back(s);
+        }
+        p.inputsHash = dash::coin::protx_check_detail::inputs_hash(tx);
+        tx.extra_payload = pack_payload(p);
+        const auto h = dash::coin::protx_check_detail::hash_without_trailing_vchsig(tx.extra_payload, 0);
+        p.vchSig = sign_compact(w.rowner, *h);
+        tx.extra_payload = pack_payload(p);
+        return tx;
+    };
+    const auto a = ec_key(0x5a).id, b = ec_key(0x5b).id;
+    const auto tx = make({{a, 6000}, {b, 4000}}, w.rop.pub);   // no key change: raised to 3
+    ASSERT_EQ(w.check(tx), std::nullopt) << *w.check(tx);
+    const auto f = w.fold({tx});
+    ASSERT_EQ(f.refused, 0u) << f.refused_reasons.front();
+    auto folded = f.sml;
+    const auto* leaf = dash::coin::detail::find_entry(folded.mnList, w.R);
+    ASSERT_NE(leaf, nullptr);
+    EXPECT_EQ(leaf->nVersion, 3) << "max(state 2, tx 3): the legacy service becomes an ExtNetInfo entry";
+    EXPECT_TRUE(leaf->isValid);
+    const auto r = w.connect({tx}, f.sml.CalcMerkleRoot(), [&](const DmlFoldEngine& eng) {
+        const auto* st = eng.find(w.R);
+        ASSERT_NE(st, nullptr);
+        ASSERT_EQ(st->v24.payouts.size(), 2u);
+        EXPECT_EQ(st->v24.payouts[1].reward, 4000);
+    });
+    EXPECT_TRUE(r.ok) << r.error;
+    // Core's codes for the version-3 rules.
+    EXPECT_CODE(w.check(make({{a, 6000}, {b, 3000}}, w.rop.pub)), "bad-protx-payout-reward-sum");
+    EXPECT_CODE(w.check(make({{a, 5000}, {w.rcollat.id, 5000}}, w.rop.pub)), "bad-protx-payee-reuse");
+    EXPECT_CODE(w.check(make({{a, 5000}, {w.rvoting.id, 5000}}, w.rop.pub)), "bad-protx-payee-reuse");
+    EXPECT_CODE(w.check(make({{a, 10000}}, w.rop.pub), /*v24=*/false), "bad-protx-version");
+    {   // a shared masternode is never updated by a ProUpRegTx
+        auto t = make({{a, 10000}}, w.rop.pub);
+        v::CProUpRegTx p;
+        ASSERT_TRUE(v::parse_protx_payload(t.extra_payload, p));
+        p.proTxHash = w.S;
+        t.extra_payload = pack_payload(p);
+        EXPECT_CODE(w.check(t), "bad-protx-shared-mn");
+    }
 }
 
 TEST(DashV24AllTx, PreActivationTheV24TypesNeverReachATemplate)

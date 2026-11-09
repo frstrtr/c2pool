@@ -21,11 +21,12 @@
 /// the "update names a listed masternode" rules also stay in the template
 /// fold, which sees the in-body changes as well as the pre-block list.
 ///
-/// Scope of this port: payload versions 1 (LegacyBLS) and 2 (BasicBLS) of
-/// types 1-3; a version-3 (ExtAddr) payload of types 1-3, or one naming a
-/// version-3 state, is refused (their v3 rules are not ported here). Type 4
-/// (ProUpRevTx) has no version-3 rule of its own and is checked at every
-/// version. The
+/// Scope of this port: every payload version of types 2-4 (version 3 payloads
+/// through the S2 payload rules of v24_rules.hpp, plus CheckProUpServTx's
+/// ApplyProUpServTx dry run, CheckProUpRegTx's shared refusal, payout list
+/// and SetStateVersion dry run); type 1 at versions 1 and 2 only: a
+/// version-3 ProRegTx (ExtAddr, every shared registration) is refused (its
+/// share consent signatures and payout-list sign string are not ported). The
 /// v24 provider types 10-12 are checked in full (CheckProDisTx,
 /// CheckProUpShareTx, CheckProUpSharedRegTx, specialtxman.cpp:1625-1875):
 /// the payload rules through v24_rules.hpp provider_payload_refusal
@@ -577,29 +578,44 @@ protx_core_refusal(const Tx& tx_in, const MnStateMachine& pre, const ProTxCheckR
     case vendor::CProUpServTx::SPECIALTX_TYPE: {
         vendor::CProUpServTx p;
         if (!parse(tx.extra_payload, p)) return no("bad-protx-payload");
-        if (!vendor::blssig_parses_canonical(p.sig, p.nVersion == pv::LEGACY_BLS))
-            return no("bad-protx-payload (malleable BLS signature)");
-        if (auto r = codec_version_refusal(p.nVersion)) return r;
-        if (p.nVersion > max_version(rules)) return no("bad-protx-version");
-        // CProUpServTx::IsTriviallyValid
-        if (p.nVersion < pv::BASIC_BLS && p.nType == vendor::MnType::EVO) return no("bad-protx-evo-version");
-        if (p.nType != vendor::MnType::REGULAR && p.nType != vendor::MnType::EVO) return no("bad-protx-type");
-        {
-            Ipv4 ip{};
-            if (classify_service(p.netInfo, ip) == ServiceKind::Empty) return no("bad-protx-netinfo-empty");
+        if (p.nVersion >= pv::EXT_ADDR) {
+            // A version-3 (ExtNetInfo) payload: GetValidatedPayload and
+            // CheckProviderNetworkFields through the S2 payload rules
+            // (v24_rules.hpp), which read ExtNetInfo exactly as Core does.
+            if (p.nVersion > max_version(rules)) return no("bad-protx-version");
+            if (auto r = provider_payload_refusal(tx.type, tx.extra_payload, provider_rules_of(rules))) return r;
+        } else {
+            if (!vendor::blssig_parses_canonical(p.sig, p.nVersion == pv::LEGACY_BLS))
+                return no("bad-protx-payload (malleable BLS signature)");
+            if (auto r = codec_version_refusal(p.nVersion)) return r;
+            if (p.nVersion > max_version(rules)) return no("bad-protx-version");
+            // CProUpServTx::IsTriviallyValid
+            if (p.nVersion < pv::BASIC_BLS && p.nType == vendor::MnType::EVO) return no("bad-protx-evo-version");
+            if (p.nType != vendor::MnType::REGULAR && p.nType != vendor::MnType::EVO) return no("bad-protx-type");
+            {
+                Ipv4 ip{};
+                if (classify_service(p.netInfo, ip) == ServiceKind::Empty) return no("bad-protx-netinfo-empty");
+            }
+            // CheckProUpServTx
+            if (auto r = network_fields_refusal(p.netInfo, p.nType, p.platformNodeID, p.platformP2PPort,
+                                                p.platformHTTPPort, /*allow_empty=*/false, rules))
+                return r;
         }
-        // CheckProUpServTx
-        if (auto r = network_fields_refusal(p.netInfo, p.nType, p.platformNodeID, p.platformP2PPort,
-                                            p.platformHTTPPort, /*allow_empty=*/false, rules))
-            return r;
         const MNState* mn = find_mn(pre, p.proTxHash);
         if (!mn) return no("bad-protx-hash");
         if (p.nType != mn->nType) return no("bad-protx-type-mismatch");
-        if (mn->nVersion >= pv::EXT_ADDR)
-            return no("bad-protx-version (ExtAddr state: not checkable by this codec, excluded)");
+        if (!rules.v24_active && mn->nVersion >= pv::EXT_ADDR)
+            return no("bad-protx-version (ExtAddr state before DEPLOYMENT_V24)");
         if (auto r = version_change_refusal(mn->nVersion, p.nVersion, rules)) return r;
         if (rules.v24_active && p.nType == vendor::MnType::EVO && p.nVersion < pv::EXT_ADDR)
             return no("bad-protx-version-disallowed");
+        // v24: ApplyProUpServTx on a copy of the pre-block state (the state
+        // version raise and the netInfo conversion must succeed).
+        if (rules.v24_active) {
+            MNState copy = *mn;
+            const auto t = v24::apply_proupserv(copy, p, mn->nType, netinfo_rules_for(rules.net));
+            if (t.error) return no(*t.error);
+        }
         // v24: a legacy -> basic migration re-keys the stored operator key.
         if (rules.v24_active && mn->nVersion == pv::LEGACY_BLS && p.nVersion >= pv::BASIC_BLS
             && operator_key_held_by_other(pre, mn->pubKeyOperator, p.proTxHash))
@@ -616,19 +632,29 @@ protx_core_refusal(const Tx& tx_in, const MnStateMachine& pre, const ProTxCheckR
     case vendor::CProUpRegTx::SPECIALTX_TYPE: {
         vendor::CProUpRegTx p;
         if (!parse(tx.extra_payload, p)) return no("bad-protx-payload");
-        if (auto r = codec_version_refusal(p.nVersion)) return r;
-        if (p.nVersion > max_version(rules)) return no("bad-protx-version");
-        // CProUpRegTx::IsTriviallyValid
-        if (p.nMode != 0) return no("bad-protx-mode");
-        if (!vendor::opkey_valid_canonical(p.pubKeyOperator, p.nVersion == pv::LEGACY_BLS)
-            || p.keyIDVoting.IsNull())
-            return no("bad-protx-key-null");
-        if (auto r = payout_refusal(p.scriptPayout.m_data, uint160{}, p.keyIDVoting)) return r;
+        if (p.nVersion >= pv::EXT_ADDR) {
+            // A version-3 payload (payout list): GetValidatedPayload through
+            // the S2 payload rules (IsPayoutListTriviallyValid without the
+            // owner key, the operator key under the basic scheme).
+            if (p.nVersion > max_version(rules)) return no("bad-protx-version");
+            if (auto r = provider_payload_refusal(tx.type, tx.extra_payload, provider_rules_of(rules))) return r;
+        } else {
+            if (auto r = codec_version_refusal(p.nVersion)) return r;
+            if (p.nVersion > max_version(rules)) return no("bad-protx-version");
+            // CProUpRegTx::IsTriviallyValid
+            if (p.nMode != 0) return no("bad-protx-mode");
+            if (!vendor::opkey_valid_canonical(p.pubKeyOperator, p.nVersion == pv::LEGACY_BLS)
+                || p.keyIDVoting.IsNull())
+                return no("bad-protx-key-null");
+            if (auto r = payout_refusal(p.scriptPayout.m_data, uint160{}, p.keyIDVoting)) return r;
+        }
         // CheckProUpRegTx
         const MNState* mn = find_mn(pre, p.proTxHash);
         if (!mn) return no("bad-protx-hash");
-        if (mn->nVersion >= pv::EXT_ADDR)
-            return no("bad-protx-version (ExtAddr state: not checkable by this codec, excluded)");
+        // Shared masternodes are updated by ProUpShareTx / ProUpSharedRegTx only.
+        if (mn->v24.IsShared()) return no("bad-protx-shared-mn");
+        if (!rules.v24_active && mn->nVersion >= pv::EXT_ADDR)
+            return no("bad-protx-version (ExtAddr state before DEPLOYMENT_V24)");
         if (auto r = version_change_refusal(mn->nVersion, p.nVersion, rules)) return r;
         if (rules.v24_active) {
             const auto new_basic = vendor::opkey_to_basic(p.pubKeyOperator, p.nVersion == pv::LEGACY_BLS);
@@ -648,8 +674,24 @@ protx_core_refusal(const Tx& tx_in, const MnStateMachine& pre, const ProTxCheckR
                                                     /*allow_empty=*/true, rules))
                     return r;
             }
+            // ... and into a version-3 target through SetStateVersion (the
+            // legacy service becomes an ExtNetInfo entry; an EvoNode's
+            // scalar Platform ports cannot be carried: bad-protx-netinfo-version).
+            if (!key_changed) {
+                MNState copy = *mn;
+                if (auto e = v24::set_state_version(copy, std::max<uint16_t>(mn->nVersion, p.nVersion), mn->nType,
+                                                    v24::state_has_ext(mn->nVersion), netinfo_rules_for(rules.net)))
+                    return no(*e);
+            }
         }
-        if (auto r = payout_refusal(p.scriptPayout.m_data, mn->keyIDOwner, p.keyIDVoting)) return r;
+        const auto owner_payouts = p.owner_payouts();
+        if (p.nVersion >= pv::EXT_ADDR) {
+            if (auto r = payout_list_refusal(owner_payouts, mn->keyIDOwner, p.keyIDVoting)) return r;
+        } else if (auto r = payout_refusal(p.scriptPayout.m_data, mn->keyIDOwner, p.keyIDVoting)) {
+            return r;
+        }
+        // DEPLOYMENT_EVO_SHARES is not active under v24.0.0.
+        if (mn->nType == vendor::MnType::EVO && owner_payouts.size() > 1) return no("bad-protx-payouts-evo");
         if (!coin) return no("bad-protx-collateral (no UTXO view to prove the coin)");
         int64_t value = 0;
         std::vector<uint8_t> script;
@@ -661,6 +703,12 @@ protx_core_refusal(const Tx& tx_in, const MnStateMachine& pre, const ProTxCheckR
         if (!collateral_dest) return no("bad-protx-collateral-dest");
         if (*collateral_dest == pkh(mn->keyIDOwner) || *collateral_dest == pkh(p.keyIDVoting))
             return no("bad-protx-collateral-reuse");
+        // IsPayoutListKeySafe: from a version-3 target no payout may pay the
+        // collateral's destination.
+        if (std::max<uint16_t>(mn->nVersion, p.nVersion) >= pv::EXT_ADDR)
+            for (const auto& payout : owner_payouts)
+                if (const auto d = extract_dest(payout.scriptPayout.m_data); d && *d == *collateral_dest)
+                    return no("bad-protx-payee-reuse");
         if (inputs_hash(tx) != p.inputsHash) return no("bad-protx-inputs-hash");
         if (!ecdsa) return no("bad-protx-sig (no ECDSA verifier wired)");
         const auto h = hash_without_trailing_vchsig(tx.extra_payload, p.vchSig.size());
