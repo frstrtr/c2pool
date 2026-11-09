@@ -52,11 +52,19 @@
 - No work is built on a burn output any more. When the sharechain was busy
   (the PPLNS split at the best share could not be read) the template refresh
   paid the whole subsidy to the zero key and cached that as the split of the
-  best share; every stratum job at that share then paid it. Now the last
-  valid split is kept for the same best share, nothing is cached otherwise,
-  and the zero-key fallback is gone. An empty sharechain pays the donation
-  (p2pool's genesis rule), and `--solo` / `--custodial` pay their own split
-  (they always paid the zero key).
+  best share; every stratum job at that share then paid it. Now a split is
+  only reused for the best share, coinbase value, bits and donation it was
+  computed for (a new block or a fee change at the same best share paid the
+  old amounts: blocks rejected bad-cb-amount, or underpaid), nothing is
+  cached otherwise, and the zero-key fallback is gone. An empty sharechain
+  pays the donation (p2pool's genesis rule).
+- A redistributed share (no usable login address) and a node fee draw pay
+  the recipient's own script type: a P2SH recipient was paid
+  P2PKH(<script hash>), which nobody can spend. With no recipient the share
+  goes to the combined donation, never the zero key.
+- `--solo` and `--custodial` refuse to start: their coinbase has no
+  extranonce slot, so every block they found was invalid (bad-txnmrklroot)
+  while the miners' shares were accepted.
 - A stratum job is no longer built while the sharechain is busy: the PPLNS at
   the job's prev share or the ref_hash could not be read, and the job used
   the cached PPLNS of another best share or a null ref_hash, so its shares

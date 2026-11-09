@@ -527,10 +527,14 @@ void MiningInterface::decide_job_payout(std::vector<unsigned char>& payout_scrip
             h160 = h;
             type = t;
         } else if (fallback) {
-            h160 = fallback(std::string());
-            type = (h160 == op_h160) ? op_type : 0;
+            auto [h, t] = fallback(std::string());
+            h160 = h;
+            type = t;
         }
-        if (h160.size() == 40) {
+        // The recipient with its own script type (a hash under another type
+        // pays another address, or nobody). No recipient, the zero key or a
+        // type a share cannot carry: no payout (no share is created from it).
+        if (h160.size() == 40 && type <= 2 && h160 != std::string(40, '0')) {
             payout_script = hash160_hex_script(h160, type);
             redistributed = true;
         } else {
@@ -1424,9 +1428,12 @@ MiningInterface::build_connection_coinbase(
         ws.merkle_branches = m_cached_merkle_branches;
         ws.pplns_fn = m_pplns_fn;
         ws.ref_hash_fn = m_ref_hash_fn;
+        // Recompute unless the cached split is the one for this prev share
+        // at this template's coinbase value and bits (and this donation).
         ws.needs_pplns_recompute = !prev_share_hash.IsNull()
             && ws.pplns_fn
-            && (!m_cached_pplns_valid || prev_share_hash != ws.pplns_best_share);
+            && !cached_pplns_matches(prev_share_hash, ws.tmpl->value("coinbasevalue", uint64_t(0)),
+                                     ws.tmpl->value("bits", std::string()), ws.donation_script);
     }
     const nlohmann::json& tmpl = *ws.tmpl;  // shared and immutable: no per-session copy
     // ── m_work_mutex RELEASED ──
@@ -1442,6 +1449,7 @@ MiningInterface::build_connection_coinbase(
     // what generate_share_transaction will compute during verification.
     // (Matches p2pool's closure pattern: coinbase is frozen at template time.)
     static const char* HX = "0123456789abcdef";
+    std::vector<std::pair<std::string, uint64_t>> recomputed_split;
 
     if (prev_share_hash.IsNull())
     {
@@ -1497,6 +1505,12 @@ MiningInterface::build_connection_coinbase(
                 });
             if (found_donation) ws.pplns_outputs.push_back(donation_entry);
             ws.pplns_best_share = prev_share_hash;
+            // Script hex, whatever the cached outputs were (none, at startup:
+            // read as hash160s they would be wrapped into P2PKH garbage).
+            ws.raw_scripts = true;
+            // The split as computed, for the cache: the V35 finder fee below
+            // is this connection's own and must not reach other jobs.
+            recomputed_split = ws.pplns_outputs;
             LOG_INFO << "[build_connection_cb] PPLNS recomputed for frozen prev_share="
                      << prev_share_hash.ToString().substr(0, 16)
                      << " outputs=" << ws.pplns_outputs.size();
@@ -1789,13 +1803,20 @@ MiningInterface::build_connection_coinbase(
         std::lock_guard<std::mutex> lock(m_work_mutex);
         auto& self = const_cast<MiningInterface&>(*this);
         // Only a split recomputed for this job's prev share is cached (a valid
-        // one: an empty recompute was held above).
-        if (ws.needs_pplns_recompute && ws.pplns_best_share == prev_share_hash
-            && (ws.pplns_best_share != self.m_cached_pplns_best_share || !self.m_cached_pplns_valid)) {
-            self.m_cached_pplns_outputs = ws.pplns_outputs;
+        // one: an empty recompute was held above), keyed by what it was
+        // computed for: the prev share, this template's coinbase value and
+        // bits, the donation script.
+        const uint64_t value = tmpl.value("coinbasevalue", uint64_t(0));
+        const std::string bits_str = tmpl.value("bits", std::string());
+        if (ws.needs_pplns_recompute && ws.pplns_best_share == prev_share_hash && !recomputed_split.empty()
+            && !self.cached_pplns_matches(prev_share_hash, value, bits_str, ws.donation_script)) {
+            self.m_cached_pplns_outputs = std::move(recomputed_split);
             self.m_cached_pplns_best_share = ws.pplns_best_share;
             self.m_cached_raw_scripts = ws.raw_scripts;
             self.m_cached_pplns_valid = true;
+            self.m_cached_pplns_value = value;
+            self.m_cached_pplns_bits = bits_str;
+            self.m_cached_pplns_donation = ws.donation_script;
         }
     }
 
@@ -1922,6 +1943,7 @@ void MiningInterface::refresh_work()
         std::vector<uint8_t> mm_commitment;
         bool pplns_valid = false;   // a real split (never a burn output)
         uint256 pplns_best;         // the best share it was computed for
+        std::vector<unsigned char> pplns_donation;   // and the donation script
 
         try {
             // V36 PPLNS path: use share-tracker proportional payouts directly
@@ -1949,6 +1971,9 @@ void MiningInterface::refresh_work()
                 // ignores it, and a pool's split of an empty sharechain is the
                 // whole subsidy to the donation script (p2pool's genesis rule).
                 auto expected = m_pplns_fn(best, block_target, coinbase_value, m_donation_script);
+                // (the LTC hook sets the donation script of the share version
+                // it computed for)
+                pplns_donation = m_donation_script;
 
                 // Debug: log PPLNS distribution
                 {
@@ -2040,9 +2065,13 @@ void MiningInterface::refresh_work()
                     }
                 } else {
                     // The tracker is busy: reuse the last valid split when it is
-                    // for this same best share; else no valid split now.
+                    // for this same best share at this template's coinbase
+                    // value and bits; else no valid split now (its amounts
+                    // would not add up to this template's value).
                     std::lock_guard<std::mutex> lock(m_work_mutex);
-                    if (m_cached_pplns_valid && m_cached_pplns_best_share == best && !m_cached_pplns_outputs.empty()) {
+                    if (cached_pplns_matches(best, coinbase_value, wd.m_data.value("bits", std::string()),
+                                             m_donation_script)
+                        && !m_cached_pplns_outputs.empty()) {
                         pplns_outputs = m_cached_pplns_outputs;
                         pplns_raw_scripts = m_cached_raw_scripts;
                         pplns_valid = true;
@@ -2109,8 +2138,12 @@ void MiningInterface::refresh_work()
             cb_parts = {};
         }
 
-        note_coinbase_built(cb_parts.first, cb_parts.second, segwit_active, merkle_branches.size(),
-                            /*fresh_template=*/true, /*has_state_root=*/false);
+        // No global coinbase this refresh (no valid split): keep the last
+        // real coinbase's weight and sigops as the reserve; an empty one
+        // would reset it to nothing while the jobs' coinbases are full size.
+        if (!cb_parts.first.empty())
+            note_coinbase_built(cb_parts.first, cb_parts.second, segwit_active, merkle_branches.size(),
+                                /*fresh_template=*/true, /*has_state_root=*/false);
 
         // Compute THE state root for sharechain anchoring (both LTC and merged coinbases)
         uint32_t tmpl_h = wd.m_data.value("height", 0);
@@ -2168,9 +2201,13 @@ void MiningInterface::refresh_work()
             m_cached_raw_scripts      = pplns_raw_scripts;
             m_cached_pplns_best_share = pplns_best;
             m_cached_pplns_valid      = true;
-        } else if (m_cached_pplns_best_share != pplns_best) {
-            // No valid split for the new best share: the cached pair is
-            // another share's; jobs must not reuse it (they recompute).
+            m_cached_pplns_value      = coinbase_value;
+            m_cached_pplns_bits       = wd.m_data.value("bits", std::string());
+            m_cached_pplns_donation   = pplns_donation;
+        } else {
+            // No valid split for this best share and template: the cached
+            // pair is another share's or another template's; jobs must not
+            // reuse it (they recompute, or are held).
             m_cached_pplns_valid = false;
         }
         m_cached_witness_commitment = std::move(witness_commitment);
@@ -11727,6 +11764,17 @@ std::map<std::array<uint8_t, 20>, double> WebServer::get_local_addr_rates() cons
         auto rates = stratum_server_->get_local_addr_rates();
         for (auto& [k, v] : rates)
             result[k] = v;
+    }
+    return result;
+}
+
+std::map<std::string, double> WebServer::get_local_user_rates() const
+{
+    std::map<std::string, double> result;
+    if (stratum_server_) {
+        auto rates = stratum_server_->get_local_rates().first;
+        for (auto& [user, rate] : rates)
+            result[user] = rate;
     }
     return result;
 }

@@ -165,6 +165,10 @@ In integrated and solo modes the miner's address appears **directly in the
 coinbase** — the pool never holds the funds. Only `--custodial` routes
 everything to the operator for off-chain accounting.
 
+`--solo` and `--custodial` are disabled in this release: c2pool-ltc refuses
+to start in them (their blocks were invalid: the coinbase had no room for
+the miners' extranonce). Use the integrated (default) mode.
+
 ---
 
 ## Dashboard & explorer

@@ -464,6 +464,11 @@ c2pool has four operating modes. The default is a full P2P pool — no flags req
 | **Custodial** | `--custodial` | no | 100% to `--address` | Hosted pool, off-chain accounting |
 | **Sharechain** | `--sharechain` | yes | *(no mining)* | P2P relay node only |
 
+> **`--solo` and `--custodial` are disabled in this release:** c2pool-ltc
+> refuses to start in them. Their coinbase has no room for the miners'
+> extranonce, so every block they found was invalid while the shares were
+> accepted. Use the integrated (default) mode.
+
 Legacy `--standalone` mode (minimal stratum + RPC daemon, no embedded SPV) is available for backwards compatibility.
 
 ### DASH daemonless masternode-set checkpoint — trust anchor
@@ -535,6 +540,7 @@ procedure: [`src/impl/dash/coin/checkpoints/README.md`](src/impl/dash/coin/check
 ./c2pool --address YOUR_LTC_ADDRESS --fee 1
 
 # Solo pool for own miners (no sharechain, proportional payouts)
+# (disabled in this release: c2pool-ltc refuses to start, see above)
 ./c2pool --solo
 
 # Custodial pool (all coinbase to operator, stratum for accounting)

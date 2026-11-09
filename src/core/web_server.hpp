@@ -1529,8 +1529,11 @@ public:
     void set_rpc_submit_fallback(std::function<std::string(const std::string&)> fn);
     // Redistribute / address-fallback callback.
     // Called when a share's primary address cannot be resolved to a valid hash160.
-    // Receives the bad address string; must return a 40-char hex hash160, or "" to keep share.
-    using address_fallback_fn_t = std::function<std::string(const std::string&)>;
+    // Receives the bad address string; returns the recipient as a 40-char hex
+    // hash160 and its V36 pubkey type (0 P2PKH, 1 P2WPKH, 2 P2SH), or "" for
+    // none. The type is the recipient's own: its hash under another script
+    // type pays another address, or nobody (a script hash as P2PKH).
+    using address_fallback_fn_t = std::function<std::pair<std::string, uint8_t>(const std::string&)>;
     // Set while the stratum thread may already build jobs: under m_redistribute_mu.
     void set_address_fallback_fn(address_fallback_fn_t fn)
     {
@@ -1872,6 +1875,20 @@ private:
     // share. False while none could be computed (the tracker was busy at a new
     // best share): jobs then recompute, and never build on the cached outputs.
     bool m_cached_pplns_valid{false};
+    // What the cached split was computed for besides the best share: its
+    // amounts depend on the template's coinbase value and bits and on the
+    // donation script, so it is only reused for the same best share AND the
+    // same three (a new block or a fee change at the same best share needs a
+    // new split). Guarded by m_work_mutex.
+    uint64_t m_cached_pplns_value{0};
+    std::string m_cached_pplns_bits;
+    std::vector<unsigned char> m_cached_pplns_donation;
+    bool cached_pplns_matches(const uint256& best, uint64_t value, const std::string& bits,
+                              const std::vector<unsigned char>& donation) const
+    {
+        return m_cached_pplns_valid && m_cached_pplns_best_share == best && m_cached_pplns_value == value
+            && m_cached_pplns_bits == bits && m_cached_pplns_donation == donation;
+    }
     // Jobs not built because the sharechain was busy (CoinbaseResult::held),
     // and refreshes that found no valid PPLNS: /local_stats-free counters, logged.
     mutable std::atomic<uint64_t> m_jobs_held{0};
@@ -2723,6 +2740,10 @@ public:
     /// Matches p2pool: get_local_addr_rates() (work.py:1975-1990).
     /// Returns {pubkey_hash → hashrate (H/s)} for all connected miners.
     std::map<std::array<uint8_t, 20>, double> get_local_addr_rates() const;
+    /// Per-login hashrate (p2pool get_local_rates' first map). The login is
+    /// the miner's payout address (worker and merged parts stripped), of any
+    /// script type: --solo pays it by its own script.
+    std::map<std::string, double> get_local_user_rates() const;
 
     // Stratum server control methods
     bool start_stratum_server();

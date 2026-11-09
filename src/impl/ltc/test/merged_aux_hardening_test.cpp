@@ -2531,17 +2531,18 @@ TEST(MergedAuxNodeFee, JobPayoutIsDecidedAtJobTime)
     mi.decide_job_payout(payout, merged);
     EXPECT_EQ(payout, miner);
     EXPECT_EQ(merged, (Merged{{98, miner_doge}}));
-    // empty login: redistributed; landing on the operator: its type and merged scripts
-    std::string pick;
+    // empty login: redistributed (the recipient comes with its own type);
+    // landing on the operator: its type and merged scripts
+    std::pair<std::string, uint8_t> pick;
     mi.set_address_fallback_fn([&pick](const std::string&) { return pick; });
-    pick = h160_of(b58(50, 0x0f));
+    pick = {h160_of(b58(50, 0x0f)), 2};
     payout.clear();
     merged.clear();
     mi.decide_job_payout(payout, merged);
     EXPECT_EQ(payout, op) << "the operator's P2SH, not a P2PKH of its hash";
     EXPECT_EQ(Merged(op_merged.begin(), op_merged.end()), merged);
     // landing on a miner: its key, no merged scripts written
-    pick = h160_of(b58(48, 0x07));
+    pick = {h160_of(b58(48, 0x07)), 0};
     payout.clear();
     merged.clear();
     mi.decide_job_payout(payout, merged);
