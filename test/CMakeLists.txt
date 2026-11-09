@@ -1016,7 +1016,8 @@ if (BUILD_TESTING AND GTest_FOUND)
     # keys — rides this BLS-backend target because it signs.
     add_executable(test_dash_govvote_bls test_dash_govvote_bls.cpp
         test_dash_protx_sig_bls.cpp
-        test_dash_v24_protx_check.cpp)   # S6: Dash Core CheckPro*Tx before a provider tx rides a template
+        test_dash_v24_protx_check.cpp    # S6: Dash Core CheckPro*Tx before a provider tx rides a template
+        test_dash_v24_alltx.cpp)         # every Dash Core v24 miner tx type: MNHF (7), shared MNs (10-12), v24 fold
     target_link_libraries(test_dash_govvote_bls PRIVATE
         GTest::gtest_main GTest::gtest
         dash_bls_verify
