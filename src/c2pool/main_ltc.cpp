@@ -5137,6 +5137,12 @@ int main(int argc, char* argv[]) {
                 assert(coin_p2p->lifetime_armed() && "LTC parent-coin P2P dial lifetime failed to arm");
                 coin_p2p->connect(NetService(p2p_host, static_cast<uint16_t>(coind_p2p_port)));
                 LOG_INFO << "Parent coin P2P broadcaster connecting to " << p2p_host << ":" << coind_p2p_port;
+                // A new block the daemon's P2P link announces refreshes the
+                // template at once (besides the 2 s getblocktemplate poll and
+                // the sharechain peers' bestblock).
+                coin_node.new_block.subscribe([&web_server](const uint256& block_hash) {
+                    web_server.refresh_on_parent_block(block_hash);
+                });
             }
 
             // Phase 1c: Whale departure detector (needs to be visible to ref_hash lambda)

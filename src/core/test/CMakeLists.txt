@@ -162,6 +162,11 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
     # is counted in /local_stats template_refresh; every session's job of a
     # generation shares one tx-hex vector (measured). Same fold-into-core_test
     # reasoning as every TU here.
+    # web_server_rpc_refresh_test.cpp: the coin daemon's template refresh
+    # over RPC (one-shot fetch + the --no-embedded getblocktemplate poll) is
+    # armed for a coin node attached after start() (c2pool-ltc starts its web
+    # server first), once, and not for an embedded node. Same fold-into-
+    # core_test reasoning as every TU here.
     # web_server_utxo_scan_test.cpp: GET /api/utxo/scan's web-server half (the
     # dedicated scan thread, one at a time, the interval, the wait cap, the
     # direct-local gate). Same fold-into-core_test reasoning as every TU here.
@@ -231,6 +236,7 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
         web_server_merged_drop_test.cpp
         web_server_mweb_hogex_test.cpp
         web_server_relay_block_test.cpp
+        web_server_rpc_refresh_test.cpp
         web_server_submitblock_test.cpp
         web_server_utxo_scan_test.cpp
         web_server_worker_liveness_test.cpp

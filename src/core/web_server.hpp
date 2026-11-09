@@ -2636,6 +2636,8 @@ class WebServer
     uint16_t port_;
     uint16_t stratum_port_;  // Explicit Stratum port configuration
     bool running_;
+    bool rpc_refresh_armed_{false};
+    uint256 last_parent_block_;   // refresh_on_parent_block dedup
     bool testnet_;
     Blockchain blockchain_;
     // Live HTTP sessions and their cap (0: unlimited), from the node's fd
@@ -2740,6 +2742,14 @@ public:
     // Use for time-critical events (new LTC block). `cause` is what
     // /local_stats template_refresh.by_cause counts it under.
     void trigger_work_refresh(core::RefreshCause cause = core::RefreshCause::block);
+    // The coin daemon template refresh over RPC: a one-shot fetch and, in
+    // --no-embedded mode, a 2 s getblocktemplate poll. Armed once, by
+    // start() or by set_coin_node() when the node is attached later.
+    void arm_rpc_template_refresh();
+    // A new block from the parent coin daemon's own P2P link (RPC mode,
+    // coin_node.new_block): refresh the template at once, once per block hash
+    // (the link announces a block by inv and again by the block itself).
+    void refresh_on_parent_block(const uint256& block_hash);
     // Debounced variant: coalesces rapid-fire calls (share arrivals) into one
     // refresh after 300 ms, gated on a sharechain tip change. Matches
     // p2pool's Twisted reactor tick coalescing.
