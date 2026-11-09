@@ -24,9 +24,10 @@
 /// Scope of this port: every payload version of types 2-4 (version 3 payloads
 /// through the S2 payload rules of v24_rules.hpp, plus CheckProUpServTx's
 /// ApplyProUpServTx dry run, CheckProUpRegTx's shared refusal, payout list
-/// and SetStateVersion dry run); type 1 at versions 1 and 2 only: a
-/// version-3 ProRegTx (ExtAddr, every shared registration) is refused (its
-/// share consent signatures and payout-list sign string are not ported). The
+/// and SetStateVersion dry run); type 1 at every version: a version-3
+/// ProRegTx (ExtAddr, every shared registration) with its payout-list sign
+/// string (MakeSignString) or every share owner's consent signature over
+/// MakeSharedRegConsentHash (proreg_v3_refusal). The
 /// v24 provider types 10-12 are checked in full (CheckProDisTx,
 /// CheckProUpShareTx, CheckProUpSharedRegTx, specialtxman.cpp:1625-1875):
 /// the payload rules through v24_rules.hpp provider_payload_refusal
@@ -491,6 +492,150 @@ inline v24::ProDisTarget prodis_target_of(const MNState& st)
     return t;
 }
 
+/// CProRegTx::MakeSharedRegConsentHash (providertx.cpp:380-418): the digest
+/// every share owner signs (vchJoinSigs) - the domain tag, the payload
+/// version, the tx's version, type and lock time, its inputs hash and
+/// sequences, its outputs hash, then the registrar configuration, the share
+/// table and the penalty terms.
+template <typename Tx>
+inline uint256 shared_reg_consent_hash(const Tx& tx, const vendor::CProRegTx& p)
+{
+    static constexpr std::string_view kTag{"DashSharedMNReg"};
+    ::PackStream s;
+    WriteCompactSize(s, kTag.size());
+    s.write(std::as_bytes(std::span{kTag.data(), kTag.size()}));
+    s << p.nVersion;
+    s << static_cast<uint16_t>(tx.version & 0xFFFF);   // CTransaction::nVersion (int16)
+    s << tx.type;
+    s << tx.locktime;
+    s << inputs_hash(tx);
+    for (const auto& in : tx.vin) s << in.sequence;
+    {
+        ::PackStream outs;   // CalcTxOutputsHash
+        for (const auto& out : tx.vout) outs << out;
+        auto sp = outs.get_span();
+        s << sha256d(reinterpret_cast<const uint8_t*>(sp.data()), sp.size());
+    }
+    s << p.nType;
+    s << p.nMode;
+    if (p.nVersion >= vendor::ProTxVersion::EXT_ADDR) s << p.extNetInfo; else s << p.netInfo;
+    if (p.nType == vendor::MnType::EVO) s << p.platformNodeID;
+    s << p.keyIDVoting;
+    s.write(std::as_bytes(std::span{p.pubKeyOperator.data(), p.pubKeyOperator.size()}));
+    s << p.nOperatorReward;
+    s << static_cast<uint8_t>(p.shares.size());
+    for (const auto& sh : p.shares) s << sh;
+    s << p.nEarlyPeriodBlocks;
+    s << p.nEarlyPenalty;
+    auto sp = s.get_span();
+    return sha256d(reinterpret_cast<const uint8_t*>(sp.data()), sp.size());
+}
+
+/// EncodeDestination of a P2PKH / P2SH script, else HexStr (PayoutListToString).
+inline std::string dest_or_hex(const std::vector<uint8_t>& script, const ProTxCheckRules& rules)
+{
+    if (is_p2pkh(script) || is_p2sh(script))
+        return core::script_to_address(script, "", rules.pkh_version(), rules.p2sh_version());
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string out;
+    for (uint8_t b : script) {
+        out.push_back(kHex[b >> 4]);
+        out.push_back(kHex[b & 15]);
+    }
+    return out;
+}
+
+/// PayoutListToString(MasternodePayoutShares) (providertx_util.cpp:24-34).
+inline std::string payout_list_to_string(const vendor::MasternodePayoutShares& payouts, const ProTxCheckRules& rules)
+{
+    std::string ret;
+    for (const auto& p : payouts) {
+        if (!ret.empty()) ret += ",";
+        ret += dest_or_hex(p.scriptPayout.m_data, rules) + ":" + std::to_string(p.reward);
+    }
+    return ret;
+}
+
+/// CheckProRegTx for a version-3 payload (ExtAddr; every shared
+/// registration), specialtxman.cpp:1208-1384, with the payload rules of
+/// v24_rules.hpp (GetValidatedPayload, the v24 version rules, the EvoNode
+/// share rules, CheckProviderNetworkFields over ExtNetInfo). The masternode
+/// list uniqueness rules (netInfo entries, owner and share owner keys,
+/// operator key, platformNodeID) are the template fold's, over the pre-block
+/// list and the body.
+template <typename Tx>
+inline Refusal proreg_v3_refusal(const Tx& tx, const vendor::CProRegTx& p, const MnStateMachine& pre,
+                                 const ProTxCheckRules& rules, const ProTxCoinFn& coin,
+                                 const ProTxEcdsaVerifyFn& ecdsa)
+{
+    if (auto r = provider_payload_refusal(vendor::CProRegTx::SPECIALTX_TYPE, tx.extra_payload,
+                                          provider_rules_of(rules)))
+        return r;
+    const int64_t want = p.nType == vendor::MnType::EVO ? kCollateralEvo : kCollateralRegular;
+    std::optional<Dest> collateral_dest;
+    const bool external = !p.collateralOutpoint.hash.IsNull();
+    if (external) {
+        if (!coin) return no("bad-protx-collateral (no UTXO view to prove the coin)");
+        int64_t value = 0;
+        std::vector<uint8_t> script;
+        const auto proof = coin(p.collateralOutpoint, value, script);
+        if (proof == ProTxCoinProof::Unknown) return no("bad-protx-collateral (the UTXO view cannot prove the coin)");
+        if (proof == ProTxCoinProof::Absent || value != want) return no("bad-protx-collateral");
+        collateral_dest = extract_dest(script);
+        if (!collateral_dest) return no("bad-protx-collateral-dest");
+        if (collateral_dest->kind != Dest::PKH) return no("bad-protx-collateral-pkh");
+    } else {
+        if (p.collateralOutpoint.index >= tx.vout.size()) return no("bad-protx-collateral-index");
+        const auto& out = tx.vout[p.collateralOutpoint.index];
+        if (out.value != want) return no("bad-protx-collateral");
+        if (p.IsShared()) {
+            if (!v24::is_shared_collateral_script(out.scriptPubKey.m_data))
+                return no("bad-protx-shares-collateral-script");
+        } else {
+            collateral_dest = extract_dest(out.scriptPubKey.m_data);
+            if (!collateral_dest) return no("bad-protx-collateral-dest");
+        }
+    }
+    // IsPayoutListKeySafe (version 3: no payout may pay the collateral key).
+    if (!p.IsShared()) {
+        if (*collateral_dest == pkh(p.keyIDOwner) || *collateral_dest == pkh(p.keyIDVoting))
+            return no("bad-protx-collateral-reuse");
+        for (const auto& po : p.payouts) {
+            const auto d = extract_dest(po.scriptPayout.m_data);
+            if (d && *d == *collateral_dest) return no("bad-protx-payee-reuse");
+        }
+    }
+    if (rules.v24_active
+        && operator_key_held_by_other(pre, vendor::opkey_to_basic(p.pubKeyOperator, /*legacy=*/false), uint256{}))
+        return no("bad-protx-dup-key (operator key under another scheme)");
+    if (inputs_hash(tx) != p.inputsHash) return no("bad-protx-inputs-hash");
+    if (external) {
+        // CheckStringSig over MakeSignString: the payout list, the operator
+        // reward, the owner and voting addresses, the payload hash.
+        if (!ecdsa) return no("bad-protx-sig (no ECDSA verifier wired)");
+        const auto h = hash_without_trailing_vchsig(tx.extra_payload, p.vchSig.size());
+        if (!h) return no("bad-protx-sig");
+        const std::string sign_string = payout_list_to_string(p.payouts, rules)
+                                      + "|" + std::to_string(p.nOperatorReward)
+                                      + "|" + encode_pkh(p.keyIDOwner, rules.pkh_version())
+                                      + "|" + encode_pkh(p.keyIDVoting, rules.pkh_version())
+                                      + "|" + h->GetHex();
+        if (!ecdsa(message_hash(sign_string), p.vchSig, collateral_dest->hash)) return no("bad-protx-sig");
+        return std::nullopt;
+    }
+    if (!p.vchSig.empty()) return no("bad-protx-sig");
+    if (p.IsShared()) {
+        // Every share owner consents to the exact funding inputs, outputs,
+        // share table, penalty terms and registrar configuration.
+        if (p.vchJoinSigs.size() != p.shares.size()) return no("bad-protx-shares-sig");
+        const uint256 consent = shared_reg_consent_hash(tx, p);
+        for (size_t i = 0; i < p.shares.size(); ++i)
+            if (!verify_hash_canonical(ecdsa, consent, p.vchJoinSigs[i], p.shares[i].keyIDOwner))
+                return no("bad-protx-shares-sig");
+    }
+    return std::nullopt;
+}
+
 } // namespace protx_check_detail
 
 /// The first reason Dash Core v24 refuses this provider tx for a block built
@@ -510,6 +655,7 @@ protx_core_refusal(const Tx& tx_in, const MnStateMachine& pre, const ProTxCheckR
     case vendor::CProRegTx::SPECIALTX_TYPE: {
         vendor::CProRegTx p;
         if (!parse(tx.extra_payload, p)) return no("bad-protx-payload");
+        if (p.nVersion >= pv::EXT_ADDR || p.IsShared()) return proreg_v3_refusal(tx, p, pre, rules, coin, ecdsa);
         if (auto r = codec_version_refusal(p.nVersion)) return r;
         if (p.nVersion > max_version(rules)) return no("bad-protx-version");
         // CProRegTx::IsTriviallyValid

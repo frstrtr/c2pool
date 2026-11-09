@@ -108,6 +108,8 @@
 #include <impl/dash/coin/mempool_ingest.hpp>     // wire_mempool_ingest (leg 1)
 #include <impl/dash/coin/tip_ingest.hpp>         // wire_tip_ingest (leg 2)
 #include <impl/dash/coin/deployment_status.hpp>  // Dash Core v24 deployment tracking (EHF + versionbits)
+#include <impl/dash/coin/v24_activation.hpp>     // the v24 activation height into the folds
+#include <impl/dash/coin/mnhf_node_env.hpp>      // Dash Core CheckMNHFTx inputs from the node
 #include <impl/dash/coin/credit_pool_lane.hpp>   // Dash Core v24 credit-pool follower (UnlockLimitV24, unlock admission)
 #include <impl/dash/coin/protx_ecdsa.hpp>        // CHashSigner::VerifyHash for the provider-tx checks
 #include <impl/dash/coin/embedded_oracle_shadow.hpp> // dash::coin::EmbeddedOracleShadow — per-block dashd cross-check (OBSERVE-only)
@@ -5574,6 +5576,9 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // status reads is destroyed (members below are destroyed first).
     std::shared_ptr<dash::coin::EhfSignalTracker>     ehf_tracker;
     std::shared_ptr<dash::coin::DashDeploymentStatus> v24_status;
+    // The v24 activation height from the tracking into the payee projection
+    // and the replay folds (v24_activation.hpp), persisted (<net>/v24_activation.v1).
+    std::shared_ptr<dash::coin::V24ActivationWire>    v24_wire;
     std::unique_ptr<dash::coin::EhfRescanLane>        ehf_rescan;
     std::string                                       ehf_path;
     // Credit-pool follower (#143 / Dash Core v24 UnlockLimitV24): the store
@@ -8210,6 +8215,21 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             node_coin_state.set_v24_state_fn(
                 [st = v24_status](uint32_t h) { return st->v24_state(h); });
             node_coin_state.set_v24_network(v24_net);
+            // The activation height from this tracking, on every network
+            // (testnet's buried 1,578,000 at once; mainnet once LOCKED_IN, a
+            // window before activation), into the payee projection here and
+            // into each replay fold where it is built. Refreshed on every
+            // ordered block (ahead of the maintainer's fold of that block),
+            // persisted so a restart after activation has it before the EHF
+            // rescan completes. Each fold also checks every block's CbTx
+            // version against it (v24_activation.hpp).
+            v24_wire = std::make_shared<dash::coin::V24ActivationWire>(
+                v24_net,
+                [st = v24_status]() { return st->activation_height(dash::coin::DashDeployment::V24); },
+                (core::filesystem::config_path() / net_subdir / "v24_activation.v1").string());
+            v24_wire->add_sink([&node_coin_state](uint32_t h) { node_coin_state.mnstates().set_v24_height(h); });
+            v24_wire->load();
+            v24_wire->refresh();
             // Dash Core's CheckMNHFTx for the type-7 signals our templates
             // carry (mnhf_check.hpp; selected under
             // --embedded-include-mn-special-txs): the quorum block on our
@@ -8219,32 +8239,14 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             {
                 auto alive = std::make_shared<std::atomic<bool>>(true);
                 v24_status_uninstall.chain_alive = alive;
-                dash::coin::MnhfCheckEnv me;
-                me.net = v24_net;
-                me.chain_height_of = [hc = header_chain.get(), alive](const uint256& h, uint32_t prev_height)
-                    -> std::optional<uint32_t> {
-                    if (!alive->load()) return std::nullopt;
-                    const auto e = hc->get_header(h);
-                    if (!e || e->height > prev_height) return std::nullopt;
-                    const auto main = hc->get_header_by_height(e->height);
-                    if (!main || main->hash != h) return std::nullopt;
-                    return e->height;
-                };
-                me.quorum_public_key = [&node_coin_state](uint8_t type, const uint256& q)
-                    -> std::optional<std::array<uint8_t, 48>> {
-                    const auto c = std::as_const(node_coin_state).qmgr().find(type, q);
-                    if (!c) return std::nullopt;
-                    return c->quorumPublicKey;
-                };
-                me.verify_sig = [](const std::array<uint8_t, 48>& pk, const uint256& h,
-                                   const std::array<uint8_t, 96>& sig) {
-                    return dash::coin::vendor::verify_chainlock_sig(pk, h, sig);
-                };
-                me.bit_staged = [t = ehf_tracker](uint8_t bit, uint32_t prev) -> std::optional<bool> {
-                    if (!t->covers(prev) || t->verified_coverage() < static_cast<int64_t>(prev))
-                        return std::nullopt;
-                    return t->signal_height(bit, prev) != dash::coin::kNoSignalHeight;
-                };
+                auto me = dash::coin::make_node_mnhf_check_env(
+                    v24_net, header_chain.get(), std::shared_ptr<const dash::coin::EhfSignalTracker>(ehf_tracker),
+                    std::shared_ptr<const std::atomic<bool>>(alive),
+                    [&node_coin_state](uint8_t type, const uint256& q) -> std::optional<std::array<uint8_t, 48>> {
+                        const auto c = std::as_const(node_coin_state).qmgr().find(type, q);
+                        if (!c) return std::nullopt;
+                        return c->quorumPublicKey;
+                    });
                 node_coin_state.set_mnhf_check_env(std::move(me));
             }
             // Testnet min-difficulty rules (Dash Core DarkGravityWave with
@@ -8275,7 +8277,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             // word is read directly, no CbTx codec needed).
             ehf_ordered_sink =
                 [t = ehf_tracker, st = v24_status, path = ehf_path, &cp_lane, latch_path,
-                 latch_seen = std::make_shared<uint64_t>(v24_status->latch_version())](
+                 latch_seen = std::make_shared<uint64_t>(v24_status->latch_version()),
+                 wire = v24_wire](
                     const dash::interfaces::BlockConnected& bc) {
                     auto packed = ::pack(static_cast<const dash::coin::BlockHeaderType&>(bc.block));
                     const uint256 h = dash::crypto::hash_x11(packed.get_span());
@@ -8307,6 +8310,10 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                                  << " (EHF stage: " << t->signals().size() << " signal(s))";
                     if (t->dirty() && !t->save(path))
                         LOG_WARNING << "[DASH-V24] could not persist " << path;
+                    // The activation height, once known, reaches the folds
+                    // before the maintainer folds this block (this is the
+                    // ordered stream's first sink).
+                    if (wire) wire->refresh();
                 };
             // Cold-start rescan: fetch [next needed, live floor - 1]. The live
             // floor is the payee cursor + 1 (the tip-follow path fetches from
@@ -9510,6 +9517,10 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                         fcfg.gates = rp::FoldGates::testnet();
                     mn_bridge_fold_engine =
                         std::make_unique<rp::DmlFoldEngine>(fcfg);
+                    if (v24_wire)
+                        v24_wire->add_sink([&mn_bridge_fold_engine](uint32_t h) {
+                            if (mn_bridge_fold_engine) mn_bridge_fold_engine->set_v24_height(h);
+                        });
                     mn_diff_writer = std::make_unique<rp::MnDiffWriter>(
                         *mn_diff_store, *mn_bridge_fold_engine);
 
@@ -10046,6 +10057,10 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     fcfg.gates = dash::coin::replay::FoldGates::testnet();
                 replay_fold_engine =
                     std::make_unique<rp::DmlFoldEngine>(fcfg);
+                if (v24_wire)
+                    v24_wire->add_sink([&replay_fold_engine](uint32_t h) {
+                        if (replay_fold_engine) replay_fold_engine->set_v24_height(h);
+                    });
                 const std::string serr =
                     rp::seed_engine_from_prestate(*replay_fold_engine, ps);
                 if (!serr.empty()) {

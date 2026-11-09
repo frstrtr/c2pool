@@ -90,6 +90,7 @@
 #include <impl/dash/coin/mn_state_db.hpp>
 #include <impl/dash/coin/tx_version_rules.hpp>      // ContextualCheckTransaction (v23.1.9)
 #include <impl/dash/coin/v24_state.hpp>             // Dash Core v24 state transitions
+#include <impl/dash/coin/v24_activation.hpp>        // the v24 switch of a mined block
 #include <impl/dash/coin/vendor/providertx.hpp>
 #include <impl/dash/coin/vendor/bls_verify.hpp>   // opkey_to_basic — canonical-BASIC store contract (#154 legacy<->basic ProUpReg)
 #include <impl/dash/coin/vendor/simplifiedmns.hpp>
@@ -492,7 +493,9 @@ public:
     /// leaves blocks in between unchecked, never refuses a valid one.
     void set_dip0003_height(uint32_t h) { m_dip0003_height = h; }
     /// DEPLOYMENT_V24 activation height (first block with the v24 rules) and
-    /// the chain's netInfo rules (SetStateVersion conversions).
+    /// the chain's netInfo rules (SetStateVersion conversions). The node
+    /// pushes the height from its deployment tracking (V24ActivationWire);
+    /// apply_block checks every block's CbTx version against it.
     void set_v24_height(uint32_t h) { m_v24_height = h; }
     void set_netinfo_rules(const vendor::NetInfoRules& r) { m_netinfo_rules = r; }
     uint32_t v24_height() const { return m_v24_height; }
@@ -1328,6 +1331,28 @@ public:
                         << " block(s) never folded) — apply refused"
                            " (fail closed, re-seed required)";
             return r;
+        }
+
+        // Dash Core v24 switch for THIS block (v24_activation.hpp): the
+        // activation height the deployment tracking pushed, checked against
+        // the CbTx version the block states (4 exactly when v24 is active).
+        // A contradiction refuses the block before any mutation; with no
+        // height pushed yet, the block's own statement decides and its height
+        // is adopted (v24 is monotone).
+        {
+            const auto sw = v24_block_switch(height, m_v24_height, block_cbtx_version(block));
+            if (sw.contradiction) {
+                r.refused = *sw.contradiction;
+                r.total_after = m_entries.size();
+                LOG_WARNING << "[MNS-SM] block h=" << height << " REFUSED: " << r.refused
+                            << " — apply skipped, cursor stays at h=" << m_last_applied_height;
+                return r;
+            }
+            if (sw.learned) {
+                m_v24_height = height;
+                LOG_INFO << "[MNS-SM] Dash Core v24 is active from h=" << height
+                         << " (the block's CbTx version 4; no activation height was pushed)";
+            }
         }
 
         // Consensus pre-scan (v23.1.9 port), BEFORE any mutation: a block
@@ -2235,10 +2260,12 @@ private:
     // ContextualCheckTransaction gate (set_dip0003_height). Mainnet default.
     uint32_t m_dip0003_height{1028160};
 
-    // DEPLOYMENT_V24 (set_v24_height): never by default (mainnet not locked
-    // in); S0's tracker sets it, testnet is 1,578,000. Below it every path is
-    // the pre-v24 one, unchanged.
-    uint32_t m_v24_height{std::numeric_limits<uint32_t>::max()};
+    // DEPLOYMENT_V24 (set_v24_height): unknown by default; the node's
+    // deployment tracking pushes it (V24ActivationWire, every network:
+    // testnet's buried 1,578,000, mainnet once LOCKED_IN), or a block's CbTx
+    // version 4 sets it (apply_block). Below it every path is the pre-v24
+    // one, unchanged.
+    uint32_t m_v24_height{kV24HeightUnknown};
     vendor::NetInfoRules m_netinfo_rules{vendor::NetInfoRules::mainnet()};
 
     /// The block-level rejects apply_block mirrors, as dashd's reject reason

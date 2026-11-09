@@ -33,6 +33,7 @@
 #include <impl/dash/coin/sml_special_fold.hpp>  // template-side types 1-4 MN-list fold (merkleRootMNList parity)
 #include <impl/dash/coin/protx_check.hpp>       // Dash Core CheckPro*Tx for template selection
 #include <impl/dash/coin/mnhf_check.hpp>        // Dash Core CheckMNHFTx for type-7 signals
+#include <impl/dash/coin/service_update_order.hpp>  // Dash Core: service updates before a key change
 #include <impl/dash/coin/sml_pose_fold.hpp>     // serve-time PoSe pass over the body's type-6 commitments
 #include <impl/dash/coin/mempool.hpp>
 #include <impl/dash/coin/inject_ride_log.hpp>  // S2: per-build inject RIDES / HELD lines
@@ -386,6 +387,80 @@ inline PinSpliceReport splice_pinned_txs(DashWorkData& w,
     for (const auto& pin : pins)
         verdicts.push_back(pin_gate_verdict(pin, mempool, mnstates, w.m_height));
     return splice_verdicted_pins(w, pins, verdicts, arm, enforce_block_budget);
+}
+
+/// GetKeyChangeTarget (txmempool.cpp) against the masternode list at the tip:
+/// the masternode a ProUpRegTx / ProUpSharedRegTx gives a different operator
+/// key (CBLSLazyPublicKey equality is point equality, so a re-encoding of the
+/// held key is no change; the store is canonical basic), or a ProUpRevTx
+/// revokes a held key from.
+inline std::optional<uint256> template_key_change_target(const MutableTransaction& tx,
+                                                         const MnStateMachine& mnstates)
+{
+    if (!tx_has_extra_payload(tx.version, tx.type)) return std::nullopt;
+    auto changes = [&](const uint256& pro, const std::array<uint8_t, vendor::BLS_PUBKEY_SIZE>& wire, bool legacy) {
+        const auto it = mnstates.entries().find(pro);
+        return it != mnstates.entries().end() && vendor::opkey_to_basic(wire, legacy) != it->second.pubKeyOperator;
+    };
+    if (tx.type == vendor::CProUpRegTx::SPECIALTX_TYPE) {
+        vendor::CProUpRegTx p;
+        if (!vendor::parse_protx_payload(tx.extra_payload, p)) return std::nullopt;
+        if (changes(p.proTxHash, p.pubKeyOperator, p.nVersion < vendor::ProTxVersion::BASIC_BLS)) return p.proTxHash;
+    } else if (tx.type == vendor::CProUpSharedRegTx::SPECIALTX_TYPE) {
+        vendor::CProUpSharedRegTx p;
+        if (!vendor::parse_protx_payload(tx.extra_payload, p)) return std::nullopt;
+        if (changes(p.proTxHash, p.pubKeyOperator, /*legacy=*/false)) return p.proTxHash;
+    } else if (tx.type == vendor::CProUpRevTx::SPECIALTX_TYPE) {
+        vendor::CProUpRevTx p;
+        if (!vendor::parse_protx_payload(tx.extra_payload, p)) return std::nullopt;
+        const auto it = mnstates.entries().find(p.proTxHash);
+        if (it != mnstates.entries().end()
+            && std::any_of(it->second.pubKeyOperator.begin(), it->second.pubKeyOperator.end(),
+                           [](uint8_t b) { return b != 0; }))
+            return p.proTxHash;
+    }
+    return std::nullopt;
+}
+
+/// Apply order_service_updates (service_update_order.hpp) to the selected
+/// body: reorder it, and leave out (fee follows) what Dash Core's miner would.
+template <typename Fees>
+void order_template_service_updates(std::vector<Mempool::SelectedTx>& selected, Fees& total_fees,
+                                    const MnStateMachine& mnstates, uint32_t height)
+{
+    bool any_service = false, any_key_change = false;
+    std::vector<ServiceOrderTx> body;
+    body.reserve(selected.size());
+    for (const auto& s : selected) {
+        ServiceOrderTx o;
+        o.txid = dash::coin::dash_txid(s.tx);
+        for (const auto& in : s.tx.vin) o.spends.push_back(in.prevout.hash);
+        o.key_change_of = template_key_change_target(s.tx, mnstates);
+        if (s.tx.type == vendor::CProUpServTx::SPECIALTX_TYPE && tx_has_extra_payload(s.tx.version, s.tx.type)) {
+            vendor::CProUpServTx p;
+            if (vendor::parse_protx_payload(s.tx.extra_payload, p)) o.service_update_of = p.proTxHash;
+        }
+        o.unorderable_kind = tx_has_extra_payload(s.tx.version, s.tx.type)
+                          && (s.tx.type == vendor::MNHFTxPayload::SPECIALTX_TYPE || s.tx.type == 8 || s.tx.type == 9);
+        any_service = any_service || o.service_update_of.has_value();
+        any_key_change = any_key_change || o.key_change_of.has_value();
+        body.push_back(std::move(o));
+    }
+    if (!any_service || !any_key_change) return;
+    const ServiceOrderResult r = order_service_updates(body);
+    if (r.moved == 0 && r.dropped.empty()) return;
+    for (const auto& [i, why] : r.dropped) {
+        total_fees -= selected[i].fee;
+        LOG_WARNING << "[GBT-EMB] excluding tx " << body[i].txid.GetHex().substr(0, 16) << " from template h=" << height
+                    << ": " << why << " (Dash Core puts a service update before the key change or leaves it out)";
+    }
+    std::vector<Mempool::SelectedTx> out;
+    out.reserve(r.order.size());
+    for (size_t i : r.order) out.push_back(std::move(selected[i]));
+    selected = std::move(out);
+    if (r.moved > 0)
+        LOG_INFO << "[GBT-EMB] h=" << height << ": moved " << r.moved
+                 << " tx(s) of pending service updates in front of an operator key change (Dash Core order)";
 }
 
 /// The ONE MnFoldContext both the template builder and the NodeCoinState emit
@@ -880,6 +955,11 @@ inline DashWorkData build_embedded_workdata(
     }
     std::optional<vendor::CSimplifiedMNList> mn_folded_sml;
     if (special_mask.allow_mn_types && sml != nullptr) {
+        // Dash Core's miner never puts a ProUpServTx after a key change of
+        // its masternode in one block (service_update_order.hpp): it pulls
+        // the update in front, or leaves it out. Before the fold, so the
+        // root is the root of the order served.
+        order_template_service_updates(selected, total_fees, mnstates, prev_height + 1);
         auto proj_for_fold = project_sml_confirmations(
             *sml, prev_height, prev_hash, mnstates, mn_min_confirmations);
         // dashd order: the type-6 PoSe pass precedes the provider txs.

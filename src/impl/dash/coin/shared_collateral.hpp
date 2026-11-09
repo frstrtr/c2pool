@@ -9,10 +9,11 @@
 /// collateral of a shared v3 ProRegTx, and a spend of it only from a ProDisTx.
 /// Before v24 such outputs and spends are nonstandard.
 ///
-/// Our templates carry neither shared registrations nor ProDisTx (the codec
-/// is v1/v2 and the selection mask admits provider types 1-4 only), so the
-/// selection rule is simply: a tx that pays or spends the template never
-/// rides, at any height. Matching is exact-script comparison.
+/// Selection (mempool.hpp): a tx paying the template rides only as a shared
+/// registration whose collateral output it is, and a tx spending it only as
+/// a ProDisTx, both only under v24 with the provider fold armed (the Dash
+/// Core checks and the v24 fold decide them there). Matching is exact-script
+/// comparison.
 
 #include <array>
 #include <cstdint>

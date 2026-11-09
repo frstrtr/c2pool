@@ -18,6 +18,10 @@
 #include <impl/dash/coin/block.hpp>
 #include <impl/dash/coin/block_producer.hpp>
 #include <impl/dash/coin/header_chain.hpp>
+#include <impl/dash/coin/mn_state_machine.hpp>
+#include <impl/dash/coin/replay_fold_engine.hpp>
+#include <impl/dash/coin/v24_activation.hpp>
+#include <impl/dash/coin/vendor/cbtx.hpp>
 #include <impl/dash/crypto/hash_x11.hpp>
 
 #include <core/hash.hpp>
@@ -26,6 +30,8 @@
 #include <gtest/gtest.h>
 
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <map>
 #include <memory>
 #include <random>
@@ -1427,4 +1433,259 @@ TEST(DashV24Deployments, CrossCheckLatchSurvivesARestart)
     other.set_v24_activation_override(70);
     ASSERT_TRUE(other.deserialize_latch(prec));
     EXPECT_FALSE(other.pin_refuted()) << "a different pin is a new operator decision";
+}
+
+
+// ── The activation height into the folds (v24_activation.hpp) ──────────────
+// A synthetic chain on MAINNET parameters: the EHF signal for bit 13 is mined
+// at 2,569,000 (after the November 9 start time), the window 2,572,416..
+// 2,576,447 signals, so v24 is LOCKED_IN at 2,576,448 and ACTIVE at
+// 2,580,480 -- the earliest mainnet activation.
+namespace {
+
+constexpr uint32_t kMainSignal = 2'569'000;
+constexpr uint32_t kMainLockIn = 2'576'448;
+constexpr uint32_t kMainActive = 2'580'480;
+
+struct MainnetActivationWorld
+{
+    SynthChain c;
+    DashDeploymentParams p = dash_deployment_params(DashNetwork::MAINNET);
+    std::shared_ptr<EhfSignalTracker> t;
+    uint32_t tip{0};
+    std::unique_ptr<DashDeploymentStatus> st;
+
+    MainnetActivationWorld()
+    {
+        c.t0 = 1'794'182'400u - 150u * 2'568'500u;   // MTP reaches the start time near 2,568,505
+        c.tip = kMainActive + 300;
+        c.signal_range(kMainLockIn - 4032, kMainLockIn - 1);
+        t = std::make_shared<EhfSignalTracker>(p, c.fn());
+        st = std::make_unique<DashDeploymentStatus>(p, c.fn(), [this] { return std::optional<uint32_t>(tip); }, t);
+    }
+    /// Scan bodies up to `h` and move the tip there.
+    void advance(uint32_t h)
+    {
+        for (uint32_t x = t->next_needed_height(); x <= h; ++x) {
+            std::vector<MutableTransaction> extra;
+            if (x == kMainSignal) extra.push_back(mnhf_tx(13));
+            ASSERT_TRUE(t->connect_block(block_at(c, x, extra), x, c.at(x)->hash)) << x;
+        }
+        tip = h;
+    }
+    V24ActivationWire::HeightFn height_fn()
+    {
+        return [this] { return st->activation_height(DashDeployment::V24); };
+    }
+};
+
+/// A mined block on top of `prev` whose coinbase states CbTx `version`.
+BlockType cbtx_block(uint32_t height, const uint256& prev, uint16_t version)
+{
+    vendor::CCbTx cb;
+    cb.nVersion = version;
+    cb.nHeight = static_cast<int32_t>(height);
+    MutableTransaction tx;
+    tx.version = 3;
+    tx.type = 5;
+    bitcoin_family::coin::TxIn in;
+    in.prevout.hash.SetNull();
+    in.prevout.index = 0xffffffff;
+    in.sequence = 0xffffffff;
+    tx.vin.push_back(in);
+    auto ps = ::pack(cb);
+    auto sp = ps.get_span();
+    tx.extra_payload.assign(reinterpret_cast<const unsigned char*>(sp.data()),
+                            reinterpret_cast<const unsigned char*>(sp.data()) + sp.size());
+    BlockType b;
+    b.m_version = 0x20000000;
+    b.m_previous_block = prev;
+    b.m_timestamp = 1'800'000'000 + height;
+    b.m_bits = 0x1e0fffff;
+    b.m_nonce = height;
+    b.m_txs.push_back(tx);
+    return b;
+}
+
+replay::FoldConfig mainnet_fold_cfg()
+{
+    replay::FoldConfig cfg;
+    cfg.enabled = true;   // mainnet gates; v24 height unknown until pushed or learned
+    cfg.gates.dip0003_enforcement_height = std::numeric_limits<int32_t>::max();   // no payee axis here
+    return cfg;
+}
+
+std::string temp_path(const char* tag)
+{
+    return (std::filesystem::temp_directory_path()
+            / ("c2pool-v24-activation-" + std::string(tag) + "-" + std::to_string(std::random_device{}()) + ".v1"))
+        .string();
+}
+
+} // namespace
+
+TEST(DashV24Activation, HeightReachesTheFoldsAWindowBeforeActivation)
+{
+    MainnetActivationWorld w;
+    const std::string path = temp_path("window");
+    std::remove(path.c_str());
+    V24ActivationWire wire(DashNetwork::MAINNET, w.height_fn(), path);
+    MnStateMachine sm;
+    replay::DmlFoldEngine eng(mainnet_fold_cfg());
+    wire.add_sink([&](uint32_t h) { sm.set_v24_height(h); });
+    wire.add_sink([&](uint32_t h) { eng.set_v24_height(h); });
+
+    // Still STARTED for the block after the tip: nothing to push.
+    w.advance(kMainLockIn - 2);
+    EXPECT_EQ(wire.refresh(), std::nullopt);
+    EXPECT_EQ(sm.v24_height(), kV24HeightUnknown);
+    EXPECT_EQ(eng.v24_height(), std::numeric_limits<int32_t>::max());
+    // LOCKED_IN for the next block: the activation height is known a whole
+    // window (4,032 blocks) before the activation block.
+    w.advance(kMainLockIn - 1);
+    EXPECT_EQ(wire.refresh(), std::optional<uint32_t>(kMainActive));
+    EXPECT_EQ(sm.v24_height(), kMainActive);
+    EXPECT_EQ(eng.v24_height(), static_cast<int32_t>(kMainActive));
+    {
+        std::ifstream in(path);
+        std::stringstream ss;
+        ss << in.rdbuf();
+        EXPECT_EQ(V24ActivationWire::parse(DashNetwork::MAINNET, ss.str()), std::optional<uint32_t>(kMainActive));
+    }
+    // ACTIVE at the tip: the same height, from the exact state machine.
+    w.advance(kMainActive + 50);
+    EXPECT_EQ(w.st->v24_state(kMainActive - 1), V24State::INACTIVE);
+    EXPECT_EQ(w.st->v24_state(kMainActive), V24State::ACTIVE);
+    EXPECT_EQ(wire.refresh(), std::optional<uint32_t>(kMainActive));
+
+    // The projection folds the boundary with the pushed height; the CbTx
+    // version of each block agrees.
+    sm.load({}, kMainActive - 2);
+    auto r = sm.apply_block(cbtx_block(kMainActive - 1, uint256{}, 3), kMainActive - 1);
+    EXPECT_TRUE(r.refused.empty()) << r.refused;
+    r = sm.apply_block(cbtx_block(kMainActive, uint256{}, 4), kMainActive);
+    EXPECT_TRUE(r.refused.empty()) << r.refused;
+    // A block contradicting the pushed height is refused before any mutation.
+    {
+        MnStateMachine sm2;
+        sm2.set_v24_height(kMainActive);
+        sm2.load({}, kMainActive - 1);
+        const auto r2 = sm2.apply_block(cbtx_block(kMainActive, uint256{}, 3), kMainActive);
+        EXPECT_NE(r2.refused.find("v24 switch contradiction"), std::string::npos) << r2.refused;
+        MnStateMachine sm3;
+        sm3.set_v24_height(kMainActive);
+        sm3.load({}, kMainActive - 2);
+        const auto r3 = sm3.apply_block(cbtx_block(kMainActive - 1, uint256{}, 4), kMainActive - 1);
+        EXPECT_NE(r3.refused.find("v24 switch contradiction"), std::string::npos) << r3.refused;
+    }
+    // The replay fold: the boundary folds, a contradicting block is refused
+    // with the held list unchanged.
+    {
+        eng.seed({}, 0, kMainActive - 1, height_hash(1, 0xa1));
+        const auto f = eng.fold_block(cbtx_block(kMainActive, eng.block_hash(), 4), kMainActive);
+        EXPECT_TRUE(f.ok) << f.error;
+        replay::DmlFoldEngine e2(mainnet_fold_cfg());
+        e2.set_v24_height(kMainActive);
+        e2.seed({}, 0, kMainActive - 2, height_hash(2, 0xa1));
+        const auto f2 = e2.fold_block(cbtx_block(kMainActive - 1, e2.block_hash(), 4), kMainActive - 1);
+        EXPECT_FALSE(f2.ok);
+        EXPECT_TRUE(f2.refused_unchanged);
+        EXPECT_NE(f2.error.find("v24 switch contradiction"), std::string::npos) << f2.error;
+    }
+    std::remove(path.c_str());
+}
+
+TEST(DashV24Activation, RestartRestoresThePersistedHeightBeforeTheTrackerCatchesUp)
+{
+    const std::string path = temp_path("restart");
+    {
+        std::ofstream out(path, std::ios::trunc);
+        out << V24ActivationWire::serialize(DashNetwork::MAINNET, kMainActive);
+    }
+    // After a restart the tracker has not rescanned yet: it knows nothing.
+    V24ActivationWire wire(DashNetwork::MAINNET, [] { return std::optional<uint32_t>{}; }, path);
+    MnStateMachine sm;
+    wire.add_sink([&](uint32_t h) { sm.set_v24_height(h); });
+    EXPECT_EQ(sm.v24_height(), kV24HeightUnknown);
+    EXPECT_TRUE(wire.load());
+    EXPECT_EQ(sm.v24_height(), kMainActive);
+    EXPECT_EQ(wire.refresh(), std::optional<uint32_t>(kMainActive)) << "an unknown answer never withdraws it";
+    // A sink added later gets it at once (the replay folds are built late).
+    replay::DmlFoldEngine eng(mainnet_fold_cfg());
+    wire.add_sink([&](uint32_t h) { eng.set_v24_height(h); });
+    EXPECT_EQ(eng.v24_height(), static_cast<int32_t>(kMainActive));
+    // Another network's file is ignored.
+    V24ActivationWire tn(DashNetwork::TESTNET, {}, path);
+    EXPECT_FALSE(tn.load());
+    EXPECT_EQ(tn.applied(), std::nullopt);
+    std::remove(path.c_str());
+}
+
+TEST(DashV24Activation, ReorgAcrossTheActivationBoundaryKeepsTheHeight)
+{
+    MainnetActivationWorld w;
+    V24ActivationWire wire(DashNetwork::MAINNET, w.height_fn());
+    MnStateMachine sm;
+    wire.add_sink([&](uint32_t h) { sm.set_v24_height(h); });
+    w.advance(kMainActive + 100);
+    ASSERT_EQ(wire.refresh(), std::optional<uint32_t>(kMainActive));
+    // Replace 2,580,470..2,580,600 with another branch: the activation height
+    // is fixed by the signalling window, so the tracking still answers it.
+    for (uint32_t h = kMainActive - 10; h <= kMainActive + 120; ++h) w.c.salt[h] = 0xb2;
+    w.c.tip = kMainActive + 120;
+    const auto kept = w.t->reconcile_with_chain();
+    ASSERT_TRUE(kept.has_value());
+    EXPECT_LT(*kept, kMainActive - 9) << "coverage cut back below the fork";
+    w.advance(kMainActive + 120);
+    EXPECT_EQ(w.st->activation_height(DashDeployment::V24), std::optional<uint32_t>(kMainActive));
+    EXPECT_EQ(wire.refresh(), std::optional<uint32_t>(kMainActive));
+    EXPECT_EQ(sm.v24_height(), kMainActive);
+    // The new branch's activation block folds under v24; a branch block that
+    // states otherwise is refused (fail closed), whichever branch it is on.
+    sm.load({}, kMainActive - 1);
+    EXPECT_TRUE(sm.apply_block(cbtx_block(kMainActive, uint256{}, 4), kMainActive).refused.empty());
+    MnStateMachine sm2;
+    sm2.set_v24_height(kMainActive);
+    sm2.load({}, kMainActive - 1);
+    EXPECT_FALSE(sm2.apply_block(cbtx_block(kMainActive, uint256{}, 3), kMainActive).refused.empty());
+}
+
+TEST(DashV24Activation, NoPushedHeightTheBlockDecidesAndIsAdopted)
+{
+    // A cold restart after activation without the persisted file, before the
+    // tracker has rescanned: each fold takes the switch from the block.
+    MnStateMachine sm;
+    sm.load({}, kMainActive + 9);
+    auto r = sm.apply_block(cbtx_block(kMainActive + 10, uint256{}, 4), kMainActive + 10);
+    EXPECT_TRUE(r.refused.empty()) << r.refused;
+    EXPECT_EQ(sm.v24_height(), kMainActive + 10);
+    MnStateMachine pre;
+    pre.load({}, kMainActive - 6);
+    EXPECT_TRUE(pre.apply_block(cbtx_block(kMainActive - 5, uint256{}, 3), kMainActive - 5).refused.empty());
+    EXPECT_EQ(pre.v24_height(), kV24HeightUnknown) << "version 3 states inactive";
+    replay::DmlFoldEngine eng(mainnet_fold_cfg());
+    eng.seed({}, 0, kMainActive + 9, height_hash(3, 0xa1));
+    const auto f = eng.fold_block(cbtx_block(kMainActive + 10, eng.block_hash(), 4), kMainActive + 10);
+    EXPECT_TRUE(f.ok) << f.error;
+    EXPECT_EQ(eng.v24_height(), static_cast<int32_t>(kMainActive + 10));
+}
+
+TEST(DashV24Activation, TestnetHeightComesFromTheSameTrackingAndMatches)
+{
+    // Testnet's activation is history: the same tracking answers the buried
+    // height, which equals the replay fold's testnet gate and the height the
+    // versionbits machine derives from the real testnet headers.
+    DashDeploymentStatus st(DashNetwork::TESTNET, [](uint32_t) { return std::optional<VbBlockInfo>{}; },
+                            [] { return std::optional<uint32_t>(1'586'000); }, nullptr);
+    V24ActivationWire wire(DashNetwork::TESTNET, [&st] { return st.activation_height(DashDeployment::V24); });
+    MnStateMachine sm;
+    wire.add_sink([&](uint32_t h) { sm.set_v24_height(h); });
+    EXPECT_EQ(wire.refresh(), std::optional<uint32_t>(1'578'000));
+    EXPECT_EQ(sm.v24_height(), 1'578'000u);
+    EXPECT_EQ(static_cast<uint32_t>(replay::FoldGates::testnet().v24_height), 1'578'000u);
+    TestnetChain tc;
+    DashDeploymentParams p = dash_deployment_params(DashNetwork::TESTNET);
+    p.v24_buried_height.reset();
+    VersionBitsChecker vb(p, DashDeployment::V24, tc.fn());
+    EXPECT_EQ(vb.state_since_height(1'577'999, 1'565'132), std::optional<int64_t>(1'578'000));
 }

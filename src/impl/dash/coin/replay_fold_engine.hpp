@@ -183,6 +183,7 @@
 #include <impl/dash/coin/vendor/providertx.hpp>
 #include <impl/dash/coin/v24_state.hpp>
 #include <impl/dash/coin/v24_sml_leaf.hpp>   // write_sml_leaf_fields (shared with the template fold)
+#include <impl/dash/coin/v24_activation.hpp> // the v24 switch of a mined block
 #include <impl/dash/coin/vendor/simplifiedmns.hpp>
 #include <impl/dash/coin/vendor/bls_verify.hpp>
 #include <impl/dash/coin/vendor/incremental_sml_merkle.hpp>
@@ -470,10 +471,19 @@ struct FoldGates
     int32_t mn_rr_height{2128896};     // MN reward reallocation (Evo 4-in-a-row OFF)
     int32_t masternode_min_confirmations{15};
     // DEPLOYMENT_V24: the first height with the v24 rules (Dash Core v24
-    // state transitions, type list 0..12, shared-collateral covenant). Never
-    // by default (mainnet is not locked in); S0's versionbits tracker sets
-    // it, testnet is 1,578,000 (v24_rules.hpp v24_active).
+    // state transitions, type list 0..12, shared-collateral covenant).
+    // Unknown by default; the node's deployment tracking pushes it
+    // (V24ActivationWire, DmlFoldEngine::set_v24_height), testnet's is
+    // 1,578,000, and a block's CbTx version 4 sets it when nothing was pushed
+    // (fold_block; v24_activation.hpp).
     int32_t v24_height{std::numeric_limits<int32_t>::max()};
+
+    /// v24_height in the v24_activation.hpp convention.
+    uint32_t v24_height_u32() const
+    {
+        return v24_height == std::numeric_limits<int32_t>::max() ? kV24HeightUnknown
+                                                                 : static_cast<uint32_t>(v24_height);
+    }
     // Chain parameters for the netInfo conversions SetStateVersion performs.
     vendor::NetInfoRules netinfo_rules{vendor::NetInfoRules::mainnet()};
 
@@ -687,6 +697,11 @@ public:
     size_t             size() const                   { return m_entries.size(); }
     uint32_t           height() const                 { return m_height; }
     const uint256&     block_hash() const             { return m_block_hash; }
+    /// DEPLOYMENT_V24 activation height (V24ActivationWire pushes it).
+    void    set_v24_height(uint32_t h) { m_cfg.gates.v24_height = h >= static_cast<uint32_t>(std::numeric_limits<int32_t>::max())
+                                                                      ? std::numeric_limits<int32_t>::max()
+                                                                      : static_cast<int32_t>(h); }
+    int32_t v24_height() const { return m_cfg.gates.v24_height; }
     uint64_t           total_registered_count() const { return m_total_registered_count; }
     const std::string& network() const                { return m_network; }
     bool               poisoned() const               { return m_poisoned; }
@@ -1009,6 +1024,19 @@ public:
 
         const int32_t H = static_cast<int32_t>(height);
 
+        // Dash Core v24 switch for THIS block (v24_activation.hpp): the pushed
+        // activation height against the CbTx version the block states. A
+        // contradiction is not ours to fold under either rule set; with no
+        // height pushed, the block decides (fold_block adopts its height).
+        const auto v24_sw = v24_block_switch(height, m_cfg.gates.v24_height_u32(), cbtx.nVersion);
+        if (v24_sw.contradiction) {
+            r.refused_unchanged = true;
+            r.error = "fold refused at h=" + std::to_string(height) + ": " + *v24_sw.contradiction
+                    + " (the held list is unchanged)";
+            return false;
+        }
+        const bool v24_here = v24_sw.active;
+
         // ── Pre-scan: ContextualCheckTransaction (validation.cpp:317-349 @
         // v23.1.9), every tx incl. the coinbase, once DIP3 is active for this
         // block (DeploymentActiveAfter(pindexPrev, DIP0003): H >=
@@ -1023,10 +1051,9 @@ public:
                 // Dash Core v24: the type list is 0..12 once DEPLOYMENT_V24
                 // is active for this block (types 10-12 fold below).
                 std::optional<std::string> why_s;
-                if (auto why = v24::contextual_tx_check_at(block.m_txs[i], i == 0,
-                                                           m_cfg.gates.v24_active(H)))
+                if (auto why = v24::contextual_tx_check_at(block.m_txs[i], i == 0, v24_here))
                     why_s = std::string(*why);
-                else if (m_cfg.gates.v24_active(H))
+                else if (v24_here)
                     why_s = v24::shared_collateral_create_refusal(block.m_txs[i]);
                 if (const auto& why = why_s) {
                     r.refused_unchanged = true;
@@ -1053,6 +1080,13 @@ public:
 
         const int32_t H = static_cast<int32_t>(height);
         const uint256 prev_hash = block.m_previous_block;
+
+        // No activation height pushed and the block states v24: adopt it.
+        if (v24_block_switch(height, m_cfg.gates.v24_height_u32(), block_cbtx_version(block)).learned) {
+            m_cfg.gates.v24_height = H;
+            LOG_INFO << "[DML-FOLD] Dash Core v24 is active from h=" << height
+                     << " (the block's CbTx version 4; no activation height was pushed)";
+        }
 
         // ── Pass 0: payee, from the PRE-block list ──────────────────────
         r.payee = project_payee(H);

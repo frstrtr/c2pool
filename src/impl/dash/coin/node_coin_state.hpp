@@ -212,6 +212,27 @@ public:
         m_mempool.set_inject_still_wanted_fn([this](const uint256& txid) {
             return m_inject_pool.still_wanted(txid, next_block_height());
         });
+        // Dash Core's provider-tx admission conflicts read the masternode
+        // list at the tip (txmempool.cpp existsProviderTxConflict: "not in
+        // the list", one pending operator key change per masternode). Only a
+        // projection folded up to the tip answers (the emit gate's condition);
+        // otherwise Unknown, and those rules are skipped. The store keeps the
+        // canonical basic encoding. Admission runs on the io thread, where the
+        // maintainer mutates m_mnstates.
+        m_mempool.set_tip_operator_key_fn([this](const uint256& protx) {
+            Mempool::TipOperatorKey k;
+            if (m_prev_height == 0 || m_mnstates.entries().empty()
+                || m_mnstates.last_applied_height() != m_prev_height)
+                return k;
+            const auto it = m_mnstates.entries().find(protx);
+            if (it == m_mnstates.entries().end()) {
+                k.state = Mempool::TipMn::Absent;
+                return k;
+            }
+            k.state = Mempool::TipMn::Listed;
+            k.key = it->second.pubKeyOperator;
+            return k;
+        });
     }
     NodeCoinState(const NodeCoinState&) = delete;
     NodeCoinState& operator=(const NodeCoinState&) = delete;

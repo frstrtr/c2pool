@@ -1095,6 +1095,9 @@ inline FoldVerdict fold_one_v24(vendor::CSimplifiedMNList& folded, const vendor:
                 if (const MNState* st = ov.state_of(ctx, *mn); st != nullptr && st->v24.IsShared())
                     return refuse("bad-shared-collateral-spend (masternode " + mn->GetHex().substr(0, 16) + ")");
     }
+    // CheckSharedCollateralTemplateOutputs: an output paying the template
+    // only as the collateral of this tx's own shared registration.
+    if (auto why = v24::shared_collateral_create_refusal(tx)) return refuse(*why);
     const bool provider = (tx.type >= 1 && tx.type <= 4) || tx_type_is_v24_provider(tx.type);
     if (!provider) return {};
     if (auto why = contextual_tx_check_v24(tx, /*is_coinbase=*/false)) return refuse(std::string(*why));
@@ -1110,8 +1113,9 @@ inline FoldVerdict fold_one_v24(vendor::CSimplifiedMNList& folded, const vendor:
     case vendor::CProRegTx::SPECIALTX_TYPE: {
         vendor::CProRegTx p;
         if (!vendor::parse_protx_payload(tx.extra_payload, p)) return refuse("bad-protx-payload");
-        if (p.nVersion >= vendor::ProTxVersion::EXT_ADDR || p.IsShared())
-            return refuse("bad-protx-version (ExtAddr ProRegTx: its Dash Core checks are not ported) - excluded");
+        // No new legacy-scheme registration under v24 (CheckProRegTx).
+        if (p.nVersion < vendor::ProTxVersion::BASIC_BLS) return refuse("bad-protx-version-disallowed");
+        const bool ext = v24::state_has_ext(p.nVersion);
         const uint256 pro = dash::coin::dash_txid(::dash::coin::MutableTransaction(tx));
         MnFoldContext::Outpoint coll = p.collateralOutpoint;
         const bool external = !coll.hash.IsNull();
@@ -1133,15 +1137,22 @@ inline FoldVerdict fold_one_v24(vendor::CSimplifiedMNList& folded, const vendor:
         const uint256 replaced_pro = replaced ? *replaced : uint256{};
         // CheckProRegTx (prevList, the MN being replaced included) and
         // ApplyTxToList (the list as built so far, after the replacement).
-        if (ov.id_held_by_other(ctx, p.keyIDOwner, none))
+        // A shared registration's share owner keys take the owner key's
+        // place in the one owner / platformNodeID namespace.
+        if (p.IsShared()) {
+            for (const auto& sh : p.shares)
+                if (ov.id_held_by_other(ctx, sh.keyIDOwner, none))
+                    return refuse("bad-protx-dup-key (a share owner key is an owner key or platformNodeID)");
+        } else if (ov.id_held_by_other(ctx, p.keyIDOwner, none)) {
             return refuse("bad-protx-dup-key (keyIDOwner is an owner key or platformNodeID)");
+        }
         const auto op_basic = vendor::opkey_to_basic(p.pubKeyOperator, p.nVersion < vendor::ProTxVersion::BASIC_BLS);
         if (ov.opkey_held_by_other(ctx, op_basic, none))
             return refuse("bad-protx-dup-key (pubKeyOperator under either scheme)");
         if (p.nType == vendor::MnType::EVO && ov.id_held_by_other(ctx, p.platformNodeID, none))
             return refuse("bad-protx-dup-platformnodeid");
         {
-            const auto svc_list = MnFoldOverlayV24::entries_of(false, p.netInfo.canonical(), vendor::ExtNetInfo{});
+            const auto svc_list = MnFoldOverlayV24::entries_of(ext, p.netInfo.canonical(), p.extNetInfo);
             for (const auto& svc : svc_list) {
                 // prevList: only the masternode this collateral replaces may hold it.
                 const auto& pm = ov.pre_index(ctx).services;
