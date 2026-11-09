@@ -9,6 +9,7 @@
 #include <core/target_utils.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstring>
 #include <sstream>
@@ -402,35 +403,47 @@ AuxWork AuxChainRPC::get_work_template()
     return work;
 }
 
-AuxWork AuxChainRPC::create_aux_block(const std::string& address)
+bool aux_target_from_le_hex(const std::string& le_hex, uint256& out)
+{
+    if (le_hex.size() != 64)
+        return false;
+    for (char c : le_hex)
+        if (!std::isxdigit(static_cast<unsigned char>(c)))
+            return false;
+    // Reverse the byte order: byte 0 (least significant) goes last, so
+    // SetHex sees the big-endian display form it expects.
+    std::string be;
+    be.reserve(64);
+    for (int i = 62; i >= 0; i -= 2)
+        be.append(le_hex, static_cast<size_t>(i), 2);
+    out.SetHex(be);
+    return true;
+}
+
+AuxWork aux_work_from_createauxblock(const nlohmann::json& result,
+                                     uint32_t default_chain_id,
+                                     const std::string& symbol)
 {
     AuxWork work;
-    work.chain_id = m_config.chain_id;
-
-    auto result = call("createauxblock", nlohmann::json::array({address}));
-    std::string hash_str = result.value("hash", "");
-    LOG_TRACE << "[MM:" << m_config.symbol << "] createauxblock raw hash: \"" << hash_str
-              << "\" height=" << result.value("height", 0);
-    work.block_hash.SetHex(hash_str);
-    work.chain_id = result.value("chainid", m_config.chain_id);
+    work.block_hash.SetHex(result.value("hash", ""));
+    work.chain_id = result.value("chainid", default_chain_id);
     work.height = result.value("height", 0);
     work.coinbase_value = result.value("coinbasevalue", uint64_t(0));
 
-    // Target: prefer the "target" field directly (like p2pool), fall back to "bits".
-    // createauxblock returns "target" as a 64-char big-endian hex string.
+    // Target: prefer the "target" field (like p2pool), then the legacy
+    // "_target", then "bits". createauxblock / getauxblock give both target
+    // fields as the raw little-endian bytes of the uint256 (HexStr(BEGIN,
+    // END)), NOT the big-endian display form GBT uses: regtest bits 207fffff
+    // comes back as "...00ffff7f". p2pool unpacks the decoded bytes as a
+    // little-endian integer; aux_target_from_le_hex does the same.
     bool target_set = false;
-    if (result.contains("target") && result["target"].is_string()) {
-        std::string target_hex = result["target"].get<std::string>();
-        if (!target_hex.empty() && target_hex.size() <= 64) {
-            work.target.SetHex(target_hex);
-            target_set = !work.target.IsNull();
-        }
-    }
-    if (!target_set && result.contains("_target") && result["_target"].is_string()) {
-        std::string target_hex = result["_target"].get<std::string>();
-        if (!target_hex.empty() && target_hex.size() <= 64) {
-            work.target.SetHex(target_hex);
-            target_set = !work.target.IsNull();
+    for (const char* field : {"target", "_target"}) {
+        if (target_set || !result.contains(field) || !result[field].is_string())
+            continue;
+        uint256 t;
+        if (aux_target_from_le_hex(result[field].get<std::string>(), t) && !t.IsNull()) {
+            work.target = t;
+            target_set = true;
         }
     }
     if (!target_set) {
@@ -439,12 +452,19 @@ AuxWork AuxChainRPC::create_aux_block(const std::string& address)
             uint32_t nbits = std::stoul(bits_hex, nullptr, 16);
             work.target.SetCompact(nbits);
         } else {
-            LOG_WARNING << "[MM:" << m_config.symbol
+            LOG_WARNING << "[MM:" << symbol
                         << "] createauxblock: no target/bits field — target will be null!";
         }
     }
-
     return work;
+}
+
+AuxWork AuxChainRPC::create_aux_block(const std::string& address)
+{
+    auto result = call("createauxblock", nlohmann::json::array({address}));
+    LOG_TRACE << "[MM:" << m_config.symbol << "] createauxblock raw hash: \"" << result.value("hash", "")
+              << "\" height=" << result.value("height", 0);
+    return aux_work_from_createauxblock(result, m_config.chain_id, m_config.symbol);
 }
 
 bool AuxChainRPC::submit_block(const std::string& block_hex)
