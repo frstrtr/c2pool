@@ -12,10 +12,8 @@
   V35 → V36 switch keeps it). `--v3601-activation-time` moves it on testnet or
   a private `--network-id` chain only.
 - Merged payouts of 3601 shares come from the share alone: its own merged
-  address, else its own P2PKH / P2WPKH parent key (or the donation script); a
-  P2SH parent key pays no one (a P2SH-P2WPKH `M...` script is anyone-can-spend
-  on DOGE) and its weight is spread over the block's other payees. No 3601
-  share feeds or uses the first-seen address of another share ("Tier 1.5"),
+  address, else its own parent key (P2PKH / P2WPKH as P2PKH, P2SH as P2SH).
+  No 3601 share feeds or uses the first-seen address of another share ("Tier 1.5"),
   which depended on the order a node received shares and let a share naming
   another miner's parent script take that miner's address-less shares.
   **V36 shares keep the old rule exactly** (Tier 1.5, P2SH as P2SH): the
@@ -28,10 +26,19 @@
   c2pool before v0.2.12) is disconnected and refused, without a ban, and is
   never sent a 3601 share; it is left on a sharechain of its own. p2pool is no
   longer supported from then on.
-- Stratum: no merged address is derived from a P2SH login (a warning says to
-  give one); P2WSH / P2TR logins are flagged "P2WSH/P2TR address →
-  redistributed"; a swapped pair whose first address is not valid
-  (`DOGE-with-bad-checksum,LTCADDR`) pays the LTC address.
+- Stratum: a P2SH login without an explicit merged address keeps the merged
+  P2SH derived from its key (as before) and is warned: if it is a
+  segwit-wrapped wallet address (P2SH-P2WPKH/P2WSH, e.g. `M...`), give the
+  DOGE address explicitly (`LTC_ADDRESS,DOGE_ADDRESS`); on DOGE (no segwit)
+  such an output becomes spendable by anyone once the redeem script is
+  public. A P2SH `--node-owner-address` is warned the same way. P2WSH / P2TR
+  logins are flagged "P2WSH/P2TR address → redistributed"; a swapped pair
+  whose first address is not valid (`DOGE-with-bad-checksum,LTCADDR`) pays the
+  LTC address.
+- A share re-wrapped under the other type number (36 <-> 3601; the share hash
+  does not commit to it) is dropped by the share handlers before the tracker
+  and its sender disconnected (never banned); the relay cache only holds the
+  bytes of the share the tracker adopted; LevelDB loads apply the same check.
 - `--no-embedded-doge` disables embedded DOGE networking entirely (no P2P, no
   DNS seeds), also when a `--merged DOGE:...` spec carries a P2P port.
 - `--no-embedded-ltc`: the initial getblocktemplate fetch and the 2 s poll are
@@ -42,6 +49,13 @@
   daemon's own P2P link announces now refreshes the template at once.
 - Redistribution reads the sharechain only under its read lock (a crash race
   with the compute thread, seen under TSAN).
+- A stratum job is no longer built while the sharechain is busy: the PPLNS at
+  the job's prev share or the ref_hash could not be read, and the job used
+  the cached PPLNS of another best share or a null ref_hash, so its shares
+  could not match their own generation transaction ("Cross-check FAILED").
+  The session holds the job and retries.
+- Shares this node makes are written to LevelDB like received ones (they
+  never were: after a restart the chain had holes until peers sent them back).
 
 ### DASH: compiled masternode anchor re-pinned to h=2563800
 - The compiled masternode anchor and the header fast-start move from h=2549400

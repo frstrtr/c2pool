@@ -686,15 +686,14 @@ carries (its LTC payout key and its merged addresses) is fixed when its job is
 built and committed in the job's coinbase, as in p2pool.
 
 1. **An LTC address and no address for a merged chain** — the chain pays the
-   LTC address's key (its hash160) when the address is P2PKH or P2WPKH (as a
-   P2PKH of the chain). No merged address is derived from a P2SH LTC address:
-   a P2SH-P2WPKH `M...` redeem script is spendable by anyone on a chain without
-   segwit (DOGE). Give a P2SH miner's merged address explicitly (case 2);
-   without one the login is accepted, the log warns and the dashboard's
-   workers list shows "P2SH address → give a merged address". Its V36 shares
-   still pay the P2SH key as a DOGE P2SH (the V36 rule, below); from the share
-   version 3601 flag day its merged share goes pro-rata to the block's other
-   payees.
+   LTC address's key (its hash160): P2PKH and P2WPKH as P2PKH, P2SH as P2SH.
+   A P2SH login without an explicit merged address is warned: if it is a
+   segwit-wrapped wallet address (P2SH-P2WPKH/P2WSH, e.g. `M...`), give your
+   DOGE address explicitly (`LTC_ADDRESS,DOGE_ADDRESS`); on DOGE (no segwit)
+   such an output becomes spendable by anyone once the redeem script is
+   public. The dashboard's workers list shows "P2SH address: if
+   segwit-wrapped, give a DOGE address". A legacy P2SH (a multisig, the
+   pool's own donation script among them) spends on DOGE as it does on LTC.
 2. **An address given for the chain** — paid as given: the comma form
    `LTCADDR,MERGEDADDR` (also `|`, `;`, space), the slash form
    `LTCADDR/CHAIN_ID:ADDR` (repeatable), `mining.set_merged_addresses`, a
@@ -746,16 +745,17 @@ share's version:
   the flag day keep exactly these payouts: nothing moves at the switch.
 - **Share version 3601** (the shares every node makes from the flag day on) is
   resolved from the share alone: its own merged address for the chain, else
-  its own parent key when that is P2PKH or P2WPKH (or the pool's donation
-  script); any other parent key (a P2SH) pays no one and its weight is spread
-  pro-rata over the block's other payees. A 3601 share neither feeds nor uses
-  Tier 1.5, so one share's merged address never pays for another share and
-  every node derives the same payout whatever order it received the shares in
-  (Tier 1.5 depended on that order, and one share naming another miner's
-  parent script could take that miner's address-less shares).
+  its own parent key (P2PKH/P2WPKH as P2PKH, P2SH as P2SH). A 3601 share
+  neither feeds nor uses Tier 1.5, so one share's merged address never pays
+  for another share and every node derives the same payout whatever order it
+  received the shares in (Tier 1.5 depended on that order, and one share
+  naming another miner's parent script could take that miner's address-less
+  shares).
 
 c2pool nodes do not re-derive each other's merged coinbases, so the rule
-decides no share's validity. `--solo` / `--custodial` merged payouts do not use per-miner
+decides no share's validity. A P2SH `--node-owner-address` without
+`--node-owner-merged-address` is paid as the same P2SH on the merged chains,
+with the same segwit-wrapped warning at startup. `--solo` / `--custodial` merged payouts do not use per-miner
 merged addresses, and `c2pool-btc` (NMC) and `c2pool-dgb` (DOGE) do not carry
 them.
 
