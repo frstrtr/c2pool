@@ -349,6 +349,10 @@ if (BUILD_TESTING AND GTest_FOUND)
     # an address share keeps the (hash, type) the share carries; a P2WSH / P2TR
     # / bare script is not a recipient (never its first bytes as P2PKH). Same
     # folding rule.
+    #
+    # solo_payouts_test.cpp: --solo pays each miner to its login's own script
+    # (P2SH, P2WPKH, P2WSH, P2TR; never P2PKH of a script hash, never the zero
+    # key) and the outputs add up to the subsidy. Same folding rule.
     # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
     add_executable(share_test
         auto_ratchet_blocked_by_test.cpp
@@ -423,6 +427,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         share_message_unpack_bounds_test.cpp
         share_remove_owns_data_test.cpp
         share_test.cpp
+        solo_payouts_test.cpp
         template_gap_gate_test.cpp
         template_hogex_survives_truncation_test.cpp
         template_mweb_ext_merge_test.cpp

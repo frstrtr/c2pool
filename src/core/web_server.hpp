@@ -2712,6 +2712,10 @@ public:
     /// Matches p2pool: get_local_addr_rates() (work.py:1975-1990).
     /// Returns {pubkey_hash → hashrate (H/s)} for all connected miners.
     std::map<std::array<uint8_t, 20>, double> get_local_addr_rates() const;
+    /// Per-login hashrate (p2pool get_local_rates' first map). The login is
+    /// the miner's payout address (worker and merged parts stripped), of any
+    /// script type: --solo pays it by its own script.
+    std::map<std::string, double> get_local_user_rates() const;
 
     // Stratum server control methods
     bool start_stratum_server();

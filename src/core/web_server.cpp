@@ -11711,6 +11711,17 @@ std::map<std::array<uint8_t, 20>, double> WebServer::get_local_addr_rates() cons
     return result;
 }
 
+std::map<std::string, double> WebServer::get_local_user_rates() const
+{
+    std::map<std::string, double> result;
+    if (stratum_server_) {
+        auto rates = stratum_server_->get_local_rates().first;
+        for (auto& [user, rate] : rates)
+            result[user] = rate;
+    }
+    return result;
+}
+
 void WebServer::trigger_work_refresh(core::RefreshCause cause)
 {
     using namespace std::chrono;

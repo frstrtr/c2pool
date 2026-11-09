@@ -59,6 +59,7 @@
 #include <impl/ltc/share.hpp>
 #include <impl/ltc/share_check.hpp>
 #include <impl/ltc/auto_ratchet.hpp>
+#include <impl/ltc/solo_payouts.hpp>
 #include <impl/ltc/share_messages.hpp>
 #include <impl/ltc/coin/block.hpp>
 #include <impl/ltc/node.hpp>
@@ -5507,8 +5508,14 @@ int main(int argc, char* argv[]) {
             // V35's gentx_before_refhash expects DONATION_SCRIPT (67 bytes),
             // causing p2pool to reject the share as PoW-invalid.
             {
-                auto [initial_ver, initial_desired] = auto_ratchet->get_share_version(
-                    p2p_node->tracker(), uint256());
+                // --solo / --custodial run no sharechain (no p2p_node): the
+                // V36 donation, as before the ratchet read (p2p_node->tracker()
+                // on a null node crashed them at startup).
+                int64_t initial_ver = 36;
+                if (p2p_node) {
+                    auto [ver, desired] = auto_ratchet->get_share_version(p2p_node->tracker(), uint256());
+                    initial_ver = ver;
+                }
                 auto donation_script = ltc::PoolConfig::get_donation_script(initial_ver);
                 web_server.get_mining_interface()->set_donation_script(donation_script);
                 web_server.get_mining_interface()->set_cached_share_version(initial_ver);
@@ -7584,52 +7591,21 @@ int main(int argc, char* argv[]) {
                     uint64_t subsidy, const std::vector<unsigned char>& donation_script)
                     -> std::map<std::vector<unsigned char>, double> {
 
-                std::map<std::vector<unsigned char>, double> result;
-
-                auto rates = web_server.get_local_addr_rates();
-                double total_rate = 0;
-                for (auto& [_, rate] : rates) total_rate += rate;
-
-                // Node owner fee
-                uint64_t owner_fee_amount = 0;
-                if (node_owner_fee > 0 && !payout_address.empty()) {
-                    owner_fee_amount = static_cast<uint64_t>(subsidy * node_owner_fee / 100.0);
-                    auto owner_script = core::address_to_script(payout_address);
-                    if (!owner_script.empty())
-                        result[owner_script] = static_cast<double>(owner_fee_amount);
+                // Each login's hashrate, paid to the login's own script
+                // (P2PKH, P2SH, P2WPKH, P2WSH, P2TR). By pubkey hash, a P2SH
+                // miner was paid P2PKH(<script hash>) and a P2WSH / P2TR one
+                // the zero key. A login with no script is not paid (the door
+                // refuses those).
+                ltc::SoloMinerRates miners;
+                for (auto& [login, rate] : web_server.get_local_user_rates()) {
+                    auto script = core::address_to_script(login);
+                    if (!script.empty() && rate > 0)
+                        miners.emplace_back(std::move(script), rate);
                 }
-
-                // Donation (dev_donation% or 1 satoshi marker when 0%)
-                uint64_t donation_amount = (dev_donation > 0)
-                    ? static_cast<uint64_t>(subsidy * dev_donation / 100.0)
-                    : 1;  // 1 satoshi marker
-                result[donation_script] += static_cast<double>(donation_amount);
-
-                uint64_t miner_pool = subsidy - owner_fee_amount - donation_amount;
-
-                if (total_rate > 0 && !rates.empty()) {
-                    // Proportional split by hashrate
-                    for (auto& [pubkey_hash, rate] : rates) {
-                        double fraction = rate / total_rate;
-                        uint64_t amount = static_cast<uint64_t>(miner_pool * fraction);
-                        if (amount == 0) continue;
-                        // Convert pubkey_hash to P2PKH script: OP_DUP OP_HASH160 <20> <hash> OP_EQUALVERIFY OP_CHECKSIG
-                        std::vector<unsigned char> script = {0x76, 0xa9, 0x14};
-                        script.insert(script.end(), pubkey_hash.begin(), pubkey_hash.end());
-                        script.push_back(0x88);
-                        script.push_back(0xac);
-                        result[script] += static_cast<double>(amount);
-                    }
-                } else {
-                    // No miners connected — all to payout address or donation
-                    if (!payout_address.empty()) {
-                        auto pa_script = core::address_to_script(payout_address);
-                        if (!pa_script.empty())
-                            result[pa_script] = static_cast<double>(miner_pool);
-                    } else {
-                        result[donation_script] += static_cast<double>(miner_pool);
-                    }
-                }
+                const auto owner_script = payout_address.empty()
+                    ? std::vector<unsigned char>{} : core::address_to_script(payout_address);
+                auto result = ltc::solo_payouts(subsidy, miners, owner_script, node_owner_fee,
+                                                donation_script, dev_donation);
                 return result;
             });
 
