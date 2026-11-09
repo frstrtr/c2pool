@@ -132,6 +132,18 @@ the primary, **reverse-derives** the LTC payout from the same key.
 Worker names (`.worker1` or `_worker1`) are stripped from each address before
 use.
 
+With several merged chains configured, a second address two of them could
+take (DOGE's `D...` is also a Bellscoin P2SH; P2SH `A...`/`9...` is shared by
+DOGE, PEP and SHIC) or that none of them identifies is ignored, with a warning
+in the node's log, and those chains pay your LTC address's key: name its chain
+with the slash form (`LTCADDR/98:DOGEADDR`) to be paid there. An address with a
+bad checksum is ignored the same way.
+
+An empty username, an invalid address or another coin's address is not
+refused: its shares are redistributed by the node's `--redistribute` mode (on
+LTC and on every merged chain), as p2pool does; the dashboard's workers list
+marks such logins "address invalid → redistributed".
+
 ### Which mode pays whom?
 
 | Mode | CLI flag | Who gets paid |
