@@ -673,7 +673,54 @@ Other chains need their daemon running externally.
 | DINGO | 98 | External | Cannot run with DOGE (same chain_id) |
 
 DOGE merged mining activates automatically when `--embedded-doge` is on (default).
-External daemons use `createauxblock`/`submitauxblock` RPC.
+External daemons use `createauxblock`/`submitauxblock` RPC. Every chain reached
+over RPC except DOGE needs `--merged-payout-address SYMBOL:ADDRESS` (an address
+of that chain for `createauxblock`; the merged coinbase itself pays PPLNS), or it
+is not mined.
+
+### Who is paid on a merged chain (`c2pool-ltc`, sharechain mode)
+
+The miner's stratum login decides, per merged chain:
+
+1. **Empty login** — the parent payout follows `--redistribute`
+   (`pplns|fee|boost|donate`, see [Configuration reference](#configuration-reference-ltc-binary)),
+   and so does every merged chain: the share carries no merged address, so on
+   each merged chain it pays whoever its redistributed parent payout went to
+   (that miner's merged address for the chain if one is on the sharechain,
+   else the same key). An **invalid or other-coin address** is refused at
+   `mining.authorize` (it is not redistributed).
+2. **A valid LTC address and no address for a merged chain** — by default the
+   chain pays the LTC address's key (its hash160: P2PKH and P2WPKH as P2PKH,
+   P2SH as P2SH). A P2WSH/P2TR address has no hash160: its merged share is
+   spread over the other miners of that chain. With
+   `--merged-unspecified-to-owner` (all merged chains) or
+   `--merged-unspecified-to-owner-chains SYMBOL[,SYMBOL...]` (those listed),
+   the chain pays the **node owner's address** for it instead
+   (`--merged-payout-address SYMBOL:ADDRESS`; for DOGE also
+   `--node-owner-merged-address`). A chain the option covers without a valid
+   owner address of that chain and network is not mined (error at startup),
+   never paid to a built-in or wrong address. The authorize log names the
+   chains redirected for each miner; `/local_stats` `merged_unspecified_to_owner`
+   and the dashboard show the policy.
+3. **An address given for the chain** — paid as given: the comma form
+   `LTCADDR,MERGEDADDR`, the slash form `LTCADDR/CHAIN_ID:ADDR` (repeatable),
+   `mining.set_merged_addresses`, a swapped `MERGEDADDR,LTCADDR`, or a merged
+   chain's address as the whole login (the LTC payout then uses its hash160).
+   With several merged chains, an address two of them could take (shared
+   version bytes: DOGE P2PKH is Bellscoin P2SH, P2SH 22 is DOGE, PEP and SHIC)
+   or that none identifies refuses the authorize: name the chain with the slash
+   form.
+
+The redirected address is written into the miner's shares as their merged
+address for the chain, so every peer (c2pool and Python p2pool) derives the
+same merged payouts and the shares stay valid. As with any merged address on
+the sharechain, it is also the address p2pool's and c2pool's PPLNS use for
+that miner's shares that carry no address for the chain (shares minted by a
+node that does not mine it), when it is the first one the sharechain has for
+the miner: a miner who mines elsewhere too should give its addresses
+explicitly. `--solo` / `--custodial` merged payouts do not use per-miner merged
+addresses, and `c2pool-btc` (NMC) and `c2pool-dgb` (DOGE) do not carry them:
+the option exists on `c2pool-ltc` only.
 
 **DigiByte Scrypt** is its own parent chain with its own binary and sharechain:
 `c2pool-dgb` (`src/c2pool/main_dgb.cpp`, sharechain port 5024). It is not
@@ -770,7 +817,12 @@ legacy YAML key set.
 | `--give-author` | `donation_percentage` | 0.1 | Developer fee % (p2pool default: 0.5%) |
 | `-f` / `--fee` | `node_owner_fee` | 0 | Node owner fee % |
 | `--node-owner-address` | `node_owner_address` | -- | Node owner payout address |
-| `--redistribute` | `redistribute` | pplns | Mode: pplns/fee/boost/donate |
+| `--redistribute` | `redistribute` | pplns | Mode: pplns/fee/boost/donate — where an empty login's share goes, on the parent and every merged chain (see [Who is paid on a merged chain](#who-is-paid-on-a-merged-chain-c2pool-ltc-sharechain-mode)) |
+| `--merged SYMBOL:CHAIN_ID:HOST:PORT:USER:PASS[:P2P_PORT]` | `merged` | DOGE:98 (embedded) | Merged-mined aux chain (repeatable) |
+| `--merged-payout-address SYMBOL:ADDRESS` | `merged_payout_addresses` | DOGE built-in | That chain's address for `createauxblock` (required for every RPC chain but DOGE); with `--merged-unspecified-to-owner` also the node owner's payout address on it (repeatable) |
+| `--node-owner-merged-address` | `node_owner_merged_address` | -- | Node owner's DOGE address (alias `--merged-operator-address`) |
+| `--merged-unspecified-to-owner` | `merged_unspecified_to_owner` | false | A miner with a valid LTC address but no address for a merged chain is paid on it to the node owner's address instead of its LTC key; a chain without a valid owner address is not mined |
+| `--merged-unspecified-to-owner-chains SYMBOL[,SYMBOL...]` | `merged_unspecified_to_owner_chains` | -- | The same for the chains listed only |
 | `-n HOST:PORT` | `seed_nodes` | -- | Sharechain seed peer (repeatable) |
 | `--startup-mode` | `startup_mode` | **wait** | Bootstrap: `wait`, `genesis`, `auto` |
 | `--genesis` | | | Shortcut for `--startup-mode genesis` |

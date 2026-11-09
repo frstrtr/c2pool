@@ -245,6 +245,8 @@ private:
     // The ones sent with mining.set_merged_addresses: the only entries that
     // outlive a re-authorize (the login's own are resolved again from it).
     std::map<uint32_t, std::string> set_merged_addresses_;
+    // The chains this login pays to the node owner (--merged-unspecified-to-owner).
+    std::set<uint32_t> merged_to_owner_;
     // The scriptPubKey a merged entry pays on its chain
     // (core::merged_addr::merged_payout_script).
     std::vector<unsigned char> merged_script_for(uint32_t chain_id, const std::string& addr) const;

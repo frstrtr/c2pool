@@ -56,6 +56,7 @@
 #include <c2pool/merged/aux_chain_params.hpp>
 #include <c2pool/merged/aux_commitment_rule.hpp>
 #include <core/merged_chain_addr.hpp>
+#include <core/stratum_server.hpp>
 #include <core/address_utils.hpp>
 #include <c2pool/merged/aux_found_verdict.hpp>
 #include <c2pool/merged/merged_mining.hpp>
@@ -2029,6 +2030,401 @@ TEST(MergedAuxStratumLogin, TestnetSwappedLoginDoesNotCrossPay)
     r = branch_login(ltc, "", true, {{98, doge}}, {98, 63}, 98);
     EXPECT_TRUE(r.refuse.empty()) << r.refuse;
     EXPECT_EQ(r.script, core::merged_addr::merged_payout_script(nullptr, doge));
+}
+
+// ---- --merged-unspecified-to-owner ------------------------------------------
+
+namespace {
+
+constexpr uint32_t kAllSix[] = {98, 63, 16, 8211, 8224, 74};
+
+// The node owner's address on each of the six chains (mainnet).
+std::map<uint32_t, std::string> six_owners()
+{
+    return {{98, b58(30, 0xd0)}, {63, b58(56, 0xd1)}, {16, b58(25, 0xd2)},
+            {8211, b58(47, 0xd3)}, {8224, b58(16, 0xd4)}, {74, b58(63, 0xd5)}};
+}
+
+core::merged_addr::LoginResolution owner_login(const std::string& username, const std::string& merged_raw,
+                                               std::map<uint32_t, std::string> explicit_addrs,
+                                               const std::set<uint32_t>& configured,
+                                               const std::map<uint32_t, std::string>& owners, bool tn = false)
+{
+    using namespace core::merged_addr;
+    return resolve_merged_login(username, merged_raw, std::move(explicit_addrs), merged_chain_table(tn, kLtcAllNetworks),
+                                [&configured](uint32_t id) { return configured.count(id) > 0; },
+                                ltc_versions(tn), kLtcHrps, owners);
+}
+
+std::string ser(const core::merged_addr::LoginResolution& r)
+{
+    std::string s = r.primary + "|" + r.refuse + "|";
+    for (const auto& [id, a] : r.addresses)
+        s += std::to_string(id) + "=" + a + ";";
+    s += "|";
+    for (auto id : r.to_owner)
+        s += std::to_string(id) + ",";
+    return s;
+}
+
+} // namespace
+
+// Off (no chain covered, or only chains that are not configured): every
+// login resolves exactly as without the option.
+TEST(MergedAuxStratumLogin, OwnerOptionOffChangesNothing)
+{
+    std::vector<unsigned char> p32(32, 0x43);
+    const std::string ltc = b58(48, 0x01), doge = b58(30, 0x21);
+    struct U { std::string primary, merged; std::map<uint32_t, std::string> expl; };
+    const std::vector<U> us = {
+        {ltc, ""}, {b58(50, 0x02), ""}, {bech32::encode_segwit("ltc", 0, std::vector<unsigned char>(20, 0x42)), ""},
+        {bech32::encode_segwit("ltc", 0, p32), ""}, {ltc, doge}, {doge, ltc}, {doge, ""}, {ltc, b58(56, 0x0d)},
+        {ltc, b58(48, 0x09)}, {ltc, "", {{98, doge}}}, {"", ""}, {"not-an-address", ""}, {ltc, b58(30, 0x44)},
+    };
+    for (const std::set<uint32_t>& conf : {std::set<uint32_t>{98}, std::set<uint32_t>{98, 63},
+                                           std::set<uint32_t>{98, 63, 16, 8211, 8224, 74}})
+        for (const auto& u : us) {
+            const auto base = ser(owner_login(u.primary, u.merged, u.expl, conf, {}));
+            EXPECT_EQ(ser(owner_login(u.primary, u.merged, u.expl, conf, {{9999, b58(30, 0xd0)}})), base);
+            const auto plain = core::merged_addr::resolve_merged_login(
+                u.primary, u.merged, u.expl, core::merged_addr::merged_chain_table(false, kLtcAllNetworks),
+                [&conf](uint32_t id) { return conf.count(id) > 0; }, ltc_versions(false), kLtcHrps);
+            EXPECT_EQ(ser(plain), base);
+        }
+}
+
+// On, all six chains: each address the miner gives (the comma form, the
+// slash form, mining.set_merged_addresses, a swapped pair, a merged chain's
+// address as the primary) is paid as given; every other chain goes to the
+// node owner's address, never to the primary's hash160.
+TEST(MergedAuxStratumLogin, OwnerOptionPaysTheOwnerOnlyWhereTheMinerGaveNoAddress)
+{
+    const std::set<uint32_t> six(std::begin(kAllSix), std::end(kAllSix));
+    // without BELLS (whose P2SH 30 is DOGE's P2PKH): DOGE addresses identify
+    const std::set<uint32_t> no_bells = {98, 63, 8211, 8224, 74};
+    const auto owners = six_owners();
+    const std::string ltc = b58(48, 0x01), doge = b58(30, 0x21), pep = b58(56, 0x22), bells = b58(25, 0x23),
+                      lky = b58(47, 0x24), shic = b58(63, 0x25);
+    auto expect = [&](const core::merged_addr::LoginResolution& r, const std::set<uint32_t>& conf,
+                      const std::map<uint32_t, std::string>& given, const std::string& what) {
+        EXPECT_TRUE(r.refuse.empty()) << what << ": " << r.refuse;
+        std::set<uint32_t> to_owner(r.to_owner.begin(), r.to_owner.end());
+        EXPECT_EQ(r.addresses.size(), conf.size()) << what;
+        for (auto id : conf) {
+            ASSERT_TRUE(r.addresses.count(id)) << what << " chain " << id;
+            if (given.count(id)) {
+                EXPECT_EQ(r.addresses.at(id), given.at(id)) << what << " chain " << id;
+                EXPECT_FALSE(to_owner.count(id)) << what << " chain " << id;
+            } else {
+                EXPECT_EQ(r.addresses.at(id), owners.at(id)) << what << " chain " << id;
+                EXPECT_TRUE(to_owner.count(id)) << what << " chain " << id;
+            }
+        }
+    };
+    expect(owner_login(ltc, "", {}, six, owners), six, {}, "LTC alone");
+    expect(owner_login(b58(50, 0x02), "", {}, six, owners), six, {}, "LTC P2SH alone");
+    expect(owner_login(bech32::encode_segwit("ltc", 0, std::vector<unsigned char>(20, 0x42)), "", {}, six, owners), six,
+           {}, "ltc1q alone");
+    expect(owner_login(ltc, pep, {}, six, owners), six, {{63, pep}}, "LTC,PEP");
+    expect(owner_login(ltc, shic, {}, six, owners), six, {{74, shic}}, "LTC,SHIC");
+    expect(owner_login(ltc, "", {{16, bells}}, six, owners), six, {{16, bells}}, "LTC/16:BELLS");
+    expect(owner_login(ltc, "", {{8211, lky}, {63, pep}}, six, owners), six, {{8211, lky}, {63, pep}},
+           "set_merged_addresses LKY + PEP");
+    expect(owner_login(ltc, pep, {{16, bells}}, six, owners), six, {{63, pep}, {16, bells}}, "LTC,PEP + /16:BELLS");
+    expect(owner_login(ltc, doge, {}, no_bells, owners), no_bells, {{98, doge}}, "LTC,DOGE");
+    {
+        const auto r = owner_login(doge, ltc, {}, no_bells, owners);
+        expect(r, no_bells, {{98, doge}}, "DOGE,LTC (swapped)");
+        EXPECT_EQ(r.primary, ltc);
+    }
+    {
+        const auto r = owner_login(doge, "", {}, no_bells, owners);
+        expect(r, no_bells, {{98, doge}}, "DOGE alone (case 5)");
+        EXPECT_EQ(r.primary, doge) << "the parent payout keeps the DOGE address's hash160";
+    }
+    // A P2WSH primary: no hash160 to reuse; without the option those chains
+    // get no address at all.
+    const std::string p2wsh = bech32::encode_segwit("ltc", 0, std::vector<unsigned char>(32, 0x43));
+    expect(owner_login(p2wsh, "", {}, six, owners), six, {}, "P2WSH alone");
+    EXPECT_TRUE(owner_login(p2wsh, "", {}, six, {}).addresses.empty());
+    // Refusals are unchanged: an address two configured chains could take,
+    // a second address no chain identifies.
+    EXPECT_FALSE(owner_login(ltc, doge, {}, six, owners).refuse.empty());
+    EXPECT_FALSE(owner_login(ltc, b58(48, 0x09), {}, six, owners).refuse.empty());
+}
+
+// Per chain: only the chains listed go to the owner; the others keep the
+// auto-derive (the primary's hash160), byte-identical to the option off.
+TEST(MergedAuxStratumLogin, OwnerOptionPerChain)
+{
+    using namespace core::merged_addr;
+    const std::set<uint32_t> conf = {98, 63, 16};
+    const std::string ltc = b58(48, 0x01);
+    const auto r = owner_login(ltc, "", {}, conf, {{63, b58(56, 0xd1)}});
+    EXPECT_EQ(r.to_owner, std::vector<uint32_t>{63});
+    EXPECT_EQ(r.addresses.at(63), b58(56, 0xd1));
+    const auto off = owner_login(ltc, "", {}, conf, {});
+    const auto table = merged_chain_table(false, kLtcAllNetworks);
+    for (uint32_t id : {98u, 16u}) {
+        EXPECT_EQ(r.addresses.at(id), ltc);
+        EXPECT_EQ(merged_payout_script(find_chain(table, id), r.addresses.at(id)),
+                  merged_payout_script(find_chain(table, id), off.addresses.at(id)));
+    }
+    // DOGE alone covered: the DOGE-only node's every other shape is unchanged
+    const auto d = owner_login(ltc, b58(30, 0x21), {}, {98}, {{98, b58(30, 0xd0)}});
+    EXPECT_TRUE(d.to_owner.empty()) << "a DOGE address was given";
+    EXPECT_EQ(d.addresses.at(98), b58(30, 0x21));
+}
+
+// An empty login (redistributed by --redistribute) and an unusable one
+// (refused at the door) get no owner address on any chain: the option
+// changes only logins with a valid primary.
+TEST(MergedAuxStratumLogin, OwnerOptionLeavesEmptyAndInvalidLoginsAlone)
+{
+    const std::set<uint32_t> conf(std::begin(kAllSix), std::end(kAllSix));
+    for (const std::string& u : {std::string(), std::string("rig1"), std::string("not-an-address"),
+                                 b58(48, 0x01).substr(0, 30)}) {
+        const auto on = owner_login(u, "", {}, conf, six_owners());
+        EXPECT_TRUE(on.to_owner.empty()) << "'" << u << "'";
+        EXPECT_EQ(ser(on), ser(owner_login(u, "", {}, conf, {}))) << "'" << u << "'";
+    }
+    // invalid primary with a DOGE address: DOGE as given, the rest as before
+    const auto c4 = owner_login("not-an-address", b58(30, 0x21), {}, conf, six_owners());
+    EXPECT_TRUE(c4.to_owner.empty());
+    EXPECT_EQ(ser(c4), ser(owner_login("not-an-address", b58(30, 0x21), {}, conf, {})));
+}
+
+// A configured chain the stratum table does not identify addresses for
+// (DINGO, NMC, ...): without the option it gets no login address (its shares
+// follow the parent script); with it, the owner's.
+TEST(MergedAuxStratumLogin, OwnerOptionChainOutsideTheTable)
+{
+    const std::string ltc = b58(48, 0x01);
+    EXPECT_FALSE(owner_login(ltc, "", {}, {98, 50}, {}).addresses.count(50));
+    const auto r = owner_login(ltc, "", {}, {98, 50}, {{50, b58(30, 0xd6)}});
+    EXPECT_EQ(r.addresses.at(50), b58(30, 0xd6));
+    EXPECT_EQ(r.to_owner, std::vector<uint32_t>{50});
+    EXPECT_EQ(r.addresses.at(98), ltc);
+}
+
+// The owner's address: only one the operator configured, of the chain and
+// network, paid with the chain's own script type; never the built-in one.
+TEST(MergedAuxOwnerAddress, OwnChainAndNetworkOnly)
+{
+    using c2pool::merged::AuxNetwork;
+    using c2pool::merged::resolve_unspecified_owner_address;
+    struct C { const char* sym; uint8_t p2pkh, p2sh; };
+    for (const C& c : {C{"DOGE", 30, 22}, C{"PEP", 56, 22}, C{"BELLS", 25, 30}, C{"LKY", 47, 5}, C{"JKC", 16, 5},
+                       C{"SHIC", 63, 22}, C{"DINGO", 30, 22}, C{"NMC", 52, 13}}) {
+        auto r = resolve_unspecified_owner_address(c.sym, AuxNetwork::mainnet, b58(c.p2pkh, 0x51), "");
+        ASSERT_TRUE(r.ok) << c.sym << ": " << r.error;
+        EXPECT_EQ(r.source, "--merged-payout-address");
+        ASSERT_EQ(r.script.size(), 25u) << c.sym;
+        EXPECT_EQ(r.script[0], 0x76) << c.sym;
+        r = resolve_unspecified_owner_address(c.sym, AuxNetwork::mainnet, b58(c.p2sh, 0x52), "");
+        ASSERT_TRUE(r.ok) << c.sym << ": " << r.error;
+        ASSERT_EQ(r.script.size(), 23u) << c.sym << " P2SH is paid as P2SH";
+        EXPECT_EQ(r.script[0], 0xa9) << c.sym;
+        // another coin's address (LTC), a bad checksum, the testnet network
+        for (const auto& bad : {b58(48, 0x53), b58(c.p2pkh, 0x51).substr(1), b58(113, 0x54)}) {
+            r = resolve_unspecified_owner_address(c.sym, AuxNetwork::mainnet, bad, "");
+            EXPECT_FALSE(r.ok) << c.sym << " " << bad;
+            EXPECT_TRUE(r.script.empty());
+            EXPECT_NE(r.error.find(std::string("--merged-payout-address ") + c.sym + ":<address>"), std::string::npos)
+                << r.error;
+        }
+        // none configured: refused (the built-in createauxblock address is never used)
+        r = resolve_unspecified_owner_address(c.sym, AuxNetwork::mainnet, "", "");
+        EXPECT_FALSE(r.ok) << c.sym;
+    }
+    // testnet: the chain's testnet / regtest versions
+    EXPECT_TRUE(resolve_unspecified_owner_address("DOGE", AuxNetwork::testnet, b58(113, 0x55), "").ok);
+    EXPECT_TRUE(resolve_unspecified_owner_address("DOGE", AuxNetwork::testnet, b58(111, 0x55), "").ok);
+    EXPECT_FALSE(resolve_unspecified_owner_address("DOGE", AuxNetwork::testnet, b58(30, 0x55), "").ok);
+    // DOGE: --node-owner-merged-address when no --merged-payout-address DOGE:
+    auto d = resolve_unspecified_owner_address("doge", AuxNetwork::mainnet, "", b58(30, 0x56));
+    EXPECT_TRUE(d.ok) << d.error;
+    EXPECT_EQ(d.source, "--node-owner-merged-address");
+    d = resolve_unspecified_owner_address("DOGE", AuxNetwork::mainnet, b58(30, 0x57), b58(30, 0x56));
+    EXPECT_EQ(d.address, b58(30, 0x57)) << "--merged-payout-address DOGE: comes first";
+    EXPECT_FALSE(resolve_unspecified_owner_address("DOGE", AuxNetwork::mainnet, "", b58(48, 0x56)).ok);
+    // only DOGE takes --node-owner-merged-address
+    EXPECT_FALSE(resolve_unspecified_owner_address("PEP", AuxNetwork::mainnet, "", b58(56, 0x56)).ok);
+    // a chain c2pool has no address parameters for: cannot be checked
+    const auto u = resolve_unspecified_owner_address("FOO", AuxNetwork::mainnet, b58(30, 0x58), "");
+    EXPECT_FALSE(u.ok);
+    EXPECT_NE(u.error.find("no address parameters"), std::string::npos) << u.error;
+}
+
+// ---- the stratum session: the owner option reaches the job's merged scripts --
+
+namespace {
+
+// A work source that records the merged scripts each job is built with.
+struct RecordingWorkSource : core::stratum::IWorkSource {
+    core::stratum::StratumConfig cfg;
+    std::set<uint32_t> chains;
+    mutable std::mutex mu;
+    mutable std::vector<std::map<uint32_t, std::vector<unsigned char>>> builds;
+
+    const core::stratum::StratumConfig& get_stratum_config() const override { return cfg; }
+    std::function<uint256()> get_best_share_hash_fn() const override { return [] { return uint256(); }; }
+    std::string get_current_gbt_prevhash() const override { return std::string(64, '1'); }
+    uint64_t get_work_generation() const override { return 1; }
+    bool has_merged_chain(uint32_t id) const override { return chains.count(id) > 0; }
+    void register_stratum_worker(const std::string&, const core::stratum::WorkerInfo&) override {}
+    void unregister_stratum_worker(const std::string&) override {}
+    void update_stratum_worker(const std::string&, double, double, double, uint64_t, uint64_t, uint64_t) override {}
+    nlohmann::json get_current_work_template() const override
+    {
+        return {{"bits", "207fffff"}, {"previousblockhash", std::string(64, '1')}, {"version", 0x20000000},
+                {"curtime", 1793210000}, {"height", 100}};
+    }
+    std::vector<std::string> get_stratum_merkle_branches() const override { return {}; }
+    std::pair<std::string, std::string> get_coinbase_parts() const override { return {"01000000", "00000000"}; }
+    core::stratum::CoinbaseResult build_connection_coinbase(
+        const uint256&, const std::string&, const std::vector<unsigned char>&,
+        const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged) const override
+    {
+        std::lock_guard<std::mutex> l(mu);
+        builds.emplace_back(merged.begin(), merged.end());
+        core::stratum::CoinbaseResult r;
+        r.coinb1 = "01000000";
+        r.coinb2 = "00000000";
+        return r;
+    }
+    nlohmann::json mining_submit(const std::string&, const std::string&, const std::string&, const std::string&,
+                                 const std::string&, const std::string&, const std::string&,
+                                 const std::map<uint32_t, std::vector<unsigned char>>&,
+                                 const core::stratum::JobSnapshot*) override
+    {
+        return {{"result", true}};
+    }
+    uint32_t get_share_bits() const override { return 0x207fffff; }
+    uint32_t get_share_max_bits() const override { return 0x207fffff; }
+    double compute_share_difficulty(const std::string&, const std::string&, const std::string&, const std::string&,
+                                    const std::string&, const std::string&, uint32_t, const std::string&,
+                                    const std::string&, const std::vector<std::string>&) const override
+    {
+        return 1.0;
+    }
+    size_t count() const
+    {
+        std::lock_guard<std::mutex> l(mu);
+        return builds.size();
+    }
+    std::map<uint32_t, std::vector<unsigned char>> last() const
+    {
+        std::lock_guard<std::mutex> l(mu);
+        return builds.empty() ? std::map<uint32_t, std::vector<unsigned char>>{} : builds.back();
+    }
+};
+
+uint16_t free_port()
+{
+    boost::asio::io_context io;
+    boost::asio::ip::tcp::acceptor a(io, {boost::asio::ip::make_address("127.0.0.1"), 0});
+    return a.local_endpoint().port();
+}
+
+} // namespace
+
+// A real StratumServer and a miner over TCP: with the option on for PEP, a
+// login without a PEP address builds jobs paying PEP to the owner's script
+// (DOGE, not covered, keeps the auto-derive); mining.set_merged_addresses
+// takes PEP back; a re-authorize keeps that address and re-derives DOGE from
+// the new primary; an empty login gets no merged script.
+TEST(MergedAuxStratumSession, OwnerOptionReachesTheJobsMergedScripts)
+{
+    using namespace std::chrono_literals;
+    const std::string ltc = b58(48, 0x01), ltc2 = b58(48, 0x02), pep = b58(56, 0x22), pep2 = b58(56, 0x33);
+    const std::string owner = b58(56, 0xd1);
+    auto ws = std::make_shared<RecordingWorkSource>();
+    ws->chains = {98, 63};
+    ws->cfg.payout_p2pkh_versions = {48};
+    ws->cfg.payout_p2sh_versions = {50, 5};
+    ws->cfg.payout_bech32_hrps = {"ltc"};
+    ws->cfg.merged_parent_versions = kLtcAllNetworks;
+    const auto o = c2pool::merged::resolve_unspecified_owner_address("PEP", c2pool::merged::AuxNetwork::mainnet, owner, "");
+    ASSERT_TRUE(o.ok) << o.error;
+    ws->cfg.merged_owner_for_unspecified[63] = {"PEP", o.address, o.script};
+
+    boost::asio::io_context ioc;
+    auto guard = boost::asio::make_work_guard(ioc);
+    const uint16_t port = free_port();
+    core::StratumServer srv(ioc, "127.0.0.1", port, ws);
+    ASSERT_TRUE(srv.start());
+    std::thread io([&] { ioc.run(); });
+
+    const auto table = core::merged_addr::merged_chain_table(false, kLtcAllNetworks);
+    const auto script_of = [&](uint32_t id, const std::string& a) {
+        return core::merged_addr::merged_payout_script(core::merged_addr::find_chain(table, id), a);
+    };
+    boost::asio::io_context cio;
+    boost::asio::ip::tcp::socket sock(cio);
+    sock.connect({boost::asio::ip::make_address("127.0.0.1"), port});
+    const auto send = [&](const nlohmann::json& j) {
+        const std::string line = j.dump() + "\n";
+        boost::asio::write(sock, boost::asio::buffer(line));
+    };
+    const auto wait_build = [&](size_t n) {
+        for (int i = 0; i < 500 && ws->count() < n; ++i)
+            std::this_thread::sleep_for(10ms);
+        return ws->count() >= n;
+    };
+    send({{"id", 1}, {"method", "mining.subscribe"}, {"params", nlohmann::json::array()}});
+    std::this_thread::sleep_for(50ms);
+    size_t n = ws->count();
+    send({{"id", 2}, {"method", "mining.authorize"}, {"params", {ltc + ".rig1", "x"}}});
+    ASSERT_TRUE(wait_build(n + 1));
+    auto m = ws->last();
+    EXPECT_EQ(m[63], o.script) << "PEP: no address given -> the owner's";
+    EXPECT_EQ(m[98], script_of(98, ltc)) << "DOGE (not covered): the LTC address's key";
+
+    n = ws->count();
+    send({{"id", 3}, {"method", "mining.set_merged_addresses"}, {"params", {{{"63", pep2}}}}});
+    std::this_thread::sleep_for(50ms);
+    boost::asio::post(ioc, [&srv] { srv.notify_all(true); });   // as the node does, on the io thread
+    ASSERT_TRUE(wait_build(n + 1));
+    m = ws->last();
+    EXPECT_EQ(m[63], script_of(63, pep2)) << "PEP: the address the miner set";
+
+    n = ws->count();
+    send({{"id", 4}, {"method", "mining.authorize"}, {"params", {ltc2, "x"}}});
+    ASSERT_TRUE(wait_build(n + 1));
+    m = ws->last();
+    EXPECT_EQ(m[63], script_of(63, pep2)) << "set_merged_addresses outlives the re-authorize";
+    EXPECT_EQ(m[98], script_of(98, ltc2)) << "DOGE re-derived from the new primary";
+
+    n = ws->count();
+    send({{"id", 5}, {"method", "mining.authorize"}, {"params", {ltc + "," + pep, "x"}}});
+    ASSERT_TRUE(wait_build(n + 1));
+    m = ws->last();
+    EXPECT_EQ(m[63], script_of(63, pep)) << "the comma address replaces the set one";
+
+    // a second miner with an empty login: nothing for the owner
+    boost::asio::ip::tcp::socket sock2(cio);
+    sock2.connect({boost::asio::ip::make_address("127.0.0.1"), port});
+    const auto send2 = [&](const nlohmann::json& j) {
+        const std::string line = j.dump() + "\n";
+        boost::asio::write(sock2, boost::asio::buffer(line));
+    };
+    send2({{"id", 1}, {"method", "mining.subscribe"}, {"params", nlohmann::json::array()}});
+    std::this_thread::sleep_for(50ms);
+    n = ws->count();
+    send2({{"id", 2}, {"method", "mining.authorize"}, {"params", {"", "x"}}});
+    std::this_thread::sleep_for(300ms);
+    for (size_t i = n; i < ws->count(); ++i) {
+        std::lock_guard<std::mutex> l(ws->mu);
+        EXPECT_TRUE(ws->builds[i].empty()) << "an empty login carries no merged script";
+    }
+
+    sock.close();
+    sock2.close();
+    srv.stop();
+    guard.reset();
+    ioc.stop();
+    io.join();
 }
 
 // ---- the commitment rule: generated parity vectors, log-only ----------------

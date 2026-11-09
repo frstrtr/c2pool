@@ -852,3 +852,95 @@ TEST(MergedWeightsThreads, EveryTrackerCopyTakesTheCacheLock)
         }
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// --merged-unspecified-to-owner: the owner's address is an ordinary explicit
+// merged address of the share (Tier 1), so every node derives the same
+// merged payouts from it (p2pool's get_v36_merged_weights resolves the same
+// tiers). Its reach beyond the redirecting node's own shares is Tier 1.5: a
+// miner's shares WITHOUT an entry for the chain (minted by a node that does
+// not mine it, or by p2pool, which only writes DOGE entries) resolve to the
+// first explicit address registered for that miner's parent script.
+// ─────────────────────────────────────────────────────────────────────────
+
+namespace {
+
+constexpr uint32_t kPep = 63;
+
+uint256 add_entry_share(ltc::ShareTracker& t, const uint256& prev, uint64_t n, unsigned miner,
+                        const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& entries)
+{
+    auto* sh = new ltc::MergedMiningShare();
+    sh->m_hash = num_hash(0x0e0e, n);
+    sh->m_prev_hash = prev;
+    sh->m_desired_version = 36;
+    sh->m_bits = 0x1e0fffff;
+    sh->m_max_bits = sh->m_bits;
+    sh->m_donation = 50;
+    char hex[48];
+    std::snprintf(hex, sizeof(hex), "%02x%038x", miner & 0xff, miner * 2654435761u);
+    sh->m_pubkey_hash.SetHex(hex);
+    sh->m_pubkey_type = 0;
+    for (const auto& [id, script] : entries) {
+        ltc::MergedAddressEntry e;
+        e.m_chain_id = id;
+        e.m_script.m_data = script;
+        sh->m_merged_addresses.push_back(e);
+    }
+    ltc::ShareType st;
+    st = sh;
+    t.add(st);
+    return sh->m_hash;
+}
+
+using Entries = std::vector<std::pair<uint32_t, std::vector<unsigned char>>>;
+
+} // namespace
+
+TEST(MergedOwnerAddress, OwnerEntriesAreOrdinaryTierOneAddresses)
+{
+    QuietLog quiet;
+    const auto owner = p2pkh_script(0xd1), own1 = p2pkh_script(0xa1), own4 = p2pkh_script(0xa4);
+    // Each share: (miner, its entries as minted).
+    const std::vector<std::pair<unsigned, Entries>> minted = {
+        {1, {{kPep, own1}}},                    // miner 1 named its PEP address
+        {2, {{kPep, owner}}},                   // miner 2 on a node with the option, no PEP address
+        {4, {{kPep, own4}}},                    // miner 4 named its PEP address first...
+        {3, {}},                                // miner 3: no entry anywhere (parent script)
+        {2, {}},                                // miner 2 on a node without PEP (Tier 1.5)
+        {4, {{kPep, owner}}},                   // ...then mined on the option node
+        {1, {{kPep, own1}}},
+        {4, {}},                                // Tier 1.5: miner 4's first address
+        {2, {{kPep, owner}}},
+    };
+    // What each share resolves to: the same chain with every share's entry
+    // written out explicitly.
+    const std::vector<std::pair<unsigned, Entries>> resolved = {
+        {1, {{kPep, own1}}}, {2, {{kPep, owner}}}, {4, {{kPep, own4}}}, {3, {}}, {2, {{kPep, owner}}},
+        {4, {{kPep, owner}}}, {1, {{kPep, own1}}}, {4, {{kPep, own4}}}, {2, {{kPep, owner}}},
+    };
+    ltc::ShareTracker a, b;
+    uint256 ta, tb;
+    for (size_t i = 0; i < minted.size(); ++i) {
+        ta = add_entry_share(a, ta, i + 1, minted[i].first, minted[i].second);
+        tb = add_entry_share(b, tb, i + 1, resolved[i].first, resolved[i].second);
+    }
+    ASSERT_EQ(ta, tb);
+    const auto wa = a.get_merged_payout_weights(ta, kPep);
+    const auto wb = b.get_merged_payout_weights(tb, kPep);
+    EXPECT_EQ(ser(wa), ser(wb));
+    // owner: miner 2's three shares and miner 4's one; own1: 2; own4: 2; miner 3: 1
+    std::map<std::vector<unsigned char>, uint288> by_script(wa.resolved.begin(), wa.resolved.end());
+    ASSERT_EQ(by_script.size(), 4u);
+    EXPECT_EQ(by_script.at(own4), by_script.at(own1));
+    EXPECT_EQ(by_script.at(owner), by_script.at(own1) + by_script.at(own1));
+    // The merged coinbase and the merged payout hash are those of the
+    // explicit chain (the hash is over the parent scripts: unchanged).
+    EXPECT_EQ(ser(ltc::ShareTracker::merged_payout_outputs(wa, kDogeValue, combined_donation())),
+              ser(ltc::ShareTracker::merged_payout_outputs(wb, kDogeValue, combined_donation())));
+    uint256 block_target;
+    block_target.SetHex("00000000000000000000ffff00000000000000000000000000000000000000ff");
+    EXPECT_EQ(a.compute_merged_payout_hash(ta, block_target), b.compute_merged_payout_hash(tb, block_target));
+    // DOGE (no entries in this chain): every share follows its parent script.
+    EXPECT_EQ(ser(a.get_merged_payout_weights(ta, kDoge)), ser(b.get_merged_payout_weights(tb, kDoge)));
+}

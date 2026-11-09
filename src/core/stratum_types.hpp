@@ -162,6 +162,16 @@ struct StratumConfig {
     // by a merged chain when a login address is identified
     // (core/merged_chain_addr.hpp).
     std::vector<uint8_t>     merged_parent_versions;
+    // --merged-unspecified-to-owner: per merged chain id, the node owner's
+    // address and its script on that chain. A miner who gives no address for
+    // such a chain is paid there to this address instead of the primary's
+    // hash160 (core/merged_chain_addr.hpp resolve_merged_login). Empty: off.
+    struct MergedOwnerAddress {
+        std::string symbol;
+        std::string address;
+        std::vector<unsigned char> script;
+    };
+    std::map<uint32_t, MergedOwnerAddress> merged_owner_for_unspecified;
 };
 
 /// Frozen share-construction fields returned by ref_hash_fn. These

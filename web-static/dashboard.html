@@ -2153,6 +2153,7 @@
                         <span class="badge"><span id="payouts_total">0</span> <span class="symbol-small">DASH</span></span>
                         <span class="badge" id="merged_payouts_badge" style="display: none; background: #6f42c1;"><span id="merged_payouts_total">0</span> <span id="merged_payouts_symbol">AUX</span></span>
                     </div>
+                    <div id="merged_owner_note" style="display: none; color: var(--text-secondary); font-size: 0.85em;"></div>
                 </div>
                 <div class="table-scroll">
                     <table id="payouts" class="data-table">
@@ -3722,6 +3723,17 @@
         }
 
         function renderLocalStats(local_stats) {
+                // --merged-unspecified-to-owner: merged chains on which a miner
+                // who gives no address for the chain pays the node owner.
+                var _mo = local_stats.merged_unspecified_to_owner;
+                var _moNote = d3.select('#merged_owner_note');
+                if (_mo && _mo.enabled && _mo.chains && _mo.chains.length) {
+                    _moNote.text('Miners who give no address for ' + _mo.chains.map(function(c) { return c.symbol; }).join(', ') +
+                        ' are paid there to the node owner\'s address (--merged-unspecified-to-owner).')
+                        .style('display', null);
+                } else {
+                    _moNote.style('display', 'none');
+                }
                 d3.select('#peers_in').text(local_stats.peers.incoming);
                 d3.select('#peers_out').text(local_stats.peers.outgoing);
                 d3.select('#peers_total').text(local_stats.peers.incoming + local_stats.peers.outgoing);

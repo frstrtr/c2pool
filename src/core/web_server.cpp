@@ -6046,6 +6046,14 @@ nlohmann::json MiningInterface::rest_local_stats()
                                             {"would_reject", st.would_reject.load()},
                                             {"last_reason", last}};
     }
+    // --merged-unspecified-to-owner: the chains on which a miner who gives no
+    // address for the chain is paid to the node owner's address.
+    {
+        nlohmann::json chains = nlohmann::json::array();
+        for (const auto& [id, o] : m_stratum_config.merged_owner_for_unspecified)
+            chains.push_back({{"chain_id", id}, {"symbol", o.symbol}, {"owner_address", o.address}});
+        result["merged_unspecified_to_owner"] = {{"enabled", !chains.empty()}, {"chains", chains}};
+    }
     // Merged (aux) blocks refused at assembly, e.g. DOGE above 1,000,000 bytes.
     result["merged_block_refusals_by_code"] = m_mm_manager ? m_mm_manager->get_block_refusals_json()
                                                            : nlohmann::json::object();

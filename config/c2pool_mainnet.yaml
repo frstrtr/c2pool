@@ -77,6 +77,12 @@ donation_percentage: 0.1       # Developer donation % (default: 0.1%)
 #                               # with an RPC daemon except DOGE; an address of another chain
 #                               # or network disables that chain at startup.
 #                               # CLI: --merged-payout-address SYMBOL:ADDRESS
+# merged_unspecified_to_owner: false  # A miner with a valid LTC address but no address
+#                               # for a merged chain is paid on it to the node owner's
+#                               # address (merged_payout_addresses; DOGE also
+#                               # node_owner_merged_address). A chain without a valid
+#                               # one is not mined. CLI: --merged-unspecified-to-owner
+# merged_unspecified_to_owner_chains: [DOGE, PEP]  # The same for these chains only
 # redistribute: pplns           # Redistribution mode: pplns, fee, boost, donate
 
 # ─── Stratum per-connection vardiff tuning ───────────────────────────────────
