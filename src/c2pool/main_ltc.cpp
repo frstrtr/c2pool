@@ -7078,6 +7078,12 @@ int main(int argc, char* argv[]) {
                     // AutoRatchet: determine share version from network state
                     auto [share_version, desired_ver] = auto_ratchet->get_share_version(
                         *guard, frozen_prev_share);
+                    // V36 shares this node makes resolve their merged payout
+                    // from themselves only (share_check.hpp
+                    // MERGED_OWN_ADDRESS_DESIRED_VERSION); still a V36 vote.
+                    if (share_version >= 36)
+                        desired_ver = std::max<int64_t>(desired_ver,
+                                                        static_cast<int64_t>(ltc::MERGED_OWN_ADDRESS_DESIRED_VERSION));
                     {
                         static int rv_log = 0;
                         if (rv_log++ < 5 || rv_log % 100 == 0)

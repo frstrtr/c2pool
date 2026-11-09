@@ -725,17 +725,23 @@ address nothing of the previous login is kept (only
 at once. While the merged chains are still being set up at startup, logins are
 refused with "merged mining not ready yet; retry".
 
-Merged payouts are derived from the sharechain with the same rules in c2pool
-and p2pool: a share's own merged address for the chain (Tier 1); for a share
-without one, the first merged address for the chain **this node** has seen in
-a share of the same parent script since it started, shares loaded at startup
-included (Tier 1.5); else the parent key. Tier 1.5 is per node and depends on
-the order the node received shares, so two nodes can derive different payouts
-for a miner's shares without a merged address (p2pool nodes then reject each
-other's DOGE coinbase for them). That is the case in p2pool and c2pool alike;
-c2pool's own shares always carry an address for every chain they can (the
-login's, the auto-derived one, the redistribution recipient's), which keeps
-them out of it. `--solo` / `--custodial` merged payouts do not use per-miner
+Merged payouts are derived from the sharechain, share by share. Shares made by
+c2pool v0.2.12 and later (V36 format, `desired_version` 37 — still a V36 vote)
+pay a chain to their own merged address for it, else to their own parent key:
+one share's merged address never pays for another share. Older V36 shares
+(`desired_version` 36: earlier c2pool, p2pool) keep the old rule: their own
+address (Tier 1); else the first merged address for the chain **this node** has
+seen in a share of the same parent script since it started (Tier 1.5); else the
+parent key. Each share is resolved by its own rule in every window, so shares
+already in the window when a node upgrades keep their payouts and nothing is
+orphaned. Tier 1.5 depended on the order a node received shares (two nodes
+could derive different payouts, and p2pool nodes then refused each other's
+DOGE coinbase), and one share naming another miner's parent script could take
+that miner's address-less shares; v0.2.12 shares are immune to both. A node
+that is not upgraded (p2pool, older c2pool) still applies Tier 1.5 to v0.2.12
+shares too, so it can derive different merged payouts for those of them that
+carry no address for a chain (c2pool's own shares always carry one for every
+chain they can); upgrade every node. `--solo` / `--custodial` merged payouts do not use per-miner
 merged addresses, and `c2pool-btc` (NMC) and `c2pool-dgb` (DOGE) do not carry
 them.
 

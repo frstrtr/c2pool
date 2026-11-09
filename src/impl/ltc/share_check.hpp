@@ -891,6 +891,18 @@ inline std::vector<unsigned char> normalize_script_for_merged(
     return {};
 }
 
+// The merged payout rule of a V36 share, by its desired_version (the share
+// version v0.2.12 nodes produce: V36 format, desired_version 37):
+//   < 37: Tier 1 (the share's own merged address for the chain), else Tier
+//         1.5 (the first explicit merged address this node has seen for the
+//         share's parent script), else the parent script;
+//  >= 37: Tier 1, else the share's own parent script. No Tier 1.5: one share's
+//         merged address never pays for another share, and every node derives
+//         the same payout whatever order it received the shares in.
+// Shares of either version are resolved by their own rule in every window, so
+// the shares already in the window when nodes upgrade keep theirs.
+inline constexpr uint64_t MERGED_OWN_ADDRESS_DESIRED_VERSION = 37;
+
 // MERGED: prefix for weight map keys — matches p2pool's 'MERGED:' + hex string.
 // Keeps Tier 1/1.5 (explicit DOGE script) keys separate from raw LTC script keys
 // in the same weight map, preventing V35+V36 weight collapse for the same miner.

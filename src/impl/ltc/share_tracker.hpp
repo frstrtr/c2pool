@@ -2672,7 +2672,10 @@ public:
                 // Tier 1.5: retroactive lookup of the same miner's explicit merged
                 // address from their other shares.  Try the raw parent script, then
                 // its normalized P2PKH form (normalize is a lookup PROBE only here).
-                if (weight_key.empty())
+                // Only for shares of the old rule (desired_version < 37,
+                // MERGED_OWN_ADDRESS_DESIRED_VERSION): a newer share without an
+                // address for the chain pays its own parent script.
+                if (weight_key.empty() && obj->m_desired_version < MERGED_OWN_ADDRESS_DESIRED_VERSION)
                 {
                     auto table_it = m_miner_merged_addr.find(*chain_id);
                     if (table_it != m_miner_merged_addr.end())
