@@ -34,6 +34,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <random>
 #include <set>
 #include <span>
 #include <stdexcept>
@@ -52,6 +53,8 @@
 #include <core/pack.hpp>
 #include <core/uint256.hpp>
 #include <c2pool/merged/aux_chain_params.hpp>
+#include <c2pool/merged/aux_commitment_rule.hpp>
+#include <core/merged_chain_addr.hpp>
 #include <c2pool/merged/aux_found_verdict.hpp>
 #include <c2pool/merged/merged_mining.hpp>
 #include <impl/doge/coin/auxpow.hpp>
@@ -456,6 +459,7 @@ TEST(MergedAuxPoll, HungChainDropsOutTheOthersKeepCommitting)
 {
     Rig r({{"DOGE", 98}, {"PEP", 63}});
     r.mm.set_refresh_round_deadline(300ms);
+    r.mm.set_unresponsive_after(200ms);
     r.mm.refresh_aux_work();
     ASSERT_EQ(r.tree_size(), 2u);
     EXPECT_EQ(r.carried(), (std::set<uint32_t>{98, 63}));
@@ -542,25 +546,50 @@ TEST(MergedAuxPoll, FailingChainDropsOutAndComesBack)
     EXPECT_EQ(r.tree_size(), p2pool_tree_size({98, 63, 1}));
 }
 
-// A chain slower than the deadline is out of that round only: its answer is
-// applied when it comes.
-TEST(MergedAuxPoll, SlowChainIsOutOfThatRoundOnly)
+// A chain slower than the round deadline but answering (a daemon whose calls
+// take seconds) is not waited for and stays committed with its last work;
+// its answer is applied when it comes. One still hanging past the hang
+// threshold drops out.
+TEST(MergedAuxPoll, SlowChainStaysCommittedHungChainDropsOut)
 {
     Rig r({{"DOGE", 98}, {"PEP", 63}});
     r.mm.set_refresh_round_deadline(150ms);
+    r.mm.set_unresponsive_after(2'000ms);
     r.mm.refresh_aux_work();
+    ASSERT_EQ(r.tree_size(), 2u);
+
+    // slow: PEP's fetch takes ~600 ms
     r.chain(1).hang();
     r.chain(1).advance("ee");
+    auto t0 = Clock::now();
+    r.mm.refresh_aux_work();
+    EXPECT_LT(ms_since(t0), 500) << "the round waited for the slow chain";
+    EXPECT_TRUE(r.responsive("PEP"));
+    EXPECT_EQ(r.tree_size(), 2u) << "PEP stays committed with its last work";
+    std::this_thread::sleep_for(450ms);
+    r.chain(1).release();
+    t0 = Clock::now();
+    while (r.mm.get_current_work().at(63).height != r.chain(1).height && ms_since(t0) < 5000)
+        std::this_thread::sleep_for(5ms);
+    r.mm.refresh_aux_work();
+    EXPECT_EQ(r.mm.get_current_work().at(63).height, r.chain(1).height) << "its answer applied";
+    EXPECT_EQ(r.tree_size(), 2u);
+
+    // hung past the threshold: out until it answers
+    r.mm.set_unresponsive_after(300ms);
+    r.chain(1).hang();
+    r.chain(1).advance("ef");
+    r.mm.refresh_aux_work();
+    std::this_thread::sleep_for(350ms);
     r.mm.refresh_aux_work();
     EXPECT_FALSE(r.responsive("PEP"));
     EXPECT_EQ(r.tree_size(), 1u);
     r.chain(1).release();
-    const auto t0 = Clock::now();
+    t0 = Clock::now();
     while (!r.responsive("PEP") && ms_since(t0) < 5000)
         std::this_thread::sleep_for(5ms);
     r.mm.refresh_aux_work();
     EXPECT_TRUE(r.responsive("PEP"));
-    EXPECT_EQ(r.mm.get_current_work().at(63).height, r.chain(1).height);
     EXPECT_EQ(r.tree_size(), 2u);
 }
 
@@ -591,12 +620,14 @@ using tcp = net::ip::tcp;
 /// `handler` (method, params) -> result; a thrown RpcError is an "error"
 /// object (HTTP 500, as bitcoind). close_after_response: the connection is
 /// closed after each answer (a daemon's idle timeout). silent: accepts and
-/// never answers.
+/// never answers. Four threads, like bitcoind's -rpcthreads: a slow call on
+/// one connection does not hold the others.
 struct FakeDaemon {
     struct RpcError { int code; std::string message; };
     net::io_context io;
-    tcp::acceptor acc{io};
-    std::thread th;
+    tcp::acceptor acc{net::make_strand(io)};   // each socket on its own strand too
+    std::vector<std::thread> th;
+    std::mutex socks_mu;
     std::vector<std::shared_ptr<tcp::socket>> socks;
     std::atomic<int> requests{0};
     std::atomic<int> accepts{0};
@@ -614,22 +645,27 @@ struct FakeDaemon {
         acc.listen();
         port = acc.local_endpoint().port();
         accept();
-        th = std::thread([this] { io.run(); });
+        for (int i = 0; i < 4; ++i)
+            th.emplace_back([this] { io.run(); });
     }
     ~FakeDaemon()
     {
         stop();
         guard.reset();
         io.stop();
-        th.join();
+        for (auto& t : th)
+            t.join();
     }
     void accept()
     {
-        auto s = std::make_shared<tcp::socket>(io);
+        auto s = std::make_shared<tcp::socket>(net::make_strand(io));
         acc.async_accept(*s, [this, s](boost::system::error_code ec) {
             if (ec) return;
             ++accepts;
-            socks.push_back(s);
+            {
+                std::lock_guard<std::mutex> l(socks_mu);
+                socks.push_back(s);
+            }
             serve(s);
             accept();
         });
@@ -673,10 +709,16 @@ struct FakeDaemon {
     void stop()
     {
         std::promise<void> done;
-        net::post(io, [this, &done] {
+        net::post(acc.get_executor(), [this, &done] {
             boost::system::error_code ig;
             acc.close(ig);
-            for (auto& s : socks) { s->shutdown(tcp::socket::shutdown_both, ig); s->close(ig); }
+            std::lock_guard<std::mutex> l(socks_mu);
+            for (auto& s : socks)
+                net::post(s->get_executor(), [s] {
+                    boost::system::error_code e;
+                    s->shutdown(tcp::socket::shutdown_both, e);
+                    s->close(e);
+                });
             socks.clear();
             done.set_value();
         });
@@ -902,21 +944,113 @@ TEST(MergedAuxVerdict, NonDogeBlockFollowsTheDaemonsChain)
 
 TEST(MergedAuxBlockSize, EachChainItsOwnLimit)
 {
-    using c2pool::merged::aux_chain_max_block_bytes;
-    EXPECT_EQ(aux_chain_max_block_bytes(98u), 1'000'000u);    // DOGE
-    EXPECT_EQ(aux_chain_max_block_bytes(63u), 1'000'000u);    // PEP
-    EXPECT_EQ(aux_chain_max_block_bytes(8211u), 1'000'000u);  // LKY
-    EXPECT_EQ(aux_chain_max_block_bytes(74u), 1'000'000u);    // SHIC
-    EXPECT_EQ(aux_chain_max_block_bytes(16u), 4'000'000u);    // BELLS (weight)
-    EXPECT_EQ(aux_chain_max_block_bytes(8224u), 4'000'000u);  // JKC (weight)
-    EXPECT_EQ(aux_chain_max_block_bytes(8225u), 4'000'000u);  // JKC testnet / regtest
-    EXPECT_EQ(aux_chain_max_block_bytes(1u), 4'000'000u);     // NMC (weight)
-    EXPECT_EQ(aux_chain_max_block_bytes(50u), 10'000'000u);   // DINGO
-    EXPECT_EQ(aux_chain_max_block_bytes(12345u), 0u);         // unknown: no guard
+    using c2pool::merged::aux_block_limit;
+    struct Row { uint32_t id; uint32_t stripped; uint32_t weight; };
+    const Row rows[] = {
+        {98, 1'000'000, 0}, {63, 1'000'000, 0}, {8211, 1'000'000, 0}, {74, 1'000'000, 0},   // MAX_BLOCK_BASE_SIZE
+        {50, 10'000'000, 0},                                                                    // DINGO after v18
+        {16, 1'000'000, 4'000'000}, {8224, 1'000'000, 4'000'000}, {8225, 1'000'000, 4'000'000},
+        {1, 1'000'000, 4'000'000},                                                              // segwit: weight
+    };
+    for (const auto& r : rows) {
+        const auto l = aux_block_limit(r.id);
+        EXPECT_EQ(l.max_stripped, r.stripped) << r.id;
+        EXPECT_EQ(l.max_weight, r.weight) << r.id;
+    }
+    EXPECT_FALSE(aux_block_limit(12345u).known()) << "unknown: no guard";
     AuxChainConfig c;
     c.chain_id = 63;
     c.max_block_bytes = 2'000'000;
-    EXPECT_EQ(aux_chain_max_block_bytes(c), 2'000'000u);
+    EXPECT_EQ(aux_block_limit(c).max_stripped, 2'000'000u);
+    // Namecoin CheckBlock: stripped * 4 <= 4,000,000 and weight <= 4,000,000.
+    const auto nmc = aux_block_limit(1u);
+    EXPECT_TRUE(nmc.check(1'000'000, 1'000'000).empty());
+    EXPECT_FALSE(nmc.check(1'000'001, 1'000'001).empty()) << "stripped over 1,000,000";
+    EXPECT_TRUE(nmc.check(900'000, 1'300'000).empty()) << "weight 4,000,000";
+    EXPECT_FALSE(nmc.check(900'000, 1'300'001).empty()) << "weight over 4,000,000";
+    EXPECT_FALSE(aux_block_limit(98u).check(1'000'001, 1'000'001).empty());
+}
+
+// The stripped size of a transaction: BIP144 marker, flag and witness
+// stacks removed; a legacy one whole; one that does not parse: nullopt.
+TEST(MergedAuxBlockSize, StrippedTransactionSize)
+{
+    using c2pool::merged::tx_stripped_size;
+    // version | vin 1: prevout 36, script 0, sequence | vout 1: value 8, script 1 (OP_TRUE) | locktime
+    std::vector<uint8_t> legacy{0x02, 0, 0, 0, 0x01};
+    legacy.insert(legacy.end(), 36, 0x11);
+    legacy.push_back(0x00);
+    legacy.insert(legacy.end(), 4, 0xff);
+    legacy.push_back(0x01);
+    legacy.insert(legacy.end(), 8, 0x01);
+    legacy.push_back(0x01);
+    legacy.push_back(0x51);
+    legacy.insert(legacy.end(), 4, 0x00);
+    EXPECT_EQ(tx_stripped_size(legacy), std::optional<size_t>(legacy.size()));
+    // The same with a witness of two items (72 and 33 bytes).
+    std::vector<uint8_t> sw(legacy.begin(), legacy.begin() + 4);
+    sw.push_back(0x00);
+    sw.push_back(0x01);
+    sw.insert(sw.end(), legacy.begin() + 4, legacy.end() - 4);
+    sw.push_back(0x02);
+    sw.push_back(72);
+    sw.insert(sw.end(), 72, 0x30);
+    sw.push_back(33);
+    sw.insert(sw.end(), 33, 0x02);
+    sw.insert(sw.end(), 4, 0x00);
+    EXPECT_EQ(tx_stripped_size(sw), std::optional<size_t>(legacy.size()));
+    std::vector<uint8_t> cut(sw.begin(), sw.end() - 5);
+    EXPECT_EQ(tx_stripped_size(cut), std::nullopt);
+}
+
+// A segwit chain (NMC): a block whose transactions carry 1.2 MB of witness
+// is under its limits (stripped < 1,000,000, weight <= 4,000,000) and goes
+// out, though its full size is over 1,000,000; one whose weight is over
+// 4,000,000 is refused and neither submitted nor relayed.
+TEST(MergedAuxBlockSize, SegwitChainCountsTheStrippedSizeAndTheWeight)
+{
+    // One input whose witness holds 1,200,000 bytes.
+    std::vector<uint8_t> tx{0x02, 0, 0, 0, 0x00, 0x01, 0x01};
+    tx.insert(tx.end(), 36, 0x22);
+    tx.push_back(0x00);
+    tx.insert(tx.end(), 4, 0xff);
+    tx.push_back(0x01);
+    tx.insert(tx.end(), 8, 0x01);
+    tx.push_back(0x01);
+    tx.push_back(0x51);
+    tx.push_back(0x01);                               // one witness item
+    tx.push_back(0xfe);                               // compact size, 4 bytes
+    for (uint32_t v = 1'200'000, k = 0; k < 4; ++k, v >>= 8) tx.push_back(static_cast<uint8_t>(v & 0xff));
+    tx.insert(tx.end(), 1'200'000, 0x42);
+    tx.insert(tx.end(), 4, 0x00);
+    ASSERT_TRUE(c2pool::merged::tx_stripped_size(tx).has_value());
+    const std::string hex = hex_of(tx);
+    {
+        Rig r({{"DOGE", 98}, {"NMC", 1}});
+        r.chain(1).tx_data = {hex};
+        r.mm.refresh_aux_work();
+        submit_share(r.mm, r.mm.get_auxpow_commitment());
+        EXPECT_EQ(r.chain(1).submitted(), 1u) << "NMC: stripped and weight within limits";
+        EXPECT_EQ(r.mm.get_block_refusals_json().value("NMC:oversize", 0), 0);
+    }
+    {
+        // 4,000,001 witness bytes: weight over 4,000,000.
+        std::vector<uint8_t> heavy(tx.begin(), tx.begin() + 7 + 36 + 1 + 4 + 1 + 8 + 2 + 1);
+        heavy.push_back(0xfe);
+        for (uint32_t v = 4'000'001, k = 0; k < 4; ++k, v >>= 8) heavy.push_back(static_cast<uint8_t>(v & 0xff));
+        heavy.insert(heavy.end(), 4'000'001, 0x42);
+        heavy.insert(heavy.end(), 4, 0x00);
+        ASSERT_TRUE(c2pool::merged::tx_stripped_size(heavy).has_value());
+        Rig r({{"DOGE", 98}, {"NMC", 1}});
+        std::vector<std::string> relayed;
+        r.mm.set_block_relay_fn([&relayed](uint32_t cid, const std::string&) { relayed.push_back(std::to_string(cid)); });
+        r.chain(1).tx_data = {hex_of(heavy)};
+        r.mm.refresh_aux_work();
+        submit_share(r.mm, r.mm.get_auxpow_commitment());
+        EXPECT_EQ(r.chain(1).submitted(), 0u);
+        EXPECT_EQ(r.mm.get_block_refusals_json().value("NMC:oversize", 0), 1);
+        EXPECT_EQ(relayed, std::vector<std::string>{"98"}) << "the refused block is not relayed";
+    }
 }
 
 // PEP's block over 1,000,000 bytes is refused (pepecoind's bad-blk-length):
@@ -951,7 +1085,7 @@ TEST(MergedAuxSubmit, ThrowingBackendDoesNotStopTheOthers)
     bool pep_error = false;
     for (const auto& b : r.mm.get_discovered_blocks())
         if (b.symbol == "PEP")
-            pep_error = b.verdict.rfind("error: backend threw", 0) == 0 && !b.accepted;
+            pep_error = b.verdict.rfind("unknown: the backend threw", 0) == 0 && !b.accepted;
     EXPECT_TRUE(pep_error);
 }
 
@@ -1016,4 +1150,728 @@ TEST(MergedAuxTree, HeightIsCapped)
     EXPECT_EQ(r.mm.chain_count(), 2u);
     r.mm.refresh_aux_work();
     EXPECT_EQ(r.tree_size(), 2u);
+}
+
+// ---- Finds are never lost to the poll: own submit connection, no backoff,
+// ---- no answer = unknown (verified against the chain), relay first ------------
+
+namespace {
+
+using c2pool::merged::AuxChainRPC;
+using MHI = MergedMiningManager::MergedHeaderInfo;
+
+uint32_t le32_at(const std::vector<uint8_t>& c, size_t o)
+{
+    return c[o] | (c[o + 1] << 8) | (c[o + 2] << 16) | (uint32_t(c[o + 3]) << 24);
+}
+
+uint32_t get_expected_index(uint32_t nonce, uint32_t chain_id, unsigned h)
+{
+    uint32_t r = nonce;
+    r = r * 1103515245u + 12345u;
+    r += chain_id;
+    r = r * 1103515245u + 12345u;
+    return r % (1u << h);
+}
+
+/// The (header infos, commitment) pair stratum puts in one job: the tree size
+/// is p2pool's make_auxpow_tree over the carried chain ids and the root is
+/// the tree over exactly the carried blocks (what a V36 peer checks). "" when
+/// consistent.
+std::string pair_problem(const std::vector<MHI>& infos, const std::vector<uint8_t>& c)
+{
+    if (c.empty())
+        return infos.empty() ? "" : "infos without a commitment";
+    if (c.size() != 44)
+        return "commitment of " + std::to_string(c.size()) + " bytes";
+    const uint32_t size = le32_at(c, 36), nonce = le32_at(c, 40);
+    if (nonce != 0)
+        return "nonce " + std::to_string(nonce);
+    std::set<uint32_t> ids;
+    for (const auto& i : infos) ids.insert(i.chain_id);
+    if (ids.size() != infos.size())
+        return "a chain carried twice";
+    if (infos.empty())
+        return "commitment without infos";
+    if (size != p2pool_tree_size(ids))
+        return "tree size " + std::to_string(size) + " != p2pool " + std::to_string(p2pool_tree_size(ids));
+    unsigned h = 0;
+    while ((1u << h) < size) ++h;
+    std::vector<uint256> layer(size);
+    for (const auto& i : infos) {
+        if (i.block_header.size() != 80) return "header not 80 bytes";
+        layer[get_expected_index(0, i.chain_id, h)] = Hash(std::span<const unsigned char>(i.block_header.data(), 80));
+    }
+    while (layer.size() > 1) {
+        std::vector<uint256> next(layer.size() / 2);
+        for (size_t k = 0; k < next.size(); ++k) next[k] = Hash(layer[2 * k], layer[2 * k + 1]);
+        layer = std::move(next);
+    }
+    uint256 root;
+    for (int i = 0; i < 32; ++i) root.data()[i] = c[4 + 31 - i];
+    if (root != layer[0])
+        return "root is not the tree over the carried blocks";
+    // the c2pool share check accepts it too
+    std::vector<std::pair<uint32_t, std::vector<unsigned char>>> carried;
+    for (const auto& i : infos) carried.emplace_back(i.chain_id, i.block_header);
+    return c2pool::merged::check_merged_aux_commitment(carried, root, size);
+}
+
+/// A thread-safe daemon-shaped backend for the stress test.
+struct StressBackend : c2pool::merged::IAuxChainBackend {
+    AuxChainConfig cfg;
+    mutable std::mutex mu;
+    std::string tip;
+    int height;
+    bool down{false};
+    int hang_ms{0};
+    bool throw_int{false};
+    std::vector<std::string> blocks;
+    StressBackend(std::string sym, uint32_t id, int h) : height(h)
+    {
+        cfg.symbol = std::move(sym);
+        cfg.chain_id = id;
+        cfg.multiaddress = true;
+        tip = std::string(56, '0') + "0000" + std::to_string(1000 + id % 1000).substr(1) + "0";
+    }
+    void set(bool d, int hang, bool ti)
+    {
+        std::lock_guard<std::mutex> l(mu);
+        down = d; hang_ms = hang; throw_int = ti;
+    }
+    void advance()
+    {
+        std::lock_guard<std::mutex> l(mu);
+        ++height;
+        char buf[17];
+        std::snprintf(buf, sizeof buf, "%016x", static_cast<unsigned>(height * 7919u + cfg.chain_id));
+        tip = std::string(48, '0') + buf;
+    }
+    void maybe_fail()
+    {
+        int hang;
+        bool d, ti;
+        { std::lock_guard<std::mutex> l(mu); hang = hang_ms; d = down; ti = throw_int; }
+        if (hang) std::this_thread::sleep_for(std::chrono::milliseconds(hang));
+        if (ti) throw 42;   // not a std::exception
+        if (d) throw std::runtime_error("down");
+    }
+    c2pool::merged::AuxWork get_work_template() override
+    {
+        maybe_fail();
+        std::lock_guard<std::mutex> l(mu);
+        c2pool::merged::AuxWork w;
+        w.chain_id = cfg.chain_id;
+        w.height = height;
+        w.coinbase_value = 1'000'000'000'000ULL + static_cast<uint64_t>(height);
+        w.block_hash.SetHex(tip);
+        w.target.SetHex(EASY_TARGET);
+        w.prev_block_hash = tip;
+        w.block_template = {
+            {"previousblockhash", tip}, {"height", height}, {"bits", "207fffff"},
+            {"curtime", 1793210000 + height}, {"version", (cfg.chain_id << 16) | 4u},
+            {"coinbasevalue", 1'000'000'000'000LL + height}, {"transactions", nlohmann::json::array()},
+        };
+        return w;
+    }
+    c2pool::merged::AuxWork create_aux_block(const std::string&) override { return get_work_template(); }
+    bool connect() override { return true; }
+    bool submit_block(const std::string& hex) override
+    {
+        maybe_fail();
+        std::lock_guard<std::mutex> l(mu);
+        blocks.push_back(hex);
+        return true;
+    }
+    bool submit_aux_block(const uint256&, const std::string&) override { return true; }
+    std::string get_block_hex(const std::string&) override { return {}; }
+    std::string get_best_block_hash() override
+    {
+        maybe_fail();
+        std::lock_guard<std::mutex> l(mu);
+        return tip;
+    }
+    std::vector<NetService> getpeerinfo() override { return {}; }
+    const AuxChainConfig& config() const override { return cfg; }
+    std::vector<std::string> blocks_copy()
+    {
+        std::lock_guard<std::mutex> l(mu);
+        return blocks;
+    }
+};
+
+/// A pepecoind-shaped JSON-RPC daemon on a socket, with per-call delays.
+struct FakeAux {
+    std::atomic<int> fetch_delay_ms{0};
+    std::atomic<int> submit_delay_ms{0};
+    std::atomic<int> submits{0};
+    std::atomic<int> height{100};
+    std::atomic<int> chainid{63};
+    std::mutex mu;
+    std::string tip = std::string(63, '0') + "1";
+    std::string chain_name = "regtest";
+    FakeDaemon d;   // last: its thread runs the handler, which reads the above
+    FakeAux()
+    {
+        d.handler = [this](const std::string& m, const nlohmann::json&) -> nlohmann::json {
+            if (m == "submitblock") {
+                if (int s = submit_delay_ms.load()) std::this_thread::sleep_for(std::chrono::milliseconds(s));
+                ++submits;   // the daemon took the block (as pepecoind: null = accepted)
+                return nullptr;
+            }
+            if (m == "getbestblockhash" || m == "createauxblock" || m == "getblocktemplate")
+                if (int s = fetch_delay_ms.load()) std::this_thread::sleep_for(std::chrono::milliseconds(s));
+            std::string t, cn;
+            { std::lock_guard<std::mutex> l(mu); t = tip; cn = chain_name; }
+            const int h = height.load();
+            if (m == "getblockchaininfo") return {{"chain", cn}, {"blocks", h}};
+            if (m == "getbestblockhash") return t;
+            if (m == "createauxblock")
+                return {{"hash", t}, {"chainid", chainid.load()}, {"height", h},
+                        {"coinbasevalue", 1'000'000'000'000LL}, {"bits", "207fffff"}};
+            if (m == "getblocktemplate")
+                return {{"previousblockhash", t}, {"height", h}, {"bits", "207fffff"},
+                        {"curtime", 1793210000 + h}, {"version", (63 << 16) | 4},
+                        {"coinbasevalue", 1'000'000'000'000LL}, {"transactions", nlohmann::json::array()}};
+            if (m == "getblockcount") return h;
+            return nullptr;
+        };
+    }
+    void new_tip(const std::string& t)
+    {
+        std::lock_guard<std::mutex> l(mu);
+        tip = std::string(64 - t.size(), '0') + t;
+        ++height;
+    }
+};
+
+AuxChainConfig pep_cfg(uint16_t port, uint32_t connect_ms, uint32_t timeout_ms, uint32_t submit_ms = 15'000)
+{
+    AuxChainConfig c;
+    c.symbol = "PEP";
+    c.chain_id = 63;
+    c.rpc_host = "127.0.0.1";
+    c.rpc_port = port;
+    c.rpc_userpass = "u:p";
+    c.multiaddress = true;
+    c.aux_payout_address = "nPEPaddr";
+    c.rpc_connect_timeout_ms = connect_ms;
+    c.rpc_timeout_ms = timeout_ms;
+    c.rpc_submit_timeout_ms = submit_ms;
+    c.rpc_reconnect_max_ms = 4'000;
+    return c;
+}
+
+} // namespace
+
+// A block found right after a poll timed out (the poll connection in its
+// reconnect backoff) is sent at once on the submit connection.
+TEST(MergedAuxFind, SubmitDuringThePollBackoffIsSent)
+{
+    FakeAux f;
+    net::io_context unused;
+    AuxChainRPC rpc(unused, pep_cfg(f.d.port, 500, 500));
+    f.fetch_delay_ms = 800;   // one slow answer: the poll call times out
+    EXPECT_EQ(rpc.get_best_block_hash(), "");
+    f.fetch_delay_ms = 0;
+    std::this_thread::sleep_for(350ms);
+    const int before = f.submits.load();
+    const auto v = rpc.submit_block_verdict("00");
+    EXPECT_EQ(v.kind, SubmitVerdict::Kind::accepted) << v.label();
+    EXPECT_EQ(f.submits.load(), before + 1) << "the block did not reach the daemon";
+    // the poll connection is still in its backoff
+    EXPECT_EQ(rpc.get_block_count(), std::nullopt);
+}
+
+// A daemon that takes the block but answers after the deadline: unknown,
+// held (the found-block check follows the chain), never "not held".
+TEST(MergedAuxFind, SubmitAnsweredAfterTheDeadlineIsUnknownAndHeld)
+{
+    FakeAux f;
+    net::io_context unused;
+    AuxChainRPC rpc(unused, pep_cfg(f.d.port, 1'000, 1'000, 1'000));
+    f.submit_delay_ms = 1'500;
+    const auto v = rpc.submit_block_verdict("00");
+    std::this_thread::sleep_for(800ms);
+    EXPECT_EQ(f.submits.load(), 1) << "the daemon took it";
+    EXPECT_EQ(v.kind, SubmitVerdict::Kind::unknown) << v.label();
+    EXPECT_TRUE(v.held());
+    // and a refused connection: unknown too (the P2P relay sent the block)
+    net::io_context unused2;
+    AuxChainRPC dead(unused2, pep_cfg(1, 300, 300));
+    const auto v2 = dead.submit_block_verdict("00");
+    EXPECT_EQ(v2.kind, SubmitVerdict::Kind::unknown) << v2.label();
+}
+
+// Through the manager: the record says unknown and the found-block callback
+// is told the daemon may hold it (its verification is scheduled).
+TEST(MergedAuxFind, SlowAcceptedSubmitIsVerifiedAgainstTheChain)
+{
+    FakeAux f;
+    boost::asio::io_context ioc;
+    MergedMiningManager mm(ioc);
+    mm.set_payout_provider(payout_provider());
+    mm.add_chain(pep_cfg(f.d.port, 1'000, 1'000, 1'000));
+    std::vector<bool> held;
+    mm.set_on_merged_block_found([&held](const std::string&, int, const std::string&, bool h, uint64_t) {
+        held.push_back(h);
+    });
+    mm.refresh_aux_work();
+    ASSERT_EQ(mm.get_auxpow_commitment().size(), 44u);
+    f.submit_delay_ms = 1'500;
+    submit_share(mm, mm.get_auxpow_commitment());
+    std::this_thread::sleep_for(800ms);
+    EXPECT_EQ(f.submits.load(), 1);
+    const auto d = mm.get_discovered_blocks();
+    ASSERT_EQ(d.size(), 1u);
+    EXPECT_FALSE(d[0].accepted);
+    EXPECT_EQ(d[0].verdict.rfind("unknown: ", 0), 0u) << d[0].verdict;
+    ASSERT_EQ(held.size(), 1u);
+    EXPECT_TRUE(held[0]) << "an accepted block must be verified against the chain";
+    mm.stop();
+}
+
+// The daemon answers every poll call in 5 s: a find meanwhile reaches it at
+// once (its own connection), not after the poll.
+TEST(MergedAuxFind, SubmitDoesNotWaitForASlowPoll)
+{
+    FakeAux f;
+    boost::asio::io_context ioc;
+    MergedMiningManager mm(ioc);
+    mm.set_payout_provider(payout_provider());
+    mm.add_chain(pep_cfg(f.d.port, 1'000, 6'000));
+    mm.refresh_aux_work();
+    const auto job = mm.get_auxpow_commitment();
+    ASSERT_EQ(job.size(), 44u);
+    f.fetch_delay_ms = 5'000;
+    f.new_tip("abcd");
+    std::thread poll([&] { mm.refresh_aux_work(); });   // 3 calls x 5 s
+    std::this_thread::sleep_for(400ms);
+    const auto t0 = Clock::now();
+    submit_share(mm, job);
+    const long took = ms_since(t0);
+    EXPECT_EQ(f.submits.load(), 1) << "the block did not reach the daemon";
+    EXPECT_LT(took, 1'500) << "the find waited for the poll";
+    const auto d = mm.get_discovered_blocks();
+    ASSERT_FALSE(d.empty());
+    EXPECT_EQ(d.back().verdict, "accepted");
+    poll.join();
+    f.fetch_delay_ms = 0;
+    mm.stop();
+}
+
+// The P2P relay (ARM A) goes before the daemon's submitblock.
+TEST(MergedAuxFind, RelayGoesBeforeTheSubmit)
+{
+    Rig r({{"DOGE", 98}, {"PEP", 63}});
+    std::mutex mu;
+    std::vector<std::string> events;
+    r.mm.set_block_relay_fn([&](uint32_t cid, const std::string&) {
+        std::lock_guard<std::mutex> l(mu);
+        events.push_back("relay " + std::to_string(cid) + " submitted=" +
+                         std::to_string(r.chain(cid == 98 ? 0 : 1).submitted()));
+    });
+    r.mm.refresh_aux_work();
+    submit_share(r.mm, r.mm.get_auxpow_commitment());
+    ASSERT_EQ(events.size(), 2u);
+    for (const auto& e : events)
+        EXPECT_NE(e.find("submitted=0"), std::string::npos) << e;
+    EXPECT_EQ(r.chain(0).submitted(), 1u);
+    EXPECT_EQ(r.chain(1).submitted(), 1u);
+}
+
+// stop() while a poll and while a find are blocked on a daemon: both return.
+TEST(MergedAuxFind, StopDuringHungPollAndHungSubmit)
+{
+    {
+        FakeAux f;
+        boost::asio::io_context ioc;
+        auto mm = std::make_unique<MergedMiningManager>(ioc);
+        mm->set_payout_provider(payout_provider());
+        mm->add_chain(pep_cfg(f.d.port, 3'000, 10'000));
+        f.fetch_delay_ms = 8'000;
+        mm->start();
+        std::this_thread::sleep_for(600ms);
+        const auto t0 = Clock::now();
+        mm->stop();
+        EXPECT_LT(ms_since(t0), 3'000);
+        mm.reset();
+        f.fetch_delay_ms = 0;
+    }
+    {
+        FakeAux f;
+        boost::asio::io_context ioc;
+        auto mm = std::make_unique<MergedMiningManager>(ioc);
+        mm->set_payout_provider(payout_provider());
+        mm->add_chain(pep_cfg(f.d.port, 3'000, 10'000));
+        mm->refresh_aux_work();
+        const auto job = mm->get_auxpow_commitment();
+        ASSERT_EQ(job.size(), 44u);
+        f.submit_delay_ms = 8'000;
+        long took_submit = -1;
+        std::thread sub([&] {
+            const auto t0 = Clock::now();
+            submit_share(*mm, job);
+            took_submit = ms_since(t0);
+        });
+        std::this_thread::sleep_for(400ms);
+        mm->stop();
+        sub.join();
+        EXPECT_LT(took_submit, 3'000);
+        const auto d = mm->get_discovered_blocks();
+        ASSERT_EQ(d.size(), 1u);
+        EXPECT_EQ(d[0].verdict.rfind("unknown: ", 0), 0u) << d[0].verdict;
+        mm.reset();
+    }
+}
+
+// A backend throwing something that is not a std::exception, in a poll and
+// in a submit: nothing escapes, the other chain is unaffected.
+TEST(MergedAuxFind, NonStdExceptionsDoNotEscape)
+{
+    boost::asio::io_context ioc;
+    MergedMiningManager mm(ioc);
+    mm.set_payout_provider(payout_provider());
+    auto a = std::make_unique<StressBackend>("DOGE", 98, 10);
+    auto b = std::make_unique<StressBackend>("PEP", 63, 10);
+    auto* pa = a.get();
+    auto* pb = b.get();
+    mm.add_chain(pa->cfg, std::move(a));
+    mm.add_chain(pb->cfg, std::move(b));
+    mm.refresh_aux_work();
+    const auto job = mm.get_auxpow_commitment();
+    ASSERT_EQ(job.size(), 44u);
+    pb->set(false, 0, true);
+    pb->advance();
+    EXPECT_NO_THROW(mm.refresh_aux_work());
+    EXPECT_NO_THROW(submit_share(mm, job));
+    EXPECT_EQ(pa->blocks_copy().size(), 1u);
+    bool pep_unknown = false;
+    for (const auto& x : mm.get_discovered_blocks())
+        if (x.symbol == "PEP") pep_unknown = x.verdict.rfind("unknown: ", 0) == 0;
+    EXPECT_TRUE(pep_unknown);
+    mm.stop();
+}
+
+// ---- configuration errors found at run time ---------------------------------
+
+// A daemon whose createauxblock chain id is not the configured one (DINGO is
+// 50, not 98, since height 265,000): the chain is disabled, the others keep
+// mining.
+TEST(MergedAuxConfig, ChainIdMismatchDisablesTheChain)
+{
+    FakeAux f;
+    f.chainid = 50;
+    boost::asio::io_context ioc;
+    MergedMiningManager mm(ioc);
+    mm.set_payout_provider(payout_provider());
+    auto doge = std::make_unique<StressBackend>("DOGE", 98, 10);
+    auto* pd = doge.get();
+    mm.add_chain(pd->cfg, std::move(doge));
+    auto cfg = pep_cfg(f.d.port, 1'000, 1'000);
+    mm.add_chain(cfg);
+    mm.refresh_aux_work();
+    mm.refresh_aux_work();
+    std::string why;
+    for (const auto& ci : mm.get_chain_infos())
+        if (ci.symbol == "PEP") why = ci.config_error;
+    EXPECT_NE(why.find("chain id is 50, configured 63"), std::string::npos) << why;
+    const auto c = mm.get_auxpow_commitment();
+    ASSERT_EQ(c.size(), 44u);
+    EXPECT_EQ(c[36], 1u) << "DOGE alone";
+    const int fetches_before = f.d.requests.load();
+    mm.refresh_aux_work();
+    EXPECT_EQ(f.d.requests.load(), fetches_before) << "a disabled chain is not polled";
+    mm.stop();
+}
+
+// The payout address against the daemon's own network (L4): a regtest
+// daemon refuses a testnet address; the chain is disabled with the option
+// to set, at its first answer.
+TEST(MergedAuxConfig, PayoutAddressOfAnotherNetworkDisablesTheChain)
+{
+    FakeAux f;   // says "regtest"
+    boost::asio::io_context ioc;
+    MergedMiningManager mm(ioc);
+    mm.set_payout_provider(payout_provider());
+    auto cfg = pep_cfg(f.d.port, 1'000, 1'000);
+    cfg.aux_payout_address = b58(113, 0x11);   // a PEP testnet address
+    cfg.check_payout_address = [addr = cfg.aux_payout_address](const std::string& chain) {
+        return c2pool::merged::check_aux_address_on_chain("PEP", chain, addr);
+    };
+    mm.add_chain(cfg);
+    mm.refresh_aux_work();
+    std::string why;
+    for (const auto& ci : mm.get_chain_infos())
+        why = ci.config_error;
+    EXPECT_NE(why.find("not a PEP address of the daemon's regtest network"), std::string::npos) << why;
+    EXPECT_TRUE(mm.get_auxpow_commitment().empty());
+    mm.stop();
+    // its own network: fine
+    EXPECT_TRUE(c2pool::merged::check_aux_address_on_chain("PEP", "regtest", b58(111, 0x11)).empty());
+    EXPECT_TRUE(c2pool::merged::check_aux_address_on_chain("PEP", "test", b58(113, 0x11)).empty());
+    EXPECT_FALSE(c2pool::merged::check_aux_address_on_chain("PEP", "main", b58(113, 0x11)).empty());
+    EXPECT_TRUE(c2pool::merged::check_aux_address_on_chain("PEP", "signet", b58(113, 0x11)).empty()) << "not judged";
+}
+
+// ---- the commitment rule, shared with p2pool --------------------------------
+
+namespace {
+std::vector<unsigned char> kat_header(uint32_t cid)
+{
+    std::vector<unsigned char> h(80);
+    for (size_t i = 0; i < 80; ++i) h[i] = static_cast<unsigned char>((cid * 7 + i) & 0xff);
+    return h;
+}
+std::vector<std::pair<uint32_t, std::vector<unsigned char>>> kat_carried(const std::vector<uint32_t>& ids)
+{
+    std::vector<std::pair<uint32_t, std::vector<unsigned char>>> out;
+    for (auto id : ids) out.emplace_back(id, kat_header(id));
+    return out;
+}
+} // namespace
+
+// The vectors pinned in p2pool test_v36_merged_multi_aux_tree.py (CROSS):
+// both implementations accept these and refuse the same variants.
+TEST(MergedAuxCommitment, CrossImplementationVectors)
+{
+    using c2pool::merged::check_merged_aux_commitment;
+    struct V { std::vector<uint32_t> ids; uint32_t size; const char* root; };
+    const V vs[] = {
+        {{98, 63}, 2, "ff2edbdd2355c879e4cee6ef4014c9c060d04ca42ca3970c989826a7ef7f7990"},
+        {{98, 63, 1}, 4, "1e38a42508658108f37c3eb2b7dfcddae24d9ebbbcf724da7f200088fd36e401"},
+        {{98, 74}, 16, "528fe2cd8a23303a26e5b6b1c46d2dd3543d89a74edba2a8192c6c4013ff2db7"},
+        {{98, 63, 16, 8211, 8224, 74, 1}, 32, "bb58ff2387da0d494ff1bb509a3158341f161896c43c3e3ccda775ea7341c462"},
+    };
+    for (const auto& v : vs) {
+        uint256 root;
+        root.SetHex(v.root);
+        EXPECT_EQ(check_merged_aux_commitment(kat_carried(v.ids), root, v.size), "") << v.root;
+        std::vector<uint32_t> rev(v.ids.rbegin(), v.ids.rend());
+        EXPECT_EQ(check_merged_aux_commitment(kat_carried(rev), root, v.size), "");
+        EXPECT_NE(check_merged_aux_commitment(kat_carried(v.ids), root, v.size * 2), "") << "size";
+        uint256 other = root;
+        other.data()[0] ^= 1;
+        EXPECT_NE(check_merged_aux_commitment(kat_carried(v.ids), other, v.size), "") << "root";
+        std::vector<uint32_t> fewer(v.ids.begin(), v.ids.end() - 1);
+        EXPECT_NE(check_merged_aux_commitment(kat_carried(fewer), root, v.size), "") << "a chain missing";
+        auto dup = kat_carried(v.ids);
+        dup.push_back(dup.front());
+        EXPECT_NE(check_merged_aux_commitment(dup, root, v.size), "") << "a chain twice";
+        auto swapped = kat_carried(v.ids);
+        swapped[0].second = kat_header(5);
+        EXPECT_NE(check_merged_aux_commitment(swapped, root, v.size), "") << "another block";
+    }
+    uint256 any;
+    any.SetHex("3039");
+    EXPECT_EQ(check_merged_aux_commitment(kat_carried({98}), any, 1), "") << "one chain: the per-chain check";
+    EXPECT_NE(check_merged_aux_commitment(kat_carried({98}), any, 2), "");
+    EXPECT_NE(check_merged_aux_commitment(kat_carried({5, 5u + (1u << 12)}), any, 8192), "") << "too large";
+    EXPECT_NE(check_merged_aux_commitment(kat_carried({5, 5u + (1u << 30)}), any, 2), "") << "no tree";
+}
+
+// p2pool's make_auxpow_tree and AuxPowTree::build give the same tree for
+// every subset of the chain table and 20,000 random sets.
+TEST(MergedAuxCommitment, TreeIsP2poolsForEverySubset)
+{
+    const std::vector<uint32_t> table{98, 63, 16, 8211, 8224, 74, 50, 1, 8225};
+    for (uint32_t mask = 1; mask < (1u << table.size()); ++mask) {
+        std::vector<uint32_t> ids;
+        std::set<uint32_t> s;
+        for (size_t k = 0; k < table.size(); ++k)
+            if (mask & (1u << k)) { ids.push_back(table[k]); s.insert(table[k]); }
+        const auto t = AuxPowTree::build(ids);
+        std::map<uint32_t, uint32_t> slots;
+        EXPECT_EQ(t.size, c2pool::merged::p2pool_aux_tree(ids, &slots)) << mask;
+        EXPECT_EQ(t.size, p2pool_tree_size(s)) << mask;
+        EXPECT_EQ(t.slot_map, slots) << mask;
+    }
+    std::mt19937 rng(7);
+    for (int i = 0; i < 20000; ++i) {
+        const size_t n = 1 + rng() % 9;
+        std::set<uint32_t> s;
+        while (s.size() < n) s.insert(rng() % 70000);
+        std::vector<uint32_t> ids(s.begin(), s.end());
+        const auto t = AuxPowTree::build(ids);
+        const uint32_t p = c2pool::merged::p2pool_aux_tree(ids);
+        if (t.size == 0) EXPECT_GT(p, 4096u);
+        else EXPECT_EQ(t.size, p);
+    }
+}
+
+// A chain whose block c2pool does not build (createauxblock mode) is not in
+// the tree once a chain is carried: the tree is the carried chains' alone.
+TEST(MergedAuxCommitment, UncarriedChainIsNotCommittedBesideCarriedOnes)
+{
+    boost::asio::io_context ioc;
+    MergedMiningManager mm(ioc);
+    mm.set_payout_provider(payout_provider());
+    auto d = std::make_unique<Backend>("DOGE", 98, 7);
+    auto p = std::make_unique<Backend>("PEP", 63, 7);
+    auto pcfg = p->cfg;
+    pcfg.multiaddress = false;
+    const auto dcfg = d->cfg;
+    mm.add_chain(dcfg, std::move(d));
+    mm.add_chain(pcfg, std::move(p));
+    mm.refresh_aux_work();
+    auto [infos, c] = mm.get_cached_header_infos_and_commitment();
+    ASSERT_EQ(infos.size(), 1u);
+    EXPECT_EQ(infos[0].chain_id, 98u);
+    ASSERT_EQ(c.size(), 44u);
+    EXPECT_EQ(pair_problem(infos, c), "");
+    EXPECT_EQ(c[36], 1u);
+    mm.stop();
+}
+
+// Chains going down, hanging past the deadline, throwing non-std exceptions
+// and moving at random while jobs are read and shares found on recent jobs:
+// every (header infos, commitment) pair a job reads passes the peers' rule,
+// every block a find sends passes the daemon's CAuxPow::check for its chain,
+// and a chain not in a job's commitment gets nothing.
+TEST(MergedAuxStress, FlappingChainsConcurrentJobsAndFinds)
+{
+    boost::asio::io_context ioc;
+    auto guard = boost::asio::make_work_guard(ioc);
+    std::thread io([&] { ioc.run(); });
+    MergedMiningManager mm(ioc);
+    mm.set_payout_provider(payout_provider());
+    mm.set_refresh_round_deadline(60ms);
+    std::vector<StressBackend*> chains;
+    for (auto [sym, id] : std::vector<std::pair<std::string, uint32_t>>{{"DOGE", 98}, {"PEP", 63}, {"NMC", 1}, {"BELLS", 16}}) {
+        auto b = std::make_unique<StressBackend>(sym, id, 1000);
+        chains.push_back(b.get());
+        auto cfg = b->cfg;
+        mm.add_chain(cfg, std::move(b));
+    }
+    std::atomic<bool> done{false};
+    std::atomic<long> reads{0}, bad_pairs{0}, finds{0}, bad_blocks{0}, wrong_chain{0};
+    std::mutex jobs_mu;
+    std::vector<std::pair<std::vector<uint8_t>, std::set<uint32_t>>> jobs;
+    std::string first_bad;
+
+    std::thread flapper([&] {
+        std::mt19937 rng(11);
+        const auto end = Clock::now() + std::chrono::seconds(6);
+        while (Clock::now() < end) {
+            for (auto* c : chains) {
+                const int r = rng() % 20;
+                if (r == 0) c->set(true, 0, false);
+                else if (r == 1) c->set(false, 120, false);   // slower than the round deadline
+                else if (r == 2) c->set(false, 0, true);
+                else if (r < 8) c->set(false, 0, false);
+                if (rng() % 4 == 0) c->advance();
+            }
+            mm.request_refresh();
+            mm.mark_pplns_dirty();
+            std::this_thread::sleep_for(std::chrono::milliseconds(15 + rng() % 30));
+        }
+        for (auto* c : chains) c->set(false, 0, false);
+        done = true;
+    });
+    std::thread reader([&] {
+        while (!done) {
+            auto [infos, c] = mm.get_cached_header_infos_and_commitment();
+            ++reads;
+            const auto why = pair_problem(infos, c);
+            if (!why.empty()) {
+                if (bad_pairs++ == 0) { std::lock_guard<std::mutex> l(jobs_mu); first_bad = why; }
+            } else if (!c.empty()) {
+                std::set<uint32_t> ids;
+                for (const auto& i : infos) ids.insert(i.chain_id);
+                std::lock_guard<std::mutex> l(jobs_mu);
+                if (jobs.empty() || jobs.back().first != c) {
+                    jobs.emplace_back(c, ids);
+                    if (jobs.size() > 40) jobs.erase(jobs.begin());
+                }
+            }
+            (void)mm.get_chain_infos();
+            (void)mm.get_rebuild_stats_json();
+            std::this_thread::sleep_for(2ms);
+        }
+    });
+    std::thread finder([&] {
+        std::mt19937 rng(5);
+        uint8_t salt = 1;
+        while (!done) {
+            std::pair<std::vector<uint8_t>, std::set<uint32_t>> job;
+            bool have = false;
+            {
+                std::lock_guard<std::mutex> l(jobs_mu);
+                if (!jobs.empty()) {
+                    job = jobs[jobs.size() - 1 - rng() % std::min<size_t>(jobs.size(), 8)];
+                    have = true;
+                }
+            }
+            if (have) {
+                std::map<uint32_t, size_t> before;
+                for (auto* c : chains) before[c->cfg.chain_id] = c->blocks_copy().size();
+                submit_share(mm, job.first, salt++);
+                ++finds;
+                for (auto* c : chains) {
+                    const auto b = c->blocks_copy();
+                    const size_t added = b.size() - before[c->cfg.chain_id];
+                    if (added && !job.second.count(c->cfg.chain_id)) ++wrong_chain;
+                    for (size_t k = before[c->cfg.chain_id]; k < b.size(); ++k)
+                        if (core_check(parse_block(b[k]), c->cfg.chain_id).has_value()) ++bad_blocks;
+                }
+            }
+            std::this_thread::sleep_for(10ms);
+        }
+    });
+    flapper.join();
+    reader.join();
+    finder.join();
+    EXPECT_EQ(bad_pairs.load(), 0) << first_bad;
+    EXPECT_EQ(bad_blocks.load(), 0);
+    EXPECT_EQ(wrong_chain.load(), 0);
+    EXPECT_GT(finds.load(), 10);
+    EXPECT_GT(reads.load(), 100);
+    mm.stop();
+    guard.reset();
+    ioc.stop();
+    io.join();
+}
+
+// ---- stratum: merged addresses by each chain's own versions (no guessing) ----
+
+TEST(MergedAuxStratumAddress, AmbiguousAddressesAreNotAssigned)
+{
+    using core::merged_addr::chains_of;
+    using core::merged_addr::merged_chain_info;
+    using core::merged_addr::script_on_chain;
+    const auto configured = [](std::set<uint32_t> s) {
+        return [s](uint32_t id) { return s.count(id) > 0; };
+    };
+    // Bellscoin's P2SH version (30) is DOGE's P2PKH version.
+    const std::string bells_p2sh = b58(30, 0x44);
+    auto m = chains_of(bells_p2sh, false, configured({98, 16}));
+    EXPECT_EQ(m.size(), 2u) << "DOGE and BELLS: ambiguous, never assigned";
+    m = chains_of(bells_p2sh, false, configured({16}));
+    ASSERT_EQ(m.size(), 1u);
+    EXPECT_EQ(m[0]->chain_id, 16u);
+    // paid as P2SH on BELLS, P2PKH on DOGE: never a P2PKH to a script hash
+    const auto s_bells = script_on_chain(*merged_chain_info(false, 16), bells_p2sh);
+    ASSERT_EQ(s_bells.size(), 23u);
+    EXPECT_EQ(s_bells[0], 0xa9);
+    const auto s_doge = script_on_chain(*merged_chain_info(false, 98), bells_p2sh);
+    ASSERT_EQ(s_doge.size(), 25u);
+    EXPECT_EQ(s_doge[0], 0x76);
+    // P2SH 22 is DOGE's, PEP's and SHIC's
+    EXPECT_EQ(chains_of(b58(22, 0x55), false, configured({98, 63, 74})).size(), 3u);
+    // testnet 113 / regtest 111: the whole Dogecoin family
+    EXPECT_EQ(chains_of(b58(113, 0x66), true, configured({98, 63})).size(), 2u);
+    // a PEP address with DOGE + PEP configured: PEP alone
+    m = chains_of(b58(56, 0x77), false, configured({98, 63}));
+    ASSERT_EQ(m.size(), 1u);
+    EXPECT_EQ(m[0]->chain_id, 63u);
+    // Junkcoin bech32 (jc) and its testnet chain id 8225
+    std::vector<uint8_t> prog(20, 0x31);
+    m = chains_of(bech32::encode_segwit("jc", 0, prog), false, configured({8224}));
+    ASSERT_EQ(m.size(), 1u);
+    EXPECT_EQ(m[0]->chain_id, 8224u);
+    m = chains_of(bech32::encode_segwit("tjc", 0, prog), true, configured({8225}));
+    ASSERT_EQ(m.size(), 1u);
+    EXPECT_EQ(m[0]->chain_id, 8225u);
+    // an LTC address is no merged chain's
+    EXPECT_TRUE(chains_of(b58(48, 0x11), false, configured({98, 63, 16, 8211, 8224, 74, 50, 1})).empty());
 }

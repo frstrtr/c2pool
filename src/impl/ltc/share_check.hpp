@@ -4,6 +4,7 @@
 // P2: Share verification — check_hash_link, check_merkle_link, share init/check
 // Ported from legacy sharechains/data.cpp + sharechains/share.cpp
 
+#include <c2pool/merged/aux_commitment_rule.hpp>
 #include "config_pool.hpp"
 #include "share.hpp"
 #include "share_messages.hpp"
@@ -1682,6 +1683,20 @@ std::string verify_merged_coinbase_commitment(
         aux_size = p[0] | (p[1] << 8) | (p[2] << 16) | (p[3] << 24);
     }
 
+    // Several chains (or a size other than 1): the commitment must be the
+    // tree over exactly the carried blocks (c2pool::merged::
+    // check_merged_aux_commitment, the same rule as p2pool data.py
+    // check_merged_aux_commitment).
+    {
+        std::vector<std::pair<uint32_t, std::vector<unsigned char>>> carried;
+        carried.reserve(share.m_merged_coinbase_info.size());
+        for (const auto& info : share.m_merged_coinbase_info)
+            carried.emplace_back(info.m_chain_id, info.m_block_header.m_data);
+        if (auto why = c2pool::merged::check_merged_aux_commitment(carried, aux_merkle_root, aux_size);
+            !why.empty())
+            return why;
+    }
+
     // Get finder script for canonical coinbase construction
     auto finder_script = get_share_script(&share);
     auto finder_merged = normalize_script_for_merged(finder_script);
@@ -1757,7 +1772,7 @@ std::string verify_merged_coinbase_commitment(
                      + " for chain " + std::to_string(chain_id);
             }
         }
-        // Multi-chain: would need aux tree reconstruction (future)
+        // Several chains: checked above (the tree over the carried blocks).
     }
 
     return {};

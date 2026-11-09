@@ -77,6 +77,10 @@ public:
     /// chain id. BTC MVP returns false unconditionally.
     virtual bool has_merged_chain(uint32_t chain_id) const = 0;
 
+    /// The node runs on a test network: merged-chain addresses are read with
+    /// the chains' testnet and regtest versions.
+    virtual bool is_testnet() const { return false; }
+
     // ── Per-connection bookkeeping ───────────────────────────────────────
     // Lifecycle: register on authorize, update each share, unregister on
     // disconnect. All keyed by stratum session_id.

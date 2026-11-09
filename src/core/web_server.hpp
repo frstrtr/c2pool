@@ -1521,6 +1521,7 @@ public:
 
     // Return true if the merged-mining manager has a configured chain with chain_id.
     bool has_merged_chain(uint32_t chain_id) const override;
+    bool is_testnet() const override { return m_testnet; }
 
     // Extract the 40-char hex hash160 from the node fee scriptPubKey (P2PKH bytes 3-22).
     // Returns "" if the fee script is not a 25-byte P2PKH.

@@ -241,6 +241,14 @@ private:
 
     // Merged mining: per-chain payout addresses set by the miner.
     std::map<uint32_t, std::string> merged_addresses_;
+    // Chains whose entry above is the primary (parent-coin) address reused for
+    // its hash160 (auto-derived), not an address of that chain.
+    std::set<uint32_t> merged_from_primary_;
+    // The scriptPubKey a merged entry pays on its chain: an address of that
+    // chain by the chain's own versions/HRPs (aux_chain_params), or the
+    // primary address's hash160 for an auto-derived entry; empty otherwise.
+    std::vector<unsigned char> merged_script_for(uint32_t chain_id, const std::string& addr) const;
+    bool testnet_network() const;
 
     // BIP 310 version-rolling (ASICBoost) state
     static constexpr uint32_t POOL_VERSION_MASK = 0x1fffe000;

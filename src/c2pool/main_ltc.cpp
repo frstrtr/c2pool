@@ -7752,12 +7752,18 @@ int main(int argc, char* argv[]) {
                     // The address createauxblock gets: the operator's
                     // (--merged-payout-address), else the built-in one (DOGE
                     // only), checked against the chain's own address versions
-                    // (aux_chain_params.hpp). The daemon refuses an address
-                    // of another chain or network (-8 / -5 "Invalid coinbase
-                    // payout address") and the chain would never get work, so
-                    // a chain without a valid one is not registered.
-                    // multiaddress mode: the PPLNS coinbase is c2pool's own;
-                    // this address is never paid.
+                    // (aux_chain_params.hpp): on mainnet exactly, on testnet
+                    // against its testnet and regtest ones, and against the
+                    // daemon's own network once it answers (check_payout_address).
+                    // The daemon refuses an address of another chain or network
+                    // (-8 / -5 "Invalid coinbase payout address"), so a chain
+                    // reached over RPC only is not registered without a valid one;
+                    // a chain with an embedded backend (DOGE, NMC, DGB), which
+                    // never calls createauxblock, keeps mining without its RPC
+                    // fallback. multiaddress mode: the PPLNS coinbase is c2pool's
+                    // own; this address is never paid.
+                    bool rpc_address_ok = false;
+                    std::string rpc_address_error;
                     {
                         std::string sym_up = cfg.symbol;
                         for (auto& c : sym_up) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
@@ -7767,32 +7773,41 @@ int main(int argc, char* argv[]) {
                             settings->m_testnet ? c2pool::merged::AuxNetwork::testnet
                                                 : c2pool::merged::AuxNetwork::mainnet,
                             ov != merged_payout_addresses.end() ? ov->second : std::string());
-                        // An embedded backend (DOGE, NMC) builds its own work and
-                        // never calls createauxblock: without an RPC daemon for the
-                        // chain no address is needed. A configured address that is
-                        // not the chain's is an error either way.
-                        const bool talks_rpc = cfg.rpc_port > 0 && !cfg.rpc_userpass.empty();
-                        if (!pa.ok && (talks_rpc || !pa.address.empty())) {
-                            const std::string msg = "merged chain " + cfg.symbol + " (chain_id "
-                                + std::to_string(cfg.chain_id) + ") DISABLED: " + pa.error;
-                            LOG_ERROR << "[MM:" << cfg.symbol << "] " << msg;
-                            std::cerr << "c2pool: " << msg << std::endl;
-                            continue;
-                        }
-                        if (pa.ok)
+                        rpc_address_ok = pa.ok;
+                        rpc_address_error = pa.error;
+                        if (pa.ok) {
                             cfg.aux_payout_address = pa.address;
+                            cfg.check_payout_address = [sym = cfg.symbol, addr = pa.address](const std::string& chain) {
+                                return c2pool::merged::check_aux_address_on_chain(sym, chain, addr);
+                            };
+                            LOG_INFO << "[MM:" << cfg.symbol << "] createauxblock payout address " << pa.address
+                                     << " (" << pa.source << ")";
+                        } else if (!pa.address.empty()) {
+                            LOG_ERROR << "[MM:" << cfg.symbol << "] " << pa.error;
+                        }
                         if (const auto* cp = c2pool::merged::find_aux_chain_params(cfg.symbol)) {
                             const auto& v = settings->m_testnet ? cp->test : cp->main;
                             if (!v.p2pkh.empty()) cfg.address_version = v.p2pkh.front();
                             if (!v.p2sh.empty()) cfg.p2sh_version = v.p2sh.front();
                         }
-                        if (pa.ok)
-                            LOG_INFO << "[MM:" << cfg.symbol << "] createauxblock payout address " << pa.address
-                                     << " (" << pa.source << ")";
-                        else
-                            LOG_INFO << "[MM:" << cfg.symbol << "] no RPC daemon: the embedded backend needs no "
-                                        "createauxblock payout address";
                     }
+                    // A chain reached over RPC only, without a valid address: not mined.
+                    const auto refuse_rpc_only = [&]() {
+                        const std::string msg = "merged chain " + cfg.symbol + " (chain_id "
+                            + std::to_string(cfg.chain_id) + ") DISABLED: " + rpc_address_error;
+                        LOG_ERROR << "[MM:" << cfg.symbol << "] " << msg;
+                        std::cerr << "c2pool: " << msg << std::endl;
+                    };
+                    // An embedded chain without a valid address: no RPC fallback.
+                    const auto rpc_fallback_ok = [&]() {
+                        if (cfg.rpc_port == 0 || cfg.rpc_userpass.empty())
+                            return false;
+                        if (!rpc_address_ok)
+                            LOG_WARNING << "[MM:" << cfg.symbol << "] RPC fallback at " << cfg.rpc_host << ":"
+                                        << cfg.rpc_port << " NOT used (" << rpc_address_error
+                                        << "); the embedded backend keeps mining";
+                        return rpc_address_ok;
+                    };
 
                     // P2P port: explicit (7th field) or auto-detected from symbol
                     if (parts.size() >= 7 && !parts[6].empty()) {
@@ -8042,6 +8057,10 @@ int main(int argc, char* argv[]) {
                         if (!doge_pool->utxo()) {
                             LOG_ERROR << "[EMB-DOGE] No DOGE UTXO set: embedded DOGE backend not installed"
                                       << (cfg.rpc_port > 0 ? " — using the RPC path" : "");
+                            if (!rpc_address_ok) {
+                                refuse_rpc_only();
+                                continue;
+                            }
                             mm_manager->add_chain(cfg);
                         } else {
                             auto backend = std::make_unique<doge::coin::AuxChainEmbedded>(
@@ -8055,7 +8074,7 @@ int main(int argc, char* argv[]) {
                             LOG_INFO << "Merged mining: DOGE embedded (primary) chain_id=" << cfg.chain_id;
 
                             // Set RPC as fallback if connection details are available
-                            if (cfg.rpc_port > 0 && !cfg.rpc_userpass.empty()) {
+                            if (rpc_fallback_ok()) {
                                 auto rpc_fallback = std::make_unique<c2pool::merged::AuxChainRPC>(ioc, cfg);
                                 mm_manager->set_fallback_backend(cfg.chain_id, std::move(rpc_fallback));
                                 LOG_INFO << "Merged mining: DOGE RPC fallback at "
@@ -8108,7 +8127,7 @@ int main(int argc, char* argv[]) {
                                 });
                             mm_manager->add_chain(cfg, std::move(backend));
                             LOG_INFO << "Merged mining: NMC embedded (primary) chain_id=" << cfg.chain_id;
-                            if (cfg.rpc_port > 0 && !cfg.rpc_userpass.empty()) {
+                            if (rpc_fallback_ok()) {
                                 auto rpc_fallback = std::make_unique<c2pool::merged::AuxChainRPC>(ioc, cfg);
                                 mm_manager->set_fallback_backend(cfg.chain_id, std::move(rpc_fallback));
                                 LOG_INFO << "Merged mining: NMC RPC fallback at "
@@ -8140,7 +8159,7 @@ int main(int argc, char* argv[]) {
                             mm_manager->add_chain(cfg, std::move(backend));
                             LOG_INFO << "Merged mining: DGB embedded (primary) chain_id=" << cfg.chain_id;
                             // digibyted RPC fallback (embedded primary persists).
-                            if (cfg.rpc_port > 0 && !cfg.rpc_userpass.empty()) {
+                            if (rpc_fallback_ok()) {
                                 auto rpc_fallback = std::make_unique<c2pool::merged::AuxChainRPC>(ioc, cfg);
                                 mm_manager->set_fallback_backend(cfg.chain_id, std::move(rpc_fallback));
                                 LOG_INFO << "Merged mining: DGB RPC fallback at "
@@ -8151,11 +8170,19 @@ int main(int argc, char* argv[]) {
                         // Without -DAUX_DOGE the DGB embedded backend is absent;
                         // fall through to the standard RPC path so the seam is a
                         // no-op rather than a broken reference.
+                        if (!rpc_address_ok) {
+                            refuse_rpc_only();
+                            continue;
+                        }
                         mm_manager->add_chain(cfg);
                         LOG_INFO << "Merged mining: added DGB via RPC (AUX_DOGE off) chain_id=" << cfg.chain_id;
 #endif // AUX_DOGE
                     } else {
                         // Non-DOGE chain or no P2P — standard RPC path
+                        if (!rpc_address_ok) {
+                            refuse_rpc_only();
+                            continue;
+                        }
                         mm_manager->add_chain(cfg);
                         LOG_INFO << "Merged mining: added " << cfg.symbol
                                  << " (chain_id=" << cfg.chain_id << ") at "

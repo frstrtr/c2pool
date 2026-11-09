@@ -49,10 +49,19 @@ struct AuxChainConfig
     uint32_t    rpc_connect_timeout_ms{3'000};
     uint32_t    rpc_timeout_ms{10'000};
     uint32_t    rpc_reconnect_max_ms{10'000};
+    // submitblock goes over its own connection, never waits for the polls'
+    // backoff, and gets this long for the daemon's answer (block validation).
+    uint32_t    rpc_submit_timeout_ms{15'000};
 
-    // Largest block the chain's CheckBlock accepts (bad-blk-length), AuxPoW
-    // included; 0 = the chain id's own (aux_chain_max_block_bytes).
+    // Largest stripped block (no witness; header with AuxPoW included) the
+    // chain's CheckBlock accepts; 0 = the chain id's own (aux_block_limit).
     uint32_t    max_block_bytes{0};
+
+    // Checks the createauxblock address against the network the daemon says
+    // it is on (getblockchaininfo "chain": "main", "test", "regtest", ...):
+    // "" when it is the network's (or the network is not known), else why
+    // not. Checked once, at the first answer; a failure keeps the chain out.
+    std::function<std::string(const std::string& chain_name)> check_payout_address;
 };
 
 // ─── What a daemon answered to submitblock ───────────────────────────────────
@@ -62,20 +71,25 @@ struct AuxChainConfig
 // "inconclusive" a block stored but not connected (a side branch: it lost the
 // race, or may still win it); "duplicate-inconclusive" the same for a block
 // whose header was known; "duplicate-invalid" and any other string a
-// rejection with that reason; a JSON-RPC error (decode failure, transport) an
-// error. Only accepted and duplicate are a win at submit time; an
-// inconclusive block is held by the daemon and decided by its chain.
+// rejection with that reason; JSON-RPC error -22 "Block decode failed" an
+// error. No answer (no connection, a timeout, a backend that threw) or any
+// other JSON-RPC error (-28 warming up, ...) is unknown: the daemon may have
+// the block, and the P2P relay sent it too. Only accepted and duplicate are a
+// win at submit time; an inconclusive or unknown block is decided by the
+// chain.
 struct SubmitVerdict
 {
-    enum class Kind { accepted, duplicate, inconclusive, rejected, error };
+    enum class Kind { accepted, duplicate, inconclusive, rejected, error, unknown };
     Kind        kind{Kind::error};
     std::string reason;   // the daemon's string, or the error
 
     bool accepted() const { return kind == Kind::accepted || kind == Kind::duplicate; }
-    // The daemon holds the block (accepted, duplicate or inconclusive): its
-    // chain decides whether it is in the best chain.
-    bool held() const { return accepted() || kind == Kind::inconclusive; }
-    // "accepted", "duplicate", "inconclusive", "rejected: <reason>", "error: <reason>".
+    // The block may be on the chain (accepted, duplicate, inconclusive, or no
+    // answer): the found-block check follows the chain. Not for a block the
+    // daemon refused.
+    bool held() const { return accepted() || kind == Kind::inconclusive || kind == Kind::unknown; }
+    // "accepted", "duplicate", "inconclusive", "rejected: <reason>",
+    // "error: <reason>", "unknown: <reason>".
     std::string label() const;
 
     static SubmitVerdict of(Kind k, std::string why = {}) { return {k, std::move(why)}; }
@@ -84,15 +98,35 @@ struct SubmitVerdict
 /// Maps a submitblock result (the JSON-RPC "result") to a verdict, as above.
 SubmitVerdict classify_submitblock_result(const nlohmann::json& result);
 
-/// The largest serialized block (header with AuxPoW, txs) the chain with this
-/// AuxPoW chain id accepts, from its CheckBlock; 0 when not known (no guard).
-uint32_t aux_chain_max_block_bytes(uint32_t chain_id);
+/// CheckBlock's size limits of the chain with this AuxPoW chain id, on the
+/// block as serialized with the AuxPoW in its header: the stripped size (no
+/// witness, SERIALIZE_TRANSACTION_NO_WITNESS) at most max_stripped, and, on a
+/// segwit chain, the weight (stripped * 3 + full) at most max_weight
+/// (Namecoin/Bellscoin/Junkcoin: stripped * 4 <= 4,000,000 and weight <=
+/// 4,000,000; the Dogecoin family: stripped <= MAX_BLOCK_BASE_SIZE).
+/// {0, 0}: not known (no guard).
+struct AuxBlockLimit {
+    uint32_t max_stripped{0};
+    uint32_t max_weight{0};   // 0: no weight rule
+    bool known() const { return max_stripped != 0; }
+    // "" when a block of these sizes passes, else why not.
+    std::string check(uint64_t stripped_bytes, uint64_t full_bytes) const;
+};
+AuxBlockLimit aux_block_limit(uint32_t chain_id);
 
-/// The config's max_block_bytes, else aux_chain_max_block_bytes(chain_id).
-inline uint32_t aux_chain_max_block_bytes(const AuxChainConfig& cfg)
+/// The config's max_block_bytes (as max_stripped), else aux_block_limit(chain_id).
+inline AuxBlockLimit aux_block_limit(const AuxChainConfig& cfg)
 {
-    return cfg.max_block_bytes ? cfg.max_block_bytes : aux_chain_max_block_bytes(cfg.chain_id);
+    AuxBlockLimit l = aux_block_limit(cfg.chain_id);
+    if (cfg.max_block_bytes)
+        l.max_stripped = cfg.max_block_bytes;
+    return l;
 }
+
+/// Size of a raw transaction without its witness (BIP144 marker, flag and
+/// witness stacks removed); the full size when it has none; nullopt when it
+/// does not parse.
+std::optional<size_t> tx_stripped_size(const std::vector<uint8_t>& tx);
 
 // ─── Cached work from an auxiliary chain daemon ───────────────────────────────
 struct AuxWork
@@ -217,6 +251,10 @@ public:
         return submit_block(block_hex) ? SubmitVerdict::of(SubmitVerdict::Kind::accepted)
                                        : SubmitVerdict::of(SubmitVerdict::Kind::rejected, "rejected");
     }
+    // submit_block_verdict may run at the same time as any other call (its
+    // own connection): a find never waits for a poll. Otherwise the manager
+    // serializes the backend's calls.
+    virtual bool submit_independent() const { return false; }
 
     // The backend's best chain, for found-block verdicts (aux_backend_verdict):
     // its height, the block at a height, a known block's height. nullopt when
@@ -224,6 +262,8 @@ public:
     virtual std::optional<uint32_t> get_block_count() { return std::nullopt; }
     virtual std::optional<uint256> get_block_hash_at(uint32_t /*height*/) { return std::nullopt; }
     virtual std::optional<uint32_t> get_block_height(const uint256& /*hash*/) { return std::nullopt; }
+    // The daemon's network (getblockchaininfo "chain"); nullopt when unknown.
+    virtual std::optional<std::string> get_chain_name() { return std::nullopt; }
 
     // Make a call blocked on the network return now, and every later one
     // fail at once (shutdown).
@@ -231,14 +271,16 @@ public:
 };
 
 // ─── RPC client for one auxiliary chain daemon ───────────────────────────────
-// One HTTP keep-alive connection, used by one call at a time (calls from
-// several threads are serialized). Every network step has a deadline
-// (AuxChainConfig::rpc_connect_timeout_ms / rpc_timeout_ms), run on the
-// client's own io_context by the calling thread. A connection the daemon
-// closed (restart, or its idle timeout: bitcoind's -rpcservertimeout, 30 s)
-// is replaced on the next call, which is sent again once on the fresh
-// connection; after a failed connect or a timeout the client waits before
-// connecting again (1 s, doubling, at most rpc_reconnect_max_ms).
+// Two HTTP keep-alive connections: one for the polls and lookups (calls from
+// several threads are serialized on it), one for submitblock only, so a find
+// is never queued behind a slow poll. Every network step has a deadline
+// (AuxChainConfig::rpc_connect_timeout_ms, rpc_timeout_ms,
+// rpc_submit_timeout_ms), run on that connection's own io_context by the
+// calling thread. A connection the daemon closed (restart, or its idle
+// timeout: bitcoind's -rpcservertimeout, 30 s) is replaced on the next call,
+// which is sent again once on the fresh connection. After a failed connect or
+// a timeout the poll connection waits before connecting again (1 s, doubling,
+// at most rpc_reconnect_max_ms); a submit always tries.
 class AuxChainRPC : public IAuxChainBackend, public jsonrpccxx::IClientConnector
 {
 public:
@@ -250,6 +292,7 @@ public:
     AuxWork create_aux_block(const std::string& address) override;
     bool submit_block(const std::string& block_hex) override;
     SubmitVerdict submit_block_verdict(const std::string& block_hex) override;
+    bool submit_independent() const override { return true; }
     bool submit_aux_block(const uint256& block_hash, const std::string& auxpow_hex) override;
     std::string get_block_hex(const std::string& block_hash) override;
     std::string get_best_block_hash() override;
@@ -257,32 +300,41 @@ public:
     std::optional<uint32_t> get_block_count() override;
     std::optional<uint256> get_block_hash_at(uint32_t height) override;
     std::optional<uint32_t> get_block_height(const uint256& hash) override;
+    std::optional<std::string> get_chain_name() override;
     void cancel_io() override;
     const AuxChainConfig& config() const override { return m_config; }
 
     bool connected() const;
-    // Connections opened so far (the first included).
+    // Poll connections opened so far (the first included).
     uint64_t connects() const { return m_connects.load(std::memory_order_relaxed); }
+
+    // One HTTP connection and the io_context its steps run on.
+    struct Conn {
+        boost::asio::io_context io;
+        boost::asio::ip::tcp::resolver resolver{io};
+        std::unique_ptr<boost::beast::tcp_stream> stream;
+        boost::beast::http::request<boost::beast::http::string_body> request;
+        bool used{false};   // has answered a request (keep-alive)
+    };
 
 private:
     std::string Send(const std::string& request) override;
     nlohmann::json call(const std::string& method,
                         const nlohmann::json& params = nlohmann::json::array());
-    // With m_io_mutex held.
-    void open_locked();
-    void close_locked();
+    // With the connection's mutex held.
+    void open(Conn& c, const char* what);
+    void close(Conn& c);
     void note_failure_locked();
-    std::string exchange_locked(const std::string& request, bool& stale_connection);
+    std::string exchange(Conn& c, const std::string& request, std::chrono::milliseconds timeout,
+                         bool& stale_connection);
 
     AuxChainConfig m_config;
-    boost::asio::io_context m_io;   // run only by the calling thread, m_io_mutex held
-    std::unique_ptr<boost::beast::tcp_stream> m_stream;
-    boost::asio::ip::tcp::resolver m_resolver;
-    boost::beast::http::request<boost::beast::http::string_body> m_http_request;
+    Conn m_poll;                     // under m_io_mutex
+    Conn m_submit;                   // under m_submit_mutex
     jsonrpccxx::JsonRpcClient m_client;
     mutable std::mutex m_io_mutex;
-    std::atomic<bool> m_connected{false};
-    bool m_used{false};              // the connection has answered a request
+    std::mutex m_submit_mutex;
+    std::atomic<bool> m_connected{false};   // the poll connection
     std::chrono::steady_clock::time_point m_next_connect{};
     std::chrono::milliseconds m_backoff{0};
     std::atomic<bool> m_cancelled{false};
@@ -453,6 +505,7 @@ public:
         int64_t     last_update_age_s{0}; // seconds since last successful work refresh
         bool        responsive{true};   // answered the last poll (else out of the commitment)
         std::string unresponsive_why;   // the last failure, when not responsive
+        std::string config_error;       // set: the chain is disabled (chain id / address)
     };
     std::vector<ChainInfo> get_chain_infos() const;
 
@@ -511,11 +564,15 @@ public:
     void refresh_aux_work();
 
     /// How long a poll waits for the chains' answers before it builds the
-    /// commitment without the ones still out (default 2 s). With more than one
-    /// chain, a chain whose fetch fails or misses this drops out of the
-    /// commitment until it answers; its answer, when it comes, is applied
-    /// then. The chains are fetched in parallel, without m_mutex held.
+    /// commitment (default 2 s); a slower answer is applied when it comes,
+    /// the chain's last work staying committed meanwhile. The chains are
+    /// fetched in parallel, without m_mutex held.
     void set_refresh_round_deadline(std::chrono::milliseconds d);
+    /// With more than one chain, a chain whose fetch fails, or is still
+    /// running this long after it started (a hung daemon; default 15 s, about
+    /// AuxChainRPC's connect and call deadlines), drops out of the commitment
+    /// until it answers.
+    void set_unresponsive_after(std::chrono::milliseconds d);
 
     /// Read-only view of an aux chain's current block template (symbol,
     /// case-insensitive), for local cross-checks: prev, height, bits,
@@ -608,13 +665,27 @@ private:
 
     // Registered aux chains
     struct ChainState {
-        // Calls into this chain's backends, one at a time: a poll's fetch
-        // and a find's submit run without m_mutex and take this instead.
+        // Calls into this chain's backends from a poll's fetch and a find's
+        // submit, which run without m_mutex: one call at a time per backend
+        // (lock_for), held for that call only, so a submit waits for at most
+        // one call of the same backend, and none for a backend whose submit
+        // has its own connection (submit_independent).
         struct ChainIo {
-            std::timed_mutex  mutex;
-            std::atomic<bool> in_flight{false};   // a fetch of this chain is running
-            int64_t           last_sync_log_ns{0};   // rate limits, under mutex
-            int64_t           last_warn_ns{0};
+            std::mutex        locks_mu;
+            std::map<const IAuxChainBackend*, std::shared_ptr<std::mutex>> locks;
+            std::shared_ptr<std::mutex> lock_for(const IAuxChainBackend* b)
+            {
+                std::lock_guard<std::mutex> l(locks_mu);
+                auto& m = locks[b];
+                if (!m)
+                    m = std::make_shared<std::mutex>();
+                return m;
+            }
+            std::atomic<bool>    in_flight{false};   // a fetch of this chain is running
+            std::atomic<int64_t> fetch_started_ns{0}; // steady clock, when it started
+            std::atomic<int64_t> last_sync_log_ns{0};   // rate limits
+            std::atomic<int64_t> last_warn_ns{0};
+            std::atomic<bool>    network_checked{false};   // check_payout_address passed
         };
         std::shared_ptr<ChainIo>             io = std::make_shared<ChainIo>();
         // Answered its last fetch in time. With more than one chain, a chain
@@ -622,6 +693,10 @@ private:
         bool                                 responsive{true};
         std::string                          unresponsive_why;
         uint64_t                             dropouts{0};
+        // A configuration error found at run time (the daemon's chain id is
+        // not the configured one, the payout address is not of the daemon's
+        // network): the chain is out of the commitment and not polled again.
+        std::string                          config_error;
         // A run of rebuilds that got no payouts for this chain (logged once).
         bool                                 no_payout_episode{false};
         int64_t                              no_payout_since{0};      // steady seconds
@@ -687,6 +762,7 @@ private:
     std::unique_ptr<boost::asio::thread_pool> m_io_pool;
     std::mutex m_io_pool_mutex;
     std::chrono::milliseconds m_refresh_deadline{2'000};
+    std::chrono::milliseconds m_unresponsive_after{15'000};
     std::atomic<bool> m_work_dirty{false};   // an answer changed the work since the last rebuild
 
     // Submit via submitauxblock and relay the accepted block via P2P

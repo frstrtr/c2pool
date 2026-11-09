@@ -290,6 +290,7 @@ std::string SubmitVerdict::label() const
     case Kind::inconclusive: return "inconclusive";
     case Kind::rejected:     return "rejected: " + reason;
     case Kind::error:        return "error: " + reason;
+    case Kind::unknown:      return "unknown: " + reason;
     }
     return "error: " + reason;
 }
@@ -311,14 +312,79 @@ SubmitVerdict classify_submitblock_result(const nlohmann::json& result)
     return SubmitVerdict::of(K::rejected, r.empty() ? std::string("rejected") : r);
 }
 
-uint32_t aux_chain_max_block_bytes(uint32_t chain_id)
+std::string AuxBlockLimit::check(uint64_t stripped_bytes, uint64_t full_bytes) const
+{
+    if (max_stripped && stripped_bytes > max_stripped)
+        return "stripped size " + std::to_string(stripped_bytes) + " > " + std::to_string(max_stripped);
+    if (max_weight && stripped_bytes * 3 + full_bytes > max_weight)
+        return "weight " + std::to_string(stripped_bytes * 3 + full_bytes) + " > " + std::to_string(max_weight);
+    return {};
+}
+
+AuxBlockLimit aux_block_limit(uint32_t chain_id)
 {
     if (chain_id == 8225)   // Junkcoin testnet / regtest
         chain_id = 8224;
     for (const auto& p : aux_chain_params_table())
         if (p.chain_id == chain_id)
-            return p.max_block_bytes;
-    return 0;
+            return {p.max_stripped_bytes, p.max_weight};
+    return {};
+}
+
+namespace {
+bool read_compact(const std::vector<uint8_t>& b, size_t& p, uint64_t& out)
+{
+    if (p >= b.size()) return false;
+    const uint8_t c = b[p++];
+    size_t n = c < 0xfd ? 0 : c == 0xfd ? 2 : c == 0xfe ? 4 : 8;
+    if (n == 0) { out = c; return true; }
+    if (p + n > b.size()) return false;
+    out = 0;
+    for (size_t i = 0; i < n; ++i)
+        out |= uint64_t(b[p + i]) << (8 * i);
+    p += n;
+    return true;
+}
+bool skip(const std::vector<uint8_t>& b, size_t& p, uint64_t n)
+{
+    if (n > b.size() || p + n > b.size()) return false;
+    p += n;
+    return true;
+}
+} // namespace
+
+std::optional<size_t> tx_stripped_size(const std::vector<uint8_t>& b)
+{
+    // version | [00 01 marker/flag] | vin | vout | [witness] | locktime
+    size_t p = 4;
+    if (b.size() < 10)
+        return std::nullopt;
+    const bool witness = b[4] == 0x00 && b[5] == 0x01;
+    if (witness)
+        p = 6;
+    uint64_t n = 0, len = 0;
+    if (!read_compact(b, p, n)) return std::nullopt;
+    const uint64_t n_in = n;
+    for (uint64_t i = 0; i < n_in; ++i)
+        if (!skip(b, p, 36) || !read_compact(b, p, len) || !skip(b, p, len) || !skip(b, p, 4))
+            return std::nullopt;
+    if (!read_compact(b, p, n)) return std::nullopt;
+    for (uint64_t i = 0; i < n; ++i)
+        if (!skip(b, p, 8) || !read_compact(b, p, len) || !skip(b, p, len))
+            return std::nullopt;
+    const size_t witness_start = p;
+    if (witness)
+        for (uint64_t i = 0; i < n_in; ++i) {
+            uint64_t items = 0;
+            if (!read_compact(b, p, items)) return std::nullopt;
+            for (uint64_t k = 0; k < items; ++k)
+                if (!read_compact(b, p, len) || !skip(b, p, len))
+                    return std::nullopt;
+        }
+    const size_t witness_bytes = p - witness_start;
+    if (!skip(b, p, 4) || p != b.size())
+        return std::nullopt;
+    return witness ? b.size() - 2 - witness_bytes : b.size();
 }
 
 // ─── AuxChainRPC ─────────────────────────────────────────────────────────────
@@ -333,59 +399,7 @@ bool is_closed_by_peer(const boost::system::error_code& ec)
         || ec == io::error::connection_reset || ec == io::error::broken_pipe
         || ec == io::error::connection_aborted;
 }
-} // namespace
 
-AuxChainRPC::AuxChainRPC(boost::asio::io_context& /*ioc*/, const AuxChainConfig& config)
-    : m_config(config), m_resolver(m_io), m_client(*this, jsonrpccxx::version::v2)
-{
-    m_http_request = {http::verb::post, "/", 11};
-    m_http_request.set(http::field::host, m_config.rpc_host + ":" + std::to_string(m_config.rpc_port));
-    m_http_request.set(http::field::user_agent, "c2pool-mm/1.0");
-    m_http_request.set(http::field::content_type, "application/json");
-    m_http_request.keep_alive(true);
-    const auto& up = m_config.rpc_userpass;
-    std::string encoded;
-    encoded.resize(beast::detail::base64::encoded_size(up.size()));
-    auto n = beast::detail::base64::encode(&encoded[0], up.data(), up.size());
-    encoded.resize(n);
-    m_http_request.set(http::field::authorization, "Basic " + encoded);
-}
-
-AuxChainRPC::~AuxChainRPC()
-{
-    std::lock_guard<std::mutex> lock(m_io_mutex);
-    close_locked();
-}
-
-bool AuxChainRPC::connected() const { return m_connected.load(); }
-
-void AuxChainRPC::cancel_io()
-{
-    m_cancelled = true;
-    m_io.stop();
-}
-
-void AuxChainRPC::close_locked()
-{
-    if (m_stream) {
-        beast::error_code ec;
-        m_stream->socket().shutdown(io::ip::tcp::socket::shutdown_both, ec);
-        m_stream->socket().close(ec);
-        m_stream.reset();
-    }
-    m_connected = false;
-    m_used = false;
-}
-
-void AuxChainRPC::note_failure_locked()
-{
-    const auto max = std::chrono::milliseconds(std::max<uint32_t>(m_config.rpc_reconnect_max_ms, 1'000));
-    m_backoff = m_backoff.count() == 0 ? std::chrono::milliseconds(1'000)
-                                       : std::min<std::chrono::milliseconds>(m_backoff * 2, max);
-    m_next_connect = SteadyClock::now() + m_backoff;
-}
-
-namespace {
 // One asynchronous step's outcome. Held by the handler too, so a step that is
 // abandoned never writes into a finished call's stack.
 struct StepState {
@@ -418,26 +432,88 @@ void abort_step(io::io_context& ioc, const StepState& st, const std::function<vo
     while (!st.done && SteadyClock::now() < end)
         ioc.run_one_until(end);
 }
+
+void prepare_request(http::request<http::string_body>& r, const AuxChainConfig& cfg)
+{
+    r = {http::verb::post, "/", 11};
+    r.set(http::field::host, cfg.rpc_host + ":" + std::to_string(cfg.rpc_port));
+    r.set(http::field::user_agent, "c2pool-mm/1.0");
+    r.set(http::field::content_type, "application/json");
+    r.keep_alive(true);
+    const auto& up = cfg.rpc_userpass;
+    std::string encoded;
+    encoded.resize(beast::detail::base64::encoded_size(up.size()));
+    auto n = beast::detail::base64::encode(&encoded[0], up.data(), up.size());
+    encoded.resize(n);
+    r.set(http::field::authorization, "Basic " + encoded);
+}
 } // namespace
 
-void AuxChainRPC::open_locked()
+AuxChainRPC::AuxChainRPC(boost::asio::io_context& /*ioc*/, const AuxChainConfig& config)
+    : m_config(config), m_client(*this, jsonrpccxx::version::v2)
+{
+    prepare_request(m_poll.request, m_config);
+    prepare_request(m_submit.request, m_config);
+}
+
+AuxChainRPC::~AuxChainRPC()
+{
+    {
+        std::lock_guard<std::mutex> lock(m_io_mutex);
+        close(m_poll);
+    }
+    std::lock_guard<std::mutex> lock(m_submit_mutex);
+    close(m_submit);
+}
+
+bool AuxChainRPC::connected() const { return m_connected.load(); }
+
+void AuxChainRPC::cancel_io()
+{
+    m_cancelled = true;
+    m_poll.io.stop();
+    m_submit.io.stop();
+}
+
+void AuxChainRPC::close(Conn& c)
+{
+    if (c.stream) {
+        beast::error_code ec;
+        c.stream->socket().shutdown(io::ip::tcp::socket::shutdown_both, ec);
+        c.stream->socket().close(ec);
+        c.stream.reset();
+    }
+    c.used = false;
+    if (&c == &m_poll)
+        m_connected = false;
+}
+
+void AuxChainRPC::note_failure_locked()
+{
+    const auto max = std::chrono::milliseconds(std::max<uint32_t>(m_config.rpc_reconnect_max_ms, 1'000));
+    m_backoff = m_backoff.count() == 0 ? std::chrono::milliseconds(1'000)
+                                       : std::min<std::chrono::milliseconds>(m_backoff * 2, max);
+    m_next_connect = SteadyClock::now() + m_backoff;
+}
+
+void AuxChainRPC::open(Conn& c, const char* what)
 {
     if (m_cancelled)
         throw std::runtime_error("RPC client stopped");
-    close_locked();
+    close(c);
     const auto connect_timeout = std::chrono::milliseconds(std::max<uint32_t>(m_config.rpc_connect_timeout_ms, 1));
     const auto margin = std::chrono::milliseconds(1'000);
 
     auto st = std::make_shared<StepState>();
-    m_resolver.async_resolve(m_config.rpc_host, std::to_string(m_config.rpc_port),
+    c.resolver.async_resolve(m_config.rpc_host, std::to_string(m_config.rpc_port),
         [st](const boost::system::error_code& e, io::ip::tcp::resolver::results_type r) {
             st->ec = e;
             st->endpoints = std::move(r);
             st->done = true;
         });
-    run_until(m_io, *st, connect_timeout, m_cancelled);
+    run_until(c.io, *st, connect_timeout, m_cancelled);
     if (!st->done) {
-        abort_step(m_io, *st, [this] { m_resolver.cancel(); });
+        abort_step(c.io, *st, [&c] { c.resolver.cancel(); });
         st->ec = io::error::timed_out;
     }
     if (m_cancelled)
@@ -445,36 +521,40 @@ void AuxChainRPC::open_locked()
     if (st->ec)
         throw std::runtime_error("resolve " + m_config.rpc_host + ": " + st->ec.message());
 
-    m_stream = std::make_unique<beast::tcp_stream>(m_io);
-    m_stream->expires_after(connect_timeout);
+    c.stream = std::make_unique<beast::tcp_stream>(c.io);
+    c.stream->expires_after(connect_timeout);
     auto cst = std::make_shared<StepState>();
-    m_stream->async_connect(st->endpoints,
+    c.stream->async_connect(st->endpoints,
         [cst](const boost::system::error_code& e, const io::ip::tcp::endpoint&) {
             cst->ec = e;
             cst->done = true;
         });
-    run_until(m_io, *cst, connect_timeout + margin, m_cancelled);
+    run_until(c.io, *cst, connect_timeout + margin, m_cancelled);
     if (!cst->done) {
-        abort_step(m_io, *cst, [this] { boost::system::error_code ig; m_stream->socket().close(ig); });
+        abort_step(c.io, *cst, [&c] { boost::system::error_code ig; c.stream->socket().close(ig); });
         cst->ec = beast::error::timeout;
     }
     if (m_cancelled) {
-        close_locked();
+        close(c);
         throw std::runtime_error("RPC client stopped");
     }
     if (cst->ec) {
-        close_locked();
+        close(c);
         throw std::runtime_error("connect " + m_config.rpc_host + ":" + std::to_string(m_config.rpc_port)
                                  + ": " + (cst->ec == beast::error::timeout ? std::string("timed out") : cst->ec.message()));
     }
-    m_connected = true;
-    m_used = false;
-    const uint64_t n = ++m_connects;
-    if (n == 1 || m_backoff.count() > 0)
-        LOG_INFO << "[MM:" << m_config.symbol << "] " << (n == 1 ? "Connected" : "Reconnected")
-                 << " to aux daemon at " << m_config.rpc_host << ":" << m_config.rpc_port;
-    else
-        LOG_DEBUG_DIAG << "[MM:" << m_config.symbol << "] new RPC connection (the last one was closed)";
+    c.used = false;
+    if (&c == &m_poll) {
+        m_connected = true;
+        const uint64_t n = ++m_connects;
+        if (n == 1 || m_backoff.count() > 0)
+            LOG_INFO << "[MM:" << m_config.symbol << "] " << (n == 1 ? "Connected" : "Reconnected")
+                     << " to aux daemon at " << m_config.rpc_host << ":" << m_config.rpc_port;
+        else
+            LOG_DEBUG_DIAG << "[MM:" << m_config.symbol << "] new RPC connection (the last one was closed)";
+    } else {
+        LOG_DEBUG_DIAG << "[MM:" << m_config.symbol << "] new " << what << " connection";
+    }
 }
 
 bool AuxChainRPC::connect()
@@ -483,7 +563,7 @@ bool AuxChainRPC::connect()
     if (m_connected)
         return true;
     try {
-        open_locked();
+        open(m_poll, "RPC");
         return true;
     } catch (const std::exception& e) {
         note_failure_locked();
@@ -492,39 +572,39 @@ bool AuxChainRPC::connect()
     }
 }
 
-std::string AuxChainRPC::exchange_locked(const std::string& request, bool& stale_connection)
+std::string AuxChainRPC::exchange(Conn& c, const std::string& request, std::chrono::milliseconds timeout,
+                                  bool& stale_connection)
 {
-    const auto timeout = std::chrono::milliseconds(std::max<uint32_t>(m_config.rpc_timeout_ms, 1));
     const auto margin = std::chrono::milliseconds(1'000);
-    const auto close_socket = [this] { boost::system::error_code ig; m_stream->socket().close(ig); };
-    m_http_request.body() = request;
-    m_http_request.prepare_payload();
+    const auto close_socket = [&c] { boost::system::error_code ig; c.stream->socket().close(ig); };
+    c.request.body() = request;
+    c.request.prepare_payload();
 
     auto wst = std::make_shared<StepState>();
-    m_stream->expires_after(timeout);
-    http::async_write(*m_stream, m_http_request,
+    c.stream->expires_after(timeout);
+    http::async_write(*c.stream, c.request,
         [wst](const boost::system::error_code& e, std::size_t) { wst->ec = e; wst->done = true; });
-    run_until(m_io, *wst, timeout + margin, m_cancelled);
+    run_until(c.io, *wst, timeout + margin, m_cancelled);
     if (!wst->done) {
-        abort_step(m_io, *wst, close_socket);
+        abort_step(c.io, *wst, close_socket);
         wst->ec = beast::error::timeout;
     }
     if (m_cancelled)
         throw std::runtime_error("RPC client stopped");
     if (wst->ec) {
-        stale_connection = m_used && is_closed_by_peer(wst->ec);
+        stale_connection = c.used && is_closed_by_peer(wst->ec);
         throw std::runtime_error("RPC write: " + (wst->ec == beast::error::timeout ? std::string("timed out")
                                                                                    : wst->ec.message()));
     }
 
     auto rst = std::make_shared<StepState>();
     rst->parser.body_limit(kRpcBodyLimit);
-    m_stream->expires_after(timeout);
-    http::async_read(*m_stream, rst->buffer, rst->parser,
+    c.stream->expires_after(timeout);
+    http::async_read(*c.stream, rst->buffer, rst->parser,
         [rst](const boost::system::error_code& e, std::size_t) { rst->ec = e; rst->done = true; });
-    run_until(m_io, *rst, timeout + margin, m_cancelled);
+    run_until(c.io, *rst, timeout + margin, m_cancelled);
     if (!rst->done) {
-        abort_step(m_io, *rst, close_socket);
+        abort_step(c.io, *rst, close_socket);
         rst->ec = beast::error::timeout;
     }
     if (m_cancelled)
@@ -532,16 +612,15 @@ std::string AuxChainRPC::exchange_locked(const std::string& request, bool& stale
     if (rst->ec) {
         // A keep-alive connection the daemon closed while idle answers the
         // next request with end-of-stream: the request was never read.
-        stale_connection = m_used && is_closed_by_peer(rst->ec);
+        stale_connection = c.used && is_closed_by_peer(rst->ec);
         throw std::runtime_error("RPC read: " + (rst->ec == beast::error::timeout
                                                      ? "no answer within " + std::to_string(timeout.count()) + " ms"
                                                      : rst->ec.message()));
     }
-    m_used = true;
-    m_backoff = std::chrono::milliseconds(0);
+    c.used = true;
     auto res = rst->parser.release();
     if (!res.keep_alive())
-        close_locked();   // the daemon closes it: the next call opens another
+        close(c);   // the daemon closes it: the next call opens another
     return std::move(res.body());
 }
 
@@ -549,6 +628,7 @@ std::string AuxChainRPC::exchange_locked(const std::string& request, bool& stale
 // back as a body (HTTP 500 with an "error" object) like any other answer.
 std::string AuxChainRPC::Send(const std::string& request)
 {
+    const auto timeout = std::chrono::milliseconds(std::max<uint32_t>(m_config.rpc_timeout_ms, 1));
     for (int attempt = 0;; ++attempt) {
         if (m_cancelled)
             throw std::runtime_error("RPC client stopped");
@@ -559,7 +639,7 @@ std::string AuxChainRPC::Send(const std::string& request)
                     + std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(m_next_connect - now).count())
                     + " ms)");
             try {
-                open_locked();
+                open(m_poll, "RPC");
             } catch (const std::exception& e) {
                 note_failure_locked();
                 LOG_WARNING << "[MM:" << m_config.symbol << "] " << e.what() << " (next try in "
@@ -569,12 +649,14 @@ std::string AuxChainRPC::Send(const std::string& request)
         }
         bool stale = false;
         try {
-            return exchange_locked(request, stale);
+            std::string body = exchange(m_poll, request, timeout, stale);
+            m_backoff = std::chrono::milliseconds(0);
+            return body;
         } catch (const std::exception& e) {
-            close_locked();
+            close(m_poll);
             if (stale && attempt == 0) {
                 LOG_DEBUG_DIAG << "[MM:" << m_config.symbol << "] the daemon closed the connection ("
-                          << e.what() << "): sending again on a new one";
+                               << e.what() << "): sending again on a new one";
                 continue;
             }
             note_failure_locked();
@@ -725,32 +807,72 @@ AuxWork AuxChainRPC::create_aux_block(const std::string& address)
 
 SubmitVerdict AuxChainRPC::submit_block_verdict(const std::string& block_hex)
 {
-    // BIP22 (classify_submitblock_result): a REJECTION is a non-null string
-    // RESULT, not a JSON-RPC error, so whether call() throws says nothing
-    // about acceptance. An inconclusive block is stored but not on the best
-    // chain: not a win now; the found-block check follows the daemon's chain.
+    // Its own connection (a find never queues behind a poll), no backoff (a
+    // block is always tried), a longer deadline (validation). BIP22
+    // (classify_submitblock_result): a rejection is a non-null string result,
+    // not a JSON-RPC error. No answer is unknown: the daemon may have taken
+    // the block, and the P2P relay sent it too; the found-block check follows
+    // the chain. A JSON-RPC error object is the daemon's refusal.
+    using K = SubmitVerdict::Kind;
     SubmitVerdict v;
-    try {
-        v = classify_submitblock_result(call("submitblock", nlohmann::json::array({block_hex})));
-    } catch (const std::exception& e) {
-        v = SubmitVerdict::of(SubmitVerdict::Kind::error, e.what());
+    const auto timeout = std::chrono::milliseconds(std::max<uint32_t>(m_config.rpc_submit_timeout_ms, 1));
+    const std::string request = nlohmann::json{{"jsonrpc", "1.0"}, {"id", "c2pool-submit"},
+                                               {"method", "submitblock"},
+                                               {"params", nlohmann::json::array({block_hex})}}.dump();
+    {
+        std::lock_guard<std::mutex> lock(m_submit_mutex);
+        for (int attempt = 0;; ++attempt) {
+            bool stale = false;
+            try {
+                if (!m_submit.stream)
+                    open(m_submit, "submit");
+                const std::string body = exchange(m_submit, request, timeout, stale);
+                const auto j = nlohmann::json::parse(body, nullptr, false);
+                if (j.is_discarded() || !j.is_object())
+                    v = SubmitVerdict::of(K::unknown, "unparsable answer: " + body.substr(0, 120));
+                else if (j.contains("error") && j["error"].is_object()) {
+                    // -22 (RPC_DESERIALIZATION_ERROR, "Block decode failed"):
+                    // the bytes are no block, on any path. Any other error
+                    // (-28 warming up, a verify error) says nothing about the
+                    // block the P2P relay also sent: the chain decides.
+                    const int code = j["error"].value("code", 0);
+                    v = SubmitVerdict::of(code == -22 ? K::error : K::unknown,
+                                          std::to_string(code) + ": " + j["error"].value("message", std::string()));
+                }
+                else if (j.contains("error") && j["error"].is_string())
+                    v = SubmitVerdict::of(K::error, j["error"].get<std::string>());
+                else
+                    v = classify_submitblock_result(j.contains("result") ? j["result"] : nlohmann::json());
+                break;
+            } catch (const std::exception& e) {
+                close(m_submit);
+                if (stale && attempt == 0)
+                    continue;   // the daemon had closed the idle connection
+                v = SubmitVerdict::of(K::unknown, e.what());
+                break;
+            }
+        }
     }
     switch (v.kind) {
-    case SubmitVerdict::Kind::accepted:
+    case K::accepted:
         LOG_INFO << "[MM:" << m_config.symbol << "] submitblock ACCEPTED";
         break;
-    case SubmitVerdict::Kind::duplicate:
+    case K::duplicate:
         LOG_INFO << "[MM:" << m_config.symbol << "] submitblock: duplicate (the daemon already has this block, valid)";
         break;
-    case SubmitVerdict::Kind::inconclusive:
+    case K::inconclusive:
         LOG_WARNING << "[MM:" << m_config.symbol << "] submitblock INCONCLUSIVE (" << v.reason
                     << "): stored, not on the daemon's best chain";
         break;
-    case SubmitVerdict::Kind::rejected:
+    case K::rejected:
         LOG_ERROR << "[MM:" << m_config.symbol << "] submitblock REJECTED by daemon: " << v.reason;
         break;
-    case SubmitVerdict::Kind::error:
-        LOG_WARNING << "[MM:" << m_config.symbol << "] submitblock failed: " << v.reason;
+    case K::error:
+        LOG_ERROR << "[MM:" << m_config.symbol << "] submitblock refused: " << v.reason;
+        break;
+    case K::unknown:
+        LOG_WARNING << "[MM:" << m_config.symbol << "] submitblock: no answer (" << v.reason
+                    << "): the chain decides (P2P relay sent it too)";
         break;
     }
     return v;
@@ -759,6 +881,16 @@ SubmitVerdict AuxChainRPC::submit_block_verdict(const std::string& block_hex)
 bool AuxChainRPC::submit_block(const std::string& block_hex)
 {
     return submit_block_verdict(block_hex).accepted();
+}
+
+std::optional<std::string> AuxChainRPC::get_chain_name()
+{
+    try {
+        const auto r = call("getblockchaininfo");
+        if (r.is_object() && r.contains("chain") && r["chain"].is_string())
+            return r["chain"].get<std::string>();
+    } catch (const std::exception&) {}
+    return std::nullopt;
 }
 
 std::optional<uint32_t> AuxChainRPC::get_block_count()
@@ -1027,6 +1159,12 @@ void MergedMiningManager::set_refresh_round_deadline(std::chrono::milliseconds d
     m_refresh_deadline = d;
 }
 
+void MergedMiningManager::set_unresponsive_after(std::chrono::milliseconds d)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    m_unresponsive_after = d;
+}
+
 boost::asio::thread_pool& MergedMiningManager::io_pool()
 {
     std::lock_guard<std::mutex> lock(m_io_pool_mutex);
@@ -1158,6 +1296,7 @@ struct MergedMiningManager::FetchResult
     enum class Kind { unchanged, waiting_sync, still_degraded, new_work, failed };
     Kind        kind{Kind::failed};
     std::string error;
+    std::string config_error;            // set: the chain is disabled (chain id / address)
     bool        swapped{false};          // primary and fallback exchanged
     bool        using_fallback{false};
     bool        tip_set{false};
@@ -1170,8 +1309,11 @@ struct MergedMiningManager::FetchResult
 // createauxblock (and the template in multiaddress mode) when it moved or the
 // template came back degraded, the embedded/RPC jumpstart and failover, the
 // daemon's authoritative target, the promotion back to the embedded backend.
-// Runs with the chain's io lock held and m_mutex not held: it only reads its
-// input and writes its result (apply_fetch_locked applies it).
+// Runs without m_mutex, each backend call under that backend's own lock (a
+// find's submit waits for at most one call): it only reads its input and
+// writes its result (apply_fetch_locked applies it). Work whose chain id is
+// not the configured one, or a payout address that is not of the daemon's
+// network, is a configuration error: the chain is disabled.
 MergedMiningManager::FetchResult MergedMiningManager::fetch_chain(const FetchInput& in)
 {
     using Kind = FetchResult::Kind;
@@ -1183,39 +1325,80 @@ MergedMiningManager::FetchResult MergedMiningManager::fetch_chain(const FetchInp
     const auto& sym = in.config.symbol;
     const auto& address = in.config.aux_payout_address;
     const auto now_ns = [] { return std::chrono::steady_clock::now().time_since_epoch().count(); };
+    auto& io = *in.io;
+    // One backend call under that backend's lock.
+    const auto locked = [&io](IAuxChainBackend* b, auto&& f) {
+        const auto m = io.lock_for(b);
+        std::lock_guard<std::mutex> g(*m);
+        return f(b);
+    };
+    const auto best_hash = [&](IAuxChainBackend* b) {
+        return locked(b, [](IAuxChainBackend* x) { return x->get_best_block_hash(); });
+    };
+    const auto aux_block = [&](IAuxChainBackend* b) {
+        return locked(b, [&address](IAuxChainBackend* x) { return x->create_aux_block(address); });
+    };
+    const auto work_template = [&](IAuxChainBackend* b) {
+        return locked(b, [](IAuxChainBackend* x) { return x->get_work_template(); });
+    };
+    // createauxblock's chain id is the daemon's: another than the configured
+    // one puts the block at a slot its daemon does not check ("Aux POW wrong
+    // index") with a version of another chain.
+    const auto chain_id_error = [&](const AuxWork& w) -> std::string {
+        if (w.chain_id == 0 || w.chain_id == in.config.chain_id)
+            return {};
+        return "the daemon's chain id is " + std::to_string(w.chain_id) + ", configured "
+               + std::to_string(in.config.chain_id) + ": fix --merged " + sym + ":<CHAIN_ID>:...";
+    };
 
     // Size budget for the template about to be built: the backends that
     // build their own (embedded) keep header + AuxPoW + coinbase room.
-    rpc->set_block_size_reserve(in.size_reserve);
-    rpc->set_block_sigop_reserve(in.sigop_reserve);
-    if (fb) {
-        fb->set_block_size_reserve(in.size_reserve);
-        fb->set_block_sigop_reserve(in.sigop_reserve);
+    for (IAuxChainBackend* b : {rpc, fb}) {
+        if (!b)
+            continue;
+        locked(b, [&](IAuxChainBackend* x) {
+            x->set_block_size_reserve(in.size_reserve);
+            x->set_block_sigop_reserve(in.sigop_reserve);
+            return 0;
+        });
     }
 
     try {
+        // The payout address against the daemon's own network, once.
+        if (in.config.check_payout_address && !io.network_checked.load()) {
+            const auto chain = locked(rpc, [](IAuxChainBackend* x) { return x->get_chain_name(); });
+            if (chain) {
+                const std::string why = in.config.check_payout_address(*chain);
+                if (!why.empty()) {
+                    r.config_error = why;
+                    r.error = why;
+                    return r;
+                }
+                io.network_checked = true;
+            }
+        }
         // A degraded template (built before the tip's body cleaned the
         // mempool: coinbase only) is fetched again on every poll until a
         // clean one comes back.
-        const auto tip = rpc->get_best_block_hash();
+        const auto tip = best_hash(rpc);
         const bool same_tip = tip == in.last_tip && in.has_work;
         if (same_tip && !in.template_degraded) {
             r.kind = Kind::unchanged;
         } else {
             // Always createauxblock: the canonical hash and target; in
             // multiaddress mode the template too (PPLNS coinbase).
-            auto new_work = rpc->create_aux_block(address);
+            auto new_work = aux_block(rpc);
 
             // Primary returned empty work (embedded chain not synced yet):
             // the fallback (daemon RPC) keeps the commitment present.
             if (new_work.block_hash.IsNull() && new_work.height == 0) {
                 if (fb && !r.using_fallback) {
                     try {
-                        new_work = fb->create_aux_block(address);
+                        new_work = aux_block(fb);
                         if (!new_work.block_hash.IsNull()) {
                             swap();
                             r.using_fallback = true;
-                            r.last_tip = rpc->get_best_block_hash();
+                            r.last_tip = best_hash(rpc);
                             r.tip_set = true;
                             LOG_INFO << "[MM:" << sym << "] Embedded not synced — using RPC (jumpstart)"
                                      << " height=" << new_work.height;
@@ -1225,8 +1408,8 @@ MergedMiningManager::FetchResult MergedMiningManager::fetch_chain(const FetchInp
                     }
                 }
                 if (new_work.block_hash.IsNull() && new_work.height == 0) {
-                    if (now_ns() - in.io->last_sync_log_ns > 30'000'000'000LL) {
-                        in.io->last_sync_log_ns = now_ns();
+                    if (now_ns() - io.last_sync_log_ns.load() > 30'000'000'000LL) {
+                        io.last_sync_log_ns = now_ns();
                         LOG_INFO << "[MM:" << sym << "] Waiting for embedded chain sync (fallback also unavailable)...";
                     }
                     if (!r.tip_set) {
@@ -1237,12 +1420,16 @@ MergedMiningManager::FetchResult MergedMiningManager::fetch_chain(const FetchInp
                     return r;
                 }
             }
+            if (auto why = chain_id_error(new_work); !why.empty()) {
+                r.config_error = r.error = why;
+                return r;
+            }
             if (!r.tip_set) {
                 r.last_tip = tip;
                 r.tip_set = true;
             }
             if (in.config.multiaddress) {
-                auto tmpl_work = rpc->get_work_template();
+                auto tmpl_work = work_template(rpc);
                 // Keep the template data but preserve the createauxblock hash
                 new_work.block_template = std::move(tmpl_work.block_template);
                 new_work.prev_block_hash = std::move(tmpl_work.prev_block_hash);
@@ -1261,7 +1448,11 @@ MergedMiningManager::FetchResult MergedMiningManager::fetch_chain(const FetchInp
             // backend computes its own, which can diverge from the chain.
             if (fb && !r.using_fallback) {
                 try {
-                    auto daemon_work = fb->create_aux_block(address);
+                    auto daemon_work = aux_block(fb);
+                    if (auto why = chain_id_error(daemon_work); !why.empty()) {
+                        r.config_error = r.error = why;
+                        return r;
+                    }
                     if (!daemon_work.target.IsNull()) {
                         if (new_work.target != daemon_work.target) {
                             LOG_INFO << "[MM:" << sym << "] Target from daemon differs from embedded:"
@@ -1280,8 +1471,8 @@ MergedMiningManager::FetchResult MergedMiningManager::fetch_chain(const FetchInp
         }
     } catch (const std::exception& e) {
         r.error = e.what();
-        if (now_ns() - in.io->last_warn_ns > 30'000'000'000LL) {   // 30 s rate limit
-            in.io->last_warn_ns = now_ns();
+        if (now_ns() - io.last_warn_ns.load() > 30'000'000'000LL) {   // 30 s rate limit
+            io.last_warn_ns = now_ns();
             LOG_WARNING << "[MM:" << sym << "] Failed to refresh: " << e.what();
         }
         r.kind = Kind::failed;
@@ -1291,10 +1482,16 @@ MergedMiningManager::FetchResult MergedMiningManager::fetch_chain(const FetchInp
             swap();
             r.using_fallback = !r.using_fallback;
             try {
-                const auto tip = rpc->get_best_block_hash();
-                AuxWork w = rpc->create_aux_block(address);
+                const auto tip = best_hash(rpc);
+                AuxWork w = aux_block(rpc);
+                if (auto why = chain_id_error(w); !why.empty()) {
+                    swap();
+                    r.using_fallback = !r.using_fallback;
+                    r.config_error = r.error = why;
+                    return r;
+                }
                 if (in.config.multiaddress) {
-                    auto tmpl_work = rpc->get_work_template();
+                    auto tmpl_work = work_template(rpc);
                     w.block_template = std::move(tmpl_work.block_template);
                     w.prev_block_hash = std::move(tmpl_work.prev_block_hash);
                     w.coinbase_value = tmpl_work.coinbase_value;
@@ -1322,7 +1519,7 @@ MergedMiningManager::FetchResult MergedMiningManager::fetch_chain(const FetchInp
     // tip, switch back to embedded (preferred backend).
     if (r.using_fallback && fb) {
         try {
-            auto embedded_tip = fb->get_best_block_hash();
+            auto embedded_tip = best_hash(fb);
             if (!embedded_tip.empty()) {
                 swap();
                 r.using_fallback = false;
@@ -1344,6 +1541,14 @@ bool MergedMiningManager::apply_fetch_locked(size_t index, FetchResult& r)
     chain.using_fallback = r.using_fallback;
     if (r.tip_set)
         chain.last_tip = r.last_tip;
+
+    if (!r.config_error.empty()) {
+        if (chain.config_error.empty()) {
+            chain.config_error = r.config_error;
+            LOG_ERROR << "[MM:" << chain.config.symbol << "] merged chain DISABLED: " << r.config_error;
+        }
+        return true;
+    }
 
     bool changed = false;
     switch (r.kind) {
@@ -1412,11 +1617,13 @@ void MergedMiningManager::refresh_aux_work()
 
     // One round: every chain not already being fetched is fetched in
     // parallel. The round waits (at most m_refresh_deadline) for the chains
-    // that answered last time; a chain still out after that is left out of
-    // this round's commitment, and its answer is applied when it comes (then
-    // a refresh is asked for). A chain already out is waited for only
-    // kOutChainWait from the round's start: one that is back rejoins in this
-    // round, one that still hangs costs the others no more than that.
+    // that answered last time, and kOutChainWait from its start for the ones
+    // already out (one that is back rejoins in this round); then it builds
+    // the commitment without waiting any longer. A slower answer is applied
+    // when it comes (then a refresh is asked for): a slow chain keeps its
+    // last work committed meanwhile. A chain whose fetch fails, or is still
+    // running m_unresponsive_after after it started (a hung daemon), drops
+    // out of the commitment until it answers.
     static constexpr auto kOutChainWait = std::chrono::milliseconds(200);
     struct Round {
         std::mutex              mu;
@@ -1427,14 +1634,16 @@ void MergedMiningManager::refresh_aux_work()
     };
     const auto round_start = std::chrono::steady_clock::now();
     auto round = std::make_shared<Round>();
-    std::vector<size_t> waited;   // chain indexes the round waits for
-    std::chrono::milliseconds deadline;
+    std::chrono::milliseconds deadline, hang_after;
     {
         std::lock_guard<std::recursive_mutex> lock(m_mutex);
         deadline = m_refresh_deadline;
+        hang_after = m_unresponsive_after;
         auto& pool = io_pool();
         for (size_t i = 0; i < m_chains.size(); ++i) {
             auto& chain = m_chains[i];
+            if (!chain.config_error.empty())
+                continue;   // disabled (configuration error): not polled
             if (chain.io->in_flight.exchange(true))
                 continue;   // still fetching (a slow or hung daemon): not waited for again
             FetchInput in;
@@ -1449,30 +1658,26 @@ void MergedMiningManager::refresh_aux_work()
             in.size_reserve = block_size_reserve_locked(chain);
             in.sigop_reserve = block_sigop_reserve_locked(chain);
             in.io = chain.io;
+            chain.io->fetch_started_ns = std::chrono::steady_clock::now().time_since_epoch().count();
             const bool wait_for = chain.responsive;
             {
                 std::lock_guard<std::mutex> rl(round->mu);
                 ++round->pending_all;
-                if (wait_for) {
-                    waited.push_back(i);
+                if (wait_for)
                     ++round->pending;
-                }
             }
             boost::asio::post(pool, [this, in = std::move(in), round, wait_for]() {
                 FetchResult r;
-                {
-                    std::unique_lock<std::timed_mutex> io_lock(in.io->mutex);
-                    try {
-                        r = fetch_chain(in);
-                    } catch (const std::exception& e) {
-                        r = FetchResult{};
-                        r.using_fallback = in.using_fallback;
-                        r.error = e.what();
-                    } catch (...) {
-                        r = FetchResult{};
-                        r.using_fallback = in.using_fallback;
-                        r.error = "unknown exception";
-                    }
+                try {
+                    r = fetch_chain(in);
+                } catch (const std::exception& e) {
+                    r = FetchResult{};
+                    r.using_fallback = in.using_fallback;
+                    r.error = e.what();
+                } catch (...) {
+                    r = FetchResult{};
+                    r.using_fallback = in.using_fallback;
+                    r.error = "unknown exception";
                 }
                 bool changed = false;
                 try {
@@ -1512,15 +1717,18 @@ void MergedMiningManager::refresh_aux_work()
         round->closed = true;
     }
 
-    // Chains the round waited for and that have not answered: slow or hung.
+    // Chains whose fetch has been running longer than hang_after: hung.
     {
         std::lock_guard<std::recursive_mutex> lock(m_mutex);
-        for (size_t i : waited) {
-            auto& chain = m_chains[i];
+        const int64_t now_ns = std::chrono::steady_clock::now().time_since_epoch().count();
+        for (auto& chain : m_chains) {
             if (!chain.io->in_flight.load() || !chain.responsive)
                 continue;
+            if (now_ns - chain.io->fetch_started_ns.load()
+                < std::chrono::duration_cast<std::chrono::nanoseconds>(hang_after).count())
+                continue;
             chain.responsive = false;
-            chain.unresponsive_why = "no answer within " + std::to_string(deadline.count()) + " ms";
+            chain.unresponsive_why = "no answer within " + std::to_string(hang_after.count()) + " ms";
             ++chain.dropouts;
             LOG_WARNING << "[MM:" << chain.config.symbol << "] " << chain.unresponsive_why
                         << (m_chains.size() > 1 ? ": out of the merged-mining commitment until it answers"
@@ -1564,8 +1772,8 @@ struct MergedMiningManager::SubmitJob
     uint32_t                             chain_id{0};
     std::string                          symbol;
     IAuxChainBackend*                    backend{nullptr};   // owned by the chain (never freed while running)
-    std::shared_ptr<ChainState::ChainIo> io;
-    std::chrono::milliseconds            lock_wait{0};
+    // The backend's call lock (null: its submit has its own connection).
+    std::shared_ptr<std::mutex>          backend_lock;
     std::string                          block_hex;
     uint256                              block_hash;
     int                                  height{0};
@@ -1849,19 +2057,28 @@ void MergedMiningManager::try_submit_merged_blocks(
         }
 
         auto block_hex = blk.str();
-        // The chain's CheckBlock refuses a block above its limit
-        // (bad-blk-length, AuxPoW included; aux_chain_max_block_bytes: DOGE,
-        // PEP, LKY, SHIC 1,000,000): such a block can never be accepted, so
-        // it is refused here and counted, not relayed.
-        const uint32_t max_block_bytes = aux_chain_max_block_bytes(chain.config);
-        if (max_block_bytes && block_hex.size() / 2 > max_block_bytes) {
-            ++m_block_refusals_by_code[chain.config.symbol + ":oversize"];
-            LOG_ERROR << "[MM:" << chain.config.symbol << "] Merged block REFUSED: "
-                      << block_hex.size() / 2 << " bytes > " << max_block_bytes
-                      << " (auxpow " << auxpow.size() / 2 << " B, coinbase "
-                      << use_coinbase->size() / 2 << " B, " << n_tx - 1
-                      << " txs) — not submitted";
-            continue;
+        // The chain's CheckBlock refuses a block over its limits (aux_block_limit:
+        // the stripped size, AuxPoW included, and on a segwit chain the
+        // weight): such a block can never be accepted, so it is refused here
+        // and counted, neither submitted nor relayed (peers ban for it).
+        const AuxBlockLimit limit = aux_block_limit(chain.config);
+        if (limit.known()) {
+            uint64_t stripped = 80 + auxpow.size() / 2 + varint_hex(n_tx).size() / 2 + use_coinbase->size() / 2;
+            if (tmpl.contains("transactions"))
+                for (auto& tx : tmpl["transactions"]) {
+                    const auto raw = from_hex(tx.value("data", std::string("")));
+                    // A transaction that does not parse counts whole (no witness to remove).
+                    stripped += tx_stripped_size(raw).value_or(raw.size());
+                }
+            const std::string why = limit.check(stripped, block_hex.size() / 2);
+            if (!why.empty()) {
+                ++m_block_refusals_by_code[chain.config.symbol + ":oversize"];
+                LOG_ERROR << "[MM:" << chain.config.symbol << "] Merged block REFUSED: " << why
+                          << " (" << block_hex.size() / 2 << " bytes; auxpow " << auxpow.size() / 2
+                          << " B, coinbase " << use_coinbase->size() / 2 << " B, " << n_tx - 1
+                          << " txs) — not submitted, not relayed";
+                continue;
+            }
         }
         if (block_hex.empty())
             continue;
@@ -1904,11 +2121,10 @@ void MergedMiningManager::try_submit_merged_blocks(
         job.chain_id = chain.config.chain_id;
         job.symbol = chain.config.symbol;
         job.backend = chain.rpc.get();
-        job.io = chain.io;
-        // A fetch of this chain may hold its io lock for at most a connect
-        // and a call (AuxChainRPC deadlines); then this submit's own call.
-        job.lock_wait = std::chrono::milliseconds(uint64_t(chain.config.rpc_connect_timeout_ms)
-                                                  + chain.config.rpc_timeout_ms + 5'000);
+        // A backend whose submit has its own connection is not waited for at
+        // all; any other waits for at most the one call it is in.
+        if (!job.backend->submit_independent())
+            job.backend_lock = chain.io->lock_for(job.backend);
         job.block_hex = std::move(block_hex);
         // The block found is the snapshot's (a share on a stale job
         // commits to an older block than the current work).
@@ -1929,28 +2145,27 @@ void MergedMiningManager::try_submit_merged_blocks(
     LOG_INFO << "[MM] try_submit_merged_blocks finished";
 }
 
-// Each block goes to its daemon on its own thread (none waits for another,
-// one that throws stops nothing); as each answers, on the calling thread (the
-// found-block callback reads its thread's submit context): the record, then
-// the P2P relay, which fires whatever the daemon said (ARM A above). One
-// block: submitted right here, as before.
+// The P2P relay first, for every block, on the calling thread (ARM A: it
+// fires whatever the daemon will say). Then each block goes to its daemon
+// on its own thread (none waits for another, one that throws stops nothing);
+// as each answers, on the calling thread (the found-block callback reads its
+// thread's submit context), its record. A backend that throws, or a daemon
+// that does not answer, is unknown: the found-block check follows the chain.
+// One block: submitted right here.
 void MergedMiningManager::run_submit_jobs(std::vector<SubmitJob>& jobs, const std::string& parent_hash_hex)
 {
+    using K = SubmitVerdict::Kind;
     const auto submit_one = [](SubmitJob& j) {
-        std::unique_lock<std::timed_mutex> io_lock(j.io->mutex, std::defer_lock);
-        if (!io_lock.try_lock_for(j.lock_wait)) {
-            j.verdict = SubmitVerdict::of(SubmitVerdict::Kind::error,
-                "the backend stayed busy for " + std::to_string(j.lock_wait.count()) + " ms");
-            LOG_ERROR << "[MM:" << j.symbol << "] submit not attempted: " << j.verdict.reason;
-            return;
-        }
         try {
+            std::unique_lock<std::mutex> lock;
+            if (j.backend_lock)
+                lock = std::unique_lock<std::mutex>(*j.backend_lock);
             j.verdict = j.backend->submit_block_verdict(j.block_hex);
         } catch (const std::exception& e) {
-            j.verdict = SubmitVerdict::of(SubmitVerdict::Kind::error, e.what());
+            j.verdict = SubmitVerdict::of(K::unknown, std::string("the backend threw: ") + e.what());
             LOG_ERROR << "[MM:" << j.symbol << "] submit threw: " << e.what();
         } catch (...) {
-            j.verdict = SubmitVerdict::of(SubmitVerdict::Kind::error, "unknown exception");
+            j.verdict = SubmitVerdict::of(K::unknown, "the backend threw an unknown exception");
             LOG_ERROR << "[MM:" << j.symbol << "] submit threw an unknown exception";
         }
     };
@@ -1959,6 +2174,11 @@ void MergedMiningManager::run_submit_jobs(std::vector<SubmitJob>& jobs, const st
         std::lock_guard<std::recursive_mutex> lock(m_mutex);
         relay = m_block_relay_fn;
     }
+    if (relay)
+        for (auto& j : jobs) {
+            try { relay(j.chain_id, j.block_hex); }
+            catch (...) {}
+        }
     const auto finish = [&](SubmitJob& j) {
         try {
             std::lock_guard<std::recursive_mutex> lock(m_mutex);
@@ -1970,10 +2190,6 @@ void MergedMiningManager::run_submit_jobs(std::vector<SubmitJob>& jobs, const st
                 }
         } catch (const std::exception& e) {
             LOG_ERROR << "[MM:" << j.symbol << "] recording the found block failed: " << e.what();
-        }
-        if (relay) {
-            try { relay(j.chain_id, j.block_hex); }
-            catch (...) {}
         }
         LOG_INFO << "[MM:" << j.symbol << "] Post-submission processing complete";
     };
@@ -2219,8 +2435,10 @@ bool MergedMiningManager::rebuild_cached_blocks()
         payout_fn = m_payout_provider;
         for (const auto& chain : m_chains) {
             // With several chains, one that did not answer its last poll is
-            // out of the commitment: no block is built for it.
+            // out of the commitment: no block is built for it. A chain with a
+            // configuration error never is.
             if (m_chains.size() > 1 && !chain.responsive) continue;
+            if (!chain.config_error.empty()) continue;
             if (chain.current_work.coinbase_value == 0) continue;
             if (chain.current_work.block_template.is_null()) continue;
             snapshots.push_back({chain.config.chain_id,
@@ -2454,7 +2672,7 @@ bool MergedMiningManager::rebuild_cached_blocks()
     for (const auto& chain : m_chains) {
         if (chain.current_work.block_hash.IsNull())
             continue;
-        if (m_chains.size() > 1 && !chain.responsive)
+        if ((m_chains.size() > 1 && !chain.responsive) || !chain.config_error.empty())
             continue;
         bool have = false;
         for (const auto& a : adopted)
@@ -2474,7 +2692,7 @@ bool MergedMiningManager::rebuild_cached_blocks()
     if (m_chains.size() <= 1) {
         std::map<uint32_t, uint256> slot_hashes;
         for (const auto& chain : m_chains) {
-            if (!chain.current_work.block_hash.IsNull()) {
+            if (!chain.current_work.block_hash.IsNull() && chain.config_error.empty()) {
                 auto it = m_tree.slot_map.find(chain.config.chain_id);
                 if (it != m_tree.slot_map.end())
                     slot_hashes[it->second] = chain.current_work.block_hash;
@@ -2493,22 +2711,35 @@ bool MergedMiningManager::rebuild_cached_blocks()
         // against the chains in the share's merged_coinbase_info the same way
         // (p2pool data.py make_auxpow_tree), so a chain out this round must
         // not leave an empty slot behind.
+        // A chain whose block c2pool does not build (createauxblock mode)
+        // has no header info: it is committed only while no chain is carried
+        // (a share without merged_coinbase_info is not checked); once one is,
+        // the tree holds the carried chains alone (the peers' rule:
+        // check_merged_aux_commitment).
         std::vector<uint32_t> ids;
         std::map<uint32_t, uint256> by_chain;
+        std::vector<std::pair<uint32_t, uint256>> uncarried;   // createauxblock-mode chains
         for (const auto& chain : m_chains) {
-            if (chain.current_work.block_hash.IsNull() || !chain.responsive)
+            if (chain.current_work.block_hash.IsNull() || !chain.responsive || !chain.config_error.empty())
                 continue;
-            if (chain.config.multiaddress) {
-                bool carried = false;
-                for (const auto& a : adopted)
-                    carried = carried || (a.chain_id == chain.config.chain_id && a.block_header.size() == 80
-                                          && Hash(a.block_header) == chain.current_work.block_hash);
-                if (!carried)
-                    continue;
+            if (!chain.config.multiaddress) {
+                uncarried.emplace_back(chain.config.chain_id, chain.current_work.block_hash);
+                continue;
             }
+            bool carried = false;
+            for (const auto& a : adopted)
+                carried = carried || (a.chain_id == chain.config.chain_id && a.block_header.size() == 80
+                                      && Hash(a.block_header) == chain.current_work.block_hash);
+            if (!carried)
+                continue;
             ids.push_back(chain.config.chain_id);
             by_chain[chain.config.chain_id] = chain.current_work.block_hash;
         }
+        if (ids.empty())
+            for (const auto& [cid, hash] : uncarried) {
+                ids.push_back(cid);
+                by_chain[cid] = hash;
+            }
         // The shares carry the header infos of the committed chains only.
         adopted.erase(std::remove_if(adopted.begin(), adopted.end(),
                                      [&](const MergedHeaderInfo& a) { return !by_chain.count(a.chain_id); }),
@@ -3066,6 +3297,7 @@ std::vector<MergedMiningManager::ChainInfo> MergedMiningManager::get_chain_infos
         }
         info.responsive = c.responsive;
         info.unresponsive_why = c.unresponsive_why;
+        info.config_error = c.config_error;
         result.push_back(std::move(info));
     }
     return result;

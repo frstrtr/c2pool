@@ -13,12 +13,20 @@
 ///
 /// Used to validate the address handed to a daemon's createauxblock (the
 /// daemon refuses one of another network: Dogecoin-family -8 "Invalid coinbase
-/// payout address", Bellscoin -5) and to size-check an assembled aux block.
+/// payout address", Bellscoin -5), to size-check an assembled aux block, and
+/// by the stratum server to tell which merged chain a miner's address is of.
+///
+/// Checked against the daemons themselves (validateaddress / getnewaddress on
+/// mainnet, testnet and regtest): DOGE (dogecoind 1.14.9), PEP (pepecoind
+/// 1.1.0). Read from local source: NMC (namecoin-core chainparams.cpp,
+/// validation.cpp). Read from the upstream repositories only, not checked
+/// against a running daemon: BELLS, LKY, JKC, SHIC, DINGO.
 
 #include <core/address_utils.hpp>
 
 #include <algorithm>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -26,7 +34,8 @@ namespace c2pool {
 namespace merged {
 
 /// The parent's network: c2pool runs mainnet or testnet. An aux daemon
-/// beside a testnet parent may be on its testnet or its regtest.
+/// beside a testnet parent may be on its testnet or its regtest; the exact
+/// network is checked once the daemon answers (check_aux_address_on_chain).
 enum class AuxNetwork { mainnet, testnet };
 
 struct AuxNetVersions {
@@ -39,12 +48,14 @@ struct AuxChainParams {
     const char*    symbol;
     uint32_t       chain_id;            // AuxPoW chain id (mainnet)
     AuxNetVersions main, test, regtest;
-    // CheckBlock's limit on the serialized block (auxpow header included).
-    // Dogecoin-family: non-witness size <= 1,000,000 (MAX_BLOCK_BASE_SIZE).
-    // Segwit chains (BELLS, JKC, NMC): stripped size * 4 <= 4,000,000 and
-    // weight <= 4,000,000; the submitted bytes carry witnesses, so the guard
-    // is the full size bound weight implies (4,000,000).
-    uint32_t       max_block_bytes;
+    // CheckBlock's limits on the block serialized with the AuxPoW in its
+    // header (bad-blk-length / bad-blk-weight). Dogecoin family:
+    // GetSerializeSize(block, NO_WITNESS) <= MAX_BLOCK_BASE_SIZE. Segwit
+    // chains (Namecoin validation.cpp, Bellscoin, Junkcoin v4):
+    // stripped size * 4 <= MAX_BLOCK_WEIGHT (4,000,000), i.e. stripped <=
+    // 1,000,000, and weight (stripped * 3 + full) <= 4,000,000.
+    uint32_t       max_stripped_bytes;
+    uint32_t       max_weight;          // 0: no weight rule (no segwit)
     // createauxblock address used when the operator gives none: only an
     // address known to be valid and unowned (a burn), else nullptr and the
     // operator must configure one.
@@ -56,28 +67,28 @@ inline const std::vector<AuxChainParams>& aux_chain_params_table()
 {
     static const std::vector<AuxChainParams> t = {
         // Dogecoin: main 30/22, testnet 113/196, regtest 111/196.
-        {"DOGE", 98, {{30}, {22}, {}}, {{113}, {196}, {}}, {{111}, {196}, {}}, 1'000'000,
+        {"DOGE", 98, {{30}, {22}, {}}, {{113}, {196}, {}}, {{111}, {196}, {}}, 1'000'000, 0,
          "DDogepartyxxxxxxxxxxxxxxxxxxw1dfzr", "nUCAGGgZEPN1QyknmQe1oAku817bQAFKFt"},
         // Pepecoin: main 56/22, testnet 113/196, regtest 111/196.
-        {"PEP", 63, {{56}, {22}, {}}, {{113}, {196}, {}}, {{111}, {196}, {}}, 1'000'000, nullptr, nullptr},
+        {"PEP", 63, {{56}, {22}, {}}, {{113}, {196}, {}}, {{111}, {196}, {}}, 1'000'000, 0, nullptr, nullptr},
         // Bellscoin: main 25/30 "bel", testnet 33/22 "tbel", regtest 111/196 "bcrt".
-        {"BELLS", 16, {{25}, {30}, {"bel"}}, {{33}, {22}, {"tbel"}}, {{111}, {196}, {"bcrt"}}, 4'000'000,
-         nullptr, nullptr},
+        {"BELLS", 16, {{25}, {30}, {"bel"}}, {{33}, {22}, {"tbel"}}, {{111}, {196}, {"bcrt"}}, 1'000'000,
+         4'000'000, nullptr, nullptr},
         // Luckycoin: main 47/5, testnet 113/196, regtest 113/196.
-        {"LKY", 8211, {{47}, {5}, {}}, {{113}, {196}, {}}, {{113}, {196}, {}}, 1'000'000, nullptr, nullptr},
+        {"LKY", 8211, {{47}, {5}, {}}, {{113}, {196}, {}}, {{113}, {196}, {}}, 1'000'000, 0, nullptr, nullptr},
         // Junkcoin v4: main 16/5 "jc", testnet 111/5 "tjc", regtest 47/5 "rjc"
         // (testnet/regtest chain id 8225).
-        {"JKC", 8224, {{16}, {5}, {"jc"}}, {{111}, {5}, {"tjc"}}, {{47}, {5}, {"rjc"}}, 4'000'000,
-         nullptr, nullptr},
+        {"JKC", 8224, {{16}, {5}, {"jc"}}, {{111}, {5}, {"tjc"}}, {{47}, {5}, {"rjc"}}, 1'000'000,
+         4'000'000, nullptr, nullptr},
         // Shibacoin: main 63/22, testnet 113/196, regtest 111/196.
-        {"SHIC", 74, {{63}, {22}, {}}, {{113}, {196}, {}}, {{111}, {196}, {}}, 1'000'000, nullptr, nullptr},
+        {"SHIC", 74, {{63}, {22}, {}}, {{113}, {196}, {}}, {{111}, {196}, {}}, 1'000'000, 0, nullptr, nullptr},
         // Dingocoin: main 30/22, testnet 113/196, regtest 111/196. Chain id 50
         // since mainnet height 265,000 (98 before); blocks up to 10,000,000
         // bytes after height 2,254,540.
-        {"DINGO", 50, {{30}, {22}, {}}, {{113}, {196}, {}}, {{111}, {196}, {}}, 10'000'000, nullptr, nullptr},
+        {"DINGO", 50, {{30}, {22}, {}}, {{113}, {196}, {}}, {{111}, {196}, {}}, 10'000'000, 0, nullptr, nullptr},
         // Namecoin: main 52/13 "nc", testnet 111/196 "tn", regtest 111/196 "ncrt".
-        {"NMC", 1, {{52}, {13}, {"nc"}}, {{111}, {196}, {"tn"}}, {{111}, {196}, {"ncrt"}}, 4'000'000,
-         nullptr, nullptr},
+        {"NMC", 1, {{52}, {13}, {"nc"}}, {{111}, {196}, {"tn"}}, {{111}, {196}, {"ncrt"}}, 1'000'000,
+         4'000'000, nullptr, nullptr},
     };
     return t;
 }
@@ -110,6 +121,38 @@ inline AuxNetVersions aux_accepted_versions(const AuxChainParams& p, AuxNetwork 
     add(v.p2sh, p.regtest.p2sh);
     add(v.hrps, p.regtest.hrps);
     return v;
+}
+
+/// The versions of the daemon's own network, from its getblockchaininfo
+/// "chain" ("main", "test", "regtest"); nullopt for a network not in the
+/// table (e.g. signet), which is then not judged.
+inline std::optional<AuxNetVersions> aux_versions_on_chain(const AuxChainParams& p, const std::string& chain)
+{
+    if (chain == "main")
+        return p.main;
+    if (chain == "test" || chain == "testnet" || chain == "testnet3" || chain == "testnet4")
+        return p.test;
+    if (chain == "regtest")
+        return p.regtest;
+    return std::nullopt;
+}
+
+/// "" when `address` is an address of `symbol` on the daemon's network
+/// `chain` (or either is not known), else why not.
+inline std::string check_aux_address_on_chain(const std::string& symbol, const std::string& chain,
+                                              const std::string& address)
+{
+    const auto* p = find_aux_chain_params(symbol);
+    if (!p)
+        return {};
+    const auto v = aux_versions_on_chain(*p, chain);
+    if (!v)
+        return {};
+    std::vector<unsigned char> script;
+    if (core::classify_address_for_coin(address, v->p2pkh, v->p2sh, v->hrps, script) == core::AddressCoinMatch::Own)
+        return {};
+    return "the createauxblock payout address " + address + " is not a " + symbol + " address of the daemon's "
+           + chain + " network; set --merged-payout-address " + symbol + ":<address>";
 }
 
 /// The address a chain's createauxblock gets, and where it came from.
