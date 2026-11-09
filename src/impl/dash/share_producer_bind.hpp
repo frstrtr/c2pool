@@ -115,6 +115,11 @@ struct FrozenMintJob
     uint256  desired_target;                         // vardiff target (pre-clip)
     uint64_t last_txout_nonce{0};                    // per-connection coinbase nonce
     dash::StaleInfo stale_info{dash::StaleInfo::none};
+    // DASHWorkSource::get_work_generation() when the job was served (the
+    // oracle's lp_count, work.py:389): the mint compares it with the current
+    // generation to tell a dead-on-arrival solve (stale_report.hpp
+    // solve_on_time). Bookkeeping only: not a rebuild input.
+    uint64_t work_generation_at_job{0};
     // Share identity frozen at job time (slice 3/3 node-fee port). When
     // non-empty this P2PKH script REPLACES MintShareInputs.payout_script in
     // the rebuild -- the mechanism behind the consensus-safe --fee
