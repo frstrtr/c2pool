@@ -1833,6 +1833,45 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
 
         cbr = mining_interface_->build_connection_coinbase(
             frozen_prev_share, extranonce1_, payout_script, merged_addrs);
+        if (cbr.held) {
+            // No coinbase its shares could verify (the sharechain is busy): no
+            // job now — the miner keeps its last one — never the global
+            // coinbase. One pending retry per session, bounded in time.
+            const auto now = std::chrono::steady_clock::now();
+            const std::chrono::seconds limit(mining_interface_->get_stratum_config().job_hold_limit_sec);
+            if (hold_retries_ == 0)
+                hold_since_ = now;
+            ++hold_retries_;
+            hold_retry_clean_ = hold_retry_clean_ || force_clean;
+            if (now - hold_since_ >= limit) {
+                LOG_WARNING << "[Stratum] job held for " << limit.count() << " s (the sharechain stayed"
+                            << " busy): no more retries, the miner keeps its last job until the next notify";
+                hold_retries_ = 0;
+                hold_retry_clean_ = false;
+                return;
+            }
+            if (!hold_retry_pending_) {
+                hold_retry_pending_ = true;
+                auto timer = std::make_shared<boost::asio::steady_timer>(socket_.get_executor());
+                timer->expires_after(std::chrono::milliseconds(500));
+                timer->async_wait([weak_self = weak_from_this(), timer](boost::system::error_code ec) {
+                    auto self = weak_self.lock();
+                    if (!self)
+                        return;
+                    self->hold_retry_pending_ = false;
+                    // The hold ended meanwhile (a job went out, or the limit
+                    // was reached): nothing to retry.
+                    if (ec || !self->is_connected() || self->hold_retries_ == 0)
+                        return;
+                    const bool clean = self->hold_retry_clean_;
+                    self->hold_retry_clean_ = false;
+                    self->send_notify_work(clean);
+                });
+            }
+            return;
+        }
+        hold_retries_ = 0;
+        hold_retry_clean_ = false;
         if (!cbr.coinb1.empty()) {
             coinb1 = std::move(cbr.coinb1);
             coinb2 = std::move(cbr.coinb2);

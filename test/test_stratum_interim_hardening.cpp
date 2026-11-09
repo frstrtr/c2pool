@@ -107,6 +107,10 @@ public:
     // Optional worker registry the session bookkeeping is forwarded to, so a
     // test can read /miner_stats exactly as the web API serves it.
     core::MiningInterface* registry{nullptr};
+    // While set, every connection coinbase is held (CoinbaseResult::held: the
+    // sharechain busy); every build_connection_coinbase call is counted.
+    std::atomic<bool> hold{false};
+    mutable std::atomic<int> build_calls{0};
 
     FakeWorkSource()
     {
@@ -152,7 +156,12 @@ public:
         const std::vector<unsigned char>&,
         const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>&) const override
     {
+        ++build_calls;
         core::stratum::CoinbaseResult r;
+        if (hold.load()) {
+            r.held = true;
+            return r;
+        }
         r.coinb1 = "01000000010000000000000000000000000000000000000000000000000000"
                    "000000000000ffffffff";
         r.coinb2 = "0000000000f2052a010000001976a914000000000000000000000000000000"
@@ -619,6 +628,80 @@ TEST(StratumInterimHardening, KeepaliveOffLeavesIdleSessionUnfed)
     EXPECT_FALSE(got_more)
         << "idle session got unexpected notifies with keepalive OFF (jobs="
         << c.jobs.size() << ")";
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Held jobs (CoinbaseResult::held: the sharechain was busy, no coinbase its
+// shares could verify). No job goes out while held, never the global coinbase;
+// one pending retry per session (every 500 ms) whatever the notify rate; a
+// clean notify held meanwhile makes the retry clean; the hold is bounded by
+// StratumConfig::job_hold_limit_sec, after which the session waits for the
+// next notify.
+// ════════════════════════════════════════════════════════════════════════════
+TEST(StratumJobHold, OnePendingRetryPerSessionAndTheCleanFlagCarried)
+{
+    ServerHarness h;
+    ASSERT_TRUE(h.start());
+
+    Client c;
+    ASSERT_TRUE(c.connect(h.port));
+    ASSERT_TRUE(c.subscribe());
+    ASSERT_TRUE(c.authorize("interimtestworker1"));
+    ASSERT_TRUE(c.collect_notifies(1, 5000ms));
+    const size_t base = c.jobs.size();
+
+    h.ws->hold = true;
+    const int calls0 = h.ws->build_calls.load();
+    // a non-clean notify held first, then nine clean ones while its retry is
+    // pending
+    h.on_io([&] { h.server->notify_all(false); return 0; });
+    h.on_io([&] { for (int i = 0; i < 9; ++i) h.server->notify_all(true); return 0; });
+    std::this_thread::sleep_for(1200ms);
+    const int held_calls = h.ws->build_calls.load() - calls0;
+    // ten notifies and the retries at 0.5 s and 1.0 s (one pending at a time);
+    // a timer per held notify would make it 10 + 20
+    EXPECT_GE(held_calls, 11);
+    EXPECT_LE(held_calls, 13);
+    EXPECT_FALSE(c.collect_notifies(base + 1, 300ms)) << "no job while it is held";
+
+    h.ws->hold = false;
+    ASSERT_TRUE(c.collect_notifies(base + 1, 2000ms)) << "the pending retry sends the job";
+    EXPECT_EQ(c.jobs.size(), base + 1) << "one job, not one per held notify";
+    EXPECT_TRUE(c.clean_flags.back()) << "a clean notify was held: the retry is clean";
+}
+
+TEST(StratumJobHold, TheHoldIsBoundedThenWaitsForTheNextNotify)
+{
+    ServerHarness h;
+    h.ws->cfg.job_hold_limit_sec = 1;
+    ASSERT_TRUE(h.start());
+
+    Client c;
+    ASSERT_TRUE(c.connect(h.port));
+    ASSERT_TRUE(c.subscribe());
+    ASSERT_TRUE(c.authorize("interimtestworker1"));
+    ASSERT_TRUE(c.collect_notifies(1, 5000ms));
+    const size_t base = c.jobs.size();
+
+    h.ws->hold = true;
+    const int calls0 = h.ws->build_calls.load();
+    h.on_io([&] { h.server->notify_all(true); return 0; });
+    std::this_thread::sleep_for(2000ms);
+    const int bounded = h.ws->build_calls.load() - calls0;
+    // the notify and its retries until 1 s since the hold began
+    EXPECT_GE(bounded, 2);
+    EXPECT_LE(bounded, 4);
+    std::this_thread::sleep_for(1500ms);
+    EXPECT_EQ(h.ws->build_calls.load() - calls0, bounded) << "no retry past the limit";
+    EXPECT_FALSE(c.collect_notifies(base + 1, 300ms)) << "the miner keeps its last job";
+
+    // the next notify starts a new hold, and the job goes out once it can be
+    // built
+    h.on_io([&] { h.server->notify_all(true); return 0; });
+    std::this_thread::sleep_for(700ms);
+    EXPECT_GE(h.ws->build_calls.load() - calls0, bounded + 2);
+    h.ws->hold = false;
+    ASSERT_TRUE(c.collect_notifies(base + 1, 2000ms));
 }
 
 // ════════════════════════════════════════════════════════════════════════════

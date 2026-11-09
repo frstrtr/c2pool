@@ -142,6 +142,13 @@ struct StratumConfig {
     //     work-generation-gated).
     uint32_t keepalive_notify_sec       = 0;
 
+    // A held job (CoinbaseResult::held: the sharechain was busy, no coinbase
+    // its shares could verify) is retried every 500 ms, one pending retry per
+    // session, for at most this many seconds since the hold began; past it the
+    // session stops retrying (the miner keeps its last job) until the next
+    // notify. Never the global coinbase.
+    uint32_t job_hold_limit_sec         = 20;
+
     // ── Payout-address acceptance for the running coin (issue #961) ──────────
     // The Base58Check version bytes and bech32 HRPs (BARE, no trailing '1') this
     // coin accepts as its OWN payout addresses on the ACTIVE network. Populated
@@ -254,6 +261,11 @@ struct CoinbaseResult {
     std::string coinb1;
     std::string coinb2;
     WorkSnapshot snapshot;
+    // No coinbase now: the work source could not build one its shares can
+    // verify (the sharechain was busy). The session holds the job (the
+    // miner keeps its last one) and retries; it never falls back to the
+    // global coinbase.
+    bool held{false};
 };
 
 /// Rolling record of one stratum connection's submit outcomes, for the
