@@ -21,12 +21,17 @@
 /// the "update names a listed masternode" rules also stay in the template
 /// fold, which sees the in-body changes as well as the pre-block list.
 ///
-/// Scope of this port: payload versions 1 (LegacyBLS) and 2 (BasicBLS), the
-/// only ones the vendored codec reads (vendor/providertx.hpp). A version-3
-/// payload, and the v24 provider types 10-12, never reach a template: the fold
-/// refuses ExtAddr and the selection mask admits types 1-4 only. With the S2
-/// codecs (v24_rules.hpp provider_payload_refusal) the payload-only part of
-/// this file is the v1/v2 subset of that one.
+/// Scope of this port: payload versions 1 (LegacyBLS) and 2 (BasicBLS) of
+/// types 1-3; a version-3 (ExtAddr) payload of types 1-3, or one naming a
+/// version-3 state, is refused (their v3 rules are not ported here). Type 4
+/// (ProUpRevTx) has no version-3 rule of its own and is checked at every
+/// version. The
+/// v24 provider types 10-12 are checked in full (CheckProDisTx,
+/// CheckProUpShareTx, CheckProUpSharedRegTx, specialtxman.cpp:1625-1875):
+/// the payload rules through v24_rules.hpp provider_payload_refusal
+/// (GetValidatedPayload and the too-early gate), then the masternode-list
+/// rules against the pre-block list, the inputs hash, and every share owner's
+/// canonical ECDSA signature (CHashSigner::VerifyHashCanonical).
 ///
 /// FAIL CLOSED. A check that cannot be decided refuses the tx: an external
 /// collateral the UTXO view cannot prove, a missing signature verifier, a
@@ -47,9 +52,12 @@
 
 #include <array>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <optional>
+#include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace dash {
@@ -62,6 +70,10 @@ struct ProTxCheckRules
     DashNetwork net{DashNetwork::MAINNET};
     bool v19_active{true};
     bool v24_active{false};
+    /// The height of the block being built (pindexPrev->nHeight + 1): the
+    /// ProDisTx early-exit period is measured to it. 0 = not known; a ProDisTx
+    /// is then refused.
+    uint32_t height{0};
 
     bool mainnet() const { return net == DashNetwork::MAINNET; }
     /// DEPLOYMENT_IPV4_OPTIONAL: height 0 on testnet and devnet, never on
@@ -120,6 +132,7 @@ inline ProTxCheckRules protx_rules_for(const ProTxCheckEnv& env, uint32_t height
     r.net = env.net;
     r.v19_active = protx_v19_active_at(env.net, height);
     r.v24_active = v24_active;
+    r.height = height;
     return r;
 }
 
@@ -399,6 +412,84 @@ inline const MNState* find_mn(const MnStateMachine& pre, const uint256& pro)
     return it == pre.entries().end() ? nullptr : &it->second;
 }
 
+/// CHashSigner::VerifyHashCanonical (messagesigner.cpp:58-90): 65 bytes, a
+/// recovery header SignCompact can produce (27..34), low S, then VerifyHash.
+template <typename Sig>
+inline bool verify_hash_canonical(const ProTxEcdsaVerifyFn& ecdsa, const uint256& hash, const Sig& sig,
+                                  const uint160& key_id)
+{
+    static constexpr uint8_t kHalfOrder[32] = {
+        0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0x5d, 0x57, 0x6e, 0x73, 0x57, 0xa4, 0x50, 0x1d, 0xdf, 0xe9, 0x2f, 0x46, 0x68, 0x1b, 0x20, 0xa0,
+    };
+    if (!ecdsa) return false;
+    if (sig.size() != vendor::COMPACT_SIGNATURE_SIZE) return false;
+    if (sig[0] < 27 || sig[0] > 34) return false;
+    if (std::memcmp(sig.data() + 33, kHalfOrder, 32) > 0) return false;
+    return ecdsa(hash, std::vector<uint8_t>(sig.begin(), sig.end()), key_id);
+}
+
+/// ::SerializeHash(proTx) of a CProUpSharedRegTx / CProDisTx-style payload
+/// whose LAST field is `u8 count || 65-byte sig * count` (excluded under
+/// SER_GETHASH).
+inline std::optional<uint256> hash_without_trailing_sig_list(const std::vector<uint8_t>& payload,
+                                                             size_t sig_count)
+{
+    const size_t tail = 1 + sig_count * vendor::COMPACT_SIGNATURE_SIZE;
+    if (payload.size() < tail) return std::nullopt;
+    return sha256d(payload.data(), payload.size() - tail);
+}
+
+/// CProDisTx::MakeSignHash (providertx.cpp:546-573): SHA256d over the
+/// domain tag, the payload version, the tx's version, type and lock time, its
+/// prevouts, its sequences, its outputs, then proTxHash, actorIndex and the
+/// signature count.
+template <typename Tx>
+inline uint256 prodis_sign_hash(const Tx& tx, const vendor::CProDisTx& p, uint8_t sig_count)
+{
+    static constexpr std::string_view kTag{"DashSharedMNDissolve"};
+    ::PackStream s;
+    WriteCompactSize(s, kTag.size());
+    s.write(std::as_bytes(std::span{kTag.data(), kTag.size()}));
+    s << p.nVersion;
+    s << static_cast<uint16_t>(tx.version & 0xFFFF);   // CTransaction::nVersion (int16)
+    s << tx.type;
+    s << tx.locktime;
+    for (const auto& in : tx.vin) s << in.prevout;
+    for (const auto& in : tx.vin) s << in.sequence;
+    for (const auto& out : tx.vout) s << out;
+    s << p.proTxHash;
+    s << p.actorIndex;
+    s << sig_count;
+    auto sp = s.get_span();
+    return sha256d(reinterpret_cast<const uint8_t*>(sp.data()), sp.size());
+}
+
+/// The provider payload rules (v24_rules.hpp) for the block being built,
+/// with the header-only BLS encoding checks (this path is compiled into
+/// every target that includes the embedded builder, not only those linking
+/// dash_bls_verify). Aggregate-initialized in full: a default-constructed
+/// BlsEncodingChecks would name the exported functions.
+inline ProviderTxRules provider_rules_of(const ProTxCheckRules& r)
+{
+    return ProviderTxRules{r.v19_active, r.v24_active, /*evo_shares_active=*/false, r.ipv4_optional(),
+                           netinfo_rules_for(r.net), vendor::bls_encoding_checks_inline()};
+}
+
+/// What CheckProDisTxForList reads from the masternode a ProDisTx names.
+inline v24::ProDisTarget prodis_target_of(const MNState& st)
+{
+    v24::ProDisTarget t;
+    t.exists = true;
+    t.shared = st.v24.IsShared();
+    t.collateral = st.collateralOutpoint;
+    t.shares = &st.v24.shares;
+    t.registered_height = st.nRegisteredHeight;
+    t.early_period_blocks = st.v24.nEarlyPeriodBlocks;
+    t.early_penalty = st.v24.nEarlyPenalty;
+    return t;
+}
+
 } // namespace protx_check_detail
 
 /// The first reason Dash Core v24 refuses this provider tx for a block built
@@ -412,7 +503,7 @@ protx_core_refusal(const Tx& tx_in, const MnStateMachine& pre, const ProTxCheckR
     using namespace protx_check_detail;
     namespace pv = vendor::ProTxVersion;
     const MutableTransaction tx(tx_in);
-    if (tx.type < 1 || tx.type > 4) return std::nullopt;
+    if ((tx.type < 1 || tx.type > 4) && !tx_type_is_v24_provider(tx.type)) return std::nullopt;
 
     switch (tx.type) {
     case vendor::CProRegTx::SPECIALTX_TYPE: {
@@ -582,16 +673,91 @@ protx_core_refusal(const Tx& tx_in, const MnStateMachine& pre, const ProTxCheckR
         if (!parse(tx.extra_payload, p)) return no("bad-protx-payload");
         if (!vendor::blssig_parses_canonical(p.sig, p.nVersion == pv::LEGACY_BLS))
             return no("bad-protx-payload (malleable BLS signature)");
-        if (auto r = codec_version_refusal(p.nVersion)) return r;
+        // CheckProUpRevTx has no version-3 rule of its own (its payload layout
+        // is the v2 one): a v3 payload, and a v3 state, are checked in full.
+        if (p.nVersion == 0 || p.nVersion > pv::EXT_ADDR) return no("bad-protx-version");
         if (p.nVersion > max_version(rules)) return no("bad-protx-version");
         if (p.nReason > vendor::CProUpRevTx::REASON_CHANGE_OF_KEYS) return no("bad-protx-reason");
         const MNState* mn = find_mn(pre, p.proTxHash);
         if (!mn) return no("bad-protx-hash");
-        if (mn->nVersion >= pv::EXT_ADDR)
-            return no("bad-protx-version (ExtAddr state: not checkable by this codec, excluded)");
+        if (!rules.v24_active && mn->nVersion >= pv::EXT_ADDR)
+            return no("bad-protx-version (ExtAddr state before DEPLOYMENT_V24)");
         if (auto r = version_change_refusal(mn->nVersion, p.nVersion, rules)) return r;
         if (inputs_hash(tx) != p.inputsHash) return no("bad-protx-inputs-hash");
         return std::nullopt;   // the BLS operator signature: the template fold
+    }
+
+    // ── Dash Core v24 shared masternodes (specialtxman.cpp:1625-1875) ────────
+    case vendor::CProUpShareTx::SPECIALTX_TYPE: {
+        // CheckProUpShareTx
+        if (auto r = provider_payload_refusal(tx.type, tx.extra_payload, provider_rules_of(rules))) return r;
+        vendor::CProUpShareTx p;
+        if (!parse(tx.extra_payload, p)) return no("bad-protx-payload");
+        const MNState* mn = find_mn(pre, p.proTxHash);
+        if (!mn) return no("bad-proupshare-hash");
+        if (!mn->v24.IsShared()) return no("bad-proupshare-not-shared");
+        if (p.shareIndex >= mn->v24.shares.size()) return no("bad-proupshare-index");
+        const auto dest = extract_dest(p.scriptReward.m_data);
+        if (!dest) return no("bad-proupshare-payee-dest");
+        if (*dest == pkh(mn->keyIDVoting)) return no("bad-proupshare-payee-reuse");
+        for (const auto& share : mn->v24.shares)
+            if (*dest == pkh(share.keyIDOwner)) return no("bad-proupshare-payee-reuse");
+        if (inputs_hash(tx) != p.inputsHash) return no("bad-protx-inputs-hash");
+        if (!ecdsa) return no("bad-proupshare-sig (no ECDSA verifier wired)");
+        const auto h = hash_without_trailing_vchsig(tx.extra_payload, p.vchSig.size());
+        if (!h || !verify_hash_canonical(ecdsa, *h, p.vchSig, mn->v24.shares[p.shareIndex].keyIDOwner))
+            return no("bad-proupshare-sig");
+        return std::nullopt;
+    }
+
+    case vendor::CProUpSharedRegTx::SPECIALTX_TYPE: {
+        // CheckProUpSharedRegTx
+        if (auto r = provider_payload_refusal(tx.type, tx.extra_payload, provider_rules_of(rules))) return r;
+        vendor::CProUpSharedRegTx p;
+        if (!parse(tx.extra_payload, p)) return no("bad-protx-payload");
+        const MNState* mn = find_mn(pre, p.proTxHash);
+        if (!mn) return no("bad-proupsharedreg-hash");
+        if (!mn->v24.IsShared()) return no("bad-proupsharedreg-not-shared");
+        if (p.vchSigs.size() != mn->v24.shares.size()) return no("bad-proupsharedreg-sig-count");
+        // HasOperatorKeyUnderAnyScheme: the payload key is always basic, and
+        // the store is canonical basic, so one point is one byte string.
+        if (operator_key_held_by_other(pre, vendor::opkey_to_basic(p.pubKeyOperator, /*legacy=*/false),
+                                       p.proTxHash))
+            return no("bad-protx-dup-key");
+        if (!v24::share_list_voting_key_safe(mn->v24.shares, p.keyIDVoting))
+            return no("bad-proupsharedreg-payee-reuse");
+        if (inputs_hash(tx) != p.inputsHash) return no("bad-protx-inputs-hash");
+        if (!ecdsa) return no("bad-proupsharedreg-sig (no ECDSA verifier wired)");
+        const auto h = hash_without_trailing_sig_list(tx.extra_payload, p.vchSigs.size());
+        if (!h) return no("bad-proupsharedreg-sig");
+        for (size_t i = 0; i < mn->v24.shares.size(); ++i)
+            if (!verify_hash_canonical(ecdsa, *h, p.vchSigs[i], mn->v24.shares[i].keyIDOwner))
+                return no("bad-proupsharedreg-sig");
+        return std::nullopt;
+    }
+
+    case vendor::CProDisTx::SPECIALTX_TYPE: {
+        // CheckProDisTx: the masternode must exist at the previous block
+        // (registering and dissolving in one block is invalid), then
+        // CheckProDisTxForList against that list at the new block's height.
+        if (auto r = provider_payload_refusal(tx.type, tx.extra_payload, provider_rules_of(rules))) return r;
+        vendor::CProDisTx p;
+        if (!parse(tx.extra_payload, p)) return no("bad-protx-payload");
+        const MNState* mn = find_mn(pre, p.proTxHash);
+        if (!mn) return no("bad-prodis-hash");
+        if (rules.height == 0) return no("bad-prodis (the height of the block being built is unknown) - excluded");
+        if (auto r = v24::prodis_list_refusal(tx, p, prodis_target_of(*mn), rules.height)) return r;
+        if (!ecdsa) return no("bad-prodis-sig (no ECDSA verifier wired)");
+        const auto& shares = mn->v24.shares;
+        const uint256 h = prodis_sign_hash(tx, p, static_cast<uint8_t>(p.vchSigs.size()));
+        if (p.vchSigs.size() == shares.size()) {
+            for (size_t i = 0; i < shares.size(); ++i)
+                if (!verify_hash_canonical(ecdsa, h, p.vchSigs[i], shares[i].keyIDOwner))
+                    return no("bad-prodis-sig");
+        } else if (!verify_hash_canonical(ecdsa, h, p.vchSigs[0], shares[p.actorIndex].keyIDOwner)) {
+            return no("bad-prodis-sig");
+        }
+        return std::nullopt;
     }
     }
     return std::nullopt;

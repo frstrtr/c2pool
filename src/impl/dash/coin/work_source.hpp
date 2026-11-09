@@ -213,6 +213,9 @@ struct EmbeddedWorkInputs {
     /// Dash Core's CheckPro*Tx environment (NodeCoinState::set_protx_check_env).
     /// nullptr => no provider tx is checkable, so none rides the template.
     const ProTxCheckEnv* protx_check_env{nullptr};
+    /// Dash Core's CheckMNHFTx environment for type-7 signals
+    /// (NodeCoinState::set_mnhf_check_env). nullptr => no signal rides.
+    const MnhfCheckEnv* mnhf_check_env{nullptr};
 
     bool viable() const {
         return has_state && mnstates != nullptr && mempool != nullptr;
@@ -363,7 +366,9 @@ inline WorkSelection select_dash_work(
                 // Dash Core v24: CbTx version 4 when v24 is active for the block.
                 emb.v24_active,
                 // Dash Core's full provider-tx checks (null => none rides).
-                emb.protx_check_env);
+                emb.protx_check_env,
+                // Dash Core's CheckMNHFTx for type-7 signals (null => none rides).
+                emb.mnhf_check_env);
             // Testnet min-difficulty: bits for the template's own curtime.
             if (emb.bits_at_time)
                 if (auto b = emb.bits_at_time(w.m_previous_block, w.m_curtime)) w.m_bits = *b;

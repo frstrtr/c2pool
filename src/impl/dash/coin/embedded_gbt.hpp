@@ -32,6 +32,7 @@
 #include <impl/dash/coin/sml_projection.hpp>    // confirmedHash rollover pass + collateral-spend predicate
 #include <impl/dash/coin/sml_special_fold.hpp>  // template-side types 1-4 MN-list fold (merkleRootMNList parity)
 #include <impl/dash/coin/protx_check.hpp>       // Dash Core CheckPro*Tx for template selection
+#include <impl/dash/coin/mnhf_check.hpp>        // Dash Core CheckMNHFTx for type-7 signals
 #include <impl/dash/coin/sml_pose_fold.hpp>     // serve-time PoSe pass over the body's type-6 commitments
 #include <impl/dash/coin/mempool.hpp>
 #include <impl/dash/coin/inject_ride_log.hpp>  // S2: per-build inject RIDES / HELD lines
@@ -422,6 +423,12 @@ inline MnFoldContext make_template_fold_context(
         protx_sig_verifier != nullptr ? *protx_sig_verifier
                                       : MnFoldContext::OperatorSigFn{});
     ctx.require_core_check = true;
+    // Dash Core v24: every provider type (1-4 and 10-12) folds through the v24
+    // transitions on full states (sml_special_fold.hpp, the v24 fold).
+    ctx.v24_rules = v24_active;
+    ctx.height = next_height;
+    ctx.netinfo_rules = netinfo_rules_for(protx_check_env != nullptr ? protx_check_env->net
+                                                                     : DashNetwork::MAINNET);
     if (protx_check_env != nullptr && protx_check_env->check_override) {
         ctx.core_check = protx_check_env->check_override;
     } else if (protx_check_env != nullptr) {
@@ -607,8 +614,11 @@ inline DashWorkData build_embedded_workdata(
     // it commits. A tx the fold cannot apply exactly is EXCLUDED (never a bad
     // root). Default false => types 1-4 stay excluded and every existing
     // positional caller is byte-unchanged (the folded copy is never built).
+    // Dash Core v24: with v24_active the same lever admits the shared-
+    // masternode types 10-12 (the fold then runs the v24 transitions for every
+    // provider type), and, with mnhf_check_env, type-7 MNHF signals.
     // The type-8 (asset-lock) selection leg rides accrue_pending_asset_locks;
-    // types 5/6/7/9 are never selected (type-6 is builder-generated, type-9 is
+    // types 5/6/9 are never selected (type-6 is builder-generated, type-9 is
     // admission-path-only via admitted_asset_unlocks).
     bool include_mn_special_txs = false,
     // ── PoSe PASS seams (sml_pose_fold.hpp, incident h=2561514) ──────────
@@ -633,9 +643,13 @@ inline DashWorkData build_embedded_workdata(
     // version 4 and commits merkleRootAssetUnlocks over this body. Default
     // false => version 3, byte-identical for every existing caller.
     bool v24_active = false,
-    // Dash Core's full provider-tx checks (protx_check.hpp) for the types 1-4
-    // the template folds. nullptr => no provider tx is checkable, none rides.
-    const ProTxCheckEnv* protx_check_env = nullptr)
+    // Dash Core's full provider-tx checks (protx_check.hpp) for the provider
+    // types the template folds. nullptr => no provider tx is checkable, none
+    // rides.
+    const ProTxCheckEnv* protx_check_env = nullptr,
+    // Dash Core's CheckMNHFTx for type-7 signals (mnhf_check.hpp). nullptr =>
+    // no signal rides (they are not selected).
+    const MnhfCheckEnv* mnhf_check_env = nullptr)
 {
     DashWorkData w;
     w.m_height          = prev_height + 1;
@@ -739,10 +753,19 @@ inline DashWorkData build_embedded_workdata(
     // SML fold excludes types 1-4 while type-8 still rides. Default (all legs
     // off) => admits() rejects every type!=0, byte-identical to the historical
     // special-tx-free template.
+    // Dash Core v24 (DEPLOYMENT_V24 active for this block): the shared-
+    // masternode provider types 10-12 ride the same lever and the same fold as
+    // types 1-4 (the fold then runs the v24 transitions for all of them), and
+    // the selection applies Core v24's type list. MNHF signals (type 7) ride
+    // the lever when their checks are wired (mnhf_check.hpp); they change no
+    // CbTx root.
     Mempool::SpecialTxSelectMask special_mask;
     special_mask.allow_all_special = false;                 // never the general path here
     special_mask.allow_mn_types    = include_mn_special_txs && (sml != nullptr);
     special_mask.allow_locks       = accrue_pending_asset_locks;
+    special_mask.allow_v24_provider = special_mask.allow_mn_types && v24_active;
+    special_mask.allow_mnhf        = include_mn_special_txs && mnhf_check_env != nullptr;
+    special_mask.v24_rules         = v24_active;
     // suppress_mempool_txs: coinbase-only body, total_fees == 0 exactly. The
     // mempool is not even consulted for selection (only, below, for the forgone-
     // fee report), so no partially-warm UTXO view can price anything into this
@@ -782,7 +805,14 @@ inline DashWorkData build_embedded_workdata(
         size_t kept = 0;
         for (size_t i = 0; i < selected.size(); ++i) {
             uint256 protx;
-            if (tx_spends_mn_collateral(mnstates, selected[i].tx, &protx)) {
+            // Dash Core v24: a ProDisTx dissolves a shared masternode by
+            // spending its collateral. With the v24 fold armed it stays: the
+            // fold checks it (CheckProDisTx) and removes the masternode in the
+            // collateral-spend pass, so the committed root carries the removal.
+            const bool v24_dissolve = special_mask.allow_v24_provider
+                && tx_is_special_version(selected[i].tx.version)
+                && selected[i].tx.type == tx_type::PROVIDER_DISSOLVE;
+            if (!v24_dissolve && tx_spends_mn_collateral(mnstates, selected[i].tx, &protx)) {
                 total_fees -= selected[i].fee;
                 LOG_WARNING << "[GBT-EMB] excluding tx "
                             << dash::coin::dash_txid(selected[i].tx).GetHex().substr(0, 16)
@@ -927,15 +957,22 @@ inline DashWorkData build_embedded_workdata(
                 break;
             }
         } else {
-            // Projection unavailable ⇒ degrade leg (b): mask types 1-4 out by
-            // dropping them from the body (the credit-pool / type-8 leg is
-            // independent and unaffected). Fail-closed and loud.
+            // Projection unavailable ⇒ degrade leg (b): mask the provider
+            // types (1-4, and 10-12 under v24) out by dropping them from the
+            // body, with every in-body descendant (a child would spend an
+            // output the block no longer creates). The credit-pool / type-8
+            // leg is independent and unaffected. Fail-closed and loud.
             size_t kept = 0;
             unsigned dropped = 0;
+            std::set<uint256> gone;
             for (size_t i = 0; i < selected.size(); ++i) {
                 const uint16_t t = selected[i].tx.type;
-                if (t >= 1 && t <= 4) {
+                bool child_of_dropped = false;
+                for (const auto& in : selected[i].tx.vin)
+                    if (gone.count(in.prevout.hash)) { child_of_dropped = true; break; }
+                if ((t >= 1 && t <= 4) || tx_type_is_v24_provider(t) || child_of_dropped) {
                     total_fees -= selected[i].fee;
+                    gone.insert(dash::coin::dash_txid(selected[i].tx));
                     ++dropped;
                     continue;
                 }
@@ -948,6 +985,37 @@ inline DashWorkData build_embedded_workdata(
                             << (prev_height + 1) << " — masked " << dropped
                             << " provider special tx(s) out of the template";
         }
+    }
+    // ── MNHF SIGNALS (type 7, mnhf_check.hpp) ────────────────────────────
+    // Dash Core's miner takes every valid signal (CheckMNHFTx in
+    // TestPackageTransactions) and skips a second one for a bit already in the
+    // block (node/miner.cpp:728-735). A signal has no inputs and no outputs,
+    // so dropping one takes nothing else with it and moves no fee.
+    if (special_mask.allow_mnhf
+        && std::any_of(selected.begin(), selected.end(), [](const Mempool::SelectedTx& s) {
+               return s.tx.type == vendor::MNHFTxPayload::SPECIALTX_TYPE;
+           })) {
+        std::vector<MutableTransaction> body;
+        body.reserve(selected.size());
+        for (const auto& s : selected) body.push_back(s.tx);
+        const auto why = mnhf_select(body, mnhf_check_env, prev_height, mtp_at_tip);
+        size_t kept = 0;
+        for (size_t i = 0; i < selected.size(); ++i) {
+            if (!why[i].empty()) {
+                total_fees -= selected[i].fee;
+                LOG_WARNING << "[GBT-EMB] excluding MNHF signal "
+                            << dash::coin::dash_txid(selected[i].tx).GetHex().substr(0, 16)
+                            << " from template h=" << (prev_height + 1) << ": " << why[i];
+                continue;
+            }
+            if (selected[i].tx.type == vendor::MNHFTxPayload::SPECIALTX_TYPE)
+                LOG_INFO << "[GBT-EMB] MNHF signal "
+                         << dash::coin::dash_txid(selected[i].tx).GetHex().substr(0, 16)
+                         << " rides template h=" << (prev_height + 1);
+            if (kept != i) selected[kept] = std::move(selected[i]);
+            ++kept;
+        }
+        selected.resize(kept);
     }
     // #143: the admitted unlocks' payload fees are ordinary miner fees (dashd
     // GetAssetUnlockFee, assetlocktx.cpp:200-212 — the fee reaches the miner

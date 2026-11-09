@@ -3507,7 +3507,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         env.ecdsa = &dash::coin::protx_ecdsa_verify_hash;
         node_coin_state.set_protx_check_env(std::move(env));
     }
-    std::cout << "[run] embedded special-tx superset (DIP types 1-4): "
+    std::cout << "[run] embedded special-tx superset (provider types 1-4; from Dash Core v24 "
+                 "activation also 10-12; MNHF signals type 7): "
               << (embedded_include_mn_special_txs
                       ? "ON (--embedded-include-mn-special-txs: SML-folded "
                         "special txs admitted; root re-folded + drift-rejected "
@@ -5583,16 +5584,20 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // leaves the registry before the header chain is destroyed. The node's
     // v24 state function (node_coin_state outlives header_chain) then answers
     // UNKNOWN instead of reading freed headers.
+    // The MNHF check environment's chain lookup reads the header chain too;
+    // it answers "unknown" (the signal is left out) once this flag drops.
     struct V24StatusUninstall {
         dash::coin::DashNetwork net;
         std::shared_ptr<dash::coin::DashDeploymentStatus> status;
+        std::shared_ptr<std::atomic<bool>> chain_alive;
         ~V24StatusUninstall()
         {
+            if (chain_alive) chain_alive->store(false);
             if (status) status->shutdown();
             dash::coin::install_dash_deployment_status(net, nullptr);
         }
     } v24_status_uninstall{testnet ? dash::coin::DashNetwork::TESTNET
-                                   : dash::coin::DashNetwork::MAINNET, nullptr};
+                                   : dash::coin::DashNetwork::MAINNET, nullptr, nullptr};
     if (coin_p2p) {
         const auto dash_params = testnet
             ? dash::coin::make_dash_chain_params_testnet()
@@ -8205,6 +8210,43 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             node_coin_state.set_v24_state_fn(
                 [st = v24_status](uint32_t h) { return st->v24_state(h); });
             node_coin_state.set_v24_network(v24_net);
+            // Dash Core's CheckMNHFTx for the type-7 signals our templates
+            // carry (mnhf_check.hpp; selected under
+            // --embedded-include-mn-special-txs): the quorum block on our
+            // chain, the quorum key from the active set, the BLS recovered
+            // signature, and the staged signals from the EHF tracker (exact
+            // only where it covers the parent; elsewhere the signal stays out).
+            {
+                auto alive = std::make_shared<std::atomic<bool>>(true);
+                v24_status_uninstall.chain_alive = alive;
+                dash::coin::MnhfCheckEnv me;
+                me.net = v24_net;
+                me.chain_height_of = [hc = header_chain.get(), alive](const uint256& h, uint32_t prev_height)
+                    -> std::optional<uint32_t> {
+                    if (!alive->load()) return std::nullopt;
+                    const auto e = hc->get_header(h);
+                    if (!e || e->height > prev_height) return std::nullopt;
+                    const auto main = hc->get_header_by_height(e->height);
+                    if (!main || main->hash != h) return std::nullopt;
+                    return e->height;
+                };
+                me.quorum_public_key = [&node_coin_state](uint8_t type, const uint256& q)
+                    -> std::optional<std::array<uint8_t, 48>> {
+                    const auto c = std::as_const(node_coin_state).qmgr().find(type, q);
+                    if (!c) return std::nullopt;
+                    return c->quorumPublicKey;
+                };
+                me.verify_sig = [](const std::array<uint8_t, 48>& pk, const uint256& h,
+                                   const std::array<uint8_t, 96>& sig) {
+                    return dash::coin::vendor::verify_chainlock_sig(pk, h, sig);
+                };
+                me.bit_staged = [t = ehf_tracker](uint8_t bit, uint32_t prev) -> std::optional<bool> {
+                    if (!t->covers(prev) || t->verified_coverage() < static_cast<int64_t>(prev))
+                        return std::nullopt;
+                    return t->signal_height(bit, prev) != dash::coin::kNoSignalHeight;
+                };
+                node_coin_state.set_mnhf_check_env(std::move(me));
+            }
             // Testnet min-difficulty rules (Dash Core DarkGravityWave with
             // fPowAllowMinDifficultyBlocks): bits follow the template's time.
             if (testnet)

@@ -61,6 +61,7 @@
 #include "vendor/assetlock.hpp"   // DIP-0027 CAssetUnlockPayload (type-9 fee source)
 #include "asset_lock_fold.hpp"    // check_asset_lock_tx: type-8 selection gate
 #include "shared_collateral.hpp"  // Dash Core v24 shared-collateral template script
+#include "vendor/mnhftx.hpp"      // MNHF signal (type 7): its zero fee needs no UTXO view
 
 #include <core/uint256.hpp>
 #include <core/pack.hpp>
@@ -396,6 +397,21 @@ public:
     bool instantsend_mining_hold() const
     {
         return m_is_hold_armed.load(std::memory_order_relaxed);
+    }
+
+    /// Dash Core v24: DEPLOYMENT_V24 is active for the block after our tip, so
+    /// admission applies Core v24's ContextualCheckTransaction type list and
+    /// accepts the shared-masternode provider types 10-12 (Core's mempool
+    /// accepts them from activation and rejects them as bad-txns-type before).
+    /// The node sets it on every tip change (NodeCoinState::set_tip). Default
+    /// off: the v23.1.9 list (0..9), unchanged.
+    void set_v24_admission(bool active)
+    {
+        m_v24_admission.store(active, std::memory_order_relaxed);
+    }
+    bool v24_admission() const
+    {
+        return m_v24_admission.load(std::memory_order_relaxed);
     }
 
     /// ── PINNED-LOCAL-TX include gate (donation-dust consolidation lane) ────
@@ -1101,7 +1117,9 @@ private:
         // relays one (IsStandardTx rejects nVersion < 1), so only a dialled
         // non-dashd peer can push it.
         if (contextual_check) {
-            if (auto why = contextual_tx_check(tx, /*is_coinbase=*/false)) {
+            const bool v24 = m_v24_admission.load(std::memory_order_relaxed);
+            if (auto why = v24 ? contextual_tx_check_v24(tx, /*is_coinbase=*/false)
+                               : contextual_tx_check(tx, /*is_coinbase=*/false)) {
                 LOG_INFO << "[MEMPOOL] reject " << *why << " txid="
                          << dash_txid(tx).GetHex().substr(0, 16)
                          << " version16=" << wire_version_i16(tx.version)
@@ -2011,10 +2029,24 @@ public:
     // meanings byte-for-byte for every existing caller — `true` masks all
     // special out, `false`/default admits all — so only the embedded builder,
     // which now passes an explicit partial mask, changes behaviour.
+    //
+    // Dash Core v24 (the embedded builder sets these from its own inputs):
+    //   * types 10-12 (ProDisTx/ProUpShareTx/ProUpSharedRegTx) — admitted when
+    //     allow_v24_provider (DEPLOYMENT_V24 active for the block and the v24
+    //     fold armed: the template folds them, sml_special_fold.hpp); a
+    //     ProDisTx may then spend its shared masternode's template-script
+    //     collateral, the only spend Core allows of that coin;
+    //   * type 7 (MNHF signal) — admitted when allow_mnhf (the builder runs
+    //     Dash Core's CheckMNHFTx and the duplicate rule, mnhf_check.hpp);
+    //   * v24_rules — the block's ContextualCheckTransaction type list is Core
+    //     v24's (0..12) instead of v23.1.9's (0..9).
     struct SpecialTxSelectMask {
         bool allow_all_special;   // legacy exclude_special == false
         bool allow_mn_types;      // types 1-4
         bool allow_locks;         // type 8
+        bool allow_v24_provider;  // types 10-12 (only with v24_rules)
+        bool allow_mnhf;          // type 7
+        bool v24_rules;           // DEPLOYMENT_V24 active for the block
         // A single user-provided constructor (default exclude_special=false =>
         // legacy admit-all). No in-class member initializers: those would be
         // odr-used by the `= {}` default argument on get_sorted_txs_with_fees
@@ -2024,13 +2056,18 @@ public:
         constexpr SpecialTxSelectMask(bool exclude_special = false)
             : allow_all_special(!exclude_special),
               allow_mn_types(false),
-              allow_locks(false) {}
+              allow_locks(false),
+              allow_v24_provider(false),
+              allow_mnhf(false),
+              v24_rules(false) {}
         constexpr bool admits(uint16_t tx_type) const {
             if (tx_type == 0) return true;              // ordinary tx
             if (allow_all_special) return true;         // legacy general path
             if (tx_type >= 1 && tx_type <= 4) return allow_mn_types;
+            if (tx_type == 7) return allow_mnhf;
             if (tx_type == 8) return allow_locks;
-            return false;                               // 5/6/7/9 never here
+            if (tx_type_is_v24_provider(tx_type)) return allow_v24_provider && v24_rules;
+            return false;                               // 5/6/9 never here
         }
     };
 
@@ -2323,7 +2360,7 @@ public:
                 // PER-TYPE special-tx admission (see SpecialTxSelectMask):
                 // the legacy exclude_special=true collapses to admits()==false
                 // for every type!=0; the partial embedded mask admits types
-                // 1-4 and/or 8 only, and 5/6/7/9 are never selected.
+                // 1-4, 7, 8 and (v24) 10-12, and 5/6/9 are never selected.
                 if (!special_mask.admits(e->tx.type)) { ok = false; break; }
                 // A type-8 lock rides only when it is a valid block member:
                 // the CheckAssetLockTx port of asset_lock_fold.hpp (version 1,
@@ -2361,7 +2398,11 @@ public:
                 // that predates it (or any future seam that bypasses it) must
                 // never ride — dashd rejects the block (bad-txns-version /
                 // bad-txns-type, ContextualCheckTransaction post-DIP3).
-                if (contextual_tx_check(e->tx, /*is_coinbase=*/false)) { ok = false; break; }
+                if (special_mask.v24_rules ? contextual_tx_check_v24(e->tx, /*is_coinbase=*/false).has_value()
+                                           : contextual_tx_check(e->tx, /*is_coinbase=*/false).has_value()) {
+                    ok = false;
+                    break;
+                }
 
                 // ── dashd TestPackageTransactions (node/miner.cpp:374-391),
                 // member-level; either failure drops the WHOLE package and —
@@ -2499,8 +2540,13 @@ public:
                             break;
                         }
                         // Dash Core v24: only a ProDisTx may spend a coin locked
-                        // to the shared-collateral template, and none rides.
-                        if (is_shared_collateral_script(coin.scriptPubKey.m_data)) {
+                        // to the shared-collateral template; one rides only
+                        // with the v24 fold armed (the builder's fold then
+                        // checks it, CheckProDisTx, and removes the masternode).
+                        if (is_shared_collateral_script(coin.scriptPubKey.m_data)
+                            && !(special_mask.allow_v24_provider && special_mask.v24_rules
+                                 && tx_is_special_version(e->tx.version)
+                                 && e->tx.type == tx_type::PROVIDER_DISSOLVE)) {
                             ok = false;
                             break;
                         }
@@ -2680,6 +2726,7 @@ private:
     // Hold arm-bit (spork2+spork3, pushed from the io thread via
     // set_instantsend_mining_hold; read on the serve executor). DEFAULT OFF.
     std::atomic<bool>                                  m_is_hold_armed{false};
+    std::atomic<bool>                                  m_v24_admission{false};   // set_v24_admission
     size_t                                             m_total_bytes{0};
     size_t                                             m_max_bytes;
     time_t                                             m_expiry_sec;
@@ -3236,6 +3283,18 @@ private:
             return false;
         }
 
+        // MNHF signal (type 7): Dash Core's CheckTransaction lets it carry no
+        // inputs and no outputs, and such a signal pays exactly zero (Core
+        // skips its relay-fee check, validation.cpp:1066-1068). Exact without
+        // a UTXO view; its +0.1 DASH priority delta (above) is modified fee
+        // only. A type 7 with inputs or outputs takes the general path.
+        if (entry.tx.type == vendor::MNHFTxPayload::SPECIALTX_TYPE
+            && entry.tx.vin.empty() && entry.tx.vout.empty()) {
+            entry.fee = 0;
+            entry.fee_known = true;
+            entry.fee_fold_proven = true;
+            return true;
+        }
         if (!utxo) {
             entry.fee_known = false;
             entry.fee_fold_proven = false;

@@ -182,6 +182,7 @@
 #include <impl/dash/coin/vendor/llmq_commitment.hpp>
 #include <impl/dash/coin/vendor/providertx.hpp>
 #include <impl/dash/coin/v24_state.hpp>
+#include <impl/dash/coin/v24_sml_leaf.hpp>   // write_sml_leaf_fields (shared with the template fold)
 #include <impl/dash/coin/vendor/simplifiedmns.hpp>
 #include <impl/dash/coin/vendor/bls_verify.hpp>
 #include <impl/dash/coin/vendor/incremental_sml_merkle.hpp>
@@ -350,29 +351,15 @@ struct ReplayMNState
     vendor::CSimplifiedMNListEntry to_sml_entry(const uint256& proTxHash) const
     {
         vendor::CSimplifiedMNListEntry e;
-        e.nVersion         = nVersion;
+        // nVersion, the netInfo (ExtNetInfo for a v3 leaf, the legacy
+        // CService below), the operator key re-encoded per nVersion (we store
+        // canonical BASIC; a legacy-era leaf hashes the legacy encoding),
+        // voting key, nType and the platform fields: v24_sml_leaf.hpp, the one
+        // definition the template-side v24 fold uses too.
+        v24::write_sml_leaf_fields(*this, e);
         e.proRegTxHash     = proTxHash;
         e.confirmedHash    = confirmedHash;
-        // An empty MnNetInfo is hashed as CService{}: 16 zero bytes, port 0.
-        e.netAddress       = netInfo.canonical().ip;
-        e.netPort          = netInfo.canonical().port_be;
-        // Dash Core v24: a v3 leaf carries the ExtNetInfo (and no
-        // platformHTTPPort; the leaf codec skips it at v3).
-        if (v24::state_has_ext(nVersion)) {
-            e.netAddress = {};
-            e.netPort    = 0;
-            e.extNetInfo = v24.extNetInfo;
-        }
-        // dashd serializes the SML leaf's operator key in the scheme the entry
-        // nVersion dictates (legacy iff nVersion < BasicBLS). We store canonical
-        // BASIC, so re-encode per nVersion here (opkey_for_leaf) — otherwise a
-        // legacy-era entry's leaf hashes the wrong bytes and diverges the root.
-        e.pubKeyOperator   = vendor::opkey_for_leaf(pubKeyOperator, nVersion < vendor::ProTxVersion::BASIC_BLS);
-        e.keyIDVoting      = keyIDVoting;
         e.isValid          = !IsBanned();
-        e.nType            = nType;
-        e.platformHTTPPort = platformHTTPPort;
-        e.platformNodeID   = platformNodeID;
         return e;
     }
 

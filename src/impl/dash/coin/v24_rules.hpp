@@ -90,6 +90,19 @@ constexpr uint16_t protx_max_version(bool v19_active_, bool v24_active_)
     return vendor::ProTxVersion::LEGACY_BLS;
 }
 
+/// The netinfo chain parameters of a network (IsNodeOnMainnet,
+/// RequireRoutableExternalIP).
+inline vendor::NetInfoRules netinfo_rules_for(DashNetwork n)
+{
+    switch (n) {
+    case DashNetwork::MAINNET: return vendor::NetInfoRules::mainnet();
+    case DashNetwork::TESTNET: return vendor::NetInfoRules::testnet();
+    case DashNetwork::DEVNET:  return vendor::NetInfoRules::devnet();
+    case DashNetwork::REGTEST: return vendor::NetInfoRules::regtest();
+    }
+    return vendor::NetInfoRules::mainnet();
+}
+
 /// The deployment state a provider tx is checked under (Core SpecialTxRules
 /// plus the chain parameters the netinfo rules read).
 struct ProviderTxRules
@@ -110,12 +123,7 @@ struct ProviderTxRules
         r.v24_active = dash::coin::v24_active(n, height);
         r.evo_shares_active = false;
         r.ipv4_optional = n == DashNetwork::TESTNET || n == DashNetwork::DEVNET;
-        switch (n) {
-        case DashNetwork::MAINNET: r.net = vendor::NetInfoRules::mainnet(); break;
-        case DashNetwork::TESTNET: r.net = vendor::NetInfoRules::testnet(); break;
-        case DashNetwork::DEVNET:  r.net = vendor::NetInfoRules::devnet();  break;
-        case DashNetwork::REGTEST: r.net = vendor::NetInfoRules::regtest(); break;
-        }
+        r.net = netinfo_rules_for(n);
         return r;
     }
 };
