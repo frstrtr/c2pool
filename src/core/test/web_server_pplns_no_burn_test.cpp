@@ -42,6 +42,7 @@
 #include <nlohmann/json.hpp>
 
 #include <core/coin/node_iface.hpp>
+#include <core/log.hpp>
 #include <core/coin/work_view.hpp>
 #include <core/uint256.hpp>
 #include <core/web_server.hpp>
@@ -125,6 +126,7 @@ struct Rig {
     Rig()
     {
         mi.set_coin_node(&ltc);
+        mi.set_cached_share_version(36);   // the LTC pool's (no V35 finder fee)
         mi.set_donation_script(don);
         mi.set_best_share_hash_fn([this] { return best; });
         // The LTC pool hook's shape: nothing for a null best share, nothing
@@ -152,9 +154,9 @@ struct Rig {
         auto [c1, c2] = mi.get_coinbase_parts();
         return c1 + c2;
     }
-    MiningInterface::CoinbaseResult job(const uint256& prev)
+    MiningInterface::CoinbaseResult job(const uint256& prev, unsigned char payout_byte = 0x77)
     {
-        const std::vector<unsigned char> payout = p2pkh(0x77);
+        const std::vector<unsigned char> payout = p2pkh(payout_byte);
         return mi.build_connection_coinbase(prev, "aabbccdd", payout, {});
     }
 };
@@ -364,6 +366,7 @@ TEST(PplnsNoBurn, ConcurrentJobsPayTheirOwnShareAtTheirOwnTemplateValue)
     std::atomic<bool> busy{false};
     const std::vector<unsigned char> don{0xa9, 0x14, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 0x87};
     mi.set_coin_node(&node);
+    mi.set_cached_share_version(36);
     mi.set_donation_script(don);
     mi.set_best_share_hash_fn([&] { std::lock_guard<std::mutex> l(best_mu); return best; });
     mi.set_pplns_fn([&](const uint256& b, const uint256&, uint64_t subsidy, const std::vector<unsigned char>& d) -> Split {
@@ -385,6 +388,8 @@ TEST(PplnsNoBurn, ConcurrentJobsPayTheirOwnShareAtTheirOwnTemplateValue)
     });
     mi.refresh_work();
 
+    // Every job and refresh logs at info/trace: thousands per second here.
+    core::log::Logger::set_severity_level(boost::log::trivial::warning);
     std::atomic<bool> stop{false};
     std::atomic<uint64_t> jobs{0}, held{0}, burns{0}, wrong_share{0}, wrong_value{0}, global_burns{0};
     const uint64_t shares[] = {0xa1, 0xb2, 0xc3, 0xd4};
@@ -428,6 +433,7 @@ TEST(PplnsNoBurn, ConcurrentJobsPayTheirOwnShareAtTheirOwnTemplateValue)
     stop = true;
     refresher.join();
     for (auto& b : builders) b.join();
+    core::log::Logger::set_severity_level(boost::log::trivial::trace);
     std::printf("[no-burn race] jobs=%llu held=%llu\n", static_cast<unsigned long long>(jobs.load()),
                 static_cast<unsigned long long>(held.load()));
     EXPECT_GT(jobs.load() - held.load(), 0u) << "some jobs were built";
@@ -457,4 +463,26 @@ TEST(PplnsNoBurn, ARefreshWithoutAGlobalCoinbaseKeepsTheLastReserve)
     ASSERT_TRUE(r.global().empty());
     EXPECT_EQ(r.mi.coinbase_weight_reserve(), weight) << "the last real coinbase's weight is kept";
     EXPECT_EQ(r.mi.coinbase_sigop_reserve(), sigops);
+}
+
+TEST(PplnsNoBurn, AV35FinderFeeStaysWithItsOwnConnection)
+{
+    // V35: each connection's coinbase moves subsidy/200 from the donation to
+    // its own payout (the finder fee). The split cached from one connection's
+    // recomputed job is the split itself, not that connection's coinbase.
+    Rig r;
+    r.mi.set_cached_share_version(35);
+    r.best = h(0xa1);
+    r.busy = true;
+    r.mi.refresh_work();   // nothing cached: the next job recomputes
+    r.busy = false;
+    auto first = r.job(h(0xa1), 0x77);
+    ASSERT_FALSE(first.held);
+    EXPECT_EQ(amount_of(first.coinb1 + first.coinb2, p2pkh(0x77)), 1000) << "its finder fee (all of the donation)";
+    const int calls = r.pplns_calls;
+    auto second = r.job(h(0xa1), 0x66);
+    ASSERT_FALSE(second.held);
+    EXPECT_EQ(r.pplns_calls, calls) << "the cached split";
+    EXPECT_EQ(amount_of(second.coinb1 + second.coinb2, p2pkh(0x77)), -1) << "no other connection's finder fee";
+    EXPECT_EQ(amount_of(second.coinb1 + second.coinb2, p2pkh(0x66)), 1000);
 }
