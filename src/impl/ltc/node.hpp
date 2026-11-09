@@ -159,6 +159,31 @@ inline std::string pre_3601_peer_line(const std::string& addr, const std::option
            + "): peer too old, upgrade to c2pool v0.2.12; disconnecting";
 }
 
+// The "too old for share version 3601" WARNING: once an hour per peer IP. An
+// old peer redials from a new ephemeral port each time, so a limit per
+// ip:port would let the line repeat on every redial; the rest go to the
+// debug log. Bounded: expired entries are dropped past 4096.
+class Pre3601WarnLimiter
+{
+public:
+    using clock = std::chrono::steady_clock;
+    bool should_warn(const std::string& ip, clock::time_point now)
+    {
+        auto& until = m_until[ip];
+        if (until > now)
+            return false;
+        until = now + std::chrono::hours(1);
+        if (m_until.size() > 4096)
+            for (auto it = m_until.begin(); it != m_until.end();)
+                it = it->second <= now ? m_until.erase(it) : std::next(it);
+        return true;
+    }
+    std::size_t size() const { return m_until.size(); }
+
+private:
+    std::map<std::string, clock::time_point> m_until;
+};
+
 // A share of a version below 3601 whose timestamp is at or after the flag
 // day: invalid on every node (share_check.hpp flag_day_problem). From a peer
 // it means the peer is too old: the share handlers drop it (never into the
@@ -671,13 +696,15 @@ public:
     // Share version 3601 flag day (see peer_takes_3601 above). io-thread only.
     // Closes the connection (no ban, and the shares sent to it in the last
     // seconds are not taken as rejected) and keeps the dialer off the address
-    // for an hour; the log line is rate-limited per address.
+    // (ip:port) for an hour; the WARNING is once an hour per IP
+    // (Pre3601WarnLimiter).
     void drop_pre_3601_peer(const NetService& addr, const std::string& line);
     // From the flag day on: drop every connected peer below 3601 (every 5 s,
     // m_flag_day_timer).
     void disconnect_pre_3601_peers();
     bool peer_takes_3601_at(const NetService& addr) const;
-    std::map<NetService, std::chrono::steady_clock::time_point> m_pre_3601_until;
+    std::map<NetService, std::chrono::steady_clock::time_point> m_pre_3601_until;   // dial suppression
+    Pre3601WarnLimiter m_pre_3601_warn;                                              // the log line, per IP
     void processing_shares_phase2(HandleSharesData& data, NetService addr);
     /// Direct tracker access — compute-thread-only (already holds exclusive lock)
     /// or startup code (before compute thread exists).

@@ -759,12 +759,11 @@ bool NodeImpl::peer_takes_3601_at(const NetService& addr) const
 void NodeImpl::drop_pre_3601_peer(const NetService& addr, const std::string& line)
 {
     const auto now = std::chrono::steady_clock::now();
-    auto& until = m_pre_3601_until[addr];
-    if (until <= now)
-        LOG_WARNING << "[Pool] " << line;   // once an hour per address
+    if (m_pre_3601_warn.should_warn(addr.address(), now))
+        LOG_WARNING << "[Pool] " << line;   // once an hour per IP
     else
         LOG_DEBUG_POOL << "[Pool] " << line;
-    until = now + std::chrono::hours(1);
+    m_pre_3601_until[addr] = now + std::chrono::hours(1);   // the dialer skips this ip:port
     // A deliberate close: what we sent it is not "rejected by the peer".
     m_last_broadcast_to.erase(addr);
     if (m_pre_3601_until.size() > 4096)

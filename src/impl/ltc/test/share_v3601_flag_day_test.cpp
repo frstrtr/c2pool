@@ -15,6 +15,7 @@
 //     from the flag day on (node.hpp peer_takes_3601 ...);
 //   - the multi-chain AuxPoW commitment rule is enforced for 3601 shares and
 //     only counted for V36 shares (share_check.hpp merged_aux_commitment_problem).
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <map>
@@ -373,6 +374,28 @@ TEST_F(FlagDay, PeersBelow3601)
     late.destroy();
     early.destroy();
     ok.destroy();
+}
+
+// The "too old" WARNING once an hour per IP, whatever port the old peer
+// redials from; another IP is warned about on its own.
+TEST(FlagDayPeers, TooOldWarningOncePerHourPerIp)
+{
+    ltc::Pre3601WarnLimiter lim;
+    const auto t0 = ltc::Pre3601WarnLimiter::clock::now();
+    EXPECT_TRUE(lim.should_warn("10.0.0.1", t0));
+    EXPECT_FALSE(lim.should_warn("10.0.0.1", t0 + std::chrono::seconds(30))) << "a redial from a new port";
+    EXPECT_FALSE(lim.should_warn("10.0.0.1", t0 + std::chrono::minutes(59)));
+    EXPECT_TRUE(lim.should_warn("10.0.0.2", t0 + std::chrono::seconds(30))) << "another IP";
+    EXPECT_TRUE(lim.should_warn("10.0.0.1", t0 + std::chrono::hours(1)));
+    EXPECT_FALSE(lim.should_warn("10.0.0.1", t0 + std::chrono::hours(1) + std::chrono::seconds(1)));
+    // bounded: once the map passes 4096, the expired entries go
+    ltc::Pre3601WarnLimiter big;
+    for (int i = 0; i < 5000; ++i)
+        EXPECT_TRUE(big.should_warn("ip" + std::to_string(i), t0));
+    EXPECT_EQ(big.size(), 5000u) << "all within their hour";
+    const auto later = t0 + std::chrono::hours(2);
+    EXPECT_TRUE(big.should_warn("ip0", later));
+    EXPECT_EQ(big.size(), 1u) << "the expired 4999 dropped";
 }
 
 // ---- the AuxPoW commitment: enforced for 3601 shares, counted for V36 ------
