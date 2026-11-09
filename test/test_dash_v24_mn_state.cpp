@@ -473,12 +473,15 @@ TEST(DashV24ProRata, PortableEqualsNative)
 {
     namespace pay = dash::coin::vendor::payments;
     const int64_t COIN = 100'000'000;
-    const int64_t edges[] = {0, 1, 2, 3, 7, 999, COIN - 1, COIN, 1000 * COIN, 21'000'000 * COIN,
-                             INT64_MAX / 3, INT64_MAX / 2, INT64_MAX - 1, INT64_MAX};
+    // Negative values and weight > weight_total included: CAmount is cast to
+    // uint64 first and the result is the low 64 bits, as in Dash Core.
+    const int64_t edges[] = {INT64_MIN, INT64_MIN + 1, -COIN, -2, -1, 0, 1, 2, 3, 7, 999, COIN - 1,
+                             COIN, 1000 * COIN, 21'000'000 * COIN, (int64_t{1} << 32) - 1,
+                             int64_t{1} << 32, INT64_MAX / 3, INT64_MAX / 2, INT64_MAX - 1, INT64_MAX};
     for (int64_t total : edges)
         for (int64_t weight : edges)
             for (int64_t wt : edges) {
-                if (wt <= 0 || weight > wt) continue;
+                if (wt == 0) continue;   // division by zero: Core throws
                 ASSERT_EQ(pay::ProRataFloorPortable(total, weight, wt), pay::ProRataFloor(total, weight, wt))
                     << total << " " << weight << " " << wt;
             }
