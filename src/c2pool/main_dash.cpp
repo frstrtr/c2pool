@@ -108,6 +108,8 @@
 #include <impl/dash/coin/mempool_ingest.hpp>     // wire_mempool_ingest (leg 1)
 #include <impl/dash/coin/tip_ingest.hpp>         // wire_tip_ingest (leg 2)
 #include <impl/dash/coin/deployment_status.hpp>  // Dash Core v24 deployment tracking (EHF + versionbits)
+#include <impl/dash/coin/v24_activation_wire.hpp>  // the v24 activation height cross-check into the folds
+#include <impl/dash/coin/mnhf_node_env.hpp>      // Dash Core CheckMNHFTx inputs from the node
 #include <impl/dash/coin/credit_pool_lane.hpp>   // Dash Core v24 credit-pool follower (UnlockLimitV24, unlock admission)
 #include <impl/dash/coin/protx_ecdsa.hpp>        // CHashSigner::VerifyHash for the provider-tx checks
 #include <impl/dash/coin/embedded_oracle_shadow.hpp> // dash::coin::EmbeddedOracleShadow — per-block dashd cross-check (OBSERVE-only)
@@ -3208,9 +3210,16 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     std::unique_ptr<dash::coin::replay::ReplayUtxoFold> fold_fee_fold;
     std::unique_ptr<dash::coin::FoldFeeSource>          fold_fee_source;
     dash::coin::NodeCoinState node_coin_state;
-    // Dash Core v24 (DEPLOYMENT_V24): the payee projection's v24 rules and
-    // netInfo chain parameters. Testnet activated at 1,578,000; on mainnet
-    // the height stays "never" until S0's versionbits tracker supplies it.
+    // Dash Core v24 (DEPLOYMENT_V24): every block folds as its CbTx version
+    // states (v24_activation.hpp); a v24 statement below the earliest
+    // possible activation is a block dashd rejects. The tracking's activation
+    // height arrives through V24ActivationWire (below) as a cross-check.
+    {
+        const auto fold_net =
+            dash::SharechainConfig::is_testnet ? dash::coin::DashNetwork::TESTNET : dash::coin::DashNetwork::MAINNET;
+        node_coin_state.mnstates().set_v24_earliest(dash::coin::v24_earliest_unmeasured_activation(fold_net));
+        node_coin_state.mnstates().set_v20_height(dash::coin::dash_deployment_params(fold_net).v20_height);
+    }
     if (dash::SharechainConfig::is_testnet) {
         // The projection's chain heights from the same testnet gates the
         // replay engines use (FoldGates::testnet()): DIP3 activation for its
@@ -3507,7 +3516,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         env.ecdsa = &dash::coin::protx_ecdsa_verify_hash;
         node_coin_state.set_protx_check_env(std::move(env));
     }
-    std::cout << "[run] embedded special-tx superset (DIP types 1-4): "
+    std::cout << "[run] embedded special-tx superset (provider types 1-4; from Dash Core v24 "
+                 "activation also 10-12; MNHF signals type 7): "
               << (embedded_include_mn_special_txs
                       ? "ON (--embedded-include-mn-special-txs: SML-folded "
                         "special txs admitted; root re-folded + drift-rejected "
@@ -5573,6 +5583,9 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // status reads is destroyed (members below are destroyed first).
     std::shared_ptr<dash::coin::EhfSignalTracker>     ehf_tracker;
     std::shared_ptr<dash::coin::DashDeploymentStatus> v24_status;
+    // The v24 activation height from the tracking into the payee projection
+    // and the replay folds (v24_activation.hpp), persisted (<net>/v24_activation.v1).
+    std::shared_ptr<dash::coin::V24ActivationWire>    v24_wire;
     std::unique_ptr<dash::coin::EhfRescanLane>        ehf_rescan;
     std::string                                       ehf_path;
     // Credit-pool follower (#143 / Dash Core v24 UnlockLimitV24): the store
@@ -5583,16 +5596,20 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // leaves the registry before the header chain is destroyed. The node's
     // v24 state function (node_coin_state outlives header_chain) then answers
     // UNKNOWN instead of reading freed headers.
+    // The MNHF check environment's chain lookup reads the header chain too;
+    // it answers "unknown" (the signal is left out) once this flag drops.
     struct V24StatusUninstall {
         dash::coin::DashNetwork net;
         std::shared_ptr<dash::coin::DashDeploymentStatus> status;
+        std::shared_ptr<std::atomic<bool>> chain_alive;
         ~V24StatusUninstall()
         {
+            if (chain_alive) chain_alive->store(false);
             if (status) status->shutdown();
             dash::coin::install_dash_deployment_status(net, nullptr);
         }
     } v24_status_uninstall{testnet ? dash::coin::DashNetwork::TESTNET
-                                   : dash::coin::DashNetwork::MAINNET, nullptr};
+                                   : dash::coin::DashNetwork::MAINNET, nullptr, nullptr};
     if (coin_p2p) {
         const auto dash_params = testnet
             ? dash::coin::make_dash_chain_params_testnet()
@@ -8195,9 +8212,24 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 std::stringstream ss;
                 if (lf) ss << lf.rdbuf();
                 if (lf && v24_status->deserialize_latch(ss.str())
-                    && v24_status->latch() != dash::coin::V24Latch::NONE)
+                    && v24_status->latch() != dash::coin::V24Latch::NONE) {
                     LOG_WARNING << "[DASH-V24] cross-check latch RESTORED from " << latch_path
                                 << ": " << ss.str();
+                    // A latch set by a CbTx version Core rejects clears now
+                    // if that block left our best chain while we were down
+                    // (reorged out, orphaned), and the record with it; one set
+                    // by a valid block waits for a cross-check that agrees.
+                    v24_status->revalidate_latch();
+                    if (v24_status->latch() == dash::coin::V24Latch::NONE) {
+                        const std::string tmp = latch_path + ".tmp";
+                        {
+                            std::ofstream out(tmp, std::ios::trunc);
+                            out << v24_status->serialize_latch();
+                        }
+                        if (std::rename(tmp.c_str(), latch_path.c_str()) != 0)
+                            LOG_WARNING << "[DASH-V24] could not persist " << latch_path;
+                    }
+                }
             }
             dash::coin::install_dash_deployment_status(v24_net, v24_status);
             // The embedded template is decided for the block it builds; an
@@ -8205,6 +8237,54 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             node_coin_state.set_v24_state_fn(
                 [st = v24_status](uint32_t h) { return st->v24_state(h); });
             node_coin_state.set_v24_network(v24_net);
+            // The activation height from this tracking, on every network
+            // (testnet's buried 1,578,000 at once; mainnet once the block that
+            // decided LOCKED_IN is settled, most of a window before
+            // activation), into the payee projection here and into each
+            // replay fold where it is built, as the cross-check of each
+            // block's own CbTx statement (v24_activation.hpp). Re-checked on
+            // every ordered block and withdrawn when the tracking disagrees
+            // or its cross-check latch fires (v24_activation_wire.hpp).
+            {
+                dash::coin::V24TrackingView view;
+                view.activation_height = [st = v24_status]() {
+                    return st->activation_height(dash::coin::DashDeployment::V24);
+                };
+                view.state = [st = v24_status](uint32_t h) { return st->v24_state(h); };
+                view.refuted = [st = v24_status]() { return st->latch() != dash::coin::V24Latch::NONE; };
+                view.tip = [hc = header_chain.get()]() -> std::optional<uint32_t> {
+                    if (!hc || hc->height() == 0) return std::nullopt;
+                    return hc->height();
+                };
+                v24_wire = std::make_shared<dash::coin::V24ActivationWire>(
+                    v24_net, std::move(view),
+                    (core::filesystem::config_path() / net_subdir / "v24_activation.v1").string());
+            }
+            v24_wire->add_sink([&node_coin_state](uint32_t h) { node_coin_state.mnstates().set_v24_height(h); });
+            // The tracking first; the persisted height only where it does not
+            // know yet, re-checked by the next refresh like any pushed height.
+            v24_wire->refresh();
+            v24_wire->load();
+            v24_wire->refresh();
+            // Dash Core's CheckMNHFTx for the type-7 signals our templates
+            // carry (mnhf_check.hpp; selected under
+            // --embedded-include-mn-special-txs): the quorum block on our
+            // chain, the quorum key from the active set, the BLS recovered
+            // signature, and the staged signals from the EHF tracker (exact
+            // only where it covers the parent; elsewhere the signal stays out).
+            {
+                auto alive = std::make_shared<std::atomic<bool>>(true);
+                v24_status_uninstall.chain_alive = alive;
+                auto me = dash::coin::make_node_mnhf_check_env(
+                    v24_net, header_chain.get(), std::shared_ptr<const dash::coin::EhfSignalTracker>(ehf_tracker),
+                    std::shared_ptr<const std::atomic<bool>>(alive),
+                    [&node_coin_state](uint8_t type, const uint256& q) -> std::optional<std::array<uint8_t, 48>> {
+                        const auto c = std::as_const(node_coin_state).qmgr().find(type, q);
+                        if (!c) return std::nullopt;
+                        return c->quorumPublicKey;
+                    });
+                node_coin_state.set_mnhf_check_env(std::move(me));
+            }
             // Testnet min-difficulty rules (Dash Core DarkGravityWave with
             // fPowAllowMinDifficultyBlocks): bits follow the template's time.
             if (testnet)
@@ -8233,7 +8313,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             // word is read directly, no CbTx codec needed).
             ehf_ordered_sink =
                 [t = ehf_tracker, st = v24_status, path = ehf_path, &cp_lane, latch_path,
-                 latch_seen = std::make_shared<uint64_t>(v24_status->latch_version())](
+                 latch_seen = std::make_shared<uint64_t>(v24_status->latch_version()),
+                 wire = v24_wire](
                     const dash::interfaces::BlockConnected& bc) {
                     auto packed = ::pack(static_cast<const dash::coin::BlockHeaderType&>(bc.block));
                     const uint256 h = dash::crypto::hash_x11(packed.get_span());
@@ -8265,6 +8346,10 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                                  << " (EHF stage: " << t->signals().size() << " signal(s))";
                     if (t->dirty() && !t->save(path))
                         LOG_WARNING << "[DASH-V24] could not persist " << path;
+                    // The activation height, once known, reaches the folds
+                    // before the maintainer folds this block (this is the
+                    // ordered stream's first sink).
+                    if (wire) wire->refresh();
                 };
             // Cold-start rescan: fetch [next needed, live floor - 1]. The live
             // floor is the payee cursor + 1 (the tip-follow path fetches from
@@ -9466,8 +9551,18 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     fcfg.enabled = true;
                     if (dash::SharechainConfig::is_testnet)   // testnet heights incl. Dash Core v24 (1,578,000)
                         fcfg.gates = rp::FoldGates::testnet();
+                    else
+                        fcfg.gates.v24_earliest =
+                            dash::coin::v24_earliest_unmeasured_activation(dash::coin::DashNetwork::MAINNET);
+                    fcfg.gates.v20_height = dash::coin::dash_deployment_params(
+                        dash::SharechainConfig::is_testnet ? dash::coin::DashNetwork::TESTNET
+                                                           : dash::coin::DashNetwork::MAINNET).v20_height;
                     mn_bridge_fold_engine =
                         std::make_unique<rp::DmlFoldEngine>(fcfg);
+                    if (v24_wire)
+                        v24_wire->add_sink([&mn_bridge_fold_engine](uint32_t h) {
+                            if (mn_bridge_fold_engine) mn_bridge_fold_engine->set_v24_height(h);
+                        });
                     mn_diff_writer = std::make_unique<rp::MnDiffWriter>(
                         *mn_diff_store, *mn_bridge_fold_engine);
 
@@ -10002,8 +10097,18 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 fcfg.enabled = true;   // W1 feature flag, explicit opt-in
                 if (dash::SharechainConfig::is_testnet)   // testnet heights incl. Dash Core v24 (1,578,000)
                     fcfg.gates = dash::coin::replay::FoldGates::testnet();
+                else
+                    fcfg.gates.v24_earliest =
+                        dash::coin::v24_earliest_unmeasured_activation(dash::coin::DashNetwork::MAINNET);
+                fcfg.gates.v20_height = dash::coin::dash_deployment_params(
+                    dash::SharechainConfig::is_testnet ? dash::coin::DashNetwork::TESTNET
+                                                       : dash::coin::DashNetwork::MAINNET).v20_height;
                 replay_fold_engine =
                     std::make_unique<rp::DmlFoldEngine>(fcfg);
+                if (v24_wire)
+                    v24_wire->add_sink([&replay_fold_engine](uint32_t h) {
+                        if (replay_fold_engine) replay_fold_engine->set_v24_height(h);
+                    });
                 const std::string serr =
                     rp::seed_engine_from_prestate(*replay_fold_engine, ps);
                 if (!serr.empty()) {
@@ -12131,6 +12236,17 @@ int run_mine_block(bool testnet, const std::string& rpc_endpoint,
 
 int main(int argc, char** argv)
 {
+    // One BLS mode per binary (vendor/bls_mode_guard.hpp): a translation unit
+    // compiled without C2POOL_DASH_BLS beside one compiled with it would leave
+    // the linker free to keep a fail-closed stub of the provider-tx checks.
+    if (dash::coin::vendor::bls_mode_mixed()) {
+        std::cerr << "[init] FATAL: this c2pool-dash binary mixes BLS-backend and BLS-stub translation units"
+                     " (C2POOL_DASH_BLS differs between them); rebuild it from one configuration\n";
+        return 1;
+    }
+    std::cout << "[init] BLS backend: "
+              << ((dash::coin::vendor::bls_modes() & dash::coin::vendor::kBlsModeBackend) ? "dashbls" : "none (stub)")
+              << "\n";
     // Interim hardening fix #4: raise RLIMIT_NOFILE to 65536 at startup
     // (one fd per stratum/miner session + RPC + sharechain P2P; distro-default
     // 1024 starves the accept loop). Report the effective soft limit.

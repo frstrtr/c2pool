@@ -212,6 +212,27 @@ public:
         m_mempool.set_inject_still_wanted_fn([this](const uint256& txid) {
             return m_inject_pool.still_wanted(txid, next_block_height());
         });
+        // Dash Core's provider-tx admission conflicts read the masternode
+        // list at the tip (txmempool.cpp existsProviderTxConflict: "not in
+        // the list", one pending operator key change per masternode). Only a
+        // projection folded up to the tip answers (the emit gate's condition);
+        // otherwise Unknown, and those rules are skipped. The store keeps the
+        // canonical basic encoding. Admission runs on the io thread, where the
+        // maintainer mutates m_mnstates.
+        m_mempool.set_tip_operator_key_fn([this](const uint256& protx) {
+            Mempool::TipOperatorKey k;
+            if (m_prev_height == 0 || m_mnstates.entries().empty()
+                || m_mnstates.last_applied_height() != m_prev_height)
+                return k;
+            const auto it = m_mnstates.entries().find(protx);
+            if (it == m_mnstates.entries().end()) {
+                k.state = Mempool::TipMn::Absent;
+                return k;
+            }
+            k.state = Mempool::TipMn::Listed;
+            k.key = it->second.pubKeyOperator;
+            return k;
+        });
     }
     NodeCoinState(const NodeCoinState&) = delete;
     NodeCoinState& operator=(const NodeCoinState&) = delete;
@@ -458,6 +479,12 @@ public:
     /// checkable, so none rides the template (fail closed).
     void set_protx_check_env(ProTxCheckEnv env) { m_protx_check_env = std::move(env); }
 
+    /// Dash Core's CheckMNHFTx for type-7 signals (mnhf_check.hpp): the chain
+    /// lookup, the quorum keys, the BLS verifier and the EHF tracker's staged
+    /// signals. The builder (under --embedded-include-mn-special-txs) and the
+    /// emit gate run it on every signal. UNSET (default) => no signal rides.
+    void set_mnhf_check_env(MnhfCheckEnv env) { m_mnhf_check_env = std::move(env); }
+
     /// Network MN_RR activation height (dashcore Params().GetConsensus()
     /// .MN_RRHeight — per-chainparams). Gates the DIP-0027 platform-share
     /// credit-pool accrual in the template build, the pre-emit value re-check,
@@ -619,6 +646,9 @@ public:
         m_curtime              = curtime;
         m_version              = version;
         m_populated            = true;
+        // Dash Core v24: the mempool admits the v24 type list (10-12) once
+        // DEPLOYMENT_V24 is active for the block after this tip.
+        m_mempool.set_v24_admission(v24_state_for(prev_height + 1) == V24State::ACTIVE);
         // S2: an inject whose expiry_height the new tip reached leaves the pool
         // and the mempool now, not at the next submit. #2121: so does one that
         // left the mempool (the lane's hook usually released it already).
@@ -1843,12 +1873,36 @@ public:
         // bad-cbtx-mnmerkleroot — a silently lost block on a winning share.
         // The builder already filters these out of selection; re-assert here
         // so a cached/bypassed template can never reach a miner.
+        // Dash Core v24: a ProDisTx spends its shared masternode's collateral
+        // by design. With the special-tx fold armed it is allowed through here
+        // and the fold below checks it and removes the masternode (refusing the
+        // template on any doubt).
+        const bool v24_fold = m_include_mn_special_txs && v24_state_for(next_h) == V24State::ACTIVE;
         for (const auto& tx : w.m_txs) {
             uint256 protx;
+            if (v24_fold && tx_is_special_version(tx.version) && tx.type == tx_type::PROVIDER_DISSOLVE)
+                continue;
             if (tx_spends_mn_collateral(m_mnstates, tx, &protx))
                 return reject("emit-collateral-spend-in-template",
                               "mn=" + protx.GetHex().substr(0, 12),
                               "no-template-tx-spends-mn-collateral");
+        }
+        // MNHF signals (type 7): every one the body carries must pass Dash
+        // Core's CheckMNHFTx and the block's duplicate rules (mnhf_check.hpp).
+        // A signal never pays a fee, so this re-check only refuses.
+        if (std::any_of(w.m_txs.begin(), w.m_txs.end(), [](const Transaction& t) {
+                return t.type == vendor::MNHFTxPayload::SPECIALTX_TYPE;
+            })) {
+            std::vector<MutableTransaction> body(w.m_txs.begin(), w.m_txs.end());
+            {
+                const auto why = mnhf_select(body, m_mnhf_check_env ? &*m_mnhf_check_env : nullptr,
+                                             m_prev_height, m_mtp_at_tip);
+                for (size_t i = 0; i < why.size(); ++i)
+                    if (!why[i].empty())
+                        return reject("emit-mnhf-refused",
+                                      dash_txid(body[i]).GetHex().substr(0, 12) + ":" + why[i],
+                                      "dash-core-checkmnhftx");
+            }
         }
         vendor::CCbTx cb;
         if (!vendor::parse_cbtx(w.m_coinbase_payload, cb))
@@ -2250,6 +2304,7 @@ public:
         // B.9: same verifier the emit gate folds with (unset => refused).
         e.protx_sig_verifier = m_protx_sig_verifier ? &m_protx_sig_verifier : nullptr;
         e.protx_check_env = m_protx_check_env ? &*m_protx_check_env : nullptr;
+        e.mnhf_check_env = m_mnhf_check_env ? &*m_mnhf_check_env : nullptr;
         return e;
     }
 
@@ -2832,6 +2887,7 @@ private:
     bool m_include_mn_special_txs{false};
     MnFoldContext::OperatorSigFn m_protx_sig_verifier;   // B.9 (unset => refuse types 2/4)
     std::optional<ProTxCheckEnv> m_protx_check_env;      // Core CheckPro*Tx (unset => no provider tx rides)
+    std::optional<MnhfCheckEnv>  m_mnhf_check_env;       // Core CheckMNHFTx (unset => no MNHF signal rides)
     // Pinned local tx (set_pinned_local_tx): held by value for the lifetime of
     // this state; the bundle exposes a pointer only when the flag is set.
     // MULTIPLE pins: the donation consolidation had to be SPLIT after
