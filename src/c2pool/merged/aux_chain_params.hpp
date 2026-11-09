@@ -238,11 +238,11 @@ inline uint16_t merged_p2p_port(const std::string& symbol, bool embedded_doge, u
 ///      (p2pool --merged-operator-address), for another chain
 ///      --merged-payout-address SYMBOL:ADDRESS; used when it is an address of
 ///      the chain on the parent's network;
-///   P2 else the operator's parent key (--node-owner-address) as P2PKH, when it
-///      is a P2PKH or P2WPKH key;
-///   P3 else (a P2SH, P2WSH or P2TR operator address) the pool donation
-///      script. A P2SH key is not converted (p2pool does): its redeem script
-///      may be P2SH-P2WPKH, anyone-can-spend on a chain without segwit.
+///   P2 else the operator's parent key (--node-owner-address) converted, as the
+///      auto-derive does (P2SH stays P2SH, P2PKH/P2WPKH become P2PKH; a P2SH
+///      is warned about: if segwit-wrapped, it is anyone-can-spend on a chain
+///      without segwit once its redeem script is public);
+///   P3 else (a P2WSH/P2TR operator address) the pool donation script.
 struct OperatorMergedScript {
     std::vector<unsigned char> script;
     std::string source;
@@ -279,15 +279,18 @@ inline OperatorMergedScript resolve_operator_merged_script(const std::string& sy
     }
     std::string atype;
     const auto h160 = core::address_to_hash160(node_owner_address, atype);
-    if (h160.size() == 40 && (atype == "p2pkh" || atype == "p2wpkh")) {
-        r.script = core::hash160_to_merged_script(h160, "p2pkh");
+    if (h160.size() == 40 && (atype == "p2pkh" || atype == "p2wpkh" || atype == "p2sh")) {
+        r.script = core::hash160_to_merged_script(h160, atype);
         r.source = "--node-owner-address key";
+        if (atype == "p2sh" && r.warning.empty())
+            r.warning = "the --node-owner-address is P2SH, paid as the same P2SH on " + up
+                        + ": if it is a segwit-wrapped address (P2SH-P2WPKH/P2WSH), set "
+                        + (up == "DOGE" ? std::string("--node-owner-merged-address")
+                                        : "--merged-payout-address " + up + ":<address>")
+                        + " (on a chain without segwit such an output becomes spendable by anyone once the"
+                          " redeem script is public)";
         return r;
     }
-    if (atype == "p2sh" && r.warning.empty())
-        r.warning = "the --node-owner-address is P2SH, which is not converted to " + up
-                    + " (P2SH-P2WPKH is anyone-can-spend there); set "
-                    + (up == "DOGE" ? std::string("--node-owner-merged-address") : "--merged-payout-address " + up + ":<address>");
     r.script = donation_script;
     r.source = "donation script";
     return r;

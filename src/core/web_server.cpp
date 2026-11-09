@@ -540,17 +540,13 @@ void MiningInterface::decide_job_payout(std::vector<unsigned char>& payout_scrip
     // p2pool's never-empty merged leg on its own landings: a share paying the
     // operator's key with no merged address gets the operator's merged
     // addresses; a redistributed share, for each merged chain it has no
-    // address for, its recipient's key as P2PKH — written into the share (Tier
-    // 1). Not for a P2SH recipient: an LTC P2SH redeem script (P2SH-P2WPKH)
-    // can be anyone-can-spend on a chain without segwit, so no merged address
-    // is written for it. The share's parent key decides then: a V36 share
-    // pays it as a P2SH (the V36 rule), a 3601 share spreads its merged weight
-    // over the other payees (ltc share_check.hpp merged_parent_key); the
-    // donation script is paid as itself by both.
+    // address for, its recipient's key converted (P2SH stays P2SH, else
+    // P2PKH) — written into the share (Tier 1), so every node derives the same
+    // payout from it.
     if (!op_h160.empty() && h160 == op_h160 && merged.empty() && !m_operator_merged_scripts.empty()) {
         merged.assign(m_operator_merged_scripts.begin(), m_operator_merged_scripts.end());
-    } else if (redistributed && m_mm_manager && type != 2) {
-        const auto floor = core::hash160_to_merged_script(h160, "p2pkh");
+    } else if (redistributed && m_mm_manager) {
+        const auto floor = core::hash160_to_merged_script(h160, type == 2 ? "p2sh" : "p2pkh");
         for (const auto& ci : m_mm_manager->get_chain_infos()) {
             const bool has = std::any_of(merged.begin(), merged.end(),
                                          [&](const auto& e) { return e.first == ci.chain_id; });

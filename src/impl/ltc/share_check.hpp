@@ -860,8 +860,6 @@ inline std::vector<unsigned char> pubkey_hash_to_script(const uint160& hash, uin
 //
 // Returns empty vector for unconvertible scripts (Tier 3: redistributed).
 // Matches Python data.py:build_canonical_merged_coinbase() conversion logic.
-// The parent key of a V36 share is resolved this way; a 3601 share's P2SH
-// parent key never reaches it (merged_parent_key below).
 // ============================================================================
 inline std::vector<unsigned char> normalize_script_for_merged(
     const std::vector<unsigned char>& script)
@@ -901,52 +899,20 @@ inline std::vector<unsigned char> normalize_script_for_merged(
 //        parent script converted as above (P2SH as P2SH) — the rule of p2pool
 //        and of c2pool before the flag day, unchanged.
 //   3601 (FLAG_DAY_SHARE_VERSION): from the share alone — its own merged
-//        address for the chain, else its own parent key when that is P2PKH /
-//        P2WPKH (as P2PKH) or the pool's donation script; any other parent
-//        key (a P2SH: its redeem script is unknown, and a P2SH-P2WPKH one is
-//        anyone-can-spend on a chain without segwit, DOGE) pays no one: the
-//        share's weight is spread over the block's other payees (an UNPAID:
-//        key, resolve_merged_payout_script). A 3601 share neither feeds nor
-//        uses Tier 1.5, so one share's merged address never pays for another
-//        share and every node derives the same payout whatever order it
-//        received the shares in.
+//        address for the chain, else its own parent script converted the same
+//        way (P2PKH / P2WPKH as P2PKH, P2SH as P2SH). A 3601 share neither
+//        feeds nor uses Tier 1.5, so one share's merged address never pays
+//        for another share and every node derives the same payout whatever
+//        order it received the shares in.
 // Each share is resolved by its own version's rule in every window, so the
 // V36 shares in the window at the flag day keep their payouts. c2pool peers
 // never re-derive a merged coinbase (merged_payout_hash covers parent scripts
-// only), so the rule decides no share's validity.
-
-// UNPAID: prefix for the weight key of a 3601 share whose parent key has no
-// safe merged form (merged_parent_key): the weight stays in the window (its
-// size is unchanged) and resolves to no payee, so accepted_total leaves it out
-// and it is spread pro-rata over the other payees. 7 bytes: "UNPAID:". A raw
-// parent script never starts with it (P2PKH 76, P2WPKH 00, P2SH a9).
-inline constexpr std::array<unsigned char, 7> UNPAID_KEY_PREFIX = {
-    0x55, 0x4e, 0x50, 0x41, 0x49, 0x44, 0x3a
-};
-
-inline bool is_unpaid_key(const std::vector<unsigned char>& key)
-{
-    return key.size() > UNPAID_KEY_PREFIX.size()
-           && std::equal(UNPAID_KEY_PREFIX.begin(), UNPAID_KEY_PREFIX.end(), key.begin());
-}
-
-// The weight key of a 3601 share without a merged address for the chain: its
-// raw parent script when that converts safely (P2PKH, P2WPKH, the pool's
-// donation script — resolved by normalize_script_for_merged like a V36
-// share's), else UNPAID: + the script.
-inline std::vector<unsigned char> merged_parent_key(const std::vector<unsigned char>& parent_script)
-{
-    const bool p2sh = parent_script.size() == 23 && parent_script[0] == 0xa9 && parent_script[1] == 0x14
-                      && parent_script[22] == 0x87;
-    const bool donation = std::equal(parent_script.begin(), parent_script.end(),
-                                     PoolConfig::COMBINED_DONATION_SCRIPT.begin(),
-                                     PoolConfig::COMBINED_DONATION_SCRIPT.end());
-    if (!p2sh || donation)
-        return parent_script;
-    std::vector<unsigned char> key(UNPAID_KEY_PREFIX.begin(), UNPAID_KEY_PREFIX.end());
-    key.insert(key.end(), parent_script.begin(), parent_script.end());
-    return key;
-}
+// only), so the rule decides no share's validity. A P2SH parent key is paid
+// as the merged chain's P2SH of the same hash160: right for a legacy P2SH
+// (the pool's 1-of-2 multisig donation script among them); a segwit-wrapped
+// one (P2SH-P2WPKH / P2WSH) becomes spendable by anyone on a chain without
+// segwit once its redeem script is public, so stratum tells such a login to
+// give its merged address (core/merged_chain_addr.hpp).
 
 // MERGED: prefix for weight map keys — matches p2pool's 'MERGED:' + hex string.
 // Keeps Tier 1/1.5 (explicit DOGE script) keys separate from raw LTC script keys
@@ -986,7 +952,6 @@ inline std::vector<unsigned char> strip_merged_key(
 
 // Resolve a weight map key to a DOGE-compatible scriptPubKey.
 // MERGED:-prefixed keys: strip prefix, use directly (already a DOGE script).
-// UNPAID:-prefixed keys (a 3601 share's P2SH parent key): no payee.
 // Raw keys: autoconvert (P2WPKH→P2PKH, P2PKH/P2SH pass through).
 // Returns empty if unconvertible (P2WSH, P2TR, etc.).
 inline std::vector<unsigned char> resolve_merged_payout_script(
@@ -994,8 +959,6 @@ inline std::vector<unsigned char> resolve_merged_payout_script(
 {
     if (is_merged_key(key))
         return strip_merged_key(key);
-    if (is_unpaid_key(key))
-        return {};
     return normalize_script_for_merged(key);
 }
 

@@ -1918,7 +1918,7 @@ const std::vector<uint8_t> kLtcAllNetworks = {48, 50, 5, 111, 196, 58};   // mai
 // scripts by the chain-agnostic hash160 type.
 std::vector<unsigned char> master_doge_script(std::string username, std::string merged_raw, bool tn,
                                               std::map<uint32_t, std::string> explicit_addrs,
-                                              std::string* final_username = nullptr, bool derive_p2sh = true)
+                                              std::string* final_username = nullptr)
 {
     const std::vector<uint8_t> DOGE_V = {0x1e, 0x16, 0x71};
     std::map<uint32_t, std::string> m = explicit_addrs;
@@ -1941,8 +1941,7 @@ std::vector<unsigned char> master_doge_script(std::string username, std::string 
     }
     std::string atype;
     auto h = core::address_to_hash160(username, atype);
-    if (h.size() == 40 && (atype == "p2pkh" || atype == "p2wpkh" || (derive_p2sh && atype == "p2sh"))
-        && !m.count(98))
+    if (h.size() == 40 && (atype == "p2pkh" || atype == "p2wpkh" || atype == "p2sh") && !m.count(98))
         m[98] = username;
     if (final_username) *final_username = username;
     if (!m.count(98)) return {};
@@ -1979,11 +1978,10 @@ Login branch_login(const std::string& username, const std::string& merged_raw, b
 // second address that is not an address at all (bad checksum, junk, in the
 // comma or the slash form): the pre-change server wrote no DOGE address for
 // it (the share's DOGE weight then followed Tier 1.5); now, as p2pool does,
-// the chain gets the primary's hash160. And a P2SH primary's key is no longer
-// used on DOGE (a P2SH-P2WPKH script is anyone-can-spend there): without a
-// DOGE address of its own the chain gets none (the weight goes to the other
-// miners). A login whose payout address the pre-change server refused at the
-// door is now accepted and redistributed.
+// the chain gets the primary's hash160 (a P2SH primary's as P2SH, as before;
+// the login is warned when it may be segwit-wrapped). A login whose payout
+// address the pre-change server refused at the door is now accepted and
+// redistributed.
 TEST(MergedAuxStratumLogin, DogeOnlyPaysWhatItPaidForEveryLoginShape)
 {
     std::vector<unsigned char> p20(20, 0x42), p32(32, 0x43);
@@ -2039,21 +2037,8 @@ TEST(MergedAuxStratumLogin, DogeOnlyPaysWhatItPaidForEveryLoginShape)
             std::string p2pool_primary = u.primary;
             if (u.as_p2pool && !u.merged.empty() && u.primary == bad_ck(doge))
                 p2pool_primary = u.merged;
-            const auto want = u.as_p2pool ? master_doge_script(p2pool_primary, "", tn, {}, nullptr, false)
-                                          : master_doge_script(u.primary, u.merged, tn, u.expl, nullptr, false);
-            {
-                std::string final_user;
-                const auto before = master_doge_script(u.primary, u.merged, tn, u.expl, &final_user);
-                const auto before_np = u.as_p2pool ? master_doge_script(p2pool_primary, "", tn, {}, nullptr, true)
-                                                   : before;
-                if (want != before_np) {
-                    // only for a P2SH primary
-                    std::string at;
-                    core::address_to_hash160(u.as_p2pool ? p2pool_primary : final_user, at);
-                    EXPECT_EQ(at, "p2sh") << (tn ? "testnet " : "mainnet ") << u.name
-                                          << ": differs from the pre-change server for a non-P2SH primary";
-                }
-            }
+            const auto want = u.as_p2pool ? master_doge_script(p2pool_primary, "", tn, {})
+                                          : master_doge_script(u.primary, u.merged, tn, u.expl);
             const auto got = branch_login(u.primary, u.merged, tn, u.expl, {98}, 98);
             // The pre-change server refused at the door a login whose payout
             // address was neither LTC's nor DOGE's (#961); it is now accepted
@@ -2132,12 +2117,12 @@ TEST(MergedAuxStratumLogin, MultiAuxNeverGuessesNorRefuses)
     EXPECT_NE(r.warnings[0].find("not an address of any configured merged chain"), std::string::npos);
     r = branch_login(ltc, b58(48, 0x09), false, {}, {98}, 98);
     EXPECT_EQ(r.script, key(b58(48, 0x09)));
-    // an ambiguous primary (case 5): usable (the parent payout is its key);
-    // a P2SH key is not used on the merged chains: none of them gets an address
+    // an ambiguous primary (case 5): usable (the parent payout is its key),
+    // every chain its key (a P2SH: on V36 jobs; dropped on 3601 jobs)
     r = branch_login(b58(22, 0x55), "", false, {}, {98, 63}, 98);
     EXPECT_TRUE(r.usable);
-    EXPECT_TRUE(r.script.empty());
-    EXPECT_GE(r.warnings.size(), 2u);
+    EXPECT_EQ(r.script, key(b58(22, 0x55)));
+    EXPECT_FALSE(r.warnings.empty());
     // swapped DOGE,LTC with DOGE + PEP: DOGE's alone
     r = branch_login(b58(30, 0x21), ltc, false, {}, {98, 63}, 98);
     EXPECT_EQ(r.primary, ltc);
@@ -2587,11 +2572,11 @@ TEST(MergedAuxNodeFee, OperatorMergedScriptCascade)
     r = resolve_operator_merged_script("DOGE", AuxNetwork::mainnet, op_p2pkh, b58(113, 0x0c), "", don);
     EXPECT_EQ(r.script, core::hash160_to_merged_script(h160_of(op_p2pkh), "p2pkh"));
     EXPECT_FALSE(r.warning.empty());
-    // a P2SH operator key is not converted (P2SH-P2WPKH is anyone-can-spend on
-    // DOGE): the donation script, with a warning
+    // P2: P2SH operator stays P2SH (as before), with the segwit-wrapped warning
     r = resolve_operator_merged_script("DOGE", AuxNetwork::mainnet, op_p2sh, "", "", don);
-    EXPECT_EQ(r.script, don);
-    EXPECT_FALSE(r.warning.empty());
+    EXPECT_EQ(r.script.size(), 23u);
+    EXPECT_EQ(r.script[0], 0xa9);
+    EXPECT_NE(r.warning.find("segwit-wrapped"), std::string::npos) << r.warning;
     // P3: a P2WSH operator -> the donation script
     r = resolve_operator_merged_script("DOGE", AuxNetwork::mainnet,
                                        bech32::encode_segwit("ltc", 0, std::vector<unsigned char>(32, 0x44)), "", "", don);
@@ -2659,15 +2644,15 @@ TEST(MergedAuxNodeFee, RedistributedJobCarriesTheRecipientsMergedAddresses)
     merged = {{63, core::address_to_script(b58(56, 0x31))}};
     mi.decide_job_payout(payout, merged);
     EXPECT_EQ(merged, (Merged{{63, core::address_to_script(b58(56, 0x31))}, {98, floor}}));
-    // a P2SH recipient: paid as P2SH on LTC, no merged address written (a P2SH
-    // redeem script may be anyone-can-spend on DOGE)
+    // a P2SH recipient: paid as P2SH on LTC and on the merged chains (as before)
     h = h160_of(b58(50, 0x2c));
     type = 2;
     payout.clear();
     merged.clear();
     mi.decide_job_payout(payout, merged);
     EXPECT_EQ(payout, core::hash160_to_merged_script(h, "p2sh"));
-    EXPECT_TRUE(merged.empty());
+    const auto p2sh_floor = core::hash160_to_merged_script(h, "p2sh");
+    EXPECT_EQ(merged, (Merged{{63, p2sh_floor}, {98, p2sh_floor}}));
     // a usable payout: nothing added
     payout = core::address_to_script(b58(48, 0x01));
     merged.clear();
@@ -2676,10 +2661,12 @@ TEST(MergedAuxNodeFee, RedistributedJobCarriesTheRecipientsMergedAddresses)
     EXPECT_TRUE(merged.empty());
 }
 
-// A P2SH primary's key is not used on merged chains (P2SH-P2WPKH is
-// anyone-can-spend on DOGE) and the login is told to give a merged address; a
-// mistyped first address before a valid parent address pays the parent
-// address (as before); a merged chain's bech32 address as the whole login warns.
+// A P2SH primary: its merged chains are paid to the same P2SH script (as
+// before) and the login is warned to give its DOGE address if the P2SH is
+// segwit-wrapped (on DOGE such an output is anyone-can-spend once the redeem
+// script is public); a mistyped first address before a valid parent address
+// pays the parent address (as before); a merged chain's bech32 address as the
+// whole login warns.
 TEST(MergedAuxStratumLogin, P2shPrimaryNeedsAMergedAddress)
 {
     using namespace core::merged_addr;
@@ -2693,14 +2680,21 @@ TEST(MergedAuxStratumLogin, P2shPrimaryNeedsAMergedAddress)
     for (const auto& primary : {p2sh, legacy3}) {
         auto r = login(primary, "", {}, {98, 63});
         EXPECT_TRUE(r.usable_primary);
-        EXPECT_TRUE(r.addresses.empty()) << "no merged address from a P2SH key";
-        EXPECT_TRUE(r.p2sh_without_merged);
+        EXPECT_EQ(r.addresses.at(98), primary) << "auto-derived, as before";
+        EXPECT_EQ(r.addresses.at(63), primary);
+        EXPECT_TRUE(r.p2sh_derived);
         ASSERT_FALSE(r.warnings.empty());
         EXPECT_NE(r.warnings.back().find("P2SH"), std::string::npos);
         // with the addresses given: paid there, no warning
         r = login(primary, "", {{98, doge}, {63, b58(56, 0x31)}}, {98, 63});
-        EXPECT_FALSE(r.p2sh_without_merged);
+        EXPECT_FALSE(r.p2sh_derived);
         EXPECT_EQ(r.addresses.at(98), doge);
+    }
+    {
+        const auto w = login(p2sh, "", {}, {98}).warnings;
+        ASSERT_FALSE(w.empty());
+        EXPECT_NE(w.back().find("segwit-wrapped"), std::string::npos) << w.back();
+        EXPECT_NE(w.back().find("LTC_ADDRESS,DOGE_ADDRESS"), std::string::npos) << w.back();
     }
     // a P2WPKH primary is still auto-derived (its key is a plain key hash)
     EXPECT_EQ(login(bech32::encode_segwit("ltc", 0, std::vector<unsigned char>(20, 0x42)), "", {}, {98}).addresses.size(),

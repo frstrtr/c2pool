@@ -745,7 +745,7 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
         // being given to one by guessing), then each configured chain without
         // one reuses the primary's hash160.
         bool usable_primary = true;
-        bool p2sh_without_merged = false;
+        bool p2sh_derived = false;
         std::vector<unsigned char> parent_script;
         {
             auto res = core::merged_addr::resolve_merged_login(
@@ -761,7 +761,7 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
             merged_addresses_ = std::move(res.addresses);
             usable_primary = res.usable_primary;
             parent_script = std::move(res.parent_script);
-            p2sh_without_merged = res.p2sh_without_merged;
+            p2sh_derived = res.p2sh_derived;
             std::set<uint32_t> given(named_now);
             given.insert(carried.begin(), carried.end());
             given.insert(res.from_login.begin(), res.from_login.end());
@@ -846,8 +846,8 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
                                 << ": a P2WSH/P2TR address cannot be carried by a V36 share (20-byte payout "
                                    "hash): its LTC payout is redistributed (--redistribute); use a P2PKH or "
                                    "P2WPKH address";
-                } else if (p2sh_without_merged) {
-                    payout_warning_ = "P2SH address → give a merged address";
+                } else if (p2sh_derived) {
+                    payout_warning_ = "P2SH address: if segwit-wrapped, give a DOGE address";
                 }
             }
         }

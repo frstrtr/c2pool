@@ -2576,7 +2576,6 @@ public:
                 // Classify script type for diagnostics
                 auto classify = [](const std::vector<unsigned char>& s) -> const char* {
                     if (is_merged_key(s)) return "MERGED";
-                    if (is_unpaid_key(s)) return "UNPAID";
                     if (s.size() == 25 && s[0] == 0x76 && s[1] == 0xa9) return "P2PKH";
                     if (s.size() == 23 && s[0] == 0xa9) return "P2SH";
                     if (s.size() == 22 && s[0] == 0x00 && s[1] == 0x14) return "P2WPKH-RAW";
@@ -2634,14 +2633,14 @@ public:
     //
     //   chain_id == nullopt : hash / v36 path — no merged-address resolution.
     //   chain_id has value  : per-chain path, by the share's version
-    //                         (share_check.hpp, above UNPAID_KEY_PREFIX):
+    //                         (share_check.hpp, above MERGED_KEY_PREFIX):
     //                         V36  — Tier 1 explicit merged_addresses, Tier 1.5
     //                                retroactive miner→merged lookup (normalize
     //                                used only as a lookup PROBE), else the
     //                                default key;
-    //                         3601 — Tier 1, else merged_parent_key (the parent
-    //                                script, or UNPAID: for a P2SH one). Never
-    //                                another share's address.
+    //                         3601 — Tier 1, else the default key (its own
+    //                                parent script). Never another share's
+    //                                address.
     //
     // Pre-V36 shares count toward window sizing but contribute zero weight
     // (p2pool returns (1, {}, 0, 0)); total_weight/donation are only set once a
@@ -2698,13 +2697,8 @@ public:
                         }
                     }
                 }
-                // 3601 shares: no Tier 1.5; the share's own parent key, unless
-                // it is a P2SH (no safe merged form: spread over the other
-                // payees, share_check.hpp merged_parent_key).
-                else if (weight_key.empty())
-                {
-                    weight_key = merged_parent_key(parent_script);
-                }
+                // 3601 shares: no Tier 1.5 — the share's own parent script
+                // (the default key below).
             }
         }
 
@@ -2894,7 +2888,6 @@ public:
                 aux_unlimited.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
                 auto classify_aux = [](const std::vector<unsigned char>& s) -> const char* {
                     if (is_merged_key(s)) return "MERGED";
-                    if (is_unpaid_key(s)) return "UNPAID";
                     if (s.size() == 25 && s[0] == 0x76 && s[1] == 0xa9) return "P2PKH";
                     if (s.size() == 23 && s[0] == 0xa9) return "P2SH";
                     if (s.size() == 22 && s[0] == 0x00 && s[1] == 0x14) return "P2WPKH-RAW";

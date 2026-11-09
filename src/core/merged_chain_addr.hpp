@@ -128,9 +128,9 @@ struct LoginResolution {
     // as the second one: the parent payout is that address's hash160 (P2SH
     // stays P2SH).
     std::vector<unsigned char> parent_script;
-    // A P2SH primary left some configured chain without an address (its key
-    // is not auto-derived): shown with the worker.
-    bool p2sh_without_merged{false};
+    // A P2SH primary's key was auto-derived for some configured chain (paid
+    // as P2SH; unsafe if segwit-wrapped): shown with the worker.
+    bool p2sh_derived{false};
     std::vector<std::string> notes;              // for the log
     std::vector<std::string> warnings;           // for the log, at warning level
 };
@@ -283,34 +283,29 @@ inline LoginResolution resolve_merged_login(std::string primary, const std::stri
 
     if (r.usable_primary) {
         // Auto-derive: each configured chain without an address reuses the
-        // primary's key (the same key spends on both chains) as P2PKH. Not a
-        // P2SH primary: the redeem script behind it is unknown, and a
-        // P2SH-P2WPKH one is anyone-can-spend on a chain without segwit (DOGE);
-        // its merged chains need an address of their own. Without one, a V36
-        // share still pays the parent key as a P2SH (the V36 rule), and from
-        // the share version 3601 flag day the reward goes to the other miners
-        // (ltc share_check.hpp merged_parent_key).
+        // primary's hash160 (the same key spends on both chains): P2PKH and
+        // P2WPKH as P2PKH, a P2SH as the chain's P2SH. Right for a legacy
+        // P2SH; a segwit-wrapped one (P2SH-P2WPKH / P2WSH, an LTC "M..."
+        // address) becomes spendable by anyone on a chain without segwit
+        // (DOGE) once its redeem script is public: the login is warned.
         std::string atype;
         const auto h160 = core::address_to_hash160(primary, atype);
-        if (h160.size() == 40 && (atype == "p2pkh" || atype == "p2wpkh")) {
+        if (h160.size() == 40 && (atype == "p2pkh" || atype == "p2wpkh" || atype == "p2sh")) {
+            std::string derived;
             for (const auto* c : conf)
                 if (!r.addresses.count(c->chain_id)) {
                     r.addresses[c->chain_id] = primary;
                     r.notes.push_back("auto-derived merged address for chain_id=" + std::to_string(c->chain_id)
                                       + " from primary " + atype + " address");
+                    derived += (derived.empty() ? "" : " and ") + std::to_string(c->chain_id);
                 }
-        } else if (h160.size() == 40 && atype == "p2sh") {
-            std::string missing;
-            for (const auto* c : conf)
-                if (!r.addresses.count(c->chain_id))
-                    missing += (missing.empty() ? "" : " and ") + std::to_string(c->chain_id);
-            if (!missing.empty()) {
-                r.p2sh_without_merged = true;
-                r.warnings.push_back("primary " + primary + " is a P2SH address: no merged address is derived "
-                                     "from it (a P2SH-P2WPKH script is anyone-can-spend on a chain without "
-                                     "segwit); chain(s) " + missing + " get no address, and from the share "
-                                     "version 3601 flag day their reward goes to the other miners — give one: "
-                                     "PRIMARY,MERGEDADDR or PRIMARY/CHAIN_ID:ADDRESS");
+            if (atype == "p2sh" && !derived.empty()) {
+                r.p2sh_derived = true;
+                r.warnings.push_back("primary " + primary + " is a P2SH address, paid as the same P2SH on "
+                                     "merged chain(s) " + derived + ": if this is a segwit-wrapped wallet "
+                                     "address (P2SH-P2WPKH/P2WSH, e.g. M...), give your DOGE address "
+                                     "explicitly (LTC_ADDRESS,DOGE_ADDRESS); on DOGE (no segwit) such an "
+                                     "output becomes spendable by anyone once the redeem script is public");
             }
         }
     } else if (!primary.empty()) {

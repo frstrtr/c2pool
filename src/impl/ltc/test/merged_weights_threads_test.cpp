@@ -857,9 +857,9 @@ TEST(MergedWeightsThreads, EveryTrackerCopyTakesTheCacheLock)
 // The merged rule by share version. V36 shares keep Tier 1 / Tier 1.5 / the
 // parent script (P2SH as P2SH) — the shares in the window at the flag day
 // keep their payouts. 3601 shares (FLAG_DAY_SHARE_VERSION) are resolved from
-// themselves only: their own merged address, else their own P2PKH / P2WPKH
-// parent key; a P2SH parent key pays no one (its weight is spread). A 3601
-// share neither feeds nor uses Tier 1.5. The scenarios:
+// themselves only: their own merged address, else their own parent key
+// (P2PKH / P2WPKH as P2PKH, P2SH as P2SH). A 3601 share neither feeds nor
+// uses Tier 1.5. The scenarios:
 // S5 (one share registers another miner's parent script with the attacker's
 // DOGE address) and S3 (nodes that received the same shares in different
 // orders).
@@ -1059,39 +1059,37 @@ TEST(MergedPerShareRule, V36SharesKeepTheirRuleAcrossTheFlagDay)
     EXPECT_EQ(a.compute_merged_payout_hash(ta, block_target), b.compute_merged_payout_hash(tb, block_target));
 }
 
-// A P2SH parent script with no merged address of its own: a V36 share pays it
-// as a P2SH (the V36 rule, unchanged); a 3601 share pays no one (P2SH-P2WPKH
-// is anyone-can-spend on DOGE): its weight is left out of the accepted total,
-// so it is spread over the other payees. With an explicit merged address the
-// same miner is paid there; the pool's donation script is paid as itself.
-TEST(MergedPerShareRule, A3601P2shParentIsNotConvertedItsWeightIsSpread)
+// A P2SH parent script with no merged address of its own is paid as the
+// merged chain's P2SH of the same hash160 by both versions (a legacy P2SH,
+// the pool's 1-of-2 multisig donation script among them, spends there). The
+// difference is Tier 1.5: a V36 share takes the address another V36 share of
+// the same parent script named; a 3601 share pays its own P2SH.
+TEST(MergedPerShareRule, A3601P2shParentIsPaidAsP2shWithoutTier15)
 {
     const std::vector<RuleShare> chain = {
         {1, 0, 1, {}, 0},
         {2, 1, 9, {}, 2},                              // P2SH, no merged address
         {3, 2, 2, {{kDoge, miner_p2pkh(2)}}, 0},
-        {4, 3, 9, {{kDoge, p2pkh_script(0x99)}}, 2},   // P2SH with a DOGE address
+        {4, 3, 9, {{kDoge, p2pkh_script(0x99)}}, 2},   // the same P2SH with a DOGE address
     };
     uint288 accepted;
     const auto w = doge_weights(chain, {1, 2, 3, 4}, 4, &accepted);
-    EXPECT_EQ(w.size(), 3u) << "miner 1, miner 2 and miner 9's named DOGE address; nothing for the P2SH key";
     const uint288 one = w.at(miner_p2pkh(1));
+    EXPECT_EQ(w.at(miner_p2sh(9)), one) << "3601: share 2 pays its own P2SH";
+    EXPECT_EQ(w.at(p2pkh_script(0x99)), one) << "share 4: its own DOGE address";
     EXPECT_EQ(w.at(miner_p2pkh(2)), one);
-    EXPECT_EQ(w.at(p2pkh_script(0x99)), one);
-    EXPECT_EQ(accepted, one + one + one) << "the address-less P2SH share is not in the accepted total";
-    // V36 (unchanged): share 2 takes miner 9's DOGE address from share 4
-    // (Tier 1.5); without share 4 it pays the P2SH parent key as a DOGE P2SH.
-    uint288 accepted36;
-    const auto w36 = doge_weights(as_version(chain, false), {1, 2, 3, 4}, 4, &accepted36);
+    EXPECT_EQ(accepted, one + one + one + one) << "every share has a payee";
+    // V36 (unchanged): share 2 takes miner 9's DOGE address from share 4 (Tier 1.5)
+    const auto w36 = doge_weights(as_version(chain, false), {1, 2, 3, 4}, 4);
     EXPECT_EQ(w36.at(p2pkh_script(0x99)), one + one);
-    EXPECT_EQ(accepted36, one + one + one + one);
+    EXPECT_EQ(w36.count(miner_p2sh(9)), 0u);
+    // without share 4 both versions pay the P2SH key as a DOGE P2SH
     const auto w36b = doge_weights(as_version({chain[0], chain[1], chain[2]}, false), {1, 2, 3}, 3);
-    EXPECT_EQ(w36b.at(miner_p2sh(9)), one) << "V36: the P2SH parent key as a DOGE P2SH";
+    EXPECT_EQ(w36b.at(miner_p2sh(9)), one);
+    const auto wb = doge_weights({chain[0], chain[1], chain[2]}, {1, 2, 3}, 3);
+    EXPECT_EQ(wb, w36b);
     const std::vector<unsigned char> don(ltc::PoolConfig::COMBINED_DONATION_SCRIPT.begin(),
                                          ltc::PoolConfig::COMBINED_DONATION_SCRIPT.end());
-    EXPECT_EQ(ltc::merged_parent_key(don), don);
-    EXPECT_EQ(ltc::resolve_merged_payout_script(ltc::merged_parent_key(don)), don);
-    EXPECT_TRUE(ltc::resolve_merged_payout_script(ltc::merged_parent_key(miner_p2sh(9))).empty());
-    EXPECT_EQ(ltc::merged_parent_key(miner_p2pkh(1)), miner_p2pkh(1));
-    EXPECT_EQ(ltc::resolve_merged_payout_script(miner_p2sh(9)), miner_p2sh(9)) << "a raw (V36) P2SH key";
+    EXPECT_EQ(ltc::resolve_merged_payout_script(don), don);
+    EXPECT_EQ(ltc::resolve_merged_payout_script(miner_p2sh(9)), miner_p2sh(9));
 }
