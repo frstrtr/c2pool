@@ -7,6 +7,7 @@
 #include <cassert>
 #include <c2pool_build_version.h>
 #endif
+#include <core/share_format_vote.hpp>
 // c2pool-btc — Bitcoin embedded SPV p2pool node.
 //
 // PR-B2-net (focused header-sync entry point).
@@ -3004,7 +3005,7 @@ int main(int argc, char* argv[])
                         using T = std::remove_pointer_t<decltype(s)>;
                         ++total;
                         version_counts[std::to_string(static_cast<int>(T::version))]++;
-                        desired_counts[std::to_string(static_cast<int>(s->m_desired_version))]++;
+                        desired_counts[std::to_string(static_cast<int>(core::share_format_vote(s->m_desired_version)))]++;
                         int si = static_cast<int>(s->m_stale_info);
                         if (si == 253) ++orphan; else if (si == 254) ++dead;
                         auto target = chain::bits_to_target(s->m_bits);
@@ -3018,7 +3019,7 @@ int main(int argc, char* argv[])
                         if (i >= skip_cnt && i < skip_cnt + sample_cnt) {
                             auto att = chain::target_to_average_attempts(target);
                             sampling_weights[std::to_string(
-                                static_cast<int>(s->m_desired_version))] +=
+                                static_cast<int>(core::share_format_vote(s->m_desired_version)))] +=
                                 static_cast<double>(att.GetLow64());
                         }
                     });

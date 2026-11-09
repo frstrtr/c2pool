@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
+#include <core/share_format_vote.hpp>
 
 // Portable 128-bit multiply-shift: (a * b) >> shift
 // GCC/Clang have __uint128_t; MSVC uses _umul128 intrinsic.
@@ -2395,7 +2396,7 @@ public:
         for (auto [hash, data] : view)
         {
             uint64_t dv = 0;
-            data.share.invoke([&](auto* obj) { dv = obj->m_desired_version; });
+            data.share.invoke([&](auto* obj) { dv = core::share_format_vote(obj->m_desired_version); });
             counts[dv]++;
         }
         return counts;
@@ -2423,7 +2424,7 @@ public:
         for (auto [hash, data] : view)
         {
             uint64_t dv = 0;
-            data.share.invoke([&](auto* obj) { dv = obj->m_desired_version; });
+            data.share.invoke([&](auto* obj) { dv = core::share_format_vote(obj->m_desired_version); });
             auto* idx = chain.get_index(hash);
             if (idx)
                 weights[dv] = weights[dv] + idx->work;

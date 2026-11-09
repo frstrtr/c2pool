@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
+#include <core/share_format_vote.hpp>
 
 // AutoRatchet: autonomous share version transition state machine.
 //
@@ -225,7 +226,7 @@ public:
             ++total;
             const int32_t depth = total - 1;
             data.share.invoke([&](auto* obj) {
-                if (static_cast<int64_t>(obj->m_desired_version) >= target_version_) {
+                if (static_cast<int64_t>(core::share_format_vote(obj->m_desired_version)) >= target_version_) {
                     ++target_votes;
                     const bool is_local = (obj->peer_addr == NetService{"0.0.0.0", 0} ||
                                            obj->peer_addr == NetService{});

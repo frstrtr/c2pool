@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
+#include <core/share_format_vote.hpp>
 
 // AutoRatchet: autonomous share version transition state machine.
 //
@@ -112,7 +113,7 @@ public:
         {
             ++total;
             data.share.invoke([&](auto* obj) {
-                if (static_cast<int64_t>(obj->m_desired_version) >= target_version_)
+                if (static_cast<int64_t>(core::share_format_vote(obj->m_desired_version)) >= target_version_)
                     ++target_votes;
                 if (static_cast<int64_t>(std::remove_pointer_t<decltype(obj)>::version) >= target_version_)
                     ++target_shares;

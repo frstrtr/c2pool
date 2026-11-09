@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
+#include <core/share_format_vote.hpp>
 
 // Portable 128-bit multiply-shift: (a * b) >> shift
 // GCC/Clang have __uint128_t; MSVC uses _umul128 intrinsic.
@@ -2492,7 +2493,7 @@ public:
         for (auto [hash, data] : view)
         {
             uint64_t dv = 0;
-            data.share.invoke([&](auto* obj) { dv = obj->m_desired_version; });
+            data.share.invoke([&](auto* obj) { dv = core::share_format_vote(obj->m_desired_version); });
             counts[dv]++;
         }
         return counts;
@@ -2521,7 +2522,7 @@ public:
         for (auto [hash, data] : view)
         {
             uint64_t dv = 0;
-            data.share.invoke([&](auto* obj) { dv = obj->m_desired_version; });
+            data.share.invoke([&](auto* obj) { dv = core::share_format_vote(obj->m_desired_version); });
             auto* idx = chain.get_index(hash);
             if (idx)
                 weights[dv] = weights[dv] + idx->work;
@@ -2672,10 +2673,11 @@ public:
                 // Tier 1.5: retroactive lookup of the same miner's explicit merged
                 // address from their other shares.  Try the raw parent script, then
                 // its normalized P2PKH form (normalize is a lookup PROBE only here).
-                // Only for shares of the old rule (desired_version < 37,
-                // MERGED_OWN_ADDRESS_DESIRED_VERSION): a newer share without an
-                // address for the chain pays its own parent script.
-                if (weight_key.empty() && obj->m_desired_version < MERGED_OWN_ADDRESS_DESIRED_VERSION)
+                // Only for shares of the old rule (share_check.hpp
+                // merged_own_address_rule: not desired_version 3601..3699): a
+                // newer share without an address for the chain pays its own
+                // parent script.
+                if (weight_key.empty() && !merged_own_address_rule(obj->m_desired_version))
                 {
                     auto table_it = m_miner_merged_addr.find(*chain_id);
                     if (table_it != m_miner_merged_addr.end())

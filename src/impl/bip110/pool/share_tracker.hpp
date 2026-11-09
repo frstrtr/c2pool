@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
+#include <core/share_format_vote.hpp>
 
 // Self-contained prerequisites: the BTC lane relied on include-order luck (this
 // header only ever reached the compiler AFTER node.cpp had already pulled cstdint
@@ -2312,7 +2313,7 @@ public:
         for (auto [hash, data] : view)
         {
             uint64_t dv = 0;
-            data.share.invoke([&](auto* obj) { dv = obj->m_desired_version; });
+            data.share.invoke([&](auto* obj) { dv = core::share_format_vote(obj->m_desired_version); });
             counts[dv]++;
         }
         return counts;
@@ -2340,7 +2341,7 @@ public:
         for (auto [hash, data] : view)
         {
             uint64_t dv = 0;
-            data.share.invoke([&](auto* obj) { dv = obj->m_desired_version; });
+            data.share.invoke([&](auto* obj) { dv = core::share_format_vote(obj->m_desired_version); });
             auto* idx = chain.get_index(hash);
             if (idx)
                 weights[dv] = weights[dv] + idx->work;

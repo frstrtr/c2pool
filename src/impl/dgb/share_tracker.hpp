@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
+#include <core/share_format_vote.hpp>
 
 #include <cstdint>
 
@@ -2358,7 +2359,7 @@ public:
         for (auto [hash, data] : chain.get_chain(share_hash, actual))
         {
             uint64_t dv = 0;
-            data.share.invoke([&](auto* obj) { dv = obj->m_desired_version; });
+            data.share.invoke([&](auto* obj) { dv = core::share_format_vote(obj->m_desired_version); });
             window.push_back(dv);
         }
         return dgb::accumulate_version_counts(window);
@@ -2398,7 +2399,7 @@ public:
         for (auto [hash, data] : chain.get_chain(share_hash, actual))
         {
             uint64_t dv = 0;
-            data.share.invoke([&](auto* obj) { dv = obj->m_desired_version; });
+            data.share.invoke([&](auto* obj) { dv = core::share_format_vote(obj->m_desired_version); });
             auto* idx = chain.get_index(hash);
             if (idx)
                 window.push_back({dv, idx->work});

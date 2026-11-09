@@ -29,6 +29,7 @@
 //       it; getMinerVersion tallies s.V, so without it the column reads 0.
 
 #pragma once
+#include <core/share_format_vote.hpp>
 
 #include "share_tracker.hpp"                 // bip110::pool::ShareTracker
 #include "share_check.hpp"                    // bip110::pool::get_share_script
@@ -90,7 +91,7 @@ inline nlohmann::json sharechain_window_report(
                         s["t"]  = obj->m_timestamp;
                         s["b"]  = obj->m_bits;
                         s["a"]  = obj->m_absheight;
-                        s["dv"] = obj->m_desired_version;
+                        s["dv"] = core::share_format_vote(obj->m_desired_version);   // 3601 -> 36
                         // (b) native share version — BTC omits this; the V36?
                         // column tallies s.V.
                         s["V"]  = static_cast<int>(obj->version);

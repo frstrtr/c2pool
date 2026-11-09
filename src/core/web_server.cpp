@@ -4,6 +4,7 @@
 #include "web_server.hpp"
 #include "stratum_server.hpp"
 #include <cctype>     // rewrite_payout_scheme_label: identifier-character test
+#include <core/share_format_vote.hpp>
 #include <algorithm>   // std::max — authorship only ever climbs, never downgrades
 #include <cctype>      // std::tolower — /found_block/<hash> case-folding
 #include <memory>
@@ -7813,7 +7814,7 @@ nlohmann::json MiningInterface::rest_version_signaling(const nlohmann::json* cac
     if (sc.contains("shares_by_version") && sc["shares_by_version"].is_object()) {
         auto& sv = sc["shares_by_version"];
         for (auto& [ver, count] : sv.items()) {
-            int v = std::stoi(ver);
+            int v = static_cast<int>(core::share_format_vote(static_cast<uint64_t>(std::stoi(ver))));
             int c = count.get<int>();
             auto it = share_type_names.find(v);
             std::string name = (it != share_type_names.end()) ? it->second : "V" + ver;
@@ -7839,7 +7840,7 @@ nlohmann::json MiningInterface::rest_version_signaling(const nlohmann::json* cac
     if (sc.contains("shares_by_desired_version") && sc["shares_by_desired_version"].is_object()) {
         auto& dv = sc["shares_by_desired_version"];
         for (auto& [ver, count] : dv.items()) {
-            int v = std::stoi(ver);
+            int v = static_cast<int>(core::share_format_vote(static_cast<uint64_t>(std::stoi(ver))));
             int c = count.get<int>();
             double pct = overall_total > 0 ? (c * 100.0 / overall_total) : 0;
             full_chain_versions[ver] = {{"count", c}, {"percentage", pct}};
@@ -7871,14 +7872,14 @@ nlohmann::json MiningInterface::rest_version_signaling(const nlohmann::json* cac
     if (sc.contains("sampling_desired_version") && sc["sampling_desired_version"].is_object()) {
         versions_json = nlohmann::json::object();
         for (auto& [ver, weight] : sc["sampling_desired_version"].items()) {
-            int v = std::stoi(ver);
+            int v = static_cast<int>(core::share_format_vote(static_cast<uint64_t>(std::stoi(ver))));
             double w = weight.get<double>();
             sampling_total_weight += w;
             if (v >= TARGET_VERSION) sampling_v36_weight += w;
         }
         // Build versions_json with percentages from work weights
         for (auto& [ver, weight] : sc["sampling_desired_version"].items()) {
-            int v = std::stoi(ver);
+            int v = static_cast<int>(core::share_format_vote(static_cast<uint64_t>(std::stoi(ver))));
             double w = weight.get<double>();
             double pct = sampling_total_weight > 0 ? (w * 100.0 / sampling_total_weight) : 0;
             versions_json[ver] = {{"weight", w}, {"percentage", pct}};
@@ -8779,7 +8780,7 @@ nlohmann::json MiningInterface::rest_pplns_current()
                 if (eit->second.version > 0)
                     m["version"] = eit->second.version;
                 if (eit->second.desired_version > 0)
-                    m["desired_version"] = eit->second.desired_version;
+                    m["desired_version"] = core::share_format_vote(eit->second.desired_version);
                 if (eit->second.last_share_at > 0)
                     m["last_share_at"] = static_cast<int64_t>(eit->second.last_share_at);
             }
@@ -8971,7 +8972,7 @@ nlohmann::json MiningInterface::rest_pplns_miner(const std::string& address)
             nlohmann::json entry;
             entry["t"]       = p.t;
             entry["version"] = p.v;
-            if (p.dv > 0) entry["desired_version"] = p.dv;
+            if (p.dv > 0) entry["desired_version"] = core::share_format_vote(p.dv);
             vh.push_back(std::move(entry));
             prev_v  = p.v;
             prev_dv = p.dv;
