@@ -1852,6 +1852,20 @@ private:
     // share. False while none could be computed (the tracker was busy at a new
     // best share): jobs then recompute, and never build on the cached outputs.
     bool m_cached_pplns_valid{false};
+    // What the cached split was computed for besides the best share: its
+    // amounts depend on the template's coinbase value and bits and on the
+    // donation script, so it is only reused for the same best share AND the
+    // same three (a new block or a fee change at the same best share needs a
+    // new split). Guarded by m_work_mutex.
+    uint64_t m_cached_pplns_value{0};
+    std::string m_cached_pplns_bits;
+    std::vector<unsigned char> m_cached_pplns_donation;
+    bool cached_pplns_matches(const uint256& best, uint64_t value, const std::string& bits,
+                              const std::vector<unsigned char>& donation) const
+    {
+        return m_cached_pplns_valid && m_cached_pplns_best_share == best && m_cached_pplns_value == value
+            && m_cached_pplns_bits == bits && m_cached_pplns_donation == donation;
+    }
     // Jobs not built because the sharechain was busy (CoinbaseResult::held),
     // and refreshes that found no valid PPLNS: /local_stats-free counters, logged.
     mutable std::atomic<uint64_t> m_jobs_held{0};

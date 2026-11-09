@@ -167,8 +167,10 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
     # any coinbase and does not poison the cached (best, outputs) pair (jobs
     # are held, CoinbaseResult::held); busy at the same share reuses the last
     # valid split; an empty sharechain pays the donation (genesis rule);
-    # solo / custodial pay their split. Same fold-into-core_test reasoning as
-    # every TU here.
+    # solo / custodial pay their split; a cached split is only reused at the
+    # coinbase value, bits and donation it was computed for (also with a
+    # refresher racing four job builders). Same fold-into-core_test reasoning
+    # as every TU here.
     # web_server_utxo_scan_test.cpp: GET /api/utxo/scan's web-server half (the
     # dedicated scan thread, one at a time, the interval, the wait cap, the
     # direct-local gate). Same fold-into-core_test reasoning as every TU here.
