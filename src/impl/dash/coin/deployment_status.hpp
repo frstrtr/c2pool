@@ -395,10 +395,16 @@ private:
     /// A latch clears when the recomputed (unlatched) answer agrees with the
     /// chain both at the latched block and at the block just checked (the
     /// tracker caught up or rewound, e.g. after a reorg).
+    ///
+    /// When the latched block has left our best chain, its statement no
+    /// longer counts: the latch clears at the first cross-check at or above
+    /// the latched height whose recomputed answer agrees with the chain (until
+    /// then the latch keeps the refuted answer from being served).
     void maybe_clear_latch(uint32_t height, bool chain_active_here)
     {
         uint32_t lh;
         bool lactive;
+        uint256 lhash;
         {
             std::lock_guard<std::mutex> lk(m_latch_mutex);
             if (m_latch == V24Latch::NONE) return;
@@ -407,9 +413,28 @@ private:
             if (m_latch_invalid_version) return;
             lh = m_latch_height;
             lactive = m_latch_chain_active;
+            lhash = m_latch_hash;
+        }
+        const auto now  = compute(height, DashDeployment::V24);
+        if (!lhash.IsNull()) {
+            const auto b = m_chain(lh);
+            if (b && b->hash != lhash) {   // the latched block was reorged out
+                if (height < lh || now.active == V24State::UNKNOWN) return;
+                if ((now.active == V24State::ACTIVE) != chain_active_here) return;
+                {
+                    std::lock_guard<std::mutex> lk(m_latch_mutex);
+                    m_latch = V24Latch::NONE;
+                    m_latch_hash.SetNull();
+                    ++m_latch_version;
+                }
+                LOG_WARNING << "[DASH-V24] cross-check latch CLEARED at h=" << height
+                            << ": the block that set it (h=" << lh << ") left our best chain and the recomputed"
+                               " v24 state agrees with the chain at h="
+                            << height;
+                return;
+            }
         }
         const auto then = compute(lh, DashDeployment::V24);
-        const auto now  = compute(height, DashDeployment::V24);
         if (then.active == V24State::UNKNOWN || now.active == V24State::UNKNOWN) return;
         if ((then.active == V24State::ACTIVE) != lactive) return;
         if ((now.active == V24State::ACTIVE) != chain_active_here) return;
@@ -433,12 +458,15 @@ private:
     }
 
 public:
-    /// Clear the latch when the block that set it is no longer on our best
-    /// chain (reorged out, orphaned): our chain view holds a different block
-    /// at that height. While that block is on the best chain (or the view
-    /// cannot tell: no header there yet, a record without a hash) the latch
-    /// stays. Called on every cross-check and by the node after it restores
-    /// a persisted latch.
+    /// Clear a latch set by a CbTx version Core rejects once the block that
+    /// set it is no longer on our best chain (reorged out, orphaned): our
+    /// chain view holds a different block at that height. While that block is
+    /// on the best chain (or the view cannot tell: no header there yet, a
+    /// record without a hash) the latch stays. A latch set by a valid block
+    /// (our answer was refuted) is not cleared here: it waits for a
+    /// cross-check that agrees (maybe_clear_latch), so the refuted answer is
+    /// never served in between. Called on every cross-check and by the node
+    /// after it restores a persisted latch.
     void revalidate_latch()
     {
         if (m_closed.load()) return;
@@ -446,7 +474,7 @@ public:
         uint256 lhash;
         {
             std::lock_guard<std::mutex> lk(m_latch_mutex);
-            if (m_latch == V24Latch::NONE || m_latch_hash.IsNull()) return;
+            if (m_latch == V24Latch::NONE || m_latch_hash.IsNull() || !m_latch_invalid_version) return;
             lh = m_latch_height;
             lhash = m_latch_hash;
         }
@@ -454,7 +482,7 @@ public:
         if (!b || b->hash == lhash) return;
         {
             std::lock_guard<std::mutex> lk(m_latch_mutex);
-            if (m_latch == V24Latch::NONE || m_latch_hash != lhash) return;
+            if (m_latch == V24Latch::NONE || m_latch_hash != lhash || !m_latch_invalid_version) return;
             m_latch = V24Latch::NONE;
             m_latch_hash.SetNull();
             m_latch_invalid_version = false;

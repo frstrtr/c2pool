@@ -8215,9 +8215,10 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     && v24_status->latch() != dash::coin::V24Latch::NONE) {
                     LOG_WARNING << "[DASH-V24] cross-check latch RESTORED from " << latch_path
                                 << ": " << ss.str();
-                    // The block that set it may have left our best chain
-                    // while we were down (reorged out, orphaned): then the
-                    // latch clears now, and the record with it.
+                    // A latch set by a CbTx version Core rejects clears now
+                    // if that block left our best chain while we were down
+                    // (reorged out, orphaned), and the record with it; one set
+                    // by a valid block waits for a cross-check that agrees.
                     v24_status->revalidate_latch();
                     if (v24_status->latch() == dash::coin::V24Latch::NONE) {
                         const std::string tmp = latch_path + ".tmp";

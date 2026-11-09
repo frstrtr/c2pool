@@ -1473,13 +1473,17 @@ TEST(DashV24Deployments, CrossCheckLatchRecordKnowsItsBlockAcrossARestart)
         again.revalidate_latch();
         EXPECT_NE(again.latch(), V24Latch::NONE);
     }
-    // Restart after the block was orphaned while we were down: cleared at once.
+    // Restart after the block was orphaned while we were down: a latch from
+    // a valid block (our answer refuted) stays until a cross-check at or above
+    // its height agrees with the recomputed answer.
     f.c.salt[55] = 0x66;
     {
         DashDeploymentStatus again(f.p, f.c.fn(), [&f] { return std::optional<uint32_t>(f.tip); }, f.t);
         ASSERT_TRUE(again.deserialize_latch(rec));
         ASSERT_NE(again.latch(), V24Latch::NONE);
         again.revalidate_latch();
+        EXPECT_NE(again.latch(), V24Latch::NONE);
+        EXPECT_EQ(again.cross_check_cbtx_version(56, f.c.at(56)->hash, 3), V24CrossCheck::AGREE);
         EXPECT_EQ(again.latch(), V24Latch::NONE);
     }
     // A record from before v2 (no block hash) still loads and stays latched
@@ -1495,6 +1499,38 @@ TEST(DashV24Deployments, CrossCheckLatchRecordKnowsItsBlockAcrossARestart)
     DashDeploymentStatus bad(f.p, f.c.fn(), [&f] { return std::optional<uint32_t>(f.tip); }, f.t);
     EXPECT_FALSE(bad.deserialize_latch("v24_latch v2 " + std::to_string(static_cast<int>(f.p.network))
                                        + " 1 55 1 0 0 1 xyz 0\n"));
+}
+
+// N4: a latch set by a VALID block that refuted our answer (the tracker was
+// wrong) is not cleared by that block's reorg alone: the refuted answer must
+// not be served until a cross-check at or above the latched height agrees.
+TEST(DashV24Deployments, LatchFromAValidBlockWaitsForAnAgreeingCrossCheck)
+{
+    LatchFixture f(true);   // signal at 25: our tracker says v24 is active from 50
+    ASSERT_EQ(f.st->v24_state(56), V24State::ACTIVE);
+    // A valid block at 55 states inactive: our answer is refuted.
+    ASSERT_EQ(f.st->cross_check_cbtx_version(55, f.c.at(55)->hash, 3), V24CrossCheck::CONTRADICTS);
+    ASSERT_NE(f.st->latch(), V24Latch::NONE);
+    EXPECT_NE(f.st->v24_state(56), V24State::ACTIVE);
+    // That block is reorged out: the latch stays, the refuted answer is not served.
+    f.c.salt[55] = 0x44;
+    f.st->revalidate_latch();
+    EXPECT_NE(f.st->latch(), V24Latch::NONE);
+    EXPECT_NE(f.st->v24_state(56), V24State::ACTIVE);
+    // The next block on the new branch also states inactive: our recomputed
+    // answer is still refuted there, so the latch stays (and the latched
+    // state answers nothing).
+    EXPECT_EQ(f.st->cross_check_cbtx_version(56, f.c.at(56)->hash, 3), V24CrossCheck::UNDECIDED);
+    EXPECT_NE(f.st->latch(), V24Latch::NONE);
+    // A branch whose blocks agree with the recomputed answer clears it at the
+    // first agreeing cross-check at or above the latched height.
+    f.c.salt[56] = 0x45;
+    EXPECT_EQ(f.st->cross_check_cbtx_version(54, f.c.at(54)->hash, 4), V24CrossCheck::UNDECIDED)
+        << "below the latched height: no clearing";
+    EXPECT_NE(f.st->latch(), V24Latch::NONE);
+    EXPECT_EQ(f.st->cross_check_cbtx_version(57, f.c.at(57)->hash, 4), V24CrossCheck::AGREE);
+    EXPECT_EQ(f.st->latch(), V24Latch::NONE);
+    EXPECT_EQ(f.st->v24_state(58), V24State::ACTIVE);
 }
 
 // A CbTx version Dash Core rejects at that height (CheckCbTx) disagrees with

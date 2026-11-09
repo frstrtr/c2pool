@@ -2730,4 +2730,124 @@ TEST(DashV24AllTx, TheBinaryIsOneBlsMode)
     EXPECT_EQ(v::bls_modes(), v::kBlsModeBackend);
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// A real mainnet ProRegTx that dashd's template carried and ours did not
+// (h=2,569,332, the live parity run): b7f443dc..., version 2, reusing the
+// external collateral of the PoSe-banned masternode 65449761... (Core removes
+// that masternode and adds the new one; same service address, allowed for the
+// same collateral). It never reached our node before the block (relay timing,
+// see the round-5 note); this KAT pins that our pipeline takes it when it
+// does: Dash Core's checks (the collateral key's signature over the sign
+// string included), mempool admission, selection, and the fold with the
+// replacement, whose root equals the block-connect fold.
+// ════════════════════════════════════════════════════════════════════════════
+
+namespace {
+const char* kMainProReg =
+    "03000100018ea9377438672d711a3e9eed5ff7147a0104d4f2e56cc7e0cba57d0dde501340020000006a47304402200c11ec"
+    "cf0ef45fe52dd147ab41e794ee9d20d7103f83ae2fd48871c9c843491102204f25899250b4b4abdebc7ce7c2d4ba3b56a985"
+    "66a2919f5e05cafb4b65ad4b380121038cae16fc7ea5184b4019885960c632e58e3276cdd235065b4228506727b2d4dcfeff"
+    "ffff01fc019804000000001976a91488b281127b8911ed78356a3ce1322490d20d155188ac00000000fd1201020000000000"
+    "7a8b2ee0eacefa73c3e22835384db009da42f04707f960f2c8df91435b18f3ea0100000000000000000000000000ffff2be0"
+    "23a3270f084229eacbab19b23f72607bf22c594e4b9fabce93e8587780ca15c6270276c653401d61394867fb4102cafdf1ea"
+    "c1404959e2f82574704f39e5a8ba6e73bf4cbead6c99084229eacbab19b23f72607bf22c594e4b9fabce00001976a91488b2"
+    "81127b8911ed78356a3ce1322490d20d155188acd15b9484076fc7049aa612bff74e045a38b819efa5b6a5efb98a6585cd48"
+    "35c84120d6b339fdab538b6a087c89dd830b08c94c45d213de5b6e66826527b60b4bfd8a48f2faef05c50d387f697d3df8b8"
+    "55237105e1bab410718fa57512821350a27d";
+}  // namespace
+
+TEST(DashV24AllTx, RealMainnetCollateralReuseProRegTxRidesOurTemplate)
+{
+    constexpr uint32_t kH = 2'569'332;
+    const auto tx = tx_from_hex(kMainProReg);
+    ASSERT_EQ(txid(tx), u256("b7f443dc8394ab310418f4458d0b4be2e144e86ebe7f31ecf3dc7f488f1df794"));
+    const uint256 old_pro = u256("6544976109c4e181344fa61595c68424e0e336292882f68129f84f1a54893305");
+    const uint256 coll_hash = u256("eaf3185b4391dfc8f260f90747f042da09b04d383528e2c373faceeae02e8b7a");
+    // The replaced masternode as Dash Core holds it at 2,569,331 (protx info).
+    MNState old;
+    old.nVersion = v::ProTxVersion::BASIC_BLS;
+    old.nType = v::MnType::REGULAR;
+    old.collateralOutpoint.hash = coll_hash;
+    old.collateralOutpoint.index = 1;
+    old.keyIDOwner = u160_from_p2pkh("76a91488b281127b8911ed78356a3ce1322490d20d155188ac");
+    old.keyIDVoting = old.keyIDOwner;
+    old.pubKeyOperator = arr_hex<48>(
+        "826b5d2455e2eae4810888658eb68e2c53b7706ae7dba242b00b1071f0e8ed7558b647cd6a0fd324f2a4b36df803a01a");
+    old.netInfo = ipv4(43, 224, 35, 163, 9999);
+    old.scriptPayout = script_of(unhex("76a914084229eacbab19b23f72607bf22c594e4b9fabce88ac"));
+    old.nRegisteredHeight = 2'568'790;
+    old.isValid = false;
+    old.nPoSeBanHeight = 2'569'290;
+    old.payoutSplitProvenance = MNState::SPLIT_KNOWN;
+    // An unrelated valid masternode, so the block has a payee.
+    V24World w;
+    MNState other = w.regular;
+    other.nRegisteredHeight = 2'500'000;
+    other.payoutSplitProvenance = MNState::SPLIT_KNOWN;
+    MnStateMachine sm;
+    sm.load({{old_pro, old}, {w.R, other}}, kH - 1);
+    const std::vector<std::pair<uint256, ReplayMNState>> states = {{old_pro, to_replay(old_pro, old, h256(0x62))},
+                                                                   {w.R, to_replay(w.R, other, h256(0x61))}};
+    std::vector<v::CSimplifiedMNListEntry> leaves;
+    for (const auto& [pro, st] : states) leaves.push_back(st.to_sml_entry(pro));
+    v::CSimplifiedMNList sml(std::move(leaves));
+    sml.sort();
+
+    // Its funding coin (confirmed at 2,560,957) and the reused collateral.
+    ::core::coin::UTXOViewCache utxo(nullptr);
+    utxo.add_coin(::core::coin::Outpoint(u256("401350de0d7da5cbe0c76ce5f2d404017a14f75fed9e3e1a712d67387437a98e"), 2),
+                  ::core::coin::Coin(77'071'322, script_of(unhex("76a91488b281127b8911ed78356a3ce1322490d20d155188ac")),
+                                     2'560'957, false));
+    utxo.add_coin(::core::coin::Outpoint(coll_hash, 1),
+                  ::core::coin::Coin(kColl, script_of(unhex("76a914332e2bab0ef016af7102f42db2866cf44f21033488ac")),
+                                     1'302'450, false));
+    dash::coin::Mempool mp;
+    mp.set_utxo(&utxo);
+
+    // Dash Core's CheckProRegTx (mainnet, before v24): passes.
+    dash::coin::ProTxCheckEnv env;
+    env.net = dash::coin::DashNetwork::MAINNET;
+    env.ecdsa = &dash::coin::protx_ecdsa_verify_hash;
+    const auto coin = [&utxo](const Outpoint& o, int64_t& value, std::vector<uint8_t>& script) {
+        ::core::coin::Coin c;
+        if (!utxo.get_coin(::core::coin::Outpoint(o.hash, o.index), c)) return ProTxCoinProof::Absent;
+        value = c.value;
+        script = c.scriptPubKey.m_data;
+        return ProTxCoinProof::Unspent;
+    };
+    const auto why = dash::coin::protx_core_refusal(tx, sm, dash::coin::protx_rules_for(env, kH, false), coin,
+                                                    &dash::coin::protx_ecdsa_verify_hash);
+    EXPECT_FALSE(why.has_value()) << *why;
+
+    // Admitted, priced (fee 478 duffs on 468 bytes) and selected.
+    ASSERT_TRUE(mp.add_tx(tx));
+    dash::coin::QuorumManager qmgr;
+    const dash::coin::MnFoldContext::OperatorSigFn sigfn = &v::verify_protx_operator_sig;
+    const auto wd = dash::coin::build_embedded_workdata(
+        kH - 1, h256(0xAB), sm, mp, 0x191ca6f1u, 1'794'215'316u, 76, 16, 1'794'215'564u, 0x20000000u, nullptr, &sml,
+        &qmgr, 0, dash::coin::k_zero_cl_sig, 0, nullptr, nullptr, dash::coin::DASH_MN_RR_HEIGHT_MAINNET, nullptr,
+        dash::coin::DASH_MN_MIN_CONFIRMATIONS_MAINNET, /*suppress=*/false, "utxo-immature-serving", nullptr, false,
+        nullptr, /*include_mn_special_txs=*/true, nullptr, nullptr, &sigfn, /*v24_active=*/false, &env, nullptr);
+    bool rides = false;
+    for (const auto& h : wd.m_tx_hashes) rides = rides || h == txid(tx);
+    ASSERT_TRUE(rides) << "the ProRegTx rides our template";
+    v::CCbTx cb;
+    ASSERT_TRUE(v::parse_cbtx(wd.m_coinbase_payload, cb));
+    EXPECT_NE(cb.merkleRootMNList, sml.CalcMerkleRoot()) << "the replacement changes the committed root";
+
+    // Block connect (the root-checked replay fold, pre-v24 mainnet gates):
+    // the old masternode leaves, the new one joins, the root is ours.
+    FoldConfig cfg;
+    cfg.enabled = true;
+    cfg.gates.dip0003_enforcement_height = std::numeric_limits<int32_t>::max();
+    DmlFoldEngine eng(cfg);
+    eng.seed(states, 2, kH - 1, h256(0x70));
+    std::vector<MutableTransaction> body;
+    for (const auto& t : wd.m_txs) body.emplace_back(t);
+    const auto r = eng.fold_block(block_of(kH, eng.block_hash(), cb.merkleRootMNList, body), kH);
+    EXPECT_TRUE(r.ok) << r.error;
+    EXPECT_EQ(eng.find(old_pro), nullptr) << "replaced";
+    EXPECT_NE(eng.find(txid(tx)), nullptr) << "registered";
+}
+
 #endif  // C2POOL_DASH_BLS
