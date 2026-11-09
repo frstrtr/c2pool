@@ -248,6 +248,13 @@ bool netinfo_empty(const S& st)
     return netinfo_of(st, state_has_ext(st.nVersion)).IsEmpty();
 }
 
+/// IsSchemeMigration (specialtxman.cpp:46-49): a state moving from the legacy
+/// BLS scheme to the basic one (its stored key changes unique-property slot).
+constexpr bool is_scheme_migration(uint16_t old_version, uint16_t new_version)
+{
+    return old_version == vendor::ProTxVersion::LEGACY_BLS && new_version >= vendor::ProTxVersion::BASIC_BLS;
+}
+
 /// ApplyProUpServTx with DEPLOYMENT_V24 active (specialtxman.cpp:107-137).
 /// Revive is the engine's (revive_allowed below).
 template <typename S>

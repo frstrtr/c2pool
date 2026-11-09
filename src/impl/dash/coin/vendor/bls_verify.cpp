@@ -376,52 +376,16 @@ make_commitment_bls_verifier(MemberKeysProvider provider)
 
 // ── Dash Core's BLS encoding rules for provider payloads (bls_canonical.hpp) ──
 
-#ifdef C2POOL_DASH_BLS
-namespace {
-/// CBLSWrapper::SetBytes(bytes, legacy) leaves the object valid AND
-/// CheckMalleable(bytes, legacy) holds.
-template <typename Element, size_t N>
-bool core_set_bytes_canonical(const std::array<uint8_t, N>& b, bool legacy)
-{
-    bool all_zero = true;
-    for (uint8_t c : b) if (c != 0) { all_zero = false; break; }
-    if (all_zero) return false;                       // SetBytes: Reset()
-    try {
-        const Element e = Element::FromBytes(bls::Bytes(b.data(), N), legacy);
-        if (e == Element()) return false;             // the identity: Reset()
-        const std::vector<uint8_t> v = e.Serialize(legacy);
-        return v.size() == N && std::equal(v.begin(), v.end(), b.begin());
-    } catch (...) {
-        return false;                                 // decode failure: Reset()
-    }
-}
-} // namespace
-#endif
-
+// The rules are header-only (bls_canonical.hpp); exported here so the
+// default BlsEncodingChecks has a linkable address.
 std::optional<bool> bls_pubkey_core_valid(const std::array<uint8_t, 48>& key, bool legacy)
 {
-    // All-zero bytes: CBLSWrapper::SetBytes resets, no BLS math involved.
-    if (std::all_of(key.begin(), key.end(), [](uint8_t c) { return c == 0; })) return false;
-#ifdef C2POOL_DASH_BLS
-    return core_set_bytes_canonical<bls::G1Element, 48>(key, legacy);
-#else
-    (void)legacy;
-    return std::nullopt;
-#endif
+    return bls_pubkey_core_valid_inline(key, legacy);
 }
 
 std::optional<bool> bls_sig_core_decodes(const std::array<uint8_t, 96>& sig, bool legacy)
 {
-    // All-zero bytes: an invalid object, which re-encodes as zeros, so
-    // CheckMalleable holds and Unserialize does not throw.
-    if (std::all_of(sig.begin(), sig.end(), [](uint8_t c) { return c == 0; })) return true;
-#ifdef C2POOL_DASH_BLS
-    return core_set_bytes_canonical<bls::G2Element, 96>(sig, legacy)
-        || core_set_bytes_canonical<bls::G2Element, 96>(sig, !legacy);
-#else
-    (void)legacy;
-    return std::nullopt;
-#endif
+    return bls_sig_core_decodes_inline(sig, legacy);
 }
 
 } // namespace vendor

@@ -18,6 +18,11 @@
 #include <impl/dash/coin/block.hpp>
 #include <impl/dash/coin/block_producer.hpp>
 #include <impl/dash/coin/header_chain.hpp>
+#include <impl/dash/coin/mn_state_machine.hpp>
+#include <impl/dash/coin/replay_fold_engine.hpp>
+#include <impl/dash/coin/service_update_order.hpp>
+#include <impl/dash/coin/v24_activation_wire.hpp>
+#include <impl/dash/coin/vendor/cbtx.hpp>
 #include <impl/dash/crypto/hash_x11.hpp>
 
 #include <core/hash.hpp>
@@ -26,9 +31,12 @@
 #include <gtest/gtest.h>
 
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <map>
 #include <memory>
 #include <random>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -1427,4 +1435,880 @@ TEST(DashV24Deployments, CrossCheckLatchSurvivesARestart)
     other.set_v24_activation_override(70);
     ASSERT_TRUE(other.deserialize_latch(prec));
     EXPECT_FALSE(other.pin_refuted()) << "a different pin is a new operator decision";
+}
+
+// The latch is bound to the block that set it: it clears once that block is
+// no longer on our best chain (reorged out, orphaned), never while it is.
+TEST(DashV24Deployments, CrossCheckLatchClearsWhenItsBlockIsOrphaned)
+{
+    LatchFixture f(false);   // no signal: v24 never active on this chain
+    ASSERT_EQ(f.st->cross_check_cbtx_version(55, f.c.at(55)->hash, 4), V24CrossCheck::CONTRADICTS);
+    ASSERT_NE(f.st->latch(), V24Latch::NONE);
+    // The disagreeing block stays on the best chain: later agreeing blocks
+    // do not clear it, nor does a revalidation.
+    for (uint32_t h = 56; h <= 60; ++h) f.st->cross_check_cbtx_version(h, f.c.at(h)->hash, 3);
+    f.st->revalidate_latch();
+    EXPECT_NE(f.st->latch(), V24Latch::NONE) << "the disagreeing block is still on our chain";
+    EXPECT_EQ(f.st->v24_state(61), V24State::UNKNOWN);
+    // It is reorged out: the next cross-check (or a revalidation) clears it.
+    f.c.salt[55] = 0x55;
+    const uint64_t v = f.st->latch_version();
+    EXPECT_EQ(f.st->cross_check_cbtx_version(61, f.c.at(61)->hash, 3), V24CrossCheck::AGREE);
+    EXPECT_EQ(f.st->latch(), V24Latch::NONE);
+    EXPECT_GT(f.st->latch_version(), v) << "the node persists the change";
+    EXPECT_EQ(f.st->v24_state(61), V24State::INACTIVE);
+}
+
+TEST(DashV24Deployments, CrossCheckLatchRecordKnowsItsBlockAcrossARestart)
+{
+    LatchFixture f(false);
+    ASSERT_EQ(f.st->cross_check_cbtx_version(55, f.c.at(55)->hash, 4), V24CrossCheck::CONTRADICTS);
+    const std::string rec = f.st->serialize_latch();
+    EXPECT_EQ(rec.rfind("v24_latch v2 ", 0), 0u);
+    EXPECT_NE(rec.find(f.c.at(55)->hash.GetHex()), std::string::npos);
+    // Restart with the block still on our chain: the latch stays.
+    {
+        DashDeploymentStatus again(f.p, f.c.fn(), [&f] { return std::optional<uint32_t>(f.tip); }, f.t);
+        ASSERT_TRUE(again.deserialize_latch(rec));
+        again.revalidate_latch();
+        EXPECT_NE(again.latch(), V24Latch::NONE);
+    }
+    // Restart after the block was orphaned while we were down: a latch from
+    // a valid block (our answer refuted) stays until a cross-check at or above
+    // its height agrees with the recomputed answer.
+    f.c.salt[55] = 0x66;
+    {
+        DashDeploymentStatus again(f.p, f.c.fn(), [&f] { return std::optional<uint32_t>(f.tip); }, f.t);
+        ASSERT_TRUE(again.deserialize_latch(rec));
+        ASSERT_NE(again.latch(), V24Latch::NONE);
+        again.revalidate_latch();
+        EXPECT_NE(again.latch(), V24Latch::NONE);
+        EXPECT_EQ(again.cross_check_cbtx_version(56, f.c.at(56)->hash, 3), V24CrossCheck::AGREE);
+        EXPECT_EQ(again.latch(), V24Latch::NONE);
+    }
+    // A record from before v2 (no block hash) still loads and stays latched
+    // until the recomputed answer agrees (the old rule).
+    {
+        DashDeploymentStatus again(f.p, f.c.fn(), [&f] { return std::optional<uint32_t>(f.tip); }, f.t);
+        ASSERT_TRUE(again.deserialize_latch("v24_latch v1 " + std::to_string(static_cast<int>(f.p.network))
+                                            + " 1 55 1 0 0 1\n"));
+        again.revalidate_latch();
+        EXPECT_NE(again.latch(), V24Latch::NONE);
+    }
+    // A malformed v2 hash is refused.
+    DashDeploymentStatus bad(f.p, f.c.fn(), [&f] { return std::optional<uint32_t>(f.tip); }, f.t);
+    EXPECT_FALSE(bad.deserialize_latch("v24_latch v2 " + std::to_string(static_cast<int>(f.p.network))
+                                       + " 1 55 1 0 0 1 xyz 0\n"));
+}
+
+// N4: a latch set by a VALID block that refuted our answer (the tracker was
+// wrong) is not cleared by that block's reorg alone: the refuted answer must
+// not be served until a cross-check at or above the latched height agrees.
+TEST(DashV24Deployments, LatchFromAValidBlockWaitsForAnAgreeingCrossCheck)
+{
+    LatchFixture f(true);   // signal at 25: our tracker says v24 is active from 50
+    ASSERT_EQ(f.st->v24_state(56), V24State::ACTIVE);
+    // A valid block at 55 states inactive: our answer is refuted.
+    ASSERT_EQ(f.st->cross_check_cbtx_version(55, f.c.at(55)->hash, 3), V24CrossCheck::CONTRADICTS);
+    ASSERT_NE(f.st->latch(), V24Latch::NONE);
+    EXPECT_NE(f.st->v24_state(56), V24State::ACTIVE);
+    // That block is reorged out: the latch stays, the refuted answer is not served.
+    f.c.salt[55] = 0x44;
+    f.st->revalidate_latch();
+    EXPECT_NE(f.st->latch(), V24Latch::NONE);
+    EXPECT_NE(f.st->v24_state(56), V24State::ACTIVE);
+    // The next block on the new branch also states inactive: our recomputed
+    // answer is still refuted there, so the latch stays (and the latched
+    // state answers nothing).
+    EXPECT_EQ(f.st->cross_check_cbtx_version(56, f.c.at(56)->hash, 3), V24CrossCheck::UNDECIDED);
+    EXPECT_NE(f.st->latch(), V24Latch::NONE);
+    // A branch whose blocks agree with the recomputed answer clears it at the
+    // first agreeing cross-check at or above the latched height.
+    f.c.salt[56] = 0x45;
+    EXPECT_EQ(f.st->cross_check_cbtx_version(54, f.c.at(54)->hash, 4), V24CrossCheck::UNDECIDED)
+        << "below the latched height: no clearing";
+    EXPECT_NE(f.st->latch(), V24Latch::NONE);
+    EXPECT_EQ(f.st->cross_check_cbtx_version(57, f.c.at(57)->hash, 4), V24CrossCheck::AGREE);
+    EXPECT_EQ(f.st->latch(), V24Latch::NONE);
+    EXPECT_EQ(f.st->v24_state(58), V24State::ACTIVE);
+}
+
+// A CbTx version Dash Core rejects at that height (CheckCbTx) disagrees with
+// every answer: it latches at the bound level, and only that block leaving
+// our chain clears it.
+TEST(DashV24Deployments, CrossCheckLatchesOnACbTxVersionCoreRejects)
+{
+    SynthChain c;
+    c.tip = 120;
+    c.signal_range(30, 39);
+    auto p = fast_params(0);
+    p.v20_height = 10;
+    uint32_t tip = 120;
+    auto t = std::make_shared<EhfSignalTracker>(p, c.fn());
+    for (uint32_t h = 0; h <= 120; ++h) t->connect_block(block_at(c, h, {}), h, c.at(h)->hash);
+    DashDeploymentStatus st(p, c.fn(), [&tip] { return std::optional<uint32_t>(tip); }, t);
+    EXPECT_EQ(st.cross_check_cbtx_version(50, c.at(50)->hash, 3), V24CrossCheck::AGREE);
+    for (const auto& [h, v] : std::vector<std::pair<uint32_t, uint16_t>>{{51, 5}, {52, 2}, {5, 3}, {53, 0}}) {
+        DashDeploymentStatus s2(p, c.fn(), [&tip] { return std::optional<uint32_t>(tip); }, t);
+        EXPECT_EQ(s2.cross_check_cbtx_version(h, c.at(h)->hash, v), V24CrossCheck::CONTRADICTS) << h << " v" << v;
+        EXPECT_EQ(s2.latch(), V24Latch::BOUND) << h << " v" << v;
+        EXPECT_EQ(s2.v24_state(60), V24State::UNKNOWN);
+        // Agreeing blocks after it never clear it ...
+        s2.cross_check_cbtx_version(60, c.at(60)->hash, 3);
+        EXPECT_EQ(s2.latch(), V24Latch::BOUND);
+        // ... its orphaning does, and the record round-trips the flag.
+        DashDeploymentStatus s3(p, c.fn(), [&tip] { return std::optional<uint32_t>(tip); }, t);
+        ASSERT_TRUE(s3.deserialize_latch(s2.serialize_latch()));
+        c.salt[h] = 0x99;
+        s2.revalidate_latch();
+        EXPECT_EQ(s2.latch(), V24Latch::NONE);
+        s3.revalidate_latch();
+        EXPECT_EQ(s3.latch(), V24Latch::NONE);
+        c.salt.erase(h);
+    }
+}
+
+
+// ── The activation height into the folds (v24_activation.hpp) ──────────────
+// A synthetic chain on MAINNET parameters: the EHF signal for bit 13 is mined
+// at 2,569,000 (after the November 9 start time), the window 2,572,416..
+// 2,576,447 signals, so v24 is LOCKED_IN at 2,576,448 and ACTIVE at
+// 2,580,480 -- the earliest mainnet activation.
+namespace {
+
+constexpr uint32_t kMainSignal = 2'569'000;
+constexpr uint32_t kMainLockIn = 2'576'448;
+constexpr uint32_t kMainActive = 2'580'480;
+
+struct MainnetActivationWorld
+{
+    SynthChain c;
+    DashDeploymentParams p = dash_deployment_params(DashNetwork::MAINNET);
+    std::shared_ptr<EhfSignalTracker> t;
+    uint32_t tip{0};
+    std::unique_ptr<DashDeploymentStatus> st;
+
+    MainnetActivationWorld()
+    {
+        c.t0 = 1'794'182'400u - 150u * 2'568'500u;   // MTP reaches the start time near 2,568,505
+        c.tip = kMainActive + 300;
+        c.signal_range(kMainLockIn - 4032, kMainLockIn - 1);
+        t = std::make_shared<EhfSignalTracker>(p, c.fn());
+        st = std::make_unique<DashDeploymentStatus>(p, c.fn(), [this] { return std::optional<uint32_t>(tip); }, t);
+    }
+    /// Scan bodies up to `h` and move the tip there.
+    void advance(uint32_t h)
+    {
+        for (uint32_t x = t->next_needed_height(); x <= h; ++x) {
+            std::vector<MutableTransaction> extra;
+            if (x == kMainSignal) extra.push_back(mnhf_tx(13));
+            ASSERT_TRUE(t->connect_block(block_at(c, x, extra), x, c.at(x)->hash)) << x;
+        }
+        tip = h;
+    }
+    /// What main_dash wires: the tracking's answers and the header tip.
+    V24TrackingView view()
+    {
+        V24TrackingView v;
+        v.activation_height = [this] { return st->activation_height(DashDeployment::V24); };
+        v.state = [this](uint32_t h) { return st->v24_state(h); };
+        v.refuted = [this] { return st->latch() != V24Latch::NONE; };
+        v.tip = [this] { return std::optional<uint32_t>(tip); };
+        return v;
+    }
+};
+
+/// A mined block on top of `prev` whose coinbase states CbTx `version`.
+BlockType cbtx_block(uint32_t height, const uint256& prev, uint16_t version)
+{
+    vendor::CCbTx cb;
+    cb.nVersion = version;
+    cb.nHeight = static_cast<int32_t>(height);
+    MutableTransaction tx;
+    tx.version = 3;
+    tx.type = 5;
+    bitcoin_family::coin::TxIn in;
+    in.prevout.hash.SetNull();
+    in.prevout.index = 0xffffffff;
+    in.sequence = 0xffffffff;
+    tx.vin.push_back(in);
+    auto ps = ::pack(cb);
+    auto sp = ps.get_span();
+    tx.extra_payload.assign(reinterpret_cast<const unsigned char*>(sp.data()),
+                            reinterpret_cast<const unsigned char*>(sp.data()) + sp.size());
+    BlockType b;
+    b.m_version = 0x20000000;
+    b.m_previous_block = prev;
+    b.m_timestamp = 1'800'000'000 + height;
+    b.m_bits = 0x1e0fffff;
+    b.m_nonce = height;
+    b.m_txs.push_back(tx);
+    return b;
+}
+
+replay::FoldConfig mainnet_fold_cfg()
+{
+    replay::FoldConfig cfg;
+    cfg.enabled = true;   // mainnet gates; v24 height unknown until pushed
+    cfg.gates.dip0003_enforcement_height = std::numeric_limits<int32_t>::max();   // no payee axis here
+    return cfg;
+}
+
+std::string temp_path(const char* tag)
+{
+    return (std::filesystem::temp_directory_path()
+            / ("c2pool-v24-activation-" + std::string(tag) + "-" + std::to_string(std::random_device{}()) + ".v1"))
+        .string();
+}
+
+} // namespace
+
+namespace {
+/// A tracking view with fixed answers (a tracker that does not know yet, or
+/// one that has decided).
+V24TrackingView fixed_view(std::optional<uint32_t> height, V24State state_everywhere = V24State::UNKNOWN,
+                           std::optional<uint32_t> tip = std::nullopt, bool refuted = false)
+{
+    V24TrackingView v;
+    v.activation_height = [height] { return height; };
+    v.state = [state_everywhere](uint32_t) { return state_everywhere; };
+    v.refuted = [refuted] { return refuted; };
+    v.tip = [tip] { return tip; };
+    return v;
+}
+bool file_exists(const std::string& path) { return std::filesystem::exists(path); }
+}  // namespace
+
+TEST(DashV24Activation, HeightIsPushedOnceTheLockInIsSettled)
+{
+    MainnetActivationWorld w;
+    const std::string path = temp_path("window");
+    std::remove(path.c_str());
+    V24ActivationWire wire(DashNetwork::MAINNET, w.view(), path);
+    MnStateMachine sm;
+    replay::DmlFoldEngine eng(mainnet_fold_cfg());
+    wire.add_sink([&](uint32_t h) { sm.set_v24_height(h); });
+    wire.add_sink([&](uint32_t h) { eng.set_v24_height(h); });
+
+    // Still STARTED for the block after the tip: nothing to push.
+    w.advance(kMainLockIn - 2);
+    EXPECT_EQ(wire.refresh(), std::nullopt);
+    // LOCKED_IN for the next block, decided by the window's last block: known,
+    // but not pushed until that block is kV24ActivationConfirmations deep.
+    w.advance(kMainLockIn - 1);
+    ASSERT_EQ(w.st->activation_height(DashDeployment::V24), std::optional<uint32_t>(kMainActive));
+    EXPECT_EQ(wire.refresh(), std::nullopt);
+    w.advance(kMainLockIn - 1 + kV24ActivationConfirmations - 1);
+    EXPECT_EQ(wire.refresh(), std::nullopt);
+    EXPECT_EQ(sm.v24_height(), kV24HeightUnknown);
+    w.advance(kMainLockIn - 1 + kV24ActivationConfirmations);
+    EXPECT_EQ(wire.refresh(), std::optional<uint32_t>(kMainActive));
+    EXPECT_EQ(sm.v24_height(), kMainActive);
+    EXPECT_EQ(eng.v24_height(), static_cast<int32_t>(kMainActive));
+    EXPECT_LT(kMainLockIn - 1 + kV24ActivationConfirmations, kMainActive - 3000) << "most of a window early";
+    {
+        std::ifstream in(path);
+        std::stringstream ss;
+        ss << in.rdbuf();
+        EXPECT_EQ(V24ActivationWire::parse(DashNetwork::MAINNET, ss.str()), std::optional<uint32_t>(kMainActive));
+    }
+    // ACTIVE at the tip: the same height, re-checked against the exact state.
+    w.advance(kMainActive + 50);
+    EXPECT_EQ(w.st->v24_state(kMainActive - 1), V24State::INACTIVE);
+    EXPECT_EQ(w.st->v24_state(kMainActive), V24State::ACTIVE);
+    EXPECT_EQ(wire.refresh(), std::optional<uint32_t>(kMainActive));
+
+    // Both engines fold the boundary as each block states; the pushed height
+    // agrees, so nothing is counted.
+    sm.load({}, kMainActive - 2);
+    EXPECT_TRUE(sm.apply_block(cbtx_block(kMainActive - 1, uint256{}, 3), kMainActive - 1).refused.empty());
+    EXPECT_TRUE(sm.apply_block(cbtx_block(kMainActive, uint256{}, 4), kMainActive).refused.empty());
+    EXPECT_EQ(sm.v24_contradictions(), 0u);
+    eng.seed({}, 0, kMainActive - 1, height_hash(1, 0xa1));
+    const auto f = eng.fold_block(cbtx_block(kMainActive, eng.block_hash(), 4), kMainActive);
+    EXPECT_TRUE(f.ok) << f.error;
+    EXPECT_EQ(eng.v24_contradictions(), 0u);
+    std::remove(path.c_str());
+}
+
+TEST(DashV24Activation, AWrongHeightNeverStallsAFold)
+{
+    // A height that disagrees with the chain (a bad persisted file, a tracker
+    // fault): every block still folds as its CbTx version states, and the
+    // disagreement is counted. Nothing is refused, nothing stalls.
+    MnStateMachine sm;
+    sm.set_v24_earliest(v24_earliest_unmeasured_activation(DashNetwork::MAINNET));
+    sm.set_v24_height(kMainActive);
+    sm.load({}, kMainActive - 1);
+    auto r = sm.apply_block(cbtx_block(kMainActive, uint256{}, 3), kMainActive);
+    EXPECT_TRUE(r.refused.empty()) << r.refused;
+    r = sm.apply_block(cbtx_block(kMainActive + 1, uint256{}, 3), kMainActive + 1);
+    EXPECT_TRUE(r.refused.empty()) << r.refused;
+    EXPECT_EQ(sm.v24_contradictions(), 2u);
+    replay::DmlFoldEngine eng(mainnet_fold_cfg());
+    eng.set_v24_earliest(v24_earliest_unmeasured_activation(DashNetwork::MAINNET));
+    eng.set_v24_height(kMainActive + 4032);
+    eng.seed({}, 0, kMainActive + 9, height_hash(2, 0xa1));
+    const auto f = eng.fold_block(cbtx_block(kMainActive + 10, eng.block_hash(), 4), kMainActive + 10);
+    EXPECT_TRUE(f.ok) << f.error;
+    EXPECT_EQ(eng.v24_contradictions(), 1u);
+}
+
+TEST(DashV24Activation, ABlockNeverSetsTheSwitchOfAnotherBlock)
+{
+    // No height pushed. A v24 statement below the earliest possible mainnet
+    // activation is a block dashd rejects (bad-cbtx-version): refused before
+    // any mutation, and nothing about it survives.
+    const uint32_t H = 2'569'300;
+    MnStateMachine sm;
+    sm.set_v24_earliest(v24_earliest_unmeasured_activation(DashNetwork::MAINNET));
+    sm.load({}, H - 1);
+    auto r = sm.apply_block(cbtx_block(H, uint256{}, 4), H);
+    EXPECT_NE(r.refused.find("bad-cbtx-version"), std::string::npos) << r.refused;
+    EXPECT_EQ(sm.v24_height(), kV24HeightUnknown);
+    EXPECT_TRUE(sm.apply_block(cbtx_block(H, uint256{}, 3), H).refused.empty()) << "the honest block";
+    EXPECT_TRUE(sm.apply_block(cbtx_block(H + 1, uint256{}, 3), H + 1).refused.empty()) << "and the next";
+    // Without the network bound, the block folds as it states, and still
+    // sets nothing: after a reorg the honest block and every later one fold.
+    MnStateMachine loose;
+    loose.load({}, H - 1);
+    EXPECT_TRUE(loose.apply_block(cbtx_block(H, uint256{}, 4), H).refused.empty());
+    EXPECT_EQ(loose.v24_height(), kV24HeightUnknown);
+    loose.load({}, H - 1);
+    EXPECT_TRUE(loose.apply_block(cbtx_block(H, uint256{}, 3), H).refused.empty());
+    EXPECT_TRUE(loose.apply_block(cbtx_block(H + 1, uint256{}, 3), H + 1).refused.empty());
+    // A refused block (bad-txns-type for a type outside v24's list) changes
+    // nothing either, in both engines.
+    MutableTransaction bad;
+    bad.version = 3;
+    bad.type = 13;
+    bitcoin_family::coin::TxIn in;
+    in.prevout.hash = uint256::ONE;
+    in.prevout.index = 0;
+    bad.vin.push_back(in);
+    bad.extra_payload = {0x01};
+    auto with_bad = cbtx_block(kMainActive + 5, uint256{}, 4);
+    with_bad.m_txs.push_back(bad);
+    MnStateMachine sm2;
+    sm2.load({}, kMainActive + 4);
+    EXPECT_FALSE(sm2.apply_block(with_bad, kMainActive + 5).refused.empty());
+    EXPECT_EQ(sm2.v24_height(), kV24HeightUnknown);
+    replay::DmlFoldEngine eng(mainnet_fold_cfg());
+    eng.seed({}, 0, kMainActive + 4, height_hash(4, 0xa1));
+    with_bad.m_previous_block = eng.block_hash();
+    const auto f = eng.fold_block(with_bad, kMainActive + 5);
+    EXPECT_FALSE(f.ok);
+    EXPECT_TRUE(f.refused_unchanged);
+    EXPECT_EQ(eng.v24_height(), std::numeric_limits<int32_t>::max());
+    // The replay fold refuses a v24 statement below the earliest activation.
+    replay::DmlFoldEngine e2(mainnet_fold_cfg());
+    e2.set_v24_earliest(v24_earliest_unmeasured_activation(DashNetwork::MAINNET));
+    e2.seed({}, 0, H - 1, height_hash(5, 0xa1));
+    const auto f2 = e2.fold_block(cbtx_block(H, e2.block_hash(), 4), H);
+    EXPECT_FALSE(f2.ok);
+    EXPECT_TRUE(f2.refused_unchanged);
+    EXPECT_NE(f2.error.find("bad-cbtx-version"), std::string::npos) << f2.error;
+}
+
+TEST(DashV24Activation, BlockSwitchMatrix)
+{
+    const uint32_t E = kMainActive;
+    // Pre-V20 CbTx (version 2) or none: the pushed height decides.
+    EXPECT_FALSE(v24_block_switch(100, kV24HeightUnknown, std::nullopt).active);
+    EXPECT_FALSE(v24_block_switch(100, kV24HeightUnknown, uint16_t{2}).active);
+    EXPECT_TRUE(v24_block_switch(kMainActive, kMainActive, uint16_t{2}).active);
+    // Version 3 / 4: the block decides; the height only cross-checks.
+    EXPECT_TRUE(v24_block_switch(100, kV24HeightUnknown, uint16_t{4}).active);
+    EXPECT_TRUE(v24_block_switch(100, kV24HeightUnknown, uint16_t{4}, E).invalid.has_value());
+    EXPECT_FALSE(v24_block_switch(kMainActive, kV24HeightUnknown, uint16_t{4}, E).invalid.has_value());
+    EXPECT_FALSE(v24_block_switch(kMainActive - 1, kMainActive, uint16_t{3}).contradiction.has_value());
+    const auto early = v24_block_switch(kMainActive - 1, kMainActive, uint16_t{4});
+    EXPECT_TRUE(early.contradiction.has_value());
+    EXPECT_TRUE(early.active);
+    const auto late = v24_block_switch(kMainActive, kMainActive, uint16_t{3});
+    EXPECT_TRUE(late.contradiction.has_value());
+    EXPECT_FALSE(late.active);
+    EXPECT_FALSE(v24_block_switch(kMainActive, kMainActive, uint16_t{4}).contradiction.has_value());
+    // CheckCbTx: version 0 or 5+ is invalid at every height; with the V20
+    // height known, below 3 after it and 3+ before it are invalid too.
+    const uint32_t V20 = dash_deployment_params(DashNetwork::MAINNET).v20_height;
+    EXPECT_TRUE(v24_block_switch(kMainActive, kV24HeightUnknown, uint16_t{5}, E, V20).invalid.has_value());
+    EXPECT_TRUE(v24_block_switch(kMainActive, kV24HeightUnknown, uint16_t{5}).invalid.has_value());
+    EXPECT_FALSE(v24_block_switch(kMainActive, kV24HeightUnknown, uint16_t{5}).active);
+    EXPECT_TRUE(v24_block_switch(kMainActive, kV24HeightUnknown, uint16_t{0}).invalid.has_value());
+    EXPECT_TRUE(v24_block_switch(V20, kV24HeightUnknown, uint16_t{2}, E, V20).invalid.has_value());
+    EXPECT_TRUE(v24_block_switch(V20, kV24HeightUnknown, std::nullopt, E, V20).invalid.has_value())
+        << "no CbTx after V20";
+    EXPECT_FALSE(v24_block_switch(V20, kV24HeightUnknown, uint16_t{3}, E, V20).invalid.has_value());
+    EXPECT_TRUE(v24_block_switch(V20 - 1, kV24HeightUnknown, uint16_t{3}, E, V20).invalid.has_value());
+    EXPECT_FALSE(v24_block_switch(V20 - 1, kV24HeightUnknown, uint16_t{2}, E, V20).invalid.has_value());
+}
+
+TEST(DashV24Activation, CbTxVersionsCoreRejectsAreRefusedBeforeAnyMutation)
+{
+    const uint32_t V20 = dash_deployment_params(DashNetwork::MAINNET).v20_height;
+    for (uint16_t bad : {uint16_t{5}, uint16_t{2}}) {
+        MnStateMachine sm;
+        sm.set_v24_earliest(v24_earliest_unmeasured_activation(DashNetwork::MAINNET));
+        sm.set_v20_height(V20);
+        sm.load({}, kMainActive + 9);
+        const auto r = sm.apply_block(cbtx_block(kMainActive + 10, uint256{}, bad), kMainActive + 10);
+        EXPECT_NE(r.refused.find("bad-cbtx-version"), std::string::npos) << bad << ": " << r.refused;
+        EXPECT_TRUE(sm.apply_block(cbtx_block(kMainActive + 10, uint256{}, 4), kMainActive + 10).refused.empty())
+            << "the valid block at the same height";
+        replay::DmlFoldEngine eng(mainnet_fold_cfg());
+        eng.set_v24_earliest(v24_earliest_unmeasured_activation(DashNetwork::MAINNET));
+        eng.set_v20_height(V20);
+        eng.seed({}, 0, kMainActive + 9, height_hash(6, 0xa1));
+        const auto f = eng.fold_block(cbtx_block(kMainActive + 10, eng.block_hash(), bad), kMainActive + 10);
+        EXPECT_FALSE(f.ok);
+        EXPECT_TRUE(f.refused_unchanged);
+        EXPECT_NE(f.error.find("bad-cbtx-version"), std::string::npos) << f.error;
+        const auto ok = eng.fold_block(cbtx_block(kMainActive + 10, eng.block_hash(), 4), kMainActive + 10);
+        EXPECT_TRUE(ok.ok) << ok.error;
+    }
+}
+
+TEST(DashV24Activation, PersistedFileIsStrictAndPlausible)
+{
+    using W = V24ActivationWire;
+    const auto M = DashNetwork::MAINNET;
+    EXPECT_EQ(W::parse(M, W::serialize(M, kMainActive)), std::optional<uint32_t>(kMainActive));
+    EXPECT_EQ(W::parse(M, W::serialize(M, kMainActive + 4032)), std::optional<uint32_t>(kMainActive + 4032));
+    // Not a period boundary, below the earliest activation, height 1.
+    EXPECT_EQ(W::parse(M, "c2pool-dash-v24-activation/1 0 1\n"), std::nullopt);
+    EXPECT_EQ(W::parse(M, "c2pool-dash-v24-activation/1 0 2569220\n"), std::nullopt);
+    EXPECT_EQ(W::parse(M, "c2pool-dash-v24-activation/1 0 2580481\n"), std::nullopt);
+    EXPECT_EQ(W::parse(M, "c2pool-dash-v24-activation/1 0 2576448\n"), std::nullopt);
+    // Not strict: trailing junk, signs, padding, another network.
+    EXPECT_EQ(W::parse(M, "c2pool-dash-v24-activation/1 0 2580480 trailing junk"), std::nullopt);
+    EXPECT_EQ(W::parse(M, "c2pool-dash-v24-activation/1 0 +2580480"), std::nullopt);
+    EXPECT_EQ(W::parse(M, "c2pool-dash-v24-activation/1 0 02580480"), std::nullopt);
+    EXPECT_EQ(W::parse(M, "c2pool-dash-v24-activation/1  0 2580480"), std::nullopt);
+    EXPECT_EQ(W::parse(M, W::serialize(DashNetwork::TESTNET, kMainActive)), std::nullopt);
+    // Testnet: only its buried height.
+    EXPECT_EQ(W::parse(DashNetwork::TESTNET, W::serialize(DashNetwork::TESTNET, 1'578'000)),
+              std::optional<uint32_t>(1'578'000));
+    EXPECT_EQ(W::parse(DashNetwork::TESTNET, W::serialize(DashNetwork::TESTNET, 1'582'032)), std::nullopt);
+
+    // An implausible file is deleted and applied nowhere.
+    const std::string path = temp_path("implausible");
+    {
+        std::ofstream o(path);
+        o << "c2pool-dash-v24-activation/1 0 2569220\n";
+    }
+    V24ActivationWire wire(M, fixed_view(std::nullopt), path);
+    MnStateMachine sm;
+    wire.add_sink([&](uint32_t h) { sm.set_v24_height(h); });
+    EXPECT_FALSE(wire.load());
+    EXPECT_FALSE(file_exists(path));
+    EXPECT_EQ(sm.v24_height(), kV24HeightUnknown);
+    EXPECT_EQ(wire.refresh(), std::nullopt);
+}
+
+TEST(DashV24Activation, PersistedHeightIsReCheckedAndWithdrawn)
+{
+    const std::string path = temp_path("restart");
+    {
+        std::ofstream out(path, std::ios::trunc);
+        out << V24ActivationWire::serialize(DashNetwork::MAINNET, kMainActive);
+    }
+    // After a restart the tracker has not rescanned yet: it knows nothing.
+    V24ActivationWire wire(DashNetwork::MAINNET, fixed_view(std::nullopt), path);
+    MnStateMachine sm;
+    wire.add_sink([&](uint32_t h) { sm.set_v24_height(h); });
+    EXPECT_TRUE(wire.load());
+    EXPECT_EQ(sm.v24_height(), kMainActive);
+    EXPECT_EQ(wire.refresh(), std::optional<uint32_t>(kMainActive)) << "an undecided tracking keeps it";
+    // A sink added later gets it at once (the replay folds are built late).
+    replay::DmlFoldEngine eng(mainnet_fold_cfg());
+    wire.add_sink([&](uint32_t h) { eng.set_v24_height(h); });
+    EXPECT_EQ(eng.v24_height(), static_cast<int32_t>(kMainActive));
+    // The tracking decides v24 is NOT active there: withdrawn from every
+    // engine, the file deleted, and the engines go on folding.
+    wire.set_view(fixed_view(std::nullopt, V24State::INACTIVE, kMainActive + 10));
+    EXPECT_EQ(wire.refresh(), std::nullopt);
+    EXPECT_EQ(sm.v24_height(), kV24HeightUnknown);
+    EXPECT_EQ(eng.v24_height(), std::numeric_limits<int32_t>::max());
+    EXPECT_FALSE(file_exists(path));
+    sm.load({}, kMainActive - 1);
+    EXPECT_TRUE(sm.apply_block(cbtx_block(kMainActive, uint256{}, 3), kMainActive).refused.empty());
+    // A settled, different height from the tracking replaces it.
+    wire.set_view(fixed_view(kMainActive + 4032, V24State::UNKNOWN, kMainActive + 4032 + 10));
+    EXPECT_EQ(wire.refresh(), std::optional<uint32_t>(kMainActive + 4032));
+    EXPECT_EQ(sm.v24_height(), kMainActive + 4032);
+    // The tracking already knows: a persisted file does not override it.
+    {
+        std::ofstream out(path, std::ios::trunc);
+        out << V24ActivationWire::serialize(DashNetwork::MAINNET, kMainActive);
+    }
+    EXPECT_FALSE(wire.load());
+    EXPECT_EQ(wire.applied(), std::optional<uint32_t>(kMainActive + 4032));
+    // Another network's file is ignored (and removed).
+    V24ActivationWire tn(DashNetwork::TESTNET, {}, path);
+    EXPECT_FALSE(tn.load());
+    EXPECT_EQ(tn.applied(), std::nullopt);
+    std::remove(path.c_str());
+}
+
+TEST(DashV24Activation, TheCrossCheckLatchWithdrawsTheHeightAndDeletesTheFile)
+{
+    const std::string path = temp_path("latch");
+    V24ActivationWire wire(DashNetwork::MAINNET, fixed_view(kMainActive, V24State::UNKNOWN, kMainActive + 1), path);
+    MnStateMachine sm;
+    wire.add_sink([&](uint32_t h) { sm.set_v24_height(h); });
+    ASSERT_EQ(wire.refresh(), std::optional<uint32_t>(kMainActive));
+    ASSERT_TRUE(file_exists(path));
+    wire.set_view(fixed_view(kMainActive, V24State::UNKNOWN, kMainActive + 1, /*refuted=*/true));
+    EXPECT_EQ(wire.refresh(), std::nullopt);
+    EXPECT_EQ(sm.v24_height(), kV24HeightUnknown);
+    EXPECT_FALSE(file_exists(path));
+}
+
+TEST(DashV24Activation, AnUnsettledLockInNeverReachesTheEngines)
+{
+    // LOCKED_IN known with the deciding block (kMainLockIn - 1) only 50 deep,
+    // then reorged back to STARTED: nothing was ever pushed or persisted.
+    const std::string path = temp_path("unsettled");
+    V24ActivationWire wire(DashNetwork::MAINNET, fixed_view(kMainActive, V24State::UNKNOWN, kMainLockIn - 1 + 50),
+                           path);
+    MnStateMachine sm;
+    wire.add_sink([&](uint32_t h) { sm.set_v24_height(h); });
+    EXPECT_EQ(wire.refresh(), std::nullopt);
+    wire.set_view(fixed_view(std::nullopt, V24State::UNKNOWN, kMainLockIn - 1 + 60));
+    EXPECT_EQ(wire.refresh(), std::nullopt);
+    EXPECT_EQ(sm.v24_height(), kV24HeightUnknown);
+    EXPECT_FALSE(file_exists(path));
+    // An implausible answer from the tracking is never pushed either.
+    wire.set_view(fixed_view(kMainActive + 1, V24State::UNKNOWN, kMainActive + 500));
+    EXPECT_EQ(wire.refresh(), std::nullopt);
+}
+
+TEST(DashV24Activation, ReorgAcrossTheActivationBoundaryKeepsTheHeight)
+{
+    MainnetActivationWorld w;
+    V24ActivationWire wire(DashNetwork::MAINNET, w.view());
+    MnStateMachine sm;
+    wire.add_sink([&](uint32_t h) { sm.set_v24_height(h); });
+    w.advance(kMainActive + 100);
+    ASSERT_EQ(wire.refresh(), std::optional<uint32_t>(kMainActive));
+    // Replace 2,580,470..2,580,600 with another branch: the activation height
+    // is fixed by the signalling window, so the tracking still answers it.
+    for (uint32_t h = kMainActive - 10; h <= kMainActive + 120; ++h) w.c.salt[h] = 0xb2;
+    w.c.tip = kMainActive + 120;
+    const auto kept = w.t->reconcile_with_chain();
+    ASSERT_TRUE(kept.has_value());
+    EXPECT_LT(*kept, kMainActive - 9) << "coverage cut back below the fork";
+    w.advance(kMainActive + 120);
+    EXPECT_EQ(w.st->activation_height(DashDeployment::V24), std::optional<uint32_t>(kMainActive));
+    EXPECT_EQ(wire.refresh(), std::optional<uint32_t>(kMainActive));
+    EXPECT_EQ(sm.v24_height(), kMainActive);
+    // The new branch's activation block folds under v24.
+    sm.load({}, kMainActive - 1);
+    EXPECT_TRUE(sm.apply_block(cbtx_block(kMainActive, uint256{}, 4), kMainActive).refused.empty());
+    EXPECT_EQ(sm.v24_contradictions(), 0u);
+}
+
+TEST(DashV24Activation, ColdRestartAfterActivationFoldsByTheBlocks)
+{
+    // A cold restart after activation without the persisted file, before the
+    // tracker has rescanned: each block's statement decides, nothing is
+    // adopted.
+    MnStateMachine sm;
+    sm.set_v24_earliest(v24_earliest_unmeasured_activation(DashNetwork::MAINNET));
+    sm.load({}, kMainActive + 9);
+    auto r = sm.apply_block(cbtx_block(kMainActive + 10, uint256{}, 4), kMainActive + 10);
+    EXPECT_TRUE(r.refused.empty()) << r.refused;
+    EXPECT_EQ(sm.v24_height(), kV24HeightUnknown);
+    replay::DmlFoldEngine eng(mainnet_fold_cfg());
+    eng.seed({}, 0, kMainActive + 9, height_hash(3, 0xa1));
+    const auto f = eng.fold_block(cbtx_block(kMainActive + 10, eng.block_hash(), 4), kMainActive + 10);
+    EXPECT_TRUE(f.ok) << f.error;
+    EXPECT_EQ(eng.v24_height(), std::numeric_limits<int32_t>::max());
+}
+
+TEST(DashV24Activation, TestnetHeightComesFromTheSameTrackingAndMatches)
+{
+    // Testnet's activation is history: the same tracking answers the buried
+    // height, which equals the replay fold's testnet gate and the height the
+    // versionbits machine derives from the real testnet headers.
+    DashDeploymentStatus st(DashNetwork::TESTNET, [](uint32_t) { return std::optional<VbBlockInfo>{}; },
+                            [] { return std::optional<uint32_t>(1'586'000); }, nullptr);
+    V24TrackingView v;
+    v.activation_height = [&st] { return st.activation_height(DashDeployment::V24); };
+    v.state = [&st](uint32_t h) { return st.v24_state(h); };
+    v.refuted = [&st] { return st.latch() != V24Latch::NONE; };
+    v.tip = [] { return std::optional<uint32_t>(1'586'000); };
+    V24ActivationWire wire(DashNetwork::TESTNET, v);
+    MnStateMachine sm;
+    wire.add_sink([&](uint32_t h) { sm.set_v24_height(h); });
+    EXPECT_EQ(wire.refresh(), std::optional<uint32_t>(1'578'000));
+    EXPECT_EQ(sm.v24_height(), 1'578'000u);
+    EXPECT_EQ(static_cast<uint32_t>(replay::FoldGates::testnet().v24_height), 1'578'000u);
+    EXPECT_EQ(replay::FoldGates::testnet().v24_earliest, 1'578'000u);
+    TestnetChain tc;
+    DashDeploymentParams p = dash_deployment_params(DashNetwork::TESTNET);
+    p.v24_buried_height.reset();
+    VersionBitsChecker vb(p, DashDeployment::V24, tc.fn());
+    EXPECT_EQ(vb.state_since_height(1'577'999, 1'565'132), std::optional<int64_t>(1'578'000));
+}
+
+// ── order_service_updates (service_update_order.hpp): invariants over
+// random parent-before-child bodies (independent verifier's property test).
+// ── order_service_updates: property fuzz over random DAG bodies ────────────
+namespace {
+struct FuzzBody {
+    std::vector<ServiceOrderTx> txs;
+};
+FuzzBody random_body(std::mt19937_64& rng, size_t n, int nmn)
+{
+    FuzzBody b;
+    auto id = [](size_t i) {
+        uint256 h;
+        h.data()[0] = static_cast<uint8_t>(i & 0xff);
+        h.data()[1] = static_cast<uint8_t>((i >> 8) & 0xff);
+        h.data()[31] = 0x5a;
+        return h;
+    };
+    auto mn = [](int m) {
+        uint256 h;
+        h.data()[0] = static_cast<uint8_t>(0xc0 + m);
+        h.data()[30] = 0x77;
+        return h;
+    };
+    for (size_t i = 0; i < n; ++i) {
+        ServiceOrderTx t;
+        t.txid = id(i);
+        // parents among earlier txs (topological input order)
+        const int np = static_cast<int>(rng() % 3);
+        for (int k = 0; k < np && i > 0; ++k) t.spends.push_back(id(rng() % i));
+        t.spends.push_back(uint256::ONE);   // a confirmed coin
+        const int kind = static_cast<int>(rng() % 10);
+        if (kind < 3) t.service_update_of = mn(static_cast<int>(rng() % nmn));
+        else if (kind < 5) t.key_change_of = mn(static_cast<int>(rng() % nmn));
+        else if (kind == 5) t.unorderable_kind = true;
+        b.txs.push_back(std::move(t));
+    }
+    return b;
+}
+} // namespace
+
+TEST(DashServiceOrder, FuzzInvariants)
+{
+    std::mt19937_64 rng(0xC0FFEE);
+    size_t moved_total = 0, dropped_total = 0;
+    for (int iter = 0; iter < 20000; ++iter) {
+        const size_t n = 1 + rng() % 14;
+        const auto b = random_body(rng, n, 1 + static_cast<int>(rng() % 3));
+        const auto r = order_service_updates(b.txs);
+        moved_total += r.moved;
+        dropped_total += r.dropped.size();
+        std::set<size_t> dropped;
+        for (const auto& d : r.dropped) dropped.insert(d.first);
+        // 1. every tx is either placed exactly once or dropped
+        std::set<size_t> placed;
+        for (size_t i : r.order) ASSERT_TRUE(placed.insert(i).second) << "placed twice iter=" << iter;
+        for (size_t i = 0; i < n; ++i)
+            ASSERT_TRUE(placed.count(i) + dropped.count(i) == 1) << "tx " << i << " lost/duplicated iter=" << iter;
+        // 2. parents before children; no kept child of a dropped parent
+        std::map<uint256, size_t> pos;
+        for (size_t k = 0; k < r.order.size(); ++k) pos[b.txs[r.order[k]].txid] = k;
+        std::map<uint256, size_t> idx;
+        for (size_t i = 0; i < n; ++i) idx[b.txs[i].txid] = i;
+        for (size_t k = 0; k < r.order.size(); ++k) {
+            const auto& t = b.txs[r.order[k]];
+            for (const auto& s : t.spends) {
+                auto it = idx.find(s);
+                if (it == idx.end()) continue;
+                ASSERT_FALSE(dropped.count(it->second)) << "kept child of dropped parent iter=" << iter;
+                ASSERT_LT(pos.at(s), k) << "child before parent iter=" << iter;
+            }
+        }
+        // 3. no service update of X after a key change of X
+        std::set<uint256> changed;
+        for (size_t k = 0; k < r.order.size(); ++k) {
+            const auto& t = b.txs[r.order[k]];
+            if (t.service_update_of) ASSERT_FALSE(changed.count(*t.service_update_of)) << "iter=" << iter;
+            if (t.key_change_of) changed.insert(*t.key_change_of);
+        }
+        // 4. only service updates and their descendants are left out:
+        //    a dropped tx is a service update or a descendant of a dropped tx
+        for (size_t d : dropped) {
+            bool ok = b.txs[d].service_update_of.has_value();
+            for (const auto& s : b.txs[d].spends) {
+                auto it = idx.find(s);
+                if (it != idx.end() && dropped.count(it->second)) ok = true;
+            }
+            ASSERT_TRUE(ok) << "dropped a non-service, non-descendant tx iter=" << iter;
+        }
+        // 5. key changes and unorderable kinds keep their relative order
+        std::vector<size_t> fixed_in, fixed_out;
+        for (size_t i = 0; i < n; ++i)
+            if (b.txs[i].key_change_of || b.txs[i].unorderable_kind) fixed_in.push_back(i);
+        for (size_t i : r.order)
+            if (b.txs[i].key_change_of || b.txs[i].unorderable_kind) fixed_out.push_back(i);
+        std::vector<size_t> fixed_in_kept;
+        for (size_t i : fixed_in) if (!dropped.count(i)) fixed_in_kept.push_back(i);
+        ASSERT_EQ(fixed_in_kept, fixed_out) << "iter=" << iter;
+    }
+    EXPECT_GT(moved_total, 0u);
+    EXPECT_GT(dropped_total, 0u);
+}
+
+// ── The independent verifier's delta KATs on the activation wire (fbfea8f58) ──
+namespace {
+constexpr uint32_t kDeltaAct = 2'580'480;
+
+BlockType delta_block(uint32_t height, const uint256& prev, uint16_t cbver, std::vector<MutableTransaction> extra = {})
+{
+    vendor::CCbTx cb;
+    cb.nVersion = cbver;
+    cb.nHeight = static_cast<int32_t>(height);
+    MutableTransaction tx;
+    tx.version = 3;
+    tx.type = 5;
+    bitcoin_family::coin::TxIn in;
+    in.prevout.hash.SetNull();
+    in.prevout.index = 0xffffffff;
+    in.sequence = 0xffffffff;
+    tx.vin.push_back(in);
+    auto ps = ::pack(cb);
+    auto sp = ps.get_span();
+    tx.extra_payload.assign(reinterpret_cast<const unsigned char*>(sp.data()),
+                            reinterpret_cast<const unsigned char*>(sp.data()) + sp.size());
+    BlockType b;
+    b.m_version = 0x20000000;
+    b.m_previous_block = prev;
+    b.m_timestamp = 1'800'000'000 + height;
+    b.m_bits = 0x1e0fffff;
+    b.m_nonce = height;
+    b.m_txs.push_back(tx);
+    for (auto& t : extra) b.m_txs.push_back(std::move(t));
+    return b;
+}
+std::string delta_tmp(const char* tag)
+{
+    return (std::filesystem::temp_directory_path()
+            / ("verify-delta-" + std::string(tag) + "-" + std::to_string(std::random_device{}()) + ".v1"))
+        .string();
+}
+V24TrackingView delta_view(std::optional<uint32_t> h, V24State st, std::optional<uint32_t> tip, bool refuted = false)
+{
+    V24TrackingView v;
+    v.activation_height = [h] { return h; };
+    v.state = [st](uint32_t) { return st; };
+    v.refuted = [refuted] { return refuted; };
+    v.tip = [tip] { return tip; };
+    return v;
+}
+} // namespace
+
+// Strict parse: a fuzz of near-miss spellings never yields a height, and only
+// period starts >= 2,580,480 are ever accepted on mainnet.
+TEST(DashV24ActivationDelta, PersistedFileParseIsStrict)
+{
+    const std::string M = "c2pool-dash-v24-activation/1";
+    const std::vector<std::string> bad = {
+        M + " 0 2580480 x", M + "  0 2580480", M + " 0  2580480", M + "\t0 2580480",
+        M + " 0 02580480", M + " 0 +2580480", M + " 0 2580481", M + " 0 2576448", M + " 0 1",
+        M + " 1 2580480", M + " 00 2580480", M + " 0 4294967295", M + " 0 99999999999", M + " 0 -2580480",
+        "c2pool-dash-v24-activation/2 0 2580480", M + " 0 2580480 ", " " + M + " 0 2580480", M + " 0",
+        M + " 0 2580480\r\nextra"};
+    for (const auto& s : bad)
+        EXPECT_EQ(V24ActivationWire::parse(DashNetwork::MAINNET, s), std::nullopt) << "accepted: [" << s << "]";
+    EXPECT_EQ(V24ActivationWire::parse(DashNetwork::MAINNET, M + " 0 2580480\r\n"), std::optional<uint32_t>(kDeltaAct));
+    EXPECT_EQ(V24ActivationWire::parse(DashNetwork::MAINNET, M + " 0 2584512"), std::optional<uint32_t>(kDeltaAct + 4032));
+    // random fuzz: anything accepted must be plausible
+    std::mt19937_64 rng(7);
+    const std::string alphabet = "0123456789 \n\r\t+-x";
+    for (int i = 0; i < 200000; ++i) {
+        std::string s = M + " 0 ";
+        const int n = 1 + static_cast<int>(rng() % 9);
+        for (int k = 0; k < n; ++k) s.push_back(alphabet[rng() % alphabet.size()]);
+        if (const auto h = V24ActivationWire::parse(DashNetwork::MAINNET, s)) {
+            ASSERT_EQ(*h % 4032, 0u) << s;
+            ASSERT_GE(*h, kDeltaAct) << s;
+        }
+    }
+    // testnet: only the buried height
+    EXPECT_EQ(V24ActivationWire::parse(DashNetwork::TESTNET, M + " 1 1578000"), std::optional<uint32_t>(1'578'000));
+    EXPECT_EQ(V24ActivationWire::parse(DashNetwork::TESTNET, M + " 1 1578100"), std::nullopt);
+}
+
+// Settlement boundary: deciding block = h - 4032 - 1; pushed only at tip >= deciding + 100.
+TEST(DashV24ActivationDelta, PushedOnlyWhenTheDecidingBlockIs100Deep)
+{
+    const uint32_t deciding = kDeltaAct - 4032 - 1;
+    for (uint32_t tip : {deciding, deciding + 99, deciding + 100, deciding + 101}) {
+        V24ActivationWire wire(DashNetwork::MAINNET, delta_view(kDeltaAct, V24State::UNKNOWN, tip));
+        std::optional<uint32_t> got;
+        wire.add_sink([&](uint32_t h) { got = h; });
+        wire.refresh();
+        if (tip >= deciding + 100)
+            EXPECT_EQ(got, std::optional<uint32_t>(kDeltaAct)) << tip;
+        else
+            EXPECT_EQ(got, std::nullopt) << tip;
+    }
+    // An implausible tracking answer is never pushed, however deep.
+    V24ActivationWire wire(DashNetwork::MAINNET, delta_view(kDeltaAct + 1, V24State::UNKNOWN, kDeltaAct + 100000));
+    std::optional<uint32_t> got;
+    wire.add_sink([&](uint32_t h) { got = h; });
+    wire.refresh();
+    EXPECT_EQ(got, std::nullopt);
+}
+
+// A stale but plausible persisted height that the tracking later contradicts
+// is withdrawn and the file deleted; the latch withdraws too.
+TEST(DashV24ActivationDelta, StaleFileIsWithdrawnByTheTrackingOrTheLatch)
+{
+    const std::string path = delta_tmp("stale");
+    {
+        std::ofstream o(path);
+        o << V24ActivationWire::serialize(DashNetwork::MAINNET, kDeltaAct);
+    }
+    {
+        V24ActivationWire wire(DashNetwork::MAINNET, delta_view(std::nullopt, V24State::UNKNOWN, std::nullopt), path);
+        std::vector<uint32_t> pushed;
+        wire.add_sink([&](uint32_t h) { pushed.push_back(h); });
+        EXPECT_TRUE(wire.load());
+        wire.refresh();   // tracking undecided: kept
+        EXPECT_EQ(wire.applied(), std::optional<uint32_t>(kDeltaAct));
+        wire.set_view(delta_view(std::nullopt, V24State::INACTIVE, kDeltaAct + 10));
+        wire.refresh();
+        EXPECT_EQ(wire.applied(), std::nullopt);
+        ASSERT_EQ(pushed.size(), 2u);
+        EXPECT_EQ(pushed[1], kV24HeightUnknown);
+        EXPECT_FALSE(std::filesystem::exists(path));
+    }
+    {
+        std::ofstream o(path);
+        o << V24ActivationWire::serialize(DashNetwork::MAINNET, kDeltaAct);
+    }
+    {
+        V24ActivationWire wire(DashNetwork::MAINNET, delta_view(std::nullopt, V24State::UNKNOWN, std::nullopt, true), path);
+        EXPECT_TRUE(wire.load());
+        wire.refresh();
+        EXPECT_EQ(wire.applied(), std::nullopt);
+        EXPECT_FALSE(std::filesystem::exists(path));
+    }
+    std::remove(path.c_str());
+}
+
+// A Core-invalid block (CbTx v4 at/after the earliest height but before the
+// real activation) is folded by the engines as it states and counted; the
+// templates are gated by the deployment status, whose cross-check latches on
+// exactly this block (DashV24Deployments.CrossCheck*).
+TEST(DashV24ActivationDelta, InvalidV4AboveEarliestFoldsButTheStatusLatches)
+{
+    const uint32_t real = kDeltaAct + 4032;   // the chain activates one period later
+    MnStateMachine sm;
+    sm.set_v24_earliest(v24_earliest_unmeasured_activation(DashNetwork::MAINNET));
+    sm.set_v24_height(real);
+    sm.load({}, kDeltaAct + 9);
+    const auto r = sm.apply_block(delta_block(kDeltaAct + 10, uint256{}, 4), kDeltaAct + 10);
+    EXPECT_TRUE(r.refused.empty()) << "folded as it states (was: refused) " << r.refused;
+    EXPECT_EQ(sm.v24_contradictions(), 1u);
+    // CbTx v5 (bad-cbtx-version in Core: >= UNKNOWN) is invalid, never "v24".
+    EXPECT_FALSE(v24_block_switch(kDeltaAct + 11, real, uint16_t{5}, kDeltaAct).active);
+    EXPECT_TRUE(v24_block_switch(kDeltaAct + 11, real, uint16_t{5}, kDeltaAct).invalid.has_value());
 }

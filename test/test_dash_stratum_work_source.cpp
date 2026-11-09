@@ -16,6 +16,7 @@
 // allowlist, or it becomes a #143-style NOT_BUILT sentinel that reds master.
 
 #include <impl/dash/stratum/work_source.hpp>
+#include <impl/dash/coin/vendor/bls_mode_guard.hpp>  // DashBlsModeGuard
 
 #include <impl/dash/stratum/submit_payee_guard.hpp>  // check_submit_payee (stale-payee fix)
 #include <impl/dash/stratum/won_block_record.hpp>    // won_block_height (stale-job block height)
@@ -4674,4 +4675,21 @@ TEST(DashPoseOracleRefresh, MainDashReSourcesFromTheOracleBlockHandler)
     ASSERT_NE(gen, std::string::npos);
     ASSERT_NE(ntf, std::string::npos);
     EXPECT_LT(ntf - due, 900u) << "the same invalidate + bump + notify as a tip change";
+}
+
+// One BLS mode per binary (vendor/bls_mode_guard.hpp): work_source.cpp
+// (dash_stratum) inlines the BLS-dependent provider-tx checks and template
+// builder, so it must be compiled in the same mode as every other TU of the
+// binary. With the backend in the build (C2POOL_DASH_BLS_EXPECTED), that mode
+// is the backend: a dash_stratum compiled without C2POOL_DASH_BLS fails here
+// (and c2pool-dash refuses to start).
+TEST(DashBlsModeGuard, StratumObjectsShareTheBuildsBlsMode)
+{
+    using namespace dash::coin::vendor;
+    EXPECT_FALSE(bls_mode_mixed()) << "modes seen: " << bls_modes();
+#if defined(C2POOL_DASH_BLS_EXPECTED)
+    EXPECT_EQ(bls_modes(), kBlsModeBackend) << "a translation unit was compiled without C2POOL_DASH_BLS";
+#else
+    EXPECT_EQ(bls_modes(), kBlsModeStub);
+#endif
 }
