@@ -479,6 +479,9 @@ struct FoldGates
     // (v24_earliest_unmeasured_activation): a block stating v24 below it is
     // refused (dashd rejects it). 0: not checked.
     uint32_t v24_earliest{0};
+    // The network's V20 height for the CbTx version rules (CheckCbTx: 3+ from
+    // V20 on, below 3 before it). 0: not checked.
+    uint32_t v20_height{0};
 
     /// v24_height in the v24_activation.hpp convention.
     uint32_t v24_height_u32() const
@@ -706,6 +709,7 @@ public:
                                                                       : static_cast<int32_t>(h); }
     int32_t v24_height() const { return m_cfg.gates.v24_height; }
     void    set_v24_earliest(uint32_t h) { m_cfg.gates.v24_earliest = h; }
+    void    set_v20_height(uint32_t h) { m_cfg.gates.v20_height = h; }
     /// Blocks whose CbTx statement disagreed with the pushed height.
     uint64_t v24_contradictions() const { return m_v24_contradictions; }
     uint64_t           total_registered_count() const { return m_total_registered_count; }
@@ -1032,10 +1036,11 @@ public:
 
         // Dash Core v24 switch for THIS block (v24_activation.hpp): the CbTx
         // version the block states decides how it folds; the pushed height
-        // only cross-checks it. A v24 statement below the earliest possible
-        // activation is a block dashd rejects.
+        // only cross-checks it. A CbTx version dashd rejects (CheckCbTx, incl.
+        // a v24 statement below the earliest possible activation) refuses the
+        // block.
         const auto v24_sw = v24_block_switch(height, m_cfg.gates.v24_height_u32(), cbtx.nVersion,
-                                             m_cfg.gates.v24_earliest);
+                                             m_cfg.gates.v24_earliest, m_cfg.gates.v20_height);
         if (v24_sw.invalid) {
             r.refused_unchanged = true;
             r.error = "fold refused at h=" + std::to_string(height) + ": " + *v24_sw.invalid
@@ -1090,7 +1095,7 @@ public:
         // height is logged and counted, never refused (v24_activation.hpp).
         {
             const auto sw = v24_block_switch(height, m_cfg.gates.v24_height_u32(), block_cbtx_version(block),
-                                             m_cfg.gates.v24_earliest);
+                                             m_cfg.gates.v24_earliest, m_cfg.gates.v20_height);
             if (sw.contradiction) {
                 const uint64_t n = ++m_v24_contradictions;
                 if (n <= 3 || n % 100 == 0)

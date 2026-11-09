@@ -15,9 +15,11 @@
 /// block on a branch that is reorged away, or one dashd rejects, cannot
 /// move the switch of any other block.
 ///
-///   * A block stating v24 below the earliest height v24 can be active on
-///     its network (v24_earliest_unmeasured_activation) is one dashd rejects
-///     (bad-cbtx-version): the engines refuse it before any mutation.
+///   * A block whose CbTx version Dash Core rejects (CheckCbTx,
+///     bad-cbtx-version: version 0 or 5+, below 3 from V20 on, 3+ before V20,
+///     and 4 below the earliest height v24 can be active on its network,
+///     v24_earliest_unmeasured_activation) is refused by the engines before
+///     any mutation.
 ///   * The activation height the deployment tracking derives
 ///     (V24ActivationWire, v24_activation_wire.hpp) is a cross-check: a block
 ///     that disagrees with it is folded as it states (it is the chain), and
@@ -84,12 +86,45 @@ struct V24BlockSwitch
     std::optional<std::string> contradiction;
 };
 
+/// CheckCbTx's version rules that do not need the v24 state: the version is
+/// one Core knows (1..4), at least 3 from V20 on and below 3 before it.
+/// `v20_height` 0: the V20 rules are not checked (not known here).
+inline std::optional<std::string> cbtx_version_refusal(uint32_t height, std::optional<uint16_t> cbtx_version,
+                                                       uint32_t v20_height)
+{
+    if (!cbtx_version) {
+        if (v20_height != 0 && height >= v20_height)
+            return "bad-cbtx-version: the block at h=" + std::to_string(height) + " carries no CbTx after V20";
+        return std::nullopt;
+    }
+    const uint16_t v = *cbtx_version;
+    if (v == 0 || v > vendor::CCbTx::VERSION_MERKLE_ROOT_ASSETUNLOCKS)
+        return "bad-cbtx-version: CbTx version " + std::to_string(v) + " at h=" + std::to_string(height)
+             + " is not one Dash Core knows";
+    if (v20_height != 0) {
+        const bool v20 = height >= v20_height;
+        if (v20 && v < vendor::CCbTx::VERSION_CLSIG_AND_BALANCE)
+            return "bad-cbtx-version: CbTx version " + std::to_string(v) + " at h=" + std::to_string(height)
+                 + " after V20 (" + std::to_string(v20_height) + ")";
+        if (!v20 && v >= vendor::CCbTx::VERSION_CLSIG_AND_BALANCE)
+            return "bad-cbtx-version: CbTx version " + std::to_string(v) + " at h=" + std::to_string(height)
+                 + " before V20 (" + std::to_string(v20_height) + ")";
+    }
+    return std::nullopt;
+}
+
 /// `earliest`: the earliest height v24 can be active on the network
-/// (v24_earliest_unmeasured_activation), 0 when not known.
+/// (v24_earliest_unmeasured_activation); `v20_height`: the network's V20
+/// height. 0: that bound is not checked.
 inline V24BlockSwitch v24_block_switch(uint32_t height, uint32_t activation_height,
-                                       std::optional<uint16_t> cbtx_version, uint32_t earliest = 0)
+                                       std::optional<uint16_t> cbtx_version, uint32_t earliest = 0,
+                                       uint32_t v20_height = 0)
 {
     V24BlockSwitch s;
+    if (auto why = cbtx_version_refusal(height, cbtx_version, v20_height)) {
+        s.invalid = std::move(why);
+        return s;
+    }
     const bool states = cbtx_version && *cbtx_version >= vendor::CCbTx::VERSION_CLSIG_AND_BALANCE;
     const bool stated = states && *cbtx_version >= vendor::CCbTx::VERSION_MERKLE_ROOT_ASSETUNLOCKS;
     const bool known = activation_height != kV24HeightUnknown;

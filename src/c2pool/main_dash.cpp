@@ -3214,8 +3214,12 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // states (v24_activation.hpp); a v24 statement below the earliest
     // possible activation is a block dashd rejects. The tracking's activation
     // height arrives through V24ActivationWire (below) as a cross-check.
-    node_coin_state.mnstates().set_v24_earliest(dash::coin::v24_earliest_unmeasured_activation(
-        dash::SharechainConfig::is_testnet ? dash::coin::DashNetwork::TESTNET : dash::coin::DashNetwork::MAINNET));
+    {
+        const auto fold_net =
+            dash::SharechainConfig::is_testnet ? dash::coin::DashNetwork::TESTNET : dash::coin::DashNetwork::MAINNET;
+        node_coin_state.mnstates().set_v24_earliest(dash::coin::v24_earliest_unmeasured_activation(fold_net));
+        node_coin_state.mnstates().set_v20_height(dash::coin::dash_deployment_params(fold_net).v20_height);
+    }
     if (dash::SharechainConfig::is_testnet) {
         // The projection's chain heights from the same testnet gates the
         // replay engines use (FoldGates::testnet()): DIP3 activation for its
@@ -8208,9 +8212,23 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 std::stringstream ss;
                 if (lf) ss << lf.rdbuf();
                 if (lf && v24_status->deserialize_latch(ss.str())
-                    && v24_status->latch() != dash::coin::V24Latch::NONE)
+                    && v24_status->latch() != dash::coin::V24Latch::NONE) {
                     LOG_WARNING << "[DASH-V24] cross-check latch RESTORED from " << latch_path
                                 << ": " << ss.str();
+                    // The block that set it may have left our best chain
+                    // while we were down (reorged out, orphaned): then the
+                    // latch clears now, and the record with it.
+                    v24_status->revalidate_latch();
+                    if (v24_status->latch() == dash::coin::V24Latch::NONE) {
+                        const std::string tmp = latch_path + ".tmp";
+                        {
+                            std::ofstream out(tmp, std::ios::trunc);
+                            out << v24_status->serialize_latch();
+                        }
+                        if (std::rename(tmp.c_str(), latch_path.c_str()) != 0)
+                            LOG_WARNING << "[DASH-V24] could not persist " << latch_path;
+                    }
+                }
             }
             dash::coin::install_dash_deployment_status(v24_net, v24_status);
             // The embedded template is decided for the block it builds; an
@@ -9535,6 +9553,9 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     else
                         fcfg.gates.v24_earliest =
                             dash::coin::v24_earliest_unmeasured_activation(dash::coin::DashNetwork::MAINNET);
+                    fcfg.gates.v20_height = dash::coin::dash_deployment_params(
+                        dash::SharechainConfig::is_testnet ? dash::coin::DashNetwork::TESTNET
+                                                           : dash::coin::DashNetwork::MAINNET).v20_height;
                     mn_bridge_fold_engine =
                         std::make_unique<rp::DmlFoldEngine>(fcfg);
                     if (v24_wire)
@@ -10078,6 +10099,9 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 else
                     fcfg.gates.v24_earliest =
                         dash::coin::v24_earliest_unmeasured_activation(dash::coin::DashNetwork::MAINNET);
+                fcfg.gates.v20_height = dash::coin::dash_deployment_params(
+                    dash::SharechainConfig::is_testnet ? dash::coin::DashNetwork::TESTNET
+                                                       : dash::coin::DashNetwork::MAINNET).v20_height;
                 replay_fold_engine =
                     std::make_unique<rp::DmlFoldEngine>(fcfg);
                 if (v24_wire)

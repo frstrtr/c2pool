@@ -504,6 +504,9 @@ public:
     /// (v24_earliest_unmeasured_activation); a block stating v24 below it is
     /// refused. 0 (default): not checked.
     void set_v24_earliest(uint32_t h) { m_v24_earliest = h; }
+    /// The network's V20 height: from it a block's CbTx must be version 3+,
+    /// before it below 3 (CheckCbTx). 0 (default): not checked.
+    void set_v20_height(uint32_t h) { m_v20_height = h; }
     void set_netinfo_rules(const vendor::NetInfoRules& r) { m_netinfo_rules = r; }
     uint32_t v24_height() const { return m_v24_height; }
     /// Blocks whose CbTx statement disagreed with the pushed height.
@@ -1348,7 +1351,8 @@ public:
         // statement below the earliest possible activation is a block dashd
         // rejects: refused before any mutation.
         {
-            const auto sw = v24_block_switch(height, m_v24_height, block_cbtx_version(block), m_v24_earliest);
+            const auto sw = v24_block_switch(height, m_v24_height, block_cbtx_version(block), m_v24_earliest,
+                                             m_v20_height);
             if (sw.invalid) {
                 r.refused = *sw.invalid;
                 r.total_after = m_entries.size();
@@ -2276,6 +2280,7 @@ private:
     // own CbTx version (v24_activation.hpp).
     uint32_t m_v24_height{kV24HeightUnknown};
     uint32_t m_v24_earliest{0};
+    uint32_t m_v20_height{0};
     uint64_t m_v24_contradictions{0};
     std::optional<std::pair<uint32_t, bool>> m_block_v24;
     vendor::NetInfoRules m_netinfo_rules{vendor::NetInfoRules::mainnet()};

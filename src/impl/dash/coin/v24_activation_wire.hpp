@@ -167,12 +167,13 @@ public:
         return std::string(kMagic) + " " + std::to_string(static_cast<int>(net)) + " " + std::to_string(height)
              + "\n";
     }
-    /// Exactly "<magic> <network> <height>" and an optional line end; the
-    /// height must be a plausible activation height for `net`.
+    /// Exactly "<magic> <network> <height>" and at most one line end ("\n"
+    /// or "\r\n"); the height must be a plausible activation height for `net`.
     static std::optional<uint32_t> parse(DashNetwork net, const std::string& text)
     {
         std::string body = text;
-        while (!body.empty() && (body.back() == '\n' || body.back() == '\r')) body.pop_back();
+        if (body.size() >= 2 && body.compare(body.size() - 2, 2, "\r\n") == 0) body.resize(body.size() - 2);
+        else if (!body.empty() && body.back() == '\n') body.pop_back();
         std::vector<std::string> tok;
         size_t i = 0;
         while (i <= body.size()) {

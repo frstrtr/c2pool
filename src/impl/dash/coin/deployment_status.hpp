@@ -194,9 +194,35 @@ public:
     {
         if (m_closed.load()) return V24CrossCheck::UNDECIDED;
         if (m_params.v24_buried_height) return V24CrossCheck::UNDECIDED;   // history
+        revalidate_latch();
         {
             auto b = m_chain(height);
             if (!b || b->hash != block_hash) return V24CrossCheck::UNDECIDED;
+        }
+        // A CbTx version Dash Core rejects whatever the v24 state (CheckCbTx:
+        // 0 or 5+, below 3 from V20 on, 3+ before V20) agrees with no answer:
+        // latch at the bound level (everything but a buried height UNKNOWN).
+        // Only this block leaving our best chain clears it.
+        if (cbtx_version_invalid(height, cbtx_version)) {
+            uint64_t n = 0;
+            {
+                std::lock_guard<std::mutex> lk(m_latch_mutex);
+                m_latch = V24Latch::BOUND;
+                m_latch_height = height;
+                m_latch_hash = block_hash;
+                m_latch_chain_active = cbtx_version >= 4;
+                m_latch_invalid_version = true;
+                ++m_latch_version;
+                n = ++m_contradictions;
+            }
+            if (n <= 3 || (n % 100) == 0)
+                LOG_ERROR << "[DASH-V24] CROSS-CHECK FAILED h=" << height << " "
+                          << block_hash.GetHex().substr(0, 16) << ": CbTx version " << cbtx_version
+                          << " is one Dash Core rejects at this height (bad-cbtx-version) -- v24 state LATCHED"
+                             " UNKNOWN until this block leaves our best chain; the embedded arm fails closed"
+                             " (v24-state-unknown). contradictions="
+                          << n;
+            return V24CrossCheck::CONTRADICTS;
         }
         const bool chain_active = cbtx_version >= 4;
         maybe_clear_latch(height, chain_active);
@@ -222,7 +248,9 @@ public:
                 ++m_latch_version;
                 if (level != V24Latch::NONE) {
                     m_latch_height = height;
+                    m_latch_hash = block_hash;
                     m_latch_chain_active = chain_active;
+                    m_latch_invalid_version = false;
                 }
                 if (round == 0) n = ++m_contradictions;
             }
@@ -270,13 +298,18 @@ public:
     /// The latch as a small text record (v24_latch.v1), and back. A restart
     /// keeps a refuted state refuted instead of serving it again until the
     /// next connected block re-latches it. Only for the same network.
+    /// v2 adds the latched block's hash and whether its CbTx version was one
+    /// Core rejects, so a restart can tell whether that block is still on our
+    /// best chain (revalidate_latch). v1 records (no hash) still load.
     std::string serialize_latch() const
     {
         std::lock_guard<std::mutex> lk(m_latch_mutex);
-        return "v24_latch v1 " + std::to_string(static_cast<int>(m_params.network)) + " "
+        return "v24_latch v2 " + std::to_string(static_cast<int>(m_params.network)) + " "
              + std::to_string(static_cast<int>(m_latch)) + " " + std::to_string(m_latch_height) + " "
              + (m_latch_chain_active ? "1" : "0") + " " + (m_pin_refuted ? "1" : "0") + " "
-             + std::to_string(m_pin.value_or(0)) + " " + std::to_string(m_contradictions) + "\n";
+             + std::to_string(m_pin.value_or(0)) + " " + std::to_string(m_contradictions) + " "
+             + (m_latch_hash.IsNull() ? std::string("-") : m_latch_hash.GetHex()) + " "
+             + (m_latch_invalid_version ? "1" : "0") + "\n";
     }
     bool deserialize_latch(const std::string& text)
     {
@@ -286,11 +319,25 @@ public:
         uint32_t h = 0, pin_height = 0;
         uint64_t n = 0;
         if (!(in >> tag >> ver >> net >> level >> h >> active >> pin >> pin_height >> n)) return false;
-        if (tag != "v24_latch" || ver != "v1" || net != static_cast<int>(m_params.network)) return false;
+        if (tag != "v24_latch" || (ver != "v1" && ver != "v2") || net != static_cast<int>(m_params.network))
+            return false;
         if (level < 0 || level > static_cast<int>(V24Latch::BOUND)) return false;
+        uint256 hash;
+        int invalid = 0;
+        if (ver == "v2") {
+            std::string hex;
+            if (!(in >> hex >> invalid)) return false;
+            if (hex != "-") {
+                if (hex.size() != 64 || hex.find_first_not_of("0123456789abcdef") != std::string::npos)
+                    return false;
+                hash.SetHex(hex);
+            }
+        }
         std::lock_guard<std::mutex> lk(m_latch_mutex);
         m_latch = static_cast<V24Latch>(level);
         m_latch_height = h;
+        m_latch_hash = hash;
+        m_latch_invalid_version = invalid != 0;
         m_latch_chain_active = active != 0;
         // A refuted pin stays refuted only while it is the same pin: the node
         // sets the pin before loading, and a changed pin is a new operator
@@ -355,6 +402,9 @@ private:
         {
             std::lock_guard<std::mutex> lk(m_latch_mutex);
             if (m_latch == V24Latch::NONE) return;
+            // A CbTx version Core rejects is refuted by nothing but the block
+            // leaving the chain (revalidate_latch).
+            if (m_latch_invalid_version) return;
             lh = m_latch_height;
             lactive = m_latch_chain_active;
         }
@@ -373,7 +423,48 @@ private:
                     << " and h=" << height;
     }
 
+    /// CheckCbTx's version rules that need no v24 state.
+    bool cbtx_version_invalid(uint32_t height, uint16_t v) const
+    {
+        if (v == 0 || v > 4) return true;
+        if (m_params.v20_height == 0) return false;
+        const bool v20 = height >= m_params.v20_height;
+        return v20 ? v < 3 : v >= 3;
+    }
+
 public:
+    /// Clear the latch when the block that set it is no longer on our best
+    /// chain (reorged out, orphaned): our chain view holds a different block
+    /// at that height. While that block is on the best chain (or the view
+    /// cannot tell: no header there yet, a record without a hash) the latch
+    /// stays. Called on every cross-check and by the node after it restores
+    /// a persisted latch.
+    void revalidate_latch()
+    {
+        if (m_closed.load()) return;
+        uint32_t lh;
+        uint256 lhash;
+        {
+            std::lock_guard<std::mutex> lk(m_latch_mutex);
+            if (m_latch == V24Latch::NONE || m_latch_hash.IsNull()) return;
+            lh = m_latch_height;
+            lhash = m_latch_hash;
+        }
+        const auto b = m_chain(lh);
+        if (!b || b->hash == lhash) return;
+        {
+            std::lock_guard<std::mutex> lk(m_latch_mutex);
+            if (m_latch == V24Latch::NONE || m_latch_hash != lhash) return;
+            m_latch = V24Latch::NONE;
+            m_latch_hash.SetNull();
+            m_latch_invalid_version = false;
+            ++m_latch_version;
+        }
+        LOG_WARNING << "[DASH-V24] cross-check latch CLEARED: the block that set it (h=" << lh << " "
+                    << lhash.GetHex().substr(0, 16) << ") is no longer on our best chain (now "
+                    << b->hash.GetHex().substr(0, 16) << ")";
+    }
+
     V24State v24_state(uint32_t height) { return resolve(height, DashDeployment::V24).active; }
     bool v24_active(uint32_t height) { return v24_state(height) == V24State::ACTIVE; }
 
@@ -565,7 +656,9 @@ private:
     bool     m_pin_refuted{false};
     V24Latch m_latch{V24Latch::NONE};
     uint32_t m_latch_height{0};
+    uint256  m_latch_hash;                 ///< the block that set the latch (null: unknown)
     bool     m_latch_chain_active{false};
+    bool     m_latch_invalid_version{false};   ///< its CbTx version is one Core rejects
     uint64_t m_contradictions{0};
     uint64_t m_latch_version{0};
 };
