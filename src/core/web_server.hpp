@@ -782,6 +782,19 @@ public:
     }
     // String-based overload: converts Base58Check address to P2PKH scriptPubKey
     void set_node_fee_from_address(double percent, const std::string& address);
+    // The merged scripts written into the operator's own shares (the node-fee
+    // shares, and redistributed shares landing on the operator's key with no
+    // merged address), per merged chain id: p2pool's --merged-operator-address
+    // cascade (c2pool::merged::resolve_operator_merged_script). Empty: those
+    // shares keep the merged addresses they had.
+    void set_operator_merged_scripts(std::map<uint32_t, std::vector<unsigned char>> scripts) {
+        m_operator_merged_scripts = std::move(scripts);
+    }
+    // --redistribute: the (hash160 hex, V36 pubkey type) a share without a
+    // payout address a share can carry is given to (decide_job_payout).
+    void set_redistribute_fn(std::function<std::pair<std::string, uint8_t>()> fn) {
+        m_redistribute_fn = std::move(fn);
+    }
     // Donation script used by get_expected_payouts (p2pool protocol)
     void set_donation_script(const std::vector<unsigned char>& script) {
         m_donation_script = script;
@@ -1967,6 +1980,8 @@ private:
     double m_node_fee_percent{0.0};
     std::vector<unsigned char> m_node_fee_script;   // node operator scriptPubKey
     std::string m_node_fee_address;                 // node operator address (display/logging)
+    std::map<uint32_t, std::vector<unsigned char>> m_operator_merged_scripts;
+    std::function<std::pair<std::string, uint8_t>()> m_redistribute_fn;
     std::vector<unsigned char> m_donation_script;   // protocol donation scriptPubKey
     std::function<double()> m_stratum_hashrate_fn;  // callback to get stratum total hashrate
     std::function<RateStats()> m_stratum_rate_stats_fn;  // callback to get rate monitor stats
@@ -2015,6 +2030,9 @@ private:
     std::string m_auth_token;   // auth token for sensitive endpoints; empty = no auth
 public:
     void set_stratum_config(const StratumConfig& cfg) { m_stratum_config = cfg; }
+    bool merged_ready() const override { return !m_stratum_config.merged_chains_expected || m_mm_manager != nullptr; }
+    void decide_job_payout(std::vector<unsigned char>& payout_script,
+                           std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged) const override;
     const StratumConfig& get_stratum_config() const override { return m_stratum_config; }
     void set_cors_origin(const std::string& origin) { m_cors_origin = origin; }
     const std::string& get_cors_origin() const { return m_cors_origin; }

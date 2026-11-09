@@ -2934,24 +2934,20 @@ public:
                                 const uint256& block_target,
                                 uint64_t subsidy,
                                 uint32_t chain_id,
-                                const std::vector<unsigned char>& donation_script,
-                                const std::vector<unsigned char>& operator_ltc_script = {},
-                                const std::vector<unsigned char>& operator_merged_script = {})
+                                const std::vector<unsigned char>& donation_script)
     {
         (void)block_target;
-        return merged_payouts_from_weights(
-            get_merged_payout_weights(best_share_hash, chain_id, operator_ltc_script, operator_merged_script),
-            subsidy, donation_script);
+        return merged_payouts_from_weights(get_merged_payout_weights(best_share_hash, chain_id),
+                                           subsidy, donation_script);
     }
 
     // The tracker half of get_merged_expected_payouts: the PPLNS weights from
-    // best_share_hash, keys resolved to merged scripts (the operator override
-    // applied). Needs the tracker; the amounts do not (merged_payouts_from_weights).
+    // best_share_hash, keys resolved to merged scripts exactly as p2pool's
+    // build_canonical_merged_coinbase does (no node-local redirect: peers
+    // rebuild this coinbase from the share chain alone). Needs the tracker;
+    // the amounts do not (merged_payouts_from_weights).
     MergedPayoutWeights
-    get_merged_payout_weights(const uint256& best_share_hash,
-                              uint32_t chain_id,
-                              const std::vector<unsigned char>& operator_ltc_script = {},
-                              const std::vector<unsigned char>& operator_merged_script = {})
+    get_merged_payout_weights(const uint256& best_share_hash, uint32_t chain_id)
     {
         MergedPayoutWeights out;
         out.best = best_share_hash;
@@ -2979,12 +2975,7 @@ public:
         // per-key floors. V36 peers re-derive this coinbase and compare.
         std::map<std::vector<unsigned char>, uint288> script_weights;
         for (const auto& [key, weight] : weights) {
-            std::vector<unsigned char> script;
-            if (!operator_ltc_script.empty() && !operator_merged_script.empty() && key == operator_ltc_script) {
-                script = operator_merged_script;
-            } else {
-                script = resolve_merged_payout_script(key);
-            }
+            std::vector<unsigned char> script = resolve_merged_payout_script(key);
             if (script.empty()) continue;  // Unconvertible (P2WSH, P2TR) — skip
             script_weights[script] = script_weights[script] + weight;
             out.accepted_total = out.accepted_total + weight;

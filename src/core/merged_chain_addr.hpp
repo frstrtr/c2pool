@@ -17,9 +17,10 @@
 // server had. Versions are still shared between merged chains (P2SH 22:
 // DOGE, PEP, SHIC; Bellscoin's P2SH 30 is DOGE's P2PKH): with several chains
 // configured, an address that two of them could take, or that none
-// identifies, is refused rather than given to one of them by guessing — the
-// miner names its chain (PRIMARY/CHAIN_ID:ADDR). With one merged chain the
-// resolution is the pre-change one.
+// identifies, is not given to one of them by guessing: it is ignored (with a
+// warning) and the chains get the primary's key — the miner names its chain
+// with PRIMARY/CHAIN_ID:ADDR. With one merged chain the resolution is the
+// pre-change one.
 //
 // Script: an address of the chain itself (its own versions on the node's
 // network) pays that chain's script type (a Bellscoin P2SH stays P2SH, a
@@ -117,14 +118,40 @@ inline std::vector<unsigned char> merged_payout_script(const ChainAddrInfo* chai
 struct LoginResolution {
     std::string primary;                         // the parent payout address (after a swap)
     std::map<uint32_t, std::string> addresses;   // chain id -> address
-    std::string refuse;                          // set: refuse the authorize with this text
+    std::vector<uint32_t> from_login;            // chains the comma form / swap / case 5 named
+    // The primary is the parent coin's address, or a configured merged
+    // chain's (case 5: the parent payout uses its hash160). False (empty,
+    // invalid, another coin's): the parent payout is redistributed, or comes
+    // from case 4 (parent_script).
+    bool usable_primary{false};
+    // Case 4 (p2pool work.py): an unusable primary with a valid DOGE address
+    // as the second one: the parent payout is that address's hash160 (P2SH
+    // stays P2SH).
+    std::vector<unsigned char> parent_script;
     std::vector<std::string> notes;              // for the log
+    std::vector<std::string> warnings;           // for the log, at warning level
 };
 
 /// Resolve a login: `primary` and the optional second address `merged_raw`
 /// (comma/pipe/space/semicolon form), `explicit_addrs` from the slash form
-/// (PRIMARY/CHAIN_ID:ADDR), the configured chains, and the parent coin's own
-/// versions/HRPs on the node's network.
+/// (PRIMARY/CHAIN_ID:ADDR) and mining.set_merged_addresses, the configured
+/// chains, and the parent coin's own versions/HRPs on the node's network.
+///
+/// No login is refused here: an address that cannot be given to exactly one
+/// configured chain never loses the miner's work, it is left unspecified and
+/// the chain is resolved as if the miner had named none (with a warning):
+///   - an address that pays nothing (bad checksum, not an address at all), as
+///     p2pool does with such a second address;
+///   - with several merged chains, an address two of them could take (shared
+///     version bytes) or none identifies: the chain gets the primary's key,
+///     which the miner holds, never a guess between chains (no cross-pay).
+/// With one merged chain an address no chain identifies keeps the
+/// pre-change fallback (its hash160 goes to that chain).
+///
+/// An unusable primary (empty, invalid, another coin's) gets no auto-derived
+/// address: its shares are redistributed by the work source, merged chains
+/// included, as p2pool does (its "Case 3"); with a valid DOGE address as the
+/// second address the parent payout is that address's key (p2pool's "Case 4").
 inline LoginResolution resolve_merged_login(std::string primary, const std::string& merged_raw,
                                             std::map<uint32_t, std::string> explicit_addrs,
                                             const std::vector<ChainAddrInfo>& table,
@@ -133,6 +160,19 @@ inline LoginResolution resolve_merged_login(std::string primary, const std::stri
                                             const std::vector<std::string>& parent_hrps)
 {
     LoginResolution r;
+    // An address that pays something on `chain` (chain-agnostic when null).
+    const auto pays = [](const ChainAddrInfo* chain, const std::string& a) {
+        return !merged_payout_script(chain, a).empty();
+    };
+    for (auto it = explicit_addrs.begin(); it != explicit_addrs.end();) {
+        if (pays(find_chain(table, it->first), it->second)) {
+            ++it;
+            continue;
+        }
+        r.warnings.push_back("merged address " + it->second + " for chain_id=" + std::to_string(it->first)
+                             + " is not a valid address: ignored");
+        it = explicit_addrs.erase(it);
+    }
     r.addresses = std::move(explicit_addrs);
     std::vector<const ChainAddrInfo*> conf;   // table order: "the first configured chain"
     for (const auto& c : table)
@@ -141,7 +181,7 @@ inline LoginResolution resolve_merged_login(std::string primary, const std::stri
     const auto chains_taking = [&](const std::string& addr) {
         std::vector<const ChainAddrInfo*> out;
         for (const auto* c : conf)
-            if (core::is_address_for_chain(addr, c->hrps, c->versions))
+            if (core::is_address_for_chain(addr, c->hrps, c->versions) && pays(c, addr))
                 out.push_back(c);
         return out;
     };
@@ -151,76 +191,105 @@ inline LoginResolution resolve_merged_login(std::string primary, const std::stri
             l += (l.empty() ? "" : " and ") + std::to_string(c->chain_id);
         return l;
     };
-    // `parent`: the parent-coin address of the example (the second one of a swapped pair).
-    const auto refuse = [&](const std::string& addr, const std::string& why, const std::string& parent) {
-        r.refuse = "merged address " + addr + " " + why + "; name its chain: PRIMARY/CHAIN_ID:ADDRESS (e.g. "
-                   + parent + "/" + (conf.empty() ? std::string("98") : std::to_string(conf.front()->chain_id))
-                   + ":" + addr + ")";
-    };
     const auto is_parent = [&](const std::string& a) {
-        return core::is_address_for_chain(a, parent_hrps, parent_versions_now);
+        return core::is_address_for_chain(a, parent_hrps, parent_versions_now) && !core::address_to_script(a).empty();
     };
+    const std::string name_it = " (name its chain: PRIMARY/CHAIN_ID:ADDRESS)";
 
-    if (!merged_raw.empty()) {
-        const auto m = chains_taking(merged_raw);
+    std::string merged = merged_raw;
+    if (!merged.empty() && chains_taking(merged).empty() && !pays(nullptr, merged) && !is_parent(merged)) {
+        r.warnings.push_back("merged address " + merged + " is not a valid address: ignored");
+        merged.clear();
+    }
+
+    bool second_used = false;
+    if (!merged.empty()) {
+        const auto m = chains_taking(merged);
         if (m.size() == 1) {
-            r.addresses[m[0]->chain_id] = merged_raw;
+            r.addresses[m[0]->chain_id] = merged;
+            r.from_login.push_back(m[0]->chain_id);
+            second_used = true;
         } else if (m.size() > 1) {
-            refuse(merged_raw, "is an address of merged chains " + ids(m), primary);
-            return r;
+            r.warnings.push_back("merged address " + merged + " is an address of merged chains " + ids(m)
+                                 + ": ignored, they get the primary's key" + name_it);
         } else {
             // Swapped order: the first address is a merged chain's, the second the parent's.
             const auto u = chains_taking(primary);
-            if (!u.empty() && is_parent(merged_raw)) {
-                if (u.size() > 1) {
-                    refuse(primary, "is an address of merged chains " + ids(u), merged_raw);
-                    return r;
+            if (!u.empty() && is_parent(merged)) {
+                if (u.size() == 1) {
+                    r.notes.push_back("swapped address order — auto-correcting");
+                    r.addresses[u[0]->chain_id] = primary;
+                    r.from_login.push_back(u[0]->chain_id);
+                } else {
+                    r.warnings.push_back("swapped address order; merged address " + primary
+                                         + " is an address of merged chains " + ids(u)
+                                         + ": ignored, they get the primary's key" + name_it);
                 }
-                r.notes.push_back("swapped address order — auto-correcting");
-                r.addresses[u[0]->chain_id] = primary;
-                primary = merged_raw;
+                primary = merged;
+                second_used = true;
             } else {
-                // No chain identifies it: its hash160 goes to the one merged
-                // chain configured (the pre-change fallback); with several,
-                // which chain it is for cannot be told.
                 std::string t;
-                if (core::address_to_hash160(merged_raw, t).size() == 40 && !conf.empty()) {
-                    if (conf.size() > 1) {
-                        refuse(merged_raw, "is not an address of any configured merged chain (" + ids(conf) + ")",
-                               primary);
-                        return r;
-                    }
-                    r.addresses[conf[0]->chain_id] = merged_raw;
+                if (core::address_to_hash160(merged, t).size() == 40 && conf.size() == 1
+                    && (is_parent(primary) || !chains_taking(primary).empty())) {
+                    // The one merged chain configured: the pre-change fallback
+                    // (only beside a usable primary: p2pool takes a second
+                    // address for DOGE only when it is one).
+                    r.addresses[conf[0]->chain_id] = merged;
+                    r.from_login.push_back(conf[0]->chain_id);
                     r.notes.push_back("assigned merged address to chain_id=" + std::to_string(conf[0]->chain_id));
+                    second_used = true;
+                } else if (!conf.empty()) {
+                    r.warnings.push_back("merged address " + merged
+                                         + " is not an address of any configured merged chain (" + ids(conf)
+                                         + "): ignored" + name_it);
                 }
             }
         }
     }
 
     // Case 5: the primary address is a merged chain's, not the parent's.
-    if (merged_raw.empty() && !primary.empty() && !is_parent(primary)) {
-        const auto u = chains_taking(primary);
+    const auto u = chains_taking(primary);
+    if (!second_used && !primary.empty() && !is_parent(primary)) {
         if (u.size() == 1) {
             r.addresses[u[0]->chain_id] = primary;
+            r.from_login.push_back(u[0]->chain_id);
             r.notes.push_back("Case 5: primary address is chain_id=" + std::to_string(u[0]->chain_id)
                               + " (not the parent's): the parent payout uses its hash160");
         } else if (u.size() > 1) {
-            refuse(primary, "(the primary) is an address of merged chains " + ids(u), "PRIMARY");
-            return r;
+            r.warnings.push_back("primary address " + primary + " is an address of merged chains " + ids(u)
+                                 + ": the parent payout and those chains use its key" + name_it);
         }
     }
+    r.usable_primary = !primary.empty() && (is_parent(primary) || !u.empty());
 
-    // Auto-derive: each configured chain without an address reuses the
-    // primary's hash160 (the same key spends on both chains).
-    std::string atype;
-    const auto h160 = core::address_to_hash160(primary, atype);
-    if (h160.size() == 40 && (atype == "p2pkh" || atype == "p2wpkh" || atype == "p2sh"))
-        for (const auto* c : conf)
-            if (!r.addresses.count(c->chain_id)) {
-                r.addresses[c->chain_id] = primary;
-                r.notes.push_back("auto-derived merged address for chain_id=" + std::to_string(c->chain_id)
-                                  + " from primary " + atype + " address");
+    if (r.usable_primary) {
+        // Auto-derive: each configured chain without an address reuses the
+        // primary's hash160 (the same key spends on both chains).
+        std::string atype;
+        const auto h160 = core::address_to_hash160(primary, atype);
+        if (h160.size() == 40 && (atype == "p2pkh" || atype == "p2wpkh" || atype == "p2sh"))
+            for (const auto* c : conf)
+                if (!r.addresses.count(c->chain_id)) {
+                    r.addresses[c->chain_id] = primary;
+                    r.notes.push_back("auto-derived merged address for chain_id=" + std::to_string(c->chain_id)
+                                      + " from primary " + atype + " address");
+                }
+    } else if (!primary.empty()) {
+        // Case 4: a valid DOGE address of this network as the second address.
+        const auto* doge = find_chain(table, 98);
+        const auto it = r.addresses.find(98);
+        if (doge && it != r.addresses.end() && std::find(r.from_login.begin(), r.from_login.end(), 98u)
+                                                   != r.from_login.end()) {
+            std::vector<unsigned char> script;
+            if (core::classify_address_for_coin(it->second, doge->p2pkh, doge->p2sh, doge->own_hrps, script)
+                    == core::AddressCoinMatch::Own
+                && (script.size() == 25 || script.size() == 23)) {
+                r.parent_script = script;   // P2PKH or P2SH of the DOGE address's hash160
+                r.notes.push_back("Case 4: primary " + primary + " is not a usable address; the parent payout uses"
+                                  " the DOGE address " + it->second + "'s key");
             }
+        }
+    }
     r.primary = std::move(primary);
     return r;
 }

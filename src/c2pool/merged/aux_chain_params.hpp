@@ -216,5 +216,63 @@ inline AuxPayoutAddress resolve_aux_payout_address(const std::string& symbol, Au
     return r;
 }
 
+/// The merged address written into the node operator's own shares: the
+/// node-fee (-f) shares and the redistributed shares that land on the
+/// operator's key with no merged address. p2pool's cascade
+/// (work.py _resolve_operator_merged_addresses), so both implementations put
+/// the same bytes into those shares:
+///   P1 the operator's address of the chain: for DOGE --node-owner-merged-address
+///      (p2pool --merged-operator-address), for another chain
+///      --merged-payout-address SYMBOL:ADDRESS; used when it is an address of
+///      the chain on the parent's network;
+///   P2 else the operator's parent key (--node-owner-address) converted, as the
+///      auto-derive does (P2SH stays P2SH, P2PKH/P2WPKH become P2PKH);
+///   P3 else (a P2WSH/P2TR operator address) the pool donation script.
+struct OperatorMergedScript {
+    std::vector<unsigned char> script;
+    std::string source;
+    std::string warning;   // a P1 address that was set but is not usable
+};
+
+inline OperatorMergedScript resolve_operator_merged_script(const std::string& symbol, AuxNetwork net,
+                                                           const std::string& node_owner_address,
+                                                           const std::string& node_owner_merged_address,
+                                                           const std::string& merged_payout_address,
+                                                           const std::vector<unsigned char>& donation_script)
+{
+    OperatorMergedScript r;
+    std::string up = symbol;
+    for (auto& c : up)
+        if (c >= 'a' && c <= 'z')
+            c = static_cast<char>(c - 32);
+    const std::string p1 = up == "DOGE" ? node_owner_merged_address : merged_payout_address;
+    const std::string p1_option = up == "DOGE" ? "--node-owner-merged-address" : "--merged-payout-address " + up;
+    if (!p1.empty()) {
+        if (const auto* p = find_aux_chain_params(up)) {
+            const auto v = aux_accepted_versions(*p, net);
+            std::vector<unsigned char> script;
+            if (core::classify_address_for_coin(p1, v.p2pkh, v.p2sh, v.hrps, script) == core::AddressCoinMatch::Own
+                && !script.empty()) {
+                r.script = std::move(script);
+                r.source = p1_option;
+                return r;
+            }
+            r.warning = p1_option + " " + p1 + " is not a " + up + " address of this network";
+        } else {
+            r.warning = "c2pool has no address parameters for " + up + " to check " + p1_option + " " + p1;
+        }
+    }
+    std::string atype;
+    const auto h160 = core::address_to_hash160(node_owner_address, atype);
+    if (h160.size() == 40 && (atype == "p2pkh" || atype == "p2wpkh" || atype == "p2sh")) {
+        r.script = core::hash160_to_merged_script(h160, atype);
+        r.source = "--node-owner-address key";
+        return r;
+    }
+    r.script = donation_script;
+    r.source = "donation script";
+    return r;
+}
+
 } // namespace merged
 } // namespace c2pool

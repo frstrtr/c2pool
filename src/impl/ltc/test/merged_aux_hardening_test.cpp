@@ -56,6 +56,14 @@
 #include <c2pool/merged/aux_chain_params.hpp>
 #include <c2pool/merged/aux_commitment_rule.hpp>
 #include <core/merged_chain_addr.hpp>
+#include <core/stratum_server.hpp>
+#include <core/web_server.hpp>
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <unistd.h>
 #include <core/address_utils.hpp>
 #include <c2pool/merged/aux_found_verdict.hpp>
 #include <c2pool/merged/merged_mining.hpp>
@@ -1846,7 +1854,8 @@ const std::vector<uint8_t> kLtcAllNetworks = {48, 50, 5, 111, 196, 58};   // mai
 // transcribed for a DOGE-only node: table {98, {}, {0x1e, 0x16, 0x71}},
 // scripts by the chain-agnostic hash160 type.
 std::vector<unsigned char> master_doge_script(std::string username, std::string merged_raw, bool tn,
-                                              std::map<uint32_t, std::string> explicit_addrs)
+                                              std::map<uint32_t, std::string> explicit_addrs,
+                                              std::string* final_username = nullptr)
 {
     const std::vector<uint8_t> DOGE_V = {0x1e, 0x16, 0x71};
     std::map<uint32_t, std::string> m = explicit_addrs;
@@ -1871,13 +1880,14 @@ std::vector<unsigned char> master_doge_script(std::string username, std::string 
     auto h = core::address_to_hash160(username, atype);
     if (h.size() == 40 && (atype == "p2pkh" || atype == "p2wpkh" || atype == "p2sh") && !m.count(98))
         m[98] = username;
+    if (final_username) *final_username = username;
     if (!m.count(98)) return {};
     std::string t2;
     auto h2 = core::address_to_hash160(m[98], t2);
     return h2.size() == 40 ? core::hash160_to_merged_script(h2, t2) : std::vector<unsigned char>{};
 }
 
-struct Login { std::vector<unsigned char> script; std::string refuse; std::string primary; };
+struct Login { std::vector<unsigned char> script; std::string primary; bool usable{false}; std::vector<std::string> warnings; };
 
 Login branch_login(const std::string& username, const std::string& merged_raw, bool tn,
                    std::map<uint32_t, std::string> explicit_addrs, std::set<uint32_t> configured, uint32_t chain)
@@ -1888,9 +1898,10 @@ Login branch_login(const std::string& username, const std::string& merged_raw, b
                                    [&configured](uint32_t id) { return configured.count(id) > 0; },
                                    ltc_versions(tn), kLtcHrps);
     Login out;
-    out.refuse = lr.refuse;
+    out.usable = lr.usable_primary;
+    out.warnings = lr.warnings;
     out.primary = lr.primary;
-    if (lr.refuse.empty() && lr.addresses.count(chain))
+    if (lr.addresses.count(chain))
         out.script = merged_payout_script(find_chain(table, chain), lr.addresses.at(chain));
     return out;
 }
@@ -1898,9 +1909,13 @@ Login branch_login(const std::string& username, const std::string& merged_raw, b
 } // namespace
 
 // A DOGE-only node: for every login shape (primary address types, comma
-// second addresses of every kind, swapped order, the slash form, bad
-// checksums, other coins' and other networks' addresses), mainnet and
-// testnet, the DOGE payout script is byte-identical to the pre-change one.
+// second addresses of every kind, swapped order, the slash form, other
+// coins' and other networks' addresses), mainnet and testnet, the DOGE payout
+// script is byte-identical to the pre-change one. Except, on purpose, a
+// second address that is not an address at all (bad checksum, junk, in the
+// comma or the slash form): the pre-change server wrote no DOGE address for
+// it (the share's DOGE weight then followed Tier 1.5); now, as p2pool does,
+// the chain gets the primary's hash160.
 TEST(MergedAuxStratumLogin, DogeOnlyPaysWhatItPaidForEveryLoginShape)
 {
     std::vector<unsigned char> p20(20, 0x42), p32(32, 0x43);
@@ -1909,7 +1924,11 @@ TEST(MergedAuxStratumLogin, DogeOnlyPaysWhatItPaidForEveryLoginShape)
         const uint8_t D = tn ? 113 : 30, DA = tn ? 196 : 22;
         const std::string ltc_hrp = tn ? "tltc" : "ltc";
         auto bad_ck = [](std::string a) { a[a.size() - 1] = a[a.size() - 1] == 'z' ? 'y' : 'z'; return a; };
-        struct U { std::string name, primary, merged; std::map<uint32_t, std::string> expl; };
+        struct U {
+            std::string name, primary, merged;
+            std::map<uint32_t, std::string> expl;
+            bool as_p2pool = false;   // not an address: resolved as if none were given
+        };
         const std::string doge = b58(D, 0x21), doge_p2sh = b58(DA, 0x22);
         const std::vector<U> us = {
             {"LTC P2PKH alone", b58(L, 0x01), ""},
@@ -1921,8 +1940,11 @@ TEST(MergedAuxStratumLogin, DogeOnlyPaysWhatItPaidForEveryLoginShape)
             {"LTC,DOGE-P2SH", b58(L, 0x01), doge_p2sh},
             {"LTC-P2SH,DOGE", b58(M, 0x02), doge},
             {"ltc1q,DOGE", bech32::encode_segwit(ltc_hrp, 0, p20), doge},
-            {"LTC,DOGE(bad checksum)", b58(L, 0x01), bad_ck(doge)},
-            {"LTC-P2SH,DOGE(bad checksum)", b58(M, 0x02), bad_ck(doge)},
+            {"LTC,DOGE(bad checksum)", b58(L, 0x01), bad_ck(doge), {}, true},
+            {"LTC-P2SH,DOGE(bad checksum)", b58(M, 0x02), bad_ck(doge), {}, true},
+            {"LTC,junk", b58(L, 0x01), "notanaddress"},
+            {"LTC/98:junk", b58(L, 0x01), "", {{98, "notanaddress"}}, true},
+            {"LTC/98:DOGE(bad checksum)", b58(L, 0x01), "", {{98, bad_ck(doge)}}, true},
             {"DOGE,LTC (swapped)", doge, b58(L, 0x01)},
             {"DOGE alone (case 5)", doge, ""},
             {"DOGE-P2SH alone (case 5)", doge_p2sh, ""},
@@ -1942,9 +1964,30 @@ TEST(MergedAuxStratumLogin, DogeOnlyPaysWhatItPaidForEveryLoginShape)
             {"DOGE/98:DOGE2 (case 5 overrides)", doge, "", {{98, b58(D, 0x31)}}},
         };
         for (const auto& u : us) {
-            const auto want = master_doge_script(u.primary, u.merged, tn, u.expl);
+            const auto want = u.as_p2pool ? master_doge_script(u.primary, "", tn, {})
+                                          : master_doge_script(u.primary, u.merged, tn, u.expl);
+            if (u.as_p2pool) {
+                const auto before = master_doge_script(u.primary, u.merged, tn, u.expl);
+                EXPECT_NE(hex_of(std::vector<uint8_t>(want.begin(), want.end())),
+                          hex_of(std::vector<uint8_t>(before.begin(), before.end())))
+                    << u.name << ": the pre-change server differed here";
+            }
             const auto got = branch_login(u.primary, u.merged, tn, u.expl, {98}, 98);
-            EXPECT_TRUE(got.refuse.empty()) << u.name << ": " << got.refuse;
+            // The pre-change server refused at the door a login whose payout
+            // address was neither LTC's nor DOGE's (#961); it is now accepted
+            // and redistributed (no DOGE address from its key).
+            std::string master_user;
+            master_doge_script(u.primary, u.merged, tn, u.expl, &master_user);
+            const core::CoinAddressAcceptance own{{ltc_versions(tn)[0]}, {ltc_versions(tn)[1], ltc_versions(tn)[2]},
+                                                  {tn ? "tltc" : "ltc"}};
+            const bool master_refused = core::decide_payout_address(master_user, own, {{{}, {0x1e, 0x16, 0x71}}})
+                                        == core::PayoutAddressDecision::Reject;
+            if (master_refused) {
+                EXPECT_FALSE(got.usable) << (tn ? "testnet " : "mainnet ") << u.name;
+                EXPECT_TRUE(got.script.empty()) << (tn ? "testnet " : "mainnet ") << u.name;
+                continue;
+            }
+            EXPECT_TRUE(got.usable) << u.name;
             EXPECT_EQ(hex_of(std::vector<uint8_t>(got.script.begin(), got.script.end())),
                       hex_of(std::vector<uint8_t>(want.begin(), want.end())))
                 << (tn ? "testnet " : "mainnet ") << u.name;
@@ -1965,18 +2008,24 @@ TEST(MergedAuxStratumLogin, DogeIdentificationIsUnchanged)
 }
 
 // Several merged chains: an address two configured chains could take, a
-// second address no chain identifies, an ambiguous primary — the login is
-// refused, naming PRIMARY/CHAIN_ID:ADDR; an address of one chain goes to it.
-TEST(MergedAuxStratumLogin, MultiAuxNeverGuesses)
+// second address no chain identifies, an ambiguous primary — never given to
+// one chain by guessing and never refused: ignored with a warning naming
+// PRIMARY/CHAIN_ID:ADDR, the chains get the primary's key (the miner's own;
+// no cross-pay). An address of one chain goes to it.
+TEST(MergedAuxStratumLogin, MultiAuxNeverGuessesNorRefuses)
 {
     const std::string ltc = b58(48, 0x01);
+    const auto key = [&](const std::string& a) { return core::merged_addr::merged_payout_script(nullptr, a); };
     // BELLS P2SH (30) is DOGE's P2PKH version
     auto r = branch_login(ltc, b58(30, 0x44), false, {}, {98, 16}, 98);
-    EXPECT_NE(r.refuse.find("98 and 16"), std::string::npos) << r.refuse;
-    EXPECT_NE(r.refuse.find("PRIMARY/CHAIN_ID:ADDRESS"), std::string::npos) << r.refuse;
-    // named explicitly: accepted, BELLS pays P2SH
+    EXPECT_TRUE(r.usable);
+    EXPECT_EQ(r.script, key(ltc));
+    ASSERT_EQ(r.warnings.size(), 1u);
+    EXPECT_NE(r.warnings[0].find("98 and 16"), std::string::npos) << r.warnings[0];
+    EXPECT_NE(r.warnings[0].find("PRIMARY/CHAIN_ID:ADDRESS"), std::string::npos) << r.warnings[0];
+    EXPECT_EQ(branch_login(ltc, b58(30, 0x44), false, {}, {98, 16}, 16).script, key(ltc));
+    // named explicitly: BELLS pays P2SH
     r = branch_login(ltc, "", false, {{16, b58(30, 0x44)}}, {98, 16}, 16);
-    EXPECT_TRUE(r.refuse.empty());
     ASSERT_EQ(r.script.size(), 23u);
     EXPECT_EQ(r.script[0], 0xa9) << "a Bellscoin P2SH is paid as P2SH";
     // the same address on DOGE (named for it) pays DOGE P2PKH
@@ -1985,27 +2034,37 @@ TEST(MergedAuxStratumLogin, MultiAuxNeverGuesses)
     EXPECT_EQ(r.script[0], 0x76);
     // P2SH 22: DOGE, PEP, SHIC
     r = branch_login(ltc, b58(22, 0x55), false, {}, {98, 63}, 98);
-    EXPECT_FALSE(r.refuse.empty());
+    EXPECT_EQ(r.script, key(ltc));
+    EXPECT_FALSE(r.warnings.empty());
     // a PEP address with DOGE + PEP: PEP's; DOGE gets the primary's key
     r = branch_login(ltc, b58(56, 0x77), false, {}, {98, 63}, 63);
-    EXPECT_TRUE(r.refuse.empty());
-    EXPECT_EQ(r.script, core::merged_addr::merged_payout_script(nullptr, b58(56, 0x77)));
+    EXPECT_EQ(r.script, key(b58(56, 0x77)));
+    EXPECT_TRUE(r.warnings.empty());
     r = branch_login(ltc, b58(56, 0x77), false, {}, {98, 63}, 98);
-    EXPECT_EQ(r.script, core::merged_addr::merged_payout_script(nullptr, ltc));
+    EXPECT_EQ(r.script, key(ltc));
     // a second address no chain identifies (another LTC address): with one
-    // chain the pre-change fallback, with two refused
+    // chain the pre-change fallback, with two ignored
     r = branch_login(ltc, b58(48, 0x09), false, {}, {98, 63}, 98);
-    EXPECT_NE(r.refuse.find("not an address of any configured merged chain"), std::string::npos) << r.refuse;
+    EXPECT_EQ(r.script, key(ltc));
+    ASSERT_EQ(r.warnings.size(), 1u);
+    EXPECT_NE(r.warnings[0].find("not an address of any configured merged chain"), std::string::npos);
     r = branch_login(ltc, b58(48, 0x09), false, {}, {98}, 98);
-    EXPECT_TRUE(r.refuse.empty());
-    EXPECT_EQ(r.script, core::merged_addr::merged_payout_script(nullptr, b58(48, 0x09)));
-    // an ambiguous primary (case 5)
+    EXPECT_EQ(r.script, key(b58(48, 0x09)));
+    // an ambiguous primary (case 5): usable (the parent payout is its key),
+    // every chain its key
     r = branch_login(b58(22, 0x55), "", false, {}, {98, 63}, 98);
-    EXPECT_FALSE(r.refuse.empty());
+    EXPECT_TRUE(r.usable);
+    EXPECT_EQ(r.script, key(b58(22, 0x55)));
+    EXPECT_FALSE(r.warnings.empty());
     // swapped DOGE,LTC with DOGE + PEP: DOGE's alone
     r = branch_login(b58(30, 0x21), ltc, false, {}, {98, 63}, 98);
-    EXPECT_TRUE(r.refuse.empty());
     EXPECT_EQ(r.primary, ltc);
+    EXPECT_EQ(r.script, key(b58(30, 0x21)));
+    // swapped with an ambiguous first address: the LTC address is the
+    // primary, the chains its key
+    r = branch_login(b58(22, 0x55), ltc, false, {}, {98, 63}, 63);
+    EXPECT_EQ(r.primary, ltc);
+    EXPECT_EQ(r.script, key(ltc));
     // a Junkcoin P2PKH "7..." (16) is paid P2PKH (the chain-agnostic type is P2SH)
     r = branch_login(ltc, b58(16, 0x66), false, {}, {8224}, 8224);
     ASSERT_EQ(r.script.size(), 25u);
@@ -2014,21 +2073,508 @@ TEST(MergedAuxStratumLogin, MultiAuxNeverGuesses)
 
 // Testnet: LTC testnet P2PKH 111 is DOGE regtest's; a swapped DOGE,LTC
 // login neither pays DOGE to the LTC key nor LTC to the DOGE key. With PEP
-// as well (whose testnet P2PKH 113 is DOGE's) the swapped pair is refused,
-// and the example names the LTC address as the primary.
+// as well (whose testnet P2PKH 113 is DOGE's) the DOGE address cannot be
+// told from a PEP one: ignored, both chains get the LTC address's key.
 TEST(MergedAuxStratumLogin, TestnetSwappedLoginDoesNotCrossPay)
 {
     const std::string doge = b58(113, 0x21), ltc = b58(111, 0x01);
     auto r = branch_login(doge, ltc, true, {}, {98}, 98);
-    EXPECT_TRUE(r.refuse.empty()) << r.refuse;
     EXPECT_EQ(r.primary, ltc) << "the parent payout is the LTC address";
     EXPECT_EQ(r.script, core::merged_addr::merged_payout_script(nullptr, doge)) << "DOGE pays the DOGE address";
     r = branch_login(doge, ltc, true, {}, {98, 63}, 98);
-    EXPECT_NE(r.refuse.find("98 and 63"), std::string::npos) << r.refuse;
-    EXPECT_NE(r.refuse.find("(e.g. " + ltc + "/98:" + doge + ")"), std::string::npos) << r.refuse;
+    EXPECT_EQ(r.primary, ltc);
+    EXPECT_EQ(r.script, core::merged_addr::merged_payout_script(nullptr, ltc));
+    ASSERT_FALSE(r.warnings.empty());
+    EXPECT_NE(r.warnings[0].find("98 and 63"), std::string::npos) << r.warnings[0];
     r = branch_login(ltc, "", true, {{98, doge}}, {98, 63}, 98);
-    EXPECT_TRUE(r.refuse.empty()) << r.refuse;
     EXPECT_EQ(r.script, core::merged_addr::merged_payout_script(nullptr, doge));
+}
+
+// An empty, invalid or other-coin primary is not usable: no merged address is
+// derived from it (p2pool never converts such a key), its shares are
+// redistributed by the work source; with a valid DOGE address of the node's
+// network as the comma second address, the parent payout is that address's
+// key (p2pool's case 4).
+TEST(MergedAuxStratumLogin, UnusablePrimaryIsRedistributedOrCase4)
+{
+    using namespace core::merged_addr;
+    const auto table = merged_chain_table(false, kLtcAllNetworks);
+    const auto login = [&](const std::string& p, const std::string& m, std::map<uint32_t, std::string> e,
+                           std::set<uint32_t> conf) {
+        return resolve_merged_login(p, m, std::move(e), table, [conf](uint32_t id) { return conf.count(id) > 0; },
+                                    ltc_versions(false), kLtcHrps);
+    };
+    for (const std::string& u : {std::string(), std::string("rig1"), std::string("notanaddress"), b58(0, 0x61),
+                                 b58(48, 0x01).substr(0, 30), b58(56, 0x31)}) {
+        const auto r = login(u, "", {}, {98});
+        EXPECT_FALSE(r.usable_primary) << "'" << u << "'";
+        EXPECT_TRUE(r.addresses.empty()) << "'" << u << "'";
+        EXPECT_TRUE(r.parent_script.empty());
+    }
+    // case 4: invalid primary, valid DOGE second (P2PKH and P2SH)
+    auto r = login("notanaddress", b58(30, 0x21), {}, {98});
+    EXPECT_FALSE(r.usable_primary);
+    EXPECT_EQ(r.parent_script, core::address_to_script(b58(30, 0x21)));
+    EXPECT_EQ(r.addresses.at(98), b58(30, 0x21));
+    r = login(b58(0, 0x61), b58(22, 0x22), {}, {98});
+    ASSERT_EQ(r.parent_script.size(), 23u) << "a DOGE P2SH gives an LTC P2SH";
+    // not case 4: a DOGE address of another network, the slash form, a PEP address
+    EXPECT_TRUE(login("notanaddress", b58(113, 0x21), {}, {98}).parent_script.empty());
+    EXPECT_TRUE(login("notanaddress", "", {{98, b58(30, 0x21)}}, {98}).parent_script.empty());
+    r = login("notanaddress", b58(56, 0x31), {}, {98, 63});
+    EXPECT_TRUE(r.parent_script.empty());
+    EXPECT_EQ(r.addresses.at(63), b58(56, 0x31));
+    EXPECT_FALSE(r.addresses.count(98)) << "no DOGE address derived from an unusable primary";
+    // the fallback (a second address no chain identifies) needs a usable primary
+    EXPECT_TRUE(login(b58(30, 0x25).substr(1), b58(48, 0x01), {}, {98}).addresses.empty());
+    // a P2WSH LTC address is usable (its key is the parent's) but has no hash160
+    r = login(bech32::encode_segwit("ltc", 0, std::vector<unsigned char>(32, 0x43)), "", {}, {98});
+    EXPECT_TRUE(r.usable_primary);
+    EXPECT_TRUE(r.addresses.empty());
+}
+
+// ---- the stratum session over TCP ------------------------------------------
+
+namespace {
+
+// A work source that records the merged scripts each job is built with.
+struct RecordingWorkSource : core::stratum::IWorkSource {
+    core::stratum::StratumConfig cfg;
+    std::set<uint32_t> chains;
+    std::atomic<bool> ready{true};
+    mutable std::mutex mu;
+    mutable std::vector<std::map<uint32_t, std::vector<unsigned char>>> builds;
+    mutable std::vector<std::vector<unsigned char>> payouts;
+    std::vector<std::map<uint32_t, std::vector<unsigned char>>> submits;
+    std::vector<std::vector<unsigned char>> submit_payouts;
+    bool merged_ready() const override { return ready.load(); }
+
+    const core::stratum::StratumConfig& get_stratum_config() const override { return cfg; }
+    std::function<uint256()> get_best_share_hash_fn() const override { return [] { return uint256(); }; }
+    std::string get_current_gbt_prevhash() const override { return std::string(64, '1'); }
+    uint64_t get_work_generation() const override { return 1; }
+    bool has_merged_chain(uint32_t id) const override { return chains.count(id) > 0; }
+    void register_stratum_worker(const std::string&, const core::stratum::WorkerInfo&) override {}
+    void unregister_stratum_worker(const std::string&) override {}
+    void update_stratum_worker(const std::string&, double, double, double, uint64_t, uint64_t, uint64_t) override {}
+    nlohmann::json get_current_work_template() const override
+    {
+        return {{"bits", "207fffff"}, {"previousblockhash", std::string(64, '1')}, {"version", 0x20000000},
+                {"curtime", 1793210000}, {"height", 100}};
+    }
+    std::vector<std::string> get_stratum_merkle_branches() const override { return {}; }
+    std::pair<std::string, std::string> get_coinbase_parts() const override { return {"01000000", "00000000"}; }
+    core::stratum::CoinbaseResult build_connection_coinbase(
+        const uint256&, const std::string&, const std::vector<unsigned char>& payout,
+        const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged) const override
+    {
+        std::lock_guard<std::mutex> l(mu);
+        builds.emplace_back(merged.begin(), merged.end());
+        payouts.push_back(payout);
+        core::stratum::CoinbaseResult r;
+        r.coinb1 = "01000000";
+        r.coinb2 = "00000000";
+        return r;
+    }
+    nlohmann::json mining_submit(const std::string&, const std::string&, const std::string&, const std::string&,
+                                 const std::string&, const std::string&, const std::string&,
+                                 const std::map<uint32_t, std::vector<unsigned char>>& merged,
+                                 const core::stratum::JobSnapshot* job) override
+    {
+        std::lock_guard<std::mutex> l(mu);
+        submits.push_back(merged);
+        submit_payouts.push_back(job && job->has_payout ? job->payout_script : std::vector<unsigned char>{0xff});
+        return {{"result", true}};
+    }
+    uint32_t get_share_bits() const override { return 0x207fffff; }
+    uint32_t get_share_max_bits() const override { return 0x207fffff; }
+    double compute_share_difficulty(const std::string&, const std::string&, const std::string&, const std::string&,
+                                    const std::string&, const std::string&, uint32_t, const std::string&,
+                                    const std::string&, const std::vector<std::string>&) const override
+    {
+        return 1e15;
+    }
+    size_t count() const
+    {
+        std::lock_guard<std::mutex> l(mu);
+        return builds.size();
+    }
+    std::map<uint32_t, std::vector<unsigned char>> last() const
+    {
+        std::lock_guard<std::mutex> l(mu);
+        return builds.empty() ? std::map<uint32_t, std::vector<unsigned char>>{} : builds.back();
+    }
+};
+
+uint16_t free_port()
+{
+    boost::asio::io_context io;
+    boost::asio::ip::tcp::acceptor a(io, {boost::asio::ip::make_address("127.0.0.1"), 0});
+    return a.local_endpoint().port();
+}
+
+} // namespace
+
+namespace {
+
+// A stratum line client over a plain socket with a receive timeout.
+struct LineClient {
+    int fd = -1;
+    std::string buf;
+    std::string last_job;
+    explicit LineClient(uint16_t port)
+    {
+        fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        sockaddr_in a{};
+        a.sin_family = AF_INET;
+        a.sin_port = htons(port);
+        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        if (::connect(fd, reinterpret_cast<sockaddr*>(&a), sizeof a) != 0) {
+            ::close(fd);
+            fd = -1;
+        }
+        struct timeval tv{0, 50000};
+        if (fd >= 0) setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    }
+    ~LineClient() { if (fd >= 0) ::close(fd); }
+    void send(const nlohmann::json& j)
+    {
+        const std::string line = j.dump() + "\n";
+        (void)::send(fd, line.data(), line.size(), MSG_NOSIGNAL);
+    }
+    // Reads until the response with `id` (also tracking mining.notify job ids).
+    std::optional<nlohmann::json> wait_id(int id, int tries = 60)
+    {
+        for (int t = 0; t < tries; ++t) {
+            size_t nl;
+            while ((nl = buf.find('\n')) != std::string::npos) {
+                const std::string line = buf.substr(0, nl);
+                buf.erase(0, nl + 1);
+                nlohmann::json j;
+                try { j = nlohmann::json::parse(line); } catch (...) { continue; }
+                if (j.contains("method") && j["method"] == "mining.notify" && j["params"].is_array())
+                    last_job = j["params"][0].get<std::string>();
+                if (j.contains("id") && j["id"].is_number() && j["id"].get<int>() == id)
+                    return j;
+            }
+            char tmp[16384];
+            const ssize_t n = ::recv(fd, tmp, sizeof tmp, 0);
+            if (n > 0) buf.append(tmp, static_cast<size_t>(n));
+            if (n == 0) return std::nullopt;
+        }
+        return std::nullopt;
+    }
+};
+
+struct SessionRig {
+    std::shared_ptr<RecordingWorkSource> ws = std::make_shared<RecordingWorkSource>();
+    boost::asio::io_context ioc;
+    std::optional<boost::asio::executor_work_guard<boost::asio::io_context::executor_type>> guard;
+    std::unique_ptr<core::StratumServer> srv;
+    std::thread io;
+    uint16_t port = 0;
+    explicit SessionRig(std::set<uint32_t> chains, bool redistribute = false)
+    {
+        ws->chains = std::move(chains);
+        ws->cfg.redistribute_unusable_logins = redistribute;
+        ws->cfg.payout_p2pkh_versions = {48};
+        ws->cfg.payout_p2sh_versions = {50, 5};
+        ws->cfg.payout_bech32_hrps = {"ltc"};
+        ws->cfg.merged_parent_versions = kLtcAllNetworks;
+        port = free_port();
+        guard.emplace(boost::asio::make_work_guard(ioc));
+        srv = std::make_unique<core::StratumServer>(ioc, "127.0.0.1", port, ws);
+        srv->start();
+        io = std::thread([this] { ioc.run(); });
+    }
+    ~SessionRig()
+    {
+        srv->stop();
+        guard.reset();
+        ioc.stop();
+        io.join();
+    }
+    // One step on `c`; returns the authorize verdict (or true) and waits for a
+    // job build when one is expected.
+    bool step(LineClient& c, int id, const std::string& method, const nlohmann::json& params)
+    {
+        const size_t nb = ws->count();
+        c.send({{"id", id}, {"method", method}, {"params", params}});
+        auto r = c.wait_id(id);
+        for (int i = 0; i < 100 && ws->count() == nb; ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        c.wait_id(-1, 2);   // collect the notify
+        return r && (*r)["result"].is_boolean() && (*r)["result"].get<bool>();
+    }
+};
+
+} // namespace
+
+// Re-authorize (round-3 review): the same primary keeps the merged address
+// the previous login gave (as the pre-change server did); another primary
+// inherits nothing of it; a re-authorize to an empty login gets new work at
+// once instead of mining on the previous identity's job.
+TEST(MergedAuxStratumSession, ReauthorizeKeepsTheGivenAddressForTheSamePrimary)
+{
+    using namespace std::chrono_literals;
+    const std::string ltc = b58(48, 0x01), ltc2 = b58(48, 0x09), doge = b58(30, 0x21), doge2 = b58(30, 0x29);
+    const auto table = core::merged_addr::merged_chain_table(false, kLtcAllNetworks);
+    const auto sc = [&](uint32_t id, const std::string& a) {
+        return core::merged_addr::merged_payout_script(core::merged_addr::find_chain(table, id), a);
+    };
+    struct Seq { std::string name; std::vector<std::pair<std::string, nlohmann::json>> steps; std::vector<unsigned char> doge; };
+    const std::vector<Seq> seqs = {
+        {"auth(LTC,DOGE) auth(LTC)", {{"mining.authorize", {ltc + "," + doge, "x"}}, {"mining.authorize", {ltc, "x"}}}, sc(98, doge)},
+        {"auth(LTC/98:DOGE) auth(LTC)", {{"mining.authorize", {ltc + "/98:" + doge, "x"}}, {"mining.authorize", {ltc, "x"}}}, sc(98, doge)},
+        {"auth(DOGE,LTC) auth(LTC)", {{"mining.authorize", {doge + "," + ltc, "x"}}, {"mining.authorize", {ltc, "x"}}}, sc(98, doge)},
+        {"auth(LTC,DOGE) auth(LTC) auth(LTC)", {{"mining.authorize", {ltc + "," + doge, "x"}}, {"mining.authorize", {ltc, "x"}}, {"mining.authorize", {ltc + ".rig2", "x"}}}, sc(98, doge)},
+        {"auth(LTC,DOGE) auth(LTC,DOGE2)", {{"mining.authorize", {ltc + "," + doge, "x"}}, {"mining.authorize", {ltc + "," + doge2, "x"}}}, sc(98, doge2)},
+        {"auth(LTC,DOGE) auth(LTC2)", {{"mining.authorize", {ltc + "," + doge, "x"}}, {"mining.authorize", {ltc2, "x"}}}, sc(98, ltc2)},
+        {"auth(LTC) auth(LTC2)", {{"mining.authorize", {ltc, "x"}}, {"mining.authorize", {ltc2, "x"}}}, sc(98, ltc2)},
+        {"auth(DOGE) auth(LTC)", {{"mining.authorize", {doge, "x"}}, {"mining.authorize", {ltc, "x"}}}, sc(98, ltc)},
+        {"auth(LTC,DOGE) set(98:DOGE2) auth(LTC)", {{"mining.authorize", {ltc + "," + doge, "x"}}, {"mining.set_merged_addresses", {{{"98", doge2}}}}, {"mining.authorize", {ltc, "x"}}}, sc(98, doge2)},
+        {"set(98:DOGE2) auth(LTC,DOGE) auth(LTC)", {{"mining.set_merged_addresses", {{{"98", doge2}}}}, {"mining.authorize", {ltc + "," + doge, "x"}}, {"mining.authorize", {ltc, "x"}}}, sc(98, doge)},
+        {"auth(LTC) set(98:junk) auth(LTC)", {{"mining.authorize", {ltc, "x"}}, {"mining.set_merged_addresses", {{{"98", "notanaddress"}}}}, {"mining.authorize", {ltc, "x"}}}, sc(98, ltc)},
+    };
+    for (const auto& q : seqs) {
+        SessionRig rig({98});
+        LineClient c(rig.port);
+        ASSERT_GE(c.fd, 0);
+        rig.step(c, 1, "mining.subscribe", nlohmann::json::array());
+        int id = 2;
+        for (const auto& [m, p] : q.steps) {
+            if (m == "mining.set_merged_addresses") {
+                c.send({{"id", id}, {"method", m}, {"params", p}});
+                c.wait_id(id);
+            } else {
+                EXPECT_TRUE(rig.step(c, id, m, p)) << q.name;
+            }
+            ++id;
+        }
+        const auto m = rig.ws->last();
+        ASSERT_TRUE(m.count(98)) << q.name;
+        EXPECT_EQ(m.at(98), q.doge) << q.name;
+    }
+    // auth(LTC,DOGE) auth(EMPTY): a new job for the new (empty) identity.
+    SessionRig rig({98});
+    LineClient c(rig.port);
+    rig.step(c, 1, "mining.subscribe", nlohmann::json::array());
+    EXPECT_TRUE(rig.step(c, 2, "mining.authorize", {ltc + "," + doge, "x"}));
+    const size_t n = rig.ws->count();
+    EXPECT_TRUE(rig.step(c, 3, "mining.authorize", {"", "x"}));
+    ASSERT_GT(rig.ws->count(), n) << "the empty login got no new job: it would mine on the previous identity's";
+    std::lock_guard<std::mutex> l(rig.ws->mu);
+    EXPECT_TRUE(rig.ws->payouts.back().empty());
+    EXPECT_TRUE(rig.ws->builds.back().empty());
+}
+
+// The share made from a job carries the payout and merged scripts that job
+// committed to, even when mining.set_merged_addresses changed them since
+// (the job's ref_hash committed to the old ones).
+TEST(MergedAuxStratumSession, SubmitCarriesWhatTheJobCommittedTo)
+{
+    using namespace std::chrono_literals;
+    const std::string ltc = b58(48, 0x01), doge2 = b58(30, 0x29);
+    const auto table = core::merged_addr::merged_chain_table(false, kLtcAllNetworks);
+    SessionRig rig({98});
+    LineClient c(rig.port);
+    rig.step(c, 1, "mining.subscribe", nlohmann::json::array());
+    ASSERT_TRUE(rig.step(c, 2, "mining.authorize", {ltc, "x"}));
+    ASSERT_FALSE(c.last_job.empty());
+    const std::string job1 = c.last_job;
+    c.send({{"id", 3}, {"method", "mining.set_merged_addresses"}, {"params", {{{"98", doge2}}}}});
+    c.wait_id(3);
+    c.send({{"id", 4}, {"method", "mining.submit"}, {"params", {"w", job1, "00000000", "6ae2a090", "00000000"}}});
+    c.wait_id(4);
+    const auto nsub = [&rig] {
+        std::lock_guard<std::mutex> l(rig.ws->mu);
+        return rig.ws->submits.size();
+    };
+    for (int i = 0; i < 100 && nsub() == 0; ++i) std::this_thread::sleep_for(5ms);
+    {
+        std::lock_guard<std::mutex> l(rig.ws->mu);
+        ASSERT_EQ(rig.ws->submits.size(), 1u);
+        EXPECT_EQ(rig.ws->submits[0].at(98),
+                  core::merged_addr::merged_payout_script(core::merged_addr::find_chain(table, 98), ltc))
+            << "the job committed to the LTC key's DOGE script";
+        EXPECT_EQ(rig.ws->submit_payouts[0], core::address_to_script(ltc));
+    }
+}
+
+// Merged chains configured but not attached yet: a login is refused (it would
+// be resolved without them and its shares would carry no merged address).
+TEST(MergedAuxStratumSession, LoginWaitsForTheMergedChains)
+{
+    SessionRig rig({98});
+    rig.ws->ready = false;
+    LineClient c(rig.port);
+    rig.step(c, 1, "mining.subscribe", nlohmann::json::array());
+    c.send({{"id", 2}, {"method", "mining.authorize"}, {"params", {b58(48, 0x01), "x"}}});
+    const auto r = c.wait_id(2);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_FALSE((*r)["result"].get<bool>());
+    EXPECT_NE((*r)["error"][1].get<std::string>().find("merged mining not ready"), std::string::npos);
+    rig.ws->ready = true;
+    c.send({{"id", 3}, {"method", "mining.authorize"}, {"params", {b58(48, 0x01), "x"}}});
+    const auto r2 = c.wait_id(3);
+    ASSERT_TRUE(r2.has_value());
+    EXPECT_TRUE((*r2)["result"].get<bool>());
+}
+
+// The node fee and the redistribution are decided when the job is built, as
+// in p2pool's get_work: a fee job pays the operator's script with the
+// operator's merged scripts (p2pool's --merged-operator-address cascade); a
+// payout a share cannot carry (empty login, P2WSH) is redistributed and the
+// LTC payout never comes from a merged chain's script.
+namespace {
+std::string h160_of(const std::string& a)
+{
+    std::string t;
+    return core::address_to_hash160(a, t);
+}
+} // namespace
+
+TEST(MergedAuxNodeFee, JobPayoutIsDecidedAtJobTime)
+{
+    using Merged = std::vector<std::pair<uint32_t, std::vector<unsigned char>>>;
+    const auto op = core::address_to_script(b58(50, 0x0f));            // a P2SH operator
+    ASSERT_EQ(op.size(), 23u);
+    const auto miner = core::address_to_script(b58(48, 0x01));
+    const auto miner_doge = core::hash160_to_merged_script(h160_of(b58(48, 0x01)), "p2pkh");
+    const std::map<uint32_t, std::vector<unsigned char>> op_merged = {{98, core::address_to_script(b58(30, 0x0e))},
+                                                                      {63, core::address_to_script(b58(56, 0x0d))}};
+    core::MiningInterface mi(false, nullptr);
+    mi.set_operator_merged_scripts(op_merged);
+    // fee 100%: every job is the operator's
+    mi.set_node_fee(100.0, op);
+    auto payout = miner;
+    Merged merged = {{98, miner_doge}};
+    mi.decide_job_payout(payout, merged);
+    EXPECT_EQ(payout, op);
+    EXPECT_EQ(Merged(op_merged.begin(), op_merged.end()), merged);
+    // fee 0: unchanged
+    mi.set_node_fee(0.0, op);
+    payout = miner;
+    merged = {{98, miner_doge}};
+    mi.decide_job_payout(payout, merged);
+    EXPECT_EQ(payout, miner);
+    EXPECT_EQ(merged, (Merged{{98, miner_doge}}));
+    // empty login: redistributed; landing on the operator: its type and merged scripts
+    std::string pick;
+    mi.set_address_fallback_fn([&pick](const std::string&) { return pick; });
+    pick = h160_of(b58(50, 0x0f));
+    payout.clear();
+    merged.clear();
+    mi.decide_job_payout(payout, merged);
+    EXPECT_EQ(payout, op) << "the operator's P2SH, not a P2PKH of its hash";
+    EXPECT_EQ(Merged(op_merged.begin(), op_merged.end()), merged);
+    // landing on a miner: its key, no merged scripts written
+    pick = h160_of(b58(48, 0x07));
+    payout.clear();
+    merged.clear();
+    mi.decide_job_payout(payout, merged);
+    EXPECT_EQ(payout, core::address_to_script(b58(48, 0x07)));
+    EXPECT_TRUE(merged.empty());
+    // a P2WSH primary with a DOGE address: the LTC payout is redistributed,
+    // never taken from the DOGE script; the DOGE address stays
+    payout = core::address_to_script(bech32::encode_segwit("ltc", 0, std::vector<unsigned char>(32, 0x43)));
+    ASSERT_EQ(payout.size(), 34u);
+    merged = {{98, core::address_to_script(b58(30, 0x21))}};
+    mi.decide_job_payout(payout, merged);
+    EXPECT_EQ(payout, core::address_to_script(b58(48, 0x07)));
+    EXPECT_EQ(merged, (Merged{{98, core::address_to_script(b58(30, 0x21))}}));
+}
+
+// The operator's merged script: p2pool's P1 / P2 / P3 cascade.
+TEST(MergedAuxNodeFee, OperatorMergedScriptCascade)
+{
+    using c2pool::merged::AuxNetwork;
+    using c2pool::merged::resolve_operator_merged_script;
+    const std::vector<unsigned char> don = {0xa9, 0x14, 1, 2, 3};
+    const std::string op_p2pkh = b58(48, 0x0a), op_p2sh = b58(50, 0x0b);
+    // P1: --node-owner-merged-address for DOGE
+    auto r = resolve_operator_merged_script("DOGE", AuxNetwork::mainnet, op_p2pkh, b58(30, 0x0c), "", don);
+    EXPECT_EQ(r.script, core::address_to_script(b58(30, 0x0c)));
+    EXPECT_TRUE(r.warning.empty());
+    // P1 invalid (another chain's / network's address) -> P2 with a warning
+    r = resolve_operator_merged_script("DOGE", AuxNetwork::mainnet, op_p2pkh, b58(113, 0x0c), "", don);
+    EXPECT_EQ(r.script, core::hash160_to_merged_script(h160_of(op_p2pkh), "p2pkh"));
+    EXPECT_FALSE(r.warning.empty());
+    // P2: P2SH operator stays P2SH
+    r = resolve_operator_merged_script("DOGE", AuxNetwork::mainnet, op_p2sh, "", "", don);
+    EXPECT_EQ(r.script.size(), 23u);
+    EXPECT_EQ(r.script[0], 0xa9);
+    // P3: a P2WSH operator -> the donation script
+    r = resolve_operator_merged_script("DOGE", AuxNetwork::mainnet,
+                                       bech32::encode_segwit("ltc", 0, std::vector<unsigned char>(32, 0x44)), "", "", don);
+    EXPECT_EQ(r.script, don);
+    // another chain: --merged-payout-address SYMBOL:, not --node-owner-merged-address
+    r = resolve_operator_merged_script("PEP", AuxNetwork::mainnet, op_p2pkh, b58(30, 0x0c), b58(56, 0x0d), don);
+    EXPECT_EQ(r.script, core::address_to_script(b58(56, 0x0d)));
+    r = resolve_operator_merged_script("PEP", AuxNetwork::mainnet, op_p2pkh, b58(30, 0x0c), "", don);
+    EXPECT_EQ(r.script, core::hash160_to_merged_script(h160_of(op_p2pkh), "p2pkh"));
+}
+
+// An empty, invalid or other-coin login: accepted and redistributed where the
+// work source redistributes (the LTC pool), refused elsewhere (#961).
+TEST(MergedAuxStratumSession, UnusableLoginIsAcceptedAndRedistributed)
+{
+    for (const bool redistribute : {true, false}) {
+        SessionRig rig({98}, redistribute);
+        int id = 1;
+        for (const std::string& u : {std::string("notanaddress"), b58(0, 0x61), b58(48, 0x06).substr(1)}) {
+            LineClient c(rig.port);
+            rig.step(c, id++, "mining.subscribe", nlohmann::json::array());
+            const size_t n = rig.ws->count();
+            EXPECT_EQ(rig.step(c, id++, "mining.authorize", {u + ".rig", "x"}), redistribute) << u;
+            if (!redistribute)
+                continue;
+            ASSERT_GT(rig.ws->count(), n) << u;
+            std::lock_guard<std::mutex> l(rig.ws->mu);
+            EXPECT_TRUE(rig.ws->payouts.back().empty()) << u << ": an empty payout, redistributed by the work source";
+            EXPECT_TRUE(rig.ws->builds.back().empty()) << u << ": no merged address from an unusable key";
+        }
+        if (!redistribute)
+            continue;
+        // case 4: an invalid LTC address with a valid DOGE address
+        LineClient c(rig.port);
+        rig.step(c, id++, "mining.subscribe", nlohmann::json::array());
+        // (the comma form needs a first address longer than 20 characters)
+        EXPECT_TRUE(rig.step(c, id++, "mining.authorize", {b58(48, 0x06).substr(1) + "," + b58(30, 0x21), "x"}));
+        std::lock_guard<std::mutex> l(rig.ws->mu);
+        EXPECT_EQ(rig.ws->payouts.back(), core::address_to_script(b58(30, 0x21)));
+        EXPECT_EQ(rig.ws->builds.back().at(98), core::address_to_script(b58(30, 0x21)));
+    }
+}
+
+// A redistributed job carries, for every merged chain it names no address
+// for, the recipient's key converted (p2pool's never-empty merged leg), in
+// the recipient's own script type; addresses the login named are kept.
+TEST(MergedAuxNodeFee, RedistributedJobCarriesTheRecipientsMergedAddresses)
+{
+    using Merged = std::vector<std::pair<uint32_t, std::vector<unsigned char>>>;
+    Rig rig({{"DOGE", 98}, {"PEP", 63}});
+    core::MiningInterface mi(false, nullptr);
+    mi.set_merged_mining_manager(&rig.mm);
+    const std::string h = h160_of(b58(50, 0x2b));   // a P2SH recipient (e.g. the donation script)
+    mi.set_redistribute_fn([h]() { return std::pair<std::string, uint8_t>{h, 2}; });
+    std::vector<unsigned char> payout;
+    Merged merged;
+    mi.decide_job_payout(payout, merged);
+    EXPECT_EQ(payout, core::hash160_to_merged_script(h, "p2sh"));
+    const auto floor = core::hash160_to_merged_script(h, "p2sh");
+    EXPECT_EQ(merged, (Merged{{63, floor}, {98, floor}}));
+    // an address the login named stays
+    payout.clear();
+    merged = {{63, core::address_to_script(b58(56, 0x31))}};
+    mi.decide_job_payout(payout, merged);
+    EXPECT_EQ(merged, (Merged{{63, core::address_to_script(b58(56, 0x31))}, {98, floor}}));
+    // a usable payout: nothing added
+    payout = core::address_to_script(b58(48, 0x01));
+    merged.clear();
+    mi.decide_job_payout(payout, merged);
+    EXPECT_EQ(payout, core::address_to_script(b58(48, 0x01)));
+    EXPECT_TRUE(merged.empty());
 }
 
 // ---- the commitment rule: generated parity vectors, log-only ----------------

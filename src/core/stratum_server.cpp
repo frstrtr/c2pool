@@ -657,8 +657,22 @@ nlohmann::json StratumSession::handle_subscribe(const nlohmann::json& params, co
 nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, const nlohmann::json& request_id)
 {
     if (params.size() >= 1 && params[0].is_string()) {
+        // Whether this connection already mined for an identity: a re-authorize
+        // to another one (even an empty login) gets new work at once.
+        const bool had_identity = !username_.empty() || !merged_addresses_.empty();
         username_ = params[0];
         authorized_ = true;
+        if (!mining_interface_->merged_ready()) {
+            // Merged chains are configured but not attached yet: a login
+            // resolved now would miss them (no merged addresses in its shares).
+            authorized_ = false;
+            nlohmann::json response;
+            response["id"] = request_id;
+            response["result"] = false;
+            response["error"] = nlohmann::json::array(
+                {24, "Unauthorized: the node is starting (merged mining not ready yet); retry shortly", nullptr});
+            return response;
+        }
         // Handshake completed -> disarm the authorize deadline (zombie-session fix).
         handshake_timer_.cancel();
 
@@ -706,57 +720,77 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
         LTC_VERSIONS.insert(LTC_VERSIONS.end(),
             scfg.payout_p2sh_versions.begin(), scfg.payout_p2sh_versions.end());
 
-        // A re-authorize starts again from mining.set_merged_addresses: the
-        // entries an earlier login gave or derived (its primary's hash160) are
-        // not carried over to the new primary.
+        // A re-authorize starts again from mining.set_merged_addresses. The
+        // addresses the previous login gave (comma form, slash form, swapped
+        // pair, a merged address as the primary) are kept when the new login
+        // has the same primary, for the chains it names no address for; with
+        // another primary nothing of the previous login is carried over (its
+        // auto-derived entries were that primary's hash160).
         merged_addresses_ = set_merged_addresses_;
         std::string merged_addr_raw;
-        parse_address_separators(username_, merged_addr_raw);
+        std::set<uint32_t> named_now;   // the slash form's chains
+        parse_address_separators(username_, merged_addr_raw, &named_now);
+        std::set<uint32_t> carried;
+        if (!login_primary_.empty() && username_ == login_primary_)
+            for (const auto& [id, a] : login_given_)
+                if (!named_now.count(id)) {
+                    merged_addresses_[id] = a;
+                    carried.insert(id);
+                }
+        std::map<uint32_t, std::string> given_now;   // committed after the door check
 
         // Which configured chain each login address is for (merged_chain_addr.hpp:
         // with one merged chain as before; with several, an address two chains
-        // could take, or none identifies, refuses the login instead of being
-        // given to one by guessing), then each configured chain without one
-        // reuses the primary's hash160.
+        // could take, or none identifies, is ignored with a warning instead of
+        // being given to one by guessing), then each configured chain without
+        // one reuses the primary's hash160.
+        bool usable_primary = true;
+        std::vector<unsigned char> parent_script;
         {
             auto res = core::merged_addr::resolve_merged_login(
                 username_, merged_addr_raw, merged_addresses_, MERGED_CHAINS,
                 [this](uint32_t id) { return mining_interface_ && mining_interface_->has_merged_chain(id); },
                 LTC_VERSIONS, LTC_HRPS);
-            if (!res.refuse.empty()) {
-                LOG_WARNING << "[Stratum] REFUSED mining.authorize (" << username_ << "): " << res.refuse;
-                authorized_ = false;
-                nlohmann::json response;
-                response["id"] = request_id;
-                response["result"] = false;
-                response["error"] = nlohmann::json::array({24, "Unauthorized: " + res.refuse, nullptr});
-                return response;
-            }
+            const std::string who = username_.empty() ? std::string("(empty login)") : username_;
             for (const auto& n : res.notes)
                 LOG_INFO << "[Stratum] " << n;
+            for (const auto& w : res.warnings)
+                LOG_WARNING << "[Stratum] " << who << ": " << w;
             username_ = std::move(res.primary);
             merged_addresses_ = std::move(res.addresses);
+            usable_primary = res.usable_primary;
+            parent_script = std::move(res.parent_script);
+            std::set<uint32_t> given(named_now);
+            given.insert(carried.begin(), carried.end());
+            given.insert(res.from_login.begin(), res.from_login.end());
+            for (auto id : given)
+                if (merged_addresses_.count(id))
+                    given_now[id] = merged_addresses_.at(id);
         }
         if (!merged_addresses_.empty())
             LOG_INFO << "[Stratum] Merged addresses from login: " << merged_addresses_.size() << " chain(s)";
 
-        // ─── #961 B1: reject a foreign-coin payout at the door ──────────────
+        // ─── #961 B1: a foreign-coin payout at the door ──────────────────────
         // If this coin published its OWN acceptance set (StratumConfig.payout_*
         // — the LTC/DOGE merged-mining server does), a username that is neither
-        // an own-coin address NOR a CONFIGURED merged chain's address MUST be
-        // rejected here. Authorizing it would put the miner on jobs whose
-        // coinbase pays a script this node cannot build for their key — an
-        // empty / zero-hash160 payout that PPLNS burns every block (accept-and-
-        // burn). Own-coin and configured-merged stay accepted (reward-safe);
-        // lanes that leave payout_* empty keep the legacy accept-any behaviour
-        // (they validate at mining_submit in their work source, where an empty
-        // payout falls back to the node-owner/donation script, not a burn).
+        // an own-coin address NOR a CONFIGURED merged chain's address is never
+        // turned into a payout script (a foreign address repurposed into a
+        // wrong-coin script, or an empty payout PPLNS would burn). A work
+        // source that redistributes such logins (StratumConfig::
+        // redistribute_unusable_logins: the LTC pool, as p2pool does) accepts
+        // them and redistributes their shares; any other lane refuses them.
+        // Lanes that leave payout_* empty keep the legacy accept-any behaviour
+        // (they validate at mining_submit in their work source).
+        payout_unusable_ = false;
+        parent_script_.clear();
+        payout_warning_.clear();
         {
             const auto& acfg = mining_interface_->get_stratum_config();
             const bool acceptance_configured =
                 !acfg.payout_p2pkh_versions.empty() ||
                 !acfg.payout_p2sh_versions.empty() ||
                 !acfg.payout_bech32_hrps.empty();
+            bool rejected = false;
             if (acceptance_configured && !username_.empty()) {
                 const core::CoinAddressAcceptance own{acfg.payout_p2pkh_versions,
                     acfg.payout_p2sh_versions, acfg.payout_bech32_hrps};
@@ -764,26 +798,44 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
                 for (const auto& chain : MERGED_CHAINS)
                     if (mining_interface_->has_merged_chain(chain.chain_id))
                         merged_cfg.push_back({chain.hrps, chain.versions});
-                if (core::decide_payout_address(username_, own, merged_cfg)
-                        == core::PayoutAddressDecision::Reject) {
-                    LOG_WARNING << "[Stratum] REJECTED mining.authorize: payout address "
-                                << username_ << " is not a"
-                                << (acfg.coin_symbol.empty() ? "" : " " + acfg.coin_symbol)
-                                << " address and not a configured merged chain — refusing "
-                                   "to authorize (issue #961: would burn the reward)";
-                    authorized_ = false;
-                    nlohmann::json response;
-                    response["id"] = request_id;
-                    response["result"] = false;
-                    response["error"] = nlohmann::json::array(
-                        {24, "Unauthorized: payout address is not for this coin "
-                             "(and not a configured merged chain)", nullptr});
-                    return response;
-                }
+                rejected = core::decide_payout_address(username_, own, merged_cfg)
+                           == core::PayoutAddressDecision::Reject;
+            }
+            if (acfg.redistribute_unusable_logins && (rejected || username_.empty() || !usable_primary)) {
+                payout_unusable_ = true;
+                parent_script_ = parent_script;
+                payout_warning_ = !parent_script_.empty()
+                    ? "address invalid → parent paid to the DOGE address's key"
+                    : username_.empty() ? "no address → redistributed" : "address invalid → redistributed";
+                LOG_WARNING << "[Stratum] " << (username_.empty() ? std::string("(empty login)") : username_)
+                            << (worker_name_.empty() ? "" : "." + worker_name_) << ": "
+                            << (username_.empty() ? "no payout address"
+                                                  : "payout address is not a" + (acfg.coin_symbol.empty() ? std::string()
+                                                                                 : " " + acfg.coin_symbol)
+                                                        + " address (nor a configured merged chain's)")
+                            << (!parent_script_.empty()
+                                    ? ": the parent payout uses the DOGE address's key (p2pool case 4)"
+                                    : ": its shares are redistributed (--redistribute), merged chains included");
+            } else if (rejected) {
+                LOG_WARNING << "[Stratum] REJECTED mining.authorize: payout address "
+                            << username_ << " is not a"
+                            << (acfg.coin_symbol.empty() ? "" : " " + acfg.coin_symbol)
+                            << " address and not a configured merged chain — refusing "
+                               "to authorize (issue #961: would burn the reward)";
+                authorized_ = false;
+                nlohmann::json response;
+                response["id"] = request_id;
+                response["result"] = false;
+                response["error"] = nlohmann::json::array(
+                    {24, "Unauthorized: payout address is not for this coin "
+                         "(and not a configured merged chain)", nullptr});
+                return response;
             }
         }
 
         LOG_INFO << "[Stratum] Mining authorization successful for: " << username_;
+        login_primary_ = username_;
+        login_given_ = std::move(given_now);
 
         // Auto-derive: for each configured merged chain without an explicit address,
         // reuse the primary address hash160 (works because chains share secp256k1 keys).
@@ -804,7 +856,9 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
             if (atype == "p2wsh" || atype == "p2tr") {
                 LOG_WARNING << "[Stratum] Primary address is " << atype
                             << " — cannot auto-derive merged mining addresses "
-                            << "(non-convertible witness program)";
+                            << "(non-convertible witness program); a share carries a 20-byte "
+                            << "payout hash only, so the work source decides its payout "
+                            << "(the LTC pool redistributes it by --redistribute)";
             }
         }
 
@@ -826,7 +880,7 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
         // coinbase: address_to_script(username_) yields the real witness/script
         // payout for (2) exactly as it yields the P2PKH payout for (1).
         // force_clean so the miner drops the stale job.
-        if (mining_interface_ && (!username_.empty() || !merged_addresses_.empty())) {
+        if (mining_interface_ && (!username_.empty() || !merged_addresses_.empty() || had_identity)) {
             send_notify_work(true);
         }
         
@@ -838,6 +892,7 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
             MiningInterface::WorkerInfo wi;
             wi.username = username_;
             wi.worker_name = worker_name_;
+            wi.payout_warning = payout_warning_;
             wi.difficulty = hashrate_tracker_.get_current_difficulty();
             wi.connected_at = connected_at_;
             try {
@@ -1081,8 +1136,18 @@ nlohmann::json StratumSession::handle_set_merged_addresses(const nlohmann::json&
         if (val.is_string()) {
             try {
                 uint32_t chain_id = static_cast<uint32_t>(std::stoul(key));
-                merged_addresses_[chain_id] = val.get<std::string>();
-                set_merged_addresses_[chain_id] = val.get<std::string>();
+                const std::string addr = val.get<std::string>();
+                if (core::merged_addr::merged_payout_script(core::merged_addr::find_chain(merged_table(), chain_id),
+                                                            addr).empty()) {
+                    // Pays nothing (bad checksum, not an address): not stored,
+                    // the chain keeps what it had.
+                    LOG_WARNING << "[Stratum] mining.set_merged_addresses: " << addr << " for chain_id="
+                                << chain_id << " is not a valid address: ignored";
+                    continue;
+                }
+                merged_addresses_[chain_id] = addr;
+                set_merged_addresses_[chain_id] = addr;
+                login_given_.erase(chain_id);       // superseded by the address set now
             } catch (...) {
                 // skip malformed
             }
@@ -1285,14 +1350,22 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
     // P2Pool checks every share against the block target regardless of
     // pool-level difficulty acceptance.  Missing this check means ~75% of
     // valid blocks are silently discarded.
+    // The merged scripts the job committed to (its ref_hash); a job built
+    // without a per-connection coinbase: the session's current ones.
     std::map<uint32_t, std::vector<unsigned char>> merged_scripts;
-    for (const auto& [chain_id, addr] : merged_addresses_) {
-        auto script = merged_script_for(chain_id, addr);
-        if (!script.empty())
-            merged_scripts[chain_id] = std::move(script);
+    if (job.has_payout) {
+        merged_scripts = job.merged_scripts;
+    } else {
+        for (const auto& [chain_id, addr] : merged_addresses_) {
+            auto script = merged_script_for(chain_id, addr);
+            if (!script.empty())
+                merged_scripts[chain_id] = std::move(script);
+        }
     }
 
     MiningInterface::JobSnapshot snapshot;
+    snapshot.has_payout      = job.has_payout;
+    snapshot.payout_script   = job.payout_script;
     snapshot.coinb1          = job.payload->coinb1;
     snapshot.coinb2          = job.payload->coinb2;
     snapshot.gbt_prevhash    = job.gbt_prevhash;
@@ -1691,6 +1764,9 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
     // think() Phase 5 (punish walk + best_descendent) ensures best is correct.
     uint256 frozen_prev_share;
     MiningInterface::CoinbaseResult cbr;
+    bool job_has_payout = false;
+    std::vector<unsigned char> job_payout_script;
+    std::map<uint32_t, std::vector<unsigned char>> job_merged_scripts;
     if (frozen_best_share)
         frozen_prev_share = *frozen_best_share;  // use cycle-frozen value (from notify_all)
     else if (auto fn = mining_interface_->get_best_share_hash_fn())
@@ -1717,7 +1793,11 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
         // is configured for this server and the legacy chain-agnostic build is
         // preserved byte-for-byte (non-LTC lanes validate at mining_submit).
         std::vector<unsigned char> payout_script;
-        if (!username_.empty()) {
+        if (payout_unusable_) {
+            // No payout address a share can carry: empty (the work source
+            // redistributes it), or p2pool's case 4 (a DOGE address's key).
+            payout_script = parent_script_;
+        } else if (!username_.empty()) {
             const auto& scfg = mining_interface_->get_stratum_config();
             const bool acceptance_configured =
                 !scfg.payout_p2pkh_versions.empty() ||
@@ -1766,6 +1846,10 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
                 merged_addrs.push_back({chain_id, std::move(script)});
         }
 
+        mining_interface_->decide_job_payout(payout_script, merged_addrs);
+        job_has_payout = true;
+        job_payout_script = payout_script;
+        job_merged_scripts = std::map<uint32_t, std::vector<unsigned char>>(merged_addrs.begin(), merged_addrs.end());
         cbr = mining_interface_->build_connection_coinbase(
             frozen_prev_share, extranonce1_, payout_script, merged_addrs);
         if (!cbr.coinb1.empty()) {
@@ -1948,6 +2032,9 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
         // validate a share against the target the miner actually received
         // (p2pool-dash work.py:477 grace), immune to later vardiff retargets.
         je.issued_difficulty = hashrate_tracker_.get_current_difficulty();
+        je.has_payout = job_has_payout;
+        je.payout_script = std::move(job_payout_script);
+        je.merged_scripts = std::move(job_merged_scripts);
         active_jobs_[job_id] = std::move(je);
         job_order_.push_back(job_id);
     }
@@ -2188,13 +2275,17 @@ void StratumSession::drop_stale(const char* reason)
 //
 // Slash format populates merged_addresses_ directly.
 // Simple formats extract merged_addr_raw for chain auto-detection.
-void StratumSession::parse_address_separators(std::string& username, std::string& merged_addr_raw)
+void StratumSession::parse_address_separators(std::string& username, std::string& merged_addr_raw,
+                                              std::set<uint32_t>* slash_chains)
 {
     // Priority 1: Slash format with explicit chain IDs and/or "/<share_diff>"
     auto slash = stratum_username::parse_slash_tokens(username);
     if (slash.had_slash) {
-        for (auto& [chain_id, addr] : slash.merged_addresses)
+        for (auto& [chain_id, addr] : slash.merged_addresses) {
             merged_addresses_[chain_id] = std::move(addr);
+            if (slash_chains)
+                slash_chains->insert(chain_id);
+        }
         if (slash.share_diff) {
             share_difficulty_override_ = slash.share_diff;
             LOG_INFO << "[Stratum] Share difficulty from username: " << *slash.share_diff;

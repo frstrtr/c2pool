@@ -2543,6 +2543,40 @@ int main(int argc, char* argv[]) {
                                 stratum_config.merged_parent_versions.push_back(v);
                 }
             }
+            stratum_config.merged_chains_expected = !merged_chain_specs.empty();
+            // A login without a usable payout address is redistributed
+            // (--redistribute), as p2pool does, not refused.
+            stratum_config.redistribute_unusable_logins = true;
+            // The merged addresses of the operator's own shares (node-fee
+            // shares, redistributed shares landing on the operator's key):
+            // p2pool's --merged-operator-address cascade, per merged chain.
+            if (node_owner_fee > 0.0 && !node_owner_address.empty() && !merged_chain_specs.empty()) {
+                std::map<uint32_t, std::vector<unsigned char>> op_scripts;
+                const std::vector<unsigned char> donation(ltc::PoolConfig::COMBINED_DONATION_SCRIPT.begin(),
+                                                          ltc::PoolConfig::COMBINED_DONATION_SCRIPT.end());
+                for (const auto& spec : merged_chain_specs) {
+                    const auto c1 = spec.find(':');
+                    if (c1 == std::string::npos)
+                        continue;
+                    std::string sym = spec.substr(0, c1);
+                    for (auto& c : sym) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                    uint32_t cid = 0;
+                    try { cid = static_cast<uint32_t>(std::stoul(spec.substr(c1 + 1))); } catch (...) { continue; }
+                    const auto ov = merged_payout_addresses.find(sym);
+                    const auto o = c2pool::merged::resolve_operator_merged_script(
+                        sym, settings->m_testnet ? c2pool::merged::AuxNetwork::testnet
+                                                 : c2pool::merged::AuxNetwork::mainnet,
+                        node_owner_address, node_owner_merged_address,
+                        ov != merged_payout_addresses.end() ? ov->second : std::string(), donation);
+                    if (!o.warning.empty())
+                        LOG_WARNING << "[MM:" << sym << "] " << o.warning << ": the node fee's " << sym
+                                    << " payout uses " << o.source;
+                    LOG_INFO << "[MM:" << sym << "] node-fee shares pay " << sym << " to the operator ("
+                             << o.source << ")";
+                    op_scripts[cid] = o.script;
+                }
+                web_server.get_mining_interface()->set_operator_merged_scripts(std::move(op_scripts));
+            }
             web_server.get_mining_interface()->set_stratum_config(stratum_config);
             if (fd_limit_known)
                 web_server.set_max_http_connections(fd_plan.http);
@@ -9737,18 +9771,10 @@ int main(int argc, char* argv[]) {
                     return result;
                 });
               } else {
-                // P2P mode: PPLNS weights from the share tracker
-                // Build operator LTC script for merged address override (p2pool --merged-operator-address)
-                auto operator_ltc_script = node_owner_address.empty()
-                    ? std::vector<unsigned char>{}
-                    : core::address_to_script(node_owner_address);
-                auto operator_merged_script = node_owner_merged_address.empty()
-                    ? std::vector<unsigned char>{}
-                    : core::address_to_script(node_owner_merged_address);
-                if (!node_owner_merged_address.empty()) {
-                    LOG_INFO << "Merged operator address override: " << node_owner_merged_address
-                             << " (script " << operator_merged_script.size() << " bytes)";
-                }
+                // P2P mode: PPLNS weights from the share tracker, exactly as
+                // p2pool derives them (no node-local redirect: the operator's
+                // merged address reaches the payouts as the merged address of
+                // the operator's own shares, see set_operator_merged_scripts).
                 // The tracker lock is often busy (the compute thread holds it
                 // exclusively while it processes shares, for tens of seconds
                 // at a stretch): the compute thread publishes the PPLNS
@@ -9767,7 +9793,7 @@ int main(int argc, char* argv[]) {
                 // COMBINED_DONATION_SCRIPT (P2SH) regardless of share version
                 // (p2pool data.py line 303); the parent chain uses the
                 // version-dependent donation.
-                auto merged_weights = [operator_ltc_script, operator_merged_script, combined_donation](
+                auto merged_weights = [combined_donation](
                     ltc::ShareTracker& tracker, const uint256& best, uint32_t chain_id)
                     -> c2pool::merged::MergedPayoutSource::Weights
                 {
@@ -9777,8 +9803,7 @@ int main(int argc, char* argv[]) {
                     if (best.IsNull() || !tracker.chain.contains(best))
                         return out;   // no derive: no payouts
                     auto w = std::make_shared<const ltc::MergedPayoutWeights>(
-                        tracker.get_merged_payout_weights(best, chain_id, operator_ltc_script,
-                                                          operator_merged_script));
+                        tracker.get_merged_payout_weights(best, chain_id));
                     out.chain_len = w->chain_len;
                     out.derive = [w, combined_donation](uint64_t coinbase_value) {
                         return ltc::ShareTracker::merged_payout_outputs(*w, coinbase_value,
@@ -9983,7 +10008,11 @@ int main(int argc, char* argv[]) {
                     for (int i = 0; i < 20; ++i)
                         op_hash.data()[i] = static_cast<uint8_t>(
                             std::stoul(op_h160.substr(i * 2, 2), nullptr, 16));
-                    redistributor->set_operator_identity(op_hash, 0); // P2PKH
+                    // The operator's own script type (p2pool: my_pubkey_type).
+                    std::string op_atype;
+                    core::address_to_hash160(node_owner_address, op_atype);
+                    const uint8_t op_type = op_atype == "p2sh" ? 2 : op_atype == "p2wpkh" ? 1 : 0;
+                    redistributor->set_operator_identity(op_hash, op_type);
                 }
             }
 
@@ -10003,6 +10032,22 @@ int main(int argc, char* argv[]) {
             if (p2p_node) {
                 auto* redistributor_ptr = redistributor.get();
                 auto* node_ptr = p2p_node.get();
+                // The pick with its pubkey type (P2SH donation, a P2SH / P2WPKH
+                // miner): decide_job_payout pays the recipient's own script type.
+                web_server.get_mining_interface()->set_redistribute_fn(
+                    [redistributor_ptr, node_ptr]() -> std::pair<std::string, uint8_t> {
+                        auto best = node_ptr->best_share_hash();
+                        auto result = redistributor_ptr->pick(node_ptr->tracker(), best);
+                        static const char* HEX = "0123456789abcdef";
+                        std::string h160;
+                        h160.reserve(40);
+                        const unsigned char* bytes = result.pubkey_hash.data();
+                        for (int i = 0; i < 20; ++i) {
+                            h160 += HEX[bytes[i] >> 4];
+                            h160 += HEX[bytes[i] & 0x0f];
+                        }
+                        return {h160, result.pubkey_type};
+                    });
                 web_server.get_mining_interface()->set_address_fallback_fn(
                     [redistributor_ptr, node_ptr](const std::string& /*bad_addr*/) -> std::string {
                         auto best = node_ptr->best_share_hash();
