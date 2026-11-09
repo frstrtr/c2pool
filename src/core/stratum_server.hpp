@@ -303,6 +303,14 @@ private:
     // never authorizes (half-open / probe) is dropped when it fires.
     boost::asio::steady_timer handshake_timer_;
 
+    // A held job (CoinbaseResult::held): one pending retry per session, for
+    // at most kJobHoldLimit since the hold began; past it the session stops
+    // retrying (the miner keeps its last valid job) until the next notify.
+    static constexpr std::chrono::seconds kJobHoldLimit{20};
+    bool hold_retry_pending_ = false;
+    std::chrono::steady_clock::time_point hold_since_{};
+    uint64_t hold_retries_ = 0;
+
 public:
     explicit StratumSession(tcp::socket socket, std::shared_ptr<IWorkSource> mining_interface,
                             StratumServer* server = nullptr);

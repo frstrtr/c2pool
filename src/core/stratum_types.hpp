@@ -170,12 +170,6 @@ struct StratumConfig {
     // source (decide_job_payout), as p2pool does. Off: such logins are
     // refused (#961) — for work sources that do not redistribute.
     bool redistribute_unusable_logins{false};
-    // A job whose connection coinbase could not be built consistently (the
-    // sharechain tracker was busy: no PPLNS at the job's prev share, or no
-    // ref_hash) is held and retried instead of falling back to the global
-    // coinbase: a share from either could never match its own generation
-    // transaction. The LTC pool (c2pool-ltc) sets it.
-    bool hold_job_without_connection_coinbase{false};
 };
 
 /// Frozen share-construction fields returned by ref_hash_fn. These
@@ -276,6 +270,11 @@ struct CoinbaseResult {
     std::string coinb1;
     std::string coinb2;
     WorkSnapshot snapshot;
+    // No coinbase now: the work source could not build one its shares can
+    // verify (the sharechain was busy). The session holds the job (the
+    // miner keeps its last one) and retries; it never falls back to the
+    // global coinbase.
+    bool held{false};
 };
 
 /// Rolling record of one stratum connection's submit outcomes, for the

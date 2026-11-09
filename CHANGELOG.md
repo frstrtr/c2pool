@@ -49,11 +49,21 @@
   daemon's own P2P link announces now refreshes the template at once.
 - Redistribution reads the sharechain only under its read lock (a crash race
   with the compute thread, seen under TSAN).
+- No work is built on a burn output any more. When the sharechain was busy
+  (the PPLNS split at the best share could not be read) the template refresh
+  paid the whole subsidy to the zero key and cached that as the split of the
+  best share; every stratum job at that share then paid it. Now the last
+  valid split is kept for the same best share, nothing is cached otherwise,
+  and the zero-key fallback is gone. An empty sharechain pays the donation
+  (p2pool's genesis rule), and `--solo` / `--custodial` pay their own split
+  (they always paid the zero key).
 - A stratum job is no longer built while the sharechain is busy: the PPLNS at
   the job's prev share or the ref_hash could not be read, and the job used
   the cached PPLNS of another best share or a null ref_hash, so its shares
   could not match their own generation transaction ("Cross-check FAILED").
-  The session holds the job and retries.
+  The job is held: the miner keeps its last job, one retry is pending per
+  session (every 500 ms), and after 20 s the session stops retrying (logged)
+  until the next notify. Never the global coinbase.
 - Shares this node makes are written to LevelDB like received ones (they
   never were: after a restart the chain had holes until peers sent them back).
 

@@ -2564,10 +2564,6 @@ int main(int argc, char* argv[]) {
             // A login without a usable payout address is redistributed
             // (--redistribute), as p2pool does, not refused.
             stratum_config.redistribute_unusable_logins = true;
-            // A job whose coinbase the busy sharechain could not build (no
-            // PPLNS at its prev share, no ref_hash) is held and retried, never
-            // replaced by the global coinbase (its shares would not verify).
-            stratum_config.hold_job_without_connection_coinbase = true;
             // The merged addresses of the operator's own shares (node-fee
             // shares, redistributed shares landing on the operator's key):
             // p2pool's --merged-operator-address cascade, per merged chain.
@@ -7074,6 +7070,10 @@ int main(int argc, char* argv[]) {
                     const uint256& best_hash, const uint256& block_target,
                     uint64_t subsidy, const std::vector<unsigned char>& /*donation_script*/)
                     -> std::map<std::vector<unsigned char>, double> {
+                // An empty sharechain: no split here; refresh_work and the
+                // stratum jobs apply p2pool's genesis rule (the whole subsidy
+                // to the donation script).
+                if (best_hash.IsNull()) return {};
                 auto guard = p2p_node->read_tracker();
                 if (!guard) return {};
 

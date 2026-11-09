@@ -1868,6 +1868,24 @@ private:
     std::vector<std::pair<std::string, uint64_t>> m_cached_pplns_outputs;
     uint256 m_cached_pplns_best_share;
     bool m_cached_raw_scripts{false};
+    // The cached (best share, outputs) pair is a real PPLNS split for that
+    // share. False while none could be computed (the tracker was busy at a new
+    // best share): jobs then recompute, and never build on the cached outputs.
+    bool m_cached_pplns_valid{false};
+    // Jobs not built because the sharechain was busy (CoinbaseResult::held),
+    // and refreshes that found no valid PPLNS: /local_stats-free counters, logged.
+    mutable std::atomic<uint64_t> m_jobs_held{0};
+    std::atomic<uint64_t> m_refresh_without_pplns{0};
+    void note_job_held(const char* why) const;
+public:
+    uint64_t jobs_held() const { return m_jobs_held.load(std::memory_order_relaxed); }
+    uint64_t refreshes_without_pplns() const { return m_refresh_without_pplns.load(std::memory_order_relaxed); }
+    bool cached_pplns_valid() const
+    {
+        std::lock_guard<std::mutex> l(m_work_mutex);
+        return m_cached_pplns_valid;
+    }
+private:
     // V35/V36 PPLNS selection. Defaults to the v35 network floor: this is the
     // fallback rest_v36_status()/rest_version_signaling() read when a coin lane
     // has not wired set_cached_share_version() or has no on-chain vote data yet.
@@ -1989,10 +2007,6 @@ private:
     std::map<uint32_t, std::vector<unsigned char>> m_operator_merged_scripts;
     std::function<std::pair<std::string, uint8_t>()> m_redistribute_fn;
     mutable std::mutex m_redistribute_mu;   // m_redistribute_fn, m_address_fallback_fn
-    // Connection coinbases not built because the tracker was busy (the
-    // session holds the job and retries: StratumConfig::hold_job_without_connection_coinbase).
-    mutable std::atomic<uint64_t> m_connection_coinbase_held{0};
-    void note_connection_coinbase_held(const char* why) const;
     std::vector<unsigned char> m_donation_script;   // protocol donation scriptPubKey
     std::function<double()> m_stratum_hashrate_fn;  // callback to get stratum total hashrate
     std::function<RateStats()> m_stratum_rate_stats_fn;  // callback to get rate monitor stats
@@ -2045,7 +2059,6 @@ public:
     void decide_job_payout(std::vector<unsigned char>& payout_script,
                            std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged) const override;
     const StratumConfig& get_stratum_config() const override { return m_stratum_config; }
-    uint64_t connection_coinbase_held() const { return m_connection_coinbase_held.load(std::memory_order_relaxed); }
     void set_cors_origin(const std::string& origin) { m_cors_origin = origin; }
     const std::string& get_cors_origin() const { return m_cors_origin; }
 
