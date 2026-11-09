@@ -633,5 +633,18 @@ private:
     mutable std::recursive_mutex m_mutex;
 };
 
+// createauxblock / getauxblock "target" and "_target" are the raw
+// little-endian bytes of the uint256 (HexStr(BEGIN, END)), low byte first.
+// Reverses them into the big-endian form uint256::SetHex reads. Returns false
+// and leaves out untouched unless le_hex is exactly 64 hex digits.
+bool aux_target_from_le_hex(const std::string& le_hex, uint256& out);
+
+// Maps a createauxblock reply to AuxWork: hash, chainid (default_chain_id when
+// absent), height, coinbasevalue, and the target from "target", then
+// "_target" (both little-endian, see above), then "bits".
+AuxWork aux_work_from_createauxblock(const nlohmann::json& result,
+                                     uint32_t default_chain_id,
+                                     const std::string& symbol);
+
 } // namespace merged
 } // namespace c2pool

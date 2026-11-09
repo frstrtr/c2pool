@@ -196,6 +196,7 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
         known_txs_eviction_test.cpp
         leveldb_store_lock_test.cpp
         listener_family_test.cpp
+        merged_aux_target_le_test.cpp
         muhash_chacha20_test.cpp
         netaddress_resolution_test.cpp
         p2p_message_stats_test.cpp
