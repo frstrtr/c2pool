@@ -10970,10 +10970,13 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
             // Case 3 (Python work.py): no valid LTC or DOGE address → redistribute
             // according to the node's configured --redistribute mode.
             if (m_address_fallback_fn) {
-                share_address = m_address_fallback_fn(primary_addr);
-                if (share_address.size() == 40)
+                auto [h160, type] = m_address_fallback_fn(primary_addr);
+                if (h160.size() == 40 && type <= 2) {
+                    share_address = std::move(h160);
+                    share_addr_type = type;   // the recipient's own script type
                     LOG_INFO << "mining_submit: Case 3 — redistributed share for invalid address '"
-                             << primary_addr << "'";
+                             << primary_addr << "' (type " << int(type) << ")";
+                }
             }
             if (share_address.size() != 40)
                 LOG_WARNING << "mining_submit: cannot resolve share address for '"
@@ -10991,16 +10994,20 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
                 // Extract hash160 from node fee scriptPubKey (any supported type)
                 static const char* HEX = "0123456789abcdef";
                 int h160_off = -1;
+                uint8_t fee_type = 0;
                 auto sz = m_node_fee_script.size();
                 if (sz == 25 && m_node_fee_script[0] == 0x76 &&
                     m_node_fee_script[1] == 0xa9 && m_node_fee_script[2] == 0x14) {
                     h160_off = 3;  // P2PKH: 76 a9 14 <20> 88 ac
+                    fee_type = 0;
                 } else if (sz == 23 && m_node_fee_script[0] == 0xa9 &&
                            m_node_fee_script[1] == 0x14) {
                     h160_off = 2;  // P2SH: a9 14 <20> 87
+                    fee_type = 2;
                 } else if (sz == 22 && m_node_fee_script[0] == 0x00 &&
                            m_node_fee_script[1] == 0x14) {
                     h160_off = 2;  // P2WPKH: 00 14 <20>
+                    fee_type = 1;
                 }
                 if (h160_off >= 0) {
                     std::string h160;
@@ -11010,6 +11017,10 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
                         h160 += HEX[m_node_fee_script[i] & 0x0f];
                     }
                     share_address = h160;
+                    // The operator's own script type, not the miner's: the
+                    // operator's hash under the miner's type pays another
+                    // address, or nobody (a script hash as P2PKH).
+                    share_addr_type = fee_type;
                     LOG_DEBUG_POOL << "Node fee: share " << job_id
                                    << " address replaced → operator (roll="
                                    << roll << " < " << m_node_fee_percent << ")";

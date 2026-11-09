@@ -171,6 +171,10 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
     # coinbase value, bits and donation it was computed for (also with a
     # refresher racing four job builders). Same fold-into-core_test reasoning
     # as every TU here.
+    # web_server_redistribute_type_test.cpp: a share's payout replaced by
+    # --redistribute (Case 3) or the node fee draw keeps its recipient's own
+    # script type (P2SH as P2SH, P2WPKH as P2WPKH; never a script hash as
+    # P2PKH). Same fold-into-core_test reasoning as every TU here.
     # web_server_utxo_scan_test.cpp: GET /api/utxo/scan's web-server half (the
     # dedicated scan thread, one at a time, the interval, the wait cap, the
     # direct-local gate). Same fold-into-core_test reasoning as every TU here.
@@ -240,6 +244,7 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
         web_server_merged_drop_test.cpp
         web_server_mweb_hogex_test.cpp
         web_server_pplns_no_burn_test.cpp
+        web_server_redistribute_type_test.cpp
         web_server_relay_block_test.cpp
         web_server_submitblock_test.cpp
         web_server_utxo_scan_test.cpp

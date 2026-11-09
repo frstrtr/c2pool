@@ -9871,8 +9871,9 @@ int main(int argc, char* argv[]) {
             LOG_INFO << "Redistribute mode: " << ltc::format_hybrid_weights(hybrid_weights);
 
             // Set operator identity for "fee" and "boost" modes.
-            // get_node_fee_hash160() extracts the hash160 from the P2PKH fee scriptPubKey
-            // that was set earlier via set_node_fee_from_address().
+            // get_node_fee_hash160() extracts the hash160 from the fee scriptPubKey
+            // that was set earlier via set_node_fee_from_address(); the type is
+            // the operator address's own (P2SH paid as P2PKH would pay nobody).
             {
                 auto op_h160 = web_server.get_mining_interface()->get_node_fee_hash160();
                 if (op_h160.size() == 40) {
@@ -9880,7 +9881,10 @@ int main(int argc, char* argv[]) {
                     for (int i = 0; i < 20; ++i)
                         op_hash.data()[i] = static_cast<uint8_t>(
                             std::stoul(op_h160.substr(i * 2, 2), nullptr, 16));
-                    redistributor->set_operator_identity(op_hash, 0); // P2PKH
+                    std::string op_atype;
+                    core::address_to_hash160(node_owner_address, op_atype);
+                    const uint8_t op_type = op_atype == "p2sh" ? 2 : op_atype == "p2wpkh" ? 1 : 0;
+                    redistributor->set_operator_identity(op_hash, op_type);
                 }
             }
 
@@ -9901,9 +9905,19 @@ int main(int argc, char* argv[]) {
                 auto* redistributor_ptr = redistributor.get();
                 auto* node_ptr = p2p_node.get();
                 web_server.get_mining_interface()->set_address_fallback_fn(
-                    [redistributor_ptr, node_ptr](const std::string& /*bad_addr*/) -> std::string {
+                    [redistributor_ptr, node_ptr](const std::string& /*bad_addr*/)
+                        -> std::pair<std::string, uint8_t> {
                         auto best = node_ptr->best_share_hash();
                         auto result = redistributor_ptr->pick(node_ptr->tracker(), best);
+                        // The recipient with its own script type. No recipient
+                        // (no operator identity set, nothing in the window) or
+                        // a type a share cannot carry: the combined donation
+                        // (P2SH), never the zero key.
+                        if (result.pubkey_hash.IsNull() || result.pubkey_type > 2) {
+                            std::memcpy(result.pubkey_hash.data(),
+                                        ltc::PoolConfig::COMBINED_DONATION_SCRIPT.data() + 2, 20);
+                            result.pubkey_type = 2;
+                        }
                         static const char* HEX = "0123456789abcdef";
                         std::string h160;
                         h160.reserve(40);
@@ -9912,14 +9926,18 @@ int main(int argc, char* argv[]) {
                             h160 += HEX[bytes[i] >> 4];
                             h160 += HEX[bytes[i] & 0x0f];
                         }
-                        return h160;
+                        return {h160, result.pubkey_type};
                     });
             } else if (!payout_address.empty()) {
                 // Solo/custodial: invalid miner address → use node operator address
+                // (with its own type; a P2WSH / P2TR one cannot be a share's).
                 web_server.get_mining_interface()->set_address_fallback_fn(
-                    [&payout_address](const std::string& /*bad_addr*/) -> std::string {
+                    [&payout_address](const std::string& /*bad_addr*/) -> std::pair<std::string, uint8_t> {
                         std::string atype;
-                        return core::address_to_hash160(payout_address, atype);
+                        auto h160 = core::address_to_hash160(payout_address, atype);
+                        if (h160.size() != 40 || (atype != "p2pkh" && atype != "p2sh" && atype != "p2wpkh"))
+                            return {std::string(), 0};
+                        return {h160, static_cast<uint8_t>(atype == "p2sh" ? 2 : atype == "p2wpkh" ? 1 : 0)};
                     });
             }
             // Keep redistributor alive for the lifetime of the pool

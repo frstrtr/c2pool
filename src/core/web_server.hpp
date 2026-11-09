@@ -1515,8 +1515,11 @@ public:
     void set_rpc_submit_fallback(std::function<std::string(const std::string&)> fn);
     // Redistribute / address-fallback callback.
     // Called when a share's primary address cannot be resolved to a valid hash160.
-    // Receives the bad address string; must return a 40-char hex hash160, or "" to keep share.
-    using address_fallback_fn_t = std::function<std::string(const std::string&)>;
+    // Receives the bad address string; returns the recipient as a 40-char hex
+    // hash160 and its V36 pubkey type (0 P2PKH, 1 P2WPKH, 2 P2SH), or "" for
+    // none. The type is the recipient's own: its hash under another script
+    // type pays another address, or nobody (a script hash as P2PKH).
+    using address_fallback_fn_t = std::function<std::pair<std::string, uint8_t>(const std::string&)>;
     void set_address_fallback_fn(address_fallback_fn_t fn) { m_address_fallback_fn = std::move(fn); }
 
     // Return true if the merged-mining manager has a configured chain with chain_id.

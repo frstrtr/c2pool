@@ -344,6 +344,11 @@ if (BUILD_TESTING AND GTest_FOUND)
     # shared try-lock elsewhere, the published verified best while busy, the
     # caller's guard when it holds one), driven on a REAL ltc::NodeImpl against
     # a compute thread moving the best share. Same folding rule.
+    #
+    # redistribute_script_type_test.cpp: a redistribution recipient taken from
+    # an address share keeps the (hash, type) the share carries; a P2WSH / P2TR
+    # / bare script is not a recipient (never its first bytes as P2PKH). Same
+    # folding rule.
     # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
     add_executable(share_test
         auto_ratchet_blocked_by_test.cpp
@@ -411,6 +416,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         peer_block_pow_carry_test.cpp
         per_peer_ingest_test.cpp
         pool_rate_head_select_test.cpp
+        redistribute_script_type_test.cpp
         restart_reorg_supersede_test.cpp
         self_connection_ban_test.cpp
         share_fetch_failover_test.cpp
