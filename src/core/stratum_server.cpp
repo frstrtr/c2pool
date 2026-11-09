@@ -1833,6 +1833,37 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
 
         cbr = mining_interface_->build_connection_coinbase(
             frozen_prev_share, extranonce1_, payout_script, merged_addrs);
+        if (cbr.held) {
+            // No coinbase its shares could verify (the sharechain is busy): no
+            // job now — the miner keeps its last one — never the global
+            // coinbase. One pending retry per session, bounded in time.
+            const auto now = std::chrono::steady_clock::now();
+            if (hold_retries_ == 0)
+                hold_since_ = now;
+            ++hold_retries_;
+            if (now - hold_since_ > kJobHoldLimit) {
+                LOG_WARNING << "[Stratum] job held for " << kJobHoldLimit.count() << " s (the sharechain stayed"
+                            << " busy): no more retries, the miner keeps its last job until the next notify";
+                hold_retries_ = 0;
+                return;
+            }
+            if (!hold_retry_pending_) {
+                hold_retry_pending_ = true;
+                auto timer = std::make_shared<boost::asio::steady_timer>(socket_.get_executor());
+                timer->expires_after(std::chrono::milliseconds(500));
+                timer->async_wait([weak_self = weak_from_this(), timer, force_clean](boost::system::error_code ec) {
+                    auto self = weak_self.lock();
+                    if (!self)
+                        return;
+                    self->hold_retry_pending_ = false;
+                    if (ec || !self->is_connected())
+                        return;
+                    self->send_notify_work(force_clean);
+                });
+            }
+            return;
+        }
+        hold_retries_ = 0;
         if (!cbr.coinb1.empty()) {
             coinb1 = std::move(cbr.coinb1);
             coinb2 = std::move(cbr.coinb2);

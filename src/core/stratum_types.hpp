@@ -254,6 +254,11 @@ struct CoinbaseResult {
     std::string coinb1;
     std::string coinb2;
     WorkSnapshot snapshot;
+    // No coinbase now: the work source could not build one its shares can
+    // verify (the sharechain was busy). The session holds the job (the
+    // miner keeps its last one) and retries; it never falls back to the
+    // global coinbase.
+    bool held{false};
 };
 
 /// Rolling record of one stratum connection's submit outcomes, for the

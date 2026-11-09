@@ -1848,6 +1848,24 @@ private:
     std::vector<std::pair<std::string, uint64_t>> m_cached_pplns_outputs;
     uint256 m_cached_pplns_best_share;
     bool m_cached_raw_scripts{false};
+    // The cached (best share, outputs) pair is a real PPLNS split for that
+    // share. False while none could be computed (the tracker was busy at a new
+    // best share): jobs then recompute, and never build on the cached outputs.
+    bool m_cached_pplns_valid{false};
+    // Jobs not built because the sharechain was busy (CoinbaseResult::held),
+    // and refreshes that found no valid PPLNS: /local_stats-free counters, logged.
+    mutable std::atomic<uint64_t> m_jobs_held{0};
+    std::atomic<uint64_t> m_refresh_without_pplns{0};
+    void note_job_held(const char* why) const;
+public:
+    uint64_t jobs_held() const { return m_jobs_held.load(std::memory_order_relaxed); }
+    uint64_t refreshes_without_pplns() const { return m_refresh_without_pplns.load(std::memory_order_relaxed); }
+    bool cached_pplns_valid() const
+    {
+        std::lock_guard<std::mutex> l(m_work_mutex);
+        return m_cached_pplns_valid;
+    }
+private:
     // V35/V36 PPLNS selection. Defaults to the v35 network floor: this is the
     // fallback rest_v36_status()/rest_version_signaling() read when a coin lane
     // has not wired set_cached_share_version() or has no on-chain vote data yet.

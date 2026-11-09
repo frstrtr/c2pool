@@ -1212,6 +1212,14 @@ MiningInterface::build_coinbase_parts(
     return { coinb1.str(), coinb2 };
 }
 
+void MiningInterface::note_job_held(const char* why) const
+{
+    const auto n = m_jobs_held.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= 5 || n % 100 == 0)
+        LOG_INFO << "[build_connection_cb] job held (" << why << " unavailable: the sharechain is busy); the"
+                 << " session keeps its last job and retries (" << n << " so far)";
+}
+
 MiningInterface::CoinbaseResult
 MiningInterface::build_connection_coinbase(
     const uint256& prev_share_hash,
@@ -1286,7 +1294,7 @@ MiningInterface::build_connection_coinbase(
         ws.ref_hash_fn = m_ref_hash_fn;
         ws.needs_pplns_recompute = !prev_share_hash.IsNull()
             && ws.pplns_fn
-            && prev_share_hash != ws.pplns_best_share;
+            && (!m_cached_pplns_valid || prev_share_hash != ws.pplns_best_share);
     }
     const nlohmann::json& tmpl = *ws.tmpl;  // shared and immutable: no per-session copy
     // ── m_work_mutex RELEASED ──
@@ -1325,7 +1333,17 @@ MiningInterface::build_connection_coinbase(
 
         auto expected = ws.pplns_fn(prev_share_hash, block_target, subsidy, ws.donation_script);
 
-        if (!expected.empty()) {
+        if (expected.empty()) {
+            // The PPLNS at this job's prev share could not be read (the tracker
+            // is busy). The cached outputs are another share's (or none): a
+            // coinbase from them would not match the share's generation
+            // transaction, and could pay what is no PPLNS split at all. Held.
+            note_job_held("pplns");
+            CoinbaseResult held;
+            held.held = true;
+            return held;
+        }
+        {
             ws.pplns_outputs.clear();
             std::string donation_hex;
             for (unsigned char b : ws.donation_script) { donation_hex += HX[b >> 4]; donation_hex += HX[b & 0x0f]; }
@@ -1572,6 +1590,14 @@ MiningInterface::build_connection_coinbase(
         ws.segwit_active, ws.witness_commitment, effective_witness_root,
         merged_addrs, branches_u256);
     LOG_TRACE << "[build_cb] ref_hash_fn returned, bits=" << std::hex << rhr.bits << std::dec;
+    if (rhr.ref_hash.IsNull()) {
+        // No ref_hash (the tracker is busy): every share of a coinbase
+        // committing to a null ref_hash is invalid. Held.
+        note_job_held("ref_hash");
+        CoinbaseResult held;
+        held.held = true;
+        return held;
+    }
 
     // Build ref_hash hex
     std::string ref_hash_hex;
@@ -1630,10 +1656,14 @@ MiningInterface::build_connection_coinbase(
     {
         std::lock_guard<std::mutex> lock(m_work_mutex);
         auto& self = const_cast<MiningInterface&>(*this);
-        if (ws.pplns_best_share != self.m_cached_pplns_best_share) {
+        // Only a split recomputed for this job's prev share is cached (a valid
+        // one: an empty recompute was held above).
+        if (ws.needs_pplns_recompute && ws.pplns_best_share == prev_share_hash
+            && (ws.pplns_best_share != self.m_cached_pplns_best_share || !self.m_cached_pplns_valid)) {
             self.m_cached_pplns_outputs = ws.pplns_outputs;
             self.m_cached_pplns_best_share = ws.pplns_best_share;
             self.m_cached_raw_scripts = ws.raw_scripts;
+            self.m_cached_pplns_valid = true;
         }
     }
 
@@ -1758,115 +1788,145 @@ void MiningInterface::refresh_work()
         std::string witness_commitment;
         uint256 witness_root;
         std::vector<uint8_t> mm_commitment;
+        bool pplns_valid = false;   // a real split (never a burn output)
+        uint256 pplns_best;         // the best share it was computed for
 
         try {
             // V36 PPLNS path: use share-tracker proportional payouts directly
             // IMPORTANT: Use m_best_share_hash_fn() here for the PPLNS computation AND
             // cache it so build_connection_coinbase can verify consistency with frozen_prev_share.
             // If they diverge, build_connection_coinbase will recompute PPLNS from frozen_prev_share.
+            // The PPLNS split the global coinbase pays, and the (best share,
+            // outputs) pair build_connection_coinbase reuses for jobs on that
+            // share. NEVER a burn output: when the split cannot be computed
+            // (pplns_fn returns nothing — the tracker try-lock failed), the
+            // last valid split for the SAME best share is reused, else nothing
+            // is cached as valid (jobs recompute or are held) and the global
+            // coinbase is not built.
             if (m_pplns_fn && m_best_share_hash_fn) {
                 auto best = m_best_share_hash_fn();
-                m_cached_pplns_best_share = best;  // remember which share PPLNS was computed from
-                if (!best.IsNull()) {
-                    LOG_INFO << "[Pool] refresh_work: PPLNS active, best_share=" << best.GetHex()
-                             << " donation_script_len=" << m_donation_script.size();
-                    uint32_t nbits = std::stoul(
-                        wd.m_data.value("bits", "1d00ffff"), nullptr, 16);
-                    uint256 block_target = chain::bits_to_target(nbits);
+                pplns_best = best;
+                LOG_INFO << "[Pool] refresh_work: PPLNS active, best_share="
+                         << (best.IsNull() ? std::string("null") : best.GetHex())
+                         << " donation_script_len=" << m_donation_script.size();
+                uint32_t nbits = std::stoul(
+                    wd.m_data.value("bits", "1d00ffff"), nullptr, 16);
+                uint256 block_target = chain::bits_to_target(nbits);
 
-                    auto expected = m_pplns_fn(best, block_target, coinbase_value, m_donation_script);
+                // Called for a null best share too: a solo / custodial split
+                // ignores it, and a pool's split of an empty sharechain is the
+                // whole subsidy to the donation script (p2pool's genesis rule).
+                auto expected = m_pplns_fn(best, block_target, coinbase_value, m_donation_script);
 
-                    // Debug: log PPLNS distribution
-                    {
-                        static int pplns_log = 0;
-                        if (pplns_log++ % 60 == 0) { // every ~5 min (60 * 5s interval)
-                            LOG_INFO << "[PPLNS] " << expected.size() << " addrs, subsidy=" << coinbase_value;
-                            for (const auto& [script, amount] : expected) {
-                                uint64_t sat = static_cast<uint64_t>(amount);
-                                LOG_INFO << "[PPLNS]   script(" << script.size() << ")="
-                                         << (script.size() > 4 ? HexStr(std::span<const unsigned char>(
-                                             reinterpret_cast<const unsigned char*>(script.data()),
-                                             std::min(script.size(), size_t(10)))) : "?")
-                                         << "... amount=" << sat;
-                            }
+                // Debug: log PPLNS distribution
+                {
+                    static int pplns_log = 0;
+                    if (pplns_log++ % 60 == 0) { // every ~5 min (60 * 5s interval)
+                        LOG_INFO << "[PPLNS] " << expected.size() << " addrs, subsidy=" << coinbase_value;
+                        for (const auto& [script, amount] : expected) {
+                            uint64_t sat = static_cast<uint64_t>(amount);
+                            LOG_INFO << "[PPLNS]   script(" << script.size() << ")="
+                                     << (script.size() > 4 ? HexStr(std::span<const unsigned char>(
+                                         reinterpret_cast<const unsigned char*>(script.data()),
+                                         std::min(script.size(), size_t(10)))) : "?")
+                                     << "... amount=" << sat;
+                        }
+                    }
+                }
+
+                if (!expected.empty()) {
+                    static const char* HEX = "0123456789abcdef";
+
+                    // Convert donation script to hex for identification
+                    std::string donation_script_hex;
+                    for (unsigned char b : m_donation_script) {
+                        donation_script_hex += HEX[b >> 4];
+                        donation_script_hex += HEX[b & 0x0f];
+                    }
+
+                    // Separate PPLNS outputs from donation output
+                    std::pair<std::string, uint64_t> donation_entry;
+                    bool found_donation = false;
+
+                    for (const auto& [script_bytes, amount] : expected) {
+                        uint64_t sat = static_cast<uint64_t>(amount);
+                        std::string hex;
+                        hex.reserve(script_bytes.size() * 2);
+                        for (unsigned char b : script_bytes) {
+                            hex += HEX[b >> 4];
+                            hex += HEX[b & 0x0f];
+                        }
+                        if (hex == donation_script_hex) {
+                            donation_entry = {hex, sat};
+                            found_donation = true;
+                        } else {
+                            if (sat == 0) continue; // Only skip zero-value PPLNS outputs
+                            pplns_outputs.push_back({std::move(hex), sat});
                         }
                     }
 
-                    if (!expected.empty()) {
-                        static const char* HEX = "0123456789abcdef";
+                    // Sort PPLNS by (amount ascending, script ascending)
+                    // matching Python's sorted(dests, key=lambda a: (amounts[a], a))[-4000:]
+                    std::sort(pplns_outputs.begin(), pplns_outputs.end(),
+                        [](const auto& a, const auto& b) {
+                            if (a.second != b.second) return a.second < b.second;
+                            return a.first < b.first;
+                        });
+                    const size_t MAX_PPLNS = m_stratum_config.max_coinbase_outputs;
+                    if (pplns_outputs.size() > MAX_PPLNS)
+                        pplns_outputs.erase(pplns_outputs.begin(),
+                                            pplns_outputs.end() - MAX_PPLNS);
 
-                        // Convert donation script to hex for identification
-                        std::string donation_script_hex;
-                        for (unsigned char b : m_donation_script) {
-                            donation_script_hex += HEX[b >> 4];
-                            donation_script_hex += HEX[b & 0x0f];
-                        }
+                    // Donation output LAST among value outputs
+                    // (matches Python's generate_transaction: payouts + [donation] + OP_RETURN)
+                    if (found_donation)
+                        pplns_outputs.push_back(donation_entry);
 
-                        // Separate PPLNS outputs from donation output
-                        std::pair<std::string, uint64_t> donation_entry;
-                        bool found_donation = false;
+                    pplns_raw_scripts = true;
+                    LOG_INFO << "[Pool] refresh_work: V" << m_cached_share_version
+                             << " PPLNS coinbase with "
+                             << pplns_outputs.size() << " outputs (donation_last="
+                             << found_donation << ")";
+                }
 
-                        for (const auto& [script_bytes, amount] : expected) {
-                            uint64_t sat = static_cast<uint64_t>(amount);
-                            std::string hex;
-                            hex.reserve(script_bytes.size() * 2);
-                            for (unsigned char b : script_bytes) {
-                                hex += HEX[b >> 4];
-                                hex += HEX[b & 0x0f];
-                            }
-                            if (hex == donation_script_hex) {
-                                donation_entry = {hex, sat};
-                                found_donation = true;
-                            } else {
-                                if (sat == 0) continue; // Only skip zero-value PPLNS outputs
-                                pplns_outputs.push_back({std::move(hex), sat});
-                            }
-                        }
-
-                        // Sort PPLNS by (amount ascending, script ascending)
-                        // matching Python's sorted(dests, key=lambda a: (amounts[a], a))[-4000:]
-                        std::sort(pplns_outputs.begin(), pplns_outputs.end(),
-                            [](const auto& a, const auto& b) {
-                                if (a.second != b.second) return a.second < b.second;
-                                return a.first < b.first;
-                            });
-                        const size_t MAX_PPLNS = m_stratum_config.max_coinbase_outputs;
-                        if (pplns_outputs.size() > MAX_PPLNS)
-                            pplns_outputs.erase(pplns_outputs.begin(),
-                                                pplns_outputs.end() - MAX_PPLNS);
-
-                        // Donation output LAST among value outputs
-                        // (matches Python's generate_transaction: payouts + [donation] + OP_RETURN)
-                        if (found_donation)
-                            pplns_outputs.push_back(donation_entry);
-
+                if (!pplns_outputs.empty()) {
+                    pplns_valid = true;
+                } else if (best.IsNull()) {
+                    // An empty sharechain and no split (the tracker busy at
+                    // startup): p2pool's genesis rule, the whole subsidy to
+                    // the donation script (as build_connection_coinbase does).
+                    static const char* HEX = "0123456789abcdef";
+                    std::string donation_hex;
+                    for (unsigned char b : m_donation_script) {
+                        donation_hex += HEX[b >> 4];
+                        donation_hex += HEX[b & 0x0f];
+                    }
+                    if (!donation_hex.empty()) {
+                        pplns_outputs.push_back({donation_hex, coinbase_value});
                         pplns_raw_scripts = true;
-                        LOG_INFO << "[Pool] refresh_work: V" << m_cached_share_version
-                                 << " PPLNS coinbase with "
-                                 << pplns_outputs.size() << " outputs (donation_last="
-                                 << found_donation << ")";
+                        pplns_valid = true;
+                    }
+                } else {
+                    // The tracker is busy: reuse the last valid split when it is
+                    // for this same best share; else no valid split now.
+                    std::lock_guard<std::mutex> lock(m_work_mutex);
+                    if (m_cached_pplns_valid && m_cached_pplns_best_share == best && !m_cached_pplns_outputs.empty()) {
+                        pplns_outputs = m_cached_pplns_outputs;
+                        pplns_raw_scripts = m_cached_raw_scripts;
+                        pplns_valid = true;
                     }
                 }
             }
 
-            // Fallback: single output to zero-key (burn) so coinbase is always valid
-            if (pplns_outputs.empty()) {
-                pplns_outputs.push_back({"0000000000000000000000000000000000000000", coinbase_value});
-                // Diagnostic: trace WHY PPLNS is empty — this causes invalid coinbase
-                static int zero_warn = 0;
-                if (zero_warn++ < 10 || zero_warn % 100 == 0) {
-                    bool has_pplns = static_cast<bool>(m_pplns_fn);
-                    bool has_best = static_cast<bool>(m_best_share_hash_fn);
-                    uint256 best_hash;
-                    if (has_best) best_hash = m_best_share_hash_fn();
-                    LOG_WARNING << "[PPLNS-EMPTY] Falling back to zero-address burn!"
-                                << " has_pplns_fn=" << has_pplns
-                                << " has_best_fn=" << has_best
-                                << " best_hash=" << (best_hash.IsNull() ? "null" : best_hash.GetHex().substr(0, 16))
-                                << " subsidy=" << coinbase_value
-                                << " donation_script_len=" << m_donation_script.size()
-                                << " (#" << zero_warn << ")";
-                }
+            if (!pplns_valid) {
+                const auto n = m_refresh_without_pplns.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (n <= 10 || n % 100 == 0)
+                    LOG_WARNING << "[PPLNS-UNAVAILABLE] no PPLNS split for the global coinbase (has_pplns_fn="
+                                << static_cast<bool>(m_pplns_fn) << " has_best_fn="
+                                << static_cast<bool>(m_best_share_hash_fn) << " best="
+                                << (pplns_best.IsNull() ? std::string("null") : pplns_best.GetHex().substr(0, 16))
+                                << "): no global coinbase this refresh, stratum jobs recompute or are held (#"
+                                << n << ")";
             }
 
             // Get merged mining commitment if an MM manager is wired.
@@ -1906,12 +1966,15 @@ void MiningInterface::refresh_work()
             }
 
             // Build fallback coinbase (without OP_RETURN, for non-p2pool or initial work)
-            cb_parts = build_coinbase_parts(wd.m_data, coinbase_value, pplns_outputs,
-                                            pplns_raw_scripts, mm_commitment, witness_commitment,
-                                            {}, uint256(), m_coinbase_text);
+            // — only from a valid split (never a burn output).
+            if (pplns_valid)
+                cb_parts = build_coinbase_parts(wd.m_data, coinbase_value, pplns_outputs,
+                                                pplns_raw_scripts, mm_commitment, witness_commitment,
+                                                {}, uint256(), m_coinbase_text);
         } catch (const std::exception& e) {
             LOG_WARNING << "refresh_work: coinbase build failed: " << e.what();
-            cb_parts = { "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff", "ffffffff0100f2052a01000000434104" };
+            // No global coinbase rather than a placeholder that pays no one.
+            cb_parts = {};
         }
 
         note_coinbase_built(cb_parts.first, cb_parts.second, segwit_active, merkle_branches.size(),
@@ -1968,8 +2031,16 @@ void MiningInterface::refresh_work()
         m_cached_coinb1           = std::move(cb_parts.first);
         m_cached_coinb2           = std::move(cb_parts.second);
         m_segwit_active           = segwit_active;
-        m_cached_pplns_outputs    = std::move(pplns_outputs);
-        m_cached_raw_scripts      = pplns_raw_scripts;
+        if (pplns_valid) {
+            m_cached_pplns_outputs    = std::move(pplns_outputs);
+            m_cached_raw_scripts      = pplns_raw_scripts;
+            m_cached_pplns_best_share = pplns_best;
+            m_cached_pplns_valid      = true;
+        } else if (m_cached_pplns_best_share != pplns_best) {
+            // No valid split for the new best share: the cached pair is
+            // another share's; jobs must not reuse it (they recompute).
+            m_cached_pplns_valid = false;
+        }
         m_cached_witness_commitment = std::move(witness_commitment);
         m_cached_witness_root       = witness_root;
         m_cached_mm_commitment    = std::move(mm_commitment);
@@ -3073,8 +3144,8 @@ nlohmann::json MiningInterface::rest_current_payouts()
     // These are always up-to-date with the latest share template and subsidy.
     auto cached = get_cached_pplns_outputs();
     if (!cached.empty()) {
-        // Skip zero-address burn entries (20-byte zero hash from PPLNS-empty fallback).
-        // These are not real payouts — they indicate PPLNS is not yet computed.
+        // Skip zero-address burn entries (20-byte zero hash: the PPLNS-empty
+        // fallback of older builds; refresh_work never caches one now).
         static const std::string zero_burn = "0000000000000000000000000000000000000000";
 
         for (const auto& [script_hex, amount] : cached) {

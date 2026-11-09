@@ -6940,6 +6940,10 @@ int main(int argc, char* argv[]) {
                     const uint256& best_hash, const uint256& block_target,
                     uint64_t subsidy, const std::vector<unsigned char>& /*donation_script*/)
                     -> std::map<std::vector<unsigned char>, double> {
+                // An empty sharechain: no split here; refresh_work and the
+                // stratum jobs apply p2pool's genesis rule (the whole subsidy
+                // to the donation script).
+                if (best_hash.IsNull()) return {};
                 auto guard = p2p_node->read_tracker();
                 if (!guard) return {};
 

@@ -162,6 +162,13 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
     # is counted in /local_stats template_refresh; every session's job of a
     # generation shares one tx-hex vector (measured). Same fold-into-core_test
     # reasoning as every TU here.
+    # web_server_pplns_no_burn_test.cpp: no work is ever built on a burn
+    # output: a busy tracker at a new best share leaves no zero-key output in
+    # any coinbase and does not poison the cached (best, outputs) pair (jobs
+    # are held, CoinbaseResult::held); busy at the same share reuses the last
+    # valid split; an empty sharechain pays the donation (genesis rule);
+    # solo / custodial pay their split. Same fold-into-core_test reasoning as
+    # every TU here.
     # web_server_utxo_scan_test.cpp: GET /api/utxo/scan's web-server half (the
     # dedicated scan thread, one at a time, the interval, the wait cap, the
     # direct-local gate). Same fold-into-core_test reasoning as every TU here.
@@ -230,6 +237,7 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
         web_server_local_share_hash_rates_test.cpp
         web_server_merged_drop_test.cpp
         web_server_mweb_hogex_test.cpp
+        web_server_pplns_no_burn_test.cpp
         web_server_relay_block_test.cpp
         web_server_submitblock_test.cpp
         web_server_utxo_scan_test.cpp
