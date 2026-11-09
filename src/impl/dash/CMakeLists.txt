@@ -52,7 +52,7 @@ target_include_directories(dash_bls_verify PRIVATE
 target_link_libraries(dash_bls_verify PRIVATE core ${Boost_LIBRARIES})
 if(C2POOL_DASH_BLS_AVAILABLE)
     target_compile_definitions(dash_bls_verify PUBLIC C2POOL_DASH_BLS)
-    target_include_directories(dash_bls_verify PUBLIC ${DASHBLS_INCLUDE_DIR})
+    target_include_directories(dash_bls_verify PUBLIC ${DASHBLS_INCLUDE_DIRS})
     target_link_libraries(dash_bls_verify PUBLIC ${DASHBLS_LIBRARIES})
 endif()
 

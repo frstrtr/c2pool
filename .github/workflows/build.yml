@@ -2636,7 +2636,11 @@ jobs:
         # --no-tests=error: per-binary zero-test floor. These KATs live behind
         # #ifdef C2POOL_DASH_BLS, so a stub build makes the selector match zero
         # -- RED here, belt to the explicit per-name assertion in the next step.
-        run: ctest --output-on-failure --no-tests=error -j8 -R 'DashBlsVerify|DashQuorumMembers|DashQuorumMemberSource|DashGovVoteBLS|DashChainLockVerify|DashIsdlockBls'
+        # DashCreditPool: the credit-pool follower cases (DashCreditPoolIdx,
+        # DashCreditPoolIdxDb, DashCreditPoolLane) are folded into the
+        # test_dash_chainlock_verify binary, but no name above matched them, so
+        # ctest never ran them here.
+        run: ctest --output-on-failure --no-tests=error -j8 -R 'DashBlsVerify|DashQuorumMembers|DashQuorumMemberSource|DashGovVoteBLS|DashChainLockVerify|DashIsdlockBls|DashCreditPoolIdx|DashCreditPoolLane'
 
       # The Dash Core v24 provider-payload rules with the real backend: Core's
       # BLS operator-key and signature decoding (stub lanes run the same
@@ -2679,6 +2683,11 @@ jobs:
             DashIsdlockBls.RealSignatureVerifiesEndToEnd \
             DashIsdlockBls.TamperedSignatureIsRejectedAndNeverReachesMempool \
             DashDstxFailClosed.BadBlsSignatureIsRejected \
+            DashCreditPoolIdx.Kat4_VerifiedUnlockIncludedAndBalanceCommitsExactly \
+            DashCreditPoolIdx.Kat5_TamperedQuorumSigRejected \
+            DashCreditPoolIdx.Kat4b_LimitBindsEvenWithValidSig \
+            DashCreditPoolIdx.V2UnlockNeedsV24ForTheBlock \
+            DashCreditPoolLane.AdmitNeedsACompleteFreshFollower \
             DashV24Bls.BackendMatchesDashdOnEveryFact \
             DashV24Bls.GeneratedSignaturesVerifyAgainstTheirKeys \
             DashV24Bls.ProductionRulesUseTheBackend
