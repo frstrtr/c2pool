@@ -3162,6 +3162,32 @@ void MergedMiningManager::record_discovered_block(
     const uint256& block_hash, int height, uint64_t coinbase_value)
 {
     // Caller must hold m_mutex
+    // A block found again (a share on a job whose block is already out: the
+    // daemon answers "duplicate") is one block: the record is kept once, its
+    // verdict improved if this answer is better; the found-block callback runs
+    // again only when the block was not held before and is now.
+    for (auto& old : m_discovered_blocks) {
+        if (old.chain_id != chain.config.chain_id || old.block_hash != block_hash.GetHex() || !old.is_local)
+            continue;
+        const bool was_accepted = old.accepted;
+        const bool was_held = was_accepted || old.verdict == "inconclusive" || old.verdict.rfind("unknown: ", 0) == 0;
+        if (verdict.accepted() && !was_accepted) {
+            old.accepted = true;
+            old.verdict = verdict.label();
+        } else if (!was_held && verdict.held()) {
+            old.verdict = verdict.label();
+        }
+        LOG_INFO << "[MM:" << chain.config.symbol << "] block " << block_hash.GetHex().substr(0, 16)
+                 << " found again (" << verdict.label() << "): recorded once";
+        if (!was_held && verdict.held() && m_on_merged_block_found) {
+            try {
+                m_on_merged_block_found(chain.config.symbol, height, block_hash.GetHex(), true, coinbase_value);
+            } catch (const std::exception& e) {
+                LOG_ERROR << "[MM:" << chain.config.symbol << "] on_merged_block_found crashed: " << e.what();
+            }
+        }
+        return;
+    }
     LOG_INFO << "[MM:" << chain.config.symbol << "] record_discovered_block: building record...";
     DiscoveredMergedBlock blk;
     blk.chain_id    = chain.config.chain_id;

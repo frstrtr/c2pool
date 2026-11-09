@@ -41,10 +41,6 @@ inline double sample_tcp_rtt_ms(int fd) {
     return 0.0;
 }
 
-using core::merged_addr::ChainAddrInfo;
-using core::merged_addr::merged_chain_table;
-using core::merged_addr::merged_chain_info;
-using core::merged_addr::is_own_address;
 }  // namespace
 
 namespace core {
@@ -694,27 +690,9 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
         //
         // Vnish firmware and some ASIC control software cannot use commas in the
         // login field, so we support pipe (|) and space as alternatives.
-        // ─── Merged chain address identification table (file-scope SSOT) ───
-        // Shared with send_notify_work()'s #961 payout check (see merged_chain_
-        // table() above). Used to auto-detect which chain a merged address
-        // belongs to.
-        const bool tn = testnet_network();
-        const auto& MERGED_CHAINS = merged_chain_table(tn);
-        // The configured merged chains this address is an address of.
-        const auto configured_chains_of = [&](const std::string& addr) {
-            std::vector<const ChainAddrInfo*> out;
-            for (const auto& chain : MERGED_CHAINS)
-                if (mining_interface_ && mining_interface_->has_merged_chain(chain.chain_id)
-                    && is_own_address(addr, chain))
-                    out.push_back(&chain);
-            return out;
-        };
-        const auto chain_list = [](const std::vector<const ChainAddrInfo*>& cs) {
-            std::string l;
-            for (const auto* c : cs)
-                l += (l.empty() ? "" : ", ") + std::to_string(c->chain_id);
-            return l;
-        };
+        // ─── Merged chain address identification (core/merged_chain_addr.hpp) ───
+        // Shared with send_notify_work()'s #961 payout check.
+        const auto& MERGED_CHAINS = merged_table();
 
         // Parent/primary-coin identification (for swap + Case-5 detection),
         // REGISTRY-SOURCED from the running coin's StratumConfig (issue #961
@@ -728,57 +706,39 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
         LTC_VERSIONS.insert(LTC_VERSIONS.end(),
             scfg.payout_p2sh_versions.begin(), scfg.payout_p2sh_versions.end());
 
+        // A re-authorize starts again from mining.set_merged_addresses: the
+        // entries an earlier login gave or derived (its primary's hash160) are
+        // not carried over to the new primary.
+        merged_addresses_ = set_merged_addresses_;
         std::string merged_addr_raw;
         parse_address_separators(username_, merged_addr_raw);
 
-        // Resolve simple-separator merged address to chain_id: the one
-        // configured chain it is an address of. An address of two configured
-        // chains (shared version bytes) or of none is not assigned: the miner
-        // names the chain (PRIMARY/CHAIN_ID:ADDR); until then the chains are
-        // paid to the primary address's key (auto-derive below).
-        if (!merged_addr_raw.empty()) {
-            const auto matches = configured_chains_of(merged_addr_raw);
-            if (matches.size() == 1) {
-                merged_addresses_[matches[0]->chain_id] = merged_addr_raw;
-            } else if (matches.size() > 1) {
-                LOG_WARNING << "[Stratum] Merged address " << merged_addr_raw << " is an address of chains "
-                            << chain_list(matches) << " (shared version bytes): not assigned; use "
-                               "PRIMARY/CHAIN_ID:ADDRESS to name its chain";
-            } else {
-                // Swap detection: first addr is a (single) merged chain's, second is LTC
-                const auto first = configured_chains_of(username_);
-                if (first.size() == 1 && is_address_for_chain(merged_addr_raw, LTC_HRPS, LTC_VERSIONS)) {
-                    LOG_WARNING << "[Stratum] Detected swapped address order — auto-correcting.";
-                    std::string merged_addr = username_;
-                    username_ = merged_addr_raw;
-                    merged_addresses_[first[0]->chain_id] = merged_addr;
-                } else {
-                    LOG_WARNING << "[Stratum] Merged address " << merged_addr_raw
-                                << " is not an address of any configured merged chain: ignored";
-                }
+        // Which configured chain each login address is for (merged_chain_addr.hpp:
+        // with one merged chain as before; with several, an address two chains
+        // could take, or none identifies, refuses the login instead of being
+        // given to one by guessing), then each configured chain without one
+        // reuses the primary's hash160.
+        {
+            auto res = core::merged_addr::resolve_merged_login(
+                username_, merged_addr_raw, merged_addresses_, MERGED_CHAINS,
+                [this](uint32_t id) { return mining_interface_ && mining_interface_->has_merged_chain(id); },
+                LTC_VERSIONS, LTC_HRPS);
+            if (!res.refuse.empty()) {
+                LOG_WARNING << "[Stratum] REFUSED mining.authorize (" << username_ << "): " << res.refuse;
+                authorized_ = false;
+                nlohmann::json response;
+                response["id"] = request_id;
+                response["result"] = false;
+                response["error"] = nlohmann::json::array({24, "Unauthorized: " + res.refuse, nullptr});
+                return response;
             }
+            for (const auto& n : res.notes)
+                LOG_INFO << "[Stratum] " << n;
+            username_ = std::move(res.primary);
+            merged_addresses_ = std::move(res.addresses);
         }
         if (!merged_addresses_.empty())
             LOG_INFO << "[Stratum] Merged addresses from login: " << merged_addresses_.size() << " chain(s)";
-
-        // Case 5: primary address belongs to a merged chain (e.g., DOGE), not LTC.
-        // Common when miners enter their DOGE address without a comma separator.
-        // The pubkey_hash is preserved — LTC payout uses P2PKH with same hash160.
-        if (merged_addr_raw.empty() && !username_.empty() && mining_interface_) {
-            bool is_ltc = is_address_for_chain(username_, LTC_HRPS, LTC_VERSIONS);
-            if (!is_ltc) {
-                const auto matches = configured_chains_of(username_);
-                if (matches.size() == 1) {
-                    merged_addresses_[matches[0]->chain_id] = username_;
-                    LOG_WARNING << "[Stratum] Case 5: Primary address is chain_id="
-                                << matches[0]->chain_id << " (not LTC) — LTC payout will use "
-                                << "reverse-derived P2PKH from same pubkey_hash";
-                } else if (matches.size() > 1) {
-                    LOG_WARNING << "[Stratum] Case 5: primary address " << username_ << " is an address of chains "
-                                << chain_list(matches) << " (shared version bytes): not assigned to either";
-                }
-            }
-        }
 
         // ─── #961 B1: reject a foreign-coin payout at the door ──────────────
         // If this coin published its OWN acceptance set (StratumConfig.payout_*
@@ -837,20 +797,11 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
                 if (h160_bytes.size() == 20)
                     std::copy(h160_bytes.begin(), h160_bytes.end(), pubkey_hash_.begin());
             }
-            if (h160.size() == 40 && (atype == "p2pkh" || atype == "p2wpkh" || atype == "p2sh")) {
-                for (const auto& chain : MERGED_CHAINS) {
-                    if (mining_interface_->has_merged_chain(chain.chain_id) &&
-                        merged_addresses_.find(chain.chain_id) == merged_addresses_.end()) {
-                        merged_addresses_[chain.chain_id] = username_;
-                        merged_from_primary_.insert(chain.chain_id);
-                        LOG_INFO << "[Stratum] Auto-derived merged address for chain_id="
-                                 << chain.chain_id << " from primary " << atype << " address";
-                    }
-                }
-            }
+            // (The configured chains without an address got the primary's
+            // hash160 in the resolution above.)
             // Cases 7-9: P2WSH/P2TR addresses have 32-byte witness programs that
             // cannot be converted to 20-byte hash160 for merged chain addresses.
-            else if (atype == "p2wsh" || atype == "p2tr") {
+            if (atype == "p2wsh" || atype == "p2tr") {
                 LOG_WARNING << "[Stratum] Primary address is " << atype
                             << " — cannot auto-derive merged mining addresses "
                             << "(non-convertible witness program)";
@@ -1098,31 +1049,19 @@ bool StratumSession::testnet_network() const
     return mining_interface_ && mining_interface_->is_testnet();
 }
 
+const std::vector<core::merged_addr::ChainAddrInfo>& StratumSession::merged_table() const
+{
+    if (!merged_table_built_) {
+        const auto& scfg = mining_interface_->get_stratum_config();
+        merged_table_ = core::merged_addr::merged_chain_table(testnet_network(), scfg.merged_parent_versions);
+        merged_table_built_ = true;
+    }
+    return merged_table_;
+}
+
 std::vector<unsigned char> StratumSession::merged_script_for(uint32_t chain_id, const std::string& addr) const
 {
-    // The primary (parent-coin) address reused for a merged chain: the same
-    // hash160 on that chain, P2PKH or P2SH by the primary address's own type.
-    if (merged_from_primary_.count(chain_id)) {
-        std::string atype;
-        auto h160 = address_to_hash160(addr, atype);
-        return h160.size() == 40 ? hash160_to_merged_script(h160, atype) : std::vector<unsigned char>{};
-    }
-    // An address the miner gave for this chain: its script by the chain's own
-    // versions and HRPs (a Bellscoin P2SH "D..." is P2SH, never a DOGE P2PKH).
-    const auto* info = merged_chain_info(testnet_network(), chain_id);
-    std::vector<unsigned char> script;
-    if (info && core::classify_address_for_coin(addr, info->p2pkh, info->p2sh, info->hrps, script)
-                    == core::AddressCoinMatch::Own)
-        return script;
-    if (!info) {
-        // A chain c2pool has no parameters for: as before (chain-agnostic).
-        std::string atype;
-        auto h160 = address_to_hash160(addr, atype);
-        return h160.size() == 40 ? hash160_to_merged_script(h160, atype) : std::vector<unsigned char>{};
-    }
-    LOG_WARNING << "[Stratum] Merged address " << addr << " is not an address of chain_id " << chain_id
-                << ": no payout script for it on that chain";
-    return {};
+    return core::merged_addr::merged_payout_script(core::merged_addr::find_chain(merged_table(), chain_id), addr);
 }
 
 // mining.set_merged_addresses extension
@@ -1143,7 +1082,7 @@ nlohmann::json StratumSession::handle_set_merged_addresses(const nlohmann::json&
             try {
                 uint32_t chain_id = static_cast<uint32_t>(std::stoul(key));
                 merged_addresses_[chain_id] = val.get<std::string>();
-                merged_from_primary_.erase(chain_id);   // an address of that chain now
+                set_merged_addresses_[chain_id] = val.get<std::string>();
             } catch (...) {
                 // skip malformed
             }
@@ -1794,7 +1733,7 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
                 const core::CoinAddressAcceptance own{scfg.payout_p2pkh_versions,
                     scfg.payout_p2sh_versions, scfg.payout_bech32_hrps};
                 std::vector<core::MergedChainAddr> merged_cfg;
-                for (const auto& chain : merged_chain_table(testnet_network()))
+                for (const auto& chain : merged_table())
                     if (mining_interface_->has_merged_chain(chain.chain_id))
                         merged_cfg.push_back({chain.hrps, chain.versions});
                 if (core::decide_payout_address(username_, own, merged_cfg)

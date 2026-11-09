@@ -2531,6 +2531,17 @@ int main(int argc, char* argv[]) {
                 stratum_config.payout_p2pkh_versions = acc.p2pkh_versions;
                 stratum_config.payout_p2sh_versions  = acc.p2sh_versions;
                 stratum_config.payout_bech32_hrps    = acc.bech32_hrps;
+                // LTC's versions on every network: a login address LTC could
+                // own is never identified as a merged chain's.
+                for (bool tn : {false, true}) {
+                    const auto a = ltc::address_acceptance(tn);
+                    for (const auto* vs : {&a.p2pkh_versions, &a.p2sh_versions})
+                        for (auto v : *vs)
+                            if (std::find(stratum_config.merged_parent_versions.begin(),
+                                          stratum_config.merged_parent_versions.end(), v)
+                                == stratum_config.merged_parent_versions.end())
+                                stratum_config.merged_parent_versions.push_back(v);
+                }
             }
             web_server.get_mining_interface()->set_stratum_config(stratum_config);
             if (fd_limit_known)
@@ -7775,6 +7786,15 @@ int main(int argc, char* argv[]) {
                             ov != merged_payout_addresses.end() ? ov->second : std::string());
                         rpc_address_ok = pa.ok;
                         rpc_address_error = pa.error;
+                        // A chain c2pool has no address parameters for (e.g. DGB as
+                        // an aux chain) and no configured address: as before, its
+                        // backends are kept and createauxblock gets no address.
+                        if (!pa.ok && pa.address.empty() && !c2pool::merged::find_aux_chain_params(cfg.symbol)) {
+                            rpc_address_ok = true;
+                            LOG_WARNING << "[MM:" << cfg.symbol << "] no address parameters for this chain and no "
+                                           "--merged-payout-address " << cfg.symbol << ":<address>: createauxblock "
+                                           "gets none (as before)";
+                        }
                         if (pa.ok) {
                             cfg.aux_payout_address = pa.address;
                             cfg.check_payout_address = [sym = cfg.symbol, addr = pa.address](const std::string& chain) {

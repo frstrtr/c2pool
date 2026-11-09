@@ -158,6 +158,10 @@ struct StratumConfig {
     std::vector<uint8_t>     payout_p2pkh_versions;
     std::vector<uint8_t>     payout_p2sh_versions;
     std::vector<std::string> payout_bech32_hrps;   // BARE HRPs, no trailing '1'
+    // The parent coin's P2PKH/P2SH versions on EVERY network: never claimed
+    // by a merged chain when a login address is identified
+    // (core/merged_chain_addr.hpp).
+    std::vector<uint8_t>     merged_parent_versions;
 };
 
 /// Frozen share-construction fields returned by ref_hash_fn. These

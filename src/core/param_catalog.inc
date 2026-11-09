@@ -470,6 +470,9 @@ C2P_PARAM("merged.spec", Merged, MERGED_SPEC, RESTART, C_BTC|C_LTC|C_NMC|C_DGB|C
   C2P_ALIAS("merged.spec", BIN_BTC, "--merged", VALUE)
   C2P_ALIAS("merged.spec", BIN_DGB, "--merged", VALUE)
 
+C2P_PARAM("merged.payout_addresses", Merged, STRING, MONEY_RESTART, C_LTC, LIT, "", NONE, "per-chain SYMBOL:ADDRESS for createauxblock (repeatable)")
+  C2P_ALIAS("merged.payout_addresses", BIN_LTC, "--merged-payout-address", VALUE)
+
 C2P_PARAM("merged.coind_address", Merged, STRING, RESTART, C_LTC|C_DOGE, LIT, "", NONE, "merged coind address")
   C2P_ALIAS("merged.coind_address", BIN_LTC, "--merged-coind-address", VALUE)
 

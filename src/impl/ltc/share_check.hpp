@@ -1683,18 +1683,21 @@ std::string verify_merged_coinbase_commitment(
         aux_size = p[0] | (p[1] << 8) | (p[2] << 16) | (p[3] << 24);
     }
 
-    // Several chains (or a size other than 1): the commitment must be the
+    // Several chains (or a size other than 1): the commitment should be the
     // tree over exactly the carried blocks (c2pool::merged::
-    // check_merged_aux_commitment, the same rule as p2pool data.py
-    // check_merged_aux_commitment).
+    // check_merged_aux_commitment, the same verdict as p2pool data.py
+    // merged_aux_commitment_problem). LOG-ONLY this release: counted and
+    // logged, never a rejection (aux_commitment_rule.hpp: enforcement waits
+    // for a share-version gate).
     {
         std::vector<std::pair<uint32_t, std::vector<unsigned char>>> carried;
         carried.reserve(share.m_merged_coinbase_info.size());
         for (const auto& info : share.m_merged_coinbase_info)
             carried.emplace_back(info.m_chain_id, info.m_block_header.m_data);
-        if (auto why = c2pool::merged::check_merged_aux_commitment(carried, aux_merkle_root, aux_size);
-            !why.empty())
-            return why;
+        const auto why = c2pool::merged::check_merged_aux_commitment(carried, aux_merkle_root, aux_size);
+        if (c2pool::merged::note_merged_rule_verdict(why))
+            LOG_WARNING << "[V36] merged commitment rule would reject a share (log-only this release; "
+                        << c2pool::merged::merged_rule_stats().would_reject.load() << " so far): " << why;
     }
 
     // Get finder script for canonical coinbase construction

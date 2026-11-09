@@ -18,15 +18,24 @@
 ///   - the root is the merkle root (double SHA-256 of each pair) over the
 ///     carried blocks' hashes at their slots, empty slots zero.
 ///
-/// The same rule is p2pool data.py check_merged_aux_commitment; a share one
-/// side accepts the other accepts (cross-implementation KATs:
+/// The same rule is p2pool data.py merged_aux_commitment_problem; both give
+/// the same verdict on every share (cross-implementation KATs:
 /// merged_aux_hardening_test.cpp, p2pool test_v36_merged_multi_aux_tree.py).
+///
+/// This release the rule is LOG-ONLY in the share check (a share it flags is
+/// counted and logged, never rejected): nodes that commit to a tree over
+/// chains they do not carry (c2pool up to this release with two or more
+/// --merged chains, one of them without a block) would otherwise be split
+/// off. TODO(enforcement): reject behind a share-version / ratchet gate once
+/// the producers of such shares are gone.
 
 #include <core/hash.hpp>
 #include <core/uint256.hpp>
 
+#include <atomic>
 #include <cstdint>
 #include <map>
+#include <mutex>
 #include <set>
 #include <span>
 #include <string>
@@ -37,6 +46,34 @@ namespace c2pool {
 namespace merged {
 
 inline constexpr uint32_t kMaxCheckedAuxTree = 4096;
+
+/// Shares the rule checked and would have rejected (log-only), and the last
+/// reason: /local_stats "merged_commitment_rule".
+struct MergedRuleStats {
+    std::atomic<uint64_t> checked{0};
+    std::atomic<uint64_t> would_reject{0};
+    std::mutex            mu;
+    std::string           last_reason;
+};
+inline MergedRuleStats& merged_rule_stats()
+{
+    static MergedRuleStats s;
+    return s;
+}
+/// Counts a verdict; true when it is one to log (the first 20 and every 1000th).
+inline bool note_merged_rule_verdict(const std::string& why)
+{
+    auto& st = merged_rule_stats();
+    st.checked.fetch_add(1, std::memory_order_relaxed);
+    if (why.empty())
+        return false;
+    const uint64_t n = st.would_reject.fetch_add(1, std::memory_order_relaxed) + 1;
+    {
+        std::lock_guard<std::mutex> l(st.mu);
+        st.last_reason = why;
+    }
+    return n <= 20 || n % 1000 == 0;
+}
 
 /// p2pool make_auxpow_tree: the tree size (0 when none up to 2^30) and the
 /// slot of each chain id.

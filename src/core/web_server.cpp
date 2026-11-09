@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
+#include <c2pool/merged/aux_commitment_rule.hpp>
 #include <core/host_port.hpp>
 #include "web_server.hpp"
 #include "stratum_server.hpp"
@@ -6031,6 +6032,20 @@ nlohmann::json MiningInterface::rest_local_stats()
     result["mweb_hold_seconds"] = get_mweb_hold_seconds();
     result["mweb_degraded"] = is_work_degraded();
     result["mweb_refusals_by_code"] = get_mweb_refusals_by_code_json();
+    // V36 merged-commitment rule (log-only this release): shares checked and
+    // the ones it would reject (aux_commitment_rule.hpp).
+    {
+        auto& st = c2pool::merged::merged_rule_stats();
+        std::string last;
+        {
+            std::lock_guard<std::mutex> l(st.mu);
+            last = st.last_reason;
+        }
+        result["merged_commitment_rule"] = {{"mode", "log-only"},
+                                            {"checked", st.checked.load()},
+                                            {"would_reject", st.would_reject.load()},
+                                            {"last_reason", last}};
+    }
     // Merged (aux) blocks refused at assembly, e.g. DOGE above 1,000,000 bytes.
     result["merged_block_refusals_by_code"] = m_mm_manager ? m_mm_manager->get_block_refusals_json()
                                                            : nlohmann::json::object();

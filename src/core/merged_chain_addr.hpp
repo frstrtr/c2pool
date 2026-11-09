@@ -1,94 +1,228 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
-// Merged-chain address identification for the stratum server (issue #961):
-// which configured merged chain a miner's address belongs to, and the script
-// it pays there.
+// Merged-chain address resolution for the stratum server (issue #961): which
+// configured merged chain each address in a miner's login is for, and the
+// script it pays there. A pure function of the login, the configured chains
+// and the parent coin's address versions, so every login shape can be pinned
+// against the pre-change behaviour (merged_aux_hardening_test.cpp,
+// MergedAuxStratumLogin).
+//
+// The chains identified are the ones the stratum server always knew (DOGE,
+// PEP, BELLS, LKY, JKC, SHIC). Their identification versions are taken from
+// c2pool::merged::aux_chain_params_table() (each coin's chainparams): the
+// mainnet and testnet P2PKH/P2SH versions, minus every version the parent
+// coin uses on any network (an address the parent could own is never claimed
+// by a merged chain). For DOGE that is exactly {30, 22, 113}, the list the
+// server had. Versions are still shared between merged chains (P2SH 22:
+// DOGE, PEP, SHIC; Bellscoin's P2SH 30 is DOGE's P2PKH): with several chains
+// configured, an address that two of them could take, or that none
+// identifies, is refused rather than given to one of them by guessing — the
+// miner names its chain (PRIMARY/CHAIN_ID:ADDR). With one merged chain the
+// resolution is the pre-change one.
+//
+// Script: an address of the chain itself (its own versions on the node's
+// network) pays that chain's script type (a Bellscoin P2SH stays P2SH, a
+// Junkcoin P2PKH "7..." stays P2PKH); any other address (the primary reused,
+// another coin's) pays its hash160 with the chain-agnostic type, as before.
+// For DOGE the two agree on every version.
 
 #include <c2pool/merged/aux_chain_params.hpp>
 #include <core/address_utils.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <string>
 #include <vector>
 
 namespace core {
 namespace merged_addr {
 
-// ─── Merged-chain address identification table (issue #961) ──────────────────
-// Shared by handle_authorize() (merged-chain resolution) and send_notify_work()
-// (the #961 payout money-path check). A username that resolves to a CONFIGURED
-// merged chain here is a legitimate merged-mining payout — the same hash160 /
-// secp256k1 key is spendable on the parent and the merged chain.
-// Built from c2pool::merged::aux_chain_params_table() (each coin's own
-// chainparams: P2PKH and P2SH versions and bech32 HRPs per network), the one
-// source the merged manager checks createauxblock addresses with. Versions
-// are shared between chains (P2SH 22: DOGE, PEP, SHIC; DOGE P2PKH 30 is
-// Bellscoin's P2SH; testnet 113 / regtest 111 across the Dogecoin family):
-// an address that is an address of two configured chains is never assigned
-// to either by guessing (the miner names the chain: PRIMARY/CHAIN_ID:ADDR).
 struct ChainAddrInfo {
     uint32_t chain_id;
-    std::vector<std::string> hrps;
-    std::vector<uint8_t> versions;   // P2PKH and P2SH (the #961 decision)
-    std::vector<uint8_t> p2pkh;
+    std::vector<std::string> hrps;       // identification (mainnet and testnet)
+    std::vector<uint8_t> versions;       // identification, P2PKH and P2SH (the #961 decision)
+    std::vector<uint8_t> p2pkh;          // the chain's own versions on the node's network (scripts)
     std::vector<uint8_t> p2sh;
+    std::vector<std::string> own_hrps;
 };
-inline const std::vector<ChainAddrInfo>& merged_chain_table(bool testnet) {
-    static const auto build = [](bool tn) {
-        std::vector<ChainAddrInfo> t;
-        for (const auto& p : c2pool::merged::aux_chain_params_table()) {
-            const auto v = c2pool::merged::aux_accepted_versions(
-                p, tn ? c2pool::merged::AuxNetwork::testnet : c2pool::merged::AuxNetwork::mainnet);
-            ChainAddrInfo i;
-            // Junkcoin's testnet and regtest chain id is 8225 (8224 on mainnet).
-            i.chain_id = (tn && p.chain_id == 8224) ? 8225 : p.chain_id;
-            i.hrps = v.hrps;
-            i.p2pkh = v.p2pkh;
-            i.p2sh = v.p2sh;
-            i.versions = v.p2pkh;
-            i.versions.insert(i.versions.end(), v.p2sh.begin(), v.p2sh.end());
-            t.push_back(std::move(i));
+
+/// The identification table for the node's network. `parent_versions`: the
+/// parent coin's P2PKH and P2SH versions on every network.
+inline std::vector<ChainAddrInfo> merged_chain_table(bool testnet, const std::vector<uint8_t>& parent_versions)
+{
+    static const std::vector<std::string> known = {"DOGE", "PEP", "BELLS", "LKY", "JKC", "SHIC"};
+    std::vector<ChainAddrInfo> t;
+    for (const auto& sym : known) {
+        const auto* p = c2pool::merged::find_aux_chain_params(sym);
+        if (!p)
+            continue;
+        ChainAddrInfo i;
+        i.chain_id = p->chain_id;
+        auto add = [&](const std::vector<uint8_t>& vs) {
+            for (auto v : vs)
+                if (std::find(parent_versions.begin(), parent_versions.end(), v) == parent_versions.end()
+                    && std::find(i.versions.begin(), i.versions.end(), v) == i.versions.end())
+                    i.versions.push_back(v);
+        };
+        add(p->main.p2pkh);
+        add(p->main.p2sh);
+        add(p->test.p2pkh);
+        add(p->test.p2sh);
+        for (const auto* hs : {&p->main.hrps, &p->test.hrps})
+            for (const auto& h : *hs)
+                if (std::find(i.hrps.begin(), i.hrps.end(), h) == i.hrps.end())
+                    i.hrps.push_back(h);
+        const auto own = c2pool::merged::aux_accepted_versions(
+            *p, testnet ? c2pool::merged::AuxNetwork::testnet : c2pool::merged::AuxNetwork::mainnet);
+        i.p2pkh = own.p2pkh;
+        i.p2sh = own.p2sh;
+        i.own_hrps = own.hrps;
+        t.push_back(i);
+        // Junkcoin's testnet and regtest chain id is 8225 (8224 on mainnet).
+        if (sym == "JKC") {
+            i.chain_id = 8225;
+            t.push_back(i);
         }
-        return t;
-    };
-    static const std::vector<ChainAddrInfo> main_t = build(false), test_t = build(true);
-    return testnet ? test_t : main_t;
+    }
+    return t;
 }
-inline const ChainAddrInfo* merged_chain_info(bool testnet, uint32_t chain_id) {
-    for (const auto& c : merged_chain_table(testnet))
+
+inline const ChainAddrInfo* find_chain(const std::vector<ChainAddrInfo>& t, uint32_t chain_id)
+{
+    for (const auto& c : t)
         if (c.chain_id == chain_id)
             return &c;
     return nullptr;
 }
-// An address of this chain, by its own versions and HRPs.
-inline bool is_own_address(const std::string& addr, const ChainAddrInfo& c) {
-    std::vector<unsigned char> script;
-    return core::classify_address_for_coin(addr, c.p2pkh, c.p2sh, c.hrps, script)
-        == core::AddressCoinMatch::Own;
+
+/// The script a merged entry pays on its chain (as described above); empty
+/// when the address decodes to nothing payable.
+inline std::vector<unsigned char> merged_payout_script(const ChainAddrInfo* chain, const std::string& addr)
+{
+    if (chain) {
+        std::vector<unsigned char> script;
+        if (core::classify_address_for_coin(addr, chain->p2pkh, chain->p2sh, chain->own_hrps, script)
+                == core::AddressCoinMatch::Own
+            && !script.empty())
+            return script;
+    }
+    std::string atype;
+    const auto h160 = core::address_to_hash160(addr, atype);
+    return h160.size() == 40 ? core::hash160_to_merged_script(h160, atype) : std::vector<unsigned char>{};
 }
 
-// The configured chains (configured(chain_id)) this address is an address of.
-inline std::vector<const ChainAddrInfo*> chains_of(const std::string& addr, bool testnet,
-                                                   const std::function<bool(uint32_t)>& configured)
-{
-    std::vector<const ChainAddrInfo*> out;
-    for (const auto& c : merged_chain_table(testnet))
-        if (configured(c.chain_id) && is_own_address(addr, c))
-            out.push_back(&c);
-    return out;
-}
+struct LoginResolution {
+    std::string primary;                         // the parent payout address (after a swap)
+    std::map<uint32_t, std::string> addresses;   // chain id -> address
+    std::string refuse;                          // set: refuse the authorize with this text
+    std::vector<std::string> notes;              // for the log
+};
 
-// The scriptPubKey an address of this chain pays there (P2PKH, P2SH or a
-// witness program by the chain's own versions / HRPs); empty when it is not
-// an address of that chain.
-inline std::vector<unsigned char> script_on_chain(const ChainAddrInfo& c, const std::string& addr)
+/// Resolve a login: `primary` and the optional second address `merged_raw`
+/// (comma/pipe/space/semicolon form), `explicit_addrs` from the slash form
+/// (PRIMARY/CHAIN_ID:ADDR), the configured chains, and the parent coin's own
+/// versions/HRPs on the node's network.
+inline LoginResolution resolve_merged_login(std::string primary, const std::string& merged_raw,
+                                            std::map<uint32_t, std::string> explicit_addrs,
+                                            const std::vector<ChainAddrInfo>& table,
+                                            const std::function<bool(uint32_t)>& configured,
+                                            const std::vector<uint8_t>& parent_versions_now,
+                                            const std::vector<std::string>& parent_hrps)
 {
-    std::vector<unsigned char> script;
-    if (core::classify_address_for_coin(addr, c.p2pkh, c.p2sh, c.hrps, script) != core::AddressCoinMatch::Own)
-        script.clear();
-    return script;
+    LoginResolution r;
+    r.addresses = std::move(explicit_addrs);
+    std::vector<const ChainAddrInfo*> conf;   // table order: "the first configured chain"
+    for (const auto& c : table)
+        if (configured(c.chain_id))
+            conf.push_back(&c);
+    const auto chains_taking = [&](const std::string& addr) {
+        std::vector<const ChainAddrInfo*> out;
+        for (const auto* c : conf)
+            if (core::is_address_for_chain(addr, c->hrps, c->versions))
+                out.push_back(c);
+        return out;
+    };
+    const auto ids = [](const std::vector<const ChainAddrInfo*>& cs) {
+        std::string l;
+        for (const auto* c : cs)
+            l += (l.empty() ? "" : " and ") + std::to_string(c->chain_id);
+        return l;
+    };
+    // `parent`: the parent-coin address of the example (the second one of a swapped pair).
+    const auto refuse = [&](const std::string& addr, const std::string& why, const std::string& parent) {
+        r.refuse = "merged address " + addr + " " + why + "; name its chain: PRIMARY/CHAIN_ID:ADDRESS (e.g. "
+                   + parent + "/" + (conf.empty() ? std::string("98") : std::to_string(conf.front()->chain_id))
+                   + ":" + addr + ")";
+    };
+    const auto is_parent = [&](const std::string& a) {
+        return core::is_address_for_chain(a, parent_hrps, parent_versions_now);
+    };
+
+    if (!merged_raw.empty()) {
+        const auto m = chains_taking(merged_raw);
+        if (m.size() == 1) {
+            r.addresses[m[0]->chain_id] = merged_raw;
+        } else if (m.size() > 1) {
+            refuse(merged_raw, "is an address of merged chains " + ids(m), primary);
+            return r;
+        } else {
+            // Swapped order: the first address is a merged chain's, the second the parent's.
+            const auto u = chains_taking(primary);
+            if (!u.empty() && is_parent(merged_raw)) {
+                if (u.size() > 1) {
+                    refuse(primary, "is an address of merged chains " + ids(u), merged_raw);
+                    return r;
+                }
+                r.notes.push_back("swapped address order — auto-correcting");
+                r.addresses[u[0]->chain_id] = primary;
+                primary = merged_raw;
+            } else {
+                // No chain identifies it: its hash160 goes to the one merged
+                // chain configured (the pre-change fallback); with several,
+                // which chain it is for cannot be told.
+                std::string t;
+                if (core::address_to_hash160(merged_raw, t).size() == 40 && !conf.empty()) {
+                    if (conf.size() > 1) {
+                        refuse(merged_raw, "is not an address of any configured merged chain (" + ids(conf) + ")",
+                               primary);
+                        return r;
+                    }
+                    r.addresses[conf[0]->chain_id] = merged_raw;
+                    r.notes.push_back("assigned merged address to chain_id=" + std::to_string(conf[0]->chain_id));
+                }
+            }
+        }
+    }
+
+    // Case 5: the primary address is a merged chain's, not the parent's.
+    if (merged_raw.empty() && !primary.empty() && !is_parent(primary)) {
+        const auto u = chains_taking(primary);
+        if (u.size() == 1) {
+            r.addresses[u[0]->chain_id] = primary;
+            r.notes.push_back("Case 5: primary address is chain_id=" + std::to_string(u[0]->chain_id)
+                              + " (not the parent's): the parent payout uses its hash160");
+        } else if (u.size() > 1) {
+            refuse(primary, "(the primary) is an address of merged chains " + ids(u), "PRIMARY");
+            return r;
+        }
+    }
+
+    // Auto-derive: each configured chain without an address reuses the
+    // primary's hash160 (the same key spends on both chains).
+    std::string atype;
+    const auto h160 = core::address_to_hash160(primary, atype);
+    if (h160.size() == 40 && (atype == "p2pkh" || atype == "p2wpkh" || atype == "p2sh"))
+        for (const auto* c : conf)
+            if (!r.addresses.count(c->chain_id)) {
+                r.addresses[c->chain_id] = primary;
+                r.notes.push_back("auto-derived merged address for chain_id=" + std::to_string(c->chain_id)
+                                  + " from primary " + atype + " address");
+            }
+    r.primary = std::move(primary);
+    return r;
 }
 
 } // namespace merged_addr

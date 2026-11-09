@@ -47,6 +47,7 @@
 #include <nlohmann/json.hpp>
 
 #include <btclibs/base58.h>
+#include <btclibs/crypto/sha256.h>
 #include <btclibs/bech32.h>
 #include <btclibs/util/strencodings.h>
 #include <core/hash.hpp>
@@ -55,6 +56,7 @@
 #include <c2pool/merged/aux_chain_params.hpp>
 #include <c2pool/merged/aux_commitment_rule.hpp>
 #include <core/merged_chain_addr.hpp>
+#include <core/address_utils.hpp>
 #include <c2pool/merged/aux_found_verdict.hpp>
 #include <c2pool/merged/merged_mining.hpp>
 #include <impl/doge/coin/auxpow.hpp>
@@ -1832,46 +1834,403 @@ TEST(MergedAuxStress, FlappingChainsConcurrentJobsAndFinds)
     io.join();
 }
 
-// ---- stratum: merged addresses by each chain's own versions (no guessing) ----
+// ---- stratum: which chain each login address is for, and what it pays -----
 
-TEST(MergedAuxStratumAddress, AmbiguousAddressesAreNotAssigned)
+namespace {
+
+const std::vector<std::string> kLtcHrps = {"ltc", "tltc", "rltc"};
+std::vector<uint8_t> ltc_versions(bool tn) { return tn ? std::vector<uint8_t>{111, 196, 58} : std::vector<uint8_t>{48, 50, 5}; }
+const std::vector<uint8_t> kLtcAllNetworks = {48, 50, 5, 111, 196, 58};   // main_ltc's merged_parent_versions
+
+// The pre-change server (master handle_authorize + the job's merged scripts),
+// transcribed for a DOGE-only node: table {98, {}, {0x1e, 0x16, 0x71}},
+// scripts by the chain-agnostic hash160 type.
+std::vector<unsigned char> master_doge_script(std::string username, std::string merged_raw, bool tn,
+                                              std::map<uint32_t, std::string> explicit_addrs)
 {
-    using core::merged_addr::chains_of;
-    using core::merged_addr::merged_chain_info;
-    using core::merged_addr::script_on_chain;
-    const auto configured = [](std::set<uint32_t> s) {
-        return [s](uint32_t id) { return s.count(id) > 0; };
-    };
-    // Bellscoin's P2SH version (30) is DOGE's P2PKH version.
-    const std::string bells_p2sh = b58(30, 0x44);
-    auto m = chains_of(bells_p2sh, false, configured({98, 16}));
-    EXPECT_EQ(m.size(), 2u) << "DOGE and BELLS: ambiguous, never assigned";
-    m = chains_of(bells_p2sh, false, configured({16}));
-    ASSERT_EQ(m.size(), 1u);
-    EXPECT_EQ(m[0]->chain_id, 16u);
-    // paid as P2SH on BELLS, P2PKH on DOGE: never a P2PKH to a script hash
-    const auto s_bells = script_on_chain(*merged_chain_info(false, 16), bells_p2sh);
-    ASSERT_EQ(s_bells.size(), 23u);
-    EXPECT_EQ(s_bells[0], 0xa9);
-    const auto s_doge = script_on_chain(*merged_chain_info(false, 98), bells_p2sh);
-    ASSERT_EQ(s_doge.size(), 25u);
-    EXPECT_EQ(s_doge[0], 0x76);
-    // P2SH 22 is DOGE's, PEP's and SHIC's
-    EXPECT_EQ(chains_of(b58(22, 0x55), false, configured({98, 63, 74})).size(), 3u);
-    // testnet 113 / regtest 111: the whole Dogecoin family
-    EXPECT_EQ(chains_of(b58(113, 0x66), true, configured({98, 63})).size(), 2u);
-    // a PEP address with DOGE + PEP configured: PEP alone
-    m = chains_of(b58(56, 0x77), false, configured({98, 63}));
-    ASSERT_EQ(m.size(), 1u);
-    EXPECT_EQ(m[0]->chain_id, 63u);
-    // Junkcoin bech32 (jc) and its testnet chain id 8225
-    std::vector<uint8_t> prog(20, 0x31);
-    m = chains_of(bech32::encode_segwit("jc", 0, prog), false, configured({8224}));
-    ASSERT_EQ(m.size(), 1u);
-    EXPECT_EQ(m[0]->chain_id, 8224u);
-    m = chains_of(bech32::encode_segwit("tjc", 0, prog), true, configured({8225}));
-    ASSERT_EQ(m.size(), 1u);
-    EXPECT_EQ(m[0]->chain_id, 8225u);
-    // an LTC address is no merged chain's
-    EXPECT_TRUE(chains_of(b58(48, 0x11), false, configured({98, 63, 16, 8211, 8224, 74, 50, 1})).empty());
+    const std::vector<uint8_t> DOGE_V = {0x1e, 0x16, 0x71};
+    std::map<uint32_t, std::string> m = explicit_addrs;
+    if (!merged_raw.empty()) {
+        bool resolved = false;
+        if (core::is_address_for_chain(merged_raw, {}, DOGE_V)) { m[98] = merged_raw; resolved = true; }
+        if (!resolved && core::is_address_for_chain(username, {}, DOGE_V)
+            && core::is_address_for_chain(merged_raw, kLtcHrps, ltc_versions(tn))) {
+            m[98] = username; username = merged_raw; resolved = true;
+        }
+        if (!resolved) {
+            std::string t;
+            if (core::address_to_hash160(merged_raw, t).size() == 40) { m[98] = merged_raw; resolved = true; }
+        }
+    }
+    if (merged_raw.empty() && !username.empty()) {
+        if (!core::is_address_for_chain(username, kLtcHrps, ltc_versions(tn))
+            && core::is_address_for_chain(username, {}, DOGE_V))
+            m[98] = username;
+    }
+    std::string atype;
+    auto h = core::address_to_hash160(username, atype);
+    if (h.size() == 40 && (atype == "p2pkh" || atype == "p2wpkh" || atype == "p2sh") && !m.count(98))
+        m[98] = username;
+    if (!m.count(98)) return {};
+    std::string t2;
+    auto h2 = core::address_to_hash160(m[98], t2);
+    return h2.size() == 40 ? core::hash160_to_merged_script(h2, t2) : std::vector<unsigned char>{};
+}
+
+struct Login { std::vector<unsigned char> script; std::string refuse; std::string primary; };
+
+Login branch_login(const std::string& username, const std::string& merged_raw, bool tn,
+                   std::map<uint32_t, std::string> explicit_addrs, std::set<uint32_t> configured, uint32_t chain)
+{
+    using namespace core::merged_addr;
+    const auto table = merged_chain_table(tn, kLtcAllNetworks);
+    auto lr = resolve_merged_login(username, merged_raw, explicit_addrs, table,
+                                   [&configured](uint32_t id) { return configured.count(id) > 0; },
+                                   ltc_versions(tn), kLtcHrps);
+    Login out;
+    out.refuse = lr.refuse;
+    out.primary = lr.primary;
+    if (lr.refuse.empty() && lr.addresses.count(chain))
+        out.script = merged_payout_script(find_chain(table, chain), lr.addresses.at(chain));
+    return out;
+}
+
+} // namespace
+
+// A DOGE-only node: for every login shape (primary address types, comma
+// second addresses of every kind, swapped order, the slash form, bad
+// checksums, other coins' and other networks' addresses), mainnet and
+// testnet, the DOGE payout script is byte-identical to the pre-change one.
+TEST(MergedAuxStratumLogin, DogeOnlyPaysWhatItPaidForEveryLoginShape)
+{
+    std::vector<unsigned char> p20(20, 0x42), p32(32, 0x43);
+    for (bool tn : {false, true}) {
+        const uint8_t L = tn ? 111 : 48, M = tn ? 58 : 50, S3 = tn ? 196 : 5;
+        const uint8_t D = tn ? 113 : 30, DA = tn ? 196 : 22;
+        const std::string ltc_hrp = tn ? "tltc" : "ltc";
+        auto bad_ck = [](std::string a) { a[a.size() - 1] = a[a.size() - 1] == 'z' ? 'y' : 'z'; return a; };
+        struct U { std::string name, primary, merged; std::map<uint32_t, std::string> expl; };
+        const std::string doge = b58(D, 0x21), doge_p2sh = b58(DA, 0x22);
+        const std::vector<U> us = {
+            {"LTC P2PKH alone", b58(L, 0x01), ""},
+            {"LTC P2SH alone", b58(M, 0x02), ""},
+            {"LTC legacy-3 P2SH alone", b58(S3, 0x03), ""},
+            {"ltc1q alone", bech32::encode_segwit(ltc_hrp, 0, p20), ""},
+            {"ltc1 P2WSH alone", bech32::encode_segwit(ltc_hrp, 0, p32), ""},
+            {"LTC,DOGE", b58(L, 0x01), doge},
+            {"LTC,DOGE-P2SH", b58(L, 0x01), doge_p2sh},
+            {"LTC-P2SH,DOGE", b58(M, 0x02), doge},
+            {"ltc1q,DOGE", bech32::encode_segwit(ltc_hrp, 0, p20), doge},
+            {"LTC,DOGE(bad checksum)", b58(L, 0x01), bad_ck(doge)},
+            {"LTC-P2SH,DOGE(bad checksum)", b58(M, 0x02), bad_ck(doge)},
+            {"DOGE,LTC (swapped)", doge, b58(L, 0x01)},
+            {"DOGE alone (case 5)", doge, ""},
+            {"DOGE-P2SH alone (case 5)", doge_p2sh, ""},
+            {"LTC,LTC2", b58(L, 0x01), b58(L, 0x09)},
+            {"LTC,LTC2-P2SH", b58(L, 0x01), b58(M, 0x0a)},
+            {"LTC-P2SH,LTC2", b58(M, 0x02), b58(L, 0x09)},
+            {"LTC,ltc1q2", b58(L, 0x01), bech32::encode_segwit(ltc_hrp, 0, std::vector<unsigned char>(20, 0x0b))},
+            {"LTC,BTC 1...", b58(L, 0x01), b58(0, 0x0c)},
+            {"LTC,PEP P...", b58(L, 0x01), b58(56, 0x0d)},
+            {"LTC,DOGE-other-net", b58(L, 0x01), b58(tn ? 30 : 113, 0x0e)},
+            {"DOGE-other-net,LTC (swapped)", b58(tn ? 30 : 113, 0x0e), b58(L, 0x01)},
+            {"LTC,DOGE-regtest", b58(L, 0x01), b58(111, 0x0f)},
+            {"DOGE-testnet-P2SH,LTC", b58(196, 0x10), b58(L, 0x01)},
+            {"LTC/98:DOGE", b58(L, 0x01), "", {{98, doge}}},
+            {"LTC/98:LTC2", b58(L, 0x01), "", {{98, b58(L, 0x09)}}},
+            {"LTC-P2SH/98:LTC2", b58(M, 0x02), "", {{98, b58(L, 0x09)}}},
+            {"DOGE/98:DOGE2 (case 5 overrides)", doge, "", {{98, b58(D, 0x31)}}},
+        };
+        for (const auto& u : us) {
+            const auto want = master_doge_script(u.primary, u.merged, tn, u.expl);
+            const auto got = branch_login(u.primary, u.merged, tn, u.expl, {98}, 98);
+            EXPECT_TRUE(got.refuse.empty()) << u.name << ": " << got.refuse;
+            EXPECT_EQ(hex_of(std::vector<uint8_t>(got.script.begin(), got.script.end())),
+                      hex_of(std::vector<uint8_t>(want.begin(), want.end())))
+                << (tn ? "testnet " : "mainnet ") << u.name;
+        }
+    }
+}
+
+// DOGE's identification versions are the server's pre-change list exactly.
+TEST(MergedAuxStratumLogin, DogeIdentificationIsUnchanged)
+{
+    for (bool tn : {false, true}) {
+        const auto t = core::merged_addr::merged_chain_table(tn, kLtcAllNetworks);
+        const auto* d = core::merged_addr::find_chain(t, 98);
+        ASSERT_NE(d, nullptr);
+        EXPECT_EQ(std::set<uint8_t>(d->versions.begin(), d->versions.end()), (std::set<uint8_t>{0x1e, 0x16, 0x71}));
+        EXPECT_TRUE(d->hrps.empty());
+    }
+}
+
+// Several merged chains: an address two configured chains could take, a
+// second address no chain identifies, an ambiguous primary — the login is
+// refused, naming PRIMARY/CHAIN_ID:ADDR; an address of one chain goes to it.
+TEST(MergedAuxStratumLogin, MultiAuxNeverGuesses)
+{
+    const std::string ltc = b58(48, 0x01);
+    // BELLS P2SH (30) is DOGE's P2PKH version
+    auto r = branch_login(ltc, b58(30, 0x44), false, {}, {98, 16}, 98);
+    EXPECT_NE(r.refuse.find("98 and 16"), std::string::npos) << r.refuse;
+    EXPECT_NE(r.refuse.find("PRIMARY/CHAIN_ID:ADDRESS"), std::string::npos) << r.refuse;
+    // named explicitly: accepted, BELLS pays P2SH
+    r = branch_login(ltc, "", false, {{16, b58(30, 0x44)}}, {98, 16}, 16);
+    EXPECT_TRUE(r.refuse.empty());
+    ASSERT_EQ(r.script.size(), 23u);
+    EXPECT_EQ(r.script[0], 0xa9) << "a Bellscoin P2SH is paid as P2SH";
+    // the same address on DOGE (named for it) pays DOGE P2PKH
+    r = branch_login(ltc, "", false, {{98, b58(30, 0x44)}}, {98, 16}, 98);
+    ASSERT_EQ(r.script.size(), 25u);
+    EXPECT_EQ(r.script[0], 0x76);
+    // P2SH 22: DOGE, PEP, SHIC
+    r = branch_login(ltc, b58(22, 0x55), false, {}, {98, 63}, 98);
+    EXPECT_FALSE(r.refuse.empty());
+    // a PEP address with DOGE + PEP: PEP's; DOGE gets the primary's key
+    r = branch_login(ltc, b58(56, 0x77), false, {}, {98, 63}, 63);
+    EXPECT_TRUE(r.refuse.empty());
+    EXPECT_EQ(r.script, core::merged_addr::merged_payout_script(nullptr, b58(56, 0x77)));
+    r = branch_login(ltc, b58(56, 0x77), false, {}, {98, 63}, 98);
+    EXPECT_EQ(r.script, core::merged_addr::merged_payout_script(nullptr, ltc));
+    // a second address no chain identifies (another LTC address): with one
+    // chain the pre-change fallback, with two refused
+    r = branch_login(ltc, b58(48, 0x09), false, {}, {98, 63}, 98);
+    EXPECT_NE(r.refuse.find("not an address of any configured merged chain"), std::string::npos) << r.refuse;
+    r = branch_login(ltc, b58(48, 0x09), false, {}, {98}, 98);
+    EXPECT_TRUE(r.refuse.empty());
+    EXPECT_EQ(r.script, core::merged_addr::merged_payout_script(nullptr, b58(48, 0x09)));
+    // an ambiguous primary (case 5)
+    r = branch_login(b58(22, 0x55), "", false, {}, {98, 63}, 98);
+    EXPECT_FALSE(r.refuse.empty());
+    // swapped DOGE,LTC with DOGE + PEP: DOGE's alone
+    r = branch_login(b58(30, 0x21), ltc, false, {}, {98, 63}, 98);
+    EXPECT_TRUE(r.refuse.empty());
+    EXPECT_EQ(r.primary, ltc);
+    // a Junkcoin P2PKH "7..." (16) is paid P2PKH (the chain-agnostic type is P2SH)
+    r = branch_login(ltc, b58(16, 0x66), false, {}, {8224}, 8224);
+    ASSERT_EQ(r.script.size(), 25u);
+    EXPECT_EQ(r.script[0], 0x76);
+}
+
+// Testnet: LTC testnet P2PKH 111 is DOGE regtest's; a swapped DOGE,LTC
+// login neither pays DOGE to the LTC key nor LTC to the DOGE key. With PEP
+// as well (whose testnet P2PKH 113 is DOGE's) the swapped pair is refused,
+// and the example names the LTC address as the primary.
+TEST(MergedAuxStratumLogin, TestnetSwappedLoginDoesNotCrossPay)
+{
+    const std::string doge = b58(113, 0x21), ltc = b58(111, 0x01);
+    auto r = branch_login(doge, ltc, true, {}, {98}, 98);
+    EXPECT_TRUE(r.refuse.empty()) << r.refuse;
+    EXPECT_EQ(r.primary, ltc) << "the parent payout is the LTC address";
+    EXPECT_EQ(r.script, core::merged_addr::merged_payout_script(nullptr, doge)) << "DOGE pays the DOGE address";
+    r = branch_login(doge, ltc, true, {}, {98, 63}, 98);
+    EXPECT_NE(r.refuse.find("98 and 63"), std::string::npos) << r.refuse;
+    EXPECT_NE(r.refuse.find("(e.g. " + ltc + "/98:" + doge + ")"), std::string::npos) << r.refuse;
+    r = branch_login(ltc, "", true, {{98, doge}}, {98, 63}, 98);
+    EXPECT_TRUE(r.refuse.empty()) << r.refuse;
+    EXPECT_EQ(r.script, core::merged_addr::merged_payout_script(nullptr, doge));
+}
+
+// ---- the commitment rule: generated parity vectors, log-only ----------------
+
+namespace {
+struct SplitMix64 {
+    uint64_t s;
+    uint64_t next()
+    {
+        s += 0x9E3779B97F4A7C15ull;
+        uint64_t z = s;
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+        return z ^ (z >> 31);
+    }
+    uint64_t below(uint64_t n) { return next() % n; }
+};
+std::vector<unsigned char> sha256d_bytes(const std::vector<unsigned char>& b)
+{
+    const uint256 h = Hash(std::span<const unsigned char>(b.data(), b.size()));
+    return std::vector<unsigned char>(h.data(), h.data() + 32);
+}
+std::vector<unsigned char> pmerkle(uint32_t size, const std::map<uint32_t, std::vector<unsigned char>>& leaves)
+{
+    std::vector<std::vector<unsigned char>> layer(size, std::vector<unsigned char>(32, 0));
+    for (const auto& [i, v] : leaves) layer[i] = v;
+    while (layer.size() > 1) {
+        std::vector<std::vector<unsigned char>> next(layer.size() / 2);
+        for (size_t k = 0; k < next.size(); ++k) {
+            auto cat = layer[2 * k];
+            cat.insert(cat.end(), layer[2 * k + 1].begin(), layer[2 * k + 1].end());
+            next[k] = sha256d_bytes(cat);
+        }
+        layer = std::move(next);
+    }
+    return layer[0];
+}
+uint32_t pid(SplitMix64& r)
+{
+    static const uint32_t REAL[] = {98, 63, 16, 8211, 8224, 8225, 74, 50, 1, 2, 7};
+    static const uint32_t SPECIAL[] = {5, 5u + (1u << 30), 5u + (1u << 29), 5u + (1u << 12), 5u + (1u << 11), 0xffffffffu, 0};
+    const uint64_t c = r.below(100);
+    if (c < 60) return REAL[r.below(11)];
+    if (c < 75) return static_cast<uint32_t>(r.below(1 << 16));
+    if (c < 85) return static_cast<uint32_t>(r.next() & 0xffffffffu);
+    if (c < 93) return SPECIAL[r.below(7)];
+    return 98u + (1u << (1 + r.below(30)));
+}
+std::vector<unsigned char> pbytes(SplitMix64& r, size_t n)
+{
+    std::vector<unsigned char> v(n);
+    for (auto& b : v) b = static_cast<unsigned char>(r.next() & 0xff);
+    return v;
+}
+struct PVec { std::vector<unsigned char> root; uint32_t size; std::vector<std::pair<uint32_t, std::vector<unsigned char>>> carried; };
+// The same generator as p2pool test_v36_merged_multi_aux_tree.py parity_vector.
+PVec parity_vector(SplitMix64& r)
+{
+    static const int KS[] = {1, 1, 2, 2, 2, 3, 3, 4, 5, 6, 8};
+    std::vector<uint32_t> ids;
+    const int k = KS[r.below(11)];
+    for (int i = 0; i < k; ++i) ids.push_back(pid(r));
+    if (r.below(100) < 8) ids.push_back(ids[r.below(ids.size())]);
+    PVec v;
+    for (auto cid : ids) {
+        size_t hl = 80;
+        if (r.below(100) < 4) { static const size_t HL[] = {0, 79, 81, 160}; hl = HL[r.below(4)]; }
+        v.carried.emplace_back(cid, pbytes(r, hl));
+    }
+    std::vector<uint32_t> uniq;
+    for (auto c : ids) if (std::find(uniq.begin(), uniq.end(), c) == uniq.end()) uniq.push_back(c);
+    std::map<uint32_t, uint32_t> slots;
+    const uint32_t size = c2pool::merged::p2pool_aux_tree(uniq, &slots);
+    std::vector<unsigned char> good(32, 0);
+    if (size > 0 && size <= 4096) {
+        std::map<uint32_t, std::vector<unsigned char>> leaves;
+        for (const auto& [c, h] : v.carried) leaves[slots.at(c)] = sha256d_bytes(h);
+        good = pmerkle(size, leaves);
+    }
+    const uint64_t mode = r.below(100);
+    v.root = good;
+    v.size = size;
+    if (mode < 45) return v;
+    if (mode < 55) {
+        const auto i = r.below(32);
+        v.root[i] ^= static_cast<unsigned char>(1u << r.below(8));
+        return v;
+    }
+    if (mode < 62) {
+        const uint64_t opts[] = {0, 1, 2, 4, uint64_t(size) * 2, std::max<uint64_t>(size / 2, 1), 1ull << 31, 4096, 8192,
+                                 r.next() & 0xffffffffu};
+        // (python builds the whole list, drawing next() for the last option,
+        // before choosing: the braced list above draws it in the same order)
+        v.size = static_cast<uint32_t>(opts[r.below(10)] & 0xffffffffu);
+        return v;
+    }
+    if (mode < 75) {
+        std::vector<uint32_t> extra;
+        const auto ne = r.below(2) + 1;
+        for (uint64_t i = 0; i < ne; ++i) extra.push_back(pid(r));
+        std::vector<uint32_t> allids = uniq;
+        for (auto c : extra) if (std::find(allids.begin(), allids.end(), c) == allids.end()) allids.push_back(c);
+        std::map<uint32_t, uint32_t> sl2;
+        const uint32_t s2 = c2pool::merged::p2pool_aux_tree(allids, &sl2);
+        if (s2 > 0 && s2 <= 4096) {
+            std::map<uint32_t, std::vector<unsigned char>> leaves;
+            for (const auto& [c, h] : v.carried) leaves[sl2.at(c)] = sha256d_bytes(h);
+            for (auto c : extra)
+                if (std::find(uniq.begin(), uniq.end(), c) == uniq.end() && r.below(2) == 0)
+                    leaves[sl2.at(c)] = pbytes(r, 32);
+            v.root = pmerkle(s2, leaves);
+            v.size = s2;
+        }
+        return v;
+    }
+    if (mode < 82 && v.carried.size() == 1) {
+        auto h = v.carried[0].second;
+        if (h.size() > 80) h.resize(80);
+        v.root = r.below(10) < 7 ? sha256d_bytes(h) : pbytes(r, 32);
+        static const uint32_t SZ[] = {1, 1, 1, 2, 0};
+        v.size = SZ[r.below(5)];
+        return v;
+    }
+    if (mode < 90) {
+        if (size > 0 && size <= 4096 && uniq.size() >= 2) {
+            std::map<uint32_t, std::vector<unsigned char>> leaves;
+            for (size_t i = 0; i < v.carried.size(); ++i) leaves[i % size] = sha256d_bytes(v.carried[i].second);
+            v.root = pmerkle(size, leaves);
+        }
+        return v;
+    }
+    v.root = pbytes(r, 32);
+    v.size = r.below(10) < 3 ? static_cast<uint32_t>(r.next() & 0xffffffffu) : static_cast<uint32_t>(1u << r.below(4));
+    return v;
+}
+std::string parity_class(const std::string& why)
+{
+    if (why.empty()) return "A";
+    if (why.find("twice") != std::string::npos) return "R:dup";
+    if (why.find("larger than") != std::string::npos) return "R:big";
+    if (why.find("size mismatch") != std::string::npos) return "R:size";
+    if (why.find("not 80 bytes") != std::string::npos) return "R:hdr";
+    if (why.find("aux root") != std::string::npos) return "R:root";
+    return "R:other";
+}
+} // namespace
+
+// 5,000 generated vectors; the verdicts' digest is pinned here and in p2pool
+// test_v36_merged_multi_aux_tree.py ParityVectors: both implementations give
+// the same verdict on each.
+TEST(MergedAuxCommitment, ParityVectors)
+{
+    SplitMix64 r{2026};
+    std::string all;
+    std::map<std::string, int> counts;
+    for (int i = 0; i < 5000; ++i) {
+        const auto v = parity_vector(r);
+        uint256 root;
+        std::memcpy(root.data(), v.root.data(), 32);
+        const auto cls = parity_class(c2pool::merged::check_merged_aux_commitment(v.carried, root, v.size));
+        all += cls + "\n";
+        ++counts[cls];
+    }
+    EXPECT_EQ(counts, (std::map<std::string, int>{{"A", 1896}, {"R:big", 131}, {"R:dup", 1121},
+                                                  {"R:hdr", 296}, {"R:root", 671}, {"R:size", 885}}));
+    unsigned char out[CSHA256::OUTPUT_SIZE];
+    CSHA256().Write(reinterpret_cast<const unsigned char*>(all.data()), all.size()).Finalize(out);
+    EXPECT_EQ(HexStr(std::span<const unsigned char>(out, CSHA256::OUTPUT_SIZE)),
+              "a37fc58712ab0392114cd05d1e6cf13432ab577a3aaab06200b3d76f7677a83c");
+}
+
+// Log-only this release: a verdict is counted (and the first ones logged),
+// never turned into a rejection by the share check.
+TEST(MergedAuxCommitment, RuleIsCountedNotEnforced)
+{
+    auto& st = c2pool::merged::merged_rule_stats();
+    const auto c0 = st.checked.load(), w0 = st.would_reject.load();
+    EXPECT_FALSE(c2pool::merged::note_merged_rule_verdict(""));
+    EXPECT_TRUE(c2pool::merged::note_merged_rule_verdict("merged aux tree size mismatch: expected 1 for chains [98], got 2"));
+    EXPECT_EQ(st.checked.load(), c0 + 2);
+    EXPECT_EQ(st.would_reject.load(), w0 + 1);
+    std::lock_guard<std::mutex> l(st.mu);
+    EXPECT_NE(st.last_reason.find("size mismatch"), std::string::npos);
+}
+
+// A block found again (shares on a job whose block is already out) is
+// recorded once: total and per-chain counts and the recent list do not grow.
+TEST(MergedAuxFind, RefindOfTheSameBlockIsRecordedOnce)
+{
+    Rig r({{"DOGE", 98}, {"PEP", 63}});
+    int calls = 0;
+    r.mm.set_on_merged_block_found([&calls](const std::string&, int, const std::string&, bool, uint64_t) { ++calls; });
+    r.mm.refresh_aux_work();
+    const auto job = r.mm.get_auxpow_commitment();
+    submit_share(r.mm, job, 0x11);
+    r.chain(1).verdict = SubmitVerdict::of(SubmitVerdict::Kind::duplicate, "duplicate");
+    submit_share(r.mm, job, 0x12);
+    submit_share(r.mm, job, 0x13);
+    EXPECT_EQ(r.chain(0).submitted(), 3u);
+    EXPECT_EQ(r.mm.get_discovered_blocks().size(), 2u);
+    EXPECT_EQ(r.mm.get_total_blocks(), 2u);
+    EXPECT_EQ(r.mm.get_chain_block_count(98), 1u);
+    EXPECT_EQ(r.mm.get_chain_block_count(63), 1u);
+    EXPECT_EQ(calls, 2);
 }
