@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
-#include <core/share_format_vote.hpp>
 
 // SSOT for the DGB DESIRED-VERSION TALLY -- the pure accumulation core of
 // ShareTracker::get_desired_version_weights() (and its flat-count diagnostic
@@ -66,7 +65,7 @@ accumulate_version_weights(const std::vector<VersionWork>& window)
 {
     std::map<uint64_t, uint288> weights;
     for (const auto& s : window)
-        weights[core::share_format_vote(s.desired_version)] = weights[core::share_format_vote(s.desired_version)] + s.work;
+        weights[s.desired_version] = weights[s.desired_version] + s.work;
     return weights;
 }
 
@@ -78,7 +77,7 @@ accumulate_version_counts(const std::vector<uint64_t>& window)
 {
     std::map<uint64_t, int32_t> counts;
     for (uint64_t dv : window)
-        counts[core::share_format_vote(dv)]++;
+        counts[dv]++;
     return counts;
 }
 

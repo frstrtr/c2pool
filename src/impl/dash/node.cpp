@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #include "node.hpp"
-#include <core/share_format_vote.hpp>
 #include "share.hpp"
 #include "mint_runloop.hpp"   // dash::mint::elect_best_share (election policy SSOT)
 #include "known_txs_retention.hpp"  // dash::retain_template_txs / all_txs_backable (F1/F3)
@@ -644,7 +643,7 @@ void NodeImpl::apply_min_protocol_ratchet()
     int64_t best_desired = 0;
     uint256 prev_hash;
     m_tracker.chain.get_share(m_best_share_hash).invoke([&](auto* obj) {
-        best_desired = static_cast<int64_t>(core::share_format_vote(obj->m_desired_version));
+        best_desired = static_cast<int64_t>(obj->m_desired_version);
         prev_hash    = obj->m_prev_hash;
     });
 

@@ -587,12 +587,7 @@
             }
             html += kv('Last Stale', staleHtml);
             html += kv('Nonce', sd.nonce != null ? sd.nonce : '-');
-            // A desired_version of 100 or more is a subversion of format dv/100
-            // (3601: V36 with the per-share merged rule), a vote for that format.
-            html += kv('Desired Version', sd.desired_version != null
-                ? (sd.desired_version >= 100 ? 'V' + Math.floor(sd.desired_version / 100) + ' (' + sd.desired_version + ')'
-                                             : 'V' + sd.desired_version)
-                : '-');
+            html += kv('Desired Version', sd.desired_version != null ? 'V' + sd.desired_version : '-');
             html += kv('Absolute Height', sd.absheight != null ? sd.absheight : '-');
             html += kv('Absolute Work', sd.abswork || '-');
             html += '</div></div>';
@@ -893,7 +888,8 @@
                             verEl.style.fontSize = fitVer + 'px';
                             verEl.style.lineHeight = '1.1';
                             verEl.style.marginTop = '1px';
-                            if (mv.dv && mv.dv !== mv.ver) {
+                            // dv 37 on a V36 share: V36 with the per-share merged rule (c2pool v0.2.12), not a V37 vote
+                            if (mv.dv && mv.dv !== mv.ver && !(mv.ver === 36 && mv.dv === 37)) {
                                 verEl.style.color = '#4dd0e1';
                                 verEl.style.textShadow = '0 1px 3px rgba(0,0,0,0.9)';
                                 verEl.style.fontWeight = '700';
@@ -927,7 +923,7 @@
                         cell.addEventListener('mouseenter', function(ev) {
                             var verLine = '';
                             if (_mv.ver) {
-                                if (_mv.dv && _mv.dv !== _mv.ver) {
+                                if (_mv.dv && _mv.dv !== _mv.ver && !(_mv.ver === 36 && _mv.dv === 37)) {
                                     verLine = '<div style="color:#4dd0e1;font-weight:600">V' + _mv.ver + ' \u2192 V' + _mv.dv + '</div>';
                                 } else if (_mv.ver >= 36) {
                                     verLine = '<div style="color:var(--success)">V' + _mv.ver + '</div>';

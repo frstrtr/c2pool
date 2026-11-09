@@ -7,7 +7,6 @@
 #include <cassert>
 #include <c2pool_build_version.h>
 #endif
-#include <core/share_format_vote.hpp>
 #include <algorithm>
 #include <iostream>
 #include <fstream>
@@ -5740,14 +5739,14 @@ int main(int argc, char* argv[]) {
                             if (static_cast<int>(s->m_stale_info) == 253) d.orphan_count = 1;
                             else if (static_cast<int>(s->m_stale_info) == 254) d.dead_count = 1;
                             d.version_counts[std::to_string(s->version)] = 1;
-                            d.desired_version_counts[std::to_string(core::share_format_vote(s->m_desired_version))] = 1;
+                            d.desired_version_counts[std::to_string(s->m_desired_version)] = 1;
 
                             auto target = chain::bits_to_target(s->m_bits);
                             d.difficulty_sum = chain::target_to_difficulty(target);
 
                             // Work-weighted desired version (matches p2pool's target_to_average_attempts weighting)
                             auto att = chain::target_to_average_attempts(target);
-                            d.desired_version_weights[std::to_string(core::share_format_vote(s->m_desired_version))] =
+                            d.desired_version_weights[std::to_string(s->m_desired_version)] =
                                 static_cast<double>(att.GetLow64());
 
                             std::string miner;
@@ -5914,7 +5913,7 @@ int main(int argc, char* argv[]) {
                         try {
                             auto& cd = chain.get(pos);
                             cd.share.invoke([&](auto* s) {
-                                if (core::share_format_vote(s->m_desired_version) >= 36) {
+                                if (static_cast<int>(s->m_desired_version) >= 36) {
                                     deepest_v36_pos = i + 1;
                                     if (contiguous) v36_contiguous_from_tip = i + 1;
                                 } else if (contiguous) {
@@ -6292,7 +6291,7 @@ int main(int argc, char* argv[]) {
                                     s["s"] = static_cast<int>(obj->m_stale_info);
                                     s["b"] = obj->m_bits;
                                     s["a"] = obj->m_absheight;
-                                    s["dv"] = core::share_format_vote(obj->m_desired_version);   // 3601 -> 36
+                                    s["dv"] = obj->m_desired_version;
 
                                     // Convert miner script to human-readable address
                                     auto script = get_share_script(obj);
@@ -6503,7 +6502,7 @@ int main(int argc, char* argv[]) {
                                 s["s"] = static_cast<int>(obj->m_stale_info);
                                 s["b"] = obj->m_bits;
                                 s["a"] = obj->m_absheight;
-                                s["dv"] = core::share_format_vote(obj->m_desired_version);   // 3601 -> 36
+                                s["dv"] = obj->m_desired_version;
 
                                 auto script = get_share_script(obj);
                                 std::string addr = core::script_to_address(script, true, testnet);
@@ -7079,14 +7078,12 @@ int main(int argc, char* argv[]) {
                     // AutoRatchet: determine share version from network state
                     auto [share_version, desired_ver] = auto_ratchet->get_share_version(
                         *guard, frozen_prev_share);
-                    // V36 shares this node makes carry the V36 subversion 3601
-                    // (share_check.hpp MERGED_OWN_ADDRESS_DESIRED_VERSION): they
-                    // resolve their merged payout from themselves only, and
-                    // vote for V36 exactly as 36 does (core::share_format_vote).
-                    // Only when the ratchet votes 36: a vote for another format
-                    // is left as it is.
-                    if (share_version == 36 && desired_ver == 36)
-                        desired_ver = static_cast<int64_t>(ltc::MERGED_OWN_ADDRESS_DESIRED_VERSION);
+                    // V36 shares this node makes resolve their merged payout
+                    // from themselves only (share_check.hpp
+                    // MERGED_OWN_ADDRESS_DESIRED_VERSION); still a V36 vote.
+                    if (share_version >= 36)
+                        desired_ver = std::max<int64_t>(desired_ver,
+                                                        static_cast<int64_t>(ltc::MERGED_OWN_ADDRESS_DESIRED_VERSION));
                     {
                         static int rv_log = 0;
                         if (rv_log++ < 5 || rv_log % 100 == 0)

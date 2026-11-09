@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
-#include <core/share_format_vote.hpp>
 
 // DASH dashboard read-models: the sharechain WINDOW, the incremental DELTA and
 // the individual SHARE DETAIL document.
@@ -162,7 +161,7 @@ inline nlohmann::json share_cell(ChainT& chain, ChainT& verified,
         s["s"]  = static_cast<int>(obj->m_stale_info);
         s["b"]  = obj->m_bits;
         s["a"]  = obj->m_absheight;
-        s["dv"] = core::share_format_vote(obj->m_desired_version);   // 3601 -> 36
+        s["dv"] = obj->m_desired_version;
 
         const auto script = dash::get_share_script(obj);
         const std::string addr = script_to_dash_address(script, ctx.testnet);

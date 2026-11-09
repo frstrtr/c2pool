@@ -854,12 +854,11 @@ TEST(MergedWeightsThreads, EveryTrackerCopyTakesTheCacheLock)
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// The per-share merged rule (desired_version 3601..3699, the V36 subversion
-// ltc::MERGED_OWN_ADDRESS_DESIRED_VERSION the shares v0.2.12 nodes make):
+// The per-share merged rule (desired_version >= 37,
+// ltc::MERGED_OWN_ADDRESS_DESIRED_VERSION, the shares v0.2.12 nodes make):
 // a share's merged payout for a chain comes from its own merged address for
 // the chain, else from its own parent script — never from another share's
-// address (Tier 1.5). Shares of desired_version 36 (and 37, never made: 37 is
-// reserved for Work Receipts) keep Tier 1.5, so the
+// address (Tier 1.5). Shares of desired_version 36 keep Tier 1.5, so the
 // shares already in the window at the upgrade keep their payouts. The
 // round-3 verifier's scenarios: S5 (one share registers another miner's
 // parent script with the attacker's DOGE address) and S3 (nodes that received
@@ -869,7 +868,6 @@ TEST(MergedWeightsThreads, EveryTrackerCopyTakesTheCacheLock)
 namespace {
 
 using Entries = std::vector<std::pair<uint32_t, std::vector<unsigned char>>>;
-constexpr uint64_t kNew = ltc::MERGED_OWN_ADDRESS_DESIRED_VERSION;   // 3601
 
 uint256 add_rule_share(ltc::ShareTracker& t, const uint256& prev, uint64_t n, unsigned miner, uint64_t desired,
                        const Entries& entries)
@@ -948,7 +946,7 @@ TEST(MergedPerShareRule, NoShareTakesAnothersPayout)
     };
     const std::vector<uint64_t> order = {1, 2, 3, 4, 5, 6};
     const auto old_rule = doge_weights(chain, order, 36, 6);
-    const auto per_share = doge_weights(chain, order, kNew, 6);
+    const auto per_share = doge_weights(chain, order, 37, 6);
     // per share: the attacker gets its own share only; miner 7 the rest
     ASSERT_TRUE(per_share.count(attacker));
     ASSERT_TRUE(per_share.count(miner_p2pkh(7)));
@@ -981,15 +979,13 @@ TEST(MergedPerShareRule, AddOrderDoesNotChangeThePayouts)
     const std::vector<uint64_t> x = {1, 2, 3, 4, 5, 6, 7, 8};
     const std::vector<uint64_t> y = {100, 1, 2, 3, 4, 5, 6, 7, 8};   // the fork share before its parent
     const std::vector<uint64_t> z = {8, 7, 6, 5, 4, 3, 2, 1};
-    const auto px = doge_weights(chain, x, kNew, 8);
-    EXPECT_EQ(px, doge_weights(chain, y, kNew, 8));
-    EXPECT_EQ(px, doge_weights(chain, z, kNew, 8));
+    const auto px = doge_weights(chain, x, 37, 8);
+    EXPECT_EQ(px, doge_weights(chain, y, 37, 8));
+    EXPECT_EQ(px, doge_weights(chain, z, 37, 8));
     // entry-less shares 3, 6, 8 pay miner 1's own key; share 1's owner address only share 1
     EXPECT_EQ(px.at(owner) + px.at(owner) + px.at(owner), px.at(miner_p2pkh(1)) - px.at(owner));
     // the old rule: X and Y differ (X registered the owner address first, Y miner 1's own)
     EXPECT_NE(doge_weights(chain, x, 36, 8), doge_weights(chain, y, 36, 8));
-    // 37 (reserved for Work Receipts) is not the per-share rule: the old one
-    EXPECT_NE(doge_weights(chain, x, 37, 8), doge_weights(chain, y, 37, 8));
 }
 
 // The upgrade: a window with shares of both rules. The old shares keep Tier
@@ -1000,7 +996,7 @@ TEST(MergedPerShareRule, OldSharesKeepTheirRuleInAMixedWindow)
     const auto attacker = p2pkh_script(0xbb);
     ltc::ShareTracker a, b;
     uint256 ta, tb;
-    // a: shares 1-4 old (36), 5-6 new (3601); b: the same with every share's
+    // a: shares 1-4 old (36), 5-6 new (37); b: the same with every share's
     // resolution written out (explicit entries), all old.
     struct S { unsigned miner; uint64_t dv; Entries minted; Entries resolved; };
     const std::vector<S> seq = {
@@ -1008,8 +1004,8 @@ TEST(MergedPerShareRule, OldSharesKeepTheirRuleInAMixedWindow)
         {2, 36, {{kDoge, miner_p2pkh(2)}}, {{kDoge, miner_p2pkh(2)}}},
         {7, 36, {}, {{kDoge, attacker}}},               // old: Tier 1.5
         {3, 36, {{kDoge, miner_p2pkh(3)}}, {{kDoge, miner_p2pkh(3)}}},
-        {7, kNew, {}, {{kDoge, miner_p2pkh(7)}}},       // new: its own key
-        {2, kNew, {}, {{kDoge, miner_p2pkh(2)}}},
+        {7, 37, {}, {{kDoge, miner_p2pkh(7)}}},         // new: its own key
+        {2, 37, {}, {{kDoge, miner_p2pkh(2)}}},
     };
     for (size_t i = 0; i < seq.size(); ++i) {
         ta = add_rule_share(a, ta, i + 1, seq[i].miner, seq[i].dv, seq[i].minted);

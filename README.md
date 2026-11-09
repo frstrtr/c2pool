@@ -726,12 +726,10 @@ at once. While the merged chains are still being set up at startup, logins are
 refused with "merged mining not ready yet; retry".
 
 Merged payouts are derived from the sharechain, share by share. Shares made by
-c2pool v0.2.12 and later (V36 format, `desired_version` 3601 — the V36
-subversion 01: a V36 vote everywhere, never a vote for 37, which is reserved
-for Work Receipts; a later 3602–3699 keeps this rule) pay a chain to their own
-merged address for it, else to their own parent key: one share's merged
-address never pays for another share. Older V36 shares (`desired_version` 36:
-earlier c2pool, p2pool) keep the old rule: their own
+c2pool v0.2.12 and later (V36 format, `desired_version` 37 — still a V36 vote)
+pay a chain to their own merged address for it, else to their own parent key:
+one share's merged address never pays for another share. Older V36 shares
+(`desired_version` 36: earlier c2pool, p2pool) keep the old rule: their own
 address (Tier 1); else the first merged address for the chain **this node** has
 seen in a share of the same parent script since it started (Tier 1.5); else the
 parent key. Each share is resolved by its own rule in every window, so shares
@@ -743,10 +741,7 @@ that miner's address-less shares; v0.2.12 shares are immune to both. A node
 that is not upgraded (p2pool, older c2pool) still applies Tier 1.5 to v0.2.12
 shares too, so it can derive different merged payouts for those of them that
 carry no address for a chain (c2pool's own shares always carry one for every
-chain they can); upgrade every node. c2pool counts 3601 as a V36 vote in its
-AutoRatchet, version checks, statistics and dashboard; a p2pool node counts it
-as a V36 vote too, but its status page warns that most shares vote for an
-unknown version (3601). `--solo` / `--custodial` merged payouts do not use per-miner
+chain they can); upgrade every node. `--solo` / `--custodial` merged payouts do not use per-miner
 merged addresses, and `c2pool-btc` (NMC) and `c2pool-dgb` (DOGE) do not carry
 them.
 

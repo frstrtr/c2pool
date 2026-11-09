@@ -7,7 +7,6 @@
 #include <cassert>
 #include <c2pool_build_version.h>
 #endif
-#include <core/share_format_vote.hpp>
 // c2pool-dash — DASH (X11 standalone parent, older-than-v35 -> V36) p2pool node
 // entry point.
 //
@@ -2302,7 +2301,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     for (auto&& [hash, data] : chain.get_chain(best, static_cast<uint64_t>(full_walk))) {
                         if (i == skip_count) sampling_start = hash;
                         data.share.invoke([&](auto* s) {
-                            int dv = static_cast<int>(core::share_format_vote(s->m_desired_version));
+                            int dv = static_cast<int>(s->m_desired_version);
                             desired_counts[dv] += 1;
                             // Wire type: DashShare=16 (public + pre-flip private
                             // chain), DashV36Share=36 (private/isolated v36 chain).

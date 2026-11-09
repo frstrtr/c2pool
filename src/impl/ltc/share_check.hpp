@@ -891,26 +891,17 @@ inline std::vector<unsigned char> normalize_script_for_merged(
     return {};
 }
 
-// The merged payout rule of a V36 share, by its desired_version. v0.2.12
-// nodes make V36 shares with desired_version 3601: a V36 SUBVERSION
-// (core::share_format_vote(3601) == 36, a V36 vote everywhere; 37 is reserved
-// for Work Receipts and never used here).
-//   36 (and anything below 3601): Tier 1 (the share's own merged address for
-//         the chain), else Tier 1.5 (the first explicit merged address this
-//         node has seen for the share's parent script), else the parent script;
-//   3601..3699 (V36 subversions from 3601 on, so a later 3602... keeps it
-//         unless it says otherwise): Tier 1, else the share's own parent
-//         script. No Tier 1.5: one share's merged address never pays for
-//         another share, and every node derives the same payout whatever order
-//         it received the shares in.
-// Shares of either kind are resolved by their own rule in every window, so
+// The merged payout rule of a V36 share, by its desired_version (the share
+// version v0.2.12 nodes produce: V36 format, desired_version 37):
+//   < 37: Tier 1 (the share's own merged address for the chain), else Tier
+//         1.5 (the first explicit merged address this node has seen for the
+//         share's parent script), else the parent script;
+//  >= 37: Tier 1, else the share's own parent script. No Tier 1.5: one share's
+//         merged address never pays for another share, and every node derives
+//         the same payout whatever order it received the shares in.
+// Shares of either version are resolved by their own rule in every window, so
 // the shares already in the window when nodes upgrade keep theirs.
-inline constexpr uint64_t MERGED_OWN_ADDRESS_DESIRED_VERSION = 3601;
-
-inline constexpr bool merged_own_address_rule(uint64_t desired_version)
-{
-    return desired_version >= MERGED_OWN_ADDRESS_DESIRED_VERSION && desired_version < 3700;
-}
+inline constexpr uint64_t MERGED_OWN_ADDRESS_DESIRED_VERSION = 37;
 
 // MERGED: prefix for weight map keys — matches p2pool's 'MERGED:' + hex string.
 // Keeps Tier 1/1.5 (explicit DOGE script) keys separate from raw LTC script keys

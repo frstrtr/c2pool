@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
-#include <core/share_format_vote.hpp>
 
 // Dash share v16 verification: hash_link, merkle, X11 PoW.
 // Simplified from LTC share_check.hpp — no segwit, no merged mining.
@@ -1289,7 +1288,7 @@ inline void verify_version_transition(const DashShare& share, ChainT& chain,
     if (prev_counts.empty())
         return;
     const uint64_t prev_version = prev_counts.begin()->first;
-    const uint64_t this_version = core::share_format_vote(share.m_desired_version);
+    const uint64_t this_version = share.m_desired_version;
 
     // Not a boundary: a share matching its parent's version was valid when it was
     // minted and is always admitted (data.py:382 type(self) is type(previous)).

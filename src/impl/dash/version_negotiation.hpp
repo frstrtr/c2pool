@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
-#include <core/share_format_vote.hpp>
 
 // Dash share-version transition negotiation (older-than-v35 -> v36).
 //
@@ -66,7 +65,7 @@ get_desired_version_counts(ShareChain& chain, const uint256& start_hash, uint64_
         data.share.invoke([&](auto* obj) {
             using S = std::remove_pointer_t<decltype(obj)>;
             if constexpr (dash::is_live_share<S>)   // DashShare, DashV36Share
-                res[core::share_format_vote(obj->m_desired_version)] += 1;
+                res[obj->m_desired_version] += 1;
         });
     }
     return res;
@@ -94,7 +93,7 @@ get_desired_version_weights(ShareChain& chain, const uint256& start_hash, uint64
         data.share.invoke([&](auto* obj) {
             using S = std::remove_pointer_t<decltype(obj)>;
             if constexpr (dash::is_live_share<S>)   // DashShare, DashV36Share
-                res[core::share_format_vote(obj->m_desired_version)] += w;
+                res[obj->m_desired_version] += w;
         });
     }
     return res;

@@ -44,10 +44,6 @@
 #include <gtest/gtest.h>
 
 #include <impl/ltc/auto_ratchet.hpp>
-#include <impl/ltc/share_check.hpp>
-#include <impl/dash/auto_ratchet.hpp>
-#include <impl/dgb/coin/desired_version_tally.hpp>
-#include <core/share_format_vote.hpp>
 #include <impl/ltc/share.hpp>
 #include <impl/ltc/share_tracker.hpp>
 #include <core/uint256.hpp>
@@ -427,106 +423,6 @@ TEST_F(RatchetExplainLine, B_RateLimitedToChangePlusHeartbeat)
     auto tip2 = build_chain(tracker2, spec2, 7);
     const std::string changed = evaluate(ar, tracker2, tip2);
     EXPECT_NE(changed.find("blocked-by=vote-pct"), std::string::npos) << changed;
-}
-
-
-// ---------------------------------------------------------------------------
-// C) The V36 subversion 3601 (the shares c2pool-ltc v0.2.12 makes:
-//    ltc::MERGED_OWN_ADDRESS_DESIRED_VERSION) is a V36 vote and nothing more:
-//    the AutoRatchet over a window of 3601 votes takes exactly the steps it
-//    takes over 36 votes, a window of 100% 3601 never moves it past V36 or
-//    toward 37 (reserved for Work Receipts), and every tally counts it as 36.
-// ---------------------------------------------------------------------------
-
-uint256 build_votes(ltc::ShareTracker& tracker, int32_t count, int32_t old_prefix, uint64_t yes_vote, size_t salt)
-{
-    uint256 prev;
-    uint256 tip;
-    for (int32_t i = 0; i < count; ++i) {
-        char buf[24];
-        std::snprintf(buf, sizeof(buf), "%zx", static_cast<size_t>((salt << 20) + 0x7100 + static_cast<size_t>(i)));
-        const uint256 h = hx(buf);
-        auto* sh = new ltc::MergedMiningShare();
-        sh->m_hash = h;
-        if (i == 0) sh->m_prev_hash.SetNull(); else sh->m_prev_hash = prev;
-        sh->m_desired_version = i >= old_prefix ? yes_vote : static_cast<uint64_t>(TARGET_VERSION - 1);
-        sh->m_bits = 0x1e0ffff0;
-        sh->m_max_bits = 0x1e0ffff0;
-        if (i >= old_prefix)
-            sh->peer_addr = NetService{"203.0.113." + std::to_string(7 + i % 3), 9333};
-        ltc::ShareType st;
-        st = sh;
-        tracker.add(st);
-        prev = h;
-        tip = h;
-    }
-    return tip;
-}
-
-TEST_F(RatchetExplainLine, C_SubversionVotesExactlyLikeV36)
-{
-    struct Spec { int32_t count, old_prefix; };
-    for (const Spec sp : {Spec{120, 0}, Spec{400, 0}, Spec{400, 80}, Spec{400, 30}, Spec{800, 0}}) {
-        ltc::ShareTracker a, b;
-        const auto ta = build_votes(a, sp.count, sp.old_prefix, 36, 3);
-        const auto tb = build_votes(b, sp.count, sp.old_prefix, ltc::MERGED_OWN_ADDRESS_DESIRED_VERSION, 3);
-        AutoRatchet ra("", TARGET_VERSION), rb("", TARGET_VERSION);
-        for (int step = 0; step < 4; ++step) {
-            const auto va = ra.get_share_version(a, ta);
-            const auto vb = rb.get_share_version(b, tb);
-            EXPECT_EQ(va, vb) << sp.count << "/" << sp.old_prefix << " step " << step;
-            EXPECT_EQ(ra.state(), rb.state()) << sp.count << "/" << sp.old_prefix << " step " << step;
-            EXPECT_LE(vb.first, TARGET_VERSION);
-            EXPECT_LE(vb.second, TARGET_VERSION) << "never a vote past V36";
-        }
-    }
-}
-
-TEST_F(RatchetExplainLine, C_FullSubversionWindowStaysV36)
-{
-    // A confirmed V36 network whose every share votes 3601: the ratchet stays
-    // where it is (no deactivation, nothing toward 37).
-    ltc::ShareTracker t;
-    const auto tip = build_votes(t, 800, 0, ltc::MERGED_OWN_ADDRESS_DESIRED_VERSION, 4);
-    AutoRatchet ar("", TARGET_VERSION);
-    std::pair<int64_t, int64_t> v{};
-    for (int step = 0; step < 6; ++step)
-        v = ar.get_share_version(t, tip);
-    EXPECT_NE(ar.state(), RatchetState::VOTING) << "3601 votes activate V36 like 36 votes";
-    EXPECT_EQ(v.first, TARGET_VERSION);
-    EXPECT_EQ(v.second, TARGET_VERSION);
-    const auto before = ar.state();
-    for (int step = 0; step < 6; ++step)
-        v = ar.get_share_version(t, tip);
-    EXPECT_EQ(ar.state(), before);
-}
-
-TEST(LTC_SubversionTally, CountedAsV36Everywhere)
-{
-    static_assert(core::share_format_vote(ltc::MERGED_OWN_ADDRESS_DESIRED_VERSION) == 36);
-    static_assert(ltc::merged_own_address_rule(3601) && ltc::merged_own_address_rule(3602)
-                  && ltc::merged_own_address_rule(3699));
-    static_assert(!ltc::merged_own_address_rule(36) && !ltc::merged_own_address_rule(37)
-                  && !ltc::merged_own_address_rule(3700));
-    ltc::ShareTracker t;
-    const auto tip = build_votes(t, 50, 10, ltc::MERGED_OWN_ADDRESS_DESIRED_VERSION, 5);
-    const auto counts = t.get_desired_version_counts(tip, 50);
-    ASSERT_EQ(counts.size(), 2u);
-    EXPECT_EQ(counts.at(36), 40);
-    EXPECT_EQ(counts.at(35), 10);
-    const auto weights = t.get_desired_version_weights(tip, 50);
-    EXPECT_EQ(weights.size(), 2u);
-    EXPECT_TRUE(weights.count(36) && !weights.count(3601) && !weights.count(37));
-    // the DASH and DGB tallies
-    const auto dw = dash::accumulate_version_weights({{3601, uint288(5)}, {36, uint288(2)}, {16, uint288(1)}});
-    EXPECT_EQ(dw.size(), 2u);
-    EXPECT_EQ(dw.at(36), uint288(7));
-    const auto gw = dgb::accumulate_version_weights({{3601, uint288(5)}, {36, uint288(2)}});
-    EXPECT_EQ(gw.size(), 1u);
-    EXPECT_EQ(gw.at(36), uint288(7));
-    const auto gc = dgb::accumulate_version_counts({3601, 3601, 36, 35});
-    EXPECT_EQ(gc.at(36), 3);
-    EXPECT_EQ(gc.at(35), 1);
 }
 
 } // namespace

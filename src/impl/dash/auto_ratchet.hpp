@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
-#include <core/share_format_vote.hpp>
 
 // DASH v36-native MINT-side auto-ratchet of the P2P accept floor.
 //
@@ -52,7 +51,7 @@ accumulate_version_weights(const std::vector<VersionWork>& window)
 {
     std::map<uint64_t, uint288> res;
     for (const auto& vw : window)
-        res[core::share_format_vote(static_cast<uint64_t>(vw.desired_version))] += vw.work;
+        res[static_cast<uint64_t>(vw.desired_version)] += vw.work;
     return res;
 }
 
@@ -65,7 +64,7 @@ accumulate_version_counts(const std::vector<VersionWork>& window)
 {
     std::map<uint64_t, uint288> res;
     for (const auto& vw : window)
-        res[core::share_format_vote(static_cast<uint64_t>(vw.desired_version))] += uint288(1);
+        res[static_cast<uint64_t>(vw.desired_version)] += uint288(1);
     return res;
 }
 
