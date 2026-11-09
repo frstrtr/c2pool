@@ -213,6 +213,17 @@ if (BUILD_TESTING AND GTest_FOUND)
     # CAuxPow::check, a root or chain that is not known fails closed, and the
     # one-chain (DOGE) bytes are pinned to the pre-fix path. Same folding rule.
     #
+    # merged_aux_hardening_test.cpp: several aux chains under one parent: each
+    # chain's createauxblock address is of its own chain and network; a hung,
+    # failing or slow aux daemon drops out of that round's commitment (the
+    # smallest tree over the chains left, as a V36 peer checks it) while the
+    # others keep committing, with no lock held over the network; AuxChainRPC
+    # deadlines, reconnect and backoff against a socket; the daemon's
+    # submitblock answer is kept and a non-DOGE find follows its chain; each
+    # chain's own block size limit; one slow or throwing submit neither delays
+    # nor aborts the others; the chain merkle tree height is capped. Same
+    # folding rule.
+    #
     # merged_rebuild_payouts_test.cpp: the merged work is always buildable: a
     # rebuild without payouts never commits to the parent's hash (keeps the
     # last block on the same parent, else no commitment), a stale rebuild is
@@ -404,6 +415,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         mempool_bip68_test.cpp
         mempool_final_tx_test.cpp
         mempool_mweb_admission_test.cpp
+        merged_aux_hardening_test.cpp
         merged_found_record_test.cpp
         merged_multi_aux_test.cpp
         merged_rebuild_payouts_test.cpp

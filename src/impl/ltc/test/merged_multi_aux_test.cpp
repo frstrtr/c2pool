@@ -384,8 +384,10 @@ TEST(MergedMultiAux, StaleJobUsesTheCommittedSnapshotOfEachChain)
 
 // A chain with no block in the job's commitment (no payouts when it was
 // built; it has older blocks frozen, so the find gets as far as the lookup):
-// the chain that has a block still gets a valid proof over the empty slot,
-// the other is refused and counted.
+// the round commits to the chain that has a block alone, in the smallest tree
+// that holds it (size 1: the root is its block hash, as a V36 peer expects
+// from a share carrying that chain only); it gets a valid proof, the other is
+// refused and counted.
 TEST(MergedMultiAux, ChainMissingFromTheCommitmentIsRefusedTheOtherSubmits)
 {
     Rig r({{"DOGE", 98}, {"NMC", 1}});
@@ -407,6 +409,11 @@ TEST(MergedMultiAux, ChainMissingFromTheCommitmentIsRefusedTheOtherSubmits)
     r.mm.refresh_aux_work();
     const auto commitment = r.mm.get_auxpow_commitment();
     ASSERT_EQ(commitment.size(), 44u);
+    EXPECT_EQ(commitment[36], 1u) << "the tree of DOGE alone";
+    EXPECT_EQ(r.root(), r.mm.get_current_work().at(98).block_hash);
+    const auto infos = r.mm.get_cached_header_infos_and_commitment().first;
+    ASSERT_EQ(infos.size(), 1u) << "the shares carry DOGE's header info only";
+    EXPECT_EQ(infos[0].chain_id, 98u);
     submit_share(r.mm, commitment);
 
     ASSERT_EQ(r.chain(0).blocks.size(), 1u) << "the chain in the commitment submits";
@@ -414,7 +421,8 @@ TEST(MergedMultiAux, ChainMissingFromTheCommitmentIsRefusedTheOtherSubmits)
     const auto doge = parse_block(r.chain(0).blocks[0]);
     const auto why = core_check(doge, 98);
     EXPECT_FALSE(why.has_value()) << why.value_or("");
-    EXPECT_EQ(doge.aux.m_chain_merkle_link.m_branch[0], uint256()) << "the empty slot is the sibling";
+    EXPECT_TRUE(doge.aux.m_chain_merkle_link.m_branch.empty()) << "a tree of one: no branch";
+    EXPECT_EQ(doge.aux.m_chain_merkle_link.m_index, 0u);
     EXPECT_EQ(r.mm.get_block_refusals_json().value("NMC:not_committed", 0), 1);
 }
 

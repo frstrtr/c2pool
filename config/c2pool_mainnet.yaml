@@ -72,6 +72,11 @@ donation_percentage: 0.1       # Developer donation % (default: 0.1%)
 # node_owner_address: ""       # Node owner payout address (LTC)
 # node_owner_merged_address: "" # Explicit merged chain (DOGE) payout address for node fee
 #                               # If not set, auto-converts from LTC address (same hash160)
+# merged_payout_addresses:       # Address each aux daemon's createauxblock gets (the merged
+#   PEP: "P..."                  # coinbase itself pays PPLNS). Required for every aux chain
+#                               # with an RPC daemon except DOGE; an address of another chain
+#                               # or network disables that chain at startup.
+#                               # CLI: --merged-payout-address SYMBOL:ADDRESS
 # redistribute: pplns           # Redistribution mode: pplns, fee, boost, donate
 
 # ─── Stratum per-connection vardiff tuning ───────────────────────────────────

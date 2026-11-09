@@ -11,6 +11,7 @@
 #include <iostream>
 #include <fstream>
 #include <string>
+#include <cctype>
 #include <map>
 #include <set>
 #include <atomic>
@@ -274,6 +275,8 @@ static void segfault_handler(int sig) {
 
 // Integrated merged mining
 #include <c2pool/merged/merged_mining.hpp>
+#include <c2pool/merged/aux_chain_params.hpp>
+#include <c2pool/merged/aux_found_verdict.hpp>
 #include <c2pool/merged/payout_source.hpp>
 #include <c2pool/merged/coin_broadcaster.hpp>
 #include <impl/ltc/coin/mweb_fetch_retry.hpp>
@@ -574,7 +577,14 @@ void print_help() {
     std::cout << "MERGED MINING (c2pool spec format — alternative):\n";
     std::cout << "  --merged SPEC             SYMBOL:CHAIN_ID:HOST:PORT:USER:PASS[:P2P_PORT]\n";
     std::cout << "                            Example: DOGE:98:192.168.86.29:22555:user:pass\n";
-    std::cout << "                            Can be specified multiple times\n\n";
+    std::cout << "                            Can be specified multiple times\n";
+    std::cout << "  --merged-payout-address SYMBOL:ADDRESS\n";
+    std::cout << "                            Address of that chain given to its daemon's createauxblock\n";
+    std::cout << "                            (the merged coinbase itself pays PPLNS). Required for every\n";
+    std::cout << "                            aux chain with an RPC daemon except DOGE (built-in); checked\n";
+    std::cout << "                            against the chain's own address versions, and a chain without\n";
+    std::cout << "                            a valid one is not mined.\n";
+    std::cout << "                            Can be specified multiple times (YAML: merged_payout_addresses)\n\n";
 
     std::cout << "NETWORK TUNING (accepted for p2pool compatibility):\n";
     std::cout << "  --max-conns N             Max outgoing P2P connections\n";
@@ -956,6 +966,10 @@ int main(int argc, char* argv[]) {
     // p2pool-style: --merged-coind-address, --merged-coind-rpc-port, etc.
     // c2pool-style: --merged SYMBOL:CHAIN_ID:HOST:PORT:USER:PASS[:P2P_PORT]
     std::vector<std::string> merged_chain_specs;
+    // --merged-payout-address SYMBOL:ADDRESS: the address each aux chain's
+    // createauxblock gets (its PPLNS coinbase is c2pool's own; the daemon
+    // only needs an address of its chain). Keyed by upper-case symbol.
+    std::map<std::string, std::string> merged_payout_addresses;
     // p2pool-style merged chain flags (assembled into spec at the end)
     std::string merged_coind_address;
     int         merged_coind_rpc_port = 0;
@@ -1510,6 +1524,18 @@ int main(int argc, char* argv[]) {
             merged_chain_specs.push_back(argv[++i]);
             cli_explicit.insert("merged");
         }
+        else if (arg == "--merged-payout-address" && i + 1 < argc) {
+            const std::string v = argv[++i];
+            const auto colon = v.find(':');
+            if (colon == std::string::npos || colon == 0 || colon + 1 == v.size()) {
+                std::cerr << "--merged-payout-address expects SYMBOL:ADDRESS, got: " << v << std::endl;
+                return 1;
+            }
+            std::string sym = v.substr(0, colon);
+            for (auto& c : sym) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+            merged_payout_addresses[sym] = v.substr(colon + 1);
+            cli_explicit.insert("merged_payout_addresses");
+        }
         // p2pool-style merged chain flags
         else if (arg == "--merged-coind-address" && i + 1 < argc) {
             merged_coind_address = argv[++i];
@@ -1802,6 +1828,15 @@ int main(int argc, char* argv[]) {
             if (!cli_explicit.count("merged") && cfg["merged"] && cfg["merged"].IsSequence()) {
                 for (const auto& item : cfg["merged"])
                     merged_chain_specs.push_back(item.as<std::string>());
+            }
+            // merged_payout_addresses: {PEP: <address>, ...} (CLI replaces)
+            if (!cli_explicit.count("merged_payout_addresses") && cfg["merged_payout_addresses"]
+                && cfg["merged_payout_addresses"].IsMap()) {
+                for (const auto& kv : cfg["merged_payout_addresses"]) {
+                    std::string sym = kv.first.as<std::string>();
+                    for (auto& c : sym) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                    merged_payout_addresses[sym] = kv.second.as<std::string>();
+                }
             }
 
             // Embedded SPV checkpoints
@@ -7714,25 +7749,50 @@ int main(int argc, char* argv[]) {
                     if (parts.size() >= 6) cfg.rpc_userpass = parts[4] + ":" + parts[5];
                     cfg.multiaddress = true;  // V36: canonical PPLNS coinbase for merged chains
 
-                    // Fallback payout address for createauxblock RPC.
-                    // Used when no per-miner address is available for a chain.
-                    // PPLNS payouts override this in multiaddress mode.
-                    if (cfg.symbol == "DOGE" && settings->m_testnet)
-                        cfg.aux_payout_address = "nUCAGGgZEPN1QyknmQe1oAku817bQAFKFt";
-                    else if (cfg.symbol == "DOGE")
-                        cfg.aux_payout_address = "DDogepartyxxxxxxxxxxxxxxxxxxw1dfzr";
-                    else if (cfg.symbol == "PEP")
-                        cfg.aux_payout_address = "PSimbaxxxxxxxxxxxxxxxxxxxxUMbTDw";
-                    else if (cfg.symbol == "BELLS")
-                        cfg.aux_payout_address = solo_address;  // no well-known burn; use operator address
-                    else if (cfg.symbol == "LKY")
-                        cfg.aux_payout_address = solo_address;
-                    else if (cfg.symbol == "JKC")
-                        cfg.aux_payout_address = solo_address;
-                    else if (cfg.symbol == "SHIC")
-                        cfg.aux_payout_address = solo_address;
-                    else if (cfg.symbol == "DINGO")
-                        cfg.aux_payout_address = solo_address;
+                    // The address createauxblock gets: the operator's
+                    // (--merged-payout-address), else the built-in one (DOGE
+                    // only), checked against the chain's own address versions
+                    // (aux_chain_params.hpp). The daemon refuses an address
+                    // of another chain or network (-8 / -5 "Invalid coinbase
+                    // payout address") and the chain would never get work, so
+                    // a chain without a valid one is not registered.
+                    // multiaddress mode: the PPLNS coinbase is c2pool's own;
+                    // this address is never paid.
+                    {
+                        std::string sym_up = cfg.symbol;
+                        for (auto& c : sym_up) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                        const auto ov = merged_payout_addresses.find(sym_up);
+                        const auto pa = c2pool::merged::resolve_aux_payout_address(
+                            cfg.symbol,
+                            settings->m_testnet ? c2pool::merged::AuxNetwork::testnet
+                                                : c2pool::merged::AuxNetwork::mainnet,
+                            ov != merged_payout_addresses.end() ? ov->second : std::string());
+                        // An embedded backend (DOGE, NMC) builds its own work and
+                        // never calls createauxblock: without an RPC daemon for the
+                        // chain no address is needed. A configured address that is
+                        // not the chain's is an error either way.
+                        const bool talks_rpc = cfg.rpc_port > 0 && !cfg.rpc_userpass.empty();
+                        if (!pa.ok && (talks_rpc || !pa.address.empty())) {
+                            const std::string msg = "merged chain " + cfg.symbol + " (chain_id "
+                                + std::to_string(cfg.chain_id) + ") DISABLED: " + pa.error;
+                            LOG_ERROR << "[MM:" << cfg.symbol << "] " << msg;
+                            std::cerr << "c2pool: " << msg << std::endl;
+                            continue;
+                        }
+                        if (pa.ok)
+                            cfg.aux_payout_address = pa.address;
+                        if (const auto* cp = c2pool::merged::find_aux_chain_params(cfg.symbol)) {
+                            const auto& v = settings->m_testnet ? cp->test : cp->main;
+                            if (!v.p2pkh.empty()) cfg.address_version = v.p2pkh.front();
+                            if (!v.p2sh.empty()) cfg.p2sh_version = v.p2sh.front();
+                        }
+                        if (pa.ok)
+                            LOG_INFO << "[MM:" << cfg.symbol << "] createauxblock payout address " << pa.address
+                                     << " (" << pa.source << ")";
+                        else
+                            LOG_INFO << "[MM:" << cfg.symbol << "] no RPC daemon: the embedded backend needs no "
+                                        "createauxblock payout address";
+                    }
 
                     // P2P port: explicit (7th field) or auto-detected from symbol
                     if (parts.size() >= 7 && !parts[6].empty()) {
@@ -9796,11 +9856,32 @@ int main(int argc, char* argv[]) {
                         web_server.trigger_work_refresh_debounced();
                     });
 
-                    // Wire DOGE block verifier.
-                    // Note: the aux block hash from createauxblock is NOT the chain
-                    // block hash. After submitauxblock, the actual block gets a
-                    // different hash (includes AuxPoW proof). We verify by checking
-                    // if the daemon's best block height >= our block height.
+                    // Wire the merged found-block verifiers: our block against
+                    // the aux chain's best chain at the height it was mined at
+                    // (aux_verdict). DOGE and NMC read their embedded header
+                    // chains when present; any other chain its daemon's best
+                    // chain (getblockcount / getblockhash / getblockheader):
+                    // a daemon that merely answers is not a confirmation, and
+                    // a block it took as "inconclusive" is confirmed only if
+                    // its chain ends up with it.
+                    auto header_view = [](const auto* hc) {
+                        ltc::coin::found_block::ChainView view;
+                        view.height_of = [hc](const uint256& hh) -> std::optional<uint32_t> {
+                            auto e = hc->get_header(hh);
+                            if (!e)
+                                return std::nullopt;
+                            return e->height;
+                        };
+                        view.hash_at = [hc](uint32_t hh) -> std::optional<uint256> {
+                            auto e = hc->get_header_by_height(hh);
+                            if (!e)
+                                return std::nullopt;
+                            return e->block_hash;
+                        };
+                        view.tip_height = [hc]() { return hc->height(); };
+                        view.has_tip = [hc]() { return hc->tip().has_value(); };
+                        return view;
+                    };
                     for (auto& chain : merged_chain_specs) {
                         auto parts_check = std::vector<std::string>();
                         { std::istringstream ss(chain); std::string t;
@@ -9810,44 +9891,23 @@ int main(int argc, char* argv[]) {
                             uint32_t cid = static_cast<uint32_t>(std::stoul(parts_check[1]));
                             auto* rpc_backend = mm_manager->get_chain_rpc(cid);
                             if (rpc_backend) {
+                                std::optional<ltc::coin::found_block::ChainView> embedded_view;
+                                if (cid == 98 && doge_chain)
+                                    embedded_view = header_view(doge_chain.get());
+                                else if (cid == 1 && nmc_chain)
+                                    embedded_view = header_view(nmc_chain.get());
                                 mi_ptr->add_chain_verify_fn(sym,
-                                    [rpc_backend, mi_ptr, dc = (cid == 98 ? doge_chain.get() : nullptr)](
-                                        const std::string& hash_hex) -> int {
-                                        ltc::coin::found_block::ChainView view;
-                                        view.height_of = [dc](const uint256& hh) -> std::optional<uint32_t> {
-                                            if (!dc)
-                                                return std::nullopt;
-                                            auto e = dc->get_header(hh);
-                                            if (!e)
-                                                return std::nullopt;
-                                            return e->height;
-                                        };
-                                        view.hash_at = [dc](uint32_t hh) -> std::optional<uint256> {
-                                            if (!dc)
-                                                return std::nullopt;
-                                            auto e = dc->get_header_by_height(hh);
-                                            if (!e)
-                                                return std::nullopt;
-                                            return e->block_hash;
-                                        };
-                                        view.tip_height = [dc]() { return dc ? dc->height() : 0u; };
-                                        view.has_tip = [dc]() { return dc && dc->tip().has_value(); };
-                                        if (!dc) {
-                                            // No embedded header chain for this aux chain
-                                            // (not DOGE): the backend being alive is all
-                                            // there is to go on, as before.
-                                            try {
-                                                return rpc_backend->get_best_block_hash().empty() ? 0 : 1;
-                                            } catch (...) {
-                                                return 0; // unreachable — can't verify
-                                            }
-                                        }
-                                        // DOGE: our block against the DOGE best chain at
-                                        // the height it was mined at.
+                                    [rpc_backend, mi_ptr, embedded_view](const std::string& hash_hex) -> int {
                                         uint256 h;
                                         h.SetHex(hash_hex);
-                                        return ltc::coin::found_block::aux_verdict(
-                                            view, h, found_block_height(*mi_ptr, hash_hex));
+                                        const auto found_height = found_block_height(*mi_ptr, hash_hex);
+                                        if (embedded_view)
+                                            return ltc::coin::found_block::aux_verdict(*embedded_view, h, found_height);
+                                        try {
+                                            return c2pool::merged::aux_backend_verdict(*rpc_backend, h, found_height);
+                                        } catch (...) {
+                                            return 0;  // cannot tell: pending
+                                        }
                                     });
                             }
                         }

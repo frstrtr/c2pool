@@ -2,6 +2,7 @@
 #pragma once
 
 #include <algorithm>
+#include <chrono>
 #include <string>
 #include <vector>
 #include <map>
@@ -9,6 +10,7 @@
 #include <mutex>
 #include <atomic>
 #include <functional>
+#include <optional>
 #include <cstdint>
 
 #include <core/uint256.hpp>
@@ -39,7 +41,58 @@ struct AuxChainConfig
     // P2P broadcaster (optional — for fast block relay to merged daemon)
     uint16_t    p2p_port{0};         // 0 = disabled; e.g. 22556 for DOGE
     std::string p2p_address;         // defaults to rpc_host if empty
+
+    // RPC client (AuxChainRPC) limits. A daemon that accepts the connection
+    // and never answers costs at most connect + rpc timeout per call, and the
+    // reconnect after a failure backs off (1 s doubling, at most
+    // rpc_reconnect_max_ms) so a dead daemon is probed, not hammered.
+    uint32_t    rpc_connect_timeout_ms{3'000};
+    uint32_t    rpc_timeout_ms{10'000};
+    uint32_t    rpc_reconnect_max_ms{10'000};
+
+    // Largest block the chain's CheckBlock accepts (bad-blk-length), AuxPoW
+    // included; 0 = the chain id's own (aux_chain_max_block_bytes).
+    uint32_t    max_block_bytes{0};
 };
+
+// ─── What a daemon answered to submitblock ───────────────────────────────────
+// BIP22 as Dogecoin Core 1.14 (and its forks: PepeCoin Core) implements it in
+// rpc/mining.cpp submitblock: a null result is a block connected to the best
+// chain; "duplicate" a block the daemon already has fully validated;
+// "inconclusive" a block stored but not connected (a side branch: it lost the
+// race, or may still win it); "duplicate-inconclusive" the same for a block
+// whose header was known; "duplicate-invalid" and any other string a
+// rejection with that reason; a JSON-RPC error (decode failure, transport) an
+// error. Only accepted and duplicate are a win at submit time; an
+// inconclusive block is held by the daemon and decided by its chain.
+struct SubmitVerdict
+{
+    enum class Kind { accepted, duplicate, inconclusive, rejected, error };
+    Kind        kind{Kind::error};
+    std::string reason;   // the daemon's string, or the error
+
+    bool accepted() const { return kind == Kind::accepted || kind == Kind::duplicate; }
+    // The daemon holds the block (accepted, duplicate or inconclusive): its
+    // chain decides whether it is in the best chain.
+    bool held() const { return accepted() || kind == Kind::inconclusive; }
+    // "accepted", "duplicate", "inconclusive", "rejected: <reason>", "error: <reason>".
+    std::string label() const;
+
+    static SubmitVerdict of(Kind k, std::string why = {}) { return {k, std::move(why)}; }
+};
+
+/// Maps a submitblock result (the JSON-RPC "result") to a verdict, as above.
+SubmitVerdict classify_submitblock_result(const nlohmann::json& result);
+
+/// The largest serialized block (header with AuxPoW, txs) the chain with this
+/// AuxPoW chain id accepts, from its CheckBlock; 0 when not known (no guard).
+uint32_t aux_chain_max_block_bytes(uint32_t chain_id);
+
+/// The config's max_block_bytes, else aux_chain_max_block_bytes(chain_id).
+inline uint32_t aux_chain_max_block_bytes(const AuxChainConfig& cfg)
+{
+    return cfg.max_block_bytes ? cfg.max_block_bytes : aux_chain_max_block_bytes(cfg.chain_id);
+}
 
 // ─── Cached work from an auxiliary chain daemon ───────────────────────────────
 struct AuxWork
@@ -63,7 +116,14 @@ struct AuxPowTree
     uint32_t                        size{0};    // tree size (power of 2)
     std::map<uint32_t, uint32_t>    slot_map;   // chain_id → slot_index
 
-    // Build from a set of chain_ids
+    // The tallest tree built. CAuxPow::check allows a branch of 30, but the
+    // tree is materialized leaf by leaf (compute_root): 2^30 leaves would be
+    // 32 GB. Every chain set in the merged chain table fits in height 5; ids
+    // that collide up to this height are a configuration error.
+    static constexpr unsigned kMaxHeight = 12;   // 4096 slots
+
+    // Build from a set of chain_ids. size 0 (no tree) when the ids cannot be
+    // given distinct slots within kMaxHeight.
     static AuxPowTree build(const std::vector<uint32_t>& chain_ids);
 
     // Compute the merkle root from per-slot hashes (empty slots = uint256{})
@@ -149,9 +209,36 @@ public:
     // a backend that builds its own template keeps the block's sigops within
     // the chain's limit with this reserved.
     virtual void set_block_sigop_reserve(uint32_t /*sigops*/) {}
+
+    // submit_block with the daemon's answer kept (SubmitVerdict). A backend
+    // that only knows yes/no: accepted or rejected.
+    virtual SubmitVerdict submit_block_verdict(const std::string& block_hex)
+    {
+        return submit_block(block_hex) ? SubmitVerdict::of(SubmitVerdict::Kind::accepted)
+                                       : SubmitVerdict::of(SubmitVerdict::Kind::rejected, "rejected");
+    }
+
+    // The backend's best chain, for found-block verdicts (aux_backend_verdict):
+    // its height, the block at a height, a known block's height. nullopt when
+    // the backend cannot tell (not supported, or no answer).
+    virtual std::optional<uint32_t> get_block_count() { return std::nullopt; }
+    virtual std::optional<uint256> get_block_hash_at(uint32_t /*height*/) { return std::nullopt; }
+    virtual std::optional<uint32_t> get_block_height(const uint256& /*hash*/) { return std::nullopt; }
+
+    // Make a call blocked on the network return now, and every later one
+    // fail at once (shutdown).
+    virtual void cancel_io() {}
 };
 
 // ─── RPC client for one auxiliary chain daemon ───────────────────────────────
+// One HTTP keep-alive connection, used by one call at a time (calls from
+// several threads are serialized). Every network step has a deadline
+// (AuxChainConfig::rpc_connect_timeout_ms / rpc_timeout_ms), run on the
+// client's own io_context by the calling thread. A connection the daemon
+// closed (restart, or its idle timeout: bitcoind's -rpcservertimeout, 30 s)
+// is replaced on the next call, which is sent again once on the fresh
+// connection; after a failed connect or a timeout the client waits before
+// connecting again (1 s, doubling, at most rpc_reconnect_max_ms).
 class AuxChainRPC : public IAuxChainBackend, public jsonrpccxx::IClientConnector
 {
 public:
@@ -162,24 +249,44 @@ public:
     AuxWork get_work_template() override;
     AuxWork create_aux_block(const std::string& address) override;
     bool submit_block(const std::string& block_hex) override;
+    SubmitVerdict submit_block_verdict(const std::string& block_hex) override;
     bool submit_aux_block(const uint256& block_hash, const std::string& auxpow_hex) override;
     std::string get_block_hex(const std::string& block_hash) override;
     std::string get_best_block_hash() override;
     std::vector<NetService> getpeerinfo() override;
+    std::optional<uint32_t> get_block_count() override;
+    std::optional<uint256> get_block_hash_at(uint32_t height) override;
+    std::optional<uint32_t> get_block_height(const uint256& hash) override;
+    void cancel_io() override;
     const AuxChainConfig& config() const override { return m_config; }
+
+    bool connected() const;
+    // Connections opened so far (the first included).
+    uint64_t connects() const { return m_connects.load(std::memory_order_relaxed); }
 
 private:
     std::string Send(const std::string& request) override;
     nlohmann::json call(const std::string& method,
                         const nlohmann::json& params = nlohmann::json::array());
+    // With m_io_mutex held.
+    void open_locked();
+    void close_locked();
+    void note_failure_locked();
+    std::string exchange_locked(const std::string& request, bool& stale_connection);
 
     AuxChainConfig m_config;
-    boost::asio::io_context& m_ioc;
-    boost::beast::tcp_stream m_stream;
+    boost::asio::io_context m_io;   // run only by the calling thread, m_io_mutex held
+    std::unique_ptr<boost::beast::tcp_stream> m_stream;
     boost::asio::ip::tcp::resolver m_resolver;
     boost::beast::http::request<boost::beast::http::string_body> m_http_request;
     jsonrpccxx::JsonRpcClient m_client;
-    bool m_connected{false};
+    mutable std::mutex m_io_mutex;
+    std::atomic<bool> m_connected{false};
+    bool m_used{false};              // the connection has answered a request
+    std::chrono::steady_clock::time_point m_next_connect{};
+    std::chrono::milliseconds m_backoff{0};
+    std::atomic<bool> m_cancelled{false};
+    std::atomic<uint64_t> m_connects{0};
 };
 
 // ─── Discovered merged block record ──────────────────────────────────────────
@@ -191,7 +298,8 @@ struct DiscoveredMergedBlock
     std::string block_hash;       // aux block hash
     std::string parent_hash;      // parent (LTC) block hash
     int64_t     timestamp{0};     // unix epoch seconds
-    bool        accepted{true};   // RPC returned success
+    bool        accepted{true};   // the daemon took it: submitblock null or "duplicate"
+    std::string verdict;          // SubmitVerdict::label() ("accepted", "inconclusive", "rejected: ...")
     uint64_t    coinbase_value{0}; // aux block reward in satoshis
     bool        is_local{false};  // true = our own submission, false = detected from peer share
     uint32_t    parent_height{0}; // parent (LTC) block height (absheight)
@@ -343,6 +451,8 @@ public:
         uint256     target;             // current aux chain target (for peer block detection)
         std::string block_hash;         // current aux block hash hex
         int64_t     last_update_age_s{0}; // seconds since last successful work refresh
+        bool        responsive{true};   // answered the last poll (else out of the commitment)
+        std::string unresponsive_why;   // the last failure, when not responsive
     };
     std::vector<ChainInfo> get_chain_infos() const;
 
@@ -380,6 +490,10 @@ public:
     /// Callback when a merged block is found:
     /// (symbol, height, block_hash, accepted, coinbase_value = aux block reward in satoshis)
     /// Used by MiningInterface to record in FoundBlock list for unified verification.
+    /// accepted: the daemon holds the block (SubmitVerdict::held: accepted,
+    /// duplicate or inconclusive), so its chain decides it; false for a
+    /// rejection or an error. Called on the thread that called
+    /// try_submit_merged_blocks.
     using MergedBlockFoundFn = std::function<void(const std::string& symbol, int height,
                                                    const std::string& block_hash, bool accepted,
                                                    uint64_t coinbase_value)>;
@@ -395,6 +509,13 @@ public:
     /// fetched when its tip changed, and again on every poll while the last
     /// one came back degraded (core::coin::kTemplateDegradedKey).
     void refresh_aux_work();
+
+    /// How long a poll waits for the chains' answers before it builds the
+    /// commitment without the ones still out (default 2 s). With more than one
+    /// chain, a chain whose fetch fails or misses this drops out of the
+    /// commitment until it answers; its answer, when it comes, is applied
+    /// then. The chains are fetched in parallel, without m_mutex held.
+    void set_refresh_round_deadline(std::chrono::milliseconds d);
 
     /// Read-only view of an aux chain's current block template (symbol,
     /// case-insensitive), for local cross-checks: prev, height, bits,
@@ -487,6 +608,20 @@ private:
 
     // Registered aux chains
     struct ChainState {
+        // Calls into this chain's backends, one at a time: a poll's fetch
+        // and a find's submit run without m_mutex and take this instead.
+        struct ChainIo {
+            std::timed_mutex  mutex;
+            std::atomic<bool> in_flight{false};   // a fetch of this chain is running
+            int64_t           last_sync_log_ns{0};   // rate limits, under mutex
+            int64_t           last_warn_ns{0};
+        };
+        std::shared_ptr<ChainIo>             io = std::make_shared<ChainIo>();
+        // Answered its last fetch in time. With more than one chain, a chain
+        // that did not is left out of the commitment until it answers.
+        bool                                 responsive{true};
+        std::string                          unresponsive_why;
+        uint64_t                             dropouts{0};
         // A run of rebuilds that got no payouts for this chain (logged once).
         bool                                 no_payout_episode{false};
         int64_t                              no_payout_since{0};      // steady seconds
@@ -536,6 +671,24 @@ private:
     std::vector<ChainState> m_chains;
     uint64_t m_frozen_seq{0};  // FrozenSnapshot::seq source (under m_mutex)
 
+    // ── Fetching and submitting without m_mutex ──
+    // A poll snapshots each chain under m_mutex, fetches outside it on
+    // m_io_pool (one task per chain, under the chain's io lock), and applies
+    // each answer under m_mutex. A find assembles its blocks under m_mutex
+    // and submits them outside it, each chain on its own thread.
+    struct FetchInput;
+    struct FetchResult;
+    struct SubmitJob;
+    static FetchResult fetch_chain(const FetchInput& in);
+    // With m_mutex held. True when what the commitment is built from changed.
+    bool apply_fetch_locked(size_t index, FetchResult& r);
+    void run_submit_jobs(std::vector<SubmitJob>& jobs, const std::string& parent_hash_hex);
+    boost::asio::thread_pool& io_pool();   // with m_mutex held (sized from m_chains)
+    std::unique_ptr<boost::asio::thread_pool> m_io_pool;
+    std::mutex m_io_pool_mutex;
+    std::chrono::milliseconds m_refresh_deadline{2'000};
+    std::atomic<bool> m_work_dirty{false};   // an answer changed the work since the last rebuild
+
     // Submit via submitauxblock and relay the accepted block via P2P
     void submit_aux_and_relay(ChainState& chain, const std::string& auxpow,
                               const std::string& parent_hash_hex = "");
@@ -550,6 +703,7 @@ private:
     // built from (remember_committed_root_locked), keyed by the root. Unused
     // with one chain, where the root is the chain's block hash.
     struct CommittedRoot {
+        std::map<uint32_t, uint32_t> slots;       // chain id -> slot
         std::map<uint32_t, uint256> slot_hashes;  // slot -> committed block hash
         uint32_t tree_size{0};
         int64_t  timestamp{0};   // same clock as FrozenSnapshot::timestamp
@@ -559,7 +713,7 @@ private:
     // Commitments per chain can move independently: room for every chain's
     // frozen window.
     static constexpr size_t kMaxCommittedRoots = 256;
-    void remember_committed_root_locked(const uint256& root,
+    void remember_committed_root_locked(const uint256& root, const AuxPowTree& tree,
                                         const std::map<uint32_t, uint256>& slot_hashes,
                                         int64_t now);
 
@@ -623,7 +777,7 @@ private:
     // The block a share actually committed to: its hash, height and coinbase
     // value from the frozen snapshot the block was built from (a stale job's
     // is not the current work).
-    void record_discovered_block(const ChainState& chain, bool accepted,
+    void record_discovered_block(const ChainState& chain, const SubmitVerdict& verdict,
                                  const std::string& parent_hash, const uint256& block_hash,
                                  int height, uint64_t coinbase_value);
 
