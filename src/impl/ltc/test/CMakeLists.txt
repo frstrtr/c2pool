@@ -363,6 +363,12 @@ if (BUILD_TESTING AND GTest_FOUND)
     # cannot load it, peers below protocol 3601, and the AuxPoW commitment
     # rule enforced for 3601 shares only. Same folding rule.
     #
+    # share_v3601_rewrap_test.cpp: a share re-wrapped under the other type
+    # number (36 <-> 3601; the hash does not commit to it) is dropped by the
+    # share handlers before the tracker, in both directions; a duplicate copy
+    # never replaces the relay bytes of the held share; LevelDB loads use the
+    # same check. Real NodeImpl phase 2. Same folding rule.
+    #
     # best_share_hash_lock_test.cpp: NodeImpl::best_share_hash() reads the
     # tracker under the reader discipline (direct on the compute thread, a
     # shared try-lock elsewhere, the published verified best while busy, the
@@ -444,6 +450,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         share_remove_owns_data_test.cpp
         share_test.cpp
         share_v3601_flag_day_test.cpp
+        share_v3601_rewrap_test.cpp
         template_gap_gate_test.cpp
         template_hogex_survives_truncation_test.cpp
         template_mweb_ext_merge_test.cpp

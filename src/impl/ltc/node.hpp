@@ -184,11 +184,28 @@ private:
     std::map<std::string, clock::time_point> m_until;
 };
 
+// A share received from a peer (or read back from LevelDB) whose type number
+// does not fit its own timestamp (share_check.hpp flag_day_problem, without
+// the parent): a type below 3601 at or after the flag day, or a 3601 share
+// before it. "" when it fits. Neither the share hash nor its coinbase
+// commits to the type number, so such a share may be an honest share
+// re-wrapped under the other number: it must never reach the tracker, whose
+// dedup by hash would keep the bad copy (it fails the share check and then
+// takes the honest children with it), nor the relay cache. The share
+// handlers drop it and disconnect the sender: a peer below 3601 past the
+// flag day is too old (drop_pre_3601_peer); one sending 3601 shares before
+// it is broken or hostile. Never a ban.
+inline std::string received_share_flag_day_problem(ShareType& share)
+{
+    std::string why;
+    share.invoke([&](auto* obj) {
+        why = flag_day_problem(std::remove_pointer_t<decltype(obj)>::version, obj->m_timestamp, std::nullopt);
+    });
+    return why;
+}
+
 // A share of a version below 3601 whose timestamp is at or after the flag
-// day: invalid on every node (share_check.hpp flag_day_problem). From a peer
-// it means the peer is too old: the share handlers drop it (never into the
-// tracker, so it never counts against the peer as an unverifiable share) and
-// disconnect the peer (drop_pre_3601_peer).
+// day (the sender is a node too old for share version 3601).
 inline bool pre_3601_share_past_flag_day(ShareType& share)
 {
     bool r = false;
@@ -699,6 +716,17 @@ public:
     // (ip:port) for an hour; the WARNING is once an hour per IP
     // (Pre3601WarnLimiter).
     void drop_pre_3601_peer(const NetService& addr, const std::string& line);
+    // The share handlers: drop a received share whose type number does not
+    // fit its timestamp (received_share_flag_day_problem). Returns true when
+    // it was dropped (destroyed); `drop_peer` then names why the sender is
+    // to be disconnected, once the batch is handled (drop_misfit_sender).
+    bool drop_misfit_share(ShareType& share, std::string& drop_peer);
+    void drop_misfit_sender(const peer_ptr& peer, const std::string& why);
+    // LevelDB: the row of a share, and a locally created share stored like a
+    // received one (caller holds the tracker lock).
+    static c2pool::storage::SharechainStorage::ShareBatchEntry share_db_entry(ShareType& share,
+                                                                               const chain::RawShare* raw);
+    bool persist_local_share(const uint256& hash);
     // From the flag day on: drop every connected peer below 3601 (every 5 s,
     // m_flag_day_timer).
     void disconnect_pre_3601_peers();

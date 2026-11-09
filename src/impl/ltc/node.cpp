@@ -771,6 +771,39 @@ void NodeImpl::drop_pre_3601_peer(const NetService& addr, const std::string& lin
             it = it->second <= now ? m_pre_3601_until.erase(it) : std::next(it);
 }
 
+bool NodeImpl::drop_misfit_share(ShareType& share, std::string& drop_peer)
+{
+    const auto why = received_share_flag_day_problem(share);
+    if (why.empty())
+        return false;
+    if (drop_peer.empty())
+        drop_peer = why;
+    share.destroy();
+    return true;
+}
+
+void NodeImpl::drop_misfit_sender(const peer_ptr& peer, const std::string& why)
+{
+    if (!peer || why.empty())
+        return;
+    if (!peer_takes_3601(peer->m_other_version) || why.find("peer too old") != std::string::npos) {
+        drop_pre_3601_peer(peer->addr(), pre_3601_peer_line(peer->addr().to_string(), peer->m_other_version,
+                                                            peer->m_other_subversion));
+    } else {
+        // A 3601-capable peer sending a share under the wrong type number:
+        // broken or hostile. Disconnected (rate-limited line), not banned.
+        const auto now = std::chrono::steady_clock::now();
+        const std::string line = "peer " + peer->addr().to_string() + " sent a share whose type number does not fit "
+                                 "its timestamp (" + why + "): dropped, disconnecting";
+        if (m_pre_3601_warn.should_warn("misfit:" + peer->addr().address(), now))
+            LOG_WARNING << "[Pool] " << line;
+        else
+            LOG_DEBUG_POOL << "[Pool] " << line;
+        m_last_broadcast_to.erase(peer->addr());
+    }
+    close_connection(peer->addr());
+}
+
 void NodeImpl::disconnect_pre_3601_peers()
 {
     if (!v3601_flag_day_passed(static_cast<uint32_t>(std::time(nullptr))))
@@ -940,17 +973,22 @@ void NodeImpl::processing_shares_phase2(HandleSharesData& data, NetService addr)
     // lock. ASIO single-thread still guarantees no overlapping IO handler.
 
     // Step 1: collect verified shares (skip any that failed verification, hash still null)
+    // and keep each one's original raw bytes, by share OBJECT: the relay cache
+    // gets them only for the object the tracker adopts (step 3), never for a
+    // duplicate by hash (a copy under another type number would otherwise
+    // replace the bytes relayed for the share the tracker holds).
     std::vector<ShareType> valid_shares;
     valid_shares.reserve(data.m_items.size());
+    std::unordered_map<const void*, chain::RawShare> raw_by_object;
     for (size_t idx = 0; idx < data.m_items.size(); ++idx)
     {
         auto& share = data.m_items[idx];
         if (share.hash().IsNull())
             continue; // verification failed in phase 1
 
-        // Cache original raw bytes for relay (keyed by computed hash)
-        if (idx < data.m_raw_items.size() && !data.m_raw_items[idx].contents.m_data.empty())
-            m_raw_share_cache[share.hash()] = std::move(data.m_raw_items[idx]);
+        if (idx < data.m_raw_items.size() && !data.m_raw_items[idx].contents.m_data.empty()
+            && data.m_raw_items[idx].type == static_cast<uint64_t>(share.version()))
+            raw_by_object.emplace(ltc::share_ptr_id(share), std::move(data.m_raw_items[idx]));
         valid_shares.push_back(share);
     }
 
@@ -1041,6 +1079,9 @@ void NodeImpl::processing_shares_phase2(HandleSharesData& data, NetService addr)
                 auto slot = batch_slot.find(adopted_id);
                 if (slot != batch_slot.end())
                     ltc::share_release(data.m_items[slot->second]);
+                // The relay bytes of the adopted object (keyed by its hash).
+                if (auto raw = raw_by_object.find(adopted_id); raw != raw_by_object.end())
+                    m_raw_share_cache[share.hash()] = std::move(raw->second);
             }
         }
 
@@ -1386,7 +1427,7 @@ std::vector<uint256> NodeImpl::send_shares(peer_ptr peer, const std::vector<uint
     for (size_t i = 0; i < shares.size(); ++i)
     {
         auto it = m_raw_share_cache.find(shares[i].hash());
-        if (it != m_raw_share_cache.end())
+        if (it != m_raw_share_cache.end() && it->second.type == static_cast<uint64_t>(shares[i].version()))
         {
             rshares.push_back(it->second);
         }
@@ -2152,6 +2193,16 @@ void NodeImpl::load_persisted_shares()
             PackStream ps(share_bytes);
 
             auto share = ltc::load_share(static_cast<int64_t>(ver), ps, NetService{"database", 0});
+            // A stored share whose type number does not fit its timestamp
+            // (the flag day): never into the tracker.
+            if (const auto why = received_share_flag_day_problem(share); !why.empty()) {
+                ++skipped_load;
+                static int misfit_log = 0;
+                if (misfit_log++ < 5)
+                    LOG_WARNING << "[Pool] LevelDB share " << hash.GetHex().substr(0, 16) << " not loaded: " << why;
+                share.destroy();
+                continue;
+            }
             // m_hash is not part of the serialized format — it's computed
             // during share_check validation.  Restore it from the LevelDB key.
             share.ACTION({ obj->m_hash = hash; });
