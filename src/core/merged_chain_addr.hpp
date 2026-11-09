@@ -117,34 +117,20 @@ inline std::vector<unsigned char> merged_payout_script(const ChainAddrInfo* chai
 struct LoginResolution {
     std::string primary;                         // the parent payout address (after a swap)
     std::map<uint32_t, std::string> addresses;   // chain id -> address
-    std::vector<uint32_t> to_owner;              // chains given the node owner's address
     std::string refuse;                          // set: refuse the authorize with this text
     std::vector<std::string> notes;              // for the log
 };
 
 /// Resolve a login: `primary` and the optional second address `merged_raw`
 /// (comma/pipe/space/semicolon form), `explicit_addrs` from the slash form
-/// (PRIMARY/CHAIN_ID:ADDR) and mining.set_merged_addresses, the configured
-/// chains, and the parent coin's own versions/HRPs on the node's network.
-///
-/// `owner_for_unspecified` (--merged-unspecified-to-owner; chain id -> the
-/// node owner's address on that chain): a configured chain in it for which
-/// the miner gave no address is paid to the owner's address instead of the
-/// primary's hash160. "Gave" is every address the login or
-/// mining.set_merged_addresses names (the comma form, the slash form, a
-/// swapped pair, a merged chain's address as the primary); the auto-derive is
-/// not. Only for a login whose primary is a payout identity (an address whose
-/// hash160 the auto-derive reuses, or a parent-coin address it cannot reduce,
-/// P2WSH/P2TR): an empty or unusable primary keeps the existing handling
-/// (redistribution / refusal), merged chains included. Empty map: the
-/// resolution is the one without the option.
+/// (PRIMARY/CHAIN_ID:ADDR), the configured chains, and the parent coin's own
+/// versions/HRPs on the node's network.
 inline LoginResolution resolve_merged_login(std::string primary, const std::string& merged_raw,
                                             std::map<uint32_t, std::string> explicit_addrs,
                                             const std::vector<ChainAddrInfo>& table,
                                             const std::function<bool(uint32_t)>& configured,
                                             const std::vector<uint8_t>& parent_versions_now,
-                                            const std::vector<std::string>& parent_hrps,
-                                            const std::map<uint32_t, std::string>& owner_for_unspecified = {})
+                                            const std::vector<std::string>& parent_hrps)
 {
     LoginResolution r;
     r.addresses = std::move(explicit_addrs);
@@ -224,25 +210,11 @@ inline LoginResolution resolve_merged_login(std::string primary, const std::stri
         }
     }
 
-    std::string atype;
-    const auto h160 = core::address_to_hash160(primary, atype);
-    const bool derivable = h160.size() == 40 && (atype == "p2pkh" || atype == "p2wpkh" || atype == "p2sh");
-
-    // --merged-unspecified-to-owner: the chains the miner gave no address
-    // for, to the node owner's address (before the auto-derive takes them).
-    if (!owner_for_unspecified.empty() && (derivable || (!primary.empty() && is_parent(primary))))
-        for (const auto& [id, owner] : owner_for_unspecified)
-            if (configured(id) && !r.addresses.count(id) && !owner.empty()) {
-                r.addresses[id] = owner;
-                r.to_owner.push_back(id);
-                r.notes.push_back("no merged address given for chain_id=" + std::to_string(id)
-                                  + ": paid to the node owner's address " + owner
-                                  + " (--merged-unspecified-to-owner)");
-            }
-
     // Auto-derive: each configured chain without an address reuses the
     // primary's hash160 (the same key spends on both chains).
-    if (derivable)
+    std::string atype;
+    const auto h160 = core::address_to_hash160(primary, atype);
+    if (h160.size() == 40 && (atype == "p2pkh" || atype == "p2wpkh" || atype == "p2sh"))
         for (const auto* c : conf)
             if (!r.addresses.count(c->chain_id)) {
                 r.addresses[c->chain_id] = primary;

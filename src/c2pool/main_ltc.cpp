@@ -584,19 +584,7 @@ void print_help() {
     std::cout << "                            aux chain with an RPC daemon except DOGE (built-in); checked\n";
     std::cout << "                            against the chain's own address versions, and a chain without\n";
     std::cout << "                            a valid one is not mined.\n";
-    std::cout << "                            Can be specified multiple times (YAML: merged_payout_addresses)\n";
-    std::cout << "  --merged-unspecified-to-owner\n";
-    std::cout << "                            A miner who gives a valid LTC address but no address for a\n";
-    std::cout << "                            merged chain is paid on that chain to the node owner's address\n";
-    std::cout << "                            (--merged-payout-address SYMBOL:ADDRESS; DOGE also\n";
-    std::cout << "                            --node-owner-merged-address) instead of the LTC address's key.\n";
-    std::cout << "                            Addresses the miner gives are paid as given; an empty login\n";
-    std::cout << "                            keeps --redistribute. A chain without a valid owner address\n";
-    std::cout << "                            is not mined. Default off (YAML:\n";
-    std::cout << "                            merged_unspecified_to_owner)\n";
-    std::cout << "  --merged-unspecified-to-owner-chains SYMBOL[,SYMBOL...]\n";
-    std::cout << "                            The same for the chains listed only (YAML:\n";
-    std::cout << "                            merged_unspecified_to_owner_chains)\n\n";
+    std::cout << "                            Can be specified multiple times (YAML: merged_payout_addresses)\n\n";
 
     std::cout << "NETWORK TUNING (accepted for p2pool compatibility):\n";
     std::cout << "  --max-conns N             Max outgoing P2P connections\n";
@@ -982,13 +970,6 @@ int main(int argc, char* argv[]) {
     // createauxblock gets (its PPLNS coinbase is c2pool's own; the daemon
     // only needs an address of its chain). Keyed by upper-case symbol.
     std::map<std::string, std::string> merged_payout_addresses;
-    // --merged-unspecified-to-owner[-chains]: the merged chains (all, or the
-    // symbols listed) on which a miner who gives no address for the chain is
-    // paid to the node owner's address (core/merged_chain_addr.hpp).
-    bool merged_unspecified_to_owner = false;
-    std::set<std::string> merged_unspecified_to_owner_chains;
-    // Chains the option covers whose owner address is missing or invalid: not mined.
-    std::map<uint32_t, std::string> merged_owner_refused;
     // p2pool-style merged chain flags (assembled into spec at the end)
     std::string merged_coind_address;
     int         merged_coind_rpc_port = 0;
@@ -1555,20 +1536,6 @@ int main(int argc, char* argv[]) {
             merged_payout_addresses[sym] = v.substr(colon + 1);
             cli_explicit.insert("merged_payout_addresses");
         }
-        else if (arg == "--merged-unspecified-to-owner") {
-            merged_unspecified_to_owner = true;
-            cli_explicit.insert("merged_unspecified_to_owner");
-        }
-        else if (arg == "--merged-unspecified-to-owner-chains" && i + 1 < argc) {
-            std::istringstream ls(argv[++i]);
-            std::string sym;
-            while (std::getline(ls, sym, ',')) {
-                for (auto& c : sym) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-                if (!sym.empty())
-                    merged_unspecified_to_owner_chains.insert(sym);
-            }
-            cli_explicit.insert("merged_unspecified_to_owner_chains");
-        }
         // p2pool-style merged chain flags
         else if (arg == "--merged-coind-address" && i + 1 < argc) {
             merged_coind_address = argv[++i];
@@ -1869,27 +1836,6 @@ int main(int argc, char* argv[]) {
                     std::string sym = kv.first.as<std::string>();
                     for (auto& c : sym) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
                     merged_payout_addresses[sym] = kv.second.as<std::string>();
-                }
-            }
-            if (!cli_explicit.count("merged_unspecified_to_owner") && cfg["merged_unspecified_to_owner"])
-                merged_unspecified_to_owner = cfg["merged_unspecified_to_owner"].as<bool>();
-            // merged_unspecified_to_owner_chains: [DOGE, PEP] or "DOGE,PEP" (CLI replaces)
-            if (!cli_explicit.count("merged_unspecified_to_owner_chains") && cfg["merged_unspecified_to_owner_chains"]) {
-                std::vector<std::string> items;
-                const auto node = cfg["merged_unspecified_to_owner_chains"];
-                if (node.IsSequence()) {
-                    for (const auto& it : node)
-                        items.push_back(it.as<std::string>());
-                } else {
-                    std::istringstream ls(node.as<std::string>());
-                    std::string sym;
-                    while (std::getline(ls, sym, ','))
-                        items.push_back(sym);
-                }
-                for (auto sym : items) {
-                    for (auto& c : sym) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-                    if (!sym.empty())
-                        merged_unspecified_to_owner_chains.insert(sym);
                 }
             }
 
@@ -2596,53 +2542,6 @@ int main(int argc, char* argv[]) {
                                 == stratum_config.merged_parent_versions.end())
                                 stratum_config.merged_parent_versions.push_back(v);
                 }
-            }
-            // --merged-unspecified-to-owner: the node owner's address on each
-            // chain it covers, checked against the chain's own versions. A
-            // covered chain without a valid one is not mined (the merged
-            // chains loop skips it), so no share of a miner who gave no
-            // address for it is ever paid to a wrong or built-in address.
-            if (merged_unspecified_to_owner || !merged_unspecified_to_owner_chains.empty()) {
-                std::set<std::string> configured_syms;
-                for (const auto& spec : merged_chain_specs) {
-                    std::vector<std::string> parts;
-                    {
-                        std::istringstream ss(spec);
-                        std::string t;
-                        while (std::getline(ss, t, ':'))
-                            parts.push_back(t);
-                    }
-                    if (parts.size() < 2)
-                        continue;
-                    std::string sym = parts[0];
-                    for (auto& c : sym) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-                    uint32_t cid = 0;
-                    try { cid = static_cast<uint32_t>(std::stoul(parts[1])); } catch (...) { continue; }
-                    configured_syms.insert(sym);
-                    if (!merged_unspecified_to_owner && !merged_unspecified_to_owner_chains.count(sym))
-                        continue;
-                    const auto ov = merged_payout_addresses.find(sym);
-                    const auto o = c2pool::merged::resolve_unspecified_owner_address(
-                        sym, settings->m_testnet ? c2pool::merged::AuxNetwork::testnet
-                                                 : c2pool::merged::AuxNetwork::mainnet,
-                        ov != merged_payout_addresses.end() ? ov->second : std::string(),
-                        node_owner_merged_address);
-                    if (o.ok) {
-                        stratum_config.merged_owner_for_unspecified[cid] = {sym, o.address, o.script};
-                        LOG_INFO << "[MM:" << sym << "] --merged-unspecified-to-owner: miners who give no "
-                                 << sym << " address are paid on " << sym << " to the node owner's "
-                                 << o.address << " (" << o.source << ")";
-                    } else {
-                        merged_owner_refused[cid] = o.error;
-                    }
-                }
-                for (const auto& sym : merged_unspecified_to_owner_chains)
-                    if (!configured_syms.count(sym))
-                        LOG_WARNING << "--merged-unspecified-to-owner-chains: " << sym
-                                    << " is not a configured merged chain";
-                if (solo_mode || custodial_mode)
-                    LOG_WARNING << "--merged-unspecified-to-owner has no effect with --solo / --custodial: "
-                                   "their merged payouts do not use the miners' merged addresses";
             }
             web_server.get_mining_interface()->set_stratum_config(stratum_config);
             if (fd_limit_known)
@@ -7860,16 +7759,6 @@ int main(int argc, char* argv[]) {
                     if (parts.size() >= 4) cfg.rpc_port = static_cast<uint16_t>(std::stoul(parts[3]));
                     if (parts.size() >= 6) cfg.rpc_userpass = parts[4] + ":" + parts[5];
                     cfg.multiaddress = true;  // V36: canonical PPLNS coinbase for merged chains
-
-                    // --merged-unspecified-to-owner covers this chain but there is
-                    // no valid owner address for it: not mined.
-                    if (const auto ro = merged_owner_refused.find(cfg.chain_id); ro != merged_owner_refused.end()) {
-                        const std::string msg = "merged chain " + cfg.symbol + " (chain_id "
-                            + std::to_string(cfg.chain_id) + ") DISABLED: " + ro->second;
-                        LOG_ERROR << "[MM:" << cfg.symbol << "] " << msg;
-                        std::cerr << "c2pool: " << msg << std::endl;
-                        continue;
-                    }
 
                     // The address createauxblock gets: the operator's
                     // (--merged-payout-address), else the built-in one (DOGE

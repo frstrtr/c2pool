@@ -710,7 +710,6 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
         // entries an earlier login gave or derived (its primary's hash160) are
         // not carried over to the new primary.
         merged_addresses_ = set_merged_addresses_;
-        merged_to_owner_.clear();
         std::string merged_addr_raw;
         parse_address_separators(username_, merged_addr_raw);
 
@@ -720,13 +719,10 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
         // given to one by guessing), then each configured chain without one
         // reuses the primary's hash160.
         {
-            std::map<uint32_t, std::string> owner_for_unspecified;
-            for (const auto& [id, o] : scfg.merged_owner_for_unspecified)
-                owner_for_unspecified[id] = o.address;
             auto res = core::merged_addr::resolve_merged_login(
                 username_, merged_addr_raw, merged_addresses_, MERGED_CHAINS,
                 [this](uint32_t id) { return mining_interface_ && mining_interface_->has_merged_chain(id); },
-                LTC_VERSIONS, LTC_HRPS, owner_for_unspecified);
+                LTC_VERSIONS, LTC_HRPS);
             if (!res.refuse.empty()) {
                 LOG_WARNING << "[Stratum] REFUSED mining.authorize (" << username_ << "): " << res.refuse;
                 authorized_ = false;
@@ -740,19 +736,6 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
                 LOG_INFO << "[Stratum] " << n;
             username_ = std::move(res.primary);
             merged_addresses_ = std::move(res.addresses);
-            merged_to_owner_ = std::set<uint32_t>(res.to_owner.begin(), res.to_owner.end());
-            if (!merged_to_owner_.empty()) {
-                std::string chains;
-                for (auto id : merged_to_owner_) {
-                    const auto it = scfg.merged_owner_for_unspecified.find(id);
-                    chains += (chains.empty() ? "" : ", ") + std::to_string(id)
-                              + (it != scfg.merged_owner_for_unspecified.end() && !it->second.symbol.empty()
-                                     ? " (" + it->second.symbol + ")" : std::string());
-                }
-                LOG_INFO << "[Stratum] " << username_ << (worker_name_.empty() ? "" : "." + worker_name_)
-                         << ": merged chain(s) " << chains << " paid to the node owner (no address given"
-                            " for them; --merged-unspecified-to-owner)";
-            }
         }
         if (!merged_addresses_.empty())
             LOG_INFO << "[Stratum] Merged addresses from login: " << merged_addresses_.size() << " chain(s)";
@@ -1078,13 +1061,6 @@ const std::vector<core::merged_addr::ChainAddrInfo>& StratumSession::merged_tabl
 
 std::vector<unsigned char> StratumSession::merged_script_for(uint32_t chain_id, const std::string& addr) const
 {
-    // The node owner's address: its script as checked on that chain at startup.
-    if (merged_to_owner_.count(chain_id) && mining_interface_) {
-        const auto& owners = mining_interface_->get_stratum_config().merged_owner_for_unspecified;
-        const auto it = owners.find(chain_id);
-        if (it != owners.end() && it->second.address == addr)
-            return it->second.script;
-    }
     return core::merged_addr::merged_payout_script(core::merged_addr::find_chain(merged_table(), chain_id), addr);
 }
 
@@ -1107,7 +1083,6 @@ nlohmann::json StratumSession::handle_set_merged_addresses(const nlohmann::json&
                 uint32_t chain_id = static_cast<uint32_t>(std::stoul(key));
                 merged_addresses_[chain_id] = val.get<std::string>();
                 set_merged_addresses_[chain_id] = val.get<std::string>();
-                merged_to_owner_.erase(chain_id);   // the miner's own address now
             } catch (...) {
                 // skip malformed
             }

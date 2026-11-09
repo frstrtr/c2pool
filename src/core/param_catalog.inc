@@ -473,12 +473,6 @@ C2P_PARAM("merged.spec", Merged, MERGED_SPEC, RESTART, C_BTC|C_LTC|C_NMC|C_DGB|C
 C2P_PARAM("merged.payout_addresses", Merged, STRING, MONEY_RESTART, C_LTC, LIT, "", NONE, "per-chain SYMBOL:ADDRESS for createauxblock (repeatable)")
   C2P_ALIAS("merged.payout_addresses", BIN_LTC, "--merged-payout-address", VALUE)
 
-C2P_PARAM("money.merged_unspecified_to_owner", Money, BOOL, MONEY_RESTART, C_LTC, LIT, "false", NONE, "merged chains a miner gives no address for pay the node owner's address")
-  C2P_ALIAS("money.merged_unspecified_to_owner", BIN_LTC, "--merged-unspecified-to-owner", FLAG)
-
-C2P_PARAM("money.merged_unspecified_to_owner_chains", Money, STRING, MONEY_RESTART, C_LTC, LIT, "", NONE, "the same for the merged chains listed (SYMBOL,SYMBOL)")
-  C2P_ALIAS("money.merged_unspecified_to_owner_chains", BIN_LTC, "--merged-unspecified-to-owner-chains", VALUE)
-
 C2P_PARAM("merged.coind_address", Merged, STRING, RESTART, C_LTC|C_DOGE, LIT, "", NONE, "merged coind address")
   C2P_ALIAS("merged.coind_address", BIN_LTC, "--merged-coind-address", VALUE)
 

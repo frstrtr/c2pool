@@ -132,19 +132,6 @@ the primary, **reverse-derives** the LTC payout from the same key.
 Worker names (`.worker1` or `_worker1`) are stripped from each address before
 use.
 
-With several merged chains configured, an address two of them could take
-(DOGE's `D...` is also a Bellscoin P2SH; P2SH `A...`/`9...` is shared by DOGE,
-PEP and SHIC) or that none of them identifies is refused at login: name its
-chain with the slash form (`LTCADDR/98:DOGEADDR`).
-
-**A node may pay chains you give no address for to its owner.** An operator
-running `--merged-unspecified-to-owner` (or
-`--merged-unspecified-to-owner-chains DOGE,PEP`) does not auto-derive: a
-merged chain you name no address for pays the node owner's address on that
-chain, and the node's log and dashboard say so. Give an address for every
-chain you want to be paid on. An empty username is not affected (it follows
-the node's `--redistribute` mode, merged chains included).
-
 ### Which mode pays whom?
 
 | Mode | CLI flag | Who gets paid |
