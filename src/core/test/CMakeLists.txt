@@ -162,6 +162,11 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
     # is counted in /local_stats template_refresh; every session's job of a
     # generation shares one tx-hex vector (measured). Same fold-into-core_test
     # reasoning as every TU here.
+    # web_server_job_held_test.cpp: a stratum job is not built on a busy
+    # sharechain (no PPLNS at the job's prev share, no ref_hash): with the LTC
+    # pool's StratumConfig flag build_connection_coinbase returns nothing and
+    # the session retries; other work sources unchanged. Same fold-into-
+    # core_test reasoning as every TU here.
     # web_server_rpc_refresh_test.cpp: the coin daemon's template refresh
     # over RPC (one-shot fetch + the --no-embedded getblocktemplate poll) is
     # armed for a coin node attached after start() (c2pool-ltc starts its web
@@ -230,6 +235,7 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
         web_server_frozen_pool_rate_guard_test.cpp
         web_server_http_cap_test.cpp
         web_server_ip_mask_test.cpp
+        web_server_job_held_test.cpp
         web_server_local_hashps_test.cpp
         web_server_local_only_test.cpp
         web_server_local_share_hash_rates_test.cpp

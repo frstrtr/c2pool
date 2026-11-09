@@ -924,6 +924,60 @@ bool NodeImpl::processing_shares(HandleSharesData& data_ref, NetService addr)
     return true;
 }
 
+// The LevelDB row of a share: its type number (8 bytes LE) and its bytes (the
+// received ones when `raw` holds them under the same type number, else packed).
+c2pool::storage::SharechainStorage::ShareBatchEntry NodeImpl::share_db_entry(ShareType& share,
+                                                                             const chain::RawShare* raw)
+{
+    std::vector<uint8_t> bytes;
+    if (raw && raw->type == static_cast<uint64_t>(share.version()) && !raw->contents.m_data.empty())
+    {
+        bytes.assign(raw->contents.m_data.begin(), raw->contents.m_data.end());
+    }
+    else
+    {
+        PackStream ps = pack(share);
+        auto span = ps.get_span();
+        bytes.assign(reinterpret_cast<const uint8_t*>(span.data()),
+                     reinterpret_cast<const uint8_t*>(span.data()) + span.size());
+    }
+    uint64_t ver = share.version();
+    std::vector<uint8_t> versioned;
+    versioned.resize(8 + bytes.size());
+    std::memcpy(versioned.data(), &ver, 8);
+    std::memcpy(versioned.data() + 8, bytes.data(), bytes.size());
+
+    c2pool::storage::SharechainStorage::ShareBatchEntry entry;
+    share.ACTION({
+        uint256 target = chain::bits_to_target(obj->m_bits);
+        uint256 abswork_256;
+        std::copy(obj->m_abswork.begin(), obj->m_abswork.end(), abswork_256.begin());
+        entry.hash = obj->m_hash;
+        entry.serialized_data = std::move(versioned);
+        entry.prev_hash = obj->m_prev_hash;
+        entry.height = obj->m_absheight;
+        entry.timestamp = obj->m_timestamp;
+        entry.work = abswork_256;
+        entry.target = target;
+    });
+    return entry;
+}
+
+// A share this node made (create_local_share) into LevelDB, as a received
+// one is in processing_shares_phase2: without it a restart reloads the
+// network's shares but not ours, and the chain has holes (many heads, "chain
+// too short") until peers send our own shares back. Caller holds the
+// tracker lock.
+bool NodeImpl::persist_local_share(const uint256& hash)
+{
+    if (!m_storage || !m_storage->is_available() || !m_chain || !m_chain->contains(hash))
+        return false;
+    auto& share = m_chain->get_share(hash);
+    std::vector<c2pool::storage::SharechainStorage::ShareBatchEntry> one;
+    one.push_back(share_db_entry(share, nullptr));
+    return m_storage->store_shares_batch(one);
+}
+
 void NodeImpl::processing_shares_phase2(HandleSharesData& data, NetService addr)
 {
     // Phase 2 (io_context thread): topological sort + chain insertion + LevelDB store.
@@ -1119,42 +1173,8 @@ void NodeImpl::processing_shares_phase2(HandleSharesData& data, NetService addr)
         // Collect for batch LevelDB persist (committed atomically after loop)
         if (m_storage && m_storage->is_available())
         {
-            std::vector<uint8_t> bytes;
             auto raw_it = m_raw_share_cache.find(share.hash());
-            if (raw_it != m_raw_share_cache.end() &&
-                raw_it->second.type == share.version() &&
-                !raw_it->second.contents.m_data.empty())
-            {
-                bytes.assign(raw_it->second.contents.m_data.begin(),
-                             raw_it->second.contents.m_data.end());
-            }
-            else
-            {
-                PackStream ps = pack(share);
-                auto span = ps.get_span();
-                bytes.assign(reinterpret_cast<const uint8_t*>(span.data()),
-                             reinterpret_cast<const uint8_t*>(span.data()) + span.size());
-            }
-            uint64_t ver = share.version();
-            std::vector<uint8_t> versioned;
-            versioned.resize(8 + bytes.size());
-            std::memcpy(versioned.data(), &ver, 8);
-            std::memcpy(versioned.data() + 8, bytes.data(), bytes.size());
-
-            share.ACTION({
-                uint256 target = chain::bits_to_target(obj->m_bits);
-                uint256 abswork_256;
-                std::copy(obj->m_abswork.begin(), obj->m_abswork.end(), abswork_256.begin());
-                c2pool::storage::SharechainStorage::ShareBatchEntry entry;
-                entry.hash = obj->m_hash;
-                entry.serialized_data = std::move(versioned);
-                entry.prev_hash = obj->m_prev_hash;
-                entry.height = obj->m_absheight;
-                entry.timestamp = obj->m_timestamp;
-                entry.work = abswork_256;
-                entry.target = target;
-                db_batch.push_back(std::move(entry));
-            });
+            db_batch.push_back(share_db_entry(share, raw_it != m_raw_share_cache.end() ? &raw_it->second : nullptr));
         }
     }
 

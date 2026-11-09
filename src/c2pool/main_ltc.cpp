@@ -1912,6 +1912,10 @@ int main(int argc, char* argv[]) {
             // Private sharechain identifier, hex (CLI --network-id/--chain-id takes precedence)
             if (!cli_explicit.count("network_id") && cfg["network_id"])
                 network_id = std::stoull(cfg["network_id"].as<std::string>(), nullptr, 16);
+            // Share version 3601 flag day (testnet / private chain only; the
+            // mainnet refusal below applies whatever the source)
+            if (!cli_explicit.count("v3601_activation_time") && cfg["v3601_activation_time"])
+                v3601_activation_time = cfg["v3601_activation_time"].as<uint64_t>();
 
             // Stratum tuning
             if (!cli_explicit.count("stratum_min_diff") && cfg["min_difficulty"])
@@ -2086,6 +2090,10 @@ int main(int argc, char* argv[]) {
         if (rc.file_set("money.give_author_pct"))    dev_donation   = rc.get_double("money.give_author_pct").value_or(dev_donation);
         if (rc.file_set("money.node_owner_address")) node_owner_address = rc.get_string("money.node_owner_address").value_or(node_owner_address);
         if (rc.file_set("money.payout_address"))     payout_address = rc.get_string("money.payout_address").value_or(payout_address);
+        if (rc.file_set("sharechain.v3601_activation_time") && !cli_explicit.count("v3601_activation_time")) {
+            if (const auto v = rc.get_i64("sharechain.v3601_activation_time"); v && *v >= 0)
+                v3601_activation_time = static_cast<uint64_t>(*v);
+        }
     }
 
     // WAIT mode: block genesis share creation until peers deliver the
@@ -2556,6 +2564,10 @@ int main(int argc, char* argv[]) {
             // A login without a usable payout address is redistributed
             // (--redistribute), as p2pool does, not refused.
             stratum_config.redistribute_unusable_logins = true;
+            // A job whose coinbase the busy sharechain could not build (no
+            // PPLNS at its prev share, no ref_hash) is held and retried, never
+            // replaced by the global coinbase (its shares would not verify).
+            stratum_config.hold_job_without_connection_coinbase = true;
             // The merged addresses of the operator's own shares (node-fee
             // shares, redistributed shares landing on the operator's key):
             // p2pool's --merged-operator-address cascade, per merged chain.
@@ -5030,14 +5042,15 @@ int main(int argc, char* argv[]) {
             // private chain (every node of a network must use the same time).
             if (v3601_activation_time) {
                 if (!settings->m_testnet && network_id == 0) {
-                    const std::string msg = "--v3601-activation-time is for testnet or a private --network-id "
-                                            "chain only: on mainnet every node uses the compiled flag day";
+                    const std::string msg = "v3601_activation_time (--v3601-activation-time or the settings "
+                                            "file) is for testnet or a private --network-id chain only: on "
+                                            "mainnet every node uses the compiled flag day";
                     LOG_ERROR << msg;
                     std::cerr << "c2pool: " << msg << std::endl;
                     return 1;
                 }
                 if (*v3601_activation_time > 0xFFFFFFFFull) {
-                    LOG_ERROR << "--v3601-activation-time " << *v3601_activation_time << " is not a 32-bit unix time";
+                    LOG_ERROR << "v3601_activation_time " << *v3601_activation_time << " is not a 32-bit unix time";
                     return 1;
                 }
                 ltc::PoolConfig::v3601_activation_time_override = static_cast<uint32_t>(*v3601_activation_time);
@@ -5046,7 +5059,7 @@ int main(int argc, char* argv[]) {
                 LOG_INFO << "[Sharechain] share version 3601 flag day: not scheduled";
             else
                 LOG_INFO << "[Sharechain] share version 3601 flag day: " << ltc::PoolConfig::v3601_activation_time()
-                         << (v3601_activation_time ? " (--v3601-activation-time)" : " (compiled)")
+                         << (v3601_activation_time ? " (v3601_activation_time)" : " (compiled)")
                          << "; peers below protocol " << ltc::PoolConfig::V3601_PROTOCOL_VERSION
                          << " are disconnected from then on";
 
@@ -7607,6 +7620,11 @@ int main(int argc, char* argv[]) {
                         ++s_pow_failed;
                         return uint256();  // share failed PoW or validation; don't broadcast
                     }
+                    // Into LevelDB like a received share (a restart then
+                    // reloads our own shares too).
+                    if (!p2p_node->persist_local_share(share_hash))
+                        LOG_DEBUG_POOL << "[Pool] local share " << share_hash.GetHex().substr(0, 16)
+                                       << " not stored (no LevelDB)";
                     ++s_created;
 
                     // Compute the GOT SHARE! prev-age WHILE we still hold the

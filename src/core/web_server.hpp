@@ -1989,6 +1989,10 @@ private:
     std::map<uint32_t, std::vector<unsigned char>> m_operator_merged_scripts;
     std::function<std::pair<std::string, uint8_t>()> m_redistribute_fn;
     mutable std::mutex m_redistribute_mu;   // m_redistribute_fn, m_address_fallback_fn
+    // Connection coinbases not built because the tracker was busy (the
+    // session holds the job and retries: StratumConfig::hold_job_without_connection_coinbase).
+    mutable std::atomic<uint64_t> m_connection_coinbase_held{0};
+    void note_connection_coinbase_held(const char* why) const;
     std::vector<unsigned char> m_donation_script;   // protocol donation scriptPubKey
     std::function<double()> m_stratum_hashrate_fn;  // callback to get stratum total hashrate
     std::function<RateStats()> m_stratum_rate_stats_fn;  // callback to get rate monitor stats
@@ -2041,6 +2045,7 @@ public:
     void decide_job_payout(std::vector<unsigned char>& payout_script,
                            std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged) const override;
     const StratumConfig& get_stratum_config() const override { return m_stratum_config; }
+    uint64_t connection_coinbase_held() const { return m_connection_coinbase_held.load(std::memory_order_relaxed); }
     void set_cors_origin(const std::string& origin) { m_cors_origin = origin; }
     const std::string& get_cors_origin() const { return m_cors_origin; }
 

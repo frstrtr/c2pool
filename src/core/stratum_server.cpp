@@ -1874,6 +1874,20 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
         if (!cbr.coinb1.empty()) {
             coinb1 = std::move(cbr.coinb1);
             coinb2 = std::move(cbr.coinb2);
+        } else if (mining_interface_->get_stratum_config().hold_job_without_connection_coinbase) {
+            // The connection coinbase could not be built consistently (the
+            // sharechain is busy): no job now — the miner keeps its current
+            // one — and a retry shortly. The global coinbase would give
+            // shares that can never match their generation transaction.
+            auto timer = std::make_shared<boost::asio::steady_timer>(socket_.get_executor());
+            timer->expires_after(std::chrono::milliseconds(500));
+            timer->async_wait([weak_self = weak_from_this(), timer, force_clean](boost::system::error_code ec) {
+                if (ec) return;
+                auto self = weak_self.lock();
+                if (!self || !self->is_connected()) return;
+                self->send_notify_work(force_clean);
+            });
+            return;
         } else {
             // Fallback to global coinbase (no ref_hash callback wired)
             auto [gcb1, gcb2] = mining_interface_->get_coinbase_parts();

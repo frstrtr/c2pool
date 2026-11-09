@@ -1344,6 +1344,15 @@ MiningInterface::build_coinbase_parts(
     return { coinb1.str(), coinb2 };
 }
 
+
+void MiningInterface::note_connection_coinbase_held(const char* why) const
+{
+    const auto n = m_connection_coinbase_held.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= 5 || n % 100 == 0)
+        LOG_INFO << "[build_connection_cb] job held (" << why << " unavailable: the sharechain is busy); the"
+                 << " session retries (" << n << " so far)";
+}
+
 MiningInterface::CoinbaseResult
 MiningInterface::build_connection_coinbase(
     const uint256& prev_share_hash,
@@ -1457,6 +1466,13 @@ MiningInterface::build_connection_coinbase(
 
         auto expected = ws.pplns_fn(prev_share_hash, block_target, subsidy, ws.donation_script);
 
+        if (expected.empty() && m_stratum_config.hold_job_without_connection_coinbase) {
+            // The PPLNS at this job's prev share could not be read (the tracker
+            // is busy): the cached outputs are another best share's, and a
+            // share from this job would not match its generation transaction.
+            note_connection_coinbase_held("pplns");
+            return {};
+        }
         if (!expected.empty()) {
             ws.pplns_outputs.clear();
             std::string donation_hex;
@@ -1704,6 +1720,12 @@ MiningInterface::build_connection_coinbase(
         ws.segwit_active, ws.witness_commitment, effective_witness_root,
         merged_addrs, branches_u256);
     LOG_TRACE << "[build_cb] ref_hash_fn returned, bits=" << std::hex << rhr.bits << std::dec;
+    if (rhr.ref_hash.IsNull() && m_stratum_config.hold_job_without_connection_coinbase) {
+        // No ref_hash (the tracker is busy): a coinbase committing to a null
+        // ref_hash makes every share of the job invalid.
+        note_connection_coinbase_held("ref_hash");
+        return {};
+    }
 
     // Build ref_hash hex
     std::string ref_hash_hex;
