@@ -436,3 +436,25 @@ TEST(PplnsNoBurn, ConcurrentJobsPayTheirOwnShareAtTheirOwnTemplateValue)
     EXPECT_EQ(wrong_share.load(), 0u) << "a job paid a split that is not its prev share's";
     EXPECT_EQ(wrong_value.load(), 0u) << "a job paid amounts computed for another template value";
 }
+
+TEST(PplnsNoBurn, ARefreshWithoutAGlobalCoinbaseKeepsTheLastReserve)
+{
+    // The template's block budget reserves room for the coinbase (weight,
+    // sigops) from the last coinbase built. A refresh that builds no global
+    // coinbase (no valid split) used to note an empty one and reset the
+    // reserve to nothing while the jobs' coinbases stay full size.
+    Rig r;
+    r.best = h(0xa1);
+    r.mi.refresh_work();
+    ASSERT_FALSE(r.global().empty());
+    const uint32_t weight = r.mi.coinbase_weight_reserve();
+    const uint32_t sigops = r.mi.coinbase_sigop_reserve();
+    ASSERT_GT(weight, 0u);
+
+    r.best = h(0xb2);
+    r.busy = true;
+    r.mi.refresh_work();
+    ASSERT_TRUE(r.global().empty());
+    EXPECT_EQ(r.mi.coinbase_weight_reserve(), weight) << "the last real coinbase's weight is kept";
+    EXPECT_EQ(r.mi.coinbase_sigop_reserve(), sigops);
+}

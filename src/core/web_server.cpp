@@ -2002,8 +2002,12 @@ void MiningInterface::refresh_work()
             cb_parts = {};
         }
 
-        note_coinbase_built(cb_parts.first, cb_parts.second, segwit_active, merkle_branches.size(),
-                            /*fresh_template=*/true, /*has_state_root=*/false);
+        // No global coinbase this refresh (no valid split): keep the last
+        // real coinbase's weight and sigops as the reserve; an empty one
+        // would reset it to nothing while the jobs' coinbases are full size.
+        if (!cb_parts.first.empty())
+            note_coinbase_built(cb_parts.first, cb_parts.second, segwit_active, merkle_branches.size(),
+                                /*fresh_template=*/true, /*has_state_root=*/false);
 
         // Compute THE state root for sharechain anchoring (both LTC and merged coinbases)
         uint32_t tmpl_h = wd.m_data.value("height", 0);
