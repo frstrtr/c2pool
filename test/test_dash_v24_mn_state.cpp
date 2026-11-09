@@ -467,6 +467,35 @@ TEST(DashV24ProDis, EarlyPenaltyFloorsAndMonotoneValidity)
     EXPECT_EQ(v24::pro_rata_floor(10, 1, 3), 3);
 }
 
+// ProRataFloor's portable form (the one MSVC builds use, no __int128) must equal
+// the native 128-bit form on every input: it decides masternode payout splits.
+TEST(DashV24ProRata, PortableEqualsNative)
+{
+    namespace pay = dash::coin::vendor::payments;
+    const int64_t COIN = 100'000'000;
+    // Negative values and weight > weight_total included: CAmount is cast to
+    // uint64 first and the result is the low 64 bits, as in Dash Core.
+    const int64_t edges[] = {INT64_MIN, INT64_MIN + 1, -COIN, -2, -1, 0, 1, 2, 3, 7, 999, COIN - 1,
+                             COIN, 1000 * COIN, 21'000'000 * COIN, (int64_t{1} << 32) - 1,
+                             int64_t{1} << 32, INT64_MAX / 3, INT64_MAX / 2, INT64_MAX - 1, INT64_MAX};
+    for (int64_t total : edges)
+        for (int64_t weight : edges)
+            for (int64_t wt : edges) {
+                if (wt == 0) continue;   // division by zero: Core throws
+                ASSERT_EQ(pay::ProRataFloorPortable(total, weight, wt), pay::ProRataFloor(total, weight, wt))
+                    << total << " " << weight << " " << wt;
+            }
+    uint64_t x = 0x9e3779b97f4a7c15ull;   // xorshift64*: reproducible
+    auto next = [&] { x ^= x >> 12; x ^= x << 25; x ^= x >> 27; return x * 0x2545f4914f6cdd1dull; };
+    for (int i = 0; i < 200'000; ++i) {
+        const int64_t total = static_cast<int64_t>(next() % (21'000'000ull * 100'000'000ull + 1));
+        const int64_t wt = static_cast<int64_t>(next() % (1ull << 62)) + 1;
+        const int64_t weight = static_cast<int64_t>(next() % static_cast<uint64_t>(wt + 1));
+        ASSERT_EQ(pay::ProRataFloorPortable(total, weight, wt), pay::ProRataFloor(total, weight, wt))
+            << total << " " << weight << " " << wt;
+    }
+}
+
 TEST(DashV24ProDis, RejectCodes)
 {
     const int64_t COIN = v::CCollateralShare::COIN;

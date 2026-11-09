@@ -33,6 +33,7 @@
 
 #include <impl/dash/coin/vendor/providertx.hpp>   // MasternodePayoutShare(s), CCollateralShare, ProTxVersion
 
+#include <boost/multiprecision/cpp_int.hpp>   // uint128_t: ProRataFloor without __int128 (MSVC)
 #include <cstdint>
 #include <vector>
 
@@ -67,13 +68,29 @@ MasternodePayoutShares GetOwnerPayouts(const T& protx)
 }
 
 // ── providertx_util.cpp:88-95 ───────────────────────────────────────────────
+// Portable form of the same 128-bit floor, for compilers without __int128
+// (MSVC). Fixed-width 128-bit unsigned arithmetic gives the bit-identical
+// result; test_dash_v24_mn_state pins it equal to the native form.
+inline CAmount ProRataFloorPortable(const CAmount total, const CAmount weight, const CAmount weight_total)
+{
+    using u128 = boost::multiprecision::uint128_t;
+    u128 v{static_cast<uint64_t>(total)};
+    v *= u128(static_cast<uint64_t>(weight));
+    v /= u128(static_cast<uint64_t>(weight_total));
+    return static_cast<CAmount>(static_cast<uint64_t>(v & u128(UINT64_MAX)));   // GetLow64()
+}
+
 inline CAmount ProRataFloor(const CAmount total, const CAmount weight, const CAmount weight_total)
 {
     // 128-bit intermediate: total * weight overflows int64 for real-world values
+#if defined(__SIZEOF_INT128__)
     unsigned __int128 v{static_cast<uint64_t>(total)};
     v *= static_cast<unsigned __int128>(static_cast<uint64_t>(weight));
     v /= static_cast<unsigned __int128>(static_cast<uint64_t>(weight_total));
     return static_cast<CAmount>(static_cast<uint64_t>(v));   // GetLow64()
+#else
+    return ProRataFloorPortable(total, weight, weight_total);
+#endif
 }
 
 // ── providertx_util.cpp:97-115 ──────────────────────────────────────────────
