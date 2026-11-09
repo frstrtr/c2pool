@@ -216,6 +216,19 @@ inline AuxPayoutAddress resolve_aux_payout_address(const std::string& symbol, Au
     return r;
 }
 
+/// The P2P port a merged chain's own networking uses (0: none). DOGE with
+/// --no-embedded-doge has none: no embedded header chain, no P2P peers, no DNS
+/// seeds, whatever P2P port a --merged DOGE spec or the defaults give; its
+/// daemon is reached over RPC only. Every other chain keeps its port.
+inline uint16_t merged_p2p_port(const std::string& symbol, bool embedded_doge, uint16_t port)
+{
+    std::string up = symbol;
+    for (auto& c : up)
+        if (c >= 'a' && c <= 'z')
+            c = static_cast<char>(c - 32);
+    return (up == "DOGE" && !embedded_doge) ? 0 : port;
+}
+
 /// The merged address written into the node operator's own shares: the
 /// node-fee (-f) shares and the redistributed shares that land on the
 /// operator's key with no merged address. p2pool's cascade
@@ -225,9 +238,11 @@ inline AuxPayoutAddress resolve_aux_payout_address(const std::string& symbol, Au
 ///      (p2pool --merged-operator-address), for another chain
 ///      --merged-payout-address SYMBOL:ADDRESS; used when it is an address of
 ///      the chain on the parent's network;
-///   P2 else the operator's parent key (--node-owner-address) converted, as the
-///      auto-derive does (P2SH stays P2SH, P2PKH/P2WPKH become P2PKH);
-///   P3 else (a P2WSH/P2TR operator address) the pool donation script.
+///   P2 else the operator's parent key (--node-owner-address) as P2PKH, when it
+///      is a P2PKH or P2WPKH key;
+///   P3 else (a P2SH, P2WSH or P2TR operator address) the pool donation
+///      script. A P2SH key is not converted (p2pool does): its redeem script
+///      may be P2SH-P2WPKH, anyone-can-spend on a chain without segwit.
 struct OperatorMergedScript {
     std::vector<unsigned char> script;
     std::string source;
@@ -264,11 +279,15 @@ inline OperatorMergedScript resolve_operator_merged_script(const std::string& sy
     }
     std::string atype;
     const auto h160 = core::address_to_hash160(node_owner_address, atype);
-    if (h160.size() == 40 && (atype == "p2pkh" || atype == "p2wpkh" || atype == "p2sh")) {
-        r.script = core::hash160_to_merged_script(h160, atype);
+    if (h160.size() == 40 && (atype == "p2pkh" || atype == "p2wpkh")) {
+        r.script = core::hash160_to_merged_script(h160, "p2pkh");
         r.source = "--node-owner-address key";
         return r;
     }
+    if (atype == "p2sh" && r.warning.empty())
+        r.warning = "the --node-owner-address is P2SH, which is not converted to " + up
+                    + " (P2SH-P2WPKH is anyone-can-spend there); set "
+                    + (up == "DOGE" ? std::string("--node-owner-merged-address") : "--merged-payout-address " + up + ":<address>");
     r.script = donation_script;
     r.source = "donation script";
     return r;

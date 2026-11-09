@@ -223,6 +223,27 @@ public:
         donation_type_ = type;
     }
 
+    // Who a share goes to when the tracker cannot be read (it is busy): the
+    // operator ("fee"), or the donation script when no operator is set.
+    RedistributeResult without_tracker() const
+    {
+        if (!operator_hash_.IsNull())
+            return {operator_hash_, operator_type_};
+        return {donation_hash_, donation_type_};
+    }
+
+    // pick() for a caller off the compute thread (the stratum thread building
+    // a job): only while `lock` (a try-acquired read lock of the tracker:
+    // node.hpp TrackerReadGuard, std::shared_lock) holds it; when the tracker
+    // is busy, without_tracker(). pick() walks the tracker (PPLNS weights).
+    template <class ReadLock>
+    RedistributeResult pick_if_locked(const ReadLock& lock, ShareTracker& tracker, const uint256& best_share_hash)
+    {
+        if (!static_cast<bool>(lock))
+            return without_tracker();
+        return pick(tracker, best_share_hash);
+    }
+
     // Pick a (pubkey_hash, pubkey_type) for shares from unnamed/broken miners.
     RedistributeResult pick(ShareTracker& tracker, const uint256& best_share_hash)
     {

@@ -128,6 +128,9 @@ struct LoginResolution {
     // as the second one: the parent payout is that address's hash160 (P2SH
     // stays P2SH).
     std::vector<unsigned char> parent_script;
+    // A P2SH primary left some configured chain without an address (its key
+    // is not auto-derived): shown with the worker.
+    bool p2sh_without_merged{false};
     std::vector<std::string> notes;              // for the log
     std::vector<std::string> warnings;           // for the log, at warning level
 };
@@ -197,6 +200,16 @@ inline LoginResolution resolve_merged_login(std::string primary, const std::stri
     const std::string name_it = " (name its chain: PRIMARY/CHAIN_ID:ADDRESS)";
 
     std::string merged = merged_raw;
+    // A first address that is not an address at all before a parent address
+    // (a mistyped merged address in a swapped pair): the parent address is
+    // the primary, as the pre-change server paid it; the first one is ignored.
+    if (!merged.empty() && is_parent(merged) && chains_taking(primary).empty() && !pays(nullptr, primary)
+        && !is_parent(primary)) {
+        r.warnings.push_back("first address " + primary + " is not a valid address: ignored, the parent address "
+                             + merged + " is paid");
+        primary = merged;
+        merged.clear();
+    }
     if (!merged.empty() && chains_taking(merged).empty() && !pays(nullptr, merged) && !is_parent(merged)) {
         r.warnings.push_back("merged address " + merged + " is not a valid address: ignored");
         merged.clear();
@@ -255,6 +268,12 @@ inline LoginResolution resolve_merged_login(std::string primary, const std::stri
             r.from_login.push_back(u[0]->chain_id);
             r.notes.push_back("Case 5: primary address is chain_id=" + std::to_string(u[0]->chain_id)
                               + " (not the parent's): the parent payout uses its hash160");
+            if (primary.find('1') != std::string::npos
+                && std::any_of(u[0]->hrps.begin(), u[0]->hrps.end(),
+                               [&](const std::string& h) { return primary.rfind(h + "1", 0) == 0; }))
+                r.warnings.push_back("primary " + primary + " is a bech32 address of merged chain "
+                                     + std::to_string(u[0]->chain_id) + ": the parent payout is its witness "
+                                     "program as a parent-coin segwit output; give a parent address first");
         } else if (u.size() > 1) {
             r.warnings.push_back("primary address " + primary + " is an address of merged chains " + ids(u)
                                  + ": the parent payout and those chains use its key" + name_it);
@@ -264,16 +283,36 @@ inline LoginResolution resolve_merged_login(std::string primary, const std::stri
 
     if (r.usable_primary) {
         // Auto-derive: each configured chain without an address reuses the
-        // primary's hash160 (the same key spends on both chains).
+        // primary's key (the same key spends on both chains) as P2PKH. Not a
+        // P2SH primary: the redeem script behind it is unknown, and a
+        // P2SH-P2WPKH one is anyone-can-spend on a chain without segwit (DOGE);
+        // its merged chains need an address of their own. Without one, a V36
+        // share still pays the parent key as a P2SH (the V36 rule), and from
+        // the share version 3601 flag day the reward goes to the other miners
+        // (ltc share_check.hpp merged_parent_key).
         std::string atype;
         const auto h160 = core::address_to_hash160(primary, atype);
-        if (h160.size() == 40 && (atype == "p2pkh" || atype == "p2wpkh" || atype == "p2sh"))
+        if (h160.size() == 40 && (atype == "p2pkh" || atype == "p2wpkh")) {
             for (const auto* c : conf)
                 if (!r.addresses.count(c->chain_id)) {
                     r.addresses[c->chain_id] = primary;
                     r.notes.push_back("auto-derived merged address for chain_id=" + std::to_string(c->chain_id)
                                       + " from primary " + atype + " address");
                 }
+        } else if (h160.size() == 40 && atype == "p2sh") {
+            std::string missing;
+            for (const auto* c : conf)
+                if (!r.addresses.count(c->chain_id))
+                    missing += (missing.empty() ? "" : " and ") + std::to_string(c->chain_id);
+            if (!missing.empty()) {
+                r.p2sh_without_merged = true;
+                r.warnings.push_back("primary " + primary + " is a P2SH address: no merged address is derived "
+                                     "from it (a P2SH-P2WPKH script is anyone-can-spend on a chain without "
+                                     "segwit); chain(s) " + missing + " get no address, and from the share "
+                                     "version 3601 flag day their reward goes to the other miners — give one: "
+                                     "PRIMARY,MERGEDADDR or PRIMARY/CHAIN_ID:ADDRESS");
+            }
+        }
     } else if (!primary.empty()) {
         // Case 4: a valid DOGE address of this network as the second address.
         const auto* doge = find_chain(table, 98);

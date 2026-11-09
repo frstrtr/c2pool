@@ -7892,6 +7892,16 @@ int main(int argc, char* argv[]) {
                         cfg.p2p_port = static_cast<uint16_t>(doge_p2p_port);
                         LOG_INFO << "DOGE P2P port overridden via --doge-p2p-port: " << doge_p2p_port;
                     }
+                    // --no-embedded-doge: no DOGE networking of its own at all
+                    // (no header chain, no P2P peers, no DNS seeds), even with a
+                    // P2P port in the --merged spec: the daemon over RPC only.
+                    {
+                        const uint16_t port = c2pool::merged::merged_p2p_port(cfg.symbol, embedded_doge, cfg.p2p_port);
+                        if (port != cfg.p2p_port)
+                            LOG_INFO << "[MM:" << cfg.symbol << "] --no-embedded-doge: no DOGE P2P / DNS ("
+                                     << "the daemon at " << cfg.rpc_host << ":" << cfg.rpc_port << " over RPC only)";
+                        cfg.p2p_port = port;
+                    }
 
                     // Create DOGE HeaderChain when embedded OR P2P is available.
                     // Even in RPC-primary mode, the HeaderChain enables live header sync
@@ -10038,35 +10048,36 @@ int main(int argc, char* argv[]) {
             if (p2p_node) {
                 auto* redistributor_ptr = redistributor.get();
                 auto* node_ptr = p2p_node.get();
+                // The pick reads the tracker: only under its read lock (a
+                // try-lock from the stratum thread; when the compute thread
+                // holds it, the operator / donation identity instead). The
+                // callbacks are published under MiningInterface's mutex: the
+                // HTTP thread can build a payout too (mining_submit).
+                const auto hex160 = [](const uint160& h) {
+                    static const char* HEX = "0123456789abcdef";
+                    std::string out;
+                    out.reserve(40);
+                    const unsigned char* bytes = h.data();
+                    for (int i = 0; i < 20; ++i) {
+                        out += HEX[bytes[i] >> 4];
+                        out += HEX[bytes[i] & 0x0f];
+                    }
+                    return out;
+                };
+                const auto pick_locked = [redistributor_ptr, node_ptr]() {
+                    auto guard = node_ptr->read_tracker();
+                    return redistributor_ptr->pick_if_locked(guard, *guard, node_ptr->best_share_hash());
+                };
                 // The pick with its pubkey type (P2SH donation, a P2SH / P2WPKH
                 // miner): decide_job_payout pays the recipient's own script type.
                 web_server.get_mining_interface()->set_redistribute_fn(
-                    [redistributor_ptr, node_ptr]() -> std::pair<std::string, uint8_t> {
-                        auto best = node_ptr->best_share_hash();
-                        auto result = redistributor_ptr->pick(node_ptr->tracker(), best);
-                        static const char* HEX = "0123456789abcdef";
-                        std::string h160;
-                        h160.reserve(40);
-                        const unsigned char* bytes = result.pubkey_hash.data();
-                        for (int i = 0; i < 20; ++i) {
-                            h160 += HEX[bytes[i] >> 4];
-                            h160 += HEX[bytes[i] & 0x0f];
-                        }
-                        return {h160, result.pubkey_type};
+                    [pick_locked, hex160]() -> std::pair<std::string, uint8_t> {
+                        const auto result = pick_locked();
+                        return {hex160(result.pubkey_hash), result.pubkey_type};
                     });
                 web_server.get_mining_interface()->set_address_fallback_fn(
-                    [redistributor_ptr, node_ptr](const std::string& /*bad_addr*/) -> std::string {
-                        auto best = node_ptr->best_share_hash();
-                        auto result = redistributor_ptr->pick(node_ptr->tracker(), best);
-                        static const char* HEX = "0123456789abcdef";
-                        std::string h160;
-                        h160.reserve(40);
-                        const unsigned char* bytes = result.pubkey_hash.data();
-                        for (int i = 0; i < 20; ++i) {
-                            h160 += HEX[bytes[i] >> 4];
-                            h160 += HEX[bytes[i] & 0x0f];
-                        }
-                        return h160;
+                    [pick_locked, hex160](const std::string& /*bad_addr*/) -> std::string {
+                        return hex160(pick_locked().pubkey_hash);
                     });
             } else if (!payout_address.empty()) {
                 // Solo/custodial: invalid miner address → use node operator address

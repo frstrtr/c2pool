@@ -793,6 +793,7 @@ public:
     // --redistribute: the (hash160 hex, V36 pubkey type) a share without a
     // payout address a share can carry is given to (decide_job_payout).
     void set_redistribute_fn(std::function<std::pair<std::string, uint8_t>()> fn) {
+        std::lock_guard<std::mutex> l(m_redistribute_mu);
         m_redistribute_fn = std::move(fn);
     }
     // Donation script used by get_expected_payouts (p2pool protocol)
@@ -1530,7 +1531,12 @@ public:
     // Called when a share's primary address cannot be resolved to a valid hash160.
     // Receives the bad address string; must return a 40-char hex hash160, or "" to keep share.
     using address_fallback_fn_t = std::function<std::string(const std::string&)>;
-    void set_address_fallback_fn(address_fallback_fn_t fn) { m_address_fallback_fn = std::move(fn); }
+    // Set while the stratum thread may already build jobs: under m_redistribute_mu.
+    void set_address_fallback_fn(address_fallback_fn_t fn)
+    {
+        std::lock_guard<std::mutex> l(m_redistribute_mu);
+        m_address_fallback_fn = std::move(fn);
+    }
 
     // Return true if the merged-mining manager has a configured chain with chain_id.
     bool has_merged_chain(uint32_t chain_id) const override;
@@ -1982,6 +1988,7 @@ private:
     std::string m_node_fee_address;                 // node operator address (display/logging)
     std::map<uint32_t, std::vector<unsigned char>> m_operator_merged_scripts;
     std::function<std::pair<std::string, uint8_t>()> m_redistribute_fn;
+    mutable std::mutex m_redistribute_mu;   // m_redistribute_fn, m_address_fallback_fn
     std::vector<unsigned char> m_donation_script;   // protocol donation scriptPubKey
     std::function<double()> m_stratum_hashrate_fn;  // callback to get stratum total hashrate
     std::function<RateStats()> m_stratum_rate_stats_fn;  // callback to get rate monitor stats

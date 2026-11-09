@@ -745,6 +745,7 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
         // being given to one by guessing), then each configured chain without
         // one reuses the primary's hash160.
         bool usable_primary = true;
+        bool p2sh_without_merged = false;
         std::vector<unsigned char> parent_script;
         {
             auto res = core::merged_addr::resolve_merged_login(
@@ -760,6 +761,7 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
             merged_addresses_ = std::move(res.addresses);
             usable_primary = res.usable_primary;
             parent_script = std::move(res.parent_script);
+            p2sh_without_merged = res.p2sh_without_merged;
             std::set<uint32_t> given(named_now);
             given.insert(carried.begin(), carried.end());
             given.insert(res.from_login.begin(), res.from_login.end());
@@ -830,6 +832,23 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
                     {24, "Unauthorized: payout address is not for this coin "
                          "(and not a configured merged chain)", nullptr});
                 return response;
+            }
+            if (!payout_unusable_ && acfg.redistribute_unusable_logins && !username_.empty()) {
+                // A parent address a share cannot carry (P2WSH / P2TR: a V36
+                // share has a 20-byte payout hash): the work source
+                // redistributes its parent payout (decide_job_payout).
+                const auto spk = address_to_script(username_);
+                const bool carried = (spk.size() == 25 && spk[0] == 0x76) || (spk.size() == 23 && spk[0] == 0xa9)
+                                     || (spk.size() == 22 && spk[0] == 0x00 && spk[1] == 0x14);
+                if (!carried) {
+                    payout_warning_ = "P2WSH/P2TR address → redistributed";
+                    LOG_WARNING << "[Stratum] " << username_ << (worker_name_.empty() ? "" : "." + worker_name_)
+                                << ": a P2WSH/P2TR address cannot be carried by a V36 share (20-byte payout "
+                                   "hash): its LTC payout is redistributed (--redistribute); use a P2PKH or "
+                                   "P2WPKH address";
+                } else if (p2sh_without_merged) {
+                    payout_warning_ = "P2SH address → give a merged address";
+                }
             }
         }
 

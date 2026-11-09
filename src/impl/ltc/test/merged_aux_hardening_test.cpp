@@ -27,6 +27,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <functional>
 #include <future>
@@ -58,6 +59,9 @@
 #include <core/merged_chain_addr.hpp>
 #include <core/stratum_server.hpp>
 #include <core/web_server.hpp>
+#include <impl/ltc/redistribute.hpp>
+#include <impl/ltc/share_check.hpp>
+#include <shared_mutex>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -1855,7 +1859,7 @@ const std::vector<uint8_t> kLtcAllNetworks = {48, 50, 5, 111, 196, 58};   // mai
 // scripts by the chain-agnostic hash160 type.
 std::vector<unsigned char> master_doge_script(std::string username, std::string merged_raw, bool tn,
                                               std::map<uint32_t, std::string> explicit_addrs,
-                                              std::string* final_username = nullptr)
+                                              std::string* final_username = nullptr, bool derive_p2sh = true)
 {
     const std::vector<uint8_t> DOGE_V = {0x1e, 0x16, 0x71};
     std::map<uint32_t, std::string> m = explicit_addrs;
@@ -1878,7 +1882,8 @@ std::vector<unsigned char> master_doge_script(std::string username, std::string 
     }
     std::string atype;
     auto h = core::address_to_hash160(username, atype);
-    if (h.size() == 40 && (atype == "p2pkh" || atype == "p2wpkh" || atype == "p2sh") && !m.count(98))
+    if (h.size() == 40 && (atype == "p2pkh" || atype == "p2wpkh" || (derive_p2sh && atype == "p2sh"))
+        && !m.count(98))
         m[98] = username;
     if (final_username) *final_username = username;
     if (!m.count(98)) return {};
@@ -1915,7 +1920,11 @@ Login branch_login(const std::string& username, const std::string& merged_raw, b
 // second address that is not an address at all (bad checksum, junk, in the
 // comma or the slash form): the pre-change server wrote no DOGE address for
 // it (the share's DOGE weight then followed Tier 1.5); now, as p2pool does,
-// the chain gets the primary's hash160.
+// the chain gets the primary's hash160. And a P2SH primary's key is no longer
+// used on DOGE (a P2SH-P2WPKH script is anyone-can-spend there): without a
+// DOGE address of its own the chain gets none (the weight goes to the other
+// miners). A login whose payout address the pre-change server refused at the
+// door is now accepted and redistributed.
 TEST(MergedAuxStratumLogin, DogeOnlyPaysWhatItPaidForEveryLoginShape)
 {
     std::vector<unsigned char> p20(20, 0x42), p32(32, 0x43);
@@ -1946,6 +1955,8 @@ TEST(MergedAuxStratumLogin, DogeOnlyPaysWhatItPaidForEveryLoginShape)
             {"LTC/98:junk", b58(L, 0x01), "", {{98, "notanaddress"}}, true},
             {"LTC/98:DOGE(bad checksum)", b58(L, 0x01), "", {{98, bad_ck(doge)}}, true},
             {"DOGE,LTC (swapped)", doge, b58(L, 0x01)},
+            {"DOGE(bad checksum),LTC (swapped)", bad_ck(doge), b58(L, 0x01), {}, true},
+            {"DOGE(bad checksum),LTC-P2SH (swapped)", bad_ck(doge), b58(M, 0x02), {}, true},
             {"DOGE alone (case 5)", doge, ""},
             {"DOGE-P2SH alone (case 5)", doge_p2sh, ""},
             {"LTC,LTC2", b58(L, 0x01), b58(L, 0x09)},
@@ -1964,13 +1975,25 @@ TEST(MergedAuxStratumLogin, DogeOnlyPaysWhatItPaidForEveryLoginShape)
             {"DOGE/98:DOGE2 (case 5 overrides)", doge, "", {{98, b58(D, 0x31)}}},
         };
         for (const auto& u : us) {
-            const auto want = u.as_p2pool ? master_doge_script(u.primary, "", tn, {})
-                                          : master_doge_script(u.primary, u.merged, tn, u.expl);
-            if (u.as_p2pool) {
-                const auto before = master_doge_script(u.primary, u.merged, tn, u.expl);
-                EXPECT_NE(hex_of(std::vector<uint8_t>(want.begin(), want.end())),
-                          hex_of(std::vector<uint8_t>(before.begin(), before.end())))
-                    << u.name << ": the pre-change server differed here";
+            // as_p2pool: the first or second address is not an address at
+            // all; resolved as if absent (a swapped pair: the parent address).
+            std::string p2pool_primary = u.primary;
+            if (u.as_p2pool && !u.merged.empty() && u.primary == bad_ck(doge))
+                p2pool_primary = u.merged;
+            const auto want = u.as_p2pool ? master_doge_script(p2pool_primary, "", tn, {}, nullptr, false)
+                                          : master_doge_script(u.primary, u.merged, tn, u.expl, nullptr, false);
+            {
+                std::string final_user;
+                const auto before = master_doge_script(u.primary, u.merged, tn, u.expl, &final_user);
+                const auto before_np = u.as_p2pool ? master_doge_script(p2pool_primary, "", tn, {}, nullptr, true)
+                                                   : before;
+                if (want != before_np) {
+                    // only for a P2SH primary
+                    std::string at;
+                    core::address_to_hash160(u.as_p2pool ? p2pool_primary : final_user, at);
+                    EXPECT_EQ(at, "p2sh") << (tn ? "testnet " : "mainnet ") << u.name
+                                          << ": differs from the pre-change server for a non-P2SH primary";
+                }
             }
             const auto got = branch_login(u.primary, u.merged, tn, u.expl, {98}, 98);
             // The pre-change server refused at the door a login whose payout
@@ -2050,12 +2073,12 @@ TEST(MergedAuxStratumLogin, MultiAuxNeverGuessesNorRefuses)
     EXPECT_NE(r.warnings[0].find("not an address of any configured merged chain"), std::string::npos);
     r = branch_login(ltc, b58(48, 0x09), false, {}, {98}, 98);
     EXPECT_EQ(r.script, key(b58(48, 0x09)));
-    // an ambiguous primary (case 5): usable (the parent payout is its key),
-    // every chain its key
+    // an ambiguous primary (case 5): usable (the parent payout is its key);
+    // a P2SH key is not used on the merged chains: none of them gets an address
     r = branch_login(b58(22, 0x55), "", false, {}, {98, 63}, 98);
     EXPECT_TRUE(r.usable);
-    EXPECT_EQ(r.script, key(b58(22, 0x55)));
-    EXPECT_FALSE(r.warnings.empty());
+    EXPECT_TRUE(r.script.empty());
+    EXPECT_GE(r.warnings.size(), 2u);
     // swapped DOGE,LTC with DOGE + PEP: DOGE's alone
     r = branch_login(b58(30, 0x21), ltc, false, {}, {98, 63}, 98);
     EXPECT_EQ(r.primary, ltc);
@@ -2125,8 +2148,13 @@ TEST(MergedAuxStratumLogin, UnusablePrimaryIsRedistributedOrCase4)
     EXPECT_TRUE(r.parent_script.empty());
     EXPECT_EQ(r.addresses.at(63), b58(56, 0x31));
     EXPECT_FALSE(r.addresses.count(98)) << "no DOGE address derived from an unusable primary";
+    // a first address that is not an address before a valid LTC address: the
+    // LTC address is the primary (as the pre-change server paid it)
+    r = login(b58(30, 0x25).substr(1), b58(48, 0x01), {}, {98});
+    EXPECT_TRUE(r.usable_primary);
+    EXPECT_EQ(r.primary, b58(48, 0x01));
     // the fallback (a second address no chain identifies) needs a usable primary
-    EXPECT_TRUE(login(b58(30, 0x25).substr(1), b58(48, 0x01), {}, {98}).addresses.empty());
+    EXPECT_TRUE(login(b58(0, 0x61), b58(56, 0x31), {}, {98}).addresses.empty());
     // a P2WSH LTC address is usable (its key is the parent's) but has no hash160
     r = login(bech32::encode_segwit("ltc", 0, std::vector<unsigned char>(32, 0x43)), "", {}, {98});
     EXPECT_TRUE(r.usable_primary);
@@ -2500,10 +2528,11 @@ TEST(MergedAuxNodeFee, OperatorMergedScriptCascade)
     r = resolve_operator_merged_script("DOGE", AuxNetwork::mainnet, op_p2pkh, b58(113, 0x0c), "", don);
     EXPECT_EQ(r.script, core::hash160_to_merged_script(h160_of(op_p2pkh), "p2pkh"));
     EXPECT_FALSE(r.warning.empty());
-    // P2: P2SH operator stays P2SH
+    // a P2SH operator key is not converted (P2SH-P2WPKH is anyone-can-spend on
+    // DOGE): the donation script, with a warning
     r = resolve_operator_merged_script("DOGE", AuxNetwork::mainnet, op_p2sh, "", "", don);
-    EXPECT_EQ(r.script.size(), 23u);
-    EXPECT_EQ(r.script[0], 0xa9);
+    EXPECT_EQ(r.script, don);
+    EXPECT_FALSE(r.warning.empty());
     // P3: a P2WSH operator -> the donation script
     r = resolve_operator_merged_script("DOGE", AuxNetwork::mainnet,
                                        bech32::encode_segwit("ltc", 0, std::vector<unsigned char>(32, 0x44)), "", "", don);
@@ -2556,25 +2585,150 @@ TEST(MergedAuxNodeFee, RedistributedJobCarriesTheRecipientsMergedAddresses)
     Rig rig({{"DOGE", 98}, {"PEP", 63}});
     core::MiningInterface mi(false, nullptr);
     mi.set_merged_mining_manager(&rig.mm);
-    const std::string h = h160_of(b58(50, 0x2b));   // a P2SH recipient (e.g. the donation script)
-    mi.set_redistribute_fn([h]() { return std::pair<std::string, uint8_t>{h, 2}; });
+    std::string h = h160_of(b58(48, 0x2b));   // a P2PKH / P2WPKH recipient
+    uint8_t type = 1;
+    mi.set_redistribute_fn([&h, &type]() { return std::pair<std::string, uint8_t>{h, type}; });
     std::vector<unsigned char> payout;
     Merged merged;
     mi.decide_job_payout(payout, merged);
-    EXPECT_EQ(payout, core::hash160_to_merged_script(h, "p2sh"));
-    const auto floor = core::hash160_to_merged_script(h, "p2sh");
+    ASSERT_EQ(payout.size(), 22u) << "the recipient's own type: P2WPKH";
+    EXPECT_EQ(payout[0], 0x00);
+    const auto floor = core::hash160_to_merged_script(h, "p2pkh");
     EXPECT_EQ(merged, (Merged{{63, floor}, {98, floor}}));
     // an address the login named stays
     payout.clear();
     merged = {{63, core::address_to_script(b58(56, 0x31))}};
     mi.decide_job_payout(payout, merged);
     EXPECT_EQ(merged, (Merged{{63, core::address_to_script(b58(56, 0x31))}, {98, floor}}));
+    // a P2SH recipient: paid as P2SH on LTC, no merged address written (a P2SH
+    // redeem script may be anyone-can-spend on DOGE)
+    h = h160_of(b58(50, 0x2c));
+    type = 2;
+    payout.clear();
+    merged.clear();
+    mi.decide_job_payout(payout, merged);
+    EXPECT_EQ(payout, core::hash160_to_merged_script(h, "p2sh"));
+    EXPECT_TRUE(merged.empty());
     // a usable payout: nothing added
     payout = core::address_to_script(b58(48, 0x01));
     merged.clear();
     mi.decide_job_payout(payout, merged);
     EXPECT_EQ(payout, core::address_to_script(b58(48, 0x01)));
     EXPECT_TRUE(merged.empty());
+}
+
+// A P2SH primary's key is not used on merged chains (P2SH-P2WPKH is
+// anyone-can-spend on DOGE) and the login is told to give a merged address; a
+// mistyped first address before a valid parent address pays the parent
+// address (as before); a merged chain's bech32 address as the whole login warns.
+TEST(MergedAuxStratumLogin, P2shPrimaryNeedsAMergedAddress)
+{
+    using namespace core::merged_addr;
+    const auto table = merged_chain_table(false, kLtcAllNetworks);
+    const auto login = [&](const std::string& p, const std::string& m, std::map<uint32_t, std::string> e,
+                           std::set<uint32_t> conf) {
+        return resolve_merged_login(p, m, std::move(e), table, [conf](uint32_t id) { return conf.count(id) > 0; },
+                                    ltc_versions(false), kLtcHrps);
+    };
+    const std::string p2sh = b58(50, 0x02), legacy3 = b58(5, 0x03), doge = b58(30, 0x21);
+    for (const auto& primary : {p2sh, legacy3}) {
+        auto r = login(primary, "", {}, {98, 63});
+        EXPECT_TRUE(r.usable_primary);
+        EXPECT_TRUE(r.addresses.empty()) << "no merged address from a P2SH key";
+        EXPECT_TRUE(r.p2sh_without_merged);
+        ASSERT_FALSE(r.warnings.empty());
+        EXPECT_NE(r.warnings.back().find("P2SH"), std::string::npos);
+        // with the addresses given: paid there, no warning
+        r = login(primary, "", {{98, doge}, {63, b58(56, 0x31)}}, {98, 63});
+        EXPECT_FALSE(r.p2sh_without_merged);
+        EXPECT_EQ(r.addresses.at(98), doge);
+    }
+    // a P2WPKH primary is still auto-derived (its key is a plain key hash)
+    EXPECT_EQ(login(bech32::encode_segwit("ltc", 0, std::vector<unsigned char>(20, 0x42)), "", {}, {98}).addresses.size(),
+              1u);
+    // DOGE(bad checksum),LTC: the LTC address is paid, DOGE gets its key
+    const std::string bad = doge.substr(0, doge.size() - 1) + (doge.back() == 'z' ? "y" : "z");
+    auto r = login(bad, b58(48, 0x01), {}, {98});
+    EXPECT_TRUE(r.usable_primary);
+    EXPECT_EQ(r.primary, b58(48, 0x01));
+    EXPECT_EQ(r.addresses.at(98), b58(48, 0x01));
+    EXPECT_FALSE(r.warnings.empty());
+    r = login(bad, b58(48, 0x01), {}, {98, 63});
+    EXPECT_EQ(r.primary, b58(48, 0x01));
+    // a Bellscoin bech32 address as the whole login: case 5, with a warning
+    r = login(bech32::encode_segwit("bel", 0, std::vector<unsigned char>(20, 0x44)), "", {}, {16});
+    EXPECT_TRUE(r.usable_primary);
+    EXPECT_TRUE(r.addresses.count(16));
+    ASSERT_FALSE(r.warnings.empty());
+    EXPECT_NE(r.warnings.front().find("bech32"), std::string::npos);
+}
+
+// --no-embedded-doge: no DOGE networking of its own (no P2P, no DNS seeds),
+// whatever P2P port a --merged DOGE spec gives; other chains keep theirs.
+TEST(MergedAuxConfig, NoEmbeddedDogeHasNoDogeP2p)
+{
+    using c2pool::merged::merged_p2p_port;
+    EXPECT_EQ(merged_p2p_port("DOGE", false, 22556), 0);
+    EXPECT_EQ(merged_p2p_port("doge", false, 44556), 0);
+    EXPECT_EQ(merged_p2p_port("DOGE", true, 22556), 22556);
+    EXPECT_EQ(merged_p2p_port("PEP", false, 33874), 33874);
+    EXPECT_EQ(merged_p2p_port("DINGO", false, 33117), 33117);
+}
+
+// The redistribution pick reads the tracker: from the stratum thread only
+// under a try-acquired read lock (main_ltc.cpp: node.read_tracker()), else the
+// operator / donation identity. A compute thread adds shares under the
+// exclusive lock meanwhile (run under TSAN: merged_tsan_test).
+TEST(MergedAuxRedistribute, PickTakesTheTrackerReadLock)
+{
+    ltc::ShareTracker tr;
+    std::shared_mutex tracker_mutex;   // node.hpp m_tracker_mutex
+    const auto hxid = [](uint64_t n) {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%llx", static_cast<unsigned long long>(n));
+        uint256 v;
+        v.SetHex(std::string(64 - std::strlen(buf), '0') + buf);
+        return v;
+    };
+    const auto add = [&](uint64_t id, const uint256& prev) {
+        auto* sh = new ltc::MergedMiningShare();
+        sh->m_hash = hxid(id);
+        sh->m_prev_hash = prev;
+        sh->m_desired_version = 36;
+        sh->m_bits = 0x1e0fffff;
+        sh->m_max_bits = 0x1e0fffff;
+        sh->m_pubkey_hash.SetHex(std::string(38, '0') + std::to_string(id % 10) + "1");
+        ltc::ShareType st;
+        st = sh;
+        tr.add(st);
+        return sh->m_hash;
+    };
+    uint256 tip;
+    for (int i = 0; i < 200; ++i) tip = add(0x100 + i, tip);
+    std::atomic<uint64_t> best_id{0x100 + 199};
+    std::atomic<bool> stop{false};
+    std::thread compute([&] {
+        uint256 prev = tip;
+        for (int i = 200; i < 1200 && !stop; ++i) {
+            std::unique_lock<std::shared_mutex> l(tracker_mutex);
+            prev = add(0x100 + i, prev);
+            best_id = 0x100 + i;
+        }
+    });
+    uint160 op;
+    op.SetHex(std::string(38, '0') + "ee");
+    int picked = 0, busy = 0;
+    for (int i = 0; i < 300; ++i) {
+        ltc::Redistributor r;
+        r.set_mode(ltc::RedistributeMode::PPLNS);
+        r.set_operator_identity(op, 0);
+        std::shared_lock<std::shared_mutex> l(tracker_mutex, std::try_to_lock);
+        const auto res = r.pick_if_locked(l, tr, hxid(best_id.load()));
+        if (l) ++picked; else { ++busy; EXPECT_EQ(res.pubkey_hash, op); }
+    }
+    stop = true;
+    compute.join();
+    EXPECT_EQ(picked + busy, 300);
 }
 
 // ---- the commitment rule: generated parity vectors, log-only ----------------
