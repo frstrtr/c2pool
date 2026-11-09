@@ -2232,6 +2232,18 @@ int main(int argc, char* argv[]) {
     if (!payout_address.empty() && node_owner_address.empty() && node_owner_fee > 0.0)
         node_owner_address = payout_address;
 
+    // --solo / --custodial build their jobs on the global coinbase, which has
+    // no extranonce slot without a ref_hash: the miners' 8 extranonce bytes
+    // land after the last output and every block they find is invalid
+    // (bad-txnmrklroot; shares are still accepted, so nothing shows it).
+    // Refused until that is fixed, before anything binds.
+    if (solo_mode || custodial_mode) {
+        const char* msg = "--solo/--custodial are not supported in this release: blocks would be invalid; use pool mode";
+        LOG_ERROR << msg;
+        std::cerr << msg << std::endl;
+        return 1;
+    }
+
     // Guard against port conflicts between stratum and web dashboard
     if (stratum_port == http_port) {
         LOG_WARNING << "Stratum port " << stratum_port << " conflicts with web dashboard port"
