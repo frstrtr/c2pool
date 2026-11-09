@@ -22,12 +22,13 @@
 /// the same verdict on every share (cross-implementation KATs:
 /// merged_aux_hardening_test.cpp, p2pool test_v36_merged_multi_aux_tree.py).
 ///
-/// This release the rule is LOG-ONLY in the share check (a share it flags is
-/// counted and logged, never rejected): nodes that commit to a tree over
-/// chains they do not carry (c2pool up to this release with two or more
-/// --merged chains, one of them without a block) would otherwise be split
-/// off. TODO(enforcement): reject behind a share-version / ratchet gate once
-/// the producers of such shares are gone.
+/// The LTC share check enforces the rule for share version 3601 (the flag-day
+/// share every producer of which builds compliant commitments: ltc
+/// share_check.hpp merged_aux_commitment_problem) and keeps it LOG-ONLY for
+/// V36 shares (a share it flags is counted and logged, never rejected): nodes
+/// that commit to a tree over chains they do not carry (c2pool before v0.2.12
+/// with two or more --merged chains, one of them without a block) would
+/// otherwise be split off.
 
 #include <core/hash.hpp>
 #include <core/uint256.hpp>

@@ -2576,6 +2576,7 @@ public:
                 // Classify script type for diagnostics
                 auto classify = [](const std::vector<unsigned char>& s) -> const char* {
                     if (is_merged_key(s)) return "MERGED";
+                    if (is_unpaid_key(s)) return "UNPAID";
                     if (s.size() == 25 && s[0] == 0x76 && s[1] == 0xa9) return "P2PKH";
                     if (s.size() == 23 && s[0] == 0xa9) return "P2SH";
                     if (s.size() == 22 && s[0] == 0x00 && s[1] == 0x14) return "P2WPKH-RAW";
@@ -2632,9 +2633,15 @@ public:
     // p2pool MergedWeightsSkipList.get_delta (data.py:1864).
     //
     //   chain_id == nullopt : hash / v36 path — no merged-address resolution.
-    //   chain_id has value  : per-chain path — Tier 1 explicit merged_addresses,
-    //                         Tier 1.5 retroactive miner→merged lookup (normalize
-    //                         used only as a lookup PROBE), else the default key.
+    //   chain_id has value  : per-chain path, by the share's version
+    //                         (share_check.hpp, above UNPAID_KEY_PREFIX):
+    //                         V36  — Tier 1 explicit merged_addresses, Tier 1.5
+    //                                retroactive miner→merged lookup (normalize
+    //                                used only as a lookup PROBE), else the
+    //                                default key;
+    //                         3601 — Tier 1, else merged_parent_key (the parent
+    //                                script, or UNPAID: for a P2SH one). Never
+    //                                another share's address.
     //
     // Pre-V36 shares count toward window sizing but contribute zero weight
     // (p2pool returns (1, {}, 0, 0)); total_weight/donation are only set once a
@@ -2669,27 +2676,34 @@ public:
                         break;
                     }
                 }
-                // Tier 1.5: retroactive lookup of the same miner's explicit merged
+                // Tier 1.5 (V36 shares): retroactive lookup of the same miner's explicit merged
                 // address from their other shares.  Try the raw parent script, then
                 // its normalized P2PKH form (normalize is a lookup PROBE only here).
-                // Only for shares of the old rule (desired_version < 37,
-                // MERGED_OWN_ADDRESS_DESIRED_VERSION): a newer share without an
-                // address for the chain pays its own parent script.
-                if (weight_key.empty() && obj->m_desired_version < MERGED_OWN_ADDRESS_DESIRED_VERSION)
+                if constexpr (ShareT::version < FLAG_DAY_SHARE_VERSION)
                 {
-                    auto table_it = m_miner_merged_addr.find(*chain_id);
-                    if (table_it != m_miner_merged_addr.end())
+                    if (weight_key.empty())
                     {
-                        auto miner_it = table_it->second.find(parent_script);
-                        if (miner_it == table_it->second.end())
+                        auto table_it = m_miner_merged_addr.find(*chain_id);
+                        if (table_it != m_miner_merged_addr.end())
                         {
-                            auto norm = normalize_script_for_merged(parent_script);
-                            if (!norm.empty() && norm != parent_script)
-                                miner_it = table_it->second.find(norm);
+                            auto miner_it = table_it->second.find(parent_script);
+                            if (miner_it == table_it->second.end())
+                            {
+                                auto norm = normalize_script_for_merged(parent_script);
+                                if (!norm.empty() && norm != parent_script)
+                                    miner_it = table_it->second.find(norm);
+                            }
+                            if (miner_it != table_it->second.end())
+                                weight_key = make_merged_key(miner_it->second);
                         }
-                        if (miner_it != table_it->second.end())
-                            weight_key = make_merged_key(miner_it->second);
                     }
+                }
+                // 3601 shares: no Tier 1.5; the share's own parent key, unless
+                // it is a P2SH (no safe merged form: spread over the other
+                // payees, share_check.hpp merged_parent_key).
+                else if (weight_key.empty())
+                {
+                    weight_key = merged_parent_key(parent_script);
                 }
             }
         }
@@ -2880,6 +2894,7 @@ public:
                 aux_unlimited.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
                 auto classify_aux = [](const std::vector<unsigned char>& s) -> const char* {
                     if (is_merged_key(s)) return "MERGED";
+                    if (is_unpaid_key(s)) return "UNPAID";
                     if (s.size() == 25 && s[0] == 0x76 && s[1] == 0xa9) return "P2PKH";
                     if (s.size() == 23 && s[0] == 0xa9) return "P2SH";
                     if (s.size() == 22 && s[0] == 0x00 && s[1] == 0x14) return "P2WPKH-RAW";
@@ -3127,6 +3142,8 @@ private:
     {
         if constexpr (requires { share->m_merged_addresses; })
         {
+            // V36 shares only: a 3601 share neither feeds nor uses Tier 1.5.
+            if constexpr (ShareT::version >= FLAG_DAY_SHARE_VERSION) return;
             if (share->m_desired_version < 36) return;
             if (share->m_merged_addresses.empty()) return;
             auto parent_script = get_share_script(share);

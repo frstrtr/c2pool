@@ -19,6 +19,7 @@
 #include <iomanip>
 #include <random>
 #include <unordered_map>
+#include <ctime>
 #ifndef _WIN32
 #include <execinfo.h>  // backtrace() for think() watchdog stack dump (glibc-only)
 #endif
@@ -328,6 +329,15 @@ std::optional<pool::PeerConnectionType> NodeImpl::handle_version(std::unique_ptr
                         << " protocol " << msg->m_version
                         << " < minimum " << m_tracker.m_params->minimum_protocol_version
                         << ", disconnecting";
+            throw std::runtime_error("peer protocol too old");
+        }
+        // From the share version 3601 flag day on, a peer that cannot load a
+        // 3601 share is refused the same clean way (no ban).
+        if (!peer_takes_3601(msg->m_version)
+            && v3601_flag_day_passed(static_cast<uint32_t>(std::time(nullptr))))
+        {
+            drop_pre_3601_peer(peer->addr(), pre_3601_peer_line(msg->m_addr_from.m_endpoint.to_string(),
+                                                                msg->m_version, msg->m_subversion));
             throw std::runtime_error("peer protocol too old");
         }
 
@@ -738,6 +748,45 @@ void NodeImpl::note_invalid_pow_share(NetService addr)
 // on the io thread each think cycle, alongside the other periodic prunes, and
 // MUST use the same steady_clock timebase as note_invalid_pow_share() so the
 // decay math is consistent (std::time() would be a different epoch).
+bool NodeImpl::peer_takes_3601_at(const NetService& addr) const
+{
+    for (const auto& [nonce, peer] : m_peers)
+        if (peer && peer->addr() == addr)
+            return peer_takes_3601(peer->m_other_version);
+    return false;
+}
+
+void NodeImpl::drop_pre_3601_peer(const NetService& addr, const std::string& line)
+{
+    const auto now = std::chrono::steady_clock::now();
+    auto& until = m_pre_3601_until[addr];
+    if (until <= now)
+        LOG_WARNING << "[Pool] " << line;   // once an hour per address
+    else
+        LOG_DEBUG_POOL << "[Pool] " << line;
+    until = now + std::chrono::hours(1);
+    // A deliberate close: what we sent it is not "rejected by the peer".
+    m_last_broadcast_to.erase(addr);
+    if (m_pre_3601_until.size() > 4096)
+        for (auto it = m_pre_3601_until.begin(); it != m_pre_3601_until.end(); )
+            it = it->second <= now ? m_pre_3601_until.erase(it) : std::next(it);
+}
+
+void NodeImpl::disconnect_pre_3601_peers()
+{
+    if (!v3601_flag_day_passed(static_cast<uint32_t>(std::time(nullptr))))
+        return;
+    std::vector<std::pair<NetService, std::string>> old;
+    for (const auto& [nonce, peer] : m_peers)
+        if (peer && !peer_takes_3601(peer->m_other_version))
+            old.emplace_back(peer->addr(), pre_3601_peer_line(peer->addr().to_string(), peer->m_other_version,
+                                                              peer->m_other_subversion));
+    for (const auto& [addr, line] : old) {
+        drop_pre_3601_peer(addr, line);
+        close_connection(addr);
+    }
+}
+
 void NodeImpl::prune_pow_misbehavior()
 {
     const double now_s = std::chrono::duration<double>(
@@ -1122,6 +1171,8 @@ std::vector<ltc::ShareType> NodeImpl::handle_get_share(std::vector<uint256> hash
     }
 
     parents = std::min(parents, (uint64_t)1000/hashes.size());
+    // No 3601 share to a peer that cannot load one.
+    const bool takes_3601 = peer_takes_3601_at(peer_addr);
 	std::vector<ltc::ShareType> shares;
 	for (const auto& handle_hash : hashes)
 	{
@@ -1141,6 +1192,8 @@ std::vector<ltc::ShareType> NodeImpl::handle_get_share(std::vector<uint256> hash
 			if (std::find(stops.begin(), stops.end(), hash) != stops.end())
 				break;
 			if (m_rejected_share_hashes.count(hash))
+				continue;
+			if (!takes_3601 && data.share.version() >= FLAG_DAY_SHARE_VERSION)
 				continue;
 			shares.push_back(data.share);
 		}
@@ -1181,7 +1234,9 @@ std::vector<uint256> NodeImpl::send_shares(peer_ptr peer, const std::vector<uint
         return {};
     }
 
-    // Collect shares that exist in our chain (skip rejected)
+    // Collect shares that exist in our chain (skip rejected; no 3601 share
+    // to a peer that cannot load one)
+    const bool takes_3601 = peer_takes_3601(peer->m_other_version);
     std::vector<ShareType> shares;
     for (const auto& hash : share_hashes)
     {
@@ -1192,7 +1247,8 @@ std::vector<uint256> NodeImpl::send_shares(peer_ptr peer, const std::vector<uint
         // Retrieve the share via get_chain(hash, 1) — first element is the share itself
         for (auto [h, data] : m_chain->get_chain(hash, 1))
         {
-            shares.push_back(data.share);
+            if (takes_3601 || data.share.version() < FLAG_DAY_SHARE_VERSION)
+                shares.push_back(data.share);
             break;
         }
     }
@@ -2258,6 +2314,10 @@ void NodeImpl::start_outbound_connections()
         m_tx_advert_timer = std::make_unique<core::Timer>(m_context, true);
         m_tx_advert_timer->start(core::TX_ADVERT_INTERVAL_SECONDS,
                                  [this]() { advertise_known_txs(); });
+        // Share version 3601 flag day: no peer below 3601 stays past it (a
+        // timer of its own: on a quiet chain no think cycle runs).
+        m_flag_day_timer = std::make_unique<core::Timer>(m_context, true);
+        m_flag_day_timer->start(5, [this]() { disconnect_pre_3601_peers(); });
     }
 
     if (m_target_outbound_peers == 0)
@@ -2281,6 +2341,11 @@ void NodeImpl::start_outbound_connections()
                 break;
             // Skip if already connected, already dialing, or banned
             if (m_connections.contains(ap.addr) || m_pending_outbound.contains(ap.addr) || is_banned(ap.addr))
+                continue;
+            // A peer refused as too old for share version 3601: not redialed
+            // for an hour (it is not banned).
+            if (auto old = m_pre_3601_until.find(ap.addr);
+                old != m_pre_3601_until.end() && old->second > std::chrono::steady_clock::now())
                 continue;
 
             LOG_INFO << "[Pool] Dialing outbound peer " << ap.addr.to_string();
@@ -2674,6 +2739,7 @@ void NodeImpl::run_think()
                 if (it->second <= now) it = m_ban_list.erase(it);
                 else ++it;
             }
+
 
             // Clear stale download set (p2pool node.py:108-141)
             m_downloading_shares.clear();

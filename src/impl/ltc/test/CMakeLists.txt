@@ -356,6 +356,13 @@ if (BUILD_TESTING AND GTest_FOUND)
     # to the pre-fix bytes; every tracker copy takes the cache lock. Same
     # folding rule.
     #
+    # share_v3601_flag_day_test.cpp: share version 3601, the flag day: the
+    # version follows from the share's timestamp (not the ratchet), the
+    # boundary skips the 60% switch gate (V35 -> V36 keeps it), straddling
+    # and reorgs across the day, a 3601 share reloads as one and an old node
+    # cannot load it, peers below protocol 3601, and the AuxPoW commitment
+    # rule enforced for 3601 shares only. Same folding rule.
+    #
     # best_share_hash_lock_test.cpp: NodeImpl::best_share_hash() reads the
     # tracker under the reader discipline (direct on the compute thread, a
     # shared try-lock elsewhere, the published verified best while busy, the
@@ -436,6 +443,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         share_message_unpack_bounds_test.cpp
         share_remove_owns_data_test.cpp
         share_test.cpp
+        share_v3601_flag_day_test.cpp
         template_gap_gate_test.cpp
         template_hogex_survives_truncation_test.cpp
         template_mweb_ext_merge_test.cpp

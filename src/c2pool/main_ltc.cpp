@@ -19,6 +19,7 @@
 #include <chrono>
 #include <csignal>
 #include <ctime>
+#include <optional>
 #include <memory>
 #include <vector>
 #ifndef _WIN32
@@ -649,6 +650,9 @@ void print_help() {
 
     std::cout << "PRIVATE SHARECHAIN:\n";
     std::cout << "  --network-id ID           Private network identifier (hex, e.g. DEADBEEF)\n";
+    std::cout << "  --v3601-activation-time T Share version 3601 flag day, unix time (testnet or a\n";
+    std::cout << "                            private --network-id chain only; mainnet uses the\n";
+    std::cout << "                            compiled time)\n";
     std::cout << "                            Default: 0 (public p2pool network)\n";
     std::cout << "                            Nonzero: creates a private sharechain. P2P prefix\n";
     std::cout << "                            and THE metadata will carry this ID on the blockchain.\n";
@@ -1041,6 +1045,7 @@ int main(int argc, char* argv[]) {
 
     // Private sharechain
     uint64_t network_id = 0;        // 0 = public p2pool network, nonzero = private (full 8 bytes)
+    std::optional<uint64_t> v3601_activation_time;   // testnet / private chain only
     std::string prefix_override_hex; // explicit --prefix; empty = compiled per-network default
 
     // Startup mode: wait (default, p2pool persist=true), genesis, auto
@@ -1589,6 +1594,10 @@ int main(int argc, char* argv[]) {
         else if (arg == "--coinbase-text" && i + 1 < argc) {
             coinbase_text = argv[++i];
             cli_explicit.insert("coinbase_text");
+        }
+        else if (arg == "--v3601-activation-time" && i + 1 < argc) {
+            v3601_activation_time = std::stoull(argv[++i]);
+            cli_explicit.insert("v3601_activation_time");
         }
         else if ((arg == "--network-id" || arg == "--chain-id") && i + 1 < argc) {
             // Full 8-byte identifier: parse as 64-bit, never truncate to 32 bits
@@ -5017,6 +5026,30 @@ int main(int argc, char* argv[]) {
             // Set testnet flag for runtime constant selection (SHARE_PERIOD, CHAIN_LENGTH, etc.)
             ltc::PoolConfig::is_testnet = settings->m_testnet;
 
+            // Share version 3601 flag day: compiled, except on testnet or a
+            // private chain (every node of a network must use the same time).
+            if (v3601_activation_time) {
+                if (!settings->m_testnet && network_id == 0) {
+                    const std::string msg = "--v3601-activation-time is for testnet or a private --network-id "
+                                            "chain only: on mainnet every node uses the compiled flag day";
+                    LOG_ERROR << msg;
+                    std::cerr << "c2pool: " << msg << std::endl;
+                    return 1;
+                }
+                if (*v3601_activation_time > 0xFFFFFFFFull) {
+                    LOG_ERROR << "--v3601-activation-time " << *v3601_activation_time << " is not a 32-bit unix time";
+                    return 1;
+                }
+                ltc::PoolConfig::v3601_activation_time_override = static_cast<uint32_t>(*v3601_activation_time);
+            }
+            if (ltc::PoolConfig::v3601_activation_time() == 0xFFFFFFFFu)
+                LOG_INFO << "[Sharechain] share version 3601 flag day: not scheduled";
+            else
+                LOG_INFO << "[Sharechain] share version 3601 flag day: " << ltc::PoolConfig::v3601_activation_time()
+                         << (v3601_activation_time ? " (--v3601-activation-time)" : " (compiled)")
+                         << "; peers below protocol " << ltc::PoolConfig::V3601_PROTOCOL_VERSION
+                         << " are disconnected from then on";
+
             // Private chain: override IDENTIFIER and PREFIX before any P2P or share ops
             if (network_id != 0) {
                 std::ostringstream hex;
@@ -5589,6 +5622,8 @@ int main(int argc, char* argv[]) {
             {
                 auto [initial_ver, initial_desired] = auto_ratchet->get_share_version(
                     p2p_node->tracker(), uint256());
+                // Past the 3601 flag day the version is 3601, not the ratchet's.
+                initial_ver = ltc::flag_day_share_version(initial_ver, static_cast<uint32_t>(std::time(nullptr)));
                 auto donation_script = ltc::PoolConfig::get_donation_script(initial_ver);
                 web_server.get_mining_interface()->set_donation_script(donation_script);
                 web_server.get_mining_interface()->set_cached_share_version(initial_ver);
@@ -7025,6 +7060,16 @@ int main(int argc, char* argv[]) {
 
                 auto [share_version, desired_ver] = auto_ratchet->get_share_version(
                     *guard, best_hash);
+                // Past the 3601 flag day the jobs build 3601 shares (V36
+                // PPLNS), whatever the ratchet says: the job timestamp is at
+                // least now and the tip's + 1 (ref_hash_fn decides it exactly).
+                {
+                    std::optional<uint32_t> tip_ts;
+                    if (!best_hash.IsNull() && guard->chain.contains(best_hash))
+                        guard->chain.get(best_hash).share.invoke([&](auto* tip) { tip_ts = tip->m_timestamp; });
+                    share_version = ltc::job_share_version(share_version, static_cast<uint32_t>(std::time(nullptr)),
+                                                           tip_ts);
+                }
                 // Update donation script + cached version so refresh_work() and
                 // build_connection_coinbase() use the correct one.
                 auto correct_donation = ltc::PoolConfig::get_donation_script(share_version);
@@ -7078,12 +7123,22 @@ int main(int argc, char* argv[]) {
                     // AutoRatchet: determine share version from network state
                     auto [share_version, desired_ver] = auto_ratchet->get_share_version(
                         *guard, frozen_prev_share);
-                    // V36 shares this node makes resolve their merged payout
-                    // from themselves only (share_check.hpp
-                    // MERGED_OWN_ADDRESS_DESIRED_VERSION); still a V36 vote.
-                    if (share_version >= 36)
-                        desired_ver = std::max<int64_t>(desired_ver,
-                                                        static_cast<int64_t>(ltc::MERGED_OWN_ADDRESS_DESIRED_VERSION));
+                    // The 3601 flag day: the version follows from this share's
+                    // timestamp (ntime clipped to the parent's + 1, as below),
+                    // not from the ratchet. 3601 shares vote as the ratchet
+                    // does (desired_version 36).
+                    {
+                        std::optional<uint32_t> parent_ts;
+                        if (!frozen_prev_share.IsNull() && guard->chain.contains(frozen_prev_share))
+                            guard->chain.get(frozen_prev_share).share.invoke([&](auto* prev) {
+                                parent_ts = prev->m_timestamp;
+                            });
+                        const int64_t v = ltc::job_share_version(share_version, timestamp, parent_ts);
+                        if (v != share_version) {
+                            share_version = v;
+                            desired_ver = std::max<int64_t>(desired_ver, 36);
+                        }
+                    }
                     {
                         static int rv_log = 0;
                         if (rv_log++ < 5 || rv_log % 100 == 0)

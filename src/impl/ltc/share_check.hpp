@@ -26,6 +26,7 @@
 
 #include <algorithm>
 #include <array>
+#include <optional>
 #include <cstring>
 #include <stdexcept>
 #include <vector>
@@ -859,6 +860,8 @@ inline std::vector<unsigned char> pubkey_hash_to_script(const uint160& hash, uin
 //
 // Returns empty vector for unconvertible scripts (Tier 3: redistributed).
 // Matches Python data.py:build_canonical_merged_coinbase() conversion logic.
+// The parent key of a V36 share is resolved this way; a 3601 share's P2SH
+// parent key never reaches it (merged_parent_key below).
 // ============================================================================
 inline std::vector<unsigned char> normalize_script_for_merged(
     const std::vector<unsigned char>& script)
@@ -891,17 +894,59 @@ inline std::vector<unsigned char> normalize_script_for_merged(
     return {};
 }
 
-// The merged payout rule of a V36 share, by its desired_version (the share
-// version v0.2.12 nodes produce: V36 format, desired_version 37):
-//   < 37: Tier 1 (the share's own merged address for the chain), else Tier
-//         1.5 (the first explicit merged address this node has seen for the
-//         share's parent script), else the parent script;
-//  >= 37: Tier 1, else the share's own parent script. No Tier 1.5: one share's
-//         merged address never pays for another share, and every node derives
-//         the same payout whatever order it received the shares in.
-// Shares of either version are resolved by their own rule in every window, so
-// the shares already in the window when nodes upgrade keep theirs.
-inline constexpr uint64_t MERGED_OWN_ADDRESS_DESIRED_VERSION = 37;
+// The merged payout of a share for a chain, by its share version:
+//   36 (V36): its own merged address for the chain (Tier 1), else the first
+//        merged address this node has seen in a V36 share of the same parent
+//        script (Tier 1.5, ShareTracker::try_register_merged_addr), else its
+//        parent script converted as above (P2SH as P2SH) — the rule of p2pool
+//        and of c2pool before the flag day, unchanged.
+//   3601 (FLAG_DAY_SHARE_VERSION): from the share alone — its own merged
+//        address for the chain, else its own parent key when that is P2PKH /
+//        P2WPKH (as P2PKH) or the pool's donation script; any other parent
+//        key (a P2SH: its redeem script is unknown, and a P2SH-P2WPKH one is
+//        anyone-can-spend on a chain without segwit, DOGE) pays no one: the
+//        share's weight is spread over the block's other payees (an UNPAID:
+//        key, resolve_merged_payout_script). A 3601 share neither feeds nor
+//        uses Tier 1.5, so one share's merged address never pays for another
+//        share and every node derives the same payout whatever order it
+//        received the shares in.
+// Each share is resolved by its own version's rule in every window, so the
+// V36 shares in the window at the flag day keep their payouts. c2pool peers
+// never re-derive a merged coinbase (merged_payout_hash covers parent scripts
+// only), so the rule decides no share's validity.
+
+// UNPAID: prefix for the weight key of a 3601 share whose parent key has no
+// safe merged form (merged_parent_key): the weight stays in the window (its
+// size is unchanged) and resolves to no payee, so accepted_total leaves it out
+// and it is spread pro-rata over the other payees. 7 bytes: "UNPAID:". A raw
+// parent script never starts with it (P2PKH 76, P2WPKH 00, P2SH a9).
+inline constexpr std::array<unsigned char, 7> UNPAID_KEY_PREFIX = {
+    0x55, 0x4e, 0x50, 0x41, 0x49, 0x44, 0x3a
+};
+
+inline bool is_unpaid_key(const std::vector<unsigned char>& key)
+{
+    return key.size() > UNPAID_KEY_PREFIX.size()
+           && std::equal(UNPAID_KEY_PREFIX.begin(), UNPAID_KEY_PREFIX.end(), key.begin());
+}
+
+// The weight key of a 3601 share without a merged address for the chain: its
+// raw parent script when that converts safely (P2PKH, P2WPKH, the pool's
+// donation script — resolved by normalize_script_for_merged like a V36
+// share's), else UNPAID: + the script.
+inline std::vector<unsigned char> merged_parent_key(const std::vector<unsigned char>& parent_script)
+{
+    const bool p2sh = parent_script.size() == 23 && parent_script[0] == 0xa9 && parent_script[1] == 0x14
+                      && parent_script[22] == 0x87;
+    const bool donation = std::equal(parent_script.begin(), parent_script.end(),
+                                     PoolConfig::COMBINED_DONATION_SCRIPT.begin(),
+                                     PoolConfig::COMBINED_DONATION_SCRIPT.end());
+    if (!p2sh || donation)
+        return parent_script;
+    std::vector<unsigned char> key(UNPAID_KEY_PREFIX.begin(), UNPAID_KEY_PREFIX.end());
+    key.insert(key.end(), parent_script.begin(), parent_script.end());
+    return key;
+}
 
 // MERGED: prefix for weight map keys — matches p2pool's 'MERGED:' + hex string.
 // Keeps Tier 1/1.5 (explicit DOGE script) keys separate from raw LTC script keys
@@ -941,6 +986,7 @@ inline std::vector<unsigned char> strip_merged_key(
 
 // Resolve a weight map key to a DOGE-compatible scriptPubKey.
 // MERGED:-prefixed keys: strip prefix, use directly (already a DOGE script).
+// UNPAID:-prefixed keys (a 3601 share's P2SH parent key): no payee.
 // Raw keys: autoconvert (P2WPKH→P2PKH, P2PKH/P2SH pass through).
 // Returns empty if unconvertible (P2WSH, P2TR, etc.).
 inline std::vector<unsigned char> resolve_merged_payout_script(
@@ -948,7 +994,62 @@ inline std::vector<unsigned char> resolve_merged_payout_script(
 {
     if (is_merged_key(key))
         return strip_merged_key(key);
+    if (is_unpaid_key(key))
+        return {};
     return normalize_script_for_merged(key);
+}
+
+// ============================================================================
+// Share version 3601 flag day (share.hpp FLAG_DAY_SHARE_VERSION)
+//
+// Not voted: the share version is fixed by the share's own timestamp against
+// PoolConfig::v3601_activation_time(). Neither the share hash nor the
+// generation transaction commits to the type number (36 and 3601 build the
+// same coinbase), so this rule is what makes exactly one of the two valid for
+// any share.
+// ============================================================================
+
+// The version of a share with timestamp `ts`: 3601 at or after the flag day;
+// before it, the version the AutoRatchet chose (35 / 36). The ratchet is not
+// consulted after the flag day.
+inline int64_t flag_day_share_version(int64_t ratchet_version, uint32_t ts)
+{
+    return ts >= PoolConfig::v3601_activation_time() ? FLAG_DAY_SHARE_VERSION : ratchet_version;
+}
+
+// The version of the share a job builds: its timestamp is the job's ntime
+// clipped to the parent's + 1 (as ref_hash_fn and create_local_share clip it),
+// so a job on a 3601 parent always builds a 3601 share.
+inline int64_t job_share_version(int64_t ratchet_version, uint32_t ntime, std::optional<uint32_t> parent_ts)
+{
+    uint32_t ts = ntime;
+    if (parent_ts && ts <= *parent_ts)
+        ts = *parent_ts + 1;
+    return flag_day_share_version(ratchet_version, ts);
+}
+
+// "" when a share of `version` with timestamp `ts`, whose parent (when known)
+// is of `parent_version`, obeys the flag day; else why not:
+//   - a 3601 share's timestamp is at or after the flag day;
+//   - any other share's is before it;
+//   - a 3601 share's child is a 3601 share (received timestamps are not
+//     checked to increase, so this is not implied by the two above).
+// The boundary into 3601 does not go through the 60% switch gate (check(),
+// step 2); its parent may be of any earlier version, so a chain cannot stall
+// at the flag day.
+inline std::string flag_day_problem(int64_t version, uint32_t ts, std::optional<int64_t> parent_version)
+{
+    const uint32_t t = PoolConfig::v3601_activation_time();
+    if (version == FLAG_DAY_SHARE_VERSION && ts < t)
+        return "share version 3601 before the flag day (timestamp " + std::to_string(ts) + " < "
+               + std::to_string(t) + ")";
+    if (version != FLAG_DAY_SHARE_VERSION && ts >= t)
+        return "share version " + std::to_string(version) + " at or after the share version 3601 flag day "
+               + "(timestamp " + std::to_string(ts) + " >= " + std::to_string(t) + "): peer too old, upgrade to "
+               + "c2pool v0.2.12";
+    if (parent_version && *parent_version == FLAG_DAY_SHARE_VERSION && version != FLAG_DAY_SHARE_VERSION)
+        return "share version " + std::to_string(version) + " after a share version 3601 parent";
+    return {};
 }
 
 // ============================================================================
@@ -1642,6 +1743,56 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, const
 //
 // Returns empty string on success, error message on failure.
 // ============================================================================
+// The AuxPoW commitment of a share that carries merged blocks: the mm_data
+// (fabe6d6d | root | size | nonce) in its coinbase scriptSig is the tree over
+// exactly the blocks in its merged_coinbase_info (c2pool::merged::
+// check_merged_aux_commitment, p2pool data.py merged_aux_commitment_problem);
+// with one chain at size 1 the root is that block's hash. "" when it is.
+// Needs no share chain. Enforced for 3601 shares; for V36 shares the tree
+// rule is counted and logged only (verify_merged_coinbase_commitment).
+template <typename ShareT>
+std::string merged_aux_commitment_problem(const ShareT& share)
+{
+    if constexpr (!requires { share.m_merged_coinbase_info; })
+        return {};
+    if (share.m_merged_coinbase_info.empty())
+        return {};
+    const auto& coinbase = share.m_coinbase.m_data;
+    static const uint8_t MM_MAGIC[] = {0xfa, 0xbe, 0x6d, 0x6d};
+    auto mm_pos = std::search(coinbase.begin(), coinbase.end(), std::begin(MM_MAGIC), std::end(MM_MAGIC));
+    if (mm_pos == coinbase.end())
+        return "merged_coinbase_info present but no mm_data marker in coinbase scriptSig";
+    const size_t mm_offset = std::distance(coinbase.begin(), mm_pos) + 4;
+    if (coinbase.size() - mm_offset < 40)
+        return "mm_data too short in coinbase scriptSig";
+    uint256 aux_merkle_root;
+    {
+        const uint8_t* p = coinbase.data() + mm_offset;
+        uint8_t* dst = reinterpret_cast<uint8_t*>(aux_merkle_root.begin());
+        for (int i = 31; i >= 0; --i)
+            dst[i] = *p++;
+    }
+    const uint8_t* sp = coinbase.data() + mm_offset + 32;
+    const uint32_t aux_size = sp[0] | (sp[1] << 8) | (sp[2] << 16) | (static_cast<uint32_t>(sp[3]) << 24);
+    std::vector<std::pair<uint32_t, std::vector<unsigned char>>> carried;
+    carried.reserve(share.m_merged_coinbase_info.size());
+    for (const auto& info : share.m_merged_coinbase_info) {
+        if (info.m_block_header.m_data.size() < 80)
+            return "merged block header too short";
+        carried.emplace_back(info.m_chain_id, info.m_block_header.m_data);
+    }
+    auto why = c2pool::merged::check_merged_aux_commitment(carried, aux_merkle_root, aux_size);
+    if (!why.empty())
+        return why;
+    if (aux_size == 1) {
+        const auto& h = share.m_merged_coinbase_info.front().m_block_header.m_data;
+        if (Hash(std::span<const unsigned char>(h.data(), 80)) != aux_merkle_root)
+            return "merged block hash != aux_merkle_root for chain "
+                   + std::to_string(share.m_merged_coinbase_info.front().m_chain_id);
+    }
+    return {};
+}
+
 template <typename ShareT, typename TrackerT>
 std::string verify_merged_coinbase_commitment(
     const ShareT& share, TrackerT& tracker, const core::CoinParams& params)
@@ -1654,6 +1805,13 @@ std::string verify_merged_coinbase_commitment(
     // No merged coinbase info → nothing to verify
     if (share.m_merged_coinbase_info.empty())
         return {};
+
+    // 3601 shares: the AuxPoW commitment is enforced, at any chain depth.
+    if constexpr (ShareT::version >= FLAG_DAY_SHARE_VERSION) {
+        const auto why = merged_aux_commitment_problem(share);
+        if (!why.empty())
+            return "merged aux commitment: " + why;
+    }
 
     // Need enough chain history for reliable PPLNS verification
     if (share.m_prev_hash.IsNull() || !tracker.chain.contains(share.m_prev_hash))
@@ -1698,10 +1856,9 @@ std::string verify_merged_coinbase_commitment(
     // Several chains (or a size other than 1): the commitment should be the
     // tree over exactly the carried blocks (c2pool::merged::
     // check_merged_aux_commitment, the same verdict as p2pool data.py
-    // merged_aux_commitment_problem). LOG-ONLY this release: counted and
-    // logged, never a rejection (aux_commitment_rule.hpp: enforcement waits
-    // for a share-version gate).
-    {
+    // merged_aux_commitment_problem). V36 shares: LOG-ONLY, counted and
+    // logged, never a rejection (3601 shares: enforced above).
+    if constexpr (ShareT::version < FLAG_DAY_SHARE_VERSION) {
         std::vector<std::pair<uint32_t, std::vector<unsigned char>>> carried;
         carried.reserve(share.m_merged_coinbase_info.size());
         for (const auto& info : share.m_merged_coinbase_info)
@@ -1820,6 +1977,19 @@ bool share_check(const ShareT& share,
     if (share.m_timestamp > now + 600)
         throw std::invalid_argument("share timestamp is too far in the future");
 
+    // 1b. Share version 3601 flag day: the version follows from the
+    // timestamp, and nothing follows a 3601 share but a 3601 share.
+    {
+        std::optional<int64_t> parent_version;
+        if (!share.m_prev_hash.IsNull() && tracker.chain.contains(share.m_prev_hash))
+            tracker.chain.get_share(share.m_prev_hash).invoke([&](auto* obj) {
+                parent_version = std::remove_pointer_t<decltype(obj)>::version;
+            });
+        const auto why = flag_day_problem(ShareT::version, share.m_timestamp, parent_version);
+        if (!why.empty())
+            throw std::invalid_argument(why);
+    }
+
     // 2. Version switch enforcement — canonical 60% weighted switch rule.
     // p2pool data.py check() (lines 1396-1414): a version BOUNDARY
     // (share.version != parent.version) is only valid when, in the sampling
@@ -1848,6 +2018,11 @@ bool share_check(const ShareT& share,
                 if (share_ver == parent_version)
                 {
                     // same version — always valid (correct when created)
+                }
+                else if (share_ver == FLAG_DAY_SHARE_VERSION || parent_version == FLAG_DAY_SHARE_VERSION)
+                {
+                    // The 3601 flag day: decided by the timestamps (step 1b),
+                    // not by the switch gate.
                 }
                 else if (share_ver == parent_version + 1)
                 {
@@ -3414,10 +3589,33 @@ uint256 create_local_share(
         }
     }
 
+    // The share version follows from the share's timestamp (the 3601 flag
+    // day); the job decided it from the same frozen timestamp. A mismatch
+    // would be a share every peer rejects: refuse it here.
+    const bool v3601 = share_version >= FLAG_DAY_SHARE_VERSION;
+    {
+        std::optional<int64_t> parent_version;
+        if (!prev_share.IsNull() && tracker.chain.contains(prev_share))
+            tracker.chain.get_share(prev_share).invoke([&](auto* obj) {
+                parent_version = std::remove_pointer_t<decltype(obj)>::version;
+            });
+        const auto why = flag_day_problem(v3601 ? FLAG_DAY_SHARE_VERSION : MergedMiningShare::version,
+                                          share.m_timestamp, parent_version);
+        if (!why.empty()) {
+            LOG_ERROR << "create_local_share: not building share " << share_hash.GetHex() << ": " << why;
+            return uint256();
+        }
+    }
+
     // Add to tracker (heap-allocate; ShareChain takes ownership via raw pointer)
-    auto* heap_share = new MergedMiningShare(share);
+    ShareType heap_share;
+    if (v3601)
+        heap_share = new MergedMiningShareV3601(share);
+    else
+        heap_share = new MergedMiningShare(share);
     tracker.add(heap_share);
     LOG_INFO << "create_local_share: added share " << share_hash.GetHex()
+             << " version=" << (v3601 ? FLAG_DAY_SHARE_VERSION : MergedMiningShare::version)
              << " height=" << share.m_absheight
              << " prev=" << prev_share.GetHex().substr(0, 16) << "...";
 
@@ -3426,7 +3624,11 @@ uint256 create_local_share(
     {
         static int xcheck_count = 0;
         if (true) { // Always cross-check (was: xcheck_count < 5)
-            uint256 verify_hash = generate_share_transaction<MergedMiningShare>(*heap_share, tracker, params, true, (MergedMiningShare::version >= 36));
+            uint256 verify_hash;
+            heap_share.invoke([&](auto* obj) {
+                using S = std::remove_pointer_t<decltype(obj)>;
+                verify_hash = generate_share_transaction<S>(*obj, tracker, params, true, (S::version >= 36));
+            });
             bool xcheck_ok = (verify_hash == gentx_hash_for_header);
             if (xcheck_ok) {
                 LOG_INFO << "[Pool] Cross-check PASSED";

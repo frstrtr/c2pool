@@ -1231,6 +1231,26 @@ std::string pair_problem(const std::vector<MHI>& infos, const std::vector<uint8_
     return c2pool::merged::check_merged_aux_commitment(carried, root, size);
 }
 
+/// The same pair as a share carries it (its coinbase scriptSig holds the
+/// commitment, its merged_coinbase_info the header infos): "" when a 3601
+/// share built on it passes the enforced share check
+/// (ltc::merged_aux_commitment_problem).
+std::string v3601_share_problem(const std::vector<MHI>& infos, const std::vector<uint8_t>& c)
+{
+    ltc::MergedMiningShareV3601 s;
+    s.m_coinbase.m_data = {0x03, 0x01, 0x02, 0x03};
+    s.m_coinbase.m_data.insert(s.m_coinbase.m_data.end(), c.begin(), c.end());
+    for (const auto& i : infos) {
+        ltc::MergedCoinbaseEntry e;
+        e.m_chain_id = i.chain_id;
+        e.m_coinbase_value = i.coinbase_value;
+        e.m_block_height = i.block_height;
+        e.m_block_header.m_data = i.block_header;
+        s.m_merged_coinbase_info.push_back(e);
+    }
+    return ltc::merged_aux_commitment_problem(s);
+}
+
 /// A thread-safe daemon-shaped backend for the stress test.
 struct StressBackend : c2pool::merged::IAuxChainBackend {
     AuxChainConfig cfg;
@@ -1733,13 +1753,50 @@ TEST(MergedAuxCommitment, UncarriedChainIsNotCommittedBesideCarriedOnes)
     EXPECT_EQ(infos[0].chain_id, 98u);
     ASSERT_EQ(c.size(), 44u);
     EXPECT_EQ(pair_problem(infos, c), "");
+    EXPECT_EQ(v3601_share_problem(infos, c), "");
     EXPECT_EQ(c[36], 1u);
     mm.stop();
 }
 
+// Our own 3601 shares are never non-compliant (the AuxPoW commitment rule is
+// enforced for them): for every set of the six chains, with chains down, the
+// job's (header infos, commitment) pair passes the peers' rule and the 3601
+// share check.
+TEST(MergedAuxCommitment, Our3601SharesAreCompliantForEveryChainSet)
+{
+    const std::vector<std::pair<std::string, uint32_t>> all = {
+        {"DOGE", 98}, {"PEP", 63}, {"BELLS", 16}, {"LKY", 8211}, {"JKC", 8224}, {"SHIC", 74}};
+    int checked = 0;
+    for (uint32_t mask = 1; mask < (1u << all.size()); ++mask) {
+        std::vector<std::pair<std::string, uint32_t>> ids;
+        for (size_t k = 0; k < all.size(); ++k)
+            if (mask & (1u << k)) ids.push_back(all[k]);
+        Rig r(ids);
+        std::vector<std::vector<bool>> downs = {std::vector<bool>(r.chains.size(), false)};
+        for (size_t k = 0; k < r.chains.size(); ++k) {
+            std::vector<bool> d(r.chains.size(), false);
+            d[k] = true;
+            downs.push_back(d);
+            std::vector<bool> rest(r.chains.size(), true);
+            rest[k] = false;
+            downs.push_back(rest);
+        }
+        for (const auto& d : downs) {
+            for (size_t k = 0; k < r.chains.size(); ++k) r.chain(k).down = d[k];
+            r.mm.refresh_aux_work();
+            auto [infos, c] = r.mm.get_cached_header_infos_and_commitment();
+            EXPECT_EQ(pair_problem(infos, c), "") << "chains " << mask;
+            EXPECT_EQ(v3601_share_problem(infos, c), "") << "chains " << mask;
+            ++checked;
+        }
+    }
+    EXPECT_GT(checked, 300);
+}
+
 // Chains going down, hanging past the deadline, throwing non-std exceptions
 // and moving at random while jobs are read and shares found on recent jobs:
-// every (header infos, commitment) pair a job reads passes the peers' rule,
+// every (header infos, commitment) pair a job reads passes the peers' rule
+// (and the 3601 share check, which enforces it),
 // every block a find sends passes the daemon's CAuxPow::check for its chain,
 // and a chain not in a job's commitment gets nothing.
 TEST(MergedAuxStress, FlappingChainsConcurrentJobsAndFinds)
@@ -1786,7 +1843,9 @@ TEST(MergedAuxStress, FlappingChainsConcurrentJobsAndFinds)
         while (!done) {
             auto [infos, c] = mm.get_cached_header_infos_and_commitment();
             ++reads;
-            const auto why = pair_problem(infos, c);
+            auto why = pair_problem(infos, c);
+            if (why.empty())
+                why = v3601_share_problem(infos, c);   // our 3601 shares: never non-compliant
             if (!why.empty()) {
                 if (bad_pairs++ == 0) { std::lock_guard<std::mutex> l(jobs_mu); first_bad = why; }
             } else if (!c.empty()) {
@@ -2900,8 +2959,9 @@ TEST(MergedAuxCommitment, ParityVectors)
               "a37fc58712ab0392114cd05d1e6cf13432ab577a3aaab06200b3d76f7677a83c");
 }
 
-// Log-only this release: a verdict is counted (and the first ones logged),
-// never turned into a rejection by the share check.
+// V36 shares: a verdict is counted (and the first ones logged), never turned
+// into a rejection by the share check (3601 shares: enforced,
+// share_v3601_flag_day_test.cpp).
 TEST(MergedAuxCommitment, RuleIsCountedNotEnforced)
 {
     auto& st = c2pool::merged::merged_rule_stats();

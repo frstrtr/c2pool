@@ -7776,7 +7776,8 @@ nlohmann::json MiningInterface::rest_version_signaling(const nlohmann::json* cac
         {16, "DashShare"},
         {17, "Share"}, {32, "PreSegwitShare"}, {33, "NewShare"},
         {34, "SegwitMiningShare"}, {35, "PaddingBugfixShare"},
-        {36, m_blockchain == Blockchain::DASH ? "DashV36Share" : "MergedMiningShare"}
+        {36, m_blockchain == Blockchain::DASH ? "DashV36Share" : "MergedMiningShare"},
+        {3601, "MergedMiningShareV3601"}   // LTC: the share version 3601 flag day
     };
 
     nlohmann::json result = nlohmann::json::object();

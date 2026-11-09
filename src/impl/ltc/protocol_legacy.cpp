@@ -112,6 +112,7 @@ void Legacy::HANDLER(shares)
 {
     try {
         ltc::HandleSharesData result; //share, txs
+        bool too_old = false;   // a V36 share past the 3601 flag day
 
         for (auto wrappedshare : msg->m_shares)
         {
@@ -124,6 +125,12 @@ void Legacy::HANDLER(shares)
             {
                 LOG_WARNING << "Failed to load share (type=" << wrappedshare.type
                             << ") from " << peer->addr().to_string() << ": " << e.what();
+                continue;
+            }
+            if (ltc::pre_3601_share_past_flag_day(share))
+            {
+                share.destroy();
+                too_old = true;
                 continue;
             }
 
@@ -149,6 +156,12 @@ void Legacy::HANDLER(shares)
         }
 
         processing_shares(result, peer->addr());
+        if (too_old)
+        {
+            drop_pre_3601_peer(peer->addr(), ltc::pre_3601_peer_line(peer->addr().to_string(), peer->m_other_version,
+                                                                     peer->m_other_subversion));
+            close_connection(peer->addr());
+        }
     } catch (const std::exception& e) {
         LOG_ERROR << "[Pool] shares handler exception: " << e.what();
     }
@@ -223,6 +236,7 @@ void Legacy::HANDLER(sharereply)
     // swallow discarded the whole reply with no free anywhere. A slow peer
     // therefore leaked every byte it eventually sent.
     ltc::ShareReplyData result;
+    bool too_old = false;   // a V36 share past the 3601 flag day
     if (msg->m_result == ShareReplyResult::good)
     {
         auto& owned = result.owned();
@@ -233,6 +247,12 @@ void Legacy::HANDLER(sharereply)
             try
             {
                 auto share = ltc::load_share(rshare, peer->addr());
+                if (ltc::pre_3601_share_past_flag_day(share))
+                {
+                    share.destroy();
+                    too_old = true;
+                    continue;
+                }
                 owned.m_items.push_back(share);
                 owned.m_raw_items.push_back(rshare);
             }
@@ -246,6 +266,12 @@ void Legacy::HANDLER(sharereply)
     }
     // Resolve the async request that originally sent the sharereq
     got_share_reply(msg->m_id, result);
+    if (too_old)
+    {
+        drop_pre_3601_peer(peer->addr(), ltc::pre_3601_peer_line(peer->addr().to_string(), peer->m_other_version,
+                                                                 peer->m_other_subversion));
+        close_connection(peer->addr());
+    }
 }
 
 void Legacy::HANDLER(bestblock)
