@@ -108,13 +108,22 @@ no extra configuration.
 | Primary address type | Merged payout auto-derived? |
 |----------------------|-----------------------------|
 | P2PKH  (`L...`, legacy)      | ✅ yes |
-| P2SH   (`M...` / `3...`)     | ✅ yes |
+| P2SH   (`M...` / `3...`)     | ❌ no — supply merged addresses explicitly |
 | P2WPKH (`ltc1q...`, segwit)  | ✅ yes |
-| P2WSH  (`ltc1q...`, 32-byte) | ❌ no — supply merged addresses explicitly |
-| P2TR   (`ltc1p...`, taproot) | ❌ no — supply merged addresses explicitly |
+| P2WSH  (`ltc1q...`, 32-byte) | ❌ not usable — use a P2PKH or P2WPKH address |
+| P2TR   (`ltc1p...`, taproot) | ❌ not usable — use a P2PKH or P2WPKH address |
 
-The 32-byte witness programs (P2WSH/P2TR) can't be reduced to a 20-byte
-`hash160`, so for those you must name each chain's address yourself.
+A P2SH key is a script hash, not a key: a P2SH-P2WPKH `M...` redeem script is
+spendable by anyone on a chain without segwit (DOGE), so c2pool derives no
+merged address from it. With a P2SH address and no merged address the login is
+accepted with a warning ("P2SH address → give a merged address" in the workers
+list); your V36 shares still pay the P2SH key as a DOGE P2SH (the V36 rule),
+and from the share version 3601 flag day your share of each merged block is
+paid to the block's other miners. The 32-byte
+witness programs (P2WSH/P2TR) can't be carried by a V36 share (a 20-byte
+payout hash): its LTC payout is redistributed like an invalid address's
+("P2WSH/P2TR address → redistributed"); merged addresses you name are still
+paid.
 
 **To override or set addresses per chain explicitly**, use any of:
 

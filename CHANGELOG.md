@@ -2,6 +2,47 @@
 
 ## [Unreleased]
 
+### LTC: share version 3601 (flag day) — upgrade every node to c2pool v0.2.12
+- From a flag day set in the release (`ltc::PoolConfig::V3601_ACTIVATION_TIME`;
+  not scheduled in this build) every share is a share version 3601 share: the
+  V36 share format under share type 3601. Not voted through the AutoRatchet:
+  a share's version follows from its own timestamp (3601 at or after the flag
+  day, an earlier version before it, nothing but 3601 after a 3601 share), and
+  the switch does not go through the 60% upgraded-hash-power gate (the
+  V35 → V36 switch keeps it). `--v3601-activation-time` moves it on testnet or
+  a private `--network-id` chain only.
+- Merged payouts of 3601 shares come from the share alone: its own merged
+  address, else its own P2PKH / P2WPKH parent key (or the donation script); a
+  P2SH parent key pays no one (a P2SH-P2WPKH `M...` script is anyone-can-spend
+  on DOGE) and its weight is spread over the block's other payees. No 3601
+  share feeds or uses the first-seen address of another share ("Tier 1.5"),
+  which depended on the order a node received shares and let a share naming
+  another miner's parent script take that miner's address-less shares.
+  **V36 shares keep the old rule exactly** (Tier 1.5, P2SH as P2SH): the
+  shares in the window at the flag day keep their payouts, nothing moves at
+  the switch.
+- 3601 shares carrying several merged chains must commit to the AuxPoW tree
+  over exactly the blocks they carry (enforced; still only counted for V36
+  shares). c2pool's own commitments always comply.
+- c2pool advertises protocol 3601. From the flag day a peer below it (p2pool,
+  c2pool before v0.2.12) is disconnected and refused, without a ban, and is
+  never sent a 3601 share; it is left on a sharechain of its own. p2pool is no
+  longer supported from then on.
+- Stratum: no merged address is derived from a P2SH login (a warning says to
+  give one); P2WSH / P2TR logins are flagged "P2WSH/P2TR address →
+  redistributed"; a swapped pair whose first address is not valid
+  (`DOGE-with-bad-checksum,LTCADDR`) pays the LTC address.
+- `--no-embedded-doge` disables embedded DOGE networking entirely (no P2P, no
+  DNS seeds), also when a `--merged DOGE:...` spec carries a P2P port.
+- `--no-embedded-ltc`: the initial getblocktemplate fetch and the 2 s poll are
+  armed when the coin daemon is attached. They never were (the web server
+  starts before the coin node): such a pool got a template only on a
+  sharechain event (a peer's share or bestblock, a merged-chain work change),
+  and an isolated one never did ("Waiting for block template"). A block the
+  daemon's own P2P link announces now refreshes the template at once.
+- Redistribution reads the sharechain only under its read lock (a crash race
+  with the compute thread, seen under TSAN).
+
 ### DASH: compiled masternode anchor re-pinned to h=2563800
 - The compiled masternode anchor and the header fast-start move from h=2549400
   to h=2563800 (blockhash 0000000000000016a129aa626ea761e0…, 3005 registered, 2249
