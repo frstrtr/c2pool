@@ -11,7 +11,8 @@
 //
 // The ONE place LTC's payout version bytes / bech32 HRP live (p2pool-merged-v36):
 // mainnet PUBKEY 48 (L...) / SCRIPT {50 (M...), 5 (legacy 3...)} / bech32 "ltc";
-// testnet PUBKEY 111 / SCRIPT {196, 58 (Q...)} / bech32 "tltc". HRPs here are
+// testnet PUBKEY 111 / SCRIPT {196, 58 (Q...)} / bech32 "tltc"; regtest = testnet
+// version bytes with bech32 "rltc" (litecoind chainparams). HRPs here are
 // BARE; make_coin_params() appends the bech32 separator '1' for its own
 // CoinParams.bech32_hrp convention. bech32_hrp2 is the secondary P2SH.
 
@@ -30,8 +31,10 @@ struct AddressEncoding {
 };
 inline constexpr AddressEncoding MAINNET_ADDR{ 48, 50, 5,  "ltc"  };
 inline constexpr AddressEncoding TESTNET_ADDR{ 111, 196, 58, "tltc" };
-inline constexpr const AddressEncoding& address_encoding(bool testnet)
-{ return testnet ? TESTNET_ADDR : MAINNET_ADDR; }
+inline constexpr AddressEncoding REGTEST_ADDR{ 111, 196, 58, "rltc" };
+// regtest wins over testnet (--regtest implies --testnet in main_ltc.cpp).
+inline constexpr const AddressEncoding& address_encoding(bool testnet, bool regtest = false)
+{ return regtest ? REGTEST_ADDR : (testnet ? TESTNET_ADDR : MAINNET_ADDR); }
 
 // Registry-sourced payout-address acceptance for LTC on the ACTIVE network
 // (issue #961). DERIVED from the AddressEncoding SSOT above — no re-typed
@@ -39,9 +42,12 @@ inline constexpr const AddressEncoding& address_encoding(bool testnet)
 // "3..." at version byte 5): an address at 0x05 maps to the SAME hash160 the
 // same key controls, so building an LTC P2SH script for it is a valid own-coin
 // payout, not a misdirection. bech32 HRPs are returned BARE.
-inline core::CoinAddressAcceptance address_acceptance(bool testnet)
+// regtest: same shape as btc/dash/bch/dgb/bip110 address_acceptance(testnet,
+// regtest). Without it a --regtest node published "tltc" only and the #961
+// stratum door rejected every rltc1 payout.
+inline core::CoinAddressAcceptance address_acceptance(bool testnet, bool regtest = false)
 {
-    const auto& e = address_encoding(testnet);
+    const auto& e = address_encoding(testnet, regtest);
     core::CoinAddressAcceptance a;
     a.p2pkh_versions = { e.p2pkh };
     a.p2sh_versions  = { e.p2sh };

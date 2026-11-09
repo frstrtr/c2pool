@@ -3,8 +3,10 @@
 // FAILS on master: ltc_doge_chain_net.hpp does not exist there (compile red),
 // and the main_ltc.cpp table had no regtest row at all.
 #include <c2pool/ltc_doge_chain_net.hpp>
+#include <impl/ltc/address_encoding.hpp>
 #include <cstdio>
 #include <string>
+#include <vector>
 
 using namespace c2pool::ltc_doge;
 
@@ -62,6 +64,27 @@ int main()
         CHECK(doge_aux_p2p_port(22556, -1, 44556, emb) == 22556); // --doge-p2p-port
         CHECK(doge_aux_p2p_port(22556, 0, 44556, emb) == 22556);  // flag beats ":0"
         CHECK(doge_aux_p2p_port(22556, 18444, 44556, emb) == 22556);
+    }
+
+    // LTC stratum payout acceptance (#961 door). Mainnet/testnet unchanged;
+    // --regtest publishes litecoind regtest bech32 "rltc" (was "tltc" -> every
+    // rltc1 payout door-rejected), same version bytes as testnet.
+    {
+        using V8 = std::vector<uint8_t>;
+        using VS = std::vector<std::string>;
+        auto m = ltc::address_acceptance(false);
+        CHECK(m.p2pkh_versions == V8{48} && m.p2sh_versions == (V8{50, 5}) && m.bech32_hrps == VS{"ltc"});
+        auto t = ltc::address_acceptance(true);
+        CHECK(t.p2pkh_versions == V8{111} && t.p2sh_versions == (V8{196, 58}) && t.bech32_hrps == VS{"tltc"});
+        CHECK(ltc::address_acceptance(true, false).bech32_hrps == VS{"tltc"});
+        for (bool tn : {false, true}) {
+            auto r = ltc::address_acceptance(tn, true);
+            CHECK(r.p2pkh_versions == V8{111});
+            CHECK(r.p2sh_versions == (V8{196, 58}));
+            CHECK(r.bech32_hrps == VS{"rltc"});
+        }
+        CHECK(std::string(ltc::address_encoding(true, true).hrp_bare) == "rltc");
+        CHECK(std::string(ltc::address_encoding(true).hrp_bare) == "tltc");
     }
 
     if (g_fail) { std::printf("ltc_doge_regtest_net_kat: %d FAIL\n", g_fail); return 1; }

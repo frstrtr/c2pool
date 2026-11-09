@@ -1878,7 +1878,7 @@ int main(int argc, char* argv[]) {
             // script, while a configured merged chain's address (DOGE etc.) is
             // still honoured via the shared merged-chain table.
             {
-                auto acc = ltc::address_acceptance(settings->m_testnet);
+                auto acc = ltc::address_acceptance(settings->m_testnet, coin_regtest);
                 stratum_config.payout_p2pkh_versions = acc.p2pkh_versions;
                 stratum_config.payout_p2sh_versions  = acc.p2sh_versions;
                 stratum_config.payout_bech32_hrps    = acc.bech32_hrps;
