@@ -137,14 +137,25 @@ protected:
 
 } // namespace
 
-TEST(FlagDayDefault, NotScheduledUntilTheRelease)
+TEST(FlagDayDefault, MainnetScheduledTestnetNot)
 {
     ASSERT_FALSE(ltc::PoolConfig::v3601_activation_time_override.has_value());
-    EXPECT_EQ(ltc::PoolConfig::V3601_ACTIVATION_TIME, 0xFFFFFFFFu);
+    // mainnet: 2026-11-11 12:00:00 UTC; testnet stays unscheduled.
+    EXPECT_EQ(ltc::PoolConfig::V3601_ACTIVATION_TIME, 1794398400u);
     EXPECT_EQ(ltc::PoolConfig::TESTNET_V3601_ACTIVATION_TIME, 0xFFFFFFFFu);
-    EXPECT_EQ(ltc::flag_day_share_version(36, 2000000000u), 36);
-    EXPECT_EQ(ltc::flag_day_problem(36, 2000000000u, 36), "");
-    EXPECT_NE(ltc::flag_day_problem(3601, 2000000000u, 36), "") << "no 3601 share before the release sets the day";
+    const bool was_testnet = ltc::PoolConfig::is_testnet;
+    ltc::PoolConfig::is_testnet = false;
+    const uint32_t t = ltc::PoolConfig::V3601_ACTIVATION_TIME;
+    EXPECT_EQ(ltc::PoolConfig::v3601_activation_time(), t);
+    EXPECT_EQ(ltc::flag_day_share_version(36, t - 1), 36);
+    EXPECT_EQ(ltc::flag_day_share_version(36, t), 3601);
+    EXPECT_EQ(ltc::flag_day_problem(36, t - 1, 36), "");
+    EXPECT_NE(ltc::flag_day_problem(3601, t - 1, 36), "") << "no 3601 share before the flag day";
+    EXPECT_NE(ltc::flag_day_problem(36, t, 36), "") << "no V36 share at or after the flag day";
+    ltc::PoolConfig::is_testnet = true;
+    EXPECT_EQ(ltc::flag_day_share_version(36, 2000000000u), 36) << "testnet: not scheduled";
+    EXPECT_NE(ltc::flag_day_problem(3601, 2000000000u, 36), "");
+    ltc::PoolConfig::is_testnet = was_testnet;
     EXPECT_EQ(ltc::PoolConfig::ADVERTISED_PROTOCOL_VERSION, 3601u);
     EXPECT_EQ(ltc::make_coin_params(false).advertised_protocol_version, 3601u);
     EXPECT_EQ(ltc::make_coin_params(false).minimum_protocol_version, 3301u) << "V36 peers still connect before it";
