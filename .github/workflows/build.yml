@@ -2644,7 +2644,11 @@ jobs:
         # (DashV24ProTxCheck 16, DashV24AllTx 44, DashProTxSigBls 2,
         # DashSupersetSpecialTx 3). It is built only in this leg, so before they
         # were named here those 65 cases ran in no CI job at all.
-        run: ctest --output-on-failure --no-tests=error -j8 -R 'DashBlsVerify|DashQuorumMembers|DashQuorumMemberSource|DashGovVoteBLS|DashChainLockVerify|DashIsdlockBls|DashCreditPoolIdx|DashCreditPoolLane|DashV24ProTxCheck|DashV24AllTx|DashProTxSigBls|DashSupersetSpecialTx'
+        # DashSupersetSpecialTx is pinned to its three govvote_bls cases: the
+        # same suite name carries 21 more cases in test_dash_embedded_gbt, which
+        # this leg does not build, so a bare name would register them as Not Run
+        # and turn the step red.
+        run: ctest --output-on-failure --no-tests=error -j8 -R 'DashBlsVerify|DashQuorumMembers|DashQuorumMemberSource|DashGovVoteBLS|DashChainLockVerify|DashIsdlockBls|DashCreditPoolIdx|DashCreditPoolLane|DashV24ProTxCheck|DashV24AllTx|DashProTxSigBls|DashSupersetSpecialTx\.(ProUpServTxWithStaleOperatorKeyIsRefused|ProUpRevTxWithWrongOperatorKeyIsRefused|RealMainnetProUpServTxRidesOnlyUnderItsOperatorKey)'
 
       # The Dash Core v24 provider-payload rules with the real backend: Core's
       # BLS operator-key and signature decoding (stub lanes run the same
