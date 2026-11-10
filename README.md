@@ -11,7 +11,7 @@ Original forum thread: <https://bitcointalk.org/index.php?topic=18313>
 
 ## Latest releases
 
-- **[v0.2.12](https://github.com/frstrtr/c2pool/releases/tag/v0.2.12)** — LTC + merged mining. **Every c2pool-ltc node must run v0.2.12 before 2026-11-11 12:00:00 UTC**, when the LTC share chain moves to [share version 3601](#share-version-3601-flag-day). Several aux chains at once, job-time payouts.
+- **[v0.2.12.1](https://github.com/frstrtr/c2pool/releases/tag/v0.2.12.1)** — LTC + merged mining. **Every c2pool-ltc node must run v0.2.12.1 before 2026-11-13 00:00:00 UTC**, when the LTC share chain moves to [share version 3601](#share-version-3601-flag-day). Several aux chains at once, job-time payouts. (v0.2.12 had an earlier date, 2026-11-11 12:00 UTC: do not run it.)
 - **[v0.2.11.1](https://github.com/frstrtr/c2pool/releases/tag/v0.2.11.1)** — DASH: Dash Core 24 hard fork support in the daemon-less node (every v24 transaction type in templates); LTC fix for a coinbase that could burn the block reward under load.
 - The Python p2pool implementations ([p2pool-dash](https://github.com/frstrtr/p2pool-dash), [p2pool-merged-v36](https://github.com/frstrtr/p2pool-merged-v36)) are no longer maintained. All updates, including security fixes and Dash Core 24 support, ship only in c2pool.
 
@@ -777,7 +777,7 @@ them.
 #### Share version 3601 (flag day)
 
 From a fixed time (the flag day, set in the release: `ltc::PoolConfig::
-V3601_ACTIVATION_TIME`; mainnet **2026-11-11 12:00:00 UTC** from v0.2.12,
+V3601_ACTIVATION_TIME`; mainnet **2026-11-13 00:00:00 UTC** from v0.2.12.1,
 testnet unscheduled) every share is a **share version 3601** share: the V36
 share format under share type 3601. It is not voted through the AutoRatchet:
 a share's version follows from its own timestamp. A share timestamped at or
@@ -793,7 +793,7 @@ upgraded-hash-power gate (the V35 → V36 switch keeps it). What 3601 changes:
   load a 3601 share and its own V36 shares are invalid from then on. Such a
   node logs "version unsupported" for the 3601 shares it is sent before the
   disconnect and is left on a sharechain of its own: **upgrade every node to
-  c2pool v0.2.12 before the flag day**. p2pool is not supported from then on.
+  c2pool v0.2.12.1 before the flag day**. p2pool is not supported from then on.
   Our log says "peer ... is too old for share version 3601 ...: peer too old,
   upgrade to c2pool v0.2.12".
 

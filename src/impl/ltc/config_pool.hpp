@@ -71,11 +71,12 @@ public:
     // time: a share whose timestamp is at or after it is a 3601 share and one
     // before it is not (share_check.hpp flag_day_problem). Not ratchet-voted:
     // every node switches at the same share timestamp. 0xFFFFFFFF = not
-    // scheduled. Mainnet: 2026-11-11 12:00:00 UTC (set by the v0.2.12
-    // release). The override is for tests and, on testnet or a private
-    // --network-id chain only, --v3601-activation-time: on mainnet every node
-    // must use the compiled time.
-    static constexpr uint32_t V3601_ACTIVATION_TIME          = 1794398400u;
+    // scheduled. Mainnet: 2026-11-13 00:00:00 UTC (v0.2.12.1; v0.2.12 had
+    // 2026-11-11 12:00:00 UTC, moved to give every node time to upgrade). The
+    // override is for tests and, on testnet or a private --network-id chain
+    // only, --v3601-activation-time: on mainnet every node must use the
+    // compiled time.
+    static constexpr uint32_t V3601_ACTIVATION_TIME          = 1794528000u;
     static constexpr uint32_t TESTNET_V3601_ACTIVATION_TIME  = 0xFFFFFFFFu;
     static inline std::optional<uint32_t> v3601_activation_time_override;
     static uint32_t v3601_activation_time()

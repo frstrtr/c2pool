@@ -140,8 +140,8 @@ protected:
 TEST(FlagDayDefault, MainnetScheduledTestnetNot)
 {
     ASSERT_FALSE(ltc::PoolConfig::v3601_activation_time_override.has_value());
-    // mainnet: 2026-11-11 12:00:00 UTC; testnet stays unscheduled.
-    EXPECT_EQ(ltc::PoolConfig::V3601_ACTIVATION_TIME, 1794398400u);
+    // mainnet: 2026-11-13 00:00:00 UTC (v0.2.12.1); testnet stays unscheduled.
+    EXPECT_EQ(ltc::PoolConfig::V3601_ACTIVATION_TIME, 1794528000u);
     EXPECT_EQ(ltc::PoolConfig::TESTNET_V3601_ACTIVATION_TIME, 0xFFFFFFFFu);
     const bool was_testnet = ltc::PoolConfig::is_testnet;
     ltc::PoolConfig::is_testnet = false;
