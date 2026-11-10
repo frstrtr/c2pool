@@ -2640,7 +2640,11 @@ jobs:
         # DashCreditPoolIdxDb, DashCreditPoolLane) are folded into the
         # test_dash_chainlock_verify binary, but no name above matched them, so
         # ctest never ran them here.
-        run: ctest --output-on-failure --no-tests=error -j8 -R 'DashBlsVerify|DashQuorumMembers|DashQuorumMemberSource|DashGovVoteBLS|DashChainLockVerify|DashIsdlockBls|DashCreditPoolIdx|DashCreditPoolLane'
+        # test_dash_govvote_bls likewise carries four suites beyond DashGovVoteBLS
+        # (DashV24ProTxCheck 16, DashV24AllTx 44, DashProTxSigBls 2,
+        # DashSupersetSpecialTx 3). It is built only in this leg, so before they
+        # were named here those 65 cases ran in no CI job at all.
+        run: ctest --output-on-failure --no-tests=error -j8 -R 'DashBlsVerify|DashQuorumMembers|DashQuorumMemberSource|DashGovVoteBLS|DashChainLockVerify|DashIsdlockBls|DashCreditPoolIdx|DashCreditPoolLane|DashV24ProTxCheck|DashV24AllTx|DashProTxSigBls|DashSupersetSpecialTx'
 
       # The Dash Core v24 provider-payload rules with the real backend: Core's
       # BLS operator-key and signature decoding (stub lanes run the same
