@@ -68,6 +68,10 @@ S* make(uint64_t id, const uint256& prev, uint32_t ts, uint64_t dv = 36)
     sh->m_donation = 50;
     if constexpr (requires { sh->m_pubkey_hash; })
         sh->m_pubkey_hash.SetHex(std::string(38, '0') + std::to_string(id % 7 + 1) + "1");
+    // A hash link as every real share has: the 32-byte state (a fixed-size
+    // field: an empty one packs to nothing and does not reload).
+    sh->m_hash_link.m_state.m_data.assign(32, 0x4c);
+    sh->m_hash_link.m_length = 64;
     return sh;
 }
 
