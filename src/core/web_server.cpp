@@ -5476,15 +5476,19 @@ nlohmann::json MiningInterface::rest_local_stats()
     // unknown, and keep the Stratum basis: a missing signal is not evidence
     // that there is no daemon. Same flags /api/node_topology reads on this
     // thread; no tracker or peer state, so no new lock surface.
-    const bool ts_embedded = m_embedded_display_override.value_or(
+    const bool ts_embedded = embedded_display_or(
         m_coin_node && m_coin_node->is_embedded());
+    // A set override is a live signal just as an attached coin node is, so a
+    // false override with no RPC arm is a known "none", not an unknown null.
+    const bool ts_signal_known = m_coin_node
+        || m_embedded_display_override.load(std::memory_order_relaxed) >= 0;
     const bool ts_rpc = (m_coin_node && m_coin_node->has_rpc())
                         || m_coin_rpc_available.load(std::memory_order_relaxed);
     const char* template_source = nullptr;
     if (ts_embedded && ts_rpc) template_source = "embedded+rpc";
     else if (ts_embedded)      template_source = "embedded";
     else if (ts_rpc)           template_source = "rpc";
-    else if (m_coin_node)      template_source = "none";
+    else if (ts_signal_known)  template_source = "none";
     if (template_source)
         result["template_source"] = template_source;
     else
@@ -6344,7 +6348,7 @@ nlohmann::json MiningInterface::rest_web_currency_info()
     // Mode indicators for conditional UI. Coin targets whose daemon RPC is an
     // external NodeRPC arm (c2pool-dash dashd) rather than an ICoinNode set the
     // m_coin_rpc_available flag so has_rpc is truthful.
-    result["embedded"] = m_embedded_display_override.value_or(
+    result["embedded"] = embedded_display_or(
                              m_coin_node && m_coin_node->is_embedded());
     result["has_rpc"]  = (m_coin_node && m_coin_node->has_rpc())
                          || m_coin_rpc_available.load(std::memory_order_relaxed);
@@ -7120,7 +7124,7 @@ nlohmann::json MiningInterface::rest_node_topology()
         if (is_primary) {
             // Real embedded/RPC flags for this node's own daemon. Coin targets
             // with an external NodeRPC arm (c2pool-dash) set m_coin_rpc_available.
-            entry["embedded"] = m_embedded_display_override.value_or(
+            entry["embedded"] = embedded_display_or(
                                     m_coin_node && m_coin_node->is_embedded());
             entry["has_rpc"]  = (m_coin_node && m_coin_node->has_rpc())
                                 || m_coin_rpc_available.load(std::memory_order_relaxed);

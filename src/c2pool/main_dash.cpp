@@ -152,6 +152,7 @@
 
 #include <core/stratum_server.hpp>             // core::StratumServer — miner-facing accept-loop (run-path caller)
 #include <impl/dash/stratum/work_source.hpp>   // dash::stratum::DASHWorkSource — concrete core::stratum::IWorkSource
+#include <impl/dash/template_source_arm.hpp>   // dash::publish_served_arm -- live template_source for the dashboard
 #include <impl/dash/mint_runloop.hpp>          // dash::mint — run-loop share minting (slice 3/3)
 #include <impl/dash/coin/v36_work_policy.hpp>    // dash::coin::resolve_v36_work_policy (DASH v36 network: work source)
 #include <impl/dash/stratum/tip_refresh.hpp>   // dash::stratum::fire_share_tip_refresh — bump + notify_all + dashboard refresh
@@ -4540,6 +4541,15 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 [ws](double diff, const std::string& miner, const uint256& pow_hash) {
                     ws->get_mining_interface()->record_share_difficulty(
                         diff, miner, pow_hash.GetHex());
+                });
+
+            // ── Live template_source for /local_stats + /api/node_topology ──
+            // Republished on every sourced template from the same facts as the
+            // arm log line. Display only; an atomic store, never gates serving.
+            work_source->set_on_served_arm_fn(
+                [ws](bool embedded_arm_selected, bool no_work) {
+                    dash::publish_served_arm(*ws->get_mining_interface(),
+                                             embedded_arm_selected, no_work);
                 });
 
             // ── Recent-blocks feed: DASH block wins into the history card ──
@@ -11580,6 +11590,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // probe's dtor (which joins the worker) while rpc is still alive. ioc.run()
     // has returned, so no further template re-source can enqueue a new job.
     if (work_source) work_source->set_shadow_compare(nullptr);
+    if (work_source) work_source->set_on_served_arm_fn(nullptr);  // captures web_server, reset below
 
     // Stop the dashboard BEFORE p2p_node unwinds: its callbacks hold a raw
     // dash::Node* and the HTTP thread must be joined while that is still valid.

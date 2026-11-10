@@ -1605,6 +1605,10 @@ void DASHWorkSource::resource_template_now(CoinStateArm arm) const
                                ? coin::ServeGateJournal::Served::Embedded
                                : coin::ServeGateJournal::Served::Fallback);
             note_arm_decision(served, sel.decline, sel.work.m_height);
+            {
+                std::lock_guard<std::mutex> lk(served_arm_mutex_);
+                if (on_served_arm_fn_) on_served_arm_fn_(work_is_embedded, no_work);
+            }
             // OBSERVE-only serve-vs-dashd SHADOW-COMPARE (--embedded-shadow-compare).
             // Hand the JUST-RESOLVED template (by const-ref; on_serve copies) to
             // the diagnostic probe. This is ENQUEUE-ONLY: the dashd oracle fetch +
@@ -3091,6 +3095,12 @@ void DASHWorkSource::set_on_found_block_fn(FoundBlockFn fn)
 {
     std::lock_guard<std::mutex> lk(found_block_mutex_);
     on_found_block_fn_ = std::move(fn);
+}
+
+void DASHWorkSource::set_on_served_arm_fn(ServedArmFn fn)
+{
+    std::lock_guard<std::mutex> lk(served_arm_mutex_);
+    on_served_arm_fn_ = std::move(fn);
 }
 
 void DASHWorkSource::set_mint_share_fn(MintShareFn fn)
