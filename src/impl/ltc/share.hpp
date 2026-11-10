@@ -55,26 +55,26 @@ struct BaseShare : chain::BaseShare<uint256, Version>
     coin::SmallBlockHeaderType m_min_header;
     // prev_hash
     BaseScript m_coinbase;              // coinbase
-    uint32_t m_nonce;                   // nonce
+    uint32_t m_nonce{0};                // nonce
     // [x]address[>=34] or [x]pubkey_hash[<34]
-    uint64_t m_subsidy;                 // subsidy
-    uint16_t m_donation;                // donation
-    ltc::StaleInfo m_stale_info;        // stale_info
-    uint64_t m_desired_version;         // desired_version
+    uint64_t m_subsidy{0};              // subsidy
+    uint16_t m_donation{0};             // donation
+    ltc::StaleInfo m_stale_info{ltc::StaleInfo::none}; // stale_info
+    uint64_t m_desired_version{0};      // desired_version
     //
     // [x] segwit_data [if segwit_activated]
     //
     uint256 m_far_share_hash;           // far_share_hash
-    uint32_t m_max_bits;                // max_bits;   bitcoin_data.FloatingIntegerType()
-    uint32_t m_bits;                    // bits;       bitcoin_data.FloatingIntegerType()
-    uint32_t m_timestamp;               // timestamp
-    uint32_t m_absheight;               // absheight
+    uint32_t m_max_bits{0};             // max_bits;   bitcoin_data.FloatingIntegerType()
+    uint32_t m_bits{0};                 // bits;       bitcoin_data.FloatingIntegerType()
+    uint32_t m_timestamp{0};            // timestamp
+    uint32_t m_absheight{0};            // absheight
     uint128 m_abswork;                  // abswork
 
     // ref_merkle_link
     MerkleLink m_ref_merkle_link;
     // last_txout_nonce
-    uint64_t m_last_txout_nonce;
+    uint64_t m_last_txout_nonce{0};
     // hash_link
     HashLinkType m_hash_link;
     // merkle_link
