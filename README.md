@@ -9,6 +9,12 @@ Bitcoin wiki: <https://en.bitcoin.it/wiki/P2Pool>
 
 Original forum thread: <https://bitcointalk.org/index.php?topic=18313>
 
+## Latest releases
+
+- **[v0.2.12](https://github.com/frstrtr/c2pool/releases/tag/v0.2.12)** — LTC + merged mining. **Every c2pool-ltc node must run v0.2.12 before 2026-11-11 12:00:00 UTC**, when the LTC share chain moves to [share version 3601](#share-version-3601-flag-day). Several aux chains at once, job-time payouts.
+- **[v0.2.11.1](https://github.com/frstrtr/c2pool/releases/tag/v0.2.11.1)** — DASH: Dash Core 24 hard fork support in the daemon-less node (every v24 transaction type in templates); LTC fix for a coinbase that could burn the block reward under load.
+- The Python p2pool implementations ([p2pool-dash](https://github.com/frstrtr/p2pool-dash), [p2pool-merged-v36](https://github.com/frstrtr/p2pool-merged-v36)) are no longer maintained. All updates, including security fixes and Dash Core 24 support, ship only in c2pool.
+
 ## Daemonless Dash
 
 Security model: no RPC and no local credentials. Older P2Pool forks need RPC
@@ -19,6 +25,9 @@ administrative access to a daemon.
 c2pool-dash builds valid Dash mainnet blocks from embedded coin-state. The
 deterministic masternode list, LLMQ quorums, ChainLocks and the DIP-4 coinbase
 are reconstructed inside c2pool. No Dash Core node is required on the serve path.
+Dash Core 24 (hard fork, earliest activation at block 2,580,480) is supported
+from v0.2.11.1: the v24 rules are built into the node, so a daemon-less pool
+has no dashd to upgrade.
 Blocks built this way have been accepted on Dash mainnet, including the pool
 development-fee split. A bare `c2pool-dash --run` is daemonless: with no
 `--coin-rpc` given, every embedded serving lever defaults ON
@@ -676,7 +685,7 @@ Other chains need their daemon running externally.
 | LKY | 8211 | External | `LKY:8211:127.0.0.1:9916:user:pass` |
 | JKC | 8224 | External | `JKC:8224:127.0.0.1:9770:user:pass` |
 | SHIC | 74 | External | `SHIC:74:127.0.0.1:33863:user:pass` |
-| DINGO | 98 | External | Cannot run with DOGE (same chain_id) |
+| DINGO | 50 (mainnet) | External | `DINGO:50:HOST:PORT:user:pass` |
 
 DOGE merged mining activates automatically when `--embedded-doge` is on (default).
 External daemons use `createauxblock`/`submitauxblock` RPC. Every chain reached
@@ -768,7 +777,8 @@ them.
 #### Share version 3601 (flag day)
 
 From a fixed time (the flag day, set in the release: `ltc::PoolConfig::
-V3601_ACTIVATION_TIME`) every share is a **share version 3601** share: the V36
+V3601_ACTIVATION_TIME`; mainnet **2026-11-11 12:00:00 UTC** from v0.2.12,
+testnet unscheduled) every share is a **share version 3601** share: the V36
 share format under share type 3601. It is not voted through the AutoRatchet:
 a share's version follows from its own timestamp. A share timestamped at or
 after the flag day must be a 3601 share, one before it must not be, and a 3601
@@ -1441,11 +1451,14 @@ cd build && ctest --output-on-failure -j$(nproc)
 | VARDIFF | Working |
 | Payout / PPLNS | Working |
 | Authority message blobs (V36) | Working |
-| Solo / Custodial modes | Working |
+| Solo / Custodial modes | Disabled in v0.2.11.1 and v0.2.12 (`c2pool-ltc` refuses to start: their blocks were invalid); fix pending |
 | Test suite | 1,875 test cases across 194 suites |
 
-> **Need a pool running today?**
-> [frstrtr/p2pool-merged-v36](https://github.com/frstrtr/p2pool-merged-v36) — production Python V36 pool (LTC + DGB + DOGE, Docker, dashboard).
+> **Need a pool running today?** Use the
+> [latest c2pool release](https://github.com/frstrtr/c2pool/releases/latest).
+> The Python [p2pool-merged-v36](https://github.com/frstrtr/p2pool-merged-v36)
+> is no longer maintained and falls off the LTC share chain at the share
+> version 3601 flag day.
 
 ---
 
