@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
+#include <c2pool/merged/aux_commitment_rule.hpp>
 #include <core/host_port.hpp>
 #include "web_server.hpp"
 #include "stratum_server.hpp"
@@ -426,6 +427,141 @@ std::string MiningInterface::get_node_fee_hash160() const
         h160 += HEX[m_node_fee_script[i] & 0x0f];
     }
     return h160;
+}
+
+namespace {
+// The hash160 (hex) of a P2PKH / P2SH / P2WPKH script and its V36 pubkey type
+// (0 P2PKH, 1 P2WPKH, 2 P2SH); empty for any other script.
+std::string script_hash160_hex(const std::vector<unsigned char>& s, uint8_t& type)
+{
+    int off = -1;
+    if (s.size() == 25 && s[0] == 0x76 && s[1] == 0xa9 && s[2] == 0x14 && s[23] == 0x88 && s[24] == 0xac) {
+        off = 3;
+        type = 0;
+    } else if (s.size() == 23 && s[0] == 0xa9 && s[1] == 0x14 && s[22] == 0x87) {
+        off = 2;
+        type = 2;
+    } else if (s.size() == 22 && s[0] == 0x00 && s[1] == 0x14) {
+        off = 2;
+        type = 1;
+    }
+    if (off < 0)
+        return {};
+    static const char* HEX = "0123456789abcdef";
+    std::string h;
+    h.reserve(40);
+    for (int i = off; i < off + 20; ++i) {
+        h += HEX[s[i] >> 4];
+        h += HEX[s[i] & 0x0f];
+    }
+    return h;
+}
+
+std::vector<unsigned char> hash160_hex_script(const std::string& h160, uint8_t type)
+{
+    if (h160.size() != 40)
+        return {};
+    std::vector<unsigned char> hash;
+    for (size_t i = 0; i < 40; i += 2)
+        hash.push_back(static_cast<unsigned char>(std::stoul(h160.substr(i, 2), nullptr, 16)));
+    std::vector<unsigned char> s;
+    if (type == 1) {
+        s = {0x00, 0x14};
+        s.insert(s.end(), hash.begin(), hash.end());
+    } else if (type == 2) {
+        s = {0xa9, 0x14};
+        s.insert(s.end(), hash.begin(), hash.end());
+        s.push_back(0x87);
+    } else {
+        s = {0x76, 0xa9, 0x14};
+        s.insert(s.end(), hash.begin(), hash.end());
+        s.push_back(0x88);
+        s.push_back(0xac);
+    }
+    return s;
+}
+} // namespace
+
+// The payout a share commits to, decided when its job is built (p2pool
+// get_user_details, at get_work time):
+//   - the node fee (-f): with probability fee%, the job is the operator's:
+//     its payout is the operator's script and its merged addresses the
+//     operator's (p2pool replaces them on a fee draw);
+//   - a payout a V36 share cannot carry (an empty login, a P2WSH/P2TR
+//     primary): redistributed by --redistribute. Never from a merged chain's
+//     script (the old submit-time "Case 4" took the LTC payout from the DOGE
+//     entry);
+//   - a share paying the operator's key with no merged address gets the
+//     operator's merged addresses (p2pool: the operator's merged payout on
+//     its own key).
+// Deciding this at job time is what makes the share's pubkey and merged
+// addresses those its coinbase's ref_hash committed to.
+void MiningInterface::decide_job_payout(std::vector<unsigned char>& payout_script,
+                                        std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged) const
+{
+    uint8_t op_type = 0;
+    const std::string op_h160 = script_hash160_hex(m_node_fee_script, op_type);
+    if (m_node_fee_percent > 0.0 && !op_h160.empty()) {
+        const float roll = core::random::random_float(0.0f, 100.0f);
+        if (roll < static_cast<float>(m_node_fee_percent)) {
+            payout_script = m_node_fee_script;
+            if (!m_operator_merged_scripts.empty())
+                merged.assign(m_operator_merged_scripts.begin(), m_operator_merged_scripts.end());
+            return;
+        }
+    }
+    uint8_t type = 0;
+    std::string h160 = script_hash160_hex(payout_script, type);
+    bool redistributed = false;
+    if (h160.empty()) {
+        // Case 3 (p2pool work.py): no payout a share can carry → redistribute.
+        std::function<std::pair<std::string, uint8_t>()> redistribute;
+        address_fallback_fn_t fallback;
+        {
+            std::lock_guard<std::mutex> l(m_redistribute_mu);
+            redistribute = m_redistribute_fn;
+            fallback = m_address_fallback_fn;
+        }
+        if (redistribute) {
+            auto [h, t] = redistribute();
+            h160 = h;
+            type = t;
+        } else if (fallback) {
+            auto [h, t] = fallback(std::string());
+            h160 = h;
+            type = t;
+        }
+        // The recipient with its own script type (a hash under another type
+        // pays another address, or nobody). No recipient, the zero key or a
+        // type a share cannot carry: no payout (no share is created from it).
+        if (h160.size() == 40 && type <= 2 && h160 != std::string(40, '0')) {
+            payout_script = hash160_hex_script(h160, type);
+            redistributed = true;
+        } else {
+            h160.clear();
+        }
+    }
+    // p2pool's never-empty merged leg on its own landings: a share paying the
+    // operator's key with no merged address gets the operator's merged
+    // addresses; a redistributed share, for each merged chain it has no
+    // address for, its recipient's key converted (P2SH stays P2SH, else
+    // P2PKH) — written into the share (Tier 1), so every node derives the same
+    // payout from it.
+    if (!op_h160.empty() && h160 == op_h160 && merged.empty() && !m_operator_merged_scripts.empty()) {
+        merged.assign(m_operator_merged_scripts.begin(), m_operator_merged_scripts.end());
+    } else if (redistributed && m_mm_manager) {
+        const auto floor = core::hash160_to_merged_script(h160, type == 2 ? "p2sh" : "p2pkh");
+        for (const auto& ci : m_mm_manager->get_chain_infos()) {
+            const bool has = std::any_of(merged.begin(), merged.end(),
+                                         [&](const auto& e) { return e.first == ci.chain_id; });
+            if (has)
+                continue;
+            const auto op = m_operator_merged_scripts.find(ci.chain_id);
+            merged.emplace_back(ci.chain_id, (!op_h160.empty() && h160 == op_h160 && op != m_operator_merged_scripts.end())
+                                                 ? op->second : floor);
+        }
+        std::sort(merged.begin(), merged.end());
+    }
 }
 
 bool MiningInterface::check_merged_mining(const std::string& header_hex,
@@ -3709,6 +3845,10 @@ nlohmann::json MiningInterface::rest_stratum_stats(bool reveal_ips)
                                          : nlohmann::json(nullptr)}
             };
         }
+        // The login's payout is not its own address ("address invalid →
+        // redistributed"): shown with the worker.
+        if (!w.payout_warning.empty())
+            workers_json[worker_key]["payout_warning"] = w.payout_warning;
     }
 
     // Pool-level stats (stratum.html reads data.pool.*)
@@ -5605,6 +5745,14 @@ nlohmann::json MiningInterface::rest_local_stats()
         // #959 slice B: name the silent workers and how long each has been
         // silent, so the operator sees which rig died, not just a count.
         result["workers_silent"] = silent_workers_list(workers, liveness);
+        // Logins whose payout is not their own address (empty, invalid,
+        // another coin's: redistributed by --redistribute).
+        nlohmann::json redistributed = nlohmann::json::array();
+        for (const auto& [sid, w] : workers)
+            if (!w.payout_warning.empty() && redistributed.size() < 50)
+                redistributed.push_back({{"worker", w.worker_name.empty() ? w.username : w.username + "." + w.worker_name},
+                                         {"warning", w.payout_warning}});
+        result["workers_payout_warnings"] = redistributed;
     }
 
     // shares — {total, orphan, dead}
@@ -6135,6 +6283,20 @@ nlohmann::json MiningInterface::rest_local_stats()
     result["mweb_hold_seconds"] = get_mweb_hold_seconds();
     result["mweb_degraded"] = is_work_degraded();
     result["mweb_refusals_by_code"] = get_mweb_refusals_by_code_json();
+    // V36 merged-commitment rule (log-only this release): shares checked and
+    // the ones it would reject (aux_commitment_rule.hpp).
+    {
+        auto& st = c2pool::merged::merged_rule_stats();
+        std::string last;
+        {
+            std::lock_guard<std::mutex> l(st.mu);
+            last = st.last_reason;
+        }
+        result["merged_commitment_rule"] = {{"mode", "log-only"},
+                                            {"checked", st.checked.load()},
+                                            {"would_reject", st.would_reject.load()},
+                                            {"last_reason", last}};
+    }
     // Merged (aux) blocks refused at assembly, e.g. DOGE above 1,000,000 bytes.
     result["merged_block_refusals_by_code"] = m_mm_manager ? m_mm_manager->get_block_refusals_json()
                                                            : nlohmann::json::object();
@@ -7718,7 +7880,8 @@ nlohmann::json MiningInterface::rest_version_signaling(const nlohmann::json* cac
         {16, "DashShare"},
         {17, "Share"}, {32, "PreSegwitShare"}, {33, "NewShare"},
         {34, "SegwitMiningShare"}, {35, "PaddingBugfixShare"},
-        {36, m_blockchain == Blockchain::DASH ? "DashV36Share" : "MergedMiningShare"}
+        {36, m_blockchain == Blockchain::DASH ? "DashV36Share" : "MergedMiningShare"},
+        {3601, "MergedMiningShareV3601"}   // LTC: the share version 3601 flag day
     };
 
     nlohmann::json result = nlohmann::json::object();
@@ -10939,99 +11102,38 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
             if (comma_pos != std::string::npos)
                 primary_addr = primary_addr.substr(0, comma_pos);
         }
-        // Decode any address format: base58 (P2PKH/P2SH) or bech32 (P2WPKH)
-        std::string addr_type_str;
-        std::string share_address = address_to_hash160(primary_addr, addr_type_str);
+        // The share's payout and merged addresses. A stratum job carries the
+        // ones its ref_hash committed to (decide_job_payout, at job time: the
+        // node fee draw and the redistribution of an empty login happen there,
+        // as in p2pool's get_work); the share must carry exactly those.
+        std::string share_address;
         uint8_t share_addr_type = 0; // 0=P2PKH, 1=P2WPKH, 2=P2SH
-        if (share_address.size() == 40) {
-            if (addr_type_str == "p2wpkh") share_addr_type = 1;
-            else if (addr_type_str == "p2sh") share_addr_type = 2;
-        }
-        if (share_address.size() != 40) {
-            // Case 4 (Python work.py): invalid/empty LTC address but miner provided an
-            // explicit DOGE merged address → derive LTC hash160 from DOGE P2PKH script.
-            // LTC and DOGE use identical secp256k1 keys: same pubkey_hash, different version byte.
-            static constexpr uint32_t DOGE_CHAIN_ID = 98;
-            auto doge_it = merged_addresses.find(DOGE_CHAIN_ID);
-            if (doge_it != merged_addresses.end()) {
-                const auto& doge_script = doge_it->second;
-                // P2PKH script: 76 a9 14 <20-byte hash160> 88 ac
-                if (doge_script.size() == 25 &&
-                    doge_script[0] == 0x76 && doge_script[1] == 0xa9 && doge_script[2] == 0x14) {
-                    static const char* HEX = "0123456789abcdef";
-                    std::string h160;
-                    h160.reserve(40);
-                    for (int i = 3; i < 23; ++i) {
-                        h160 += HEX[doge_script[i] >> 4];
-                        h160 += HEX[doge_script[i] & 0x0f];
-                    }
-                    share_address = h160;
-                    LOG_INFO << "mining_submit: Case 4 — LTC share hash160 derived from DOGE merged address";
-                }
+        std::map<uint32_t, std::vector<unsigned char>> share_merged = merged_addresses;
+        if (job && job->has_payout) {
+            share_address = script_hash160_hex(job->payout_script, share_addr_type);
+            if (share_address.size() != 40)
+                LOG_WARNING << "mining_submit: job payout of '" << primary_addr
+                            << "' is not a P2PKH/P2SH/P2WPKH script — share will carry zero-hash payout";
+        } else {
+            // No frozen job payout (callers without a stratum job): decided now.
+            std::string addr_type_str;
+            share_address = address_to_hash160(primary_addr, addr_type_str);
+            if (share_address.size() == 40) {
+                if (addr_type_str == "p2wpkh") share_addr_type = 1;
+                else if (addr_type_str == "p2sh") share_addr_type = 2;
             }
-        }
-        if (share_address.size() != 40) {
-            // Case 3 (Python work.py): no valid LTC or DOGE address → redistribute
-            // according to the node's configured --redistribute mode.
-            if (m_address_fallback_fn) {
-                auto [h160, type] = m_address_fallback_fn(primary_addr);
-                if (h160.size() == 40 && type <= 2) {
-                    share_address = std::move(h160);
-                    share_addr_type = type;   // the recipient's own script type
-                    LOG_INFO << "mining_submit: Case 3 — redistributed share for invalid address '"
-                             << primary_addr << "' (type " << int(type) << ")";
-                }
-            }
+            std::vector<unsigned char> payout = share_address.size() == 40
+                ? hash160_hex_script(share_address, share_addr_type) : std::vector<unsigned char>{};
+            std::vector<std::pair<uint32_t, std::vector<unsigned char>>> merged(merged_addresses.begin(),
+                                                                                merged_addresses.end());
+            decide_job_payout(payout, merged);
+            share_address = script_hash160_hex(payout, share_addr_type);
+            share_merged = std::map<uint32_t, std::vector<unsigned char>>(merged.begin(), merged.end());
             if (share_address.size() != 40)
                 LOG_WARNING << "mining_submit: cannot resolve share address for '"
                             << primary_addr << "' — share will carry zero-hash payout";
         }
 
-        // p2pool -f: probabilistic node fee (matches work.py:1592-1594).
-        // With probability fee%, replace the miner's pubkey_hash with the
-        // node operator's. ~fee% of shares carry the operator's address
-        // in PPLNS, so the operator earns ~fee% of block rewards.
-        // Supports P2PKH, P2SH, and P2WPKH node fee addresses.
-        if (m_node_fee_percent > 0.0 && !m_node_fee_script.empty()) {
-            float roll = core::random::random_float(0.0f, 100.0f);
-            if (roll < static_cast<float>(m_node_fee_percent)) {
-                // Extract hash160 from node fee scriptPubKey (any supported type)
-                static const char* HEX = "0123456789abcdef";
-                int h160_off = -1;
-                uint8_t fee_type = 0;
-                auto sz = m_node_fee_script.size();
-                if (sz == 25 && m_node_fee_script[0] == 0x76 &&
-                    m_node_fee_script[1] == 0xa9 && m_node_fee_script[2] == 0x14) {
-                    h160_off = 3;  // P2PKH: 76 a9 14 <20> 88 ac
-                    fee_type = 0;
-                } else if (sz == 23 && m_node_fee_script[0] == 0xa9 &&
-                           m_node_fee_script[1] == 0x14) {
-                    h160_off = 2;  // P2SH: a9 14 <20> 87
-                    fee_type = 2;
-                } else if (sz == 22 && m_node_fee_script[0] == 0x00 &&
-                           m_node_fee_script[1] == 0x14) {
-                    h160_off = 2;  // P2WPKH: 00 14 <20>
-                    fee_type = 1;
-                }
-                if (h160_off >= 0) {
-                    std::string h160;
-                    h160.reserve(40);
-                    for (int i = h160_off; i < h160_off + 20; ++i) {
-                        h160 += HEX[m_node_fee_script[i] >> 4];
-                        h160 += HEX[m_node_fee_script[i] & 0x0f];
-                    }
-                    share_address = h160;
-                    // The operator's own script type, not the miner's: the
-                    // operator's hash under the miner's type pays another
-                    // address, or nobody (a script hash as P2PKH).
-                    share_addr_type = fee_type;
-                    LOG_DEBUG_POOL << "Node fee: share " << job_id
-                                   << " address replaced → operator (roll="
-                                   << roll << " < " << m_node_fee_percent << ")";
-                }
-            }
-        }
-        
         // Track mining_share submission for statistics
         if (m_node) {
             m_node->track_mining_share_submission(username, share_difficulty);
@@ -11046,8 +11148,7 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
         // Create a proper V36 share in the tracker with all block template data.
         // The payout_script is built from share_address (which may have been
         // probabilistically replaced with the node operator's address for the
-        // primary chain node fee).  Merged addresses are passed through
-        // unmodified — Python p2pool does NOT apply node fee to merged chains.
+        // node fee); the merged addresses are share_merged (above).
         uint256 created_share;  // #946: named on an own-find DOGE row
         if (m_create_share_fn) {
             ShareCreationParams params;
@@ -11096,7 +11197,7 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
                 }
             }
 
-            params.merged_addresses = merged_addresses;
+            params.merged_addresses = share_merged;
             params.nonce = static_cast<uint32_t>(std::stoul(nonce, nullptr, 16));
             params.timestamp = static_cast<uint32_t>(std::stoul(ntime, nullptr, 16));
 
@@ -11613,57 +11714,9 @@ bool WebServer::start()
             start_stratum_server();
         }
 
-        // One-shot initial template fetch: populate the cache before any events fire.
-        // After this, all template updates are event-driven (bestblock, best_share_changed).
-        // p2pool has no recurring refresh timer — Twisted reactor events handle everything.
-        if (m_coin_node_ && m_coin_node_->has_rpc()) {
-            auto timer = std::make_shared<net::steady_timer>(ioc_);
-            timer->expires_after(std::chrono::milliseconds(500));
-            timer->async_wait([this, timer](beast::error_code ec) {
-                if (ec || !running_) return;
-                try { mining_interface_->refresh_work(); }
-                catch (const std::exception& e) { LOG_WARNING << "initial refresh_work failed: " << e.what(); }
-                catch (...) { LOG_WARNING << "initial refresh_work failed: unknown error"; }
-                LOG_INFO << "Initial block template fetched";
-            });
-        }
-
-        // ── No-embedded RPC mode: recurring getblocktemplate poll ─────────────
-        // The one-shot fetch above is the ONLY template refresh in --no-embedded
-        // mode: there is no embedded header-sync on_new_headers callback and no
-        // ZMQ/longpoll subscription to fire "bestblock" events (embedded mode drives
-        // refresh via on_new_headers → trigger_work_refresh). If the daemon was still
-        // in IBD at the 500ms one-shot, m_work_valid stayed false and never recovered
-        // because nothing polls again. Add a recurring poll that (a) bootstraps the
-        // cache once the daemon leaves IBD and (b) re-notifies miners when the network
-        // tip advances — replacing the event source embedded mode gets for free.
-        if (m_coin_node_ && m_coin_node_->has_rpc() && !m_coin_node_->is_embedded()) {
-            auto poll = std::make_shared<net::steady_timer>(ioc_);
-            auto prev_hash = std::make_shared<std::string>();
-            auto poll_fn = std::make_shared<std::function<void(beast::error_code)>>();
-            *poll_fn = [this, poll, prev_hash, poll_fn](beast::error_code ec) {
-                if (ec || !running_) return;
-                poll->expires_after(std::chrono::seconds(2));
-                poll->async_wait(*poll_fn);
-                try {
-                    mining_interface_->refresh_work();
-                    std::string tip = mining_interface_->get_current_gbt_prevhash();
-                    if (!tip.empty() && tip != *prev_hash) {
-                        bool first = prev_hash->empty();
-                        *prev_hash = tip;
-                        if (stratum_server_) stratum_server_->notify_all();
-                        LOG_INFO << "[LTC] no-embed GBT poll: "
-                                 << (first ? "first template " : "new tip ")
-                                 << tip.substr(0, 16) << "... — miners notified";
-                    }
-                } catch (const std::exception& e) {
-                    LOG_WARNING << "[LTC] no-embed GBT poll failed: " << e.what();
-                }
-            };
-            poll->expires_after(std::chrono::seconds(2));
-            poll->async_wait(*poll_fn);
-            LOG_INFO << "[LTC] no-embedded RPC mode: recurring GBT poll scheduled (2s)";
-        }
+        // The coin daemon's template refresh (RPC); also armed by
+        // set_coin_node() when the node is attached after start().
+        arm_rpc_template_refresh();
 
         // Schedule stat_log timer (every 60 seconds for graph data)
         {
@@ -11899,7 +11952,80 @@ void WebServer::set_coin_node(core::coin::ICoinNode* node)
     m_coin_node_ = node;
     mining_interface_->set_coin_node(node);
     LOG_INFO << "WebServer: coin node " << (node ? "attached" : "detached");
+    // Attached after start() (c2pool-ltc starts the web server early, before
+    // its coin node exists): start() armed no template refresh, and a
+    // --no-embedded-ltc pool never fetched a template ("Waiting for block
+    // template"). Embedded mode refreshes on its header sync, as before.
+    if (running_ && node && node->has_rpc() && !node->is_embedded())
+        arm_rpc_template_refresh();
 }
+
+void WebServer::refresh_on_parent_block(const uint256& block_hash)
+{
+    if (block_hash.IsNull() || block_hash == last_parent_block_)
+        return;
+    last_parent_block_ = block_hash;
+    trigger_work_refresh(core::RefreshCause::block);
+}
+
+void WebServer::arm_rpc_template_refresh()
+{
+    if (rpc_refresh_armed_ || !running_ || !m_coin_node_)
+        return;
+    rpc_refresh_armed_ = true;
+    // One-shot initial template fetch: populate the cache before any events fire.
+    // After this, all template updates are event-driven (bestblock, best_share_changed).
+    // p2pool has no recurring refresh timer — Twisted reactor events handle everything.
+    if (m_coin_node_ && m_coin_node_->has_rpc()) {
+        auto timer = std::make_shared<net::steady_timer>(ioc_);
+        timer->expires_after(std::chrono::milliseconds(500));
+        timer->async_wait([this, timer](beast::error_code ec) {
+            if (ec || !running_) return;
+            try { mining_interface_->refresh_work(); }
+            catch (const std::exception& e) { LOG_WARNING << "initial refresh_work failed: " << e.what(); }
+            catch (...) { LOG_WARNING << "initial refresh_work failed: unknown error"; }
+            LOG_INFO << "Initial block template fetched";
+        });
+    }
+
+    // ── No-embedded RPC mode: recurring getblocktemplate poll ─────────────
+    // The one-shot fetch above is the ONLY template refresh in --no-embedded
+    // mode: there is no embedded header-sync on_new_headers callback and no
+    // ZMQ/longpoll subscription to fire "bestblock" events (embedded mode drives
+    // refresh via on_new_headers → trigger_work_refresh). If the daemon was still
+    // in IBD at the 500ms one-shot, m_work_valid stayed false and never recovered
+    // because nothing polls again. Add a recurring poll that (a) bootstraps the
+    // cache once the daemon leaves IBD and (b) re-notifies miners when the network
+    // tip advances — replacing the event source embedded mode gets for free.
+    if (m_coin_node_ && m_coin_node_->has_rpc() && !m_coin_node_->is_embedded()) {
+        auto poll = std::make_shared<net::steady_timer>(ioc_);
+        auto prev_hash = std::make_shared<std::string>();
+        auto poll_fn = std::make_shared<std::function<void(beast::error_code)>>();
+        *poll_fn = [this, poll, prev_hash, poll_fn](beast::error_code ec) {
+            if (ec || !running_) return;
+            poll->expires_after(std::chrono::seconds(2));
+            poll->async_wait(*poll_fn);
+            try {
+                mining_interface_->refresh_work();
+                std::string tip = mining_interface_->get_current_gbt_prevhash();
+                if (!tip.empty() && tip != *prev_hash) {
+                    bool first = prev_hash->empty();
+                    *prev_hash = tip;
+                    if (stratum_server_) stratum_server_->notify_all();
+                    LOG_INFO << "[LTC] no-embed GBT poll: "
+                             << (first ? "first template " : "new tip ")
+                             << tip.substr(0, 16) << "... — miners notified";
+                }
+            } catch (const std::exception& e) {
+                LOG_WARNING << "[LTC] no-embed GBT poll failed: " << e.what();
+            }
+        };
+        poll->expires_after(std::chrono::seconds(2));
+        poll->async_wait(*poll_fn);
+        LOG_INFO << "[LTC] no-embedded RPC mode: recurring GBT poll scheduled (2s)";
+    }
+}
+
 
 void WebServer::set_best_share_hash_fn(std::function<uint256()> fn)
 {

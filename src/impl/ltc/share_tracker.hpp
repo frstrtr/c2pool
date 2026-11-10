@@ -2632,9 +2632,15 @@ public:
     // p2pool MergedWeightsSkipList.get_delta (data.py:1864).
     //
     //   chain_id == nullopt : hash / v36 path — no merged-address resolution.
-    //   chain_id has value  : per-chain path — Tier 1 explicit merged_addresses,
-    //                         Tier 1.5 retroactive miner→merged lookup (normalize
-    //                         used only as a lookup PROBE), else the default key.
+    //   chain_id has value  : per-chain path, by the share's version
+    //                         (share_check.hpp, above MERGED_KEY_PREFIX):
+    //                         V36  — Tier 1 explicit merged_addresses, Tier 1.5
+    //                                retroactive miner→merged lookup (normalize
+    //                                used only as a lookup PROBE), else the
+    //                                default key;
+    //                         3601 — Tier 1, else the default key (its own
+    //                                parent script). Never another share's
+    //                                address.
     //
     // Pre-V36 shares count toward window sizing but contribute zero weight
     // (p2pool returns (1, {}, 0, 0)); total_weight/donation are only set once a
@@ -2669,25 +2675,30 @@ public:
                         break;
                     }
                 }
-                // Tier 1.5: retroactive lookup of the same miner's explicit merged
+                // Tier 1.5 (V36 shares): retroactive lookup of the same miner's explicit merged
                 // address from their other shares.  Try the raw parent script, then
                 // its normalized P2PKH form (normalize is a lookup PROBE only here).
-                if (weight_key.empty())
+                if constexpr (ShareT::version < FLAG_DAY_SHARE_VERSION)
                 {
-                    auto table_it = m_miner_merged_addr.find(*chain_id);
-                    if (table_it != m_miner_merged_addr.end())
+                    if (weight_key.empty())
                     {
-                        auto miner_it = table_it->second.find(parent_script);
-                        if (miner_it == table_it->second.end())
+                        auto table_it = m_miner_merged_addr.find(*chain_id);
+                        if (table_it != m_miner_merged_addr.end())
                         {
-                            auto norm = normalize_script_for_merged(parent_script);
-                            if (!norm.empty() && norm != parent_script)
-                                miner_it = table_it->second.find(norm);
+                            auto miner_it = table_it->second.find(parent_script);
+                            if (miner_it == table_it->second.end())
+                            {
+                                auto norm = normalize_script_for_merged(parent_script);
+                                if (!norm.empty() && norm != parent_script)
+                                    miner_it = table_it->second.find(norm);
+                            }
+                            if (miner_it != table_it->second.end())
+                                weight_key = make_merged_key(miner_it->second);
                         }
-                        if (miner_it != table_it->second.end())
-                            weight_key = make_merged_key(miner_it->second);
                     }
                 }
+                // 3601 shares: no Tier 1.5 — the share's own parent script
+                // (the default key below).
             }
         }
 
@@ -2934,24 +2945,20 @@ public:
                                 const uint256& block_target,
                                 uint64_t subsidy,
                                 uint32_t chain_id,
-                                const std::vector<unsigned char>& donation_script,
-                                const std::vector<unsigned char>& operator_ltc_script = {},
-                                const std::vector<unsigned char>& operator_merged_script = {})
+                                const std::vector<unsigned char>& donation_script)
     {
         (void)block_target;
-        return merged_payouts_from_weights(
-            get_merged_payout_weights(best_share_hash, chain_id, operator_ltc_script, operator_merged_script),
-            subsidy, donation_script);
+        return merged_payouts_from_weights(get_merged_payout_weights(best_share_hash, chain_id),
+                                           subsidy, donation_script);
     }
 
     // The tracker half of get_merged_expected_payouts: the PPLNS weights from
-    // best_share_hash, keys resolved to merged scripts (the operator override
-    // applied). Needs the tracker; the amounts do not (merged_payouts_from_weights).
+    // best_share_hash, keys resolved to merged scripts exactly as p2pool's
+    // build_canonical_merged_coinbase does (no node-local redirect: peers
+    // rebuild this coinbase from the share chain alone). Needs the tracker;
+    // the amounts do not (merged_payouts_from_weights).
     MergedPayoutWeights
-    get_merged_payout_weights(const uint256& best_share_hash,
-                              uint32_t chain_id,
-                              const std::vector<unsigned char>& operator_ltc_script = {},
-                              const std::vector<unsigned char>& operator_merged_script = {})
+    get_merged_payout_weights(const uint256& best_share_hash, uint32_t chain_id)
     {
         MergedPayoutWeights out;
         out.best = best_share_hash;
@@ -2979,12 +2986,7 @@ public:
         // per-key floors. V36 peers re-derive this coinbase and compare.
         std::map<std::vector<unsigned char>, uint288> script_weights;
         for (const auto& [key, weight] : weights) {
-            std::vector<unsigned char> script;
-            if (!operator_ltc_script.empty() && !operator_merged_script.empty() && key == operator_ltc_script) {
-                script = operator_merged_script;
-            } else {
-                script = resolve_merged_payout_script(key);
-            }
+            std::vector<unsigned char> script = resolve_merged_payout_script(key);
             if (script.empty()) continue;  // Unconvertible (P2WSH, P2TR) — skip
             script_weights[script] = script_weights[script] + weight;
             out.accepted_total = out.accepted_total + weight;
@@ -3133,6 +3135,8 @@ private:
     {
         if constexpr (requires { share->m_merged_addresses; })
         {
+            // V36 shares only: a 3601 share neither feeds nor uses Tier 1.5.
+            if constexpr (ShareT::version >= FLAG_DAY_SHARE_VERSION) return;
             if (share->m_desired_version < 36) return;
             if (share->m_merged_addresses.empty()) return;
             auto parent_script = get_share_script(share);

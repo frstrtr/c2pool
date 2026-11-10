@@ -19,6 +19,7 @@
 #include <iomanip>
 #include <random>
 #include <unordered_map>
+#include <ctime>
 #ifndef _WIN32
 #include <execinfo.h>  // backtrace() for think() watchdog stack dump (glibc-only)
 #endif
@@ -328,6 +329,15 @@ std::optional<pool::PeerConnectionType> NodeImpl::handle_version(std::unique_ptr
                         << " protocol " << msg->m_version
                         << " < minimum " << m_tracker.m_params->minimum_protocol_version
                         << ", disconnecting";
+            throw std::runtime_error("peer protocol too old");
+        }
+        // From the share version 3601 flag day on, a peer that cannot load a
+        // 3601 share is refused the same clean way (no ban).
+        if (!peer_takes_3601(msg->m_version)
+            && v3601_flag_day_passed(static_cast<uint32_t>(std::time(nullptr))))
+        {
+            drop_pre_3601_peer(peer->addr(), pre_3601_peer_line(msg->m_addr_from.m_endpoint.to_string(),
+                                                                msg->m_version, msg->m_subversion));
             throw std::runtime_error("peer protocol too old");
         }
 
@@ -738,6 +748,77 @@ void NodeImpl::note_invalid_pow_share(NetService addr)
 // on the io thread each think cycle, alongside the other periodic prunes, and
 // MUST use the same steady_clock timebase as note_invalid_pow_share() so the
 // decay math is consistent (std::time() would be a different epoch).
+bool NodeImpl::peer_takes_3601_at(const NetService& addr) const
+{
+    for (const auto& [nonce, peer] : m_peers)
+        if (peer && peer->addr() == addr)
+            return peer_takes_3601(peer->m_other_version);
+    return false;
+}
+
+void NodeImpl::drop_pre_3601_peer(const NetService& addr, const std::string& line)
+{
+    const auto now = std::chrono::steady_clock::now();
+    if (m_pre_3601_warn.should_warn(addr.address(), now))
+        LOG_WARNING << "[Pool] " << line;   // once an hour per IP
+    else
+        LOG_DEBUG_POOL << "[Pool] " << line;
+    m_pre_3601_until[addr] = now + std::chrono::hours(1);   // the dialer skips this ip:port
+    // A deliberate close: what we sent it is not "rejected by the peer".
+    m_last_broadcast_to.erase(addr);
+    if (m_pre_3601_until.size() > 4096)
+        for (auto it = m_pre_3601_until.begin(); it != m_pre_3601_until.end(); )
+            it = it->second <= now ? m_pre_3601_until.erase(it) : std::next(it);
+}
+
+bool NodeImpl::drop_misfit_share(ShareType& share, std::string& drop_peer)
+{
+    const auto why = received_share_flag_day_problem(share);
+    if (why.empty())
+        return false;
+    if (drop_peer.empty())
+        drop_peer = why;
+    share.destroy();
+    return true;
+}
+
+void NodeImpl::drop_misfit_sender(const peer_ptr& peer, const std::string& why)
+{
+    if (!peer || why.empty())
+        return;
+    if (!peer_takes_3601(peer->m_other_version) || why.find("peer too old") != std::string::npos) {
+        drop_pre_3601_peer(peer->addr(), pre_3601_peer_line(peer->addr().to_string(), peer->m_other_version,
+                                                            peer->m_other_subversion));
+    } else {
+        // A 3601-capable peer sending a share under the wrong type number:
+        // broken or hostile. Disconnected (rate-limited line), not banned.
+        const auto now = std::chrono::steady_clock::now();
+        const std::string line = "peer " + peer->addr().to_string() + " sent a share whose type number does not fit "
+                                 "its timestamp (" + why + "): dropped, disconnecting";
+        if (m_pre_3601_warn.should_warn("misfit:" + peer->addr().address(), now))
+            LOG_WARNING << "[Pool] " << line;
+        else
+            LOG_DEBUG_POOL << "[Pool] " << line;
+        m_last_broadcast_to.erase(peer->addr());
+    }
+    close_connection(peer->addr());
+}
+
+void NodeImpl::disconnect_pre_3601_peers()
+{
+    if (!v3601_flag_day_passed(static_cast<uint32_t>(std::time(nullptr))))
+        return;
+    std::vector<std::pair<NetService, std::string>> old;
+    for (const auto& [nonce, peer] : m_peers)
+        if (peer && !peer_takes_3601(peer->m_other_version))
+            old.emplace_back(peer->addr(), pre_3601_peer_line(peer->addr().to_string(), peer->m_other_version,
+                                                              peer->m_other_subversion));
+    for (const auto& [addr, line] : old) {
+        drop_pre_3601_peer(addr, line);
+        close_connection(addr);
+    }
+}
+
 void NodeImpl::prune_pow_misbehavior()
 {
     const double now_s = std::chrono::duration<double>(
@@ -843,6 +924,60 @@ bool NodeImpl::processing_shares(HandleSharesData& data_ref, NetService addr)
     return true;
 }
 
+// The LevelDB row of a share: its type number (8 bytes LE) and its bytes (the
+// received ones when `raw` holds them under the same type number, else packed).
+c2pool::storage::SharechainStorage::ShareBatchEntry NodeImpl::share_db_entry(ShareType& share,
+                                                                             const chain::RawShare* raw)
+{
+    std::vector<uint8_t> bytes;
+    if (raw && raw->type == static_cast<uint64_t>(share.version()) && !raw->contents.m_data.empty())
+    {
+        bytes.assign(raw->contents.m_data.begin(), raw->contents.m_data.end());
+    }
+    else
+    {
+        PackStream ps = pack(share);
+        auto span = ps.get_span();
+        bytes.assign(reinterpret_cast<const uint8_t*>(span.data()),
+                     reinterpret_cast<const uint8_t*>(span.data()) + span.size());
+    }
+    uint64_t ver = share.version();
+    std::vector<uint8_t> versioned;
+    versioned.resize(8 + bytes.size());
+    std::memcpy(versioned.data(), &ver, 8);
+    std::memcpy(versioned.data() + 8, bytes.data(), bytes.size());
+
+    c2pool::storage::SharechainStorage::ShareBatchEntry entry;
+    share.ACTION({
+        uint256 target = chain::bits_to_target(obj->m_bits);
+        uint256 abswork_256;
+        std::copy(obj->m_abswork.begin(), obj->m_abswork.end(), abswork_256.begin());
+        entry.hash = obj->m_hash;
+        entry.serialized_data = std::move(versioned);
+        entry.prev_hash = obj->m_prev_hash;
+        entry.height = obj->m_absheight;
+        entry.timestamp = obj->m_timestamp;
+        entry.work = abswork_256;
+        entry.target = target;
+    });
+    return entry;
+}
+
+// A share this node made (create_local_share) into LevelDB, as a received
+// one is in processing_shares_phase2: without it a restart reloads the
+// network's shares but not ours, and the chain has holes (many heads, "chain
+// too short") until peers send our own shares back. Caller holds the
+// tracker lock.
+bool NodeImpl::persist_local_share(const uint256& hash)
+{
+    if (!m_storage || !m_storage->is_available() || !m_chain || !m_chain->contains(hash))
+        return false;
+    auto& share = m_chain->get_share(hash);
+    std::vector<c2pool::storage::SharechainStorage::ShareBatchEntry> one;
+    one.push_back(share_db_entry(share, nullptr));
+    return m_storage->store_shares_batch(one);
+}
+
 void NodeImpl::processing_shares_phase2(HandleSharesData& data, NetService addr)
 {
     // Phase 2 (io_context thread): topological sort + chain insertion + LevelDB store.
@@ -892,17 +1027,22 @@ void NodeImpl::processing_shares_phase2(HandleSharesData& data, NetService addr)
     // lock. ASIO single-thread still guarantees no overlapping IO handler.
 
     // Step 1: collect verified shares (skip any that failed verification, hash still null)
+    // and keep each one's original raw bytes, by share OBJECT: the relay cache
+    // gets them only for the object the tracker adopts (step 3), never for a
+    // duplicate by hash (a copy under another type number would otherwise
+    // replace the bytes relayed for the share the tracker holds).
     std::vector<ShareType> valid_shares;
     valid_shares.reserve(data.m_items.size());
+    std::unordered_map<const void*, chain::RawShare> raw_by_object;
     for (size_t idx = 0; idx < data.m_items.size(); ++idx)
     {
         auto& share = data.m_items[idx];
         if (share.hash().IsNull())
             continue; // verification failed in phase 1
 
-        // Cache original raw bytes for relay (keyed by computed hash)
-        if (idx < data.m_raw_items.size() && !data.m_raw_items[idx].contents.m_data.empty())
-            m_raw_share_cache[share.hash()] = std::move(data.m_raw_items[idx]);
+        if (idx < data.m_raw_items.size() && !data.m_raw_items[idx].contents.m_data.empty()
+            && data.m_raw_items[idx].type == static_cast<uint64_t>(share.version()))
+            raw_by_object.emplace(ltc::share_ptr_id(share), std::move(data.m_raw_items[idx]));
         valid_shares.push_back(share);
     }
 
@@ -993,6 +1133,9 @@ void NodeImpl::processing_shares_phase2(HandleSharesData& data, NetService addr)
                 auto slot = batch_slot.find(adopted_id);
                 if (slot != batch_slot.end())
                     ltc::share_release(data.m_items[slot->second]);
+                // The relay bytes of the adopted object (keyed by its hash).
+                if (auto raw = raw_by_object.find(adopted_id); raw != raw_by_object.end())
+                    m_raw_share_cache[share.hash()] = std::move(raw->second);
             }
         }
 
@@ -1030,42 +1173,8 @@ void NodeImpl::processing_shares_phase2(HandleSharesData& data, NetService addr)
         // Collect for batch LevelDB persist (committed atomically after loop)
         if (m_storage && m_storage->is_available())
         {
-            std::vector<uint8_t> bytes;
             auto raw_it = m_raw_share_cache.find(share.hash());
-            if (raw_it != m_raw_share_cache.end() &&
-                raw_it->second.type == share.version() &&
-                !raw_it->second.contents.m_data.empty())
-            {
-                bytes.assign(raw_it->second.contents.m_data.begin(),
-                             raw_it->second.contents.m_data.end());
-            }
-            else
-            {
-                PackStream ps = pack(share);
-                auto span = ps.get_span();
-                bytes.assign(reinterpret_cast<const uint8_t*>(span.data()),
-                             reinterpret_cast<const uint8_t*>(span.data()) + span.size());
-            }
-            uint64_t ver = share.version();
-            std::vector<uint8_t> versioned;
-            versioned.resize(8 + bytes.size());
-            std::memcpy(versioned.data(), &ver, 8);
-            std::memcpy(versioned.data() + 8, bytes.data(), bytes.size());
-
-            share.ACTION({
-                uint256 target = chain::bits_to_target(obj->m_bits);
-                uint256 abswork_256;
-                std::copy(obj->m_abswork.begin(), obj->m_abswork.end(), abswork_256.begin());
-                c2pool::storage::SharechainStorage::ShareBatchEntry entry;
-                entry.hash = obj->m_hash;
-                entry.serialized_data = std::move(versioned);
-                entry.prev_hash = obj->m_prev_hash;
-                entry.height = obj->m_absheight;
-                entry.timestamp = obj->m_timestamp;
-                entry.work = abswork_256;
-                entry.target = target;
-                db_batch.push_back(std::move(entry));
-            });
+            db_batch.push_back(share_db_entry(share, raw_it != m_raw_share_cache.end() ? &raw_it->second : nullptr));
         }
     }
 
@@ -1122,6 +1231,8 @@ std::vector<ltc::ShareType> NodeImpl::handle_get_share(std::vector<uint256> hash
     }
 
     parents = std::min(parents, (uint64_t)1000/hashes.size());
+    // No 3601 share to a peer that cannot load one.
+    const bool takes_3601 = peer_takes_3601_at(peer_addr);
 	std::vector<ltc::ShareType> shares;
 	for (const auto& handle_hash : hashes)
 	{
@@ -1141,6 +1252,8 @@ std::vector<ltc::ShareType> NodeImpl::handle_get_share(std::vector<uint256> hash
 			if (std::find(stops.begin(), stops.end(), hash) != stops.end())
 				break;
 			if (m_rejected_share_hashes.count(hash))
+				continue;
+			if (!takes_3601 && data.share.version() >= FLAG_DAY_SHARE_VERSION)
 				continue;
 			shares.push_back(data.share);
 		}
@@ -1181,7 +1294,9 @@ std::vector<uint256> NodeImpl::send_shares(peer_ptr peer, const std::vector<uint
         return {};
     }
 
-    // Collect shares that exist in our chain (skip rejected)
+    // Collect shares that exist in our chain (skip rejected; no 3601 share
+    // to a peer that cannot load one)
+    const bool takes_3601 = peer_takes_3601(peer->m_other_version);
     std::vector<ShareType> shares;
     for (const auto& hash : share_hashes)
     {
@@ -1192,7 +1307,8 @@ std::vector<uint256> NodeImpl::send_shares(peer_ptr peer, const std::vector<uint
         // Retrieve the share via get_chain(hash, 1) — first element is the share itself
         for (auto [h, data] : m_chain->get_chain(hash, 1))
         {
-            shares.push_back(data.share);
+            if (takes_3601 || data.share.version() < FLAG_DAY_SHARE_VERSION)
+                shares.push_back(data.share);
             break;
         }
     }
@@ -1331,7 +1447,7 @@ std::vector<uint256> NodeImpl::send_shares(peer_ptr peer, const std::vector<uint
     for (size_t i = 0; i < shares.size(); ++i)
     {
         auto it = m_raw_share_cache.find(shares[i].hash());
-        if (it != m_raw_share_cache.end())
+        if (it != m_raw_share_cache.end() && it->second.type == static_cast<uint64_t>(shares[i].version()))
         {
             rshares.push_back(it->second);
         }
@@ -2097,6 +2213,16 @@ void NodeImpl::load_persisted_shares()
             PackStream ps(share_bytes);
 
             auto share = ltc::load_share(static_cast<int64_t>(ver), ps, NetService{"database", 0});
+            // A stored share whose type number does not fit its timestamp
+            // (the flag day): never into the tracker.
+            if (const auto why = received_share_flag_day_problem(share); !why.empty()) {
+                ++skipped_load;
+                static int misfit_log = 0;
+                if (misfit_log++ < 5)
+                    LOG_WARNING << "[Pool] LevelDB share " << hash.GetHex().substr(0, 16) << " not loaded: " << why;
+                share.destroy();
+                continue;
+            }
             // m_hash is not part of the serialized format — it's computed
             // during share_check validation.  Restore it from the LevelDB key.
             share.ACTION({ obj->m_hash = hash; });
@@ -2258,6 +2384,10 @@ void NodeImpl::start_outbound_connections()
         m_tx_advert_timer = std::make_unique<core::Timer>(m_context, true);
         m_tx_advert_timer->start(core::TX_ADVERT_INTERVAL_SECONDS,
                                  [this]() { advertise_known_txs(); });
+        // Share version 3601 flag day: no peer below 3601 stays past it (a
+        // timer of its own: on a quiet chain no think cycle runs).
+        m_flag_day_timer = std::make_unique<core::Timer>(m_context, true);
+        m_flag_day_timer->start(5, [this]() { disconnect_pre_3601_peers(); });
     }
 
     if (m_target_outbound_peers == 0)
@@ -2281,6 +2411,11 @@ void NodeImpl::start_outbound_connections()
                 break;
             // Skip if already connected, already dialing, or banned
             if (m_connections.contains(ap.addr) || m_pending_outbound.contains(ap.addr) || is_banned(ap.addr))
+                continue;
+            // A peer refused as too old for share version 3601: not redialed
+            // for an hour (it is not banned).
+            if (auto old = m_pre_3601_until.find(ap.addr);
+                old != m_pre_3601_until.end() && old->second > std::chrono::steady_clock::now())
                 continue;
 
             LOG_INFO << "[Pool] Dialing outbound peer " << ap.addr.to_string();
@@ -2674,6 +2809,7 @@ void NodeImpl::run_think()
                 if (it->second <= now) it = m_ban_list.erase(it);
                 else ++it;
             }
+
 
             // Clear stale download set (p2pool node.py:108-141)
             m_downloading_shares.clear();

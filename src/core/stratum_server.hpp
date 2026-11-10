@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
+#include "merged_chain_addr.hpp"
 
 #include <memory>
 #include <string>
@@ -181,6 +182,12 @@ private:
         // of p2pool-dash work.py:477 grace (p2pool judges each share by its own
         // job's target). 0.0 = unset ⇒ gate falls back to the live vardiff.
         double issued_difficulty{0.0};
+        // The payout and merged scripts this job's ref_hash committed to: the
+        // share made from it carries these, whatever the session's login is
+        // by the time the miner submits.
+        bool has_payout{false};
+        std::vector<unsigned char> payout_script;
+        std::map<uint32_t, std::vector<unsigned char>> merged_scripts;
     };
     std::unordered_map<std::string, JobEntry> active_jobs_;
     // Insertion-order companion to active_jobs_ (interim hardening fix #1).
@@ -241,6 +248,28 @@ private:
 
     // Merged mining: per-chain payout addresses set by the miner.
     std::map<uint32_t, std::string> merged_addresses_;
+    // The ones sent with mining.set_merged_addresses: the only entries that
+    // outlive a re-authorize (the login's own are resolved again from it).
+    std::map<uint32_t, std::string> set_merged_addresses_;
+    // The last successful login's primary and the merged addresses it gave
+    // itself (not set_merged_addresses, not auto-derived): kept by a
+    // re-authorize with the same primary.
+    std::string login_primary_;
+    std::map<uint32_t, std::string> login_given_;
+    // The login has no payout address a share can carry (empty, invalid,
+    // another coin's) and the work source redistributes it: the jobs carry
+    // parent_script_ (p2pool's case 4) or an empty payout.
+    bool payout_unusable_{false};
+    std::vector<unsigned char> parent_script_;
+    std::string payout_warning_;   // shown with the worker ("address invalid → redistributed")
+    // The scriptPubKey a merged entry pays on its chain
+    // (core::merged_addr::merged_payout_script).
+    std::vector<unsigned char> merged_script_for(uint32_t chain_id, const std::string& addr) const;
+    bool testnet_network() const;
+    // The merged-chain identification table (built once per session).
+    const std::vector<core::merged_addr::ChainAddrInfo>& merged_table() const;
+    mutable std::vector<core::merged_addr::ChainAddrInfo> merged_table_;
+    mutable bool merged_table_built_{false};
 
     // BIP 310 version-rolling (ASICBoost) state
     static constexpr uint32_t POOL_VERSION_MASK = 0x1fffe000;
@@ -354,7 +383,8 @@ private:
     void arm_handshake_timer();
 
     std::string generate_extranonce1();
-    void parse_address_separators(std::string& username, std::string& merged_addr_raw);
+    void parse_address_separators(std::string& username, std::string& merged_addr_raw,
+                                  std::set<uint32_t>* slash_chains = nullptr);
 };
 
 /// Stratum Server — accepts TCP connections and spawns StratumSession per miner.

@@ -2,6 +2,79 @@
 
 ## [Unreleased]
 
+### LTC: share version 3601 (flag day) — upgrade every node to c2pool v0.2.12
+- From a flag day set in the release (`ltc::PoolConfig::V3601_ACTIVATION_TIME`;
+  not scheduled in this build) every share is a share version 3601 share: the
+  V36 share format under share type 3601. Not voted through the AutoRatchet:
+  a share's version follows from its own timestamp (3601 at or after the flag
+  day, an earlier version before it, nothing but 3601 after a 3601 share), and
+  the switch does not go through the 60% upgraded-hash-power gate (the
+  V35 → V36 switch keeps it). `--v3601-activation-time` moves it on testnet or
+  a private `--network-id` chain only.
+- Merged payouts of 3601 shares come from the share alone: its own merged
+  address, else its own parent key (P2PKH / P2WPKH as P2PKH, P2SH as P2SH).
+  No 3601 share feeds or uses the first-seen address of another share ("Tier 1.5"),
+  which depended on the order a node received shares and let a share naming
+  another miner's parent script take that miner's address-less shares.
+  **V36 shares keep the old rule exactly** (Tier 1.5, P2SH as P2SH): the
+  shares in the window at the flag day keep their payouts, nothing moves at
+  the switch.
+- 3601 shares carrying several merged chains must commit to the AuxPoW tree
+  over exactly the blocks they carry (enforced; still only counted for V36
+  shares). c2pool's own commitments always comply.
+- c2pool advertises protocol 3601. From the flag day a peer below it (p2pool,
+  c2pool before v0.2.12) is disconnected and refused, without a ban, and is
+  never sent a 3601 share; it is left on a sharechain of its own. p2pool is no
+  longer supported from then on.
+- Stratum: a P2SH login without an explicit merged address keeps the merged
+  P2SH derived from its key (as before) and is warned: if it is a
+  segwit-wrapped wallet address (P2SH-P2WPKH/P2WSH, e.g. `M...`), give the
+  DOGE address explicitly (`LTC_ADDRESS,DOGE_ADDRESS`); on DOGE (no segwit)
+  such an output becomes spendable by anyone once the redeem script is
+  public. A P2SH `--node-owner-address` is warned the same way. P2WSH / P2TR
+  logins are flagged "P2WSH/P2TR address → redistributed"; a swapped pair
+  whose first address is not valid (`DOGE-with-bad-checksum,LTCADDR`) pays the
+  LTC address.
+- A share re-wrapped under the other type number (36 <-> 3601; the share hash
+  does not commit to it) is dropped by the share handlers before the tracker
+  and its sender disconnected (never banned); the relay cache only holds the
+  bytes of the share the tracker adopted; LevelDB loads apply the same check.
+- `--no-embedded-doge` disables embedded DOGE networking entirely (no P2P, no
+  DNS seeds), also when a `--merged DOGE:...` spec carries a P2P port.
+- `--no-embedded-ltc`: the initial getblocktemplate fetch and the 2 s poll are
+  armed when the coin daemon is attached. They never were (the web server
+  starts before the coin node): such a pool got a template only on a
+  sharechain event (a peer's share or bestblock, a merged-chain work change),
+  and an isolated one never did ("Waiting for block template"). A block the
+  daemon's own P2P link announces now refreshes the template at once.
+- Redistribution reads the sharechain only under its read lock (a crash race
+  with the compute thread, seen under TSAN).
+- No work is built on a burn output any more. When the sharechain was busy
+  (the PPLNS split at the best share could not be read) the template refresh
+  paid the whole subsidy to the zero key and cached that as the split of the
+  best share; every stratum job at that share then paid it. Now a split is
+  only reused for the best share, coinbase value, bits and donation it was
+  computed for (a new block or a fee change at the same best share paid the
+  old amounts: blocks rejected bad-cb-amount, or underpaid), nothing is
+  cached otherwise, and the zero-key fallback is gone. An empty sharechain
+  pays the donation (p2pool's genesis rule).
+- A redistributed share (no usable login address) and a node fee draw pay
+  the recipient's own script type: a P2SH recipient was paid
+  P2PKH(<script hash>), which nobody can spend. With no recipient the share
+  goes to the combined donation, never the zero key.
+- `--solo` and `--custodial` refuse to start: their coinbase has no
+  extranonce slot, so every block they found was invalid (bad-txnmrklroot)
+  while the miners' shares were accepted.
+- A stratum job is no longer built while the sharechain is busy: the PPLNS at
+  the job's prev share or the ref_hash could not be read, and the job used
+  the cached PPLNS of another best share or a null ref_hash, so its shares
+  could not match their own generation transaction ("Cross-check FAILED").
+  The job is held: the miner keeps its last job, one retry is pending per
+  session (every 500 ms), and after 20 s the session stops retrying (logged)
+  until the next notify. Never the global coinbase.
+- Shares this node makes are written to LevelDB like received ones (they
+  never were: after a restart the chain had holes until peers sent them back).
+
 ### DASH: compiled masternode anchor re-pinned to h=2563800
 - The compiled masternode anchor and the header fast-start move from h=2549400
   to h=2563800 (blockhash 0000000000000016a129aa626ea761e0…, 3005 registered, 2249

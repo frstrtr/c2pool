@@ -165,6 +165,18 @@ struct StratumConfig {
     std::vector<uint8_t>     payout_p2pkh_versions;
     std::vector<uint8_t>     payout_p2sh_versions;
     std::vector<std::string> payout_bech32_hrps;   // BARE HRPs, no trailing '1'
+    // The parent coin's P2PKH/P2SH versions on EVERY network: never claimed
+    // by a merged chain when a login address is identified
+    // (core/merged_chain_addr.hpp).
+    std::vector<uint8_t>     merged_parent_versions;
+    // Merged chains are configured (--merged / embedded DOGE): logins wait
+    // until the merged-mining manager is attached (IWorkSource::merged_ready).
+    bool merged_chains_expected{false};
+    // A login without a payout address a share can carry (empty, invalid,
+    // another coin's) is accepted and its shares redistributed by the work
+    // source (decide_job_payout), as p2pool does. Off: such logins are
+    // refused (#961) — for work sources that do not redistribute.
+    bool redistribute_unusable_logins{false};
 };
 
 /// Frozen share-construction fields returned by ref_hash_fn. These
@@ -219,6 +231,10 @@ struct JobSnapshot {
     std::string block_nbits;      // original GBT block bits (for block target check)
     RefHashResult frozen_ref;     // frozen share fields from template time
     int stale_info{0};            // 0=none, 253=orphan (stale block template)
+    // The payout the job committed to (IWorkSource::decide_job_payout); the
+    // merged scripts it committed to are the map passed with the snapshot.
+    bool has_payout{false};
+    std::vector<unsigned char> payout_script;
 };
 
 /// Atomic snapshot of work-related fields under the work source's mutex.
@@ -394,6 +410,9 @@ struct WorkerInfo {
     // session that records them (set at authorize). Null when the entry did
     // not come from a core stratum session.
     std::shared_ptr<SubmitOutcomeWindow> submit_window;
+    // Set when the login's payout is not its own address
+    // (e.g. "address invalid → redistributed").
+    std::string payout_warning;
 };
 
 }  // namespace core::stratum

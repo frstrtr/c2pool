@@ -210,6 +210,8 @@ C2P_PARAM("sharechain.network_id", Sharechain, HEX, MONEY_RESTART, C_LTC|C_BTC|C
   C2P_ALIAS("sharechain.network_id", BIN_LTC, "--chain-id", VALUE)
   C2P_ALIAS("sharechain.network_id", BIN_BTC, "--network-id", VALUE)
   C2P_ALIAS("sharechain.network_id", BIN_DASH, "--network-id", VALUE)
+C2P_PARAM("sharechain.v3601_activation_time", Sharechain, INT64, MONEY_RESTART, C_LTC, LIT, "", NONE, "share version 3601 flag day, unix time (testnet / private --network-id chain only)")
+  C2P_ALIAS("sharechain.v3601_activation_time", BIN_LTC, "--v3601-activation-time", VALUE)
 
 C2P_PARAM("sharechain.prefix", Sharechain, HEX, MONEY_RESTART, C_LTC|C_BTC|C_DASH, LIT, "", HEX_EVEN, "private sharechain prefix")
   C2P_ALIAS("sharechain.prefix", BIN_LTC, "--prefix", VALUE)
@@ -469,6 +471,9 @@ C2P_PARAM("merged.spec", Merged, MERGED_SPEC, RESTART, C_BTC|C_LTC|C_NMC|C_DGB|C
   C2P_ALIAS("merged.spec", BIN_LTC, "--merged", VALUE)
   C2P_ALIAS("merged.spec", BIN_BTC, "--merged", VALUE)
   C2P_ALIAS("merged.spec", BIN_DGB, "--merged", VALUE)
+
+C2P_PARAM("merged.payout_addresses", Merged, STRING, MONEY_RESTART, C_LTC, LIT, "", NONE, "per-chain SYMBOL:ADDRESS for createauxblock (repeatable)")
+  C2P_ALIAS("merged.payout_addresses", BIN_LTC, "--merged-payout-address", VALUE)
 
 C2P_PARAM("merged.coind_address", Merged, STRING, RESTART, C_LTC|C_DOGE, LIT, "", NONE, "merged coind address")
   C2P_ALIAS("merged.coind_address", BIN_LTC, "--merged-coind-address", VALUE)

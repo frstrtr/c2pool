@@ -2153,6 +2153,7 @@
                         <span class="badge"><span id="payouts_total">0</span> <span class="symbol-small">DASH</span></span>
                         <span class="badge" id="merged_payouts_badge" style="display: none; background: #6f42c1;"><span id="merged_payouts_total">0</span> <span id="merged_payouts_symbol">AUX</span></span>
                     </div>
+                    <div id="payout_warning_note" style="display: none; color: var(--warning, #d97706); font-size: 0.85em;"></div>
                 </div>
                 <div class="table-scroll">
                     <table id="payouts" class="data-table">
@@ -3722,6 +3723,17 @@
         }
 
         function renderLocalStats(local_stats) {
+                // Logins without a payout address of their own (empty, invalid,
+                // another coin's): their shares are redistributed.
+                var _pw = local_stats.workers_payout_warnings;
+                var _pwNote = d3.select('#payout_warning_note');
+                if (_pw && _pw.length) {
+                    _pwNote.text(_pw.length + ' connected login(s): ' + _pw.slice(0, 3).map(function(x) {
+                        return x.worker + ' (' + x.warning + ')';
+                    }).join(', ') + (_pw.length > 3 ? ', …' : '')).style('display', null);
+                } else {
+                    _pwNote.style('display', 'none');
+                }
                 d3.select('#peers_in').text(local_stats.peers.incoming);
                 d3.select('#peers_out').text(local_stats.peers.outgoing);
                 d3.select('#peers_total').text(local_stats.peers.incoming + local_stats.peers.outgoing);

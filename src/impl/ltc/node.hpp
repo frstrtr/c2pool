@@ -30,6 +30,9 @@
 #include <chrono>
 #include <cstdint>
 #include <deque>
+#include <map>
+#include <optional>
+#include <string>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -129,6 +132,89 @@ struct ShareReplyData
     std::size_t size() const { return m_owned ? m_owned->m_items.size() : 0; }
     bool empty() const { return size() == 0; }
 };
+
+// ── Share version 3601 flag day: peers (share.hpp FLAG_DAY_SHARE_VERSION) ──
+// A peer below PoolConfig::V3601_PROTOCOL_VERSION cannot load a 3601 share
+// (old c2pool logs "version unsupported" for each; p2pool drops the
+// connection), and from the flag day on its own shares are V36 shares we
+// reject. Before the flag day it is a normal peer; from it, it is
+// disconnected and refused (a clean close, never a ban), and a 3601 share is
+// never sent to it.
+inline bool peer_takes_3601(const std::optional<uint32_t>& protocol)
+{
+    return protocol.has_value() && *protocol >= PoolConfig::V3601_PROTOCOL_VERSION;
+}
+
+inline bool v3601_flag_day_passed(uint32_t now_unix)
+{
+    return now_unix >= PoolConfig::v3601_activation_time();
+}
+
+inline std::string pre_3601_peer_line(const std::string& addr, const std::optional<uint32_t>& protocol,
+                                      const std::string& subversion)
+{
+    return "peer " + addr + " (protocol " + (protocol ? std::to_string(*protocol) : std::string("?"))
+           + (subversion.empty() ? std::string() : ", " + subversion) + ") is too old for share version 3601"
+           + " (switched at " + std::to_string(PoolConfig::v3601_activation_time())
+           + "): peer too old, upgrade to c2pool v0.2.12; disconnecting";
+}
+
+// The "too old for share version 3601" WARNING: once an hour per peer IP. An
+// old peer redials from a new ephemeral port each time, so a limit per
+// ip:port would let the line repeat on every redial; the rest go to the
+// debug log. Bounded: expired entries are dropped past 4096.
+class Pre3601WarnLimiter
+{
+public:
+    using clock = std::chrono::steady_clock;
+    bool should_warn(const std::string& ip, clock::time_point now)
+    {
+        auto& until = m_until[ip];
+        if (until > now)
+            return false;
+        until = now + std::chrono::hours(1);
+        if (m_until.size() > 4096)
+            for (auto it = m_until.begin(); it != m_until.end();)
+                it = it->second <= now ? m_until.erase(it) : std::next(it);
+        return true;
+    }
+    std::size_t size() const { return m_until.size(); }
+
+private:
+    std::map<std::string, clock::time_point> m_until;
+};
+
+// A share received from a peer (or read back from LevelDB) whose type number
+// does not fit its own timestamp (share_check.hpp flag_day_problem, without
+// the parent): a type below 3601 at or after the flag day, or a 3601 share
+// before it. "" when it fits. Neither the share hash nor its coinbase
+// commits to the type number, so such a share may be an honest share
+// re-wrapped under the other number: it must never reach the tracker, whose
+// dedup by hash would keep the bad copy (it fails the share check and then
+// takes the honest children with it), nor the relay cache. The share
+// handlers drop it and disconnect the sender: a peer below 3601 past the
+// flag day is too old (drop_pre_3601_peer); one sending 3601 shares before
+// it is broken or hostile. Never a ban.
+inline std::string received_share_flag_day_problem(ShareType& share)
+{
+    std::string why;
+    share.invoke([&](auto* obj) {
+        why = flag_day_problem(std::remove_pointer_t<decltype(obj)>::version, obj->m_timestamp, std::nullopt);
+    });
+    return why;
+}
+
+// A share of a version below 3601 whose timestamp is at or after the flag
+// day (the sender is a node too old for share version 3601).
+inline bool pre_3601_share_past_flag_day(ShareType& share)
+{
+    bool r = false;
+    share.invoke([&](auto* obj) {
+        r = std::remove_pointer_t<decltype(obj)>::version < FLAG_DAY_SHARE_VERSION
+            && obj->m_timestamp >= PoolConfig::v3601_activation_time();
+    });
+    return r;
+}
 
 class NodeImpl : public pool::SharechainNode<ltc::Config, ltc::ShareChain, ltc::Peer>
 {
@@ -623,6 +709,30 @@ public:
     // past threshold. Drop decayed scorer entries each think cycle.
     void note_invalid_pow_share(NetService addr);
     void prune_pow_misbehavior();
+
+    // Share version 3601 flag day (see peer_takes_3601 above). io-thread only.
+    // Closes the connection (no ban, and the shares sent to it in the last
+    // seconds are not taken as rejected) and keeps the dialer off the address
+    // (ip:port) for an hour; the WARNING is once an hour per IP
+    // (Pre3601WarnLimiter).
+    void drop_pre_3601_peer(const NetService& addr, const std::string& line);
+    // The share handlers: drop a received share whose type number does not
+    // fit its timestamp (received_share_flag_day_problem). Returns true when
+    // it was dropped (destroyed); `drop_peer` then names why the sender is
+    // to be disconnected, once the batch is handled (drop_misfit_sender).
+    bool drop_misfit_share(ShareType& share, std::string& drop_peer);
+    void drop_misfit_sender(const peer_ptr& peer, const std::string& why);
+    // LevelDB: the row of a share, and a locally created share stored like a
+    // received one (caller holds the tracker lock).
+    static c2pool::storage::SharechainStorage::ShareBatchEntry share_db_entry(ShareType& share,
+                                                                               const chain::RawShare* raw);
+    bool persist_local_share(const uint256& hash);
+    // From the flag day on: drop every connected peer below 3601 (every 5 s,
+    // m_flag_day_timer).
+    void disconnect_pre_3601_peers();
+    bool peer_takes_3601_at(const NetService& addr) const;
+    std::map<NetService, std::chrono::steady_clock::time_point> m_pre_3601_until;   // dial suppression
+    Pre3601WarnLimiter m_pre_3601_warn;                                              // the log line, per IP
     void processing_shares_phase2(HandleSharesData& data, NetService addr);
     /// Direct tracker access — compute-thread-only (already holds exclusive lock)
     /// or startup code (before compute thread exists).
@@ -1205,6 +1315,7 @@ protected:
     // Periodic have_tx/losing_tx delta sweep (core/tx_advertiser.hpp). Cadence
     // mirrors the canonical known-tx removal loop, node.py:298 t.start(10).
     std::unique_ptr<core::Timer> m_tx_advert_timer;
+    std::unique_ptr<core::Timer> m_flag_day_timer;   // disconnect_pre_3601_peers
     std::unique_ptr<core::Timer> m_readvert_timer; // one-shot ROOT-2 re-advert
     std::set<NetService> m_pending_outbound;   // addresses currently being dialed
     std::set<NetService> m_outbound_addrs;     // successfully connected outbound peers

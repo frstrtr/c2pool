@@ -464,6 +464,11 @@ c2pool has four operating modes. The default is a full P2P pool — no flags req
 | **Custodial** | `--custodial` | no | 100% to `--address` | Hosted pool, off-chain accounting |
 | **Sharechain** | `--sharechain` | yes | *(no mining)* | P2P relay node only |
 
+> **`--solo` and `--custodial` are disabled in this release:** c2pool-ltc
+> refuses to start in them. Their coinbase has no room for the miners'
+> extranonce, so every block they found was invalid while the shares were
+> accepted. Use the integrated (default) mode.
+
 Legacy `--standalone` mode (minimal stratum + RPC daemon, no embedded SPV) is available for backwards compatibility.
 
 ### DASH daemonless masternode-set checkpoint — trust anchor
@@ -535,6 +540,7 @@ procedure: [`src/impl/dash/coin/checkpoints/README.md`](src/impl/dash/coin/check
 ./c2pool --address YOUR_LTC_ADDRESS --fee 1
 
 # Solo pool for own miners (no sharechain, proportional payouts)
+# (disabled in this release: c2pool-ltc refuses to start, see above)
 ./c2pool --solo
 
 # Custodial pool (all coinbase to operator, stratum for accounting)
@@ -673,7 +679,137 @@ Other chains need their daemon running externally.
 | DINGO | 98 | External | Cannot run with DOGE (same chain_id) |
 
 DOGE merged mining activates automatically when `--embedded-doge` is on (default).
-External daemons use `createauxblock`/`submitauxblock` RPC.
+External daemons use `createauxblock`/`submitauxblock` RPC. Every chain reached
+over RPC except DOGE needs `--merged-payout-address SYMBOL:ADDRESS` (an address
+of that chain for `createauxblock`; the merged coinbase itself pays PPLNS), or it
+is not mined. Exempt: DGB and any chain c2pool has no address parameters for,
+which keep their RPC backend without one (as before).
+
+### Who is paid on a merged chain (`c2pool-ltc`, sharechain mode)
+
+The miner's stratum login decides, per merged chain. The payout a share
+carries (its LTC payout key and its merged addresses) is fixed when its job is
+built and committed in the job's coinbase, as in p2pool.
+
+1. **An LTC address and no address for a merged chain** — the chain pays the
+   LTC address's key (its hash160): P2PKH and P2WPKH as P2PKH, P2SH as P2SH.
+   A P2SH login without an explicit merged address is warned: if it is a
+   segwit-wrapped wallet address (P2SH-P2WPKH/P2WSH, e.g. `M...`), give your
+   DOGE address explicitly (`LTC_ADDRESS,DOGE_ADDRESS`); on DOGE (no segwit)
+   such an output becomes spendable by anyone once the redeem script is
+   public. The dashboard's workers list shows "P2SH address: if
+   segwit-wrapped, give a DOGE address". A legacy P2SH (a multisig, the
+   pool's own donation script among them) spends on DOGE as it does on LTC.
+2. **An address given for the chain** — paid as given: the comma form
+   `LTCADDR,MERGEDADDR` (also `|`, `;`, space), the slash form
+   `LTCADDR/CHAIN_ID:ADDR` (repeatable), `mining.set_merged_addresses`, a
+   swapped `MERGEDADDR,LTCADDR`, or a merged chain's address as the whole login
+   (the LTC payout then uses its hash160). With one merged chain configured a
+   second address no chain identifies goes to that chain (as before).
+3. **An address that cannot be given to exactly one configured chain** never
+   loses the miner's work: it is ignored, with a warning in the log, and the
+   chains get the LTC address's key (never a guess between chains):
+   - not an address at all (bad checksum, junk; comma or slash form, or
+     `mining.set_merged_addresses`) — as p2pool does;
+   - with several merged chains, an address two of them could take (shared
+     version bytes: DOGE P2PKH is Bellscoin P2SH; P2SH 22 is DOGE, PEP and
+     SHIC; LKY's P2PKH 47 is Junkcoin's regtest one; on testnet DOGE, PEP, LKY
+     and SHIC all use P2PKH 113 and P2SH 196), or that none of them
+     identifies. Name the chain with the slash form, e.g.
+     `LTCADDR/98:DOGEADDR/63:PEPADDR`.
+4. **Empty login, or an LTC address that is invalid or another coin's** — the
+   login is accepted and its shares are redistributed by `--redistribute`
+   (`pplns|fee|boost|donate`, see [Configuration reference](#configuration-reference-ltc-binary)),
+   as p2pool does: the LTC payout goes to the recipient the mode picks, and
+   every merged chain the share names no address for gets that recipient's key
+   (the node owner's merged addresses when it is the owner) — written into the
+   share, so every node derives the same payout. With a valid DOGE address as
+   the second address of an invalid LTC address, the LTC payout uses that DOGE
+   address's key instead (p2pool's "case 4"). The log warns per miner and the
+   dashboard's workers list shows "address invalid → redistributed".
+   A P2WSH/P2TR LTC address cannot be carried by a V36 share (a 20-byte payout
+   hash): its LTC payout is redistributed the same way, with the same warning
+   in the log and "P2WSH/P2TR address → redistributed" in the workers list; the
+   LTC payout is never taken from a merged chain's address for it. A swapped
+   pair whose first address is not valid (`DOGE-with-bad-checksum,LTCADDR`)
+   pays the valid LTC address, as before.
+
+A re-authorize on the same connection with the same LTC address and no merged
+address keeps the merged addresses the previous login gave; with another LTC
+address nothing of the previous login is kept (only
+`mining.set_merged_addresses` carries over), and the connection gets new work
+at once. While the merged chains are still being set up at startup, logins are
+refused with "merged mining not ready yet; retry".
+
+Merged payouts are derived from the sharechain, share by share, by the
+share's version:
+
+- **V36 shares** keep the rule of p2pool and of earlier c2pool: the share's own
+  merged address for the chain, else the first merged address this node has
+  seen in a V36 share of the same parent script ("Tier 1.5"), else its parent
+  key (P2PKH/P2WPKH as P2PKH, P2SH as P2SH). The V36 shares in the window at
+  the flag day keep exactly these payouts: nothing moves at the switch.
+- **Share version 3601** (the shares every node makes from the flag day on) is
+  resolved from the share alone: its own merged address for the chain, else
+  its own parent key (P2PKH/P2WPKH as P2PKH, P2SH as P2SH). A 3601 share
+  neither feeds nor uses Tier 1.5, so one share's merged address never pays
+  for another share and every node derives the same payout whatever order it
+  received the shares in (Tier 1.5 depended on that order, and one share
+  naming another miner's parent script could take that miner's address-less
+  shares).
+
+c2pool nodes do not re-derive each other's merged coinbases, so the rule
+decides no share's validity. A P2SH `--node-owner-address` without
+`--node-owner-merged-address` is paid as the same P2SH on the merged chains,
+with the same segwit-wrapped warning at startup. `--solo` / `--custodial` merged payouts do not use per-miner
+merged addresses, and `c2pool-btc` (NMC) and `c2pool-dgb` (DOGE) do not carry
+them.
+
+#### Share version 3601 (flag day)
+
+From a fixed time (the flag day, set in the release: `ltc::PoolConfig::
+V3601_ACTIVATION_TIME`) every share is a **share version 3601** share: the V36
+share format under share type 3601. It is not voted through the AutoRatchet:
+a share's version follows from its own timestamp. A share timestamped at or
+after the flag day must be a 3601 share, one before it must not be, and a 3601
+share's child is a 3601 share; the switch does not go through the 60%
+upgraded-hash-power gate (the V35 → V36 switch keeps it). What 3601 changes:
+
+- the merged payout rule above (V36 shares keep theirs);
+- the AuxPoW commitment of a share carrying several merged chains must be the
+  tree over exactly the blocks it carries (counted only, for V36 shares);
+- c2pool advertises protocol 3601. From the flag day a peer below it (p2pool,
+  c2pool before v0.2.12) is disconnected and refused, without a ban: it cannot
+  load a 3601 share and its own V36 shares are invalid from then on. Such a
+  node logs "version unsupported" for the 3601 shares it is sent before the
+  disconnect and is left on a sharechain of its own: **upgrade every node to
+  c2pool v0.2.12 before the flag day**. p2pool is not supported from then on.
+  Our log says "peer ... is too old for share version 3601 ...: peer too old,
+  upgrade to c2pool v0.2.12".
+
+`--v3601-activation-time UNIX` moves the flag day on testnet or a private
+`--network-id` chain only (every node of the chain must use the same time); a
+mainnet node always uses the compiled one.
+
+#### Logins resolved differently with several merged chains
+
+With one merged chain configured (DOGE alone, the default) every login is
+resolved as before (except an address that is not an address at all, now
+ignored as p2pool does). With two or more (e.g. DOGE + PEP), where the server
+before this release gave an address to one chain by guessing, it is now
+ignored with a warning and the chains get the LTC address's key (as in case 1):
+
+- a second address of a version two configured chains share: a P2SH `9.../A...`
+  (22: DOGE, PEP, SHIC), a DOGE `D...` with Bellscoin configured (Bellscoin's
+  P2SH is 30), an LKY `L...` (47) with Junkcoin configured; on testnet any
+  DOGE/PEP/LKY/SHIC address (113, 196);
+- such an address as the only address (the "case 5" primary: the LTC payout
+  uses its key) or as the first of a swapped pair;
+- a second address no configured chain identifies: another LTC address, a
+  Bitcoin address, an address of a chain that is not configured, or one of
+  another network (a DOGE testnet address on mainnet).
+
+Name the chain explicitly, e.g. `LTCADDR/98:DOGEADDR/63:PEPADDR`.
 
 **DigiByte Scrypt** is its own parent chain with its own binary and sharechain:
 `c2pool-dgb` (`src/c2pool/main_dgb.cpp`, sharechain port 5024). It is not
@@ -759,7 +895,7 @@ legacy YAML key set.
 | `--embedded-ltc` | `embedded_ltc` | **true** | Embedded LTC SPV node |
 | `--no-embedded-ltc` | | | Disable embedded LTC, use RPC daemon |
 | `--embedded-doge` | `embedded_doge` | **true** | Embedded DOGE SPV for merged mining |
-| `--no-embedded-doge` | | | Disable embedded DOGE |
+| `--no-embedded-doge` | | | Disable embedded DOGE: no DOGE P2P connection or DNS seed lookup, also when a `--merged DOGE:...` RPC spec is given (DOGE is then mined over that RPC only) |
 | `--net` | -- | litecoin | LTC-binary chain selector (`--net CHAIN`; alias `--blockchain`). Not the way to run DGB/BTC/BCH/DASH pools — those are separate binaries |
 | `--testnet` | `testnet` | false | Enable testnet mode |
 | `--settings FILE` | -- | `<data-dir>/c2pool.toml` | TOML settings file (all binaries; see above) |
@@ -768,9 +904,12 @@ legacy YAML key set.
 | `--config FILE` | -- | -- | **Deprecated** legacy YAML overlay (LTC only); takes precedence over TOML this release |
 | `--address` | `solo_address` | -- | Node operator payout address (optional) |
 | `--give-author` | `donation_percentage` | 0.1 | Developer fee % (p2pool default: 0.5%) |
-| `-f` / `--fee` | `node_owner_fee` | 0 | Node owner fee % |
+| `-f` / `--fee` | `node_owner_fee` | 0 | Node owner fee %: with that probability a job (decided when it is built, as p2pool does) is the owner's, on LTC and on every merged chain |
 | `--node-owner-address` | `node_owner_address` | -- | Node owner payout address |
-| `--redistribute` | `redistribute` | pplns | Mode: pplns/fee/boost/donate |
+| `--redistribute` | `redistribute` | pplns | Mode: pplns/fee/boost/donate — where the shares of an empty, invalid or other-coin login go, on the parent and every merged chain (accepted, not refused; see [Who is paid on a merged chain](#who-is-paid-on-a-merged-chain-c2pool-ltc-sharechain-mode)) |
+| `--merged SYMBOL:CHAIN_ID:HOST:PORT:USER:PASS[:P2P_PORT]` | `merged` | DOGE:98 (embedded) | Merged-mined aux chain (repeatable) |
+| `--merged-payout-address SYMBOL:ADDRESS` | `merged_payout_addresses` | DOGE built-in | That chain's address for `createauxblock` (required for every RPC chain but DOGE; DGB and chains without address parameters are exempt); the node owner's address on that chain for its node-fee shares (chains other than DOGE) (repeatable) |
+| `--node-owner-merged-address` | `node_owner_merged_address` | -- | Node owner's DOGE address (alias `--merged-operator-address`, as in p2pool): the DOGE address written into the owner's own shares (node-fee shares, redistributed shares landing on the owner's key). Unset or not a DOGE address of the network: the owner's LTC key, converted (P2PKH/P2WPKH only; a P2SH `--node-owner-address` is not converted and the donation script is written, with a warning). It is not a payout-time redirect: peers derive the same payouts from the shares |
 | `-n HOST:PORT` | `seed_nodes` | -- | Sharechain seed peer (repeatable) |
 | `--startup-mode` | `startup_mode` | **wait** | Bootstrap: `wait`, `genesis`, `auto` |
 | `--genesis` | | | Shortcut for `--startup-mode genesis` |
@@ -792,6 +931,7 @@ legacy YAML key set.
 | `--no-vardiff` | `vardiff_enabled` | true | Disable auto-difficulty |
 | `--max-coinbase-outputs` | `max_coinbase_outputs` | 4000 | Max coinbase outputs |
 | `--network-id` | `network_id` | 0 | Private chain identifier (hex) |
+| `--v3601-activation-time` | `sharechain.v3601_activation_time` | compiled | Share version 3601 flag day, unix time — testnet or a private `--network-id` chain only (see [Share version 3601](#share-version-3601-flag-day)) |
 | `--log-level` | `log_level` | trace | trace/debug/info/warning/error |
 | `--log-file` | `log_file` | debug.log | Log filename |
 | `--log-rotation-mb` | `log_rotation_size_mb` | 100 | Log rotation threshold (MB) |

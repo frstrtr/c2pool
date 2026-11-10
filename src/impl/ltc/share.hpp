@@ -55,26 +55,26 @@ struct BaseShare : chain::BaseShare<uint256, Version>
     coin::SmallBlockHeaderType m_min_header;
     // prev_hash
     BaseScript m_coinbase;              // coinbase
-    uint32_t m_nonce;                   // nonce
+    uint32_t m_nonce{0};                // nonce
     // [x]address[>=34] or [x]pubkey_hash[<34]
-    uint64_t m_subsidy;                 // subsidy
-    uint16_t m_donation;                // donation
-    ltc::StaleInfo m_stale_info;        // stale_info
-    uint64_t m_desired_version;         // desired_version
+    uint64_t m_subsidy{0};              // subsidy
+    uint16_t m_donation{0};             // donation
+    ltc::StaleInfo m_stale_info{ltc::StaleInfo::none}; // stale_info
+    uint64_t m_desired_version{0};      // desired_version
     //
     // [x] segwit_data [if segwit_activated]
     //
     uint256 m_far_share_hash;           // far_share_hash
-    uint32_t m_max_bits;                // max_bits;   bitcoin_data.FloatingIntegerType()
-    uint32_t m_bits;                    // bits;       bitcoin_data.FloatingIntegerType()
-    uint32_t m_timestamp;               // timestamp
-    uint32_t m_absheight;               // absheight
+    uint32_t m_max_bits{0};             // max_bits;   bitcoin_data.FloatingIntegerType()
+    uint32_t m_bits{0};                 // bits;       bitcoin_data.FloatingIntegerType()
+    uint32_t m_timestamp{0};            // timestamp
+    uint32_t m_absheight{0};            // absheight
     uint128 m_abswork;                  // abswork
 
     // ref_merkle_link
     MerkleLink m_ref_merkle_link;
     // last_txout_nonce
-    uint64_t m_last_txout_nonce;
+    uint64_t m_last_txout_nonce{0};
     // hash_link
     HashLinkType m_hash_link;
     // merkle_link
@@ -131,7 +131,19 @@ struct PaddingBugfixShare : BaseShare<35>, types::DataSegwitShare
     PaddingBugfixShare(const uint256& hash, const uint256& prev_hash) : BaseShare<35>(hash, prev_hash) {}
 };
 
-struct MergedMiningShare : BaseShare<36>
+// The V36 share and its flag-day successor, share version 3601
+// (FLAG_DAY_SHARE_VERSION): the same fields and the same wire bytes; only the
+// type number of the share message differs. A share whose timestamp is at or
+// after the flag day (PoolConfig::v3601_activation_time()) must be a 3601
+// share and one before it must not (share_check.hpp flag_day_problem); 3601
+// shares resolve their merged payouts by the per-share rule
+// (share_tracker.hpp merged_weights_delta). Neither the share hash nor its
+// generation transaction commits to the type number, so the flag-day rule is
+// what binds a share to exactly one of the two.
+inline constexpr int64_t FLAG_DAY_SHARE_VERSION = 3601;
+
+template <int64_t V>
+struct MergedMiningShareT : BaseShare<V>
 {
     uint160 m_pubkey_hash;
     uint8_t m_pubkey_type{0};                                    // 0=P2PKH, 1=P2WPKH, 2=P2SH
@@ -142,9 +154,47 @@ struct MergedMiningShare : BaseShare<36>
     V36HashLinkType m_hash_link;                                 // shadows BaseShare::m_hash_link
     BaseScript m_message_data;                                   // empty = none
 
-    MergedMiningShare() {}
-    MergedMiningShare(const uint256& hash, const uint256& prev_hash) : BaseShare<36>(hash, prev_hash) {}
+    MergedMiningShareT() {}
+    MergedMiningShareT(const uint256& hash, const uint256& prev_hash) : BaseShare<V>(hash, prev_hash) {}
+
+    // The same share under the other type number (36 <-> 3601): every field,
+    // wire and transient (merged_aux_hardening_test.cpp checks the bytes).
+    template <int64_t W>
+        requires(W != V)
+    explicit MergedMiningShareT(const MergedMiningShareT<W>& o) : BaseShare<V>(o.m_hash, o.m_prev_hash)
+    {
+        this->m_pow_hash = o.m_pow_hash;
+        this->m_min_header = o.m_min_header;
+        this->m_coinbase = o.m_coinbase;
+        this->m_nonce = o.m_nonce;
+        this->m_subsidy = o.m_subsidy;
+        this->m_donation = o.m_donation;
+        this->m_stale_info = o.m_stale_info;
+        this->m_desired_version = o.m_desired_version;
+        this->m_far_share_hash = o.m_far_share_hash;
+        this->m_max_bits = o.m_max_bits;
+        this->m_bits = o.m_bits;
+        this->m_timestamp = o.m_timestamp;
+        this->m_absheight = o.m_absheight;
+        this->m_abswork = o.m_abswork;
+        this->m_ref_merkle_link = o.m_ref_merkle_link;
+        this->m_last_txout_nonce = o.m_last_txout_nonce;
+        static_cast<BaseShare<V>&>(*this).m_hash_link = static_cast<const BaseShare<W>&>(o).m_hash_link;
+        this->m_merkle_link = o.m_merkle_link;
+        this->peer_addr = o.peer_addr;
+        m_pubkey_hash = o.m_pubkey_hash;
+        m_pubkey_type = o.m_pubkey_type;
+        m_segwit_data = o.m_segwit_data;
+        m_merged_addresses = o.m_merged_addresses;
+        m_merged_coinbase_info = o.m_merged_coinbase_info;
+        m_merged_payout_hash = o.m_merged_payout_hash;
+        m_hash_link = o.m_hash_link;
+        m_message_data = o.m_message_data;
+    }
 };
+
+using MergedMiningShare = MergedMiningShareT<36>;
+using MergedMiningShareV3601 = MergedMiningShareT<FLAG_DAY_SHARE_VERSION>;
 
 struct Formatter
 {
@@ -252,7 +302,8 @@ struct Formatter
     }
 };
 
-using ShareType = chain::ShareVariants<Formatter, Share, NewShare, SegwitMiningShare, PaddingBugfixShare, MergedMiningShare>;
+using ShareType = chain::ShareVariants<Formatter, Share, NewShare, SegwitMiningShare, PaddingBugfixShare, MergedMiningShare,
+                                        MergedMiningShareV3601>;
 
 inline ShareType load_share(chain::RawShare& rshare, NetService peer_addr)
 {

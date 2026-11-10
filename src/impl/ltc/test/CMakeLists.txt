@@ -207,6 +207,23 @@ if (BUILD_TESTING AND GTest_FOUND)
     # {0, 1}, colliding ids grow the tree, every proof carries the index and
     # size the daemon checks. Same folding rule.
     #
+    # merged_multi_aux_test.cpp: two or more aux chains: a find recovers its
+    # chain's committed block and chain merkle branch from the leaves the
+    # committed root was built from (stale jobs included), the proofs pass
+    # CAuxPow::check, a root or chain that is not known fails closed, and the
+    # one-chain (DOGE) bytes are pinned to the pre-fix path. Same folding rule.
+    #
+    # merged_aux_hardening_test.cpp: several aux chains under one parent: each
+    # chain's createauxblock address is of its own chain and network; a hung,
+    # failing or slow aux daemon drops out of that round's commitment (the
+    # smallest tree over the chains left, as a V36 peer checks it) while the
+    # others keep committing, with no lock held over the network; AuxChainRPC
+    # deadlines, reconnect and backoff against a socket; the daemon's
+    # submitblock answer is kept and a non-DOGE find follows its chain; each
+    # chain's own block size limit; one slow or throwing submit neither delays
+    # nor aborts the others; the chain merkle tree height is capped. Same
+    # folding rule.
+    #
     # merged_rebuild_payouts_test.cpp: the merged work is always buildable: a
     # rebuild without payouts never commits to the parent's hash (keeps the
     # last block on the same parent, else no commitment), a stale rebuild is
@@ -339,6 +356,19 @@ if (BUILD_TESTING AND GTest_FOUND)
     # to the pre-fix bytes; every tracker copy takes the cache lock. Same
     # folding rule.
     #
+    # share_v3601_flag_day_test.cpp: share version 3601, the flag day: the
+    # version follows from the share's timestamp (not the ratchet), the
+    # boundary skips the 60% switch gate (V35 -> V36 keeps it), straddling
+    # and reorgs across the day, a 3601 share reloads as one and an old node
+    # cannot load it, peers below protocol 3601, and the AuxPoW commitment
+    # rule enforced for 3601 shares only. Same folding rule.
+    #
+    # share_v3601_rewrap_test.cpp: a share re-wrapped under the other type
+    # number (36 <-> 3601; the hash does not commit to it) is dropped by the
+    # share handlers before the tracker, in both directions; a duplicate copy
+    # never replaces the relay bytes of the held share; LevelDB loads use the
+    # same check. Real NodeImpl phase 2. Same folding rule.
+    #
     # best_share_hash_lock_test.cpp: NodeImpl::best_share_hash() reads the
     # tracker under the reader discipline (direct on the compute thread, a
     # shared try-lock elsewhere, the published verified best while busy, the
@@ -407,7 +437,9 @@ if (BUILD_TESTING AND GTest_FOUND)
         mempool_bip68_test.cpp
         mempool_final_tx_test.cpp
         mempool_mweb_admission_test.cpp
+        merged_aux_hardening_test.cpp
         merged_found_record_test.cpp
+        merged_multi_aux_test.cpp
         merged_rebuild_payouts_test.cpp
         merged_refresh_request_test.cpp
         merged_weights_threads_test.cpp
@@ -427,6 +459,8 @@ if (BUILD_TESTING AND GTest_FOUND)
         share_message_unpack_bounds_test.cpp
         share_remove_owns_data_test.cpp
         share_test.cpp
+        share_v3601_flag_day_test.cpp
+        share_v3601_rewrap_test.cpp
         solo_payouts_test.cpp
         template_gap_gate_test.cpp
         template_hogex_survives_truncation_test.cpp

@@ -782,6 +782,20 @@ public:
     }
     // String-based overload: converts Base58Check address to P2PKH scriptPubKey
     void set_node_fee_from_address(double percent, const std::string& address);
+    // The merged scripts written into the operator's own shares (the node-fee
+    // shares, and redistributed shares landing on the operator's key with no
+    // merged address), per merged chain id: p2pool's --merged-operator-address
+    // cascade (c2pool::merged::resolve_operator_merged_script). Empty: those
+    // shares keep the merged addresses they had.
+    void set_operator_merged_scripts(std::map<uint32_t, std::vector<unsigned char>> scripts) {
+        m_operator_merged_scripts = std::move(scripts);
+    }
+    // --redistribute: the (hash160 hex, V36 pubkey type) a share without a
+    // payout address a share can carry is given to (decide_job_payout).
+    void set_redistribute_fn(std::function<std::pair<std::string, uint8_t>()> fn) {
+        std::lock_guard<std::mutex> l(m_redistribute_mu);
+        m_redistribute_fn = std::move(fn);
+    }
     // Donation script used by get_expected_payouts (p2pool protocol)
     void set_donation_script(const std::vector<unsigned char>& script) {
         m_donation_script = script;
@@ -1520,10 +1534,16 @@ public:
     // none. The type is the recipient's own: its hash under another script
     // type pays another address, or nobody (a script hash as P2PKH).
     using address_fallback_fn_t = std::function<std::pair<std::string, uint8_t>(const std::string&)>;
-    void set_address_fallback_fn(address_fallback_fn_t fn) { m_address_fallback_fn = std::move(fn); }
+    // Set while the stratum thread may already build jobs: under m_redistribute_mu.
+    void set_address_fallback_fn(address_fallback_fn_t fn)
+    {
+        std::lock_guard<std::mutex> l(m_redistribute_mu);
+        m_address_fallback_fn = std::move(fn);
+    }
 
     // Return true if the merged-mining manager has a configured chain with chain_id.
     bool has_merged_chain(uint32_t chain_id) const override;
+    bool is_testnet() const override { return m_testnet; }
 
     // Extract the 40-char hex hash160 from the node fee scriptPubKey (P2PKH bytes 3-22).
     // Returns "" if the fee script is not a 25-byte P2PKH.
@@ -2001,6 +2021,9 @@ private:
     double m_node_fee_percent{0.0};
     std::vector<unsigned char> m_node_fee_script;   // node operator scriptPubKey
     std::string m_node_fee_address;                 // node operator address (display/logging)
+    std::map<uint32_t, std::vector<unsigned char>> m_operator_merged_scripts;
+    std::function<std::pair<std::string, uint8_t>()> m_redistribute_fn;
+    mutable std::mutex m_redistribute_mu;   // m_redistribute_fn, m_address_fallback_fn
     std::vector<unsigned char> m_donation_script;   // protocol donation scriptPubKey
     std::function<double()> m_stratum_hashrate_fn;  // callback to get stratum total hashrate
     std::function<RateStats()> m_stratum_rate_stats_fn;  // callback to get rate monitor stats
@@ -2049,6 +2072,9 @@ private:
     std::string m_auth_token;   // auth token for sensitive endpoints; empty = no auth
 public:
     void set_stratum_config(const StratumConfig& cfg) { m_stratum_config = cfg; }
+    bool merged_ready() const override { return !m_stratum_config.merged_chains_expected || m_mm_manager != nullptr; }
+    void decide_job_payout(std::vector<unsigned char>& payout_script,
+                           std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged) const override;
     const StratumConfig& get_stratum_config() const override { return m_stratum_config; }
     void set_cors_origin(const std::string& origin) { m_cors_origin = origin; }
     const std::string& get_cors_origin() const { return m_cors_origin; }
@@ -2645,6 +2671,8 @@ class WebServer
     uint16_t port_;
     uint16_t stratum_port_;  // Explicit Stratum port configuration
     bool running_;
+    bool rpc_refresh_armed_{false};
+    uint256 last_parent_block_;   // refresh_on_parent_block dedup
     bool testnet_;
     Blockchain blockchain_;
     // Live HTTP sessions and their cap (0: unlimited), from the node's fd
@@ -2753,6 +2781,14 @@ public:
     // Use for time-critical events (new LTC block). `cause` is what
     // /local_stats template_refresh.by_cause counts it under.
     void trigger_work_refresh(core::RefreshCause cause = core::RefreshCause::block);
+    // The coin daemon template refresh over RPC: a one-shot fetch and, in
+    // --no-embedded mode, a 2 s getblocktemplate poll. Armed once, by
+    // start() or by set_coin_node() when the node is attached later.
+    void arm_rpc_template_refresh();
+    // A new block from the parent coin daemon's own P2P link (RPC mode,
+    // coin_node.new_block): refresh the template at once, once per block hash
+    // (the link announces a block by inv and again by the block itself).
+    void refresh_on_parent_block(const uint256& block_hash);
     // Debounced variant: coalesces rapid-fire calls (share arrivals) into one
     // refresh after 300 ms, gated on a sharechain tip change. Matches
     // p2pool's Twisted reactor tick coalescing.

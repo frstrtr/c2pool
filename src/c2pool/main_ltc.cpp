@@ -11,6 +11,7 @@
 #include <iostream>
 #include <fstream>
 #include <string>
+#include <cctype>
 #include <map>
 #include <set>
 #include <atomic>
@@ -18,6 +19,7 @@
 #include <chrono>
 #include <csignal>
 #include <ctime>
+#include <optional>
 #include <memory>
 #include <vector>
 #ifndef _WIN32
@@ -275,6 +277,8 @@ static void segfault_handler(int sig) {
 
 // Integrated merged mining
 #include <c2pool/merged/merged_mining.hpp>
+#include <c2pool/merged/aux_chain_params.hpp>
+#include <c2pool/merged/aux_found_verdict.hpp>
 #include <c2pool/merged/payout_source.hpp>
 #include <c2pool/merged/coin_broadcaster.hpp>
 #include <impl/ltc/coin/mweb_fetch_retry.hpp>
@@ -575,7 +579,14 @@ void print_help() {
     std::cout << "MERGED MINING (c2pool spec format — alternative):\n";
     std::cout << "  --merged SPEC             SYMBOL:CHAIN_ID:HOST:PORT:USER:PASS[:P2P_PORT]\n";
     std::cout << "                            Example: DOGE:98:192.168.86.29:22555:user:pass\n";
-    std::cout << "                            Can be specified multiple times\n\n";
+    std::cout << "                            Can be specified multiple times\n";
+    std::cout << "  --merged-payout-address SYMBOL:ADDRESS\n";
+    std::cout << "                            Address of that chain given to its daemon's createauxblock\n";
+    std::cout << "                            (the merged coinbase itself pays PPLNS). Required for every\n";
+    std::cout << "                            aux chain with an RPC daemon except DOGE (built-in); checked\n";
+    std::cout << "                            against the chain's own address versions, and a chain without\n";
+    std::cout << "                            a valid one is not mined.\n";
+    std::cout << "                            Can be specified multiple times (YAML: merged_payout_addresses)\n\n";
 
     std::cout << "NETWORK TUNING (accepted for p2pool compatibility):\n";
     std::cout << "  --max-conns N             Max outgoing P2P connections\n";
@@ -640,6 +651,9 @@ void print_help() {
 
     std::cout << "PRIVATE SHARECHAIN:\n";
     std::cout << "  --network-id ID           Private network identifier (hex, e.g. DEADBEEF)\n";
+    std::cout << "  --v3601-activation-time T Share version 3601 flag day, unix time (testnet or a\n";
+    std::cout << "                            private --network-id chain only; mainnet uses the\n";
+    std::cout << "                            compiled time)\n";
     std::cout << "                            Default: 0 (public p2pool network)\n";
     std::cout << "                            Nonzero: creates a private sharechain. P2P prefix\n";
     std::cout << "                            and THE metadata will carry this ID on the blockchain.\n";
@@ -957,6 +971,10 @@ int main(int argc, char* argv[]) {
     // p2pool-style: --merged-coind-address, --merged-coind-rpc-port, etc.
     // c2pool-style: --merged SYMBOL:CHAIN_ID:HOST:PORT:USER:PASS[:P2P_PORT]
     std::vector<std::string> merged_chain_specs;
+    // --merged-payout-address SYMBOL:ADDRESS: the address each aux chain's
+    // createauxblock gets (its PPLNS coinbase is c2pool's own; the daemon
+    // only needs an address of its chain). Keyed by upper-case symbol.
+    std::map<std::string, std::string> merged_payout_addresses;
     // p2pool-style merged chain flags (assembled into spec at the end)
     std::string merged_coind_address;
     int         merged_coind_rpc_port = 0;
@@ -1028,6 +1046,7 @@ int main(int argc, char* argv[]) {
 
     // Private sharechain
     uint64_t network_id = 0;        // 0 = public p2pool network, nonzero = private (full 8 bytes)
+    std::optional<uint64_t> v3601_activation_time;   // testnet / private chain only
     std::string prefix_override_hex; // explicit --prefix; empty = compiled per-network default
 
     // Startup mode: wait (default, p2pool persist=true), genesis, auto
@@ -1511,6 +1530,18 @@ int main(int argc, char* argv[]) {
             merged_chain_specs.push_back(argv[++i]);
             cli_explicit.insert("merged");
         }
+        else if (arg == "--merged-payout-address" && i + 1 < argc) {
+            const std::string v = argv[++i];
+            const auto colon = v.find(':');
+            if (colon == std::string::npos || colon == 0 || colon + 1 == v.size()) {
+                std::cerr << "--merged-payout-address expects SYMBOL:ADDRESS, got: " << v << std::endl;
+                return 1;
+            }
+            std::string sym = v.substr(0, colon);
+            for (auto& c : sym) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+            merged_payout_addresses[sym] = v.substr(colon + 1);
+            cli_explicit.insert("merged_payout_addresses");
+        }
         // p2pool-style merged chain flags
         else if (arg == "--merged-coind-address" && i + 1 < argc) {
             merged_coind_address = argv[++i];
@@ -1564,6 +1595,10 @@ int main(int argc, char* argv[]) {
         else if (arg == "--coinbase-text" && i + 1 < argc) {
             coinbase_text = argv[++i];
             cli_explicit.insert("coinbase_text");
+        }
+        else if (arg == "--v3601-activation-time" && i + 1 < argc) {
+            v3601_activation_time = std::stoull(argv[++i]);
+            cli_explicit.insert("v3601_activation_time");
         }
         else if ((arg == "--network-id" || arg == "--chain-id") && i + 1 < argc) {
             // Full 8-byte identifier: parse as 64-bit, never truncate to 32 bits
@@ -1804,6 +1839,15 @@ int main(int argc, char* argv[]) {
                 for (const auto& item : cfg["merged"])
                     merged_chain_specs.push_back(item.as<std::string>());
             }
+            // merged_payout_addresses: {PEP: <address>, ...} (CLI replaces)
+            if (!cli_explicit.count("merged_payout_addresses") && cfg["merged_payout_addresses"]
+                && cfg["merged_payout_addresses"].IsMap()) {
+                for (const auto& kv : cfg["merged_payout_addresses"]) {
+                    std::string sym = kv.first.as<std::string>();
+                    for (auto& c : sym) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                    merged_payout_addresses[sym] = kv.second.as<std::string>();
+                }
+            }
 
             // Embedded SPV checkpoints
             if (!cli_explicit.count("header_checkpoint") && cfg["header_checkpoint"])
@@ -1869,6 +1913,10 @@ int main(int argc, char* argv[]) {
             // Private sharechain identifier, hex (CLI --network-id/--chain-id takes precedence)
             if (!cli_explicit.count("network_id") && cfg["network_id"])
                 network_id = std::stoull(cfg["network_id"].as<std::string>(), nullptr, 16);
+            // Share version 3601 flag day (testnet / private chain only; the
+            // mainnet refusal below applies whatever the source)
+            if (!cli_explicit.count("v3601_activation_time") && cfg["v3601_activation_time"])
+                v3601_activation_time = cfg["v3601_activation_time"].as<uint64_t>();
 
             // Stratum tuning
             if (!cli_explicit.count("stratum_min_diff") && cfg["min_difficulty"])
@@ -2043,6 +2091,10 @@ int main(int argc, char* argv[]) {
         if (rc.file_set("money.give_author_pct"))    dev_donation   = rc.get_double("money.give_author_pct").value_or(dev_donation);
         if (rc.file_set("money.node_owner_address")) node_owner_address = rc.get_string("money.node_owner_address").value_or(node_owner_address);
         if (rc.file_set("money.payout_address"))     payout_address = rc.get_string("money.payout_address").value_or(payout_address);
+        if (rc.file_set("sharechain.v3601_activation_time") && !cli_explicit.count("v3601_activation_time")) {
+            if (const auto v = rc.get_i64("sharechain.v3601_activation_time"); v && *v >= 0)
+                v3601_activation_time = static_cast<uint64_t>(*v);
+        }
     }
 
     // WAIT mode: block genesis share creation until peers deliver the
@@ -2509,6 +2561,51 @@ int main(int argc, char* argv[]) {
                 stratum_config.payout_p2pkh_versions = acc.p2pkh_versions;
                 stratum_config.payout_p2sh_versions  = acc.p2sh_versions;
                 stratum_config.payout_bech32_hrps    = acc.bech32_hrps;
+                // LTC's versions on every network: a login address LTC could
+                // own is never identified as a merged chain's.
+                for (bool tn : {false, true}) {
+                    const auto a = ltc::address_acceptance(tn);
+                    for (const auto* vs : {&a.p2pkh_versions, &a.p2sh_versions})
+                        for (auto v : *vs)
+                            if (std::find(stratum_config.merged_parent_versions.begin(),
+                                          stratum_config.merged_parent_versions.end(), v)
+                                == stratum_config.merged_parent_versions.end())
+                                stratum_config.merged_parent_versions.push_back(v);
+                }
+            }
+            stratum_config.merged_chains_expected = !merged_chain_specs.empty();
+            // A login without a usable payout address is redistributed
+            // (--redistribute), as p2pool does, not refused.
+            stratum_config.redistribute_unusable_logins = true;
+            // The merged addresses of the operator's own shares (node-fee
+            // shares, redistributed shares landing on the operator's key):
+            // p2pool's --merged-operator-address cascade, per merged chain.
+            if (node_owner_fee > 0.0 && !node_owner_address.empty() && !merged_chain_specs.empty()) {
+                std::map<uint32_t, std::vector<unsigned char>> op_scripts;
+                const std::vector<unsigned char> donation(ltc::PoolConfig::COMBINED_DONATION_SCRIPT.begin(),
+                                                          ltc::PoolConfig::COMBINED_DONATION_SCRIPT.end());
+                for (const auto& spec : merged_chain_specs) {
+                    const auto c1 = spec.find(':');
+                    if (c1 == std::string::npos)
+                        continue;
+                    std::string sym = spec.substr(0, c1);
+                    for (auto& c : sym) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                    uint32_t cid = 0;
+                    try { cid = static_cast<uint32_t>(std::stoul(spec.substr(c1 + 1))); } catch (...) { continue; }
+                    const auto ov = merged_payout_addresses.find(sym);
+                    const auto o = c2pool::merged::resolve_operator_merged_script(
+                        sym, settings->m_testnet ? c2pool::merged::AuxNetwork::testnet
+                                                 : c2pool::merged::AuxNetwork::mainnet,
+                        node_owner_address, node_owner_merged_address,
+                        ov != merged_payout_addresses.end() ? ov->second : std::string(), donation);
+                    if (!o.warning.empty())
+                        LOG_WARNING << "[MM:" << sym << "] " << o.warning << ": the node fee's " << sym
+                                    << " payout uses " << o.source;
+                    LOG_INFO << "[MM:" << sym << "] node-fee shares pay " << sym << " to the operator ("
+                             << o.source << ")";
+                    op_scripts[cid] = o.script;
+                }
+                web_server.get_mining_interface()->set_operator_merged_scripts(std::move(op_scripts));
             }
             web_server.get_mining_interface()->set_stratum_config(stratum_config);
             if (fd_limit_known)
@@ -4950,6 +5047,31 @@ int main(int argc, char* argv[]) {
             // Set testnet flag for runtime constant selection (SHARE_PERIOD, CHAIN_LENGTH, etc.)
             ltc::PoolConfig::is_testnet = settings->m_testnet;
 
+            // Share version 3601 flag day: compiled, except on testnet or a
+            // private chain (every node of a network must use the same time).
+            if (v3601_activation_time) {
+                if (!settings->m_testnet && network_id == 0) {
+                    const std::string msg = "v3601_activation_time (--v3601-activation-time or the settings "
+                                            "file) is for testnet or a private --network-id chain only: on "
+                                            "mainnet every node uses the compiled flag day";
+                    LOG_ERROR << msg;
+                    std::cerr << "c2pool: " << msg << std::endl;
+                    return 1;
+                }
+                if (*v3601_activation_time > 0xFFFFFFFFull) {
+                    LOG_ERROR << "v3601_activation_time " << *v3601_activation_time << " is not a 32-bit unix time";
+                    return 1;
+                }
+                ltc::PoolConfig::v3601_activation_time_override = static_cast<uint32_t>(*v3601_activation_time);
+            }
+            if (ltc::PoolConfig::v3601_activation_time() == 0xFFFFFFFFu)
+                LOG_INFO << "[Sharechain] share version 3601 flag day: not scheduled";
+            else
+                LOG_INFO << "[Sharechain] share version 3601 flag day: " << ltc::PoolConfig::v3601_activation_time()
+                         << (v3601_activation_time ? " (v3601_activation_time)" : " (compiled)")
+                         << "; peers below protocol " << ltc::PoolConfig::V3601_PROTOCOL_VERSION
+                         << " are disconnected from then on";
+
             // Private chain: override IDENTIFIER and PREFIX before any P2P or share ops
             if (network_id != 0) {
                 std::ostringstream hex;
@@ -5037,6 +5159,12 @@ int main(int argc, char* argv[]) {
                 assert(coin_p2p->lifetime_armed() && "LTC parent-coin P2P dial lifetime failed to arm");
                 coin_p2p->connect(NetService(p2p_host, static_cast<uint16_t>(coind_p2p_port)));
                 LOG_INFO << "Parent coin P2P broadcaster connecting to " << p2p_host << ":" << coind_p2p_port;
+                // A new block the daemon's P2P link announces refreshes the
+                // template at once (besides the 2 s getblocktemplate poll and
+                // the sharechain peers' bestblock).
+                coin_node.new_block.subscribe([&web_server](const uint256& block_hash) {
+                    web_server.refresh_on_parent_block(block_hash);
+                });
             }
 
             // Phase 1c: Whale departure detector (needs to be visible to ref_hash lambda)
@@ -5528,6 +5656,8 @@ int main(int argc, char* argv[]) {
                     auto [ver, desired] = auto_ratchet->get_share_version(p2p_node->tracker(), uint256());
                     initial_ver = ver;
                 }
+                // Past the 3601 flag day the version is 3601, not the ratchet's.
+                initial_ver = ltc::flag_day_share_version(initial_ver, static_cast<uint32_t>(std::time(nullptr)));
                 auto donation_script = ltc::PoolConfig::get_donation_script(initial_ver);
                 web_server.get_mining_interface()->set_donation_script(donation_script);
                 web_server.get_mining_interface()->set_cached_share_version(initial_ver);
@@ -6968,6 +7098,16 @@ int main(int argc, char* argv[]) {
 
                 auto [share_version, desired_ver] = auto_ratchet->get_share_version(
                     *guard, best_hash);
+                // Past the 3601 flag day the jobs build 3601 shares (V36
+                // PPLNS), whatever the ratchet says: the job timestamp is at
+                // least now and the tip's + 1 (ref_hash_fn decides it exactly).
+                {
+                    std::optional<uint32_t> tip_ts;
+                    if (!best_hash.IsNull() && guard->chain.contains(best_hash))
+                        guard->chain.get(best_hash).share.invoke([&](auto* tip) { tip_ts = tip->m_timestamp; });
+                    share_version = ltc::job_share_version(share_version, static_cast<uint32_t>(std::time(nullptr)),
+                                                           tip_ts);
+                }
                 // Update donation script + cached version so refresh_work() and
                 // build_connection_coinbase() use the correct one.
                 auto correct_donation = ltc::PoolConfig::get_donation_script(share_version);
@@ -7021,6 +7161,22 @@ int main(int argc, char* argv[]) {
                     // AutoRatchet: determine share version from network state
                     auto [share_version, desired_ver] = auto_ratchet->get_share_version(
                         *guard, frozen_prev_share);
+                    // The 3601 flag day: the version follows from this share's
+                    // timestamp (ntime clipped to the parent's + 1, as below),
+                    // not from the ratchet. 3601 shares vote as the ratchet
+                    // does (desired_version 36).
+                    {
+                        std::optional<uint32_t> parent_ts;
+                        if (!frozen_prev_share.IsNull() && guard->chain.contains(frozen_prev_share))
+                            guard->chain.get(frozen_prev_share).share.invoke([&](auto* prev) {
+                                parent_ts = prev->m_timestamp;
+                            });
+                        const int64_t v = ltc::job_share_version(share_version, timestamp, parent_ts);
+                        if (v != share_version) {
+                            share_version = v;
+                            desired_ver = std::max<int64_t>(desired_ver, 36);
+                        }
+                    }
                     {
                         static int rv_log = 0;
                         if (rv_log++ < 5 || rv_log % 100 == 0)
@@ -7483,6 +7639,11 @@ int main(int argc, char* argv[]) {
                         ++s_pow_failed;
                         return uint256();  // share failed PoW or validation; don't broadcast
                     }
+                    // Into LevelDB like a received share (a restart then
+                    // reloads our own shares too).
+                    if (!p2p_node->persist_local_share(share_hash))
+                        LOG_DEBUG_POOL << "[Pool] local share " << share_hash.GetHex().substr(0, 16)
+                                       << " not stored (no LevelDB)";
                     ++s_created;
 
                     // Compute the GOT SHARE! prev-age WHILE we still hold the
@@ -7706,25 +7867,74 @@ int main(int argc, char* argv[]) {
                     if (parts.size() >= 6) cfg.rpc_userpass = parts[4] + ":" + parts[5];
                     cfg.multiaddress = true;  // V36: canonical PPLNS coinbase for merged chains
 
-                    // Fallback payout address for createauxblock RPC.
-                    // Used when no per-miner address is available for a chain.
-                    // PPLNS payouts override this in multiaddress mode.
-                    if (cfg.symbol == "DOGE" && settings->m_testnet)
-                        cfg.aux_payout_address = "nUCAGGgZEPN1QyknmQe1oAku817bQAFKFt";
-                    else if (cfg.symbol == "DOGE")
-                        cfg.aux_payout_address = "DDogepartyxxxxxxxxxxxxxxxxxxw1dfzr";
-                    else if (cfg.symbol == "PEP")
-                        cfg.aux_payout_address = "PSimbaxxxxxxxxxxxxxxxxxxxxUMbTDw";
-                    else if (cfg.symbol == "BELLS")
-                        cfg.aux_payout_address = solo_address;  // no well-known burn; use operator address
-                    else if (cfg.symbol == "LKY")
-                        cfg.aux_payout_address = solo_address;
-                    else if (cfg.symbol == "JKC")
-                        cfg.aux_payout_address = solo_address;
-                    else if (cfg.symbol == "SHIC")
-                        cfg.aux_payout_address = solo_address;
-                    else if (cfg.symbol == "DINGO")
-                        cfg.aux_payout_address = solo_address;
+                    // The address createauxblock gets: the operator's
+                    // (--merged-payout-address), else the built-in one (DOGE
+                    // only), checked against the chain's own address versions
+                    // (aux_chain_params.hpp): on mainnet exactly, on testnet
+                    // against its testnet and regtest ones, and against the
+                    // daemon's own network once it answers (check_payout_address).
+                    // The daemon refuses an address of another chain or network
+                    // (-8 / -5 "Invalid coinbase payout address"), so a chain
+                    // reached over RPC only is not registered without a valid one;
+                    // a chain with an embedded backend (DOGE, NMC, DGB), which
+                    // never calls createauxblock, keeps mining without its RPC
+                    // fallback. multiaddress mode: the PPLNS coinbase is c2pool's
+                    // own; this address is never paid.
+                    bool rpc_address_ok = false;
+                    std::string rpc_address_error;
+                    {
+                        std::string sym_up = cfg.symbol;
+                        for (auto& c : sym_up) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                        const auto ov = merged_payout_addresses.find(sym_up);
+                        const auto pa = c2pool::merged::resolve_aux_payout_address(
+                            cfg.symbol,
+                            settings->m_testnet ? c2pool::merged::AuxNetwork::testnet
+                                                : c2pool::merged::AuxNetwork::mainnet,
+                            ov != merged_payout_addresses.end() ? ov->second : std::string());
+                        rpc_address_ok = pa.ok;
+                        rpc_address_error = pa.error;
+                        // A chain c2pool has no address parameters for (e.g. DGB as
+                        // an aux chain) and no configured address: as before, its
+                        // backends are kept and createauxblock gets no address.
+                        if (!pa.ok && pa.address.empty() && !c2pool::merged::find_aux_chain_params(cfg.symbol)) {
+                            rpc_address_ok = true;
+                            LOG_WARNING << "[MM:" << cfg.symbol << "] no address parameters for this chain and no "
+                                           "--merged-payout-address " << cfg.symbol << ":<address>: createauxblock "
+                                           "gets none (as before)";
+                        }
+                        if (pa.ok) {
+                            cfg.aux_payout_address = pa.address;
+                            cfg.check_payout_address = [sym = cfg.symbol, addr = pa.address](const std::string& chain) {
+                                return c2pool::merged::check_aux_address_on_chain(sym, chain, addr);
+                            };
+                            LOG_INFO << "[MM:" << cfg.symbol << "] createauxblock payout address " << pa.address
+                                     << " (" << pa.source << ")";
+                        } else if (!pa.address.empty()) {
+                            LOG_ERROR << "[MM:" << cfg.symbol << "] " << pa.error;
+                        }
+                        if (const auto* cp = c2pool::merged::find_aux_chain_params(cfg.symbol)) {
+                            const auto& v = settings->m_testnet ? cp->test : cp->main;
+                            if (!v.p2pkh.empty()) cfg.address_version = v.p2pkh.front();
+                            if (!v.p2sh.empty()) cfg.p2sh_version = v.p2sh.front();
+                        }
+                    }
+                    // A chain reached over RPC only, without a valid address: not mined.
+                    const auto refuse_rpc_only = [&]() {
+                        const std::string msg = "merged chain " + cfg.symbol + " (chain_id "
+                            + std::to_string(cfg.chain_id) + ") DISABLED: " + rpc_address_error;
+                        LOG_ERROR << "[MM:" << cfg.symbol << "] " << msg;
+                        std::cerr << "c2pool: " << msg << std::endl;
+                    };
+                    // An embedded chain without a valid address: no RPC fallback.
+                    const auto rpc_fallback_ok = [&]() {
+                        if (cfg.rpc_port == 0 || cfg.rpc_userpass.empty())
+                            return false;
+                        if (!rpc_address_ok)
+                            LOG_WARNING << "[MM:" << cfg.symbol << "] RPC fallback at " << cfg.rpc_host << ":"
+                                        << cfg.rpc_port << " NOT used (" << rpc_address_error
+                                        << "); the embedded backend keeps mining";
+                        return rpc_address_ok;
+                    };
 
                     // P2P port: explicit (7th field) or auto-detected from symbol
                     if (parts.size() >= 7 && !parts[6].empty()) {
@@ -7748,6 +7958,16 @@ int main(int argc, char* argv[]) {
                     if (cfg.symbol == "DOGE" && doge_p2p_port > 0) {
                         cfg.p2p_port = static_cast<uint16_t>(doge_p2p_port);
                         LOG_INFO << "DOGE P2P port overridden via --doge-p2p-port: " << doge_p2p_port;
+                    }
+                    // --no-embedded-doge: no DOGE networking of its own at all
+                    // (no header chain, no P2P peers, no DNS seeds), even with a
+                    // P2P port in the --merged spec: the daemon over RPC only.
+                    {
+                        const uint16_t port = c2pool::merged::merged_p2p_port(cfg.symbol, embedded_doge, cfg.p2p_port);
+                        if (port != cfg.p2p_port)
+                            LOG_INFO << "[MM:" << cfg.symbol << "] --no-embedded-doge: no DOGE P2P / DNS ("
+                                     << "the daemon at " << cfg.rpc_host << ":" << cfg.rpc_port << " over RPC only)";
+                        cfg.p2p_port = port;
                     }
 
                     // Create DOGE HeaderChain when embedded OR P2P is available.
@@ -7974,6 +8194,10 @@ int main(int argc, char* argv[]) {
                         if (!doge_pool->utxo()) {
                             LOG_ERROR << "[EMB-DOGE] No DOGE UTXO set: embedded DOGE backend not installed"
                                       << (cfg.rpc_port > 0 ? " — using the RPC path" : "");
+                            if (!rpc_address_ok) {
+                                refuse_rpc_only();
+                                continue;
+                            }
                             mm_manager->add_chain(cfg);
                         } else {
                             auto backend = std::make_unique<doge::coin::AuxChainEmbedded>(
@@ -7987,7 +8211,7 @@ int main(int argc, char* argv[]) {
                             LOG_INFO << "Merged mining: DOGE embedded (primary) chain_id=" << cfg.chain_id;
 
                             // Set RPC as fallback if connection details are available
-                            if (cfg.rpc_port > 0 && !cfg.rpc_userpass.empty()) {
+                            if (rpc_fallback_ok()) {
                                 auto rpc_fallback = std::make_unique<c2pool::merged::AuxChainRPC>(ioc, cfg);
                                 mm_manager->set_fallback_backend(cfg.chain_id, std::move(rpc_fallback));
                                 LOG_INFO << "Merged mining: DOGE RPC fallback at "
@@ -8040,7 +8264,7 @@ int main(int argc, char* argv[]) {
                                 });
                             mm_manager->add_chain(cfg, std::move(backend));
                             LOG_INFO << "Merged mining: NMC embedded (primary) chain_id=" << cfg.chain_id;
-                            if (cfg.rpc_port > 0 && !cfg.rpc_userpass.empty()) {
+                            if (rpc_fallback_ok()) {
                                 auto rpc_fallback = std::make_unique<c2pool::merged::AuxChainRPC>(ioc, cfg);
                                 mm_manager->set_fallback_backend(cfg.chain_id, std::move(rpc_fallback));
                                 LOG_INFO << "Merged mining: NMC RPC fallback at "
@@ -8072,7 +8296,7 @@ int main(int argc, char* argv[]) {
                             mm_manager->add_chain(cfg, std::move(backend));
                             LOG_INFO << "Merged mining: DGB embedded (primary) chain_id=" << cfg.chain_id;
                             // digibyted RPC fallback (embedded primary persists).
-                            if (cfg.rpc_port > 0 && !cfg.rpc_userpass.empty()) {
+                            if (rpc_fallback_ok()) {
                                 auto rpc_fallback = std::make_unique<c2pool::merged::AuxChainRPC>(ioc, cfg);
                                 mm_manager->set_fallback_backend(cfg.chain_id, std::move(rpc_fallback));
                                 LOG_INFO << "Merged mining: DGB RPC fallback at "
@@ -8083,11 +8307,19 @@ int main(int argc, char* argv[]) {
                         // Without -DAUX_DOGE the DGB embedded backend is absent;
                         // fall through to the standard RPC path so the seam is a
                         // no-op rather than a broken reference.
+                        if (!rpc_address_ok) {
+                            refuse_rpc_only();
+                            continue;
+                        }
                         mm_manager->add_chain(cfg);
                         LOG_INFO << "Merged mining: added DGB via RPC (AUX_DOGE off) chain_id=" << cfg.chain_id;
 #endif // AUX_DOGE
                     } else {
                         // Non-DOGE chain or no P2P — standard RPC path
+                        if (!rpc_address_ok) {
+                            refuse_rpc_only();
+                            continue;
+                        }
                         mm_manager->add_chain(cfg);
                         LOG_INFO << "Merged mining: added " << cfg.symbol
                                  << " (chain_id=" << cfg.chain_id << ") at "
@@ -9622,18 +9854,10 @@ int main(int argc, char* argv[]) {
                     return result;
                 });
               } else {
-                // P2P mode: PPLNS weights from the share tracker
-                // Build operator LTC script for merged address override (p2pool --merged-operator-address)
-                auto operator_ltc_script = node_owner_address.empty()
-                    ? std::vector<unsigned char>{}
-                    : core::address_to_script(node_owner_address);
-                auto operator_merged_script = node_owner_merged_address.empty()
-                    ? std::vector<unsigned char>{}
-                    : core::address_to_script(node_owner_merged_address);
-                if (!node_owner_merged_address.empty()) {
-                    LOG_INFO << "Merged operator address override: " << node_owner_merged_address
-                             << " (script " << operator_merged_script.size() << " bytes)";
-                }
+                // P2P mode: PPLNS weights from the share tracker, exactly as
+                // p2pool derives them (no node-local redirect: the operator's
+                // merged address reaches the payouts as the merged address of
+                // the operator's own shares, see set_operator_merged_scripts).
                 // The tracker lock is often busy (the compute thread holds it
                 // exclusively while it processes shares, for tens of seconds
                 // at a stretch): the compute thread publishes the PPLNS
@@ -9652,7 +9876,7 @@ int main(int argc, char* argv[]) {
                 // COMBINED_DONATION_SCRIPT (P2SH) regardless of share version
                 // (p2pool data.py line 303); the parent chain uses the
                 // version-dependent donation.
-                auto merged_weights = [operator_ltc_script, operator_merged_script, combined_donation](
+                auto merged_weights = [combined_donation](
                     ltc::ShareTracker& tracker, const uint256& best, uint32_t chain_id)
                     -> c2pool::merged::MergedPayoutSource::Weights
                 {
@@ -9662,8 +9886,7 @@ int main(int argc, char* argv[]) {
                     if (best.IsNull() || !tracker.chain.contains(best))
                         return out;   // no derive: no payouts
                     auto w = std::make_shared<const ltc::MergedPayoutWeights>(
-                        tracker.get_merged_payout_weights(best, chain_id, operator_ltc_script,
-                                                          operator_merged_script));
+                        tracker.get_merged_payout_weights(best, chain_id));
                     out.chain_len = w->chain_len;
                     out.derive = [w, combined_donation](uint64_t coinbase_value) {
                         return ltc::ShareTracker::merged_payout_outputs(*w, coinbase_value,
@@ -9788,11 +10011,32 @@ int main(int argc, char* argv[]) {
                         web_server.trigger_work_refresh_debounced();
                     });
 
-                    // Wire DOGE block verifier.
-                    // Note: the aux block hash from createauxblock is NOT the chain
-                    // block hash. After submitauxblock, the actual block gets a
-                    // different hash (includes AuxPoW proof). We verify by checking
-                    // if the daemon's best block height >= our block height.
+                    // Wire the merged found-block verifiers: our block against
+                    // the aux chain's best chain at the height it was mined at
+                    // (aux_verdict). DOGE and NMC read their embedded header
+                    // chains when present; any other chain its daemon's best
+                    // chain (getblockcount / getblockhash / getblockheader):
+                    // a daemon that merely answers is not a confirmation, and
+                    // a block it took as "inconclusive" is confirmed only if
+                    // its chain ends up with it.
+                    auto header_view = [](const auto* hc) {
+                        ltc::coin::found_block::ChainView view;
+                        view.height_of = [hc](const uint256& hh) -> std::optional<uint32_t> {
+                            auto e = hc->get_header(hh);
+                            if (!e)
+                                return std::nullopt;
+                            return e->height;
+                        };
+                        view.hash_at = [hc](uint32_t hh) -> std::optional<uint256> {
+                            auto e = hc->get_header_by_height(hh);
+                            if (!e)
+                                return std::nullopt;
+                            return e->block_hash;
+                        };
+                        view.tip_height = [hc]() { return hc->height(); };
+                        view.has_tip = [hc]() { return hc->tip().has_value(); };
+                        return view;
+                    };
                     for (auto& chain : merged_chain_specs) {
                         auto parts_check = std::vector<std::string>();
                         { std::istringstream ss(chain); std::string t;
@@ -9802,44 +10046,23 @@ int main(int argc, char* argv[]) {
                             uint32_t cid = static_cast<uint32_t>(std::stoul(parts_check[1]));
                             auto* rpc_backend = mm_manager->get_chain_rpc(cid);
                             if (rpc_backend) {
+                                std::optional<ltc::coin::found_block::ChainView> embedded_view;
+                                if (cid == 98 && doge_chain)
+                                    embedded_view = header_view(doge_chain.get());
+                                else if (cid == 1 && nmc_chain)
+                                    embedded_view = header_view(nmc_chain.get());
                                 mi_ptr->add_chain_verify_fn(sym,
-                                    [rpc_backend, mi_ptr, dc = (cid == 98 ? doge_chain.get() : nullptr)](
-                                        const std::string& hash_hex) -> int {
-                                        ltc::coin::found_block::ChainView view;
-                                        view.height_of = [dc](const uint256& hh) -> std::optional<uint32_t> {
-                                            if (!dc)
-                                                return std::nullopt;
-                                            auto e = dc->get_header(hh);
-                                            if (!e)
-                                                return std::nullopt;
-                                            return e->height;
-                                        };
-                                        view.hash_at = [dc](uint32_t hh) -> std::optional<uint256> {
-                                            if (!dc)
-                                                return std::nullopt;
-                                            auto e = dc->get_header_by_height(hh);
-                                            if (!e)
-                                                return std::nullopt;
-                                            return e->block_hash;
-                                        };
-                                        view.tip_height = [dc]() { return dc ? dc->height() : 0u; };
-                                        view.has_tip = [dc]() { return dc && dc->tip().has_value(); };
-                                        if (!dc) {
-                                            // No embedded header chain for this aux chain
-                                            // (not DOGE): the backend being alive is all
-                                            // there is to go on, as before.
-                                            try {
-                                                return rpc_backend->get_best_block_hash().empty() ? 0 : 1;
-                                            } catch (...) {
-                                                return 0; // unreachable — can't verify
-                                            }
-                                        }
-                                        // DOGE: our block against the DOGE best chain at
-                                        // the height it was mined at.
+                                    [rpc_backend, mi_ptr, embedded_view](const std::string& hash_hex) -> int {
                                         uint256 h;
                                         h.SetHex(hash_hex);
-                                        return ltc::coin::found_block::aux_verdict(
-                                            view, h, found_block_height(*mi_ptr, hash_hex));
+                                        const auto found_height = found_block_height(*mi_ptr, hash_hex);
+                                        if (embedded_view)
+                                            return ltc::coin::found_block::aux_verdict(*embedded_view, h, found_height);
+                                        try {
+                                            return c2pool::merged::aux_backend_verdict(*rpc_backend, h, found_height);
+                                        } catch (...) {
+                                            return 0;  // cannot tell: pending
+                                        }
                                     });
                             }
                         }
@@ -9869,6 +10092,7 @@ int main(int argc, char* argv[]) {
                     for (int i = 0; i < 20; ++i)
                         op_hash.data()[i] = static_cast<uint8_t>(
                             std::stoul(op_h160.substr(i * 2, 2), nullptr, 16));
+                    // The operator's own script type (p2pool: my_pubkey_type).
                     std::string op_atype;
                     core::address_to_hash160(node_owner_address, op_atype);
                     const uint8_t op_type = op_atype == "p2sh" ? 2 : op_atype == "p2wpkh" ? 1 : 0;
@@ -9892,29 +10116,46 @@ int main(int argc, char* argv[]) {
             if (p2p_node) {
                 auto* redistributor_ptr = redistributor.get();
                 auto* node_ptr = p2p_node.get();
+                // The pick reads the tracker: only under its read lock (a
+                // try-lock from the stratum thread; when the compute thread
+                // holds it, the operator / donation identity instead). The
+                // callbacks are published under MiningInterface's mutex: the
+                // HTTP thread can build a payout too (mining_submit).
+                const auto hex160 = [](const uint160& h) {
+                    static const char* HEX = "0123456789abcdef";
+                    std::string out;
+                    out.reserve(40);
+                    const unsigned char* bytes = h.data();
+                    for (int i = 0; i < 20; ++i) {
+                        out += HEX[bytes[i] >> 4];
+                        out += HEX[bytes[i] & 0x0f];
+                    }
+                    return out;
+                };
+                const auto pick_locked = [redistributor_ptr, node_ptr]() {
+                    auto guard = node_ptr->read_tracker();
+                    auto result = redistributor_ptr->pick_if_locked(guard, *guard, node_ptr->best_share_hash());
+                    // No recipient (no operator identity set, nothing in the
+                    // window) or a type a share cannot carry: the combined
+                    // donation (P2SH), never the zero key.
+                    if (result.pubkey_hash.IsNull() || result.pubkey_type > 2) {
+                        std::memcpy(result.pubkey_hash.data(),
+                                    ltc::PoolConfig::COMBINED_DONATION_SCRIPT.data() + 2, 20);
+                        result.pubkey_type = 2;
+                    }
+                    return result;
+                };
+                // The pick with its pubkey type (P2SH donation, a P2SH / P2WPKH
+                // miner): decide_job_payout pays the recipient's own script type.
+                web_server.get_mining_interface()->set_redistribute_fn(
+                    [pick_locked, hex160]() -> std::pair<std::string, uint8_t> {
+                        const auto result = pick_locked();
+                        return {hex160(result.pubkey_hash), result.pubkey_type};
+                    });
                 web_server.get_mining_interface()->set_address_fallback_fn(
-                    [redistributor_ptr, node_ptr](const std::string& /*bad_addr*/)
-                        -> std::pair<std::string, uint8_t> {
-                        auto best = node_ptr->best_share_hash();
-                        auto result = redistributor_ptr->pick(node_ptr->tracker(), best);
-                        // The recipient with its own script type. No recipient
-                        // (no operator identity set, nothing in the window) or
-                        // a type a share cannot carry: the combined donation
-                        // (P2SH), never the zero key.
-                        if (result.pubkey_hash.IsNull() || result.pubkey_type > 2) {
-                            std::memcpy(result.pubkey_hash.data(),
-                                        ltc::PoolConfig::COMBINED_DONATION_SCRIPT.data() + 2, 20);
-                            result.pubkey_type = 2;
-                        }
-                        static const char* HEX = "0123456789abcdef";
-                        std::string h160;
-                        h160.reserve(40);
-                        const unsigned char* bytes = result.pubkey_hash.data();
-                        for (int i = 0; i < 20; ++i) {
-                            h160 += HEX[bytes[i] >> 4];
-                            h160 += HEX[bytes[i] & 0x0f];
-                        }
-                        return {h160, result.pubkey_type};
+                    [pick_locked, hex160](const std::string& /*bad_addr*/) -> std::pair<std::string, uint8_t> {
+                        const auto result = pick_locked();
+                        return {hex160(result.pubkey_hash), result.pubkey_type};
                     });
             } else if (!payout_address.empty()) {
                 // Solo/custodial: invalid miner address → use node operator address

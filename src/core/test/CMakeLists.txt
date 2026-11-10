@@ -162,6 +162,17 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
     # is counted in /local_stats template_refresh; every session's job of a
     # generation shares one tx-hex vector (measured). Same fold-into-core_test
     # reasoning as every TU here.
+    # web_server_job_held_test.cpp: a stratum job is not built on a busy
+    # sharechain (no PPLNS at the job's prev share, no ref_hash):
+    # build_connection_coinbase returns CoinbaseResult::held and the session
+    # keeps its last job (one pending retry, bounded); a work source with the
+    # PPLNS at hand is unchanged. Same fold-into-core_test reasoning as every
+    # TU here.
+    # web_server_rpc_refresh_test.cpp: the coin daemon's template refresh
+    # over RPC (one-shot fetch + the --no-embedded getblocktemplate poll) is
+    # armed for a coin node attached after start() (c2pool-ltc starts its web
+    # server first), once, and not for an embedded node. Same fold-into-
+    # core_test reasoning as every TU here.
     # web_server_pplns_no_burn_test.cpp: no work is ever built on a burn
     # output: a busy tracker at a new best share leaves no zero-key output in
     # any coinbase and does not poison the cached (best, outputs) pair (jobs
@@ -238,6 +249,7 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
         web_server_frozen_pool_rate_guard_test.cpp
         web_server_http_cap_test.cpp
         web_server_ip_mask_test.cpp
+        web_server_job_held_test.cpp
         web_server_local_hashps_test.cpp
         web_server_local_only_test.cpp
         web_server_local_share_hash_rates_test.cpp
@@ -246,6 +258,7 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
         web_server_pplns_no_burn_test.cpp
         web_server_redistribute_type_test.cpp
         web_server_relay_block_test.cpp
+        web_server_rpc_refresh_test.cpp
         web_server_submitblock_test.cpp
         web_server_utxo_scan_test.cpp
         web_server_worker_liveness_test.cpp
