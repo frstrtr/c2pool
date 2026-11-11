@@ -876,10 +876,25 @@ inline DashWorkData build_embedded_workdata(
     // when the types-1-4 fold below is armed: a collateral spend has no ProTx
     // effect the fold applies, so excluding it stays the simplest safe route —
     // subsuming it into the fold is a later step, per the frozen design.)
+    // An excluded tx takes its in-body descendants with it, fees included:
+    // selection is topological (mempool.hpp G1), so a child (or grandchild)
+    // of the spend was packed after it and, left behind, would spend an
+    // output the block does not create (bad-txns-inputs-missingorspent).
     {
+        std::set<uint256> excluded;
         size_t kept = 0;
         for (size_t i = 0; i < selected.size(); ++i) {
             uint256 protx;
+            const uint256 id = dash::coin::dash_txid(selected[i].tx);
+            if (spends_earlier_in_set(selected[i].tx, excluded)) {
+                total_fees -= selected[i].fee;
+                excluded.insert(id);
+                LOG_WARNING << "[GBT-EMB] excluding tx " << id.GetHex().substr(0, 16)
+                            << " from template h=" << (prev_height + 1)
+                            << ": it spends an output of an excluded"
+                               " collateral-spending tx";
+                continue;
+            }
             // Dash Core v24: a ProDisTx dissolves a shared masternode by
             // spending its collateral. With the v24 fold armed it stays: the
             // fold checks it (CheckProDisTx) and removes the masternode in the
@@ -889,8 +904,9 @@ inline DashWorkData build_embedded_workdata(
                 && selected[i].tx.type == tx_type::PROVIDER_DISSOLVE;
             if (!v24_dissolve && tx_spends_mn_collateral(mnstates, selected[i].tx, &protx)) {
                 total_fees -= selected[i].fee;
+                excluded.insert(id);
                 LOG_WARNING << "[GBT-EMB] excluding tx "
-                            << dash::coin::dash_txid(selected[i].tx).GetHex().substr(0, 16)
+                            << id.GetHex().substr(0, 16)
                             << " from template h=" << (prev_height + 1)
                             << ": spends collateral of MN "
                             << protx.GetHex().substr(0, 16)
@@ -1136,13 +1152,19 @@ inline DashWorkData build_embedded_workdata(
         // topological (mempool.hpp G1), so a parent that rides this template
         // has already been pushed when its child is considered.
         std::set<uint256> candidate_ids;
+        std::set<uint256> candidate_excluded;
         for (const auto& c : cand) {
-            // The SAME MN-collateral exclusion the served path applies: a
-            // candidate set that included them would overstate what we could
-            // actually have served and make the coverage gate too generous.
+            // The SAME MN-collateral exclusion the served path applies, in-body
+            // descendants included: a candidate set that included them would
+            // overstate what we could actually have served and make the
+            // coverage gate too generous.
             uint256 protx;
-            if (tx_spends_mn_collateral(mnstates, c.tx, &protx)) continue;
             const uint256 cid = dash::coin::dash_txid(c.tx);
+            if (spends_earlier_in_set(c.tx, candidate_excluded)
+                || tx_spends_mn_collateral(mnstates, c.tx, &protx)) {
+                candidate_excluded.insert(cid);
+                continue;
+            }
             w.m_mempool_probe_depends_in_set.push_back(
                 spends_earlier_in_set(c.tx, candidate_ids) ? 1u : 0u);
             w.m_txset_candidates.push_back(cid);

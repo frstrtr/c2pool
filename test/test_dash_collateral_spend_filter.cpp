@@ -31,6 +31,7 @@
 #include <impl/dash/coin/mn_state_db.hpp>
 #include <impl/dash/coin/mempool.hpp>
 #include <impl/dash/coin/node_coin_state.hpp>
+#include <impl/dash/coin/quorum_manager.hpp>
 #include <impl/dash/coin/subsidy.hpp>
 #include <impl/dash/coin/transaction.hpp>
 #include <impl/dash/coin/utxo_adapter.hpp>
@@ -256,4 +257,88 @@ TEST(DashCollateralSpendFilter, PredicateMatchesExactOutpointOnly) {
     in2.sequence = 0xffffffffu;
     multi.vin.push_back(in2);
     EXPECT_TRUE(tx_spends_mn_collateral(mnstates, multi));
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// The exclusion takes the spend's in-body descendants with it. Selection is
+// topological (mempool.hpp G1), so a child of the spend and that child's own
+// child are packed after it; left behind, each spends an output the block
+// does not create and a won block is rejected
+// bad-txns-inputs-missingorspent. The exclusion runs in both postures: the
+// bare builder and the default daemonless one (SML present,
+// --embedded-include-mn-special-txs on).
+// ════════════════════════════════════════════════════════════════════════
+
+TEST(DashCollateralSpendFilter, ExcludedSpendTakesItsChildAndGrandchildOut) {
+    UTXOViewCache utxo(nullptr);
+    Mempool mp;
+    mp.set_utxo(&utxo);
+    const uint256 p0 = mint_hash(0x50);
+    utxo.add_coin(Outpoint(p0, 0), Coin(100'000, {}, 1, false));
+    const auto innocent = make_spend(p0, 0, 90'000, /*salt=*/1);                  // fee 10'000
+    const uint256 collat = raw256(0xC0);
+    utxo.add_coin(Outpoint(collat, 0), Coin(100'000'000'000LL, {}, 1, false));
+    const auto spend = make_spend(collat, 0, 99'999'950'000LL, /*salt=*/2);       // fee 50'000
+    const auto child = make_spend(dash::coin::dash_txid(spend), 0,
+                                  99'999'940'000LL, /*salt=*/3);                  // fee 10'000
+    const auto grandchild = make_spend(dash::coin::dash_txid(child), 0,
+                                       99'999'930'000LL, /*salt=*/4);             // fee 10'000
+    ASSERT_TRUE(mp.add_tx(innocent));
+    ASSERT_TRUE(mp.add_tx(spend));
+    ASSERT_TRUE(mp.add_tx(child));
+    ASSERT_TRUE(mp.add_tx(grandchild));
+
+    std::vector<CSimplifiedMNListEntry> entries;
+    for (uint8_t b : {0x01, 0x02}) {
+        CSimplifiedMNListEntry e;
+        e.nVersion = CSimplifiedMNListEntry::VER_BASIC_BLS;
+        e.proRegTxHash = raw256(b);
+        e.confirmedHash = raw256(0x77);
+        e.isValid = true;
+        entries.push_back(e);
+    }
+    const CSimplifiedMNList sml(std::move(entries));
+    dash::coin::QuorumManager qmgr;
+    auto build = [&](const MnStateMachine& mnstates, bool daemonless) {
+        if (!daemonless)
+            return build_embedded_workdata(H - 1, raw256(0xAB), mnstates, mp, 0x1b104be3u,
+                                           1'700'000'000u, DASH_PUBKEY_VER, DASH_P2SH_VER);
+        return build_embedded_workdata(
+            H - 1, raw256(0xAB), mnstates, mp, 0x1b104be3u, 1'700'000'000u,
+            DASH_PUBKEY_VER, DASH_P2SH_VER, 1'700'000'100u, 0x20000000u, nullptr,
+            &sml, &qmgr, 0, dash::coin::k_zero_cl_sig, 0, nullptr, nullptr,
+            dash::coin::DASH_MN_RR_HEIGHT_MAINNET, nullptr,
+            dash::coin::DASH_MN_MIN_CONFIRMATIONS_MAINNET, /*suppress=*/false,
+            "utxo-immature-serving", nullptr, false, nullptr,
+            /*include_mn_special_txs=*/true, nullptr, nullptr, nullptr,
+            /*v24_active=*/false, nullptr, nullptr);
+    };
+    auto rides = [](const DashWorkData& w, const MutableTransaction& tx) {
+        for (const auto& h : w.m_tx_hashes)
+            if (h == dash::coin::dash_txid(tx)) return true;
+        return false;
+    };
+    const int64_t reward = compute_dash_block_reward_post_v20(H);
+
+    // Not vacuous: when the outpoint backs no masternode the whole chain rides.
+    const auto no_mn = mn_set_with_collateral(raw256(0xC1), 0);
+    for (bool daemonless : {false, true}) {
+        const auto w = build(no_mn, daemonless);
+        EXPECT_TRUE(rides(w, spend) && rides(w, child) && rides(w, grandchild))
+            << "daemonless=" << daemonless << ": the selector packs the chain";
+        EXPECT_EQ(w.m_coinbase_value, static_cast<uint64_t>(reward + 80'000));
+    }
+
+    const auto mnstates = mn_set_with_collateral(collat, 0);
+    for (bool daemonless : {false, true}) {
+        const auto w = build(mnstates, daemonless);
+        EXPECT_TRUE(rides(w, innocent)) << "daemonless=" << daemonless;
+        EXPECT_FALSE(rides(w, spend)) << "daemonless=" << daemonless;
+        EXPECT_FALSE(rides(w, child))
+            << "daemonless=" << daemonless << ": child of the excluded spend left in the body";
+        EXPECT_FALSE(rides(w, grandchild))
+            << "daemonless=" << daemonless << ": grandchild of the excluded spend left in the body";
+        EXPECT_EQ(w.m_coinbase_value, static_cast<uint64_t>(reward + 10'000))
+            << "daemonless=" << daemonless << ": the dropped fees must leave the coinbase";
+    }
 }
