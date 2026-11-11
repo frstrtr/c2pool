@@ -410,12 +410,22 @@ export PATH="$PATH:$HOME/.local/bin"   # so `conan` is on PATH (add to ~/.bashrc
 conan profile detect --force
 
 git clone https://github.com/frstrtr/c2pool.git
-cd c2pool && mkdir build && cd build
-conan install .. --build=missing --output-folder=. --settings=build_type=Debug
-cmake .. --preset conan-debug
-cmake --build . --target c2pool -j$(nproc)
-./src/c2pool/c2pool
+cd c2pool && git checkout v0.2.12.1   # or the newest tag on the Releases page; omit to build master
+mkdir build && cd build
+conan install .. --build=missing --output-folder=. --settings=build_type=Release
+cmake .. -DCMAKE_TOOLCHAIN_FILE=conan_toolchain.cmake -DCMAKE_BUILD_TYPE=Release
+cmake --build . --target c2pool-ltc -j$(nproc)
+./src/c2pool/c2pool-ltc
 ```
+
+This builds the LTC node (`c2pool-ltc`, the binary the release packages ship).
+For another coin use its target (`c2pool-dash`, `c2pool-btc`, … — see
+[Build targets](#build-targets)). The target `c2pool` is a dev alias of the
+same LTC node. For a production node, prefer the signed binaries from
+[Releases](https://github.com/frstrtr/c2pool/releases) (see
+[Verify downloads](#verify-downloads)), or build **Release** as above: a Debug
+build (`build_type=Debug` + `--preset conan-debug`) is several times larger
+and slower and is meant for development only.
 
 **Linux (Ubuntu 26.04 LTS)** — *theoretical: CI builds on 24.04, so the 26.04 path below is documented from known toolchain deltas, not yet exercised in the CI matrix. Report any gotcha via an issue.*
 
@@ -424,7 +434,7 @@ The 24.04 steps above apply unchanged; the build is Conan-managed, so it is larg
 - **Externally-managed pip (PEP 668).** As on 24.04, install Conan with `pip install "conan>=2.0,<3.0" --break-system-packages`, or prefer an isolated `pipx install "conan>=2.0,<3.0"` (`sudo apt-get install -y pipx`) so the tool does not touch the system Python. (Conan is c2pool's **C++** dependency manager — a pip-distributed tool — and is unrelated to any Python component of a pool.)
 - **apt package names are unchanged**: `g++ cmake make libleveldb-dev libsecp256k1-dev python3-pip`.
 
-Everything else — `conan install` → `cmake --preset conan-debug` → `cmake --build` — is identical to 24.04.
+Everything else — `conan install` → `cmake` (Release toolchain) → `cmake --build` — is identical to 24.04.
 
 **macOS (Intel & Apple Silicon)**
 ```bash
@@ -434,8 +444,8 @@ brew install cmake boost leveldb secp256k1 nlohmann-json yaml-cpp
 git clone https://github.com/frstrtr/c2pool.git
 cd c2pool && mkdir build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release
-cmake --build . --target c2pool -j$(sysctl -n hw.ncpu)
-./src/c2pool/c2pool
+cmake --build . --target c2pool-ltc -j$(sysctl -n hw.ncpu)
+./src/c2pool/c2pool-ltc
 ```
 
 **Windows (setup.exe or build from source)**
