@@ -2730,7 +2730,8 @@ public:
             auto* s = find_session(key);
             if (!s) continue;
             m_gov_pull_sent += invs.size();
-            s->write(message_getdata::make_raw(invs));
+            auto getdata_msg = message_getdata::make_raw(invs);
+            s->write(getdata_msg);
         }
     }
 
