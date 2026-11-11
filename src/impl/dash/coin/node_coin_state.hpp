@@ -1730,6 +1730,26 @@ public:
                               "built=" + std::to_string(w.m_tx_serve_stamp.superblock_total),
                               "verdict=" + std::to_string(want) + "@h=" +
                                   std::to_string(next_h));
+            // ...and the ORDERED payee list itself (CSuperblock::IsValid
+            // matches payment by payment, in order — superblock.cpp:296-333):
+            // the builder appends the schedule as the LAST packed payments, so
+            // the tail must be exactly the verdict's schedule, entry by entry.
+            const size_t n = sbd.payments.size();
+            if (n > w.m_packed_payments.size())
+                return reject("emit-superblock-drift",
+                              "built-payees=" + std::to_string(w.m_packed_payments.size()),
+                              "schedule=" + std::to_string(n));
+            const size_t off = w.m_packed_payments.size() - n;
+            for (size_t i = 0; i < n; ++i) {
+                const auto& pp = w.m_packed_payments[off + i];
+                const auto& sp = sbd.payments[i];
+                if (pp.payee != superblock_payee_token(sp.script) ||
+                    pp.amount != static_cast<uint64_t>(sp.amount))
+                    return reject("emit-superblock-drift",
+                                  "payee[" + std::to_string(i) + "]=" + pp.payee + ":" +
+                                      std::to_string(pp.amount),
+                                  "schedule-order@h=" + std::to_string(next_h));
+            }
         }
         // E1: with a qc plan installed the DKG-window heights are SERVED,
         // not refused — re-derive the mandatory type-6 set here and require
@@ -2445,6 +2465,23 @@ private:
             }
         }
         return out;
+    }
+
+    /// The packed-payment token the embedded builder emits for a superblock
+    /// payee (embedded_gbt.hpp superblock block): the base58 address for a
+    /// standard script under the tip's version bytes, "!<hex>" otherwise.
+    std::string superblock_payee_token(const std::vector<uint8_t>& script) const {
+        std::string addr = ::core::script_to_address(
+            script, /*bech32_hrp=*/"", m_address_version, m_address_p2sh_version);
+        if (!addr.empty()) return addr;
+        static const char* digits = "0123456789abcdef";
+        std::string hex = "!";
+        hex.reserve(1 + script.size() * 2);
+        for (uint8_t b : script) {
+            hex.push_back(digits[(b >> 4) & 0xF]);
+            hex.push_back(digits[b & 0xF]);
+        }
+        return hex;
     }
 
     /// Superblock disposition for a candidate next height. ok=false => refuse

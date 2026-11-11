@@ -84,6 +84,8 @@ struct GovFundingVote {
                                          // a newer NONE replaces a stored YES,
                                          // dropping the yes-count)
     int64_t timestamp{0};                // newer replaces older
+    uint256 signer_fp;                   // operator-key fingerprint the vote
+                                         // verified under (null = unrecorded)
 };
 
 /// dashd's std::map<uint256, ...> iteration order: base_blob::Compare is a
@@ -133,7 +135,7 @@ public:
     static constexpr size_t MAX_TRIGGERS = 64;
     /// Bound on outstanding (non-admitted) trigger records. Overflow is
     /// itself a blocker until the cycle prunes (fail closed).
-    static constexpr size_t MAX_OUTSTANDING = 256;
+    static constexpr size_t MAX_OUTSTANDING = 1024;
     /// Bound on votes we could not verify yet (per parent, any outcome).
     /// Overflow is a blocker for every height until the cycle prunes.
     static constexpr size_t MAX_UNVERIFIABLE_VOTES = 8192;
@@ -171,6 +173,19 @@ public:
     /// try to fake it from the SML alone.
     void set_vote_weight_fn(std::function<int(const std::string&)> fn) {
         m_vote_weight_fn = std::move(fn);
+    }
+
+    /// RemoveInvalidVotes parity (Dash Core v24 governance.cpp:1180-1226 +
+    /// votedb.cpp:81-101): when a masternode's operator (or voting) key
+    /// changes, or it leaves the list, dashd re-checks its stored votes
+    /// against the TIP list and drops every one that no longer verifies — for
+    /// a trigger funding vote, one signed under the old operator key. This
+    /// seam returns the CURRENT operator-key fingerprint for an outpoint key
+    /// (nullopt = not in the list); a stored vote counts only while it still
+    /// equals the fingerprint the vote verified under. Unset => not enforced
+    /// (KATs); main_dash wires it.
+    void set_signer_fp_fn(std::function<std::optional<uint256>(const std::string&)> fn) {
+        m_signer_fp_fn = std::move(fn);
     }
 
     /// Ingest a parsed superblock trigger (from a govobj MNGOVERNANCEOBJECT of
@@ -222,7 +237,11 @@ public:
                 outcome < it->second.outcome)
                 return;
         }
-        per_obj[mn_outpoint_key] = GovFundingVote{outcome, timestamp};
+        uint256 fp;
+        if (m_signer_fp_fn) {
+            if (auto cur = m_signer_fp_fn(mn_outpoint_key)) fp = *cur;
+        }
+        per_obj[mn_outpoint_key] = GovFundingVote{outcome, timestamp, fp};
         // A verified vote from this voter supersedes an earlier unverifiable
         // one (the voter is now resolvable).
         auto uit = m_unverifiable.find(parent_hash);
@@ -245,6 +264,7 @@ public:
         if (it == m_funding_votes.end()) return 0;
         int yes = 0, no = 0;
         for (const auto& [k, v] : it->second) {
+            if (!vote_still_valid(k, v)) continue; // RemoveInvalidVotes parity
             const int w = m_vote_weight_fn ? m_vote_weight_fn(k) : 0;
             if (w <= 0) continue;                 // not in valid set / seam unset
             if (v.outcome == VOTE_OUTCOME_YES) yes += w;
@@ -293,51 +313,19 @@ public:
 
     // ── C1: STRICT ABSENCE — may "not triggered at H" be asserted at all? ───
 
-    /// Raw (unweighted) count of stored verified votes with `outcome` on a
-    /// trigger. Unweighted on purpose: a YES from an MN our weight seam
-    /// cannot resolve is still evidence someone wants this trigger funded.
-    size_t raw_vote_count(const uint256& object_hash, int32_t outcome) const {
-        auto it = m_funding_votes.find(object_hash);
-        if (it == m_funding_votes.end()) return 0;
-        size_t n = 0;
-        for (const auto& [k, v] : it->second)
-            if (v.outcome == outcome) ++n;
-        return n;
-    }
-    /// Weighted NO count (what a down-vote must carry to count as one).
-    int weighted_no_count(const uint256& object_hash) const {
-        auto it = m_funding_votes.find(object_hash);
-        if (it == m_funding_votes.end()) return 0;
-        int no = 0;
-        for (const auto& [k, v] : it->second) {
-            if (v.outcome != VOTE_OUTCOME_NO) continue;
-            const int w = m_vote_weight_fn ? m_vote_weight_fn(k) : 0;
-            if (w > 0) no += w;
-        }
-        return no;
-    }
-
     /// Why "not triggered at `height`" can NOT be asserted from the stored
-    /// triggers, or nullopt when every stored trigger at the height is
-    /// POSITIVELY voted down. dashd IsSuperblockTriggered is a pure function
-    /// of the trigger set + tally; our copy of both can be partial (votes not
-    /// yet streamed, a voter our DMN view cannot resolve), so a stored
-    /// trigger at H only permits "not triggered" when it carries counted
-    /// votes, NONE of them YES, and a weighted NO side — any YES (raw), any
-    /// positive absolute-yes, a trigger with no counted votes at all, or any
-    /// vote we could not verify keeps the height AMBIGUOUS. (dashd's own
-    /// trigger creator always votes YES on the trigger it supports —
-    /// governance/signing.cpp VoteGovernanceTriggers — so in practice any
-    /// stored trigger at H blocks the unfunded verdict; that is intended.)
+    /// triggers, or nullopt when no trigger for the height is held at all.
+    /// Called only when no trigger at H reached the threshold. dashd's
+    /// IsSuperblockTriggered is a pure function of the trigger set + tally,
+    /// and our copy of the tally can lag or be partial (votes not yet
+    /// streamed, YES votes withheld by a peer while NO votes arrive), so a
+    /// stored trigger at H — whatever its visible votes — makes the unfunded
+    /// verdict unprovable. (dashd's trigger creator always votes YES on the
+    /// trigger it supports, governance/signing.cpp VoteGovernanceTriggers, so
+    /// an honestly voted-down trigger is rare; refusing it is the cheap side.)
     std::optional<std::string> ambiguous_at(int32_t height) const {
-        for (const auto& [hash, trig] : m_triggers) {
-            if (trig.event_block_height != height) continue;
-            if (unverifiable_vote_count(hash) > 0) return std::string("trigger-unverified-votes");
-            if (absolute_yes_count(hash) > 0)       return std::string("trigger-ambiguous");
-            if (raw_vote_count(hash, VOTE_OUTCOME_YES) > 0)
-                return std::string("trigger-ambiguous");
-            if (weighted_no_count(hash) <= 0)       return std::string("trigger-ambiguous");
-        }
+        for (const auto& [hash, trig] : m_triggers)
+            if (trig.event_block_height == height) return std::string("trigger-present");
         return std::nullopt;
     }
 
@@ -398,9 +386,12 @@ public:
     }
     /// Parents recorded only through an orphan YES vote (fetch candidates).
     std::vector<uint256> orphan_yes_parents() const {
+        return outstanding_hashes(GovOutstandingKind::OrphanYesVote);
+    }
+    std::vector<uint256> outstanding_hashes(GovOutstandingKind kind) const {
         std::vector<uint256> out;
         for (const auto& [hash, rec] : m_outstanding)
-            if (rec.kind == GovOutstandingKind::OrphanYesVote) out.push_back(hash);
+            if (rec.kind == kind) out.push_back(hash);
         return out;
     }
 
@@ -508,6 +499,12 @@ public:
     }
 
 private:
+    bool vote_still_valid(const std::string& key, const GovFundingVote& v) const {
+        if (!m_signer_fp_fn || v.signer_fp.IsNull()) return true;
+        const auto cur = m_signer_fp_fn(key);
+        return cur && *cur == v.signer_fp;
+    }
+
     struct Outstanding {
         GovOutstandingKind kind{GovOutstandingKind::Unparsed};
         int32_t event_height{0};   // 0 = unknown => cycle-wide
@@ -528,6 +525,8 @@ private:
     int m_funding_threshold{0};  // 0 = unknown => fail closed
     // outpoint key -> current voting weight (0 = absent). Unset => fail closed.
     std::function<int(const std::string&)> m_vote_weight_fn;
+    // outpoint key -> current operator-key fingerprint (RemoveInvalidVotes).
+    std::function<std::optional<uint256>(const std::string&)> m_signer_fp_fn;
     // C2/C3 non-admitted trigger objects (+ orphan-YES parents).
     std::map<uint256, Outstanding> m_outstanding;
     bool m_outstanding_overflow{false};

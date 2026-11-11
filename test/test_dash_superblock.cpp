@@ -62,6 +62,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -957,8 +958,18 @@ TEST(DashSuperblock, GovSyncStatusCompletenessDetermination) {
     s.note_govsync_requested("peerA", t0);
     EXPECT_FALSE(s.is_complete(t0 + 10'000)) << "single-peer view is never complete";
 
-    // Second distinct peer covered, but the settle floor has not elapsed.
+    // Two peers REQUESTED but SILENT (pruned / -disablegovernance / unsynced
+    // dashd return before answering, net_governance.cpp:86-91): an empty
+    // store behind them must NEVER read as complete.
     s.note_govsync_requested("peerB", t0 + 5);
+    EXPECT_FALSE(s.is_complete(t0 + 10'000))
+        << "requested-but-silent peers must not count as coverage";
+    EXPECT_EQ(s.answered_peer_count(), 0u);
+
+    // Both ANSWER (ssc + every announced object received), but the settle
+    // floor has not elapsed.
+    s.note_govsync_answered("peerA", t0 + 6);
+    s.note_govsync_answered("peerB", t0 + 7);
     EXPECT_FALSE(s.is_complete(t0 + 30)) << "not settled (60s floor since first req)";
 
     // Settled, but an object just arrived => not quiesced.
@@ -972,6 +983,14 @@ TEST(DashSuperblock, GovSyncStatusCompletenessDetermination) {
     s.note_vote_arrival(t0 + 200);
     EXPECT_FALSE(s.is_complete(t0 + 210));
     EXPECT_TRUE(s.is_complete(t0 + 200 + 30)) << "quiesces again after the vote";
+
+    // A fresh prime re-opens that peer's proof: one answered peer left.
+    s.note_govsync_requested("peerB", t0 + 300);
+    EXPECT_FALSE(s.is_complete(t0 + 1'000)) << "re-primed peer must answer again";
+    s.note_govsync_answered("peerB", t0 + 301);
+    EXPECT_TRUE(s.is_complete(t0 + 1'000));
+    s.note_govsync_unanswered("peerA");
+    EXPECT_FALSE(s.is_complete(t0 + 1'000)) << "a lapsed proof (disconnect) uncovers";
 
     // reset() (desync / reorg) forces the view back to INCOMPLETE.
     s.reset();
@@ -1016,11 +1035,18 @@ TEST(DashSuperblock, MaintainerGovSyncCompleteGatesServe) {
     EXPECT_FALSE(st.make_embedded_work_inputs().viable())
         << "single-peer govsync is never complete";
 
-    // Second peer, but not yet settled/quiesced.
+    // Second peer requested — both SILENT so far: never complete.
     m.note_govsync_requested("peerB");
-    now += 5;
+    now += 10'000;
     EXPECT_FALSE(st.make_embedded_work_inputs().viable())
-        << "two peers but not settled/quiesced => refuse";
+        << "requested-but-silent peers => incomplete => refuse";
+    EXPECT_EQ(st.describe_decline().value, "govsync-incomplete");
+
+    // Both answer; not yet quiesced.
+    m.note_govsync_answered("peerA");
+    m.note_govsync_answered("peerB");
+    EXPECT_FALSE(st.make_embedded_work_inputs().viable())
+        << "answered but not quiesced => refuse";
 
     // Settle + quiesce elapse with no new arrivals => COMPLETE => serve.
     now += 100;
@@ -1106,7 +1132,14 @@ TEST(DashSuperblock, SuperblockMatchDoesNotLatchAndPrunes) {
     m.on_block_connected(blk, SBH);
 
     EXPECT_FALSE(m.gov_desync_latched()) << "a matching coinbase must not latch";
-    // The executed cycle is pruned (store bounded across cycles).
+    // The executed trigger stays resolvable for the reorg-keep depth (a re-
+    // fold of this block must see the same view), then is pruned (store
+    // bounded across cycles).
+    EXPECT_EQ(m.gov_store().trigger_count(), 1u);
+    BlockType later;
+    later.m_txs.push_back(make_cb(500'000'000, p2pkh_script(0x30)));
+    bind_block(later);
+    m.on_block_connected(later, SBH + 32);
     EXPECT_EQ(m.gov_store().trigger_count(), 0u);
 }
 
@@ -1359,8 +1392,13 @@ void arm_tristate(CoinStateMaintainer& m, int64_t& now, int threshold = 1) {
         [](uint32_t h) { return superblock_budget(h, DASH_SUPERBLOCK_CYCLE_TESTNET); });
     m.gov_store().set_funding_threshold(threshold);
     m.gov_store().set_vote_weight_fn(weight_all_regular);
+    m.set_not_triggered_enabled(true);       // testnet posture
     m.note_govsync_requested("peerA");
     m.note_govsync_requested("peerB");
+    now += 100;
+    ASSERT_FALSE(m.gov_sync_complete()) << "requested-but-silent is not coverage";
+    m.note_govsync_answered("peerA");
+    m.note_govsync_answered("peerB");
     now += 100;
     ASSERT_TRUE(m.gov_sync_complete());
 }
@@ -1419,67 +1457,45 @@ TEST(DashSuperblockTriState, EachVerdictBranch) {
     EXPECT_EQ(r.verdict, SuperblockVerdict::Unknown);
 }
 
-// ── T2. C1 strict absence: a sub-threshold trigger with any yes is AMBIGUOUS ──
-TEST(DashSuperblockTriState, StrictAbsenceAmbiguityC1) {
+// ── T2. C1 strict absence: ANY held trigger at H makes "unfunded" unprovable ─
+// Our tally can lag or be partial — votes not yet streamed, or a peer that
+// relays a trigger's NO votes while withholding its YES votes — so a stored
+// trigger at H blocks the unfunded verdict whatever its visible votes.
+TEST(DashSuperblockTriState, StrictAbsenceAnyHeldTriggerBlocksC1) {
     auto fresh = []() {
         GovernanceStore s;
         s.set_funding_threshold(5);
-        s.set_vote_weight_fn([](const std::string& k) {
-            return k.rfind("ghost", 0) == 0 ? 0 : DASH_VOTE_WEIGHT_REGULAR;
-        });
+        s.set_vote_weight_fn(weight_all_regular);
         return s;
     };
     auto verdict = [](const GovernanceStore& s) {
         return resolve_superblock_payments(s, TSH, tbudget(TSH), true);
     };
-    // A trigger at H with NO counted votes: nothing proves it voted down.
+    // No votes at all.
     {
         auto s = fresh();
         ASSERT_TRUE(s.add_trigger(mk_trig(72, TSH)));
-        auto r = verdict(s);
-        EXPECT_EQ(r.verdict, SuperblockVerdict::Unknown);
-        EXPECT_EQ(r.reason, "trigger-ambiguous");
+        EXPECT_EQ(verdict(s).verdict, SuperblockVerdict::Unknown);
+        EXPECT_EQ(verdict(s).reason, "trigger-present");
     }
-    // Sub-threshold with yes votes (abs 2 < 5): AMBIGUOUS, not "unfunded".
+    // Sub-threshold yes (abs 2 < 5).
     {
         auto s = fresh();
         ASSERT_TRUE(s.add_trigger(mk_trig(73, TSH)));
         s.add_verified_funding_vote(hash_of(73), "mn-1", VOTE_OUTCOME_YES, 1);
         s.add_verified_funding_vote(hash_of(73), "mn-2", VOTE_OUTCOME_YES, 1);
-        EXPECT_EQ(verdict(s).reason, "trigger-ambiguous");
+        EXPECT_EQ(verdict(s).reason, "trigger-present");
     }
-    // abs-yes 0 (1 yes, 1 no): still a YES on record => ambiguous.
-    {
-        auto s = fresh();
-        ASSERT_TRUE(s.add_trigger(mk_trig(74, TSH)));
-        s.add_verified_funding_vote(hash_of(74), "mn-1", VOTE_OUTCOME_YES, 1);
-        s.add_verified_funding_vote(hash_of(74), "mn-2", VOTE_OUTCOME_NO, 1);
-        EXPECT_EQ(s.absolute_yes_count(hash_of(74)), 0);
-        EXPECT_EQ(verdict(s).reason, "trigger-ambiguous");
-    }
-    // A YES from a voter our weight seam cannot resolve (weight 0) still counts
-    // as a YES on record (raw) => ambiguous.
-    {
-        auto s = fresh();
-        ASSERT_TRUE(s.add_trigger(mk_trig(75, TSH)));
-        s.add_verified_funding_vote(hash_of(75), "ghost-1", VOTE_OUTCOME_YES, 1);
-        s.add_verified_funding_vote(hash_of(75), "mn-2", VOTE_OUTCOME_NO, 1);
-        EXPECT_EQ(s.absolute_yes_count(hash_of(75)), -1);
-        EXPECT_EQ(verdict(s).reason, "trigger-ambiguous");
-    }
-    // POSITIVELY voted down (counted NO, zero YES): provably not triggered.
+    // ONLY NO votes visible (the withheld-YES variant): still unprovable.
     {
         auto s = fresh();
         ASSERT_TRUE(s.add_trigger(mk_trig(76, TSH)));
-        s.add_verified_funding_vote(hash_of(76), "mn-1", VOTE_OUTCOME_NO, 1);
-        s.add_verified_funding_vote(hash_of(76), "mn-2", VOTE_OUTCOME_ABSTAIN, 1);
-        EXPECT_EQ(verdict(s).verdict, SuperblockVerdict::NotTriggered);
-        // ...but not while a vote on it is still unverifiable.
-        s.note_unverifiable_vote(hash_of(76), "mn-3");
-        EXPECT_EQ(verdict(s).reason, "trigger-unverified-votes");
-        // a verified vote from that voter supersedes the unverifiable record
-        s.add_verified_funding_vote(hash_of(76), "mn-3", VOTE_OUTCOME_NO, 2);
-        EXPECT_EQ(verdict(s).verdict, SuperblockVerdict::NotTriggered);
+        for (int i = 0; i < 20; ++i)
+            s.add_verified_funding_vote(hash_of(76), "mn-" + std::to_string(i),
+                                        VOTE_OUTCOME_NO, 1);
+        EXPECT_LT(s.absolute_yes_count(hash_of(76)), 0);
+        EXPECT_EQ(verdict(s).verdict, SuperblockVerdict::Unknown);
+        EXPECT_EQ(verdict(s).reason, "trigger-present");
     }
     // A trigger for ANOTHER height never blocks H.
     {
@@ -1499,7 +1515,39 @@ TEST(DashSuperblockTriState, StrictAbsenceAmbiguityC1) {
         ASSERT_TRUE(s.add_trigger(mk_trig(79, TSH, "4.0")));
         s.note_unverifiable_vote(hash_of(79), "mn-9");
         EXPECT_EQ(verdict(s).reason, "trigger-unverified-votes");
+        // a verified vote from that voter supersedes the unverifiable record
+        s.add_verified_funding_vote(hash_of(79), "mn-9", VOTE_OUTCOME_NO, 2);
+        EXPECT_EQ(verdict(s).verdict, SuperblockVerdict::Triggered);
     }
+}
+
+// ── T2b. RemoveInvalidVotes parity (MED-4): a vote counts only under the
+// voter's CURRENT operator key ──────────────────────────────────────────────
+TEST(DashSuperblockTriState, VoteDroppedWhenOperatorKeyChangesMED4) {
+    GovernanceStore s;
+    s.set_funding_threshold(2);
+    s.set_vote_weight_fn(weight_all_regular);
+    std::map<std::string, uint256> keys{{"mn-1", hash_of(901)}, {"mn-2", hash_of(902)}};
+    s.set_signer_fp_fn([&keys](const std::string& k) -> std::optional<uint256> {
+        auto it = keys.find(k);
+        if (it == keys.end()) return std::nullopt;
+        return it->second;
+    });
+    ASSERT_TRUE(s.add_trigger(mk_trig(95, TSH)));
+    s.add_verified_funding_vote(hash_of(95), "mn-1", VOTE_OUTCOME_YES, 1);
+    s.add_verified_funding_vote(hash_of(95), "mn-2", VOTE_OUTCOME_YES, 1);
+    EXPECT_EQ(s.absolute_yes_count(hash_of(95)), 2);
+    EXPECT_TRUE(s.get_best_superblock(TSH).has_value());
+    // ProUpRegTx: mn-2's operator key changes — its old vote no longer verifies.
+    keys["mn-2"] = hash_of(903);
+    EXPECT_EQ(s.absolute_yes_count(hash_of(95)), 1);
+    EXPECT_FALSE(s.get_best_superblock(TSH).has_value());
+    // mn-1 leaves the list.
+    keys.erase("mn-1");
+    EXPECT_EQ(s.absolute_yes_count(hash_of(95)), 0);
+    // A fresh vote under the new key counts again.
+    s.add_verified_funding_vote(hash_of(95), "mn-2", VOTE_OUTCOME_YES, 5);
+    EXPECT_EQ(s.absolute_yes_count(hash_of(95)), 1);
 }
 
 // ── T3. C2/C3 outstanding objects block BOTH verdicts, and clear by cycle ────
@@ -1657,7 +1705,46 @@ TEST(DashSuperblockTriState, ProvenUnfundedHeightServesNormalCoinbase) {
     auto d = st.describe_decline();
     EXPECT_FALSE(d.viable);
     EXPECT_EQ(d.cause, "superblock-refused");
-    EXPECT_EQ(d.value, "trigger-ambiguous");
+    EXPECT_EQ(d.value, "trigger-present");
+}
+
+// ── T6b. MAINNET default: the unfunded verdict is never served ──────────────
+// Without the explicit opt-in (main_dash enables it on testnet only, or with
+// --embedded-superblock-unfunded-mainnet) a PROVEN-unfunded superblock height
+// is still refused — exactly master's behaviour. The Triggered path is not
+// affected.
+TEST(DashSuperblockTriState, MainnetDefaultNeverServesNotTriggered) {
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+    int64_t now = 1'700'000'000;
+    m.on_mn_list_update(single_mn(p2pkh_script(0x30)));
+    m.on_new_tip(SBH - 1, raw256(0xAB), 0x1e0ffff0u, 1'700'000'000u,
+                 140, 19, 1'700'000'100u, 0x20000000u);
+    arm_tristate(m, now);
+    m.set_not_triggered_enabled(false);          // the maintainer's own default
+    {
+        NodeCoinState fresh_st;
+        CoinStateMaintainer fresh(fresh_st);
+        EXPECT_FALSE(fresh.not_triggered_enabled()) << "default must be OFF";
+    }
+    st.set_is_superblock_fn([](uint32_t h) { return h == SBH; });
+    st.set_superblock_resolver([&m](uint32_t h) { return m.superblock_resolution(h); });
+    st.set_require_superblock_provider(true);
+    st.set_superblock_sync_complete_fn([&m]() { return m.gov_sync_complete(); });
+
+    auto r = m.superblock_resolution(SBH);
+    EXPECT_EQ(r.verdict, SuperblockVerdict::Unknown);
+    EXPECT_EQ(r.reason, "not-triggered-disabled");
+    EXPECT_FALSE(st.make_embedded_work_inputs().viable());
+    EXPECT_EQ(st.describe_decline().value, "not-triggered-disabled");
+    EXPECT_EQ(m.gov_not_triggered_served_height(), 0u);
+
+    // A funded trigger still serves (the gate is on the unfunded verdict only).
+    ASSERT_TRUE(m.gov_store().add_trigger(mk_trig(96, static_cast<int32_t>(SBH))));
+    m.gov_store().add_verified_funding_vote(hash_of(96), "mn-1", VOTE_OUTCOME_YES, 1);
+    auto e = st.make_embedded_work_inputs();
+    ASSERT_TRUE(e.viable()) << st.describe_decline().value;
+    EXPECT_EQ(e.superblock_payments.size(), 1u);
 }
 
 // ── T7. C2 at the maintainer: signed-but-unparseable / store-full recorded ───
@@ -1740,8 +1827,8 @@ TEST(DashSuperblockTriState, MaintainerSignatureGateC3) {
     EXPECT_TRUE(m.gov_store().has_trigger(hash_of(83)));
     EXPECT_EQ(m.gov_pending_objects(), 0u);
     EXPECT_EQ(m.gov_store().outstanding_count(), 0u);
-    // A stored trigger with no votes: ambiguous (C1), never "unfunded".
-    EXPECT_EQ(m.superblock_resolution(SBH).reason, "trigger-ambiguous");
+    // A stored trigger with no votes: present (C1), never "unfunded".
+    EXPECT_EQ(m.superblock_resolution(SBH).reason, "trigger-present");
 
     // Unset verifier (production default before wiring): CannotVerify, never stored.
     NodeCoinState st2;
@@ -1793,8 +1880,12 @@ TEST(DashSuperblockTriState, MaintainerVoteResyncAndOrphansC4) {
     auto r = m.superblock_resolution(SBH);
     ASSERT_EQ(r.verdict, SuperblockVerdict::Triggered) << r.reason;
 
-    // C4 legs: tip H - window and H - 1 re-request the held trigger's votes,
-    // nothing in between, never a full sync.
+    // C4 legs: tip H - window (A) and H - late_lead (B = H-3 on testnet)
+    // re-request the held trigger's votes; leg B also re-primes (nProp=0),
+    // H-1 asks nothing (its vote burst would re-open R5 right before H).
+    int reprimes = 0;
+    m.set_on_gov_reprime([&reprimes]() { ++reprimes; });
+    ASSERT_EQ(m.late_lead(), 3);
     auto connect = [&m](uint32_t h) {
         BlockType blk;
         blk.m_txs.push_back(make_cb(500'000'000, p2pkh_script(0x30)));
@@ -1805,9 +1896,10 @@ TEST(DashSuperblockTriState, MaintainerVoteResyncAndOrphansC4) {
         connect(h);
         const size_t want =
             h < SBH - DASH_SUPERBLOCK_MATURITY_WINDOW_TESTNET ? 0u
-            : h < SBH - 1                                     ? 1u
+            : h < SBH - 3                                     ? 1u
                                                               : 2u;
         ASSERT_EQ(resync.size(), want) << "after connecting h=" << h;
+        ASSERT_EQ(reprimes, h < SBH - 3 ? 0 : 1) << "after connecting h=" << h;
     }
     EXPECT_EQ(resync[0], hash_of(85));
     EXPECT_EQ(resync[1], hash_of(85));
@@ -1821,7 +1913,8 @@ TEST(DashSuperblockTriState, ExecutedTriggerIsHistoryAndPruned) {
     m.on_mn_list_update(single_mn(p2pkh_script(0x30)));
     // Restart AFTER the superblock at SBH executed (mainnet tenant: the
     // executed 2558864 trigger re-synced and sat in the store).
-    m.on_new_tip(SBH + 5, raw256(0xAB), 0x1e0ffff0u, 1'700'000'000u,
+    // (Beyond the reorg-keep depth: within it a trigger stays resolvable.)
+    m.on_new_tip(SBH + 40, raw256(0xAB), 0x1e0ffff0u, 1'700'000'000u,
                  140, 19, 1'700'000'100u, 0x20000000u);
     arm_tristate(m, now);
     m.set_object_verifier([](const CoinStateMaintainer::GovObjectContext&) {
@@ -1836,13 +1929,16 @@ TEST(DashSuperblockTriState, ExecutedTriggerIsHistoryAndPruned) {
     EXPECT_EQ(m.gov_orphan_votes(), 0u);
     EXPECT_EQ(m.gov_store().outstanding_count(), 0u);
 
-    // A trigger held for SBH+24 is pruned by the first block past it, even a
-    // NON-superblock block (the restart case never crosses H itself).
-    ASSERT_TRUE(m.gov_store().add_trigger(mk_trig(88, static_cast<int32_t>(SBH) + 24)));
+    // A trigger held for SBH+48 survives the reorg-keep depth past its
+    // height, then is pruned by the next block — even a NON-superblock block
+    // (the restart case never crosses H itself).
+    ASSERT_TRUE(m.gov_store().add_trigger(mk_trig(88, static_cast<int32_t>(SBH) + 48)));
     BlockType blk;
     blk.m_txs.push_back(make_cb(500'000'000, p2pkh_script(0x30)));
     bind_block(blk);
-    m.on_block_connected(blk, SBH + 25);
+    m.on_block_connected(blk, SBH + 48 + 31);
+    EXPECT_EQ(m.gov_store().trigger_count(), 1u) << "kept within the reorg depth";
+    m.on_block_connected(blk, SBH + 48 + 32);
     EXPECT_EQ(m.gov_store().trigger_count(), 0u);
     EXPECT_TRUE(m.gov_store().is_erased(hash_of(88)));
 }
@@ -1919,14 +2015,72 @@ TEST(DashSuperblockTriState, ReverseCheckLatchesOnPaidSuperblockC5) {
     EXPECT_EQ(rig.m.superblock_resolution(SBH2 + 24).reason, "trigger-latched");
 }
 
-TEST(DashSuperblockTriState, ReverseCheckLatchesWhenUnprovableC5) {
+TEST(DashSuperblockTriState, ReverseCheckUnprovableIsLoggedNotLatchedC5) {
     C5Rig rig;
-    // No platform OP_RETURN: the masternode payment cannot be re-derived, so
-    // nothing proves the coinbase superblock-free => latch (fail closed).
+    // No platform OP_RETURN: our own MN view cannot re-derive the payment.
+    // That is not evidence about governance — counted + logged, NOT latched
+    // (MED-5); the latch needs positive evidence of a paid superblock.
     rig.m.on_block_connected(rig.block(1'000'000'000, 3'000'000'000LL, {}, false), SBH2);
-    EXPECT_TRUE(rig.m.gov_desync_latched());
-    EXPECT_NE(rig.m.gov_desync_reason().find("could not be proven"), std::string::npos)
-        << rig.m.gov_desync_reason();
+    EXPECT_FALSE(rig.m.gov_desync_latched()) << rig.m.gov_desync_reason();
+    EXPECT_EQ(rig.m.gov_c5_unverified(), 1u);
+}
+
+TEST(DashSuperblockTriState, ReverseCheckMnViewNotAtParentIsNotLatchedC5) {
+    C5Rig rig;
+    // The payee view is one block behind (not at the parent): not latched.
+    rig.m.on_mn_list_update(single_mn(p2pkh_script(0x30)), SBH2 - 2);
+    rig.m.on_block_connected(
+        rig.block(1'000'000'000, 3'000'000'000LL,
+                  {{500'000'000, std::vector<unsigned char>(kScriptYeRZ.begin(), kScriptYeRZ.end())}}),
+        SBH2);
+    EXPECT_FALSE(rig.m.gov_desync_latched()) << rig.m.gov_desync_reason();
+    EXPECT_EQ(rig.m.gov_c5_unverified(), 1u);
+}
+
+// ── MED-5: the desync latch lasts one following cycle, not until restart ───
+TEST(DashSuperblockTriState, DesyncLatchLiftsAfterTheNextCycle) {
+    C5Rig rig;
+    rig.m.on_block_connected(
+        rig.block(1'000'000'000, 3'000'000'000LL,
+                  {{500'000'000, std::vector<unsigned char>(kScriptYeRZ.begin(), kScriptYeRZ.end())}}),
+        SBH2);
+    ASSERT_TRUE(rig.m.gov_desync_latched());
+    // The whole following cycle refuses...
+    EXPECT_EQ(rig.m.superblock_resolution(SBH2 + 24).reason, "trigger-latched");
+    BlockType nb;
+    nb.m_txs.push_back(make_cb(500'000'000, p2pkh_script(0x30)));
+    bind_block(nb);
+    rig.m.on_block_connected(nb, SBH2 + 10);
+    EXPECT_TRUE(rig.m.gov_desync_latched()) << "not lifted mid-cycle";
+    // ...and the latch lifts once that cycle's superblock has connected.
+    rig.m.on_block_connected(nb, SBH2 + 24);
+    EXPECT_FALSE(rig.m.gov_desync_latched());
+    EXPECT_NE(rig.m.superblock_resolution(SBH2 + 48).reason, "trigger-latched");
+}
+
+// ── MED-5: a reorg re-folding the superblock block sees the same view ──────
+TEST(DashSuperblockTriState, ReorgRefoldOfSuperblockDoesNotFalseLatch) {
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+    m.on_mn_list_update(single_mn(p2pkh_script(0x30)));
+    m.on_new_tip(SBH - 1, raw256(0xAB), 0x1e0ffff0u, 1'700'000'000u,
+                 140, 19, 1'700'000'100u, 0x20000000u);
+    arm_trigger_confident(m);
+    BlockType blk;
+    auto cb = make_cb(500'000'000, p2pkh_script(0x30));
+    ::bitcoin_family::coin::TxOut sb_out;
+    sb_out.value = 500'000'000LL;
+    sb_out.scriptPubKey.m_data.assign(kScriptYeRZ.begin(), kScriptYeRZ.end());
+    cb.vout.push_back(sb_out);
+    blk.m_txs.push_back(cb);
+    bind_block(blk);
+    m.on_block_connected(blk, SBH);
+    ASSERT_FALSE(m.gov_desync_latched());
+    EXPECT_EQ(m.gov_store().trigger_count(), 1u) << "kept for the reorg depth";
+    // The same superblock block is folded again (reorg): still Triggered, still
+    // matching — no NotTriggered re-resolution, no false latch.
+    m.on_block_connected(blk, SBH);
+    EXPECT_FALSE(m.gov_desync_latched()) << m.gov_desync_reason();
 }
 
 TEST(DashSuperblockTriState, ReverseCheckSkippedWhenNeverServableC5) {
@@ -1947,4 +2101,95 @@ TEST(DashSuperblockTriState, ReverseCheckSkippedWhenNeverServableC5) {
     bind_block(blk);
     m.on_block_connected(blk, SBH2);
     EXPECT_FALSE(m.gov_desync_latched());
+}
+
+// ── MED-3: a settled vote is never re-verified and never re-arms R5 ────────
+TEST(DashSuperblockTriState, VerifiedVoteMemoSkipsReverifyAndR5MED3) {
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+    int64_t now = 1'700'000'000;
+    arm_tristate(m, now);
+    int verifies = 0;
+    m.set_vote_verifier([&verifies](const CoinStateMaintainer::GovVoteContext&) {
+        ++verifies;
+        return true;
+    });
+    ASSERT_TRUE(m.gov_store().add_trigger(mk_trig(97, static_cast<int32_t>(SBH))));
+    auto v = fund_vote(hash_of(97), VOTE_OUTCOME_YES);
+    v.vote_id = hash_of(9701);
+    m.on_govvote(v, "mn-1");
+    EXPECT_EQ(verifies, 1);
+    now += 100;
+    ASSERT_TRUE(m.gov_sync_complete());
+    // The per-object re-sync delivers it again: no BLS work, no R5 re-arm.
+    for (int i = 0; i < 50; ++i) m.on_govvote(v, "mn-1");
+    EXPECT_EQ(verifies, 1);
+    EXPECT_EQ(m.gov_votes_memo_hits(), 50u);
+    EXPECT_TRUE(m.gov_sync_complete()) << "a known vote must not reopen the sync";
+    // A NEW vote still counts (and re-arms).
+    auto v2 = fund_vote(hash_of(97), VOTE_OUTCOME_YES);
+    v2.vote_id = hash_of(9702);
+    m.on_govvote(v2, "mn-2");
+    EXPECT_EQ(verifies, 2);
+    EXPECT_FALSE(m.gov_sync_complete());
+    EXPECT_EQ(m.gov_store().absolute_yes_count(hash_of(97)), 2);
+}
+
+// ── LOW-6: orphan-vote BLS work is bounded per peer ─────────────────────────
+TEST(DashSuperblockTriState, OrphanVoteVerifyBudgetPerPeerLOW6) {
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+    int64_t now = 1'700'000'000;
+    arm_tristate(m, now);
+    int verifies = 0;
+    m.set_vote_verifier([&verifies](const CoinStateMaintainer::GovVoteContext&) {
+        ++verifies;
+        return false;                       // junk: every signature is bad
+    });
+    for (uint64_t i = 0; i < 4100; ++i) {
+        auto v = fund_vote(hash_of(20000 + i), VOTE_OUTCOME_YES);
+        v.vote_id = hash_of(30000 + i);
+        v.peer_key = "hostile";
+        v.vch_sig.assign(96, 0x11);           // BLS-shaped junk: costs a pairing
+        m.on_govvote(v, "mn-x");
+    }
+    EXPECT_EQ(verifies, 4096) << "per-peer BLS budget";
+    EXPECT_EQ(m.gov_orphans_dropped(), 4u);
+    EXPECT_EQ(m.gov_store().outstanding_count(), 0u) << "junk never becomes a blocker";
+    auto v = fund_vote(hash_of(40000), VOTE_OUTCOME_YES);
+    v.vote_id = hash_of(40001);
+    v.peer_key = "honest";
+    v.vch_sig.assign(96, 0x22);
+    m.on_govvote(v, "mn-y");
+    EXPECT_EQ(verifies, 4097) << "another peer has its own budget";
+}
+
+// ── LOW-6: startup-window records are re-fetched once the view exists ──────
+TEST(DashSuperblockTriState, StartupHeldRecordsRefetchedWhenViewCurrentLOW6) {
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+    int64_t now = 1'700'000'000;
+    m.on_mn_list_update(single_mn(p2pkh_script(0x30)));
+    m.on_new_tip(SBH - 10, raw256(0xAB), 0x1e0ffff0u, 1'700'000'000u,
+                 140, 19, 1'700'000'100u, 0x20000000u);
+    arm_tristate(m, now);
+    bool current = false;
+    m.set_gov_view_current_fn([&current]() { return current; });
+    std::vector<uint256> fetched;
+    m.set_on_gov_object_fetch([&fetched](const uint256& h) { fetched.push_back(h); });
+    // A held record whose object did not fit the buffer (startup flood).
+    m.gov_store().note_outstanding(hash_of(98), GovOutstandingKind::UnverifiedPending,
+                                   static_cast<int32_t>(SBH));
+    BlockType blk;
+    blk.m_txs.push_back(make_cb(500'000'000, p2pkh_script(0x30)));
+    bind_block(blk);
+    m.on_block_connected(blk, SBH - 9);
+    EXPECT_TRUE(fetched.empty()) << "nothing to gain before the view exists";
+    EXPECT_EQ(m.superblock_resolution(SBH).reason, "trigger-unverified-pending");
+    current = true;
+    m.on_block_connected(blk, SBH - 8);
+    ASSERT_EQ(fetched.size(), 1u);
+    EXPECT_EQ(fetched[0], hash_of(98));
+    EXPECT_EQ(m.gov_store().outstanding_count(), 0u)
+        << "the record is released; the re-fetched object is verified for real";
 }

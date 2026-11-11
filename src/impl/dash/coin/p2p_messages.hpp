@@ -408,6 +408,25 @@ BEGIN_MESSAGE(govsync)
     }
 END_MESSAGE()
 
+// SYNCSTATUSCOUNT ("ssc", Dash Core protocol.cpp / masternode/sync.h): a
+// peer's answer to our govsync — nItemID (int32) + nCount (int32).
+// MASTERNODE_SYNC_GOVOBJ (10) answers the nProp=0 full sync with the number of
+// object invs it relays; MASTERNODE_SYNC_GOVOBJ_VOTE (11) answers a
+// per-object vote sync (net_governance.cpp:144-160).
+inline constexpr int32_t DASH_MASTERNODE_SYNC_GOVOBJ      = 10;
+inline constexpr int32_t DASH_MASTERNODE_SYNC_GOVOBJ_VOTE = 11;
+BEGIN_MESSAGE(ssc)
+    MESSAGE_FIELDS
+    (
+        (int32_t, m_item_id),
+        (int32_t, m_count)
+    )
+    {
+        READWRITE(obj.m_item_id);
+        READWRITE(obj.m_count);
+    }
+END_MESSAGE()
+
 // ── G4 feed: deterministic InstantSend lock (DIP-0022) ────────────────────
 // "isdlock" — dashd instantsend/lock.h InstantSendLock, wire order:
 //   nVersion (u8, ISDLOCK_VERSION == 1; anything else is dropped in the
@@ -683,6 +702,7 @@ using Handler = MessageHandler<
     message_govobj,
     message_govobjvote,
     message_govsync,
+    message_ssc,
     // ⚠ SPORK lane — same registry rule as the DIP-24 pair above (#1077): a
     // handler that exists but whose message type is absent from this list can
     // never run; the payload dies on the unhandled-command path at DEBUG.

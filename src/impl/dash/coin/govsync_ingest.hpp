@@ -48,6 +48,7 @@ wire_govobject_ingest(::dash::interfaces::Node& node,
             o.mn_outpoint_index = r.mn_outpoint_index;
             o.vch_sig           = r.vch_sig;
             o.sig_hash          = r.sig_hash;
+            o.peer_key          = r.peer_key;
             maint.on_govobject(o);
         });
 }
@@ -71,6 +72,8 @@ wire_govvote_ingest(::dash::interfaces::Node& node,
             ctx.time              = r.time;
             ctx.vch_sig           = r.vch_sig;
             ctx.vote_hash         = r.vote_hash;
+            ctx.vote_id           = r.vote_id;
+            ctx.peer_key          = r.peer_key;
             maint.on_govvote(ctx, r.mn_outpoint_key);
         });
 }

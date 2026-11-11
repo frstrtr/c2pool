@@ -242,6 +242,7 @@ struct Node
         uint32_t             mn_outpoint_index{0};
         std::vector<uint8_t> vch_sig;
         uint256              sig_hash;      // govobject_signature_hash
+        std::string          peer_key;      // session that delivered it
     };
     Event<GovObjectRecord> new_govobject;
 
@@ -265,6 +266,8 @@ struct Node
         int64_t              time{0};
         std::vector<uint8_t> vch_sig;            // BLS operator-key sig (verify seam)
         uint256              vote_hash;          // govvote_signature_hash (signed digest)
+        uint256              vote_id;            // govvote_identity_hash (== inv hash)
+        std::string          peer_key;           // session that delivered it
     };
     Event<GovVoteRecord> new_govvote;
 

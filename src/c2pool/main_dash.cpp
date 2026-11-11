@@ -616,6 +616,8 @@ void print_banner(const char* argv0)
         << "           [--external-ip ADDR]\n"
         << "           [--embedded-utxo[=false]] [--embedded-mainnet[=false]] [--embedded-null-arm[=false]]\n"
         << "           [--embedded-superblock[=false]] [--embedded-include-mn-special-txs[=false]]\n"
+        << "           [--embedded-superblock-unfunded-mainnet]  (MAINNET opt-in: serve a PROVEN-unfunded\n"
+        << "              superblock height with a normal coinbase; default OFF = refuse, testnet always on)\n"
         << "           [--embedded-accrue-asset-locks[=false]] [--embedded-mn-bridge-max N]\n"
         << "           [--embedded-asn-diversity]\n"
         << "           [--embedded-mn-bridge-no-cursor]\n"
@@ -1339,7 +1341,13 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
              // re-folds and rejects on root drift, so an included special tx
              // always commits a folded MN root. Default false = today's
              // exclude-all (coinbase-only body for special txs).
-             bool embedded_include_mn_special_txs = false)
+             bool embedded_include_mn_special_txs = false,
+             // --embedded-superblock-unfunded-mainnet: explicit MAINNET opt-in
+             // for serving a PROVEN-unfunded superblock height (NotTriggered,
+             // normal coinbase). Default OFF: on mainnet every superblock height
+             // without a funded trigger refuses (master's behaviour). Testnet
+             // serves NotTriggered without it. Never implied by any other flag.
+             bool embedded_superblock_unfunded_mainnet = false)
 {
     namespace io = boost::asio;
 
@@ -6550,6 +6558,17 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 maintainer->set_superblock_maturity_window(
                     testnet ? dash::coin::DASH_SUPERBLOCK_MATURITY_WINDOW_TESTNET
                             : dash::coin::DASH_SUPERBLOCK_MATURITY_WINDOW_MAINNET);
+                // MAINNET GATE: NotTriggered is served on testnet; on mainnet
+                // only with the explicit opt-in flag (default OFF => Unknown
+                // "not-triggered-disabled" => refuse, master's behaviour).
+                maintainer->set_not_triggered_enabled(testnet || embedded_superblock_unfunded_mainnet);
+                if (!testnet && embedded_superblock_unfunded_mainnet)
+                    LOG_WARNING << "[E-SUPERBLOCK] --embedded-superblock-unfunded-mainnet SET: "
+                                   "this MAINNET node will serve a superblock height with a "
+                                   "NORMAL coinbase when it PROVES no trigger is funded (R5 "
+                                   "answered coverage from >= "
+                                << dash::coin::DASH_GOVSYNC_MIN_PEERS_DEFAULT
+                                << " peers + strict absence). A wrong proof loses the block.";
                 // R5 GOVSYNC-COMPLETENESS GATE (production wiring). Model:
                 // dashcore CMasternodeSync governance-phase completion — the
                 // view is COMPLETE only when the governance set was requested
@@ -6696,6 +6715,24 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                             return dash::coin::gov_vote_weight_for_key(
                                 std::as_const(*ncs).mnstates(), key);
                         });
+
+                    // MED-4 RemoveInvalidVotes parity: a stored vote counts
+                    // only while the voter's CURRENT operator key is the one it
+                    // verified under (a ProUpRegTx key change or removal from
+                    // the list drops it in dashd, governance.cpp:1180-1226).
+                    maintainer->gov_store().set_signer_fp_fn(
+                        [ncs](const std::string& key) -> std::optional<uint256> {
+                            return dash::coin::gov_operator_fp_for_key(
+                                std::as_const(*ncs).mnstates(), key);
+                        });
+
+                    // LOW-6: "the DMN view has folded the serve tip" — held
+                    // startup-window trigger records are re-fetched once true.
+                    maintainer->set_gov_view_current_fn([ncs]() {
+                        const auto& mns = std::as_const(*ncs).mnstates();
+                        return ncs->prev_height() != 0 &&
+                               mns.last_applied_height() >= ncs->prev_height();
+                    });
                 }
 
                 // Reconciled log (R5 completeness gate + R3 vote-verify both wired).
@@ -8844,7 +8881,21 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // request (repeat => Misbehaving(20)): nFulfilledRequestExpireTime is
         // 3600 s on mainnet and 300 s on testnet (chainparams.cpp), + margin.
         coin_p2p->set_govsync_votes_resync_secs(testnet ? 360 : 3660);
+        // R5 coverage = ANSWERED peers only (ssc(GOVOBJ) + every announced
+        // object received), never "requested".
+        coin_p2p->set_on_govsync_coverage(
+            [maint = maintainer.get()](const std::string& pk, bool covered) {
+                if (covered) maint->note_govsync_answered(pk);
+                else         maint->note_govsync_unanswered(pk);
+            });
         if (embedded_govsync || embedded_superblock) {
+            // Leg B fresh nProp=0 re-prime inside the maturity window (the
+            // client keeps it to at most once per hour per peer).
+            maintainer->set_on_gov_reprime(
+                [cp = coin_p2p.get(), maint = maintainer.get()]() {
+                    for (const auto& pk : cp->send_govsync_prime())
+                        maint->note_govsync_requested(pk);
+                });
             maintainer->set_on_trigger_vote_resync(
                 [cp = coin_p2p.get()](const uint256& h) { cp->send_govsync(h); });
             maintainer->set_on_gov_object_fetch(
@@ -12472,6 +12523,7 @@ int main(int argc, char** argv)
     bool embedded_superblock = false;
     bool embedded_superblock_off = false;      // --embedded-superblock=false
     bool allow_stub_bls = false;               // --allow-stub-bls (#1671): run a bls=stub build knowingly in a BLS-relying config
+    bool embedded_superblock_unfunded_mainnet = false; // --embedded-superblock-unfunded-mainnet: explicit mainnet NotTriggered opt-in (default OFF)
     bool embedded_govsync = false;             // --embedded-govsync: OBSERVE-ONLY arm of the governance sourcing lane (inv 17/18 pull + store populate); default OFF; does NOT arm serving (that is --embedded-superblock)
     std::string stratum_host = "0.0.0.0";      // --stratum [HOST:]PORT bind interface (default all)
     uint16_t    stratum_port = 0;              // 0 disables the Stratum accept-loop; --stratum sets it
@@ -12741,6 +12793,8 @@ int main(int argc, char** argv)
             allow_stub_bls = true;                  // #1671: run bls=stub knowingly (see the refuse-to-start gate before run_node)
         else if (std::strcmp(argv[i], "--embedded-govsync") == 0)
             embedded_govsync = true;
+        else if (std::strcmp(argv[i], "--embedded-superblock-unfunded-mainnet") == 0)
+            embedded_superblock_unfunded_mainnet = true;
         else if (std::strcmp(argv[i], "--embedded-utxo") == 0)
             embedded_utxo = true;
         else if (std::strcmp(argv[i], "--embedded-utxo=false") == 0)
@@ -13639,7 +13693,8 @@ int main(int argc, char** argv)
                         embedded_utxo_fold_fees_db,    // W5-A fold fee source
                         embedded_utxo_fold_expect,     // W5-A anchor restatement
                         explorer_enabled,             // /api/explorer surface (default ON)
-                        embedded_include_mn_special_txs); // special-tx superset (DIP types 1-4)
+                        embedded_include_mn_special_txs, // special-tx superset (DIP types 1-4)
+                        embedded_superblock_unfunded_mainnet); // explicit mainnet NotTriggered opt-in
     }
     return run_selftest();
 }

@@ -89,10 +89,30 @@ public:
     void note_govsync_requested(const std::string& peer_key, int64_t now) {
         if (m_first_request_time == 0) m_first_request_time = now;
         m_requested_peers.insert(peer_key);
+        // A (re-)prime re-opens this peer's proof: coverage counts only once
+        // the peer has ANSWERED this request (note_govsync_answered).
+        m_answered_peers.erase(peer_key);
         // A new request re-arms the quiescence window (dashcore bumps
         // nTimeLastBumped when it (re)asks a peer): we must not call a view
         // "quiesced" the instant after asking a fresh peer.
         if (now > m_last_activity_time) m_last_activity_time = now;
+    }
+
+    /// `peer_key` ANSWERED our govsync: it sent SYNCSTATUSCOUNT(GOVOBJ, n),
+    /// announced >= n objects on this connection and every one of them has
+    /// been received (the coin-P2P client's coverage proof — CoinClient
+    /// GovPeerSync). Only answered peers count toward min_peers: a pruned,
+    /// -disablegovernance or not-yet-synced dashd never answers
+    /// (net_governance.cpp:86-91), so a request alone proves nothing and an
+    /// empty store behind silent peers must never read as complete.
+    void note_govsync_answered(const std::string& peer_key, int64_t now) {
+        m_answered_peers.insert(peer_key);
+        if (now > m_last_activity_time) m_last_activity_time = now;
+    }
+    /// The peer's proof lapsed (disconnected, re-primed, a newly announced
+    /// object not yet received).
+    void note_govsync_unanswered(const std::string& peer_key) {
+        m_answered_peers.erase(peer_key);
     }
 
     /// A governance OBJECT (govobj) arrived at `now` — the stream is still
@@ -115,6 +135,7 @@ public:
     /// re-quiesces — a re-proof obligation, never trust a torn view.
     void reset() {
         m_requested_peers.clear();
+        m_answered_peers.clear();
         m_first_request_time = 0;
         m_last_activity_time = 0;
         m_objects = 0;
@@ -123,7 +144,8 @@ public:
 
     /// The completeness determination. TRUE only when ALL hold:
     ///   1. at least one govsync was requested (m_first_request_time set), AND
-    ///   2. the governance set was requested from >= min_peers DISTINCT peers, AND
+    ///   2. >= min_peers DISTINCT peers ANSWERED it (note_govsync_answered —
+    ///      requested-but-silent peers do not count), AND
     ///   3. the settle floor has elapsed since the first request, AND
     ///   4. no new object/vote has arrived for >= quiesce window (quiesced).
     /// Anything else (default, mid-sync, under-covered, not-yet-quiesced) is
@@ -139,7 +161,7 @@ public:
     /// defends the latter, which is why it is never lowered by default.
     bool is_complete(int64_t now) const {
         if (m_first_request_time == 0) return false;               // never asked
-        if (m_requested_peers.size() < m_min_peers) return false;  // under-covered
+        if (m_answered_peers.size() < m_min_peers) return false;   // under-covered
         if (now - m_first_request_time < m_settle_secs) return false;   // not settled
         if (now - m_last_activity_time < m_quiesce_secs) return false;  // not quiesced
         return true;
@@ -147,6 +169,7 @@ public:
 
     // ── observability (logs / tests) ────────────────────────────────────────
     size_t   requested_peer_count() const { return m_requested_peers.size(); }
+    size_t   answered_peer_count() const { return m_answered_peers.size(); }
     uint64_t object_count() const { return m_objects; }
     uint64_t vote_count() const { return m_votes; }
     int64_t  first_request_time() const { return m_first_request_time; }
@@ -154,6 +177,7 @@ public:
 
 private:
     std::set<std::string> m_requested_peers;
+    std::set<std::string> m_answered_peers;
     int64_t m_first_request_time{0};
     int64_t m_last_activity_time{0};
     uint64_t m_objects{0};

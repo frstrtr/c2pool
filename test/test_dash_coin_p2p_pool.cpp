@@ -61,6 +61,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <map>
 #include <memory>
 #include <set>
 #include <string>
@@ -980,6 +981,10 @@ TEST(DashCoinP2PPool, govsync_prime_returned_keys_drive_R5_to_two_peer_completen
     rig.use_fake_clock();
     rig.fake_now = t0;
     rig.client.set_max_peers(2);
+    rig.client.set_on_govsync_coverage([&](const std::string& pk, bool covered) {
+        if (covered) gov.note_govsync_answered(pk, rig.fake_now);
+        else         gov.note_govsync_unanswered(pk);
+    });
 
     // First peer handshakes and is primed -> record its returned key.
     rig.handshake(1);
@@ -996,13 +1001,22 @@ TEST(DashCoinP2PPool, govsync_prime_returned_keys_drive_R5_to_two_peer_completen
         gov.note_govsync_requested(pk, rig.fake_now);
     EXPECT_EQ(gov.requested_peer_count(), 2u)
         << "two handshakes did not accrue two DISTINCT primed peers";
+    // Requested is NOT coverage: two silent peers (pruned / -disablegovernance
+    // / unsynced dashd never answer) must never make the view complete.
+    EXPECT_FALSE(gov.is_complete(t0 + 10'000))
+        << "requested-but-silent peers counted as coverage";
 
+    // Both ANSWER the prime: SYNCSTATUSCOUNT(GOVOBJ, 0) — an empty governance
+    // set, nothing announced, nothing pending.
+    rig.deliver(1, p2p::message_ssc::make_raw(p2p::DASH_MASTERNODE_SYNC_GOVOBJ, 0));
+    rig.deliver(2, p2p::message_ssc::make_raw(p2p::DASH_MASTERNODE_SYNC_GOVOBJ, 0));
+    EXPECT_EQ(gov.answered_peer_count(), 2u);
     // Not settled yet (60s floor since first request).
     EXPECT_FALSE(gov.is_complete(t0 + 30));
     // After the settle floor AND the quiescence window with no new arrivals, the
-    // >=2-peer view is COMPLETE — the serve path may now trust the store.
+    // >=2-peer ANSWERED view is COMPLETE — the serve path may now trust it.
     EXPECT_TRUE(gov.is_complete(t0 + 61 + 30))
-        << "a >=2-peer, settled, quiesced governance view was not declared complete";
+        << "a >=2-peer answered, settled, quiesced governance view was not declared complete";
 }
 
 // ── VERACK-DRIVEN PRIME: every handshaked peer covered, once, per session ─────
@@ -1039,6 +1053,10 @@ TEST(DashCoinP2PPool, verack_primes_every_handshaked_peer_for_R5_coverage)
     rig.client.set_gov_pull(true);                     // = --embedded-govsync armed
     rig.client.set_on_govsync_primed(
         [&](const std::string& pk){ gov.note_govsync_requested(pk, rig.fake_now); });
+    rig.client.set_on_govsync_coverage([&](const std::string& pk, bool covered) {
+        if (covered) gov.note_govsync_answered(pk, rig.fake_now);
+        else         gov.note_govsync_unanswered(pk);
+    });
 
     // The FUTURE PRIMARY (first verack) is primed at its own handshake — not
     // gated behind primary election.
@@ -1066,11 +1084,15 @@ TEST(DashCoinP2PPool, verack_primes_every_handshaked_peer_for_R5_coverage)
     EXPECT_TRUE(rig.client.send_govsync_prime().empty())
         << "a peer was left unprimed by the verack path (residual drive gap)";
 
-    // >=2 DISTINCT primed peers -> the min_peers=2 floor is crossable; after the
-    // settle floor AND quiescence the view flips COMPLETE -> gov_complete=1.
+    // >=2 DISTINCT primed peers are NOT yet coverage: neither has answered.
+    EXPECT_FALSE(gov.is_complete(t0 + 10'000)) << "silent primed peers counted";
+    // Both answer -> the min_peers=2 floor is crossable; after the settle floor
+    // AND quiescence the view flips COMPLETE -> gov_complete=1.
+    rig.deliver(1, p2p::message_ssc::make_raw(p2p::DASH_MASTERNODE_SYNC_GOVOBJ, 0));
+    rig.deliver(2, p2p::message_ssc::make_raw(p2p::DASH_MASTERNODE_SYNC_GOVOBJ, 0));
     EXPECT_FALSE(gov.is_complete(t0 + 30)) << "settled before the 60s floor";
     EXPECT_TRUE(gov.is_complete(t0 + 5 + 61 + 30))
-        << "a >=2-peer settled quiesced governance view was not declared complete";
+        << "a >=2-peer answered settled quiesced governance view was not declared complete";
 }
 
 TEST(DashCoinP2PPool, primary_election_does_not_double_prime_the_primary)
@@ -2267,4 +2289,119 @@ TEST(DashCoinP2PPool, inv_dedup_forget_type_only_drops_that_type)
     EXPECT_EQ(d.size(), d.index_size()) << "queue/index lockstep (leak invariant)";
     EXPECT_EQ(d.size(), 1u);
     EXPECT_TRUE(d.admit(VOTE, a, 103)) << "a forgotten vote inv is pulled again";
+}
+
+
+// ── HIGH-1: govsync coverage = ANSWERED, and every announced object received ──
+namespace {
+std::unique_ptr<RawMessage> gov_obj_inv(const uint256& h)
+{
+    return p2p::message_inv::make_raw(std::vector<p2p::inventory_type>{
+        p2p::inventory_type(p2p::inventory_type::govobject, h)});
+}
+// A proposal-type governance object and its identity hash (what the inv
+// announces and the handler recomputes).
+struct GovObjFixture {
+    std::vector<uint8_t> data;
+    int64_t              time{1700000000};
+    uint256 hash() const {
+        return dash::coin::govobject_hash(uint256(), 1, time, data, uint256(), 0xffffffffu, {});
+    }
+    std::unique_ptr<RawMessage> msg() const {
+        p2p::GovOutPoint op;
+        op.hash = uint256();
+        op.index = 0xffffffffu;
+        return p2p::message_govobj::make_raw(uint256(), 1, time, uint256(), data,
+                                             int32_t{1}, op, std::vector<uint8_t>{});
+    }
+};
+} // namespace
+
+TEST(DashCoinP2PPool, govsync_coverage_requires_answer_and_every_announced_object)
+{
+    PoolRig rig;
+    rig.use_fake_clock();
+    rig.client.set_max_peers(2);
+    rig.client.set_gov_pull(true);                      // primes at verack
+    std::map<std::string, bool> covered;
+    rig.client.set_on_govsync_coverage(
+        [&](const std::string& pk, bool c) { covered[pk] = c; });
+    rig.handshake(1);
+    rig.handshake(2);
+    const auto k1 = PoolRig::peer_key(1), k2 = PoolRig::peer_key(2);
+
+    // Primed, silent: never covered, however long we wait.
+    rig.run_seconds(120);
+    EXPECT_FALSE(rig.client.gov_peer_covered(k1));
+    EXPECT_FALSE(rig.client.gov_peer_covered(k2));
+
+    GovObjFixture a{std::vector<uint8_t>{'{', '}'}};
+    GovObjFixture b{std::vector<uint8_t>{'[', ']'}};
+    // Peer 1 answers "2 objects" before relaying them: not covered yet.
+    rig.deliver(1, p2p::message_ssc::make_raw(p2p::DASH_MASTERNODE_SYNC_GOVOBJ, 2));
+    EXPECT_FALSE(rig.client.gov_peer_covered(k1)) << "ssc alone is not coverage";
+    rig.deliver(1, gov_obj_inv(a.hash()));
+    rig.deliver(1, gov_obj_inv(b.hash()));
+    EXPECT_FALSE(rig.client.gov_peer_covered(k1)) << "announced but not received";
+    rig.deliver(1, a.msg());
+    EXPECT_FALSE(rig.client.gov_peer_covered(k1)) << "one object still pending";
+    rig.deliver(1, b.msg());
+    EXPECT_TRUE(rig.client.gov_peer_covered(k1));
+    EXPECT_TRUE(covered[k1]);
+
+    // Peer 2 claims 3 objects but only ever announces the 2 we hold: its
+    // proof never closes (it announced fewer than it said it has).
+    rig.deliver(2, p2p::message_ssc::make_raw(p2p::DASH_MASTERNODE_SYNC_GOVOBJ, 3));
+    rig.deliver(2, gov_obj_inv(a.hash()));
+    rig.deliver(2, gov_obj_inv(b.hash()));
+    EXPECT_FALSE(rig.client.gov_peer_covered(k2));
+    EXPECT_EQ(rig.client.gov_covered_peer_count(), 1u);
+
+    // A re-prime re-opens the proof: peer 1 must answer again.
+    rig.client.set_govsync_reprime_secs(0);
+    rig.client.send_govsync_prime();
+    EXPECT_FALSE(rig.client.gov_peer_covered(k1));
+    EXPECT_FALSE(covered[k1]);
+    // Its inv-known filter suppresses re-announcing what it already sent us:
+    // the per-connection announced set still satisfies the count.
+    rig.deliver(1, p2p::message_ssc::make_raw(p2p::DASH_MASTERNODE_SYNC_GOVOBJ, 2));
+    EXPECT_TRUE(rig.client.gov_peer_covered(k1));
+}
+
+// ── HIGH-2: a silent first announcer cannot starve a governance object ───────
+TEST(DashCoinP2PPool, gov_pull_retries_from_another_announcer_after_timeout)
+{
+    PoolRig rig;
+    rig.use_fake_clock();
+    rig.client.set_max_peers(2);
+    rig.client.set_gov_pull(true);
+    rig.client.set_gov_pull_timing(/*timeout=*/20, /*giveup=*/600);
+    rig.handshake(1);
+    rig.handshake(2);
+    GovObjFixture a{std::vector<uint8_t>{'{', '}'}};
+
+    const uint64_t s1 = rig.session(1)->msgs_sent;
+    const uint64_t s2 = rig.session(2)->msgs_sent;
+    rig.deliver(1, gov_obj_inv(a.hash()));          // first announcer: asked
+    rig.deliver(2, gov_obj_inv(a.hash()));          // second: remembered, not asked
+    EXPECT_EQ(rig.session(1)->msgs_sent, s1 + 1u);
+    EXPECT_EQ(rig.session(2)->msgs_sent, s2);
+    EXPECT_EQ(rig.client.gov_inflight_count(), 1u);
+
+    // Peer 1 stays silent past the timeout: the pull moves to peer 2.
+    rig.run_seconds(21);
+    EXPECT_GE(rig.session(2)->msgs_sent, s2 + 1u) << "not re-asked from the other announcer";
+    EXPECT_EQ(rig.client.gov_pull_retried_count(), 1u);
+    rig.deliver(2, a.msg());
+    EXPECT_EQ(rig.client.gov_inflight_count(), 0u);
+
+    // A notfound from the asked peer hands the pull over on the next tick.
+    GovObjFixture b{std::vector<uint8_t>{'[', ']'}};
+    rig.deliver(1, gov_obj_inv(b.hash()));
+    rig.deliver(2, gov_obj_inv(b.hash()));
+    const uint64_t s2b = rig.session(2)->msgs_sent;
+    rig.deliver(1, p2p::message_notfound::make_raw(std::vector<p2p::inventory_type>{
+        p2p::inventory_type(p2p::inventory_type::govobject, b.hash())}));
+    rig.run_seconds(1);
+    EXPECT_GE(rig.session(2)->msgs_sent, s2b + 1u) << "notfound did not hand the pull over";
 }
