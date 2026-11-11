@@ -2633,11 +2633,21 @@ TEST(DashServeGateNamesRefusal, SuperblockVerdictDriftFailsPreEmit) {
     st.set_require_superblock_provider(true);
     st.set_superblock_sync_complete_fn([]() { return true; });
 
-    // Proven unfunded: served, normal coinbase, passes the gate.
+    // Proven unfunded: served, normal coinbase, and the template clears the
+    // gate's superblock checks. (The shared harness seeds a NULL bestCL
+    // signature — set_best_cl(H-1, {}) — so this baseline is stopped LATER in
+    // the gate by emit-bestcl-null-committed; the superblock checks run before
+    // it, so the drift assertions below are unaffected.)
     WorkSelection sel = st.select_work([] { return DashWorkData{}; });
     ASSERT_EQ(sel.source, WorkSource::Embedded) << st.describe_decline().value;
     EXPECT_EQ(sel.work.m_tx_serve_stamp.superblock_total, 0u);
-    EXPECT_TRUE(st.embedded_template_emit_ok(sel.work));
+    {
+        DeclineReport base;
+        const bool ok = st.embedded_template_emit_ok(sel.work, &base);
+        EXPECT_TRUE(ok || base.cause == "emit-bestcl-null-committed")
+            << "baseline must pass every superblock check; cause=" << base.cause;
+        EXPECT_EQ(base.cause.rfind("emit-superblock", 0), std::string::npos) << base.cause;
+    }
 
     // The network's trigger gets funded before emit: discard, named.
     verdict.verdict = SuperblockVerdict::Triggered;
