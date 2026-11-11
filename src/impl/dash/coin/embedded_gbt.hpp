@@ -186,6 +186,59 @@ inline bool spends_earlier_in_set(const MutableTransaction& tx,
     return false;
 }
 
+/// The first input of `tx` that spends an output of a MEMPOOL transaction not
+/// in `in_body` (the txids placed before `tx`); nullopt when there is none.
+/// Such an output exists neither on chain (its tx is unconfirmed) nor in the
+/// block before `tx`, so a block carrying `tx` is
+/// bad-txns-inputs-missingorspent. Shared by the builder's topology pass and
+/// the pre-emit gate (node_coin_state.hpp).
+template <typename Tx>
+inline std::optional<uint256> unserved_mempool_parent(const Tx& tx,
+                                                      const std::set<uint256>& in_body,
+                                                      const Mempool& mempool)
+{
+    for (const auto& vin : tx.vin)
+        if (!in_body.count(vin.prevout.hash) && mempool.contains(vin.prevout.hash))
+            return vin.prevout.hash;
+    return std::nullopt;
+}
+
+/// Topology pass over the mempool range: drop, with its fee, every selected
+/// tx that spends an output of a mempool tx not earlier in the range
+/// (unserved_mempool_parent). Walking in body order takes every descendant of
+/// a dropped tx out as well: its input names the dropped txid, which is still
+/// in the mempool and no longer in the body. The txs placed before the range
+/// (type-6 commitments, pinned local txs, type-9 unlocks) are not mempool
+/// txs, so the range alone decides; a mempool tx that is also one of those
+/// would only make the pass drop more, never less. Returns how many it
+/// dropped.
+template <typename Fees>
+inline size_t drop_txs_spending_unserved_mempool_parents(
+    std::vector<Mempool::SelectedTx>& selected, Fees& total_fees,
+    const Mempool& mempool, uint32_t height)
+{
+    std::set<uint256> in_body;
+    size_t kept = 0, dropped = 0;
+    for (size_t i = 0; i < selected.size(); ++i) {
+        const uint256 id = dash::coin::dash_txid(selected[i].tx);
+        if (const auto parent = unserved_mempool_parent(selected[i].tx, in_body, mempool)) {
+            total_fees -= selected[i].fee;
+            ++dropped;
+            LOG_WARNING << "[GBT-EMB] excluding tx " << id.GetHex().substr(0, 16)
+                        << " from template h=" << height
+                        << ": it spends an output of mempool tx "
+                        << parent->GetHex().substr(0, 16)
+                        << ", which the template does not carry";
+            continue;
+        }
+        in_body.insert(id);
+        if (kept != i) selected[kept] = std::move(selected[i]);
+        ++kept;
+    }
+    selected.resize(kept);
+    return dropped;
+}
+
 /// Append only — the caller must already hold an ok PinVerdict for THIS height.
 inline void pin_append(DashWorkData& w, const MutableTransaction& pin)
 {
@@ -919,6 +972,14 @@ inline DashWorkData build_embedded_workdata(
         }
         selected.resize(kept);
     }
+    // Topology, defence in depth: whatever a filter above dropped, no selected
+    // tx may spend an output of a mempool tx the template does not carry.
+    // Every later stage that drops a tx takes its in-body descendants with it
+    // (the MN-list fold loop and its degrade branch, service-update ordering)
+    // or drops a tx without outputs (MNHF signals), and running here, before
+    // the MN-list fold, keeps the committed merkleRootMNList the root of the
+    // body actually served. The pre-emit gate re-checks the final body.
+    drop_txs_spending_unserved_mempool_parents(selected, total_fees, mempool, prev_height + 1);
     // S2: is each admitted inject in this body? One RIDES / HELD line per
     // inject per height (telemetry only; the body is untouched).
     log_inject_rides(mempool, selected, prev_height + 1, suppress_mempool_txs);

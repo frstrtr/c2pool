@@ -1887,6 +1887,30 @@ public:
                               "mn=" + protx.GetHex().substr(0, 12),
                               "no-template-tx-spends-mn-collateral");
         }
+        // Body topology: no body tx may spend an output of a mempool tx that
+        // is not earlier in the body. That output exists neither on chain nor
+        // in the block, so a won block is bad-txns-inputs-missingorspent. The
+        // builder drops such txs (drop_txs_spending_unserved_mempool_parents);
+        // re-asserted here on the final body, because nothing else checks
+        // input topology: the tx-serve referee checks fees, fee-fold proofs
+        // and double-spends, and the other checks here are CbTx and list
+        // checks. The builder's txids are used when they line up with the
+        // body (they are the ids the header's merkle root commits).
+        {
+            const bool ids_aligned = w.m_tx_hashes.size() == w.m_txs.size();
+            std::set<uint256> in_body;
+            for (size_t i = 0; i < w.m_txs.size(); ++i) {
+                const auto& tx = w.m_txs[i];
+                const uint256 id = ids_aligned ? w.m_tx_hashes[i]
+                                               : dash_txid(MutableTransaction(tx));
+                if (const auto parent = unserved_mempool_parent(tx, in_body, m_mempool))
+                    return reject("emit-tx-spends-unserved-mempool-parent",
+                                  "tx=" + id.GetHex().substr(0, 12)
+                                      + ":parent=" + parent->GetHex().substr(0, 12),
+                                  "every-mempool-parent-earlier-in-body");
+                in_body.insert(id);
+            }
+        }
         // MNHF signals (type 7): every one the body carries must pass Dash
         // Core's CheckMNHFTx and the block's duplicate rules (mnhf_check.hpp).
         // A signal never pays a fee, so this re-check only refuses.

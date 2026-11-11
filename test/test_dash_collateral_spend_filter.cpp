@@ -342,3 +342,121 @@ TEST(DashCollateralSpendFilter, ExcludedSpendTakesItsChildAndGrandchildOut) {
             << "daemonless=" << daemonless << ": the dropped fees must leave the coinbase";
     }
 }
+
+// ════════════════════════════════════════════════════════════════════════
+// TOPOLOGY, defence in depth: a body tx that spends an output of a mempool tx
+// the body does not carry before it. The builder drops it (and, by the same
+// rule, its descendants) with their fees; the pre-emit gate refuses a final
+// body that still carries one. Neither the tx-serve referee nor any other
+// gate checked input topology, which is how an orphaned child of an excluded
+// collateral spend could reach a miner.
+// ════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+// P (chain-funded), its child C, C's child G, and an independent U, all in
+// the mempool; fees 10'000 each.
+struct Chain {
+    UTXOViewCache utxo{nullptr};
+    Mempool mp;
+    MutableTransaction p, c, g, u;
+    Chain()
+    {
+        mp.set_utxo(&utxo);
+        const uint256 fp = mint_hash(0x61), fu = mint_hash(0x62);
+        utxo.add_coin(Outpoint(fp, 0), Coin(1'000'000, {}, 1, false));
+        utxo.add_coin(Outpoint(fu, 0), Coin(1'000'000, {}, 1, false));
+        p = make_spend(fp, 0, 990'000, 11);
+        c = make_spend(dash::coin::dash_txid(p), 0, 980'000, 12);
+        g = make_spend(dash::coin::dash_txid(c), 0, 970'000, 13);
+        u = make_spend(fu, 0, 990'000, 14);
+        for (const auto* t : {&p, &c, &g, &u}) EXPECT_TRUE(mp.add_tx(*t));
+    }
+};
+
+std::vector<Mempool::SelectedTx> selection(std::initializer_list<const MutableTransaction*> txs)
+{
+    std::vector<Mempool::SelectedTx> out;
+    for (const auto* t : txs) out.push_back(Mempool::SelectedTx{*t, 10'000, 200});
+    return out;
+}
+
+} // namespace
+
+TEST(DashBodyTopology, BuilderPassDropsATxWhoseMempoolParentIsNotServed) {
+    Chain ch;
+    using dash::coin::drop_txs_spending_unserved_mempool_parents;
+
+    // P left out: C and, through C, G go with their fees; U stays.
+    auto sel = selection({&ch.u, &ch.c, &ch.g});
+    uint64_t fees = 30'000;
+    EXPECT_EQ(drop_txs_spending_unserved_mempool_parents(sel, fees, ch.mp, H), 2u);
+    ASSERT_EQ(sel.size(), 1u);
+    EXPECT_EQ(dash::coin::dash_txid(sel[0].tx), dash::coin::dash_txid(ch.u));
+    EXPECT_EQ(fees, 10'000u);
+
+    // The whole chain, parents first: nothing to drop.
+    auto full = selection({&ch.p, &ch.c, &ch.g, &ch.u});
+    fees = 40'000;
+    EXPECT_EQ(drop_txs_spending_unserved_mempool_parents(full, fees, ch.mp, H), 0u);
+    EXPECT_EQ(full.size(), 4u);
+    EXPECT_EQ(fees, 40'000u);
+
+    // A child placed before its parent is dropped, its own child with it.
+    auto reversed = selection({&ch.c, &ch.p, &ch.g});
+    fees = 30'000;
+    EXPECT_EQ(drop_txs_spending_unserved_mempool_parents(reversed, fees, ch.mp, H), 2u);
+    ASSERT_EQ(reversed.size(), 1u);
+    EXPECT_EQ(dash::coin::dash_txid(reversed[0].tx), dash::coin::dash_txid(ch.p));
+    EXPECT_EQ(fees, 10'000u);
+}
+
+TEST(DashBodyTopology, EmitGateRefusesABodyTxWhoseMempoolParentIsNotEarlier) {
+    const uint256 prev_hash = raw256(0xAB);
+    auto seed = mn_set_with_collateral(raw256(0xC0), 0);
+    std::vector<CSimplifiedMNListEntry> entries;
+    for (uint8_t b : {0x01, 0x02}) {
+        CSimplifiedMNListEntry e;
+        e.nVersion = CSimplifiedMNListEntry::VER_BASIC_BLS;
+        e.proRegTxHash = raw256(b);
+        e.confirmedHash = raw256(0x77);
+        e.isValid = true;
+        entries.push_back(e);
+    }
+    CSimplifiedMNList sml(std::move(entries));
+
+    UTXOViewCache utxo(nullptr);
+    NodeCoinState st;
+    st.set_require_sml(true);
+    st.sml() = sml;
+    st.set_have_sml(true);
+    st.set_sml_current_hash(prev_hash);
+    st.mnstates().load(seed.snapshot(), H - 1);
+    st.mempool().set_utxo(&utxo);
+    st.set_tip(H - 1, prev_hash, 0x1b104be3u, 1'700'000'000u,
+               DASH_PUBKEY_VER, DASH_P2SH_VER);
+    const uint256 fp = mint_hash(0x61);
+    utxo.add_coin(Outpoint(fp, 0), Coin(1'000'000, {}, 1, false));
+    const auto p = make_spend(fp, 0, 990'000, 11);
+    const auto c = make_spend(dash::coin::dash_txid(p), 0, 980'000, 12);
+    ASSERT_TRUE(st.mempool().add_tx(p));
+    ASSERT_TRUE(st.mempool().add_tx(c));
+
+    auto body = [&](std::initializer_list<const MutableTransaction*> txs) {
+        DashWorkData w;
+        auto cb = build_embedded_cbtx(H - 1, sml, st.qmgr(),
+                                      0, std::array<uint8_t, 96>{}, 0, nullptr);
+        w.m_coinbase_payload = encode_cbtx(cb);
+        for (const auto* t : txs) w.m_txs.emplace_back(*t);
+        return w;
+    };
+    DeclineReport why;
+
+    EXPECT_FALSE(st.embedded_template_emit_ok(body({&c}), &why));
+    EXPECT_EQ(why.cause, "emit-tx-spends-unserved-mempool-parent");
+    EXPECT_FALSE(st.embedded_template_emit_ok(body({&c, &p}), &why));
+    EXPECT_EQ(why.cause, "emit-tx-spends-unserved-mempool-parent") << "parent after child";
+
+    EXPECT_TRUE(st.embedded_template_emit_ok(body({&p, &c}), &why))
+        << why.cause << " " << why.value;
+}
