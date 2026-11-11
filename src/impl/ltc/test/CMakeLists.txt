@@ -456,6 +456,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         redistribute_script_type_test.cpp
         restart_reorg_supersede_test.cpp
         self_connection_ban_test.cpp
+        bootstrap_hosts_test.cpp
         share_fetch_failover_test.cpp
         share_message_unpack_bounds_test.cpp
         share_remove_owns_data_test.cpp

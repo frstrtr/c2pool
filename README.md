@@ -669,7 +669,7 @@ The sharechain P2P layer discovers peers from multiple sources:
 | CLI seed nodes | `-n HOST:PORT` (repeatable) | Highest |
 | YAML config | `seed_nodes:` list | Appended to CLI |
 | `~/.c2pool/ltc/pool.yaml` | `bootstrap_addrs:` (auto-generated, persists learned peers) | Medium |
-| Hardcoded bootstrap hosts | `ml.toom.im`, `usa.p2p-spb.xyz`, + 9 IPs | Fallback |
+| Hardcoded bootstrap hosts | `ltc.voidbind.com`, `p2p-spb.xyz`, `usa.p2p-spb.xyz`, + 3 IPs (V36 share-chain nodes only) | Fallback |
 
 With `startup_mode: wait` (default), the node waits until peers deliver
 shares before opening stratum. This matches p2pool's `PERSIST=True` behavior.
