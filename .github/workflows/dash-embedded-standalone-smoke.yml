@@ -1,0 +1,129 @@
+name: DASH embedded-standalone daemonless smoke
+
+# ci-steward 2026-11-11. First CI coverage of the dash embedded-standalone
+# (daemonless) boot path: c2pool-dash with NO dashd, --run --coin-p2p-discover
+# + --web-port. coin-matrix.yml's dash-daemonless cell runs replay/fold gtests
+# only and never boots the binary, so a regression on this path is otherwise
+# invisible until prod.
+#
+# Builds the c2pool-dash target, boots it daemonless, and asserts (bounded):
+# process stays up, DashCoinPeerManager starts against real DASH DNS seeds, and
+# the HTTP engine endpoint /node_info returns 200. A live coin-peer handshake
+# is observed BEST-EFFORT (same #1469 downgrade as the dgb smoke). Runs
+# github-hosted for real DNS + P2P egress. The gate emits a NAMED, logged skip
+# if the DASH network is unreachable, so a silent skip can never read as green.
+#
+# Deliberately does NOT assert header-tip advance (dgb precedent): this smoke
+# gates boot + discovery + HTTP-200 only.
+#
+# Neutral-skip on branches without the dash embedded-standalone sources
+# (PR #47 per-coin source-presence guard preserved — this job is an ADDITIVE
+# guard and does NOT relax the coin-matrix guard).
+
+on:
+  # additive: callable by ci-required.yml aggregator (no push/PR behaviour change)
+  workflow_call:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'src/c2pool/main_dash.cpp'
+      - 'src/impl/dash/coin/coin_peer_manager.hpp'
+      - 'src/impl/dash/coin/chain_seeds.hpp'
+      - 'src/impl/dash/coin/arm_resolution.hpp'
+      - 'src/impl/dash/coin/p2p_client.hpp'
+      - 'tests/gates/dash_embedded_standalone_smoke.sh'
+      - '.github/workflows/dash-embedded-standalone-smoke.yml'
+
+concurrency:
+  # See coin-matrix.yml: github.workflow is the CALLER name when reused, so
+  # scope the reused-path group to the run instance; direct triggers keep a
+  # stable per-ref group.
+  group: dash-standalone-smoke-${{ github.ref }}-${{ github.workflow == 'DASH embedded-standalone daemonless smoke' && 'direct' || github.run_id }}
+  cancel-in-progress: ${{ github.event_name != 'push' }}
+
+jobs:
+  dash-embedded-standalone-smoke:
+    name: DASH embedded-standalone daemonless smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check dash embedded-standalone source presence
+        id: presence
+        run: |
+          if [ -f "src/c2pool/main_dash.cpp" ] && [ -f "tests/gates/dash_embedded_standalone_smoke.sh" ]; then
+            echo "exists=1" >> "$GITHUB_OUTPUT"
+            echo "::notice::dash embedded-standalone sources present — running daemonless smoke."
+          else
+            echo "exists=0" >> "$GITHUB_OUTPUT"
+            echo "::notice::dash embedded-standalone sources absent on this branch — neutral skip (PR #47 guard preserved)."
+          fi
+
+      - name: Set per-job Conan home
+        if: steps.presence.outputs.exists == '1'
+        run: echo "CONAN_HOME=$RUNNER_TEMP/conan2" >> "$GITHUB_ENV"
+
+      - name: Install system dependencies
+        if: steps.presence.outputs.exists == '1'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            g++ ccache cmake make libleveldb-dev libsecp256k1-dev
+
+      - uses: actions/setup-python@v6
+        if: steps.presence.outputs.exists == '1'
+        with: { python-version: '3.12' }
+
+      - name: Install Conan 2
+        if: steps.presence.outputs.exists == '1'
+        run: |
+          pip install "conan>=2.0,<3.0"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Restore Conan cache
+        if: steps.presence.outputs.exists == '1'
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/conan2
+          key: conan2-ubuntu24-gcc13-dash-smoke-${{ hashFiles('conanfile.txt', 'ci/conan/linux-gcc13.profile', 'conan.lock') }}
+          restore-keys: |
+            conan2-ubuntu24-gcc13-dash-smoke-
+            conan2-ubuntu24-gcc13-
+
+      # Match the green coin-matrix provisioning exactly: lockfile-pinned deps
+      # and an EXPLICIT build_type=Release so conan generates the Release dep
+      # data cmake then consumes (no host/build build_type drift).
+      - name: Conan install
+        if: steps.presence.outputs.exists == '1'
+        run: |
+          for attempt in 1 2 3; do
+            if conan install . \
+              -pr:a=ci/conan/linux-gcc13.profile \
+              --lockfile=conan.lock \
+              --build=missing \
+              --output-folder=build_ci \
+              --settings=build_type=Release; then exit 0; fi
+            echo "conan install failed (attempt $attempt/3); retrying in $((attempt * 15))s"
+            sleep $((attempt * 15))
+          done
+          exit 1
+
+      - name: Configure
+        if: steps.presence.outputs.exists == '1'
+        run: |
+          cmake -S . -B build_ci \
+            -DCMAKE_TOOLCHAIN_FILE=build_ci/conan_toolchain.cmake \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build c2pool-dash target
+        if: steps.presence.outputs.exists == '1'
+        run: cmake --build build_ci --target c2pool-dash -j"$(nproc)"
+
+      - name: Run dash embedded-standalone daemonless smoke
+        if: steps.presence.outputs.exists == '1'
+        shell: bash
+        env:
+          BUILD_DIR: build_ci
+        run: bash tests/gates/dash_embedded_standalone_smoke.sh
