@@ -2212,3 +2212,59 @@ TEST(DashCoinP2PPool, archival_rotation_is_bounded_and_never_churns_a_healthy_po
             << "a second rotation must wait out OUTBOUND_ROTATE_INTERVAL_SEC";
     }
 }
+
+// ── E-SUPERBLOCK C4: per-object vote sync — once per (peer, object) window ────
+// Dash Core v24 net_governance.cpp:116-133 records a per-object vote sync as a
+// fulfilled request and answers a repeat inside nFulfilledRequestExpireTime
+// (mainnet 1 h, testnet 5 min) with Misbehaving(20). Re-syncs at H - window
+// and H - 1 must therefore never re-ask the same peer for the same object
+// inside the window, while a DIFFERENT object or an expired window is fine.
+TEST(DashCoinP2PPool, govsync_vote_sync_once_per_peer_object_window)
+{
+    PoolRig rig;
+    rig.use_fake_clock();
+    rig.client.set_max_peers(2);
+    rig.handshake(1);
+    rig.handshake(2);
+    uint256 h1, h2;
+    h1.data()[0] = 0x11;
+    h2.data()[0] = 0x22;
+
+    EXPECT_EQ(rig.client.send_govsync(h1), 2u);
+    EXPECT_EQ(rig.client.send_govsync(h1), 0u) << "re-asked inside the fulfilled window";
+    EXPECT_EQ(rig.client.govsync_votes_skipped(), 2u);
+    EXPECT_EQ(rig.client.send_govsync(h2), 2u) << "a different object is a different request";
+    rig.fake_now += 3661;                          // mainnet window (+ margin) default
+    EXPECT_EQ(rig.client.send_govsync(h1), 2u) << "an expired window must permit a re-ask";
+
+    // Testnet window (main_dash sets 360 s for a 300 s nFulfilledRequestExpireTime).
+    rig.client.set_govsync_votes_resync_secs(360);
+    EXPECT_EQ(rig.client.send_govsync(h2), 2u);    // last asked 3661 s ago
+    EXPECT_EQ(rig.client.send_govsync(h2), 0u) << "re-asked inside the 360 s window";
+    rig.fake_now += 361;
+    EXPECT_EQ(rig.client.send_govsync(h2), 2u);
+
+    // The object fetch (empty filter) is not a tracked request: never gated.
+    EXPECT_EQ(rig.client.send_govobject_fetch(h1), 2u);
+    EXPECT_EQ(rig.client.send_govobject_fetch(h1), 2u);
+}
+
+// An explicit vote re-sync forgets the vote-type inv dedup so votes pulled and
+// dropped inside the 600 s TTL are pulled again; other types are untouched.
+TEST(DashCoinP2PPool, inv_dedup_forget_type_only_drops_that_type)
+{
+    InvDedup d;
+    uint256 a, b, c;
+    a.data()[0] = 1; b.data()[0] = 2; c.data()[0] = 3;
+    const uint32_t VOTE = 18, OBJ = 17;
+    ASSERT_TRUE(d.admit(VOTE, a, 100));
+    ASSERT_TRUE(d.admit(OBJ, b, 101));
+    ASSERT_TRUE(d.admit(VOTE, c, 102));
+    EXPECT_EQ(d.forget_type(VOTE), 2u);
+    EXPECT_FALSE(d.contains(VOTE, a));
+    EXPECT_FALSE(d.contains(VOTE, c));
+    EXPECT_TRUE(d.contains(OBJ, b));
+    EXPECT_EQ(d.size(), d.index_size()) << "queue/index lockstep (leak invariant)";
+    EXPECT_EQ(d.size(), 1u);
+    EXPECT_TRUE(d.admit(VOTE, a, 103)) << "a forgotten vote inv is pulled again";
+}

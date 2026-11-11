@@ -31,8 +31,9 @@
 /// Every uncertain / under-covered / not-yet-quiesced view returns false, so the
 /// NodeCoinState superblock guard routes to the reward-safe dashd fallback.
 /// This is a NECESSARY (not sufficient) gate: the serve path additionally
-/// requires a trigger-confident winner (GovernanceStore::get_best_superblock)
-/// and the R6 desync latch to be clear — defence in depth.
+/// requires a tri-state verdict that is not Unknown (superblock.hpp: a funded
+/// winner, or provable absence — no outstanding/unverified/ambiguous trigger)
+/// and the R6/C5 desync latch to be clear — defence in depth.
 
 #include <cstdint>
 #include <set>
@@ -129,11 +130,13 @@ public:
     /// FALSE => the superblock arm fails closed to dashd.
     ///
     /// NOTE it deliberately does NOT require objects>0: a genuinely unfunded
-    /// cycle has no trigger, and the winner-selection gate
-    /// (get_best_superblock => nullopt) already refuses that height. Requiring
-    /// objects here would wrongly serve nothing on a complete-but-unfunded view
-    /// AND could not distinguish "no trigger this cycle" from "peer withheld it"
-    /// — the peer-coverage floor is what defends the latter.
+    /// cycle has no trigger at all (testnet live: `gobject count` triggers 0),
+    /// and that complete-but-empty view is EXACTLY what lets a superblock
+    /// height be served as NotTriggered (superblock.hpp resolve_superblock_
+    /// payments: R5 complete AND strict absence). This predicate cannot tell
+    /// "no trigger this cycle" from "peer withheld it" — the peer-coverage
+    /// floor (>= DASH_GOVSYNC_MIN_PEERS_DEFAULT distinct peers) is what
+    /// defends the latter, which is why it is never lowered by default.
     bool is_complete(int64_t now) const {
         if (m_first_request_time == 0) return false;               // never asked
         if (m_requested_peers.size() < m_min_peers) return false;  // under-covered

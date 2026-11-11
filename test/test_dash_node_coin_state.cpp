@@ -2614,3 +2614,48 @@ TEST(DashNodeCoinState, V24UnsetSeamFallsBackToTheNetworkAnswer) {
         EXPECT_TRUE(e.v24_active);
     }
 }
+
+// ── E-SUPERBLOCK: the pre-emit gate re-asserts the superblock VERDICT ────────
+// A template built while the superblock height was PROVEN unfunded carries no
+// treasury outputs; if the verdict moves before emit (a trigger crossed the
+// threshold, a schedule changed) the built treasury slice no longer matches
+// what dashd will demand (IsBlockValueValid / IsBlockPayeeValid, Dash Core v24
+// masternode/payments.cpp:313-388) and the template must be discarded.
+TEST(DashServeGateNamesRefusal, SuperblockVerdictDriftFailsPreEmit) {
+    using namespace dash::coin;
+    NodeCoinState st;
+    seed_healthy_armed(st);
+    SuperblockResolution verdict;
+    verdict.verdict = SuperblockVerdict::NotTriggered;
+    verdict.reason  = "not-triggered";
+    st.set_is_superblock_fn([](uint32_t next_h) { return next_h == H; });
+    st.set_superblock_resolver([&verdict](uint32_t) { return verdict; });
+    st.set_require_superblock_provider(true);
+    st.set_superblock_sync_complete_fn([]() { return true; });
+
+    // Proven unfunded: served, normal coinbase, passes the gate.
+    WorkSelection sel = st.select_work([] { return DashWorkData{}; });
+    ASSERT_EQ(sel.source, WorkSource::Embedded) << st.describe_decline().value;
+    EXPECT_EQ(sel.work.m_tx_serve_stamp.superblock_total, 0u);
+    EXPECT_TRUE(st.embedded_template_emit_ok(sel.work));
+
+    // The network's trigger gets funded before emit: discard, named.
+    verdict.verdict = SuperblockVerdict::Triggered;
+    verdict.reason  = "triggered";
+    SuperblockPayment sp;
+    sp.script = p2pkh_script(0x77);
+    sp.amount = 500'000'000;
+    verdict.payments = {sp};
+    DeclineReport why;
+    EXPECT_FALSE(st.embedded_template_emit_ok(sel.work, &why));
+    EXPECT_EQ(why.cause, "emit-superblock-drift");
+
+    // Unknown at emit time: discard with the verdict's own reason.
+    verdict = SuperblockResolution::unknown("trigger-ambiguous");
+    EXPECT_FALSE(st.embedded_template_emit_ok(sel.work, &why));
+    EXPECT_EQ(why.cause, "emit-superblock-refused");
+    EXPECT_EQ(why.value, "trigger-ambiguous");
+    // ...and viability names it the same way.
+    EXPECT_EQ(st.describe_decline().cause, "superblock-refused");
+    EXPECT_EQ(st.describe_decline().value, "trigger-ambiguous");
+}

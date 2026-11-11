@@ -38,6 +38,7 @@
 #include <impl/dash/coin/subsidy.hpp>            // compute_dash_platform_reward_post_v20_mn_rr (creditPool re-check)
 
 #include <impl/dash/coin/governance_object.hpp>  // SuperblockPayment (daemonless superblock schedule)
+#include <impl/dash/coin/superblock.hpp>         // SuperblockResolution (tri-state superblock verdict)
 #include <impl/dash/coin/deployment_status.hpp> // V24State (Dash Core v24 deployment state)
 
 #include <core/uint256.hpp>
@@ -1303,6 +1304,16 @@ public:
         m_superblock_provider = std::move(fn);
     }
 
+    /// The tri-state form of the provider (production: CoinStateMaintainer::
+    /// superblock_resolution). Preferred over set_superblock_provider when
+    /// both are set: besides the verdict it names WHY a height is Unknown, so
+    /// the refusal carries a distinct value (govsync-incomplete,
+    /// trigger-ambiguous, trigger-latched, trigger-unverified-pending, ...)
+    /// instead of one opaque "not-trigger-confident".
+    void set_superblock_resolver(std::function<SuperblockResolution(uint32_t)> fn) {
+        m_superblock_resolver = std::move(fn);
+    }
+
     /// Enable the daemonless superblock arm (--embedded-superblock opt-in).
     /// Default OFF preserves the prior REWARD-SAFE posture EXACTLY: every
     /// superblock height refuses the embedded arm and routes to the dashd
@@ -1699,11 +1710,27 @@ public:
                           "header-tip-current");
         const uint32_t next_h = m_prev_height + 1;
         // Superblock height-class guard (E-SUPERBLOCK): refuse unless the
-        // daemonless govsync provider is trigger-confident for this height
-        // (resolve_superblock().ok folds disabled-arm + unfunded cases).
-        if (!resolve_superblock(next_h).ok)
-            return reject("emit-superblock-refused", "not-trigger-confident",
-                          "trigger-confident@h=" + std::to_string(next_h));
+        // tri-state verdict for this height is Triggered (exact schedule) or
+        // PROVEN NotTriggered (normal coinbase); the refusal value names the
+        // gate (arm disabled / govsync incomplete / ambiguous / latched ...).
+        if (const auto sbd = resolve_superblock(next_h); !sbd.ok) {
+            return reject("emit-superblock-refused", sbd.reason,
+                          "triggered-or-proven-unfunded@h=" + std::to_string(next_h));
+        } else {
+            // The verdict may have moved since the template was BUILT (a
+            // trigger crossed the threshold, a vote landed): the built
+            // treasury slice must equal what the verdict demands NOW — 0 for
+            // a non-superblock or proven-unfunded height, the schedule total
+            // when triggered. A normal coinbase served after the network's
+            // trigger got funded is exactly the lost-block case.
+            uint64_t want = 0;
+            for (const auto& sp : sbd.payments) want += static_cast<uint64_t>(sp.amount);
+            if (w.m_tx_serve_stamp.superblock_total != want)
+                return reject("emit-superblock-drift",
+                              "built=" + std::to_string(w.m_tx_serve_stamp.superblock_total),
+                              "verdict=" + std::to_string(want) + "@h=" +
+                                  std::to_string(next_h));
+        }
         // E1: with a qc plan installed the DKG-window heights are SERVED,
         // not refused — re-derive the mandatory type-6 set here and require
         // the BUILT template to carry exactly it (count + payload bytes, in
@@ -2179,7 +2206,7 @@ public:
         // gate take the same decision over the same plan.
         std::optional<QcPoseDecision> qc_pose;
         if (qc_plan) qc_pose = qc_pose_decision(qc_plan->commitments);
-        e.decline   = evaluate_viability(qc_ok, qc_gap, sb.ok, payee_resolvable,
+        e.decline   = evaluate_viability(qc_ok, qc_gap, sb, payee_resolvable,
                                          utxo_immature,
                                          qc_pose ? &*qc_pose : nullptr);
         e.has_state = e.decline.viable;
@@ -2420,6 +2447,23 @@ private:
         return out;
     }
 
+    /// Superblock disposition for a candidate next height. ok=false => refuse
+    /// (fail closed, `reason` names the gate). payments empty+ok => normal
+    /// block (non-superblock height, or a PROVEN unfunded superblock);
+    /// non-empty+ok => emit exactly those treasury outputs.
+    struct SuperblockDisposition {
+        bool ok{true};
+        std::vector<SuperblockPayment> payments;
+        std::string reason{"none"};
+
+        static SuperblockDisposition refuse(std::string why) {
+            SuperblockDisposition d;
+            d.ok = false;
+            d.reason = std::move(why);
+            return d;
+        }
+    };
+
     /// THE clause list. The ONLY transcription of embedded-arm viability:
     /// make_embedded_work_inputs() derives has_state from `.viable`, and
     /// describe_decline()/classify_decline() read the very same object, so the
@@ -2427,7 +2471,7 @@ private:
     /// the old AND used, and the FIRST unmet one is returned — exactly one
     /// named cause, never a list of maybes.
     ///
-    /// qc_ok / sb_ok / payee_resolvable are passed IN because the caller has
+    /// qc_ok / sb / payee_resolvable are passed IN because the caller has
     /// already paid for them (the qc plan and superblock schedule are needed by
     /// the builder regardless); re-invoking those predicates here would double
     /// the cost on a per-template path and, worse, could observe a different
@@ -2439,7 +2483,7 @@ private:
     /// `qc_pose` is the PoSe-pass decision over the same plan (null when no
     /// plan was derived), passed in for the same reason as qc_gap.
     DeclineReport evaluate_viability(bool qc_ok, const QcPlanGap& qc_gap,
-                                     bool sb_ok,
+                                     const SuperblockDisposition& sb,
                                      bool payee_resolvable,
                                      bool utxo_immature,
                                      const QcPoseDecision* qc_pose = nullptr) const {
@@ -2490,9 +2534,11 @@ private:
             // make_embedded_work_inputs sets suppress_mempool_txs so the
             // builder emits no mempool txs.
             d = refuse("utxo-immature", "utxo_ready=false", "utxo_ready=true");
-        else if (!sb_ok)
-            d = refuse("superblock-refused", "not-trigger-confident",
-                       "trigger-confident@h=" + std::to_string(next_h));
+        else if (!sb.ok)
+            // The value names WHICH superblock gate refused (the tri-state
+            // verdict's reason), never one opaque token.
+            d = refuse("superblock-refused", sb.reason,
+                       "triggered-or-proven-unfunded@h=" + std::to_string(next_h));
         else if (!m_qc_plan_fn && m_commitment_window_fn && m_commitment_window_fn(next_h))
             d = refuse("dkg-commitment-window", "in-window@h=" + std::to_string(next_h),
                        "off-window");
@@ -2764,34 +2810,47 @@ private:
         return *expected;
     }
 
-    /// Superblock disposition for a candidate next height. ok=false => refuse
-    /// (fail closed). payments empty+ok => normal block; non-empty+ok => emit.
-    struct SuperblockDisposition {
-        bool ok{true};
-        std::vector<SuperblockPayment> payments;
-    };
-
     SuperblockDisposition resolve_superblock(uint32_t next_h) const {
         // Not a superblock height => nothing to do, arm serves normally.
         if (!m_is_superblock_fn || !m_is_superblock_fn(next_h))
-            return SuperblockDisposition{true, {}};
+            return SuperblockDisposition{true, {}, "not-superblock-height"};
         // It IS a superblock height. If the daemonless arm is not enabled,
         // refuse (route to the reward-safe dashd fallback) — old behaviour.
-        if (!m_require_superblock_provider || !m_superblock_provider)
-            return SuperblockDisposition{false, {}};
+        if (!m_require_superblock_provider ||
+            (!m_superblock_provider && !m_superblock_resolver))
+            return SuperblockDisposition::refuse("superblock-arm-disabled");
         // R5 COMPLETENESS GATE (structural): a trigger-confident answer from a
-        // PARTIAL governance view is the confidently-wrong-winner hazard, so
-        // the serve path additionally requires the govsync-completeness
-        // predicate to be PRESENT and TRUE. Default-absent => refuse => the
-        // reward-safe dashd fallback — landing vote-verify alone can never
-        // open this path.
+        // PARTIAL governance view is the confidently-wrong-winner hazard, and
+        // an "unfunded" answer from one is the missing-treasury hazard, so
+        // BOTH verdicts additionally require the govsync-completeness
+        // predicate to be PRESENT and TRUE. Default-absent => refuse.
         if (!m_superblock_sync_complete_fn || !m_superblock_sync_complete_fn())
-            return SuperblockDisposition{false, {}};
-        // Consult the governance provider: nullopt => not trigger-confident =>
-        // fail closed; a value (possibly empty = unfunded) => arm may serve.
+            return SuperblockDisposition::refuse("govsync-incomplete");
+        if (m_superblock_resolver) {
+            auto r = m_superblock_resolver(next_h);
+            switch (r.verdict) {
+                case SuperblockVerdict::Triggered:
+                    // A Triggered verdict always carries a non-empty schedule;
+                    // an empty one is malformed => refuse.
+                    if (r.payments.empty())
+                        return SuperblockDisposition::refuse("trigger-invalid-best");
+                    return SuperblockDisposition{true, std::move(r.payments), "triggered"};
+                case SuperblockVerdict::NotTriggered:
+                    // PROVEN unfunded (dashd payments.cpp:365-373): a normal
+                    // coinbase is the valid block at this superblock height.
+                    return SuperblockDisposition{true, {}, "not-triggered"};
+                case SuperblockVerdict::Unknown:
+                    break;
+            }
+            return SuperblockDisposition::refuse(r.reason.empty() ? std::string("unknown")
+                                                                  : r.reason);
+        }
+        // Optional-vector provider: nullopt => Unknown => refuse; a value
+        // (possibly empty = proven unfunded) => the arm may serve.
         auto sched = m_superblock_provider(next_h);
-        if (!sched) return SuperblockDisposition{false, {}};
-        return SuperblockDisposition{true, std::move(*sched)};
+        if (!sched) return SuperblockDisposition::refuse("not-trigger-confident");
+        const char* label = sched->empty() ? "not-triggered" : "triggered";
+        return SuperblockDisposition{true, std::move(*sched), label};
     }
 
     // D2 root memo (2026-08-07/08 production freeze, remaining half of the class).
@@ -2901,6 +2960,7 @@ private:
     // + opt-in gate. Default gate OFF => every superblock height refuses (old
     // reward-safe behaviour); ON => resolve_superblock consults the provider.
     std::function<std::optional<std::vector<SuperblockPayment>>(uint32_t)> m_superblock_provider;
+    std::function<SuperblockResolution(uint32_t)> m_superblock_resolver;   // tri-state (preferred)
     bool m_require_superblock_provider{false};
     // R5 govsync-completeness gate: absent (default) or false => superblock
     // heights refuse the embedded arm even when the provider is confident.

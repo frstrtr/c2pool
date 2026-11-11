@@ -485,6 +485,22 @@ public:
         m_order.clear();
         m_seen.clear();
     }
+
+    /// Forget every entry of one inv type (E-SUPERBLOCK C4): an explicit
+    /// per-object vote re-sync asks the peer to re-announce votes we may have
+    /// pulled and dropped inside the TTL; without this the re-announcement
+    /// would be suppressed and the re-sync would fetch nothing.
+    std::size_t forget_type(uint32_t type)
+    {
+        std::size_t n = 0;
+        std::deque<Entry> kept;
+        for (auto& e : m_order) {
+            if (e.key.first == type) { m_seen.erase(e.key); ++n; }
+            else kept.push_back(e);
+        }
+        m_order.swap(kept);
+        return n;
+    }
 };
 
 // ── Per-peer session state ───────────────────────────────────────────────
@@ -938,6 +954,16 @@ private:
     // own netfulfilledman HasFulfilledRequest("governance-sync") gate.
     std::map<std::string, int64_t> m_govsync_primed;   // peer_key -> primed-at
     int64_t  m_govsync_reprime_secs{3600};             // dashd mainnet 1h expiry
+    // E-SUPERBLOCK per-object vote sync bookkeeping: (peer_key, object) ->
+    // wall-seconds of the last vote-sync request. Dash Core v24 tracks a
+    // per-object vote sync as a fulfilled request ("govsync-votes-<hash>",
+    // net_governance.cpp:116-133) and answers a repeat inside
+    // nFulfilledRequestExpireTime with Misbehaving(20): mainnet 1 h, testnet/
+    // devnet/regtest 5 min (chainparams.cpp). Default = the mainnet window
+    // (+ margin); main_dash lowers it on testnet.
+    std::map<std::pair<std::string, uint256>, int64_t> m_govsync_votes_sent;
+    int64_t  m_govsync_votes_resync_secs{3660};
+    uint64_t m_govsync_votes_skipped{0};               // window-suppressed re-asks
     size_t   m_tx_pull_inflight_cap{64};
     std::map<uint256, int64_t> m_tx_pull_inflight;   // txid -> requested-at
     uint64_t m_tx_inv_offered{0};    // inv(MSG_TX) SEEN on the wire, pre-dedup
@@ -2522,22 +2548,70 @@ public:
 
     /// Per-object vote sync (E-SUPERBLOCK, routing class 2 for THIS leg): dashcore
     /// serves a governance object's VOTES only in reply to a govsync whose nProp
-    /// is that object's hash (CGovernanceManager::SyncSingleObjVotes). A
-    /// govsync(nProp=0) invs OBJECTS only, never their votes, so a trigger's
-    /// funding votes are unreachable until we ask for them by hash. Fired from the
-    /// govobj handler the moment a TRIGGER object is accepted, to every handshaked
-    /// peer so the tally can reach the funding threshold.
+    /// is that object's hash. A govsync(nProp=0) invs OBJECTS only, never their
+    /// votes, so a trigger's funding votes are unreachable until we ask for
+    /// them by hash. Fired from the govobj handler the moment a TRIGGER object
+    /// is accepted, and by the maintainer's C4 re-syncs at H - maturity window
+    /// and H - 1, to every handshaked peer.
     ///
-    /// FANOUT IS SAFE HERE (unlike the nProp=0 prime): SyncSingleObjVotes has NO
-    /// netfulfilledman gate and draws NO Misbehaving penalty — per-object vote
-    /// sync repeats are not punished — and the reply is bounded by one object's
-    /// vote set (the inv handler further collapses N-peer vote invs to one batched
-    /// getdata per vote). Multi-peer vote gathering is the tally defence: a single
-    /// peer withholding a trigger's funding votes must not hold the tally under the
-    /// funding threshold. It fires once per accepted trigger, so it is naturally
-    /// once-per-object, not churn-multiplied. Bloom filter empty (match none =>
-    /// send all votes for the object).
+    /// THE FILTER MUST BE NON-EMPTY. Dash Core v24 net_governance.cpp:116-162:
+    /// a nonzero nProp with an EMPTY bloom filter is an OBJECT FETCH (the peer
+    /// answers with the object's inv, never its votes); and before v24 an
+    /// empty filter made CBloomFilter::contains() return true for every vote
+    /// (bloom.cpp:72-75), so GetSyncableVoteInvs skipped them all. Either way
+    /// an empty filter yields ZERO votes. We send the smallest valid filter
+    /// that matches nothing: one zero byte, one hash function — every vote
+    /// hash misses it, so the peer streams the whole vote set.
+    ///
+    /// AT MOST ONCE PER (PEER, OBJECT) PER EXPIRY WINDOW: v24 records a vote
+    /// sync as a fulfilled request and punishes a repeat inside
+    /// nFulfilledRequestExpireTime with Misbehaving(20) (net_governance.cpp
+    /// 120-133). Each peer is skipped while its window runs; the reply is
+    /// bounded by one object's vote set. The vote-type inv dedup is forgotten
+    /// first so votes pulled-and-dropped inside the 600 s dedup TTL are pulled
+    /// again (a later trigger arrival must still get its votes).
     std::size_t send_govsync(const uint256& prop)
+    {
+        const int64_t now = now_sec();
+        std::size_t sent = 0;
+        bool forgot = false;
+        for (auto& p : m_pool) {
+            if (!p->handshake.complete()) continue;
+            const auto key = std::make_pair(p->key, prop);
+            auto it = m_govsync_votes_sent.find(key);
+            if (it != m_govsync_votes_sent.end() && m_govsync_votes_resync_secs > 0 &&
+                now - it->second < m_govsync_votes_resync_secs) {
+                ++m_govsync_votes_skipped;
+                continue;
+            }
+            if (!forgot) {
+                m_inv_dedup.forget_type(static_cast<uint32_t>(inventory_type::govobjectvote));
+                forgot = true;
+            }
+            auto m = message_govsync::make_raw(
+                prop, std::vector<uint8_t>{0x00}, /*nHashFuncs=*/1u, /*nTweak=*/0u,
+                /*nFlags=*/uint8_t{0});
+            p->write(m);
+            m_govsync_votes_sent[key] = now;
+            ++sent;
+        }
+        // Bound the bookkeeping: entries older than the window are dead.
+        if (m_govsync_votes_sent.size() > 4096) {
+            for (auto it = m_govsync_votes_sent.begin(); it != m_govsync_votes_sent.end();) {
+                if (now - it->second >= m_govsync_votes_resync_secs) it = m_govsync_votes_sent.erase(it);
+                else ++it;
+            }
+        }
+        return sent;
+    }
+
+    /// Fetch a governance OBJECT we only know by hash (the parent of an orphan
+    /// vote): MNGOVERNANCESYNC nProp=hash with an EMPTY filter — exactly
+    /// dashd's own orphan-parent request (net_governance.cpp:47-61, 258-265).
+    /// v24 answers with the object's inv (not tracked as a fulfilled request,
+    /// net_governance.cpp:113-118 — no penalty); a pre-v24 peer treats it as a
+    /// vote sync whose empty filter matches every vote, i.e. sends nothing.
+    std::size_t send_govobject_fetch(const uint256& prop)
     {
         std::size_t sent = 0;
         for (auto& p : m_pool) {
@@ -2549,6 +2623,12 @@ public:
         }
         return sent;
     }
+
+    /// DEPLOYMENT SEAM: the per-(peer, object) vote re-sync window, seconds.
+    /// Must be >= the network's nFulfilledRequestExpireTime (mainnet 3600,
+    /// testnet 300). 0 disables the guard (KATs).
+    void set_govsync_votes_resync_secs(int64_t secs) { m_govsync_votes_resync_secs = secs; }
+    uint64_t govsync_votes_skipped() const { return m_govsync_votes_skipped; }
 
     /// Relay a pre-serialized won block as a `block` P2P message (the embedded
     /// P2P-relay arm of the dual-path broadcaster).
@@ -4581,6 +4661,15 @@ private:
             msg->m_vch_sig);
         rec.object_type = msg->m_object_type;
         rec.vch_data    = msg->m_vch_data;
+        // C3: the signer + its signature over CGovernanceObject::
+        // GetSignatureHash (Governance::Object serialized WITHOUT vchSig).
+        rec.mn_outpoint_hash  = msg->m_masternode_outpoint.hash;
+        rec.mn_outpoint_index = msg->m_masternode_outpoint.index;
+        rec.vch_sig           = msg->m_vch_sig;
+        rec.sig_hash = ::dash::coin::govobject_signature_hash(
+            msg->m_hash_parent, msg->m_revision, msg->m_time,
+            msg->m_collateral_hash, msg->m_vch_data, msg->m_object_type,
+            msg->m_masternode_outpoint.hash, msg->m_masternode_outpoint.index);
         LOG_INFO << "[" << m_chain_label << "] govobj: hash="
                  << rec.object_hash.GetHex().substr(0, 16) << " type="
                  << rec.object_type << " data=" << rec.vch_data.size() << "B";

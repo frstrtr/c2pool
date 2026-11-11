@@ -6535,12 +6535,21 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                         return dash::coin::superblock_budget(
                             h, static_cast<int>(budget_cycle));
                     });
-                node_coin_state.set_superblock_provider(
-                    [maint = maintainer.get()](uint32_t next_height)
-                        -> std::optional<std::vector<dash::coin::SuperblockPayment>> {
-                        return maint->superblock_schedule(next_height);
+                // Tri-state verdict (Triggered / NotTriggered / Unknown + the
+                // gate that refused): a PROVEN-unfunded superblock height
+                // serves a normal coinbase; anything unprovable refuses with
+                // a distinct reason in the decline value.
+                node_coin_state.set_superblock_resolver(
+                    [maint = maintainer.get()](uint32_t next_height) {
+                        return maint->superblock_resolution(next_height);
                     });
                 node_coin_state.set_require_superblock_provider(embedded_superblock);
+                // C4: chainparams nSuperblockMaturityWindow (Dash Core v24
+                // chainparams.cpp: mainnet 1662, testnet 8) — the per-trigger
+                // vote re-sync fires at tip H - window and H - 1.
+                maintainer->set_superblock_maturity_window(
+                    testnet ? dash::coin::DASH_SUPERBLOCK_MATURITY_WINDOW_TESTNET
+                            : dash::coin::DASH_SUPERBLOCK_MATURITY_WINDOW_MAINNET);
                 // R5 GOVSYNC-COMPLETENESS GATE (production wiring). Model:
                 // dashcore CMasternodeSync governance-phase completion — the
                 // view is COMPLETE only when the governance set was requested
@@ -6584,13 +6593,61 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 {
                     auto* ncs = &node_coin_state;
 
+                    // Tri-state signer resolution shared by the vote and the
+                    // C3 trigger-object verifier. "Current" = the DMN view has
+                    // folded the serve tip, so a collateral outpoint it cannot
+                    // resolve is one dashd's TIP list cannot resolve either
+                    // (=> Invalid, dashd parity); on a lagging view, or with
+                    // no BLS backend, nothing is concluded (=> CannotVerify:
+                    // held aside, and the superblock verdict it could affect
+                    // stays Unknown).
+                    using SigCheck = dash::coin::CoinStateMaintainer::GovSigCheck;
+                    auto check_operator_sig =
+                        [ncs](const uint256& op_hash, uint32_t op_index,
+                              const uint256& digest,
+                              const std::vector<uint8_t>& sig) -> SigCheck {
+                        // A BLS signature is 96 bytes; anything else (e.g. the
+                        // 65-byte ECDSA voting-key signature a PROPOSAL funding
+                        // vote carries) can never verify under an operator key
+                        // — dashd's SetBytes rejects it outright.
+                        if (sig.size() != 96) return SigCheck::Invalid;
+                        if (!dash::coin::vendor::bls_backend_available())
+                            return SigCheck::CannotVerify;
+                        const auto& mns = std::as_const(*ncs).mnstates();
+                        const bool current = ncs->prev_height() != 0 &&
+                            mns.last_applied_height() >= ncs->prev_height();
+                        // UNFILTERED (no PoSe-ban check) — dashcore
+                        // CGovernanceVote::IsValid / IsValidLocally resolve
+                        // via GetMNByCollateral, so a banned MN's signature
+                        // still verifies in dashd and must here too.
+                        bitcoin_family::coin::TxPrevOut op;
+                        op.hash  = op_hash;
+                        op.index = op_index;
+                        const dash::coin::MNState* mn =
+                            dash::coin::gov_mn_by_collateral(mns, op);
+                        if (!mn) return current ? SigCheck::Invalid
+                                                : SigCheck::CannotVerify;
+                        // The projection store holds every operator key
+                        // as canonical BASIC bytes (P-3): decode them as
+                        // basic, with no scheme fallback -- read as
+                        // legacy they can decode to -P and accept a
+                        // signature dashd rejects.
+                        if (dash::coin::vendor::verify_govvote_operator_sig(
+                                mn->pubKeyOperator, /*key_legacy_scheme=*/false,
+                                digest, sig, /*pubkey_scheme_fallback=*/false))
+                            return SigCheck::Valid;
+                        // A stale view may hold a pre-ProUpRegTx operator key.
+                        return current ? SigCheck::Invalid : SigCheck::CannotVerify;
+                    };
+
                     // Vote-signature verifier — dashcore CGovernanceVote::
                     // CheckSignature over the MN's OPERATOR key (TRIGGER funding
                     // votes; the ECDSA voting-key path is PROPOSAL-only and NOT
                     // used here). Plus the IsValid time bound (nTime <= now+1h).
-                    maintainer->set_vote_verifier(
-                        [ncs](const dash::coin::CoinStateMaintainer::GovVoteContext& v)
-                            -> bool {
+                    maintainer->set_vote_check(
+                        [check_operator_sig](
+                            const dash::coin::CoinStateMaintainer::GovVoteContext& v)
+                            -> SigCheck {
                             // dashcore IsValid: reject a vote timestamped more
                             // than an hour into the future (clock-skew bound).
                             // KNOWN NIT (documented, not fixed): dashcore uses
@@ -6601,29 +6658,26 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                             // skew of the +1h edge; NTP-disciplined hosts make
                             // it negligible. Revisit if soak shows drift.
                             if (v.time > static_cast<int64_t>(std::time(nullptr)) + 60 * 60)
-                                return false;
-                            // Resolve collateral outpoint -> DMN -> operator
-                            // key. UNFILTERED (no PoSe-ban check) — dashcore
-                            // CGovernanceVote::IsValid resolves via
-                            // GetMNByCollateral, so a banned MN's vote still
-                            // verifies in dashd and must here too (dropping a
-                            // banned MN's NO inflates our yes−no vs dashd).
-                            bitcoin_family::coin::TxPrevOut op;
-                            op.hash  = v.mn_outpoint_hash;
-                            op.index = v.mn_outpoint_index;
-                            const dash::coin::MNState* mn =
-                                dash::coin::gov_mn_by_collateral(
-                                    ncs->mnstates(), op);
-                            if (!mn) return false;           // MN not in DMN list
-                            // The projection store holds every operator key
-                            // as canonical BASIC bytes (P-3): decode them as
-                            // basic, with no scheme fallback -- read as
-                            // legacy they can decode to -P and accept a vote
-                            // signed with -sk that dashd rejects.
-                            return dash::coin::vendor::verify_govvote_operator_sig(
-                                mn->pubKeyOperator, /*key_legacy_scheme=*/false,
-                                v.vote_hash, v.vch_sig,
-                                /*pubkey_scheme_fallback=*/false);
+                                return SigCheck::Invalid;
+                            return check_operator_sig(v.mn_outpoint_hash,
+                                                      v.mn_outpoint_index,
+                                                      v.vote_hash, v.vch_sig);
+                        });
+
+                    // C3 — TRIGGER-object signature (dashcore IsValidLocally,
+                    // Dash Core v24 governance/object.cpp:746-761): the MN named
+                    // by the object's collateral outpoint must be in the tip
+                    // list and the object must verify under its OPERATOR key
+                    // over CGovernanceObject::GetSignatureHash (object.cpp
+                    // 551-575; govobject_signature_hash). Unverified triggers
+                    // are never stored.
+                    maintainer->set_object_verifier(
+                        [check_operator_sig](
+                            const dash::coin::CoinStateMaintainer::GovObjectContext& o)
+                            -> SigCheck {
+                            return check_operator_sig(o.mn_outpoint_hash,
+                                                      o.mn_outpoint_index,
+                                                      o.sig_hash, o.vch_sig);
                         });
 
                     // Vote-weight + membership-at-tally — dashcore
@@ -6636,8 +6690,11 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     // SAME live DMN view.
                     maintainer->gov_store().set_vote_weight_fn(
                         [ncs](const std::string& key) -> int {
+                            // Const view: a read must not bump the D2 root-memo
+                            // epoch (the tally now also runs inside the
+                            // template build via the tri-state resolver).
                             return dash::coin::gov_vote_weight_for_key(
-                                ncs->mnstates(), key);
+                                std::as_const(*ncs).mnstates(), key);
                         });
                 }
 
@@ -6654,10 +6711,12 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                              << (dash::coin::vendor::bls_backend_available()
                                      ? "BLS backend ON"
                                      : "BLS backend ABSENT => votes never verify")
-                             << "). Serve stays CLOSED until the completeness "
-                                "predicate proves complete (single peer / empty store "
-                                "=> FALSE) and a funded soak clears -- R3 vote-verify "
-                                "landing here cannot by itself open it.";
+                             << "). Tri-state verdict: Triggered pays the exact "
+                                "trigger, NotTriggered (normal coinbase) only when PROVEN "
+                                "(R5 complete + no stored/held/orphan-voted trigger at H "
+                                "+ C3 trigger signatures verified), anything else refuses "
+                                "with a named reason. A single peer can never prove "
+                                "completeness (R5 floor is not lowered).";
             }
         }
 
@@ -8776,6 +8835,21 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             [maint = maintainer.get()](const std::string& pk) {
                 maint->note_govsync_requested(pk);
             });
+
+        // E-SUPERBLOCK C4: the maintainer re-requests each held trigger's
+        // votes at tip H - maturity window and H - 1 (per-object govsync with
+        // a non-empty filter — never the nProp=0 full sync) and fetches the
+        // parent object of any orphan FUNDING YES vote. The client enforces
+        // the once-per-(peer, object) window dashd v24 tracks as a fulfilled
+        // request (repeat => Misbehaving(20)): nFulfilledRequestExpireTime is
+        // 3600 s on mainnet and 300 s on testnet (chainparams.cpp), + margin.
+        coin_p2p->set_govsync_votes_resync_secs(testnet ? 360 : 3660);
+        if (embedded_govsync || embedded_superblock) {
+            maintainer->set_on_trigger_vote_resync(
+                [cp = coin_p2p.get()](const uint256& h) { cp->send_govsync(h); });
+            maintainer->set_on_gov_object_fetch(
+                [cp = coin_p2p.get()](const uint256& h) { cp->send_govobject_fetch(h); });
+        }
 
         // Kick the initial sync once the version/verack handshake completes:
         // getheaders off our current locator + a mempool prime.
@@ -11577,7 +11651,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         *diag_tick = [diag_timer, diag_tick, ticks, diag_mi, embed_shape,
                       embed_since, embed_last, &node_coin_state, &maintainer,
                       dml_lanes, &utxo_lane,
-                      &header_chain, &mn_ckpt_lane,
+                      &header_chain, &mn_ckpt_lane, &coin_p2p,
                       ws_ri = work_source.get(), &stratum_server](
                          const boost::system::error_code& ec) {
             if (ec) return;   // cancelled at shutdown
@@ -11709,8 +11783,46 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                         << (maintainer
                                 ? (maintainer->gov_sync_complete() ? 1 : 0)
                                 : 0)
+                        // Governance stream volume (R5 quiescence inputs) and
+                        // the C2/C3 held-aside state: objects/votes received,
+                        // triggers rejected for a bad masternode signature,
+                        // records blocking a verdict (unparsed / pending /
+                        // store-full / orphan-YES parents), signatures not yet
+                        // checkable, orphan votes buffered.
+                        << " gov_objects="
+                        << (maintainer ? maintainer->gov_sync_status().object_count() : 0)
+                        << " gov_votes="
+                        << (maintainer ? maintainer->gov_sync_status().vote_count() : 0)
+                        << " gov_trig_rejected="
+                        << (maintainer ? maintainer->gov_triggers_rejected() : 0)
+                        << " gov_outstanding="
+                        << (maintainer ? maintainer->gov_store().outstanding_count() : 0)
+                        << " gov_pending="
+                        << (maintainer ? maintainer->gov_pending_objects() : 0)
+                        << " gov_unverif_votes="
+                        << (maintainer ? maintainer->gov_unverifiable_votes() : 0)
+                        << " gov_orphan_votes="
+                        << (maintainer ? maintainer->gov_orphan_votes() : 0)
+                        << " gov_latch="
+                        << (maintainer ? (maintainer->gov_desync_latched() ? 1 : 0) : 0)
                         << " trigger=" << (changed ? "shape-change" : "heartbeat")
                         << " suppressed=" << *embed_since;
+                    // Governance ingest companion line (same cadence): what
+                    // the peers announced and what we pulled, plus the
+                    // superblock verdict reason for the next height when it is
+                    // a superblock height (grep-provable on the soak).
+                    if (coin_p2p)
+                        LOG_INFO << coin_p2p->gov_ingest_status()
+                                 << " vote_resync_skipped="
+                                 << coin_p2p->govsync_votes_skipped()
+                                 << " not_triggered_served_h="
+                                 << (maintainer
+                                         ? maintainer->gov_not_triggered_served_height()
+                                         : 0u)
+                                 << " latch_reason="
+                                 << (maintainer && maintainer->gov_desync_latched()
+                                         ? maintainer->gov_desync_reason()
+                                         : std::string("none"));
                     *embed_shape = shape.str();
                     *embed_last  = now;
                     *embed_since = 0;

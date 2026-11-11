@@ -6,8 +6,10 @@
 //
 // Two legs, mirroring the SML axis (wire_mnlistdiff_ingest):
 //   * new_govobject -> CoinStateMaintainer::on_govobject: a governance object.
-//     A TRIGGER (type 2) whose vchData parses as a valid superblock schedule is
-//     added to the store; everything else is dropped.
+//     A TRIGGER (type 2) is admitted only after its masternode signature
+//     verifies (C3) and its vchData parses as a valid superblock schedule;
+//     anything it cannot admit is recorded so the superblock verdict at the
+//     affected height stays Unknown (C2). Proposals are remembered by hash.
 //   * new_govvote   -> CoinStateMaintainer::on_govvote: a governance vote. A
 //     FUNDING-signal vote on a known trigger is counted ONLY if the maintainer's
 //     vote verifier confirms its signature — for TRIGGER funding votes that is
@@ -38,7 +40,15 @@ wire_govobject_ingest(::dash::interfaces::Node& node,
     return node.new_govobject.subscribe(
         [&maint](const ::dash::interfaces::Node::GovObjectRecord& r)
         {
-            maint.on_govobject(r.object_hash, r.object_type, r.vch_data);
+            ::dash::coin::CoinStateMaintainer::GovObjectContext o;
+            o.object_hash       = r.object_hash;
+            o.object_type       = r.object_type;
+            o.vch_data          = r.vch_data;
+            o.mn_outpoint_hash  = r.mn_outpoint_hash;
+            o.mn_outpoint_index = r.mn_outpoint_index;
+            o.vch_sig           = r.vch_sig;
+            o.sig_hash          = r.sig_hash;
+            maint.on_govobject(o);
         });
 }
 

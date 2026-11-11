@@ -33,7 +33,9 @@
 #include <impl/dash/coin/governance_store.hpp>   // GovernanceStore (daemonless superblock)
 #include <impl/dash/coin/govsync_status.hpp>     // GovSyncStatus (R5 completeness determination)
 #include <impl/dash/coin/governance_object.hpp>  // parse_superblock_trigger, govvote_signature_hash
-#include <impl/dash/coin/superblock.hpp>         // get_superblock_payments (R6 cross-check + provider)
+#include <impl/dash/coin/superblock.hpp>         // resolve_superblock_payments (tri-state verdict, R6/C5 cross-check)
+#include <impl/dash/coin/deployment_status.hpp>  // V24State (R6 v24-strict payment matching)
+#include <impl/dash/coin/vendor/masternode_payments.hpp> // C5: GetBlockTxOutsForPayee (MN-derived block value)
 #include <impl/dash/coin/mn_state_machine.hpp>   // MNState
 #include <impl/dash/coin/mn_gap_repair.hpp>      // MnGapRepairFn (diff-store gap repair seam)
 #include <impl/dash/coin/lane_diag.hpp>          // diag::MnSource (population attribution)
@@ -56,10 +58,12 @@
 #include <array>
 #include <cstdint>
 #include <ctime>
+#include <deque>
 #include <functional>
 #include <iterator>
 #include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -144,8 +148,8 @@ public:
     // ── E-SUPERBLOCK: daemonless governance object/vote ingestion ─────────
 
     /// The node-owned governance object/vote store (daemonless superblock payee
-    /// sourcing). main_dash routes the NodeCoinState superblock provider
-    /// through superblock_schedule() below (which folds the desync latch).
+    /// sourcing). main_dash routes the NodeCoinState superblock resolver
+    /// through superblock_resolution() below (which folds every local gate).
     GovernanceStore&       gov_store()       { return m_gov_store; }
     const GovernanceStore& gov_store() const { return m_gov_store; }
 
@@ -166,30 +170,68 @@ public:
     /// `is_superblock_fn(height)` — is this height a superblock height (same
     /// predicate NodeCoinState holds); `budget_fn(height)` — the superblock
     /// budget cap in duffs (superblock_budget). Unset (default) => the
-    /// cross-check and superblock_schedule() are inert (nullopt => fail
-    /// closed), matching the KAT posture.
+    /// cross-check is inert and every verdict is Unknown (fail closed),
+    /// matching the KAT posture.
     void set_superblock_ctx(std::function<bool(uint32_t)> is_superblock_fn,
                             std::function<int64_t(uint32_t)> budget_fn) {
         m_sb_is_fn     = std::move(is_superblock_fn);
         m_sb_budget_fn = std::move(budget_fn);
     }
 
-    /// The daemonless superblock schedule for `height`, folding EVERY local
-    /// gate: the R6 desync latch (a proven-wrong governance view must never
-    /// serve again until re-proven), the superblock ctx being wired, and
-    /// get_superblock_payments' threshold/budget gates. This is what the
-    /// NodeCoinState provider closure calls — never reach around it to the
-    /// raw store. nullopt => NOT trigger-confident => dashd fallback.
+    /// C4: chainparams nSuperblockMaturityWindow (Dash Core v24
+    /// chainparams.cpp: mainnet 1662, testnet 8). At tip == H - window (the
+    /// height masternodes start creating triggers for H — governance/
+    /// signing.cpp CreateSuperblockCandidate) and again at tip == H - 1 the
+    /// maintainer re-requests the per-trigger vote sync for every trigger it
+    /// holds at H. 0 (default) disables only the H - window leg.
+    void set_superblock_maturity_window(int32_t w) { m_sb_maturity_window = w > 0 ? w : 0; }
+
+    /// C4 seams (main_dash wires both to the coin-P2P client):
+    ///   vote_resync(hash)  — per-object vote sync (MNGOVERNANCESYNC nProp=hash
+    ///                        with a NON-empty filter; v24 net_governance.cpp
+    ///                        116-162). Never the nProp=0 full sync.
+    ///   object_fetch(hash) — fetch a missing parent object (MNGOVERNANCESYNC
+    ///                        nProp=hash, EMPTY filter — dashd's own orphan-vote
+    ///                        parent request, net_governance.cpp:47-61/258-265).
+    /// Unset => nothing is sent (the KAT posture).
+    void set_on_trigger_vote_resync(std::function<void(const uint256&)> fn) {
+        m_on_vote_resync = std::move(fn);
+    }
+    void set_on_gov_object_fetch(std::function<void(const uint256&)> fn) {
+        m_on_object_fetch = std::move(fn);
+    }
+
+    /// The daemonless superblock VERDICT for `height`, folding EVERY local
+    /// gate: the R6 desync latch (a proven-wrong governance view never serves
+    /// again until restart), the superblock ctx being wired, the vote-backlog
+    /// overflow, and resolve_superblock_payments (threshold, outstanding
+    /// objects, unverified votes, budget, C1 strict absence, R5 completeness
+    /// for the unfunded verdict). This is what the NodeCoinState resolver
+    /// closure calls — never reach around it to the raw store.
+    SuperblockResolution superblock_resolution(uint32_t height) const {
+        auto r = resolve_at(height, gov_sync_complete());
+        if (r.verdict == SuperblockVerdict::NotTriggered)
+            m_sb_not_triggered_served.store(height, std::memory_order_relaxed);
+        return r;
+    }
+
+    /// Optional-vector view of superblock_resolution: the winning schedule
+    /// (Triggered), {} (NotTriggered — a normal coinbase), nullopt (Unknown).
     std::optional<std::vector<SuperblockPayment>>
     superblock_schedule(uint32_t height) const {
-        if (m_gov_desync_latched) return std::nullopt;   // R6 latch: fail closed
-        if (!m_sb_budget_fn) return std::nullopt;        // ctx not wired
-        return get_superblock_payments(
-            m_gov_store, static_cast<int32_t>(height), m_sb_budget_fn(height));
+        auto r = superblock_resolution(height);
+        switch (r.verdict) {
+            case SuperblockVerdict::Triggered:    return std::move(r.payments);
+            case SuperblockVerdict::NotTriggered: return std::vector<SuperblockPayment>{};
+            case SuperblockVerdict::Unknown:      break;
+        }
+        return std::nullopt;
     }
 
     /// R6 desync latch state (observability / tests).
     bool gov_desync_latched() const { return m_gov_desync_latched; }
+    /// Why the latch fired ("" while unlatched).
+    const std::string& gov_desync_reason() const { return m_gov_desync_reason; }
 
     // ── R5 govsync-completeness determination ────────────────────────────────
     // Models dashcore CMasternodeSync's governance-phase completion (peer
@@ -201,7 +243,7 @@ public:
 
     /// Completeness tunables (main_dash sets these from the deployment; a
     /// single-peer deployment leaves min_peers unmet => permanently INCOMPLETE
-    /// => reward-safe dashd fallback). See govsync_status.hpp for the model.
+    /// => every superblock height refuses). See govsync_status.hpp for the model.
     void set_gov_sync_params(size_t min_peers, int64_t settle_secs,
                              int64_t quiesce_secs) {
         m_gov_sync_status.set_params(min_peers, settle_secs, quiesce_secs);
@@ -227,6 +269,14 @@ public:
     /// Observability handle (logs / tests).
     const GovSyncStatus& gov_sync_status() const { return m_gov_sync_status; }
 
+    /// Tri-state signature check (C3 + vote verify). CannotVerify is NOT a
+    /// rejection: the signer is not resolvable in a CURRENT DMN view yet, or
+    /// no BLS backend is compiled in — the object/vote is held aside and
+    /// blocks the superblock verdict it could affect (fail closed) instead of
+    /// being dropped (which could hide the network's winner) or admitted
+    /// (which could let a forgery win or fill the store).
+    enum class GovSigCheck : uint8_t { Valid, Invalid, CannotVerify };
+
     /// Vote verification seam — the contract the follow-up implementer MUST
     /// build to (WRONG-SCHEME WARNING: trigger funding votes are NOT
     /// ECDSA/keyIDVoting-signed; that path applies only to PROPOSAL funding
@@ -243,14 +293,13 @@ public:
     ///      govvote_signature_hash(outpoint, parent, outcome, signal, time)
     ///      — dashcore CGovernanceVote::CheckSignature(CBLSPublicKey):
     ///      sig.SetBytes(vchSig, false); sig.VerifyInsecure(pubKey,
-    ///      GetSignatureHash(), false). Requires the bls-signatures lib and a
-    ///      from-wire vote + operator-key vector pin BEFORE enabling.
+    ///      GetSignatureHash(), false).
     ///   3. Enforce dashcore CGovernanceVote::IsValid's time bound:
     ///      nTime <= now + 60*60 (an hour of clock skew, no more).
-    /// UNSET (default) => NO vote is counted => the funding tally stays 0 =>
-    /// no trigger ever reaches threshold => the superblock arm FAILS CLOSED to
-    /// dashd. This default stands until BLS vote-verify is pinned; nothing in
-    /// this file verifies votes today.
+    /// UNSET (default) => every vote is CannotVerify => it never counts, and a
+    /// trigger carrying one is Unknown (fail closed). The bool form maps
+    /// true => Valid, false => Invalid; the tri-state form (production) can
+    /// also say CannotVerify.
     struct GovVoteContext {
         uint256              parent_hash;
         uint256              mn_outpoint_hash;
@@ -262,45 +311,92 @@ public:
         uint256              vote_hash;   // govvote_signature_hash (BLS signing digest)
     };
     void set_vote_verifier(std::function<bool(const GovVoteContext&)> fn) {
-        m_vote_verifier = std::move(fn);
+        if (!fn) { m_vote_check = nullptr; return; }
+        m_vote_check = [f = std::move(fn)](const GovVoteContext& v) {
+            return f(v) ? GovSigCheck::Valid : GovSigCheck::Invalid;
+        };
+    }
+    void set_vote_check(std::function<GovSigCheck(const GovVoteContext&)> fn) {
+        m_vote_check = std::move(fn);
     }
 
-    /// Reception path (govobj): ingest a governance object. Only TRIGGER objects
-    /// (type 2) whose vchData parses as a valid superblock payment schedule are
-    /// added to the store; everything else (proposals, malformed triggers) is
-    /// dropped. The trigger's payee vector is re-derived from its OWN vchData
-    /// (parse_superblock_trigger), never guessed — a parse failure fails closed.
+    /// C3 — trigger-object signature seam. dashcore admits a TRIGGER only when
+    /// IsValidLocally(fCheckCollateral=true) holds (Dash Core v24
+    /// governance/object.cpp:746-761, called from ProcessObject /
+    /// AddGovernanceObjectInternal, governance.cpp:228-271/307-321): the
+    /// masternode named by the object's collateral outpoint must exist in the
+    /// TIP list (GetMNByCollateral) and the object's vchSig must verify under
+    /// its OPERATOR key over CGovernanceObject::GetSignatureHash
+    /// (govobject_signature_hash) — sig.SetBytes(vchSig,false);
+    /// VerifyInsecure(pubKeyOperator, hash, false), object.cpp:566-575. An
+    /// unverified trigger is NEVER stored. UNSET => every trigger is
+    /// CannotVerify (held, blocks its height, never stored — fail closed).
+    struct GovObjectContext {
+        uint256              object_hash;        // govobject_hash (identity)
+        int32_t              object_type{0};
+        std::vector<uint8_t> vch_data;           // plaintext JSON bytes
+        uint256              mn_outpoint_hash;
+        uint32_t             mn_outpoint_index{0};
+        std::vector<uint8_t> vch_sig;
+        uint256              sig_hash;           // govobject_signature_hash
+    };
+    void set_object_verifier(std::function<GovSigCheck(const GovObjectContext&)> fn) {
+        m_object_check = std::move(fn);
+    }
+
+    /// Reception path (govobj): ingest a governance object.
+    ///   PROPOSAL  — remembered by hash (its funding votes are voting-key
+    ///               votes this store never tallies; knowing the hash keeps
+    ///               them out of the orphan path).
+    ///   TRIGGER   — C3 signature check FIRST (Invalid => dropped, as dashd
+    ///               drops it; CannotVerify => held as UnverifiedPending and
+    ///               retried every block), THEN the chain-strict schedule
+    ///               parse (failure => Unparsed: C2, blocks the cycle), THEN
+    ///               the bounded store (full => StoreFull: C2, blocks). A
+    ///               trigger for an already-connected height is history.
     /// NOTE: wire vchData is the PLAINTEXT JSON bytes (dashcore
     /// GetDataAsPlainString does no hex layer; RPC DataHex is hex OF these
-    /// bytes). The parse is CHAIN-STRICT per set_gov_params.
-    void on_govobject(const uint256& object_hash, int32_t object_type,
-                      const std::vector<uint8_t>& vch_data) {
+    /// bytes).
+    void on_govobject(const GovObjectContext& o) {
         // R5: ANY object arrival (trigger, proposal, or malformed) proves the
         // peer is still streaming its set — re-arm the quiescence window BEFORE
         // the type filter, so a stream of proposals still keeps us "mid-sync".
         m_gov_sync_status.note_object_arrival(m_now_fn());
-        if (object_type != GOVERNANCE_OBJECT_TRIGGER) return;   // only superblock triggers
-        std::string plain(vch_data.begin(), vch_data.end());
-        auto trig = parse_superblock_trigger(plain, object_hash, m_gov_testnet);
-        if (!trig) return;                                      // malformed → fail closed
-        if (!m_gov_store.add_trigger(*trig)) {
-            LOG_WARNING << "[GOVSYNC] trigger store FULL ("
-                        << m_gov_store.trigger_count()
-                        << ") — dropping trigger "
-                        << object_hash.GetHex().substr(0, 16);
+        if (o.object_type == GOVERNANCE_OBJECT_PROPOSAL) {
+            note_proposal(o.object_hash);
+            drop_orphans_of(o.object_hash);
+            m_gov_store.clear_outstanding(o.object_hash);
             return;
         }
-        LOG_INFO << "[GOVSYNC] trigger " << object_hash.GetHex().substr(0, 16)
-                 << " for superblock h=" << trig->event_block_height << " with "
-                 << trig->payments.size() << " payee(s), total="
-                 << trig->total_amount() << " duffs";
+        if (o.object_type != GOVERNANCE_OBJECT_TRIGGER) return;
+        ++m_gov_triggers_seen;
+        if (m_gov_store.has_trigger(o.object_hash) || m_gov_store.is_erased(o.object_hash))
+            return;                                             // idempotent / history
+        ingest_trigger_object(o);
     }
 
-    /// Reception path (govobjvote): ingest a governance vote. Only FUNDING-signal
-    /// votes on a KNOWN trigger are relevant; the vote is counted ONLY if the
-    /// verifier confirms its signature — for trigger funding votes that is BLS
-    /// by the MN's OPERATOR key (see set_vote_verifier — default UNSET =>
-    /// never counted => fail closed).
+    /// Back-compat form (KATs): an object with no signer / signature. A
+    /// TRIGGER here is CannotVerify unless a test verifier says otherwise.
+    void on_govobject(const uint256& object_hash, int32_t object_type,
+                      const std::vector<uint8_t>& vch_data) {
+        GovObjectContext o;
+        o.object_hash = object_hash;
+        o.object_type = object_type;
+        o.vch_data    = vch_data;
+        on_govobject(o);
+    }
+
+    /// Reception path (govobjvote): ingest a governance vote. Only FUNDING-
+    /// signal votes matter. A vote on a STORED trigger is verified (Valid =>
+    /// tallied; CannotVerify => recorded as unverifiable — keeps the
+    /// trigger's height Unknown — and retried every block; Invalid =>
+    /// dropped). A vote whose parent we do NOT hold is an ORPHAN (dashd keeps
+    /// orphan votes and asks for the parent: governance.cpp:278-305,
+    /// net_governance.cpp:258-265): buffered (bounded) so a later trigger
+    /// arrival still gets it without a re-download, and — when it is a
+    /// non-Invalid YES — it marks its parent OrphanYesVote (a masternode wants
+    /// a trigger we do not hold funded => "not triggered" is unprovable this
+    /// cycle) and the parent is fetched.
     void on_govvote(const GovVoteContext& v, const std::string& mn_outpoint_key) {
         // R5: ANY vote arrival re-arms the quiescence window (mid-sync signal),
         // BEFORE the signal/outcome/known-trigger filters below.
@@ -314,13 +410,25 @@ public:
         // in c2pool after the voter withdrew it (tally inflation vs dashd).
         if (v.outcome < VOTE_OUTCOME_NONE || v.outcome > VOTE_OUTCOME_ABSTAIN)
             return;
-        if (!m_gov_store.has_trigger(v.parent_hash)) return;    // vote for a non-trigger → ignore
-        if (!m_vote_verifier || !m_vote_verifier(v)) {
-            // Unverified (default) or failed verify: DO NOT count. Fail closed.
+        if (m_gov_store.has_trigger(v.parent_hash)) {
+            tally_vote(v, mn_outpoint_key);
             return;
         }
-        m_gov_store.add_verified_funding_vote(
-            v.parent_hash, mn_outpoint_key, v.outcome, v.time);
+        // History (executed/expired trigger) or a proposal's funding vote
+        // (voting-key path, never tallied here).
+        if (m_gov_store.is_erased(v.parent_hash) || is_proposal(v.parent_hash)) return;
+        ingest_orphan_vote(v, mn_outpoint_key);
+    }
+
+    /// Observability (EMBED-STATUS / tests).
+    uint64_t gov_triggers_seen() const      { return m_gov_triggers_seen; }
+    uint64_t gov_triggers_rejected() const  { return m_gov_triggers_rejected; }
+    size_t   gov_pending_objects() const    { return m_pending_objects.size(); }
+    size_t   gov_orphan_votes() const       { return m_orphan_total; }
+    size_t   gov_unverifiable_votes() const { return m_unverifiable_votes.size(); }
+    /// Last verdict this node handed the serve path as NotTriggered (0 = none).
+    uint32_t gov_not_triggered_served_height() const {
+        return m_sb_not_triggered_served.load(std::memory_order_relaxed);
     }
 
     /// Reception path (mnlistdiff): replace the masternode set the embedded
@@ -1488,6 +1596,9 @@ private:
         // restart / future re-proof path unlatches), demote to the dashd
         // fallback, and log loudly.
         cross_check_superblock_on_block(block, height);
+        // Every block: prune executed/expired triggers, retry held signature
+        // checks, and fire the C4 vote re-syncs at H - window and H - 1.
+        governance_on_block(height);
 
         // E2c snapshot fence: blocks the payout-bearing snapshot already
         // reflects (height <= its as-of height) must NOT be re-folded -- the
@@ -2243,57 +2354,487 @@ private:
             governance_funding_threshold(weighted, m_gov_min_quorum));
     }
 
-    // E-SUPERBLOCK (R6): superblock desync cross-check (see the call site in
-    // on_block_connected for the rationale). Compares the schedule we WOULD
-    // have served at `height` against the actual coinbase outputs of the
-    // network-accepted block at that height.
+    // E-SUPERBLOCK (R6 + C5): superblock desync cross-check (see the call
+    // site in on_block_connected for the rationale). Resolves the STRUCTURAL
+    // verdict our store held for `height` (R5 forced true: the question is
+    // what the store says, not whether we served) and holds it against the
+    // network-accepted coinbase at that height:
+    //   Triggered    => R6: the coinbase must carry our schedule exactly as
+    //                   CSuperblock::IsValid matches it (v24-strict when v24
+    //                   is active at the height); a miss latches.
+    //   NotTriggered => C5 (reverse R6): when that verdict was or could have
+    //                   been served, the coinbase must stay within the
+    //                   non-superblock block value; more latches.
     void cross_check_superblock_on_block(const dash::coin::BlockType& block,
                                          uint32_t height) {
         if (!m_sb_is_fn || !m_sb_is_fn(height)) return;   // not a superblock height
-        // Resolve our confident view FIRST (superblock_schedule folds the
-        // latch + threshold/budget gates), THEN prune the executed cycle.
-        auto ours = superblock_schedule(height);
-        if (ours && !ours->empty() && !block.m_txs.empty()) {
-            const auto& cb = block.m_txs[0];
-            bool all_found = true;
-            for (const auto& sp : *ours) {
-                bool found = false;
-                for (const auto& out : cb.vout) {
-                    if (out.value == sp.amount &&
-                        out.scriptPubKey.m_data.size() == sp.script.size() &&
-                        std::equal(sp.script.begin(), sp.script.end(),
-                                   out.scriptPubKey.m_data.begin())) {
-                        found = true;
-                        break;
-                    }
-                }
-                if (!found) { all_found = false; break; }
-            }
-            if (!all_found) {
-                LOG_WARNING << "[GOVSYNC] SUPERBLOCK DESYNC at h=" << height
-                            << " — our trigger-confident schedule ("
-                            << ours->size() << " payee(s)) does NOT match the "
-                               "accepted block's coinbase. Clearing governance "
-                               "store + LATCHING the superblock arm closed "
-                               "(superblock heights fail to dashd until "
-                               "restart); re-issuing work.";
-                m_gov_store.clear();
-                m_gov_sync_status.reset();   // R5: a proven-wrong view is no
-                                             // longer "complete"; force re-sync
-                m_gov_desync_latched = true;
-                // Transient invalidate + re-issue so any currently-published
-                // template is rebuilt. The MN axis is a separate axis — if it
-                // is healthy the arm re-publishes for NON-superblock heights;
-                // superblock heights stay closed via the latch above
-                // (superblock_schedule => nullopt => resolve_superblock
-                // refuses => dashd fallback).
-                demote();
-                notify_state_dirty();
+        if (!block.m_txs.empty()) {
+            const auto res = resolve_at(height, /*sync_complete=*/true);
+            if (res.verdict == SuperblockVerdict::Triggered) {
+                const bool v24 = m_state.v24_state_for(height) == V24State::ACTIVE;
+                if (!coinbase_carries_schedule(block.m_txs[0], res.payments, v24))
+                    latch_gov_desync(height,
+                        "our trigger-confident schedule (" +
+                        std::to_string(res.payments.size()) +
+                        " payee(s)) does NOT match the accepted block's coinbase");
+            } else if (res.verdict == SuperblockVerdict::NotTriggered &&
+                       (gov_sync_complete() ||
+                        m_sb_not_triggered_served.load(std::memory_order_relaxed) == height)) {
+                reverse_check_not_triggered(block, height);
             }
         }
-        // The cycle at `height` has executed — dashcore erases executed
-        // triggers; prune keeps the store bounded across cycles (F2).
+        // The cycle at `height` has executed — its unknown-height records
+        // (unparsed objects, orphan-YES parents, overflow latches) are over.
+        // Height-bound pruning runs for every block in governance_on_block.
+        end_gov_cycle();
+    }
+
+    // ── E-SUPERBLOCK private machinery ───────────────────────────────────
+
+    /// Bounds for the maintainer-side governance buffers (see on_govvote).
+    static constexpr size_t GOV_MAX_PENDING_OBJECTS   = 64;
+    static constexpr size_t GOV_MAX_ORPHAN_VOTES      = 8192;
+    static constexpr size_t GOV_MAX_UNVERIFIABLE_RETRY = 8192;
+    static constexpr size_t GOV_MAX_PROPOSALS         = 4096;
+
+    struct HeldVote {
+        GovVoteContext v;
+        std::string    key;
+        bool           verified{false};   // orphan buffer: signature already Valid
+    };
+
+    /// The verdict with every local gate, for an explicit R5 value (the
+    /// cross-check evaluates the STRUCTURAL verdict with R5 forced true).
+    SuperblockResolution resolve_at(uint32_t height, bool sync_complete) const {
+        if (m_gov_desync_latched) return SuperblockResolution::unknown("trigger-latched");
+        if (!m_sb_budget_fn)      return SuperblockResolution::unknown("trigger-ctx-unwired");
+        if (m_orphan_overflow)    return SuperblockResolution::unknown("trigger-vote-backlog");
+        return resolve_superblock_payments(m_gov_store, static_cast<int32_t>(height),
+                                           m_sb_budget_fn(height), sync_complete);
+    }
+
+    GovSigCheck check_object(const GovObjectContext& o) const {
+        return m_object_check ? m_object_check(o) : GovSigCheck::CannotVerify;
+    }
+    GovSigCheck check_vote(const GovVoteContext& v) const {
+        return m_vote_check ? m_vote_check(v) : GovSigCheck::CannotVerify;
+    }
+
+    void ingest_trigger_object(const GovObjectContext& o) {
+        const auto chk = check_object(o);
+        if (chk == GovSigCheck::Invalid) {
+            // dashd IsValidLocally false => ProcessObject returns false, the
+            // object is never stored or relayed (governance.cpp:262-270).
+            ++m_gov_triggers_rejected;
+            // Real masternodes vote only on triggers dashd accepted, so a
+            // (non-Invalid) masternode YES already buffered for an object we
+            // now reject means OUR check disagrees with the network: keep the
+            // unfunded verdict unprovable (OrphanYesVote) instead of clearing.
+            if (has_orphan_yes(o.object_hash))
+                m_gov_store.note_outstanding(o.object_hash,
+                                             GovOutstandingKind::OrphanYesVote, 0);
+            else
+                m_gov_store.clear_outstanding(o.object_hash);
+            LOG_WARNING << "[GOVSYNC] trigger " << o.object_hash.GetHex().substr(0, 16)
+                        << " REJECTED: masternode signature invalid (dashd "
+                           "IsValidLocally parity) — not stored";
+            drop_pending_object(o.object_hash);
+            return;
+        }
+        std::string plain(o.vch_data.begin(), o.vch_data.end());
+        auto trig = parse_superblock_trigger(plain, o.object_hash, m_gov_testnet);
+        if (chk == GovSigCheck::CannotVerify) {
+            const int32_t eh = trig ? trig->event_block_height : 0;
+            if (trig && is_history_height(eh)) {           // cannot matter any more
+                m_gov_store.note_erased(o.object_hash);
+                drop_pending_object(o.object_hash);
+                return;
+            }
+            m_gov_store.note_outstanding(o.object_hash,
+                                         GovOutstandingKind::UnverifiedPending, eh);
+            hold_pending_object(o);
+            LOG_INFO << "[GOVSYNC] trigger " << o.object_hash.GetHex().substr(0, 16)
+                     << " signature NOT YET VERIFIABLE (signer not in a current "
+                        "DMN view / no BLS backend) — held, blocks h="
+                     << (eh ? std::to_string(eh) : std::string("cycle"));
+            return;
+        }
+        drop_pending_object(o.object_hash);
+        admit_verified_trigger(o, trig);
+    }
+
+    void admit_verified_trigger(const GovObjectContext& o,
+                                const std::optional<GovernanceTrigger>& trig) {
+        if (!trig) {
+            // C2: a masternode-signed TRIGGER we cannot parse. dashd may parse
+            // it (our parser is deliberately narrower in places), so its
+            // existence makes every verdict this cycle unprovable.
+            m_gov_store.note_outstanding(o.object_hash, GovOutstandingKind::Unparsed, 0);
+            LOG_WARNING << "[GOVSYNC] trigger " << o.object_hash.GetHex().substr(0, 16)
+                        << " signed but UNPARSEABLE — superblock verdicts this "
+                           "cycle are Unknown (fail closed)";
+            return;
+        }
+        if (is_history_height(trig->event_block_height)) {
+            // Executed / expired: dashd keeps executed triggers for a cycle to
+            // serve syncs (superblock.cpp:338-372), they can never pay again.
+            m_gov_store.note_erased(o.object_hash);
+            m_gov_store.clear_outstanding(o.object_hash);
+            drop_orphans_of(o.object_hash);
+            return;
+        }
+        if (!m_gov_store.add_trigger(*trig)) {
+            m_gov_store.note_outstanding(o.object_hash, GovOutstandingKind::StoreFull,
+                                         trig->event_block_height);
+            LOG_WARNING << "[GOVSYNC] trigger store FULL ("
+                        << m_gov_store.trigger_count()
+                        << ") — dropping trigger "
+                        << o.object_hash.GetHex().substr(0, 16)
+                        << " (recorded: h=" << trig->event_block_height
+                        << " verdict is Unknown)";
+            return;
+        }
+        m_gov_store.clear_outstanding(o.object_hash);
+        LOG_INFO << "[GOVSYNC] trigger " << o.object_hash.GetHex().substr(0, 16)
+                 << " (signature verified) for superblock h="
+                 << trig->event_block_height << " with "
+                 << trig->payments.size() << " payee(s), total="
+                 << trig->total_amount() << " duffs";
+        replay_orphans_of(o.object_hash);
+    }
+
+    /// A height at or below the serve tip has been connected: a trigger for
+    /// it can never pay again.
+    bool is_history_height(int32_t event_height) const {
+        return m_have_tip && event_height > 0 &&
+               event_height <= static_cast<int32_t>(m_prev_height);
+    }
+
+    void tally_vote(const GovVoteContext& v, const std::string& key) {
+        switch (check_vote(v)) {
+            case GovSigCheck::Valid:
+                m_gov_store.add_verified_funding_vote(v.parent_hash, key, v.outcome, v.time);
+                return;
+            case GovSigCheck::CannotVerify:
+                m_gov_store.note_unverifiable_vote(v.parent_hash, key);
+                if (m_unverifiable_votes.size() < GOV_MAX_UNVERIFIABLE_RETRY)
+                    m_unverifiable_votes.push_back(HeldVote{v, key});
+                return;
+            case GovSigCheck::Invalid:
+                // forged / wrong key: never counted (and no longer clouding
+                // the tally if it was held as unverifiable before)
+                m_gov_store.clear_unverifiable_vote(v.parent_hash, key);
+                return;
+        }
+    }
+
+    bool has_orphan_yes(const uint256& parent) const {
+        auto it = m_orphan_votes.find(parent);
+        if (it == m_orphan_votes.end()) return false;
+        for (const auto& h : it->second)
+            if (h.v.outcome == VOTE_OUTCOME_YES) return true;
+        return false;
+    }
+
+    void ingest_orphan_vote(const GovVoteContext& v, const std::string& key) {
+        const auto chk = check_vote(v);
+        if (chk == GovSigCheck::Invalid) return;        // proposal (ECDSA) votes land here
+        if (m_orphan_total >= GOV_MAX_ORPHAN_VOTES) {
+            m_orphan_overflow = true;                   // fail closed until the cycle prunes
+            return;
+        }
+        m_orphan_votes[v.parent_hash].push_back(HeldVote{v, key, chk == GovSigCheck::Valid});
+        ++m_orphan_total;
+        if (v.outcome != VOTE_OUTCOME_YES) return;
+        // A (verified or not-yet-verifiable) masternode YES for a trigger we do
+        // not hold. Keep a stronger existing record (pending/unparsed/full
+        // carry the parent's height or block the cycle already).
+        if (!m_gov_store.is_outstanding(v.parent_hash))
+            m_gov_store.note_outstanding(v.parent_hash, GovOutstandingKind::OrphanYesVote, 0);
+        if (m_on_object_fetch && m_fetched_parents.insert(v.parent_hash).second) {
+            LOG_INFO << "[GOVSYNC] orphan FUNDING YES for unknown parent "
+                     << v.parent_hash.GetHex().substr(0, 16)
+                     << " — fetching the object (verdicts Unknown until it lands)";
+            m_on_object_fetch(v.parent_hash);
+        }
+    }
+
+    void replay_orphans_of(const uint256& parent) {
+        auto it = m_orphan_votes.find(parent);
+        if (it == m_orphan_votes.end()) return;
+        auto held = std::move(it->second);
+        m_orphan_total -= std::min(m_orphan_total, held.size());
+        m_orphan_votes.erase(it);
+        for (const auto& h : held) tally_vote(h.v, h.key);
+    }
+
+    void drop_orphans_of(const uint256& parent) {
+        auto it = m_orphan_votes.find(parent);
+        if (it == m_orphan_votes.end()) return;
+        m_orphan_total -= std::min(m_orphan_total, it->second.size());
+        m_orphan_votes.erase(it);
+    }
+
+    void hold_pending_object(const GovObjectContext& o) {
+        for (auto& p : m_pending_objects)
+            if (p.object_hash == o.object_hash) { p = o; return; }
+        if (m_pending_objects.size() >= GOV_MAX_PENDING_OBJECTS) return; // record still blocks
+        m_pending_objects.push_back(o);
+    }
+    void drop_pending_object(const uint256& h) {
+        m_pending_objects.erase(
+            std::remove_if(m_pending_objects.begin(), m_pending_objects.end(),
+                           [&](const GovObjectContext& p) { return p.object_hash == h; }),
+            m_pending_objects.end());
+    }
+
+    void note_proposal(const uint256& h) {
+        if (!m_proposals.insert(h).second) return;
+        m_proposal_order.push_back(h);
+        while (m_proposal_order.size() > GOV_MAX_PROPOSALS) {
+            m_proposals.erase(m_proposal_order.front());
+            m_proposal_order.pop_front();
+        }
+    }
+    bool is_proposal(const uint256& h) const { return m_proposals.count(h) != 0; }
+
+    /// Re-run every held signature check (the DMN view or BLS backend may
+    /// have caught up). Cheap: the buffers are bounded and a CannotVerify
+    /// answer returns before any pairing.
+    void retry_gov_pending() {
+        if (!m_pending_objects.empty()) {
+            auto pending = std::move(m_pending_objects);
+            m_pending_objects.clear();
+            for (const auto& o : pending) {
+                if (m_gov_store.has_trigger(o.object_hash) || m_gov_store.is_erased(o.object_hash))
+                    continue;
+                ingest_trigger_object(o);
+            }
+        }
+        if (!m_unverifiable_votes.empty()) {
+            auto held = std::move(m_unverifiable_votes);
+            m_unverifiable_votes.clear();
+            for (const auto& h : held) {
+                if (!m_gov_store.has_trigger(h.v.parent_hash)) continue;
+                tally_vote(h.v, h.key);   // CannotVerify re-queues itself
+            }
+        }
+        // Orphans held as not-yet-verifiable: settle them, and lift an
+        // OrphanYesVote blocker whose only YES turned out Invalid.
+        for (auto it = m_orphan_votes.begin(); it != m_orphan_votes.end();) {
+            auto& bucket = it->second;
+            for (auto h = bucket.begin(); h != bucket.end();) {
+                if (h->verified) { ++h; continue; }
+                const auto chk = check_vote(h->v);
+                if (chk == GovSigCheck::Invalid) {
+                    h = bucket.erase(h);
+                    if (m_orphan_total > 0) --m_orphan_total;
+                    continue;
+                }
+                if (chk == GovSigCheck::Valid) h->verified = true;
+                ++h;
+            }
+            const uint256 parent = it->first;
+            if (m_gov_store.outstanding_kind(parent) == GovOutstandingKind::OrphanYesVote &&
+                !has_orphan_yes(parent))
+                m_gov_store.clear_outstanding(parent);
+            if (bucket.empty()) it = m_orphan_votes.erase(it);
+            else ++it;
+        }
+    }
+
+    /// C4: per-trigger vote re-sync for superblock height `sb_h` (never the
+    /// nProp=0 full sync — dashd penalises repeats, net_governance.cpp
+    /// 116-130). Also re-asks the parent of every orphan-YES record.
+    void request_trigger_votes(uint32_t sb_h, const char* leg) {
+        size_t n_votes = 0, n_fetch = 0;
+        if (m_on_vote_resync) {
+            for (const auto& h : m_gov_store.trigger_hashes_at(static_cast<int32_t>(sb_h))) {
+                m_on_vote_resync(h);
+                ++n_votes;
+            }
+        }
+        if (m_on_object_fetch) {
+            for (const auto& h : m_gov_store.orphan_yes_parents()) {
+                m_on_object_fetch(h);
+                ++n_fetch;
+            }
+        }
+        LOG_INFO << "[GOVSYNC] C4 " << leg << " for superblock h=" << sb_h
+                 << ": per-trigger vote re-sync x" << n_votes
+                 << ", orphan-parent fetch x" << n_fetch
+                 << " (triggers=" << m_gov_store.trigger_count()
+                 << " outstanding=" << m_gov_store.outstanding_count() << ")";
+    }
+
+    /// Governance bookkeeping on EVERY connected block (after the R6/C5
+    /// cross-check): prune executed/expired triggers (restart-resynced
+    /// history included), retry held signature checks, and fire the C4
+    /// re-syncs at H - maturity window and H - 1.
+    void governance_on_block(uint32_t height) {
         m_gov_store.prune_executed(static_cast<int32_t>(height));
+        if (!m_sb_is_fn) return;
+        retry_gov_pending();
+        if (m_sb_maturity_window > 0 &&
+            m_sb_is_fn(height + static_cast<uint32_t>(m_sb_maturity_window)))
+            request_trigger_votes(height + static_cast<uint32_t>(m_sb_maturity_window),
+                                  "H-maturity-window");
+        if (m_sb_is_fn(height + 1))
+            request_trigger_votes(height + 1, "H-1");
+    }
+
+    /// The superblock at `height` is connected: end the cycle's unknown-height
+    /// bookkeeping.
+    void end_gov_cycle() {
+        m_gov_store.prune_cycle();
+        m_orphan_votes.clear();
+        m_orphan_total = 0;
+        m_orphan_overflow = false;
+        m_fetched_parents.clear();
+    }
+
+    void latch_gov_desync(uint32_t height, const std::string& why) {
+        LOG_WARNING << "[GOVSYNC] SUPERBLOCK DESYNC at h=" << height << " — " << why
+                    << ". Clearing governance store + LATCHING the superblock "
+                       "arm closed (every superblock height refuses until "
+                       "restart); re-issuing work.";
+        m_gov_store.clear();
+        m_gov_sync_status.reset();   // R5: a proven-wrong view is no
+                                     // longer "complete"; force re-sync
+        m_gov_desync_latched = true;
+        m_gov_desync_reason = why;
+        m_pending_objects.clear();
+        m_unverifiable_votes.clear();
+        // Transient invalidate + re-issue so any currently-published
+        // template is rebuilt. The MN axis is a separate axis — if it
+        // is healthy the arm re-publishes for NON-superblock heights;
+        // superblock heights stay closed via the latch (Unknown
+        // "trigger-latched" => resolve_superblock refuses).
+        demote();
+        notify_state_dirty();
+    }
+
+    /// dashcore CSuperblock::IsValid payment matching (Dash Core v24
+    /// governance/superblock.cpp:296-333): every expected payment, IN ORDER,
+    /// must find a (script, amount)-equal output at or after the previous
+    /// match — from v24 strictly after it (each payment consumes a distinct
+    /// output), before v24 at the previous index inclusive.
+    static bool coinbase_carries_schedule(const dash::coin::MutableTransaction& cb,
+                                          const std::vector<SuperblockPayment>& pays,
+                                          bool v24) {
+        int idx = -1;
+        const int n = static_cast<int>(cb.vout.size());
+        for (const auto& sp : pays) {
+            bool found = false;
+            const int start = v24 ? idx + 1 : std::max(idx, 0);
+            for (int j = start; j < n; ++j) {
+                const auto& out = cb.vout[j];
+                if (out.value == sp.amount &&
+                    out.scriptPubKey.m_data.size() == sp.script.size() &&
+                    std::equal(sp.script.begin(), sp.script.end(),
+                               out.scriptPubKey.m_data.begin())) {
+                    idx = j;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return false;
+        }
+        return true;
+    }
+
+    /// C5 helper — the maximum block value (subsidy + fees) the accepted
+    /// coinbase's OWN masternode payment admits, fee-free:
+    ///   masternodeReward R = GetMasternodePayment(h, subsidy + fees)
+    ///                      = (subsidy + fees) * 3 / 4        (payments.cpp
+    ///                        96-101, every post-realloc era)
+    /// and GetBlockTxOuts pays exactly R as [platform OP_RETURN P] + owner
+    /// payouts / shares + operator (payments.cpp:131-199; the splits sum to
+    /// R - P exactly). So R = P + sum(MN outputs), recognised by the projected
+    /// payee's scripts and then RE-DERIVED and matched output-for-output with
+    /// strict multiplicity. floor(3V/4) = R  =>  V <= (4R + 3) / 3.
+    /// nullopt (with `why`) whenever any step cannot be proven.
+    std::optional<int64_t> mn_derived_block_value_max(const dash::coin::BlockType& block,
+                                                      uint32_t height,
+                                                      std::string& why) const {
+        namespace pay = vendor::payments;
+        const auto& cb = block.m_txs[0];
+        const int64_t P = dash::coin::compute_dash_platform_reward_post_v20_mn_rr(
+            height, m_state.mn_rr_height());
+        if (P <= 0) { why = "pre-evo-reward-era"; return std::nullopt; }
+        const MnStateMachine& mns = std::as_const(m_state).mnstates();
+        if (mns.last_applied_height() + 1 != height) {
+            why = "mn-view-not-at-parent(" + std::to_string(mns.last_applied_height()) + ")";
+            return std::nullopt;
+        }
+        const auto expected = mns.find_expected_payee();
+        if (!expected) { why = "mn-payee-unresolved"; return std::nullopt; }
+        auto eit = mns.entries().find(*expected);
+        if (eit == mns.entries().end()) { why = "mn-payee-unresolved"; return std::nullopt; }
+        const pay::DmnPayee payee = pay::dmn_payee_of(eit->second);
+
+        std::vector<pay::CTxOut> actual;
+        actual.reserve(cb.vout.size());
+        for (const auto& o : cb.vout) actual.emplace_back(o.value, o.scriptPubKey.m_data);
+
+        // Probe the payee's script set (amounts are irrelevant here; the probe
+        // reward is large enough that no split rounds to zero and small enough
+        // that operator/owner products stay inside int64).
+        std::vector<pay::CTxOut> probe;
+        pay::GetBlockTxOutsForPayee(&payee, /*masternodeReward=*/1'000'000'000'000LL, P,
+                                    /*evo_reward_era=*/true, probe);
+        std::map<pay::CScript, size_t> want;
+        for (size_t i = 1; i < probe.size(); ++i) ++want[probe[i].scriptPubKey];
+        int64_t mn_sum = 0;
+        for (const auto& [script, n_expected] : want) {
+            size_t n_found = 0;
+            for (const auto& a : actual) {
+                if (a.scriptPubKey != script) continue;
+                ++n_found;
+                mn_sum += a.nValue;
+            }
+            if (n_found > n_expected) {          // an MN script also used elsewhere
+                why = "mn-script-ambiguous";
+                return std::nullopt;
+            }
+        }
+        const int64_t R = mn_sum + P;
+        std::vector<pay::CTxOut> exact;
+        pay::GetBlockTxOutsForPayee(&payee, R, P, /*evo_reward_era=*/true, exact);
+        if (pay::FindUnmatchedMasternodePayment(exact, actual, /*strict_multiplicity=*/true) != -1) {
+            why = "mn-outputs-unverified";
+            return std::nullopt;
+        }
+        return (4 * R + 3) / 3;
+    }
+
+    /// C5 (reverse R6): our verdict at the superblock height `height` was
+    /// NotTriggered, but did the network pay a superblock? dashd caps a
+    /// not-triggered superblock height's coinbase at blockReward = subsidy +
+    /// fees (payments.cpp:365-373); a triggered one may carry blockReward +
+    /// the trigger total. Coinbase value above the MN-derived block-value
+    /// ceiling therefore proves a superblock we called absent. Anything we
+    /// cannot prove is treated as a desync too (fail closed).
+    void reverse_check_not_triggered(const dash::coin::BlockType& block, uint32_t height) {
+        std::string why;
+        const auto vmax = mn_derived_block_value_max(block, height, why);
+        int64_t total = 0;
+        for (const auto& o : block.m_txs[0].vout) total += o.value;
+        if (!vmax) {
+            latch_gov_desync(height, "our verdict was NOT-TRIGGERED and the accepted "
+                                     "coinbase could not be proven superblock-free (" + why + ")");
+            return;
+        }
+        if (total > *vmax) {
+            latch_gov_desync(height, "our verdict was NOT-TRIGGERED but the accepted "
+                                     "coinbase pays " + std::to_string(total) +
+                                     " > block value ceiling " + std::to_string(*vmax) +
+                                     " (the network paid a superblock we did not see)");
+            return;
+        }
+        LOG_INFO << "[GOVSYNC] superblock h=" << height << " NOT-TRIGGERED verdict "
+                 << "confirmed by the accepted coinbase (value " << total
+                 << " <= ceiling " << *vmax << ")";
     }
 
     // ── BODY-FIRST serve-tip machinery ───────────────────────────────────
@@ -2665,14 +3206,35 @@ private:
     std::function<int64_t()> m_now_fn{[]() {
         return static_cast<int64_t>(std::time(nullptr));
     }};
-    // Vote-verify seam (unset = fail closed). Contract: BLS by the MN's
-    // OPERATOR key for trigger funding votes — see set_vote_verifier docs.
-    std::function<bool(const GovVoteContext&)> m_vote_verifier;
+    // Vote-verify seam (unset = CannotVerify = never counted). Contract: BLS
+    // by the MN's OPERATOR key for trigger funding votes — see
+    // set_vote_verifier docs.
+    std::function<GovSigCheck(const GovVoteContext&)> m_vote_check;
+    // C3 trigger-object signature seam (unset = CannotVerify = never stored).
+    std::function<GovSigCheck(const GovObjectContext&)> m_object_check;
     bool m_gov_testnet{false};       // chain-strict trigger address decode
     int  m_gov_min_quorum{0};        // chainparams nGovernanceMinQuorum (0 = unset => fail closed)
-    bool m_gov_desync_latched{false};// R6: proven-wrong governance view => never serve
+    bool m_gov_desync_latched{false};// R6/C5: proven-wrong governance view => never serve
+    std::string m_gov_desync_reason; // why the latch fired
     std::function<bool(uint32_t)>    m_sb_is_fn;      // superblock-height predicate (R6)
     std::function<int64_t(uint32_t)> m_sb_budget_fn;  // superblock budget cap (duffs)
+    int32_t m_sb_maturity_window{0};                  // C4: nSuperblockMaturityWindow
+    std::function<void(const uint256&)> m_on_vote_resync;   // C4 per-trigger vote sync
+    std::function<void(const uint256&)> m_on_object_fetch;  // orphan parent fetch
+    // C5: the last height superblock_resolution() answered NotTriggered for
+    // (written from the serve path's const call, read on block connect).
+    mutable std::atomic<uint32_t> m_sb_not_triggered_served{0};
+    // C3 held objects / votes awaiting a verifiable signer; C4 orphans.
+    std::vector<GovObjectContext> m_pending_objects;
+    std::vector<HeldVote> m_unverifiable_votes;
+    std::map<uint256, std::vector<HeldVote>> m_orphan_votes;
+    size_t m_orphan_total{0};
+    bool   m_orphan_overflow{false};
+    std::set<uint256> m_fetched_parents;     // orphan parents asked this cycle
+    std::set<uint256> m_proposals;           // known proposal hashes (bounded)
+    std::deque<uint256> m_proposal_order;
+    uint64_t m_gov_triggers_seen{0};
+    uint64_t m_gov_triggers_rejected{0};
     std::function<void()> m_on_state_dirty;  // SML/bestCL/reorg -> re-issue work
     std::function<void()> m_on_mn_reseed;    // payee desync -> authoritative protx re-seed
     ReseedReason m_last_reseed_reason{ReseedReason::None};   // F2: why the last ask fired
