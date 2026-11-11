@@ -591,7 +591,7 @@ C2P_PARAM("embedded.superblock", Embedded, BOOL, RESTART, C_DASH, LIT, "false", 
 C2P_PARAM("embedded.govsync", Embedded, BOOL, RESTART, C_DASH, LIT, "false", NONE, "observe-only governance store")
   C2P_ALIAS("embedded.govsync", BIN_DASH, "--embedded-govsync", FLAG)
 
-C2P_PARAM("embedded.superblock_unfunded_mainnet", Embedded, BOOL, RESTART, C_DASH, LIT, "false", NONE, "MAINNET opt-in: serve a proven-unfunded superblock height with a normal coinbase (testnet always on)")
+C2P_PARAM("embedded.superblock_unfunded_mainnet", Embedded, BOOL, RESTART, C_DASH, LIT, "false", NONE, "TEST/SOAK ONLY - never set on a production mainnet node: serve a superblock height the node believes unfunded with a normal coinbase (default off = refuse; testnet always on)")
   C2P_ALIAS("embedded.superblock_unfunded_mainnet", BIN_DASH, "--embedded-superblock-unfunded-mainnet", FLAG)
 
 C2P_PARAM("embedded.serve_mempool_txs", Embedded, TRISTATE_BOOL, RESTART, C_DASH|C_BIP110|C_DGB, NONE, "", NONE, "fee-carrying templates (daemonless default ON; DGB: advisory GBT only -- the mined stratum job stays coinbase-only until the S2 job-commit lands)")

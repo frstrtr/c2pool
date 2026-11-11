@@ -2746,8 +2746,14 @@ private:
                 for (const auto& p : m_pending_objects)
                     if (p.object_hash == h) { held = true; break; }
                 if (held) continue;
-                m_gov_store.clear_outstanding(h);
-                m_on_object_fetch(h);
+                // MED-C: the record is KEPT until the object actually arrives
+                // again and is verified for real — a fetch that never delivers
+                // (a v23 peer answers nothing) must not make us forget a real
+                // competing trigger. A masternode YES already seen for it
+                // makes it an orphan-YES parent (cycle-wide blocker).
+                if (has_orphan_yes(h))
+                    m_gov_store.note_outstanding(h, GovOutstandingKind::OrphanYesVote, 0);
+                if (m_refetched.insert(h).second) m_on_object_fetch(h);   // once per cycle
             }
         }
         if (!m_pending_objects.empty()) {
@@ -2850,6 +2856,7 @@ private:
         m_orphan_total = 0;
         m_orphan_peer_budget.clear();
         m_fetched_parents.clear();
+        m_refetched.clear();
         if (m_gov_desync_latched && height > m_gov_desync_height) {
             LOG_WARNING << "[GOVSYNC] superblock desync latch (set at h="
                         << m_gov_desync_height << ": " << m_gov_desync_reason
@@ -3422,6 +3429,7 @@ private:
     std::function<void()> m_on_gov_reprime;        // leg B fresh nProp=0 re-prime
     std::function<bool()> m_gov_view_current_fn;   // DMN view folded the tip
     std::set<uint256> m_fetched_parents;     // orphan parents asked this cycle
+    std::set<uint256> m_refetched;           // held records re-fetched this cycle
     std::set<uint256> m_proposals;           // known proposal hashes (bounded)
     std::deque<uint256> m_proposal_order;
     uint64_t m_gov_triggers_seen{0};

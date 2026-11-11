@@ -953,7 +953,10 @@ private:
     // whose recorded time is within m_govsync_reprime_secs. Mirrors dashcore's
     // own netfulfilledman HasFulfilledRequest("governance-sync") gate.
     std::map<std::string, int64_t> m_govsync_primed;   // peer_key -> primed-at
-    int64_t  m_govsync_reprime_secs{3600};             // dashd mainnet 1h expiry
+    // dashd mainnet fulfilled-request expiry is exactly 3600 s; re-asking AT the
+    // edge risks Misbehaving(20), so the window carries the same 60 s margin as
+    // the vote-sync window.
+    int64_t  m_govsync_reprime_secs{3660};
     // E-SUPERBLOCK per-object vote sync bookkeeping: (peer_key, object) ->
     // wall-seconds of the last vote-sync request. Dash Core v24 tracks a
     // per-object vote sync as a fulfilled request ("govsync-votes-<hash>",
@@ -979,6 +982,8 @@ private:
         bool    ssc{false};
         int32_t ssc_count{-1};
         bool    covered{false};
+        bool    overflow{false};       // announced past the per-peer caps: this
+                                       // connection can never cover (MED-B)
         std::set<uint256> announced;   // object invs this peer announced (connection)
         std::set<uint256> pending;     // ...of which not yet received
     };
@@ -986,22 +991,39 @@ private:
     std::function<void(const std::string&, bool)> m_on_govsync_coverage;
     // Per-(type, hash) governance pull state: ONE request in flight, every
     // announcer remembered, timed-out requests retried from another announcer.
+    using GovKey = std::pair<uint32_t, uint256>;
     struct GovInflight {
         std::string           peer;      // asked
         int64_t               at{0};     // asked-at (0 = retry now)
-        std::set<std::string> tried;
-        std::set<std::string> announcers;
+        int64_t               created{0};
+        std::set<std::string> tried;      // <= GOV_ANNOUNCERS_CAP
+        std::set<std::string> announcers; // <= GOV_ANNOUNCERS_CAP
     };
-    std::map<std::pair<uint32_t, uint256>, GovInflight> m_gov_inflight;
-    std::set<std::pair<uint32_t, uint256>>   m_gov_received;
-    std::deque<std::pair<uint32_t, uint256>> m_gov_received_order;
+    std::map<GovKey, GovInflight> m_gov_inflight;
+    // Deadline queue (asked-at, key) in non-decreasing order — the pool tick
+    // pops only what has timed out instead of walking the whole map. Stale
+    // records (the entry was re-asked or is gone) are skipped on pop.
+    std::deque<std::pair<int64_t, GovKey>> m_gov_inflight_order;
+    std::map<std::string, size_t> m_gov_inflight_per_peer;   // asked-peer -> entries
+    std::set<GovKey>   m_gov_received;
+    std::deque<GovKey> m_gov_received_order;
+    uint64_t m_gov_objects_received_total{0};   // session: any object ever received
     int64_t  m_gov_pull_timeout_secs{20};
     int64_t  m_gov_pull_giveup_secs{600};
     uint64_t m_gov_pull_retried{0};
     uint64_t m_gov_pull_exhausted{0};
-    static constexpr size_t GOV_RECEIVED_CAP = 262144;
-    static constexpr size_t GOV_INFLIGHT_CAP = 262144;
-    static constexpr size_t GOV_ANNOUNCED_CAP = 65536;
+    uint64_t m_gov_pull_capped{0};
+    size_t   m_gov_getdata_chunk{50000};        // Dash Core MAX_INV_SZ
+    // MED-B bounds, sized to the real network with headroom: mainnet carries a
+    // few hundred governance objects and a per-trigger vote sync of a few
+    // thousand votes; a hostile peer cannot grow any of these past the caps.
+    static constexpr size_t GOV_RECEIVED_CAP          = 131072;
+    static constexpr size_t GOV_INFLIGHT_CAP          = 50000;
+    static constexpr size_t GOV_INFLIGHT_PER_PEER_CAP = 20000;
+    static constexpr size_t GOV_ANNOUNCERS_CAP        = 16;
+    static constexpr size_t GOV_ANNOUNCED_CAP         = 8192;
+    static constexpr size_t GOV_PENDING_CAP           = 4096;
+    static constexpr size_t GOV_TICK_BUDGET           = 8192;   // deadline pops per tick
     size_t   m_tx_pull_inflight_cap{64};
     std::map<uint256, int64_t> m_tx_pull_inflight;   // txid -> requested-at
     uint64_t m_tx_inv_offered{0};    // inv(MSG_TX) SEEN on the wire, pre-dedup
@@ -2624,7 +2646,12 @@ public:
 
     void gov_eval_coverage(const std::string& key, GovPeerSync& st)
     {
-        const bool c = st.primed && st.ssc && st.ssc_count >= 0 &&
+        // A zero-object answer only counts while we have never seen a single
+        // governance object from anyone: a peer that claims an empty set when
+        // objects demonstrably exist is not proof of anything (LOW).
+        const bool zero_ok = st.ssc_count > 0 || m_gov_objects_received_total == 0;
+        const bool c = st.primed && st.ssc && st.ssc_count >= 0 && zero_ok &&
+                       !st.overflow &&
                        st.announced.size() >= static_cast<size_t>(st.ssc_count) &&
                        st.pending.empty();
         gov_set_covered(key, st, c);
@@ -2635,10 +2662,34 @@ public:
         return m_gov_received.count({type, h}) != 0;
     }
 
+    void gov_inflight_erase(std::map<GovKey, GovInflight>::iterator it)
+    {
+        auto pit = m_gov_inflight_per_peer.find(it->second.peer);
+        if (pit != m_gov_inflight_per_peer.end() && pit->second > 0 && --pit->second == 0)
+            m_gov_inflight_per_peer.erase(pit);
+        m_gov_inflight.erase(it);
+    }
+
+    /// (Re)assign an in-flight pull to `peer` at `now`.
+    void gov_inflight_assign(const GovKey& k, GovInflight& f, const std::string& peer, int64_t now)
+    {
+        if (!f.peer.empty()) {
+            auto pit = m_gov_inflight_per_peer.find(f.peer);
+            if (pit != m_gov_inflight_per_peer.end() && pit->second > 0 && --pit->second == 0)
+                m_gov_inflight_per_peer.erase(pit);
+        }
+        f.peer = peer;
+        f.at = now;
+        if (f.tried.size() < GOV_ANNOUNCERS_CAP) f.tried.insert(peer);
+        ++m_gov_inflight_per_peer[peer];
+        m_gov_inflight_order.emplace_back(now, k);
+    }
+
     void gov_mark_received(uint32_t type, const uint256& h)
     {
         const auto k = std::make_pair(type, h);
-        m_gov_inflight.erase(k);
+        if (auto it = m_gov_inflight.find(k); it != m_gov_inflight.end()) gov_inflight_erase(it);
+        if (type == static_cast<uint32_t>(inventory_type::govobject)) ++m_gov_objects_received_total;
         if (m_gov_received.insert(k).second) {
             m_gov_received_order.push_back(k);
             while (m_gov_received_order.size() > GOV_RECEIVED_CAP) {
@@ -2660,35 +2711,40 @@ public:
         const auto k = std::make_pair(type, inv.m_hash);
         if (inv.base_type() == inventory_type::govobject) {
             auto& st = m_gov_peer[p->key];
-            if (st.announced.size() < GOV_ANNOUNCED_CAP) st.announced.insert(inv.m_hash);
-            if (!gov_received(type, inv.m_hash)) st.pending.insert(inv.m_hash);
+            const bool have = gov_received(type, inv.m_hash);
+            if (st.announced.size() >= GOV_ANNOUNCED_CAP ||
+                (!have && st.pending.size() >= GOV_PENDING_CAP)) {
+                // MED-B: more objects than any real network carries. Stop
+                // tracking for this connection, which can never cover.
+                st.overflow = true;
+            } else {
+                st.announced.insert(inv.m_hash);
+                if (!have) st.pending.insert(inv.m_hash);
+            }
             gov_eval_coverage(p->key, st);
         }
         if (gov_received(type, inv.m_hash)) return;            // already have it
         auto it = m_gov_inflight.find(k);
         if (it == m_gov_inflight.end()) {
-            if (m_gov_inflight.size() >= GOV_INFLIGHT_CAP) {
-                // Untracked fallback: still ask, just without retry state.
-                ++m_gov_inv_seen;
-                batch.emplace_back(inv.m_type, inv.m_hash);
+            if (m_gov_inflight.size() >= GOV_INFLIGHT_CAP ||
+                m_gov_inflight_per_peer[p->key] >= GOV_INFLIGHT_PER_PEER_CAP) {
+                ++m_gov_pull_capped;                           // not asked at all
                 return;
             }
             GovInflight f;
-            f.peer = p->key;
-            f.at = now;
-            f.tried.insert(p->key);
+            f.created = now;
             f.announcers.insert(p->key);
-            m_gov_inflight.emplace(k, std::move(f));
+            auto [nit, ok] = m_gov_inflight.emplace(k, std::move(f));
+            gov_inflight_assign(k, nit->second, p->key, now);
             ++m_gov_inv_seen;
             batch.emplace_back(inv.m_type, inv.m_hash);
             return;
         }
         auto& f = it->second;
-        f.announcers.insert(p->key);
-        if (!f.tried.count(p->key) && now - f.at >= m_gov_pull_timeout_secs) {
-            f.peer = p->key;
-            f.at = now;
-            f.tried.insert(p->key);
+        if (f.announcers.size() < GOV_ANNOUNCERS_CAP) f.announcers.insert(p->key);
+        if (!f.tried.count(p->key) && now - f.at >= m_gov_pull_timeout_secs &&
+            m_gov_inflight_per_peer[p->key] < GOV_INFLIGHT_PER_PEER_CAP) {
+            gov_inflight_assign(k, f, p->key, now);
             ++m_gov_pull_retried;
             batch.emplace_back(inv.m_type, inv.m_hash);
         }
@@ -2696,43 +2752,84 @@ public:
 
     /// Pool tick: re-ask every timed-out governance pull from an announcer
     /// that has not been tried; give an exhausted entry up after the give-up
-    /// window so a later announcement starts afresh.
+    /// window so a later announcement starts afresh. Pops only expired
+    /// deadlines (bounded per tick) — never walks the whole in-flight map.
     void gov_retry_tick(int64_t now)
     {
         std::map<std::string, std::vector<inventory_type>> asks;
-        for (auto it = m_gov_inflight.begin(); it != m_gov_inflight.end();) {
+        size_t budget = GOV_TICK_BUDGET;
+        while (budget-- > 0 && !m_gov_inflight_order.empty() &&
+               now - m_gov_inflight_order.front().first >= m_gov_pull_timeout_secs) {
+            const auto [at, k] = m_gov_inflight_order.front();
+            m_gov_inflight_order.pop_front();
+            auto it = m_gov_inflight.find(k);
+            if (it == m_gov_inflight.end() || it->second.at != at) continue;   // stale
             auto& f = it->second;
-            if (now - f.at < m_gov_pull_timeout_secs) { ++it; continue; }
             std::string next;
             for (const auto& a : f.announcers) {
                 if (f.tried.count(a)) continue;
+                if (m_gov_inflight_per_peer[a] >= GOV_INFLIGHT_PER_PEER_CAP) continue;
                 auto* s = find_session(a);
                 if (s && s->handshake.complete()) { next = a; break; }
             }
             if (!next.empty()) {
-                f.peer = next;
-                f.at = now;
-                f.tried.insert(next);
+                gov_inflight_assign(k, f, next, now);
                 ++m_gov_pull_retried;
-                asks[next].emplace_back(
-                    static_cast<inventory_type::inv_type>(it->first.first), it->first.second);
-                ++it;
+                asks[next].emplace_back(static_cast<inventory_type::inv_type>(k.first), k.second);
                 continue;
             }
-            if (now - f.at >= m_gov_pull_giveup_secs) {
+            if (now - f.created >= m_gov_pull_giveup_secs) {
                 ++m_gov_pull_exhausted;
-                it = m_gov_inflight.erase(it);
+                gov_inflight_erase(it);
                 continue;
             }
-            ++it;
+            f.at = now;                                  // check again later
+            m_gov_inflight_order.emplace_back(now, k);
         }
         for (auto& [key, invs] : asks) {
             auto* s = find_session(key);
             if (!s) continue;
-            m_gov_pull_sent += invs.size();
-            auto getdata_msg = message_getdata::make_raw(invs);
-            s->write(getdata_msg);
+            // Dash Core MAX_INV_SZ: a getdata carries at most 50000 entries.
+            for (size_t off = 0; off < invs.size(); off += m_gov_getdata_chunk) {
+                const size_t n = std::min(m_gov_getdata_chunk, invs.size() - off);
+                std::vector<inventory_type> chunk(invs.begin() + off, invs.begin() + off + n);
+                m_gov_pull_sent += chunk.size();
+                auto getdata_msg = message_getdata::make_raw(chunk);
+                s->write(getdata_msg);
+            }
         }
+    }
+
+    /// Mark an in-flight pull for immediate retry (front of the deadline queue).
+    void gov_inflight_retry_now(const GovKey& k, GovInflight& f)
+    {
+        f.at = 0;
+        m_gov_inflight_order.emplace_front(0, k);
+    }
+
+    /// TEST SEAM: getdata chunk size (Dash Core MAX_INV_SZ = 50000).
+    void set_gov_getdata_chunk_for_test(size_t n) { m_gov_getdata_chunk = n ? n : 1; }
+    int64_t govsync_reprime_secs() const { return m_govsync_reprime_secs; }
+    uint64_t gov_pull_capped_count() const { return m_gov_pull_capped; }
+    bool gov_peer_overflowed(const std::string& key) const {
+        auto it = m_gov_peer.find(key);
+        return it != m_gov_peer.end() && it->second.overflow;
+    }
+
+    void gov_forget_received(uint32_t type, const uint256& h)
+    {
+        if (m_gov_received.erase({type, h}) == 0) return;
+        // The order deque keeps the stale key; eviction of an absent key is a
+        // no-op erase, so the bound still holds.
+    }
+    void gov_forget_received_type(uint32_t type)
+    {
+        std::deque<GovKey> kept;
+        for (const auto& k : m_gov_received_order) {
+            if (k.first == type) m_gov_received.erase(k);
+            else kept.push_back(k);
+        }
+        m_gov_received_order.swap(kept);
     }
 
     PeerSession* find_session(const std::string& key)
@@ -2786,7 +2883,12 @@ public:
                 continue;
             }
             if (!forgot) {
-                m_inv_dedup.forget_type(static_cast<uint32_t>(inventory_type::govobjectvote));
+                // Gov invs bypass InvDedup; the "already received" set is what
+                // would suppress the re-announced votes. An explicit vote
+                // re-sync must be able to re-pull votes dropped earlier (e.g.
+                // past the orphan budget) — the maintainer's verified-vote
+                // memo keeps the re-pull from costing any BLS work.
+                gov_forget_received_type(static_cast<uint32_t>(inventory_type::govobjectvote));
                 forgot = true;
             }
             auto m = message_govsync::make_raw(
@@ -2814,6 +2916,10 @@ public:
     /// vote sync whose empty filter matches every vote, i.e. sends nothing.
     std::size_t send_govobject_fetch(const uint256& prop)
     {
+        // MED-C: an explicit fetch must be able to pull an object we received
+        // before (and could not keep, e.g. its signer was not resolvable yet):
+        // forget the "already received" marker so the answering inv is pulled.
+        gov_forget_received(static_cast<uint32_t>(inventory_type::govobject), prop);
         std::size_t sent = 0;
         for (auto& p : m_pool) {
             if (!p->handshake.complete()) continue;
@@ -3366,7 +3472,16 @@ private:
                 m_gov_peer.erase(git);
             }
             for (auto& [gk, f] : m_gov_inflight)
-                if (f.peer == key) f.at = 0;
+                if (f.peer == key) gov_inflight_retry_now(gk, f);
+            // MED-A: dashd keys fulfilled requests by the CService it sees —
+            // our address INCLUDING the ephemeral source port — so a new
+            // connection is a new requester: re-prime (and re-sync votes) on
+            // reconnect instead of staying uncovered until leg B.
+            m_govsync_primed.erase(key);
+            for (auto vit = m_govsync_votes_sent.begin(); vit != m_govsync_votes_sent.end();) {
+                if (vit->first.first == key) vit = m_govsync_votes_sent.erase(vit);
+                else ++vit;
+            }
         }
 
         // Erase LAST: the unique_ptr destructor tears the Connection (and its
@@ -5065,7 +5180,8 @@ private:
                 // longer does): re-ask another announcer on the next tick, and
                 // the peer no longer vouches for that object.
                 auto it = m_gov_inflight.find({static_cast<uint32_t>(inv.m_type), inv.m_hash});
-                if (it != m_gov_inflight.end() && it->second.peer == p->key) it->second.at = 0;
+                if (it != m_gov_inflight.end() && it->second.peer == p->key)
+                    gov_inflight_retry_now(it->first, it->second);
                 if (inv.base_type() == inventory_type::govobject) {
                     auto git = m_gov_peer.find(p->key);
                     if (git != m_gov_peer.end() && git->second.pending.erase(inv.m_hash)) {

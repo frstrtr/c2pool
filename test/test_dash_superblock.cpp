@@ -2190,6 +2190,54 @@ TEST(DashSuperblockTriState, StartupHeldRecordsRefetchedWhenViewCurrentLOW6) {
     m.on_block_connected(blk, SBH - 8);
     ASSERT_EQ(fetched.size(), 1u);
     EXPECT_EQ(fetched[0], hash_of(98));
-    EXPECT_EQ(m.gov_store().outstanding_count(), 0u)
-        << "the record is released; the re-fetched object is verified for real";
+    // MED-C: the record is KEPT until the object really arrives — a fetch that
+    // never delivers must not make us forget a real competing trigger.
+    EXPECT_EQ(m.gov_store().outstanding_count(), 1u);
+    EXPECT_EQ(m.superblock_resolution(SBH).reason, "trigger-unverified-pending");
+    m.on_block_connected(blk, SBH - 7);
+    EXPECT_EQ(fetched.size(), 1u) << "fetched once per cycle, not every block";
+    // The object arrives and verifies: admitted, record released.
+    m.set_object_verifier([](const CoinStateMaintainer::GovObjectContext&) {
+        return CoinStateMaintainer::GovSigCheck::Valid;
+    });
+    m.on_govobject(trig_obj(98, trig_plain(static_cast<int32_t>(SBH))));
+    EXPECT_TRUE(m.gov_store().has_trigger(hash_of(98)));
+    EXPECT_EQ(m.gov_store().outstanding_count(), 0u);
+}
+
+// MED-C: a held record that already has a masternode YES becomes an
+// orphan-YES parent when re-fetched (cycle-wide blocker), and an Invalid
+// re-arrival keeps it.
+TEST(DashSuperblockTriState, HeldRecordWithOrphanYesBecomesOrphanYesParentMEDC) {
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+    int64_t now = 1'700'000'000;
+    m.on_mn_list_update(single_mn(p2pkh_script(0x30)));
+    m.on_new_tip(SBH - 10, raw256(0xAB), 0x1e0ffff0u, 1'700'000'000u,
+                 140, 19, 1'700'000'100u, 0x20000000u);
+    arm_tristate(m, now);
+    m.set_gov_view_current_fn([]() { return true; });
+    std::vector<uint256> fetched;
+    m.set_on_gov_object_fetch([&fetched](const uint256& h) { fetched.push_back(h); });
+    m.set_vote_verifier([](const CoinStateMaintainer::GovVoteContext&) { return true; });
+    m.gov_store().note_outstanding(hash_of(99), GovOutstandingKind::UnverifiedPending,
+                                   static_cast<int32_t>(SBH));
+    auto v = fund_vote(hash_of(99), VOTE_OUTCOME_YES);
+    v.vote_id = hash_of(9901);
+    m.on_govvote(v, "mn-1");
+    ASSERT_EQ(m.gov_orphan_votes(), 1u);
+    BlockType blk;
+    blk.m_txs.push_back(make_cb(500'000'000, p2pkh_script(0x30)));
+    bind_block(blk);
+    m.on_block_connected(blk, SBH - 9);
+    EXPECT_EQ(m.gov_store().outstanding_kind(hash_of(99)), GovOutstandingKind::OrphanYesVote);
+    EXPECT_EQ(m.superblock_resolution(SBH + 24).reason, "trigger-orphan-votes")
+        << "an orphan-YES parent blocks the whole cycle";
+    // The object comes back with a bad signature: still blocked (a real
+    // masternode wanted it funded — our check disagrees with the network).
+    m.set_object_verifier([](const CoinStateMaintainer::GovObjectContext&) {
+        return CoinStateMaintainer::GovSigCheck::Invalid;
+    });
+    m.on_govobject(trig_obj(99, trig_plain(static_cast<int32_t>(SBH))));
+    EXPECT_EQ(m.gov_store().outstanding_kind(hash_of(99)), GovOutstandingKind::OrphanYesVote);
 }

@@ -616,8 +616,10 @@ void print_banner(const char* argv0)
         << "           [--external-ip ADDR]\n"
         << "           [--embedded-utxo[=false]] [--embedded-mainnet[=false]] [--embedded-null-arm[=false]]\n"
         << "           [--embedded-superblock[=false]] [--embedded-include-mn-special-txs[=false]]\n"
-        << "           [--embedded-superblock-unfunded-mainnet]  (MAINNET opt-in: serve a PROVEN-unfunded\n"
-        << "              superblock height with a normal coinbase; default OFF = refuse, testnet always on)\n"
+        << "           [--embedded-superblock-unfunded-mainnet]  (TEST/SOAK ONLY — MUST NEVER be set on a\n"
+        << "              production MAINNET node: serves a superblock height with a normal coinbase when\n"
+        << "              the node believes no trigger is funded; a wrong belief loses the block. Default\n"
+        << "              OFF = refuse, master's behaviour; testnet serves the unfunded verdict without it)\n"
         << "           [--embedded-accrue-asset-locks[=false]] [--embedded-mn-bridge-max N]\n"
         << "           [--embedded-asn-diversity]\n"
         << "           [--embedded-mn-bridge-no-cursor]\n"
@@ -1344,9 +1346,11 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
              bool embedded_include_mn_special_txs = false,
              // --embedded-superblock-unfunded-mainnet: explicit MAINNET opt-in
              // for serving a PROVEN-unfunded superblock height (NotTriggered,
-             // normal coinbase). Default OFF: on mainnet every superblock height
-             // without a funded trigger refuses (master's behaviour). Testnet
-             // serves NotTriggered without it. Never implied by any other flag.
+             // normal coinbase). TEST/SOAK ONLY — it must never be set on a
+             // production mainnet node. Default OFF: on mainnet every
+             // superblock height without a funded trigger refuses (master's
+             // behaviour). Testnet serves NotTriggered without it. Never
+             // implied by any other flag.
              bool embedded_superblock_unfunded_mainnet = false)
 {
     namespace io = boost::asio;
@@ -6563,7 +6567,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 // "not-triggered-disabled" => refuse, master's behaviour).
                 maintainer->set_not_triggered_enabled(testnet || embedded_superblock_unfunded_mainnet);
                 if (!testnet && embedded_superblock_unfunded_mainnet)
-                    LOG_WARNING << "[E-SUPERBLOCK] --embedded-superblock-unfunded-mainnet SET: "
+                    LOG_WARNING << "[E-SUPERBLOCK] --embedded-superblock-unfunded-mainnet SET "
+                                   "(TEST/SOAK ONLY — never on a production mainnet node): "
                                    "this MAINNET node will serve a superblock height with a "
                                    "NORMAL coinbase when it PROVES no trigger is funded (R5 "
                                    "answered coverage from >= "
