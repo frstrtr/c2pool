@@ -109,13 +109,23 @@ jobs:
           done
           exit 1
 
-      - name: Configure
+      # The daemonless cut refuses to start on a bls=stub build, so this smoke
+      # must link the REAL dashbls verifier, mirroring build.yml's BLS job.
+      # Builds dash's src/dashbls at the pinned tag (cached per runner/prefix)
+      # and exports DASHBLS_ROOT; fails loudly if it cannot.
+      - name: Provision dashbls
+        if: steps.presence.outputs.exists == '1'
+        uses: ./.github/actions/provision-dashbls
+
+      # A missing dashbls is a configure-time FATAL_ERROR, not a warning.
+      - name: Configure (C2POOL_DASH_BLS=ON)
         if: steps.presence.outputs.exists == '1'
         run: |
           cmake -S . -B build_ci \
             -DCMAKE_TOOLCHAIN_FILE=build_ci/conan_toolchain.cmake \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
-            -DCMAKE_BUILD_TYPE=Release
+            -DCMAKE_BUILD_TYPE=Release \
+            -DC2POOL_DASH_BLS=ON -DDASHBLS_ROOT="$DASHBLS_ROOT"
 
       - name: Build c2pool-dash target
         if: steps.presence.outputs.exists == '1'
