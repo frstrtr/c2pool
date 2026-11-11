@@ -188,40 +188,54 @@ inline bool spends_earlier_in_set(const MutableTransaction& tx,
 
 /// The first input of `tx` that spends an output of a MEMPOOL transaction not
 /// in `in_body` (the txids placed before `tx`); nullopt when there is none.
-/// Such an output exists neither on chain (its tx is unconfirmed) nor in the
-/// block before `tx`, so a block carrying `tx` is
-/// bad-txns-inputs-missingorspent. Shared by the builder's topology pass and
-/// the pre-emit gate (node_coin_state.hpp).
+/// `pooled` holds the pool's txids among the inputs being judged
+/// (pooled_input_txids, one Mempool lock per body). Such an output exists
+/// neither on chain (its tx is unconfirmed) nor in the block before `tx`, so a
+/// block carrying `tx` is bad-txns-inputs-missingorspent. Shared by the
+/// builder's topology pass and the pre-emit gate (node_coin_state.hpp).
 template <typename Tx>
 inline std::optional<uint256> unserved_mempool_parent(const Tx& tx,
                                                       const std::set<uint256>& in_body,
-                                                      const Mempool& mempool)
+                                                      const std::set<uint256>& pooled)
 {
     for (const auto& vin : tx.vin)
-        if (!in_body.count(vin.prevout.hash) && mempool.contains(vin.prevout.hash))
+        if (!in_body.count(vin.prevout.hash) && pooled.count(vin.prevout.hash))
             return vin.prevout.hash;
     return std::nullopt;
 }
 
+/// The txids the pool holds among the inputs of `txs` (`tx_of(element)` is
+/// the transaction), read under one Mempool lock.
+template <typename Range, typename TxOf>
+inline std::set<uint256> pooled_input_txids(const Range& txs, TxOf&& tx_of, const Mempool& mempool)
+{
+    std::set<uint256> refs;
+    for (const auto& t : txs)
+        for (const auto& vin : tx_of(t).vin) refs.insert(vin.prevout.hash);
+    return mempool.contained(refs);
+}
+
 /// Topology pass over the mempool range: drop, with its fee, every selected
-/// tx that spends an output of a mempool tx not earlier in the range
-/// (unserved_mempool_parent). Walking in body order takes every descendant of
-/// a dropped tx out as well: its input names the dropped txid, which is still
-/// in the mempool and no longer in the body. The txs placed before the range
-/// (type-6 commitments, pinned local txs, type-9 unlocks) are not mempool
-/// txs, so the range alone decides; a mempool tx that is also one of those
-/// would only make the pass drop more, never less. Returns how many it
-/// dropped.
+/// tx that spends an output of a mempool tx placed neither before the range
+/// (`placed_before`: the type-6 commitments, the pins that ride, the type-9
+/// unlocks) nor earlier in it (unserved_mempool_parent). Walking in body
+/// order takes every descendant of a dropped tx out as well: its input names
+/// the dropped txid, which is still in the mempool and no longer in the body.
+/// Returns how many it dropped.
 template <typename Fees>
 inline size_t drop_txs_spending_unserved_mempool_parents(
     std::vector<Mempool::SelectedTx>& selected, Fees& total_fees,
-    const Mempool& mempool, uint32_t height)
+    const Mempool& mempool, uint32_t height,
+    const std::set<uint256>& placed_before = {})
 {
-    std::set<uint256> in_body;
+    const auto pooled = pooled_input_txids(
+        selected, [](const Mempool::SelectedTx& s) -> const MutableTransaction& { return s.tx; },
+        mempool);
+    std::set<uint256> in_body = placed_before;
     size_t kept = 0, dropped = 0;
     for (size_t i = 0; i < selected.size(); ++i) {
         const uint256 id = dash::coin::dash_txid(selected[i].tx);
-        if (const auto parent = unserved_mempool_parent(selected[i].tx, in_body, mempool)) {
+        if (const auto parent = unserved_mempool_parent(selected[i].tx, in_body, pooled)) {
             total_fees -= selected[i].fee;
             ++dropped;
             LOG_WARNING << "[GBT-EMB] excluding tx " << id.GetHex().substr(0, 16)
@@ -972,14 +986,69 @@ inline DashWorkData build_embedded_workdata(
         }
         selected.resize(kept);
     }
-    // Topology, defence in depth: whatever a filter above dropped, no selected
-    // tx may spend an output of a mempool tx the template does not carry.
-    // Every later stage that drops a tx takes its in-body descendants with it
-    // (the MN-list fold loop and its degrade branch, service-update ordering)
-    // or drops a tx without outputs (MNHF signals), and running here, before
-    // the MN-list fold, keeps the committed merkleRootMNList the root of the
-    // body actually served. The pre-emit gate re-checks the final body.
-    drop_txs_spending_unserved_mempool_parents(selected, total_fees, mempool, prev_height + 1);
+    // ── MNHF SIGNALS (type 7, mnhf_check.hpp) ────────────────────────────
+    // Dash Core's miner takes every valid signal (CheckMNHFTx in
+    // TestPackageTransactions) and skips a second one for a bit already in the
+    // block (node/miner.cpp:728-735). Selection admits a signal only with no
+    // inputs and no outputs (mempool.hpp), so dropping one moves no fee and
+    // orphans nothing; should a signal with an output ever get here, the
+    // topology pass right below takes its in-body descendants out. This runs
+    // before that pass and before the MN-list fold because a signal commits
+    // nothing to the CbTx and no ordering moves it, while a descendant dropped
+    // after the fold could be a provider tx the fold already applied.
+    if (special_mask.allow_mnhf
+        && std::any_of(selected.begin(), selected.end(), [](const Mempool::SelectedTx& s) {
+               return s.tx.type == vendor::MNHFTxPayload::SPECIALTX_TYPE;
+           })) {
+        std::vector<MutableTransaction> body;
+        body.reserve(selected.size());
+        for (const auto& s : selected) body.push_back(s.tx);
+        const auto why = mnhf_select(body, mnhf_check_env, prev_height, mtp_at_tip);
+        size_t kept = 0;
+        for (size_t i = 0; i < selected.size(); ++i) {
+            if (!why[i].empty()) {
+                total_fees -= selected[i].fee;
+                LOG_WARNING << "[GBT-EMB] excluding MNHF signal "
+                            << dash::coin::dash_txid(selected[i].tx).GetHex().substr(0, 16)
+                            << " from template h=" << (prev_height + 1) << ": " << why[i];
+                continue;
+            }
+            if (selected[i].tx.type == vendor::MNHFTxPayload::SPECIALTX_TYPE)
+                LOG_INFO << "[GBT-EMB] MNHF signal "
+                         << dash::coin::dash_txid(selected[i].tx).GetHex().substr(0, 16)
+                         << " rides template h=" << (prev_height + 1);
+            if (kept != i) selected[kept] = std::move(selected[i]);
+            ++kept;
+        }
+        selected.resize(kept);
+    }
+    // Topology, defence in depth: whatever a filter above dropped (the
+    // collateral filter, the MNHF screen), no selected tx may spend an output
+    // of a mempool tx the template does not carry. Every later stage that
+    // drops a tx takes its in-body descendants with it (the MN-list fold loop
+    // and its degrade branch, service-update ordering), and running here,
+    // before the MN-list fold, keeps the committed merkleRootMNList the root
+    // of the body actually served. The pre-emit gate re-checks the final body.
+    // The txs placed before the mempool range count as served: the type-6
+    // commitments, the pins the pin gate admits at this height (judged once
+    // here and spliced below from the same verdicts) and the type-9 unlocks.
+    std::vector<PinVerdict> pin_verdicts;
+    std::set<uint256> placed_before;
+    if (qc_commitments != nullptr)
+        for (const auto& c : *qc_commitments)
+            placed_before.insert(dash::coin::dash_txid(build_qc_tx(w.m_height, c)));
+    if (pinned_local_txs != nullptr) {
+        pin_verdicts.reserve(pinned_local_txs->size());
+        for (const auto& pin : *pinned_local_txs) {
+            pin_verdicts.push_back(pin_gate_verdict(pin, mempool, mnstates, w.m_height));
+            if (pin_verdicts.back().ok) placed_before.insert(dash::coin::dash_txid(pin));
+        }
+    }
+    if (admitted_asset_unlocks != nullptr)
+        for (const auto& t : admitted_asset_unlocks->txs)
+            placed_before.insert(dash::coin::dash_txid(t));
+    drop_txs_spending_unserved_mempool_parents(selected, total_fees, mempool, prev_height + 1,
+                                               placed_before);
     // S2: is each admitted inject in this body? One RIDES / HELD line per
     // inject per height (telemetry only; the body is untouched).
     log_inject_rides(mempool, selected, prev_height + 1, suppress_mempool_txs);
@@ -1143,37 +1212,6 @@ inline DashWorkData build_embedded_workdata(
                             << " provider special tx(s) out of the template";
         }
     }
-    // ── MNHF SIGNALS (type 7, mnhf_check.hpp) ────────────────────────────
-    // Dash Core's miner takes every valid signal (CheckMNHFTx in
-    // TestPackageTransactions) and skips a second one for a bit already in the
-    // block (node/miner.cpp:728-735). A signal has no inputs and no outputs,
-    // so dropping one takes nothing else with it and moves no fee.
-    if (special_mask.allow_mnhf
-        && std::any_of(selected.begin(), selected.end(), [](const Mempool::SelectedTx& s) {
-               return s.tx.type == vendor::MNHFTxPayload::SPECIALTX_TYPE;
-           })) {
-        std::vector<MutableTransaction> body;
-        body.reserve(selected.size());
-        for (const auto& s : selected) body.push_back(s.tx);
-        const auto why = mnhf_select(body, mnhf_check_env, prev_height, mtp_at_tip);
-        size_t kept = 0;
-        for (size_t i = 0; i < selected.size(); ++i) {
-            if (!why[i].empty()) {
-                total_fees -= selected[i].fee;
-                LOG_WARNING << "[GBT-EMB] excluding MNHF signal "
-                            << dash::coin::dash_txid(selected[i].tx).GetHex().substr(0, 16)
-                            << " from template h=" << (prev_height + 1) << ": " << why[i];
-                continue;
-            }
-            if (selected[i].tx.type == vendor::MNHFTxPayload::SPECIALTX_TYPE)
-                LOG_INFO << "[GBT-EMB] MNHF signal "
-                         << dash::coin::dash_txid(selected[i].tx).GetHex().substr(0, 16)
-                         << " rides template h=" << (prev_height + 1);
-            if (kept != i) selected[kept] = std::move(selected[i]);
-            ++kept;
-        }
-        selected.resize(kept);
-    }
     // #143: the admitted unlocks' payload fees are ordinary miner fees (dashd
     // GetAssetUnlockFee, assetlocktx.cpp:200-212 — the fee reaches the miner
     // through the coinbase). Folded into total_fees BEFORE block_value below,
@@ -1295,7 +1333,8 @@ inline DashWorkData build_embedded_workdata(
     // applies here too — a pinned tx spending a collateral would poison the
     // committed merkleRootMNList exactly like a selected one.
     if (pinned_local_txs != nullptr && !pinned_local_txs->empty())
-        splice_pinned_txs(w, *pinned_local_txs, mempool, mnstates, "GBT-EMB");
+        splice_verdicted_pins(w, *pinned_local_txs, pin_verdicts, "GBT-EMB",
+                              /*enforce_block_budget=*/false);
     // ── #143 VERIFIED TYPE-9 UNLOCKS — after the consensus-required type-6
     // set and the pins, BEFORE the mempool-sourced range below (they are not
     // testmempoolaccept-probe material: special txs with no vin). Every tx

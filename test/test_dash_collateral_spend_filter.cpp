@@ -31,6 +31,8 @@
 #include <impl/dash/coin/mn_state_db.hpp>
 #include <impl/dash/coin/mempool.hpp>
 #include <impl/dash/coin/node_coin_state.hpp>
+#include <impl/dash/coin/vendor/mnhftx.hpp>
+#include <impl/dash/coin/mnhf_check.hpp>
 #include <impl/dash/coin/quorum_manager.hpp>
 #include <impl/dash/coin/subsidy.hpp>
 #include <impl/dash/coin/transaction.hpp>
@@ -45,6 +47,8 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <set>
+#include <utility>
 #include <vector>
 
 using dash::coin::DashWorkData;
@@ -459,4 +463,176 @@ TEST(DashBodyTopology, EmitGateRefusesABodyTxWhoseMempoolParentIsNotEarlier) {
 
     EXPECT_TRUE(st.embedded_template_emit_ok(body({&p, &c}), &why))
         << why.cause << " " << why.value;
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// An MNHF signal with an output. Dash Core's CheckTransaction lets a type-7
+// tx carry inputs and outputs (consensus/tx_check.cpp:18-21), though its
+// signer never adds any (MNHFTxPayload::PrepareTx, evo/mnhftx.cpp:37-45). A
+// relayed signal B with a bad signature and one output, plus C spending B:0:
+// both used to be selected (B lifted by the +0.1 DASH MNHF priority delta),
+// the builder's MNHF screen then dropped B after every other check and kept
+// C. That is an invalid block whose coinbase claims C's fee, or, with a
+// pre-emit topology check, a template refused on every rebuild.
+// ════════════════════════════════════════════════════════════════════════
+
+TEST(DashBodyTopology, MnhfSignalWithAnOutputNeverOrphansItsChild) {
+    UTXOViewCache utxo(nullptr);
+    Mempool mp;
+    mp.set_utxo(&utxo);
+    const uint256 f = mint_hash(0x70);
+    utxo.add_coin(Outpoint(f, 0), Coin(1'000'000, {}, 1, false));
+
+    MutableTransaction b;
+    b.version = 3; b.type = dash::coin::vendor::MNHFTxPayload::SPECIALTX_TYPE; b.locktime = 0;
+    dash::coin::vendor::MNHFTxPayload pl;
+    pl.nVersion = 1;
+    pl.signal.versionBit = 13;
+    pl.signal.quorumHash = raw256(0x99);   // no such quorum: CheckMNHFTx refuses it
+    {
+        ::PackStream s;
+        s << pl;
+        auto sp = s.get_span();
+        const auto* d = reinterpret_cast<const unsigned char*>(sp.data());
+        b.extra_payload.assign(d, d + sp.size());
+    }
+    TxOut bo; bo.value = 0; bo.scriptPubKey.m_data = {0x51};
+    b.vout.push_back(bo);
+    const uint256 bid = dash::coin::dash_txid(b);
+
+    MutableTransaction c;
+    c.version = 1; c.type = 0; c.locktime = 77;
+    TxIn i0; i0.prevout.hash = bid; i0.prevout.index = 0; i0.sequence = 0xffffffffu;
+    TxIn i1; i1.prevout.hash = f;   i1.prevout.index = 0; i1.sequence = 0xffffffffu;
+    c.vin.push_back(i0); c.vin.push_back(i1);
+    TxOut co; co.value = 990'000; c.vout.push_back(co);                 // fee 10'000
+    const uint256 cid = dash::coin::dash_txid(c);
+    ASSERT_TRUE(mp.add_tx(b));
+    ASSERT_TRUE(mp.add_tx(c));
+
+    std::vector<CSimplifiedMNListEntry> entries;
+    for (uint8_t x : {0x01, 0x02}) {
+        CSimplifiedMNListEntry e;
+        e.nVersion = CSimplifiedMNListEntry::VER_BASIC_BLS;
+        e.proRegTxHash = raw256(x);
+        e.confirmedHash = raw256(0x77);
+        e.isValid = true;
+        entries.push_back(e);
+    }
+    const CSimplifiedMNList sml(std::move(entries));
+    dash::coin::QuorumManager qmgr;
+    const auto mn = mn_set_with_collateral(raw256(0xC1), 0);
+    dash::coin::MnhfCheckEnv env;   // wired, as in production; this signal fails it
+    const auto w = build_embedded_workdata(
+        H - 1, raw256(0xAB), mn, mp, 0x1b104be3u, 1'700'000'000u,
+        DASH_PUBKEY_VER, DASH_P2SH_VER, 1'700'000'100u, 0x20000000u, nullptr,
+        &sml, &qmgr, 0, dash::coin::k_zero_cl_sig, 0, nullptr, nullptr,
+        dash::coin::DASH_MN_RR_HEIGHT_MAINNET, nullptr,
+        dash::coin::DASH_MN_MIN_CONFIRMATIONS_MAINNET, /*suppress=*/false,
+        "utxo-immature-serving", nullptr, false, nullptr,
+        /*include_mn_special_txs=*/true, nullptr, nullptr, nullptr,
+        /*v24_active=*/false, nullptr, &env);
+    auto rides = [&](const uint256& id) {
+        for (const auto& h : w.m_tx_hashes) if (h == id) return true;
+        return false;
+    };
+    EXPECT_FALSE(rides(bid)) << "the refused signal rides";
+    EXPECT_FALSE(rides(cid)) << "the child of the refused signal was left in the body";
+    // Every body input that names a mempool tx names one earlier in the body.
+    ASSERT_EQ(w.m_tx_hashes.size(), w.m_txs.size());
+    std::set<uint256> earlier;
+    for (size_t i = 0; i < w.m_txs.size(); ++i) {
+        for (const auto& in : w.m_txs[i].vin)
+            EXPECT_TRUE(earlier.count(in.prevout.hash) || !mp.contains(in.prevout.hash))
+                << "body tx " << w.m_tx_hashes[i].GetHex().substr(0, 16)
+                << " spends an output of mempool tx " << in.prevout.hash.GetHex().substr(0, 16)
+                << " that the body does not carry before it";
+        earlier.insert(w.m_tx_hashes[i]);
+    }
+    EXPECT_EQ(w.m_coinbase_value, static_cast<uint64_t>(compute_dash_block_reward_post_v20(H)))
+        << "the coinbase claims the fee of a tx the block cannot carry";
+}
+
+// The txs placed before the mempool range (type-6 commitments, the pins that
+// ride, type-9 unlocks) count as served: a selected child of one of them,
+// should that parent also sit in the mempool, stays.
+TEST(DashBodyTopology, BuilderPassCountsTheTxsPlacedBeforeTheRangeAsServed) {
+    Chain ch;
+    using dash::coin::drop_txs_spending_unserved_mempool_parents;
+    auto sel = selection({&ch.c, &ch.g});
+    uint64_t fees = 20'000;
+    const std::set<uint256> placed_before{dash::coin::dash_txid(ch.p)};
+    EXPECT_EQ(drop_txs_spending_unserved_mempool_parents(sel, fees, ch.mp, H, placed_before), 0u);
+    EXPECT_EQ(sel.size(), 2u);
+    EXPECT_EQ(fees, 20'000u);
+    EXPECT_EQ(drop_txs_spending_unserved_mempool_parents(sel, fees, ch.mp, H), 2u)
+        << "without it the parent is unserved";
+    EXPECT_TRUE(sel.empty());
+    EXPECT_EQ(fees, 0u);
+}
+
+// Builder to gate on the production branch, where m_tx_hashes lines up with
+// the body. A CPFP pair (a parent below the block min fee rate on its own,
+// paid for by its child) rides parent first and passes the gate; the same
+// template with the parent cut out, ids kept aligned, is refused.
+TEST(DashBodyTopology, BuilderCpfpTemplatePassesTheGateAndFailsItWithoutTheParent) {
+    const uint256 prev_hash = raw256(0xAB);
+    auto seed = mn_set_with_collateral(raw256(0xC0), 0);
+    std::vector<CSimplifiedMNListEntry> entries;
+    for (uint8_t b : {0x01, 0x02}) {
+        CSimplifiedMNListEntry e;
+        e.nVersion = CSimplifiedMNListEntry::VER_BASIC_BLS;
+        e.proRegTxHash = raw256(b);
+        e.confirmedHash = raw256(0x77);
+        e.isValid = true;
+        entries.push_back(e);
+    }
+    UTXOViewCache utxo(nullptr);
+    NodeCoinState st;
+    st.set_require_sml(true);
+    st.sml() = CSimplifiedMNList(std::move(entries));
+    st.set_have_sml(true);
+    st.set_sml_current_hash(prev_hash);
+    st.mnstates().load(seed.snapshot(), H - 1);
+    st.mempool().set_utxo(&utxo);
+    st.set_tip(H - 1, prev_hash, 0x1b104be3u, 1'700'000'000u,
+               DASH_PUBKEY_VER, DASH_P2SH_VER, 1'700'000'100u, 0x20000000u);
+    const uint256 fp = mint_hash(0x63);
+    utxo.add_coin(Outpoint(fp, 0), Coin(1'000'000, {}, 1, false));
+    const auto p = make_spend(fp, 0, 999'990, 21);                                // fee 10
+    const auto c = make_spend(dash::coin::dash_txid(p), 0, 949'990, 22);          // fee 50'000
+    ASSERT_TRUE(st.mempool().add_tx(p));
+    ASSERT_TRUE(st.mempool().add_tx(c));
+
+    const auto w = build_embedded_workdata(
+        H - 1, prev_hash, std::as_const(st).mnstates(), st.mempool(), 0x1b104be3u,
+        1'700'000'000u, DASH_PUBKEY_VER, DASH_P2SH_VER, 1'700'000'100u, 0x20000000u, nullptr,
+        &std::as_const(st).sml(), &std::as_const(st).qmgr(), 0, dash::coin::k_zero_cl_sig, 0,
+        nullptr, nullptr, dash::coin::DASH_MN_RR_HEIGHT_MAINNET, nullptr,
+        dash::coin::DASH_MN_MIN_CONFIRMATIONS_MAINNET);
+    ASSERT_EQ(w.m_tx_hashes.size(), w.m_txs.size());
+    auto index_of = [&](const DashWorkData& t, const MutableTransaction& tx) {
+        for (size_t i = 0; i < t.m_tx_hashes.size(); ++i)
+            if (t.m_tx_hashes[i] == dash::coin::dash_txid(tx)) return static_cast<long>(i);
+        return -1L;
+    };
+    const long ip = index_of(w, p), ic = index_of(w, c);
+    ASSERT_GE(ip, 0) << "the CPFP parent rides with its child";
+    ASSERT_GE(ic, 0);
+    EXPECT_LT(ip, ic) << "parent before child";
+    EXPECT_EQ(w.m_coinbase_value,
+              static_cast<uint64_t>(compute_dash_block_reward_post_v20(H) + 50'010));
+    DeclineReport why;
+    EXPECT_TRUE(st.embedded_template_emit_ok(w, &why))
+        << why.cause << " " << why.value << " / " << why.threshold;
+
+    auto cut = w;
+    auto erase_at = [](auto& v, long i) { v.erase(v.begin() + i); };
+    erase_at(cut.m_txs, ip);
+    erase_at(cut.m_tx_hashes, ip);
+    if (cut.m_tx_fees.size() == w.m_txs.size()) erase_at(cut.m_tx_fees, ip);
+    if (cut.m_tx_data_hex.size() == w.m_txs.size()) erase_at(cut.m_tx_data_hex, ip);
+    ASSERT_EQ(cut.m_tx_hashes.size(), cut.m_txs.size());
+    EXPECT_FALSE(st.embedded_template_emit_ok(cut, &why));
+    EXPECT_EQ(why.cause, "emit-tx-spends-unserved-mempool-parent");
 }

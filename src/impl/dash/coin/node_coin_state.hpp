@@ -1898,12 +1898,14 @@ public:
         // body (they are the ids the header's merkle root commits).
         {
             const bool ids_aligned = w.m_tx_hashes.size() == w.m_txs.size();
+            const auto pooled = pooled_input_txids(
+                w.m_txs, [](const auto& t) -> const auto& { return t; }, m_mempool);
             std::set<uint256> in_body;
             for (size_t i = 0; i < w.m_txs.size(); ++i) {
                 const auto& tx = w.m_txs[i];
                 const uint256 id = ids_aligned ? w.m_tx_hashes[i]
                                                : dash_txid(MutableTransaction(tx));
-                if (const auto parent = unserved_mempool_parent(tx, in_body, m_mempool))
+                if (const auto parent = unserved_mempool_parent(tx, in_body, pooled))
                     return reject("emit-tx-spends-unserved-mempool-parent",
                                   "tx=" + id.GetHex().substr(0, 12)
                                       + ":parent=" + parent->GetHex().substr(0, 12),
