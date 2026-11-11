@@ -29,9 +29,12 @@
 //   nothing on the hashing hot path, which never touches this lock.
 //
 // SCOPE
-//   Guard the *init* calls only:  randomx_init_cache / randomx_init_dataset.
-//   NOT randomx_calculate_hash*, NOT randomx_create_vm, NOT alloc/release.
-//   Holding it across a hash would serialise mining and is a bug.
+//   Guard randomx_init_cache only. NOT randomx_init_dataset, NOT
+//   randomx_calculate_hash*, NOT randomx_create_vm, NOT alloc/release.
+//   On the Linux build no object outside the cache and dataset passed in is
+//   written by randomx_init_cache or randomx_init_dataset, other than through
+//   the thread-safe heap allocator and the page protections of the cache's own
+//   JIT pages. Holding it across a hash would serialise mining and is a bug.
 //
 //   Header-only and dependency-free on purpose: both the verifier
 //   (randomx_verify.hpp) and the miner (xmr_cpu_miner.hpp) include it, and the

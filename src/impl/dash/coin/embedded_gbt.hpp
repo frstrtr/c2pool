@@ -31,6 +31,9 @@
 #include <impl/dash/coin/mn_state_machine.hpp>
 #include <impl/dash/coin/sml_projection.hpp>    // confirmedHash rollover pass + collateral-spend predicate
 #include <impl/dash/coin/sml_special_fold.hpp>  // template-side types 1-4 MN-list fold (merkleRootMNList parity)
+#include <impl/dash/coin/protx_check.hpp>       // Dash Core CheckPro*Tx for template selection
+#include <impl/dash/coin/mnhf_check.hpp>        // Dash Core CheckMNHFTx for type-7 signals
+#include <impl/dash/coin/service_update_order.hpp>  // Dash Core: service updates before a key change
 #include <impl/dash/coin/sml_pose_fold.hpp>     // serve-time PoSe pass over the body's type-6 commitments
 #include <impl/dash/coin/mempool.hpp>
 #include <impl/dash/coin/inject_ride_log.hpp>  // S2: per-build inject RIDES / HELD lines
@@ -44,6 +47,7 @@
 #include <impl/dash/coin/quorum_manager.hpp>
 #include <impl/dash/coin/dkg_commitments.hpp>   // E1: build_qc_tx (mandatory type-6 txs)
 #include <impl/dash/coin/vendor/cbtx.hpp>
+#include <impl/dash/coin/cbtx_asset_unlocks.hpp>  // Dash Core v24: CbTx v4 + merkleRootAssetUnlocks
 #include <impl/dash/coin/vendor/simplifiedmns.hpp>
 
 #include <btclibs/util/strencodings.h>          // HexStr (m_tx_data_hex fill)
@@ -104,7 +108,8 @@ inline bool underfill_guard_trips(uint64_t selected_bytes,
 inline vendor::CCbTx build_embedded_cbtx(
     uint32_t, const vendor::CSimplifiedMNList&, const QuorumManager&,
     int32_t, const std::array<uint8_t, 96>&, int64_t,
-    const uint256* quorum_root_override);
+    const uint256* quorum_root_override,
+    bool v24_active, const uint256& asset_unlock_root);
 inline std::vector<unsigned char> encode_cbtx(const vendor::CCbTx&);
 // Zero CLSIG default for the E2d best_cl_sig seam (no temporary-bound ref).
 inline const std::array<uint8_t, 96> k_zero_cl_sig{};
@@ -384,14 +389,95 @@ inline PinSpliceReport splice_pinned_txs(DashWorkData& w,
     return splice_verdicted_pins(w, pins, verdicts, arm, enforce_block_budget);
 }
 
+/// GetKeyChangeTarget (txmempool.cpp) against the masternode list at the tip:
+/// the masternode a ProUpRegTx / ProUpSharedRegTx gives a different operator
+/// key (CBLSLazyPublicKey equality is point equality, so a re-encoding of the
+/// held key is no change; the store is canonical basic), or a ProUpRevTx
+/// revokes a held key from.
+inline std::optional<uint256> template_key_change_target(const MutableTransaction& tx,
+                                                         const MnStateMachine& mnstates)
+{
+    if (!tx_has_extra_payload(tx.version, tx.type)) return std::nullopt;
+    auto changes = [&](const uint256& pro, const std::array<uint8_t, vendor::BLS_PUBKEY_SIZE>& wire, bool legacy) {
+        const auto it = mnstates.entries().find(pro);
+        return it != mnstates.entries().end() && vendor::opkey_to_basic(wire, legacy) != it->second.pubKeyOperator;
+    };
+    if (tx.type == vendor::CProUpRegTx::SPECIALTX_TYPE) {
+        vendor::CProUpRegTx p;
+        if (!vendor::parse_protx_payload(tx.extra_payload, p)) return std::nullopt;
+        if (changes(p.proTxHash, p.pubKeyOperator, p.nVersion < vendor::ProTxVersion::BASIC_BLS)) return p.proTxHash;
+    } else if (tx.type == vendor::CProUpSharedRegTx::SPECIALTX_TYPE) {
+        vendor::CProUpSharedRegTx p;
+        if (!vendor::parse_protx_payload(tx.extra_payload, p)) return std::nullopt;
+        if (changes(p.proTxHash, p.pubKeyOperator, /*legacy=*/false)) return p.proTxHash;
+    } else if (tx.type == vendor::CProUpRevTx::SPECIALTX_TYPE) {
+        vendor::CProUpRevTx p;
+        if (!vendor::parse_protx_payload(tx.extra_payload, p)) return std::nullopt;
+        const auto it = mnstates.entries().find(p.proTxHash);
+        if (it != mnstates.entries().end()
+            && std::any_of(it->second.pubKeyOperator.begin(), it->second.pubKeyOperator.end(),
+                           [](uint8_t b) { return b != 0; }))
+            return p.proTxHash;
+    }
+    return std::nullopt;
+}
+
+/// Apply order_service_updates (service_update_order.hpp) to the selected
+/// body: reorder it, and leave out (fee follows) what Dash Core's miner would.
+template <typename Fees>
+void order_template_service_updates(std::vector<Mempool::SelectedTx>& selected, Fees& total_fees,
+                                    const MnStateMachine& mnstates, uint32_t height)
+{
+    bool any_service = false, any_key_change = false;
+    std::vector<ServiceOrderTx> body;
+    body.reserve(selected.size());
+    for (const auto& s : selected) {
+        ServiceOrderTx o;
+        o.txid = dash::coin::dash_txid(s.tx);
+        for (const auto& in : s.tx.vin) o.spends.push_back(in.prevout.hash);
+        o.key_change_of = template_key_change_target(s.tx, mnstates);
+        if (s.tx.type == vendor::CProUpServTx::SPECIALTX_TYPE && tx_has_extra_payload(s.tx.version, s.tx.type)) {
+            vendor::CProUpServTx p;
+            if (vendor::parse_protx_payload(s.tx.extra_payload, p)) o.service_update_of = p.proTxHash;
+        }
+        o.unorderable_kind = tx_has_extra_payload(s.tx.version, s.tx.type)
+                          && (s.tx.type == vendor::MNHFTxPayload::SPECIALTX_TYPE || s.tx.type == 8 || s.tx.type == 9);
+        any_service = any_service || o.service_update_of.has_value();
+        any_key_change = any_key_change || o.key_change_of.has_value();
+        body.push_back(std::move(o));
+    }
+    if (!any_service || !any_key_change) return;
+    const ServiceOrderResult r = order_service_updates(body);
+    if (r.moved == 0 && r.dropped.empty()) return;
+    for (const auto& [i, why] : r.dropped) {
+        total_fees -= selected[i].fee;
+        LOG_WARNING << "[GBT-EMB] excluding tx " << body[i].txid.GetHex().substr(0, 16) << " from template h=" << height
+                    << ": " << why << " (Dash Core puts a service update before the key change or leaves it out)";
+    }
+    std::vector<Mempool::SelectedTx> out;
+    out.reserve(r.order.size());
+    for (size_t i : r.order) out.push_back(std::move(selected[i]));
+    selected = std::move(out);
+    if (r.moved > 0)
+        LOG_INFO << "[GBT-EMB] h=" << height << ": moved " << r.moved
+                 << " tx(s) of pending service updates in front of an operator key change (Dash Core order)";
+}
+
 /// The ONE MnFoldContext both the template builder and the NodeCoinState emit
 /// gate fold with (sml_special_fold.hpp): the pre-block list from the live
 /// MnStateMachine, external-collateral proofs from the same chain views the
 /// selector priced from (Mempool::prove_chain_coin), and the BLS operator-
 /// signature verifier (nullptr/empty ⇒ ProUpServTx / ProUpRevTx refused).
+///
+/// Every provider tx must also pass Dash Core's full CheckPro*Tx for the block
+/// being built (protx_check.hpp, `next_height`, `v24_active`): without a
+/// ProTxCheckEnv no provider tx is checkable, so none rides (fail closed).
 inline MnFoldContext make_template_fold_context(
     const MnStateMachine& mnstates, const Mempool& mempool,
-    const MnFoldContext::OperatorSigFn* protx_sig_verifier)
+    const MnFoldContext::OperatorSigFn* protx_sig_verifier,
+    const ProTxCheckEnv* protx_check_env = nullptr,
+    uint32_t next_height = 0,
+    bool v24_active = false)
 {
     MnFoldContext::CollateralCoinFn coin =
         [&mempool](const MnFoldContext::Outpoint& op, int64_t& value) {
@@ -407,10 +493,43 @@ inline MnFoldContext make_template_fold_context(
             }
             return MnFoldContext::CollateralProof::Unknown;
         };
-    return MnFoldContext::from(
+    MnFoldContext ctx = MnFoldContext::from(
         mnstates, std::move(coin),
         protx_sig_verifier != nullptr ? *protx_sig_verifier
                                       : MnFoldContext::OperatorSigFn{});
+    ctx.require_core_check = true;
+    // Dash Core v24: every provider type (1-4 and 10-12) folds through the v24
+    // transitions on full states (sml_special_fold.hpp, the v24 fold).
+    ctx.v24_rules = v24_active;
+    ctx.height = next_height;
+    ctx.netinfo_rules = netinfo_rules_for(protx_check_env != nullptr ? protx_check_env->net
+                                                                     : DashNetwork::MAINNET);
+    if (protx_check_env != nullptr && protx_check_env->check_override) {
+        ctx.core_check = protx_check_env->check_override;
+    } else if (protx_check_env != nullptr) {
+        const ProTxCheckRules rules = protx_rules_for(*protx_check_env, next_height, v24_active);
+        ProTxCoinFn script_coin =
+            [&mempool](const bitcoin_family::coin::TxPrevOut& op, int64_t& value,
+                       std::vector<uint8_t>& script) {
+                ::core::coin::Coin c;
+                switch (mempool.prove_chain_coin(::core::coin::Outpoint(op.hash, op.index), c)) {
+                case Mempool::CoinProof::Unspent:
+                    value = c.value;
+                    script = c.scriptPubKey.m_data;
+                    return ProTxCoinProof::Unspent;
+                case Mempool::CoinProof::Absent:
+                    return ProTxCoinProof::Absent;
+                case Mempool::CoinProof::Unknown:
+                    break;
+                }
+                return ProTxCoinProof::Unknown;
+            };
+        ctx.core_check = [&mnstates, rules, script_coin = std::move(script_coin),
+                          ecdsa = protx_check_env->ecdsa](const MutableTransaction& tx) {
+            return protx_core_refusal(tx, mnstates, rules, script_coin, ecdsa);
+        };
+    }
+    return ctx;
 }
 
 inline DashWorkData build_embedded_workdata(
@@ -570,8 +689,11 @@ inline DashWorkData build_embedded_workdata(
     // it commits. A tx the fold cannot apply exactly is EXCLUDED (never a bad
     // root). Default false => types 1-4 stay excluded and every existing
     // positional caller is byte-unchanged (the folded copy is never built).
+    // Dash Core v24: with v24_active the same lever admits the shared-
+    // masternode types 10-12 (the fold then runs the v24 transitions for every
+    // provider type), and, with mnhf_check_env, type-7 MNHF signals.
     // The type-8 (asset-lock) selection leg rides accrue_pending_asset_locks;
-    // types 5/6/7/9 are never selected (type-6 is builder-generated, type-9 is
+    // types 5/6/9 are never selected (type-6 is builder-generated, type-9 is
     // admission-path-only via admitted_asset_unlocks).
     bool include_mn_special_txs = false,
     // ── PoSe PASS seams (sml_pose_fold.hpp, incident h=2561514) ──────────
@@ -591,18 +713,33 @@ inline DashWorkData build_embedded_workdata(
     // c2pool-dash). nullptr => those two types are REFUSED (fail closed): a
     // stale-key ProUpServTx is bad-protx-sig on every block that carries it.
     // Only consulted when include_mn_special_txs admitted types 1-4.
-    const MnFoldContext::OperatorSigFn* protx_sig_verifier = nullptr)
+    const MnFoldContext::OperatorSigFn* protx_sig_verifier = nullptr,
+    // Dash Core v24: DEPLOYMENT_V24 is active for this block, so the CbTx is
+    // version 4 and commits merkleRootAssetUnlocks over this body. Default
+    // false => version 3, byte-identical for every existing caller.
+    bool v24_active = false,
+    // Dash Core's full provider-tx checks (protx_check.hpp) for the provider
+    // types the template folds. nullptr => no provider tx is checkable, none
+    // rides.
+    const ProTxCheckEnv* protx_check_env = nullptr,
+    // Dash Core's CheckMNHFTx for type-7 signals (mnhf_check.hpp). nullptr =>
+    // no signal rides (they are not selected).
+    const MnhfCheckEnv* mnhf_check_env = nullptr)
 {
     DashWorkData w;
     w.m_height          = prev_height + 1;
     w.m_previous_block  = prev_hash;
     w.m_bits            = bits_for_next;
-    w.m_curtime         = curtime;
     // Step 8: real median-time-past from header_chain. dashcore
     // requires curtime > MTP for the candidate block to be valid;
     // GBT returns MTP+1 as mintime so miners don't accidentally
     // produce stale-time blocks.
     w.m_mintime         = mtp_at_tip + 1;
+    // curtime is never below mintime: Dash Core's miner sets
+    // nTime = max(MTP(prev) + 1, adjusted time) (node/miner.cpp
+    // UpdateTime). A clock behind the tip MTP would otherwise give a
+    // time-too-old header. A clock at or past mintime is unchanged.
+    w.m_curtime         = std::max(curtime, w.m_mintime);
     w.m_version         = version;              // seam: default 0x20000000 (BIP9 baseline)
 
     // Subsidy + tx selection.
@@ -691,10 +828,19 @@ inline DashWorkData build_embedded_workdata(
     // SML fold excludes types 1-4 while type-8 still rides. Default (all legs
     // off) => admits() rejects every type!=0, byte-identical to the historical
     // special-tx-free template.
+    // Dash Core v24 (DEPLOYMENT_V24 active for this block): the shared-
+    // masternode provider types 10-12 ride the same lever and the same fold as
+    // types 1-4 (the fold then runs the v24 transitions for all of them), and
+    // the selection applies Core v24's type list. MNHF signals (type 7) ride
+    // the lever when their checks are wired (mnhf_check.hpp); they change no
+    // CbTx root.
     Mempool::SpecialTxSelectMask special_mask;
     special_mask.allow_all_special = false;                 // never the general path here
     special_mask.allow_mn_types    = include_mn_special_txs && (sml != nullptr);
     special_mask.allow_locks       = accrue_pending_asset_locks;
+    special_mask.allow_v24_provider = special_mask.allow_mn_types && v24_active;
+    special_mask.allow_mnhf        = include_mn_special_txs && mnhf_check_env != nullptr;
+    special_mask.v24_rules         = v24_active;
     // suppress_mempool_txs: coinbase-only body, total_fees == 0 exactly. The
     // mempool is not even consulted for selection (only, below, for the forgone-
     // fee report), so no partially-warm UTXO view can price anything into this
@@ -734,7 +880,14 @@ inline DashWorkData build_embedded_workdata(
         size_t kept = 0;
         for (size_t i = 0; i < selected.size(); ++i) {
             uint256 protx;
-            if (tx_spends_mn_collateral(mnstates, selected[i].tx, &protx)) {
+            // Dash Core v24: a ProDisTx dissolves a shared masternode by
+            // spending its collateral. With the v24 fold armed it stays: the
+            // fold checks it (CheckProDisTx) and removes the masternode in the
+            // collateral-spend pass, so the committed root carries the removal.
+            const bool v24_dissolve = special_mask.allow_v24_provider
+                && tx_is_special_version(selected[i].tx.version)
+                && selected[i].tx.type == tx_type::PROVIDER_DISSOLVE;
+            if (!v24_dissolve && tx_spends_mn_collateral(mnstates, selected[i].tx, &protx)) {
                 total_fees -= selected[i].fee;
                 LOG_WARNING << "[GBT-EMB] excluding tx "
                             << dash::coin::dash_txid(selected[i].tx).GetHex().substr(0, 16)
@@ -802,6 +955,11 @@ inline DashWorkData build_embedded_workdata(
     }
     std::optional<vendor::CSimplifiedMNList> mn_folded_sml;
     if (special_mask.allow_mn_types && sml != nullptr) {
+        // Dash Core's miner never puts a ProUpServTx after a key change of
+        // its masternode in one block (service_update_order.hpp): it pulls
+        // the update in front, or leaves it out. Before the fold, so the
+        // root is the root of the order served.
+        order_template_service_updates(selected, total_fees, mnstates, prev_height + 1);
         auto proj_for_fold = project_sml_confirmations(
             *sml, prev_height, prev_hash, mnstates, mn_min_confirmations);
         // dashd order: the type-6 PoSe pass precedes the provider txs.
@@ -809,7 +967,8 @@ inline DashWorkData build_embedded_workdata(
         if (proj_for_fold.ok) {
             // The SAME context the emit gate folds with (B10 parity).
             const MnFoldContext fold_ctx =
-                make_template_fold_context(mnstates, mempool, protx_sig_verifier);
+                make_template_fold_context(mnstates, mempool, protx_sig_verifier,
+                                           protx_check_env, w.m_height, v24_active);
             // Fold, drop what it refused (fee follows the tx out), and repeat
             // while a drop also takes an in-body DESCENDANT with it: a child of
             // a dropped tx would spend an output the block no longer creates
@@ -878,15 +1037,22 @@ inline DashWorkData build_embedded_workdata(
                 break;
             }
         } else {
-            // Projection unavailable ⇒ degrade leg (b): mask types 1-4 out by
-            // dropping them from the body (the credit-pool / type-8 leg is
-            // independent and unaffected). Fail-closed and loud.
+            // Projection unavailable ⇒ degrade leg (b): mask the provider
+            // types (1-4, and 10-12 under v24) out by dropping them from the
+            // body, with every in-body descendant (a child would spend an
+            // output the block no longer creates). The credit-pool / type-8
+            // leg is independent and unaffected. Fail-closed and loud.
             size_t kept = 0;
             unsigned dropped = 0;
+            std::set<uint256> gone;
             for (size_t i = 0; i < selected.size(); ++i) {
                 const uint16_t t = selected[i].tx.type;
-                if (t >= 1 && t <= 4) {
+                bool child_of_dropped = false;
+                for (const auto& in : selected[i].tx.vin)
+                    if (gone.count(in.prevout.hash)) { child_of_dropped = true; break; }
+                if ((t >= 1 && t <= 4) || tx_type_is_v24_provider(t) || child_of_dropped) {
                     total_fees -= selected[i].fee;
+                    gone.insert(dash::coin::dash_txid(selected[i].tx));
                     ++dropped;
                     continue;
                 }
@@ -899,6 +1065,37 @@ inline DashWorkData build_embedded_workdata(
                             << (prev_height + 1) << " — masked " << dropped
                             << " provider special tx(s) out of the template";
         }
+    }
+    // ── MNHF SIGNALS (type 7, mnhf_check.hpp) ────────────────────────────
+    // Dash Core's miner takes every valid signal (CheckMNHFTx in
+    // TestPackageTransactions) and skips a second one for a bit already in the
+    // block (node/miner.cpp:728-735). A signal has no inputs and no outputs,
+    // so dropping one takes nothing else with it and moves no fee.
+    if (special_mask.allow_mnhf
+        && std::any_of(selected.begin(), selected.end(), [](const Mempool::SelectedTx& s) {
+               return s.tx.type == vendor::MNHFTxPayload::SPECIALTX_TYPE;
+           })) {
+        std::vector<MutableTransaction> body;
+        body.reserve(selected.size());
+        for (const auto& s : selected) body.push_back(s.tx);
+        const auto why = mnhf_select(body, mnhf_check_env, prev_height, mtp_at_tip);
+        size_t kept = 0;
+        for (size_t i = 0; i < selected.size(); ++i) {
+            if (!why[i].empty()) {
+                total_fees -= selected[i].fee;
+                LOG_WARNING << "[GBT-EMB] excluding MNHF signal "
+                            << dash::coin::dash_txid(selected[i].tx).GetHex().substr(0, 16)
+                            << " from template h=" << (prev_height + 1) << ": " << why[i];
+                continue;
+            }
+            if (selected[i].tx.type == vendor::MNHFTxPayload::SPECIALTX_TYPE)
+                LOG_INFO << "[GBT-EMB] MNHF signal "
+                         << dash::coin::dash_txid(selected[i].tx).GetHex().substr(0, 16)
+                         << " rides template h=" << (prev_height + 1);
+            if (kept != i) selected[kept] = std::move(selected[i]);
+            ++kept;
+        }
+        selected.resize(kept);
     }
     // #143: the admitted unlocks' payload fees are ordinary miner fees (dashd
     // GetAssetUnlockFee, assetlocktx.cpp:200-212 — the fee reaches the miner
@@ -1128,16 +1325,6 @@ inline DashWorkData build_embedded_workdata(
                     " overstate; a valid block beats no block)";
     }
 
-    // Platform Credit Pool burn (DIP-0027): emit OP_RETURN payment
-    // FIRST (matches dashcore GetBlockTxOuts ordering at payments.cpp:55).
-    // Payee uses the "!hex" raw-script convention; OP_RETURN single byte = 0x6a.
-    if (platform_reward > 0) {
-        PackedPayment burn;
-        burn.payee  = "!6a";
-        burn.amount = static_cast<uint64_t>(platform_reward);
-        w.m_packed_payments.push_back(std::move(burn));
-    }
-
     // MN payee → packed_payment(s). dashcore GBT returns "payee" as a
     // base58 address. We use script_to_address() to produce the same
     // wire form for standard P2PKH/P2SH scripts. Unrecognized script
@@ -1162,39 +1349,38 @@ inline DashWorkData build_embedded_workdata(
         }
         return hex_script;
     };
-    auto expected = mnstates.find_expected_payee();
-    if (expected) {
-        auto it = mnstates.entries().find(*expected);
-        if (it != mnstates.entries().end() && mn_payment > 0) {
-            const auto& st = it->second;
-            // ── Operator-reward split (incident h=2516595 bad-cb-payee) ──
-            // dashd masternode/payments.cpp GetBlockTxOuts pays the MN
-            // share as a SET: when the scheduled MN registered an operator
-            // share (nOperatorReward bps, ProRegTx) AND its operator set a
-            // payout script (ProUpServTx), the coinbase carries
-            //   owner   : mnShare - floor(mnShare * bps / 10000)
-            //   operator: floor(mnShare * bps / 10000)
-            // in that order, and CheckMasternodePayments validates scripts
-            // AND amounts. h=2516595 (mn 0037c2c5…, bps=800) was rejected
-            // bad-cb-payee precisely because this builder paid the whole
-            // share to the owner. The truncating division is dashd's own;
-            // do NOT "fix" the rounding.
-            const int64_t operator_payment = st.operator_payment_of(mn_payment);
-            const int64_t owner_payment    = mn_payment - operator_payment;
-            if (owner_payment > 0) {
-                PackedPayment pp;
-                pp.payee  = script_to_payee_token(st.scriptPayout.m_data);
-                pp.amount = static_cast<uint64_t>(owner_payment);
-                w.m_packed_payments.push_back(std::move(pp));
-            }
-            // dashd: `if (operatorReward > 0) emplace_back(...)` — a split
-            // whose floor rounds to zero emits NO operator output.
-            if (operator_payment > 0) {
-                PackedPayment pp;
-                pp.payee  = script_to_payee_token(st.scriptOperatorPayout.m_data);
-                pp.amount = static_cast<uint64_t>(operator_payment);
-                w.m_packed_payments.push_back(std::move(pp));
-            }
+    // dashd masternode/payments.cpp CMNPaymentsProcessor::GetBlockTxOuts,
+    // through the verbatim Core v24.0.0 port (vendor/masternode_payments.hpp
+    // GetBlockTxOutsForPayee): the platform credit-pool burn (DIP-0027)
+    // OP_RETURN FIRST in the EvoReward era, then the scheduled payee's owner
+    // payouts -- a v3 payout list, a shared masternode's share split, or
+    // scriptPayout below v3 -- then the operator output (incident
+    // h=2516595: the operator share is dashd's own truncation; do NOT "fix"
+    // the rounding). Each output only when > 0, one packed payment each,
+    // never merged: from v24 every expected output consumes a distinct
+    // coinbase output. Payee SELECTION is the projection's (GetMNPayee is
+    // unchanged in v24). For a v1/v2 payee this is byte for byte the
+    // burn/owner/operator list emitted before v24.
+    {
+        std::optional<vendor::payments::DmnPayee> dmn_payee;
+        if (auto expected = mnstates.find_expected_payee()) {
+            auto it = mnstates.entries().find(*expected);
+            if (it != mnstates.entries().end())
+                dmn_payee = vendor::payments::dmn_payee_of(it->second);
+        }
+        std::vector<vendor::payments::CTxOut> vout;
+        vendor::payments::GetBlockTxOutsForPayee(
+            dmn_payee ? &*dmn_payee : nullptr,
+            /*masternodeReward=*/mn_payment + platform_reward,   // GetMasternodePayment(h, subsidy + fees)
+            /*platformReward=*/platform_reward,                   // PlatformShare(GetMasternodePayment(h, subsidy))
+            /*evo_reward_era=*/platform_reward > 0,
+            vout);
+        for (const auto& out : vout) {
+            if (out.nValue <= 0) continue;
+            PackedPayment pp;
+            pp.payee  = script_to_payee_token(out.scriptPubKey);   // OP_RETURN -> "!6a"
+            pp.amount = static_cast<uint64_t>(out.nValue);
+            w.m_packed_payments.push_back(std::move(pp));
         }
     }
 
@@ -1343,9 +1529,14 @@ inline DashWorkData build_embedded_workdata(
         // BuildNewListFromBlock). Otherwise commit the projected root.
         const vendor::CSimplifiedMNList& cbtx_sml =
             mn_folded_sml.has_value() ? *mn_folded_sml : proj.sml;
+        // Dash Core v24 CalcCbTxMerkleRootAssetUnlocks over the body this
+        // template carries (null until a stable-txid unlock rides it, which
+        // selection does not admit today).
+        const uint256 asset_unlock_root = compute_merkle_root_asset_unlocks(w.m_txs);
         vendor::CCbTx cb = build_embedded_cbtx(
             prev_height, cbtx_sml, *qmgr, best_cl_height, best_cl_sig,
-            accrued_credit_pool, quorum_root_override);
+            accrued_credit_pool, quorum_root_override,
+            v24_active, asset_unlock_root);
         w.m_coinbase_payload = encode_cbtx(cb);
     } else {
         w.m_coinbase_payload.clear();
@@ -1456,10 +1647,17 @@ inline vendor::CCbTx build_embedded_cbtx(
     // type-6 commitments over the active set). nullptr (default) => the
     // plain PROVEN active-set root — byte-identical for every pre-E1 caller
     // AND for all-null commitment sets.
-    const uint256* quorum_root_override = nullptr)
+    const uint256* quorum_root_override = nullptr,
+    // Dash Core v24 (CheckCbTx): version 4 exactly when DEPLOYMENT_V24 is
+    // active for the block (V20 is active for every block we build), with
+    // merkleRootAssetUnlocks (CalcCbTxMerkleRootAssetUnlocks over the body).
+    // false => version 3, byte-identical.
+    bool v24_active = false,
+    const uint256& asset_unlock_root = uint256::ZERO)
 {
     vendor::CCbTx c;
-    c.nVersion           = vendor::CCbTx::VERSION_CLSIG_AND_BALANCE;
+    c.nVersion           = required_cbtx_version(/*v20_active=*/true, v24_active);
+    if (v24_active) c.merkleRootAssetUnlocks = asset_unlock_root;
     c.nHeight            = static_cast<int32_t>(prev_height + 1);
     // CalcMerkleRoot() is const and does NOT cache — every call hashes the
     // full list (~2000 x SHA256d on mainnet). A prior comment here claimed
@@ -1548,6 +1746,17 @@ inline bool cbtx_xcheck(const vendor::CCbTx& embedded,
         LOG_WARNING << "[CBTX-XCHECK] merkleRootQuorums MISMATCH "
                     << "embedded=" << embedded.merkleRootQuorums.GetHex().substr(0, 16)
                     << " rpc="     << rpc_cbtx.merkleRootQuorums.GetHex().substr(0, 16);
+        roots_ok = false;
+    }
+
+    // Dash Core v24 (CbTx version 4): the asset-unlock root is derived from
+    // the block's own txs, so any difference is real drift.
+    if (embedded.nVersion >= vendor::CCbTx::VERSION_MERKLE_ROOT_ASSETUNLOCKS
+        && rpc_cbtx.nVersion >= vendor::CCbTx::VERSION_MERKLE_ROOT_ASSETUNLOCKS
+        && embedded.merkleRootAssetUnlocks != rpc_cbtx.merkleRootAssetUnlocks) {
+        LOG_WARNING << "[CBTX-XCHECK] merkleRootAssetUnlocks MISMATCH "
+                    << "embedded=" << embedded.merkleRootAssetUnlocks.GetHex().substr(0, 16)
+                    << " rpc="     << rpc_cbtx.merkleRootAssetUnlocks.GetHex().substr(0, 16);
         roots_ok = false;
     }
 

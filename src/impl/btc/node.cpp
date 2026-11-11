@@ -4,6 +4,7 @@
 #include "share_tx_refs.hpp"          // btc::new_tx_hashes -- uniform gate probe (#880)
 #include "coin/template_other_txs.hpp"  // deserialize_template_other_txs (GBT data[] -> MutableTransaction)
 
+#include <core/reloaded_block_flag.hpp>   // core::restore_block_flag (a reloaded share keeps its block flag)
 #include <core/common.hpp>
 #include <core/hash.hpp>
 #include <core/random.hpp>
@@ -1635,9 +1636,15 @@ void NodeImpl::load_persisted_shares()
                     }
                 }
 
-                // p2pool known_verified: pre-populate verified tracker without re-verification
-                if (meta.is_verified)
+                // p2pool known_verified: pre-populate verified tracker without re-verification.
+                // Not verified again, so its block flag comes from its PoW hash and header
+                // bits here, with no found-block event (the block was recorded when the
+                // share was first verified; the found-block store survives the restart).
+                if (meta.is_verified) {
+                    if (auto* idx = m_tracker.chain.get_index(share.hash()))
+                        share.ACTION({ core::restore_block_flag(*idx, *obj, idx->pow_hash); });
                     verified_hashes.push_back(share.hash());
+                }
 
                 if (loaded % 1000 == 0) {
                     size_t progress = i - skip + 1;

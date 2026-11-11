@@ -10,11 +10,15 @@
 // launcher, which never defines C2POOL_DASH_BLS).
 
 #include <impl/dash/coin/vendor/bls_verify.hpp>
+#include <impl/dash/coin/vendor/bls_canonical.hpp>
 
 #include <core/pack.hpp>       // PackStream, WriteCompactSize
 #include <core/hash.hpp>       // CHash256
 
+#include <algorithm>
 #include <cstring>
+#include <optional>
+#include <vector>
 #include <span>
 
 #ifdef C2POOL_DASH_BLS
@@ -185,13 +189,14 @@ bool verify_final_commitment(const CFinalCommitment& c,
 bool verify_govvote_operator_sig(
     const std::array<uint8_t, CFinalCommitment::BLS_PUBKEY_SIZE>& pubkey_operator,
     bool key_legacy_scheme, const uint256& digest,
-    const std::vector<uint8_t>& vch_sig)
+    const std::vector<uint8_t>& vch_sig, bool pubkey_scheme_fallback)
 {
 #ifndef C2POOL_DASH_BLS
     (void)pubkey_operator;
     (void)key_legacy_scheme;
     (void)digest;
     (void)vch_sig;
+    (void)pubkey_scheme_fallback;
     return false;   // no BLS backend → fail closed (vote never tallied → dashd)
 #else
     // dashcore CGovernanceVote::CheckSignature: a BLS signature is 96 bytes.
@@ -239,7 +244,10 @@ bool verify_govvote_operator_sig(
         // fallback. (Pinned against the real from-wire testnet vote:
         // legacy-encoded pubkey + basic-encoded sig + basic DST verifies; a
         // forged/tampered sig or wrong key verifies under NO pubkey encoding.)
+        // With pubkey_scheme_fallback = false only the declared scheme is
+        // tried (P-3: canonical-basic projection keys).
         for (bool pk_legacy : {key_legacy_scheme, !key_legacy_scheme}) {
+            if (pk_legacy != key_legacy_scheme && !pubkey_scheme_fallback) break;
             bls::G1Element pk;
             try {
                 pk = bls::G1Element::FromBytes(
@@ -364,6 +372,20 @@ make_commitment_bls_verifier(MemberKeysProvider provider)
         if (!members) return false;   // member set uncertain → fail closed
         return verify_final_commitment(c, *members);
     };
+}
+
+// ── Dash Core's BLS encoding rules for provider payloads (bls_canonical.hpp) ──
+
+// The rules are header-only (bls_canonical.hpp); exported here so the
+// default BlsEncodingChecks has a linkable address.
+std::optional<bool> bls_pubkey_core_valid(const std::array<uint8_t, 48>& key, bool legacy)
+{
+    return bls_pubkey_core_valid_inline(key, legacy);
+}
+
+std::optional<bool> bls_sig_core_decodes(const std::array<uint8_t, 96>& sig, bool legacy)
+{
+    return bls_sig_core_decodes_inline(sig, legacy);
 }
 
 } // namespace vendor

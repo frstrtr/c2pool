@@ -150,6 +150,13 @@ inline PayeeGuardResult check_submit_payee(
     // subsidy + fees and drifts with the mempool between template re-pulls at
     // the same height; dashd checks it against the block's OWN fees, so an
     // amount difference here is NOT a reject and must NOT block the submit.
+    // Occurrence-counted (Dash Core v24 strict multiplicity,
+    // FindUnmatchedMasternodePayment): each mandated payment consumes a
+    // DISTINCT coinbase output, so a payout set that pays one script twice (a
+    // 50/50 operator split to the owner's script, two shares with one reward
+    // script) needs two outputs. Our builders emit one output per packed
+    // payment, so a coinbase built from this job always satisfies it.
+    std::vector<bool> consumed(cb.vout.size(), false);
     for (const auto& pay : current.m_packed_payments) {
         if (pay.amount == 0)
             continue;   // no-op payment — builder emits no output for it
@@ -158,8 +165,9 @@ inline PayeeGuardResult check_submit_payee(
         if (want_script.empty())
             continue;   // undecodable payee — builder drops these too
         bool found = false;
-        for (const auto& out : cb.vout) {
-            if (out.scriptPubKey.m_data == want_script) {   // script only, ANY amount
+        for (size_t j = 0; j < cb.vout.size(); ++j) {
+            if (!consumed[j] && cb.vout[j].scriptPubKey.m_data == want_script) {   // script only, ANY amount
+                consumed[j] = true;
                 found = true;
                 break;
             }

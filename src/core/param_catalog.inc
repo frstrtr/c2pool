@@ -210,6 +210,8 @@ C2P_PARAM("sharechain.network_id", Sharechain, HEX, MONEY_RESTART, C_LTC|C_BTC|C
   C2P_ALIAS("sharechain.network_id", BIN_LTC, "--chain-id", VALUE)
   C2P_ALIAS("sharechain.network_id", BIN_BTC, "--network-id", VALUE)
   C2P_ALIAS("sharechain.network_id", BIN_DASH, "--network-id", VALUE)
+C2P_PARAM("sharechain.v3601_activation_time", Sharechain, INT64, MONEY_RESTART, C_LTC, LIT, "", NONE, "share version 3601 flag day, unix time (testnet / private --network-id chain only)")
+  C2P_ALIAS("sharechain.v3601_activation_time", BIN_LTC, "--v3601-activation-time", VALUE)
 
 C2P_PARAM("sharechain.prefix", Sharechain, HEX, MONEY_RESTART, C_LTC|C_BTC|C_DASH, LIT, "", HEX_EVEN, "private sharechain prefix")
   C2P_ALIAS("sharechain.prefix", BIN_LTC, "--prefix", VALUE)
@@ -258,6 +260,14 @@ C2P_PARAM("coin_p2p.doge_port", CoinP2P, INT64, RESTART, C_LTC|C_DOGE|C_DGB, LIT
 
 C2P_PARAM("coin_p2p.address", CoinP2P, STRING, RESTART, C_LTC, LIT, "", NONE, "coind P2P address")
   C2P_ALIAS("coin_p2p.address", BIN_LTC, "--coind-p2p-address", VALUE)
+
+// Core's -connect for the embedded coin P2P: these peers and no other (no
+// peer DB, DNS / fixed / HTTP seeds, getpeerinfo or addr gossip). Repeatable.
+C2P_PARAM("coin_p2p.ltc_connect", CoinP2P, STRING, RESTART, C_LTC, LIT, "", NONE, "dial only this LTC peer IP[:PORT] (repeatable; Core -connect; no names)")
+  C2P_ALIAS("coin_p2p.ltc_connect", BIN_LTC, "--ltc-connect", VALUE)
+
+C2P_PARAM("coin_p2p.doge_connect", CoinP2P, STRING, RESTART, C_LTC|C_DOGE, LIT, "", NONE, "dial only this DOGE peer IP[:PORT] (repeatable; Core -connect; no names)")
+  C2P_ALIAS("coin_p2p.doge_connect", BIN_LTC, "--doge-connect", VALUE)
 
 C2P_PARAM("coin_p2p.port", CoinP2P, INT64, RESTART, C_LTC|C_DGB, LIT, "-1", NONE, "coind P2P port (-1 auto,0 off)")
   C2P_ALIAS("coin_p2p.port", BIN_LTC, "--coind-p2p-port", VALUE)
@@ -462,6 +472,9 @@ C2P_PARAM("merged.spec", Merged, MERGED_SPEC, RESTART, C_BTC|C_LTC|C_NMC|C_DGB|C
   C2P_ALIAS("merged.spec", BIN_BTC, "--merged", VALUE)
   C2P_ALIAS("merged.spec", BIN_DGB, "--merged", VALUE)
 
+C2P_PARAM("merged.payout_addresses", Merged, STRING, MONEY_RESTART, C_LTC, LIT, "", NONE, "per-chain SYMBOL:ADDRESS for createauxblock (repeatable)")
+  C2P_ALIAS("merged.payout_addresses", BIN_LTC, "--merged-payout-address", VALUE)
+
 C2P_PARAM("merged.coind_address", Merged, STRING, RESTART, C_LTC|C_DOGE, LIT, "", NONE, "merged coind address")
   C2P_ALIAS("merged.coind_address", BIN_LTC, "--merged-coind-address", VALUE)
 
@@ -495,6 +508,40 @@ C2P_PARAM("embedded.header_checkpoint", Embedded, STRING, RESTART, C_LTC, LIT, "
 C2P_PARAM("embedded.doge_header_checkpoint", Embedded, STRING, RESTART, C_LTC|C_DOGE, LIT, "", NONE, "DOGE header checkpoint H:HASH")
   C2P_ALIAS("embedded.doge_header_checkpoint", BIN_LTC, "--doge-header-checkpoint", VALUE)
 
+// The full DOGE UTXO set (built from genesis; prices the DOGE template once
+// complete). Off keeps the accrual view only (the rollback).
+C2P_PARAM("embedded.doge_utxo_full", Embedded, TRISTATE_BOOL, RESTART, C_LTC|C_DOGE, NONE, "", NONE, "embedded DOGE full UTXO set built from genesis (default on)")
+  C2P_ALIAS("embedded.doge_utxo_full", BIN_LTC, "--doge-utxo-full", FLAG)
+  C2P_ALIAS("embedded.doge_utxo_full", BIN_LTC, "--no-doge-utxo-full", FLAG_NO_PREFIX)
+
+C2P_PARAM("embedded.doge_utxo_full_dir", Embedded, PATH, RESTART, C_LTC|C_DOGE, LIT, "", NONE, "the full DOGE UTXO set's LevelDB (default <data-dir>/dogecoin/utxo_full_leveldb)")
+  C2P_ALIAS("embedded.doge_utxo_full_dir", BIN_LTC, "--doge-utxo-full-dir", VALUE)
+
+// The full LTC UTXO set (#2137 S2): built from genesis on its own header
+// chain from genesis; prices the LTC template once complete. Off (the
+// default) keeps the accrual view only.
+C2P_PARAM("embedded.ltc_utxo_full", Embedded, TRISTATE_BOOL, RESTART, C_LTC, NONE, "", NONE, "embedded LTC full UTXO set built from genesis (default off)")
+  C2P_ALIAS("embedded.ltc_utxo_full", BIN_LTC, "--ltc-utxo-full", FLAG)
+  C2P_ALIAS("embedded.ltc_utxo_full", BIN_LTC, "--no-ltc-utxo-full", FLAG_NO_PREFIX)
+
+C2P_PARAM("embedded.ltc_utxo_full_dir", Embedded, PATH, RESTART, C_LTC, LIT, "", NONE, "the full LTC UTXO set's LevelDB (default <data-dir>/litecoin/utxo_full_leveldb)")
+  C2P_ALIAS("embedded.ltc_utxo_full_dir", BIN_LTC, "--ltc-utxo-full-dir", VALUE)
+
+// One-shot LevelDB tools: run, print, exit; no node starts. Compile-time
+// readonly like the other print-and-exit rows (refused in a settings file,
+// never mirrored into the resolved config).
+C2P_PARAM("utility.dump_doge_schedule_anchors", Meta, PATH, COMPILE_TIME_READONLY, C_LTC|C_DOGE, LIT, "", NONE, "write the DOGE hash schedule's anchors from the header LevelDB DIR (to OUT, else stdout), then exit")
+  C2P_ALIAS("utility.dump_doge_schedule_anchors", BIN_LTC, "--dump-doge-schedule-anchors", VALUE)
+
+C2P_PARAM("utility.utxo_digest", Meta, PATH, COMPILE_TIME_READONLY, C_LTC|C_DOGE, LIT, "", NONE, "print the digest of the UTXO LevelDB at DIR, then exit")
+  C2P_ALIAS("utility.utxo_digest", BIN_LTC, "--utxo-digest", VALUE)
+
+C2P_PARAM("utility.utxo_stats", Meta, PATH, COMPILE_TIME_READONLY, C_LTC|C_DOGE, LIT, "", NONE, "print gettxoutsetinfo (Dogecoin Core 1.14.9 GetUTXOStats) for the UTXO LevelDB at DIR, then exit")
+  C2P_ALIAS("utility.utxo_stats", BIN_LTC, "--utxo-stats", VALUE)
+
+C2P_PARAM("utility.ltc_utxo_stats", Meta, PATH, COMPILE_TIME_READONLY, C_LTC, LIT, "", NONE, "print gettxoutsetinfo (Litecoin Core 0.21.4 GetUTXOStats, hash_serialized_2) for the UTXO LevelDB at DIR, then exit")
+  C2P_ALIAS("utility.ltc_utxo_stats", BIN_LTC, "--ltc-utxo-stats", VALUE)
+
 C2P_PARAM("embedded.ltc_cmpct_v3", Embedded, TRISTATE_BOOL, RESTART, C_LTC, NONE, "", NONE, "ask LTC MWEB peers for v3 compact blocks (default on)")
   C2P_ALIAS("embedded.ltc_cmpct_v3", BIN_LTC, "--ltc-cmpct-v3", FLAG)
   C2P_ALIAS("embedded.ltc_cmpct_v3", BIN_LTC, "--no-ltc-cmpct-v3", FLAG_NO_PREFIX)
@@ -511,6 +558,9 @@ C2P_PARAM("embedded.ltc_mweb_cmpct_provisional", Embedded, BOOL, RESTART, C_LTC,
 
 C2P_PARAM("embedded.template_tx_check", Embedded, ENUM_STR, RESTART, C_LTC, LIT, "strict", ENUM_MEMBER, "LTC template transaction check: strict (refuse / HOLD) or warn (log and count only)")
   C2P_ALIAS("embedded.template_tx_check", BIN_LTC, "--template-tx-check", VALUE)
+
+C2P_PARAM("embedded.ltc_mweb_ext", Embedded, ENUM_STR, RESTART, C_LTC, LIT, "none", ENUM_MEMBER, "LTC MWEB extension source: none (empty body, daemonless) or litecoind (the local litecoind's, checked against c2pool's MWEB state; needs the LTC RPC settings)")
+  C2P_ALIAS("embedded.ltc_mweb_ext", BIN_LTC, "--ltc-mweb-ext", VALUE)
 
 C2P_PARAM("embedded.anchor", Embedded, STRING, RESTART, C_BCH, LIT, "", NONE, "BCH anchor H:HASH")
   C2P_ALIAS("embedded.anchor", BIN_BCH, "--anchor", VALUE)
@@ -564,6 +614,9 @@ C2P_PARAM("embedded.accrue_asset_locks", Embedded, BOOL, RESTART, C_DASH, LIT, "
 
 C2P_PARAM("embedded.accrue_asset_unlocks", Embedded, BOOL, RESTART, C_DASH, LIT, "false", NONE, "type-9 asset-unlock fold")
   C2P_ALIAS("embedded.accrue_asset_unlocks", BIN_DASH, "--embedded-accrue-asset-unlocks", FLAG)
+
+C2P_PARAM("embedded.credit_pool_seed", Embedded, BOOL, RESTART, C_DASH, LIT, "false", NONE, "seed the credit-pool follower from the v20 floor (needed to admit asset unlocks)")
+  C2P_ALIAS("embedded.credit_pool_seed", BIN_DASH, "--embedded-credit-pool-seed", FLAG)
 
 C2P_PARAM("embedded.null_arm", Embedded, TRISTATE_BOOL, MONEY_RESTART, C_DASH, NONE, "", NONE, "optimistic null commitment (money/consensus)")
   C2P_ALIAS("embedded.null_arm", BIN_DASH, "--embedded-null-arm", FLAG_OPT_EQFALSE)
@@ -779,6 +832,9 @@ C2P_PARAM("utility.max_nonce", Meta, INT64, RESTART, C_DASH, LIT, "4294967295", 
 
 C2P_PARAM("bls.allow_stub", Gate, BOOL, RESTART, C_DASH, LIT, "false", NONE, "knowingly run a bls=stub (BLS-dark) build in a BLS-relying config")
   C2P_ALIAS("bls.allow_stub", BIN_DASH, "--allow-stub-bls", FLAG)
+
+C2P_PARAM("dash.v24_activation_height", Embedded, INT64, RESTART, C_DASH, NONE, "", NONE, "pin the Dash Core v24 activation height once locked in (unset: follow the EHF signals)")
+  C2P_ALIAS("dash.v24_activation_height", BIN_DASH, "--dash-v24-activation-height", VALUE)
 
 #undef C2P_PARAM
 #undef C2P_ALIAS

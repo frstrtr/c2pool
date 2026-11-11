@@ -347,10 +347,31 @@ jobs:
         if: steps.presence.outputs.exists == '1'
         run: brew install cmake boost leveldb secp256k1 nlohmann-json yaml-cpp
 
+      # DASH cell only: build/reuse dash's own src/dashbls at the pinned tag for
+      # THIS arch (native, Homebrew gmp; dashbls's configure picks ARITH=GMP on arm64
+      # and ARITH=EASY on x86_64 Darwin, the same split as dashd's builds) and export
+      # DASHBLS_ROOT, so the package links the REAL BLS12-381 verifier like the
+      # Linux one. googletest is only for the BLS KATs run below.
+      - name: Provision dashbls (DASH only)
+        if: steps.presence.outputs.exists == '1' && matrix.coin == 'dash'
+        uses: ./.github/actions/provision-dashbls
+
+      - name: Install googletest (DASH only, for the BLS KATs)
+        if: steps.presence.outputs.exists == '1' && matrix.coin == 'dash'
+        run: brew install googletest
+
       - name: Configure
         if: steps.presence.outputs.exists == '1'
-        # DGB: -DAUX_DOGE=ON -> DGB parent + embedded DOGE (mirrors c2pool-ltc). Inert for other coins.
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release ${{ matrix.coin == 'dgb' && '-DAUX_DOGE=ON' || '' }}
+        run: |
+          # DGB: -DAUX_DOGE=ON -> DGB parent + embedded DOGE (mirrors c2pool-ltc).
+          # DASH: -DC2POOL_DASH_BLS=ON is a HARD requirement (cmake FATAL_ERRORs
+          # without the library), so this cell cannot package a BLS-dark binary.
+          EXTRA=""
+          case "${{ matrix.coin }}" in
+            dgb)  EXTRA="-DAUX_DOGE=ON" ;;
+            dash) EXTRA="-DC2POOL_DASH_BLS=ON -DDASHBLS_ROOT=$DASHBLS_ROOT" ;;
+          esac
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release $EXTRA
 
       - name: Build c2pool-${{ matrix.coin }}
         if: steps.presence.outputs.exists == '1'
@@ -362,6 +383,45 @@ jobs:
           BIN=build/src/c2pool/c2pool-${{ matrix.coin }}
           file "$BIN"
           "$BIN" --help 2>&1 | head -5 || true
+
+      # Same three legs as the Linux DASH cell and build.yml's linux-dash-bls:
+      # the artefact carries dashbls (rodata + symbols, pre-strip), the binary
+      # names a REAL backend at startup, and the BLS-crypto KATs run green on
+      # this arch's relic + gmp build.
+      - name: BLS link guard + backend line (DASH, pre-strip)
+        if: steps.presence.outputs.exists == '1' && matrix.coin == 'dash'
+        run: |
+          BIN=build/src/c2pool/c2pool-dash
+          bash scripts/ci/dash_bls_linked_guard.sh "$BIN"
+          "$BIN" --help > help.log 2>&1 || true
+          line="$(grep -m1 'DASH BLS backend:' help.log || true)"
+          echo "${{ matrix.arch }}: $line"
+          case "$line" in
+            *"DASH BLS backend: REAL"*) ;;
+            *) echo "::error::c2pool-dash (${{ matrix.arch }}) does not report a REAL BLS backend"; exit 1 ;;
+          esac
+
+      - name: BLS KATs (DASH only)
+        if: steps.presence.outputs.exists == '1' && matrix.coin == 'dash'
+        run: |
+          cmake --build build --target test_dash_bls_verify -j"${BUILD_J:-4}"
+          ./build/test/test_dash_bls_verify > bls_kat.log 2>&1 || { cat bls_kat.log; exit 1; }
+          cat bls_kat.log
+          log="$(cat bls_kat.log)"
+          missing=0
+          for t in \
+            DashBlsVerify.SelfReportIsTruthful \
+            DashBlsVerify.RealQuorumSigAcceptsAndTamperRejects \
+            DashBlsVerify.BlsSmokeSignVerify \
+            DashBlsVerify.VerifyFinalCommitmentSyntheticRoundTrip \
+            DashBlsVerify.OpkeyPointEqIsSchemeFaithful
+          do
+            case "$log" in
+              *"OK ] $t"*) echo "  ok   $t" ;;
+              *) echo "  MISS $t did not report as run"; missing=1 ;;
+            esac
+          done
+          [ "$missing" -eq 0 ] || { echo "::error::BLS KATs did not all run on ${{ matrix.arch }}"; exit 1; }
 
       - name: Stage per-arch package
         if: steps.presence.outputs.exists == '1'
@@ -379,13 +439,47 @@ jobs:
             cp "$dylib" "${PKG}/lib/${base}"
             install_name_tool -change "$dylib" "@executable_path/lib/${base}" "${PKG}/c2pool-${COIN}"
           done
-          for lib in "${PKG}"/lib/*.dylib; do
-            for ref in $(otool -L "$lib" | grep "${BREW_PREFIX}" | awk '{print $1}'); do
-              base=$(basename "$ref")
-              [ -f "${PKG}/lib/${base}" ] && install_name_tool -change "$ref" "@executable_path/lib/${base}" "$lib"
+          # In-tree shared objects linked via @rpath (DASH: libdash_scriptcheck, the
+          # hidden-visibility script interpreter, src/impl/dash/CMakeLists.txt) are not
+          # under the brew prefix; bundle them the same way.
+          for ref in $(otool -L "${PKG}/c2pool-${COIN}" | awk '/@rpath\//{print $1}'); do
+            base=$(basename "$ref")
+            src=$(find build -name "$base" -type f | head -1)
+            [ -n "$src" ] || { echo "PKG-ASSERT FAIL: $ref not found under build/"; exit 1; }
+            cp "$src" "${PKG}/lib/${base}"
+            install_name_tool -change "$ref" "@executable_path/lib/${base}" "${PKG}/c2pool-${COIN}"
+          done
+          # Bundle what the bundled dylibs need in turn (libleveldb -> libsnappy,
+          # ...), repeating until no brew reference is left. A dependency that is
+          # only present on the build runner makes the package fail on a clean Mac.
+          changed=1
+          while [ "$changed" -eq 1 ]; do
+            changed=0
+            for lib in "${PKG}"/lib/*.dylib; do
+              for ref in $(otool -L "$lib" | tail -n +2 | grep "${BREW_PREFIX}" | awk '{print $1}'); do
+                base=$(basename "$ref")
+                if [ ! -f "${PKG}/lib/${base}" ]; then
+                  cp "$ref" "${PKG}/lib/${base}" && chmod u+w "${PKG}/lib/${base}"
+                  changed=1
+                fi
+                install_name_tool -change "$ref" "@executable_path/lib/${base}" "$lib"
+              done
             done
+          done
+          for lib in "${PKG}"/lib/*.dylib; do
             install_name_tool -id "@executable_path/lib/$(basename $lib)" "$lib"
           done
+          if otool -L "${PKG}/c2pool-${COIN}" "${PKG}"/lib/*.dylib | tail -n +1 | grep -vE "^${PKG}/" | grep -E "@rpath/|/actions-runner/|${BREW_PREFIX}/|/opt/homebrew/|/usr/local/"; then
+            echo "PKG-ASSERT FAIL: a dylib reference points outside the package"; exit 1
+          fi
+          # DASH: libdashbls.a is static, but relic's ARITH=GMP backend links
+          # Homebrew's SHARED libgmp, which the loop above must have bundled.
+          if [ "$COIN" = dash ]; then
+            case "$(ls "${PKG}/lib/")" in
+              *libgmp.*) echo "  ok   libgmp bundled" ;;
+              *) echo "PKG-ASSERT FAIL: libgmp not bundled in ${PKG}/lib (BLS build needs it)"; exit 1 ;;
+            esac
+          fi
           cp start.sh "${PKG}/" && chmod +x "${PKG}/start.sh"
           cp "config/${COIN}/c2pool_mainnet.yaml" "${PKG}/config/c2pool_mainnet.yaml.example"
           cp "config/${COIN}/c2pool_testnet.yaml" "${PKG}/config/c2pool_testnet.yaml"
@@ -480,9 +574,71 @@ jobs:
             fi
           done
           chmod +x "${PKG}/start.sh" 2>/dev/null || true
+          # Ad-hoc re-sign. The per-arch step's strip and install_name_tool
+          # invalidate the ad-hoc signatures the linker and Homebrew put on the
+          # binary and the bundled dylibs ("changes being made to the file will
+          # invalidate the code signature"), and Apple Silicon kills a process
+          # that maps code with an invalid signature. Report what arrived
+          # broken, then sign every Mach-O in the package ad hoc (each slice of
+          # a universal file is signed). This is not a Developer ID signature.
+          bad=0
+          for f in "${PKG}"/lib/*.dylib "${PKG}/c2pool-${COIN}"; do
+            codesign --verify "$f" 2>/dev/null || bad=$((bad + 1))
+          done
+          echo "Mach-O files with an invalid signature before re-signing: $bad"
+          for f in "${PKG}"/lib/*.dylib "${PKG}/c2pool-${COIN}"; do
+            codesign --force --sign - "$f"
+          done
+          for f in "${PKG}"/lib/*.dylib "${PKG}/c2pool-${COIN}"; do
+            codesign --verify --strict "$f" || { echo "::error::$f still fails codesign --verify"; exit 1; }
+          done
           file "${PKG}/c2pool-${COIN}"
           lipo -info "${PKG}/c2pool-${COIN}"
           zip -r "${PKG}.zip" "${PKG}/"
+
+      # On the binary users download: each slice of the stripped universal
+      # c2pool-dash carries dashbls (rodata leg; stripped Mach-O keeps a token
+      # symbol table, hence --rodata-only), the bundled libgmp has both slices,
+      # and the package starts and names a REAL backend (arm64 natively, x86_64
+      # under Rosetta when the host has it).
+      - name: BLS link guard + backend line (DASH, universal package)
+        if: steps.presence.outputs.exists == '1' && matrix.coin == 'dash'
+        run: |
+          PKG="c2pool-dash-${{ steps.ver.outputs.version }}-macos-universal"
+          BIN="${PKG}/c2pool-dash"
+          for a in arm64 x86_64; do
+            lipo -thin "$a" "$BIN" -output "bls-guard-$a"
+            echo "== slice $a"
+            bash scripts/ci/dash_bls_linked_guard.sh --rodata-only "bls-guard-$a"
+            rm -f "bls-guard-$a"
+          done
+          found=0
+          for lib in "${PKG}"/lib/libgmp*.dylib; do
+            [ -f "$lib" ] || continue
+            found=1
+            lipo -info "$lib"
+            lipo "$lib" -verify_arch arm64 x86_64 || { echo "::error::$lib is not universal"; exit 1; }
+          done
+          [ "$found" -eq 1 ] || { echo "::error::no libgmp in ${PKG}/lib"; exit 1; }
+          # Prints the backend line; on a miss, the exit status and the output.
+          run_line() {
+            rc=0
+            "$@" --help > help.log 2>&1 || rc=$?
+            if ! grep -m1 'DASH BLS backend:' help.log; then
+              echo "(no backend line; exit status $rc; output follows)"
+              tail -n 20 help.log
+            fi
+          }
+          line="$(run_line "$BIN")"
+          echo "arm64 (native): $line"
+          case "$line" in *"DASH BLS backend: REAL"*) ;; *) echo "::error::universal c2pool-dash (arm64) does not report a REAL BLS backend"; exit 1 ;; esac
+          if arch -x86_64 /usr/bin/true 2>/dev/null; then
+            line="$(run_line arch -x86_64 "$BIN")"
+            echo "x86_64 (Rosetta): $line"
+            case "$line" in *"DASH BLS backend: REAL"*) ;; *) echo "::error::universal c2pool-dash (x86_64) does not report a REAL BLS backend"; exit 1 ;; esac
+          else
+            echo "::warning::Rosetta is not available on this host; the x86_64 slice's runtime line was checked natively in its per-arch job only"
+          fi
 
       - name: Upload universal package
         if: steps.presence.outputs.exists == '1'
@@ -624,11 +780,20 @@ jobs:
           cmake --build secp256k1-src/build --config Release
           cmake --install secp256k1-src/build --config Release
 
+      # DASH cell only: c2pool_dashbls.dll -- dash's own src/dashbls at the
+      # pinned tag, built as dashd's Windows release builds it (mingw-w64 via
+      # MSYS2, ARITH=GMP) behind a C ABI the MSVC exe can link. Once per runner
+      # per key; exports DASHBLS_ROOT.
+      - name: Provision dashbls (DASH only)
+        if: steps.presence.outputs.exists == '1' && matrix.coin == 'dash'
+        uses: ./.github/actions/provision-dashbls-win64
+
       - name: Configure
         if: steps.presence.outputs.exists == '1'
         shell: cmd
-        # DGB: -DAUX_DOGE=ON -> DGB parent + embedded DOGE (mirrors c2pool-ltc). Inert for other coins.
-        run: cmake -S . -B build_ci -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=build_ci/conan_toolchain.cmake -DCMAKE_PREFIX_PATH="%GITHUB_WORKSPACE%/secp256k1" -DCMAKE_CXX_FLAGS="/D_WIN32_WINNT=0x0A00" ${{ matrix.coin == 'dgb' && '-DAUX_DOGE=ON' || '' }}
+        # DGB: -DAUX_DOGE=ON -> DGB parent + embedded DOGE (mirrors c2pool-ltc).
+        # DASH: -DC2POOL_DASH_BLS=ON is a HARD requirement (FATAL_ERROR without the DLL).
+        run: cmake -S . -B build_ci -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=build_ci/conan_toolchain.cmake -DCMAKE_PREFIX_PATH="%GITHUB_WORKSPACE%/secp256k1" -DCMAKE_CXX_FLAGS="/D_WIN32_WINNT=0x0A00" ${{ matrix.coin == 'dgb' && '-DAUX_DOGE=ON' || '' }} ${{ matrix.coin == 'dash' && '-DC2POOL_DASH_BLS=ON -DDASHBLS_ROOT="%DASHBLS_ROOT%"' || '' }}
 
       # Boost header-integrity + version gate (VS multi-config -> --config/-C Release).
       # A torn/mixed Boost tree fails HERE, before the coin packaging build.
@@ -655,11 +820,41 @@ jobs:
         run: |
           # SONAME-agnostic glob: upstream bumps libsecp256k1-N.dll (6->7 etc). Do NOT re-pin a number.
           Copy-Item "${env:GITHUB_WORKSPACE}/secp256k1/bin/libsecp256k1-*.dll" build_ci/src/c2pool/Release/
+          if ("${{ matrix.coin }}" -eq "dash") { Copy-Item "${env:DASHBLS_ROOT}/bin/c2pool_dashbls.dll" build_ci/src/c2pool/Release/ }
           $ErrorActionPreference = 'SilentlyContinue'
           # --help writes usage to stderr; buffer first so Select-Object truncation
           # cannot break the pipe and surface a NativeCommandError (false red).
           $out = & build_ci/src/c2pool/Release/c2pool-${{ matrix.coin }}.exe --help 2>&1
           $out | Select-Object -First 5 | Write-Host
+          exit 0
+
+      # The BLS-crypto KATs run through the very DLL that ships (real testnet
+      # quorum signature, tamper rejection, aggregate VerifySecure round-trip,
+      # scheme-faithful key compare) -- the same KATs build.yml's
+      # linux-dash-bls leg runs. The startup line is checked on the packaged
+      # exe below, where every DLL it needs sits next to it.
+      - name: BLS KATs (DASH only)
+        if: steps.presence.outputs.exists == '1' && matrix.coin == 'dash'
+        run: |
+          $ErrorActionPreference = 'Continue'
+          cmake --build build_ci --target test_dash_bls_verify --config Release -j 8
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::test_dash_bls_verify failed to build"; exit 1 }
+          $tdir = "build_ci/test/Release"
+          Copy-Item "${env:GITHUB_WORKSPACE}/secp256k1/bin/libsecp256k1-*.dll" $tdir
+          Copy-Item "${env:DASHBLS_ROOT}/bin/c2pool_dashbls.dll" $tdir
+          $kat = (& "$tdir/test_dash_bls_verify.exe" 2>&1 | Out-String)
+          $rc = $LASTEXITCODE
+          Write-Host $kat
+          if ($rc -ne 0) { Write-Host "::error::BLS KATs failed (exit $rc)"; exit 1 }
+          $missing = $false
+          foreach ($t in @('DashBlsVerify.SelfReportIsTruthful',
+                           'DashBlsVerify.RealQuorumSigAcceptsAndTamperRejects',
+                           'DashBlsVerify.BlsSmokeSignVerify',
+                           'DashBlsVerify.VerifyFinalCommitmentSyntheticRoundTrip',
+                           'DashBlsVerify.OpkeyPointEqIsSchemeFaithful')) {
+            if ($kat.Contains("OK ] $t")) { Write-Host "  ok   $t" } else { Write-Host "  MISS $t did not report as run"; $missing = $true }
+          }
+          if ($missing) { Write-Host "::error::BLS KATs did not all run on Windows"; exit 1 }
           exit 0
 
       - name: Package
@@ -675,12 +870,53 @@ jobs:
           # SONAME-agnostic glob: upstream bumps libsecp256k1-N.dll (6->7 etc). Do NOT re-pin a number.
           Copy-Item "${env:GITHUB_WORKSPACE}/secp256k1/bin/libsecp256k1-*.dll" "${PKG}/"
           Copy-Item "${env:GITHUB_WORKSPACE}/secp256k1/bin/libsecp256k1-*.dll" "${PKG}/lib/"
+          # In-tree shared libraries the exe links (DASH: the dash_scriptcheck script
+          # interpreter, a SHARED target in src/impl/dash/CMakeLists.txt) sit in the
+          # build tree, not in the secp256k1 prefix; bundle them next to the exe (portable zip) and in lib/ (the installer packs lib\*).
+          Get-ChildItem -Recurse -Path build_ci -Filter "*scriptcheck*.dll" | ForEach-Object { Copy-Item $_.FullName "${PKG}/"; Copy-Item $_.FullName "${PKG}/lib/" }
+          if ($COIN -eq "dash" -and -not (Get-ChildItem -Path "${PKG}" -Filter "*scriptcheck*.dll")) {
+            Write-Error "PKG-ASSERT FAIL: dash_scriptcheck DLL not bundled in ${PKG}"; exit 1
+          }
+          # DASH: the BLS backend (dashbls + static gmp/libstdc++ in one DLL).
+          # c2pool-dash.exe imports it, so without it the exe does not start.
+          if ($COIN -eq "dash") {
+            Copy-Item "${env:DASHBLS_ROOT}/bin/c2pool_dashbls.dll" "${PKG}/"
+            Copy-Item "${env:DASHBLS_ROOT}/bin/c2pool_dashbls.dll" "${PKG}/lib/"
+          }
           Copy-Item start.bat "${PKG}/"
           Copy-Item -Recurse web-static/* "${PKG}/web-static/"
           Copy-Item explorer/explorer.py "${PKG}/explorer/"
           Copy-Item "config/${COIN}/c2pool_mainnet.yaml" "${PKG}/config/c2pool_mainnet.yaml.example"
           Copy-Item "config/${COIN}/c2pool_testnet.yaml" "${PKG}/config/c2pool_testnet.yaml"
           Compress-Archive -Path "${PKG}" -DestinationPath "${PKG}.zip"
+
+      # On the packaged files: the exe imports the BLS verify entry points from
+      # c2pool_dashbls.dll by name, the DLL next to it carries the ciphersuite,
+      # loads, and reports the pinned tag with ARITH=GMP; then the packaged exe
+      # itself starts and names a REAL backend.
+      - name: BLS link guard + backend line (DASH, packaged artefact)
+        if: steps.presence.outputs.exists == '1' && matrix.coin == 'dash'
+        run: |
+          $PKG = "c2pool-dash-${{ steps.ver.outputs.version }}-windows-x86_64"
+          $pin = ($env:DASHBLS_WIN_KEY -split ' ')[0]
+          & powershell -NoProfile -ExecutionPolicy Bypass -File scripts/ci/dash_bls_linked_guard.ps1 -Exe "${PKG}/c2pool-dash.exe" -Pin $pin
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Get-ChildItem "${PKG}" -Filter *.dll | ForEach-Object { Write-Host ("  bundled {0} ({1:N0} bytes)" -f $_.Name, $_.Length) }
+          # The packaged exe starts and names a REAL backend. [string] + Contains,
+          # not -match: an empty pipeline result is AutomationNull, and
+          # "AutomationNull -notmatch x" is an empty (false) array, which once let
+          # a missing line through.
+          $ErrorActionPreference = 'Continue'
+          $out = [string](& "${PKG}/c2pool-dash.exe" --help 2>&1 | Out-String)
+          $rc = $LASTEXITCODE
+          $line = [string]($out -split "`r?`n" | Where-Object { $_.Contains('DASH BLS backend:') } | Select-Object -First 1)
+          Write-Host ("windows x86_64 (packaged, exit 0x{0:X8}): {1}" -f $rc, $line)
+          if (-not $line.Contains('DASH BLS backend: REAL')) {
+            Write-Host "--- output ---"; Write-Host $out
+            Write-Host "::error::packaged c2pool-dash.exe does not report a REAL BLS backend"
+            exit 1
+          }
+          exit 0
 
       - name: Upload package
         if: steps.presence.outputs.exists == '1'

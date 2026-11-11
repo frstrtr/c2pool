@@ -92,6 +92,8 @@ add_executable(c2wallet-qt-signer
     src/shell/PageSignMonero.cpp
     src/shell/PageAirGap.cpp
     src/shell/PageDashInject.cpp
+    src/shell/KeyInputWidgets.cpp
+    src/shell/PageSignMessage.cpp
 )
 
 # The wired pages include the C++20 hdkeys/convert public headers; build the
@@ -101,6 +103,49 @@ set_target_properties(c2wallet-qt-signer PROPERTIES
     CXX_STANDARD_REQUIRED ON)
 
 target_include_directories(c2wallet-qt-signer PRIVATE src)
+
+# ── Version + packaging (release packaging, ci/CI_WIRING.md) ────────────────
+# C2WALLET_QT_VERSION is printed by `c2wallet-qt-signer --version` (which exits
+# before any QApplication exists, so it needs no display). CI passes the release
+# version; a developer build takes `git describe --tags --match "v*" --dirty`
+# (release tags only: the coin-lane tags such as ltc-0.2.9-dev.* never match).
+if(NOT C2WALLET_QT_VERSION)
+    find_package(Git QUIET)
+    if(GIT_FOUND)
+        execute_process(COMMAND "${GIT_EXECUTABLE}" describe --tags --match "v*" --dirty
+                        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+                        OUTPUT_VARIABLE _c2w_git_version
+                        OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    endif()
+    if(NOT _c2w_git_version)
+        set(_c2w_git_version "0.0.0-unknown")
+    endif()
+    set(C2WALLET_QT_VERSION "${_c2w_git_version}" CACHE STRING
+        "Version printed by c2wallet-qt-signer --version")
+endif()
+# Only main.cpp sees the version, so a version bump recompiles one TU.
+set_property(SOURCE src/main.cpp APPEND PROPERTY COMPILE_DEFINITIONS
+             "C2WALLET_QT_VERSION=\"${C2WALLET_QT_VERSION}\"")
+
+# Bundle-friendly target properties for the release jobs: a macOS .app with
+# packaging/Info.plist.in, a Windows GUI-subsystem exe (main.cpp borrows the
+# parent console for --version). No effect on Linux. Off for the PR-time build.
+option(C2WALLET_QT_PACKAGING "Bundle-friendly target properties (macOS .app, Windows GUI subsystem)" OFF)
+if(C2WALLET_QT_PACKAGING)
+    string(REGEX MATCH "[0-9]+\\.[0-9]+\\.[0-9]+" _c2w_numeric_version "${C2WALLET_QT_VERSION}")
+    if(NOT _c2w_numeric_version)
+        set(_c2w_numeric_version "0.0.0")
+    endif()
+    set_target_properties(c2wallet-qt-signer PROPERTIES
+        OUTPUT_NAME c2wallet-qt-signer
+        MACOSX_BUNDLE ON
+        MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/packaging/Info.plist.in"
+        MACOSX_BUNDLE_GUI_IDENTIFIER org.c2pool.c2wallet-qt-signer
+        MACOSX_BUNDLE_BUNDLE_NAME c2wallet-qt-signer
+        MACOSX_BUNDLE_BUNDLE_VERSION "${_c2w_numeric_version}"
+        MACOSX_BUNDLE_SHORT_VERSION_STRING "${_c2w_numeric_version}"
+        WIN32_EXECUTABLE ON)
+endif()
 
 # The whole security invariant in one place. If a future phase adds
 # Qt6::Network / Qt6::WebEngine* / Qt6::WebChannel / a curl / an asio here, the

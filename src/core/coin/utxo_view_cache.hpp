@@ -25,11 +25,17 @@
 
 #include <core/log.hpp>
 
+#include <algorithm>
 #include <cstdint>
+#include <cstring>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
+#include <string>
+#include <string_view>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace core {
@@ -200,6 +206,8 @@ public:
         Outpoint missing;      // the input's prevout
         uint256  txid;         // the transaction spending it
         uint32_t tx_index{0};  // its position in the block
+        bool     spent_in_block{false};  // an earlier tx of the same block spent it (no valid
+                                         // block does: a mutated or forged body)
     };
 
     /// connect_block with the mode explicit. strict = false is the call above
@@ -221,11 +229,14 @@ public:
         std::unique_lock<std::shared_mutex> lock(m_mu);
         // The block's changes, applied to the view only once every input resolved.
         std::unordered_map<Outpoint, std::optional<Coin>, OutpointHasher> overlay;
+        bool spent_in_block = false;
         auto lookup = [&](const Outpoint& op, Coin& coin) {
             auto it = overlay.find(op);
             if (it != overlay.end()) {
-                if (!it->second.has_value())
-                    return false;  // spent earlier in this block
+                if (!it->second.has_value()) {
+                    spent_in_block = true;  // spent earlier in this block
+                    return false;
+                }
                 coin = *it->second;
                 return true;
             }
@@ -252,6 +263,7 @@ public:
                             why->missing = op;
                             why->txid = txid;
                             why->tx_index = static_cast<uint32_t>(t);
+                            why->spent_in_block = spent_in_block;
                         }
                         return std::nullopt;
                     }
@@ -400,13 +412,16 @@ public:
     /// legacy accrual view that never recorded one).
     uint32_t anchor_height() const { return sync_state().anchor_height; }
 
-    /// The set holds every coin of the best chain up to `chain_height`: it was
-    /// built from genesis and its best block is at that height.
-    bool complete(uint32_t chain_height) const {
+    /// The set holds every coin of the best chain up to its tip: it was
+    /// built from genesis and its best block IS the tip (`chain_hash` at
+    /// `chain_height`), not only at the tip's height (a sibling of the tip
+    /// is not the tip's set).
+    bool complete(uint32_t chain_height, const uint256& chain_hash) const {
         std::shared_lock<std::shared_mutex> lock(m_mu);
-        if (!m_base)
+        if (!m_base || chain_hash.IsNull())
             return false;
-        return m_base->get_sync_state().anchor_height == 0 && m_base->get_best_height() == chain_height;
+        return m_base->get_sync_state().anchor_height == 0 && m_base->get_best_height() == chain_height
+            && m_base->get_best_block() == chain_hash;
     }
 
     /// Re-anchor the view: drop all in-memory pending changes AND wipe the
@@ -445,6 +460,126 @@ public:
     uint32_t get_best_height() const {
         std::shared_lock<std::shared_mutex> lock(m_mu);
         return m_base ? m_base->get_best_height() : 0;
+    }
+    /// Best block and its height, read together (a flush between two
+    /// separate reads would pair one block's hash with another's height).
+    std::pair<uint256, uint32_t> get_best() const {
+        std::shared_lock<std::shared_mutex> lock(m_mu);
+        if (!m_base)
+            return {uint256(), 0};
+        return {m_base->get_best_block(), m_base->get_best_height()};
+    }
+
+    // ── Full scan (read-only) ───────────────────────────────────────────
+
+    /// What one scan_coins pass saw.
+    struct CoinScan {
+        bool     ok{false};         // false: no backing DB, a DB read error or an unreadable record
+        bool     stopped{false};    // `fn` asked to stop
+        bool     cancelled{false};  // `cancelled` turned true; the rows are incomplete
+        uint256  best_block;        // the view the rows are: the DB's best block when the scan began
+        uint32_t best_height{0};
+        uint256  best_after;        // the DB's best block when the scan ended
+        size_t   pending{0};        // unflushed changes in the cache when the scan began (applied)
+        uint64_t scanned{0};        // 'C' records read
+        /// The rows are not exactly the set at best_block: a flush moved the
+        /// best block during the pass, or unflushed changes were applied.
+        bool tip_moved() const { return best_after != best_block || pending != 0; }
+    };
+
+    /// Every coin of the view whose scriptPubKey `match` accepts, passed to
+    /// `fn` (outpoint, coin). Read-only; any thread; the cache lock is NOT
+    /// held during the pass. The best block, a copy of the unflushed changes
+    /// and a LevelDB snapshot are taken together under the shared lock, then
+    /// the snapshot's 'C' records are read in key order with the changes
+    /// applied (a coin they spend or replace is skipped, and every coin they
+    /// add that matches is passed after the DB records). The rows are the view
+    /// at that instant whatever the owner connects or flushes meanwhile;
+    /// tip_moved() says whether it did. `match` sees the script bytes in place
+    /// before a Coin is built, so a record that does not match costs no
+    /// allocation. `fn` returns false to stop; `cancelled` (optional) is
+    /// polled every 65536 records.
+    CoinScan scan_coins(const std::function<bool(const uint8_t* spk, size_t len)>& match,
+                        const std::function<bool(const Outpoint&, const Coin&)>& fn,
+                        const std::function<bool()>& cancelled = {}) const {
+        CoinScan st;
+        std::unordered_map<Outpoint, std::optional<Coin>, OutpointHasher> pending;
+        ::core::LevelDBStore::Snapshot snap;
+        {
+            std::shared_lock<std::shared_mutex> lock(m_mu);
+            if (!m_base)
+                return st;
+            st.best_block = m_base->get_best_block();
+            st.best_height = m_base->get_best_height();
+            pending = m_cache;
+            snap = m_base->snapshot();
+        }
+        if (!snap)
+            return st;
+        st.pending = pending.size();
+        bool bad = false;
+        const bool read_ok = m_base->for_each_record_at(
+            snap, std::string(1, 'C'), [&](std::string_view key, std::string_view val) {
+                ++st.scanned;
+                if ((st.scanned & 0xFFFF) == 0 && cancelled && cancelled()) {
+                    st.cancelled = true;
+                    return false;
+                }
+                if (key.size() != 37) {
+                    bad = true;
+                    return false;
+                }
+                const auto* v = reinterpret_cast<const uint8_t*>(val.data());
+                size_t pos = 0;
+                uint64_t code = 0, value = 0, slen = 0;
+                if (!read_varint_checked(v, val.size(), pos, code) ||
+                    !read_varint_checked(v, val.size(), pos, value) ||
+                    !read_varint_checked(v, val.size(), pos, slen) || slen > val.size() - pos) {
+                    bad = true;
+                    return false;
+                }
+                if (!match(v + pos, static_cast<size_t>(slen)))
+                    return true;
+                Outpoint op;
+                std::memcpy(op.txid.data(), key.data() + 1, 32);
+                const auto* ix = reinterpret_cast<const uint8_t*>(key.data() + 33);
+                op.index = uint32_t(ix[0]) | (uint32_t(ix[1]) << 8) | (uint32_t(ix[2]) << 16) |
+                           (uint32_t(ix[3]) << 24);
+                if (!pending.empty() && pending.count(op))
+                    return true;   // spent or replaced by an unflushed change
+                Coin coin;
+                if (!deserialize_coin(v, val.size(), coin)) {
+                    bad = true;
+                    return false;
+                }
+                if (!fn(op, coin)) {
+                    st.stopped = true;
+                    return false;
+                }
+                return true;
+            });
+        if (!read_ok || bad)
+            return st;
+        if (!st.stopped && !st.cancelled) {
+            std::vector<std::pair<Outpoint, const Coin*>> added;
+            for (const auto& [op, change] : pending)
+                if (change && match(change->scriptPubKey.m_data.data(), change->scriptPubKey.m_data.size()))
+                    added.emplace_back(op, &*change);
+            std::sort(added.begin(), added.end(),
+                      [](const auto& a, const auto& b) { return a.first < b.first; });
+            for (const auto& [op, coin] : added) {
+                if (!fn(op, *coin)) {
+                    st.stopped = true;
+                    break;
+                }
+            }
+        }
+        {
+            std::shared_lock<std::shared_mutex> lock(m_mu);
+            st.best_after = m_base->get_best_block();
+        }
+        st.ok = true;
+        return st;
     }
 
     /// Number of blocks connected since startup (or loaded from DB on restart).

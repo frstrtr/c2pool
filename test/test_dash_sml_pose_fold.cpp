@@ -779,6 +779,16 @@ void seed_gate(NodeCoinState& st, const CSimplifiedMNList& sml,
                kPubkeyVer, kP2shVer, 1'700'000'123u, 0x20000000u);
 }
 
+/// S6: the serving fold runs Dash Core's CheckPro*Tx; these KATs are about the
+/// fold's ordering and replacement rules with synthetic provider txs, so they
+/// stand in an environment whose Core check accepts everything.
+dash::coin::ProTxCheckEnv accept_all_core_checks()
+{
+    dash::coin::ProTxCheckEnv env;
+    env.check_override = [](const dash::coin::MutableTransaction&) { return std::optional<std::string>{}; };
+    return env;
+}
+
 dash::coin::MnFoldContext::OperatorSigFn accept_all_operator_sigs()
 {
     return [](const dash::coin::MnFoldContext::OpKey&, bool, const uint256&,
@@ -851,6 +861,7 @@ TEST(DashSmlPoseFoldGate, RevivingProUpServAfterQcBanOrdersLikeDashd)
     // The fold verifies a ProUpServTx's BLS operator signature (B.9); this KAT
     // is about ordering, not crypto, so every signature verifies here.
     st.set_protx_operator_sig_verifier(accept_all_operator_sigs());
+    st.set_protx_check_env(accept_all_core_checks());
     st.set_qc_pose_fold_inputs(
         members_table({{qhash(1), member_run(0, 8)}}),
         [](const uint256&) { return std::optional<PoSePenaltyView>{{50, 50, false}}; },
@@ -933,6 +944,7 @@ TEST(DashSmlPoseFoldGate, EmitGateRefusesTemplateWhoseFoldWouldReplaceAnMn)
     st.set_include_mn_special_txs(true);
     st.set_serve_mempool_txs(true);
     st.set_protx_operator_sig_verifier(accept_all_operator_sigs());
+    st.set_protx_check_env(accept_all_core_checks());
     st.set_qc_pose_fold_inputs(
         members_table({{qhash(1), member_run(0, 8)}}),
         [](const uint256&) { return std::optional<PoSePenaltyView>{{50, 50, false}}; },

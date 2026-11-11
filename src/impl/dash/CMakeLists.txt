@@ -23,6 +23,8 @@ add_subdirectory(stratum)
 add_library(dash_block_replay STATIC coin/vendor/blockencodings.cpp)
 target_include_directories(dash_block_replay PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(dash_block_replay PRIVATE core nlohmann_json::nlohmann_json ${Boost_LIBRARIES})
+# One BLS mode per binary (see dash_bls_verify below).
+target_link_libraries(dash_block_replay PUBLIC dash_bls_verify)
 
 # Launcher slice-3 external-dashd-RPC client (won-block dual-path broadcaster,
 # RPC leg). coin/rpc.cpp is a real boost::beast + jsonrpccxx HTTP JSON-RPC
@@ -42,8 +44,18 @@ target_link_libraries(dash_block_replay PRIVATE core nlohmann_json::nlohmann_jso
 # define is set (PUBLIC, so the sole consumer c2pool-dash inherits it) ONLY when
 # the library was found. Without it the verify functions are fail-closed stubs
 # and NO dashbls dependency enters the build — keeping the Windows main_ltc
-# launcher (shared core only) clean. SAFE-ADDITIVE: the only executable linking
-# dash_bls_verify is c2pool-dash (plus its KAT test_dash_govvote_bls).
+# launcher (shared core only) clean.
+#
+# ONE BLS MODE PER BINARY. bls_verify.hpp / bls_canonical.hpp carry inline
+# code whose body depends on C2POOL_DASH_BLS, and so does everything inlined
+# over it (the provider-tx checks, the template builder). Every DASH library
+# linked into c2pool-dash (dash, dash_rpc, dash_stratum, dash_block_replay)
+# therefore links this target PUBLIC, so each of its translation units — and
+# each consumer's — is compiled with the same macro, include path and
+# libraries on every platform (Linux, macOS, the Windows MSVC facade). A
+# translation unit compiled without the macro in a BLS binary was an ODR
+# violation the linker could resolve to the stub. vendor/bls_mode_guard.hpp
+# records every TU's mode; c2pool-dash refuses to start on a mixed binary.
 add_library(dash_bls_verify STATIC coin/vendor/bls_verify.cpp)
 target_include_directories(dash_bls_verify PRIVATE
     ${CMAKE_SOURCE_DIR}/src
@@ -52,7 +64,7 @@ target_include_directories(dash_bls_verify PRIVATE
 target_link_libraries(dash_bls_verify PRIVATE core ${Boost_LIBRARIES})
 if(C2POOL_DASH_BLS_AVAILABLE)
     target_compile_definitions(dash_bls_verify PUBLIC C2POOL_DASH_BLS)
-    target_include_directories(dash_bls_verify PUBLIC ${DASHBLS_INCLUDE_DIR})
+    target_include_directories(dash_bls_verify PUBLIC ${DASHBLS_INCLUDE_DIRS})
     target_link_libraries(dash_bls_verify PUBLIC ${DASHBLS_LIBRARIES})
 endif()
 
@@ -62,6 +74,9 @@ target_include_directories(dash_rpc PRIVATE
     ${CMAKE_SOURCE_DIR}/src/btclibs
     ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(dash_rpc PRIVATE core nlohmann_json::nlohmann_json ${Boost_LIBRARIES})
+# rpc.hpp reaches the BLS-dependent inline code (mn_state_machine.hpp ->
+# providertx.hpp -> bls_canonical.hpp): one BLS mode per binary.
+target_link_libraries(dash_rpc PUBLIC dash_bls_verify)
 
 # dashd ZMQ `hashblock` instant tip-notify (coin/zmq_tip_notify.cpp). libzmq is
 # OPTIONAL: when available, compile the subscriber (C2POOL_ZMQ) and link libzmq.
@@ -93,7 +108,8 @@ target_include_directories(dash PRIVATE
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/src/btclibs
     ${CMAKE_SOURCE_DIR}/include)
-target_link_libraries(dash core pool sharechain c2pool_storage dash_x11 btclibs nlohmann_json::nlohmann_json ${Boost_LIBRARIES} ${SECP256K1_LIBRARIES})
+target_link_libraries(dash core pool sharechain c2pool_storage dash_x11 btclibs nlohmann_json::nlohmann_json ${Boost_LIBRARIES} ${SECP256K1_LIBRARIES}
+    dash_bls_verify)   # one BLS mode per binary (see dash_bls_verify)
 
 # ── PR-C4 (dashd-cut, tx-serving reward-safety) ──────────────────────────────
 # Consensus-exact CheckInputScripts over the C1 fold view. dash_scriptcheck is

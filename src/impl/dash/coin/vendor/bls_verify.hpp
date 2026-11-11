@@ -52,6 +52,8 @@
 #include <vector>
 #include <algorithm>
 
+#include <impl/dash/coin/vendor/bls_mode_guard.hpp>   // one BLS mode per binary
+
 #ifdef C2POOL_DASH_BLS
 // Pulled ONLY under the BLS backend (which already links dashbls): the opkey
 // scheme helpers below are inline so a BLS-OFF translation unit that includes
@@ -163,11 +165,17 @@ make_commitment_bls_verifier(MemberKeysProvider provider);
 // FAIL-CLOSED (reward-critical): returns false when the BLS backend is absent,
 // vch_sig is not 96 bytes, either point fails to deserialize, or the BLS verify
 // fails — so an unverified vote is NEVER tallied. Never throws.
+//
+// `pubkey_scheme_fallback` = false (P-3): decode the key ONLY under
+// `key_legacy_scheme`. Keys from the payee-projection store are canonical
+// BASIC bytes; reading them under the other scheme can decode to -P, which
+// would accept a vote signed with -sk that dashd rejects.
 bool verify_govvote_operator_sig(
     const std::array<uint8_t, CFinalCommitment::BLS_PUBKEY_SIZE>& pubkey_operator,
     bool key_legacy_scheme,
     const uint256& digest,
-    const std::vector<uint8_t>& vch_sig);
+    const std::vector<uint8_t>& vch_sig,
+    bool pubkey_scheme_fallback = true);
 
 // ── B.9: ProUpServTx / ProUpRevTx operator-signature verify ─────────────────
 //
@@ -334,6 +342,60 @@ opkey_for_leaf(const std::array<uint8_t, CFinalCommitment::BLS_PUBKEY_SIZE>& sto
 #endif
 }
 
+// CBLSLazyWrapper<CBLSPublicKey>::Get().IsValid() as Dash Core v24 evaluates it
+// for an operator key read under the payload's scheme (bls/bls.h SetBytes +
+// CheckMalleable): the bytes are not all zero, decode to a valid G1 point under
+// EXACTLY the declared scheme, and that point re-serializes under the same
+// scheme to the same bytes (a non-canonical encoding is "malleable" and
+// invalid). The ProTx checks (protx_check.hpp) answer bad-protx-key-null when
+// this is false. FAIL-CLOSED: false without the BLS backend.
+inline bool opkey_valid_canonical(const std::array<uint8_t, CFinalCommitment::BLS_PUBKEY_SIZE>& wire,
+                                  bool legacy)
+{
+    bool all_zero = true;
+    for (uint8_t b : wire) if (b != 0) { all_zero = false; break; }
+    if (all_zero) return false;
+#ifndef C2POOL_DASH_BLS
+    (void)legacy;
+    return false;
+#else
+    try {
+        bls::G1Element e = bls::G1Element::FromBytes(bls::Bytes(wire.data(), wire.size()), legacy);
+        if (!e.IsValid()) return false;
+        const std::vector<uint8_t> back = e.Serialize(legacy);
+        return back.size() == wire.size() && std::equal(back.begin(), back.end(), wire.begin());
+    } catch (...) {
+        return false;
+    }
+#endif
+}
+
+// CBLSSignature unserialization under the payload's scheme (bls/bls.h
+// Unserialize: SetBytes then CheckMalleable, which throws "malleable BLS
+// object" so GetTxPayload fails with bad-protx-payload): all-zero bytes are
+// the null signature and parse; anything else must decode under EXACTLY the
+// declared scheme and re-serialize to the same bytes. FAIL-CLOSED: false
+// without the BLS backend (unless all zero).
+inline bool blssig_parses_canonical(const std::array<uint8_t, CFinalCommitment::BLS_SIG_SIZE>& wire,
+                                    bool legacy)
+{
+    bool all_zero = true;
+    for (uint8_t b : wire) if (b != 0) { all_zero = false; break; }
+    if (all_zero) return true;
+#ifndef C2POOL_DASH_BLS
+    (void)legacy;
+    return false;
+#else
+    try {
+        bls::G2Element e = bls::G2Element::FromBytes(bls::Bytes(wire.data(), wire.size()), legacy);
+        const std::vector<uint8_t> back = e.Serialize(legacy);
+        return back.size() == wire.size() && std::equal(back.begin(), back.end(), wire.begin());
+    } catch (...) {
+        return false;
+    }
+#endif
+}
+
 // dashd keys its masternode unique-property map (and the mempool's
 // mapProTxBlsPubKeyHashes) by the operator key's BYTES under the scheme its
 // holder read it with — legacy iff the holder's nVersion < BasicBLS
@@ -366,6 +428,52 @@ opkey_legacy_wire_to_basic(const std::array<uint8_t, CFinalCommitment::BLS_PUBKE
         return out;
     } catch (...) {
         return std::nullopt;
+    }
+#endif
+}
+
+// --- ingest canonicalization (P-3) -----------------------------------------
+// The payee projection's store holds every operator key as canonical BASIC
+// bytes, the only form in which a byte compare IS a point compare: legacy
+// and basic encodings of G1 points overlap (L(P) can be byte-for-byte B(-P),
+// and B(P) read as legacy can decode to -P), so a store that mixes them
+// cannot tell a rotation to the negated key from "unchanged". Every source
+// that prints a key in the entry's OWN scheme -- dashd `protx list` JSON and
+// the checkpoint rows -- goes through this at ingest: legacy for a v1 entry,
+// basic otherwise. Strict, no fallback: a v1 key must be the canonical
+// legacy encoding of a valid point, else nullopt (the caller refuses the
+// seed). All-zero (a null key, e.g. after a revocation) stays null. Without
+// the BLS backend the bytes are kept as they are: the stub build keeps
+// master's behaviour, behind its startup gate (main_dash refuses the
+// daemonless posture without --allow-stub-bls).
+inline std::optional<std::array<uint8_t, CFinalCommitment::BLS_PUBKEY_SIZE>>
+opkey_canonical_from_own_scheme(const std::array<uint8_t, CFinalCommitment::BLS_PUBKEY_SIZE>& key,
+                                uint16_t entry_version)
+{
+    bool zero = true;
+    for (uint8_t b : key) if (b != 0) { zero = false; break; }
+    if (zero || entry_version >= 2) return key;   // dashd prints v2+ keys in basic
+    return opkey_legacy_wire_to_basic(key);
+}
+
+/// True for null bytes or the canonical BASIC encoding of a valid point --
+/// the only forms the projection store holds. Without the BLS backend the
+/// bytes cannot be checked and pass.
+inline bool opkey_is_canonical_basic_or_null(const std::array<uint8_t, CFinalCommitment::BLS_PUBKEY_SIZE>& key)
+{
+    bool zero = true;
+    for (uint8_t b : key) if (b != 0) { zero = false; break; }
+    if (zero) return true;
+#ifndef C2POOL_DASH_BLS
+    return true;
+#else
+    try {
+        const bls::G1Element e = bls::G1Element::FromBytes(bls::Bytes(key.data(), key.size()), /*fLegacy=*/false);
+        if (!e.IsValid()) return false;
+        const std::vector<uint8_t> v = e.Serialize(/*fLegacy=*/false);
+        return v.size() == key.size() && std::equal(v.begin(), v.end(), key.begin());
+    } catch (...) {
+        return false;
     }
 #endif
 }

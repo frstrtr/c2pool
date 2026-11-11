@@ -823,83 +823,93 @@ TEST(DigiShieldRetargetKAT, Mainnet200002MatchesChain) {
 
 // ─── HeaderChain from-genesis wedge regression (red-then-green) ──────────────
 //
-// Reproduces the exact from-genesis embedded-sync path that wedged at height
-// 960: a mainnet HeaderChain is fed a linked run of headers with the real
-// retarget-boundary timestamps and per-window nBits. On the pre-fix
-// first-block selection the header at 960 fails validate_difficulty and is
-// rejected (the chain sticks at 959, the observed re-request loop); with the
-// Core-matching selection the header at 960 is accepted and the chain walks
-// past it. scrypt PoW is skipped by advertising a far peer tip, exactly as the
-// real bulk-sync fast path does for old headers.
+// The from-genesis embedded-sync path that wedged at height 960: a mainnet
+// HeaderChain is fed a linked run of headers up to the first pre-DigiShield
+// retarget that is not clamped. Its bits depend on the retarget's first
+// block: with Dogecoin Core's (new_height - interval - 1 = 719) the header
+// carrying them is accepted and the chain walks past; on the pre-fix choice
+// (720) the expected bits differ and it is refused (the chain stuck at 959,
+// re-requesting). CalculateDogecoinNextWorkRequired's KATs above pin the
+// real chain's values.
+//
+// Every header's scrypt PoW is checked whatever a peer reports, so the
+// headers are mined with mainnet's retarget rules and the most permissive
+// limit (0x207fffff). The root is at 710: headers below 960 are within the
+// 250 after it, whose difficulty is not checked, so they take the limit's
+// bits except 959, the retarget's previous block, whose target leaves the
+// retarget's product room in 256 bits (CalculateDogecoinNextWorkRequired
+// multiplies it by the timespan, 1,800 s here). 719 -> 959 is 1,800 s and
+// 720 -> 959 is 900 s, so the two first blocks give different bits.
 TEST(DOGEFromGenesisRetargetTest, AcceptsHeader960AndWalksPast) {
+    constexpr uint32_t kEasyBits = 0x207fffff;
+    constexpr uint32_t kBits959 = 0x1f246380;   // ~(2^256 - 1) / 1801
     auto params = DOGEChainParams::mainnet();
+    params.pow_limit.SetCompact(kEasyBits);
     HeaderChain chain(params);
     ASSERT_TRUE(chain.init());
-    chain.set_peer_tip_height(2000000);  // skip scrypt for all synthetic headers
+    chain.set_peer_tip_height(2000000);   // paces the sync only: every header's PoW is checked
 
-    // Seed a height-1 root so header 2 can connect (from-genesis linkage; the
-    // genesis timestamp is never consulted for the validated boundaries, which
-    // use first blocks 239/479/719).
     uint256 root_hash;
     root_hash.SetHex("0000000000000000000000000000000000000000000000000000000000000001");
-    chain.set_dynamic_checkpoint(1, root_hash);
-    ASSERT_EQ(chain.height(), 1u);
+    chain.set_dynamic_checkpoint(710, root_hash);
+    ASSERT_EQ(chain.height(), 710u);
 
-    auto bits_for = [](uint32_t h) -> uint32_t {
-        if (h < 240) return 0x1e0ffff0u;   // genesis difficulty window
-        if (h < 480) return 0x1e0fffffu;   // set at the h240 retarget
-        if (h < 720) return 0x1e00ffffu;   // set at the h480 retarget
-        if (h < 960) return 0x1d0ffff0u;   // set at the h720 retarget
-        return 0x1d03d07bu;                // set at the h960 retarget
-    };
-    // Real boundary timestamps at the blocks used as first/prev for a validated
-    // retarget; everything else gets a monotone filler (never consulted).
     auto ts_for = [](uint32_t h) -> uint32_t {
-        switch (h) {
-            case 239: return 1386475638u;
-            case 240: return 1386475640u;
-            case 479: return 1386475840u;
-            case 480: return 1386475842u;
-            case 719: return 1386476362u;
-            case 720: return 1386476390u;
-            case 959: return 1386479795u;
-        }
-        return static_cast<uint32_t>(1386325540 + static_cast<int64_t>(h) * 60);
+        const uint32_t t719 = 1386476362u;
+        if (h <= 719)
+            return t719 - (719u - h) * 60u;
+        if (h <= 958)
+            return t719 + 900u + (h - 720u) * 3u;
+        return t719 + 1800u + (h - 959u) * 60u;
     };
+    const uint32_t bits_960 = calculate_doge_next_work(kBits959, ts_for(959), ts_for(719), 960, params);
+    const uint32_t bits_960_off_by_one = calculate_doge_next_work(kBits959, ts_for(959), ts_for(720), 960, params);
+    {
+        uint256 t959, t960;
+        t959.SetCompact(kBits959);
+        t960.SetCompact(bits_960);
+        uint256 lower = t959;
+        lower >>= 4;
+        ASSERT_TRUE(t960 < t959 && t960 > lower) << "an unclamped retarget, timespan 1,800 of 14,400 s";
+    }
+    ASSERT_NE(bits_960, bits_960_off_by_one) << "the first-block choice decides 960's bits";
 
     uint256 prev = root_hash;
-    auto make_and_add = [&](uint32_t h) -> bool {
+    auto make = [&](uint32_t h, uint32_t bits) {
         BlockHeaderType hd;
         hd.m_version = 1;
         hd.m_previous_block = prev;
         hd.m_merkle_root.SetNull();
         hd.m_timestamp = ts_for(h);
-        hd.m_bits = bits_for(h);
-        hd.m_nonce = h;  // unique → unique block hash
-        bool ok = chain.add_header(hd);
-        prev = doge::coin::block_hash(hd);
+        hd.m_bits = bits;
+        hd.m_nonce = h << 16;   // a distinct start per header
+        while (!check_pow(scrypt_hash(hd), hd.m_bits, params.pow_limit))
+            ++hd.m_nonce;
+        return hd;
+    };
+    auto add = [&](const BlockHeaderType& hd) {
+        const bool ok = chain.add_header(hd);
+        if (ok)
+            prev = doge::coin::block_hash(hd);
         return ok;
     };
 
-    // Build 2..959 — all must accept (240 boundary skipped by the 250-header
-    // gate; 480 and 720 boundaries validate and pass under both selections).
-    for (uint32_t h = 2; h <= 959; ++h)
-        ASSERT_TRUE(make_and_add(h)) << "header " << h << " should be accepted";
+    for (uint32_t h = 711; h <= 959; ++h)
+        ASSERT_TRUE(add(make(h, h == 959 ? kBits959 : kEasyBits))) << "header " << h << " should be accepted";
     ASSERT_EQ(chain.height(), 959u);
 
-    // Header 960: the first pre-DigiShield unclamped retarget. RED on the
-    // pre-fix selection (rejected → height stays 959); GREEN after the fix.
-    ASSERT_TRUE(make_and_add(960))
+    // Header 960: checked against the retarget from Core's first block (719);
+    // a choice of 720 would expect bits_960_off_by_one and refuse it.
+    ASSERT_TRUE(add(make(960, bits_960)))
         << "header 960 must be accepted (first-block selection must match Core)";
     EXPECT_EQ(chain.height(), 960u);
     auto h960 = chain.get_header_by_height(960);
     ASSERT_TRUE(h960.has_value());
-    EXPECT_EQ(h960->header.m_bits, 0x1d03d07bu);
+    EXPECT_EQ(h960->header.m_bits, bits_960);
 
     // And it keeps walking — the re-request loop is gone.
-    EXPECT_TRUE(make_and_add(961)) << "header 961 must be accepted";
-    EXPECT_TRUE(make_and_add(962)) << "header 962 must be accepted";
-    EXPECT_EQ(chain.height(), 962u);
+    EXPECT_TRUE(add(make(961, bits_960))) << "header 961 must be accepted";
+    EXPECT_EQ(chain.height(), 961u);
 }
 
 // ─── DOGE-aux SUBMIT-BLOCK ASSEMBLER — byte-exact layout KAT ─────────────────

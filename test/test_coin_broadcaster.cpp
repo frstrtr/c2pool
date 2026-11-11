@@ -13,6 +13,9 @@
 
 #include <boost/asio.hpp>
 #include <set>
+#include <iterator>
+#include <fstream>
+#include <filesystem>
 #include <vector>
 #include <thread>
 #include <chrono>
@@ -1028,6 +1031,78 @@ TEST(NmcSeamDogePreservation, SinkSetShortCircuitsAndCarriesBytes)
     EXPECT_EQ(sink_bytes, expect);       // sink carried the exact payload bytes
     EXPECT_FALSE(parser_called);          // sink short-circuits before the parser
     EXPECT_FALSE(new_headers_fired);      // and before new_headers
+}
+
+// --ltc-connect / --doge-connect (PeerManagerConfig::connect_only, Core's
+// -connect; the operator's LAN-only rule): only the given peers are dial
+// targets. The persisted peer DB, the DNS / fixed / HTTP seeds and addr
+// gossip add none, no emergency re-arm fires, a lost peer is a target again,
+// and stop() leaves the peer DB of a normal run as it was.
+TEST(CoinPeerManager, ConnectOnlyDialsTheGivenPeersAndNoOther)
+{
+    const std::string dir = (std::filesystem::temp_directory_path()
+        / ("c2pool_connect_only_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())))
+        .string();
+    std::filesystem::create_directories(dir);
+    boost::asio::io_context ioc;
+    {
+        // A normal run banked two internet peers.
+        PeerManagerConfig cfg;
+        CoinPeerManager pm(ioc, "LTC", dir, cfg);
+        pm.add_discovered_peer(NetService("45.33.32.1", 9333));
+        pm.add_discovered_peer(NetService("45.33.32.2", 9333));
+        pm.stop();  // saves the peer DB
+    }
+    std::string db_before;
+    for (const auto& e : std::filesystem::directory_iterator(dir)) {
+        std::ifstream f(e.path());
+        db_before += std::string(std::istreambuf_iterator<char>(f), {});
+    }
+    ASSERT_NE(db_before.find("45.33.32.1"), std::string::npos);
+
+    PeerManagerConfig cfg;
+    cfg.connect_only = {NetService("192.168.86.197", 9333), NetService("192.168.86.198", 9333)};
+    CoinPeerManager pm(ioc, "LTC", dir, cfg);
+    pm.set_dns_seeds({{"seed-a.litecoin.loshan.co.uk", 9333}});
+    pm.set_fixed_seeds({NetService("45.33.32.9", 9333)});
+    pm.set_http_peer_seeds({{"voidbind.com", 8080}});
+    pm.start();
+    ioc.run_for(std::chrono::milliseconds(200));  // no seed timer adds anyone
+
+    auto keys = [](const std::vector<PeerEndpoint>& v) {
+        std::set<std::string> out;
+        for (const auto& ep : v)
+            out.insert(ep.to_string());
+        return out;
+    };
+    const std::set<std::string> lan{"192.168.86.197:9333", "192.168.86.198:9333"};
+    EXPECT_TRUE(pm.connect_only());
+    EXPECT_EQ(pm.peer_count(), 2u) << "the peer DB or a seed added a peer";
+    EXPECT_EQ(keys(pm.get_peers_to_connect({})), lan);
+    EXPECT_FALSE(pm.discovery_enabled()) << "addr gossip would be banked";
+    pm.add_discovered_peer(NetService("45.33.32.3", 9333));
+    EXPECT_EQ(pm.peer_count(), 2u) << "an addr-gossiped peer was taken";
+    EXPECT_FALSE(pm.needs_emergency_refresh(0));
+    pm.arm_emergency_fallbacks();
+    ioc.restart();
+    ioc.run_for(std::chrono::milliseconds(100));
+    EXPECT_EQ(pm.emergency_attempts(), 0);
+    EXPECT_EQ(keys(pm.get_peers_to_connect({"192.168.86.197:9333"})),
+              std::set<std::string>{"192.168.86.198:9333"});
+    // A lost peer is a dial target again.
+    pm.notify_connected("192.168.86.197:9333");
+    pm.notify_disconnected("192.168.86.197:9333");
+    EXPECT_EQ(keys(pm.get_peers_to_connect({"192.168.86.198:9333"})),
+              std::set<std::string>{"192.168.86.197:9333"});
+    pm.stop();
+
+    std::string db_after;
+    for (const auto& e : std::filesystem::directory_iterator(dir)) {
+        std::ifstream f(e.path());
+        db_after += std::string(std::istreambuf_iterator<char>(f), {});
+    }
+    EXPECT_EQ(db_after, db_before) << "the connect-only run rewrote the peer DB";
+    std::filesystem::remove_all(dir);
 }
 
 int main(int argc, char** argv)

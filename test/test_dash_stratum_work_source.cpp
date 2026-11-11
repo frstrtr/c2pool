@@ -16,6 +16,7 @@
 // allowlist, or it becomes a #143-style NOT_BUILT sentinel that reds master.
 
 #include <impl/dash/stratum/work_source.hpp>
+#include <impl/dash/coin/vendor/bls_mode_guard.hpp>  // DashBlsModeGuard
 
 #include <impl/dash/stratum/submit_payee_guard.hpp>  // check_submit_payee (stale-payee fix)
 #include <impl/dash/stratum/won_block_record.hpp>    // won_block_height (stale-job block height)
@@ -229,6 +230,12 @@ TEST(DashStratumWorkSource, ConfigDefaultsMatchStratumConfigWithX11Overrides)
     EXPECT_DOUBLE_EQ(cfg.set_difficulty_multiplier, 1.0);
     // Runtime coin tag for the coin-agnostic core log lines (#732).
     EXPECT_EQ(cfg.coin_symbol, "DASH");
+    // Dash Core v24: version bits 13 (v24) and 14 (evo_shares) are never
+    // rollable; BIP320's default 0x1fffe000 would let a miner flip them.
+    EXPECT_EQ(cfg.version_rolling_pool_mask, 0x1fff8000u);
+    EXPECT_EQ(cfg.version_rolling_pool_mask & 0x6000u, 0u);
+    EXPECT_EQ(core::stratum::StratumConfig{}.version_rolling_pool_mask, 0x1fffe000u)
+        << "every other coin keeps the BIP320 default";
 }
 
 TEST(DashStratumWorkSource, WorkGenerationStartsZeroAndBumps)
@@ -4579,4 +4586,110 @@ TEST(DashStratumDashboardSeams, MainDashWiresLocalRatesFromItsStratumServer)
     EXPECT_LT(getter - local_seam, 200u) << "the seam is fed by this StratumServer";
     EXPECT_LT(local_seam - hashrate_seam, 2000u)
         << "wired in the same block as the other stratum dashboard seams";
+}
+
+// ── PoSe oracle re-source (race after a tip change) ─────────────────────────
+//
+// On the hotel reserve (mainnet, daemonless) every stage=oracle-not-at-tip
+// refusal of a punishing quorum commitment came 37-60 ms before the oracle
+// folded the parent: the header tip change re-sourced the template first. The
+// height was then served only when something unrelated re-sourced it, once
+// as late as the next block (h=2566523). The oracle's block handler now
+// re-sources the refused height as soon as it stands on the parent.
+
+namespace {
+std::string code_without_comments(const char* path)
+{
+    std::ifstream in(path);
+    EXPECT_TRUE(in.good()) << "cannot open " << path;
+    std::stringstream buf; buf << in.rdbuf();
+    std::string src = buf.str();
+    for (auto b = src.find("/*"); b != std::string::npos; b = src.find("/*", b)) {
+        const auto e = src.find("*/", b + 2);
+        src.erase(b, e == std::string::npos ? std::string::npos : e + 2 - b);
+    }
+    std::string code;
+    std::istringstream lines(src);
+    for (std::string line; std::getline(lines, line);) {
+        const auto c = line.find("//");
+        code += (c == std::string::npos ? line : line.substr(0, c)) + "\n";
+    }
+    return code;
+}
+} // namespace
+
+TEST(DashPoseOracleRefresh, DueOnlyWhenTheOracleFoldedTheRefusedHeightsParent)
+{
+    using WS = dash::stratum::DASHWorkSource;
+    constexpr uint32_t H = 2'566'523;
+    EXPECT_TRUE(WS::pose_oracle_refresh_due(H, H - 1))
+        << "the oracle now stands on the parent of the refused template";
+    EXPECT_FALSE(WS::pose_oracle_refresh_due(0, H - 1)) << "no PoSe refusal open";
+    EXPECT_FALSE(WS::pose_oracle_refresh_due(H, H))
+        << "the refused height itself connected: the tip change re-sources";
+    EXPECT_FALSE(WS::pose_oracle_refresh_due(H, H - 2))
+        << "a catch-up fold below the parent is not the tip the template needs";
+    static_assert(WS::pose_oracle_refresh_due(5, 4), "usable at compile time");
+}
+
+TEST(DashPoseOracleRefresh, FreshWorkSourceHasNoPosePassRefusal)
+{
+    dash::coin::NodeCoinState cs;
+    dash::stratum::DASHWorkSource ws(cs, [] { return dash::coin::DashWorkData{}; });
+    EXPECT_EQ(ws.pose_pass_decline_height(), 0u);
+}
+
+TEST(DashPoseOracleRefresh, ArmDecisionRecordsOnlyAPosePassRefusal)
+{
+    const std::string code = code_without_comments(DASH_WORK_SOURCE_SRC);
+    const auto set = code.find("last_decline_      = served_embedded ?");
+    ASSERT_NE(set, std::string::npos);
+    const auto rec = code.find("pose_pass_decline_height_.store(", set);
+    ASSERT_NE(rec, std::string::npos);
+    EXPECT_LT(rec - set, 200u) << "recorded from the same decision as last_decline_";
+    const auto cond = code.find("why.cause == \"qc-real-pose-unfolded\"", rec);
+    ASSERT_NE(cond, std::string::npos);
+    EXPECT_LT(cond - rec, 200u) << "only the PoSe-pass cause records a height";
+    const auto idle = code.find("observe_ready_idle(now_sec);");
+    ASSERT_NE(idle, std::string::npos);
+    const auto clr = code.find("pose_pass_decline_height_.store(0,", idle);
+    ASSERT_NE(clr, std::string::npos);
+    EXPECT_LT(clr - idle, 200u) << "a ready-idle arm clears it";
+}
+
+TEST(DashPoseOracleRefresh, MainDashReSourcesFromTheOracleBlockHandler)
+{
+    const std::string code = code_without_comments(DASH_MAIN_SRC);
+    const auto fold = code.find("po->on_block(bc.block, bc.height);");
+    ASSERT_NE(fold, std::string::npos);
+    const auto due = code.find("pose_oracle_refresh_due(", fold);
+    ASSERT_NE(due, std::string::npos);
+    EXPECT_LT(due - fold, 600u) << "decided right after the oracle folds";
+    const auto at_tip = code.find("cur->first == bc.height", fold);
+    ASSERT_NE(at_tip, std::string::npos);
+    EXPECT_LT(at_tip, due) << "only when the fold actually advanced the oracle";
+    const auto inv = code.find("ws->invalidate_template_cache(", due);
+    const auto gen = code.find("ws->bump_work_generation();", due);
+    const auto ntf = code.find("stratum_server->notify_all();", due);
+    ASSERT_NE(inv, std::string::npos);
+    ASSERT_NE(gen, std::string::npos);
+    ASSERT_NE(ntf, std::string::npos);
+    EXPECT_LT(ntf - due, 900u) << "the same invalidate + bump + notify as a tip change";
+}
+
+// One BLS mode per binary (vendor/bls_mode_guard.hpp): work_source.cpp
+// (dash_stratum) inlines the BLS-dependent provider-tx checks and template
+// builder, so it must be compiled in the same mode as every other TU of the
+// binary. With the backend in the build (C2POOL_DASH_BLS_EXPECTED), that mode
+// is the backend: a dash_stratum compiled without C2POOL_DASH_BLS fails here
+// (and c2pool-dash refuses to start).
+TEST(DashBlsModeGuard, StratumObjectsShareTheBuildsBlsMode)
+{
+    using namespace dash::coin::vendor;
+    EXPECT_FALSE(bls_mode_mixed()) << "modes seen: " << bls_modes();
+#if defined(C2POOL_DASH_BLS_EXPECTED)
+    EXPECT_EQ(bls_modes(), kBlsModeBackend) << "a translation unit was compiled without C2POOL_DASH_BLS";
+#else
+    EXPECT_EQ(bls_modes(), kBlsModeStub);
+#endif
 }

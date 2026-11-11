@@ -40,6 +40,7 @@ inline uint64_t mul128_shift(uint64_t a, uint64_t b, unsigned shift) {
 #include <functional>
 #include <iomanip>
 #include <map>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <vector>
@@ -172,6 +173,23 @@ struct CumulativeWeights
     std::map<std::vector<unsigned char>, uint288> weights;
     uint288 total_weight;
     uint288 total_donation_weight;
+};
+
+/// The PPLNS weights a merged (aux) chain's payouts are split by, with each
+/// key resolved to its merged script. Taken under the tracker lock
+/// (ShareTracker::get_merged_payout_weights); the amounts for ANY coinbase
+/// value then follow from them alone (ShareTracker::merged_payouts_from_weights),
+/// exactly as get_merged_expected_payouts computes them.
+struct MergedPayoutWeights
+{
+    uint256 best;
+    uint32_t chain_id{0};
+    int32_t chain_len{0};      // min(height(best), real_chain_length)
+    uint288 total_weight;
+    uint288 donation_weight;
+    // (merged script, summed weight of the keys resolving to it), by script.
+    std::vector<std::pair<std::vector<unsigned char>, uint288>> resolved;
+    uint288 accepted_total;    // sum of the resolved weights
 };
 
 // ── Dense PPLNS Ring Buffer ──────────────────────────────────────────────
@@ -2028,8 +2046,15 @@ public:
         if (start.IsNull())
             return {};
 
-        ensure_weights_skiplist();
-        auto sl_result = m_weights_skiplist->query(start, max_shares, desired_weight);
+        // The lock covers the lazy skip list only; its own mutex serializes
+        // the walk (see m_weights_cache_mutex).
+        chain::WeightsSkipList* sl = nullptr;
+        {
+            std::lock_guard<std::mutex> cache_lock(m_weights_cache_mutex);
+            ensure_weights_skiplist();
+            sl = &*m_weights_skiplist;
+        }
+        auto sl_result = sl->query(start, max_shares, desired_weight);
         return CumulativeWeights{
             std::move(sl_result.weights),
             sl_result.total_weight,
@@ -2051,6 +2076,9 @@ public:
     {
         if (start.IsNull())
             return {};
+
+        // The result cache below is read here and written at the end.
+        std::lock_guard<std::mutex> cache_lock(m_weights_cache_mutex);
 
         // Cache: keyed by (start_hash, max_shares, desired_weight).
         // Same inputs always produce same outputs (deterministic walk).
@@ -2511,16 +2539,19 @@ public:
         if (start.IsNull())
             return {};
 
-        auto& sl = ensure_merged_skiplist(target_chain_id);
-        auto result = sl.query(start, max_shares, desired_weight);
+        chain::WeightsSkipList* sl = nullptr;
+        {
+            std::lock_guard<std::mutex> cache_lock(m_weights_cache_mutex);
+            sl = &ensure_merged_skiplist(target_chain_id);
+        }
+        auto result = sl->query(start, max_shares, desired_weight);
 
         // [DOGE-PPLNS] Per-address breakdown — shows whether autoconverted
         // addresses appear in merged PPLNS weights.  Log once per new height.
         {
-            static int32_t s_last_doge_height = -1;
+            static std::atomic<int32_t> s_last_doge_height{-1};
             auto h = chain.get_height(start);
-            if (h != s_last_doge_height) {
-                s_last_doge_height = h;
+            if (s_last_doge_height.exchange(h) != h) {
                 auto to_dec = [](const uint288& val) -> std::string {
                     if (val.IsNull()) return "0";
                     uint288 tmp = val; std::string r;
@@ -2584,8 +2615,13 @@ public:
         if (start.IsNull())
             return {};
 
-        ensure_v36_skiplist();
-        auto result = m_v36_weights_skiplist->query(start, max_shares, desired_weight);
+        chain::WeightsSkipList* sl = nullptr;
+        {
+            std::lock_guard<std::mutex> cache_lock(m_weights_cache_mutex);
+            ensure_v36_skiplist();
+            sl = &*m_v36_weights_skiplist;
+        }
+        auto result = sl->query(start, max_shares, desired_weight);
         return {std::move(result.weights), result.total_weight, result.total_donation_weight};
     }
 
@@ -2596,9 +2632,15 @@ public:
     // p2pool MergedWeightsSkipList.get_delta (data.py:1864).
     //
     //   chain_id == nullopt : hash / v36 path — no merged-address resolution.
-    //   chain_id has value  : per-chain path — Tier 1 explicit merged_addresses,
-    //                         Tier 1.5 retroactive miner→merged lookup (normalize
-    //                         used only as a lookup PROBE), else the default key.
+    //   chain_id has value  : per-chain path, by the share's version
+    //                         (share_check.hpp, above MERGED_KEY_PREFIX):
+    //                         V36  — Tier 1 explicit merged_addresses, Tier 1.5
+    //                                retroactive miner→merged lookup (normalize
+    //                                used only as a lookup PROBE), else the
+    //                                default key;
+    //                         3601 — Tier 1, else the default key (its own
+    //                                parent script). Never another share's
+    //                                address.
     //
     // Pre-V36 shares count toward window sizing but contribute zero weight
     // (p2pool returns (1, {}, 0, 0)); total_weight/donation are only set once a
@@ -2633,25 +2675,30 @@ public:
                         break;
                     }
                 }
-                // Tier 1.5: retroactive lookup of the same miner's explicit merged
+                // Tier 1.5 (V36 shares): retroactive lookup of the same miner's explicit merged
                 // address from their other shares.  Try the raw parent script, then
                 // its normalized P2PKH form (normalize is a lookup PROBE only here).
-                if (weight_key.empty())
+                if constexpr (ShareT::version < FLAG_DAY_SHARE_VERSION)
                 {
-                    auto table_it = m_miner_merged_addr.find(*chain_id);
-                    if (table_it != m_miner_merged_addr.end())
+                    if (weight_key.empty())
                     {
-                        auto miner_it = table_it->second.find(parent_script);
-                        if (miner_it == table_it->second.end())
+                        auto table_it = m_miner_merged_addr.find(*chain_id);
+                        if (table_it != m_miner_merged_addr.end())
                         {
-                            auto norm = normalize_script_for_merged(parent_script);
-                            if (!norm.empty() && norm != parent_script)
-                                miner_it = table_it->second.find(norm);
+                            auto miner_it = table_it->second.find(parent_script);
+                            if (miner_it == table_it->second.end())
+                            {
+                                auto norm = normalize_script_for_merged(parent_script);
+                                if (!norm.empty() && norm != parent_script)
+                                    miner_it = table_it->second.find(norm);
+                            }
+                            if (miner_it != table_it->second.end())
+                                weight_key = make_merged_key(miner_it->second);
                         }
-                        if (miner_it != table_it->second.end())
-                            weight_key = make_merged_key(miner_it->second);
                     }
                 }
+                // 3601 shares: no Tier 1.5 — the share's own parent script
+                // (the default key below).
             }
         }
 
@@ -2808,9 +2855,8 @@ public:
         // Per-address merged PPLNS breakdown — log once per new chain height
         // for death valley comparison between p2pool and c2pool.
         {
-            static int32_t s_last_log_height = -1;
-            if (height != s_last_log_height) {
-                s_last_log_height = height;
+            static std::atomic<int32_t> s_last_log_height{-1};
+            if (s_last_log_height.exchange(height) != height) {
                 LOG_INFO << "[MERGED-PPLNS] height=" << height
                          << " chain_len=" << chain_len
                          << " addrs=" << sorted_by_script.size()
@@ -2899,18 +2945,67 @@ public:
                                 const uint256& block_target,
                                 uint64_t subsidy,
                                 uint32_t chain_id,
-                                const std::vector<unsigned char>& donation_script,
-                                const std::vector<unsigned char>& operator_ltc_script = {},
-                                const std::vector<unsigned char>& operator_merged_script = {})
+                                const std::vector<unsigned char>& donation_script)
     {
-        auto chain_len = std::min(chain.get_height(best_share_hash),
-                                  static_cast<int32_t>(PoolConfig::real_chain_length()));
+        (void)block_target;
+        return merged_payouts_from_weights(get_merged_payout_weights(best_share_hash, chain_id),
+                                           subsidy, donation_script);
+    }
+
+    // The tracker half of get_merged_expected_payouts: the PPLNS weights from
+    // best_share_hash, keys resolved to merged scripts exactly as p2pool's
+    // build_canonical_merged_coinbase does (no node-local redirect: peers
+    // rebuild this coinbase from the share chain alone). Needs the tracker;
+    // the amounts do not (merged_payouts_from_weights).
+    MergedPayoutWeights
+    get_merged_payout_weights(const uint256& best_share_hash, uint32_t chain_id)
+    {
+        MergedPayoutWeights out;
+        out.best = best_share_hash;
+        out.chain_id = chain_id;
+        out.chain_len = std::min(chain.get_height(best_share_hash),
+                                 static_cast<int32_t>(PoolConfig::real_chain_length()));
         // Unlimited desired_weight — exponential decay handles windowing.
         uint288 unlimited_weight;
         unlimited_weight.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
 
         auto [weights, total_weight, donation_weight] =
-            get_merged_cumulative_weights(best_share_hash, chain_len, unlimited_weight, chain_id);
+            get_merged_cumulative_weights(best_share_hash, out.chain_len, unlimited_weight, chain_id);
+        out.total_weight = total_weight;
+        out.donation_weight = donation_weight;
+
+        // p2pool data.py:220-269: accepted_total_weight is the sum of ONLY
+        // convertible weights (after filtering unconvertible P2WSH/P2TR).
+        // NOT total_weight - donation_weight (which includes unconvertible).
+        // First pass: resolve scripts and compute accepted_total.
+        // Keys resolving to the same merged script (a miner's P2PKH and P2WPKH
+        // shares, an explicit merged address equal to an autoconverted one)
+        // are summed BEFORE the split, as p2pool's
+        // build_canonical_merged_coinbase does (script_weights): one
+        // floor(miners_reward * sum / accepted) per script, not a sum of
+        // per-key floors. V36 peers re-derive this coinbase and compare.
+        std::map<std::vector<unsigned char>, uint288> script_weights;
+        for (const auto& [key, weight] : weights) {
+            std::vector<unsigned char> script = resolve_merged_payout_script(key);
+            if (script.empty()) continue;  // Unconvertible (P2WSH, P2TR) — skip
+            script_weights[script] = script_weights[script] + weight;
+            out.accepted_total = out.accepted_total + weight;
+        }
+        for (auto& [script, weight] : script_weights)
+            out.resolved.emplace_back(script, weight);
+        return out;
+    }
+
+    // The amounts half of get_merged_expected_payouts: a pure function of the
+    // weights and the coinbase value (no tracker access).
+    static std::map<std::vector<unsigned char>, uint64_t>
+    merged_payouts_from_weights(const MergedPayoutWeights& w,
+                                uint64_t subsidy,
+                                const std::vector<unsigned char>& donation_script)
+    {
+        const uint288& total_weight = w.total_weight;
+        const uint288& donation_weight = w.donation_weight;
+        const uint288& accepted_total = w.accepted_total;
 
         std::map<std::vector<unsigned char>, uint64_t> result;
 
@@ -2929,37 +3024,15 @@ public:
         // finder_fee = 0 (CANONICAL_MERGED_FINDER_FEE_PER_MILLE = 0 in p2pool)
         uint64_t miners_reward = subsidy - donation_amount;
 
-        // p2pool data.py:220-269: accepted_total_weight is the sum of ONLY
-        // convertible weights (after filtering unconvertible P2WSH/P2TR).
-        // NOT total_weight - donation_weight (which includes unconvertible).
-        // First pass: resolve scripts and compute accepted_total
-        struct ResolvedEntry {
-            std::vector<unsigned char> script;
-            uint288 weight;
-        };
-        std::vector<ResolvedEntry> resolved;
-        uint288 accepted_total;
-        for (const auto& [key, weight] : weights) {
-            std::vector<unsigned char> script;
-            if (!operator_ltc_script.empty() && !operator_merged_script.empty() && key == operator_ltc_script) {
-                script = operator_merged_script;
-            } else {
-                script = resolve_merged_payout_script(key);
-            }
-            if (script.empty()) continue;  // Unconvertible (P2WSH, P2TR) — skip
-            resolved.push_back({std::move(script), weight});
-            accepted_total = accepted_total + weight;
-        }
-
         // Second pass: distribute miners_reward proportionally (uint288 arithmetic)
         uint64_t total_distributed = 0;
         uint288 miners_reward288(miners_reward);
-        for (const auto& entry : resolved) {
+        for (const auto& [script, weight] : w.resolved) {
             uint64_t amount = !accepted_total.IsNull()
-                ? (miners_reward288 * entry.weight / accepted_total).GetLow64()
+                ? (miners_reward288 * weight / accepted_total).GetLow64()
                 : 0;
             if (amount > 0) {
-                result[entry.script] += amount;
+                result[script] += amount;
                 total_distributed += amount;
             }
         }
@@ -2990,6 +3063,21 @@ public:
         return result;
     }
 
+    // merged_payouts_from_weights as the merged coinbase takes them: the
+    // outputs of at least 1 satoshi, sorted by (script, amount).
+    static std::vector<std::pair<std::vector<unsigned char>, uint64_t>>
+    merged_payout_outputs(const MergedPayoutWeights& w,
+                          uint64_t subsidy,
+                          const std::vector<unsigned char>& donation_script)
+    {
+        std::vector<std::pair<std::vector<unsigned char>, uint64_t>> out;
+        for (auto& [script, amount] : merged_payouts_from_weights(w, subsidy, donation_script))
+            if (amount >= 1)
+                out.emplace_back(script, amount);
+        std::sort(out.begin(), out.end());
+        return out;
+    }
+
     // F10/(b): should_punish_version (the 95%-obsolescence punish) was removed.
     // It was non-canonical — canonical p2pool check() has no 95% obsolescence
     // rule; the count-based AutoRatchet plus the 60% weighted switch rule
@@ -3004,6 +3092,31 @@ private:
     std::optional<chain::WeightsSkipList> m_weights_skiplist;
     std::optional<chain::WeightsSkipList> m_v36_weights_skiplist;
     std::unordered_map<uint32_t, chain::WeightsSkipList> m_merged_skiplists;
+
+    // -- Lock for the lazily-filled weight caches --
+    // The skip lists above and the decayed-walk result cache below are memo
+    // caches that READERS fill: get_cumulative_weights,
+    // get_v36_decayed_cumulative_weights, get_merged_cumulative_weights and
+    // get_v36_merged_weights (with everything built on them: the merged payout
+    // weights, compute_merged_payout_hash's per-chain log, the expected
+    // payouts) are called under the SHARED tracker lock (read_tracker), so two
+    // threads can fill the same cache at once -- the merged-mining RPC thread
+    // rebuilding the merged block and the IO thread caching the tip payouts,
+    // both in get_merged_payout_weights (SIGSEGV in WeightsSkipList::query on
+    // the LTC+DOGE canary, 2026-11-06). Every access to these caches holds
+    // m_weights_cache_mutex; writers (forget on removal, the skip-list reset
+    // on a new merged address, the cache priming) take it as well. A walk
+    // (WeightsSkipList::query) runs under the skip list's OWN mutex only, so
+    // a cold walk of one skip list does not hold up a warm query of another:
+    // the reader takes the skip list's address under m_weights_cache_mutex
+    // and keeps it valid by holding the tracker lock, because a skip list is
+    // only ever dropped (try_register_merged_addr, under add) while the
+    // tracker lock is held exclusively. The decayed cache's walk stays under
+    // m_weights_cache_mutex (one entry, read at the top, written at the end).
+    // Lock order: tracker lock -> m_weights_cache_mutex -> the skip list's own
+    // mutex. The skip lists' delta / previous callbacks read the chain only
+    // and never take it; no function holding it calls another that does.
+    mutable std::mutex m_weights_cache_mutex;
 
     // -- Retroactive merged address lookup table --
     // Maps (chain_id) → (parent_script → explicit_merged_script).
@@ -3022,6 +3135,8 @@ private:
     {
         if constexpr (requires { share->m_merged_addresses; })
         {
+            // V36 shares only: a 3601 share neither feeds nor uses Tier 1.5.
+            if constexpr (ShareT::version >= FLAG_DAY_SHARE_VERSION) return;
             if (share->m_desired_version < 36) return;
             if (share->m_merged_addresses.empty()) return;
             auto parent_script = get_share_script(share);
@@ -3047,7 +3162,10 @@ private:
                 {
                     // New mapping — stale skip list entries used auto-convert
                     // for this miner; recreate to use the explicit address.
-                    m_merged_skiplists.erase(entry.m_chain_id);
+                    {
+                        std::lock_guard<std::mutex> cache_lock(m_weights_cache_mutex);
+                        m_merged_skiplists.erase(entry.m_chain_id);
+                    }
                     auto to_hex_short = [](const std::vector<unsigned char>& s, size_t n = 20) {
                         static const char* H = "0123456789abcdef";
                         std::string r; for (size_t i = 0; i < std::min(s.size(), n); ++i) { r += H[s[i]>>4]; r += H[s[i]&0xf]; }
@@ -3140,6 +3258,7 @@ private:
 
     void invalidate_weight_caches(const uint256& hash)
     {
+        std::lock_guard<std::mutex> cache_lock(m_weights_cache_mutex);
         if (m_weights_skiplist) m_weights_skiplist->forget(hash);
         if (m_v36_weights_skiplist) m_v36_weights_skiplist->forget(hash);
         for (auto& [_, sl] : m_merged_skiplists) sl.forget(hash);
@@ -3157,6 +3276,7 @@ private:
     // an approximation — it produces identical CumulativeWeights.
     void prime_pplns_cache(const uint256& start, int32_t max_shares,
                            const CumulativeWeights& weights) {
+        std::lock_guard<std::mutex> cache_lock(m_weights_cache_mutex);
         m_decayed_cache_start = start;
         m_decayed_cache_shares = max_shares;
         // Verification always uses unlimited desired_weight

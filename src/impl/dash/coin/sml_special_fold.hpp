@@ -2,7 +2,10 @@
 #pragma once
 
 /// Template-side masternode-list fold for the DIP-3 provider special
-/// transactions (types 1-4) a served embedded block includes.
+/// transactions (types 1-4) a served embedded block includes, and, once Dash
+/// Core v24 is active for the block, for every provider type (1-4 and the
+/// shared-masternode types 10-12) through the v24 transitions (THE V24 FOLD,
+/// below).
 ///
 /// ─────────────────────────────────────────────────────────────────────────
 /// WHY THIS EXISTS
@@ -68,6 +71,8 @@
 #include <impl/dash/coin/transaction.hpp>
 #include <impl/dash/coin/tx_version_rules.hpp>
 #include <impl/dash/coin/utxo_adapter.hpp>   // dash_txid
+#include <impl/dash/coin/v24_sml_leaf.hpp>   // Dash Core v24 state -> SML leaf (shared with the replay fold)
+#include <impl/dash/coin/v24_state.hpp>      // Dash Core v24 state transitions (shared with both mined-block folds)
 
 #include <core/uint256.hpp>
 
@@ -82,6 +87,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -97,15 +103,16 @@ enum class MnFoldOutcome {
 
 namespace detail {
 
-// Is a legacy 18-byte CService "empty" (no address AND no port)? dashd
-// registers/keeps a masternode BANNED while its netInfo is empty; the SML
-// leaf reflects that as isValid=false.
-inline bool net_service_empty(const std::array<uint8_t, vendor::NETADDR_SIZE>& ip,
-                              uint16_t port_be)
+// Is a legacy 18-byte CService "empty"? dashd registers/keeps a masternode
+// BANNED while its netInfo is empty; the SML leaf reflects that as
+// isValid=false. Empty is Dash Core's rule (MnNetInfo::IsEmpty): ANY service
+// whose address is not valid (::ffff:0.0.0.0, ::, ::ffff:255.255.255.255,
+// TORv2- or internal-in-IPv6, 2001:db8::/32), whatever its port -- not just
+// the all-zero bytes. Such a service is held and hashed as 16 zero bytes and
+// port 0 (LegacyNetService::canonical()).
+inline bool net_service_empty(const vendor::LegacyNetService& n)
 {
-    if (port_be != 0) return false;
-    for (uint8_t b : ip) if (b != 0) return false;
-    return true;
+    return n.IsEmpty();
 }
 
 // Find the SML entry for a proRegTxHash. Returns nullptr when absent.
@@ -168,6 +175,9 @@ inline MnFoldOutcome apply_mn_special_tx_to_sml(
         vendor::CProRegTx pl;
         if (!vendor::parse_protx_payload(tx.extra_payload, pl))
             return MnFoldOutcome::Refused;
+        // A v3 (ExtAddr, Dash Core v24) leaf carries an ExtNetInfo this fold
+        // does not build yet: refuse rather than emit a v2-shaped v3 leaf.
+        if (pl.nVersion >= vendor::ProTxVersion::EXT_ADDR) return MnFoldOutcome::Refused;
 
         // The new registration's proRegTxHash is the ProRegTx's own txid
         // (dashd: newState->proTxHash = tx.GetHash()).
@@ -184,8 +194,8 @@ inline MnFoldOutcome apply_mn_special_tx_to_sml(
         e.nVersion       = pl.nVersion;               // 1=legacy,2=basic,3=extaddr
         e.proRegTxHash   = pro;
         e.confirmedHash  = uint256::ZERO;             // registered here, not yet confirmed
-        e.netAddress     = pl.netInfo.ip;
-        e.netPort        = pl.netInfo.port_be;
+        e.netAddress     = pl.netInfo.canonical().ip;
+        e.netPort        = pl.netInfo.canonical().port_be;
         // The ProReg payload's operator key is ALREADY encoded in the scheme
         // its nVersion dictates (legacy iff nVersion < BASIC_BLS), which is
         // exactly the scheme the SML leaf hashes for that nVersion — copy the
@@ -193,7 +203,7 @@ inline MnFoldOutcome apply_mn_special_tx_to_sml(
         e.pubKeyOperator = pl.pubKeyOperator;
         e.keyIDVoting    = pl.keyIDVoting;
         // Empty netInfo ⇒ registers BANNED (isValid=false), else valid.
-        e.isValid        = !detail::net_service_empty(pl.netInfo.ip, pl.netInfo.port_be);
+        e.isValid        = !detail::net_service_empty(pl.netInfo);
         e.nType          = pl.nType;
         e.platformHTTPPort = pl.platformHTTPPort;
         e.platformNodeID   = pl.platformNodeID;
@@ -206,10 +216,12 @@ inline MnFoldOutcome apply_mn_special_tx_to_sml(
         vendor::CProUpServTx pl;
         if (!vendor::parse_protx_payload(tx.extra_payload, pl))
             return MnFoldOutcome::Refused;
+        if (pl.nVersion >= vendor::ProTxVersion::EXT_ADDR) return MnFoldOutcome::Refused;
         auto* e = detail::find_entry(list, pl.proTxHash);
         if (e == nullptr) return MnFoldOutcome::Refused;
-        e->netAddress = pl.netInfo.ip;
-        e->netPort    = pl.netInfo.port_be;
+        if (e->has_ext_netinfo()) return MnFoldOutcome::Refused;   // v24 SetStateVersion not ported
+        e->netAddress = pl.netInfo.canonical().ip;
+        e->netPort    = pl.netInfo.canonical().port_be;
         if (e->nType == vendor::CSimplifiedMNListEntry::TYPE_EVO) {
             e->platformHTTPPort = pl.platformHTTPPort;
             e->platformNodeID   = pl.platformNodeID;
@@ -217,7 +229,7 @@ inline MnFoldOutcome apply_mn_special_tx_to_sml(
         // dashd revives a banned masternode on a ProUpServTx once its service
         // is set again (BuildNewListFromBlock Revive). A non-empty netInfo is
         // the revive trigger the SML leaf can see.
-        if (!detail::net_service_empty(pl.netInfo.ip, pl.netInfo.port_be))
+        if (!detail::net_service_empty(pl.netInfo))
             e->isValid = true;
         return MnFoldOutcome::Applied;
     }
@@ -227,8 +239,10 @@ inline MnFoldOutcome apply_mn_special_tx_to_sml(
         vendor::CProUpRegTx pl;
         if (!vendor::parse_protx_payload(tx.extra_payload, pl))
             return MnFoldOutcome::Refused;
+        if (pl.nVersion >= vendor::ProTxVersion::EXT_ADDR) return MnFoldOutcome::Refused;
         auto* e = detail::find_entry(list, pl.proTxHash);
         if (e == nullptr) return MnFoldOutcome::Refused;
+        if (e->has_ext_netinfo()) return MnFoldOutcome::Refused;   // v24 SetStateVersion not ported
         e->keyIDVoting = pl.keyIDVoting;
         // Operator-key change (dashd compares the keys as CBLSLazyPublicKey —
         // bytes under one scheme, points across schemes) ⇒ ResetOperatorFields
@@ -254,8 +268,11 @@ inline MnFoldOutcome apply_mn_special_tx_to_sml(
         vendor::CProUpRevTx pl;
         if (!vendor::parse_protx_payload(tx.extra_payload, pl))
             return MnFoldOutcome::Refused;
+        if (pl.nVersion >= vendor::ProTxVersion::EXT_ADDR) return MnFoldOutcome::Refused;
         auto* e = detail::find_entry(list, pl.proTxHash);
         if (e == nullptr) return MnFoldOutcome::Refused;
+        // After v24 a revocation keeps a v3 state's version; not ported.
+        if (e->has_ext_netinfo()) return MnFoldOutcome::Refused;
         // ResetOperatorFields + ban (nVersion back to LegacyBLS): invalid
         // until a fresh ProUpRegTx(new key) + ProUpServTx pair.
         detail::reset_operator_fields(*e);
@@ -345,6 +362,30 @@ struct MnFoldContext
     CollateralCoinFn      collateral_coin;
     OperatorSigFn         verify_operator_sig;
 
+    /// Dash Core's full CheckPro*Tx for the block being built (protx_check.hpp):
+    /// payload rules, network fields, collateral, inputsHash and the ECDSA
+    /// signatures. Returns the reject reason, nullopt to pass.
+    using CoreCheckFn = std::function<std::optional<std::string>(const MutableTransaction&)>;
+    CoreCheckFn core_check;
+    /// The serving folds (template builder and emit gate) set this: every
+    /// provider tx must then pass core_check, and a missing core_check refuses
+    /// it (fail closed). The service-update ordering rule of Dash Core's miner
+    /// applies as well. Unset (the plain context fold) => unchanged.
+    bool require_core_check{false};
+
+    /// Dash Core v24: DEPLOYMENT_V24 is active for the block being built. The
+    /// fold then applies every provider type (1-4 and 10-12) through the v24
+    /// transitions (v24_state.hpp, the code the payee projection and the
+    /// root-checked replay fold run for mined blocks) on full masternode
+    /// states, and re-derives each changed leaf from the state
+    /// (v24_sml_leaf.hpp). False (the default): the pre-v24 fold, unchanged.
+    bool v24_rules{false};
+    /// The height of the block being built: a registration's
+    /// nRegisteredHeight and a ban's height. Read only when v24_rules is set.
+    uint32_t height{0};
+    /// SetStateVersion's netInfo chain parameters (v24 fold only).
+    vendor::NetInfoRules netinfo_rules{vendor::NetInfoRules::mainnet()};
+
     static MnFoldContext from(const MnStateMachine& m,
                               CollateralCoinFn coin = {},
                               OperatorSigFn sig = {})
@@ -382,7 +423,7 @@ struct MnFoldContext
                         u.owner_or_platform_ids.emplace(st.keyIDOwner, pro);
                     if (st.nType == vendor::MnType::EVO && !st.platformNodeID.IsNull())
                         u.owner_or_platform_ids.emplace(st.platformNodeID, pro);
-                    if (!detail::net_service_empty(st.netInfo.ip, st.netInfo.port_be))
+                    if (!detail::net_service_empty(st.netInfo))
                         u.services.emplace(Service{st.netInfo.ip, st.netInfo.port_be}, pro);
                 }
             }
@@ -474,6 +515,11 @@ struct MnFoldOverlay
         return *base_opkeys_idx;
     }
     std::map<MnFoldContext::Service, uint256>    added_services;
+    /// Masternodes whose operator key a body tx changed or revoked (a
+    /// ProUpRegTx with a new key, a ProUpRevTx): Dash Core's miner never puts a
+    /// ProUpServTx for one of them after that tx (node/miner.cpp, the
+    /// keyChangedMNs rule).
+    std::set<uint256> key_changed;
 
     /// GetMNByCollateral on the evolving list.
     std::optional<uint256> collateral_owner(const MnFoldContext& ctx,
@@ -522,7 +568,7 @@ inline bool held_by_other(const Key& k, const BaseMap& base, const AddedMap& add
 inline std::optional<MnFoldContext::Service>
 service_of(const vendor::LegacyNetService& n)
 {
-    if (net_service_empty(n.ip, n.port_be)) return std::nullopt;
+    if (net_service_empty(n)) return std::nullopt;
     return MnFoldContext::Service{n.ip, n.port_be};
 }
 
@@ -574,8 +620,16 @@ update_target_refusal(const vendor::CSimplifiedMNList& base,
     if (ov.removed.count(pro))
         return "bad-protx-hash (" + pro.GetHex().substr(0, 16)
              + " was removed earlier in this block)";
-    for (const auto& e : list)
-        if (e.proRegTxHash == pro) return std::nullopt;
+    for (const auto& e : list) {
+        if (e.proRegTxHash != pro) continue;
+        // Dash Core v24: an update of a version-3 (ExtAddr) state goes
+        // through SetStateVersion (target max(state, tx), netInfo
+        // conversion), which this fold does not implement: refuse by name.
+        if (be_out->has_ext_netinfo() || e.has_ext_netinfo())
+            return "bad-protx-version (target entry " + pro.GetHex().substr(0, 16)
+                 + " is nVersion=3, ExtAddr — DEPLOYMENT_V24 transitions are not ported)";
+        return std::nullopt;
+    }
     return "bad-protx-hash (" + pro.GetHex().substr(0, 16) + " not in the folded list)";
 }
 
@@ -606,6 +660,12 @@ inline FoldVerdict fold_one_with_ctx(vendor::CSimplifiedMNList& folded,
     if (tx.type < 1 || tx.type > 4) return {};
     if (auto why = contextual_tx_check(tx, /*is_coinbase=*/false))
         return refuse(std::string(*why));
+    if (ctx.require_core_check) {
+        if (!ctx.core_check)
+            return refuse("provider tx not checkable (no Dash Core check wired) - excluded");
+        if (auto why = ctx.core_check(::dash::coin::MutableTransaction(tx)))
+            return refuse(*why);
+    }
 
     switch (tx.type) {
     case vendor::CProRegTx::SPECIALTX_TYPE: {
@@ -700,9 +760,17 @@ inline FoldVerdict fold_one_with_ctx(vendor::CSimplifiedMNList& folded,
             return refuse("bad-protx-type (nType=" + std::to_string(pl.nType) + ")");
         if (pl.nType == vendor::MnType::EVO && pl.nVersion < vendor::ProTxVersion::BASIC_BLS)
             return refuse("bad-protx-evo-version");
+        // CProUpServTx::IsTriviallyValid (providertx.cpp:177 v23.1.7, :471
+        // v24.0.0): an empty netInfo -- any invalid service, whatever its
+        // port -- makes the tx, and a block carrying it, invalid.
+        if (pl.netInfo.IsEmpty()) return refuse("bad-protx-netinfo-empty");
         const vendor::CSimplifiedMNListEntry* be = nullptr;
         if (auto why = update_target_refusal(base, list, ov, pl.proTxHash, be))
             return refuse(*why);
+        if (ctx.require_core_check && ov.key_changed.count(pl.proTxHash))
+            return refuse("service update follows a key change of masternode "
+                          + pl.proTxHash.GetHex().substr(0, 16)
+                          + " in this block (Dash Core miner rule) - excluded");
         // #7488: nType must equal the registered MN's nType.
         if (pl.nType != be->nType)
             return refuse("bad-protx-type-mismatch (payload nType=" + std::to_string(pl.nType)
@@ -752,6 +820,7 @@ inline FoldVerdict fold_one_with_ctx(vendor::CSimplifiedMNList& folded,
         if (apply_mn_special_tx_to_sml(list, tx) != MnFoldOutcome::Applied)
             return refuse("bad-protx-hash (leaf apply)");   // unreachable: checked above
         if (key_changes && !opkey_is_null(op_wire)) ov.added_opkeys[op_wire] = pl.proTxHash;
+        if (key_changes) ov.key_changed.insert(pl.proTxHash);
         return {MnFoldOutcome::Applied, {}};
     }
 
@@ -767,6 +836,478 @@ inline FoldVerdict fold_one_with_ctx(vendor::CSimplifiedMNList& folded,
             return refuse(*why);
         if (apply_mn_special_tx_to_sml(list, tx) != MnFoldOutcome::Applied)
             return refuse("bad-protx-hash (leaf apply)");   // unreachable: checked above
+        ov.key_changed.insert(pl.proTxHash);   // a revocation resets the operator key
+        return {MnFoldOutcome::Applied, {}};
+    }
+
+    default:
+        return {};
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+// THE V24 FOLD (DEPLOYMENT_V24 active for the block being built)
+// ═════════════════════════════════════════════════════════════════════════
+//
+// Dash Core v24 ApplyTxToList (specialtxman.cpp:346-697) and
+// FinishListForBlock (:732-806), as the miner's CMNListBuilder runs them on
+// the block it builds (node/miner.cpp:741-768), for every provider type:
+// 1-4 and the shared-masternode types 10 (ProDisTx), 11 (ProUpShareTx) and
+// 12 (ProUpSharedRegTx). The transitions are v24_state.hpp's, the code the
+// payee projection and the root-checked replay fold run for mined blocks;
+// nothing here re-states a rule. Each masternode a body tx touches is held as
+// a FULL state, copied from the payee projection's pre-block state the first
+// time, and its leaf is re-derived from that state (v24_sml_leaf.hpp, the
+// replay fold's to_sml_entry). confirmedHash and isValid come from the
+// projected leaf (the confirmation pass and the PoSe pass ran before).
+//
+// FAIL CLOSED: a tx this fold cannot apply exactly is refused, never folded
+// approximately:
+//   * the projection's pre-block state of the masternode must reproduce its
+//     SML leaf byte for byte (CalcHash); a state that drifted from the list
+//     dashd committed refuses every tx touching that masternode;
+//   * no projection state, no leaf, an unknown or removed masternode;
+//   * any transition error Core reports (Core rejects the block on it);
+//   * the uniqueness rules of CheckPro*Tx (pre-block list) and of
+//     ApplyTxToList (the list as built so far), both enforced;
+//   * a tx spending a shared masternode's collateral that is not a ProDisTx
+//     (bad-shared-collateral-spend).
+// A refused tx never mutates the list and its inputs are not counted as
+// spends.
+
+/// In-body changes to the pre-block list under the v24 rules.
+struct MnFoldOverlayV24
+{
+    /// A netInfo entry as a unique property: (network id, address bytes,
+    /// port) for a service (Core hashes the CService, ADDRv2 for the
+    /// networks ADDRv1 cannot carry), (kDomain, name bytes, port) for a
+    /// domain entry.
+    using Service = std::tuple<uint8_t, std::vector<uint8_t>, uint16_t>;
+    static constexpr uint8_t kDomain = 0xff;
+
+    /// The evolving state of every masternode a body tx registered or
+    /// changed (newList for those entries).
+    std::map<uint256, MNState> touched;
+    /// Removed by a ProRegTx collateral reuse, or by a collateral spend.
+    std::set<uint256> removed;
+    /// Dash Core's miner keyChangedMNs: an operator key changed or revoked.
+    std::set<uint256> key_changed;
+
+    /// prevList unique-property indexes (dashd mnUniquePropertyMap), built on
+    /// first use: operator keys (the store is canonical basic, so a point is
+    /// one byte string and this is HasOperatorKeyUnderAnyScheme), keyIDOwner
+    /// ∪ Evo platformNodeID ∪ share owner keys (one namespace), and every
+    /// netInfo entry (the legacy CService, or each ExtNetInfo service and
+    /// domain entry of every purpose).
+    struct PreIndex {
+        std::multimap<MnFoldContext::OpKey, uint256> opkeys;
+        std::multimap<uint160, uint256>              ids;
+        std::multimap<Service, uint256>              services;
+    };
+    std::optional<PreIndex> pre;
+
+    /// The unique-property entries of a netInfo: ExtNetInfo when `ext`,
+    /// else the legacy service (none when empty).
+    static std::vector<Service> entries_of(bool ext, const vendor::LegacyNetService& legacy,
+                                           const vendor::ExtNetInfo& extinfo)
+    {
+        std::vector<Service> out;
+        if (ext) {
+            for (const auto& e : extinfo.GetAllEntries()) {
+                if (const auto* s = e.service(); s && s->IsValid())
+                    out.emplace_back(static_cast<uint8_t>(s->net), s->addr, s->port);
+                else if (const auto* d = e.domain())
+                    out.emplace_back(kDomain, std::vector<uint8_t>(d->addr.begin(), d->addr.end()), d->port);
+            }
+        } else if (!net_service_empty(legacy)) {
+            const auto s = vendor::NetService::from_legacy(legacy);
+            out.emplace_back(static_cast<uint8_t>(s.net), s.addr, s.port);
+        }
+        return out;
+    }
+    static std::vector<Service> services_of(const MNState& st)
+    {
+        return entries_of(v24::state_has_ext(st.nVersion), st.netInfo, st.v24.extNetInfo);
+    }
+    static std::vector<uint160> ids_of(const MNState& st)
+    {
+        std::vector<uint160> out;
+        if (!st.keyIDOwner.IsNull()) out.push_back(st.keyIDOwner);
+        if (st.nType == vendor::MnType::EVO && !st.platformNodeID.IsNull()) out.push_back(st.platformNodeID);
+        for (const auto& sh : st.v24.shares)
+            if (!sh.keyIDOwner.IsNull()) out.push_back(sh.keyIDOwner);
+        return out;
+    }
+
+    const PreIndex& pre_index(const MnFoldContext& ctx)
+    {
+        if (!pre) {
+            PreIndex ix;
+            if (ctx.mns != nullptr) {
+                for (const auto& [pro, st] : ctx.mns->entries()) {
+                    if (!opkey_is_null(st.pubKeyOperator)) ix.opkeys.emplace(st.pubKeyOperator, pro);
+                    for (const auto& id : ids_of(st)) ix.ids.emplace(id, pro);
+                    for (auto& s : services_of(st)) ix.services.emplace(std::move(s), pro);
+                }
+            }
+            pre = std::move(ix);
+        }
+        return *pre;
+    }
+
+    /// Held by a masternode other than `self` (and other than `also_not`) in
+    /// the pre-block list (CheckPro*Tx reads pindexPrev's list, so an entry
+    /// a body tx changed or removed still counts there) or in the list as
+    /// built so far (ApplyTxToList; a touched state's current value).
+    template <typename Key, typename PreMap, typename Of>
+    bool held_by_other(const Key& k, const PreMap& pm, Of&& values_of, const uint256& self,
+                       const uint256& also_not = uint256{}) const
+    {
+        for (auto [it, end] = pm.equal_range(k); it != end; ++it)
+            if (it->second != self && it->second != also_not) return true;
+        for (const auto& [pro, st] : touched) {
+            if (pro == self || pro == also_not || removed.count(pro)) continue;
+            for (const auto& v : values_of(st))
+                if (v == k) return true;
+        }
+        return false;
+    }
+    bool opkey_held_by_other(const MnFoldContext& ctx, const MnFoldContext::OpKey& basic, const uint256& self,
+                             const uint256& also_not = uint256{})
+    {
+        if (opkey_is_null(basic)) return false;
+        return held_by_other(basic, pre_index(ctx).opkeys,
+                             [](const MNState& st) { return std::vector<MnFoldContext::OpKey>{st.pubKeyOperator}; },
+                             self, also_not);
+    }
+    bool id_held_by_other(const MnFoldContext& ctx, const uint160& id, const uint256& self,
+                          const uint256& also_not = uint256{})
+    {
+        if (id.IsNull()) return false;
+        return held_by_other(id, pre_index(ctx).ids, &ids_of, self, also_not);
+    }
+    bool service_held_by_other(const MnFoldContext& ctx, const Service& s, const uint256& self,
+                               const uint256& also_not = uint256{})
+    {
+        return held_by_other(s, pre_index(ctx).services, &services_of, self, also_not);
+    }
+
+    /// GetMN on the list as built so far.
+    const MNState* state_of(const MnFoldContext& ctx, const uint256& pro) const
+    {
+        if (removed.count(pro)) return nullptr;
+        if (auto t = touched.find(pro); t != touched.end()) return &t->second;
+        if (ctx.mns == nullptr) return nullptr;
+        auto it = ctx.mns->entries().find(pro);
+        return it == ctx.mns->entries().end() ? nullptr : &it->second;
+    }
+
+    /// GetMNByCollateral on the list as built so far.
+    std::optional<uint256> collateral_owner(const MnFoldContext& ctx, const MnFoldContext::Outpoint& op) const
+    {
+        for (const auto& [pro, st] : touched)
+            if (!removed.count(pro) && st.collateralOutpoint.hash == op.hash
+                && st.collateralOutpoint.index == op.index)
+                return pro;
+        auto b = ctx.collateral_owner(op);
+        if (b && !removed.count(*b)) return b;
+        return std::nullopt;
+    }
+
+    /// RemoveMN on the evolving list and its leaves.
+    void remove_mn(std::vector<vendor::CSimplifiedMNListEntry>& list, const uint256& pro)
+    {
+        for (auto it = list.begin(); it != list.end(); ++it)
+            if (it->proRegTxHash == pro) { list.erase(it); break; }
+        removed.insert(pro);
+        touched.erase(pro);
+    }
+};
+
+/// The masternode's state to transition, held in the overlay: on first touch
+/// the projection's pre-block state, with isValid taken from the projected
+/// leaf, and only if that state reproduces the leaf exactly. nullptr with
+/// `why` set refuses.
+inline MNState* touch_v24(vendor::CSimplifiedMNList& folded, const MnFoldContext& ctx, MnFoldOverlayV24& ov,
+                          const uint256& pro, const char* code, std::string& why)
+{
+    const std::string short_pro = pro.GetHex().substr(0, 16);
+    if (ov.removed.count(pro)) {
+        why = std::string(code) + " (" + short_pro + " was removed earlier in this block)";
+        return nullptr;
+    }
+    if (auto t = ov.touched.find(pro); t != ov.touched.end()) return &t->second;
+    const MNState* pre = ov.state_of(ctx, pro);
+    vendor::CSimplifiedMNListEntry* leaf = find_entry(folded.mnList, pro);
+    if (pre == nullptr || leaf == nullptr) {
+        why = std::string(code) + " (" + short_pro
+            + (pre == nullptr ? " is not in the payee projection's pre-block list)"
+                              : " is not in the projected SML)");
+        return nullptr;
+    }
+    MNState st = *pre;
+    st.isValid = leaf->isValid;
+    if (!st.isValid && st.nPoSeBanHeight == 0) st.nPoSeBanHeight = ctx.height;
+    if (st.isValid) st.nPoSeBanHeight = 0;
+    vendor::CSimplifiedMNListEntry derived = *leaf;
+    v24::write_sml_leaf_fields(st, derived);
+    if (derived.CalcHash() != leaf->CalcHash()) {
+        why = "masternode " + short_pro
+            + ": the payee projection's state does not reproduce its SML leaf (state drift) - excluded";
+        return nullptr;
+    }
+    return &ov.touched.emplace(pro, std::move(st)).first->second;
+}
+
+/// Re-derive the leaf of `pro` from its state (a new registration's leaf is
+/// added unconfirmed).
+inline void write_leaf_v24(vendor::CSimplifiedMNList& folded, const uint256& pro, const MNState& st)
+{
+    vendor::CSimplifiedMNListEntry* e = find_entry(folded.mnList, pro);
+    if (e == nullptr) {
+        vendor::CSimplifiedMNListEntry fresh;
+        fresh.proRegTxHash = pro;
+        fresh.confirmedHash = uint256::ZERO;
+        folded.mnList.push_back(fresh);
+        e = &folded.mnList.back();
+    }
+    v24::write_sml_leaf_fields(st, *e);
+    e->isValid = st.isValid;
+}
+
+inline void ban_v24(MNState& st, uint32_t height)
+{
+    if (st.nPoSeBanHeight == 0) st.nPoSeBanHeight = height;
+    st.isValid = false;
+}
+
+template <typename Tx>
+inline FoldVerdict fold_one_v24(vendor::CSimplifiedMNList& folded, const vendor::CSimplifiedMNList& base,
+                                const Tx& tx, const MnFoldContext& ctx, MnFoldOverlayV24& ov,
+                                SmlSpecialFold& out)
+{
+    auto& list = folded.mnList;
+    // FinishListForBlock: a shared masternode's collateral may be spent only
+    // by a ProDisTx; any other spender makes the block invalid.
+    if (!(tx_is_special_version(tx.version) && tx.type == tx_type::PROVIDER_DISSOLVE)) {
+        for (const auto& in : tx.vin)
+            if (auto mn = ov.collateral_owner(ctx, in.prevout))
+                if (const MNState* st = ov.state_of(ctx, *mn); st != nullptr && st->v24.IsShared())
+                    return refuse("bad-shared-collateral-spend (masternode " + mn->GetHex().substr(0, 16) + ")");
+    }
+    // CheckSharedCollateralTemplateOutputs: an output paying the template
+    // only as the collateral of this tx's own shared registration.
+    if (auto why = v24::shared_collateral_create_refusal(tx)) return refuse(*why);
+    const bool provider = (tx.type >= 1 && tx.type <= 4) || tx_type_is_v24_provider(tx.type);
+    if (!provider) return {};
+    if (auto why = contextual_tx_check_v24(tx, /*is_coinbase=*/false)) return refuse(std::string(*why));
+    if (ctx.require_core_check) {
+        if (!ctx.core_check)
+            return refuse("provider tx not checkable (no Dash Core check wired) - excluded");
+        if (auto why = ctx.core_check(::dash::coin::MutableTransaction(tx))) return refuse(*why);
+    }
+    const auto& rules = ctx.netinfo_rules;
+    std::string why;
+
+    switch (tx.type) {
+    case vendor::CProRegTx::SPECIALTX_TYPE: {
+        vendor::CProRegTx p;
+        if (!vendor::parse_protx_payload(tx.extra_payload, p)) return refuse("bad-protx-payload");
+        // No new legacy-scheme registration under v24 (CheckProRegTx).
+        if (p.nVersion < vendor::ProTxVersion::BASIC_BLS) return refuse("bad-protx-version-disallowed");
+        const bool ext = v24::state_has_ext(p.nVersion);
+        const uint256 pro = dash::coin::dash_txid(::dash::coin::MutableTransaction(tx));
+        MnFoldContext::Outpoint coll = p.collateralOutpoint;
+        const bool external = !coll.hash.IsNull();
+        if (!external) coll.hash = pro;
+        if (external && ctx.collateral_coin) {
+            int64_t value = 0;
+            const auto proof = ctx.collateral_coin(coll, value);
+            if (proof == MnFoldContext::CollateralProof::Absent)
+                return refuse("bad-protx-collateral (not an unspent coin)");
+            const int64_t want = p.nType == vendor::MnType::EVO ? kCollateralEvo : kCollateralRegular;
+            if (proof == MnFoldContext::CollateralProof::Unspent && value != want)
+                return refuse("bad-protx-collateral (amount " + std::to_string(value) + " != "
+                              + std::to_string(want) + ")");
+        }
+        if (ov.state_of(ctx, pro) != nullptr || find_entry(list, pro) != nullptr)
+            return refuse("bad-protx-dup (proRegTxHash)");
+        const auto replaced = ov.collateral_owner(ctx, coll);
+        const uint256 none{};
+        const uint256 replaced_pro = replaced ? *replaced : uint256{};
+        // CheckProRegTx (prevList, the MN being replaced included) and
+        // ApplyTxToList (the list as built so far, after the replacement).
+        // A shared registration's share owner keys take the owner key's
+        // place in the one owner / platformNodeID namespace.
+        if (p.IsShared()) {
+            for (const auto& sh : p.shares)
+                if (ov.id_held_by_other(ctx, sh.keyIDOwner, none))
+                    return refuse("bad-protx-dup-key (a share owner key is an owner key or platformNodeID)");
+        } else if (ov.id_held_by_other(ctx, p.keyIDOwner, none)) {
+            return refuse("bad-protx-dup-key (keyIDOwner is an owner key or platformNodeID)");
+        }
+        const auto op_basic = vendor::opkey_to_basic(p.pubKeyOperator, p.nVersion < vendor::ProTxVersion::BASIC_BLS);
+        if (ov.opkey_held_by_other(ctx, op_basic, none))
+            return refuse("bad-protx-dup-key (pubKeyOperator under either scheme)");
+        if (p.nType == vendor::MnType::EVO && ov.id_held_by_other(ctx, p.platformNodeID, none))
+            return refuse("bad-protx-dup-platformnodeid");
+        {
+            const auto svc_list = MnFoldOverlayV24::entries_of(ext, p.netInfo.canonical(), p.extNetInfo);
+            for (const auto& svc : svc_list) {
+                // prevList: only the masternode this collateral replaces may hold it.
+                const auto& pm = ov.pre_index(ctx).services;
+                for (auto [it, end] = pm.equal_range(svc); it != end; ++it) {
+                    const auto pc = ctx.collateral_of(it->second);
+                    if (!(pc && pc->hash == coll.hash && pc->index == coll.index))
+                        return refuse("bad-protx-dup-netinfo-entry (service in use)");
+                }
+                if (ov.held_by_other(svc, std::multimap<MnFoldOverlayV24::Service, uint256>{},
+                                     &MnFoldOverlayV24::services_of, none, replaced_pro))
+                    return refuse("bad-protx-dup-netinfo-entry (service registered in this block)");
+            }
+        }
+        // ── mutate (Core ApplyTxToList, the projection's case 1) ──
+        if (replaced) {
+            ov.remove_mn(list, *replaced);
+            ++out.replaced;
+        }
+        MNState st;
+        st.nType = static_cast<uint8_t>(p.nType);
+        st.nRegisteredHeight = ctx.height;
+        st.collateralOutpoint = coll;
+        v24::state_from_proreg(st, p, op_basic);
+        st.nOperatorReward = p.nOperatorReward;
+        st.payoutSplitProvenance = MNState::SPLIT_KNOWN;
+        st.isValid = true;
+        if (v24::netinfo_empty(st)) ban_v24(st, ctx.height);
+        write_leaf_v24(folded, pro, st);
+        ov.touched[pro] = std::move(st);
+        return {MnFoldOutcome::Applied, {}};
+    }
+
+    case vendor::CProUpServTx::SPECIALTX_TYPE: {
+        vendor::CProUpServTx p;
+        if (!vendor::parse_protx_payload(tx.extra_payload, p)) return refuse("bad-protx-payload");
+        const vendor::CSimplifiedMNListEntry* be = base_entry(base, p.proTxHash);
+        if (be == nullptr) return refuse("bad-protx-hash (not in the pre-block list)");
+        MNState* cur = touch_v24(folded, ctx, ov, p.proTxHash, "bad-protx-hash", why);
+        if (cur == nullptr) return refuse(why);
+        if (ctx.require_core_check && ov.key_changed.count(p.proTxHash))
+            return refuse("service update follows a key change of masternode "
+                          + p.proTxHash.GetHex().substr(0, 16) + " in this block (Dash Core miner rule) - excluded");
+        if (p.nType != cur->nType) return refuse("bad-protx-type-mismatch");
+        for (const auto& svc : MnFoldOverlayV24::entries_of(v24::state_has_ext(p.nVersion), p.netInfo.canonical(),
+                                                            p.extNetInfo))
+            if (ov.service_held_by_other(ctx, svc, p.proTxHash))
+                return refuse("bad-protx-dup-netinfo-entry (an entry held by another MN)");
+        if (p.nType == vendor::MnType::EVO && ov.id_held_by_other(ctx, p.platformNodeID, p.proTxHash))
+            return refuse("bad-protx-dup-platformnodeid");
+        if (auto w = operator_sig_refusal(ctx, *be, tx.extra_payload, p)) return refuse(*w);
+        MNState next = *cur;
+        const uint16_t old_version = next.nVersion;
+        const uint16_t target = std::max<uint16_t>(old_version, p.nVersion);
+        const auto t = v24::apply_proupserv(next, p, next.nType, rules);
+        if (t.error) return refuse(*t.error);
+        if (!next.isValid && v24::revive_allowed(next)) {
+            next.nPoSeBanHeight = 0;
+            next.nPoSeRevivedHeight = ctx.height;
+            next.isValid = true;
+        }
+        if (v24::is_scheme_migration(old_version, target)
+            && ov.opkey_held_by_other(ctx, next.pubKeyOperator, p.proTxHash))
+            return refuse("bad-protx-dup-key (the legacy-to-basic migration re-keys onto a held key)");
+        *cur = std::move(next);
+        write_leaf_v24(folded, p.proTxHash, *cur);
+        return {MnFoldOutcome::Applied, {}};
+    }
+
+    case vendor::CProUpRegTx::SPECIALTX_TYPE: {
+        vendor::CProUpRegTx p;
+        if (!vendor::parse_protx_payload(tx.extra_payload, p)) return refuse("bad-protx-payload");
+        if (base_entry(base, p.proTxHash) == nullptr) return refuse("bad-protx-hash (not in the pre-block list)");
+        MNState* cur = touch_v24(folded, ctx, ov, p.proTxHash, "bad-protx-hash", why);
+        if (cur == nullptr) return refuse(why);
+        const auto incoming = vendor::opkey_to_basic(p.pubKeyOperator, p.nVersion < vendor::ProTxVersion::BASIC_BLS);
+        const bool operator_changed = cur->pubKeyOperator != incoming;
+        const uint16_t target = std::max<uint16_t>(cur->nVersion, p.nVersion);
+        if ((operator_changed || v24::is_scheme_migration(cur->nVersion, target))
+            && ov.opkey_held_by_other(ctx, incoming, p.proTxHash))
+            return refuse("bad-protx-dup-key (pubKeyOperator held by another MN under either scheme)");
+        MNState next = *cur;
+        const auto t = v24::apply_proupreg(next, p, next.nType, operator_changed, incoming, rules);
+        if (t.error) return refuse(*t.error);
+        if (t.ban) ban_v24(next, ctx.height);
+        *cur = std::move(next);
+        if (operator_changed) ov.key_changed.insert(p.proTxHash);
+        write_leaf_v24(folded, p.proTxHash, *cur);
+        return {MnFoldOutcome::Applied, {}};
+    }
+
+    case vendor::CProUpRevTx::SPECIALTX_TYPE: {
+        vendor::CProUpRevTx p;
+        if (!vendor::parse_protx_payload(tx.extra_payload, p)) return refuse("bad-protx-payload");
+        const vendor::CSimplifiedMNListEntry* be = base_entry(base, p.proTxHash);
+        if (be == nullptr) return refuse("bad-protx-hash (not in the pre-block list)");
+        MNState* cur = touch_v24(folded, ctx, ov, p.proTxHash, "bad-protx-hash", why);
+        if (cur == nullptr) return refuse(why);
+        if (auto w = operator_sig_refusal(ctx, *be, tx.extra_payload, p)) return refuse(*w);
+        MNState next = *cur;
+        const auto t = v24::apply_prouprev(next, p, next.nType, rules);
+        if (t.error) return refuse(*t.error);
+        ban_v24(next, ctx.height);
+        *cur = std::move(next);
+        ov.key_changed.insert(p.proTxHash);   // a revocation resets the operator key
+        write_leaf_v24(folded, p.proTxHash, *cur);
+        return {MnFoldOutcome::Applied, {}};
+    }
+
+    case vendor::CProDisTx::SPECIALTX_TYPE: {
+        // No list action in ApplyTxToList: the masternode leaves in the
+        // collateral-spend pass (FinishListForBlock), like any spent
+        // collateral. The Core check proved it exists before the block and
+        // that this tx spends its collateral.
+        vendor::CProDisTx p;
+        if (!vendor::parse_protx_payload(tx.extra_payload, p)) return refuse("bad-protx-payload");
+        const MNState* st = ov.state_of(ctx, p.proTxHash);
+        if (st == nullptr) return refuse("bad-prodis-hash (not in the list as built so far)");
+        if (!st->v24.IsShared()) return refuse("bad-prodis-not-shared");
+        if (tx.vin.size() != 1 || tx.vin[0].prevout.hash != st->collateralOutpoint.hash
+            || tx.vin[0].prevout.index != st->collateralOutpoint.index)
+            return refuse("bad-prodis-input");
+        if (find_entry(list, p.proTxHash) == nullptr)
+            return refuse("bad-prodis-hash (" + p.proTxHash.GetHex().substr(0, 16) + " is not in the projected SML)");
+        return {MnFoldOutcome::Applied, {}};
+    }
+
+    case vendor::CProUpShareTx::SPECIALTX_TYPE: {
+        vendor::CProUpShareTx p;
+        if (!vendor::parse_protx_payload(tx.extra_payload, p)) return refuse("bad-protx-payload");
+        MNState* cur = touch_v24(folded, ctx, ov, p.proTxHash, "bad-protx-hash", why);
+        if (cur == nullptr) return refuse(why);
+        MNState next = *cur;
+        const auto t = v24::apply_proupshare(next, p);
+        if (t.error) return refuse(*t.error);
+        *cur = std::move(next);
+        write_leaf_v24(folded, p.proTxHash, *cur);   // the share table is not hashed: the leaf is unchanged
+        return {MnFoldOutcome::Applied, {}};
+    }
+
+    case vendor::CProUpSharedRegTx::SPECIALTX_TYPE: {
+        vendor::CProUpSharedRegTx p;
+        if (!vendor::parse_protx_payload(tx.extra_payload, p)) return refuse("bad-protx-payload");
+        MNState* cur = touch_v24(folded, ctx, ov, p.proTxHash, "bad-protx-hash", why);
+        if (cur == nullptr) return refuse(why);
+        const auto incoming = vendor::opkey_to_basic(p.pubKeyOperator, /*legacy=*/false);
+        const bool operator_changed = cur->pubKeyOperator != incoming;
+        MNState next = *cur;
+        const auto t = v24::apply_proupsharedreg(next, p, next.nType, operator_changed, incoming, rules);
+        if (t.error) return refuse(*t.error);
+        if (operator_changed && ov.opkey_held_by_other(ctx, incoming, p.proTxHash))
+            return refuse("bad-protx-dup-key (pubKeyOperator held by another MN under either scheme)");
+        if (t.ban) ban_v24(next, ctx.height);
+        *cur = std::move(next);
+        if (operator_changed) ov.key_changed.insert(p.proTxHash);
+        write_leaf_v24(folded, p.proTxHash, *cur);
         return {MnFoldOutcome::Applied, {}};
     }
 
@@ -782,7 +1323,8 @@ inline FoldVerdict fold_one_with_ctx(vendor::CSimplifiedMNList& folded,
 /// `ctx`, then remove every MN whose collateral a non-refused body tx spends
 /// (dashd's second RebuildListFromBlock loop). Refused txs never mutate the
 /// list and their inputs are not counted as spends — the caller drops them,
-/// so the served body never carries them.
+/// so the served body never carries them. With `ctx.v24_rules` the v24 fold
+/// above runs instead, for types 1-4 and 10-12.
 template <typename TxRange, typename TxidFn>
 inline SmlSpecialFold fold_mn_special_txs(const vendor::CSimplifiedMNList& base,
                                           const TxRange& body_txs,
@@ -791,6 +1333,35 @@ inline SmlSpecialFold fold_mn_special_txs(const vendor::CSimplifiedMNList& base,
 {
     SmlSpecialFold out;
     out.sml = base;                         // COPY — never the follower's list
+    if (ctx.v24_rules) {
+        detail::MnFoldOverlayV24 ov;
+        std::vector<bool> refused;
+        for (const auto& tx : body_txs) {
+            const auto v = detail::fold_one_v24(out.sml, base, tx, ctx, ov, out);
+            refused.push_back(v.outcome == MnFoldOutcome::Refused);
+            if (v.outcome == MnFoldOutcome::Applied) {
+                ++out.applied;
+            } else if (v.outcome == MnFoldOutcome::Refused) {
+                ++out.refused;
+                out.refused_ids.push_back(txid_of(tx));
+                out.refused_reasons.push_back(v.reason);
+            }
+        }
+        // FinishListForBlock's collateral loop, after every tx was applied.
+        size_t i = 0;
+        for (const auto& tx : body_txs) {
+            if (!refused[i++]) {
+                for (const auto& in : tx.vin) {
+                    if (auto mn = ov.collateral_owner(ctx, in.prevout)) {
+                        ov.remove_mn(out.sml.mnList, *mn);
+                        ++out.collateral_removed;
+                    }
+                }
+            }
+        }
+        out.sml.sort();                     // dashd memcmp(proRegTxHash) order
+        return out;
+    }
     detail::MnFoldOverlay ov;
     std::vector<bool> refused;
     for (const auto& tx : body_txs) {

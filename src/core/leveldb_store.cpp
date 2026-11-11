@@ -4,6 +4,7 @@
 #include <leveldb/write_batch.h>
 #include <leveldb/filter_policy.h>
 #include <leveldb/cache.h>
+#include <core/leveldb_pread_env.hpp>
 #include <cstring>
 #include <filesystem>
 #include <mutex>
@@ -67,6 +68,12 @@ LevelDBStore::LevelDBStore(const std::string& db_path, const LevelDBOptions& opt
 {
 }
 
+struct LevelDBStore::SnapshotRegistry {
+    std::mutex mu;
+    leveldb::DB* db = nullptr;   // null once the store closed
+    std::set<const leveldb::Snapshot*> live;
+};
+
 LevelDBStore::~LevelDBStore()
 {
     close();
@@ -104,6 +111,10 @@ bool LevelDBStore::open()
         db_options.paranoid_checks = m_options.paranoid_checks;
         db_options.write_buffer_size = m_options.write_buffer_size;
         db_options.max_open_files = m_options.max_open_files;
+        db_options.max_file_size = m_options.max_file_size;
+        if (!m_options.mmap_reads)
+            if (leveldb::Env* env = leveldb_pread_env())
+                db_options.env = env;
         db_options.block_size = m_options.block_size;
         db_options.compression = m_options.use_compression ? leveldb::kSnappyCompression : leveldb::kNoCompression;
 
@@ -158,6 +169,8 @@ bool LevelDBStore::open()
         }
 
         m_db.reset(db_ptr);
+        m_snapshots = std::make_shared<SnapshotRegistry>();
+        m_snapshots->db = db_ptr;
         LOG_INFO << "LevelDB store opened successfully at: " << m_db_path;
         return true;
 
@@ -184,6 +197,16 @@ bool LevelDBStore::open_waiting(int attempts, std::chrono::milliseconds wait)
 
 void LevelDBStore::close()
 {
+    if (m_snapshots) {
+        // Snapshots still held are released here, while the DB exists; their
+        // copies then release nothing.
+        std::lock_guard<std::mutex> lock(m_snapshots->mu);
+        for (const leveldb::Snapshot* s : m_snapshots->live)
+            m_snapshots->db->ReleaseSnapshot(s);
+        m_snapshots->live.clear();
+        m_snapshots->db = nullptr;
+    }
+    m_snapshots.reset();
     if (m_db) {
         LOG_INFO << "Closing LevelDB store at: " << m_db_path;
         m_db.reset();
@@ -365,6 +388,62 @@ bool LevelDBStore::for_each_prefix(const std::string& prefix,
         return false;
     }
 
+    return true;
+}
+
+LevelDBStore::Snapshot LevelDBStore::snapshot()
+{
+    if (!m_db || !m_snapshots)
+        return nullptr;
+    std::shared_ptr<SnapshotRegistry> reg = m_snapshots;
+    std::lock_guard<std::mutex> lock(reg->mu);
+    const leveldb::Snapshot* snap = reg->db->GetSnapshot();
+    reg->live.insert(snap);
+    return Snapshot(snap, [reg](const leveldb::Snapshot* s) {
+        std::lock_guard<std::mutex> l(reg->mu);
+        if (reg->db && reg->live.erase(s) != 0)
+            reg->db->ReleaseSnapshot(s);
+    });
+}
+
+bool LevelDBStore::for_each_prefix_at(const Snapshot& at, const std::string& prefix,
+                                      const std::function<bool(std::string_view key,
+                                                               std::string_view value)>& fn)
+{
+    if (!m_db) {
+        LOG_ERROR << "LevelDB store not open";
+        return false;
+    }
+    if (at) {
+        // A snapshot of an earlier open was released by its close().
+        std::lock_guard<std::mutex> lock(m_snapshots->mu);
+        if (m_snapshots->live.count(at.get()) == 0) {
+            LOG_ERROR << "LevelDB snapshot is not of this open of " << m_db_path;
+            return false;
+        }
+    }
+    leveldb::ReadOptions ro;
+    ro.snapshot = at.get();
+    ro.fill_cache = false;
+    std::unique_ptr<leveldb::Iterator> it(m_db->NewIterator(ro));
+    if (prefix.empty())
+        it->SeekToFirst();
+    else
+        it->Seek(prefix);
+    for (; it->Valid(); it->Next()) {
+        const leveldb::Slice key = it->key();
+        if (!prefix.empty() &&
+            (key.size() < prefix.size() ||
+             std::memcmp(key.data(), prefix.data(), prefix.size()) != 0))
+            break;
+        const leveldb::Slice val = it->value();
+        if (!fn(std::string_view(key.data(), key.size()), std::string_view(val.data(), val.size())))
+            return true;   // caller-requested early stop is not an error
+    }
+    if (!it->status().ok()) {
+        LOG_ERROR << "Error scanning prefix: " << it->status().ToString();
+        return false;
+    }
     return true;
 }
 

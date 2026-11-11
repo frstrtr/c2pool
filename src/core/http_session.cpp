@@ -19,7 +19,10 @@
 #include "config_endpoint.hpp"   // #157 Slice B: check_control_token() on the submit route
 #include "filesystem.hpp"
 #include "p2p_message_stats.hpp"
+#include "inject_ledger_obs.hpp"   // S4: /api/tx-inject/ledger
 
+#include <algorithm>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -176,6 +179,74 @@ static nlohmann::json build_tx_inject_status_json()
     return out;
 }
 
+// ── /api/tx-inject/ledger — read-only per-inject ledger (S4) ────────────
+//
+// Serialises core::obs::inject_ledger() (one entry per inject the DASH inject
+// pool tracks: submit time, expiry_height, size, flags, and the last template
+// build's RIDES / HELD verdict) with the pool counts from inject_status() and
+// the best ChainLock the node adopted (core::obs::best_chainlock()). Pure
+// reader: the ledger is copied out under its own mutex, no node lock is taken
+// and no node call is made.
+//
+// A build that has the route always answers 200 (a wallet feature-detects the
+// ledger by a 404): "wired": false with an empty entries array while the lane
+// has never published. "bestchainlock" is null until an adoption is
+// published; its blockhash is null when the adoption did not name one.
+static nlohmann::json build_tx_inject_ledger_json()
+{
+    const auto& s   = obs::inject_status();
+    const auto& led = obs::inject_ledger();
+    const auto updated = led.updated_at();
+
+    nlohmann::json out;
+    out["wired"]      = (updated != 0);
+    out["enabled"]    = s.enabled.load(std::memory_order_relaxed);
+    out["updated_at"] = updated;
+    out["tip_height"] = led.tip();
+    out["pool"] = {
+        {"entries",         s.pool_entries.load(std::memory_order_relaxed)},
+        {"bytes",           s.pool_bytes.load(std::memory_order_relaxed)},
+        {"max_entries",     s.max_entries.load(std::memory_order_relaxed)},
+        {"max_total_bytes", s.max_total_bytes.load(std::memory_order_relaxed)}
+    };
+    nlohmann::json entries = nlohmann::json::array();
+    for (const auto& e : led.snapshot()) {
+        nlohmann::json j;
+        j["txid"]          = e.txid.GetHex();
+        j["submit_time"]   = e.submit_time;
+        j["expiry_height"] = e.expiry_height;
+        j["byte_size"]     = e.byte_size;
+        j["flags"]         = e.flags;
+        j["in_mempool"]    = e.in_mempool;
+        if (e.last_build) {
+            j["last_build"] = {
+                {"height",  e.last_build->height},
+                {"verdict", e.last_build->rides ? "RIDES" : "HELD"},
+                {"cause",   e.last_build->cause},
+                {"vin",     e.last_build->vin},
+                {"fee",     e.last_build->fee}
+            };
+        } else {
+            j["last_build"] = nullptr;
+        }
+        entries.push_back(std::move(j));
+    }
+    out["entries"] = std::move(entries);
+    out["overflow_dropped"] = led.overflow_dropped();
+    if (const auto cl = obs::best_chainlock().snapshot()) {
+        out["bestchainlock"] = {
+            {"height",     cl->height},
+            {"blockhash",  cl->blockhash.IsNull() ? nlohmann::json(nullptr)
+                                                  : nlohmann::json(cl->blockhash.GetHex())},
+            {"provenance", cl->provenance},
+            {"updated_at", cl->updated_at}
+        };
+    } else {
+        out["bestchainlock"] = nullptr;
+    }
+    return out;
+}
+
 
 // ── Security helpers ───────────────────────────────────────────────────
 // URL-decode percent-encoded strings (%20 → space, etc.)
@@ -242,15 +313,55 @@ static bool is_valid_graph_param(const std::string& s)
 }
 
 /// HttpSession Implementation
-HttpSession::HttpSession(tcp::socket socket, std::shared_ptr<MiningInterface> mining_interface)
-    : socket_(std::move(socket))
+HttpSession::HttpSession(tcp::socket socket, std::shared_ptr<MiningInterface> mining_interface,
+                         std::shared_ptr<void> slot, std::chrono::milliseconds idle_timeout,
+                         std::chrono::milliseconds request_timeout)
+    : slot_(std::move(slot))
+    , socket_(std::move(socket))
     , mining_interface_(mining_interface)
+    , deadline_(socket_.get_executor())
+    , idle_timeout_(idle_timeout)
+    , request_timeout_(request_timeout)
 {
 }
 
 void HttpSession::run()
 {
+    parser_.emplace();
+    read_started_ = std::chrono::steady_clock::now();
+    arm_deadline();
     read_request();
+}
+
+void HttpSession::arm_deadline()
+{
+    // The next instant the request read gives up: idle_timeout_ after the
+    // last byte, and no later than request_timeout_ after the accept.
+    using clock = std::chrono::steady_clock;
+    const bool idle = idle_timeout_.count() > 0, whole = request_timeout_.count() > 0;
+    if (!idle && !whole)
+        return;
+    clock::time_point at = idle ? clock::now() + idle_timeout_ : read_started_ + request_timeout_;
+    if (idle && whole)
+        at = std::min(at, read_started_ + request_timeout_);
+    reading_ = true;
+    deadline_.expires_at(at);   // cancels the wait armed before
+    deadline_.async_wait([self = shared_from_this()](beast::error_code ec) {
+        // Cancelled (re-armed, or the request was read); or it expired just
+        // as the deadline moved, or as the request completed.
+        if (ec || !self->reading_ || self->deadline_.expiry() > clock::now())
+            return;
+        // Closing cancels the pending read; its handler ends the session.
+        beast::error_code ignore;
+        self->socket_.shutdown(tcp::socket::shutdown_both, ignore);
+        self->socket_.close(ignore);
+    });
+}
+
+void HttpSession::end_reading()
+{
+    reading_ = false;
+    deadline_.cancel();
 }
 
 bool is_direct_local_request(const boost::asio::ip::address& peer,
@@ -281,18 +392,43 @@ bool HttpSession::is_direct_local() const
 void HttpSession::read_request()
 {
     auto self = shared_from_this();
-    
-    http::async_read(socket_, buffer_, request_,
+
+    // Read what has arrived and parse it, so that every byte received
+    // restarts the idle deadline (http::async_read completes only on the
+    // whole message, and beast's parser takes the head only once complete).
+    socket_.async_read_some(buffer_.prepare(4096),
         [self](beast::error_code ec, std::size_t bytes_transferred)
         {
-            boost::ignore_unused(bytes_transferred);
-            
-            if(ec == http::error::end_of_stream)
+            if (ec) {
+                self->end_reading();
+                if (ec == net::error::eof)
+                    ec = http::error::end_of_stream;
                 return self->handle_error(ec, "read_request");
-                
-            if(ec)
-                return self->handle_error(ec, "read_request");
-                
+            }
+            self->buffer_.commit(bytes_transferred);
+            beast::error_code pec;
+            while (self->buffer_.size() > 0 && !self->parser_->is_done()) {
+                const std::size_t used = self->parser_->put(self->buffer_.data(), pec);
+                self->buffer_.consume(used);
+                if (pec == http::error::need_more) {
+                    pec = {};
+                    break;
+                }
+                if (pec || used == 0)
+                    break;
+            }
+            if (pec) {
+                self->end_reading();
+                return self->handle_error(pec, "read_request");
+            }
+            if (!self->parser_->is_done()) {
+                if (bytes_transferred > 0)
+                    self->arm_deadline();   // bytes arrived: the idle window restarts
+                return self->read_request();
+            }
+            self->end_reading();
+            self->request_ = self->parser_->release();
+            self->parser_.reset();
             self->process_request();
         });
 }
@@ -465,7 +601,19 @@ void HttpSession::process_request()
                         "data: {\"connected\":true}\n\n";
                     auto buf = std::make_shared<std::string>(sse_headers);
                     auto self = shared_from_this();
-                    auto sock_ptr = std::make_shared<tcp::socket>(std::move(socket_));
+                    // The stream is long-lived: no read deadline follows it
+                    // (end_reading() ran when the request was read), and it
+                    // keeps this session's place under the HTTP cap until the
+                    // stream's socket is dropped (declared first: released
+                    // after the socket closes).
+                    struct StreamSocket {
+                        std::shared_ptr<void> slot;
+                        tcp::socket sock;
+                        StreamSocket(std::shared_ptr<void> s, tcp::socket&& k)
+                            : slot(std::move(s)), sock(std::move(k)) {}
+                    };
+                    auto hold = std::make_shared<StreamSocket>(slot_, std::move(socket_));
+                    std::shared_ptr<tcp::socket> sock_ptr(hold, &hold->sock);
                     boost::asio::async_write(*sock_ptr, boost::asio::buffer(*buf),
                         [buf, sock_ptr, mi = mining_interface_](beast::error_code ec, std::size_t) {
                             if (!ec) mi->sse_register(sock_ptr);
@@ -579,6 +727,49 @@ void HttpSession::process_request()
                     return;
                 }
                 rest_result = build_tx_inject_status_json();
+            }
+            else if (target == "/api/utxo/scan") {
+                // c2wallet Scan & Plan (N1): read-only scan of the full UTXO
+                // set for a few scripts. Direct-local only: a loopback peer
+                // with no forwarded header, so a same-host reverse proxy
+                // (whose requests come from 127.0.0.1) never reaches it. The
+                // scan runs on the MiningInterface's scan thread; this thread
+                // waits for it (bounded, rest_utxo_scan).
+                auto answer = [&](int status, const nlohmann::json& j) {
+                    response.result(static_cast<http::status>(status));
+                    response.body() = j.dump();
+                    response.prepare_payload();
+                    send_response(std::move(response));
+                };
+                if (!is_direct_local()) {
+                    answer(403, {{"ok", false}, {"error", "utxo-scan-local-only"}});
+                    return;
+                }
+                if (!mining_interface_->has_utxo_scan_fn()) {
+                    answer(404, {{"ok", false}, {"error", "utxo-scan-not-wired"}});
+                    return;
+                }
+                const auto qp = raw_target.find('?');
+                auto j = mining_interface_->rest_utxo_scan(
+                    qp == std::string::npos ? std::string() : raw_target.substr(qp + 1));
+                int st = j.is_object() ? j.value("http_status", 200) : 200;
+                if (st < 100 || st > 599) st = 200;
+                if (j.is_object()) j.erase("http_status");
+                answer(st, j);
+                return;
+            }
+            else if (target == "/api/tx-inject/ledger") {
+                // Read-only per-inject ledger (S4). Loopback-only, same posture
+                // as /api/tx-inject-status: it names the txids this node is
+                // injecting. SHOWS state only.
+                if (!is_direct_local()) {
+                    response.result(http::status::forbidden);
+                    response.body() = R"({"error":"tx-inject ledger is local-only"})";
+                    response.prepare_payload();
+                    send_response(std::move(response));
+                    return;
+                }
+                rest_result = build_tx_inject_ledger_json();
             }
             else if (target == "/api/config" || target == "/api/config/schema") {
                 if (!is_direct_local()) {
@@ -1315,6 +1506,54 @@ void HttpSession::process_request()
                 send_response(std::move(response));
                 return;
             }
+            // ── c2wallet Scan & Plan (N3): POST /api/tx-inject/validate ──────
+            // The dry run of /api/tx-inject/submit: the same body, the same
+            // direct-local and control-token rules, the same io-thread
+            // dispatch; NodeCoinState::validate_inject answers the submit's
+            // verdict plus per-input maturity and pool conflicts, and changes
+            // nothing (no admission, no rate charge, no fee delta). A dispatch
+            // timeout is a plain 504: a dry run has nothing to take back.
+            if (std::string(request_.target()) == "/api/tx-inject/validate") {
+                auto answer = [&](int status, const std::string& body) {
+                    response.result(static_cast<http::status>(status));
+                    response.body() = body;
+                    response.prepare_payload();
+                    send_response(std::move(response));
+                };
+                if (!is_direct_local()) {
+                    answer(403, R"({"error":"tx-inject API is local-only"})");
+                    return;
+                }
+                if (!mining_interface_->has_tx_inject_validate_fn()) {
+                    answer(503, R"({"ok":false,"error":"tx-inject validate not wired"})");
+                    return;
+                }
+                {
+                    std::string presented;
+                    auto body_j = nlohmann::json::parse(request_.body(), nullptr,
+                                                        /*allow_exceptions=*/false);
+                    if (body_j.is_object() && body_j.contains("control_token") &&
+                        body_j["control_token"].is_string())
+                        presented = body_j["control_token"].get<std::string>();
+                    if (!c2pool::config_endpoint::check_control_token(presented)) {
+                        answer(403, R"({"ok":false,"cause":"missing or invalid control token"})");
+                        return;
+                    }
+                }
+                nlohmann::json j;
+                try {
+                    j = mining_interface_->rest_tx_inject_validate(request_.body());
+                } catch (const std::exception& e) {
+                    LOG_WARNING << "[tx-inject] validate dispatch failed: " << e.what();
+                    answer(504, R"({"ok":false,"timed_out":true,"cause":"validate dispatch timed out"})");
+                    return;
+                }
+                int st = j.is_object() ? j.value("http_status", 200) : 200;
+                if (st < 100 || st > 599) st = 200;
+                if (j.is_object()) j.erase("http_status");
+                answer(st, j.dump());
+                return;
+            }
             // Handle JSON-RPC POST request.
             // Accept both 1.0 and 2.0 — upgrade 1.0 to 2.0 for the library.
             std::string request_body = request_.body();
@@ -1327,6 +1566,12 @@ void HttpSession::process_request()
                 }
             }
 
+            // A merged chain's getblocktemplate is answered to a direct
+            // local client only (MiningInterface::t_direct_local_request).
+            struct DirectLocalScope {
+                explicit DirectLocalScope(bool v) { MiningInterface::t_direct_local_request = v; }
+                ~DirectLocalScope() { MiningInterface::t_direct_local_request = false; }
+            } direct_local_scope(is_direct_local());
             response_body = mining_interface_->HandleRequest(request_body);
         }
         else {

@@ -16,6 +16,20 @@
 //   Call query(start, max_shares, desired_weight) for PPLNS computation.
 //   Call forget(hash) when a share is removed from the chain.
 //   Call clear() when the underlying chain is structurally modified.
+//
+// Threads: query() is a read of the chain, but it fills the skip levels as
+// it walks (m_skips: new nodes, and levels appended to nodes it passed).
+// Callers run it under a SHARED tracker lock, so two threads can be in it at
+// once on one skip list: the merged-mining RPC thread rebuilding a merged
+// block and the IO thread caching the tip payouts, both in
+// ShareTracker::get_merged_payout_weights. Unsynchronized, that is a
+// concurrent unordered_map insert/rehash and deque append, which corrupted
+// the heap (SIGSEGV in deque::emplace_back under query, LTC+DOGE canary
+// 2026-11-06). query(), forget() and clear() therefore hold m_mutex. The
+// result does not depend on the order or the threads the levels were built
+// in: the skip levels only change how far one step jumps, never the sum.
+// The get_delta / previous callbacks run under m_mutex and must not call
+// back into the same skip list.
 
 #pragma once
 
@@ -25,6 +39,7 @@
 #include <deque>
 #include <functional>
 #include <map>
+#include <mutex>
 #include <random>
 #include <unordered_map>
 #include <vector>
@@ -106,8 +121,41 @@ public:
         , m_rng(std::random_device{}())
     {}
 
-    void forget(const uint256& hash) { m_skips.erase(hash); }
-    void clear()                     { m_skips.clear(); }
+    // Movable (the trackers keep skip lists in containers); the mutex is
+    // not moved: a moved-to skip list has its own. Moving one another thread
+    // is querying is a bug of the caller (its owner is being replaced).
+    WeightsSkipList(WeightsSkipList&& other) noexcept
+    {
+        std::lock_guard<std::mutex> lock(other.m_mutex);
+        m_get_delta = std::move(other.m_get_delta);
+        m_previous = std::move(other.m_previous);
+        m_rng = other.m_rng;
+        m_skips = std::move(other.m_skips);
+    }
+    WeightsSkipList& operator=(WeightsSkipList&& other) noexcept
+    {
+        if (this != &other) {
+            std::scoped_lock lock(m_mutex, other.m_mutex);
+            m_get_delta = std::move(other.m_get_delta);
+            m_previous = std::move(other.m_previous);
+            m_rng = other.m_rng;
+            m_skips = std::move(other.m_skips);
+        }
+        return *this;
+    }
+    WeightsSkipList(const WeightsSkipList&) = delete;
+    WeightsSkipList& operator=(const WeightsSkipList&) = delete;
+
+    void forget(const uint256& hash)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_skips.erase(hash);
+    }
+    void clear()
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_skips.clear();
+    }
 
     // ------------------------------------------------------------------
     // query — C++ implementation of the p2pool SkipList.__call__ query
@@ -124,6 +172,9 @@ public:
     {
         if (start.IsNull() || !m_get_delta)
             return {};
+
+        // The whole walk: it reads and extends m_skips throughout.
+        std::lock_guard<std::mutex> lock(m_mutex);
 
         // --- updates dict (skiplist.py:14) ---
         // Pending higher-level pointers to be filled in when a future
@@ -352,6 +403,8 @@ private:
         return {std::move(merged), total, donation};
     }
 
+    // Guards m_skips and m_rng (query, forget, clear): see the header note.
+    std::mutex   m_mutex;
     get_delta_fn m_get_delta;
     previous_fn  m_previous;
     std::mt19937 m_rng;

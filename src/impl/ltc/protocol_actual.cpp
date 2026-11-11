@@ -104,6 +104,7 @@ void Actual::HANDLER(getaddrs)
 void Actual::HANDLER(shares)
 {
     ltc::HandleSharesData result;
+    std::string misfit;   // a share whose type number does not fit its timestamp
 
     for (auto wrappedshare : msg->m_shares)
     {
@@ -122,6 +123,8 @@ void Actual::HANDLER(shares)
                         << ") from " << peer->addr().to_string() << ": " << e.what();
             continue;
         }
+        if (drop_misfit_share(share, misfit))
+            continue;
 
         std::vector<coin::MutableTransaction> txs;
         share.ACTION
@@ -145,6 +148,7 @@ void Actual::HANDLER(shares)
     }
 
     processing_shares(result, peer->addr());
+    drop_misfit_sender(peer, misfit);
 }
 
 void Actual::HANDLER(sharereq)
@@ -184,6 +188,7 @@ void Actual::HANDLER(sharereply)
     // swallow discarded the whole reply with no free anywhere. A slow peer
     // therefore leaked every byte it eventually sent.
     ltc::ShareReplyData result;
+    std::string misfit;   // a share whose type number does not fit its timestamp
     if (msg->m_result == ShareReplyResult::good)
     {
         auto& owned = result.owned();
@@ -194,6 +199,8 @@ void Actual::HANDLER(sharereply)
             try
             {
                 auto share = ltc::load_share(rshare, peer->addr());
+                if (drop_misfit_share(share, misfit))
+                    continue;
                 owned.m_items.push_back(share);
                 owned.m_raw_items.push_back(rshare);
             }
@@ -206,6 +213,7 @@ void Actual::HANDLER(sharereply)
         }
     }
     got_share_reply(msg->m_id, result);
+    drop_misfit_sender(peer, misfit);
 }
 
 void Actual::HANDLER(bestblock)

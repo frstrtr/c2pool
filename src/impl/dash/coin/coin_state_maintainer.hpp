@@ -50,6 +50,7 @@
 #include <core/uint256.hpp>
 #include <core/pack.hpp>
 #include <core/log.hpp>
+#include <core/inject_ledger_obs.hpp>          // core::obs::best_chainlock (read-only mirror)
 
 #include <algorithm>
 #include <array>
@@ -817,9 +818,11 @@ public:
                         // NOT regress our best. A stale/replayed diff carrying an
                         // older bestCL must not roll the committed bestCL* back
                         // (that would desync the next template's CCbTx from dashd).
-                        if (best_h > 0 && best_h >= m_state.best_cl_height())
+                        if (best_h > 0 && best_h >= m_state.best_cl_height()) {
                             m_state.set_best_cl(best_h, observed.bestCLSignature,
                                                 ClProvenance::ChainCommitted);
+                            publish_chain_committed_chainlock(best_h);
+                        }
                     }
                     // Record what THIS block's coinbase committed, keyed by its
                     // own on-wire nHeight. Distinct from the "best" above: this
@@ -965,6 +968,9 @@ public:
         // commit a ChainLock NEWER than the one block H-1 committed — that is
         // the case dashcore makes us prove with BLS (specialtxman.cpp:74-88).
         m_state.set_best_cl(height, sig, ClProvenance::BlsVerified);
+        // S4 read-only mirror (/api/tx-inject/ledger, getblockchaininfo).
+        ::core::obs::best_chainlock().publish(
+            {height, block_hash, "bls-verified", static_cast<int64_t>(std::time(nullptr))});
         LOG_INFO << "[CL] adopted VERIFIED ChainLock height=" << height
                  << " block=" << block_hash.GetHex().substr(0, 16) << "...";
         // A fresher bestCL* changes the next template's committed CCbTx —
@@ -2106,9 +2112,24 @@ private:
                                        observed.has_best_cl_signature(),
                                        committed_cl_h);
         if (observed.has_best_cl_signature() && committed_cl_h > 0
-            && committed_cl_h >= m_state.best_cl_height())
+            && committed_cl_h >= m_state.best_cl_height()) {
             m_state.set_best_cl(committed_cl_h, observed.bestCLSignature,
                                 ClProvenance::ChainCommitted);
+            publish_chain_committed_chainlock(committed_cl_h);
+        }
+    }
+
+    /// S4 read-only mirror of a chain-committed ChainLock adoption: the cbTx
+    /// carries only the height, so the block hash comes from the current
+    /// chain's height index when one is wired (null = unknown, never guessed).
+    void publish_chain_committed_chainlock(int32_t height) {
+        ::core::obs::BestChainLock cl;
+        cl.height = height;
+        if (m_chain_hash_at_height_fn && height > 0)
+            if (auto h = m_chain_hash_at_height_fn(static_cast<uint32_t>(height))) cl.blockhash = *h;
+        cl.provenance = "chain-committed";
+        cl.updated_at = static_cast<int64_t>(std::time(nullptr));
+        ::core::obs::best_chainlock().publish(cl);
     }
 
     void advance_credit_pool_on_block(const dash::coin::BlockType& block,

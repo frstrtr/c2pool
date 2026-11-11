@@ -11,6 +11,7 @@
 #include <core/uint256.hpp>
 #include <core/common.hpp>
 #include <core/random.hpp>
+#include <core/reloaded_block_flag.hpp>   // core::restore_block_flag (a reloaded share keeps its block flag)
 #include <core/version_gate.hpp>   // core::version_gate::V36_ACTIVATION_VERSION (ratchet v36 guard)
 
 #include <boost/asio/post.hpp>
@@ -512,10 +513,20 @@ void NodeImpl::load_persisted_shares()
             }
             m_tracker.add(share);
             ++loaded;
-            // Restore the cached X11 pow_hash (attempt_verify recomputes and
-            // re-caches when missing).
-            if (auto* idx = m_tracker.chain.get_index(hash); idx && !meta.pow_hash.IsNull())
-                idx->pow_hash = meta.pow_hash;
+            if (auto* idx = m_tracker.chain.get_index(hash)) {
+                // The X11 pow_hash: cached in the store, else the share hash
+                // itself (on DASH the share hash IS X11 of the block header,
+                // share_check.hpp; attempt_verify caches the same value).
+                idx->pow_hash = meta.pow_hash.IsNull() ? hash : meta.pow_hash;
+                // A share reloaded as verified is not verified again: its
+                // block flag from its PoW hash and header bits, with no
+                // found-block event (the block was recorded when the share
+                // was first verified; the found-block store survives).
+                if (meta.is_verified)
+                    m_tracker.chain.get_share(hash).invoke([&](auto* obj) {
+                        core::restore_block_flag(*idx, *obj, idx->pow_hash);
+                    });
+            }
             if (meta.is_verified)
                 verified_hashes.push_back(hash);
         } catch (const std::exception& e) {

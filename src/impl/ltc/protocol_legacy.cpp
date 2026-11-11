@@ -112,6 +112,7 @@ void Legacy::HANDLER(shares)
 {
     try {
         ltc::HandleSharesData result; //share, txs
+        std::string misfit;   // a share whose type number does not fit its timestamp
 
         for (auto wrappedshare : msg->m_shares)
         {
@@ -126,6 +127,8 @@ void Legacy::HANDLER(shares)
                             << ") from " << peer->addr().to_string() << ": " << e.what();
                 continue;
             }
+            if (drop_misfit_share(share, misfit))
+                continue;
 
             std::vector<coin::MutableTransaction> txs;
             share.ACTION
@@ -149,6 +152,7 @@ void Legacy::HANDLER(shares)
         }
 
         processing_shares(result, peer->addr());
+        drop_misfit_sender(peer, misfit);
     } catch (const std::exception& e) {
         LOG_ERROR << "[Pool] shares handler exception: " << e.what();
     }
@@ -223,6 +227,7 @@ void Legacy::HANDLER(sharereply)
     // swallow discarded the whole reply with no free anywhere. A slow peer
     // therefore leaked every byte it eventually sent.
     ltc::ShareReplyData result;
+    std::string misfit;   // a share whose type number does not fit its timestamp
     if (msg->m_result == ShareReplyResult::good)
     {
         auto& owned = result.owned();
@@ -233,6 +238,8 @@ void Legacy::HANDLER(sharereply)
             try
             {
                 auto share = ltc::load_share(rshare, peer->addr());
+                if (drop_misfit_share(share, misfit))
+                    continue;
                 owned.m_items.push_back(share);
                 owned.m_raw_items.push_back(rshare);
             }
@@ -246,6 +253,7 @@ void Legacy::HANDLER(sharereply)
     }
     // Resolve the async request that originally sent the sharereq
     got_share_reply(msg->m_id, result);
+    drop_misfit_sender(peer, misfit);
 }
 
 void Legacy::HANDLER(bestblock)

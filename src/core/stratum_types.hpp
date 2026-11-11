@@ -91,6 +91,14 @@ struct StratumConfig {
     // Default false: every other coin negotiates version-rolling as before.
     bool disable_version_rolling{false};
 
+    // ── Pool side of the BIP310 version-rolling mask ──────────────────────────
+    // The negotiated mask is this AND the miner's. The BIP320 default
+    // 0x1fffe000 (bits 13..28) suits coins whose versionbits deployments sit
+    // below bit 13. Dash Core v24 deploys on bits 13 (v24) and 14 (evo_shares),
+    // so the DASH lane narrows it to keep those two under the template's
+    // control. Default: every other coin byte-identical.
+    uint32_t version_rolling_pool_mask{0x1fffe000};
+
     // ── Live-session hygiene (production ZOMBIE-SESSION LEAK fix) ──────────
     // A NAT-dropped miner's TCP connection is frequently never FIN/RST'd, so
     // StratumSession::is_connected() (socket_.is_open()) stays true FOREVER and
@@ -134,6 +142,13 @@ struct StratumConfig {
     //     work-generation-gated).
     uint32_t keepalive_notify_sec       = 0;
 
+    // A held job (CoinbaseResult::held: the sharechain was busy, no coinbase
+    // its shares could verify) is retried every 500 ms, one pending retry per
+    // session, for at most this many seconds since the hold began; past it the
+    // session stops retrying (the miner keeps its last job) until the next
+    // notify. Never the global coinbase.
+    uint32_t job_hold_limit_sec         = 20;
+
     // ── Payout-address acceptance for the running coin (issue #961) ──────────
     // The Base58Check version bytes and bech32 HRPs (BARE, no trailing '1') this
     // coin accepts as its OWN payout addresses on the ACTIVE network. Populated
@@ -150,6 +165,18 @@ struct StratumConfig {
     std::vector<uint8_t>     payout_p2pkh_versions;
     std::vector<uint8_t>     payout_p2sh_versions;
     std::vector<std::string> payout_bech32_hrps;   // BARE HRPs, no trailing '1'
+    // The parent coin's P2PKH/P2SH versions on EVERY network: never claimed
+    // by a merged chain when a login address is identified
+    // (core/merged_chain_addr.hpp).
+    std::vector<uint8_t>     merged_parent_versions;
+    // Merged chains are configured (--merged / embedded DOGE): logins wait
+    // until the merged-mining manager is attached (IWorkSource::merged_ready).
+    bool merged_chains_expected{false};
+    // A login without a payout address a share can carry (empty, invalid,
+    // another coin's) is accepted and its shares redistributed by the work
+    // source (decide_job_payout), as p2pool does. Off: such logins are
+    // refused (#961) — for work sources that do not redistribute.
+    bool redistribute_unusable_logins{false};
 };
 
 /// Frozen share-construction fields returned by ref_hash_fn. These
@@ -204,6 +231,10 @@ struct JobSnapshot {
     std::string block_nbits;      // original GBT block bits (for block target check)
     RefHashResult frozen_ref;     // frozen share fields from template time
     int stale_info{0};            // 0=none, 253=orphan (stale block template)
+    // The payout the job committed to (IWorkSource::decide_job_payout); the
+    // merged scripts it committed to are the map passed with the snapshot.
+    bool has_payout{false};
+    std::vector<unsigned char> payout_script;
 };
 
 /// Atomic snapshot of work-related fields under the work source's mutex.
@@ -246,6 +277,11 @@ struct CoinbaseResult {
     std::string coinb1;
     std::string coinb2;
     WorkSnapshot snapshot;
+    // No coinbase now: the work source could not build one its shares can
+    // verify (the sharechain was busy). The session holds the job (the
+    // miner keeps its last one) and retries; it never falls back to the
+    // global coinbase.
+    bool held{false};
 };
 
 /// Rolling record of one stratum connection's submit outcomes, for the
@@ -374,6 +410,9 @@ struct WorkerInfo {
     // session that records them (set at authorize). Null when the entry did
     // not come from a core stratum session.
     std::shared_ptr<SubmitOutcomeWindow> submit_window;
+    // Set when the login's payout is not its own address
+    // (e.g. "address invalid → redistributed").
+    std::string payout_warning;
 };
 
 }  // namespace core::stratum

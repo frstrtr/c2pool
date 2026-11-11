@@ -42,6 +42,7 @@
 #include <impl/bip110/pool/sharechain_window_report.hpp> // /sharechain/window explorer + V36? column (read-only)
 #include <impl/bip110/pool/share_detail_report.hpp>   // /web/share rich detail (DASH parity, read-only)
 
+#include <core/view_block_hashes.hpp>   // core::found_block_hashes_in (block_hashes of a view)
 #include <core/coin/utxo_view_db.hpp>              // M3 own-UTXO view (T2 pricing)
 #include <core/coin/utxo_view_cache.hpp>
 #include <core/pack.hpp>
@@ -2322,9 +2323,15 @@ int run_embedded(bool coin_p2p_discover,
                 for (auto& [hh, _] : chain.get_heads())
                     heads_arr.push_back(hh.GetHex().substr(0, 16));
                 nlohmann::json blocks_arr = nlohmann::json::array();
+                std::vector<std::string> found_full;
                 if (mi) for (const auto& fb : mi->get_found_blocks())
-                    if (!fb.share_hash.empty())
+                    if (!fb.share_hash.empty()) {
                         blocks_arr.push_back(fb.share_hash.substr(0, 16));
+                        found_full.push_back(fb.share_hash);
+                    }
+                // Full hashes of the found blocks among this delta's new shares
+                // (matched on H); omitted when there are none.
+                nlohmann::json block_hashes_arr = core::found_block_hashes_in(shares_arr, found_full);
 
                 nlohmann::json result;
                 result["shares"] = std::move(shares_arr);
@@ -2332,6 +2339,8 @@ int run_embedded(bool coin_p2p_discover,
                 result["tip"]    = best.IsNull() ? "" : best.GetHex().substr(0, 16);
                 result["heads"]  = std::move(heads_arr);
                 result["blocks"] = std::move(blocks_arr);
+                if (!block_hashes_arr.empty())
+                    result["block_hashes"] = std::move(block_hashes_arr);
                 return result;
             });
 

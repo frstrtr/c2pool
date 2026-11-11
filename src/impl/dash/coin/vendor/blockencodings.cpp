@@ -15,6 +15,7 @@
 //      (MempoolShortIdProvider).
 
 #include <impl/dash/coin/vendor/blockencodings.hpp>
+#include <impl/dash/coin/dash_txid.hpp>
 
 #include <core/hash.hpp>
 #include <core/log.hpp>
@@ -48,9 +49,10 @@ CBlockHeaderAndShortTxIDs::CBlockHeaderAndShortTxIDs(const CBlock& block) :
     prefilledtxn[0] = {0, MakeTransactionRef(block.m_txs[0])};
     for (size_t i = 1; i < block.m_txs.size(); i++) {
         const auto& tx = block.m_txs[i];
-        auto packed = pack(tx);
-        uint256 txhash = ::Hash(packed.get_span());
-        shorttxids[i - 1] = GetShortID(txhash);
+        // Dash Core v24 blockencodings.cpp: short IDs are over the INSTANCE
+        // hash (GetInstanceHash), so a re-signed version-2 asset unlock that
+        // shares its txid with the mempool copy is not mistaken for it.
+        shorttxids[i - 1] = GetShortID(::dash::coin::dash_instance_hash(tx));
     }
 }
 
@@ -153,13 +155,13 @@ ReadStatus PartiallyDownloadedBlock::InitData(const CBlockHeaderAndShortTxIDs& c
                 extra_count++;
             } else {
                 if (txn_available[idit->second] &&
-                    // Compare hashes of the existing slot vs the candidate; extra_txn
-                    // duplicates that already matched via the mempool path are
-                    // harmless.
-                    [&] {
-                        auto packed = pack(*txn_available[idit->second]);
-                        return ::Hash(packed.get_span()) != extra_txn[i].first;
-                    }())
+                    // Dash Core: txn_available[...]->GetHash() !=
+                    // extra_txn[i].second->GetHash() -- the txids of the two
+                    // txs (the key, extra_txn[i].first, is the instance hash).
+                    // extra_txn duplicates that already matched via the
+                    // mempool path are harmless.
+                    ::dash::coin::dash_txid(*txn_available[idit->second])
+                        != ::dash::coin::dash_txid(*extra_txn[i].second))
                 {
                     txn_available[idit->second].reset();
                     mempool_count--;

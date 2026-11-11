@@ -6,6 +6,7 @@
 #include <gtest/gtest.h>
 
 #include <impl/dash/messages.hpp>
+#include <impl/dash/coin/dash_txid.hpp>     // RememberTxCarriesZeroInputSpecialTxs
 #include <impl/dash/coin/bestblock_diag.hpp>  // #1046 bestblock out=0 classifier
 #include <impl/dash/config_pool.hpp>   // SharechainConfig net-aware prefix selectors
 #include <btclibs/util/strencodings.h> // ParseHexBytes (prefix isolation primitive)
@@ -289,4 +290,58 @@ TEST(DashConnectModePrefix, WirePrefix_NetAware_MainnetVsTestnet) {
     EXPECT_NE(main_bytes, test_bytes);
 
     SharechainConfig::is_testnet = saved;
+}
+
+// A block of a share may carry a Dash Core MNHF signal (type 7) or a quorum
+// commitment (type 6): special txs with no inputs (and, for both, no
+// outputs). The sharechain relays a share's txs in remember_tx with the Dash
+// codec (coin::MutableTransaction): the 32-bit version|type word, vin, vout,
+// lock time, then the payload; no segwit marker is ever read, so an empty vin
+// is never mistaken for one. Both round-trip byte-exactly, with the same
+// txid, next to an ordinary tx, on the Actual and the Legacy (v16 fleet)
+// handlers alike (one message codec).
+TEST(DashPoolNodeMessages, RememberTxCarriesZeroInputSpecialTxs) {
+    // The real testnet MNHF signal mined at 1,565,132 (v24, bit 13).
+    const char* kMnhf =
+        "0300070000000000000082010dfab03beecae3ec79691a966f8a37a836dab21a409f1ee39bfe98a26f03000000a3520c90ae1a"
+        "3aa2b750be245cb9eaa1c4be78f0ee43f46b56a0d319cae9e76a87c5ce23d93e24b7484b93288bdbc7e70610d04c7d9ba4f30dc3"
+        "b71b58baf6436752ffbace4c79da3e4d6de87646610a8cff9001b51d768c4b6d8a4ddda6f01c";
+    const std::vector<unsigned char> raw = ParseHex(kMnhf);
+    coin::MutableTransaction mnhf;
+    {
+        ::PackStream ps(raw);
+        ps >> mnhf;
+    }
+    EXPECT_EQ(mnhf.type, 7);
+    EXPECT_TRUE(mnhf.vin.empty());
+    EXPECT_TRUE(mnhf.vout.empty());
+    EXPECT_FALSE(mnhf.extra_payload.empty());
+    {
+        ::PackStream back;
+        back << mnhf;
+        EXPECT_EQ(bytes_of(back), raw) << "byte-exact re-serialization";
+    }
+    // A quorum-commitment-shaped tx: version 3, type 6, no inputs/outputs.
+    coin::MutableTransaction qc;
+    qc.version = 3;
+    qc.type = 6;
+    qc.extra_payload = std::vector<unsigned char>(40, 0x5c);
+    // An ordinary tx after them must stay aligned.
+    const auto plain = make_inject_tx();
+
+    const std::vector<coin::MutableTransaction> txs{mnhf, qc, plain};
+    std::vector<uint256> hashes;
+    for (const auto& t : txs) hashes.push_back(coin::dash_txid(t));
+    auto rmsg = message_remember_tx::make_raw(std::vector<uint256>{}, txs);
+    auto parsed = message_remember_tx::make(rmsg->m_data);
+    ASSERT_EQ(parsed->m_txs.size(), 3u);
+    for (size_t i = 0; i < txs.size(); ++i) {
+        EXPECT_EQ(coin::dash_txid(parsed->m_txs[i]), hashes[i]) << i;
+        EXPECT_EQ(parsed->m_txs[i].type, txs[i].type) << i;
+        EXPECT_EQ(parsed->m_txs[i].vin.size(), txs[i].vin.size()) << i;
+        EXPECT_EQ(parsed->m_txs[i].vout.size(), txs[i].vout.size()) << i;
+        EXPECT_EQ(parsed->m_txs[i].extra_payload, txs[i].extra_payload) << i;
+    }
+    EXPECT_EQ(hashes[0].GetHex(), "46a47fe65c9fd29e9379f3f74020df33dabb1d4095c8da6b1fa05e508b74a491")
+        << "the mined txid";
 }

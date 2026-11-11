@@ -352,6 +352,25 @@ public:
     /// Triggers stratum sessions to re-push work on their next heartbeat.
     void bump_work_generation() { work_generation_.fetch_add(1, std::memory_order_relaxed); }
 
+    /// The template height the serve gate last refused with the PoSe pass
+    /// (cause qc-real-pose-unfolded), or 0 when the last arm decision was
+    /// anything else. Lock-free, because main_dash.cpp reads it from the PoSe
+    /// oracle's block-connected handler.
+    uint32_t pose_pass_decline_height() const
+    { return pose_pass_decline_height_.load(std::memory_order_relaxed); }
+
+    /// True when the PoSe oracle has just folded the parent of the height the
+    /// gate refused with the PoSe pass. The header tip change re-sources the
+    /// template as soon as the new header arrives, which is usually before
+    /// the parent's body. A real commitment that punishes a member is then
+    /// refused with stage=oracle-not-at-tip, and before this hook nothing
+    /// re-sourced the template once the oracle had folded the body: the
+    /// height waited for an unrelated re-source (up to the next block on the
+    /// hotel reserve, h=2566523). The caller re-sources when this is true.
+    static constexpr bool pose_oracle_refresh_due(uint32_t declined_height,
+                                                  uint32_t folded_height)
+    { return declined_height != 0 && declined_height == folded_height + 1; }
+
     /// Gate-lift (v0.2.4 trigger): allow the daemonless embedded arm on MAINNET.
     /// The embedded CbTx (version, merkleRootMNList, merkleRootQuorums, bestCL,
     /// creditPoolBalance) is proven BYTE-IDENTICAL to a real dashd
@@ -904,6 +923,8 @@ private:
     mutable std::mutex              serve_gate_mutex_;
     mutable coin::ServeGateJournal  serve_gate_journal_{kDeclineHeartbeatSec};
     mutable coin::DeclineReport     last_decline_;
+    // Written beside last_decline_ (same decision); see pose_pass_decline_height().
+    mutable std::atomic<uint32_t>   pose_pass_decline_height_{0};
     mutable bool                    last_arm_embedded_{false};
     mutable bool                    arm_ever_observed_{false};
     // Monotonic second of the last emitted cumulative roll-up; -1 until the

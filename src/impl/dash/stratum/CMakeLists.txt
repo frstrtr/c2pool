@@ -19,4 +19,5 @@ target_include_directories(dash_stratum PUBLIC
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/src/btclibs
     ${CMAKE_SOURCE_DIR}/include)
-target_link_libraries(dash_stratum core dash_x11 nlohmann_json::nlohmann_json ${Boost_LIBRARIES})
+target_link_libraries(dash_stratum core dash_x11 nlohmann_json::nlohmann_json ${Boost_LIBRARIES}
+    dash_bls_verify)   # one BLS mode per binary: work_source.cpp inlines the BLS-dependent checks

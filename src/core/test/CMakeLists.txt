@@ -115,6 +115,9 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
     # new tails are pure appends with null-not-zero unknowns, update_coinbase
     # reaches past 1000 records, and find_by_hash needs the full hash. Folded
     # into core_test for the same #769 reason.
+    # web_server_http_cap_test.cpp: the HTTP session cap (the HTTP share of
+    # the node's fd plan): a connection beyond it closed at once, a slot freed
+    # when its connection ends. Same fold-into-core_test reasoning.
     # web_server_ip_mask_test.cpp: issue #1985 miner/peer IP masking for web
     # viewers that are not direct local (/stratum_stats, peer views,
     # /ban_stats). Same fold-into-core_test reasoning as every TU here.
@@ -131,9 +134,66 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
     # vin/vout, HogEx not last / missing, txid, pegin outputs vs HogEx inputs,
     # fees vs coinbasevalue) refuses the template that breaks it. Same
     # fold-into-core_test reasoning as every TU here.
+    # web_server_aux_template_test.cpp: getblocktemplate [{"chain":"DOGE"}]
+    # answers with the merged DOGE template (prev, height, bits, curtime,
+    # coinbase value, txs, degraded mark), over JSON-RPC to a direct local
+    # client only; the call without "chain" is unchanged. Same
+    # fold-into-core_test reasoning as every TU here.
+    # web_server_block_budget_test.cpp: the LTC block weight (bad-blk-weight):
+    # a REAL TemplateBuilder template over a mempool above 4 MWU, built within
+    # the embedded node's budget over the web server's coinbase reserve,
+    # yields a found block of at most 4,000,000 weight with a 4,000-output
+    # PPLNS coinbase; a job above the limit is refused at assembly and
+    # counted. Same fold-into-core_test reasoning as every TU here.
+    # web_server_merged_drop_test.cpp: the share side follows the merged
+    # commitment. With no buildable DOGE block the job carries neither mm_data
+    # nor the share's merged_coinbase_info (a V36 peer rejects info without
+    # mm_data). Real MiningInterface + MergedMiningManager; same
+    # fold-into-core_test reasoning as every TU here (c2pool_merged_mining linked).
     # leveldb_store_lock_test.cpp: LevelDBStore::open on a DB whose LOCK is
     # held (another process, another handle) fails and leaves LOCK alone; an
     # unheld LOCK file opens. Same fold-into-core_test reasoning as every TU here.
+    # template_refresh_on_tx_test.cpp: the transaction-triggered template
+    # refresh (#2137 S1): core::TxRefreshPacer (coalesce within 1 s of the
+    # last rebuild, rebuild at once after a quiet interval, skip what another
+    # rebuild covered, an interval of at least 4 rebuild costs) and a REAL
+    # WebServer whose tx-triggered rebuild fires after a sharechain-unchanged
+    # debounce window, notifies nobody when the template did not change, and
+    # is counted in /local_stats template_refresh; every session's job of a
+    # generation shares one tx-hex vector (measured). Same fold-into-core_test
+    # reasoning as every TU here.
+    # web_server_job_held_test.cpp: a stratum job is not built on a busy
+    # sharechain (no PPLNS at the job's prev share, no ref_hash):
+    # build_connection_coinbase returns CoinbaseResult::held and the session
+    # keeps its last job (one pending retry, bounded); a work source with the
+    # PPLNS at hand is unchanged. Same fold-into-core_test reasoning as every
+    # TU here.
+    # web_server_rpc_refresh_test.cpp: the coin daemon's template refresh
+    # over RPC (one-shot fetch + the --no-embedded getblocktemplate poll) is
+    # armed for a coin node attached after start() (c2pool-ltc starts its web
+    # server first), once, and not for an embedded node. Same fold-into-
+    # core_test reasoning as every TU here.
+    # web_server_pplns_no_burn_test.cpp: no work is ever built on a burn
+    # output: a busy tracker at a new best share leaves no zero-key output in
+    # any coinbase and does not poison the cached (best, outputs) pair (jobs
+    # are held, CoinbaseResult::held); busy at the same share reuses the last
+    # valid split; an empty sharechain pays the donation (genesis rule);
+    # solo / custodial pay their split; a cached split is only reused at the
+    # coinbase value, bits and donation it was computed for (also with a
+    # refresher racing four job builders). Same fold-into-core_test reasoning
+    # as every TU here.
+    # web_server_redistribute_type_test.cpp: a share's payout replaced by
+    # --redistribute (Case 3) or the node fee draw keeps its recipient's own
+    # script type (P2SH as P2SH, P2WPKH as P2WPKH; never a script hash as
+    # P2PKH). Same fold-into-core_test reasoning as every TU here.
+    # web_server_utxo_scan_test.cpp: GET /api/utxo/scan's web-server half (the
+    # dedicated scan thread, one at a time, the interval, the wait cap, the
+    # direct-local gate). Same fold-into-core_test reasoning as every TU here.
+    # inject_ledger_obs_test.cpp: the S4 read-only per-inject ledger and
+    # best-ChainLock mirrors behind GET /api/tx-inject/ledger (bound + overflow
+    # count, retain self-heal, set_last_build no-op on an absent txid, ChainLock
+    # round-trip). Header-only over core/uint256. Same fold-into-core_test
+    # reasoning as every TU here.
     # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
     add_executable(core_test
         addr_store_save_test.cpp
@@ -154,11 +214,13 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
         found_block_store_test.cpp
         graph_history_test.cpp
         host_port_test.cpp
+        inject_ledger_obs_test.cpp
         inject_status_test.cpp
         known_txs_backing_test.cpp
         known_txs_eviction_test.cpp
         leveldb_store_lock_test.cpp
         listener_family_test.cpp
+        merged_aux_target_le_test.cpp
         muhash_chacha20_test.cpp
         netaddress_resolution_test.cpp
         p2p_message_stats_test.cpp
@@ -166,27 +228,41 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
         packet_test.cpp
         payout_manager_rules_test.cpp
         random_choice_guard_test.cpp
+        reloaded_block_flag_test.cpp
         socket_write_queue_test.cpp
         socket_read_empty_prefix_test.cpp
+        template_refresh_on_tx_test.cpp
         template_txs_check_test.cpp
         tx_advertiser_test.cpp
         utxo_set_hash_test.cpp
+        utxo_stats_test.cpp
         utxo_snapshot_test.cpp
         utxo_tools_test.cpp
+        view_block_hashes_test.cpp
         version_gate_test.cpp
+        web_server_aux_template_test.cpp
+        web_server_block_budget_test.cpp
         web_server_config_endpoint_test.cpp
         web_server_current_payouts_test.cpp
         web_server_daemonless_graph_feed_test.cpp
         web_server_dashboard_data_test.cpp
         web_server_frozen_pool_rate_guard_test.cpp
+        web_server_http_cap_test.cpp
         web_server_ip_mask_test.cpp
+        web_server_job_held_test.cpp
         web_server_local_hashps_test.cpp
         web_server_local_only_test.cpp
         web_server_local_share_hash_rates_test.cpp
+        web_server_merged_drop_test.cpp
         web_server_mweb_hogex_test.cpp
+        web_server_pplns_no_burn_test.cpp
+        web_server_redistribute_type_test.cpp
         web_server_relay_block_test.cpp
+        web_server_rpc_refresh_test.cpp
         web_server_submitblock_test.cpp
+        web_server_utxo_scan_test.cpp
         web_server_worker_liveness_test.cpp
+        worker_pools_test.cpp
     )
     target_compile_definitions(core_test PRIVATE C2POOL_SRC_ROOT="${CMAKE_SOURCE_DIR}/src")
     target_link_libraries(core_test PRIVATE GTest::gtest_main core c2pool_merged_mining GTest::gtest)

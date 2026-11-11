@@ -336,8 +336,8 @@ are unchanged. Only `replay_view` (`:1097-1136`) changes its SOURCE:
   designed); receipt frames -> bounded per-peer inbound queue (drop-oldest,
   counted) -> ONE **relay-verify worker** thread.
 * The relay-verify worker owns its OWN `LightVerifier` (+256 MiB RSS, +256 MiB
-  transiently at epoch rollover; `randomx_init_lock` already serialises inits
-  against the stratum verifier and the `--mine` miner). Seeds: prefetch on every
+  transiently at epoch rollover; `randomx_init_lock` already serialises cache
+  inits against the stratum verifier and the `--mine` miner). Seeds: prefetch on every
   new template (`seed_hash`, `next_seed_hash` are in `TemplateJob`), plus
   `seed_for_bin(bin)` via `MainchainIndex::seed_hash_for_height` (`:222`) for
   backfilled receipts of an older epoch. Rationale for a second instance: a

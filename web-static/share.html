@@ -511,30 +511,42 @@
             }
             html += '</div>';
 
-            // Block solution banners
-            var isLtcBlock = share.is_block_solution;
+            // Block solution banners. The primary coin's symbol and block
+            // explorer come from /web/currency_info (a DASH node's block is a
+            // DASH block); the twin and merged-child banners are the LTC+DOGE
+            // node's (is_doge_block is set only there).
+            var primarySym = String(symbol || 'LTC').toUpperCase();
+            var childSym = mergedSym || 'DOGE';
+            var isPrimaryBlock = share.is_block_solution;
             var isDogeBlock = share.is_doge_block;
-            var blockExplorer = block_prefix || 'https://blockchair.com/litecoin/block/';
             var dogeExplorer = 'https://blockchair.com/dogecoin/block/';
+            // A block hash linked to the coin's explorer, or plain text when
+            // the node configures none.
+            var primaryBlockLink = function(hash, n) {
+                var shown = esc(hash.substr(0, n)) + '…';
+                return block_prefix
+                    ? '<a href="' + block_prefix + hash + '" target="_blank">' + shown + '</a>'
+                    : shown;
+            };
 
-            if (isLtcBlock && isDogeBlock) {
+            if (isPrimaryBlock && isDogeBlock) {
                 // LEGENDARY — twin block
                 var db = share.doge_block || {};
                 html += '<div class="block-banner legendary">';
                 html += '<div class="banner-title" style="color:#ff8000">TWIN BLOCK — LEGENDARY</div>';
-                html += '<div class="banner-detail" style="color:#ffd700">LTC Block: <a href="' + blockExplorer + share_hash + '" target="_blank">' + share_hash.substr(0, 20) + '…</a>';
+                html += '<div class="banner-detail" style="color:#ffd700">' + esc(primarySym) + ' Block: ' + primaryBlockLink(share_hash, 20);
                 if (share.ltc_block_height) html += ' (height ' + share.ltc_block_height + ')';
                 if (share.ltc_block_confirmations) html += ' — ' + share.ltc_block_confirmations + ' confirmations';
                 html += '</div>';
-                html += '<div class="banner-detail" style="color:#00e5ff">DOGE Block: <a href="' + dogeExplorer + (db.block_hash || '') + '" target="_blank">' + (db.block_hash || '').substr(0, 20) + '…</a>';
+                html += '<div class="banner-detail" style="color:#00e5ff">' + esc(childSym) + ' Block: <a href="' + dogeExplorer + (db.block_hash || '') + '" target="_blank">' + (db.block_hash || '').substr(0, 20) + '…</a>';
                 if (db.height) html += ' (height ' + db.height + ')';
-                if (db.reward) html += ' — ' + db.reward.toFixed(2) + ' DOGE reward';
+                if (db.reward) html += ' — ' + db.reward.toFixed(2) + ' ' + esc(childSym) + ' reward';
                 html += '</div>';
                 html += '</div>';
-            } else if (isLtcBlock) {
+            } else if (isPrimaryBlock) {
                 html += '<div class="block-banner ltc-block">';
-                html += '<div class="banner-title" style="color:#ffd700">LTC BLOCK SOLUTION</div>';
-                html += '<div class="banner-detail" style="color:#ffd700">Block: <a href="' + blockExplorer + share_hash + '" target="_blank">' + share_hash.substr(0, 24) + '…</a>';
+                html += '<div class="banner-title" style="color:#ffd700">' + esc(primarySym) + ' BLOCK SOLUTION</div>';
+                html += '<div class="banner-detail" style="color:#ffd700">Block: ' + primaryBlockLink(share_hash, 24);
                 if (share.ltc_block_height) html += ' (height ' + share.ltc_block_height + ')';
                 if (share.ltc_block_confirmations) html += ' — ' + share.ltc_block_confirmations + ' confirmations';
                 html += '</div>';
@@ -544,11 +556,11 @@
             } else if (isDogeBlock) {
                 var db = share.doge_block || {};
                 html += '<div class="block-banner doge-block">';
-                html += '<div class="banner-title" style="color:#00e5ff">DOGE BLOCK SOLUTION</div>';
+                html += '<div class="banner-title" style="color:#00e5ff">' + esc(childSym) + ' BLOCK SOLUTION</div>';
                 html += '<div class="banner-detail" style="color:#00e5ff">Block: <a href="' + dogeExplorer + (db.block_hash || '') + '" target="_blank">' + (db.block_hash || '').substr(0, 24) + '…</a>';
                 if (db.height) html += ' (height ' + db.height + ')';
                 html += '</div>';
-                if (db.reward) html += '<div class="banner-detail" style="color:var(--text)">Block reward: ' + db.reward.toFixed(2) + ' DOGE</div>';
+                if (db.reward) html += '<div class="banner-detail" style="color:var(--text)">Block reward: ' + db.reward.toFixed(2) + ' ' + esc(childSym) + '</div>';
                 html += '</div>';
             }
 
@@ -618,9 +630,10 @@
             // Generation TX
             var gentx = block.gentx || {};
             html += '<h3>Generation Transaction</h3><div class="kv-grid">';
-            var txLink = tx_prefix
-                ? '<a href="' + tx_prefix + (gentx.hash || '') + '" target="_blank">' + esc(gentx.hash || '') + '</a>'
-                : esc(gentx.hash || '');
+            var txLink = !gentx.hash ? '-'
+                : tx_prefix
+                ? '<a href="' + tx_prefix + gentx.hash + '" target="_blank">' + esc(gentx.hash) + '</a>'
+                : esc(gentx.hash);
             html += kv('TX Hash', txLink);
             html += kv('Value', (gentx.value != null ? gentx.value.toFixed(8) : '-') + ' ' + symbol);
             var txNonce = gentx.last_txout_nonce;
@@ -644,6 +657,9 @@
                     html += '<a href="' + link + '" target="_blank">' + (i+1) + '</a>';
                 });
                 html += '</div>';
+            } else if (block.other_transaction_hashes_note) {
+                html += '<h3>Other Transactions</h3>';
+                html += '<div class="kv-label">' + esc(block.other_transaction_hashes_note) + '</div>';
             }
 
             html += '</div>'; // close block section
@@ -789,7 +805,7 @@
 
                     var rects = pplnsTreemap(_shareEntries, 0, 0, w, h);
                     var minerAddr = _shareMinerAddr;
-                    var addrPrefix = ci.address_explorer_url_prefix || 'https://blockchair.com/litecoin/address/';
+                    var addrPrefix = ci.address_explorer_url_prefix || '';
 
                     rects.forEach(function(r) {
                         var isThis = r.addr === minerAddr;
@@ -896,8 +912,8 @@
                             cell.style.borderColor = 'rgba(220,53,69,0.6)';
                         }
 
-                        // Click → blockchair
-                        cell.addEventListener('click', function() {
+                        // Click → the coin's address explorer (none configured: no link)
+                        if (addrPrefix) cell.addEventListener('click', function() {
                             window.open(addrPrefix + r.addr, '_blank');
                         });
 

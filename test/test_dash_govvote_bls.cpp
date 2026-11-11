@@ -533,3 +533,36 @@ TEST(DashGovVoteBLS, MaintainerIngestsNoneVote) {
 }
 
 } // namespace
+
+// P-3: the payee projection stores operator keys as canonical BASIC bytes,
+// so the governance tally verifies with key_legacy_scheme = false and NO
+// pubkey-scheme fallback. Read as legacy, B(P) decodes to -P for about half
+// of all keys, so the fallback form accepted a vote signed with -sk, which
+// dashd rejects. Secrets {s, 0, ..., 0}, s = 1..64; the -sk signature is the
+// negated +sk signature.
+#ifdef C2POOL_DASH_BLS
+#include <dashbls/bls.hpp>
+TEST(DashGovVoteBLS, CanonicalBasicKeyVerifiesWithoutTheSchemeFallback)
+{
+    uint256 digest;
+    for (int i = 0; i < 32; ++i) digest.data()[i] = static_cast<uint8_t>(0x5a + i);
+    const bls::Bytes msg(digest.data(), 32);
+    size_t old_form_accepts_neg = 0;
+    for (int s = 1; s <= 64; ++s) {
+        std::vector<uint8_t> skb(32, 0);
+        skb[0] = static_cast<uint8_t>(s);
+        const auto sk = bls::PrivateKey::FromBytes(bls::Bytes(skb.data(), skb.size()));
+        std::array<uint8_t, 48> stored{};
+        const auto pb = sk.GetG1Element().Serialize(/*fLegacy=*/false);
+        std::copy_n(pb.begin(), 48, stored.begin());
+        const bls::G2Element good = bls::BasicSchemeMPL().Sign(sk, msg);
+        const std::vector<uint8_t> good_sig = good.Serialize(false);
+        const std::vector<uint8_t> neg_sig = good.Negate().Serialize(false);
+        EXPECT_TRUE(verify_govvote_operator_sig(stored, false, digest, good_sig, false)) << s;
+        EXPECT_FALSE(verify_govvote_operator_sig(stored, false, digest, neg_sig, false)) << s;
+        // The pre-P-3 call (legacy flag for a v1 masternode, fallback on).
+        old_form_accepts_neg += verify_govvote_operator_sig(stored, true, digest, neg_sig, true);
+    }
+    EXPECT_GT(old_form_accepts_neg, 0u) << "the hole the fix closes";
+}
+#endif

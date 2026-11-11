@@ -13,17 +13,23 @@
 //   - a pegin output without its kernel (litecoind kernel-mismatch);
 //   - empty vin or vout outside MWEB-only txs (CheckTransaction), which also
 //     catches the 10-byte stub a SERIALIZE_NO_MWEB relay would give;
-//   - a loose HogEx.
+//   - a loose HogEx;
+//   - with a view: a premature coinbase spend (inputs_invalid) and, with a
+//     set built from genesis, a tx whose input is in neither the set nor the
+//     pool (missing_inputs: an orphan, outside the pool).
 // Real bytes: the peg-in and peg-out mempool txs and 3200601's HogEx
 // (ltc_mweb_tx_fixtures.hpp). Refusals are counted by code, with the kernel
-// fees given up.
+// fees given up -- per delivery, and once per tx by its kernel id
+// (mweb_txs_seen_distinct, #2137 S3).
 // ---------------------------------------------------------------------------
 
 #include <gtest/gtest.h>
 
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <optional>
+#include <random>
 #include <span>
 #include <string>
 #include <vector>
@@ -34,6 +40,9 @@
 #include <core/uint256.hpp>
 #include <btclibs/util/strencodings.h>
 
+#include <core/coin/utxo.hpp>
+#include <core/coin/utxo_view_cache.hpp>
+#include <core/coin/utxo_view_db.hpp>
 #include <impl/ltc/coin/mempool.hpp>
 #include <impl/ltc/coin/transaction.hpp>
 
@@ -199,6 +208,88 @@ TEST(LtcMempoolMwebAdmission, EveryRefusalCode)
     ASSERT_TRUE(r);
     EXPECT_EQ(r->code, Code::duplicate);
 
+    // A coinbase 5 blocks deep (maturity 100): refused, not pooled.
+    {
+        core::coin::UTXOViewCache view(nullptr);
+        core::coin::Coin cb;
+        cb.value = 5000000000LL;
+        cb.scriptPubKey.m_data = {0x51};
+        cb.height = 95;
+        cb.coinbase = true;
+        view.add_coin(core::coin::Outpoint(pay(0x08, 1000).vin[0].prevout.hash, 0), cb);
+        pool.set_tip_height(100);
+        r = pool.admit(pay(0x08, 1000), &view);
+        ASSERT_TRUE(r);
+        EXPECT_EQ(r->code, Code::inputs_invalid);
+        pool.set_tip_height(0);
+    }
+
+    // A HogAddr input (a HogEx output 0, which only the next block's HogEx
+    // spends): refused, not pooled.
+    {
+        core::coin::UTXOViewCache view(nullptr);
+        core::coin::Coin hog;
+        hog.value = 5000000000LL;
+        hog.scriptPubKey.m_data = hogaddr_spk;
+        hog.height = 99;
+        view.add_coin(core::coin::Outpoint(pay(0x0a, 1000).vin[0].prevout.hash, 0), hog);
+        r = pool.admit(pay(0x0a, 1000), &view);
+        ASSERT_TRUE(r);
+        EXPECT_EQ(r->code, Code::hogaddr_spend);
+    }
+
+    // An input in neither the set nor the pool, the set built from genesis:
+    // an orphan (outside the pool).
+    {
+        std::mt19937_64 rng(std::random_device{}());
+        const auto dir = std::filesystem::temp_directory_path() / ("ltc_admission_" + std::to_string(rng()));
+        {
+            core::coin::UTXOViewDB db(dir.string());
+            ASSERT_TRUE(db.open());
+            core::coin::UTXOViewCache full(&db);
+            core::coin::SyncState s;
+            s.anchor_height = 0;
+            s.strict = 1;
+            ASSERT_TRUE(full.set_sync_state(s));
+            r = pool.admit(pay(0x09, 1000), &full);
+            ASSERT_TRUE(r);
+            EXPECT_EQ(r->code, Code::missing_inputs);
+            EXPECT_EQ(pool.orphan_count(), 1u);
+        }
+        std::error_code ec;
+        std::filesystem::remove_all(dir, ec);
+    }
+
+    // Not final in the next block (CheckFinalTx): locked to its height.
+    {
+        pool.set_lock_time_cutoff(1001, 1'600'000'000);
+        MutableTransaction locked = pay(0x0a, 1000);
+        locked.locktime = 1001;
+        locked.vin[0].sequence = 0xfffffffe;
+        r = pool.admit(locked, nullptr);
+        ASSERT_TRUE(r);
+        EXPECT_EQ(r->code, Code::non_final);
+        pool.set_lock_time_cutoff(0, 0);
+    }
+
+    // Relative lock-times the next block does not satisfy (CheckSequenceLocks):
+    // a height lock of 2 on a coin at the tip's height.
+    {
+        core::coin::UTXOViewCache view(nullptr);
+        core::coin::Coin coin;
+        coin.value = 5000;
+        coin.scriptPubKey.m_data = {0x51};
+        coin.height = 1000;
+        MutableTransaction locked = pay(0x0b, 1000);
+        locked.vin[0].sequence = 2;
+        view.add_coin(core::coin::Outpoint(locked.vin[0].prevout.hash, 0), coin);
+        pool.set_lock_time_cutoff(1001, 1'600'000'000);
+        r = pool.admit(locked, &view);
+        ASSERT_TRUE(r);
+        EXPECT_EQ(r->code, Code::non_bip68_final);
+        pool.set_lock_time_cutoff(0, 0);
+    }
+
     // The rules key on MWEB data only: an ordinary legacy tx (any coin
     // sharing this pool, e.g. DOGE) is admitted as before.
     MutableTransaction legacy = pay(0x07, 5000, {0x76, 0xa9, 0x14, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
@@ -225,4 +316,72 @@ TEST(LtcMempoolMwebAdmission, EveryRefusalCode)
     EXPECT_EQ(j["rejected"]["mweb_only"], 1);
     EXPECT_EQ(j["rejected"]["duplicate"], 1);
     EXPECT_EQ(j["mweb_txs_seen"], 3);
+}
+
+namespace {
+
+// An MWEB-only tx: no canonical part, one kernel (fee, excess `tag`).
+MutableTransaction mweb_only(uint32_t tag, int64_t fee)
+{
+    std::vector<unsigned char> mw(64, 0);  // kernel_offset, stealth_offset
+    mw.push_back(0x00);                    // inputs
+    mw.push_back(0x00);                    // outputs
+    mw.push_back(0x01);                    // one kernel
+    mw.push_back(0x01);                    // features: fee
+    // VARINT fee (MSB base-128, serialize.h WriteVarInt).
+    std::vector<unsigned char> v;
+    uint64_t n = static_cast<uint64_t>(fee);
+    while (true) {
+        v.push_back(static_cast<unsigned char>((n & 0x7F) | (v.empty() ? 0x00 : 0x80)));
+        if (n <= 0x7F)
+            break;
+        n = (n >> 7) - 1;
+    }
+    mw.insert(mw.end(), v.rbegin(), v.rend());
+    std::vector<unsigned char> excess(33, 0x08);
+    std::memcpy(excess.data() + 1, &tag, sizeof(tag));
+    mw.insert(mw.end(), excess.begin(), excess.end());
+    mw.insert(mw.end(), 64, 0x11);         // signature
+    MutableTransaction tx;
+    tx.version = 2;
+    tx.locktime = 0;
+    tx.mweb_tx_raw = mw;
+    return tx;
+}
+
+} // namespace
+
+// The delivery counters repeat a refused MWEB tx once per announcing peer;
+// mweb_txs_seen_distinct / mweb_fee_skipped_distinct_sat count it once
+// (keyed by its first kernel id over the last 4096 distinct txs).
+TEST(LtcMempoolMwebAdmission, DistinctRefusedMwebDeliveries)
+{
+    Mempool pool;
+    const MutableTransaction pegin = parse_tx(fx::kPeginTxHex);
+    const MutableTransaction pegout = parse_tx(fx::kPegoutTxHex);
+    for (int peer = 0; peer < 3; ++peer) {
+        ASSERT_TRUE(pool.admit(pegin, nullptr));
+        ASSERT_TRUE(pool.admit(pegout, nullptr));
+    }
+    auto j = pool.reject_stats_json();
+    EXPECT_EQ(j["mweb_txs_seen"], 6u);
+    EXPECT_EQ(j["mweb_fee_skipped_sat"], 3u * (fx::kPeginKernelFee + fx::kPegoutKernelFee));
+    EXPECT_EQ(j["mweb_txs_seen_distinct"], 2u);
+    EXPECT_EQ(j["mweb_fee_skipped_distinct_sat"], static_cast<uint64_t>(fx::kPeginKernelFee + fx::kPegoutKernelFee));
+
+    // The window: 4096 distinct kernels; the oldest is forgotten first.
+    Mempool w;
+    const MutableTransaction first = mweb_only(0, 1000);
+    ASSERT_TRUE(w.admit(first, nullptr));
+    for (uint32_t i = 1; i < Mempool::MWEB_SEEN_DISTINCT_KEPT; ++i)
+        ASSERT_TRUE(w.admit(mweb_only(i, 1000), nullptr));
+    EXPECT_EQ(w.reject_stats_json()["mweb_txs_seen_distinct"], Mempool::MWEB_SEEN_DISTINCT_KEPT);
+    ASSERT_TRUE(w.admit(first, nullptr));
+    EXPECT_EQ(w.reject_stats_json()["mweb_txs_seen_distinct"], Mempool::MWEB_SEEN_DISTINCT_KEPT)
+        << "still remembered";
+    ASSERT_TRUE(w.admit(mweb_only(Mempool::MWEB_SEEN_DISTINCT_KEPT, 1000), nullptr));  // pushes out `first`
+    ASSERT_TRUE(w.admit(first, nullptr));
+    EXPECT_EQ(w.reject_stats_json()["mweb_txs_seen_distinct"], Mempool::MWEB_SEEN_DISTINCT_KEPT + 2)
+        << "forgotten after 4096 newer ones, counted again";
+    EXPECT_EQ(w.reject_stats_json()["mweb_txs_seen"], Mempool::MWEB_SEEN_DISTINCT_KEPT + 3);
 }

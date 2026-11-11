@@ -20,11 +20,13 @@
 /// == false always routes there, and it remains the [GBT-XCHECK] cross-check.
 
 #include <impl/dash/coin/work_source.hpp>        // EmbeddedWorkInputs, select_dash_work, WorkSelection
+#include <core/address_utils.hpp>                // script_to_address (emit gate payee tokens)
 #include <impl/dash/coin/mn_state_machine.hpp>   // MnStateMachine
 #include <impl/dash/coin/mempool.hpp>            // Mempool
 #include <impl/dash/coin/tx_inject_pool.hpp>     // TxInjectPool (#157 miner/user tx-injection)
 #include <impl/dash/coin/inject_sandbox.hpp>     // #157 M3: InjectSandbox (bounded-work script-verify guard)
 #include <impl/dash/coin/inject_rate_limiter.hpp> // #157 M3: InjectRateLimiter (node-wide count+byte cap)
+#include <impl/dash/coin/inject_dry_run_causes.hpp> // N3: the causes only the dry run answers
 #include <impl/dash/coin/rpc_data.hpp>           // DashWorkData
 #include <impl/dash/coin/quorum_manager.hpp>     // QuorumManager (merkleRootQuorums source)
 #include <impl/dash/coin/quorum_root.hpp>        // compute_merkle_root_quorums (pre-emit recompute)
@@ -32,20 +34,27 @@
 #include <impl/dash/coin/vendor/simplifiedmns.hpp> // vendor::CSimplifiedMNList (merkleRootMNList source)
 #include <impl/dash/coin/sml_projection.hpp>     // confirmedHash rollover projection + collateral-spend predicate
 #include <impl/dash/coin/vendor/cbtx.hpp>        // vendor::parse_cbtx (pre-emit CbTx self-check)
+#include <impl/dash/coin/cbtx_asset_unlocks.hpp> // Dash Core v24: required CbTx version + unlock root
 #include <impl/dash/coin/subsidy.hpp>            // compute_dash_platform_reward_post_v20_mn_rr (creditPool re-check)
 
 #include <impl/dash/coin/governance_object.hpp>  // SuperblockPayment (daemonless superblock schedule)
+#include <impl/dash/coin/deployment_status.hpp> // V24State (Dash Core v24 deployment state)
 
 #include <core/uint256.hpp>
 #include <core/p2p_message_stats.hpp>    // core::obs::inject_status (#157 read-only status mirror)
+#include <core/inject_ledger_obs.hpp>    // core::obs::inject_ledger (S4 per-inject read-only mirror)
 
+#include <algorithm>
 #include <ctime>
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <limits>
+#include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -191,14 +200,39 @@ inline std::string discriminating_hash_tail(const uint256& h, size_t n = 12)
 class NodeCoinState {
 public:
     NodeCoinState() {
-        // VERIFY-S2b S-B: a rewind puts back only the injects this ledger
-        // still tracks. The ledger keeps a confirmed inject until its
-        // expiry_height (reconcile_inject_pool), so a reaped one is expired
-        // and stays out instead of coming back untracked. (If the ledger ever
-        // forgets on confirm, it must keep confirmed entries for the undo keep
-        // or this must change with it.)
-        m_mempool.set_inject_still_wanted_fn(
-            [this](const uint256& txid) { return m_inject_pool.contains(txid); });
+        // VERIFY-S2b S-B / #2121: a rewind puts back only the injects this
+        // ledger still wants. The ledger releases an inject when it leaves the
+        // mempool (reconcile_inject_pool) but keeps its record in the released
+        // ledger as deep as the mempool's confirmed keep, so a confirmed inject
+        // a rewind takes out is put back and re-tracked with its original
+        // metadata. One whose expiry_height the next block passes, or one the
+        // active caps have no room for, stays out instead of coming back
+        // untracked. Called inside Mempool::readmit_disconnected_injects on the
+        // io thread (the lane's rewind).
+        m_mempool.set_inject_still_wanted_fn([this](const uint256& txid) {
+            return m_inject_pool.still_wanted(txid, next_block_height());
+        });
+        // Dash Core's provider-tx admission conflicts read the masternode
+        // list at the tip (txmempool.cpp existsProviderTxConflict: "not in
+        // the list", one pending operator key change per masternode). Only a
+        // projection folded up to the tip answers (the emit gate's condition);
+        // otherwise Unknown, and those rules are skipped. The store keeps the
+        // canonical basic encoding. Admission runs on the io thread, where the
+        // maintainer mutates m_mnstates.
+        m_mempool.set_tip_operator_key_fn([this](const uint256& protx) {
+            Mempool::TipOperatorKey k;
+            if (m_prev_height == 0 || m_mnstates.entries().empty()
+                || m_mnstates.last_applied_height() != m_prev_height)
+                return k;
+            const auto it = m_mnstates.entries().find(protx);
+            if (it == m_mnstates.entries().end()) {
+                k.state = Mempool::TipMn::Absent;
+                return k;
+            }
+            k.state = Mempool::TipMn::Listed;
+            k.key = it->second.pubKeyOperator;
+            return k;
+        });
     }
     NodeCoinState(const NodeCoinState&) = delete;
     NodeCoinState& operator=(const NodeCoinState&) = delete;
@@ -439,6 +473,18 @@ public:
         m_protx_sig_verifier = std::move(fn);
     }
 
+    /// Dash Core's full CheckPro*Tx for template selection (protx_check.hpp):
+    /// the network and the ECDSA verifier. The builder and the emit gate run
+    /// it on every provider tx they fold. UNSET (default) => no provider tx is
+    /// checkable, so none rides the template (fail closed).
+    void set_protx_check_env(ProTxCheckEnv env) { m_protx_check_env = std::move(env); }
+
+    /// Dash Core's CheckMNHFTx for type-7 signals (mnhf_check.hpp): the chain
+    /// lookup, the quorum keys, the BLS verifier and the EHF tracker's staged
+    /// signals. The builder (under --embedded-include-mn-special-txs) and the
+    /// emit gate run it on every signal. UNSET (default) => no signal rides.
+    void set_mnhf_check_env(MnhfCheckEnv env) { m_mnhf_check_env = std::move(env); }
+
     /// Network MN_RR activation height (dashcore Params().GetConsensus()
     /// .MN_RRHeight — per-chainparams). Gates the DIP-0027 platform-share
     /// credit-pool accrual in the template build, the pre-emit value re-check,
@@ -449,6 +495,42 @@ public:
     /// exactly one block's platform reward (constant 66,966,830 duffs).
     void set_mn_rr_height(int h) { m_mn_rr_height = h; }
     int mn_rr_height() const { return m_mn_rr_height; }
+
+    /// Dash Core v24: DeploymentActiveAfter(prev, DEPLOYMENT_V24) for the
+    /// block at a height (deployment_status.hpp). Unset => the process-wide
+    /// answer for the network (dash::coin::v24_state(net, h): the installed
+    /// status, else INACTIVE only below the earliest possible activation and
+    /// UNKNOWN from it on), so an unwired caller fails closed past the
+    /// earliest v24 height instead of building pre-v24 blocks. UNKNOWN
+    /// refuses the embedded template (cause v24-state-unknown): every v24 rule
+    /// of the block being built depends on it.
+    using V24StateFn = std::function<V24State(uint32_t height)>;
+    void set_v24_state_fn(V24StateFn fn) { m_v24_state_fn = std::move(fn); }
+    void set_v24_network(DashNetwork net) { m_v24_net = net; }
+
+    /// #143 / Dash Core v24: type-9 admission for the template at `height`
+    /// on `prev_hash` (credit_pool_lane.hpp admit). Null result => every
+    /// unlock is excluded. Unset => never called.
+    using AssetUnlockAdmitFn = std::function<std::shared_ptr<const AssetUnlockAdmission>(
+        uint32_t height, const uint256& prev_hash,
+        const std::vector<MutableTransaction>& candidates, const QuorumManager& qmgr)>;
+    void set_asset_unlock_admit_fn(AssetUnlockAdmitFn fn) { m_asset_unlock_admit_fn = std::move(fn); }
+
+    /// Testnet (Dash Core fPowAllowMinDifficultyBlocks): bits for a block at a
+    /// given time on top of a given parent (HeaderChain::next_work_required_at).
+    /// Passed to the work source, which applies it at the template's curtime.
+    using BitsAtTimeFn = std::function<std::optional<uint32_t>(const uint256& prev_hash, uint32_t block_time)>;
+    void set_bits_at_time_fn(BitsAtTimeFn fn) { m_bits_at_time_fn = std::move(fn); }
+
+    /// Heights the embedded arm declined because the scheduled payee is paid
+    /// through a v24 payout list (cause mn-payee-v24-payout-list), and the
+    /// last such height. Counted once per height (templates rebuild).
+    uint64_t v24_payout_list_declines() const { return m_v24_payout_list_declines.load(); }
+    uint32_t v24_payout_list_last_height() const { return m_v24_payout_list_last_h.load(); }
+    V24State v24_state_for(uint32_t height) const
+    {
+        return m_v24_state_fn ? m_v24_state_fn(height) : dash::coin::v24_state(m_v24_net, height);
+    }
 
     /// Network nMasternodeMinimumConfirmations (dashcore Params().GetConsensus()
     /// .nMasternodeMinimumConfirmations — per-chainparams: mainnet 15, testnet/
@@ -564,8 +646,12 @@ public:
         m_curtime              = curtime;
         m_version              = version;
         m_populated            = true;
+        // Dash Core v24: the mempool admits the v24 type list (10-12) once
+        // DEPLOYMENT_V24 is active for the block after this tip.
+        m_mempool.set_v24_admission(v24_state_for(prev_height + 1) == V24State::ACTIVE);
         // S2: an inject whose expiry_height the new tip reached leaves the pool
-        // and the mempool now, not at the next submit.
+        // and the mempool now, not at the next submit. #2121: so does one that
+        // left the mempool (the lane's hook usually released it already).
         reconcile_inject_pool();
     }
 
@@ -802,8 +888,8 @@ public:
                 r.cause = sb.name(); return r;
             }
         }
-        // Lazily reconcile the pool with the mempool before admitting: forget
-        // any tracked inject no longer in the mempool (confirmed / evicted) and
+        // Reconcile the pool with the mempool before admitting: release any
+        // tracked inject no longer in the mempool (confirmed / evicted) and
         // reap expired ones, so the caps reflect what is actually live.
         reconcile_inject_pool();
         // DoS caps FIRST (cheap, no consensus work): a full / over-cap pool
@@ -821,29 +907,216 @@ public:
         // Track it for DoS accounting + expiry.
         m_inject_pool.admit(r.txid, flags, expiry_height, byte_size);
         publish_inject_status();
+        // S4: mirror the new entry into the read-only per-inject ledger.
+        if (const auto e = m_inject_pool.entry(r.txid))
+            core::obs::inject_ledger().upsert(to_ledger_entry(*e));
         r.ok = true;
         r.cause = "ok";
         return r;
     }
 
-    /// Reconcile the inject ledger with the live mempool + tip: drop tracked
-    /// injects that have left the mempool (confirmed / conflict-evicted) or have
-    /// expired, evicting the expired ones from the mempool too. Called from
-    /// submit_inject and (S2) on every tip advance (set_tip), so an expiry_height
-    /// withdraws an inject without a second submit.
+    /// Outcome of validate_inject (POST /api/tx-inject/validate).
+    struct InjectValidateResult {
+        bool        ok{false};           // would_admit, a known tip, no input immature at
+                                         // next_height, no other pool tx spending an input
+        bool        would_admit{false};  // submit_inject would answer "ok" now (its rate
+                                         // limiter aside: the dry run does not charge it)
+        std::string cause;               // the first refusal in submit order, then
+                                         // the dry-run-only causes
+                                         // (inject_dry_run_causes.hpp); else "ok"
+        std::string gate;                // Mempool::add_inject's verdict ("" when a
+                                         // structural check refused before it)
+        uint256     txid;
+        bool        armed{false};
+        uint32_t    next_height{0};      // 0: tip unknown
+        uint32_t    immature_at_next_height{0};
+        bool        analysed{false};     // the mempool dry run ran (inputs / fee below)
+        Mempool::InjectDryRun dry;
+    };
+
+    /// Dash coinbase maturity (consensus.h COINBASE_MATURITY).
+    static constexpr uint32_t kCoinbaseMaturity = 100;
+
+    /// The dry run of submit_inject (c2wallet Scan & Plan N3): the same gate
+    /// in the same order, answered without admitting anything — the inject
+    /// ledger, the mempool, the fee deltas, the submit rate windows and the
+    /// status counters are left exactly as they were (no reconcile, no
+    /// admission; Mempool::validate_inject prices on a scratch entry). Its
+    /// one write is its own budget: like a submit it is charged on attempt
+    /// (after the charge-free type and size checks, before the sandbox and
+    /// the script verify, armed or not) to m_inject_rate_validate, a local
+    /// window of its own, so a preflight loop cannot hold the io thread and
+    /// cannot spend the operator's submit budget. It adds what admission does
+    /// not check: each input's coin, its maturity at the next height (a
+    /// coinbase input needs height + 100 <= next_height; the template build
+    /// would drop an immature inject silently), and any other pool tx
+    /// spending an input. A tx the structural checks refuse (type, size,
+    /// sandbox) or the budget refuses is not analysed. io-thread only, like
+    /// submit_inject (it reads the inject ledger and the tip).
+    InjectValidateResult validate_inject(const MutableTransaction& tx,
+                                         uint64_t max_fee = std::numeric_limits<uint64_t>::max()) {
+        InjectValidateResult r;
+        r.txid = dash::coin::dash_txid(tx);
+        r.armed = m_tx_inject_enabled;
+        r.next_height = m_prev_height != 0 ? m_prev_height + 1 : 0;
+        std::string structural;
+        const uint32_t byte_size = static_cast<uint32_t>(::pack(tx).get_span().size());
+        if (tx.type != 0 || tx.vin.empty() || tx.vout.empty()) {
+            structural = "inject-type-unsupported";
+        } else if (byte_size > dash::coin::TxInjectPool::kMaxInjectTxBytes) {
+            structural = dash::coin::TxInjectPool::admit_name(dash::coin::TxInjectPool::Admit::TooLarge);
+        }
+        if (structural.empty()) {
+            const auto rl = m_inject_rate_validate.try_consume(byte_size, std::time(nullptr));
+            if (!rl.ok()) {
+                r.cause = rl.name();   // the dry run itself was refused, armed or not
+                return r;
+            }
+            const auto sb = dash::coin::InjectSandbox::vet(tx);
+            if (!sb.ok()) structural = sb.name();
+        }
+        if (!structural.empty()) {
+            r.cause = r.armed ? structural : "inject-disabled";
+            return r;
+        }
+        r.dry = m_mempool.validate_inject(tx, max_fee);
+        r.analysed = true;
+        r.gate = dash::coin::Mempool::inject_gate_name(r.dry.gate);
+        const auto pv = m_inject_pool.would_admit(r.txid, byte_size);
+        bool conflict = false;
+        for (const auto& in : r.dry.inputs) {
+            if (in.pool_spender) conflict = true;
+            if (r.next_height != 0 && in.resolved && in.coinbase &&
+                static_cast<uint64_t>(in.height) + kCoinbaseMaturity > r.next_height)
+                ++r.immature_at_next_height;
+        }
+        r.would_admit = r.armed && pv == dash::coin::TxInjectPool::Admit::Ok &&
+                        r.dry.gate == dash::coin::Mempool::InjectGate::Ok;
+        if (!r.armed) r.cause = "inject-disabled";
+        else if (pv != dash::coin::TxInjectPool::Admit::Ok) r.cause = dash::coin::TxInjectPool::admit_name(pv);
+        else if (r.dry.gate != dash::coin::Mempool::InjectGate::Ok) r.cause = r.gate;
+        else if (r.next_height == 0) r.cause = inject_dry_run_cause::kTipUnknown;
+        else if (r.immature_at_next_height != 0) r.cause = inject_dry_run_cause::kImmatureCoinbaseInput;
+        else if (conflict) r.cause = inject_dry_run_cause::kInputSpentInMempool;
+        else r.cause = "ok";
+        r.ok = r.cause == "ok";
+        return r;
+    }
+
+    /// Reconcile the inject ledger with the live mempool + tip (#2121). After
+    /// it, the active set equals Mempool::inject_txids_in_pool(): nothing that
+    /// left the mempool counts against the caps, and every inject in the
+    /// mempool is tracked. Five steps, io thread:
+    ///   1. expiry: reap the injects the next block passes (expiry_height != 0
+    ///      && next height > expiry_height) and evict them from the mempool;
+    ///   2. read the injects live in the mempool;
+    ///   3. release every tracked inject that is not live (confirmed or
+    ///      conflict-evicted by a block); its record stays in the released
+    ///      ledger for a rewind;
+    ///   4. re-track every live inject that is not tracked: a rewind put it
+    ///      back (original metadata from the released ledger), or it has no
+    ///      record (tracked fresh: flags 0, expiry 0, its mempool size). A
+    ///      refusal by the caps evicts it from the mempool again by name;
+    ///   5. prune released records the undo-keep depth no longer reaches.
+    /// Then the status mirror is published. Called from submit_inject (before
+    /// the caps check), set_tip (every tip advance), and the UTXO lane's
+    /// mempool-changed hook (main_dash: after every block connect / rewind the
+    /// lane runs, so a confirm releases before the next promotion).
+    /// Rate-limiter windows are never refunded here.
     void reconcile_inject_pool() {
-        if (m_inject_pool.empty()) return;
-        // Expiry against our own tip.
+        const int32_t next_h = next_block_height();
+        // (1) Expiry against our own tip.
         if (m_prev_height != 0) {
-            for (const auto& id : m_inject_pool.reap_expired(
-                     static_cast<int32_t>(m_prev_height + 1))) {
+            for (const auto& id : m_inject_pool.reap_expired(next_h)) {
                 m_mempool.remove_tx(id);
             }
         }
+        // (2) The injects live in the mempool.
+        const std::vector<uint256> live = m_mempool.inject_txids_in_pool();
+        const std::set<uint256> live_set(live.begin(), live.end());
+        // (3) Release what left the mempool.
+        for (const auto& id : m_inject_pool.tracked_ids()) {
+            if (live_set.count(id)) continue;
+            m_inject_pool.release(id, m_prev_height);
+            LOG_INFO << "[MEMPOOL] inject released txid=" << id.GetHex().substr(0, 16)
+                     << " cause=left-mempool height=" << m_prev_height;
+        }
+        // (4) Re-track what came back (or was never tracked), PARENTS FIRST. A
+        //     rewind can put back a parent and its child together while the
+        //     caps have room for only part of the set (still_wanted checked
+        //     each one against the same active set, before any of them came
+        //     back). In txid order the parent could be the one refused, leaving
+        //     the child live and tracked with an input that is neither in the
+        //     view nor in the pool. In topological order the parent takes the
+        //     room first, and a refused inject takes its live descendants with
+        //     it: an untracked one is refused by name, a tracked one evicted.
+        std::vector<uint256> untracked;
+        for (const auto& id : live)
+            if (!m_inject_pool.contains(id)) untracked.push_back(id);
+        std::set<uint256> refused;
+        std::vector<uint256> retracked;
+        for (const auto& id : inject_parents_first(untracked)) {
+            const char* how = "rewind";
+            std::string cause;
+            if (spends_one_of(id, refused)) {
+                cause = "inject-pool-parent-refused";
+            } else {
+                auto v = m_inject_pool.retrack(id);
+                if (v == TxInjectPool::Admit::NotTracked) {
+                    how = "untracked";
+                    const auto e = m_mempool.get_entry(id);
+                    v = m_inject_pool.admit(id, 0, 0, e ? e->base_size : 0u);
+                }
+                if (v != TxInjectPool::Admit::Ok) cause = TxInjectPool::admit_name(v);
+            }
+            if (!cause.empty()) {
+                refused.insert(id);
+                m_mempool.remove_tx(id);
+                LOG_WARNING << "[MEMPOOL] inject readmit refused txid=" << id.GetHex().substr(0, 16)
+                            << " cause=" << cause
+                            << "; evicted from the mempool, resubmit it if it is still wanted";
+            } else {
+                LOG_INFO << "[MEMPOOL] inject re-tracked txid=" << id.GetHex().substr(0, 16)
+                         << " cause=" << how;
+                retracked.push_back(id);
+            }
+        }
+        // A tracked inject that spends a refused one (its child came back in an
+        // earlier rewind) cannot ride without it: evict it too, transitively.
+        for (bool more = !refused.empty(); more;) {
+            more = false;
+            for (const auto& id : m_inject_pool.tracked_ids()) {
+                if (!spends_one_of(id, refused)) continue;
+                refused.insert(id);
+                m_inject_pool.forget(id);
+                m_mempool.remove_tx(id);
+                LOG_WARNING << "[MEMPOOL] inject evicted txid=" << id.GetHex().substr(0, 16)
+                            << " cause=inject-pool-parent-refused"
+                            << "; resubmit it with its parent if it is still wanted";
+                more = true;
+            }
+        }
+        // (5) Released records a rewind can no longer reach.
+        if (m_prev_height != 0)
+            m_inject_pool.prune_released(m_prev_height, Mempool::kConfirmedInjectDepth);
         publish_inject_status();
+        // S4: the read-only per-inject ledger follows the active set: the
+        // re-tracked / fresh entries are (re)inserted, everything else that
+        // is no longer tracked (released, reaped, refused) is dropped.
+        auto& ledger = core::obs::inject_ledger();
+        for (const auto& id : retracked)
+            if (const auto e = m_inject_pool.entry(id)) ledger.upsert(to_ledger_entry(*e));
+        ledger.retain(m_inject_pool.tracked_ids());
+        ledger.set_tip(m_prev_height);
     }
 
     size_t inject_pool_size() const { return m_inject_pool.size(); }
+    /// Bytes the active inject set counts against kMaxInjectTotalBytes.
+    size_t inject_pool_bytes() const { return m_inject_pool.total_bytes(); }
+    /// The active ledger entry for `txid` (nullopt when it is not tracked).
+    std::optional<InjectEntry> inject_entry(const uint256& txid) const {
+        return m_inject_pool.entry(txid);
+    }
 
     /// Publish the current tx-inject lane state into the process-global
     /// read-only observability snapshot (core::obs::inject_status()),
@@ -884,6 +1157,8 @@ public:
     size_t inject_rate_count() const { return m_inject_rate.count_in_window(); }
     // #157 M3: same, for the aggregate-PEER rate limiter.
     size_t inject_rate_count_peer() const { return m_inject_rate_peer.count_in_window(); }
+    // N3: dry runs (validate_inject) the dry-run budget still counts in its window.
+    size_t inject_validate_rate_count() const { return m_inject_rate_validate.count_in_window(); }
     // #157 M3: bytes the LOCAL rate limiter still counts in its window — proves
     // an oversize blob was refused BEFORE the byte-window was charged.
     uint64_t inject_rate_bytes() const { return m_inject_rate.bytes_in_window; }
@@ -1534,44 +1809,59 @@ public:
                 if (it != m_mnstates.entries().end()) {
                     const int64_t mn_payment =
                         static_cast<int64_t>(w.m_payment_amount);
-                    const int64_t op_due =
-                        it->second.operator_payment_of(mn_payment);
-                    if (op_due > 0) {
-                        // Occurrence-counted so a 50/50 split (owner amount
-                        // == operator amount) needs TWO outputs, not one
-                        // double-matched.
-                        //
-                        // dashd masternode/payments.cpp:74-79 emits each
-                        // output only when its amount is > 0. The operator
-                        // amount is > 0 here by construction, so it is always
-                        // required; the owner amount is 0 exactly when
-                        // bps == 10000 (the whole share goes to the operator)
-                        // and then dashd emits NO owner output — requiring one
-                        // rejected every correct full-operator template
-                        // (owner=0-MISSING, 2026-10-28).
-                        const uint64_t own_amt =
-                            static_cast<uint64_t>(mn_payment - op_due);
-                        const uint64_t op_amt = static_cast<uint64_t>(op_due);
-                        size_t own_n = 0, op_n = 0;
-                        for (const auto& p : w.m_packed_payments) {
-                            if (p.payee == "!6a") continue;
-                            if (p.amount == own_amt) ++own_n;
-                            if (p.amount == op_amt)  ++op_n;
+                    // The payout SET dashd's GetBlockTxOuts derives for this
+                    // payee (v24::expected_mn_outputs, the Core v24 port:
+                    // owner payouts / share split, then the operator; each
+                    // only when > 0; a full 10000-bps operator share has NO
+                    // owner output). Checked whenever more than one output,
+                    // or an operator output, is due -- the h=2516595 class
+                    // and every v24 multi-output payee -- as (payee, amount)
+                    // pairs: the template must carry each due output at its
+                    // script (as the packed-payment token the builder
+                    // writes) AND amount, occurrence-counted (Dash Core v24
+                    // strict multiplicity: each expected output consumes a
+                    // distinct coinbase output), so a 50/50 split needs two
+                    // outputs and a same-amount payment at another script
+                    // (a superblock entry) cannot stand in for a missing one.
+                    const auto due = v24::expected_mn_outputs(it->second, mn_payment);
+                    const bool op_due = it->second.operator_payment_of(mn_payment) > 0;
+                    if (due.size() >= 2 || op_due) {
+                        auto token_of = [&](const std::vector<unsigned char>& script) {
+                            std::string addr = ::core::script_to_address(
+                                script, /*bech32_hrp=*/"", m_address_version, m_address_p2sh_version);
+                            if (!addr.empty()) return addr;
+                            static const char* digits = "0123456789abcdef";
+                            std::string hx = "!";
+                            for (uint8_t b : script) { hx += digits[b >> 4]; hx += digits[b & 0xF]; }
+                            return hx;
+                        };
+                        std::vector<std::pair<std::string, uint64_t>> have;
+                        for (const auto& p : w.m_packed_payments)
+                            if (p.payee != "!6a") have.emplace_back(p.payee, p.amount);
+                        const auto& st = it->second;
+                        const bool multi = !st.v24.shares.empty()
+                            || st.nVersion >= vendor::ProTxVersion::EXT_ADDR;
+                        const char* owner_role = !st.v24.shares.empty() ? "share" : "payout";
+                        std::string report;
+                        bool all_present = true;
+                        for (size_t i = 0; i < due.size(); ++i) {
+                            const bool is_op = op_due && i + 1 == due.size();
+                            const std::string role = is_op ? std::string("operator")
+                                : multi ? owner_role + std::to_string(i)
+                                        : std::string("owner");
+                            const std::pair<std::string, uint64_t> want{
+                                token_of(due[i].script), static_cast<uint64_t>(due[i].amount)};
+                            auto f = std::find(have.begin(), have.end(), want);
+                            const bool present = f != have.end();
+                            if (present) have.erase(f);
+                            all_present = all_present && present;
+                            report += (report.empty() ? "" : ",") + role + "="
+                                    + std::to_string(due[i].amount)
+                                    + (present ? "-present" : "-MISSING");
                         }
-                        const bool owner_ok =
-                            own_amt == 0
-                                ? true
-                                : (own_amt == op_amt ? own_n >= 2 : own_n >= 1);
-                        const bool op_ok =
-                            own_amt == op_amt ? op_n >= 2 : op_n >= 1;
-                        if (!owner_ok || !op_ok)
-                            return reject(
-                                "emit-mn-payout-split-drift",
-                                "owner=" + std::to_string(mn_payment - op_due)
-                                    + (owner_ok ? "-present" : "-MISSING")
-                                    + ",operator=" + std::to_string(op_due)
-                                    + (op_ok ? "-present" : "-MISSING"),
-                                "both-split-amounts-in-template");
+                        if (!all_present)
+                            return reject("emit-mn-payout-split-drift", report,
+                                          "every-payout-set-output-in-template");
                     }
                 }
             }
@@ -1583,12 +1873,36 @@ public:
         // bad-cbtx-mnmerkleroot — a silently lost block on a winning share.
         // The builder already filters these out of selection; re-assert here
         // so a cached/bypassed template can never reach a miner.
+        // Dash Core v24: a ProDisTx spends its shared masternode's collateral
+        // by design. With the special-tx fold armed it is allowed through here
+        // and the fold below checks it and removes the masternode (refusing the
+        // template on any doubt).
+        const bool v24_fold = m_include_mn_special_txs && v24_state_for(next_h) == V24State::ACTIVE;
         for (const auto& tx : w.m_txs) {
             uint256 protx;
+            if (v24_fold && tx_is_special_version(tx.version) && tx.type == tx_type::PROVIDER_DISSOLVE)
+                continue;
             if (tx_spends_mn_collateral(m_mnstates, tx, &protx))
                 return reject("emit-collateral-spend-in-template",
                               "mn=" + protx.GetHex().substr(0, 12),
                               "no-template-tx-spends-mn-collateral");
+        }
+        // MNHF signals (type 7): every one the body carries must pass Dash
+        // Core's CheckMNHFTx and the block's duplicate rules (mnhf_check.hpp).
+        // A signal never pays a fee, so this re-check only refuses.
+        if (std::any_of(w.m_txs.begin(), w.m_txs.end(), [](const Transaction& t) {
+                return t.type == vendor::MNHFTxPayload::SPECIALTX_TYPE;
+            })) {
+            std::vector<MutableTransaction> body(w.m_txs.begin(), w.m_txs.end());
+            {
+                const auto why = mnhf_select(body, m_mnhf_check_env ? &*m_mnhf_check_env : nullptr,
+                                             m_prev_height, m_mtp_at_tip);
+                for (size_t i = 0; i < why.size(); ++i)
+                    if (!why[i].empty())
+                        return reject("emit-mnhf-refused",
+                                      dash_txid(body[i]).GetHex().substr(0, 12) + ":" + why[i],
+                                      "dash-core-checkmnhftx");
+            }
         }
         vendor::CCbTx cb;
         if (!vendor::parse_cbtx(w.m_coinbase_payload, cb))
@@ -1598,6 +1912,27 @@ public:
         if (cb.nHeight != static_cast<int32_t>(next_h))
             return reject("emit-cbtx-height-drift", std::to_string(cb.nHeight),
                           std::to_string(next_h));
+        // Dash Core v24 CheckCbTx: version 4 exactly when v24 is active for
+        // this block (bad-cbtx-version otherwise), committing the asset-unlock
+        // root of THIS body (bad-cbtx-assetunlockmerkleroot).
+        {
+            const V24State v24 = v24_state_for(next_h);
+            if (v24 == V24State::UNKNOWN)
+                return reject("emit-v24-state-unknown", "h=" + std::to_string(next_h),
+                              "ehf-scan-or-pin");
+            const uint16_t want = required_cbtx_version(/*v20_active=*/true,
+                                                        v24 == V24State::ACTIVE);
+            if (cb.nVersion != want)
+                return reject("emit-cbtx-version", std::to_string(cb.nVersion),
+                              std::to_string(want));
+            if (cb.nVersion >= vendor::CCbTx::VERSION_MERKLE_ROOT_ASSETUNLOCKS) {
+                const uint256 root = compute_merkle_root_asset_unlocks(w.m_txs);
+                if (cb.merkleRootAssetUnlocks != root)
+                    return reject("emit-asset-unlock-root-drift",
+                                  cb.merkleRootAssetUnlocks.GetHex().substr(0, 16),
+                                  root.GetHex().substr(0, 16));
+            }
+        }
         // FINDING-1: the root block next_h must commit is the tip SML with the
         // verifier's height-driven confirmation pass applied (specialtxman.cpp
         // :206-215 — see sml_projection.hpp). Comparing against the RAW tip
@@ -1670,7 +2005,9 @@ public:
             // operator-signature verifier.
             const MnFoldContext fold_ctx = make_template_fold_context(
                 m_mnstates, m_mempool,
-                m_protx_sig_verifier ? &m_protx_sig_verifier : nullptr);
+                m_protx_sig_verifier ? &m_protx_sig_verifier : nullptr,
+                m_protx_check_env ? &*m_protx_check_env : nullptr, next_h,
+                v24_state_for(next_h) == V24State::ACTIVE);
             auto fold = fold_mn_special_txs(
                 proj.sml, w.m_txs,
                 [](const Transaction& t) {
@@ -1846,6 +2183,27 @@ public:
                                          utxo_immature,
                                          qc_pose ? &*qc_pose : nullptr);
         e.has_state = e.decline.viable;
+        // Dash Core v24: decided for the block being built (its parent is our
+        // tip). Never served on UNKNOWN; the dashd fallback (a v24 dashd)
+        // serves instead.
+        {
+            const V24State v24 = v24_state_for(m_prev_height + 1);
+            e.v24_active = v24 == V24State::ACTIVE;
+            if (e.has_state && v24 == V24State::UNKNOWN) {
+                e.decline.viable    = false;
+                e.decline.cause     = "v24-state-unknown";
+                e.decline.value     = "h=" + std::to_string(m_prev_height + 1);
+                e.decline.threshold = "ehf-scan-or-pin";
+                e.has_state         = false;
+            }
+        }
+        // #143 / Dash Core v24: the credit-pool follower admits type-9 unlocks
+        // for this template (only when the pool holds any; null => excluded).
+        if (e.has_state && m_asset_unlock_admit_fn) {
+            auto cands = m_mempool.asset_unlock_candidates();
+            if (!cands.empty())
+                e.asset_unlocks = m_asset_unlock_admit_fn(m_prev_height + 1, m_prev_hash, cands, m_qmgr);
+        }
         // NAME THE STATE: while the UTXO lane is immature under the OPT-IN
         // serving policy we DO serve, but only a coinbase-only body. The
         // builder marks the template (m_txset_empty_cause) and logs the
@@ -1897,6 +2255,7 @@ public:
         e.mnstates             = &m_mnstates;
         e.mempool              = &m_mempool;
         e.bits_for_next        = m_bits_for_next;
+        e.bits_at_time         = m_bits_at_time_fn;
         e.mtp_at_tip           = m_mtp_at_tip;
         e.address_version      = m_address_version;
         e.address_p2sh_version = m_address_p2sh_version;
@@ -1944,6 +2303,8 @@ public:
         e.qc_pose_oracle  = &m_qc_pose_oracle;
         // B.9: same verifier the emit gate folds with (unset => refused).
         e.protx_sig_verifier = m_protx_sig_verifier ? &m_protx_sig_verifier : nullptr;
+        e.protx_check_env = m_protx_check_env ? &*m_protx_check_env : nullptr;
+        e.mnhf_check_env = m_mnhf_check_env ? &*m_mnhf_check_env : nullptr;
         return e;
     }
 
@@ -1989,6 +2350,76 @@ public:
     }
 
 private:
+    /// The height of the block the next template builds (tip + 1), or 0 while
+    /// no tip is known (the inject ledger then treats nothing as expired).
+    int32_t next_block_height() const {
+        return m_prev_height ? static_cast<int32_t>(m_prev_height + 1) : 0;
+    }
+
+    /// S4: the read-only ledger's copy of an active inject entry. in_mempool
+    /// is true by the reconcile invariant (the active set equals the injects
+    /// live in the mempool); last_build is left to the ride log.
+    static core::obs::InjectLedgerEntry to_ledger_entry(const InjectEntry& e) {
+        core::obs::InjectLedgerEntry le;
+        le.txid          = e.txid;
+        le.submit_time   = static_cast<int64_t>(e.submit_time);
+        le.expiry_height = e.expiry_height;
+        le.byte_size     = e.byte_size;
+        le.flags         = e.flags;
+        le.in_mempool    = true;
+        return le;
+    }
+
+    /// Whether the mempool tx `id` spends an output of a tx in `txids`.
+    bool spends_one_of(const uint256& id, const std::set<uint256>& txids) const {
+        if (txids.empty()) return false;
+        const auto e = m_mempool.get_entry(id);
+        if (!e) return false;
+        for (const auto& in : e->tx.vin)
+            if (txids.count(in.prevout.hash)) return true;
+        return false;
+    }
+
+    /// `ids` (mempool txids) reordered so every tx comes after the txs of
+    /// `ids` it spends; otherwise the given order is kept.
+    std::vector<uint256> inject_parents_first(const std::vector<uint256>& ids) const {
+        const std::set<uint256> in_set(ids.begin(), ids.end());
+        std::map<uint256, std::vector<uint256>> parents;
+        for (const auto& id : ids) {
+            const auto e = m_mempool.get_entry(id);
+            if (!e) continue;
+            for (const auto& vin : e->tx.vin)
+                if (vin.prevout.hash != id && in_set.count(vin.prevout.hash))
+                    parents[id].push_back(vin.prevout.hash);
+        }
+        std::vector<uint256> out;
+        out.reserve(ids.size());
+        std::set<uint256> placed;
+        // Iterative post-order walk (a chain of injects can be long).
+        for (const auto& root : ids) {
+            if (placed.count(root)) continue;
+            std::vector<std::pair<uint256, size_t>> stack{{root, 0}};
+            std::set<uint256> on_stack{root};
+            while (!stack.empty()) {
+                auto& [cur, next] = stack.back();
+                const auto it = parents.find(cur);
+                if (it != parents.end() && next < it->second.size()) {
+                    const uint256 p = it->second[next++];
+                    if (!placed.count(p) && !on_stack.count(p)) {
+                        on_stack.insert(p);
+                        stack.emplace_back(p, 0);
+                    }
+                    continue;
+                }
+                placed.insert(cur);
+                out.push_back(cur);
+                on_stack.erase(cur);
+                stack.pop_back();
+            }
+        }
+        return out;
+    }
+
     /// THE clause list. The ONLY transcription of embedded-arm viability:
     /// make_embedded_work_inputs() derives has_state from `.viable`, and
     /// describe_decline()/classify_decline() read the very same object, so the
@@ -2150,6 +2581,17 @@ private:
                            "protx=" + protx->GetHex().substr(0, 12),
                            "payout-set-known");
         }
+        // Dash Core v24: a payee paid through a payout list the builder
+        // cannot build yet (S4). Explicit, and counted per height.
+        if (d.viable && m_require_resolvable_payee) {
+            if (auto protx = mn_payee_unpayable_at_tip()) {
+                d = refuse("mn-payee-v24-payout-list",
+                           "protx=" + protx->GetHex().substr(0, 12),
+                           "v24-payee-builder");
+                if (m_v24_payout_list_last_h.exchange(next_h) != next_h)
+                    m_v24_payout_list_declines.fetch_add(1);
+            }
+        }
 
         if (d.viable) return d;
 
@@ -2262,6 +2704,36 @@ private:
         if (!expected) return false;              // #996: nullopt while payment due
         return m_mnstates.entries().find(*expected) != m_mnstates.entries().end();
     }
+
+    /// The safety net for the masternode payee builder: the scheduled payee
+    /// must be payable, i.e. every output Dash Core's GetBlockTxOuts expects
+    /// for it (v24::expected_mn_outputs: the v3 payout list, a shared
+    /// masternode's share split, or scriptPayout, then the operator) has a
+    /// script. A payee with no payout data at all would be paid to an empty
+    /// script (bad-cb-payee). Returns the scheduled proRegTxHash when the
+    /// height must be REFUSED (cause=mn-payee-v24-payout-list), nullopt when
+    /// serving is safe. Same no-payment-due carve-outs as
+    /// mn_payee_resolvable_at_tip(). (Testnet shadow h=1586594, VM504 dashd
+    /// 24.0.0: before the v24 payee builder, an Evo masternode with a v3
+    /// payout list was paid to an empty scriptPayout.)
+    std::optional<uint256> mn_payee_unpayable_at_tip() const {
+        if (m_mnstates.entries().empty()) return std::nullopt;
+        const uint32_t next_h = m_prev_height + 1;
+        const int64_t reward = compute_dash_block_reward_post_v20(next_h);
+        const int64_t platform_reward =
+            compute_dash_platform_reward_post_v20_mn_rr(next_h, m_mn_rr_height);
+        if (compute_dash_mn_payment_post_v20(reward) - platform_reward <= 0) return std::nullopt;
+        const auto expected = m_mnstates.find_expected_payee();
+        if (!expected) return std::nullopt;   // payee-unresolvable owns this
+        const auto it = m_mnstates.entries().find(*expected);
+        if (it == m_mnstates.entries().end()) return std::nullopt;
+        const auto due = v24::expected_mn_outputs(it->second, int64_t{1'000'000'000'000});
+        bool payable = !due.empty();
+        for (const auto& o : due) payable = payable && !o.script.empty();
+        if (payable) return std::nullopt;
+        return *expected;
+    }
+
 
     // Incident h=2516595 (bad-cb-payee): the scheduled payee's operator-
     // reward split must be PROVEN before the embedded arm may build the
@@ -2396,6 +2868,11 @@ private:
     // inject. The per-peer half remains dash::PeerInjectGuard (tx_inject_relay.hpp).
     dash::coin::InjectRateLimiter m_inject_rate_peer{
         dash::coin::InjectRateLimiter::Scope::Peers};
+    // N3: the LOCAL budget of the dry run (validate_inject). Same caps and
+    // the same local cause names as m_inject_rate, but its own window, so a
+    // preflight loop is throttled without spending the operator's submit
+    // budget (the split the peer budget already has).
+    dash::coin::InjectRateLimiter m_inject_rate_validate;
     // #107 PHASE 2 (--embedded-accrue-asset-locks): DEFAULT OFF — accrue the
     // pending type-8 asset-lock term into the CbTx creditPoolBalance. See
     // set_accrue_pending_asset_locks. Consumed by make_embedded_work_inputs
@@ -2409,6 +2886,8 @@ private:
     // embedded_template_emit_ok (matching folded-root emit-gate re-derivation).
     bool m_include_mn_special_txs{false};
     MnFoldContext::OperatorSigFn m_protx_sig_verifier;   // B.9 (unset => refuse types 2/4)
+    std::optional<ProTxCheckEnv> m_protx_check_env;      // Core CheckPro*Tx (unset => no provider tx rides)
+    std::optional<MnhfCheckEnv>  m_mnhf_check_env;       // Core CheckMNHFTx (unset => no MNHF signal rides)
     // Pinned local tx (set_pinned_local_tx): held by value for the lifetime of
     // this state; the bundle exposes a pointer only when the flag is set.
     // MULTIPLE pins: the donation consolidation had to be SPLIT after
@@ -2451,6 +2930,12 @@ private:
     bool     m_require_resolvable_payee{true};   // refuse embedded when a due MN payee is unresolvable (#996)
     bool     m_require_provable_payout_split{true}; // refuse embedded when the scheduled MN's operator-reward split is unproven (h=2516595 bad-cb-payee)
     int      m_mn_rr_height{DASH_MN_RR_HEIGHT_MAINNET}; // network MN_RR activation height (platform-share gate)
+    V24StateFn m_v24_state_fn;   // Dash Core v24 deployment state (unset => registry for m_v24_net)
+    DashNetwork m_v24_net{DashNetwork::MAINNET};
+    AssetUnlockAdmitFn m_asset_unlock_admit_fn;   // #143 credit-pool follower admission
+    BitsAtTimeFn m_bits_at_time_fn;               // testnet min-difficulty bits (unset on mainnet)
+    mutable std::atomic<uint64_t> m_v24_payout_list_declines{0};
+    mutable std::atomic<uint32_t> m_v24_payout_list_last_h{0};
     int      m_mn_min_confirmations{DASH_MN_MIN_CONFIRMATIONS_MAINNET}; // network nMasternodeMinimumConfirmations (rollover projection)
     uint256  m_credit_pool_current_hash;     // block hash the credit-pool seed is current at
     int32_t  m_credit_pool_height{-1};       // seed cbTx's OWN height (-1 = never seeded)
