@@ -20,6 +20,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <utility>
@@ -145,7 +146,9 @@ TEST(NodeFeeDraw, FractionalFeesAreHonoured)
     core::random::seed(kSeed);
     constexpr int N = 400'000;
     // sd at 0.5% = sqrt(.005*.995/N) = 0.011%; at 1.5% = 0.019%. Tolerances
-    // are >= 8 sd; the old draw gave 0.99% for 0.5% and 1% and 1.98% for 1.5%.
+    // are about 8 sd or wider (1.5%: 7.8 sd). The old draw gave 0.99% for
+    // 0.5% and 1% and 1.98% for 1.5%: the 0.5% and 1.5% cases reject it; the
+    // 1% (old 0.990%) and 50% (old 49.5%) cases only pin the new rate.
     EXPECT_NEAR(fee_hit_rate(0.5, N), 0.005, 0.001);
     EXPECT_NEAR(fee_hit_rate(1.0, N), 0.010, 0.0015);
     EXPECT_NEAR(fee_hit_rate(1.5, N), 0.015, 0.0015);
