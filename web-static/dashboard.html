@@ -1755,7 +1755,6 @@
                     <a href="graphs.html">Graphs</a>
                     <a href="stratum.html">Stratum</a>
                     <a href="miners.html">Miners</a>
-                    <a href="index.html">Classic</a>
                     <a href="javascript:manualRefresh()" class="refresh-btn" title="Refresh data">🔄 Refresh</a>
                     <a href="javascript:toggleAutoRefresh()" id="auto-refresh-btn" class="refresh-btn" title="Toggle auto-refresh">⏸ Auto-Refresh: OFF</a>
                 </nav>
@@ -3419,7 +3418,7 @@
                 var nav = document.querySelector('nav');
                 var _old = document.getElementById('nav-explorer'); if (_old) _old.remove();
                 if (nav) {
-                    var classicLink = nav.querySelector('a[href="index.html"]');
+                    var classicLink = nav.querySelector('a[href="miners.html"]');
                     var a = document.createElement('a');
                     a.id = 'nav-explorer';
                     a.href = explorerHref;
