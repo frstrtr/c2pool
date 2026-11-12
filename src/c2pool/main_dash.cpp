@@ -638,6 +638,8 @@ void print_banner(const char* argv0)
         << "              types 1-4) + funded superblocks, reward-safe; =false opts each out)\n"
         << "           [--embedded-fresh-datum-race] [--embedded-fresh-datum-race-k N]\n"
         << "           [--embedded-getmnlistd-tracker]\n"
+        << "           [--embedded-compact-blocks[=false]]  (BIP 152 compact-block receive for new\n"
+        << "              tip bodies, default ON; =false fetches every body whole)\n"
         << "           [--embedded-fold-live PATH] [--embedded-fold-live-expect HASH]\n"
         << "           [--embedded-fold-checkscripts[=false]]\n"
         << "           [--embedded-tx-inject] [--embedded-tx-inject-hex FILE]\n"
@@ -3017,6 +3019,14 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // => the coin client keeps its stall-only rotation (byte-identical to
         // master); the setter only flips a member bool.
         coin_p2p->set_proactive_rotate_enabled(embedded_proactive_rotate);
+        // #968a: the operator's --coin-p2p-connect targets (the pinned local
+        // dashd among them) are never disconnected by Misbehaving(); neither
+        // is any loopback / private-LAN peer (p2p_client.hpp is_protected_peer).
+        {
+            std::set<std::string> protected_keys;
+            for (const auto& t : coin_p2p_targets) protected_keys.insert(t.to_string());
+            coin_p2p->set_protected_peer_keys(std::move(protected_keys));
+        }
 
         if (coin_p2p_discover_eff) {
             // ── Network-standalone arm: seed-discovered, SCORED, group-diverse
@@ -12906,6 +12916,14 @@ int main(int argc, char** argv)
             dash::coin::set_embedded_getmnlistd_tracker_enabled(true);
         else if (std::strcmp(argv[i], "--embedded-getmnlistd-tracker=false") == 0)
             dash::coin::set_embedded_getmnlistd_tracker_enabled(false);
+        // #968a --embedded-compact-blocks[=false] (default ON): ask for a new
+        // tip body as getdata(MSG_CMPCT_BLOCK) and rebuild it from the mempool.
+        // =false is the canary kill switch: every body is fetched whole, any
+        // cmpctblock is dropped. Process-wide flag (compact_negotiation.hpp).
+        else if (std::strcmp(argv[i], "--embedded-compact-blocks") == 0)
+            dash::coin::set_embedded_compact_blocks_enabled(true);
+        else if (std::strcmp(argv[i], "--embedded-compact-blocks=false") == 0)
+            dash::coin::set_embedded_compact_blocks_enabled(false);
         else if (std::strcmp(argv[i], "--embedded-asn-diversity") == 0)
             embedded_asn_diversity = true;   // PR-4: require racing set to span >=2 ASNs
         else if (std::strcmp(argv[i], "--embedded-asn-diversity=false") == 0)

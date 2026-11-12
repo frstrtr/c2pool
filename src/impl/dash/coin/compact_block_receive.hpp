@@ -11,47 +11,43 @@
 //   cmpctblock -> InitData
 //       OK, every tx present (prefilled + mempool)  -> FillBlock -> Complete
 //       OK, some tx missing                          -> NeedTxn (getblocktxn),
-//                                                       block parked per peer
+//                                                       block parked
 //       INVALID (bad short-id / prefilled index)     -> Reject (dashcore
 //                                                       Misbehaving(100))
 //       FAILED (short-id collision)                  -> FallbackFull (getdata
 //                                                       MSG_BLOCK)
-//   blocktxn -> FillBlock against the peer's parked block
-//       no parked block / hash mismatch              -> Ignore (dashcore
+//   blocktxn -> FillBlock against the (peer, hash) park
+//       no park for (peer, hash)                     -> Ignore (dashcore
 //                                                       "unrequested blocktxn")
-//       INVALID (too few / too many txs)             -> Reject
+//       tx count != the indexes we asked for         -> Ignore, park kept (the
+//                                                       lost-body watchdog
+//                                                       falls back)
 //       filled, body does not bind to header merkle  -> FallbackFull
 //       filled + binds                               -> Complete
 //
 // The merkle bind is the adaptation the vendor note asks for: vendor
-// FillBlock drops dashcore's CheckBlock, so a short-id collision that pulled
-// in the wrong mempool tx would otherwise ride through unchecked. dashcore
-// answers that case (READ_STATUS_CHECKBLOCK_FAILED) by fetching the full
-// block, and so do we. block_body_binds_to_header also carries the
+// FillBlock drops dashcore's CheckBlock/IsBlockMutated, so a short-id
+// collision that pulled in the wrong mempool tx would otherwise ride through
+// unchecked. dashcore answers that case (READ_STATUS_FAILED) by fetching the
+// full block, and so do we. block_body_binds_to_header also carries the
 // CVE-2012-2459 duplicate-padding guard.
 //
-// One parked block per peer (dashcore keeps one in-flight compact block per
-// peer per hash). A new cmpctblock from the same peer replaces the old one.
-// on_disconnect drops it; drop_block drops every peer's park for one hash
-// (the body landed, or the lost-body watchdog fell back to a full block).
+// Parks are keyed by (peer, block hash), at most MAX_PARKED_PER_PEER per peer
+// and MAX_PARKED_TOTAL overall (the oldest goes first). on_disconnect drops a
+// peer's parks; drop_block drops every park for one hash (the body landed, or
+// the lost-body watchdog fell back to a full block).
 //
-// compact_gate() is the DoS gate the CoinClient runs BEFORE InitData (dashcore
-// ProcessMessage CMPCTBLOCK, the part between the header and InitData):
-//   prev header unknown                 -> GetHeaders (MaybeSendGetHeaders)
-//   header PoW does not meet its nBits  -> Misbehave  (BLOCK_INVALID_HEADER,
-//                                                      Misbehaving(100))
-//   header refused by the header chain  -> Drop
-//   body already held                   -> Drop       (BLOCK_HAVE_DATA)
-//   not more work than our best body    -> FetchFull if we asked this peer
-//                                          (getdata MSG_BLOCK), else Drop
-//   more than 2 blocks past our best    -> FetchFull if asked, else
-//   body                                   HeaderOnly (fRevertToHeaderProcessing)
-//   asked this peer, or this peer is    -> Reconstruct (InitData)
-//   one of our high-bandwidth peers
-//   otherwise                           -> HeaderOnly
-// So InitData (the short-id map, the mempool walk) only ever runs for a header
-// with real PoW that connects to our chain, extends our best body by at most
-// two, and that we either requested from this peer or asked this peer to push.
+// compact_gate() is the gate the CoinClient runs BEFORE InitData. A
+// cmpctblock is processed ONLY as the answer to our own getdata
+// (MSG_CMPCT_BLOCK) to that peer, and only for a header that is already in
+// our header chain (it came through getheaders, like every other header).
+// Nothing from a cmpctblock is ever fed to the header chain:
+//   not our request to this peer        -> Ignore (unsolicited: dropped)
+//   header not in our header chain      -> FetchFull (getdata MSG_BLOCK)
+//   body already held                   -> Drop      (BLOCK_HAVE_DATA)
+//   not more work than our best body,   -> FetchFull (dashcore: we asked, but
+//   or more than 2 past it                 the mempool will not help)
+//   otherwise                           -> Reconstruct (InitData)
 
 #include <impl/dash/coin/vendor/blockencodings.hpp>
 #include <impl/dash/coin/block.hpp>
@@ -77,30 +73,11 @@ namespace coin {
 // MaxBlockSize() / MIN_TRANSACTION_SIZE, so this (not a tx count) is what the
 // receiver passes down.
 inline constexpr size_t DASH_MAX_BLOCK_SIZE = 2'000'000;
-// Dash Core net_processing.cpp: we serve cmpctblock / blocktxn only for blocks
-// this close to our tip.
-inline constexpr int MAX_CMPCTBLOCK_DEPTH = 5;
-inline constexpr int MAX_BLOCKTXN_DEPTH   = 10;
-// Dash Core net_processing.cpp MAX_CMPCTBLOCKS_INFLIGHT_PER_BLOCK: at most this
-// many peers reconstruct one block at a time.
-inline constexpr size_t MAX_CMPCTBLOCKS_INFLIGHT_PER_BLOCK = 3;
-
-// CheckBlockHeader's proof of work: X11(header) <= the target nBits encodes,
-// with nBits itself well formed (Dash Core CheckProofOfWork, minus the
-// powLimit bound, which the header chain applies when the header is added).
-inline bool header_pow_meets_bits(const uint256& x11_hash, uint32_t bits)
-{
-    bool negative = false, overflow = false;
-    uint256 target;
-    target.SetCompact(bits, &negative, &overflow);
-    if (negative || overflow || target.IsNull())
-        return false;
-    return x11_hash <= target;
-}
 
 // The header-chain facts the cmpctblock gate needs. Supplied by the owner of
 // the HeaderChain (main_dash binds it, compact_mempool_provider.hpp); the
-// receiver and the client stay free of the chain itself.
+// receiver and the client stay free of the chain itself. Read-only: the
+// compact path never adds a header.
 struct CompactChainEntry
 {
     uint32_t height{0};
@@ -112,62 +89,36 @@ struct CompactChainView
 {
     std::function<std::optional<CompactChainEntry>(const uint256&)> lookup;
     std::function<uint256()> tip_hash;                 // best header
-    std::function<std::vector<uint256>()> locator;     // for getheaders
     explicit operator bool() const
     {
-        return static_cast<bool>(lookup) && static_cast<bool>(tip_hash)
-            && static_cast<bool>(locator);
+        return static_cast<bool>(lookup) && static_cast<bool>(tip_hash);
     }
 };
 
 struct CompactGateFacts
 {
-    bool prev_known{false};        // header.hashPrevBlock is in the header chain
-    bool pow_ok{false};            // header_pow_meets_bits
-    bool header_accepted{false};   // in the header chain after we fed it
+    bool requested{false};         // we sent THIS peer getdata(MSG_CMPCT_BLOCK)
+    bool header_known{false};      // the header is already in our header chain
     bool have_body{false};         // the body was already delivered
     bool more_work{false};         // chain work > our best delivered body's
     bool near_tip{false};          // height <= best delivered body + 2
-    bool requested{false};         // we sent THIS peer getdata(MSG_CMPCT_BLOCK)
-    bool high_bandwidth{false};    // we asked THIS peer to push (sendcmpct 1)
 };
 
 enum class CompactGate
 {
-    GetHeaders,
-    Misbehave,
+    Ignore,
     Drop,
     FetchFull,
-    HeaderOnly,
     Reconstruct,
 };
 
-inline const char* compact_gate_name(CompactGate g)
-{
-    switch (g) {
-    case CompactGate::GetHeaders:  return "getheaders";
-    case CompactGate::Misbehave:   return "misbehave";
-    case CompactGate::Drop:        return "drop";
-    case CompactGate::FetchFull:   return "fetch-full";
-    case CompactGate::HeaderOnly:  return "header-only";
-    case CompactGate::Reconstruct: return "reconstruct";
-    }
-    return "?";
-}
-
 inline CompactGate compact_gate(const CompactGateFacts& f)
 {
-    if (!f.prev_known)      return CompactGate::GetHeaders;
-    if (!f.pow_ok)          return CompactGate::Misbehave;
-    if (!f.header_accepted) return CompactGate::Drop;
-    if (f.have_body)        return CompactGate::Drop;
-    if (!f.more_work)
-        return f.requested ? CompactGate::FetchFull : CompactGate::Drop;
-    if (!f.near_tip)
-        return f.requested ? CompactGate::FetchFull : CompactGate::HeaderOnly;
-    if (f.requested || f.high_bandwidth)
-        return CompactGate::Reconstruct;
-    return CompactGate::HeaderOnly;
+    if (!f.requested)                 return CompactGate::Ignore;
+    if (!f.header_known)              return CompactGate::FetchFull;
+    if (f.have_body)                  return CompactGate::Drop;
+    if (!f.more_work || !f.near_tip)  return CompactGate::FetchFull;
+    return CompactGate::Reconstruct;
 }
 
 struct CompactReceiveVerdict
@@ -177,7 +128,7 @@ struct CompactReceiveVerdict
         NeedTxn,       // send `request` as getblocktxn to the same peer
         FallbackFull,  // send getdata MSG_BLOCK for `blockhash`
         Reject,        // malformed by the peer (dashcore Misbehaving)
-        Ignore,        // nothing to do (unrequested / stale blocktxn)
+        Ignore,        // nothing to do (unrequested / mismatched blocktxn)
     };
 
     Kind kind{Kind::Ignore};
@@ -190,6 +141,9 @@ struct CompactReceiveVerdict
 class CompactBlockReceiver
 {
 public:
+    static constexpr size_t MAX_PARKED_PER_PEER = 2;
+    static constexpr size_t MAX_PARKED_TOTAL    = 8;
+
     // `max_block_size` is the block size limit in bytes (DASH_MAX_BLOCK_SIZE
     // in production), as Dash Core passes MaxBlockSize() to InitData.
     CompactBlockReceiver(vendor::MempoolShortIdProvider mempool,
@@ -205,7 +159,7 @@ public:
     {
         CompactReceiveVerdict v;
         v.blockhash = blockhash;
-        m_parked.erase(peer);   // a fresh announcement supersedes the old one
+        m_parked.erase(Key{peer, blockhash});   // a repeat of the same block restarts it
 
         auto pdb = std::make_unique<vendor::PartiallyDownloadedBlock>(
             m_mempool, m_max_block_size);
@@ -231,7 +185,7 @@ public:
         if (req.indexes.empty())
             return fill(*pdb, {}, blockhash);
 
-        m_parked[peer] = Parked{blockhash, std::move(pdb)};
+        park(peer, blockhash, std::move(pdb), req.indexes.size());
         v.kind = CompactReceiveVerdict::Kind::NeedTxn;
         v.request = std::move(req);
         v.reason = "missing transactions";
@@ -243,10 +197,18 @@ public:
     {
         CompactReceiveVerdict v;
         v.blockhash = txs.blockhash;
-        auto it = m_parked.find(peer);
-        if (it == m_parked.end() || it->second.blockhash != txs.blockhash) {
+        auto it = m_parked.find(Key{peer, txs.blockhash});
+        if (it == m_parked.end()) {
             v.kind = CompactReceiveVerdict::Kind::Ignore;
             v.reason = "unrequested blocktxn";
+            return v;
+        }
+        // Not an answer to what we asked for: ignore it and keep waiting; the
+        // lost-body watchdog turns a park that never completes into a full
+        // block from another peer. Never punished.
+        if (txs.txn.size() != it->second.requested_count) {
+            v.kind = CompactReceiveVerdict::Kind::Ignore;
+            v.reason = "blocktxn tx count differs from the getblocktxn we sent";
             return v;
         }
         auto pdb = std::move(it->second.pdb);
@@ -254,33 +216,30 @@ public:
         return fill(*pdb, txs.txn, txs.blockhash);
     }
 
-    void on_disconnect(const std::string& peer) { m_parked.erase(peer); }
+    void on_disconnect(const std::string& peer)
+    {
+        for (auto it = m_parked.begin(); it != m_parked.end();)
+            if (it->first.first == peer) it = m_parked.erase(it);
+            else ++it;
+    }
     void clear_parked() { m_parked.clear(); }
 
-    // Drop every peer's park for `blockhash`. Returns how many were dropped.
+    // Drop every park for `blockhash`. Returns how many were dropped.
     size_t drop_block(const uint256& blockhash)
     {
         size_t n = 0;
         for (auto it = m_parked.begin(); it != m_parked.end();)
-            if (it->second.blockhash == blockhash) { it = m_parked.erase(it); ++n; }
+            if (it->first.second == blockhash) { it = m_parked.erase(it); ++n; }
             else ++it;
         return n;
-    }
-
-    // The hash `peer` has parked, if any.
-    std::optional<uint256> parked_hash(const std::string& peer) const
-    {
-        auto it = m_parked.find(peer);
-        if (it == m_parked.end()) return std::nullopt;
-        return it->second.blockhash;
     }
 
     // How many peers have `blockhash` parked.
     size_t parked_count_for(const uint256& blockhash) const
     {
         size_t n = 0;
-        for (const auto& [_, pk] : m_parked)
-            if (pk.blockhash == blockhash) ++n;
+        for (const auto& [k, _] : m_parked)
+            if (k.second == blockhash) ++n;
         return n;
     }
 
@@ -294,13 +253,44 @@ public:
     bool has_mempool_provider() const { return static_cast<bool>(m_mempool); }
 
     size_t parked_count() const { return m_parked.size(); }
-    bool has_parked(const std::string& peer) const { return m_parked.count(peer) != 0; }
+    bool has_parked(const std::string& peer) const
+    {
+        for (const auto& [k, _] : m_parked)
+            if (k.first == peer) return true;
+        return false;
+    }
+    bool has_parked(const std::string& peer, const uint256& blockhash) const
+    {
+        return m_parked.count(Key{peer, blockhash}) != 0;
+    }
 
 private:
+    using Key = std::pair<std::string, uint256>;
     struct Parked {
-        uint256 blockhash;
         std::unique_ptr<vendor::PartiallyDownloadedBlock> pdb;
+        size_t requested_count{0};   // indexes in the getblocktxn we sent
+        uint64_t seq{0};             // park order, for eviction
     };
+
+    void park(const std::string& peer, const uint256& blockhash,
+              std::unique_ptr<vendor::PartiallyDownloadedBlock> pdb, size_t requested)
+    {
+        auto evict_oldest = [this](bool same_peer_only, const std::string& p) {
+            auto victim = m_parked.end();
+            for (auto it = m_parked.begin(); it != m_parked.end(); ++it) {
+                if (same_peer_only && it->first.first != p) continue;
+                if (victim == m_parked.end() || it->second.seq < victim->second.seq)
+                    victim = it;
+            }
+            if (victim != m_parked.end()) m_parked.erase(victim);
+        };
+        size_t mine = 0;
+        for (const auto& [k, _] : m_parked)
+            if (k.first == peer) ++mine;
+        if (mine >= MAX_PARKED_PER_PEER) evict_oldest(true, peer);
+        if (m_parked.size() >= MAX_PARKED_TOTAL) evict_oldest(false, peer);
+        m_parked[Key{peer, blockhash}] = Parked{std::move(pdb), requested, ++m_seq};
+    }
 
     CompactReceiveVerdict fill(vendor::PartiallyDownloadedBlock& pdb,
                                const std::vector<vendor::CTransactionRef>& missing,
@@ -311,7 +301,7 @@ private:
         BlockType block;
         if (pdb.FillBlock(block, missing) != vendor::READ_STATUS_OK) {
             v.kind = CompactReceiveVerdict::Kind::Reject;
-            v.reason = "blocktxn count does not match the request";
+            v.reason = "blocktxn does not fill the block";
             return v;
         }
         if (!block_body_binds_to_header(block)) {
@@ -326,7 +316,8 @@ private:
 
     vendor::MempoolShortIdProvider m_mempool;
     size_t m_max_block_size;
-    std::map<std::string, Parked> m_parked;
+    std::map<Key, Parked> m_parked;
+    uint64_t m_seq{0};
 };
 
 } // namespace coin

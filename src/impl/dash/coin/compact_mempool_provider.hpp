@@ -64,8 +64,9 @@ inline vendor::MempoolShortIdProvider make_mempool_short_id_provider(const Mempo
 }
 
 // The cmpctblock gate's view of a HeaderChain (compact_block_receive.hpp
-// CompactChainView). Holds `chain` by raw pointer: bind it through
-// CompactChainViewBinding when the client can outlive the chain.
+// CompactChainView): lookups only, the compact path never adds a header.
+// Holds `chain` by raw pointer: bind it through CompactChainViewBinding when
+// the client can outlive the chain.
 inline CompactChainView make_header_chain_compact_view(const HeaderChain* chain)
 {
     CompactChainView v;
@@ -80,7 +81,6 @@ inline CompactChainView make_header_chain_compact_view(const HeaderChain* chain)
         auto t = chain->tip();
         return t ? t->hash : uint256();
     };
-    v.locator = [chain]() { return chain->get_locator(); };
     return v;
 }
 

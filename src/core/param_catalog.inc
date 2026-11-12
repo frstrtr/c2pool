@@ -636,6 +636,9 @@ C2P_PARAM("embedded.fresh_datum_race_k", Embedded, INT64, LIVE, C_DASH, LIT, "2"
 C2P_PARAM("embedded.getmnlistd_tracker", Embedded, TRISTATE_BOOL, LIVE, C_DASH, NONE, "", NONE, "10s slot re-ask tracker (default ON)")
   C2P_ALIAS("embedded.getmnlistd_tracker", BIN_DASH, "--embedded-getmnlistd-tracker", FLAG_OPT_EQFALSE)
 
+C2P_PARAM("embedded.compact_blocks", Embedded, TRISTATE_BOOL, RESTART, C_DASH, NONE, "", NONE, "BIP 152 compact-block receive for new tip bodies (default ON; =false fetches every body whole)")
+  C2P_ALIAS("embedded.compact_blocks", BIN_DASH, "--embedded-compact-blocks", FLAG_OPT_EQFALSE)
+
 C2P_PARAM("embedded.asn_diversity", Embedded, TRISTATE_BOOL, LIVE, C_DASH, NONE, "", NONE, "require >=2 ASNs in racing set")
   C2P_ALIAS("embedded.asn_diversity", BIN_DASH, "--embedded-asn-diversity", FLAG_OPT_EQFALSE)
 

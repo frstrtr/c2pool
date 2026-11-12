@@ -563,9 +563,6 @@ struct PeerSession
     // disconnects it (never from inside its own read handler).
     int misbehavior{0};
     std::string disconnect_reason;   // non-empty = flagged for disconnect
-    // dashcore MaybeSendGetHeaders: one getheaders per peer per
-    // HEADERS_RESPONSE_TIME for a cmpctblock whose parent we lack.
-    int64_t last_cmpct_getheaders{0};
 
     // TEST-ONLY write observer, stamped at attach from the client's
     // set_write_tap_for_test(). Empty in production.
@@ -833,64 +830,63 @@ private:
     // member here.
     dash::coin::GetmnlistdSlotTracker m_getmnlistd_tracker;
 
-    // ── #968a BIP 152 compact blocks (receive + minimal serving) ──────────
-    // One parked block per peer while a getblocktxn is outstanding. Starts
+    // ── #968a BIP 152 compact blocks (receive only) ──────────────────────
+    // One park per (peer, block) while a getblocktxn is outstanding. Starts
     // with no mempool provider; set_compact_mempool_provider arms it. The
     // bound passed down is Dash Core's MaxBlockSize() in BYTES: InitData
     // divides it by MIN_TRANSACTION_SIZE itself (2'000'000 / 10 = 200'000 tx).
     dash::coin::CompactBlockReceiver m_cmpct_rx{nullptr, dash::coin::DASH_MAX_BLOCK_SIZE};
-    // Per-peer sendcmpct state (dashcore m_provides_cmpctblocks /
-    // m_requested_hb_cmpctblocks). Read before asking a peer for
-    // MSG_CMPCT_BLOCK and before asking it for high-bandwidth push.
+    // Per-peer sendcmpct state (dashcore m_provides_cmpctblocks). Read before
+    // asking a peer for MSG_CMPCT_BLOCK. We send no sendcmpct ourselves
+    // (compact_negotiation.hpp).
     dash::coin::CompactPeerNegotiation m_cmpct_neg;
-    // The (at most three) peers we asked to push cmpctblock (sendcmpct 1).
-    dash::coin::CompactHighBandwidthSet m_cmpct_hb;
-    // The header chain as the cmpctblock gate sees it. Unset = compact blocks
-    // are OFF: nothing is requested as MSG_CMPCT_BLOCK, nobody is asked for
-    // high-bandwidth push, and a cmpctblock is dropped unprocessed.
+    // The header chain as the cmpctblock gate sees it (lookups only). Unset =
+    // compact blocks are OFF: nothing is requested as MSG_CMPCT_BLOCK and a
+    // cmpctblock is dropped unprocessed.
     dash::coin::CompactChainView m_cmpct_view;
-    // getdata(MSG_CMPCT_BLOCK) we sent: block hash -> peer asked. Dashcore
-    // mapBlocksInFlight with a partialBlock; "requested_block_from_this_peer".
-    // Erased when the body lands or the watchdog falls back to a full block.
+    // getdata(MSG_CMPCT_BLOCK) we sent: block hash -> peer asked. A cmpctblock
+    // is processed ONLY when it answers one of these (dashcore
+    // "requested_block_from_this_peer"). Erased when the body lands, the
+    // watchdog falls back to a full block, or the peer goes.
     struct CmpctAsk { std::string key; int64_t at{0}; };
     std::map<uint256, CmpctAsk> m_cmpct_requested;
     // Block bodies already delivered (dashcore BLOCK_HAVE_DATA, for the gate)
     // and the most-work one among them (dashcore ActiveChain().Tip(): the
     // "more work than our tip" and "height <= tip + 2" checks). Bounded FIFO.
+    // Only bodies that bind to their header ever get here.
     static constexpr size_t RECENT_BODIES_CAP = 64;
     std::deque<uint256> m_recent_body_order;
     std::set<uint256>   m_recent_bodies;
     struct BodyTip { uint256 hash; uint32_t height{0}; uint256 work; };
     std::optional<BodyTip> m_body_tip;
-    // Recent tip bodies (and won blocks) we can serve as cmpctblock/blocktxn.
-    // Dashcore serves both only within MAX_CMPCTBLOCK_DEPTH / MAX_BLOCKTXN_DEPTH
-    // of its tip; we hold the last few only.
-    static constexpr size_t SERVED_BLOCKS_CAP = 4;
-    static_assert(SERVED_BLOCKS_CAP <= static_cast<size_t>(dash::coin::MAX_CMPCTBLOCK_DEPTH),
-                  "serve only blocks dashcore would still serve as cmpctblock");
-    struct ServedBlock { uint256 hash; std::shared_ptr<const BlockType> block; };
-    std::deque<ServedBlock> m_served_blocks;
     // Who we asked for which body (any getdata MSG_BLOCK / MSG_CMPCT_BLOCK).
     // A delivery credits the peer (bulk forgiveness, delivered tally, TipBody
-    // latency) only when we asked THAT peer for THAT body. Bounded FIFO.
+    // latency) only when we asked THAT peer for THAT body, and consumes only
+    // that peer's ask. Bounded FIFO.
     static constexpr size_t BODY_ASK_CAP = 8192;
     std::map<uint256, std::vector<std::string>> m_body_asks;
     std::deque<uint256> m_body_ask_order;
-    // dashcore DISCOURAGEMENT_THRESHOLD and the time a discouraged address is
-    // kept off the dial plan (dashcore keeps it in its rolling filter; a day
-    // is the same order).
+    // dashcore DISCOURAGEMENT_THRESHOLD. Crossing it disconnects the peer and
+    // keeps its address off the dial plan for MISBEHAVE_BACKOFF_SEC (not
+    // dashcore's day-long discouragement: the only trigger left is a malformed
+    // answer to our own compact request, and a backoff this short bounds the
+    // damage if the fault is ours, e.g. a codec bug, while a hostile peer that
+    // comes back is cut again on its next bad answer). Protected peers
+    // (operator-pinned, local) are never disconnected, and neither is our
+    // last handshaked peer.
     static constexpr int     DISCOURAGEMENT_THRESHOLD = 100;
-    static constexpr int64_t DISCOURAGE_SEC = 24 * 60 * 60;
-    // dashcore HEADERS_RESPONSE_TIME (MaybeSendGetHeaders spacing).
-    static constexpr int64_t CMPCT_GETHEADERS_SPACING_SEC = 120;
+    static constexpr int64_t MISBEHAVE_BACKOFF_SEC = 30 * 60;
+    std::set<std::string> m_protected_peer_keys;
     uint64_t m_cmpct_requests{0};          // getdata(MSG_CMPCT_BLOCK) sent
     uint64_t m_cmpct_reconstructed{0};     // bodies delivered via cmpctblock
     uint64_t m_cmpct_getblocktxn{0};       // getblocktxn sent
     uint64_t m_cmpct_fallbacks{0};         // full-block fallbacks
-    uint64_t m_cmpct_rejected{0};          // InitData/FillBlock INVALID
-    uint64_t m_cmpct_gate_dropped{0};      // cmpctblock refused by the gate
-    uint64_t m_cmpct_served{0};            // cmpctblock / blocktxn we served
+    uint64_t m_cmpct_rejected{0};          // InitData INVALID (malformed answer)
+    uint64_t m_cmpct_unsolicited{0};       // cmpctblock we did not ask for: dropped
+    uint64_t m_cmpct_gate_dropped{0};      // answered, but refused by the gate
+    uint64_t m_bodies_unbound{0};          // bodies refused: merkle root mismatch
     uint64_t m_misbehavior_disconnects{0};
+    uint64_t m_misbehavior_spared{0};      // would disconnect, but protected / last peer
     // WARNING lines on the compact path are rate-limited: at most
     // CMPCT_WARN_BURST per CMPCT_WARN_WINDOW_SEC, the rest counted and
     // reported on the next line that gets through.
@@ -1464,11 +1460,10 @@ public:
         m_active = nullptr;
         m_pool.clear();
         // #968a: per-peer compact state belongs to the sessions just dropped.
-        // The delivered-body record and the serving cache are chain facts and
+        // The delivered-body record and the best-body pointer are chain facts and
         // stay.
         m_cmpct_rx.clear_parked();
         m_cmpct_neg.clear();
-        m_cmpct_hb.clear();
         m_cmpct_requested.clear();
     }
 
@@ -1837,35 +1832,45 @@ public:
     void set_compact_chain_view(dash::coin::CompactChainView v)
     { m_cmpct_view = std::move(v); }
     bool has_compact_chain_view() const { return static_cast<bool>(m_cmpct_view); }
-    /// Compact blocks are ON when both the header chain and the mempool are
-    /// wired (dashcore: never request compact blocks in -blocksonly mode, our
-    /// mempool would not help).
+    /// Compact blocks are ON when --embedded-compact-blocks is on (default)
+    /// and both the header chain and the mempool are wired (dashcore: never
+    /// request compact blocks in -blocksonly mode, our mempool would not help).
     bool compact_blocks_enabled() const
-    { return static_cast<bool>(m_cmpct_view) && m_cmpct_rx.has_mempool_provider(); }
-    /// One greppable line for the compact lane.
+    {
+        return dash::coin::embedded_compact_blocks_enabled()
+            && static_cast<bool>(m_cmpct_view) && m_cmpct_rx.has_mempool_provider();
+    }
+    /// Peers that misbehaving() never disconnects: the operator's
+    /// --coin-p2p-connect targets (the pinned local dashd among them). Peers on
+    /// loopback / private-LAN addresses are protected as well.
+    void set_protected_peer_keys(std::set<std::string> keys)
+    { m_protected_peer_keys = std::move(keys); }
+    /// One greppable line for the compact lane (logged with POOL-STATUS).
     std::string compact_status() const
     {
-        std::string hb;
-        for (const auto& k : m_cmpct_hb.peers()) { if (!hb.empty()) hb += ","; hb += k; }
         return "[CMPCT] enabled=" + std::to_string(compact_blocks_enabled() ? 1 : 0)
              + " requested=" + std::to_string(m_cmpct_requests)
              + " reconstructed=" + std::to_string(m_cmpct_reconstructed)
              + " getblocktxn=" + std::to_string(m_cmpct_getblocktxn)
              + " fallbacks=" + std::to_string(m_cmpct_fallbacks)
              + " rejected=" + std::to_string(m_cmpct_rejected)
+             + " unsolicited=" + std::to_string(m_cmpct_unsolicited)
              + " gate_dropped=" + std::to_string(m_cmpct_gate_dropped)
-             + " served=" + std::to_string(m_cmpct_served)
+             + " unbound_bodies=" + std::to_string(m_bodies_unbound)
              + " misbehavior_disconnects=" + std::to_string(m_misbehavior_disconnects)
-             + " hb=[" + hb + "]";
+             + " misbehavior_spared=" + std::to_string(m_misbehavior_spared)
+             + " parked=" + std::to_string(m_cmpct_rx.parked_count());
     }
     uint64_t cmpct_requests() const        { return m_cmpct_requests; }
     uint64_t cmpct_reconstructed() const   { return m_cmpct_reconstructed; }
     uint64_t cmpct_getblocktxn() const     { return m_cmpct_getblocktxn; }
     uint64_t cmpct_fallbacks() const       { return m_cmpct_fallbacks; }
     uint64_t cmpct_rejected() const        { return m_cmpct_rejected; }
+    uint64_t cmpct_unsolicited() const     { return m_cmpct_unsolicited; }
     uint64_t cmpct_gate_dropped() const    { return m_cmpct_gate_dropped; }
-    uint64_t cmpct_served() const          { return m_cmpct_served; }
+    uint64_t bodies_unbound() const        { return m_bodies_unbound; }
     uint64_t misbehavior_disconnects() const { return m_misbehavior_disconnects; }
+    uint64_t misbehavior_spared() const    { return m_misbehavior_spared; }
     /// TEST-ONLY: observe every message written to any peer (key, message).
     /// Stamped onto sessions attached AFTER the call and onto live ones.
     void set_write_tap_for_test(std::function<void(const std::string&, const RawMessage&)> tap)
@@ -1877,14 +1882,22 @@ public:
     bool cmpct_requested_from_for_test(const uint256& h, const std::string& key) const
     { auto it = m_cmpct_requested.find(h); return it != m_cmpct_requested.end() && it->second.key == key; }
     bool cmpct_parked_for_test(const std::string& key) const { return m_cmpct_rx.has_parked(key); }
+    bool cmpct_parked_for_test(const std::string& key, const uint256& h) const
+    { return m_cmpct_rx.has_parked(key, h); }
     size_t cmpct_parked_count_for_test() const { return m_cmpct_rx.parked_count(); }
-    bool cmpct_high_bandwidth_for_test(const std::string& key) const { return m_cmpct_hb.contains(key); }
-    size_t cmpct_high_bandwidth_count_for_test() const { return m_cmpct_hb.size(); }
     bool have_body_for_test(const uint256& h) const { return have_body(h); }
     int misbehavior_for_test(const std::string& key) const
     { for (const auto& p : m_pool) if (p->key == key) return p->misbehavior; return 0; }
     bool flagged_for_disconnect_for_test(const std::string& key) const
     { for (const auto& p : m_pool) if (p->key == key) return !p->disconnect_reason.empty(); return false; }
+    /// TEST-ONLY: send a getdata(MSG_CMPCT_BLOCK) for `h` to a named peer, as
+    /// request_block_impl would (the L2 multi-park KAT asks one peer for two
+    /// blocks).
+    bool request_compact_from_for_test(const std::string& key, const uint256& h)
+    { PeerSession* p = find_peer(key); if (!p) return false; send_block_getdata(p, h, true); return true; }
+    /// TEST-ONLY: misbehaving() on a named peer (the protection KATs).
+    void misbehaving_for_test(const std::string& key, int howmuch)
+    { if (PeerSession* p = find_peer(key)) misbehaving(p, howmuch, "test"); }
     bool request_block_tracked_for_test(const uint256& h) { return request_block_tracked(h); }
     /// Register ONE historical-mnlistdiff consumer. Additive, not a slot: the
     /// Phase-L member source and the MN-checkpoint lane both source historical
@@ -3119,20 +3132,6 @@ public:
     /// count being honest, so it is logged either way.
     std::size_t submit_block_p2p_raw(const std::vector<unsigned char>& raw_block)
     {
-        // #968a: a peer we asked for high-bandwidth push knows we provide
-        // compact blocks; after this push it may ask us for this block
-        // compactly (compact_negotiation.hpp). Hold it for serving. A parse
-        // failure only skips the cache, never the relay below.
-        if (compact_blocks_enabled())
-        {
-            try {
-                PackStream ps(raw_block);
-                BlockType won;
-                ps >> won;
-                auto hp = pack(static_cast<BlockHeaderType>(won));
-                cache_served_block(dash::crypto::hash_x11(hp.get_span()), won);
-            } catch (const std::exception&) {}
-        }
         std::size_t sent = 0;
         std::string targets;
         for (auto& p : m_pool)
@@ -3617,16 +3616,18 @@ private:
         }
     }
 
-    /// The body for `h` landed from `key`: was that peer asked for it? The
-    /// ask record for `h` is consumed either way.
+    /// The body for `h` landed from `key`: was that peer asked for it? Only
+    /// THAT peer's ask is consumed. A delivery from a peer we did not ask
+    /// leaves every other peer's ask (and its credit) where it was.
     bool take_body_ask(const uint256& h, const std::string& key)
     {
         auto it = m_body_asks.find(h);
         if (it == m_body_asks.end()) return false;
-        const bool asked = std::find(it->second.begin(), it->second.end(), key)
-                           != it->second.end();
-        m_body_asks.erase(it);
-        return asked;
+        auto k = std::find(it->second.begin(), it->second.end(), key);
+        if (k == it->second.end()) return false;
+        it->second.erase(k);
+        if (it->second.empty()) m_body_asks.erase(it);
+        return true;
     }
 
     bool have_body(const uint256& h) const { return m_recent_bodies.count(h) != 0; }
@@ -3752,76 +3753,58 @@ private:
         return s;
     }
 
-    /// dashcore Misbehaving(): add to the peer's score; crossing
+    /// A peer misbehaving() never disconnects: an operator-pinned target
+    /// (--coin-p2p-connect, set_protected_peer_keys) or one on a loopback /
+    /// private-LAN address (the local dashd).
+    bool is_protected_peer(const PeerSession* p) const
+    {
+        if (!p) return false;
+        if (m_protected_peer_keys.count(p->key)) return true;
+        const AddrClass c = classify_address(p->addr.address());
+        return c == AddrClass::loopback || c == AddrClass::private_net;
+    }
+
+    /// dashcore Misbehaving(): add to the peer's score. Crossing
     /// DISCOURAGEMENT_THRESHOLD flags it for disconnect (handle() stops
     /// processing its messages, the next pool tick removes it) and keeps its
-    /// address off the dial plan for DISCOURAGE_SEC.
+    /// address off the dial plan for MISBEHAVE_BACKOFF_SEC. Never for a
+    /// protected peer, and never for our only handshaked peer: those are
+    /// logged and counted (misbehavior_spared), the bad message is still
+    /// dropped by the caller.
     void misbehaving(PeerSession* p, int howmuch, const std::string& reason)
     {
         if (!p || howmuch <= 0) return;
         const int before = p->misbehavior;
         p->misbehavior += howmuch;
-        const bool discourage = p->misbehavior >= DISCOURAGEMENT_THRESHOLD
-                                && before < DISCOURAGEMENT_THRESHOLD;
+        // At or over the threshold and not yet flagged. A peer spared earlier
+        // (last peer) is cut on its next offence once another peer is up.
+        bool cross = p->misbehavior >= DISCOURAGEMENT_THRESHOLD
+                     && p->disconnect_reason.empty();
+        // An alternative is another handshaked peer that is not itself on its
+        // way out.
+        size_t others = 0;
+        for (const auto& up : m_pool)
+            if (up.get() != p && up->handshake.complete() && up->disconnect_reason.empty())
+                ++others;
+        const char* spared = nullptr;
+        if (cross && is_protected_peer(p)) spared = "protected peer";
+        else if (cross && others == 0)     spared = "no other peer";
+        if (spared) { ++m_misbehavior_spared; cross = false; }
         if (cmpct_warn_allowed())
             LOG_WARNING << "[" << m_chain_label << "] Misbehaving: peer=" << p->key
                         << " (" << before << " -> " << p->misbehavior << ")"
-                        << (discourage ? " DISCOURAGE THRESHOLD EXCEEDED" : "")
+                        << (cross ? " disconnecting, backoff "
+                                    + std::to_string(MISBEHAVE_BACKOFF_SEC) + "s"
+                                  : std::string())
+                        << (spared ? std::string(" NOT disconnected: ") + spared
+                                   : std::string())
                         << ": " << reason << cmpct_warn_suffix();
-        if (!discourage) return;
+        if (!cross) return;
         p->disconnect_reason = "misbehaving: " + reason;
         auto& until = m_rotation_cooldown[p->key];
-        until = std::max<int64_t>(until, now_sec() + DISCOURAGE_SEC);
+        until = std::max<int64_t>(until, now_sec() + MISBEHAVE_BACKOFF_SEC);
         ++m_misbehavior_disconnects;
         m_cmpct_rx.on_disconnect(p->key);
-        m_cmpct_hb.on_disconnect(p->key);
-    }
-
-    /// dashcore BlockChecked -> MaybeSetPeerAsAnnouncingHeaderAndIDs: the peer
-    /// whose block just became our new tip, with nothing else in flight, is
-    /// asked to push new blocks as cmpctblock (sendcmpct 1); past three, the
-    /// oldest is told to stop (sendcmpct 0). Skipped unless compact blocks
-    /// are on (dashcore: never in -blocksonly) and the peer provides them.
-    void maybe_set_high_bandwidth(PeerSession* p)
-    {
-        if (!p || !compact_blocks_enabled()) return;
-        if (!m_pending_bodies.empty() || !m_cmpct_requested.empty()) return;
-        if (!m_cmpct_neg.supports_compact(p->key)) return;
-        if (!dash::coin::compact_blocks_version_ok(PROTOCOL_VERSION, p->version)) return;
-        const auto change = m_cmpct_hb.select(p->key);
-        if (change.announce_on)
-        {
-            auto m = message_sendcmpct::make_raw(true, dash::coin::CMPCTBLOCKS_VERSION);
-            p->write(m);
-            LOG_INFO << "[" << m_chain_label << "] BIP152 high-bandwidth: asked "
-                     << p->key << " to push cmpctblock (sendcmpct 1); hb peers "
-                     << m_cmpct_hb.size() << "/" << dash::coin::CompactHighBandwidthSet::MAX_PEERS;
-        }
-        if (change.announce_off)
-        {
-            if (PeerSession* q = find_peer(*change.announce_off))
-            {
-                auto m = message_sendcmpct::make_raw(false, dash::coin::CMPCTBLOCKS_VERSION);
-                q->write(m);
-            }
-        }
-    }
-
-    // ── #968a minimal serving (blocks we hold) ───────────────────────────
-    void cache_served_block(const uint256& hash, const BlockType& block)
-    {
-        for (const auto& sb : m_served_blocks)
-            if (sb.hash == hash) return;
-        if (block.m_txs.empty()) return;
-        m_served_blocks.push_back(ServedBlock{hash, std::make_shared<const BlockType>(block)});
-        while (m_served_blocks.size() > SERVED_BLOCKS_CAP)
-            m_served_blocks.pop_front();
-    }
-    std::shared_ptr<const BlockType> served_block(const uint256& hash) const
-    {
-        for (const auto& sb : m_served_blocks)
-            if (sb.hash == hash) return sb.block;
-        return nullptr;
     }
 
     bool holds_key(const std::string& key) const
@@ -3926,12 +3909,11 @@ private:
         // disconnect, exactly as the spec requires). No-op unless the tracker was
         // ever consulted; harmless when the flag is OFF.
         m_getmnlistd_tracker.on_disconnect(key);
-        // #968a: its parked compact block, its sendcmpct state, its
-        // high-bandwidth slot, and our MSG_CMPCT_BLOCK asks to it. A body
-        // still wanted stays on the watchdog, which re-asks another peer.
+        // #968a: its parked compact blocks, its sendcmpct state, and our
+        // MSG_CMPCT_BLOCK asks to it. A body still wanted stays on the
+        // watchdog, which re-asks another peer.
         m_cmpct_rx.on_disconnect(key);
         m_cmpct_neg.on_disconnect(key);
-        m_cmpct_hb.on_disconnect(key);
         for (auto cit = m_cmpct_requested.begin(); cit != m_cmpct_requested.end();)
             if (cit->second.key == key) cit = m_cmpct_requested.erase(cit);
             else ++cit;
@@ -4791,11 +4773,10 @@ private:
         auto msg_getsporks = message_getsporks::make_raw();
         p->write(msg_getsporks);
 
-        // #968a: NO blanket sendcmpct(0, 1) here (dashcore sends one at
-        // VERACK because it serves compact blocks for every block it holds; we
-        // do not, see compact_negotiation.hpp). The only sendcmpct we send is
-        // sendcmpct(1, 1) to a high-bandwidth peer (maybe_set_high_bandwidth)
-        // and sendcmpct(0, 1) to the one it displaces.
+        // #968a: NO sendcmpct (dashcore sends sendcmpct(0, 1) at VERACK
+        // because it serves compact blocks; we serve none and never ask for
+        // high-bandwidth push, and receiving by getdata(MSG_CMPCT_BLOCK) needs
+        // nothing from us: compact_negotiation.hpp).
 
         // E-SUPERBLOCK GOVSYNC PRIME (routing class 3), mirroring getsporks:
         // ask THIS peer for the full governance object set exactly once, so a
@@ -5069,11 +5050,29 @@ private:
         auto header = static_cast<BlockHeaderType>(block);
         auto packed_header = pack(header);
         auto blockhash = dash::crypto::hash_x11(packed_header.get_span());
+        // #968a: the body must bind to its own header (merkle root over the
+        // txs, with the CVE-2012-2459 duplicate guard) BEFORE it touches
+        // anything: the watchdog slot, the ask ledger, the matcher, the
+        // compact state, the held-body record, the bulk lane or the ingest
+        // legs. A body that does not bind is somebody else's txs under this
+        // header; it is dropped here and the watchdog keeps asking for the
+        // real one. A reassembled compact body was already bound by the
+        // receiver, so it is not hashed twice.
+        if (!via_compact && !block_body_binds_to_header(block))
+        {
+            ++m_bodies_unbound;
+            if (cmpct_warn_allowed())
+                LOG_WARNING << "[" << m_chain_label << "] block body "
+                            << blockhash.GetHex().substr(0, 16) << "... from " << p->key
+                            << " does not bind to its header merkle root, dropped"
+                            << cmpct_warn_suffix();
+            return;
+        }
         // #968a: a peer is credited for a body only when we ASKED it for that
         // body (any getdata MSG_BLOCK / MSG_CMPCT_BLOCK, the ask ledger). A
-        // high-bandwidth push we did not ask for, or a body some other peer
-        // was asked for, earns no bulk forgiveness, no delivered tally and no
-        // TipBody latency sample.
+        // body we did not ask that peer for earns no bulk forgiveness, no
+        // delivered tally and no TipBody latency sample, and leaves the ask we
+        // made to another peer in place.
         const bool asked = take_body_ask(blockhash, p->key);
         // PR-0 instrumentation (record-only): time the tip/body delivery on the
         // peer that answered. Pure telemetry; the block is verified identically
@@ -5125,20 +5124,9 @@ private:
             return;
         }
         // #968a: the tip body is now held (dashcore BLOCK_HAVE_DATA) and may
-        // be our new best body; keep it for serving, and let the peer whose
-        // block became our new tip, with nothing else in flight, push the
-        // next one as cmpctblock (dashcore BlockChecked ->
-        // MaybeSetPeerAsAnnouncingHeaderAndIDs). A full block must bind to its
-        // header before it earns that (a reassembled one already did).
+        // be our new best body.
         note_body_delivered(blockhash);
         if (via_compact) ++m_cmpct_reconstructed;
-        if (compact_blocks_enabled())
-        {
-            cache_served_block(blockhash, block);
-            if (m_body_tip && m_body_tip->hash == blockhash
-                && (via_compact || block_body_binds_to_header(block)))
-                maybe_set_high_bandwidth(p);
-        }
         LOG_INFO << "[" << m_chain_label << "] block received from " << p->key
                  << ": " << blockhash.GetHex().substr(0, 16) << "..."
                  << (via_compact ? " (compact)" : "");
@@ -5745,82 +5733,24 @@ private:
     ADD_P2P_HANDLER(sendaddrv2)    { /* acknowledged */ }
     ADD_P2P_HANDLER(mempool)       { /* we don't serve mempool */ }
     ADD_P2P_HANDLER(getaddr)       { /* we don't serve addresses */ }
-    // We serve no blocks and no transactions, with one exception (#968a):
-    // MSG_CMPCT_BLOCK for the few recent blocks we hold (m_served_blocks), so
-    // the sendcmpct we send a high-bandwidth peer is not a false claim. A
-    // dashcore peer only asks for a block it saw us announce, and we announce
-    // nothing but a won block (pushed whole), so this is the narrow case of
-    // compact_negotiation.hpp, answered the way dashcore answers it.
-    ADD_P2P_HANDLER(getdata)
-    {
-        PeerSession* p = m_active;
-        if (!p) return;
-        // At most one answer per held block per message: a getdata repeating
-        // one hash 50'000 times must not make us build 50'000 cmpctblocks
-        // (dashcore stops at a full send buffer; we have none to stop at).
-        std::set<uint256> answered;
-        for (const auto& inv : msg->m_requests)
-        {
-            if (inv.m_type != DASH_MSG_CMPCT_BLOCK) continue;
-            auto b = served_block(inv.m_hash);
-            if (!b) continue;
-            if (!answered.insert(inv.m_hash).second) continue;
-            dash::coin::vendor::CBlockHeaderAndShortTxIDs cmpct(*b);
-            auto m = message_cmpctblock::make_raw(cmpct);
-            p->write(m);
-            ++m_cmpct_served;
-        }
-    }
+    ADD_P2P_HANDLER(getdata)       { /* we don't serve blocks/txs */ }
     ADD_P2P_HANDLER(getblocks)     { /* we don't serve blocks */ }
     ADD_P2P_HANDLER(getheaders)    { /* we don't serve headers */ }
     ADD_P2P_HANDLER(getmnlistd)    { /* we don't serve SML diffs */ }
     ADD_P2P_HANDLER(getqrinfo)     { /* we don't serve rotation info either */ }
+    ADD_P2P_HANDLER(getblocktxn)   { /* we don't serve compact blocks (no sendcmpct) */ }
 
-    // dashcore GETBLOCKTXN + SendBlockTransactions, for the blocks we hold.
-    // An index past the block is Misbehaving(100) exactly as in dashcore; a
-    // block we do not hold is ignored ("a block we don't have").
-    ADD_P2P_HANDLER(getblocktxn)
-    {
-        PeerSession* p = m_active;
-        if (!p) return;
-        const auto& req = msg->m_req;
-        auto b = served_block(req.blockhash);
-        if (!b)
-        {
-            LOG_DEBUG_COIND << "[" << m_chain_label << "] getblocktxn from " << p->key
-                            << " for a block we don't hold: "
-                            << req.blockhash.GetHex().substr(0, 16) << "...";
-            return;
-        }
-        dash::coin::vendor::BlockTransactions resp(req);
-        for (size_t i = 0; i < req.indexes.size(); ++i)
-        {
-            if (req.indexes[i] >= b->m_txs.size())
-            {
-                misbehaving(p, 100, "getblocktxn with out-of-bounds tx indices");
-                return;
-            }
-            resp.txn[i] = dash::coin::vendor::MakeTransactionRef(b->m_txs[req.indexes[i]]);
-        }
-        auto m = message_blocktxn::make_raw(resp);
-        p->write(m);
-        ++m_cmpct_served;
-    }
-
-    // #968a: BIP 152 receive (dashcore ProcessMessage CMPCTBLOCK). A
-    // cmpctblock reaches us because we asked for it (getdata MSG_CMPCT_BLOCK,
-    // request_block_impl) or because a high-bandwidth peer pushed it
-    // (maybe_set_high_bandwidth). Either way the header goes first:
-    //   1. its parent must be in our header chain (else getheaders, as dashcore);
-    //   2. its X11 hash must meet its own nBits (else Misbehaving(100));
-    //   3. it is fed into the header chain through the same new_headers seam a
-    //      headers message uses (dashcore ProcessNewBlockHeaders before
-    //      InitData), and must come out connected;
-    //   4. compact_gate() then decides from the chain position, our best body,
-    //      and whether we asked this peer / this peer is high-bandwidth.
-    // Only a header that passes all of it reaches InitData. The reassembled
-    // body is delivered through deliver_block_body, so the header is in the
-    // chain before the body, and wire_full_block_ingest connects it.
+    // #968a: BIP 152 receive (dashcore ProcessMessage CMPCTBLOCK, the
+    // requested_block_from_this_peer path only). A cmpctblock is processed
+    // ONLY as the answer to our own getdata(MSG_CMPCT_BLOCK) to this peer
+    // (request_block_impl), for a header that is already in our header chain
+    // (it came in through getheaders like every other header). Anything else
+    // is dropped unprocessed: we never asked anyone to push cmpctblock, and a
+    // push would be a block that has passed only the header and PoW checks
+    // (dashcore NewPoWValidBlock). Nothing from a cmpctblock is ever fed to
+    // the header chain. compact_gate() then decides from the chain position
+    // and our best body; the reassembled body goes through deliver_block_body
+    // like a downloaded one.
     ADD_P2P_HANDLER(cmpctblock)
     {
         PeerSession* p = m_active;
@@ -5831,131 +5761,64 @@ private:
     void on_cmpctblock(PeerSession* p, const dash::coin::vendor::CBlockHeaderAndShortTxIDs& cmpct)
     {
         using dash::coin::CompactGate;
-        if (!compact_blocks_enabled())
-        {
-            ++m_cmpct_gate_dropped;
-            LOG_DEBUG_COIND << "[" << m_chain_label << "] cmpctblock from " << p->key
-                            << " dropped: compact blocks are off (no header chain / mempool wired)";
-            return;
-        }
-        const BlockHeaderType& hdr = cmpct.header;
-        auto packed_header = pack(hdr);
+        auto packed_header = pack(cmpct.header);
         const uint256 blockhash = dash::crypto::hash_x11(packed_header.get_span());
         const auto tag = blockhash.GetHex().substr(0, 16);
 
         dash::coin::CompactGateFacts f;
         {
             auto it = m_cmpct_requested.find(blockhash);
-            f.requested = it != m_cmpct_requested.end() && it->second.key == p->key;
+            f.requested = compact_blocks_enabled()
+                          && it != m_cmpct_requested.end() && it->second.key == p->key;
         }
-        f.high_bandwidth = m_cmpct_hb.contains(p->key);
-        f.prev_known = m_cmpct_view.lookup(hdr.m_previous_block).has_value();
-        bool received_new_header = false;
-        if (f.prev_known)
+        if (!f.requested)
         {
-            f.pow_ok = dash::coin::header_pow_meets_bits(blockhash, hdr.m_bits);
-            if (f.pow_ok)
-            {
-                auto entry = m_cmpct_view.lookup(blockhash);
-                if (!entry)
-                {
-                    received_new_header = true;
-                    m_coin->new_headers.happened(std::vector<BlockHeaderType>{hdr});
-                    entry = m_cmpct_view.lookup(blockhash);
-                }
-                if (entry)
-                {
-                    f.header_accepted = true;
-                    f.have_body = have_body(blockhash);
-                    f.more_work = !m_body_tip || entry->chain_work > m_body_tip->work;
-                    f.near_tip = m_body_tip.has_value()
-                                 && entry->height <= m_body_tip->height + 2;
-                }
-            }
-        }
-        if (received_new_header && f.header_accepted)
-            LOG_INFO << "[" << m_chain_label << "] saw new cmpctblock header "
-                     << tag << "... from " << p->key;
-
-        const CompactGate gate = dash::coin::compact_gate(f);
-        switch (gate)
-        {
-        case CompactGate::GetHeaders:
-        {
-            ++m_cmpct_gate_dropped;
-            const int64_t now = now_sec();
-            if (p->last_cmpct_getheaders == 0
-                || now - p->last_cmpct_getheaders >= CMPCT_GETHEADERS_SPACING_SEC)
-            {
-                p->last_cmpct_getheaders = now;
-                auto m = message_getheaders::make_raw(PROTOCOL_VERSION, m_cmpct_view.locator(), uint256());
-                p->write(m);
-            }
+            ++m_cmpct_unsolicited;
             LOG_DEBUG_COIND << "[" << m_chain_label << "] cmpctblock " << tag << "... from "
-                            << p->key << ": parent unknown, asked for headers";
+                            << p->key << " dropped: not an answer to our getdata"
+                            << (compact_blocks_enabled() ? "" : " (compact blocks off)");
             return;
         }
-        case CompactGate::Misbehave:
-            ++m_cmpct_gate_dropped;
-            misbehaving(p, 100, "invalid header via cmpctblock (high-hash)");
-            return;
+        if (auto entry = m_cmpct_view.lookup(blockhash))
+        {
+            f.header_known = true;
+            f.have_body = have_body(blockhash);
+            f.more_work = !m_body_tip || entry->chain_work > m_body_tip->work;
+            f.near_tip = m_body_tip.has_value()
+                         && entry->height <= m_body_tip->height + 2;
+        }
+
+        switch (dash::coin::compact_gate(f))
+        {
+        case CompactGate::Ignore:
+            return;   // not reached: unsolicited returned above
         case CompactGate::Drop:
             ++m_cmpct_gate_dropped;
-            if (f.prev_known && f.pow_ok && !f.header_accepted)
-            {
-                if (cmpct_warn_allowed())
-                    LOG_WARNING << "[" << m_chain_label << "] cmpctblock " << tag << "... from "
-                                << p->key << ": header refused by the header chain, not"
-                                   " reconstructing" << cmpct_warn_suffix();
-            }
-            else
-            {
-                LOG_DEBUG_COIND << "[" << m_chain_label << "] cmpctblock " << tag << "... from "
-                                << p->key << " dropped ("
-                                << (f.have_body ? "body already held" : "not more work than our tip")
-                                << ")";
-            }
+            compact_drop_state(blockhash);
+            LOG_DEBUG_COIND << "[" << m_chain_label << "] cmpctblock " << tag << "... from "
+                            << p->key << " dropped: body already held";
             return;
         case CompactGate::FetchFull:
-            // dashcore: we asked for it, but it is not a new tip (or far
-            // ahead), so our mempool will not help: getdata MSG_BLOCK.
-            compact_fetch_full(p, blockhash, /*same_peer=*/true,
-                               f.more_work ? "far ahead of our best body"
-                                           : "not more work than our best body");
-            return;
-        case CompactGate::HeaderOnly:
-            // dashcore fRevertToHeaderProcessing: the header is in our chain
-            // now; treat the message as a block announcement, exactly like an
-            // inv from this peer (one fetch per block, routed back here).
+            // dashcore: we asked for it, but the header is not in our chain
+            // yet, or it is not the next tip, so our mempool will not help:
+            // getdata MSG_BLOCK from the same peer.
             ++m_cmpct_gate_dropped;
-            record_block_announcer(blockhash, p->key);
-            if (m_inv_dedup.admit(static_cast<uint32_t>(inventory_type::block), blockhash, now_sec()))
-                m_coin->new_block.happened(blockhash);
+            compact_fetch_full(p, blockhash, /*same_peer=*/true,
+                               !f.header_known ? "header not in our header chain"
+                               : !f.more_work  ? "not more work than our best body"
+                                               : "more than two past our best body");
             return;
         case CompactGate::Reconstruct:
             break;
         }
 
         // dashcore: "Peer sent us compact block we were already syncing!"
-        if (auto parked = m_cmpct_rx.parked_hash(p->key); parked && *parked == blockhash)
+        if (m_cmpct_rx.has_parked(p->key, blockhash))
         {
             LOG_DEBUG_COIND << "[" << m_chain_label << "] cmpctblock " << tag << "... from "
                             << p->key << ": already reconstructing it";
             return;
         }
-        // dashcore MAX_CMPCTBLOCKS_INFLIGHT_PER_BLOCK: at most three peers on
-        // one block unless we asked this one.
-        if (!f.requested
-            && m_cmpct_rx.parked_count_for(blockhash) >= dash::coin::MAX_CMPCTBLOCKS_INFLIGHT_PER_BLOCK)
-        {
-            ++m_cmpct_gate_dropped;
-            return;
-        }
-        // The block is ours to fetch now: later invs for it are duplicates
-        // (one fetch per block, as for an inv), the watchdog owns its timeout,
-        // and a re-request starts at this peer, which holds it.
-        m_inv_dedup.admit(static_cast<uint32_t>(inventory_type::block), blockhash, now_sec());
-        record_block_announcer(blockhash, p->key);
         ensure_pending_body(blockhash, p->key);
         apply_cmpct_verdict(p, m_cmpct_rx.on_cmpctblock(p->key, cmpct, blockhash));
     }
@@ -5979,8 +5842,9 @@ private:
                                 << "... from " << p->key << ": body already held";
                 return;
             }
-            // The gate fed the header first; deliver only while it is still
-            // in the header chain (wire_full_block_ingest needs its height).
+            // The header came in through getheaders (the gate requires it);
+            // deliver only while it is still in the header chain
+            // (wire_full_block_ingest needs its height).
             if (!m_cmpct_view || !m_cmpct_view.lookup(v.blockhash))
             {
                 compact_fetch_full(p, v.blockhash, /*same_peer=*/true,

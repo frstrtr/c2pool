@@ -231,15 +231,19 @@ TEST(DashCompactReceive, BlocktxnForOtherHashLeavesParkedBlock) {
     EXPECT_EQ(rx.on_blocktxn(kPeer, answer(vd.request, b)).kind, Kind::Complete);
 }
 
-TEST(DashCompactReceive, ShortBlocktxnIsRejected) {
+// L1: a blocktxn whose tx count is not the count we asked for is not an
+// answer to our getblocktxn: ignored, never punished, and the park is kept
+// (the lost-body watchdog falls back if the right answer never comes).
+TEST(DashCompactReceive, ShortBlocktxnIsIgnoredAndKeepsThePark) {
     const BlockType b = mk_block(4);
     CompactBlockReceiver rx(nullptr, kMaxTx);
     auto vd = rx.on_cmpctblock(kPeer, v::CBlockHeaderAndShortTxIDs(b), bhash(10));
     ASSERT_EQ(vd.kind, Kind::NeedTxn);
     auto resp = answer(vd.request, b);
     resp.txn.pop_back();
-    EXPECT_EQ(rx.on_blocktxn(kPeer, resp).kind, Kind::Reject);
-    EXPECT_FALSE(rx.has_parked(kPeer));
+    EXPECT_EQ(rx.on_blocktxn(kPeer, resp).kind, Kind::Ignore);
+    EXPECT_TRUE(rx.has_parked(kPeer, bhash(10)));
+    EXPECT_EQ(rx.on_blocktxn(kPeer, answer(vd.request, b)).kind, Kind::Complete);
 }
 
 TEST(DashCompactReceive, DisconnectDropsParkedBlock) {
@@ -272,18 +276,7 @@ TEST(DashCompactReceive, DeserializedCmpctblockReassembles) {
 // ── #968a slice 2: sendcmpct negotiation ───────────────────────────────────
 //
 // Revert-red arms: drop the version != 1 guard in on_sendcmpct
-// (Version2IsIgnored and Version2DoesNotOverwriteVersion1 go red), drop the
-// SHORT_IDS_BLOCKS_VERSION gate in compact_blocks_version_ok
-// (VersionGateUsesCommonVersion goes red).
-
-TEST(DashCompactNegotiation, VersionGateUsesCommonVersion) {
-    EXPECT_TRUE(dash::coin::compact_blocks_version_ok(70230, 70230));
-    // our 70230 vs peer exactly at the gate: common = 70209.
-    EXPECT_TRUE(dash::coin::compact_blocks_version_ok(70230, 70209));
-    // our side below the gate wins even if the peer is new.
-    EXPECT_FALSE(dash::coin::compact_blocks_version_ok(70208, 70230));
-    EXPECT_FALSE(dash::coin::compact_blocks_version_ok(70230, 70208));
-}
+// (Version2IsIgnored and Version2DoesNotOverwriteVersion1 go red).
 
 TEST(DashCompactNegotiation, UnknownPeerHasNoCompactState) {
     dash::coin::CompactPeerNegotiation n;
@@ -694,15 +687,54 @@ TEST(DashCompactReceive, DuplicateShortIdsFallBackToFullBlock) {
     EXPECT_FALSE(rx.has_parked(kPeer));
 }
 
-TEST(DashCompactReceive, OverLongBlocktxnIsRejected) {
+TEST(DashCompactReceive, OverLongBlocktxnIsIgnoredAndKeepsThePark) {
     const BlockType b = mk_block(4);
     CompactBlockReceiver rx(nullptr, kMaxTx);
     auto vd = rx.on_cmpctblock(kPeer, v::CBlockHeaderAndShortTxIDs(b), bhash(67));
     ASSERT_EQ(vd.kind, Kind::NeedTxn);
     auto resp = answer(vd.request, b);
     resp.txn.push_back(v::MakeTransactionRef(mk_tx(4242)));
-    EXPECT_EQ(rx.on_blocktxn(kPeer, resp).kind, Kind::Reject);
-    EXPECT_FALSE(rx.has_parked(kPeer));
+    EXPECT_EQ(rx.on_blocktxn(kPeer, resp).kind, Kind::Ignore);
+    EXPECT_TRUE(rx.has_parked(kPeer, bhash(67)));
+}
+
+// L2: parks are keyed by (peer, block). One peer can have two blocks parked;
+// a third evicts that peer's oldest; the overall cap evicts the oldest park.
+TEST(DashCompactReceive, ParksAreKeyedByPeerAndBlock) {
+    const BlockType b = mk_block(3);
+    CompactBlockReceiver rx(nullptr, kMaxTx);
+    auto r1 = rx.on_cmpctblock(kPeer, v::CBlockHeaderAndShortTxIDs(b), bhash(80));
+    auto r2 = rx.on_cmpctblock(kPeer, v::CBlockHeaderAndShortTxIDs(b), bhash(81));
+    ASSERT_EQ(r1.kind, Kind::NeedTxn);
+    ASSERT_EQ(r2.kind, Kind::NeedTxn);
+    EXPECT_TRUE(rx.has_parked(kPeer, bhash(80)));
+    EXPECT_TRUE(rx.has_parked(kPeer, bhash(81)));
+    EXPECT_EQ(rx.parked_count(), 2u);
+    // Each completes against its own park.
+    v::BlockTransactions t2 = answer(r2.request, b);
+    EXPECT_EQ(rx.on_blocktxn(kPeer, t2).kind, Kind::Complete);
+    EXPECT_TRUE(rx.has_parked(kPeer, bhash(80)));
+    EXPECT_EQ(rx.on_blocktxn(kPeer, answer(r1.request, b)).kind, Kind::Complete);
+    EXPECT_EQ(rx.parked_count(), 0u);
+}
+
+TEST(DashCompactReceive, ParkCapsEvictTheOldest) {
+    const BlockType b = mk_block(3);
+    CompactBlockReceiver rx(nullptr, kMaxTx);
+    // Per peer: a third block evicts that peer's oldest.
+    for (uint8_t i = 0; i < 3; ++i)
+        ASSERT_EQ(rx.on_cmpctblock(kPeer, v::CBlockHeaderAndShortTxIDs(b), bhash(90 + i)).kind,
+                  Kind::NeedTxn);
+    EXPECT_EQ(rx.parked_count(), CompactBlockReceiver::MAX_PARKED_PER_PEER);
+    EXPECT_FALSE(rx.has_parked(kPeer, bhash(90)));
+    EXPECT_TRUE(rx.has_parked(kPeer, bhash(92)));
+    // Overall: never more than MAX_PARKED_TOTAL.
+    for (int p = 0; p < 10; ++p)
+        rx.on_cmpctblock("peer" + std::to_string(p), v::CBlockHeaderAndShortTxIDs(b), bhash(100));
+    EXPECT_EQ(rx.parked_count(), CompactBlockReceiver::MAX_PARKED_TOTAL);
+    EXPECT_EQ(rx.parked_count_for(bhash(100)), CompactBlockReceiver::MAX_PARKED_TOTAL);
+    rx.on_disconnect("peer9");
+    EXPECT_EQ(rx.parked_count(), CompactBlockReceiver::MAX_PARKED_TOTAL - 1);
 }
 
 TEST(DashCompactReceive, DropBlockClearsEveryPeersPark) {
@@ -788,66 +820,24 @@ TEST(DashCompactMempool, SameV2AssetUnlockInstanceIsFilledFromThePool) {
     EXPECT_EQ(dash_instance_hash(vd.block.m_txs[1]), dash_instance_hash(pooled));
 }
 
-// ── #968a: the cmpctblock gate (dashcore ProcessMessage CMPCTBLOCK) ─────────
+// ── #968a: the cmpctblock gate (solicited only) ─────────────────────────────
 
 TEST(DashCompactGate, DecisionTable) {
     using G = CompactGate;
     CompactGateFacts ok;
-    ok.prev_known = ok.pow_ok = ok.header_accepted = true;
-    ok.more_work = ok.near_tip = true;
+    ok.requested = ok.header_known = ok.more_work = ok.near_tip = true;
 
     auto with = [&](auto f) { CompactGateFacts x = ok; f(x); return compact_gate(x); };
 
-    EXPECT_EQ(with([](auto& x) { x.prev_known = false; }), G::GetHeaders);
-    EXPECT_EQ(with([](auto& x) { x.pow_ok = false; }), G::Misbehave);
-    EXPECT_EQ(with([](auto& x) { x.header_accepted = false; x.requested = true; }), G::Drop);
-    EXPECT_EQ(with([](auto& x) { x.have_body = true; x.requested = true; }), G::Drop);
-    EXPECT_EQ(with([](auto& x) { x.more_work = false; }), G::Drop);
-    EXPECT_EQ(with([](auto& x) { x.more_work = false; x.requested = true; }), G::FetchFull);
-    EXPECT_EQ(with([](auto& x) { x.near_tip = false; }), G::HeaderOnly);
-    EXPECT_EQ(with([](auto& x) { x.near_tip = false; x.requested = true; }), G::FetchFull);
-    EXPECT_EQ(with([](auto& x) { x.requested = true; }), G::Reconstruct);
-    EXPECT_EQ(with([](auto& x) { x.high_bandwidth = true; }), G::Reconstruct);
-    EXPECT_EQ(compact_gate(ok), G::HeaderOnly) << "unsolicited, not high-bandwidth";
-    // A high-bandwidth push of a stale or far-ahead header is not reconstructed.
-    EXPECT_EQ(with([](auto& x) { x.high_bandwidth = true; x.more_work = false; }), G::Drop);
-    EXPECT_EQ(with([](auto& x) { x.high_bandwidth = true; x.near_tip = false; }), G::HeaderOnly);
-}
-
-TEST(DashCompactGate, PowMeetsItsOwnBits) {
-    uint256 easy_hash;            // all zero: meets any well-formed target
-    EXPECT_TRUE(header_pow_meets_bits(easy_hash, 0x1d00ffff));
-    uint256 hard_hash;
-    hard_hash.data()[31] = 0xff;  // most significant byte
-    EXPECT_FALSE(header_pow_meets_bits(hard_hash, 0x1d00ffff));
-    EXPECT_FALSE(header_pow_meets_bits(easy_hash, 0));            // null target
-    EXPECT_FALSE(header_pow_meets_bits(easy_hash, 0x04800000));   // negative
-    EXPECT_FALSE(header_pow_meets_bits(easy_hash, 0xff123456));   // overflow
-}
-
-// ── #968a: high-bandwidth peer set (MaybeSetPeerAsAnnouncingHeaderAndIDs) ───
-
-TEST(DashCompactNegotiation, HighBandwidthSetKeepsThreeAndRotatesTheOldest) {
-    CompactHighBandwidthSet hb;
-    auto c1 = hb.select("a");
-    EXPECT_EQ(c1.announce_on, std::optional<std::string>("a"));
-    EXPECT_FALSE(c1.announce_off.has_value());
-    hb.select("b");
-    hb.select("c");
-    EXPECT_EQ(hb.size(), 3u);
-    // An existing member moves to the back and nothing is sent.
-    auto again = hb.select("a");
-    EXPECT_FALSE(again.announce_on.has_value());
-    EXPECT_FALSE(again.announce_off.has_value());
-    // A fourth evicts the oldest ("b", since "a" was refreshed).
-    auto c4 = hb.select("d");
-    EXPECT_EQ(c4.announce_on, std::optional<std::string>("d"));
-    EXPECT_EQ(c4.announce_off, std::optional<std::string>("b"));
-    EXPECT_EQ(hb.size(), 3u);
-    EXPECT_FALSE(hb.contains("b"));
-    hb.on_disconnect("a");
-    EXPECT_FALSE(hb.contains("a"));
-    EXPECT_EQ(hb.size(), 2u);
+    EXPECT_EQ(compact_gate(ok), G::Reconstruct);
+    // Not our request: ignored whatever else is true. Nothing is fed anywhere.
+    EXPECT_EQ(with([](auto& x) { x.requested = false; }), G::Ignore);
+    EXPECT_EQ(compact_gate(CompactGateFacts{}), G::Ignore);
+    // Our request, but the header did not come through getheaders yet.
+    EXPECT_EQ(with([](auto& x) { x.header_known = false; }), G::FetchFull);
+    EXPECT_EQ(with([](auto& x) { x.have_body = true; }), G::Drop);
+    EXPECT_EQ(with([](auto& x) { x.more_work = false; }), G::FetchFull);
+    EXPECT_EQ(with([](auto& x) { x.near_tip = false; }), G::FetchFull);
 }
 
 // ── #968a GOLDEN VECTOR: a real Dash testnet cmpctblock ─────────────────────

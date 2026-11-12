@@ -4,20 +4,23 @@
 // test_dash_compact_block_receive.cpp drives the pure receiver. This TU drives
 // the real CoinClient<dash::Config>: raw messages in through handle() (the
 // socket demux), every write out through the test write tap, the header chain
-// as a fake CompactChainView fed by the client's own new_headers event, and a
-// real Mempool behind make_mempool_short_id_provider. It pins:
+// as a fake CompactChainView fed ONLY by the client's headers handler (the
+// normal getheaders path), and a real Mempool behind
+// make_mempool_short_id_provider. It pins:
 //   * the request: a new tip body is asked for as getdata(MSG_CMPCT_BLOCK=20)
-//     from the announcer once bodies are caught up, never before;
-//   * header first: the cmpctblock header reaches the header chain before the
-//     reassembled body is delivered (full_block);
-//   * getblocktxn / blocktxn round trip, high-bandwidth selection
-//     (sendcmpct 1) and push, credit only for asked-for bodies;
-//   * the gate: parent unknown, bad PoW, refused header, held body,
-//     unsolicited non-high-bandwidth push;
-//   * hostile input: InitData INVALID, duplicate short ids, over-long
-//     blocktxn, Misbehaving(100) -> disconnect, full-block fallback;
-//   * the lost-body watchdog as the compact timeout;
-//   * disconnect() clearing compact state, and minimal serving.
+//     from the announcer once bodies are caught up, never before, never while
+//     another body is in flight, never with --embedded-compact-blocks=false;
+//   * solicited only: a cmpctblock is processed only as the answer to our own
+//     getdata to that peer, for a header already in the chain; nothing from a
+//     cmpctblock ever reaches the header chain; we send no sendcmpct and
+//     serve nothing;
+//   * getblocktxn / blocktxn round trip, parks per (peer, block), a blocktxn
+//     of the wrong size ignored (never punished);
+//   * hostile input: InitData INVALID, duplicate short ids, Misbehaving(100)
+//     -> disconnect, never for a protected peer or our last peer;
+//   * bind first: a body that does not bind to its header touches nothing;
+//   * credit only for the asked peer, and no peer takes another's ask;
+//   * the lost-body watchdog as the compact timeout; disconnect().
 
 #include <gtest/gtest.h>
 
@@ -60,6 +63,14 @@ uint256 x11_of(const BlockHeaderType& h)
     return dash::crypto::hash_x11(ps.get_span());
 }
 
+bool pow_meets_bits(const uint256& h, uint32_t bits)
+{
+    bool neg = false, ovf = false;
+    uint256 target;
+    target.SetCompact(bits, &neg, &ovf);
+    return !neg && !ovf && !target.IsNull() && h <= target;
+}
+
 MutableTransaction mk_tx(uint32_t tag)
 {
     MutableTransaction tx;
@@ -84,36 +95,35 @@ MutableTransaction mk_coinbase(uint32_t tag)
 }
 
 // A block on `prev` with real (easy) PoW and a merkle root over its txs.
-BlockType mk_block(const uint256& prev, uint32_t tag, size_t ntx,
-                   uint32_t bits = kEasyBits, bool grind = true)
+BlockType mk_block(const uint256& prev, uint32_t tag, size_t ntx)
 {
     BlockType b;
     b.m_version = 0x20000000;
     b.m_previous_block = prev;
     b.m_timestamp = 1'700'000'000u + tag;
-    b.m_bits = bits;
+    b.m_bits = kEasyBits;
     b.m_txs.push_back(mk_coinbase(tag));
     for (size_t i = 1; i < ntx; ++i)
         b.m_txs.push_back(mk_tx(tag * 1000 + static_cast<uint32_t>(i)));
     std::vector<uint256> ids;
     for (const auto& t : b.m_txs) ids.push_back(dash::coin::dash_txid(t));
     b.m_merkle_root = dash::coin::compute_merkle_root(ids);
-    for (uint32_t n = 0; grind; ++n) {
+    for (uint32_t n = 0;; ++n) {
         b.m_nonce = n;
-        if (dash::coin::header_pow_meets_bits(x11_of(b), b.m_bits)) break;
+        if (pow_meets_bits(x11_of(b), b.m_bits)) break;
     }
     return b;
 }
 
 uint256 hash_of(const BlockType& b) { return x11_of(b); }
 
-// The header chain the gate reads: accepts a header whose parent it holds and
-// whose PoW meets its own bits (unless told to refuse everything).
+// The header chain the gate reads. Fed ONLY through the client's headers
+// handler (the new_headers event); accepts a header whose parent it holds.
 struct FakeChain
 {
     std::map<uint256, dash::coin::CompactChainEntry> idx;
     uint256 tip;
-    bool refuse{false};
+    size_t headers_fed{0};
 
     void add_base(const BlockType& b, uint32_t height)
     {
@@ -124,13 +134,13 @@ struct FakeChain
 
     void on_headers(const std::vector<BlockHeaderType>& hs)
     {
-        if (refuse) return;
         for (const auto& hdr : hs) {
+            ++headers_fed;
             const uint256 h = x11_of(hdr);
             if (idx.count(h)) continue;
             auto prev = idx.find(hdr.m_previous_block);
             if (prev == idx.end()) continue;
-            if (!dash::coin::header_pow_meets_bits(h, hdr.m_bits)) continue;
+            if (!pow_meets_bits(h, hdr.m_bits)) continue;
             dash::coin::CompactChainEntry e{prev->second.height + 1,
                                             prev->second.chain_work + uint256::ONE,
                                             hdr.m_previous_block};
@@ -148,7 +158,6 @@ struct FakeChain
             return it->second;
         };
         vw.tip_hash = [this] { return tip; };
-        vw.locator = [this] { return std::vector<uint256>{tip}; };
         return vw;
     }
 };
@@ -181,6 +190,21 @@ std::vector<std::pair<uint32_t, uint256>> getdata_invs(const Sent& s)
     }
     return out;
 }
+
+v::BlockTransactionsRequest getblocktxn_of(const Sent& s)
+{
+    PackStream ps(s.payload);
+    v::BlockTransactionsRequest req;
+    ps >> req;
+    return req;
+}
+
+// Restores the process-wide --embedded-compact-blocks flag.
+struct CompactSwitchGuard
+{
+    bool saved{dash::coin::embedded_compact_blocks_enabled()};
+    ~CompactSwitchGuard() { dash::coin::set_embedded_compact_blocks_enabled(saved); }
+};
 
 struct CmpctRig
 {
@@ -227,22 +251,24 @@ struct CmpctRig
     static NetService peer_addr(int n) { return NetService{"192.0.2." + std::to_string(n), 19999}; }
     static std::string key(int n) { return peer_addr(n).to_string(); }
 
-    void deliver(int n, std::unique_ptr<RawMessage> m) { client.handle(std::move(m), peer_addr(n)); }
+    void deliver_from(const NetService& a, std::unique_ptr<RawMessage> m) { client.handle(std::move(m), a); }
+    void deliver(int n, std::unique_ptr<RawMessage> m) { deliver_from(peer_addr(n), std::move(m)); }
 
     // version / verack, then the peer's own sendcmpct(0, 1) as dashcore sends
     // it at VERACK (it provides compact blocks).
-    void handshake(int n, bool peer_sends_sendcmpct = true)
+    void handshake_at(const NetService& a, bool peer_sends_sendcmpct = true)
     {
-        client.attach_peer_for_test(peer_addr(n));
-        deliver(n, p2p::message_version::make_raw(
+        client.attach_peer_for_test(a);
+        deliver_from(a, p2p::message_version::make_raw(
             70230, /*services=*/1, 1234567890ull,
             addr_t{1, NetService{"127.0.0.1", 19999}},
             addr_t{1, NetService{"127.0.0.1", 19999}},
             0x1122334455667788ull, "/Dash Core:24.0.0/", 1000));
-        deliver(n, p2p::message_verack::make_raw());
+        deliver_from(a, p2p::message_verack::make_raw());
         if (peer_sends_sendcmpct)
-            deliver(n, p2p::message_sendcmpct::make_raw(false, 1));
+            deliver_from(a, p2p::message_sendcmpct::make_raw(false, 1));
     }
+    void handshake(int n, bool peer_sends_sendcmpct = true) { handshake_at(peer_addr(n), peer_sends_sendcmpct); }
 
     void inv_block(int n, const uint256& h)
     {
@@ -250,8 +276,28 @@ struct CmpctRig
             {p2p::inventory_type(p2p::inventory_type::block, h)}));
     }
 
-    // Cold start: the first tip body arrives whole (no body tip yet), from
-    // peer n, which then becomes a high-bandwidth peer.
+    // The getheaders reply: the header reaches the chain the normal way.
+    void headers_from(int n, const BlockType& b)
+    {
+        BlockType h = b;
+        h.m_txs.clear();
+        deliver(n, p2p::message_headers::make_raw(std::vector<BlockType>{h}));
+    }
+
+    // inv, then the header (the reply to the getheaders the inv triggers;
+    // same stream, so it lands before the body reply).
+    void announce(int n, const BlockType& b)
+    {
+        inv_block(n, hash_of(b));
+        headers_from(n, b);
+    }
+
+    void cmpct(int n, const BlockType& b)
+    {
+        deliver(n, p2p::message_cmpctblock::make_raw(v::CBlockHeaderAndShortTxIDs(b)));
+    }
+
+    // Cold start: the first tip body arrives whole (no body tip yet).
     void warm(int n)
     {
         b0 = mk_block(uint256(), 0, 2);
@@ -266,6 +312,12 @@ struct CmpctRig
         for (const auto& s : sent)
             if (s.key == key(n) && s.cmd == cmd) out.push_back(s);
         return out;
+    }
+    size_t sent_cmd(const std::string& cmd) const
+    {
+        size_t n = 0;
+        for (const auto& s : sent) if (s.cmd == cmd) ++n;
+        return n;
     }
 
     void run_seconds(int64_t s)
@@ -310,17 +362,36 @@ std::unique_ptr<RawMessage> raw_cmpct(const BlockHeaderType& h, const std::vecto
 
 } // namespace
 
-// ── the request: compact only for the next tip, from the announcer ─────────
+// ── we send nothing, we serve nothing ───────────────────────────────────────
 
-TEST(DashCmpctClient, NoBlanketSendcmpctAtVerack)
+TEST(DashCmpctClient, NoSendcmpctEverAndNothingServed)
 {
     CmpctRig rig;
     rig.handshake(1);
-    EXPECT_TRUE(rig.sent_to(1, "sendcmpct").empty())
-        << "we serve compact blocks only for a handful of blocks: no blanket sendcmpct";
+    rig.handshake(2);
+    rig.warm(1);
+    const BlockType b1 = mk_block(hash_of(rig.b0), 1, 3);
+    rig.add_to_pool(b1, {1, 2});
+    rig.announce(2, b1);
+    rig.cmpct(2, b1);
+    ASSERT_EQ(rig.delivered.size(), 2u);
+    EXPECT_EQ(rig.sent_cmd("sendcmpct"), 0u)
+        << "no sendcmpct: receiving by getdata(MSG_CMPCT_BLOCK) needs none, and we serve none";
+    // A peer asking us for a compact block or its txs gets nothing.
+    rig.sent.clear();
+    rig.deliver(2, p2p::message_getdata::make_raw(
+        {p2p::inventory_type(p2p::DASH_MSG_CMPCT_BLOCK, hash_of(rig.b0))}));
+    v::BlockTransactionsRequest req;
+    req.blockhash = hash_of(rig.b0);
+    req.indexes = {1};
+    rig.deliver(2, p2p::message_getblocktxn::make_raw(req));
+    EXPECT_TRUE(rig.sent.empty()) << "no serving: no cmpctblock, no blocktxn";
+    EXPECT_EQ(rig.client.misbehavior_for_test(CmpctRig::key(2)), 0);
 }
 
-TEST(DashCmpctClient, ColdStartFetchesWholeThenAsksTheDelivererForHighBandwidth)
+// ── the request ─────────────────────────────────────────────────────────────
+
+TEST(DashCmpctClient, ColdStartFetchesTheFirstBodyWhole)
 {
     CmpctRig rig;
     rig.handshake(1);
@@ -331,14 +402,10 @@ TEST(DashCmpctClient, ColdStartFetchesWholeThenAsksTheDelivererForHighBandwidth)
         << "no best body yet: the first body is a plain MSG_BLOCK";
     ASSERT_EQ(rig.delivered.size(), 1u);
     EXPECT_TRUE(rig.client.have_body_for_test(hash_of(rig.b0)));
-    // dashcore BlockChecked -> MaybeSetPeerAsAnnouncingHeaderAndIDs.
-    auto sc = rig.sent_to(1, "sendcmpct");
-    ASSERT_EQ(sc.size(), 1u);
-    EXPECT_EQ(sc[0].payload.at(0), 1u) << "sendcmpct(1, 1): push new blocks as cmpctblock";
-    EXPECT_TRUE(rig.client.cmpct_high_bandwidth_for_test(CmpctRig::key(1)));
+    EXPECT_EQ(rig.client.peer_delivered_for_test(CmpctRig::key(1)), 1u);
 }
 
-TEST(DashCmpctClient, NewTipIsRequestedCompactHeaderFirstBodyDelivered)
+TEST(DashCmpctClient, NewTipIsRequestedCompactAndDeliveredAfterItsHeader)
 {
     CmpctRig rig;
     rig.handshake(1);
@@ -351,23 +418,22 @@ TEST(DashCmpctClient, NewTipIsRequestedCompactHeaderFirstBodyDelivered)
     rig.inv_block(2, h1);   // peer 2 announces the new tip
     auto gd = rig.sent_to(2, "getdata");
     ASSERT_EQ(gd.size(), 1u);
-    const auto inv = getdata_invs(gd[0]).at(0);
-    EXPECT_EQ(inv.first, kMsgCmpctBlock) << "the next tip is fetched as MSG_CMPCT_BLOCK";
-    EXPECT_EQ(inv.second, h1);
+    EXPECT_EQ(getdata_invs(gd[0]).at(0), std::make_pair(kMsgCmpctBlock, h1))
+        << "the next tip is fetched as MSG_CMPCT_BLOCK, from the announcer";
     EXPECT_TRUE(rig.client.cmpct_requested_from_for_test(h1, CmpctRig::key(2)));
-    EXPECT_FALSE(rig.chain.idx.count(h1)) << "header not known yet";
 
-    rig.deliver(2, p2p::message_cmpctblock::make_raw(v::CBlockHeaderAndShortTxIDs(b1)));
+    rig.headers_from(2, b1);   // the getheaders reply, same stream, first
+    const size_t fed = rig.chain.headers_fed;
+    rig.cmpct(2, b1);
+    EXPECT_EQ(rig.chain.headers_fed, fed) << "nothing from a cmpctblock reaches the header chain";
     ASSERT_EQ(rig.delivered.size(), 2u);
     EXPECT_EQ(rig.delivered.back(), h1);
-    EXPECT_TRUE(rig.header_known_at_delivery.back())
-        << "the cmpctblock header reached the header chain before the body";
+    EXPECT_TRUE(rig.header_known_at_delivery.back());
     EXPECT_EQ(rig.client.cmpct_reconstructed(), 1u);
     EXPECT_EQ(rig.client.pending_body_count(), 0u);
     EXPECT_TRUE(rig.sent_to(2, "getblocktxn").empty()) << "the mempool held every tx";
     EXPECT_EQ(rig.client.peer_delivered_for_test(CmpctRig::key(2)), 1u)
         << "asked-for body: credited";
-    EXPECT_TRUE(rig.client.cmpct_high_bandwidth_for_test(CmpctRig::key(2)));
 }
 
 TEST(DashCmpctClient, MissingTxsGoThroughGetblocktxn)
@@ -380,16 +446,14 @@ TEST(DashCmpctClient, MissingTxsGoThroughGetblocktxn)
     const uint256 h1 = hash_of(b1);
     rig.add_to_pool(b1, {1});
 
-    rig.inv_block(2, h1);
-    rig.deliver(2, p2p::message_cmpctblock::make_raw(v::CBlockHeaderAndShortTxIDs(b1)));
+    rig.announce(2, b1);
+    rig.cmpct(2, b1);
     auto gbt = rig.sent_to(2, "getblocktxn");
     ASSERT_EQ(gbt.size(), 1u);
-    PackStream ps(gbt[0].payload);
-    v::BlockTransactionsRequest req;
-    ps >> req;
+    const auto req = getblocktxn_of(gbt[0]);
     EXPECT_EQ(req.blockhash, h1);
     EXPECT_EQ(req.indexes, (std::vector<uint16_t>{2, 3}));
-    EXPECT_TRUE(rig.client.cmpct_parked_for_test(CmpctRig::key(2)));
+    EXPECT_TRUE(rig.client.cmpct_parked_for_test(CmpctRig::key(2), h1));
     EXPECT_EQ(rig.delivered.size(), 1u);
 
     rig.deliver(2, p2p::message_blocktxn::make_raw(answer(req, b1)));
@@ -414,7 +478,7 @@ TEST(DashCmpctClient, NotCompactWhileAnotherBodyIsInFlight)
         << "dashcore asks compact only for the single block in flight";
 }
 
-TEST(DashCmpctClient, CompactOffWithoutChainViewAndMempool)
+TEST(DashCmpctClient, OffWithoutChainViewAndMempool)
 {
     CmpctRig rig(/*wire_compact=*/false);
     rig.handshake(1);
@@ -423,115 +487,95 @@ TEST(DashCmpctClient, CompactOffWithoutChainViewAndMempool)
     rig.sent.clear();
     rig.inv_block(1, hash_of(b1));
     EXPECT_EQ(getdata_invs(rig.sent_to(1, "getdata").at(0)).at(0).first, kMsgBlock);
-    EXPECT_TRUE(rig.sent_to(1, "sendcmpct").empty());
-    rig.deliver(1, p2p::message_cmpctblock::make_raw(v::CBlockHeaderAndShortTxIDs(b1)));
+    rig.cmpct(1, b1);
     EXPECT_EQ(rig.client.cmpct_parked_count_for_test(), 0u);
-    EXPECT_EQ(rig.client.cmpct_gate_dropped(), 1u);
+    EXPECT_EQ(rig.client.cmpct_unsolicited(), 1u);
 }
 
-// ── high-bandwidth push ─────────────────────────────────────────────────────
-
-TEST(DashCmpctClient, HighBandwidthPushIsReconstructedButNotCredited)
+// --embedded-compact-blocks=false: the canary kill switch, no rebuild.
+TEST(DashCmpctClient, SwitchOffFetchesWholeAndDropsCmpctblock)
 {
+    CompactSwitchGuard guard;
     CmpctRig rig;
     rig.handshake(1);
     rig.handshake(2);
     rig.warm(1);
-    ASSERT_TRUE(rig.client.cmpct_high_bandwidth_for_test(CmpctRig::key(1)));
-    const uint64_t credited_before = rig.client.peer_delivered_for_test(CmpctRig::key(1));
-    const BlockType b1 = mk_block(hash_of(rig.b0), 1, 3);
+    ASSERT_TRUE(rig.client.compact_blocks_enabled());
+    dash::coin::set_embedded_compact_blocks_enabled(false);
+    EXPECT_FALSE(rig.client.compact_blocks_enabled());
+    const BlockType b1 = mk_block(hash_of(rig.b0), 1, 2);
     const uint256 h1 = hash_of(b1);
-    rig.add_to_pool(b1, {1, 2});
+    rig.add_to_pool(b1, {1});
     rig.sent.clear();
-
-    // Pushed unasked, before any inv.
-    rig.deliver(1, p2p::message_cmpctblock::make_raw(v::CBlockHeaderAndShortTxIDs(b1)));
-    ASSERT_EQ(rig.delivered.size(), 2u);
+    rig.announce(2, b1);
+    EXPECT_EQ(getdata_invs(rig.sent_to(2, "getdata").at(0)).at(0), std::make_pair(kMsgBlock, h1));
+    rig.cmpct(2, b1);
+    EXPECT_EQ(rig.client.cmpct_parked_count_for_test(), 0u);
+    EXPECT_EQ(rig.delivered.size(), 1u) << "a cmpctblock is dropped while the switch is off";
+    rig.deliver(2, p2p::message_block::make_raw(b1));
     EXPECT_EQ(rig.delivered.back(), h1);
-    EXPECT_TRUE(rig.header_known_at_delivery.back());
-    EXPECT_EQ(rig.client.peer_delivered_for_test(CmpctRig::key(1)), credited_before)
-        << "a push we did not ask for earns no delivery credit";
-    // The block is handled: a later inv for it is a duplicate, not a fetch.
-    rig.inv_block(2, h1);
-    EXPECT_TRUE(rig.sent_to(2, "getdata").empty());
+    EXPECT_NE(rig.client.compact_status().find("enabled=0"), std::string::npos);
 }
 
-TEST(DashCmpctClient, UnsolicitedPushFromNonHighBandwidthPeerIsOnlyAnAnnouncement)
+// ── solicited only ──────────────────────────────────────────────────────────
+
+TEST(DashCmpctClient, UnsolicitedCmpctblockIsDroppedAndNeverFedToTheChain)
 {
     CmpctRig rig;
     rig.handshake(1);
     rig.handshake(2);
     rig.warm(1);
-    ASSERT_FALSE(rig.client.cmpct_high_bandwidth_for_test(CmpctRig::key(2)));
+    const BlockType b1 = mk_block(hash_of(rig.b0), 1, 3);   // valid PoW, connects
+    rig.add_to_pool(b1, {1, 2});
+    rig.sent.clear();
+    const size_t fed = rig.chain.headers_fed;
+    rig.cmpct(1, b1);
+    EXPECT_EQ(rig.client.cmpct_unsolicited(), 1u);
+    EXPECT_EQ(rig.chain.headers_fed, fed);
+    EXPECT_FALSE(rig.chain.idx.count(hash_of(b1))) << "the header never reaches the chain";
+    EXPECT_EQ(rig.client.cmpct_parked_count_for_test(), 0u);
+    EXPECT_EQ(rig.delivered.size(), 1u);
+    EXPECT_TRUE(rig.sent.empty()) << "no getheaders, no getdata, nothing";
+    EXPECT_EQ(rig.client.misbehavior_for_test(CmpctRig::key(1)), 0);
+}
+
+TEST(DashCmpctClient, CmpctblockFromAPeerWeDidNotAskIsDropped)
+{
+    CmpctRig rig;
+    rig.handshake(1);
+    rig.handshake(2);
+    rig.warm(1);
     const BlockType b1 = mk_block(hash_of(rig.b0), 1, 3);
     const uint256 h1 = hash_of(b1);
     rig.add_to_pool(b1, {1, 2});
-    rig.sent.clear();
-
-    rig.deliver(2, p2p::message_cmpctblock::make_raw(v::CBlockHeaderAndShortTxIDs(b1)));
-    EXPECT_EQ(rig.client.cmpct_parked_count_for_test(), 0u);
-    EXPECT_EQ(rig.delivered.size(), 1u) << "no InitData for an unasked, non-hb push";
-    EXPECT_TRUE(rig.chain.idx.count(h1)) << "but its header is processed (fRevertToHeaderProcessing)";
-    // ... and it is fetched like an announced block: compact, from that peer.
-    auto gd = rig.sent_to(2, "getdata");
-    ASSERT_EQ(gd.size(), 1u);
-    EXPECT_EQ(getdata_invs(gd[0]).at(0), std::make_pair(kMsgCmpctBlock, h1));
-    rig.deliver(2, p2p::message_cmpctblock::make_raw(v::CBlockHeaderAndShortTxIDs(b1)));
+    rig.announce(2, b1);                 // we asked peer 2
+    ASSERT_TRUE(rig.client.cmpct_requested_from_for_test(h1, CmpctRig::key(2)));
+    rig.cmpct(1, b1);                    // peer 1 answers instead
+    EXPECT_EQ(rig.client.cmpct_unsolicited(), 1u);
+    EXPECT_EQ(rig.delivered.size(), 1u);
+    rig.cmpct(2, b1);                    // the asked peer
     EXPECT_EQ(rig.delivered.size(), 2u);
 }
 
-// ── the gate ────────────────────────────────────────────────────────────────
-
-TEST(DashCmpctClient, ParentUnknownAsksForHeadersOnly)
-{
-    CmpctRig rig;
-    rig.handshake(1);
-    rig.warm(1);
-    const BlockType orphan = mk_block(hash_of(mk_block(uint256(), 55, 1)), 2, 2);
-    rig.sent.clear();
-    rig.deliver(1, p2p::message_cmpctblock::make_raw(v::CBlockHeaderAndShortTxIDs(orphan)));
-    EXPECT_EQ(rig.sent_to(1, "getheaders").size(), 1u);
-    EXPECT_FALSE(rig.chain.idx.count(hash_of(orphan)));
-    EXPECT_EQ(rig.client.cmpct_parked_count_for_test(), 0u);
-    rig.deliver(1, p2p::message_cmpctblock::make_raw(v::CBlockHeaderAndShortTxIDs(orphan)));
-    EXPECT_EQ(rig.sent_to(1, "getheaders").size(), 1u) << "MaybeSendGetHeaders spacing";
-}
-
-TEST(DashCmpctClient, BadPowIsMisbehaviourAndDisconnects)
+TEST(DashCmpctClient, AnswerBeforeItsHeaderFetchesTheFullBlock)
 {
     CmpctRig rig;
     rig.handshake(1);
     rig.handshake(2);
     rig.warm(1);
-    const BlockType bad = mk_block(hash_of(rig.b0), 9, 2, /*bits=*/0x1d00ffff, /*grind=*/false);
-    ASSERT_FALSE(dash::coin::header_pow_meets_bits(hash_of(bad), bad.m_bits));
-    rig.deliver(2, p2p::message_cmpctblock::make_raw(v::CBlockHeaderAndShortTxIDs(bad)));
-    EXPECT_EQ(rig.client.misbehavior_for_test(CmpctRig::key(2)), 100);
-    EXPECT_TRUE(rig.client.flagged_for_disconnect_for_test(CmpctRig::key(2)));
-    EXPECT_FALSE(rig.chain.idx.count(hash_of(bad))) << "never fed to the header chain";
-    EXPECT_EQ(rig.client.cmpct_parked_count_for_test(), 0u);
-    // A flagged peer is not processed any further ...
-    const size_t sent_before = rig.sent.size();
-    rig.deliver(2, p2p::message_ping::make_raw(7));
-    EXPECT_EQ(rig.sent.size(), sent_before) << "no pong to a flagged peer";
-    // ... and the next pool tick disconnects it.
-    rig.run_seconds(1);
-    EXPECT_EQ(rig.client.peer_session(CmpctRig::key(2)), nullptr);
-    EXPECT_EQ(rig.client.misbehavior_disconnects(), 1u);
-}
-
-TEST(DashCmpctClient, HeaderRefusedByTheChainIsNotReconstructed)
-{
-    CmpctRig rig;
-    rig.handshake(1);
-    rig.warm(1);
     const BlockType b1 = mk_block(hash_of(rig.b0), 1, 3);
-    rig.chain.refuse = true;
-    rig.deliver(1, p2p::message_cmpctblock::make_raw(v::CBlockHeaderAndShortTxIDs(b1)));
+    const uint256 h1 = hash_of(b1);
+    rig.inv_block(2, h1);                // asked compact, header not in yet
+    rig.sent.clear();
+    rig.cmpct(2, b1);                    // the answer races ahead of the header
+    EXPECT_FALSE(rig.chain.idx.count(h1)) << "never fed from the cmpctblock";
     EXPECT_EQ(rig.client.cmpct_parked_count_for_test(), 0u);
-    EXPECT_EQ(rig.delivered.size(), 1u);
-    EXPECT_EQ(rig.client.misbehavior_for_test(CmpctRig::key(1)), 0)
-        << "a chain-context refusal is not punished";
+    auto gd = rig.sent_to(2, "getdata");
+    ASSERT_EQ(gd.size(), 1u);
+    EXPECT_EQ(getdata_invs(gd[0]).at(0), std::make_pair(kMsgBlock, h1));
+    rig.headers_from(2, b1);
+    rig.deliver(2, p2p::message_block::make_raw(b1));
+    EXPECT_EQ(rig.delivered.back(), h1);
 }
 
 TEST(DashCmpctClient, HeldBodyIsNotReconstructedAgain)
@@ -541,13 +585,69 @@ TEST(DashCmpctClient, HeldBodyIsNotReconstructedAgain)
     rig.warm(1);
     const BlockType b1 = mk_block(hash_of(rig.b0), 1, 2);
     rig.add_to_pool(b1, {1});
-    rig.deliver(1, p2p::message_cmpctblock::make_raw(v::CBlockHeaderAndShortTxIDs(b1)));
+    rig.announce(1, b1);
+    rig.cmpct(1, b1);
     ASSERT_EQ(rig.delivered.size(), 2u);
-    rig.deliver(1, p2p::message_cmpctblock::make_raw(v::CBlockHeaderAndShortTxIDs(b1)));
+    rig.cmpct(1, b1);   // our ask is spent: a repeat is unsolicited
     EXPECT_EQ(rig.delivered.size(), 2u);
+    EXPECT_EQ(rig.client.cmpct_unsolicited(), 1u);
 }
 
-// ── hostile compact data ────────────────────────────────────────────────────
+// ── parks per (peer, block); blocktxn of the wrong size ─────────────────────
+
+TEST(DashCmpctClient, OnePeerCanHaveTwoBlocksParked)
+{
+    CmpctRig rig;
+    rig.handshake(1);
+    rig.handshake(2);
+    rig.warm(1);
+    const BlockType b1 = mk_block(hash_of(rig.b0), 1, 3);
+    const BlockType b1x = mk_block(hash_of(rig.b0), 2, 3);   // a sibling
+    rig.headers_from(2, b1);
+    rig.headers_from(2, b1x);
+    ASSERT_TRUE(rig.client.request_compact_from_for_test(CmpctRig::key(2), hash_of(b1)));
+    ASSERT_TRUE(rig.client.request_compact_from_for_test(CmpctRig::key(2), hash_of(b1x)));
+    rig.cmpct(2, b1);
+    rig.cmpct(2, b1x);
+    EXPECT_TRUE(rig.client.cmpct_parked_for_test(CmpctRig::key(2), hash_of(b1)));
+    EXPECT_TRUE(rig.client.cmpct_parked_for_test(CmpctRig::key(2), hash_of(b1x)));
+    auto gbt = rig.sent_to(2, "getblocktxn");
+    ASSERT_EQ(gbt.size(), 2u);
+    rig.deliver(2, p2p::message_blocktxn::make_raw(answer(getblocktxn_of(gbt[0]), b1)));
+    rig.deliver(2, p2p::message_blocktxn::make_raw(answer(getblocktxn_of(gbt[1]), b1x)));
+    ASSERT_EQ(rig.delivered.size(), 3u);
+    EXPECT_EQ(rig.delivered[1], hash_of(b1));
+    EXPECT_EQ(rig.delivered[2], hash_of(b1x));
+}
+
+TEST(DashCmpctClient, BlocktxnOfTheWrongSizeIsIgnoredNeverPunished)
+{
+    CmpctRig rig;
+    rig.handshake(1);
+    rig.handshake(2);
+    rig.warm(1);
+    const BlockType b1 = mk_block(hash_of(rig.b0), 1, 4);
+    const uint256 h1 = hash_of(b1);
+    rig.announce(2, b1);
+    rig.cmpct(2, b1);
+    auto gbt = rig.sent_to(2, "getblocktxn");
+    ASSERT_EQ(gbt.size(), 1u);
+    const auto req = getblocktxn_of(gbt[0]);
+    auto longer = answer(req, b1);
+    longer.txn.push_back(v::MakeTransactionRef(mk_tx(4242)));
+    auto shorter = answer(req, b1);
+    shorter.txn.pop_back();
+    rig.deliver(2, p2p::message_blocktxn::make_raw(longer));
+    rig.deliver(2, p2p::message_blocktxn::make_raw(shorter));
+    EXPECT_EQ(rig.client.misbehavior_for_test(CmpctRig::key(2)), 0);
+    EXPECT_FALSE(rig.client.flagged_for_disconnect_for_test(CmpctRig::key(2)));
+    EXPECT_TRUE(rig.client.cmpct_parked_for_test(CmpctRig::key(2), h1)) << "park kept";
+    EXPECT_EQ(rig.delivered.size(), 1u);
+    rig.deliver(2, p2p::message_blocktxn::make_raw(answer(req, b1)));   // the right one
+    EXPECT_EQ(rig.delivered.back(), h1);
+}
+
+// ── hostile compact data and Misbehaving ────────────────────────────────────
 
 TEST(DashCmpctClient, InvalidCmpctblockMisbehavesAndFetchesFullFromAnotherPeer)
 {
@@ -557,7 +657,7 @@ TEST(DashCmpctClient, InvalidCmpctblockMisbehavesAndFetchesFullFromAnotherPeer)
     rig.warm(1);
     const BlockType b1 = mk_block(hash_of(rig.b0), 1, 3);
     const uint256 h1 = hash_of(b1);
-    rig.inv_block(2, h1);
+    rig.announce(2, b1);
     ASSERT_TRUE(rig.client.cmpct_requested_from_for_test(h1, CmpctRig::key(2)));
     rig.sent.clear();
     // prefilled at absolute index 3 past 2 short ids + 0: READ_STATUS_INVALID.
@@ -568,8 +668,69 @@ TEST(DashCmpctClient, InvalidCmpctblockMisbehavesAndFetchesFullFromAnotherPeer)
     auto gd = rig.sent_to(1, "getdata");
     ASSERT_EQ(gd.size(), 1u) << "the block still comes, from another peer";
     EXPECT_EQ(getdata_invs(gd[0]).at(0), std::make_pair(kMsgBlock, h1));
+    // A flagged peer is not processed any further ...
+    const size_t before = rig.sent.size();
+    rig.deliver(2, p2p::message_ping::make_raw(7));
+    EXPECT_EQ(rig.sent.size(), before) << "no pong to a flagged peer";
+    // ... the next pool tick disconnects it, and the block arrives.
+    rig.run_seconds(1);
+    EXPECT_EQ(rig.client.peer_session(CmpctRig::key(2)), nullptr);
+    EXPECT_EQ(rig.client.misbehavior_disconnects(), 1u);
     rig.deliver(1, p2p::message_block::make_raw(b1));
     EXPECT_EQ(rig.delivered.back(), h1);
+}
+
+TEST(DashCmpctClient, ProtectedPeerIsNeverDisconnected)
+{
+    CmpctRig rig;
+    rig.handshake(1);
+    rig.handshake(2);
+    rig.client.set_protected_peer_keys({CmpctRig::key(2)});   // --coin-p2p-connect
+    rig.warm(1);
+    const BlockType b1 = mk_block(hash_of(rig.b0), 1, 3);
+    rig.announce(2, b1);
+    rig.deliver(2, raw_cmpct(b1, {1, 2}, {{3, b1.m_txs[0]}}));
+    EXPECT_EQ(rig.client.cmpct_rejected(), 1u);
+    EXPECT_FALSE(rig.client.flagged_for_disconnect_for_test(CmpctRig::key(2)));
+    EXPECT_EQ(rig.client.misbehavior_spared(), 1u);
+    rig.run_seconds(1);
+    EXPECT_NE(rig.client.peer_session(CmpctRig::key(2)), nullptr);
+}
+
+TEST(DashCmpctClient, LocalDashdIsNeverDisconnected)
+{
+    CmpctRig rig;
+    const NetService local{"127.0.0.1", 19999};
+    rig.handshake_at(local);
+    rig.handshake(2);
+    rig.client.misbehaving_for_test(local.to_string(), 100);
+    EXPECT_FALSE(rig.client.flagged_for_disconnect_for_test(local.to_string()));
+    const NetService lan{"10.1.2.3", 9999};
+    rig.handshake_at(lan);
+    rig.client.misbehaving_for_test(lan.to_string(), 100);
+    EXPECT_FALSE(rig.client.flagged_for_disconnect_for_test(lan.to_string()));
+    EXPECT_EQ(rig.client.misbehavior_spared(), 2u);
+}
+
+TEST(DashCmpctClient, LastPeerIsNeverDisconnected)
+{
+    CmpctRig rig;
+    rig.handshake(1);
+    rig.client.misbehaving_for_test(CmpctRig::key(1), 100);
+    EXPECT_FALSE(rig.client.flagged_for_disconnect_for_test(CmpctRig::key(1)));
+    EXPECT_EQ(rig.client.misbehavior_spared(), 1u);
+    rig.handshake(2);
+    rig.client.misbehaving_for_test(CmpctRig::key(2), 100);
+    EXPECT_TRUE(rig.client.flagged_for_disconnect_for_test(CmpctRig::key(2)))
+        << "with another peer up, a public peer is disconnected";
+    // A peer on its way out is no alternative: peer 1 is spared again ...
+    rig.client.misbehaving_for_test(CmpctRig::key(1), 10);
+    EXPECT_FALSE(rig.client.flagged_for_disconnect_for_test(CmpctRig::key(1)));
+    // ... and cut on its next offence once a healthy peer is up.
+    rig.handshake(3);
+    rig.client.misbehaving_for_test(CmpctRig::key(1), 10);
+    EXPECT_TRUE(rig.client.flagged_for_disconnect_for_test(CmpctRig::key(1)));
+    EXPECT_EQ(rig.client.misbehavior_spared(), 2u);
 }
 
 TEST(DashCmpctClient, DuplicateShortIdsFetchTheFullBlockFromTheSamePeer)
@@ -580,7 +741,7 @@ TEST(DashCmpctClient, DuplicateShortIdsFetchTheFullBlockFromTheSamePeer)
     rig.warm(1);
     const BlockType b1 = mk_block(hash_of(rig.b0), 1, 3);
     const uint256 h1 = hash_of(b1);
-    rig.inv_block(2, h1);
+    rig.announce(2, b1);
     rig.sent.clear();
     rig.deliver(2, raw_cmpct(b1, {0xabc, 0xabc}, {{0, b1.m_txs[0]}}));
     EXPECT_EQ(rig.client.misbehavior_for_test(CmpctRig::key(2)), 0)
@@ -588,32 +749,6 @@ TEST(DashCmpctClient, DuplicateShortIdsFetchTheFullBlockFromTheSamePeer)
     auto gd = rig.sent_to(2, "getdata");
     ASSERT_EQ(gd.size(), 1u);
     EXPECT_EQ(getdata_invs(gd[0]).at(0), std::make_pair(kMsgBlock, h1));
-}
-
-TEST(DashCmpctClient, OverLongBlocktxnMisbehavesAndFetchesFullElsewhere)
-{
-    CmpctRig rig;
-    rig.handshake(1);
-    rig.handshake(2);
-    rig.warm(1);
-    const BlockType b1 = mk_block(hash_of(rig.b0), 1, 3);
-    const uint256 h1 = hash_of(b1);
-    rig.inv_block(2, h1);
-    rig.deliver(2, p2p::message_cmpctblock::make_raw(v::CBlockHeaderAndShortTxIDs(b1)));
-    auto gbt = rig.sent_to(2, "getblocktxn");
-    ASSERT_EQ(gbt.size(), 1u);
-    PackStream ps(gbt[0].payload);
-    v::BlockTransactionsRequest req;
-    ps >> req;
-    auto resp = answer(req, b1);
-    resp.txn.push_back(v::MakeTransactionRef(mk_tx(4242)));
-    rig.sent.clear();
-    rig.deliver(2, p2p::message_blocktxn::make_raw(resp));
-    EXPECT_EQ(rig.client.misbehavior_for_test(CmpctRig::key(2)), 100);
-    auto gd = rig.sent_to(1, "getdata");
-    ASSERT_EQ(gd.size(), 1u);
-    EXPECT_EQ(getdata_invs(gd[0]).at(0), std::make_pair(kMsgBlock, h1));
-    EXPECT_EQ(rig.delivered.size(), 1u);
 }
 
 TEST(DashCmpctClient, OversizedCmpctblockIsDroppedAtParse)
@@ -630,6 +765,53 @@ TEST(DashCmpctClient, OversizedCmpctblockIsDroppedAtParse)
     EXPECT_NE(rig.client.peer_session(CmpctRig::key(1)), nullptr) << "read loop preserved";
 }
 
+// ── bind first, credit only the asked peer ──────────────────────────────────
+
+TEST(DashCmpctClient, BodyThatDoesNotBindTouchesNothing)
+{
+    CmpctRig rig;
+    rig.handshake(1);
+    rig.handshake(2);
+    rig.warm(1);
+    const BlockType b1 = mk_block(hash_of(rig.b0), 1, 3);
+    const uint256 h1 = hash_of(b1);
+    rig.client.request_block_tracked(hash_of(mk_block(hash_of(rig.b0), 9, 2)));  // body in flight -> full fetch
+    rig.announce(2, b1);
+    ASSERT_EQ(rig.client.pending_body_count(), 2u);
+    const uint64_t credit = rig.client.peer_delivered_for_test(CmpctRig::key(2));
+    BlockType forged = b1;               // b1's header, other txs
+    forged.m_txs[1] = mk_tx(31337);
+    ASSERT_EQ(hash_of(forged), h1);
+    rig.deliver(2, p2p::message_block::make_raw(forged));
+    EXPECT_EQ(rig.client.bodies_unbound(), 1u);
+    EXPECT_EQ(rig.delivered.size(), 1u);
+    EXPECT_FALSE(rig.client.have_body_for_test(h1));
+    EXPECT_EQ(rig.client.pending_body_count(), 2u) << "the watchdog still wants it";
+    EXPECT_EQ(rig.client.peer_delivered_for_test(CmpctRig::key(2)), credit) << "no credit";
+    // The real body still credits the peer we asked (its ask was not consumed).
+    rig.deliver(2, p2p::message_block::make_raw(b1));
+    EXPECT_EQ(rig.delivered.back(), h1);
+    EXPECT_EQ(rig.client.peer_delivered_for_test(CmpctRig::key(2)), credit + 1);
+}
+
+TEST(DashCmpctClient, UnaskedDeliveryDoesNotTakeAnotherPeersAsk)
+{
+    CmpctRig rig;
+    rig.handshake(1);
+    rig.handshake(2);
+    rig.warm(1);
+    const uint64_t c1 = rig.client.peer_delivered_for_test(CmpctRig::key(1));
+    const BlockType b1 = mk_block(hash_of(rig.b0), 1, 2);
+    rig.client.request_block_tracked(hash_of(mk_block(hash_of(rig.b0), 9, 2)));  // force MSG_BLOCK
+    rig.announce(1, b1);                 // asked peer 1
+    rig.deliver(2, p2p::message_block::make_raw(b1));   // peer 2 delivers, unasked
+    EXPECT_EQ(rig.delivered.back(), hash_of(b1));
+    EXPECT_EQ(rig.client.peer_delivered_for_test(CmpctRig::key(2)), 0u) << "unasked: no credit";
+    rig.deliver(1, p2p::message_block::make_raw(b1));   // the asked peer, late
+    EXPECT_EQ(rig.client.peer_delivered_for_test(CmpctRig::key(1)), c1 + 1)
+        << "peer 1's ask survived peer 2's delivery";
+}
+
 // ── the timeout is the lost-body watchdog ───────────────────────────────────
 
 TEST(DashCmpctClient, StalledBlocktxnFallsBackToFullBlockFromAnotherPeer)
@@ -640,11 +822,11 @@ TEST(DashCmpctClient, StalledBlocktxnFallsBackToFullBlockFromAnotherPeer)
     rig.warm(1);
     const BlockType b1 = mk_block(hash_of(rig.b0), 1, 3);
     const uint256 h1 = hash_of(b1);
-    rig.inv_block(2, h1);
-    rig.deliver(2, p2p::message_cmpctblock::make_raw(v::CBlockHeaderAndShortTxIDs(b1)));
+    rig.announce(2, b1);
+    rig.cmpct(2, b1);
     auto gbt = rig.sent_to(2, "getblocktxn");
     ASSERT_EQ(gbt.size(), 1u);
-    ASSERT_TRUE(rig.client.cmpct_parked_for_test(CmpctRig::key(2)));
+    ASSERT_TRUE(rig.client.cmpct_parked_for_test(CmpctRig::key(2), h1));
     ASSERT_EQ(rig.client.pending_body_count(), 1u);
     rig.sent.clear();
 
@@ -656,17 +838,12 @@ TEST(DashCmpctClient, StalledBlocktxnFallsBackToFullBlockFromAnotherPeer)
     EXPECT_EQ(getdata_invs(gd[0]).at(0), std::make_pair(kMsgBlock, h1));
 
     // The late blocktxn is now unrequested and ignored.
-    PackStream ps(gbt[0].payload);
-    v::BlockTransactionsRequest req;
-    ps >> req;
-    rig.deliver(2, p2p::message_blocktxn::make_raw(answer(req, b1)));
+    rig.deliver(2, p2p::message_blocktxn::make_raw(answer(getblocktxn_of(gbt[0]), b1)));
     EXPECT_EQ(rig.delivered.size(), 1u);
     rig.deliver(1, p2p::message_block::make_raw(b1));
     EXPECT_EQ(rig.delivered.back(), h1);
     EXPECT_EQ(rig.client.pending_body_count(), 0u);
 }
-
-// ── teardown and serving ────────────────────────────────────────────────────
 
 TEST(DashCmpctClient, DisconnectClearsCompactState)
 {
@@ -675,56 +852,10 @@ TEST(DashCmpctClient, DisconnectClearsCompactState)
     rig.handshake(2);
     rig.warm(1);
     const BlockType b1 = mk_block(hash_of(rig.b0), 1, 3);
-    rig.inv_block(2, hash_of(b1));
-    rig.deliver(2, p2p::message_cmpctblock::make_raw(v::CBlockHeaderAndShortTxIDs(b1)));
+    rig.announce(2, b1);
+    rig.cmpct(2, b1);
     ASSERT_EQ(rig.client.cmpct_parked_count_for_test(), 1u);
-    ASSERT_EQ(rig.client.cmpct_high_bandwidth_count_for_test(), 1u);
     rig.client.disconnect();
     EXPECT_EQ(rig.client.cmpct_parked_count_for_test(), 0u);
-    EXPECT_EQ(rig.client.cmpct_high_bandwidth_count_for_test(), 0u);
     EXPECT_FALSE(rig.client.cmpct_requested_from_for_test(hash_of(b1), CmpctRig::key(2)));
-}
-
-TEST(DashCmpctClient, ServesCmpctblockAndBlocktxnForHeldBlocks)
-{
-    CmpctRig rig;
-    rig.handshake(1);
-    rig.handshake(2);
-    rig.warm(1);
-    const uint256 h0 = hash_of(rig.b0);
-    rig.sent.clear();
-    // One answer per held block per message, however often it is repeated.
-    rig.deliver(2, p2p::message_getdata::make_raw(
-        {p2p::inventory_type(p2p::DASH_MSG_CMPCT_BLOCK, h0),
-         p2p::inventory_type(p2p::DASH_MSG_CMPCT_BLOCK, h0),
-         p2p::inventory_type(p2p::DASH_MSG_CMPCT_BLOCK, h0)}));
-    auto cb = rig.sent_to(2, "cmpctblock");
-    ASSERT_EQ(cb.size(), 1u);
-    PackStream ps(cb[0].payload);
-    v::CBlockHeaderAndShortTxIDs got;
-    ps >> got;
-    EXPECT_EQ(x11_of(got.header), h0);
-    EXPECT_EQ(got.BlockTxCount(), rig.b0.m_txs.size());
-
-    v::BlockTransactionsRequest req;
-    req.blockhash = h0;
-    req.indexes = {1};
-    rig.deliver(2, p2p::message_getblocktxn::make_raw(req));
-    auto bt = rig.sent_to(2, "blocktxn");
-    ASSERT_EQ(bt.size(), 1u);
-    PackStream ps2(bt[0].payload);
-    v::BlockTransactions txn;
-    ps2 >> txn;
-    ASSERT_EQ(txn.txn.size(), 1u);
-    EXPECT_EQ(dash::coin::dash_txid(*txn.txn[0]), dash::coin::dash_txid(rig.b0.m_txs[1]));
-
-    // dashcore: an index past the block is Misbehaving(100).
-    req.indexes = {9};
-    rig.deliver(2, p2p::message_getblocktxn::make_raw(req));
-    EXPECT_EQ(rig.client.misbehavior_for_test(CmpctRig::key(2)), 100);
-    // A block we do not hold is not served.
-    rig.sent.clear();
-    rig.deliver(1, p2p::message_getdata::make_raw(
-        {p2p::inventory_type(p2p::DASH_MSG_CMPCT_BLOCK, uint256::ONE)}));
-    EXPECT_TRUE(rig.sent_to(1, "cmpctblock").empty());
 }
