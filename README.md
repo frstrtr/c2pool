@@ -861,7 +861,9 @@ Every node binary resolves its launch configuration in three layers
 (`src/core/settings_cli.hpp`): **compiled defaults (L0) < settings file (L1) <
 command line (L2)**. The CLI always wins, even over a money-class key that the
 file has acknowledged. The catalog of every key and its per-binary CLI spelling
-is `src/core/param_catalog.inc`.
+is `src/core/param_catalog.inc`. Commented example files for c2pool-ltc, -dash,
+-btc, -bch and -dgb, checked against the release binaries, are in
+[config/examples/](config/examples/).
 
 | Flag | Binaries | Behaviour |
 |------|----------|-----------|

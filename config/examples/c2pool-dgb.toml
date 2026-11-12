@@ -1,0 +1,120 @@
+# c2pool-dgb -- example settings file (TOML), checked against release 0.2.12.1
+#
+# WHAT THIS IS
+#   Launch settings for the c2pool-dgb node (DigiByte, Scrypt, mainnet only).
+#   The upper part sets the keys this binary applies from a file. The
+#   REFERENCE block at the end lists the keys the file loader accepts but this
+#   release does not apply (use their CLI flags instead).
+#
+# WHERE TO PUT IT
+#   Either name it on the command line:
+#     c2pool-dgb --run --stratum 0.0.0.0:9434 --settings /etc/c2pool/c2pool-dgb.toml
+#   or copy it to <data-dir>/c2pool.toml (data dir default: ~/.c2pool, or the
+#   one given with --data-dir); that file is loaded when --settings is absent.
+#   An explicit --settings path that does not exist is fatal (exit 78).
+#   Two things are command-line only in this release: --run (without it the
+#   binary runs its self-test and exits) and --stratum [HOST:]PORT (Stratum
+#   is off unless given). Run the binary from the unpacked release directory
+#   (the dashboard serves ./web-static), not through start.sh: it adds
+#   --stratum 5025 --http 8080 on the command line, and command-line flags
+#   override this file.
+#
+# PRECEDENCE
+#   compiled defaults  <  this file  <  command-line flags
+#   A flag on the command line always wins over the same key in this file.
+#
+# CHECK IT BEFORE YOU RUN
+#   c2pool-dgb --settings c2pool-dgb.toml --dump-resolved-config
+#   prints "key=value source=compiled|file|cli" for each resolved key and
+#   exits 0 without starting the node. A key left at its compiled default is
+#   usually not printed. "source=file" proves the file was read, not that the
+#   key is used: keys from the REFERENCE block also print as source=file.
+#
+# MONEY GATE
+#   Keys marked [money] (fees, donation, payout addresses, redistribution,
+#   network identity) are never accepted from a file without your explicit
+#   acknowledgement:
+#     1. uncomment the key(s) and enter your own value(s);
+#     2. run  c2pool-dgb --settings c2pool-dgb.toml --ack-money-settings
+#        it exits 0; the last line of its output is the hash (64 hex chars);
+#     3. put that hash in [gate] money_ack_hash at the end of this file;
+#     4. run --dump-resolved-config again: exit 0, money keys show source=file.
+#   Without a matching hash the node refuses to start, names the money keys
+#   and exits 78. Changing, adding or removing any money key changes the hash:
+#   repeat steps 2 and 3. The same values given as CLI flags need no hash.
+#
+# FORMAT
+#   Keys live in [dgb.<section>] tables. A misspelled key in a [dgb.*] table
+#   is fatal (exit 78). Tables for other coins are ignored by this binary, but
+#   use one file per binary all the same: [gate] holds a single money_ack_hash.
+#
+# POSTURE
+#   Daemonless: coin_p2p.discover = true finds DigiByte network peers by
+#   itself, so no digibyted is needed. Leave producer_target and the
+#   [dgb.daemon_rpc] keys commented out for that.
+#
+# PORTS (one host running ltc, dash, btc, dgb and bch from these examples)
+#   dgb: sharechain 5024, Stratum 9434 (via --stratum), web 8084
+#   ltc 9326/9327/8080, dash 8999/7903/8082, btc 9333/9334/8083,
+#   bch 9349/9534/8085 (sharechain/Stratum/web)
+
+[dgb.coin_p2p]
+discover = true             # daemonless DigiByte peer discovery; default false. Must be exactly true (lower case)
+# producer_target = "127.0.0.1:12024"   # one explicit digibyted P2P endpoint HOST:PORT for the embedded coin feed (CLI --coin-daemon); default none
+
+[dgb.sharechain]
+listen = "0.0.0.0:5024"     # sharechain (pool P2P) listener; default port 5024. Only the PORT part is used
+no_p2p_relay = false        # true = do not relay won blocks over the embedded coin P2P (testing the RPC arm only); default false. Only the value true has an effect
+
+[dgb.web]
+port = 8084                 # dashboard TCP port, bound on 0.0.0.0; default 0 (off). For a loopback-only bind use the CLI: --http 127.0.0.1:8084
+
+[dgb.embedded]
+# serve_mempool_txs = true    # embedded fee-proof lane. Unset (default) = fee-proof lane ON, Stratum job commit OFF; true = also arm the job-commit lever (inert in this release); false = opt out of both
+
+[dgb.daemon_rpc]
+# submit_endpoint = "127.0.0.1:14022"                # external digibyted RPC endpoint for submitblock (CLI --coin-rpc); default none
+# auth_file = "/home/<user>/.digibyte/digibyte.conf" # file holding rpcuser/rpcpassword for that RPC (CLI --coin-rpc-auth); default ~/.digibyte/digibyte.conf
+
+[dgb.money]
+# give_author_pct = 0.1                        # [money] author donation, percent 0-100; default 0.1
+# node_owner_fee_pct = 1.0                     # [money] node-owner fee, percent 0-100; default 0 (off); needs node_owner_address
+# node_owner_address = "<your-DGB-address>"    # [money] operator payout identity for the fee and for redistribute = "fee"; default none
+# redistribute = "pplns"                       # [money] where shares of an empty or invalid login go: pplns, fee, boost, donate, or a mix such as "boost:70,donate:20"; default pplns
+
+[gate]
+# money_ack_hash = "<64-hex output of: c2pool-dgb --settings THIS_FILE --ack-money-settings>"   # needed only when a [money] key is uncommented
+
+# ---------------------------------------------------------------------------
+# REFERENCE: keys the loader ACCEPTS but c2pool-dgb 0.2.12.1 does NOT apply
+# ---------------------------------------------------------------------------
+# The loader knows these keys (so they are not refused as typos) and
+# --dump-resolved-config shows them as source=file when set, but this release
+# copies only the keys above into the running node. Setting one of these here
+# has no effect: use the CLI flag shown. A [money] key still trips the money
+# gate. Defaults are not repeated here; see "Per-binary launch reference" in
+# README.md. Form:  key [money] -- meaning (CLI flag)
+# [dgb.meta]
+#   data_dir -- data directory; cannot work from a file, the file itself is found through the data dir (CLI: --data-dir)
+#   run -- run the node (CLI: --run)
+#   selftest -- run self-test (CLI: --selftest)
+# [dgb.network]
+#   regtest [money] -- regtest network identity (CLI: --regtest)
+#   coin_genesis [money] -- coin genesis hash override (CLI: --coin-genesis)
+# [dgb.sharechain]
+#   addnodes -- persistent outbound sharechain peers (CLI: --sharechain-addnode)
+# [dgb.coin_p2p]
+#   magic [money] -- wire magic override (regtest) (CLI: --coin-magic)
+#   doge_address -- doge coin-P2P address (CLI: --doge-p2p-address)
+#   doge_port -- doge coin-P2P port (CLI: --doge-p2p-port)
+#   port -- coind P2P port (-1 auto,0 off) (CLI: --coind-p2p-port)
+# [dgb.daemon_rpc]
+#   endpoint -- coin daemon RPC endpoint (empty=daemonless) (no CLI flag on this binary)
+# [dgb.stratum]
+#   bind -- stratum bind [HOST:]PORT (0=off) (CLI: --stratum)
+# [dgb.merged]
+#   spec -- merged-mining spec SYMBOL:CHAIN:HOST:PORT:USER:PASS (CLI: --merged)
+# [dgb.embedded]
+#   doge_enabled -- embedded DOGE SPV (default on) (CLI: --embedded-doge)
+#   regtest_force_won_share [money] -- regtest-only forced won share (CLI: --regtest-force-won-share)
+#   dev_relax_algo_softforks [money] -- dev-only softfork relax (mainnet fail-closed) (CLI: --dev-relax-algo-softforks)
