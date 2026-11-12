@@ -29,6 +29,8 @@
 #include <ctime>
 #include <cstdint>
 #include <functional>
+#include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -106,6 +108,10 @@ struct EmbeddedWorkInputs {
     // defaults (std::time(nullptr) / 0x20000000 BIP9 baseline).
     uint32_t              curtime{0};
     uint32_t              version{0};
+    // Dash Core v24: DEPLOYMENT_V24 is active for the block being built
+    // (NodeCoinState::set_v24_state_fn; UNKNOWN never reaches the builder).
+    // false => the pre-v24 template, byte-identical.
+    bool                  v24_active{false};
 
     // CCbTx (DIP-0004 type-5 extra_payload) seams. When sml AND qmgr are both
     // non-null, build_embedded_workdata folds the real type-5 payload
@@ -180,6 +186,18 @@ struct EmbeddedWorkInputs {
     // NodeCoinState::make_embedded_work_inputs from set_include_mn_special_txs.
     bool                             include_mn_special_txs{false};
 
+    // #143 / Dash Core v24: the type-9 asset unlocks the credit-pool follower
+    // admitted for this template (credit_pool_lane.hpp admit: version-2 gate,
+    // UnlockLimitV24, quorum signatures). Null => every unlock is excluded.
+    // Set by NodeCoinState::make_embedded_work_inputs from its admit hook.
+    std::shared_ptr<const AssetUnlockAdmission> asset_unlocks;
+
+    // Testnet (Dash Core fPowAllowMinDifficultyBlocks): the bits of the block
+    // depend on its own time, so they are re-derived for the template's final
+    // curtime (Core's UpdateTime recomputes nBits the same way). Returns
+    // nullopt to keep bits_for_next. Unset on mainnet.
+    std::function<std::optional<uint32_t>(const uint256& prev_hash, uint32_t block_time)> bits_at_time;
+
     // PoSe pass seams (sml_pose_fold.hpp): the member proTxHash source and
     // the penalty oracle for the builder's own HandleQuorumCommitment pass
     // over qc_commitments. Point into NodeCoinState (same lifetime discipline
@@ -192,6 +210,12 @@ struct EmbeddedWorkInputs {
     // ProUpServTx / ProUpRevTx with. Points into NodeCoinState; nullptr =>
     // those two types are refused (fail closed).
     const MnFoldContext::OperatorSigFn* protx_sig_verifier{nullptr};
+    /// Dash Core's CheckPro*Tx environment (NodeCoinState::set_protx_check_env).
+    /// nullptr => no provider tx is checkable, so none rides the template.
+    const ProTxCheckEnv* protx_check_env{nullptr};
+    /// Dash Core's CheckMNHFTx environment for type-7 signals
+    /// (NodeCoinState::set_mnhf_check_env). nullptr => no signal rides.
+    const MnhfCheckEnv* mnhf_check_env{nullptr};
 
     bool viable() const {
         return has_state && mnstates != nullptr && mempool != nullptr;
@@ -292,7 +316,7 @@ inline WorkSelection select_dash_work(
     return select_dash_work(
         emb,
         [&emb]() {
-            return build_embedded_workdata(
+            auto w = build_embedded_workdata(
                 emb.prev_height, emb.prev_hash, *emb.mnstates, *emb.mempool,
                 emb.bits_for_next, emb.mtp_at_tip,
                 emb.address_version, emb.address_p2sh_version,
@@ -327,9 +351,9 @@ inline WorkSelection select_dash_work(
                 // #107 phase 2: accrue pending type-8 asset-lock term into the
                 // CbTx creditPoolBalance (default false => byte-unchanged).
                 emb.accrue_pending_asset_locks,
-                // #143 verified type-9 unlocks: not wired through this arm yet
-                // (admission-path-only; default nullptr => byte-unchanged).
-                /*admitted_asset_unlocks=*/nullptr,
+                // #143 verified type-9 unlocks (credit-pool follower admission;
+                // null => every unlock excluded, byte-unchanged).
+                emb.asset_unlocks.get(),
                 // SUPERSET: include provider special txs (types 1-4) + fold
                 // them into merkleRootMNList (default false => byte-unchanged).
                 emb.include_mn_special_txs,
@@ -338,7 +362,17 @@ inline WorkSelection select_dash_work(
                 emb.qc_pose_members, emb.qc_pose_oracle,
                 // B.9: ProUpServTx / ProUpRevTx operator-signature verifier
                 // (null => those types are refused by the fold).
-                emb.protx_sig_verifier);
+                emb.protx_sig_verifier,
+                // Dash Core v24: CbTx version 4 when v24 is active for the block.
+                emb.v24_active,
+                // Dash Core's full provider-tx checks (null => none rides).
+                emb.protx_check_env,
+                // Dash Core's CheckMNHFTx for type-7 signals (null => none rides).
+                emb.mnhf_check_env);
+            // Testnet min-difficulty: bits for the template's own curtime.
+            if (emb.bits_at_time)
+                if (auto b = emb.bits_at_time(w.m_previous_block, w.m_curtime)) w.m_bits = *b;
+            return w;
         },
         dashd_fallback);
 }

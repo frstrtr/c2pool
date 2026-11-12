@@ -18,7 +18,14 @@
 ///   - a tx with an MWEB part (peg-in, peg-out, MWEB-to-MWEB or mixed);
 ///   - a pegin output without its kernel (mweb_policy.cpp kernel-mismatch);
 ///   - empty vin or vout, unless MWEB-only (consensus/tx_check.cpp);
-///   - a HogEx (valid only in a block; validation.cpp PreChecks).
+///   - a HogEx (valid only in a block; validation.cpp PreChecks);
+///   - a tx not final in the next block (CheckFinalTx: IsFinalTx at the
+///     tip's height + 1 and the tip's median time past), once the caller set
+///     that block (set_lock_time_cutoff);
+///   - on a chain that enforces BIP68 (Mempool::bip68_for), a tx whose
+///     relative lock-times (nSequence) the next block does not satisfy
+///     (CheckSequenceLocks: an input's coin at its height in the view, an
+///     in-pool parent's at the next block's height).
 /// Children of a refused tx need no rule: their input is in neither the UTXO
 /// set nor the pool, so their fee stays unknown and they are never selected.
 ///
@@ -42,6 +49,7 @@
 #include <core/pack.hpp>
 #include <core/hash.hpp>
 #include <core/log.hpp>
+#include <core/coin/sigop_cost.hpp>
 #include <core/coin/utxo_view_cache.hpp>
 
 #include <nlohmann/json.hpp>
@@ -49,6 +57,7 @@
 #include <algorithm>
 #include <atomic>
 #include <deque>
+#include <functional>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -72,6 +81,7 @@ struct MempoolEntry {
     uint64_t fee{0};            // satoshi (computed from UTXO when available)
     bool     fee_known{false};  // true when fee was computed from UTXO lookups
     time_t   time_added{0};
+    int64_t  sigop_cost{-1};    // GetTransactionSigOpCost under the pool's rules (-1: not known yet)
 
     double feerate() const {
         uint32_t vsize = (weight + 3) / 4;  // ceil(weight/4)
@@ -120,6 +130,162 @@ inline void compute_tx_weight(const MutableTransaction& tx,
     weight = base_size * 4 + witness_size;
 }
 
+/// The block a tx must be final in: its height and the lock-time cutoff, the
+/// median time past of its parent (litecoind uses MTP for both relay,
+/// CheckFinalTx with STANDARD_LOCKTIME_VERIFY_FLAGS, and its own templates,
+/// BlockAssembler's nLockTimeCutoff; BIP113).
+struct LockTimeCutoff {
+    uint32_t height{0};  // the block's height (tip + 1)
+    int64_t  mtp{0};     // the median time past of its parent (the tip)
+    /// The median time past of the block at a height below the parent's on
+    /// this block's chain, or a value no lower than it; nullopt: unknown.
+    /// Time-based relative lock-times (BIP68) need it; without it they are
+    /// not satisfied.
+    std::function<std::optional<int64_t>(uint32_t)> mtp_at;
+
+    /// litecoind CalculateSequenceLocks' coin time: the median time past of
+    /// the block before the one holding a coin at `coin_height`
+    /// (GetAncestor(max(coin_height - 1, 0))).
+    std::optional<int64_t> coin_time(uint32_t coin_height) const {
+        const uint32_t h = coin_height > 0 ? coin_height - 1 : 0;
+        if (height != 0 && h + 1 == height)
+            return mtp;
+        if (mtp_at)
+            return mtp_at(h);
+        return std::nullopt;
+    }
+};
+
+/// litecoind IsFinalTx (consensus/tx_verify.cpp): a tx with nLockTime 0 is
+/// final; one whose nLockTime (a height below LOCKTIME_THRESHOLD, else a
+/// time) is below the block's height / cutoff time is final; otherwise it is
+/// final only when every input's nSequence is SEQUENCE_FINAL. litecoind also
+/// refuses an MWEB part whose kernel lock height is above the block's: not
+/// checked here, since admission refuses every tx with an MWEB part first and
+/// no block tx may carry one.
+inline bool is_final_tx(const MutableTransaction& tx, uint32_t block_height, int64_t block_time)
+{
+    constexpr int64_t  LOCKTIME_THRESHOLD = 500000000;   // script.h (Tue Nov  5 00:53:20 1985 UTC)
+    constexpr uint32_t SEQUENCE_FINAL     = 0xffffffff;  // CTxIn::SEQUENCE_FINAL
+    if (tx.locktime == 0)
+        return true;
+    const int64_t lt = static_cast<int64_t>(tx.locktime);
+    if (lt < (lt < LOCKTIME_THRESHOLD ? static_cast<int64_t>(block_height) : block_time))
+        return true;
+    for (const auto& in : tx.vin)
+        if (in.sequence != SEQUENCE_FINAL)
+            return false;
+    return true;
+}
+
+/// GetTransactionSigOpCost (Litecoin Core 0.21.4 / Dogecoin Core 1.14.9
+/// consensus/tx_verify.cpp) of `tx` under `rules`: the legacy sigops of every
+/// scriptSig and scriptPubKey (GetLegacySigOpCount) x scale; for a non-coinbase
+/// tx also the P2SH sigops (GetP2SHSigOpCount) x scale and the witness sigops
+/// (CountWitnessSigOps), as `rules` enables them. `prevout_spk(i)` is the
+/// scriptPubKey of input i's coin (nullptr: unknown, and so is the cost). A
+/// block tx carries no MWEB data, so litecoind's extra count of an MWEB part's
+/// peg-out scripts never applies.
+template <typename PrevoutSpk>
+inline std::optional<int64_t> tx_sigop_cost(const MutableTransaction& tx,
+                                             const core::coin::sigops::SigopRules& rules,
+                                             PrevoutSpk&& prevout_spk)
+{
+    namespace sg = core::coin::sigops;
+    auto bytes = [](const std::vector<unsigned char>& v) { return sg::Bytes(v.data(), v.size()); };
+    int64_t legacy = 0;
+    for (const auto& in : tx.vin)
+        legacy += sg::script_sigops(bytes(in.scriptSig.m_data), false);
+    for (const auto& out : tx.vout)
+        legacy += sg::script_sigops(bytes(out.scriptPubKey.m_data), false);
+    int64_t cost = legacy * rules.scale;
+    const bool coinbase = tx.vin.size() == 1 && tx.vin[0].prevout.hash.IsNull()
+                       && tx.vin[0].prevout.index == 0xffffffff;
+    if (coinbase)
+        return cost;
+    for (size_t i = 0; i < tx.vin.size(); ++i) {
+        const std::vector<unsigned char>* spk = prevout_spk(i);
+        if (!spk)
+            return std::nullopt;
+        const auto& in = tx.vin[i];
+        if (rules.p2sh && sg::is_p2sh(bytes(*spk)))
+            cost += static_cast<int64_t>(sg::p2sh_sigops(bytes(*spk), bytes(in.scriptSig.m_data))) * rules.scale;
+        if (rules.witness)
+            cost += sg::witness_sigops(bytes(in.scriptSig.m_data), bytes(*spk), in.scriptWitness.stack);
+    }
+    return cost;
+}
+
+/// BIP68 relative lock-times (litecoind consensus/tx_verify.cpp
+/// CalculateSequenceLocks / EvaluateSequenceLocks, primitives/transaction.h).
+/// For a tx of version >= 2 (compared unsigned) each input whose nSequence
+/// has the disable flag (bit 31) clear locks the tx until its coin is
+/// `value` (the low 16 bits) blocks old, or with the type flag (bit 22)
+/// value x 512 seconds past the median time past of the block before the
+/// coin's block.
+inline constexpr uint32_t SEQUENCE_LOCKTIME_DISABLE_FLAG = 1u << 31;
+inline constexpr uint32_t SEQUENCE_LOCKTIME_TYPE_FLAG    = 1u << 22;
+inline constexpr uint32_t SEQUENCE_LOCKTIME_MASK         = 0x0000ffff;
+inline constexpr int      SEQUENCE_LOCKTIME_GRANULARITY  = 9;  // 512 s
+
+/// The last height and time at which the tx is not yet valid (nLockTime
+/// semantics: -1, any).
+struct SequenceLocks {
+    int64_t height{-1};
+    int64_t time{-1};
+};
+
+/// Whether BIP68 locks anything in `tx`: version >= 2 and an input with the
+/// disable flag clear.
+inline bool has_sequence_locks(const MutableTransaction& tx)
+{
+    if (static_cast<uint32_t>(tx.version) < 2)
+        return false;
+    for (const auto& in : tx.vin)
+        if (!(in.sequence & SEQUENCE_LOCKTIME_DISABLE_FLAG))
+            return true;
+    return false;
+}
+
+/// CalculateSequenceLocks with LOCKTIME_VERIFY_SEQUENCE in `block`.
+/// `coin_height(i)` is input i's coin's height (nullopt: unknown); the coin
+/// time is block.coin_time. nullopt when a locking input's height or time
+/// is unknown.
+template <typename CoinHeight>
+inline std::optional<SequenceLocks> calculate_sequence_locks(const MutableTransaction& tx,
+                                                             CoinHeight&& coin_height,
+                                                             const LockTimeCutoff& block)
+{
+    SequenceLocks l;
+    if (static_cast<uint32_t>(tx.version) < 2)
+        return l;
+    for (size_t i = 0; i < tx.vin.size(); ++i) {
+        const uint32_t seq = tx.vin[i].sequence;
+        if (seq & SEQUENCE_LOCKTIME_DISABLE_FLAG)
+            continue;
+        const std::optional<uint32_t> h = coin_height(i);
+        if (!h)
+            return std::nullopt;
+        const int64_t value = static_cast<int64_t>(seq & SEQUENCE_LOCKTIME_MASK);
+        if (seq & SEQUENCE_LOCKTIME_TYPE_FLAG) {
+            const std::optional<int64_t> t = block.coin_time(*h);
+            if (!t)
+                return std::nullopt;
+            l.time = std::max(l.time, *t + (value << SEQUENCE_LOCKTIME_GRANULARITY) - 1);
+        } else {
+            l.height = std::max(l.height, static_cast<int64_t>(*h) + value - 1);
+        }
+    }
+    return l;
+}
+
+/// EvaluateSequenceLocks: the block at block.height, whose parent's median
+/// time past is block.mtp, satisfies `l`.
+inline bool evaluate_sequence_locks(const LockTimeCutoff& block, const SequenceLocks& l)
+{
+    return !(l.height >= static_cast<int64_t>(block.height) || l.time >= block.mtp);
+}
+
 // ─── Mempool ─────────────────────────────────────────────────────────────────
 
 class Mempool {
@@ -130,13 +296,44 @@ public:
     /// Transaction expiry window.
     static constexpr time_t DEFAULT_EXPIRY_SECS = 14 * 24 * 3600;  // 14 days
 
+    /// The block sigop rules of the chain these limits are: DOGE (no
+    /// segwit, 20,000 sigops) for DOGE_LIMITS, else Litecoin's.
+    static core::coin::sigops::SigopRules sigop_rules_for(const core::coin::ChainLimits& l) {
+        const auto& d = core::coin::DOGE_LIMITS;
+        if (l.max_money == d.max_money && l.coinbase_maturity == d.coinbase_maturity
+            && l.pegout_maturity == d.pegout_maturity)
+            return core::coin::sigops::DOGE_SIGOP_RULES;
+        return core::coin::sigops::LTC_SIGOP_RULES;
+    }
+
+    /// Whether the chain these limits are enforces BIP68. Litecoin: yes
+    /// (CSV active since 1,201,536 on mainnet, 6,048 on testnet; litecoind's
+    /// mempool applies it at every height, STANDARD_LOCKTIME_VERIFY_FLAGS).
+    /// Dogecoin: no (its CSV deployment never activated: the BIP9 condition
+    /// needs block versions with top bits 001, and Dogecoin Core mines
+    /// version 4 with the AuxPoW chain id).
+    static bool bip68_for(const core::coin::ChainLimits& l) {
+        const auto& d = core::coin::DOGE_LIMITS;
+        return !(l.max_money == d.max_money && l.coinbase_maturity == d.coinbase_maturity
+                 && l.pegout_maturity == d.pegout_maturity);
+    }
+
     explicit Mempool(core::coin::ChainLimits limits = core::coin::LTC_LIMITS,
                      size_t max_bytes  = DEFAULT_MAX_BYTES,
-                     time_t expiry_sec = DEFAULT_EXPIRY_SECS)
+                     time_t expiry_sec = DEFAULT_EXPIRY_SECS,
+                     std::optional<core::coin::sigops::SigopRules> sigop_rules = std::nullopt)
         : m_limits(limits)
+        , m_sigop_rules(sigop_rules.value_or(sigop_rules_for(limits)))
+        , m_bip68(bip68_for(limits))
         , m_max_bytes(max_bytes)
         , m_expiry_sec(expiry_sec)
     {}
+
+    /// The block sigop rules the selection keeps to.
+    const core::coin::sigops::SigopRules& sigop_rules() const { return m_sigop_rules; }
+
+    /// Whether admission and the selection check BIP68 (bip68_for).
+    bool bip68() const { return m_bip68; }
 
     /// Update the current chain tip height (for coinbase maturity checks).
     /// Call after each block connection.
@@ -149,6 +346,27 @@ public:
     }
     uint32_t tip_height() const { return m_tip_height; }
     void set_utxo(core::coin::UTXOViewCache* u) { m_utxo.store(u); }
+
+    /// The next block relayed txs must be final in (litecoind CheckFinalTx:
+    /// the header tip's height + 1 and the tip's median time past) and whose
+    /// relative lock-times they must satisfy (CheckSequenceLocks; `mtp_at`
+    /// as LockTimeCutoff::mtp_at). Set on every tip change; until it is set
+    /// (height 0) admission checks neither.
+    void set_lock_time_cutoff(uint32_t next_height, int64_t median_time_past,
+                              std::function<std::optional<int64_t>(uint32_t)> mtp_at = {}) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_lock_time_cutoff = LockTimeCutoff{next_height, median_time_past, std::move(mtp_at)};
+    }
+    LockTimeCutoff lock_time_cutoff() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_lock_time_cutoff;
+    }
+
+    /// Counts every time an entry became priced (admitted priced, a child or
+    /// an orphan priced by its parent, a fee recomputed after a block, a fee
+    /// set): a caller compares it before and after admit() to learn whether
+    /// the selectable set grew (the transaction-triggered template refresh).
+    uint64_t priced_changes() const { return m_priced_seq.load(std::memory_order_relaxed); }
 
     // Disable copy
     Mempool(const Mempool&) = delete;
@@ -171,6 +389,9 @@ public:
             duplicate,               // already in the pool
             inputs_invalid,          // premature coinbase/pegout spend, money range, outputs above inputs
             missing_inputs,          // an input in neither the set nor the pool: parked as an orphan
+            non_final,               // not final in the next block (CheckFinalTx)
+            hogaddr_spend,           // spends a HogAddr (a HogEx output 0), which only the next HogEx spends
+            non_bip68_final,         // its relative lock-times are not satisfied in the next block (CheckSequenceLocks)
             count
         };
         Code     code{malformed};
@@ -194,6 +415,9 @@ public:
             case Reject::duplicate:              return "duplicate";
             case Reject::inputs_invalid:         return "inputs_invalid";
             case Reject::missing_inputs:         return "missing_inputs";
+            case Reject::non_final:              return "non_final";
+            case Reject::hogaddr_spend:          return "hogaddr_spend";
+            case Reject::non_bip68_final:        return "non_bip68_final";
             case Reject::count:                  break;
         }
         return "unknown";
@@ -205,24 +429,42 @@ public:
         std::atomic<uint64_t> admitted{0};
         std::atomic<uint64_t> mweb_txs_seen{0};         // deliveries of txs with an MWEB part
         std::atomic<uint64_t> mweb_fee_skipped_sat{0};  // their kernel fees
+        // The same, once per MWEB tx: a refused tx is fetched again from
+        // every peer that announces it, so the delivery counts above repeat
+        // it. Keyed by its first kernel id over the last
+        // MWEB_SEEN_DISTINCT_KEPT distinct txs (DESIGN 9.3: class C per block).
+        std::atomic<uint64_t> mweb_txs_seen_distinct{0};
+        std::atomic<uint64_t> mweb_fee_skipped_distinct_sat{0};
         std::atomic<uint64_t> pegins_seen{0};           // peg-in kernels among them
         std::atomic<uint64_t> pegouts_seen{0};          // peg-out coins among them
         std::atomic<uint64_t> template_tx_dropped{0};   // admitted txs a template still refused
+        std::atomic<uint64_t> template_sigop_skipped{0}; // selections that left a tx out: its sigop cost would pass the block limit
+        std::atomic<int64_t>  template_sigop_cost{0};    // the last selection's block sigop cost (the seed's included)
+        std::atomic<uint64_t> template_bip68_skipped{0}; // selections that left a tx out: its relative lock-times are not satisfied in the template's block
         std::atomic<uint64_t> orphans_promoted{0};      // orphans admitted once their parent was
         std::atomic<uint64_t> orphans_dropped{0};       // orphans expired, evicted or too large
+        std::atomic<uint64_t> admitted_unpriced{0};     // admitted with a view but fee unknown (an input the partial view lacks)
     };
 
     /// Orphan set bounds (Dogecoin Core 1.14 net_processing.cpp / net_processing.h).
     static constexpr size_t   MAX_ORPHANS = 100;              // DEFAULT_MAX_ORPHAN_TRANSACTIONS
     static constexpr time_t   ORPHAN_EXPIRE_SECS = 20 * 60;   // ORPHAN_TX_EXPIRE_TIME
     static constexpr uint32_t MAX_ORPHAN_WEIGHT = 400'000;    // MAX_STANDARD_TX_WEIGHT
+    /// Kernel ids remembered for mweb_txs_seen_distinct.
+    static constexpr size_t   MWEB_SEEN_DISTINCT_KEPT = 4096;
 
     /// Admit `tx` (nullopt) or say why not, checking in this order: empty vin
     /// or vout unless MWEB-only (CheckTransaction), a HogEx, an MWEB part, a
     /// pegin output without one (litecoind PreChecks refuses each of these);
-    /// then the pool's own duplicate check; then, with a view, the inputs
-    /// (inputs_invalid; missing_inputs parks the tx as an orphan when the
-    /// view is built from genesis). Fees are computed as add_tx does. An
+    /// not final in the next block (CheckFinalTx, once set_lock_time_cutoff
+    /// named it); then the pool's own duplicate check; then, with a view, the
+    /// inputs: a HogAddr input (hogaddr_spend: a HogEx output 0, which the
+    /// next block's HogEx spends as its vin[0]), then inputs_invalid;
+    /// missing_inputs parks the tx as an orphan when the view is built from
+    /// genesis; with every input known, a tx whose relative lock-times the
+    /// next block does not satisfy is refused before inputs_invalid
+    /// (non_bip68_final, litecoind PreChecks: CheckSequenceLocks before
+    /// CheckTxInputs). Fees are computed as add_tx does. An
     /// admitted tx admits the orphans waiting for it.
     std::optional<Reject> admit(const MutableTransaction& tx, core::coin::UTXOViewCache* utxo) {
         auto r = admit_one(tx, utxo, /*count=*/true);
@@ -266,6 +508,11 @@ private:
             r.n_pegins = mw->n_pegins();
             m_stats.mweb_fee_skipped_sat.fetch_add(static_cast<uint64_t>(r.mweb_fee),
                                                    std::memory_order_relaxed);
+            if (note_mweb_kernel_seen(r.kernel_id)) {
+                m_stats.mweb_txs_seen_distinct.fetch_add(1, std::memory_order_relaxed);
+                m_stats.mweb_fee_skipped_distinct_sat.fetch_add(static_cast<uint64_t>(r.mweb_fee),
+                                                                std::memory_order_relaxed);
+            }
             m_stats.pegins_seen.fetch_add(r.n_pegins, std::memory_order_relaxed);
             m_stats.pegouts_seen.fetch_add(mw->n_pegouts(), std::memory_order_relaxed);
             if (mw->has_pegin() || pegin_output)
@@ -277,12 +524,32 @@ private:
         if (pegin_output)
             return refuse(Reject::pegin_output_no_kernel);
 
+        // litecoind PreChecks: CheckFinalTx(tx, STANDARD_LOCKTIME_VERIFY_FLAGS)
+        // -- IsFinalTx at the tip's height + 1 and the tip's median time past.
+        const LockTimeCutoff cut = lock_time_cutoff();
+        if (cut.height != 0 && !is_final_tx(tx, cut.height, cut.mtp))
+            return refuse(Reject::non_final);
+
         if (utxo) {
             std::lock_guard<std::mutex> lock(m_mutex);
             if (m_pool.count(r.txid))
                 return refuse(Reject::duplicate);
+            if (spends_hogaddr(tx, utxo)) {
+                erase_orphan_locked(r.txid);
+                return refuse(Reject::hogaddr_spend);
+            }
             std::vector<uint256> missing;
-            switch (check_inputs_locked(tx, utxo, missing)) {
+            const Inputs inputs = check_inputs_locked(tx, utxo, missing);
+            // litecoind PreChecks: CheckSequenceLocks(STANDARD_LOCKTIME_VERIFY_FLAGS)
+            // once every input is found, before CheckTxInputs: the next block
+            // (the tip's height + 1, the tip's median time past), an in-pool
+            // parent's coin at that height.
+            if (inputs != Inputs::Missing && m_bip68 && cut.height != 0
+                && sequence_locks_ok_locked(tx, utxo, cut) == std::optional<bool>(false)) {
+                erase_orphan_locked(r.txid);
+                return refuse(Reject::non_bip68_final);
+            }
+            switch (inputs) {
             case Inputs::Ok:
                 break;
             case Inputs::Invalid:
@@ -299,13 +566,31 @@ private:
             }
         }
 
+        const uint64_t priced_before = m_priced_seq.load(std::memory_order_relaxed);
         if (!add_tx_unchecked(tx, utxo))
             return refuse(Reject::duplicate);
-        if (count)
+        if (count) {
             m_stats.admitted.fetch_add(1, std::memory_order_relaxed);
+            if (utxo && m_priced_seq.load(std::memory_order_relaxed) == priced_before)
+                m_stats.admitted_unpriced.fetch_add(1, std::memory_order_relaxed);
+        }
         if (utxo)
             reprice_children(r.txid, utxo);
         return std::nullopt;
+    }
+
+    /// True the first time `kernel_id` is seen among the last
+    /// MWEB_SEEN_DISTINCT_KEPT distinct ones (the oldest is forgotten).
+    bool note_mweb_kernel_seen(const uint256& kernel_id) {
+        std::lock_guard<std::mutex> lock(m_mweb_seen_mutex);
+        if (!m_mweb_seen.insert(kernel_id).second)
+            return false;
+        m_mweb_seen_order.push_back(kernel_id);
+        if (m_mweb_seen_order.size() > MWEB_SEEN_DISTINCT_KEPT) {
+            m_mweb_seen.erase(m_mweb_seen_order.front());
+            m_mweb_seen_order.pop_front();
+        }
+        return true;
     }
 
     /// The pool's unpriced children of `parent` (admitted before it) are
@@ -329,6 +614,7 @@ private:
                     continue;
                 if (compute_fee_locked(cit->second, utxo)) {
                     m_feerate_index.emplace(cit->second.feerate(), cit->first);
+                    m_priced_seq.fetch_add(1, std::memory_order_relaxed);
                     work.push_back(cit->first);
                 }
             }
@@ -377,8 +663,12 @@ public:
     }
 
     /// {"admitted", "rejected": {code: n}, "mweb_txs_seen", "mweb_fee_skipped_sat",
-    ///  "pegins_seen", "pegouts_seen", "template_tx_dropped", "orphans",
-    ///  "orphans_promoted", "orphans_dropped"}
+    ///  "mweb_txs_seen_distinct", "mweb_fee_skipped_distinct_sat",
+    ///  "pegins_seen", "pegouts_seen", "template_tx_dropped",
+    ///  "template_sigop_skipped", "template_sigop_cost", "template_bip68_skipped",
+    ///  "sigop_limit", "orphans",
+    ///  "orphans_promoted", "orphans_dropped", "admitted_unpriced",
+    ///  "still_unknown"}
     nlohmann::json reject_stats_json() const {
         nlohmann::json rejected = nlohmann::json::object();
         for (int c = 0; c < Reject::count; ++c)
@@ -389,13 +679,32 @@ public:
             {"rejected", std::move(rejected)},
             {"mweb_txs_seen", m_stats.mweb_txs_seen.load(std::memory_order_relaxed)},
             {"mweb_fee_skipped_sat", m_stats.mweb_fee_skipped_sat.load(std::memory_order_relaxed)},
+            {"mweb_txs_seen_distinct", m_stats.mweb_txs_seen_distinct.load(std::memory_order_relaxed)},
+            {"mweb_fee_skipped_distinct_sat", m_stats.mweb_fee_skipped_distinct_sat.load(std::memory_order_relaxed)},
             {"pegins_seen", m_stats.pegins_seen.load(std::memory_order_relaxed)},
             {"pegouts_seen", m_stats.pegouts_seen.load(std::memory_order_relaxed)},
             {"template_tx_dropped", m_stats.template_tx_dropped.load(std::memory_order_relaxed)},
+            {"template_sigop_skipped", m_stats.template_sigop_skipped.load(std::memory_order_relaxed)},
+            {"template_sigop_cost", m_stats.template_sigop_cost.load(std::memory_order_relaxed)},
+            {"template_bip68_skipped", m_stats.template_bip68_skipped.load(std::memory_order_relaxed)},
+            {"sigop_limit", m_sigop_rules.max_block_cost},
             {"orphans", orphan_count()},
             {"orphans_promoted", m_stats.orphans_promoted.load(std::memory_order_relaxed)},
             {"orphans_dropped", m_stats.orphans_dropped.load(std::memory_order_relaxed)},
+            {"admitted_unpriced", m_stats.admitted_unpriced.load(std::memory_order_relaxed)},
+            {"still_unknown", unpriced_count()},
         };
+    }
+
+    /// Pool entries whose fee is unknown (never selected): with a partial
+    /// view, the txs spending a coin older than the view.
+    size_t unpriced_count() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        size_t n = 0;
+        for (const auto& [txid, entry] : m_pool)
+            if (!entry.fee_known)
+                ++n;
+        return n;
     }
 
     // ─── Mutation ────────────────────────────────────────────────────────
@@ -457,6 +766,7 @@ public:
         // Add to feerate index if fee is known
         if (stored.fee_known) {
             m_feerate_index.emplace(stored.feerate(), txid);
+            m_priced_seq.fetch_add(1, std::memory_order_relaxed);
         }
 
         // Periodic mempool stats (every 100 txs)
@@ -485,6 +795,7 @@ public:
         it->second.fee = fee;
         it->second.fee_known = true;
         m_feerate_index.emplace(it->second.feerate(), txid);
+        m_priced_seq.fetch_add(1, std::memory_order_relaxed);
     }
 
     /// Remove confirmed txs + double-spend conflicts from mempool.
@@ -634,6 +945,11 @@ public:
         return m_last_block_hash;
     }
 
+    /// How many cleaned blocks cleaned_for() remembers: late copies of older
+    /// blocks and stale siblings' bodies are cleaned after the tip's too, so
+    /// the tip's entry must outlive a burst of them (#2136).
+    static constexpr size_t CLEANED_BLOCKS_KEPT = 32;
+
     /// True when remove_for_block() ran for `block_hash` (one of the last
     /// CLEANED_BLOCKS_KEPT blocks it saw): the txs that block confirmed are
     /// gone. Late copies of an older block or a stale sibling's body also run
@@ -699,6 +1015,39 @@ public:
         bool     fee_known{false};
     };
 
+    /// What a template already holds before the selection runs: the
+    /// outpoints it spends (no selected tx spends one again: the HogEx's own
+    /// inputs) and the txids it carries (never selected again; a pool tx
+    /// that spends one of their outputs may follow them).
+    struct SelectionSeed {
+        std::set<std::pair<uint256, uint32_t>> consumed;
+        std::set<uint256> in_template;
+        // Sigop cost the block already has outside the selection (the
+        // coinbase, the HogEx, txs already in the template), under the
+        // pool's rules: the selection keeps the total within the limit.
+        int64_t sigop_cost{0};
+    };
+
+    /// A coin with the HogAddr script (OP_8 PUSH32, a HogEx output 0): the
+    /// next block's HogEx spends it as its vin[0], and no other tx of a
+    /// valid block can.
+    static bool is_hogaddr_coin(const core::coin::Coin& coin) {
+        return mweb_wire::is_hogaddr(coin.scriptPubKey);
+    }
+
+    /// True when an input of `tx` is a HogAddr coin in `utxo`.
+    static bool spends_hogaddr(const MutableTransaction& tx, core::coin::UTXOViewCache* utxo) {
+        if (!utxo)
+            return false;
+        for (const auto& vin : tx.vin) {
+            core::coin::Coin coin;
+            if (utxo->get_coin(core::coin::Outpoint(vin.prevout.hash, vin.prevout.index), coin)
+                && is_hogaddr_coin(coin))
+                return true;
+        }
+        return false;
+    }
+
     /// Return transactions sorted by feerate (highest first), up to max_weight.
     /// Only priced (fee_known) transactions are selected: with a view built
     /// from genesis an unpriced tx is an orphan, a premature spend or a
@@ -725,8 +1074,23 @@ public:
     ///       both passes) refuses the second spender.
     /// Reward-neutral: total_fees sums only INCLUDED txs' known fees, so
     /// coinbasevalue tracks exactly the txs that ship.
+    /// With `final_at` (the template's height and its parent's median time
+    /// past) a tx not final in that block is not selected (litecoind
+    /// BlockAssembler::TestPackageTransactions, IsFinalTx): a no-op while
+    /// admission checks finality, but a reorg can lower the next height.
+    /// On a chain that enforces BIP68 it also leaves out a tx whose relative
+    /// lock-times that block does not satisfy (ConnectBlock's SequenceLocks;
+    /// litecoind's mempool keeps only txs that satisfy them at the next
+    /// block): a coin from the view at its height, one of a parent in the
+    /// template at the template's height, times from final_at's mtp_at.
+    /// With `seed` the selection starts from what the template already holds
+    /// (SelectionSeed: at least the HogEx's inputs); those txs are not in the
+    /// result, nor in total_fees. A HogAddr coin is never spent by a
+    /// selected tx.
     std::pair<std::vector<SelectedTx>, uint64_t>
-    get_sorted_txs_with_fees(uint32_t max_weight) const {
+    get_sorted_txs_with_fees(uint32_t max_weight,
+                             std::optional<LockTimeCutoff> final_at = std::nullopt,
+                             const SelectionSeed* seed = nullptr) const {
         std::lock_guard<std::mutex> lock(m_mutex);
 
         std::vector<SelectedTx> result;
@@ -736,10 +1100,43 @@ public:
         // Per-template consumed outpoints: one entry per input of every
         // selected tx, so no outpoint is spent twice.
         std::set<std::pair<uint256, uint32_t>> consumed;
+        // The block's sigop cost so far (what the template holds outside the
+        // selection) and its limit under the pool's rules.
+        int64_t sigop_used = 0;
+        if (seed) {
+            selected = seed->in_template;
+            consumed = seed->consumed;
+            sigop_used = std::max<int64_t>(seed->sigop_cost, 0);
+        }
+        const int64_t sigop_limit = m_sigop_rules.max_block_cost;
+        std::set<uint256> sigop_left_out;  // txs the sigop limit kept out of this selection
+
+        // The template's block for BIP68, its median times past looked up
+        // once per height.
+        std::map<uint32_t, std::optional<int64_t>> mtp_memo;
+        std::optional<LockTimeCutoff> bip68_block;
+        if (m_bip68 && final_at && final_at->height != 0) {
+            bip68_block = LockTimeCutoff{final_at->height, final_at->mtp, {}};
+            if (final_at->mtp_at)
+                bip68_block->mtp_at = [&mtp_memo, f = final_at->mtp_at](uint32_t h) -> std::optional<int64_t> {
+                    auto it = mtp_memo.find(h);
+                    if (it == mtp_memo.end())
+                        it = mtp_memo.emplace(h, f(h)).first;
+                    return it->second;
+                };
+        }
+        std::set<uint256> bip68_left_out;  // txs their relative lock-times kept out of this selection
 
         auto* utxo = m_utxo.load();
         if (!utxo)
             return {std::move(result), total_fees};  // no view, no selection
+
+        // The height of the block being built (Core GetSpendHeight): the
+        // template's own when given, else the pool's height + 1 (0: unknown,
+        // maturity unchecked). The pool's height follows the UTXO view and
+        // can be above the template's after a reorg onto a lower branch.
+        const uint32_t spend_height = (final_at && final_at->height != 0) ? final_at->height
+                                    : (m_tip_height > 0 ? m_tip_height + 1 : 0);
 
         // Belt under admit(): a tx no block can carry never joins a template,
         // however it reached the pool. Counted per template; expected 0.
@@ -764,6 +1161,9 @@ public:
         auto admissible = [&](const MempoolEntry& entry) -> bool {
             if (barred.count(entry.txid))
                 return false;
+            if (final_at && final_at->height != 0
+                && !is_final_tx(entry.tx, final_at->height, final_at->mtp))
+                return false;
             for (const auto& vin : entry.tx.vin) {
                 std::pair<uint256, uint32_t> op(vin.prevout.hash, vin.prevout.index);
                 if (consumed.count(op)) return false;  // intra-template double-spend
@@ -781,9 +1181,26 @@ public:
                     core::coin::Coin coin;
                     if (!utxo->get_coin(uop, coin))
                         return false;  // absent from UTXO and mempool — stale
-                    // Not spendable in the block being built (height tip + 1).
-                    if (m_tip_height > 0 && !coin.is_mature(m_tip_height + 1, m_limits))
+                    if (is_hogaddr_coin(coin))
+                        return false;  // only the HogEx spends a HogAddr
+                    // Not spendable in the block being built.
+                    if (spend_height != 0 && !coin.is_mature(spend_height, m_limits))
                         return false;
+                }
+            }
+            if (bip68_block && has_sequence_locks(entry.tx)) {
+                const auto l = calculate_sequence_locks(entry.tx, [&](size_t i) -> std::optional<uint32_t> {
+                    const auto& prevout = entry.tx.vin[i].prevout;
+                    if (m_pool.count(prevout.hash))
+                        return bip68_block->height;  // a parent in this template
+                    core::coin::Coin coin;
+                    if (utxo->get_coin(core::coin::Outpoint(prevout.hash, prevout.index), coin))
+                        return coin.height;
+                    return std::nullopt;
+                }, *bip68_block);
+                if (!l || !evaluate_sequence_locks(*bip68_block, *l)) {
+                    bip68_left_out.insert(entry.txid);
+                    return false;
                 }
             }
             return true;
@@ -805,7 +1222,18 @@ public:
                 if (!entry.fee_known) continue;
                 if (total_weight + entry.weight > max_weight) continue;
                 if (!admissible(entry)) continue;
+                // The block's sigop cost stays within the chain's limit
+                // (litecoind / dogecoind ConnectBlock: bad-blk-sigops); a tx
+                // whose cost is not known is left out.
+                const std::optional<int64_t> cost = entry.sigop_cost >= 0
+                    ? std::optional<int64_t>(entry.sigop_cost) : entry_sigop_cost_locked(entry, utxo);
+                if (!cost || sigop_used + *cost > sigop_limit) {
+                    sigop_left_out.insert(entry.txid);
+                    continue;
+                }
 
+                sigop_used += *cost;
+                sigop_left_out.erase(entry.txid);
                 total_weight += entry.weight;
                 total_fees += entry.fee;
                 result.push_back({entry.tx, entry.fee, true});
@@ -815,8 +1243,19 @@ public:
                 progress = true;
             }
         }
+        if (!sigop_left_out.empty())
+            m_stats.template_sigop_skipped.fetch_add(sigop_left_out.size(), std::memory_order_relaxed);
+        if (!bip68_left_out.empty())
+            m_stats.template_bip68_skipped.fetch_add(bip68_left_out.size(), std::memory_order_relaxed);
+        m_stats.template_sigop_cost.store(sigop_used, std::memory_order_relaxed);
 
         return {std::move(result), total_fees};
+    }
+
+    /// The selection without a finality cutoff, from `seed`.
+    std::pair<std::vector<SelectedTx>, uint64_t>
+    get_sorted_txs_with_fees(uint32_t max_weight, const SelectionSeed* seed) const {
+        return get_sorted_txs_with_fees(max_weight, std::nullopt, seed);
     }
 
     /// Re-attempt fee computation for all transactions with fee_known=false,
@@ -845,6 +1284,7 @@ public:
             if (entry.fee_known) continue;
             if (compute_fee_locked(entry, utxo)) {
                 m_feerate_index.emplace(entry.feerate(), txid);
+                m_priced_seq.fetch_add(1, std::memory_order_relaxed);
                 resolved_total_fee += entry.fee;
                 ++resolved;
                 continue;
@@ -1084,19 +1524,55 @@ private:
     /// What check_inputs_locked found.
     enum class Inputs { Ok, Missing, Invalid };
 
+    /// Whether `block` satisfies the relative lock-times of `tx`
+    /// (CheckSequenceLocks): an input's coin at its height in the view, an
+    /// in-pool parent's at block.height (litecoind: an in-mempool coin
+    /// confirms in the next block). nullopt when an input or a needed median
+    /// time past is unknown.
+    std::optional<bool> sequence_locks_ok_locked(const MutableTransaction& tx, core::coin::UTXOViewCache* utxo,
+                                                 const LockTimeCutoff& block) const {
+        if (!has_sequence_locks(tx))
+            return true;
+        const auto l = calculate_sequence_locks(tx, [&](size_t i) -> std::optional<uint32_t> {
+            const auto& prevout = tx.vin[i].prevout;
+            auto parent = m_pool.find(prevout.hash);
+            if (parent != m_pool.end() && prevout.index < parent->second.tx.vout.size())
+                return block.height;
+            core::coin::Coin coin;
+            if (utxo && utxo->get_coin(core::coin::Outpoint(prevout.hash, prevout.index), coin))
+                return coin.height;
+            return std::nullopt;
+        }, block);
+        if (!l)
+            return std::nullopt;
+        return evaluate_sequence_locks(block, *l);
+    }
+
+    /// The next block's height, at which admission judges coinbase / pegout
+    /// maturity (Core GetSpendHeight = tip + 1): the header tip's next block
+    /// once set_lock_time_cutoff named it, else the pool's height + 1 (0:
+    /// unknown). Not the UTXO view's height + 1: during a fill the view lags
+    /// the tip, and a spend maturing in between would be refused for good.
+    uint32_t spend_height_locked() const {
+        if (m_lock_time_cutoff.height != 0)
+            return m_lock_time_cutoff.height;
+        return m_tip_height > 0 ? m_tip_height + 1 : 0;
+    }
+
     /// Core HaveInputs + CheckTxInputs against the view and the pool: every
     /// input in the view or an in-pool parent (else Missing, with the missing
-    /// parents' txids); a view coin mature at the next block's height (Core
-    /// GetSpendHeight = tip + 1) and in money range; inputs cover outputs.
+    /// parents' txids); a view coin mature at the next block's height
+    /// (spend_height_locked) and in money range; inputs cover outputs.
     Inputs check_inputs_locked(const MutableTransaction& tx, core::coin::UTXOViewCache* utxo,
                                std::vector<uint256>& missing) const {
+        const uint32_t spend_height = spend_height_locked();
         int64_t value_in = 0;
         for (const auto& vin : tx.vin) {
             core::coin::Outpoint op(vin.prevout.hash, vin.prevout.index);
             core::coin::Coin coin;
             int64_t v = 0;
             if (utxo->get_coin(op, coin)) {
-                if (m_tip_height > 0 && !coin.is_mature(m_tip_height + 1, m_limits))
+                if (spend_height != 0 && !coin.is_mature(spend_height, m_limits))
                     return Inputs::Invalid;  // bad-txns-premature-spend-of-coinbase
                 v = coin.value;
             } else {
@@ -1354,7 +1830,34 @@ private:
 
         entry.fee = static_cast<uint64_t>(fee);
         entry.fee_known = true;
+        // Every prevout is known now: the sigop cost under the pool's rules.
+        entry.sigop_cost = entry_sigop_cost_locked(entry, utxo).value_or(-1);
         return true;
+    }
+
+    /// The sigop cost of `entry` under the pool's rules, its prevout scripts
+    /// from the view or from in-pool parents (nullopt: one is in neither).
+    std::optional<int64_t> entry_sigop_cost_locked(const MempoolEntry& entry,
+                                                   core::coin::UTXOViewCache* utxo) const {
+        std::vector<std::vector<unsigned char>> spks(entry.tx.vin.size());
+        std::vector<bool> found(entry.tx.vin.size(), false);
+        for (size_t i = 0; i < entry.tx.vin.size(); ++i) {
+            const auto& vin = entry.tx.vin[i];
+            core::coin::Coin coin;
+            if (utxo && utxo->get_coin(core::coin::Outpoint(vin.prevout.hash, vin.prevout.index), coin)) {
+                spks[i] = coin.scriptPubKey.m_data;
+                found[i] = true;
+                continue;
+            }
+            auto parent = m_pool.find(vin.prevout.hash);
+            if (parent != m_pool.end() && vin.prevout.index < parent->second.tx.vout.size()) {
+                spks[i] = parent->second.tx.vout[vin.prevout.index].scriptPubKey.m_data;
+                found[i] = true;
+            }
+        }
+        return tx_sigop_cost(entry.tx, m_sigop_rules, [&](size_t i) -> const std::vector<unsigned char>* {
+            return found[i] ? &spks[i] : nullptr;
+        });
     }
 
     void remove_tx_locked(const uint256& txid) {
@@ -1454,16 +1957,24 @@ private:
     size_t m_max_bytes;
     time_t m_expiry_sec;
     core::coin::ChainLimits m_limits;   // MoneyRange + maturity constants
+    core::coin::sigops::SigopRules m_sigop_rules;  // the block sigop limit and what counts towards it
+    bool m_bip68;                                  // BIP68 checked at admission and selection (bip68_for)
     std::atomic<uint32_t> m_tip_height{0};  // current chain tip (maturity); set from the io_context and the DOGE full set's thread
     std::atomic<core::coin::UTXOViewCache*> m_utxo{nullptr};  // for template-time input validation
+    LockTimeCutoff m_lock_time_cutoff;          // the next block, for admission's finality check (m_mutex)
+    std::atomic<uint64_t> m_priced_seq{0};      // see priced_changes()
 
     // Blocks remove_for_block() ran for (most recent last), for cleaned_for().
-    static constexpr size_t CLEANED_BLOCKS_KEPT = 16;
     std::deque<uint256> m_cleaned_blocks;
     uint256 m_last_block_hash;
     time_t  m_last_cleaned_time{0};
 
     mutable RejectStats m_stats;   // template_tx_dropped counts in const selection
+
+    // Kernel ids of the MWEB txs refused lately (note_mweb_kernel_seen).
+    std::mutex m_mweb_seen_mutex;
+    std::set<uint256> m_mweb_seen;
+    std::deque<uint256> m_mweb_seen_order;
 };
 
 } // namespace coin

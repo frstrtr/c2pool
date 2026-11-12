@@ -23,6 +23,7 @@
 
 #include <impl/dash/coin/block.hpp>
 #include <impl/dash/coin/transaction.hpp>
+#include <impl/dash/coin/dash_txid.hpp>   // dash_txid (stable txid of v2 asset unlocks)
 
 #include <core/coin/utxo.hpp>
 #include <core/coin/utxo_view_cache.hpp>
@@ -78,11 +79,8 @@ inline constexpr uint32_t DASH_MINING_GATE_DEPTH =
 //
 // UTXOViewCache::connect_block<BlockType> takes a TxidFn parameter —
 // this function matches that signature.
-inline ::uint256 dash_txid(const MutableTransaction& tx)
-{
-    auto packed = ::pack(tx);
-    return ::Hash(packed.get_span());
-}
+// Defined in dash_txid.hpp (with the Dash Core v24 stable-txid rule for
+// version-2 asset unlocks): dash_txid(const MutableTransaction&).
 
 // ── Alias so call sites read naturally ─────────────────────────────────────
 using UtxoViewCache = ::core::coin::UTXOViewCache;

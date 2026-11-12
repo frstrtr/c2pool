@@ -50,6 +50,11 @@ private:
     std::unique_ptr<leveldb::DB> m_db;
     std::string m_registered;   // the path this store holds in the process's registry
     bool m_lock_held{false};
+    /// The open DB's live snapshots, shared with each Snapshot's release:
+    /// close() releases them and detaches the DB, so a Snapshot dropped
+    /// after close() (or after the store is destroyed) touches no DB.
+    struct SnapshotRegistry;
+    std::shared_ptr<SnapshotRegistry> m_snapshots;
 
 public:
     class BatchWriter {
@@ -117,8 +122,9 @@ public:
 
     /// A read view of the whole store at one instant (a LevelDB snapshot): a
     /// scan through it sees no write committed after it was taken. Released
-    /// when the last copy is dropped, so the store must stay open until then.
-    /// Null when the store is closed.
+    /// when the last copy is dropped, or by close(), whichever comes first: a
+    /// copy may outlive the store, and a scan through a snapshot of an
+    /// earlier open fails. Null when the store is closed.
     using Snapshot = std::shared_ptr<const leveldb::Snapshot>;
     Snapshot snapshot();
 

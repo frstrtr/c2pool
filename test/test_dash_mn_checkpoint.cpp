@@ -612,12 +612,19 @@ TEST(DashMnCheckpoint, NetworkMismatchRefuses)
 
 TEST(DashMnCheckpoint, BadMagicRefuses)
 {
+    // /2 is the Dash Core v24 format now; an unknown future format still
+    // refuses by name.
     std::string p = mutate(kRealCheckpoint1519543,
                            "c2pool-dash-mn-checkpoint/1",
-                           "c2pool-dash-mn-checkpoint/2");
+                           "c2pool-dash-mn-checkpoint/3");
     auto cp = parse_mn_checkpoint(p, "testnet");
     EXPECT_FALSE(cp.ok);
     EXPECT_NE(cp.error.find("bad magic"), std::string::npos) << cp.error;
+    // A /1 file relabelled /2 has the wrong column count for /2 and refuses.
+    std::string p2 = mutate(kRealCheckpoint1519543,
+                            "c2pool-dash-mn-checkpoint/1",
+                            "c2pool-dash-mn-checkpoint/2");
+    EXPECT_FALSE(parse_mn_checkpoint(p2, "testnet").ok);
 }
 
 TEST(DashMnCheckpoint, UnknownKeyRefusesRatherThanIgnoring)
@@ -1305,6 +1312,10 @@ MutableTransaction pro_up_serv_tx(const char* protx)
     p.nVersion  = dash::coin::vendor::ProTxVersion::BASIC_BLS;
     p.nType     = dash::coin::vendor::MnType::REGULAR;
     p.proTxHash = uint256S(protx);
+    // A non-empty service (::ffff:1.2.3.4). In Dash Core [::]:9012 is EMPTY (the
+    // address is invalid, whatever the port): a ProRegTx with it registers
+    // banned and a ProUpServTx with it is an invalid tx.
+    p.netInfo.ip = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 1, 2, 3, 4};
     p.netInfo.port_be = 0x2334;
 
     MutableTransaction tx;
@@ -1342,6 +1353,10 @@ MutableTransaction pro_reg_tx(const std::vector<unsigned char>& payout,
     p.nType    = dash::coin::vendor::MnType::REGULAR;
     p.collateralOutpoint.hash  = uint256{};
     p.collateralOutpoint.index = nonce;
+    // A non-empty service (::ffff:1.2.3.4). In Dash Core [::]:9012 is EMPTY (the
+    // address is invalid, whatever the port): a ProRegTx with it registers
+    // banned and a ProUpServTx with it is an invalid tx.
+    p.netInfo.ip = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 1, 2, 3, 4};
     p.netInfo.port_be          = 0x2334;
     p.scriptPayout.m_data      = payout;
 
@@ -4744,6 +4759,10 @@ MutableTransaction pro_up_serv_tx_for(const uint256& protx)
     p.nVersion  = dash::coin::vendor::ProTxVersion::BASIC_BLS;
     p.nType     = dash::coin::vendor::MnType::REGULAR;
     p.proTxHash = protx;
+    // A non-empty service (::ffff:1.2.3.4). In Dash Core [::]:9012 is EMPTY (the
+    // address is invalid, whatever the port): a ProRegTx with it registers
+    // banned and a ProUpServTx with it is an invalid tx.
+    p.netInfo.ip = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 1, 2, 3, 4};
     p.netInfo.port_be = 0x2334;
 
     MutableTransaction tx;
@@ -5939,6 +5958,53 @@ TEST(DashMnBridgeCursor, AFormatV1RecordFromTheFalseSplitDetectorIsRefusedAndRep
     const auto after = cs.raw();
     ASSERT_GT(after.size(), 28u);
     EXPECT_EQ(after[24], static_cast<uint8_t>(MnBridgeCursorStore::kFormatVersion));
+}
+
+// ── 6c. A v2 record is REFUSED (P-3): it copies a projection store that mixed
+//     dashd's LEGACY bytes for v1 operator keys with basic bytes the
+//     projection wrote. Legacy and basic encodings overlap, so a resume
+//     would bring back the phantom operator changes (a same-point ProUpRegTx
+//     read as a key change: reset + ban) and the negated-key ambiguity. The
+//     bridge starts COLD from the compiled anchor, whose keys the checkpoint
+//     parser converts strictly.
+TEST(DashMnBridgeCursor, AFormatV2RecordWithMixedOperatorKeysIsRefusedAndReplayedCold)
+{
+    EXPECT_GE(MnBridgeCursorStore::kFormatVersion, 3u)
+        << "a v2 cursor carries mixed legacy/basic operator keys";
+    TempCursorStore cs("fmtv2");
+    { CursorRun a(&cs.store, 1519545); a.run(); ASSERT_TRUE(a.h.published); }
+    auto b = cs.raw();
+    ASSERT_GT(b.size(), 28u);
+    b[24] = 2; b[25] = 0; b[26] = 0; b[27] = 0;   // byte for byte what a v2 build wrote
+    cs.write_raw(b);
+    std::string why;
+    EXPECT_FALSE(cs.store.load(why).has_value()) << "a v2 record must never be resumed into: " << why;
+    EXPECT_NE(why.find("format v2"), std::string::npos) << why;
+    CursorRun r(&cs.store, 1519546);
+    r.run();
+    EXPECT_FALSE(r.h.lane.cursor_restored());
+    EXPECT_NE(r.h.lane.restore_verdict().find("COLD"), std::string::npos) << r.h.lane.restore_verdict();
+    ASSERT_TRUE(r.h.published) << r.h.lane.status();
+    EXPECT_EQ(r.h.lane.replay_applied(), 3u) << "a refused v2 record must produce a FULL cold replay from the anchor";
+    const auto after = cs.raw();
+    ASSERT_GT(after.size(), 28u);
+    EXPECT_EQ(after[24], static_cast<uint8_t>(MnBridgeCursorStore::kFormatVersion));
+}
+
+// ── 6d. A v3 record is REFUSED (Dash Core v24): MNState rows with nVersion
+//     >= 3 now carry the v24 state block, which a v3 record never wrote.
+TEST(DashMnBridgeCursor, AFormatV3RecordFromBeforeTheV24StateIsRefused)
+{
+    EXPECT_GE(MnBridgeCursorStore::kFormatVersion, 4u);
+    TempCursorStore cs("fmtv3");
+    { CursorRun a(&cs.store, 1519545); a.run(); ASSERT_TRUE(a.h.published); }
+    auto b = cs.raw();
+    ASSERT_GT(b.size(), 28u);
+    b[24] = 3; b[25] = 0; b[26] = 0; b[27] = 0;
+    cs.write_raw(b);
+    std::string why;
+    EXPECT_FALSE(cs.store.load(why).has_value()) << why;
+    EXPECT_NE(why.find("format v3"), std::string::npos) << why;
 }
 
 // ── 7. A fail-closed bridge must not be resumable ──────────────────────────

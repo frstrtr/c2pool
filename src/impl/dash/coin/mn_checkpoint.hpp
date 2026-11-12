@@ -127,6 +127,7 @@
 
 #include <impl/dash/coin/mn_state_db.hpp>        // MNState
 #include <impl/dash/coin/vendor/providertx.hpp>  // MnType / ProTxVersion / BLS_PUBKEY_SIZE
+#include <impl/dash/coin/vendor/bls_verify.hpp>  // opkey_canonical_from_own_scheme (P-3)
 
 #include <core/log.hpp>
 #include <core/uint256.hpp>
@@ -149,6 +150,14 @@ namespace coin {
 /// BREAKING format change: an older binary must reject a newer file rather
 /// than misread it, which the exact-string compare below guarantees.
 inline constexpr const char* kMnCheckpointMagic = "c2pool-dash-mn-checkpoint/1";
+/// Format /2 (Dash Core v24): an 18th `mn` column carries a version-3
+/// state's payout list, share table, early-exit terms and ExtNetInfo as the
+/// hex of its MnStateV24Ext encoding (`-` for a v1/v2 row), and a version-3
+/// row's scriptPayout column is `-` (its payouts are in column 18). A set
+/// with no version-3 state is still written as /1, byte for byte; /1 files
+/// keep loading, and a /1 row claiming version 3 is rejected (it cannot hold
+/// the payout list).
+inline constexpr const char* kMnCheckpointMagicV2 = "c2pool-dash-mn-checkpoint/2";
 
 struct MnCheckpoint {
     bool        ok{false};
@@ -332,6 +341,7 @@ inline MnCheckpoint parse_mn_checkpoint(const std::string& payload,
         }
     }
 
+    int      format = 1;   // 1 or 2 (Dash Core v24 payout column)
     bool     have_magic = false, have_height = false, have_hash = false;
     bool     have_count = false, have_digest = false, have_network = false;
     uint64_t declared_count = 0;
@@ -355,10 +365,13 @@ inline MnCheckpoint parse_mn_checkpoint(const std::string& payload,
         if (line.empty() || line[0] == '#') continue;
 
         if (!have_magic) {
-            if (line != kMnCheckpointMagic)
+            if (line == kMnCheckpointMagicV2) {
+                format = 2;
+            } else if (line != kMnCheckpointMagic) {
                 return fail("bad magic on line " + std::to_string(lineno)
-                            + ": expected '" + kMnCheckpointMagic
-                            + "', got '" + line + "'");
+                            + ": expected '" + kMnCheckpointMagic + "' or '"
+                            + kMnCheckpointMagicV2 + "', got '" + line + "'");
+            }
             have_magic = true;
             continue;
         }
@@ -419,10 +432,11 @@ inline MnCheckpoint parse_mn_checkpoint(const std::string& payload,
                 std::string tok;
                 while (fs >> tok) f.push_back(tok);
             }
-            if (f.size() != 17)
+            const size_t want_fields = format == 2 ? 18 : 17;
+            if (f.size() != want_fields)
                 return fail("mn record on line " + std::to_string(lineno)
                             + " has " + std::to_string(f.size())
-                            + " fields, want 17");
+                            + " fields, want " + std::to_string(want_fields));
 
             MNState mn;
             if (!ckpt_detail::is_hex_n(f[0], 64))
@@ -471,9 +485,34 @@ inline MnCheckpoint parse_mn_checkpoint(const std::string& payload,
             // payout script still occupies a slot in the DIP-3 queue, so a
             // blank one would make our projection disagree with dashd's at
             // the moment it is scheduled — a served bad-cb-payee.
-            if (f[12] == "-" || f[12].empty()
+            const bool v3_row = v24::state_has_ext(mn.nVersion);
+            if (v3_row) {
+                // Dash Core v24: the payouts live in column 18.
+                std::vector<unsigned char> blob;
+                if (format != 2)
+                    return fail("mn line " + std::to_string(lineno)
+                                + ": a version-3 state needs format /2 (its payout list)");
+                if (f[12] != "-" || f[17] == "-" || !ckpt_detail::hex_to_bytes(f[17], blob))
+                    return fail("mn line " + std::to_string(lineno)
+                                + ": version-3 row needs scriptPayout '-' and a v24 column");
+                try {
+                    ::PackStream ps(blob);
+                    ps >> mn.v24;
+                    if (!ps.empty()) throw std::ios_base::failure("trailing bytes");
+                } catch (const std::exception& ex) {
+                    return fail("mn line " + std::to_string(lineno) + ": bad v24 column: " + ex.what());
+                }
+                if (mn.v24.payouts.empty() && mn.v24.shares.empty())
+                    return fail("mn line " + std::to_string(lineno)
+                                + ": version-3 row with neither payouts nor shares"
+                                  " (fail-closed: a payee-less MN would project a wrong payee)");
+            } else if (format == 2 && f[17] != "-") {
+                return fail("mn line " + std::to_string(lineno)
+                            + ": v24 column on a version-" + std::to_string(mn.nVersion) + " row");
+            }
+            if (!v3_row && (f[12] == "-" || f[12].empty()
                 || !ckpt_detail::hex_to_bytes(f[12], mn.scriptPayout.m_data)
-                || mn.scriptPayout.m_data.empty())
+                || mn.scriptPayout.m_data.empty()))
                 return fail("mn line " + std::to_string(lineno)
                             + ": missing/undecodable scriptPayout '" + f[12]
                             + "' (fail-closed: a payee-less MN would project"
@@ -502,6 +541,33 @@ inline MnCheckpoint parse_mn_checkpoint(const std::string& payload,
                                 + ": bad pubKeyOperator '" + f[16] + "'");
                 for (size_t i = 0; i < vendor::BLS_PUBKEY_SIZE; ++i)
                     mn.pubKeyOperator[i] = pk[i];
+                // The key encoding follows the PRODUCER, which the digest-
+                // committed `source` line names (P-3; the store holds
+                // canonical BASIC):
+                //  * c2pool's own dumpers ("self-derived ...", e.g. the
+                //    compiled mainnet anchor) write the replay / projection
+                //    store's canonical BASIC bytes -- kept, after checking
+                //    they are exactly that;
+                //  * anything else is dashd-derived (gen_mn_checkpoint.py:
+                //    "dashd ... RPC", "offline capture", fixtures) and holds
+                //    the key as dashd prints it, LEGACY for v1 -- converted.
+                // Strict either way: no fallback, a key in the wrong form
+                // refuses the checkpoint (the two forms overlap, so guessing
+                // per row could turn a key into its negation).
+                if (cp.source.rfind("self-derived", 0) == 0) {
+                    if (!vendor::opkey_is_canonical_basic_or_null(mn.pubKeyOperator))
+                        return fail("mn line " + std::to_string(lineno)
+                                    + ": pubKeyOperator is not canonical basic bytes in a"
+                                      " self-derived checkpoint");
+                } else {
+                    const auto canon = vendor::opkey_canonical_from_own_scheme(
+                        mn.pubKeyOperator, mn.nVersion);
+                    if (!canon)
+                        return fail("mn line " + std::to_string(lineno)
+                                    + ": pubKeyOperator is not a canonical legacy BLS key"
+                                      " for a v1 entry of a dashd-derived checkpoint");
+                    mn.pubKeyOperator = *canon;
+                }
             }
 
             // DERIVED, never stored — same projection mn_seed.hpp makes.

@@ -33,6 +33,12 @@
 #include <gtest/gtest.h>
 
 #include <impl/dash/coin/mn_state_machine.hpp>
+#include <impl/dash/coin/mn_seed.hpp>
+#include <impl/dash/coin/mn_checkpoint.hpp>
+#include <nlohmann/json.hpp>
+#ifdef C2POOL_DASH_BLS
+#include <dashbls/bls.hpp>
+#endif
 #include <impl/dash/coin/mn_state_db.hpp>
 #include <impl/dash/coin/vendor/providertx.hpp>
 #include <impl/dash/coin/vendor/simplifiedmns.hpp>
@@ -713,6 +719,641 @@ TEST(DashMnState, NegativeVersionBeforeDip3IsOutsideTheRule) {
     auto r = m.apply_block(b, 2400051);
     EXPECT_TRUE(r.refused.empty()) << r.refused;
     EXPECT_EQ(m.last_applied_height(), 2400051u);
+}
+
+// ── Dash Core v24 fail-closed rule (the B4 hotfix of the v24 design) ──
+// A provider tx the payee state model cannot fold exactly refuses the WHOLE
+// block, before any mutation, instead of being logged and skipped (which let
+// the payee set drift from dashd's): a v3 (ExtAddr) payload, a payload that
+// does not parse or has an unknown version, a ProTx naming a v3 state, and a
+// v24 type 10-12. A valid v2 update of the same masternode still folds.
+TEST(DashMnState, V24UnfoldableProviderTxRefusesTheBlockNeverSkips) {
+    namespace vv = dash::coin::vendor;
+    uint256 h;
+    MnStateMachine m = v2319_one_regular_mn(h, 2400060);
+    const MNState before = m.entries().at(h);
+    auto apply_with = [&](MnStateMachine& sm, MutableTransaction tx, uint32_t at) {
+        BlockType b;
+        b.m_txs.push_back(coinbase_tx({script_bytes(0xD5)}));
+        b.m_txs.push_back(std::move(tx));
+        return sm.apply_block(b, at);
+    };
+    auto expect_refused = [&](MnStateMachine& sm, MutableTransaction tx, uint32_t at,
+                              const char* why) {
+        const uint32_t cursor = sm.last_applied_height();
+        auto r = apply_with(sm, std::move(tx), at);
+        EXPECT_NE(r.refused.find(why), std::string::npos) << r.refused;
+        EXPECT_EQ(r.registered + r.updated, 0u) << "nothing of the refused block is applied";
+        EXPECT_EQ(sm.last_applied_height(), cursor);
+    };
+
+    // (a) ProRegTx v3: a payout list this MNState cannot hold.
+    auto reg3 = make_proreg(ProTxVersion::EXT_ADDR, MnType::REGULAR);
+    reg3.collateralOutpoint.hash = raw256(0x11);
+    vv::MasternodePayoutShare po;
+    po.scriptPayout.m_data = script_bytes(0x76, 25);
+    reg3.payouts = {po};
+    expect_refused(m, special_tx(CProRegTx::SPECIALTX_TYPE, protx_payload(reg3)), 2400061,
+                   "unfoldable: ProRegTx nVersion=3");
+    // (b) An unparseable ProUpRegTx (truncated payload): refused, not skipped.
+    CProUpRegTx upreg;
+    upreg.nVersion = ProTxVersion::BASIC_BLS;
+    upreg.proTxHash = h;
+    auto bad = protx_payload(upreg);
+    bad.pop_back();
+    expect_refused(m, special_tx(CProUpRegTx::SPECIALTX_TYPE, bad), 2400061,
+                   "unfoldable: ProUpRegTx payload does not parse");
+    // (c) A ProUpRevTx with a version no codec knows (4).
+    CProUpRevTx rev;
+    rev.nVersion = 4;
+    rev.proTxHash = h;
+    expect_refused(m, special_tx(CProUpRevTx::SPECIALTX_TYPE, protx_payload(rev)), 2400061,
+                   "unfoldable: ProUpRevTx payload does not parse");
+    // (d) A v24 type 10 ProDisTx: bad-txns-type at DIP3 heights (v23.1.9
+    //     whitelist), and still refused below DIP3.
+    vv::CProDisTx dis;
+    dis.proTxHash = h;
+    dis.vchSigs.resize(1);
+    expect_refused(m, special_tx(10, protx_payload(dis)), 2400061, "bad-txns-type");
+    {
+        MnStateMachine pre;
+        pre.set_dip0003_height(3'000'000);
+        expect_refused(pre, special_tx(10, protx_payload(dis)), 2400061,
+                       "unfoldable: v24 provider tx type 10");
+    }
+    EXPECT_EQ(m.entries().at(h), before);
+    // (e) A v2 ProUpServTx for a masternode whose state is v3.
+    {
+        MNState st3 = before;
+        st3.nVersion = ProTxVersion::EXT_ADDR;
+        MnStateMachine m3;
+        m3.load({{h, st3}}, 2400060);
+        expect_refused(m3, special_tx(CProUpServTx::SPECIALTX_TYPE,
+                                      protx_payload(v2319_serv(h, MnType::REGULAR))),
+                       2400061, "whose state is nVersion=3");
+    }
+    // Control: the valid v2 update of the same masternode folds.
+    auto ok = apply_with(m, special_tx(CProUpServTx::SPECIALTX_TYPE,
+                                       protx_payload(v2319_serv(h, MnType::REGULAR))), 2400061);
+    EXPECT_TRUE(ok.refused.empty()) << ok.refused;
+    EXPECT_EQ(ok.updated, 1u);
+    EXPECT_EQ(m.last_applied_height(), 2400061u);
+}
+
+// The legacy services Dash Core reads as an EMPTY MnNetInfo although their
+// bytes are not all zero (CNetAddr::SetLegacyIPv6 + IsValid; confirmed with
+// dashd 24.0.0 decoderawtransaction: `addresses` is {} for each).
+static std::vector<std::pair<const char*, dash::coin::vendor::LegacyNetService>> core_empty_services()
+{
+    using L = dash::coin::vendor::LegacyNetService;
+    auto mk = [](std::array<uint8_t, 16> ip, uint16_t port) { L l; l.ip = ip; l.port_be = port; return l; };
+    std::array<uint8_t, 16> m4{};
+    m4[10] = 0xff; m4[11] = 0xff;
+    auto none = m4; none[12] = none[13] = none[14] = none[15] = 0xff;
+    std::array<uint8_t, 16> tor{0xfd, 0x87, 0xd8, 0x7e, 0xeb, 0x43, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+    std::array<uint8_t, 16> internal{0xfd, 0x6b, 0x88, 0xc0, 0x87, 0x24, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+    std::array<uint8_t, 16> doc{0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
+    return {{"::ffff:0.0.0.0:9999", mk(m4, 9999)},
+            {"::ffff:255.255.255.255:9999", mk(none, 9999)},
+            {"[::]:9999", mk({}, 9999)},
+            {"TORv2-in-IPv6", mk(tor, 9999)},
+            {"internal-in-IPv6", mk(internal, 9999)},
+            {"[2001:db8::1]:9999", mk(doc, 9999)}};
+}
+
+// P-1: Dash Core's empty-service rule in the payee projection. A registration
+// whose address is invalid (non-zero bytes included) starts BANNED with an
+// empty service, as in Core; a valid one is unchanged.
+TEST(DashMnState, InvalidNonZeroServiceRegistersBanned) {
+    for (const auto& [name, svc] : core_empty_services()) {
+        SCOPED_TRACE(name);
+        auto reg = make_proreg(ProTxVersion::BASIC_BLS, MnType::REGULAR);
+        reg.netInfo = svc;
+        auto regtx = special_tx(CProRegTx::SPECIALTX_TYPE, protx_payload(reg));
+        BlockType b;
+        b.m_txs.push_back(coinbase_tx({script_bytes(0xD7)}));
+        b.m_txs.push_back(regtx);
+        MnStateMachine m;
+        auto r = m.apply_block(b, 2400200);
+        ASSERT_EQ(r.registered, 1u);
+        const auto& e = m.entries().at(tx_hash(regtx));
+        EXPECT_FALSE(e.isValid);
+        EXPECT_EQ(e.nPoSeBanHeight, 2400200u);
+        EXPECT_EQ(e.netInfo, dash::coin::vendor::LegacyNetService{});
+    }
+    uint256 h;
+    MnStateMachine m = v2319_one_regular_mn(h, 2400210);
+    EXPECT_TRUE(m.entries().at(h).isValid) << "a valid address registers valid, unchanged";
+    EXPECT_EQ(m.entries().at(h).nPoSeBanHeight, 0u);
+}
+
+// The predicate itself, against the forms Core reads.
+TEST(DashMnState, LegacyServiceAddressValidityMatchesCore) {
+    using dash::coin::vendor::legacy_service_address_valid;
+    for (const auto& [name, svc] : core_empty_services())
+        EXPECT_FALSE(legacy_service_address_valid(svc.ip)) << name;
+    std::array<uint8_t, 16> v4{};
+    v4[10] = 0xff; v4[11] = 0xff; v4[12] = 1; v4[13] = 2; v4[14] = 3; v4[15] = 4;
+    EXPECT_TRUE(legacy_service_address_valid(v4));
+    std::array<uint8_t, 16> v6{0x2a, 0x01, 0x04, 0xf8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
+    EXPECT_TRUE(legacy_service_address_valid(v6));
+    dash::coin::vendor::LegacyNetService port0;
+    port0.ip = v4;
+    port0.port_be = 0;
+    EXPECT_FALSE(port0.IsEmpty()) << "the port plays no part in Core's emptiness";
+}
+
+// ── P-3: operator keys are canonical BASIC at every ingest ──────────────────
+// dashd prints a v1 key in the LEGACY scheme (protx list JSON, the checkpoint
+// rows). A projection that stored those bytes saw a ProUpRegTx carrying the
+// SAME point as an operator change (reset, ban, cleared operator payout --
+// Core changes nothing). A byte rule accepting both forms is no fix: legacy
+// and basic encodings overlap, so a rotation to the NEGATED key -P reads as
+// "unchanged" for half of all keys (Core: changed, reset, ban). The fix:
+// every ingest converts to canonical basic; the compare is on those bytes.
+// Keys: secret {8, 0, ..., 0} in both encodings, and secret 1.
+namespace p3 {
+using Key = std::array<uint8_t, 48>;
+using OptKey = std::optional<Key>;
+std::array<uint8_t, 48> kh48(const char* h)
+{
+    std::array<uint8_t, 48> a{};
+    for (size_t i = 0; i < 48; ++i) a[i] = static_cast<uint8_t>(std::stoul(std::string(h + 2 * i, 2), nullptr, 16));
+    return a;
+}
+const char* K8L = "16f73d53f6a4f1239713e45716f347dba9566937430c21b849f5e1fa028e5d0bad2bd7b65719356ece764dad57fdabe4";
+const char* K8B = "96f73d53f6a4f1239713e45716f347dba9566937430c21b849f5e1fa028e5d0bad2bd7b65719356ece764dad57fdabe4";
+const char* K1B = "a1fc56c400756e2f053ea015d7a61606f668a10f5ee0808f86df9443778021b802174b1d9cdb0cde3c3a4fe5803d02b5";
+
+MNState v1_mn(const std::array<uint8_t, 48>& stored_key)
+{
+    MNState st;
+    st.nVersion = ProTxVersion::LEGACY_BLS;
+    st.nType = MnType::REGULAR;
+    st.collateralOutpoint.hash = raw256(0x41);
+    st.collateralOutpoint.index = 1;
+    st.keyIDOwner = raw160(0x21);
+    st.keyIDVoting = raw160(0x51);
+    st.pubKeyOperator = stored_key;
+    st.nOperatorReward = 500;
+    st.scriptPayout.m_data = script_bytes(0x61);
+    st.scriptOperatorPayout.m_data = script_bytes(0x62);
+    st.payoutSplitProvenance = MNState::SPLIT_KNOWN;
+    st.netInfo.ip = seq_array<16>(0x11);
+    st.netInfo.ip[10] = 0xff; st.netInfo.ip[11] = 0xff;
+    st.netInfo.port_be = 9999;
+    st.nRegisteredHeight = 2000000;
+    st.isValid = true;
+    return st;
+}
+
+// The store a dashd `protx list` row seeds for a v1 masternode whose key
+// dashd prints as `printed` (the seed path, mn_seed.hpp).
+std::optional<std::array<uint8_t, 48>> seeded_key(const std::string& printed)
+{
+    const std::string row =
+        "[{\"type\":\"Regular\",\"proTxHash\":\"" + std::string(64, 'a') + "\","
+        "\"collateralHash\":\"" + std::string(64, 'b') + "\",\"collateralIndex\":1,"
+        "\"operatorReward\":0,\"state\":{\"version\":1,\"service\":\"1.2.3.4:9999\","
+        "\"registeredHeight\":100,\"lastPaidHeight\":0,\"consecutivePayments\":0,\"PoSePenalty\":0,"
+        "\"PoSeRevivedHeight\":-1,\"PoSeBanHeight\":-1,\"revocationReason\":0,"
+        "\"ownerAddress\":\"yQxgY6sdiHRWmi8STNftizktwqy4zhndfS\","
+        "\"votingAddress\":\"yQxgY6sdiHRWmi8STNftizktwqy4zhndfS\","
+        "\"payoutAddress\":\"yVXDAM73Tg6A44Bm3qduXsMCYxzuqBCT48\","
+        "\"pubKeyOperator\":\"" + printed + "\"}}]";
+    const auto seed = dash::coin::parse_protx_list_seed(nlohmann::json::parse(row), 140, 19);
+    if (seed.size() != 1) return std::nullopt;
+    return seed[0].second.pubKeyOperator;
+}
+
+// Applies a ProUpRegTx (payload version, key) to a one-MN set whose store
+// holds `stored` (canonical basic, as every ingest now writes it).
+MNState apply_upreg(const std::array<uint8_t, 48>& stored, uint16_t payload_version,
+                    const std::array<uint8_t, 48>& payload_key)
+{
+    MnStateMachine m;
+    const uint256 pro = raw256(0x31);
+    m.load({{pro, v1_mn(stored)}}, 2400110);
+    CProUpRegTx ur;
+    ur.nVersion = payload_version;
+    ur.proTxHash = pro;
+    ur.pubKeyOperator = payload_key;
+    ur.keyIDVoting = raw160(0x51);
+    ur.scriptPayout.m_data = script_bytes(0x63);
+    BlockType b;
+    b.m_txs.push_back(coinbase_tx({script_bytes(0xC9)}));
+    b.m_txs.push_back(special_tx(CProUpRegTx::SPECIALTX_TYPE, protx_payload(ur)));
+    m.apply_block(b, 2400111);
+    return m.entries().at(pro);
+}
+
+void expect_unchanged(const MNState& e)
+{
+    EXPECT_EQ(e.nPoSeBanHeight, 0u) << "Core: same point, not an operator change -> no ban";
+    EXPECT_TRUE(e.isValid);
+    EXPECT_EQ(e.scriptOperatorPayout.m_data, script_bytes(0x62)) << "Core keeps the operator payout";
+    EXPECT_EQ(e.netInfo, v1_mn(kh48(K8B)).netInfo) << "Core keeps the service";
+    EXPECT_EQ(e.scriptPayout.m_data, script_bytes(0x63));
+}
+
+void expect_changed(const MNState& e)
+{
+    EXPECT_EQ(e.nPoSeBanHeight, 2400111u);
+    EXPECT_FALSE(e.isValid);
+    EXPECT_TRUE(e.scriptOperatorPayout.m_data.empty());
+    EXPECT_EQ(e.netInfo, dash::coin::vendor::LegacyNetService{});
+}
+} // namespace p3
+
+// Same point in a v2 payload (basic bytes) against the canonical store.
+TEST(DashMnState, SameOperatorPointV2PayloadIsNoOperatorChange) {
+    p3::expect_unchanged(p3::apply_upreg(p3::kh48(p3::K8B), ProTxVersion::BASIC_BLS, p3::kh48(p3::K8B)));
+}
+
+// Control: a different point IS an operator change: reset and ban.
+TEST(DashMnState, DifferentOperatorKeyStillResetsAndBans) {
+    p3::expect_changed(p3::apply_upreg(p3::kh48(p3::K8B), ProTxVersion::BASIC_BLS, p3::kh48(p3::K1B)));
+}
+
+#ifdef C2POOL_DASH_BLS
+// The seed path stores a v1 row's LEGACY key as canonical BASIC bytes, keeps
+// a null key null, and refuses (aborts the seed on) a v1 key that is not a
+// canonical legacy encoding -- no fallback.
+TEST(DashMnState, SeedStoresAV1OperatorKeyAsCanonicalBasic) {
+    EXPECT_EQ(p3::seeded_key(p3::K8L), p3::OptKey{p3::kh48(p3::K8B)});
+    EXPECT_EQ(p3::seeded_key(std::string(96, '0')), p3::OptKey{p3::Key{}});
+    EXPECT_EQ(p3::seeded_key(std::string(96, 'f')), std::nullopt) << "not a point: seed aborted";
+}
+
+// The ingest helpers the seed and the checkpoint parser share: a v1 key in
+// dashd's (legacy) form -> the canonical basic store, null stays null, v2+
+// keys pass through, a v1 key that is not canonical legacy is refused; and
+// the canonical-basic check self-derived checkpoints and the cursor use.
+TEST(DashMnState, OperatorKeyIngestCanonicalization) {
+    namespace vv = dash::coin::vendor;
+    const auto L = p3::kh48(p3::K8L), B = p3::kh48(p3::K8B);
+    EXPECT_EQ(vv::opkey_canonical_from_own_scheme(L, 1), p3::OptKey{B});
+    EXPECT_EQ(vv::opkey_canonical_from_own_scheme(B, 2), p3::OptKey{B});
+    EXPECT_EQ(vv::opkey_canonical_from_own_scheme(p3::Key{}, 1),
+              p3::OptKey{p3::Key{}});
+    std::array<uint8_t, 48> junk;
+    junk.fill(0xff);
+    EXPECT_EQ(vv::opkey_canonical_from_own_scheme(junk, 1), std::nullopt);
+    EXPECT_TRUE(vv::opkey_is_canonical_basic_or_null(B));
+    EXPECT_TRUE(vv::opkey_is_canonical_basic_or_null(p3::Key{}));
+    EXPECT_FALSE(vv::opkey_is_canonical_basic_or_null(junk));
+}
+
+// Checkpoints: the key encoding follows the producer named by the `source`
+// line. The compiled mainnet anchor is self-derived (c2pool's dumper): its
+// keys are canonical basic and are kept. The testnet fixture is dashd-
+// derived (gen_mn_checkpoint.py): its v1 keys are legacy and are converted.
+// Either way the store ends up canonical basic.
+TEST(DashMnState, CheckpointKeysEndCanonicalBasicWhateverTheProducer) {
+    namespace vv = dash::coin::vendor;
+    static const char* const kMainnet =
+#include <impl/dash/coin/checkpoints/dash_mn_checkpoint_mainnet.inc>
+    ;
+    static const char* const kTestnetFixture =
+#include "dash_mn_checkpoint_testnet_1519543.inc"
+    ;
+    const auto m = dash::coin::parse_mn_checkpoint(kMainnet, "mainnet");
+    ASSERT_TRUE(m.ok) << m.error;
+    ASSERT_EQ(m.source.rfind("self-derived", 0), 0u);
+    size_t v1 = 0;
+    for (const auto& [h, st] : m.entries) {
+        EXPECT_TRUE(vv::opkey_is_canonical_basic_or_null(st.pubKeyOperator)) << h.GetHex();
+        v1 += st.nVersion == 1;
+    }
+    EXPECT_GT(v1, 1000u) << "the anchor carries v1 masternodes";
+    const auto t = dash::coin::parse_mn_checkpoint(kTestnetFixture, "testnet");
+    ASSERT_TRUE(t.ok) << t.error;
+    ASSERT_NE(t.source.rfind("self-derived", 0), 0u);
+    for (const auto& [h, st] : t.entries)
+        EXPECT_TRUE(vv::opkey_is_canonical_basic_or_null(st.pubKeyOperator)) << h.GetHex();
+}
+
+// End to end: a dashd-seeded v1 masternode and a ProUpRegTx carrying the
+// same point, in a v1 payload (legacy bytes) and in a v2 payload (basic):
+// no operator change (the live mainnet case, a3296ab3 / cf5649c6).
+TEST(DashMnState, SeededV1KeySamePointIsNoOperatorChange) {
+    const auto stored = p3::seeded_key(p3::K8L);
+    ASSERT_TRUE(stored.has_value());
+    p3::expect_unchanged(p3::apply_upreg(*stored, ProTxVersion::LEGACY_BLS, p3::kh48(p3::K8L)));
+    p3::expect_unchanged(p3::apply_upreg(*stored, ProTxVersion::BASIC_BLS, p3::kh48(p3::K8B)));
+}
+
+// VERIFY-P3: a deliberate rotation to the NEGATED key -P is an operator
+// change (Core: reset + ban) for every key, whichever way the key entered
+// the store (the dashd seed path, or written by the projection) and in
+// either payload version. Secrets {s, 0, ..., 0}, s = 1..64.
+TEST(DashMnState, NegatedKeyRotationIsAnOperatorChange) {
+    for (const bool via_seed : {true, false})
+        for (const uint16_t pv : {ProTxVersion::LEGACY_BLS, ProTxVersion::BASIC_BLS}) {
+            size_t wrong = 0;
+            for (int sk = 1; sk <= 64; ++sk) {
+                std::vector<uint8_t> skb(32, 0);
+                skb[0] = static_cast<uint8_t>(sk);
+                const auto priv = bls::PrivateKey::FromBytes(bls::Bytes(skb.data(), skb.size()));
+                const bls::G1Element P = priv.GetG1Element();
+                const bls::G1Element N = P.Negate();
+                auto arr = [](const std::vector<uint8_t>& v) {
+                    std::array<uint8_t, 48> a{};
+                    std::copy_n(v.begin(), 48, a.begin());
+                    return a;
+                };
+                std::array<uint8_t, 48> stored = arr(P.Serialize(/*legacy=*/false));
+                if (via_seed) {
+                    std::string hex;
+                    for (uint8_t c : P.Serialize(/*legacy=*/true)) {
+                        static const char* d = "0123456789abcdef";
+                        hex += d[c >> 4];
+                        hex += d[c & 15];
+                    }
+                    const auto s = p3::seeded_key(hex);
+                    ASSERT_TRUE(s.has_value()) << sk;
+                    stored = *s;
+                }
+                const auto e = p3::apply_upreg(stored, pv, arr(N.Serialize(pv == ProTxVersion::LEGACY_BLS)));
+                if (e.nPoSeBanHeight == 0) ++wrong;
+            }
+            EXPECT_EQ(wrong, 0u) << (via_seed ? "seeded" : "projection-written") << " store, payload v" << pv;
+        }
+}
+#endif
+
+// ── Dash Core v24 (slice S3): the payee projection's v24 transitions ──
+// Gated on set_v24_height; below it every path is the pre-v24 one (the
+// whole suite above runs with the default "never").
+namespace {
+namespace vv = dash::coin::vendor;
+MutableTransaction shared_reg_tx(MNState* want = nullptr)
+{
+    CProRegTx p;
+    p.nVersion = ProTxVersion::EXT_ADDR;
+    p.collateralOutpoint.index = 0;
+    p.extNetInfo.set(vv::NetInfoPurpose::CORE_P2P, {vv::NetInfoEntry{vv::NetService::ipv4(1, 2, 3, 9, 9999)}});
+    p.pubKeyOperator = seq_array<48>(0x41);
+    p.keyIDVoting = raw160(0x42);
+    vv::CCollateralShare a, b;
+    a.amount = 600 * vv::CCollateralShare::COIN;
+    a.scriptRefund.m_data = script_bytes(0xa1);
+    a.keyIDOwner = raw160(0xb1);
+    b.amount = 400 * vv::CCollateralShare::COIN;
+    b.scriptRefund.m_data = script_bytes(0xa2);
+    b.keyIDOwner = raw160(0xb2);
+    p.shares = {a, b};
+    p.vchJoinSigs.resize(2);
+    auto tx = special_tx(CProRegTx::SPECIALTX_TYPE, protx_payload(p));
+    TxOut coll;
+    coll.value = 1000 * vv::CCollateralShare::COIN;
+    coll.scriptPubKey.m_data = dash::coin::v24::shared_collateral_script();
+    tx.vout = {coll};
+    if (want) want->v24.shares = p.shares;
+    return tx;
+}
+BlockType block_of(std::vector<MutableTransaction> txs)
+{
+    BlockType b;
+    b.m_txs.push_back(coinbase_tx({script_bytes(0xD6)}));
+    for (auto& t : txs) b.m_txs.push_back(std::move(t));
+    return b;
+}
+} // namespace
+
+TEST(DashMnState, V24SharedMasternodeLifecycle) {
+    MnStateMachine m;
+    m.set_v24_height(2400100);
+    MNState want;
+    const auto reg = shared_reg_tx(&want);
+    const uint256 pro = tx_hash(reg);
+    auto r = m.apply_block(block_of({reg}), 2400100);
+    ASSERT_TRUE(r.refused.empty()) << r.refused;
+    ASSERT_EQ(r.registered, 1u);
+    const auto& e = m.entries().at(pro);
+    EXPECT_EQ(e.nVersion, ProTxVersion::EXT_ADDR);
+    EXPECT_EQ(e.v24.shares, want.v24.shares);
+    EXPECT_TRUE(e.keyIDOwner.IsNull());
+    EXPECT_EQ(e.collateralOutpoint.hash, pro);
+
+    vv::CProUpShareTx us;
+    us.proTxHash = pro;
+    us.shareIndex = 1;
+    us.scriptReward.m_data = script_bytes(0xc3);
+    r = m.apply_block(block_of({special_tx(11, protx_payload(us))}), 2400101);
+    ASSERT_TRUE(r.refused.empty()) << r.refused;
+    EXPECT_EQ(m.entries().at(pro).v24.shares[1].scriptReward.m_data, script_bytes(0xc3));
+
+    vv::CProUpSharedRegTx sr;
+    sr.proTxHash = pro;
+    sr.pubKeyOperator = seq_array<48>(0x51);
+    sr.keyIDVoting = raw160(0x52);
+    sr.vchSigs.resize(2);
+    r = m.apply_block(block_of({special_tx(12, protx_payload(sr))}), 2400102);
+    ASSERT_TRUE(r.refused.empty()) << r.refused;
+    EXPECT_EQ(m.entries().at(pro).nPoSeBanHeight, 2400102u) << "operator change bans";
+    EXPECT_FALSE(m.entries().at(pro).isValid);
+    EXPECT_EQ(m.entries().at(pro).nVersion, ProTxVersion::EXT_ADDR);
+
+    vv::CProDisTx dis;
+    dis.proTxHash = pro;
+    dis.vchSigs.resize(2);
+    auto dtx = special_tx(10, protx_payload(dis));
+    dtx.vin[0].prevout.hash = pro;
+    dtx.vin[0].prevout.index = 0;
+    r = m.apply_block(block_of({dtx}), 2400103);
+    ASSERT_TRUE(r.refused.empty()) << r.refused;
+    EXPECT_EQ(m.entries().count(pro), 0u) << "dissolved: the collateral spend removes it";
+}
+
+TEST(DashMnState, V24ServiceUpdateRaisesAndMigratesThePayout) {
+    uint256 h;
+    MnStateMachine m = v2319_one_regular_mn(h, 2400110);
+    m.set_v24_height(2400111);
+    const auto old_payout = m.entries().at(h).scriptPayout;
+    CProUpServTx up;
+    up.nVersion = ProTxVersion::EXT_ADDR;
+    up.proTxHash = h;
+    up.extNetInfo.set(vv::NetInfoPurpose::CORE_P2P, {vv::NetInfoEntry{vv::NetService::ipv4(5, 6, 7, 8, 9999)}});
+    const auto r = m.apply_block(block_of({special_tx(CProUpServTx::SPECIALTX_TYPE, protx_payload(up))}), 2400111);
+    ASSERT_TRUE(r.refused.empty()) << r.refused;
+    const auto& e = m.entries().at(h);
+    EXPECT_EQ(e.nVersion, ProTxVersion::EXT_ADDR);
+    ASSERT_EQ(e.v24.payouts.size(), 1u);
+    EXPECT_EQ(e.v24.payouts[0].scriptPayout, old_payout);
+    EXPECT_EQ(e.v24.payouts[0].reward, 10000);
+    EXPECT_TRUE(e.scriptPayout.m_data.empty());
+    EXPECT_EQ(e.v24.extNetInfo, up.extNetInfo);
+}
+
+// The payload rules (v24_rules.hpp) are template-selection only: the payee
+// projection folds a mined ProUpServTx whose signature the rules refuse
+// (BLS build: bad-protx-payload, Core cannot decode it; stub build:
+// unverifiable). See DashReplayFoldV24.MinedBlockFoldNeverRunsTheBlsPayloadRules.
+TEST(DashMnState, V24MinedBlockFoldNeverRunsTheBlsPayloadRules) {
+    uint256 h;
+    MnStateMachine m = v2319_one_regular_mn(h, 2400110);
+    m.set_v24_height(2400111);
+    CProUpServTx up;
+    up.nVersion = ProTxVersion::EXT_ADDR;
+    up.proTxHash = h;
+    up.extNetInfo.set(vv::NetInfoPurpose::CORE_P2P, {vv::NetInfoEntry{vv::NetService::ipv4(5, 6, 7, 8, 9999)}});
+    up.sig.fill(0xff);
+    const auto payload = protx_payload(up);
+    auto rules = dash::coin::ProviderTxRules::for_block(dash::coin::DashNetwork::MAINNET, 2400111);
+    rules.v24_active = true;
+    const auto why = dash::coin::provider_payload_refusal(CProUpServTx::SPECIALTX_TYPE, payload, rules);
+    ASSERT_TRUE(why.has_value()) << "the rules must refuse this payload";
+    EXPECT_TRUE(*why == "bad-protx-payload" || why->rfind("unverifiable-", 0) == 0) << *why;
+    const auto r = m.apply_block(block_of({special_tx(CProUpServTx::SPECIALTX_TYPE, payload)}), 2400111);
+    ASSERT_TRUE(r.refused.empty()) << r.refused;
+    EXPECT_EQ(r.updated, 1u);
+    EXPECT_EQ(m.entries().at(h).v24.extNetInfo, up.extNetInfo);
+}
+
+// MF-1 of VERIFY-S3 on the v24 path: a legacy-seeded key and a ProUpRegTx
+// carrying the same point (v2 payload, basic bytes; v1 payload, legacy
+// bytes) is no operator change at v24 either; the version follows the
+// payload (target max(state, tx)).
+#ifdef C2POOL_DASH_BLS
+TEST(DashMnState, V24LegacySeededKeySamePointIsNoOperatorChange) {
+    // The dashd seed stores the v1 key canonical basic (P-3); a ProUpRegTx
+    // carrying the same point (v2 payload: basic bytes; v1 payload: legacy
+    // bytes) is no operator change at v24, and the version follows the
+    // payload (target max(state, tx)).
+    const auto stored = p3::seeded_key(p3::K8L);
+    ASSERT_TRUE(stored.has_value());
+    struct Case { uint16_t v; const char* key; };
+    const Case cases[] = {{ProTxVersion::BASIC_BLS, p3::K8B}, {ProTxVersion::LEGACY_BLS, p3::K8L}};
+    for (const auto& c : cases) {
+        SCOPED_TRACE(c.v);
+        MnStateMachine m;
+        const uint256 pro = raw256(0x31);
+        m.load({{pro, p3::v1_mn(*stored)}}, 2400110);
+        m.set_v24_height(2400111);
+        CProUpRegTx ur;
+        ur.nVersion = c.v;
+        ur.proTxHash = pro;
+        ur.pubKeyOperator = p3::kh48(c.key);
+        ur.keyIDVoting = raw160(0x51);
+        ur.scriptPayout.m_data = script_bytes(0x63);
+        BlockType b;
+        b.m_txs.push_back(coinbase_tx({script_bytes(0xC9)}));
+        b.m_txs.push_back(special_tx(CProUpRegTx::SPECIALTX_TYPE, protx_payload(ur)));
+        const auto r = m.apply_block(b, 2400111);
+        ASSERT_TRUE(r.refused.empty()) << r.refused;
+        const auto& e = m.entries().at(pro);
+        EXPECT_EQ(e.nPoSeBanHeight, 0u);
+        EXPECT_TRUE(e.isValid);
+        EXPECT_EQ(e.scriptOperatorPayout.m_data, script_bytes(0x62));
+        EXPECT_EQ(e.netInfo, p3::v1_mn(*stored).netInfo);
+        EXPECT_EQ(e.nVersion, c.v);
+    }
+}
+#endif
+
+// VERIFY-S3 should-fix 1 / nit 2: at v24 the projection refuses (fail
+// closed, before any mutation) an update naming a masternode its set does
+// not hold, and a ProDisTx whose target is unknown or not shared.
+TEST(DashMnState, V24UnknownTargetAndNonSharedProDisTxRefuse) {
+    uint256 h;
+    MnStateMachine m = v2319_one_regular_mn(h, 2400110);
+    m.set_v24_height(2400111);
+    const MNState before = m.entries().at(h);
+    auto expect = [&](MutableTransaction tx, const char* why) {
+        const auto r = m.apply_block(block_of({std::move(tx)}), 2400111);
+        EXPECT_NE(r.refused.find(why), std::string::npos) << r.refused;
+        EXPECT_EQ(m.last_applied_height(), 2400110u);
+        EXPECT_EQ(m.entries().at(h), before);
+    };
+    CProUpRegTx ur;
+    ur.nVersion = ProTxVersion::BASIC_BLS;
+    ur.proTxHash = raw256(0x7e);                 // not in the set
+    ur.keyIDVoting = raw160(0x51);
+    expect(special_tx(CProUpRegTx::SPECIALTX_TYPE, protx_payload(ur)), "this set does not hold");
+    CProUpRevTx rv;
+    rv.nVersion = ProTxVersion::BASIC_BLS;
+    rv.proTxHash = raw256(0x7e);
+    expect(special_tx(CProUpRevTx::SPECIALTX_TYPE, protx_payload(rv)), "this set does not hold");
+    vv::CProDisTx dis;
+    dis.proTxHash = h;                           // a regular, non-shared MN
+    dis.vchSigs.resize(1);
+    expect(special_tx(10, protx_payload(dis)), "bad-prodis-not-shared");
+    dis.proTxHash = raw256(0x7e);
+    expect(special_tx(10, protx_payload(dis)), "bad-prodis-hash");
+}
+
+// S4: a v3 payee is paid at its payout list, which the projection's paid
+// check must recognise. After the v3 raise the state has no scriptPayout;
+// the pre-S4 check read scriptPayout and raised a false payee desync.
+TEST(DashMnState, V24ProjectionRecognisesAV3PayeePaidAtItsPayoutList) {
+    uint256 h;
+    MnStateMachine m = v2319_one_regular_mn(h, 2400110);
+    m.set_v24_height(2400111);
+    const auto old_payout = m.entries().at(h).scriptPayout.m_data;
+    CProUpServTx up;
+    up.nVersion = ProTxVersion::EXT_ADDR;
+    up.proTxHash = h;
+    up.extNetInfo.set(vv::NetInfoPurpose::CORE_P2P, {vv::NetInfoEntry{vv::NetService::ipv4(5, 6, 7, 8, 9999)}});
+    BlockType b1;
+    b1.m_txs.push_back(coinbase_tx({old_payout}));   // pays the pre-block (v2) script
+    b1.m_txs.push_back(special_tx(CProUpServTx::SPECIALTX_TYPE, protx_payload(up)));
+    const auto r1 = m.apply_block(b1, 2400111);
+    ASSERT_TRUE(r1.refused.empty()) << r1.refused;
+    ASSERT_FALSE(r1.payee_desync);
+    ASSERT_TRUE(m.entries().at(h).scriptPayout.m_data.empty());
+    ASSERT_EQ(m.find_expected_payee(), std::optional<uint256>{h});
+    BlockType b;
+    b.m_txs.push_back(coinbase_tx({script_bytes(0xC7), old_payout}));   // miner, then the payout
+    const auto r = m.apply_block(b, 2400112);
+    EXPECT_FALSE(r.payee_desync);
+    EXPECT_EQ(m.entries().at(h).nLastPaidHeight, 2400112u);
+}
+
+TEST(DashMnState, V24RefusalsBeforeAnyMutation) {
+    MnStateMachine m;
+    m.set_v24_height(2400120);
+    const auto reg = shared_reg_tx();
+    const uint256 pro = tx_hash(reg);
+    ASSERT_TRUE(m.apply_block(block_of({reg}), 2400120).refused.empty());
+    auto expect_refused = [&](MutableTransaction tx, const char* why) {
+        const MNState before = m.entries().at(pro);
+        const uint32_t cursor = m.last_applied_height();
+        const auto r = m.apply_block(block_of({std::move(tx)}), cursor + 1);
+        EXPECT_NE(r.refused.find(why), std::string::npos) << r.refused;
+        EXPECT_EQ(m.last_applied_height(), cursor);
+        EXPECT_EQ(m.entries().at(pro), before);
+    };
+    // A shared collateral spent by a normal tx.
+    MutableTransaction spend;
+    TxIn in;
+    in.prevout.hash = pro;
+    in.prevout.index = 0;
+    in.sequence = 0xFFFFFFFF;
+    spend.vin.push_back(in);
+    expect_refused(spend, "bad-shared-collateral-spend");
+    // ProUpRegTx for a shared masternode (dry run of the transition).
+    CProUpRegTx up;
+    up.nVersion = ProTxVersion::EXT_ADDR;
+    up.proTxHash = pro;
+    up.pubKeyOperator = seq_array<48>(0x41);
+    up.keyIDVoting = raw160(0x42);
+    vv::MasternodePayoutShare po;
+    po.scriptPayout.m_data = script_bytes(0x77);
+    up.payouts = {po};
+    expect_refused(special_tx(CProUpRegTx::SPECIALTX_TYPE, protx_payload(up)), "bad-protx-shared-mn");
+    // A legacy-scheme registration after DEPLOYMENT_V24.
+    auto legacy = make_proreg(ProTxVersion::LEGACY_BLS, MnType::REGULAR);
+    expect_refused(special_tx(CProRegTx::SPECIALTX_TYPE, protx_payload(legacy)), "bad-protx-version-disallowed");
+    // A template output outside a shared registration.
+    MutableTransaction t;
+    t.vin.push_back(in);
+    t.vin[0].prevout.hash = raw256(0x5a);
+    TxOut o;
+    o.value = 1;
+    o.scriptPubKey.m_data = dash::coin::v24::shared_collateral_script();
+    t.vout.push_back(o);
+    expect_refused(t, "bad-shared-collateral-create");
 }
 
 TEST(DashMnState, CollateralSpendRemovesMN) {

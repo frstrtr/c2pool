@@ -183,6 +183,29 @@ inline StratumPasswordOpts parse_stratum_password(const std::string& password)
     return opts;
 }
 
+// The (hash160, V36 pubkey type) a share carries for a payout script:
+// P2PKH 0, P2WPKH 1, P2SH 2. False for any other script.
+inline bool script_pubkey_of(const std::vector<unsigned char>& script, uint160& hash, uint8_t& type)
+{
+    if (script.size() == 25 && script[0] == 0x76 && script[1] == 0xa9 && script[2] == 0x14
+        && script[23] == 0x88 && script[24] == 0xac) {
+        std::memcpy(hash.data(), script.data() + 3, 20);
+        type = 0;
+        return true;
+    }
+    if (script.size() == 22 && script[0] == 0x00 && script[1] == 0x14) {
+        std::memcpy(hash.data(), script.data() + 2, 20);
+        type = 1;
+        return true;
+    }
+    if (script.size() == 23 && script[0] == 0xa9 && script[1] == 0x14 && script[22] == 0x87) {
+        std::memcpy(hash.data(), script.data() + 2, 20);
+        type = 2;
+        return true;
+    }
+    return false;
+}
+
 class Redistributor
 {
 public:
@@ -221,6 +244,27 @@ public:
     {
         donation_hash_ = hash;
         donation_type_ = type;
+    }
+
+    // Who a share goes to when the tracker cannot be read (it is busy): the
+    // operator ("fee"), or the donation script when no operator is set.
+    RedistributeResult without_tracker() const
+    {
+        if (!operator_hash_.IsNull())
+            return {operator_hash_, operator_type_};
+        return {donation_hash_, donation_type_};
+    }
+
+    // pick() for a caller off the compute thread (the stratum thread building
+    // a job): only while `lock` (a try-acquired read lock of the tracker:
+    // node.hpp TrackerReadGuard, std::shared_lock) holds it; when the tracker
+    // is busy, without_tracker(). pick() walks the tracker (PPLNS weights).
+    template <class ReadLock>
+    RedistributeResult pick_if_locked(const ReadLock& lock, ShareTracker& tracker, const uint256& best_share_hash)
+    {
+        if (!static_cast<bool>(lock))
+            return without_tracker();
+        return pick(tracker, best_share_hash);
     }
 
     // Pick a (pubkey_hash, pubkey_type) for shares from unnamed/broken miners.
@@ -464,6 +508,7 @@ private:
             uint160 pk_hash;
             uint8_t pk_type = 0;
             uint64_t work = 0;
+            bool carried = true;
             data.share.invoke([&](auto* obj) {
                 script = get_share_script(obj);
                 auto target = chain::bits_to_target(obj->m_bits);
@@ -476,14 +521,15 @@ private:
                     pk_hash = obj->m_pubkey_hash;
                     pk_type = 0;
                 } else {
-                    if (script.size() == 25 && script[0] == 0x76 && script[1] == 0xa9)
-                        std::memcpy(pk_hash.data(), script.data() + 3, 20);
-                    else if (script.size() >= 22 && script[0] == 0x00 && script[1] == 0x14)
-                        std::memcpy(pk_hash.data(), script.data() + 2, 20);
-                    else if (script.size() >= 20)
-                        std::memcpy(pk_hash.data(), script.data(), 20);
+                    // An address share: (hash, type) from its script, as a
+                    // share carries it. Another script (P2WSH, P2TR, bare) is
+                    // not a recipient: its first bytes paid as P2PKH would pay
+                    // nobody.
+                    carried = script_pubkey_of(script, pk_hash, pk_type);
                 }
             });
+            if (!carried)
+                continue;
             auto& entry = addr_work[script];
             entry.script = script;
             entry.hash = pk_hash;

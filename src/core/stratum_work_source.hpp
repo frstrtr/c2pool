@@ -77,6 +77,23 @@ public:
     /// chain id. BTC MVP returns false unconditionally.
     virtual bool has_merged_chain(uint32_t chain_id) const = 0;
 
+    /// The node runs on a test network: merged-chain addresses are read with
+    /// the chains' testnet and regtest versions.
+    virtual bool is_testnet() const { return false; }
+
+    // False while merged chains are configured but not attached yet: a login
+    // resolved then would carry no merged addresses (stratum refuses it).
+    virtual bool merged_ready() const { return true; }
+
+    // The payout a job commits to (its ref_hash carries the share's pubkey
+    // and merged addresses), decided when the job is built, as p2pool does in
+    // get_work: the work source may give the job to the node operator (the
+    // node fee) or redistribute a payout a share cannot carry (an empty
+    // login). The share made from the job carries exactly these. Default:
+    // unchanged.
+    virtual void decide_job_payout(std::vector<unsigned char>& /*payout_script*/,
+                                   std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& /*merged*/) const {}
+
     // ── Per-connection bookkeeping ───────────────────────────────────────
     // Lifecycle: register on authorize, update each share, unregister on
     // disconnect. All keyed by stratum session_id.

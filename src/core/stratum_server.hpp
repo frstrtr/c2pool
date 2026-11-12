@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
+#include "merged_chain_addr.hpp"
 
 #include <memory>
 #include <string>
@@ -181,6 +182,12 @@ private:
         // of p2pool-dash work.py:477 grace (p2pool judges each share by its own
         // job's target). 0.0 = unset ⇒ gate falls back to the live vardiff.
         double issued_difficulty{0.0};
+        // The payout and merged scripts this job's ref_hash committed to: the
+        // share made from it carries these, whatever the session's login is
+        // by the time the miner submits.
+        bool has_payout{false};
+        std::vector<unsigned char> payout_script;
+        std::map<uint32_t, std::vector<unsigned char>> merged_scripts;
     };
     std::unordered_map<std::string, JobEntry> active_jobs_;
     // Insertion-order companion to active_jobs_ (interim hardening fix #1).
@@ -241,6 +248,28 @@ private:
 
     // Merged mining: per-chain payout addresses set by the miner.
     std::map<uint32_t, std::string> merged_addresses_;
+    // The ones sent with mining.set_merged_addresses: the only entries that
+    // outlive a re-authorize (the login's own are resolved again from it).
+    std::map<uint32_t, std::string> set_merged_addresses_;
+    // The last successful login's primary and the merged addresses it gave
+    // itself (not set_merged_addresses, not auto-derived): kept by a
+    // re-authorize with the same primary.
+    std::string login_primary_;
+    std::map<uint32_t, std::string> login_given_;
+    // The login has no payout address a share can carry (empty, invalid,
+    // another coin's) and the work source redistributes it: the jobs carry
+    // parent_script_ (p2pool's case 4) or an empty payout.
+    bool payout_unusable_{false};
+    std::vector<unsigned char> parent_script_;
+    std::string payout_warning_;   // shown with the worker ("address invalid → redistributed")
+    // The scriptPubKey a merged entry pays on its chain
+    // (core::merged_addr::merged_payout_script).
+    std::vector<unsigned char> merged_script_for(uint32_t chain_id, const std::string& addr) const;
+    bool testnet_network() const;
+    // The merged-chain identification table (built once per session).
+    const std::vector<core::merged_addr::ChainAddrInfo>& merged_table() const;
+    mutable std::vector<core::merged_addr::ChainAddrInfo> merged_table_;
+    mutable bool merged_table_built_{false};
 
     // BIP 310 version-rolling (ASICBoost) state
     static constexpr uint32_t POOL_VERSION_MASK = 0x1fffe000;
@@ -273,6 +302,16 @@ private:
     // sec): armed at start(), disarmed once authorize completes. A session that
     // never authorizes (half-open / probe) is dropped when it fires.
     boost::asio::steady_timer handshake_timer_;
+
+    // A held job (CoinbaseResult::held): one pending retry per session, for
+    // at most StratumConfig::job_hold_limit_sec since the hold began; past it
+    // the session stops retrying (the miner keeps its last valid job) until
+    // the next notify. hold_retry_clean_: a notify held meanwhile asked for
+    // clean jobs, so the retry does.
+    bool hold_retry_pending_ = false;
+    bool hold_retry_clean_ = false;
+    std::chrono::steady_clock::time_point hold_since_{};
+    uint64_t hold_retries_ = 0;
 
 public:
     explicit StratumSession(tcp::socket socket, std::shared_ptr<IWorkSource> mining_interface,
@@ -344,7 +383,8 @@ private:
     void arm_handshake_timer();
 
     std::string generate_extranonce1();
-    void parse_address_separators(std::string& username, std::string& merged_addr_raw);
+    void parse_address_separators(std::string& username, std::string& merged_addr_raw,
+                                  std::set<uint32_t>* slash_chains = nullptr);
 };
 
 /// Stratum Server — accepts TCP connections and spawns StratumSession per miner.
@@ -364,6 +404,12 @@ class StratumServer
     // STRICT per-node miner cap (interim hardening fix #5): connections refused
     // because sessions_.size() >= StratumConfig::max_stratum_connections.
     std::atomic<uint64_t> refused_connections_{0};
+
+    // Drain-mode admission gate (#866 action 2). Default true = the legacy
+    // accept path, unchanged. false refuses every new connection regardless of
+    // the cap -- the cap alone cannot express "refuse all" because 0 = unlimited.
+    std::atomic<bool> accepting_{true};
+    std::atomic<uint64_t> refused_draining_{0};
 
     // Sessions dropped because an inbound line exceeded
     // StratumSession::kMaxStratumLineBytes without a '\n'.
@@ -398,7 +444,10 @@ public:
 
     /// Push new work to ALL connected miners immediately (p2pool: new_work_event).
     /// Called when best_share changes or new block template arrives.
-    void notify_all();
+    /// force_clean=false (a template rebuilt for new transactions on the
+    /// same block) sends clean_jobs only where the block's prevhash changed,
+    /// so the ASIC pipelines are not wiped once a second.
+    void notify_all(bool force_clean = true);
 
     /// Sum of all connected miners' hashrate (H/s).
     double get_total_hashrate() const;
@@ -439,6 +488,18 @@ public:
     void record_oversized_line_drop() { oversized_line_drops_.fetch_add(1); }
     /// Live session count (dead sessions pruned lazily — see notify_all()).
     size_t get_session_count() const;
+
+    /// Drain-mode hooks (#866 action 2). Default-inert: while accepting is true
+    /// (the default) nothing changes. set_accepting(false) closes each new
+    /// connection on accept and bumps get_refused_draining(); live sessions are
+    /// left alone. Coin-side drain controllers drive these; core has no policy.
+    void set_accepting(bool accepting) { accepting_.store(accepting); }
+    bool is_accepting() const { return accepting_.load(); }
+    uint64_t get_refused_draining() const { return refused_draining_.load(); }
+    /// Close up to n live sessions: unauthorized ones first, then lowest
+    /// hashrate first. Each close runs the normal disconnect path. Returns the
+    /// number closed. Call on the io thread.
+    size_t drop_sessions(size_t n);
     /// Diagnostics: {distinct SharedJobPayload blocks, total active jobs}
     /// summed across all sessions. Bounded-memory evidence: distinct payloads
     /// track retained work GENERATIONS, not sessions × jobs. Test/diag hook —

@@ -188,14 +188,14 @@ depend on a file the operator could lose, swap, or forget to install.
 
 | file | state |
 |---|---|
-| `dash_mn_checkpoint_mainnet.inc` | **PINNED** at height 2513000 — 2974 registered masternodes (2068 payee-eligible, 906 PoSe-banned) |
+| `dash_mn_checkpoint_mainnet.inc` | **PINNED** at height 2563800 — 3005 registered masternodes (2249 payee-eligible, 756 PoSe-banned) |
 | `dash_mn_checkpoint_testnet.inc` | **UNPINNED** — no anchor; daemonless DASH testnet fails closed |
 
 Pinning requires RPC access to a synced dashd on the corresponding network,
 which is a release-time step, not a build-time one. Until then the mechanism
 is present and refuses to serve, which is the intended safe default.
 
-The mainnet anchor's 2068 payee-eligible records are byte-identical to the
+The 2513000 anchor's 2068 payee-eligible records are byte-identical to the
 previous `valid`-based pin at the same height; the re-pin is purely additive
 (the 906 present-but-ineligible records) and does not move a single eligible
 masternode's payout state.
@@ -222,7 +222,7 @@ What the pin binds (`c2pool-utxo-snapshot/1`, parsed by
 | line | checked at import |
 |---|---|
 | `network`, `coin` | must be the node's (`mainnet`, `dash`) |
-| `height`, `blockhash` | the file's base hash; the lane refuses to use the set until the header chain holds that hash at that height (at or above the 2549400 checkpoint) |
+| `height`, `blockhash` | the file's base hash; the lane refuses to use the set until the header chain holds that hash at that height (at or above the 2563800 checkpoint) |
 | `coins` | the file's coin count and the number of coins decoded |
 | `muhash` | MuHash3072 over the decoded set (`gettxoutsetinfo muhash`) |
 | `hash_serialized_2` | the legacy set hash (`dumptxoutset` `txoutset_hash`) |

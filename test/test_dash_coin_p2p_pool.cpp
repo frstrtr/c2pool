@@ -61,6 +61,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <map>
 #include <memory>
 #include <set>
 #include <string>
@@ -980,6 +981,10 @@ TEST(DashCoinP2PPool, govsync_prime_returned_keys_drive_R5_to_two_peer_completen
     rig.use_fake_clock();
     rig.fake_now = t0;
     rig.client.set_max_peers(2);
+    rig.client.set_on_govsync_coverage([&](const std::string& pk, bool covered) {
+        if (covered) gov.note_govsync_answered(pk, rig.fake_now);
+        else         gov.note_govsync_unanswered(pk);
+    });
 
     // First peer handshakes and is primed -> record its returned key.
     rig.handshake(1);
@@ -996,13 +1001,22 @@ TEST(DashCoinP2PPool, govsync_prime_returned_keys_drive_R5_to_two_peer_completen
         gov.note_govsync_requested(pk, rig.fake_now);
     EXPECT_EQ(gov.requested_peer_count(), 2u)
         << "two handshakes did not accrue two DISTINCT primed peers";
+    // Requested is NOT coverage: two silent peers (pruned / -disablegovernance
+    // / unsynced dashd never answer) must never make the view complete.
+    EXPECT_FALSE(gov.is_complete(t0 + 10'000))
+        << "requested-but-silent peers counted as coverage";
 
+    // Both ANSWER the prime: SYNCSTATUSCOUNT(GOVOBJ, 0) — an empty governance
+    // set, nothing announced, nothing pending.
+    rig.deliver(1, p2p::message_ssc::make_raw(p2p::DASH_MASTERNODE_SYNC_GOVOBJ, 0));
+    rig.deliver(2, p2p::message_ssc::make_raw(p2p::DASH_MASTERNODE_SYNC_GOVOBJ, 0));
+    EXPECT_EQ(gov.answered_peer_count(), 2u);
     // Not settled yet (60s floor since first request).
     EXPECT_FALSE(gov.is_complete(t0 + 30));
     // After the settle floor AND the quiescence window with no new arrivals, the
-    // >=2-peer view is COMPLETE — the serve path may now trust the store.
+    // >=2-peer ANSWERED view is COMPLETE — the serve path may now trust it.
     EXPECT_TRUE(gov.is_complete(t0 + 61 + 30))
-        << "a >=2-peer, settled, quiesced governance view was not declared complete";
+        << "a >=2-peer answered, settled, quiesced governance view was not declared complete";
 }
 
 // ── VERACK-DRIVEN PRIME: every handshaked peer covered, once, per session ─────
@@ -1039,6 +1053,10 @@ TEST(DashCoinP2PPool, verack_primes_every_handshaked_peer_for_R5_coverage)
     rig.client.set_gov_pull(true);                     // = --embedded-govsync armed
     rig.client.set_on_govsync_primed(
         [&](const std::string& pk){ gov.note_govsync_requested(pk, rig.fake_now); });
+    rig.client.set_on_govsync_coverage([&](const std::string& pk, bool covered) {
+        if (covered) gov.note_govsync_answered(pk, rig.fake_now);
+        else         gov.note_govsync_unanswered(pk);
+    });
 
     // The FUTURE PRIMARY (first verack) is primed at its own handshake — not
     // gated behind primary election.
@@ -1066,11 +1084,15 @@ TEST(DashCoinP2PPool, verack_primes_every_handshaked_peer_for_R5_coverage)
     EXPECT_TRUE(rig.client.send_govsync_prime().empty())
         << "a peer was left unprimed by the verack path (residual drive gap)";
 
-    // >=2 DISTINCT primed peers -> the min_peers=2 floor is crossable; after the
-    // settle floor AND quiescence the view flips COMPLETE -> gov_complete=1.
+    // >=2 DISTINCT primed peers are NOT yet coverage: neither has answered.
+    EXPECT_FALSE(gov.is_complete(t0 + 10'000)) << "silent primed peers counted";
+    // Both answer -> the min_peers=2 floor is crossable; after the settle floor
+    // AND quiescence the view flips COMPLETE -> gov_complete=1.
+    rig.deliver(1, p2p::message_ssc::make_raw(p2p::DASH_MASTERNODE_SYNC_GOVOBJ, 0));
+    rig.deliver(2, p2p::message_ssc::make_raw(p2p::DASH_MASTERNODE_SYNC_GOVOBJ, 0));
     EXPECT_FALSE(gov.is_complete(t0 + 30)) << "settled before the 60s floor";
     EXPECT_TRUE(gov.is_complete(t0 + 5 + 61 + 30))
-        << "a >=2-peer settled quiesced governance view was not declared complete";
+        << "a >=2-peer answered settled quiesced governance view was not declared complete";
 }
 
 TEST(DashCoinP2PPool, primary_election_does_not_double_prime_the_primary)
@@ -1105,13 +1127,14 @@ TEST(DashCoinP2PPool, primary_election_does_not_double_prime_the_primary)
         << "the primary was left unprimed / re-primeable after its verack";
 }
 
-TEST(DashCoinP2PPool, verack_reprime_within_window_does_not_resend_no_ban_vector)
+TEST(DashCoinP2PPool, verack_reprime_on_reconnect_and_window_margin)
 {
-    // KAT-2: the requester-side mirror of dashd's netfulfilledman once-per-window
-    // gate must survive a RECONNECT. A peer dropped and re-handshaked from the
-    // SAME address inside m_govsync_reprime_secs must NOT be re-sent a full
-    // govsync (that repeat is the CGovernanceManager::SyncObjects Misbehaving(20)
-    // ban vector). Once the window lapses, the re-handshake IS re-primed (TTL).
+    // MED-A: dashd keys its fulfilled-request window by the CService it sees —
+    // our address INCLUDING the ephemeral source port (netfulfilledman.cpp) —
+    // so a NEW connection is a new requester and may be re-primed at once. On
+    // the SAME connection the once-per-window guard still holds, and the
+    // window carries a 60 s margin over dashd's 3600 s expiry (re-asking at
+    // the exact edge is the Misbehaving(20) case).
     using dash::coin::GovSyncStatus;
     GovSyncStatus gov;
     int primed_reports = 0;
@@ -1120,18 +1143,34 @@ TEST(DashCoinP2PPool, verack_reprime_within_window_does_not_resend_no_ban_vector
     rig.use_fake_clock();
     rig.client.set_max_peers(3);
     rig.client.set_gov_pull(true);
+    EXPECT_EQ(rig.client.govsync_reprime_secs(), 3660);
     rig.client.set_on_govsync_primed([&](const std::string& pk){
         ++primed_reports;
         gov.note_govsync_requested(pk, rig.fake_now);
+    });
+    rig.client.set_on_govsync_coverage([&](const std::string& pk, bool c) {
+        if (c) gov.note_govsync_answered(pk, rig.fake_now);
+        else   gov.note_govsync_unanswered(pk);
     });
 
     rig.handshake(1);
     rig.handshake(2);
     ASSERT_EQ(primed_reports, 2);
-    ASSERT_EQ(gov.requested_peer_count(), 2u);
 
-    // Keep the PRIMARY (peer 1) alive across the reap window by answering its
-    // pings; let the WITNESS (peer 2) go silent so ONLY it is reaped.
+    // Same connection, inside the window: never re-primed.
+    EXPECT_TRUE(rig.client.send_govsync_prime().empty());
+    rig.fake_now += 3600;                       // exactly dashd's expiry: still not
+    EXPECT_TRUE(rig.client.send_govsync_prime().empty())
+        << "re-primed at the exact 3600 s edge (Misbehaving(20) risk)";
+    rig.fake_now += 61;
+    EXPECT_EQ(rig.client.send_govsync_prime().size(), 2u) << "margin elapsed";
+    primed_reports = 2;                           // walker does not report
+
+    // Peer 2 answers and covers; then it is reaped and RECONNECTS well inside
+    // the window — the new connection is re-primed at its verack and can prove
+    // coverage again right away (no wait for leg B).
+    rig.deliver(2, p2p::message_ssc::make_raw(p2p::DASH_MASTERNODE_SYNC_GOVOBJ, 0));
+    ASSERT_TRUE(rig.client.gov_peer_covered(PoolRig::peer_key(2)));
     const auto answer_peer1 = [&](int64_t){
         const PeerSession* s = rig.session(1);
         if (s && s->liveness.ping_outstanding())
@@ -1139,28 +1178,12 @@ TEST(DashCoinP2PPool, verack_reprime_within_window_does_not_resend_no_ban_vector
     };
     rig.run_seconds(rig.client.peer_timeout_sec(), answer_peer1);
     ASSERT_EQ(rig.session(2), nullptr) << "the witness peer was not reaped";
-    ASSERT_NE(rig.session(1), nullptr) << "the primary was wrongly reaped";
-    // Still well inside the default 3600s reprime window (peer_timeout is 1200s),
-    // so the reconnect below must be treated as an in-window repeat.
-    ASSERT_LT(rig.fake_now - 1'000'000, static_cast<int64_t>(3600));
-
-    // RECONNECT the same address INSIDE the window: a NEW session, same peer_key.
+    EXPECT_FALSE(rig.client.gov_peer_covered(PoolRig::peer_key(2)));
+    EXPECT_EQ(gov.answered_peer_count(), 0u) << "a gone peer must uncover";
     rig.handshake(2);
-    EXPECT_EQ(primed_reports, 2)
-        << "a reconnect inside the window re-sent govsync (dashd Misbehaving(20))";
-    EXPECT_EQ(gov.requested_peer_count(), 2u)
-        << "a window-skipped reconnect spuriously re-armed R5 coverage";
-
-    // Collapse the window (TTL semantics), reap the witness again, reconnect: now
-    // the govsync IS re-sent — proving the guard is an EXPIRY window, not a latch,
-    // and that the discipline lives in the shared send-site helper.
-    rig.client.set_govsync_reprime_secs(0);
-    rig.run_seconds(rig.client.peer_timeout_sec(), answer_peer1);
-    ASSERT_EQ(rig.session(2), nullptr) << "the witness peer was not reaped (2nd)";
-    rig.handshake(2);
-    EXPECT_EQ(primed_reports, 3)
-        << "a lapsed reprime window did not permit a verack re-prime";
-    EXPECT_EQ(gov.requested_peer_count(), 2u);   // same key -> still 2 distinct
+    EXPECT_EQ(primed_reports, 3) << "a reconnect was not re-primed";
+    rig.deliver(2, p2p::message_ssc::make_raw(p2p::DASH_MASTERNODE_SYNC_GOVOBJ, 0));
+    EXPECT_TRUE(rig.client.gov_peer_covered(PoolRig::peer_key(2)));
 }
 
 TEST(DashCoinP2PPool, getaddr_is_broadcast_because_discovery_breadth_refills_the_pool)
@@ -2211,4 +2234,312 @@ TEST(DashCoinP2PPool, archival_rotation_is_bounded_and_never_churns_a_healthy_po
         EXPECT_EQ(rig.client.outbound_rotations_for_test(), 1u)
             << "a second rotation must wait out OUTBOUND_ROTATE_INTERVAL_SEC";
     }
+}
+
+// ── E-SUPERBLOCK C4: per-object vote sync — once per (peer, object) window ────
+// Dash Core v24 net_governance.cpp:116-133 records a per-object vote sync as a
+// fulfilled request and answers a repeat inside nFulfilledRequestExpireTime
+// (mainnet 1 h, testnet 5 min) with Misbehaving(20). Re-syncs at H - window
+// and H - 1 must therefore never re-ask the same peer for the same object
+// inside the window, while a DIFFERENT object or an expired window is fine.
+TEST(DashCoinP2PPool, govsync_vote_sync_once_per_peer_object_window)
+{
+    PoolRig rig;
+    rig.use_fake_clock();
+    rig.client.set_max_peers(2);
+    rig.handshake(1);
+    rig.handshake(2);
+    uint256 h1, h2;
+    h1.data()[0] = 0x11;
+    h2.data()[0] = 0x22;
+
+    EXPECT_EQ(rig.client.send_govsync(h1), 2u);
+    EXPECT_EQ(rig.client.send_govsync(h1), 0u) << "re-asked inside the fulfilled window";
+    EXPECT_EQ(rig.client.govsync_votes_skipped(), 2u);
+    EXPECT_EQ(rig.client.send_govsync(h2), 2u) << "a different object is a different request";
+    rig.fake_now += 3661;                          // mainnet window (+ margin) default
+    EXPECT_EQ(rig.client.send_govsync(h1), 2u) << "an expired window must permit a re-ask";
+
+    // Testnet window (main_dash sets 360 s for a 300 s nFulfilledRequestExpireTime).
+    rig.client.set_govsync_votes_resync_secs(360);
+    EXPECT_EQ(rig.client.send_govsync(h2), 2u);    // last asked 3661 s ago
+    EXPECT_EQ(rig.client.send_govsync(h2), 0u) << "re-asked inside the 360 s window";
+    rig.fake_now += 361;
+    EXPECT_EQ(rig.client.send_govsync(h2), 2u);
+
+    // The object fetch (empty filter) is not a tracked request: never gated.
+    EXPECT_EQ(rig.client.send_govobject_fetch(h1), 2u);
+    EXPECT_EQ(rig.client.send_govobject_fetch(h1), 2u);
+}
+
+// An explicit vote re-sync forgets the vote-type inv dedup so votes pulled and
+// dropped inside the 600 s TTL are pulled again; other types are untouched.
+TEST(DashCoinP2PPool, inv_dedup_forget_type_only_drops_that_type)
+{
+    InvDedup d;
+    uint256 a, b, c;
+    a.data()[0] = 1; b.data()[0] = 2; c.data()[0] = 3;
+    const uint32_t VOTE = 18, OBJ = 17;
+    ASSERT_TRUE(d.admit(VOTE, a, 100));
+    ASSERT_TRUE(d.admit(OBJ, b, 101));
+    ASSERT_TRUE(d.admit(VOTE, c, 102));
+    EXPECT_EQ(d.forget_type(VOTE), 2u);
+    EXPECT_FALSE(d.contains(VOTE, a));
+    EXPECT_FALSE(d.contains(VOTE, c));
+    EXPECT_TRUE(d.contains(OBJ, b));
+    EXPECT_EQ(d.size(), d.index_size()) << "queue/index lockstep (leak invariant)";
+    EXPECT_EQ(d.size(), 1u);
+    EXPECT_TRUE(d.admit(VOTE, a, 103)) << "a forgotten vote inv is pulled again";
+}
+
+
+// ── HIGH-1: govsync coverage = ANSWERED, and every announced object received ──
+namespace {
+std::unique_ptr<RawMessage> gov_obj_inv(const uint256& h)
+{
+    return p2p::message_inv::make_raw(std::vector<p2p::inventory_type>{
+        p2p::inventory_type(p2p::inventory_type::govobject, h)});
+}
+// A proposal-type governance object and its identity hash (what the inv
+// announces and the handler recomputes).
+struct GovObjFixture {
+    std::vector<uint8_t> data;
+    int64_t              time{1700000000};
+    uint256 hash() const {
+        return dash::coin::govobject_hash(uint256(), 1, time, data, uint256(), 0xffffffffu, {});
+    }
+    std::unique_ptr<RawMessage> msg() const {
+        p2p::GovOutPoint op;
+        op.hash = uint256();
+        op.index = 0xffffffffu;
+        return p2p::message_govobj::make_raw(uint256(), 1, time, uint256(), data,
+                                             int32_t{1}, op, std::vector<uint8_t>{});
+    }
+};
+} // namespace
+
+TEST(DashCoinP2PPool, govsync_coverage_requires_answer_and_every_announced_object)
+{
+    PoolRig rig;
+    rig.use_fake_clock();
+    rig.client.set_max_peers(2);
+    rig.client.set_gov_pull(true);                      // primes at verack
+    std::map<std::string, bool> covered;
+    rig.client.set_on_govsync_coverage(
+        [&](const std::string& pk, bool c) { covered[pk] = c; });
+    rig.handshake(1);
+    rig.handshake(2);
+    const auto k1 = PoolRig::peer_key(1), k2 = PoolRig::peer_key(2);
+
+    // Primed, silent: never covered, however long we wait.
+    rig.run_seconds(120);
+    EXPECT_FALSE(rig.client.gov_peer_covered(k1));
+    EXPECT_FALSE(rig.client.gov_peer_covered(k2));
+
+    GovObjFixture a{std::vector<uint8_t>{'{', '}'}};
+    GovObjFixture b{std::vector<uint8_t>{'[', ']'}};
+    // Peer 1 answers "2 objects" before relaying them: not covered yet.
+    rig.deliver(1, p2p::message_ssc::make_raw(p2p::DASH_MASTERNODE_SYNC_GOVOBJ, 2));
+    EXPECT_FALSE(rig.client.gov_peer_covered(k1)) << "ssc alone is not coverage";
+    rig.deliver(1, gov_obj_inv(a.hash()));
+    rig.deliver(1, gov_obj_inv(b.hash()));
+    EXPECT_FALSE(rig.client.gov_peer_covered(k1)) << "announced but not received";
+    rig.deliver(1, a.msg());
+    EXPECT_FALSE(rig.client.gov_peer_covered(k1)) << "one object still pending";
+    rig.deliver(1, b.msg());
+    EXPECT_TRUE(rig.client.gov_peer_covered(k1));
+    EXPECT_TRUE(covered[k1]);
+
+    // Peer 2 claims 3 objects but only ever announces the 2 we hold: its
+    // proof never closes (it announced fewer than it said it has).
+    rig.deliver(2, p2p::message_ssc::make_raw(p2p::DASH_MASTERNODE_SYNC_GOVOBJ, 3));
+    rig.deliver(2, gov_obj_inv(a.hash()));
+    rig.deliver(2, gov_obj_inv(b.hash()));
+    EXPECT_FALSE(rig.client.gov_peer_covered(k2));
+    EXPECT_EQ(rig.client.gov_covered_peer_count(), 1u);
+
+    // A re-prime re-opens the proof: peer 1 must answer again.
+    rig.client.set_govsync_reprime_secs(0);
+    rig.client.send_govsync_prime();
+    EXPECT_FALSE(rig.client.gov_peer_covered(k1));
+    EXPECT_FALSE(covered[k1]);
+    // Its inv-known filter suppresses re-announcing what it already sent us:
+    // the per-connection announced set still satisfies the count.
+    rig.deliver(1, p2p::message_ssc::make_raw(p2p::DASH_MASTERNODE_SYNC_GOVOBJ, 2));
+    EXPECT_TRUE(rig.client.gov_peer_covered(k1));
+}
+
+// ── HIGH-2: a silent first announcer cannot starve a governance object ───────
+TEST(DashCoinP2PPool, gov_pull_retries_from_another_announcer_after_timeout)
+{
+    PoolRig rig;
+    rig.use_fake_clock();
+    rig.client.set_max_peers(2);
+    rig.client.set_gov_pull(true);
+    rig.client.set_gov_pull_timing(/*timeout=*/20, /*giveup=*/600);
+    rig.handshake(1);
+    rig.handshake(2);
+    GovObjFixture a{std::vector<uint8_t>{'{', '}'}};
+
+    const uint64_t s1 = rig.session(1)->msgs_sent;
+    const uint64_t s2 = rig.session(2)->msgs_sent;
+    rig.deliver(1, gov_obj_inv(a.hash()));          // first announcer: asked
+    rig.deliver(2, gov_obj_inv(a.hash()));          // second: remembered, not asked
+    EXPECT_EQ(rig.session(1)->msgs_sent, s1 + 1u);
+    EXPECT_EQ(rig.session(2)->msgs_sent, s2);
+    EXPECT_EQ(rig.client.gov_inflight_count(), 1u);
+
+    // Peer 1 stays silent past the timeout: the pull moves to peer 2.
+    rig.run_seconds(21);
+    EXPECT_GE(rig.session(2)->msgs_sent, s2 + 1u) << "not re-asked from the other announcer";
+    EXPECT_EQ(rig.client.gov_pull_retried_count(), 1u);
+    rig.deliver(2, a.msg());
+    EXPECT_EQ(rig.client.gov_inflight_count(), 0u);
+
+    // A notfound from the asked peer hands the pull over on the next tick.
+    GovObjFixture b{std::vector<uint8_t>{'[', ']'}};
+    rig.deliver(1, gov_obj_inv(b.hash()));
+    rig.deliver(2, gov_obj_inv(b.hash()));
+    const uint64_t s2b = rig.session(2)->msgs_sent;
+    rig.deliver(1, p2p::message_notfound::make_raw(std::vector<p2p::inventory_type>{
+        p2p::inventory_type(p2p::inventory_type::govobject, b.hash())}));
+    rig.run_seconds(1);
+    EXPECT_GE(rig.session(2)->msgs_sent, s2b + 1u) << "notfound did not hand the pull over";
+}
+
+// ── Round 3: bounds, fetch bypass, vote re-pull, chunking, zero-count ssc ────
+namespace {
+std::unique_ptr<RawMessage> gov_invs(p2p::inventory_type::inv_type t,
+                                     const std::vector<uint256>& hs)
+{
+    std::vector<p2p::inventory_type> v;
+    v.reserve(hs.size());
+    for (const auto& h : hs) v.emplace_back(t, h);
+    return p2p::message_inv::make_raw(v);
+}
+uint256 nth_hash(uint32_t n, uint8_t salt)
+{
+    uint256 h;
+    h.data()[0] = static_cast<unsigned char>(n & 0xff);
+    h.data()[1] = static_cast<unsigned char>((n >> 8) & 0xff);
+    h.data()[2] = static_cast<unsigned char>((n >> 16) & 0xff);
+    h.data()[31] = salt;
+    return h;
+}
+} // namespace
+
+// MED-B: a peer announcing more objects than any real network carries stops
+// being tracked and can never cover; in-flight pulls per peer are capped.
+TEST(DashCoinP2PPool, gov_hostile_announcer_is_bounded_and_never_covers)
+{
+    PoolRig rig;
+    rig.use_fake_clock();
+    rig.client.set_max_peers(2);
+    rig.client.set_gov_pull(true);
+    rig.handshake(1);
+    rig.deliver(1, p2p::message_ssc::make_raw(p2p::DASH_MASTERNODE_SYNC_GOVOBJ, 1));
+    std::vector<uint256> objs;
+    for (uint32_t i = 0; i < 4097; ++i) objs.push_back(nth_hash(i, 0x01));
+    rig.deliver(1, gov_invs(p2p::inventory_type::govobject, objs));
+    EXPECT_TRUE(rig.client.gov_peer_overflowed(PoolRig::peer_key(1)));
+    EXPECT_FALSE(rig.client.gov_peer_covered(PoolRig::peer_key(1)));
+
+    std::vector<uint256> votes;
+    for (uint32_t i = 0; i < 20000; ++i) votes.push_back(nth_hash(i, 0x02));
+    rig.deliver(1, gov_invs(p2p::inventory_type::govobjectvote, votes));
+    EXPECT_LE(rig.client.gov_inflight_count(), 20000u) << "per-announcer in-flight cap";
+    EXPECT_GE(rig.client.gov_pull_capped_count(), 4097u)
+        << "announcements past the cap must not be requested";
+    // The tick pops only what timed out, a bounded number per tick, and the
+    // map drains to the give-up window without a full walk per tick.
+    rig.client.set_gov_pull_timing(20, 60);
+    rig.run_seconds(70);
+    EXPECT_LT(rig.client.gov_inflight_count(), 20000u);
+    rig.run_seconds(10);
+    EXPECT_EQ(rig.client.gov_inflight_count(), 0u) << "exhausted entries given up";
+}
+
+// MED-C: an explicit object fetch bypasses the "already received" marker.
+TEST(DashCoinP2PPool, gov_explicit_fetch_repulls_a_received_object)
+{
+    PoolRig rig;
+    rig.use_fake_clock();
+    rig.client.set_max_peers(2);
+    rig.client.set_gov_pull(true);
+    rig.handshake(1);
+    GovObjFixture a{std::vector<uint8_t>{'{', '}'}};
+    rig.deliver(1, gov_obj_inv(a.hash()));
+    rig.deliver(1, a.msg());
+    const uint64_t s1 = rig.session(1)->msgs_sent;
+    rig.deliver(1, gov_obj_inv(a.hash()));
+    EXPECT_EQ(rig.session(1)->msgs_sent, s1) << "a received object is not re-pulled";
+    EXPECT_EQ(rig.client.send_govobject_fetch(a.hash()), 1u);
+    const uint64_t s2 = rig.session(1)->msgs_sent;   // + the fetch itself
+    rig.deliver(1, gov_obj_inv(a.hash()));           // v24 answers with the inv
+    EXPECT_EQ(rig.session(1)->msgs_sent, s2 + 1u) << "the fetched object was not pulled";
+}
+
+// LOW: an explicit per-object vote re-sync can re-pull votes received before.
+TEST(DashCoinP2PPool, gov_vote_resync_repulls_received_votes)
+{
+    PoolRig rig;
+    rig.use_fake_clock();
+    rig.client.set_max_peers(2);
+    rig.client.set_gov_pull(true);
+    rig.handshake(1);
+    p2p::GovOutPoint op;
+    op.hash = nth_hash(7, 0x07);
+    op.index = 3;
+    const uint256 parent = nth_hash(8, 0x08);
+    const int64_t t = 1700000000;
+    const uint256 vid = dash::coin::govvote_identity_hash(op.hash, op.index, parent,
+                                                         1, 1, t);
+    rig.deliver(1, gov_invs(p2p::inventory_type::govobjectvote, {vid}));
+    rig.deliver(1, p2p::message_govobjvote::make_raw(op, parent, int32_t{1}, int32_t{1}, t,
+                                                     std::vector<uint8_t>(96, 0x01)));
+    const uint64_t s1 = rig.session(1)->msgs_sent;
+    rig.deliver(1, gov_invs(p2p::inventory_type::govobjectvote, {vid}));
+    EXPECT_EQ(rig.session(1)->msgs_sent, s1) << "a received vote is not re-pulled";
+    EXPECT_EQ(rig.client.send_govsync(parent), 1u);
+    const uint64_t s2 = rig.session(1)->msgs_sent;
+    rig.deliver(1, gov_invs(p2p::inventory_type::govobjectvote, {vid}));
+    EXPECT_EQ(rig.session(1)->msgs_sent, s2 + 1u) << "the re-synced vote was not re-pulled";
+}
+
+// LOW: retry getdata is chunked at MAX_INV_SZ (seam: chunk of 2 here).
+TEST(DashCoinP2PPool, gov_retry_getdata_is_chunked)
+{
+    PoolRig rig;
+    rig.use_fake_clock();
+    rig.client.set_max_peers(2);
+    rig.client.set_gov_pull(true);
+    rig.client.set_gov_getdata_chunk_for_test(2);
+    rig.handshake(1);
+    rig.handshake(2);
+    std::vector<uint256> objs;
+    for (uint32_t i = 0; i < 5; ++i) objs.push_back(nth_hash(i, 0x05));
+    rig.deliver(1, gov_invs(p2p::inventory_type::govobject, objs));
+    rig.deliver(2, gov_invs(p2p::inventory_type::govobject, objs));
+    const uint64_t s2 = rig.session(2)->msgs_sent;
+    rig.run_seconds(21);
+    EXPECT_EQ(rig.session(2)->msgs_sent, s2 + 3u) << "5 retries in chunks of 2 = 3 getdata";
+}
+
+// LOW: a zero-object answer does not count once objects demonstrably exist.
+TEST(DashCoinP2PPool, govsync_zero_count_answer_does_not_cover_when_objects_exist)
+{
+    PoolRig rig;
+    rig.use_fake_clock();
+    rig.client.set_max_peers(2);
+    rig.client.set_gov_pull(true);
+    rig.handshake(1);
+    rig.handshake(2);
+    GovObjFixture a{std::vector<uint8_t>{'{', '}'}};
+    rig.deliver(1, gov_obj_inv(a.hash()));
+    rig.deliver(1, a.msg());
+    rig.deliver(2, p2p::message_ssc::make_raw(p2p::DASH_MASTERNODE_SYNC_GOVOBJ, 0));
+    EXPECT_FALSE(rig.client.gov_peer_covered(PoolRig::peer_key(2)))
+        << "\"I have nothing\" while an object exists is not coverage";
+    rig.deliver(1, p2p::message_ssc::make_raw(p2p::DASH_MASTERNODE_SYNC_GOVOBJ, 1));
+    EXPECT_TRUE(rig.client.gov_peer_covered(PoolRig::peer_key(1)));
 }

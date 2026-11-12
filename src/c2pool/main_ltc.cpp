@@ -11,6 +11,7 @@
 #include <iostream>
 #include <fstream>
 #include <string>
+#include <cctype>
 #include <map>
 #include <set>
 #include <atomic>
@@ -18,6 +19,7 @@
 #include <chrono>
 #include <csignal>
 #include <ctime>
+#include <optional>
 #include <memory>
 #include <vector>
 #ifndef _WIN32
@@ -29,6 +31,7 @@
 #include <sstream>
 
 // Core includes
+#include <core/view_block_hashes.hpp>   // core::found_block_hashes_in (block_hashes of a view)
 #include <core/settings.hpp>
 #include <core/fileconfig.hpp>
 #include <core/core_util.hpp>
@@ -58,6 +61,7 @@
 #include <impl/ltc/share.hpp>
 #include <impl/ltc/share_check.hpp>
 #include <impl/ltc/auto_ratchet.hpp>
+#include <impl/ltc/solo_payouts.hpp>
 #include <impl/ltc/share_messages.hpp>
 #include <impl/ltc/coin/block.hpp>
 #include <impl/ltc/node.hpp>
@@ -273,10 +277,14 @@ static void segfault_handler(int sig) {
 
 // Integrated merged mining
 #include <c2pool/merged/merged_mining.hpp>
+#include <c2pool/merged/aux_chain_params.hpp>
+#include <c2pool/merged/aux_found_verdict.hpp>
 #include <c2pool/merged/payout_source.hpp>
 #include <c2pool/merged/coin_broadcaster.hpp>
 #include <impl/ltc/coin/mweb_fetch_retry.hpp>
+#include <impl/ltc/coin/mweb_ext_poller.hpp>
 #include <impl/ltc/coin/utxo_order.hpp>
+#include <impl/ltc/coin/utxo_view_stats.hpp>
 #include <impl/ltc/coin/found_block_verify.hpp>
 #include <impl/ltc/coin/header_sync.hpp>
 #include <impl/ltc/coin/cold_start_tick.hpp>
@@ -289,6 +297,10 @@ static void segfault_handler(int sig) {
 #include <impl/doge/coin/utxo_lane.hpp>
 #include <impl/doge/coin/hash_schedule.hpp>
 #include <impl/doge/coin/utxo_full_state.hpp>
+#include <impl/doge/coin/process_memory.hpp>
+#include <impl/doge/coin/store_fds.hpp>
+#include <core/coin/utxo_full_state.hpp>
+#include <core/coin/utxo_lane.hpp>
 #include <impl/doge/coin/header_sync.hpp>
 #include <impl/doge/coin/range_sync.hpp>
 #include <impl/doge/coin/schedule_anchors.hpp>
@@ -567,7 +579,14 @@ void print_help() {
     std::cout << "MERGED MINING (c2pool spec format — alternative):\n";
     std::cout << "  --merged SPEC             SYMBOL:CHAIN_ID:HOST:PORT:USER:PASS[:P2P_PORT]\n";
     std::cout << "                            Example: DOGE:98:192.168.86.29:22555:user:pass\n";
-    std::cout << "                            Can be specified multiple times\n\n";
+    std::cout << "                            Can be specified multiple times\n";
+    std::cout << "  --merged-payout-address SYMBOL:ADDRESS\n";
+    std::cout << "                            Address of that chain given to its daemon's createauxblock\n";
+    std::cout << "                            (the merged coinbase itself pays PPLNS). Required for every\n";
+    std::cout << "                            aux chain with an RPC daemon except DOGE (built-in); checked\n";
+    std::cout << "                            against the chain's own address versions, and a chain without\n";
+    std::cout << "                            a valid one is not mined.\n";
+    std::cout << "                            Can be specified multiple times (YAML: merged_payout_addresses)\n\n";
 
     std::cout << "NETWORK TUNING (accepted for p2pool compatibility):\n";
     std::cout << "  --max-conns N             Max outgoing P2P connections\n";
@@ -593,6 +612,12 @@ void print_help() {
     std::cout << "  --no-doge-utxo-full       Keep the DOGE UTXO set an accrual view (no full set from\n";
     std::cout << "                            genesis; YAML doge_utxo_full: false)\n";
     std::cout << "  --doge-utxo-full-dir PATH The full DOGE UTXO set's LevelDB\n";
+    std::cout << "  --ltc-utxo-full           Build the LTC UTXO set from genesis (strictly connected; the\n";
+    std::cout << "                            templates price against it once it reaches the tip, the\n";
+    std::cout << "                            accrual view until then). Its header chain starts at genesis\n";
+    std::cout << "                            (<data>/litecoin/embedded_headers_full; --header-checkpoint\n";
+    std::cout << "                            is not applied). YAML ltc_utxo_full (default off)\n";
+    std::cout << "  --ltc-utxo-full-dir PATH  The full LTC UTXO set's LevelDB\n";
     std::cout << "                            (default: <data>/dogecoin/utxo_full_leveldb)\n";
     std::cout << "  --dump-doge-schedule-anchors DIR [OUT]  Write the DOGE hash schedule's anchors (the .inc\n";
     std::cout << "                            for src/impl/doge/coin/doge_schedule_anchors.inc) from the DOGE\n";
@@ -603,6 +628,8 @@ void print_help() {
     std::cout << "                            its coins, sync state and best block) and exit\n";
     std::cout << "  --utxo-stats DIR          Print gettxoutsetinfo for the UTXO LevelDB at DIR (Dogecoin\n";
     std::cout << "                            Core 1.14.9's fields and hash_serialized) and exit\n";
+    std::cout << "  --ltc-utxo-stats DIR      Print gettxoutsetinfo for the UTXO LevelDB at DIR (Litecoin\n";
+    std::cout << "                            Core 0.21.4's fields and hash_serialized_2) and exit\n";
     std::cout << "  --ltc-connect IP[:PORT]   Dial only this LTC peer (repeatable): no peer DB, DNS /\n";
     std::cout << "                            fixed / HTTP seeds or addr gossip (Core's -connect)\n";
     std::cout << "  --doge-connect IP[:PORT]  Dial only this DOGE peer (repeatable), as --ltc-connect\n";
@@ -612,7 +639,10 @@ void print_help() {
     std::cout << "                            (pre-retry behaviour) instead of the tip's block once\n";
     std::cout << "  --ltc-mweb-cmpct-provisional  Reserved; not implemented in this build\n";
     std::cout << "  --template-tx-check MODE  LTC template transaction check: strict (refuse /\n";
-    std::cout << "                            HOLD, default) or warn (log and count only)\n\n";
+    std::cout << "                            HOLD, default) or warn (log and count only)\n";
+    std::cout << "  --ltc-mweb-ext MODE       LTC MWEB extension: none (default: empty body, no daemon)\n";
+    std::cout << "                            or litecoind (the local litecoind's mw::Block, HogEx and\n";
+    std::cout << "                            peg-ins, checked; needs --rpcuser / --rpcpassword)\n\n";
 
     std::cout << "COINBASE CUSTOMIZATION:\n";
     std::cout << "  --coinbase-text TEXT       Custom text in coinbase scriptSig (replaces /c2pool/ tag)\n";
@@ -621,6 +651,9 @@ void print_help() {
 
     std::cout << "PRIVATE SHARECHAIN:\n";
     std::cout << "  --network-id ID           Private network identifier (hex, e.g. DEADBEEF)\n";
+    std::cout << "  --v3601-activation-time T Share version 3601 flag day, unix time (testnet or a\n";
+    std::cout << "                            private --network-id chain only; mainnet uses the\n";
+    std::cout << "                            compiled time)\n";
     std::cout << "                            Default: 0 (public p2pool network)\n";
     std::cout << "                            Nonzero: creates a private sharechain. P2P prefix\n";
     std::cout << "                            and THE metadata will carry this ID on the blockchain.\n";
@@ -810,8 +843,12 @@ int main(int argc, char* argv[]) {
     // Interim hardening fix #4: raise RLIMIT_NOFILE to 65536 at startup.
     // One fd per stratum session + HTTP + RPC + P2P + LevelDB — distro-default
     // 1024 starves the accept loop under miner churn. Log the effective limit.
+    // The raise is capped by the hard limit (and on macOS by
+    // kern.maxfilesperproc); a refused raise asks again for half as much.
     {
-        const uint64_t nofile = core::raise_nofile_limit(65536);
+        const core::NofileLimit lim = core::raise_nofile_limit_report(65536);
+        const uint64_t nofile = lim.after;
+        const auto num = [](uint64_t v) { return v == UINT64_MAX ? std::string("unlimited") : std::to_string(v); };
         if (nofile == 0)
 #ifdef _WIN32
             // Windows has no RLIMIT_NOFILE; emit on stdout so the --help smoke
@@ -822,10 +859,12 @@ int main(int argc, char* argv[]) {
             LOG_WARNING << "RLIMIT_NOFILE: unsupported on this platform (or query failed)";
 #endif
         else if (nofile < 65536)
-            LOG_WARNING << "RLIMIT_NOFILE soft limit is " << nofile
-                        << " (< 65536; hard limit too low — raise with ulimit -Hn / limits.conf)";
+            LOG_WARNING << "RLIMIT_NOFILE soft limit is " << num(nofile) << " (was " << num(lim.before)
+                        << "; hard " << num(lim.hard) << ", highest admitted " << num(lim.ceiling)
+                        << "; < 65536: raise with ulimit -Hn / limits.conf / launchctl limit maxfiles)";
         else
-            LOG_INFO << "RLIMIT_NOFILE soft limit: " << nofile;
+            LOG_INFO << "RLIMIT_NOFILE soft limit: " << num(nofile) << " (was " << num(lim.before)
+                     << ", hard " << num(lim.hard) << ")";
     }
 
 
@@ -884,6 +923,12 @@ int main(int argc, char* argv[]) {
     //   doge_utxo_full_dir  its LevelDB (default <data>/dogecoin/utxo_full_leveldb)
     bool        doge_utxo_full = true;
     std::string doge_utxo_full_dir;
+    // The LTC UTXO set built from genesis and strictly connected (#2137 S2),
+    // the same lane and dual-DB transition as DOGE's (core/coin/utxo_lane.hpp):
+    //   ltc_utxo_full      false (default) / true
+    //   ltc_utxo_full_dir  its LevelDB (default <data>/litecoin/utxo_full_leveldb)
+    bool        ltc_utxo_full = false;
+    std::string ltc_utxo_full_dir;
     // Core's -connect for the coin P2P: the LTC / DOGE peers to dial and no
     // other (no peer DB, DNS / fixed / HTTP seeds, addr gossip). HOST[:PORT].
     std::vector<std::string> ltc_connect;
@@ -908,6 +953,13 @@ int main(int argc, char* argv[]) {
     // "strict" refuses (HOLD at ingress, no block at assembly), "warn" logs
     // and counts only (rollback should litecoind's own template trip a rule).
     std::string template_tx_check = "strict";  // --template-tx-check MODE
+    // Where the embedded LTC template's MWEB extension comes from (#2137 S3):
+    // "none" (default): the empty body, c2pool's own HogEx -- daemonless;
+    // "litecoind": the local litecoind's getblocktemplate extension (its
+    // mw::Block, HogEx and peg-ins), checked against c2pool's own MWEB state
+    // and replaced by the empty body on any mismatch. Needs the LTC RPC
+    // settings (--rpcuser / --rpcpassword, ltc_rpc_user / ltc_rpc_password).
+    std::string ltc_mweb_ext = "none";         // --ltc-mweb-ext MODE
     Blockchain blockchain = Blockchain::LITECOIN;  // Default to Litecoin
     std::string blockchain_label = "ltc";  // Raw coin string -> web layer node_symbol() fallback (config-driven labeling)
 
@@ -919,6 +971,10 @@ int main(int argc, char* argv[]) {
     // p2pool-style: --merged-coind-address, --merged-coind-rpc-port, etc.
     // c2pool-style: --merged SYMBOL:CHAIN_ID:HOST:PORT:USER:PASS[:P2P_PORT]
     std::vector<std::string> merged_chain_specs;
+    // --merged-payout-address SYMBOL:ADDRESS: the address each aux chain's
+    // createauxblock gets (its PPLNS coinbase is c2pool's own; the daemon
+    // only needs an address of its chain). Keyed by upper-case symbol.
+    std::map<std::string, std::string> merged_payout_addresses;
     // p2pool-style merged chain flags (assembled into spec at the end)
     std::string merged_coind_address;
     int         merged_coind_rpc_port = 0;
@@ -990,6 +1046,7 @@ int main(int argc, char* argv[]) {
 
     // Private sharechain
     uint64_t network_id = 0;        // 0 = public p2pool network, nonzero = private (full 8 bytes)
+    std::optional<uint64_t> v3601_activation_time;   // testnet / private chain only
     std::string prefix_override_hex; // explicit --prefix; empty = compiled per-network default
 
     // Startup mode: wait (default, p2pool persist=true), genesis, auto
@@ -1232,6 +1289,10 @@ int main(int argc, char* argv[]) {
             template_tx_check = argv[++i];
             cli_explicit.insert("template_tx_check");
         }
+        else if (arg == "--ltc-mweb-ext" && i + 1 < argc) {
+            ltc_mweb_ext = argv[++i];
+            cli_explicit.insert("ltc_mweb_ext");
+        }
         else if (arg == "--doge-p2p-address" && i + 1 < argc) {
             doge_p2p_address = argv[++i];
             cli_explicit.insert("doge_p2p_address");
@@ -1251,6 +1312,18 @@ int main(int argc, char* argv[]) {
         else if (arg == "--doge-utxo-full-dir" && i + 1 < argc) {
             doge_utxo_full_dir = argv[++i];
             cli_explicit.insert("doge_utxo_full_dir");
+        }
+        else if (arg == "--ltc-utxo-full") {
+            ltc_utxo_full = true;
+            cli_explicit.insert("ltc_utxo_full");
+        }
+        else if (arg == "--no-ltc-utxo-full") {
+            ltc_utxo_full = false;
+            cli_explicit.insert("ltc_utxo_full");
+        }
+        else if (arg == "--ltc-utxo-full-dir" && i + 1 < argc) {
+            ltc_utxo_full_dir = argv[++i];
+            cli_explicit.insert("ltc_utxo_full_dir");
         }
         else if (arg == "--ltc-connect" && i + 1 < argc) {
             ltc_connect.push_back(argv[++i]);
@@ -1348,6 +1421,53 @@ int main(int argc, char* argv[]) {
                       << st.hash_serialized.GetHex() << "\",\"total_amount\":" << total << "}\n";
             return 0;
         }
+        else if (arg == "--ltc-utxo-stats" && i + 1 < argc) {
+            // gettxoutsetinfo of a UTXO LevelDB, Litecoin Core 0.21.4's
+            // GetUTXOStats (hash_serialized_2; #2137): the LTC full set
+            // against litecoind at the same best block. No node is started.
+            const std::string dir = argv[++i];
+            if (!std::filesystem::exists(std::filesystem::path(dir) / "CURRENT")) {
+                std::cerr << "ltc-utxo-stats: no LevelDB at " << dir << "\n";
+                return 1;
+            }
+            core::coin::UTXOViewDB db(dir);
+            if (!db.open()) {
+                std::cerr << "ltc-utxo-stats: cannot open " << dir << " (in use by a running node?)\n";
+                return 1;
+            }
+            const auto t0 = std::chrono::steady_clock::now();
+            const auto st = core::coin::utxo_stats_ltc(db, [&t0](uint64_t records) {
+                const auto secs = std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::steady_clock::now() - t0).count();
+                std::cerr << "ltc-utxo-stats: " << records << " records scanned (" << secs << " s)\n";
+            });
+            if (!st.ok) {
+                std::cerr << "ltc-utxo-stats: scan error in " << dir << "\n";
+                return 1;
+            }
+            const std::string total = core::coin::format_coin_amount(st.total_amount);
+            std::cout << "ltc-utxo-stats " << dir << "\n"
+                      << "  height             " << st.best_height << "\n"
+                      << "  bestblock          " << st.best_block.GetHex() << "\n"
+                      << "  transactions       " << st.transactions << "\n"
+                      << "  txouts             " << st.txouts << "\n"
+                      << "  bogosize           " << st.bogosize << "\n"
+                      << "  hash_serialized_2  " << st.hash_serialized.GetHex() << "\n"
+                      << "  total_amount       " << total << "\n";
+            if (st.sync.tracked())
+                std::cout << "  sync               anchor=" << st.sync.anchor_height << " strict=" << int(st.sync.strict)
+                          << " synced=" << int(st.sync.synced) << " coins=" << st.sync.coins << "\n";
+            else
+                std::cout << "  sync               none (an accrual view: anchor unknown)\n";
+            if (st.unspendable_skipped)
+                std::cout << "  WARNING            " << st.unspendable_skipped
+                          << " unspendable records skipped (Core never stores one)\n";
+            std::cout << "{\"height\":" << st.best_height << ",\"bestblock\":\"" << st.best_block.GetHex()
+                      << "\",\"transactions\":" << st.transactions << ",\"txouts\":" << st.txouts
+                      << ",\"bogosize\":" << st.bogosize << ",\"hash_serialized_2\":\""
+                      << st.hash_serialized.GetHex() << "\",\"total_amount\":" << total << "}\n";
+            return 0;
+        }
         else if (arg == "--config" && i + 1 < argc) {
             config_file = argv[++i];
         }
@@ -1410,6 +1530,18 @@ int main(int argc, char* argv[]) {
             merged_chain_specs.push_back(argv[++i]);
             cli_explicit.insert("merged");
         }
+        else if (arg == "--merged-payout-address" && i + 1 < argc) {
+            const std::string v = argv[++i];
+            const auto colon = v.find(':');
+            if (colon == std::string::npos || colon == 0 || colon + 1 == v.size()) {
+                std::cerr << "--merged-payout-address expects SYMBOL:ADDRESS, got: " << v << std::endl;
+                return 1;
+            }
+            std::string sym = v.substr(0, colon);
+            for (auto& c : sym) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+            merged_payout_addresses[sym] = v.substr(colon + 1);
+            cli_explicit.insert("merged_payout_addresses");
+        }
         // p2pool-style merged chain flags
         else if (arg == "--merged-coind-address" && i + 1 < argc) {
             merged_coind_address = argv[++i];
@@ -1463,6 +1595,10 @@ int main(int argc, char* argv[]) {
         else if (arg == "--coinbase-text" && i + 1 < argc) {
             coinbase_text = argv[++i];
             cli_explicit.insert("coinbase_text");
+        }
+        else if (arg == "--v3601-activation-time" && i + 1 < argc) {
+            v3601_activation_time = std::stoull(argv[++i]);
+            cli_explicit.insert("v3601_activation_time");
         }
         else if ((arg == "--network-id" || arg == "--chain-id") && i + 1 < argc) {
             // Full 8-byte identifier: parse as 64-bit, never truncate to 32 bits
@@ -1703,6 +1839,15 @@ int main(int argc, char* argv[]) {
                 for (const auto& item : cfg["merged"])
                     merged_chain_specs.push_back(item.as<std::string>());
             }
+            // merged_payout_addresses: {PEP: <address>, ...} (CLI replaces)
+            if (!cli_explicit.count("merged_payout_addresses") && cfg["merged_payout_addresses"]
+                && cfg["merged_payout_addresses"].IsMap()) {
+                for (const auto& kv : cfg["merged_payout_addresses"]) {
+                    std::string sym = kv.first.as<std::string>();
+                    for (auto& c : sym) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                    merged_payout_addresses[sym] = kv.second.as<std::string>();
+                }
+            }
 
             // Embedded SPV checkpoints
             if (!cli_explicit.count("header_checkpoint") && cfg["header_checkpoint"])
@@ -1713,6 +1858,10 @@ int main(int argc, char* argv[]) {
                 doge_utxo_full = cfg["doge_utxo_full"].as<bool>();
             if (!cli_explicit.count("doge_utxo_full_dir") && cfg["doge_utxo_full_dir"])
                 doge_utxo_full_dir = cfg["doge_utxo_full_dir"].as<std::string>();
+            if (!cli_explicit.count("ltc_utxo_full") && cfg["ltc_utxo_full"])
+                ltc_utxo_full = cfg["ltc_utxo_full"].as<bool>();
+            if (!cli_explicit.count("ltc_utxo_full_dir") && cfg["ltc_utxo_full_dir"])
+                ltc_utxo_full_dir = cfg["ltc_utxo_full_dir"].as<std::string>();
 
             // Embedded LTC block relay (see the declarations)
             if (!cli_explicit.count("ltc_cmpct_v3") && cfg["ltc_cmpct_v3"])
@@ -1727,6 +1876,9 @@ int main(int argc, char* argv[]) {
             // Template-tx check mode (see the declaration)
             if (!cli_explicit.count("template_tx_check") && cfg["template_tx_check"])
                 template_tx_check = cfg["template_tx_check"].as<std::string>();
+            // MWEB extension source (see the declaration)
+            if (!cli_explicit.count("ltc_mweb_ext") && cfg["ltc_mweb_ext"])
+                ltc_mweb_ext = cfg["ltc_mweb_ext"].as<std::string>();
 
             // Coin daemon P2P broadcaster
             if (!cli_explicit.count("coind_p2p_port") && cfg["coind_p2p_port"])
@@ -1761,6 +1913,10 @@ int main(int argc, char* argv[]) {
             // Private sharechain identifier, hex (CLI --network-id/--chain-id takes precedence)
             if (!cli_explicit.count("network_id") && cfg["network_id"])
                 network_id = std::stoull(cfg["network_id"].as<std::string>(), nullptr, 16);
+            // Share version 3601 flag day (testnet / private chain only; the
+            // mainnet refusal below applies whatever the source)
+            if (!cli_explicit.count("v3601_activation_time") && cfg["v3601_activation_time"])
+                v3601_activation_time = cfg["v3601_activation_time"].as<uint64_t>();
 
             // Stratum tuning
             if (!cli_explicit.count("stratum_min_diff") && cfg["min_difficulty"])
@@ -1848,6 +2004,41 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // ltc_mweb_ext: none | litecoind. litecoind needs the LTC RPC settings
+    // (the user and password; the host defaults to 127.0.0.1 and the port to
+    // the network's). Refused here, before anything starts.
+    if (ltc_mweb_ext != "none" && ltc_mweb_ext != "litecoind") {
+        const std::string msg = "ltc_mweb_ext \"" + ltc_mweb_ext + "\": must be none or litecoind";
+        LOG_ERROR << msg;
+        std::cerr << "c2pool: " << msg << std::endl;
+        return 1;
+    }
+    if (ltc_mweb_ext == "litecoind" && (rpc_user.empty() || rpc_pass.empty())) {
+        const std::string msg = "ltc_mweb_ext litecoind needs the LTC RPC settings: --rpcuser and"
+                                " --rpcpassword (config ltc_rpc_user / ltc_rpc_password), and --rpchost /"
+                                " --rpcport unless litecoind listens on 127.0.0.1 at the network's port";
+        LOG_ERROR << msg;
+        std::cerr << "c2pool: " << msg << std::endl;
+        return 1;
+    }
+    // Its getblocktemplate poller connects to an IP address: a name would
+    // need a DNS query no timeout bounds (the LAN-only runs allow none).
+    // "localhost" is 127.0.0.1. Only the embedded node runs the poller: in
+    // RPC mode --rpchost is used as before, a name included.
+    if (ltc_mweb_ext == "litecoind" && embedded_ltc) {
+        if (rpc_host == "localhost")
+            rpc_host = "127.0.0.1";
+        boost::system::error_code ec;
+        boost::asio::ip::make_address(rpc_host, ec);
+        if (ec) {
+            const std::string msg = "ltc_mweb_ext litecoind: --rpchost " + rpc_host
+                + " is not an IP address (an IPv4 or IPv6 literal; a name is not resolved)";
+            LOG_ERROR << msg;
+            std::cerr << "c2pool: " << msg << std::endl;
+            return 1;
+        }
+    }
+
     // ---- M0b control-plane wiring ------------------------------------------
     // compiled defaults (L0) -> settings file (L1, TOML) -> CLI (L2). No file =>
     // a structural no-op (AbsentOk) so the locals/settings above are today's
@@ -1900,6 +2091,10 @@ int main(int argc, char* argv[]) {
         if (rc.file_set("money.give_author_pct"))    dev_donation   = rc.get_double("money.give_author_pct").value_or(dev_donation);
         if (rc.file_set("money.node_owner_address")) node_owner_address = rc.get_string("money.node_owner_address").value_or(node_owner_address);
         if (rc.file_set("money.payout_address"))     payout_address = rc.get_string("money.payout_address").value_or(payout_address);
+        if (rc.file_set("sharechain.v3601_activation_time") && !cli_explicit.count("v3601_activation_time")) {
+            if (const auto v = rc.get_i64("sharechain.v3601_activation_time"); v && *v >= 0)
+                v3601_activation_time = static_cast<uint64_t>(*v);
+        }
     }
 
     // WAIT mode: block genesis share creation until peers deliver the
@@ -2038,9 +2233,68 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // The fd limit split between the stores and the sockets
+    // (doge::coin::FdPlan): under a tight limit (a hard limit near macOS's
+    // 256) the stores' tables are mapped, then the peer, stratum and HTTP
+    // caps lowered, so that no store or accept runs out of fds at run time.
+    const uint64_t fd_limit = core::raise_nofile_limit(65536);   // already raised: the limit in effect
+    const bool fd_limit_known = fd_limit != 0 && fd_limit != UINT64_MAX;
+    doge::coin::FdPlan fd_plan;
+    {
+        doge::coin::FdWants w;
+        w.doge_headers = embedded_doge;
+        w.doge_full = embedded_doge && doge_utxo_full;
+        w.ltc_full = embedded_ltc && ltc_utxo_full;
+        int other_merged = 0;
+        for (const auto& spec : merged_chain_specs)
+            if (spec.substr(0, 4) != "DOGE" && spec.substr(0, 4) != "doge")
+                ++other_merged;
+        // The sharechain and found-block stores; LTC's header store and
+        // accrual set; DOGE's accrual set; a header store per other merged chain.
+        w.other_dbs = 2 + (embedded_ltc ? 2 : 0) + (embedded_doge ? 1 : 0) + other_merged;
+        w.merged_chains = static_cast<int>(merged_chain_specs.size());
+        w.sharechain_peers = p2p_max_peers;
+        w.stratum = stratum_config.max_stratum_connections;
+        fd_plan = doge::coin::FdPlan::make(fd_limit, w);
+        if (fd_limit_known) {
+            if (!fd_plan.fits) {
+                LOG_ERROR << "RLIMIT_NOFILE soft limit " << fd_limit << " cannot hold the stores (" << fd_plan.stores
+                          << " fds at most) and the fewest sockets the node runs with (" << fd_plan.sockets
+                          << "): raise it (ulimit -n; launchctl limit maxfiles on macOS)";
+                return 1;
+            }
+            if (fd_plan.mapped)
+                LOG_WARNING << "RLIMIT_NOFILE " << fd_limit << ": tables mapped (no fd kept per table, more"
+                            << " resident memory): DOGE header store " << (fd_plan.doge_headers.mmap_reads ? "yes" : "no")
+                            << ", DOGE full set " << (fd_plan.doge_full.mmap_reads ? "yes" : "no")
+                            << ", LTC full set " << (fd_plan.ltc_full.mmap_reads ? "yes" : "no");
+            if (fd_plan.trimmed)
+                LOG_WARNING << "RLIMIT_NOFILE " << fd_limit << " is too low for the configured socket caps beside the"
+                            << " stores (" << fd_plan.stores << " fds at most): LTC peers " << w.ltc_peers << " -> "
+                            << fd_plan.ltc_peers << ", merged peers " << w.merged_peers << " -> " << fd_plan.merged_peers
+                            << " per chain, sharechain peers " << w.sharechain_peers << " -> " << fd_plan.sharechain_peers
+                            << ", max_stratum_connections " << w.stratum << " -> " << fd_plan.stratum
+                            << ", HTTP sessions " << fd_plan.http << "; raise the limit (ulimit -n) for the full caps";
+            stratum_config.max_stratum_connections = fd_plan.stratum;
+            p2p_max_peers = fd_plan.sharechain_peers;
+        }
+    }
+
     // If --address was given without --node-owner-address, use it for node owner too
     if (!payout_address.empty() && node_owner_address.empty() && node_owner_fee > 0.0)
         node_owner_address = payout_address;
+
+    // --solo / --custodial build their jobs on the global coinbase, which has
+    // no extranonce slot without a ref_hash: the miners' 8 extranonce bytes
+    // land after the last output and every block they find is invalid
+    // (bad-txnmrklroot; shares are still accepted, so nothing shows it).
+    // Refused until that is fixed, before anything binds.
+    if (solo_mode || custodial_mode) {
+        const char* msg = "--solo/--custodial are not supported in this release: blocks would be invalid; use pool mode";
+        LOG_ERROR << msg;
+        std::cerr << msg << std::endl;
+        return 1;
+    }
 
     // Guard against port conflicts between stratum and web dashboard
     if (stratum_port == http_port) {
@@ -2163,6 +2417,14 @@ int main(int argc, char* argv[]) {
             std::unique_ptr<ltc::coin::HeaderChain>     embedded_chain;
             std::unique_ptr<ltc::coin::Mempool>         embedded_pool;
             std::unique_ptr<c2pool::merged::CoinBroadcaster> embedded_broadcaster;
+            // The MWEB extension's source and its getblocktemplate poller
+            // (ltc_mweb_ext, #2137 S3). The source exists in every mode (its
+            // /local_stats block); the poller only with litecoind, and the
+            // ordered shutdown stops it first. Declared before the embedded
+            // node, which holds the source: it outlives the node.
+            auto ltc_mweb_ext_src = std::make_unique<ltc::coin::mweb_ext::MwebExtSource>(ltc_mweb_ext);
+            std::unique_ptr<ltc::coin::mweb_ext::MwebExtPoller> ltc_mweb_ext_poller;
+            auto ltc_mweb_ext_alive = std::make_shared<std::atomic<bool>>(true);
             std::unique_ptr<ltc::coin::MWEBTracker>     mweb_tracker;
             std::unique_ptr<ltc::coin::EmbeddedCoinNode> embedded_node;
             // The header-validation pools (LTC, DOGE, NMC): their tasks use the
@@ -2172,6 +2434,13 @@ int main(int argc, char* argv[]) {
             // UTXO set for fee computation (block reward + mempool tx fees)
             std::unique_ptr<core::coin::UTXOViewDB>     ltc_utxo_db;
             std::unique_ptr<core::coin::UTXOViewCache>  ltc_utxo_cache;
+            // The full LTC UTXO set (--ltc-utxo-full, #2137 S2): its DB, its
+            // cache, its lane's thread and the state shared with its handlers.
+            std::unique_ptr<core::coin::UTXOViewDB>     ltc_full_db;
+            std::unique_ptr<core::coin::UTXOViewCache>  ltc_full_cache;
+            std::shared_ptr<boost::asio::thread_pool>   ltc_full_pool;
+            std::shared_ptr<core::coin::UtxoLane>       ltc_full_lane;
+            auto ltc_full = std::make_shared<core::coin::UtxoFullState>();
 
             // ── Timer heartbeat tracking ────────────────────────────────
             // Each recurring timer stores its last-fired timestamp (ms).
@@ -2220,7 +2489,11 @@ int main(int argc, char* argv[]) {
                 log_shutdown_signal();
                 start_shutdown_watchdog();
                 // 1. No new work: the HTTP API and stratum, the coin peers (no
-                //    more blocks, headers or txs), the merged-mining poll.
+                //    more blocks, headers or txs), the merged-mining poll, the
+                //    MWEB extension's getblocktemplate poller.
+                ltc_mweb_ext_alive->store(false);
+                if (ltc_mweb_ext_poller)
+                    ltc_mweb_ext_poller->stop();
                 web_server.stop();
                 // The mining interface's background threads run this scope's
                 // callbacks (the PPLNS walk: a detached thread read a freed
@@ -2230,6 +2503,7 @@ int main(int argc, char* argv[]) {
                     embedded_broadcaster->stop();
                 if (shutdown_stop_merged)
                     shutdown_stop_merged();
+                ltc_full->stopping = true;
                 // 2. The workers: the header pools and the DOGE full lane's
                 //    pool drop their queued tasks and are joined (the lanes end
                 //    a drain after the block being connected, each flushed when
@@ -2238,6 +2512,8 @@ int main(int argc, char* argv[]) {
                 std::vector<std::string> still_running = worker_pools.stop_and_join(POOLS_DEADLINE);
                 if (shutdown_join_lane && !shutdown_join_lane(POOLS_DEADLINE))
                     still_running.push_back("DOGE full set");
+                if (ltc_full_pool && !core::stop_and_join_within(ltc_full_pool, POOLS_DEADLINE))
+                    still_running.push_back("LTC full set");
                 if (shutdown_join_compute && !shutdown_join_compute(COMPUTE_DEADLINE))
                     still_running.push_back("sharechain compute");
                 if (!still_running.empty()) {
@@ -2252,6 +2528,9 @@ int main(int argc, char* argv[]) {
                 }
                 // 3. Flush, then the scope closes the stores.
                 web_server.get_mining_interface()->save_stat_log();
+                if (ltc_full_db)
+                    LOG_INFO << "[EMB-LTC] Full UTXO set at h=" << ltc_full_db->get_best_height()
+                             << " on shutdown (a restart resumes there)";
                 if (shutdown_flush)
                     shutdown_flush();
                 enhanced_node->shutdown();
@@ -2282,8 +2561,55 @@ int main(int argc, char* argv[]) {
                 stratum_config.payout_p2pkh_versions = acc.p2pkh_versions;
                 stratum_config.payout_p2sh_versions  = acc.p2sh_versions;
                 stratum_config.payout_bech32_hrps    = acc.bech32_hrps;
+                // LTC's versions on every network: a login address LTC could
+                // own is never identified as a merged chain's.
+                for (bool tn : {false, true}) {
+                    const auto a = ltc::address_acceptance(tn);
+                    for (const auto* vs : {&a.p2pkh_versions, &a.p2sh_versions})
+                        for (auto v : *vs)
+                            if (std::find(stratum_config.merged_parent_versions.begin(),
+                                          stratum_config.merged_parent_versions.end(), v)
+                                == stratum_config.merged_parent_versions.end())
+                                stratum_config.merged_parent_versions.push_back(v);
+                }
+            }
+            stratum_config.merged_chains_expected = !merged_chain_specs.empty();
+            // A login without a usable payout address is redistributed
+            // (--redistribute), as p2pool does, not refused.
+            stratum_config.redistribute_unusable_logins = true;
+            // The merged addresses of the operator's own shares (node-fee
+            // shares, redistributed shares landing on the operator's key):
+            // p2pool's --merged-operator-address cascade, per merged chain.
+            if (node_owner_fee > 0.0 && !node_owner_address.empty() && !merged_chain_specs.empty()) {
+                std::map<uint32_t, std::vector<unsigned char>> op_scripts;
+                const std::vector<unsigned char> donation(ltc::PoolConfig::COMBINED_DONATION_SCRIPT.begin(),
+                                                          ltc::PoolConfig::COMBINED_DONATION_SCRIPT.end());
+                for (const auto& spec : merged_chain_specs) {
+                    const auto c1 = spec.find(':');
+                    if (c1 == std::string::npos)
+                        continue;
+                    std::string sym = spec.substr(0, c1);
+                    for (auto& c : sym) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                    uint32_t cid = 0;
+                    try { cid = static_cast<uint32_t>(std::stoul(spec.substr(c1 + 1))); } catch (...) { continue; }
+                    const auto ov = merged_payout_addresses.find(sym);
+                    const auto o = c2pool::merged::resolve_operator_merged_script(
+                        sym, settings->m_testnet ? c2pool::merged::AuxNetwork::testnet
+                                                 : c2pool::merged::AuxNetwork::mainnet,
+                        node_owner_address, node_owner_merged_address,
+                        ov != merged_payout_addresses.end() ? ov->second : std::string(), donation);
+                    if (!o.warning.empty())
+                        LOG_WARNING << "[MM:" << sym << "] " << o.warning << ": the node fee's " << sym
+                                    << " payout uses " << o.source;
+                    LOG_INFO << "[MM:" << sym << "] node-fee shares pay " << sym << " to the operator ("
+                             << o.source << ")";
+                    op_scripts[cid] = o.script;
+                }
+                web_server.get_mining_interface()->set_operator_merged_scripts(std::move(op_scripts));
             }
             web_server.get_mining_interface()->set_stratum_config(stratum_config);
+            if (fd_limit_known)
+                web_server.set_max_http_connections(fd_plan.http);
             // Template-tx check mode (template ingress and block assembly).
             if (template_tx_check != "strict" && template_tx_check != "warn") {
                 LOG_WARNING << "[Config] template_tx_check \"" << template_tx_check
@@ -2345,9 +2671,12 @@ int main(int argc, char* argv[]) {
 
                 // LevelDB-backed header chain for persistence across restarts
                 // Use absolute path under ~/.c2pool/ (matches sharechain + found_blocks)
+                // The full UTXO set (--ltc-utxo-full) places every height from
+                // genesis by the header chain: its own store, from genesis (no
+                // checkpoint), so turning it off returns to the checkpointed one.
                 std::string chain_db_path = (core::filesystem::config_path()
                     / (settings->m_testnet ? "litecoin_testnet" : "litecoin")
-                    / "embedded_headers").string();
+                    / (ltc_utxo_full ? "embedded_headers_full" : "embedded_headers")).string();
                 LOG_INFO << "[EMB-LTC] Creating HeaderChain with DB at " << chain_db_path;
                 embedded_chain = std::make_unique<ltc::coin::HeaderChain>(ltc_params, chain_db_path);
                 // Retry init up to 5 times (previous process may still hold LevelDB lock)
@@ -2381,22 +2710,25 @@ int main(int argc, char* argv[]) {
                 constexpr uint32_t LTC_BLOCK_PERIOD = 150; // seconds
                 uint32_t score_backlog = 5 * ltc::PoolConfig::share_period()
                     * ltc::PoolConfig::chain_length() / LTC_BLOCK_PERIOD;
-                if (!header_checkpoint_str.empty()) {
-                    auto colon = header_checkpoint_str.find(':');
-                    if (colon != std::string::npos) {
-                        uint32_t cp_height = static_cast<uint32_t>(std::stoul(header_checkpoint_str.substr(0, colon)));
-                        uint256 cp_hash;
-                        cp_hash.SetHex(header_checkpoint_str.substr(colon + 1));
-                        if (!cp_hash.IsNull()) {
-                            embedded_chain->set_dynamic_checkpoint(cp_height, cp_hash);
-                            // Warn if checkpoint doesn't provide enough backlog
-                            // for accurate share chain scoring.  Operators should
-                            // set the checkpoint at least score_backlog blocks
-                            // before the current network tip.
-                            LOG_INFO << "[EMB-LTC] Score backlog needed: " << score_backlog
-                                     << " blocks before network tip"
-                                     << " (checkpoint at height " << cp_height << ")";
-                        }
+                // After init() (which loaded the store and verified the PoW of
+                // any header it held unverified): the checkpoint. Full mode
+                // starts at genesis (every header's PoW verified, on the header
+                // threads) and pins it without seeding it; otherwise it is
+                // pinned and seeded as the root when above the tip.
+                if (const auto cp = ltc::coin::parse_header_checkpoint(header_checkpoint_str)) {
+                    if (ltc_utxo_full) {
+                        embedded_chain->pin_checkpoint(cp->first, cp->second);
+                        LOG_INFO << "[EMB-LTC] Full UTXO set: the header chain starts at genesis; checkpoint "
+                                 << cp->first << " pinned (not seeded)";
+                    } else {
+                        embedded_chain->set_dynamic_checkpoint(cp->first, cp->second);
+                        // Warn if checkpoint doesn't provide enough backlog
+                        // for accurate share chain scoring.  Operators should
+                        // set the checkpoint at least score_backlog blocks
+                        // before the current network tip.
+                        LOG_INFO << "[EMB-LTC] Score backlog needed: " << score_backlog
+                                 << " blocks before network tip"
+                                 << " (checkpoint at height " << cp->first << ")";
                     }
                 }
 
@@ -2477,26 +2809,189 @@ int main(int argc, char* argv[]) {
                         }
                     }
                 }
+                // The full LTC UTXO set (--ltc-utxo-full, #2137 S2), DOGE's dual DB:
+                // built from genesis and strictly connected by its own lane (below).
+                // At a start where it is built from genesis, synced and no more
+                // than LTC_MIN_BLOCKS_TO_KEEP behind the header tip it prices the
+                // templates at once; otherwise the accrual set prices while it
+                // catches up, and the pool switches when it completes. It places
+                // every height by the header chain, which therefore starts at
+                // genesis in this mode (embedded_headers_full).
+                if (ltc_utxo_full && !embedded_chain->get_header_by_height(0)) {
+                    LOG_ERROR << "[EMB-LTC] Full UTXO set: the header chain does not start at genesis"
+                              << " (its store holds a checkpointed chain) — the full set is off";
+                } else if (ltc_utxo_full) {
+                    const std::string full_path = !ltc_utxo_full_dir.empty()
+                        ? ltc_utxo_full_dir
+                        : (core::filesystem::config_path()
+                           / (settings->m_testnet ? "litecoin_testnet" : "litecoin")
+                           / "utxo_full_leveldb").string();
+                    // DOGE's full-set options: written once per block for millions
+                    // of blocks; tables read with pread in 32 MB files, one fd per
+                    // open table, drawn from the raised soft limit
+                    // (doge::coin::StoreFds); malloc arenas limited.
+                    core::LevelDBOptions full_opts;
+                    full_opts.write_buffer_size = 64 * 1024 * 1024;
+                    full_opts.block_cache_size = 128 * 1024 * 1024;
+                    // Its own share of the fd budget beside DOGE's header store and
+                    // full set (StoreFds::ltc_full_set, as FdPlan planned it): pread
+                    // while it fits, else mapped tables (no fd kept per table).
+                    const auto fd_share = fd_plan.ltc_full;
+                    full_opts.max_open_files = fd_share.max_open_files;
+                    full_opts.max_file_size = 32 * 1024 * 1024;
+                    full_opts.mmap_reads = fd_share.mmap_reads;
+                    if (fd_share.mmap_reads)
+                        LOG_WARNING << "[EMB-LTC] Full UTXO set: the fd limit leaves no table budget beside DOGE's"
+                                    << " stores; its tables are mapped (no fd kept per table, more resident memory)";
+                    doge::coin::ProcessMemory::limit_arenas();
+                    // A set another c2pool holds is waited for, 5 x 2 s; still
+                    // held, this node exits (the templates would otherwise price
+                    // against the accrual set for the whole run).
+                    for (int attempt = 1;; ++attempt) {
+                        ltc_full_db = std::make_unique<core::coin::UTXOViewDB>(full_path, full_opts);
+                        if (ltc_full_db->open())
+                            break;
+                        ltc_full_db.reset();
+                        core::LevelDBStore probe(full_path, full_opts);
+                        const bool held = !probe.open() && probe.lock_held();
+                        probe.close();
+                        if (!held)
+                            break;
+                        if (attempt >= 5) {
+                            const std::string msg = "the LTC full UTXO set " + full_path
+                                + " is held by another c2pool; " + core::LevelDBStore::held_advice() + ". Exiting";
+                            LOG_ERROR << "[EMB-LTC] " << msg;
+                            std::cerr << "c2pool: " << msg << std::endl;
+                            std::_Exit(EXIT_FAILURE);
+                        }
+                        LOG_WARNING << "[EMB-LTC] Full UTXO set at " << full_path << " is held by another open"
+                                    << " (attempt " << attempt << "/5): again in 2 s";
+                        std::this_thread::sleep_for(std::chrono::seconds(2));
+                    }
+                    if (ltc_full_db) {
+                        ltc_full_cache = std::make_unique<core::coin::UTXOViewCache>(ltc_full_db.get());
+                        const auto full_ss = ltc_full_db->get_sync_state();
+                        const bool live = core::coin::UtxoFullState::start_live(
+                            full_ss, ltc_full_db->get_best_height(), embedded_chain->height(),
+                            core::coin::LTC_MIN_BLOCKS_TO_KEEP);
+                        ltc_full->schedule_ready.store(true);  // a header chain from genesis
+                        LOG_INFO << "[EMB-LTC] Full UTXO set at " << full_path << ": best_height="
+                                 << ltc_full_db->get_best_height() << " anchor="
+                                 << (full_ss.tracked() ? std::to_string(full_ss.anchor_height) : std::string("none"))
+                                 << " synced=" << int(full_ss.synced) << " coins=" << full_ss.coins
+                                 << " header_height=" << embedded_chain->height()
+                                 << (live ? " — the templates price against it"
+                                          : " — catching up; the accrual set prices meanwhile");
+                        if (live) {
+                            ltc_full->live.store(true);
+                            embedded_pool->set_utxo(ltc_full_cache.get());
+                        }
+                    } else {
+                        LOG_ERROR << "[EMB-LTC] Full UTXO set DB failed to open at " << full_path
+                                  << " — accrual set only";
+                    }
+                }
                 mweb_tracker    = std::make_unique<ltc::coin::MWEBTracker>();
                 embedded_node   = std::make_unique<ltc::coin::EmbeddedCoinNode>(
                     *embedded_chain, *embedded_pool, settings->m_testnet, mweb_tracker.get());
                 embedded_node->set_template_tx_check_strict(template_tx_check_strict);
+                // ltc_mweb_ext litecoind (#2137 S3): the templates take the
+                // local litecoind's MWEB extension when it checks out against
+                // the tip's MWEB state. Its getblocktemplate is polled on a
+                // worker thread (every tip change, every 5 s while it is for
+                // the tip, 3 s timeout); the builder reads only the last one.
+                if (ltc_mweb_ext_src->enabled()) {
+                    embedded_node->set_mweb_ext(ltc_mweb_ext_src.get());
+                    const int ext_rpc_port = rpc_port > 0 ? rpc_port : (settings->m_testnet ? 19332 : 9332);
+                    const ltc::coin::mweb_ext::RpcEndpoint ext_ep{
+                        rpc_host, static_cast<uint16_t>(ext_rpc_port), rpc_user + ":" + rpc_pass};
+                    // Worker-thread state of the deliver callback.
+                    struct ExtDeliverState {
+                        std::pair<uint256, uint256> last_key;  // (prev, HogEx txid) of the last G
+                        bool failing{false};
+                        std::chrono::steady_clock::time_point last_warn{};
+                    };
+                    auto ext_state = std::make_shared<ExtDeliverState>();
+                    ltc_mweb_ext_poller = std::make_unique<ltc::coin::mweb_ext::MwebExtPoller>(
+                        [ext_ep]() {
+                            return ltc::coin::mweb_ext::fetch_gbt(ext_ep, std::chrono::milliseconds(3000));
+                        },
+                        [src = ltc_mweb_ext_src.get(), ext_state, alive = ltc_mweb_ext_alive,
+                         chain = embedded_chain.get(), ext_ep, &web_server, &ioc](
+                            ltc::coin::mweb_ext::FetchResult&& r, const uint256&) {
+                            src->note_fetch(r.ok, r.timeout, r.ms, r.error);
+                            const auto now = std::chrono::steady_clock::now();
+                            if (!r.ok) {
+                                if (!ext_state->failing || now - ext_state->last_warn > std::chrono::minutes(5)) {
+                                    LOG_WARNING << "[EMB-LTC] MWEB extension: getblocktemplate from litecoind at "
+                                                << ext_ep.host << ":" << ext_ep.port << " failed ("
+                                                << (r.timeout ? "timeout: " : "") << r.error << ", " << r.ms
+                                                << " ms); templates keep the last G only while it is for the tip";
+                                    ext_state->last_warn = now;
+                                }
+                                ext_state->failing = true;
+                                return;
+                            }
+                            if (ext_state->failing)
+                                LOG_INFO << "[EMB-LTC] MWEB extension: litecoind answers again (" << r.ms << " ms)";
+                            ext_state->failing = false;
+                            auto parsed = ltc::coin::mweb_ext::parse_extension(r.result);
+                            bool changed = false;
+                            uint256 prev;
+                            if (parsed.bundle) {
+                                const std::pair<uint256, uint256> key{parsed.bundle->prev, parsed.bundle->hogex.txid};
+                                changed = key != ext_state->last_key;
+                                ext_state->last_key = key;
+                                prev = parsed.bundle->prev;
+                            } else {
+                                // The stored G is now the failure: the next good
+                                // one is a change, whatever came before.
+                                ext_state->last_key = {};
+                            }
+                            src->set_parsed(std::move(parsed), r.at);
+                            if (!changed)
+                                return;
+                            // A new extension for the tip: rebuild (paced like a
+                            // tx refresh, no clean_jobs).
+                            boost::asio::post(ioc, [alive, chain, prev, &web_server]() {
+                                if (!alive->load())
+                                    return;
+                                const auto t = chain->tip();
+                                if (t && t->block_hash == prev)
+                                    web_server.trigger_work_refresh_mempool();
+                            });
+                        });
+                    if (auto t = embedded_chain->tip())
+                        ltc_mweb_ext_poller->notify_tip(t->block_hash);
+                    ltc_mweb_ext_poller->start();
+                    LOG_INFO << "[EMB-LTC] MWEB extension: litecoind at " << ext_ep.host << ":" << ext_ep.port
+                             << " (ltc_mweb_ext=litecoind: getblocktemplate on every tip change and every 5 s,"
+                             << " 3 s timeout; checked against c2pool's MWEB state, empty body on any mismatch)";
+                } else {
+                    LOG_INFO << "[EMB-LTC] MWEB extension: none (empty MWEB body, c2pool's own HogEx)";
+                }
                 // Leave room for the PPLNS coinbase the web server builds on
                 // each template (up to max_coinbase_outputs outputs): the
                 // last one's weight plus a margin, not a fixed 2,000.
                 embedded_node->set_coinbase_reserve_fn(
                     [mi = web_server.get_mining_interface()]() { return mi->coinbase_weight_reserve(); });
+                // And the coinbase's sigops, for the block's sigop limit.
+                embedded_node->set_coinbase_sigop_reserve_fn(
+                    [mi = web_server.get_mining_interface()]() { return mi->coinbase_sigop_reserve(); });
                 // Gate mining until UTXO has coinbase maturity depth (100 blocks for LTC).
                 // Without this, block templates may include TXs spending immature coinbase outputs.
                 // Reference: litecoin/src/consensus/consensus.h COINBASE_MATURITY = 100
-                if (ltc_utxo_cache) {
-                    auto* cache_ptr = ltc_utxo_cache.get();
+                // The view the pool prices against (the accrual set, or the full
+                // set once it completed).
+                if (ltc_utxo_cache || ltc_full_cache) {
+                    auto* pool_ptr = embedded_pool.get();
                     // Mining gate: coinbase_maturity + reorg_buffer
                     // LTC: 100 + 6 (pegout maturity) = 106
                     // Reference: litecoin/src/consensus/consensus.h
                     constexpr uint32_t LTC_GATE = core::coin::LTC_MINING_GATE_DEPTH; // 106
-                    embedded_node->set_utxo_ready_fn([cache_ptr, LTC_GATE]() {
-                        auto connected = cache_ptr->blocks_connected();
+                    embedded_node->set_utxo_ready_fn([pool_ptr, LTC_GATE]() {
+                        const auto* view = pool_ptr->utxo();
+                        auto connected = view ? view->blocks_connected() : 0u;
                         bool ready = connected >= LTC_GATE;
                         if (!ready) {
                             static int s_log_ctr = 0;
@@ -2539,6 +3034,8 @@ int main(int argc, char* argv[]) {
                     }
                 }
                 c2pool::merged::PeerManagerConfig ltc_pm_cfg;
+                ltc_pm_cfg.max_peers = fd_plan.ltc_peers;   // FdPlan: 20 unless the fd limit is tight
+                ltc_pm_cfg.min_peers = std::min(ltc_pm_cfg.min_peers, ltc_pm_cfg.max_peers);
                 ltc_pm_cfg.connect_only = connect_only_peers(
                     ltc_connect, static_cast<uint16_t>(coind_p2p_port > 0 ? coind_p2p_port : 9333), "EMB-LTC");
                 embedded_broadcaster = std::make_unique<c2pool::merged::CoinBroadcaster>(
@@ -2560,13 +3057,24 @@ int main(int argc, char* argv[]) {
                 LOG_INFO << "[EMB-LTC] Wiring P2P tx → Mempool callback";
                 // Admission refuses what an embedded block can never carry
                 // (Mempool::admit: txs with an MWEB part, pegin outputs
-                // without a kernel, empty vin/vout, a loose HogEx).
+                // without a kernel, empty vin/vout, a loose HogEx) and what is
+                // not final in the next block. An admission that priced a tx
+                // (it, a child waiting for it, an orphan it resolved) asks for
+                // a template rebuild, paced to one a second (#2137 S1): the
+                // share-driven refreshes left templates tens of seconds old.
                 embedded_broadcaster->set_on_new_tx(
                     [pool = embedded_pool.get(),
-                     utxo = ltc_utxo_cache.get()](const std::string& peer_key,
-                                                   const ltc::coin::Transaction& tx) {
+                     utxo = ltc_utxo_cache.get(),
+                     &web_server](const std::string& peer_key,
+                                  const ltc::coin::Transaction& tx) {
                         ltc::coin::MutableTransaction mtx(tx);
-                        auto reject = pool->admit(mtx, utxo);
+                        const uint64_t priced_before = pool->priced_changes();
+                        // Against the view the pool prices against (the full set
+                        // once it completed: an unknown input is an orphan there).
+                        (void)utxo;
+                        auto reject = pool->admit(mtx, pool->utxo());
+                        if (pool->priced_changes() != priced_before)
+                            web_server.trigger_work_refresh_mempool();
                         if (!reject) {
                             LOG_DEBUG_COIND << "[EMB-LTC] TX from " << peer_key
                                       << " added to mempool (size=" << pool->size() << ")";
@@ -2593,14 +3101,14 @@ int main(int argc, char* argv[]) {
                         }
                     });
 
-                // Wire peer height callback for fast-sync: skip scrypt PoW on old headers.
-                // No anchor checkpoint needed — header sync is fast (headers are 80 bytes,
-                // old ones skip scrypt PoW). Use --header-checkpoint as optional speedup.
+                // A peer's reported tip height: the sync progress line and the
+                // header batch sizing only (core::coin::PeerHeightGate). Every
+                // header above the checkpoint has its proof of work verified
+                // regardless of it.
                 embedded_broadcaster->set_on_peer_height(
                     [chain = embedded_chain.get()](uint32_t h) {
                         chain->set_peer_tip_height(h);
-                        LOG_INFO << "[LTC] Peer reports chain height " << h
-                                 << " — fast-sync: scrypt skip below " << (h > 2100 ? h - 2100 : 0);
+                        LOG_INFO << "[LTC] Peer reports chain height " << h;
                     });
 
                 // Block relay (set before start(): applied per connection).
@@ -2629,6 +3137,9 @@ int main(int argc, char* argv[]) {
 
             } else {
                 // Legacy RPC mode
+                if (ltc_mweb_ext == "litecoind")
+                    LOG_INFO << "[LTC] ltc_mweb_ext=litecoind has no effect in RPC mode: the whole template"
+                             << " comes from litecoind";
                 node_rpc = std::make_unique<ltc::coin::NodeRPC>(&ioc, &coin_node, settings->m_testnet);
 
                 // Adjust default RPC port based on testnet flag when user didn't override
@@ -2934,7 +3445,7 @@ int main(int argc, char* argv[]) {
                     };
                     hs.accepted = [&web_server](int) {
                         LOG_INFO << "[EMB-LTC] Triggering work refresh (new headers)";
-                        web_server.trigger_work_refresh_debounced();
+                        web_server.trigger_work_refresh_debounced(core::RefreshCause::block);
                     };
                     ltc_hdr_sync = std::make_shared<ltc::coin::HeaderSync>(std::move(hs));
                 }
@@ -2987,6 +3498,10 @@ int main(int argc, char* argv[]) {
                 // height; that first block is allowed past the next-height /
                 // parent checks. 0 = none.
                 auto utxo_jump_from = std::make_shared<uint32_t>(0);
+                // The first height this process connected into an empty UTXO
+                // set (a cold start, a re-anchor): the view's anchor, which an
+                // accrual set does not record (/local_stats ltc_utxo). 0 = none.
+                auto ltc_view_anchor = std::make_shared<std::atomic<uint32_t>>(0);
                 // Cold start (utxo_order.hpp cold_start_plan): decided once, by
                 // the 1-s tick below, when the header chain is synced; over the
                 // tip's last score-backlog heights (5 * SHARE_PERIOD *
@@ -3099,6 +3614,10 @@ int main(int argc, char* argv[]) {
                             }
                             for (uint32_t h : undone)
                                 utxo_db->remove_block_undo(h);
+                            // The pool judges maturity at the set's height:
+                            // follow it down (#2136).
+                            if (pool)
+                                pool->set_tip_height(rw.height);
                             LOG_WARNING << "[EMB-LTC] UTXO rewound to the best chain (" << reason
                                         << "): disconnected " << rw.disconnected << " blocks (h="
                                         << before << "→" << rw.height << ") best="
@@ -3126,7 +3645,8 @@ int main(int argc, char* argv[]) {
                             // the set refills; each drain's revalidate_inputs would
                             // evict them meanwhile (and nothing refetches them).
                             // Quarantined, they are re-priced by recompute_unknown_fees.
-                            if (pool) {
+                            // (Only while the pool prices against this set.)
+                            if (pool && pool->utxo() == utxo) {
                                 const int requarantined = pool->requarantine_all();
                                 LOG_INFO << "[EMB-LTC] UTXO rebuild: " << requarantined
                                          << " priced mempool txs quarantined until their inputs reconnect";
@@ -3316,6 +3836,141 @@ int main(int argc, char* argv[]) {
                         }
                     });
 
+                // The full LTC UTXO set's lane (--ltc-utxo-full; core::coin::UtxoLane,
+                // Mode::Full, #2137 S2) on its own thread: its IBD (every block
+                // from height 1, strictly connected) never runs on the io_context.
+                // The accrual set keeps its lane and keeps pricing until the full
+                // set reaches the header tip; then host.completed swaps the pool's
+                // view (UtxoFullState::adopt) and the templates price against it.
+                // The accrual handlers stay on the block feed (MWEB state, the
+                // pool's cleanup, the explorer) and price against the pool's view.
+                if (ltc_full_cache && ltc_full_db && embedded_broadcaster) {
+                    ltc_full_pool = std::make_shared<boost::asio::thread_pool>(1);
+                    auto* fpool = ltc_full_pool.get();
+                    auto* lc = embedded_chain.get();
+                    auto* lb = embedded_broadcaster.get();
+                    auto* lp = embedded_pool.get();
+                    auto full = ltc_full;
+                    constexpr uint32_t LTC_KEEP = core::coin::LTC_MIN_BLOCKS_TO_KEEP;
+                    core::coin::UtxoLaneHost host;
+                    host.stopping = [full]() { return full->stopping.load(); };
+                    host.chain_height = [lc]() { return lc->height(); };
+                    host.chain_hash_at = [lc](uint32_t h) {
+                        auto e = lc->get_header_by_height(h);
+                        return e ? e->block_hash : uint256();
+                    };
+                    host.prev_of = [lc](const uint256& hh) -> std::optional<uint256> {
+                        auto e = lc->get_header(hh);
+                        if (!e)
+                            return std::nullopt;
+                        return e->prev_hash;
+                    };
+                    // Every request is recorded (hash -> height); every copy of
+                    // the answer is placed by it (UtxoFullState::place).
+                    host.request = [hash_at = host.chain_hash_at, chain_height = host.chain_height, lb, full,
+                                    rr = std::make_shared<size_t>(0)](uint32_t h, core::coin::UtxoAsk how) {
+                        const uint256 hash = hash_at(h);
+                        if (hash.IsNull()) {
+                            LOG_ERROR << "[EMB-LTC] [full] No best-chain hash for h=" << h << ": not requested";
+                            return;
+                        }
+                        full->note_request(hash, h);
+                        if (how != core::coin::UtxoAsk::Broadcast && lb->request_full_block_targeted(hash, (*rr)++))
+                            return;
+                        lb->request_full_block_peers(hash, core::coin::block_request_services(chain_height(), h));
+                    };
+                    // Block download (Core's): several blocks in flight per peer,
+                    // from peers that serve every block (NODE_NETWORK).
+                    host.download_peers = [lb]() { return lb->ready_peers(1 /* NODE_NETWORK */); };
+                    host.request_from = [hash_at = host.chain_hash_at, lb, full](const std::string& peer, uint32_t h) {
+                        const uint256 hash = hash_at(h);
+                        if (hash.IsNull())
+                            return false;
+                        full->note_request(hash, h);
+                        return lb->request_full_block_from(peer, hash);
+                    };
+                    host.wiped = [lp, full]() {
+                        if (!full->live.load())
+                            return;
+                        const int n = lp->requarantine_all();
+                        LOG_WARNING << "[EMB-LTC] UTXO rebuild of the full set: " << n
+                                    << " priced mempool txs quarantined until it completes";
+                    };
+                    // The set reached the header tip, built from genesis: the pool
+                    // prices against it from now on (every tx re-priced; one with an
+                    // input the set does not hold becomes an orphan).
+                    host.completed = [lp, full, full_cache = ltc_full_cache.get(), full_db = ltc_full_db.get(),
+                                      &ioc, &web_server]() {
+                        const auto a = full->adopt(*lp, full_cache, full_db);
+                        LOG_INFO << "[EMB-LTC] The LTC templates price against the full UTXO set ("
+                                 << a.requarantined << " txs re-priced: " << a.priced << " priced, " << a.evicted
+                                 << " evicted, " << a.orphans << " orphans)";
+                        boost::asio::post(ioc, [&web_server]() { web_server.trigger_work_refresh_debounced(); });
+                    };
+                    // The 30 s last resort (every peer asked), through host.request
+                    // so the answers are placed.
+                    host.fill_started = [fpool, req = host.request](core::coin::UtxoLaneHost::Fill& f) {
+                        f.start_stall_timer_on(fpool->get_executor(),
+                            [req](uint32_t h) { req(h, core::coin::UtxoAsk::Broadcast); }, "EMB-LTC full");
+                    };
+                    host.fill_stopped = [](core::coin::UtxoLaneHost::Fill& f) { f.stop_stall_timer(); };
+                    // A tip body that never came is asked again.
+                    host.chase_tip = [lc]() { return lc->is_synced(); };
+                    ltc_full_lane = std::make_shared<core::coin::UtxoLane>(
+                        *ltc_full_cache, *ltc_full_db, std::move(host), LTC_KEEP, core::coin::UtxoLaneMode::Full, 0,
+                        core::coin::LTC_UTXO_LANE);
+
+                    // The block download's clock (stalls, request timeouts, the
+                    // window refill, the rate) every second, and malloc pages given
+                    // back to the kernel, both on the lane's thread.
+                    auto tick_fn = std::make_shared<std::function<void(boost::system::error_code)>>();
+                    auto tick_timer = std::make_shared<boost::asio::steady_timer>(fpool->get_executor());
+                    *tick_fn = [tick_fn, tick_timer, lane = std::weak_ptr<core::coin::UtxoLane>(ltc_full_lane)](
+                                   boost::system::error_code ec) {
+                        if (ec)
+                            return;
+                        tick_timer->expires_after(std::chrono::seconds(1));
+                        tick_timer->async_wait(*tick_fn);
+                        auto l = lane.lock();
+                        if (!l)
+                            return;
+                        try {
+                            l->tick();
+                        } catch (const std::exception& e) {
+                            LOG_WARNING << "[EMB-LTC] Full UTXO lane tick error: " << e.what();
+                        }
+                    };
+                    tick_timer->expires_after(std::chrono::seconds(1));
+                    tick_timer->async_wait(*tick_fn);
+                    auto trim_fn = std::make_shared<std::function<void(boost::system::error_code)>>();
+                    auto trim_timer = std::make_shared<boost::asio::steady_timer>(fpool->get_executor());
+                    *trim_fn = [trim_fn, trim_timer, full](boost::system::error_code ec) {
+                        if (ec)
+                            return;
+                        trim_timer->expires_after(doge::coin::ProcessMemory::TRIM_EVERY);
+                        trim_timer->async_wait(*trim_fn);
+                        if (doge::coin::ProcessMemory::trim())
+                            full->malloc_trims.fetch_add(1, std::memory_order_relaxed);
+                    };
+                    trim_timer->expires_after(doge::coin::ProcessMemory::TRIM_EVERY);
+                    trim_timer->async_wait(*trim_fn);
+
+                    // Once at startup (a reorg persisted without its UTXO side, a
+                    // set to resume): the lane's startup check, on its thread.
+                    boost::asio::post(*fpool, [lane = ltc_full_lane]() {
+                        try {
+                            lane->startup();
+                        } catch (const std::exception& e) {
+                            LOG_WARNING << "[EMB-LTC] Full UTXO set startup check error: " << e.what();
+                        }
+                    });
+                    // The IBD's historical bodies are logged at DEBUG.
+                    lb->set_block_log_quiet([full, lc](const uint256& hash) {
+                        const auto h = full->requested_height(hash);
+                        return h && *h + core::coin::LTC_MIN_BLOCKS_TO_KEEP < lc->height();
+                    });
+                }
+
                 // Coin-side metrics in /local_stats: "ltc_mweb" (the MWEB state
                 // window and relay counters, plus state_kernels: the kernel count
                 // of the block the MWEB state came from -- templates after a block
@@ -3323,9 +3978,18 @@ int main(int argc, char* argv[]) {
                 // matter) and "ltc_mempool" (admission: refusals by code, MWEB txs
                 // seen, kernel fees given up, template drops, the last block the
                 // pool was cleaned for).
+                // "ltc_utxo" is the depth of the UTXO view the template prices
+                // against and what it cannot price (utxo_view_stats.hpp).
+                // "ltc_mweb_ext" is the MWEB extension's source (#2137 S3): its
+                // mode, what the last template imported, the fallbacks by
+                // reason, the age of litecoind's last template.
                 mi->set_coin_metrics_fn(
                     [mweb_stats, ltc_cmpct_v3, ltc_cmpct_hb_peers, ltc_mweb_fetch_retry, ltc_hdr_sync, ltc_dl,
-                     pool = embedded_pool.get(), tracker = mweb_tracker.get()]() {
+                     pool = embedded_pool.get(), tracker = mweb_tracker.get(),
+                     utxo = ltc_utxo_cache.get(), chain = embedded_chain.get(), ltc_view_anchor,
+                     full_lane = std::weak_ptr<core::coin::UtxoLane>(ltc_full_lane),
+                     full_cache = ltc_full_cache.get(), full = ltc_full,
+                     ext = ltc_mweb_ext_src.get()]() {
                         nlohmann::json j = mweb_stats->to_json();
                         j["config"] = {
                             {"cmpct_v3", ltc_cmpct_v3},
@@ -3341,7 +4005,41 @@ int main(int argc, char* argv[]) {
                         mp["last_cleaned_ago_s"] = cleaned
                             ? nlohmann::json(static_cast<int64_t>(std::time(nullptr) - cleaned))
                             : nlohmann::json(nullptr);
+                        const auto tip = chain ? chain->tip() : std::nullopt;
+                        // The view the template prices against: the full set once it
+                        // completed ("full", anchor 0), else the accrual set.
+                        const auto* view = pool->utxo();
+                        const bool full_view = full_cache && view == full_cache;
+                        nlohmann::json u = ltc::coin::utxo_view_json(
+                            view, full_view ? 0u : ltc_view_anchor->load(std::memory_order_relaxed),
+                            tip ? tip->height : 0, tip ? tip->block_hash : uint256(), pool);
+                        u["mode"] = full_view ? "full" : "accrual";
+                        // The full set while it builds (or once it prices): its lane's
+                        // IBD counters, its best height and how far behind the tip.
+                        if (auto f = full_lane.lock(); f && full_cache) {
+                            nlohmann::json d = f->stats().to_json();
+                            const uint32_t best = full_cache->get_best_height();
+                            const uint32_t th = tip ? tip->height : 0;
+                            const auto ss = full_cache->sync_state();
+                            d["best_height"] = best;
+                            d["behind"] = th > best ? th - best : 0;
+                            d["blocks_connected"] = full_cache->blocks_connected();
+                            d["anchor_height"] = ss.tracked() ? nlohmann::json(ss.anchor_height)
+                                                              : nlohmann::json(nullptr);
+                            d["complete"] = tip && full_cache->complete(th, tip->block_hash);
+                            d["synced"] = ss.synced != 0;
+                            d["coins"] = ss.coins;
+                            d["stuck"] = f->stuck();
+                            d["live"] = full->live.load();
+                            d["adoptions"] = full->adoptions.load();
+                            d["queued_bytes"] = full->queued_bytes.load();
+                            d["queue_dropped"] = full->queue_dropped.load();
+                            d["malloc_trims"] = full->malloc_trims.load();
+                            u["full"] = std::move(d);
+                        }
                         return nlohmann::json{{"ltc_mweb", j}, {"ltc_mempool", std::move(mp)},
+                                              {"ltc_utxo", std::move(u)},
+                                              {"ltc_mweb_ext", ext->to_json()},
                                               {"ltc_headers", ltc_hdr_sync->to_json()},
                                               {"ltc_bootstrap", ltc_dl->to_json()}};
                     });
@@ -3371,7 +4069,9 @@ int main(int argc, char* argv[]) {
                          pending_merged_resolve, on_full_block_merged,
                          ltc_bs, mweb_retry, mweb_stats, seen_blocks, on_mweb_state, fill_rr,
                          utxo_jump_from, utxo_heal, ltc_dl, ltc_cold_decided, ltc_stall_request,
+                         ltc_view_anchor,
                          ltc_mweb_activation, self = std::weak_ptr<FullBlockFn>(full_block_fn),
+                         full_lane = ltc_full_lane, fpool = ltc_full_pool.get(), full = ltc_full,
                          &ioc, &web_server](
                             const std::string& peer,
                             const ltc::coin::BlockType& block,
@@ -3435,6 +4135,44 @@ int main(int argc, char* argv[]) {
                             if (entry) {
                                 auto at = chain->get_header_by_height(entry->height);
                                 on_best_chain = at && at->block_hash == block_hash;
+                            }
+                            // The full UTXO set's lane (--ltc-utxo-full), on its own
+                            // thread: every body, placed by the header chain (or by
+                            // the lane's request); the queue to it is bounded
+                            // (UtxoFullState::enqueue). A body only it asked for (deep,
+                            // not the tip's) runs none of the passes below. Once the
+                            // set prices the pool, a body it connected re-prices the
+                            // pool against it and rebuilds the template (the template
+                            // gate waits for the pool's view to reach the tip).
+                            if (full_lane && fpool) {
+                                uint256 tip_hash;
+                                if (const auto t = chain->tip())
+                                    tip_hash = t->block_hash;
+                                const auto placed = full->place(block_hash, height, chain->height(), tip_hash,
+                                                                core::coin::LTC_MIN_BLOCKS_TO_KEEP);
+                                const uint64_t body_bytes = core::coin::estimate_body_bytes(block);
+                                if (full->enqueue(placed, body_bytes)) {
+                                    boost::asio::post(*fpool, [full_lane, block, block_hash, at = placed.height, peer,
+                                                               pool, full, body_bytes, &web_server, &ioc]() {
+                                        full->dequeued(block_hash, body_bytes);
+                                        try {
+                                            const auto fed = full_lane->on_block(block, block_hash, at, peer);
+                                            if (!full->live.load() || fed.connected == 0)
+                                                return;
+                                            if (auto* view = pool->utxo()) {
+                                                pool->recompute_unknown_fees(view);
+                                                pool->revalidate_inputs(view);
+                                            }
+                                            boost::asio::post(ioc, [&web_server]() {
+                                                web_server.trigger_work_refresh_debounced();
+                                            });
+                                        } catch (const std::exception& e) {
+                                            LOG_WARNING << "[EMB-LTC] Full UTXO lane error: " << e.what();
+                                        }
+                                    });
+                                }
+                                if (placed.full_only)
+                                    return;
                             }
                             auto state_source = [&]() {
                                 switch (src) {
@@ -3522,17 +4260,21 @@ int main(int argc, char* argv[]) {
                                     // and mempool cleanup do not depend on the UTXO set,
                                     // so a stalled fill does not hold templates on stale
                                     // state or on transactions this block confirmed.
+                                    // With the tip's MWEB state the template is
+                                    // coinbase + HogEx on the tip until the drain
+                                    // brings the UTXO set to the tip (the pool's txs
+                                    // need a view at the tip, #2136; the drain's
+                                    // completion refreshes). The pool's height follows
+                                    // the drain, which sets it as it reaches each height.
                                     if (ltc_bs->phase != "Bootstrap" && on_best_chain) {
                                         auto tip_now = chain->tip();
                                         if (tip_now && tip_now->block_hash == block_hash) {
-                                            if (pool) {
-                                                pool->set_tip_height(height);
+                                            if (pool)
                                                 pool->remove_for_block(block);
-                                            }
                                             if (tracker && tracker->state_hash() != block_hash
                                                 && tracker->update(block, height, block.m_mweb_raw)) {
                                                 on_mweb_state(block_hash, state_source());
-                                                web_server.trigger_work_refresh();
+                                                web_server.trigger_work_refresh(core::RefreshCause::mweb);
                                             }
                                         }
                                     }
@@ -3563,10 +4305,13 @@ int main(int argc, char* argv[]) {
                                             uint32_t h) {
                                         if (h == *utxo_jump_from)
                                             *utxo_jump_from = 0;
+                                        const bool into_empty_set = utxo->get_best_block().IsNull();
                                         auto undo = utxo->connect_block(b, h, txid_fn, bh);
                                         utxo_db->put_block_undo(h, undo);
                                         utxo->flush(bh, h);
                                         utxo->prune_undo(h, LTC_KEEP);
+                                        if (into_empty_set)
+                                            ltc_view_anchor->store(h, std::memory_order_relaxed);
 
                                         if (explorer_enabled) {
                                             PackStream ps;
@@ -3652,11 +4397,14 @@ int main(int argc, char* argv[]) {
                                     if (cold_start && drained.connected > 0)
                                         ltc_dl->drained(drained.connected);
                                     // Fees and inputs once per drain, as the normal path does.
-                                    if (drained.connected > 0 && pool && utxo) {
-                                        int resolved = pool->recompute_unknown_fees(utxo);
-                                        int evicted = pool->revalidate_inputs(utxo);
+                                    // A mempool change: the paced rebuild (the debounced
+                                    // one drops its trailing call on an unchanged sharechain).
+                                    // Against the pool's view (the full set once it priced).
+                                    if (drained.connected > 0 && pool && pool->utxo()) {
+                                        int resolved = pool->recompute_unknown_fees(pool->utxo());
+                                        int evicted = pool->revalidate_inputs(pool->utxo());
                                         if (resolved > 0 || evicted > 0)
-                                            web_server.trigger_work_refresh_debounced();
+                                            web_server.trigger_work_refresh_mempool();
                                     }
 
                                     // Progress log
@@ -3711,7 +4459,7 @@ int main(int argc, char* argv[]) {
                                     LOG_INFO << "[EMB-LTC] MWEB state updated from " << peer
                                              << " h=" << height << " (repeat delivery)";
                                     on_mweb_state(block_hash, state_source());
-                                    web_server.trigger_work_refresh();
+                                    web_server.trigger_work_refresh(core::RefreshCause::mweb);
                                 }
                                 auto pit = pending_merged_resolve->find(block_hash);
                                 if (pit != pending_merged_resolve->end()
@@ -3740,15 +4488,16 @@ int main(int argc, char* argv[]) {
                                                 << " — buffering it and fetching " << utxo_best + 1
                                                 << ".." << height - 1 << " in order";
                                     // Its MWEB state and mempool cleanup do not depend
-                                    // on the UTXO set: do them now so templates do not
-                                    // wait for the fill.
-                                    if (pool) {
-                                        pool->set_tip_height(height);
+                                    // on the UTXO set: do them now. Until the fill
+                                    // brings the UTXO set to this block the template
+                                    // is coinbase + HogEx on it (the pool's txs need a
+                                    // view at the tip, #2136), and the pool's height
+                                    // stays the set's until the drain reaches it.
+                                    if (pool)
                                         pool->remove_for_block(block);
-                                    }
                                     if (tracker && tracker->update(block, height, block.m_mweb_raw)) {
                                         on_mweb_state(block_hash, state_source());
-                                        web_server.trigger_work_refresh();
+                                        web_server.trigger_work_refresh(core::RefreshCause::mweb);
                                     }
                                     ltc::coin::ordered_arm(*ltc_bs, utxo_best + 1, height);
                                     ltc_bs->phase = "UTXO gap fill";
@@ -3822,13 +4571,16 @@ int main(int argc, char* argv[]) {
                             }
 
                             if (pool) {
-                                pool->set_tip_height(height);
+                                // The pool judges maturity at the UTXO set's height,
+                                // never at a block's the set has not connected (a side
+                                // branch's, an older copy's).
+                                pool->set_tip_height(utxo ? utxo->get_best_height() : height);
                                 pool->remove_for_block(block);
-                                if (utxo) {
-                                    int resolved = pool->recompute_unknown_fees(utxo);
-                                    int evicted = pool->revalidate_inputs(utxo);
+                                if (auto* view = pool->utxo()) {
+                                    int resolved = pool->recompute_unknown_fees(view);
+                                    int evicted = pool->revalidate_inputs(view);
                                     if (resolved > 0 || evicted > 0)
-                                        web_server.trigger_work_refresh_debounced();
+                                        web_server.trigger_work_refresh_mempool();
                                 }
                             }
 
@@ -3845,7 +4597,7 @@ int main(int argc, char* argv[]) {
                                 // trailing edge on a sharechain change, so a call
                                 // right after the tip-change refresh would be dropped.
                                 // Main ioc; the tracker mutex is already released.
-                                web_server.trigger_work_refresh();
+                                web_server.trigger_work_refresh(core::RefreshCause::mweb);
                             } else if (tracker && on_best_chain
                                        && !tracker->mweb_active_at(height, ltc_mweb_activation)) {
                                 // Before MWEB the block itself is what the fetch waits for.
@@ -3983,14 +4735,31 @@ int main(int argc, char* argv[]) {
                 // full_block callback above — same as Litecoin Core, which
                 // runs removeForBlock() identically for both normal advances
                 // and reorgs (no clear()).
+                // Admission's finality and BIP68 checks
+                // (Mempool::set_lock_time_cutoff): the next block after the
+                // header tip, set now and on every tip change below.
+                auto set_ltc_lock_time_cutoff = [](ltc::coin::Mempool* pool, const ltc::coin::HeaderChain* chain,
+                                                   const uint256& tip_hash) {
+                    if (!pool || !chain)
+                        return;
+                    if (auto e = chain->get_header(tip_hash))
+                        pool->set_lock_time_cutoff(
+                            e->height + 1, ltc::coin::TemplateBuilder::median_time_past(*chain, *e),
+                            [chain](uint32_t h) { return ltc::coin::TemplateBuilder::median_time_past_at(*chain, h); });
+                };
+                if (auto t = embedded_chain->tip())
+                    set_ltc_lock_time_cutoff(embedded_pool.get(), embedded_chain.get(), t->block_hash);
                 embedded_chain->set_on_tip_changed(
                     [tracker = mweb_tracker.get(),
+                     ext_poller = ltc_mweb_ext_poller.get(),
                      bcaster = embedded_broadcaster.get(),
                      chain = embedded_chain.get(),
                      utxo = ltc_utxo_cache.get(),
                      utxo_db = ltc_utxo_db.get(),
+                     pool = embedded_pool.get(), set_ltc_lock_time_cutoff,
                      mweb_stats, mweb_fetch_step, log_mweb_window, ltc_bs, utxo_heal,
                      ltc_mweb_activation, ltc_mweb_fetch_retry,
+                     full_lane = ltc_full_lane, fpool = ltc_full_pool.get(),
                      &web_server, &ioc](
                         const uint256& old_tip, uint32_t old_height,
                         const uint256& new_tip, uint32_t new_height) {
@@ -3999,12 +4768,28 @@ int main(int argc, char* argv[]) {
                         // Post all work to ioc to avoid cross-thread access to
                         // bcaster/web_server/UTXO which are ioc-thread objects.
                         const auto tip_seen_at = std::chrono::steady_clock::now();
+                        // litecoind's template for the new tip (thread-safe).
+                        if (ext_poller)
+                            ext_poller->notify_tip(new_tip);
                         boost::asio::post(ioc,
-                            [tracker, bcaster, chain, utxo, utxo_db, &web_server, &ioc,
+                            [tracker, bcaster, chain, utxo, utxo_db, pool, set_ltc_lock_time_cutoff,
+                             &web_server, &ioc,
                              mweb_stats, mweb_fetch_step, log_mweb_window, ltc_bs, utxo_heal,
-                             ltc_mweb_activation, ltc_mweb_fetch_retry, tip_seen_at,
+                             ltc_mweb_activation, ltc_mweb_fetch_retry, tip_seen_at, full_lane, fpool,
                              old_tip, old_height, new_tip, new_height]() {
                       try {
+                        // The full UTXO set's lane sees every tip change (on its
+                        // thread): a reorg walks it back by its undo records.
+                        if (full_lane && fpool)
+                            boost::asio::post(*fpool, [full_lane, old_tip, old_height, new_tip, new_height]() {
+                                try {
+                                    full_lane->on_tip_changed(old_tip, old_height, new_tip, new_height);
+                                } catch (const std::exception& e) {
+                                    LOG_WARNING << "[EMB-LTC] Full UTXO lane tip error: " << e.what();
+                                }
+                            });
+                        // Relayed txs must be final in the block after this tip.
+                        set_ltc_lock_time_cutoff(pool, chain, new_tip);
                         // A reorg is any switch to a tip that does not descend from
                         // the old one: a sibling or shorter branch, and also a heavier
                         // side branch that ends higher than the old tip.
@@ -4075,7 +4860,7 @@ int main(int argc, char* argv[]) {
                             bcaster->request_full_block(new_tip);
                         }
                         // Trigger work refresh so stratum miners get the new tip
-                        web_server.trigger_work_refresh_debounced();
+                        web_server.trigger_work_refresh_debounced(core::RefreshCause::block);
                       } catch (const std::exception& e) {
                         LOG_ERROR << "[EMB-LTC] Reorg handler error: " << e.what();
                       }
@@ -4189,7 +4974,7 @@ int main(int argc, char* argv[]) {
                                                   << utxo->get_best_height();
                                         return;
                                     }
-                                    if (pool)
+                                    if (pool && pool->utxo() == utxo)
                                         pool->requarantine_all();
                                 }
                                 arm(r->first, r->second, 0);
@@ -4261,6 +5046,31 @@ int main(int argc, char* argv[]) {
 
             // Set testnet flag for runtime constant selection (SHARE_PERIOD, CHAIN_LENGTH, etc.)
             ltc::PoolConfig::is_testnet = settings->m_testnet;
+
+            // Share version 3601 flag day: compiled, except on testnet or a
+            // private chain (every node of a network must use the same time).
+            if (v3601_activation_time) {
+                if (!settings->m_testnet && network_id == 0) {
+                    const std::string msg = "v3601_activation_time (--v3601-activation-time or the settings "
+                                            "file) is for testnet or a private --network-id chain only: on "
+                                            "mainnet every node uses the compiled flag day";
+                    LOG_ERROR << msg;
+                    std::cerr << "c2pool: " << msg << std::endl;
+                    return 1;
+                }
+                if (*v3601_activation_time > 0xFFFFFFFFull) {
+                    LOG_ERROR << "v3601_activation_time " << *v3601_activation_time << " is not a 32-bit unix time";
+                    return 1;
+                }
+                ltc::PoolConfig::v3601_activation_time_override = static_cast<uint32_t>(*v3601_activation_time);
+            }
+            if (ltc::PoolConfig::v3601_activation_time() == 0xFFFFFFFFu)
+                LOG_INFO << "[Sharechain] share version 3601 flag day: not scheduled";
+            else
+                LOG_INFO << "[Sharechain] share version 3601 flag day: " << ltc::PoolConfig::v3601_activation_time()
+                         << (v3601_activation_time ? " (v3601_activation_time)" : " (compiled)")
+                         << "; peers below protocol " << ltc::PoolConfig::V3601_PROTOCOL_VERSION
+                         << " are disconnected from then on";
 
             // Private chain: override IDENTIFIER and PREFIX before any P2P or share ops
             if (network_id != 0) {
@@ -4349,6 +5159,12 @@ int main(int argc, char* argv[]) {
                 assert(coin_p2p->lifetime_armed() && "LTC parent-coin P2P dial lifetime failed to arm");
                 coin_p2p->connect(NetService(p2p_host, static_cast<uint16_t>(coind_p2p_port)));
                 LOG_INFO << "Parent coin P2P broadcaster connecting to " << p2p_host << ":" << coind_p2p_port;
+                // A new block the daemon's P2P link announces refreshes the
+                // template at once (besides the 2 s getblocktemplate poll and
+                // the sharechain peers' bestblock).
+                coin_node.new_block.subscribe([&web_server](const uint256& block_hash) {
+                    web_server.refresh_on_parent_block(block_hash);
+                });
             }
 
             // Phase 1c: Whale departure detector (needs to be visible to ref_hash lambda)
@@ -4832,8 +5648,16 @@ int main(int argc, char* argv[]) {
             // V35's gentx_before_refhash expects DONATION_SCRIPT (67 bytes),
             // causing p2pool to reject the share as PoW-invalid.
             {
-                auto [initial_ver, initial_desired] = auto_ratchet->get_share_version(
-                    p2p_node->tracker(), uint256());
+                // --solo / --custodial run no sharechain (no p2p_node): the
+                // V36 donation, as before the ratchet read (p2p_node->tracker()
+                // on a null node crashed them at startup).
+                int64_t initial_ver = 36;
+                if (p2p_node) {
+                    auto [ver, desired] = auto_ratchet->get_share_version(p2p_node->tracker(), uint256());
+                    initial_ver = ver;
+                }
+                // Past the 3601 flag day the version is 3601, not the ratchet's.
+                initial_ver = ltc::flag_day_share_version(initial_ver, static_cast<uint32_t>(std::time(nullptr)));
                 auto donation_script = ltc::PoolConfig::get_donation_script(initial_ver);
                 web_server.get_mining_interface()->set_donation_script(donation_script);
                 web_server.get_mining_interface()->set_cached_share_version(initial_ver);
@@ -5098,7 +5922,9 @@ int main(int argc, char* argv[]) {
                     }
                     return rh;
                 };
-                uint256 verified_best_stat = p2p_node->best_share_hash();
+                // The guard above holds the tracker lock: elect under it
+                // (best_share_hash() would take the shared lock again).
+                uint256 verified_best_stat = p2p_node->best_share_hash(guard);
                 sharechain::PoolRateHead stat_vhead;
                 bool stat_vpresent = false;
                 if (!verified_best_stat.IsNull() && chain.contains(verified_best_stat)) {
@@ -5601,13 +6427,21 @@ int main(int argc, char* argv[]) {
 
                 // LTC found blocks — use is_block_solution flag (above), but also keep
                 // share hashes from persistence for blocks found before restart
+                // `blocks` keeps the 16-hex short hashes (display, older
+                // dashboards); `block_hashes` the full ones of the blocks whose
+                // shares are in this window (core::found_block_hashes_in), which
+                // the explorer matches a share's full hash H against.
                 nlohmann::json blocks_arr = nlohmann::json::array();
+                std::vector<std::string> found_full;
                 if (mi) {
                     for (const auto& fb : mi->get_found_blocks()) {
-                        if (!fb.share_hash.empty())
+                        if (!fb.share_hash.empty()) {
                             blocks_arr.push_back(fb.share_hash.substr(0, 16));
+                            found_full.push_back(fb.share_hash);
+                        }
                     }
                 }
+                nlohmann::json block_hashes_arr = core::found_block_hashes_in(shares_arr, found_full);
 
                 // DOGE discovered blocks — keyed by parent (LTC) block hash.
                 // doge_arr keeps the legacy 16-char marker strings; doge_detail
@@ -5628,6 +6462,7 @@ int main(int argc, char* argv[]) {
                 result["shares"] = std::move(shares_arr);
                 result["heads"] = std::move(heads_arr);
                 result["blocks"] = std::move(blocks_arr);
+                result["block_hashes"] = std::move(block_hashes_arr);
                 result["doge_blocks"] = std::move(doge_arr);
                 result["doge_blocks_detail"] = std::move(doge_detail);
                 result["total"] = static_cast<int>(chain.size());
@@ -5781,10 +6616,17 @@ int main(int argc, char* argv[]) {
                     heads_arr.push_back(hh.GetHex().substr(0, 16));
 
                 nlohmann::json blocks_arr = nlohmann::json::array();
+                std::vector<std::string> found_full;
                 if (mi) {
                     for (const auto& fb : mi->get_found_blocks())
-                        if (!fb.share_hash.empty()) blocks_arr.push_back(fb.share_hash.substr(0, 16));
+                        if (!fb.share_hash.empty()) {
+                            blocks_arr.push_back(fb.share_hash.substr(0, 16));
+                            found_full.push_back(fb.share_hash);
+                        }
                 }
+                // Only the found blocks among this delta's new shares; omitted
+                // when there are none (the client accumulates them).
+                nlohmann::json block_hashes_arr = core::found_block_hashes_in(shares_arr, found_full);
                 nlohmann::json doge_arr = nlohmann::json::array();
                 nlohmann::json doge_detail = nlohmann::json::array();
                 if (mi) {
@@ -5800,6 +6642,8 @@ int main(int argc, char* argv[]) {
                 result["tip"] = best.IsNull() ? "" : best.GetHex().substr(0, 16);
                 result["heads"] = std::move(heads_arr);
                 result["blocks"] = std::move(blocks_arr);
+                if (!block_hashes_arr.empty())
+                    result["block_hashes"] = std::move(block_hashes_arr);
                 result["doge_blocks"] = std::move(doge_arr);
                 result["doge_blocks_detail"] = std::move(doge_detail);
 
@@ -6245,11 +7089,25 @@ int main(int argc, char* argv[]) {
                     const uint256& best_hash, const uint256& block_target,
                     uint64_t subsidy, const std::vector<unsigned char>& /*donation_script*/)
                     -> std::map<std::vector<unsigned char>, double> {
+                // An empty sharechain: no split here; refresh_work and the
+                // stratum jobs apply p2pool's genesis rule (the whole subsidy
+                // to the donation script).
+                if (best_hash.IsNull()) return {};
                 auto guard = p2p_node->read_tracker();
                 if (!guard) return {};
 
                 auto [share_version, desired_ver] = auto_ratchet->get_share_version(
                     *guard, best_hash);
+                // Past the 3601 flag day the jobs build 3601 shares (V36
+                // PPLNS), whatever the ratchet says: the job timestamp is at
+                // least now and the tip's + 1 (ref_hash_fn decides it exactly).
+                {
+                    std::optional<uint32_t> tip_ts;
+                    if (!best_hash.IsNull() && guard->chain.contains(best_hash))
+                        guard->chain.get(best_hash).share.invoke([&](auto* tip) { tip_ts = tip->m_timestamp; });
+                    share_version = ltc::job_share_version(share_version, static_cast<uint32_t>(std::time(nullptr)),
+                                                           tip_ts);
+                }
                 // Update donation script + cached version so refresh_work() and
                 // build_connection_coinbase() use the correct one.
                 auto correct_donation = ltc::PoolConfig::get_donation_script(share_version);
@@ -6303,6 +7161,22 @@ int main(int argc, char* argv[]) {
                     // AutoRatchet: determine share version from network state
                     auto [share_version, desired_ver] = auto_ratchet->get_share_version(
                         *guard, frozen_prev_share);
+                    // The 3601 flag day: the version follows from this share's
+                    // timestamp (ntime clipped to the parent's + 1, as below),
+                    // not from the ratchet. 3601 shares vote as the ratchet
+                    // does (desired_version 36).
+                    {
+                        std::optional<uint32_t> parent_ts;
+                        if (!frozen_prev_share.IsNull() && guard->chain.contains(frozen_prev_share))
+                            guard->chain.get(frozen_prev_share).share.invoke([&](auto* prev) {
+                                parent_ts = prev->m_timestamp;
+                            });
+                        const int64_t v = ltc::job_share_version(share_version, timestamp, parent_ts);
+                        if (v != share_version) {
+                            share_version = v;
+                            desired_ver = std::max<int64_t>(desired_ver, 36);
+                        }
+                    }
                     {
                         static int rv_log = 0;
                         if (rv_log++ < 5 || rv_log % 100 == 0)
@@ -6765,6 +7639,11 @@ int main(int argc, char* argv[]) {
                         ++s_pow_failed;
                         return uint256();  // share failed PoW or validation; don't broadcast
                     }
+                    // Into LevelDB like a received share (a restart then
+                    // reloads our own shares too).
+                    if (!p2p_node->persist_local_share(share_hash))
+                        LOG_DEBUG_POOL << "[Pool] local share " << share_hash.GetHex().substr(0, 16)
+                                       << " not stored (no LevelDB)";
                     ++s_created;
 
                     // Compute the GOT SHARE! prev-age WHILE we still hold the
@@ -6885,52 +7764,21 @@ int main(int argc, char* argv[]) {
                     uint64_t subsidy, const std::vector<unsigned char>& donation_script)
                     -> std::map<std::vector<unsigned char>, double> {
 
-                std::map<std::vector<unsigned char>, double> result;
-
-                auto rates = web_server.get_local_addr_rates();
-                double total_rate = 0;
-                for (auto& [_, rate] : rates) total_rate += rate;
-
-                // Node owner fee
-                uint64_t owner_fee_amount = 0;
-                if (node_owner_fee > 0 && !payout_address.empty()) {
-                    owner_fee_amount = static_cast<uint64_t>(subsidy * node_owner_fee / 100.0);
-                    auto owner_script = core::address_to_script(payout_address);
-                    if (!owner_script.empty())
-                        result[owner_script] = static_cast<double>(owner_fee_amount);
+                // Each login's hashrate, paid to the login's own script
+                // (P2PKH, P2SH, P2WPKH, P2WSH, P2TR). By pubkey hash, a P2SH
+                // miner was paid P2PKH(<script hash>) and a P2WSH / P2TR one
+                // the zero key. A login with no script is not paid (the door
+                // refuses those).
+                ltc::SoloMinerRates miners;
+                for (auto& [login, rate] : web_server.get_local_user_rates()) {
+                    auto script = core::address_to_script(login);
+                    if (!script.empty() && rate > 0)
+                        miners.emplace_back(std::move(script), rate);
                 }
-
-                // Donation (dev_donation% or 1 satoshi marker when 0%)
-                uint64_t donation_amount = (dev_donation > 0)
-                    ? static_cast<uint64_t>(subsidy * dev_donation / 100.0)
-                    : 1;  // 1 satoshi marker
-                result[donation_script] += static_cast<double>(donation_amount);
-
-                uint64_t miner_pool = subsidy - owner_fee_amount - donation_amount;
-
-                if (total_rate > 0 && !rates.empty()) {
-                    // Proportional split by hashrate
-                    for (auto& [pubkey_hash, rate] : rates) {
-                        double fraction = rate / total_rate;
-                        uint64_t amount = static_cast<uint64_t>(miner_pool * fraction);
-                        if (amount == 0) continue;
-                        // Convert pubkey_hash to P2PKH script: OP_DUP OP_HASH160 <20> <hash> OP_EQUALVERIFY OP_CHECKSIG
-                        std::vector<unsigned char> script = {0x76, 0xa9, 0x14};
-                        script.insert(script.end(), pubkey_hash.begin(), pubkey_hash.end());
-                        script.push_back(0x88);
-                        script.push_back(0xac);
-                        result[script] += static_cast<double>(amount);
-                    }
-                } else {
-                    // No miners connected — all to payout address or donation
-                    if (!payout_address.empty()) {
-                        auto pa_script = core::address_to_script(payout_address);
-                        if (!pa_script.empty())
-                            result[pa_script] = static_cast<double>(miner_pool);
-                    } else {
-                        result[donation_script] += static_cast<double>(miner_pool);
-                    }
-                }
+                const auto owner_script = payout_address.empty()
+                    ? std::vector<unsigned char>{} : core::address_to_script(payout_address);
+                auto result = ltc::solo_payouts(subsidy, miners, owner_script, node_owner_fee,
+                                                donation_script, dev_donation);
                 return result;
             });
 
@@ -7019,25 +7867,74 @@ int main(int argc, char* argv[]) {
                     if (parts.size() >= 6) cfg.rpc_userpass = parts[4] + ":" + parts[5];
                     cfg.multiaddress = true;  // V36: canonical PPLNS coinbase for merged chains
 
-                    // Fallback payout address for createauxblock RPC.
-                    // Used when no per-miner address is available for a chain.
-                    // PPLNS payouts override this in multiaddress mode.
-                    if (cfg.symbol == "DOGE" && settings->m_testnet)
-                        cfg.aux_payout_address = "nUCAGGgZEPN1QyknmQe1oAku817bQAFKFt";
-                    else if (cfg.symbol == "DOGE")
-                        cfg.aux_payout_address = "DDogepartyxxxxxxxxxxxxxxxxxxw1dfzr";
-                    else if (cfg.symbol == "PEP")
-                        cfg.aux_payout_address = "PSimbaxxxxxxxxxxxxxxxxxxxxUMbTDw";
-                    else if (cfg.symbol == "BELLS")
-                        cfg.aux_payout_address = solo_address;  // no well-known burn; use operator address
-                    else if (cfg.symbol == "LKY")
-                        cfg.aux_payout_address = solo_address;
-                    else if (cfg.symbol == "JKC")
-                        cfg.aux_payout_address = solo_address;
-                    else if (cfg.symbol == "SHIC")
-                        cfg.aux_payout_address = solo_address;
-                    else if (cfg.symbol == "DINGO")
-                        cfg.aux_payout_address = solo_address;
+                    // The address createauxblock gets: the operator's
+                    // (--merged-payout-address), else the built-in one (DOGE
+                    // only), checked against the chain's own address versions
+                    // (aux_chain_params.hpp): on mainnet exactly, on testnet
+                    // against its testnet and regtest ones, and against the
+                    // daemon's own network once it answers (check_payout_address).
+                    // The daemon refuses an address of another chain or network
+                    // (-8 / -5 "Invalid coinbase payout address"), so a chain
+                    // reached over RPC only is not registered without a valid one;
+                    // a chain with an embedded backend (DOGE, NMC, DGB), which
+                    // never calls createauxblock, keeps mining without its RPC
+                    // fallback. multiaddress mode: the PPLNS coinbase is c2pool's
+                    // own; this address is never paid.
+                    bool rpc_address_ok = false;
+                    std::string rpc_address_error;
+                    {
+                        std::string sym_up = cfg.symbol;
+                        for (auto& c : sym_up) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                        const auto ov = merged_payout_addresses.find(sym_up);
+                        const auto pa = c2pool::merged::resolve_aux_payout_address(
+                            cfg.symbol,
+                            settings->m_testnet ? c2pool::merged::AuxNetwork::testnet
+                                                : c2pool::merged::AuxNetwork::mainnet,
+                            ov != merged_payout_addresses.end() ? ov->second : std::string());
+                        rpc_address_ok = pa.ok;
+                        rpc_address_error = pa.error;
+                        // A chain c2pool has no address parameters for (e.g. DGB as
+                        // an aux chain) and no configured address: as before, its
+                        // backends are kept and createauxblock gets no address.
+                        if (!pa.ok && pa.address.empty() && !c2pool::merged::find_aux_chain_params(cfg.symbol)) {
+                            rpc_address_ok = true;
+                            LOG_WARNING << "[MM:" << cfg.symbol << "] no address parameters for this chain and no "
+                                           "--merged-payout-address " << cfg.symbol << ":<address>: createauxblock "
+                                           "gets none (as before)";
+                        }
+                        if (pa.ok) {
+                            cfg.aux_payout_address = pa.address;
+                            cfg.check_payout_address = [sym = cfg.symbol, addr = pa.address](const std::string& chain) {
+                                return c2pool::merged::check_aux_address_on_chain(sym, chain, addr);
+                            };
+                            LOG_INFO << "[MM:" << cfg.symbol << "] createauxblock payout address " << pa.address
+                                     << " (" << pa.source << ")";
+                        } else if (!pa.address.empty()) {
+                            LOG_ERROR << "[MM:" << cfg.symbol << "] " << pa.error;
+                        }
+                        if (const auto* cp = c2pool::merged::find_aux_chain_params(cfg.symbol)) {
+                            const auto& v = settings->m_testnet ? cp->test : cp->main;
+                            if (!v.p2pkh.empty()) cfg.address_version = v.p2pkh.front();
+                            if (!v.p2sh.empty()) cfg.p2sh_version = v.p2sh.front();
+                        }
+                    }
+                    // A chain reached over RPC only, without a valid address: not mined.
+                    const auto refuse_rpc_only = [&]() {
+                        const std::string msg = "merged chain " + cfg.symbol + " (chain_id "
+                            + std::to_string(cfg.chain_id) + ") DISABLED: " + rpc_address_error;
+                        LOG_ERROR << "[MM:" << cfg.symbol << "] " << msg;
+                        std::cerr << "c2pool: " << msg << std::endl;
+                    };
+                    // An embedded chain without a valid address: no RPC fallback.
+                    const auto rpc_fallback_ok = [&]() {
+                        if (cfg.rpc_port == 0 || cfg.rpc_userpass.empty())
+                            return false;
+                        if (!rpc_address_ok)
+                            LOG_WARNING << "[MM:" << cfg.symbol << "] RPC fallback at " << cfg.rpc_host << ":"
+                                        << cfg.rpc_port << " NOT used (" << rpc_address_error
+                                        << "); the embedded backend keeps mining";
+                        return rpc_address_ok;
+                    };
 
                     // P2P port: explicit (7th field) or auto-detected from symbol
                     if (parts.size() >= 7 && !parts[6].empty()) {
@@ -7062,6 +7959,16 @@ int main(int argc, char* argv[]) {
                         cfg.p2p_port = static_cast<uint16_t>(doge_p2p_port);
                         LOG_INFO << "DOGE P2P port overridden via --doge-p2p-port: " << doge_p2p_port;
                     }
+                    // --no-embedded-doge: no DOGE networking of its own at all
+                    // (no header chain, no P2P peers, no DNS seeds), even with a
+                    // P2P port in the --merged spec: the daemon over RPC only.
+                    {
+                        const uint16_t port = c2pool::merged::merged_p2p_port(cfg.symbol, embedded_doge, cfg.p2p_port);
+                        if (port != cfg.p2p_port)
+                            LOG_INFO << "[MM:" << cfg.symbol << "] --no-embedded-doge: no DOGE P2P / DNS ("
+                                     << "the daemon at " << cfg.rpc_host << ":" << cfg.rpc_port << " over RPC only)";
+                        cfg.p2p_port = port;
+                    }
 
                     // Create DOGE HeaderChain when embedded OR P2P is available.
                     // Even in RPC-primary mode, the HeaderChain enables live header sync
@@ -7085,6 +7992,7 @@ int main(int argc, char* argv[]) {
                         std::string doge_db = (core::filesystem::config_path()
                             / doge_net_dir / "embedded_headers").string();
                         doge_chain = std::make_unique<doge::coin::HeaderChain>(*doge_params_ptr, doge_db);
+                        doge_chain->set_store_share(fd_plan.doge_headers);
                         {
                             bool doge_ok = false;
                             for (int attempt = 1; attempt <= 5; ++attempt) {
@@ -7093,54 +8001,18 @@ int main(int argc, char* argv[]) {
                                             << attempt << "/5) — retrying in 2s...";
                                 std::this_thread::sleep_for(std::chrono::seconds(2));
                                 doge_chain = std::make_unique<doge::coin::HeaderChain>(*doge_params_ptr, doge_db);
+                                doge_chain->set_store_share(fd_plan.doge_headers);
                             }
                             if (!doge_ok)
                                 LOG_WARNING << "DOGE HeaderChain LevelDB init failed after 5 attempts — in-memory only";
                         }
 
-                        // Apply DOGE checkpoint if provided
-                        if (!doge_header_checkpoint_str.empty()) {
-                            auto colon = doge_header_checkpoint_str.find(':');
-                            if (colon != std::string::npos) {
-                                uint32_t cp_h = static_cast<uint32_t>(std::stoul(
-                                    doge_header_checkpoint_str.substr(0, colon)));
-                                uint256 cp_hash;
-                                cp_hash.SetHex(doge_header_checkpoint_str.substr(colon + 1));
-                                if (!cp_hash.IsNull())
-                                    doge_chain->set_dynamic_checkpoint(cp_h, cp_hash);
-                            }
-                        }
-
-                        // Seed genesis if empty (same pattern as LTC genesis seeding).
-                        // Reference: dogecoin/src/chainparams.cpp CreateGenesisBlock()
-                        //   All networks: merkle_root=5b2a3f53..., version=1, bits=0x1e0ffff0
-                        //   Mainnet:       nTime=1386325540, nNonce=99943
-                        //   Testnet:       nTime=1391503289, nNonce=997879
-                        //   Testnet4alpha: nTime=1737907200, nNonce=1812121
-                        if (doge_chain->size() == 0) {
-                            ltc::coin::BlockHeaderType genesis;
-                            genesis.m_previous_block.SetNull();
-                            genesis.m_version = 1;
-                            genesis.m_merkle_root.SetHex("5b2a3f53f605d62c53e62932dac6925e3d74afa5a4b459745c36d42d0ed26a69");
-                            genesis.m_bits = 0x1e0ffff0;
-                            if (doge_testnet4alpha) {
-                                genesis.m_timestamp = 1737907200;
-                                genesis.m_nonce     = 1812121;
-                            } else if (settings->m_testnet) {
-                                genesis.m_timestamp = 1391503289;
-                                genesis.m_nonce     = 997879;
-                            } else {
-                                genesis.m_timestamp = 1386325540;
-                                genesis.m_nonce     = 99943;
-                            }
-                            if (doge_chain->add_header(genesis))
-                                LOG_INFO << "[DOGE] HeaderChain: genesis block seeded (height 0)";
-                            else
-                                LOG_WARNING << "[DOGE] HeaderChain: genesis seed rejected — wrong genesis hash?";
-                        } else {
-                            LOG_INFO << "DOGE HeaderChain: loaded " << doge_chain->size()
-                                     << " headers (height=" << doge_chain->height() << ")";
-                        }
+                        // The checkpoint applied (pinned; the root when above the
+                        // tip), then genesis when empty: the same start the tests
+                        // drive (doge::coin::start_doge_chain). init() above has
+                        // already re-rooted an older store format.
+                        doge::coin::start_doge_chain(*doge_chain, doge_header_checkpoint_str,
+                                                     doge::coin::doge_genesis_header(settings->m_testnet, doge_testnet4alpha));
 
                         if (!doge_pool)
                             doge_pool = std::make_unique<ltc::coin::Mempool>(core::coin::DOGE_LIMITS);
@@ -7171,9 +8043,11 @@ int main(int argc, char* argv[]) {
                             core::LevelDBOptions full_opts;
                             full_opts.write_buffer_size = 64 * 1024 * 1024;
                             full_opts.block_cache_size = 128 * 1024 * 1024;
-                            full_opts.max_open_files = doge::coin::StoreFds::full_set(core::raise_nofile_limit(65536));
+                            // The share the node planned (FdPlan): pread, or mapped tables
+                            // under a tight fd limit.
+                            full_opts.max_open_files = fd_plan.doge_full.max_open_files;
                             full_opts.max_file_size = 32 * 1024 * 1024;
-                            full_opts.mmap_reads = false;
+                            full_opts.mmap_reads = fd_plan.doge_full.mmap_reads;
                             // malloc's thread arenas (813 MB of anonymous mappings there).
                             doge::coin::ProcessMemory::limit_arenas();
                             // A set another c2pool holds (the same --data-dir) is waited
@@ -7320,6 +8194,10 @@ int main(int argc, char* argv[]) {
                         if (!doge_pool->utxo()) {
                             LOG_ERROR << "[EMB-DOGE] No DOGE UTXO set: embedded DOGE backend not installed"
                                       << (cfg.rpc_port > 0 ? " — using the RPC path" : "");
+                            if (!rpc_address_ok) {
+                                refuse_rpc_only();
+                                continue;
+                            }
                             mm_manager->add_chain(cfg);
                         } else {
                             auto backend = std::make_unique<doge::coin::AuxChainEmbedded>(
@@ -7333,7 +8211,7 @@ int main(int argc, char* argv[]) {
                             LOG_INFO << "Merged mining: DOGE embedded (primary) chain_id=" << cfg.chain_id;
 
                             // Set RPC as fallback if connection details are available
-                            if (cfg.rpc_port > 0 && !cfg.rpc_userpass.empty()) {
+                            if (rpc_fallback_ok()) {
                                 auto rpc_fallback = std::make_unique<c2pool::merged::AuxChainRPC>(ioc, cfg);
                                 mm_manager->set_fallback_backend(cfg.chain_id, std::move(rpc_fallback));
                                 LOG_INFO << "Merged mining: DOGE RPC fallback at "
@@ -7386,7 +8264,7 @@ int main(int argc, char* argv[]) {
                                 });
                             mm_manager->add_chain(cfg, std::move(backend));
                             LOG_INFO << "Merged mining: NMC embedded (primary) chain_id=" << cfg.chain_id;
-                            if (cfg.rpc_port > 0 && !cfg.rpc_userpass.empty()) {
+                            if (rpc_fallback_ok()) {
                                 auto rpc_fallback = std::make_unique<c2pool::merged::AuxChainRPC>(ioc, cfg);
                                 mm_manager->set_fallback_backend(cfg.chain_id, std::move(rpc_fallback));
                                 LOG_INFO << "Merged mining: NMC RPC fallback at "
@@ -7418,7 +8296,7 @@ int main(int argc, char* argv[]) {
                             mm_manager->add_chain(cfg, std::move(backend));
                             LOG_INFO << "Merged mining: DGB embedded (primary) chain_id=" << cfg.chain_id;
                             // digibyted RPC fallback (embedded primary persists).
-                            if (cfg.rpc_port > 0 && !cfg.rpc_userpass.empty()) {
+                            if (rpc_fallback_ok()) {
                                 auto rpc_fallback = std::make_unique<c2pool::merged::AuxChainRPC>(ioc, cfg);
                                 mm_manager->set_fallback_backend(cfg.chain_id, std::move(rpc_fallback));
                                 LOG_INFO << "Merged mining: DGB RPC fallback at "
@@ -7429,11 +8307,19 @@ int main(int argc, char* argv[]) {
                         // Without -DAUX_DOGE the DGB embedded backend is absent;
                         // fall through to the standard RPC path so the seam is a
                         // no-op rather than a broken reference.
+                        if (!rpc_address_ok) {
+                            refuse_rpc_only();
+                            continue;
+                        }
                         mm_manager->add_chain(cfg);
                         LOG_INFO << "Merged mining: added DGB via RPC (AUX_DOGE off) chain_id=" << cfg.chain_id;
 #endif // AUX_DOGE
                     } else {
                         // Non-DOGE chain or no P2P — standard RPC path
+                        if (!rpc_address_ok) {
+                            refuse_rpc_only();
+                            continue;
+                        }
                         mm_manager->add_chain(cfg);
                         LOG_INFO << "Merged mining: added " << cfg.symbol
                                  << " (chain_id=" << cfg.chain_id << ") at "
@@ -7456,8 +8342,8 @@ int main(int argc, char* argv[]) {
                                 pm_cfg.min_peers = 1;
                                 pm_cfg.disable_discovery = true;
                             } else {
-                                pm_cfg.max_peers = 20;
-                                pm_cfg.min_peers = 4;
+                                pm_cfg.max_peers = fd_plan.merged_peers;   // FdPlan: 20 unless the fd limit is tight
+                                pm_cfg.min_peers = std::min(4, pm_cfg.max_peers);
                             }
                             if (cfg.symbol == "DOGE" || cfg.symbol == "doge")
                                 pm_cfg.connect_only = connect_only_peers(
@@ -7520,12 +8406,21 @@ int main(int argc, char* argv[]) {
                                     return rpc_ptr->getpeerinfo();
                                 });
                             }
-                            // Phase 5.8: wire AuxPoW header parser for DOGE P2P
-                            if (cfg.symbol == "DOGE") {
-                                broadcaster->set_raw_headers_parser(
-                                    doge::coin::parse_doge_headers_message);
-                                broadcaster->set_raw_block_parser(
-                                    doge::coin::parse_doge_block);
+                            // Phase 5.8: wire the AuxPoW header/block parser for
+                            // DOGE P2P. A 'headers' message's proofs go with its
+                            // headers (message_proofs_slot -> on_doge_headers ->
+                            // HeaderChain::add_headers), and the chain checks each
+                            // header against its own copy (CAuxPow::check) on the
+                            // DOGE header pool, not here on the io thread. A block's
+                            // proof is checked as it is parsed.
+                            if (cfg.symbol == "DOGE" && doge_chain) {
+                                const auto rules = doge::coin::auxpow_rules(*doge_params_ptr);
+                                broadcaster->set_raw_headers_parser([](const uint8_t* d, size_t n) {
+                                    return doge::coin::parse_doge_headers_message_with_proofs(d, n);
+                                });
+                                broadcaster->set_raw_block_parser([rules](const uint8_t* d, size_t n) {
+                                    return doge::coin::parse_doge_block(d, n, &rules);
+                                });
                             }
 
                             // Step 4: wire DOGE header sync via AuxPoW parser.
@@ -7543,7 +8438,8 @@ int main(int argc, char* argv[]) {
                                 // The peer whose headers move the tip (the tip handler asks it).
                                 auto doge_hdr_from = std::make_shared<doge::coin::HeadersFrom>();
 
-                                // Wire peer tip height for fast-sync scrypt skip
+                                // A peer's reported tip height: progress and batch
+                                // sizing only; every header's proof is verified.
                                 broadcaster->set_on_peer_height(
                                     [dc = doge_chain.get()](uint32_t h) {
                                         dc->set_peer_tip_height(h);
@@ -7682,8 +8578,13 @@ int main(int argc, char* argv[]) {
                                             LOG_INFO << "[EMB-DOGE] Received " << hdrs.size()
                                                      << " headers from P2P";
                                         auto batch = std::make_shared<std::vector<ltc::coin::BlockHeaderType>>(hdrs);
+                                        // This message's own AuxPoW proofs, aligned with
+                                        // its headers (taken here, in the same call as the
+                                        // parse, before the batch leaves the io thread).
+                                        auto proofs = std::make_shared<std::vector<std::optional<doge::coin::CAuxPow<>>>>(
+                                            doge::coin::take_message_proofs(hdrs.size()));
                                         boost::asio::post(*doge_hdr_pool,
-                                            [batch, dc, bcaster_ptr, &ioc, sched, sched_sync, range_sync, send_sched_ask,
+                                            [batch, proofs, dc, bcaster_ptr, &ioc, sched, sched_sync, range_sync, send_sched_ask,
                                              full, key, doge_hdr_asks, doge_hdr_from, truncated_at]() {
                                                 // Below the checkpoint: an anchored range, or the
                                                 // sequential schedule's batch (doge::coin::route_headers);
@@ -7721,7 +8622,7 @@ int main(int argc, char* argv[]) {
                                                     return;
                                                 }
                                                 doge_hdr_from->set(key);
-                                                int accepted = dc->add_headers(*batch);
+                                                int accepted = dc->add_headers(*batch, proofs.get());
                                                 doge_hdr_from->clear();
                                                 if (accepted > 0)
                                                     LOG_INFO << "[EMB-DOGE] add_headers: "
@@ -8953,18 +9854,10 @@ int main(int argc, char* argv[]) {
                     return result;
                 });
               } else {
-                // P2P mode: PPLNS weights from the share tracker
-                // Build operator LTC script for merged address override (p2pool --merged-operator-address)
-                auto operator_ltc_script = node_owner_address.empty()
-                    ? std::vector<unsigned char>{}
-                    : core::address_to_script(node_owner_address);
-                auto operator_merged_script = node_owner_merged_address.empty()
-                    ? std::vector<unsigned char>{}
-                    : core::address_to_script(node_owner_merged_address);
-                if (!node_owner_merged_address.empty()) {
-                    LOG_INFO << "Merged operator address override: " << node_owner_merged_address
-                             << " (script " << operator_merged_script.size() << " bytes)";
-                }
+                // P2P mode: PPLNS weights from the share tracker, exactly as
+                // p2pool derives them (no node-local redirect: the operator's
+                // merged address reaches the payouts as the merged address of
+                // the operator's own shares, see set_operator_merged_scripts).
                 // The tracker lock is often busy (the compute thread holds it
                 // exclusively while it processes shares, for tens of seconds
                 // at a stretch): the compute thread publishes the PPLNS
@@ -8983,7 +9876,7 @@ int main(int argc, char* argv[]) {
                 // COMBINED_DONATION_SCRIPT (P2SH) regardless of share version
                 // (p2pool data.py line 303); the parent chain uses the
                 // version-dependent donation.
-                auto merged_weights = [operator_ltc_script, operator_merged_script, combined_donation](
+                auto merged_weights = [combined_donation](
                     ltc::ShareTracker& tracker, const uint256& best, uint32_t chain_id)
                     -> c2pool::merged::MergedPayoutSource::Weights
                 {
@@ -8993,8 +9886,7 @@ int main(int argc, char* argv[]) {
                     if (best.IsNull() || !tracker.chain.contains(best))
                         return out;   // no derive: no payouts
                     auto w = std::make_shared<const ltc::MergedPayoutWeights>(
-                        tracker.get_merged_payout_weights(best, chain_id, operator_ltc_script,
-                                                          operator_merged_script));
+                        tracker.get_merged_payout_weights(best, chain_id));
                     out.chain_len = w->chain_len;
                     out.derive = [w, combined_donation](uint64_t coinbase_value) {
                         return ltc::ShareTracker::merged_payout_outputs(*w, coinbase_value,
@@ -9119,11 +10011,32 @@ int main(int argc, char* argv[]) {
                         web_server.trigger_work_refresh_debounced();
                     });
 
-                    // Wire DOGE block verifier.
-                    // Note: the aux block hash from createauxblock is NOT the chain
-                    // block hash. After submitauxblock, the actual block gets a
-                    // different hash (includes AuxPoW proof). We verify by checking
-                    // if the daemon's best block height >= our block height.
+                    // Wire the merged found-block verifiers: our block against
+                    // the aux chain's best chain at the height it was mined at
+                    // (aux_verdict). DOGE and NMC read their embedded header
+                    // chains when present; any other chain its daemon's best
+                    // chain (getblockcount / getblockhash / getblockheader):
+                    // a daemon that merely answers is not a confirmation, and
+                    // a block it took as "inconclusive" is confirmed only if
+                    // its chain ends up with it.
+                    auto header_view = [](const auto* hc) {
+                        ltc::coin::found_block::ChainView view;
+                        view.height_of = [hc](const uint256& hh) -> std::optional<uint32_t> {
+                            auto e = hc->get_header(hh);
+                            if (!e)
+                                return std::nullopt;
+                            return e->height;
+                        };
+                        view.hash_at = [hc](uint32_t hh) -> std::optional<uint256> {
+                            auto e = hc->get_header_by_height(hh);
+                            if (!e)
+                                return std::nullopt;
+                            return e->block_hash;
+                        };
+                        view.tip_height = [hc]() { return hc->height(); };
+                        view.has_tip = [hc]() { return hc->tip().has_value(); };
+                        return view;
+                    };
                     for (auto& chain : merged_chain_specs) {
                         auto parts_check = std::vector<std::string>();
                         { std::istringstream ss(chain); std::string t;
@@ -9133,44 +10046,23 @@ int main(int argc, char* argv[]) {
                             uint32_t cid = static_cast<uint32_t>(std::stoul(parts_check[1]));
                             auto* rpc_backend = mm_manager->get_chain_rpc(cid);
                             if (rpc_backend) {
+                                std::optional<ltc::coin::found_block::ChainView> embedded_view;
+                                if (cid == 98 && doge_chain)
+                                    embedded_view = header_view(doge_chain.get());
+                                else if (cid == 1 && nmc_chain)
+                                    embedded_view = header_view(nmc_chain.get());
                                 mi_ptr->add_chain_verify_fn(sym,
-                                    [rpc_backend, mi_ptr, dc = (cid == 98 ? doge_chain.get() : nullptr)](
-                                        const std::string& hash_hex) -> int {
-                                        ltc::coin::found_block::ChainView view;
-                                        view.height_of = [dc](const uint256& hh) -> std::optional<uint32_t> {
-                                            if (!dc)
-                                                return std::nullopt;
-                                            auto e = dc->get_header(hh);
-                                            if (!e)
-                                                return std::nullopt;
-                                            return e->height;
-                                        };
-                                        view.hash_at = [dc](uint32_t hh) -> std::optional<uint256> {
-                                            if (!dc)
-                                                return std::nullopt;
-                                            auto e = dc->get_header_by_height(hh);
-                                            if (!e)
-                                                return std::nullopt;
-                                            return e->block_hash;
-                                        };
-                                        view.tip_height = [dc]() { return dc ? dc->height() : 0u; };
-                                        view.has_tip = [dc]() { return dc && dc->tip().has_value(); };
-                                        if (!dc) {
-                                            // No embedded header chain for this aux chain
-                                            // (not DOGE): the backend being alive is all
-                                            // there is to go on, as before.
-                                            try {
-                                                return rpc_backend->get_best_block_hash().empty() ? 0 : 1;
-                                            } catch (...) {
-                                                return 0; // unreachable — can't verify
-                                            }
-                                        }
-                                        // DOGE: our block against the DOGE best chain at
-                                        // the height it was mined at.
+                                    [rpc_backend, mi_ptr, embedded_view](const std::string& hash_hex) -> int {
                                         uint256 h;
                                         h.SetHex(hash_hex);
-                                        return ltc::coin::found_block::aux_verdict(
-                                            view, h, found_block_height(*mi_ptr, hash_hex));
+                                        const auto found_height = found_block_height(*mi_ptr, hash_hex);
+                                        if (embedded_view)
+                                            return ltc::coin::found_block::aux_verdict(*embedded_view, h, found_height);
+                                        try {
+                                            return c2pool::merged::aux_backend_verdict(*rpc_backend, h, found_height);
+                                        } catch (...) {
+                                            return 0;  // cannot tell: pending
+                                        }
                                     });
                             }
                         }
@@ -9190,8 +10082,9 @@ int main(int argc, char* argv[]) {
             LOG_INFO << "Redistribute mode: " << ltc::format_hybrid_weights(hybrid_weights);
 
             // Set operator identity for "fee" and "boost" modes.
-            // get_node_fee_hash160() extracts the hash160 from the P2PKH fee scriptPubKey
-            // that was set earlier via set_node_fee_from_address().
+            // get_node_fee_hash160() extracts the hash160 from the fee scriptPubKey
+            // that was set earlier via set_node_fee_from_address(); the type is
+            // the operator address's own (P2SH paid as P2PKH would pay nobody).
             {
                 auto op_h160 = web_server.get_mining_interface()->get_node_fee_hash160();
                 if (op_h160.size() == 40) {
@@ -9199,7 +10092,11 @@ int main(int argc, char* argv[]) {
                     for (int i = 0; i < 20; ++i)
                         op_hash.data()[i] = static_cast<uint8_t>(
                             std::stoul(op_h160.substr(i * 2, 2), nullptr, 16));
-                    redistributor->set_operator_identity(op_hash, 0); // P2PKH
+                    // The operator's own script type (p2pool: my_pubkey_type).
+                    std::string op_atype;
+                    core::address_to_hash160(node_owner_address, op_atype);
+                    const uint8_t op_type = op_atype == "p2sh" ? 2 : op_atype == "p2wpkh" ? 1 : 0;
+                    redistributor->set_operator_identity(op_hash, op_type);
                 }
             }
 
@@ -9219,26 +10116,57 @@ int main(int argc, char* argv[]) {
             if (p2p_node) {
                 auto* redistributor_ptr = redistributor.get();
                 auto* node_ptr = p2p_node.get();
+                // The pick reads the tracker: only under its read lock (a
+                // try-lock from the stratum thread; when the compute thread
+                // holds it, the operator / donation identity instead). The
+                // callbacks are published under MiningInterface's mutex: the
+                // HTTP thread can build a payout too (mining_submit).
+                const auto hex160 = [](const uint160& h) {
+                    static const char* HEX = "0123456789abcdef";
+                    std::string out;
+                    out.reserve(40);
+                    const unsigned char* bytes = h.data();
+                    for (int i = 0; i < 20; ++i) {
+                        out += HEX[bytes[i] >> 4];
+                        out += HEX[bytes[i] & 0x0f];
+                    }
+                    return out;
+                };
+                const auto pick_locked = [redistributor_ptr, node_ptr]() {
+                    auto guard = node_ptr->read_tracker();
+                    auto result = redistributor_ptr->pick_if_locked(guard, *guard, node_ptr->best_share_hash());
+                    // No recipient (no operator identity set, nothing in the
+                    // window) or a type a share cannot carry: the combined
+                    // donation (P2SH), never the zero key.
+                    if (result.pubkey_hash.IsNull() || result.pubkey_type > 2) {
+                        std::memcpy(result.pubkey_hash.data(),
+                                    ltc::PoolConfig::COMBINED_DONATION_SCRIPT.data() + 2, 20);
+                        result.pubkey_type = 2;
+                    }
+                    return result;
+                };
+                // The pick with its pubkey type (P2SH donation, a P2SH / P2WPKH
+                // miner): decide_job_payout pays the recipient's own script type.
+                web_server.get_mining_interface()->set_redistribute_fn(
+                    [pick_locked, hex160]() -> std::pair<std::string, uint8_t> {
+                        const auto result = pick_locked();
+                        return {hex160(result.pubkey_hash), result.pubkey_type};
+                    });
                 web_server.get_mining_interface()->set_address_fallback_fn(
-                    [redistributor_ptr, node_ptr](const std::string& /*bad_addr*/) -> std::string {
-                        auto best = node_ptr->best_share_hash();
-                        auto result = redistributor_ptr->pick(node_ptr->tracker(), best);
-                        static const char* HEX = "0123456789abcdef";
-                        std::string h160;
-                        h160.reserve(40);
-                        const unsigned char* bytes = result.pubkey_hash.data();
-                        for (int i = 0; i < 20; ++i) {
-                            h160 += HEX[bytes[i] >> 4];
-                            h160 += HEX[bytes[i] & 0x0f];
-                        }
-                        return h160;
+                    [pick_locked, hex160](const std::string& /*bad_addr*/) -> std::pair<std::string, uint8_t> {
+                        const auto result = pick_locked();
+                        return {hex160(result.pubkey_hash), result.pubkey_type};
                     });
             } else if (!payout_address.empty()) {
                 // Solo/custodial: invalid miner address → use node operator address
+                // (with its own type; a P2WSH / P2TR one cannot be a share's).
                 web_server.get_mining_interface()->set_address_fallback_fn(
-                    [&payout_address](const std::string& /*bad_addr*/) -> std::string {
+                    [&payout_address](const std::string& /*bad_addr*/) -> std::pair<std::string, uint8_t> {
                         std::string atype;
-                        return core::address_to_hash160(payout_address, atype);
+                        auto h160 = core::address_to_hash160(payout_address, atype);
+                        if (h160.size() != 40 || (atype != "p2pkh" && atype != "p2sh" && atype != "p2wpkh"))
+                            return {std::string(), 0};
+                        return {h160, static_cast<uint8_t>(atype == "p2sh" ? 2 : atype == "p2wpkh" ? 1 : 0)};
                     });
             }
             // Keep redistributor alive for the lifetime of the pool

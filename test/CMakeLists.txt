@@ -438,6 +438,9 @@ if (BUILD_TESTING AND GTest_FOUND)
     # the per-share split on an individual share's page. FOLDED in for the same
     # reason; needs the same link set plus the header-only mint/producer weight
     # walk and coinbase allocator, both already reachable from `dash`.
+    # test_dash_reload_block_flag.cpp: a share that solved a block keeps its
+    # block flag when the node reloads it from the store as verified, and no
+    # second found-block event fires (load_persisted_shares).
     # test_dash_v36_live_variant.cpp: the private/isolated DASH v36 sharechain
     # live-variant KATs (load gate, share-type admission, type dispatch, node
     # receive -> tracker verify -> LevelDB persist -> reload of v36 shares).
@@ -476,7 +479,7 @@ if (BUILD_TESTING AND GTest_FOUND)
     # (disconnect, inbound refusal, decay, per-offence weights, public-network
     # oracle parity, whitelist). Same harness and link set; folded in for the
     # same reason.
-    add_executable(test_dash_node test_dash_node.cpp test_dash_dashboard_found_block.cpp test_dash_addrme.cpp test_dash_standing_forget.cpp test_dash_block_confirm_lane.cpp test_dash_dashboard_views.cpp test_dash_dashboard_pplns.cpp test_dash_shutdown_order.cpp test_dash_v36_live_variant.cpp test_dash_v36_flip.cpp test_dash_v36_e2e.cpp test_dash_v36_template_txs.cpp test_dash_v36_finder_block.cpp test_dash_share_precheck.cpp test_dash_outbound_redial.cpp test_dash_peer_misbehaviour.cpp test_dash_self_connection_ban.cpp)
+    add_executable(test_dash_node test_dash_node.cpp test_dash_dashboard_found_block.cpp test_dash_addrme.cpp test_dash_standing_forget.cpp test_dash_block_confirm_lane.cpp test_dash_dashboard_views.cpp test_dash_dashboard_pplns.cpp test_dash_shutdown_order.cpp test_dash_v36_live_variant.cpp test_dash_reload_block_flag.cpp test_dash_v36_flip.cpp test_dash_v36_e2e.cpp test_dash_v36_template_txs.cpp test_dash_v36_finder_block.cpp test_dash_share_precheck.cpp test_dash_outbound_redial.cpp test_dash_peer_misbehaviour.cpp test_dash_self_connection_ban.cpp)
     target_link_libraries(test_dash_node PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core
@@ -780,14 +783,27 @@ if (BUILD_TESTING AND GTest_FOUND)
     # CSimplifiedMNList wire + CalcHash (SER_GETHASH) + memcmp sort + merkle root.
     # Header-only over core/uint256 + core/pack + core/hash; no ltc/pool SCC
     # dependency. Base leaf of the embedded_gbt dependency chain (S7 main).
-    add_executable(test_dash_simplifiedmns test_dash_simplifiedmns.cpp)
+    #
+    # Second TU: test_dash_v24_protx_codecs.cpp -- Dash Core v24 provider
+    # payload codecs (ProTx v3, ExtNetInfo, types 10-12, SML entry v3): testnet
+    # captures, synthetic Core-layout vectors (dash_v24_s2_vectors.inc), the
+    # reject-reason table and the pre-v24 golden vs a frozen copy of the
+    # master codecs. Header-only over the same vendor leaves; folded into this
+    # allowlisted target (a standalone one would be a NOT_BUILT sentinel, #769).
+    # DASH_FIXTURE_DIR: the golden reads the real testnet mnlistdiff captures.
+    add_executable(test_dash_simplifiedmns test_dash_simplifiedmns.cpp
+        test_dash_v24_protx_codecs.cpp)
+    # dash_bls_verify: Core's BLS key / signature decoding in the v24 payload
+    # rules (vendor/bls_canonical.hpp; a fail-closed stub without dashbls).
     target_link_libraries(test_dash_simplifiedmns PRIVATE
         GTest::gtest_main GTest::gtest
-        dash_x11 core
+        dash_bls_verify dash_x11 core
         nlohmann_json::nlohmann_json
         ${Boost_LIBRARIES}
     )
     target_link_libraries(test_dash_simplifiedmns PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
+    target_compile_definitions(test_dash_simplifiedmns PRIVATE
+        DASH_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
     gtest_add_tests(test_dash_simplifiedmns "" AUTO)
 
     # DASH daemonless-fold SIMD-SHA256 reward-safety KAT (dashd-cut replay
@@ -1000,7 +1016,9 @@ if (BUILD_TESTING AND GTest_FOUND)
     # ProUpServTx / ProUpRevTx operator-signature check against real dashbls
     # keys — rides this BLS-backend target because it signs.
     add_executable(test_dash_govvote_bls test_dash_govvote_bls.cpp
-        test_dash_protx_sig_bls.cpp)
+        test_dash_protx_sig_bls.cpp
+        test_dash_v24_protx_check.cpp    # S6: Dash Core CheckPro*Tx before a provider tx rides a template
+        test_dash_v24_alltx.cpp)         # every Dash Core v24 miner tx type: MNHF (7), shared MNs (10-12), v24 fold
     target_link_libraries(test_dash_govvote_bls PRIVATE
         GTest::gtest_main GTest::gtest
         dash_bls_verify
@@ -1080,6 +1098,9 @@ if (BUILD_TESTING AND GTest_FOUND)
                    test_dash_replay_payee_publish.cpp
                    test_dash_replay_mnlist_seed.cpp
                    test_dash_replay_prestate_empty_dip3.cpp
+                   # Dash Core v24 (S3): state transitions, the shared-collateral
+                   # and ProDisTx rules, and the v24 persistence formats.
+                   test_dash_v24_mn_state.cpp
                    # Differential KAT (Dash Core v23.1.9 PR-1 verify, M1/M2): the
                    # template fold must commit the root the root-proven DML fold
                    # computes and refuse what it refuses (real dashbls keys).
@@ -1134,6 +1155,7 @@ if (BUILD_TESTING AND GTest_FOUND)
     add_executable(test_dash_embedded_gbt
         test_dash_embedded_gbt.cpp
         test_dash_embedded_cbtx_byte_parity.cpp
+        test_dash_v24_cbtx.cpp            # Dash Core v24 CbTx version 4 (S1)
         test_dash_mnlistdiff_root_parity.cpp
         test_dash_qrinfo.cpp
         test_dash_rotated_quorum_members.cpp
@@ -1282,7 +1304,18 @@ if (BUILD_TESTING AND GTest_FOUND)
     # retained-fallback KAT; harness-free (embedded builder injected as a stub,
     # oracle-parity already pinned by test_dash_embedded_gbt). Same link set as
     # the embedded_gbt capstone (work_source.hpp includes embedded_gbt.hpp).
-    add_executable(test_dash_work_source test_dash_work_source.cpp)
+    # Second TU: test_dash_v24_deployments.cpp -- Dash Core v24 deployment
+    # tracking (versionbits port, EHF signal tracker, deployment status, the
+    # testnet replay of the 1,578,000 switch). Header-only; folded into this
+    # allowlisted target (a standalone one would be a NOT_BUILT sentinel, #769).
+    # Third TU: test_dash_bls_mode_probe.cpp -- the one-BLS-mode guard
+    # (vendor/bls_mode_guard.hpp): compiled with C2POOL_DASH_BLS forced on
+    # while the rest of this target is not, so the binary is mixed on purpose
+    # and the guard must detect it (it includes nothing else).
+    add_executable(test_dash_work_source test_dash_work_source.cpp
+        test_dash_v24_deployments.cpp
+        test_dash_bls_mode_probe.cpp)
+    set_source_files_properties(test_dash_bls_mode_probe.cpp PROPERTIES COMPILE_DEFINITIONS C2POOL_DASH_BLS)
     target_link_libraries(test_dash_work_source PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core
@@ -1382,6 +1415,12 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_compile_definitions(test_dash_stratum_work_source PRIVATE
         DASH_WORK_SOURCE_SRC="${CMAKE_CURRENT_SOURCE_DIR}/../src/impl/dash/stratum/work_source.cpp"
         DASH_MAIN_SRC="${CMAKE_CURRENT_SOURCE_DIR}/../src/c2pool/main_dash.cpp")
+    # One BLS mode per binary: with the backend in the build, work_source.cpp
+    # (dash_stratum) and this target's own TUs must all be backend-mode
+    # (DashBlsModeGuard.StratumObjectsShareTheBuildsBlsMode).
+    if(C2POOL_DASH_BLS_AVAILABLE)
+        target_compile_definitions(test_dash_stratum_work_source PRIVATE C2POOL_DASH_BLS_EXPECTED=1)
+    endif()
     gtest_add_tests(test_dash_stratum_work_source "" AUTO)
 
     # CoinStateMaintainer: drives NodeCoinState off async tip/MN/mempool update

@@ -11,12 +11,19 @@
 // Timeline bucketing (time-dependent) is NOT included — bucket boundaries
 // shift with "now" and can't be pre-aggregated. The caller does a short
 // walk for recent shares only (last hour ≈ few hundred shares).
+//
+// Threads: like WeightsSkipList, query() fills the cache it reads (m_nodes)
+// and is called by several threads at once under a shared tracker lock (the
+// dashboard's sharechain-stats readers), so query(), forget() and clear()
+// hold m_mutex. The callbacks run under it and must not call back into the
+// same skip list.
 
 #pragma once
 
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <mutex>
 #include <random>
 #include <string>
 #include <unordered_map>
@@ -103,14 +110,25 @@ public:
         , m_rng(std::random_device{}())
     {}
 
-    void forget(const uint256& hash) { m_nodes.erase(hash); }
-    void clear()                     { m_nodes.clear(); }
+    void forget(const uint256& hash)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_nodes.erase(hash);
+    }
+    void clear()
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_nodes.clear();
+    }
 
     /// Accumulate stats over `max_shares` shares backward from `start`.
     StatsResult query(const uint256& start, int32_t max_shares)
     {
         if (start.IsNull() || !m_get_delta || max_shares <= 0)
             return {};
+
+        // Both phases: phase 1 extends m_nodes, phase 2 walks it.
+        std::lock_guard<std::mutex> lock(m_mutex);
 
         // Phase 1: ensure nodes are cached (build tail→head)
         {
@@ -228,6 +246,8 @@ private:
         }
     }
 
+    // Guards m_nodes and m_rng (query, forget, clear).
+    std::mutex   m_mutex;
     get_delta_fn m_get_delta;
     previous_fn  m_previous;
     std::mt19937 m_rng;

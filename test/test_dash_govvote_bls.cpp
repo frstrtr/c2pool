@@ -533,3 +533,117 @@ TEST(DashGovVoteBLS, MaintainerIngestsNoneVote) {
 }
 
 } // namespace
+
+// P-3: the payee projection stores operator keys as canonical BASIC bytes,
+// so the governance tally verifies with key_legacy_scheme = false and NO
+// pubkey-scheme fallback. Read as legacy, B(P) decodes to -P for about half
+// of all keys, so the fallback form accepted a vote signed with -sk, which
+// dashd rejects. Secrets {s, 0, ..., 0}, s = 1..64; the -sk signature is the
+// negated +sk signature.
+#ifdef C2POOL_DASH_BLS
+#include <dashbls/bls.hpp>
+TEST(DashGovVoteBLS, CanonicalBasicKeyVerifiesWithoutTheSchemeFallback)
+{
+    uint256 digest;
+    for (int i = 0; i < 32; ++i) digest.data()[i] = static_cast<uint8_t>(0x5a + i);
+    const bls::Bytes msg(digest.data(), 32);
+    size_t old_form_accepts_neg = 0;
+    for (int s = 1; s <= 64; ++s) {
+        std::vector<uint8_t> skb(32, 0);
+        skb[0] = static_cast<uint8_t>(s);
+        const auto sk = bls::PrivateKey::FromBytes(bls::Bytes(skb.data(), skb.size()));
+        std::array<uint8_t, 48> stored{};
+        const auto pb = sk.GetG1Element().Serialize(/*fLegacy=*/false);
+        std::copy_n(pb.begin(), 48, stored.begin());
+        const bls::G2Element good = bls::BasicSchemeMPL().Sign(sk, msg);
+        const std::vector<uint8_t> good_sig = good.Serialize(false);
+        const std::vector<uint8_t> neg_sig = good.Negate().Serialize(false);
+        EXPECT_TRUE(verify_govvote_operator_sig(stored, false, digest, good_sig, false)) << s;
+        EXPECT_FALSE(verify_govvote_operator_sig(stored, false, digest, neg_sig, false)) << s;
+        // The pre-P-3 call (legacy flag for a v1 masternode, fallback on).
+        old_form_accepts_neg += verify_govvote_operator_sig(stored, true, digest, neg_sig, true);
+    }
+    EXPECT_GT(old_form_accepts_neg, 0u) << "the hole the fix closes";
+}
+
+// ── C3: TRIGGER-object masternode signature (dashcore IsValidLocally) ───────
+// Dash Core v24 governance/object.cpp:746-761: a TRIGGER is admitted only when
+// the object's vchSig verifies under the creating MN's OPERATOR key over
+// CGovernanceObject::GetSignatureHash (object.cpp:551-575 — Governance::Object
+// serialized without vchSig; governance/signing.cpp signs it with SignBasic).
+// Same BLS primitive as the vote path (basic scheme, no key-scheme fallback),
+// different digest: govobject_signature_hash.
+TEST(DashGovVoteBLS, TriggerObjectSignatureGatesAdmissionC3) {
+    if (!bls_backend_available()) GTEST_SKIP();
+    using dash::coin::CoinStateMaintainer;
+    std::vector<uint8_t> seed(32, 0x3c);
+    bls::PrivateKey sk = bls::BasicSchemeMPL().KeyGen(seed);
+    std::array<uint8_t, 48> pk{};
+    {
+        const auto pb = sk.GetG1Element().Serialize(/*fLegacy=*/false);
+        std::copy_n(pb.begin(), 48, pk.begin());
+    }
+    const uint256 op_hash = uint256S(kMnCollateralDisplay);
+    const uint32_t op_index = kMnCollateralIndex;
+    const int32_t H = 1519824;
+    const std::string json =
+        std::string("{\"event_block_height\":") + std::to_string(H) +
+        ",\"payment_addresses\":\"yeRZBWYfeNE4yVUHV4ZLs83Ppn9aMRH57A\","
+        "\"payment_amounts\":\"5.0\",\"proposal_hashes\":"
+        "\"38e7621be9ca265288095a324dc185b6ba739fe3846858e3133f775c12a91306\",\"type\":2}";
+    const std::vector<uint8_t> data(json.begin(), json.end());
+    const int64_t t = 1784232979;
+    const uint256 digest = dash::coin::govobject_signature_hash(
+        uint256(), 1, t, uint256(), data, dash::coin::GOVERNANCE_OBJECT_TRIGGER,
+        op_hash, op_index);
+    const std::vector<uint8_t> sig =
+        bls::BasicSchemeMPL().Sign(sk, bls::Bytes(digest.data(), 32)).Serialize(false);
+
+    // The primitive: right digest verifies; tampered data / the identity hash
+    // (a wrong preimage) / a tampered sig do not.
+    EXPECT_TRUE(verify_govvote_operator_sig(pk, false, digest, sig, false));
+    auto data2 = data;
+    data2[data2.size() - 3] ^= 0x01;
+    EXPECT_FALSE(verify_govvote_operator_sig(
+        pk, false,
+        dash::coin::govobject_signature_hash(uint256(), 1, t, uint256(), data2,
+                                             dash::coin::GOVERNANCE_OBJECT_TRIGGER,
+                                             op_hash, op_index),
+        sig, false));
+    EXPECT_FALSE(verify_govvote_operator_sig(
+        pk, false,
+        dash::coin::govobject_hash(uint256(), 1, t, data, op_hash, op_index, sig),
+        sig, false));
+    auto sig_bad = sig;
+    sig_bad[5] ^= 0x01;
+    EXPECT_FALSE(verify_govvote_operator_sig(pk, false, digest, sig_bad, false));
+
+    // End to end through the maintainer's C3 seam (the production closure
+    // resolves the MN by collateral; here the key is pinned).
+    dash::coin::NodeCoinState ncs;
+    CoinStateMaintainer m(ncs);
+    m.set_gov_params(true, 1);
+    m.set_object_verifier([pk](const CoinStateMaintainer::GovObjectContext& o) {
+        return verify_govvote_operator_sig(pk, false, o.sig_hash, o.vch_sig, false)
+                   ? CoinStateMaintainer::GovSigCheck::Valid
+                   : CoinStateMaintainer::GovSigCheck::Invalid;
+    });
+    CoinStateMaintainer::GovObjectContext o;
+    o.object_hash = dash::coin::govobject_hash(uint256(), 1, t, data, op_hash, op_index, sig);
+    o.object_type = dash::coin::GOVERNANCE_OBJECT_TRIGGER;
+    o.vch_data = data;
+    o.mn_outpoint_hash = op_hash;
+    o.mn_outpoint_index = op_index;
+    o.vch_sig = sig;
+    o.sig_hash = digest;
+    auto forged = o;
+    forged.object_hash = h(0xF0);
+    forged.vch_sig = sig_bad;
+    m.on_govobject(forged);
+    EXPECT_FALSE(m.gov_store().has_trigger(forged.object_hash)) << "forged trigger stored";
+    EXPECT_EQ(m.gov_store().outstanding_count(), 0u) << "a forgery must not block either";
+    EXPECT_EQ(m.gov_triggers_rejected(), 1u);
+    m.on_govobject(o);
+    EXPECT_TRUE(m.gov_store().has_trigger(o.object_hash)) << "MN-signed trigger not stored";
+}
+#endif

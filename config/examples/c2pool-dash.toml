@@ -1,0 +1,224 @@
+# c2pool-dash -- example settings file (TOML), checked against release 0.2.12.1
+#
+# WHAT THIS IS
+#   Launch settings for the c2pool-dash node (Dash, X11). The upper part sets
+#   the keys this binary applies from a file. The REFERENCE block at the end
+#   lists the keys the file loader accepts but this release does not apply
+#   (use their CLI flags instead).
+#
+# WHERE TO PUT IT
+#   Either name it on the command line:
+#     c2pool-dash --run --settings /etc/c2pool/c2pool-dash.toml
+#   or copy it to <data-dir>/c2pool.toml (data dir default: ~/.c2pool, or the
+#   one given with --data-dir); that file is loaded when --settings is absent.
+#   An explicit --settings path that does not exist is fatal (exit 78).
+#   --run is required on the command line: without it the binary runs its
+#   self-test and exits (meta.run is not read from the file). Do not launch
+#   through start.sh: it adds --stratum 7903 and --dashboard-dir on the
+#   command line, and command-line flags override this file.
+#
+# PRECEDENCE
+#   compiled defaults  <  this file  <  command-line flags
+#   A flag on the command line always wins over the same key in this file.
+#
+# CHECK IT BEFORE YOU RUN
+#   c2pool-dash --settings c2pool-dash.toml --dump-resolved-config
+#   prints "key=value source=compiled|file|cli" for each resolved key and
+#   exits 0 without starting the node. A key left at its compiled default is
+#   usually not printed. "source=file" proves the file was read, not that the
+#   key is used: keys from the REFERENCE block also print as source=file.
+#
+# MONEY GATE
+#   Keys marked [money] (fees, donation, payout addresses, network identity,
+#   the control-plane token file) are never accepted from a file without your
+#   explicit acknowledgement:
+#     1. uncomment the key(s) and enter your own value(s);
+#     2. run  c2pool-dash --settings c2pool-dash.toml --ack-money-settings
+#        it exits 0; the last line of its output is the hash (64 hex chars);
+#     3. put that hash in [gate] money_ack_hash at the end of this file;
+#     4. run --dump-resolved-config again: exit 0, money keys show source=file.
+#   Without a matching hash the node refuses to start, names the money keys
+#   and exits 78. Changing, adding or removing any money key changes the hash:
+#   repeat steps 2 and 3. The same values given as CLI flags need no hash.
+#
+# FORMAT
+#   Keys live in [dash.<section>] tables. A misspelled key in a [dash.*] table
+#   is fatal (exit 78). Tables for other coins are ignored by this binary, but
+#   use one file per binary all the same: [gate] holds a single money_ack_hash.
+#
+# POSTURE
+#   Daemonless: with no dashd named (daemon_rpc.endpoint and
+#   daemon_rpc.auth_file both unset, and no --coin-rpc / --coin-rpc-auth on
+#   the command line) every embedded serving lever defaults ON and the node
+#   finds Dash network peers by itself; no dashd is needed. Setting EITHER
+#   daemon_rpc key switches the node to the dashd-attached posture, where the
+#   embedded levers default OFF.
+#
+# PORTS (one host running ltc, dash, btc, dgb and bch from these examples)
+#   dash: sharechain 8999 (compiled default; change it with --listen), Stratum
+#   7903, web 8082. The web default is 8080, the same as c2pool-ltc's, so this
+#   example moves it to 8082 to let both run on one host.
+#   ltc 9326/9327/8080, btc 9333/9334/8083, dgb 5024/9434/8084,
+#   bch 9349/9534/8085 (sharechain/Stratum/web)
+
+[dash.web]
+port = 8082                 # dashboard + JSON API TCP port; default 8080 (0 = off). 8082 here so it does not collide with c2pool-ltc
+dashboard_dir = "web-static"   # dashboard static files; default "web-static", relative to the working directory. Use an absolute path (the release ships it beside the binary) when you start the node from elsewhere
+# external_ip = "pool.example.com"   # miner-facing host shown in the dashboard Stratum URL (behind NAT); default: auto-detect
+
+[dash.stratum]
+bind = "0.0.0.0:7903"       # Stratum (miner) listener [HOST:]PORT; default off (port 0). A bare port binds 0.0.0.0
+
+[dash.daemon_rpc]
+# Leave both commented out for the daemonless posture (see POSTURE above).
+# endpoint = "127.0.0.1:9998"                       # dashd RPC endpoint HOST:PORT, no secret here; default none (daemonless)
+# auth_file = "/home/<user>/.dashcore/dash.conf"    # dash.conf with rpcuser/rpcpassword; default ~/.dashcore/dash.conf once an endpoint is set
+
+[dash.sharechain]
+# Leave these unset to join the public DASH sharechain.
+# network = "v36"                       # [money] named sharechain network: "v36" = the DASH v36 network; default none (public). Cannot be combined with network_id/prefix or --testnet
+# network_id = "<hex>"                  # [money] private sharechain identifier (forks the chain); default empty = public
+# prefix = "<hex>"                      # [money] private sharechain prefix (needs network_id); default empty
+
+[dash.money]
+# give_author_pct = 0.1                        # [money] author donation, percent 0-100; default 0.1
+# node_owner_fee_pct = 1.0                     # [money] node-owner fee, percent 0-100; default 0 (off)
+# node_owner_address = "<your-DASH-address>"   # [money] where the node-owner fee is paid; default none
+# redistribute = "pplns"                       # [money] where shares of an empty or invalid login go: pplns, fee, boost or donate; default pplns
+
+[dash.control]
+# token_file = "/etc/c2pool/control.token"     # [money] control-plane token file (mode 0600, owner-only, 32-128 char token) that unlocks POST /api/config/apply on loopback; default none (apply stays off)
+
+[gate]
+# money_ack_hash = "<64-hex output of: c2pool-dash --settings THIS_FILE --ack-money-settings>"   # needed only when a [money] key is uncommented
+
+# ---------------------------------------------------------------------------
+# REFERENCE: keys the loader ACCEPTS but c2pool-dash 0.2.12.1 does NOT apply
+# ---------------------------------------------------------------------------
+# The loader knows these keys (so they are not refused as typos) and
+# --dump-resolved-config shows them as source=file when set, but this release
+# copies only the keys above into the running node. Setting one of these here
+# has no effect: use the CLI flag shown. A [money] key still trips the money
+# gate. Defaults are not repeated here; see "Per-binary launch reference" in
+# README.md. Form:  key [money] -- meaning (CLI flag)
+# [dash.meta]
+#   data_dir -- data directory; cannot work from a file, the file itself is found through the data dir (CLI: --data-dir)
+#   run -- run the node (CLI: --run)
+#   selftest -- run self-test (CLI: --selftest)
+#   mine_block -- one-shot CPU miner harness (CLI: --mine-block)
+# [dash.network]
+#   testnet [money] -- testnet network identity (CLI: --testnet)
+#   regtest [money] -- regtest network identity (CLI: --regtest)
+# [dash.sharechain]
+#   listen -- sharechain P2P bind [HOST:]PORT (CLI: --listen)
+#   addnodes -- persistent outbound sharechain peers (CLI: --addnode)
+#   connects -- connect-only sharechain peers (CLI: --connect)
+#   no_p2p_relay -- suppress embedded won-block relay (CLI: --no-p2p-relay)
+# [dash.coin_p2p]
+#   connect -- explicit coin-network dial (CLI: --coin-p2p-connect)
+#   discover -- scored/diverse coin-P2P discovery (CLI: --coin-p2p-discover)
+#   magic [money] -- wire magic override (regtest) (CLI: --coin-p2p-magic)
+#   peers -- coin-P2P pool peer count (cap 16) (CLI: --coin-p2p-peers)
+#   zmq_hashblock -- opt-in dashd ZMQ hashblock endpoint (CLI: --coin-zmq-hashblock)
+# [dash.stratum]
+#   advertise_host -- stratum advertise host (CLI: --stratum-advertise)
+# [dash.web]
+#   host -- web bind host (CLI: --web-host)
+#   explorer -- loopback-only /api/explorer surface (default on) (CLI: --explorer / --no-explorer)
+# [dash.global]
+#   message_blob_hex -- authority message blob hex (CLI: --message-blob-hex / --transition-message)
+# [dash.money]
+#   payout_pubkey_hash [money] -- P2PKH for mine-block (CLI: --payout-pubkey-hash)
+#   coinbase_text [money] -- coinbase attribution text (CLI: --coinbase-text)
+# [dash.embedded]
+#   mainnet [money] -- gate-lift: embedded template on MAINNET (CLI: --embedded-mainnet)
+#   utxo -- E2b UTXO/fee lane (CLI: --embedded-utxo)
+#   utxo_immature_serve_empty -- serve coinbase-only until mature (CLI: --embedded-utxo-immature-serve-empty)
+#   utxo_snapshot -- S2: import this pinned dumptxoutset snapshot into the full UTXO set at start (comma-separated parts) (CLI: --embedded-utxo-snapshot / --utxo-snapshot)
+#   utxo_snapshot_pin -- S2: digest-gated pin file for a snapshot newer than the built-in pin (CLI: --embedded-utxo-snapshot-pin)
+#   superblock -- daemonless superblock payee sourcing (CLI: --embedded-superblock)
+#   govsync -- observe-only governance store (CLI: --embedded-govsync)
+#   serve_mempool_txs -- fee-carrying templates (daemonless default ON; DGB: advisory GBT only -- the mined stratum job stays coinbase-only until the S2 job-commit lands) (CLI: --embedded-serve-mempool-txs)
+#   tx_serve_own_set [money] -- serve-time self-validation referee (default ON) (CLI: --embedded-tx-serve-own-set)
+#   mempool_ingest -- coin-P2P MSG_TX pull (default ON) (CLI: --embedded-mempool-ingest)
+#   ingest_isdlock -- MSG_ISDLOCK feed (default ON) (CLI: --embedded-ingest-isdlock)
+#   ingest_dstx -- CoinJoin DSTX lane (default ON) (CLI: --embedded-ingest-dstx)
+#   accrue_asset_locks -- type-8 asset-lock fold (CLI: --embedded-accrue-asset-locks)
+#   accrue_asset_unlocks -- type-9 asset-unlock fold (CLI: --embedded-accrue-asset-unlocks)
+#   credit_pool_seed -- seed the credit-pool follower from the v20 floor (needed to admit asset unlocks) (CLI: --embedded-credit-pool-seed)
+#   null_arm [money] -- optimistic null commitment (money/consensus) (CLI: --embedded-null-arm)
+#   include_mn_special_txs -- DIP special-tx superset types 1-4 (daemonless default ON) (CLI: --embedded-include-mn-special-txs)
+#   fresh_datum_race -- race freshest getmnlistd (default OFF in the code; the catalog text says ON) (CLI: --embedded-fresh-datum-race)
+#   fresh_datum_race_k -- race K netgroups (CLI: --embedded-fresh-datum-race-k)
+#   getmnlistd_tracker -- 10s slot re-ask tracker (default OFF in the code; the catalog text says ON) (CLI: --embedded-getmnlistd-tracker)
+#   asn_diversity -- require >=2 ASNs in racing set (CLI: --embedded-asn-diversity)
+#   proactive_rotate -- low-rate peer rotation (CLI: --embedded-proactive-rotate)
+#   peer_latency_score -- latency tie-break (CLI: --embedded-peer-latency-score)
+#   fold_live -- PR-C1 fold store live path (pairs with expect) (CLI: --embedded-fold-live)
+#   fold_live_expect -- fold-live hash_serialized_2 expect (CLI: --embedded-fold-live-expect)
+#   fold_checkscripts -- consensus-exact input-script check (CLI: --embedded-fold-checkscripts)
+#   tx_inject [money] -- #157 miner/user tx-injection arm (opt-in, default OFF, reward-neutral; MONEY-path: arming changes mined-block body -> the full two-phase money-nonce + M0 tripwire gate, Slice B) (CLI: --embedded-tx-inject)
+#   tx_inject_hex -- #157 local tx-inject submit file (raw tx hex per line) (CLI: --embedded-tx-inject-hex)
+#   utxo_fold_fees -- W5 fold fee pricing path (pairs with expect) (CLI: --embedded-utxo-fold-fees)
+#   utxo_fold_expect -- fold-fees hash expect (CLI: --embedded-utxo-fold-expect)
+#   creditpool_publish_at_serve_tip [money] -- PR-5 creditpool publish (MONEY) (CLI: --embedded-creditpool-publish-at-serve-tip; the catalog maps --embedded-mined-commitment-index here by mistake)
+#   no_dashd_mn_seed -- cut E2c protx-list seed (CLI: --embedded-no-dashd-mn-seed)
+#   fold_only_proof -- strict fold-only payee population (CLI: --embedded-fold-only-proof)
+#   mn_bridge_max -- anchor staleness bound (CLI: --embedded-mn-bridge-max)
+#   mn_bridge_no_cursor -- disable bridge cursor (CLI: --embedded-mn-bridge-no-cursor)
+#   oracle_shadow -- observe-only dashd cross-check (CLI: --embedded-oracle-shadow)
+#   shadow_compare -- observe-only serve-vs-dashd diff (CLI: --embedded-shadow-compare)
+#   oracle_graduation_blocks -- oracle graduation block count (CLI: --oracle-graduation-blocks)
+#   oracle_class_coverage -- oracle class coverage (CLI: --oracle-class-coverage)
+#   bestcl_policy [money] -- bestCL policy consensus-exact|freshness (CLI: --bestcl-policy)
+#   serve_gate_state_file -- cross-restart serve-gate accounting file (CLI: --serve-gate-state-file)
+#   regtest_force_won_block [money] -- fail-closed regtest E5 harness (CLI: --regtest-force-won-block)
+# [dash.replay]
+#   utxo_import -- S2: import a pinned dumptxoutset snapshot into <datadir>/<net>/utxo_full_leveldb and exit (beside a running node) (CLI: --utxo-import)
+#   utxo_db -- standalone fold status utility (CLI: --replay-utxo-db)
+#   utxo_hash -- compute hash_serialized_2 (CLI: --replay-utxo-hash)
+#   utxo_expect -- gate compare hash (CLI: --replay-utxo-expect)
+#   bulk -- bulk replay (CLI: --replay-bulk)
+#   bulk_capture -- bulk capture dir (implies bulk) (CLI: --replay-bulk-capture)
+#   bulk_start -- bulk start height (CLI: --replay-bulk-start)
+#   fold_prestate -- fold prestate path (implies bulk) (CLI: --replay-fold-prestate)
+#   fold_quorums -- fold quorums (CLI: --replay-fold-quorums)
+#   fold_qsnapshot -- fold qsnapshot path (CLI: --replay-fold-qsnapshot)
+#   fold_worklists -- fold worklists path (CLI: --replay-fold-worklists)
+#   mnlist_seed_height -- mnlist seed height (implies bulk) (CLI: --replay-mnlist-seed-height)
+#   mnlist_seed_source -- mnlist seed source (CLI: --replay-mnlist-seed-source)
+#   mnlist_seed_file -- mnlist seed file (CLI: --replay-mnlist-seed-file)
+#   mined_commitment_index -- replay mined commitment index (CLI: --replay-mined-commitment-index)
+# [dash.alert_relay]
+#   origin -- origin role: detect offline stratum workers and relay signed alerts over the sharechain p2p (CLI: --alert-relay-origin)
+#   telegram -- relay role: accept allowlisted alerts addressed to this node for the Telegram sidecar (CLI: --alert-relay-telegram)
+#   forward -- store-and-forward alerts not addressed to this node (CLI: --alert-relay-forward)
+#   test -- origin: send one test alert ~30s after start (CLI: --alert-relay-test)
+#   key_file -- alert secp256k1 key file (created 0600 on first use; default <data-dir>/<net>/alert_relay/alert.key) (CLI: --alert-relay-key-file)
+#   to -- origin: relay pubkey to seal alerts for (repeatable) (CLI: --alert-relay-to)
+#   accept -- relay: allowlisted origin pubkey (repeatable) (CLI: --alert-relay-accept)
+#   accept_file -- relay: file of allowlisted origin pubkeys (one hex per line) (CLI: --alert-relay-accept-file)
+#   label -- origin: short label shown in the alert text (<=32 chars) (CLI: --alert-relay-label)
+#   offline_after -- origin: seconds a worker must be down before OFFLINE fires (CLI: --alert-relay-offline-after)
+#   online_after -- origin: seconds a worker must be back before BACK_ONLINE fires (CLI: --alert-relay-online-after)
+#   min_interval -- origin: minimum seconds between OFFLINE alerts for one worker (CLI: --alert-relay-min-interval)
+#   startup_grace -- origin: no OFFLINE alerts this many seconds after start (CLI: --alert-relay-startup-grace)
+#   stall_after -- origin: connected worker with no accepted share this long counts as down (0=off) (CLI: --alert-relay-stall-after)
+#   retry_every -- origin: seconds between retransmits of an unacked alert (CLI: --alert-relay-retry-every)
+#   retry_max -- origin: total transmissions per alert before it is recorded undelivered (CLI: --alert-relay-retry-max)
+#   serve_stall_after -- origin: no work handed to hashing miners this long => WORK_STALLED, then WORK_RESUMED (0=off) (CLI: --alert-relay-serve-stall-after)
+#   hashrate_min -- origin: page HASHRATE LOW when a worker's credited rate stays below RATE (e.g. 1.35T, 1350G; 0=off), HASHRATE OK on recovery (CLI: --alert-relay-hashrate-min)
+#   hashrate_window -- origin: seconds of credited work per HASHRATE LOW/OK evaluation (120-86400) (CLI: --alert-relay-hashrate-window)
+# [dash.tx_ingestion]
+#   pin_local_tx_hex [money] -- PIN donation-tx blob path (CLI: --pin-local-tx-hex)
+#   pin_splice_xcheck_arm [money] -- PIN splice cross-check arm (CLI: --pin-splice-xcheck-arm)
+#   pin_splice_block_budget [money] -- PIN splice block budget (CLI: --pin-splice-block-budget)
+# [dash.utility]
+#   submit_block -- one-shot submitblock hex (CLI: --submit-block)
+#   submit_block_file -- one-shot submitblock file (CLI: --submit-block-file)
+#   dump_mn_checkpoint -- dump MN checkpoint H FILE (CLI: --dump-mn-checkpoint)
+#   max_nonce -- mine-block max nonce (CLI: --max-nonce)
+# [dash.bls]
+#   allow_stub -- knowingly run a bls=stub (BLS-dark) build in a BLS-relying config (CLI: --allow-stub-bls)
+# [dash.dash]
+#   v24_activation_height -- pin the Dash Core v24 activation height once locked in (unset: follow the EHF signals); its file table is [dash.dash] because the key name itself starts with "dash." (CLI: --dash-v24-activation-height)

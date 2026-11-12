@@ -480,3 +480,37 @@ TEST(DashDashboardViews, SharesMintedHereOnlyLeaveASilentRigStalled)
     EXPECT_STREQ(MI::session_state(lv.at("s-peer")), "standby");
     EXPECT_TRUE(lv.at("s-peer").hashing_elsewhere);
 }
+
+// block_hashes: the found-block ledger is uncapped, so the window sends the
+// full hashes of the found blocks whose shares it carries, and a delta those
+// among its new shares, omitting the key when there are none. `blocks` (the
+// 16-hex short hashes of the whole ledger) is unchanged.
+TEST(DashDashboardViews, BlockHashesAreTheFoundBlocksInTheView)
+{
+    ChainHarness h(12);
+    auto ctx = h.ctx();
+    uint256 outside;
+    outside.SetHex(std::string(14, '0') + "21" + std::string(48, 'e'));   // an older block, not in the chain
+    ctx.found_block_hashes = {view_hash(11).GetHex(), outside.GetHex(), view_hash(5).GetHex()};
+
+    auto w = dash::dashboard::build_window(h.node.tracker(), ctx);
+    ASSERT_TRUE(w.contains("block_hashes"));
+    EXPECT_EQ(w["block_hashes"], nlohmann::json::array({view_hash(11).GetHex(), view_hash(5).GetHex()}));
+    EXPECT_EQ(w["blocks"].size(), 3u) << "the short hashes of the whole ledger, as before";
+
+    // Three new shares (11, 10, 9): the one found block among them.
+    auto d3 = dash::dashboard::build_delta(h.node.tracker(), view_hash(8).GetHex().substr(0, 16), ctx);
+    ASSERT_TRUE(d3.contains("block_hashes"));
+    EXPECT_EQ(d3["block_hashes"], nlohmann::json::array({view_hash(11).GetHex()}));
+    EXPECT_EQ(d3["blocks"].size(), 3u);
+
+    // New shares without a found block, or none at all: no block_hashes.
+    auto d1 = dash::dashboard::build_delta(h.node.tracker(), view_hash(10).GetHex().substr(0, 16), ctx);
+    EXPECT_EQ(d1["count"].get<int>(), 1);
+    EXPECT_TRUE(d1.contains("block_hashes")) << "share 11 is new and is a found block";
+    ctx.found_block_hashes = {view_hash(5).GetHex()};
+    auto d1b = dash::dashboard::build_delta(h.node.tracker(), view_hash(10).GetHex().substr(0, 16), ctx);
+    EXPECT_FALSE(d1b.contains("block_hashes"));
+    auto d0 = dash::dashboard::build_delta(h.node.tracker(), h.tip.GetHex().substr(0, 16), ctx);
+    EXPECT_FALSE(d0.contains("block_hashes"));
+}

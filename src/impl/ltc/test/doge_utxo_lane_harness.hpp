@@ -7,7 +7,27 @@
 // chain (the best chain by height, every header's parent) that records the
 // heights the lane asks for, and the full-block / tip-change handlers as
 // main_ltc.cpp calls them (Lane::deliver, Lane::switch_to).
+//
+// The lane is core::coin's, shared with LTC's full set (#2137): the suites run
+// again for LTC (ltc_utxo_lane_rerun_test.cpp, ltc_utxo_full_rerun_test.cpp),
+// which set these before including them. Defaults: DOGE.
+//   C2_LANE_SUITE(name)  the test suite's name
+//   C2_LANE_KEEP         the coin's MIN_BLOCKS_TO_KEEP (the default `keep`)
+//   C2_LANE_LIMITS       the coin's ChainLimits (the suites' mempools)
+//   C2_LANE_CHAIN        the coin's core::coin::UtxoLaneChain (its log tags)
 // ---------------------------------------------------------------------------
+#ifndef C2_LANE_SUITE
+#define C2_LANE_SUITE(name) name
+#endif
+#ifndef C2_LANE_KEEP
+#define C2_LANE_KEEP core::coin::DOGE_MIN_BLOCKS_TO_KEEP
+#endif
+#ifndef C2_LANE_LIMITS
+#define C2_LANE_LIMITS core::coin::DOGE_LIMITS
+#endif
+#ifndef C2_LANE_CHAIN
+#define C2_LANE_CHAIN core::coin::DOGE_UTXO_LANE
+#endif
 
 #include <gtest/gtest.h>
 
@@ -310,10 +330,11 @@ struct Lane {
     TempDb t;
     Net net;
     UtxoLane lane;
-    explicit Lane(uint32_t keep = core::coin::DOGE_MIN_BLOCKS_TO_KEEP,
+    explicit Lane(uint32_t keep = C2_LANE_KEEP,
                   UtxoLane::Mode mode = UtxoLane::Mode::Accrual, size_t window = 0, bool download = false,
                   bool cold_gate = false)
-        : lane(*t.cache, *t.db, (net.download = download, net.cold_gate = cold_gate, net.host()), keep, mode, window)
+        : lane(*t.cache, *t.db, (net.download = download, net.cold_gate = cold_gate, net.host()), keep, mode, window,
+               C2_LANE_CHAIN)
     {
     }
 
@@ -402,6 +423,7 @@ struct DogeTip {
     DogeTip(const BlockType& tip, uint32_t height)
         : body(tip)
     {
+        chain.set_require_auxpow_proof(false);  // the lane tests drive UTXO ordering, not AuxPoW
         chain.set_dynamic_checkpoint(height - 1, tip.m_previous_block);
         EXPECT_TRUE(chain.add_header(static_cast<const BlockHeaderType&>(tip)));
         EXPECT_EQ(chain.height(), height);

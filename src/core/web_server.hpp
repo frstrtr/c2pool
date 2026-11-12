@@ -39,6 +39,7 @@
 #include <c2pool/hashrate/tracker.hpp>
 #include <core/address_utils.hpp>
 #include <core/graph_history.hpp>
+#include <core/template_refresh.hpp>
 
 // Forward declaration for merged mining integration
 namespace c2pool { namespace merged { class MergedMiningManager; } }
@@ -66,17 +67,40 @@ class StratumServer;
 /// HTTP Session handler for incoming connections
 class HttpSession : public std::enable_shared_from_this<HttpSession>
 {
+    // The session's place under WebServer's HTTP cap: declared first, so it
+    // is released after the socket is closed.
+    std::shared_ptr<void> slot_;
     tcp::socket socket_;
     beast::flat_buffer buffer_;
     http::request<http::string_body> request_;
     std::shared_ptr<MiningInterface> mining_interface_;
+    // Reading the request: the parser (beast's default limits, as
+    // http::async_read: an 8 KB head, a 1 MB body) and its deadlines. The
+    // connection is closed when no byte arrives for idle_timeout_, or when
+    // the request is not complete within request_timeout_ of the accept
+    // (0: none). Neither applies once the request is read: a response being
+    // written, or the event stream (/sharechain/stream) handed off.
+    std::optional<http::request_parser<http::string_body>> parser_;
+    net::steady_timer deadline_;
+    std::chrono::steady_clock::time_point read_started_{};
+    bool reading_{false};
+    std::chrono::milliseconds idle_timeout_;
+    std::chrono::milliseconds request_timeout_;
 
 public:
-    explicit HttpSession(tcp::socket socket, std::shared_ptr<MiningInterface> mining_interface);
+    static constexpr std::chrono::milliseconds kIdleTimeout{30000};
+    static constexpr std::chrono::milliseconds kRequestTimeout{120000};
+
+    explicit HttpSession(tcp::socket socket, std::shared_ptr<MiningInterface> mining_interface,
+                         std::shared_ptr<void> slot = {},
+                         std::chrono::milliseconds idle_timeout = kIdleTimeout,
+                         std::chrono::milliseconds request_timeout = kRequestTimeout);
     void run();
 
 private:
     void read_request();
+    void arm_deadline();
+    void end_reading();
     void process_request();
     void send_response(http::response<http::string_body> response);
     void handle_error(beast::error_code ec, char const* what);
@@ -758,6 +782,20 @@ public:
     }
     // String-based overload: converts Base58Check address to P2PKH scriptPubKey
     void set_node_fee_from_address(double percent, const std::string& address);
+    // The merged scripts written into the operator's own shares (the node-fee
+    // shares, and redistributed shares landing on the operator's key with no
+    // merged address), per merged chain id: p2pool's --merged-operator-address
+    // cascade (c2pool::merged::resolve_operator_merged_script). Empty: those
+    // shares keep the merged addresses they had.
+    void set_operator_merged_scripts(std::map<uint32_t, std::vector<unsigned char>> scripts) {
+        m_operator_merged_scripts = std::move(scripts);
+    }
+    // --redistribute: the (hash160 hex, V36 pubkey type) a share without a
+    // payout address a share can carry is given to (decide_job_payout).
+    void set_redistribute_fn(std::function<std::pair<std::string, uint8_t>()> fn) {
+        std::lock_guard<std::mutex> l(m_redistribute_mu);
+        m_redistribute_fn = std::move(fn);
+    }
     // Donation script used by get_expected_payouts (p2pool protocol)
     void set_donation_script(const std::vector<unsigned char>& script) {
         m_donation_script = script;
@@ -993,6 +1031,30 @@ public:
     static constexpr uint32_t kCoinbaseExtranonceBytes = 16;
     uint32_t coinbase_weight_reserve() const;
     static uint32_t coinbase_weight(const std::string& coinb1, const std::string& coinb2, bool segwit);
+
+    // Sigop budget (LTC): the legacy sigops (GetLegacySigOpCount; a coinbase
+    // has no other kind) the template's coinbase can carry -- the bound
+    // (coinbase_sigop_bound) of the largest coinbase built for the current
+    // template plus kCoinbaseSigopMargin for a few new payees; before the
+    // first coinbase, one per output max_coinbase_outputs allows plus the
+    // scriptSig's worst case. The embedded template builder keeps the block's
+    // sigop cost within the limit with this reserved.
+    static constexpr uint32_t kCoinbaseSigopMargin = 20;
+    // The per-connection coinbase's scriptSig ends with the 32-byte state
+    // root, not pushed: its bytes parse as opcodes and change with every
+    // template.
+    static constexpr size_t kCoinbaseRawScriptSigTail = 32;
+    uint32_t coinbase_sigop_reserve() const;
+    /// The legacy sigops of coinb1 | extranonce1 | extranonce2 | coinb2
+    /// (the extranonces, 8 bytes in the OP_RETURN push, as zeros: no
+    /// opcode); nullopt when that does not parse as a transaction.
+    static std::optional<uint32_t> coinbase_sigops(const std::string& coinb1, const std::string& coinb2);
+    /// The same with the state root at its worst case, 20 per byte: an upper
+    /// bound for this coinbase whatever its root. With has_state_root the
+    /// scriptSig's last 32 bytes are the root; without (the template's own
+    /// coinbase) the 32 x 20 are added for the root its connections append.
+    static std::optional<uint32_t> coinbase_sigop_bound(const std::string& coinb1, const std::string& coinb2,
+                                                        bool has_state_root);
     uint64_t get_mweb_template_refusals() const { return m_mweb_template_refusals.load(std::memory_order_relaxed); }
     double get_mweb_hold_seconds() const;
     // True while the cached template failed the MWEB shape check and was
@@ -1017,6 +1079,15 @@ public:
     nlohmann::json get_template_tx_refusals_json() const;
     nlohmann::json get_mweb_refusals_by_code_json() const;
     uint64_t get_template_fee_outliers() const { return m_template_fee_outliers.load(std::memory_order_relaxed); }
+
+    // Template rebuilds (/local_stats "template_refresh", #2137 S1): executed
+    // rebuilds by cause (tx, share, block, mweb), the last one's duration,
+    // the mempool changes reported and the tx-triggered pacing interval.
+    // WebServer::trigger_work_refresh records each rebuild here.
+    void note_template_refresh(core::RefreshCause cause, uint64_t took_ms,
+                               uint64_t tx_changes, uint64_t tx_interval_ms,
+                               uint64_t tx_unchanged = 0);
+    nlohmann::json get_template_refresh_json() const;
 
     // Coin-side metrics merged into /local_stats next to the MWEB counters
     // above: the function returns a JSON object whose keys are copied into
@@ -1458,12 +1529,21 @@ public:
     void set_rpc_submit_fallback(std::function<std::string(const std::string&)> fn);
     // Redistribute / address-fallback callback.
     // Called when a share's primary address cannot be resolved to a valid hash160.
-    // Receives the bad address string; must return a 40-char hex hash160, or "" to keep share.
-    using address_fallback_fn_t = std::function<std::string(const std::string&)>;
-    void set_address_fallback_fn(address_fallback_fn_t fn) { m_address_fallback_fn = std::move(fn); }
+    // Receives the bad address string; returns the recipient as a 40-char hex
+    // hash160 and its V36 pubkey type (0 P2PKH, 1 P2WPKH, 2 P2SH), or "" for
+    // none. The type is the recipient's own: its hash under another script
+    // type pays another address, or nobody (a script hash as P2PKH).
+    using address_fallback_fn_t = std::function<std::pair<std::string, uint8_t>(const std::string&)>;
+    // Set while the stratum thread may already build jobs: under m_redistribute_mu.
+    void set_address_fallback_fn(address_fallback_fn_t fn)
+    {
+        std::lock_guard<std::mutex> l(m_redistribute_mu);
+        m_address_fallback_fn = std::move(fn);
+    }
 
     // Return true if the merged-mining manager has a configured chain with chain_id.
     bool has_merged_chain(uint32_t chain_id) const override;
+    bool is_testnet() const override { return m_testnet; }
 
     // Extract the 40-char hex hash160 from the node fee scriptPubKey (P2PKH bytes 3-22).
     // Returns "" if the fee script is not a 25-byte P2PKH.
@@ -1546,9 +1626,11 @@ private:
     void note_mweb_degraded_template(const std::string& why);
     void note_mweb_template_accepted();
     // A coinbase was built (refresh_work: fresh_template; per connection:
-    // raises the mark): records its weight for coinbase_weight_reserve().
+    // raises the mark): records its weight for coinbase_weight_reserve() and
+    // its sigop bound for coinbase_sigop_reserve(); has_state_root when the
+    // scriptSig ends with the root.
     void note_coinbase_built(const std::string& coinb1, const std::string& coinb2, bool segwit,
-                             size_t branch_len, bool fresh_template) const;
+                             size_t branch_len, bool fresh_template, bool has_state_root) const;
     void close_mweb_hold_window(const char* reason);
     // Template-tx check bookkeeping: count `code` (ingress), one ERROR per
     // (height, code).
@@ -1623,11 +1705,31 @@ private:
     std::atomic<int64_t>    m_last_work_update_time{0}; // monotonic seconds since epoch
     std::atomic<double>     m_last_work_latency{0};    // template build latency (ms)
     nlohmann::json          m_cached_template;
+    // The cached template and its tx hex, built once per refresh_work and
+    // shared by every connection's coinbase snapshot and job of that
+    // generation (#2137): a notify no longer deep-copies the template or the
+    // tx hex per session (256 jobs x sessions x the template's hex).
+    std::shared_ptr<const nlohmann::json>           m_cached_template_sp;
+    std::shared_ptr<const std::vector<std::string>> m_cached_tx_data;
+    // What the installed template commits to (prev, version, bits, value,
+    // txids, mweb, degraded marks; not curtime): m_template_content_seq moves
+    // only when it changes, so a tx-caused refresh that rebuilt the same
+    // template (a HOLD, an empty template on the tip) notifies nobody.
+    uint256                 m_template_content_key;
+    std::atomic<uint64_t>   m_template_content_seq{0};
 
 public:
     // Monotonically increasing counter — incremented on each refresh_work().
     // Used by per-miner safety timer to avoid pushing unchanged work.
     uint64_t get_work_generation() const override { return m_work_generation.load(); }
+    // Moves when refresh_work installs a template whose content differs from
+    // the last one's (see m_template_content_key).
+    uint64_t get_template_content_seq() const { return m_template_content_seq.load(); }
+    // The tx hex of the installed template (shared, one per generation).
+    std::shared_ptr<const std::vector<std::string>> get_cached_tx_data() const {
+        std::lock_guard<std::mutex> lock(m_work_mutex);
+        return m_cached_tx_data;
+    }
 
     // IWorkSource atomic-state getters — replace direct m_share_bits.load()
     // member access from stratum_server (post-extraction).
@@ -1769,6 +1871,38 @@ private:
     std::vector<std::pair<std::string, uint64_t>> m_cached_pplns_outputs;
     uint256 m_cached_pplns_best_share;
     bool m_cached_raw_scripts{false};
+    // The cached (best share, outputs) pair is a real PPLNS split for that
+    // share. False while none could be computed (the tracker was busy at a new
+    // best share): jobs then recompute, and never build on the cached outputs.
+    bool m_cached_pplns_valid{false};
+    // What the cached split was computed for besides the best share: its
+    // amounts depend on the template's coinbase value and bits and on the
+    // donation script, so it is only reused for the same best share AND the
+    // same three (a new block or a fee change at the same best share needs a
+    // new split). Guarded by m_work_mutex.
+    uint64_t m_cached_pplns_value{0};
+    std::string m_cached_pplns_bits;
+    std::vector<unsigned char> m_cached_pplns_donation;
+    bool cached_pplns_matches(const uint256& best, uint64_t value, const std::string& bits,
+                              const std::vector<unsigned char>& donation) const
+    {
+        return m_cached_pplns_valid && m_cached_pplns_best_share == best && m_cached_pplns_value == value
+            && m_cached_pplns_bits == bits && m_cached_pplns_donation == donation;
+    }
+    // Jobs not built because the sharechain was busy (CoinbaseResult::held),
+    // and refreshes that found no valid PPLNS: /local_stats-free counters, logged.
+    mutable std::atomic<uint64_t> m_jobs_held{0};
+    std::atomic<uint64_t> m_refresh_without_pplns{0};
+    void note_job_held(const char* why) const;
+public:
+    uint64_t jobs_held() const { return m_jobs_held.load(std::memory_order_relaxed); }
+    uint64_t refreshes_without_pplns() const { return m_refresh_without_pplns.load(std::memory_order_relaxed); }
+    bool cached_pplns_valid() const
+    {
+        std::lock_guard<std::mutex> l(m_work_mutex);
+        return m_cached_pplns_valid;
+    }
+private:
     // V35/V36 PPLNS selection. Defaults to the v35 network floor: this is the
     // fallback rest_v36_status()/rest_version_signaling() read when a coin lane
     // has not wired set_cached_share_version() or has no on-chain vote data yet.
@@ -1802,6 +1936,12 @@ private:
     // Template-tx check (see set_template_tx_check_strict).
     std::atomic<bool>     m_template_tx_check_strict{true};
     std::atomic<uint64_t> m_template_fee_outliers{0};
+    std::atomic<uint64_t> m_template_refresh_by_cause[static_cast<size_t>(core::RefreshCause::count)] = {};
+    std::atomic<uint64_t> m_template_refresh_ms_last{0};
+    std::atomic<int8_t>   m_template_refresh_last_cause{-1};
+    std::atomic<uint64_t> m_template_refresh_tx_changes{0};
+    std::atomic<uint64_t> m_template_refresh_tx_interval_ms{core::TxRefreshPacer::INTERVAL.count()};
+    std::atomic<uint64_t> m_template_refresh_tx_unchanged{0};  // tx rebuilds that notified nobody
     struct TemplateTxRefusalLog {
         std::map<std::string, uint64_t> by_code;
         uint64_t    total{0};
@@ -1816,10 +1956,13 @@ private:
     mutable std::mutex m_template_tx_mutex;
     TemplateTxRefusalLog m_template_tx_refusals;                     // ingress
     mutable std::map<std::string, uint64_t> m_mweb_refusals_by_code; // assembly (const path)
+    std::map<std::string, uint64_t> m_template_degraded_by_code;     // ingress: served without pool txs
     // Weight of the largest coinbase built for the current template (its own
     // and the per-connection ones built on it): the next template leaves room
     // for it (coinbase_weight_reserve). 0 = none built yet.
     mutable std::atomic<uint32_t> m_coinbase_weight{0};
+    mutable std::atomic<uint32_t> m_coinbase_sigops{0};
+    mutable std::atomic<bool>     m_coinbase_sigops_known{false};
     // Coin-side metrics for /local_stats (see set_coin_metrics_fn).
     mutable std::mutex    m_coin_metrics_mutex;
     coin_metrics_fn_t     m_coin_metrics_fn;
@@ -1878,6 +2021,9 @@ private:
     double m_node_fee_percent{0.0};
     std::vector<unsigned char> m_node_fee_script;   // node operator scriptPubKey
     std::string m_node_fee_address;                 // node operator address (display/logging)
+    std::map<uint32_t, std::vector<unsigned char>> m_operator_merged_scripts;
+    std::function<std::pair<std::string, uint8_t>()> m_redistribute_fn;
+    mutable std::mutex m_redistribute_mu;   // m_redistribute_fn, m_address_fallback_fn
     std::vector<unsigned char> m_donation_script;   // protocol donation scriptPubKey
     std::function<double()> m_stratum_hashrate_fn;  // callback to get stratum total hashrate
     std::function<RateStats()> m_stratum_rate_stats_fn;  // callback to get rate monitor stats
@@ -1926,6 +2072,9 @@ private:
     std::string m_auth_token;   // auth token for sensitive endpoints; empty = no auth
 public:
     void set_stratum_config(const StratumConfig& cfg) { m_stratum_config = cfg; }
+    bool merged_ready() const override { return !m_stratum_config.merged_chains_expected || m_mm_manager != nullptr; }
+    void decide_job_payout(std::vector<unsigned char>& payout_script,
+                           std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged) const override;
     const StratumConfig& get_stratum_config() const override { return m_stratum_config; }
     void set_cors_origin(const std::string& origin) { m_cors_origin = origin; }
     const std::string& get_cors_origin() const { return m_cors_origin; }
@@ -2522,8 +2671,17 @@ class WebServer
     uint16_t port_;
     uint16_t stratum_port_;  // Explicit Stratum port configuration
     bool running_;
+    bool rpc_refresh_armed_{false};
+    uint256 last_parent_block_;   // refresh_on_parent_block dedup
     bool testnet_;
     Blockchain blockchain_;
+    // Live HTTP sessions and their cap (0: unlimited), from the node's fd
+    // plan: an accept beyond it is closed at once.
+    std::shared_ptr<std::atomic<size_t>> http_live_ = std::make_shared<std::atomic<size_t>>(0);
+    std::atomic<size_t> max_http_connections_{0};
+    // An HTTP session's request-read deadlines (HttpSession), in ms.
+    std::atomic<int64_t> http_idle_timeout_ms_{HttpSession::kIdleTimeout.count()};
+    std::atomic<int64_t> http_request_timeout_ms_{HttpSession::kRequestTimeout.count()};
     std::thread server_thread_;
     std::unique_ptr<StratumServer> stratum_server_;
 
@@ -2540,6 +2698,16 @@ class WebServer
     bool m_work_refresh_pending = false;
     std::chrono::steady_clock::time_point m_last_work_refresh{};  // last executed refresh
     std::string m_last_refresh_tip_hash;  // sharechain tip at last executed refresh
+    core::RefreshCause m_work_refresh_pending_cause = core::RefreshCause::share;  // the trailing refresh's
+
+    // Transaction-triggered refresh (trigger_work_refresh_mempool, #2137 S1):
+    // the pacer (core/template_refresh.hpp) and its timer. Every rebuild,
+    // whatever its cause, reports to the pacer (it covers the mempool changes
+    // before it). The mutex guards the pacer only, never a rebuild.
+    std::mutex m_tx_refresh_mutex;
+    core::TxRefreshPacer m_tx_refresh;
+    std::shared_ptr<net::steady_timer> m_tx_refresh_timer;
+    std::atomic<uint64_t> m_tx_refresh_unchanged{0};  // tx rebuilds whose template did not change
 
     // Payout system integration
     c2pool::payout::PayoutManager* payout_manager_ptr_ = nullptr;
@@ -2572,6 +2740,10 @@ public:
     /// Matches p2pool: get_local_addr_rates() (work.py:1975-1990).
     /// Returns {pubkey_hash → hashrate (H/s)} for all connected miners.
     std::map<std::array<uint8_t, 20>, double> get_local_addr_rates() const;
+    /// Per-login hashrate (p2pool get_local_rates' first map). The login is
+    /// the miner's payout address (worker and merged parts stripped), of any
+    /// script type: --solo pays it by its own script.
+    std::map<std::string, double> get_local_user_rates() const;
 
     // Stratum server control methods
     bool start_stratum_server();
@@ -2579,6 +2751,17 @@ public:
     bool is_stratum_running() const;
     void set_stratum_port(uint16_t port);
     uint16_t get_stratum_port() const;
+    /// At most n HTTP sessions at once (0: unlimited); one beyond is closed
+    /// on accept.
+    void set_max_http_connections(size_t n) { max_http_connections_ = n; }
+    /// A session's request-read deadlines (defaults 30 s without a byte, 120 s
+    /// for the whole request; 0 disables either), for sessions accepted after.
+    void set_http_timeouts(std::chrono::milliseconds idle, std::chrono::milliseconds request)
+    {
+        http_idle_timeout_ms_ = idle.count();
+        http_request_timeout_ms_ = request.count();
+    }
+    size_t http_sessions() const { return http_live_->load(); }
 
     // Dashboard directory for static file serving
     void set_dashboard_dir(const std::string& dir);
@@ -2595,11 +2778,28 @@ public:
     // Forward P2P block relay callback to the underlying MiningInterface
     void set_on_block_relay(std::function<void(const std::string&)> fn);
     // Immediately refresh the cached block template and push to all miners.
-    // Use for time-critical events (new LTC block).
-    void trigger_work_refresh();
+    // Use for time-critical events (new LTC block). `cause` is what
+    // /local_stats template_refresh.by_cause counts it under.
+    void trigger_work_refresh(core::RefreshCause cause = core::RefreshCause::block);
+    // The coin daemon template refresh over RPC: a one-shot fetch and, in
+    // --no-embedded mode, a 2 s getblocktemplate poll. Armed once, by
+    // start() or by set_coin_node() when the node is attached later.
+    void arm_rpc_template_refresh();
+    // A new block from the parent coin daemon's own P2P link (RPC mode,
+    // coin_node.new_block): refresh the template at once, once per block hash
+    // (the link announces a block by inv and again by the block itself).
+    void refresh_on_parent_block(const uint256& block_hash);
     // Debounced variant: coalesces rapid-fire calls (share arrivals) into one
-    // refresh after 100ms. Matches p2pool's Twisted reactor tick coalescing.
-    void trigger_work_refresh_debounced();
+    // refresh after 300 ms, gated on a sharechain tip change. Matches
+    // p2pool's Twisted reactor tick coalescing.
+    void trigger_work_refresh_debounced(core::RefreshCause cause = core::RefreshCause::share);
+    // The mempool changed (a tx was priced): rebuild the template, at most
+    // once a second and once per 4 rebuild costs (<= 25 % of the io thread),
+    // counted from the last rebuild of any cause; gated on a mempool-change
+    // counter, not on the sharechain tip, so a change no rebuild has covered
+    // always gets one (core::TxRefreshPacer). Main ioc thread. A rebuild whose
+    // template did not change notifies nobody.
+    void trigger_work_refresh_mempool();
     // Wire the share tracker's best hash into MiningInterface
     void set_best_share_hash_fn(std::function<uint256()> fn);
     // Wire the PPLNS computation from the share tracker
@@ -2628,7 +2828,9 @@ private:
     void handle_accept(beast::error_code ec, tcp::socket socket);
     // Body of a debounced work refresh (capture prev tip → refresh → caches →
     // SSE). Runs on the leading edge and on the trailing coalesced timer.
-    void execute_debounced_work_refresh();
+    void execute_debounced_work_refresh(core::RefreshCause cause);
+    // Arm the transaction-triggered refresh timer for `at`.
+    void arm_tx_refresh_timer(core::TxRefreshPacer::clock::time_point at);
 };
 
 // StratumSession and StratumServer — see stratum_server.hpp

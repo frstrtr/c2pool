@@ -64,10 +64,13 @@
 ///                        EvoNode-4x weight, completeness, desync latch); a
 ///                        non-confident trigger refuses exactly as today, never a
 ///                        guessed payee. Implies the govsync pull at the call site.
-///   include_mn_special_txs  the special-tx superset (DIP types 1-4). The builder
-///                        DROPS any tx the SML fold cannot apply exactly and the
-///                        emit gate re-folds and rejects on root drift, so an
-///                        included special tx always commits a folded MN root.
+///   include_mn_special_txs  the special-tx superset (DIP types 1-4; from Dash
+///                        Core v24 activation also the shared-masternode types
+///                        10-12; and type-7 MNHF signals that pass Dash Core's
+///                        CheckMNHFTx). The builder DROPS any tx the SML fold
+///                        cannot apply exactly and the emit gate re-folds and
+///                        rejects on root drift, so an included special tx
+///                        always commits a folded MN root.
 ///   accrue_asset_locks type-8 DIP-0027 asset-lock accrual. Body membership and
 ///                        creditPool accrual are the SAME bit (embedded_gbt.hpp
 ///                        allow_locks == accrue), so CbTx creditPoolBalance always

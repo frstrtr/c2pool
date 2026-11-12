@@ -37,6 +37,7 @@
 
 #include <impl/dgb/node.hpp>
 #include <impl/dgb/params.hpp>          // dgb::address_acceptance (#961 cross-lane payout publish)
+#include <core/view_block_hashes.hpp>   // core::found_block_hashes_in (block_hashes of a view)
 #include <core/settings_cli.hpp>          // M0b control-plane wiring
 #include <core/config_endpoint.hpp>       // M1 control-plane READ-ONLY endpoints
 #include <impl/dgb/catalog_defaults.hpp>  // M0b L0 compiled defaults
@@ -565,25 +566,11 @@ int run_node(const core::CoinParams& params, bool testnet,
                 if (!doge_aux_chain->init())
                     std::cout << "[EMB-DOGE] HeaderChain LevelDB init failed — in-memory only" << std::endl;
 
-                // Seed DOGE genesis if empty (dogecoin/src/chainparams.cpp
-                // CreateGenesisBlock: merkle 5b2a3f53..., version 1, bits 0x1e0ffff0;
-                // mainnet nTime 1386325540 nNonce 99943, testnet 1391503289/997879).
-                if (doge_aux_chain->size() == 0) {
-                    ltc::coin::BlockHeaderType g;
-                    g.m_previous_block.SetNull();
-                    g.m_version = 1;
-                    g.m_merkle_root.SetHex("5b2a3f53f605d62c53e62932dac6925e3d74afa5a4b459745c36d42d0ed26a69");
-                    g.m_bits = 0x1e0ffff0;
-                    if (testnet) { g.m_timestamp = 1391503289; g.m_nonce = 997879; }
-                    else         { g.m_timestamp = 1386325540; g.m_nonce = 99943;  }
-                    if (doge_aux_chain->add_header(g))
-                        std::cout << "[EMB-DOGE] genesis seeded (height 0)" << std::endl;
-                    else
-                        std::cout << "[EMB-DOGE] genesis seed REJECTED — wrong genesis hash?" << std::endl;
-                } else {
-                    std::cout << "[EMB-DOGE] loaded " << doge_aux_chain->size()
-                              << " headers (height=" << doge_aux_chain->height() << ")" << std::endl;
-                }
+                // Genesis when empty (no checkpoint in this binary): the same
+                // start the tests drive (doge::coin::start_doge_chain); init()
+                // above has already re-rooted an older store format.
+                doge::coin::start_doge_chain(*doge_aux_chain, std::string(),
+                                             doge::coin::doge_genesis_header(testnet, false));
 
                 doge_aux_pool = std::make_unique<ltc::coin::Mempool>(core::coin::DOGE_LIMITS);
 
@@ -631,8 +618,20 @@ int run_node(const core::CoinParams& params, bool testnet,
                     // so the resident IndexEntry is HEADERS-ONLY (no AuxPow blob
                     // residency — the OOM-residency requirement is satisfied at the
                     // parse boundary, mirroring #1414's post-persist blob drop).
-                    broadcaster->set_raw_headers_parser(doge::coin::parse_doge_headers_message);
-                    broadcaster->set_raw_block_parser(doge::coin::parse_doge_block);
+                    // A 'headers' message's AuxPoW proofs go with its headers
+                    // (message_proofs_slot -> the headers callback ->
+                    // HeaderChain::add_headers), checked against each header's own
+                    // copy off the io thread; a block's proof is checked as parsed.
+                    {
+                        const auto rules = doge::coin::auxpow_rules(
+                            doge_aux_params ? *doge_aux_params : doge::coin::DOGEChainParams::mainnet());
+                        broadcaster->set_raw_headers_parser([](const uint8_t* d, size_t n) {
+                            return doge::coin::parse_doge_headers_message_with_proofs(d, n);
+                        });
+                        broadcaster->set_raw_block_parser([rules](const uint8_t* d, size_t n) {
+                            return doge::coin::parse_doge_block(d, n, &rules);
+                        });
+                    }
 
                     auto* bcaster_ptr = broadcaster.get();
                     auto doge_hdr_pool = std::make_shared<boost::asio::thread_pool>(1);
@@ -649,8 +648,11 @@ int run_node(const core::CoinParams& params, bool testnet,
                             const std::vector<ltc::coin::BlockHeaderType>& hdrs) {
                             auto batch = std::make_shared<
                                 std::vector<ltc::coin::BlockHeaderType>>(hdrs);
-                            boost::asio::post(*doge_hdr_pool, [batch, dc, bcaster_ptr, &ioc]() {
-                                int accepted = dc->add_headers(*batch);
+                            // This message's own AuxPoW proofs (same call as the parse).
+                            auto proofs = std::make_shared<std::vector<std::optional<doge::coin::CAuxPow<>>>>(
+                                doge::coin::take_message_proofs(hdrs.size()));
+                            boost::asio::post(*doge_hdr_pool, [batch, proofs, dc, bcaster_ptr, &ioc]() {
+                                int accepted = dc->add_headers(*batch, proofs.get());
                                 if (accepted > 0)
                                     std::cout << "[EMB-DOGE] add_headers " << accepted << "/"
                                               << batch->size() << " accepted height="
@@ -2475,17 +2477,25 @@ int run_node(const core::CoinParams& params, bool testnet,
 
             // Found blocks — is_block_solution flag above, plus persisted share
             // hashes for blocks found before restart.
+            // `blocks`: 16-hex short hashes (display, older dashboards);
+            // `block_hashes`: the full ones of the blocks whose shares are in
+            // this window, which the explorer matches H against.
             nlohmann::json blocks_arr = nlohmann::json::array();
+            std::vector<std::string> found_full;
             if (mi) {
                 for (const auto& fb : mi->get_found_blocks()) {
-                    if (!fb.share_hash.empty())
+                    if (!fb.share_hash.empty()) {
                         blocks_arr.push_back(fb.share_hash.substr(0, 16));
+                        found_full.push_back(fb.share_hash);
+                    }
                 }
             }
+            nlohmann::json block_hashes_arr = core::found_block_hashes_in(shares_arr, found_full);
 
             result["shares"] = std::move(shares_arr);
             result["heads"] = std::move(heads_arr);
             result["blocks"] = std::move(blocks_arr);
+            result["block_hashes"] = std::move(block_hashes_arr);
             result["total"] = static_cast<int>(chain.size());
 
             // Per-share PPLNS + current as fallback.
