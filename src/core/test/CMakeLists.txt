@@ -150,6 +150,11 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
     # nor the share's merged_coinbase_info (a V36 peer rejects info without
     # mm_data). Real MiningInterface + MergedMiningManager; same
     # fold-into-core_test reasoning as every TU here (c2pool_merged_mining linked).
+    # web_server_merged_payout_source_test.cpp: /current_merged_payouts labels
+    # each merged output explicit / auto-convert / donation from the payout
+    # provider's origins and shows it under the parent address it is paid for
+    # (one DOGE address of two LTC addresses: its part under each). Same
+    # fold-into-core_test reasoning as every TU here.
     # leveldb_store_lock_test.cpp: LevelDBStore::open on a DB whose LOCK is
     # held (another process, another handle) fails and leaves LOCK alone; an
     # unheld LOCK file opens. Same fold-into-core_test reasoning as every TU here.
@@ -254,6 +259,7 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
         web_server_local_only_test.cpp
         web_server_local_share_hash_rates_test.cpp
         web_server_merged_drop_test.cpp
+        web_server_merged_payout_source_test.cpp
         web_server_mweb_hogex_test.cpp
         web_server_pplns_no_burn_test.cpp
         web_server_redistribute_type_test.cpp

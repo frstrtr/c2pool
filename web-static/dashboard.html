@@ -5126,21 +5126,62 @@
                             .attr('target', '_blank')
                             .attr('title', merged.symbol + ': ' + merged.address)
                             .text(merged.address);
-                        // p2pool-style source labels
+                        // Source labels (/current_merged_payouts "source"):
+                        // explicit = the miner's shares gave this merged address
+                        // (stratum login PARENT,MERGED); auto-convert = derived from
+                        // the parent address key (same hash160), no merged address
+                        // in the login. From the 3601 flag day each share pays a
+                        // merged chain only to its own merged address, else to its
+                        // own parent key.
+                        var _psym = (typeof currency_info !== 'undefined' && currency_info.symbol) || 'LTC';
                         if (merged.source === 'auto-convert') {
                             addrCell.append('span')
                                 .style('color', '#b08800')
                                 .style('font-size', '0.6rem')
                                 .style('margin-left', '4px')
-                                .attr('title', 'Auto-converted from parent chain address (same pubkey hash). During V35\u2192V36 transition, all merged addresses are auto-converted since V35 shares cannot carry explicit merged addresses.')
+                                .attr('title', 'Derived from this miner\'s ' + _psym + ' address key (same hash160): no '
+                                    + merged.symbol + ' address was given in the login. The coins belong to the owner of the '
+                                    + _psym + ' key. To be paid to your own ' + merged.symbol + ' wallet, log in as '
+                                    + _psym + '_ADDRESS,' + merged.symbol + '_ADDRESS.worker')
                                 .text('\u26A0 auto');
+                            if (merged.parent_p2sh) {
+                                // A P2SH parent paid as the same P2SH on the merged chain:
+                                // a segwit-wrapped wallet address (M...) becomes spendable
+                                // by anyone there (no segwit) once its redeem script is public.
+                                addrCell.append('div')
+                                    .style('color', '#dc3545')
+                                    .style('font-size', '0.65rem')
+                                    .style('font-weight', 'bold')
+                                    .style('margin-left', '20px')
+                                    .attr('title', 'The ' + _psym + ' address is a P2SH address, paid as the same P2SH on '
+                                        + merged.symbol + '. If it is a segwit-wrapped wallet address (P2SH-P2WPKH/P2WSH, e.g. M...), '
+                                        + 'give your ' + merged.symbol + ' address explicitly (' + _psym + '_ADDRESS,' + merged.symbol
+                                        + '_ADDRESS); on ' + merged.symbol + ' (no segwit) such an output becomes spendable by anyone '
+                                        + 'once the redeem script is public.')
+                                    .text('\u2757 P2SH ' + _psym + ' address: give your ' + merged.symbol + ' address explicitly ('
+                                        + _psym + '_ADDRESS,' + merged.symbol + '_ADDRESS)');
+                            }
                         } else if (merged.source === 'explicit') {
                             addrCell.append('span')
                                 .style('color', '#28a745')
                                 .style('font-size', '0.6rem')
                                 .style('margin-left', '4px')
-                                .attr('title', 'Explicit merged chain address provided by miner via stratum username')
+                                .attr('title', 'Explicit ' + merged.symbol + ' address given by the miner in the stratum login ('
+                                    + _psym + '_ADDRESS,' + merged.symbol + '_ADDRESS.worker)')
                                 .text('\u2713 explicit');
+                        }
+                        if (merged.fraction !== undefined && merged.output_amount !== undefined) {
+                            // One merged address given by several parent addresses:
+                            // this row is this parent's part of the output by PPLNS weight.
+                            addrCell.append('span')
+                                .style('color', 'var(--text-muted)')
+                                .style('font-size', '0.6rem')
+                                .style('margin-left', '4px')
+                                .attr('title', 'This ' + merged.symbol + ' address is also given by other '
+                                    + _psym + ' addresses: the output is '
+                                    + d3.format(',.8f')(merged.output_amount) + ' ' + merged.symbol
+                                    + '; this row is this ' + _psym + ' address\'s part by PPLNS weight.')
+                                .text('(' + d3.format('.1%')(merged.fraction) + ' of output)');
                         }
                         
                         subRow.append('td'); // V36 column spacer

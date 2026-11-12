@@ -9892,6 +9892,7 @@ int main(int argc, char* argv[]) {
                         return ltc::ShareTracker::merged_payout_outputs(*w, coinbase_value,
                                                                          combined_donation);
                     };
+                    out.origins = [w]() { return ltc::ShareTracker::merged_payout_origins(*w); };
                     return out;
                 };
 
@@ -9955,6 +9956,31 @@ int main(int argc, char* argv[]) {
                     if (result.empty())
                         c2pool::merged::MergedMiningManager::note_payout_miss(miss.empty() ? "empty" : miss);
                     return result;
+                });
+
+                // The same payouts with their origins (from the same weights),
+                // for the web payouts view: which parent address each merged
+                // output is paid for, and whether the shares gave the merged
+                // address or it is derived from the parent key. Never waits
+                // for the tracker lock.
+                mm_manager->set_payout_detail_provider(
+                    [&p2p_node, merged_payout_source, merged_weights](
+                        uint32_t chain_id, uint64_t coinbase_value)
+                    -> c2pool::merged::MergedPayoutDetail
+                {
+                    auto best = p2p_node->best_share_hash();
+                    if (best.IsNull())
+                        return {};
+                    std::string miss;
+                    return merged_payout_source->get_detail(
+                        best, chain_id, coinbase_value, /*may_wait=*/false,
+                        [&]() -> std::optional<c2pool::merged::MergedPayoutSource::Weights> {
+                            auto guard = p2p_node->read_tracker();
+                            if (!guard)
+                                return std::nullopt;
+                            return merged_weights(*guard, best, chain_id);
+                        },
+                        miss);
                 });
               } // end MM payout provider
 
