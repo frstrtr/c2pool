@@ -485,6 +485,22 @@ public:
         m_order.clear();
         m_seen.clear();
     }
+
+    /// Forget every entry of one inv type (E-SUPERBLOCK C4): an explicit
+    /// per-object vote re-sync asks the peer to re-announce votes we may have
+    /// pulled and dropped inside the TTL; without this the re-announcement
+    /// would be suppressed and the re-sync would fetch nothing.
+    std::size_t forget_type(uint32_t type)
+    {
+        std::size_t n = 0;
+        std::deque<Entry> kept;
+        for (auto& e : m_order) {
+            if (e.key.first == type) { m_seen.erase(e.key); ++n; }
+            else kept.push_back(e);
+        }
+        m_order.swap(kept);
+        return n;
+    }
 };
 
 // ── Per-peer session state ───────────────────────────────────────────────
@@ -937,7 +953,77 @@ private:
     // whose recorded time is within m_govsync_reprime_secs. Mirrors dashcore's
     // own netfulfilledman HasFulfilledRequest("governance-sync") gate.
     std::map<std::string, int64_t> m_govsync_primed;   // peer_key -> primed-at
-    int64_t  m_govsync_reprime_secs{3600};             // dashd mainnet 1h expiry
+    // dashd mainnet fulfilled-request expiry is exactly 3600 s; re-asking AT the
+    // edge risks Misbehaving(20), so the window carries the same 60 s margin as
+    // the vote-sync window.
+    int64_t  m_govsync_reprime_secs{3660};
+    // E-SUPERBLOCK per-object vote sync bookkeeping: (peer_key, object) ->
+    // wall-seconds of the last vote-sync request. Dash Core v24 tracks a
+    // per-object vote sync as a fulfilled request ("govsync-votes-<hash>",
+    // net_governance.cpp:116-133) and answers a repeat inside
+    // nFulfilledRequestExpireTime with Misbehaving(20): mainnet 1 h, testnet/
+    // devnet/regtest 5 min (chainparams.cpp). Default = the mainnet window
+    // (+ margin); main_dash lowers it on testnet.
+    std::map<std::pair<std::string, uint256>, int64_t> m_govsync_votes_sent;
+    int64_t  m_govsync_votes_resync_secs{3660};
+    uint64_t m_govsync_votes_skipped{0};               // window-suppressed re-asks
+    // E-SUPERBLOCK govsync COVERAGE PROOF (R5 input). A peer covers the
+    // governance view only once it has ANSWERED our nProp=0 prime: Dash Core
+    // pushes SYNCSTATUSCOUNT(MASTERNODE_SYNC_GOVOBJ, n) and then relays the n
+    // object invs (net_governance.cpp:144-153). A pruned / -disablegovernance /
+    // not-yet-synced dashd returns before answering (net_governance.cpp:86-91)
+    // — so "requested" proves nothing. Covered <=> ssc(GOVOBJ) received since
+    // the latest prime AND the peer has announced >= n objects on this
+    // connection (its inv-known filter suppresses re-announcing ones it already
+    // sent us, so the count is per connection) AND every object it announced
+    // has been received.
+    struct GovPeerSync {
+        bool    primed{false};
+        bool    ssc{false};
+        int32_t ssc_count{-1};
+        bool    covered{false};
+        bool    overflow{false};       // announced past the per-peer caps: this
+                                       // connection can never cover (MED-B)
+        std::set<uint256> announced;   // object invs this peer announced (connection)
+        std::set<uint256> pending;     // ...of which not yet received
+    };
+    std::map<std::string, GovPeerSync> m_gov_peer;
+    std::function<void(const std::string&, bool)> m_on_govsync_coverage;
+    // Per-(type, hash) governance pull state: ONE request in flight, every
+    // announcer remembered, timed-out requests retried from another announcer.
+    using GovKey = std::pair<uint32_t, uint256>;
+    struct GovInflight {
+        std::string           peer;      // asked
+        int64_t               at{0};     // asked-at (0 = retry now)
+        int64_t               created{0};
+        std::set<std::string> tried;      // <= GOV_ANNOUNCERS_CAP
+        std::set<std::string> announcers; // <= GOV_ANNOUNCERS_CAP
+    };
+    std::map<GovKey, GovInflight> m_gov_inflight;
+    // Deadline queue (asked-at, key) in non-decreasing order — the pool tick
+    // pops only what has timed out instead of walking the whole map. Stale
+    // records (the entry was re-asked or is gone) are skipped on pop.
+    std::deque<std::pair<int64_t, GovKey>> m_gov_inflight_order;
+    std::map<std::string, size_t> m_gov_inflight_per_peer;   // asked-peer -> entries
+    std::set<GovKey>   m_gov_received;
+    std::deque<GovKey> m_gov_received_order;
+    uint64_t m_gov_objects_received_total{0};   // session: any object ever received
+    int64_t  m_gov_pull_timeout_secs{20};
+    int64_t  m_gov_pull_giveup_secs{600};
+    uint64_t m_gov_pull_retried{0};
+    uint64_t m_gov_pull_exhausted{0};
+    uint64_t m_gov_pull_capped{0};
+    size_t   m_gov_getdata_chunk{50000};        // Dash Core MAX_INV_SZ
+    // MED-B bounds, sized to the real network with headroom: mainnet carries a
+    // few hundred governance objects and a per-trigger vote sync of a few
+    // thousand votes; a hostile peer cannot grow any of these past the caps.
+    static constexpr size_t GOV_RECEIVED_CAP          = 131072;
+    static constexpr size_t GOV_INFLIGHT_CAP          = 50000;
+    static constexpr size_t GOV_INFLIGHT_PER_PEER_CAP = 20000;
+    static constexpr size_t GOV_ANNOUNCERS_CAP        = 16;
+    static constexpr size_t GOV_ANNOUNCED_CAP         = 8192;
+    static constexpr size_t GOV_PENDING_CAP           = 4096;
+    static constexpr size_t GOV_TICK_BUDGET           = 8192;   // deadline pops per tick
     size_t   m_tx_pull_inflight_cap{64};
     std::map<uint256, int64_t> m_tx_pull_inflight;   // txid -> requested-at
     uint64_t m_tx_inv_offered{0};    // inv(MSG_TX) SEEN on the wire, pre-dedup
@@ -1965,11 +2051,34 @@ public:
         return "[GOVSYNC-INGEST] armed=" + std::string(m_gov_pull_enabled ? "1" : "0")
              + " gov_inv_offered=" + std::to_string(m_gov_inv_offered)
              + " gov_inv=" + std::to_string(m_gov_inv_seen)
-             + " getdata=" + std::to_string(m_gov_pull_sent);
+             + " getdata=" + std::to_string(m_gov_pull_sent)
+             + " inflight=" + std::to_string(m_gov_inflight.size())
+             + " retried=" + std::to_string(m_gov_pull_retried)
+             + " exhausted=" + std::to_string(m_gov_pull_exhausted)
+             + " covered_peers=" + std::to_string(gov_covered_peer_count());
     }
     uint64_t gov_inv_offered_count() const { return m_gov_inv_offered; }
     uint64_t gov_inv_seen_count()    const { return m_gov_inv_seen; }
     uint64_t gov_pull_sent_count()   const { return m_gov_pull_sent; }
+    uint64_t gov_pull_retried_count() const { return m_gov_pull_retried; }
+    size_t   gov_inflight_count()    const { return m_gov_inflight.size(); }
+    size_t gov_covered_peer_count() const {
+        size_t n = 0;
+        for (const auto& [k, st] : m_gov_peer) if (st.covered) ++n;
+        return n;
+    }
+    bool gov_peer_covered(const std::string& key) const {
+        auto it = m_gov_peer.find(key);
+        return it != m_gov_peer.end() && it->second.covered;
+    }
+    /// R5 coverage seam: fires (peer_key, covered) whenever a peer's govsync
+    /// coverage proof flips (see GovPeerSync). main_dash routes it into
+    /// GovSyncStatus::note_govsync_answered / _unanswered.
+    void set_on_govsync_coverage(std::function<void(const std::string&, bool)> fn)
+    { m_on_govsync_coverage = std::move(fn); }
+    /// TEST/DEPLOYMENT SEAM: governance getdata retry timing (seconds).
+    void set_gov_pull_timing(int64_t timeout_secs, int64_t giveup_secs)
+    { m_gov_pull_timeout_secs = timeout_secs; m_gov_pull_giveup_secs = giveup_secs; }
 
     /// One greppable line: what the ingest lane asked for and what it got.
     /// received < pull_sent is normal (notfound, races, peers that drop);
@@ -2512,7 +2621,222 @@ public:
             /*nHashFuncs=*/0u, /*nTweak=*/0u, /*nFlags=*/uint8_t{0});
         p->write(m);
         m_govsync_primed[p->key] = now;
+        // A fresh prime re-opens this peer's coverage proof: it must answer
+        // THIS prime (a new ssc) before it counts again.
+        auto& st = m_gov_peer[p->key];
+        st.primed = true;
+        st.ssc = false;
+        st.ssc_count = -1;
+        gov_set_covered(p->key, st, false);
         return true;
+    }
+
+    // ── E-SUPERBLOCK governance pull + coverage machinery ─────────────────
+
+    void gov_set_covered(const std::string& key, GovPeerSync& st, bool covered)
+    {
+        if (st.covered == covered) return;
+        st.covered = covered;
+        LOG_INFO << "[" << m_chain_label << "] govsync coverage "
+                 << (covered ? "PROVEN" : "revoked") << " for " << key
+                 << " (ssc=" << st.ssc_count << " announced=" << st.announced.size()
+                 << " pending=" << st.pending.size() << ")";
+        if (m_on_govsync_coverage) m_on_govsync_coverage(key, covered);
+    }
+
+    void gov_eval_coverage(const std::string& key, GovPeerSync& st)
+    {
+        // A zero-object answer only counts while we have never seen a single
+        // governance object from anyone: a peer that claims an empty set when
+        // objects demonstrably exist is not proof of anything (LOW).
+        const bool zero_ok = st.ssc_count > 0 || m_gov_objects_received_total == 0;
+        const bool c = st.primed && st.ssc && st.ssc_count >= 0 && zero_ok &&
+                       !st.overflow &&
+                       st.announced.size() >= static_cast<size_t>(st.ssc_count) &&
+                       st.pending.empty();
+        gov_set_covered(key, st, c);
+    }
+
+    bool gov_received(uint32_t type, const uint256& h) const
+    {
+        return m_gov_received.count({type, h}) != 0;
+    }
+
+    void gov_inflight_erase(std::map<GovKey, GovInflight>::iterator it)
+    {
+        auto pit = m_gov_inflight_per_peer.find(it->second.peer);
+        if (pit != m_gov_inflight_per_peer.end() && pit->second > 0 && --pit->second == 0)
+            m_gov_inflight_per_peer.erase(pit);
+        m_gov_inflight.erase(it);
+    }
+
+    /// (Re)assign an in-flight pull to `peer` at `now`.
+    void gov_inflight_assign(const GovKey& k, GovInflight& f, const std::string& peer, int64_t now)
+    {
+        if (!f.peer.empty()) {
+            auto pit = m_gov_inflight_per_peer.find(f.peer);
+            if (pit != m_gov_inflight_per_peer.end() && pit->second > 0 && --pit->second == 0)
+                m_gov_inflight_per_peer.erase(pit);
+        }
+        f.peer = peer;
+        f.at = now;
+        if (f.tried.size() < GOV_ANNOUNCERS_CAP) f.tried.insert(peer);
+        ++m_gov_inflight_per_peer[peer];
+        m_gov_inflight_order.emplace_back(now, k);
+    }
+
+    void gov_mark_received(uint32_t type, const uint256& h)
+    {
+        const auto k = std::make_pair(type, h);
+        if (auto it = m_gov_inflight.find(k); it != m_gov_inflight.end()) gov_inflight_erase(it);
+        if (type == static_cast<uint32_t>(inventory_type::govobject)) ++m_gov_objects_received_total;
+        if (m_gov_received.insert(k).second) {
+            m_gov_received_order.push_back(k);
+            while (m_gov_received_order.size() > GOV_RECEIVED_CAP) {
+                m_gov_received.erase(m_gov_received_order.front());
+                m_gov_received_order.pop_front();
+            }
+        }
+        if (type == static_cast<uint32_t>(inventory_type::govobject)) {
+            for (auto& [key, st] : m_gov_peer) {
+                if (st.pending.erase(h)) gov_eval_coverage(key, st);
+            }
+        }
+    }
+
+    void gov_on_announce(PeerSession* p, const inventory_type& inv, int64_t now,
+                         std::vector<inventory_type>& batch)
+    {
+        const uint32_t type = static_cast<uint32_t>(inv.m_type);
+        const auto k = std::make_pair(type, inv.m_hash);
+        if (inv.base_type() == inventory_type::govobject) {
+            auto& st = m_gov_peer[p->key];
+            const bool have = gov_received(type, inv.m_hash);
+            if (st.announced.size() >= GOV_ANNOUNCED_CAP ||
+                (!have && st.pending.size() >= GOV_PENDING_CAP)) {
+                // MED-B: more objects than any real network carries. Stop
+                // tracking for this connection, which can never cover.
+                st.overflow = true;
+            } else {
+                st.announced.insert(inv.m_hash);
+                if (!have) st.pending.insert(inv.m_hash);
+            }
+            gov_eval_coverage(p->key, st);
+        }
+        if (gov_received(type, inv.m_hash)) return;            // already have it
+        auto it = m_gov_inflight.find(k);
+        if (it == m_gov_inflight.end()) {
+            if (m_gov_inflight.size() >= GOV_INFLIGHT_CAP ||
+                m_gov_inflight_per_peer[p->key] >= GOV_INFLIGHT_PER_PEER_CAP) {
+                ++m_gov_pull_capped;                           // not asked at all
+                return;
+            }
+            GovInflight f;
+            f.created = now;
+            f.announcers.insert(p->key);
+            auto [nit, ok] = m_gov_inflight.emplace(k, std::move(f));
+            gov_inflight_assign(k, nit->second, p->key, now);
+            ++m_gov_inv_seen;
+            batch.emplace_back(inv.m_type, inv.m_hash);
+            return;
+        }
+        auto& f = it->second;
+        if (f.announcers.size() < GOV_ANNOUNCERS_CAP) f.announcers.insert(p->key);
+        if (!f.tried.count(p->key) && now - f.at >= m_gov_pull_timeout_secs &&
+            m_gov_inflight_per_peer[p->key] < GOV_INFLIGHT_PER_PEER_CAP) {
+            gov_inflight_assign(k, f, p->key, now);
+            ++m_gov_pull_retried;
+            batch.emplace_back(inv.m_type, inv.m_hash);
+        }
+    }
+
+    /// Pool tick: re-ask every timed-out governance pull from an announcer
+    /// that has not been tried; give an exhausted entry up after the give-up
+    /// window so a later announcement starts afresh. Pops only expired
+    /// deadlines (bounded per tick) — never walks the whole in-flight map.
+    void gov_retry_tick(int64_t now)
+    {
+        std::map<std::string, std::vector<inventory_type>> asks;
+        size_t budget = GOV_TICK_BUDGET;
+        while (budget-- > 0 && !m_gov_inflight_order.empty() &&
+               now - m_gov_inflight_order.front().first >= m_gov_pull_timeout_secs) {
+            const auto [at, k] = m_gov_inflight_order.front();
+            m_gov_inflight_order.pop_front();
+            auto it = m_gov_inflight.find(k);
+            if (it == m_gov_inflight.end() || it->second.at != at) continue;   // stale
+            auto& f = it->second;
+            std::string next;
+            for (const auto& a : f.announcers) {
+                if (f.tried.count(a)) continue;
+                if (m_gov_inflight_per_peer[a] >= GOV_INFLIGHT_PER_PEER_CAP) continue;
+                auto* s = find_session(a);
+                if (s && s->handshake.complete()) { next = a; break; }
+            }
+            if (!next.empty()) {
+                gov_inflight_assign(k, f, next, now);
+                ++m_gov_pull_retried;
+                asks[next].emplace_back(static_cast<inventory_type::inv_type>(k.first), k.second);
+                continue;
+            }
+            if (now - f.created >= m_gov_pull_giveup_secs) {
+                ++m_gov_pull_exhausted;
+                gov_inflight_erase(it);
+                continue;
+            }
+            f.at = now;                                  // check again later
+            m_gov_inflight_order.emplace_back(now, k);
+        }
+        for (auto& [key, invs] : asks) {
+            auto* s = find_session(key);
+            if (!s) continue;
+            // Dash Core MAX_INV_SZ: a getdata carries at most 50000 entries.
+            for (size_t off = 0; off < invs.size(); off += m_gov_getdata_chunk) {
+                const size_t n = std::min(m_gov_getdata_chunk, invs.size() - off);
+                std::vector<inventory_type> chunk(invs.begin() + off, invs.begin() + off + n);
+                m_gov_pull_sent += chunk.size();
+                auto getdata_msg = message_getdata::make_raw(chunk);
+                s->write(getdata_msg);
+            }
+        }
+    }
+
+    /// Mark an in-flight pull for immediate retry (front of the deadline queue).
+    void gov_inflight_retry_now(const GovKey& k, GovInflight& f)
+    {
+        f.at = 0;
+        m_gov_inflight_order.emplace_front(0, k);
+    }
+
+    /// TEST SEAM: getdata chunk size (Dash Core MAX_INV_SZ = 50000).
+    void set_gov_getdata_chunk_for_test(size_t n) { m_gov_getdata_chunk = n ? n : 1; }
+    int64_t govsync_reprime_secs() const { return m_govsync_reprime_secs; }
+    uint64_t gov_pull_capped_count() const { return m_gov_pull_capped; }
+    bool gov_peer_overflowed(const std::string& key) const {
+        auto it = m_gov_peer.find(key);
+        return it != m_gov_peer.end() && it->second.overflow;
+    }
+
+    void gov_forget_received(uint32_t type, const uint256& h)
+    {
+        if (m_gov_received.erase({type, h}) == 0) return;
+        // The order deque keeps the stale key; eviction of an absent key is a
+        // no-op erase, so the bound still holds.
+    }
+    void gov_forget_received_type(uint32_t type)
+    {
+        std::deque<GovKey> kept;
+        for (const auto& k : m_gov_received_order) {
+            if (k.first == type) m_gov_received.erase(k);
+            else kept.push_back(k);
+        }
+        m_gov_received_order.swap(kept);
+    }
+
+    PeerSession* find_session(const std::string& key)
+    {
+        for (auto& up : m_pool)
+            if (up->key == key) return up.get();
+        return nullptr;
     }
 
     /// TEST/DEPLOYMENT SEAM: the govsync-prime re-ask TTL, seconds. Default 3600
@@ -2522,23 +2846,80 @@ public:
 
     /// Per-object vote sync (E-SUPERBLOCK, routing class 2 for THIS leg): dashcore
     /// serves a governance object's VOTES only in reply to a govsync whose nProp
-    /// is that object's hash (CGovernanceManager::SyncSingleObjVotes). A
-    /// govsync(nProp=0) invs OBJECTS only, never their votes, so a trigger's
-    /// funding votes are unreachable until we ask for them by hash. Fired from the
-    /// govobj handler the moment a TRIGGER object is accepted, to every handshaked
-    /// peer so the tally can reach the funding threshold.
+    /// is that object's hash. A govsync(nProp=0) invs OBJECTS only, never their
+    /// votes, so a trigger's funding votes are unreachable until we ask for
+    /// them by hash. Fired from the govobj handler the moment a TRIGGER object
+    /// is accepted, and by the maintainer's C4 re-syncs at H - maturity window
+    /// and H - 1, to every handshaked peer.
     ///
-    /// FANOUT IS SAFE HERE (unlike the nProp=0 prime): SyncSingleObjVotes has NO
-    /// netfulfilledman gate and draws NO Misbehaving penalty — per-object vote
-    /// sync repeats are not punished — and the reply is bounded by one object's
-    /// vote set (the inv handler further collapses N-peer vote invs to one batched
-    /// getdata per vote). Multi-peer vote gathering is the tally defence: a single
-    /// peer withholding a trigger's funding votes must not hold the tally under the
-    /// funding threshold. It fires once per accepted trigger, so it is naturally
-    /// once-per-object, not churn-multiplied. Bloom filter empty (match none =>
-    /// send all votes for the object).
+    /// THE FILTER MUST BE NON-EMPTY. Dash Core v24 net_governance.cpp:116-162:
+    /// a nonzero nProp with an EMPTY bloom filter is an OBJECT FETCH (the peer
+    /// answers with the object's inv, never its votes); and before v24 an
+    /// empty filter made CBloomFilter::contains() return true for every vote
+    /// (bloom.cpp:72-75), so GetSyncableVoteInvs skipped them all. Either way
+    /// an empty filter yields ZERO votes. We send the smallest valid filter
+    /// that matches nothing: one zero byte, one hash function — every vote
+    /// hash misses it, so the peer streams the whole vote set.
+    ///
+    /// AT MOST ONCE PER (PEER, OBJECT) PER EXPIRY WINDOW: v24 records a vote
+    /// sync as a fulfilled request and punishes a repeat inside
+    /// nFulfilledRequestExpireTime with Misbehaving(20) (net_governance.cpp
+    /// 120-133). Each peer is skipped while its window runs; the reply is
+    /// bounded by one object's vote set. The vote-type inv dedup is forgotten
+    /// first so votes pulled-and-dropped inside the 600 s dedup TTL are pulled
+    /// again (a later trigger arrival must still get its votes).
     std::size_t send_govsync(const uint256& prop)
     {
+        const int64_t now = now_sec();
+        std::size_t sent = 0;
+        bool forgot = false;
+        for (auto& p : m_pool) {
+            if (!p->handshake.complete()) continue;
+            const auto key = std::make_pair(p->key, prop);
+            auto it = m_govsync_votes_sent.find(key);
+            if (it != m_govsync_votes_sent.end() && m_govsync_votes_resync_secs > 0 &&
+                now - it->second < m_govsync_votes_resync_secs) {
+                ++m_govsync_votes_skipped;
+                continue;
+            }
+            if (!forgot) {
+                // Gov invs bypass InvDedup; the "already received" set is what
+                // would suppress the re-announced votes. An explicit vote
+                // re-sync must be able to re-pull votes dropped earlier (e.g.
+                // past the orphan budget) — the maintainer's verified-vote
+                // memo keeps the re-pull from costing any BLS work.
+                gov_forget_received_type(static_cast<uint32_t>(inventory_type::govobjectvote));
+                forgot = true;
+            }
+            auto m = message_govsync::make_raw(
+                prop, std::vector<uint8_t>{0x00}, /*nHashFuncs=*/1u, /*nTweak=*/0u,
+                /*nFlags=*/uint8_t{0});
+            p->write(m);
+            m_govsync_votes_sent[key] = now;
+            ++sent;
+        }
+        // Bound the bookkeeping: entries older than the window are dead.
+        if (m_govsync_votes_sent.size() > 4096) {
+            for (auto it = m_govsync_votes_sent.begin(); it != m_govsync_votes_sent.end();) {
+                if (now - it->second >= m_govsync_votes_resync_secs) it = m_govsync_votes_sent.erase(it);
+                else ++it;
+            }
+        }
+        return sent;
+    }
+
+    /// Fetch a governance OBJECT we only know by hash (the parent of an orphan
+    /// vote): MNGOVERNANCESYNC nProp=hash with an EMPTY filter — exactly
+    /// dashd's own orphan-parent request (net_governance.cpp:47-61, 258-265).
+    /// v24 answers with the object's inv (not tracked as a fulfilled request,
+    /// net_governance.cpp:113-118 — no penalty); a pre-v24 peer treats it as a
+    /// vote sync whose empty filter matches every vote, i.e. sends nothing.
+    std::size_t send_govobject_fetch(const uint256& prop)
+    {
+        // MED-C: an explicit fetch must be able to pull an object we received
+        // before (and could not keep, e.g. its signer was not resolvable yet):
+        // forget the "already received" marker so the answering inv is pulled.
+        gov_forget_received(static_cast<uint32_t>(inventory_type::govobject), prop);
         std::size_t sent = 0;
         for (auto& p : m_pool) {
             if (!p->handshake.complete()) continue;
@@ -2549,6 +2930,12 @@ public:
         }
         return sent;
     }
+
+    /// DEPLOYMENT SEAM: the per-(peer, object) vote re-sync window, seconds.
+    /// Must be >= the network's nFulfilledRequestExpireTime (mainnet 3600,
+    /// testnet 300). 0 disables the guard (KATs).
+    void set_govsync_votes_resync_secs(int64_t secs) { m_govsync_votes_resync_secs = secs; }
+    uint64_t govsync_votes_skipped() const { return m_govsync_votes_skipped; }
 
     /// Relay a pre-serialized won block as a `block` P2P message (the embedded
     /// P2P-relay arm of the dual-path broadcaster).
@@ -3076,6 +3463,26 @@ private:
         // disconnect, exactly as the spec requires). No-op unless the tracker was
         // ever consulted; harmless when the flag is OFF.
         m_getmnlistd_tracker.on_disconnect(key);
+        // E-SUPERBLOCK: a gone peer no longer covers the governance view; its
+        // in-flight governance pulls fall to the retry tick (other announcers).
+        {
+            auto git = m_gov_peer.find(key);
+            if (git != m_gov_peer.end()) {
+                gov_set_covered(key, git->second, false);
+                m_gov_peer.erase(git);
+            }
+            for (auto& [gk, f] : m_gov_inflight)
+                if (f.peer == key) gov_inflight_retry_now(gk, f);
+            // MED-A: dashd keys fulfilled requests by the CService it sees —
+            // our address INCLUDING the ephemeral source port — so a new
+            // connection is a new requester: re-prime (and re-sync votes) on
+            // reconnect instead of staying uncovered until leg B.
+            m_govsync_primed.erase(key);
+            for (auto vit = m_govsync_votes_sent.begin(); vit != m_govsync_votes_sent.end();) {
+                if (vit->first.first == key) vit = m_govsync_votes_sent.erase(vit);
+                else ++vit;
+            }
+        }
 
         // Erase LAST: the unique_ptr destructor tears the Connection (and its
         // socket) down, so nothing may hold p afterwards.
@@ -3525,6 +3932,7 @@ private:
     void on_pool_tick()
     {
         const int64_t now = now_sec();
+        if (m_gov_pull_enabled) gov_retry_tick(now);
 
         // Collect first, act after: remove_peer() erases from m_pool, which
         // would invalidate the iteration.
@@ -4022,6 +4430,18 @@ private:
             if (is_gov_type) ++m_gov_inv_offered;
             if (!pulled && !is_block && !is_tx && !is_dstx && !is_gov)
                 continue;   // not actionable — do not spend a dedup slot on it
+            if (is_gov)
+            {
+                // E-SUPERBLOCK: governance invs bypass the global InvDedup. The
+                // dedup admits ONE announcer and never re-asks, so a silent
+                // first announcer would starve the object/vote for good. Here
+                // every announcer is remembered, ONE getdata is in flight per
+                // (type, hash), and a timed-out request is retried from a
+                // DIFFERENT announcer (gov_retry_tick). Object announcements
+                // also feed this peer's govsync coverage proof.
+                gov_on_announce(p, inv, now, gov_pull_batch);
+                continue;
+            }
             if (!m_inv_dedup.admit(static_cast<uint32_t>(inv.m_type), inv.m_hash, now))
             {
                 // Already answered from an earlier peer's announcement. This
@@ -4055,17 +4475,6 @@ private:
                 auto getdata_msg = message_getdata::make_raw(
                     {inventory_type(inv.m_type, inv.m_hash)});
                 p->write(getdata_msg);
-                continue;
-            }
-            if (is_gov)
-            {
-                // E-SUPERBLOCK gated pull: collect this admitted governance inv
-                // for the ONE batched getdata after the loop (echo the announced
-                // type + hash straight back — the govobj inv hash is the object
-                // identity hash, the govobjvote inv hash is the vote identity
-                // hash; both are only ever echoed to the peer, never derived).
-                ++m_gov_inv_seen;
-                gov_pull_batch.emplace_back(inv.m_type, inv.m_hash);
                 continue;
             }
             if (is_tx || is_dstx)
@@ -4581,6 +4990,17 @@ private:
             msg->m_vch_sig);
         rec.object_type = msg->m_object_type;
         rec.vch_data    = msg->m_vch_data;
+        rec.peer_key    = m_active ? m_active->key : std::string();
+        gov_mark_received(static_cast<uint32_t>(inventory_type::govobject), rec.object_hash);
+        // C3: the signer + its signature over CGovernanceObject::
+        // GetSignatureHash (Governance::Object serialized WITHOUT vchSig).
+        rec.mn_outpoint_hash  = msg->m_masternode_outpoint.hash;
+        rec.mn_outpoint_index = msg->m_masternode_outpoint.index;
+        rec.vch_sig           = msg->m_vch_sig;
+        rec.sig_hash = ::dash::coin::govobject_signature_hash(
+            msg->m_hash_parent, msg->m_revision, msg->m_time,
+            msg->m_collateral_hash, msg->m_vch_data, msg->m_object_type,
+            msg->m_masternode_outpoint.hash, msg->m_masternode_outpoint.index);
         LOG_INFO << "[" << m_chain_label << "] govobj: hash="
                  << rec.object_hash.GetHex().substr(0, 16) << " type="
                  << rec.object_type << " data=" << rec.vch_data.size() << "B";
@@ -4626,6 +5046,14 @@ private:
             msg->m_masternode_outpoint.hash, msg->m_masternode_outpoint.index,
             msg->m_parent_hash, msg->m_vote_outcome, msg->m_vote_signal,
             msg->m_time);
+        // Identity hash == the inv hash: keys the pull state and the
+        // maintainer's verified-vote memo (a known vote is never re-verified).
+        rec.vote_id          = ::dash::coin::govvote_identity_hash(
+            msg->m_masternode_outpoint.hash, msg->m_masternode_outpoint.index,
+            msg->m_parent_hash, msg->m_vote_outcome, msg->m_vote_signal,
+            msg->m_time);
+        rec.peer_key         = m_active ? m_active->key : std::string();
+        gov_mark_received(static_cast<uint32_t>(inventory_type::govobjectvote), rec.vote_id);
         // DEBUG, not INFO: a mainnet governance sync streams tens of
         // thousands of votes (per-vote INFO would flood the journal).
         LOG_DEBUG_COIND << "[" << m_chain_label << "] govobjvote: parent="
@@ -4636,6 +5064,25 @@ private:
     }
 
     ADD_P2P_HANDLER(govsync)   { /* inbound sync request — we don't serve governance */ }
+
+    ADD_P2P_HANDLER(ssc)
+    {
+        // SYNCSTATUSCOUNT (Dash Core masternode/sync.h): the peer's answer to
+        // our govsync — MASTERNODE_SYNC_GOVOBJ (10) = the number of object invs
+        // it is relaying for the nProp=0 prime; _VOTE (11) for a per-object
+        // vote sync (informational here). Only an answer to a prime WE sent on
+        // this connection counts toward coverage.
+        PeerSession* p = m_active;
+        if (!p) return;
+        LOG_INFO << "[" << m_chain_label << "] ssc from " << p->key << ": item="
+                 << msg->m_item_id << " count=" << msg->m_count;
+        if (msg->m_item_id != DASH_MASTERNODE_SYNC_GOVOBJ) return;
+        auto it = m_gov_peer.find(p->key);
+        if (it == m_gov_peer.end() || !it->second.primed) return;
+        it->second.ssc = true;
+        it->second.ssc_count = msg->m_count;
+        gov_eval_coverage(p->key, it->second);
+    }
 
     // ── SPORK listener (state + telemetry only; NO serve-gate consults this) ─
 
@@ -4725,6 +5172,23 @@ private:
                 // next_bulk_peer() converges away from non-servers of deep
                 // history onto archival peers that actually deliver.
                 note_bulk_nonserver(p->key);
+            }
+            else if (inv.base_type() == inventory_type::govobject ||
+                     inv.base_type() == inventory_type::govobjectvote)
+            {
+                // E-SUPERBLOCK: the peer does not hold what it announced (or no
+                // longer does): re-ask another announcer on the next tick, and
+                // the peer no longer vouches for that object.
+                auto it = m_gov_inflight.find({static_cast<uint32_t>(inv.m_type), inv.m_hash});
+                if (it != m_gov_inflight.end() && it->second.peer == p->key)
+                    gov_inflight_retry_now(it->first, it->second);
+                if (inv.base_type() == inventory_type::govobject) {
+                    auto git = m_gov_peer.find(p->key);
+                    if (git != m_gov_peer.end() && git->second.pending.erase(inv.m_hash)) {
+                        git->second.announced.erase(inv.m_hash);
+                        gov_eval_coverage(p->key, git->second);
+                    }
+                }
             }
         }
     }
