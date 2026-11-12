@@ -41,6 +41,11 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
     # per-coin protocol_legacy.cpp / protocol_actual.cpp addrme+addrs handlers.
     # Same reasoning as above: FOLDED into the EXISTING allowlisted core_test
     # target, never a new add_executable.
+    # random_uniform_test.cpp: random_float / random_double are continuous
+    # [min, max) draws (they were integer draws: random_float(0, 100) gave only
+    # 0..100, so the node-fee draw took ceil(fee)/101 and every peer-selection
+    # random_float(0, 1) < 0.8 held 50%). Fixed-seed, wide-tolerance hit rates
+    # for the fee draw. FOLDED into core_test, never a new add_executable.
     # p2p_message_stats_test.cpp: the p2p wire observability layer
     # (core/p2p_message_stats.hpp) -- command -> message-type mapping including
     # the NUL-padded wire form, the per-direction counters, and the embedded-
@@ -228,6 +233,7 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
         packet_test.cpp
         payout_manager_rules_test.cpp
         random_choice_guard_test.cpp
+        random_uniform_test.cpp
         reloaded_block_flag_test.cpp
         socket_write_queue_test.cpp
         socket_read_empty_prefix_test.cpp
