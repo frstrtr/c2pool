@@ -115,9 +115,6 @@ public:
     void write(std::span<const std::byte> src)
     {
         ctx.Write(reinterpret_cast<const unsigned char*>(src.data()), src.size());
-        for (int i = 0; i < src.size(); i++) std::cout << (char)*(src.data() + i) << " ";
-        // for (auto v : ctx.s) std::cout << v << " ";
-        std::cout << std::endl;
     }
 
     /** Compute the double-SHA256 hash of all data written to this object.

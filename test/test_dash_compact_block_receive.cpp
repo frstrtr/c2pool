@@ -980,3 +980,17 @@ TEST(DashCompactGolden, TestnetBlock1590326FromDashCoreV24) {
         EXPECT_EQ(back.indexes, req.indexes);
     }
 }
+
+// N3: core HashWriter::write only hashes. It used to print every byte it was
+// fed to stdout; TaggedHash() reaches it through operator<<.
+TEST(DashCompactShortId, CoreHashWriterHashesSilently) {
+    uint256 v;
+    for (int i = 0; i < 32; ++i) v.data()[i] = static_cast<unsigned char>(i * 7 + 1);
+    testing::internal::CaptureStdout();
+    HashWriter w{};
+    w << v;
+    const uint256 got = w.GetHash();
+    EXPECT_EQ(testing::internal::GetCapturedStdout(), "");
+    auto ps = pack(v);
+    EXPECT_EQ(got, ::Hash(ps.get_span())) << "double SHA-256 of the 32 bytes";
+}
