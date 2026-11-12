@@ -1752,7 +1752,6 @@
                     <a href="dashboard.html" class="active">Dashboard</a>
                     <a href="#pplns-section">PPLNS</a>
                     <a href="#sharechain-section">Sharechain</a>
-                    <a href="graphs.html">Graphs</a>
                     <a href="stratum.html">Stratum</a>
                     <a href="miners.html">Miners</a>
                     <a href="javascript:manualRefresh()" class="refresh-btn" title="Refresh data">🔄 Refresh</a>
@@ -8067,8 +8066,8 @@
             
             // This node's OWN hashrate, as distinct from the pool total.
             // Both sources are already served by rest_web_graph_data() and are
-            // populated on every coin -- see web-static/graphs.html, which has
-            // plotted them on a separate legacy page since the p2pool port.
+            // populated on every coin (the same /web/graph_data endpoints the
+            // removed legacy p2pool Graphs page plotted).
             var localEndpoints = {
                 'hour': '../web/graph_data/local_hash_rate/last_hour',
                 'day': '../web/graph_data/local_hash_rate/last_day',
