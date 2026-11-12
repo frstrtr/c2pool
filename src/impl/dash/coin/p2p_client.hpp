@@ -885,6 +885,16 @@ private:
     uint64_t m_cmpct_unsolicited{0};       // cmpctblock we did not ask for: dropped
     uint64_t m_cmpct_gate_dropped{0};      // answered, but refused by the gate
     uint64_t m_bodies_unbound{0};          // bodies refused: merkle root mismatch
+    // N1: tracked bodies latched SELF-BIND-FAULT (>= SELF_BIND_FAULT_PEERS
+    // distinct asked peers answered with a body that does not bind).
+    uint64_t m_self_bind_faults{0};
+    // N1: peers that answered with a non-binding body, proven wrong once a
+    // body for the same header bound (dashcore BLOCK_MUTATED, Misbehaving 100).
+    uint64_t m_unbound_blamed{0};
+    // N1: distinct asked peers whose non-binding answer latches SELF-BIND-FAULT,
+    // and the most answerers remembered per tracked body.
+    static constexpr size_t SELF_BIND_FAULT_PEERS = 2;
+    static constexpr size_t UNBOUND_FROM_CAP = 8;
     uint64_t m_misbehavior_disconnects{0};
     uint64_t m_misbehavior_spared{0};      // would disconnect, but protected / last peer
     // WARNING lines on the compact path are rate-limited: at most
@@ -1173,6 +1183,19 @@ private:
         // deliverer, instead of waiting BODY_REREQUEST_MAX round-robin rotations
         // like an ordinary buffered-ahead slot.
         bool        hol{false};
+        // N1: distinct peers that answered OUR ask for this body with one that
+        // does not bind to its header merkle root. An answer is not a stall:
+        // the fault may be ours (a txid or codec we do not compute like Dash
+        // Core), so nobody is blamed until a body for this header binds.
+        std::vector<std::string> unbound_from;
+        // N1: the carrier answered with a non-binding body and nobody was
+        // re-asked yet: the next watchdog pass is not a stall.
+        bool        carrier_answered{false};
+        // N1: SELF-BIND-FAULT latched for this body (SELF_BIND_FAULT_PEERS
+        // distinct asked peers answered with non-binding bodies). No peer is
+        // evicted or demoted for it, and every re-ask backs off to
+        // BODY_STALL_TIMEOUT_MAX. Cleared with the slot when a body binds.
+        bool        self_bind_fault{false};
     };
     std::vector<PendingBody> m_pending_bodies;
     uint64_t m_body_rerequests_total{0};
@@ -1857,6 +1880,9 @@ public:
              + " unsolicited=" + std::to_string(m_cmpct_unsolicited)
              + " gate_dropped=" + std::to_string(m_cmpct_gate_dropped)
              + " unbound_bodies=" + std::to_string(m_bodies_unbound)
+             + " self_bind_faults=" + std::to_string(m_self_bind_faults)
+             + " self_bind_active=" + std::to_string(self_bind_faults_active())
+             + " unbound_blamed=" + std::to_string(m_unbound_blamed)
              + " misbehavior_disconnects=" + std::to_string(m_misbehavior_disconnects)
              + " misbehavior_spared=" + std::to_string(m_misbehavior_spared)
              + " parked=" + std::to_string(m_cmpct_rx.parked_count());
@@ -1869,6 +1895,21 @@ public:
     uint64_t cmpct_unsolicited() const     { return m_cmpct_unsolicited; }
     uint64_t cmpct_gate_dropped() const    { return m_cmpct_gate_dropped; }
     uint64_t bodies_unbound() const        { return m_bodies_unbound; }
+    uint64_t self_bind_faults() const      { return m_self_bind_faults; }
+    uint64_t unbound_blamed() const        { return m_unbound_blamed; }
+    /// Tracked bodies currently latched SELF-BIND-FAULT.
+    size_t self_bind_faults_active() const
+    {
+        size_t n = 0;
+        for (const auto& pb : m_pending_bodies) if (pb.self_bind_fault) ++n;
+        return n;
+    }
+    bool self_bind_fault_for_test(const uint256& h) const
+    {
+        for (const auto& pb : m_pending_bodies)
+            if (pb.hash == h) return pb.self_bind_fault;
+        return false;
+    }
     uint64_t misbehavior_disconnects() const { return m_misbehavior_disconnects; }
     uint64_t misbehavior_spared() const    { return m_misbehavior_spared; }
     /// TEST-ONLY: observe every message written to any peer (key, message).
@@ -3630,6 +3671,105 @@ private:
         return true;
     }
 
+    /// Did we ask `key` for the body of `h`? Leaves the ask in place.
+    bool has_body_ask(const uint256& h, const std::string& key) const
+    {
+        auto it = m_body_asks.find(h);
+        return it != m_body_asks.end()
+            && std::find(it->second.begin(), it->second.end(), key) != it->second.end();
+    }
+
+    static bool answered_unbound(const PendingBody& pb, const std::string& key)
+    {
+        return std::find(pb.unbound_from.begin(), pb.unbound_from.end(), key)
+               != pb.unbound_from.end();
+    }
+
+    /// N1: the full body for `h` that `p` sent does not bind to its header.
+    ///
+    /// dashcore punishes that (BLOCK_MUTATED, Misbehaving 100), because its
+    /// own txids are right by definition. Ours may not be: a tx type or
+    /// version we hash or decode unlike Dash Core makes EVERY honest peer's
+    /// body fail the bind, and blaming the carrier as a staller would evict
+    /// the honest pool one peer at a time. So a non-binding answer to OUR ask
+    /// is an answer, not a stall:
+    ///  - the peer is remembered on the slot and never evicted for it here;
+    ///  - the first one re-asks a different peer at once;
+    ///  - SELF_BIND_FAULT_PEERS distinct answerers latch SELF-BIND-FAULT: a
+    ///    loud alert, no evictions or demotions for this body, re-asks backed
+    ///    off. The body never reaches the ingest legs, so the embedded arm
+    ///    stays fail-closed on it;
+    ///  - when a body for `h` does bind, the others were provably not the
+    ///    block, and blame_unbound_answerers() applies dashcore's penalty.
+    /// A body nobody asked `p` for is only dropped, as before.
+    void note_unbound_answer(PeerSession* p, const uint256& h)
+    {
+        if (!p || !has_body_ask(h, p->key)) return;
+        PendingBody* pb = nullptr;
+        for (auto& s : m_pending_bodies)
+            if (s.hash == h) { pb = &s; break; }
+        if (!pb) return;
+        if (!answered_unbound(*pb, p->key) && pb->unbound_from.size() < UNBOUND_FROM_CAP)
+            pb->unbound_from.push_back(p->key);
+        const bool was_carrier = pb->last_peer == p->key;
+        // It answered: the stall window that follows has nobody to blame.
+        if (was_carrier) { pb->last_peer.clear(); pb->carrier_answered = true; }
+
+        if (!pb->self_bind_fault && pb->unbound_from.size() >= SELF_BIND_FAULT_PEERS)
+        {
+            pb->self_bind_fault = true;
+            ++m_self_bind_faults;
+            std::string from;
+            for (const auto& k : pb->unbound_from) from += (from.empty() ? "" : ",") + k;
+            LOG_ERROR << "[" << m_chain_label << "] SELF-BIND-FAULT body "
+                      << h.GetHex() << ": " << pb->unbound_from.size()
+                      << " distinct peers answered with a body that does not bind to"
+                         " its header merkle root (" << from << "). Suspect our own"
+                         " txid/codec. No peer is evicted for this body; re-asks back"
+                         " off to " << BODY_STALL_TIMEOUT_MAX << "s; the block is not"
+                         " ingested (embedded arm fail-closed on it) until a body binds.";
+        }
+        if (pb->self_bind_fault || !was_carrier) return;
+
+        // One non-binding answer: ask a different peer for the full body now
+        // instead of waiting out a stall window.
+        PeerSession* target = other_block_peer(h, p->key);
+        pb->last_req = now_sec();
+        if (!target) return;   // the watchdog re-asks when due, blaming nobody
+        send_block_getdata(target, h, /*cmpct=*/false);
+        ++pb->rerequests;
+        ++m_body_rerequests_total;
+        pb->last_peer = target->key;
+        pb->carrier_answered = false;
+        pb->stall_timeout = BODY_STALL_TIMEOUT_INIT;
+        LOG_INFO << "[" << m_chain_label << "] cause=body-unbound-reask attempt="
+                 << pb->rerequests << " peer=" << target->key << " hash="
+                 << h.GetHex().substr(0, 16) << "... after a non-binding answer from "
+                 << p->key;
+    }
+
+    /// N1: a body for `pb.hash` bound, delivered by `deliverer`. Every OTHER
+    /// peer that answered with a non-binding body sent something that is not
+    /// this block, so dashcore's BLOCK_MUTATED penalty now applies to it.
+    void blame_unbound_answerers(const PendingBody& pb, const std::string& deliverer)
+    {
+        if (pb.self_bind_fault)
+            LOG_WARNING << "[" << m_chain_label << "] SELF-BIND-FAULT cleared: body "
+                        << pb.hash.GetHex().substr(0, 16) << "... bound from "
+                        << deliverer << "; the " << pb.unbound_from.size()
+                        << " non-binding answers were not this block";
+        for (const auto& k : pb.unbound_from)
+        {
+            if (k == deliverer) continue;
+            PeerSession* q = find_peer(k);
+            if (!q) continue;
+            ++m_unbound_blamed;
+            misbehaving(q, 100, "block body " + pb.hash.GetHex().substr(0, 16)
+                                + "... did not bind to its header; " + deliverer
+                                + "'s did");
+        }
+    }
+
     bool have_body(const uint256& h) const { return m_recent_bodies.count(h) != 0; }
 
     void note_body_delivered(const uint256& h)
@@ -4470,8 +4610,12 @@ private:
             // mapBlocksInFlight until the body actually lands (that removal
             // lives in the block handler). Abandoning it is the wedge this
             // replaces (height 967736: connected=8/8, slot dropped, lane frozen).
+            // N1: when the last asked peer ANSWERED (with a body that did not
+            // bind), this window has no staller to count against the set; a
+            // SELF-BIND-FAULT body never counts toward an eviction.
             const std::string staller = pb.last_peer;
-            ++pb.stalls_since_evict;
+            if (!pb.carrier_answered && !pb.self_bind_fault) ++pb.stalls_since_evict;
+            pb.carrier_answered = false;
 
             // #968a: a compact fetch of this body (our MSG_CMPCT_BLOCK ask, or
             // a block parked waiting for blocktxn) ran out the same stall
@@ -4534,7 +4678,7 @@ private:
                 // time it disconnects). Still guarded by a survivor/refill so the
                 // pool can never be drained by one missing block.
                 if (!staller.empty() && staller != target->key
-                    && pb.stall_timeout >= 16)
+                    && pb.stall_timeout >= 16 && !pb.self_bind_fault)
                 {
                     PeerSession* bad = find_peer(staller);
                     const bool have_alternative =
@@ -4583,8 +4727,13 @@ private:
             pb.last_req = now;
             // A freshly-assigned peer gets the full fast window (dashd resets
             // the stall clock on (re)assignment); doubling, capped, only when
-            // the pool leaves us re-asking the same staller.
-            if (target->key != staller)
+            // the pool leaves us re-asking the same staller. N1: also when
+            // re-asking a peer that already answered with a non-binding body,
+            // and on every re-ask of a SELF-BIND-FAULT body, so a body our
+            // codec cannot bind costs at most one fetch per
+            // BODY_STALL_TIMEOUT_MAX instead of a tight request loop.
+            if (target->key != staller && !pb.self_bind_fault
+                && !answered_unbound(pb, target->key))
                 pb.stall_timeout = BODY_STALL_TIMEOUT_INIT;
             else
                 pb.stall_timeout =
@@ -4594,7 +4743,8 @@ private:
                      << pb.rerequests << " peer=" << target->key << " hash="
                      << pb.hash.GetHex().substr(0, 16) << "... unanswered_for="
                      << (now - pb.first_req) << "s next_stall_window="
-                     << pb.stall_timeout << "s";
+                     << pb.stall_timeout << "s"
+                     << (pb.self_bind_fault ? " self_bind_fault=1" : "");
 
             // dashd disconnect-on-stall + FindNextBlocksToDownload: with 8/8
             // connected but none serving THIS body, rotation alone spins. Once
@@ -4605,7 +4755,8 @@ private:
             // Guarded: only when a real staller is still held AND a survivor (or
             // an armed refill) can replace it, so one missing block can never
             // drain the pool to zero.
-            if (pb.stalls_since_evict >= BODY_REREQUEST_MAX && !staller.empty())
+            if (pb.stalls_since_evict >= BODY_REREQUEST_MAX && !staller.empty()
+                && !pb.self_bind_fault)
             {
                 PeerSession* bad = find_peer(staller);
                 const bool have_alternative =
@@ -5057,7 +5208,8 @@ private:
         // legs. A body that does not bind is somebody else's txs under this
         // header; it is dropped here and the watchdog keeps asking for the
         // real one. A reassembled compact body was already bound by the
-        // receiver, so it is not hashed twice.
+        // receiver, so it is not hashed twice. N1: if we asked this peer for
+        // it, it answered (note_unbound_answer): it is not a staller.
         if (!via_compact && !block_body_binds_to_header(block))
         {
             ++m_bodies_unbound;
@@ -5066,6 +5218,7 @@ private:
                             << blockhash.GetHex().substr(0, 16) << "... from " << p->key
                             << " does not bind to its header merkle root, dropped"
                             << cmpct_warn_suffix();
+            note_unbound_answer(p, blockhash);
             return;
         }
         // #968a: a peer is credited for a body only when we ASKED it for that
@@ -5092,6 +5245,8 @@ private:
                 // re-targets the new first in-flight block).
                 if (!m_hol_hash.IsNull() && m_hol_hash == blockhash)
                     m_hol_hash.SetNull();
+                // N1: this body binds, so the non-binding answers were not it.
+                if (!it->unbound_from.empty()) blame_unbound_answerers(*it, p->key);
                 m_pending_bodies.erase(it);
                 break;
             }

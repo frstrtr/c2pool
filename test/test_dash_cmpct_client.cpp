@@ -859,3 +859,169 @@ TEST(DashCmpctClient, DisconnectClearsCompactState)
     EXPECT_EQ(rig.client.cmpct_parked_count_for_test(), 0u);
     EXPECT_FALSE(rig.client.cmpct_requested_from_for_test(hash_of(b1), CmpctRig::key(2)));
 }
+
+// ── N1: a body that does not bind is an answer, not a stall ─────────────────
+
+// The block every honest peer serves, whose header merkle root our txids do
+// not reproduce: what a tx type we hash unlike Dash Core looks like from here.
+static BlockType mk_unbindable_block(const uint256& prev, uint32_t tag, size_t ntx)
+{
+    BlockType b = mk_block(prev, tag, ntx);
+    b.m_merkle_root.data()[0] ^= 0x01;
+    for (uint32_t n = 0;; ++n) {
+        b.m_nonce = n;
+        if (pow_meets_bits(x11_of(b), b.m_bits)) break;
+    }
+    return b;
+}
+
+// Peer number of a rig key ("192.0.2.N:19999"), 0 when unknown.
+static int peer_no(const std::string& key)
+{
+    for (int n = 1; n <= 9; ++n) if (CmpctRig::key(n) == key) return n;
+    return 0;
+}
+
+// Answer every getdata for `h` sent since `seen` (MSG_BLOCK or
+// MSG_CMPCT_BLOCK) at once, from the peer that was asked, with `body_of(n)` as
+// a full block. Returns how many asks were answered.
+template <typename BodyOf>
+static size_t answer_asks(CmpctRig& rig, size_t& seen, const uint256& h, BodyOf body_of)
+{
+    size_t answered = 0;
+    while (seen < rig.sent.size()) {
+        const Sent s = rig.sent[seen++];   // copy: deliver() appends to sent
+        if (s.cmd != "getdata") continue;
+        for (const auto& [type, ih] : getdata_invs(s)) {
+            if (ih != h || (type != kMsgBlock && type != kMsgCmpctBlock)) continue;
+            const int n = peer_no(s.key);
+            if (n == 0) continue;
+            rig.deliver(n, p2p::message_block::make_raw(body_of(n)));
+            ++answered;
+        }
+    }
+    return answered;
+}
+
+TEST(DashCmpctClient, SelfBindFaultNeverEvictsHonestPeers)
+{
+    CmpctRig rig;
+    for (int n = 1; n <= 4; ++n) rig.handshake(n);
+    rig.warm(1);
+    const BlockType b1 = mk_unbindable_block(hash_of(rig.b0), 1, 3);
+    const uint256 h1 = hash_of(b1);
+    size_t seen = rig.sent.size();
+    rig.announce(2, b1);
+    auto honest = [&](int) { return b1; };
+    size_t answers = answer_asks(rig, seen, h1, honest);
+    EXPECT_TRUE(rig.client.self_bind_fault_for_test(h1))
+        << "the first non-binding answer re-asks another peer at once; the second latches";
+    for (int s = 0; s < 120; ++s) {
+        rig.run_seconds(1);
+        answers += answer_asks(rig, seen, h1, honest);
+    }
+    EXPECT_EQ(rig.client.self_bind_faults(), 1u);
+    EXPECT_EQ(rig.client.self_bind_faults_active(), 1u);
+    EXPECT_EQ(rig.client.body_stall_evictions(), 0u) << "no honest peer evicted as a staller";
+    EXPECT_EQ(rig.client.misbehavior_disconnects(), 0u);
+    EXPECT_EQ(rig.client.unbound_blamed(), 0u);
+    for (int n = 1; n <= 4; ++n)
+        EXPECT_FALSE(rig.client.flagged_for_disconnect_for_test(CmpctRig::key(n))) << n;
+    EXPECT_EQ(rig.client.handshaked_peer_keys().size(), 4u);
+    EXPECT_EQ(rig.delivered.size(), 1u) << "never ingested: the embedded arm stays fail-closed on it";
+    EXPECT_FALSE(rig.client.have_body_for_test(h1));
+    EXPECT_EQ(rig.client.pending_body_count(), 1u) << "still wanted";
+    EXPECT_GE(answers, 4u) << "re-asks continue";
+    EXPECT_LE(answers, 9u) << "backed off to 64 s, not a request loop";
+    EXPECT_NE(rig.client.compact_status().find("self_bind_faults=1 self_bind_active=1"),
+              std::string::npos);
+}
+
+TEST(DashCmpctClient, OneForgedAnswerReasksAtOnceThenTheForgerIsBlamed)
+{
+    CmpctRig rig;
+    for (int n = 1; n <= 3; ++n) rig.handshake(n);
+    rig.warm(1);
+    const BlockType b1 = mk_block(hash_of(rig.b0), 1, 3);
+    const uint256 h1 = hash_of(b1);
+    BlockType forged = b1;                 // b1's header, other txs
+    forged.m_txs[1] = mk_tx(31337);
+    ASSERT_EQ(hash_of(forged), h1);
+    rig.announce(2, b1);
+    ASSERT_GE(rig.sent_to(2, "getdata").size(), 1u);
+    const size_t seen = rig.sent.size();
+    rig.deliver(2, p2p::message_block::make_raw(forged));
+    EXPECT_EQ(rig.client.bodies_unbound(), 1u);
+    EXPECT_EQ(rig.client.misbehavior_for_test(CmpctRig::key(2)), 0) << "not blamed yet";
+    EXPECT_FALSE(rig.client.self_bind_fault_for_test(h1));
+    // Re-asked from another peer at once, without waiting out a stall window.
+    int reasked = 0;
+    for (size_t i = seen; i < rig.sent.size(); ++i)
+        if (rig.sent[i].cmd == "getdata" && rig.sent[i].key != CmpctRig::key(2))
+            for (const auto& [type, ih] : getdata_invs(rig.sent[i]))
+                if (ih == h1 && type == kMsgBlock) reasked = peer_no(rig.sent[i].key);
+    ASSERT_NE(reasked, 0);
+    rig.deliver(reasked, p2p::message_block::make_raw(b1));
+    EXPECT_EQ(rig.delivered.back(), h1);
+    EXPECT_EQ(rig.client.pending_body_count(), 0u);
+    EXPECT_EQ(rig.client.unbound_blamed(), 1u);
+    EXPECT_TRUE(rig.client.flagged_for_disconnect_for_test(CmpctRig::key(2)))
+        << "dashcore BLOCK_MUTATED, applied once the real body bound";
+    EXPECT_FALSE(rig.client.flagged_for_disconnect_for_test(CmpctRig::key(reasked)));
+    EXPECT_EQ(rig.client.body_stall_evictions(), 0u);
+}
+
+TEST(DashCmpctClient, TwoForgersLatchButTheRealBodyClearsItAndBlamesBoth)
+{
+    CmpctRig rig;
+    for (int n = 1; n <= 4; ++n) rig.handshake(n);
+    rig.warm(1);
+    const BlockType b1 = mk_block(hash_of(rig.b0), 1, 3);
+    const uint256 h1 = hash_of(b1);
+    std::vector<int> forgers;
+    // Every peer forges except peer 4, which serves the real block.
+    auto body_of = [&](int n) {
+        if (n == 4) return b1;
+        if (std::find(forgers.begin(), forgers.end(), n) == forgers.end()) forgers.push_back(n);
+        BlockType f = b1;
+        f.m_txs[1] = mk_tx(40000 + static_cast<uint32_t>(n));
+        return f;
+    };
+    size_t seen = rig.sent.size();
+    rig.announce(2, b1);
+    answer_asks(rig, seen, h1, body_of);
+    for (int s = 0; s < 120 && rig.client.pending_body_count() > 0; ++s) {
+        rig.run_seconds(1);
+        answer_asks(rig, seen, h1, body_of);
+    }
+    ASSERT_EQ(rig.client.pending_body_count(), 0u) << "the real body was still fetched";
+    EXPECT_EQ(rig.delivered.back(), h1);
+    ASSERT_GE(forgers.size(), 2u);
+    EXPECT_EQ(rig.client.self_bind_faults(), 1u) << "two forgers do latch";
+    EXPECT_EQ(rig.client.self_bind_faults_active(), 0u) << "cleared with the slot";
+    EXPECT_EQ(rig.client.unbound_blamed(), forgers.size());
+    for (int n : forgers)
+        EXPECT_TRUE(rig.client.flagged_for_disconnect_for_test(CmpctRig::key(n))) << n;
+    EXPECT_FALSE(rig.client.flagged_for_disconnect_for_test(CmpctRig::key(4)));
+    EXPECT_EQ(rig.client.body_stall_evictions(), 0u);
+}
+
+TEST(DashCmpctClient, UnaskedNonBindingBodyIsOnlyDropped)
+{
+    CmpctRig rig;
+    for (int n = 1; n <= 3; ++n) rig.handshake(n);
+    rig.warm(1);
+    const BlockType b1 = mk_block(hash_of(rig.b0), 1, 3);
+    const uint256 h1 = hash_of(b1);
+    BlockType forged = b1;
+    forged.m_txs[1] = mk_tx(31337);
+    rig.announce(2, b1);
+    rig.deliver(3, p2p::message_block::make_raw(forged));   // peer 3 was not asked
+    rig.deliver(1, p2p::message_block::make_raw(forged));   // nor was peer 1
+    EXPECT_EQ(rig.client.bodies_unbound(), 2u);
+    EXPECT_FALSE(rig.client.self_bind_fault_for_test(h1)) << "unasked bodies never latch";
+    rig.deliver(2, p2p::message_block::make_raw(b1));
+    EXPECT_EQ(rig.delivered.back(), h1);
+    EXPECT_EQ(rig.client.unbound_blamed(), 0u) << "only asked answerers are remembered";
+    EXPECT_EQ(rig.client.misbehavior_for_test(CmpctRig::key(3)), 0);
+}
