@@ -904,6 +904,11 @@ private:
     // stops immediate re-asks and only backs off (answers_overflow), so an
     // unrecorded answerer can never look "fresh" for ever (verify R1).
     static constexpr size_t UNBOUND_FROM_CAP = 32;
+    // The pool never holds more than POOL_PEERS_HARD_CAP peers, and a prune
+    // keeps only held keys, so answers_overflow is unreachable while this
+    // holds (verify round 3, V1: its fallback re-asks one peer).
+    static_assert(UNBOUND_FROM_CAP > POOL_PEERS_HARD_CAP,
+                  "every pool member must fit in a slot's answerer list");
     uint64_t m_misbehavior_disconnects{0};
     uint64_t m_misbehavior_spared{0};      // would disconnect, but protected / last peer
     // WARNING lines on the compact path are rate-limited: at most
