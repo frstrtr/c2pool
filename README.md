@@ -1085,6 +1085,7 @@ Only the daemonless trust anchor applies to a daemonless node — see
 | `--embedded-asn-diversity[=false]` | off | Require the racing set to span ≥2 ASNs. |
 | `--embedded-peer-latency-score[=false]` | off | Latency tie-breaker inside the eligible peer set. |
 | `--embedded-proactive-rotate` | off | Low-rate proactive coin-peer rotation (default is stall-only). |
+| `--embedded-compact-blocks[=false]` | on | BIP 152 compact-block receive: a new tip body is asked for as `getdata(MSG_CMPCT_BLOCK)` and rebuilt from the mempool. `=false` fetches every body whole. |
 
 **Embedded serving levers** (all daemonless-default ON, `=false` opts out;
 dashd-attached default OFF)

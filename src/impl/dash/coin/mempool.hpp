@@ -2301,6 +2301,27 @@ public:
         return out;
     }
 
+    /// BIP 152 short-id walk (Dash Core PartiallyDownloadedBlock::InitData:
+    /// LOCK(pool->cs), then every pool->vTxHashes entry). Calls `fn` once per
+    /// pooled tx, under the pool lock, with the tx by reference: nothing is
+    /// copied here. The key is the INSTANCE hash Dash Core v24 keys vTxHashes
+    /// by (txmempool.cpp GetInstanceHash): the pool key (dash_txid) for every
+    /// tx except a version-2 asset unlock, whose stable txid zeroes the quorum
+    /// signing info and so differs from the instance hash. `fn` returns false
+    /// to stop the walk. It must not call back into this Mempool.
+    template <typename Fn>
+    void for_each_tx_by_instance_hash(Fn&& fn) const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        for (const auto& [txid, e] : m_pool) {
+            if (is_asset_unlock_with_stable_txid(e.tx)) {
+                if (!fn(dash_instance_hash(e.tx), e.tx)) return;
+            } else if (!fn(txid, e.tx)) {
+                return;
+            }
+        }
+    }
+
     /// Phase C-TEMPLATE prerequisite — fee-aware tx selection.
     /// Returns transactions in TOPOLOGICALLY-VALID feerate order (see G1
     /// below) up to `max_bytes` of base-size budget. Transactions with
