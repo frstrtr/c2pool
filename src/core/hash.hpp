@@ -125,10 +125,12 @@ public:
      * Invalidates this object.
      */
     uint256 GetHash() {
+        // Byte digests (Finalize(unsigned char*)): uint256::begin() is a
+        // uint32_t* and would pick CSHA256::Finalize(uint32_t*), which copies
+        // the raw state words instead of the digest bytes.
         uint256 result;
-        ctx.Finalize(result.begin());
-        auto _data = result.GetChars();
-        ctx.Reset().Write(_data.data(), CSHA256::OUTPUT_SIZE).Finalize(result.begin());
+        ctx.Finalize(result.data());
+        ctx.Reset().Write(result.data(), CSHA256::OUTPUT_SIZE).Finalize(result.data());
         return result;
     }
 
@@ -138,7 +140,7 @@ public:
      */
     uint256 GetSHA256() {
         uint256 result;
-        ctx.Finalize(result.begin());
+        ctx.Finalize(result.data());   // byte digest, see GetHash()
         return result;
     }
 
