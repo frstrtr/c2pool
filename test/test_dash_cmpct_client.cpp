@@ -878,18 +878,21 @@ static BlockType mk_unbindable_block(const uint256& prev, uint32_t tag, size_t n
 // Peer number of a rig key ("192.0.2.N:19999"), 0 when unknown.
 static int peer_no(const std::string& key)
 {
-    for (int n = 1; n <= 9; ++n) if (CmpctRig::key(n) == key) return n;
+    for (int n = 1; n <= 16; ++n) if (CmpctRig::key(n) == key) return n;
     return 0;
 }
 
 // Answer every getdata for `h` sent since `seen` (MSG_BLOCK or
 // MSG_CMPCT_BLOCK) at once, from the peer that was asked, with `body_of(n)` as
 // a full block. Returns how many asks were answered.
+// A re-ask loop would never drain `sent`; `max_answers` turns that into a
+// failed bound instead of a hung test.
 template <typename BodyOf>
-static size_t answer_asks(CmpctRig& rig, size_t& seen, const uint256& h, BodyOf body_of)
+static size_t answer_asks(CmpctRig& rig, size_t& seen, const uint256& h, BodyOf body_of,
+                          size_t max_answers = 1000)
 {
     size_t answered = 0;
-    while (seen < rig.sent.size()) {
+    while (seen < rig.sent.size() && answered < max_answers) {
         const Sent s = rig.sent[seen++];   // copy: deliver() appends to sent
         if (s.cmd != "getdata") continue;
         for (const auto& [type, ih] : getdata_invs(s)) {
@@ -1083,6 +1086,32 @@ TEST(DashCmpctClient, HolSlotStillDisconnectsSilentStallersButNotTheAnswerer)
     const auto keys = rig.client.handshaked_peer_keys();
     EXPECT_NE(std::find(keys.begin(), keys.end(), CmpctRig::key(answerer)), keys.end())
         << "the peer that answered is never evicted for this body";
+}
+
+TEST(DashCmpctClient, MorePeersThanTheOldAnswererCapStillBackOff)
+{
+    // Verify R1: a pool larger than the recorded-answerer cap must not turn
+    // two unrecorded answerers into a re-ask loop with no clock in it.
+    CmpctRig rig;
+    rig.client.set_max_peers(12);
+    for (int n = 1; n <= 12; ++n) rig.handshake(n);
+    ASSERT_EQ(rig.client.handshaked_peer_keys().size(), 12u);
+    rig.warm(1);
+    const BlockType b1 = mk_unbindable_block(hash_of(rig.b0), 1, 3);
+    const uint256 h1 = hash_of(b1);
+    size_t seen = rig.sent.size();
+    rig.announce(2, b1);
+    auto honest = [&](int) { return b1; };
+    size_t answers = answer_asks(rig, seen, h1, honest);
+    EXPECT_LE(answers, 12u) << "each peer once, then no immediate re-ask";
+    for (int s = 0; s < 120; ++s) {
+        rig.run_seconds(1);
+        answers += answer_asks(rig, seen, h1, honest);
+    }
+    EXPECT_LE(answers, 20u) << "12 first answers, then a doubling backoff";
+    EXPECT_EQ(rig.client.body_stall_evictions(), 0u);
+    EXPECT_EQ(rig.client.handshaked_peer_keys().size(), 12u);
+    EXPECT_TRUE(rig.client.self_bind_fault_for_test(h1));
 }
 
 TEST(DashCmpctClient, SinglePeerPoolLatchesToo)

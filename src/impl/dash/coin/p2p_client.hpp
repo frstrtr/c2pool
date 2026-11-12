@@ -110,6 +110,7 @@
 #include <exception>
 #include <map>
 #include <memory>
+#include <new>
 #include <optional>
 #include <set>
 #include <string>
@@ -898,7 +899,11 @@ private:
     // N1: distinct asked peers whose non-binding answer latches SELF-BIND-FAULT,
     // and the most answerers remembered per tracked body.
     static constexpr size_t SELF_BIND_FAULT_PEERS = 2;
-    static constexpr size_t UNBOUND_FROM_CAP = 8;
+    // Above POOL_PEERS_HARD_CAP, so a whole pool plus some churn fits; keys no
+    // longer in the pool are pruned first. Should it still overflow, the slot
+    // stops immediate re-asks and only backs off (answers_overflow), so an
+    // unrecorded answerer can never look "fresh" for ever (verify R1).
+    static constexpr size_t UNBOUND_FROM_CAP = 32;
     uint64_t m_misbehavior_disconnects{0};
     uint64_t m_misbehavior_spared{0};      // would disconnect, but protected / last peer
     // WARNING lines on the compact path are rate-limited: at most
@@ -1195,6 +1200,10 @@ private:
         // N1: the carrier answered with a non-binding body and nobody was
         // re-asked yet: the next watchdog pass is not a stall.
         bool        carrier_answered{false};
+        // N1 (R1): an answerer could not be recorded (unbound_from full even
+        // after pruning departed peers). From then on: no immediate re-ask,
+        // and every watchdog re-ask doubles the window.
+        bool        answers_overflow{false};
         // N1: SELF-BIND-FAULT latched for this body (SELF_BIND_FAULT_PEERS
         // distinct asked peers, or the whole smaller pool, answered with
         // bodies that do not bind or decode): a loud alert, and no deferred
@@ -3331,7 +3340,9 @@ public:
             // why NOTHING may escape this function.
             LOG_ERROR << "[" << m_chain_label << "] parse('" << cmd
                       << "') threw: " << ec.what() << " — message dropped";
-            if (have_block_hdr) note_undecodable_block(peer, block_hdr);
+            // R2: an allocation failure is ours, not a property of the bytes.
+            if (have_block_hdr && !dynamic_cast<const std::bad_alloc*>(&ec))
+                note_undecodable_block(peer, block_hdr);
             return;
         }
 
@@ -3774,8 +3785,18 @@ private:
         for (auto& s : m_pending_bodies)
             if (s.hash == h) { pb = &s; break; }
         if (!pb) return;
-        if (!answered_unbound(*pb, p->key) && pb->unbound_from.size() < UNBOUND_FROM_CAP)
-            pb->unbound_from.push_back(p->key);
+        if (!answered_unbound(*pb, p->key))
+        {
+            if (pb->unbound_from.size() >= UNBOUND_FROM_CAP)
+                pb->unbound_from.erase(
+                    std::remove_if(pb->unbound_from.begin(), pb->unbound_from.end(),
+                                   [this](const std::string& k) { return !holds_key(k); }),
+                    pb->unbound_from.end());
+            if (pb->unbound_from.size() < UNBOUND_FROM_CAP)
+                pb->unbound_from.push_back(p->key);
+            else
+                pb->answers_overflow = true;
+        }
         const bool was_carrier = pb->last_peer == p->key;
         // It answered: the stall window that follows has nobody to blame.
         if (was_carrier) { pb->last_peer.clear(); pb->carrier_answered = true; }
@@ -3797,6 +3818,7 @@ private:
                          " ingested (embedded arm fail-closed on it) until a body binds.";
         }
         if (!was_carrier) return;
+        if (pb->answers_overflow) { pb->last_req = now_sec(); return; }   // R1: back off only
 
         // Ask a peer that has not answered yet for the full body now, instead
         // of waiting out a stall window. None left: the watchdog re-asks an
@@ -4705,8 +4727,13 @@ private:
             // against the set. A peer that has answered this body is never
             // evicted for it (the !answered_unbound guards below); a SILENT one
             // still is, as on master.
+            // R3: a recorded answerer that stays silent on a re-ask is never
+            // evicted for this body, so its window does not count either:
+            // otherwise the count would sit at the mark and the next
+            // never-answered peer would be cut on its first stall.
             const std::string staller = pb.last_peer;
-            if (!pb.carrier_answered) ++pb.stalls_since_evict;
+            if (!pb.carrier_answered && !(!staller.empty() && answered_unbound(pb, staller)))
+                ++pb.stalls_since_evict;
             pb.carrier_answered = false;
 
             // #968a: a compact fetch of this body (our MSG_CMPCT_BLOCK ask, or
@@ -4835,7 +4862,8 @@ private:
             // does not bind (every peer has, or fresh_body_peer would have
             // picked another), so a body our codec cannot bind backs off by
             // doubling up to BODY_STALL_TIMEOUT_MAX instead of a request loop.
-            if (target->key != staller && !answered_unbound(pb, target->key))
+            if (target->key != staller && !answered_unbound(pb, target->key)
+                && !pb.answers_overflow)
                 pb.stall_timeout = BODY_STALL_TIMEOUT_INIT;
             else
                 pb.stall_timeout =
