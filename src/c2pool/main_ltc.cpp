@@ -5974,6 +5974,10 @@ int main(int argc, char* argv[]) {
                 int v36_contiguous_from_tip = 0;
                 bool contiguous = true;
                 int full_walk = std::min(chain_ht, chain_len);
+                // Window share-target difficulties for the Best Share card's
+                // median row (p2pool web.py best_share median_pct).
+                std::vector<double> window_diffs;
+                window_diffs.reserve(static_cast<size_t>(std::max(full_walk, 0)));
                 {
                     uint256 pos = best;
                     for (int i = 0; i < full_walk && !pos.IsNull(); ++i) {
@@ -5982,6 +5986,8 @@ int main(int argc, char* argv[]) {
                         try {
                             auto& cd = chain.get(pos);
                             cd.share.invoke([&](auto* s) {
+                                window_diffs.push_back(chain::target_to_difficulty(
+                                    chain::bits_to_target(s->m_bits)));
                                 if (static_cast<int>(s->m_desired_version) >= 36) {
                                     deepest_v36_pos = i + 1;
                                     if (contiguous) v36_contiguous_from_tip = i + 1;
@@ -5993,6 +5999,8 @@ int main(int argc, char* argv[]) {
                         } catch (...) { break; }
                     }
                 }
+                result["median_difficulty"] =
+                    core::MiningInterface::median_share_difficulty(std::move(window_diffs));
                 result["deepest_v36_position"] = deepest_v36_pos;
                 result["v36_contiguous_from_tip"] = v36_contiguous_from_tip;
 
@@ -6902,14 +6910,16 @@ int main(int argc, char* argv[]) {
                 });
             };
 
-            // Wire share difficulty tracking for best share dashboard display.
-            // Every verified share reports its difficulty — both LTC and DOGE use
-            // the same share difficulty (scrypt PoW), just compared against different
-            // network targets for the percentage display.
+            // Every verified share (any pool miner, incl. startup re-verify)
+            // reports its share TARGET difficulty: feed the per-miner hashrate
+            // ring + share stats only. The Best Share card is fed by local
+            // stratum pseudoshares with their achieved scrypt difficulty
+            // (MiningInterface::record_best_pseudoshare, p2pool work.py:4132/
+            // 4182); a peer's share target is not a "best share" of this node.
             p2p_node->tracker().m_on_share_difficulty = [&web_server](double diff, const std::string& miner) {
                 auto mi = web_server.get_mining_interface();
-                mi->record_share_difficulty(diff, miner);
-                mi->record_merged_share_difficulty(diff, miner);
+                mi->record_share_difficulty(diff, miner, /*share_hash=*/"",
+                                            /*update_best=*/false);
             };
 
             // Wire merged block detection for peer shares.

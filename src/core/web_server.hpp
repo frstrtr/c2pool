@@ -2290,9 +2290,37 @@ public:
     // share_hash: optional pow-hash of the record-setting share (display only;
     // DASH stratum submit path supplies it so the Best Share card can show the
     // exact hash that got closest to net difficulty).
+    // update_best=false: feed only the hashrate ring, the share counter and the
+    // recent-share-difficulty snapshot. LTC passes false for every verified
+    // sharechain share: those carry the share TARGET difficulty of any pool
+    // miner, which is not an achieved hash and must not reach the Best Share
+    // card (p2pool work.py records target_to_difficulty(pow_hash) of local
+    // submits only).
     void record_share_difficulty(double difficulty, const std::string& miner,
-                                 const std::string& share_hash = "");
+                                 const std::string& share_hash = "",
+                                 bool update_best = true);
     void record_merged_share_difficulty(double difficulty, const std::string& miner);
+    // Best Share card legs only (no ring / counters). Raises the primary
+    // all_time / session / round legs and, when update_merged, the merged
+    // all_time / round legs. Python p2pool work.py update_best_difficulty.
+    void update_best_difficulty(double difficulty, const std::string& miner,
+                                const std::string& pow_hash_hex = "",
+                                bool update_merged = true);
+    // Median of the per-share target difficulties in a sharechain window
+    // (p2pool web.py best_share median_pct). 0 for an empty window.
+    static double median_share_difficulty(std::vector<double> diffs);
+    /// IWorkSource override: the LTC stratum path (this class is its work
+    /// source) reports the achieved scrypt difficulty of every accepted
+    /// pseudoshare here. It feeds the Best Share legs only; the pow-hash is
+    /// recomputed only when the share can set a record. Display only.
+    void record_best_pseudoshare(
+        double share_difficulty, const std::string& miner,
+        const std::string& coinb1, const std::string& coinb2,
+        const std::string& extranonce1, const std::string& extranonce2,
+        const std::string& ntime, const std::string& nonce,
+        uint32_t version, const std::string& prevhash_hex,
+        const std::string& nbits_hex,
+        const std::vector<std::string>& merkle_branches) override;
     // A pool block was won -> the sharechain round boundary moved. Reset the
     // round-level best-share tracker (all_time / session are left untouched).
     // See #922: round previously only ever raised, degenerating into a
@@ -2393,7 +2421,7 @@ private:
     // best_share showed all_time == session == round — the "all-time" leg
     // reset on every restart because it lived only in memory, so the card
     // was quietly lying about what "all time" means. Persisted as a small
-    // sidecar JSON next to the stat log (all_time leg ONLY: session and
+    // sidecar JSON next to the stat log (all_time + merged all_time legs ONLY: session and
     // round are honestly per-process/per-round). Display only.
     std::string best_share_db_path() const {
         return m_stat_log_path.empty() ? std::string()

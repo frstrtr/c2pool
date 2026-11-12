@@ -1800,3 +1800,126 @@ TEST(DashboardData, ScheduledChecksFollowTheBlockAcrossAnInsert)
     EXPECT_EQ(st_new, MiningInterface::BlockStatus::pending);
     EXPECT_EQ(checks_new, 0u) << "the newcomer was never scheduled";
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Best Share = this node's achieved hash difficulty, not a peer share target
+// ═══════════════════════════════════════════════════════════════════════════
+
+// THE INCIDENT (LTC+DOGE, 2026-11): ~150 GH/s for 12 h, the card read round
+// 511 — a peer's share TARGET from the sharechain verify hook — while the
+// local stratum's achieved scrypt difficulties (best ~1.5e6) never reached it
+// (record_best_pseudoshare was the IWorkSource no-op on MiningInterface).
+// p2pool work.py:4132/4182 records target_to_difficulty(pow_hash) of local
+// submits only.
+namespace {
+void best_pseudoshare(MiningInterface& mi, double diff, const std::string& who)
+{
+    mi.record_best_pseudoshare(diff, who, "", "", "", "", "", "", 0, "", "", {});
+}
+}  // namespace
+
+TEST(DashboardData, BestShareIsFedByLocalPseudoshares)
+{
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::LITECOIN);
+    mi.update_network_difficulty(94.7e6, "test");
+
+    best_pseudoshare(mi, 1.5e6, "w1");
+
+    auto bs = mi.rest_best_share();
+    EXPECT_DOUBLE_EQ(bs["session"]["difficulty"].get<double>(), 1.5e6);
+    EXPECT_DOUBLE_EQ(bs["round"]["difficulty"].get<double>(), 1.5e6);
+    EXPECT_DOUBLE_EQ(bs["all_time"]["difficulty"].get<double>(), 1.5e6);
+    EXPECT_EQ(bs["round"]["miner"].get<std::string>(), "w1");
+    EXPECT_NEAR(bs["round"]["pct_of_block"].get<double>(), 1.584, 1e-3);
+    EXPECT_TRUE(bs["has_best_share"].get<bool>());
+    ASSERT_TRUE(bs.contains("merged"));
+    EXPECT_DOUBLE_EQ(bs["merged"]["round"]["difficulty"].get<double>(), 1.5e6);
+    EXPECT_DOUBLE_EQ(bs["merged"]["all_time"]["difficulty"].get<double>(), 1.5e6);
+
+    // A lower pseudoshare never lowers a leg.
+    best_pseudoshare(mi, 9.0e5, "w2");
+    bs = mi.rest_best_share();
+    EXPECT_DOUBLE_EQ(bs["round"]["difficulty"].get<double>(), 1.5e6);
+    EXPECT_EQ(bs["round"]["miner"].get<std::string>(), "w1");
+}
+
+TEST(DashboardData, SharechainShareTargetsDoNotReachBestShare)
+{
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::LITECOIN);
+    mi.update_network_difficulty(94.7e6, "test");
+    best_pseudoshare(mi, 1.5e6, "w1");
+
+    // A verified peer share far above the local best (startup re-verify of a
+    // big-target share) feeds the ring only.
+    mi.record_share_difficulty(21631.0, "peer", "", /*update_best=*/false);
+    mi.record_share_difficulty(5.0e6, "peer", "", /*update_best=*/false);
+
+    auto bs = mi.rest_best_share();
+    EXPECT_DOUBLE_EQ(bs["all_time"]["difficulty"].get<double>(), 1.5e6);
+    EXPECT_DOUBLE_EQ(bs["session"]["difficulty"].get<double>(), 1.5e6);
+    EXPECT_DOUBLE_EQ(bs["round"]["difficulty"].get<double>(), 1.5e6);
+    EXPECT_EQ(bs["round"]["miner"].get<std::string>(), "w1");
+    EXPECT_DOUBLE_EQ(bs["merged"]["round"]["difficulty"].get<double>(), 1.5e6);
+
+    // Default (DASH / bip110 callers) still raises the PRIMARY legs only.
+    mi.record_share_difficulty(2.0e6, "dash", "ab");
+    bs = mi.rest_best_share();
+    EXPECT_DOUBLE_EQ(bs["round"]["difficulty"].get<double>(), 2.0e6);
+    EXPECT_DOUBLE_EQ(bs["merged"]["round"]["difficulty"].get<double>(), 1.5e6);
+}
+
+TEST(DashboardData, BestShareMedianRowIsTheWindowMedian)
+{
+    EXPECT_DOUBLE_EQ(MiningInterface::median_share_difficulty({}), 0.0);
+    EXPECT_DOUBLE_EQ(MiningInterface::median_share_difficulty({511.0}), 511.0);
+    // Odd: middle of the sorted window, not the mean (5401.6).
+    EXPECT_DOUBLE_EQ(MiningInterface::median_share_difficulty(
+                         {21631.0, 511.0, 600.0, 4000.0, 266.0}), 600.0);
+    // Even: mean of the two middle values (web.py:1606).
+    EXPECT_DOUBLE_EQ(MiningInterface::median_share_difficulty(
+                         {400.0, 100.0, 300.0, 200.0}), 250.0);
+
+    // rest_best_share prefers median_difficulty over the window average.
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::LITECOIN);
+    mi.update_network_difficulty(1000.0, "test");
+    mi.set_sharechain_stats_fn([]() {
+        return nlohmann::json{{"average_difficulty", 500.0},
+                              {"median_difficulty", 100.0}};
+    });
+    EXPECT_DOUBLE_EQ(mi.rest_best_share()["median_pct"].get<double>(), 10.0);
+    mi.set_sharechain_stats_fn([]() {
+        return nlohmann::json{{"average_difficulty", 500.0}};
+    });
+    EXPECT_DOUBLE_EQ(mi.rest_best_share()["median_pct"].get<double>(), 50.0)
+        << "coins without a median keep the average";
+}
+
+TEST(DashboardData, MergedAllTimeBestShareSurvivesARestart)
+{
+    const std::string log_path = "/tmp/c2pool_test_bestshare_merged_statlog.json";
+    std::remove(log_path.c_str());
+    std::remove((log_path + ".best.json").c_str());
+    {
+        MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                           c2pool::address::Blockchain::LITECOIN);
+        mi.set_stat_log_path(log_path);
+        best_pseudoshare(mi, 1.5e6, "w1");
+        mi.save_stat_log();
+    }
+    MiningInterface mi2(/*testnet=*/false, /*node=*/nullptr,
+                        c2pool::address::Blockchain::LITECOIN);
+    mi2.set_stat_log_path(log_path);
+    mi2.load_stat_log();
+    auto bs = mi2.rest_best_share();
+    EXPECT_DOUBLE_EQ(bs["all_time"]["difficulty"].get<double>(), 1.5e6);
+    ASSERT_TRUE(bs.contains("merged"));
+    EXPECT_DOUBLE_EQ(bs["merged"]["all_time"]["difficulty"].get<double>(), 1.5e6);
+    EXPECT_EQ(bs["merged"]["all_time"]["miner"].get<std::string>(), "w1");
+    EXPECT_DOUBLE_EQ(bs["merged"]["round"]["difficulty"].get<double>(), 0.0)
+        << "round is per-process";
+    std::remove(log_path.c_str());
+    std::remove((log_path + ".best.json").c_str());
+}

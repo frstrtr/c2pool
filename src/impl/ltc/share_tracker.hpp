@@ -624,11 +624,17 @@ public:
         if (m_on_share_difficulty) {
             share_var.invoke([&](auto* s) {
                 double diff = chain::target_to_difficulty(chain::bits_to_target(s->m_bits));
-                std::string miner;
-                if constexpr (requires { s->m_pubkey_hash; })
-                    miner = s->m_pubkey_hash.GetHex();
-                else if constexpr (requires { s->m_address; })
-                    miner = HexStr(s->m_address.m_data);
+                // Payout address, so the hashrate ring (keyed by address in
+                // /pplns/current and /pplns/miner) matches. Raw bytes only
+                // when the script has no address form.
+                std::string miner = core::script_to_address(
+                    get_share_script(s), /*is_litecoin=*/true, PoolConfig::is_testnet);
+                if (miner.empty()) {
+                    if constexpr (requires { s->m_pubkey_hash; })
+                        miner = s->m_pubkey_hash.GetHex();
+                    else if constexpr (requires { s->m_address; })
+                        miner = HexStr(s->m_address.m_data);
+                }
                 m_on_share_difficulty(diff, miner);
             });
         }
