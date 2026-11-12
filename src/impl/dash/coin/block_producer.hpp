@@ -81,28 +81,20 @@ inline uint256 compute_merkle_root(const std::vector<uint256>& txids)
     return layer[0];
 }
 
-// Body↔header binding (reward-critical, E2 finding A). The P2P layer validates
-// HEADERS (X11 PoW + DarkGravityWave) but delivers block BODIES cryptographically
-// UNBOUND: nothing checks the tx set against the header's committed merkle root.
-// A forged body under a real PoW header — e.g. a fake type-5 coinbase carrying
-// the correct nHeight but a WRONG creditPoolBalance — would otherwise be adopted
-// by the daemonless credit-pool bootstrap and served as a bad-cbtx. This binds
-// them: the merkle root folded over the body's tx set must equal the header's
-// committed root. Reuses the SAME fold dashcore commits (compute_merkle_root:
-// duplicate-last on odd, via bp_sha256d) so a valid body is NEVER false-rejected,
-// PLUS dashcore's consensus/merkle.cpp CVE-2012-2459 mutation guard: a body
-// padded with duplicate txids yields the same root but is consensus-INVALID, so
-// we reject it too (never false-ACCEPT a mutated body). Matches dashcore block
-// acceptance byte-for-byte. txid = sha256d(canonical tx bytes) == dash_txid.
 // Dash Core v24.0.0 CheckMerkleRoot (validation.cpp), second half: a version-2
 // asset unlock's txid excludes its quorum signing bytes, so the tx merkle root
 // does not commit to them; a CbTx of version >= 4 commits the unlocks' INSTANCE
 // hashes instead (merkleRootAssetUnlocks). A mismatch is a mutation, rejected as
 // BLOCK_MUTATED "bad-cbtx-assetunlockmerkleroot": signing-info bytes a middleman
-// altered without breaking the merkle root. Core's exact condition: vtx[0] is a
-// type-5 coinbase whose payload parses as a CCbTx (GetTxPayload, assert_type
-// false; a payload that does not parse skips the check) with nVersion >=
-// MERKLE_ROOT_ASSETUNLOCKS. There is no deployment test: the CbTx version decides.
+// altered without breaking the merkle root.
+// Core's condition: vtx[0] is a type-5 coinbase whose payload deserializes as a
+// CCbTx (GetTxPayload, assert_type false; a payload that does not skips the
+// check) with nVersion >= MERKLE_ROOT_ASSETUNLOCKS. There is no deployment test:
+// the CbTx version decides. Our parse_cbtx is a little laxer than GetTxPayload
+// (no MAX_SIZE range on the bestCLHeightDiff CompactSize, no G2 validity check of
+// bestCLSignature), so for such a payload we check where Core skips. Core rejects
+// that block anyway (bad-cbtx-payload in specialtxman), so this refuses nothing
+// on a valid chain; it only calls an invalid block "mutated, re-fetch".
 // The root is CalcCbTxMerkleRootAssetUnlocks: the instance hashes of the
 // unlocks with a stable txid, in block order, ComputeMerkleRoot (null when none).
 inline bool block_asset_unlock_root_binds(const BlockType& block)
@@ -119,6 +111,20 @@ inline bool block_asset_unlock_root_binds(const BlockType& block)
     return compute_merkle_root(leaves) == cbtx.merkleRootAssetUnlocks;
 }
 
+// Body↔header binding (reward-critical, E2 finding A). The P2P layer validates
+// HEADERS (X11 PoW + DarkGravityWave) but delivers block BODIES cryptographically
+// UNBOUND: nothing checks the tx set against the header's committed merkle root.
+// A forged body under a real PoW header — e.g. a fake type-5 coinbase carrying
+// the correct nHeight but a WRONG creditPoolBalance — would otherwise be adopted
+// by the daemonless credit-pool bootstrap and served as a bad-cbtx. This binds
+// them: the merkle root folded over the body's tx set must equal the header's
+// committed root. Reuses the SAME fold dashcore commits (compute_merkle_root:
+// duplicate-last on odd, via bp_sha256d) so a valid body is NEVER false-rejected,
+// PLUS dashcore's consensus/merkle.cpp CVE-2012-2459 mutation guard: a body
+// padded with duplicate txids yields the same root but is consensus-INVALID, so
+// we reject it too (never false-ACCEPT a mutated body). Matches dashcore block
+// acceptance byte-for-byte. txid = sha256d(canonical tx bytes) == dash_txid.
+// Then the second half of Core's CheckMerkleRoot: block_asset_unlock_root_binds.
 inline bool block_body_binds_to_header(const BlockType& block)
 {
     if (block.m_txs.empty()) return false;   // a real block always carries a coinbase
