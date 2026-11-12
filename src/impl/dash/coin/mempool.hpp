@@ -2136,6 +2136,17 @@ public:
         return m_pool.count(txid) > 0;
     }
 
+    /// The txids of `txids` the pool holds, read under one lock (one
+    /// consistent view for a whole template body).
+    std::set<uint256> contained(const std::set<uint256>& txids) const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        std::set<uint256> out;
+        for (const auto& id : txids)
+            if (m_pool.count(id) > 0) out.insert(id);
+        return out;
+    }
+
     size_t size() const
     {
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -2705,6 +2716,15 @@ public:
                 // for every type!=0; the partial embedded mask admits types
                 // 1-4, 7, 8 and (v24) 10-12, and 5/6/9 are never selected.
                 if (!special_mask.admits(e->tx.type)) { ok = false; break; }
+                // An MNHF signal rides only in the shape Dash Core's signer
+                // builds: no inputs and no outputs (MNHFTxPayload::PrepareTx,
+                // evo/mnhftx.cpp:37-45). CheckTransaction lets a type-7 tx
+                // carry both (consensus/tx_check.cpp:18-21), but a signal with
+                // an output can have an in-mempool child while the builder
+                // refuses signals one by one (mnhf_check.hpp). Dropping the
+                // member drops its package, so such a child never rides.
+                if (e->tx.type == vendor::MNHFTxPayload::SPECIALTX_TYPE
+                    && (!e->tx.vin.empty() || !e->tx.vout.empty())) { ok = false; break; }
                 // A type-8 lock rides only when it is a valid block member:
                 // the CheckAssetLockTx port of asset_lock_fold.hpp (version 1,
                 // P2PKH credit outputs, one `6a 00` marker equal to the
