@@ -30,8 +30,16 @@
 #include <core/pack.hpp>
 #include <core/uint256.hpp>
 
+#include <impl/dash/crypto/hash_x11.hpp>
+
+#include <algorithm>
 #include <cstdint>
+#include <cstdio>
+#include <fstream>
+#include <map>
 #include <memory>
+#include <span>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -41,7 +49,9 @@ using Kind = CompactReceiveVerdict::Kind;
 
 namespace {
 
-constexpr size_t kMaxTx = 100000;
+// The production bound: Dash Core MaxBlockSize() in bytes; InitData divides
+// it by MIN_TRANSACTION_SIZE itself.
+constexpr size_t kMaxTx = DASH_MAX_BLOCK_SIZE;
 const std::string kPeer = "1.2.3.4:9999";
 
 MutableTransaction mk_tx(uint32_t locktime) {
@@ -49,6 +59,21 @@ MutableTransaction mk_tx(uint32_t locktime) {
     tx.version = 1;
     tx.type = 0;
     tx.locktime = locktime;
+    return tx;
+}
+
+// A coinbase-shaped tx: one input, one output. Dash Core InitData rejects a
+// prefilled tx with neither (CTransaction::IsNull).
+MutableTransaction mk_coinbase(uint32_t tag) {
+    MutableTransaction tx = mk_tx(tag);
+    TxIn in;
+    in.prevout.hash.SetNull();
+    in.prevout.index = 0xffffffff;
+    in.sequence = 0xffffffff;
+    tx.vin.push_back(in);
+    TxOut out;
+    out.value = 500000000 + tag;
+    tx.vout.push_back(out);
     return tx;
 }
 
@@ -67,7 +92,7 @@ BlockType mk_block(size_t n) {
     b.m_nonce = 7;
     std::vector<uint256> ids;
     for (size_t i = 0; i < n; ++i) {
-        b.m_txs.push_back(mk_tx(static_cast<uint32_t>(5000 + i)));
+        b.m_txs.push_back(i == 0 ? mk_coinbase(5000) : mk_tx(static_cast<uint32_t>(5000 + i)));
         ids.push_back(txid(b.m_txs.back()));
     }
     b.m_merkle_root = compute_merkle_root(ids);
@@ -82,11 +107,19 @@ uint256 bhash(uint8_t tag) {
     return h;
 }
 
+// A provider over a fixed (key, tx) list, walked the way the Mempool walks.
+v::MempoolShortIdProvider walk_of(std::vector<std::pair<uint256, MutableTransaction>> entries) {
+    return [entries](const v::MempoolTxVisitor& visit) {
+        for (const auto& [k, tx] : entries)
+            if (!visit(k, tx)) return;
+    };
+}
+
 v::MempoolShortIdProvider pool_of(const BlockType& b, std::vector<size_t> idx) {
-    std::vector<std::pair<uint256, v::CTransactionRef>> snap;
+    std::vector<std::pair<uint256, MutableTransaction>> snap;
     for (size_t i : idx)
-        snap.emplace_back(txid(b.m_txs[i]), v::MakeTransactionRef(b.m_txs[i]));
-    return [snap] { return snap; };
+        snap.emplace_back(txid(b.m_txs[i]), b.m_txs[i]);
+    return walk_of(std::move(snap));
 }
 
 v::BlockTransactions answer(const v::BlockTransactionsRequest& req, const BlockType& b) {
@@ -146,11 +179,10 @@ TEST(DashCompactReceive, PartialMempoolRequestsOnlyTheGaps) {
 // accepted: the merkle bind fails and we fall back to the full block.
 TEST(DashCompactReceive, PoisonedMempoolFallsBackToFullBlock) {
     const BlockType b = mk_block(3);
-    std::vector<std::pair<uint256, v::CTransactionRef>> snap{
-        {txid(b.m_txs[1]), v::MakeTransactionRef(mk_tx(999999))},
-        {txid(b.m_txs[2]), v::MakeTransactionRef(b.m_txs[2])},
-    };
-    CompactBlockReceiver rx([snap] { return snap; }, kMaxTx);
+    CompactBlockReceiver rx(walk_of({
+        {txid(b.m_txs[1]), mk_tx(999999)},
+        {txid(b.m_txs[2]), b.m_txs[2]},
+    }), kMaxTx);
     auto vd = rx.on_cmpctblock(kPeer, v::CBlockHeaderAndShortTxIDs(b), bhash(4));
     EXPECT_EQ(vd.kind, Kind::FallbackFull) << vd.reason;
     EXPECT_EQ(vd.blockhash, bhash(4));
@@ -241,25 +273,16 @@ TEST(DashCompactReceive, DeserializedCmpctblockReassembles) {
 //
 // Revert-red arms: drop the version != 1 guard in on_sendcmpct
 // (Version2IsIgnored and Version2DoesNotOverwriteVersion1 go red), drop the
-// SHORT_IDS_BLOCKS_VERSION gate in sendcmpct_on_verack (VerackBelowShortIds...
-// goes red), or send announce=true (VerackSendsLowBandwidthVersion1 goes red).
+// SHORT_IDS_BLOCKS_VERSION gate in compact_blocks_version_ok
+// (VersionGateUsesCommonVersion goes red).
 
-TEST(DashCompactNegotiation, VerackSendsLowBandwidthVersion1) {
-    auto sc = dash::coin::sendcmpct_on_verack(70230, 70230);
-    ASSERT_TRUE(sc.has_value());
-    EXPECT_FALSE(sc->announce);
-    EXPECT_EQ(sc->version, 1u);
-}
-
-TEST(DashCompactNegotiation, VerackUsesCommonVersion) {
-    // our 70230 vs peer exactly at the gate: common = 70209, send.
-    EXPECT_TRUE(dash::coin::sendcmpct_on_verack(70230, 70209).has_value());
+TEST(DashCompactNegotiation, VersionGateUsesCommonVersion) {
+    EXPECT_TRUE(dash::coin::compact_blocks_version_ok(70230, 70230));
+    // our 70230 vs peer exactly at the gate: common = 70209.
+    EXPECT_TRUE(dash::coin::compact_blocks_version_ok(70230, 70209));
     // our side below the gate wins even if the peer is new.
-    EXPECT_FALSE(dash::coin::sendcmpct_on_verack(70208, 70230).has_value());
-}
-
-TEST(DashCompactNegotiation, VerackBelowShortIdsVersionSendsNothing) {
-    EXPECT_FALSE(dash::coin::sendcmpct_on_verack(70230, 70208).has_value());
+    EXPECT_FALSE(dash::coin::compact_blocks_version_ok(70208, 70230));
+    EXPECT_FALSE(dash::coin::compact_blocks_version_ok(70230, 70208));
 }
 
 TEST(DashCompactNegotiation, UnknownPeerHasNoCompactState) {
@@ -396,21 +419,37 @@ TEST(DashCompactMempool, EvictedTxIsRequested) {
     EXPECT_EQ(vd.request.indexes, (std::vector<uint16_t>{2}));
 }
 
-TEST(DashCompactMempool, SnapshotKeysAreDashTxid) {
+TEST(DashCompactMempool, WalkKeysAreInstanceHashes) {
     Mempool mp;
     std::vector<MutableTransaction> txs{mk_tx(7001), mk_tx(7002), mk_tx(7003)};
     for (const auto& tx : txs) ASSERT_TRUE(mp.add_tx(tx));
 
     auto provider = make_mempool_short_id_provider(&mp);
     ASSERT_TRUE(static_cast<bool>(provider));
-    const auto snap = provider();
-    ASSERT_EQ(snap.size(), txs.size());
-    for (const auto& [key, ref] : snap) {
-        ASSERT_TRUE(ref);
-        EXPECT_EQ(key, dtxid(*ref));
-        EXPECT_EQ(key, txid(*ref));   // the hash the vendored GetShortID is fed
-        EXPECT_TRUE(mp.contains(key));
-    }
+    // The walk holds the pool lock: the visitor must not call back into the
+    // Mempool, so membership is checked after it returns.
+    std::vector<uint256> keys;
+    provider([&](const uint256& key, const MutableTransaction& tx) {
+        // The hash Dash Core v24 keys vTxHashes by and the vendored
+        // GetShortID is fed: the instance hash, here equal to the txid.
+        EXPECT_EQ(key, dash_instance_hash(tx));
+        EXPECT_EQ(key, dtxid(tx));
+        keys.push_back(key);
+        return true;
+    });
+    EXPECT_EQ(keys.size(), txs.size());
+    for (const auto& k : keys) EXPECT_TRUE(mp.contains(k));
+}
+
+// The walk stops when the visitor says so (Dash Core's early exit once every
+// short id is filled) and copies nothing on its own.
+TEST(DashCompactMempool, WalkStopsWhenTheVisitorSaysSo) {
+    Mempool mp;
+    for (uint32_t i = 0; i < 5; ++i) ASSERT_TRUE(mp.add_tx(mk_tx(7100 + i)));
+    auto provider = make_mempool_short_id_provider(&mp);
+    size_t seen = 0;
+    provider([&](const uint256&, const MutableTransaction&) { return ++seen < 2; });
+    EXPECT_EQ(seen, 2u);
 }
 
 TEST(DashCompactMempool, SetterArmsAndClearsTheReceiver) {
@@ -542,4 +581,412 @@ TEST(DashCompactBinding, ClientGoneFirstIsSafe) {
     EXPECT_FALSE(binding.bound());
     binding.unbind();   // nothing to take out; must not touch the freed client
     EXPECT_FALSE(binding.bound());
+}
+
+// ── #968a hostile / bound cases at the receiver ─────────────────────────────
+//
+// Raw cmpctblock bytes, built the way a peer would put them on the wire, so
+// the cases the in-memory constructor cannot express (bad prefilled index,
+// duplicate short ids, a null prefilled tx) reach InitData exactly as they
+// would off the socket. Revert-red arms:
+//   bound back to a tx count (m_cmpct_rx{nullptr, 200000})  -> ProductionBound... red
+//   drop the prefilled IsNull check in InitData              -> NullPrefilledTx... red
+//   drop the short-id collision check                        -> DuplicateShortIds... red
+
+namespace {
+
+v::CBlockHeaderAndShortTxIDs raw_cmpct(const BlockHeaderType& h, uint64_t nonce,
+                                       const std::vector<uint64_t>& ids,
+                                       const std::vector<std::pair<uint64_t, MutableTransaction>>& prefilled)
+{
+    PackStream ps;
+    ps << h;
+    ps << nonce;
+    WriteCompactSize(ps, ids.size());
+    for (uint64_t id : ids) {
+        uint8_t b6[6];
+        for (int i = 0; i < 6; ++i) b6[i] = static_cast<uint8_t>((id >> (8 * i)) & 0xff);
+        ps.write(std::as_bytes(std::span{b6}));
+    }
+    WriteCompactSize(ps, prefilled.size());
+    for (const auto& [idx, tx] : prefilled) {
+        WriteCompactSize(ps, idx);
+        ps << tx;
+    }
+    v::CBlockHeaderAndShortTxIDs out;
+    ps >> out;
+    return out;
+}
+
+BlockHeaderType hdr_of(const BlockType& b) { return static_cast<const BlockHeaderType&>(b); }
+
+} // namespace
+
+// Dash Core passes MaxBlockSize() (2 MB) and divides by MIN_TRANSACTION_SIZE
+// (10) inside InitData: 200'000 tx. A block with 20'001 txs is legal on Dash
+// (2 MB of ~60-byte txs is ~33k) and must not be refused; the old bound
+// (200'000 / 10 = 20'000) refused it as INVALID, i.e. Misbehaving(100) on an
+// honest peer.
+TEST(DashCompactReceive, ProductionBoundAcceptsMoreThanTwentyThousandTxs) {
+    BlockType b;
+    b.m_version = 1;
+    b.m_bits = 0x1d00ffff;
+    b.m_txs.push_back(mk_coinbase(1));
+    for (uint32_t i = 0; i < 20001; ++i) b.m_txs.push_back(mk_tx(100000 + i));
+    v::CBlockHeaderAndShortTxIDs cmpct(b);
+    ASSERT_EQ(cmpct.BlockTxCount(), 20002u);
+    CompactBlockReceiver rx(nullptr, DASH_MAX_BLOCK_SIZE);
+    auto vd = rx.on_cmpctblock(kPeer, cmpct, bhash(60));
+    ASSERT_EQ(vd.kind, Kind::NeedTxn) << vd.reason;
+    EXPECT_EQ(vd.request.indexes.size(), 20001u);
+}
+
+// The bound is still enforced, in bytes / MIN_TRANSACTION_SIZE.
+TEST(DashCompactReceive, TooManyEntriesForTheSizeLimitIsInvalid) {
+    const BlockType b = mk_block(11);
+    CompactBlockReceiver rx(nullptr, /*max_block_size=*/100);   // 100 / 10 = 10 tx
+    auto vd = rx.on_cmpctblock(kPeer, v::CBlockHeaderAndShortTxIDs(b), bhash(61));
+    EXPECT_EQ(vd.kind, Kind::Reject) << vd.reason;
+    CompactBlockReceiver ok(nullptr, /*max_block_size=*/110);   // 11 tx fit
+    EXPECT_EQ(ok.on_cmpctblock(kPeer, v::CBlockHeaderAndShortTxIDs(b), bhash(61)).kind, Kind::NeedTxn);
+}
+
+TEST(DashCompactReceive, PrefilledIndexPastTheBlockIsInvalid) {
+    const BlockType b = mk_block(3);
+    // two short ids + one prefilled at differential index 3 -> absolute 3,
+    // past shorttxids.size() + 0 = 2: a tx with neither prefill nor short id.
+    auto cmpct = raw_cmpct(hdr_of(b), 42, {1, 2}, {{3, b.m_txs[0]}});
+    CompactBlockReceiver rx(nullptr, kMaxTx);
+    auto vd = rx.on_cmpctblock(kPeer, cmpct, bhash(62));
+    EXPECT_EQ(vd.kind, Kind::Reject) << vd.reason;
+    EXPECT_FALSE(rx.has_parked(kPeer));
+}
+
+TEST(DashCompactReceive, NullPrefilledTxIsInvalid) {
+    const BlockType b = mk_block(3);
+    auto cmpct = raw_cmpct(hdr_of(b), 42, {1, 2}, {{0, mk_tx(77)}});   // no vin, no vout
+    CompactBlockReceiver rx(nullptr, kMaxTx);
+    EXPECT_EQ(rx.on_cmpctblock(kPeer, cmpct, bhash(63)).kind, Kind::Reject);
+}
+
+TEST(DashCompactReceive, NullHeaderIsInvalid) {
+    BlockType b = mk_block(3);
+    b.m_bits = 0;   // BlockHeaderType::IsNull
+    CompactBlockReceiver rx(nullptr, kMaxTx);
+    EXPECT_EQ(rx.on_cmpctblock(kPeer, v::CBlockHeaderAndShortTxIDs(b), bhash(64)).kind, Kind::Reject);
+}
+
+TEST(DashCompactReceive, EmptyCmpctblockIsInvalid) {
+    const BlockType b = mk_block(1);
+    auto cmpct = raw_cmpct(hdr_of(b), 42, {}, {});
+    CompactBlockReceiver rx(nullptr, kMaxTx);
+    EXPECT_EQ(rx.on_cmpctblock(kPeer, cmpct, bhash(65)).kind, Kind::Reject);
+}
+
+// Dash Core READ_STATUS_FAILED: duplicate short ids are a collision, not
+// misbehaviour; the answer is the full block.
+TEST(DashCompactReceive, DuplicateShortIdsFallBackToFullBlock) {
+    const BlockType b = mk_block(3);
+    auto cmpct = raw_cmpct(hdr_of(b), 42, {0xabcdef, 0xabcdef}, {{0, b.m_txs[0]}});
+    CompactBlockReceiver rx(nullptr, kMaxTx);
+    auto vd = rx.on_cmpctblock(kPeer, cmpct, bhash(66));
+    EXPECT_EQ(vd.kind, Kind::FallbackFull) << vd.reason;
+    EXPECT_FALSE(rx.has_parked(kPeer));
+}
+
+TEST(DashCompactReceive, OverLongBlocktxnIsRejected) {
+    const BlockType b = mk_block(4);
+    CompactBlockReceiver rx(nullptr, kMaxTx);
+    auto vd = rx.on_cmpctblock(kPeer, v::CBlockHeaderAndShortTxIDs(b), bhash(67));
+    ASSERT_EQ(vd.kind, Kind::NeedTxn);
+    auto resp = answer(vd.request, b);
+    resp.txn.push_back(v::MakeTransactionRef(mk_tx(4242)));
+    EXPECT_EQ(rx.on_blocktxn(kPeer, resp).kind, Kind::Reject);
+    EXPECT_FALSE(rx.has_parked(kPeer));
+}
+
+TEST(DashCompactReceive, DropBlockClearsEveryPeersPark) {
+    const BlockType b = mk_block(3);
+    CompactBlockReceiver rx(nullptr, kMaxTx);
+    ASSERT_EQ(rx.on_cmpctblock("a", v::CBlockHeaderAndShortTxIDs(b), bhash(68)).kind, Kind::NeedTxn);
+    ASSERT_EQ(rx.on_cmpctblock("b", v::CBlockHeaderAndShortTxIDs(b), bhash(68)).kind, Kind::NeedTxn);
+    ASSERT_EQ(rx.parked_count_for(bhash(68)), 2u);
+    EXPECT_EQ(rx.drop_block(bhash(68)), 2u);
+    EXPECT_EQ(rx.parked_count(), 0u);
+}
+
+// ── #968a v24: version-2 asset unlocks are matched by INSTANCE hash ─────────
+// A re-signed instance of one withdrawal shares the stable txid with the
+// pooled one, so a txid-keyed lookup would splice the WRONG instance into the
+// block (and fail the CbTx v4 unlock commitment). Keyed by instance hash, the
+// block's instance has a short id no pooled tx produces: it is requested.
+// Revert-red arm: key the walk by the pool key (dash_txid, the stable txid)
+// for every tx -> SameV2AssetUnlockInstanceIsFilledFromThePool goes red (the
+// pooled instance no longer matches its own short id and is re-fetched).
+
+namespace {
+
+MutableTransaction mk_unlock_v2(uint8_t sig_tag) {
+    MutableTransaction tx;
+    tx.version = 3;
+    tx.type = 9;   // tx_type::ASSET_UNLOCK
+    tx.extra_payload.assign(kAssetUnlockPayloadSize, 0x11);
+    tx.extra_payload[0] = 2;   // payload version 2: stable txid
+    std::fill(tx.extra_payload.end() - 96, tx.extra_payload.end(), sig_tag);
+    TxOut o;
+    o.value = 123456;
+    tx.vout.push_back(o);
+    return tx;
+}
+
+BlockType block_with(std::vector<MutableTransaction> txs) {
+    BlockType b;
+    b.m_version = 1;
+    b.m_bits = 0x1d00ffff;
+    b.m_timestamp = 1700000000;
+    b.m_txs.push_back(mk_coinbase(9));
+    for (auto& t : txs) b.m_txs.push_back(std::move(t));
+    std::vector<uint256> ids;
+    for (const auto& t : b.m_txs) ids.push_back(dash_txid(t));
+    b.m_merkle_root = compute_merkle_root(ids);
+    return b;
+}
+
+} // namespace
+
+TEST(DashCompactMempool, ReSignedV2AssetUnlockIsRequested) {
+    const MutableTransaction pooled = mk_unlock_v2(0xaa);
+    const MutableTransaction mined = mk_unlock_v2(0xbb);   // re-signed instance
+    ASSERT_TRUE(is_asset_unlock_with_stable_txid(pooled));
+    ASSERT_EQ(dash_txid(pooled), dash_txid(mined));
+    ASSERT_NE(dash_instance_hash(pooled), dash_instance_hash(mined));
+
+    Mempool mp;
+    ASSERT_TRUE(mp.add_tx(pooled) || mp.add_tx_skipping_contextual_check_for_test(pooled));
+    const MutableTransaction plain = mk_tx(8801);
+    ASSERT_TRUE(mp.add_tx(plain));
+
+    const BlockType b = block_with({plain, mined});
+    CompactBlockReceiver rx(make_mempool_short_id_provider(&mp), kMaxTx);
+    auto vd = rx.on_cmpctblock(kPeer, v::CBlockHeaderAndShortTxIDs(b), bhash(70));
+    ASSERT_EQ(vd.kind, Kind::NeedTxn) << vd.reason;
+    EXPECT_EQ(vd.request.indexes, (std::vector<uint16_t>{2}))
+        << "the plain tx comes from the pool, the re-signed unlock is requested";
+    auto done = rx.on_blocktxn(kPeer, answer(vd.request, b));
+    ASSERT_EQ(done.kind, Kind::Complete) << done.reason;
+    EXPECT_EQ(dash_instance_hash(done.block.m_txs[2]), dash_instance_hash(mined));
+}
+
+TEST(DashCompactMempool, SameV2AssetUnlockInstanceIsFilledFromThePool) {
+    const MutableTransaction pooled = mk_unlock_v2(0xaa);
+    Mempool mp;
+    ASSERT_TRUE(mp.add_tx(pooled) || mp.add_tx_skipping_contextual_check_for_test(pooled));
+    const BlockType b = block_with({pooled});
+    CompactBlockReceiver rx(make_mempool_short_id_provider(&mp), kMaxTx);
+    auto vd = rx.on_cmpctblock(kPeer, v::CBlockHeaderAndShortTxIDs(b), bhash(71));
+    ASSERT_EQ(vd.kind, Kind::Complete) << vd.reason;
+    EXPECT_EQ(dash_instance_hash(vd.block.m_txs[1]), dash_instance_hash(pooled));
+}
+
+// ── #968a: the cmpctblock gate (dashcore ProcessMessage CMPCTBLOCK) ─────────
+
+TEST(DashCompactGate, DecisionTable) {
+    using G = CompactGate;
+    CompactGateFacts ok;
+    ok.prev_known = ok.pow_ok = ok.header_accepted = true;
+    ok.more_work = ok.near_tip = true;
+
+    auto with = [&](auto f) { CompactGateFacts x = ok; f(x); return compact_gate(x); };
+
+    EXPECT_EQ(with([](auto& x) { x.prev_known = false; }), G::GetHeaders);
+    EXPECT_EQ(with([](auto& x) { x.pow_ok = false; }), G::Misbehave);
+    EXPECT_EQ(with([](auto& x) { x.header_accepted = false; x.requested = true; }), G::Drop);
+    EXPECT_EQ(with([](auto& x) { x.have_body = true; x.requested = true; }), G::Drop);
+    EXPECT_EQ(with([](auto& x) { x.more_work = false; }), G::Drop);
+    EXPECT_EQ(with([](auto& x) { x.more_work = false; x.requested = true; }), G::FetchFull);
+    EXPECT_EQ(with([](auto& x) { x.near_tip = false; }), G::HeaderOnly);
+    EXPECT_EQ(with([](auto& x) { x.near_tip = false; x.requested = true; }), G::FetchFull);
+    EXPECT_EQ(with([](auto& x) { x.requested = true; }), G::Reconstruct);
+    EXPECT_EQ(with([](auto& x) { x.high_bandwidth = true; }), G::Reconstruct);
+    EXPECT_EQ(compact_gate(ok), G::HeaderOnly) << "unsolicited, not high-bandwidth";
+    // A high-bandwidth push of a stale or far-ahead header is not reconstructed.
+    EXPECT_EQ(with([](auto& x) { x.high_bandwidth = true; x.more_work = false; }), G::Drop);
+    EXPECT_EQ(with([](auto& x) { x.high_bandwidth = true; x.near_tip = false; }), G::HeaderOnly);
+}
+
+TEST(DashCompactGate, PowMeetsItsOwnBits) {
+    uint256 easy_hash;            // all zero: meets any well-formed target
+    EXPECT_TRUE(header_pow_meets_bits(easy_hash, 0x1d00ffff));
+    uint256 hard_hash;
+    hard_hash.data()[31] = 0xff;  // most significant byte
+    EXPECT_FALSE(header_pow_meets_bits(hard_hash, 0x1d00ffff));
+    EXPECT_FALSE(header_pow_meets_bits(easy_hash, 0));            // null target
+    EXPECT_FALSE(header_pow_meets_bits(easy_hash, 0x04800000));   // negative
+    EXPECT_FALSE(header_pow_meets_bits(easy_hash, 0xff123456));   // overflow
+}
+
+// ── #968a: high-bandwidth peer set (MaybeSetPeerAsAnnouncingHeaderAndIDs) ───
+
+TEST(DashCompactNegotiation, HighBandwidthSetKeepsThreeAndRotatesTheOldest) {
+    CompactHighBandwidthSet hb;
+    auto c1 = hb.select("a");
+    EXPECT_EQ(c1.announce_on, std::optional<std::string>("a"));
+    EXPECT_FALSE(c1.announce_off.has_value());
+    hb.select("b");
+    hb.select("c");
+    EXPECT_EQ(hb.size(), 3u);
+    // An existing member moves to the back and nothing is sent.
+    auto again = hb.select("a");
+    EXPECT_FALSE(again.announce_on.has_value());
+    EXPECT_FALSE(again.announce_off.has_value());
+    // A fourth evicts the oldest ("b", since "a" was refreshed).
+    auto c4 = hb.select("d");
+    EXPECT_EQ(c4.announce_on, std::optional<std::string>("d"));
+    EXPECT_EQ(c4.announce_off, std::optional<std::string>("b"));
+    EXPECT_EQ(hb.size(), 3u);
+    EXPECT_FALSE(hb.contains("b"));
+    hb.on_disconnect("a");
+    EXPECT_FALSE(hb.contains("a"));
+    EXPECT_EQ(hb.size(), 2u);
+}
+
+// ── #968a GOLDEN VECTOR: a real Dash testnet cmpctblock ─────────────────────
+// fixtures/dash_testnet_cmpctblock_1590326.txt: captured from a Dash Core
+// v24.0.0 testnet node over P2P (we sent sendcmpct(1,1), it pushed this
+// cmpctblock for block 1590326; we then asked for the same block with
+// getdata(MSG_CMPCT_BLOCK) and for every non-prefilled tx with getblocktxn).
+// Checks our codec, our X11 block identity, our SipHash keys and short ids
+// (over dash_instance_hash) and both reassembly paths against dashd's bytes.
+
+namespace {
+
+std::map<std::string, std::string> load_fixture(const std::string& name) {
+    std::map<std::string, std::string> kv;
+    std::ifstream f(std::string(DASH_FIXTURE_DIR) + "/" + name);
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        auto eq = line.find('=');
+        if (eq != std::string::npos) kv[line.substr(0, eq)] = line.substr(eq + 1);
+    }
+    return kv;
+}
+
+std::vector<unsigned char> unhex(const std::string& h) {
+    std::vector<unsigned char> out;
+    out.reserve(h.size() / 2);
+    for (size_t i = 0; i + 1 < h.size(); i += 2)
+        out.push_back(static_cast<unsigned char>(std::stoul(h.substr(i, 2), nullptr, 16)));
+    return out;
+}
+
+template <typename T>
+T unpack_bytes(const std::vector<unsigned char>& bytes) {
+    PackStream ps(bytes);
+    T out;
+    ps >> out;
+    return out;
+}
+
+std::vector<unsigned char> bytes_of(PackStream ps) {
+    auto sp = ps.get_span();
+    const auto* p = reinterpret_cast<const unsigned char*>(sp.data());
+    return std::vector<unsigned char>(p, p + sp.size());
+}
+
+// The 6-byte short ids straight off the wire (offset 88: header + nonce).
+std::vector<uint64_t> wire_short_ids(const std::vector<unsigned char>& raw) {
+    PackStream ps(std::vector<unsigned char>(raw.begin() + 88, raw.end()));
+    const uint64_t n = ReadCompactSize(ps);
+    std::vector<uint64_t> ids;
+    for (uint64_t i = 0; i < n; ++i) {
+        uint8_t b6[6];
+        ps.read(std::as_writable_bytes(std::span{b6}));
+        uint64_t v = 0;
+        for (int k = 0; k < 6; ++k) v |= static_cast<uint64_t>(b6[k]) << (8 * k);
+        ids.push_back(v);
+    }
+    return ids;
+}
+
+} // namespace
+
+TEST(DashCompactGolden, TestnetBlock1590326FromDashCoreV24) {
+    auto fx = load_fixture("dash_testnet_cmpctblock_1590326.txt");
+    ASSERT_FALSE(fx["block"].empty()) << "fixture missing";
+    const auto raw_block = unhex(fx["block"]);
+    const auto raw_pushed = unhex(fx["pushed_cmpctblock"]);
+    const auto raw_asked = unhex(fx["getdata_cmpctblock"]);
+    const auto raw_txn = unhex(fx["blocktxn"]);
+    const size_t ntx = std::stoul(fx["ntx"]);
+
+    const BlockType block = unpack_bytes<BlockType>(raw_block);
+    ASSERT_EQ(block.m_txs.size(), ntx);
+    auto hp = pack(static_cast<const BlockHeaderType&>(block));
+    const uint256 hash = dash::crypto::hash_x11(hp.get_span());
+    EXPECT_EQ(hash.GetHex(), fx["hash"]) << "X11 block identity";
+    EXPECT_TRUE(block_body_binds_to_header(block));
+    // The full block round-trips byte-exact through our codec.
+    EXPECT_EQ(bytes_of(pack(block)), raw_block);
+
+    for (const auto* raw : {&raw_pushed, &raw_asked}) {
+        const auto cmpct = unpack_bytes<v::CBlockHeaderAndShortTxIDs>(*raw);
+        // Codec: byte-exact round trip, header identical to the block's.
+        EXPECT_EQ(bytes_of(pack(cmpct)), *raw);
+        EXPECT_EQ(bytes_of(pack(cmpct.header)), bytes_of(hp));
+        ASSERT_EQ(cmpct.BlockTxCount(), ntx);
+
+        // SipHash keys (SHA256(header || nonce)) and short ids over the
+        // instance hash: ours must equal dashd's for every non-prefilled tx
+        // (dashd prefills only the coinbase).
+        const auto ids = wire_short_ids(*raw);
+        ASSERT_EQ(ids.size(), ntx - 1);
+        for (size_t i = 1; i < ntx; ++i)
+            EXPECT_EQ(cmpct.GetShortID(dash_instance_hash(block.m_txs[i])), ids[i - 1])
+                << "short id of tx " << i;
+    }
+    // The pushed one also matches the Python recomputation in the fixture.
+    {
+        const auto ids = wire_short_ids(raw_pushed);
+        std::string joined;
+        for (uint64_t id : ids) {
+            char buf[16];
+            std::snprintf(buf, sizeof(buf), "%012llx", static_cast<unsigned long long>(id));
+            if (!joined.empty()) joined += ",";
+            joined += buf;
+        }
+        EXPECT_EQ(joined, fx["wire_shortids"]);
+    }
+
+    // Reassembly from a full mempool: no round trip, byte-identical block.
+    std::vector<std::pair<uint256, MutableTransaction>> pool;
+    for (size_t i = 1; i < ntx; ++i) pool.emplace_back(dash_instance_hash(block.m_txs[i]), block.m_txs[i]);
+    {
+        CompactBlockReceiver rx(walk_of(pool), DASH_MAX_BLOCK_SIZE);
+        auto vd = rx.on_cmpctblock(kPeer, unpack_bytes<v::CBlockHeaderAndShortTxIDs>(raw_pushed), hash);
+        ASSERT_EQ(vd.kind, Kind::Complete) << vd.reason;
+        EXPECT_EQ(bytes_of(pack(vd.block)), raw_block);
+    }
+    // Reassembly from an empty mempool + dashd's own blocktxn answer.
+    {
+        CompactBlockReceiver rx(nullptr, DASH_MAX_BLOCK_SIZE);
+        auto vd = rx.on_cmpctblock(kPeer, unpack_bytes<v::CBlockHeaderAndShortTxIDs>(raw_asked), hash);
+        ASSERT_EQ(vd.kind, Kind::NeedTxn) << vd.reason;
+        ASSERT_EQ(vd.request.indexes.size(), ntx - 1);
+        const auto txn = unpack_bytes<v::BlockTransactions>(raw_txn);
+        EXPECT_EQ(txn.blockhash, hash);
+        EXPECT_EQ(bytes_of(pack(txn)), raw_txn);
+        auto done = rx.on_blocktxn(kPeer, txn);
+        ASSERT_EQ(done.kind, Kind::Complete) << done.reason;
+        EXPECT_EQ(bytes_of(pack(done.block)), raw_block);
+    }
+    // Our own getblocktxn for the same indexes encodes the way dashd decoded
+    // it (differential indexes): it answered with exactly these txs.
+    {
+        v::BlockTransactionsRequest req;
+        req.blockhash = hash;
+        for (size_t i = 1; i < ntx; ++i) req.indexes.push_back(static_cast<uint16_t>(i));
+        const auto back = unpack_bytes<v::BlockTransactionsRequest>(bytes_of(pack(req)));
+        EXPECT_EQ(back.indexes, req.indexes);
+    }
 }

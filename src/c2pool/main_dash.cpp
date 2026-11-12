@@ -5517,6 +5517,12 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // subscriptions -> lane -> maintainer -> header_chain.
     std::unique_ptr<dash::coin::MnCheckpointLane> mn_ckpt_lane;
     std::vector<std::shared_ptr<EventDisposable>> coin_feed_subs;
+    // #968a: the header chain the cmpctblock gate reads. Declared AFTER
+    // header_chain, so it is destroyed BEFORE it: the destructor takes the
+    // view out of coin_p2p (which can outlive this scope, see
+    // cmpct_mempool_binding above) while the chain is still alive.
+    dash::coin::CompactChainViewBinding<dash::coin::p2p::CoinClient<dash::Config>>
+        cmpct_chain_binding;
     // ── W2 replay bulk-fetch locals (--replay-bulk; replay_bulk_fetch.hpp) ──
     // Declared AFTER header_chain (they read it) so they unwind FIRST at
     // return; the timer is last so its callbacks stop before the lane dies.
@@ -7941,6 +7947,12 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // Node::block_connected, driving leg 3 + the E2b UTXO lane.
         coin_feed_subs.push_back(
             dash::coin::wire_full_block_ingest(coin_state, *header_chain));
+        // #968a: BIP 152 compact blocks need the header chain (the cmpctblock
+        // gate: parent known, PoW, header connected before the body) and the
+        // mempool (short ids, bound above). With both wired, a new tip body is
+        // requested as MSG_CMPCT_BLOCK and up to three peers that served us
+        // tips are asked to push cmpctblock (p2p_client.hpp).
+        cmpct_chain_binding.bind(coin_p2p, *header_chain);
 
         // ── PR-C1 (embedded-fold-live) LIVE tip-tracking wiring ──────────────
         // Armed only when --embedded-fold-live opened + VERIFIED a store above.

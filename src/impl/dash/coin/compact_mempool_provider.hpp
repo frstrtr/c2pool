@@ -4,24 +4,28 @@
 // #968a slice 3: BIP 152 mempool short-id lookup for compact-block receive.
 //
 // Port of the mempool half of dashcore PartiallyDownloadedBlock::InitData:
-// dashcore walks pool->vTxHashes under the mempool lock and matches each
-// txid's SipHash short id against the cmpctblock. The vendored InitData
-// keeps that loop and the SipHash (CBlockHeaderAndShortTxIDs::GetShortID),
-// but asks a MempoolShortIdProvider for the (txid, tx) pairs instead of
-// holding a CTxMemPool*. This header builds that provider over the DASH
-// embedded Mempool.
+// dashcore takes LOCK(pool->cs) and walks pool->vTxHashes, matching each
+// entry's SipHash short id against the cmpctblock. The vendored InitData keeps
+// that loop and the SipHash (CBlockHeaderAndShortTxIDs::GetShortID) and asks a
+// MempoolShortIdProvider to do the walk. This header builds that provider over
+// the DASH embedded Mempool.
 //
-//   - The snapshot is taken when InitData calls the provider, under the
-//     Mempool's own lock (all_txs_map), so a tx admitted after the provider
-//     was built is still found, and an evicted one is not.
-//   - Keys are the Mempool's keys, which are dash_txid (Hash(pack(tx))).
-//     That is the hash dashcore feeds GetShortID (no wtxid on Dash; we pin
-//     CMPCTBLOCKS_VERSION 1).
+//   - The walk runs when InitData calls the provider, under the Mempool's own
+//     lock (Mempool::for_each_tx_by_instance_hash), over the live pool: a tx
+//     admitted after the provider was built is found, an evicted one is not.
+//     Nothing is copied for the walk; InitData copies only a tx whose short id
+//     matches.
+//   - Keys are INSTANCE hashes, as in Dash Core v24 vTxHashes
+//     (GetInstanceHash): the pool key dash_txid for every tx except a
+//     version-2 asset unlock. Short ids in a v24 cmpctblock are over instance
+//     hashes (blockencodings.cpp), so a re-signed v2 unlock that shares its
+//     txid with the pooled one gets a different short id and is requested,
+//     never spliced in.
 //   - A null Mempool gives a null provider: every non-prefilled tx is then
-//     fetched by getblocktxn, the pre-slice-3 behaviour.
+//     fetched by getblocktxn.
 //
 // A tx that matches by short id but is the wrong tx is not caught here. The
-// receiver's merkle bind catches it and fetches the full block (slice 1).
+// receiver's merkle bind catches it and fetches the full block.
 //
 // LIFETIME: the provider holds `mp` by raw pointer. Only InitData calls it
 // (vendor/blockencodings.cpp), and InitData runs inside on_cmpctblock, so a
@@ -29,8 +33,13 @@
 // must outlive every receiver the provider is INSTALLED in. A client that
 // can outlive the Mempool is bound through CompactMempoolBinding (below),
 // which takes the provider out again before the Mempool goes.
+//
+// The same holds for the header chain the cmpctblock gate reads
+// (make_header_chain_compact_view / CompactChainViewBinding).
 
 #include <impl/dash/coin/mempool.hpp>
+#include <impl/dash/coin/header_chain.hpp>
+#include <impl/dash/coin/compact_block_receive.hpp>
 #include <impl/dash/coin/vendor/shim.hpp>
 
 #include <core/uint256.hpp>
@@ -46,14 +55,33 @@ inline vendor::MempoolShortIdProvider make_mempool_short_id_provider(const Mempo
 {
     if (!mp)
         return nullptr;
-    return [mp] {
-        auto txs = mp->all_txs_map();
-        std::vector<std::pair<uint256, vendor::CTransactionRef>> snap;
-        snap.reserve(txs.size());
-        for (auto& [txid, tx] : txs)
-            snap.emplace_back(txid, std::make_shared<const MutableTransaction>(std::move(tx)));
-        return snap;
+    return [mp](const vendor::MempoolTxVisitor& visit) {
+        mp->for_each_tx_by_instance_hash(
+            [&visit](const uint256& instance_hash, const MutableTransaction& tx) {
+                return visit(instance_hash, tx);
+            });
     };
+}
+
+// The cmpctblock gate's view of a HeaderChain (compact_block_receive.hpp
+// CompactChainView). Holds `chain` by raw pointer: bind it through
+// CompactChainViewBinding when the client can outlive the chain.
+inline CompactChainView make_header_chain_compact_view(const HeaderChain* chain)
+{
+    CompactChainView v;
+    if (!chain)
+        return v;
+    v.lookup = [chain](const uint256& h) -> std::optional<CompactChainEntry> {
+        auto e = chain->get_header(h);
+        if (!e) return std::nullopt;
+        return CompactChainEntry{e->height, e->chain_work, e->prev_hash};
+    };
+    v.tip_hash = [chain]() -> uint256 {
+        auto t = chain->tip();
+        return t ? t->hash : uint256();
+    };
+    v.locator = [chain]() { return chain->get_locator(); };
+    return v;
 }
 
 // #968a slice 3b: installs a Mempool's provider into a coin-P2P client and
@@ -96,6 +124,41 @@ public:
     {
         if (auto c = m_client.lock())
             c->set_compact_mempool_provider(nullptr);
+        m_client.reset();
+    }
+
+    bool bound() const { return !m_client.expired(); }
+
+private:
+    std::weak_ptr<Client> m_client;
+};
+
+// #968a: the same teardown discipline for the header chain the cmpctblock gate
+// reads. In run_node the HeaderChain (header_chain) is declared AFTER the
+// mempool binding, so it needs its own binding declared after it. Client needs
+// set_compact_chain_view(CompactChainView).
+template <class Client>
+class CompactChainViewBinding
+{
+public:
+    CompactChainViewBinding() = default;
+    CompactChainViewBinding(const CompactChainViewBinding&) = delete;
+    CompactChainViewBinding& operator=(const CompactChainViewBinding&) = delete;
+    ~CompactChainViewBinding() { unbind(); }
+
+    void bind(const std::shared_ptr<Client>& client, const HeaderChain& chain)
+    {
+        unbind();
+        if (!client)
+            return;
+        client->set_compact_chain_view(make_header_chain_compact_view(&chain));
+        m_client = client;
+    }
+
+    void unbind()
+    {
+        if (auto c = m_client.lock())
+            c->set_compact_chain_view(CompactChainView{});
         m_client.reset();
     }
 
