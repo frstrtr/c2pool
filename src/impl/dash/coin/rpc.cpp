@@ -501,7 +501,12 @@ DashWorkData NodeRPC::getwork()
             push_payment(work["masternode"]);
     }
     if (work.contains("superblock") && work["superblock"].is_array())
-        for (auto& e : work["superblock"]) push_payment(e);
+        for (auto& e : work["superblock"]) {
+            const size_t before = w.m_packed_payments.size();
+            push_payment(e);   // drops zero-amount entries
+            if (w.m_packed_payments.size() > before)
+                w.m_superblock_payments.push_back(w.m_packed_payments.back());
+        }
 
     // ----- DIP3/DIP4 coinbase extra payload -----
     if (work.contains("coinbase_payload") && work["coinbase_payload"].is_string())
