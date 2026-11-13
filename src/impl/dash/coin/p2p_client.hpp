@@ -3079,8 +3079,8 @@ public:
     /// is that object's hash. A govsync(nProp=0) invs OBJECTS only, never their
     /// votes, so a trigger's funding votes are unreachable until we ask for
     /// them by hash. Fired from the govobj handler the moment a TRIGGER object
-    /// is accepted, and by the maintainer's C4 re-syncs at H - maturity window
-    /// and H - 1, to every handshaked peer.
+    /// is accepted, and by the maintainer's C4 re-syncs at H - maturity window,
+    /// H - late lead and H - 2, to every handshaked peer.
     ///
     /// THE FILTER MUST BE NON-EMPTY. Dash Core v24 net_governance.cpp:116-162:
     /// a nonzero nProp with an EMPTY bloom filter is an OBJECT FETCH (the peer

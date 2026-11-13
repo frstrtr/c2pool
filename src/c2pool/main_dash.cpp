@@ -6589,7 +6589,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 node_coin_state.set_require_superblock_provider(embedded_superblock);
                 // C4: chainparams nSuperblockMaturityWindow (Dash Core v24
                 // chainparams.cpp: mainnet 1662, testnet 8) — the per-trigger
-                // vote re-sync fires at tip H - window and H - 1.
+                // vote re-sync fires at tip H - window, H - late lead and
+                // H - 2 (after the deferred 24.0.1 NO votes; never H - 1).
                 maintainer->set_superblock_maturity_window(
                     testnet ? dash::coin::DASH_SUPERBLOCK_MATURITY_WINDOW_TESTNET
                             : dash::coin::DASH_SUPERBLOCK_MATURITY_WINDOW_MAINNET);
@@ -8916,9 +8917,10 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             });
 
         // E-SUPERBLOCK C4: the maintainer re-requests each held trigger's
-        // votes at tip H - maturity window and H - 1 (per-object govsync with
-        // a non-empty filter — never the nProp=0 full sync) and fetches the
-        // parent object of any orphan FUNDING YES vote. The client enforces
+        // votes at tip H - maturity window, H - late lead and H - 2
+        // (per-object govsync with a non-empty filter — never the nProp=0
+        // full sync) and fetches the parent object of any orphan FUNDING YES
+        // vote. The client enforces
         // the once-per-(peer, object) window dashd v24 tracks as a fulfilled
         // request (repeat => Misbehaving(20)): nFulfilledRequestExpireTime is
         // 3600 s on mainnet and 300 s on testnet (chainparams.cpp), + margin.

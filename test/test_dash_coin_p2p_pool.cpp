@@ -2261,9 +2261,10 @@ TEST(DashCoinP2PPool, archival_rotation_is_bounded_and_never_churns_a_healthy_po
 // ── E-SUPERBLOCK C4: per-object vote sync — once per (peer, object) window ────
 // Dash Core v24 net_governance.cpp:116-133 records a per-object vote sync as a
 // fulfilled request and answers a repeat inside nFulfilledRequestExpireTime
-// (mainnet 1 h, testnet 5 min) with Misbehaving(20). Re-syncs at H - window
-// and H - 1 must therefore never re-ask the same peer for the same object
-// inside the window, while a DIFFERENT object or an expired window is fine.
+// (mainnet 1 h, testnet 5 min) with Misbehaving(20). Re-syncs at H - window,
+// H - late lead and H - 2 must therefore never re-ask the same peer for the
+// same object inside the window, while a DIFFERENT object or an expired
+// window is fine.
 TEST(DashCoinP2PPool, govsync_vote_sync_once_per_peer_object_window)
 {
     PoolRig rig;
