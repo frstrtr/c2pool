@@ -830,6 +830,8 @@ jobs:
     # are serialized against this leg on a shared heavy host by the per-host disk semaphore (SLOTS=1).
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-heavy"]') || 'ubuntu-24.04' }}
     continue-on-error: true
+    # ~2x a normal 2h09m run (incl. heavy-leg lock wait); well short of the 6h default.
+    timeout-minutes: 240
     steps:
       # Reap-guard: host-scoped exclusivity vs the other RAM-heavy leg
       # (CodeQL c-cpp analyze). The lock is held by a disowned holder
