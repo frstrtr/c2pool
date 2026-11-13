@@ -41,6 +41,11 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
     # per-coin protocol_legacy.cpp / protocol_actual.cpp addrme+addrs handlers.
     # Same reasoning as above: FOLDED into the EXISTING allowlisted core_test
     # target, never a new add_executable.
+    # random_uniform_test.cpp: random_float / random_double are continuous
+    # [min, max) draws (they were integer draws: random_float(0, 100) gave only
+    # 0..100, so the node-fee draw took ceil(fee)/101 and every peer-selection
+    # random_float(0, 1) < 0.8 held 50%). Fixed-seed, wide-tolerance hit rates
+    # for the fee draw. FOLDED into core_test, never a new add_executable.
     # p2p_message_stats_test.cpp: the p2p wire observability layer
     # (core/p2p_message_stats.hpp) -- command -> message-type mapping including
     # the NUL-padded wire form, the per-direction counters, and the embedded-
@@ -150,9 +155,18 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
     # nor the share's merged_coinbase_info (a V36 peer rejects info without
     # mm_data). Real MiningInterface + MergedMiningManager; same
     # fold-into-core_test reasoning as every TU here (c2pool_merged_mining linked).
+    # web_server_merged_payout_source_test.cpp: /current_merged_payouts labels
+    # each merged output explicit / auto-convert / donation from the payout
+    # provider's origins and shows it under the parent address it is paid for
+    # (one DOGE address of two LTC addresses: its part under each). Same
+    # fold-into-core_test reasoning as every TU here.
     # leveldb_store_lock_test.cpp: LevelDBStore::open on a DB whose LOCK is
     # held (another process, another handle) fails and leaves LOCK alone; an
     # unheld LOCK file opens. Same fold-into-core_test reasoning as every TU here.
+    # sharechain_height_index_test.cpp: the sharechain store keeps every share of
+    # an absheight (`height:` one hash as before, the others under `hsib:`),
+    # removing one share never drops another's, and the index is rebuilt when an
+    # earlier binary may have written it since (dirty != 2). Same reasoning.
     # template_refresh_on_tx_test.cpp: the transaction-triggered template
     # refresh (#2137 S1): core::TxRefreshPacer (coalesce within 1 s of the
     # last rebuild, rebuild at once after a quiet interval, skip what another
@@ -228,7 +242,9 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
         packet_test.cpp
         payout_manager_rules_test.cpp
         random_choice_guard_test.cpp
+        random_uniform_test.cpp
         reloaded_block_flag_test.cpp
+        sharechain_height_index_test.cpp
         socket_write_queue_test.cpp
         socket_read_empty_prefix_test.cpp
         template_refresh_on_tx_test.cpp
@@ -254,6 +270,7 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
         web_server_local_only_test.cpp
         web_server_local_share_hash_rates_test.cpp
         web_server_merged_drop_test.cpp
+        web_server_merged_payout_source_test.cpp
         web_server_mweb_hogex_test.cpp
         web_server_pplns_no_burn_test.cpp
         web_server_redistribute_type_test.cpp

@@ -143,6 +143,12 @@ BEGIN_MESSAGE(blocktxn)
     }
 END_MESSAGE()
 
+// Dash Core protocol.h GetDataMsg: MSG_CMPCT_BLOCK = 20 (BIP 152, "defined in
+// BIP152"; Dash renumbered it, Bitcoin uses 4). bitcoin_family's
+// inventory_type::cmpct_block is Bitcoin's 4 and must never go on a Dash wire.
+inline constexpr inventory_type::inv_type DASH_MSG_CMPCT_BLOCK =
+    static_cast<inventory_type::inv_type>(20);
+
 BEGIN_MESSAGE(clsig)
     MESSAGE_FIELDS
     (
@@ -405,6 +411,25 @@ BEGIN_MESSAGE(govsync)
         READWRITE(obj.m_filter_nhashfuncs);
         READWRITE(obj.m_filter_ntweak);
         READWRITE(obj.m_filter_nflags);
+    }
+END_MESSAGE()
+
+// SYNCSTATUSCOUNT ("ssc", Dash Core protocol.cpp / masternode/sync.h): a
+// peer's answer to our govsync — nItemID (int32) + nCount (int32).
+// MASTERNODE_SYNC_GOVOBJ (10) answers the nProp=0 full sync with the number of
+// object invs it relays; MASTERNODE_SYNC_GOVOBJ_VOTE (11) answers a
+// per-object vote sync (net_governance.cpp:144-160).
+inline constexpr int32_t DASH_MASTERNODE_SYNC_GOVOBJ      = 10;
+inline constexpr int32_t DASH_MASTERNODE_SYNC_GOVOBJ_VOTE = 11;
+BEGIN_MESSAGE(ssc)
+    MESSAGE_FIELDS
+    (
+        (int32_t, m_item_id),
+        (int32_t, m_count)
+    )
+    {
+        READWRITE(obj.m_item_id);
+        READWRITE(obj.m_count);
     }
 END_MESSAGE()
 
@@ -683,6 +708,7 @@ using Handler = MessageHandler<
     message_govobj,
     message_govobjvote,
     message_govsync,
+    message_ssc,
     // ⚠ SPORK lane — same registry rule as the DIP-24 pair above (#1077): a
     // handler that exists but whose message type is absent from this list can
     // never run; the payload dies on the unhandled-command path at DEBUG.

@@ -153,7 +153,12 @@ void Actual::HANDLER(shares)
 
 void Actual::HANDLER(sharereq)
 {
-    auto shares = handle_get_share(msg->m_hashes, msg->m_parents, msg->m_stops, peer->addr());
+    bool busy = false;
+    auto shares = handle_get_share(msg->m_hashes, msg->m_parents, msg->m_stops, peer->addr(), &busy);
+    // think() holds the tracker: the request waits for it briefly, without
+    // blocking the io thread, and is answered by retry_deferred_sharereqs.
+    if (busy && defer_sharereq(peer, msg->m_id, msg->m_hashes, msg->m_parents, msg->m_stops))
+        return;
 
     std::vector<chain::RawShare> rshares;
 

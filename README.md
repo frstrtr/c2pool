@@ -11,7 +11,9 @@ Original forum thread: <https://bitcointalk.org/index.php?topic=18313>
 
 ## Latest releases
 
-- **[v0.2.12.1](https://github.com/frstrtr/c2pool/releases/tag/v0.2.12.1)** — LTC + merged mining. **Every c2pool-ltc node must run v0.2.12.1 before 2026-11-13 00:00:00 UTC**, when the LTC share chain moves to [share version 3601](#share-version-3601-flag-day). Several aux chains at once, job-time payouts. (v0.2.12 had an earlier date, 2026-11-11 12:00 UTC: do not run it.)
+- **[v0.2.12.3](https://github.com/frstrtr/c2pool/releases/tag/v0.2.12.3)** — LTC: a node serves every share it holds (no gaps for peers after a dropped connection); the node fee is taken at exactly the configured rate. DASH: compact-block (BIP 152) receive, superblock governance sync, block bodies checked against the header including the v24 asset-unlock root. macOS packages in this release are Apple Silicon only; universal again from the next release.
+- **[v0.2.12.2](https://github.com/frstrtr/c2pool/releases/tag/v0.2.12.2)** — LTC: the built-in bootstrap list holds V36 share-chain nodes only.
+- **[v0.2.12.1](https://github.com/frstrtr/c2pool/releases/tag/v0.2.12.1)** — LTC + merged mining: [share version 3601](#share-version-3601-flag-day), active since 2026-11-13 00:00:00 UTC. Nodes older than v0.2.12.1 and Python p2pool are no longer on the LTC share chain. Several aux chains at once, job-time payouts. (v0.2.12 had an earlier date, 2026-11-11 12:00 UTC: do not run it.)
 - **[v0.2.11.1](https://github.com/frstrtr/c2pool/releases/tag/v0.2.11.1)** — DASH: Dash Core 24 hard fork support in the daemon-less node (every v24 transaction type in templates); LTC fix for a coinbase that could burn the block reward under load.
 - The Python p2pool implementations ([p2pool-dash](https://github.com/frstrtr/p2pool-dash), [p2pool-merged-v36](https://github.com/frstrtr/p2pool-merged-v36)) are no longer maintained. All updates, including security fixes and Dash Core 24 support, ship only in c2pool.
 
@@ -323,6 +325,10 @@ c2pool is an independent C++ implementation of the P2Pool sharechain concept ori
 
 Development is supported by Anthropic's [Claude for Open Source](https://claude.com/contact-sales/claude-for-oss) program (2026). The design, the consensus rules, and responsibility for every byte shipped remain with the maintainers.
 
+> **First LTC + DOGE twin block found by c2pool in production** (2026-11-12 15:46:10 UTC) LTC [#3211872](https://blockchair.com/litecoin/block/3211872) + DOGE [#6454700](https://blockchair.com/dogecoin/block/6454700) — one proof of work, 6.256 LTC + 10,001 DOGE, found by a public V36 pool node (about 210 GH/s) eleven hours after it moved from Python p2pool to c2pool v0.2.12.2.
+>
+> **LTC share chain on share version 3601** (2026-11-13 00:00:00 UTC) — the flag day passed without a split. Python p2pool and c2pool before v0.2.12.1 can no longer join the share chain; the nodes on it run c2pool.
+>
 > **First merged-mined DOGE block:** [#6135703](https://blockchair.com/dogecoin/block/f84500c25a4cce2a08887f29763726bd5ecec7b66fed65a88b181fb0b0ab2383) (2026-03-23) — decentralized LTC+DOGE merged mining via P2Pool V36, cross-validated with c2pool on shared share chain
 >
 > **First daemonless DOGE block:** (2026-03-27) — DOGE block accepted on testnet4alpha via embedded SPV P2P, no dogecoind RPC needed
@@ -361,8 +367,14 @@ Pre-built binaries are available on the [Releases page](https://github.com/frstr
 | Platform | Package | Notes |
 |----------|---------|-------|
 | Linux x86_64 | `.tar.gz` | Extract and run `./start.sh` |
-| macOS (universal) | `.dmg` or `.zip` | Single universal arm64 + x86_64 build (lipo-merged); bundled dylibs, no Homebrew needed |
+| macOS (universal) | `.dmg` or `.zip` | One universal binary for Apple Silicon and Intel Macs; no Homebrew needed |
 | Windows x86_64 | `.zip` or `setup.exe` | Installer bundles VC++ Runtime + firewall rules |
+
+macOS packages are built on an Apple Silicon build host. The arm64 slice is a
+native build; the x86_64 slice is cross-compiled there and started under
+Rosetta 2 before the package is published. Both slices link the same pinned
+libraries, statically. Intel Macs remain a supported target through the
+x86_64 slice. Details: [docs/ci-macos.md](docs/ci-macos.md).
 
 ### Verify downloads
 
@@ -410,12 +422,22 @@ export PATH="$PATH:$HOME/.local/bin"   # so `conan` is on PATH (add to ~/.bashrc
 conan profile detect --force
 
 git clone https://github.com/frstrtr/c2pool.git
-cd c2pool && mkdir build && cd build
-conan install .. --build=missing --output-folder=. --settings=build_type=Debug
-cmake .. --preset conan-debug
-cmake --build . --target c2pool -j$(nproc)
-./src/c2pool/c2pool
+cd c2pool && git checkout v0.2.12.1   # or the newest tag on the Releases page; omit to build master
+mkdir build && cd build
+conan install .. --build=missing --output-folder=. --settings=build_type=Release
+cmake .. -DCMAKE_TOOLCHAIN_FILE=conan_toolchain.cmake -DCMAKE_BUILD_TYPE=Release
+cmake --build . --target c2pool-ltc -j$(nproc)
+./src/c2pool/c2pool-ltc
 ```
+
+This builds the LTC node (`c2pool-ltc`, the binary the release packages ship).
+For another coin use its target (`c2pool-dash`, `c2pool-btc`, … — see
+[Build targets](#build-targets)). The target `c2pool` is a dev alias of the
+same LTC node. For a production node, prefer the signed binaries from
+[Releases](https://github.com/frstrtr/c2pool/releases) (see
+[Verify downloads](#verify-downloads)), or build **Release** as above: a Debug
+build (`build_type=Debug` + `--preset conan-debug`) is several times larger
+and slower and is meant for development only.
 
 **Linux (Ubuntu 26.04 LTS)** — *theoretical: CI builds on 24.04, so the 26.04 path below is documented from known toolchain deltas, not yet exercised in the CI matrix. Report any gotcha via an issue.*
 
@@ -424,7 +446,7 @@ The 24.04 steps above apply unchanged; the build is Conan-managed, so it is larg
 - **Externally-managed pip (PEP 668).** As on 24.04, install Conan with `pip install "conan>=2.0,<3.0" --break-system-packages`, or prefer an isolated `pipx install "conan>=2.0,<3.0"` (`sudo apt-get install -y pipx`) so the tool does not touch the system Python. (Conan is c2pool's **C++** dependency manager — a pip-distributed tool — and is unrelated to any Python component of a pool.)
 - **apt package names are unchanged**: `g++ cmake make libleveldb-dev libsecp256k1-dev python3-pip`.
 
-Everything else — `conan install` → `cmake --preset conan-debug` → `cmake --build` — is identical to 24.04.
+Everything else — `conan install` → `cmake` (Release toolchain) → `cmake --build` — is identical to 24.04.
 
 **macOS (Intel & Apple Silicon)**
 ```bash
@@ -434,8 +456,8 @@ brew install cmake boost leveldb secp256k1 nlohmann-json yaml-cpp
 git clone https://github.com/frstrtr/c2pool.git
 cd c2pool && mkdir build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release
-cmake --build . --target c2pool -j$(sysctl -n hw.ncpu)
-./src/c2pool/c2pool
+cmake --build . --target c2pool-ltc -j$(sysctl -n hw.ncpu)
+./src/c2pool/c2pool-ltc
 ```
 
 **Windows (setup.exe or build from source)**
@@ -659,7 +681,7 @@ The sharechain P2P layer discovers peers from multiple sources:
 | CLI seed nodes | `-n HOST:PORT` (repeatable) | Highest |
 | YAML config | `seed_nodes:` list | Appended to CLI |
 | `~/.c2pool/ltc/pool.yaml` | `bootstrap_addrs:` (auto-generated, persists learned peers) | Medium |
-| Hardcoded bootstrap hosts | `ml.toom.im`, `usa.p2p-spb.xyz`, + 9 IPs | Fallback |
+| Hardcoded bootstrap hosts | `ltc.voidbind.com`, `p2p-spb.xyz`, `usa.p2p-spb.xyz`, + 3 IPs (V36 share-chain nodes only) | Fallback |
 
 With `startup_mode: wait` (default), the node waits until peers deliver
 shares before opening stratum. This matches p2pool's `PERSIST=True` behavior.
@@ -851,7 +873,9 @@ Every node binary resolves its launch configuration in three layers
 (`src/core/settings_cli.hpp`): **compiled defaults (L0) < settings file (L1) <
 command line (L2)**. The CLI always wins, even over a money-class key that the
 file has acknowledged. The catalog of every key and its per-binary CLI spelling
-is `src/core/param_catalog.inc`.
+is `src/core/param_catalog.inc`. Commented example files for c2pool-ltc, -dash,
+-btc, -bch and -dgb, checked against the release binaries, are in
+[config/examples/](config/examples/).
 
 | Flag | Binaries | Behaviour |
 |------|----------|-----------|
@@ -1073,6 +1097,7 @@ Only the daemonless trust anchor applies to a daemonless node — see
 | `--embedded-asn-diversity[=false]` | off | Require the racing set to span ≥2 ASNs. |
 | `--embedded-peer-latency-score[=false]` | off | Latency tie-breaker inside the eligible peer set. |
 | `--embedded-proactive-rotate` | off | Low-rate proactive coin-peer rotation (default is stall-only). |
+| `--embedded-compact-blocks[=false]` | on | BIP 152 compact-block receive: a new tip body is asked for as `getdata(MSG_CMPCT_BLOCK)` and rebuilt from the mempool. `=false` fetches every body whole. |
 
 **Embedded serving levers** (all daemonless-default ON, `=false` opts out;
 dashd-attached default OFF)

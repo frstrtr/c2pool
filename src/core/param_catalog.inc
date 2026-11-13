@@ -591,6 +591,9 @@ C2P_PARAM("embedded.superblock", Embedded, BOOL, RESTART, C_DASH, LIT, "false", 
 C2P_PARAM("embedded.govsync", Embedded, BOOL, RESTART, C_DASH, LIT, "false", NONE, "observe-only governance store")
   C2P_ALIAS("embedded.govsync", BIN_DASH, "--embedded-govsync", FLAG)
 
+C2P_PARAM("embedded.superblock_unfunded_mainnet", Embedded, BOOL, RESTART, C_DASH, LIT, "false", NONE, "TEST/SOAK ONLY - never set on a production mainnet node: serve a superblock height the node believes unfunded with a normal coinbase (default off = refuse; testnet always on)")
+  C2P_ALIAS("embedded.superblock_unfunded_mainnet", BIN_DASH, "--embedded-superblock-unfunded-mainnet", FLAG)
+
 C2P_PARAM("embedded.serve_mempool_txs", Embedded, TRISTATE_BOOL, RESTART, C_DASH|C_BIP110|C_DGB, NONE, "", NONE, "fee-carrying templates (daemonless default ON; DGB: advisory GBT only -- the mined stratum job stays coinbase-only until the S2 job-commit lands)")
   C2P_ALIAS("embedded.serve_mempool_txs", BIN_DASH, "--embedded-serve-mempool-txs", FLAG_OPT_EQFALSE)
   C2P_ALIAS("embedded.serve_mempool_txs", BIN_DGB, "--embedded-serve-mempool-txs", FLAG_OPT_EQFALSE)
@@ -632,6 +635,9 @@ C2P_PARAM("embedded.fresh_datum_race_k", Embedded, INT64, LIVE, C_DASH, LIT, "2"
 
 C2P_PARAM("embedded.getmnlistd_tracker", Embedded, TRISTATE_BOOL, LIVE, C_DASH, NONE, "", NONE, "10s slot re-ask tracker (default ON)")
   C2P_ALIAS("embedded.getmnlistd_tracker", BIN_DASH, "--embedded-getmnlistd-tracker", FLAG_OPT_EQFALSE)
+
+C2P_PARAM("embedded.compact_blocks", Embedded, TRISTATE_BOOL, RESTART, C_DASH, NONE, "", NONE, "BIP 152 compact-block receive for new tip bodies (default ON; =false fetches every body whole)")
+  C2P_ALIAS("embedded.compact_blocks", BIN_DASH, "--embedded-compact-blocks", FLAG_OPT_EQFALSE)
 
 C2P_PARAM("embedded.asn_diversity", Embedded, TRISTATE_BOOL, LIVE, C_DASH, NONE, "", NONE, "require >=2 ASNs in racing set")
   C2P_ALIAS("embedded.asn_diversity", BIN_DASH, "--embedded-asn-diversity", FLAG_OPT_EQFALSE)

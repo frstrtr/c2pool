@@ -319,6 +319,26 @@ std::string ser(const ltc::CumulativeWeights& w)
     return o.str();
 }
 
+// The weights with each MERGED: key as it was before the key carried the
+// parent script ("MERGED:" <merged script>), keys that differ only by parent
+// summed: the per-merged-script weights the payouts are split by. The golden
+// digest below was taken before that change, so it equal => the weights are.
+ltc::CumulativeWeights fold_merged_parents(ltc::CumulativeWeights w)
+{
+    std::map<std::vector<unsigned char>, uint288> folded;
+    for (const auto& [k, v] : w.weights) {
+        std::vector<unsigned char> key = k;
+        if (ltc::is_merged_key(k)) {
+            const auto merged = ltc::strip_merged_key(k);
+            key.assign(ltc::MERGED_KEY_PREFIX.begin(), ltc::MERGED_KEY_PREFIX.end());
+            key.insert(key.end(), merged.begin(), merged.end());
+        }
+        folded[key] = folded[key] + v;
+    }
+    w.weights = std::move(folded);
+    return w;
+}
+
 std::string ser(const ltc::MergedPayoutWeights& w)
 {
     std::ostringstream o;
@@ -368,7 +388,7 @@ Snapshot snapshot(ltc::ShareTracker& t, const uint256& best)
     const auto payouts = ltc::ShareTracker::merged_payout_outputs(w, kDogeValue, combined_donation());
     s.merged_payouts = ser(payouts);
     s.merged_coinbase = MergedMiningManager::build_pplns_coinbase_hex(kDogeHeight, payouts, uint256());
-    s.nmc_weights = ser(t.get_merged_cumulative_weights(best, len, unlimited(), kNmc));
+    s.nmc_weights = ser(fold_merged_parents(t.get_merged_cumulative_weights(best, len, unlimited(), kNmc)));
     s.v36_weights = ser(t.get_v36_merged_weights(best, len, unlimited()));
     uint256 block_target;
     block_target.SetHex("00000000000000000000ffff00000000000000000000000000000000000000ff");
@@ -1092,4 +1112,99 @@ TEST(MergedPerShareRule, A3601P2shParentIsPaidAsP2shWithoutTier15)
                                          ltc::PoolConfig::COMBINED_DONATION_SCRIPT.end());
     EXPECT_EQ(ltc::resolve_merged_payout_script(don), don);
     EXPECT_EQ(ltc::resolve_merged_payout_script(miner_p2sh(9)), miner_p2sh(9));
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Where each merged payout comes from (merged_payout_origins), for the web
+// payouts view: the parent script of the shares and whether they gave the
+// merged address (explicit) or it is their parent key's (auto-convert), from
+// the same weights the amounts are split by.
+// ─────────────────────────────────────────────────────────────────────────
+
+TEST(MergedPayoutOrigins, MergedKeyCarriesTheParentAndResolvesAsBefore)
+{
+    const auto doge = p2pkh_script(0xd0);
+    const auto parent = miner_p2pkh(2);
+    const auto k = ltc::make_merged_key(doge, parent);
+    ASSERT_TRUE(ltc::is_merged_key(k));
+    EXPECT_EQ(ltc::strip_merged_key(k), doge);
+    EXPECT_EQ(ltc::merged_key_parent(k), parent);
+    EXPECT_EQ(ltc::resolve_merged_payout_script(k), doge);
+    const auto bare = ltc::make_merged_key(doge);
+    EXPECT_EQ(ltc::strip_merged_key(bare), doge);
+    EXPECT_TRUE(ltc::merged_key_parent(bare).empty());
+    EXPECT_NE(k, ltc::make_merged_key(doge, miner_p2pkh(3))) << "one key per (merged, parent)";
+    // an empty merged script stays unconvertible (skipped), as before
+    EXPECT_TRUE(ltc::resolve_merged_payout_script(ltc::make_merged_key({}, parent)).empty());
+}
+
+TEST(MergedPayoutOrigins, ExplicitAutoP2shAndSharedExplicitAddress)
+{
+    const auto doge = p2pkh_script(0xd0);   // one DOGE address given by miners 2 and 3
+    const std::vector<RuleShare> chain = {
+        {1, 0, 1, {}, 0},                    // miner 1: P2PKH, no DOGE address
+        {2, 1, 9, {}, 2},                    // miner 9: P2SH, no DOGE address
+        {3, 2, 2, {{kDoge, doge}}, 0},       // miner 2: explicit
+        {4, 3, 3, {{kDoge, doge}}, 0},       // miner 3: the same explicit address
+        {5, 4, 3, {{kDoge, doge}}, 0},
+        {6, 5, 4, {{kDoge, p2pkh_script(0xd4)}}, 1},   // miner 4: P2WPKH, explicit
+    };
+    for (bool v3601 : {true, false}) {
+        ltc::ShareTracker t;
+        for (const auto& s : as_version(chain, v3601))
+            add_rule_share(t, s.prev ? num_hash(0x0e37, s.prev) : uint256(), s.n, s.miner, s.type, s.entries,
+                           s.v3601);
+        const auto w = t.get_merged_payout_weights(num_hash(0x0e37, 6), kDoge);
+        const WMap resolved(w.resolved.begin(), w.resolved.end());
+        const uint288 one = resolved.at(miner_p2pkh(1));
+        EXPECT_EQ(resolved.at(doge), one + one + one) << "the shared address: one output, summed before the split";
+
+        // sources sum to the resolved weights
+        WMap from_sources;
+        for (const auto& src : w.sources)
+            from_sources[src.script] = from_sources[src.script] + src.weight;
+        EXPECT_EQ(from_sources, resolved) << v3601;
+
+        struct O { bool expl; double fraction; };
+        std::map<std::pair<std::vector<unsigned char>, std::vector<unsigned char>>, O> by;
+        for (const auto& o : ltc::ShareTracker::merged_payout_origins(w))
+            by[{o.script, o.parent_script}] = {o.explicit_address, o.fraction};
+        ASSERT_EQ(by.size(), 5u) << v3601;
+        const auto at = [&](const std::vector<unsigned char>& sc, const std::vector<unsigned char>& p) {
+            const auto it = by.find({sc, p});
+            EXPECT_NE(it, by.end());
+            return it == by.end() ? O{false, -1} : it->second;
+        };
+        EXPECT_FALSE(at(miner_p2pkh(1), miner_p2pkh(1)).expl) << "auto-convert, P2PKH parent";
+        EXPECT_DOUBLE_EQ(at(miner_p2pkh(1), miner_p2pkh(1)).fraction, 1.0);
+        EXPECT_FALSE(at(miner_p2sh(9), miner_p2sh(9)).expl) << "auto-convert, P2SH parent";
+        EXPECT_TRUE(at(doge, miner_p2pkh(2)).expl);
+        EXPECT_TRUE(at(doge, miner_p2pkh(3)).expl);
+        EXPECT_NEAR(at(doge, miner_p2pkh(2)).fraction, 1.0 / 3, 1e-9);
+        EXPECT_NEAR(at(doge, miner_p2pkh(3)).fraction, 2.0 / 3, 1e-9);
+        // miner 4's parent script is its P2WPKH script, not the P2PKH form
+        std::vector<unsigned char> p2wpkh = {0x00, 0x14};
+        const auto p4 = miner_p2pkh(4);
+        p2wpkh.insert(p2wpkh.end(), p4.begin() + 3, p4.begin() + 23);
+        EXPECT_TRUE(at(p2pkh_script(0xd4), p2wpkh).expl);
+
+        // the amounts are those of the resolved weights alone
+        MergedPayoutSource::Weights pw;
+        auto shared = std::make_shared<const ltc::MergedPayoutWeights>(w);
+        pw.best = w.best;
+        pw.chain_id = kDoge;
+        pw.chain_len = w.chain_len;
+        pw.derive = [shared](uint64_t v) {
+            return ltc::ShareTracker::merged_payout_outputs(*shared, v, combined_donation());
+        };
+        pw.origins = [shared] { return ltc::ShareTracker::merged_payout_origins(*shared); };
+        MergedPayoutSource src;
+        src.publish(pw);
+        std::string miss;
+        const auto none = [] { return std::optional<MergedPayoutSource::Weights>{}; };
+        const auto d = src.get_detail(w.best, kDoge, kDogeValue, false, none, miss);
+        EXPECT_EQ(d.payouts, src.get(w.best, kDoge, kDogeValue, false, none, miss));
+        EXPECT_EQ(d.payouts, ltc::ShareTracker::merged_payout_outputs(w, kDogeValue, combined_donation()));
+        EXPECT_EQ(d.origins.size(), 5u);
+    }
 }

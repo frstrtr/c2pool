@@ -28,6 +28,26 @@ if (BUILD_TESTING AND GTest_FOUND)
     # existing allowlisted target (a standalone add_executable would be absent
     # from build.yml's --target list and silently Not-Run — the #769 trap).
     #
+    # serve_marked_shares_test.cpp + own_share_reject_marks_test.cpp: getshares
+    # replies are complete and contiguous even for shares pushed to a peer that
+    # dropped right after (dba0be63d skipped them forever); the narrowed
+    # own-share re-broadcast hold-off (peer abort only, 10 min TTL). REAL
+    # NodeImpl + real loopback peer. Same folding rule: into the existing
+    # allowlisted target.
+    #
+    # restart_reload_window_test.cpp: the 2026-11-13 restart stall — a restart
+    # reloads the whole persisted window (the store's height index keeps every
+    # share of a height; the loader reads the share records). REAL store and
+    # NodeImpl. Same folding rule: into the existing allowlisted target.
+    #
+    # parent_fetch_rotation_test.cpp: same incident — a parent is asked of every
+    # connected peer, at once, before the pacer backs it off. REAL NodeImpl +
+    # loopback peers, and the pure FetchPeerRotation. Same folding rule.
+    #
+    # sharereq_busy_wait_test.cpp: same incident — a SHAREREQ waits briefly for
+    # a busy tracker instead of being answered empty. REAL NodeImpl + loopback
+    # peer. Same folding rule.
+    #
     # pool_rate_head_select_test.cpp: the coin-generic dashboard pool-rate
     # HEAD-SELECTION + get_average_stale_prop SSOT (sharechain/
     # pool_rate_head_select.hpp, issue #1482) — verified best when live, else the
@@ -428,6 +448,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         ingest_ownership_test.cpp
         invalid_pow_score_test.cpp
         legacy_addrme_self_probe_test.cpp
+        listen_port_guard_test.cpp
         ltc_fd_plan_test.cpp
         ltc_full_view_prices_old_inputs_test.cpp
         ltc_gentx_golden_kat_test.cpp
@@ -449,18 +470,24 @@ if (BUILD_TESTING AND GTest_FOUND)
         mweb_next_header_test.cpp
         mweb_state_hash_binding_test.cpp
         mweb_tx_wire_test.cpp
+        own_share_reject_marks_test.cpp
+        parent_fetch_rotation_test.cpp
         peer_block_pow_carry_test.cpp
         per_peer_ingest_test.cpp
         pool_rate_head_select_test.cpp
         redistribute_script_type_test.cpp
+        restart_reload_window_test.cpp
         restart_reorg_supersede_test.cpp
         self_connection_ban_test.cpp
+        serve_marked_shares_test.cpp
+        bootstrap_hosts_test.cpp
         share_fetch_failover_test.cpp
         share_message_unpack_bounds_test.cpp
         share_remove_owns_data_test.cpp
         share_test.cpp
         share_v3601_flag_day_test.cpp
         share_v3601_rewrap_test.cpp
+        sharereq_busy_wait_test.cpp
         solo_payouts_test.cpp
         template_gap_gate_test.cpp
         template_hogex_survives_truncation_test.cpp

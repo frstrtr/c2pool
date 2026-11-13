@@ -918,18 +918,33 @@ inline std::vector<unsigned char> normalize_script_for_merged(
 // Keeps Tier 1/1.5 (explicit DOGE script) keys separate from raw LTC script keys
 // in the same weight map, preventing V35+V36 weight collapse for the same miner.
 // 7 bytes: 0x4d 0x45 0x52 0x47 0x45 0x44 0x3a = "MERGED:"
+//
+// A key is "MERGED:" <merged script> <parent script> <len(parent script), 2
+// bytes big-endian>: the parent (LTC) script of the share whose explicit merged
+// address it is rides along, so the merged payouts can say which parent
+// address fed each explicit merged output (the web payouts view). The amounts
+// never see it: resolve_merged_payout_script strips it, and
+// get_merged_payout_weights sums the weights of all keys resolving to one
+// merged script before the split, so the per-script weights (and the merged
+// coinbase) are exactly those of a key without the parent.
 inline constexpr std::array<unsigned char, 7> MERGED_KEY_PREFIX = {
     0x4d, 0x45, 0x52, 0x47, 0x45, 0x44, 0x3a
 };
 
-// Prepend MERGED: prefix to a script for use as a weight map key.
+// The weight map key of an explicit merged address `script`, given (or
+// looked up, Tier 1.5) for a share whose parent script is `parent`.
 inline std::vector<unsigned char> make_merged_key(
-    const std::vector<unsigned char>& script)
+    const std::vector<unsigned char>& script,
+    const std::vector<unsigned char>& parent = {})
 {
+    const size_t plen = parent.size() <= 0xffff ? parent.size() : 0;
     std::vector<unsigned char> key;
-    key.reserve(MERGED_KEY_PREFIX.size() + script.size());
+    key.reserve(MERGED_KEY_PREFIX.size() + script.size() + plen + 2);
     key.insert(key.end(), MERGED_KEY_PREFIX.begin(), MERGED_KEY_PREFIX.end());
     key.insert(key.end(), script.begin(), script.end());
+    key.insert(key.end(), parent.begin(), parent.begin() + static_cast<std::ptrdiff_t>(plen));
+    key.push_back(static_cast<unsigned char>(plen >> 8));
+    key.push_back(static_cast<unsigned char>(plen & 0xff));
     return key;
 }
 
@@ -941,13 +956,34 @@ inline bool is_merged_key(const std::vector<unsigned char>& key)
                       key.begin());
 }
 
-// Strip MERGED: prefix, returning the raw script bytes.
+// The length of the parent script a MERGED: key carries (0 when the trailer
+// does not fit, which make_merged_key never produces).
+inline size_t merged_key_parent_len(const std::vector<unsigned char>& key)
+{
+    const size_t body = key.size() - MERGED_KEY_PREFIX.size();
+    if (body < 2) return 0;
+    const size_t plen = (static_cast<size_t>(key[key.size() - 2]) << 8) | key[key.size() - 1];
+    return plen + 2 <= body ? plen : 0;
+}
+
+// Strip MERGED: prefix and the parent trailer, returning the merged script.
 // Caller must check is_merged_key() first.
 inline std::vector<unsigned char> strip_merged_key(
     const std::vector<unsigned char>& key)
 {
+    const size_t body = key.size() - MERGED_KEY_PREFIX.size();
+    const size_t tail = body >= 2 ? merged_key_parent_len(key) + 2 : 0;
     return std::vector<unsigned char>(
-        key.begin() + MERGED_KEY_PREFIX.size(), key.end());
+        key.begin() + MERGED_KEY_PREFIX.size(), key.end() - static_cast<std::ptrdiff_t>(tail));
+}
+
+// The parent script a MERGED: key carries (empty if none).
+// Caller must check is_merged_key() first.
+inline std::vector<unsigned char> merged_key_parent(
+    const std::vector<unsigned char>& key)
+{
+    const size_t plen = merged_key_parent_len(key);
+    return std::vector<unsigned char>(key.end() - 2 - static_cast<std::ptrdiff_t>(plen), key.end() - 2);
 }
 
 // Resolve a weight map key to a DOGE-compatible scriptPubKey.

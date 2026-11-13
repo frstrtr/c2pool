@@ -65,6 +65,7 @@
 #include <impl/dash/coin/rpc_conf.hpp>     // dash.conf creds resolution (rpcpassword off argv)
 #include <impl/dash/coin/node_interface.hpp>
 #include <impl/dash/coin/p2p_client.hpp>   // dash::coin::p2p::CoinClient — OPT-IN coin-network dial (E1, --coin-p2p-connect)
+#include <impl/dash/coin/compact_mempool_provider.hpp> // dash::coin::CompactMempoolBinding — #968a cmpctblock short ids vs the embedded mempool
 #include <impl/dash/coin/coin_peer_manager.hpp> // dash::coin::DashCoinPeerManager — DASH-ISOLATED scored/diverse peer discovery (--coin-p2p-discover; network-standalone gate)
 #include <impl/dash/coin/chain_seeds.hpp>  // dash::coin::dash_dns_seeds / dash_fixed_seeds — DASH mainnet/testnet seed bootstrap
 #include <impl/dash/coin/won_block_dispatch.hpp> // dash::coin::broadcast_won_block — S8 dual-path won-block dispatcher (embedded P2P primary + submitblock RPC backup)
@@ -616,6 +617,10 @@ void print_banner(const char* argv0)
         << "           [--external-ip ADDR]\n"
         << "           [--embedded-utxo[=false]] [--embedded-mainnet[=false]] [--embedded-null-arm[=false]]\n"
         << "           [--embedded-superblock[=false]] [--embedded-include-mn-special-txs[=false]]\n"
+        << "           [--embedded-superblock-unfunded-mainnet]  (TEST/SOAK ONLY — MUST NEVER be set on a\n"
+        << "              production MAINNET node: serves a superblock height with a normal coinbase when\n"
+        << "              the node believes no trigger is funded; a wrong belief loses the block. Default\n"
+        << "              OFF = refuse, master's behaviour; testnet serves the unfunded verdict without it)\n"
         << "           [--embedded-accrue-asset-locks[=false]] [--embedded-mn-bridge-max N]\n"
         << "           [--embedded-asn-diversity]\n"
         << "           [--embedded-mn-bridge-no-cursor]\n"
@@ -633,6 +638,8 @@ void print_banner(const char* argv0)
         << "              types 1-4) + funded superblocks, reward-safe; =false opts each out)\n"
         << "           [--embedded-fresh-datum-race] [--embedded-fresh-datum-race-k N]\n"
         << "           [--embedded-getmnlistd-tracker]\n"
+        << "           [--embedded-compact-blocks[=false]]  (BIP 152 compact-block receive for new\n"
+        << "              tip bodies, default ON; =false fetches every body whole)\n"
         << "           [--embedded-fold-live PATH] [--embedded-fold-live-expect HASH]\n"
         << "           [--embedded-fold-checkscripts[=false]]\n"
         << "           [--embedded-tx-inject] [--embedded-tx-inject-hex FILE]\n"
@@ -1339,7 +1346,15 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
              // re-folds and rejects on root drift, so an included special tx
              // always commits a folded MN root. Default false = today's
              // exclude-all (coinbase-only body for special txs).
-             bool embedded_include_mn_special_txs = false)
+             bool embedded_include_mn_special_txs = false,
+             // --embedded-superblock-unfunded-mainnet: explicit MAINNET opt-in
+             // for serving a PROVEN-unfunded superblock height (NotTriggered,
+             // normal coinbase). TEST/SOAK ONLY — it must never be set on a
+             // production mainnet node. Default OFF: on mainnet every
+             // superblock height without a funded trigger refuses (master's
+             // behaviour). Testnet serves NotTriggered without it. Never
+             // implied by any other flag.
+             bool embedded_superblock_unfunded_mainnet = false)
 {
     namespace io = boost::asio;
 
@@ -3004,6 +3019,14 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // => the coin client keeps its stall-only rotation (byte-identical to
         // master); the setter only flips a member bool.
         coin_p2p->set_proactive_rotate_enabled(embedded_proactive_rotate);
+        // #968a: the operator's --coin-p2p-connect targets (the pinned local
+        // dashd among them) are never disconnected by Misbehaving(); neither
+        // is any loopback / private-LAN peer (p2p_client.hpp is_protected_peer).
+        {
+            std::set<std::string> protected_keys;
+            for (const auto& t : coin_p2p_targets) protected_keys.insert(t.to_string());
+            coin_p2p->set_protected_peer_keys(std::move(protected_keys));
+        }
 
         if (coin_p2p_discover_eff) {
             // ── Network-standalone arm: seed-discovered, SCORED, group-diverse
@@ -3480,6 +3503,20 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         arm_is_hold();   // seed posture now (mainnet seed: both active)
         coin_p2p->set_spork_change_callback(arm_is_hold);
     }
+    // #968a slice 3b: BIP 152 cmpctblock short ids are matched against THIS
+    // node's embedded Mempool (compact_mempool_provider.hpp), so a compact
+    // block whose txs we already hold completes without a getblocktxn round
+    // trip. A wrong tx that matches by short id is caught by the receiver's
+    // merkle bind, and the full block is fetched. Declared AFTER
+    // node_coin_state, so it is destroyed BEFORE it: the destructor takes the
+    // provider out of coin_p2p while the Mempool is still alive. coin_p2p is
+    // declared earlier and can outlive this scope (set_lifetime pins it per
+    // async op), so without this it would keep a provider pointing into a
+    // freed Mempool. No coin-P2P arm => nothing is bound.
+    dash::coin::CompactMempoolBinding<dash::coin::p2p::CoinClient<dash::Config>>
+        cmpct_mempool_binding;
+    if (coin_p2p)
+        cmpct_mempool_binding.bind(coin_p2p, node_coin_state.mempool());
     // #107 PHASE 2 (--embedded-accrue-asset-locks): DEFAULT OFF. When ON the
     // embedded CbTx creditPoolBalance accrues the pending type-8 asset-lock term
     // dashd commits, so the gbt-xcheck-modulo-special-explained swap stops
@@ -5490,6 +5527,12 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // subscriptions -> lane -> maintainer -> header_chain.
     std::unique_ptr<dash::coin::MnCheckpointLane> mn_ckpt_lane;
     std::vector<std::shared_ptr<EventDisposable>> coin_feed_subs;
+    // #968a: the header chain the cmpctblock gate reads. Declared AFTER
+    // header_chain, so it is destroyed BEFORE it: the destructor takes the
+    // view out of coin_p2p (which can outlive this scope, see
+    // cmpct_mempool_binding above) while the chain is still alive.
+    dash::coin::CompactChainViewBinding<dash::coin::p2p::CoinClient<dash::Config>>
+        cmpct_chain_binding;
     // ── W2 replay bulk-fetch locals (--replay-bulk; replay_bulk_fetch.hpp) ──
     // Declared AFTER header_chain (they read it) so they unwind FIRST at
     // return; the timer is last so its callbacks stop before the lane dies.
@@ -6535,12 +6578,33 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                         return dash::coin::superblock_budget(
                             h, static_cast<int>(budget_cycle));
                     });
-                node_coin_state.set_superblock_provider(
-                    [maint = maintainer.get()](uint32_t next_height)
-                        -> std::optional<std::vector<dash::coin::SuperblockPayment>> {
-                        return maint->superblock_schedule(next_height);
+                // Tri-state verdict (Triggered / NotTriggered / Unknown + the
+                // gate that refused): a PROVEN-unfunded superblock height
+                // serves a normal coinbase; anything unprovable refuses with
+                // a distinct reason in the decline value.
+                node_coin_state.set_superblock_resolver(
+                    [maint = maintainer.get()](uint32_t next_height) {
+                        return maint->superblock_resolution(next_height);
                     });
                 node_coin_state.set_require_superblock_provider(embedded_superblock);
+                // C4: chainparams nSuperblockMaturityWindow (Dash Core v24
+                // chainparams.cpp: mainnet 1662, testnet 8) — the per-trigger
+                // vote re-sync fires at tip H - window and H - 1.
+                maintainer->set_superblock_maturity_window(
+                    testnet ? dash::coin::DASH_SUPERBLOCK_MATURITY_WINDOW_TESTNET
+                            : dash::coin::DASH_SUPERBLOCK_MATURITY_WINDOW_MAINNET);
+                // MAINNET GATE: NotTriggered is served on testnet; on mainnet
+                // only with the explicit opt-in flag (default OFF => Unknown
+                // "not-triggered-disabled" => refuse, master's behaviour).
+                maintainer->set_not_triggered_enabled(testnet || embedded_superblock_unfunded_mainnet);
+                if (!testnet && embedded_superblock_unfunded_mainnet)
+                    LOG_WARNING << "[E-SUPERBLOCK] --embedded-superblock-unfunded-mainnet SET "
+                                   "(TEST/SOAK ONLY — never on a production mainnet node): "
+                                   "this MAINNET node will serve a superblock height with a "
+                                   "NORMAL coinbase when it PROVES no trigger is funded (R5 "
+                                   "answered coverage from >= "
+                                << dash::coin::DASH_GOVSYNC_MIN_PEERS_DEFAULT
+                                << " peers + strict absence). A wrong proof loses the block.";
                 // R5 GOVSYNC-COMPLETENESS GATE (production wiring). Model:
                 // dashcore CMasternodeSync governance-phase completion — the
                 // view is COMPLETE only when the governance set was requested
@@ -6584,13 +6648,61 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 {
                     auto* ncs = &node_coin_state;
 
+                    // Tri-state signer resolution shared by the vote and the
+                    // C3 trigger-object verifier. "Current" = the DMN view has
+                    // folded the serve tip, so a collateral outpoint it cannot
+                    // resolve is one dashd's TIP list cannot resolve either
+                    // (=> Invalid, dashd parity); on a lagging view, or with
+                    // no BLS backend, nothing is concluded (=> CannotVerify:
+                    // held aside, and the superblock verdict it could affect
+                    // stays Unknown).
+                    using SigCheck = dash::coin::CoinStateMaintainer::GovSigCheck;
+                    auto check_operator_sig =
+                        [ncs](const uint256& op_hash, uint32_t op_index,
+                              const uint256& digest,
+                              const std::vector<uint8_t>& sig) -> SigCheck {
+                        // A BLS signature is 96 bytes; anything else (e.g. the
+                        // 65-byte ECDSA voting-key signature a PROPOSAL funding
+                        // vote carries) can never verify under an operator key
+                        // — dashd's SetBytes rejects it outright.
+                        if (sig.size() != 96) return SigCheck::Invalid;
+                        if (!dash::coin::vendor::bls_backend_available())
+                            return SigCheck::CannotVerify;
+                        const auto& mns = std::as_const(*ncs).mnstates();
+                        const bool current = ncs->prev_height() != 0 &&
+                            mns.last_applied_height() >= ncs->prev_height();
+                        // UNFILTERED (no PoSe-ban check) — dashcore
+                        // CGovernanceVote::IsValid / IsValidLocally resolve
+                        // via GetMNByCollateral, so a banned MN's signature
+                        // still verifies in dashd and must here too.
+                        bitcoin_family::coin::TxPrevOut op;
+                        op.hash  = op_hash;
+                        op.index = op_index;
+                        const dash::coin::MNState* mn =
+                            dash::coin::gov_mn_by_collateral(mns, op);
+                        if (!mn) return current ? SigCheck::Invalid
+                                                : SigCheck::CannotVerify;
+                        // The projection store holds every operator key
+                        // as canonical BASIC bytes (P-3): decode them as
+                        // basic, with no scheme fallback -- read as
+                        // legacy they can decode to -P and accept a
+                        // signature dashd rejects.
+                        if (dash::coin::vendor::verify_govvote_operator_sig(
+                                mn->pubKeyOperator, /*key_legacy_scheme=*/false,
+                                digest, sig, /*pubkey_scheme_fallback=*/false))
+                            return SigCheck::Valid;
+                        // A stale view may hold a pre-ProUpRegTx operator key.
+                        return current ? SigCheck::Invalid : SigCheck::CannotVerify;
+                    };
+
                     // Vote-signature verifier — dashcore CGovernanceVote::
                     // CheckSignature over the MN's OPERATOR key (TRIGGER funding
                     // votes; the ECDSA voting-key path is PROPOSAL-only and NOT
                     // used here). Plus the IsValid time bound (nTime <= now+1h).
-                    maintainer->set_vote_verifier(
-                        [ncs](const dash::coin::CoinStateMaintainer::GovVoteContext& v)
-                            -> bool {
+                    maintainer->set_vote_check(
+                        [check_operator_sig](
+                            const dash::coin::CoinStateMaintainer::GovVoteContext& v)
+                            -> SigCheck {
                             // dashcore IsValid: reject a vote timestamped more
                             // than an hour into the future (clock-skew bound).
                             // KNOWN NIT (documented, not fixed): dashcore uses
@@ -6601,29 +6713,26 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                             // skew of the +1h edge; NTP-disciplined hosts make
                             // it negligible. Revisit if soak shows drift.
                             if (v.time > static_cast<int64_t>(std::time(nullptr)) + 60 * 60)
-                                return false;
-                            // Resolve collateral outpoint -> DMN -> operator
-                            // key. UNFILTERED (no PoSe-ban check) — dashcore
-                            // CGovernanceVote::IsValid resolves via
-                            // GetMNByCollateral, so a banned MN's vote still
-                            // verifies in dashd and must here too (dropping a
-                            // banned MN's NO inflates our yes−no vs dashd).
-                            bitcoin_family::coin::TxPrevOut op;
-                            op.hash  = v.mn_outpoint_hash;
-                            op.index = v.mn_outpoint_index;
-                            const dash::coin::MNState* mn =
-                                dash::coin::gov_mn_by_collateral(
-                                    ncs->mnstates(), op);
-                            if (!mn) return false;           // MN not in DMN list
-                            // The projection store holds every operator key
-                            // as canonical BASIC bytes (P-3): decode them as
-                            // basic, with no scheme fallback -- read as
-                            // legacy they can decode to -P and accept a vote
-                            // signed with -sk that dashd rejects.
-                            return dash::coin::vendor::verify_govvote_operator_sig(
-                                mn->pubKeyOperator, /*key_legacy_scheme=*/false,
-                                v.vote_hash, v.vch_sig,
-                                /*pubkey_scheme_fallback=*/false);
+                                return SigCheck::Invalid;
+                            return check_operator_sig(v.mn_outpoint_hash,
+                                                      v.mn_outpoint_index,
+                                                      v.vote_hash, v.vch_sig);
+                        });
+
+                    // C3 — TRIGGER-object signature (dashcore IsValidLocally,
+                    // Dash Core v24 governance/object.cpp:746-761): the MN named
+                    // by the object's collateral outpoint must be in the tip
+                    // list and the object must verify under its OPERATOR key
+                    // over CGovernanceObject::GetSignatureHash (object.cpp
+                    // 551-575; govobject_signature_hash). Unverified triggers
+                    // are never stored.
+                    maintainer->set_object_verifier(
+                        [check_operator_sig](
+                            const dash::coin::CoinStateMaintainer::GovObjectContext& o)
+                            -> SigCheck {
+                            return check_operator_sig(o.mn_outpoint_hash,
+                                                      o.mn_outpoint_index,
+                                                      o.sig_hash, o.vch_sig);
                         });
 
                     // Vote-weight + membership-at-tally — dashcore
@@ -6636,9 +6745,30 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     // SAME live DMN view.
                     maintainer->gov_store().set_vote_weight_fn(
                         [ncs](const std::string& key) -> int {
+                            // Const view: a read must not bump the D2 root-memo
+                            // epoch (the tally now also runs inside the
+                            // template build via the tri-state resolver).
                             return dash::coin::gov_vote_weight_for_key(
-                                ncs->mnstates(), key);
+                                std::as_const(*ncs).mnstates(), key);
                         });
+
+                    // MED-4 RemoveInvalidVotes parity: a stored vote counts
+                    // only while the voter's CURRENT operator key is the one it
+                    // verified under (a ProUpRegTx key change or removal from
+                    // the list drops it in dashd, governance.cpp:1180-1226).
+                    maintainer->gov_store().set_signer_fp_fn(
+                        [ncs](const std::string& key) -> std::optional<uint256> {
+                            return dash::coin::gov_operator_fp_for_key(
+                                std::as_const(*ncs).mnstates(), key);
+                        });
+
+                    // LOW-6: "the DMN view has folded the serve tip" — held
+                    // startup-window trigger records are re-fetched once true.
+                    maintainer->set_gov_view_current_fn([ncs]() {
+                        const auto& mns = std::as_const(*ncs).mnstates();
+                        return ncs->prev_height() != 0 &&
+                               mns.last_applied_height() >= ncs->prev_height();
+                    });
                 }
 
                 // Reconciled log (R5 completeness gate + R3 vote-verify both wired).
@@ -6654,10 +6784,12 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                              << (dash::coin::vendor::bls_backend_available()
                                      ? "BLS backend ON"
                                      : "BLS backend ABSENT => votes never verify")
-                             << "). Serve stays CLOSED until the completeness "
-                                "predicate proves complete (single peer / empty store "
-                                "=> FALSE) and a funded soak clears -- R3 vote-verify "
-                                "landing here cannot by itself open it.";
+                             << "). Tri-state verdict: Triggered pays the exact "
+                                "trigger, NotTriggered (normal coinbase) only when PROVEN "
+                                "(R5 complete + no stored/held/orphan-voted trigger at H "
+                                "+ C3 trigger signatures verified), anything else refuses "
+                                "with a named reason. A single peer can never prove "
+                                "completeness (R5 floor is not lowered).";
             }
         }
 
@@ -7825,6 +7957,12 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // Node::block_connected, driving leg 3 + the E2b UTXO lane.
         coin_feed_subs.push_back(
             dash::coin::wire_full_block_ingest(coin_state, *header_chain));
+        // #968a: BIP 152 compact blocks need the header chain (the cmpctblock
+        // gate: parent known, PoW, header connected before the body) and the
+        // mempool (short ids, bound above). With both wired, a new tip body is
+        // requested as MSG_CMPCT_BLOCK and up to three peers that served us
+        // tips are asked to push cmpctblock (p2p_client.hpp).
+        cmpct_chain_binding.bind(coin_p2p, *header_chain);
 
         // ── PR-C1 (embedded-fold-live) LIVE tip-tracking wiring ──────────────
         // Armed only when --embedded-fold-live opened + VERIFIED a store above.
@@ -8776,6 +8914,35 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             [maint = maintainer.get()](const std::string& pk) {
                 maint->note_govsync_requested(pk);
             });
+
+        // E-SUPERBLOCK C4: the maintainer re-requests each held trigger's
+        // votes at tip H - maturity window and H - 1 (per-object govsync with
+        // a non-empty filter — never the nProp=0 full sync) and fetches the
+        // parent object of any orphan FUNDING YES vote. The client enforces
+        // the once-per-(peer, object) window dashd v24 tracks as a fulfilled
+        // request (repeat => Misbehaving(20)): nFulfilledRequestExpireTime is
+        // 3600 s on mainnet and 300 s on testnet (chainparams.cpp), + margin.
+        coin_p2p->set_govsync_votes_resync_secs(testnet ? 360 : 3660);
+        // R5 coverage = ANSWERED peers only (ssc(GOVOBJ) + every announced
+        // object received), never "requested".
+        coin_p2p->set_on_govsync_coverage(
+            [maint = maintainer.get()](const std::string& pk, bool covered) {
+                if (covered) maint->note_govsync_answered(pk);
+                else         maint->note_govsync_unanswered(pk);
+            });
+        if (embedded_govsync || embedded_superblock) {
+            // Leg B fresh nProp=0 re-prime inside the maturity window (the
+            // client keeps it to at most once per hour per peer).
+            maintainer->set_on_gov_reprime(
+                [cp = coin_p2p.get(), maint = maintainer.get()]() {
+                    for (const auto& pk : cp->send_govsync_prime())
+                        maint->note_govsync_requested(pk);
+                });
+            maintainer->set_on_trigger_vote_resync(
+                [cp = coin_p2p.get()](const uint256& h) { cp->send_govsync(h); });
+            maintainer->set_on_gov_object_fetch(
+                [cp = coin_p2p.get()](const uint256& h) { cp->send_govobject_fetch(h); });
+        }
 
         // Kick the initial sync once the version/verack handshake completes:
         // getheaders off our current locator + a mempool prime.
@@ -11577,7 +11744,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         *diag_tick = [diag_timer, diag_tick, ticks, diag_mi, embed_shape,
                       embed_since, embed_last, &node_coin_state, &maintainer,
                       dml_lanes, &utxo_lane,
-                      &header_chain, &mn_ckpt_lane,
+                      &header_chain, &mn_ckpt_lane, &coin_p2p,
                       ws_ri = work_source.get(), &stratum_server](
                          const boost::system::error_code& ec) {
             if (ec) return;   // cancelled at shutdown
@@ -11709,8 +11876,46 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                         << (maintainer
                                 ? (maintainer->gov_sync_complete() ? 1 : 0)
                                 : 0)
+                        // Governance stream volume (R5 quiescence inputs) and
+                        // the C2/C3 held-aside state: objects/votes received,
+                        // triggers rejected for a bad masternode signature,
+                        // records blocking a verdict (unparsed / pending /
+                        // store-full / orphan-YES parents), signatures not yet
+                        // checkable, orphan votes buffered.
+                        << " gov_objects="
+                        << (maintainer ? maintainer->gov_sync_status().object_count() : 0)
+                        << " gov_votes="
+                        << (maintainer ? maintainer->gov_sync_status().vote_count() : 0)
+                        << " gov_trig_rejected="
+                        << (maintainer ? maintainer->gov_triggers_rejected() : 0)
+                        << " gov_outstanding="
+                        << (maintainer ? maintainer->gov_store().outstanding_count() : 0)
+                        << " gov_pending="
+                        << (maintainer ? maintainer->gov_pending_objects() : 0)
+                        << " gov_unverif_votes="
+                        << (maintainer ? maintainer->gov_unverifiable_votes() : 0)
+                        << " gov_orphan_votes="
+                        << (maintainer ? maintainer->gov_orphan_votes() : 0)
+                        << " gov_latch="
+                        << (maintainer ? (maintainer->gov_desync_latched() ? 1 : 0) : 0)
                         << " trigger=" << (changed ? "shape-change" : "heartbeat")
                         << " suppressed=" << *embed_since;
+                    // Governance ingest companion line (same cadence): what
+                    // the peers announced and what we pulled, plus the
+                    // superblock verdict reason for the next height when it is
+                    // a superblock height (grep-provable on the soak).
+                    if (coin_p2p)
+                        LOG_INFO << coin_p2p->gov_ingest_status()
+                                 << " vote_resync_skipped="
+                                 << coin_p2p->govsync_votes_skipped()
+                                 << " not_triggered_served_h="
+                                 << (maintainer
+                                         ? maintainer->gov_not_triggered_served_height()
+                                         : 0u)
+                                 << " latch_reason="
+                                 << (maintainer && maintainer->gov_desync_latched()
+                                         ? maintainer->gov_desync_reason()
+                                         : std::string("none"));
                     *embed_shape = shape.str();
                     *embed_last  = now;
                     *embed_since = 0;
@@ -12360,6 +12565,7 @@ int main(int argc, char** argv)
     bool embedded_superblock = false;
     bool embedded_superblock_off = false;      // --embedded-superblock=false
     bool allow_stub_bls = false;               // --allow-stub-bls (#1671): run a bls=stub build knowingly in a BLS-relying config
+    bool embedded_superblock_unfunded_mainnet = false; // --embedded-superblock-unfunded-mainnet: explicit mainnet NotTriggered opt-in (default OFF)
     bool embedded_govsync = false;             // --embedded-govsync: OBSERVE-ONLY arm of the governance sourcing lane (inv 17/18 pull + store populate); default OFF; does NOT arm serving (that is --embedded-superblock)
     std::string stratum_host = "0.0.0.0";      // --stratum [HOST:]PORT bind interface (default all)
     uint16_t    stratum_port = 0;              // 0 disables the Stratum accept-loop; --stratum sets it
@@ -12629,6 +12835,8 @@ int main(int argc, char** argv)
             allow_stub_bls = true;                  // #1671: run bls=stub knowingly (see the refuse-to-start gate before run_node)
         else if (std::strcmp(argv[i], "--embedded-govsync") == 0)
             embedded_govsync = true;
+        else if (std::strcmp(argv[i], "--embedded-superblock-unfunded-mainnet") == 0)
+            embedded_superblock_unfunded_mainnet = true;
         else if (std::strcmp(argv[i], "--embedded-utxo") == 0)
             embedded_utxo = true;
         else if (std::strcmp(argv[i], "--embedded-utxo=false") == 0)
@@ -12708,6 +12916,14 @@ int main(int argc, char** argv)
             dash::coin::set_embedded_getmnlistd_tracker_enabled(true);
         else if (std::strcmp(argv[i], "--embedded-getmnlistd-tracker=false") == 0)
             dash::coin::set_embedded_getmnlistd_tracker_enabled(false);
+        // #968a --embedded-compact-blocks[=false] (default ON): ask for a new
+        // tip body as getdata(MSG_CMPCT_BLOCK) and rebuild it from the mempool.
+        // =false is the canary kill switch: every body is fetched whole, any
+        // cmpctblock is dropped. Process-wide flag (compact_negotiation.hpp).
+        else if (std::strcmp(argv[i], "--embedded-compact-blocks") == 0)
+            dash::coin::set_embedded_compact_blocks_enabled(true);
+        else if (std::strcmp(argv[i], "--embedded-compact-blocks=false") == 0)
+            dash::coin::set_embedded_compact_blocks_enabled(false);
         else if (std::strcmp(argv[i], "--embedded-asn-diversity") == 0)
             embedded_asn_diversity = true;   // PR-4: require racing set to span >=2 ASNs
         else if (std::strcmp(argv[i], "--embedded-asn-diversity=false") == 0)
@@ -13527,7 +13743,8 @@ int main(int argc, char** argv)
                         embedded_utxo_fold_fees_db,    // W5-A fold fee source
                         embedded_utxo_fold_expect,     // W5-A anchor restatement
                         explorer_enabled,             // /api/explorer surface (default ON)
-                        embedded_include_mn_special_txs); // special-tx superset (DIP types 1-4)
+                        embedded_include_mn_special_txs, // special-tx superset (DIP types 1-4)
+                        embedded_superblock_unfunded_mainnet); // explicit mainnet NotTriggered opt-in
     }
     return run_selftest();
 }

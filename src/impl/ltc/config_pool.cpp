@@ -37,7 +37,12 @@ void PoolConfig::load()
     if (node["bootstrap_addrs"] && node["bootstrap_addrs"].IsSequence())
     {
         for (const auto& item : node["bootstrap_addrs"])
-            m_bootstrap_addrs.emplace_back(item.as<std::string>());
+        {
+            const auto addr = item.as<std::string>();
+            if (is_foreign_chain_host(addr))
+                continue;   // another share chain: never dial it from the saved list
+            m_bootstrap_addrs.emplace_back(addr);
+        }
     }
     else
     {

@@ -2014,18 +2014,45 @@ TEST(DashMempool, MnhfSignalAutoPrioritiseSortsToTopButFeeStaysBase)
     EXPECT_EQ(en->modified_fee(), 50'000u)
         << "ordinary tx carries NO auto-delta (modified == base)";
 
-    // Template-level: the EHF signal sorts to the TOP despite its lower base
-    // feerate, and the coinbase-facing fee accounting excludes the delta.
+    // Template-level. Selection takes a type-7 tx only in the shape Dash
+    // Core's signer builds, with no inputs and no outputs
+    // (MNHFTxPayload::PrepareTx): this fee-bearing one stays in the pool but
+    // never rides, since the builder refuses signals one by one and a child of
+    // a refused signal with an output would be orphaned.
+    {
+        auto [sel, total_fees] = mp.get_sorted_txs_with_fees(1u << 20);
+        ASSERT_EQ(sel.size(), 1u);
+        EXPECT_EQ(dash_txid(sel[0].tx), norm_id);
+        EXPECT_EQ(total_fees, 50'000u);
+    }
+
+    // A signal of Core's shape: the EHF signal sorts to the TOP despite its
+    // lower base feerate, and the coinbase-facing fee accounting excludes the
+    // delta.
+    MutableTransaction sig;
+    sig.version = 3;
+    sig.type    = 7;
+    {
+        dash::coin::vendor::MNHFTxPayload pl;
+        pl.signal.versionBit = 13;
+        ::PackStream ps;
+        ps << pl;
+        const auto sp = ps.get_span();
+        const auto* d = reinterpret_cast<const unsigned char*>(sp.data());
+        sig.extra_payload.assign(d, d + sp.size());
+    }
+    ASSERT_TRUE(mp.add_tx(sig));
+    const uint256 sig_id = dash_txid(sig);
     auto [sel, total_fees] = mp.get_sorted_txs_with_fees(1u << 20);
     ASSERT_EQ(sel.size(), 2u);
-    EXPECT_EQ(dash_txid(sel[0].tx), mnhf_id)
+    EXPECT_EQ(dash_txid(sel[0].tx), sig_id)
         << "MNHF/EHF signal must be first — the auto-prioritise delta outranks "
            "a higher-base-fee ordinary tx (RED on master without the delta)";
     EXPECT_EQ(dash_txid(sel[1].tx), norm_id);
     // SelectedTx.fee and total_fees are BASE fees (dashd AddToBlock nFees +=
     // GetFee(), never the modified fee) — the delta must not inflate coinbase.
-    EXPECT_EQ(sel[0].fee, 1'000u)   << "served fee for the EHF tx is its base fee";
-    EXPECT_EQ(total_fees, 51'000u)
+    EXPECT_EQ(sel[0].fee, 0u)   << "served fee for the EHF tx is its base fee";
+    EXPECT_EQ(total_fees, 50'000u)
         << "total_fees → coinbasevalue sums BASE fees only; the 0.1 COIN "
            "prioritise delta must NEVER enter the coinbase (reward-safety)";
 }

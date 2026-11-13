@@ -15,6 +15,12 @@
 /// store from the network in seconds. (Contrast E3's SMLDb/QuorumDb, which
 /// persist per-block-mutating consensus state to avoid a cold ~450 kB re-pull.)
 ///
+/// TRI-STATE (C1/C2/C3): besides the funded-winner selection the store keeps
+/// what makes "NOT triggered at H" provable or not — triggers we could not
+/// admit (unparsed / store-full / signature not yet checkable / parents known
+/// only through an orphan YES vote), votes we could not verify, and executed-
+/// trigger history. superblock.hpp resolve_superblock_payments reads them.
+///
 /// FAIL-CLOSED DISCIPLINE (E1/E2 parity): a trigger is only ELIGIBLE to back a
 /// superblock template when its WEIGHTED funding-signal absolute-yes tally
 /// reaches the network funding threshold AND every counted vote was
@@ -32,9 +38,12 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
+#include <deque>
 #include <functional>
 #include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -75,7 +84,48 @@ struct GovFundingVote {
                                          // a newer NONE replaces a stored YES,
                                          // dropping the yes-count)
     int64_t timestamp{0};                // newer replaces older
+    uint256 signer_fp;                   // operator-key fingerprint the vote
+                                         // verified under (null = unrecorded)
 };
+
+/// dashd's std::map<uint256, ...> iteration order: base_blob::Compare is a
+/// memcmp over the 32 raw (internal, little-endian) bytes — NOT the
+/// arithmetic order c2pool's uint256::operator< uses (most-significant word
+/// first). SuperblockManager::GetBestSuperblockInternal (superblock.cpp
+/// 523-542) keeps the FIRST maximum in that order (strict '>'), so a tie
+/// between equally-voted triggers resolves to the memcmp-smallest hash.
+inline bool gov_hash_less_dashd(const uint256& a, const uint256& b)
+{
+    return std::memcmp(a.data(), b.data(), 32) < 0;
+}
+
+/// C2/C3 — a TRIGGER-type governance object we could NOT admit to the
+/// trigger map but whose existence makes "no trigger is funded at H"
+/// unprovable. Any record that applies to H turns the superblock verdict at
+/// H into Unknown (refuse) for BOTH the triggered and the unfunded path: the
+/// object we could not hold may be the network's winner.
+enum class GovOutstandingKind : uint8_t {
+    Unparsed,          // MN signature verified, schedule parse failed (our
+                       // parser is narrower than dashd's in places)
+    StoreFull,         // verified + parsed, dropped at MAX_TRIGGERS
+    UnverifiedPending, // signature not checkable yet (MN not in a current DMN
+                       // view / no BLS backend) — retried, never stored
+    OrphanYesVote,     // a VERIFIED operator-key FUNDING YES vote whose parent
+                       // trigger we do not hold (withheld / rejected by us /
+                       // not yet arrived) — real masternodes only vote YES on
+                       // triggers dashd accepted
+};
+
+inline const char* gov_outstanding_reason(GovOutstandingKind k)
+{
+    switch (k) {
+        case GovOutstandingKind::Unparsed:          return "trigger-unparsed";
+        case GovOutstandingKind::StoreFull:         return "trigger-store-full";
+        case GovOutstandingKind::UnverifiedPending: return "trigger-unverified-pending";
+        case GovOutstandingKind::OrphanYesVote:     return "trigger-orphan-votes";
+    }
+    return "trigger-outstanding";
+}
 
 class GovernanceStore {
 public:
@@ -83,6 +133,16 @@ public:
     /// of competing triggers per cycle (typically 1-3); a peer streaming more
     /// than this is hostile or broken, and an unbounded map is a memory bomb.
     static constexpr size_t MAX_TRIGGERS = 64;
+    /// Bound on outstanding (non-admitted) trigger records. Overflow is
+    /// itself a blocker until the cycle prunes (fail closed).
+    static constexpr size_t MAX_OUTSTANDING = 1024;
+    /// Bound on votes we could not verify yet (per parent, any outcome).
+    /// Overflow is a blocker for every height until the cycle prunes.
+    static constexpr size_t MAX_UNVERIFIABLE_VOTES = 8192;
+    /// Hashes of triggers pruned as executed/expired (dashd keeps them in
+    /// mapErasedGovernanceObjects): a re-synced copy or a late vote for one
+    /// of them is history, not a competitor. Oldest-first eviction.
+    static constexpr size_t MAX_ERASED = 1024;
 
     /// Network funding threshold — the WEIGHTED absolute-yes count a trigger's
     /// funding tally must reach to be considered triggered. Derive it with
@@ -113,6 +173,19 @@ public:
     /// try to fake it from the SML alone.
     void set_vote_weight_fn(std::function<int(const std::string&)> fn) {
         m_vote_weight_fn = std::move(fn);
+    }
+
+    /// RemoveInvalidVotes parity (Dash Core v24 governance.cpp:1180-1226 +
+    /// votedb.cpp:81-101): when a masternode's operator (or voting) key
+    /// changes, or it leaves the list, dashd re-checks its stored votes
+    /// against the TIP list and drops every one that no longer verifies — for
+    /// a trigger funding vote, one signed under the old operator key. This
+    /// seam returns the CURRENT operator-key fingerprint for an outpoint key
+    /// (nullopt = not in the list); a stored vote counts only while it still
+    /// equals the fingerprint the vote verified under. Unset => not enforced
+    /// (KATs); main_dash wires it.
+    void set_signer_fp_fn(std::function<std::optional<uint256>(const std::string&)> fn) {
+        m_signer_fp_fn = std::move(fn);
     }
 
     /// Ingest a parsed superblock trigger (from a govobj MNGOVERNANCEOBJECT of
@@ -164,7 +237,18 @@ public:
                 outcome < it->second.outcome)
                 return;
         }
-        per_obj[mn_outpoint_key] = GovFundingVote{outcome, timestamp};
+        uint256 fp;
+        if (m_signer_fp_fn) {
+            if (auto cur = m_signer_fp_fn(mn_outpoint_key)) fp = *cur;
+        }
+        per_obj[mn_outpoint_key] = GovFundingVote{outcome, timestamp, fp};
+        // A verified vote from this voter supersedes an earlier unverifiable
+        // one (the voter is now resolvable).
+        auto uit = m_unverifiable.find(parent_hash);
+        if (uit != m_unverifiable.end() && uit->second.erase(mn_outpoint_key)) {
+            if (m_unverifiable_total > 0) --m_unverifiable_total;
+            if (uit->second.empty()) m_unverifiable.erase(uit);
+        }
     }
 
     /// dashcore CGovernanceObject::GetAbsoluteYesCount(VOTE_SIGNAL_FUNDING) ==
@@ -180,6 +264,7 @@ public:
         if (it == m_funding_votes.end()) return 0;
         int yes = 0, no = 0;
         for (const auto& [k, v] : it->second) {
+            if (!vote_still_valid(k, v)) continue; // RemoveInvalidVotes parity
             const int w = m_vote_weight_fn ? m_vote_weight_fn(k) : 0;
             if (w <= 0) continue;                 // not in valid set / seam unset
             if (v.outcome == VOTE_OUTCOME_YES) yes += w;
@@ -194,14 +279,19 @@ public:
         return static_cast<bool>(get_best_superblock(height));
     }
 
-    /// dashcore CSuperblockManager::GetBestSuperblock(height): among the
-    /// triggers that (a) pay THIS height and (b) reached the funding threshold,
-    /// return the one with the highest absolute-yes tally. Deterministic
-    /// tie-break: lowest object hash (dashcore GetBestSuperblockInternal keeps
-    /// the first max in ascending-hash map order — strict '>' — which is the
-    /// lowest hash among equals, so all nodes converge on the same winner).
-    /// nullopt when none qualifies — i.e. the height is unfunded OR our view
-    /// is not yet trigger-confident.
+    /// dashcore SuperblockManager::GetBestSuperblockInternal (Dash Core v24
+    /// governance/superblock.cpp:523-542) as reached through
+    /// IsSuperblockTriggered: dashd picks the max-absolute-yes trigger at the
+    /// height among ALL triggers there, and IsSuperblockTriggered only lets a
+    /// superblock exist when some trigger reached the threshold — so the
+    /// winner is the max-yes trigger, which is necessarily >= threshold. We
+    /// restrict the scan to >= threshold candidates: same max, same set of
+    /// ties. Tie-break: the FIRST maximum in dashd's std::map order — memcmp
+    /// over the raw hash bytes (gov_hash_less_dashd), NOT uint256::operator<
+    /// (arithmetic order), which would pick a different winner on a tie.
+    /// nullopt when none qualifies — the height is not triggered in OUR view
+    /// (which, alone, proves nothing about the network: see ambiguous_at()
+    /// and outstanding_blocker()).
     std::optional<GovernanceTrigger> get_best_superblock(int32_t height) const {
         if (m_funding_threshold <= 0) return std::nullopt; // unknown => fail closed
         const GovernanceTrigger* best = nullptr;
@@ -211,7 +301,8 @@ public:
             int yes = absolute_yes_count(hash);
             if (yes < m_funding_threshold) continue;       // not triggered
             if (yes > best_yes ||
-                (yes == best_yes && best && hash < best->object_hash)) {
+                (yes == best_yes && best &&
+                 gov_hash_less_dashd(hash, best->object_hash))) {
                 best = &trig;
                 best_yes = yes;
             }
@@ -220,30 +311,232 @@ public:
         return *best;
     }
 
+    // ── C1: STRICT ABSENCE — may "not triggered at H" be asserted at all? ───
+
+    /// Why "not triggered at `height`" can NOT be asserted from the stored
+    /// triggers, or nullopt when no trigger for the height is held at all.
+    /// Called only when no trigger at H reached the threshold. dashd's
+    /// IsSuperblockTriggered is a pure function of the trigger set + tally,
+    /// and our copy of the tally can lag or be partial (votes not yet
+    /// streamed, YES votes withheld by a peer while NO votes arrive), so a
+    /// stored trigger at H — whatever its visible votes — makes the unfunded
+    /// verdict unprovable. (dashd's trigger creator always votes YES on the
+    /// trigger it supports, governance/signing.cpp VoteGovernanceTriggers, so
+    /// an honestly voted-down trigger is rare; refusing it is the cheap side.)
+    std::optional<std::string> ambiguous_at(int32_t height) const {
+        for (const auto& [hash, trig] : m_triggers)
+            if (trig.event_block_height == height) return std::string("trigger-present");
+        return std::nullopt;
+    }
+
+    /// Any stored trigger at `height` carrying a vote we could not verify:
+    /// its true tally is unknown, so it may out-vote (or be) the winner.
+    /// Blocks BOTH verdicts.
+    bool unverified_votes_at(int32_t height) const {
+        for (const auto& [hash, trig] : m_triggers)
+            if (trig.event_block_height == height && unverifiable_vote_count(hash) > 0)
+                return true;
+        return false;
+    }
+
+    // ── C2/C3: outstanding (non-admitted) trigger objects ──────────────────
+
+    /// Record a trigger-type object we could not admit. `event_height` is the
+    /// parsed superblock height, or 0 when unknown (an unparseable object, an
+    /// orphan vote's parent) => blocks EVERY height of the current cycle
+    /// until prune_cycle(). Idempotent per hash (the newest kind wins).
+    /// Overflow (MAX_OUTSTANDING) is itself a cycle-wide blocker.
+    void note_outstanding(const uint256& hash, GovOutstandingKind kind,
+                          int32_t event_height) {
+        auto it = m_outstanding.find(hash);
+        if (it == m_outstanding.end() && m_outstanding.size() >= MAX_OUTSTANDING) {
+            m_outstanding_overflow = true;
+            return;
+        }
+        m_outstanding[hash] = Outstanding{kind, event_height};
+    }
+    void clear_outstanding(const uint256& hash) { m_outstanding.erase(hash); }
+    bool is_outstanding(const uint256& hash) const { return m_outstanding.count(hash) != 0; }
+    std::optional<GovOutstandingKind> outstanding_kind(const uint256& hash) const {
+        auto it = m_outstanding.find(hash);
+        if (it == m_outstanding.end()) return std::nullopt;
+        return it->second.kind;
+    }
+    size_t outstanding_count() const { return m_outstanding.size(); }
+    bool outstanding_overflow() const { return m_outstanding_overflow; }
+
+    /// The first outstanding record that applies to `height` (its own height,
+    /// or unknown-height => cycle-wide), as a stable refusal token.
+    std::optional<std::string> outstanding_blocker(int32_t height) const {
+        if (m_outstanding_overflow) return std::string("trigger-outstanding-overflow");
+        if (m_unverifiable_overflow) return std::string("trigger-unverified-votes");
+        for (const auto& [hash, rec] : m_outstanding) {
+            if (rec.event_height == 0 || rec.event_height == height)
+                return std::string(gov_outstanding_reason(rec.kind));
+        }
+        return std::nullopt;
+    }
+
+    /// Hashes of the stored triggers paying `height` (C4 vote re-sync).
+    std::vector<uint256> trigger_hashes_at(int32_t height) const {
+        std::vector<uint256> out;
+        for (const auto& [hash, trig] : m_triggers)
+            if (trig.event_block_height == height) out.push_back(hash);
+        return out;
+    }
+    /// Parents recorded only through an orphan YES vote (fetch candidates).
+    std::vector<uint256> orphan_yes_parents() const {
+        return outstanding_hashes(GovOutstandingKind::OrphanYesVote);
+    }
+    std::vector<uint256> outstanding_hashes(GovOutstandingKind kind) const {
+        std::vector<uint256> out;
+        for (const auto& [hash, rec] : m_outstanding)
+            if (rec.kind == kind) out.push_back(hash);
+        return out;
+    }
+
+    /// A vote on `parent_hash` whose signature could not be checked yet
+    /// (voter not in a current DMN view, or no BLS backend). Kept per voter
+    /// until a verified vote from the same voter replaces it or the parent is
+    /// pruned. Any such vote on a trigger at H keeps H Unknown.
+    void note_unverifiable_vote(const uint256& parent_hash,
+                                const std::string& mn_outpoint_key) {
+        auto it = m_unverifiable.find(parent_hash);
+        if (it != m_unverifiable.end() && it->second.count(mn_outpoint_key)) return;
+        if (m_unverifiable_total >= MAX_UNVERIFIABLE_VOTES) {
+            m_unverifiable_overflow = true;
+            return;
+        }
+        m_unverifiable[parent_hash].insert(mn_outpoint_key);
+        ++m_unverifiable_total;
+    }
+    /// The held vote turned out INVALID on retry (forged / wrong key): it no
+    /// longer clouds the tally.
+    void clear_unverifiable_vote(const uint256& parent_hash,
+                                 const std::string& mn_outpoint_key) {
+        auto it = m_unverifiable.find(parent_hash);
+        if (it == m_unverifiable.end() || !it->second.erase(mn_outpoint_key)) return;
+        if (m_unverifiable_total > 0) --m_unverifiable_total;
+        if (it->second.empty()) m_unverifiable.erase(it);
+    }
+    size_t unverifiable_vote_count(const uint256& parent_hash) const {
+        auto it = m_unverifiable.find(parent_hash);
+        return it == m_unverifiable.end() ? 0 : it->second.size();
+    }
+    size_t unverifiable_vote_total() const { return m_unverifiable_total; }
+
+    /// Executed/expired trigger history (see MAX_ERASED).
+    bool is_erased(const uint256& hash) const { return m_erased.count(hash) != 0; }
+    void note_erased(const uint256& hash) {
+        if (!m_erased.insert(hash).second) return;
+        m_erased_order.push_back(hash);
+        while (m_erased_order.size() > MAX_ERASED) {
+            m_erased.erase(m_erased_order.front());
+            m_erased_order.pop_front();
+        }
+    }
+
     /// Drop triggers/votes for heights at or below `executed_height` — dashcore
-    /// erases executed triggers. Keeps the store bounded across cycles.
-    /// CoinStateMaintainer calls this from the block-connect leg whenever a
-    /// superblock height is crossed.
+    /// erases executed triggers (SuperblockManager::Clean / IsExpired; dashd
+    /// keeps an EXECUTED trigger for one more cycle only to answer syncs,
+    /// superblock.cpp:338-372 — it can never pay a future height, because a
+    /// trigger pays exactly its event_block_height). Called from EVERY block
+    /// connect with the connected height, so a trigger re-synced after a
+    /// restart for an already-executed superblock is dropped on the next
+    /// block instead of sitting in the store until the next superblock.
+    /// Pruned hashes are remembered (note_erased) so their late votes are
+    /// history, not orphans. Height-bound outstanding records go too.
     void prune_executed(int32_t executed_height) {
         for (auto it = m_triggers.begin(); it != m_triggers.end();) {
             if (it->second.event_block_height <= executed_height) {
-                m_funding_votes.erase(it->first);
+                drop_votes_of(it->first);
+                note_erased(it->first);
                 it = m_triggers.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        for (auto it = m_outstanding.begin(); it != m_outstanding.end();) {
+            if (it->second.event_height != 0 &&
+                it->second.event_height <= executed_height) {
+                drop_votes_of(it->first);
+                note_erased(it->first);
+                it = m_outstanding.erase(it);
             } else {
                 ++it;
             }
         }
     }
 
-    void clear() { m_triggers.clear(); m_funding_votes.clear(); }
+    /// The superblock at `sb_height` has been connected: the cycle the
+    /// unknown-height records belonged to is over. Clears them and the
+    /// overflow latches (a fresh cycle re-proves itself from scratch).
+    void prune_cycle() {
+        for (auto it = m_outstanding.begin(); it != m_outstanding.end();) {
+            if (it->second.event_height == 0) {
+                drop_votes_of(it->first);
+                it = m_outstanding.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        m_outstanding_overflow = false;
+        if (m_unverifiable_overflow) {
+            m_unverifiable.clear();
+            m_unverifiable_total = 0;
+            m_unverifiable_overflow = false;
+        }
+    }
+
+    void clear() {
+        m_triggers.clear();
+        m_funding_votes.clear();
+        m_outstanding.clear();
+        m_outstanding_overflow = false;
+        m_unverifiable.clear();
+        m_unverifiable_total = 0;
+        m_unverifiable_overflow = false;
+    }
 
 private:
+    bool vote_still_valid(const std::string& key, const GovFundingVote& v) const {
+        if (!m_signer_fp_fn || v.signer_fp.IsNull()) return true;
+        const auto cur = m_signer_fp_fn(key);
+        return cur && *cur == v.signer_fp;
+    }
+
+    struct Outstanding {
+        GovOutstandingKind kind{GovOutstandingKind::Unparsed};
+        int32_t event_height{0};   // 0 = unknown => cycle-wide
+    };
+
+    void drop_votes_of(const uint256& hash) {
+        m_funding_votes.erase(hash);
+        auto it = m_unverifiable.find(hash);
+        if (it != m_unverifiable.end()) {
+            m_unverifiable_total -= std::min(m_unverifiable_total, it->second.size());
+            m_unverifiable.erase(it);
+        }
+    }
+
     std::map<uint256, GovernanceTrigger> m_triggers;
     // object hash -> (mn collateral-outpoint key -> latest verified funding vote)
     std::map<uint256, std::map<std::string, GovFundingVote>> m_funding_votes;
     int m_funding_threshold{0};  // 0 = unknown => fail closed
     // outpoint key -> current voting weight (0 = absent). Unset => fail closed.
     std::function<int(const std::string&)> m_vote_weight_fn;
+    // outpoint key -> current operator-key fingerprint (RemoveInvalidVotes).
+    std::function<std::optional<uint256>(const std::string&)> m_signer_fp_fn;
+    // C2/C3 non-admitted trigger objects (+ orphan-YES parents).
+    std::map<uint256, Outstanding> m_outstanding;
+    bool m_outstanding_overflow{false};
+    // parent hash -> voters whose vote could not be verified yet.
+    std::map<uint256, std::set<std::string>> m_unverifiable;
+    size_t m_unverifiable_total{0};
+    bool m_unverifiable_overflow{false};
+    // executed/expired trigger hashes (bounded, oldest evicted first).
+    std::set<uint256> m_erased;
+    std::deque<uint256> m_erased_order;
 };
 
 } // namespace coin

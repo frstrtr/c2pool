@@ -2136,6 +2136,17 @@ public:
         return m_pool.count(txid) > 0;
     }
 
+    /// The txids of `txids` the pool holds, read under one lock (one
+    /// consistent view for a whole template body).
+    std::set<uint256> contained(const std::set<uint256>& txids) const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        std::set<uint256> out;
+        for (const auto& id : txids)
+            if (m_pool.count(id) > 0) out.insert(id);
+        return out;
+    }
+
     size_t size() const
     {
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -2288,6 +2299,27 @@ public:
         std::map<uint256, MutableTransaction> out;
         for (const auto& [txid, e] : m_pool) out[txid] = e.tx;
         return out;
+    }
+
+    /// BIP 152 short-id walk (Dash Core PartiallyDownloadedBlock::InitData:
+    /// LOCK(pool->cs), then every pool->vTxHashes entry). Calls `fn` once per
+    /// pooled tx, under the pool lock, with the tx by reference: nothing is
+    /// copied here. The key is the INSTANCE hash Dash Core v24 keys vTxHashes
+    /// by (txmempool.cpp GetInstanceHash): the pool key (dash_txid) for every
+    /// tx except a version-2 asset unlock, whose stable txid zeroes the quorum
+    /// signing info and so differs from the instance hash. `fn` returns false
+    /// to stop the walk. It must not call back into this Mempool.
+    template <typename Fn>
+    void for_each_tx_by_instance_hash(Fn&& fn) const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        for (const auto& [txid, e] : m_pool) {
+            if (is_asset_unlock_with_stable_txid(e.tx)) {
+                if (!fn(dash_instance_hash(e.tx), e.tx)) return;
+            } else if (!fn(txid, e.tx)) {
+                return;
+            }
+        }
     }
 
     /// Phase C-TEMPLATE prerequisite — fee-aware tx selection.
@@ -2705,6 +2737,15 @@ public:
                 // for every type!=0; the partial embedded mask admits types
                 // 1-4, 7, 8 and (v24) 10-12, and 5/6/9 are never selected.
                 if (!special_mask.admits(e->tx.type)) { ok = false; break; }
+                // An MNHF signal rides only in the shape Dash Core's signer
+                // builds: no inputs and no outputs (MNHFTxPayload::PrepareTx,
+                // evo/mnhftx.cpp:37-45). CheckTransaction lets a type-7 tx
+                // carry both (consensus/tx_check.cpp:18-21), but a signal with
+                // an output can have an in-mempool child while the builder
+                // refuses signals one by one (mnhf_check.hpp). Dropping the
+                // member drops its package, so such a child never rides.
+                if (e->tx.type == vendor::MNHFTxPayload::SPECIALTX_TYPE
+                    && (!e->tx.vin.empty() || !e->tx.vout.empty())) { ok = false; break; }
                 // A type-8 lock rides only when it is a valid block member:
                 // the CheckAssetLockTx port of asset_lock_fold.hpp (version 1,
                 // P2PKH credit outputs, one `6a 00` marker equal to the

@@ -2614,3 +2614,103 @@ TEST(DashNodeCoinState, V24UnsetSeamFallsBackToTheNetworkAnswer) {
         EXPECT_TRUE(e.v24_active);
     }
 }
+
+// ── E-SUPERBLOCK: the pre-emit gate re-asserts the superblock VERDICT ────────
+// A template built while the superblock height was PROVEN unfunded carries no
+// treasury outputs; if the verdict moves before emit (a trigger crossed the
+// threshold, a schedule changed) the built treasury slice no longer matches
+// what dashd will demand (IsBlockValueValid / IsBlockPayeeValid, Dash Core v24
+// masternode/payments.cpp:313-388) and the template must be discarded.
+TEST(DashServeGateNamesRefusal, SuperblockVerdictDriftFailsPreEmit) {
+    using namespace dash::coin;
+    NodeCoinState st;
+    seed_healthy_armed(st);
+    SuperblockResolution verdict;
+    verdict.verdict = SuperblockVerdict::NotTriggered;
+    verdict.reason  = "not-triggered";
+    st.set_is_superblock_fn([](uint32_t next_h) { return next_h == H; });
+    st.set_superblock_resolver([&verdict](uint32_t) { return verdict; });
+    st.set_require_superblock_provider(true);
+    st.set_superblock_sync_complete_fn([]() { return true; });
+
+    // Proven unfunded: served, normal coinbase, and the template clears the
+    // gate's superblock checks. (The shared harness seeds a NULL bestCL
+    // signature — set_best_cl(H-1, {}) — so this baseline is stopped LATER in
+    // the gate by emit-bestcl-null-committed; the superblock checks run before
+    // it, so the drift assertions below are unaffected.)
+    WorkSelection sel = st.select_work([] { return DashWorkData{}; });
+    ASSERT_EQ(sel.source, WorkSource::Embedded) << st.describe_decline().value;
+    EXPECT_EQ(sel.work.m_tx_serve_stamp.superblock_total, 0u);
+    {
+        DeclineReport base;
+        const bool ok = st.embedded_template_emit_ok(sel.work, &base);
+        EXPECT_TRUE(ok || base.cause == "emit-bestcl-null-committed")
+            << "baseline must pass every superblock check; cause=" << base.cause;
+        EXPECT_EQ(base.cause.rfind("emit-superblock", 0), std::string::npos) << base.cause;
+    }
+
+    // The network's trigger gets funded before emit: discard, named.
+    verdict.verdict = SuperblockVerdict::Triggered;
+    verdict.reason  = "triggered";
+    SuperblockPayment sp;
+    sp.script = p2pkh_script(0x77);
+    sp.amount = 500'000'000;
+    verdict.payments = {sp};
+    DeclineReport why;
+    EXPECT_FALSE(st.embedded_template_emit_ok(sel.work, &why));
+    EXPECT_EQ(why.cause, "emit-superblock-drift");
+
+    // Unknown at emit time: discard with the verdict's own reason.
+    verdict = SuperblockResolution::unknown("trigger-ambiguous");
+    EXPECT_FALSE(st.embedded_template_emit_ok(sel.work, &why));
+    EXPECT_EQ(why.cause, "emit-superblock-refused");
+    EXPECT_EQ(why.value, "trigger-ambiguous");
+    // ...and viability names it the same way.
+    EXPECT_EQ(st.describe_decline().cause, "superblock-refused");
+    EXPECT_EQ(st.describe_decline().value, "trigger-ambiguous");
+}
+
+// LOW-7: the pre-emit gate compares the ORDERED superblock payee list, not
+// only the total — a same-total schedule in another order (or to another
+// payee) is a different block to dashd's CSuperblock::IsValid.
+TEST(DashServeGateNamesRefusal, SuperblockPayeeOrderDriftFailsPreEmit) {
+    using namespace dash::coin;
+    NodeCoinState st;
+    seed_healthy_armed(st);
+    SuperblockPayment a, b;
+    a.script = p2pkh_script(0x71); a.amount = 300'000'000;
+    b.script = p2pkh_script(0x72); b.amount = 200'000'000;
+    SuperblockResolution verdict;
+    verdict.verdict  = SuperblockVerdict::Triggered;
+    verdict.reason   = "triggered";
+    verdict.payments = {a, b};
+    st.set_is_superblock_fn([](uint32_t next_h) { return next_h == H; });
+    st.set_superblock_resolver([&verdict](uint32_t) { return verdict; });
+    st.set_require_superblock_provider(true);
+    st.set_superblock_sync_complete_fn([]() { return true; });
+
+    WorkSelection sel = st.select_work([] { return DashWorkData{}; });
+    ASSERT_EQ(sel.source, WorkSource::Embedded) << st.describe_decline().value;
+    EXPECT_EQ(sel.work.m_tx_serve_stamp.superblock_total, 500'000'000u);
+    {
+        DeclineReport base;
+        st.embedded_template_emit_ok(sel.work, &base);
+        EXPECT_EQ(base.cause.rfind("emit-superblock", 0), std::string::npos) << base.cause;
+    }
+    // Same total, swapped order => drift.
+    verdict.payments = {b, a};
+    DeclineReport why;
+    EXPECT_FALSE(st.embedded_template_emit_ok(sel.work, &why));
+    EXPECT_EQ(why.cause, "emit-superblock-drift");
+    // Same total and order but another payee => drift.
+    SuperblockPayment c = a;
+    c.script = p2pkh_script(0x73);
+    verdict.payments = {c, b};
+    EXPECT_FALSE(st.embedded_template_emit_ok(sel.work, &why));
+    EXPECT_EQ(why.cause, "emit-superblock-drift");
+    // The schedule it was built from passes the superblock checks again.
+    verdict.payments = {a, b};
+    DeclineReport again;
+    st.embedded_template_emit_ok(sel.work, &again);
+    EXPECT_EQ(again.cause.rfind("emit-superblock", 0), std::string::npos) << again.cause;
+}
