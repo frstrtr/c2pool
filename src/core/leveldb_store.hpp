@@ -194,6 +194,18 @@ private:
     void load_metadata();
     void save_metadata();
 
+    /// Rebuild every `height:` key from the `index:` records (and drop index
+    /// records whose share data is gone). Run at open() after an ungraceful
+    /// shutdown, and once on a store written before the height index held
+    /// every share of a height (kHeightIndexFormat).
+    void rebuild_height_index(const char* why);
+
+    /// The value of a `height:` key now holds the hash of EVERY stored share
+    /// at that height (32 bytes each, concatenated); format 1 held one hash,
+    /// the last one written, and removing any share of the height deleted
+    /// the key — the main-chain share with it.
+    static constexpr uint8_t kHeightIndexFormat = 2;
+
 public:
     SharechainLevelDBStore(const std::string& base_path, const std::string& network_name);
     ~SharechainLevelDBStore();
@@ -254,6 +266,17 @@ public:
     // Chain traversal
     std::vector<uint256> get_chain_hashes(const uint256& start_hash, uint64_t max_count, bool forward = true);
     std::vector<uint256> get_shares_by_height_range(uint64_t start_height, uint64_t end_height);
+
+    /// One stored share as its own `index:` record describes it.
+    struct IndexEntry {
+        uint256 hash;
+        uint64_t height = 0;      // the share's absheight
+        bool is_verified = false;
+    };
+    /// Every stored share, read from the `index:` records themselves (never
+    /// from the `height:` index), sorted by (height, hash): parents before
+    /// children. False when the store is closed or the scan fails.
+    bool scan_share_index(std::vector<IndexEntry>& out);
 
     // Statistics
     uint64_t get_share_count();

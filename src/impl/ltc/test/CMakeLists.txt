@@ -35,6 +35,11 @@ if (BUILD_TESTING AND GTest_FOUND)
     # NodeImpl + real loopback peer. Same folding rule: into the existing
     # allowlisted target.
     #
+    # restart_reload_window_test.cpp: the 2026-11-13 restart stall — a restart
+    # reloads the whole persisted window (the store's height index keeps every
+    # share of a height; the loader reads the share records). REAL store and
+    # NodeImpl. Same folding rule: into the existing allowlisted target.
+    #
     # pool_rate_head_select_test.cpp: the coin-generic dashboard pool-rate
     # HEAD-SELECTION + get_average_stale_prop SSOT (sharechain/
     # pool_rate_head_select.hpp, issue #1482) — verified best when live, else the
@@ -462,6 +467,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         per_peer_ingest_test.cpp
         pool_rate_head_select_test.cpp
         redistribute_script_type_test.cpp
+        restart_reload_window_test.cpp
         restart_reorg_supersede_test.cpp
         self_connection_ban_test.cpp
         serve_marked_shares_test.cpp

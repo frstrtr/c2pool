@@ -4,6 +4,7 @@
 #include <thread>
 
 #include "share_tx_refs.hpp"
+#include "persisted_reload.hpp"
 
 #include <core/reloaded_block_flag.hpp>   // core::restore_block_flag (a reloaded share keeps its block flag)
 #include <core/common.hpp>
@@ -2225,36 +2226,44 @@ void NodeImpl::load_persisted_shares()
     if (!m_storage || !m_storage->is_available())
         return;
 
-    // load_sharechain iterates the height index and loads each share.
-    // Limit to keep_per_head shares to avoid loading unbounded history
-    // into memory (LevelDB is never pruned, so it accumulates forever).
-    LOG_INFO << "[Pool] Scanning LevelDB height index for persisted shares...";
+    // Every stored share's own index record (absheight, verified), not the
+    // height index: that one lost a height's main-chain share whenever a fork
+    // share of the height was pruned, and a graceful stop skips its rebuild,
+    // so a restart reloaded a fraction of the window in fragments and could
+    // not reconnect its tip (persisted_reload.hpp). Reload every share in the
+    // 2*CHAIN_LENGTH+10 absheights ending at the highest verified share, and
+    // everything above it, in absheight order (parents before children).
+    LOG_INFO << "[Pool] Scanning LevelDB share index for persisted shares...";
     auto t0 = std::chrono::steady_clock::now();
-    auto all_hashes = m_storage->get_shares_by_height_range(0, UINT64_MAX);
+    std::vector<core::SharechainLevelDBStore::IndexEntry> entries;
+    if (!m_storage->scan_share_index(entries))
+    {
+        LOG_ERROR << "[Pool] LevelDB share index scan failed — starting without persisted shares";
+        return;
+    }
     auto scan_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - t0).count();
-    {
-        std::set<uint256> unique(all_hashes.begin(), all_hashes.end());
-        LOG_INFO << "[Pool] Height index scan: " << all_hashes.size() << " entries ("
-                 << unique.size() << " unique) in " << scan_ms << "ms";
-    }
-    if (all_hashes.empty())
+    if (entries.empty())
     {
         LOG_INFO << "No persisted shares found in LevelDB";
         return;
     }
 
-    const size_t keep_per_head = m_tracker.m_params->chain_length * 2 + 10;
-    const size_t total_in_db = all_hashes.size();
-
-    // Only load the most recent shares (highest height = end of vector)
-    size_t skip = 0;
-    if (total_in_db > keep_per_head)
-    {
-        skip = total_in_db - keep_per_head;
-        LOG_INFO << "[Pool] LevelDB has " << total_in_db << " shares, loading only newest "
-                 << keep_per_head << " (skipping " << skip << " old shares)";
-    }
+    const uint64_t keep_per_head = m_tracker.m_params->chain_length * 2 + 10;
+    const size_t total_in_db = entries.size();
+    const ltc::ReloadWindow window = ltc::reload_window(entries, keep_per_head);
+    const size_t first = static_cast<size_t>(
+        std::lower_bound(entries.begin(), entries.end(), window.low,
+                         [](const core::SharechainLevelDBStore::IndexEntry& e, uint64_t h) {
+                             return e.height < h;
+                         })
+        - entries.begin());
+    const size_t skip = first;   // entries below the window
+    LOG_INFO << "[Pool] Share index scan: " << total_in_db << " shares, absheight "
+             << entries.front().height << ".." << entries.back().height << " in " << scan_ms
+             << "ms; reloading absheight >= " << window.low << " (anchor " << window.anchor
+             << (window.anchored_on_verified ? ", highest verified" : ", highest stored; none verified")
+             << ", window " << keep_per_head << "), " << skip << " older";
 
     const size_t to_load = total_in_db - skip;
     LOG_INFO << "[Pool] Loading shares from LevelDB: " << to_load << " shares to process...";
@@ -2262,7 +2271,7 @@ void NodeImpl::load_persisted_shares()
     std::vector<uint256> verified_hashes; // shares to pre-populate into verified
     for (size_t i = skip; i < total_in_db; ++i)
     {
-        const auto& hash = all_hashes[i];
+        const auto& hash = entries[i].hash;
         std::vector<uint8_t> data;
         core::ShareMetadata meta;
         if (!m_storage->load_share(hash, data, meta)) {
@@ -2373,20 +2382,39 @@ void NodeImpl::load_persisted_shares()
         LOG_INFO << "[Pool] Pre-populated " << pre_verified << " verified shares from LevelDB";
 
     LOG_INFO << "[Pool] Loaded " << loaded << " shares from LevelDB storage"
-             << " (DB total: " << total_in_db << ", limit: " << keep_per_head
+             << " (DB total: " << total_in_db << ", window: " << keep_per_head
+             << " absheights from " << window.low
              << ", skipped: load=" << skipped_load << " small=" << skipped_small
-             << " dup=" << skipped_contains << ")";
+             << " dup=" << skipped_contains << ") in "
+             << std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - t0).count()
+             << "ms";
 
-    // Prune old shares from LevelDB that we skipped
-    if (skip > 0)
+    // Prune the shares below the window (they are never reloaded, so nothing
+    // else would ever remove them) — only below a VERIFIED anchor: an
+    // unverified absheight is a peer's claim and never decides a deletion.
+    if (skip > 0 && window.prune_below)
     {
+        constexpr size_t PRUNE_CHUNK = 2000;   // one WriteBatch per chunk
         size_t pruned = 0;
+        std::vector<uint256> chunk;
+        chunk.reserve(PRUNE_CHUNK);
         for (size_t i = 0; i < skip; ++i)
         {
-            if (m_storage->remove_share(all_hashes[i]))
-                ++pruned;
+            chunk.push_back(entries[i].hash);
+            if (chunk.size() == PRUNE_CHUNK || i + 1 == skip)
+            {
+                if (m_storage->remove_shares_batch(chunk))
+                    pruned += chunk.size();
+                chunk.clear();
+            }
         }
         LOG_INFO << "[Pool] Pruned " << pruned << " old shares from LevelDB";
+    }
+    else if (skip > 0)
+    {
+        LOG_INFO << "[Pool] Kept " << skip << " shares below the reload window in LevelDB:"
+                 << " no verified share anchors the window";
     }
 }
 
