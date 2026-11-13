@@ -2359,9 +2359,15 @@ struct SessionRig {
         srv->start();
         io = std::thread([this] { ioc.run(); });
     }
+    // stop() closes the acceptor and the session sockets: run it on the io
+    // thread, as test_stratum_interim_hardening's harness does. Calling it
+    // from the test thread while ioc.run() is live raced the reactor
+    // (UBSan: epoll_reactor.ipp member access within null descriptor_state).
     ~SessionRig()
     {
-        srv->stop();
+        std::promise<void> done;
+        boost::asio::post(ioc, [&] { srv->stop(); done.set_value(); });
+        done.get_future().wait();
         guard.reset();
         ioc.stop();
         io.join();
