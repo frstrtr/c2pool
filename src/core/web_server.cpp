@@ -25,7 +25,7 @@
 
 #include <core/hash.hpp>   // Hash(a,b) double-SHA256 for merkle computation
 #include <core/block_body_summary.hpp> // #946 coinbase_txid + tx_count of a submitted block
-#include <core/random.hpp> // core::random::random_float for probabilistic fee
+#include <core/random.hpp> // core::random::random_double for probabilistic fee
 #include <core/target_utils.hpp> // chain::bits_to_target
 #include <btclibs/util/strencodings.h>  // ParseHex, HexStr
 #include <crypto/scrypt.h>  // scrypt_1024_1_1_256 for Litecoin PoW
@@ -502,8 +502,11 @@ void MiningInterface::decide_job_payout(std::vector<unsigned char>& payout_scrip
     uint8_t op_type = 0;
     const std::string op_h160 = script_hash160_hex(m_node_fee_script, op_type);
     if (m_node_fee_percent > 0.0 && !op_h160.empty()) {
-        const float roll = core::random::random_float(0.0f, 100.0f);
-        if (roll < static_cast<float>(m_node_fee_percent)) {
+        // p2pool: random.uniform(0, 100) < node_fee. A continuous draw on
+        // [0, 100), compared as double: fee 100 always takes, a fractional
+        // fee is honoured exactly in expectation.
+        const double roll = core::random::random_double(0.0, 100.0);
+        if (roll < m_node_fee_percent) {
             payout_script = m_node_fee_script;
             if (!m_operator_merged_scripts.empty())
                 merged.assign(m_operator_merged_scripts.begin(), m_operator_merged_scripts.end());

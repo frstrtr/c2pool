@@ -3,6 +3,7 @@
 #include <map>
 #include <list>
 #include <stdexcept>
+#include <cstdint>
 #include <core/uint256.hpp>
 
 namespace core::random
@@ -10,8 +11,16 @@ namespace core::random
     // [min, max)
     int random_int(int min, int max);
 
-    // [min, max]
+    // [min, max): a continuous uniform draw (p2pool random.uniform); max is
+    // never returned. min >= max returns min.
     float random_float(float min, float max);
+
+    // [min, max): as random_float, in double precision.
+    double random_double(double min, double max);
+
+    // Reseed the process-wide generator (tests: a fixed seed makes every draw
+    // reproducible).
+    void seed(uint32_t value);
 
     std::vector<unsigned char> random_bytes(int32_t length);
 
