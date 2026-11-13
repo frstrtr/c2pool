@@ -1384,11 +1384,16 @@ void NodeImpl::write_sharereply(const peer_ptr& peer, const uint256& id, std::ve
 bool NodeImpl::defer_sharereq(const peer_ptr& peer, const uint256& id, std::vector<uint256> hashes,
                               uint64_t parents, std::vector<uint256> stops)
 {
-    if (m_context && m_deferred_sharereqs.size() < SHAREREQ_DEFERRED_MAX)
+    const NetService addr = peer->addr();
+    const auto of_peer = static_cast<std::size_t>(std::count_if(
+        m_deferred_sharereqs.begin(), m_deferred_sharereqs.end(),
+        [&](const DeferredShareReq& d) { return d.addr == addr; }));
+    if (m_context && m_deferred_sharereqs.size() < SHAREREQ_DEFERRED_MAX
+        && of_peer < SHAREREQ_DEFERRED_PER_PEER)
     {
         ++m_sharereq_defer_stats.deferred;
         m_deferred_sharereqs.push_back(DeferredShareReq{
-            peer, id, std::move(hashes), parents, std::move(stops),
+            peer, addr, id, std::move(hashes), parents, std::move(stops),
             std::chrono::steady_clock::now() + m_sharereq_busy_budget});
         arm_sharereq_retry();
         return true;
@@ -1402,14 +1407,14 @@ bool NodeImpl::defer_sharereq(const peer_ptr& peer, const uint256& id, std::vect
     return false;
 }
 
-void NodeImpl::arm_sharereq_retry()
+void NodeImpl::arm_sharereq_retry(std::chrono::milliseconds after)
 {
     if (m_sharereq_retry_armed || !m_context)
         return;
     if (!m_sharereq_retry_timer)
         m_sharereq_retry_timer = std::make_unique<boost::asio::steady_timer>(*m_context);
     m_sharereq_retry_armed = true;
-    m_sharereq_retry_timer->expires_after(SHAREREQ_RETRY_INTERVAL);
+    m_sharereq_retry_timer->expires_after(after);
     m_sharereq_retry_timer->async_wait([this](const boost::system::error_code& ec) {
         if (ec)   // cancelled: the timer (and its node) is going away
             return;
@@ -1422,11 +1427,19 @@ void NodeImpl::retry_deferred_sharereqs()
 {
     // IO thread. Every waiting request gets one more non-blocking try; one past
     // its deadline is answered with what that try got (empty while still busy).
+    // At most SHAREREQ_SERVED_PER_PASS are answered from the tracker per pass;
+    // the rest keep their place for the next pass.
     auto waiting = std::move(m_deferred_sharereqs);
     m_deferred_sharereqs.clear();
     const auto now = std::chrono::steady_clock::now();
+    std::size_t served = 0;
     for (auto& req : waiting)
     {
+        if (served >= SHAREREQ_SERVED_PER_PASS)
+        {
+            m_deferred_sharereqs.push_back(std::move(req));
+            continue;
+        }
         auto peer = req.peer.lock();
         const bool connected = peer && std::any_of(m_peers.begin(), m_peers.end(),
             [&](const auto& kv) { return kv.second == peer; });
@@ -1454,12 +1467,14 @@ void NodeImpl::retry_deferred_sharereqs()
         else
         {
             ++m_sharereq_defer_stats.served_after_wait;
+            ++served;
         }
         m_sharereq_defer_stats.last_reply_shares = shares.size();
         write_sharereply(peer, req.id, shares);
     }
     if (!m_deferred_sharereqs.empty())
-        arm_sharereq_retry();
+        arm_sharereq_retry(served >= SHAREREQ_SERVED_PER_PASS ? SHAREREQ_CONTINUE_INTERVAL
+                                                              : SHAREREQ_RETRY_INTERVAL);
 }
 
 std::vector<uint256> NodeImpl::send_shares(peer_ptr peer, const std::vector<uint256>& share_hashes)

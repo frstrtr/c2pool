@@ -831,6 +831,7 @@ public:
 
     struct DeferredShareReq {
         std::weak_ptr<peer_t> peer;
+        NetService addr;
         uint256 id;
         std::vector<uint256> hashes;
         uint64_t parents{0};
@@ -838,9 +839,16 @@ public:
         std::chrono::steady_clock::time_point deadline;
     };
     static constexpr std::chrono::milliseconds SHAREREQ_RETRY_INTERVAL{100};
-    // At most this many requests wait at once; past it a busy request is
-    // answered empty at once, as before (a flood holds no unbounded state).
+    // At most this many requests wait at once, and this many per peer; past
+    // either a busy request is answered empty at once, as before (a flood
+    // holds no unbounded state, and one peer cannot take the whole list).
     static constexpr std::size_t SHAREREQ_DEFERRED_MAX = 256;
+    static constexpr std::size_t SHAREREQ_DEFERRED_PER_PEER = 8;
+    // One timer pass answers at most this many waiting requests from the
+    // tracker (each can pack up to 1000 shares); the rest go in the next pass,
+    // SHAREREQ_CONTINUE_INTERVAL later, so the io thread is never held long.
+    static constexpr std::size_t SHAREREQ_SERVED_PER_PASS = 16;
+    static constexpr std::chrono::milliseconds SHAREREQ_CONTINUE_INTERVAL{10};
     std::chrono::milliseconds m_sharereq_busy_budget{2000};
     std::deque<DeferredShareReq> m_deferred_sharereqs;   // IO thread only
     std::unique_ptr<boost::asio::steady_timer> m_sharereq_retry_timer;
@@ -850,10 +858,10 @@ public:
         uint64_t served_after_wait{0}; // ... and were answered from the tracker
         uint64_t empty_after_wait{0};  // ... and were still busy at the deadline: empty
         uint64_t peer_gone{0};         // ... whose peer disconnected meanwhile
-        uint64_t not_deferred{0};      // busy with the wait list full: empty at once
+        uint64_t not_deferred{0};      // busy with the wait list (or the peer's share) full: empty at once
         size_t last_reply_shares{0};   // shares in the last reply sent after a wait
     } m_sharereq_defer_stats;          // IO thread only
-    void arm_sharereq_retry();
+    void arm_sharereq_retry(std::chrono::milliseconds after = SHAREREQ_RETRY_INTERVAL);
     void retry_deferred_sharereqs();
 
     /// Broadcast a new best-block notification to all connected P2P peers.

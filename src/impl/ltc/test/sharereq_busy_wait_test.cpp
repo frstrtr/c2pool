@@ -13,7 +13,9 @@
 // thread never blocks — for up to 2 s, then answered with what the last try
 // got (empty only if the tracker was busy the whole time). Bounded: at most
 // SHAREREQ_DEFERRED_MAX requests wait; past that a busy one is answered empty
-// at once, as before. A request whose peer has gone is dropped.
+// at once, as before; at most SHAREREQ_DEFERRED_PER_PEER of them per peer.
+// One timer pass answers at most SHAREREQ_SERVED_PER_PASS from the tracker. A
+// request whose peer has gone is dropped.
 //
 // Pinned on a REAL ltc::NodeImpl and sharechain with a peer on a real loopback
 // socket; "think()" is a thread holding the tracker mutex exclusively.
@@ -218,20 +220,78 @@ TEST(LtcSharereqBusyWait, ARequestWhosePeerIsGoneIsDropped)
     EXPECT_TRUE(node.m_deferred_sharereqs.empty());
 }
 
-// The wait list is bounded: past SHAREREQ_DEFERRED_MAX a busy request is not
-// kept (the handler answers it empty at once, as before).
-TEST(LtcSharereqBusyWait, TheWaitListIsBounded)
+// The wait list is bounded per peer: past SHAREREQ_DEFERRED_PER_PEER a busy
+// request of that peer is not kept (the handler answers it empty at once, as
+// before); another peer's still is.
+TEST(LtcSharereqBusyWait, OnePeerCannotTakeTheWholeWaitList)
 {
-    SocketPair pair;
+    SocketPair pa, pb;
     StubCommunicator stub;
-    ServeNode node(pair.ioc);
+    ServeNode node(pa.ioc);
     const uint256 tip = node.build_chain(1);
-    auto peer = node.attach_peer(pair, stub, 0xa1);
+    auto a = node.attach_peer(pa, stub, 0xa1);
+    auto b = node.attach_peer(pb, stub, 0xb2);
 
     Think think(node.m_tracker_mutex);
+    for (size_t i = 0; i < ltc::NodeImpl::SHAREREQ_DEFERRED_PER_PEER; ++i)
+        ASSERT_TRUE(node.defer_sharereq(a, H(0x100 + i), {tip}, 0, {}));
+    EXPECT_FALSE(node.defer_sharereq(a, H(0x9999), {tip}, 0, {})) << "peer a's share is full";
+    EXPECT_TRUE(node.defer_sharereq(b, H(0x200), {tip}, 0, {})) << "peer b still waits";
+    EXPECT_EQ(node.m_sharereq_defer_stats.not_deferred, 1u);
+}
+
+// And overall: past SHAREREQ_DEFERRED_MAX nobody's busy request is kept.
+TEST(LtcSharereqBusyWait, TheWaitListIsBounded)
+{
+    constexpr size_t kPeers = ltc::NodeImpl::SHAREREQ_DEFERRED_MAX / ltc::NodeImpl::SHAREREQ_DEFERRED_PER_PEER + 1;
+    std::vector<std::unique_ptr<SocketPair>> pairs;
+    for (size_t i = 0; i < kPeers; ++i)
+        pairs.push_back(std::make_unique<SocketPair>());
+    StubCommunicator stub;
+    ServeNode node(pairs[0]->ioc);
+    const uint256 tip = node.build_chain(1);
+    std::vector<ltc::NodeImpl::peer_ptr> peers;
+    for (size_t i = 0; i < kPeers; ++i)
+        peers.push_back(node.attach_peer(*pairs[i], stub, 0x1000 + i));
+
+    Think think(node.m_tracker_mutex);
+    size_t accepted = 0;
     for (size_t i = 0; i < ltc::NodeImpl::SHAREREQ_DEFERRED_MAX; ++i)
-        ASSERT_TRUE(node.defer_sharereq(peer, H(0x100 + i), {tip}, 0, {}));
-    EXPECT_FALSE(node.defer_sharereq(peer, H(0x9999), {tip}, 0, {}));
+        accepted += node.defer_sharereq(peers[i / ltc::NodeImpl::SHAREREQ_DEFERRED_PER_PEER],
+                                        H(0x100 + i), {tip}, 0, {}) ? 1 : 0;
+    ASSERT_EQ(accepted, ltc::NodeImpl::SHAREREQ_DEFERRED_MAX);
+    EXPECT_FALSE(node.defer_sharereq(peers.back(), H(0x9999), {tip}, 0, {}))
+        << "a fresh peer, but the list is full";
     EXPECT_EQ(node.m_sharereq_defer_stats.not_deferred, 1u);
     EXPECT_EQ(node.m_deferred_sharereqs.size(), ltc::NodeImpl::SHAREREQ_DEFERRED_MAX);
+}
+
+// One timer pass answers at most SHAREREQ_SERVED_PER_PASS waiting requests
+// from the tracker; the rest keep their place for the next pass.
+TEST(LtcSharereqBusyWait, OnePassServesABoundedNumber)
+{
+    SocketPair pa, pb, pc;
+    StubCommunicator stub;
+    ServeNode node(pa.ioc);
+    const uint256 tip = node.build_chain(3);
+    auto a = node.attach_peer(pa, stub, 0xa1);
+    auto b = node.attach_peer(pb, stub, 0xb2);
+    auto c = node.attach_peer(pc, stub, 0xc3);
+
+    {
+        Think think(node.m_tracker_mutex);
+        size_t n = 0;
+        for (auto& p : {a, b, c})
+            for (size_t i = 0; i < ltc::NodeImpl::SHAREREQ_DEFERRED_PER_PEER; ++i)
+                ASSERT_TRUE(node.defer_sharereq(p, H(0x100 + n++), {tip}, 2, {}));
+    }   // think() done: the tracker is free
+    const size_t waiting = 3 * ltc::NodeImpl::SHAREREQ_DEFERRED_PER_PEER;
+    ASSERT_EQ(node.m_deferred_sharereqs.size(), waiting);
+
+    node.retry_deferred_sharereqs();   // one pass
+    EXPECT_EQ(node.m_sharereq_defer_stats.served_after_wait, ltc::NodeImpl::SHAREREQ_SERVED_PER_PASS);
+    EXPECT_EQ(node.m_deferred_sharereqs.size(), waiting - ltc::NodeImpl::SHAREREQ_SERVED_PER_PASS);
+    node.retry_deferred_sharereqs();   // the next one
+    EXPECT_EQ(node.m_sharereq_defer_stats.served_after_wait, waiting);
+    EXPECT_TRUE(node.m_deferred_sharereqs.empty());
 }
