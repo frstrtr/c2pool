@@ -2093,6 +2093,10 @@ jobs:
     # the old MAC_INTEL_OFFLINE / MAC_INTEL_PAUSED repo variables are no longer
     # read by any workflow.
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","macOS","ARM64","c2pool-mac-arm"]') || 'macos-14' }}
+    # Pinned minimum macOS, same value as release.yml and os.version in
+    # ci/conan/macos-clang.profile (provision-macos-deps fails otherwise).
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '26.0'
     strategy:
       fail-fast: false
       matrix:
@@ -2128,10 +2132,12 @@ jobs:
         # CMAKE_IGNORE_PREFIX_PATH keeps find_library/find_package away from
         # Homebrew's arm64-only libraries, which would mis-link the x86_64 leg.
         run: |
+          CFLAGS="$C2POOL_PREFIX_MAP_FLAGS" CXXFLAGS="$C2POOL_PREFIX_MAP_FLAGS" \
           cmake -S . -B build \
             -DCMAKE_TOOLCHAIN_FILE="$C2POOL_CONAN_TOOLCHAIN" \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }} \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET="$MACOSX_DEPLOYMENT_TARGET" \
             -DCMAKE_PREFIX_PATH="$C2POOL_MACOS_DEPS" \
             "-DCMAKE_IGNORE_PREFIX_PATH=/opt/homebrew;/usr/local" \
             -DCMAKE_C_COMPILER_LAUNCHER=sccache \
@@ -2150,6 +2156,9 @@ jobs:
           archs="$(lipo -archs "$BIN")"
           echo "lipo -archs $BIN: $archs"
           [ "$archs" = "${{ matrix.arch }}" ] || { echo "::error::$BIN is '$archs', expected ${{ matrix.arch }}"; exit 1; }
+          minos="$(otool -l "$BIN" | awk '$1=="minos"{print $2; exit}')"
+          echo "minimum macOS: ${minos:-none} (pinned $MACOSX_DEPLOYMENT_TARGET)"
+          [ "$minos" = "$MACOSX_DEPLOYMENT_TARGET" ] || { echo "::error::$BIN minimum macOS is '${minos:-none}', pinned target is $MACOSX_DEPLOYMENT_TARGET"; exit 1; }
           bash scripts/ci/macos_slice_smoke.sh ${{ matrix.arch }} "$BIN"
 
       - name: Package release

@@ -302,6 +302,12 @@ jobs:
   macos:
     name: ${{ matrix.coin }} ${{ matrix.arch }} (macOS build)
     runs-on: ${{ inputs.force-github-hosted != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","macOS","ARM64","c2pool-mac-arm"]') || 'macos-14' }}
+    # Pinned minimum macOS of every slice; must equal os.version in
+    # ci/conan/macos-clang.profile (provision-macos-deps fails otherwise).
+    # Without the pin it would follow the build host's SDK, and an x86_64
+    # slice built for a macOS that has no Intel release runs on no Intel Mac.
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '26.0'
     strategy:
       fail-fast: false
       matrix:
@@ -380,10 +386,14 @@ jobs:
             dgb)  EXTRA="-DAUX_DOGE=ON" ;;
             dash) EXTRA="-DC2POOL_DASH_BLS=ON -DDASHBLS_ROOT=$DASHBLS_ROOT" ;;
           esac
+          # CFLAGS/CXXFLAGS carry the -ffile-prefix-map flags (no host path in
+          # __FILE__ strings); CMake adds them to the Conan toolchain's flags.
+          CFLAGS="$C2POOL_PREFIX_MAP_FLAGS" CXXFLAGS="$C2POOL_PREFIX_MAP_FLAGS" \
           cmake -S . -B build \
             -DCMAKE_TOOLCHAIN_FILE="$C2POOL_CONAN_TOOLCHAIN" \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }} \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET="$MACOSX_DEPLOYMENT_TARGET" \
             -DCMAKE_PREFIX_PATH="$C2POOL_MACOS_DEPS" \
             -DCMAKE_IGNORE_PREFIX_PATH="/opt/homebrew;/usr/local" \
             $EXTRA
@@ -510,6 +520,15 @@ jobs:
             [ -f "$lib" ] || continue
             install_name_tool -id "@executable_path/lib/$(basename $lib)" "$lib"
           done
+          # The link step leaves LC_RPATH entries into the build tree and the
+          # Conan cache (paths of the build host). Every dependency is now
+          # addressed via @executable_path, so drop any rpath outside the package.
+          for f in "${PKG}/c2pool-${COIN}" "${PKG}"/lib/*.dylib; do
+            [ -f "$f" ] || continue
+            for rp in $(otool -l "$f" | awk '$2=="LC_RPATH"{r=1; next} r&&$1=="path"{print $2; r=0}' | grep -v -E '^(@executable_path|@loader_path)(/|$)' || true); do
+              install_name_tool -delete_rpath "$rp" "$f" 2>/dev/null || true
+            done
+          done
           echo "== load commands"
           otool -L "${PKG}/c2pool-${COIN}" "${PKG}"/lib/*.dylib 2>/dev/null || true
           if otool -L "${PKG}/c2pool-${COIN}" "${PKG}"/lib/*.dylib 2>/dev/null | grep -vE "^${PKG}/" | grep -E "@rpath/|/actions-runner/|/opt/homebrew/|/usr/local/|/Users/|/private/"; then
@@ -520,6 +539,11 @@ jobs:
             a="$(lipo -archs "$f")"
             [ "$a" = "$ARCH" ] || { echo "PKG-ASSERT FAIL: $f is '$a', expected $ARCH"; exit 1; }
           done
+          # Pinned minimum macOS, no rpath and no string naming the build host.
+          files=("${PKG}/c2pool-${COIN}")
+          for lib in "${PKG}"/lib/*.dylib; do if [ -f "$lib" ]; then files+=("$lib"); fi; done
+          bash scripts/ci/macos_macho_check.sh --min "$MACOSX_DEPLOYMENT_TARGET" --archs "$ARCH" "${files[@]}" \
+            || { echo "PKG-ASSERT FAIL: Mach-O check (see above)"; exit 1; }
           cp start.sh "${PKG}/" && chmod +x "${PKG}/start.sh"
           cp "config/${COIN}/c2pool_mainnet.yaml" "${PKG}/config/c2pool_mainnet.yaml.example"
           cp "config/${COIN}/c2pool_testnet.yaml" "${PKG}/config/c2pool_testnet.yaml"
@@ -545,6 +569,12 @@ jobs:
     needs: macos
     if: always()
     runs-on: ${{ inputs.force-github-hosted != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","macOS","ARM64","c2pool-mac-arm"]') || 'macos-14' }}
+    # Pinned minimum macOS of every slice; must equal os.version in
+    # ci/conan/macos-clang.profile (provision-macos-deps fails otherwise).
+    # Without the pin it would follow the build host's SDK, and an x86_64
+    # slice built for a macOS that has no Intel release runs on no Intel Mac.
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '26.0'
     strategy:
       fail-fast: false
       matrix:
@@ -643,10 +673,12 @@ jobs:
           file "${PKG}/c2pool-${COIN}"
 
       # What ships must be universal end to end: the binary and every bundled
-      # dylib carry exactly the arm64 and x86_64 slices, and both slices of the
-      # signed package start (arm64 natively, x86_64 under Rosetta 2). The
-      # x86_64 slice is cross-built, so this is where it is run as shipped.
-      - name: Verify universal package (lipo -archs + both slices start)
+      # dylib carry exactly the arm64 and x86_64 slices, every slice has the
+      # pinned minimum macOS and no rpath or string naming the build host, and
+      # both slices of the signed package start (arm64 natively, x86_64 under
+      # Rosetta 2). The x86_64 slice is cross-built, so this is where it is run
+      # as shipped.
+      - name: Verify universal package (lipo -archs, minimum macOS, host paths, both slices start)
         if: steps.presence.outputs.exists == '1'
         run: |
           PKG="c2pool-${{ matrix.coin }}-${{ steps.ver.outputs.version }}-macos-universal"
@@ -667,10 +699,9 @@ jobs:
             [ "$(echo $archs | wc -w)" -eq 2 ] || { echo "::error::${f#${PKG}/} has unexpected slices: $archs"; fail=1; }
           done
           [ "$fail" -eq 0 ] || exit 1
-          for a in arm64 x86_64; do
-            minos="$(otool -arch "$a" -l "$BIN" | awk '/LC_BUILD_VERSION/{f=1} f&&/minos/{print $2; exit}')"
-            echo "$a slice minimum macOS: ${minos:-unknown}"
-          done
+          files=("$BIN")
+          for lib in "${PKG}"/lib/*.dylib; do if [ -f "$lib" ]; then files+=("$lib"); fi; done
+          bash scripts/ci/macos_macho_check.sh --min "$MACOSX_DEPLOYMENT_TARGET" --archs "arm64 x86_64" "${files[@]}"
           bash scripts/ci/macos_slice_smoke.sh arm64 "$BIN" smoke-universal-arm64.log
           bash scripts/ci/macos_slice_smoke.sh x86_64 "$BIN" smoke-universal-x86_64.log
 

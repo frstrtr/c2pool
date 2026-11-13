@@ -67,8 +67,9 @@ echo "[build_dashbls] building dash $DASH_REF src/dashbls (dashd-byte-identical)
 # the c2pool CMake find treats the relic library as optional accordingly.
 # DASHBLS_CONFIGURE_ARGS: extra configure arguments, word-split on purpose.
 # The macOS x86_64 slice is cross-built on Apple Silicon with
-# "--build=aarch64-apple-darwin --host=x86_64-apple-darwin --with-backend=gmp"
-# plus CC/CXX/CPPFLAGS/LDFLAGS from the environment (see
+# "--build=aarch64-apple-darwin --host=x86_64-apple-darwin --with-backend=easy"
+# (the arm64 slice: --host=aarch64-apple-darwin --with-backend=gmp) plus
+# CC/CXX/CPPFLAGS/LDFLAGS from the environment (see
 # .github/actions/provision-dashbls). Unset = the native build, as before.
 (
     cd "$DASHBLS_SRC"

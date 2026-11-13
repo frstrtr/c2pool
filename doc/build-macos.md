@@ -6,13 +6,17 @@ This guide covers building c2pool from source on macOS.
 
 | Component | Version |
 |-----------|---------|
-| macOS | 26.3.1 (Tahoe) |
+| macOS | 26.6 (Tahoe) |
 | Xcode / Apple Clang | 21.0.0 |
-| CMake | 4.3.1 |
+| CMake | 4.4 |
 | Boost | 1.90.0 |
 | LevelDB | 1.23 |
-| libsecp256k1 | 0.7.1 |
-| Architecture | x86_64 (Intel Mac Pro) |
+| libsecp256k1 | 0.8.0 |
+| Architecture | arm64 (Apple Silicon); x86_64 cross-compiled on the same host and run under Rosetta 2 |
+
+This is the configuration CI builds the release packages with (see
+[docs/ci-macos.md](../docs/ci-macos.md)); those packages require macOS 26.0 or
+later on both Intel and Apple Silicon Macs.
 
 > Other macOS versions may work but are untested. Boost API changes between
 > major versions are the most common source of build failures on untested

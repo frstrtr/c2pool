@@ -209,11 +209,17 @@ runs:
             arm64)  host_triple=aarch64-apple-darwin; backend=gmp ;;
             x86_64) host_triple=x86_64-apple-darwin;  backend=easy ;;
           esac
-          export CC="clang -arch $DASHBLS_ARCH" CXX="clang++ -arch $DASHBLS_ARCH"
+          # The pinned minimum macOS (job-level MACOSX_DEPLOYMENT_TARGET, part
+          # of DASHBLS_PIN through the deps key) and neutral names for the
+          # source and install paths, so no host path reaches the binary.
+          : "${MACOSX_DEPLOYMENT_TARGET:?set MACOSX_DEPLOYMENT_TARGET at job level}"
+          export BUILD_DIR="${RUNNER_TEMP:-/tmp}/dashbls-build-$DASHBLS_ARCH"
+          cflags="-arch $DASHBLS_ARCH -mmacosx-version-min=$MACOSX_DEPLOYMENT_TARGET"
+          cflags="$cflags -ffile-prefix-map=$BUILD_DIR=dashbls-src -ffile-prefix-map=$DASHBLS_PREFIX=dashbls"
+          export CC="clang $cflags" CXX="clang++ $cflags"
           export CPPFLAGS="-I$C2POOL_MACOS_DEPS/include" LDFLAGS="-L$C2POOL_MACOS_DEPS/lib"
           export BREW=/usr/bin/false
           export DASHBLS_CONFIGURE_ARGS="--build=aarch64-apple-darwin --host=$host_triple --with-backend=$backend"
-          export BUILD_DIR="${RUNNER_TEMP:-/tmp}/dashbls-build-$DASHBLS_ARCH"
         fi
         bash scripts/build_dashbls.sh "$DASHBLS_PREFIX"
         printf '%s\n' "$DASHBLS_PIN" > "$marker"
@@ -235,8 +241,10 @@ runs:
         done
         if [ "$(uname -s)" = "Darwin" ] && [ -f "$DASHBLS_PREFIX/lib/libdashbls.a" ]; then
           archs="$(lipo -archs "$DASHBLS_PREFIX/lib/libdashbls.a" 2>/dev/null || true)"
-          echo "  libdashbls.a: $archs"
+          minos="$(otool -l "$DASHBLS_PREFIX/lib/libdashbls.a" | awk '$1=="minos"{print $2}' | sort -u | tr '\n' ' ' | sed 's/ $//')"
+          echo "  libdashbls.a: arch $archs, minos $minos"
           [ "$archs" = "$DASHBLS_ARCH" ] || { echo "  WRONG ARCH (want $DASHBLS_ARCH)"; fail=1; }
+          [ "$minos" = "${MACOSX_DEPLOYMENT_TARGET:-}" ] || { echo "  WRONG MINIMUM macOS (want ${MACOSX_DEPLOYMENT_TARGET:-unset})"; fail=1; }
           grep -h -E '^#define (ARITH|ARCH|WSIZE) ' "$DASHBLS_PREFIX/include/relic_conf.h" 2>/dev/null | sed 's/^/  relic: /' || true
         fi
         if [ "$fail" -ne 0 ]; then

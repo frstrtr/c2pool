@@ -6,8 +6,17 @@
 # compiler.version is the Apple clang of the build host; every macOS package is
 # built from source there, so the value labels the binaries in the runner's
 # own cache rather than selecting prebuilt ones.
+#
+# os.version is the minimum macOS of every shipped slice (the deployment
+# target). It is pinned, not left to the build host's SDK default: if the host
+# moves to a macOS release that has no Intel version, an unpinned x86_64 slice
+# would silently stop running on every Intel Mac. The macOS jobs in
+# release.yml and build.yml set MACOSX_DEPLOYMENT_TARGET to the same value and
+# .github/actions/provision-macos-deps fails when the two differ. 26.0 is the
+# minimum the packages have had since the universal build started.
 [settings]
 os=Macos
+os.version=26.0
 arch=armv8
 build_type=Release
 compiler=apple-clang

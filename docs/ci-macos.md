@@ -44,6 +44,29 @@ All third-party libraries are linked statically. The package bundles only the
 in-tree dylibs (for DASH, `libdash_scriptcheck.dylib`), and those are built for
 both architectures and lipo-merged like the executable.
 
+### Minimum macOS
+
+The deployment target is pinned to **macOS 26.0** for both slices: `os.version`
+in `ci/conan/macos-clang.profile`, and `MACOSX_DEPLOYMENT_TARGET` at job level
+in the macOS jobs of `release.yml` and `build.yml` (the provisioning action
+fails if the two differ). Every library above is built for it, and it is part
+of the cache keys. Without the pin the minimum would follow the build host's
+SDK; once the host runs a macOS release that has no Intel version, the x86_64
+slice would no longer start on any Intel Mac while CI stayed green. The
+package checks fail if any slice of the binary or of a bundled dylib has a
+different minimum.
+
+### No build-host paths in the binaries
+
+Compilers see the Conan cache, the library prefixes, the checkout and the
+runner's temp directory under neutral names (`-ffile-prefix-map`, passed to
+Conan as `tools.build:cflags`/`cxxflags` and to the c2pool build through
+`CFLAGS`/`CXXFLAGS`), so `__FILE__` strings from Boost.Log, ZeroMQ, relic and
+c2pool itself carry no path of the host. Packaging deletes every `LC_RPATH`
+that points outside the package. `scripts/ci/macos_macho_check.sh` then fails
+the job if any slice still has such an rpath or contains `/Users/`,
+`.c2pool-deps`, `actions-runner`, the runner name or the host name.
+
 On the self-hosted runner the Conan cache and the per-arch library prefixes
 live under `~/.c2pool-deps/` and are reused across jobs; only a change to a pin
 rebuilds them (a cold Conan build of the whole set takes about five minutes per
@@ -67,11 +90,15 @@ Universal job (`macos-universal` in `release.yml`):
 2. Ad-hoc re-sign every Mach-O file (this is not a Developer ID signature).
 3. `lipo -archs` on the binary and on every bundled dylib must show exactly
    `arm64` and `x86_64`.
-4. Start both slices of the signed universal binary again (arm64 natively,
-   x86_64 under Rosetta 2). The log also prints each slice's minimum macOS.
-5. DASH: the BLS rodata guard on each slice, gmp linked statically where relic
+4. `scripts/ci/macos_macho_check.sh` on every slice of the binary and the
+   bundled dylibs: pinned minimum macOS, no rpath outside the package, no
+   string naming the build host (the per-arch packaging step runs the same
+   check on its own slice).
+5. Start both slices of the signed universal binary again (arm64 natively,
+   x86_64 under Rosetta 2).
+6. DASH: the BLS rodata guard on each slice, gmp linked statically where relic
    uses it (or bundled universal), and a REAL backend on both slices.
-6. Zip and DMG (`installer/macos/create-dmg.sh --staged ... --arch universal`).
+7. Zip and DMG (`installer/macos/create-dmg.sh --staged ... --arch universal`).
 
 ## Limits
 
@@ -82,3 +109,5 @@ Universal job (`macos-universal` in `release.yml`):
   they run on pushes to master and in every `release.yml` run.
 - The macOS legs are serialized on one host, so a full release run takes
   longer than when two machines shared the work.
+- GitHub-hosted fallback runners (`macos-14`) install Rosetta 2 on demand and
+  build the whole Conan set from source on a cold cache.
