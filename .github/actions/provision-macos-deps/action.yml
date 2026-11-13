@@ -147,9 +147,10 @@ runs:
           --lockfile=conan.lock \
           --build=missing \
           --output-folder="${{ inputs.output-folder }}"
-        # Keep the cache to finished packages: source and build trees of a
-        # from-source boost run to several GB and are never reused.
-        conan cache clean "*" --source --build --temp
+        # Drop build trees (several GB for a from-source boost, never reused).
+        # Keep the extracted sources: they are shared by both arches, so the
+        # other arch's cold build does not download boost again.
+        conan cache clean "*" --build --temp
         tc="$(cd "${{ inputs.output-folder }}" && pwd)/conan_toolchain.cmake"
         [ -f "$tc" ] || { echo "::error::conan did not produce $tc"; exit 1; }
         echo "C2POOL_CONAN_TOOLCHAIN=$tc" >> "$GITHUB_ENV"
