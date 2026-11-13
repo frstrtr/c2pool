@@ -11,7 +11,9 @@ Original forum thread: <https://bitcointalk.org/index.php?topic=18313>
 
 ## Latest releases
 
-- **[v0.2.12.1](https://github.com/frstrtr/c2pool/releases/tag/v0.2.12.1)** — LTC + merged mining. **Every c2pool-ltc node must run v0.2.12.1 before 2026-11-13 00:00:00 UTC**, when the LTC share chain moves to [share version 3601](#share-version-3601-flag-day). Several aux chains at once, job-time payouts. (v0.2.12 had an earlier date, 2026-11-11 12:00 UTC: do not run it.)
+- **[v0.2.12.3](https://github.com/frstrtr/c2pool/releases/tag/v0.2.12.3)** — LTC: a node serves every share it holds (no gaps for peers after a dropped connection); the node fee is taken at exactly the configured rate. DASH: compact-block (BIP 152) receive, superblock governance sync, block bodies checked against the header including the v24 asset-unlock root. macOS packages in this release are Apple Silicon only; universal again from the next release.
+- **[v0.2.12.2](https://github.com/frstrtr/c2pool/releases/tag/v0.2.12.2)** — LTC: the built-in bootstrap list holds V36 share-chain nodes only.
+- **[v0.2.12.1](https://github.com/frstrtr/c2pool/releases/tag/v0.2.12.1)** — LTC + merged mining: [share version 3601](#share-version-3601-flag-day), active since 2026-11-13 00:00:00 UTC. Nodes older than v0.2.12.1 and Python p2pool are no longer on the LTC share chain. Several aux chains at once, job-time payouts. (v0.2.12 had an earlier date, 2026-11-11 12:00 UTC: do not run it.)
 - **[v0.2.11.1](https://github.com/frstrtr/c2pool/releases/tag/v0.2.11.1)** — DASH: Dash Core 24 hard fork support in the daemon-less node (every v24 transaction type in templates); LTC fix for a coinbase that could burn the block reward under load.
 - The Python p2pool implementations ([p2pool-dash](https://github.com/frstrtr/p2pool-dash), [p2pool-merged-v36](https://github.com/frstrtr/p2pool-merged-v36)) are no longer maintained. All updates, including security fixes and Dash Core 24 support, ship only in c2pool.
 
@@ -323,6 +325,10 @@ c2pool is an independent C++ implementation of the P2Pool sharechain concept ori
 
 Development is supported by Anthropic's [Claude for Open Source](https://claude.com/contact-sales/claude-for-oss) program (2026). The design, the consensus rules, and responsibility for every byte shipped remain with the maintainers.
 
+> **First LTC + DOGE twin block found by c2pool in production** (2026-11-12 15:46:10 UTC) LTC [#3211872](https://blockchair.com/litecoin/block/3211872) + DOGE [#6454700](https://blockchair.com/dogecoin/block/6454700) — one proof of work, 6.256 LTC + 10,001 DOGE, found by a public V36 pool node (about 210 GH/s) eleven hours after it moved from Python p2pool to c2pool v0.2.12.2.
+>
+> **LTC share chain on share version 3601** (2026-11-13 00:00:00 UTC) — the flag day passed without a split. Python p2pool and c2pool before v0.2.12.1 can no longer join the share chain; the nodes on it run c2pool.
+>
 > **First merged-mined DOGE block:** [#6135703](https://blockchair.com/dogecoin/block/f84500c25a4cce2a08887f29763726bd5ecec7b66fed65a88b181fb0b0ab2383) (2026-03-23) — decentralized LTC+DOGE merged mining via P2Pool V36, cross-validated with c2pool on shared share chain
 >
 > **First daemonless DOGE block:** (2026-03-27) — DOGE block accepted on testnet4alpha via embedded SPV P2P, no dogecoind RPC needed
