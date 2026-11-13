@@ -303,6 +303,16 @@ private:
     // never authorizes (half-open / probe) is dropped when it fires.
     boost::asio::steady_timer handshake_timer_;
 
+    // Single-owner close. The EOF/read-error handler, drop_stale(), the write
+    // error path and StratumServer::stop() all end in cancel_timers(); the
+    // first caller claims the close and the rest return without touching the
+    // socket or the timers. Before this, a session ended on EOF (closed on the
+    // io thread) was still in StratumServer::sessions_, so stop() closed the
+    // same socket a second time; when stop() ran on another thread the two
+    // closes raced in the reactor (UBSan: epoll_reactor deregister_descriptor,
+    // member access within null pointer of type descriptor_state).
+    std::atomic<bool> close_claimed_{false};
+
     // A held job (CoinbaseResult::held): one pending retry per session, for
     // at most StratumConfig::job_hold_limit_sec since the hold began; past it
     // the session stops retrying (the miner keeps its last valid job) until
@@ -318,7 +328,11 @@ public:
                             StratumServer* server = nullptr);
     void start();
 
-    bool is_connected() const { return socket_.is_open(); }
+    // false once any path has claimed the close (close_claimed_), so a caller
+    // on another thread never reads socket_ while its owner is closing it.
+    bool is_connected() const {
+        return !close_claimed_.load(std::memory_order_acquire) && socket_.is_open();
+    }
     bool is_subscribed() const { return subscribed_; }
     bool is_authorized() const { return authorized_; }
     // Seconds since the last inbound stratum line (zombie-session reaper).
@@ -414,6 +428,7 @@ class StratumServer
     // Sessions dropped because an inbound line exceeded
     // StratumSession::kMaxStratumLineBytes without a '\n'.
     std::atomic<uint64_t> oversized_line_drops_{0};
+    std::atomic<uint64_t> session_socket_closes_{0};
 
     // p2pool RateMonitor pair (work.py:223-226):
     //   local_rate_monitor: per-user hashrate (for get_local_rates)
@@ -486,6 +501,10 @@ public:
     /// Sessions dropped for an over-length line (no '\n' within the cap).
     uint64_t get_oversized_line_drops() const { return oversized_line_drops_.load(); }
     void record_oversized_line_drop() { oversized_line_drops_.fetch_add(1); }
+    // Session sockets actually closed (one per session, whichever path won the
+    // close claim). Diagnostics / regression KAT for the single-owner close.
+    uint64_t get_session_socket_closes() const { return session_socket_closes_.load(); }
+    void record_session_socket_close() { session_socket_closes_.fetch_add(1); }
     /// Live session count (dead sessions pruned lazily — see notify_all()).
     size_t get_session_count() const;
 
