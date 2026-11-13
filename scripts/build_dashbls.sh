@@ -65,10 +65,16 @@ echo "[build_dashbls] building dash $DASH_REF src/dashbls (dashd-byte-identical)
 # listed above). The resulting libdashbls.a is SELF-CONTAINED (bls + relic +
 # mimalloc objects in one archive), so no separate librelic_s.a is installed —
 # the c2pool CMake find treats the relic library as optional accordingly.
+# DASHBLS_CONFIGURE_ARGS: extra configure arguments, word-split on purpose.
+# The macOS x86_64 slice is cross-built on Apple Silicon with
+# "--build=aarch64-apple-darwin --host=x86_64-apple-darwin --with-backend=gmp"
+# plus CC/CXX/CPPFLAGS/LDFLAGS from the environment (see
+# .github/actions/provision-dashbls). Unset = the native build, as before.
 (
     cd "$DASHBLS_SRC"
     sh autogen.sh
-    ./configure --prefix="$PREFIX" --disable-shared
+    # shellcheck disable=SC2086
+    ./configure --prefix="$PREFIX" --disable-shared ${DASHBLS_CONFIGURE_ARGS:-}
     make -j "$JOBS"
     make install
 )

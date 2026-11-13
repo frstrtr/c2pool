@@ -361,8 +361,14 @@ Pre-built binaries are available on the [Releases page](https://github.com/frstr
 | Platform | Package | Notes |
 |----------|---------|-------|
 | Linux x86_64 | `.tar.gz` | Extract and run `./start.sh` |
-| macOS (universal) | `.dmg` or `.zip` | Single universal arm64 + x86_64 build (lipo-merged); bundled dylibs, no Homebrew needed |
+| macOS (universal) | `.dmg` or `.zip` | One universal binary for Apple Silicon and Intel Macs; no Homebrew needed |
 | Windows x86_64 | `.zip` or `setup.exe` | Installer bundles VC++ Runtime + firewall rules |
+
+macOS packages are built on an Apple Silicon build host. The arm64 slice is a
+native build; the x86_64 slice is cross-compiled there and started under
+Rosetta 2 before the package is published. Both slices link the same pinned
+libraries, statically. Intel Macs remain a supported target through the
+x86_64 slice. Details: [docs/ci-macos.md](docs/ci-macos.md).
 
 ### Verify downloads
 

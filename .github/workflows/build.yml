@@ -2046,12 +2046,13 @@ jobs:
   # ════════════════════════════════════════════════════════════════════════════
 
   # ════════════════════════════════════════════════════════════════════════════
-  # macOS (matrix). Both arches self-hosted on push/internal-branch PRs, with
-  # GitHub-hosted fork fallback: arm64 -> Mac-mini-Alonso-227 (c2pool-mac-arm)
-  # else macos-14; x86_64 -> macpro-intel-204 (c2pool-mac-intel). Resolves the
-  # macOS x86_64 CI starvation (#42). sccache caches across self-hosted runs.
+  # macOS (matrix). Both arches run on the Apple Silicon build host
+  # (c2pool-mac-arm) on push/internal-branch PRs, with GitHub-hosted macos-14
+  # (also Apple Silicon) as the fork fallback. The Intel build runner is retired
+  # (operator decision 2026-11-13): the x86_64 leg is a cross build on the same
+  # host and its binary is started under Rosetta 2. sccache caches across
+  # self-hosted runs. See docs/ci-macos.md.
   # ════════════════════════════════════════════════════════════════════════════
-  # A paused leg is SKIPPED, never silently green — see mac-x86_64-coverage.
   # Makes PR platform coverage VISIBLE. Dropping legs for speed is fine; a green
   # rollup that silently means less than it did yesterday is not. This job always
   # runs, costs nothing, and states exactly which platforms this run covered.
@@ -2072,16 +2073,12 @@ jobs:
               echo "Restore full PR coverage: \`gh variable delete PR_LINUX_ONLY --repo frstrtr/c2pool\`"
             } >> "$GITHUB_STEP_SUMMARY"
           else
-            if [ "${{ vars.MAC_INTEL_PAUSED }}" = "true" ]; then
-              echo "::warning title=macOS x86_64 NOT COVERED::The macOS x86_64 leg is PAUSED (MAC_INTEL_PAUSED=true). This run does NOT test x86_64."
-              echo "- macOS x86_64: **PAUSED — NOT covered**" >> "$GITHUB_STEP_SUMMARY"
-            elif [ "${{ vars.MAC_INTEL_OFFLINE }}" = "true" ]; then
-              echo "::warning title=macOS x86_64 cross-built::x86_64 was CROSS-BUILT on the ARM M4. Any tests ran under Rosetta 2 — weaker evidence than native Intel silicon."
-              echo "- macOS x86_64: cross-built on ARM M4 (Rosetta)" >> "$GITHUB_STEP_SUMMARY"
-            else
-              echo "- macOS x86_64: covered natively" >> "$GITHUB_STEP_SUMMARY"
-            fi
-            echo "- Linux + Windows: covered" >> "$GITHUB_STEP_SUMMARY"
+            {
+              echo "### Platform coverage"
+              echo "- macOS arm64: built and started natively on the Apple Silicon build host"
+              echo "- macOS x86_64: cross-built on the Apple Silicon build host, started under Rosetta 2 (no Intel hardware in CI)"
+              echo "- Linux + Windows: covered"
+            } >> "$GITHUB_STEP_SUMMARY"
           fi
   macos:
     name: macOS ${{ matrix.arch }}
@@ -2091,124 +2088,89 @@ jobs:
     # runs in release.yml at tag time, so this DEFERS detection rather than
     # losing it. See the ci-platform-coverage job for the visible statement.
     if: ${{ !(github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'dash-linux-only')) && !(github.event_name == 'pull_request' && vars.PR_LINUX_ONLY == 'true') }}
-    runs-on: ${{ matrix.runner }}
+    # Both legs on the Apple Silicon build host. The Intel build runner
+    # (c2pool-mac-intel) is retired; nothing targets its labels any more, and
+    # the old MAC_INTEL_OFFLINE / MAC_INTEL_PAUSED repo variables are no longer
+    # read by any workflow.
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","macOS","ARM64","c2pool-mac-arm"]') || 'macos-14' }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - arch: arm64
-            runner: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","macOS","ARM64","c2pool-mac-arm"]') || 'macos-14' }}
-          # macpro-intel-204 taken offline by operator 2026-07-28 (AFK several hours).
-          # While away, cross-build the x86_64 slice on our own Apple-Silicon M4
-          # (Mac-mini-Alonso-227 / c2pool-mac-arm) via CMAKE_OSX_ARCHITECTURES, the
-          # same way release.yml lipo-ships the universal package. Keeps the work on
-          # our build factory, spends no hosted-runner minutes, keeps sccache warm.
-          # Default (no var) = self-hosted macpro-intel-204, the normal steady state.
-          # COVERAGE NOTE: while offline this leg is BUILD-ONLY unless Rosetta 2 is
-          # present on the ARM runner (x86_64 binaries execute only under Rosetta) --
-          # a green here is weaker evidence than a native-Intel green. See Verify.
-          #   ENABLE  offline mode : gh variable set    MAC_INTEL_OFFLINE --body true --repo frstrtr/c2pool
-          #   DISABLE (machine back): gh variable delete MAC_INTEL_OFFLINE            --repo frstrtr/c2pool
-          # MAC_INTEL_PAUSED=true DROPS this leg entirely — for when the Intel
-          # machine is physically away and the ARM M4 cannot cross-build it
-          # (no x86_64 Homebrew under /usr/local). This is a REAL COVERAGE GAP,
-          # not a pass: the mac-x86_64-coverage job below turns it into a
-          # visible warning so a green rollup cannot be mistaken for "x86_64 is
-          # tested". Prefer MAC_INTEL_OFFLINE (reroute to the M4) whenever the
-          # M4 has an x86_64 Homebrew; only pause when neither host can build.
-          #   PAUSE   : gh variable set    MAC_INTEL_PAUSED --body true --repo frstrtr/c2pool
-          #   RESUME  : gh variable delete MAC_INTEL_PAUSED            --repo frstrtr/c2pool
-          - arch: x86_64
-            runner: ${{ vars.MAC_INTEL_OFFLINE == 'true' && ((github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","macOS","ARM64","c2pool-mac-arm"]') || 'macos-14') || fromJSON('["self-hosted","macOS","X64","c2pool-mac-intel"]') }}
+        arch: [arm64, x86_64]
     steps:
       - uses: actions/checkout@v6
 
       - name: Set up Homebrew PATH
-        # Self-hosted Intel runner (macpro-intel-204) launches the Actions
-        # service from launchd, whose PATH omits Homebrew's /usr/local/bin
-        # (#100: brew exit 127). GitHub-hosted arm64 keeps /opt/homebrew on PATH.
-        # Append whichever prefix actually has brew so every later step
-        # (cmake, brew --prefix) inherits it via $GITHUB_PATH.
+        # Homebrew supplies build TOOLS only (cmake, conan, sccache). The runner
+        # service starts from launchd, whose PATH omits /opt/homebrew/bin
+        # (#100: brew exit 127), so add it explicitly.
         run: |
           if [ -x /opt/homebrew/bin/brew ]; then
             echo "/opt/homebrew/bin" >> "$GITHUB_PATH"
-          elif [ -x /usr/local/bin/brew ]; then
-            echo "/usr/local/bin" >> "$GITHUB_PATH"
           else
-            echo "::error::Homebrew not found at /opt/homebrew or /usr/local on ${RUNNER_NAME:-runner}" >&2
+            echo "::error::Homebrew not found at /opt/homebrew on ${RUNNER_NAME:-runner} (an Apple Silicon host is required)" >&2
             exit 1
           fi
 
-      - name: Resolve target toolchain (arch-aware)
-        id: tc
-        # macpro-intel-204 offline fallback: the x86_64 leg runs on the Apple
-        # Silicon M4, so it must link x86_64 deps from the SEPARATE x86_64
-        # Homebrew rooted at /usr/local -- not the arm64 /opt/homebrew. Native
-        # legs (arm64 here, or x86_64 on macpro-intel-204 when the var is unset)
-        # use whichever brew "Set up Homebrew PATH" put on PATH. Fail loudly if
-        # x86_64 brew is absent rather than silently linking arm64 into an
-        # x86_64 target (a mis-linked binary that "builds" is worse than a red).
-        run: |
-          HOST="$(uname -m)"; TARGET="${{ matrix.arch }}"
-          if [ "$TARGET" = "x86_64" ] && [ "$HOST" = "arm64" ]; then
-            if [ ! -x /usr/local/bin/brew ]; then
-              echo "::error::x86_64 Homebrew (/usr/local/bin/brew) not found on ${RUNNER_NAME:-runner}; cannot cross-build the x86_64 slice. Install x86_64 Homebrew on Mac-mini-Alonso-227, or bring macpro-intel-204 back (gh variable delete MAC_INTEL_OFFLINE)." >&2
-              exit 1
-            fi
-            echo "brew=arch -x86_64 /usr/local/bin/brew" >> "$GITHUB_OUTPUT"
-            echo "prefix=/usr/local" >> "$GITHUB_OUTPUT"
-            echo "cross=1" >> "$GITHUB_OUTPUT"
-          else
-            echo "brew=brew" >> "$GITHUB_OUTPUT"
-            echo "prefix=$(brew --prefix)" >> "$GITHUB_OUTPUT"
-            echo "cross=0" >> "$GITHUB_OUTPUT"
-          fi
+      # Same provisioning as release.yml: Conan pins (conanfile.txt +
+      # conan.lock) and static secp256k1/gmp, built for THIS arch. x86_64 is a
+      # Conan cross build (-s:h arch=x86_64); no Homebrew library is linked.
+      - name: Provision macOS dependencies (${{ matrix.arch }})
+        uses: ./.github/actions/provision-macos-deps
+        with:
+          arch: ${{ matrix.arch }}
+          output-folder: build
 
-      - name: Install dependencies
-        run: ${{ steps.tc.outputs.brew }} install cmake boost leveldb secp256k1 nlohmann-json yaml-cpp sccache
+      - name: Ensure sccache
+        run: command -v sccache > /dev/null 2>&1 || brew install sccache
 
       - name: Configure
-        # Drive the target arch explicitly (sibling of release.yml universal) and
-        # point find_package at the matching Homebrew prefix so the x86_64 cross
-        # leg links x86_64 libs, not arm64 ones.
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }} -DCMAKE_PREFIX_PATH=${{ steps.tc.outputs.prefix }} -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
+        # CMAKE_IGNORE_PREFIX_PATH keeps find_library/find_package away from
+        # Homebrew's arm64-only libraries, which would mis-link the x86_64 leg.
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_TOOLCHAIN_FILE="$C2POOL_CONAN_TOOLCHAIN" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }} \
+            -DCMAKE_PREFIX_PATH="$C2POOL_MACOS_DEPS" \
+            "-DCMAKE_IGNORE_PREFIX_PATH=/opt/homebrew;/usr/local" \
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
 
       - name: Build
         run: cmake --build build --target c2pool -j"${BUILD_J:-4}"
 
       - name: Verify binary
-        # `file` inspects the Mach-O without executing. The --help smoke actually
-        # runs the binary; for x86_64 cross-built on Apple Silicon that needs
-        # Rosetta 2. Probe for it -- run the smoke under Rosetta if present, else
-        # emit a BUILD-ONLY warning (not a failure). Native legs always smoke.
+        # The binary must be exactly this arch and must start: natively for
+        # arm64, under Rosetta 2 for the cross-built x86_64 leg. A host without
+        # Rosetta fails the x86_64 leg instead of passing it build-only.
         run: |
-          file build/src/c2pool/c2pool
-          if [ "${{ steps.tc.outputs.cross }}" = "1" ]; then
-            if arch -x86_64 /usr/bin/true 2>/dev/null; then
-              arch -x86_64 build/src/c2pool/c2pool --help 2>&1 | head -3
-            else
-              echo "::warning::x86_64 --help smoke skipped -- Rosetta 2 absent on ${RUNNER_NAME:-runner}; this leg is BUILD-ONLY while macpro-intel-204 is offline (MAC_INTEL_OFFLINE)."
-            fi
-          else
-            build/src/c2pool/c2pool --help 2>&1 | head -3
-          fi
+          BIN=build/src/c2pool/c2pool
+          file "$BIN"
+          archs="$(lipo -archs "$BIN")"
+          echo "lipo -archs $BIN: $archs"
+          [ "$archs" = "${{ matrix.arch }}" ] || { echo "::error::$BIN is '$archs', expected ${{ matrix.arch }}"; exit 1; }
+          bash scripts/ci/macos_slice_smoke.sh ${{ matrix.arch }} "$BIN"
 
       - name: Package release
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           PKG="c2pool-${VERSION}-macos-${{ matrix.arch }}"
-          BREW="$(brew --prefix)"
           mkdir -p "${PKG}/lib" "${PKG}/config" "${PKG}/web-static" "${PKG}/explorer"
           cp build/src/c2pool/c2pool "${PKG}/"
           strip "${PKG}/c2pool"
-          for dylib in $(otool -L "${PKG}/c2pool" | grep "${BREW}" | awk '{print $1}'); do
+          # Third-party libraries are static (provision-macos-deps); bundle any
+          # other non-system dylib reference so nothing points at the build host.
+          ext_refs() { otool -L "$1" | tail -n +2 | awk '{print $1}' | grep -E '^/' | grep -vE '^(/usr/lib/|/System/)' || true; }
+          for dylib in $(ext_refs "${PKG}/c2pool"); do
             base=$(basename "$dylib")
-            cp "$dylib" "${PKG}/lib/${base}"
+            cp "$dylib" "${PKG}/lib/${base}" && chmod u+w "${PKG}/lib/${base}"
             install_name_tool -change "$dylib" "@executable_path/lib/${base}" "${PKG}/c2pool"
           done
           for lib in "${PKG}"/lib/*.dylib; do
-            for ref in $(otool -L "$lib" | grep "${BREW}" | awk '{print $1}'); do
+            [ -f "$lib" ] || continue
+            for ref in $(ext_refs "$lib"); do
               base=$(basename "$ref")
               [ -f "${PKG}/lib/${base}" ] && install_name_tool -change "$ref" "@executable_path/lib/${base}" "$lib"
             done
@@ -2323,8 +2285,8 @@ jobs:
           }
           # -DSECP256K1_ENABLE_MODULE_RECOVERY=ON: upstream defaults this module
           # OFF, and with it off the recovery header (secp256k1_recovery.h) is
-          # NOT installed and the recovery symbols are NOT compiled. Linux/macOS
-          # get it from their distro packages (libsecp256k1-dev / brew secp256k1);
+          # NOT installed and the recovery symbols are NOT compiled. Linux gets
+          # it from libsecp256k1-dev, macOS from scripts/ci/build_macos_deps.sh;
           # this source build must enable it explicitly so spork.hpp's
           # <secp256k1_recovery.h> resolves and secp256k1_ecdsa_recover* link.
           cmake -B secp256k1-src/build -S secp256k1-src -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="${env:GITHUB_WORKSPACE}/secp256k1" -DSECP256K1_ENABLE_MODULE_RECOVERY=ON -DSECP256K1_BUILD_TESTS=OFF -DSECP256K1_BUILD_EXHAUSTIVE_TESTS=OFF -DSECP256K1_BUILD_BENCHMARK=OFF -DSECP256K1_BUILD_EXAMPLES=OFF

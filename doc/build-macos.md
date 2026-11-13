@@ -21,8 +21,11 @@ This guide covers building c2pool from source on macOS.
 ## Option 1: Pre-built DMG (recommended)
 
 Download from the [Releases page](https://github.com/frstrtr/c2pool/releases):
-- **Intel Mac**: `c2pool-VERSION-macos-x86_64.dmg`
-- **Apple Silicon (M1/M2/M3/M4)**: `c2pool-VERSION-macos-arm64.dmg`
+`c2pool-<coin>-VERSION-macos-universal.dmg` (or `.zip`). It is one universal
+binary that runs natively on both Intel and Apple Silicon (M1/M2/M3/M4) Macs.
+Release packages are built on an Apple Silicon build host; the x86_64 slice is
+cross-compiled there and started under Rosetta 2 before release (see
+[docs/ci-macos.md](../docs/ci-macos.md)).
 
 ```bash
 # Mount the DMG
@@ -41,8 +44,9 @@ cd ~/c2pool
 
 Dashboard: `http://localhost:8080` — Stratum: `stratum+tcp://YOUR_IP:9327`
 
-The DMG contains everything needed: the binary, bundled `libsecp256k1`, web dashboard,
-config templates, block explorer, and a start script. No additional dependencies required.
+The DMG contains everything needed: the binary (third-party libraries linked in statically), web
+dashboard, config templates, block explorer, and a start script. No additional
+dependencies required.
 
 > **macOS Gatekeeper**: On first run, macOS may block the binary. Open
 > System Settings > Privacy & Security and click "Allow Anyway", or run:

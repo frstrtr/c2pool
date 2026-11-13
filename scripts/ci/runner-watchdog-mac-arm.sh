@@ -13,10 +13,10 @@
 #   token minted with repo-admin creds, which live here on the bridge, not
 #   on the Mac node. This watchdog closes that gap.
 #
-#   Sibling of runner-watchdog-mac-intel.sh. arm64 is a REQUIRED release leg
-#   (the macOS universal package lipo-merges the arm64 + x86_64 binaries), so
-#   the Apple Silicon node needs the same self-heal the Intel node already
-#   has -- an unattended arm64 drop must not block a release.
+#   This is the only macOS build host: it builds BOTH slices of the universal
+#   package (arm64 natively, x86_64 cross-compiled; the Intel runner and its
+#   runner-watchdog-mac-intel.sh are retired, see docs/ci-macos.md), so an
+#   unattended drop here stops every macOS release leg.
 #
 # WHAT IT DOES (idempotent, non-destructive):
 #   1. Polls the repo's runners API for Mac-mini-Alonso-227.
@@ -75,8 +75,8 @@ REG_TOKEN=$(gh api --method POST "repos/${REPO}/actions/runners/registration-tok
 # wiping the local config files directly.
 RM_TOKEN=$(gh api --method POST "repos/${REPO}/actions/runners/remove-token" --jq .token 2>/dev/null || true)
 
-# macOS runner service management is more involved than the Intel sibling's
-# original 5-liner assumed (that flow was never drop-tested). Two facts,
+# macOS runner service management is more involved than the (now retired)
+# Intel sibling's original 5-liner assumed (that flow was never drop-tested). Two facts,
 # both confirmed by an actual .227 drop test 2026-07-27:
 #   (a) The runner's launchd LaunchAgent lives in the user's *GUI* (Aqua)
 #       domain. Over a non-GUI SSH session `svc.sh install/uninstall`

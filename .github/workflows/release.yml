@@ -15,11 +15,14 @@ name: Release matrix
 # the ship decouple: a red btc cell still lets ltc/dash/doge/dgb/bch package.
 #
 # macOS: ships UNIVERSAL (arm64+x86_64) at tag time (operator decision
-# 2026-06-11). Each arch builds natively on its own runner — macos-14
-# (Apple Silicon -> arm64) and macos-13 (Intel -> x86_64) — so there is no
-# cross-compile and no dual Conan profile; brew supplies native deps on
-# each. The macos-universal job lipo-merges the per-arch binary and every
-# bundled dylib into the single universal package that ships.
+# 2026-06-11). Both slices build on the Apple Silicon build host (operator
+# decision 2026-11-13: the Intel build runner is retired). arm64 is a native
+# build; x86_64 is cross-compiled there (Conan host profile arch=x86_64, build
+# profile armv8) and started under Rosetta 2 before it ships. Both slices link
+# the same pinned libraries (conanfile.txt + conan.lock, plus
+# scripts/ci/build_macos_deps.sh); no Homebrew library is linked. The
+# macos-universal job lipo-merges the per-arch binary and every bundled dylib
+# into the single universal package that ships. See docs/ci-macos.md.
 #
 # Triggers: tags only, plus workflow_dispatch for a full-matrix dry run
 # from any ref. PR-time per-coin coverage stays in coin-matrix.yml; this
@@ -285,25 +288,25 @@ jobs:
 
   # ════════════════════════════════════════════════════════════════════════════
   # macOS universal (arm64 + x86_64) — operator decision 2026-06-11.
-  # Each arch builds natively on its own runner (macos-14 = Apple Silicon ->
-  # arm64, macos-13 = Intel -> x86_64); no cross-compile, no dual Conan
-  # profile. The per-arch packages here are INTERMEDIATE artifacts
-  # (intermediate-macos-*, deliberately not pkg-* so the checksums job skips
-  # them); the macos-universal job lipo-merges them into the shipped package.
+  # Both arches build on the Apple Silicon build host (c2pool-mac-arm; the
+  # GitHub-hosted fallback is macos-14, also Apple Silicon). The Intel build
+  # runner is retired (operator decision 2026-11-13). arm64 builds natively;
+  # x86_64 is a cross build (Conan -s:h arch=x86_64, clang -arch x86_64) whose
+  # binary is started under Rosetta 2 here and again in macos-universal.
+  # Libraries: .github/actions/provision-macos-deps (Conan pins + static
+  # secp256k1/gmp) for BOTH arches, so the slices never differ in versions.
+  # The per-arch packages here are INTERMEDIATE artifacts (intermediate-macos-*,
+  # deliberately not pkg-* so the checksums job skips them); the
+  # macos-universal job lipo-merges them into the shipped package.
   # ════════════════════════════════════════════════════════════════════════════
   macos:
     name: ${{ matrix.coin }} ${{ matrix.arch }} (macOS build)
-    runs-on: ${{ matrix.runner }}
+    runs-on: ${{ inputs.force-github-hosted != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","macOS","ARM64","c2pool-mac-arm"]') || 'macos-14' }}
     strategy:
       fail-fast: false
       matrix:
         coin: ${{ fromJSON(github.event.inputs.coins || '["btc","ltc","dgb","dash","bch","bip110"]') }}
         arch: [arm64, x86_64]
-        include:
-          - arch: arm64
-            runner: ${{ inputs.force-github-hosted != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","macOS","ARM64","c2pool-mac-arm"]') || 'macos-14' }}
-          - arch: x86_64
-            runner: ${{ inputs.force-github-hosted != 'true' && fromJSON('["self-hosted","macOS","X64","c2pool-mac-intel"]') || 'macos-13' }}
     steps:
       - uses: actions/checkout@v6
 
@@ -329,36 +332,39 @@ jobs:
           fi
 
       - name: Set up Homebrew PATH
-        # Self-hosted Intel runner (macpro-intel-204) launches Actions from
-        # launchd, whose PATH omits Homebrew's /usr/local/bin (#100: brew exit
-        # 127). GitHub-hosted arm64 keeps /opt/homebrew on PATH. Append whichever
-        # prefix actually has brew so later steps inherit it via $GITHUB_PATH.
+        # Homebrew supplies build TOOLS only (cmake, conan, autotools); the
+        # runner service is started from launchd, whose PATH omits
+        # /opt/homebrew/bin (#100: brew exit 127), so add it explicitly.
         run: |
           if [ -x /opt/homebrew/bin/brew ]; then
             echo "/opt/homebrew/bin" >> "$GITHUB_PATH"
-          elif [ -x /usr/local/bin/brew ]; then
-            echo "/usr/local/bin" >> "$GITHUB_PATH"
           else
-            echo "::error::Homebrew not found at /opt/homebrew or /usr/local on ${RUNNER_NAME:-runner}" >&2
+            echo "::error::Homebrew not found at /opt/homebrew on ${RUNNER_NAME:-runner} (an Apple Silicon host is required)" >&2
             exit 1
           fi
 
-      - name: Install dependencies
+      # Every library both slices link, built for THIS arch from the same pins:
+      # Conan (conanfile.txt + conan.lock; gtest included, for the DASH KATs)
+      # and static secp256k1 + gmp. Exports CONAN_HOME, C2POOL_MACOS_DEPS and
+      # C2POOL_CONAN_TOOLCHAIN for the configure below.
+      - name: Provision macOS dependencies (${{ matrix.arch }})
         if: steps.presence.outputs.exists == '1'
-        run: brew install cmake boost leveldb secp256k1 nlohmann-json yaml-cpp
+        uses: ./.github/actions/provision-macos-deps
+        with:
+          arch: ${{ matrix.arch }}
+          output-folder: build
 
       # DASH cell only: build/reuse dash's own src/dashbls at the pinned tag for
-      # THIS arch (native, Homebrew gmp; dashbls's configure picks ARITH=GMP on arm64
-      # and ARITH=EASY on x86_64 Darwin, the same split as dashd's builds) and export
+      # THIS arch (x86_64 is an autotools cross build; relic backend GMP on
+      # arm64 and EASY on x86_64, the same split dashd's own macOS builds get)
+      # and export
       # DASHBLS_ROOT, so the package links the REAL BLS12-381 verifier like the
-      # Linux one. googletest is only for the BLS KATs run below.
+      # Linux one.
       - name: Provision dashbls (DASH only)
         if: steps.presence.outputs.exists == '1' && matrix.coin == 'dash'
         uses: ./.github/actions/provision-dashbls
-
-      - name: Install googletest (DASH only, for the BLS KATs)
-        if: steps.presence.outputs.exists == '1' && matrix.coin == 'dash'
-        run: brew install googletest
+        with:
+          arch: ${{ matrix.arch }}
 
       - name: Configure
         if: steps.presence.outputs.exists == '1'
@@ -366,23 +372,38 @@ jobs:
           # DGB: -DAUX_DOGE=ON -> DGB parent + embedded DOGE (mirrors c2pool-ltc).
           # DASH: -DC2POOL_DASH_BLS=ON is a HARD requirement (cmake FATAL_ERRORs
           # without the library), so this cell cannot package a BLS-dark binary.
+          # CMAKE_IGNORE_PREFIX_PATH keeps find_library/find_package away from
+          # Homebrew's arm64-only libraries (they would mis-link the x86_64
+          # slice and make the two slices differ).
           EXTRA=""
           case "${{ matrix.coin }}" in
             dgb)  EXTRA="-DAUX_DOGE=ON" ;;
             dash) EXTRA="-DC2POOL_DASH_BLS=ON -DDASHBLS_ROOT=$DASHBLS_ROOT" ;;
           esac
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release $EXTRA
+          cmake -S . -B build \
+            -DCMAKE_TOOLCHAIN_FILE="$C2POOL_CONAN_TOOLCHAIN" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }} \
+            -DCMAKE_PREFIX_PATH="$C2POOL_MACOS_DEPS" \
+            -DCMAKE_IGNORE_PREFIX_PATH="/opt/homebrew;/usr/local" \
+            $EXTRA
 
       - name: Build c2pool-${{ matrix.coin }}
         if: steps.presence.outputs.exists == '1'
         run: cmake --build build --target c2pool-${{ matrix.coin }} -j"${BUILD_J:-4}"
 
-      - name: Smoke test (--help)
+      # The slice must be exactly this arch, and it must start: natively for
+      # arm64, under Rosetta 2 for the cross-built x86_64 (a host without
+      # Rosetta fails here rather than shipping an x86_64 slice nobody ran).
+      - name: Arch check + smoke test (--help)
         if: steps.presence.outputs.exists == '1'
         run: |
           BIN=build/src/c2pool/c2pool-${{ matrix.coin }}
           file "$BIN"
-          "$BIN" --help 2>&1 | head -5 || true
+          archs="$(lipo -archs "$BIN")"
+          echo "lipo -archs $BIN: $archs"
+          [ "$archs" = "${{ matrix.arch }}" ] || { echo "::error::$BIN is '$archs', expected ${{ matrix.arch }}"; exit 1; }
+          bash scripts/ci/macos_slice_smoke.sh ${{ matrix.arch }} "$BIN"
 
       # Same three legs as the Linux DASH cell and build.yml's linux-dash-bls:
       # the artefact carries dashbls (rodata + symbols, pre-strip), the binary
@@ -393,7 +414,7 @@ jobs:
         run: |
           BIN=build/src/c2pool/c2pool-dash
           bash scripts/ci/dash_bls_linked_guard.sh "$BIN"
-          "$BIN" --help > help.log 2>&1 || true
+          arch -${{ matrix.arch }} "$BIN" --help > help.log 2>&1 || true
           line="$(grep -m1 'DASH BLS backend:' help.log || true)"
           echo "${{ matrix.arch }}: $line"
           case "$line" in
@@ -405,7 +426,8 @@ jobs:
         if: steps.presence.outputs.exists == '1' && matrix.coin == 'dash'
         run: |
           cmake --build build --target test_dash_bls_verify -j"${BUILD_J:-4}"
-          ./build/test/test_dash_bls_verify > bls_kat.log 2>&1 || { cat bls_kat.log; exit 1; }
+          # x86_64: the cross-built KAT binary runs under Rosetta 2.
+          arch -${{ matrix.arch }} ./build/test/test_dash_bls_verify > bls_kat.log 2>&1 || { cat bls_kat.log; exit 1; }
           cat bls_kat.log
           log="$(cat bls_kat.log)"
           missing=0
@@ -429,34 +451,52 @@ jobs:
           VERSION="${{ steps.ver.outputs.version }}"
           COIN="${{ matrix.coin }}"
           ARCH="${{ matrix.arch }}"
-          BREW_PREFIX="$(brew --prefix)"
           PKG="c2pool-${COIN}-${VERSION}-macos-${ARCH}"
           mkdir -p "${PKG}/lib" "${PKG}/config" "${PKG}/web-static" "${PKG}/explorer"
           cp "build/src/c2pool/c2pool-${COIN}" "${PKG}/"
+          # DASH: when this arch's relic uses the GMP backend (arm64; x86_64 uses
+          # EASY, as dashd does, see provision-dashbls), gmp comes from the
+          # static archive and must be inside the executable (unstripped build).
+          if [ "$COIN" = dash ]; then
+            arith="$(awk '$1=="#define" && $2=="ARITH" {print $3}' "$DASHBLS_ROOT/include/relic_conf.h")"
+            echo "  relic ARITH backend ($ARCH): ${arith:-unknown}"
+            if [ "$arith" = "GMP" ]; then
+              # (no grep -q: under pipefail its early exit would SIGPIPE nm)
+              if nm "build/src/c2pool/c2pool-${COIN}" | grep ' ___gmpn_' > /dev/null; then
+                echo "  ok   gmp linked statically"
+              else
+                echo "PKG-ASSERT FAIL: relic uses GMP but c2pool-dash has no gmp symbols"; exit 1
+              fi
+            fi
+          fi
           strip "${PKG}/c2pool-${COIN}"
-          for dylib in $(otool -L "${PKG}/c2pool-${COIN}" | grep "${BREW_PREFIX}" | awk '{print $1}'); do
+          # Third-party libraries are static (provision-macos-deps), so the only
+          # dylibs a slice may load from outside /usr/lib and /System are the
+          # in-tree ones linked via @rpath (DASH: libdash_scriptcheck, the
+          # hidden-visibility script interpreter, src/impl/dash/CMakeLists.txt).
+          # Any other absolute reference is bundled the same way, so a stray
+          # dependency can never stay pointed at the build host.
+          ext_refs() { otool -L "$1" | tail -n +2 | awk '{print $1}' | grep -E '^/' | grep -vE '^(/usr/lib/|/System/)' || true; }
+          for dylib in $(ext_refs "${PKG}/c2pool-${COIN}"); do
             base=$(basename "$dylib")
-            cp "$dylib" "${PKG}/lib/${base}"
+            cp "$dylib" "${PKG}/lib/${base}" && chmod u+w "${PKG}/lib/${base}"
             install_name_tool -change "$dylib" "@executable_path/lib/${base}" "${PKG}/c2pool-${COIN}"
           done
-          # In-tree shared objects linked via @rpath (DASH: libdash_scriptcheck, the
-          # hidden-visibility script interpreter, src/impl/dash/CMakeLists.txt) are not
-          # under the brew prefix; bundle them the same way.
           for ref in $(otool -L "${PKG}/c2pool-${COIN}" | awk '/@rpath\//{print $1}'); do
             base=$(basename "$ref")
             src=$(find build -name "$base" -type f | head -1)
             [ -n "$src" ] || { echo "PKG-ASSERT FAIL: $ref not found under build/"; exit 1; }
-            cp "$src" "${PKG}/lib/${base}"
+            cp "$src" "${PKG}/lib/${base}" && chmod u+w "${PKG}/lib/${base}"
             install_name_tool -change "$ref" "@executable_path/lib/${base}" "${PKG}/c2pool-${COIN}"
           done
-          # Bundle what the bundled dylibs need in turn (libleveldb -> libsnappy,
-          # ...), repeating until no brew reference is left. A dependency that is
-          # only present on the build runner makes the package fail on a clean Mac.
+          # Bundle what the bundled dylibs need in turn, repeating until no
+          # outside reference is left.
           changed=1
           while [ "$changed" -eq 1 ]; do
             changed=0
             for lib in "${PKG}"/lib/*.dylib; do
-              for ref in $(otool -L "$lib" | tail -n +2 | grep "${BREW_PREFIX}" | awk '{print $1}'); do
+              [ -f "$lib" ] || continue
+              for ref in $(ext_refs "$lib"); do
                 base=$(basename "$ref")
                 if [ ! -f "${PKG}/lib/${base}" ]; then
                   cp "$ref" "${PKG}/lib/${base}" && chmod u+w "${PKG}/lib/${base}"
@@ -467,19 +507,19 @@ jobs:
             done
           done
           for lib in "${PKG}"/lib/*.dylib; do
+            [ -f "$lib" ] || continue
             install_name_tool -id "@executable_path/lib/$(basename $lib)" "$lib"
           done
-          if otool -L "${PKG}/c2pool-${COIN}" "${PKG}"/lib/*.dylib | tail -n +1 | grep -vE "^${PKG}/" | grep -E "@rpath/|/actions-runner/|${BREW_PREFIX}/|/opt/homebrew/|/usr/local/"; then
+          echo "== load commands"
+          otool -L "${PKG}/c2pool-${COIN}" "${PKG}"/lib/*.dylib 2>/dev/null || true
+          if otool -L "${PKG}/c2pool-${COIN}" "${PKG}"/lib/*.dylib 2>/dev/null | grep -vE "^${PKG}/" | grep -E "@rpath/|/actions-runner/|/opt/homebrew/|/usr/local/|/Users/|/private/"; then
             echo "PKG-ASSERT FAIL: a dylib reference points outside the package"; exit 1
           fi
-          # DASH: libdashbls.a is static, but relic's ARITH=GMP backend links
-          # Homebrew's SHARED libgmp, which the loop above must have bundled.
-          if [ "$COIN" = dash ]; then
-            case "$(ls "${PKG}/lib/")" in
-              *libgmp.*) echo "  ok   libgmp bundled" ;;
-              *) echo "PKG-ASSERT FAIL: libgmp not bundled in ${PKG}/lib (BLS build needs it)"; exit 1 ;;
-            esac
-          fi
+          for f in "${PKG}/c2pool-${COIN}" "${PKG}"/lib/*.dylib; do
+            [ -f "$f" ] || continue
+            a="$(lipo -archs "$f")"
+            [ "$a" = "$ARCH" ] || { echo "PKG-ASSERT FAIL: $f is '$a', expected $ARCH"; exit 1; }
+          done
           cp start.sh "${PKG}/" && chmod +x "${PKG}/start.sh"
           cp "config/${COIN}/c2pool_mainnet.yaml" "${PKG}/config/c2pool_mainnet.yaml.example"
           cp "config/${COIN}/c2pool_testnet.yaml" "${PKG}/config/c2pool_testnet.yaml"
@@ -561,17 +601,22 @@ jobs:
           # config/web-static/explorer/start.sh are arch-independent; seed the
           # universal package from the arm64 tree, then overwrite the binary
           # and every dylib with their lipo-merged universal counterparts.
+          # Both slices link the same pinned libraries, so each bundled dylib
+          # must exist in BOTH trees; one present in a single tree would ship
+          # thin and fail to load on the other arch, so that is an error.
           cp -R "${ARM_SRC}" "${PKG}"
+          mkdir -p "${PKG}/lib"
           rm -f "${PKG}/c2pool-${COIN}"
           lipo -create "${ARM_SRC}/c2pool-${COIN}" "${X86_SRC}/c2pool-${COIN}" -output "${PKG}/c2pool-${COIN}"
           chmod +x "${PKG}/c2pool-${COIN}"
-          for lib in "${ARM_SRC}"/lib/*.dylib; do
-            base=$(basename "$lib")
-            if [ -f "${X86_SRC}/lib/${base}" ]; then
-              lipo -create "$lib" "${X86_SRC}/lib/${base}" -output "${PKG}/lib/${base}"
-            else
-              cp "$lib" "${PKG}/lib/${base}"
+          for base in $( (ls "${ARM_SRC}/lib" "${X86_SRC}/lib" 2>/dev/null || true) | grep '\.dylib$' | sort -u); do
+            a="${ARM_SRC}/lib/${base}"; x="${X86_SRC}/lib/${base}"
+            if [ ! -f "$a" ] || [ ! -f "$x" ]; then
+              echo "::error::lib/${base} is bundled for only one arch (arm64: $([ -f "$a" ] && echo yes || echo no), x86_64: $([ -f "$x" ] && echo yes || echo no))"
+              exit 1
             fi
+            rm -f "${PKG}/lib/${base}"
+            lipo -create "$a" "$x" -output "${PKG}/lib/${base}"
           done
           chmod +x "${PKG}/start.sh" 2>/dev/null || true
           # Ad-hoc re-sign. The per-arch step's strip and install_name_tool
@@ -583,24 +628,64 @@ jobs:
           # a universal file is signed). This is not a Developer ID signature.
           bad=0
           for f in "${PKG}"/lib/*.dylib "${PKG}/c2pool-${COIN}"; do
+            [ -f "$f" ] || continue
             codesign --verify "$f" 2>/dev/null || bad=$((bad + 1))
           done
           echo "Mach-O files with an invalid signature before re-signing: $bad"
           for f in "${PKG}"/lib/*.dylib "${PKG}/c2pool-${COIN}"; do
+            [ -f "$f" ] || continue
             codesign --force --sign - "$f"
           done
           for f in "${PKG}"/lib/*.dylib "${PKG}/c2pool-${COIN}"; do
+            [ -f "$f" ] || continue
             codesign --verify --strict "$f" || { echo "::error::$f still fails codesign --verify"; exit 1; }
           done
           file "${PKG}/c2pool-${COIN}"
-          lipo -info "${PKG}/c2pool-${COIN}"
+
+      # What ships must be universal end to end: the binary and every bundled
+      # dylib carry exactly the arm64 and x86_64 slices, and both slices of the
+      # signed package start (arm64 natively, x86_64 under Rosetta 2). The
+      # x86_64 slice is cross-built, so this is where it is run as shipped.
+      - name: Verify universal package (lipo -archs + both slices start)
+        if: steps.presence.outputs.exists == '1'
+        run: |
+          PKG="c2pool-${{ matrix.coin }}-${{ steps.ver.outputs.version }}-macos-universal"
+          BIN="${PKG}/c2pool-${{ matrix.coin }}"
+          fail=0
+          for f in "$BIN" "${PKG}"/lib/*.dylib; do
+            [ -f "$f" ] || continue
+            archs="$(lipo -archs "$f")"
+            echo "lipo -archs ${f#${PKG}/}: $archs"
+            case " $archs " in
+              *" arm64 "*) ;;
+              *) echo "::error::${f#${PKG}/} has no arm64 slice"; fail=1 ;;
+            esac
+            case " $archs " in
+              *" x86_64 "*) ;;
+              *) echo "::error::${f#${PKG}/} has no x86_64 slice"; fail=1 ;;
+            esac
+            [ "$(echo $archs | wc -w)" -eq 2 ] || { echo "::error::${f#${PKG}/} has unexpected slices: $archs"; fail=1; }
+          done
+          [ "$fail" -eq 0 ] || exit 1
+          for a in arm64 x86_64; do
+            minos="$(otool -arch "$a" -l "$BIN" | awk '/LC_BUILD_VERSION/{f=1} f&&/minos/{print $2; exit}')"
+            echo "$a slice minimum macOS: ${minos:-unknown}"
+          done
+          bash scripts/ci/macos_slice_smoke.sh arm64 "$BIN" smoke-universal-arm64.log
+          bash scripts/ci/macos_slice_smoke.sh x86_64 "$BIN" smoke-universal-x86_64.log
+
+      - name: Zip universal package
+        if: steps.presence.outputs.exists == '1'
+        run: |
+          PKG="c2pool-${{ matrix.coin }}-${{ steps.ver.outputs.version }}-macos-universal"
           zip -r "${PKG}.zip" "${PKG}/"
 
       # On the binary users download: each slice of the stripped universal
       # c2pool-dash carries dashbls (rodata leg; stripped Mach-O keeps a token
-      # symbol table, hence --rodata-only), the bundled libgmp has both slices,
-      # and the package starts and names a REAL backend (arm64 natively, x86_64
-      # under Rosetta when the host has it).
+      # symbol table, hence --rodata-only), gmp is either linked in statically
+      # (the provision-macos-deps build) or bundled as a universal dylib, and
+      # the package starts and names a REAL backend on both slices (arm64
+      # natively, x86_64 under Rosetta 2; no Rosetta is an error).
       - name: BLS link guard + backend line (DASH, universal package)
         if: steps.presence.outputs.exists == '1' && matrix.coin == 'dash'
         run: |
@@ -612,14 +697,21 @@ jobs:
             bash scripts/ci/dash_bls_linked_guard.sh --rodata-only "bls-guard-$a"
             rm -f "bls-guard-$a"
           done
-          found=0
-          for lib in "${PKG}"/lib/libgmp*.dylib; do
-            [ -f "$lib" ] || continue
-            found=1
-            lipo -info "$lib"
-            lipo "$lib" -verify_arch arm64 x86_64 || { echo "::error::$lib is not universal"; exit 1; }
+          # gmp: a slice that loads a libgmp dylib must find it in lib/ with
+          # both slices; otherwise it is linked statically (no load command).
+          for a in arm64 x86_64; do
+            refs="$(otool -arch "$a" -L "$BIN" | awk 'NR>1 && /libgmp/{print $1}')"
+            if [ -z "$refs" ]; then
+              echo "  ok   $a: gmp linked statically (no libgmp load command)"
+              continue
+            fi
+            for r in $refs; do
+              lib="${PKG}/lib/$(basename "$r")"
+              [ -f "$lib" ] || { echo "::error::$a slice loads $r, which is not bundled"; exit 1; }
+              lipo "$lib" -verify_arch arm64 x86_64 || { echo "::error::$lib is not universal"; exit 1; }
+              echo "  ok   $a: $r bundled and universal"
+            done
           done
-          [ "$found" -eq 1 ] || { echo "::error::no libgmp in ${PKG}/lib"; exit 1; }
           # Prints the backend line; on a miss, the exit status and the output.
           run_line() {
             rc=0
@@ -629,16 +721,16 @@ jobs:
               tail -n 20 help.log
             fi
           }
-          line="$(run_line "$BIN")"
+          line="$(run_line arch -arm64 "$BIN")"
           echo "arm64 (native): $line"
           case "$line" in *"DASH BLS backend: REAL"*) ;; *) echo "::error::universal c2pool-dash (arm64) does not report a REAL BLS backend"; exit 1 ;; esac
-          if arch -x86_64 /usr/bin/true 2>/dev/null; then
-            line="$(run_line arch -x86_64 "$BIN")"
-            echo "x86_64 (Rosetta): $line"
-            case "$line" in *"DASH BLS backend: REAL"*) ;; *) echo "::error::universal c2pool-dash (x86_64) does not report a REAL BLS backend"; exit 1 ;; esac
-          else
-            echo "::warning::Rosetta is not available on this host; the x86_64 slice's runtime line was checked natively in its per-arch job only"
+          if ! arch -x86_64 /usr/bin/true 2>/dev/null; then
+            echo "::error::Rosetta 2 is not available on this host; the cross-built x86_64 slice cannot be checked"
+            exit 1
           fi
+          line="$(run_line arch -x86_64 "$BIN")"
+          echo "x86_64 (Rosetta 2): $line"
+          case "$line" in *"DASH BLS backend: REAL"*) ;; *) echo "::error::universal c2pool-dash (x86_64) does not report a REAL BLS backend"; exit 1 ;; esac
 
       - name: Upload universal package
         if: steps.presence.outputs.exists == '1'
@@ -772,8 +864,8 @@ jobs:
           }
           # -DSECP256K1_ENABLE_MODULE_RECOVERY=ON: upstream defaults this module
           # OFF, and with it off the recovery header (secp256k1_recovery.h) is
-          # NOT installed and the recovery symbols are NOT compiled. Linux/macOS
-          # get it from their distro packages (libsecp256k1-dev / brew secp256k1);
+          # NOT installed and the recovery symbols are NOT compiled. Linux gets
+          # it from libsecp256k1-dev, macOS from scripts/ci/build_macos_deps.sh;
           # this source build must enable it explicitly so spork.hpp's
           # <secp256k1_recovery.h> resolves and secp256k1_ecdsa_recover* link.
           cmake -B secp256k1-src/build -S secp256k1-src -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="${env:GITHUB_WORKSPACE}/secp256k1" -DSECP256K1_ENABLE_MODULE_RECOVERY=ON -DSECP256K1_BUILD_TESTS=OFF -DSECP256K1_BUILD_EXHAUSTIVE_TESTS=OFF -DSECP256K1_BUILD_BENCHMARK=OFF -DSECP256K1_BUILD_EXAMPLES=OFF

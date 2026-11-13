@@ -17,6 +17,21 @@ description: >
   FAILS the job if the library or headers are not present when it finishes -
   never leaves a job believing it has BLS when it does not.
 
+  macOS: every macOS build runs on Apple Silicon and takes gmp from the static
+  prefix .github/actions/provision-macos-deps builds (run it first; it exports
+  C2POOL_MACOS_DEPS). The arm64 library builds natively; the x86_64 library is
+  an autotools cross build (--host=x86_64-apple-darwin). The relic backend is
+  selected explicitly and matches what dash's configure picks for dashd itself:
+  GMP on arm64, EASY on x86_64 (dash's configure.ac has no minimum gmp version
+  for x86_64 Darwin, so its gmp check fails there and auto falls back to EASY;
+  the native Intel builds this replaces got EASY the same way).
+
+inputs:
+  arch:
+    description: "macOS only: target architecture (arm64 or x86_64). Default: the host's."
+    required: false
+    default: ""
+
 runs:
   using: composite
   steps:
@@ -24,14 +39,26 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        # Fixed prefix (no input): the github-hosted cache path below must be a
-        # literal, and a configurable prefix that silently misses the cache is
-        # worse than none. macOS keys it by architecture: the universal package
-        # is built from one native arm64 and one native x86_64 library, and a
-        # host that ever built both must never hand one arch the other's .a.
+        # Fixed prefix per target: the github-hosted cache path below must be
+        # derivable from the inputs, and a configurable prefix that silently
+        # misses the cache is worse than none. macOS keys it by TARGET
+        # architecture: the universal package is built from one arm64 and one
+        # x86_64 library on the same host, and that host must never hand one
+        # arch the other's .a.
         case "$(uname -s)" in
-          Darwin) prefix="$HOME/.c2pool-deps/dashbls-macos-$(uname -m)" ;;
-          *)      prefix="$HOME/.c2pool-deps/dashbls" ;;
+          Darwin)
+            arch="${{ inputs.arch }}"
+            [ -n "$arch" ] || arch="$(uname -m)"
+            case "$arch" in
+              arm64|x86_64) ;;
+              *) echo "::error::provision-dashbls: unknown arch '$arch'"; exit 1 ;;
+            esac
+            prefix="$HOME/.c2pool-deps/dashbls-macos-$arch"
+            echo "DASHBLS_ARCH=$arch" >> "$GITHUB_ENV"
+            ;;
+          *)
+            prefix="$HOME/.c2pool-deps/dashbls"
+            ;;
         esac
         # Single source of truth for the pin: scripts/build_dashbls.sh. Parsing
         # it here means a re-pin of the tag cannot silently leave CI on the old
@@ -41,9 +68,15 @@ runs:
           echo "::error::could not parse DASH_REF from scripts/build_dashbls.sh"
           exit 1
         fi
-        echo "dashbls prefix=$prefix pinned dash ref=$ref"
+        # macOS: the marker also names the gmp build it was configured against,
+        # so a re-pin in scripts/ci/build_macos_deps.sh rebuilds the library.
+        pin="$ref"
+        if [ "$(uname -s)" = "Darwin" ]; then
+          pin="$ref+$(bash scripts/ci/build_macos_deps.sh --key "$arch")"
+        fi
+        echo "dashbls prefix=$prefix pin=$pin"
         echo "DASHBLS_PREFIX=$prefix" >> "$GITHUB_ENV"
-        echo "DASHBLS_PIN=$ref" >> "$GITHUB_ENV"
+        echo "DASHBLS_PIN=$pin" >> "$GITHUB_ENV"
 
     # Ephemeral github-hosted runners only (fork PRs). Self-hosted runners keep
     # the prefix on disk, which is both faster and immune to the cache-service
@@ -52,8 +85,8 @@ runs:
       if: runner.environment == 'github-hosted'
       uses: actions/cache@v5
       with:
-        path: ${{ runner.os == 'macOS' && format('~/.c2pool-deps/dashbls-macos-{0}', runner.arch == 'ARM64' && 'arm64' || 'x86_64') || '~/.c2pool-deps/dashbls' }}
-        key: dashbls-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build_dashbls.sh') }}
+        path: ${{ runner.os == 'macOS' && format('~/.c2pool-deps/dashbls-macos-{0}', inputs.arch != '' && inputs.arch || (runner.arch == 'ARM64' && 'arm64' || 'x86_64')) || '~/.c2pool-deps/dashbls' }}
+        key: dashbls-${{ runner.os }}-${{ runner.os == 'macOS' && (inputs.arch != '' && inputs.arch || runner.arch) || runner.arch }}-${{ hashFiles('scripts/build_dashbls.sh', 'scripts/ci/build_macos_deps.sh') }}
 
     - name: Install dashbls build dependencies (Linux)
       if: runner.os == 'Linux'
@@ -78,35 +111,49 @@ runs:
         sudo apt-get install -y --no-install-recommends \
           autoconf automake libtool libgmp-dev || true
 
-    # macOS: Homebrew supplies the same toolchain dashd documents for a native
-    # macOS build (doc/build-osx.md). pkg-config is needed at autogen time on
-    # every non-mingw host (configure.ac PKG_PROG_PKG_CONFIG). Non-fatal for
-    # the same reason as the Linux step; the assertion below is what gates.
+    # macOS: Homebrew supplies only the autotools that dashd documents for a
+    # macOS build (doc/build-osx.md); pkg-config is needed at autogen time
+    # (configure.ac PKG_PROG_PKG_CONFIG). gmp is NOT taken from Homebrew: its
+    # bottles are arm64-only, so both slices use the static gmp that
+    # provision-macos-deps built for the target arch. Non-fatal for the same
+    # reason as the Linux step; the assertion below is what gates.
     - name: Install dashbls build dependencies (macOS)
       if: runner.os == 'macOS'
       shell: bash
       run: |
         set -uo pipefail
-        brew install autoconf automake libtool pkg-config gmp || true
+        missing=""
+        for t in autoconf automake glibtoolize pkg-config; do
+          command -v "$t" > /dev/null 2>&1 || missing="$missing $t"
+        done
+        if [ -n "$missing" ]; then
+          pkgs="$(echo "$missing" | sed 's/glibtoolize/libtool/')"
+          brew install $pkgs || true
+        fi
 
     - name: Assert libgmp development files are present (macOS)
       if: runner.os == 'macOS'
       shell: bash
       run: |
         set -euo pipefail
-        # gmp for relic, as dashd (which hard-requires gmp). dashbls's configure uses
-        # ARITH=GMP where it knows the gmp version check and ARITH=EASY on x86_64
-        # Darwin; dashd's own builds have the same split.
-        # The dylib is what c2pool links and the release bundles into lib/.
-        gp="$(brew --prefix gmp 2>/dev/null || true)"
-        for f in "$gp/include/gmp.h" "$gp/lib/libgmp.dylib"; do
-          if [ -n "$gp" ] && [ -e "$f" ]; then
+        # gmp for relic's GMP backend, as dashd (which hard-requires gmp).
+        # Static, from provision-macos-deps, built for the TARGET arch; c2pool's
+        # find_library(gmp) picks the same archive up via CMAKE_PREFIX_PATH.
+        deps="${C2POOL_MACOS_DEPS:-}"
+        if [ -z "$deps" ]; then
+          echo "::error::C2POOL_MACOS_DEPS is not set; run ./.github/actions/provision-macos-deps before provision-dashbls"
+          exit 1
+        fi
+        for f in "$deps/include/gmp.h" "$deps/lib/libgmp.a"; do
+          if [ -e "$f" ]; then
             echo "  ok   $f"
           else
-            echo "::error::Homebrew gmp is not installed on this runner (missing $f)"
+            echo "::error::gmp for $DASHBLS_ARCH is missing ($f)"
             exit 1
           fi
         done
+        archs="$(lipo -archs "$deps/lib/libgmp.a")"
+        [ "$archs" = "$DASHBLS_ARCH" ] || { echo "::error::$deps/lib/libgmp.a is '$archs', want $DASHBLS_ARCH"; exit 1; }
 
     - name: Assert libgmp development files are present (Linux)
       if: runner.os == 'Linux'
@@ -151,6 +198,23 @@ runs:
           *) echo "::error::refusing to remove unexpected prefix $DASHBLS_PREFIX"; exit 1 ;;
         esac
         rm -rf "$DASHBLS_PREFIX"
+        if [ "$(uname -s)" = "Darwin" ]; then
+          # Target-arch compilers, gmp from the static deps prefix, and BREW set
+          # to a no-op so configure does not add Homebrew's (arm64) gmp paths
+          # ahead of ours. --host makes the x86_64 build a real cross build
+          # (relic picks its arch from host_cpu). The backend is explicit (see
+          # the description above): on arm64 a missing or unusable gmp is then
+          # a configure error instead of a quiet fallback to EASY.
+          case "$DASHBLS_ARCH" in
+            arm64)  host_triple=aarch64-apple-darwin; backend=gmp ;;
+            x86_64) host_triple=x86_64-apple-darwin;  backend=easy ;;
+          esac
+          export CC="clang -arch $DASHBLS_ARCH" CXX="clang++ -arch $DASHBLS_ARCH"
+          export CPPFLAGS="-I$C2POOL_MACOS_DEPS/include" LDFLAGS="-L$C2POOL_MACOS_DEPS/lib"
+          export BREW=/usr/bin/false
+          export DASHBLS_CONFIGURE_ARGS="--build=aarch64-apple-darwin --host=$host_triple --with-backend=$backend"
+          export BUILD_DIR="${RUNNER_TEMP:-/tmp}/dashbls-build-$DASHBLS_ARCH"
+        fi
         bash scripts/build_dashbls.sh "$DASHBLS_PREFIX"
         printf '%s\n' "$DASHBLS_PIN" > "$marker"
 
@@ -169,6 +233,12 @@ runs:
             fail=1
           fi
         done
+        if [ "$(uname -s)" = "Darwin" ] && [ -f "$DASHBLS_PREFIX/lib/libdashbls.a" ]; then
+          archs="$(lipo -archs "$DASHBLS_PREFIX/lib/libdashbls.a" 2>/dev/null || true)"
+          echo "  libdashbls.a: $archs"
+          [ "$archs" = "$DASHBLS_ARCH" ] || { echo "  WRONG ARCH (want $DASHBLS_ARCH)"; fail=1; }
+          grep -h -E '^#define (ARITH|ARCH|WSIZE) ' "$DASHBLS_PREFIX/include/relic_conf.h" 2>/dev/null | sed 's/^/  relic: /' || true
+        fi
         if [ "$fail" -ne 0 ]; then
           echo "::error::dashbls provisioning did not produce a usable prefix at $DASHBLS_PREFIX"
           exit 1
