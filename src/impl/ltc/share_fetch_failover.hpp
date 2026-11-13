@@ -22,6 +22,7 @@
 // any ordered, copyable key types (production: uint256 hash, NetService peer key).
 
 #include <cstdint>
+#include <iterator>
 #include <map>
 #include <set>
 #include <vector>
@@ -298,6 +299,58 @@ private:
     double m_ttl;
     // hash -> { peer_key -> last_failure_timestamp }
     std::map<HashT, std::map<PeerKeyT, double>> m_failed;
+};
+
+// PeerWakeGate — may a peer that just completed its handshake make every
+// backed-off parent eligible again (node.cpp note_fetch_peer_connected)?
+// Only a host not seen connecting within kHostWindow: a host seen since is the
+// same peer coming back (a redial, a duplicate-nonce replacement, a flapping
+// link), not a new source of shares. And at most one wake per kMinInterval
+// overall. Without the gate every reconnect collapsed the pacer's 5..300 s
+// backoff, so a flapping peer turned it back into a request storm. A peer the
+// gate turns away is still untried (FetchPeerRotation): it is asked when the
+// backoff ends.
+//
+// Pure / templated (HostT: an ordered key — production: the peer's IP).
+template <typename HostT>
+class PeerWakeGate {
+public:
+    static constexpr double kHostWindow = 600.0;
+    static constexpr double kMinInterval = 30.0;
+
+    explicit PeerWakeGate(double host_window = kHostWindow, double min_interval = kMinInterval)
+        : m_host_window(host_window), m_min_interval(min_interval) {}
+
+    // `host` completed a handshake at `now`: true iff it may wake the backoff.
+    bool admit(const HostT& host, double now)
+    {
+        prune(now);
+        auto it = m_seen.find(host);
+        const bool fresh = it == m_seen.end() || now - it->second > m_host_window;
+        m_seen[host] = now;
+        if (!fresh)
+            return false;
+        if (m_woke && now - m_last_wake < m_min_interval)
+            return false;
+        m_woke = true;
+        m_last_wake = now;
+        return true;
+    }
+
+    void prune(double now)
+    {
+        for (auto it = m_seen.begin(); it != m_seen.end();)
+            it = now - it->second > m_host_window ? m_seen.erase(it) : std::next(it);
+    }
+
+    std::size_t tracked_hosts() const { return m_seen.size(); }
+
+private:
+    double m_host_window;
+    double m_min_interval;
+    std::map<HostT, double> m_seen;   // host -> last handshake
+    bool m_woke{false};
+    double m_last_wake{0.0};
 };
 
 } // namespace ltc

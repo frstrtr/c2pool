@@ -2197,6 +2197,19 @@ void NodeImpl::download_shares(peer_ptr advertiser, const uint256& target_hash,
                     if (p) connected.push_back(p->addr());
                 if (m_fetch_rotation.record_failure(target_hash, chosen_key_val, connected, now))
                 {
+                    // Already being fetched by another request, or already
+                    // held (it arrived another way): nothing to ask for.
+                    if (m_downloading_shares.count(target_hash))
+                        return;
+                    {
+                        std::shared_lock<std::shared_mutex> lock(m_tracker_mutex, std::try_to_lock);
+                        if (lock.owns_lock() && m_chain && m_chain->contains(target_hash))
+                        {
+                            m_fetch_rotation.clear_hash(target_hash);
+                            m_desired_pacer.record_success(target_hash);
+                            return;
+                        }
+                    }
                     // A connected peer has not been asked for it yet: ask it
                     // now, no backoff. The peer that holds the share is often
                     // not the one that advertised it.

@@ -19,10 +19,13 @@
 //     advertiser sends the request to the next peer AT ONCE, with no backoff;
 //     the pacer backs off only once every connected peer has answered empty;
 //     a peer that connects then is asked at once;
-//   * the policy (FetchPeerRotation, the pure header node.cpp wires in):
-//     untried first, advertiser only while untried, a 30 min memory, rotation
-//     once every peer failed, a reconnected peer is untried; and the incident
-//     replayed over simulated hours.
+//   * the node, too: a peer that keeps reconnecting does not collapse the
+//     backoff (only a host not seen for 10 min wakes it, at most every 30 s),
+//     and a share that arrived another way is not asked for again;
+//   * the policy (FetchPeerRotation and PeerWakeGate, the pure headers
+//     node.cpp wires in): untried first, advertiser only while untried, a
+//     30 min memory, rotation once every peer failed, a reconnected peer is
+//     untried; and the incident replayed over simulated hours.
 //
 // RED on master: the two NodeImpl cases that use only master's API
 // (EmptyReplyFromTheAdvertiserAsksTheNextPeerAtOnce,
@@ -36,6 +39,7 @@
 
 #include <impl/ltc/desired_request_pacer.hpp>
 #include <impl/ltc/node.hpp>
+#include <impl/ltc/share.hpp>
 #include <impl/ltc/share_fetch_failover.hpp>
 
 #include <core/netaddress.hpp>
@@ -116,6 +120,7 @@ struct FetchNode : public ltc::NodeImpl
 
     using ltc::NodeImpl::m_desired_pacer;
     using ltc::NodeImpl::m_peers;
+    using ltc::NodeImpl::m_tracker;
 
     peer_ptr attach_peer(SocketPair& pair, StubCommunicator& stub, uint64_t nonce)
     {
@@ -230,6 +235,56 @@ TEST(LtcParentFetchRotation, APeerThatConnectsIsAskedAtOnce)
     node.drain_pending_desired();
     ASSERT_EQ(node.asked.size(), 3u);
     EXPECT_EQ(node.asked[2].second, newcomer->addr()) << "the new peer is the untried one";
+}
+
+// A peer that keeps reconnecting (here: the same host again within minutes)
+// does not collapse the backoff: only the first handshake of a host wakes the
+// backed-off parents.
+TEST(LtcParentFetchRotation, AFlappingPeerDoesNotCollapseTheBackoff)
+{
+    SocketPair pa, pb;
+    StubCommunicator stub;
+    struct JoinNode : FetchNode {
+        using FetchNode::FetchNode;
+        using ltc::NodeImpl::note_fetch_peer_connected;
+    } node(pa.ioc);
+    auto advertiser = node.attach_peer(pa, stub, 0xa1);
+    auto other = node.attach_peer(pb, stub, 0xb2);
+    node.note_fetch_peer_connected(advertiser->addr());   // both handshakes: hosts seen
+    node.note_fetch_peer_connected(other->addr());
+
+    node.download_shares(advertiser, kWanted);
+    node.answer_last_empty();
+    pa.ioc.run_for(300ms);
+    node.answer_last_empty();
+    pa.ioc.run_for(300ms);
+    ASSERT_FALSE(node.m_desired_pacer.eligible(kWanted, now_s())) << "backed off";
+
+    // The same host redials (a new source port), again and again.
+    for (uint16_t port : {40001, 40002, 40003}) {
+        node.note_fetch_peer_connected(NetService{other->addr().address(), port});
+        EXPECT_FALSE(node.m_desired_pacer.eligible(kWanted, now_s()))
+            << "a redial of a host seen minutes ago must not reset the backoff";
+    }
+}
+
+// The advertiser answers empty, but meanwhile the share arrived another way:
+// nobody is asked for it again.
+TEST(LtcParentFetchRotation, AShareAlreadyHeldIsNotAskedAgain)
+{
+    SocketPair pa, pb;
+    StubCommunicator stub;
+    FetchNode node(pa.ioc);
+    auto advertiser = node.attach_peer(pa, stub, 0xa1);
+    node.attach_peer(pb, stub, 0xb2);
+
+    node.download_shares(advertiser, kWanted);
+    ASSERT_EQ(node.asked.size(), 1u);
+    node.m_tracker.chain.add(new ltc::MergedMiningShare(kWanted, uint256()));
+    node.answer_last_empty();
+    pa.ioc.run_for(300ms);
+    EXPECT_EQ(node.asked.size(), 1u) << "held: not asked of the other peer";
+    EXPECT_EQ(node.m_desired_pacer.attempts(kWanted), 0);
 }
 
 // ---- the policy -------------------------------------------------------------
@@ -403,3 +458,21 @@ TEST(LtcParentFetchRotation, TheFieldPeerSetIsAskedInFullBeforeAnyBackoff)
         EXPECT_LT(now, 15.0) << "seconds, not the pacer's minutes";
     }
 }
+
+// The wake gate itself: a host wakes once per 10 min of absence, and wakes are
+// at least 30 s apart overall.
+TEST(LtcParentFetchRotation, TheWakeGateAdmitsNewHostsOnlyAndSpacesThem)
+{
+    ltc::PeerWakeGate<std::string> gate;
+    EXPECT_TRUE(gate.admit("10.0.0.1", 0.0)) << "a new host wakes";
+    EXPECT_FALSE(gate.admit("10.0.0.1", 5.0)) << "its redial does not";
+    EXPECT_FALSE(gate.admit("10.0.0.2", 10.0)) << "a new host within 30 s of the last wake does not";
+    EXPECT_TRUE(gate.admit("10.0.0.3", 31.0)) << "a new host after 30 s does";
+    // Flapping keeps the host seen: every redial refreshes it.
+    for (double t = 100.0; t < 2000.0; t += 300.0)
+        EXPECT_FALSE(gate.admit("10.0.0.1", t)) << t;
+    EXPECT_TRUE(gate.admit("10.0.0.1", 1900.0 + 601.0)) << "back after 10 min away: a new source again";
+    gate.prune(1e6);
+    EXPECT_EQ(gate.tracked_hosts(), 0u);
+}
+

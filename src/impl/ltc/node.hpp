@@ -1343,12 +1343,19 @@ protected:
     // share_fetch_failover.hpp FetchPeerRotation. IO-THREAD CONFINED.
     ltc::FetchPeerRotation<uint256, NetService> m_fetch_rotation;
 
-    // A peer finished its handshake: it is untried for every parent, and every
-    // backed-off parent may be asked again now (it gets asked first). IO thread.
+    // Whether a handshake may wake the backed-off parents (a host not seen
+    // within 10 min, at most once per 30 s). IO-THREAD CONFINED.
+    ltc::PeerWakeGate<std::string> m_peer_wake_gate;
+
+    // A peer finished its handshake: it is untried for every parent, and —
+    // when it is a new source (m_peer_wake_gate) — every backed-off parent may
+    // be asked again now (it gets asked first). IO thread.
     void note_fetch_peer_connected(const NetService& addr)
     {
+        const double now = static_cast<double>(std::time(nullptr));
         m_fetch_rotation.forget_peer(addr);
-        m_desired_pacer.make_all_eligible(static_cast<double>(std::time(nullptr)));
+        if (m_peer_wake_gate.admit(addr.address(), now))
+            m_desired_pacer.make_all_eligible(now);
     }
 
     // Refresh the peer-key snapshot from the live IO-owned m_peers map. MUST be
