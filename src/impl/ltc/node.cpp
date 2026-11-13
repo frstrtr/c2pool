@@ -415,6 +415,8 @@ std::optional<pool::PeerConnectionType> NodeImpl::handle_version(std::unique_ptr
         m_peers[peer->m_nonce] = peer;
         m_peer_count.store(m_peers.size(), std::memory_order_relaxed);
         publish_peer_info_snapshot();   // IO thread: refresh the display snapshot
+        // A new peer has been asked for none of the parents we are missing.
+        note_fetch_peer_connected(peer->addr());
 
         // Request peers from the newly established connection
         {
@@ -1953,21 +1955,22 @@ void NodeImpl::download_shares(peer_ptr advertiser, const uint256& target_hash,
     std::optional<NetService> advertiser_key;
     if (advertiser) advertiser_key = advertiser->addr();
 
-    // #25(C): pick a peer that has NOT recently failed this exact hash, preferring
-    // the advertiser. nullopt => every peer has failed it within the TTL: back off
-    // this cycle (the failures age out and a different desired parent is tried).
+    // Pick a peer that has not failed this exact hash (30 min memory), the
+    // advertiser first while it has not; once every connected peer has failed
+    // it, the one that failed it longest ago (FetchPeerRotation). The pacer, not
+    // this choice, decides WHEN a hash every peer failed is asked again.
     const double fnow = static_cast<double>(std::time(nullptr));
     std::optional<NetService> chosen_key;
     {
         std::lock_guard<std::mutex> g(m_fetch_failover_mtx);
         m_fetch_failures.prune(fnow);
         m_peer_keys_snapshot = peer_keys;  // keep fresh for clean_tracker's parent_abandoned
-        chosen_key = m_fetch_failures.choose(
-            target_hash, advertiser_key, peer_keys, fnow,
-            [](std::size_t n) -> std::size_t {
-                return static_cast<std::size_t>(core::random::random_uint256().GetLow64() % n);
-            });
     }
+    chosen_key = m_fetch_rotation.choose(
+        target_hash, advertiser_key, peer_keys, fnow,
+        [](std::size_t n) -> std::size_t {
+            return static_cast<std::size_t>(core::random::random_uint256().GetLow64() % n);
+        });
     if (!chosen_key.has_value()) {
         m_downloading_shares.erase(target_hash);
         return;
@@ -2053,31 +2056,58 @@ void NodeImpl::download_shares(peer_ptr advertiser, const uint256& target_hash,
 
     request_shares(req_id, peer, hashes, parents, stops,
         [this, weak_peer, target_hash, peer_addr_for_log, req_id, chosen_key_val,
-         walk_depth](ltc::ShareReplyData reply)
+         advertiser_key, walk_depth](ltc::ShareReplyData reply)
         {
             m_downloading_shares.erase(target_hash);
             m_pending_share_reqs.erase(req_id);
 
             if (reply.empty())
             {
-                // Empty reply = timeout or this peer had no matching shares.
-                // #25(C): remember the (hash, peer) failure so we fail over to a
-                // DIFFERENT peer next cycle, and only abandon the head once the
-                // whole peer set has failed it (see FetchFailureMemory::abandoned).
+                // Empty reply = timeout, disconnect, or this peer had no
+                // matching shares. #25(C): remember the (hash, peer) failure; the
+                // head is abandoned only once the whole peer set has failed it
+                // within 90 s (FetchFailureMemory::abandoned, unchanged).
+                const double now = static_cast<double>(std::time(nullptr));
                 {
                     std::lock_guard<std::mutex> g(m_fetch_failover_mtx);
-                    m_fetch_failures.record(target_hash, chosen_key_val,
-                                            static_cast<double>(std::time(nullptr)));
+                    m_fetch_failures.record(target_hash, chosen_key_val, now);
                 }
-                // Futility backoff (io thread): damp THIS hash for a growing
-                // interval so a desired set nobody can serve stops being
-                // re-requested at full rate every think() cycle.
-                m_desired_pacer.record_empty(
-                    target_hash, static_cast<double>(std::time(nullptr)));
+                std::vector<NetService> connected;
+                connected.reserve(m_peers.size());
+                for (const auto& [nonce, p] : m_peers)
+                    if (p) connected.push_back(p->addr());
+                if (m_fetch_rotation.record_failure(target_hash, chosen_key_val, connected, now))
+                {
+                    // A connected peer has not been asked for it yet: ask it
+                    // now, no backoff. The peer that holds the share is often
+                    // not the one that advertised it.
+                    LOG_INFO << "[Pool] Share request empty for "
+                             << target_hash.ToString().substr(0,16)
+                             << " from " << peer_addr_for_log.to_string()
+                             << " (asking an untried peer next)";
+                    if (m_pending_desired.size() < DESIRED_QUEUE_MAX)
+                    {
+                        m_pending_desired.push_front(DesiredRequest{
+                            advertiser_key.value_or(NetService{}), target_hash, walk_depth});
+                        // Not from inside this callback: it also runs from
+                        // error()/close_connection() cancelling a dropped
+                        // peer's requests.
+                        if (m_context)
+                            schedule_desired_drain();
+                        else
+                            drain_pending_desired();
+                    }
+                    return;
+                }
+                // Every connected peer has failed it. Futility backoff (io
+                // thread): damp THIS hash for a growing interval so a desired
+                // set nobody can serve stops being re-requested at full rate
+                // every think() cycle.
+                m_desired_pacer.record_empty(target_hash, now);
                 LOG_INFO << "[Pool] Share request empty for "
                          << target_hash.ToString().substr(0,16)
                          << " from " << peer_addr_for_log.to_string()
-                         << " (failing over to another peer)";
+                         << " (every connected peer has failed it; backing off)";
                 return;
             }
 
@@ -2086,6 +2116,7 @@ void NodeImpl::download_shares(peer_ptr advertiser, const uint256& target_hash,
                 std::lock_guard<std::mutex> g(m_fetch_failover_mtx);
                 m_fetch_failures.clear_hash(target_hash);
             }
+            m_fetch_rotation.clear_hash(target_hash);
             m_desired_pacer.record_success(target_hash);
 
             auto& owned = *reply.m_owned;
@@ -2184,8 +2215,9 @@ void NodeImpl::drain_pending_desired()
     while (!m_pending_desired.empty() && processed < DESIRED_REQUEST_BUDGET) {
         auto entry = m_pending_desired.front();
         m_pending_desired.pop_front();
-        // Futility backoff. A hash whose last reply was empty is skipped until
-        // its backoff expires; unknown and healthy hashes are always eligible.
+        // Futility backoff. A hash every connected peer has answered empty is
+        // skipped until its backoff expires; unknown and healthy hashes, and
+        // hashes some connected peer has not failed yet, are always eligible.
         // A skip does NOT consume budget -- it is a map lookup, and the point of
         // the pass is to reach the hashes that can still be served.
         if (!m_desired_pacer.eligible(entry.hash, now))
@@ -2923,6 +2955,7 @@ void NodeImpl::run_think()
                 std::lock_guard<std::mutex> g(m_fetch_failover_mtx);
                 m_fetch_failures.prune(static_cast<double>(std::time(nullptr)));
             }
+            m_fetch_rotation.prune(static_cast<double>(std::time(nullptr)));
             // #1601: drop invalid-PoW scorer entries that have decayed to ~0, so
             // the misbehavior map stays bounded even under identity cycling.
             prune_pow_misbehavior();

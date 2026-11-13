@@ -1292,6 +1292,21 @@ protected:
     ltc::FetchFailureMemory<uint256, NetService> m_fetch_failures;  // guarded by m_fetch_failover_mtx
     std::vector<NetService> m_peer_keys_snapshot;                   // guarded by m_fetch_failover_mtx
 
+    // Which peer download_shares asks next for a parent: untried peers first
+    // (30 min memory), the next untried one at once after an empty reply, the
+    // pacer only once every connected peer has failed the hash. The 90 s
+    // m_fetch_failures above stays the abandoned() input. See
+    // share_fetch_failover.hpp FetchPeerRotation. IO-THREAD CONFINED.
+    ltc::FetchPeerRotation<uint256, NetService> m_fetch_rotation;
+
+    // A peer finished its handshake: it is untried for every parent, and every
+    // backed-off parent may be asked again now (it gets asked first). IO thread.
+    void note_fetch_peer_connected(const NetService& addr)
+    {
+        m_fetch_rotation.forget_peer(addr);
+        m_desired_pacer.make_all_eligible(static_cast<double>(std::time(nullptr)));
+    }
+
     // Refresh the peer-key snapshot from the live IO-owned m_peers map. MUST be
     // called on the IO thread. Takes m_fetch_failover_mtx.
     void refresh_peer_keys_snapshot()

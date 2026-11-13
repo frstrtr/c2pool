@@ -40,6 +40,10 @@ if (BUILD_TESTING AND GTest_FOUND)
     # share of a height; the loader reads the share records). REAL store and
     # NodeImpl. Same folding rule: into the existing allowlisted target.
     #
+    # parent_fetch_rotation_test.cpp: same incident — a parent is asked of every
+    # connected peer, at once, before the pacer backs it off. REAL NodeImpl +
+    # loopback peers, and the pure FetchPeerRotation. Same folding rule.
+    #
     # pool_rate_head_select_test.cpp: the coin-generic dashboard pool-rate
     # HEAD-SELECTION + get_average_stale_prop SSOT (sharechain/
     # pool_rate_head_select.hpp, issue #1482) — verified best when live, else the
@@ -463,6 +467,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         mweb_state_hash_binding_test.cpp
         mweb_tx_wire_test.cpp
         own_share_reject_marks_test.cpp
+        parent_fetch_rotation_test.cpp
         peer_block_pow_carry_test.cpp
         per_peer_ingest_test.cpp
         pool_rate_head_select_test.cpp
