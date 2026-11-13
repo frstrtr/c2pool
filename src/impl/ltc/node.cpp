@@ -1261,7 +1261,7 @@ void NodeImpl::processing_shares_phase2(HandleSharesData& data, NetService addr)
     }
 }
 
-std::vector<ltc::ShareType> NodeImpl::handle_get_share(std::vector<uint256> hashes, uint64_t parents, std::vector<uint256> stops, NetService peer_addr)
+std::vector<ltc::ShareType> NodeImpl::handle_get_share(std::vector<uint256> hashes, uint64_t parents, std::vector<uint256> stops, NetService peer_addr, bool* busy)
 {
     // An empty hash list would divide by zero in the parents cap below (UB;
     // SIGFPE on x86). Answer it empty, as BTC and DASH do (dash/node.cpp
@@ -1290,6 +1290,10 @@ std::vector<ltc::ShareType> NodeImpl::handle_get_share(std::vector<uint256> hash
     std::shared_lock<std::shared_mutex> lock(m_tracker_mutex, std::try_to_lock);
     if (!lock.owns_lock())
     {
+        if (busy) {   // the caller lets the request wait (defer_sharereq)
+            *busy = true;
+            return {};
+        }
         static int defer_log = 0;
         if (defer_log++ % 50 == 0)
             LOG_INFO << "[handle_get_share] tracker busy — returning empty to "
@@ -1341,6 +1345,121 @@ std::vector<ltc::ShareType> NodeImpl::handle_get_share(std::vector<uint256> hash
 	// independent memory it destroy()s. Same borrow-vs-own rule as #1131/#1163.
 	for (auto& s : shares) s = s.clone();
 	return shares;
+}
+
+void NodeImpl::write_sharereply(const peer_ptr& peer, const uint256& id, std::vector<ltc::ShareType>& shares)
+{
+    {
+        static int dbg_rep = 0;
+        if (dbg_rep < 20)
+        {
+            ++dbg_rep;
+            LOG_WARNING << "SHAREREPLY (after wait) #" << dbg_rep << " returning " << shares.size() << " shares to "
+                        << peer->addr().to_string();
+        }
+    }
+    std::vector<chain::RawShare> rshares;
+    try
+    {
+        for (auto& share : shares)
+            rshares.emplace_back(share.version(), pack(share));
+        peer->write(ltc::message_sharereply::make_raw(id, ltc::ShareReplyResult::good, rshares));
+    }
+    catch (const std::invalid_argument& e)
+    {
+        // Serialization overflow: the packed shares exceeded the P2P message
+        // size limit (32 MB). Reply with too_long so the peer requests a
+        // smaller batch. This is the correct behavior per Python p2pool.
+        LOG_WARNING << "Share reply too large, sending too_long: " << e.what();
+        peer->write(ltc::message_sharereply::make_raw(id, ltc::ShareReplyResult::too_long, {}));
+    }
+    // #1130: free the OWNED copies handle_get_share cloned. Each variant owns
+    // independent heap from clone(), so this never touches the pointers the
+    // sharechain still owns.
+    for (auto& share : shares)
+        share.destroy();
+    shares.clear();
+}
+
+bool NodeImpl::defer_sharereq(const peer_ptr& peer, const uint256& id, std::vector<uint256> hashes,
+                              uint64_t parents, std::vector<uint256> stops)
+{
+    if (m_context && m_deferred_sharereqs.size() < SHAREREQ_DEFERRED_MAX)
+    {
+        ++m_sharereq_defer_stats.deferred;
+        m_deferred_sharereqs.push_back(DeferredShareReq{
+            peer, id, std::move(hashes), parents, std::move(stops),
+            std::chrono::steady_clock::now() + m_sharereq_busy_budget});
+        arm_sharereq_retry();
+        return true;
+    }
+    ++m_sharereq_defer_stats.not_deferred;
+    static int busy_log = 0;
+    if (busy_log++ % 50 == 0)
+        LOG_INFO << "[handle_get_share] tracker busy — returning empty to "
+                 << peer->addr().to_string() << " (" << m_deferred_sharereqs.size()
+                 << " requests already waiting)";
+    return false;
+}
+
+void NodeImpl::arm_sharereq_retry()
+{
+    if (m_sharereq_retry_armed || !m_context)
+        return;
+    if (!m_sharereq_retry_timer)
+        m_sharereq_retry_timer = std::make_unique<boost::asio::steady_timer>(*m_context);
+    m_sharereq_retry_armed = true;
+    m_sharereq_retry_timer->expires_after(SHAREREQ_RETRY_INTERVAL);
+    m_sharereq_retry_timer->async_wait([this](const boost::system::error_code& ec) {
+        if (ec)   // cancelled: the timer (and its node) is going away
+            return;
+        m_sharereq_retry_armed = false;
+        retry_deferred_sharereqs();
+    });
+}
+
+void NodeImpl::retry_deferred_sharereqs()
+{
+    // IO thread. Every waiting request gets one more non-blocking try; one past
+    // its deadline is answered with what that try got (empty while still busy).
+    auto waiting = std::move(m_deferred_sharereqs);
+    m_deferred_sharereqs.clear();
+    const auto now = std::chrono::steady_clock::now();
+    for (auto& req : waiting)
+    {
+        auto peer = req.peer.lock();
+        const bool connected = peer && std::any_of(m_peers.begin(), m_peers.end(),
+            [&](const auto& kv) { return kv.second == peer; });
+        if (!connected)
+        {
+            ++m_sharereq_defer_stats.peer_gone;
+            continue;
+        }
+        bool busy = false;
+        auto shares = handle_get_share(req.hashes, req.parents, req.stops, peer->addr(), &busy);
+        if (busy && now < req.deadline)
+        {
+            m_deferred_sharereqs.push_back(std::move(req));
+            continue;
+        }
+        if (busy)
+        {
+            ++m_sharereq_defer_stats.empty_after_wait;
+            static int expired_log = 0;
+            if (expired_log++ % 50 == 0)
+                LOG_INFO << "[handle_get_share] tracker still busy after "
+                         << m_sharereq_busy_budget.count() << " ms — returning empty to "
+                         << peer->addr().to_string();
+        }
+        else
+        {
+            ++m_sharereq_defer_stats.served_after_wait;
+        }
+        m_sharereq_defer_stats.last_reply_shares = shares.size();
+        write_sharereply(peer, req.id, shares);
+    }
+    if (!m_deferred_sharereqs.empty())
+        arm_sharereq_retry();
 }
 
 std::vector<uint256> NodeImpl::send_shares(peer_ptr peer, const std::vector<uint256>& share_hashes)

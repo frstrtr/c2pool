@@ -810,7 +810,51 @@ public:
         catch (const std::invalid_argument&) { /* request already timed out */ }
     }
 
-    std::vector<ltc::ShareType> handle_get_share(std::vector<uint256> hashes, uint64_t parents, std::vector<uint256> stops, NetService peer_addr);
+    /// The shares a SHAREREQ asks for (owned clones; the caller destroy()s
+    /// them). Never blocks: when think() holds the tracker lock the answer is
+    /// empty, and `*busy` (when given) is set so the caller can try again.
+    std::vector<ltc::ShareType> handle_get_share(std::vector<uint256> hashes, uint64_t parents, std::vector<uint256> stops, NetService peer_addr, bool* busy = nullptr);
+
+    /// A SHAREREQ that found the tracker busy (handle_get_share `*busy`): it
+    /// waits, retried every SHAREREQ_RETRY_INTERVAL on a timer — the io thread
+    /// never blocks — for up to m_sharereq_busy_budget, and only then is
+    /// answered empty, as every busy request was before. False when it cannot
+    /// wait (no io_context, or SHAREREQ_DEFERRED_MAX already waiting): the
+    /// caller answers now. A node whose think() holds the lock most of each
+    /// minute otherwise answers nearly every request empty, and the peers that
+    /// need its shares never get them.
+    bool defer_sharereq(const peer_ptr& peer, const uint256& id, std::vector<uint256> hashes,
+                        uint64_t parents, std::vector<uint256> stops);
+    /// The sharereply for `id` to a waited request (good, or too_long when it
+    /// would not fit); destroy()s `shares`.
+    void write_sharereply(const peer_ptr& peer, const uint256& id, std::vector<ltc::ShareType>& shares);
+
+    struct DeferredShareReq {
+        std::weak_ptr<peer_t> peer;
+        uint256 id;
+        std::vector<uint256> hashes;
+        uint64_t parents{0};
+        std::vector<uint256> stops;
+        std::chrono::steady_clock::time_point deadline;
+    };
+    static constexpr std::chrono::milliseconds SHAREREQ_RETRY_INTERVAL{100};
+    // At most this many requests wait at once; past it a busy request is
+    // answered empty at once, as before (a flood holds no unbounded state).
+    static constexpr std::size_t SHAREREQ_DEFERRED_MAX = 256;
+    std::chrono::milliseconds m_sharereq_busy_budget{2000};
+    std::deque<DeferredShareReq> m_deferred_sharereqs;   // IO thread only
+    std::unique_ptr<boost::asio::steady_timer> m_sharereq_retry_timer;
+    bool m_sharereq_retry_armed{false};
+    struct SharereqDeferStats {
+        uint64_t deferred{0};          // requests that found the tracker busy and waited
+        uint64_t served_after_wait{0}; // ... and were answered from the tracker
+        uint64_t empty_after_wait{0};  // ... and were still busy at the deadline: empty
+        uint64_t peer_gone{0};         // ... whose peer disconnected meanwhile
+        uint64_t not_deferred{0};      // busy with the wait list full: empty at once
+        size_t last_reply_shares{0};   // shares in the last reply sent after a wait
+    } m_sharereq_defer_stats;          // IO thread only
+    void arm_sharereq_retry();
+    void retry_deferred_sharereqs();
 
     /// Broadcast a new best-block notification to all connected P2P peers.
     void broadcast_bestblock(const coin::BlockHeaderType& header) {
