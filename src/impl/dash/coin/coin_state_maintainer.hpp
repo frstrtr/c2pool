@@ -201,20 +201,43 @@ public:
     }
 
     /// C4: chainparams nSuperblockMaturityWindow (Dash Core v24
-    /// chainparams.cpp: mainnet 1662, testnet 8). Two legs per superblock H:
+    /// chainparams.cpp: mainnet 1662, testnet 8). Three legs per superblock H:
     ///   A  tip == H - window (masternodes start creating triggers for H —
     ///      governance/signing.cpp CreateSuperblockCandidate): per-trigger vote
     ///      re-sync for every trigger held at H;
     ///   B  tip == H - late_lead() (= max(3, window/8): testnet H-3, mainnet
     ///      H-207): a FRESH nProp=0 re-prime of every peer (the coin-P2P
     ///      client enforces its once-per-hour-per-peer window), which re-opens
-    ///      every peer's coverage proof, plus the vote re-sync again. Leg B is
-    ///      deliberately NOT H-1: the vote burst it triggers re-arms R5
-    ///      quiescence, and the proof must re-close before H's template.
-    /// 0 (default) disables both legs.
+    ///      every peer's coverage proof, plus the vote re-sync again;
+    ///   C  tip == H - last_call_lead() (= 2): the per-trigger vote re-sync
+    ///      ONLY — no re-prime, so no peer's coverage proof re-opens. Dash
+    ///      Core 24.0.1 (#8131, governance/signing.cpp NO_VOTE_DEADLINE_BLOCKS
+    ///      = 3) makes a masternode whose own candidate matches no trigger
+    ///      hold its NO-FUNDING votes until nHeight + 3 >= H, then NO every
+    ///      active trigger it has not voted on, so they are cast at tip H-3
+    ///      (later only if the masternode itself is late). Those NOs can drop
+    ///      the winner below the threshold or, when the voters already voted
+    ///      on some triggers, change the winner (max yes - no); a node that
+    ///      missed their relay would build H from a stale tally and lose the
+    ///      block. Leg C asks for them once they exist.
+    /// No leg fires at H-1: a vote burst there re-arms R5 quiescence right
+    /// when H's template is built. Leg C's burst is only the votes we lacked
+    /// (the verified-vote memo drops the rest without re-arming), and it has
+    /// a whole block interval to quiesce.
+    /// The client's once-per-(peer, object) window (dashd's fulfilled-request
+    /// expiry: mainnet 3600 s, testnet 300 s) still applies: on mainnet leg C
+    /// runs ~9 h after leg B, but a peer is skipped when the object's vote
+    /// sync went to it inside the window (a trigger accepted in the last hour);
+    /// on testnet leg C follows leg B by one block and is mostly skipped.
+    /// Relay of the votes as they are cast stays the primary path.
+    /// 0 (default) disables every leg.
     void set_superblock_maturity_window(int32_t w) { m_sb_maturity_window = w > 0 ? w : 0; }
     int32_t late_lead() const {
         return m_sb_maturity_window > 0 ? std::max<int32_t>(3, m_sb_maturity_window / 8) : 0;
+    }
+    static constexpr int32_t SB_VOTE_LAST_CALL_LEAD = 2;
+    int32_t last_call_lead() const {
+        return m_sb_maturity_window > 0 ? SB_VOTE_LAST_CALL_LEAD : 0;
     }
 
     /// Leg B re-prime seam (main_dash: CoinClient::send_govsync_prime() and
@@ -1685,7 +1708,8 @@ private:
         // fallback, and log loudly.
         cross_check_superblock_on_block(block, height);
         // Every block: prune executed/expired triggers, retry held signature
-        // checks, and fire the C4 vote re-syncs at H - window and H - 1.
+        // checks, and fire the C4 vote re-syncs at H - window, H - late lead
+        // and H - 2.
         governance_on_block(height);
 
         // E2c snapshot fence: blocks the payout-bearing snapshot already
@@ -2824,7 +2848,8 @@ private:
     /// Governance bookkeeping on EVERY connected block (after the R6/C5
     /// cross-check): prune executed/expired triggers (restart-resynced
     /// history included), retry held signature checks, and fire the C4
-    /// re-syncs at H - maturity window and H - 1.
+    /// re-syncs at H - maturity window, H - late lead and H - 2 (legs A, B,
+    /// C: see set_superblock_maturity_window).
     void governance_on_block(uint32_t height) {
         // MED-5: keep a trigger resolvable GOV_REORG_KEEP blocks past its
         // height, so a reorg re-folding the superblock block resolves the
@@ -2844,6 +2869,11 @@ private:
             if (m_on_gov_reprime) m_on_gov_reprime();
             request_trigger_votes(height + lead, "B:H-late-lead");
         }
+        // Leg C: votes only, after the deferred 24.0.1 NO votes are cast.
+        // Skipped when leg A or B already asked on this block.
+        const uint32_t last = static_cast<uint32_t>(last_call_lead());
+        if (last != win && last != lead && m_sb_is_fn(height + last))
+            request_trigger_votes(height + last, "C:H-2-late-no-votes");
     }
 
     /// The superblock at `height` is connected: end the cycle's unknown-height

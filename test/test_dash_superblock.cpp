@@ -1840,7 +1840,7 @@ TEST(DashSuperblockTriState, MaintainerSignatureGateC3) {
     EXPECT_EQ(m2.gov_store().outstanding_count(), 1u);
 }
 
-// ── T9. C4: per-trigger vote re-sync at H - window and H - 1; orphans ────────
+// ── T9. C4: per-trigger vote re-sync at H - window, H - 3 and H - 2; orphans ─
 TEST(DashSuperblockTriState, MaintainerVoteResyncAndOrphansC4) {
     NodeCoinState st;
     CoinStateMaintainer m(st);
@@ -1880,12 +1880,14 @@ TEST(DashSuperblockTriState, MaintainerVoteResyncAndOrphansC4) {
     auto r = m.superblock_resolution(SBH);
     ASSERT_EQ(r.verdict, SuperblockVerdict::Triggered) << r.reason;
 
-    // C4 legs: tip H - window (A) and H - late_lead (B = H-3 on testnet)
-    // re-request the held trigger's votes; leg B also re-primes (nProp=0),
-    // H-1 asks nothing (its vote burst would re-open R5 right before H).
+    // C4 legs: tip H - window (A), H - late_lead (B = H-3 on testnet) and
+    // H - 2 (C, after the deferred 24.0.1 NO votes) re-request the held
+    // trigger's votes; only leg B re-primes (nProp=0). H-1 asks nothing (its
+    // vote burst would re-open R5 right before H).
     int reprimes = 0;
     m.set_on_gov_reprime([&reprimes]() { ++reprimes; });
     ASSERT_EQ(m.late_lead(), 3);
+    ASSERT_EQ(m.last_call_lead(), 2);
     auto connect = [&m](uint32_t h) {
         BlockType blk;
         blk.m_txs.push_back(make_cb(500'000'000, p2pkh_script(0x30)));
@@ -1897,12 +1899,131 @@ TEST(DashSuperblockTriState, MaintainerVoteResyncAndOrphansC4) {
         const size_t want =
             h < SBH - DASH_SUPERBLOCK_MATURITY_WINDOW_TESTNET ? 0u
             : h < SBH - 3                                     ? 1u
-                                                              : 2u;
+            : h < SBH - 2                                     ? 2u
+                                                              : 3u;
         ASSERT_EQ(resync.size(), want) << "after connecting h=" << h;
         ASSERT_EQ(reprimes, h < SBH - 3 ? 0 : 1) << "after connecting h=" << h;
     }
     EXPECT_EQ(resync[0], hash_of(85));
     EXPECT_EQ(resync[1], hash_of(85));
+    EXPECT_EQ(resync[2], hash_of(85));
+}
+
+// ── T9b/T9c. C4 leg C: the deferred 24.0.1 NO votes move the verdict ────────
+// Dash Core 24.0.1 (#8131, governance/signing.cpp VoteGovernanceTriggers): a
+// masternode whose own candidate matches no trigger holds its NO-FUNDING
+// votes while nHeight + NO_VOTE_DEADLINE_BLOCKS (3) < H, then votes NO on
+// every active trigger it has not voted on yet — at tip H-3. A node that
+// missed the relay of those NOs keeps a stale tally and builds H from it:
+// with superblock outputs the network no longer pays (T9b), or with the
+// wrong trigger's outputs (T9c); dashd rejects either block. Leg C re-asks
+// the triggers' votes at tip H-2, after the NOs exist. A peer answers a
+// re-sync asked on block t with the votes cast BEFORE block t (a vote cast on
+// block t itself is still in flight), so leg B (H-3 on testnet) cannot see
+// them; leg C can. Master has no request after leg B and keeps the stale
+// tally.
+namespace {
+
+struct LateNoRig {
+    NodeCoinState st;
+    CoinStateMaintainer m{st};
+    int64_t now{1'700'000'000};
+    struct NetVote { uint256 parent; std::string key; uint32_t cast_at; };
+    std::vector<NetVote> missed;                     // never relayed to us
+    std::vector<std::pair<uint256, uint32_t>> asked; // (object, tip asked on)
+    uint32_t tip{0};
+
+    LateNoRig() {
+        m.on_mn_list_update(single_mn(p2pkh_script(0x30)));
+        m.on_new_tip(SBH - 10, raw256(0xAB), 0x1e0ffff0u, 1'700'000'000u,
+                     140, 19, 1'700'000'100u, 0x20000000u);
+        arm_tristate(m, now);
+        m.set_superblock_maturity_window(DASH_SUPERBLOCK_MATURITY_WINDOW_TESTNET);
+        m.set_object_verifier([](const CoinStateMaintainer::GovObjectContext&) {
+            return CoinStateMaintainer::GovSigCheck::Valid;
+        });
+        m.set_vote_verifier([](const CoinStateMaintainer::GovVoteContext&) { return true; });
+        m.set_on_trigger_vote_resync([this](const uint256& h) { asked.emplace_back(h, tip); });
+    }
+    void trigger(uint64_t id, const char* amt) {
+        m.on_govobject(trig_obj(id, trig_plain(static_cast<int32_t>(SBH), amt)));
+        ASSERT_TRUE(m.gov_store().has_trigger(hash_of(id)));
+    }
+    void yes(uint64_t id, int mn) {
+        m.on_govvote(fund_vote(hash_of(id), VOTE_OUTCOME_YES, 100), "mn-" + std::to_string(mn));
+    }
+    // mn's NO on trigger `id`, cast on block H-3 and missed by relay.
+    void late_no(uint64_t id, int mn) {
+        missed.push_back({hash_of(id), "mn-" + std::to_string(mn), static_cast<uint32_t>(SBH - 3)});
+    }
+    // Connect H-9 .. H-1; after each block the peers answer the re-syncs.
+    void run_to_h_minus_1() {
+        for (tip = SBH - 9; tip <= SBH - 1; ++tip) {
+            BlockType blk;
+            blk.m_txs.push_back(make_cb(500'000'000, p2pkh_script(0x30)));
+            bind_block(blk);
+            m.on_block_connected(blk, tip);
+            for (const auto& [h, at] : asked)
+                for (const auto& v : missed)
+                    if (v.parent == h && v.cast_at < at)
+                        m.on_govvote(fund_vote(v.parent, VOTE_OUTCOME_NO, 200), v.key);
+            asked.clear();
+            now += 100;   // a block interval: R5 quiesces after any new votes
+        }
+    }
+};
+
+} // namespace
+
+// T9b: the common case. mn-8 and mn-9 have no trigger of their own and NO
+// the only trigger at H-3: it falls below the threshold, the network pays no
+// superblock, and a held trigger at H means we cannot prove that either.
+TEST(DashSuperblockTriState, LateNoVotesDropTheTriggerBelowThresholdC4) {
+    LateNoRig r;
+    r.trigger(93, "4.0");
+    r.yes(93, 4);
+    r.yes(93, 5);
+    r.now += 100;
+    ASSERT_EQ(r.m.superblock_resolution(SBH).verdict, SuperblockVerdict::Triggered);
+    r.late_no(93, 8);
+    r.late_no(93, 9);
+    r.run_to_h_minus_1();
+    EXPECT_EQ(r.m.gov_store().absolute_yes_count(hash_of(93)), 0) << "the H-3 NOs reached us";
+    const auto res = r.m.superblock_resolution(SBH);
+    EXPECT_NE(res.verdict, SuperblockVerdict::Triggered)
+        << "serving the unfunded trigger's outputs loses the block";
+    EXPECT_EQ(res.verdict, SuperblockVerdict::Unknown) << res.reason;
+    EXPECT_EQ(res.reason, "trigger-present");
+}
+
+// T9c: the winner flips. mn-1..3 voted YES on B, then restarted (the 24.0.1
+// upgrade is a restart) after the approved proposal set moved: the YES is no
+// longer in their memory (votedFundingYesTrigger), their candidate matches no
+// trigger, so they defer and at H-3 NO every trigger they have not voted on —
+// A, not B. mn-8 never voted and NOs both. A: 4 - 4 = 0, B: 3 - 1 = 2.
+TEST(DashSuperblockTriState, LateNoVotesFlipTheWinnerC4) {
+    LateNoRig r;
+    r.trigger(91, "3.0");   // B
+    r.trigger(92, "4.0");   // A
+    for (int mn = 1; mn <= 3; ++mn) r.yes(91, mn);
+    for (int mn = 4; mn <= 7; ++mn) r.yes(92, mn);
+    r.now += 100;
+    auto best = r.m.gov_store().get_best_superblock(static_cast<int32_t>(SBH));
+    ASSERT_TRUE(best.has_value());
+    ASSERT_EQ(best->object_hash, hash_of(92)) << "before H-3 the network agrees: A leads";
+    for (int mn = 1; mn <= 3; ++mn) r.late_no(92, mn);
+    r.late_no(92, 8);
+    r.late_no(91, 8);
+    r.run_to_h_minus_1();
+    EXPECT_EQ(r.m.gov_store().absolute_yes_count(hash_of(92)), 0) << "the H-3 NOs reached us";
+    EXPECT_EQ(r.m.gov_store().absolute_yes_count(hash_of(91)), 2);
+    best = r.m.gov_store().get_best_superblock(static_cast<int32_t>(SBH));
+    ASSERT_TRUE(best.has_value());
+    EXPECT_EQ(best->object_hash, hash_of(91)) << "serving A's outputs loses the block";
+    const auto res = r.m.superblock_resolution(SBH);
+    ASSERT_EQ(res.verdict, SuperblockVerdict::Triggered) << res.reason;
+    ASSERT_EQ(res.payments.size(), 1u);
+    EXPECT_EQ(res.payments[0].amount, 300'000'000LL) << "B's payment (3 DASH), not A's (4)";
 }
 
 // ── T10. executed triggers are history: never stored, pruned every block ─────

@@ -753,6 +753,18 @@ TEST(DashV24Deployments, ActivationPinValidation)
     EXPECT_FALSE(validate_v24_activation_pin(DashNetwork::MAINNET, 0).empty());
     EXPECT_TRUE(validate_v24_activation_pin(DashNetwork::TESTNET, 1'578'000).empty());
     EXPECT_FALSE(validate_v24_activation_pin(DashNetwork::TESTNET, 1'578'050).empty());
+    // The pin obeys the same rule as the block folds (v24_activation_height_refusal):
+    // a later period start is a possible activation (a missed signal window)...
+    EXPECT_TRUE(validate_v24_activation_pin(DashNetwork::MAINNET, 2'584'512).empty());
+    // ...a period start below the earliest possible activation is not...
+    EXPECT_FALSE(validate_v24_activation_pin(DashNetwork::MAINNET, 2'576'448).empty());
+    EXPECT_FALSE(validate_v24_activation_pin(DashNetwork::MAINNET, 8'064).empty());
+    // ...a buried network accepts only its buried height...
+    const auto& tp = dash_deployment_params(DashNetwork::TESTNET);
+    const int64_t tP = vb_period(tp, tp.dep(DashDeployment::V24));
+    EXPECT_FALSE(validate_v24_activation_pin(DashNetwork::TESTNET, 1'578'000 + tP).empty());
+    // ...and a value past the height range is no height.
+    EXPECT_FALSE(validate_v24_activation_pin(DashNetwork::MAINNET, int64_t{1} << 40).empty());
 }
 
 // ── Cold-start rescan lane ──────────────────────────────────────────────────
