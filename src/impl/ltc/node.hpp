@@ -12,6 +12,7 @@
 #include "desired_request_pacer.hpp"   // futility backoff for the desired-request drain
 #include "ingest_budget.hpp"            // inbound-share admission bounds + ancestor-walk depth bound
 #include "misbehavior.hpp"              // #1601 per-peer invalid-PoW misbehavior scoring
+#include "own_share_reject_marks.hpp"    // re-broadcast hold-off for our own shares a peer aborted on
 #include <pool/share_download.hpp>     // shared downloader helpers (build_stops)
 
 #include <core/coin_params.hpp>
@@ -672,6 +673,10 @@ public:
 
     // ICommunicator (override BaseNode to track outbound lifecycle):
     void error(const message_error_type& err, const NetService& service, const std::source_location where = std::source_location::current()) override;
+    // Socket read errors arrive here as an error_code. Records whether it was a
+    // peer abort (classified on the code, not its possibly localized text), then
+    // takes the base route, which renders the code and lands in error() above.
+    void error(const boost::system::error_code& ec, const NetService& service, const std::source_location where = std::source_location::current()) override;
     void close_connection(const NetService& service) override;
 
     // BaseNode:
@@ -1194,7 +1199,23 @@ protected:
     std::function<std::vector<std::string>()> m_local_miner_scripts_fn;
     std::string m_node_payout_script_hex;
     std::set<uint256> m_shared_share_hashes;  // de-dup set for broadcast_share
-    std::set<uint256> m_rejected_share_hashes; // shares rejected by peers — never re-broadcast
+    // Our OWN shares a peer aborted on right after we pushed them: held off
+    // RE-broadcast for a TTL. Never consulted when serving shares — see
+    // own_share_reject_marks.hpp for why the old never-expiring, serve-filtering
+    // m_rejected_share_hashes was removed.
+    ltc::OwnShareRejectMarks<uint256, NetService> m_own_share_rejects;
+    // Clock for m_own_share_rejects. A test subclass overrides it to step time.
+    virtual std::chrono::steady_clock::time_point reject_mark_now() const
+    {
+        return std::chrono::steady_clock::now();
+    }
+    // error() path: attribute a peer-initiated drop to our latest push, if any.
+    // `ec_peer_abort` is the error_code classification when the drop came in as
+    // one; the text of `reason` is the fallback.
+    void note_disconnect_for_reject_marks(const NetService& service, const std::string& reason,
+                                          bool ec_peer_abort);
+    // Set by error(error_code) for the nested error(string) call, consumed there.
+    bool m_drop_ec_is_peer_abort = false;
     // broadcast_share tracker try-lock outcome counters (see the accessors above).
     std::atomic<uint64_t> m_broadcast_deferred{0};
     std::atomic<uint64_t> m_broadcast_acquired{0};
@@ -1298,14 +1319,6 @@ protected:
     // respond_all() on just that peer's deferrer. c2pool has a shared m_share_getter,
     // so we track which req_ids belong to which peer for cancel-on-disconnect.
     std::map<uint256, NetService> m_pending_share_reqs;  // req_id → peer addr
-
-    // Track recently-broadcast share hashes + timestamp so we can detect
-    // rapid disconnections (peer rejected our share → PoW invalid loop).
-    struct BroadcastRecord {
-        std::vector<uint256> hashes;
-        std::chrono::steady_clock::time_point when;
-    };
-    std::map<NetService, BroadcastRecord> m_last_broadcast_to; // per-peer
 
     // Connection maintenance
     static constexpr size_t DEFAULT_TARGET_OUTBOUND_PEERS = 8;

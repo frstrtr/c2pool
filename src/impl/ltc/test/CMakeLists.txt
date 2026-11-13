@@ -28,6 +28,13 @@ if (BUILD_TESTING AND GTest_FOUND)
     # existing allowlisted target (a standalone add_executable would be absent
     # from build.yml's --target list and silently Not-Run — the #769 trap).
     #
+    # serve_marked_shares_test.cpp + own_share_reject_marks_test.cpp: getshares
+    # replies are complete and contiguous even for shares pushed to a peer that
+    # dropped right after (dba0be63d skipped them forever); the narrowed
+    # own-share re-broadcast hold-off (peer abort only, 10 min TTL). REAL
+    # NodeImpl + real loopback peer. Same folding rule: into the existing
+    # allowlisted target.
+    #
     # pool_rate_head_select_test.cpp: the coin-generic dashboard pool-rate
     # HEAD-SELECTION + get_average_stale_prop SSOT (sharechain/
     # pool_rate_head_select.hpp, issue #1482) — verified best when live, else the
@@ -450,12 +457,14 @@ if (BUILD_TESTING AND GTest_FOUND)
         mweb_next_header_test.cpp
         mweb_state_hash_binding_test.cpp
         mweb_tx_wire_test.cpp
+        own_share_reject_marks_test.cpp
         peer_block_pow_carry_test.cpp
         per_peer_ingest_test.cpp
         pool_rate_head_select_test.cpp
         redistribute_script_type_test.cpp
         restart_reorg_supersede_test.cpp
         self_connection_ban_test.cpp
+        serve_marked_shares_test.cpp
         bootstrap_hosts_test.cpp
         share_fetch_failover_test.cpp
         share_message_unpack_bounds_test.cpp
