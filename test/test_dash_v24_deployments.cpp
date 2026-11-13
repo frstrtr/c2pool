@@ -763,8 +763,9 @@ TEST(DashV24Deployments, ActivationPinValidation)
     const auto& tp = dash_deployment_params(DashNetwork::TESTNET);
     const int64_t tP = vb_period(tp, tp.dep(DashDeployment::V24));
     EXPECT_FALSE(validate_v24_activation_pin(DashNetwork::TESTNET, 1'578'000 + tP).empty());
-    // ...and a value past the height range is no height.
-    EXPECT_FALSE(validate_v24_activation_pin(DashNetwork::MAINNET, int64_t{1} << 40).empty());
+    // ...and a period start past the height range is no height (master took
+    // it: a multiple of the window, above two periods).
+    EXPECT_FALSE(validate_v24_activation_pin(DashNetwork::MAINNET, int64_t{4032} << 21).empty());
 }
 
 // ── Cold-start rescan lane ──────────────────────────────────────────────────
