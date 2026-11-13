@@ -100,6 +100,12 @@ namespace dash::mint {
 // makes the target EASIER, i.e. it cannot mitigate the over-minting this cap
 // addresses. work_target.hpp carries it for the later port.
 //
+// Miner override (#865): a miner-supplied share target (oracle username
+// "ADDR/<difficulty>") replaces Cap 1 outright, matching work.py:312. It is
+// still floored by max_target and band-clipped like any other desired target.
+// Nothing supplies one yet — the stratum "/" parse is a separate slice — so
+// every current caller takes the std::nullopt default and is bit-identical.
+//
 // Per-miner pseudoshare (vardiff) difficulty stays a session concern and is
 // untouched; the share target the mint gate enforces is the modulated one.
 struct ProducerJobBuild
@@ -114,12 +120,14 @@ struct ProducerJobBuild
 // pre-cap value EXACTLY. compute_share_target applies the [pre_target3//30,
 // pre_target3] band afterwards; nothing here can escape it.
 inline uint256 desired_share_target(const core::CoinParams& params,
-                                    double local_hash_rate)
+                                    double local_hash_rate,
+                                    std::optional<uint256> miner_share_target = std::nullopt)
 {
     dash::stratum::WorkTargetInputs wt;
-    wt.local_hash_rate = local_hash_rate;
-    wt.share_period    = static_cast<uint32_t>(params.share_period);
-    wt.dust_gate       = false;   // Cap 2 not wired (see the note above)
+    wt.local_hash_rate    = local_hash_rate;
+    wt.share_period       = static_cast<uint32_t>(params.share_period);
+    wt.dust_gate          = false;   // Cap 2 not wired (see the note above)
+    wt.miner_share_target = miner_share_target;
 
     uint256 desired = dash::stratum::modulate_desired_share_target(wt);
     if (params.max_target < desired)
@@ -192,7 +200,8 @@ inline std::optional<ProducerJobBuild> build_producer_job(
     uint16_t donation,
     const std::string& coinbase_text,
     double local_hash_rate = 0.0,
-    const std::vector<unsigned char>& message_data = {})
+    const std::vector<unsigned char>& message_data = {},
+    std::optional<uint256> miner_share_target = std::nullopt)
 {
     const bool v36 = core::version_gate::is_v36_active(params.current_share_version);
     if (v36 && wd.m_tx_data_hex.size() != wd.m_tx_hashes.size()) {
@@ -251,7 +260,8 @@ inline std::optional<ProducerJobBuild> build_producer_job(
     }
     pin.desired_tx_hashes  = wd.m_tx_hashes;
     pin.desired_timestamp  = desired_timestamp;
-    pin.desired_target     = desired_share_target(params, local_hash_rate);
+    pin.desired_target     = desired_share_target(params, local_hash_rate,
+                                                  miner_share_target);
     if (v36)
         pin.message_data   = message_data;           // v16 has no message_data field
 
