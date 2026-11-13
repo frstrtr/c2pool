@@ -162,8 +162,9 @@ TEST(LtcRestartReload, BatchRemovalOfForkSharesKeepsTheMainChainIndexed)
     std::filesystem::remove_all(dir);
 }
 
-// A store written by a binary whose height index held one hash per height
-// (and has the holes that left) is rebuilt from the share records once.
+// A store last written by an earlier binary (one hash per height, and the
+// holes its unguarded deletes left; it closes with dirty=0) is rebuilt from
+// the share records on open.
 TEST(LtcRestartReload, AStoreWithTheOldOneHashIndexIsRebuiltOnOpen)
 {
     const auto dir = fresh_dir("old_index");
@@ -187,7 +188,6 @@ TEST(LtcRestartReload, AStoreWithTheOldOneHashIndexIsRebuiltOnOpen)
         // absheight 4 and stopped gracefully.
         core::LevelDBStore raw(db_path, core::LevelDBOptions{});
         ASSERT_TRUE(raw.open());
-        raw.remove("height_index_format");
         raw.remove("height:0000000000000004");
         raw.put("dirty", std::vector<uint8_t>{0});
         raw.close();

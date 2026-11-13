@@ -99,6 +99,9 @@ public:
 
     bool put(const std::string& key, const std::vector<uint8_t>& value);
     bool get(const std::string& key, std::vector<uint8_t>& value);
+    /// get(), telling an absent key from a read error: false only on an error;
+    /// `found` says whether the key exists (`value` is empty when it does not).
+    bool lookup(const std::string& key, std::vector<uint8_t>& value, bool& found);
     bool remove(const std::string& key);
     bool exists(const std::string& key);
 
@@ -174,6 +177,22 @@ bool leveldb_status_lock_held(const leveldb::Status& status, const std::string& 
 
 /**
  * Specialized LevelDB store for sharechain data with optimized indexing
+ *
+ * Keys: `share:<hash>` (the share's bytes), `index:<hash>` (its metadata:
+ * parent, absheight, ...), and the height index over absheights:
+ *   `height:<16-digit h>` = ONE 32-byte hash (the primary): exactly the
+ *                           format every earlier binary writes and reads;
+ *   `hsib:<16-digit h><hash>` = every OTHER stored share of absheight h.
+ * Storing a share adds it to its height (as the primary when it is the
+ * first); removing one removes only it, a removed primary being replaced by
+ * a sibling. Before, a height held one hash, the last written, and removing
+ * any share of the height deleted the key: every pruned fork share took the
+ * main-chain share of its height out of the index.
+ *
+ * Writers: store_share / store_shares_batch / remove_share /
+ * remove_shares_batch read-modify-write the height index, so no two of them
+ * may run at once on one store (the nodes serialize them under their
+ * exclusive tracker lock, or run them before / after the node runs).
  */
 class SharechainLevelDBStore
 {
@@ -194,19 +213,20 @@ private:
     void load_metadata();
     void save_metadata();
 
-    /// Rebuild every `height:` key from the `index:` records (and drop index
-    /// records whose share data is gone). Run at open() after an ungraceful
-    /// shutdown, and once on a store written before the height index held
-    /// every share of a height (kHeightIndexFormat).
+    /// Rebuild every `height:` and `hsib:` key from the `index:` records (and
+    /// drop index records whose share data is gone). Run at open() unless the
+    /// store was last closed cleanly by a binary that keeps the full index
+    /// (kCleanClose).
     void rebuild_height_index(const char* why);
 
-    /// The value of a `height:` key now holds the hash of EVERY stored share
-    /// at that height (32 bytes each, concatenated); format 1 held one hash,
-    /// the last one written, and removing any share of the height deleted
-    /// the key — the main-chain share with it.
-    static constexpr uint8_t kHeightIndexFormat = 2;
 
 public:
+    /// The "dirty" value close() writes. Earlier binaries write 0 and treat
+    /// only 1 (set while open) as dirty; any value but this one at open()
+    /// means an earlier binary (or a crash) wrote the height index last, and
+    /// it is rebuilt.
+    static constexpr uint8_t kCleanClose = 2;
+
     SharechainLevelDBStore(const std::string& base_path, const std::string& network_name);
     ~SharechainLevelDBStore();
 
@@ -265,6 +285,8 @@ public:
 
     // Chain traversal
     std::vector<uint256> get_chain_hashes(const uint256& start_hash, uint64_t max_count, bool forward = true);
+    /// Every stored share of each absheight in [start, end], in absheight
+    /// order (a height's `height:` share first, then its `hsib:` shares).
     std::vector<uint256> get_shares_by_height_range(uint64_t start_height, uint64_t end_height);
 
     /// One stored share as its own `index:` record describes it.
