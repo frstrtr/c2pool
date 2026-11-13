@@ -8566,15 +8566,79 @@ nlohmann::json MiningInterface::compute_current_merged_payouts()
         result[addr] = {{"amount", amount}, {"merged", nlohmann::json::array()}};
     }
 
-    // Add merged chain payouts via the payout_provider callback
+    // Add merged chain payouts via the payout provider. Each merged output is
+    // shown under the parent address(es) it is paid for, with its source:
+    //   "explicit"     the shares gave this merged address (stratum login
+    //                  LTC_ADDRESS,DOGE_ADDRESS, Tier 1; or Tier 1.5 for V36);
+    //   "auto-convert" no merged address in the shares: the parent key's own
+    //                  script on the merged chain (same hash160);
+    //   "donation"     the donation output.
+    // Both come from the provider's origins (get_payout_detail: the same PPLNS
+    // weights the amounts are split by). One merged output paid for several
+    // parent addresses (one DOGE address given by several LTC addresses) is
+    // listed under each of them with its part of the amount by PPLNS weight;
+    // such an entry carries "output_amount" (the whole output) and "fraction".
+    // A provider without origins (solo/custodial, other parents) keeps the old
+    // view: attached by equal hash160, labelled "auto-convert".
     if (m_mm_manager) {
+        static const char* HEX = "0123456789abcdef";
+        auto h160_of = [](const std::vector<unsigned char>& sc) -> std::string {
+            int off = -1;
+            if (sc.size() == 25 && sc[0] == 0x76) off = 3;        // P2PKH
+            else if (sc.size() == 23 && sc[0] == 0xa9) off = 2;   // P2SH
+            else if (sc.size() == 22 && sc[0] == 0x00) off = 2;   // P2WPKH
+            if (off < 0) return {};
+            std::string h;
+            h.reserve(40);
+            for (int i = off; i < off + 20; ++i) { h += HEX[sc[i] >> 4]; h += HEX[sc[i] & 0x0f]; }
+            return h;
+        };
+        // The parent rows by script and by hash160 (the rows are keyed by the
+        // parent address /current_payouts renders).
+        std::map<std::vector<unsigned char>, std::string> row_by_script;
+        std::map<std::string, std::string> row_by_h160;
+        for (auto& [parent_addr, entry] : result.items()) {
+            auto ps = address_to_script(parent_addr);
+            if (ps.empty()) continue;
+            row_by_script.emplace(ps, parent_addr);
+            auto h = h160_of(ps);
+            if (!h.empty()) row_by_h160.emplace(h, parent_addr);
+        }
+        const bool parent_is_ltc = (m_blockchain == Blockchain::LITECOIN);
+        auto row_for_parent = [&](const std::vector<unsigned char>& parent_script) -> std::string {
+            auto it = row_by_script.find(parent_script);
+            if (it != row_by_script.end()) return it->second;
+            // A parent with no parent-chain payout in the current window (the
+            // merged weights are flat, the parent's decay): its own row.
+            std::string addr = core::script_to_address(parent_script, parent_is_ltc, m_testnet);
+            if (addr.empty()) {
+                for (auto b : parent_script) { addr += HEX[b >> 4]; addr += HEX[b & 0x0f]; }
+            }
+            if (!result.contains(addr))
+                result[addr] = {{"amount", 0.0}, {"merged", nlohmann::json::array()}};
+            row_by_script.emplace(parent_script, addr);
+            return addr;
+        };
+
         auto chain_infos = m_mm_manager->get_chain_infos();
         for (const auto& ci : chain_infos) {
             if (ci.coinbase_value == 0) continue;
 
-            // Use the same payout_provider that build_multiaddress_block uses
-            auto merged_payouts = m_mm_manager->get_payouts(ci.chain_id, ci.coinbase_value);
+            // The same payouts build_multiaddress_block uses, with their origins.
+            auto detail = m_mm_manager->get_payout_detail(ci.chain_id, ci.coinbase_value);
+            const auto& merged_payouts = detail.payouts;
             if (merged_payouts.empty()) continue;
+
+            // Per merged script: (parent script -> {explicit, fraction}). A
+            // parent paid both ways to one script (its explicit address equal
+            // to its own derived one) is one entry, explicit.
+            std::map<std::vector<unsigned char>,
+                     std::map<std::vector<unsigned char>, std::pair<bool, double>>> origins_by_script;
+            for (const auto& o : detail.origins) {
+                auto& e = origins_by_script[o.script][o.parent_script];
+                e.first = e.first || o.explicit_address;
+                e.second += o.fraction;
+            }
 
             // Per-coin aux-payout address version bytes from the merged
             // chain's own config -- never a hardcoded DOGE assumption, so a
@@ -8585,8 +8649,6 @@ nlohmann::json MiningInterface::compute_current_merged_payouts()
             uint8_t merged_p2sh_ver  = ci.p2sh_version    ? ci.p2sh_version    : 0x16;
 
             for (auto& [script, amount] : merged_payouts) {
-                // Determine source label (p2pool: auto-convert, donation, explicit)
-                std::string source = "auto-convert"; // default for V35 (no explicit merged addrs)
                 // Donation: P2PK (ends with OP_CHECKSIG), P2SH matching donation script,
                 // or script matching the known donation_script from MiningInterface
                 bool is_donation = (script.size() > 33 && script.back() == 0xac); // P2PK
@@ -8597,8 +8659,7 @@ nlohmann::json MiningInterface::compute_current_merged_payouts()
                     if (script[2] == 0x8c && script[3] == 0x62 && script[4] == 0x72)
                         is_donation = true;
                 }
-                if (is_donation) source = "donation";
-                // TODO: detect "explicit" when V36 shares carry merged_addresses
+                std::string source = is_donation ? "donation" : "auto-convert";
 
                 // Convert merged script to proper DOGE address
                 std::string merged_addr = script_to_address(script, "", merged_p2pkh_ver, merged_p2sh_ver);
@@ -8609,42 +8670,50 @@ nlohmann::json MiningInterface::compute_current_merged_payouts()
                 }
 
                 // Extract hash160 from merged script for matching to parent LTC address
-                std::string hash160_hex;
-                int h160_offset = -1;
-                if (script.size() == 25 && script[0] == 0x76) h160_offset = 3; // P2PKH
-                else if (script.size() == 23 && script[0] == 0xa9) h160_offset = 2; // P2SH
-                else if (script.size() == 22 && script[0] == 0x00) h160_offset = 2; // P2WPKH
-                if (h160_offset >= 0) {
-                    static const char* HEX = "0123456789abcdef";
-                    hash160_hex.reserve(40);
-                    for (int i = h160_offset; i < h160_offset + 20; ++i) {
-                        hash160_hex += HEX[script[i] >> 4];
-                        hash160_hex += HEX[script[i] & 0x0f];
+                std::string hash160_hex = h160_of(script);
+
+                bool attached = false;
+
+                // Origins known: under each parent address it is paid for.
+                const auto oit = is_donation ? origins_by_script.end() : origins_by_script.find(script);
+                if (oit != origins_by_script.end() && !oit->second.empty()) {
+                    const auto& parents = oit->second;
+                    const bool split = parents.size() > 1;
+                    for (const auto& [parent_script, how] : parents) {
+                        const bool expl = how.first;
+                        const double part = split ? how.second : 1.0;
+                        const std::string row = row_for_parent(parent_script);
+                        nlohmann::json m = {
+                            {"symbol", ci.symbol},
+                            {"address", merged_addr.empty() ? hash160_hex : merged_addr},
+                            {"amount", amount * part / 1e8},
+                            {"source", expl ? "explicit" : "auto-convert"},
+                            {"parent", row},
+                        };
+                        if (split) {
+                            m["output_amount"] = amount / 1e8;
+                            m["fraction"] = part;
+                        }
+                        // A parent P2SH key paid as the merged chain's P2SH:
+                        // unsafe for a segwit-wrapped wallet address (M...).
+                        if (!expl && parent_script.size() == 23 && parent_script[0] == 0xa9)
+                            m["parent_p2sh"] = true;
+                        result[row]["merged"].push_back(std::move(m));
                     }
+                    attached = true;
                 }
 
-                // Find parent LTC address with same hash160
-                bool attached = false;
-                if (!hash160_hex.empty()) {
-                    for (auto& [parent_addr, entry] : result.items()) {
-                        auto ps = address_to_script(parent_addr);
-                        int po = (ps.size() == 25) ? 3 : (ps.size() == 22) ? 2 : (ps.size() == 23) ? 2 : -1;
-                        if (po >= 0 && po + 20 <= static_cast<int>(ps.size())) {
-                            static const char* HEX = "0123456789abcdef";
-                            std::string ph;
-                            ph.reserve(40);
-                            for (int i = po; i < po + 20; ++i) { ph += HEX[ps[i] >> 4]; ph += HEX[ps[i] & 0x0f]; }
-                            if (ph == hash160_hex) {
-                                entry["merged"].push_back({
-                                    {"symbol", ci.symbol},
-                                    {"address", merged_addr.empty() ? hash160_hex : merged_addr},
-                                    {"amount", amount / 1e8},
-                                    {"source", source}
-                                });
-                                attached = true;
-                                break;
-                            }
-                        }
+                // No origins: the parent address with the same hash160.
+                if (!attached && !hash160_hex.empty()) {
+                    auto rit = row_by_h160.find(hash160_hex);
+                    if (rit != row_by_h160.end()) {
+                        result[rit->second]["merged"].push_back({
+                            {"symbol", ci.symbol},
+                            {"address", merged_addr.empty() ? hash160_hex : merged_addr},
+                            {"amount", amount / 1e8},
+                            {"source", source}
+                        });
+                        attached = true;
                     }
                 }
                 // Donation not matched by hash160 — attach to LTC donation address

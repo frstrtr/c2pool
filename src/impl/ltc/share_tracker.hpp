@@ -30,6 +30,7 @@ inline uint64_t mul128_shift(uint64_t a, uint64_t b, unsigned shift) {
 #include <core/uint256.hpp>
 #include <core/netaddress.hpp>
 #include <sharechain/weights_skiplist.hpp>
+#include <c2pool/merged/payout_source.hpp>  // PayoutOrigins (merged_payout_origins)
 #include <btclibs/base58.h>
 #include <btclibs/bech32.h>
 
@@ -190,6 +191,17 @@ struct MergedPayoutWeights
     // (merged script, summed weight of the keys resolving to it), by script.
     std::vector<std::pair<std::vector<unsigned char>, uint288>> resolved;
     uint288 accepted_total;    // sum of the resolved weights
+
+    // Where each resolved script's weight came from, one entry per weight key
+    // (display only: the amounts never read it). Their weights sum to the
+    // script's resolved weight.
+    struct Source {
+        std::vector<unsigned char> script;   // the merged payout script (as in resolved)
+        std::vector<unsigned char> parent;   // the parent (LTC) payout script of the shares
+        bool explicit_address{false};        // the shares' merged address (Tier 1 / 1.5), else derived from parent
+        uint288 weight;
+    };
+    std::vector<Source> sources;
 };
 
 // ── Dense PPLNS Ring Buffer ──────────────────────────────────────────────
@@ -2671,7 +2683,7 @@ public:
                 {
                     if (entry.m_chain_id == *chain_id)
                     {
-                        weight_key = make_merged_key(entry.m_script.m_data);
+                        weight_key = make_merged_key(entry.m_script.m_data, parent_script);
                         break;
                     }
                 }
@@ -2693,7 +2705,7 @@ public:
                                     miner_it = table_it->second.find(norm);
                             }
                             if (miner_it != table_it->second.end())
-                                weight_key = make_merged_key(miner_it->second);
+                                weight_key = make_merged_key(miner_it->second, parent_script);
                         }
                     }
                 }
@@ -2985,14 +2997,39 @@ public:
         // floor(miners_reward * sum / accepted) per script, not a sum of
         // per-key floors. V36 peers re-derive this coinbase and compare.
         std::map<std::vector<unsigned char>, uint288> script_weights;
+        out.sources.reserve(weights.size());
         for (const auto& [key, weight] : weights) {
             std::vector<unsigned char> script = resolve_merged_payout_script(key);
             if (script.empty()) continue;  // Unconvertible (P2WSH, P2TR) — skip
             script_weights[script] = script_weights[script] + weight;
             out.accepted_total = out.accepted_total + weight;
+            const bool expl = is_merged_key(key);
+            out.sources.push_back({script, expl ? merged_key_parent(key) : key, expl, weight});
         }
         for (auto& [script, weight] : script_weights)
             out.resolved.emplace_back(script, weight);
+        return out;
+    }
+
+    // For each merged payout script, the parent scripts whose shares it is
+    // paid for and how (explicit merged address or derived from the parent
+    // key), with each one's fraction of the script's weight: from the same
+    // weights as the amounts (merged_payouts_from_weights), no walk. The
+    // donation script's own share (donation weight + rounding) has no source.
+    static c2pool::merged::PayoutOrigins
+    merged_payout_origins(const MergedPayoutWeights& w)
+    {
+        c2pool::merged::PayoutOrigins out;
+        out.reserve(w.sources.size());
+        for (const auto& src : w.sources) {
+            const auto it = std::lower_bound(
+                w.resolved.begin(), w.resolved.end(), src.script,
+                [](const auto& e, const std::vector<unsigned char>& s) { return e.first < s; });
+            double fraction = 0;
+            if (it != w.resolved.end() && it->first == src.script && !it->second.IsNull())
+                fraction = static_cast<double>((src.weight * 1000000000u / it->second).GetLow64()) / 1e9;
+            out.push_back({src.script, src.parent, src.explicit_address, fraction});
+        }
         return out;
     }
 
