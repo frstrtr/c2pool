@@ -602,3 +602,156 @@ TEST(DashV24StableTxid, RealTestnetBlock1578005StillBinds)
     EXPECT_EQ(dash::coin::dash_txid(blk.m_txs[1]), dash::coin::dash_instance_hash(blk.m_txs[1]))
         << "a version-1 unlock keeps its full-hash txid";
 }
+
+// ═══ CheckMerkleRoot: merkleRootAssetUnlocks binds the body (Core v24) ══════
+// Dash Core v24.0.0 validation.cpp CheckMerkleRoot: after the tx merkle root, a
+// CbTx of version >= 4 must commit the INSTANCE-hash root of the block's
+// version-2 unlocks, or the block is BLOCK_MUTATED
+// (bad-cbtx-assetunlockmerkleroot). The stable txid hides the quorum signing
+// bytes from the tx merkle root, so this is the only commitment to them.
+// Revert-red arm: drop the block_asset_unlock_root_binds call from
+// block_body_binds_to_header -> MutatedUnlockSigningInfoDoesNotBind,
+// UnlockRootWithoutTheUnlockDoesNotBind, TwoUnlocksCommitInBlockOrder and
+// LeafSetAndVersionEdges go red (control run against master, 11-13).
+
+namespace {
+
+MutableTransaction cbtx_coinbase(uint16_t version, const uint256& unlock_root)
+{
+    CCbTx c = sample_cbtx(version);
+    if (version >= CCbTx::VERSION_MERKLE_ROOT_ASSETUNLOCKS) c.merkleRootAssetUnlocks = unlock_root;
+    // The null BLS signature: a payload Dash Core's GetTxPayload accepts too
+    // (sample_cbtx's 0xa0.. bytes are not a G2 point, and Core would skip the
+    // unlock-root check on them), so every vector here is one Core judges.
+    for (auto& byte : c.bestCLSignature) byte = 0;
+    MutableTransaction cb;
+    cb.version = 3;
+    cb.type = 5;
+    bitcoin_family::coin::TxIn in;
+    in.prevout.hash.SetNull();
+    in.prevout.index = 0xffffffff;
+    in.sequence = 0xffffffff;
+    cb.vin.push_back(in);
+    bitcoin_family::coin::TxOut o;
+    o.value = 1;
+    cb.vout.push_back(o);
+    cb.extra_payload = dash::coin::encode_cbtx(c);
+    return cb;
+}
+
+// A body whose header commits the tx merkle root over its own txids.
+dash::coin::BlockType bound_body(std::vector<MutableTransaction> txs)
+{
+    dash::coin::BlockType b;
+    std::vector<uint256> ids;
+    for (auto& t : txs) {
+        ids.push_back(dash::coin::dash_txid(t));
+        b.m_txs.push_back(std::move(t));
+    }
+    b.m_merkle_root = dash::coin::compute_merkle_root(ids);
+    return b;
+}
+
+} // namespace
+
+TEST(DashV24UnlockRootBind, MatchingRootBinds)
+{
+    const auto u = stable_unlock(2, 0x11, 2000, 500, u256_one(), 0x44);
+    auto b = bound_body({cbtx_coinbase(4, dash::coin::dash_instance_hash(u)), u});
+    EXPECT_TRUE(dash::coin::block_body_binds_to_header(b));
+}
+
+TEST(DashV24UnlockRootBind, MutatedUnlockSigningInfoDoesNotBind)
+{
+    const auto real = stable_unlock(2, 0x11, 2000, 500, u256_one(), 0x44);
+    auto b = bound_body({cbtx_coinbase(4, dash::coin::dash_instance_hash(real)), real});
+    ASSERT_TRUE(dash::coin::block_body_binds_to_header(b));
+    // A middleman re-signs the unlock (other quorum signature bytes): the
+    // stable txid, and so the tx merkle root, do not move.
+    const auto resigned = stable_unlock(2, 0x11, 2000, 500, u256_one(), 0x45);
+    ASSERT_EQ(dash::coin::dash_txid(resigned), dash::coin::dash_txid(real));
+    ASSERT_NE(dash::coin::dash_instance_hash(resigned), dash::coin::dash_instance_hash(real));
+    const uint256 header_root = b.m_merkle_root;
+    b.m_txs[1] = resigned;
+    ASSERT_EQ(dash::coin::compute_merkle_root({dash::coin::dash_txid(b.m_txs[0]),
+                                               dash::coin::dash_txid(b.m_txs[1])}), header_root)
+        << "the tx merkle root alone cannot see the mutation";
+    EXPECT_FALSE(dash::coin::block_body_binds_to_header(b))
+        << "Core: bad-cbtx-assetunlockmerkleroot (BLOCK_MUTATED)";
+    // The other quorum-info bytes the stable txid zeroes: the quorum hash.
+    auto b2 = bound_body({cbtx_coinbase(4, dash::coin::dash_instance_hash(real)), real});
+    b2.m_txs[1] = stable_unlock(2, 0x11, 2000, 500, u256_two(), 0x44);
+    ASSERT_EQ(dash::coin::dash_txid(b2.m_txs[1]), dash::coin::dash_txid(real));
+    EXPECT_FALSE(dash::coin::block_body_binds_to_header(b2));
+}
+
+TEST(DashV24UnlockRootBind, UnlockRootWithoutTheUnlockDoesNotBind)
+{
+    const auto u = stable_unlock(2, 0x11, 2000, 500, u256_one(), 0x44);
+    // The CbTx commits an unlock the body does not carry.
+    auto b = bound_body({cbtx_coinbase(4, dash::coin::dash_instance_hash(u))});
+    EXPECT_FALSE(dash::coin::block_body_binds_to_header(b));
+    // ...and a null root with a version-2 unlock in the body.
+    auto b2 = bound_body({cbtx_coinbase(4, uint256::ZERO), u});
+    EXPECT_FALSE(dash::coin::block_body_binds_to_header(b2));
+}
+
+TEST(DashV24UnlockRootBind, OnlyAVersion4CbTxCommits)
+{
+    const auto u = stable_unlock(2, 0x11, 2000, 500, u256_one(), 0x44);
+    // CbTx v3 (before v24) carries no unlock root: the tx merkle root decides.
+    EXPECT_TRUE(dash::coin::block_body_binds_to_header(bound_body({cbtx_coinbase(3, uint256()), u})));
+    // A coinbase whose payload does not parse as a CbTx: Core's GetTxPayload
+    // (assert_type=false) gives nullopt and the check is skipped.
+    auto junk = cbtx_coinbase(4, uint256::ZERO);
+    junk.extra_payload.push_back(0x00);   // a trailing byte: parse_cbtx refuses it
+    EXPECT_TRUE(dash::coin::block_body_binds_to_header(bound_body({junk, u})));
+    // A version-1 unlock is not a leaf: a null root binds.
+    const auto v1 = stable_unlock(1, 0x11, 2000, 500, u256_one(), 0x44);
+    EXPECT_TRUE(dash::coin::block_body_binds_to_header(bound_body({cbtx_coinbase(4, uint256::ZERO), v1})));
+    // No unlocks at all: the null root.
+    EXPECT_TRUE(dash::coin::block_body_binds_to_header(bound_body({cbtx_coinbase(4, uint256::ZERO)})));
+}
+
+TEST(DashV24UnlockRootBind, LeafSetAndVersionEdges)
+{
+    const auto a = stable_unlock(2, 0x11, 2000, 500, u256_one(), 0x44);
+    const uint256 ra = dash::coin::dash_instance_hash(a);
+    // CbTx v5 (any version >= 4) commits too.
+    EXPECT_TRUE(dash::coin::block_body_binds_to_header(bound_body({cbtx_coinbase(5, ra), a})));
+    EXPECT_FALSE(dash::coin::block_body_binds_to_header(bound_body({cbtx_coinbase(5, uint256::ZERO), a})));
+    // A payload of 144 or 146 bytes is not an asset-unlock payload: no leaf.
+    for (size_t size : {size_t{144}, size_t{146}}) {
+        const auto odd = unlock_tx(2, 0x21, size);
+        ASSERT_FALSE(dash::coin::is_asset_unlock_with_stable_txid(odd));
+        EXPECT_TRUE(dash::coin::block_body_binds_to_header(bound_body({cbtx_coinbase(4, uint256::ZERO), odd})))
+            << size;
+    }
+    // Payload version 3 (>= 2) is a stable-txid unlock: a leaf.
+    const auto v3 = stable_unlock(3, 0x13, 2000, 500, u256_one(), 0x66);
+    ASSERT_TRUE(dash::coin::is_asset_unlock_with_stable_txid(v3));
+    EXPECT_FALSE(dash::coin::block_body_binds_to_header(bound_body({cbtx_coinbase(4, uint256::ZERO), v3})));
+    EXPECT_TRUE(dash::coin::block_body_binds_to_header(
+        bound_body({cbtx_coinbase(4, dash::coin::dash_instance_hash(v3)), v3})));
+    // Three unlocks: an odd leaf layer duplicates its last leaf.
+    const auto b = stable_unlock(2, 0x12, 2000, 500, u256_one(), 0x55);
+    const uint256 r3 = dash::coin::compute_merkle_root(
+        {ra, dash::coin::dash_instance_hash(b), dash::coin::dash_instance_hash(v3)});
+    EXPECT_TRUE(dash::coin::block_body_binds_to_header(bound_body({cbtx_coinbase(4, r3), a, b, v3})));
+    // The coinbase is not a CbTx (type 0): no commitment to check.
+    auto plain = cbtx_coinbase(4, uint256::ZERO);
+    plain.type = 0;
+    plain.extra_payload.clear();
+    EXPECT_TRUE(dash::coin::block_body_binds_to_header(bound_body({plain, a})));
+}
+
+TEST(DashV24UnlockRootBind, TwoUnlocksCommitInBlockOrder)
+{
+    const auto a = stable_unlock(2, 0x11, 2000, 500, u256_one(), 0x44);
+    const auto c = stable_unlock(2, 0x12, 2000, 500, u256_one(), 0x55);
+    const uint256 root = dash::coin::compute_merkle_root(
+        {dash::coin::dash_instance_hash(a), dash::coin::dash_instance_hash(c)});
+    EXPECT_TRUE(dash::coin::block_body_binds_to_header(bound_body({cbtx_coinbase(4, root), a, c})));
+    EXPECT_FALSE(dash::coin::block_body_binds_to_header(bound_body({cbtx_coinbase(4, root), c, a})))
+        << "the unlock root follows block order (bound_body re-commits the tx merkle root)";
+}

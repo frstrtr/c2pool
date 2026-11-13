@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+### Node fee draw honours fractional fees; addr gossip at 80%
+- `core::random::random_float` was an integer draw: `random_float(0, 100)`
+  returned only 0..100 and `random_float(0, 1)` only 0 or 1. It is now a
+  continuous draw on [min, max) (p2pool `random.uniform`).
+- The node-fee draw (`-f` / `money.node_owner_fee_pct`, LTC stratum and the
+  HTTP JSON-RPC submit path) took the fee with probability ceil(fee)/101:
+  0.5% took about 0.99%, 1% about 0.99%, 1.5% about 1.98%, 100% about 99%.
+  It now takes exactly the configured rate. Operators with a node fee see
+  it taken at that rate from this release on. DASH and BTC stratum use
+  their own fee rolls and are unchanged.
+- Share-chain addr / addrme relay (`random_float(0, 1) < 0.8`, every coin)
+  fired 50% of the time; it now fires 80%, as in p2pool. No share or block
+  construction or validation uses these draws.
+
 ### LTC: share version 3601 (flag day) — upgrade every node to c2pool v0.2.12
 - From a flag day set in the release (`ltc::PoolConfig::V3601_ACTIVATION_TIME`;
   not scheduled in this build) every share is a share version 3601 share: the

@@ -88,7 +88,9 @@ HashWriter TaggedHash(const std::string& tag)
 {
     HashWriter writer{};
     uint256 taghash;
-    CSHA256().Write((const unsigned char*)tag.data(), tag.size()).Finalize(taghash.begin());
+    // Byte digest: uint256::begin() is a uint32_t* and would pick
+    // CSHA256::Finalize(uint32_t*), the raw state words.
+    CSHA256().Write((const unsigned char*)tag.data(), tag.size()).Finalize(taghash.data());
     writer << taghash << taghash;
     return writer;
 }

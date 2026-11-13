@@ -19,6 +19,7 @@
 #include <iomanip>
 #include <random>
 #include <unordered_map>
+#include <utility>
 #include <ctime>
 #ifndef _WIN32
 #include <execinfo.h>  // backtrace() for think() watchdog stack dump (glibc-only)
@@ -127,6 +128,28 @@ static uint64_t make_random_nonce()
     return rng();
 }
 
+// A share WE minted: it never arrived from a peer. Same test as the local-fork
+// log in processing_shares and auto_ratchet.hpp. Shares reloaded from LevelDB
+// carry peer_addr "database" and so do not count.
+static bool share_locally_minted(ShareType& share)
+{
+    bool local = false;
+    share.invoke([&](auto* obj) {
+        local = (obj->peer_addr == NetService{"0.0.0.0", 0} || obj->peer_addr == NetService{});
+    });
+    return local;
+}
+
+// The subset of `sent` that is in `own`, in `sent` order.
+static std::vector<uint256> own_subset(const std::vector<uint256>& sent, const std::set<uint256>& own)
+{
+    std::vector<uint256> out;
+    for (const auto& h : sent)
+        if (own.count(h))
+            out.push_back(h);
+    return out;
+}
+
 void NodeImpl::send_ping(peer_ptr peer)
 {
         auto rmsg = ltc::message_ping::make_raw();
@@ -156,28 +179,60 @@ void NodeImpl::connected(std::shared_ptr<core::Socket> socket)
     send_version(peer);
 }
 
+void NodeImpl::note_disconnect_for_reject_marks(const NetService& service, const std::string& reason,
+                                                bool ec_peer_abort)
+{
+    using Marks = decltype(m_own_share_rejects);
+    const bool peer_abort = ec_peer_abort || ltc::disconnect_is_peer_abort(reason);
+    const auto out = m_own_share_rejects.on_disconnect(
+        service, peer_abort ? Marks::DropKind::PeerAbort : Marks::DropKind::Other, reject_mark_now());
+    if (out.verdict == Marks::Verdict::Marked && !out.newly_marked.empty()) {
+        // Our own share(s), and the peer ABORTED (RST) right after the push:
+        // the canonical bad-share drop. Rare by construction, still capped.
+        static uint64_t mark_log = 0;
+        const bool loud = mark_log < 20 || mark_log % 100 == 0;
+        ++mark_log;
+        const std::string line = "[Pool] Peer " + service.to_string()
+            + " aborted the connection (" + reason + ") "
+            + std::to_string(out.since_push.count()) + "ms after we pushed "
+            + std::to_string(out.newly_marked.size()) + " of our own share(s), first "
+            + out.newly_marked.front().GetHex().substr(0, 16)
+            + ": holding them off re-broadcast for "
+            + std::to_string(std::chrono::duration_cast<std::chrono::seconds>(Marks::MARK_TTL).count())
+            + "s (still served to any peer that asks)";
+        if (loud)
+            LOG_WARNING << line;
+        else
+            LOG_DEBUG_POOL << line;
+    } else if (out.verdict == Marks::Verdict::NotARejection) {
+        // A timeout / EOF / other drop shortly after a push of our own shares.
+        // Not a rejection (dba0be63d treated it as one; see
+        // own_share_reject_marks.hpp). Debug-level, sampled.
+        static uint64_t skip_log = 0;
+        if (skip_log++ % 50 == 0)
+            LOG_DEBUG_POOL << "[Pool] Peer " << service.to_string() << " dropped ("
+                           << reason << ") " << out.since_push.count()
+                           << "ms after a push of " << out.own_in_push
+                           << " own share(s): not a rejection, nothing held off";
+    }
+}
+
+void NodeImpl::error(const boost::system::error_code& ec, const NetService& service, const std::source_location where)
+{
+    // Classify on the code: WSAECONNRESET's text is localized on Windows.
+    // base_t renders the code (parse_net_error) and calls error(string) below,
+    // synchronously on this thread, which consumes the flag.
+    m_drop_ec_is_peer_abort = ltc::disconnect_is_peer_abort(ec);
+    base_t::error(ec, service, where);
+    m_drop_ec_is_peer_abort = false;
+}
+
 void NodeImpl::error(const message_error_type& err, const NetService& service, const std::source_location where)
 {
-    // If peer disconnected within 10s of us sending shares, those shares
-    // were likely rejected (e.g. PoW-invalid).  Mark them so we don't
-    // keep re-broadcasting the same bad share on every reconnection.
-    {
-        auto it = m_last_broadcast_to.find(service);
-        if (it != m_last_broadcast_to.end()) {
-            auto elapsed = std::chrono::steady_clock::now() - it->second.when;
-            if (elapsed < std::chrono::seconds(10)) {
-                for (const auto& h : it->second.hashes) {
-                    if (m_rejected_share_hashes.insert(h).second) {
-                        LOG_WARNING << "[Pool] Marking share " << h.GetHex().substr(0, 16)
-                                    << " as rejected (peer " << service.to_string()
-                                    << " disconnected " << std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count()
-                                    << "ms after broadcast)";
-                    }
-                }
-            }
-            m_last_broadcast_to.erase(it);
-        }
-    }
+    // A peer-initiated drop right after we pushed OUR OWN shares may be the
+    // canonical bad-share abort. Only that case holds those shares off
+    // RE-broadcast, for a TTL. Nothing here ever affects serving them.
+    note_disconnect_for_reject_marks(service, err, std::exchange(m_drop_ec_is_peer_abort, false));
 
     // Drop stale nonce->peer entries for this endpoint before base cleanup.
     // Without this, reconnects can be rejected as false duplicates because
@@ -217,19 +272,11 @@ void NodeImpl::error(const message_error_type& err, const NetService& service, c
 
 void NodeImpl::close_connection(const NetService& service)
 {
-    // Same rejection tracking as error() — close_connection is another
-    // path for peer disconnection.
-    {
-        auto it = m_last_broadcast_to.find(service);
-        if (it != m_last_broadcast_to.end()) {
-            auto elapsed = std::chrono::steady_clock::now() - it->second.when;
-            if (elapsed < std::chrono::seconds(10)) {
-                for (const auto& h : it->second.hashes)
-                    m_rejected_share_hashes.insert(h);
-            }
-            m_last_broadcast_to.erase(it);
-        }
-    }
+    // Every caller of close_connection is a close WE decided on (ban,
+    // duplicate/self swap, misfit or pre-3601 sender, remembered-tx cap, admin
+    // drop). The peer rejected nothing, so nothing we pushed it is marked.
+    // (dba0be63d marked here too.)
+    m_own_share_rejects.forget_peer(service);
 
     m_pending_outbound.erase(service);
     m_outbound_addrs.erase(service);
@@ -771,7 +818,7 @@ void NodeImpl::drop_pre_3601_peer(const NetService& addr, const std::string& lin
         LOG_DEBUG_POOL << "[Pool] " << line;
     m_pre_3601_until[addr] = now + std::chrono::hours(1);   // the dialer skips this ip:port
     // A deliberate close: what we sent it is not "rejected by the peer".
-    m_last_broadcast_to.erase(addr);
+    m_own_share_rejects.forget_peer(addr);
     if (m_pre_3601_until.size() > 4096)
         for (auto it = m_pre_3601_until.begin(); it != m_pre_3601_until.end(); )
             it = it->second <= now ? m_pre_3601_until.erase(it) : std::next(it);
@@ -805,7 +852,7 @@ void NodeImpl::drop_misfit_sender(const peer_ptr& peer, const std::string& why)
             LOG_WARNING << "[Pool] " << line;
         else
             LOG_DEBUG_POOL << "[Pool] " << line;
-        m_last_broadcast_to.erase(peer->addr());
+        m_own_share_rejects.forget_peer(peer->addr());
     }
     close_connection(peer->addr());
 }
@@ -1213,6 +1260,18 @@ void NodeImpl::processing_shares_phase2(HandleSharesData& data, NetService addr)
 
 std::vector<ltc::ShareType> NodeImpl::handle_get_share(std::vector<uint256> hashes, uint64_t parents, std::vector<uint256> stops, NetService peer_addr)
 {
+    // An empty hash list would divide by zero in the parents cap below (UB;
+    // SIGFPE on x86). Answer it empty, as BTC and DASH do (dash/node.cpp
+    // handle_get_share). Rate-limited: the peer controls how often this fires.
+    if (hashes.empty())
+    {
+        static uint64_t empty_log = 0;
+        if (empty_log++ % 50 == 0)
+            LOG_WARNING << "[handle_get_share] EMPTY hashes from " << peer_addr.to_string()
+                        << " (malformed sharereq) — answering empty";
+        return {};
+    }
+
     // try_to_lock per the architectural rule (node.hpp:67) — IO thread MUST
     // never block on m_tracker_mutex.  A blocking shared_lock here was the
     // root cause of the periodic event-loop freeze + SIGABRT cycle on
@@ -1257,8 +1316,10 @@ std::vector<ltc::ShareType> NodeImpl::handle_get_share(std::vector<uint256> hash
         {
 			if (std::find(stops.begin(), stops.end(), hash) != stops.end())
 				break;
-			if (m_rejected_share_hashes.count(hash))
-				continue;
+			// Serve every share we hold, contiguously, as canonical
+			// handle_get_shares does (p2pool-merged-v36 p2pool/node.py:141-152).
+			// The own-share reject marks never filter a reply: a hole here
+			// makes every syncing peer fail over (own_share_reject_marks.hpp).
 			if (!takes_3601 && data.share.version() >= FLAG_DAY_SHARE_VERSION)
 				continue;
 			shares.push_back(data.share);
@@ -1300,15 +1361,15 @@ std::vector<uint256> NodeImpl::send_shares(peer_ptr peer, const std::vector<uint
         return {};
     }
 
-    // Collect shares that exist in our chain (skip rejected; no 3601 share
-    // to a peer that cannot load one)
+    // Collect shares that exist in our chain (no 3601 share to a peer that
+    // cannot load one). The own-share reject marks are NOT consulted here: the
+    // broadcast / re-advertise walks that build share_hashes apply them, and
+    // this function must send whatever its caller asked for.
     const bool takes_3601 = peer_takes_3601(peer->m_other_version);
     std::vector<ShareType> shares;
     for (const auto& hash : share_hashes)
     {
         if (!m_chain->contains(hash))
-            continue;
-        if (m_rejected_share_hashes.count(hash))
             continue;
         // Retrieve the share via get_chain(hash, 1) — first element is the share itself
         for (auto [h, data] : m_chain->get_chain(hash, 1))
@@ -1582,7 +1643,9 @@ void NodeImpl::broadcast_share(const uint256& share_hash)
     // breaks on the marked hash, no retry path exists, and m_shared_share_hashes
     // is only ever cleared wholesale on overflow. A chain TIP lost that way is
     // silent PPLNS-credit loss. Mark only what reached >= 1 peer, below.
+    const auto mark_now = reject_mark_now();
     std::vector<uint256> to_send;
+    std::set<uint256> own;   // the locally minted subset of to_send
     int32_t height = m_chain->get_height(share_hash);
     int32_t walk = std::min(height, 5);
 
@@ -1590,8 +1653,10 @@ void NodeImpl::broadcast_share(const uint256& share_hash)
     {
         if (m_shared_share_hashes.count(hash))
             break;
-        if (m_rejected_share_hashes.count(hash))
-            continue; // skip shares previously rejected by peers
+        if (m_own_share_rejects.suppressed(hash, mark_now))
+            continue; // our own share a peer aborted on, within its TTL
+        if (share_locally_minted(data.share))
+            own.insert(hash);
         to_send.push_back(hash);
     }
 
@@ -1602,19 +1667,16 @@ void NodeImpl::broadcast_share(const uint256& share_hash)
     // runs. This counter is the one that stayed at zero in production.
     m_broadcast_reached_send.fetch_add(1, std::memory_order_relaxed);
 
-    auto now = std::chrono::steady_clock::now();
     std::vector<uint256> actually_sent;
     for (auto& [nonce, peer] : m_peers) {
         auto sent = send_shares(peer, to_send);
         actually_sent.insert(actually_sent.end(), sent.begin(), sent.end());
-        // Record what THIS peer was actually sent, not the pre-gate batch.
-        // error()/close_connection() turn this record into permanent entries in
-        // m_rejected_share_hashes when the peer drops within 10s — and that set
-        // is never cleared and also stops us serving those shares to syncing
-        // peers. Recording to_send would brand shares the gate withheld, or a
-        // whole batch send_shares abandoned, as "peer-rejected" despite never
-        // having been a byte on the wire.
-        m_last_broadcast_to[peer->addr()] = {sent, now};
+        // Record only OUR OWN shares that THIS peer was actually sent, not the
+        // pre-gate batch: a share the gate withheld, or a batch send_shares
+        // abandoned, was never a byte on the wire, and a share we received is
+        // never ours to hold off. error() can turn this record into a TTL'd
+        // re-broadcast hold-off if the peer aborts within the window.
+        m_own_share_rejects.note_push(peer->addr(), own_subset(sent, own), mark_now);
     }
     // Mark ONLY the shares a peer actually accepted for write; anything skipped
     // for every peer (or with no peers connected) stays unmarked and is retried
@@ -1825,24 +1887,27 @@ void NodeImpl::readvertise_best_share()
     if (!m_chain->contains(head))
         return;
 
+    const auto mark_now = reject_mark_now();
     std::vector<uint256> to_send;
+    std::set<uint256> own;   // the locally minted subset of to_send
     int32_t height = m_chain->get_height(head);
     int32_t walk = std::min(height, 5);
     for (auto [hash, data] : m_chain->get_chain(head, walk)) {
-        if (m_rejected_share_hashes.count(hash))
-            continue; // never re-broadcast peer-rejected shares
+        if (m_own_share_rejects.suppressed(hash, mark_now))
+            continue; // our own share a peer aborted on, within its TTL
+        if (share_locally_minted(data.share))
+            own.insert(hash);
         to_send.push_back(hash);
     }
     if (to_send.empty())
         return;
 
-    auto now = std::chrono::steady_clock::now();
     for (auto& [nonce, peer] : m_peers) {
         auto sent = send_shares(peer, to_send);
-        // Per-peer sent set, not the pre-gate batch — see broadcast_share for
-        // why recording to_send here can brand a never-sent share as
-        // permanently peer-rejected.
-        m_last_broadcast_to[peer->addr()] = {sent, now};
+        // Own shares actually sent to THIS peer only; see broadcast_share.
+        // Other miners' head shares are re-pushed here on every best change,
+        // which is how dba0be63d came to brand them.
+        m_own_share_rejects.note_push(peer->addr(), own_subset(sent, own), mark_now);
     }
     LOG_INFO << "[readvertise] re-pushed " << to_send.size()
              << " head share(s) to " << m_peers.size() << " peer(s) (ROOT-2)";
@@ -2833,6 +2898,8 @@ void NodeImpl::run_think()
             // #1601: drop invalid-PoW scorer entries that have decayed to ~0, so
             // the misbehavior map stays bounded even under identity cycling.
             prune_pow_misbehavior();
+            // Expire own-share re-broadcast hold-offs and stale push records.
+            m_own_share_rejects.prune(reject_mark_now());
             // #1716 part B: apply the hourly canonical banscore forgiveness.
             run_forgiveness(std::chrono::steady_clock::now());
             // Keep the peer-key snapshot fresh for clean_tracker's parent_abandoned.

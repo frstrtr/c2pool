@@ -8,11 +8,11 @@
 // Adaptations (see vendor/README.md):
 //   1. Dashcore primitives replaced by dash::coin::vendor typedefs.
 //   2. CDataStream / streams.h replaced by c2pool's PackStream.
-//   3. CheckBlock call removed from FillBlock (c2pool-dash validates
-//      blocks at higher layers).
+//   3. CheckBlock / IsBlockMutated call removed from FillBlock; the caller
+//      binds the body to the header merkle root (READ_STATUS_FAILED path).
 //   4. LogPrint(BCLog::CMPCTBLOCK, ...) routed to LOG_DEBUG_COIND.
-//   5. Mempool iteration replaced by a caller-supplied snapshot
-//      (MempoolShortIdProvider).
+//   5. Mempool iteration goes through a caller-supplied walker
+//      (MempoolShortIdProvider) that holds the pool lock, like LOCK(pool->cs).
 
 #include <impl/dash/coin/vendor/blockencodings.hpp>
 #include <impl/dash/coin/dash_txid.hpp>
@@ -62,7 +62,13 @@ void CBlockHeaderAndShortTxIDs::FillShortTxIDSelector() const {
     CSHA256 hasher;
     hasher.Write(reinterpret_cast<const unsigned char*>(stream.data()), stream.size());
     uint256 shorttxidhash;
-    hasher.Finalize(shorttxidhash.begin());
+    // The BYTE digest (Finalize(unsigned char*)), as Dash Core writes it.
+    // uint256::begin() is a uint32_t*, which would pick the
+    // Finalize(uint32_t*) overload: that copies the raw SHA-256 state words
+    // without the big-endian write, so k0/k1 (and every short id) would
+    // differ from the network's. The testnet golden vector pins this
+    // (test_dash_compact_block_receive.cpp, DashCompactGolden).
+    hasher.Finalize(shorttxidhash.data());
     shorttxidk0 = shorttxidhash.GetUint64(0);
     shorttxidk1 = shorttxidhash.GetUint64(1);
 }
@@ -76,16 +82,21 @@ uint64_t CBlockHeaderAndShortTxIDs::GetShortID(const uint256& txhash) const {
 ReadStatus PartiallyDownloadedBlock::InitData(const CBlockHeaderAndShortTxIDs& cmpctblock, const std::vector<std::pair<uint256, CTransactionRef>>& extra_txn) {
     if (cmpctblock.header.IsNull() || (cmpctblock.shorttxids.empty() && cmpctblock.prefilledtxn.empty()))
         return READ_STATUS_INVALID;
-    if (cmpctblock.shorttxids.size() + cmpctblock.prefilledtxn.size() > max_block_tx_count / MIN_TRANSACTION_SIZE)
+    if (cmpctblock.shorttxids.size() + cmpctblock.prefilledtxn.size() > max_block_size / MIN_TRANSACTION_SIZE)
         return READ_STATUS_INVALID;
 
-    assert(header.IsNull() && txn_available.empty());
+    if (!header.IsNull() || !txn_available.empty()) return READ_STATUS_INVALID;
+
     header = cmpctblock.header;
     txn_available.resize(cmpctblock.BlockTxCount());
 
     int32_t lastprefilledindex = -1;
     for (size_t i = 0; i < cmpctblock.prefilledtxn.size(); i++) {
-        if (!cmpctblock.prefilledtxn[i].tx)
+        // Dash Core: prefilledtxn[i].tx->IsNull() (no inputs and no outputs).
+        // The deserializer always allocates the tx, so the pointer check is
+        // only belt-and-braces.
+        const auto& ptx = cmpctblock.prefilledtxn[i].tx;
+        if (!ptx || (ptx->vin.empty() && ptx->vout.empty()))
             return READ_STATUS_INVALID;
 
         lastprefilledindex += cmpctblock.prefilledtxn[i].index + 1; //index is a uint16_t, so can't overflow here
@@ -122,13 +133,16 @@ ReadStatus PartiallyDownloadedBlock::InitData(const CBlockHeaderAndShortTxIDs& c
 
     std::vector<bool> have_txn(txn_available.size());
     if (mempool_provider) {
-        auto snapshot = mempool_provider();
-        for (const auto& entry : snapshot) {
-            uint64_t shortid = cmpctblock.GetShortID(entry.first);
+        // Dash Core: LOCK(pool->cs) and walk pool->vTxHashes. The provider
+        // holds the pool lock for the walk and hands each tx by reference;
+        // only a tx whose short id matches is copied out.
+        mempool_provider([&](const uint256& instance_hash,
+                             const ::dash::coin::MutableTransaction& tx) {
+            uint64_t shortid = cmpctblock.GetShortID(instance_hash);
             auto idit = shorttxids.find(shortid);
             if (idit != shorttxids.end()) {
                 if (!have_txn[idit->second]) {
-                    txn_available[idit->second] = entry.second;
+                    txn_available[idit->second] = MakeTransactionRef(tx);
                     have_txn[idit->second] = true;
                     mempool_count++;
                 } else {
@@ -139,9 +153,11 @@ ReadStatus PartiallyDownloadedBlock::InitData(const CBlockHeaderAndShortTxIDs& c
                     }
                 }
             }
-            if (mempool_count == shorttxids.size())
-                break;
-        }
+            // Though ideally we'd continue scanning for the two-txn-match-shortid case,
+            // the performance win of an early exit here is too good to pass up and worth
+            // the extra risk.
+            return mempool_count != shorttxids.size();
+        });
     }
 
     for (size_t i = 0; i < extra_txn.size(); i++) {
@@ -183,13 +199,13 @@ ReadStatus PartiallyDownloadedBlock::InitData(const CBlockHeaderAndShortTxIDs& c
 }
 
 bool PartiallyDownloadedBlock::IsTxAvailable(size_t index) const {
-    assert(!header.IsNull());
+    if (header.IsNull()) return false;
     assert(index < txn_available.size());
     return txn_available[index] != nullptr;
 }
 
 ReadStatus PartiallyDownloadedBlock::FillBlock(CBlock& block, const std::vector<CTransactionRef>& vtx_missing) {
-    assert(!header.IsNull());
+    if (header.IsNull()) return READ_STATUS_INVALID;
     block = CBlock();
     static_cast<CBlockHeader&>(block) = header;
     block.m_txs.resize(txn_available.size());
