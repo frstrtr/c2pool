@@ -4,6 +4,7 @@
 #include <thread>
 
 #include "share_tx_refs.hpp"
+#include "persisted_reload.hpp"
 
 #include <core/reloaded_block_flag.hpp>   // core::restore_block_flag (a reloaded share keeps its block flag)
 #include <core/common.hpp>
@@ -414,6 +415,8 @@ std::optional<pool::PeerConnectionType> NodeImpl::handle_version(std::unique_ptr
         m_peers[peer->m_nonce] = peer;
         m_peer_count.store(m_peers.size(), std::memory_order_relaxed);
         publish_peer_info_snapshot();   // IO thread: refresh the display snapshot
+        // A new peer has been asked for none of the parents we are missing.
+        note_fetch_peer_connected(peer->addr());
 
         // Request peers from the newly established connection
         {
@@ -1258,7 +1261,7 @@ void NodeImpl::processing_shares_phase2(HandleSharesData& data, NetService addr)
     }
 }
 
-std::vector<ltc::ShareType> NodeImpl::handle_get_share(std::vector<uint256> hashes, uint64_t parents, std::vector<uint256> stops, NetService peer_addr)
+std::vector<ltc::ShareType> NodeImpl::handle_get_share(std::vector<uint256> hashes, uint64_t parents, std::vector<uint256> stops, NetService peer_addr, bool* busy)
 {
     // An empty hash list would divide by zero in the parents cap below (UB;
     // SIGFPE on x86). Answer it empty, as BTC and DASH do (dash/node.cpp
@@ -1287,6 +1290,10 @@ std::vector<ltc::ShareType> NodeImpl::handle_get_share(std::vector<uint256> hash
     std::shared_lock<std::shared_mutex> lock(m_tracker_mutex, std::try_to_lock);
     if (!lock.owns_lock())
     {
+        if (busy) {   // the caller lets the request wait (defer_sharereq)
+            *busy = true;
+            return {};
+        }
         static int defer_log = 0;
         if (defer_log++ % 50 == 0)
             LOG_INFO << "[handle_get_share] tracker busy — returning empty to "
@@ -1338,6 +1345,136 @@ std::vector<ltc::ShareType> NodeImpl::handle_get_share(std::vector<uint256> hash
 	// independent memory it destroy()s. Same borrow-vs-own rule as #1131/#1163.
 	for (auto& s : shares) s = s.clone();
 	return shares;
+}
+
+void NodeImpl::write_sharereply(const peer_ptr& peer, const uint256& id, std::vector<ltc::ShareType>& shares)
+{
+    {
+        static int dbg_rep = 0;
+        if (dbg_rep < 20)
+        {
+            ++dbg_rep;
+            LOG_WARNING << "SHAREREPLY (after wait) #" << dbg_rep << " returning " << shares.size() << " shares to "
+                        << peer->addr().to_string();
+        }
+    }
+    std::vector<chain::RawShare> rshares;
+    try
+    {
+        for (auto& share : shares)
+            rshares.emplace_back(share.version(), pack(share));
+        peer->write(ltc::message_sharereply::make_raw(id, ltc::ShareReplyResult::good, rshares));
+    }
+    catch (const std::invalid_argument& e)
+    {
+        // Serialization overflow: the packed shares exceeded the P2P message
+        // size limit (32 MB). Reply with too_long so the peer requests a
+        // smaller batch. This is the correct behavior per Python p2pool.
+        LOG_WARNING << "Share reply too large, sending too_long: " << e.what();
+        peer->write(ltc::message_sharereply::make_raw(id, ltc::ShareReplyResult::too_long, {}));
+    }
+    // #1130: free the OWNED copies handle_get_share cloned. Each variant owns
+    // independent heap from clone(), so this never touches the pointers the
+    // sharechain still owns.
+    for (auto& share : shares)
+        share.destroy();
+    shares.clear();
+}
+
+bool NodeImpl::defer_sharereq(const peer_ptr& peer, const uint256& id, std::vector<uint256> hashes,
+                              uint64_t parents, std::vector<uint256> stops)
+{
+    const NetService addr = peer->addr();
+    const auto of_peer = static_cast<std::size_t>(std::count_if(
+        m_deferred_sharereqs.begin(), m_deferred_sharereqs.end(),
+        [&](const DeferredShareReq& d) { return d.addr == addr; }));
+    if (m_context && m_deferred_sharereqs.size() < SHAREREQ_DEFERRED_MAX
+        && of_peer < SHAREREQ_DEFERRED_PER_PEER)
+    {
+        ++m_sharereq_defer_stats.deferred;
+        m_deferred_sharereqs.push_back(DeferredShareReq{
+            peer, addr, id, std::move(hashes), parents, std::move(stops),
+            std::chrono::steady_clock::now() + m_sharereq_busy_budget});
+        arm_sharereq_retry();
+        return true;
+    }
+    ++m_sharereq_defer_stats.not_deferred;
+    static int busy_log = 0;
+    if (busy_log++ % 50 == 0)
+        LOG_INFO << "[handle_get_share] tracker busy — returning empty to "
+                 << peer->addr().to_string() << " (" << m_deferred_sharereqs.size()
+                 << " requests already waiting)";
+    return false;
+}
+
+void NodeImpl::arm_sharereq_retry(std::chrono::milliseconds after)
+{
+    if (m_sharereq_retry_armed || !m_context)
+        return;
+    if (!m_sharereq_retry_timer)
+        m_sharereq_retry_timer = std::make_unique<boost::asio::steady_timer>(*m_context);
+    m_sharereq_retry_armed = true;
+    m_sharereq_retry_timer->expires_after(after);
+    m_sharereq_retry_timer->async_wait([this](const boost::system::error_code& ec) {
+        if (ec)   // cancelled: the timer (and its node) is going away
+            return;
+        m_sharereq_retry_armed = false;
+        retry_deferred_sharereqs();
+    });
+}
+
+void NodeImpl::retry_deferred_sharereqs()
+{
+    // IO thread. Every waiting request gets one more non-blocking try; one past
+    // its deadline is answered with what that try got (empty while still busy).
+    // At most SHAREREQ_SERVED_PER_PASS are answered from the tracker per pass;
+    // the rest keep their place for the next pass.
+    auto waiting = std::move(m_deferred_sharereqs);
+    m_deferred_sharereqs.clear();
+    const auto now = std::chrono::steady_clock::now();
+    std::size_t served = 0;
+    for (auto& req : waiting)
+    {
+        if (served >= SHAREREQ_SERVED_PER_PASS)
+        {
+            m_deferred_sharereqs.push_back(std::move(req));
+            continue;
+        }
+        auto peer = req.peer.lock();
+        const bool connected = peer && std::any_of(m_peers.begin(), m_peers.end(),
+            [&](const auto& kv) { return kv.second == peer; });
+        if (!connected)
+        {
+            ++m_sharereq_defer_stats.peer_gone;
+            continue;
+        }
+        bool busy = false;
+        auto shares = handle_get_share(req.hashes, req.parents, req.stops, peer->addr(), &busy);
+        if (busy && now < req.deadline)
+        {
+            m_deferred_sharereqs.push_back(std::move(req));
+            continue;
+        }
+        if (busy)
+        {
+            ++m_sharereq_defer_stats.empty_after_wait;
+            static int expired_log = 0;
+            if (expired_log++ % 50 == 0)
+                LOG_INFO << "[handle_get_share] tracker still busy after "
+                         << m_sharereq_busy_budget.count() << " ms — returning empty to "
+                         << peer->addr().to_string();
+        }
+        else
+        {
+            ++m_sharereq_defer_stats.served_after_wait;
+            ++served;
+        }
+        m_sharereq_defer_stats.last_reply_shares = shares.size();
+        write_sharereply(peer, req.id, shares);
+    }
+    if (!m_deferred_sharereqs.empty())
+        arm_sharereq_retry(served >= SHAREREQ_SERVED_PER_PASS ? SHAREREQ_CONTINUE_INTERVAL
+                                                              : SHAREREQ_RETRY_INTERVAL);
 }
 
 std::vector<uint256> NodeImpl::send_shares(peer_ptr peer, const std::vector<uint256>& share_hashes)
@@ -1952,21 +2089,22 @@ void NodeImpl::download_shares(peer_ptr advertiser, const uint256& target_hash,
     std::optional<NetService> advertiser_key;
     if (advertiser) advertiser_key = advertiser->addr();
 
-    // #25(C): pick a peer that has NOT recently failed this exact hash, preferring
-    // the advertiser. nullopt => every peer has failed it within the TTL: back off
-    // this cycle (the failures age out and a different desired parent is tried).
+    // Pick a peer that has not failed this exact hash (30 min memory), the
+    // advertiser first while it has not; once every connected peer has failed
+    // it, the one that failed it longest ago (FetchPeerRotation). The pacer, not
+    // this choice, decides WHEN a hash every peer failed is asked again.
     const double fnow = static_cast<double>(std::time(nullptr));
     std::optional<NetService> chosen_key;
     {
         std::lock_guard<std::mutex> g(m_fetch_failover_mtx);
         m_fetch_failures.prune(fnow);
         m_peer_keys_snapshot = peer_keys;  // keep fresh for clean_tracker's parent_abandoned
-        chosen_key = m_fetch_failures.choose(
-            target_hash, advertiser_key, peer_keys, fnow,
-            [](std::size_t n) -> std::size_t {
-                return static_cast<std::size_t>(core::random::random_uint256().GetLow64() % n);
-            });
     }
+    chosen_key = m_fetch_rotation.choose(
+        target_hash, advertiser_key, peer_keys, fnow,
+        [](std::size_t n) -> std::size_t {
+            return static_cast<std::size_t>(core::random::random_uint256().GetLow64() % n);
+        });
     if (!chosen_key.has_value()) {
         m_downloading_shares.erase(target_hash);
         return;
@@ -2052,31 +2190,71 @@ void NodeImpl::download_shares(peer_ptr advertiser, const uint256& target_hash,
 
     request_shares(req_id, peer, hashes, parents, stops,
         [this, weak_peer, target_hash, peer_addr_for_log, req_id, chosen_key_val,
-         walk_depth](ltc::ShareReplyData reply)
+         advertiser_key, walk_depth](ltc::ShareReplyData reply)
         {
             m_downloading_shares.erase(target_hash);
             m_pending_share_reqs.erase(req_id);
 
             if (reply.empty())
             {
-                // Empty reply = timeout or this peer had no matching shares.
-                // #25(C): remember the (hash, peer) failure so we fail over to a
-                // DIFFERENT peer next cycle, and only abandon the head once the
-                // whole peer set has failed it (see FetchFailureMemory::abandoned).
+                // Empty reply = timeout, disconnect, or this peer had no
+                // matching shares. #25(C): remember the (hash, peer) failure; the
+                // head is abandoned only once the whole peer set has failed it
+                // within 90 s (FetchFailureMemory::abandoned, unchanged).
+                const double now = static_cast<double>(std::time(nullptr));
                 {
                     std::lock_guard<std::mutex> g(m_fetch_failover_mtx);
-                    m_fetch_failures.record(target_hash, chosen_key_val,
-                                            static_cast<double>(std::time(nullptr)));
+                    m_fetch_failures.record(target_hash, chosen_key_val, now);
                 }
-                // Futility backoff (io thread): damp THIS hash for a growing
-                // interval so a desired set nobody can serve stops being
-                // re-requested at full rate every think() cycle.
-                m_desired_pacer.record_empty(
-                    target_hash, static_cast<double>(std::time(nullptr)));
+                std::vector<NetService> connected;
+                connected.reserve(m_peers.size());
+                for (const auto& [nonce, p] : m_peers)
+                    if (p) connected.push_back(p->addr());
+                if (m_fetch_rotation.record_failure(target_hash, chosen_key_val, connected, now))
+                {
+                    // Already being fetched by another request, or already
+                    // held (it arrived another way): nothing to ask for.
+                    if (m_downloading_shares.count(target_hash))
+                        return;
+                    {
+                        std::shared_lock<std::shared_mutex> lock(m_tracker_mutex, std::try_to_lock);
+                        if (lock.owns_lock() && m_chain && m_chain->contains(target_hash))
+                        {
+                            m_fetch_rotation.clear_hash(target_hash);
+                            m_desired_pacer.record_success(target_hash);
+                            return;
+                        }
+                    }
+                    // A connected peer has not been asked for it yet: ask it
+                    // now, no backoff. The peer that holds the share is often
+                    // not the one that advertised it.
+                    LOG_INFO << "[Pool] Share request empty for "
+                             << target_hash.ToString().substr(0,16)
+                             << " from " << peer_addr_for_log.to_string()
+                             << " (asking an untried peer next)";
+                    if (m_pending_desired.size() < DESIRED_QUEUE_MAX)
+                    {
+                        m_pending_desired.push_front(DesiredRequest{
+                            advertiser_key.value_or(NetService{}), target_hash, walk_depth});
+                        // Not from inside this callback: it also runs from
+                        // error()/close_connection() cancelling a dropped
+                        // peer's requests.
+                        if (m_context)
+                            schedule_desired_drain();
+                        else
+                            drain_pending_desired();
+                    }
+                    return;
+                }
+                // Every connected peer has failed it. Futility backoff (io
+                // thread): damp THIS hash for a growing interval so a desired
+                // set nobody can serve stops being re-requested at full rate
+                // every think() cycle.
+                m_desired_pacer.record_empty(target_hash, now);
                 LOG_INFO << "[Pool] Share request empty for "
                          << target_hash.ToString().substr(0,16)
                          << " from " << peer_addr_for_log.to_string()
-                         << " (failing over to another peer)";
+                         << " (every connected peer has failed it; backing off)";
                 return;
             }
 
@@ -2085,6 +2263,7 @@ void NodeImpl::download_shares(peer_ptr advertiser, const uint256& target_hash,
                 std::lock_guard<std::mutex> g(m_fetch_failover_mtx);
                 m_fetch_failures.clear_hash(target_hash);
             }
+            m_fetch_rotation.clear_hash(target_hash);
             m_desired_pacer.record_success(target_hash);
 
             auto& owned = *reply.m_owned;
@@ -2183,8 +2362,9 @@ void NodeImpl::drain_pending_desired()
     while (!m_pending_desired.empty() && processed < DESIRED_REQUEST_BUDGET) {
         auto entry = m_pending_desired.front();
         m_pending_desired.pop_front();
-        // Futility backoff. A hash whose last reply was empty is skipped until
-        // its backoff expires; unknown and healthy hashes are always eligible.
+        // Futility backoff. A hash every connected peer has answered empty is
+        // skipped until its backoff expires; unknown and healthy hashes, and
+        // hashes some connected peer has not failed yet, are always eligible.
         // A skip does NOT consume budget -- it is a map lookup, and the point of
         // the pass is to reach the hashes that can still be served.
         if (!m_desired_pacer.eligible(entry.hash, now))
@@ -2225,36 +2405,44 @@ void NodeImpl::load_persisted_shares()
     if (!m_storage || !m_storage->is_available())
         return;
 
-    // load_sharechain iterates the height index and loads each share.
-    // Limit to keep_per_head shares to avoid loading unbounded history
-    // into memory (LevelDB is never pruned, so it accumulates forever).
-    LOG_INFO << "[Pool] Scanning LevelDB height index for persisted shares...";
+    // Every stored share's own index record (absheight, verified), not the
+    // height index: that one lost a height's main-chain share whenever a fork
+    // share of the height was pruned, and a graceful stop skips its rebuild,
+    // so a restart reloaded a fraction of the window in fragments and could
+    // not reconnect its tip (persisted_reload.hpp). Reload every share in the
+    // 2*CHAIN_LENGTH+10 absheights ending at the highest verified share, and
+    // everything above it, in absheight order (parents before children).
+    LOG_INFO << "[Pool] Scanning LevelDB share index for persisted shares...";
     auto t0 = std::chrono::steady_clock::now();
-    auto all_hashes = m_storage->get_shares_by_height_range(0, UINT64_MAX);
+    std::vector<core::SharechainLevelDBStore::IndexEntry> entries;
+    if (!m_storage->scan_share_index(entries))
+    {
+        LOG_ERROR << "[Pool] LevelDB share index scan failed — starting without persisted shares";
+        return;
+    }
     auto scan_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - t0).count();
-    {
-        std::set<uint256> unique(all_hashes.begin(), all_hashes.end());
-        LOG_INFO << "[Pool] Height index scan: " << all_hashes.size() << " entries ("
-                 << unique.size() << " unique) in " << scan_ms << "ms";
-    }
-    if (all_hashes.empty())
+    if (entries.empty())
     {
         LOG_INFO << "No persisted shares found in LevelDB";
         return;
     }
 
-    const size_t keep_per_head = m_tracker.m_params->chain_length * 2 + 10;
-    const size_t total_in_db = all_hashes.size();
-
-    // Only load the most recent shares (highest height = end of vector)
-    size_t skip = 0;
-    if (total_in_db > keep_per_head)
-    {
-        skip = total_in_db - keep_per_head;
-        LOG_INFO << "[Pool] LevelDB has " << total_in_db << " shares, loading only newest "
-                 << keep_per_head << " (skipping " << skip << " old shares)";
-    }
+    const uint64_t keep_per_head = m_tracker.m_params->chain_length * 2 + 10;
+    const size_t total_in_db = entries.size();
+    const ltc::ReloadWindow window = ltc::reload_window(entries, keep_per_head);
+    const size_t first = static_cast<size_t>(
+        std::lower_bound(entries.begin(), entries.end(), window.low,
+                         [](const core::SharechainLevelDBStore::IndexEntry& e, uint64_t h) {
+                             return e.height < h;
+                         })
+        - entries.begin());
+    const size_t skip = first;   // entries below the window
+    LOG_INFO << "[Pool] Share index scan: " << total_in_db << " shares, absheight "
+             << entries.front().height << ".." << entries.back().height << " in " << scan_ms
+             << "ms; reloading absheight >= " << window.low << " (anchor " << window.anchor
+             << (window.anchored_on_verified ? ", highest verified" : ", highest stored; none verified")
+             << ", window " << keep_per_head << "), " << skip << " older";
 
     const size_t to_load = total_in_db - skip;
     LOG_INFO << "[Pool] Loading shares from LevelDB: " << to_load << " shares to process...";
@@ -2262,7 +2450,7 @@ void NodeImpl::load_persisted_shares()
     std::vector<uint256> verified_hashes; // shares to pre-populate into verified
     for (size_t i = skip; i < total_in_db; ++i)
     {
-        const auto& hash = all_hashes[i];
+        const auto& hash = entries[i].hash;
         std::vector<uint8_t> data;
         core::ShareMetadata meta;
         if (!m_storage->load_share(hash, data, meta)) {
@@ -2373,20 +2561,39 @@ void NodeImpl::load_persisted_shares()
         LOG_INFO << "[Pool] Pre-populated " << pre_verified << " verified shares from LevelDB";
 
     LOG_INFO << "[Pool] Loaded " << loaded << " shares from LevelDB storage"
-             << " (DB total: " << total_in_db << ", limit: " << keep_per_head
+             << " (DB total: " << total_in_db << ", window: " << keep_per_head
+             << " absheights from " << window.low
              << ", skipped: load=" << skipped_load << " small=" << skipped_small
-             << " dup=" << skipped_contains << ")";
+             << " dup=" << skipped_contains << ") in "
+             << std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - t0).count()
+             << "ms";
 
-    // Prune old shares from LevelDB that we skipped
-    if (skip > 0)
+    // Prune the shares below the window (they are never reloaded, so nothing
+    // else would ever remove them) — only below a VERIFIED anchor: an
+    // unverified absheight is a peer's claim and never decides a deletion.
+    if (skip > 0 && window.prune_below)
     {
+        constexpr size_t PRUNE_CHUNK = 2000;   // one WriteBatch per chunk
         size_t pruned = 0;
+        std::vector<uint256> chunk;
+        chunk.reserve(PRUNE_CHUNK);
         for (size_t i = 0; i < skip; ++i)
         {
-            if (m_storage->remove_share(all_hashes[i]))
-                ++pruned;
+            chunk.push_back(entries[i].hash);
+            if (chunk.size() == PRUNE_CHUNK || i + 1 == skip)
+            {
+                if (m_storage->remove_shares_batch(chunk))
+                    pruned += chunk.size();
+                chunk.clear();
+            }
         }
         LOG_INFO << "[Pool] Pruned " << pruned << " old shares from LevelDB";
+    }
+    else if (skip > 0)
+    {
+        LOG_INFO << "[Pool] Kept " << skip << " shares below the reload window in LevelDB:"
+                 << " no verified share anchors the window";
     }
 }
 
@@ -2895,6 +3102,7 @@ void NodeImpl::run_think()
                 std::lock_guard<std::mutex> g(m_fetch_failover_mtx);
                 m_fetch_failures.prune(static_cast<double>(std::time(nullptr)));
             }
+            m_fetch_rotation.prune(static_cast<double>(std::time(nullptr)));
             // #1601: drop invalid-PoW scorer entries that have decayed to ~0, so
             // the misbehavior map stays bounded even under identity cycling.
             prune_pow_misbehavior();

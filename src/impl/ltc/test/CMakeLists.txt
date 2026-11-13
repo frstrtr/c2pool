@@ -35,6 +35,19 @@ if (BUILD_TESTING AND GTest_FOUND)
     # NodeImpl + real loopback peer. Same folding rule: into the existing
     # allowlisted target.
     #
+    # restart_reload_window_test.cpp: the 2026-11-13 restart stall — a restart
+    # reloads the whole persisted window (the store's height index keeps every
+    # share of a height; the loader reads the share records). REAL store and
+    # NodeImpl. Same folding rule: into the existing allowlisted target.
+    #
+    # parent_fetch_rotation_test.cpp: same incident — a parent is asked of every
+    # connected peer, at once, before the pacer backs it off. REAL NodeImpl +
+    # loopback peers, and the pure FetchPeerRotation. Same folding rule.
+    #
+    # sharereq_busy_wait_test.cpp: same incident — a SHAREREQ waits briefly for
+    # a busy tracker instead of being answered empty. REAL NodeImpl + loopback
+    # peer. Same folding rule.
+    #
     # pool_rate_head_select_test.cpp: the coin-generic dashboard pool-rate
     # HEAD-SELECTION + get_average_stale_prop SSOT (sharechain/
     # pool_rate_head_select.hpp, issue #1482) — verified best when live, else the
@@ -458,10 +471,12 @@ if (BUILD_TESTING AND GTest_FOUND)
         mweb_state_hash_binding_test.cpp
         mweb_tx_wire_test.cpp
         own_share_reject_marks_test.cpp
+        parent_fetch_rotation_test.cpp
         peer_block_pow_carry_test.cpp
         per_peer_ingest_test.cpp
         pool_rate_head_select_test.cpp
         redistribute_script_type_test.cpp
+        restart_reload_window_test.cpp
         restart_reorg_supersede_test.cpp
         self_connection_ban_test.cpp
         serve_marked_shares_test.cpp
@@ -472,6 +487,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         share_test.cpp
         share_v3601_flag_day_test.cpp
         share_v3601_rewrap_test.cpp
+        sharereq_busy_wait_test.cpp
         solo_payouts_test.cpp
         template_gap_gate_test.cpp
         template_hogex_survives_truncation_test.cpp

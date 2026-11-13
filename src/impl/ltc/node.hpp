@@ -810,7 +810,59 @@ public:
         catch (const std::invalid_argument&) { /* request already timed out */ }
     }
 
-    std::vector<ltc::ShareType> handle_get_share(std::vector<uint256> hashes, uint64_t parents, std::vector<uint256> stops, NetService peer_addr);
+    /// The shares a SHAREREQ asks for (owned clones; the caller destroy()s
+    /// them). Never blocks: when think() holds the tracker lock the answer is
+    /// empty, and `*busy` (when given) is set so the caller can try again.
+    std::vector<ltc::ShareType> handle_get_share(std::vector<uint256> hashes, uint64_t parents, std::vector<uint256> stops, NetService peer_addr, bool* busy = nullptr);
+
+    /// A SHAREREQ that found the tracker busy (handle_get_share `*busy`): it
+    /// waits, retried every SHAREREQ_RETRY_INTERVAL on a timer — the io thread
+    /// never blocks — for up to m_sharereq_busy_budget, and only then is
+    /// answered empty, as every busy request was before. False when it cannot
+    /// wait (no io_context, or SHAREREQ_DEFERRED_MAX already waiting): the
+    /// caller answers now. A node whose think() holds the lock most of each
+    /// minute otherwise answers nearly every request empty, and the peers that
+    /// need its shares never get them.
+    bool defer_sharereq(const peer_ptr& peer, const uint256& id, std::vector<uint256> hashes,
+                        uint64_t parents, std::vector<uint256> stops);
+    /// The sharereply for `id` to a waited request (good, or too_long when it
+    /// would not fit); destroy()s `shares`.
+    void write_sharereply(const peer_ptr& peer, const uint256& id, std::vector<ltc::ShareType>& shares);
+
+    struct DeferredShareReq {
+        std::weak_ptr<peer_t> peer;
+        NetService addr;
+        uint256 id;
+        std::vector<uint256> hashes;
+        uint64_t parents{0};
+        std::vector<uint256> stops;
+        std::chrono::steady_clock::time_point deadline;
+    };
+    static constexpr std::chrono::milliseconds SHAREREQ_RETRY_INTERVAL{100};
+    // At most this many requests wait at once, and this many per peer; past
+    // either a busy request is answered empty at once, as before (a flood
+    // holds no unbounded state, and one peer cannot take the whole list).
+    static constexpr std::size_t SHAREREQ_DEFERRED_MAX = 256;
+    static constexpr std::size_t SHAREREQ_DEFERRED_PER_PEER = 8;
+    // One timer pass answers at most this many waiting requests from the
+    // tracker (each can pack up to 1000 shares); the rest go in the next pass,
+    // SHAREREQ_CONTINUE_INTERVAL later, so the io thread is never held long.
+    static constexpr std::size_t SHAREREQ_SERVED_PER_PASS = 16;
+    static constexpr std::chrono::milliseconds SHAREREQ_CONTINUE_INTERVAL{10};
+    std::chrono::milliseconds m_sharereq_busy_budget{2000};
+    std::deque<DeferredShareReq> m_deferred_sharereqs;   // IO thread only
+    std::unique_ptr<boost::asio::steady_timer> m_sharereq_retry_timer;
+    bool m_sharereq_retry_armed{false};
+    struct SharereqDeferStats {
+        uint64_t deferred{0};          // requests that found the tracker busy and waited
+        uint64_t served_after_wait{0}; // ... and were answered from the tracker
+        uint64_t empty_after_wait{0};  // ... and were still busy at the deadline: empty
+        uint64_t peer_gone{0};         // ... whose peer disconnected meanwhile
+        uint64_t not_deferred{0};      // busy with the wait list (or the peer's share) full: empty at once
+        size_t last_reply_shares{0};   // shares in the last reply sent after a wait
+    } m_sharereq_defer_stats;          // IO thread only
+    void arm_sharereq_retry(std::chrono::milliseconds after = SHAREREQ_RETRY_INTERVAL);
+    void retry_deferred_sharereqs();
 
     /// Broadcast a new best-block notification to all connected P2P peers.
     void broadcast_bestblock(const coin::BlockHeaderType& header) {
@@ -1291,6 +1343,28 @@ protected:
     std::mutex m_fetch_failover_mtx;
     ltc::FetchFailureMemory<uint256, NetService> m_fetch_failures;  // guarded by m_fetch_failover_mtx
     std::vector<NetService> m_peer_keys_snapshot;                   // guarded by m_fetch_failover_mtx
+
+    // Which peer download_shares asks next for a parent: untried peers first
+    // (30 min memory), the next untried one at once after an empty reply, the
+    // pacer only once every connected peer has failed the hash. The 90 s
+    // m_fetch_failures above stays the abandoned() input. See
+    // share_fetch_failover.hpp FetchPeerRotation. IO-THREAD CONFINED.
+    ltc::FetchPeerRotation<uint256, NetService> m_fetch_rotation;
+
+    // Whether a handshake may wake the backed-off parents (a host not seen
+    // within 10 min, at most once per 30 s). IO-THREAD CONFINED.
+    ltc::PeerWakeGate<std::string> m_peer_wake_gate;
+
+    // A peer finished its handshake: it is untried for every parent, and —
+    // when it is a new source (m_peer_wake_gate) — every backed-off parent may
+    // be asked again now (it gets asked first). IO thread.
+    void note_fetch_peer_connected(const NetService& addr)
+    {
+        const double now = static_cast<double>(std::time(nullptr));
+        m_fetch_rotation.forget_peer(addr);
+        if (m_peer_wake_gate.admit(addr.address(), now))
+            m_desired_pacer.make_all_eligible(now);
+    }
 
     // Refresh the peer-key snapshot from the live IO-owned m_peers map. MUST be
     // called on the IO thread. Takes m_fetch_failover_mtx.

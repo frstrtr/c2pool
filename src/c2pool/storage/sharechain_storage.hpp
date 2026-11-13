@@ -198,6 +198,11 @@ public:
      * @return Vector of share hashes
      */
     std::vector<uint256> get_shares_by_height_range(uint64_t start_height, uint64_t end_height);
+
+    /// Every stored share as its own index record names it (hash, absheight,
+    /// verified), sorted by (absheight, hash) — read from the index records,
+    /// not the height index. See core::SharechainLevelDBStore::scan_share_index.
+    bool scan_share_index(std::vector<core::SharechainLevelDBStore::IndexEntry>& out);
     
     /**
      * @brief Schedule periodic maintenance tasks

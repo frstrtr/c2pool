@@ -163,6 +163,10 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
     # leveldb_store_lock_test.cpp: LevelDBStore::open on a DB whose LOCK is
     # held (another process, another handle) fails and leaves LOCK alone; an
     # unheld LOCK file opens. Same fold-into-core_test reasoning as every TU here.
+    # sharechain_height_index_test.cpp: the sharechain store keeps every share of
+    # an absheight (`height:` one hash as before, the others under `hsib:`),
+    # removing one share never drops another's, and the index is rebuilt when an
+    # earlier binary may have written it since (dirty != 2). Same reasoning.
     # template_refresh_on_tx_test.cpp: the transaction-triggered template
     # refresh (#2137 S1): core::TxRefreshPacer (coalesce within 1 s of the
     # last rebuild, rebuild at once after a quiet interval, skip what another
@@ -240,6 +244,7 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
         random_choice_guard_test.cpp
         random_uniform_test.cpp
         reloaded_block_flag_test.cpp
+        sharechain_height_index_test.cpp
         socket_write_queue_test.cpp
         socket_read_empty_prefix_test.cpp
         template_refresh_on_tx_test.cpp
