@@ -102,12 +102,15 @@
 #include <impl/dash/coin/proactive_rotation_policy.hpp>  // PR-3: LOW-RATE proactive rotation decision helpers (pure, shared with the KAT)
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <deque>
 #include <exception>
 #include <map>
 #include <memory>
+#include <new>
 #include <optional>
 #include <set>
 #include <string>
@@ -885,6 +888,27 @@ private:
     uint64_t m_cmpct_unsolicited{0};       // cmpctblock we did not ask for: dropped
     uint64_t m_cmpct_gate_dropped{0};      // answered, but refused by the gate
     uint64_t m_bodies_unbound{0};          // bodies refused: merkle root mismatch
+    // N1: tracked bodies latched SELF-BIND-FAULT (>= SELF_BIND_FAULT_PEERS
+    // distinct asked peers answered with a body that does not bind).
+    uint64_t m_self_bind_faults{0};
+    // N1 (F3): `block` messages our codec could not decode (counted as answers).
+    uint64_t m_bodies_undecodable{0};
+    // N1: peers that answered with a non-binding body, proven wrong once a
+    // body for the same header bound (dashcore BLOCK_MUTATED, Misbehaving 100).
+    uint64_t m_unbound_blamed{0};
+    // N1: distinct asked peers whose non-binding answer latches SELF-BIND-FAULT,
+    // and the most answerers remembered per tracked body.
+    static constexpr size_t SELF_BIND_FAULT_PEERS = 2;
+    // Above POOL_PEERS_HARD_CAP, so a whole pool plus some churn fits; keys no
+    // longer in the pool are pruned first. Should it still overflow, the slot
+    // stops immediate re-asks and only backs off (answers_overflow), so an
+    // unrecorded answerer can never look "fresh" for ever (verify R1).
+    static constexpr size_t UNBOUND_FROM_CAP = 32;
+    // The pool never holds more than POOL_PEERS_HARD_CAP peers, and a prune
+    // keeps only held keys, so answers_overflow is unreachable while this
+    // holds (verify round 3, V1: its fallback re-asks one peer).
+    static_assert(UNBOUND_FROM_CAP > POOL_PEERS_HARD_CAP,
+                  "every pool member must fit in a slot's answerer list");
     uint64_t m_misbehavior_disconnects{0};
     uint64_t m_misbehavior_spared{0};      // would disconnect, but protected / last peer
     // WARNING lines on the compact path are rate-limited: at most
@@ -1173,6 +1197,25 @@ private:
         // deliverer, instead of waiting BODY_REREQUEST_MAX round-robin rotations
         // like an ordinary buffered-ahead slot.
         bool        hol{false};
+        // N1: distinct peers that answered OUR ask for this body with one that
+        // does not bind to its header merkle root. An answer is not a stall:
+        // the fault may be ours (a txid or codec we do not compute like Dash
+        // Core), so nobody is blamed until a body for this header binds.
+        std::vector<std::string> unbound_from;
+        // N1: the carrier answered with a non-binding body and nobody was
+        // re-asked yet: the next watchdog pass is not a stall.
+        bool        carrier_answered{false};
+        // N1 (R1): an answerer could not be recorded (unbound_from full even
+        // after pruning departed peers). From then on: no immediate re-ask,
+        // and every watchdog re-ask doubles the window.
+        bool        answers_overflow{false};
+        // N1: SELF-BIND-FAULT latched for this body (SELF_BIND_FAULT_PEERS
+        // distinct asked peers, or the whole smaller pool, answered with
+        // bodies that do not bind or decode): a loud alert, and no deferred
+        // blame when a body later binds. Answerers are never evicted for this
+        // body latched or not; re-asks back off once every peer has answered.
+        // Cleared with the slot when a body binds.
+        bool        self_bind_fault{false};
     };
     std::vector<PendingBody> m_pending_bodies;
     uint64_t m_body_rerequests_total{0};
@@ -1857,6 +1900,10 @@ public:
              + " unsolicited=" + std::to_string(m_cmpct_unsolicited)
              + " gate_dropped=" + std::to_string(m_cmpct_gate_dropped)
              + " unbound_bodies=" + std::to_string(m_bodies_unbound)
+             + " undecodable_bodies=" + std::to_string(m_bodies_undecodable)
+             + " self_bind_faults=" + std::to_string(m_self_bind_faults)
+             + " self_bind_active=" + std::to_string(self_bind_faults_active())
+             + " unbound_blamed=" + std::to_string(m_unbound_blamed)
              + " misbehavior_disconnects=" + std::to_string(m_misbehavior_disconnects)
              + " misbehavior_spared=" + std::to_string(m_misbehavior_spared)
              + " parked=" + std::to_string(m_cmpct_rx.parked_count());
@@ -1869,6 +1916,22 @@ public:
     uint64_t cmpct_unsolicited() const     { return m_cmpct_unsolicited; }
     uint64_t cmpct_gate_dropped() const    { return m_cmpct_gate_dropped; }
     uint64_t bodies_unbound() const        { return m_bodies_unbound; }
+    uint64_t self_bind_faults() const      { return m_self_bind_faults; }
+    uint64_t bodies_undecodable() const    { return m_bodies_undecodable; }
+    uint64_t unbound_blamed() const        { return m_unbound_blamed; }
+    /// Tracked bodies currently latched SELF-BIND-FAULT.
+    size_t self_bind_faults_active() const
+    {
+        size_t n = 0;
+        for (const auto& pb : m_pending_bodies) if (pb.self_bind_fault) ++n;
+        return n;
+    }
+    bool self_bind_fault_for_test(const uint256& h) const
+    {
+        for (const auto& pb : m_pending_bodies)
+            if (pb.hash == h) return pb.self_bind_fault;
+        return false;
+    }
     uint64_t misbehavior_disconnects() const { return m_misbehavior_disconnects; }
     uint64_t misbehavior_spared() const    { return m_misbehavior_spared; }
     /// TEST-ONLY: observe every message written to any peer (key, message).
@@ -2333,7 +2396,7 @@ public:
                 return sent;
             }
         if (m_pending_bodies.size() >= effective_pending_cap())
-            m_pending_bodies.erase(m_pending_bodies.begin());   // oldest slot
+            drop_oldest_pending_body();
         PendingBody pb;
         pb.hash      = block_hash;
         pb.first_req = now;
@@ -3223,6 +3286,17 @@ public:
         // below has to be able to name what threw.
         const std::string cmd = rmsg ? rmsg->m_command : std::string("<null>");
 
+        // N1 (F3): a `block` our codec cannot decode is still that peer's
+        // ANSWER (the codec may be what is wrong). Its 80-byte header names the
+        // block; keep it before parse() consumes the payload.
+        std::array<unsigned char, 80> block_hdr{};
+        bool have_block_hdr = false;
+        if (cmd == "block" && rmsg && rmsg->m_data.size() >= block_hdr.size())
+        {
+            std::memcpy(block_hdr.data(), rmsg->m_data.data(), block_hdr.size());
+            have_block_hdr = true;
+        }
+
         p2p::Handler::result_t result;
         try
         {
@@ -3231,6 +3305,7 @@ public:
         {
             LOG_ERROR << "[" << m_chain_label << "] handle(" << cmd
                       << ") from " << peer->key << ": " << ec.what();
+            if (have_block_hdr) note_undecodable_block(peer, block_hdr);
             return;
         } catch (const std::out_of_range&)
         {
@@ -3270,6 +3345,9 @@ public:
             // why NOTHING may escape this function.
             LOG_ERROR << "[" << m_chain_label << "] parse('" << cmd
                       << "') threw: " << ec.what() << " — message dropped";
+            // R2: an allocation failure is ours, not a property of the bytes.
+            if (have_block_hdr && !dynamic_cast<const std::bad_alloc*>(&ec))
+                note_undecodable_block(peer, block_hdr);
             return;
         }
 
@@ -3630,6 +3708,172 @@ private:
         return true;
     }
 
+    /// Did we ask `key` for the body of `h`? Leaves the ask in place.
+    bool has_body_ask(const uint256& h, const std::string& key) const
+    {
+        auto it = m_body_asks.find(h);
+        return it != m_body_asks.end()
+            && std::find(it->second.begin(), it->second.end(), key) != it->second.end();
+    }
+
+    static bool answered_unbound(const PendingBody& pb, const std::string& key)
+    {
+        return std::find(pb.unbound_from.begin(), pb.unbound_from.end(), key)
+               != pb.unbound_from.end();
+    }
+
+    /// N1: a peer to ask for `pb`'s body that has NOT already answered it with
+    /// a non-binding body, and is not `avoid`. A tip slot prefers the
+    /// announcer; a head-of-line slot only takes bulk-eligible peers. Either
+    /// then prefers the best demonstrated deliverer. nullptr when every usable
+    /// peer has answered: only then do the re-asks fall back to answered peers
+    /// and back off.
+    PeerSession* fresh_body_peer(const PendingBody& pb, const std::string& avoid)
+    {
+        auto usable = [&](PeerSession* q) {
+            return q && q->handshake.complete() && q->disconnect_reason.empty()
+                   && q->key != avoid && !answered_unbound(pb, q->key)
+                   && (!pb.hol || bulk_eligible(q));
+        };
+        if (!pb.hol)
+            if (PeerSession* a = announced_source(pb.hash); usable(a)) return a;
+        PeerSession* best = nullptr;
+        uint64_t best_n = 0;
+        for (auto& up : m_pool)
+        {
+            PeerSession* q = up.get();
+            if (!usable(q)) continue;
+            auto it = m_peer_bodies_delivered.find(q->key);
+            const uint64_t n = it == m_peer_bodies_delivered.end() ? 0 : it->second;
+            if (!best || n > best_n) { best = q; best_n = n; }
+        }
+        return best;
+    }
+
+    /// N1 (F3): a `block` from `p` that our codec could not decode. Its header
+    /// (the first 80 bytes, kept before parse) names the block; to the
+    /// watchdog this is an answer like a body that does not bind, not a stall.
+    void note_undecodable_block(PeerSession* p, const std::array<unsigned char, 80>& hdr)
+    {
+        const uint256 h = dash::crypto::hash_x11(
+            std::span<const unsigned char>(hdr.data(), hdr.size()));
+        ++m_bodies_undecodable;
+        note_unbound_answer(p, h);
+    }
+
+    /// N1: the full body for `h` that `p` sent does not bind to its header, or
+    /// could not be decoded at all (note_undecodable_block).
+    ///
+    /// dashcore punishes that (BLOCK_MUTATED, Misbehaving 100), because its
+    /// own txids are right by definition. Ours may not be: a tx type or
+    /// version we hash or decode unlike Dash Core makes EVERY honest peer's
+    /// body fail, and blaming the carrier as a staller would evict the honest
+    /// pool one peer at a time. So a non-binding answer to OUR ask is an
+    /// answer, not a stall:
+    ///  - the peer is remembered on the slot, never counted as a staller and
+    ///    never re-asked while a peer that has not answered remains
+    ///    (fresh_body_peer); a peer that stays SILENT is still a staller;
+    ///  - each such answer re-asks a fresh peer at once;
+    ///  - SELF_BIND_FAULT_PEERS distinct answerers (or every handshaked peer,
+    ///    in a smaller pool) latch SELF-BIND-FAULT: a loud alert. The body
+    ///    never reaches the ingest legs, so the embedded arm stays fail-closed
+    ///    on it; once every peer has answered, re-asks back off to
+    ///    BODY_STALL_TIMEOUT_MAX;
+    ///  - when a body for `h` does bind, the others were not the block, and
+    ///    blame_unbound_answerers() applies dashcore's penalty, unless the
+    ///    slot latched (then our own codec was in doubt: no penalty).
+    /// A body nobody asked `p` for is only dropped, as before.
+    void note_unbound_answer(PeerSession* p, const uint256& h)
+    {
+        if (!p || !has_body_ask(h, p->key)) return;
+        PendingBody* pb = nullptr;
+        for (auto& s : m_pending_bodies)
+            if (s.hash == h) { pb = &s; break; }
+        if (!pb) return;
+        if (!answered_unbound(*pb, p->key))
+        {
+            if (pb->unbound_from.size() >= UNBOUND_FROM_CAP)
+                pb->unbound_from.erase(
+                    std::remove_if(pb->unbound_from.begin(), pb->unbound_from.end(),
+                                   [this](const std::string& k) { return !holds_key(k); }),
+                    pb->unbound_from.end());
+            if (pb->unbound_from.size() < UNBOUND_FROM_CAP)
+                pb->unbound_from.push_back(p->key);
+            else
+                pb->answers_overflow = true;
+        }
+        const bool was_carrier = pb->last_peer == p->key;
+        // It answered: the stall window that follows has nobody to blame.
+        if (was_carrier) { pb->last_peer.clear(); pb->carrier_answered = true; }
+
+        const size_t latch_at = std::max<size_t>(
+            1, std::min<size_t>(SELF_BIND_FAULT_PEERS, handshaked_peer_count()));
+        if (!pb->self_bind_fault && pb->unbound_from.size() >= latch_at)
+        {
+            pb->self_bind_fault = true;
+            ++m_self_bind_faults;
+            std::string from;
+            for (const auto& k : pb->unbound_from) from += (from.empty() ? "" : ",") + k;
+            LOG_ERROR << "[" << m_chain_label << "] SELF-BIND-FAULT body "
+                      << h.GetHex() << ": " << pb->unbound_from.size()
+                      << " distinct peers answered with a body that does not bind to"
+                         " its header merkle root or does not decode (" << from
+                      << "). Suspect our own txid/codec (or forging peers). No"
+                         " answering peer is evicted for this body; the block is not"
+                         " ingested (embedded arm fail-closed on it) until a body binds.";
+        }
+        if (!was_carrier) return;
+        if (pb->answers_overflow) { pb->last_req = now_sec(); return; }   // R1: back off only
+
+        // Ask a peer that has not answered yet for the full body now, instead
+        // of waiting out a stall window. None left: the watchdog re-asks an
+        // answered peer when due, with a doubling window, blaming nobody.
+        PeerSession* target = fresh_body_peer(*pb, p->key);
+        if (!target) { pb->last_req = now_sec(); return; }
+        send_block_getdata(target, h, /*cmpct=*/false);
+        ++pb->rerequests;
+        ++m_body_rerequests_total;
+        pb->last_req = now_sec();
+        pb->last_peer = target->key;
+        pb->carrier_answered = false;
+        // A tip slot gives the fresh peer the full fast window. A head-of-line
+        // slot keeps its adaptive window (F6): resetting it on every answer
+        // would keep a SILENT carrier below the disconnect mark for ever.
+        if (!pb->hol) pb->stall_timeout = BODY_STALL_TIMEOUT_INIT;
+        LOG_INFO << "[" << m_chain_label << "] cause=body-unbound-reask attempt="
+                 << pb->rerequests << " peer=" << target->key << " hash="
+                 << h.GetHex().substr(0, 16) << "... after a non-binding answer from "
+                 << p->key;
+    }
+
+    /// N1: a body for `pb.hash` bound, delivered by `deliverer`. Every OTHER
+    /// peer that answered with a non-binding body sent something that is not
+    /// this block, so dashcore's BLOCK_MUTATED penalty now applies to it.
+    void blame_unbound_answerers(const PendingBody& pb, const std::string& deliverer)
+    {
+        // F4: a latched slot means our own txid/codec was in doubt. A body that
+        // binds under that same codec does not prove the others forged, so a
+        // latched slot clears without any penalty.
+        if (pb.self_bind_fault)
+        {
+            LOG_WARNING << "[" << m_chain_label << "] SELF-BIND-FAULT cleared: body "
+                        << pb.hash.GetHex().substr(0, 16) << "... bound from "
+                        << deliverer << " after " << pb.unbound_from.size()
+                        << " non-binding answers; no penalty (the slot latched)";
+            return;
+        }
+        for (const auto& k : pb.unbound_from)
+        {
+            if (k == deliverer) continue;
+            PeerSession* q = find_peer(k);
+            if (!q) continue;
+            ++m_unbound_blamed;
+            misbehaving(q, 100, "block body " + pb.hash.GetHex().substr(0, 16)
+                                + "... did not bind to its header; " + deliverer
+                                + "'s did");
+        }
+    }
+
     bool have_body(const uint256& h) const { return m_recent_bodies.count(h) != 0; }
 
     void note_body_delivered(const uint256& h)
@@ -3658,12 +3902,25 @@ private:
         for (auto& pb : m_pending_bodies)
             if (pb.hash == hash) return;
         if (m_pending_bodies.size() >= effective_pending_cap())
-            m_pending_bodies.erase(m_pending_bodies.begin());
+            drop_oldest_pending_body();
         PendingBody pb;
         pb.hash = hash;
         pb.first_req = pb.last_req = now_sec();
         pb.last_peer = peer_key;
         m_pending_bodies.push_back(std::move(pb));
+    }
+
+    /// The tracked-slot cap drops the oldest slot. N1: a SELF-BIND-FAULT slot
+    /// is not dropped silently.
+    void drop_oldest_pending_body()
+    {
+        if (m_pending_bodies.empty()) return;
+        const PendingBody& old = m_pending_bodies.front();
+        if (old.self_bind_fault)
+            LOG_WARNING << "[" << m_chain_label << "] SELF-BIND-FAULT body "
+                        << old.hash.GetHex().substr(0, 16)
+                        << "... dropped by the tracked-slot cap, still unbound";
+        m_pending_bodies.erase(m_pending_bodies.begin());
     }
 
     /// Forget every compact fetch of `hash` (parked blocks, our MSG_CMPCT_BLOCK
@@ -4470,8 +4727,19 @@ private:
             // mapBlocksInFlight until the body actually lands (that removal
             // lives in the block handler). Abandoning it is the wedge this
             // replaces (height 967736: connected=8/8, slot dropped, lane frozen).
+            // N1: when the last asked peer ANSWERED (with a body that did not
+            // bind or did not decode), this window has no staller to count
+            // against the set. A peer that has answered this body is never
+            // evicted for it (the !answered_unbound guards below); a SILENT one
+            // still is, as on master.
+            // R3: a recorded answerer that stays silent on a re-ask is never
+            // evicted for this body, so its window does not count either:
+            // otherwise the count would sit at the mark and the next
+            // never-answered peer would be cut on its first stall.
             const std::string staller = pb.last_peer;
-            ++pb.stalls_since_evict;
+            if (!pb.carrier_answered && !(!staller.empty() && answered_unbound(pb, staller)))
+                ++pb.stalls_since_evict;
+            pb.carrier_answered = false;
 
             // #968a: a compact fetch of this body (our MSG_CMPCT_BLOCK ask, or
             // a block parked waiting for blocktxn) ran out the same stall
@@ -4497,7 +4765,11 @@ private:
             // disconnect, no served bytes.
             if (pb.hol)
             {
-                PeerSession* target = fastest_bulk_peer(staller);
+                // N1 (F1): never re-home to a peer that already answered this
+                // body with one that does not bind while a fresh peer remains.
+                PeerSession* target =
+                    pb.unbound_from.empty() ? nullptr : fresh_body_peer(pb, staller);
+                if (!target) target = fastest_bulk_peer(staller);
                 if (!target) { ++it; continue; }   // retry when the pool refills
                 send_block_getdata(target, pb.hash, /*cmpct=*/false);
                 ++pb.rerequests;
@@ -4534,7 +4806,7 @@ private:
                 // time it disconnects). Still guarded by a survivor/refill so the
                 // pool can never be drained by one missing block.
                 if (!staller.empty() && staller != target->key
-                    && pb.stall_timeout >= 16)
+                    && pb.stall_timeout >= 16 && !answered_unbound(pb, staller))
                 {
                     PeerSession* bad = find_peer(staller);
                     const bool have_alternative =
@@ -4564,27 +4836,39 @@ private:
             // just ask; a single-peer pool re-asks the same peer (still
             // strictly better than the 600 s inv-TTL wait). The ANNOUNCER goes
             // first — it holds the block by definition.
-            std::vector<PeerSession*> cands;
-            if (PeerSession* src = block_source(pb.hash))
-                if (src->handshake.complete()) cands.push_back(src);
-            for (auto& up : m_pool)
-                if (up->handshake.complete() &&
-                    (cands.empty() || up.get() != cands.front()))
-                    cands.push_back(up.get());
-            if (cands.empty()) { ++it; continue; }   // retry when the pool refills
+            // N1 (F1/F2): a peer that has not answered this body yet goes
+            // before the rotation once anyone has answered with a non-binding
+            // body, so forgers cost one round trip each, not stall windows.
             PeerSession* target =
-                cands[static_cast<size_t>(pb.rerequests) % cands.size()];
-            if (target->key == pb.last_peer && cands.size() > 1)
-                target = cands[(static_cast<size_t>(pb.rerequests) + 1)
-                               % cands.size()];
+                pb.unbound_from.empty() ? nullptr : fresh_body_peer(pb, staller);
+            if (!target)
+            {
+                std::vector<PeerSession*> cands;
+                if (PeerSession* src = block_source(pb.hash))
+                    if (src->handshake.complete()) cands.push_back(src);
+                for (auto& up : m_pool)
+                    if (up->handshake.complete() &&
+                        (cands.empty() || up.get() != cands.front()))
+                        cands.push_back(up.get());
+                if (cands.empty()) { ++it; continue; }   // retry when the pool refills
+                target = cands[static_cast<size_t>(pb.rerequests) % cands.size()];
+                if (target->key == pb.last_peer && cands.size() > 1)
+                    target = cands[(static_cast<size_t>(pb.rerequests) + 1)
+                                   % cands.size()];
+            }
             send_block_getdata(target, pb.hash, /*cmpct=*/false);
             ++pb.rerequests;
             ++m_body_rerequests_total;
             pb.last_req = now;
             // A freshly-assigned peer gets the full fast window (dashd resets
             // the stall clock on (re)assignment); doubling, capped, only when
-            // the pool leaves us re-asking the same staller.
-            if (target->key != staller)
+            // the pool leaves us re-asking the same staller. N1: also when
+            // re-asking a peer that already answered this body with one that
+            // does not bind (every peer has, or fresh_body_peer would have
+            // picked another), so a body our codec cannot bind backs off by
+            // doubling up to BODY_STALL_TIMEOUT_MAX instead of a request loop.
+            if (target->key != staller && !answered_unbound(pb, target->key)
+                && !pb.answers_overflow)
                 pb.stall_timeout = BODY_STALL_TIMEOUT_INIT;
             else
                 pb.stall_timeout =
@@ -4594,7 +4878,8 @@ private:
                      << pb.rerequests << " peer=" << target->key << " hash="
                      << pb.hash.GetHex().substr(0, 16) << "... unanswered_for="
                      << (now - pb.first_req) << "s next_stall_window="
-                     << pb.stall_timeout << "s";
+                     << pb.stall_timeout << "s"
+                     << (pb.self_bind_fault ? " self_bind_fault=1" : "");
 
             // dashd disconnect-on-stall + FindNextBlocksToDownload: with 8/8
             // connected but none serving THIS body, rotation alone spins. Once
@@ -4605,7 +4890,8 @@ private:
             // Guarded: only when a real staller is still held AND a survivor (or
             // an armed refill) can replace it, so one missing block can never
             // drain the pool to zero.
-            if (pb.stalls_since_evict >= BODY_REREQUEST_MAX && !staller.empty())
+            if (pb.stalls_since_evict >= BODY_REREQUEST_MAX && !staller.empty()
+                && !answered_unbound(pb, staller))
             {
                 PeerSession* bad = find_peer(staller);
                 const bool have_alternative =
@@ -5057,7 +5343,8 @@ private:
         // legs. A body that does not bind is somebody else's txs under this
         // header; it is dropped here and the watchdog keeps asking for the
         // real one. A reassembled compact body was already bound by the
-        // receiver, so it is not hashed twice.
+        // receiver, so it is not hashed twice. N1: if we asked this peer for
+        // it, it answered (note_unbound_answer): it is not a staller.
         if (!via_compact && !block_body_binds_to_header(block))
         {
             ++m_bodies_unbound;
@@ -5066,6 +5353,7 @@ private:
                             << blockhash.GetHex().substr(0, 16) << "... from " << p->key
                             << " does not bind to its header merkle root, dropped"
                             << cmpct_warn_suffix();
+            note_unbound_answer(p, blockhash);
             return;
         }
         // #968a: a peer is credited for a body only when we ASKED it for that
@@ -5092,6 +5380,8 @@ private:
                 // re-targets the new first in-flight block).
                 if (!m_hol_hash.IsNull() && m_hol_hash == blockhash)
                     m_hol_hash.SetNull();
+                // N1: this body binds, so the non-binding answers were not it.
+                if (!it->unbound_from.empty()) blame_unbound_answerers(*it, p->key);
                 m_pending_bodies.erase(it);
                 break;
             }
