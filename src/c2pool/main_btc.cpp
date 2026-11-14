@@ -1070,10 +1070,35 @@ int main(int argc, char* argv[])
             (void)chain_params;  // captured for genesis fallback if needed later
         });
 
+    // Unknown-block resync: a block INV whose header HeaderChain does not have
+    // means bitcoind fell back from sendheaders to inv (reorg / storm), so
+    // re-issue getheaders(locator) or the full_block that follows is dropped
+    // and HeaderChain stalls forever (.234 G3b testnet3, 2026-10-25). The
+    // decision + throttle live in TipReconcileGate (SSOT with the KAT).
+    auto unknown_resync_last =
+        std::make_shared<std::optional<std::chrono::steady_clock::time_point>>();
     coin_node.new_block.subscribe(
-        [](const uint256& block_hash)
+        [&header_chain, &coin_node, unknown_resync_last, BTC_PROTOCOL_VERSION]
+        (const uint256& block_hash)
         {
             LOG_INFO << "[BTC] new_block: " << block_hash.GetHex().substr(0, 32) << "...";
+
+            const auto now = std::chrono::steady_clock::now();
+            const bool known = header_chain.get_header(block_hash).has_value();
+            const auto& last = *unknown_resync_last;
+            if (btc::coin::TipReconcileGate::on_block_announce(
+                    known, coin_node.is_handshake_complete(), last.has_value(),
+                    last ? now - *last : std::chrono::steady_clock::duration::zero())
+                != btc::coin::TipReconcileGate::Action::Poll)
+                return;
+
+            *unknown_resync_last = now;
+            auto locator = header_chain.get_locator();
+            LOG_INFO << "[BTC] new_block: header unknown for "
+                     << block_hash.GetHex().substr(0, 16)
+                     << " -- resync getheaders chain_height=" << header_chain.height()
+                     << " locator_len=" << locator.size();
+            coin_node.send_getheaders(BTC_PROTOCOL_VERSION, locator, uint256::ZERO);
         });
 
     // BTC txid: SHA256d of the non-witness serialization (BIP 144). Witness
