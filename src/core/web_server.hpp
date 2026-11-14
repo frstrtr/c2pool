@@ -38,6 +38,7 @@
 #include <c2pool/payout/payout_manager.hpp>
 #include <c2pool/hashrate/tracker.hpp>
 #include <core/address_utils.hpp>
+#include <core/found_block_submit.hpp>
 #include <core/graph_history.hpp>
 #include <core/template_refresh.hpp>
 
@@ -385,7 +386,14 @@ public:
                             // has not labelled its sites leaves `unknown`,
                             // which reports as unknown and never as a claim.
                             BlockAuthorship authorship =
-                                BlockAuthorship::unknown);
+                                BlockAuthorship::unknown,
+                            // The height is the block's OWN: its coinbase
+                            // BIP34 push, or the header chain's height of its
+                            // prev + 1 -- not a template or sharechain value.
+                            // Such a height corrects a stored one it
+                            // contradicts (a pre-fix LTC peer row holds the
+                            // share absheight); any other only fills a 0.
+                            bool height_from_block = false);
     
     // Boundary types hoisted to core::stratum (see core/stratum_types.hpp).
     // Aliases kept here so existing references like `MiningInterface::JobSnapshot`
@@ -1178,6 +1186,11 @@ public:
         // by definition from history), so it stays last in the struct and out
         // of every positional aggregate-init above.
         bool from_history{false};
+        // Transient, never persisted: the height this row was stored under
+        // before a height correction moved it (0 = none). The key of a stored
+        // row carries its height, so the persistence callback passes this to
+        // FoundBlockStore::store to drop the record at the old key.
+        uint64_t replaced_height{0};
     };
 
     // Block acceptance verification: schedule async checks at +10s, +30s, +120s.
@@ -1416,6 +1429,52 @@ public:
     using block_height_lookup_fn = std::function<uint64_t(const std::string& block_hash)>;
     void backfill_found_block_heights(const block_height_lookup_fn& height_fn);
 
+    /// Correct a primary-chain row whose stored height the coin header chain
+    /// CONTRADICTS: the lookup knows this exact block hash at another height
+    /// (0 = not known, row untouched). The header of a hash fixes its height,
+    /// so the stored value is the wrong one -- the LTC peer path recorded the
+    /// SHARE absheight (27707625 for LTC block 3211872), which also kept the
+    /// row "pending" forever (the verdict waited for the chain to reach that
+    /// height). Re-sorts, re-derives luck, persists. Merged (aux) rows are
+    /// skipped: the parent header chain does not know them. One-shot at
+    /// startup, after load_persisted_found_blocks.
+    /// Only a stored height ABOVE `tip_height` (the parent chain's tip; no
+    /// block of the chain can sit there) is replaced: a header chain built on
+    /// a wrong checkpoint must not rewrite correct heights. A corrected row
+    /// that was orphaned at the wrong height is pending again and its
+    /// verification is scheduled.
+    void correct_found_block_heights(const block_height_lookup_fn& height_fn,
+                                     uint64_t tip_height);
+
+    /// A found-block row of THIS node's own (parent) chain, as opposed to a
+    /// merged/aux child (DOGE on an LTC node) that rides the same ledger. A
+    /// merged row carries its parent block (#946 parent_hash) or a chain
+    /// label other than this node's (the testnet "t" prefix allowed: tLTC is
+    /// LTC). With no node symbol configured every unparented row counts.
+    bool is_primary_found_block(const FoundBlock& b) const;
+    static bool found_block_chain_is_primary(const std::string& chain_label,
+                                             const std::string& parent_hash,
+                                             const std::string& node_symbol);
+    /// The share a row names, as every node can agree on it. On a parent-chain
+    /// row the winning share's hash IS the block hash (p2pool: share hash ==
+    /// header hash); a stored value that differs is the pre-fix finder record
+    /// (the sharechain best share at submit time, i.e. the winner's PARENT) and
+    /// reads "" (unknown). Merged rows keep theirs: the parent share that
+    /// carried the aux solve.
+    std::string found_block_share_hash(const FoundBlock& b) const;
+    /// The miner as the dashboard shows it. A pre-fix LTC peer row stored raw
+    /// hex instead of an address: HexStr of the address STRING (v34/v35
+    /// shares) decodes back to that address; a bare 20-byte pubkey hash
+    /// (v36) cannot be rendered without its script type and reads "".
+    static std::string found_block_miner_display(const std::string& stored);
+    /// Block-explorer prefix for a merged (aux) chain label ("" = none known,
+    /// emitted as null). The parent prefix (block_explorer_prefix) must never
+    /// link an aux hash: blockchair/litecoin answers "not found" for a DOGE id.
+    /// Testnet: none (aux rows carry the mainnet label, e.g. "DOGE", on
+    /// testnet too, so the label alone cannot tell).
+    static std::string merged_block_explorer_prefix(const std::string& chain_label,
+                                                    bool testnet);
+
     /// #946: fill the explorer body fields (coinbase_txid, tx_count) on the
     /// already-recorded row(s) for this block hash. Fill-only: a known value
     /// is never overwritten, and an unknown hash is a no-op (no new row).
@@ -1448,6 +1507,11 @@ public:
         // The share this submit minted; empty when it missed the share
         // target, so the row's "share" stays null.
         std::string             share_hash;
+        // The minted share's payout script (LTC lane). When set, the row's
+        // miner is this script rendered as an address -- what every peer
+        // reads off the gossiped share -- and takes precedence over `miner`.
+        // Rendered only when an aux block is found, never per share.
+        std::vector<unsigned char> miner_script;
     };
     class MergedSubmitScope {
     public:
@@ -1459,6 +1523,25 @@ public:
         MergedSubmitContext        m_ctx;
         const MergedSubmitContext* m_prev;
     };
+
+    /// The parent-chain twin of MergedSubmitScope: what the stratum submit
+    /// knows about the block it is about to hand to submitblock() -- the share
+    /// it minted, that share's payout, BIP34 height and committed coinbase
+    /// value (core/found_block_submit.hpp). Installed on the submitting thread
+    /// around submitblock(); the block-submitted callback fires synchronously
+    /// inside it and reads it with found_block_submit_context(). Null outside
+    /// a stratum submit (e.g. a JSON-RPC submitblock from a GBT miner).
+    class FoundBlockSubmitScope {
+    public:
+        explicit FoundBlockSubmitScope(core::FoundBlockSubmitContext ctx);
+        ~FoundBlockSubmitScope();
+        FoundBlockSubmitScope(const FoundBlockSubmitScope&) = delete;
+        FoundBlockSubmitScope& operator=(const FoundBlockSubmitScope&) = delete;
+    private:
+        core::FoundBlockSubmitContext        m_ctx;
+        const core::FoundBlockSubmitContext* m_prev;
+    };
+    static const core::FoundBlockSubmitContext* found_block_submit_context();
 
     /// #946: record a merged (DOGE) block this node submitted. Fills miner,
     /// subsidy and parent_* from the active MergedSubmitScope when there is
@@ -1488,12 +1571,15 @@ private:
     /// after backfill_block_fields fills a previously-missing network_difficulty.
     void recompute_found_block_luck_locked();
     /// Give the row (hash, chain) `height` if it is still at 0 (unknown).
-    /// Height only ever climbs out of 0; a known height is never changed.
+    /// Height only ever climbs out of 0; a known height is never changed --
+    /// except by `replace_known`, which only correct_found_block_heights
+    /// passes, with the header chain's own height for that exact hash.
     /// Re-sorts the list (references into it are invalid afterwards) and
     /// re-derives the luck series. Returns the updated row, to persist.
     /// CALLER MUST HOLD m_blocks_mutex.
     std::optional<FoundBlock> learn_found_block_height_locked(
-        const std::string& hash, const std::string& chain, uint64_t height);
+        const std::string& hash, const std::string& chain, uint64_t height,
+        bool replace_known = false);
     /// One /recent_blocks row. Shared by rest_recent_blocks and
     /// rest_found_block so the two can never drift apart.
     /// CALLER MUST HOLD m_blocks_mutex.
@@ -1660,7 +1746,8 @@ private:
                              const std::string& extranonce2,
                              const JobSnapshot* job = nullptr,
                              const std::string& miner = "",
-                             const uint256& share_hash = uint256());
+                             const uint256& share_hash = uint256(),
+                             const std::vector<unsigned char>& miner_script = {});
     
     // Internal state
     uint64_t m_work_id_counter;

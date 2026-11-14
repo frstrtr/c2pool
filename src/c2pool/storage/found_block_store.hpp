@@ -242,18 +242,23 @@ public:
     /// block -- otherwise the old key, which lists first, would be loaded
     /// again on the next start. Written first, removed second: a crash in
     /// between leaves both, which the load path resolves to the real height.
-    bool store(const FoundBlockRecord& rec)
+    ///
+    /// A height that is CORRECTED (MiningInterface's correction of a pre-fix
+    /// LTC peer row stored at the share absheight, 27707625 for block 3211872)
+    /// names the key it moves from: `replaced_height`, from
+    /// FoundBlock::replaced_height. The record at that key is dropped too, so
+    /// the old height is not loaded again. O(1): no key scan on the record
+    /// path (in embedded mode it runs before the block relay).
+    bool store(const FoundBlockRecord& rec, uint64_t replaced_height = 0)
     {
         auto key = make_key(rec.chain, rec.height, rec.block_hash);
         auto data = rec.serialize();
         if (!m_store.put(key, data))
             return false;
         if (rec.height != 0) {
-            const auto zero_key = make_key(rec.chain, 0, rec.block_hash);
-            std::vector<uint8_t> old;
-            if (m_store.get(zero_key, old)
-                && FoundBlockRecord::deserialize(old).block_hash == rec.block_hash)
-                m_store.remove(zero_key);
+            drop_other_key(rec, 0);
+            if (replaced_height != 0 && replaced_height != rec.height)
+                drop_other_key(rec, replaced_height);
         }
         return true;
     }
@@ -349,6 +354,17 @@ public:
     }
 
 private:
+    // Remove the record of `rec`'s block stored at `height`, if the value
+    // there is that block (the key only carries a 16-hex hash prefix).
+    void drop_other_key(const FoundBlockRecord& rec, uint64_t height)
+    {
+        const auto other = make_key(rec.chain, height, rec.block_hash);
+        std::vector<uint8_t> old;
+        if (m_store.get(other, old)
+            && FoundBlockRecord::deserialize(old).block_hash == rec.block_hash)
+            m_store.remove(other);
+    }
+
     core::LevelDBStore& m_store;
 
     static std::string make_key(const std::string& chain, uint64_t height,

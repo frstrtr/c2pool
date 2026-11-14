@@ -218,6 +218,17 @@ if (BUILD_TESTING AND GTest_FOUND)
     # tip is not a confirmation, a best-chain block confirms once 6 deep.
     # Same folding rule.
     #
+    # dashboard_found_block_test.cpp: one LTC find -> the same /recent_blocks
+    # row on the finder (ltc::dashboard::row_from_submit, fed by the stratum
+    # submit that minted the share) and on every peer (row_from_share, off the
+    # gossiped share): BIP34 block height (never the share absheight), the
+    # payout address (never raw pubkey-hash hex), the share's own hash (never
+    # the winner's parent). Field share of LTC 3211872. Same folding rule.
+    #
+    # found_block_wiring_test.cpp: source-structural guard that main_ltc.cpp's
+    # two LTC record sites use those builders and label the finder this_node.
+    # Same folding rule.
+    #
     # merged_found_record_test.cpp: a merged find on a stale job is recorded
     # as the block the share committed to (its hash and height from the
     # frozen snapshot), not the current work. Same folding rule.
@@ -435,6 +446,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         cmpct_v3_mweb_state_test.cpp
         compact_block_merkle_test.cpp
         compact_block_mweb_relay_test.cpp
+        dashboard_found_block_test.cpp
         desired_request_pacer_test.cpp
         desired_version_tally_test.cpp
         doge_auxpow_witness_test.cpp
@@ -456,6 +468,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         f11_donation_invariance_test.cpp
         found_block_peer_txid_test.cpp
         found_block_verify_test.cpp
+        found_block_wiring_test.cpp
         head_retention_test.cpp
         head_score_block_solution_test.cpp
         header_pow_always_test.cpp
