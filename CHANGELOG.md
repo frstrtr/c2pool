@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+### Linux packages: the binary starts without start.sh
+- `c2pool-<coin>` in the Linux tarball now loads its bundled libraries from
+  the package's `lib/` by itself (RUNPATH `$ORIGIN/lib`, and `$ORIGIN` on
+  `lib/libdash_scriptcheck.so`). Through v0.2.12.6 only `start.sh`, which sets
+  `LD_LIBRARY_PATH`, found them: run directly (a systemd unit, your own
+  script) the binary failed with `error while loading shared libraries:
+  libsecp256k1.so.6` unless the host had a library of that name, and then
+  used the host's copy, not the bundled one; `c2pool-dash` always failed
+  (`libdash_scriptcheck.so`). On those versions, set
+  `LD_LIBRARY_PATH=<package dir>/lib` (systemd: `Environment=`). `start.sh`
+  is unchanged.
+
 ### Node fee draw honours fractional fees; addr gossip at 80%
 - `core::random::random_float` was an integer draw: `random_float(0, 100)`
   returned only 0..100 and `random_float(0, 1)` only 0 or 1. It is now a
