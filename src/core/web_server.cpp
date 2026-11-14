@@ -7766,26 +7766,23 @@ nlohmann::json MiningInterface::rest_best_share()
                 {"started", m_best_difficulty.merged_round_start}
             }}
         };
-        // Merged median (same share difficulties, different network target)
-        if (m_sharechain_stats_fn) {
-            auto sc = m_sharechain_stats_fn();
-            double avg = sc.value("average_difficulty", 0.0);
-            if (avg > 0 && merged_net_diff > 0)
-                result["median_merged_pct"] = avg / merged_net_diff * 100.0;
-        }
     }
 
-    // ── Median share % (approximate from average difficulty in skiplist) ──
+    // ── Median share % (p2pool web.py: median of the window's share targets) ──
+    // median_difficulty is published by coins whose stats fn walks the window
+    // (LTC); others fall back to the window average.
+    double window_diff = 0.0;
     if (m_sharechain_stats_fn) {
         auto sc = m_sharechain_stats_fn();
-        double avg = sc.value("average_difficulty", 0.0);
-        if (avg > 0 && net_diff > 0)
-            result["median_pct"] = avg / net_diff * 100.0;
-        else
-            result["median_pct"] = 0.0;
-    } else {
-        result["median_pct"] = 0.0;
+        window_diff = sc.value("median_difficulty", 0.0);
+        if (!(window_diff > 0.0))
+            window_diff = sc.value("average_difficulty", 0.0);
     }
+    result["median_pct"] = (window_diff > 0 && net_diff > 0)
+        ? window_diff / net_diff * 100.0 : 0.0;
+    // Merged median (same share difficulties, different network target)
+    if (result.contains("merged") && window_diff > 0 && merged_net_diff > 0)
+        result["median_merged_pct"] = window_diff / merged_net_diff * 100.0;
 
     return result;
 }
@@ -9967,7 +9964,8 @@ void MiningInterface::reset_best_difficulty_round(uint64_t ts)
 }
 
 void MiningInterface::record_share_difficulty(double difficulty, const std::string& miner,
-                                              const std::string& share_hash)
+                                              const std::string& share_hash,
+                                              bool update_best)
 {
     // Feed the rolling-hashrate ring. Independent of the best-diff
     // tracking below; the ring has its own internal lock.
@@ -9986,25 +9984,49 @@ void MiningInterface::record_share_difficulty(double difficulty, const std::stri
     if (difficulty > 0)
         m_recent_share_difficulty.store(difficulty, std::memory_order_relaxed);
 
+    // Primary legs only: the callers that still feed the card through here
+    // (DASH stratum + tracker, bip110 tracker) never fed the merged legs.
+    if (update_best)
+        update_best_difficulty(difficulty, miner, share_hash, /*update_merged=*/false);
+}
+
+void MiningInterface::update_best_difficulty(double difficulty, const std::string& miner,
+                                             const std::string& pow_hash_hex,
+                                             bool update_merged)
+{
+    if (!(difficulty > 0.0)) return;
     std::lock_guard<std::mutex> lock(m_best_diff_mutex);
     auto now_ts = static_cast<uint64_t>(std::time(nullptr));
     if (difficulty > m_best_difficulty.all_time) {
         m_best_difficulty.all_time = difficulty;
         m_best_difficulty.all_time_miner = miner;
-        m_best_difficulty.all_time_hash = share_hash;
+        m_best_difficulty.all_time_hash = pow_hash_hex;
         m_best_difficulty.all_time_ts = now_ts;
     }
     if (difficulty > m_best_difficulty.session) {
         m_best_difficulty.session = difficulty;
         m_best_difficulty.session_miner = miner;
-        m_best_difficulty.session_hash = share_hash;
+        m_best_difficulty.session_hash = pow_hash_hex;
         m_best_difficulty.session_ts = now_ts;
     }
     if (difficulty > m_best_difficulty.round) {
         m_best_difficulty.round = difficulty;
         m_best_difficulty.miner = miner;
-        m_best_difficulty.hash = share_hash;
+        m_best_difficulty.hash = pow_hash_hex;
         m_best_difficulty.timestamp = now_ts;
+    }
+    if (!update_merged) return;
+    // Merged (aux) chain: the same scrypt pow-hash, read against the aux
+    // network difficulty by rest_best_share (work.py merged_best_difficulty).
+    if (difficulty > m_best_difficulty.merged_all_time) {
+        m_best_difficulty.merged_all_time = difficulty;
+        m_best_difficulty.merged_all_time_miner = miner;
+        m_best_difficulty.merged_all_time_ts = now_ts;
+    }
+    if (difficulty > m_best_difficulty.merged_round) {
+        m_best_difficulty.merged_round = difficulty;
+        m_best_difficulty.merged_round_miner = miner;
+        m_best_difficulty.merged_round_ts = now_ts;
     }
 }
 
@@ -10022,6 +10044,52 @@ void MiningInterface::record_merged_share_difficulty(double difficulty, const st
         m_best_difficulty.merged_round_miner = miner;
         m_best_difficulty.merged_round_ts = now_ts;
     }
+}
+
+void MiningInterface::record_best_pseudoshare(
+    double share_difficulty, const std::string& miner,
+    const std::string& coinb1, const std::string& coinb2,
+    const std::string& extranonce1, const std::string& extranonce2,
+    const std::string& ntime, const std::string& nonce,
+    uint32_t version, const std::string& prevhash_hex,
+    const std::string& nbits_hex,
+    const std::vector<std::string>& merkle_branches)
+{
+    if (!(share_difficulty > 0.0)) return;
+    // Cheap gate: almost every pseudoshare is below every leg, so skip the
+    // second scrypt pass unless this share can set some record.
+    {
+        std::lock_guard<std::mutex> lock(m_best_diff_mutex);
+        const auto& b = m_best_difficulty;
+        if (!(share_difficulty > b.round || share_difficulty > b.session
+              || share_difficulty > b.all_time || share_difficulty > b.merged_round
+              || share_difficulty > b.merged_all_time))
+            return;
+    }
+    // The exact pow-hash for the card's hash field: the same header bytes the
+    // vardiff gate hashed (calculate_share_difficulty). Empty on bad input.
+    std::string pow_hex;
+    const uint256 merkle_root =
+        reconstruct_merkle_root(coinb1 + extranonce1 + extranonce2 + coinb2, merkle_branches);
+    const auto header =
+        build_header_bytes(version, prevhash_hex, merkle_root, ntime, nbits_hex, nonce);
+    if (header.size() == 80) {
+        char out[32];
+        scrypt_1024_1_1_256(reinterpret_cast<const char*>(header.data()), out);
+        uint256 pow_hash;
+        memcpy(pow_hash.begin(), out, 32);
+        pow_hex = pow_hash.GetHex();
+    }
+    update_best_difficulty(share_difficulty, miner, pow_hex, /*update_merged=*/true);
+}
+
+/*static*/
+double MiningInterface::median_share_difficulty(std::vector<double> diffs)
+{
+    const size_t n = diffs.size();
+    if (n == 0) return 0.0;
+    std::sort(diffs.begin(), diffs.end());
+    return (n % 2 == 1) ? diffs[n / 2] : (diffs[n / 2 - 1] + diffs[n / 2]) / 2.0;
 }
 
 void MiningInterface::update_stat_log()
@@ -10916,7 +10984,7 @@ void MiningInterface::load_stat_log()
 // Measured (primary node, 2026-08-05, uptime 36 min): /local_stats
 // best_share reported all_time == session == round because the all-time leg
 // lived only in memory — every restart re-founded "all time", and the card
-// silently redefined the word. Only the all-time leg is persisted: session
+// silently redefined the word. Only the all-time legs (primary + merged) are persisted: session
 // and round are honestly per-process / per-round and must reset.
 void MiningInterface::save_best_share_all_time()
 {
@@ -10925,11 +10993,17 @@ void MiningInterface::save_best_share_all_time()
     nlohmann::json j;
     {
         std::lock_guard<std::mutex> lock(m_best_diff_mutex);
-        if (m_best_difficulty.all_time <= 0.0) return;   // nothing measured
+        if (m_best_difficulty.all_time <= 0.0
+            && m_best_difficulty.merged_all_time <= 0.0) return;   // nothing measured
         j = {{"difficulty", m_best_difficulty.all_time},
              {"miner", m_best_difficulty.all_time_miner},
              {"hash", m_best_difficulty.all_time_hash},
              {"ts", m_best_difficulty.all_time_ts}};
+        // Merged (aux) all-time leg rides in the same sidecar.
+        if (m_best_difficulty.merged_all_time > 0.0)
+            j["merged"] = {{"difficulty", m_best_difficulty.merged_all_time},
+                           {"miner", m_best_difficulty.merged_all_time_miner},
+                           {"ts", m_best_difficulty.merged_all_time_ts}};
     }
     try {
         const std::string tmp = path + ".new";
@@ -10950,9 +11024,20 @@ void MiningInterface::load_best_share_all_time()
         auto j = nlohmann::json::parse(std::string(
             (std::istreambuf_iterator<char>(f)),
             std::istreambuf_iterator<char>()));
+        if (!j.is_object()) return;
         const double d = j.value("difficulty", 0.0);
-        if (d <= 0.0) return;
         std::lock_guard<std::mutex> lock(m_best_diff_mutex);
+        if (j.contains("merged") && j["merged"].is_object()) {
+            const auto& m = j["merged"];
+            const double md = m.value("difficulty", 0.0);
+            // Same raise-only rule as the primary leg below.
+            if (md > m_best_difficulty.merged_all_time) {
+                m_best_difficulty.merged_all_time       = md;
+                m_best_difficulty.merged_all_time_miner = m.value("miner", std::string());
+                m_best_difficulty.merged_all_time_ts    = m.value("ts", uint64_t(0));
+            }
+        }
+        if (d <= 0.0) return;
         // Only ever RAISE: a persisted record must never overwrite a better
         // share found before the load ran.
         if (d > m_best_difficulty.all_time) {
