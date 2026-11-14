@@ -5695,7 +5695,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 -> std::optional<uint32_t> {
                 std::lock_guard<std::mutex> lk(oracle->m);
                 if (!oracle->hc) return std::nullopt;
-                return oracle->hc->expected_bits_after(prev_block, block_time);
+                return oracle->hc->expected_bits_after(prev_block, block_time,
+                                                       dash::BLOCK_CREDIT_MAX_PARENT_DEPTH);
             };
         LOG_INFO << "[HEAD-SCORE] block-solution credit ARMED: a block-solving share's header"
                     " bits are checked against this node's header chain";

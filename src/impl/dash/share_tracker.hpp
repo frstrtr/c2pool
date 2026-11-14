@@ -140,6 +140,13 @@ inline int32_t head_punish_reason(bool is_block_solution, int32_t naughty)
 /// share's own header bits on trust (data.py:1691), so a share claiming an
 /// easy block target would win every same-parent race and tie a one-share-
 /// longer branch; here it gets no credit and scores as a plain share.
+/// The deepest parent (blocks below our header-chain tip) a block-solution
+/// credit is checked for. A real block share's parent is our tip, or tip - 1
+/// once the block itself arrived. A share naming an older parent would be
+/// checked against that parent's historic bits, which are easier whenever
+/// the difficulty rose since: no credit beyond this depth.
+inline constexpr uint32_t BLOCK_CREDIT_MAX_PARENT_DEPTH = 6;
+
 inline bool block_solution_credit(bool is_block_solution, uint32_t header_bits,
                                   std::optional<uint32_t> expected_bits)
 {

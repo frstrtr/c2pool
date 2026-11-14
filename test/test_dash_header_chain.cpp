@@ -988,3 +988,18 @@ TEST(DashHeaderChain, ExpectedBitsAfterSkipsWindowsWithTheSyntheticAnchor)
     EXPECT_TRUE(hc.expected_bits_after(hashes[24], t).has_value())
         << "anchor + 24: 24 real headers";
 }
+
+// An old parent is refused: the block-solution credit checks a share's
+// header bits against its parent's expected bits, and an old parent's
+// historic bits are easier whenever the difficulty rose since. With
+// max_depth only parents within that many blocks of the tip are answered.
+TEST(DashHeaderChain, ExpectedBitsAfterRefusesAParentDeeperThanMaxDepth)
+{
+    auto mc = build_mined_chain(40, 1'800'000'000u);
+    auto& hc = *mc.hc;
+    const int64_t t = mc.tip_time + 150;
+    EXPECT_TRUE(hc.expected_bits_after(mc.hashes[40], t, 6).has_value()) << "the tip";
+    EXPECT_TRUE(hc.expected_bits_after(mc.hashes[34], t, 6).has_value()) << "6 below the tip";
+    EXPECT_FALSE(hc.expected_bits_after(mc.hashes[33], t, 6).has_value()) << "7 below the tip";
+    EXPECT_TRUE(hc.expected_bits_after(mc.hashes[33], t).has_value()) << "no depth bound by default";
+}

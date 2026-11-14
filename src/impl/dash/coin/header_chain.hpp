@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <functional>
 #include <iomanip>
 #include <map>
@@ -446,14 +447,18 @@ public:
     /// at it is missing (below a fast-start anchor) or is the synthetic
     /// anchor itself (bits 0, time 0: dark_gravity_wave would average a zero
     /// target into the window). None of those is a network target to check
-    /// against.
-    std::optional<uint32_t> expected_bits_after(const uint256& prev_hash, int64_t block_time) const {
+    /// against. `max_depth`: nullopt also when `prev_hash` is more than this
+    /// many blocks below our tip, so a caller can refuse an old parent whose
+    /// historic bits are easier than today's.
+    std::optional<uint32_t> expected_bits_after(const uint256& prev_hash, int64_t block_time,
+                                                uint32_t max_depth = UINT32_MAX) const {
         std::lock_guard<std::mutex> lock(m_mutex);
         auto it = m_headers.find(prev_hash);
         if (it == m_headers.end()) return std::nullopt;
         const uint32_t h = it->second.height;
         auto at = m_height_index.find(h);
         if (at == m_height_index.end() || at->second != prev_hash) return std::nullopt;
+        if (h > m_tip_height || m_tip_height - h > max_depth) return std::nullopt;
         if (h < static_cast<uint32_t>(DGW_PAST_BLOCKS)) return std::nullopt;
         for (uint32_t n = 0; n < static_cast<uint32_t>(DGW_PAST_BLOCKS); ++n) {
             const auto e = get_header_by_height_internal(h - n);
