@@ -1006,3 +1006,79 @@ TEST(StratumInterimHardening, DrainHooksRefuseAndDropExactly)
     ASSERT_TRUE(c4.connect(h.port));
     EXPECT_TRUE(c4.subscribe()) << "accepting=true must restore the accept path";
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// Teardown — single-owner session close (EOF, then stop()).
+//
+// A session that ends on EOF closes its socket on the io thread but stays in
+// StratumServer::sessions_ (pruned lazily), so stop() reached it again and
+// closed the same socket a second time. When stop() ran on another thread
+// (the pre-#2207 SessionRig did) the two closes raced in the reactor: UBSan
+// "member access within null pointer of type descriptor_state" in
+// epoll_reactor::deregister_descriptor, flaking the ASan leg on unrelated PRs.
+// The close is now claimed once; whoever comes second does not touch the
+// socket. get_session_socket_closes() counts real closes: exactly one per
+// session, whatever the order (pre-fix: two for the EOF-ended session).
+// ════════════════════════════════════════════════════════════════════════════
+namespace {
+bool wait_socket_closes(ServerHarness& h, uint64_t want,
+                        std::chrono::milliseconds timeout = 5000ms)
+{
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (h.on_io([&] { return h.server->get_session_socket_closes(); }) >= want)
+            return true;
+        std::this_thread::sleep_for(10ms);
+    }
+    return false;
+}
+}  // namespace
+
+// Deterministic order: the EOF is fully processed on the io thread, then stop()
+// runs on the io thread. No sanitizer needed: the close counter is the oracle.
+TEST(StratumTeardown, EofThenStopClosesTheSessionSocketOnce)
+{
+    ServerHarness h;
+    ASSERT_TRUE(h.start());
+
+    auto c = std::make_unique<Client>();
+    ASSERT_TRUE(c->connect(h.port));
+    ASSERT_TRUE(c->subscribe());
+    c.reset();  // client FIN: the server read handler sees EOF
+
+    ASSERT_TRUE(wait_socket_closes(h, 1)) << "server never processed the EOF";
+    EXPECT_EQ(h.on_io([&] { return h.server->get_session_count(); }), 1u)
+        << "precondition: the EOF-ended session is still registered, so stop() reaches it";
+
+    h.on_io([&] { h.server->stop(); return 0; });
+    EXPECT_EQ(h.on_io([&] { return h.server->get_session_socket_closes(); }), 1u)
+        << "stop() after EOF must not close the session socket a second time";
+}
+
+// The flaking shape: one session EOFs while stop() runs on the TEST thread with
+// ioc.run() live on the io thread, so the EOF handler and stop() contend for
+// the close. Repeated to widen the window for the ASan+UBSan leg; the counter
+// must still read exactly one close per session.
+TEST(StratumTeardown, EofRacingStopFromAnotherThreadClosesEachSocketOnce)
+{
+    for (int iter = 0; iter < 25; ++iter) {
+        ServerHarness h;
+        ASSERT_TRUE(h.start());
+
+        auto eof_client = std::make_unique<Client>();
+        Client live_client;
+        ASSERT_TRUE(eof_client->connect(h.port));
+        ASSERT_TRUE(eof_client->subscribe());
+        ASSERT_TRUE(live_client.connect(h.port));
+        ASSERT_TRUE(live_client.subscribe());
+
+        eof_client.reset();   // EOF in flight on the io thread...
+        h.server->stop();     // ...while stop() closes from this thread
+
+        // Quiesce: the aborted/EOF read handlers run on the io thread.
+        EXPECT_TRUE(wait_socket_closes(h, 2)) << "iter " << iter;
+        std::this_thread::sleep_for(20ms);
+        EXPECT_EQ(h.on_io([&] { return h.server->get_session_socket_closes(); }), 2u)
+            << "iter " << iter << ": each session socket must be closed exactly once";
+    }
+}

@@ -1591,7 +1591,7 @@ void StratumSession::send_response(const nlohmann::json& response)
 
 void StratumSession::do_write()
 {
-    if (write_queue_.empty() || !socket_.is_open()) {
+    if (write_queue_.empty() || !is_connected()) {
         writing_ = false;
         return;
     }
@@ -1603,7 +1603,9 @@ void StratumSession::do_write()
                 LOG_ERROR << "[Stratum] Error sending response: " << ec.message();
                 write_queue_.clear();
                 writing_ = false;
-                try { socket_.close(); } catch (...) {}
+                // Through the single-owner close, so a later stop() or
+                // reaper pass does not close this socket again.
+                cancel_timers();
                 return;
             }
             write_queue_.pop_front();
@@ -2256,6 +2258,11 @@ size_t StratumSession::distinct_job_payloads() const
 
 void StratumSession::cancel_timers()
 {
+    // Single-owner close (see close_claimed_): only the first caller cancels
+    // and closes; a later caller (stop() after EOF, a drain after a write
+    // error) must not touch the socket again.
+    if (close_claimed_.exchange(true, std::memory_order_acq_rel))
+        return;
     // Cancel pending timer — callback fires with ec=operation_aborted → returns.
     // Timer is a member, so it outlives all its callbacks (no use-after-free).
     work_push_timer_.cancel();
@@ -2264,6 +2271,8 @@ void StratumSession::cancel_timers()
     // callbacks that fire with ec=success after cancel().
     boost::system::error_code ec;
     socket_.close(ec);
+    if (server_)
+        server_->record_session_socket_close();
 }
 
 // ── Zombie-session fixes (transport/liveness only; consensus-neutral) ────────
