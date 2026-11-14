@@ -384,7 +384,7 @@ if (BUILD_TESTING AND GTest_FOUND)
     # rather than a standalone executable: a fresh target would need a build.yml
     # --target edit and would trip CI's NOT_BUILT sentinel until it had one
     # (#143/#883/#893). Header-only pure function -- needs no extra link deps.
-    add_executable(test_dash_share_tracker test_dash_share_tracker.cpp test_dash_share_remove_owns_data.cpp test_dash_pool_rate_head_select.cpp)
+    add_executable(test_dash_share_tracker test_dash_share_tracker.cpp test_dash_share_remove_owns_data.cpp test_dash_pool_rate_head_select.cpp test_dash_head_score_block_solution.cpp)
     target_link_libraries(test_dash_share_tracker PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core

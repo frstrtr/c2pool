@@ -1,0 +1,163 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// DASH think() Phase 4 head score: the p2pool block-solution credit.
+//
+// p2pool (p2pool-merged-v36 data.py:1690-1696) punishes a block-solution
+// share with -1 ("block solution"), checked before the naughty checks, and
+// sorts the heads ascending as ((work - min(punish,1)*ata(target), -punish,
+// -time_seen), h), the last one best (data.py:2933-2940). So a head that
+// solved a block gets one share of work ahead of an equal-work sibling, and
+// a full tie goes to the numerically larger hash h.
+//
+// c2pool punished naughty heads only, and its time_seen is whole seconds, so
+// a block-solving share and a same-parent sibling minted in the same second
+// tied, and the sibling could win. On 11-13/14 two blocks found by the hotel
+// (2571721, 2571868) ended with their solving shares as orphaned heads off
+// the best sharechain. The block reward was not affected (it is fixed in
+// the coinbase), but the finder lost one share of PPLNS weight and the
+// dashboard counts disagreed.
+//
+// Expectations are hand-derived from the p2pool tuple, not from the helpers
+// under test. FOLDED into the allowlisted test_dash_share_tracker target.
+
+#include <gtest/gtest.h>
+
+#include <impl/dash/share_tracker.hpp>
+#include <core/uint256.hpp>
+
+#include <algorithm>
+#include <string>
+#include <vector>
+
+using dash::DecoratedData;
+using dash::HeadScore;
+using dash::TraditionalScore;
+using dash::head_punish_reason;
+using dash::make_head_score;
+using dash::make_traditional_score;
+
+namespace {
+
+struct Head {
+    std::string hex;        // share hash, big-endian hex as logged
+    uint64_t work;          // verified work up to the 5th parent
+    uint64_t attempts;      // ata(target) of the head itself
+    int64_t time_seen;      // whole seconds, as the index keeps it
+    bool block = false;
+    int32_t naughty = 0;
+};
+
+uint256 h(const std::string& hex)
+{
+    uint256 r;
+    r.SetHex(hex);
+    return r;
+}
+
+// p2pool: sorted(decorated_heads)[-1]
+std::string best_of(const std::vector<Head>& heads)
+{
+    std::vector<DecoratedData<HeadScore>> d;
+    for (const auto& x : heads) {
+        const uint256 hash = h(x.hex);
+        d.push_back({make_head_score(uint288(x.work), uint288(x.attempts),
+                                     head_punish_reason(x.block, x.naughty), x.time_seen, hash),
+                     hash});
+    }
+    std::sort(d.begin(), d.end());
+    return d.back().hash.GetHex();
+}
+
+std::string pad(const std::string& tail)
+{
+    return std::string(64 - tail.size(), '0') + tail;
+}
+
+constexpr uint64_t W = 1'000'000;   // work at the 5th parent
+constexpr uint64_t A = 1'000;       // one share's attempts
+
+} // namespace
+
+TEST(DashHeadScoreBlockSolution, PunishReasonIsBlockSolutionFirstThenNaughty)
+{
+    EXPECT_EQ(head_punish_reason(false, 0), 0);
+    EXPECT_EQ(head_punish_reason(true, 0), -1);
+    EXPECT_EQ(head_punish_reason(false, 1), 1);
+    EXPECT_EQ(head_punish_reason(false, 3), 3) << "a descendant of a naughty share keeps its depth";
+    EXPECT_EQ(head_punish_reason(true, 1), -1) << "p2pool checks the block solution before naughty";
+}
+
+// The 11-14 case at h 2571868: block share 0022.. and its sibling 3bfe..
+// (same parent 0266.., same second; 3bfe arrived 187 ms later and has the
+// larger hash). p2pool keeps the block share.
+TEST(DashHeadScoreBlockSolution, BlockShareBeatsSameSecondSiblingWithLargerHash)
+{
+    const std::string blk = pad("22a7698e043c411c28df049209b695f97aef28ea22fc70ac9e");
+    const std::string sib = pad("3bfe0000000000000000000000000000000000000000000000");
+    ASSERT_TRUE(h(blk) < h(sib)) << "the sibling has the larger hash: a hash tie-break alone would pick it";
+    const Head b{blk, W, A, 1794616206, true};
+    const Head s{sib, W, A, 1794616206};
+    EXPECT_EQ(best_of({b, s}), h(blk).GetHex());
+    EXPECT_EQ(best_of({s, b}), h(blk).GetHex()) << "independent of arrival order";
+}
+
+// The 11-13 case at h 2571721: block share 0002.. against 53f3.., minted
+// 121 ms EARLIER in the same second on the same parent.
+TEST(DashHeadScoreBlockSolution, BlockShareBeatsEarlierSiblingInTheSameSecond)
+{
+    const std::string blk = pad("023dd4b4dd4fbaaa226d74fe4410e64f0fb71be92b722503c5");
+    const std::string sib = pad("53f30000000000000000000000000000000000000000000000");
+    EXPECT_EQ(best_of({{sib, W, A, 1794593964}, {blk, W, A, 1794593964, true}}), h(blk).GetHex());
+}
+
+// Even a sibling SEEN a second earlier loses: the -1 punish adds one share
+// of work, which outranks time_seen.
+TEST(DashHeadScoreBlockSolution, BlockShareBeatsSiblingSeenEarlier)
+{
+    const std::string blk = pad("aa");
+    const std::string sib = pad("bb");
+    EXPECT_EQ(best_of({{sib, W, A, 100}, {blk, W, A, 101, true}}), h(blk).GetHex());
+}
+
+// +1 share of work: a block head ties a one-share-longer branch on work and
+// wins on -punish; a two-share-longer branch still wins.
+TEST(DashHeadScoreBlockSolution, BlockShareCreditIsExactlyOneShare)
+{
+    const std::string blk = pad("aa");
+    const std::string lng = pad("ff");
+    EXPECT_EQ(best_of({{blk, W, A, 100, true}, {lng, W + A, A, 100}}), h(blk).GetHex());
+    EXPECT_EQ(best_of({{blk, W, A, 100, true}, {lng, W + 2 * A, A, 100}}), h(lng).GetHex());
+}
+
+// No block, no punish: equal work goes to the head seen first, a full tie
+// to the numerically larger hash (p2pool's trailing h).
+TEST(DashHeadScoreBlockSolution, TieBreaksAreTimeSeenThenLargerHash)
+{
+    const std::string lo = pad("10");
+    const std::string hi = pad("20");
+    EXPECT_EQ(best_of({{hi, W, A, 101}, {lo, W, A, 100}}), h(lo).GetHex()) << "seen first wins";
+    EXPECT_EQ(best_of({{lo, W, A, 100}, {hi, W, A, 100}}), h(hi).GetHex()) << "full tie: larger hash";
+    EXPECT_EQ(best_of({{hi, W, A, 100}, {lo, W, A, 100}}), h(hi).GetHex()) << "in either order";
+}
+
+// A naughty head is one share behind: against a clean head with one share
+// less work it ties on work and loses on -punish.
+TEST(DashHeadScoreBlockSolution, NaughtyHeadIsOneShareBehind)
+{
+    const std::string bad = pad("ff");
+    const std::string ok = pad("01");
+    EXPECT_EQ(best_of({{bad, W + A, A, 100, false, 1}, {ok, W, A, 100}}), h(ok).GetHex());
+    EXPECT_EQ(best_of({{bad, W + 2 * A, A, 100, false, 1}, {ok, W, A, 100}}), h(bad).GetHex());
+}
+
+// p2pool punish_aggressively = traditional_sort[-1][0][2] (= -punish): true
+// when the traditional best is punished either way, a block solution included.
+TEST(DashHeadScoreBlockSolution, TraditionalSortCarriesTheBlockSolutionPunish)
+{
+    std::vector<DecoratedData<TraditionalScore>> t;
+    const uint256 blk = h(pad("aa")), sib = h(pad("bb"));
+    t.push_back({make_traditional_score(uint288(W), head_punish_reason(true, 0), 100, blk), blk});
+    t.push_back({make_traditional_score(uint288(W), head_punish_reason(false, 0), 101, sib), sib});
+    std::sort(t.begin(), t.end());
+    EXPECT_EQ(t.back().hash, blk) << "traditional: equal work, seen first";
+    EXPECT_NE(t.back().score.neg_reason, 0) << "punish_aggressively is set";
+}

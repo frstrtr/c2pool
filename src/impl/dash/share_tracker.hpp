@@ -76,37 +76,81 @@ struct TailScore
     }
 };
 
+// p2pool think() Phase 4 (p2pool-merged-v36 data.py:2933-2947) sorts the
+// heads ascending as tuples ((score...), h) and takes the last. h is the
+// share hash as an integer, so on a full tie of the score the numerically
+// larger hash wins. `hash` is that trailing element: uint256 operator< is
+// CompareTo (arithmetic), the same order as p2pool's ints.
 struct HeadScore
 {
-    // p2pool: (work - min(punish,1)*ata(target), -reason, -time_seen)
+    // p2pool: ((work - min(punish,1)*ata(target), -punish, -time_seen), h)
     // Sorted ascending, .back() = best. Standard < comparison.
-    uint288 adjusted_work;  // work - punishment_deduction
-    int32_t neg_reason{};   // -reason (higher = less punished = better)
+    uint288 adjusted_work;  // work - min(punish,1)*ata(target)
+    int32_t neg_reason{};   // -punish (a block solution is -(-1) = +1: better)
     int64_t neg_time_seen{}; // -time_seen (higher = seen earlier = better)
+    uint256 hash;           // p2pool's trailing h: larger wins a full tie
 
     friend bool operator<(const HeadScore& a, const HeadScore& b)
     {
         if (a.adjusted_work < b.adjusted_work) return true;
         if (b.adjusted_work < a.adjusted_work) return false;
-        return std::tie(a.neg_reason, a.neg_time_seen) < std::tie(b.neg_reason, b.neg_time_seen);
+        if (std::tie(a.neg_reason, a.neg_time_seen) != std::tie(b.neg_reason, b.neg_time_seen))
+            return std::tie(a.neg_reason, a.neg_time_seen) < std::tie(b.neg_reason, b.neg_time_seen);
+        return a.hash < b.hash;
     }
 };
 
 struct TraditionalScore
 {
-    // p2pool: (work, -time_seen, -reason)
+    // p2pool: ((work, -time_seen, -punish), h)
     // No is_local. Sorted ascending, .back() = best.
     uint288 work;
     int64_t neg_time_seen{};
     int32_t neg_reason{};
+    uint256 hash;           // p2pool's trailing h
 
     friend bool operator<(const TraditionalScore& a, const TraditionalScore& b)
     {
         if (a.work < b.work) return true;
         if (b.work < a.work) return false;
-        return std::tie(a.neg_time_seen, a.neg_reason) < std::tie(b.neg_time_seen, b.neg_reason);
+        if (std::tie(a.neg_time_seen, a.neg_reason) != std::tie(b.neg_time_seen, b.neg_reason))
+            return std::tie(a.neg_time_seen, a.neg_reason) < std::tie(b.neg_time_seen, b.neg_reason);
+        return a.hash < b.hash;
     }
 };
+
+/// p2pool Share.should_punish_reason as head scoring sees it
+/// (p2pool-merged-v36 data.py:1690-1696). A block solution (the share's PoW
+/// hash at or below its header's block target: is_block_solution) is -1,
+/// checked FIRST, before naughty. A naughty share is 1 and a descendant of
+/// one its naughty depth (> 1). Anything else is 0. Phase 5 walks back only
+/// while the punish is > 0, so a block-solution head is never walked back.
+inline int32_t head_punish_reason(bool is_block_solution, int32_t naughty)
+{
+    if (is_block_solution) return -1;
+    if (naughty > 0) return naughty;
+    return 0;
+}
+
+/// p2pool Phase 4 head key. work is the verified work up to the head's 5th
+/// parent; attempts is ata(target) of the head itself (its index `work`).
+/// work - min(punish,1)*attempts: a punished head (punish > 0) is one share
+/// behind, a block solution (punish -1) one share ahead.
+inline HeadScore make_head_score(const uint288& work, const uint288& attempts,
+                                 int32_t punish, int64_t time_seen, const uint256& hash)
+{
+    uint288 adjusted = work;
+    if (punish > 0) adjusted = adjusted - attempts;
+    else if (punish < 0) adjusted = adjusted + attempts;
+    return {adjusted, -punish, -time_seen, hash};
+}
+
+/// p2pool Phase 4 traditional key: ((work, -time_seen, -punish), h).
+inline TraditionalScore make_traditional_score(const uint288& work, int32_t punish,
+                                               int64_t time_seen, const uint256& hash)
+{
+    return {work, -time_seen, -punish, hash};
+}
 
 template <typename ScoreT>
 struct DecoratedData
@@ -1475,30 +1519,20 @@ public:
                     if (!head_idx) continue;
                     int64_t ts = head_idx->time_seen;
 
-                    // Punish heads: naughty (invalid block) only.
+                    // p2pool should_punish_reason (head_punish_reason): a
+                    // block solution is -1, ahead of a naughty head (> 0).
                     // F10/(b): the non-canonical 95%-version-obsolescence punish
-                    // is dropped — canonical Phase-4 head-scoring punishes only
-                    // naughty heads. The version gate is the check() 60% weighted
+                    // is dropped — the version gate is the check() 60% weighted
                     // switch rule (share_check), not head-scoring.
-                    int32_t reason = 0;
-                    {
-                        auto* idx = chain.get_index(hh);
-                        if (idx && idx->naughty > 0)
-                            reason = idx->naughty;
-                    }
+                    const int32_t reason =
+                        head_punish_reason(head_idx->is_block_solution, head_idx->naughty);
 
-                    // p2pool: sort key = (work - min(punish,1)*ata(target), -reason, -time_seen)
+                    // p2pool: sort key = ((work - min(punish,1)*ata(target), -punish, -time_seen), h)
                     // peer_addr is None is COMMENTED OUT in p2pool — no is_local dimension.
-                    // Punishment deducted from work: a punished share is mathematically behind.
-                    uint288 adjusted_work = work_score;
-                    if (reason > 0) {
-                        // Deduct one share's worth of attempts (min(reason,1) * ata(target))
-                        auto* share_idx = chain.get_index(hh);
-                        if (share_idx)
-                            adjusted_work = adjusted_work - share_idx->work;
-                    }
-                    decorated_heads.push_back({{adjusted_work, -reason, -ts}, hh});
-                    traditional_sort.push_back({{work_score, -ts, -reason}, hh});
+                    decorated_heads.push_back(
+                        {make_head_score(work_score, head_idx->work, reason, ts, hh), hh});
+                    traditional_sort.push_back(
+                        {make_traditional_score(work_score, reason, ts, hh), hh});
                 } catch (const std::exception&) {
                     // Chain concurrently modified — skip this head, retry next cycle
                 }
@@ -1521,10 +1555,13 @@ public:
         {
             // Check if best share should be punished
             auto* best_idx = chain.get_index(best);
-            if (best_idx && best_idx->naughty > 0)
+            auto punish_of = [](const auto* idx) {
+                return idx ? head_punish_reason(idx->is_block_solution, idx->naughty) : 0;
+            };
+            if (punish_of(best_idx) > 0)
             {
-                // Walk back through punished shares
-                while (best_idx && best_idx->naughty > 0)
+                // Walk back through punished shares (p2pool: while punish > 0)
+                while (punish_of(best_idx) > 0)
                 {
                     uint256 prev;
                     chain.get_share(best).invoke([&](auto* obj) {
@@ -1535,7 +1572,7 @@ public:
                     best_idx = chain.get_index(best);
 
                     // p2pool: if not punish, find best descendent
-                    if (best_idx && best_idx->naughty == 0)
+                    if (best_idx && punish_of(best_idx) <= 0)
                     {
                         // Find deepest non-naughty child via reverse map
                         std::function<std::pair<int,uint256>(const uint256&, int)> best_desc;
@@ -1561,7 +1598,7 @@ public:
                     }
                 }
             }
-            punish_val = (best_idx && best_idx->naughty > 0) ? best_idx->naughty : 0;
+            punish_val = punish_of(best_idx);
         }
 
         // Phase 6: Compute cutoffs for desired shares filtering
