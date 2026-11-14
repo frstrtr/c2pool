@@ -24,6 +24,7 @@
 #include <chrono>
 #include <map>
 #include <mutex>
+#include <limits>
 #include <optional>
 #include <set>
 #include <thread>
@@ -418,7 +419,12 @@ public:
     /// walk reaching below an anchor): get_next_work_required would fall back
     /// to the parent's bits or powLimit there, which is no network target to
     /// check against. Share-chain head scoring uses it (never share validity).
-    std::optional<uint32_t> expected_bits_after(const uint256& prev_hash, int64_t block_time) const {
+    /// `max_depth` bounds how far below our tip the parent may be (0: the
+    /// parent is the tip): head scoring passes a small bound, since an old
+    /// best-chain parent answers its own, possibly far easier, historic bits.
+    std::optional<uint32_t> expected_bits_after(
+        const uint256& prev_hash, int64_t block_time,
+        uint32_t max_depth = std::numeric_limits<uint32_t>::max()) const {
         std::lock_guard<std::mutex> lock(m_mutex);
         auto it = m_headers.find(prev_hash);
         if (it == m_headers.end()) return std::nullopt;
@@ -426,6 +432,7 @@ public:
         const uint32_t h = prev.height;
         auto at = m_height_index.find(h);
         if (at == m_height_index.end() || at->second != prev_hash) return std::nullopt;
+        if (m_tip_height < h || m_tip_height - h > max_depth) return std::nullopt;
         if (prev.header.m_bits == 0) return std::nullopt;   // fast-start anchor: no header
 
         const int64_t interval = m_params.difficulty_adjustment_interval();

@@ -5230,7 +5230,8 @@ int main(int argc, char* argv[]) {
                 // Head scoring credits a block-solution share only when its
                 // header bits are the network target for its parent block, as
                 // the embedded LTC header chain computes it (Litecoin retarget
-                // over a complete window on our best chain). Without an
+                // over a complete window on our best chain), and that parent is
+                // at most BLOCK_CREDIT_MAX_PARENT_DEPTH below our tip. Without an
                 // embedded header chain (--no-embedded-ltc: litecoind RPC) the
                 // oracle stays empty: no block-solution credit.
                 if (embedded_ltc) {
@@ -5242,7 +5243,8 @@ int main(int argc, char* argv[]) {
                         -> std::optional<uint32_t> {
                         std::lock_guard<std::mutex> lk(oracle->m);
                         if (!oracle->hc) return std::nullopt;
-                        return oracle->hc->expected_bits_after(prev_block, block_time);
+                        return oracle->hc->expected_bits_after(prev_block, block_time,
+                                                               ltc::BLOCK_CREDIT_MAX_PARENT_DEPTH);
                     };
 
                 // Begin actively connecting to outbound peers from bootstrap list / addr store

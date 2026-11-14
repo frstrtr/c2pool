@@ -556,12 +556,14 @@ constexpr int64_t kGateInterval = 8;   // retarget every 8 blocks (1200 s / 150 
 // 0x207fffff it overflows (in Litecoin Core as in the port).
 constexpr uint32_t kGateBits = 0x1f7fffff;
 
-BlockHeaderType gate_genesis() {
+constexpr uint32_t kGateHard = 0x1f1fffff;   // 4x harder: the first retarget's result
+
+BlockHeaderType gate_genesis(uint32_t bits = kGateBits) {
     BlockHeaderType g;
     g.m_version = 1;
     g.m_merkle_root = hx("5eed");
     g.m_timestamp = kGateT0;
-    g.m_bits = kGateBits;
+    g.m_bits = bits;
     g.m_nonce = 1;
     return g;
 }
@@ -571,25 +573,29 @@ uint256 hash_of(const BlockHeaderType& hdr) {
 }
 
 // Litecoin mainnet rules (no min-difficulty), the easiest PoW limit and an
-// 8-block retarget interval, so a full window is cheap to mine.
-ltc::coin::LTCChainParams gate_params() {
-    auto p = ltc::coin::make_ltc_chain_params_mainnet();
-    p.pow_limit.SetCompact(ltc_test::kEasyBits);
+// 8-block retarget interval, so a full window is cheap to mine. `testnet`:
+// testnet rules (min-difficulty blocks) with powLimit kGateBits and a
+// genesis at kGateHard.
+ltc::coin::LTCChainParams gate_params(bool testnet = false) {
+    auto p = testnet ? ltc::coin::make_ltc_chain_params_testnet()
+                     : ltc::coin::make_ltc_chain_params_mainnet();
+    p.pow_limit.SetCompact(testnet ? kGateBits : ltc_test::kEasyBits);
     p.target_timespan = kGateInterval * 150;
     p.target_spacing = 150;
-    p.genesis_hash = hash_of(gate_genesis());
+    p.genesis_hash = hash_of(gate_genesis(testnet ? kGateHard : kGateBits));
     return p;
 }
 
-BlockHeaderType mined_child(const uint256& prev, uint32_t tag, uint32_t time) {
+BlockHeaderType mined_child(const uint256& prev, uint32_t tag, uint32_t time,
+                            uint32_t bits = kGateBits, bool testnet = false) {
     BlockHeaderType h;
     h.m_version = 0x20000000;
     h.m_previous_block = prev;
     h.m_merkle_root = hn(0x900000 + tag);
     h.m_timestamp = time;
-    h.m_bits = kGateBits;
+    h.m_bits = bits;
     h.m_nonce = tag << 16;
-    ltc_test::mine(h, gate_params());
+    ltc_test::mine(h, gate_params(testnet));
     return h;
 }
 
@@ -627,7 +633,7 @@ TEST(LtcHeadScoreBlockSolution, ExpectedBitsAfterFollowsLitecoinRetarget) {
     // Height 8, the first retarget: back interval-1 = 7 blocks to genesis.
     // Timespan 70 s clamps to 1200/4 = 300 s: target * 300 / 1200 =
     // (0x7fffff << 224) / 4, compact 0x1f1fffff.
-    EXPECT_EQ(g.chain.expected_bits_after(g.h[7], kGateT0 + 80), std::optional<uint32_t>(0x1f1fffffu));
+    EXPECT_EQ(g.chain.expected_bits_after(g.h[7], kGateT0 + 80), std::optional<uint32_t>(kGateHard));
     // Unknown parent, and a parent off the best chain: nullopt.
     EXPECT_FALSE(g.chain.expected_bits_after(hx("dead"), kGateT0).has_value());
     EXPECT_FALSE(g.chain.expected_bits_after(g.s3, kGateT0 + 40).has_value());
@@ -660,7 +666,7 @@ namespace {
 void bind_header_chain(ltc::ShareTracker& t, const HeaderChain* hc) {
     t.m_expected_block_bits = [hc](const uint256& prev_block, int64_t block_time) -> std::optional<uint32_t> {
         if (!hc) return std::nullopt;
-        return hc->expected_bits_after(prev_block, block_time);
+        return hc->expected_bits_after(prev_block, block_time, ltc::BLOCK_CREDIT_MAX_PARENT_DEPTH);
     };
 }
 
@@ -668,7 +674,8 @@ void bind_header_chain(ltc::ShareTracker& t, const HeaderChain* hc) {
 // `prev_block` and header `bits`, flagged a block solution from those bits as
 // mark_block_solution flags it (PoW at the declared target); `plain` (larger
 // hash). Returns whether think() picks the claimant.
-bool claimant_wins(const HeaderChain* hc, const uint256& prev_block, uint32_t bits, bool bind = true) {
+bool claimant_wins(const HeaderChain* hc, const uint256& prev_block, uint32_t bits,
+                   uint32_t header_time = kGateT0 + 100, bool bind = true) {
     ltc::ShareTracker t;
     const uint256 tip = build_trunk(t, kTrunk);
     if (bind)
@@ -681,7 +688,7 @@ bool claimant_wins(const HeaderChain* hc, const uint256& prev_block, uint32_t bi
     t.chain.get_share(claimant).invoke([&](auto* s) {
         s->m_min_header.m_previous_block = prev_block;
         s->m_min_header.m_bits = bits;
-        s->m_min_header.m_timestamp = kGateT0 + 100;
+        s->m_min_header.m_timestamp = header_time;
     });
     EXPECT_TRUE(t.mark_block_solution(claimant, chain::bits_to_target(bits)));
     EXPECT_TRUE(t.chain.get_index(claimant)->is_block_solution);   // the flag rests on its own bits
@@ -709,6 +716,101 @@ TEST(LtcHeadScoreBlockSolution, UnknownParentOrNoHeaderChainGetsNoCredit) {
     EXPECT_FALSE(claimant_wins(&g.chain, hx("dead"), kGateBits));   // unknown parent
     EXPECT_FALSE(claimant_wins(&g.chain, g.s3, kGateBits));         // off the best chain
     EXPECT_FALSE(claimant_wins(nullptr, g.h[3], kGateBits));        // oracle detached
-    EXPECT_FALSE(claimant_wins(&g.chain, g.h[3], kGateBits, false)); // no oracle bound
+    EXPECT_FALSE(claimant_wins(&g.chain, g.h[3], kGateBits, kGateT0 + 100, false)); // no oracle bound
     EXPECT_TRUE(claimant_wins(&g.chain, g.h[3], kGateBits));        // control: credited
+}
+
+// The retarget window's first block is the anchor itself (anchor 95, parent
+// 103, interval 8: back 8 to 95): the anchor carries no header, so nullopt.
+// One above (anchor 94): 95 is a real header, timespan t103 - t95 = 80 s
+// clamps to 300 s, target / 4: 0x1f1fffff.
+TEST(LtcHeadScoreBlockSolution, WindowFirstBlockIsTheAnchor) {
+    for (uint32_t anchor_h : {95u, 94u}) {
+        HeaderChain chain{gate_params()};
+        ASSERT_TRUE(chain.init());
+        uint256 prev = hx("a0c4");
+        chain.set_dynamic_checkpoint(anchor_h, prev);
+        for (uint32_t ht = anchor_h + 1, i = 1; ht <= 103; ++ht, ++i) {
+            auto hdr = mined_child(prev, 300 + ht, kGateT0 + 10 * i);
+            ASSERT_TRUE(chain.add_header(hdr));
+            prev = hash_of(hdr);
+        }
+        ASSERT_EQ(chain.height(), 103u);
+        const auto r = chain.expected_bits_after(prev, kGateT0 + 1000);
+        if (anchor_h == 95)
+            EXPECT_FALSE(r.has_value()) << "window first block is the anchor";
+        else
+            EXPECT_EQ(r, std::optional<uint32_t>(kGateHard)) << "window first block one above the anchor";
+    }
+}
+
+// Testnet min-difficulty (Litecoin Core GetNextWorkRequired, fPowAllowMin-
+// DifficultyBlocks): a block more than 2 x 150 s after its parent may carry
+// powLimit, which is then the network target and creditable; otherwise the
+// rule walks back over min-difficulty blocks to the last real one. A walk
+// that reaches a fast-start anchor has no answer.
+TEST(LtcHeadScoreBlockSolution, TestnetMinDifficultyBits) {
+    HeaderChain chain{gate_params(true)};
+    ASSERT_TRUE(chain.init());
+    ASSERT_TRUE(chain.add_header(gate_genesis(kGateHard)));
+    std::vector<uint256> h{hash_of(gate_genesis(kGateHard))};
+    for (uint32_t i = 1; i <= 4; ++i) {   // h1, h2 at kGateHard; h3, h4 min-difficulty
+        auto hdr = mined_child(h.back(), 400 + i, kGateT0 + 10 * i, i <= 2 ? kGateHard : kGateBits, true);
+        ASSERT_TRUE(chain.add_header(hdr));
+        h.push_back(hash_of(hdr));
+    }
+    const uint32_t t4 = kGateT0 + 40;
+    EXPECT_EQ(chain.expected_bits_after(h[4], t4 + 301), std::optional<uint32_t>(kGateBits));  // powLimit
+    EXPECT_EQ(chain.expected_bits_after(h[4], t4 + 300), std::optional<uint32_t>(kGateHard));  // walk h4,h3 -> h2
+    EXPECT_EQ(chain.expected_bits_after(h[2], kGateT0 + 30), std::optional<uint32_t>(kGateHard));
+    EXPECT_TRUE(claimant_wins(&chain, h[4], kGateBits, t4 + 301));    // powLimit, late enough: credited
+    EXPECT_FALSE(claimant_wins(&chain, h[4], kGateBits, t4 + 300));   // too early for powLimit
+    EXPECT_TRUE(claimant_wins(&chain, h[4], kGateHard, t4 + 300));    // the walked-back bits
+
+    // From an anchor at 96: 97..99 min-difficulty. The walk from 99 reads 98,
+    // 97, then the anchor: nullopt. Late enough for powLimit, no walk.
+    HeaderChain anchored{gate_params(true)};
+    ASSERT_TRUE(anchored.init());
+    uint256 prev = hx("a0c5");
+    anchored.set_dynamic_checkpoint(96, prev);
+    for (uint32_t i = 1; i <= 3; ++i) {
+        auto hdr = mined_child(prev, 500 + i, kGateT0 + 10 * i, kGateBits, true);
+        ASSERT_TRUE(anchored.add_header(hdr));
+        prev = hash_of(hdr);
+    }
+    EXPECT_FALSE(anchored.expected_bits_after(prev, kGateT0 + 40).has_value());
+    EXPECT_EQ(anchored.expected_bits_after(prev, kGateT0 + 30 + 301), std::optional<uint32_t>(kGateBits));
+}
+
+// An old parent answers its own historic bits, so the credit is bounded to
+// parents at most BLOCK_CREDIT_MAX_PARENT_DEPTH (6) below our tip. The chain
+// retargets 4x harder at height 8 (h8..h11 at 0x1f1fffff), tip h11: the
+// pre-retarget easy bits are refused on the tip, on an ancient parent (h3,
+// 8 below) and on genesis; on h5 (tip - 6, whose next bits really are the
+// easy ones) they are credited, on h4 (tip - 7) not.
+TEST(LtcHeadScoreBlockSolution, AncientParentGetsNoCredit) {
+    HeaderChain chain{gate_params()};
+    ASSERT_TRUE(chain.init());
+    ASSERT_TRUE(chain.add_header(gate_genesis()));
+    std::vector<uint256> h{hash_of(gate_genesis())};
+    for (uint32_t i = 1; i <= 11; ++i) {
+        auto hdr = mined_child(h.back(), 600 + i, kGateT0 + 10 * i, i >= 8 ? kGateHard : kGateBits);
+        ASSERT_TRUE(chain.add_header(hdr));
+        h.push_back(hash_of(hdr));
+    }
+    ASSERT_EQ(chain.height(), 11u);
+    const uint32_t D = ltc::BLOCK_CREDIT_MAX_PARENT_DEPTH;
+    ASSERT_EQ(D, 6u);
+    EXPECT_EQ(chain.expected_bits_after(h[7], kGateT0 + 80), std::optional<uint32_t>(kGateHard));
+    EXPECT_EQ(chain.expected_bits_after(h[3], kGateT0 + 40), std::optional<uint32_t>(kGateBits));  // unbounded
+    EXPECT_FALSE(chain.expected_bits_after(h[3], kGateT0 + 40, D).has_value());                   // 8 below
+    EXPECT_EQ(chain.expected_bits_after(h[5], kGateT0 + 60, D), std::optional<uint32_t>(kGateBits)); // tip - 6
+    EXPECT_FALSE(chain.expected_bits_after(h[4], kGateT0 + 50, D).has_value());                   // tip - 7
+
+    EXPECT_TRUE(claimant_wins(&chain, h[11], kGateHard));    // honest, on the tip
+    EXPECT_FALSE(claimant_wins(&chain, h[11], kGateBits));   // fake easy bits on the tip
+    EXPECT_FALSE(claimant_wins(&chain, h[3], kGateBits));    // same bits, ancient parent
+    EXPECT_FALSE(claimant_wins(&chain, h[0], kGateBits));    // same bits, genesis parent
+    EXPECT_TRUE(claimant_wins(&chain, h[5], kGateBits));     // tip - K: credited
+    EXPECT_FALSE(claimant_wins(&chain, h[4], kGateBits));    // tip - K - 1: not
 }

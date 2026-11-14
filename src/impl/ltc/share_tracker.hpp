@@ -142,7 +142,8 @@ inline int32_t head_punish_reason(bool is_block_solution, int32_t naughty)
 /// share whose header bits ARE the network target for its parent block:
 /// expected_bits is that target as our coin header chain computes it
 /// (HeaderChain::expected_bits_after), nullopt when the parent is unknown,
-/// off our best chain, or the retarget window is incomplete. p2pool takes the
+/// off our best chain, more than BLOCK_CREDIT_MAX_PARENT_DEPTH below our tip,
+/// or the retarget window is incomplete. p2pool takes the
 /// share's own header bits on trust (data.py:1691), so a share claiming an
 /// easy block target would win every same-parent race and tie a one-share-
 /// longer branch; here it gets no credit and scores as a plain share.
@@ -151,6 +152,17 @@ inline bool block_solution_credit(bool is_block_solution, uint32_t header_bits,
 {
     return is_block_solution && expected_bits.has_value() && *expected_bits == header_bits;
 }
+
+/// How far below our LTC header-chain tip a block-solution share's parent
+/// may be and still be credited (0: the parent is the tip). Share
+/// verification never checks a share's header previous_block, and an old
+/// best-chain parent answers its own historic bits, possibly far easier
+/// than today's (genesis-era bits with a header chain from genesis): an
+/// unbounded oracle would credit any share naming an old parent. A real
+/// solution's parent is the tip when it is mined, one below once its block
+/// connects; 6 blocks (~15 min) also covers a late share or a lagging
+/// header chain. The coin-side oracle (main_ltc) applies it.
+inline constexpr uint32_t BLOCK_CREDIT_MAX_PARENT_DEPTH = 6;
 
 /// p2pool Phase 4 head key. work is the verified work up to the head's 5th
 /// parent; attempts is ata(target) of the head itself (its index `work`).
