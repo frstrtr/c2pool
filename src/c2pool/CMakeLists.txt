@@ -436,6 +436,13 @@ target_link_libraries(c2pool-bip110
     Threads::Threads
 )
 
+# Linux release packages (release.yml, linux job): each of these six binaries
+# ships at the root of its tarball with its shared-library closure in lib/, so
+# the loader must look in $ORIGIN/lib (cmake/LinuxPackageRunpath.cmake).
+foreach (_pkg_exe c2pool-ltc c2pool-btc c2pool-dgb c2pool-bch c2pool-dash c2pool-bip110)
+    c2pool_linux_package_runpath(${_pkg_exe} "$ORIGIN/lib")
+endforeach()
+
 # Dashboard assets: the shared coin-generic WebServer serves the web-static/
 # frontend from a CWD-relative "web-static" dir (core::WebServer::set_dashboard_dir,
 # same convention btc/dgb/dash use — no lane compiles it into the binary). On the
