@@ -1402,6 +1402,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         test_dash_tx_serve_referee.cpp
         test_dash_submit_gate_scaling.cpp
         test_dash_serve_staleness_seam.cpp
+        test_dash_share_gate_frozen_bits.cpp
         test_dash_serve_staleness_unit.cpp
         test_dash_gbt_quorum_staleness.cpp
         ${CMAKE_SOURCE_DIR}/src/impl/dash/coin/zmq_tip_notify.cpp)
