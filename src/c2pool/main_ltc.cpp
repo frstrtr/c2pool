@@ -329,6 +329,7 @@ static void segfault_handler(int sig) {
 #include <impl/ltc/coin/header_chain.hpp>
 #include <impl/ltc/coin/mempool.hpp>
 #include <impl/ltc/coin/mweb_builder.hpp>
+#include <c2pool/ltc/mweb_topology_state.hpp>
 #include <impl/ltc/coin/template_builder.hpp>
 
 #include <boost/asio.hpp>
@@ -6265,7 +6266,8 @@ int main(int argc, char* argv[]) {
             // surface embedded-daemon synced/tip. Web/diagnostic layer only.
             web_server.get_mining_interface()->set_node_topology_fn(
                 [coin_peer_sources, &ltc_utxo_cache, &embedded_chain,
-                 &doge_utxo_ptr, blockchain]() {
+                 &doge_utxo_ptr, blockchain,
+                 work_mi = web_server.get_mining_interface()]() {
                 auto upcase = [](std::string s) {
                     for (auto& ch : s)
                         if (ch >= 'a' && ch <= 'z') ch = static_cast<char>(ch - 32);
@@ -6321,6 +6323,7 @@ int main(int argc, char* argv[]) {
                     e["peers"]    = 0;
                     coins.push_back(std::move(e));
                 }
+                c2pool::ltc::add_mweb_topology_state(coins, work_mi->get_work_snapshot());
                 nlohmann::json r = nlohmann::json::object();
                 r["node_symbol"]   = primary;
                 r["source"]        = "stats_provider";

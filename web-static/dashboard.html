@@ -3647,9 +3647,20 @@
                 }
                 var tip = (c.height != null && c.height > 0)
                     ? ' &nbsp;&middot;&nbsp; tip ' + c.height : '';
+                // MWEB state of the LTC work template. Only rendered when the
+                // backend reports it: before the first template there is no state.
+                var mweb = '';
+                if (typeof c.mweb_active === 'boolean') {
+                    if (c.mweb_degraded === true)
+                        mweb = ' &nbsp;&middot;&nbsp; <span style="color:#e90;" title="Serving work without MWEB state for the tip: LTC blocks are refused until it arrives">MWEB degraded</span>';
+                    else if (c.mweb_active)
+                        mweb = ' &nbsp;&middot;&nbsp; <span style="color:#3c3;">MWEB active</span>';
+                    else
+                        mweb = ' &nbsp;&middot;&nbsp; <span style="opacity:0.8;">MWEB inactive</span>';
+                }
                 return '<div><strong>' + c.coin + '</strong>' + tagStr +
                        ' &nbsp;&middot;&nbsp; ' + peers + ' peer' + (peers === 1 ? '' : 's') +
-                       sync + hsync + tip + nowork + '</div>';
+                       sync + hsync + tip + mweb + nowork + '</div>';
             }).join('');
             document.getElementById('node_topology_coins').innerHTML = rows;
             d3.select('#node_topology_symbol').text(t.node_symbol ? '(' + t.node_symbol + ')' : '');
