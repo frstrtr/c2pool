@@ -3264,8 +3264,12 @@
                 legendNative: 'V36 (others)', legendSignaling: 'V36 signaling',
                 legendStale: 'V35 only'
             },
+            // DASH's share version is the network's: V16 on the legacy chain,
+            // V36 on the v36 network. fromLive: the labels and the cutoff
+            // follow /v36_status auto_ratchet.live_share_version once it is
+            // known (liveShareVersionDescriptor); V16 is the default until then.
             DASH: {
-                threshold: 16, signaling: false,
+                threshold: 16, signaling: false, fromLive: true,
                 statNative: 'V16 Current', statSignaling: null,
                 legendNative: 'V16 (others)', legendSignaling: null,
                 legendStale: 'Below V16'
@@ -3284,6 +3288,48 @@
         function shareVersionDescriptor(sym) {
             return SHARE_VERSION_DESCRIPTORS[(sym || '').toUpperCase()]
                 || SHARE_VERSION_DESCRIPTORS.LTC;
+        }
+        // BEGIN c2pLiveShareVersion (tested by sharechain-explorer/tests/unit/dashboard-window-blocks.test.ts)
+        // A fromLive descriptor (DASH) named after the live share version:
+        // "V36 Current" / "V36 (others)" / "Below V36" on a V36 chain. Any
+        // other descriptor, or no live version yet, is returned unchanged.
+        function liveShareVersionDescriptor(base, live) {
+            if (!base || !base.fromLive || typeof live !== 'number' || !(live > 0)) return base;
+            return {
+                threshold: live, signaling: false, fromLive: true,
+                statNative: 'V' + live + ' Current', statSignaling: null,
+                legendNative: 'V' + live + ' (others)', legendSignaling: null,
+                legendStale: 'Below V' + live
+            };
+        }
+        // END c2pLiveShareVersion
+        // The live share version from /v36_status (null until it arrives).
+        window.__liveShareVersion = null;
+        // Write a descriptor's stat/legend labels and make it the active one.
+        function applyShareVersionDescriptor(vdesc) {
+            window.__shareVersionDescriptor = vdesc;
+            function setText(id, txt) {
+                var el = document.getElementById(id);
+                if (el && typeof txt === 'string') el.textContent = txt;
+            }
+            setText('stat-native-label', vdesc.statNative);
+            setText('legend-native-label', vdesc.legendNative);
+            setText('legend-stale-label', vdesc.legendStale);
+            var sr = document.getElementById('stat-signaling-row');
+            var li = document.getElementById('legend-signaling-item');
+            if (vdesc.signaling) {
+                setText('stat-signaling-label', vdesc.statSignaling);
+                setText('legend-signaling-label', vdesc.legendSignaling);
+                if (sr) sr.style.display = '';
+                if (li) li.style.display = '';
+            } else {
+                // No pending version boundary — hide signaling stat + legend.
+                if (sr) sr.style.display = 'none';
+                if (li) li.style.display = 'none';
+            }
+            // Payouts version-column header follows the coin threshold too
+            // (LTC family keeps "V36?", DASH renders its live version).
+            setText('payouts-version-th', 'V' + vdesc.threshold + '?');
         }
         // Effective descriptor for the active coin; defaults to LTC until
         // currency_info resolves. Read by defrag.updateStats for the
@@ -3362,32 +3408,8 @@
             // Drives the native/signaling/stale entries off the coin's own
             // version descriptor so a coin without LTC's V35->V36 crossing
             // (e.g. DASH's V16 tip) never renders LTC's version scheme.
-            var vdesc = shareVersionDescriptor(sym);
-            window.__shareVersionDescriptor = vdesc;
-            function setText(id, txt) {
-                var el = document.getElementById(id);
-                if (el && typeof txt === 'string') el.textContent = txt;
-            }
-            setText('stat-native-label', vdesc.statNative);
-            setText('legend-native-label', vdesc.legendNative);
-            setText('legend-stale-label', vdesc.legendStale);
-            if (vdesc.signaling) {
-                setText('stat-signaling-label', vdesc.statSignaling);
-                setText('legend-signaling-label', vdesc.legendSignaling);
-                var sr = document.getElementById('stat-signaling-row');
-                if (sr) sr.style.display = '';
-                var li = document.getElementById('legend-signaling-item');
-                if (li) li.style.display = '';
-            } else {
-                // No pending version boundary — hide signaling stat + legend.
-                var sr2 = document.getElementById('stat-signaling-row');
-                if (sr2) sr2.style.display = 'none';
-                var li2 = document.getElementById('legend-signaling-item');
-                if (li2) li2.style.display = 'none';
-            }
-            // Payouts version-column header follows the coin threshold too
-            // (LTC family keeps "V36?", DASH renders "V16?").
-            setText('payouts-version-th', 'V' + vdesc.threshold + '?');
+            applyShareVersionDescriptor(
+                liveShareVersionDescriptor(shareVersionDescriptor(sym), window.__liveShareVersion));
 
             d3.select('#parent_chain_peers_title').text(chainName);
             if (info && info.block_period) {
@@ -3513,6 +3535,14 @@
             var pct = sc.v36_percentage;          // work-weighted signalling %
             var live = ar.live_share_version;
             var active = ar.v36_active;
+            if (typeof live === 'number' && live !== window.__liveShareVersion) {
+                window.__liveShareVersion = live;
+                var csym = (window.currency_info && window.currency_info.symbol) || '';
+                if (csym) {
+                    var cbase = shareVersionDescriptor(csym);
+                    if (cbase.fromLive) applyShareVersionDescriptor(liveShareVersionDescriptor(cbase, live));
+                }
+            }
             // Visibility gate (operator design point on #921): show the crossing card
             // ONLY while a cross is genuinely underway or done. A quiet pre-crossing
             // node (voting, 0% signalled, not latched) must not render a card at all --
@@ -4527,6 +4557,9 @@
         
         function loadBlocks() {
             d3.json('../recent_blocks', function(blocks) {
+                // The window panel's "Blocks in Window" reads the whole ledger
+                // (c2pWindowBlocks), not only the 10 rows the table shows.
+                window.c2pRecentBlocks = blocks || [];
                 d3.select('#blocks_loading').style('display', 'none');
                 // Clear existing rows before adding new data
                 d3.select('#blocks tbody').selectAll('tr').remove();
@@ -5790,6 +5823,52 @@
             return tipShort || '';
         }
         // END c2pBlockMarks
+        // BEGIN c2pWindowBlocks (tested by sharechain-explorer/tests/unit/dashboard-window-blocks.test.ts)
+        // "Blocks in Window": the blocks found since the oldest share in the
+        // window. The window marks the blocks whose solving share is among its
+        // shares (c2pMarkBlocks). The found-block ledger (/recent_blocks, the
+        // rows the hashrate chart marks) also has blocks whose solving share
+        // is NOT on the best sharechain: a same-parent sibling share won the
+        // head race, so the block is on the coin chain but its share is an
+        // orphaned head the grid cannot show. Those are counted apart
+        // ("off-chain") instead of silently missing, so the panel and the
+        // chart agree. Ledger rows of another chain (a merged child) are left
+        // to their own counter. A share without its full hash (an older node)
+        // is matched on the 16-hex short hash. Keys follow c2pShareKey.
+        function c2pWindowBlocks(blocks, shares, set, sym) {
+            var onChain = {}, inFull = {}, inShort = {}, oldest = Infinity;
+            (shares || []).forEach(function(s) {
+                if (s.H) inFull[s.H] = true;
+                else if (s.h) inShort[s.h] = true;
+                if (set && set[c2pShareKey(s)]) onChain[c2pShareKey(s)] = true;
+                if (typeof s.t === 'number' && s.t > 0 && s.t < oldest) oldest = s.t;
+            });
+            var offChain = 0, seen = {};
+            (blocks || []).forEach(function(b) {
+                if (!b || typeof b.ts !== 'number' || !(b.ts >= oldest)) return;
+                if (b.chain && sym && String(b.chain).toUpperCase() !== String(sym).toUpperCase()) return;
+                var key = b.share || b.hash;
+                if (!key || seen[key]) return;
+                seen[key] = true;
+                var hit = inFull[key] ? key
+                        : (b.hash && inFull[b.hash]) ? b.hash
+                        : inShort[key.substr(0, 16)] ? key.substr(0, 16)
+                        : null;
+                if (hit) onChain[hit] = true;
+                else offChain++;
+            });
+            var on = Object.keys(onChain).length;
+            return { total: on + offChain, onChain: on, offChain: offChain,
+                     oldest: oldest === Infinity ? null : oldest };
+        }
+        // "<n> <SYM>", plus "(<k> by off-chain share[s])" when k > 0.
+        function c2pWindowBlocksText(r, sym) {
+            var t = r.total + ' ' + sym;
+            if (r.offChain > 0)
+                t += ' (' + r.offChain + ' by off-chain share' + (r.offChain === 1 ? '' : 's') + ')';
+            return t;
+        }
+        // END c2pWindowBlocks
         function blockMarkKind(isPrimary, isChild) {
             if (isPrimary && isChild) return 'twin';
             if (isPrimary) return 'primary';
@@ -7370,7 +7449,7 @@
             updateStats: function(data) {
                 var shares = data.shares || [];
                 var mine = 0, stale = 0, dead = 0, verified = 0, fee = 0, v36sig = 0, v36native = 0;
-                var ltcBlocks = 0, dogeBlocks = 0;
+                var dogeBlocks = 0;
                 var self = this;
                 // Native-version threshold is coin-specific (LTC=36, DASH=16);
                 // read it from the active coin's share-version descriptor.
@@ -7383,7 +7462,6 @@
                     if (s.fee) fee++;
                     if (s.V >= vthr) v36native++;
                     else if (s.dv && s.dv >= vthr) v36sig++;
-                    if (c2pIsBlockShare(self.blockSet, s)) ltcBlocks++;
                     if (self.dogeSet[s.h]) dogeBlocks++;
                 });
 
@@ -7407,33 +7485,43 @@
                 // have none, so no "/ 0 DOGE" tail leaks onto them.
                 var ci = currency_info || {};
                 var psym = ci.symbol || 'COIN';
-                var blocksText = ltcBlocks + ' ' + psym;
+                // Blocks since the oldest window share: the window's own block
+                // shares plus the ledger's blocks whose share is off the best
+                // sharechain, shown apart (the hashrate chart marks both).
+                var wb = c2pWindowBlocks(window.c2pRecentBlocks, shares, self.blockSet, psym);
+                var blocksText = c2pWindowBlocksText(wb, psym);
                 if (ci.merged_child_symbol) {
                     blocksText += ' / ' + dogeBlocks + ' ' + ci.merged_child_symbol;
                 }
                 document.getElementById('defrag-blocks').textContent = blocksText;
-                setBlocksScopeTitle(shares);
+                setBlocksScopeTitle(shares, wb);
                 document.getElementById('defrag-fee').textContent = fee;
                 document.getElementById('defrag-v36native').textContent = v36native;
                 document.getElementById('defrag-v36sig').textContent = v36sig;
             }
         };
 
-        // "Blocks in Window" counts the shares IN THE SHOWN WINDOW that solved
-        // a block — the same scope as Shares / Verified / Orphan above it, not
-        // the node's whole found-block history. The window covers the last
-        // window_size shares, so its time span depends on the share rate;
-        // the tooltip states the actual span.
-        function setBlocksScopeTitle(shares) {
+        // "Blocks in Window" counts the blocks found since the oldest share IN
+        // THE SHOWN WINDOW — the same scope as Shares / Verified / Orphan above
+        // it, not the node's whole found-block history. A block whose solving
+        // share is off the best sharechain is counted too, and named apart
+        // (c2pWindowBlocks). The window covers the last window_size shares, so
+        // its time span depends on the share rate; the tooltip states it.
+        function setBlocksScopeTitle(shares, wb) {
             var n = shares ? shares.length : 0;
             var span = '';
             if (n > 1 && shares[0].t && shares[n - 1].t) {
                 var hrs = Math.abs(shares[0].t - shares[n - 1].t) / 3600;
                 span = ' (spanning ' + (hrs >= 1 ? hrs.toFixed(1) + ' h' : Math.round(hrs * 60) + ' min') + ')';
             }
-            var title = 'Shares that solved a block, counted over the ' + n
-                + ' shares in this window' + span + '. Blocks found before the'
-                + ' oldest share in the window are not counted.';
+            var title = 'Blocks found since the oldest of the ' + n
+                + ' shares in this window' + span + '.';
+            if (wb && wb.offChain > 0)
+                title += ' ' + wb.onChain + ' were solved by shares in this window; '
+                    + wb.offChain + ' by shares that are not on the best sharechain'
+                    + ' (a same-parent sibling share won the head race), so the grid'
+                    + ' does not show them.';
+            title += ' Blocks found before the oldest share in the window are not counted.';
             var l = document.getElementById('defrag-blocks-label');
             var v = document.getElementById('defrag-blocks');
             if (l) l.title = title;
@@ -10338,12 +10426,15 @@
                             // parent (LTC->DOGE), never on DASH/BTC/DGB.
                             var bci = window.currency_info || {};
                             var bsym = bci.symbol || 'COIN';
-                            var bt = s.primaryBlocks + ' ' + bsym;
+                            var bwb = c2pWindowBlocks(window.c2pRecentBlocks, state.window.shares, null, bsym);
+                            var bwr = { total: s.primaryBlocks + bwb.offChain,
+                                        onChain: s.primaryBlocks, offChain: bwb.offChain };
+                            var bt = c2pWindowBlocksText(bwr, bsym);
                             if (bci.merged_child_symbol) {
                                 bt += ' / ' + s.dogeBlocks + ' ' + bci.merged_child_symbol;
                             }
                             statEls.blocks.textContent = bt;
-                            setBlocksScopeTitle(state.window.shares);
+                            setBlocksScopeTitle(state.window.shares, bwr);
                         }
                     }
                     window.addEventListener('beforeunload', function() {
