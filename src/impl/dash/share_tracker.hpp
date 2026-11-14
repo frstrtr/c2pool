@@ -132,6 +132,20 @@ inline int32_t head_punish_reason(bool is_block_solution, int32_t naughty)
     return 0;
 }
 
+/// The block-solution credit (head_punish_reason's -1) is granted only for a
+/// share whose header bits ARE the network target for its parent block:
+/// expected_bits is that target as our coin header chain computes it
+/// (HeaderChain::expected_bits_after), nullopt when the parent is unknown,
+/// off our best chain, or the retarget window is incomplete. p2pool takes the
+/// share's own header bits on trust (data.py:1691), so a share claiming an
+/// easy block target would win every same-parent race and tie a one-share-
+/// longer branch; here it gets no credit and scores as a plain share.
+inline bool block_solution_credit(bool is_block_solution, uint32_t header_bits,
+                                  std::optional<uint32_t> expected_bits)
+{
+    return is_block_solution && expected_bits.has_value() && *expected_bits == header_bits;
+}
+
 /// p2pool Phase 4 head key. work is the verified work up to the head's 5th
 /// parent; attempts is ata(target) of the head itself (its index `work`).
 /// work - min(punish,1)*attempts: a punished head (punish > 0) is one share
@@ -447,6 +461,12 @@ public:
     std::function<void(const uint256&)> m_on_share_verified;
     // Callback fired when a verified share meets the block target (found block)
     std::function<void(const uint256&)> m_on_block_found;
+    // Head scoring's block-solution credit: the bits a block on top of
+    // `prev_block` at `block_time` must carry, from the coin header chain
+    // (HeaderChain::expected_bits_after); nullopt when unknown. Unset (tests,
+    // tools, a node with no header chain) => no block-solution credit at all.
+    std::function<std::optional<uint32_t>(const uint256& prev_block, int64_t block_time)>
+        m_expected_block_bits;
     // Callback fired when a verified share meets a merged chain target (DOGE block)
     // Args: share_hash, pow_hash (for target comparison by caller)
     std::function<void(const uint256&, const uint256&)> m_on_merged_block_check;
@@ -1496,6 +1516,26 @@ public:
             }
         }
 
+        // The block-solution credit of a share, checked against the network
+        // target once per think() cycle (Phase 4 heads, Phase 5 walk-back).
+        std::map<uint256, bool> block_credit_cache;
+        auto block_credit_of = [&](const uint256& h, const auto* idx) -> bool {
+            if (!idx || !idx->is_block_solution || !m_expected_block_bits) return false;
+            auto it = block_credit_cache.find(h);
+            if (it != block_credit_cache.end()) return it->second;
+            uint256 prev_block;
+            uint32_t bits = 0, ts = 0;
+            chain.get_share(h).invoke([&](auto* obj) {
+                prev_block = obj->m_min_header.m_previous_block;
+                bits = obj->m_min_header.m_bits;
+                ts = obj->m_min_header.m_timestamp;
+            });
+            const bool ok = block_solution_credit(true, bits,
+                m_expected_block_bits(prev_block, static_cast<int64_t>(ts)));
+            block_credit_cache.emplace(h, ok);
+            return ok;
+        };
+
         // Phase 4: Score heads within the best tail — pick the best head
         std::vector<DecoratedData<HeadScore>> decorated_heads;
         std::vector<DecoratedData<TraditionalScore>> traditional_sort;
@@ -1523,12 +1563,14 @@ public:
                     int64_t ts = head_idx->time_seen;
 
                     // p2pool should_punish_reason (head_punish_reason): a
-                    // block solution is -1, ahead of a naughty head (> 0).
-                    // F10/(b): the non-canonical 95%-version-obsolescence punish
-                    // is dropped — the version gate is the check() 60% weighted
-                    // switch rule (share_check), not head-scoring.
+                    // block solution is -1, ahead of a naughty head (> 0), but
+                    // only with header bits bound to the network target
+                    // (block_credit_of). F10/(b): the non-canonical
+                    // 95%-version-obsolescence punish is dropped — the version
+                    // gate is the check() 60% weighted switch rule
+                    // (share_check), not head-scoring.
                     const int32_t reason =
-                        head_punish_reason(head_idx->is_block_solution, head_idx->naughty);
+                        head_punish_reason(block_credit_of(hh, head_idx), head_idx->naughty);
 
                     // p2pool: sort key = ((work - min(punish,1)*ata(target), -punish, -time_seen), h)
                     // peer_addr is None is COMMENTED OUT in p2pool — no is_local dimension.
@@ -1558,13 +1600,15 @@ public:
         {
             // Check if best share should be punished
             auto* best_idx = chain.get_index(best);
-            auto punish_of = [](const auto* idx) {
-                return idx ? head_punish_reason(idx->is_block_solution, idx->naughty) : 0;
+            auto punish_of = [&](const uint256& h) -> int32_t {
+                auto* idx = chain.get_index(h);
+                if (!idx) return 0;
+                return head_punish_reason(block_credit_of(h, idx), idx->naughty);
             };
-            if (punish_of(best_idx) > 0)
+            if (punish_of(best) > 0)
             {
                 // Walk back through punished shares (p2pool: while punish > 0)
-                while (punish_of(best_idx) > 0)
+                while (punish_of(best) > 0)
                 {
                     uint256 prev;
                     chain.get_share(best).invoke([&](auto* obj) {
@@ -1577,7 +1621,7 @@ public:
                     // p2pool: if not punish, find best descendent. Exactly 0:
                     // a block-solution parent (-1) ends the walk-back without
                     // descending (the loop condition is punish > 0).
-                    if (best_idx && punish_of(best_idx) == 0)
+                    if (best_idx && punish_of(best) == 0)
                     {
                         // Find deepest non-naughty child via reverse map
                         std::function<std::pair<int,uint256>(const uint256&, int)> best_desc;
@@ -1603,7 +1647,7 @@ public:
                     }
                 }
             }
-            punish_val = punish_of(best_idx);
+            punish_val = punish_of(best);
         }
 
         // Phase 6: Compute cutoffs for desired shares filtering

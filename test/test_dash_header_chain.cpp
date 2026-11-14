@@ -907,3 +907,51 @@ TEST(DashHeaderChain, TestnetMinDifficultyBitsFollowTheBlockTime)
     EXPECT_EQ(dgw_bits_for_block_time(dgw, prev_bits, prev_time, prev_time + 7201, mn), dgw);
     EXPECT_EQ(dgw_bits_for_block_time(dgw, prev_bits, prev_time, prev_time + 605, mn), dgw);
 }
+
+// Head scoring's block-solution credit asks the header chain for the network
+// target of a block on top of a given parent (expected_bits_after): for any
+// parent on our best chain, not only the tip; nothing for an unknown parent,
+// a parent off the best chain, or an incomplete retarget window (where
+// dark_gravity_wave would answer powLimit, which is no target to check
+// against).
+TEST(DashHeaderChain, ExpectedBitsAfterAnyBestChainParent)
+{
+    auto mc = build_mined_chain(30, 1'800'000'000u);
+    auto& hc = *mc.hc;
+    const int64_t t = mc.tip_time + 150;
+
+    // The tip: the same answer as next_work_required_at.
+    const auto at_tip = hc.expected_bits_after(mc.hashes[30], t);
+    ASSERT_TRUE(at_tip.has_value());
+    EXPECT_EQ(*at_tip, hc.next_work_required_at(mc.hashes[30], t));
+
+    // A parent below the tip: DGW over the window ending at it, with its own
+    // bits and time for the min-difficulty rule.
+    const auto p29 = hc.get_header(mc.hashes[29]);
+    ASSERT_TRUE(p29.has_value());
+    const int64_t t29 = static_cast<int64_t>(p29->header.m_timestamp) + 150;
+    const auto below = hc.expected_bits_after(mc.hashes[29], t29);
+    ASSERT_TRUE(below.has_value());
+    auto anc = [&](uint32_t hh) { return hc.get_header_by_height(hh); };
+    EXPECT_EQ(*below, dgw_bits_for_block_time(dark_gravity_wave(anc, 29, mc.params),
+                                              p29->header.m_bits, p29->header.m_timestamp,
+                                              t29, mc.params));
+
+    // Unknown parent.
+    uint256 unknown;
+    unknown.SetHex("ab");
+    EXPECT_FALSE(hc.expected_bits_after(unknown, t).has_value());
+
+    // Fewer than DGW_PAST_BLOCKS headers ending at the parent.
+    EXPECT_FALSE(hc.expected_bits_after(mc.hashes[10], t).has_value());
+    EXPECT_FALSE(hc.expected_bits_after(mc.hashes[22], t).has_value());
+    EXPECT_TRUE(hc.expected_bits_after(mc.hashes[24], t).has_value()) << "heights 1..24: a full window";
+
+    // A parent off the best chain: a mined sibling of hashes[29].
+    const auto fork = mine_header(mc.hashes[28], p29->header.m_timestamp + 1,
+                                  mc.params.pow_limit.GetCompact(), mc.params.pow_limit);
+    ASSERT_TRUE(hc.add_header(fork));
+    ASSERT_TRUE(hc.has_header(x11_hash(fork)));
+    EXPECT_EQ(hc.get_header_by_height(30)->hash, mc.hashes[30]) << "the tip did not move";
+    EXPECT_FALSE(hc.expected_bits_after(x11_hash(fork), t).has_value());
+}

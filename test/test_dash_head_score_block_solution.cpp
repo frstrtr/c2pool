@@ -25,25 +25,31 @@
 #include <core/uint256.hpp>
 
 #include <algorithm>
+#include <optional>
 #include <string>
 #include <vector>
 
 using dash::DecoratedData;
 using dash::HeadScore;
 using dash::TraditionalScore;
+using dash::block_solution_credit;
 using dash::head_punish_reason;
 using dash::make_head_score;
 using dash::make_traditional_score;
 
 namespace {
 
+constexpr uint32_t NET_BITS = 0x1923269b;   // the network target for the parent (11-14)
+
 struct Head {
     std::string hex;        // share hash, big-endian hex as logged
     uint64_t work;          // verified work up to the 5th parent
     uint64_t attempts;      // ata(target) of the head itself
     int64_t time_seen;      // whole seconds, as the index keeps it
-    bool block = false;
+    bool block = false;     // is_block_solution (PoW meets the header's bits)
     int32_t naughty = 0;
+    uint32_t header_bits = NET_BITS;                    // the share header's block bits
+    std::optional<uint32_t> expected = NET_BITS;        // header chain's target for the parent
 };
 
 uint256 h(const std::string& hex)
@@ -59,8 +65,9 @@ std::string best_of(const std::vector<Head>& heads)
     std::vector<DecoratedData<HeadScore>> d;
     for (const auto& x : heads) {
         const uint256 hash = h(x.hex);
+        const bool credit = block_solution_credit(x.block, x.header_bits, x.expected);
         d.push_back({make_head_score(uint288(x.work), uint288(x.attempts),
-                                     head_punish_reason(x.block, x.naughty), x.time_seen, hash),
+                                     head_punish_reason(credit, x.naughty), x.time_seen, hash),
                      hash});
     }
     std::sort(d.begin(), d.end());
@@ -169,4 +176,32 @@ TEST(DashHeadScoreBlockSolution, TraditionalSortCarriesTheBlockSolutionPunish)
     std::sort(t.begin(), t.end());
     EXPECT_EQ(t.back().hash, blk) << "traditional: equal work, seen first";
     EXPECT_NE(t.back().score.neg_reason, 0) << "punish_aggressively is set";
+}
+
+// The credit needs the network target. p2pool trusts the share's own header
+// bits; here a share whose header claims an easier target than the one our
+// coin header chain computes for its parent (or whose parent is unknown or
+// off our best chain: no expected bits) gets no credit and scores as a plain
+// share. Otherwise any peer could mark every share a "block solution".
+TEST(DashHeadScoreBlockSolution, CreditNeedsTheNetworkTargetForTheParent)
+{
+    EXPECT_TRUE(block_solution_credit(true, NET_BITS, NET_BITS));
+    EXPECT_FALSE(block_solution_credit(true, 0x1f00ffff, NET_BITS)) << "fake easy bits";
+    EXPECT_FALSE(block_solution_credit(true, NET_BITS, std::nullopt)) << "parent unknown / off chain";
+    EXPECT_FALSE(block_solution_credit(false, NET_BITS, NET_BITS)) << "not a block solution";
+}
+
+TEST(DashHeadScoreBlockSolution, FakeEasyBitsWinNoRace)
+{
+    const std::string fake = pad("aa");
+    const std::string sib = pad("bb");
+    Head f{fake, W, A, 100, true};
+    f.header_bits = 0x1f00ffff;     // meets its own (easy) bits: is_block_solution
+    EXPECT_EQ(best_of({f, {sib, W, A, 100}}), h(sib).GetHex())
+        << "no credit: the full tie goes to the larger hash";
+    EXPECT_EQ(best_of({f, {pad("01"), W + A, A, 100}}), h(pad("01")).GetHex())
+        << "no credit: a one-share-longer branch wins";
+    Head u{fake, W, A, 100, true};
+    u.expected = std::nullopt;      // parent unknown to our header chain
+    EXPECT_EQ(best_of({u, {sib, W, A, 100}}), h(sib).GetHex());
 }

@@ -438,6 +438,31 @@ public:
                                        block_time, m_params);
     }
 
+    /// The bits a block on top of `prev_hash` must carry at `block_time`
+    /// (Dash Core GetNextWorkRequired(pindexPrev, pblock)) for any `prev_hash`
+    /// on our best chain, not only the tip. nullopt when `prev_hash` is
+    /// unknown, off the best chain, or any of the DGW_PAST_BLOCKS headers
+    /// ending at it is missing (below a fast-start anchor): dark_gravity_wave
+    /// would answer powLimit there, which is no network target to check
+    /// against.
+    std::optional<uint32_t> expected_bits_after(const uint256& prev_hash, int64_t block_time) const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        auto it = m_headers.find(prev_hash);
+        if (it == m_headers.end()) return std::nullopt;
+        const uint32_t h = it->second.height;
+        auto at = m_height_index.find(h);
+        if (at == m_height_index.end() || at->second != prev_hash) return std::nullopt;
+        if (h + 1 < static_cast<uint32_t>(DGW_PAST_BLOCKS)) return std::nullopt;
+        for (uint32_t n = 0; n < static_cast<uint32_t>(DGW_PAST_BLOCKS); ++n)
+            if (!get_header_by_height_internal(h - n)) return std::nullopt;
+        auto get_ancestor = [this](uint32_t hh) -> std::optional<IndexEntry> {
+            return this->get_header_by_height_internal(hh);
+        };
+        const uint32_t dgw = dark_gravity_wave(get_ancestor, h, m_params);
+        return dgw_bits_for_block_time(dgw, it->second.header.m_bits, it->second.header.m_timestamp,
+                                       block_time, m_params);
+    }
+
     size_t size() const {
         std::lock_guard<std::mutex> lock(m_mutex);
         return m_headers.size();
