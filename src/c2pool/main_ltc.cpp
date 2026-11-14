@@ -7264,13 +7264,15 @@ int main(int argc, char* argv[]) {
                     target_in.spread = ltc::PoolConfig::SPREAD;
                     target_in.block_bits = bits;
                     // Cap 2's pool rate: over the last hour of shares at the
-                    // prev share, once the chain is that deep.
+                    // prev share, once the chain is that deep; whatever the
+                    // job's local rate (p2pool applies the dust rule at no
+                    // rate too: its expected payout, 0, is below DUST).
                     {
                         auto& trk = *guard;
                         if (!frozen_prev_share.IsNull() && trk.chain.contains(frozen_prev_share)) {
                             int32_t lookbehind = 3600 / ltc::PoolConfig::share_period();
                             auto height = trk.chain.get_acc_height(frozen_prev_share);
-                            if (height > lookbehind && local_hash_rate > 0.0) {
+                            if (height > lookbehind) {
                                 auto pool_aps = trk.get_pool_attempts_per_second(
                                     frozen_prev_share, lookbehind, /*min_work=*/false);
                                 target_in.pool_aps = static_cast<double>(pool_aps.GetLow64());

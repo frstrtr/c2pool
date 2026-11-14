@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <limits>
 #include <core/target_utils.hpp>
@@ -80,7 +81,7 @@ struct JobTargetInputs
     double   local_hash_rate{0.0};   // H/s
     uint32_t share_period{0};        // PoolConfig::share_period()
     // Cap 2 (dust); pool_aps <= 0: not applied (no prev share past the
-    // one-hour lookbehind, or no rate).
+    // one-hour lookbehind).
     double   pool_aps{0.0};          // pool attempts/s over the lookbehind at the prev share
     uint64_t subsidy{0};
     double   donation_percent{0.0};
@@ -96,24 +97,27 @@ struct JobTargetInputs
 //          average_attempts_to_target(local_hash_rate * SHARE_PERIOD / 0.0167);
 //   Cap 2: when its expected payout per block is below DUST,
 //          average_attempts_to_target(block attempts * SPREAD * DUST / subsidy).
-// Both only ever lower (harden) the target. No rate: no cap, the easiest
+// Both only ever lower (harden) the target. Cap 1 needs a rate (p2pool:
+// `if local_hash_rate > 0.0`); Cap 2 does not: at no rate the expected payout
+// is 0, below DUST, and the dust target applies (p2pool work.py 3020-3028
+// runs it whatever the rate). No rate and no chain an hour deep: the easiest
 // target (2**256-1, clipped to pre_target3).
 inline uint256 job_desired_share_target(const JobTargetInputs& in)
 {
     uint256 desired;
     desired.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
-    if (!(in.local_hash_rate > 0.0))
-        return desired;
 
-    const double avg_attempts = in.local_hash_rate * in.share_period / 0.0167;
-    if (avg_attempts > 1.0) {
-        const uint256 cap = average_attempts_to_target(avg_attempts);
-        if (cap < desired)
-            desired = cap;
+    if (in.local_hash_rate > 0.0) {
+        const double avg_attempts = in.local_hash_rate * in.share_period / 0.0167;
+        if (avg_attempts > 1.0) {
+            const uint256 cap = average_attempts_to_target(avg_attempts);
+            if (cap < desired)
+                desired = cap;
+        }
     }
 
     if (in.pool_aps > 0.0) {
-        const double expected_payout = (in.local_hash_rate / in.pool_aps)
+        const double expected_payout = (std::max(in.local_hash_rate, 0.0) / in.pool_aps)
             * static_cast<double>(in.subsidy) * (1.0 - in.donation_percent / 100.0);
         if (expected_payout < static_cast<double>(in.dust_threshold)) {
             // Double arithmetic (no uint288 overflow), the block's attempts
