@@ -251,6 +251,13 @@ jobs:
           head -1 "${PKG}/config/c2pool_mainnet.yaml.example" | grep -qi "${COIN}" || { echo "PKG-ASSERT FAIL: ${PKG} config header does not identify ${COIN}"; exit 1; }
           cp -r web-static/* "${PKG}/web-static/"
           cp explorer/explorer.py "${PKG}/explorer/"
+          # Shipped RUNPATH: the build links $ORIGIN/lib first
+          # (cmake/LinuxPackageRunpath.cmake) and keeps the runner's Conan/build
+          # dirs after it, which the ldd loop above needs to find
+          # libdash_scriptcheck.so. Now that lib/ is complete, drop those runner
+          # paths: c2pool-<coin> -> $ORIGIN/lib, lib/*.so that carry a RUNPATH ->
+          # $ORIGIN. Fails if the binary has no $ORIGIN/lib entry at all.
+          cmake -DPKG_DIR="${PKG}" -P scripts/ci/linux_pkg_normalize_runpath.cmake
           tar czf "${PKG}.tar.gz" "${PKG}/"
 
       # ...and again on the STRIPPED binary that is actually inside the tarball
@@ -272,6 +279,20 @@ jobs:
             *libgmp.so*) echo "  ok   libgmp bundled" ;;
             *) echo "PKG-ASSERT FAIL: libgmp not bundled in ${PKG}/lib (BLS build needs it)"; exit 1 ;;
           esac
+
+      # The tarball as an operator runs it: unpacked to a temp dir and started
+      # WITHOUT start.sh's LD_LIBRARY_PATH (systemd unit, own script). Asserts
+      # RUNPATH $ORIGIN/lib on the binary ($ORIGIN on bundled .so that need a
+      # bundled lib), ldd under env -i resolving every non-glibc dependency
+      # inside lib/ (never a host copy, never "not found"), no runner path left
+      # in any RUNPATH (--strict), and `env -i ./c2pool-<coin> --help` exit 0.
+      # v0.2.12.x shipped without this: the bare binary failed with
+      # "libsecp256k1.so.6: cannot open shared object file" off the runner.
+      - name: Smoke packaged tarball (clean env, no LD_LIBRARY_PATH)
+        if: steps.presence.outputs.exists == '1'
+        run: |
+          bash scripts/ci/smoke-linux-package.sh --strict \
+            "c2pool-${{ matrix.coin }}-${{ steps.ver.outputs.version }}-linux-x86_64.tar.gz"
 
       - name: Upload package
         if: steps.presence.outputs.exists == '1'

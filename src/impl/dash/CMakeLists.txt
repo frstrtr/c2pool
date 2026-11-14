@@ -181,3 +181,5 @@ set_target_properties(dash_scriptcheck PROPERTIES
     VISIBILITY_INLINES_HIDDEN ON
     POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(dash_scriptcheck PRIVATE ${SECP256K1_LIBRARIES})
+# Shipped in the Linux package's lib/ next to the libsecp256k1 it needs.
+c2pool_linux_package_runpath(dash_scriptcheck "$ORIGIN")

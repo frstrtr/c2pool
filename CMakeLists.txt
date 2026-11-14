@@ -6,6 +6,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Reproducible builds: remap source/build/Conan-cache absolute paths in compiled
 # output (docs/xmr-lane/REPRODUCIBLE-BUILD.md). Before any add_subdirectory().
 include(${CMAKE_SOURCE_DIR}/cmake/ReproducibleBuild.cmake)
+# c2pool_linux_package_runpath(): $ORIGIN-relative RUNPATH for the binaries and
+# shared objects the Linux release tarball ships (see the module header).
+include(${CMAKE_SOURCE_DIR}/cmake/LinuxPackageRunpath.cmake)
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Release)
