@@ -286,7 +286,8 @@ nlohmann::json mweb_template(const std::vector<std::pair<std::string, std::strin
 void stub_ref_hash(MiningInterface& mi)
 {
     mi.set_ref_hash_fn([](const uint256&, const std::vector<unsigned char>&,
-                          const std::vector<unsigned char>&, uint64_t, uint32_t, uint32_t,
+                          const std::vector<unsigned char>&, const core::stratum::PayoutKey&,
+                          uint64_t, uint32_t, uint32_t,
                           bool, const std::string&, const uint256&,
                           const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>&,
                           const std::vector<uint256>&) {

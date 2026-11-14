@@ -422,6 +422,14 @@ if (BUILD_TESTING AND GTest_FOUND)
     # goes to the larger hash; Phase 5 walks back only while punish > 0; a
     # merged-only (DOGE) solution earns nothing. REAL ShareTracker::think().
     # Same folding rule.
+    #
+    # node_fee_job_target_test.cpp: --fee pays the operator the fee. A node-fee
+    # job (decide_job_payout gave its payout to the operator) has its miner's
+    # share bits (the login's rate key -> job_desired_share_target ->
+    # the REAL ShareTracker::compute_share_target band clip), and over many
+    # seeded jobs the operator's expected PPLNS weight equals the jobs the fee
+    # drew (was ~0.64 of them; field 0.08% of the block for --fee 1). Same
+    # folding rule.
     # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
     add_executable(share_test
         auto_ratchet_blocked_by_test.cpp
@@ -492,6 +500,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         mweb_next_header_test.cpp
         mweb_state_hash_binding_test.cpp
         mweb_tx_wire_test.cpp
+        node_fee_job_target_test.cpp
         own_share_reject_marks_test.cpp
         parent_fetch_rotation_test.cpp
         peer_block_pow_carry_test.cpp

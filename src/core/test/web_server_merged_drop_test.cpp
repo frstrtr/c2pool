@@ -126,7 +126,8 @@ struct Rig {
         mi.set_coin_node(&ltc);
         mi.set_merged_mining_manager(&mm);
         mi.set_ref_hash_fn([this](const uint256&, const std::vector<unsigned char>&,
-                                  const std::vector<unsigned char>&, uint64_t, uint32_t, uint32_t,
+                                  const std::vector<unsigned char>&, const core::stratum::PayoutKey&,
+                                  uint64_t, uint32_t, uint32_t,
                                   bool, const std::string&, const uint256&,
                                   const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>&,
                                   const std::vector<uint256>&) {

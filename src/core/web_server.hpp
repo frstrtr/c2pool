@@ -487,11 +487,15 @@ public:
     // Returns (ref_hash, last_txout_nonce) pair.  The ref_hash depends on
     // the share tracker state (prev_share, absheight, abswork, etc.) and
     // the miner's payout address (implicit via existing connection state).
-    // Called per-connection during work generation.
+    // Called per-connection during work generation. `rate_key` is the key
+    // whose local hash rate sizes the job's share target: the stratum
+    // connection's login key (IWorkSource::build_connection_coinbase_for),
+    // also on a job whose payout decide_job_payout gave to the node operator.
     using ref_hash_fn_t = std::function<RefHashResult(
         const uint256& prev_share_hash,
         const std::vector<unsigned char>& coinbase_scriptSig,
         const std::vector<unsigned char>& payout_script,
+        const core::stratum::PayoutKey& rate_key,
         uint64_t subsidy, uint32_t bits, uint32_t timestamp,
         bool segwit_active, const std::string& witness_commitment_hex,
         const uint256& witness_root,
@@ -509,8 +513,18 @@ public:
     // prev_share_hash is frozen at the caller and passed in to avoid race conditions.
     // Also returns work snapshot atomically (under same lock) to prevent race with refresh_work.
     // Returns (coinb1, coinb2) or empty strings if not possible.
+    // Without a login key (callers that are no stratum connection) the share
+    // target is sized by the payout's key.
     using CoinbaseResult = core::stratum::CoinbaseResult;
     CoinbaseResult build_connection_coinbase(
+        const uint256& prev_share_hash,
+        const std::string& extranonce1_hex,
+        const std::vector<unsigned char>& payout_script,
+        const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs) const override;
+    // The same for the stratum connection whose login key is `login_key`:
+    // the share target is sized by the local rate of `login_key`.
+    CoinbaseResult build_connection_coinbase_for(
+        const core::stratum::PayoutKey& login_key,
         const uint256& prev_share_hash,
         const std::string& extranonce1_hex,
         const std::vector<unsigned char>& payout_script,
@@ -1981,6 +1995,12 @@ private:
     mutable std::atomic<uint64_t> m_jobs_held{0};
     std::atomic<uint64_t> m_refresh_without_pplns{0};
     void note_job_held(const char* why) const;
+    // build_connection_coinbase(_for): the job's share target is sized by the
+    // local hash rate of `rate_key` (passed to ref_hash_fn).
+    CoinbaseResult build_job_coinbase(const uint256& prev_share_hash, const std::string& extranonce1_hex,
+                                      const std::vector<unsigned char>& payout_script,
+                                      const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs,
+                                      const core::stratum::PayoutKey& rate_key) const;
 public:
     uint64_t jobs_held() const { return m_jobs_held.load(std::memory_order_relaxed); }
     uint64_t refreshes_without_pplns() const { return m_refresh_without_pplns.load(std::memory_order_relaxed); }
