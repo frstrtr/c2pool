@@ -58,11 +58,12 @@ std::vector<unsigned char> p2pkh(unsigned char fill)
 
 // Share targets of a small and a big miner, 30x apart (the Cap 1 band edge).
 constexpr uint32_t SMALL_BITS = 0x1c0bc28d, SMALL_MAX = 0x1c0fffff;
-constexpr uint32_t BIG_BITS   = 0x1b6477da, BIG_MAX   = 0x1c0fffff;
+constexpr uint32_t BIG_BITS   = 0x1b6477da, BIG_MAX   = 0x1c07ffff;
 
 struct Rig {
     dash::coin::NodeCoinState cs;
     std::unique_ptr<dash::stratum::DASHWorkSource> ws;
+    bool producer_declines = false;   // the producer gives no job (tracker busy)
     Rig()
     {
         auto fallback = []() -> dash::coin::DashWorkData { return gate_work(); };
@@ -71,9 +72,11 @@ struct Rig {
             cs, fallback, submit, core::stratum::StratumConfig{}, /*is_testnet=*/false);
         // A producer job per payout, sized by that payout's miner (Cap 1).
         ws->set_producer_job_fn(
-            [](const uint256&, const std::vector<unsigned char>& payout,
-               const dash::coin::DashWorkData&)
+            [this](const uint256&, const std::vector<unsigned char>& payout,
+                   const dash::coin::DashWorkData&)
                 -> std::optional<dash::stratum::DASHWorkSource::ProducerJob> {
+                if (producer_declines)
+                    return std::nullopt;
                 dash::stratum::DASHWorkSource::ProducerJob pj;
                 pj.gentx_bytes.assign(64, 0x00);
                 pj.nonce64_offset = 40;
@@ -116,4 +119,19 @@ TEST(DashShareGateFrozenBits, SmallMinersSubmitIsJudgedByItsOwnJobAfterABiggerJo
         << "judged by the big miner's bits, the small miner keeps about 1/30 of its shares";
     EXPECT_EQ(core::stratum::pool_share_bits(small.snapshot.frozen_ref.max_bits, r.ws->get_share_max_bits()),
               SMALL_MAX);
+}
+
+// A job built without a producer job (tracker busy, non-P2PKH payout) freezes
+// no bits: the gate falls back to the live bits, and such a job cannot mint.
+TEST(DashShareGateFrozenBits, NonProducerJobFreezesNothing)
+{
+    Rig r;
+    (void)r.ws->build_connection_coinbase(uint256::ZERO, "00000001", p2pkh(0xbb), {});
+    r.producer_declines = true;
+    const auto plain = r.ws->build_connection_coinbase(uint256::ZERO, "00000000", p2pkh(0x5a), {});
+    ASSERT_TRUE(plain.snapshot.has_header);
+    EXPECT_EQ(plain.snapshot.frozen_ref.bits, 0u);
+    EXPECT_EQ(plain.snapshot.frozen_ref.max_bits, 0u);
+    EXPECT_EQ(core::stratum::pool_share_bits(plain.snapshot.frozen_ref.bits, r.ws->get_share_bits()),
+              BIG_BITS) << "a job without frozen bits is gated by the live bits";
 }

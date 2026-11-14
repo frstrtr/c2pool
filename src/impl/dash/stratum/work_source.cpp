@@ -2452,9 +2452,10 @@ core::stratum::CoinbaseResult DASHWorkSource::build_connection_coinbase(
                         // as pseudoshares.
                         out.snapshot.frozen_ref.bits     = pj->share_bits;
                         out.snapshot.frozen_ref.max_bits = pj->share_max_bits;
-                        // Publish the share_info-committed target so the
-                        // mining_submit share gate matches the minted share's
-                        // own m_bits (the ban-safety alignment).
+                        // Also publish it as the node's live target: the
+                        // dashboard reads it, and a job built without frozen
+                        // bits (the non-producer path) is gated by it. The
+                        // frozen value above is what gates THIS job.
                         // set_share_target only stores atomics; const_cast is
                         // safe here (build_connection_coinbase is const by
                         // interface contract, the target publish is a relaxed
