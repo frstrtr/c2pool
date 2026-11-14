@@ -220,6 +220,21 @@ inline PayoutKey job_rate_key(const PayoutKey& login_key, const std::vector<unsi
     return payout_script_key(job_payout_script);
 }
 
+/// The share bits a submission is judged by when deciding whether it makes a
+/// share (StratumSession::handle_submit's pool-share gate): its job's own,
+/// frozen when the job was built, the bits the share it makes carries (p2pool
+/// got_response: pow_hash <= share_info['bits'].target, of that job).
+/// `live_bits` (the work source's get_share_bits(): the bits of the last job
+/// built for ANY connection) only for a job built without frozen bits. Judged
+/// by the live bits, a job's share was dropped whenever the last job built
+/// was a harder one (another miner's, or any job after a node-fee job sized
+/// by the operator's key), and a harder job's submission went to share
+/// creation, which refused its PoW, whenever the last job built was easier.
+inline uint32_t pool_share_bits(uint32_t job_frozen_bits, uint32_t live_bits)
+{
+    return job_frozen_bits != 0 ? job_frozen_bits : live_bits;
+}
+
 /// Frozen share-construction fields returned by ref_hash_fn. These
 /// capture the share-tracker state at the moment a job was assembled
 /// so the resulting share matches even if the tip moved before submit.

@@ -17,7 +17,9 @@
 // key), and that MiningInterface::build_connection_coinbase_for hands
 // ref_hash_fn the job's payout AND the rate key of the connection's miner,
 // on a fee job too, while the plain build_connection_coinbase (callers that
-// are no stratum connection) keeps sizing it by the payout.
+// are no stratum connection) keeps sizing it by the payout. And the share
+// gate (core::stratum::pool_share_bits): a submission is judged by its own
+// job's share bits, not by the last job built for any connection.
 // ---------------------------------------------------------------------------
 
 #include <gtest/gtest.h>
@@ -194,4 +196,14 @@ TEST(NodeFeeShareTarget, PlainBuildIsSizedByThePayout)
     const auto cbr = r.mi.build_connection_coinbase(prev, "aabbccdd", p2sh(0x0c), {});
     ASSERT_FALSE(cbr.coinb1.empty());
     EXPECT_EQ(r.seen_rate_key, key_of(0x0c)) << "no stratum connection: the payout's key, as before";
+}
+
+// A submission makes a share when its PoW meets its own job's share bits (the
+// bits the share carries), not the last job built for any connection.
+TEST(PoolShareGate, TheJobsOwnBitsNotTheLastJobBuilt)
+{
+    constexpr uint32_t easy = 0x1c0bc28d, hard = 0x1b6477da;   // field: a fee job, its miner's job
+    EXPECT_EQ(core::stratum::pool_share_bits(easy, hard), easy);
+    EXPECT_EQ(core::stratum::pool_share_bits(hard, easy), hard);
+    EXPECT_EQ(core::stratum::pool_share_bits(0, hard), hard) << "a job without frozen bits: the live ones";
 }

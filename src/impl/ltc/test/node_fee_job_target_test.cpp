@@ -14,15 +14,28 @@
 // address on ~15 connections, the node most of its sharechain): owner shares
 // 2.35% of the window by count, 0.08% by weight, against ~1% due.
 //
+// The stratum server then judged whether a submission makes a share by the
+// share bits of the last job built for ANY connection, not by its own job's:
+// on a node whose miners sit at the hard edge, a fee job's easy shares were
+// dropped unless its connection's job was the last one built, and those it
+// made (PoW at the hard bits) weighed 1/30. Both together give the field's
+// numbers: modelled with the field's 14 connections, its tx refresh rate and
+// each connection in turn as the last one built, 2.36% by count, 0.081% by
+// weight. Fixed: a job's own frozen bits judge its submissions
+// (core::stratum::pool_share_bits); a smaller miner on a node of bigger ones
+// keeps its weight too.
+//
 // Pinned on the real pieces of a job: MiningInterface::decide_job_payout (the
 // fee draw), core::stratum::job_rate_key (whose rate sizes the job),
-// ltc::stratum::job_desired_share_target (Cap 1, as ref_hash_fn applies it)
-// and ltc::ShareTracker::compute_share_target (the band clip), through
+// ltc::stratum::job_desired_share_target (Cap 1, as ref_hash_fn applies it),
+// ltc::ShareTracker::compute_share_target (the band clip) and
+// core::stratum::pool_share_bits (the share gate), through
 // MiningInterface::build_connection_coinbase_for where a coinbase is built.
 // ---------------------------------------------------------------------------
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <map>
 #include <string>
 #include <vector>
@@ -94,6 +107,30 @@ struct Node {
     }
 };
 
+// One round of jobs (every connection's job, built in order, until the first
+// share or a template refresh: competing exponentials). A submission makes a
+// share when its PoW meets the bits the stratum gate judges it by
+// (pool_share_bits: its job's own, else the last job built) AND its job's own
+// (share creation's PoW check); the share weighs its job's own attempts.
+// Returns each job's expected weight: P(its share ends the round) x its
+// share's attempts.
+std::vector<double> round_weights(const std::vector<uint32_t>& job_bits, const std::vector<double>& conn_rate,
+                                  double refresh_rate)
+{
+    const uint32_t live_bits = job_bits.back();   // the last job built
+    std::vector<double> own(job_bits.size()), rate(job_bits.size()), weight(job_bits.size());
+    double end_rate = refresh_rate;
+    for (size_t c = 0; c < job_bits.size(); ++c) {
+        own[c] = attempts(job_bits[c]);
+        const double gate = attempts(core::stratum::pool_share_bits(job_bits[c], live_bits));
+        rate[c] = conn_rate[c] / std::max(own[c], gate);
+        end_rate += rate[c];
+    }
+    for (size_t c = 0; c < job_bits.size(); ++c)
+        weight[c] = rate[c] / end_rate * own[c];
+    return weight;
+}
+
 struct LtcCoin : public core::coin::ICoinNode {
     nlohmann::json work_data = {
         {"previousblockhash", std::string(62, '0') + "ab"}, {"version", 0x20000000},
@@ -118,7 +155,7 @@ struct LtcCoin : public core::coin::ICoinNode {
 struct Rig {
     LtcCoin coin;
     Node node;
-    MiningInterface mi{/*testnet=*/false};
+    MiningInterface mi{/*testnet=*/true};
     Rig()
     {
         mi.set_coin_node(&coin);
@@ -197,17 +234,18 @@ TEST(NodeFeeJobTarget, OperatorsOwnJobsAreSizedByItsRate)
 // (~every 4.2 s). Each round every connection gets a job (the fee draw is the
 // real decide_job_payout, seeded), the round lasts until the first share or a
 // refresh (competing exponentials), and each job is credited its expected
-// weight: P(its share ends the round) x its share's attempts. A share needs
-// PoW at its job's own share bits (p2pool got_response).
+// weight: P(its share ends the round) x its share's attempts (round_weights).
 //
 // A fee job sized by the operator's key (rate 0 -> pre_target3) is 30x
-// likelier to end its round early, and the operator's weight came out at
-// ~0.64 of the draws; sized by its miner, it equals the draws.
+// likelier to end its round early: the operator's weight came out at ~0.64 of
+// the draws with each job judged by its own bits, and at ~0.1 judged by the
+// last job built (here a normal job: the fee job's easy shares dropped, those
+// at the hard bits weighing 1/30). Sized by its miner, it equals the draws.
 TEST(NodeFeeJobTarget, OperatorsWeightIsTheFee)
 {
     core::random::seed(kSeed);
     Node node;
-    MiningInterface mi{/*testnet=*/false};
+    MiningInterface mi{/*testnet=*/true};
     const auto miner = p2pkh(0x0a);
     const auto op = p2pkh(0x0e);
     const double fee = 1.0;   // percent
@@ -220,28 +258,25 @@ TEST(NodeFeeJobTarget, OperatorsWeightIsTheFee)
     const double refresh_rate = 1.0 / 4.17;         // template refreshes / s
     node.rates[key_of(0x0a)] = conn_rate * kConnections;
 
+    const std::vector<double> conn_rates(kConnections, conn_rate);
     double owner = 0.0, total = 0.0;
     long draws = 0;
     for (int round = 0; round < kRounds; ++round) {
-        std::vector<double> share_attempts(kConnections), share_rate(kConnections);
+        std::vector<uint32_t> bits(kConnections);
         std::vector<bool> is_fee(kConnections);
-        double end_rate = refresh_rate;
         for (int c = 0; c < kConnections; ++c) {
             auto payout = miner;
             Merged merged;
             mi.decide_job_payout(payout, merged);
             is_fee[c] = payout == op;
             draws += is_fee[c];
-            const uint32_t bits = node.share_bits(core::stratum::job_rate_key(key_of(0x0a), payout));
-            share_attempts[c] = attempts(bits);
-            share_rate[c] = conn_rate / share_attempts[c];
-            end_rate += share_rate[c];
+            bits[c] = node.share_bits(core::stratum::job_rate_key(key_of(0x0a), payout));
         }
+        const auto weight = round_weights(bits, conn_rates, refresh_rate);
         for (int c = 0; c < kConnections; ++c) {
-            const double weight = share_rate[c] / end_rate * share_attempts[c];
-            total += weight;
+            total += weight[c];
             if (is_fee[c])
-                owner += weight;
+                owner += weight[c];
         }
     }
     const double draw_rate = double(draws) / (double(kConnections) * kRounds);
@@ -250,4 +285,37 @@ TEST(NodeFeeJobTarget, OperatorsWeightIsTheFee)
     EXPECT_NEAR(owner_fraction / draw_rate, 1.0, 0.01)
         << "the operator's weight is the jobs the fee drew: owner " << owner_fraction * 100.0
         << "% of the weight for " << draw_rate * 100.0 << "% of the jobs";
+}
+
+// A node of a big miner (9 connections, its rate at the hard edge) and a
+// small one (1 connection, its rate below the band: the easiest share), the
+// big miner's job built last. The small miner's expected weight is its share
+// of the hash rate. Judged by the last job built (the big miner's hard bits),
+// its easy shares were dropped and those it made weighed 1/30: 1/30 of it.
+TEST(NodeFeeJobTarget, SmallMinerKeepsItsWeightBesideABigOne)
+{
+    Node node;
+    const double a_easy = attempts(node.easiest());
+    const double big_conn = a_easy / 5.8, small_conn = a_easy / 5000.0;   // H/s
+    node.rates[key_of(0x0b)] = big_conn * 9;
+    node.rates[key_of(0x05)] = small_conn;   // Cap 1 wants an easier share than the band's easiest
+
+    std::vector<uint32_t> bits;
+    std::vector<double> rates;
+    bits.push_back(node.share_bits(key_of(0x05)));
+    rates.push_back(small_conn);
+    for (int c = 0; c < 9; ++c) {
+        bits.push_back(node.share_bits(key_of(0x0b)));
+        rates.push_back(big_conn);
+    }
+    ASSERT_EQ(bits.front(), node.easiest()) << "the small miner's jobs are the easiest share";
+    ASSERT_NEAR(attempts(bits.back()) / a_easy, 30.0, 0.1) << "the big miner's, the hardest";
+
+    const auto weight = round_weights(bits, rates, 1.0 / 4.17);
+    double total = 0.0;
+    for (double w : weight)
+        total += w;
+    const double due = small_conn / (small_conn + 9 * big_conn);
+    EXPECT_NEAR(weight.front() / total / due, 1.0, 1e-9)
+        << "the small miner's weight is its hash rate (was 1/30 of it)";
 }

@@ -1342,9 +1342,12 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
     // not just those meeting pool share_bits. This gives smooth hashrate data.
     double vardiff_difficulty = hashrate_tracker_.get_current_difficulty();
 
-    // Pool share difficulty (for P2P share creation threshold)
+    // Pool share difficulty (for P2P share creation threshold): this job's
+    // own share bits, the bits the share it makes carries; the live ones
+    // (the last job built for any connection) only for a job without them
+    // (core::stratum::pool_share_bits).
     double pool_difficulty = 0.0;
-    uint32_t sb = mining_interface_->get_share_bits();
+    uint32_t sb = core::stratum::pool_share_bits(job.frozen_bits, mining_interface_->get_share_bits());
     if (sb != 0)
         pool_difficulty = chain::target_to_difficulty(chain::bits_to_target(sb));
 
