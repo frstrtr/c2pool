@@ -20,6 +20,7 @@
 #include <csignal>
 #include <ctime>
 #include <optional>
+#include <mutex>
 #include <memory>
 #include <vector>
 #ifndef _WIN32
@@ -2415,6 +2416,24 @@ int main(int argc, char* argv[]) {
 
             // Phase 4 embedded objects (alive for the duration of integrated mode)
             std::unique_ptr<ltc::coin::HeaderChain>     embedded_chain;
+            // Head scoring's block-solution credit reads the header chain
+            // through this oracle (the tracker's m_expected_block_bits).
+            // Declared after embedded_chain, so it is destroyed first: it
+            // detaches under the oracle's mutex, after which a think() cycle
+            // gets nullopt (no credit) instead of reading freed headers; a
+            // call in flight finishes before the detach.
+            struct BlockBitsOracle {
+                std::mutex m;
+                const ltc::coin::HeaderChain* hc{nullptr};
+            };
+            struct BlockBitsOracleDetach {
+                std::shared_ptr<BlockBitsOracle> oracle = std::make_shared<BlockBitsOracle>();
+                ~BlockBitsOracleDetach()
+                {
+                    std::lock_guard<std::mutex> lk(oracle->m);
+                    oracle->hc = nullptr;
+                }
+            } block_bits_oracle;
             std::unique_ptr<ltc::coin::Mempool>         embedded_pool;
             std::unique_ptr<c2pool::merged::CoinBroadcaster> embedded_broadcaster;
             // The MWEB extension's source and its getblocktemplate poller
@@ -5207,6 +5226,26 @@ int main(int argc, char* argv[]) {
                             return 0; // RPC error or not found — safe default
                         });
                 }
+
+                // Head scoring credits a block-solution share only when its
+                // header bits are the network target for its parent block, as
+                // the embedded LTC header chain computes it (Litecoin retarget
+                // over a complete window on our best chain), and that parent is
+                // at most BLOCK_CREDIT_MAX_PARENT_DEPTH below our tip. Without an
+                // embedded header chain (--no-embedded-ltc: litecoind RPC) the
+                // oracle stays empty: no block-solution credit.
+                if (embedded_ltc) {
+                    std::lock_guard<std::mutex> lk(block_bits_oracle.oracle->m);
+                    block_bits_oracle.oracle->hc = embedded_chain.get();
+                }
+                p2p_node->tracker().m_expected_block_bits =
+                    [oracle = block_bits_oracle.oracle](const uint256& prev_block, int64_t block_time)
+                        -> std::optional<uint32_t> {
+                        std::lock_guard<std::mutex> lk(oracle->m);
+                        if (!oracle->hc) return std::nullopt;
+                        return oracle->hc->expected_bits_after(prev_block, block_time,
+                                                               ltc::BLOCK_CREDIT_MAX_PARENT_DEPTH);
+                    };
 
                 // Begin actively connecting to outbound peers from bootstrap list / addr store
                 p2p_node->start_outbound_connections();
