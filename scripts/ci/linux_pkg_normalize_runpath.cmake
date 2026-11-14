@@ -26,15 +26,23 @@ if (NOT PKG_DIR OR NOT IS_DIRECTORY "${PKG_DIR}")
     message(FATAL_ERROR "usage: cmake -DPKG_DIR=<staged package dir> -P ${CMAKE_CURRENT_LIST_FILE}")
 endif()
 
+# <_out> = the file's DT_RUNPATH (else DT_RPATH) as a ;-list, "" if it has none.
+# file(READ_ELF) does not touch an output variable whose entry the file lacks,
+# and a function body sees its caller's variables, so every output is cleared
+# first and named apart from the caller's: otherwise a library without a
+# RUNPATH reads back the previous file's (the executable's) and gets rewritten.
 function(_c2pool_runpath_of _file _out)
-    file(READ_ELF "${_file}" RUNPATH _rp RPATH _rpath CAPTURE_ERROR _err)
-    if (_err)
-        message(FATAL_ERROR "${_file}: not a readable ELF file (${_err})")
+    set(_elf_runpath "")
+    set(_elf_rpath "")
+    set(_elf_error "")
+    file(READ_ELF "${_file}" RUNPATH _elf_runpath RPATH _elf_rpath CAPTURE_ERROR _elf_error)
+    if (_elf_error)
+        message(FATAL_ERROR "${_file}: not a readable ELF file (${_elf_error})")
     endif()
-    if (NOT _rp)
-        set(_rp "${_rpath}")
+    if (_elf_runpath STREQUAL "")
+        set(_elf_runpath "${_elf_rpath}")
     endif()
-    set(${_out} "${_rp}" PARENT_SCOPE)
+    set(${_out} "${_elf_runpath}" PARENT_SCOPE)
 endfunction()
 
 file(GLOB _exes LIST_DIRECTORIES false "${PKG_DIR}/c2pool-*")
@@ -42,23 +50,27 @@ if (NOT _exes)
     message(FATAL_ERROR "${PKG_DIR}: no c2pool-<coin> executable")
 endif()
 foreach (_exe IN LISTS _exes)
-    _c2pool_runpath_of("${_exe}" _rp)
+    _c2pool_runpath_of("${_exe}" _exe_rp)
     # The build must already have put $ORIGIN/lib there; finding it proves the
     # binary came from a tree with cmake/LinuxPackageRunpath.cmake.
-    string(REPLACE ":" ";" _entries "${_rp}")
+    string(REPLACE ":" ";" _entries "${_exe_rp}")
     if (NOT "$ORIGIN/lib" IN_LIST _entries)
-        message(FATAL_ERROR "${_exe}: RUNPATH [${_rp}] has no $ORIGIN/lib entry "
+        message(FATAL_ERROR "${_exe}: RUNPATH [${_exe_rp}] has no $ORIGIN/lib entry "
                             "(built without cmake/LinuxPackageRunpath.cmake?)")
     endif()
-    if (NOT _rp STREQUAL "$ORIGIN/lib")
+    if (NOT _exe_rp STREQUAL "$ORIGIN/lib")
         file(RPATH_SET FILE "${_exe}" NEW_RPATH "$ORIGIN/lib")
     endif()
 endforeach()
 
+# Bundled libraries: only those that carry a RUNPATH/RPATH are rewritten (ours,
+# e.g. libdash_scriptcheck.so -> $ORIGIN). The system copies the ldd loop
+# bundles (libsecp256k1, libgmp) have none, need only glibc, and are left
+# byte-identical.
 file(GLOB _libs LIST_DIRECTORIES false "${PKG_DIR}/lib/*.so*")
 foreach (_lib IN LISTS _libs)
-    _c2pool_runpath_of("${_lib}" _rp)
-    if (_rp AND NOT _rp STREQUAL "$ORIGIN")
+    _c2pool_runpath_of("${_lib}" _lib_rp)
+    if (NOT _lib_rp STREQUAL "" AND NOT _lib_rp STREQUAL "$ORIGIN")
         file(RPATH_SET FILE "${_lib}" NEW_RPATH "$ORIGIN")
     endif()
 endforeach()
