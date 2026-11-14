@@ -572,7 +572,8 @@ bool MiningInterface::check_merged_mining(const std::string& header_hex,
                                           const std::string& extranonce2,
                                           const JobSnapshot* job,
                                           const std::string& miner,
-                                          const uint256& share_hash)
+                                          const uint256& share_hash,
+                                          const std::vector<unsigned char>& miner_script)
 {
     // Counted before the manager check so the call path itself is observable.
     m_aux_checks.fetch_add(1, std::memory_order_relaxed);
@@ -605,6 +606,7 @@ bool MiningInterface::check_merged_mining(const std::string& header_hex,
     ctx.parent_hash = Hash(hdr_bytes).GetHex();
     if (job) ctx.parent_prev_hash = job->gbt_prevhash;
     ctx.miner = miner;
+    ctx.miner_script = miner_script;
     if (!share_hash.IsNull()) ctx.share_hash = share_hash.GetHex();
     MergedSubmitScope submit_scope(std::move(ctx));
 
@@ -3446,12 +3448,14 @@ std::string MiningInterface::block_explorer_prefix() const
     }
 }
 
-std::string MiningInterface::merged_block_explorer_prefix(const std::string& chain_label)
+std::string MiningInterface::merged_block_explorer_prefix(const std::string& chain_label,
+                                                          bool testnet)
 {
-    // Testnet aux labels carry a lowercase "t" ("tDOGE"): no public testnet
-    // explorer is named for them, so the link is null rather than a mainnet
-    // URL that cannot resolve the hash.
-    if (chain_label.size() > 1 && chain_label[0] == 't')
+    // No public testnet explorer is named for an aux chain, so on testnet the
+    // link is null rather than a mainnet URL that cannot resolve the hash.
+    // The node's network decides: aux rows carry the mainnet label ("DOGE")
+    // on testnet too; a "t"-prefixed label is testnet by its name.
+    if (testnet || (chain_label.size() > 1 && chain_label[0] == 't'))
         return "";
     std::string label = chain_label;
     for (auto& ch : label) if (ch >= 'a' && ch <= 'z') ch = static_cast<char>(ch - 32);
@@ -3561,7 +3565,7 @@ nlohmann::json MiningInterface::found_block_row_locked(const FoundBlock& b) cons
     // blockchair/litecoin, which answers "not found".
     const bool primary_row = is_primary_found_block(b);
     const std::string explorer_prefix = primary_row
-        ? block_explorer_prefix() : merged_block_explorer_prefix(b.chain);
+        ? block_explorer_prefix() : merged_block_explorer_prefix(b.chain, m_testnet);
     auto explorer_url = [&](const std::string& hash_hex) -> nlohmann::json {
         if (explorer_prefix.empty() || hash_hex.empty())
             return nlohmann::json(nullptr);
@@ -4780,7 +4784,8 @@ void MiningInterface::record_found_block(uint64_t height, const uint256& hash, u
                                           double share_difficulty,
                                           double pool_hashrate,
                                           uint64_t subsidy,
-                                          BlockAuthorship authorship)
+                                          BlockAuthorship authorship,
+                                          bool height_from_block)
 {
     if (ts == 0) ts = static_cast<uint64_t>(std::time(nullptr));
     std::string hash_hex = hash.GetHex();
@@ -4832,11 +4837,14 @@ void MiningInterface::record_found_block(uint64_t height, const uint256& hash, u
     // rest of time. An ATTRIBUTED record now upgrades an unattributed row in
     // place; nothing ever downgrades, and a second attributed record for the
     // same (hash, chain) still dedups exactly as before.
+    bool handled = false;     // an existing row took this record
+    bool reverify = false;    // its corrected height reopened the verdict
     {
         std::lock_guard<std::mutex> lock(m_blocks_mutex);
         for (auto& existing : m_found_blocks) {
             if (existing.hash != hash_hex || existing.chain != chain)
                 continue;
+            handled = true;
             // AUTHORSHIP CLIMBS FIRST, and OUTSIDE the enrichment branch.
             // It was inside it, gated on the existing row being unattributed
             // -- which made the raise unreachable on the path it exists for.
@@ -4892,13 +4900,27 @@ void MiningInterface::record_found_block(uint64_t height, const uint256& hash, u
                 // context (JSON-RPC submitblock) knows the miner but no share.
                 // Whatever one path lacked, the other fills. Fill-only: a known
                 // value is never overwritten.
-                if (existing.miner.empty() && !miner.empty()) {
+                // A pre-fix value that does not render (a raw-hex miner, a
+                // parent row naming another share than its block) counts as
+                // unknown: the record that knows the real one replaces it.
+                const bool miner_unknown = existing.miner.empty()
+                    || found_block_miner_display(existing.miner) != existing.miner;
+                if (miner_unknown && !miner.empty()
+                    && found_block_miner_display(miner) == miner
+                    && miner != existing.miner) {
                     existing.miner = miner;
                     row_dirty = true;
                 }
-                if (existing.share_hash.empty() && !share_hash.empty()) {
-                    existing.share_hash = share_hash;
-                    row_dirty = true;
+                const bool share_unknown = existing.share_hash.empty()
+                    || found_block_share_hash(existing).empty();
+                if (share_unknown && !share_hash.empty()
+                    && share_hash != existing.share_hash) {
+                    FoundBlock probe = existing;
+                    probe.share_hash = share_hash;
+                    if (!found_block_share_hash(probe).empty()) {
+                        existing.share_hash = share_hash;
+                        row_dirty = true;
+                    }
                 }
                 if (existing.share_difficulty <= 0.0 && share_difficulty > 0.0) {
                     existing.share_difficulty = share_difficulty;
@@ -4951,10 +4973,21 @@ void MiningInterface::record_found_block(uint64_t height, const uint256& hash, u
             // 2026-10-25). The first later record that knows the height -- the
             // sharechain hook re-records a block from its share's BIP34 height
             // -- gives it that height, so the confirm/orphan lane can resolve
-            // it and it sorts into its place. A known height is never changed.
-            if (existing.height == 0 && height != 0) {
+            // it and it sorts into its place.
+            //
+            // A KNOWN height changes only for the block's OWN height
+            // (height_from_block: its coinbase BIP34 push, or the header
+            // chain's prev + 1) on a parent-chain row: the pre-fix LTC peer
+            // path stored the share absheight (27707625 for block 3211872),
+            // and the next record of the block from its share corrects it.
+            const bool learn = existing.height == 0 && height != 0;
+            const bool correct = height_from_block && height != 0
+                && existing.height != 0 && existing.height != height
+                && found_block_chain_is_primary(chain, existing.parent_hash, node_symbol());
+            if (learn || correct) {
                 // Re-sorts the list: `existing` is not used past this point.
-                auto learned = learn_found_block_height_locked(hash_hex, chain, height);
+                auto learned = learn_found_block_height_locked(hash_hex, chain, height,
+                                                               /*replace_known=*/correct);
                 if (learned && m_persist_block_fn) {
                     try { m_persist_block_fn(*learned); }
                     catch (const std::exception& e) {
@@ -4962,7 +4995,9 @@ void MiningInterface::record_found_block(uint64_t height, const uint256& hash, u
                                        " height: " << e.what();
                     }
                 }
-                return;
+                reverify = correct && learned
+                        && learned->status == BlockStatus::pending;
+                break;
             }
 
             if (row_dirty && m_persist_block_fn) {
@@ -4972,8 +5007,15 @@ void MiningInterface::record_found_block(uint64_t height, const uint256& hash, u
                                    " block: " << e.what();
                 }
             }
-            return;  // already recorded (possibly just enriched)
+            break;  // already recorded (possibly just enriched)
         }
+    }
+    if (handled) {
+        // A corrected height reopens the verdict; scheduling takes
+        // m_blocks_mutex, so it runs here, after the lock is released.
+        if (reverify)
+            schedule_block_verification(hash_hex);
+        return;
     }
 
     FoundBlock blk{height, hash_hex, ts, BlockStatus::pending, 0, chain, 0,
@@ -5165,7 +5207,13 @@ void MiningInterface::record_merged_found_block(const std::string& symbol, int h
     const MergedSubmitContext* ctx = t_merged_submit_ctx;
     uint256 h;
     h.SetHex(block_hash);
-    const std::string miner = (ctx && !ctx->miner.empty()) ? ctx->miner : get_payout_address();
+    // The minted share's payout script, rendered now that an aux block was
+    // found: the address every peer reads off the gossiped share.
+    std::string miner;
+    if (ctx && !ctx->miner_script.empty())
+        miner = core::script_to_address(ctx->miner_script, /*is_litecoin=*/true, m_testnet);
+    if (miner.empty())
+        miner = (ctx && !ctx->miner.empty()) ? ctx->miner : get_payout_address();
     // share = the one this submit minted; "" (JSON null) when the solve
     // missed the share target. Network difficulty is still the parent's (#1738).
     const std::string share = ctx ? ctx->share_hash : std::string();
@@ -5239,10 +5287,29 @@ MiningInterface::learn_found_block_height_locked(const std::string& hash,
         [&](const FoundBlock& b) { return b.hash == hash && b.chain == chain; });
     if (it == m_found_blocks.end() || it->height == height) return std::nullopt;
     if (it->height != 0 && !replace_known) return std::nullopt;
-    LOG_INFO << "[Pool] found-block height " << (it->height ? "corrected" : "learned")
+    const uint64_t old_height = it->height;
+    LOG_INFO << "[Pool] found-block height " << (old_height ? "corrected" : "learned")
              << ": hash=" << hash.substr(0, 16)
-             << " chain=" << chain << " h=" << it->height << " -> " << height;
+             << " chain=" << chain << " h=" << old_height << " -> " << height;
     it->height = height;
+    if (old_height != 0) {
+        // A verdict taken at the wrong height says nothing about the block:
+        // an orphan call there (another block, or none, at that height) is
+        // withdrawn and the row is judged again at its real height.
+        if (it->status == BlockStatus::orphaned) {
+            it->status = BlockStatus::pending;
+            it->confirmations = 0;
+            it->check_count = 0;
+        }
+        // The row moves within its chain's order, so every interval of that
+        // chain is re-derived from the new order, not only the unknown ones.
+        for (auto& b : m_found_blocks) {
+            if (b.chain != chain) continue;
+            b.time_to_find = 0.0;
+            b.expected_time = 0.0;
+            b.luck = 0.0;
+        }
+    }
     // Same order record_found_block keeps: newest first by height, ts breaks
     // ties. The row's interval was derived from its old place (none, at the
     // bottom); the recompute re-derives every interval still unknown.
@@ -5253,7 +5320,11 @@ MiningInterface::learn_found_block_height_locked(const std::string& hash,
         });
     recompute_found_block_luck_locked();
     for (const auto& b : m_found_blocks)
-        if (b.hash == hash && b.chain == chain) return b;
+        if (b.hash == hash && b.chain == chain) {
+            FoundBlock row = b;
+            row.replaced_height = old_height;   // the persisted key to drop
+            return row;
+        }
     return std::nullopt;
 }
 
@@ -5292,17 +5363,22 @@ void MiningInterface::backfill_found_block_heights(const block_height_lookup_fn&
                  << ", height learned for " << learned.size();
 }
 
-void MiningInterface::correct_found_block_heights(const block_height_lookup_fn& height_fn)
+void MiningInterface::correct_found_block_heights(const block_height_lookup_fn& height_fn,
+                                                  uint64_t tip_height)
 {
-    if (!height_fn) return;
+    if (!height_fn || tip_height == 0) return;
     // Snapshot under the lock, ask the lookup with it released (the header
     // chain has locks of its own), as backfill_found_block_heights does.
     struct Known { std::string hash, chain; uint64_t height; };
     std::vector<Known> known;
     {
         std::lock_guard<std::mutex> lock(m_blocks_mutex);
+        // Only a height no block of this chain can have (above the tip):
+        // the share absheight a pre-fix peer row stored. A height at or
+        // below the tip is left alone -- a header chain built on a wrong
+        // checkpoint would otherwise rewrite correct heights.
         for (const auto& b : m_found_blocks)
-            if (b.height != 0 && !b.hash.empty() && is_primary_found_block(b))
+            if (b.height > tip_height && !b.hash.empty() && is_primary_found_block(b))
                 known.push_back({b.hash, b.chain, b.height});
     }
     std::vector<FoundBlock> corrected;
@@ -5327,6 +5403,12 @@ void MiningInterface::correct_found_block_heights(const block_height_lookup_fn& 
     if (!corrected.empty())
         LOG_INFO << "[Pool] found-block heights corrected from the header chain: "
                  << corrected.size() << " of " << known.size();
+    // Judge each corrected row again at its real height (a row an orphan call
+    // at the wrong height had closed is pending again). Outside the lock:
+    // scheduling takes m_blocks_mutex.
+    for (const auto& b : corrected)
+        if (b.status == BlockStatus::pending)
+            schedule_block_verification(b.hash);
 }
 
 void MiningInterface::load_persisted_found_blocks()
@@ -7958,6 +8040,24 @@ nlohmann::json MiningInterface::rest_best_share()
     return result;
 }
 
+namespace {
+// The script an address pays, for comparing two spellings of one payee: LTC
+// P2SH as 3... or M..., testnet 2... or Q..., an all-uppercase bech32 (BIP173
+// allows it). {} when the address does not decode.
+std::vector<unsigned char> payee_script(const std::string& address)
+{
+    if (address.empty()) return {};
+    auto script = core::address_to_script(address);
+    if (script.empty()) {
+        std::string lower = address;
+        for (auto& c : lower)
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (lower != address) script = core::address_to_script(lower);
+    }
+    return script;
+}
+} // namespace
+
 nlohmann::json MiningInterface::rest_miner_payouts(const std::string& address)
 {
     nlohmann::json result = nlohmann::json::object();
@@ -8010,12 +8110,19 @@ nlohmann::json MiningInterface::rest_miner_payouts(const std::string& address)
                 : "https://blockchair.com/bitcoin/block/";
         }
 
+        // One payee, however the address is spelled: compared by the script
+        // it pays (the row's miner as rendered; a pre-fix raw-hex one reads
+        // as the address it encodes, or not at all).
+        const auto want = payee_script(address);
         for (const auto& b : m_found_blocks) {
             // Parent-chain blocks only: a merged (DOGE) row counted as a block
             // this miner found, added its aux reward to the parent-coin totals
             // and linked its aux hash through the parent explorer.
             if (!is_primary_found_block(b)) continue;
-            if (b.miner == address || address.empty()) {
+            const std::string row_miner = found_block_miner_display(b.miner);
+            const bool same_payee = address.empty() || row_miner == address
+                || (!want.empty() && !row_miner.empty() && payee_script(row_miner) == want);
+            if (same_payee) {
                 ++blocks_found;
                 double payout_estimate = b.subsidy > 0 ? static_cast<double>(b.subsidy) / 1e8 : 0;
                 if (b.status == BlockStatus::confirmed)
@@ -9415,8 +9522,8 @@ nlohmann::json MiningInterface::rest_recent_merged_blocks()
             if (ci.symbol == symbol) return nlohmann::json(ci.chain_id);
         return nlohmann::json(nullptr);
     };
-    auto explorer_of = [](const std::string& symbol, const std::string& hash) -> nlohmann::json {
-        const std::string prefix = merged_block_explorer_prefix(symbol);
+    auto explorer_of = [this](const std::string& symbol, const std::string& hash) -> nlohmann::json {
+        const std::string prefix = merged_block_explorer_prefix(symbol, m_testnet);
         if (prefix.empty() || hash.empty()) return nlohmann::json(nullptr);
         return nlohmann::json(prefix + hash);
     };
@@ -11489,12 +11596,16 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
         // probabilistically replaced with the node operator's address for the
         // node fee); the merged addresses are share_merged (above).
         uint256 created_share;  // #946: named on an own-find DOGE row
-        // What a found-block record needs and the header cannot give: the
-        // minted share, whom it pays, its BIP34 height and committed coinbase
-        // value -- the same facts every peer reads off the gossiped share.
-        // Login address until a share's payout script is known.
-        core::FoundBlockSubmitContext found_ctx;
-        found_ctx.miner = primary_addr;
+        // What a found-block record needs and the header cannot give -- the
+        // minted share's payout script, coinbase scriptSig (BIP34 height),
+        // committed coinbase value and target: the same facts every peer
+        // reads off the gossiped share. Kept raw (moved out of the share
+        // params once the share is minted); the context is composed only
+        // for a block-target hit, never per pseudoshare.
+        std::vector<unsigned char> found_payout_script;
+        std::vector<unsigned char> found_script_sig;
+        uint64_t found_subsidy = 0;
+        uint32_t found_share_bits = 0;
         if (m_create_share_fn) {
             ShareCreationParams params;
             // Miner display name: PRIMARY_ADDR.WORKER (strip merged addrs, keep worker)
@@ -11710,16 +11821,16 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
             if (!params.payout_script.empty() && params.bits != 0) {
                 created_share = m_create_share_fn(params);
             }
+            // The share params are done with: keep what a found block needs.
             // The miner is the share's payout script rendered for the coin --
             // what peers render from the gossiped share (after any node-fee
-            // draw the share pays whom its script names, not the login).
-            // Rendered on the LTC lane only; elsewhere the login stays.
-            static const std::vector<unsigned char> kNoScript;
-            found_ctx = core::make_found_block_submit_context(
-                m_blockchain == Blockchain::LITECOIN ? params.payout_script : kNoScript,
-                /*is_litecoin=*/true, m_testnet, primary_addr, created_share,
-                params.coinbase_scriptSig, params.subsidy,
-                params.has_frozen_fields ? params.frozen_bits : 0);
+            // draw the share pays whom its script names, not the login) --
+            // on the LTC lane only; elsewhere the login stays.
+            if (m_blockchain == Blockchain::LITECOIN)
+                found_payout_script = std::move(params.payout_script);
+            found_script_sig = std::move(params.coinbase_scriptSig);
+            found_subsidy = params.subsidy;
+            found_share_bits = params.has_frozen_fields ? params.frozen_bits : 0;
         }
 
         // Attempt block construction + submission only when PoW meets blockchain target.
@@ -11731,7 +11842,8 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
             if (!header_hex.empty()) {
                 // Check merged mining targets for every share (aux targets are lower)
                 bool merged_found = check_merged_mining(header_hex, extranonce1, extranonce2, job,
-                                                        found_ctx.miner, created_share);
+                                                        primary_addr, created_share,
+                                                        found_payout_script);
 
                 auto block_bytes = ParseHex(header_hex);
                 if (block_bytes.size() == 80) {
@@ -11786,13 +11898,24 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
                                          << " hash=" << block_hash.GetHex().substr(0,16);
                                 // The block-submitted callback fires inside
                                 // submitblock() on this thread and records the
-                                // row from this. The minted share IS this block
-                                // only when its header is the one submitted (the
-                                // job-less fallback may rebuild under a newer
-                                // header): otherwise the share is not named.
-                                core::FoundBlockSubmitContext submit_ctx = found_ctx;
-                                if (submit_ctx.share_hash != block_hash.GetHex())
+                                // row from this context.
+                                auto submit_ctx = core::make_found_block_submit_context(
+                                    found_payout_script, /*is_litecoin=*/true, m_testnet,
+                                    primary_addr, created_share, found_script_sig,
+                                    found_subsidy, found_share_bits);
+                                // The job-less fallback may have rebuilt the
+                                // block under a newer header: then neither the
+                                // minted share nor what came from its coinbase
+                                // (height, value, target) describes this block.
+                                // A share is named only when it IS the block.
+                                if (ParseHex(header_hex) != block_bytes) {
                                     submit_ctx.share_hash.clear();
+                                    submit_ctx.height = 0;
+                                    submit_ctx.subsidy = 0;
+                                    submit_ctx.share_difficulty = 0.0;
+                                } else if (submit_ctx.share_hash != block_hash.GetHex()) {
+                                    submit_ctx.share_hash.clear();
+                                }
                                 FoundBlockSubmitScope found_scope(std::move(submit_ctx));
                                 auto submit_res = submitblock(block_hex);
                                 if (!submit_res.contains("error")) {

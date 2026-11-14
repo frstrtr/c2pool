@@ -386,7 +386,14 @@ public:
                             // has not labelled its sites leaves `unknown`,
                             // which reports as unknown and never as a claim.
                             BlockAuthorship authorship =
-                                BlockAuthorship::unknown);
+                                BlockAuthorship::unknown,
+                            // The height is the block's OWN: its coinbase
+                            // BIP34 push, or the header chain's height of its
+                            // prev + 1 -- not a template or sharechain value.
+                            // Such a height corrects a stored one it
+                            // contradicts (a pre-fix LTC peer row holds the
+                            // share absheight); any other only fills a 0.
+                            bool height_from_block = false);
     
     // Boundary types hoisted to core::stratum (see core/stratum_types.hpp).
     // Aliases kept here so existing references like `MiningInterface::JobSnapshot`
@@ -1165,6 +1172,11 @@ public:
         // by definition from history), so it stays last in the struct and out
         // of every positional aggregate-init above.
         bool from_history{false};
+        // Transient, never persisted: the height this row was stored under
+        // before a height correction moved it (0 = none). The key of a stored
+        // row carries its height, so the persistence callback passes this to
+        // FoundBlockStore::store to drop the record at the old key.
+        uint64_t replaced_height{0};
     };
 
     // Block acceptance verification: schedule async checks at +10s, +30s, +120s.
@@ -1412,7 +1424,13 @@ public:
     /// height). Re-sorts, re-derives luck, persists. Merged (aux) rows are
     /// skipped: the parent header chain does not know them. One-shot at
     /// startup, after load_persisted_found_blocks.
-    void correct_found_block_heights(const block_height_lookup_fn& height_fn);
+    /// Only a stored height ABOVE `tip_height` (the parent chain's tip; no
+    /// block of the chain can sit there) is replaced: a header chain built on
+    /// a wrong checkpoint must not rewrite correct heights. A corrected row
+    /// that was orphaned at the wrong height is pending again and its
+    /// verification is scheduled.
+    void correct_found_block_heights(const block_height_lookup_fn& height_fn,
+                                     uint64_t tip_height);
 
     /// A found-block row of THIS node's own (parent) chain, as opposed to a
     /// merged/aux child (DOGE on an LTC node) that rides the same ledger. A
@@ -1438,7 +1456,10 @@ public:
     /// Block-explorer prefix for a merged (aux) chain label ("" = none known,
     /// emitted as null). The parent prefix (block_explorer_prefix) must never
     /// link an aux hash: blockchair/litecoin answers "not found" for a DOGE id.
-    static std::string merged_block_explorer_prefix(const std::string& chain_label);
+    /// Testnet: none (aux rows carry the mainnet label, e.g. "DOGE", on
+    /// testnet too, so the label alone cannot tell).
+    static std::string merged_block_explorer_prefix(const std::string& chain_label,
+                                                    bool testnet);
 
     /// #946: fill the explorer body fields (coinbase_txid, tx_count) on the
     /// already-recorded row(s) for this block hash. Fill-only: a known value
@@ -1472,6 +1493,11 @@ public:
         // The share this submit minted; empty when it missed the share
         // target, so the row's "share" stays null.
         std::string             share_hash;
+        // The minted share's payout script (LTC lane). When set, the row's
+        // miner is this script rendered as an address -- what every peer
+        // reads off the gossiped share -- and takes precedence over `miner`.
+        // Rendered only when an aux block is found, never per share.
+        std::vector<unsigned char> miner_script;
     };
     class MergedSubmitScope {
     public:
@@ -1706,7 +1732,8 @@ private:
                              const std::string& extranonce2,
                              const JobSnapshot* job = nullptr,
                              const std::string& miner = "",
-                             const uint256& share_hash = uint256());
+                             const uint256& share_hash = uint256(),
+                             const std::vector<unsigned char>& miner_script = {});
     
     // Internal state
     uint64_t m_work_id_counter;

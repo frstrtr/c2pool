@@ -3266,7 +3266,8 @@ int main(int argc, char* argv[]) {
                             // re-persists the row, so it survives a restart.
                             rec.parent_hash = blk.parent_hash;
                             rec.parent_height = blk.parent_height;
-                            return fblk_store->store(rec);
+                            // A corrected height names the key it moved from.
+                            return fblk_store->store(rec, blk.replaced_height);
                         },
                         [fblk_store, fblk_leveldb]() -> std::vector<MI::FoundBlock> {
                             auto records = fblk_store->load_all();
@@ -5493,6 +5494,9 @@ int main(int argc, char* argv[]) {
                 auto row = ltc::dashboard::row_from_submit(
                     block_hash, hdr.m_timestamp, chain_height,
                     core::MiningInterface::found_block_submit_context(), is_testnet);
+                // The header chain's prev + 1 or the share's BIP34 push: the
+                // block's own height (the template's below is not).
+                const bool height_from_block = row.height != 0;
                 if (row.height == 0) {
                     // Last resort: the live template (it may build on a newer tip).
                     auto tmpl = mi->get_current_work_template();
@@ -5523,7 +5527,8 @@ int main(int argc, char* argv[]) {
                     // the block. Authorship only climbs, so the sharechain hook
                     // (sharechain_peer, when the winning share verifies here)
                     // can never downgrade it.
-                    core::MiningInterface::BlockAuthorship::this_node);
+                    core::MiningInterface::BlockAuthorship::this_node,
+                    height_from_block);
                 // Verify every found block against the best chain, a stale
                 // or refused one too: it is orphaned once the chain is 6 deep
                 // from its height, never left pending.
@@ -6956,7 +6961,10 @@ int main(int argc, char* argv[]) {
                         row.height, block_hash, row.timestamp, row.chain,
                         row.miner, row.share_hash, mi->get_network_difficulty(),
                         row.share_difficulty, /*pool_hashrate=*/0.0, row.subsidy,
-                        core::MiningInterface::BlockAuthorship::sharechain_peer);
+                        core::MiningInterface::BlockAuthorship::sharechain_peer,
+                        // BIP34 off the share's coinbase: it corrects a
+                        // pre-fix row stored at the share absheight.
+                        /*height_from_block=*/row.height != 0);
                     // coinbase_txid = the gentx hash the share commits to.
                     // tx_count stays null: v34+ shares carry no tx list.
                     try {
@@ -11010,7 +11018,11 @@ int main(int argc, char* argv[]) {
                     return entry ? static_cast<uint64_t>(entry->height) : 0;
                 };
                 web_server.get_mining_interface()->backfill_found_block_heights(height_lookup);
-                web_server.get_mining_interface()->correct_found_block_heights(height_lookup);
+                // Only heights above the tip (no LTC block can sit there) are
+                // corrected: a header chain on a wrong checkpoint must not
+                // rewrite correct ones.
+                web_server.get_mining_interface()->correct_found_block_heights(
+                    height_lookup, static_cast<uint64_t>(hc->height()));
             }
 
             // #159 (G2): re-verify any found block that was still pending at the

@@ -21,6 +21,7 @@
 
 #include <gtest/gtest.h>
 
+#include <cctype>
 #include <cmath>
 #include <ctime>
 #include <string>
@@ -232,6 +233,39 @@ TEST(FoundBlockRows, MinerPayoutsCountParentBlocksOnly)
     ASSERT_EQ(st["blocks"].size(), 1u);
     EXPECT_EQ(st["blocks"][0]["block_hash"].get<std::string>(), kLtcBlock);
     EXPECT_NEAR(st["total_estimated_rewards"].get<double>(), 6.25549157, 1e-9);
+}
+
+// /miner_payouts matches the PAYEE, not the spelling of its address: an LTC
+// P2SH is 3... or M..., a bech32 may be written in upper case.
+TEST(FoundBlockRows, MinerPayoutsMatchThePayeeNotTheSpelling)
+{
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::LITECOIN);
+    std::vector<unsigned char> h(20);
+    for (size_t i = 0; i < h.size(); ++i) h[i] = static_cast<unsigned char>(0x40 + i);
+    std::vector<unsigned char> p2sh{0xa9, 0x14};
+    p2sh.insert(p2sh.end(), h.begin(), h.end());
+    p2sh.push_back(0x87);
+    std::vector<unsigned char> p2wpkh{0x00, 0x14};
+    p2wpkh.insert(p2wpkh.end(), h.begin(), h.end());
+    const std::string m_addr = core::script_to_address(p2sh, "", 0x30, 0x32);   // M...
+    const std::string three  = core::script_to_address(p2sh, "", 0x00, 0x05);   // 3...
+    const std::string bech   = core::script_to_address(p2wpkh, "ltc", 0x30, 0x32);
+    ASSERT_EQ(m_addr[0], 'M');
+    ASSERT_EQ(three[0], '3');
+    std::string bech_uc = bech;
+    for (auto& c : bech_uc) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+
+    const std::string b1 = "7777777777777777777777777777777777777777777777777777777777770001";
+    const std::string b2 = "7777777777777777777777777777777777777777777777777777777777770002";
+    mi.record_found_block(3211000, uint256S(b1), 1794400000, "LTC", m_addr, b1,
+                          0.0, 0.0, 0.0, 625000000, MiningInterface::BlockAuthorship::this_node);
+    mi.record_found_block(3211001, uint256S(b2), 1794400100, "LTC", bech, b2,
+                          0.0, 0.0, 0.0, 625000000, MiningInterface::BlockAuthorship::this_node);
+    EXPECT_EQ(mi.rest_miner_payouts(three)["blocks_found"].get<int>(), 1)
+        << three << " and " << m_addr << " pay the same script";
+    EXPECT_EQ(mi.rest_miner_payouts(bech_uc)["blocks_found"].get<int>(), 1) << bech_uc;
+    EXPECT_EQ(mi.rest_miner_payouts(kMiner)["blocks_found"].get<int>(), 0);
 }
 
 // Requirement 3: rows persisted by the old binaries restore without harm and

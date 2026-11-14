@@ -543,7 +543,7 @@ void wire_store(MI& mi, FoundBlockStore& store)
             rec.share_difficulty = b.share_difficulty;
             rec.pool_hashrate = b.pool_hashrate; rec.share_hash = b.share_hash;
             rec.authorship = static_cast<uint8_t>(b.authorship);
-            return store.store(rec);
+            return store.store(rec, b.replaced_height);
         },
         [&store]() {
             std::vector<MI::FoundBlock> out;
@@ -721,8 +721,9 @@ TEST(FoundBlockStoreKat, StartupBackfillGivesAHeightZeroRowItsHeight)
 
 // A height the header chain CORRECTS (the LTC peer path stored the share
 // absheight, 27707625 for block 3211872, 2026-11-12) moves the row to its
-// real key: the absheight key must not survive to be loaded again, and the
-// verdict then runs at the real height. Wired as main_ltc.cpp wires the store.
+// real key: the absheight key must not survive to be loaded again. Wired as
+// main_ltc.cpp wires the store (FoundBlock::replaced_height names the old
+// key; store() stays O(1), no key scan).
 TEST(FoundBlockStoreKat, CorrectedHeightLeavesOneKey)
 {
     const std::string kLtc = "84024db9063696eabf560504fa15737d6ab15a560441e5bab7fd51bd03571223";
@@ -749,7 +750,7 @@ TEST(FoundBlockStoreKat, CorrectedHeightLeavesOneKey)
         mi.load_persisted_found_blocks();
         mi.correct_found_block_heights([&](const std::string& h) -> uint64_t {
             return h == kLtc ? kReal : 0;
-        });
+        }, /*tip_height=*/kReal + 100);
         EXPECT_FALSE(has_key(t.db, fblk_key("LTC", kAbs, kLtc)))
             << "the absheight key would be loaded again on the next start";
         EXPECT_TRUE(has_key(t.db, fblk_key("LTC", kReal, kLtc)));
@@ -766,4 +767,30 @@ TEST(FoundBlockStoreKat, CorrectedHeightLeavesOneKey)
     for (const auto& b : mi.rest_recent_blocks())
         if (b["hash"].get<std::string>() == kLtc)
             EXPECT_EQ(b["miner"].get<std::string>(), "");
+}
+
+// The record path's correction (the block's own BIP34 height arriving for a
+// row stored at the share absheight) re-keys the stored row the same way.
+TEST(FoundBlockStoreKat, RecordPathCorrectionLeavesOneKey)
+{
+    const std::string kLtc = "84024db9063696eabf560504fa15737d6ab15a560441e5bab7fd51bd03571223";
+    constexpr uint64_t kAbs = 27707625, kReal = 3211872;
+    TempDb t("fblk_height_record_correct");
+    ASSERT_TRUE(t.db.open());
+    FoundBlockStore store(t.db);
+    MI mi(/*testnet=*/false, nullptr, c2pool::address::Blockchain::LITECOIN);
+    wire_store(mi, store);
+    uint256 h; h.SetHex(kLtc);
+    mi.record_found_block(kAbs, h, 1794498365, "LTC", "085cdff070d752d9e137e82396e387ec1641fd75",
+                          kLtc, 0.0, 0.0, 0.0, 0, MI::BlockAuthorship::sharechain_peer);
+    ASSERT_TRUE(has_key(t.db, fblk_key("LTC", kAbs, kLtc)));
+    mi.record_found_block(kReal, h, 1794498365, "LTC", "LVypi56LPcT9jR3e5Y5AdoVc5EGdrVk26F",
+                          kLtc, 0.0, 0.0, 0.0, 0, MI::BlockAuthorship::sharechain_peer,
+                          /*height_from_block=*/true);
+    EXPECT_FALSE(has_key(t.db, fblk_key("LTC", kAbs, kLtc)));
+    EXPECT_TRUE(has_key(t.db, fblk_key("LTC", kReal, kLtc)));
+    const auto loaded = store.load_all();
+    ASSERT_EQ(loaded.size(), 1u);
+    EXPECT_EQ(loaded[0].height, kReal);
+    EXPECT_EQ(loaded[0].finder_address, "LVypi56LPcT9jR3e5Y5AdoVc5EGdrVk26F");
 }
