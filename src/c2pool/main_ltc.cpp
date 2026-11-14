@@ -7240,10 +7240,11 @@ int main(int argc, char* argv[]) {
                     // 3013-3028): Cap 1 (1.67% of pool shares) and Cap 2 (dust)
                     // from the local rate of the miner the job is for, then
                     // compute_share_target clips it into [pre_target3/30,
-                    // pre_target3]. The miner is rate_key (core::stratum::
-                    // job_rate_key): the connection's login key, NOT the key of
-                    // payout_script, which decide_job_payout replaces with the
-                    // operator's on a node-fee job. The operator's key has no
+                    // pre_target3]. The miner is rate_key (IWorkSource::
+                    // build_connection_coinbase_for): the stratum connection's
+                    // login key, NOT the key of payout_script, which
+                    // decide_job_payout replaces with the operator's on a
+                    // node-fee job. The operator's key has no
                     // local rate: a fee job sized by it got the easiest share
                     // target (pre_target3, 30x easier than its miner's at the
                     // hard edge), its shares weighed 1/30 of their work and it
@@ -7252,12 +7253,7 @@ int main(int argc, char* argv[]) {
                     LOG_TRACE << "[ref_hash_fn] getting local_addr_rates...";
                     auto local_addr_rates = web_server.get_local_addr_rates();
                     LOG_TRACE << "[ref_hash_fn] got " << local_addr_rates.size() << " addr rates";
-                    double local_hash_rate = 0.0;
-                    {
-                        auto rate_it = local_addr_rates.find(rate_key);
-                        if (rate_it != local_addr_rates.end())
-                            local_hash_rate = rate_it->second;
-                    }
+                    const double local_hash_rate = ltc::stratum::job_local_hash_rate(local_addr_rates, rate_key);
 
                     ltc::stratum::JobTargetInputs target_in;
                     target_in.local_hash_rate = local_hash_rate;

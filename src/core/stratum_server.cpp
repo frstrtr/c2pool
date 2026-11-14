@@ -661,6 +661,10 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
         // to another one (even an empty login) gets new work at once.
         const bool had_identity = !username_.empty() || !merged_addresses_.empty();
         username_ = params[0];
+        // The login key goes with the login: a re-authorize to a keyless login
+        // (empty, P2WSH, P2TR) must not keep the previous login's key, which
+        // its pseudoshares would be recorded under and its jobs sized by.
+        pubkey_hash_ = {};
         authorized_ = true;
         if (!mining_interface_->merged_ready()) {
             // Merged chains are configured but not attached yet: a login
@@ -1404,8 +1408,12 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
     snapshot.subsidy         = job.subsidy;
     snapshot.witness_commitment_hex = job.witness_commitment_hex;
     snapshot.witness_root            = job.witness_root;
-    snapshot.share_bits      = mining_interface_->get_share_bits();
-    snapshot.share_max_bits  = mining_interface_->get_share_max_bits();
+    // The share bits the gate below judged this submission by (its job's own;
+    // the live ones only for a job without them): work sources classify the
+    // submission against these (BTC/BCH mining_submit).
+    snapshot.share_bits      = sb;
+    snapshot.share_max_bits  = core::stratum::pool_share_bits(job.frozen_max_bits,
+                                                               mining_interface_->get_share_max_bits());
     // Pass frozen share fields through to ShareCreationParams
     snapshot.frozen_ref.absheight = job.frozen_absheight;
     snapshot.frozen_ref.abswork = job.frozen_abswork;
@@ -1873,8 +1881,8 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
         job_payout_script = payout_script;
         job_merged_scripts = std::map<uint32_t, std::vector<unsigned char>>(merged_addrs.begin(), merged_addrs.end());
         // The share target is sized by this connection's login key (its
-        // pseudoshares' key), not by the job's payout: a node-fee job is its
-        // miner's job but for the payout (core::stratum::job_rate_key).
+        // pseudoshares' key, zero for a keyless login), not by the job's
+        // payout: a node-fee job is its miner's job but for the payout.
         cbr = mining_interface_->build_connection_coinbase_for(
             pubkey_hash_, frozen_prev_share, extranonce1_, payout_script, merged_addrs);
         if (cbr.held) {

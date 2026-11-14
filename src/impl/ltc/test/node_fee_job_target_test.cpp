@@ -26,11 +26,11 @@
 // keeps its weight too.
 //
 // Pinned on the real pieces of a job: MiningInterface::decide_job_payout (the
-// fee draw), core::stratum::job_rate_key (whose rate sizes the job),
-// ltc::stratum::job_desired_share_target (Cap 1, as ref_hash_fn applies it),
+// fee draw), MiningInterface::build_connection_coinbase_for (the rate key:
+// the connection's login key), ltc::stratum::job_local_hash_rate and
+// job_desired_share_target (as main_ltc's ref_hash_fn applies them),
 // ltc::ShareTracker::compute_share_target (the band clip) and
-// core::stratum::pool_share_bits (the share gate), through
-// MiningInterface::build_connection_coinbase_for where a coinbase is built.
+// core::stratum::pool_share_bits (the share gate).
 // ---------------------------------------------------------------------------
 
 #include <gtest/gtest.h>
@@ -92,8 +92,7 @@ struct Node {
     uint32_t share_bits(const PayoutKey& rate_key)
     {
         ltc::stratum::JobTargetInputs in;
-        const auto it = rates.find(rate_key);
-        in.local_hash_rate = it == rates.end() ? 0.0 : it->second;
+        in.local_hash_rate = ltc::stratum::job_local_hash_rate(rates, rate_key);
         in.share_period = ltc::PoolConfig::share_period();
         const auto desired = ltc::stratum::job_desired_share_target(in);
         return tracker.compute_share_target(uint256(), 1600000000u, desired).bits;
@@ -244,19 +243,18 @@ TEST(NodeFeeJobTarget, OperatorsOwnJobsAreSizedByItsRate)
 TEST(NodeFeeJobTarget, OperatorsWeightIsTheFee)
 {
     core::random::seed(kSeed);
-    Node node;
-    MiningInterface mi{/*testnet=*/true};
+    Rig r;   // each job: decide_job_payout + build_connection_coinbase_for, as the session builds it
     const auto miner = p2pkh(0x0a);
     const auto op = p2pkh(0x0e);
     const double fee = 1.0;   // percent
-    mi.set_node_fee(fee, op);
+    r.mi.set_node_fee(fee, op);
 
     constexpr int kConnections = 10;
     constexpr int kRounds = 20000;
-    const double a_easy = attempts(node.easiest());
+    const double a_easy = attempts(r.node.easiest());
     const double conn_rate = a_easy / 5.8;          // H/s per connection
     const double refresh_rate = 1.0 / 4.17;         // template refreshes / s
-    node.rates[key_of(0x0a)] = conn_rate * kConnections;
+    r.node.rates[key_of(0x0a)] = conn_rate * kConnections;
 
     const std::vector<double> conn_rates(kConnections, conn_rate);
     double owner = 0.0, total = 0.0;
@@ -265,12 +263,10 @@ TEST(NodeFeeJobTarget, OperatorsWeightIsTheFee)
         std::vector<uint32_t> bits(kConnections);
         std::vector<bool> is_fee(kConnections);
         for (int c = 0; c < kConnections; ++c) {
-            auto payout = miner;
-            Merged merged;
-            mi.decide_job_payout(payout, merged);
+            const auto [payout, job_bits] = r.job(key_of(0x0a), miner);
             is_fee[c] = payout == op;
             draws += is_fee[c];
-            bits[c] = node.share_bits(core::stratum::job_rate_key(key_of(0x0a), payout));
+            bits[c] = job_bits;
         }
         const auto weight = round_weights(bits, conn_rates, refresh_rate);
         for (int c = 0; c < kConnections; ++c) {

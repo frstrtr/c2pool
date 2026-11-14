@@ -200,26 +200,6 @@ inline PayoutKey payout_script_key(const std::vector<unsigned char>& script)
     return key;
 }
 
-/// The key whose local hash rate sizes a job's share target (p2pool get_work:
-/// the desired share target from the local rate of the miner the work is
-/// for): the connection's login key, the key its pseudoshares are recorded
-/// under (StratumServer::record_pseudoshare). Not the job's payout:
-/// decide_job_payout gives a job to the node operator (the node fee) by
-/// replacing its payout, and the operator's key has no local rate of its own
-/// here. Sized by it, a fee job got the easiest share target the chain allows
-/// (30x easier than its miner's jobs at the hard edge of the band): its shares
-/// weighed 1/30 of the work behind them and the job ended at its first, quick
-/// share, so the operator got a small part of the fee. Sized by the miner's
-/// rate, a fee job is the job it replaced but for its payout, and the
-/// operator's weight is the fee. A login without a key (empty, P2WSH, P2TR:
-/// its payout is redistributed): the job payout's key.
-inline PayoutKey job_rate_key(const PayoutKey& login_key, const std::vector<unsigned char>& job_payout_script)
-{
-    if (login_key != PayoutKey{})
-        return login_key;
-    return payout_script_key(job_payout_script);
-}
-
 /// The share bits a submission is judged by when deciding whether it makes a
 /// share (StratumSession::handle_submit's pool-share gate): its job's own,
 /// frozen when the job was built, the bits the share it makes carries (p2pool
@@ -230,6 +210,8 @@ inline PayoutKey job_rate_key(const PayoutKey& login_key, const std::vector<unsi
 /// was a harder one (another miner's, or any job after a node-fee job sized
 /// by the operator's key), and a harder job's submission went to share
 /// creation, which refused its PoW, whenever the last job built was easier.
+/// The work source's mining_submit gets the same bits (JobSnapshot::share_bits;
+/// BTC/BCH classify the submission against them).
 inline uint32_t pool_share_bits(uint32_t job_frozen_bits, uint32_t live_bits)
 {
     return job_frozen_bits != 0 ? job_frozen_bits : live_bits;

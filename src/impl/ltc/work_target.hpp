@@ -61,10 +61,20 @@ inline uint256 average_attempts_to_target(double avg_attempts)
     return out;
 }
 
+// The local hash rate a job's share target is sized by: the rate of
+// `rate_key` (ref_hash_fn's: the stratum connection's login key, never the key
+// of a payout decide_job_payout substituted) in the node's per-address rates
+// (StratumServer::get_local_addr_rates); 0 when it has none.
+template <class AddrRates, class Key>
+double job_local_hash_rate(const AddrRates& rates, const Key& rate_key)
+{
+    const auto it = rates.find(rate_key);
+    return it == rates.end() ? 0.0 : it->second;
+}
+
 // What a job's desired share target is computed from (ref_hash_fn, at job
-// time). local_hash_rate is the local rate of the miner the job is for: the
-// rate of core::stratum::job_rate_key, never of a payout decide_job_payout
-// substituted (the node fee).
+// time). local_hash_rate is the local rate of the miner the job is for
+// (job_local_hash_rate).
 struct JobTargetInputs
 {
     double   local_hash_rate{0.0};   // H/s

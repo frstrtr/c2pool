@@ -480,9 +480,9 @@ public:
     // the share tracker state (prev_share, absheight, abswork, etc.) and
     // the miner's payout address (implicit via existing connection state).
     // Called per-connection during work generation. `rate_key` is the key
-    // whose local hash rate sizes the job's share target
-    // (core::stratum::job_rate_key): the miner's, also on a job whose payout
-    // decide_job_payout gave to the node operator.
+    // whose local hash rate sizes the job's share target: the stratum
+    // connection's login key (IWorkSource::build_connection_coinbase_for),
+    // also on a job whose payout decide_job_payout gave to the node operator.
     using ref_hash_fn_t = std::function<RefHashResult(
         const uint256& prev_share_hash,
         const std::vector<unsigned char>& coinbase_scriptSig,
@@ -514,7 +514,7 @@ public:
         const std::vector<unsigned char>& payout_script,
         const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs) const override;
     // The same for the stratum connection whose login key is `login_key`:
-    // the share target is sized by job_rate_key(login_key, payout_script).
+    // the share target is sized by the local rate of `login_key`.
     CoinbaseResult build_connection_coinbase_for(
         const core::stratum::PayoutKey& login_key,
         const uint256& prev_share_hash,

@@ -13,13 +13,16 @@
 // operator got a fraction of the fee (field: 0.08% of the block for --fee 1,
 // a node of ~150 GH/s that is most of its sharechain).
 //
-// Pinned here: core::stratum::job_rate_key (the login key, else the payout's
-// key), and that MiningInterface::build_connection_coinbase_for hands
-// ref_hash_fn the job's payout AND the rate key of the connection's miner,
-// on a fee job too, while the plain build_connection_coinbase (callers that
-// are no stratum connection) keeps sizing it by the payout. And the share
-// gate (core::stratum::pool_share_bits): a submission is judged by its own
-// job's share bits, not by the last job built for any connection.
+// Pinned here: MiningInterface::build_connection_coinbase_for hands
+// ref_hash_fn the job's payout AND the connection's login key as the rate
+// key (the key its pseudoshares are recorded under, zero for a keyless
+// login), on a fee job too, while the plain build_connection_coinbase
+// (callers that are no stratum connection) sizes it by the payout's key
+// (core::stratum::payout_script_key). And the share gate
+// (core::stratum::pool_share_bits): a submission is judged by its own job's
+// share bits, not by the last job built for any connection. The stratum
+// session's side (it passes its login key, it gates by the job's bits) is
+// pinned over TCP in share_test NodeFeeStratumSession.*.
 // ---------------------------------------------------------------------------
 
 #include <gtest/gtest.h>
@@ -146,16 +149,6 @@ TEST(JobRateKey, PayoutScriptKeyReadsP2pkhP2shP2wpkh)
     EXPECT_EQ(core::stratum::payout_script_key({}), PayoutKey{});
 }
 
-TEST(JobRateKey, TheLoginKeyNotTheJobPayout)
-{
-    // A fee job: the payout is the operator's, the work is the miner's.
-    EXPECT_EQ(core::stratum::job_rate_key(key_of(0x0a), p2pkh(0x0e)), key_of(0x0a));
-    // A login without a key (empty / P2WSH / P2TR, its payout redistributed):
-    // the job payout's key, as before.
-    EXPECT_EQ(core::stratum::job_rate_key(PayoutKey{}, p2pkh(0x0e)), key_of(0x0e));
-    EXPECT_EQ(core::stratum::job_rate_key(PayoutKey{}, p2wpkh(0x0f)), key_of(0x0f));
-}
-
 // The field case: --fee draws the job for the operator. Its payout is the
 // operator's; the key that sizes its share target is the miner's.
 TEST(NodeFeeShareTarget, FeeJobIsSizedByItsMiner)
@@ -179,13 +172,20 @@ TEST(NodeFeeShareTarget, NormalJobIsSizedByItsMiner)
     EXPECT_EQ(r.seen_rate_key, key_of(0x0a)) << "unchanged: the miner's key is its payout's";
 }
 
-TEST(NodeFeeShareTarget, KeylessLoginKeepsThePayoutKey)
+// A keyless login (empty, P2WSH, P2TR): its pseudoshares are recorded under
+// the zero key, and its jobs, fee or redistributed, are sized by it, never by
+// the operator's or the redistribution recipient's key.
+TEST(NodeFeeShareTarget, KeylessLoginIsSizedByItsZeroKey)
 {
     Rig r;
     const auto op = p2pkh(0x0e);
+    r.mi.set_redistribute_fn([] { return std::make_pair(std::string(40, 'c'), uint8_t(0)); });
+    r.mi.set_node_fee(0.0, op);
+    EXPECT_EQ(r.job(PayoutKey{}, {}), p2pkh(0xcc)) << "redistributed";
+    EXPECT_EQ(r.seen_rate_key, PayoutKey{}) << "not the recipient's key";
     r.mi.set_node_fee(100.0, op);
-    r.job(PayoutKey{}, p2pkh(0x0a));
-    EXPECT_EQ(r.seen_rate_key, key_of(0x0e)) << "no login key: the job payout's key";
+    EXPECT_EQ(r.job(PayoutKey{}, {}), op);
+    EXPECT_EQ(r.seen_rate_key, PayoutKey{}) << "not the operator's key: the fee job is the login's job";
 }
 
 TEST(NodeFeeShareTarget, PlainBuildIsSizedByThePayout)

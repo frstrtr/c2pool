@@ -414,7 +414,7 @@ if (BUILD_TESTING AND GTest_FOUND)
     #
     # node_fee_job_target_test.cpp: --fee pays the operator the fee. A node-fee
     # job (decide_job_payout gave its payout to the operator) has its miner's
-    # share bits (core::stratum::job_rate_key -> job_desired_share_target ->
+    # share bits (the login's rate key -> job_desired_share_target ->
     # the REAL ShareTracker::compute_share_target band clip), and over many
     # seeded jobs the operator's expected PPLNS weight equals the jobs the fee
     # drew (was ~0.64 of them; field 0.08% of the block for --fee 1). Same

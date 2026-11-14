@@ -1378,8 +1378,9 @@ MiningInterface::build_connection_coinbase_for(
     const std::vector<unsigned char>& payout_script,
     const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs) const
 {
-    return build_job_coinbase(prev_share_hash, extranonce1_hex, payout_script, merged_addrs,
-                              core::stratum::job_rate_key(login_key, payout_script));
+    // Sized by the login's key, the key its pseudoshares are recorded under
+    // (zero for a keyless login): a fee or redistributed job is its miner's.
+    return build_job_coinbase(prev_share_hash, extranonce1_hex, payout_script, merged_addrs, login_key);
 }
 
 MiningInterface::CoinbaseResult
