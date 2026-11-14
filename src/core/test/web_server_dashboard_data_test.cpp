@@ -155,6 +155,57 @@ TEST(DashboardData, UncomputedLuckIsNullNeverZero)
         << "the trend chart must SKIP unmeasured rows, not draw them at 0";
 }
 
+// #1142 item 8: /luck_stats emits the pool luck aggregates the Recent Blocks
+// "Avg" badge reads. Three blocks 2 s and 4 s apart at expected_time 1 s give
+// lucks 50% and 25% (the first block has none): avg 37.5, min 25, max 50.
+// The average must equal /recent_blocks pool_avg_luck (same rows), and with
+// no measured row every aggregate is null, never 0%.
+TEST(DashboardData, LuckStatsEmitsAvgLuckOverMeasuredBlocks)
+{
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::DASH);
+    wire_dash_template(mi);
+    const std::string addr = "XoZcEFbqwnty5secW7HYjdQEZYfubMkURu";
+    const std::string h1 =
+        "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1";
+    const std::string h2 =
+        "a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2";
+    const std::string h3 =
+        "a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3";
+
+    mi.record_found_block(2516911, uint256S(h1), 1785955172, "DASH",
+                          addr, h1, 0.0, 240228.0, 0.0, 0);
+    {
+        auto luck = mi.rest_luck_stats();
+        EXPECT_EQ(luck["blocks_found"].get<uint64_t>(), 1u);
+        EXPECT_EQ(luck["blocks_with_luck"].get<uint64_t>(), 0u);
+        EXPECT_TRUE(luck["avg_luck"].is_null())
+            << "no measured luck -> null, never a fabricated 0%";
+        EXPECT_TRUE(luck["min_luck"].is_null());
+        EXPECT_TRUE(luck["max_luck"].is_null());
+    }
+
+    mi.record_found_block(2516914, uint256S(h2), 1785955174, "DASH",
+                          addr, h2, 0.0, 240228.0, 0.0, 0);
+    mi.record_found_block(2516917, uint256S(h3), 1785955178, "DASH",
+                          addr, h3, 0.0, 240228.0, 0.0, 0);
+
+    auto luck = mi.rest_luck_stats();
+    EXPECT_EQ(luck["blocks_found"].get<uint64_t>(), 3u);
+    EXPECT_EQ(luck["blocks_with_luck"].get<uint64_t>(), 2u);
+    ASSERT_TRUE(luck["avg_luck"].is_number());
+    EXPECT_DOUBLE_EQ(luck["avg_luck"].get<double>(), 37.5);
+    EXPECT_DOUBLE_EQ(luck["min_luck"].get<double>(), 25.0);
+    EXPECT_DOUBLE_EQ(luck["max_luck"].get<double>(), 50.0);
+
+    auto arr = mi.rest_recent_blocks();
+    ASSERT_FALSE(arr.empty());
+    ASSERT_TRUE(arr[0]["pool_avg_luck"].is_number());
+    EXPECT_DOUBLE_EQ(arr[0]["pool_avg_luck"].get<double>(),
+                     luck["avg_luck"].get<double>())
+        << "both endpoints must average the same rows";
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // 2. Junk-row honesty + ENRICHMENT
 // ═══════════════════════════════════════════════════════════════════════════
