@@ -3446,6 +3446,82 @@ std::string MiningInterface::block_explorer_prefix() const
     }
 }
 
+std::string MiningInterface::merged_block_explorer_prefix(const std::string& chain_label)
+{
+    // Testnet aux labels carry a lowercase "t" ("tDOGE"): no public testnet
+    // explorer is named for them, so the link is null rather than a mainnet
+    // URL that cannot resolve the hash.
+    if (chain_label.size() > 1 && chain_label[0] == 't')
+        return "";
+    std::string label = chain_label;
+    for (auto& ch : label) if (ch >= 'a' && ch <= 'z') ch = static_cast<char>(ch - 32);
+    if (label == "DOGE") return "https://blockchair.com/dogecoin/block/";
+    if (label == "NMC")  return "https://nmc.tokenview.io/en/blockdetail/";
+    return "";
+}
+
+bool MiningInterface::found_block_chain_is_primary(const std::string& chain_label,
+                                                   const std::string& parent_hash,
+                                                   const std::string& node_symbol)
+{
+    // Only a merged (aux) row names the parent block it rode (#946).
+    if (!parent_hash.empty())
+        return false;
+    if (node_symbol.empty() || chain_label.empty())
+        return true;
+    auto upper = [](std::string s) {
+        for (auto& ch : s) if (ch >= 'a' && ch <= 'z') ch = static_cast<char>(ch - 32);
+        return s;
+    };
+    std::string label = chain_label;
+    if (label.size() > 1 && label[0] == 't')   // testnet: "tLTC" is LTC
+        label.erase(0, 1);
+    return upper(label) == upper(node_symbol);
+}
+
+bool MiningInterface::is_primary_found_block(const FoundBlock& b) const
+{
+    return found_block_chain_is_primary(b.chain, b.parent_hash, node_symbol());
+}
+
+std::string MiningInterface::found_block_share_hash(const FoundBlock& b) const
+{
+    if (b.share_hash.empty() || !is_primary_found_block(b))
+        return b.share_hash;
+    auto lower = [](std::string s) {
+        for (auto& ch : s) if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch + 32);
+        return s;
+    };
+    return lower(b.share_hash) == lower(b.hash) ? b.share_hash : std::string();
+}
+
+std::string MiningInterface::found_block_miner_display(const std::string& stored)
+{
+    if (stored.empty() || stored.size() % 2 != 0)
+        return stored;
+    for (char c : stored)
+        if (!std::isxdigit(static_cast<unsigned char>(c)))
+            return stored;   // an address: base58 / bech32 are never all-hex
+    // All-hex: the pre-fix LTC peer path's HexStr(...). Decode it; an address
+    // string comes back printable (v34/v35 m_address), a 20-byte pubkey hash
+    // (v36) does not and has no script type to render it with.
+    std::string decoded;
+    decoded.reserve(stored.size() / 2);
+    auto nib = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        return c - 'A' + 10;
+    };
+    for (size_t i = 0; i < stored.size(); i += 2)
+        decoded.push_back(static_cast<char>((nib(stored[i]) << 4) | nib(stored[i + 1])));
+    if (decoded.size() < 26 || decoded.size() > 90)
+        return "";
+    for (char c : decoded)
+        if (!std::isalnum(static_cast<unsigned char>(c)))
+            return "";
+    return decoded;
+}
+
 nlohmann::json MiningInterface::found_block_row_locked(const FoundBlock& b) const
 {
     static const char* status_str[] = {"pending", "confirmed", "orphaned", "stale"};
@@ -3480,7 +3556,12 @@ nlohmann::json MiningInterface::found_block_row_locked(const FoundBlock& b) cons
     // block reward in whole coins, luck-provenance sample counts, and a
     // first-row pool luck aggregate. All DISPLAY-ONLY and honest-null (#942):
     // an unmeasured value is null, never a fabricated 0.
-    const std::string explorer_prefix = block_explorer_prefix();
+    // A merged (aux) row reachable here through /found_block/<hash> links its
+    // OWN chain's explorer: the parent prefix sent a DOGE id to
+    // blockchair/litecoin, which answers "not found".
+    const bool primary_row = is_primary_found_block(b);
+    const std::string explorer_prefix = primary_row
+        ? block_explorer_prefix() : merged_block_explorer_prefix(b.chain);
     auto explorer_url = [&](const std::string& hash_hex) -> nlohmann::json {
         if (explorer_prefix.empty() || hash_hex.empty())
             return nlohmann::json(nullptr);
@@ -3570,10 +3651,13 @@ nlohmann::json MiningInterface::found_block_row_locked(const FoundBlock& b) cons
         {"checks", b.check_count},
         {"chain", b.chain},
         {"confirmations", b.confirmations},
-        {"miner", b.miner},
+        // Rendered on read so a pre-fix peer row's raw hex never reaches the
+        // UI as if it were an address (found_block_miner_display).
+        {"miner", found_block_miner_display(b.miner)},
         // #946: no share behind the find (e.g. an aux solve that missed the
-        // share target) is null, never "".
-        {"share", str_or_null(b.share_hash)},
+        // share target) is null, never "". A pre-fix finder row naming the
+        // winner's PARENT share is null too (found_block_share_hash).
+        {"share", str_or_null(found_block_share_hash(b))},
         {"found_locally", have_local_record},
         // Authorship, set at the call site that knows. "unknown" is a real
         // answer -- a coin lane that has not labelled its sites -- and the
@@ -3632,6 +3716,14 @@ nlohmann::json MiningInterface::rest_recent_blocks()
 
     std::lock_guard<std::mutex> lock(m_blocks_mutex);
     for (const auto& b : m_found_blocks) {
+        // THIS chain's blocks only. A merged (aux) find shares the ledger --
+        // record_merged_found_block keeps it there for verification and
+        // persistence -- but it is not a block of this chain: it belongs on
+        // /recent_merged_blocks, and must not count toward the "Recent Blocks"
+        // total or the pool luck below. The finder listed its DOGE 6454700
+        // here as a second row (2026-11-12); its peers, which learn aux finds
+        // only into the merged list, did not.
+        if (!is_primary_found_block(b)) continue;
         auto row = found_block_row_locked(b);
         // luck_approximate is true exactly on the rows that computed a luck,
         // so those rows feed the first-row pool aggregate below.
@@ -4092,10 +4184,11 @@ nlohmann::json MiningInterface::rest_global_stats()
     // zero it): the newest row for THIS node's primary chain.
     {
         uint64_t last_h = 0, last_ts = 0;
-        const std::string primary = node_symbol();
         std::lock_guard<std::mutex> lock(m_blocks_mutex);
         for (const auto& b : m_found_blocks) {
-            if (!primary.empty() && b.chain != primary) continue;
+            // Same rule as /recent_blocks (the testnet "tLTC" label is this
+            // chain too; the plain symbol compare dropped every testnet row).
+            if (!is_primary_found_block(b)) continue;
             if (b.height > last_h) { last_h = b.height; last_ts = b.ts; }
         }
         result["last_block"] = last_h;
@@ -4792,6 +4885,29 @@ void MiningInterface::record_found_block(uint64_t height, const uint256& hash, u
                             " unattributed): h=" << existing.height
                          << " hash=" << hash_hex.substr(0, 16)
                          << " miner=" << miner;
+            } else {
+                // FIELD FILL on an attributed row. Two record paths meet on one
+                // block -- the finder's own submit and the sharechain hook when
+                // the winning share verifies -- and a submit with no stratum
+                // context (JSON-RPC submitblock) knows the miner but no share.
+                // Whatever one path lacked, the other fills. Fill-only: a known
+                // value is never overwritten.
+                if (existing.miner.empty() && !miner.empty()) {
+                    existing.miner = miner;
+                    row_dirty = true;
+                }
+                if (existing.share_hash.empty() && !share_hash.empty()) {
+                    existing.share_hash = share_hash;
+                    row_dirty = true;
+                }
+                if (existing.share_difficulty <= 0.0 && share_difficulty > 0.0) {
+                    existing.share_difficulty = share_difficulty;
+                    row_dirty = true;
+                }
+                if (existing.subsidy == 0 && subsidy != 0) {
+                    existing.subsidy = subsidy;
+                    row_dirty = true;
+                }
             }
 
             // NETWORK-DIFFICULTY REPAIR — independent of attribution state.
@@ -4924,8 +5040,12 @@ void MiningInterface::record_found_block(uint64_t height, const uint256& hash, u
     // than staying pinned to the last winning share forever. Reached only for
     // genuinely new blocks -- the (hash, chain) dedup above returns early on
     // duplicates, so twin / replayed notifications never double-reset. Tied to
-    // the block-found event, not a timer.
-    reset_best_difficulty_round(ts);
+    // the block-found event, not a timer. A PARENT-chain block only: a merged
+    // (aux) find ends no round -- the sharechain's round is the parent's, and
+    // only the finder records its aux finds here, so resetting on them put the
+    // finder's round boundary where no peer has one.
+    if (found_block_chain_is_primary(chain, /*parent_hash=*/"", node_symbol()))
+        reset_best_difficulty_round(ts);
 }
 
 void MiningInterface::set_found_block_body(const std::string& block_hash,
@@ -5017,6 +5137,27 @@ MiningInterface::MergedSubmitScope::~MergedSubmitScope()
     t_merged_submit_ctx = m_prev;
 }
 
+namespace {
+// The submitting thread's FoundBlockSubmitScope (null outside a stratum submit).
+thread_local const core::FoundBlockSubmitContext* t_found_block_submit_ctx = nullptr;
+} // namespace
+
+MiningInterface::FoundBlockSubmitScope::FoundBlockSubmitScope(core::FoundBlockSubmitContext ctx)
+    : m_ctx(std::move(ctx)), m_prev(t_found_block_submit_ctx)
+{
+    t_found_block_submit_ctx = &m_ctx;
+}
+
+MiningInterface::FoundBlockSubmitScope::~FoundBlockSubmitScope()
+{
+    t_found_block_submit_ctx = m_prev;
+}
+
+const core::FoundBlockSubmitContext* MiningInterface::found_block_submit_context()
+{
+    return t_found_block_submit_ctx;
+}
+
 void MiningInterface::record_merged_found_block(const std::string& symbol, int height,
                                                 const std::string& block_hash, bool accepted,
                                                 uint64_t coinbase_value)
@@ -5089,16 +5230,19 @@ void MiningInterface::recompute_found_block_luck_locked()
 std::optional<MiningInterface::FoundBlock>
 MiningInterface::learn_found_block_height_locked(const std::string& hash,
                                                  const std::string& chain,
-                                                 uint64_t height)
+                                                 uint64_t height,
+                                                 bool replace_known)
 {
     // CALLER HOLDS m_blocks_mutex.
     if (height == 0) return std::nullopt;
     auto it = std::find_if(m_found_blocks.begin(), m_found_blocks.end(),
         [&](const FoundBlock& b) { return b.hash == hash && b.chain == chain; });
-    if (it == m_found_blocks.end() || it->height != 0) return std::nullopt;
+    if (it == m_found_blocks.end() || it->height == height) return std::nullopt;
+    if (it->height != 0 && !replace_known) return std::nullopt;
+    LOG_INFO << "[Pool] found-block height " << (it->height ? "corrected" : "learned")
+             << ": hash=" << hash.substr(0, 16)
+             << " chain=" << chain << " h=" << it->height << " -> " << height;
     it->height = height;
-    LOG_INFO << "[Pool] found-block height learned: hash=" << hash.substr(0, 16)
-             << " chain=" << chain << " h=0 -> " << height;
     // Same order record_found_block keeps: newest first by height, ts breaks
     // ties. The row's interval was derived from its old place (none, at the
     // bottom); the recompute re-derives every interval still unknown.
@@ -5146,6 +5290,43 @@ void MiningInterface::backfill_found_block_heights(const block_height_lookup_fn&
     if (!unknown.empty())
         LOG_INFO << "[Pool] found blocks at unknown height: " << unknown.size()
                  << ", height learned for " << learned.size();
+}
+
+void MiningInterface::correct_found_block_heights(const block_height_lookup_fn& height_fn)
+{
+    if (!height_fn) return;
+    // Snapshot under the lock, ask the lookup with it released (the header
+    // chain has locks of its own), as backfill_found_block_heights does.
+    struct Known { std::string hash, chain; uint64_t height; };
+    std::vector<Known> known;
+    {
+        std::lock_guard<std::mutex> lock(m_blocks_mutex);
+        for (const auto& b : m_found_blocks)
+            if (b.height != 0 && !b.hash.empty() && is_primary_found_block(b))
+                known.push_back({b.hash, b.chain, b.height});
+    }
+    std::vector<FoundBlock> corrected;
+    for (const auto& k : known) {
+        uint64_t h = 0;
+        try { h = height_fn(k.hash); } catch (...) { h = 0; }
+        if (h == 0 || h == k.height) continue;
+        std::lock_guard<std::mutex> lock(m_blocks_mutex);
+        if (auto row = learn_found_block_height_locked(k.hash, k.chain, h,
+                                                       /*replace_known=*/true))
+            corrected.push_back(std::move(*row));
+    }
+    if (m_persist_block_fn) {
+        for (const auto& b : corrected) {
+            try { m_persist_block_fn(b); }
+            catch (const std::exception& e) {
+                LOG_WARNING << "[Pool] Failed to persist corrected found-block height: "
+                            << e.what();
+            }
+        }
+    }
+    if (!corrected.empty())
+        LOG_INFO << "[Pool] found-block heights corrected from the header chain: "
+                 << corrected.size() << " of " << known.size();
 }
 
 void MiningInterface::load_persisted_found_blocks()
@@ -7442,10 +7623,21 @@ nlohmann::json MiningInterface::rest_luck_stats()
 {
     nlohmann::json result = nlohmann::json::object();
     std::lock_guard<std::mutex> lock(m_blocks_mutex);
-    result["luck_available"] = !m_found_blocks.empty();
 
+    // THIS chain's blocks only (the /recent_blocks rule). A merged (aux) row's
+    // luck is computed against the PARENT's network difficulty and the aux
+    // chain's own inter-find gaps -- meaningless -- and it polluted the 7d/30d
+    // averages. Worse, the open round was timed from m_found_blocks.front(),
+    // the highest-HEIGHT row: on an LTC finder that is any DOGE row (DOGE
+    // heights ~6.4M sit above LTC's ~3.2M), so "Round: N%" restarted at every
+    // local DOGE find. The round runs from the newest parent block by time.
+    uint64_t last_primary_ts = 0;
+    bool any_primary = false;
     nlohmann::json blocks = nlohmann::json::array();
     for (const auto& b : m_found_blocks) {
+        if (!is_primary_found_block(b)) continue;
+        any_primary = true;
+        if (b.ts > last_primary_ts) last_primary_ts = b.ts;
         // luck==0 is "never computed" (relay-learned row, or recorded with
         // no network difficulty), not "0% lucky". The chart previously drew
         // those as 0-value points, which is exactly the wrong-luck-trend the
@@ -7455,14 +7647,15 @@ nlohmann::json MiningInterface::rest_luck_stats()
                           {"luck", b.luck > 0.0 ? nlohmann::json(b.luck)
                                                 : nlohmann::json(nullptr)}});
     }
+    result["luck_available"] = any_primary;
     result["blocks"] = blocks;
 
     // Current round luck: expected_time / time_since_last_block * 100
     // Matches p2pool: shows how the ongoing round compares to expectation
     nlohmann::json current_luck_val = nullptr;
-    if (!m_found_blocks.empty()) {
+    if (any_primary && last_primary_ts > 0) {
         auto now_ts = static_cast<double>(std::time(nullptr));
-        double time_since_last = now_ts - static_cast<double>(m_found_blocks.front().ts);
+        double time_since_last = now_ts - static_cast<double>(last_primary_ts);
 
         // Get LIVE pool hashrate and network difficulty
         double pool_hr = m_pool_hashrate_fn ? m_pool_hashrate_fn() : 0;
@@ -7818,6 +8011,10 @@ nlohmann::json MiningInterface::rest_miner_payouts(const std::string& address)
         }
 
         for (const auto& b : m_found_blocks) {
+            // Parent-chain blocks only: a merged (DOGE) row counted as a block
+            // this miner found, added its aux reward to the parent-coin totals
+            // and linked its aux hash through the parent explorer.
+            if (!is_primary_found_block(b)) continue;
             if (b.miner == address || address.empty()) {
                 ++blocks_found;
                 double payout_estimate = b.subsidy > 0 ? static_cast<double>(b.subsidy) / 1e8 : 0;
@@ -9188,21 +9385,91 @@ nlohmann::json MiningInterface::rest_pplns_miner(const std::string& address)
 
 nlohmann::json MiningInterface::rest_recent_merged_blocks()
 {
+    constexpr size_t kLimit = 50;
     nlohmann::json arr = nlohmann::json::array();
-    if (!m_mm_manager) return arr;
 
-    for (const auto& blk : m_mm_manager->get_recent_blocks(50)) {
+    // This node's OWN merged finds live in the found-block ledger
+    // (record_merged_found_block: verified, persisted), the merged manager's
+    // in-memory list holds them only until a restart -- the local submit never
+    // reaches the merged block store, only peer-learned finds do. So a finder
+    // that had restarted served [] here for the DOGE block it found while its
+    // peers listed it (2026-11-12, DOGE 6454700). Serve the union, one row per
+    // aux block hash; the ledger row fills what the manager's lacks (the
+    // manager never learns the local miner, and its local parent_hash is the
+    // scrypt PoW hash, not the parent block id).
+    std::vector<FoundBlock> ledger;
+    {
+        std::lock_guard<std::mutex> lock(m_blocks_mutex);
+        for (const auto& b : m_found_blocks)
+            if (!is_primary_found_block(b))
+                ledger.push_back(b);
+    }
+    std::vector<c2pool::merged::MergedMiningManager::ChainInfo> infos;
+    std::vector<c2pool::merged::DiscoveredMergedBlock> discovered;
+    if (m_mm_manager) {
+        infos = m_mm_manager->get_chain_infos();
+        discovered = m_mm_manager->get_recent_blocks(kLimit);
+    }
+    auto chain_id_of = [&infos](const std::string& symbol) -> nlohmann::json {
+        for (const auto& ci : infos)
+            if (ci.symbol == symbol) return nlohmann::json(ci.chain_id);
+        return nlohmann::json(nullptr);
+    };
+    auto explorer_of = [](const std::string& symbol, const std::string& hash) -> nlohmann::json {
+        const std::string prefix = merged_block_explorer_prefix(symbol);
+        if (prefix.empty() || hash.empty()) return nlohmann::json(nullptr);
+        return nlohmann::json(prefix + hash);
+    };
+    auto ledger_row = [&ledger](const std::string& hash) -> const FoundBlock* {
+        for (const auto& b : ledger)
+            if (b.hash == hash) return &b;
+        return nullptr;
+    };
+
+    std::set<std::string> served;
+    for (const auto& blk : discovered) {
         nlohmann::json j;
         // Field names match dashboard.html renderMergedBlocks() expectations
+        const FoundBlock* own = ledger_row(blk.block_hash);
+        std::string miner = blk.miner;
+        std::string parent = blk.parent_hash;
+        if (own) {
+            if (miner.empty()) miner = own->miner;
+            if (blk.is_local && !own->parent_hash.empty()) parent = own->parent_hash;
+        }
         j["ts"]          = blk.timestamp;
         j["symbol"]      = blk.symbol;
         j["network"]     = blk.symbol;
         j["chainid"]     = blk.chain_id;
         j["pow_hash"]    = blk.block_hash;
-        j["parent_hash"] = blk.parent_hash;
+        j["parent_hash"] = parent;
         j["height"]      = blk.height;
-        j["miner"]       = blk.miner.empty() ? nlohmann::json(nullptr) : nlohmann::json(blk.miner);
-        j["verified"]    = blk.accepted ? nlohmann::json(true) : nlohmann::json(nullptr);
+        j["miner"]       = miner.empty() ? nlohmann::json(nullptr) : nlohmann::json(miner);
+        j["verified"]    = (blk.accepted || (own && own->status == BlockStatus::confirmed))
+                               ? nlohmann::json(true) : nlohmann::json(nullptr);
+        j["explorer_url"] = explorer_of(blk.symbol, blk.block_hash);
+        served.insert(blk.block_hash);
+        arr.push_back(std::move(j));
+    }
+    // Ledger rows the manager does not hold (newest first by height).
+    for (const auto& b : ledger) {
+        if (arr.size() >= kLimit) break;
+        if (served.count(b.hash)) continue;
+        served.insert(b.hash);
+        nlohmann::json j;
+        j["ts"]          = b.ts;
+        j["symbol"]      = b.chain;
+        j["network"]     = b.chain;
+        j["chainid"]     = chain_id_of(b.chain);
+        j["pow_hash"]    = b.hash;
+        j["parent_hash"] = b.parent_hash.empty() ? nlohmann::json(nullptr)
+                                                 : nlohmann::json(b.parent_hash);
+        j["height"]      = b.height;
+        j["miner"]       = b.miner.empty() ? nlohmann::json(nullptr) : nlohmann::json(b.miner);
+        j["verified"]    = b.status == BlockStatus::confirmed ? nlohmann::json(true)
+                         : b.status == BlockStatus::orphaned  ? nlohmann::json(false)
+                                                              : nlohmann::json(nullptr);
+        j["explorer_url"] = explorer_of(b.chain, b.hash);
         arr.push_back(std::move(j));
     }
     return arr;
@@ -11222,6 +11489,12 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
         // probabilistically replaced with the node operator's address for the
         // node fee); the merged addresses are share_merged (above).
         uint256 created_share;  // #946: named on an own-find DOGE row
+        // What a found-block record needs and the header cannot give: the
+        // minted share, whom it pays, its BIP34 height and committed coinbase
+        // value -- the same facts every peer reads off the gossiped share.
+        // Login address until a share's payout script is known.
+        core::FoundBlockSubmitContext found_ctx;
+        found_ctx.miner = primary_addr;
         if (m_create_share_fn) {
             ShareCreationParams params;
             // Miner display name: PRIMARY_ADDR.WORKER (strip merged addrs, keep worker)
@@ -11437,8 +11710,18 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
             if (!params.payout_script.empty() && params.bits != 0) {
                 created_share = m_create_share_fn(params);
             }
+            // The miner is the share's payout script rendered for the coin --
+            // what peers render from the gossiped share (after any node-fee
+            // draw the share pays whom its script names, not the login).
+            // Rendered on the LTC lane only; elsewhere the login stays.
+            static const std::vector<unsigned char> kNoScript;
+            found_ctx = core::make_found_block_submit_context(
+                m_blockchain == Blockchain::LITECOIN ? params.payout_script : kNoScript,
+                /*is_litecoin=*/true, m_testnet, primary_addr, created_share,
+                params.coinbase_scriptSig, params.subsidy,
+                params.has_frozen_fields ? params.frozen_bits : 0);
         }
-        
+
         // Attempt block construction + submission only when PoW meets blockchain target.
         if (m_coin_node && !extranonce1.empty()) {
             // Header first: the merged-mining check needs only the header, the
@@ -11448,7 +11731,7 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
             if (!header_hex.empty()) {
                 // Check merged mining targets for every share (aux targets are lower)
                 bool merged_found = check_merged_mining(header_hex, extranonce1, extranonce2, job,
-                                                        primary_addr, created_share);
+                                                        found_ctx.miner, created_share);
 
                 auto block_bytes = ParseHex(header_hex);
                 if (block_bytes.size() == 80) {
@@ -11501,6 +11784,16 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
                                 LOG_INFO << "[BLOCK] " << (merged_found ? "Twin" : "Parent")
                                          << " block found by " << username
                                          << " hash=" << block_hash.GetHex().substr(0,16);
+                                // The block-submitted callback fires inside
+                                // submitblock() on this thread and records the
+                                // row from this. The minted share IS this block
+                                // only when its header is the one submitted (the
+                                // job-less fallback may rebuild under a newer
+                                // header): otherwise the share is not named.
+                                core::FoundBlockSubmitContext submit_ctx = found_ctx;
+                                if (submit_ctx.share_hash != block_hash.GetHex())
+                                    submit_ctx.share_hash.clear();
+                                FoundBlockSubmitScope found_scope(std::move(submit_ctx));
                                 auto submit_res = submitblock(block_hex);
                                 if (!submit_res.contains("error")) {
                                     mark_block_submitted(block_hash);

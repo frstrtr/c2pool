@@ -718,3 +718,52 @@ TEST(FoundBlockStoreKat, StartupBackfillGivesAHeightZeroRowItsHeight)
     arm_competitor_verdict(mi);
     EXPECT_EQ(mi.run_block_verification_now(kStaleHash), -1);
 }
+
+// A height the header chain CORRECTS (the LTC peer path stored the share
+// absheight, 27707625 for block 3211872, 2026-11-12) moves the row to its
+// real key: the absheight key must not survive to be loaded again, and the
+// verdict then runs at the real height. Wired as main_ltc.cpp wires the store.
+TEST(FoundBlockStoreKat, CorrectedHeightLeavesOneKey)
+{
+    const std::string kLtc = "84024db9063696eabf560504fa15737d6ab15a560441e5bab7fd51bd03571223";
+    const std::string kOther = "84024db9063696ea" + std::string(48, '0');   // same key suffix
+    constexpr uint64_t kAbs = 27707625, kReal = 3211872;
+    TempDb t("fblk_height_correct");
+    ASSERT_TRUE(t.db.open());
+    FoundBlockStore store(t.db);
+    auto ltc_row = [](uint64_t height, const std::string& hash) {
+        FoundBlockRecord rec;
+        rec.chain = "LTC"; rec.height = height; rec.block_hash = hash;
+        rec.timestamp = 1794498365; rec.status = 0;
+        rec.finder_address = "085cdff070d752d9e137e82396e387ec1641fd75";
+        rec.share_hash = hash; rec.authorship = 1;
+        return rec;
+    };
+    ASSERT_TRUE(store.store(ltc_row(kAbs, kLtc)));
+    // A different block whose key shares the 16-hex suffix is not touched.
+    ASSERT_TRUE(store.store(ltc_row(3000000, kOther)));
+
+    {
+        MI mi(/*testnet=*/false, nullptr, c2pool::address::Blockchain::LITECOIN);
+        wire_store(mi, store);
+        mi.load_persisted_found_blocks();
+        mi.correct_found_block_heights([&](const std::string& h) -> uint64_t {
+            return h == kLtc ? kReal : 0;
+        });
+        EXPECT_FALSE(has_key(t.db, fblk_key("LTC", kAbs, kLtc)))
+            << "the absheight key would be loaded again on the next start";
+        EXPECT_TRUE(has_key(t.db, fblk_key("LTC", kReal, kLtc)));
+        EXPECT_TRUE(has_key(t.db, fblk_key("LTC", 3000000, kOther)));
+    }
+    MI mi(/*testnet=*/false, nullptr, c2pool::address::Blockchain::LITECOIN);
+    wire_store(mi, store);
+    mi.load_persisted_found_blocks();
+    const auto rows = mi.get_found_blocks();
+    ASSERT_EQ(rows.size(), 2u);
+    ASSERT_NE(row_of(rows, kLtc), nullptr);
+    EXPECT_EQ(row_of(rows, kLtc)->height, kReal);
+    // The row now renders the miner it can: a bare pubkey hash is not an address.
+    for (const auto& b : mi.rest_recent_blocks())
+        if (b["hash"].get<std::string>() == kLtc)
+            EXPECT_EQ(b["miner"].get<std::string>(), "");
+}

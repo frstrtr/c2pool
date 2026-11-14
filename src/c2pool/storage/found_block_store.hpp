@@ -242,18 +242,28 @@ public:
     /// block -- otherwise the old key, which lists first, would be loaded
     /// again on the next start. Written first, removed second: a crash in
     /// between leaves both, which the load path resolves to the real height.
+    ///
+    /// The same holds for a height the header chain CORRECTS
+    /// (MiningInterface::correct_found_block_heights: an LTC peer row stored
+    /// at the share absheight, 27707625 for block 3211872). One block, one
+    /// key: every other record of this block in the chain is dropped, not only
+    /// the height-0 one. A crash in between leaves both; the next start's
+    /// correction re-stores the row and drops the stale key then.
     bool store(const FoundBlockRecord& rec)
     {
         auto key = make_key(rec.chain, rec.height, rec.block_hash);
         auto data = rec.serialize();
         if (!m_store.put(key, data))
             return false;
-        if (rec.height != 0) {
-            const auto zero_key = make_key(rec.chain, 0, rec.block_hash);
-            std::vector<uint8_t> old;
-            if (m_store.get(zero_key, old)
-                && FoundBlockRecord::deserialize(old).block_hash == rec.block_hash)
-                m_store.remove(zero_key);
+        if (rec.height != 0 && rec.block_hash.size() >= 16) {
+            for (const auto& other : m_store.list_keys("fblk:" + rec.chain + ":", SIZE_MAX)) {
+                if (other == key || !key_ends_with_hash(other, rec.block_hash))
+                    continue;
+                std::vector<uint8_t> old;
+                if (m_store.get(other, old)
+                    && FoundBlockRecord::deserialize(old).block_hash == rec.block_hash)
+                    m_store.remove(other);
+            }
         }
         return true;
     }

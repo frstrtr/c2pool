@@ -208,6 +208,16 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
     # count, retain self-heal, set_last_build no-op on an absent txid, ChainLock
     # round-trip). Header-only over core/uint256. Same fold-into-core_test
     # reasoning as every TU here.
+    # web_server_block_rows_test.cpp: one find, one story on every node -- a
+    # merged (DOGE) find never lists as a /recent_blocks row, counts toward no
+    # parent luck/round/miner total, and is on the finder's own
+    # /recent_merged_blocks; pre-fix persisted rows render honestly. Uses only
+    # the pre-fix public API, so it also runs red against the old code.
+    # found_block_submit_test.cpp: the pieces those rows are built from
+    # (core/found_block_submit.hpp BIP34 height + stratum submit context, the
+    # parent-vs-merged predicate, the pre-fix miner display, the header-chain
+    # height correction, fill-only second records). Same fold-into-core_test
+    # reasoning as every TU here.
     # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
     add_executable(core_test
         addr_store_save_test.cpp
@@ -226,6 +236,7 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
         factory_connect_failed_uaf_test.cpp
         filesystem_test.cpp
         found_block_store_test.cpp
+        found_block_submit_test.cpp
         graph_history_test.cpp
         host_port_test.cpp
         inject_ledger_obs_test.cpp
@@ -258,6 +269,7 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
         version_gate_test.cpp
         web_server_aux_template_test.cpp
         web_server_block_budget_test.cpp
+        web_server_block_rows_test.cpp
         web_server_config_endpoint_test.cpp
         web_server_current_payouts_test.cpp
         web_server_daemonless_graph_feed_test.cpp
