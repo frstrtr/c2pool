@@ -1634,6 +1634,15 @@ void NodeImpl::broadcast_share(const uint256& share_hash)
         m_shared_share_hashes.insert(h);
 }
 
+// #950: canonical's per-entry remembered-tx charge, 100 + packed_size(tx)
+// (sender p2p.py:259/:261/:267/:379, receiver :469/:485). Used by the standing
+// set and by the send_shares bracket so both bill the peer exactly as it counts.
+static std::size_t remembered_tx_size(const coin::Transaction& tx)
+{
+    coin::MutableTransaction mtx(tx);
+    return 100 + pack(coin::TX_WITH_WITNESS(mtx)).get_span().size();
+}
+
 std::vector<uint256> NodeImpl::send_shares(peer_ptr peer,
                                            const std::vector<uint256>& share_hashes)
 {
@@ -1721,27 +1730,60 @@ std::vector<uint256> NodeImpl::send_shares(peer_ptr peer,
             }
         });
     }
-    if (!needed_txs.empty()) {
-        std::vector<uint256> known_hashes;
-        std::vector<coin::MutableTransaction> full_txs;
+    // #950 F1: resolve the bracket and bill it as the peer will (canonical
+    // hashes_to_send, p2p.py:377: only txs we hold). `bracketed` is exactly what
+    // remember_tx carries, so the closing forget_tx can never name a hash the
+    // peer does not hold (KeyError, p2p.py:495).
+    std::vector<uint256> known_hashes;
+    std::vector<coin::MutableTransaction> full_txs;
+    std::vector<uint256> bracketed;
+    std::size_t bracket_size = 0;
+    {
         size_t missing = 0;
         for (const auto& th : needed_txs) {
-            if (peer->m_remote_txs.count(th)) {
-                known_hashes.push_back(th);
-            } else if (auto it = m_known_txs.find(th); it != m_known_txs.end()) {
-                full_txs.emplace_back(it->second);
-            } else {
+            auto it = m_known_txs.find(th);
+            if (it == m_known_txs.end()) {
                 ++missing;
+                continue;
             }
+            bracket_size += remembered_tx_size(it->second);
+            bracketed.push_back(th);
+            if (peer->m_remote_txs.count(th))
+                known_hashes.push_back(th);
+            else
+                full_txs.emplace_back(it->second);
         }
         if (missing > 0)
             LOG_WARNING << "[send_shares] " << missing << " referenced tx(s) not in "
                            "m_known_txs — peer may drop these shares "
                            "(register_template_txs gap?)";
-        if (!known_hashes.empty() || !full_txs.empty()) {
-            auto rtx_msg = message_remember_tx::make_raw(known_hashes, full_txs);
-            peer->write(std::move(rtx_msg));
-        }
+    }
+
+    // #950 F1: remote cap. The peer already counts its standing set for us
+    // (m_remote_remembered_size); the bracket rides on top of it. Canonical
+    // sendShares refuses the whole batch when the sum would pass the cap
+    // (p2p.py:379-381, `>`), but its receiver raises at `>=` (p2p.py:488), so a
+    // bracket landing EXACTLY on the cap is refused here too. Refused means
+    // nothing reaches this peer and no share is reported sent, so the caller
+    // leaves it un-marked. No running total is kept for the bracket: it is
+    // opened and closed in this one call (remember -> shares -> forget, in
+    // order on one write queue), so the peer is back at m_remote_remembered_size
+    // before any other writer runs; only its peak can trip the cap.
+    if (bracket_size > 0 &&
+        peer->m_remote_remembered_size + bracket_size >= MAX_REMEMBERED_TXS_SIZE) {
+        static int cap_log = 0;
+        if (cap_log++ % 20 == 0)
+            LOG_WARNING << "[send_shares] refused " << shares.size() << " share(s) to "
+                        << peer->addr().to_string() << ": bracket of " << bracketed.size()
+                        << " tx(s) / " << bracket_size << " B on top of the peer's "
+                        << peer->m_remote_remembered_size << " B standing would reach its "
+                        << MAX_REMEMBERED_TXS_SIZE << " B cap (canonical p2p.py:380/:488)";
+        return {};
+    }
+
+    if (!known_hashes.empty() || !full_txs.empty()) {
+        auto rtx_msg = message_remember_tx::make_raw(known_hashes, full_txs);
+        peer->write(std::move(rtx_msg));
     }
 
     // Pack and send via the message_shares wire codec (round-trip pinned by
@@ -1753,14 +1795,13 @@ std::vector<uint256> NodeImpl::send_shares(peer_ptr peer,
     auto shares_msg = message_shares::make_raw(rshares);
     peer->write(std::move(shares_msg));
 
-    if (!needed_txs.empty()) {
-        std::vector<uint256> forget_vec(needed_txs.begin(), needed_txs.end());
-        auto ftx_msg = message_forget_tx::make_raw(forget_vec);
+    if (!bracketed.empty()) {
+        auto ftx_msg = message_forget_tx::make_raw(bracketed);
         peer->write(std::move(ftx_msg));
     }
 
     LOG_INFO << "[Pool] Sent " << shares.size() << " share(s) (+"
-             << needed_txs.size() << " tx refs) to " << peer->addr().to_string();
+             << bracketed.size() << " tx refs) to " << peer->addr().to_string();
 
     // F2: report exactly which shares reached this peer so the caller marks only
     // those broadcast (a share skipped for all peers stays un-marked → retried).
@@ -1901,42 +1942,72 @@ uint256 NodeImpl::add_local_share(ShareType share, bool block_winning)
     return hash;
 }
 
-// #950: standing remembered-set seed (canonical p2p.py:269). Declared in
-// node.hpp. IO-thread only. Sizes each tx with canonical's 100 + packed_size
-// accounting (p2p.py:379) so the seed never overshoots the peer's cap (p2p.py:488).
-static std::size_t remembered_tx_size(const coin::Transaction& tx)
+// #950: standing remembered-set seed (canonical p2p.py:267-269). Declared in
+// node.hpp. IO-thread only. Reads m_current_template, which is IO-confined and
+// not tracker state, so unlike the #1167 seed this takes no tracker try-lock: a
+// lost try-lock used to leave the peer unseeded (txpool == 0, the #950 symptom)
+// with nothing to retry it.
+void NodeImpl::send_standing_remember(const peer_ptr& peer)
 {
-    coin::MutableTransaction mtx(tx);
-    return 100 + pack(coin::TX_WITH_WITNESS(mtx)).get_span().size();
+    // Canonical p2p.py:269 sends tx_hashes=[] (all as bodies): at handshake we do
+    // not yet know the peer's remote_tx_hashes.
+    sync_standing_remembered(peer, /*bodies_only=*/true);
 }
 
-void NodeImpl::send_standing_remember(const peer_ptr& peer)
+void NodeImpl::sync_standing_remembered(const peer_ptr& peer, bool bodies_only)
 {
     if (!peer)
         return;
-    std::vector<coin::MutableTransaction> full_txs;
-    std::vector<uint256> seeded;
-    {
-        // try_to_lock, never block: mirrors advertise_known_txs — if the compute
-        // thread is mid-cycle we skip; the next inbound handshake reseeds.
-        std::shared_lock<std::shared_mutex> lk(m_tracker_mutex, std::try_to_lock);
-        if (!lk.owns_lock())
-            return;
-        auto chosen = dash::select_standing_remember(
-            m_known_txs, MAX_REMEMBERED_TXS_SIZE, &remembered_tx_size);
-        full_txs.reserve(chosen.size());
-        for (const auto& h : chosen)
-            if (auto it = m_known_txs.find(h); it != m_known_txs.end()) {
-                full_txs.emplace_back(it->second);
-                seeded.push_back(h);
-            }
+    auto& standing = peer->m_standing_remembered;
+
+    // Leavers first (canonical p2p.py:257-259): every standing hash that is no
+    // longer in the current template, refunding exactly the charge it was billed.
+    std::vector<uint256> leavers;
+    for (auto it = standing.begin(); it != standing.end();) {
+        if (m_current_template_set.count(it->first)) {
+            ++it;
+            continue;
+        }
+        leavers.push_back(it->first);
+        peer->m_remote_remembered_size -= std::min(peer->m_remote_remembered_size, it->second);
+        it = standing.erase(it);
     }
-    if (full_txs.empty())
-        return;
-    peer->m_standing_remembered.insert(seeded.begin(), seeded.end());
-    // Canonical p2p.py:269 sends tx_hashes=[] (all as bodies): at handshake we do
-    // not yet know the peer's remote_tx_hashes.
-    peer->write(dash::message_remember_tx::make_raw({}, full_txs));
+    if (!leavers.empty())
+        peer->write(message_forget_tx::make_raw(leavers));
+
+    // Then arrivals, in template order (p2p.py:260-263). Diffing against the
+    // peer's standing set, not the previous template, is what retries an arrival
+    // skipped earlier for lack of room. Canonical asserts the cap (:262); we skip
+    // the entry instead and keep going, so the peer never reaches it (:488).
+    std::vector<uint256> by_hash;
+    std::vector<coin::MutableTransaction> bodies;
+    std::size_t skipped = 0;
+    for (const auto& [h, tx] : m_current_template) {
+        if (standing.count(h))
+            continue;
+        const std::size_t charge = remembered_tx_size(tx);
+        if (peer->m_remote_remembered_size + charge >= MAX_REMEMBERED_TXS_SIZE) {
+            ++skipped;
+            continue;
+        }
+        peer->m_remote_remembered_size += charge;
+        standing.emplace(h, charge);
+        if (!bodies_only && peer->m_remote_txs.count(h))
+            by_hash.push_back(h);
+        else
+            bodies.emplace_back(tx);
+    }
+    if (!by_hash.empty() || !bodies.empty())
+        peer->write(dash::message_remember_tx::make_raw(by_hash, bodies));
+
+    if (skipped > 0) {
+        static int skip_log = 0;
+        if (skip_log++ % 20 == 0)
+            LOG_INFO << "[standing_remember] " << skipped << " template tx(s) not remembered to "
+                     << peer->addr().to_string() << ": the peer's count ("
+                     << peer->m_remote_remembered_size << " B) would reach its "
+                     << MAX_REMEMBERED_TXS_SIZE << " B cap (p2p.py:488); retried next template";
+    }
 }
 
 void NodeImpl::register_template_txs(const std::vector<coin::Transaction>& txs,
@@ -1975,6 +2046,24 @@ void NodeImpl::register_template_txs(const std::vector<coin::Transaction>& txs,
     // templates (≈ minutes of stale-solve coverage), not N re-registrations.
     dash::retain_template_txs(m_recent_template_tx_sets, m_known_txs,
                               hashes, txs, RETAINED_TEMPLATE_TX_SETS);
+
+    // #950 F1: template transition (canonical mining_txs_var.transitioned,
+    // p2p.py:254-264). Identity is the tx-hash SET, the same key
+    // retain_template_txs dedups on: the ~50 per-payout-script re-registrations
+    // of one template, in any order, change nothing and send nothing.
+    std::set<uint256> new_set(hashes.begin(), hashes.end());
+    if (new_set == m_current_template_set)
+        return;
+    m_current_template.clear();
+    m_current_template.reserve(hashes.size());
+    for (std::size_t i = 0; i < hashes.size(); ++i)
+        m_current_template.emplace_back(hashes[i], txs[i]);
+    m_current_template_set = std::move(new_set);
+
+    // m_peers is IO-thread-owned (handle_version insert / error() erase), and so
+    // is this call (assert above), so plain iteration is safe.
+    for (auto& entry : m_peers)
+        sync_standing_remembered(entry.second, /*bodies_only=*/false);
 }
 
 } // namespace dash

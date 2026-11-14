@@ -443,6 +443,15 @@ protected:
     // over this (p2p.py:488), so the standing-remember seed stays under it.
     static constexpr std::size_t MAX_REMEMBERED_TXS_SIZE = 2500000;
     std::deque<std::set<uint256>> m_recent_template_tx_sets;
+    // #950 F1: the CURRENT template's txs in template order (canonical
+    // mining_txs_var) and its tx-hash set (the template's identity). Every
+    // peer's standing remembered set tracks this. register_template_txs
+    // replaces it only when the SET changes: an identical re-registration (one
+    // per payout script, main_dash.cpp producer-job cache) is a no-op, as
+    // Variable.set is on an equal value (util/variable.py:73-75).
+    // IO-thread-confined, same discipline as m_known_txs.
+    std::vector<std::pair<uint256, coin::Transaction>> m_current_template;
+    std::set<uint256> m_current_template_set;
     // Fired on the IO thread when run_think() elects a new best share
     // (p2pool: new_work_event) — main_dash binds the stratum work refresh.
     std::function<void()> m_on_best_share_changed;
@@ -1113,6 +1122,8 @@ public:
         // interleave the comment above warns of — it is safely queued after
         // the have_tx advert. Bounded by MAX_REMEMBERED_TXS_SIZE so a
         // canonical peer never disconnects us on overflow (p2p.py:488).
+        // #950 F1: the seed is the CURRENT template only (p2p.py:267-269);
+        // register_template_txs keeps it current from here on (p2p.py:254-264).
         send_standing_remember(peer);
 
         // #754 join trigger (oracle p2p.py handle_version → node.py
@@ -1654,12 +1665,21 @@ public:
     }
 
     /// #950: seed a freshly-connected peer's STANDING remembered set with the
-    /// txs we already hold, bounded by MAX_REMEMBERED_TXS_SIZE (canonical
-    /// p2p.py:269, :30/:488). IO-THREAD ONLY (handle_version handler): reads
-    /// IO-confined m_known_txs, same discipline as advertise_known_txs.
-    /// Defined in node.cpp because it serializes tx bytes (pack /
-    /// TX_WITH_WITNESS) to size the per-peer cap.
+    /// CURRENT template, all as bodies (canonical p2p.py:267-269), each entry
+    /// admitted only while the peer's count stays below MAX_REMEMBERED_TXS_SIZE
+    /// (p2p.py:30/:488). IO-THREAD ONLY (handle_version handler). Defined in
+    /// node.cpp because it serializes tx bytes (pack / TX_WITH_WITNESS) to
+    /// size the per-peer cap.
     void send_standing_remember(const peer_ptr& peer);
+
+    /// #950 F1: bring one peer's standing set to the current template —
+    /// forget_tx the hashes that left, then remember_tx the arrivals (by hash
+    /// when the peer advertised the tx and !bodies_only, else as a body),
+    /// skipping any arrival that would take the peer's count to or past the
+    /// cap (canonical p2p.py:254-264; it asserts at :262 where we skip). A
+    /// skipped tx stays out of the standing set, so it is never forgotten, and
+    /// is retried at the next transition. IO-THREAD ONLY.
+    void sync_standing_remembered(const peer_ptr& peer, bool bodies_only);
 
     /// Broadcast a new best-block notification to every connected pool peer.
     /// Straight port of the LTC reference (src/impl/ltc/node.hpp:316-320; same

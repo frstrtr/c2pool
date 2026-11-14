@@ -420,6 +420,11 @@ if (BUILD_TESTING AND GTest_FOUND)
     # send_shares over a REAL loopback socket via the shared
     # dash_socket_harness.hpp, so it needs the same link set as
     # test_dash_addrme.cpp. FOLDED in for the same reason.
+    # test_dash_standing_current_template.cpp (#950 F1): the standing set is
+    # the CURRENT template (transition forget/remember, handshake seed) and the
+    # per-peer remote remembered-size stays strictly under the cap, decoded off
+    # the REAL loopback wire against a model of the canonical receiver. Same
+    # harness and link set; FOLDED in for the same reason.
     # test_dash_block_confirm_lane.cpp: the post-broadcast found-block
     # confirmation / orphan lane (daemonless resolve_status verdict + the
     # MiningInterface pending→confirmed / pending→orphaned status flip). FOLDED
@@ -479,7 +484,7 @@ if (BUILD_TESTING AND GTest_FOUND)
     # (disconnect, inbound refusal, decay, per-offence weights, public-network
     # oracle parity, whitelist). Same harness and link set; folded in for the
     # same reason.
-    add_executable(test_dash_node test_dash_node.cpp test_dash_dashboard_found_block.cpp test_dash_addrme.cpp test_dash_standing_forget.cpp test_dash_block_confirm_lane.cpp test_dash_dashboard_views.cpp test_dash_dashboard_pplns.cpp test_dash_shutdown_order.cpp test_dash_v36_live_variant.cpp test_dash_reload_block_flag.cpp test_dash_v36_flip.cpp test_dash_v36_e2e.cpp test_dash_v36_template_txs.cpp test_dash_v36_finder_block.cpp test_dash_share_precheck.cpp test_dash_outbound_redial.cpp test_dash_peer_misbehaviour.cpp test_dash_self_connection_ban.cpp)
+    add_executable(test_dash_node test_dash_node.cpp test_dash_dashboard_found_block.cpp test_dash_addrme.cpp test_dash_standing_forget.cpp test_dash_standing_current_template.cpp test_dash_block_confirm_lane.cpp test_dash_dashboard_views.cpp test_dash_dashboard_pplns.cpp test_dash_shutdown_order.cpp test_dash_v36_live_variant.cpp test_dash_reload_block_flag.cpp test_dash_v36_flip.cpp test_dash_v36_e2e.cpp test_dash_v36_template_txs.cpp test_dash_v36_finder_block.cpp test_dash_share_precheck.cpp test_dash_outbound_redial.cpp test_dash_peer_misbehaviour.cpp test_dash_self_connection_ban.cpp)
     target_link_libraries(test_dash_node PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core

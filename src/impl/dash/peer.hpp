@@ -18,6 +18,7 @@
 #include "alert_relay.hpp"       // D-MINER.7: dash::alert::PeerAlertGuard
 
 #include <chrono>
+#include <cstddef>
 #include <map>
 #include <optional>
 #include <set>
@@ -43,14 +44,23 @@ struct Peer
     std::set<uint256> m_remote_txs;                       // hashes the remote peer has advertised
     std::map<uint256, coin::Transaction> m_remembered_txs; // full txs keyed by hash
 
-    // #950: hashes WE seeded this peer with as its STANDING remembered set
-    // (send_standing_remember, canonical p2p.py:283). send_shares keeps these
-    // OUT of its transient remember/forget bracket, as canonical does with
-    // mining_txs (p2p.py:377): re-remembering one makes a canonical peer
-    // disconnect (p2p.py:474-477) and forgetting one erases the seed
-    // (p2p.py:493-497). Per peer, not node-wide, because the seed is a capped
-    // snapshot of m_known_txs taken at this peer's handshake.
-    std::set<uint256> m_standing_remembered;
+    // #950 F1: this peer's STANDING remembered set, hash -> the canonical charge
+    // (100 + packed size) we billed for it. It tracks the CURRENT template:
+    // seeded at handshake (canonical p2p.py:267-269) and re-synced on every
+    // template transition, forgetting what left and remembering what arrived
+    // (p2p.py:254-264), minus any arrival that did not fit under the peer's cap.
+    // send_shares keeps these OUT of its transient remember/forget bracket, as
+    // canonical does with mining_txs (p2p.py:377): re-remembering one makes a
+    // canonical peer disconnect (p2p.py:473-476) and forgetting one erases it
+    // (p2p.py:493-497). Per peer, because a skipped arrival is per-peer state.
+    std::map<uint256, std::size_t> m_standing_remembered;
+
+    // #950 F1: what this peer counts in its remembered_txs_size for us
+    // (canonical remote_remembered_txs_size, p2p.py:78) = the sum of the
+    // standing charges above. The peer raises at >= 2 500 000 (p2p.py:30/:488),
+    // so a standing arrival or a send_shares bracket is admitted only while the
+    // total stays STRICTLY below that cap.
+    std::size_t m_remote_remembered_size{0};
 
     // Send side of the tx-pool advertisement: our reconstruction of what this
     // peer believes WE hold, so each sweep can emit only the delta as
