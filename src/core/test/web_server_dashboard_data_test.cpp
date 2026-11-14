@@ -575,8 +575,10 @@ TEST(FoundBlockAuthorship, UnlabelledCallSiteStaysUnknownAndClaimsNothing)
 
 TEST(FoundBlockAuthorship, LabelledSitesReportTheFinderTheyKnow)
 {
+    // DASH rows on a DASH node: /recent_blocks lists this node's own chain
+    // only (a merged child's rows go to /recent_merged_blocks).
     MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
-                       c2pool::address::Blockchain::LITECOIN);
+                       c2pool::address::Blockchain::DASH);
     const std::string hp =
         "6666666666666666666666666666666666666666666666666666666666666666";
     const std::string hl =
@@ -598,8 +600,10 @@ TEST(FoundBlockAuthorship, LabelledSitesReportTheFinderTheyKnow)
 
 TEST(FoundBlockAuthorship, EnrichmentRaisesAuthorshipAndNeverLowersIt)
 {
+    // DASH rows on a DASH node: /recent_blocks lists this node's own chain
+    // only (a merged child's rows go to /recent_merged_blocks).
     MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
-                       c2pool::address::Blockchain::LITECOIN);
+                       c2pool::address::Blockchain::DASH);
     const std::string h =
         "8888888888888888888888888888888888888888888888888888888888888888";
     // The real ordering on DASH: the peer path sees the block on the

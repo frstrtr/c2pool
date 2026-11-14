@@ -61,6 +61,7 @@
 // LTC implementation
 #include <impl/ltc/share.hpp>
 #include <impl/ltc/share_check.hpp>
+#include <impl/ltc/dashboard_found_block.hpp>  // one /recent_blocks row shape: finder + peers
 #include <impl/ltc/auto_ratchet.hpp>
 #include <impl/ltc/solo_payouts.hpp>
 #include <impl/ltc/share_messages.hpp>
@@ -3265,7 +3266,8 @@ int main(int argc, char* argv[]) {
                             // re-persists the row, so it survives a restart.
                             rec.parent_hash = blk.parent_hash;
                             rec.parent_height = blk.parent_height;
-                            return fblk_store->store(rec);
+                            // A corrected height names the key it moved from.
+                            return fblk_store->store(rec, blk.replaced_height);
                         },
                         [fblk_store, fblk_leveldb]() -> std::vector<MI::FoundBlock> {
                             auto records = fblk_store->load_all();
@@ -5467,7 +5469,7 @@ int main(int argc, char* argv[]) {
                 // up in the header chain — this gives the ACTUAL block height, not the
                 // live template height (which changes rapidly during sync).
                 uint256 block_hash = Hash(ParseHex(header_hex.substr(0, 160)));
-                uint64_t height = 0;
+                uint64_t chain_height = 0;
                 {
                     // prev_block is at bytes 4..36 of the 80-byte header (LE uint256)
                     auto hdr_bytes = ParseHex(header_hex.substr(0, 160));
@@ -5477,33 +5479,56 @@ int main(int argc, char* argv[]) {
                         if (embedded_chain_ptr) {
                             auto entry = embedded_chain_ptr->get_header(prev_block);
                             if (entry.has_value())
-                                height = entry->height + 1;
+                                chain_height = entry->height + 1;
                         }
                     }
-                    // Fallback to template height if header chain lookup fails
-                    if (height == 0) {
-                        auto tmpl = web_server.get_mining_interface()->get_current_work_template();
-                        if (!tmpl.is_null() && tmpl.contains("height"))
-                            height = tmpl["height"].get<uint64_t>();
-                    }
                 }
-                // Capture enriched data for dashboard /recent_blocks
+                // The row every peer derives from the gossiped share
+                // (ltc::dashboard::row_from_share): the stratum submit that
+                // minted the share hands over its hash (== this block's hash),
+                // payout address, BIP34 height and committed coinbase value.
+                // The sharechain BEST share was recorded here before -- the
+                // winner's PARENT, the new share not being best yet -- and the
+                // node's own --address as the miner ("" on a node without one).
                 auto* mi = web_server.get_mining_interface();
-                double net_diff = mi->get_network_difficulty();
-                double pool_hr = mi->get_local_hashrate();
-                uint64_t block_subsidy = 0;
-                {
+                auto row = ltc::dashboard::row_from_submit(
+                    block_hash, hdr.m_timestamp, chain_height,
+                    core::MiningInterface::found_block_submit_context(), is_testnet);
+                // The header chain's prev + 1 or the share's BIP34 push: the
+                // block's own height (the template's below is not).
+                const bool height_from_block = row.height != 0;
+                if (row.height == 0) {
+                    // Last resort: the live template (it may build on a newer tip).
+                    auto tmpl = mi->get_current_work_template();
+                    if (!tmpl.is_null() && tmpl.contains("height"))
+                        row.height = tmpl["height"].get<uint64_t>();
+                }
+                // No stratum context (a JSON-RPC submitblock from a GBT miner):
+                // the block pays this node's template, i.e. its own address.
+                if (row.miner.empty())
+                    row.miner = mi->get_payout_address();
+                if (row.subsidy == 0) {
                     auto tmpl = mi->get_current_work_template();
                     if (!tmpl.is_null() && tmpl.contains("coinbasevalue"))
-                        block_subsidy = tmpl["coinbasevalue"].get<uint64_t>();
+                        row.subsidy = tmpl["coinbasevalue"].get<uint64_t>();
                 }
-                std::string miner_addr = mi->get_payout_address();
-                std::string share_h;
-                if (auto fn = mi->get_best_share_hash_fn())
-                    share_h = fn().GetHex();
+                const uint64_t height = row.height;
+                // Pool hashrate 0 -> record_found_block reads the sharechain
+                // pool estimator, the rate a peer records the same block with
+                // (this node's own stratum rate gave the finder and its peers
+                // luck values ~300x apart). No sharechain: the local rate.
                 mi->record_found_block(
-                    height, block_hash, 0, is_testnet ? "tLTC" : "LTC",
-                    miner_addr, share_h, net_diff, 0, pool_hr, block_subsidy);
+                    height, block_hash, row.timestamp, row.chain,
+                    row.miner, row.share_hash, mi->get_network_difficulty(),
+                    row.share_difficulty,
+                    /*pool_hashrate=*/p2p_node ? 0.0 : mi->get_local_hashrate(),
+                    row.subsidy,
+                    // Local dispatch: THIS node built the template and submitted
+                    // the block. Authorship only climbs, so the sharechain hook
+                    // (sharechain_peer, when the winning share verifies here)
+                    // can never downgrade it.
+                    core::MiningInterface::BlockAuthorship::this_node,
+                    height_from_block);
                 // Verify every found block against the best chain, a stale
                 // or refused one too: it is orphaned once the chain is 6 deep
                 // from its height, never left pending.
@@ -6474,9 +6499,12 @@ int main(int argc, char* argv[]) {
                 std::vector<std::string> found_full;
                 if (mi) {
                     for (const auto& fb : mi->get_found_blocks()) {
-                        if (!fb.share_hash.empty()) {
-                            blocks_arr.push_back(fb.share_hash.substr(0, 16));
-                            found_full.push_back(fb.share_hash);
+                        // found_block_share_hash: a pre-fix finder row names
+                        // the winner's PARENT share; it marks nothing.
+                        const std::string sh = mi->found_block_share_hash(fb);
+                        if (!sh.empty()) {
+                            blocks_arr.push_back(sh.substr(0, 16));
+                            found_full.push_back(sh);
                         }
                     }
                 }
@@ -6657,11 +6685,13 @@ int main(int argc, char* argv[]) {
                 nlohmann::json blocks_arr = nlohmann::json::array();
                 std::vector<std::string> found_full;
                 if (mi) {
-                    for (const auto& fb : mi->get_found_blocks())
-                        if (!fb.share_hash.empty()) {
-                            blocks_arr.push_back(fb.share_hash.substr(0, 16));
-                            found_full.push_back(fb.share_hash);
+                    for (const auto& fb : mi->get_found_blocks()) {
+                        const std::string sh = mi->found_block_share_hash(fb);
+                        if (!sh.empty()) {
+                            blocks_arr.push_back(sh.substr(0, 16));
+                            found_full.push_back(sh);
                         }
+                    }
                 }
                 // Only the found blocks among this delta's new shares; omitted
                 // when there are none (the client accumulates them).
@@ -6747,7 +6777,12 @@ int main(int argc, char* argv[]) {
                         }
                     }
                     if (is_ltc_block) {
+                        // The LTC row only: a merged (DOGE) row names this
+                        // share as its share too, and sorts first (higher
+                        // height), so the finder answered the DOGE height and
+                        // confirmations here.
                         for (const auto& fb : mi->get_found_blocks()) {
+                            if (!mi->is_primary_found_block(fb)) continue;
                             if (fb.hash == hash.GetHex() ||
                                 (!fb.share_hash.empty() && fb.share_hash == hash.GetHex())) {
                                 result["ltc_block_height"] = fb.height;
@@ -6903,31 +6938,33 @@ int main(int argc, char* argv[]) {
                 if (!chain.contains(share_hash)) return;
 
                 chain.get(share_hash).share.invoke([&](auto* s) {
-                    uint64_t height = s->m_absheight;
-                    uint256 block_hash = s->m_hash;  // share hash = block header hash
-                    double net_diff = mi->get_network_difficulty();
-                    double share_diff = chain::target_to_difficulty(chain::bits_to_target(s->m_bits));
-                    double pool_hr = mi->get_local_hashrate();
-
-                    std::string miner_addr;
-                    if constexpr (requires { s->m_address; })
-                        miner_addr = HexStr(s->m_address.m_data);
-                    else if constexpr (requires { s->m_pubkey_hash; })
-                        miner_addr = s->m_pubkey_hash.GetHex();
+                    // The finder records the same block from its stratum
+                    // submit (row_from_submit); both rows come from the share's
+                    // own fields, so every node shows the same facts. This site
+                    // recorded the sharechain ABSHEIGHT as the block height and
+                    // the raw pubkey-hash hex (byte-reversed) as the miner.
+                    const auto row = ltc::dashboard::row_from_share(share_hash, *s, is_testnet);
+                    const uint256& block_hash = row.block_hash;  // share hash = block header hash
 
                     LOG_INFO << "GOT BLOCK FROM PEER! share=" << share_hash.GetHex().substr(0,16)
-                             << " miner=" << miner_addr.substr(0,16)
-                             << " height=" << height;
+                             << " miner=" << row.miner
+                             << " height=" << row.height
+                             << " (share absheight " << s->m_absheight << ")";
 
                     // sharechain_peer: this hook fires for ANY verified share
                     // meeting the block target. For our own find the submit
                     // path records this_node and authorship only climbs, so
                     // labelling peer here can never downgrade a local record.
+                    // Pool hashrate 0 -> the sharechain pool estimator, the
+                    // same rate the finder records with.
                     mi->record_found_block(
-                        height, block_hash, s->m_min_header.m_timestamp,
-                        is_testnet ? "tLTC" : "LTC",
-                        miner_addr, share_hash.GetHex(), net_diff, share_diff, pool_hr, 0,
-                        core::MiningInterface::BlockAuthorship::sharechain_peer);
+                        row.height, block_hash, row.timestamp, row.chain,
+                        row.miner, row.share_hash, mi->get_network_difficulty(),
+                        row.share_difficulty, /*pool_hashrate=*/0.0, row.subsidy,
+                        core::MiningInterface::BlockAuthorship::sharechain_peer,
+                        // BIP34 off the share's coinbase: it corrects a
+                        // pre-fix row stored at the share absheight.
+                        /*height_from_block=*/row.height != 0);
                     // coinbase_txid = the gentx hash the share commits to.
                     // tx_count stays null: v34+ shares carry no tx list.
                     try {
@@ -10935,6 +10972,24 @@ int main(int argc, char* argv[]) {
                 // runs, whose luck point the one-shot backfill can never reach.
                 web_server.get_mining_interface()->set_block_field_lookups(
                     diff_lookup, ts_lookup);
+                // The height of each row's block in the header chain: fills a
+                // row stored at height 0 and corrects one the header chain
+                // contradicts. Pre-fix peer rows hold the share ABSHEIGHT
+                // (27707625 for LTC block 3211872), which also left them
+                // "pending" forever: the verdict waited for the chain to reach
+                // that height. Runs before the re-verification below.
+                auto height_lookup = [hc](const std::string& block_hash_hex) -> uint64_t {
+                    uint256 h;
+                    h.SetHex(block_hash_hex);
+                    auto entry = hc->get_header(h);
+                    return entry ? static_cast<uint64_t>(entry->height) : 0;
+                };
+                web_server.get_mining_interface()->backfill_found_block_heights(height_lookup);
+                // Only heights above the tip (no LTC block can sit there) are
+                // corrected: a header chain on a wrong checkpoint must not
+                // rewrite correct ones.
+                web_server.get_mining_interface()->correct_found_block_heights(
+                    height_lookup, static_cast<uint64_t>(hc->height()));
             }
 
             // #159 (G2): re-verify any found block that was still pending at the

@@ -975,3 +975,133 @@ TEST(LtcMwebHogex, N4_FrozenJobWithLitecoindsExtensionAssemblesItsOwnBlock)
     EXPECT_TRUE(ends_with(f.node.last_submitted_hex, "01" + kMweb));
     EXPECT_EQ(parse_block(f.node.last_submitted_hex).m_txs.size(), 3u);
 }
+
+// ---------------------------------------------------------------------------
+// The found-block submit scope, driven through a real stratum block hit.
+//
+// The block-submitted callback records the finder's /recent_blocks row from
+// MiningInterface::found_block_submit_context(), which mining_submit installs
+// around submitblock(): the share it just minted (on a p2pool chain the share
+// hash IS the block header hash), that share's payout script rendered as an
+// address, the BIP34 height of its coinbase and the coinbase value it
+// committed to -- what every peer reads off the gossiped share. Before it the
+// finder recorded the sharechain BEST share (the winner's parent) and its own
+// --address. These pin the scope from the outside: delete it, or feed it
+// other values, and they fail.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// A coinbase whose scriptSig starts with a BIP34 push of 3211872 (03 600231),
+// followed by en1 + en2: 4 + 4 + 4 = 0x0c bytes.
+const std::string kCoinb1Bip34 = "01000000" "01" + rep("00", 32) + "ffffffff" "0c" "03600231";
+// P2PKH over the 2026-11-12 finder's hash160.
+const std::vector<unsigned char> kScopePayout{
+    0x76, 0xa9, 0x14, 0x75, 0xfd, 0x41, 0x16, 0xec, 0x87, 0xe3, 0x96, 0x23, 0xe8,
+    0x37, 0xe1, 0xd9, 0x52, 0xd7, 0x70, 0xf0, 0xdf, 0x5c, 0x08, 0x88, 0xac};
+constexpr uint64_t kScopeSubsidy = 625549157;
+
+// A pre-MWEB job whose payout is frozen with it (decide_job_payout), with the
+// share target frozen too, and the nonce that meets the block target.
+Job scoped_job()
+{
+    Job j;
+    j.snap.coinb1 = kCoinb1Bip34;
+    j.snap.coinb2 = kCoinb2;
+    j.snap.gbt_prevhash = kPrev;
+    j.snap.nbits = kBits;
+    j.snap.block_nbits = kBits;
+    j.snap.version = kVersion;
+    j.snap.merkle_branches = MiningInterface::compute_merkle_branches(std::vector<std::string>{});
+    j.snap.tx_data = std::make_shared<std::vector<std::string>>();
+    j.snap.segwit_active = true;
+    j.snap.share_bits = 0x207fffff;
+    j.snap.frozen_ref.bits = 0x207fffff;
+    j.snap.subsidy = kScopeSubsidy;
+    j.snap.has_payout = true;
+    j.snap.payout_script = kScopePayout;
+    const uint256 root = MiningInterface::reconstruct_merkle_root(
+        kCoinb1Bip34 + kEn1 + kEn2 + kCoinb2, j.snap.merkle_branches);
+    j.nonce = find_block_nonce(kVersion, kPrev, root, kBits, &j.header);
+    return j;
+}
+
+uint256 header_hash(const Job& j)
+{
+    return Hash(std::span<const unsigned char>(j.header.data(), j.header.size()));
+}
+
+// What the block-submitted callback sees of the scope.
+struct ScopeSeen {
+    int fired = 0;
+    bool had_ctx = false;
+    core::FoundBlockSubmitContext ctx;
+};
+
+void watch_scope(Fixture& f, ScopeSeen& seen)
+{
+    f.mi.set_on_block_submitted([&seen](const std::string&, int) {
+        ++seen.fired;
+        const auto* c = MiningInterface::found_block_submit_context();
+        seen.had_ctx = (c != nullptr);
+        if (c) seen.ctx = *c;
+    });
+}
+
+} // namespace
+
+TEST(FoundBlockSubmitScope, BlockHitNamesTheMintedShareInsideTheCallback)
+{
+    Fixture f;
+    const Job j = scoped_job();
+    const uint256 block = header_hash(j);
+    // p2pool: the share minted for this submit has the header's hash.
+    f.mi.set_create_share_fn([block](const MiningInterface::ShareCreationParams&) { return block; });
+    ScopeSeen seen;
+    watch_scope(f, seen);
+
+    EXPECT_EQ(MiningInterface::found_block_submit_context(), nullptr);
+    submit(f, j);
+
+    ASSERT_EQ(f.node.submit_calls, 1) << "a block-target share must reach the daemon";
+    ASSERT_EQ(seen.fired, 1);
+    ASSERT_TRUE(seen.had_ctx) << "the block-submitted callback must run inside the submit scope";
+    EXPECT_EQ(seen.ctx.miner, core::script_to_address(kScopePayout, /*is_litecoin=*/true,
+                                                      /*testnet=*/true))
+        << "the share's payout script rendered for LTC, not the login '" << "mweb-kat-miner" << "'";
+    EXPECT_EQ(seen.ctx.share_hash, block.GetHex()) << "the minted share is the block";
+    EXPECT_EQ(seen.ctx.height, 3211872u) << "BIP34 of the share's coinbase";
+    EXPECT_EQ(seen.ctx.subsidy, kScopeSubsidy) << "the coinbase value the job froze";
+    EXPECT_GT(seen.ctx.share_difficulty, 0.0) << "the frozen share target";
+    EXPECT_EQ(MiningInterface::found_block_submit_context(), nullptr)
+        << "the scope ends with the submit";
+}
+
+TEST(FoundBlockSubmitScope, AShareThatIsNotTheBlockIsNotNamed)
+{
+    Fixture f;
+    const Job j = scoped_job();
+    const uint256 other = uint256S(rep("7", 64));
+    f.mi.set_create_share_fn([other](const MiningInterface::ShareCreationParams&) { return other; });
+    ScopeSeen seen;
+    watch_scope(f, seen);
+    submit(f, j);
+    ASSERT_EQ(seen.fired, 1);
+    ASSERT_TRUE(seen.had_ctx);
+    EXPECT_TRUE(seen.ctx.share_hash.empty());
+    EXPECT_EQ(seen.ctx.height, 3211872u) << "same header: the coinbase is the block's";
+    EXPECT_EQ(seen.ctx.miner, core::script_to_address(kScopePayout, true, true));
+}
+
+TEST(FoundBlockSubmitScope, NoShareMintedNamesTheLoginAndNoShare)
+{
+    Fixture f;   // no create_share_fn: no share, no payout script kept
+    const Job j = scoped_job();
+    ScopeSeen seen;
+    watch_scope(f, seen);
+    submit(f, j);
+    ASSERT_EQ(seen.fired, 1);
+    ASSERT_TRUE(seen.had_ctx);
+    EXPECT_EQ(seen.ctx.miner, "mweb-kat-miner");
+    EXPECT_TRUE(seen.ctx.share_hash.empty());
+}
