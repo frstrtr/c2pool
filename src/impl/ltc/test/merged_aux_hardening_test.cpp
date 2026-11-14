@@ -2219,7 +2219,24 @@ struct RecordingWorkSource : core::stratum::IWorkSource {
     mutable std::vector<std::vector<unsigned char>> payouts;
     std::vector<std::map<uint32_t, std::vector<unsigned char>>> submits;
     std::vector<std::vector<unsigned char>> submit_payouts;
+    std::vector<uint32_t> submit_share_bits;   // the share bits each submit was handed
+    // Node-fee and share-target knobs (set before a connection): every job
+    // the operator's (decide_job_payout), the live share bits
+    // (get_share_bits: the last job built), the jobs' frozen share bits, the
+    // difficulty every submission has, the template's block bits.
+    std::vector<unsigned char> fee_script;
+    uint32_t live_bits{0x207fffff};
+    uint32_t frozen_bits{0};
+    double submit_difficulty{1e15};
+    std::string block_bits{"207fffff"};
+    mutable std::vector<core::stratum::PayoutKey> login_keys;   // build_connection_coinbase_for
     bool merged_ready() const override { return ready.load(); }
+    void decide_job_payout(std::vector<unsigned char>& payout,
+                           std::vector<std::pair<uint32_t, std::vector<unsigned char>>>&) const override
+    {
+        if (!fee_script.empty())
+            payout = fee_script;
+    }
 
     const core::stratum::StratumConfig& get_stratum_config() const override { return cfg; }
     std::function<uint256()> get_best_share_hash_fn() const override { return [] { return uint256(); }; }
@@ -2231,7 +2248,7 @@ struct RecordingWorkSource : core::stratum::IWorkSource {
     void update_stratum_worker(const std::string&, double, double, double, uint64_t, uint64_t, uint64_t) override {}
     nlohmann::json get_current_work_template() const override
     {
-        return {{"bits", "207fffff"}, {"previousblockhash", std::string(64, '1')}, {"version", 0x20000000},
+        return {{"bits", block_bits}, {"previousblockhash", std::string(64, '1')}, {"version", 0x20000000},
                 {"curtime", 1793210000}, {"height", 100}};
     }
     std::vector<std::string> get_stratum_merkle_branches() const override { return {}; }
@@ -2246,7 +2263,19 @@ struct RecordingWorkSource : core::stratum::IWorkSource {
         core::stratum::CoinbaseResult r;
         r.coinb1 = "01000000";
         r.coinb2 = "00000000";
+        r.snapshot.frozen_ref.bits = frozen_bits;
         return r;
+    }
+    core::stratum::CoinbaseResult build_connection_coinbase_for(
+        const core::stratum::PayoutKey& login_key, const uint256& prev, const std::string& en1,
+        const std::vector<unsigned char>& payout,
+        const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged) const override
+    {
+        {
+            std::lock_guard<std::mutex> l(mu);
+            login_keys.push_back(login_key);
+        }
+        return build_connection_coinbase(prev, en1, payout, merged);
     }
     nlohmann::json mining_submit(const std::string&, const std::string&, const std::string&, const std::string&,
                                  const std::string&, const std::string&, const std::string&,
@@ -2256,15 +2285,16 @@ struct RecordingWorkSource : core::stratum::IWorkSource {
         std::lock_guard<std::mutex> l(mu);
         submits.push_back(merged);
         submit_payouts.push_back(job && job->has_payout ? job->payout_script : std::vector<unsigned char>{0xff});
+        submit_share_bits.push_back(job ? job->share_bits : 0);
         return {{"result", true}};
     }
-    uint32_t get_share_bits() const override { return 0x207fffff; }
+    uint32_t get_share_bits() const override { return live_bits; }
     uint32_t get_share_max_bits() const override { return 0x207fffff; }
     double compute_share_difficulty(const std::string&, const std::string&, const std::string&, const std::string&,
                                     const std::string&, const std::string&, uint32_t, const std::string&,
                                     const std::string&, const std::vector<std::string>&) const override
     {
-        return 1e15;
+        return submit_difficulty;
     }
     size_t count() const
     {
@@ -2477,6 +2507,68 @@ TEST(MergedAuxStratumSession, SubmitCarriesWhatTheJobCommittedTo)
             << "the job committed to the LTC key's DOGE script";
         EXPECT_EQ(rig.ws->submit_payouts[0], core::address_to_script(ltc));
     }
+}
+
+// --fee at the stratum session: the work source gives every job to the
+// operator (decide_job_payout); the session builds it for its login's key
+// (build_connection_coinbase_for), the key its pseudoshares are recorded
+// under, so a work source sizes the fee job's share target by the miner's
+// local rate, not by the operator's key (which has none: the fee job was the
+// easiest share, 1/30 of the weight). A re-authorize to a keyless login drops
+// the previous login's key.
+TEST(NodeFeeStratumSession, FeeJobIsBuiltForTheLoginsKey)
+{
+    const std::string ltc = b58(48, 0x01);
+    const auto op = core::address_to_script(b58(48, 0x0e));
+    SessionRig rig({98});
+    rig.ws->fee_script = op;
+    LineClient c(rig.port);
+    rig.step(c, 1, "mining.subscribe", nlohmann::json::array());
+    ASSERT_TRUE(rig.step(c, 2, "mining.authorize", {ltc, "x"}));
+    core::stratum::PayoutKey miner;
+    miner.fill(0x01);
+    {
+        std::lock_guard<std::mutex> l(rig.ws->mu);
+        ASSERT_FALSE(rig.ws->login_keys.empty()) << "the session built its job without its login key";
+        EXPECT_EQ(rig.ws->login_keys.back(), miner) << "the fee job is sized by the miner's key";
+        EXPECT_EQ(rig.ws->payouts.back(), op) << "the job pays the operator";
+    }
+    ASSERT_TRUE(rig.step(c, 3, "mining.authorize", {"", "x"}));
+    {
+        std::lock_guard<std::mutex> l(rig.ws->mu);
+        EXPECT_EQ(rig.ws->login_keys.back(), core::stratum::PayoutKey{})
+            << "a keyless login after a keyed one is sized by the zero key its pseudoshares are recorded under";
+    }
+}
+
+// A submission makes a share when its PoW meets its own job's share bits, the
+// bits the share carries (p2pool got_response), and the work source gets those
+// bits: not the live ones (get_share_bits: the last job built, for any
+// connection). Field: a fee job's easy shares were dropped whenever the last
+// job built was a normal (30x harder) one.
+TEST(NodeFeeStratumSession, SubmitIsJudgedByItsJobsShareBits)
+{
+    using namespace std::chrono_literals;
+    constexpr uint32_t easy = 0x1c0bc28d, hard = 0x1b6477da;   // field: diff ~21.8 and ~652
+    SessionRig rig({98});
+    rig.ws->frozen_bits = easy;          // this job's share bits
+    rig.ws->live_bits = hard;            // the last job built
+    rig.ws->submit_difficulty = 100.0;   // meets its job's bits, not the live ones
+    rig.ws->block_bits = "1a0fffff";     // no block (difficulty ~1e6)
+    LineClient c(rig.port);
+    rig.step(c, 1, "mining.subscribe", nlohmann::json::array());
+    ASSERT_TRUE(rig.step(c, 2, "mining.authorize", {b58(48, 0x01), "x"}));
+    ASSERT_FALSE(c.last_job.empty());
+    c.send({{"id", 3}, {"method", "mining.submit"}, {"params", {"w", c.last_job, "00000000", "6ae2a090", "00000000"}}});
+    c.wait_id(3);
+    const auto nsub = [&rig] {
+        std::lock_guard<std::mutex> l(rig.ws->mu);
+        return rig.ws->submits.size();
+    };
+    for (int i = 0; i < 100 && nsub() == 0; ++i) std::this_thread::sleep_for(5ms);
+    std::lock_guard<std::mutex> l(rig.ws->mu);
+    ASSERT_EQ(rig.ws->submits.size(), 1u) << "a share at its job's own bits was dropped (judged by the last job built)";
+    EXPECT_EQ(rig.ws->submit_share_bits[0], easy) << "the work source classifies it against its job's bits";
 }
 
 // Merged chains configured but not attached yet: a login is refused (it would
