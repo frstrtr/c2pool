@@ -945,6 +945,8 @@ TEST(DashHeaderChain, ExpectedBitsAfterAnyBestChainParent)
     // Fewer than DGW_PAST_BLOCKS headers ending at the parent.
     EXPECT_FALSE(hc.expected_bits_after(mc.hashes[10], t).has_value());
     EXPECT_FALSE(hc.expected_bits_after(mc.hashes[22], t).has_value());
+    EXPECT_FALSE(hc.expected_bits_after(mc.hashes[23], t).has_value())
+        << "below height DGW_PAST_BLOCKS Core answers powLimit: no target to check against";
     EXPECT_TRUE(hc.expected_bits_after(mc.hashes[24], t).has_value()) << "heights 1..24: a full window";
 
     // A parent off the best chain: a mined sibling of hashes[29].
@@ -954,4 +956,35 @@ TEST(DashHeaderChain, ExpectedBitsAfterAnyBestChainParent)
     ASSERT_TRUE(hc.has_header(x11_hash(fork)));
     EXPECT_EQ(hc.get_header_by_height(30)->hash, mc.hashes[30]) << "the tip did not move";
     EXPECT_FALSE(hc.expected_bits_after(x11_hash(fork), t).has_value());
+}
+
+// A chain seeded from a fast-start anchor: the anchor entry is synthetic
+// (bits 0, time 0). A retarget window that still contains it is no network
+// target (dark_gravity_wave would average a zero target in and answer a far
+// easier one), so expected_bits_after gives nothing until the window is 24
+// real headers above the anchor.
+TEST(DashHeaderChain, ExpectedBitsAfterSkipsWindowsWithTheSyntheticAnchor)
+{
+    auto params = make_easy_test_params();
+    DashChainParams::Checkpoint cp{};
+    cp.height = 1000;
+    cp.hash.SetHex("00000000000000000000000000000000000000000000000000000000000000cc");
+    params.fast_start_checkpoint = cp;
+    HeaderChain hc(params, /*db_path=*/"");
+    ASSERT_TRUE(hc.init());
+    ASSERT_EQ(hc.height(), 1000u);
+    std::vector<uint256> hashes{cp.hash};
+    uint32_t t = 1'800'000'000u;
+    for (int i = 0; i < 30; ++i) {
+        t += 150u;
+        auto h = mine_header(hashes.back(), t, params.pow_limit.GetCompact(), params.pow_limit);
+        ASSERT_TRUE(hc.add_header(h)) << "mined header " << (i + 1) << " above the anchor";
+        hashes.push_back(x11_hash(h));
+    }
+    ASSERT_EQ(hc.height(), 1030u);
+    EXPECT_FALSE(hc.expected_bits_after(hashes[0], t).has_value()) << "the anchor itself";
+    EXPECT_FALSE(hc.expected_bits_after(hashes[23], t).has_value())
+        << "anchor + 23: the window still holds the synthetic anchor";
+    EXPECT_TRUE(hc.expected_bits_after(hashes[24], t).has_value())
+        << "anchor + 24: 24 real headers";
 }

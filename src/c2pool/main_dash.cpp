@@ -5670,6 +5670,10 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             oracle->hc = nullptr;
         }
     } block_bits_oracle;
+    if (!coin_p2p)
+        LOG_WARNING << "[HEAD-SCORE] block-solution credit OFF: no coin header chain on this node"
+                       " (no coin-P2P feed), so a block-solving share scores as a plain share here"
+                       " while nodes with a header chain prefer it";
     if (coin_p2p) {
         const auto dash_params = testnet
             ? dash::coin::make_dash_chain_params_testnet()
@@ -5693,6 +5697,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 if (!oracle->hc) return std::nullopt;
                 return oracle->hc->expected_bits_after(prev_block, block_time);
             };
+        LOG_INFO << "[HEAD-SCORE] block-solution credit ARMED: a block-solving share's header"
+                    " bits are checked against this node's header chain";
 
         // CROSS-LANE ASYMMETRY CLOSED: HeaderChain::is_synced() was DEFINED
         // AND NEVER CALLED on the DASH path (bch 13 callers, ltc 12, nmc 12,
