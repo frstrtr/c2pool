@@ -1800,3 +1800,62 @@ TEST(DashboardData, ScheduledChecksFollowTheBlockAcrossAnInsert)
     EXPECT_EQ(st_new, MiningInterface::BlockStatus::pending);
     EXPECT_EQ(checks_new, 0u) << "the newcomer was never scheduled";
 }
+
+// #1142 item 11: /network_difficulty?period= windows the history the way
+// p2pool-dash does instead of ignoring the query and returning everything.
+TEST(DashboardData, NetworkDifficultyPeriodWindowsAndAnchorsTheHistory)
+{
+    const double now = 1'000'000.0;
+    const std::vector<std::pair<double, double>> samples = {
+        {now - 7200, 10.0},   // before the hour window: the anchor value
+        {now - 1800, 20.0},
+        {now - 600,  30.0},
+    };
+    auto arr = MiningInterface::window_network_difficulty(samples, now, "hour", 40.0);
+    ASSERT_EQ(arr.size(), 4u);
+    EXPECT_DOUBLE_EQ(arr[0]["ts"].get<double>(), now - 3600);
+    EXPECT_DOUBLE_EQ(arr[0]["network_diff"].get<double>(), 10.0);
+    EXPECT_EQ(arr[0]["source"], "window_start");
+    EXPECT_DOUBLE_EQ(arr[1]["network_diff"].get<double>(), 20.0);
+    EXPECT_DOUBLE_EQ(arr[2]["network_diff"].get<double>(), 30.0);
+    EXPECT_DOUBLE_EQ(arr[3]["ts"].get<double>(), now);
+    EXPECT_DOUBLE_EQ(arr[3]["network_diff"].get<double>(), 40.0);
+    EXPECT_EQ(arr[3]["source"], "current");
+
+    // "day" keeps the pre-hour sample; an unknown period reads as "day".
+    EXPECT_EQ(MiningInterface::window_network_difficulty(samples, now, "day", 40.0).size(), 4u);
+    EXPECT_EQ(MiningInterface::window_network_difficulty(samples, now, "bogus", 40.0),
+              MiningInterface::window_network_difficulty(samples, now, "day", 40.0));
+}
+
+TEST(DashboardData, NetworkDifficultyPeriodInterpolatesAnEmptyWindow)
+{
+    const double now = 1'000'000.0;
+    // Only a pre-window sample: hold 10 at the start, ramp to the live 70.
+    const std::vector<std::pair<double, double>> samples = {{now - 7200, 10.0}};
+    auto arr = MiningInterface::window_network_difficulty(samples, now, "hour", 70.0);
+    ASSERT_EQ(arr.size(), 7u);   // start + 5 fills + current
+    double last_ts = -1;
+    for (const auto& p : arr) {
+        EXPECT_GT(p["ts"].get<double>(), last_ts);
+        last_ts = p["ts"].get<double>();
+    }
+    EXPECT_EQ(arr[3]["source"], "interpolated");
+    EXPECT_DOUBLE_EQ(arr[3]["ts"].get<double>(), now - 1800);
+    EXPECT_DOUBLE_EQ(arr[3]["network_diff"].get<double>(), 40.0);
+
+    // Nothing known at all: an empty array, never a fabricated zero line.
+    EXPECT_TRUE(MiningInterface::window_network_difficulty({}, now, "hour", 0.0).empty());
+}
+
+TEST(DashboardData, NetworkDifficultyPeriodDownsamplesKeepingBothEnds)
+{
+    const double now = 1'000'000.0;
+    std::vector<std::pair<double, double>> samples;
+    for (int i = 0; i < 300; ++i)
+        samples.emplace_back(now - 3500 + i * 10, 1.0 + i);
+    auto arr = MiningInterface::window_network_difficulty(samples, now, "hour", 0.0);
+    EXPECT_LE(arr.size(), 31u);
+    EXPECT_DOUBLE_EQ(arr.front()["network_diff"].get<double>(), 1.0);
+    EXPECT_DOUBLE_EQ(arr.back()["network_diff"].get<double>(), 300.0);
+}
