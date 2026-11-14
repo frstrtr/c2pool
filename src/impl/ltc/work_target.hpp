@@ -1,6 +1,8 @@
 #pragma once
 
+#include <cstdint>
 #include <limits>
+#include <core/target_utils.hpp>
 #include <core/uint256.hpp>
 
 // LTC producer-target modulation helpers.
@@ -57,6 +59,66 @@ inline uint256 average_attempts_to_target(double avg_attempts)
     uint256 out;
     out.SetHex(t_288.GetHex());
     return out;
+}
+
+// What a job's desired share target is computed from (ref_hash_fn, at job
+// time). local_hash_rate is the local rate of the miner the job is for: the
+// rate of core::stratum::job_rate_key, never of a payout decide_job_payout
+// substituted (the node fee).
+struct JobTargetInputs
+{
+    double   local_hash_rate{0.0};   // H/s
+    uint32_t share_period{0};        // PoolConfig::share_period()
+    // Cap 2 (dust); pool_aps <= 0: not applied (no prev share past the
+    // one-hour lookbehind, or no rate).
+    double   pool_aps{0.0};          // pool attempts/s over the lookbehind at the prev share
+    uint64_t subsidy{0};
+    double   donation_percent{0.0};
+    uint64_t dust_threshold{0};      // PoolConfig::dust_threshold()
+    uint32_t spread{0};              // PoolConfig::SPREAD
+    uint32_t block_bits{0};
+};
+
+// The desired share target of a job, before compute_share_target clips it
+// into the chain's band [pre_target3/30, pre_target3] (p2pool-merged-v36
+// work.py get_work, desired_share_target):
+//   Cap 1: limit the miner to 1.67% of pool shares,
+//          average_attempts_to_target(local_hash_rate * SHARE_PERIOD / 0.0167);
+//   Cap 2: when its expected payout per block is below DUST,
+//          average_attempts_to_target(block attempts * SPREAD * DUST / subsidy).
+// Both only ever lower (harden) the target. No rate: no cap, the easiest
+// target (2**256-1, clipped to pre_target3).
+inline uint256 job_desired_share_target(const JobTargetInputs& in)
+{
+    uint256 desired;
+    desired.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    if (!(in.local_hash_rate > 0.0))
+        return desired;
+
+    const double avg_attempts = in.local_hash_rate * in.share_period / 0.0167;
+    if (avg_attempts > 1.0) {
+        const uint256 cap = average_attempts_to_target(avg_attempts);
+        if (cap < desired)
+            desired = cap;
+    }
+
+    if (in.pool_aps > 0.0) {
+        const double expected_payout = (in.local_hash_rate / in.pool_aps)
+            * static_cast<double>(in.subsidy) * (1.0 - in.donation_percent / 100.0);
+        if (expected_payout < static_cast<double>(in.dust_threshold)) {
+            // Double arithmetic (no uint288 overflow), the block's attempts
+            // read as their low 64 bits.
+            const uint288 block_aps = chain::target_to_average_attempts(chain::bits_to_target(in.block_bits));
+            const double dust_avg = static_cast<double>(block_aps.GetLow64()) * in.spread
+                * static_cast<double>(in.dust_threshold) / static_cast<double>(in.subsidy);
+            if (dust_avg > 1.0) {
+                const uint256 dust_target = average_attempts_to_target(dust_avg);
+                if (dust_target < desired)
+                    desired = dust_target;
+            }
+        }
+    }
+    return desired;
 }
 
 } // namespace ltc::stratum

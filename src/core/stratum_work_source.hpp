@@ -145,6 +145,23 @@ public:
         const std::vector<unsigned char>& payout_script,
         const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs) const = 0;
 
+    /// build_connection_coinbase for the connection whose login key is
+    /// `login_key` (the key its pseudoshares are recorded under; all zero:
+    /// none). `payout_script` is the job's, after decide_job_payout. A work
+    /// source that sizes a job's share target by its miner's local hash rate
+    /// reads the rate of job_rate_key(login_key, payout_script): the miner's,
+    /// also on a job decide_job_payout gave to the node operator. Default: the
+    /// plain build.
+    virtual CoinbaseResult build_connection_coinbase_for(
+        const PayoutKey& /*login_key*/,
+        const uint256& prev_share_hash,
+        const std::string& extranonce1_hex,
+        const std::vector<unsigned char>& payout_script,
+        const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs) const
+    {
+        return build_connection_coinbase(prev_share_hash, extranonce1_hex, payout_script, merged_addrs);
+    }
+
     // ── Share submission (the hot path) ──────────────────────────────────
 
     /// Process a `mining.submit` from a stratum session. Validates the

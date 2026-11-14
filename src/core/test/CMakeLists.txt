@@ -208,6 +208,10 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
     # count, retain self-heal, set_last_build no-op on an absent txid, ChainLock
     # round-trip). Header-only over core/uint256. Same fold-into-core_test
     # reasoning as every TU here.
+    # job_rate_key_test.cpp: a stratum job's share target is sized by its
+    # connection's miner (core::stratum::job_rate_key), also on a node-fee job
+    # whose payout is the operator's; MiningInterface::build_connection_coinbase_for
+    # hands ref_hash_fn that key. Same fold-into-core_test reasoning as every TU here.
     # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
     add_executable(core_test
         addr_store_save_test.cpp
@@ -230,6 +234,7 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
         host_port_test.cpp
         inject_ledger_obs_test.cpp
         inject_status_test.cpp
+        job_rate_key_test.cpp
         known_txs_backing_test.cpp
         known_txs_eviction_test.cpp
         leveldb_store_lock_test.cpp

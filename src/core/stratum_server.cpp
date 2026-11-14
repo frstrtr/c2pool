@@ -1869,8 +1869,11 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
         job_has_payout = true;
         job_payout_script = payout_script;
         job_merged_scripts = std::map<uint32_t, std::vector<unsigned char>>(merged_addrs.begin(), merged_addrs.end());
-        cbr = mining_interface_->build_connection_coinbase(
-            frozen_prev_share, extranonce1_, payout_script, merged_addrs);
+        // The share target is sized by this connection's login key (its
+        // pseudoshares' key), not by the job's payout: a node-fee job is its
+        // miner's job but for the payout (core::stratum::job_rate_key).
+        cbr = mining_interface_->build_connection_coinbase_for(
+            pubkey_hash_, frozen_prev_share, extranonce1_, payout_script, merged_addrs);
         if (cbr.held) {
             // No coinbase its shares could verify (the sharechain is busy): no
             // job now — the miner keeps its last one — never the global

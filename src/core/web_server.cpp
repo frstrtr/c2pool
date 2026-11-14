@@ -1366,6 +1366,30 @@ MiningInterface::build_connection_coinbase(
     const std::vector<unsigned char>& payout_script,
     const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs) const
 {
+    return build_job_coinbase(prev_share_hash, extranonce1_hex, payout_script, merged_addrs,
+                              core::stratum::payout_script_key(payout_script));
+}
+
+MiningInterface::CoinbaseResult
+MiningInterface::build_connection_coinbase_for(
+    const core::stratum::PayoutKey& login_key,
+    const uint256& prev_share_hash,
+    const std::string& extranonce1_hex,
+    const std::vector<unsigned char>& payout_script,
+    const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs) const
+{
+    return build_job_coinbase(prev_share_hash, extranonce1_hex, payout_script, merged_addrs,
+                              core::stratum::job_rate_key(login_key, payout_script));
+}
+
+MiningInterface::CoinbaseResult
+MiningInterface::build_job_coinbase(
+    const uint256& prev_share_hash,
+    const std::string& extranonce1_hex,
+    const std::vector<unsigned char>& payout_script,
+    const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs,
+    const core::stratum::PayoutKey& rate_key) const
+{
     // ── Lock hierarchy: m_work_mutex (1) > sessions_mutex_ (2) > MM::m_mutex (3) ──
     //
     // This function is called from StratumSession::send_notify_work which may be
@@ -1735,7 +1759,7 @@ MiningInterface::build_connection_coinbase(
     }
     auto rhr = ws.ref_hash_fn(
         prev_share_hash,
-        scriptsig_bytes, payout_script, subsidy, bits, timestamp,
+        scriptsig_bytes, payout_script, rate_key, subsidy, bits, timestamp,
         ws.segwit_active, ws.witness_commitment, effective_witness_root,
         merged_addrs, branches_u256);
     LOG_TRACE << "[build_cb] ref_hash_fn returned, bits=" << std::hex << rhr.bits << std::dec;

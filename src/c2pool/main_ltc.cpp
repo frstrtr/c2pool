@@ -7185,6 +7185,7 @@ int main(int argc, char* argv[]) {
                     const uint256& frozen_prev_share,
                     const std::vector<unsigned char>& coinbase_scriptSig,
                     const std::vector<unsigned char>& payout_script,
+                    const core::stratum::PayoutKey& rate_key,
                     uint64_t subsidy, uint32_t bits, uint32_t timestamp,
                     bool segwit_active, const std::string& witness_commitment_hex,
                     const uint256& witness_root,
@@ -7235,51 +7236,39 @@ int main(int argc, char* argv[]) {
                     params.donation = static_cast<uint16_t>(std::round(65535.0 * dev_donation / 100.0));
                     params.desired_version = desired_ver;
 
-                    // Per-miner desired_target — matches p2pool work.py:2490-2505.
-                    // 1) Start with 2^256-1 (easiest possible)
-                    // 2) Cap to 1.67% of pool shares by local hashrate
-                    // 3) Dust threshold: if expected payout < DUST, use block-proportional target
-                    // Result: clips to [pre_target3/30, pre_target3] in compute_share_target.
-                    auto desired_target = uint256S("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
-
-                    // Extract pubkey_hash from payout_script for hashrate lookup
-                    std::array<uint8_t, 20> miner_pubkey{};
-                    if (payout_script.size() == 25 && payout_script[0] == 0x76) {
-                        std::copy(payout_script.begin() + 3, payout_script.begin() + 23, miner_pubkey.begin());
-                    } else if (payout_script.size() == 23 && payout_script[0] == 0xa9) {
-                        std::copy(payout_script.begin() + 2, payout_script.begin() + 22, miner_pubkey.begin());
-                    } else if (payout_script.size() == 22 && payout_script[0] == 0x00) {
-                        std::copy(payout_script.begin() + 2, payout_script.begin() + 22, miner_pubkey.begin());
-                    }
-
-                    // p2pool work.py:2488-2505: per-miner desired_target computation
+                    // Per-miner desired_target (p2pool-merged-v36 work.py get_work
+                    // 3013-3028): Cap 1 (1.67% of pool shares) and Cap 2 (dust)
+                    // from the local rate of the miner the job is for, then
+                    // compute_share_target clips it into [pre_target3/30,
+                    // pre_target3]. The miner is rate_key (core::stratum::
+                    // job_rate_key): the connection's login key, NOT the key of
+                    // payout_script, which decide_job_payout replaces with the
+                    // operator's on a node-fee job. The operator's key has no
+                    // local rate: a fee job sized by it got the easiest share
+                    // target (pre_target3, 30x easier than its miner's at the
+                    // hard edge), its shares weighed 1/30 of their work and it
+                    // ended at its first, quick share, so the operator got a
+                    // fraction of the fee.
                     LOG_TRACE << "[ref_hash_fn] getting local_addr_rates...";
                     auto local_addr_rates = web_server.get_local_addr_rates();
                     LOG_TRACE << "[ref_hash_fn] got " << local_addr_rates.size() << " addr rates";
                     double local_hash_rate = 0.0;
                     {
-                        auto rate_it = local_addr_rates.find(miner_pubkey);
+                        auto rate_it = local_addr_rates.find(rate_key);
                         if (rate_it != local_addr_rates.end())
                             local_hash_rate = rate_it->second;
                     }
 
-                    // Cap 1: limit to 1.67% of pool shares (work.py:2492-2495)
-                    // desired_target = min(desired_target,
-                    //   average_attempts_to_target(local_hash_rate * SHARE_PERIOD / 0.0167))
-                    if (local_hash_rate > 0.0) {
-                        double avg_attempts = local_hash_rate * ltc::PoolConfig::share_period() / 0.0167;
-                        if (avg_attempts > 1.0) {
-                            // #859: saturating narrowing (ltc::stratum helper) --
-                            // avoids UB / a "Division by zero" throw for avg >= 2^64.
-                            uint256 cap_target = ltc::stratum::average_attempts_to_target(avg_attempts);
-                            if (cap_target < desired_target)
-                                desired_target = cap_target;
-                        }
-                    }
-
-                    // Cap 2: dust threshold (work.py:2497-2505)
-                    // If expected payout per block < DUST_THRESHOLD, ease the target
-                    // so small miners still get meaningful payouts.
+                    ltc::stratum::JobTargetInputs target_in;
+                    target_in.local_hash_rate = local_hash_rate;
+                    target_in.share_period = ltc::PoolConfig::share_period();
+                    target_in.subsidy = subsidy;
+                    target_in.donation_percent = dev_donation;
+                    target_in.dust_threshold = ltc::PoolConfig::dust_threshold();
+                    target_in.spread = ltc::PoolConfig::SPREAD;
+                    target_in.block_bits = bits;
+                    // Cap 2's pool rate: over the last hour of shares at the
+                    // prev share, once the chain is that deep.
                     {
                         auto& trk = *guard;
                         if (!frozen_prev_share.IsNull() && trk.chain.contains(frozen_prev_share)) {
@@ -7288,31 +7277,11 @@ int main(int argc, char* argv[]) {
                             if (height > lookbehind && local_hash_rate > 0.0) {
                                 auto pool_aps = trk.get_pool_attempts_per_second(
                                     frozen_prev_share, lookbehind, /*min_work=*/false);
-                                double pool_aps_d = static_cast<double>(pool_aps.GetLow64());
-                                if (pool_aps_d > 0.0) {
-                                    double expected_payout = (local_hash_rate / pool_aps_d)
-                                        * subsidy * (1.0 - dev_donation / 100.0);
-                                    if (expected_payout < ltc::PoolConfig::dust_threshold()) {
-                                        // p2pool: average_attempts_to_target(
-                                        //   target_to_average_attempts(block_target) * SPREAD * DUST / subsidy)
-                                        uint256 block_target = chain::bits_to_target(bits);
-                                        uint288 block_aps = chain::target_to_average_attempts(block_target);
-                                        // Use double arithmetic to avoid uint288 overflow
-                                        double dust_avg = static_cast<double>(block_aps.GetLow64())
-                                            * ltc::PoolConfig::SPREAD
-                                            * ltc::PoolConfig::dust_threshold()
-                                            / static_cast<double>(subsidy);
-                                        if (dust_avg > 1.0) {
-                                            // #859 sibling: same saturating helper.
-                                            uint256 dust_target = ltc::stratum::average_attempts_to_target(dust_avg);
-                                            if (dust_target < desired_target)
-                                                desired_target = dust_target;
-                                        }
-                                    }
-                                }
+                                target_in.pool_aps = static_cast<double>(pool_aps.GetLow64());
                             }
                         }
                     }
+                    const uint256 desired_target = ltc::stratum::job_desired_share_target(target_in);
                     // With fork shares excluded from verified, best_share (= frozen_prev)
                     // is always the main chain head. CST walks the main chain directly.
                     LOG_TRACE << "[ref_hash_fn] calling compute_share_target...";

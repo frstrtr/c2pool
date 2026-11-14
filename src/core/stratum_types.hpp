@@ -23,6 +23,7 @@
 #include <core/uint256.hpp>
 #include <memory>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdint>
@@ -178,6 +179,46 @@ struct StratumConfig {
     // refused (#961) — for work sources that do not redistribute.
     bool redistribute_unusable_logins{false};
 };
+
+/// The 20-byte key of a payout: the hash160 (P2PKH, P2SH) or witness program
+/// (P2WPKH) its script pays. The per-address hashrate map
+/// (StratumServer::get_local_addr_rates, p2pool get_local_addr_rates) is keyed
+/// by it.
+using PayoutKey = std::array<uint8_t, 20>;
+
+/// The key a P2PKH / P2SH / P2WPKH payout script pays; all zero for any
+/// other script.
+inline PayoutKey payout_script_key(const std::vector<unsigned char>& script)
+{
+    PayoutKey key{};
+    if (script.size() == 25 && script[0] == 0x76)
+        std::copy(script.begin() + 3, script.begin() + 23, key.begin());
+    else if (script.size() == 23 && script[0] == 0xa9)
+        std::copy(script.begin() + 2, script.begin() + 22, key.begin());
+    else if (script.size() == 22 && script[0] == 0x00)
+        std::copy(script.begin() + 2, script.begin() + 22, key.begin());
+    return key;
+}
+
+/// The key whose local hash rate sizes a job's share target (p2pool get_work:
+/// the desired share target from the local rate of the miner the work is
+/// for): the connection's login key, the key its pseudoshares are recorded
+/// under (StratumServer::record_pseudoshare). Not the job's payout:
+/// decide_job_payout gives a job to the node operator (the node fee) by
+/// replacing its payout, and the operator's key has no local rate of its own
+/// here. Sized by it, a fee job got the easiest share target the chain allows
+/// (30x easier than its miner's jobs at the hard edge of the band): its shares
+/// weighed 1/30 of the work behind them and the job ended at its first, quick
+/// share, so the operator got a small part of the fee. Sized by the miner's
+/// rate, a fee job is the job it replaced but for its payout, and the
+/// operator's weight is the fee. A login without a key (empty, P2WSH, P2TR:
+/// its payout is redistributed): the job payout's key.
+inline PayoutKey job_rate_key(const PayoutKey& login_key, const std::vector<unsigned char>& job_payout_script)
+{
+    if (login_key != PayoutKey{})
+        return login_key;
+    return payout_script_key(job_payout_script);
+}
 
 /// Frozen share-construction fields returned by ref_hash_fn. These
 /// capture the share-tracker state at the moment a job was assembled

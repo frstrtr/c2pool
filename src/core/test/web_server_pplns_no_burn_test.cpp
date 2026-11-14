@@ -140,7 +140,7 @@ struct Rig {
             return {{p2pkh(who), static_cast<double>(subsidy - 1000)}, {d, 1000.0}};
         });
         mi.set_ref_hash_fn([](const uint256&, const std::vector<unsigned char>&, const std::vector<unsigned char>&,
-                              uint64_t, uint32_t, uint32_t, bool, const std::string&, const uint256&,
+                              const core::stratum::PayoutKey&, uint64_t, uint32_t, uint32_t, bool, const std::string&, const uint256&,
                               const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>&,
                               const std::vector<uint256>&) {
             MiningInterface::RefHashResult r;
@@ -376,7 +376,7 @@ TEST(PplnsNoBurn, ConcurrentJobsPayTheirOwnShareAtTheirOwnTemplateValue)
         return {{p2pkh(who), static_cast<double>(subsidy - 1000)}, {d, 1000.0}};
     });
     mi.set_ref_hash_fn([&](const uint256&, const std::vector<unsigned char>&, const std::vector<unsigned char>&,
-                           uint64_t, uint32_t, uint32_t, bool, const std::string&, const uint256&,
+                           const core::stratum::PayoutKey&, uint64_t, uint32_t, uint32_t, bool, const std::string&, const uint256&,
                            const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>&,
                            const std::vector<uint256>&) {
         MiningInterface::RefHashResult r;
