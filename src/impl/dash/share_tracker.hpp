@@ -659,13 +659,16 @@ public:
         if (m_on_share_verified)
             m_on_share_verified(share_hash);
 
-        // Block detection: if share_init_verify flagged this share as a block solution,
-        // fire the callback. Matches p2pool's tracker.verified.added watcher (node.py:289).
-        if (m_on_block_found && g_last_init_is_block) {
+        // Block detection: share_init_verify flagged this share as a block
+        // solution (its PoW hash meets its header's block target). The index
+        // flag feeds head scoring (head_punish_reason) whether or not a
+        // found-block hook is bound; the hook fires as p2pool's
+        // tracker.verified.added watcher does (node.py:289).
+        if (g_last_init_is_block) {
             g_last_init_is_block = false;
             auto* idx = chain.get_index(share_hash);
             if (idx) idx->is_block_solution = true;
-            m_on_block_found(share_hash);
+            if (m_on_block_found) m_on_block_found(share_hash);
         }
 
         // Report share difficulty for best-share dashboard tracking.
@@ -1571,8 +1574,10 @@ public:
                     best = prev;
                     best_idx = chain.get_index(best);
 
-                    // p2pool: if not punish, find best descendent
-                    if (best_idx && punish_of(best_idx) <= 0)
+                    // p2pool: if not punish, find best descendent. Exactly 0:
+                    // a block-solution parent (-1) ends the walk-back without
+                    // descending (the loop condition is punish > 0).
+                    if (best_idx && punish_of(best_idx) == 0)
                     {
                         // Find deepest non-naughty child via reverse map
                         std::function<std::pair<int,uint256>(const uint256&, int)> best_desc;

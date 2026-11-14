@@ -72,6 +72,12 @@ std::string pad(const std::string& tail)
     return std::string(64 - tail.size(), '0') + tail;
 }
 
+// A share known only by its logged 16-hex short hash: the prefix, zero tail.
+std::string prefix16(const std::string& short_hash)
+{
+    return short_hash + std::string(48, '0');
+}
+
 constexpr uint64_t W = 1'000'000;   // work at the 5th parent
 constexpr uint64_t A = 1'000;       // one share's attempts
 
@@ -86,13 +92,14 @@ TEST(DashHeadScoreBlockSolution, PunishReasonIsBlockSolutionFirstThenNaughty)
     EXPECT_EQ(head_punish_reason(true, 1), -1) << "p2pool checks the block solution before naughty";
 }
 
-// The 11-14 case at h 2571868: block share 0022.. and its sibling 3bfe..
-// (same parent 0266.., same second; 3bfe arrived 187 ms later and has the
-// larger hash). p2pool keeps the block share.
+// The 11-14 case at h 2571868: block share 0000000000000022a769.. (full
+// hash) and its sibling, logged as 0000000000003bfe (short hash only: the
+// tail here is zero). Same parent 0266.., same second; the sibling arrived
+// 187 ms later and has the larger hash. p2pool keeps the block share.
 TEST(DashHeadScoreBlockSolution, BlockShareBeatsSameSecondSiblingWithLargerHash)
 {
     const std::string blk = pad("22a7698e043c411c28df049209b695f97aef28ea22fc70ac9e");
-    const std::string sib = pad("3bfe0000000000000000000000000000000000000000000000");
+    const std::string sib = prefix16("0000000000003bfe");
     ASSERT_TRUE(h(blk) < h(sib)) << "the sibling has the larger hash: a hash tie-break alone would pick it";
     const Head b{blk, W, A, 1794616206, true};
     const Head s{sib, W, A, 1794616206};
@@ -100,12 +107,14 @@ TEST(DashHeadScoreBlockSolution, BlockShareBeatsSameSecondSiblingWithLargerHash)
     EXPECT_EQ(best_of({s, b}), h(blk).GetHex()) << "independent of arrival order";
 }
 
-// The 11-13 case at h 2571721: block share 0002.. against 53f3.., minted
-// 121 ms EARLIER in the same second on the same parent.
+// The 11-13 case at h 2571721: block share 00000000000000023dd4.. (full
+// hash) against its sibling logged as 00000000000053f3 (short hash only),
+// minted 121 ms EARLIER in the same second on the same parent.
 TEST(DashHeadScoreBlockSolution, BlockShareBeatsEarlierSiblingInTheSameSecond)
 {
     const std::string blk = pad("023dd4b4dd4fbaaa226d74fe4410e64f0fb71be92b722503c5");
-    const std::string sib = pad("53f30000000000000000000000000000000000000000000000");
+    const std::string sib = prefix16("00000000000053f3");
+    ASSERT_TRUE(h(blk) < h(sib));
     EXPECT_EQ(best_of({{sib, W, A, 1794593964}, {blk, W, A, 1794593964, true}}), h(blk).GetHex());
 }
 
