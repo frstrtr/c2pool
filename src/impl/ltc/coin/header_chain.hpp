@@ -409,6 +409,62 @@ public:
         return hit->second;
     }
 
+    /// The nBits a block on top of `prev_hash` must carry at `block_time`
+    /// (Litecoin Core GetNextWorkRequired(pindexPrev, pblock), as
+    /// get_next_work_required ports it) for any `prev_hash` on our best
+    /// chain, not only the tip. nullopt when `prev_hash` is unknown, off the
+    /// best chain, a fast-start anchor without a header, or any header the
+    /// rule reads is missing (a retarget window or a testnet min-difficulty
+    /// walk reaching below an anchor): get_next_work_required would fall back
+    /// to the parent's bits or powLimit there, which is no network target to
+    /// check against. Share-chain head scoring uses it (never share validity).
+    std::optional<uint32_t> expected_bits_after(const uint256& prev_hash, int64_t block_time) const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        auto it = m_headers.find(prev_hash);
+        if (it == m_headers.end()) return std::nullopt;
+        const IndexEntry& prev = it->second;
+        const uint32_t h = prev.height;
+        auto at = m_height_index.find(h);
+        if (at == m_height_index.end() || at->second != prev_hash) return std::nullopt;
+        if (prev.header.m_bits == 0) return std::nullopt;   // fast-start anchor: no header
+
+        const int64_t interval = m_params.difficulty_adjustment_interval();
+        const uint32_t new_height = h + 1;
+        if (interval <= 0) return std::nullopt;
+        auto real_header_at = [this](uint32_t hh) {
+            auto e = get_header_by_height_internal(hh);
+            return e && e->header.m_bits != 0;
+        };
+        if (new_height % interval == 0) {
+            if (!m_params.no_retargeting) {
+                // Litecoin: the full interval back, interval-1 only for the
+                // first retarget after genesis (Art Forz's fix).
+                const uint32_t back = (static_cast<int64_t>(new_height) == interval)
+                    ? static_cast<uint32_t>(interval - 1) : static_cast<uint32_t>(interval);
+                if (h < back || !real_header_at(h - back)) return std::nullopt;
+            }
+        } else if (m_params.allow_min_difficulty
+                   && block_time <= static_cast<int64_t>(prev.header.m_timestamp) + m_params.target_spacing * 2) {
+            // Testnet: the last block not at the min-difficulty limit, walked
+            // back to the retarget boundary; every header on the way is read.
+            uint256 limit = m_params.pow_limit;
+            const uint32_t limit_bits = limit.GetCompact();
+            uint32_t hh = h;
+            uint32_t bits = prev.header.m_bits;
+            while (hh > 0 && (hh % interval) != 0 && bits == limit_bits) {
+                auto a = get_header_by_height_internal(hh - 1);
+                if (!a || a->header.m_bits == 0) return std::nullopt;
+                bits = a->header.m_bits;
+                --hh;
+            }
+        }
+        auto get_ancestor = [this](uint32_t hh) -> std::optional<IndexEntry> {
+            return this->get_header_by_height_internal(hh);
+        };
+        return get_next_work_required(get_ancestor, h, prev.header.m_bits, prev.header.m_timestamp,
+                                      static_cast<uint32_t>(block_time), m_params);
+    }
+
     /// Add a single header. Returns true if accepted (new + valid).
     bool add_header(const BlockHeaderType& header) {
         PendingTipChange ptc;

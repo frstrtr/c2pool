@@ -403,6 +403,14 @@ if (BUILD_TESTING AND GTest_FOUND)
     # solo_payouts_test.cpp: --solo pays each miner to its login's own script
     # (P2SH, P2WPKH, P2WSH, P2TR; never P2PKH of a script hash, never the zero
     # key) and the outputs add up to the subsidy. Same folding rule.
+    #
+    # head_score_block_solution_test.cpp: think() head selection as in
+    # p2pool-merged-v36 (data.py:1690-1696, 2933-2967): a head whose share
+    # solved an LTC block is punish -1, one share of work ahead of an
+    # equal-work sibling and level with a branch one share longer; a full tie
+    # goes to the larger hash; Phase 5 walks back only while punish > 0; a
+    # merged-only (DOGE) solution earns nothing. REAL ShareTracker::think().
+    # Same folding rule.
     # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
     add_executable(share_test
         auto_ratchet_blocked_by_test.cpp
@@ -441,6 +449,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         found_block_peer_txid_test.cpp
         found_block_verify_test.cpp
         head_retention_test.cpp
+        head_score_block_solution_test.cpp
         header_pow_always_test.cpp
         hogaddr_spend_guard_test.cpp
         ingest_bounds_test.cpp
