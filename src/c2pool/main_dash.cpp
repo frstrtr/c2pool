@@ -5653,6 +5653,27 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         }
     } v24_status_uninstall{testnet ? dash::coin::DashNetwork::TESTNET
                                    : dash::coin::DashNetwork::MAINNET, nullptr, nullptr};
+    // Head scoring's block-solution credit reads the header chain through this
+    // oracle (the tracker's m_expected_block_bits). Declared after
+    // header_chain, so it is destroyed first: it detaches under the oracle's
+    // mutex, after which a think() cycle gets nullopt (no credit) instead of
+    // reading freed headers; a call in flight finishes before the detach.
+    struct BlockBitsOracle {
+        std::mutex m;
+        const dash::coin::HeaderChain* hc{nullptr};
+    };
+    struct BlockBitsOracleDetach {
+        std::shared_ptr<BlockBitsOracle> oracle = std::make_shared<BlockBitsOracle>();
+        ~BlockBitsOracleDetach()
+        {
+            std::lock_guard<std::mutex> lk(oracle->m);
+            oracle->hc = nullptr;
+        }
+    } block_bits_oracle;
+    if (!coin_p2p)
+        LOG_WARNING << "[HEAD-SCORE] block-solution credit OFF: no coin header chain on this node"
+                       " (no coin-P2P feed), so a block-solving share scores as a plain share here"
+                       " while nodes with a header chain prefer it";
     if (coin_p2p) {
         const auto dash_params = testnet
             ? dash::coin::make_dash_chain_params_testnet()
@@ -5661,6 +5682,24 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             / net_subdir / "dash_headers").string();
         header_chain = std::make_unique<dash::coin::HeaderChain>(dash_params, hdr_db);
         header_chain->init();
+
+        // Head scoring credits a block-solution share only when its header
+        // bits are the network target for its parent block, as this header
+        // chain computes it (DGW over a complete window on our best chain).
+        {
+            std::lock_guard<std::mutex> lk(block_bits_oracle.oracle->m);
+            block_bits_oracle.oracle->hc = header_chain.get();
+        }
+        p2p_node.tracker().m_expected_block_bits =
+            [oracle = block_bits_oracle.oracle](const uint256& prev_block, int64_t block_time)
+                -> std::optional<uint32_t> {
+                std::lock_guard<std::mutex> lk(oracle->m);
+                if (!oracle->hc) return std::nullopt;
+                return oracle->hc->expected_bits_after(prev_block, block_time,
+                                                       dash::BLOCK_CREDIT_MAX_PARENT_DEPTH);
+            };
+        LOG_INFO << "[HEAD-SCORE] block-solution credit ARMED: a block-solving share's header"
+                    " bits are checked against this node's header chain";
 
         // CROSS-LANE ASYMMETRY CLOSED: HeaderChain::is_synced() was DEFINED
         // AND NEVER CALLED on the DASH path (bch 13 callers, ltc 12, nmc 12,
