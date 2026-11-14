@@ -44,6 +44,7 @@
 
 #include <core/coin/node_iface.hpp>
 #include <core/coin/work_view.hpp>
+#include <core/log.hpp>
 #include <core/random.hpp>
 #include <core/stratum_types.hpp>
 #include <core/target_utils.hpp>
@@ -76,6 +77,13 @@ PayoutKey key_of(unsigned char b)
     k.fill(b);
     return k;
 }
+
+// Each coinbase build logs several lines at trace level: quiet them while a
+// KAT builds thousands (as web_server_pplns_no_burn_test does).
+struct QuietLog {
+    QuietLog() { core::log::Logger::set_severity_level(boost::log::trivial::warning); }
+    ~QuietLog() { core::log::Logger::set_severity_level(boost::log::trivial::trace); }
+};
 
 double attempts(uint32_t bits)
 {
@@ -242,6 +250,7 @@ TEST(NodeFeeJobTarget, OperatorsOwnJobsAreSizedByItsRate)
 // at the hard bits weighing 1/30). Sized by its miner, it equals the draws.
 TEST(NodeFeeJobTarget, OperatorsWeightIsTheFee)
 {
+    const QuietLog quiet;
     core::random::seed(kSeed);
     Rig r;   // each job: decide_job_payout + build_connection_coinbase_for, as the session builds it
     const auto miner = p2pkh(0x0a);
