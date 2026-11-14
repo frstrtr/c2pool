@@ -1778,6 +1778,7 @@ struct MergedMiningManager::SubmitJob
     uint256                              block_hash;
     int                                  height{0};
     uint64_t                             coinbase_value{0};
+    double                               aux_difficulty{0};   // #1738: the snapshot bits, not the parent
     SubmitVerdict                        verdict;
 };
 
@@ -2131,6 +2132,7 @@ void MergedMiningManager::try_submit_merged_blocks(
         job.block_hash = committed_block_hash;
         job.height = snapshot_height;
         job.coinbase_value = tmpl.value("coinbasevalue", chain.current_work.coinbase_value);
+        job.aux_difficulty = ::chain::target_to_difficulty(::chain::bits_to_target(nbits));
         jobs.push_back(std::move(job));
       } catch (const std::exception& e) {
         ++m_block_refusals_by_code[chain.config.symbol + ":assembly_error"];
@@ -2185,7 +2187,7 @@ void MergedMiningManager::run_submit_jobs(std::vector<SubmitJob>& jobs, const st
             for (const auto& chain : m_chains)
                 if (chain.config.chain_id == j.chain_id) {
                     record_discovered_block(chain, j.verdict, parent_hash_hex, j.block_hash, j.height,
-                                            j.coinbase_value);
+                                            j.coinbase_value, j.aux_difficulty);
                     break;
                 }
         } catch (const std::exception& e) {
@@ -3154,12 +3156,13 @@ void MergedMiningManager::record_discovered_block(
                             accepted ? SubmitVerdict::of(SubmitVerdict::Kind::accepted)
                                      : SubmitVerdict::of(SubmitVerdict::Kind::rejected, "rejected"),
                             parent_hash, chain.current_work.block_hash,
-                            chain.current_work.height, chain.current_work.coinbase_value);
+                            chain.current_work.height, chain.current_work.coinbase_value,
+                            ::chain::target_to_difficulty(chain.current_work.target));
 }
 
 void MergedMiningManager::record_discovered_block(
     const ChainState& chain, const SubmitVerdict& verdict, const std::string& parent_hash,
-    const uint256& block_hash, int height, uint64_t coinbase_value)
+    const uint256& block_hash, int height, uint64_t coinbase_value, double aux_difficulty)
 {
     // Caller must hold m_mutex
     // A block found again (a share on a job whose block is already out: the
@@ -3181,7 +3184,8 @@ void MergedMiningManager::record_discovered_block(
                  << " found again (" << verdict.label() << "): recorded once";
         if (!was_held && verdict.held() && m_on_merged_block_found) {
             try {
-                m_on_merged_block_found(chain.config.symbol, height, block_hash.GetHex(), true, coinbase_value);
+                m_on_merged_block_found(chain.config.symbol, height, block_hash.GetHex(), true, coinbase_value,
+                                        aux_difficulty);
             } catch (const std::exception& e) {
                 LOG_ERROR << "[MM:" << chain.config.symbol << "] on_merged_block_found crashed: " << e.what();
             }
@@ -3213,8 +3217,9 @@ void MergedMiningManager::record_discovered_block(
             LOG_INFO << "[MM:" << chain.config.symbol << "] calling on_merged_block_found...";
             // held: accepted, duplicate or inconclusive — the found-block
             // check then follows the daemon's chain.
+            // #1738: the aux target, not the parent's, prices this block.
             m_on_merged_block_found(chain.config.symbol, height, block_hash.GetHex(), verdict.held(),
-                                    coinbase_value);
+                                    coinbase_value, aux_difficulty);
             LOG_INFO << "[MM:" << chain.config.symbol << "] on_merged_block_found returned OK";
         } catch (const std::exception& e) {
             LOG_ERROR << "[MM:" << chain.config.symbol
