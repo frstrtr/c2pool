@@ -1865,6 +1865,40 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
                 }
                 // Accepted (own-coin OR configured-merged): byte-identical build.
                 payout_script = address_to_script(username_);
+                // The chain-agnostic decoder knows a fixed HRP list; an own-coin
+                // HRP outside it (e.g. DGB "dgb"/"dgbt"/"dgbrt") decoded EMPTY
+                // here even though decide_payout_address() accepted it. Fall
+                // back to the running coin's own network-aware decode. Only
+                // reached when the legacy build is empty, so every address that
+                // already built a script is byte-identical.
+                if (payout_script.empty())
+                    payout_script = core::address_to_script_for_coin(username_, own);
+
+                // ── EMPTY-SCRIPT GUARD (acceptance-configured lanes only): the
+                // address PASSED decide_payout_address() (own-coin or configured
+                // merged) yet still built NO script — a decoder gap. Issuing the
+                // job would drop the finder output from the job coinbase while
+                // the share created at submit commits the real address (the
+                // verify_share GENTX mismatch, regtest bcrt1 repro), or pay a
+                // won block with no finder output. Refuse the job instead.
+                //
+                // Deliberately NOT applied on the legacy path above (payout_*
+                // left empty): there an undecodable username (e.g. a bare
+                // worker name) is accept-any by contract — the work source
+                // validates at mining_submit and falls back to the node-owner /
+                // donation script (see handle_authorize). Master behaviour on
+                // that path is unchanged.
+                if (payout_script.empty()) {
+                    if (!empty_script_warned_) {
+                        empty_script_warned_ = true;
+                        LOG_WARNING << "[Stratum] REFUSING to build work: payout address "
+                                       "decodes to an EMPTY script (user=" << username_ << ")"
+                                    << (scfg.coin_symbol.empty() ? "" : " on " + scfg.coin_symbol)
+                                    << " — no finder-less coinbase will be issued"
+                                       " (logged once per session)";
+                    }
+                    return;
+                }
             }
         }
 
