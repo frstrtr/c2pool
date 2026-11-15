@@ -222,6 +222,7 @@ public:
         , m_fixed_seed_timer(ioc)
         , m_http_seed_timer(ioc)
         , m_emergency_timer(ioc)
+        , m_dns_resolver(ioc)
     {
     }
 
@@ -352,6 +353,7 @@ public:
         m_fixed_seed_timer.cancel();
         m_http_seed_timer.cancel();
         m_emergency_timer.cancel();
+        m_dns_resolver.cancel();
         if (!connect_only())  // the peer DB keeps the peers of a normal run
             save_peers();
     }
@@ -1111,14 +1113,23 @@ private:
 
     // ─── DNS seed bootstrap ─────────────────────────────────────────────
 
+    /// Resolve the DNS seeds off this thread, in parallel, each bounded by
+    /// ParallelSeedResolver's timeout. From an io_context handler (the
+    /// emergency re-arm) this returns at once and the peers are added on the
+    /// io thread when the round completes: getaddrinfo() never runs on the
+    /// event loop. At start-up, before the loop runs, it waits for the round.
     void bootstrap_from_dns_seeds()
     {
         if (m_dns_seeds.empty()) return;
 
         LOG_INFO << "[" << m_symbol << "] Resolving " << m_dns_seeds.size() << " DNS seeds...";
-        c2pool::dns::DnsSeeder seeder(m_ioc, m_dns_seeds);
-        auto peers = seeder.resolve_all_sync();
+        if (!m_dns_resolver.resolve(m_dns_seeds,
+                [this](std::vector<NetService> peers) { add_dns_seed_peers(peers); }))
+            LOG_INFO << "[" << m_symbol << "] DNS seed round already in flight, not starting another";
+    }
 
+    void add_dns_seed_peers(const std::vector<NetService>& peers)
+    {
         if (peers.empty()) {
             LOG_WARNING << "[" << m_symbol << "] DNS seeds returned 0 peers";
             return;
@@ -1364,6 +1375,8 @@ private:
     std::vector<std::string> m_anchors;             // last N successfully connected (partition resistance)
     bool m_bootstrapped{false};
     bool m_running{false};
+    /// Last member: destroyed first, so no seed round outlives the rest.
+    c2pool::dns::ParallelSeedResolver m_dns_resolver;
 };
 
 } // namespace merged
