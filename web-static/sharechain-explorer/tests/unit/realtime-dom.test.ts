@@ -344,7 +344,8 @@ test('orchestrator: revision bumps and the listener fires on data changes', asyn
 
 test('dashboard.html: bundled hover hit-test uses the painted layout', () => {
   const html = readFileSync(new URL('../../../dashboard.html', import.meta.url), 'utf8');
-  const start = html.indexOf("import('./sharechain-explorer/dist/sharechain-explorer.js')");
+  // The import may carry a ?v=<hash> cache-bust stamp.
+  const start = html.indexOf("import('./sharechain-explorer/dist/sharechain-explorer.js");
   assert.ok(start > 0, 'bundled bootstrap present');
   const boot = html.slice(start);
   assert.ok(boot.includes('__explorerBundled.cellAtPoint('), 'hover asks the controller');
@@ -354,8 +355,27 @@ test('dashboard.html: bundled hover hit-test uses the painted layout', () => {
     'stale limitation comment removed');
 });
 
-test('dashboard-bundled.mjs: hover hit-test uses the painted layout', () => {
+test('dashboard-bundled.mjs: hover hit-test uses the painted layout, guarded for an old cached bundle', () => {
   const src = readFileSync(new URL('../../dashboard-bundled.mjs', import.meta.url), 'utf8');
   assert.ok(src.includes('rt.cellAtPoint('));
+  assert.ok(src.includes("typeof rt.cellAtPoint !== 'function'"));
   assert.ok(!/computeGridLayout\(/.test(src));
+});
+
+test('a failed start() leaves no resize listener, timer, frame or change listener behind', async () => {
+  const fw = installFakeWindow();
+  try {
+    const c = makeCanvas();
+    const transport = makeTransport({ window: { shares: shares(5) } });
+    transport.subscribeStream = () => { throw new Error('stream down'); };
+    const rt = createRealtime({ canvas: c.canvas, transport, userContext: CONTEXT, containerWidth: () => 800 });
+    await assert.rejects(rt.start(), /stream down/);
+    assert.equal(fw.pending(), 0, 'the frame queued during start was cancelled');
+    fw.fireResize();
+    rt.invalidate();
+    assert.equal(fw.pending(), 0, 'no resize listener, and the loop is stopped');
+    assert.equal(c.paints(), 0);
+  } finally {
+    fw.restore();
+  }
 });
