@@ -17,8 +17,9 @@
     "typecheck": "tsc --noEmit && tsc -p tsconfig.typetests.json",
     "test": "node --import tsx --test \"tests/unit/*.test.ts\"",
     "manifest": "node scripts/emit-manifest.mjs",
+    "stamp": "node scripts/stamp-html.mjs",
     "size": "node scripts/check-bundle-size.mjs",
-    "verify": "npm run typecheck && npm run build && npm test && npm run manifest && npm run size",
+    "verify": "npm run typecheck && npm run build && node scripts/stamp-html.mjs --check && npm test && npm run manifest && npm run size",
     "visual": "bash tests/visual/run.sh",
     "clean": "rm -rf dist"
   },
