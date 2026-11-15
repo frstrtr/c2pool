@@ -295,7 +295,9 @@ export interface TooltipLine {
 
 const KIND_TEXT: Record<number, string> = {
   [TileKind.ThisNode]: '★ mines on this node',
-  [TileKind.OwnerFee]: '⚑ node owner fee',
+  // The owner's tile weighs the node fee AND any shares the owner mines
+  // on that address, so it is labelled as the owner, not as "the fee".
+  [TileKind.OwnerFee]: '⚑ node owner (weight includes the node fee)',
   [TileKind.Donation]: '◇ donation',
 };
 

@@ -209,7 +209,9 @@ test('dashboard.html: the view is opt-in, stamped, and the grid only dims when a
   assert.match(block, /q\.has\('pplns-view'\)/);
   assert.match(block, /localStorage\.getItem\('c2p_pplns_view'\) === '1'/);
   assert.match(block, /import\('\.\/sharechain-explorer\/dist\/scene\.js\?v=[0-9a-f]{8}'\)/);
-  assert.match(block, /d3\.json\('\.\.\/current_payouts'/, 'weights from /current_payouts');
+  assert.match(block, /c2pFetchJSON\('\.\.\/current_payouts'\)/, 'weights from /current_payouts');
+  assert.match(block, /Promise\.all\(\[/, 'the three feeds are fetched in parallel');
+  assert.match(block, /if \(!payouts\) return;/, 'only the payouts are required');
   assert.doesNotMatch(block, /block_value_miner/, 'never the projected block value as a denominator');
   assert.doesNotMatch(block, /my_address/, 'the owner is never inferred from my_address');
   assert.match(html, /function loadMainPPLNS\(_attempt\) \{\s*if \(c2pPplnsViewEnabled\(\)\) \{ loadPplnsView\(\); return; \}/);

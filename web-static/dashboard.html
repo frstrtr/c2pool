@@ -7913,7 +7913,7 @@
         }
         function c2pPplnsViewMount() {
             if (_pplnsViewP) return _pplnsViewP;
-            _pplnsViewP = import('./sharechain-explorer/dist/scene.js?v=e0d6aba0').then(function(mod) {
+            _pplnsViewP = import('./sharechain-explorer/dist/scene.js?v=e1410b9f').then(function(mod) {
                 var ci = (typeof currency_info !== 'undefined' && currency_info) || {};
                 var grid = document.getElementById('pplns-main-grid');
                 grid.innerHTML = '';
@@ -7944,23 +7944,32 @@
             });
             return _pplnsViewP;
         }
+        // The three feeds are fetched in parallel. Payouts are required;
+        // merged children and the stratum workers (for ★) are optional,
+        // so a failure there still renders the treemap.
+        function c2pFetchJSON(url) {
+            return new Promise(function(resolve) {
+                d3.json(url, function(d) { resolve(d && typeof d === 'object' ? d : null); });
+            });
+        }
         function loadPplnsView() {
             c2pPplnsViewMount().then(function(h) {
-                d3.json('../current_payouts', function(payouts) {
-                    if (!payouts || typeof payouts !== 'object') return;
-                    d3.json('../current_merged_payouts', function(merged) {
-                        d3.json('../stratum_stats', function(ss) {
-                            var ci = (typeof currency_info !== 'undefined' && currency_info) || {};
-                            var special = { thisNode: h.mod.addressesFromWorkers(ss && ss.workers) };
-                            if (ci.node_owner_address) special.ownerAddresses = [ci.node_owner_address];
-                            if (defrag.feeHash160) special.ownerHash160 = defrag.feeHash160;
-                            if (ci.donation_address) special.donationAddresses = [ci.donation_address];
-                            _pplnsFacts = c2pPplnsFacts();
-                            h.view.update({ payouts: payouts, merged: (merged && typeof merged === 'object') ? merged : {} }, special);
-                            var pl = document.getElementById('pplns-loading');
-                            if (pl) pl.style.display = 'none';
-                        });
-                    });
+                return Promise.all([
+                    c2pFetchJSON('../current_payouts'),
+                    c2pFetchJSON('../current_merged_payouts'),
+                    c2pFetchJSON('../stratum_stats')
+                ]).then(function(r) {
+                    var payouts = r[0], merged = r[1], ss = r[2];
+                    if (!payouts) return;
+                    var ci = (typeof currency_info !== 'undefined' && currency_info) || {};
+                    var special = { thisNode: h.mod.addressesFromWorkers(ss && ss.workers) };
+                    if (ci.node_owner_address) special.ownerAddresses = [ci.node_owner_address];
+                    if (defrag.feeHash160) special.ownerHash160 = defrag.feeHash160;
+                    if (ci.donation_address) special.donationAddresses = [ci.donation_address];
+                    _pplnsFacts = c2pPplnsFacts();
+                    h.view.update({ payouts: payouts, merged: merged || {} }, special);
+                    var pl = document.getElementById('pplns-loading');
+                    if (pl) pl.style.display = 'none';
                 });
             }).catch(function(err) {
                 console.error('[c2pool] PPLNS view failed to load', err);

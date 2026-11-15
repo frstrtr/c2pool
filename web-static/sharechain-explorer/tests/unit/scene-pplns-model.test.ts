@@ -154,6 +154,9 @@ test('tooltip: weight %, payout and % of miner payouts, merged child, facts, wei
   assert.ok(lines.includes('next block: 0.25000000 LTC (4.00% of miner payouts)'));
   assert.ok(lines.includes('410.0000 DOGE → Dmid · explicit'));
   assert.ok(lines.includes('★ mines on this node'));
+  const owner = tooltipLines({ ...t, items: [{ ...t.items[0]!, data: { ...t.items[0]!.data!, kind: TileKind.OwnerFee } }] },
+    { total: 100, mode: 'parent', symbol: 'LTC' }).map((l) => l.text);
+  assert.ok(owner.includes('⚑ node owner (weight includes the node fee)'), 'never claims the whole tile is fee');
   assert.ok(lines.includes('12 shares in window (60.00% of count)'));
   assert.ok(lines.includes('last share 2 min ago'));
   assert.ok(lines.some((l) => l.startsWith('weight ≠ share count')), 'a 25% vs 60% gap is flagged');
