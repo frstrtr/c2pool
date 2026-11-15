@@ -32,6 +32,8 @@
 #include <crypto/sha256.h>      // CSHA256 for P2PK→P2PKH conversion
 #include <crypto/ripemd160.h>   // CRIPEMD160 for Hash160
 #include <c2pool/merged/merged_mining.hpp>  // Integrated merged mining
+#include <c2pool/merged/aux_chain_params.hpp>  // merged-chain address versions (/web/currency_info)
+#include <core/donation.hpp>                    // COMBINED_DONATION_SCRIPT (merged donation address)
 #include <impl/ltc/config_pool.hpp>          // PoolConfig::is_testnet for donation addr
 
 #include <iomanip>
@@ -3302,10 +3304,31 @@ nlohmann::json MiningInterface::rest_global_rate()
     return rate;
 }
 
+std::string MiningInterface::primary_script_to_address(const std::vector<unsigned char>& s) const
+{
+    // Chain-specific version bytes, so Dash payouts render as 'X...' not
+    // Bitcoin '1...'.
+    if (m_blockchain == Blockchain::DASH) {
+        uint8_t p2pkh = m_testnet ? 140 : 76;   // Dash: 'y' / 'X'
+        uint8_t p2sh  = m_testnet ?  19 : 16;   // Dash: '7'
+        return core::script_to_address(s, "", p2pkh, p2sh);
+    }
+    if (m_blockchain == Blockchain::DOGECOIN) {
+        // DOGE version bytes: mainnet 0x1e ('D') / 0x16, testnet 0x71 / 0xc4.
+        // Without this arm a primary-DOGE node falls through to the bool
+        // overload's BTC branch (is_ltc==false) and renders DOGE payouts as
+        // Bitcoin '1...' addresses. Display-only, reward-safe (scripts and
+        // amounts are unchanged; only the human-readable address string is).
+        uint8_t p2pkh = m_testnet ? 0x71 : 0x1e;
+        uint8_t p2sh  = m_testnet ? 0xc4 : 0x16;
+        return core::script_to_address(s, "", p2pkh, p2sh);
+    }
+    return core::script_to_address(s, m_blockchain == Blockchain::LITECOIN, m_testnet);
+}
+
 nlohmann::json MiningInterface::rest_current_payouts()
 {
     nlohmann::json result = nlohmann::json::object();
-    bool is_ltc = (m_blockchain == Blockchain::LITECOIN);
 
     // #939: authoritative direct source, when a coin wires one (DASH has no
     // coinbase-builder PPLNS cache feeding this endpoint, so it returned {} on
@@ -3318,25 +3341,10 @@ nlohmann::json MiningInterface::rest_current_payouts()
             return direct;
     }
 
-    // Script-to-address resolver — picks chain-specific version bytes so
-    // Dash payouts render as 'X...' not Bitcoin '1...'.
-    auto resolve_addr = [this, is_ltc](const std::vector<unsigned char>& s) -> std::string {
-        if (m_blockchain == Blockchain::DASH) {
-            uint8_t p2pkh = m_testnet ? 140 : 76;   // Dash: 'y' / 'X'
-            uint8_t p2sh  = m_testnet ?  19 : 16;   // Dash: '7'
-            return core::script_to_address(s, "", p2pkh, p2sh);
-        }
-        if (m_blockchain == Blockchain::DOGECOIN) {
-            // DOGE version bytes: mainnet 0x1e ('D') / 0x16, testnet 0x71 / 0xc4.
-            // Without this arm a primary-DOGE node falls through to the bool
-            // overload's BTC branch (is_ltc==false) and renders DOGE payouts as
-            // Bitcoin '1...' addresses. Display-only, reward-safe (scripts and
-            // amounts are unchanged; only the human-readable address string is).
-            uint8_t p2pkh = m_testnet ? 0x71 : 0x1e;
-            uint8_t p2sh  = m_testnet ? 0xc4 : 0x16;
-            return core::script_to_address(s, "", p2pkh, p2sh);
-        }
-        return core::script_to_address(s, is_ltc, m_testnet);
+    // Script-to-address resolver (the row keys; /web/currency_info renders
+    // the node-owner and donation addresses with the same one).
+    auto resolve_addr = [this](const std::vector<unsigned char>& s) -> std::string {
+        return primary_script_to_address(s);
     };
 
     // Primary source: cached PPLNS outputs from the coinbase builder.
@@ -6697,6 +6705,52 @@ nlohmann::json MiningInterface::rest_coin_peers(const std::string& remote_ip)
     return m_coin_peers_fn();
 }
 
+namespace {
+// The P2PKH script of a P2PK script's pubkey (p2pool shows a P2PK output by
+// its key's P2PKH address, as /current_payouts keys the pre-V36 donation);
+// empty for any other script.
+std::vector<unsigned char> p2pk_as_p2pkh(const std::vector<unsigned char>& s)
+{
+    if (s.size() < 35 || s.back() != 0xac || static_cast<size_t>(s[0]) + 2 != s.size()
+        || (s[0] != 33 && s[0] != 65))
+        return {};
+    unsigned char sha[32], rip[20];
+    CSHA256().Write(&s[1], s[0]).Finalize(sha);
+    CRIPEMD160().Write(sha, 32).Finalize(rip);
+    std::vector<unsigned char> p2pkh = {0x76, 0xa9, 0x14};
+    p2pkh.insert(p2pkh.end(), rip, rip + 20);
+    p2pkh.push_back(0x88);
+    p2pkh.push_back(0xac);
+    return p2pkh;
+}
+
+// A merged chain's address of a script on the node's network, from the
+// chain's own versions in c2pool::merged::aux_chain_params_table (the table
+// main_ltc sets each AuxChainConfig's address_version / p2sh_version from,
+// i.e. the bytes /current_merged_payouts renders its merged rows with). ""
+// for a chain c2pool has no address parameters for, or a script with no
+// address form.
+std::string merged_chain_script_to_address(const std::vector<unsigned char>& script,
+                                           const std::string& symbol, bool testnet)
+{
+    const auto* p = c2pool::merged::find_aux_chain_params(symbol);
+    if (!p)
+        return {};
+    const auto& v = testnet ? p->test : p->main;
+    if (v.p2pkh.empty() || v.p2sh.empty())
+        return {};
+    return core::script_to_address(script, v.hrps.empty() ? std::string() : v.hrps.front(),
+                                   v.p2pkh.front(), v.p2sh.front());
+}
+
+std::string upper_symbol(std::string s)
+{
+    for (auto& ch : s)
+        if (ch >= 'a' && ch <= 'z') ch = static_cast<char>(ch - 32);
+    return s;
+}
+} // namespace
+
 nlohmann::json MiningInterface::rest_web_currency_info()
 {
     nlohmann::json result = nlohmann::json::object();
@@ -6966,6 +7020,95 @@ nlohmann::json MiningInterface::rest_web_currency_info()
             }
         }
         result["coins"] = coins;
+    }
+
+    // ─── Payee identities for the PPLNS treemap (node-owner fee, donation) ───
+    // Explicit fields so the dashboard never guesses an output's role from an
+    // address prefix. Each is rendered from the script the node actually pays,
+    // in the form /current_payouts and /current_merged_payouts key their rows
+    // by, so a tile is matched by string equality. "" / {} when the node pays
+    // no such output, and on a coin this function has no address form for
+    // (BCH CashAddr, DGB, NMC, BIP110: an empty field, never a Bitcoin-format
+    // address the chain does not pay).
+    {
+        bool parent_renderable = false;
+        if (coin_label_uc != "BCH" && coin_label_uc != "NMC" && coin_label_uc != "BIP110") {
+            switch (m_blockchain) {
+            case Blockchain::LITECOIN:
+            case Blockchain::BITCOIN:
+            case Blockchain::DOGECOIN:
+            case Blockchain::DASH:
+                parent_renderable = true;
+                break;
+            default:
+                break;
+            }
+        }
+        auto parent_address = [&](const std::vector<unsigned char>& s) -> std::string {
+            if (!parent_renderable || s.empty())
+                return {};
+            auto a = primary_script_to_address(s);
+            if (a.empty()) {
+                const auto p2pkh = p2pk_as_p2pkh(s);
+                if (!p2pkh.empty())
+                    a = primary_script_to_address(p2pkh);
+            }
+            return a;
+        };
+
+        const auto chain_infos = m_mm_manager ? m_mm_manager->get_chain_infos()
+                                              : std::vector<c2pool::merged::MergedMiningManager::ChainInfo>{};
+
+        // node_owner_address: the --node-owner-address the --fee shares are
+        // minted to (set_node_fee_from_address). "" without a fee.
+        std::string owner;
+        if (m_node_fee_percent > 0.0)
+            owner = parent_address(m_node_fee_script);
+        result["node_owner_address"] = owner;
+
+        // node_owner_merged_addresses: per merged chain this node mines, the
+        // address the fee shares carry there (set_operator_merged_scripts: the
+        // effective one of resolve_operator_merged_script's cascade, i.e.
+        // --node-owner-merged-address for DOGE when it is set, else the one
+        // derived from the owner key, else the donation script). A chain that
+        // is not configured, or is disabled, is not named.
+        nlohmann::json owner_merged = nlohmann::json::object();
+        if (!owner.empty()) {
+            for (const auto& ci : chain_infos) {
+                if (!ci.config_error.empty())
+                    continue;
+                const auto op = m_operator_merged_scripts.find(ci.chain_id);
+                if (op == m_operator_merged_scripts.end())
+                    continue;
+                const auto addr = merged_chain_script_to_address(op->second, ci.symbol, m_testnet);
+                if (!addr.empty())
+                    owner_merged[upper_symbol(ci.symbol)] = addr;
+            }
+        }
+        result["node_owner_merged_addresses"] = owner_merged;
+
+        // donation_address: the parent coinbase's donation output (the
+        // donation script the share version's coinbase pays, kept current by
+        // the coin's PPLNS hook). A pre-V36 P2PK donation is shown by its
+        // key's P2PKH address, as /current_payouts does.
+        result["donation_address"] = parent_address(m_donation_script);
+
+        // merged_donation_addresses: every merged chain whose block c2pool
+        // builds itself (multiaddress; build_pplns_coinbase_hex always pays
+        // the V36 combined donation P2SH) and that is not disabled. A
+        // createauxblock-mode chain's coinbase is the daemon's, with no
+        // donation output: not listed.
+        nlohmann::json donation_merged = nlohmann::json::object();
+        const std::vector<unsigned char> combined_donation(core::donation::COMBINED_DONATION_SCRIPT.begin(),
+                                                           core::donation::COMBINED_DONATION_SCRIPT.end());
+        for (const auto& ci : chain_infos) {
+            if (!ci.multiaddress || !ci.config_error.empty())
+                continue;
+            const auto addr = merged_chain_script_to_address(combined_donation, ci.symbol, m_testnet);
+            if (!addr.empty())
+                donation_merged[upper_symbol(ci.symbol)] = addr;
+        }
+        result["merged_donation_addresses"] = donation_merged;
     }
 
     return result;

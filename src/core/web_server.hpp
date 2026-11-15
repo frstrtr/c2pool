@@ -1659,6 +1659,10 @@ public:
     // Returns "" if the fee script is not a 25-byte P2PKH.
     std::string get_node_fee_hash160() const;
 private:
+    // The primary coin's address of a scriptPubKey, the form /current_payouts
+    // keys its rows by: DASH and DOGE version bytes, else the LTC / BTC ones.
+    // "" for a script with no address form.
+    std::string primary_script_to_address(const std::vector<unsigned char>& script) const;
     void setup_methods();
     // Build Stratum-compatible coinb1/coinb2 from a live block template
     // Output ordering matches generate_share_transaction():
