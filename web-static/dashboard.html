@@ -2103,8 +2103,8 @@
                                 <th>Block Hash</th>
                                 <th>Luck</th>
                                 <th title="Time to find block (actual/expected)">Round</th>
-                                <th title="Network difficulty target">Net Diff</th>
-                                <th title="Actual hash difficulty">Hash Diff</th>
+                                <th title="Network difficulty, shown as the hashrate it implies at this coin's block time (hover a cell for the difficulty)">Net Diff</th>
+                                <th title="Difficulty the found block hash met, shown as the hashrate it implies at this coin's block time (hover a cell for the difficulty)">Hash Diff</th>
                                 <th title="Block status">✓</th>
                             </tr>
                         </thead>
@@ -2490,6 +2490,28 @@
             if (d < 1000) return d3.format('.2f')(d) + ' T';
             d = d / 1000;
             return d3.format('.2f')(d) + ' P';
+        }
+
+        // A block's difficulty SHOWN as the hashrate it implies (difficulty x 2^32 /
+        // block period), so miners can compare it with their own PH/s. The block
+        // period is the coin's own (currency_info.block_period; 150 s until loaded).
+        function block_period_sec() {
+            return (typeof parentBlockPeriodMs !== 'undefined' && parentBlockPeriodMs > 0)
+                ? parentBlockPeriodMs / 1000 : 150;
+        }
+        function diff_as_hashrate(diff) {
+            return format_hashrate(Math.floor(diff * Math.pow(2, 32) / block_period_sec()));
+        }
+        // "pdiff" (difficulty x 65536) is the Scrypt pool-difficulty convention
+        // (LTC/DOGE). X11 (DASH) and SHA256 coins have no such factor.
+        function is_scrypt_coin() {
+            var sym = (window.currency_info && window.currency_info.symbol) || '';
+            return /^t?(LTC|DOGE)$/i.test(sym);
+        }
+        function diff_detail(diff) {
+            var s = 'difficulty ' + d3.format(',.2f')(diff) + ' (' + format_difficulty(diff) + ')';
+            if (is_scrypt_coin()) s += ', pdiff ' + d3.format('.2e')(diff * 65536);
+            return s;
         }
 
         // Coin-generic finder attribution for a /recent_blocks row (#901).
@@ -4654,16 +4676,11 @@
                             expected = (b.network_difficulty * Math.pow(2, 32)) / b.pool_hashrate_at_find;
                         }
                         
-                        var formatTime = function(seconds) {
-                            var hours = Math.floor(seconds / 3600);
-                            var mins = Math.floor((seconds % 3600) / 60);
-                            return ('0' + hours).slice(-2) + ':' + ('0' + mins).slice(-2);
-                        };
-                        
-                        var exp = expected > 0 ? formatTime(expected) : '--:--';
-                        var act = actual > 0 ? formatTime(actual) : '--:--';
+                        // Adaptive units: a 107 s find reads "1m 47s", not a truncated "00:01".
+                        var exp = expected > 0 ? format_duration(expected) : '-';
+                        var act = actual > 0 ? format_duration(actual) : '-';
                         // Display as actual/expected since that's more intuitive (time taken vs time expected)
-                        return act + '/' + exp;
+                        return act + ' / ' + exp;
                     })
                     .attr('title', function(b) {
                         var actual = b.time_to_find || 0;
@@ -4681,27 +4698,31 @@
                         var act = actual > 0 ? format_dt(actual) : 'unknown';
                         return 'Actual: ' + act + '\nExpected: ' + exp;
                     });
+                // Net Diff / Hash Diff are SHOWN as a hashrate (diff_as_hashrate) so
+                // miners can compare them with their own PH/s; the tooltip carries the
+                // difficulty itself.
                 tr.append('td')
                     .text(function(b) {
                         if (!b.network_difficulty) return '-';
-                        var hashrate = Math.floor(b.network_difficulty * Math.pow(2, 32) / 150);
-                        return format_hashrate(hashrate);
+                        return diff_as_hashrate(b.network_difficulty);
                     })
                     .attr('title', function(b) {
                         if (!b.network_difficulty) return '';
-                        var pdiff = b.network_difficulty * 65536;
-                        return 'bdiff: ' + d3.format(',.2f')(b.network_difficulty) + '\npdiff: ' + d3.format('.2e')(pdiff);
+                        return 'Network ' + diff_detail(b.network_difficulty) +
+                            '\nShown as hashrate: difficulty x 2^32 / ' + block_period_sec() + ' s block time';
                     });
                 tr.append('td')
                     .text(function(b) {
                         if (!b.actual_hash_difficulty) return '-';
-                        var hashrate = Math.floor(b.actual_hash_difficulty * Math.pow(2, 32) / 150);
-                        return format_hashrate(hashrate);
+                        return diff_as_hashrate(b.actual_hash_difficulty);
                     })
                     .attr('title', function(b) {
                         if (!b.actual_hash_difficulty) return '';
-                        var pdiff = b.actual_hash_difficulty * 65536;
-                        return 'bdiff: ' + d3.format(',.2f')(b.actual_hash_difficulty) + '\npdiff: ' + d3.format('.2e')(pdiff);
+                        return 'Block hash ' + diff_detail(b.actual_hash_difficulty) +
+                            (b.network_difficulty
+                                ? '\n' + d3.format('.2f')(b.actual_hash_difficulty / b.network_difficulty) + 'x the network difficulty'
+                                : '') +
+                            '\nShown as hashrate: difficulty x 2^32 / ' + block_period_sec() + ' s block time';
                     });
                 tr.append('td')
                     .attr('class', function(b) {
@@ -8969,16 +8990,12 @@
                                 s += 'Expected: <b>' + format_dt(b.expected_time) + '</b><br/>';
                             }
                             if (b.network_difficulty) {
-                                var netHashrate = Math.floor(b.network_difficulty * Math.pow(2, 32) / 150);
-                                var netPdiff = b.network_difficulty * 65536;
-                                s += 'Net Diff: <b style="color:#8888ff">' + format_hashrate(netHashrate) + '</b><br/>';
-                                s += '<span style="font-size:10px;color:#aaa">(bdiff: ' + d3.format(',.2f')(b.network_difficulty) + ', pdiff: ' + d3.format('.2e')(netPdiff) + ')</span><br/>';
+                                s += 'Net Diff: <b style="color:#8888ff">' + diff_as_hashrate(b.network_difficulty) + '</b><br/>';
+                                s += '<span style="font-size:10px;color:#aaa">(' + diff_detail(b.network_difficulty) + ')</span><br/>';
                             }
                             if (b.actual_hash_difficulty) {
-                                var actualHashrate = Math.floor(b.actual_hash_difficulty * Math.pow(2, 32) / 150);
-                                var actualPdiff = b.actual_hash_difficulty * 65536;
-                                s += 'Hash Diff: <b style="color:#00d4ff">' + format_hashrate(actualHashrate) + '</b><br/>';
-                                s += '<span style="font-size:10px;color:#aaa">(bdiff: ' + d3.format(',.2f')(b.actual_hash_difficulty) + ', pdiff: ' + d3.format('.2e')(actualPdiff) + ')</span><br/>';
+                                s += 'Hash Diff: <b style="color:#00d4ff">' + diff_as_hashrate(b.actual_hash_difficulty) + '</b><br/>';
+                                s += '<span style="font-size:10px;color:#aaa">(' + diff_detail(b.actual_hash_difficulty) + ')</span><br/>';
                             }
                             // Show Hash/Net difficulty ratio (how many more leading zeroes than required)
                             if (b.actual_hash_difficulty && b.network_difficulty && b.network_difficulty > 0) {
@@ -9112,16 +9129,12 @@
                                 s += 'Expected: <b>' + format_dt(b.expected_time) + '</b><br/>';
                             }
                             if (b.network_difficulty) {
-                                var netHashrate = Math.floor(b.network_difficulty * Math.pow(2, 32) / 150);
-                                var netPdiff = b.network_difficulty * 65536;
-                                s += 'Net Diff: <b style="color:#8888ff">' + format_hashrate(netHashrate) + '</b><br/>';
-                                s += '<span style="font-size:10px;color:#aaa">(bdiff: ' + d3.format(',.2f')(b.network_difficulty) + ', pdiff: ' + d3.format('.2e')(netPdiff) + ')</span><br/>';
+                                s += 'Net Diff: <b style="color:#8888ff">' + diff_as_hashrate(b.network_difficulty) + '</b><br/>';
+                                s += '<span style="font-size:10px;color:#aaa">(' + diff_detail(b.network_difficulty) + ')</span><br/>';
                             }
                             if (b.actual_hash_difficulty) {
-                                var actualHashrate = Math.floor(b.actual_hash_difficulty * Math.pow(2, 32) / 150);
-                                var actualPdiff = b.actual_hash_difficulty * 65536;
-                                s += 'Hash Diff: <b style="color:#00d4ff">' + format_hashrate(actualHashrate) + '</b><br/>';
-                                s += '<span style="font-size:10px;color:#aaa">(bdiff: ' + d3.format(',.2f')(b.actual_hash_difficulty) + ', pdiff: ' + d3.format('.2e')(actualPdiff) + ')</span><br/>';
+                                s += 'Hash Diff: <b style="color:#00d4ff">' + diff_as_hashrate(b.actual_hash_difficulty) + '</b><br/>';
+                                s += '<span style="font-size:10px;color:#aaa">(' + diff_detail(b.actual_hash_difficulty) + ')</span><br/>';
                             }
                             // Show Hash/Net difficulty ratio (how many more leading zeroes than required)
                             if (b.actual_hash_difficulty && b.network_difficulty && b.network_difficulty > 0) {
@@ -9681,18 +9694,14 @@
                                 s += 'Expected: <b>' + format_dt(b.expected_time) + '</b><br/>';
                             }
                             if (b.network_difficulty) {
-                                var netHashrate = Math.floor(b.network_difficulty * Math.pow(2, 32) / 150);
-                                var netPdiff = b.network_difficulty * 65536;
-                                s += 'Net Diff: <b style="color:#8888ff">' + format_hashrate(netHashrate) + '</b><br/>';
-                                s += '<span style="font-size:11px;color:#888">(Hashrate needed to solve in 2.5 min)</span><br/>';
-                                s += '<span style="font-size:11px;color:#aaa">bdiff: ' + d3.format(',.2f')(b.network_difficulty) + ', pdiff: ' + d3.format('.2e')(netPdiff) + '</span><br/>';
+                                s += 'Net Diff: <b style="color:#8888ff">' + diff_as_hashrate(b.network_difficulty) + '</b><br/>';
+                                s += '<span style="font-size:11px;color:#888">(Hashrate needed to solve in ' + format_duration(block_period_sec()) + ')</span><br/>';
+                                s += '<span style="font-size:11px;color:#aaa">' + diff_detail(b.network_difficulty) + '</span><br/>';
                             }
                             if (b.actual_hash_difficulty) {
-                                var actualHashrate = Math.floor(b.actual_hash_difficulty * Math.pow(2, 32) / 150);
-                                var actualPdiff = b.actual_hash_difficulty * 65536;
-                                s += 'Hash Diff: <b style="color:#00d4ff">' + format_hashrate(actualHashrate) + '</b><br/>';
+                                s += 'Hash Diff: <b style="color:#00d4ff">' + diff_as_hashrate(b.actual_hash_difficulty) + '</b><br/>';
                                 s += '<span style="font-size:11px;color:#888">(Hashrate equivalent of found hash)</span><br/>';
-                                s += '<span style="font-size:11px;color:#aaa">bdiff: ' + d3.format(',.2f')(b.actual_hash_difficulty) + ', pdiff: ' + d3.format('.2e')(actualPdiff) + '</span><br/>';
+                                s += '<span style="font-size:11px;color:#aaa">' + diff_detail(b.actual_hash_difficulty) + '</span><br/>';
                             }
                             // Show Hash/Net difficulty ratio
                             if (b.actual_hash_difficulty && b.network_difficulty && b.network_difficulty > 0) {
@@ -9838,16 +9847,12 @@
                                 s += 'Expected: <b>' + format_dt(b.expected_time) + '</b><br/>';
                             }
                             if (b.network_difficulty) {
-                                var netHashrate = Math.floor(b.network_difficulty * Math.pow(2, 32) / 150);
-                                var netPdiff = b.network_difficulty * 65536;
-                                s += 'Net Diff: <b style="color:#8888ff">' + format_hashrate(netHashrate) + '</b><br/>';
-                                s += '<span style="font-size:10px;color:#aaa">(bdiff: ' + d3.format(',.2f')(b.network_difficulty) + ', pdiff: ' + d3.format('.2e')(netPdiff) + ')</span><br/>';
+                                s += 'Net Diff: <b style="color:#8888ff">' + diff_as_hashrate(b.network_difficulty) + '</b><br/>';
+                                s += '<span style="font-size:10px;color:#aaa">(' + diff_detail(b.network_difficulty) + ')</span><br/>';
                             }
                             if (b.actual_hash_difficulty) {
-                                var actualHashrate = Math.floor(b.actual_hash_difficulty * Math.pow(2, 32) / 150);
-                                var actualPdiff = b.actual_hash_difficulty * 65536;
-                                s += 'Hash Diff: <b style="color:#00d4ff">' + format_hashrate(actualHashrate) + '</b><br/>';
-                                s += '<span style="font-size:10px;color:#aaa">(bdiff: ' + d3.format(',.2f')(b.actual_hash_difficulty) + ', pdiff: ' + d3.format('.2e')(actualPdiff) + ')</span><br/>';
+                                s += 'Hash Diff: <b style="color:#00d4ff">' + diff_as_hashrate(b.actual_hash_difficulty) + '</b><br/>';
+                                s += '<span style="font-size:10px;color:#aaa">(' + diff_detail(b.actual_hash_difficulty) + ')</span><br/>';
                             }
                             // Show Hash/Net difficulty ratio
                             if (b.actual_hash_difficulty && b.network_difficulty && b.network_difficulty > 0) {
