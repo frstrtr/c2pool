@@ -52,6 +52,7 @@ The engine draws into a **container** element (`position: relative`, sized by th
 - A requested `renderer` (e.g. a GPU backend) is initialised on a new surface in the background. It replaces Canvas2D only if its `init` resolves. If `init` throws or rejects, the failure goes to `onError` and the scene stays on Canvas2D.
 - On context loss, the engine initialises `fallbackRenderer()` (default Canvas2D) on a **new** surface, swaps it in, removes the lost surface and re-uploads every record.
 - `swapRenderer(next)` does the same on request and rejects, keeping the current renderer, if `next` fails.
+- **For a GPU backend author.** The engine registers `onContextLost` only after `init` resolves, when it installs the renderer. The backend must therefore own its `webglcontextlost` / `device.lost` listener from `init` onward, and fire the engine's callback even if the loss happened between `init` and install. It must also remove that listener in `dispose()`, so a disposed backend never triggers a fallback.
 
 ## Layout plug-in contract
 
@@ -138,6 +139,19 @@ Labels, axes and marks are a separate 2D pass drawn *after* the tiles, never by 
 - With a GPU renderer, it draws on a 2D canvas stacked above.
 
 Each frame the engine passes the view's `labels(placedTiles)` for the tiles as placed at that instant, so labels follow moving tiles.
+
+## Views
+
+| View | Mount | Notes |
+|---|---|---|
+| PPLNS treemap (`views/pplns-treemap.ts` + pure `views/pplns-model.ts`) | `mountPplnsTreemap({ container, symbol, mergedSymbol?, bus?, special?, facts?, addressUrl? })`, then `view.update({ payouts, merged }, special?)` | See below. |
+
+**PPLNS treemap.**
+- **Data.** Tile weight = `/current_payouts`, i.e. what the payout code pays. Merged children come from `/current_merged_payouts`. In merged mode the same keys (parent addresses) are re-weighted by their child amount, so the toggle tweens each miner in place.
+- **"% of miner payouts"** divides by the sum of `/current_payouts`. It never uses `/local_stats` `block_value_miner`, which on a relay is a projection without fees.
+- **Special tiles.** ★ = addresses this node's stratum serves (`/stratum_stats` workers, the key up to the first `.`). ⚑ = an explicit owner address, or a tile whose hash160 equals the window's `fee_hash160`. ◇ = an explicit donation address only. Nothing is inferred from address prefixes.
+- **Interaction.** Hover shows the tooltip and lights the miner in linked views. Click pins and Esc unpins. Clicking "N others" lays the small miners out. Ctrl/⌘-click opens the address explorer. Search dims non-matching tiles. The opt-in log scale carries a "not proportional" badge.
+- **dashboard.html** mounts it in `#pplns-main-grid` behind `?pplns-view=1` (or `localStorage c2p_pplns_view=1`), and links it to the share-chain grid through one `SelectionBus`. A pinned miner, or one hovered in the treemap, keeps full colour in the grid; the rest dim.
 
 ## Budgets and hosts
 

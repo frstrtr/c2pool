@@ -70,6 +70,17 @@ const server = createServer((req, res) => {
     const raw = readFileSync(join(FIXTURES, 'merged_payouts.json'), 'utf8');
     return serveJson(res, raw);
   }
+  // MOCK_PAYOUTS=1 (tests/visual/capture-pplns.mjs only): serve the
+  // PPLNS view's inputs. /current_payouts mirrors the merged fixture's
+  // parent amounts; two miners are "on this node". Off by default, so
+  // the pixel-diff gate sees exactly what it always did.
+  if (process.env.MOCK_PAYOUTS === '1' && path === '/current_payouts') {
+    const merged = JSON.parse(readFileSync(join(FIXTURES, 'merged_payouts.json'), 'utf8'));
+    return serveJson(res, Object.fromEntries(Object.entries(merged).map(([a, v]) => [a, v.amount])));
+  }
+  if (process.env.MOCK_PAYOUTS === '1' && path === '/stratum_stats') {
+    return serveJson(res, { pool: {}, workers: { 'XMINEADDRESS.rig1': {}, 'XminerDDDDD4.s19': {} } });
+  }
   if (path === '/sharechain/stream') {
     // Minimal SSE: hello + keep-alive only. No tips fired = no animation
     // churn during the screenshot window.

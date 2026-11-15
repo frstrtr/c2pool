@@ -6063,6 +6063,9 @@
                     }
                     self.shares = data.shares;
                     self.myAddress = data.my_address || '';
+                    // Node-owner fee payee as a hash160 (LTC; "" without --fee).
+                    // Used only to mark the owner's tile in the PPLNS view.
+                    self.feeHash160 = typeof data.fee_hash160 === 'string' ? data.fee_hash160 : '';
                     // Build the self-identity set: single my_address ∪ the
                     // my_addresses array (node-owner ∪ local stratum workers).
                     // Backward-compatible — a lane emitting only my_address
@@ -6265,9 +6268,13 @@
                     var x = ml + col * step;
                     var y = row * step;
 
-                    // Fill color
+                    // Fill color. With the PPLNS view on, a miner pinned or
+                    // hovered there keeps full colour and the rest dim.
+                    var dimCell = !!this.focusMiner && share.m !== this.focusMiner;
+                    if (dimCell) ctx.globalAlpha = 0.25;
                     ctx.fillStyle = this.getColor(share);
                     ctx.fillRect(x, y, cs, cs);
+                    if (dimCell) ctx.globalAlpha = 1;
 
                     var isLtcBlock = c2pIsBlockShare(this.blockSet, share);
                     var isDogeBlock = !!this.dogeSet[share.h];
@@ -6342,6 +6349,9 @@
                     // Update data
                     self.shares = data.shares;
                     self.myAddress = data.my_address || '';
+                    // Node-owner fee payee as a hash160 (LTC; "" without --fee).
+                    // Used only to mark the owner's tile in the PPLNS view.
+                    self.feeHash160 = typeof data.fee_hash160 === 'string' ? data.fee_hash160 : '';
                     // Build the self-identity set: single my_address ∪ the
                     // my_addresses array (node-owner ∪ local stratum workers).
                     // Backward-compatible — a lane emitting only my_address
@@ -7048,6 +7058,9 @@
                 if (idx !== this.hoveredIdx) {
                     var prevIdx = this.hoveredIdx;
                     this.hoveredIdx = idx;
+                    if (window.c2pSelectionBus) {
+                        window.c2pSelectionBus.hover(idx >= 0 && this.shares[idx] ? this.shares[idx].m : null, 'grid');
+                    }
                     this.render();
 
                     if (idx >= 0) {
@@ -7856,7 +7869,116 @@
         // retry above. Keeps the existing #pplns-loading placeholder visible
         // (renderMainPPLNS only hides it on success).
         var _pplnsLoadMaxRetries = 3;
+
+        // BEGIN c2pPplnsView
+        // Interactive PPLNS treemap on the scene engine (dist/scene.js),
+        // opt-in with ?pplns-view=1 or localStorage c2p_pplns_view=1.
+        // Tile weight = /current_payouts (what the payout code pays);
+        // merged children from /current_merged_payouts; ★ = addresses this
+        // node's stratum serves; ⚑ = the node owner (explicit address, or
+        // the window's fee_hash160); ◇ = an explicit donation address only.
+        // Hover/pin link with the share-chain grid through one bus.
+        function c2pPplnsViewEnabled() {
+            try {
+                var q = new URLSearchParams(location.search);
+                if (q.has('pplns-view')) return q.get('pplns-view') !== '0';
+            } catch (e) { /* old browser */ }
+            try { return localStorage.getItem('c2p_pplns_view') === '1'; } catch (e) { return false; }
+        }
+        var _pplnsViewP = null;
+        var _pplnsFacts = null;
+        function c2pPplnsFacts() {
+            var shares = (defrag && defrag.shares) || [];
+            var n = shares.length, counts = {}, last = {};
+            for (var i = 0; i < n; i++) {
+                var s = shares[i];
+                if (!s || !s.m) continue;
+                counts[s.m] = (counts[s.m] || 0) + 1;
+                if (typeof s.t === 'number' && !(last[s.m] >= s.t)) last[s.m] = s.t;
+            }
+            var nowS = Date.now() / 1000;
+            return function(addr) {
+                var out = {};
+                if (n > 0) { out.shares = counts[addr] || 0; out.countFraction = (counts[addr] || 0) / n; }
+                if (last[addr]) out.lastShareAgeS = Math.max(0, nowS - last[addr]);
+                var hr = defrag.minerHashrates ? defrag.minerHashrates[addr] : 0;
+                if (hr > 0) out.hashrate = format_hashrate(hr);
+                var mv = getMinerVersion(addr);
+                if (mv && mv.ver) out.version = (mv.dv && mv.dv !== mv.ver) ? ('V' + mv.ver + ' \u2192 V' + mv.dv) : ('V' + mv.ver);
+                return out;
+            };
+        }
+        function c2pPplnsViewMount() {
+            if (_pplnsViewP) return _pplnsViewP;
+            _pplnsViewP = import('./sharechain-explorer/dist/scene.js?v=e1410b9f').then(function(mod) {
+                var ci = (typeof currency_info !== 'undefined' && currency_info) || {};
+                var grid = document.getElementById('pplns-main-grid');
+                grid.innerHTML = '';
+                var bus = mod.createSelectionBus();
+                window.c2pSelectionBus = bus;
+                var child = (ci.merged_child_symbol || '').toUpperCase();
+                var opts = {
+                    container: grid,
+                    symbol: ci.symbol || 'COIN',
+                    bus: bus,
+                    facts: function(a) { return _pplnsFacts ? _pplnsFacts(a) : undefined; },
+                    addressUrl: function(a) {
+                        return ci.address_explorer_url_prefix ? ci.address_explorer_url_prefix + a : undefined;
+                    }
+                };
+                if (child) opts.mergedSymbol = child;
+                var view = mod.mountPplnsTreemap(opts);
+                // A miner pinned (or hovered in the treemap) keeps full
+                // colour in the grid; the rest dim.
+                bus.subscribe(function(st) {
+                    var focus = st.pinned || (st.source !== 'grid' ? st.hover : null);
+                    if (defrag.focusMiner !== focus) {
+                        defrag.focusMiner = focus;
+                        if (typeof defrag.render === 'function') defrag.render();
+                    }
+                });
+                return { mod: mod, view: view };
+            });
+            return _pplnsViewP;
+        }
+        // The three feeds are fetched in parallel. Payouts are required;
+        // merged children and the stratum workers (for ★) are optional,
+        // so a failure there still renders the treemap.
+        function c2pFetchJSON(url) {
+            return new Promise(function(resolve) {
+                d3.json(url, function(d) { resolve(d && typeof d === 'object' ? d : null); });
+            });
+        }
+        function loadPplnsView() {
+            c2pPplnsViewMount().then(function(h) {
+                return Promise.all([
+                    c2pFetchJSON('../current_payouts'),
+                    c2pFetchJSON('../current_merged_payouts'),
+                    c2pFetchJSON('../stratum_stats')
+                ]).then(function(r) {
+                    var payouts = r[0], merged = r[1], ss = r[2];
+                    if (!payouts) return;
+                    var ci = (typeof currency_info !== 'undefined' && currency_info) || {};
+                    var special = { thisNode: h.mod.addressesFromWorkers(ss && ss.workers) };
+                    if (ci.node_owner_address) special.ownerAddresses = [ci.node_owner_address];
+                    if (defrag.feeHash160) special.ownerHash160 = defrag.feeHash160;
+                    if (ci.donation_address) special.donationAddresses = [ci.donation_address];
+                    _pplnsFacts = c2pPplnsFacts();
+                    h.view.update({ payouts: payouts, merged: merged || {} }, special);
+                    var pl = document.getElementById('pplns-loading');
+                    if (pl) pl.style.display = 'none';
+                });
+            }).catch(function(err) {
+                console.error('[c2pool] PPLNS view failed to load', err);
+                var grid = document.getElementById('pplns-main-grid');
+                if (grid) grid.innerHTML = '<div style="padding:12px;color:#ff6b6b">'
+                    + 'PPLNS view failed to load (sharechain-explorer/dist/scene.js).</div>';
+            });
+        }
+        // END c2pPplnsView
+
         function loadMainPPLNS(_attempt) {
+            if (c2pPplnsViewEnabled()) { loadPplnsView(); return; }
             var attempt = _attempt || 0;
             d3.json('../current_merged_payouts', function(payouts) {
                 if (!payouts || typeof payouts !== 'object') {
