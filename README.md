@@ -3,7 +3,12 @@
 [![CI](https://github.com/frstrtr/c2pool/actions/workflows/build.yml/badge.svg)](https://github.com/frstrtr/c2pool/actions/workflows/build.yml)
 [![Claude for Open Source](https://img.shields.io/badge/Claude%20for%20Open%20Source-supported-D97757?logo=claude&logoColor=white)](https://claude.com/contact-sales/claude-for-oss)
 
-C++ reimplementation of [forrestv/p2pool](https://github.com/p2pool/p2pool) targeting the **V36 share format**, with **per-coin binaries** for six parent chains and their merged-mining children: **Litecoin** (flagship — LTC + DOGE, PEP, BELLS, LKY, JKC, SHIC), **Bitcoin** (+ Namecoin), **DigiByte** (Scrypt), **Bitcoin Cash**, **Dash**, and **BIP-110** (the Bitcoin Knots BLAKE2b minority hard fork — embedded daemonless, experimental). See [Supported chains](#supported-chains) for the full matrix and status.
+C++ reimplementation of [forrestv/p2pool](https://github.com/p2pool/p2pool) targeting the **V36 share format**, with **per-coin binaries** for six parent chains and their merged-mining children. Two of them are in production use:
+
+- **Litecoin**, with merged mining of DOGE, PEP, BELLS, LKY, JKC and SHIC. LTC + DOGE merged mining runs in production on the V36 share chain.
+- **Dash**, with a daemonless embedded node in production. It needs no dashd and is ready for Dash Core 24 (v24). It covers compact blocks (BIP 152), superblock governance and the full UTXO set from a pinned snapshot.
+
+The other parent chains are **Bitcoin** (+ Namecoin), **DigiByte** (Scrypt), **Bitcoin Cash**, and **BIP-110** (the Bitcoin Knots BLAKE2b minority hard fork; embedded daemonless, experimental). See [Supported chains](#supported-chains) for the full matrix and status.
 
 Bitcoin wiki: <https://en.bitcoin.it/wiki/P2Pool>
 
@@ -168,16 +173,17 @@ c2pool builds one binary per **parent chain** (`c2pool-<coin>`). Several parents
 | Parent chain | Algorithm | Merged-mining children | Status |
 |---|---|---|---|
 | **Litecoin** (LTC) | Scrypt | DOGE, PEP, BELLS, LKY, JKC, SHIC — external daemons | **Production** (V36; live LTC+DOGE blocks) — `c2pool-ltc` |
+| **Dash** (DASH) | X11 | — | **Production**, daemonless (`c2pool-dash --run`; dash.voidbind.com): v24-ready, compact blocks, superblock governance, full UTXO set; dashd-attached posture via `--coin-rpc` still supported |
 | **Bitcoin** (BTC) | SHA256d | Namecoin (NMC) | Live, daemonless (`c2pool-btc --coin-p2p-discover`; btc.voidbind.com); NMC embedded merged mining in development |
 | **DigiByte** (DGB) | Scrypt¹ | DOGE (embedded, `-DAUX_DOGE`) | Live, daemonless (`c2pool-dgb --run --coin-p2p-discover`; dgb.voidbind.com) — mainnet only, no testnet mode |
 | **Bitcoin Cash** (BCH) | SHA256d | — | Live, daemonless (`c2pool-bch --pool`; bch.voidbind.com) |
-| **Dash** (DASH) | X11 | — | Live, daemonless (`c2pool-dash --run`; dash.voidbind.com); dashd-attached posture via `--coin-rpc` still supported |
 | **BIP-110** (Knots BLAKE2b fork) | BLAKE2b² (SHA256d until height 961640) | — | **Experimental** (new fork; daemonless embedded; live on bip110.voidbind.com) — `c2pool-bip110 --run` |
 | **Monero** (XMR) | RandomX | none | **Experimental**, stagenet only (v37 lane; daemonless, several nodes, one owed ledger; `c2pool-v37-xmr`); mainnet fenced, see [docs/xmr-lane](docs/xmr-lane/README.md) |
 
 "Live" means a public voidbind node runs that per-coin binary with no coin
 daemon on the serve path. It is not a production-maturity claim: only the LTC
-line has the crossing-soak record behind it. Each binary's real flag surface is
+and Dash lines are in production use (LTC with the V35→V36 crossing-soak record,
+Dash as a daemonless node finding mainnet blocks). Each binary's real flag surface is
 in [Per-binary launch reference](#per-binary-launch-reference).
 
 ¹ DigiByte is a MultiAlgo chain; c2pool runs its **Scrypt** algorithm as a standalone parent — it is **not** an AuxPoW child of Litecoin.
