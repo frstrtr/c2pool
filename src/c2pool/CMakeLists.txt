@@ -383,6 +383,15 @@ target_link_libraries(c2pool-dash
     nlohmann_json::nlohmann_json
     ${Boost_LIBRARIES}
 )
+# A BLS-dark c2pool-dash must not finish its build silently (#1671): the
+# configure-time STATUS line in the root CMakeLists scrolls away long before
+# the link, so repeat it as the last line of the c2pool-dash build.
+if(NOT C2POOL_DASH_BLS_AVAILABLE)
+    add_custom_command(TARGET c2pool-dash POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E echo
+                "WARNING: c2pool-dash was built WITHOUT dashbls (bls=stub). A daemonless c2pool-dash --run refuses to start on this binary. Rebuild with -DC2POOL_DASH_BLS=ON -DDASHBLS_ROOT=<prefix> (scripts/build_dashbls.sh; README: Dash: build with BLS)."
+        VERBATIM)
+endif()
 
 # c2pool-bip110: Bitcoin Knots BLAKE2b hard fork (BIP-110) — M1 EMBEDDED lane.
 # BIP-110 swaps Bitcoin's SHA256d PoW for the BLAKE2b commitment pipeline

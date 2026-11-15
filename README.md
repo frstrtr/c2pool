@@ -430,7 +430,8 @@ All release binaries are built from the tagged git commit. To verify a binary ma
 
 **Linux (Ubuntu 24.04)**
 ```bash
-sudo apt-get install -y g++ cmake make libleveldb-dev libsecp256k1-dev python3-pip
+sudo apt-get update
+sudo apt-get install -y g++ cmake make git libleveldb-dev libsecp256k1-dev python3-pip
 pip install "conan>=2.0,<3.0" --break-system-packages
 export PATH="$PATH:$HOME/.local/bin"   # so `conan` is on PATH (add to ~/.bashrc to persist)
 conan profile detect --force
@@ -444,10 +445,13 @@ cmake --build . --target c2pool-ltc -j$(nproc)
 ./src/c2pool/c2pool-ltc
 ```
 
-This builds the LTC node (`c2pool-ltc`, the binary the release packages ship).
-For another coin use its target (`c2pool-dash`, `c2pool-btc`, … — see
-[Build targets](#build-targets)). The target `c2pool` is a dev alias of the
-same LTC node. For a production node, prefer the signed binaries from
+This builds the LTC node (`c2pool-ltc`). Every coin has its own target
+(`c2pool-dash`, `c2pool-btc`, … — see [Build targets](#build-targets)), and the
+release packages ship one binary per coin (`c2pool-<coin>-VERSION-…`). The
+target `c2pool` is a dev alias of the LTC node. **For Dash, build with BLS** —
+see [Dash: build with BLS](#dash-build-with-bls) below; the plain
+`--target c2pool-dash` build is BLS-dark. For a production node, prefer the
+signed binaries from
 [Releases](https://github.com/frstrtr/c2pool/releases) (see
 [Verify downloads](#verify-downloads)), or build **Release** as above: a Debug
 build (`build_type=Debug` + `--preset conan-debug`) is several times larger
@@ -485,6 +489,37 @@ shares before opening stratum to miners.
 
 Miners connect to stratum and set their LTC payout address as the username
 (p2pool convention). No `--address` flag needed.
+
+### Dash: build with BLS
+
+`c2pool-dash` verifies Dash quorum commitments, ChainLocks, InstantSend locks
+and governance votes with **dashbls** — the BLS12-381 library dashd itself
+links. It is not on ConanCenter, so it is built once from dash's own
+`src/dashbls` subtree by `scripts/build_dashbls.sh`. Continue from the Linux
+quick start above (still inside `build/`):
+
+```bash
+sudo apt-get install -y autoconf automake libtool libgmp-dev
+../scripts/build_dashbls.sh "$HOME/.c2pool-deps/dashbls"
+cmake .. -DCMAKE_TOOLCHAIN_FILE=conan_toolchain.cmake -DCMAKE_BUILD_TYPE=Release \
+  -DC2POOL_DASH_BLS=ON -DDASHBLS_ROOT="$HOME/.c2pool-deps/dashbls"
+cmake --build . --target c2pool-dash -j$(nproc)
+./src/c2pool/c2pool-dash --version   # the last line must end in: bls=dashbls
+```
+
+Check the last line of `--version`:
+
+| `--version` ends in | Meaning |
+|---|---|
+| `bls=dashbls` | BLS verification armed. This is what the release packages ship. |
+| `bls=stub` | Built without `-DC2POOL_DASH_BLS=ON`. Quorum/ChainLock/InstantSend/governance verification is inert, and the daemonless posture (a bare `c2pool-dash --run`) **refuses to start** with `[BLS-STUB] refusing to start` (exit 2). Only a dashd-attached node (`--coin-rpc`) runs on a stub build. `--allow-stub-bls` overrides the refusal for testing only — never in production. |
+
+`-DC2POOL_DASH_BLS=ON` with the library missing is a configure-time error, not
+a silent fallback. The script builds the `src/dashbls` subtree of the dash
+release tag pinned in it (`DASH_REF`, currently `v23.1.7`) — dashd's own BLS
+code, not the standalone bls-signatures repo. It clones into
+`/tmp/dashbls-build`, so `git` and network access are needed. On macOS install the same tools with
+`brew install autoconf automake libtool gmp`.
 
 Full step-by-step guides: [Linux](doc/build-unix.md) | [macOS](doc/build-macos.md) | [Windows](doc/build-windows.md)
 
@@ -1462,7 +1497,7 @@ See [above](#configuration-reference) for details.
 | `c2pool-btc` | Bitcoin parent (`src/c2pool/main_btc.cpp`) |
 | `c2pool-dgb` | DigiByte Scrypt parent (`src/c2pool/main_dgb.cpp`; `-DAUX_DOGE` for embedded DOGE) |
 | `c2pool-bch` | Bitcoin Cash parent (`src/c2pool/main_bch.cpp`) |
-| `c2pool-dash` | Dash parent (`src/c2pool/main_dash.cpp`) |
+| `c2pool-dash` | Dash parent (`src/c2pool/main_dash.cpp`); configure with `-DC2POOL_DASH_BLS=ON` — see [Dash: build with BLS](#dash-build-with-bls) |
 | `c2pool-bip110` | BIP-110 BLAKE2b fork (`src/c2pool/main_bip110.cpp`) |
 | `test_hardening` | Softfork gate + reply-matcher regression tests |
 | `test_share_messages` | V36 authority message decrypt/verify tests |
