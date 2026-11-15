@@ -1065,15 +1065,15 @@
         }
 
         /* Main PPLNS treemap cells */
-        /* Same viewport-derived fill pattern as .defrag-canvas-wrap so
-           the treemap scales to the panel on resize. Override via
-           --pplns-fill-h on an ancestor if a different target height
-           is needed. See the .defrag-canvas-wrap comment for why we
-           use max(px, vh) rather than calc(100vh - Npx) — browser
-           zoom makes the fixed header-height subtraction crush the
-           widget disproportionately. */
+        /* Viewport-derived height so the treemap scales with the window,
+           but capped: max(320px, 78vh) grew to ~1400 px on tall screens,
+           far more than a treemap needs to stay legible. Override via
+           --pplns-fill-h on an ancestor if a different target height is
+           needed. See the .defrag-canvas-wrap comment for why the height
+           is vh-based rather than calc(100vh - Npx): browser zoom makes
+           the fixed header-height subtraction crush the widget. */
         .pplns-main-grid {
-            height: var(--pplns-fill-h, max(320px, 78vh));
+            height: var(--pplns-fill-h, clamp(320px, 60vh, 720px));
             min-height: 240px;
         }
         .pplns-main-cell {

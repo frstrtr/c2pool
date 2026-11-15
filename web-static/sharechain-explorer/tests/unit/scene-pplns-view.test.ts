@@ -217,3 +217,9 @@ test('dashboard.html: the view is opt-in, stamped, and the grid only dims when a
   assert.match(html, /function loadMainPPLNS\(_attempt\) \{\s*if \(c2pPplnsViewEnabled\(\)\) \{ loadPplnsView\(\); return; \}/);
   assert.match(html, /var dimCell = !!this\.focusMiner && share\.m !== this\.focusMiner;/);
 });
+
+test('dashboard.html: the PPLNS treemap height is capped (no ~1400 px panel on tall screens)', async () => {
+  const { readFileSync } = await import('node:fs');
+  const html = readFileSync(new URL('../../../dashboard.html', import.meta.url), 'utf8');
+  assert.match(html, /\.pplns-main-grid \{\s*height: var\(--pplns-fill-h, clamp\(320px, 60vh, 720px\)\);/);
+});
