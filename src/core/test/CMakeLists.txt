@@ -155,6 +155,11 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
     # nor the share's merged_coinbase_info (a V36 peer rejects info without
     # mm_data). Real MiningInterface + MergedMiningManager; same
     # fold-into-core_test reasoning as every TU here (c2pool_merged_mining linked).
+    # web_server_currency_info_payees_test.cpp: /web/currency_info names the
+    # node-owner fee payee and the donation outputs (parent and merged chains)
+    # as the /current_payouts and /current_merged_payouts row keys, for the
+    # PPLNS treemap; "" / {} where the node pays none. Same fold-into-core_test
+    # reasoning as every TU here (c2pool_merged_mining linked).
     # web_server_merged_payout_source_test.cpp: /current_merged_payouts labels
     # each merged output explicit / auto-convert / donation from the payout
     # provider's origins and shows it under the parent address it is paid for
@@ -277,6 +282,7 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
         web_server_block_budget_test.cpp
         web_server_block_rows_test.cpp
         web_server_config_endpoint_test.cpp
+        web_server_currency_info_payees_test.cpp
         web_server_current_payouts_test.cpp
         web_server_daemonless_graph_feed_test.cpp
         web_server_dashboard_data_test.cpp
