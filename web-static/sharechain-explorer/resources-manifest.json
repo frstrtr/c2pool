@@ -1,36 +1,30 @@
 {
   "version": "0.1.0-alpha",
-  "generated": "2026-11-15T07:31:31.178Z",
+  "generated": "2026-11-15T07:18:40.353Z",
   "files": [
-    "layout.js",
     "pplns-view.js",
     "sharechain-explorer.js",
     "shared-core.js"
   ],
   "filesDev": [
-    "layout.js.map",
     "pplns-view.js.map",
     "sharechain-explorer.js.map",
     "shared-core.js.map"
   ],
   "integrity": {
-    "layout.js": "sha384-rznDQ7GymZsiXsx0M6XkdytffpQXO+CNx+4zJNjZ4+va0cOxu+Brnb5yIZm/Nx8m",
-    "layout.js.map": "sha384-uJB6MoaokCgUadLKQ8f8iKypssZ9gfnzJKBp/JxA9lfdvmFn9Fb0Df8gxqcOaGYr",
-    "pplns-view.js": "sha384-NjHhKQeff+IRCogCuPAheyw+SjqO4kJ+d8/vJ8MnonqacLoEKT31DFXX7NnzIpJj",
-    "pplns-view.js.map": "sha384-u0IcyEfgptNxkEzoFtHXIKk1MA4WzxqgqXIZ/lwyRwl6iYgWFux92qYuSSyhi8a5",
-    "sharechain-explorer.js": "sha384-yDPz5hUHTQ48QfLapjPWO+qZfm8I3zELgzG3YTbU6bWs7qXcW6pv3IC38w2s2cjZ",
-    "sharechain-explorer.js.map": "sha384-iZb1kEEHLstM5rnUgP/xqbTLpK40RYyyCGgCBlnb1WWxvE/jlz0nFaTnx1OB13em",
-    "shared-core.js": "sha384-WaH4sIhVIyNuRMNgoN1ysxpl2iraZzc+UE+nv6j/rAdNY/TACXN9daLxfr0APLLY",
-    "shared-core.js.map": "sha384-VH28vuULY6fs/wyk/4X0DCMSb2AuttuvmeNswcNvr2ZhPfqPvWUJ/wTcSpzQjw7Z"
+    "pplns-view.js": "sha384-/cHI3U+QO74fSFbk0Es5ETWJMR1ZoT9gzRCGJNB1bPlprrz+o6AzuKRYTkRxdgtp",
+    "pplns-view.js.map": "sha384-J4jHvn3U6ZFjUtKDE5Y8h+AMx52ASTFtlaaS4qYsg3t8N00LlONyNWaagbofgda9",
+    "sharechain-explorer.js": "sha384-cbKIv2Jfri3GCzBldTjOcioN8YrNtBLHQO7B3ZqlqEcW6WKmW+s4Kx4LTzXWeIdj",
+    "sharechain-explorer.js.map": "sha384-EqCu16Hvso+xmc1jozFi97sYSUS7oFNoxYEYvgPV1TCXhkgG6mcgTIG473stWtbS",
+    "shared-core.js": "sha384-ipfy2tdWEJ1Abd5eM+9rad7vgI2AYVtjWtC2hoPKX+SYV30U1pH3UWVtQdO3h/LT",
+    "shared-core.js.map": "sha384-h/CtoHST4knUYeVo+rPk/UQ3LdmWyDAmKSel1UjUnOs4czHLCdkgsl7rdMrwCxn0"
   },
   "sizes": {
-    "layout.js": 1510,
-    "layout.js.map": 9110,
-    "pplns-view.js": 32751,
-    "pplns-view.js.map": 129625,
-    "sharechain-explorer.js": 60310,
-    "sharechain-explorer.js.map": 292190,
-    "shared-core.js": 25949,
-    "shared-core.js.map": 118924
+    "pplns-view.js": 32954,
+    "pplns-view.js.map": 128604,
+    "sharechain-explorer.js": 61154,
+    "sharechain-explorer.js.map": 294824,
+    "shared-core.js": 25695,
+    "shared-core.js.map": 114315
   }
 }

@@ -13,8 +13,6 @@ import {
   createHttpTransport,
   createRealtime,
   createHoverZoomPanel,
-  computeGridLayout,
-  cellAtPoint,
 } from './dist/sharechain-explorer.js?v=38e752f9';
 
 const params   = new URL(location.href).searchParams;
@@ -154,18 +152,11 @@ function onMouseMove(ev) {
   const state = rt.getState();
   const shares = state.window.shares;
   if (shares.length === 0) return;
-  const layout = computeGridLayout({
-    shareCount: shares.length,
-    containerWidth: wrap.clientWidth,
-    cellSize: 10,
-    gap: 1,
-    marginLeft: 38,
-    minHeight: 40,
-  });
+  // Hit-test against the painted (auto-fit) layout, not a fixed grid.
   const rect = canvas.getBoundingClientRect();
   const x = ev.clientX - rect.left;
   const y = ev.clientY - rect.top;
-  const idx = cellAtPoint(layout, x, y);
+  const idx = rt.cellAtPoint(x, y);
   if (idx === null) {
     if (hoveredIdx !== -1) { hoveredIdx = -1; hoverPanel.hide(); }
     return;
