@@ -13,7 +13,7 @@ import {
   createHttpTransport,
   createRealtime,
   createHoverZoomPanel,
-} from './dist/sharechain-explorer.js';
+} from './dist/sharechain-explorer.js?v=fc03fa60';
 
 const params   = new URL(location.href).searchParams;
 const qsBase   = params.get('base');
@@ -149,6 +149,8 @@ function stopHover() {
 }
 function onMouseMove(ev) {
   if (!rt || !hoverPanel) return;
+  // A cached bundle older than this page lacks the API.
+  if (typeof rt.cellAtPoint !== 'function') return;
   const state = rt.getState();
   const shares = state.window.shares;
   if (shares.length === 0) return;

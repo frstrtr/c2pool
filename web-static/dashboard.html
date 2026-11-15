@@ -9,6 +9,10 @@
     <script src="multipool.js"></script>
     <script src="highcharts.js"></script>
     <script src="highcharts-exporting.js"></script>
+    <!-- The one squarify (sharechain-explorer/src/pplns/squarify.ts) as a
+         classic script: defines C2PLayout for the treemaps below. The ?v=
+         stamp is the file's content hash (npm run stamp). -->
+    <script src="sharechain-explorer/dist/layout.js?v=be69538d"></script>
     <style>
         :root {
             --primary: #008de4;
@@ -2455,6 +2459,26 @@
     </footer>
     
     <script>
+        // BEGIN c2pLayout
+        // Treemap layout: the one squarify in web-static, loaded in <head>
+        // as sharechain-explorer/dist/layout.js (global C2PLayout). The
+        // legacy views keep the 1 px minimum strip they always had, so
+        // sub-pixel miners still show as a sliver.
+        function c2pLayoutReady() {
+            return typeof C2PLayout !== 'undefined' && typeof C2PLayout.squarify === 'function';
+        }
+        function c2pSquarify(items, x, y, w, h) {
+            if (!c2pLayoutReady()) {
+                if (!c2pSquarify._warned) {
+                    c2pSquarify._warned = true;
+                    console.error('[c2pool] sharechain-explorer/dist/layout.js did not load; treemaps are disabled');
+                }
+                return [];
+            }
+            return C2PLayout.squarify(items, x, y, w, h, { minStrip: 1 });
+        }
+        // END c2pLayout
+
         // Utility functions
         function format_dt(dt) {
             if (dt < 0) dt = 0;
@@ -7364,86 +7388,11 @@
                 return ((hash % 360) + 360) % 360;
             },
 
-            // Squarified treemap: place items into rows trying to keep aspect ratio ~1
+            // Squarified treemap of the per-share PPLNS (shared C2PLayout
+            // squarify, keeping this view's 1 px minimum strip).
             treemap: function(data, x, y, w, h) {
-                var rects = [];
-                var items = data.map(function(d) { return { addr: d.addr, pct: d.pct, area: d.pct }; });
-                this._layoutRow(items, x, y, w, h, rects);
-                return rects;
-            },
-
-            _layoutRow: function(items, x, y, w, h, rects) {
-                if (items.length === 0) return;
-                var totalArea = 0;
-                items.forEach(function(it) { totalArea += it.area; });
-                if (totalArea <= 0) return;
-
-                // Lay out along the shorter axis
-                var vertical = w >= h;
-                var mainSize = vertical ? h : w;
-                var crossSize = vertical ? w : h;
-
-                var row = [];
-                var rowArea = 0;
-                var remaining = items.slice();
-
-                while (remaining.length > 0) {
-                    row.push(remaining[0]);
-                    rowArea += remaining[0].area;
-                    remaining.shift();
-
-                    if (remaining.length === 0) break;
-
-                    // Check if adding next item worsens aspect ratio
-                    var nextArea = rowArea + remaining[0].area;
-                    var rowFraction = rowArea / totalArea;
-                    var nextFraction = nextArea / totalArea;
-                    var stripSize = rowFraction * crossSize;
-                    var nextStripSize = nextFraction * crossSize;
-
-                    var worstCurrent = this._worstAspect(row, rowArea, stripSize, mainSize, totalArea);
-                    var testRow = row.concat([remaining[0]]);
-                    var worstNext = this._worstAspect(testRow, nextArea, nextStripSize, mainSize, totalArea);
-
-                    if (worstNext > worstCurrent && row.length >= 1) {
-                        // Current row is better, lay it out
-                        break;
-                    }
-                }
-
-                // Lay out the row
-                var rowFraction = rowArea / totalArea;
-                var stripSize = Math.max(1, rowFraction * crossSize);
-                var offset = 0;
-                for (var i = 0; i < row.length; i++) {
-                    var itemFraction = row[i].area / rowArea;
-                    var itemSize = itemFraction * mainSize;
-                    if (vertical) {
-                        rects.push({ x: x, y: y + offset, w: stripSize, h: itemSize, addr: row[i].addr, pct: row[i].pct });
-                    } else {
-                        rects.push({ x: x + offset, y: y, w: itemSize, h: stripSize, addr: row[i].addr, pct: row[i].pct });
-                    }
-                    offset += itemSize;
-                }
-
-                // Recurse on remaining
-                if (remaining.length > 0) {
-                    if (vertical) {
-                        this._layoutRow(remaining, x + stripSize, y, w - stripSize, h, rects);
-                    } else {
-                        this._layoutRow(remaining, x, y + stripSize, w, h - stripSize, rects);
-                    }
-                }
-            },
-
-            _worstAspect: function(row, rowArea, stripSize, mainSize, totalArea) {
-                var worst = 0;
-                for (var i = 0; i < row.length; i++) {
-                    var itemSize = (row[i].area / rowArea) * mainSize;
-                    var aspect = Math.max(itemSize / stripSize, stripSize / itemSize);
-                    if (aspect > worst) worst = aspect;
-                }
-                return worst;
+                return c2pSquarify(data.map(function(d) { return { area: d.pct, data: d }; }), x, y, w, h)
+                    .map(function(r) { return { x: r.x, y: r.y, w: r.w, h: r.h, addr: r.data.addr, pct: r.data.pct }; });
             },
 
             bitsToDifficulty: function(bits) {
@@ -7720,41 +7669,17 @@
                 var w = grid.clientWidth;
                 var h = Math.max(grid.clientHeight, 240);
 
-                // Squarified treemap layout (standalone — carries all fields)
-                var rects = [];
-                var items = entries.map(function(d) { return { addr:d.addr, pct:d.pct, amt:d.amt, doge:d.doge, dogeAddr:d.dogeAddr, area:d.pct }; });
-                function tmLayout(items, x, y, w, h) {
-                    if (!items.length || w <= 0 || h <= 0) return;
-                    var tot = 0; items.forEach(function(it) { tot += it.area; });
-                    if (tot <= 0) return;
-                    var vert = w >= h, main = vert ? h : w, cross = vert ? w : h;
-                    var row = [], rowA = 0, rem = items.slice();
-                    while (rem.length) {
-                        row.push(rem[0]); rowA += rem[0].area; rem.shift();
-                        if (!rem.length) break;
-                        var sNow = (rowA/tot)*cross, sNext = ((rowA+rem[0].area)/tot)*cross;
-                        var wNow = 0, wNext = 0;
-                        row.forEach(function(r) { var s=(r.area/rowA)*main; var a=Math.max(s/sNow,sNow/s); if(a>wNow)wNow=a; });
-                        var testRow = row.concat([rem[0]]), testA = rowA+rem[0].area;
-                        testRow.forEach(function(r) { var s=(r.area/testA)*main; var a=Math.max(s/sNext,sNext/s); if(a>wNext)wNext=a; });
-                        if (wNext > wNow && row.length >= 1) break;
-                    }
-                    var strip = Math.max(1, (rowA/tot)*cross), off = 0;
-                    for (var i = 0; i < row.length; i++) {
-                        var sz = (row[i].area/rowA)*main;
-                        var r = vert
-                            ? { x:x, y:y+off, w:strip, h:sz }
-                            : { x:x+off, y:y, w:sz, h:strip };
-                        r.addr=row[i].addr; r.pct=row[i].pct; r.amt=row[i].amt; r.doge=row[i].doge; r.dogeAddr=row[i].dogeAddr;
-                        rects.push(r);
-                        off += sz;
-                    }
-                    if (rem.length) {
-                        if (vert) tmLayout(rem, x+strip, y, w-strip, h);
-                        else tmLayout(rem, x, y+strip, w, h-strip);
-                    }
+                // Squarified treemap layout (shared C2PLayout squarify).
+                if (!c2pLayoutReady()) {
+                    grid.innerHTML = '<div style="padding:12px;color:#ff6b6b">'
+                        + 'Treemap layout module failed to load (sharechain-explorer/dist/layout.js).</div>';
+                    return;
                 }
-                tmLayout(items, 0, 0, w, h);
+                var rects = c2pSquarify(entries.map(function(d) { return { area: d.pct, data: d }; }), 0, 0, w, h)
+                    .map(function(r) {
+                        var d = r.data;
+                        return { x: r.x, y: r.y, w: r.w, h: r.h, addr: d.addr, pct: d.pct, amt: d.amt, doge: d.doge, dogeAddr: d.dogeAddr };
+                    });
 
                 var addrPrefix = (typeof currency_info !== 'undefined' && currency_info.address_explorer_url_prefix)
                     ? currency_info.address_explorer_url_prefix : 'https://blockchair.com/litecoin/address/';
@@ -10257,7 +10182,7 @@
          are unchanged for default users. -->
     <script type="module">
         if (window.__c2pBundledExplorer) {
-            import('./sharechain-explorer/dist/sharechain-explorer.js')
+            import('./sharechain-explorer/dist/sharechain-explorer.js?v=fc03fa60')
                 .then(function(mod) {
                     var canvas = document.getElementById('defrag-canvas');
                     var wrap = canvas && canvas.parentElement;

@@ -1007,12 +1007,26 @@ export function createRealtime(opts: RealtimeDOMOptions): RealtimeController {
 
   const onResize = (): void => schedule();
 
-  orchestrator.setChangeListener(schedule);
+  /** Undo everything start() attached (also when start() fails). */
+  const detach = (): void => {
+    stopped = true;
+    if (raf !== null) window.cancelAnimationFrame(raf);
+    raf = null;
+    if (typeof window.removeEventListener === 'function') {
+      window.removeEventListener('resize', onResize);
+    }
+    resizeObserver?.disconnect();
+    resizeObserver = null;
+    if (clockTimer !== null) clearInterval(clockTimer);
+    clockTimer = null;
+    orchestrator.setChangeListener(null);
+  };
 
   return {
     async start() {
       stopped = false;
       paintedKey = null;
+      orchestrator.setChangeListener(schedule);
       if (typeof window.addEventListener === 'function') {
         window.addEventListener('resize', onResize);
       }
@@ -1030,20 +1044,16 @@ export function createRealtime(opts: RealtimeDOMOptions): RealtimeController {
         // Never keep a non-browser host (tests, SSR) alive on this timer.
         (clockTimer as unknown as { unref?: () => void }).unref?.();
       }
-      await orchestrator.start();
+      try {
+        await orchestrator.start();
+      } catch (err) {
+        detach();  // a failed start leaves no listener, observer or timer behind
+        throw err;
+      }
       schedule();
     },
     async stop() {
-      stopped = true;
-      if (raf !== null) window.cancelAnimationFrame(raf);
-      raf = null;
-      if (typeof window.removeEventListener === 'function') {
-        window.removeEventListener('resize', onResize);
-      }
-      resizeObserver?.disconnect();
-      resizeObserver = null;
-      if (clockTimer !== null) clearInterval(clockTimer);
-      clockTimer = null;
+      detach();
       await orchestrator.stop();
       renderer.destroy();
     },
