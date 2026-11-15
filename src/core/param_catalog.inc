@@ -14,6 +14,8 @@
 
 C2P_PARAM("meta.version", Meta, BOOL, COMPILE_TIME_READONLY, C_ALL, LIT, "false", NONE, "print version and exit")
   C2P_ALIAS("meta.version", BIN_DASH, "--version", FLAG)
+  C2P_ALIAS("meta.version", BIN_LTC, "--version", FLAG)
+  C2P_ALIAS("meta.version", BIN_BTC, "--version", FLAG)
   C2P_ALIAS("meta.version", BIN_DGB, "--version", FLAG)
   C2P_ALIAS("meta.version", BIN_BCH, "--version", FLAG)
   C2P_ALIAS("meta.version", BIN_BIP110, "--version", FLAG)
