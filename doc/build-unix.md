@@ -16,7 +16,8 @@ cd c2pool-${COIN}-${VERSION}-linux-x86_64
 ```
 
 Dashboard: `http://localhost:8080`. Stratum: `stratum+tcp://YOUR_IP:<port>`, where
-`start.sh` binds 9327 (LTC), 7903 (DASH), 9332 (BTC), 5025 (DGB) or 9348 (BCH).
+`start.sh` binds 9327 (LTC), 7903 (DASH), 9332 (BTC), 5025 (DGB) or 9348 (BCH);
+`c2pool-bip110 --run` binds 9336 by default.
 The packaged `c2pool-dash` is built with BLS (`./c2pool-dash --version` ends in
 `bls=dashbls`).
 
