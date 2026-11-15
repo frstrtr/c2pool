@@ -7391,7 +7391,12 @@ nlohmann::json MiningInterface::rest_mempool_entry(const std::string& txid_hex)
         return nlohmann::json{{"error", "txid must be 64 hex digits"}, {"http_status", 400}};
     if (!m_mempool_entry_fn)
         return nlohmann::json{{"error", "mempool-entry-not-wired"}, {"http_status", 404}};
-    auto j = m_mempool_entry_fn(txid_hex);
+    nlohmann::json j;
+    try {
+        j = m_mempool_entry_fn(txid_hex);   // producer thread, bounded wait
+    } catch (const std::exception&) {
+        j = nullptr;                        // producer busy past PRODUCER_DISPATCH_TIMEOUT
+    }
     if (j.is_null())
         return nlohmann::json{{"error", "mempool-entry-unavailable"}, {"http_status", 503}};
     return j;

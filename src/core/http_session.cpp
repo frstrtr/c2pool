@@ -373,8 +373,9 @@ bool is_direct_local_request(const boost::asio::ip::address& peer,
             boost::asio::ip::v4_mapped, peer.to_v6()).is_loopback();
     if (!loopback)
         return false;
+    // Via: RFC 9110 7.6.3, set by proxies that add none of the others.
     for (const char* name : {"X-Forwarded-For", "Forwarded", "X-Real-IP",
-                             "X-Forwarded-Host", "X-Forwarded-Proto"})
+                             "X-Forwarded-Host", "X-Forwarded-Proto", "Via"})
         if (headers.count(name) != 0)
             return false;
     return true;
