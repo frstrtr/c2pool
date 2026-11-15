@@ -31,3 +31,16 @@ export { createSelectionBus, matchesQuery } from './selection.js';
 export type { SelectionBus, SelectionState } from './selection.js';
 
 export type { Rect, SceneItem, Tile, PlacedTile, Layout, TileStyle, Label } from './types.js';
+
+// Views on the engine.
+export { mountPplnsTreemap, tooltipHtml } from './views/pplns-treemap.js';
+export type { PplnsTreemap, PplnsTreemapOptions } from './views/pplns-treemap.js';
+export {
+  buildPplnsItems, classifyAddress, addressesFromWorkers, parentAmountMismatches,
+  pplnsStyle, pplnsLabels, tooltipLines, addrHue, shortAddress, formatAge,
+} from './views/pplns-model.js';
+export type {
+  PplnsSnapshot, PplnsMode, CurrentPayouts, CurrentMergedPayouts, MergedChild,
+  SpecialAddresses, MinerDatum, MinerFacts, TooltipLine,
+} from './views/pplns-model.js';
+export { hash160OfAddress } from './views/address-hash.js';

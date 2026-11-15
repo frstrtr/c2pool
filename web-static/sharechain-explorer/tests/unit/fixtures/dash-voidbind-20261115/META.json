@@ -1,0 +1,12 @@
+{
+ "source": "https://dash.voidbind.com (public endpoints, c2pool-dash relay node)",
+ "captured_utc_start": 1794729765.9440517,
+ "captured_utc_end": 1794729768.839703,
+ "spread_s": 2.896,
+ "current_payouts_entries": 2,
+ "current_payouts_sum": 0.41115545,
+ "block_value_miner": 0.4109451099999999,
+ "fee_hash160": "",
+ "my_address": "",
+ "note": "fetched in parallel; the node may have moved a share between requests"
+}
