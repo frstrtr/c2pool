@@ -15,7 +15,7 @@ import {
   createHoverZoomPanel,
   computeGridLayout,
   cellAtPoint,
-} from './dist/sharechain-explorer.js';
+} from './dist/sharechain-explorer.js?v=38e752f9';
 
 const params   = new URL(location.href).searchParams;
 const qsBase   = params.get('base');

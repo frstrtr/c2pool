@@ -52,7 +52,7 @@ npm run build:dev    # esbuild → dist/*.js with inline sourcemaps
 npm test             # Node --test (no jest, no vitest)
 npm run manifest     # regenerate resources-manifest.json
 npm run size         # bundle-size gate
-npm run stamp        # rewrite ?v=<content hash> on the pages' dist/*.js loads
+npm run stamp        # rewrite ?v=<content hash> on every page/loader script load
 npm run verify       # typecheck + build + stamp check + test + manifest + size
 ```
 
