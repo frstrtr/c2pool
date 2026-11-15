@@ -216,11 +216,14 @@ private:
 /// not answered by then is logged as timed out and its answer is dropped; its
 /// worker finishes on its own, bounded by the system resolver's timeouts.
 ///
-/// One round at a time: resolve() returns false while one is in flight.
-/// cancel() and the destructor drop an in-flight round's result and join its
-/// coordinator at once, so nothing reaches on_done or `ioc` afterwards. Call
-/// resolve() and cancel() from one thread (the one that runs `ioc`), and
-/// destroy the resolver before `ioc`, like any timer on it.
+/// One round at a time: a round started from a handler is in flight until its
+/// peers have been handed to on_done on `ioc`, and resolve() returns false
+/// (with busy() true) meanwhile. cancel() and the destructor drop every round
+/// not yet delivered, a delivery already queued on `ioc` included, and join
+/// the coordinator at once, so on_done never runs after them. An exception out
+/// of on_done in a delivery on `ioc` is caught and logged. Call resolve() and
+/// cancel() from one thread (the one that runs `ioc`), and destroy the resolver
+/// before `ioc`, like any timer on it.
 class ParallelSeedResolver
 {
 public:
@@ -248,11 +251,14 @@ public:
     ParallelSeedResolver(const ParallelSeedResolver&) = delete;
     ParallelSeedResolver& operator=(const ParallelSeedResolver&) = delete;
 
-    /// A round started from an io_context handler has not delivered yet.
+    /// A round started from an io_context handler has been neither delivered
+    /// on `ioc` nor cancelled yet.
     bool busy() const { return m_busy.load(); }
 
     /// Resolve `seeds` and hand the peers to on_done (see the class comment
-    /// for which thread, and when). False if a round is already in flight.
+    /// for which thread, and when). False if a round is already in flight
+    /// (busy() is then true) or no coordinator thread could be started (logged
+    /// here; busy() is then false).
     bool resolve(std::vector<DnsSeed> seeds, Callback on_done)
     {
         if (m_busy.load())
@@ -276,18 +282,26 @@ public:
         }
 
         m_busy = true;
+        auto alive = m_alive;
         try {
             m_coordinator = std::thread(
-                [this, round, seeds = std::move(seeds), on_done = std::move(on_done)]() mutable {
+                [this, round, alive, seeds = std::move(seeds), on_done = std::move(on_done)]() mutable {
                     auto peers = run_round(round, seeds, m_seed_timeout, m_max_results);
-                    if (!round->is_cancelled()) {
-                        boost::asio::post(m_ioc,
-                            [round, on_done = std::move(on_done), peers = std::move(peers)]() mutable {
-                                if (!round->is_cancelled())
-                                    on_done(std::move(peers));
-                            });
-                    }
-                    m_busy = false;
+                    if (round->is_cancelled())
+                        return;              // cancel() is joining this thread
+                    boost::asio::post(m_ioc,
+                        [this, alive, on_done = std::move(on_done), peers = std::move(peers)]() mutable {
+                            // cancel() ran after the post (stop, destruction):
+                            // drop the round, and `this` may be gone.
+                            if (!alive->load())
+                                return;
+                            m_busy = false;  // over once delivered, not once posted
+                            try {
+                                on_done(std::move(peers));
+                            } catch (const std::exception& e) {
+                                LOG_WARNING << "[DNS] Seed round delivery failed: " << e.what();
+                            }
+                        });
                 });
         } catch (const std::system_error& e) {
             m_busy = false;
@@ -297,10 +311,15 @@ public:
         return true;
     }
 
-    /// Drop an in-flight round: its result is never delivered. Returns at
-    /// once (abandoned getaddrinfo() calls are not waited for).
+    /// Drop every round not yet delivered, including one whose delivery is
+    /// already queued on `ioc`: on_done is not called for it. Returns at once
+    /// (abandoned getaddrinfo() calls are not waited for).
     void cancel()
     {
+        // Every delivery posted so far holds this token; later rounds get a
+        // fresh one.
+        m_alive->store(false);
+        m_alive = std::make_shared<std::atomic<bool>>(true);
         std::shared_ptr<Round> round;
         {
             std::lock_guard<std::mutex> lock(m_round_mutex);
@@ -464,6 +483,7 @@ private:
     const std::chrono::milliseconds m_seed_timeout;
     const int m_max_results;
     std::atomic<bool> m_busy{false};
+    std::shared_ptr<std::atomic<bool>> m_alive = std::make_shared<std::atomic<bool>>(true);
     std::thread m_coordinator;
     std::mutex m_round_mutex;
     std::shared_ptr<Round> m_round;

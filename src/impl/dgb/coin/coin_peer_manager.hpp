@@ -1180,7 +1180,8 @@ private:
 
         LOG_INFO << "[" << m_symbol << "] Resolving " << m_dns_seeds.size() << " DNS seeds...";
         if (!m_dns_resolver.resolve(m_dns_seeds,
-                [this](std::vector<NetService> peers) { add_dns_seed_peers(peers); }))
+                [this](std::vector<NetService> peers) { add_dns_seed_peers(peers); })
+            && m_dns_resolver.busy())   // else no thread could start: the resolver logged it
             LOG_INFO << "[" << m_symbol << "] DNS seed round already in flight, not starting another";
     }
 

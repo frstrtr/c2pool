@@ -24,6 +24,12 @@
 //   preloop    start() before the event loop runs waits for the round, so the
 //              peers are there when it returns, but in parallel: about one
 //              seed's delay, not the sum, and at most the round timeout.
+//   stop       a round in flight when the manager is stopped or destroyed is
+//              never delivered: stop()/destroy 500 ms into a round; and a round
+//              whose delivery is already queued on the io_context when start()
+//              runs again and the manager is stopped or destroyed. A stopped
+//              manager must have no peers; a delivery to a destroyed one is a
+//              heap-use-after-free (run it under ASan to see that leg fail).
 // Linux only (ELF symbol preemption + dlsym(RTLD_NEXT)).
 
 #include <boost/asio.hpp>
@@ -169,6 +175,7 @@ struct Subject
     std::shared_ptr<void> owner;
     std::function<void(std::vector<c2pool::dns::DnsSeed>)> set_dns_seeds;
     std::function<void()> start;
+    std::function<void()> stop;
     std::function<void()> arm_emergency;
     std::function<size_t()> peer_count;
 };
@@ -189,6 +196,7 @@ Subject make_subject(boost::asio::io_context& ioc, const std::string& name, cons
     s.owner = mgr;
     s.set_dns_seeds = [m](std::vector<c2pool::dns::DnsSeed> v) { m->set_dns_seeds(std::move(v)); };
     s.start = [m] { m->start(); };
+    s.stop = [m] { m->stop(); };
     s.arm_emergency = [m] { m->arm_emergency_fallbacks(); };
     s.peer_count = [m] { return static_cast<size_t>(m->peer_count()); };
     return s;
@@ -256,12 +264,17 @@ long long since_ms(Clock::time_point t)
     return std::chrono::duration_cast<milliseconds>(Clock::now() - t).count();
 }
 
-/// Run the io_context until pred() holds or `limit` passes.
+/// Run the io_context until pred() holds or `limit` passes. A context that
+/// ran out of work is stopped and runs nothing more until restart(): restart
+/// it, or handlers posted later (a round's delivery) would never run.
 template <class Pred>
 void run_until(boost::asio::io_context& ioc, Pred pred, Clock::time_point limit)
 {
-    while (!pred() && Clock::now() < limit)
-        ioc.run_one_for(milliseconds(50));
+    while (!pred() && Clock::now() < limit) {
+        if (ioc.stopped()) ioc.restart();
+        if (ioc.run_one_for(milliseconds(50)) == 0)
+            std::this_thread::sleep_for(milliseconds(10));
+    }
 }
 
 bool all_have_peers(const std::vector<Subject>& v)
@@ -370,6 +383,68 @@ int mode_preloop(boost::asio::io_context& ioc)
     return 0;
 }
 
+int mode_stop(boost::asio::io_context& ioc)
+{
+    const auto slow = seeds(/*with_stuck=*/false);   // two answers and an NXDOMAIN, kSlowMs each
+
+    // (a) stop() and (b) destroy, 500 ms into a round started from a handler;
+    // the loop runs on past the answers. The control manager is left running
+    // and must get its peers: the deliveries did run.
+    auto stopped = make_subjects(ioc, "stop-a");
+    auto destroyed = make_subjects(ioc, "stop-b");
+    std::vector<Subject> control;
+    control.push_back(make_subject<c2pool::merged::CoinPeerManager, c2pool::merged::PeerManagerConfig>(
+        ioc, "LTC", "stop-control-ab"));
+    for (auto* v : {&stopped, &destroyed, &control})
+        for (auto& s : *v) {
+            s.set_dns_seeds(slow);
+            boost::asio::post(ioc, [&s] { s.start(); });
+        }
+    boost::asio::steady_timer at500(ioc);
+    at500.expires_after(milliseconds(500));
+    at500.async_wait([&](const boost::system::error_code&) {
+        for (auto& s : stopped) s.stop();
+        destroy(destroyed);
+    });
+    run_until(ioc, [] { return false; }, Clock::now() + milliseconds(kSlowMs + 1500));
+    for (auto& s : stopped)
+        CHECK(s.peer_count() == 0, "[stop/%s] peer_count=%zu: the round was delivered after stop()",
+              s.name.c_str(), s.peer_count());
+    CHECK(control.front().peer_count() == 2, "[stop/control] peer_count=%zu: the running manager's"
+          " round was not delivered (the test ran nothing)", control.front().peer_count());
+    destroy(stopped);
+    destroy(control);
+
+    // (c) stop() and (d) destroy while a finished round's delivery is queued:
+    // a handler holds the io thread past the answers, then calls start() again
+    // (a second round, if the resolver takes one) and stops or destroys.
+    auto stale_stopped = make_subjects(ioc, "stop-c");
+    auto stale_destroyed = make_subjects(ioc, "stop-d");
+    control.clear();
+    control.push_back(make_subject<c2pool::merged::CoinPeerManager, c2pool::merged::PeerManagerConfig>(
+        ioc, "LTC", "stop-control-cd"));
+    for (auto* v : {&stale_stopped, &stale_destroyed, &control})
+        for (auto& s : *v) {
+            s.set_dns_seeds(slow);
+            boost::asio::post(ioc, [&s] { s.start(); });
+        }
+    boost::asio::post(ioc, [&] {
+        std::this_thread::sleep_for(milliseconds(kSlowMs + 1000));  // deliveries get queued behind us
+        for (auto& s : stale_stopped) { s.start(); s.stop(); }
+        for (auto& s : stale_destroyed) { s.start(); s.owner.reset(); }
+    });
+    run_until(ioc, [] { return false; }, Clock::now() + milliseconds(2 * kSlowMs + 2500));
+    for (auto& s : stale_stopped)
+        CHECK(s.peer_count() == 0, "[stop/stale/%s] peer_count=%zu: a queued delivery reached the"
+              " stopped manager", s.name.c_str(), s.peer_count());
+    CHECK(control.front().peer_count() == 2, "[stop/stale/control] peer_count=%zu: the queued"
+          " deliveries never ran (the test ran nothing)", control.front().peer_count());
+    destroy(stale_stopped);
+    destroy(control);
+    std::printf("[stop] no round delivered after stop() or destruction\n");
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -383,8 +458,9 @@ int main(int argc, char** argv)
     if (mode == "start")          mode_start(ioc);
     else if (mode == "emergency") mode_emergency(ioc);
     else if (mode == "preloop")   mode_preloop(ioc);
+    else if (mode == "stop")      mode_stop(ioc);
     else {
-        std::printf("usage: %s start|emergency|preloop\n", argv[0]);
+        std::printf("usage: %s start|emergency|preloop|stop\n", argv[0]);
         return 2;
     }
 

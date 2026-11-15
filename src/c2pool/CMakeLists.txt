@@ -767,14 +767,15 @@ add_test(NAME coin_peer_rearm_kat COMMAND coin_peer_rearm_kat)
 # A getaddrinfo() interposer serves slow, NXDOMAIN and hung fake seeds; a 100 ms
 # timer must keep its cadence while every coin's peer manager resolves them from
 # start() in an io handler, from the emergency re-arm (60 s floor), and before
-# the loop runs. Linux only: the interposer needs ELF symbol preemption and
-# dlsym(RTLD_NEXT).
+# the loop runs; a round in flight at stop() or destruction is never delivered
+# (mode stop; its destroy legs need ASan to show a failure). Linux only: the
+# interposer needs ELF symbol preemption and dlsym(RTLD_NEXT).
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_executable(coin_peer_dns_offthread_kat coin_peer_dns_offthread_kat.cpp)
     target_link_libraries(coin_peer_dns_offthread_kat core ltc)
     target_link_libraries(coin_peer_dns_offthread_kat c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage ltc_coin pool)
     target_link_libraries(coin_peer_dns_offthread_kat nlohmann_json::nlohmann_json ${CMAKE_DL_LIBS})
-    foreach(mode start emergency preloop)
+    foreach(mode start emergency preloop stop)
         add_test(NAME coin_peer_dns_offthread_${mode} COMMAND coin_peer_dns_offthread_kat ${mode})
         set_tests_properties(coin_peer_dns_offthread_${mode} PROPERTIES TIMEOUT 600)
     endforeach()
