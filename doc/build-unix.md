@@ -206,13 +206,29 @@ silent fallback. Running options: README
 
 ### Build the test suite (optional)
 
+A quick check builds three test targets and runs them directly:
+
 ```bash
+# still inside build/
 cmake --build . \
     --target test_hardening test_share_messages test_coin_broadcaster \
     -j$(nproc)
-ctest --output-on-failure -j$(nproc)
-# Expected: 94 tests, 0 failures
+./test/test_hardening && ./test/test_share_messages && ./test/test_coin_broadcaster
+# Expected at v0.2.12.7: 20 + 9 + 68 = 97 tests, each binary ends in [  PASSED  ]
 ```
+
+Do not run `ctest` after building only these three. `ctest` runs the whole
+registered suite (5,550 tests across all coins at v0.2.12.7) and reports every
+test whose target was not built as *Not Run* or `…_NOT_BUILT`. For the full
+suite, build all targets first (a long build), then run it:
+
+```bash
+cmake --build . -j$(nproc)
+ctest --output-on-failure -j$(nproc)
+```
+
+The Dash BLS tests only run in a `-DC2POOL_DASH_BLS=ON` build (see
+[Dash: build with BLS](#dash-build-with-bls)); in a stub build they compile out.
 
 ---
 
