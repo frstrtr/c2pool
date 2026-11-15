@@ -7557,12 +7557,9 @@
         // (c2pool-explorer-plugin-architecture.md §16.2) says the
         // inline path stays until pixel-diff parity is confirmed.
         //
-        // Known limitations while the flag is on:
-        //   - Right-hand stats panel stays at "-" (bundled path does
-        //     not yet update #defrag-total etc).
-        //   - RealTime toggle button is inert (bundled is always live).
-        //   - Hover-zoom + per-share PPLNS treemap not yet ported.
-        // These land in subsequent Phase B commits.
+        // With the flag on, the bootstrap at the end of this file wires
+        // the stats panel (Phase B #10), the per-share PPLNS hover zoom
+        // (#12) and the RealTime toggle (#13) to the bundled renderer.
         window.__c2pBundledExplorer = (function() {
             try {
                 var p = new URLSearchParams(location.search);
@@ -10308,21 +10305,17 @@
                     }
                     function onMouseMove(ev) {
                         if (!window.__explorerBundled) return;
+                        // A cached bundle older than this page lacks the API.
+                        if (typeof window.__explorerBundled.cellAtPoint !== 'function') return;
                         var state = window.__explorerBundled.getState();
                         var shares = state.window.shares;
                         if (shares.length === 0) return;
-                        var layout = mod.computeGridLayout({
-                            shareCount: shares.length,
-                            containerWidth: wrap.clientWidth,
-                            cellSize: 10,
-                            gap: 1,
-                            marginLeft: 38,
-                            minHeight: 40,
-                        });
+                        // Hit-test against the layout the renderer actually
+                        // painted (auto-fit cell size), not a fixed 10 px grid.
                         var rect = canvas.getBoundingClientRect();
                         var x = ev.clientX - rect.left;
                         var y = ev.clientY - rect.top;
-                        var idx = mod.cellAtPoint(layout, x, y);
+                        var idx = window.__explorerBundled.cellAtPoint(x, y);
                         if (idx === null) {
                             if (hoveredIdx !== -1) { hoveredIdx = -1; hoverPanel.hide(); }
                             return;
