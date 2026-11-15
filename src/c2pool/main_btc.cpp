@@ -115,6 +115,7 @@ static void print_usage()
         "Usage: c2pool-btc [--testnet | --testnet4 | --regtest] --bitcoind HOST:PORT\n"
         "                  [--p2pool HOST:PORT]\n"
         "\n"
+        "  --version       print \"c2pool-btc <version>\" and exit\n"
         "  --testnet       BTC testnet3 chain (genesis 000000000933ea01...)\n"
         "  --testnet4      BTC testnet4 chain (genesis 00000000da84f2ba...)\n"
         "  --regtest       BTC regtest chain (genesis 0f9188f13cb7b2c7...)\n"
@@ -236,6 +237,15 @@ int main(int argc, char* argv[])
         if (arg == "-h" || arg == "--help")
         {
             print_usage();
+            return 0;
+        }
+        else if (arg == "--version")
+        {
+#ifdef C2POOL_VERSION
+            std::cout << "c2pool-btc " << C2POOL_VERSION << "\n";
+#else
+            std::cout << "c2pool-btc dev\n";
+#endif
             return 0;
         }
         else if (arg == "--settings" && i + 1 < argc)

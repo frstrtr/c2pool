@@ -970,6 +970,7 @@ legacy YAML key set.
 
 | CLI flag | YAML key | Default | Description |
 |----------|----------|---------|-------------|
+| `--version` | -- | | Print `c2pool-ltc <version> embedded=ltc,doge,nmc` (the coins with an embedded node in this binary) and exit |
 | `--integrated` | `integrated` | **true** | Full P2P pool mode |
 | `--solo` | `solo` | false | Solo pool (no sharechain) |
 | `--custodial` | `custodial` | false | Custodial pool (single-address coinbase) |
@@ -1209,9 +1210,9 @@ dashd-attached default OFF)
 ### c2pool-btc — Bitcoin (SHA256d)
 
 Source: `src/c2pool/main_btc.cpp` — `print_usage()` and the `main()` parse
-loop. Unknown argument → `unknown arg: …` + usage, exit 1. There is **no
-`--version`** flag on this binary. A coin source is mandatory: without
-`--bitcoind` **or** `--coin-p2p-discover` the binary prints usage and exits 1.
+loop. Unknown argument → `unknown arg: …` + usage, exit 1. A coin source is
+mandatory: without `--bitcoind` **or** `--coin-p2p-discover` the binary prints
+usage and exits 1.
 
 ```bash
 # Daemonless public pool (btc.voidbind.com posture)
@@ -1227,6 +1228,7 @@ loop. Unknown argument → `unknown arg: …` + usage, exit 1. There is **no
 | Flag | Default | Meaning |
 |------|---------|---------|
 | `-h` / `--help` | | Usage and exit 0. |
+| `--version` | | Print `c2pool-btc <version>` and exit 0. |
 | `--data-dir PATH`, `--settings PATH`, `--dump-resolved-config`, `--ack-money-settings` | | Control plane, see [Settings file](#settings-file-toml--all-binaries). `--dump-resolved-config` runs before the mandatory-coin-source check, so it works with no endpoint. |
 | `--testnet` / `--testnet4` / `--regtest` | mainnet | Chain selection (testnet4 also sets the testnet flag). |
 | `--bitcoind HOST:PORT` | — | bitcoind **P2P** endpoint (8333 / 18333 / 48333 testnet4 / 18443 regtest). Required unless `--coin-p2p-discover`. |

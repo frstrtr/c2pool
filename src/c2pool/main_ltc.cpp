@@ -531,6 +531,7 @@ void print_help() {
     std::cout << "COMMAND LINE OPTIONS:\n";
     std::cout << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
     std::cout << "  --help, -h                Show this help message and exit\n";
+    std::cout << "  --version                 Print \"c2pool-ltc <version> embedded=<coins>\" and exit\n";
     std::cout << "  --data-dir PATH           Root all per-instance state here (default: ~/.c2pool)\n";
     std::cout << "                            (isolates co-located instances)\n";
     std::cout << "  --testnet                 Use testnet instead of mainnet\n";
@@ -812,6 +813,26 @@ static int dump_doge_schedule_anchors(const std::string& dir, const std::string&
 }
 
 int main(int argc, char* argv[]) {
+    // --version: a pure query, answered before anything else runs (data dir,
+    // crash handlers, logger, the RLIMIT notice, settings, network), so stdout
+    // carries exactly this one line on every platform. Same shape as
+    // c2pool-dash's `c2pool-dash <version> bls=<backend>`: the version, then a
+    // build-feature token, last so `--version | grep -oE 'embedded=[a-z,]+'`
+    // reads it. embedded= names the coins with an embedded (daemonless) node
+    // compiled into this binary: the LTC parent and the DOGE and NMC
+    // merged-mining aux chains.
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--version") {
+#ifdef C2POOL_VERSION
+            std::cout << "c2pool-ltc " << C2POOL_VERSION << " embedded=ltc,doge,nmc\n";
+#else
+            std::cout << "c2pool-ltc dev embedded=ltc,doge,nmc\n";
+#endif
+            return 0;
+        }
+    }
+
     // Pre-scan for --data-dir BEFORE anything reads config_path() — the
     // Settings ctor (Fileconfig captures its path at construction) and the
     // file-log sink both resolve through it. Redirecting the chokepoint here
