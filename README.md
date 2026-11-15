@@ -3,7 +3,12 @@
 [![CI](https://github.com/frstrtr/c2pool/actions/workflows/build.yml/badge.svg)](https://github.com/frstrtr/c2pool/actions/workflows/build.yml)
 [![Claude for Open Source](https://img.shields.io/badge/Claude%20for%20Open%20Source-supported-D97757?logo=claude&logoColor=white)](https://claude.com/contact-sales/claude-for-oss)
 
-C++ reimplementation of [forrestv/p2pool](https://github.com/p2pool/p2pool) targeting the **V36 share format**, with **per-coin binaries** for six parent chains and their merged-mining children: **Litecoin** (flagship — LTC + DOGE, PEP, BELLS, LKY, JKC, SHIC), **Bitcoin** (+ Namecoin), **DigiByte** (Scrypt), **Bitcoin Cash**, **Dash**, and **BIP-110** (the Bitcoin Knots BLAKE2b minority hard fork — embedded daemonless, experimental). See [Supported chains](#supported-chains) for the full matrix and status.
+C++ reimplementation of [forrestv/p2pool](https://github.com/p2pool/p2pool) targeting the **V36 share format**, with **per-coin binaries** for six parent chains and their merged-mining children. Two of them are in production use:
+
+- **Litecoin**, with **DOGE** merged mining in production on the V36 share chain (embedded DOGE node). More Scrypt AuxPoW chains (PEP, LKY, SHIC, BELLS, JKC) can be added through external daemons. They are not production-tested, and segwit aux chains (BELLS, JKC) are not supported yet.
+- **Dash**, with a daemonless embedded node in production. It needs no dashd and is ready for Dash Core 24 (v24). It covers compact blocks (BIP 152), superblock governance and the full UTXO set from a pinned snapshot.
+
+The other parent chains are **Bitcoin** (+ Namecoin), **DigiByte** (Scrypt), **Bitcoin Cash**, and **BIP-110** (the Bitcoin Knots BLAKE2b minority hard fork; embedded daemonless, experimental). See [Supported chains](#supported-chains) for the full matrix and status.
 
 Bitcoin wiki: <https://en.bitcoin.it/wiki/P2Pool>
 
@@ -11,6 +16,10 @@ Original forum thread: <https://bitcointalk.org/index.php?topic=18313>
 
 ## Latest releases
 
+- **[v0.2.12.7](https://github.com/frstrtr/c2pool/releases/tag/v0.2.12.7)** — LTC: `--fee` pays the node owner the configured fee (v0.2.12–v0.2.12.6 paid about 1/12 of it), and a smaller miner's shares count at their full weight next to a bigger miner. DASH: on a node with several miners, each submission is judged by its own job's share target (a smaller miner could keep as little as 1/30 of its shares). LTC dashboard: one found block shows as the same row on every node, and merged blocks appear only under Merged Mining Blocks. Linux packages run without `start.sh`.
+- **[v0.2.12.6](https://github.com/frstrtr/c2pool/releases/tag/v0.2.12.6)** — LTC + DASH: a share that solves a block wins its head race against an equal-work sibling, as in p2pool. Dashboard fixes.
+- **[v0.2.12.5](https://github.com/frstrtr/c2pool/releases/tag/v0.2.12.5)** — DASH: superblock trigger votes are re-synced right before the superblock, for the Dash Core 24.0.1 voting change. Upgrade before superblock 2,575,480.
+- **[v0.2.12.4](https://github.com/frstrtr/c2pool/releases/tag/v0.2.12.4)** — LTC: a restarted node reconnects to the live share chain; share-store fixes for all coins; the dashboard shows whether each merged (DOGE) payout address was given by the miner or derived from the LTC address; universal macOS packages again (Apple Silicon + Intel).
 - **[v0.2.12.3](https://github.com/frstrtr/c2pool/releases/tag/v0.2.12.3)** — LTC: a node serves every share it holds (no gaps for peers after a dropped connection); the node fee is taken at exactly the configured rate. DASH: compact-block (BIP 152) receive, superblock governance sync, block bodies checked against the header including the v24 asset-unlock root. macOS packages in this release are Apple Silicon only; universal again from the next release.
 - **[v0.2.12.2](https://github.com/frstrtr/c2pool/releases/tag/v0.2.12.2)** — LTC: the built-in bootstrap list holds V36 share-chain nodes only.
 - **[v0.2.12.1](https://github.com/frstrtr/c2pool/releases/tag/v0.2.12.1)** — LTC + merged mining: [share version 3601](#share-version-3601-flag-day), active since 2026-11-13 00:00:00 UTC. Nodes older than v0.2.12.1 and Python p2pool are no longer on the LTC share chain. Several aux chains at once, job-time payouts. (v0.2.12 had an earlier date, 2026-11-11 12:00 UTC: do not run it.)
@@ -27,9 +36,11 @@ administrative access to a daemon.
 c2pool-dash builds valid Dash mainnet blocks from embedded coin-state. The
 deterministic masternode list, LLMQ quorums, ChainLocks and the DIP-4 coinbase
 are reconstructed inside c2pool. No Dash Core node is required on the serve path.
-Dash Core 24 (hard fork, earliest activation at block 2,580,480) is supported
-from v0.2.11.1: the v24 rules are built into the node, so a daemon-less pool
-has no dashd to upgrade.
+Dash Core 24 (hard fork) is supported from v0.2.11.1: the v24 rules are built
+into the node, so a daemon-less pool has no dashd to upgrade. The activation
+signal was not mined by block 2,572,415, so the earliest v24 activation is now
+block 2,584,512 (around 2026-12-06). c2pool is compatible with Dash Core 24.0.2
+peers.
 Blocks built this way have been accepted on Dash mainnet, including the pool
 development-fee split. A bare `c2pool-dash --run` is daemonless: with no
 `--coin-rpc` given, every embedded serving lever defaults ON
@@ -161,17 +172,18 @@ c2pool builds one binary per **parent chain** (`c2pool-<coin>`). Several parents
 
 | Parent chain | Algorithm | Merged-mining children | Status |
 |---|---|---|---|
-| **Litecoin** (LTC) | Scrypt | DOGE, PEP, BELLS, LKY, JKC, SHIC — external daemons | **Production** (V36; live LTC+DOGE blocks) — `c2pool-ltc` |
+| **Litecoin** (LTC) | Scrypt | DOGE (embedded); PEP, LKY, SHIC via external daemons (untested); BELLS, JKC not yet (segwit) | **Production** (V36; live LTC+DOGE blocks) — `c2pool-ltc` |
+| **Dash** (DASH) | X11 | — | **Production**, daemonless (`c2pool-dash --run`; dash.voidbind.com): v24-ready, compact blocks, superblock governance, full UTXO set; dashd-attached posture via `--coin-rpc` still supported |
 | **Bitcoin** (BTC) | SHA256d | Namecoin (NMC) | Live, daemonless (`c2pool-btc --coin-p2p-discover`; btc.voidbind.com); NMC embedded merged mining in development |
 | **DigiByte** (DGB) | Scrypt¹ | DOGE (embedded, `-DAUX_DOGE`) | Live, daemonless (`c2pool-dgb --run --coin-p2p-discover`; dgb.voidbind.com) — mainnet only, no testnet mode |
 | **Bitcoin Cash** (BCH) | SHA256d | — | Live, daemonless (`c2pool-bch --pool`; bch.voidbind.com) |
-| **Dash** (DASH) | X11 | — | Live, daemonless (`c2pool-dash --run`; dash.voidbind.com); dashd-attached posture via `--coin-rpc` still supported |
 | **BIP-110** (Knots BLAKE2b fork) | BLAKE2b² (SHA256d until height 961640) | — | **Experimental** (new fork; daemonless embedded; live on bip110.voidbind.com) — `c2pool-bip110 --run` |
 | **Monero** (XMR) | RandomX | none | **Experimental**, stagenet only (v37 lane; daemonless, several nodes, one owed ledger; `c2pool-v37-xmr`); mainnet fenced, see [docs/xmr-lane](docs/xmr-lane/README.md) |
 
 "Live" means a public voidbind node runs that per-coin binary with no coin
 daemon on the serve path. It is not a production-maturity claim: only the LTC
-line has the crossing-soak record behind it. Each binary's real flag surface is
+and Dash lines are in production use (LTC with the V35→V36 crossing-soak record,
+Dash as a daemonless node finding mainnet blocks). Each binary's real flag surface is
 in [Per-binary launch reference](#per-binary-launch-reference).
 
 ¹ DigiByte is a MultiAlgo chain; c2pool runs its **Scrypt** algorithm as a standalone parent — it is **not** an AuxPoW child of Litecoin.
@@ -325,6 +337,8 @@ c2pool is an independent C++ implementation of the P2Pool sharechain concept ori
 
 Development is supported by Anthropic's [Claude for Open Source](https://claude.com/contact-sales/claude-for-oss) program (2026). The design, the consensus rules, and responsibility for every byte shipped remain with the maintainers.
 
+> **Two Dash blocks in a row from the daemonless pool** (2026-11-15 03:40:39 and 03:42:26 UTC) — [#2572489](https://blockchair.com/dash/block/2572489) and [#2572490](https://blockchair.com/dash/block/2572490), 107 seconds apart. Both were built from embedded coin-state with no Dash Core node on the serve path, and both are confirmed.
+>
 > **First LTC + DOGE twin block found by c2pool in production** (2026-11-12 15:46:10 UTC) LTC [#3211872](https://blockchair.com/litecoin/block/3211872) + DOGE [#6454700](https://blockchair.com/dogecoin/block/6454700) — one proof of work, 6.256 LTC + 10,001 DOGE, found by a public V36 pool node (about 210 GH/s) eleven hours after it moved from Python p2pool to c2pool v0.2.12.2.
 >
 > **LTC share chain on share version 3601** (2026-11-13 00:00:00 UTC) — the flag day passed without a split. Python p2pool and c2pool before v0.2.12.1 can no longer join the share chain; the nodes on it run c2pool.
@@ -422,7 +436,7 @@ export PATH="$PATH:$HOME/.local/bin"   # so `conan` is on PATH (add to ~/.bashrc
 conan profile detect --force
 
 git clone https://github.com/frstrtr/c2pool.git
-cd c2pool && git checkout v0.2.12.1   # or the newest tag on the Releases page; omit to build master
+cd c2pool && git checkout v0.2.12.7   # or the newest tag on the Releases page; omit to build master
 mkdir build && cd build
 conan install .. --build=missing --output-folder=. --settings=build_type=Release
 cmake .. -DCMAKE_TOOLCHAIN_FILE=conan_toolchain.cmake -DCMAKE_BUILD_TYPE=Release
