@@ -38,6 +38,20 @@ Views on different engines link through a `SelectionBus` (hover, pin and search 
 | Resize | Snaps: no tween, and leaving tiles are dropped. |
 | `setLayout()` | A keyed transition: the same keys tween from the old layout to the new one. LOD changes are layout swaps. |
 | Time base | Records store `t0` as f32 milliseconds from an engine epoch. The epoch is rebased after an idle hour, so pages left open for days keep millisecond precision. |
+| Hit-testing | Uses the placement of the **last drawn frame** while a tween runs (what is on screen, not a frame ahead). While idle it uses a cached placement, invalidated by any update, restyle or resize, so mousemove does not allocate. |
+
+## Surfaces
+
+The engine draws into a **container** element (`position: relative`, sized by the host) and adds its own canvases to it:
+- **One canvas per renderer, always fresh.** A canvas that ever held a WebGL or WebGPU context returns `null` for `getContext('2d')`, so a fallback can never reuse it.
+- **The text overlay** has its own canvas stacked on top (`pointer-events: none`). It never shares a surface with a GPU context and does not move when the renderer is swapped.
+- **Pointer events.** Hosts bind them to the container, so handlers survive a renderer swap.
+
+**Boot and swap:**
+- The engine **always boots on Canvas2D** (synchronous, always available), so the page is never blank.
+- A requested `renderer` (e.g. a GPU backend) is initialised on a new surface in the background. It replaces Canvas2D only if its `init` resolves. If `init` throws or rejects, the failure goes to `onError` and the scene stays on Canvas2D.
+- On context loss, the engine initialises `fallbackRenderer()` (default Canvas2D) on a **new** surface, swaps it in, removes the lost surface and re-uploads every record.
+- `swapRenderer(next)` does the same on request and rejects, keeping the current renderer, if `next` fails.
 
 ## Layout plug-in contract
 
@@ -57,7 +71,7 @@ interface Layout<D> {
 
 | Layout | id | Status |
 |---|---|---|
-| `createTreemapLayout()` | `treemap` | Squarified (`src/pplns/squarify.ts`, minStrip 0), so area ∝ weight. "N others" aggregation (`othersFraction`, `minTileArea`), `expandOthers`, an optional `scale: 'log'` (non-proportional, must be labelled), and `gap`. |
+| `createTreemapLayout()` | `treemap` | Squarified (`src/pplns/squarify.ts`, minStrip 0), so each **cell** (the rect before the `gap` inset) has area ∝ weight. That is the weights gate. The drawn tile is the cell inset by `gap/2` per side, so a 4×4 cell draws 3×3. Small tiles therefore *look* smaller than their weight; hovers state the true %. Also "N others" aggregation (`othersFraction`, `minTileArea`), `expandOthers`, and an optional `scale: 'log'` (non-proportional, must be labelled). |
 | grid | `grid` | P2 ("Fluid", replaces the inline defrag renderer). |
 | roundabout | `roundabout` | P2 prototype, on the agreed v37 data model only. |
 
@@ -75,9 +89,10 @@ interface Renderer {
 }
 ```
 
-**Lifecycle:** `init → resize → (upload | draw)* → [contextLost] → dispose`.
-- **Async init.** `init` may be asynchronous: a GPU backend compiles shaders without blocking the page, and the engine draws nothing with it until it resolves.
-- **Context loss.** On `webglcontextlost` or WebGPU `device.lost`, the backend calls the engine's callback. The engine then swaps in `fallbackRenderer()` (default Canvas2D, which is always available) and re-uploads every record. Nothing on the page breaks.
+**Lifecycle:** `init(freshCanvas) → resize → (upload | draw)* → [contextLost] → dispose`.
+- **init.** `init` receives a canvas created for this renderer alone; see Surfaces. It may be asynchronous: a GPU backend compiles shaders without blocking the page, and Canvas2D keeps drawing until init resolves.
+- **Context loss.** On `webglcontextlost` or WebGPU `device.lost`, the backend calls the engine's callback. The engine moves to a fallback renderer on a fresh surface. Nothing on the page breaks.
+- **dispose.** Releases GPU resources; the engine removes the surface.
 
 **Instance record.** Fixed at 56 B: 14 × 4-byte words, little-endian, and the *same* layout for every backend:
 

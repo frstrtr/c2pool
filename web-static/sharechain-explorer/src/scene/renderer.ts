@@ -5,11 +5,13 @@
 // the Canvas2D backend and a GPU backend (vertex shader) draw the same
 // thing and CPU hit-testing (same easing) agrees with both.
 //
-// Lifecycle: init → resize → (upload | draw)* → [contextLost] → dispose.
-// init may resolve later (a GPU backend compiles shaders off the main
-// path); the engine keeps the previous renderer drawing until it does.
-// On context loss the engine swaps in a fallback renderer (Canvas2D is
-// always available) and re-uploads every record: no page break.
+// Lifecycle: init(freshCanvas) → resize → (upload | draw)* →
+// [contextLost] → dispose. Every renderer gets a canvas of its own (one
+// that held a GPU context can never give a 2D one). init may resolve
+// later (a GPU backend compiles shaders off the main path); the engine
+// keeps Canvas2D drawing until it does, and stays on Canvas2D if it
+// fails. On context loss the engine moves to a fallback renderer on a
+// fresh canvas and re-uploads every record: no page break.
 
 import type { DirtyRange, InstanceBuffer } from './instance-buffer.js';
 import type { Label } from './types.js';
@@ -17,6 +19,7 @@ import type { Label } from './types.js';
 export interface Renderer {
   /** 'canvas2d', 'webgl2', 'webgpu', … */
   readonly kind: string;
+  /** `canvas` is created for this renderer alone. */
   init(canvas: HTMLCanvasElement): void | Promise<void>;
   /** Drawing-surface size in CSS px and the device pixel ratio. */
   resize(cssWidth: number, cssHeight: number, dpr: number): void;
@@ -34,9 +37,8 @@ export interface Renderer {
 }
 
 /** TEXT OVERLAY CONTRACT. Labels, axes and marks are drawn by a separate
- *  2D pass on top of the tiles, never by the quad renderer. With the
- *  Canvas2D renderer it shares the canvas; with a GPU renderer it draws
- *  on a 2D canvas stacked above. `draw` replaces the previous labels. */
+ *  2D pass on its own canvas stacked above the renderer's, never by the
+ *  quad renderer. `draw` replaces the previous labels. */
 export interface TextOverlay {
   resize(cssWidth: number, cssHeight: number, dpr: number): void;
   draw(labels: readonly Label[]): void;

@@ -16,13 +16,28 @@
 // - Idle-stop: requestAnimationFrame runs only while something moves or
 //   a redraw was requested.
 // - Hit-testing runs on the CPU through the active layout, on tiles
-//   placed with the same easing the renderer uses.
+//   placed with the same easing the renderer uses, at the instant of the
+//   last drawn frame.
 // - setLayout() is a keyed transition: the same keys tween from the old
 //   layout's rects to the new one's (LOD changes, layout swaps).
+//
+// Surfaces: the engine draws into a CONTAINER element. Every renderer
+// gets a fresh canvas of its own (a canvas that once held a WebGL/WebGPU
+// context can never give a 2D one), and the text overlay has its own
+// canvas stacked on top (pointer-events: none). Hosts bind pointer events
+// to the container, so they survive a renderer swap. The engine always
+// boots on Canvas2D; a requested renderer replaces it when (and only if)
+// its init resolves, and a context loss swaps a fresh Canvas2D surface
+// back in.
 
 import { lerp, progress } from './easing.js';
 import { alpha, lerpRgba, withAlpha } from './colour.js';
-import { InstanceBuffer, type RecordState } from './instance-buffer.js';
+import {
+  InstanceBuffer, RECORD_WORDS,
+  W_DUR, W_FLAGS, W_FROM_H, W_FROM_RGBA, W_FROM_W, W_FROM_X, W_FROM_Y,
+  W_T0, W_TO_H, W_TO_RGBA, W_TO_W, W_TO_X, W_TO_Y,
+  type RecordState,
+} from './instance-buffer.js';
 import { createCanvas2DRenderer, createCanvas2DTextOverlay } from './canvas2d.js';
 import type { Renderer, TextOverlay } from './renderer.js';
 import type { Label, Layout, PlacedTile, Rect, SceneItem, Tile, TileStyle } from './types.js';
@@ -32,28 +47,47 @@ export interface FrameScheduler {
   cancel(id: number): void;
 }
 
+/** The DOM the engine needs from its container (tests pass a fake). */
+interface SurfaceHost {
+  appendChild(node: unknown): unknown;
+  insertBefore(node: unknown, ref: unknown): unknown;
+  removeChild(node: unknown): unknown;
+}
+
 export interface SceneOptions<D = unknown> {
-  canvas: HTMLCanvasElement;
+  /** Element the engine draws into (give it position: relative and a
+   *  size). The engine adds its canvases as children. */
+  container: HTMLElement;
   layout: Layout<D>;
   /** Colour and flags of a tile, given the view's current state. */
   style: (tile: Tile<D>) => TileStyle;
   /** Labels for the tiles as placed this frame (text overlay pass). */
   labels?: (tiles: readonly PlacedTile<D>[]) => Label[];
-  /** Default: Canvas2D on `canvas`. */
+  /** Preferred renderer (e.g. a GPU backend). The engine boots on
+   *  Canvas2D and switches when this one's init resolves; if init throws
+   *  or rejects it stays on Canvas2D. Default: Canvas2D only. */
   renderer?: Renderer;
-  /** Fallback after a context loss. Default: a Canvas2D renderer. */
+  /** Replacement after a context loss. Default: a Canvas2D renderer. */
   fallbackRenderer?: () => Renderer;
-  /** Default: a Canvas2D overlay sharing `canvas`; null disables labels. */
+  /** Default: a Canvas2D overlay on its own stacked canvas; null
+   *  disables labels. */
   overlay?: TextOverlay | null;
+  /** Fresh canvas for a renderer or the overlay. Default:
+   *  document.createElement('canvas'), absolutely positioned at 0,0. */
+  createSurface?: (role: 'renderer' | 'overlay') => HTMLCanvasElement;
   /** Tween length in ms. Default 500. */
   duration?: number;
-  /** Packed RGBA8 background (Canvas2D default renderer only). */
+  /** Packed RGBA8 background (Canvas2D renderers). */
   background?: number;
   /** Clock in ms. Default performance.now. */
   clock?: () => number;
   /** Default: window.requestAnimationFrame. */
   scheduler?: FrameScheduler;
   devicePixelRatio?: () => number;
+  /** Renderer failures. Default: console.error. */
+  onError?: (err: unknown) => void;
+  /** Contract warnings (once each). Default: console.warn. */
+  onWarn?: (msg: string) => void;
 }
 
 export interface Scene<D = unknown> {
@@ -65,14 +99,16 @@ export interface Scene<D = unknown> {
   restyle(): void;
   /** New viewport in CSS px; tiles snap (no tween). */
   resize(cssWidth: number, cssHeight: number): void;
-  /** Topmost live tile at (x, y) in CSS px, as drawn right now. */
+  /** Topmost live tile at (x, y) in CSS px of the container, as drawn in
+   *  the last frame. */
   hitTest(x: number, y: number): PlacedTile<D> | null;
-  /** Live tiles (not leaving) as drawn right now. */
-  placed(): PlacedTile<D>[];
+  /** Live tiles (not leaving) as drawn in the last frame. */
+  placed(): readonly PlacedTile<D>[];
   isAnimating(): boolean;
   /** Request one redraw. */
   invalidate(): void;
-  /** Replace the renderer (after init resolves); re-uploads everything. */
+  /** Move to `next` on a fresh surface once its init resolves. Rejects,
+   *  keeping the current renderer, if init fails. */
   swapRenderer(next: Renderer): Promise<void>;
   readonly renderer: Renderer;
   readonly buffer: InstanceBuffer;
@@ -97,21 +133,41 @@ function defaultScheduler(): FrameScheduler {
   };
 }
 
+function defaultSurface(role: 'renderer' | 'overlay'): HTMLCanvasElement {
+  const c = document.createElement('canvas');
+  c.style.position = 'absolute';
+  c.style.left = '0';
+  c.style.top = '0';
+  c.style.display = 'block';
+  if (role === 'overlay') c.style.pointerEvents = 'none';
+  return c;
+}
+
 export function createScene<D = unknown>(opts: SceneOptions<D>): Scene<D> {
   const clock = opts.clock ?? (() => performance.now());
   const scheduler = opts.scheduler ?? defaultScheduler();
   const dprOf = opts.devicePixelRatio ?? (() => (typeof window !== 'undefined' && window.devicePixelRatio) || 1);
   const duration = Math.max(0, opts.duration ?? 500);
+  const reportError = opts.onError ?? ((e: unknown) => console.error('[scene]', e));
+  const warned = new Set<string>();
+  const warnOnce = (id: string, msg: string): void => {
+    if (warned.has(id)) return;
+    warned.add(id);
+    (opts.onWarn ?? ((m: string) => console.warn('[scene]', m)))(msg);
+  };
+  const createSurface = opts.createSurface ?? defaultSurface;
+  const host = opts.container as unknown as SurfaceHost;
+  const canvas2d = (): Renderer => createCanvas2DRenderer(
+    opts.background !== undefined ? { background: opts.background } : {});
+
   const buffer = new InstanceBuffer();
   const entries = new Map<string, Entry<D>>();
-  const canvas = opts.canvas;
 
   let layout = opts.layout;
-  let renderer: Renderer = opts.renderer ?? createCanvas2DRenderer(
-    opts.background !== undefined ? { background: opts.background } : {});
-  const overlay: TextOverlay | null = opts.overlay === undefined
-    ? createCanvas2DTextOverlay(canvas)
-    : opts.overlay;
+  let renderer: Renderer | null = null;
+  let surface: HTMLCanvasElement | null = null;
+  let overlay: TextOverlay | null = null;
+  let overlaySurface: HTMLCanvasElement | null = null;
   let epoch = clock();
   let items: readonly SceneItem<D>[] = [];
   let pending: readonly SceneItem<D>[] | null = null;
@@ -120,9 +176,11 @@ export function createScene<D = unknown>(opts: SceneOptions<D>): Scene<D> {
   let raf: number | null = null;
   let destroyed = false;
   let uploadedGeneration = -1;
-  /** False until the current renderer's init resolves (GPU backends
-   *  compile asynchronously); frames wait, state keeps updating. */
-  let ready = true;
+  let lastFrameT: number | null = null;
+  /** Settled placement, reused by hitTest/placed while idle. */
+  let placedCache: PlacedTile<D>[] | null = null;
+  /** Bumps on every renderer switch, so a stale async init is dropped. */
+  let switches = 0;
 
   const now = (): number => clock() - epoch;
 
@@ -132,15 +190,55 @@ export function createScene<D = unknown>(opts: SceneOptions<D>): Scene<D> {
   };
 
   const fallback = (): void => {
-    const fb = opts.fallbackRenderer ? opts.fallbackRenderer() : createCanvas2DRenderer(
-      opts.background !== undefined ? { background: opts.background } : {});
-    void swapRenderer(fb);
+    const next = opts.fallbackRenderer ? opts.fallbackRenderer() : canvas2d();
+    swapRenderer(next).catch((e) => reportError(e));
   };
 
-  const initRenderer = (r: Renderer): void | Promise<void> => {
-    r.onContextLost(fallback);
-    return r.init(canvas);
+  /** Put `next` (already initialised on `s`) on screen in place of the
+   *  current renderer and its surface. */
+  const install = (next: Renderer, s: HTMLCanvasElement): void => {
+    const old = renderer;
+    const oldSurface = surface;
+    host.insertBefore(s, overlaySurface);
+    renderer = next;
+    surface = s;
+    next.onContextLost(fallback);
+    next.resize(viewport.w, viewport.h, dprOf());
+    buffer.markAllDirty();
+    uploadedGeneration = -1;
+    switches++;
+    if (old !== null && old !== next) old.dispose();
+    if (oldSurface !== null && oldSurface !== s) host.removeChild(oldSurface);
+    schedule();
   };
+
+  async function swapRenderer(next: Renderer): Promise<void> {
+    if (destroyed) return;
+    const at = switches;
+    const s = createSurface('renderer');
+    try {
+      await next.init(s);
+    } catch (e) {
+      next.dispose();
+      throw e;
+    }
+    // Destroyed meanwhile, or another switch (e.g. a context-loss
+    // fallback) happened first: keep what is on screen.
+    if (destroyed || at !== switches) { next.dispose(); return; }
+    install(next, s);
+  }
+
+  // Overlay first: its own stacked canvas, so it never shares a surface
+  // with a GPU context and does not move when the renderer is swapped.
+  if (opts.overlay === undefined) {
+    overlaySurface = createSurface('overlay');
+    host.appendChild(overlaySurface);
+    overlay = createCanvas2DTextOverlay(overlaySurface, { ownsCanvas: true });
+  } else {
+    overlay = opts.overlay;
+  }
+
+  // ── tween bookkeeping ───────────────────────────────────────────
 
   /** Current interpolated state of a record at engine time t. */
   const current = (slot: number, t: number): { rect: Rect; color: number; settled: boolean; rec: RecordState } => {
@@ -193,17 +291,23 @@ export function createScene<D = unknown>(opts: SceneOptions<D>): Scene<D> {
     }
     epoch += t;
     animEnd = -Infinity;
+    lastFrameT = null;
   };
 
   /** Lay out `next` and retarget every record. dur 0 snaps. */
   const apply = (next: readonly SceneItem<D>[], dur: number): void => {
     maybeRebaseEpoch();
+    placedCache = null;
     items = next;
     const t = now();
     const tiles = layout.layout(items, viewport);
     const seen = new Set<string>();
     for (const tile of tiles) {
-      if (seen.has(tile.key)) continue;  // keys must be unique; keep the first
+      if (seen.has(tile.key)) {
+        warnOnce(`dup:${layout.id}`,
+          `layout '${layout.id}' returned duplicate key '${tile.key}' (and maybe others); keeping the first of each`);
+        continue;
+      }
       seen.add(tile.key);
       const style = opts.style(tile);
       const e = entries.get(tile.key);
@@ -240,25 +344,40 @@ export function createScene<D = unknown>(opts: SceneOptions<D>): Scene<D> {
     schedule();
   };
 
-  const placedAt = (t: number, includeExiting: boolean): PlacedTile<D>[] => {
+  /** Live tiles placed at engine time t, read straight from the buffer. */
+  const placedAt = (t: number): PlacedTile<D>[] => {
     const out: PlacedTile<D>[] = [];
+    const f = buffer.f32, u = buffer.u32;
     for (const e of entries.values()) {
-      if (e.exiting && !includeExiting) continue;
-      const cur = current(e.slot, t);
+      if (e.exiting) continue;
+      const o = e.slot * RECORD_WORDS;
+      const p = progress(t, f[o + W_T0]!, f[o + W_DUR]!);
       out.push({
         ...e.tile,
-        x: cur.rect.x, y: cur.rect.y, w: cur.rect.w, h: cur.rect.h,
-        color: cur.color,
-        flags: cur.rec.flags,
-        exiting: e.exiting,
+        x: lerp(f[o + W_FROM_X]!, f[o + W_TO_X]!, p),
+        y: lerp(f[o + W_FROM_Y]!, f[o + W_TO_Y]!, p),
+        w: lerp(f[o + W_FROM_W]!, f[o + W_TO_W]!, p),
+        h: lerp(f[o + W_FROM_H]!, f[o + W_TO_H]!, p),
+        color: lerpRgba(u[o + W_FROM_RGBA]!, u[o + W_TO_RGBA]!, p),
+        flags: u[o + W_FLAGS]!,
+        exiting: false,
       });
     }
     return out;
   };
 
+  /** Placement as on screen: at the last drawn frame while animating,
+   *  at now when idle (identical then, and cached until a change). */
+  const currentPlacement = (): PlacedTile<D>[] => {
+    const t = now();
+    if (t < animEnd) return placedAt(lastFrameT ?? t);
+    if (placedCache === null) placedCache = placedAt(t);
+    return placedCache;
+  };
+
   function frame(): void {
     raf = null;
-    if (destroyed || !ready) return;
+    if (destroyed || renderer === null) return;
     let t = now();
     for (const [key, e] of entries) {
       if (e.exiting && t >= e.removeAt) {
@@ -278,37 +397,30 @@ export function createScene<D = unknown>(opts: SceneOptions<D>): Scene<D> {
     }
     renderer.upload(buffer, buffer.takeDirty());
     renderer.draw(t);
-    if (overlay !== null) overlay.draw(opts.labels ? opts.labels(placedAt(t, false)) : []);
+    lastFrameT = t;
+    if (overlay !== null) {
+      if (t >= animEnd) placedCache = null;  // settle: recompute once
+      overlay.draw(opts.labels ? opts.labels(t < animEnd ? placedAt(t) : currentPlacement()) : []);
+    }
     if (t < animEnd || pending !== null) schedule();
   }
 
-  async function swapRenderer(next: Renderer): Promise<void> {
-    await initRenderer(next);
-    if (destroyed) { next.dispose(); return; }
-    const old = renderer;
-    renderer = next;
-    next.resize(viewport.w, viewport.h, dprOf());
-    buffer.markAllDirty();
-    uploadedGeneration = -1;
-    if (old !== next) old.dispose();
-    schedule();
-  }
-
-  // Initial renderer: Canvas2D is synchronous; a renderer whose init is
-  // async simply draws once it resolves.
-  const first = initRenderer(renderer);
-  if (first instanceof Promise) {
-    ready = false;
-    void first.then(() => { ready = true; schedule(); });
-  }
-
+  // Boot on Canvas2D (synchronous, always available), then try the
+  // requested renderer in the background.
   {
-    const el = canvas as unknown as { clientWidth?: number; clientHeight?: number };
+    const boot = canvas2d();
+    const s = createSurface('renderer');
+    boot.init(s);
+    install(boot, s);
+    const el = opts.container as unknown as { clientWidth?: number; clientHeight?: number };
     const w = el.clientWidth ?? 0, h = el.clientHeight ?? 0;
     if (w > 0 && h > 0) {
       viewport = { x: 0, y: 0, w, h };
-      renderer.resize(w, h, dprOf());
+      boot.resize(w, h, dprOf());
       overlay?.resize(w, h, dprOf());
+    }
+    if (opts.renderer !== undefined) {
+      swapRenderer(opts.renderer).catch((e) => reportError(e));
     }
   }
 
@@ -339,6 +451,7 @@ export function createScene<D = unknown>(opts: SceneOptions<D>): Scene<D> {
     },
     restyle() {
       if (destroyed) return;
+      placedCache = null;
       for (const e of entries.values()) {
         if (e.exiting) continue;
         const style = opts.style(e.tile);
@@ -359,28 +472,32 @@ export function createScene<D = unknown>(opts: SceneOptions<D>): Scene<D> {
       if (destroyed) return;
       viewport = { x: 0, y: 0, w: Math.max(0, w), h: Math.max(0, h) };
       const dpr = dprOf();
-      renderer.resize(viewport.w, viewport.h, dpr);
+      renderer?.resize(viewport.w, viewport.h, dpr);
       overlay?.resize(viewport.w, viewport.h, dpr);
       apply(pending ?? items, 0);
       pending = null;
     },
     hitTest(x, y) {
-      const tiles = placedAt(now(), false);
+      const tiles = currentPlacement();
       return layout.hitTest ? layout.hitTest(tiles, x, y) : defaultHit(tiles, x, y);
     },
-    placed: () => placedAt(now(), false),
+    placed: () => currentPlacement(),
     isAnimating: () => now() < animEnd,
     invalidate: schedule,
     swapRenderer,
-    get renderer() { return renderer; },
+    get renderer() { return renderer!; },
     buffer,
     destroy() {
+      if (destroyed) return;
       destroyed = true;
       if (raf !== null) scheduler.cancel(raf);
       raf = null;
-      renderer.dispose();
+      renderer?.dispose();
       overlay?.dispose();
+      if (surface !== null) host.removeChild(surface);
+      if (overlaySurface !== null) host.removeChild(overlaySurface);
       entries.clear();
+      placedCache = null;
     },
   };
 }
