@@ -7381,6 +7381,22 @@ nlohmann::json MiningInterface::rest_embedded_template()
         {"note", "embedded-template endpoint not wired on this node"}};
 }
 
+nlohmann::json MiningInterface::rest_mempool_entry(const std::string& txid_hex)
+{
+    // A txid is 64 hex digits; anything else never reaches the coin target.
+    const bool well_formed = txid_hex.size() == 64
+        && std::all_of(txid_hex.begin(), txid_hex.end(),
+                       [](unsigned char c) { return std::isxdigit(c) != 0; });
+    if (!well_formed)
+        return nlohmann::json{{"error", "txid must be 64 hex digits"}, {"http_status", 400}};
+    if (!m_mempool_entry_fn)
+        return nlohmann::json{{"error", "mempool-entry-not-wired"}, {"http_status", 404}};
+    auto j = m_mempool_entry_fn(txid_hex);
+    if (j.is_null())
+        return nlohmann::json{{"error", "mempool-entry-unavailable"}, {"http_status", 503}};
+    return j;
+}
+
 nlohmann::json MiningInterface::rest_config()
 {
     // Control-plane M1 (SAFE): read-only resolved LAUNCH config. The fn reads

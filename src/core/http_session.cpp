@@ -706,6 +706,26 @@ void HttpSession::process_request()
                 rest_result = mining_interface_->rest_embedded_oracle();
             else if (target == "/embedded_template")
                 rest_result = mining_interface_->rest_embedded_template();
+            else if (target == "/mempool_entry") {
+                // Fee-parity shadow tooling: one mempool entry's candidacy.
+                // Direct-local only, like /api/utxo/scan.
+                auto answer = [&](int status, const nlohmann::json& j) {
+                    response.result(static_cast<http::status>(status));
+                    response.body() = j.dump();
+                    response.prepare_payload();
+                    send_response(std::move(response));
+                };
+                if (!is_direct_local()) {
+                    answer(403, {{"error", "mempool-entry-local-only"}});
+                    return;
+                }
+                auto j = mining_interface_->rest_mempool_entry(getQueryParam("txid"));
+                int st = j.is_object() ? j.value("http_status", 200) : 200;
+                if (st < 100 || st > 599) st = 200;
+                if (j.is_object()) j.erase("http_status");
+                answer(st, j);
+                return;
+            }
 
             // ── Control-plane M1 (SAFE half): READ-ONLY resolved-config +
             // catalog schema. Loopback-only (same posture as /api/admin/*):

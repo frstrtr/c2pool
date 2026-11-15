@@ -93,6 +93,7 @@
 #include <impl/dash/coin/utxo_snapshot_import.hpp>  // S2: the full UTXO set from a pinned dumptxoutset snapshot
 #include <impl/dash/coin/utxo_status.hpp>            // S2: /local_stats utxo + [EMBED-STATUS] utxo=
 #include <impl/dash/coin/utxo_scan.hpp>              // N1: GET /api/utxo/scan (full-set script scan)
+#include <impl/dash/coin/mempool_probe_json.hpp>     // GET /mempool_entry (fee-parity shadow probe)
 #include <impl/dash/coin/inject_validate.hpp>        // N3: POST /api/tx-inject/validate reply
 #include <impl/dash/coin/header_chain.hpp>       // dash::coin::HeaderChain — SPV header/tip authority (E2a)
 #include <impl/dash/coin/block_confirm.hpp>      // dash::coin::block_confirm — post-broadcast confirm/orphan verdict
@@ -3472,6 +3473,16 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         web_server->get_mining_interface()->set_utxo_scan_fn(
             [source = utxo_scan_source](const std::string& query, const std::atomic<bool>& cancel) {
                 return source->handle(query, cancel);
+            });
+        // GET /mempool_entry?txid=HEX (direct-local, read-only): one entry's
+        // template candidacy for the fee-parity shadow comparator. Runs on the
+        // producer thread (thread_safe_wrap), so node_coin_state is alive.
+        web_server->get_mining_interface()->set_mempool_entry_fn(
+            [&node_coin_state](std::string txid_hex) -> nlohmann::json {
+                uint256 txid;
+                txid.SetHex(txid_hex);
+                return dash::coin::mempool_probe_json(
+                    txid, node_coin_state.mempool().probe(txid));
             });
     }
     // ── IS/CL MINING-SAFETY HOLD arming (dashd TestPackageTransactions) ─────
