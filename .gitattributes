@@ -1,0 +1,3 @@
+
+# GitHub/`git archive` source archives: substitute the release tag (no .git in an archive).
+cmake/version-archive.txt export-subst
