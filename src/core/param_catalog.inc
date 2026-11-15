@@ -357,6 +357,9 @@ C2P_PARAM("web.dashboard_dir", WebOps, PATH, RESTART, C_DASH|C_LTC, LIT, "web-st
   C2P_ALIAS("web.dashboard_dir", BIN_DASH, "--dashboard-dir", VALUE)
   C2P_ALIAS("web.dashboard_dir", BIN_LTC, "--dashboard-dir", VALUE)
 
+C2P_PARAM("web.mempool_entry_probe", WebOps, BOOL, RESTART, C_DASH, LIT, "false", NONE, "direct-local GET /mempool_entry probe (fee-parity shadow tooling)")
+  C2P_ALIAS("web.mempool_entry_probe", BIN_DASH, "--mempool-entry-probe", FLAG)
+
 C2P_PARAM("web.explorer", WebOps, TRISTATE_BOOL, RESTART, C_DASH|C_BIP110, NONE, "", NONE, "loopback-only /api/explorer surface (default on)")
   C2P_ALIAS("web.explorer", BIN_DASH, "--explorer", FLAG)
   C2P_ALIAS("web.explorer", BIN_DASH, "--no-explorer", FLAG_NO_PREFIX)
