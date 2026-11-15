@@ -24,6 +24,7 @@ const entries = [
   { entryPoints: ['src/index.ts'],          outfile: 'dist/shared-core.js' },
   { entryPoints: ['src/explorer/index.ts'], outfile: 'dist/sharechain-explorer.js' },
   { entryPoints: ['src/pplns/index.ts'],    outfile: 'dist/pplns-view.js' },
+  { entryPoints: ['src/scene/index.ts'],    outfile: 'dist/scene.js' },
 ];
 
 for (const e of entries) {

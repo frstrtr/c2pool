@@ -1,0 +1,33 @@
+// dist/scene.js — the universal scene engine (see README.md here).
+// One layout-agnostic engine; layouts are plug-ins; the renderer is
+// replaceable (Canvas2D now, a GPU backend later) behind a fixed
+// instance-buffer contract.
+
+export { createScene } from './engine.js';
+export type { Scene, SceneOptions, FrameScheduler } from './engine.js';
+
+export { createTreemapLayout, DEFAULT_OTHERS_KEY } from './layouts/treemap.js';
+export type { TreemapOptions } from './layouts/treemap.js';
+
+export { createCanvas2DRenderer, createCanvas2DTextOverlay } from './canvas2d.js';
+export type { Canvas2DOptions, Ctx2D } from './canvas2d.js';
+
+export {
+  FLAG_DIM, FLAG_SELECTED, FLAG_PINNED, FLAG_MATCH, DIM_ALPHA,
+  KIND_SHIFT, KIND_MASK, TileKind, withKind, kindOf,
+} from './renderer.js';
+export type { Renderer, TextOverlay, TileKindValue } from './renderer.js';
+
+export {
+  InstanceBuffer, RECORD_BYTES, RECORD_WORDS,
+  W_FROM_X, W_FROM_Y, W_FROM_W, W_FROM_H, W_TO_X, W_TO_Y, W_TO_W, W_TO_H,
+  W_FROM_RGBA, W_TO_RGBA, W_T0, W_DUR, W_FLAGS, W_PAD,
+} from './instance-buffer.js';
+export type { DirtyRange, RecordState } from './instance-buffer.js';
+
+export { smootherstep, progress, lerp } from './easing.js';
+export { rgba, hsl, withAlpha, lerpRgba, toCss, red, green, blue, alpha } from './colour.js';
+export { createSelectionBus, matchesQuery } from './selection.js';
+export type { SelectionBus, SelectionState } from './selection.js';
+
+export type { Rect, SceneItem, Tile, PlacedTile, Layout, TileStyle, Label } from './types.js';
