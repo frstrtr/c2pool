@@ -163,6 +163,7 @@
 #include <impl/dash/coin/v36_work_policy.hpp>    // dash::coin::resolve_v36_work_policy (DASH v36 network: work source)
 #include <impl/dash/stratum/tip_refresh.hpp>   // dash::stratum::fire_share_tip_refresh — bump + notify_all + dashboard refresh
 #include <impl/dash/local_mint_ledger.hpp>     // dash::mint::LocalMintLedger — display-only local orphan/sibling gauge
+#include <impl/dash/deferred_mint_dash.hpp>    // dash::mint::DeferredSolve / mint_solve_once — deferred-mint queue binding
 #include <impl/dash/share_messages.hpp>        // dash::validate_message_data — operator message-blob validation (EMIT side, mirrors main_ltc.cpp)
 #include <c2pool/storage/found_block_store.hpp>  // FoundBlockStore/Record + LevelDBStore + MergedBlockStore (persistence, main_ltc parity)
 #include <c2pool/storage/the_checkpoint.hpp>   // TheCheckpointStore — #159 (G9) DASH parity wiring (inert until merged mining)
@@ -313,6 +314,12 @@ UtxoSnapshotCli g_utxo_snapshot;
 // nothing new. Even on, the route answers only a direct local request.
 // File scope like g_utxo_snapshot: written once while parsing argv.
 bool g_mempool_entry_probe = false;
+
+// --no-deferred-mint: KILL SWITCH for the deferred-mint queue
+// (core/deferred_mint.hpp). Default ON: a solve the busy tracker declines is
+// queued and minted at the next point the lock is free instead of being lost.
+// --no-deferred-mint restores the old single try-and-decline exactly.
+bool g_deferred_mint = true;
 
 // --embedded-mn-bridge-no-cursor (#91): DISABLE the bridge's resumable replay
 // cursor, so every process start replays the whole window from the pinned
@@ -639,6 +646,10 @@ void print_banner(const char* argv0)
         << "              running node that is not using that set; the next start opens it)\n"
         << "             (full UTXO set: import a pinned dumptxoutset into <net>/utxo_full_leveldb\n"
         << "              at start, then connect strictly from its base; alias --utxo-snapshot)\n"
+        << "           [--no-deferred-mint]\n"
+        << "             (kill switch: decline a solve the busy tracker cannot take, as\n"
+        << "              before, instead of queueing it for the next free lock; default\n"
+        << "              is to queue)\n"
         << "           [--mempool-entry-probe]\n"
         << "             (wire the direct-local GET /mempool_entry?txid= probe for the fee-parity\n"
         << "              shadow; default off)\n"
@@ -1672,6 +1683,50 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // local_mint_ledger.hpp.
     auto mint_ledger = std::make_shared<dash::mint::LocalMintLedger>();
 
+    // ── Deferred mint (core/deferred_mint.hpp) ────────────────────────────
+    // A solve the busy tracker declines is queued and minted at the next point
+    // the lock is free: both IO-phase epilogues (think slot still held, so the
+    // batch gets one think) and the 2 s advert tick. The stratum thread never
+    // waits. --no-deferred-mint is the kill switch (the old decline, exactly).
+    // Two extra display-only ledgers settle the shares minted FROM THE QUEUE,
+    // split by whether the solve's prev was the tip when it arrived (only those
+    // can land on the best chain; the others are siblings that lose the tie).
+    auto deferred_ledger_tip    = std::make_shared<dash::mint::LocalMintLedger>();
+    auto deferred_ledger_behind = std::make_shared<dash::mint::LocalMintLedger>();
+    using DashDeferredMinter = core::DeferredMinter<dash::mint::DeferredSolve>;
+    auto deferred_minter = std::make_shared<DashDeferredMinter>(
+        g_deferred_mint,
+        [node = &p2p_node, mint_params, mint_ledger, deferred_ledger_tip,
+         deferred_ledger_behind](const dash::mint::DeferredSolve& s,
+                                 const core::MintAttempt& a) {
+            const auto out = dash::mint::mint_solve_once(*node, mint_params, s, a);
+            if (out.result == core::MintResult::Minted) {
+                // Display-only: remember what we minted so the best-share-
+                // changed leg can tell later whether it stayed on the best
+                // chain (local_mint_ledger.hpp). Never gates the mint.
+                mint_ledger->record_mint(out.hash);
+                if (a.from_queue)
+                    (s.prev_was_tip ? deferred_ledger_tip : deferred_ledger_behind)
+                        ->record_mint(out.hash);
+            }
+            return out;
+        },
+        [node = &p2p_node]() { node->run_think(); });
+    p2p_node.set_deferred_mint_drain(
+        [w = std::weak_ptr<DashDeferredMinter>(deferred_minter)]() {
+            auto m = w.lock();
+            if (!m) return;
+            const auto st = m->drain_point();
+            if (st.minted > 0 || st.dropped > 0)
+                LOG_INFO << "[MINT-DEFER] drained: minted=" << st.minted
+                         << " dropped=" << st.dropped << " left=" << m->depth()
+                         << (st.stopped_busy ? " (tracker busy again)" : "");
+        });
+    std::cout << "[run] deferred mint "
+              << (g_deferred_mint ? "ON (busy-tracker solves are queued; --no-deferred-mint disables)"
+                                  : "OFF (--no-deferred-mint: busy-tracker solves are declined)")
+              << "\n";
+
     // ── Hashing on another node (failback): ONE sharechain read ───────────
     // Per payout address, the newest share minted on ANOTHER node (received
     // from a pool peer; a share minted here, or loaded from the local store,
@@ -2171,7 +2226,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             // tally + work-weighted sampling mirror what apply_min_protocol_ratchet
             // keys on (version_negotiation::get_desired_version_weights), so the
             // dashboard shows the SAME numbers the ratchet decides on.
-            mi->set_sharechain_stats_fn([node_ptr, mint_ledger]() -> nlohmann::json {
+            mi->set_sharechain_stats_fn([node_ptr, mint_ledger, deferred_minter,
+                                         deferred_ledger_tip, deferred_ledger_behind]() -> nlohmann::json {
                 // Last-good cache (mirrors main_ltc.cpp's stats_fn): think() holds the
                 // tracker lock frequently during normal operation, and returning a
                 // 4-field snapshot then would make the transition gauge (which reads
@@ -2205,6 +2261,35 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     out["local_pending_shares"]  = lm.pending;
                     out["local_gone_shares"]     = lm.gone;
                     out["local_orphan_rate"]     = lm.orphan_rate;
+                }
+                // Deferred mint (core/deferred_mint.hpp): queue counters and
+                // the on-best-chain outcome of the shares minted from it.
+                {
+                    const auto snap = deferred_minter->snapshot();
+                    nlohmann::json d;
+                    d["enabled"]             = snap.enabled;
+                    d["depth"]               = snap.depth;
+                    d["deferred"]            = snap.counters.deferred;
+                    d["minted"]              = snap.counters.minted;
+                    d["busy_stops"]          = snap.counters.busy_stops;
+                    d["batch_thinks"]        = snap.thinks;
+                    d["max_depth"]           = snap.counters.max_depth;
+                    d["max_age_ms_at_mint"]  = snap.counters.max_age_ms_at_mint;
+                    nlohmann::json dropped = nlohmann::json::object();
+                    for (size_t i = 1; i < snap.counters.dropped.size(); ++i)
+                        if (snap.counters.dropped[i] > 0)
+                            dropped[core::to_string(static_cast<core::MintDropReason>(i))] =
+                                snap.counters.dropped[i];
+                    d["dropped"] = dropped;
+                    const auto ledger_json = [](const dash::mint::LocalMintLedger& l) {
+                        const auto st = l.stats();
+                        return nlohmann::json{{"minted", st.minted}, {"on_chain", st.on_chain},
+                                              {"orphaned", st.orphaned}, {"pending", st.pending},
+                                              {"gone", st.gone}, {"orphan_rate", st.orphan_rate}};
+                    };
+                    d["prev_was_tip"]    = ledger_json(*deferred_ledger_tip);
+                    d["prev_was_behind"] = ledger_json(*deferred_ledger_behind);
+                    out["mint_defer"] = d;
                 }
 
                 // Protocol-floor gauge inputs (v16→v36 crossing). The live accept-floor
@@ -4980,7 +5065,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // commitment, deterministic producer rebuild (X11 identity gate +
         // pow<=target ban-safety gate inside), tracker insert + broadcast.
         work_source->set_mint_share_fn(
-            [node_ptr, mint_params, mint_registry, mint_ledger](
+            [node_ptr, mint_registry, deferred_minter](
                 const dash::stratum::DASHWorkSource::MintShareInputs& in) -> uint256
             {
                 if (in.ref_hash.IsNull()) {
@@ -4988,6 +5073,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                                    "no sharechain credit (fail-closed)";
                     return uint256();
                 }
+                // The frozen job is COPIED here, at arrival: a queued solve never
+                // depends on the registry still holding its job (FIFO cap 512).
                 auto frozen = mint_registry->get(in.ref_hash);
                 if (!frozen) {
                     LOG_WARNING << "[MINT] no frozen job for ref="
@@ -4996,78 +5083,34 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     return uint256();
                 }
 
-                // #889: a WON BLOCK is unrepeatable — there is no next solve to
-                // mint instead, and an unminted block-winning share is a block
-                // no p2pool peer can ever see (they detect pool blocks by
-                // watching the sharechain for a share meeting the block target,
-                // p2pool/node.py:145-147). So the block arm takes a BOUNDED WAIT
-                // for the tracker; the ordinary share arm keeps today's single
-                // try-and-decline, which is the right trade when the next solve
-                // mints. THE BLOCK IS ALREADY SUBMITTED at this point — the
-                // won-block arm in work_source.cpp dispatches it before invoking
-                // this seam — so no wait here can delay or endanger it.
+                // #889: a WON BLOCK is unrepeatable, so mint_solve_once gives it
+                // a BOUNDED WAIT for the tracker (the block itself was submitted
+                // before this seam; no wait here can delay it). An ordinary
+                // solve keeps the single try; with the deferred-mint queue ON a
+                // busy tracker QUEUES it instead of losing it, and a won-block
+                // share whose bounded wait expired goes to the FRONT.
                 //
                 // #878/#881: this lambda holds ZERO locks on entry (stratum
                 // asio handler -> process_message -> handle_submit ->
-                // mining_submit -> mint seam; verified lock-free end to end),
-                // which is what makes a bounded wait viable instead of a
-                // deadlock. The guard below is scoped and RELEASED before
-                // add_local_share takes the exclusive lock — never nested.
-                const auto urgency = in.won_block
-                    ? dash::tracker_acquire::Urgency::BlockWinning
-                    : dash::tracker_acquire::Urgency::Opportunistic;
-
-                std::optional<dash::stratum::MintedShare> built;
-                {
-                    auto guard = node_ptr->read_tracker(urgency);
-                    if (!guard) {
-                        if (in.won_block) {
-                            LOG_ERROR << "[MINT-BLOCK] FORFEIT — tracker still "
-                                         "busy after "
-                                      << dash::tracker_acquire::
-                                             BLOCK_SHARE_LOCK_BUDGET.count()
-                                      << "ms; cannot even REBUILD the "
-                                         "block-winning share. The block was "
-                                         "already submitted, but no p2pool peer "
-                                         "will see it.";
-                        } else {
-                            LOG_WARNING << "[MINT] tracker busy — solve declined "
-                                           "(retry on next share)";
-                        }
-                        return uint256();
-                    }
-                    // The share type this chain mints: v16 DashShare (public)
-                    // or v36 DashV36Share (private/isolated v36 sharechain).
-                    built = dash::mint::mint_from_inputs_any(
-                        guard->chain, mint_params, in, *frozen);
+                // mining_submit -> mint seam; verified lock-free end to end).
+                // mint_solve_once scopes and RELEASES its read guard before
+                // add_local_share_ex takes the exclusive lock — never nested.
+                dash::mint::DeferredSolve solve{
+                    in, std::move(*frozen),
+                    in.prev_share_hash == node_ptr->snapshot_best_share()};
+                const auto r = deferred_minter->on_solve(std::move(solve), in.won_block);
+                if (r.outcome.result == core::MintResult::Minted)
+                    return r.outcome.hash;
+                if (r.outcome.result == core::MintResult::Busy) {
+                    if (r.queued)
+                        LOG_INFO << "[MINT-DEFER] tracker busy — solve queued (depth="
+                                 << deferred_minter->depth() << ")"
+                                 << (in.won_block ? " BLOCK-WINNING share at the front" : "");
+                    else if (!in.won_block)
+                        LOG_WARNING << "[MINT] tracker busy — solve declined (retry on next share)"
+                                    << (deferred_minter->enabled() ? " [deferred-mint queue full]" : "");
                 }
-                if (!built) {
-                    LOG_WARNING << "[MINT] producer rebuild declined the solve "
-                                   "(identity/target gate) — NOT minted";
-                    return uint256();
-                }
-
-                dash::ShareType share = built->to_share_type();
-                // #889: same urgency for the tracker WRITE. add_local_share
-                // still returns ZERO if the bounded wait expires — the decline
-                // is preserved, it is just no longer silent (LOG_ERROR + a
-                // forfeit counter) and no longer triggered by a merely
-                // momentary think().
-                const uint256 minted =
-                    node_ptr->add_local_share(share, in.won_block);
-                if (minted.IsNull()) {
-                    // Not inserted (busy/duplicate) — reclaim the allocation.
-                    share.invoke([](auto* obj) { delete obj; });
-                    return uint256();
-                }
-                LOG_INFO << "[MINT] share " << minted.GetHex().substr(0, 16)
-                         << " minted onto the sharechain (prev="
-                         << in.prev_share_hash.GetHex().substr(0, 16) << ")";
-                // Display-only: remember what we minted so the best-share-changed
-                // leg below can tell us later whether it stayed on the best chain
-                // (see local_mint_ledger.hpp). Never gates the mint.
-                mint_ledger->record_mint(minted);
-                return minted;
+                return uint256();
             });
 
         // PPLNS fallback-coinbase weights (non-producer path): oracle-window
@@ -5120,7 +5163,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             core::WebServer* web = web_server.get();   // may be null (dashboard off)
             p2p_node.set_on_best_share_changed(
                 [ws = work_source.get(), web, &stratum_server, node_ptr,
-                 mint_ledger]() {
+                 mint_ledger, deferred_ledger_tip, deferred_ledger_behind]() {
                     dash::stratum::fire_share_tip_refresh(
                         ws, stratum_server.get(), web);
 
@@ -5128,17 +5171,21 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     // the new best chain. Runs AFTER the notify (miners first)
                     // and on a try-lock read guard, so a busy tracker simply
                     // defers the verdict to the next tip change.
-                    if (mint_ledger->pending_count() > 0) {
+                    if (mint_ledger->pending_count() > 0
+                        || deferred_ledger_tip->pending_count() > 0
+                        || deferred_ledger_behind->pending_count() > 0) {
                         auto guard = node_ptr->read_tracker();
                         if (guard) {
                             const uint256 best = node_ptr->snapshot_best_share();
                             auto& chain = guard->chain;
-                            mint_ledger->settle(
-                                [&chain, &best](const uint256& h) {
-                                    return dash::mint::classify_local_mint(
-                                        chain, best, h,
-                                        dash::mint::LocalMintLedger::kSettleDepth);
-                                });
+                            const auto classify = [&chain, &best](const uint256& h) {
+                                return dash::mint::classify_local_mint(
+                                    chain, best, h,
+                                    dash::mint::LocalMintLedger::kSettleDepth);
+                            };
+                            mint_ledger->settle(classify);
+                            deferred_ledger_tip->settle(classify);
+                            deferred_ledger_behind->settle(classify);
                         }
                     }
                 });
@@ -12336,6 +12383,14 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // run() has returned but web_server/mining-interface teardown is below.
     if (web_server) web_server->get_mining_interface()->save_stat_log();
 
+    // Deferred mint: run() has returned (ioc stopped), so nothing is minted
+    // from the queue any more — a share stored now could never be broadcast.
+    // Count and log what is left; drop the node's drain hook.
+    p2p_node.set_deferred_mint_drain(nullptr);
+    if (const size_t left = deferred_minter->shutdown())
+        LOG_WARNING << "[MINT-DEFER] shutdown: " << left
+                    << " queued solve(s) not minted (counted as 'shutdown')";
+
     // Stop the ZMQ hashblock subscriber (joins its thread) BEFORE the stratum
     // acceptor + work source it refreshes are torn down. Its callback only posts
     // onto the now-stopped ioc, so no refresh can run past here.
@@ -12940,6 +12995,8 @@ int main(int argc, char** argv)
             g_utxo_snapshot.import_file = argv[++i];  // S2: offline import, exits
         else if (std::strcmp(argv[i], "--mempool-entry-probe") == 0)
             g_mempool_entry_probe = true;
+        else if (std::strcmp(argv[i], "--no-deferred-mint") == 0)
+            g_deferred_mint = false;
         else if (std::strcmp(argv[i], "--explorer") == 0)
             explorer_enabled = true;
         else if (std::strcmp(argv[i], "--no-explorer") == 0)

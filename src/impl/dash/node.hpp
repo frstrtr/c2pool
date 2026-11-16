@@ -327,6 +327,8 @@ protected:
         NetService addr;
     };
     std::vector<PendingShareBatch> m_pending_adds;
+    // Deferred mint drain hook (set_deferred_mint_drain). IO-thread-only.
+    std::function<void()> m_deferred_mint_drain;
 
     // ── think() watchdog + backpressure (livelock defense-in-depth) ──
     // If a think() cycle exceeds THINK_WATCHDOG_SECONDS the watchdog (slice D)
@@ -1306,6 +1308,30 @@ public:
     /// from the stratum handler) holds zero locks; the compute thread is guarded
     /// against explicitly inside.
     uint256 add_local_share(ShareType share, bool block_winning = false);
+
+    /// Deferred mint (core/deferred_mint.hpp): add_local_share with the REASON
+    /// it did not insert, so a caller can tell a busy tracker (retry later)
+    /// from a share that can never be inserted (drop). `think_after` false
+    /// skips the trailing run_think(): a caller minting a BATCH runs one think
+    /// for all of it (a think per item would take the lock between items and
+    /// make the next one busy). add_local_share() == add_local_share_ex(share,
+    /// block_winning, true) plus the old busy warning.
+    enum class LocalAddStatus { added, busy, duplicate, not_backable, null_hash };
+    struct LocalAddResult {
+        uint256        hash;      ///< set only when status == added
+        LocalAddStatus status{LocalAddStatus::null_hash};
+    };
+    LocalAddResult add_local_share_ex(ShareType share, bool block_winning, bool think_after);
+
+    /// Deferred mint: the coin binding's drain (main_dash.cpp). Called on the
+    /// IO thread in both IO-phase epilogues, while the think slot is still
+    /// held (a drained mint's run_think() is queued as the pending re-think and
+    /// served once for the whole batch), and on the 2 s advert tick as a
+    /// backstop. Set before the io_context runs; empty = no drain.
+    void set_deferred_mint_drain(std::function<void()> fn) { m_deferred_mint_drain = std::move(fn); }
+    /// Runs the drain hook and never throws (an exception is logged): it sits
+    /// in front of drain_pending_adds() and inside the advert timer.
+    void run_deferred_mint_drain();
 
     /// #889 observability: block-winning mints lost because the bounded wait on
     /// the tracker expired. MUST stay 0 in production — every increment is one

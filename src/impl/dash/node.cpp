@@ -966,6 +966,11 @@ void NodeImpl::run_think()
                 broadcast_share(m_best_share_hash);
             }
 
+            // Deferred mints first (the miners' solves are older than the peer
+            // shares deferred below), then deferred peer adds. The slot is
+            // still held, so the drained mints' think is queued and served by
+            // the release below: one think for the whole batch.
+            run_deferred_mint_drain();
             drain_pending_adds();
 
             // #854: the release reports whether a run_think() request was
@@ -989,6 +994,19 @@ void NodeImpl::run_think()
         });
     });
     slot.commit();   // the cycle's IO-phase now owns the slot
+}
+
+void NodeImpl::run_deferred_mint_drain()
+{
+    if (!m_deferred_mint_drain)
+        return;
+    try {
+        m_deferred_mint_drain();
+    } catch (const std::exception& e) {
+        LOG_ERROR << "[MINT-DEFER] drain failed: " << e.what();
+    } catch (...) {
+        LOG_ERROR << "[MINT-DEFER] drain failed: unknown error";
+    }
 }
 
 void NodeImpl::drain_pending_adds()
@@ -1222,6 +1240,10 @@ void NodeImpl::start_outbound_connections()
     m_advert_timer = std::make_unique<core::Timer>(m_context, true);
     m_advert_timer->start(2, [this]() {
         drain_peer_best_adverts();
+        // Deferred-mint backstop: a solve deferred while the tracker was held
+        // by something with no IO epilogue (a shared reader on another thread),
+        // or left behind by an epilogue that threw.
+        run_deferred_mint_drain();
         // IO thread: keep the display peer-info snapshot's uptimes fresh
         // (peer add/remove refresh it on membership change; this ticks it so
         // the dashboard card's uptime advances between events). Cheap — a few
@@ -1546,6 +1568,7 @@ void NodeImpl::clean_tracker()
                     m_on_best_share_changed();
                 broadcast_share(m_best_share_hash);  // re-announce new head
             }
+            run_deferred_mint_drain();   // same order and slot rule as run_think's epilogue
             drain_pending_adds();
         } catch (const std::exception& e) {
             LOG_ERROR << "[CLEAN] IO phase failed: " << e.what();
@@ -1773,9 +1796,19 @@ std::vector<uint256> NodeImpl::send_shares(peer_ptr peer,
 
 uint256 NodeImpl::add_local_share(ShareType share, bool block_winning)
 {
+    const auto r = add_local_share_ex(share, block_winning, /*think_after=*/true);
+    if (r.status == LocalAddStatus::busy && !block_winning)
+        LOG_WARNING << "[MINT] tracker busy — local share "
+                    << share.hash().GetHex().substr(0, 16) << " declined (retry on next solve)";
+    return r.hash;
+}
+
+NodeImpl::LocalAddResult NodeImpl::add_local_share_ex(ShareType share, bool block_winning,
+                                                      bool think_after)
+{
     const uint256 hash = share.hash();
     if (hash.IsNull())
-        return uint256::ZERO;
+        return {uint256::ZERO, LocalAddStatus::null_hash};
 
     {
         // Exclusive tracker lock.
@@ -1826,15 +1859,15 @@ uint256 NodeImpl::add_local_share(ShareType share, bool block_winning)
                              "submitted, but no p2pool peer will see it and its "
                              "PPLNS weight is lost. forfeits="
                           << m_block_share_lock_forfeits.load(std::memory_order_relaxed);
-            } else {
-                LOG_WARNING << "[MINT] tracker busy — local share "
-                            << hash.GetHex().substr(0, 16) << " declined (retry on next solve)";
             }
-            return uint256::ZERO;
+            // The ordinary busy case is logged by the caller: add_local_share()
+            // keeps today's "declined" warning; the deferred-mint binding
+            // queues the solve instead.
+            return {uint256::ZERO, LocalAddStatus::busy};
         }
         if (m_chain->contains(hash)) {
             LOG_WARNING << "[MINT] duplicate local share " << hash.GetHex().substr(0, 16);
-            return uint256::ZERO;
+            return {uint256::ZERO, LocalAddStatus::duplicate};
         }
 
         // F1-sub (by-construction backability): DECLINE a solve whose template
@@ -1874,7 +1907,7 @@ uint256 NodeImpl::add_local_share(ShareType share, bool block_winning)
                                    "declined (stale job past retention window; retry "
                                    "on next solve)";
                 }
-                return uint256::ZERO;
+                return {uint256::ZERO, LocalAddStatus::not_backable};
             }
         }
 
@@ -1897,8 +1930,9 @@ uint256 NodeImpl::add_local_share(ShareType share, bool block_winning)
     // (IO thread, tracker lock already released, m_think_running still true) —
     // the residual missed-notify path. acquire_think_slot() now queues it.
     broadcast_share(hash);
-    run_think();
-    return hash;
+    if (think_after)
+        run_think();
+    return {hash, LocalAddStatus::added};
 }
 
 // #950: standing remembered-set seed (canonical p2p.py:269). Declared in
