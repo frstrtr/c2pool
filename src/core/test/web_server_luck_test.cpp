@@ -887,3 +887,35 @@ TEST(PoolLuckEndpoints, BinnedHistoryNeverRewritesAStoredRate)
     EXPECT_EQ(str(high, "effort_method"), "integrated");
     EXPECT_TRUE(written.empty()) << "a read must not write a row back either";
 }
+
+// Deviation 13. DigiByte makes a block every 15 s over FIVE algorithms, each
+// retargeted to one block in 75 s. currency_info.block_period is the chain's
+// (15); the network rate behind this node's difficulty is
+// difficulty * 2^32 / 75. algo_block_period serves that interval, equal to
+// block_period on every other coin.
+TEST(PoolLuckEndpoints, CurrencyInfoServesTheAlgorithmsBlockPeriod)
+{
+    struct Case { Blockchain chain; const char* label; int block_period, algo_block_period; };
+    const Case cases[] = {
+        {Blockchain::DIGIBYTE, "", 15, 75},
+        {Blockchain::LITECOIN, "", 150, 150},
+        {Blockchain::DASH, "", 150, 150},
+        {Blockchain::BITCOIN, "", 600, 600},
+        {Blockchain::BITCOIN, "BCH", 600, 600},
+        {Blockchain::DOGECOIN, "", 60, 60},
+    };
+    for (const auto& c : cases) {
+        MiningInterface mi(false, nullptr, c.chain);
+        if (*c.label) mi.set_coin_label(c.label);
+        mi.update_network_difficulty(1.0e6, "test");
+        const auto info = mi.rest_web_currency_info();
+        ASSERT_TRUE(info.contains("block_period")) << info.dump(1);
+        EXPECT_EQ(info["block_period"].get<int>(), c.block_period);
+        ASSERT_TRUE(info.contains("algo_block_period"))
+            << "chain " << static_cast<int>(c.chain) << " label '" << c.label << "'";
+        EXPECT_EQ(info["algo_block_period"].get<int>(), c.algo_block_period);
+        // The interval /global_stats turns the difficulty into a rate with.
+        EXPECT_NEAR(mi.rest_global_stats()["network_hashrate"].get<double>(),
+                    1.0e6 * kT32 / c.algo_block_period, 1.0);
+    }
+}

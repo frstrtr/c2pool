@@ -7606,6 +7606,16 @@ nlohmann::json MiningInterface::rest_web_currency_info()
         break;
     }
 
+    // algo_block_period: the block interval of the ALGORITHM this node mines,
+    // i.e. what turns its network difficulty into a network rate
+    // (difficulty * 2^32 / algo_block_period, as /global_stats
+    // network_hashrate does). It equals block_period on every coin but
+    // DigiByte, whose chain makes a block every 15 s over five algorithms,
+    // each retargeted to one block in 75 s: a consumer that divided by
+    // block_period there read the scrypt network 5x high.
+    if (result.contains("block_period"))
+        result["algo_block_period"] = static_cast<int>(coin_block_period());
+
     // Expose explorer state so dashboard JS can link to internal explorer
     result["explorer_enabled"] = m_explorer_enabled;
     if (m_explorer_enabled && !m_explorer_url.empty())
