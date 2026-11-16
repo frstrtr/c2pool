@@ -139,6 +139,7 @@
 #include <impl/dash/coin/mn_diff_store.hpp>      // dashd evodb dmn_D4/dmn_S3 port: per-block MN list diffs + snapshots
 #include <impl/dash/coin/mn_gap_repair.hpp>      // payee-queue gap-repair seam (maintainer + checkpoint bridge)
 #include <impl/dash/node.hpp>          // dash::Node — sharechain pool-node (NodeBridge<NodeImpl,Legacy,Actual>)
+#include <impl/dash/diag_lock_hold.hpp>  // DIAG ONLY: names the tracker exclusive holder on a declined mint
 #include <impl/dash/config.hpp>        // dash::Config (PoolConfig/CoinConfig)
 #include <impl/dash/config_pool.hpp>   // dash::SharechainConfig — P2P_PORT / PREFIX / min-proto SSOT
 #include <core/filesystem.hpp>         // core::filesystem::config_path()
@@ -5027,8 +5028,12 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                                          "already submitted, but no p2pool peer "
                                          "will see it.";
                         } else {
+                            const auto [diag_h, diag_age] =
+                                dash::diag::lock_hold_recorder().current();
                             LOG_WARNING << "[MINT] tracker busy — solve declined "
-                                           "(retry on next share)";
+                                           "(retry on next share)"
+                                        << " holder=" << (diag_h ? diag_h : "?")
+                                        << " age=" << diag_age << "ms";
                         }
                         return uint256();
                     }
