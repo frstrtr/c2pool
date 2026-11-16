@@ -11053,6 +11053,25 @@ int main(int argc, char* argv[]) {
                 // Kept for a row recorded at height 0 after this backfill:
                 // it learns its height when its block confirms.
                 web_server.get_mining_interface()->set_block_height_lookup(height_lookup);
+                // The stretch of time the header chain holds. With it the
+                // confirm lane can tell a pending block the chain does NOT
+                // hold -- the finds stored at the share absheight that never
+                // reached the chain: their hash is unknown although the
+                // chain spans their time -- from one it merely cannot judge
+                // (a chain rooted at a later checkpoint, or still syncing).
+                // A fast-start checkpoint is a root without a header: the
+                // first header above it dates the chain's start then.
+                web_server.get_mining_interface()->set_block_chain_span_fn(
+                    [hc]() -> std::pair<uint64_t, uint64_t> {
+                        const auto tip = hc->tip();
+                        const uint32_t low = hc->lowest_height();
+                        auto first = hc->get_header_by_height(low);
+                        if (!first || first->header.m_timestamp == 0)
+                            first = hc->get_header_by_height(low + 1);
+                        if (!tip || !first)
+                            return {0, 0};
+                        return {first->header.m_timestamp, tip->header.m_timestamp};
+                    });
                 // Only heights above the tip (no LTC block can sit there) are
                 // corrected: a header chain on a wrong checkpoint must not
                 // rewrite correct ones.
