@@ -153,6 +153,52 @@ inline bool classify_prev_was_tip(const uint256& prev, const uint256& best,
     return last_claimed_prev.IsNull() || prev != last_claimed_prev;
 }
 
+/// Which prev share a solve of ours already claims (soak metric only; io
+/// thread only). A claim is made when a solve is minted or queued on a prev; a
+/// MINTED share holds it for good (its siblings lose the tie to it), a QUEUED
+/// one only until it is minted or finally dropped. Only the newest claimed
+/// prev is tracked: a claim on a different prev replaces it (a solve on an older
+/// prev is "behind" anyway, since prev != best).
+class PrevClaimTracker
+{
+public:
+    bool classify_tip(const uint256& prev, const uint256& best) const
+    {
+        return classify_prev_was_tip(prev, best, m_prev);
+    }
+    /// A solve on `prev` was minted synchronously (`minted`) or queued.
+    void claim(const uint256& prev, bool minted)
+    {
+        if (prev != m_prev) {
+            m_prev = prev;
+            m_queued = 0;
+            m_minted = false;
+        }
+        if (minted) m_minted = true;
+        else        ++m_queued;
+    }
+    /// A queued solve on `prev` was minted from the queue.
+    void queued_minted(const uint256& prev)
+    {
+        if (prev != m_prev) return;
+        if (m_queued > 0) --m_queued;
+        m_minted = true;
+    }
+    /// A queued solve on `prev` was finally dropped: release its claim.
+    void queued_dropped(const uint256& prev)
+    {
+        if (prev != m_prev) return;
+        if (m_queued > 0) --m_queued;
+        if (m_queued == 0 && !m_minted) m_prev.SetNull();
+    }
+    const uint256& claimed_prev() const { return m_prev; }
+
+private:
+    uint256  m_prev;
+    uint32_t m_queued{0};
+    bool     m_minted{false};
+};
+
 /// The `mint_defer` object of the sharechain stats JSON (/sharechain/stats):
 /// queue counters plus the on-best-chain outcome of the shares minted FROM THE
 /// QUEUE, per cause. Lock-free for the caller (both inputs carry their own mutex).

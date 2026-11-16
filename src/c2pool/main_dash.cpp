@@ -1694,40 +1694,51 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // can land on the best chain; the others are siblings that lose the tie).
     auto deferred_ledger_tip    = std::make_shared<dash::mint::LocalMintLedger>();
     auto deferred_ledger_behind = std::make_shared<dash::mint::LocalMintLedger>();
+    // io thread only (the minter's owner): which prev a solve of ours already
+    // claims, for the tip/behind split (dash::mint::PrevClaimTracker).
+    auto prev_claims = std::make_shared<dash::mint::PrevClaimTracker>();
     using DashDeferredMinter = core::DeferredMinter<dash::mint::DeferredSolve>;
     auto deferred_minter = std::make_shared<DashDeferredMinter>(
         g_deferred_mint,
         [node = &p2p_node, mint_params, mint_ledger, deferred_ledger_tip,
-         deferred_ledger_behind](const dash::mint::DeferredSolve& s,
-                                 const core::MintAttempt& a) {
+         deferred_ledger_behind, prev_claims](const dash::mint::DeferredSolve& s,
+                                              const core::MintAttempt& a) {
             const auto out = dash::mint::mint_solve_once(*node, mint_params, s, a);
             if (out.result == core::MintResult::Minted) {
                 // Display-only: remember what we minted so the best-share-
                 // changed leg can tell later whether it stayed on the best
                 // chain (local_mint_ledger.hpp). Never gates the mint.
                 mint_ledger->record_mint(out.hash);
-                if (a.from_queue)
+                if (a.from_queue) {
                     (s.prev_was_tip ? deferred_ledger_tip : deferred_ledger_behind)
                         ->record_mint(out.hash);
+                    prev_claims->queued_minted(s.in.prev_share_hash);
+                }
             }
             return out;
         },
         [node = &p2p_node]() { node->run_think(); },
-        // Every queued solve that is finally NOT minted. A block-winning one is
-        // a forfeit: loud and counted, exactly like the bounded-wait expiry.
-        [node = &p2p_node](const dash::mint::DeferredSolve& s, core::MintDropReason why) {
-            if (s.in.won_block)
+        // Every solve the queue finally loses. A block-winning one is a
+        // forfeit, loud and counted like the bounded-wait expiry (a duplicate
+        // is not: the chain already holds that share). queue_full is logged by
+        // the mint seam (the solve was never queued) and shutdown by the
+        // shutdown block; neither held a claim.
+        [node = &p2p_node, prev_claims](const dash::mint::DeferredSolve& s,
+                                        core::MintDropReason why) {
+            using R = core::MintDropReason;
+            if (why != R::queue_full && why != R::shutdown)
+                prev_claims->queued_dropped(s.in.prev_share_hash);
+            if (s.in.won_block && why != R::duplicate) {
                 node->record_block_share_forfeit(s.in.pow_hash, core::to_string(why));
-            else
+            } else if (why != R::queue_full && why != R::shutdown) {
                 LOG_INFO << "[MINT-DEFER] queued solve dropped (" << core::to_string(why)
-                         << ") prev=" << s.in.prev_share_hash.GetHex().substr(0, 16);
+                         << ") prev=" << s.in.prev_share_hash.GetHex().substr(0, 16)
+                         << (s.in.won_block ? " (block-winning share, already in the chain)" : "");
+            }
         });
     // Owner = this thread: run_node's own thread is the one that runs ioc.run()
     // (the stratum seam, both IO epilogues and the advert tick all run there).
     deferred_minter->bind_owner_thread();
-    // io thread only: the prev of the newest solve we minted or queued (see
-    // dash::mint::classify_prev_was_tip).
-    auto last_claimed_prev = std::make_shared<uint256>();
     p2p_node.set_deferred_mint_drain(
         [w = std::weak_ptr<DashDeferredMinter>(deferred_minter)]() {
             auto m = w.lock();
@@ -1736,7 +1747,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             if (st.minted > 0 || st.dropped > 0)
                 LOG_INFO << "[MINT-DEFER] drained: minted=" << st.minted
                          << " dropped=" << st.dropped << " left=" << m->depth()
-                         << (st.stopped_busy ? " (tracker busy again)" : "");
+                         << (st.stopped_busy ? " (tracker busy again)" : "")
+                         << (st.stopped_budget ? " (time budget)" : "");
         });
     std::cout << "[run] deferred mint "
               << (g_deferred_mint ? "ON (--deferred-mint: busy-tracker solves are queued)"
@@ -5059,7 +5071,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // commitment, deterministic producer rebuild (X11 identity gate +
         // pow<=target ban-safety gate inside), tracker insert + broadcast.
         work_source->set_mint_share_fn(
-            [node_ptr, mint_registry, deferred_minter, last_claimed_prev](
+            [node_ptr, mint_registry, deferred_minter, prev_claims](
                 const dash::stratum::DASHWorkSource::MintShareInputs& in) -> uint256
             {
                 if (in.ref_hash.IsNull()) {
@@ -5089,15 +5101,18 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 // mining_submit -> mint seam; verified lock-free end to end).
                 // mint_solve_once scopes and RELEASES its read guard before
                 // add_local_share_ex takes the exclusive lock — never nested.
-                // The soak metric's cause split; only the queue uses it, so the
-                // kill switch skips the extra snapshot read.
-                const bool prev_was_tip = deferred_minter->enabled()
-                    && dash::mint::classify_prev_was_tip(
-                           in.prev_share_hash, node_ptr->snapshot_best_share(), *last_claimed_prev);
+                // Runs on the io thread, the minter's owner (prev_claims and
+                // depth() are io-thread state). The soak metric's cause split
+                // is only computed with the queue on: the default skips the
+                // extra snapshot read and the claim bookkeeping.
+                const bool on = deferred_minter->enabled();
+                const bool prev_was_tip = on
+                    && prev_claims->classify_tip(in.prev_share_hash, node_ptr->snapshot_best_share());
                 dash::mint::DeferredSolve solve{in, std::move(*frozen), prev_was_tip};
                 const auto r = deferred_minter->on_solve(std::move(solve), in.won_block);
-                if (r.outcome.result == core::MintResult::Minted || r.queued)
-                    *last_claimed_prev = in.prev_share_hash;
+                if (on && (r.outcome.result == core::MintResult::Minted || r.queued))
+                    prev_claims->claim(in.prev_share_hash,
+                                       r.outcome.result == core::MintResult::Minted);
                 if (r.outcome.result == core::MintResult::Minted)
                     return r.outcome.hash;
                 if (r.queued) {

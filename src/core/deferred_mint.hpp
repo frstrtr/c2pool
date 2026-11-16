@@ -159,6 +159,14 @@ public:
         DrainStats st;
         size_t processed = 0;
         const auto wall0 = clock::now();
+        const auto over_budget = [&] {
+            if (max_time.count() > 0 && !m_q.empty() && clock::now() - wall0 >= max_time) {
+                ++m_counters.budget_stops;
+                st.stopped_budget = true;
+                return true;
+            }
+            return false;
+        };
         while (!m_q.empty() && processed < max_items) {
             Entry e = std::move(m_q.front());
             m_q.pop_front();
@@ -166,6 +174,7 @@ public:
                 drop(e.item, MintDropReason::ttl, on_drop);
                 ++st.dropped;
                 ++processed;
+                if (over_budget()) break;
                 continue;
             }
             MintOutcome out;
@@ -191,11 +200,7 @@ public:
                 drop(e.item, out.why == MintDropReason::none ? MintDropReason::other : out.why, on_drop);
                 ++st.dropped;
             }
-            if (max_time.count() > 0 && !m_q.empty() && clock::now() - wall0 >= max_time) {
-                ++m_counters.budget_stops;
-                st.stopped_budget = true;
-                break;
-            }
+            if (over_budget()) break;
         }
         return st;
     }
@@ -325,6 +330,11 @@ public:
     SolveResult on_solve(Item item, bool won_block, clock::time_point now = clock::now())
     {
         SolveResult r;
+        if (!m_enabled) {
+            // Disabled: exactly the old path, from any thread, at any time.
+            r.outcome = m_mint_once(item, MintAttempt{true, false, false});
+            return r;
+        }
         if (m_stopped.load()) {
             // The node is stopping: a share minted now could not be broadcast,
             // whichever thread the solve came from. Only the owner touches the
@@ -340,10 +350,6 @@ public:
         }
         if (!on_owner_thread()) {
             // Never touch the queue off the owner thread: the old path.
-            r.outcome = m_mint_once(item, MintAttempt{true, false, false});
-            return r;
-        }
-        if (!m_enabled) {
             r.outcome = m_mint_once(item, MintAttempt{true, false, false});
             return r;
         }

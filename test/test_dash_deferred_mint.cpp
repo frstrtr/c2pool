@@ -49,6 +49,7 @@
 #include <fstream>
 #include <iterator>
 #include <memory>
+#include <cctype>
 #include <string>
 #include <shared_mutex>
 #include <stdexcept>
@@ -457,38 +458,73 @@ TEST(DeferredMintQueue, TimeBudgetStopsTheDrainAndKeepsTheRest)
 // DEFAULT OFF (DIRECTOR 11-17): the binary ships with the queue off until a
 // soak and a production canary have measured it; --deferred-mint turns it on.
 // Pins the constant, that main_dash takes its default from it and parses both
-// spellings, the catalog entry, and that the default constructs the old path.
+// spellings (whitespace-insensitive), and the catalog entry with both aliases.
 TEST(DashDeferredMintDefault, IsOffAndTheBinaryUsesIt)
 {
     EXPECT_FALSE(dash::mint::kDeferredMintDefault);
 
-    std::ifstream in(DASH_MAIN_SRC);
-    ASSERT_TRUE(in.good()) << "cannot open " << DASH_MAIN_SRC;
-    const std::string src((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-    EXPECT_NE(src.find("bool g_deferred_mint = dash::mint::kDeferredMintDefault;"), std::string::npos);
-    EXPECT_NE(src.find(R"("--deferred-mint") == 0)
-            g_deferred_mint = true;)"), std::string::npos);
-    EXPECT_NE(src.find(R"("--no-deferred-mint") == 0)
-            g_deferred_mint = false;)"), std::string::npos);
+    // Whitespace-insensitive: compare with every space, tab and newline removed
+    // (formatter- and CRLF-proof), plain substring search.
+    const auto squeezed = [](const std::filesystem::path& p) {
+        std::ifstream in(p);
+        EXPECT_TRUE(in.good()) << "cannot open " << p;
+        std::string out;
+        for (std::istreambuf_iterator<char> it(in), end; it != end; ++it)
+            if (!std::isspace(static_cast<unsigned char>(*it))) out.push_back(*it);
+        return out;
+    };
+    const auto has = [](const std::string& hay, const char* needle) {
+        return hay.find(needle) != std::string::npos;
+    };
+    const std::string src = squeezed(DASH_MAIN_SRC);
+    EXPECT_TRUE(has(src, "boolg_deferred_mint=dash::mint::kDeferredMintDefault;"));
+    EXPECT_TRUE(has(src, R"("--deferred-mint")==0)g_deferred_mint=true;)"));
+    EXPECT_TRUE(has(src, R"("--no-deferred-mint")==0)g_deferred_mint=false;)"));
 
-    const auto cat_path = std::filesystem::path(DASH_MAIN_SRC).parent_path().parent_path()
-                          / "core" / "param_catalog.inc";
-    std::ifstream cin_(cat_path);
-    ASSERT_TRUE(cin_.good()) << "cannot open " << cat_path;
-    std::string line, entry;
-    while (std::getline(cin_, line))
-        if (line.find(R"(C2P_PARAM("sharechain.deferred_mint")") != std::string::npos) entry = line;
-    ASSERT_FALSE(entry.empty());
-    EXPECT_NE(entry.find("default off"), std::string::npos) << entry;
+    const std::string cat = squeezed(std::filesystem::path(DASH_MAIN_SRC).parent_path().parent_path()
+                                     / "core" / "param_catalog.inc");
+    const auto at = cat.find(R"(C2P_PARAM("sharechain.deferred_mint")");
+    ASSERT_NE(at, std::string::npos);
+    const std::string entry = cat.substr(at, cat.find("C2P_ALIAS", at) - at);   // up to its first alias
+    EXPECT_TRUE(has(entry, "(defaultoff;--deferred-mintenables)")) << entry;
+    EXPECT_TRUE(has(cat, R"(C2P_ALIAS("sharechain.deferred_mint",BIN_DASH,"--deferred-mint",FLAG))"));
+    EXPECT_TRUE(has(cat, R"(C2P_ALIAS("sharechain.deferred_mint",BIN_DASH,"--no-deferred-mint",FLAG_NO_PREFIX))"));
+}
 
-    ScriptedMint s;
-    s.outcome = [](int) { return busy(); };
-    auto m = s.make(dash::mint::kDeferredMintDefault);
-    EXPECT_FALSE(m->on_solve(1, false).queued) << "by default a busy tracker declines, as before";
-    ASSERT_EQ(s.calls.size(), 1u);
-    EXPECT_TRUE(s.calls[0].second.think_after);
-    EXPECT_FALSE(s.calls[0].second.deferrable);
-    EXPECT_FALSE(m->snapshot().enabled);
+// The claim bookkeeping behind the tip/behind split, over the sequences the
+// soak sees.
+TEST(DashDeferredMintClassify, PrevClaimTrackerSequences)
+{
+    uint256 p, q;
+    p.begin()[0] = 1;
+    q.begin()[0] = 2;
+    dash::mint::PrevClaimTracker c;
+    EXPECT_TRUE(c.classify_tip(p, p)) << "nothing of ours claims p";
+
+    // A solve on p is minted: every later solve on p (best not moved yet) is a sibling.
+    c.claim(p, /*minted=*/true);
+    EXPECT_FALSE(c.classify_tip(p, p));
+    // Our share is elected: best = q (its hash) and solves on q are on the tip.
+    EXPECT_TRUE(c.classify_tip(q, q));
+
+    // A solve on q is queued, then finally dropped: the claim is released.
+    c.claim(q, /*minted=*/false);
+    EXPECT_FALSE(c.classify_tip(q, q)) << "a queued solve on q will win the tie";
+    c.queued_dropped(q);
+    EXPECT_TRUE(c.classify_tip(q, q)) << "nothing of ours on q any more";
+
+    // Two queued on q, one dropped: still claimed. Then the other mints: claimed for good.
+    c.claim(q, false);
+    c.claim(q, false);
+    c.queued_dropped(q);
+    EXPECT_FALSE(c.classify_tip(q, q));
+    c.queued_minted(q);
+    c.queued_dropped(q);   // a stray release cannot undo a minted claim
+    EXPECT_FALSE(c.classify_tip(q, q));
+
+    // A drop for an older prev does not touch the current claim.
+    c.queued_dropped(p);
+    EXPECT_EQ(c.claimed_prev(), q);
 }
 
 // Shares a drain already minted keep their think even if the fresh attempt
@@ -524,7 +560,7 @@ TEST(DashDeferredMintClassify, PrevWasTipOnlyWhenNoShareOfOursClaimsIt)
     EXPECT_FALSE(classify_prev_was_tip(q, p, uint256())) << "a stale job: prev is behind the tip";
 }
 
-TEST(DashDeferredMintClassify, StatsJsonShape)
+TEST(DashDeferredMintStats, JsonShape)
 {
     core::DeferredMintSnapshot snap;
     snap.enabled = true;
@@ -580,7 +616,7 @@ Wired wire_minter(LiveNode& a, const core::CoinParams& p, bool enabled)
         },
         [&a]() { a.node->run_think(); },
         [&a](const dash::mint::DeferredSolve& s, MintDropReason why) {
-            if (s.in.won_block)
+            if (s.in.won_block && why != MintDropReason::duplicate)
                 a.node->record_block_share_forfeit(s.in.pow_hash, core::to_string(why));
         });
     a.node->set_deferred_mint_drain([wm = std::weak_ptr<Minter>(w.m)]() {
@@ -833,4 +869,43 @@ TEST(DashDeferredMint, QueuedDuplicateIsDroppedNotRetried)
     EXPECT_EQ(w.m->depth(), 0u);
     EXPECT_EQ(drops(w.m->counters(), MintDropReason::duplicate), 1u);
     EXPECT_EQ(w.m->counters().minted, 0u);
+}
+
+// THE PRODUCTION DEFAULT (queue off) for a block-winning solve, through the real
+// mint body exactly as main_dash calls it (mint_solve_once, deferrable=false).
+// (a) Tracker held SHARED: the rebuild succeeds, the exclusive add's bounded wait
+//     expires -> one counted [MINT-BLOCK] FORFEIT, as before the queue existed.
+// (b) Tracker held EXCLUSIVELY: the read guard's bounded wait expires -> the
+//     "cannot even REBUILD" FORFEIT line, NOT counted, as on master.
+TEST(DashDeferredMint, DefaultPathWonBlockAddBusyIsCountedOnceAsBefore)
+{
+    NodeCase k("c2pool_dash_defer_default_won_add");
+    auto w = wire_minter(k.a, k.p, dash::mint::kDeferredMintDefault);
+    {
+        TrackerHold hold(k.a.node->tracker_mutex(), Mode::shared,
+                         dash::tracker_acquire::BLOCK_SHARE_LOCK_BUDGET + 300ms);
+        const auto r = w.m->on_solve(solve_of(k.t.other, /*won_block=*/true), true);
+        EXPECT_EQ(r.outcome.result, MintResult::Busy);
+        EXPECT_FALSE(r.queued) << "the default never queues";
+        hold.release();
+    }
+    EXPECT_EQ(k.a.node->block_share_lock_forfeits(), 1u);
+    EXPECT_FALSE(chain_has(k.a, k.t.o));
+    EXPECT_EQ(w.m->counters().deferred, 0u);
+}
+
+TEST(DashDeferredMint, DefaultPathWonBlockReadBusyIsNotCountedAsOnMaster)
+{
+    NodeCase k("c2pool_dash_defer_default_won_read");
+    auto w = wire_minter(k.a, k.p, dash::mint::kDeferredMintDefault);
+    {
+        TrackerHold hold(k.a.node->tracker_mutex(), Mode::exclusive,
+                         dash::tracker_acquire::BLOCK_SHARE_LOCK_BUDGET + 300ms);
+        const auto r = w.m->on_solve(solve_of(k.t.other, /*won_block=*/true), true);
+        EXPECT_EQ(r.outcome.result, MintResult::Busy);
+        EXPECT_FALSE(r.queued);
+        hold.release();
+    }
+    EXPECT_EQ(k.a.node->block_share_lock_forfeits(), 0u);
+    EXPECT_FALSE(chain_has(k.a, k.t.o));
 }
