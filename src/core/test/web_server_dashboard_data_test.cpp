@@ -43,6 +43,14 @@ nlohmann::json find_block(const nlohmann::json& arr, const std::string& hash)
     return nlohmann::json(nullptr);
 }
 
+// The winning share's difficulty in the fixtures that run a pool of 2^32 H/s.
+// It has to be one such a pool could mine: a share's difficulty bounds its
+// pool's rate from below (core::luck::rate_at_find_plausible -- a rate
+// recorded "at find" under that bound is some node's own stratum rate, not
+// the pool's), and the 240228 a real DASH share carries belongs to a pool of
+// ~5e13 H/s.
+constexpr double kShareDifficulty = 240.0;
+
 // Wire a live coin template the way main_dash does: netdiff 1.0 and a pool
 // hashrate of exactly 2^32 H/s make expected_time == 1 s, so the luck
 // arithmetic is checkable by eye. (MiningInterface is neither movable nor
@@ -92,13 +100,13 @@ TEST(DashboardData, LuckIsComputedFromTheLiveTemplateWhenTheCacheIsCold)
     mi.record_found_block(2516911, uint256S(h1), /*ts=*/1785955172, "DASH",
                           "XoZcEFbqwnty5secW7HYjdQEZYfubMkURu", h1,
                           /*network_difficulty=*/0.0,
-                          /*share_difficulty=*/240228.0,
+                          /*share_difficulty=*/kShareDifficulty,
                           /*pool_hashrate=*/0.0, /*subsidy=*/0);
     // Second block 2 s later: expected_time = 1.0 * 2^32 / 2^32 = 1 s,
     // time_to_find = 2 s, luck = 50%.
     mi.record_found_block(2516914, uint256S(h2), /*ts=*/1785955174, "DASH",
                           "XoZcEFbqwnty5secW7HYjdQEZYfubMkURu", h2,
-                          0.0, 240228.0, 0.0, 0);
+                          0.0, kShareDifficulty, 0.0, 0);
 
     auto blk = find_block(mi.rest_recent_blocks(), h2);
     ASSERT_TRUE(blk.is_object());
@@ -144,10 +152,10 @@ TEST(DashboardData, UncomputedLuckIsNullNeverZero)
         "5555555555555555555555555555555555555555555555555555555555555556";
     mi.record_found_block(2516911, uint256S(h1), 1785955172, "DASH",
                           "XoZcEFbqwnty5secW7HYjdQEZYfubMkURu", h1,
-                          0.0, 240228.0, 0.0, 0);
+                          0.0, kShareDifficulty, 0.0, 0);
     mi.record_found_block(2516914, uint256S(h2), 1785955174, "DASH",
                           "XoZcEFbqwnty5secW7HYjdQEZYfubMkURu", h2,
-                          0.0, 240228.0, 0.0, 0);
+                          0.0, kShareDifficulty, 0.0, 0);
 
     auto arr = mi.rest_recent_blocks();
     auto first = find_block(arr, h1);
@@ -881,10 +889,10 @@ TEST(DashboardData, RecentBlocksCarriesOracleParityResidualFields)
     // Two blocks 2 s apart -> the newer row computes a luck (single-hashrate).
     mi.record_found_block(2516911, uint256S(h1), 1785955172, "DASH",
                           "XoZcEFbqwnty5secW7HYjdQEZYfubMkURu", h1,
-                          0.0, 240228.0, 0.0, 0);
+                          0.0, kShareDifficulty, 0.0, 0);
     mi.record_found_block(2516914, uint256S(h2), 1785955174, "DASH",
                           "XoZcEFbqwnty5secW7HYjdQEZYfubMkURu", h2,
-                          0.0, 240228.0, 0.0, 0);
+                          0.0, kShareDifficulty, 0.0, 0);
 
     // As of the second block's own time, so the open round after it adds
     // nothing to the pool aggregate below.
@@ -1021,10 +1029,10 @@ TEST(DashboardData, HeaderLookupFillsNetdiffWhenTemplateAndCacheAreCold)
     // call shape of the replay hook: netdiff 0, pool_hashrate 0, subsidy 0.
     mi.record_found_block(2531045, uint256S(h1), /*ts=*/1788182946, "DASH",
                           "XghFtkZ8W3vhEHejUBbD3n387hemVJ6Pt4", h1,
-                          0.0, 240228.0, 0.0, 0);
+                          0.0, kShareDifficulty, 0.0, 0);
     mi.record_found_block(2531046, uint256S(h2), /*ts=*/1788182948, "DASH",
                           "XghFtkZ8W3vhEHejUBbD3n387hemVJ6Pt4", h2,
-                          0.0, 240228.0, 0.0, 0);
+                          0.0, kShareDifficulty, 0.0, 0);
 
     auto blk = find_block(mi.rest_recent_blocks(), h2);
     ASSERT_TRUE(blk.is_object());
@@ -1056,10 +1064,10 @@ TEST(DashboardData, NetdiffUnavailableLabelIsDistinctFromFirstBlock)
         "2222222222222222222222222222222222222222222222222222222222220002";
     mi.record_found_block(2531045, uint256S(h1), 1788182946, "DASH",
                           "XghFtkZ8W3vhEHejUBbD3n387hemVJ6Pt4", h1,
-                          0.0, 240228.0, 0.0, 0);
+                          0.0, kShareDifficulty, 0.0, 0);
     mi.record_found_block(2531046, uint256S(h2), 1788182948, "DASH",
                           "XghFtkZ8W3vhEHejUBbD3n387hemVJ6Pt4", h2,
-                          0.0, 240228.0, 0.0, 0);
+                          0.0, kShareDifficulty, 0.0, 0);
 
     auto arr = mi.rest_recent_blocks();
     auto b1 = find_block(arr, h1);
@@ -1091,9 +1099,9 @@ TEST(DashboardData, EnrichmentFillsNetdiffOnAlreadyAttributedRow)
     // Predecessor, then the attributed win with NO netdiff (no header, no
     // template) — lands attributed but luck-less.
     mi.record_found_block(2531045, uint256S(h1), 1788182946, "DASH",
-                          "Xminer", h1, 0.0, 240228.0, 0.0, 0);
+                          "Xminer", h1, 0.0, kShareDifficulty, 0.0, 0);
     mi.record_found_block(2531046, uint256S(h2), 1788182948, "DASH",
-                          "Xminer", h2, 0.0, 240228.0, 0.0, 0);
+                          "Xminer", h2, 0.0, kShareDifficulty, 0.0, 0);
     {
         auto blk = find_block(mi.rest_recent_blocks(), h2);
         ASSERT_TRUE(blk["found_locally"].get<bool>());
@@ -1103,7 +1111,7 @@ TEST(DashboardData, EnrichmentFillsNetdiffOnAlreadyAttributedRow)
     // A later attributed record for the same block carries the real netdiff.
     mi.record_found_block(2531046, uint256S(h2), 1788182948, "DASH",
                           "Xminer", h2, /*network_difficulty=*/1.0,
-                          240228.0, 4294967296.0, 0);
+                          kShareDifficulty, 4294967296.0, 0);
 
     auto arr = mi.rest_recent_blocks();
     int copies = 0;
@@ -1133,23 +1141,19 @@ TEST(DashboardData, ConfirmationRepairsNetdiffAndComputesLuck)
         "4444444444444444444444444444444444444444444444444444444444440002";
     // Predecessor + winning block, both with netdiff 0 and NO lookup yet.
     mi.record_found_block(2531045, uint256S(h1), 1788182946, "DASH",
-                          "Xminer", h1, 0.0, 240228.0, 4294967296.0, 0);
+                          "Xminer", h1, 0.0, kShareDifficulty, 4294967296.0, 0);
     mi.record_found_block(2531046, uint256S(h2), 1788182948, "DASH",
-                          "Xminer", h2, 0.0, 240228.0, 4294967296.0, 0);
+                          "Xminer", h2, 0.0, kShareDifficulty, 4294967296.0, 0);
     {
         auto blk = find_block(mi.rest_recent_blocks(), h2);
         EXPECT_TRUE(blk["network_difficulty"].is_null());
         EXPECT_TRUE(blk["luck"].is_null());
     }
 
-    // The header chain is available by the time the confirm lane runs. The
-    // lane checks every found block; the earlier one is confirmed too (a
-    // block left pending for good while a later one confirms never got a
-    // verdict, and would stop being the later block's predecessor).
+    // The header chain is available by the time the confirm lane runs.
     mi.set_block_field_lookups(fixed_diff_lookup(1.0), null_ts_lookup());
     mi.set_block_verify_fn([](const std::string&) -> int { return 6; });
 
-    EXPECT_GT(mi.run_block_verification_now(h1), 0);
     int v = mi.run_block_verification_now(h2);
     EXPECT_GT(v, 0);
 
@@ -1189,7 +1193,7 @@ TEST(DashboardData, BackfillPersistsRepairedRows)
         b.chain = "DASH"; b.confirmations = 300;
         b.miner = "Xminer"; b.share_hash = hash;
         b.network_difficulty = 0.0;      // the defect
-        b.share_difficulty = 240228.0;
+        b.share_difficulty = kShareDifficulty;
         b.pool_hashrate = 4294967296.0;
         return b;
     };

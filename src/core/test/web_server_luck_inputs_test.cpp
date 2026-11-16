@@ -10,14 +10,28 @@
 //     row stored before the difficulty was recorded;
 //   * the rate history fed sample by sample (add_luck_rate_sample), and the
 //     endpoints as of a given instant (rest_luck_stats_at / _blocks_at), so
-//     the open round and the period windows are exact.
+//     the open round and the period windows are exact: what a period counts
+//     of a row (effort_covered / measured), when a stored rate is rewritten,
+//     the hourly fold of samples older than a month;
+//   * the confirm lane: the evidence that a pending block is not on the
+//     chain (set_block_height_lookup, set_block_chain_span_fn), and its
+//     header lookups running with the ledger unlocked.
 // ---------------------------------------------------------------------------
 
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <chrono>
 #include <cmath>
+#include <ctime>
+#include <future>
+#include <memory>
+#include <mutex>
 #include <sstream>
+#include <stdexcept>
 #include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 
 #include <boost/asio/io_context.hpp>
@@ -59,6 +73,25 @@ double num(const nlohmann::json& row, const char* key)
     if (!row.is_object() || !row.contains(key) || !row[key].is_number())
         return std::nan("");
     return row[key].get<double>();
+}
+
+std::string str(const nlohmann::json& row, const char* key)
+{
+    if (!row.is_object() || !row.contains(key) || !row[key].is_string())
+        return "<absent>";
+    return row[key].get<std::string>();
+}
+
+double now_s() { return static_cast<double>(std::time(nullptr)); }
+
+// A block of the pool, recorded as a sharechain peer's (no share difficulty).
+void record(MiningInterface& mi, const std::string& chain, uint64_t height, unsigned tag,
+            double ts, double netdiff, double pool_rate)
+{
+    const std::string h = hash_of(tag);
+    mi.record_found_block(height, uint256S(h), static_cast<uint64_t>(ts), chain, kMiner, h,
+                          netdiff, 0.0, pool_rate, 625000000,
+                          MiningInterface::BlockAuthorship::sharechain_peer);
 }
 
 // A flat hour-by-hour rate history over [from, to]: H against the PARENT's
@@ -176,6 +209,58 @@ TEST(PoolLuckInputs, PeerLearnedMergedBlockIsMeasuredAgainstItsOwnBits)
     EXPECT_NEAR(num(row, "effort"), effort, effort * 1e-9);
     EXPECT_NEAR(num(row, "luck"), 100.0 / effort, 100.0 / effort * 1e-9);
     EXPECT_NEAR(num(row, "history_coverage"), 1.0, 1e-9);
+
+    // F1. Every merged row SAYS whether it is a block of the aux chain. The
+    // refused submit is served with its own effort and luck (timed from the
+    // block before it), exactly like a real block: without main_chain a
+    // consumer builds a round out of it -- here a "block" one day before the
+    // next one, a fake fast pair.
+    for (const auto& r : merged) {
+        ASSERT_TRUE(r.contains("main_chain")) << r.dump(1);
+        ASSERT_TRUE(r["main_chain"].is_boolean());
+    }
+    const auto refused = find_row(merged, "pow_hash", hash_of(0xd2));
+    ASSERT_TRUE(refused.is_object());
+    EXPECT_FALSE(refused["main_chain"].get<bool>()) << refused.dump(1);
+    EXPECT_FALSE(refused.value("measured", true));
+    EXPECT_TRUE(refused["verified"].is_null());
+    EXPECT_TRUE(refused["luck"].is_number()) << "it still carries a luck of its own";
+    EXPECT_TRUE(row["main_chain"].get<bool>());
+    EXPECT_TRUE(row.value("measured", false));
+    EXPECT_TRUE(find_row(merged, "pow_hash", hash_of(0xd1))["main_chain"].get<bool>());
+}
+
+// F1, the ledger side: this node's own merged find that its aux chain
+// orphaned is not a block of the aux chain either.
+TEST(PoolLuckInputs, OrphanedMergedLedgerRowIsNotMainChain)
+{
+    MiningInterface mi(false, nullptr, Blockchain::LITECOIN);
+    const double t1 = 1.0e9, day = 86400.0;
+    feed_history(mi, t1 - 3600.0, t1 + 3 * day, 1.9e11, 9.5e7);
+    auto doge = [&](uint64_t height, unsigned tag, double ts) {
+        const std::string h = hash_of(tag);
+        mi.record_found_block(height, uint256S(h), static_cast<uint64_t>(ts), "DOGE", kMiner, "",
+                              3.3e7, 0.0, 0.0, 1000000000000ULL,
+                              MiningInterface::BlockAuthorship::this_node);
+    };
+    doge(6454000, 0xe1, t1);
+    doge(6454400, 0xe2, t1 + day);
+    doge(6454700, 0xe3, t1 + 2 * day);
+    mi.add_chain_verify_fn("DOGE", [](const std::string& hash) {
+        return hash == hash_of(0xe2) ? -1 : 12;
+    });
+    for (unsigned tag : {0xe1u, 0xe2u, 0xe3u})
+        mi.run_block_verification_now(hash_of(tag));
+
+    const auto merged = mi.rest_recent_merged_blocks();
+    const auto orphan = find_row(merged, "pow_hash", hash_of(0xe2));
+    ASSERT_TRUE(orphan.is_object()) << merged.dump(1);
+    EXPECT_FALSE(orphan["main_chain"].get<bool>());
+    EXPECT_FALSE(orphan["verified"].get<bool>());
+    const auto last = find_row(merged, "pow_hash", hash_of(0xe3));
+    EXPECT_TRUE(last["main_chain"].get<bool>());
+    EXPECT_EQ(last["prev_block_hash"].get<std::string>(), hash_of(0xe1));
+    EXPECT_NEAR(num(last, "time_to_find"), 2 * day, 1e-6);
 }
 
 // The open round and the period windows as of an exact instant, over a
@@ -285,4 +370,442 @@ TEST(PoolLuckInputs, RowAtHeightZeroLearnsItsHeightWhenItsBlockConfirms)
     EXPECT_EQ(written.back().hash, h2);
     EXPECT_EQ(written.back().height, 21000250u);
     EXPECT_EQ(written.back().status, MiningInterface::BlockStatus::confirmed);
+}
+
+// A pending block is left out only on POSITIVE evidence that it is not on
+// the chain. "Nobody can judge it" keeps it: no lookup wired, a header chain
+// that does not reach back to it, an RPC or header outage however long. (The
+// rule used to be "still pending after its checks ran out while a later
+// block confirmed", which dropped a real block after any long outage.)
+TEST(PoolLuckInputs, PendingBlockIsKeptUnlessTheChainProvesItAbsent)
+{
+    const double now = now_s();
+    const double day = 86400.0;
+    const double D = 1000.0, H = kT32;
+    // Four blocks, days apart; the second never gets a verdict.
+    auto ledger = [&](MiningInterface& mi) {
+        record(mi, "LTC", 100, 1, now - 40 * day, D, H);
+        record(mi, "LTC", 101, 2, now - 30 * day, D, H);
+        record(mi, "LTC", 102, 3, now - 20 * day, D, H);
+        record(mi, "LTC", 103, 4, now - 10 * day, D, H);
+        mi.set_block_verify_fn([](const std::string& hash) { return hash == hash_of(2) ? 0 : 6; });
+    };
+    auto verify_all = [](MiningInterface& mi) {
+        for (unsigned tag : {1u, 3u, 4u, 2u})
+            mi.run_block_verification_now(hash_of(tag));
+    };
+    auto pending_row = [](MiningInterface& mi) {
+        const auto recent = mi.rest_recent_blocks();
+        auto row = find_row(recent, "hash", hash_of(2));
+        row["__next_prev"] = str(find_row(recent, "hash", hash_of(3)), "prev_block_hash");
+        row["__k"] = recent[0].value("blocks_for_luck", uint64_t(0));
+        return row;
+    };
+
+    {   // No by-hash lookup at all (a lane that cannot ask): kept.
+        MiningInterface mi(false, nullptr, Blockchain::LITECOIN);
+        ledger(mi);
+        verify_all(mi);
+        const auto row = pending_row(mi);
+        ASSERT_EQ(str(row, "status"), "pending");
+        EXPECT_EQ(row.value("main_chain", false), true) << row.dump(1);
+        EXPECT_EQ(str(row, "__next_prev"), hash_of(2));
+        EXPECT_EQ(row["__k"].get<uint64_t>(), 4u);
+    }
+    {   // The lookup is down -- it answers for nothing, the pool's confirmed
+        // blocks included (an RPC outage): that is no evidence. Kept.
+        MiningInterface mi(false, nullptr, Blockchain::LITECOIN);
+        ledger(mi);
+        mi.set_block_height_lookup([](const std::string&) -> uint64_t { return 0; });
+        verify_all(mi);
+        const auto row = pending_row(mi);
+        EXPECT_EQ(row.value("main_chain", false), true) << row.dump(1);
+        EXPECT_EQ(row["__k"].get<uint64_t>(), 4u);
+    }
+    {   // The header chain is rooted AFTER the block (a later checkpoint): it
+        // holds the later blocks only. It cannot speak for the block. Kept.
+        MiningInterface mi(false, nullptr, Blockchain::LITECOIN);
+        ledger(mi);
+        mi.set_block_height_lookup([](const std::string& hash) -> uint64_t {
+            return (hash == hash_of(3) || hash == hash_of(4)) ? 3200000u : 0u;
+        });
+        mi.set_block_chain_span_fn([&]() {
+            return std::pair<uint64_t, uint64_t>(static_cast<uint64_t>(now - 25 * day),
+                                                 static_cast<uint64_t>(now));
+        });
+        verify_all(mi);
+        const auto row = pending_row(mi);
+        EXPECT_EQ(row.value("main_chain", false), true) << row.dump(1);
+        EXPECT_EQ(str(row, "__next_prev"), hash_of(2));
+    }
+    {   // One failed call is not evidence: the lookup answers "nothing" for
+        // the block once (an RPC that timed out), then is seen working for
+        // the blocks around it -- and, asked again, holds the block. Kept.
+        MiningInterface mi(false, nullptr, Blockchain::LITECOIN);
+        ledger(mi);
+        int asked = 0;
+        mi.set_block_height_lookup([&asked](const std::string& hash) -> uint64_t {
+            if (hash == hash_of(2) && ++asked == 1) return 0u;
+            return 3200000u;
+        });
+        verify_all(mi);
+        const auto row = pending_row(mi);
+        EXPECT_EQ(asked, 2);
+        EXPECT_EQ(row.value("main_chain", false), true) << row.dump(1);
+        EXPECT_EQ(row["__k"].get<uint64_t>(), 4u);
+    }
+    {   // A lookup that throws is nobody to ask. Kept.
+        MiningInterface mi(false, nullptr, Blockchain::LITECOIN);
+        ledger(mi);
+        mi.set_block_height_lookup([](const std::string& hash) -> uint64_t {
+            if (hash == hash_of(2)) throw std::runtime_error("rpc timeout");
+            return 3200000u;
+        });
+        verify_all(mi);
+        EXPECT_EQ(pending_row(mi).value("main_chain", false), true);
+    }
+    {   // Evidence: the lookup holds the pool's confirmed blocks from before
+        // and after it, and not this one.
+        MiningInterface mi(false, nullptr, Blockchain::LITECOIN);
+        ledger(mi);
+        mi.set_block_height_lookup([](const std::string& hash) -> uint64_t {
+            return hash == hash_of(2) ? 0u : 3200000u;
+        });
+        verify_all(mi);
+        const auto row = pending_row(mi);
+        ASSERT_EQ(str(row, "status"), "pending");
+        EXPECT_EQ(row.value("main_chain", true), false) << row.dump(1);
+        EXPECT_EQ(str(row, "__next_prev"), hash_of(1)) << "the round runs across it";
+        EXPECT_EQ(row["__k"].get<uint64_t>(), 3u);
+    }
+    {   // Evidence: the header chain's own span covers the block's time (no
+        // earlier pool block needed), and it does not hold the hash.
+        MiningInterface mi(false, nullptr, Blockchain::LITECOIN);
+        record(mi, "LTC", 101, 2, now - 30 * day, D, H);   // the ledger starts with it
+        record(mi, "LTC", 102, 3, now - 20 * day, D, H);
+        mi.set_block_verify_fn([](const std::string& hash) { return hash == hash_of(2) ? 0 : 6; });
+        mi.set_block_height_lookup([](const std::string& hash) -> uint64_t {
+            return hash == hash_of(3) ? 3200000u : 0u;
+        });
+        mi.set_block_chain_span_fn([&]() {
+            return std::pair<uint64_t, uint64_t>(static_cast<uint64_t>(now - 60 * day),
+                                                 static_cast<uint64_t>(now));
+        });
+        mi.run_block_verification_now(hash_of(3));
+        mi.run_block_verification_now(hash_of(2));
+        const auto recent = mi.rest_recent_blocks();
+        const auto row = find_row(recent, "hash", hash_of(2));
+        EXPECT_EQ(row.value("main_chain", true), false) << row.dump(1);
+        EXPECT_EQ(str(find_row(recent, "hash", hash_of(3)), "effort_method"), "first_block");
+
+        // The header turns up after all (a late sync): the evidence is gone.
+        mi.set_block_height_lookup([](const std::string&) -> uint64_t { return 3200000u; });
+        mi.run_block_verification_now(hash_of(2));
+        EXPECT_EQ(find_row(mi.rest_recent_blocks(), "hash", hash_of(2)).value("main_chain", false),
+                  true);
+    }
+    {   // A block found minutes ago is nobody's phantom: the chain has not
+        // moved a clear margin past its time yet.
+        MiningInterface mi(false, nullptr, Blockchain::LITECOIN);
+        record(mi, "LTC", 100, 1, now - 40 * day, D, H);
+        record(mi, "LTC", 101, 2, now - 600.0, D, H);
+        mi.set_block_verify_fn([](const std::string& hash) { return hash == hash_of(2) ? 0 : 6; });
+        mi.set_block_height_lookup([](const std::string& hash) -> uint64_t {
+            return hash == hash_of(1) ? 3200000u : 0u;
+        });
+        mi.set_block_chain_span_fn([&]() {
+            return std::pair<uint64_t, uint64_t>(static_cast<uint64_t>(now - 60 * day),
+                                                 static_cast<uint64_t>(now));
+        });
+        mi.run_block_verification_now(hash_of(1));
+        mi.run_block_verification_now(hash_of(2));
+        EXPECT_EQ(find_row(mi.rest_recent_blocks(), "hash", hash_of(2)).value("main_chain", false),
+                  true);
+    }
+}
+
+// F4. The by-hash header lookups can be RPCs (DGB: digibyted
+// getblockheader). They ran under the ledger's lock in the confirm lane, so
+// a slow daemon stalled every /recent_blocks, /luck_stats and found-block
+// record. Each lookup here asks another thread to read the ledger and waits
+// for it: if that thread cannot get in, the lookup was called with the lock
+// held. (The wait is long so that a loaded machine cannot fail the test; it
+// is only ever waited out when the lookup IS under the lock.)
+TEST(PoolLuckInputs, HeaderLookupsRunWithTheLedgerUnlocked)
+{
+    MiningInterface mi(false, nullptr, Blockchain::DIGIBYTE);
+    std::atomic<int> calls{0}, under_lock{0};
+    std::vector<std::thread> probes;
+    std::mutex probes_mutex;
+    auto probe = [&]() {
+        ++calls;
+        auto done = std::make_shared<std::promise<void>>();
+        auto fut = done->get_future();
+        {
+            std::lock_guard<std::mutex> l(probes_mutex);
+            probes.emplace_back([&mi, done]() { (void)mi.get_found_blocks(); done->set_value(); });
+        }
+        if (fut.wait_for(std::chrono::seconds(10)) != std::future_status::ready)
+            ++under_lock;
+    };
+    mi.set_block_field_lookups(
+        [&](const std::string&) { probe(); return 2000.0; },
+        [&](const std::string&) { probe(); return uint32_t(0); });
+    mi.set_block_height_lookup([&](const std::string&) -> uint64_t { probe(); return 21000250u; });
+
+    const std::string h1 = hash_of(1), h2 = hash_of(2), h3 = hash_of(3);
+    auto rec = [&](uint64_t height, const std::string& h, uint64_t ts, double netdiff) {
+        mi.record_found_block(height, uint256S(h), ts, "DGB", kMiner, h, netdiff, 0.0, kT32, 0,
+                              MiningInterface::BlockAuthorship::this_node);
+    };
+    rec(21000000, h1, 1000000000, 1000.0);
+    rec(0, h2, 1000100000, 0.0);        // height and difficulty to be learned
+    rec(21000900, h3, 1000200000, 1000.0);
+    rec(0, h2, 1000100000, 0.0);        // the same block recorded again: the existing-row path
+    const int at_record = calls.load();
+    EXPECT_GT(at_record, 0) << "the record path asks the header for the difficulty";
+
+    // The confirm lane: a confirmation (difficulty + height from the header),
+    // then a block with no verdict (is it absent from the chain?).
+    mi.set_block_verify_fn([&](const std::string& hash) { return hash == h3 ? 0 : 6; });
+    EXPECT_GT(mi.run_block_verification_now(h1), 0);
+    EXPECT_GT(mi.run_block_verification_now(h2), 0);
+    EXPECT_EQ(mi.run_block_verification_now(h3), 0);
+    EXPECT_GT(calls.load(), at_record) << "the confirm lane asks the header too";
+
+    for (auto& t : probes) t.join();
+    EXPECT_EQ(under_lock.load(), 0)
+        << under_lock.load() << " of " << calls.load()
+        << " header lookups were made with the ledger locked";
+    // And the lookups' answers landed.
+    const auto row = mi.rest_found_block(h2);
+    EXPECT_EQ(row["height"].get<uint64_t>(), 21000250u);
+    EXPECT_NEAR(num(row, "network_difficulty"), 2000.0, 1e-9);
+}
+
+// L2-1. A row's `effort` is the best estimate for its own round: where the
+// history has a gap it is scaled up to the whole round. A period counts only
+// the time the history watched. A consumer summing rows needs the SAME rule
+// as the server's periods, so every row serves what a period counts of it:
+// effort_covered and measured. lambda = 1e-3 blocks per second:
+//
+//   t = 100000  first block                                 1.0     counted
+//   t = 106000  history covers [100400, 106000] of its      5.6     counted
+//               round: effort 6.0 (scaled), 5.6 covered
+//   t = 120000  no history over its round: single sample   14.0     counted
+//   t = 140000  history covers [126400, 131000]; the block   4.6     NOT counted
+//               was found in the dark: effort 20.0 (scaled)          (k_unmeasured)
+//   now = 141000  open round, no history: live rate          1.0
+//
+//   periods.all: k = 3, blocks_expected = 26.2
+TEST(PoolLuckInputs, RowsServeWhatAPeriodCountsOfThem)
+{
+    MiningInterface mi(false, nullptr, Blockchain::LITECOIN);
+    const double D = 1000.0;
+    mi.set_pool_hashrate_fn([]() { return kT32; });
+    mi.update_network_difficulty(D, "test");
+    for (double t : {104000.0, 105000.0, 106000.0, 130000.0, 131000.0})
+        mi.add_luck_rate_sample(t, kT32, 0.0, D);
+    auto rec = [&](uint64_t height, unsigned tag, double ts) {
+        const std::string h = hash_of(tag);
+        mi.record_found_block(height, uint256S(h), static_cast<uint64_t>(ts), "LTC", kMiner, h,
+                              D, 0.0, kT32, 625000000,
+                              MiningInterface::BlockAuthorship::this_node);
+    };
+    rec(100, 1, 100000.0);
+    rec(101, 2, 106000.0);
+    rec(102, 3, 120000.0);
+    rec(103, 4, 140000.0);
+
+    const double now = 141000.0;
+    const auto recent = mi.rest_recent_blocks_at(now);
+    struct Want { unsigned tag; double effort, covered; bool measured; const char* method; };
+    const Want wants[] = {
+        {1, 1.0, 1.0, true, "first_block"},
+        {2, 6.0, 5.6, true, "integrated"},
+        {3, 14.0, 14.0, true, "single_sample"},
+        {4, 20.0, 4.6, false, "integrated"},
+    };
+    double sum_covered = 0.0;
+    uint64_t sum_measured = 0;
+    for (const auto& w : wants) {
+        const auto row = find_row(recent, "hash", hash_of(w.tag));
+        ASSERT_TRUE(row.is_object());
+        EXPECT_EQ(row["effort_method"].get<std::string>(), w.method) << row.dump(1);
+        EXPECT_NEAR(num(row, "effort"), w.effort, 1e-9) << "tag " << w.tag;
+        EXPECT_NEAR(num(row, "effort_covered"), w.covered, 1e-9) << "tag " << w.tag;
+        EXPECT_EQ(row["measured"].get<bool>(), w.measured) << "tag " << w.tag;
+        EXPECT_TRUE(row["main_chain"].get<bool>());
+        sum_covered += num(row, "effort_covered");
+        if (row["measured"].get<bool>()) ++sum_measured;
+    }
+
+    const auto luck = mi.rest_luck_stats_at(now);
+    const auto& round = luck["current_round"];
+    EXPECT_NEAR(num(round, "effort"), 1.0, 1e-9);
+    EXPECT_NEAR(num(round, "effort_covered"), 1.0, 1e-9);
+    const auto& all = luck["periods"]["all"];
+    EXPECT_EQ(all["k"].get<uint64_t>(), 3u);
+    EXPECT_EQ(all["k_unmeasured"].get<uint64_t>(), 1u);
+    EXPECT_NEAR(num(all, "blocks_expected"), 26.2, 1e-9);
+    // The rows and the open round ADD UP to the period: what the dashboard's
+    // trend is built from is what the badges show.
+    EXPECT_EQ(sum_measured, all["k"].get<uint64_t>());
+    EXPECT_NEAR(sum_covered + num(round, "effort_covered"), num(all, "blocks_expected"), 1e-9);
+    // /luck_stats blocks[] carries the same pair.
+    for (const auto& b : luck["blocks"]) {
+        const auto row = find_row(recent, "hash", b["hash"].get<std::string>());
+        EXPECT_NEAR(num(b, "effort_covered"), num(row, "effort_covered"), 1e-12);
+        EXPECT_EQ(b["measured"].get<bool>(), row["measured"].get<bool>());
+    }
+}
+
+
+// F2, the samples' side. A stored rate is rewritten on disk only when
+//   - it is missing or not plausibly a pool rate (judged against a sample of
+//     the block's own time), or
+//   - a sample of the block's own MINUTE contradicts it by more than 25 %.
+// A sample taken after a restart speaks for up to the hour before it: it is
+// the estimator's reading, not the rate of any one minute in that hour, and
+// a rate recorded at find 30 % away from it stands.
+TEST(PoolLuckInputs, StoredRateIsRewrittenOnlyAgainstASampleOfItsOwnMinute)
+{
+    using FB = MiningInterface::FoundBlock;
+    const double R = 2.0e11, D = 9.5e7;
+    const double T = 1.0e9;
+    MiningInterface mi(false, nullptr, Blockchain::LITECOIN);
+    // Minute samples over [T - 2 h, T + 2 h]; then the node is down for six
+    // hours; then one sample, which reaches an hour back.
+    for (double t = T - 7200.0; t <= T + 7200.0; t += 60.0)
+        mi.add_luck_rate_sample(t, R, 0.0, D);
+    const double restart = T + 7200.0 + 6 * 3600.0;
+    mi.add_luck_rate_sample(restart, R, 0.0, D);
+
+    auto stored_row = [&](uint64_t height, unsigned tag, double ts, double rate) {
+        FB b;
+        b.height = height;
+        b.hash = hash_of(tag);
+        b.ts = static_cast<uint64_t>(ts);
+        b.status = MiningInterface::BlockStatus::confirmed;
+        b.chain = "LTC";
+        b.share_hash = b.hash;
+        b.miner = kMiner;
+        b.network_difficulty = D;
+        b.pool_hashrate = rate;
+        return b;
+    };
+    const std::vector<FB> on_disk = {
+        stored_row(3200000, 0x10, T - 3000.0, 1.2 * R),          // its minute agrees: kept
+        stored_row(3200010, 0x11, T - 1000.0, 1.3 * R),          // its minute contradicts: rewritten
+        stored_row(3200020, 0x12, T + 1000.0, 0.0),              // never recorded: filled in
+        stored_row(3200030, 0x13, restart - 3000.0, 1.3 * R),    // only the restart sample: kept
+        stored_row(3200040, 0x14, restart - 2000.0, 0.7 * R),    // only the restart sample: kept
+        stored_row(3200050, 0x15, restart - 1000.0, 4.0e6),      // not a pool rate: rewritten
+        stored_row(3200060, 0x16, T + 3 * 3600.0, 1.3 * R),      // no history at its time: kept
+    };
+    std::vector<FB> written;
+    mi.set_found_block_persistence(
+        [&written](const FB& b) { written.push_back(b); return true; },
+        [&on_disk]() { return on_disk; });
+    mi.load_persisted_found_blocks();
+
+    auto written_rate = [&](unsigned tag) {
+        double rate = -1.0;   // -1 = the row was not written back
+        for (const auto& b : written)
+            if (b.hash == hash_of(tag)) rate = b.pool_hashrate;
+        return rate;
+    };
+    EXPECT_DOUBLE_EQ(written_rate(0x10), -1.0);
+    EXPECT_NEAR(written_rate(0x11), R, R * 1e-9);
+    EXPECT_NEAR(written_rate(0x12), R, R * 1e-9);
+    EXPECT_DOUBLE_EQ(written_rate(0x13), -1.0) << "30 % from a reading that spans an hour";
+    EXPECT_DOUBLE_EQ(written_rate(0x14), -1.0);
+    EXPECT_NEAR(written_rate(0x15), R, R * 1e-9);
+    EXPECT_DOUBLE_EQ(written_rate(0x16), -1.0);
+
+    const auto recent = mi.rest_recent_blocks_at(restart + 60.0);
+    auto served = [&](unsigned tag) {
+        return num(find_row(recent, "hash", hash_of(tag)), "pool_hashrate_at_find");
+    };
+    EXPECT_NEAR(served(0x10), 1.2 * R, R * 1e-9);
+    EXPECT_NEAR(served(0x11), R, R * 1e-9);
+    EXPECT_NEAR(served(0x13), 1.3 * R, R * 1e-9);
+    EXPECT_NEAR(served(0x14), 0.7 * R, R * 1e-9);
+    EXPECT_NEAR(served(0x15), R, R * 1e-9);
+    EXPECT_NEAR(served(0x16), 1.3 * R, R * 1e-9);
+}
+
+// F6. The node feeds the history a sample a minute and kept every one for
+// 400 days: 576,000 segments, and a trim that shifted them all every minute.
+// Samples older than 31 days are now folded into hourly bins, a day's worth
+// at a time. A round over whole hours has the same effort as before; a row
+// the bins cover is never "repaired" against them.
+TEST(PoolLuckInputs, SamplesOlderThanAMonthAreFoldedIntoHourlyBins)
+{
+    using FB = MiningInterface::FoundBlock;
+    const double D = 1000.0;
+    const double T0 = 277778.0 * 3600.0;   // an hour boundary, ~1.0e9
+    const double hour = 3600.0, day = 86400.0;
+    MiningInterface mi(false, nullptr, Blockchain::LITECOIN);
+    // 34 days, a sample a minute. Within every hour the rate climbs from
+    // 1.0 to 1.983 x 2^32 H/s: the hour's mean is 1.4916(6) x 2^32.
+    const int minutes = 34 * 24 * 60;
+    for (int i = 1; i <= minutes; ++i)
+        mi.add_luck_rate_sample(T0 + 60.0 * i, (1.0 + ((i - 1) % 60) / 60.0) * kT32, 0.0, D);
+    const double mean = 1.0 + 29.5 / 60.0;
+
+    // 31 to 32 days of minute samples, the rest in hourly bins (unfolded:
+    // 48,960 segments here, 576,000 after 400 days).
+    const size_t held = mi.luck_rate_history_size();
+    EXPECT_LE(held, static_cast<size_t>(32 * 1440 + 3 * 24 + 2));
+    EXPECT_GE(held, static_cast<size_t>(31 * 1440));
+
+    // Stored rows: each found in the first minute of an hour (the sample of
+    // that minute reads 1.0 x 2^32) and stored at the hour's mean, 49 % up.
+    auto stored_row = [&](uint64_t height, unsigned tag, double ts) {
+        FB b;
+        b.height = height;
+        b.hash = hash_of(tag);
+        b.ts = static_cast<uint64_t>(ts);
+        b.status = MiningInterface::BlockStatus::confirmed;
+        b.chain = "LTC";
+        b.share_hash = b.hash;
+        b.miner = kMiner;
+        b.network_difficulty = D;
+        b.pool_hashrate = mean * kT32;
+        return b;
+    };
+    const std::vector<FB> on_disk = {
+        stored_row(100, 0x20, T0 + 6 * hour + 30.0),               // 34 days old: binned
+        stored_row(101, 0x21, T0 + 30 * hour + 30.0),              // 33 days old: binned
+        stored_row(102, 0x22, T0 + 20 * day + 6 * hour + 30.0),    // 14 days old: minute samples
+    };
+    std::vector<FB> written;
+    mi.set_found_block_persistence(
+        [&written](const FB& b) { written.push_back(b); return true; },
+        [&on_disk]() { return on_disk; });
+    mi.load_persisted_found_blocks();
+
+    // Only the row its own minute contradicts is rewritten.
+    ASSERT_EQ(written.size(), 1u);
+    EXPECT_EQ(written[0].hash, hash_of(0x22));
+    EXPECT_NEAR(written[0].pool_hashrate, kT32, kT32 * 1e-9);
+
+    const auto recent = mi.rest_recent_blocks_at(T0 + 34 * day);
+    // The round over 24 whole hours of bins: 24 h at the hourly mean.
+    const auto old_round = find_row(recent, "hash", hash_of(0x21));
+    const double effort = 24 * hour * mean / D;
+    EXPECT_EQ(str(old_round, "effort_method"), "integrated") << old_round.dump(1);
+    EXPECT_NEAR(num(old_round, "effort"), effort, effort * 1e-9);
+    EXPECT_NEAR(num(old_round, "history_coverage"), 1.0, 1e-9);
+    EXPECT_NEAR(num(old_round, "pool_hashrate_at_find"), mean * kT32, kT32 * 1e-9);
+    EXPECT_EQ(str(old_round, "pool_hashrate_source"), "recorded");
+    // The 19-day round that runs from the bins into the minute samples: the
+    // same mean throughout, but for its last 30 s -- the first half of a
+    // minute sampled at 1.0, where a bin would have said the hour's mean.
+    const auto fine_round = find_row(recent, "hash", hash_of(0x22));
+    const double long_seconds = 20 * day + 6 * hour - 30 * hour;
+    const double long_effort = ((long_seconds - 30.0) * mean + 30.0 * 1.0) / D;
+    EXPECT_NEAR(num(fine_round, "effort"), long_effort, long_effort * 1e-9);
+    EXPECT_NEAR(num(fine_round, "pool_hashrate_at_find"), kT32, kT32 * 1e-9);
 }
