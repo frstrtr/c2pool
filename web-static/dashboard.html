@@ -2587,12 +2587,40 @@
             return d3.format('.2f')(d) + ' P';
         }
 
+        // BEGIN c2pDiffPeriod (tested by sharechain-explorer/tests/unit/dashboard-diff-period.test.ts)
+        // The block period a difficulty is turned into a hashrate at
+        // (difficulty x 2^32 / period): the block interval of the algorithm
+        // the difficulty belongs to. The node serves it as
+        // currency_info.algo_block_period where it is not the chain's
+        // block_period: on DGB each of five algorithms retargets to 75 s under
+        // a 15 s chain, and the node's own network_hashrate uses the 75 s.
+        // Else the chain's block_period; null when the node serves neither.
+        function c2pDifficultyBlockPeriod(info) {
+            if (info && info.algo_block_period > 0) return info.algo_block_period;
+            if (info && info.block_period > 0) return info.block_period;
+            return null;
+        }
+        // "N s block time", naming the algorithm's interval where it is not the chain's.
+        function c2pDifficultyBlockPeriodNote(info) {
+            var period = c2pDifficultyBlockPeriod(info);
+            if (period === null) return '';
+            if (info.block_period > 0 && info.block_period !== period)
+                return period + ' s, the block time of this algorithm (the chain\'s is ' + info.block_period + ' s)';
+            return period + ' s block time';
+        }
+        // END c2pDiffPeriod
+
         // A block's difficulty SHOWN as the hashrate it implies (difficulty x 2^32 /
         // block period), so miners can compare it with their own PH/s. The block
-        // period is the coin's own (currency_info.block_period; 150 s until loaded).
+        // period is the coin's own (c2pDifficultyBlockPeriod; 150 s until loaded).
         function block_period_sec() {
+            var own = c2pDifficultyBlockPeriod(window.currency_info);
+            if (own !== null) return own;
             return (typeof parentBlockPeriodMs !== 'undefined' && parentBlockPeriodMs > 0)
                 ? parentBlockPeriodMs / 1000 : 150;
+        }
+        function block_period_note() {
+            return c2pDifficultyBlockPeriodNote(window.currency_info) || (block_period_sec() + ' s block time');
         }
         function diff_as_hashrate(diff) {
             return format_hashrate(Math.floor(diff * Math.pow(2, 32) / block_period_sec()));
@@ -4790,7 +4818,7 @@
                     .attr('title', function(b) {
                         if (!b.network_difficulty) return '';
                         return 'Network ' + diff_detail(b.network_difficulty) +
-                            '\nShown as hashrate: difficulty x 2^32 / ' + block_period_sec() + ' s block time';
+                            '\nShown as hashrate: difficulty x 2^32 / ' + block_period_note();
                     });
                 tr.append('td')
                     .text(function(b) {
@@ -4803,7 +4831,7 @@
                             (b.network_difficulty
                                 ? '\n' + d3.format('.2f')(b.actual_hash_difficulty / b.network_difficulty) + 'x the network difficulty'
                                 : '') +
-                            '\nShown as hashrate: difficulty x 2^32 / ' + block_period_sec() + ' s block time';
+                            '\nShown as hashrate: difficulty x 2^32 / ' + block_period_note();
                     });
                 tr.append('td')
                     .attr('class', function(b) {
