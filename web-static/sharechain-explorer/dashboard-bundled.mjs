@@ -13,7 +13,7 @@ import {
   createHttpTransport,
   createRealtime,
   createHoverZoomPanel,
-} from './dist/sharechain-explorer.js?v=fc03fa60';
+} from './dist/sharechain-explorer.js?v=10b8f190';
 
 const params   = new URL(location.href).searchParams;
 const qsBase   = params.get('base');

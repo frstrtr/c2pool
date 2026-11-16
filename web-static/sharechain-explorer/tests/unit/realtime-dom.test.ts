@@ -31,7 +31,7 @@ interface MockTransport extends Transport {
 
 function makeTransport(opts: {
   window: { shares: ShareForClassify[] };
-  delta?: () => { shares: ShareForClassify[]; tip?: string };
+  delta?: () => { shares: ShareForClassify[]; tip?: string; fork_switch?: boolean };
 }): MockTransport {
   const subs: Array<(ev: TipEvent) => void> = [];
   return {
@@ -378,4 +378,63 @@ test('a failed start() leaves no resize listener, timer, frame or change listene
   } finally {
     fw.restore();
   }
+});
+
+// ── hasQueued is derived from the animator, not a mirror flag ─────
+
+function deltaFeed(): { delta: () => { shares: ShareForClassify[]; tip: string }; next: () => string } {
+  let n = 0;
+  let last = '';
+  return {
+    next() { n++; last = `d${n.toString(16).padStart(15, '0')}`; return last; },
+    delta: () => ({ shares: [sh(last)], tip: last }),
+  };
+}
+
+test('hasQueued: true while a plan waits, false once the animator starts it on its own', async () => {
+  const feed = deltaFeed();
+  const transport = makeTransport({ window: { shares: shares(20) }, delta: feed.delta });
+  const o = new RealtimeOrchestrator({ transport, userContext: CONTEXT, containerWidth: () => 800 });
+  await o.start();
+  transport.fireTip({ hash: feed.next(), height: 2 } as TipEvent);
+  await settle();
+  assert.equal(o.getState().animating, true);
+  assert.equal(o.getState().hasQueued, false);
+  transport.fireTip({ hash: feed.next(), height: 3 } as TipEvent);
+  await settle();
+  assert.equal(o.getState().hasQueued, true, 'second delta queued behind the first');
+  // Far past the first plan's end: tick() itself dequeues the second plan.
+  o.animationFrame(performance.now() + 120_000);
+  assert.equal(o.getState().hasQueued, false, 'no stale flag after the animator dequeues');
+  o.animationFrame(performance.now() + 240_000);
+  assert.equal(o.getState().animating, false);
+  assert.equal(o.getState().hasQueued, false);
+  await o.stop();
+});
+
+test('a full rebuild (fork switch) drops a plan queued against the old window', async () => {
+  const feed = deltaFeed();
+  let forkNext = false;
+  const transport = makeTransport({
+    window: { shares: shares(20) },
+    delta: () => (forkNext ? { ...feed.delta(), fork_switch: true } : feed.delta()),
+  });
+  const o = new RealtimeOrchestrator({ transport, userContext: CONTEXT, containerWidth: () => 800 });
+  await o.start();
+  transport.fireTip({ hash: feed.next(), height: 2 } as TipEvent);
+  await settle();
+  transport.fireTip({ hash: feed.next(), height: 3 } as TipEvent);
+  await settle();
+  assert.equal(o.getState().hasQueued, true);
+  // Reorg: the node now serves a different window (a few shares replaced).
+  const reorged = [sh('ffffffffffffff01'), sh('ffffffffffffff02'), ...shares(18)];
+  transport.fetchWindow = async () => ({ shares: reorged });
+  forkNext = true;
+  transport.fireTip({ hash: feed.next(), height: 4 } as TipEvent);
+  await settle();
+  await settle();
+  assert.equal(o.getState().hasQueued, false, 'the stale queued plan is dropped');
+  o.animationFrame(performance.now() + 120_000);  // finish the rebuild animation
+  assert.equal(o.getState().animating, false, 'nothing stale plays after the rebuild');
+  await o.stop();
 });
