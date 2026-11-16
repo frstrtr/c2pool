@@ -4476,6 +4476,10 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // consulted, i.e. during an actual embedded outage.
     const bool xcheck_wanted = (testnet || embedded_mainnet);
     work_source->set_gbt_xcheck(xcheck_wanted && static_cast<bool>(rpc));
+    // The xcheck's label aid (a collateral spend only dashd's template
+    // carries) needs the committed fold kept in the template: exactly where
+    // the xcheck runs, nowhere else (a daemonless node keeps nothing).
+    node_coin_state.set_xcheck_collateral_aid(xcheck_wanted && static_cast<bool>(rpc));
     // --embedded-tx-serve-own-set: serve own valid tx set on a divergent
     // mempool selection instead of the dashd-parity swap (DEFAULT OFF).
     work_source->set_tx_serve_own_set(embedded_tx_serve_own_set);

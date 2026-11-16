@@ -10,10 +10,10 @@
 // tx_spends_mn_collateral), nor its in-body descendants. dashd's miner takes
 // such a tx and removes the MN in FinishListForBlock's collateral loop, so
 // while the spend sits in the mempool the two templates commit different MN
-// roots — both valid for their own tx set. Testnet h=1592649: deletedMN
-// 8448db99…, collateral spent by type-0 74d628077f306e0d; the mined,
-// ChainLocked block committed dashd's root, and the embedded root equalled the
-// parent's (nothing else differed).
+// roots — both valid for their own tx set. (Testnet h=1592649 looked like
+// this but was NOT this class: the spend never reached our builder, so there
+// was nothing excluded to replay. That class, a spend only dashd's template
+// carries, has its own label: gbt_xcheck_dashd_only_collateral.hpp.)
 //
 // The rule (classification only — serving is UNCHANGED: any MN-root
 // difference still swaps to dashd's template in the caller). Explained iff ALL:

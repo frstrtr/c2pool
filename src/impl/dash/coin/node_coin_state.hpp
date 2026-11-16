@@ -464,6 +464,12 @@ public:
     void set_include_mn_special_txs(bool v) { m_include_mn_special_txs = v; }
     bool include_mn_special_txs() const { return m_include_mn_special_txs; }
 
+    /// GBT-xcheck label aid (gbt_xcheck_dashd_only_collateral.hpp): the
+    /// builder keeps its committed fold in the template so the xcheck can
+    /// label a collateral spend only dashd's template carries. main_dash sets
+    /// it exactly when it arms the GBT-xcheck; default OFF (nothing kept).
+    void set_xcheck_collateral_aid(bool v) { m_xcheck_collateral_aid = v; }
+
     /// B.9: the BLS verifier for the operator signature of ProUpServTx /
     /// ProUpRevTx in the types 1-4 fold — the builder's and the emit gate's
     /// (one context, sml_special_fold.hpp). c2pool-dash wires
@@ -2345,6 +2351,8 @@ public:
         // SUPERSET: include provider special txs (types 1-4) + fold them into
         // the committed merkleRootMNList. Default OFF (canary flag).
         e.include_mn_special_txs = m_include_mn_special_txs;
+        // GBT-xcheck label aid (never served; false => nothing kept).
+        e.want_xcheck_aid = m_xcheck_collateral_aid;
         // E-SUPERBLOCK: hand the resolved treasury schedule to the builder.
         // Empty at non-superblock heights and confidently-unfunded superblocks
         // (normal block); the winning trigger's payees at a funded superblock.
@@ -3007,6 +3015,8 @@ private:
     // Consumed by make_embedded_work_inputs (builder) and
     // embedded_template_emit_ok (matching folded-root emit-gate re-derivation).
     bool m_include_mn_special_txs{false};
+    // GBT-xcheck label aid requested (set_xcheck_collateral_aid). Default OFF.
+    bool m_xcheck_collateral_aid{false};
     MnFoldContext::OperatorSigFn m_protx_sig_verifier;   // B.9 (unset => refuse types 2/4)
     std::optional<ProTxCheckEnv> m_protx_check_env;      // Core CheckPro*Tx (unset => no provider tx rides)
     std::optional<MnhfCheckEnv>  m_mnhf_check_env;       // Core CheckMNHFTx (unset => no MNHF signal rides)

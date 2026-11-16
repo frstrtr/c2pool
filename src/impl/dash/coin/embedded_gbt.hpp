@@ -31,6 +31,7 @@
 #include <impl/dash/coin/mn_state_machine.hpp>
 #include <impl/dash/coin/sml_projection.hpp>    // confirmedHash rollover pass + collateral-spend predicate
 #include <impl/dash/coin/sml_special_fold.hpp>  // template-side types 1-4 MN-list fold (merkleRootMNList parity)
+#include <impl/dash/coin/gbt_xcheck_dashd_only_collateral.hpp>  // XcheckCollateralAid (label aid, never served)
 #include <impl/dash/coin/protx_check.hpp>       // Dash Core CheckPro*Tx for template selection
 #include <impl/dash/coin/mnhf_check.hpp>        // Dash Core CheckMNHFTx for type-7 signals
 #include <impl/dash/coin/service_update_order.hpp>  // Dash Core: service updates before a key change
@@ -791,7 +792,13 @@ inline DashWorkData build_embedded_workdata(
     const ProTxCheckEnv* protx_check_env = nullptr,
     // Dash Core's CheckMNHFTx for type-7 signals (mnhf_check.hpp). nullptr =>
     // no signal rides (they are not selected).
-    const MnhfCheckEnv* mnhf_check_env = nullptr)
+    const MnhfCheckEnv* mnhf_check_env = nullptr,
+    // GBT-xcheck label aid (gbt_xcheck_dashd_only_collateral.hpp): keep the
+    // committed fold's list and its collateral index in
+    // w.m_xcheck_collateral_aid. Only a node that runs the GBT-xcheck asks for
+    // it. false (default) => nothing kept; the template is byte-unchanged
+    // either way.
+    bool want_xcheck_aid = false)
 {
     DashWorkData w;
     w.m_height          = prev_height + 1;
@@ -1127,6 +1134,7 @@ inline DashWorkData build_embedded_workdata(
             // (bad-txns-inputs-missingorspent), and a dropped child that the
             // fold had applied changes the list, so the body is re-folded.
             // Every pass removes at least one tx, so this terminates.
+            CollateralOwnerIndex fold_owners;   // filled only for the xcheck aid
             for (;;) {
                 std::vector<MutableTransaction> body_for_fold;
                 body_for_fold.reserve(selected.size());
@@ -1136,7 +1144,7 @@ inline DashWorkData build_embedded_workdata(
                     [](const MutableTransaction& t) {
                         return dash::coin::dash_txid(t);
                     },
-                    fold_ctx);
+                    fold_ctx, want_xcheck_aid ? &fold_owners : nullptr);
                 bool dropped_descendant = false;
                 if (!fold.refused_ids.empty()) {
                     std::map<uint256, std::string> why;
@@ -1179,6 +1187,16 @@ inline DashWorkData build_embedded_workdata(
                 // counted as spends, so this fold IS the fold of the body that
                 // remains.
                 mn_folded_sml = std::move(fold.sml);
+                // GBT-xcheck LABEL aid (never served): this committed fold's
+                // list and the collateral index the fold resolved for it, for
+                // a spend only dashd's template carries
+                // (gbt_xcheck_dashd_only_collateral.hpp).
+                if (want_xcheck_aid) {
+                    auto aid = std::make_shared<XcheckCollateralAid>();
+                    aid->folded = *mn_folded_sml;
+                    aid->owners = std::move(fold_owners);
+                    w.m_xcheck_collateral_aid = std::move(aid);
+                }
                 if (fold.applied > 0 || fold.collateral_removed > 0)
                     LOG_INFO << "[GBT-EMB] types 1-4 MN-list fold h="
                              << (prev_height + 1) << " applied=" << fold.applied
