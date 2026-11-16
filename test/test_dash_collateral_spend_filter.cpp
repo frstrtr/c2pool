@@ -639,10 +639,10 @@ TEST(DashBodyTopology, BuilderCpfpTemplatePassesTheGateAndFailsItWithoutTheParen
 
 // ════════════════════════════════════════════════════════════════════════
 // GBT-xcheck LABEL: an MN-root difference explained EXACTLY by the
-// collateral spends the builder excludes (testnet h=1592649: dashd took a
-// type-0 spend of MN 8448db99…'s collateral, the embedded template excluded
-// it, the roots legitimately differed). Classification only — serving is
-// unchanged (stratum/work_source.cpp still swaps to dashd on ANY root diff).
+// collateral spends the builder excludes (dashd takes a type-0 spend of an
+// MN's collateral, the embedded template excludes it, the roots legitimately
+// differ). Classification only — serving is unchanged
+// (stratum/work_source.cpp still swaps to dashd on ANY root diff).
 // ════════════════════════════════════════════════════════════════════════
 
 #include <impl/dash/coin/gbt_xcheck_collateral.hpp>
@@ -669,7 +669,8 @@ CSimplifiedMNList two_entry_sml(bool with_victim) {
 
 DashWorkData build_daemonless(const MnStateMachine& mnstates, Mempool& mp,
                               const CSimplifiedMNList& sml,
-                              dash::coin::QuorumManager& qmgr) {
+                              dash::coin::QuorumManager& qmgr,
+                              bool want_xcheck_aid = false) {
     return build_embedded_workdata(
         H - 1, raw256(0xAB), mnstates, mp, 0x1b104be3u, 1'700'000'000u,
         DASH_PUBKEY_VER, DASH_P2SH_VER, 1'700'000'100u, 0x20000000u, nullptr,
@@ -678,7 +679,7 @@ DashWorkData build_daemonless(const MnStateMachine& mnstates, Mempool& mp,
         dash::coin::DASH_MN_MIN_CONFIRMATIONS_MAINNET, /*suppress=*/false,
         "utxo-immature-serving", nullptr, false, nullptr,
         /*include_mn_special_txs=*/true, nullptr, nullptr, nullptr,
-        /*v24_active=*/false, nullptr, nullptr);
+        /*v24_active=*/false, nullptr, nullptr, want_xcheck_aid);
 }
 
 uint256 committed_mnroot(const DashWorkData& w) {
@@ -760,7 +761,7 @@ struct XcheckCase {
 } // namespace
 
 // RED on master (the classifier does not exist; every MN-root diff was a
-// hard mismatch): the h=1592649 shape is explained.
+// hard mismatch): an excluded spend dashd took is explained.
 TEST(DashXcheckCollateral, ExactCollateralExplanationIsLabelledExplained) {
     EXPECT_EQ(XcheckCase{}.run(), MnRootXcheck::CollateralExplained);
 }
@@ -801,4 +802,211 @@ TEST(DashXcheckCollateral, NothingExcludedIsAMismatch) {
     XcheckCase c;
     c.excluded.clear();
     EXPECT_EQ(c.run(), MnRootXcheck::Mismatch);
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// GBT-xcheck step 0b: an MN-root difference explained EXACTLY by collateral
+// spends only dashd's template carries — txs our candidate set never had
+// (testnet h=1592649: the spend never reached the builder's filter).
+// Separate label (gbt-xcheck-modulo-dashd-only-collateral); classification
+// only — serving is unchanged.
+// ════════════════════════════════════════════════════════════════════════
+
+#include <impl/dash/coin/gbt_xcheck_dashd_only_collateral.hpp>
+
+namespace {
+
+using dash::coin::DashdOnlyCollateral;
+using dash::coin::XcheckCollateralAid;
+using dash::coin::apply_appended_collateral_spends;
+using dash::coin::classify_dashd_only_collateral;
+using DashTx = dash::coin::Transaction;
+
+// Our side of the h=1592649 shape: our pool holds only an innocent tx (the
+// collateral spend never reached us), the builder keeps its fold.
+struct DashdOnlyShape {
+    UTXOViewCache utxo{nullptr};
+    Mempool mp;
+    uint256 collat = raw256(0xC0);
+    MutableTransaction innocent, spend;
+    CSimplifiedMNList sml = two_entry_sml(/*with_victim=*/true);
+    dash::coin::QuorumManager qmgr;
+    MnStateMachine mnstates = mn_set_with_collateral(raw256(0xC0), 0);
+    DashWorkData w;
+
+    DashdOnlyShape() {
+        mp.set_utxo(&utxo);
+        const uint256 p0 = mint_hash(0x50);
+        utxo.add_coin(Outpoint(p0, 0), Coin(100'000, {}, 1, false));
+        innocent = make_spend(p0, 0, 90'000, /*salt=*/1);
+        spend = make_spend(collat, 0, 99'999'950'000LL, /*salt=*/2);   // NOT pooled
+        EXPECT_TRUE(mp.add_tx(innocent));
+        w = build_daemonless(mnstates, mp, sml, qmgr, /*want_xcheck_aid=*/true);
+    }
+    // dashd's body: the innocent tx plus the spend we never had.
+    std::vector<DashTx> dashd_txs() const { return {DashTx(innocent), DashTx(spend)}; }
+    std::vector<uint256> dashd_ids() const {
+        return {dash::coin::dash_txid(innocent), dash::coin::dash_txid(spend)};
+    }
+    dash::coin::DashdOnlyCollateralVerdict run(const std::vector<DashTx>& txs,
+                                               const std::vector<uint256>& ids,
+                                               const uint256& dashd_root,
+                                               bool quorums_equal = true,
+                                               const XcheckCollateralAid* aid_override = nullptr,
+                                               bool use_override = false) const {
+        return classify_dashd_only_collateral(
+            use_override ? aid_override : w.m_xcheck_collateral_aid.get(),
+            committed_mnroot(w), dashd_root, quorums_equal, w.m_tx_hashes,
+            w.m_xcheck_collateral_excluded_txids, ids, txs);
+    }
+};
+
+} // namespace
+
+// RED on master (no aid, no replay): the fold's exported collateral index,
+// replayed for the excluded spend chain, gives EXACTLY the root of #2244's
+// full re-fold — the two paths agree, so the dashd-only label uses the same
+// collateral loop the committed fold runs.
+TEST(DashXcheckDashdOnlyCollateral, AidReplayEqualsTheFullRefoldOfTheExcludedSpend) {
+    UTXOViewCache utxo(nullptr);
+    Mempool mp;
+    mp.set_utxo(&utxo);
+    const uint256 p0 = mint_hash(0x50);
+    utxo.add_coin(Outpoint(p0, 0), Coin(100'000, {}, 1, false));
+    const auto innocent = make_spend(p0, 0, 90'000, /*salt=*/1);
+    const uint256 collat = raw256(0xC0);
+    utxo.add_coin(Outpoint(collat, 0), Coin(100'000'000'000LL, {}, 1, false));
+    const auto spend = make_spend(collat, 0, 99'999'950'000LL, /*salt=*/2);
+    const auto child = make_spend(dash::coin::dash_txid(spend), 0, 99'999'940'000LL, /*salt=*/3);
+    ASSERT_TRUE(mp.add_tx(innocent));
+    ASSERT_TRUE(mp.add_tx(spend));
+    ASSERT_TRUE(mp.add_tx(child));
+    const auto sml = two_entry_sml(true);
+    dash::coin::QuorumManager qmgr;
+    const auto mnstates = mn_set_with_collateral(collat, 0);
+    const auto w = build_daemonless(mnstates, mp, sml, qmgr, /*want_xcheck_aid=*/true);
+
+    ASSERT_TRUE(w.m_xcheck_collateral_aid) << "builder kept no fold for the xcheck";
+    const auto& aid = *w.m_xcheck_collateral_aid;
+    EXPECT_EQ(aid.folded.CalcMerkleRoot(), committed_mnroot(w));
+    EXPECT_EQ(aid.owners.size(), 2u);   // both listed MNs, each by its own collateral
+    ASSERT_FALSE(w.m_xcheck_collateral_alt_mnroot.IsNull());
+    unsigned removed = 0;
+    const auto replay = apply_appended_collateral_spends(
+        aid.folded, aid.owners, std::vector<MutableTransaction>{spend, child}, &removed);
+    EXPECT_EQ(removed, 1u);
+    EXPECT_EQ(replay.CalcMerkleRoot(), w.m_xcheck_collateral_alt_mnroot);
+    EXPECT_EQ(replay.CalcMerkleRoot(), two_entry_sml(false).CalcMerkleRoot());
+}
+
+// Guard: a node that does not ask keeps nothing, and asking never changes the
+// template (body and CbTx byte-equal).
+TEST(DashXcheckDashdOnlyCollateral, AidIsOptInAndNeverChangesTheTemplate) {
+    UTXOViewCache utxo(nullptr);
+    Mempool mp;
+    mp.set_utxo(&utxo);
+    const uint256 p0 = mint_hash(0x50);
+    utxo.add_coin(Outpoint(p0, 0), Coin(100'000, {}, 1, false));
+    ASSERT_TRUE(mp.add_tx(make_spend(p0, 0, 90'000, /*salt=*/1)));
+    const auto sml = two_entry_sml(true);
+    dash::coin::QuorumManager qmgr;
+    const auto mnstates = mn_set_with_collateral(raw256(0xC1), 0);
+    const auto off = build_daemonless(mnstates, mp, sml, qmgr);
+    const auto on  = build_daemonless(mnstates, mp, sml, qmgr, /*want_xcheck_aid=*/true);
+    EXPECT_FALSE(off.m_xcheck_collateral_aid);
+    EXPECT_TRUE(on.m_xcheck_collateral_aid);
+    EXPECT_EQ(off.m_coinbase_payload, on.m_coinbase_payload);
+    EXPECT_EQ(off.m_tx_hashes, on.m_tx_hashes);
+    EXPECT_EQ(off.m_coinbase_value, on.m_coinbase_value);
+}
+
+// RED on master: the h=1592649 shape. The spend is only in dashd's body; its
+// collateral loop removes the victim, giving dashd's root exactly.
+TEST(DashXcheckDashdOnlyCollateral, SpendOnlyDashdCarriesIsExplained) {
+    DashdOnlyShape c;
+    ASSERT_EQ(c.w.m_tx_hashes.size(), 1u);
+    ASSERT_TRUE(c.w.m_xcheck_collateral_excluded_txids.empty());   // never reached the filter
+    const auto v = c.run(c.dashd_txs(), c.dashd_ids(), two_entry_sml(false).CalcMerkleRoot());
+    EXPECT_EQ(v.verdict, DashdOnlyCollateral::Explained) << v.why;
+    EXPECT_EQ(v.dashd_only, 1u);
+    EXPECT_EQ(v.spends, 1u);
+    EXPECT_EQ(v.removed, 1u);
+    EXPECT_EQ(v.alt_mnroot, two_entry_sml(false).CalcMerkleRoot());
+}
+
+TEST(DashXcheckDashdOnlyCollateral, QuorumRootDifferenceIsNeverExplained) {
+    DashdOnlyShape c;
+    const auto v = c.run(c.dashd_txs(), c.dashd_ids(), two_entry_sml(false).CalcMerkleRoot(),
+                         /*quorums_equal=*/false);
+    EXPECT_EQ(v.verdict, DashdOnlyCollateral::Mismatch);
+}
+
+TEST(DashXcheckDashdOnlyCollateral, NoAidIsAMismatch) {
+    DashdOnlyShape c;
+    const auto v = c.run(c.dashd_txs(), c.dashd_ids(), two_entry_sml(false).CalcMerkleRoot(),
+                         true, nullptr, /*use_override=*/true);
+    EXPECT_EQ(v.verdict, DashdOnlyCollateral::Mismatch);
+}
+
+// An aid that is not the list the template committed explains nothing.
+TEST(DashXcheckDashdOnlyCollateral, AidNotTheCommittedListIsAMismatch) {
+    DashdOnlyShape c;
+    XcheckCollateralAid other = *c.w.m_xcheck_collateral_aid;
+    other.folded = two_entry_sml(false);
+    const auto v = c.run(c.dashd_txs(), c.dashd_ids(), two_entry_sml(false).CalcMerkleRoot(),
+                         true, &other, /*use_override=*/true);
+    EXPECT_EQ(v.verdict, DashdOnlyCollateral::Mismatch);
+}
+
+TEST(DashXcheckDashdOnlyCollateral, ReplayNotEqualToDashdRootIsAMismatch) {
+    DashdOnlyShape c;
+    const auto v = c.run(c.dashd_txs(), c.dashd_ids(), raw256(0x33));
+    EXPECT_EQ(v.verdict, DashdOnlyCollateral::Mismatch);
+}
+
+// DIRECTOR's case: the spend is in BOTH sets, yet the roots differ — it is
+// not dashd-only and explains nothing.
+TEST(DashXcheckDashdOnlyCollateral, SpendPresentInBothSetsYetRootsDifferIsAMismatch) {
+    DashdOnlyShape c;
+    auto ours = c.w.m_tx_hashes;
+    ours.push_back(dash::coin::dash_txid(c.spend));
+    const auto v = classify_dashd_only_collateral(
+        c.w.m_xcheck_collateral_aid.get(), committed_mnroot(c.w),
+        two_entry_sml(false).CalcMerkleRoot(), true, ours,
+        c.w.m_xcheck_collateral_excluded_txids, c.dashd_ids(), c.dashd_txs());
+    EXPECT_EQ(v.verdict, DashdOnlyCollateral::Mismatch);
+}
+
+// A provider tx only dashd carries changes leaves a collateral loop cannot
+// account for: never explained, even next to a matching spend.
+TEST(DashXcheckDashdOnlyCollateral, DashdOnlyProviderTxIsAMismatch) {
+    DashdOnlyShape c;
+    MutableTransaction pro;
+    pro.version = 3; pro.type = dash::coin::tx_type::PROVIDER_UPDATE_SERVICE; pro.locktime = 7;
+    auto txs = c.dashd_txs();
+    auto ids = c.dashd_ids();
+    txs.emplace_back(pro);
+    ids.push_back(dash::coin::dash_txid(pro));
+    const auto v = c.run(txs, ids, two_entry_sml(false).CalcMerkleRoot());
+    EXPECT_EQ(v.verdict, DashdOnlyCollateral::Mismatch);
+}
+
+// Spends our builder excluded are the #2244 class, not this one.
+TEST(DashXcheckDashdOnlyCollateral, SpendsAllBuilderExcludedAreNotThisLabel) {
+    DashdOnlyShape c;
+    const std::vector<uint256> excluded{dash::coin::dash_txid(c.spend)};
+    const auto v = classify_dashd_only_collateral(
+        c.w.m_xcheck_collateral_aid.get(), committed_mnroot(c.w),
+        two_entry_sml(false).CalcMerkleRoot(), true, c.w.m_tx_hashes, excluded,
+        c.dashd_ids(), c.dashd_txs());
+    EXPECT_EQ(v.verdict, DashdOnlyCollateral::Mismatch);
+}
+
+TEST(DashXcheckDashdOnlyCollateral, DashdOnlyTxSpendingNoCollateralIsAMismatch) {
+    DashdOnlyShape c;
+    const auto unrelated = make_spend(mint_hash(0x61), 0, 1'000, /*salt=*/9);
+    const std::vector<DashTx> txs{DashTx(c.innocent), DashTx(unrelated)};
+    const std::vector<uint256> ids{dash::coin::dash_txid(c.innocent), dash::coin::dash_txid(unrelated)};
+    const auto v = c.run(txs, ids, two_entry_sml(false).CalcMerkleRoot());
+    EXPECT_EQ(v.verdict, DashdOnlyCollateral::Mismatch);
 }

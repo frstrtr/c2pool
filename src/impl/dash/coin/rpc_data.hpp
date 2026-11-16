@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 #include <cstdint>
+#include <memory>
 
 #include <core/uint256.hpp>
 #include <nlohmann/json.hpp>
@@ -17,6 +18,11 @@ namespace dash
 {
 namespace coin
 {
+
+// gbt_xcheck_dashd_only_collateral.hpp: the committed fold kept for the
+// GBT-xcheck label (DashWorkData::m_xcheck_collateral_aid). Complete only
+// where it is built (embedded_gbt.hpp) and read (stratum/work_source.cpp).
+struct XcheckCollateralAid;
 
 // One masternode / superblock / platform payment entry after normalization.
 // payee == "!" + hex_script when the payment is a raw script (OP_RETURN
@@ -202,7 +208,7 @@ struct DashWorkData {
     // collateral (sml_projection.hpp tx_spends_mn_collateral), plus its
     // in-body descendants. dashd's miner includes such a tx and removes the
     // MN, so the two templates' merkleRootMNList legitimately differ while
-    // the spend sits in the mempool (testnet h=1592649).
+    // the spend sits in the mempool.
     //
     // m_xcheck_collateral_alt_mnroot is the root the builder's OWN fold
     // (fold_mn_special_txs, same projected list, same fold context as the
@@ -213,6 +219,15 @@ struct DashWorkData {
     // consensus path reads these fields.
     uint256              m_xcheck_collateral_alt_mnroot;
     std::vector<uint256> m_xcheck_collateral_excluded_txids;
+
+    // ── GBT-XCHECK CLASSIFICATION AID: COLLATERAL SPENDS ONLY DASHD HAS ───
+    // The committed fold's result list and its collateral index
+    // (gbt_xcheck_dashd_only_collateral.hpp), for a spend our candidate set
+    // never had (testnet h=1592649: not in our pool, so no builder exclusion).
+    // Set only when the node runs the GBT-xcheck (want_xcheck_aid); null
+    // otherwise, so a daemonless node pays nothing. Shared, never served, and
+    // no consensus path reads it.
+    std::shared_ptr<const XcheckCollateralAid> m_xcheck_collateral_aid;
 
     // Per-entry "this tx spends an output of an EARLIER entry of the same
     // probe set" flag, parallel to whichever probe set is populated (the
