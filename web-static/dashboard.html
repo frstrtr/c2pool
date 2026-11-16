@@ -26,6 +26,8 @@
             --text: #e0e0e0;
             --text-muted: #8888a0;
             --border: #3a3a5a;
+            --pace-fast: #00d4ff;
+            --pace-slow: #a78bfa;
         }
         
         * {
@@ -676,6 +678,42 @@
             color: var(--warning);
             font-weight: 600;
         }
+
+        /* Block pace (effort = time taken / expected time): a fast block is
+           cyan, a slow one violet. Slow is not red: a long round is chance,
+           not a fault. */
+        .pace-fast { color: var(--pace-fast); }
+        .pace-slow { color: var(--pace-slow); }
+        .pace-strong { font-weight: 700; }
+        .effort-unknown { color: var(--text-muted); }
+        /* Duplet bracket down the first cell of the pair's rows: a dashed
+           edge, with a tick on the later (upper) and the earlier (lower) row. */
+        td.duplet-edge { position: relative; border-left: 2px dashed var(--pace-fast); }
+        /* The tags and the pill widen the Recent Blocks table: in a narrow
+           panel the Round cell wraps, not the time or the difficulties. */
+        #blocks td:first-child, #blocks td:nth-child(6), #blocks td:nth-child(7) { white-space: nowrap; }
+        td.duplet-top::before, td.duplet-bottom::after {
+            content: '';
+            position: absolute;
+            left: 0;
+            width: 9px;
+            border-top: 2px dashed var(--pace-fast);
+        }
+        td.duplet-top::before { top: 0; }
+        td.duplet-bottom::after { bottom: 0; }
+        .duplet-pill {
+            display: inline-block;
+            margin-left: 6px;
+            padding: 0 6px;
+            border: 1px dashed var(--pace-fast);
+            border-radius: 10px;
+            color: var(--pace-fast);
+            font-size: 10px;
+            font-weight: 400;
+            white-space: nowrap;
+            cursor: help;
+        }
+        .luck-ci { margin-left: 4px; font-size: 0.7em; font-weight: 400; color: var(--text-muted); }
         
         /* Collapsible Miner Rows */
         .miner-row {
@@ -1990,7 +2028,7 @@
                         <div class="legend-item disabled" data-series="workers" onclick="toggleSeries('workers', this)" title="Click to toggle worker connections"><span class="legend-color" style="background: #9c27b0;"></span><span>Workers</span></div>
                         <div class="legend-item" data-series="miners" onclick="toggleSeries('miners', this)" title="Click to toggle unique miner addresses"><span class="legend-color" style="background: #673ab7;"></span><span>Miners</span></div>
                         <div class="legend-item" data-series="connected" onclick="toggleSeries('connected', this)" title="Click to toggle connected miners (all connections)"><span class="legend-color" style="background: #e91e63;"></span><span>Connected</span></div>
-                        <div class="legend-item" data-series="lucktrend" onclick="toggleSeries('lucktrend', this)" title="Click to toggle luck trend line"><span class="legend-color" style="background: #ffc107;"></span><span>Luck</span></div>
+                        <div class="legend-item" data-series="lucktrend" onclick="toggleSeries('lucktrend', this)" title="Click to toggle the luck line: the pooled luck of the last 10 rounds (blocks found / blocks expected), the open round included"><span class="legend-color" style="background: #ffc107;"></span><span>Luck</span></div>
                         <div class="legend-item disabled" data-series="netdiff" onclick="toggleSeries('netdiff', this)" title="Click to toggle network difficulty"><span class="legend-color" style="background: #8b5cf6;"></span><span>Net Diff</span></div>
                         <div class="legend-item" data-series="local" onclick="toggleSeries('local', this)" title="Click to toggle THIS node's own hashrate (as distinct from the pool total)"><span class="legend-color" style="background: #00d4ff;"></span><span>Local</span></div>
                         <div class="legend-item disabled" data-series="localdoa" onclick="toggleSeries('localdoa', this)" title="Click to toggle this node's dead-on-arrival hashrate"><span class="legend-color" style="background: #ff8800;"></span><span>Local DOA</span></div>
@@ -2002,7 +2040,7 @@
                         <div class="graph-stat"><div class="graph-stat-label">Average</div><div class="graph-stat-value" id="graph-average">-</div></div>
                         <div class="graph-stat"><div class="graph-stat-label">Peak</div><div class="graph-stat-value" id="graph-peak">-</div></div>
                         <div class="graph-stat" title="Worker connections / Unique payout addresses"><div class="graph-stat-label">Workers/Miners</div><div class="graph-stat-value" id="graph-miners">-</div></div>
-                        <div class="graph-stat"><div class="graph-stat-label">Avg Luck</div><div class="graph-stat-value" id="graph-luck">-</div></div>
+                        <div class="graph-stat"><div class="graph-stat-label" id="graph-luck-label">Pool Luck</div><div class="graph-stat-value" id="graph-luck">-</div></div>
                     </div>
                     <div class="graph-diagnostic" id="hashrate-diagnostic" style="margin: 6px 0 2px; font-size: 12px; color: var(--text-muted);" title="Effective hashrate the pool's found blocks imply (exact Poisson 95% confidence interval on the block rate), versus the hashrate the miners report. If reported sits outside the interval, the rigs are not delivering what they claim.">-</div>
                 </div>
@@ -2026,7 +2064,7 @@
                     <div class="legend-item legend-key" title="Orphaned block: another block won its height" style="font-size: 14px; padding: 6px 12px;"><span class="legend-color legend-orphan" style="width: 14px; height: 14px;"></span><span>Orphaned</span></div>
                     <div class="legend-item disabled" data-series="workers" onclick="toggleSeries('workers', this)" title="Click to toggle worker connections" style="font-size: 14px; padding: 6px 12px;"><span class="legend-color" style="background: #9c27b0; width: 14px; height: 14px;"></span><span>Workers</span></div>
                     <div class="legend-item" data-series="miners" onclick="toggleSeries('miners', this)" title="Click to toggle unique miner addresses" style="font-size: 14px; padding: 6px 12px;"><span class="legend-color" style="background: #673ab7; width: 14px; height: 14px;"></span><span>Miners</span></div>
-                    <div class="legend-item" data-series="lucktrend" onclick="toggleSeries('lucktrend', this)" title="Click to toggle luck trend line" style="font-size: 14px; padding: 6px 12px;"><span class="legend-color" style="background: #ffc107; width: 14px; height: 14px;"></span><span>Luck</span></div>
+                    <div class="legend-item" data-series="lucktrend" onclick="toggleSeries('lucktrend', this)" title="Click to toggle the luck line: the pooled luck of the last 10 rounds (blocks found / blocks expected), the open round included" style="font-size: 14px; padding: 6px 12px;"><span class="legend-color" style="background: #ffc107; width: 14px; height: 14px;"></span><span>Luck</span></div>
                     <div class="legend-item disabled" data-series="netdiff" onclick="toggleSeries('netdiff', this)" title="Click to toggle network difficulty" style="font-size: 14px; padding: 6px 12px;"><span class="legend-color" style="background: #8b5cf6; width: 14px; height: 14px;"></span><span>Net Diff</span></div>
                     <div class="legend-item" data-series="local" onclick="toggleSeries('local', this)" title="Click to toggle THIS node's own hashrate (as distinct from the pool total)" style="font-size: 14px; padding: 6px 12px;"><span class="legend-color" style="background: #00d4ff; width: 14px; height: 14px;"></span><span>Local</span></div>
                     <div class="legend-item disabled" data-series="localdoa" onclick="toggleSeries('localdoa', this)" title="Click to toggle this node's dead-on-arrival hashrate" style="font-size: 14px; padding: 6px 12px;"><span class="legend-color" style="background: #ff8800; width: 14px; height: 14px;"></span><span>Local DOA</span></div>
@@ -2040,7 +2078,7 @@
                 <div class="fullscreen-stat"><div class="fullscreen-stat-label">Average</div><div class="fullscreen-stat-value" id="fs-graph-average">-</div></div>
                 <div class="fullscreen-stat"><div class="fullscreen-stat-label">Peak</div><div class="fullscreen-stat-value" id="fs-graph-peak">-</div></div>
                 <div class="fullscreen-stat" title="Worker connections / Unique payout addresses"><div class="fullscreen-stat-label">Workers/Miners</div><div class="fullscreen-stat-value" id="fs-graph-miners">-</div></div>
-                <div class="fullscreen-stat"><div class="fullscreen-stat-label">Avg Luck</div><div class="fullscreen-stat-value" id="fs-graph-luck">-</div></div>
+                <div class="fullscreen-stat"><div class="fullscreen-stat-label" id="fs-graph-luck-label">Pool Luck</div><div class="fullscreen-stat-value" id="fs-graph-luck">-</div></div>
             </div>
             <div class="fullscreen-diagnostic" id="fs-hashrate-diagnostic" style="margin: 8px 16px; font-size: 13px; color: var(--text-muted);">-</div>
         </div>
@@ -2093,9 +2131,10 @@
                     <h2>🏆 Recent Blocks</h2>
                     <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
                         <span class="badge" id="blocks_count">0</span>
-                        <span class="badge" id="luck_current_round" style="background: var(--primary);" title="Current round luck">Round: -</span>
-                        <span class="badge" id="luck_seven_days" style="background: var(--primary);" title="7-day average luck">7d: -</span>
-                        <span class="badge" id="luck_thirty_days" style="background: var(--primary);" title="30-day average luck">30d: -</span>
+                        <span class="badge" id="luck_current_round" style="display: none; background: var(--primary); cursor: help;" title="Open round: time since the last pool block against the expected time">Round —</span>
+                        <span class="badge" id="luck_seven_days" style="background: var(--primary); cursor: help;" title="Pool luck, 7 days">7d: —</span>
+                        <span class="badge" id="luck_thirty_days" style="background: var(--primary); cursor: help;" title="Pool luck, 30 days">30d: —</span>
+                        <span class="badge" id="luck_ninety_days" style="background: var(--primary); cursor: help;" title="Pool luck, 90 days">90d: —</span>
                     </div>
                 </div>
                 <div class="table-scroll">
@@ -2105,8 +2144,8 @@
                                 <th>Time</th>
                                 <th>Height</th>
                                 <th>Block Hash</th>
-                                <th>Luck</th>
-                                <th title="Time to find block (actual/expected)">Round</th>
+                                <th title="Round duration vs. expected (p2pool.info: 'vs. Expected'). Under 100% the round was faster than expected, i.e. lucky. Luck = 1 / effort is in each cell's tooltip.">Effort</th>
+                                <th title="Round duration: actual / expected. ⚡ under ⅓ of the expected time, 🐢 over 2×.">Round</th>
                                 <th title="Network difficulty, shown as the hashrate it implies at this coin's block time (hover a cell for the difficulty)">Net Diff</th>
                                 <th title="Difficulty the found block hash met, shown as the hashrate it implies at this coin's block time (hover a cell for the difficulty)">Hash Diff</th>
                                 <th title="Block status">✓</th>
@@ -2135,6 +2174,7 @@
                                 <th>Time</th>
                                 <th>Network</th>
                                 <th>Height</th>
+                                <th title="Round duration vs. expected on this merged chain, at its own difficulty. Under 100% the round was faster than expected.">Effort</th>
                                 <th>Block Hash</th>
                                 <th>Miner</th>
                                 <th title="Block status">✓</th>
@@ -2576,10 +2616,15 @@
         function block_is_stale(b) {
             return !!b && b.status === 'stale';
         }
+        // A find the node says is not on the coin chain (`main_chain` false)
+        // though neither orphaned nor stale: it never confirmed.
+        function block_is_unconfirmed_find(b) {
+            return !!b && b.main_chain === false && !block_is_orphaned(b) && !block_is_stale(b);
+        }
         function block_marker_style(b, luckColor) {
             if (block_is_orphaned(b))
                 return { fillColor: '#6b7280', lineColor: '#ef4444', symbol: 'triangle-down' };
-            if (block_is_stale(b))
+            if (block_is_stale(b) || block_is_unconfirmed_find(b))
                 return { fillColor: '#4b5563', lineColor: '#9ca3af', symbol: 'square' };
             return { fillColor: luckColor, lineColor: '#00ff88', symbol: 'diamond' };
         }
@@ -2588,6 +2633,8 @@
                 return '<span style="color:#ef4444">▼</span> <b>Block Orphaned</b><br/>';
             if (block_is_stale(b))
                 return '<span style="color:#9ca3af">■</span> <b>Stale Block</b><br/>';
+            if (block_is_unconfirmed_find(b))
+                return '<span style="color:#9ca3af">■</span> <b>Not on the coin chain</b><br/>';
             return '<span style="color:#00ff88">◆</span> <b>Block Found!</b><br/>';
         }
         function block_status_html(b) {
@@ -4606,6 +4653,13 @@
                 // The window panel's "Blocks in Window" reads the whole ledger
                 // (c2pWindowBlocks), not only the 10 rows the table shows.
                 window.c2pRecentBlocks = blocks || [];
+                // Pace (effort, ⚡/🐢, duplets) over the whole ledger, before
+                // the table keeps its 10 rows, so the oldest row shown still
+                // has its predecessor.
+                var pace = c2pBlockPace(window.c2pRecentBlocks, (window.currency_info && window.currency_info.symbol) || '');
+                window.c2pPace = pace;
+                var paceOf = function(b) { return pace.byHash[c2pRowHash(b)] || null; };
+                c2pRenderLuckSummary();
                 d3.select('#blocks_loading').style('display', 'none');
                 // Clear existing rows before adding new data
                 d3.select('#blocks tbody').selectAll('tr').remove();
@@ -4632,95 +4686,65 @@
                     
                     d3.select('#blocks tbody').selectAll('tr').remove();
                     var tr = d3.select('#blocks tbody').selectAll('tr').data(displayBlocks).enter().append('tr');
-                tr.append('td').text(function(b) { return format_time_short(b.ts); });
-                tr.append('td').text(function(b) { return b.number; });
+                // Duplet bracket: a dashed edge on both rows of the pair.
+                tr.append('td')
+                    .attr('class', function(b) {
+                        var p = paceOf(b);
+                        return c2pDupletEdgeClass(p);
+                    })
+                    .text(function(b) { return format_time_short(b.ts); });
+                tr.append('td').each(function(b) {
+                    var td = d3.select(this), p = paceOf(b);
+                    td.append('span').text(b.number);
+                    if (p && p.duplet) {
+                        td.append('span').attr('class', 'duplet-pill')
+                            .attr('title', c2pDupletTip(p))
+                            .text('⁑ duplet');
+                    }
+                });
                 tr.append('td').append('a')
                     .attr('class', 'hash-link')
                     .attr('href', function(b) { return currency_info.block_explorer_url_prefix + b.hash; })
                     .attr('target', '_blank')
                     .attr('title', function(b) { return b.hash; })
                     .text(function(b) { return '...' + b.hash.substr(-8); });
+                // Effort: round duration vs. expected, coloured at the bounds
+                // the luck colours had (luck = 1 / effort is in the tooltip).
                 tr.append('td')
-                    .attr('class', function(b) {
-                        // #1138: honor the full backend luck_method taxonomy. 'relayed'
-                        // (peer-learned, no local timing) and 'netdiff_unavailable' (header
-                        // never synced) are NOT this pool's pending first block -- render
-                        // them neutral so relay rows stop masquerading as our own blocks.
-                        if (b.luck_method === 'relayed' || b.luck_method === 'netdiff_unavailable') return '';
-                        if (b.luck_method === 'first_block') return 'status-pending';  // genuine first block - no luck calc
-                        if (!b.luck) return '';
-                        if (b.luck >= 100) return 'status-confirmed';
-                        if (b.luck >= 75) return 'status-pending';
-                        return 'status-orphaned';
-                    })
+                    .attr('class', function(b) { return c2pEffortClass(paceOf(b)); })
                     .text(function(b) {
-                        // #1138: distinct glyphs per method so only a GENUINE first block
-                        // reads '1st'; relay-learned and header-unavailable rows are honest.
+                        var p = paceOf(b);
+                        if (p && p.effort !== null) return (p.first ? '1st ' : '') + c2pFmtPct(p.effort * 100);
+                        // Off the coin chain: the effort the node gives it, muted; it is no round.
+                        if (p && p.offChain && p.offEffort !== null) return c2pFmtPct(p.offEffort * 100);
+                        // #1138: distinct glyphs per method; relay-learned and
+                        // header-unavailable rows are honest about why.
                         if (b.luck_method === 'relayed') return '↗';   // relay-learned from a peer
-                        if (b.luck_method === 'netdiff_unavailable') return 'n/a';
-                        if (b.luck_method === 'first_block') return '1st';  // genuine first block indicator
-                        if (b.luck === undefined || b.luck === null) return '-';
-                        // Show decimal for very small luck values
-                        if (b.luck < 1) return d3.format('.2f')(b.luck) + '%';
-                        return b.luck < 1 ? d3.format('.2f')(b.luck) : d3.format('.0f')(b.luck) + '%';
+                        if (b.luck_method === 'netdiff_unavailable' || b.luck_method === 'hashrate_unavailable') return 'n/a';
+                        return '—';
                     })
-                    .attr('title', function(b) {
-                        if (b.luck_method === 'relayed')
-                            return 'Relayed from a peer over P2P -- this node has no local timing, so no luck is computed here';
-                        if (b.luck_method === 'netdiff_unavailable')
-                            return 'Luck unavailable -- the block header was never synced, so network difficulty at find time is unknown';
-                        if (b.luck_method === 'first_block') {
-                            var tip = 'First block - no previous block for luck calculation';
-                            if (b.expected_time) tip += '\nExpected time was: ' + format_dt(b.expected_time);
-                            return tip;
-                        }
-                        if (!b.time_to_find) return '';
-                        var tip = 'Found in ' + format_dt(b.time_to_find);
-                        if (b.expected_time) tip += ' (expected: ' + format_dt(b.expected_time) + ')';
-                        if (b.luck_method === 'time_weighted_avg') tip += '\n[Precise: ' + b.hashrate_samples_used + ' samples]';
-                        else if (b.luck_method === 'simple_avg') tip += '\n[Avg of block hashrates]';
-                        else if (b.luck_method) tip += '\n[' + b.luck_method + ']';
-                        return tip;
-                    });
+                    .attr('title', function(b) { return c2pEffortCellTip(b, paceOf(b)); });
                 tr.append('td')
                     .attr('style', 'font-family: monospace; font-size: 11px;')
-                    .text(function(b) {
-                        var actual = b.time_to_find || 0;
-                        
-                        // Calculate expected time - prioritize backend value, then derive from luck
-                        var expected = 0;
-                        if (b.expected_time) {
-                            // Use backend-calculated expected time (most accurate)
-                            expected = b.expected_time;
-                        } else if (b.luck && b.luck > 0 && actual > 0) {
-                            // Derive from luck: luck = (expected / actual) * 100
-                            expected = (actual * b.luck) / 100;
-                        } else if (b.network_difficulty && b.pool_hashrate_at_find && b.pool_hashrate_at_find > 0) {
-                            // Fallback calculation: expected_hashes / hashrate = time
-                            expected = (b.network_difficulty * Math.pow(2, 32)) / b.pool_hashrate_at_find;
+                    .each(function(b) {
+                        var td = d3.select(this), p = paceOf(b), t = c2pRoundTimes(b, p);
+                        if (p && p.tag) {
+                            td.append('span')
+                                .attr('class', (c2pIsFast(p.tier) ? 'pace-fast' : 'pace-slow') +
+                                               (p.tier === 'fast2' || p.tier === 'slow2' ? ' pace-strong' : ''))
+                                .text(p.tag + ' ');
                         }
-                        
                         // Adaptive units: a 107 s find reads "1m 47s", not a truncated "00:01".
-                        var exp = expected > 0 ? format_duration(expected) : '-';
-                        var act = actual > 0 ? format_duration(actual) : '-';
-                        // Display as actual/expected since that's more intuitive (time taken vs time expected)
-                        return act + ' / ' + exp;
+                        // Actual / expected: time taken vs time expected.
+                        td.append('span').text((t.actual > 0 ? format_duration(t.actual) : '-') + ' / ' +
+                                               (t.expected > 0 ? format_duration(t.expected) : '-'));
                     })
                     .attr('title', function(b) {
-                        var actual = b.time_to_find || 0;
-                        var expected = 0;
-                        if (b.expected_time) {
-                            expected = b.expected_time;
-                        } else if (b.luck && b.luck > 0 && actual > 0) {
-                            // Derive from luck: luck = (expected / actual) * 100
-                            expected = (actual * b.luck) / 100;
-                        } else if (b.network_difficulty && b.pool_hashrate_at_find && b.pool_hashrate_at_find > 0) {
-                            expected = (b.network_difficulty * Math.pow(2, 32)) / b.pool_hashrate_at_find;
-                        }
-                        
-                        var exp = expected > 0 ? format_dt(expected) : 'unknown';
-                        var act = actual > 0 ? format_dt(actual) : 'unknown';
-                        return 'Actual: ' + act + '\nExpected: ' + exp;
+                        var p = paceOf(b), t = c2pRoundTimes(b, p);
+                        var tip = 'Actual: ' + (t.actual > 0 ? format_dt(t.actual) : 'unknown') +
+                                  '\nExpected: ' + (t.expected > 0 ? format_dt(t.expected) : 'unknown');
+                        if (p && p.tag) tip += '\n' + c2pPaceTip(p) + '\n' + c2pEffortSourceNote(p);
+                        return tip;
                     });
                 // Net Diff / Hash Diff are SHOWN as a hashrate (diff_as_hashrate) so
                 // miners can compare them with their own PH/s; the tooltip carries the
@@ -4814,6 +4838,11 @@
                 // Clear existing rows
                 d3.select('#merged_blocks tbody').selectAll('tr').remove();
                 
+                // Pace per merged chain, over all rows, when the node serves
+                // the merged chain's own effort (never paired across chains).
+                var mergedPace = c2pBlockPace(blocks, '');
+                var mergedPaceOf = function(b) { return mergedPace.byHash[c2pRowHash(b)] || null; };
+
                 // Store only 10 most recent merged blocks for table display
                 window.allMergedBlocks = blocks.slice().sort(function(a,b){var ha=(a.height!=null?a.height:a.number)||0,hb=(b.height!=null?b.height:b.number)||0;return hb-ha;}).slice(0, 10);
                 window.mergedBlocksDisplayCount = Math.min(10, window.allMergedBlocks.length);
@@ -4833,7 +4862,12 @@
                     d3.select('#merged_blocks tbody').selectAll('tr').remove();
                     var tr = d3.select('#merged_blocks tbody').selectAll('tr').data(displayBlocks).enter().append('tr');
                     
-                    tr.append('td').text(function(b) { return format_time_short(b.ts); });
+                    tr.append('td')
+                        .attr('class', function(b) {
+                            var p = mergedPaceOf(b);
+                            return c2pDupletEdgeClass(p);
+                        })
+                        .text(function(b) { return format_time_short(b.ts); });
                     tr.append('td')
                         .style('font-weight', 'bold')
                         .style('color', '#6f42c1')
@@ -4850,6 +4884,33 @@
                                 .attr('target', '_blank')
                                 .attr('title', (b.symbol || 'AUX') + ' block #' + b.height)
                                 .text('#' + b.height);
+                        });
+                    // Effort on the merged chain, with the same ⚡ / 🐢 tags
+                    // and duplet mark as the parent rows. A dash until the
+                    // node serves the merged chain's difficulty at find.
+                    tr.append('td')
+                        .attr('class', function(b) { return c2pEffortClass(mergedPaceOf(b)); })
+                        .each(function(b) {
+                            var td = d3.select(this), p = mergedPaceOf(b);
+                            if (!p || p.effort === null) { td.text('—'); return; }
+                            if (p.tag) {
+                                td.append('span')
+                                    .attr('class', (c2pIsFast(p.tier) ? 'pace-fast' : 'pace-slow') +
+                                                   (p.tier === 'fast2' || p.tier === 'slow2' ? ' pace-strong' : ''))
+                                    .text(p.tag + ' ');
+                            }
+                            td.append('span').text((p.first ? '1st ' : '') + c2pFmtPct(p.effort * 100));
+                            if (p.duplet) {
+                                td.append('span').attr('class', 'duplet-pill')
+                                    .attr('title', c2pDupletTip(p))
+                                    .text('⁑ duplet');
+                            }
+                        })
+                        .attr('title', function(b) {
+                            var p = mergedPaceOf(b);
+                            if (p && (p.effort !== null || p.offChain)) return c2pEffortCellTip(b, p);
+                            return 'Effort needs the ' + (b.symbol || b.network || 'merged chain') +
+                                ' difficulty at find, which this node does not serve.';
                         });
                     tr.append('td').append('a')
                         .attr('class', 'hash-link')
@@ -5047,45 +5108,11 @@
         
         function loadPoolLuck() {
             d3.json('../luck_stats', function(luckData) {
-                if (!luckData || !luckData.luck_available) {
-                    return;
-                }
-
-                // Current round luck (current luck trend)
-                if (luckData.current_luck_trend) {
-                    var currentLuck = luckData.current_luck_trend;
-                    d3.select('#luck_current_round')
-                        .text('Round: ' + d3.format('.0f')(currentLuck) + '%')
-                        .style('background', currentLuck >= 100 ? 'var(--success)' : (currentLuck >= 75 ? 'var(--warning)' : 'var(--danger)'));
-                } else {
-                    d3.select('#luck_current_round').text('Round: -').style('background', 'var(--primary)');
-                }
-
-                // Calculate 7-day and 30-day luck from blocks
-                var now = Date.now() / 1000;
-                var sevenDaysAgo = now - (7 * 24 * 60 * 60);
-                var thirtyDaysAgo = now - (30 * 24 * 60 * 60);
-
-                var sevenDayBlocks = luckData.blocks.filter(function(b) { return b.ts >= sevenDaysAgo && b.luck; });
-                var thirtyDayBlocks = luckData.blocks.filter(function(b) { return b.ts >= thirtyDaysAgo && b.luck; });
-
-                if (sevenDayBlocks.length > 0) {
-                    var sevenDayLuck = d3.sum(sevenDayBlocks, function(b) { return b.luck; }) / sevenDayBlocks.length;
-                    d3.select('#luck_seven_days')
-                        .text('7d: ' + d3.format('.0f')(sevenDayLuck) + '%')
-                        .style('background', sevenDayLuck >= 100 ? 'var(--success)' : (sevenDayLuck >= 75 ? 'var(--warning)' : 'var(--danger)'));
-                } else {
-                    d3.select('#luck_seven_days').text('7d: -').style('background', 'var(--primary)');
-                }
-
-                if (thirtyDayBlocks.length > 0) {
-                    var thirtyDayLuck = d3.sum(thirtyDayBlocks, function(b) { return b.luck; }) / thirtyDayBlocks.length;
-                    d3.select('#luck_thirty_days')
-                        .text('30d: ' + d3.format('.0f')(thirtyDayLuck) + '%')
-                        .style('background', thirtyDayLuck >= 100 ? 'var(--success)' : (thirtyDayLuck >= 75 ? 'var(--warning)' : 'var(--danger)'));
-                } else {
-                    d3.select('#luck_thirty_days').text('30d: -').style('background', 'var(--primary)');
-                }
+                // Kept whole: the luck badges and the hashrate charts read
+                // `periods` and `current_round` from it (c2pRenderLuckSummary,
+                // c2pChartLuck). A failed load keeps the last one.
+                if (luckData) window.c2pLuckStats = luckData;
+                c2pRenderLuckSummary();
             });
         }
 
@@ -8173,7 +8200,7 @@
             
             function tryRender() {
                 loadCount++;
-                if (loadCount === 8) {  // hashrate, worker_count, unique_miner_count, connected_miners, blocks, network_difficulty, local_hash_rate, local_dead_hash_rate
+                if (loadCount === 9) {  // hashrate, worker_count, unique_miner_count, connected_miners, blocks, luck_stats, network_difficulty, local_hash_rate, local_dead_hash_rate
                     graphData = hashrateData;
                     graphMinerData = minerCountData;
                     graphUniqueMinersData = uniqueMinerCountData;
@@ -8241,7 +8268,15 @@
                 blocksData = blocks || [];
                 tryRender();
             });
-            
+
+            // The open round and the period lucks the chart shows
+            // (c2pChartLuck reads window.c2pLuckStats). An older node serves
+            // neither; a failed load keeps the last one.
+            d3.json('../luck_stats', function(luckData) {
+                if (luckData) window.c2pLuckStats = luckData;
+                tryRender();
+            });
+
             // Net Diff follows the period selector through the same binned
             // graph_data source as every other series. The old
             // /network_difficulty?period= ring was sparse (#1140) AND the
@@ -8443,7 +8478,204 @@
         }
 
         // BEGIN c2pLuck (tested by sharechain-explorer/tests/unit/dashboard-luck-*.test.ts)
-        // The exact Poisson interval behind the CI95 diagnostic above.
+        // Pool luck on the effort model.
+        //
+        // The effort of a round is the number of blocks expected over it:
+        // time taken / expected time. Under 1 the round was faster than
+        // expected. For a fair pool it is Exp(1): mean 1, median 0.69, and no
+        // memory. Per-block luck = 100 / effort is a per-block figure only.
+        // It is never averaged: E[1 / effort] is infinite, so a mean of
+        // per-block lucks reads far above 100 % for a fair pool. Every figure
+        // over several rounds is pooled, blocks found / blocks expected
+        // = k / sum(effort), the open round's effort so far included.
+        //
+        // The node serves `effort` per row, and `periods` and `current_round`
+        // in /luck_stats. An older node serves none of them: the effort of a
+        // row is then its time_to_find / expected_time when both are there,
+        // and unknown (a dash) when they are not. Nothing here falls back to
+        // a mean of per-block luck.
+        var C2P_FAST = 1 / 3, C2P_VERY_FAST = 0.1, C2P_SLOW = 2, C2P_VERY_SLOW = 3, C2P_DRY_HINT = 5;
+        var C2P_TREND_ROUNDS = 10;
+        var C2P_LUCK_CAP = 1000;
+        var C2P_LUCK_SAMPLES = 16;
+        var C2P_PERIODS = [['1d', 86400], ['7d', 604800], ['30d', 2592000], ['90d', 7776000], ['all', null]];
+
+        function c2pNum(v) { return typeof v === 'number' && isFinite(v) ? v : null; }
+
+        // ⚡ under 1/3 of the expected time, ⚡⚡ under 0.1; 🐢 over 2x, 🐢🐢
+        // over 3x. The bounds themselves are untagged.
+        function c2pPaceTier(e) {
+            if (!(e > 0)) return '';
+            if (e < C2P_VERY_FAST) return 'fast2';
+            if (e < C2P_FAST) return 'fast';
+            if (e > C2P_VERY_SLOW) return 'slow2';
+            if (e > C2P_SLOW) return 'slow';
+            return '';
+        }
+        function c2pPaceTag(tier) {
+            return tier === 'fast2' ? '⚡⚡' : tier === 'fast' ? '⚡'
+                 : tier === 'slow2' ? '🐢🐢' : tier === 'slow' ? '🐢' : '';
+        }
+        function c2pIsFast(tier) { return tier === 'fast' || tier === 'fast2'; }
+        function c2pIsSlow(tier) { return tier === 'slow' || tier === 'slow2'; }
+        // The colour band of an effort, at the bounds the luck colours always
+        // had: luck >= 100 %, >= 75 %, below.
+        function c2pEffortBand(e) {
+            if (!(e > 0)) return '';
+            return e <= 1 ? 'good' : (e <= 4 / 3 ? 'mid' : 'poor');
+        }
+
+        function c2pFmtX(e) {
+            if (c2pNum(e) === null || e < 0) return '—';
+            if (e > 0 && e < 0.01) return '<0.01×';
+            return (e < 0.095 ? e.toFixed(2) : e < 9.95 ? e.toFixed(1) : e.toFixed(0)) + '×';
+        }
+        function c2pFmtNum(v) {
+            if (c2pNum(v) === null || v < 0) return '—';
+            if (v === 0) return '0';
+            return v >= 9.95 ? v.toFixed(0) : v >= 0.95 ? v.toFixed(1) : v.toFixed(2);
+        }
+        function c2pFmtPct(v) { return c2pNum(v) !== null && v >= 0 ? c2pFmtNum(v) + '%' : '—'; }
+        // Odds, from a probability: "28", "13.5", "0.67".
+        function c2pFmtOdds(p) {
+            var v = p * 100;
+            return v >= 20 ? v.toFixed(0) : v >= 1 ? v.toFixed(1) : v.toFixed(2);
+        }
+        function c2pFmtDur(s) {
+            if (c2pNum(s) === null || s < 0) return '?';
+            var d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600);
+            var m = Math.floor((s % 3600) / 60), sec = Math.floor(s % 60);
+            if (d > 0) return d + 'd ' + h + 'h';
+            if (h > 0) return h + 'h ' + m + 'm';
+            if (m > 0) return m + 'm ' + sec + 's';
+            return sec + 's';
+        }
+
+        function c2pRowChain(b) { return String(b.chain || b.symbol || b.network || '').toUpperCase(); }
+        function c2pRowHash(b) { return (b && (b.hash || b.pow_hash)) || ''; }
+        function c2pRowHeight(b) { return b.height != null ? b.height : b.number; }
+        // Off the coin chain. The node says so in `main_chain` (false also on
+        // a find that never confirmed); an older node has only the status:
+        // an orphaned or stale row. A merged row has no status;
+        // verified === false is its orphan mark.
+        function c2pRowOffChain(b) {
+            if (typeof b.main_chain === 'boolean') return !b.main_chain;
+            if (b.status === 'orphaned' || b.status === 'stale') return true;
+            return b.status == null && b.verified === false;
+        }
+
+        // The pace of every ledger row (/recent_blocks, /recent_merged_blocks),
+        // keyed by block hash, and the rounds of each chain, oldest first.
+        // A round ends at a main-chain block; rows off the chain (orphaned,
+        // stale, never confirmed) are never a round, a tag, a duplet member or
+        // a predecessor: the effort the node serves on one is kept for
+        // display only (offEffort). Chains are never mixed. `sym` names the
+        // chain whose rounds are returned as
+        // `rounds` (the chain with the most rows when it is not there);
+        // `noEffort` has the times of its main-chain rows with no effort.
+        //
+        // effort: the row's own `effort`; else 1 for the node's first block
+        // (it has no earlier block to time its round from and counts as
+        // 100 %); else time_to_find / expected_time; else null.
+        // An older node times a round from the previous ledger row, orphans
+        // included: when that row is an orphan and the served time_to_find
+        // is the gap to it, the round is timed from the previous main-chain
+        // block instead.
+        // duplet: a fast block (effort under 1/3) and the main-chain block
+        // before it. The first block and a row with no effort close none.
+        function c2pBlockPace(rows, sym) {
+            var byHash = {}, lists = {}, chains = {}, lastMain = {}, noEffort = {};
+            (rows || []).forEach(function(b) {
+                if (!b || typeof b.ts !== 'number') return;
+                var h = c2pRowHash(b);
+                if (!h || byHash[h]) return;
+                var c = c2pRowChain(b);
+                byHash[h] = { hash: h, chain: c, ts: b.ts, height: c2pRowHeight(b), offChain: c2pRowOffChain(b),
+                              effort: null, offEffort: null, luck: null, first: false, source: null, method: null,
+                              coverage: null,
+                              gap: null, expected: null, gapFixed: false, tier: '', tag: '',
+                              prev: null, duplet: null, dupletOpen: null };
+                (lists[c] = lists[c] || []).push(b);
+            });
+            Object.keys(lists).forEach(function(c) {
+                var list = lists[c].sort(function(a, b) {
+                    return a.ts - b.ts || (c2pRowHeight(a) || 0) - (c2pRowHeight(b) || 0);
+                });
+                var rounds = chains[c] = [], unknown = noEffort[c] = [];
+                var prevMain = null, prevRow = null;
+                list.forEach(function(b) {
+                    var p = byHash[c2pRowHash(b)];
+                    var eff = c2pNum(b.effort), ttf = c2pNum(b.time_to_find), exp = c2pNum(b.expected_time);
+                    if (p.offChain) {
+                        if (eff !== null && eff > 0) p.offEffort = eff;
+                        prevRow = b;
+                        return;
+                    }
+                    if (eff !== null && eff > 0) {
+                        p.effort = eff;
+                        p.source = 'server';
+                        p.method = b.effort_method || null;
+                        p.first = b.effort_method === 'first_block';
+                        p.gap = ttf > 0 ? ttf : null;
+                    } else if (b.effort_method === 'first_block' || b.luck_method === 'first_block') {
+                        p.effort = 1;
+                        p.first = true;
+                        p.source = 'first_block';
+                        p.method = 'first_block';
+                    } else if (ttf > 0 && exp > 0) {
+                        p.gap = ttf;
+                        if (prevRow && prevMain && c2pRowOffChain(prevRow) && b.ts - prevMain.ts > 0 &&
+                                Math.abs(ttf - (b.ts - prevRow.ts)) <= 2) {
+                            p.gap = b.ts - prevMain.ts;
+                            p.gapFixed = true;
+                        }
+                        p.effort = p.gap / exp;
+                        p.source = 'client';
+                        p.method = 'single_sample';
+                    }
+                    p.expected = exp > 0 ? exp : null;
+                    p.coverage = c2pNum(b.history_coverage);
+                    if (p.effort !== null) {
+                        p.luck = 100 / p.effort;
+                        if (!p.first) p.tier = c2pPaceTier(p.effort);
+                        p.tag = c2pPaceTag(p.tier);
+                        rounds.push({ ts: b.ts, effort: p.effort, first: p.first, hash: p.hash, height: p.height, gap: p.gap });
+                    } else {
+                        unknown.push(b.ts);
+                    }
+                    // The round's start: the block the node names, else the
+                    // previous main-chain row by time.
+                    var prev = b.prev_block_hash ? byHash[b.prev_block_hash] : (prevMain ? byHash[c2pRowHash(prevMain)] : null);
+                    if (prev && (prev.offChain || prev.chain !== c || prev.hash === p.hash)) prev = null;
+                    if (prev) p.prev = prev.hash;
+                    if (prev && c2pIsFast(p.tier) && (prev.height == null || prev.height !== p.height)) {
+                        var measured = prev.effort !== null && !prev.first;
+                        p.duplet = {
+                            'with': prev.hash,
+                            withHeight: prev.height,
+                            gap: b.ts - prev.ts > 0 ? b.ts - prev.ts : p.gap,
+                            prevEffort: measured ? prev.effort : null,
+                            kind: measured && prev.effort > C2P_SLOW ? 'dry' : (c2pIsFast(prev.tier) ? 'triple' : 'plain')
+                        };
+                        prev.dupletOpen = p.hash;
+                    }
+                    prevMain = b;
+                    prevRow = b;
+                });
+                lastMain[c] = prevMain;
+            });
+            var want = String(sym || '').toUpperCase(), pick = chains[want] ? want : null;
+            if (pick === null) {
+                Object.keys(lists).forEach(function(c) {
+                    if (pick === null || lists[c].length > lists[pick].length) pick = c;
+                });
+            }
+            return { byHash: byHash, chains: chains, chain: pick,
+                     rounds: (pick !== null && chains[pick]) || [],
+                     noEffort: (pick !== null && noEffort[pick]) || [],
+                     lastMain: (pick !== null && lastMain[pick]) || null };
+        }
+
         // ln Gamma(x), x > 0: shifted up to x >= 10, then Stirling's series.
         function c2pLogGamma(x) {
             var shift = 0;
@@ -8499,6 +8731,20 @@
         function c2pPoissonCI(k) {
             return { low: k > 0 ? c2pGammaQuantile(0.025, k) : 0, high: c2pGammaQuantile(0.975, k + 1) };
         }
+        // Luck % and its exact 95 % interval for k blocks found against
+        // `expected` blocks. null when nothing was expected.
+        function c2pLuckOf(k, expected) {
+            if (!(expected > 0) || !(k >= 0)) return null;
+            var ci = c2pPoissonCI(k);
+            return { k: k, blocks_expected: expected, luck: 100 * k / expected,
+                     ci95_low: 100 * ci.low / expected, ci95_high: 100 * ci.high / expected };
+        }
+        // Where the pooled luck of k rounds of a FAIR pool lands 95 % of the
+        // time: k / Gamma(k, 1). 5 blocks: 49-308 %, 30 blocks: 72-148 %.
+        function c2pFairBand(k) {
+            if (!(k >= 1)) return null;
+            return { low: 100 * k / c2pGammaQuantile(0.975, k), high: 100 * k / c2pGammaQuantile(0.025, k) };
+        }
         // The 95 % interval of the hashrate that k blocks found in windowSec
         // seconds imply, at netDiff: the exact Poisson interval on the block
         // rate, times the hashes per block. No prior.
@@ -8507,103 +8753,572 @@
             var ci = c2pPoissonCI(k), perBlock = netDiff * 4294967296;
             return { low: ci.low / windowSec * perBlock, high: ci.high / windowSec * perBlock };
         }
-        // END c2pLuck
 
-        // BEGIN c2pLuckTrend (tested by sharechain-explorer/tests/unit/dashboard-luck-trend.test.ts)
-        // The hashrate charts' Luck series, in raw luck % (the caller applies
-        // the display transform). observed: [ms, luck] of the blocks with a
-        // computed luck (> 0) between minTime and the last graph sample.
-        // sortedBlocks: all blocks, oldest first. live: the in-progress round
-        // {x: now ms, expectedMs, lastBlkMs}, or null; its y is not read, every
-        // point here is computed at its own x.
-        // The series runs from minTime to max(live.x, last block), past the
-        // last graph sample, so a block found after that sample is a point too.
-        // A completed round is a point at its luck. The in-progress round is
-        // luck-if-found-now = expected / elapsed * 100, capped at 1000: a
-        // hyperbola, so it is sampled, not drawn as a chord. It starts at the
-        // last block when that block is in the series (at minTime only when
-        // the block is older). The node's first known block (luck_method
-        // "first_block": no earlier block to time its round from) counts as
-        // 100 % here, a point like any other. A last block with no computed
-        // luck otherwise gets no luck value: the line breaks there and the
-        // curve starts at its time, from the cap (elapsed -> 0). Curve samples
-        // have no marker.
-        var C2P_LUCK_CAP = 1000;
-        var C2P_LUCK_SAMPLES = 32;
-        function c2pLuckTrendPoints(observed, sortedBlocks, minTime, live) {
-            var trendLuck = function(b) {
-                return b.luck > 0 ? b.luck : (b.luck_method === 'first_block' ? 100 : 0);
-            };
-            var pts = observed.slice();
-            var lastObs = -Infinity, firstBlockMs = null;
-            pts.forEach(function(p) { lastObs = Math.max(lastObs, p[0]); });
-            // The first block (never in observed: its luck is null), and the
-            // blocks after the last observed one (found after the last graph
-            // sample, still inside this series): their luck is a point too.
-            sortedBlocks.forEach(function(b) {
-                var t = b.ts * 1000;
-                var luck = trendLuck(b);
-                if (t >= minTime && luck > 0 && (t > lastObs || !(b.luck > 0))) {
-                    pts.push([t, luck]);
-                    if (!(b.luck > 0)) firstBlockMs = t;
+        // The open round: {effort, elapsed (s), expected_time (s to a block
+        // at the current rate), pace_time (s per expected block over the
+        // round so far: elapsed / effort), source}.
+        // The node's current_round, its effort integrated over the round;
+        // null there (no main-chain block yet) is no round. An older node has
+        // no such field: its current_luck_trend, which is 100 / effort; else
+        // the round since lastMainTs against fallbackExpected seconds. null
+        // when none works.
+        function c2pOpenRound(luckStats, lastMainTs, nowS, fallbackExpected) {
+            var ls = luckStats || {}, cr = ls.current_round;
+            var sinceLast = lastMainTs > 0 && nowS >= lastMainTs ? nowS - lastMainTs : null;
+            var e, elapsed, expected;
+            if (cr === null && 'current_round' in ls) return null;
+            if (cr && c2pNum(cr.effort) !== null && cr.effort >= 0) {
+                e = cr.effort;
+                elapsed = c2pNum(cr.elapsed) !== null ? cr.elapsed : sinceLast;
+                var pace = e > 0 && elapsed > 0 ? elapsed / e : null;
+                expected = cr.expected_time > 0 ? cr.expected_time : pace;
+                return { effort: e, elapsed: elapsed, expected_time: expected, pace_time: pace !== null ? pace : expected,
+                         source: 'server', since: cr.since_block_hash || null,
+                         method: cr.effort_method || null, coverage: c2pNum(cr.history_coverage) };
+            }
+            if (c2pNum(ls.current_luck_trend) !== null && ls.current_luck_trend > 0) {
+                e = 100 / ls.current_luck_trend;
+                expected = sinceLast !== null ? sinceLast / e : null;
+                return { effort: e, elapsed: sinceLast, expected_time: expected, pace_time: expected,
+                         source: 'server_trend', since: null, method: null, coverage: null };
+            }
+            if (sinceLast !== null && fallbackExpected > 0) {
+                return { effort: sinceLast / fallbackExpected, elapsed: sinceLast, expected_time: fallbackExpected,
+                         pace_time: fallbackExpected, source: 'client', since: null, method: null, coverage: null };
+            }
+            return null;
+        }
+
+        // Pooled luck over the last spanS seconds (over every round when
+        // spanS is null), as the node computes its `periods`: k = the blocks
+        // found in the span, expected = the effort of the span's rounds, each
+        // clipped to the span (the round that straddles its start counts for
+        // the part inside, the open round for its part so far). The fallback
+        // for a node that serves no `periods`. A block with no effort is left
+        // out with its round (`skipped` counts them, from noEffort); a period
+        // with such blocks and no round with an effort has no luck to give.
+        function c2pPeriodLuck(rounds, nowS, spanS, open, noEffort) {
+            var k = 0, expected = 0, from = spanS ? nowS - spanS : -Infinity, oldest = null;
+            (rounds || []).forEach(function(r) {
+                if (r.ts < from || !(r.effort > 0)) return;
+                k++;
+                expected += r.gap > 0 && r.ts - r.gap < from ? r.effort * (r.ts - from) / r.gap : r.effort;
+                if (oldest === null || r.ts < oldest) oldest = r.ts;
+            });
+            var skipped = (noEffort || []).filter(function(ts) { return ts >= from; }).length;
+            if (k === 0 && skipped > 0) return null;
+            if (open && open.effort > 0) {
+                var part = spanS && open.elapsed > spanS ? spanS / open.elapsed : 1;
+                expected += open.effort * part;
+            }
+            var out = c2pLuckOf(k, expected);
+            if (!out) return null;
+            out.span_s = spanS || (oldest !== null ? Math.max(0, nowS - oldest) : null);
+            out.skipped = skipped;
+            out.source = 'client';
+            return out;
+        }
+        // The periods to show: the node's own where it serves them, else
+        // c2pPeriodLuck. {'1d': {k, blocks_expected, luck, ci95_low,
+        // ci95_high, span_s, source} | null, '7d': ..., 'all': ...}. A served
+        // period with no luck or no block count is a dash, not recomputed.
+        function c2pLuckPeriods(luckStats, rounds, nowS, open, noEffort) {
+            var served = (luckStats && luckStats.periods) || {}, out = {};
+            C2P_PERIODS.forEach(function(def) {
+                var s = served[def[0]];
+                if (s && typeof s === 'object') {
+                    out[def[0]] = c2pNum(s.luck) === null || c2pNum(s.k) === null ? null : {
+                        k: s.k, blocks_expected: c2pNum(s.blocks_expected), luck: s.luck,
+                        ci95_low: c2pNum(s.ci95_low), ci95_high: c2pNum(s.ci95_high),
+                        span_s: c2pNum(s.span_s), skipped: c2pNum(s.k_unmeasured) || 0, source: 'server'
+                    };
+                } else {
+                    out[def[0]] = c2pPeriodLuck(rounds, nowS, def[1], open, noEffort);
                 }
             });
-            pts.sort(function(a, b) { return a[0] - b[0]; });
-            // Start at minTime: the luck of the last block before the window,
-            // else the first in-window point's. Nothing came before the node's
-            // first block: when it is the first point, the line starts at it.
-            if (pts.length > 0 && pts[0][0] > minTime && pts[0][0] !== firstBlockMs && sortedBlocks.length > 0) {
-                var prevBlock = null;
-                for (var i = 0; i < sortedBlocks.length; i++) {
-                    var bt = sortedBlocks[i].ts * 1000;
-                    if (bt < minTime && trendLuck(sortedBlocks[i]) > 0) {
-                        prevBlock = sortedBlocks[i];
-                    } else if (bt >= minTime) {
-                        break;
-                    }
-                }
-                pts.unshift([minTime, prevBlock ? trendLuck(prevBlock) : pts[0][1]]);
-            }
-            if (!live) return pts;
-            var last = sortedBlocks[sortedBlocks.length - 1] || {};
-            var blkMs = live.lastBlkMs;
-            // Never end before the round starts (a block ahead of this clock).
-            var endMs = Math.max(live.x, blkMs);
-            var luckAt = function(x) {
-                return Math.min((live.expectedMs / Math.max(x - blkMs, 1000)) * 100, C2P_LUCK_CAP);
+            return out;
+        }
+
+        // The Round badge of the open round at effort e.
+        function c2pDrySpell(e) {
+            if (c2pNum(e) === null || e < 0) return null;
+            var x = c2pFmtX(e);
+            if (e > C2P_VERY_SLOW) return { state: 'long', text: '🏜️ Long dry spell ' + x, background: '#5b4b8a', hint: e > C2P_DRY_HINT };
+            if (e > C2P_SLOW) return { state: 'dry', text: '🏜️ Dry spell ' + x, background: '#5b4b8a', hint: false };
+            if (e >= 1) return { state: 'over', text: 'Round ' + x, background: '#3a3a5a', hint: false };
+            return { state: 'round', text: 'Round ' + x, background: 'var(--primary)', hint: false };
+        }
+
+        // The hashrate charts' Luck series: the pooled luck of the last
+        // C2P_TREND_ROUNDS rounds, in raw luck % (the caller applies the
+        // display transform). rounds: c2pBlockPace(...).rounds. Each round
+        // from minTime on is a point at n / sum(effort) over the n <= N
+        // rounds ending at it, so the node's first block, effort 1, is a
+        // point at 100 %. The line starts at minTime with the value of the
+        // last round before the window; nothing is drawn before the first
+        // round there is.
+        // live: the open round {x: end ms, lastBlkMs, expectedMs}, or null.
+        // It is in the pool too: from the last block the series runs on as
+        // n / (sum(effort) + elapsed / expected), sampled (no markers) up to
+        // a marked end point. Points are {x, y, n, expected}, y capped at
+        // C2P_LUCK_CAP.
+        function c2pLuckTrendPoints(rounds, minTime, live, N) {
+            N = N > 0 ? N : C2P_TREND_ROUNDS;
+            rounds = rounds || [];
+            var pts = [], before = null, sum = 0, n = 0;
+            var point = function(x, expected, extra) {
+                var p = { x: x, y: Math.min(100 * n / expected, C2P_LUCK_CAP), n: n, expected: expected };
+                for (var key in extra) p[key] = extra[key];
+                return p;
             };
-            var lastX = pts.length > 0 ? pts[pts.length - 1][0] : -Infinity;
-            var startMs = Math.max(blkMs, minTime);
-            if (blkMs >= minTime) {
-                if (trendLuck(last) > 0) {
-                    startMs = blkMs + 1000;  // just after the block's own point
-                } else if (pts.length > 0) {
-                    // Its round has no luck: break the line instead of
-                    // ramping the previous point up to the cap.
-                    pts.push([blkMs, null]);
-                }
-            }
-            var xs = [];
-            if (startMs < endMs) {
-                xs.push(startMs);
-                // Flat at the cap up to the knee, then geometric steps: the
-                // curve is 1/elapsed, so equal ratios keep it smooth.
-                var e1 = endMs - blkMs;
-                var d0 = Math.max(startMs - blkMs, live.expectedMs * 100 / C2P_LUCK_CAP);
-                if (d0 < e1) {
-                    if (blkMs + d0 > startMs) xs.push(blkMs + d0);
-                    var ratio = Math.pow(e1 / d0, 1 / C2P_LUCK_SAMPLES);
-                    for (var k = 1; k < C2P_LUCK_SAMPLES; k++) xs.push(blkMs + d0 * Math.pow(ratio, k));
-                }
-            }
-            xs.forEach(function(x) {
-                pts.push({x: x, y: luckAt(x), marker: {enabled: false}});
-                lastX = x;
+            rounds.forEach(function(r, i) {
+                var lo = Math.max(0, i - N + 1);
+                n = i - lo + 1;
+                sum = 0;
+                for (var j = lo; j <= i; j++) sum += rounds[j].effort;
+                var t = r.ts * 1000;
+                if (t >= minTime) pts.push(point(t, sum, {}));
+                else before = point(minTime, sum, { marker: { enabled: false } });
             });
-            if (endMs > lastX) pts.push([endMs, luckAt(endMs)]);
+            if (before) pts.unshift(before);
+            if (!live || n === 0 || !(live.expectedMs > 0)) return pts;
+            var blkMs = live.lastBlkMs, endMs = Math.max(live.x, blkMs), startMs = Math.max(blkMs, minTime);
+            var at = function(x, extra) {
+                extra.open = true;
+                return point(x, sum + Math.max(x - blkMs, 0) / live.expectedMs, extra);
+            };
+            // The round began before the window: the start value has the
+            // part of it that came before minTime.
+            if (blkMs < minTime && before) pts.shift();
+            var lastX = pts.length > 0 ? pts[pts.length - 1].x : -Infinity;
+            if (startMs > lastX) { pts.push(at(startMs, { marker: { enabled: false } })); lastX = startMs; }
+            for (var s = 1; s < C2P_LUCK_SAMPLES; s++) {
+                var x = startMs + (endMs - startMs) * s / C2P_LUCK_SAMPLES;
+                if (x > lastX) { pts.push(at(x, { marker: { enabled: false } })); lastX = x; }
+            }
+            if (endMs > lastX) pts.push(at(endMs, {}));
             return pts;
         }
-        // END c2pLuckTrend
+        // The luck axis: linear to 100 %, log-compressed above it.
+        function c2pLuckDisplay(luck) {
+            return luck <= 100 ? luck : 100 + 100 * Math.log10(1 + (luck - 100) / 100);
+        }
+        function c2pLuckFromDisplay(v) {
+            return v <= 100 ? v : 100 + 100 * (Math.pow(10, (v - 100) / 100) - 1);
+        }
+
+        // The first-cell class of a row in a duplet: the later block of the
+        // pair is the upper row of the newest-first tables.
+        function c2pDupletEdgeClass(p) {
+            if (!p || !(p.duplet || p.dupletOpen)) return null;
+            return 'duplet-edge' + (p.duplet && !p.dupletOpen ? ' duplet-top' : '') +
+                                   (p.dupletOpen && !p.duplet ? ' duplet-bottom' : '');
+        }
+        // The Recent Blocks cell class of a row's effort. The first block's
+        // 100 % is a convention, not a measurement: it keeps the amber it had.
+        function c2pEffortClass(p) {
+            if (p && p.first) return 'status-pending';
+            var band = p ? c2pEffortBand(p.effort) : '';
+            return band === 'good' ? 'status-confirmed' : band === 'mid' ? 'status-pending'
+                 : band === 'poor' ? 'status-orphaned' : 'effort-unknown';
+        }
+        // Round duration and expected time of a row, in seconds (0: unknown).
+        function c2pRoundTimes(b, p) {
+            var actual = p && p.gap > 0 ? p.gap : (b.time_to_find > 0 ? b.time_to_find : 0);
+            var expected = 0;
+            if (b.expected_time > 0) expected = b.expected_time;
+            else if (p && p.effort > 0 && !p.first && actual > 0) expected = actual / p.effort;
+            else if (b.network_difficulty > 0 && b.pool_hashrate_at_find > 0)
+                expected = b.network_difficulty * 4294967296 / b.pool_hashrate_at_find;
+            return { actual: actual, expected: expected };
+        }
+        // Tooltip texts. Each gives the Poisson odds of what it names, and
+        // none suggests a pattern: our study of 50,707 blocks found none.
+        function c2pPaceTip(p) {
+            if (!p || !p.tier) return '';
+            if (c2pIsFast(p.tier)) {
+                return '⚡ Fast block: found in ' + c2pFmtX(p.effort) + ' the expected time. About ' +
+                    c2pFmtOdds(1 - Math.exp(-C2P_FAST)) + ' % of blocks come in under ⅓ of it' +
+                    (p.tier === 'fast2' ? ' (' + c2pFmtOdds(1 - Math.exp(-C2P_VERY_FAST)) + ' % under 0.1×)' : '') +
+                    ' by pure chance (Poisson). It does not predict the next block.';
+            }
+            return '🐢 Slow block: took ' + c2pFmtX(p.effort) + ' the expected time. About ' +
+                c2pFmtOdds(Math.exp(-C2P_SLOW)) + ' % of blocks take over 2× (' +
+                c2pFmtOdds(Math.exp(-C2P_VERY_SLOW)) + ' % over 3×) by chance. ' +
+                'Mining has no memory, so the pool was never "due" a block.';
+        }
+        function c2pDupletTip(p) {
+            if (!p || !p.duplet) return '';
+            var d = p.duplet, fast = c2pFmtOdds(1 - Math.exp(-C2P_FAST));
+            var s = 'Duplet: 2 blocks ' + c2pFmtDur(d.gap) + ' apart (' + c2pFmtX(p.effort) + ' the expected time). ' +
+                'In a fair Poisson process ' + fast + ' % of consecutive blocks are within ⅓ of the expected time, and ' +
+                c2pFmtOdds(1 - Math.exp(-2 * C2P_FAST)) + ' % of blocks have a neighbour that close. ' +
+                'A dry spell does not speed up the next block: ' +
+                (d.prevEffort > 0 ? 'after this ' + c2pFmtX(d.prevEffort) + ' wait' : 'after any wait') +
+                ' the chance of a quick follow-up was still ' + fast + ' %. ' +
+                'Our study of 50,707 LTC+DASH p2pool blocks (2012-2026) found no excess.';
+            if (d.kind === 'dry') {
+                var pair = Math.exp(-C2P_SLOW) * (1 - Math.exp(-C2P_FAST));
+                s += '\nLong wait then a quick pair: ' + c2pFmtOdds(pair) + ' % of block pairs, about 1 in ' +
+                    Math.round(1 / pair) + '. In any 20 blocks you will see one about half the time.';
+            } else if (d.kind === 'triple') {
+                s += '\nTwo fast blocks in a row: ' + c2pFmtOdds(Math.pow(1 - Math.exp(-C2P_FAST), 2)) +
+                    ' % of consecutive pairs by chance.';
+            }
+            return s;
+        }
+        // How the effort of a row was measured.
+        function c2pEffortSourceNote(p) {
+            if (!p || p.effort === null) return '';
+            if (p.first) {
+                return 'First block known to this node: there is no earlier block to time its round from, ' +
+                    'so it counts as effort 100 % (luck 100 %).';
+            }
+            if (p.source === 'server' && p.method === 'integrated') {
+                return 'Effort integrated over the round from the pool hashrate and difficulty history' +
+                    (p.coverage !== null && p.coverage < 0.995
+                        ? ' (history covers ' + Math.round(p.coverage * 100) + ' % of the round; the rest is taken at its mean).' : '.');
+            }
+            if (p.source === 'client') {
+                return 'Computed in the browser from this node\'s time_to_find / expected_time (older node). ' +
+                    'Expected time uses the pool hashrate sampled at find time (approximate).' +
+                    (p.gapFixed ? ' Timed from the previous main-chain block: the node timed it from an orphaned block.' : '');
+            }
+            return 'Expected time uses the pool hashrate sampled at find time (approximate).';
+        }
+        function c2pEffortTip(p) {
+            if (!p || p.effort === null) return '';
+            var s = 'Effort ' + c2pFmtNum(p.effort * 100) + ' % of expected';
+            if (!p.first && p.gap > 0 && p.expected > 0)
+                s += ': found in ' + c2pFmtDur(p.gap) + ', expected ' + c2pFmtDur(p.expected);
+            s += '.\nLuck = 1 / effort = ' + c2pFmtNum(p.luck) + ' %.';
+            var pace = c2pPaceTip(p);
+            if (pace) s += '\n' + pace;
+            return s + '\n' + c2pEffortSourceNote(p);
+        }
+        function c2pEffortCellTip(b, p) {
+            if (p && p.effort !== null) return c2pEffortTip(p);
+            if (p && p.offChain) {
+                return 'Not on the coin chain (orphaned, stale or never confirmed): it ends no round of the pool, ' +
+                    'so it has no tag and is not counted in pool luck.' +
+                    (p.offEffort !== null ? ' Timed from the last main-chain block before it, it came at ' +
+                        c2pFmtNum(p.offEffort * 100) + ' % of the expected time.' : '');
+            }
+            if (b.luck_method === 'hashrate_unavailable')
+                return 'Effort unavailable -- no pool hashrate is known over this block\'s round';
+            if (b.luck_method === 'relayed')
+                return 'Relayed from a peer over P2P -- this node has no local timing for it, so no effort is computed here';
+            if (b.luck_method === 'netdiff_unavailable')
+                return 'Effort unavailable -- the block header was never synced, so network difficulty at find time is unknown';
+            return 'Effort unknown: this node has no round time and expected time for this block' +
+                (b.luck_method ? ' [' + b.luck_method + ']' : '') + '.';
+        }
+        function c2pPeriodTip(label, per) {
+            if (!per) return 'Pool luck, ' + label + ': no round with a known effort in this period.';
+            var s = 'Pool luck, ' + label + ': ' + per.k + (per.k === 1 ? ' block' : ' blocks') + ' found / ' +
+                (c2pNum(per.blocks_expected) !== null ? per.blocks_expected.toFixed(2) : '?') + ' expected = ' +
+                c2pFmtNum(per.luck) + ' %.';
+            if (per.ci95_low !== null && per.ci95_high !== null)
+                s += '\n95 % interval for the pool\'s true luck: ' + c2pFmtNum(per.ci95_low) + ' – ' +
+                    c2pFmtNum(per.ci95_high) + ' % (exact Poisson).';
+            if (per.k === 0 && per.blocks_expected > 0)
+                s += '\nWith ' + per.blocks_expected.toFixed(2) + ' blocks expected, a fair pool finds none ' +
+                    c2pFmtOdds(Math.exp(-per.blocks_expected)) + ' % of the time (Poisson).';
+            var band = c2pFairBand(per.k);
+            if (band)
+                s += '\nA fair pool lands in ' + c2pFmtNum(band.low) + ' – ' + c2pFmtNum(band.high) +
+                    ' % 95 % of the time with this many blocks.';
+            s += '\nPooled: blocks found / blocks expected, the open round included. Never a mean of per-block luck.';
+            if (per.source === 'client')
+                s += '\nComputed in the browser from this node\'s time_to_find / expected_time (older node).';
+            if (per.skipped > 0)
+                s += '\n' + per.skipped + (per.skipped === 1 ? ' block has' : ' blocks have') +
+                    ' no known effort and ' + (per.skipped === 1 ? 'is' : 'are') + ' left out with ' +
+                    (per.skipped === 1 ? 'its round.' : 'their rounds.');
+            return s;
+        }
+        // A period as the badges and the chart stat show it: the luck, its
+        // interval and block count, and a tone.
+        function c2pPeriodView(per) {
+            if (!per) return { value: '—', detail: '', tone: 'none' };
+            var ci = per.ci95_low !== null && per.ci95_high !== null
+                ? '[' + c2pFmtNum(per.ci95_low) + '–' + c2pFmtNum(per.ci95_high) + '] ' : '';
+            // No block: the blocks expected say more than an interval from 0.
+            if (per.k === 0) {
+                return { value: '0 blk', tone: 'none',
+                         detail: c2pNum(per.blocks_expected) !== null ? '/ ' + per.blocks_expected.toFixed(2) + ' exp.' : '' };
+            }
+            // The tone follows the figure as shown: 99.6 % reads "100%".
+            var shown = +c2pFmtNum(per.luck);
+            return { value: c2pFmtPct(per.luck), detail: ci + 'k=' + per.k,
+                     tone: shown >= 100 ? 'up' : (shown >= 75 ? 'mid' : 'down') };
+        }
+        function c2pRoundTip(open) {
+            if (!open || c2pNum(open.effort) === null || open.effort < 0) return '';
+            var e = open.effort, again = c2pFmtOdds(1 - Math.exp(-1));
+            var s = 'This round has run ' + c2pFmtX(e) + ' its expected length' +
+                (open.elapsed > 0 ? ' (' + c2pFmtDur(open.elapsed) + ' so far)' : '') + '. ' +
+                c2pFmtOdds(Math.exp(-e)) + ' % of rounds run at least this long by chance (Poisson). ';
+            s += open.expected_time > 0
+                ? 'A block is expected every ' + c2pFmtDur(open.expected_time) + ' at the current rate: the chance of one in the next ' +
+                  c2pFmtDur(open.expected_time) + ' is ' + again + ' %, exactly as at the start of the round. Mining has no memory.'
+                : 'The chance of a block within one expected round time from now is ' + again +
+                  ' %, exactly as at the start of the round. Mining has no memory.';
+            if (e > C2P_DRY_HINT) {
+                s += '\nRounds over 5× happen ' + c2pFmtOdds(Math.exp(-C2P_DRY_HINT)) + ' % of the time. If the CI95 ' +
+                    'check under the hashrate chart says the reported hashrate is above the band, look for lost ' +
+                    'hashrate (outage, failover).';
+            }
+            if (open.source === 'server' && open.method === 'integrated') {
+                s += '\nEffort integrated over the open round from the pool hashrate and difficulty history' +
+                    (open.coverage !== null && open.coverage < 0.995
+                        ? ' (history covers ' + Math.round(open.coverage * 100) + ' % of it; the rest is taken at its mean).' : '.');
+            } else if (open.source === 'server_trend') {
+                s += '\nFrom this node\'s current_luck_trend (older node): elapsed / expected time at the current pool hashrate and difficulty.';
+            } else if (open.source === 'client') {
+                s += '\nExpected time at the latest pool hashrate and network difficulty (approximate).';
+            }
+            return s;
+        }
+        // END c2pLuck
+
+        // The Recent Blocks luck badges, from the last /luck_stats
+        // (window.c2pLuckStats) and the pace of the last /recent_blocks
+        // (window.c2pPace). Run after either loads.
+        var C2P_TONE_BG = { up: 'var(--success)', mid: 'var(--warning)', down: 'var(--danger)', none: '#3a3a5a' };
+        function c2pRenderLuckSummary() {
+            var ls = window.c2pLuckStats || null;
+            var pace = window.c2pPace || c2pBlockPace(window.c2pRecentBlocks || [], '');
+            var nowS = Date.now() / 1000;
+            // No main-chain block yet: there is no round to show.
+            var open = pace.lastMain ? c2pOpenRound(ls, pace.lastMain.ts, nowS, 0) : null;
+            var spell = open ? c2pDrySpell(open.effort) : null;
+            var round = d3.select('#luck_current_round');
+            if (spell) {
+                round.style('display', null).text(spell.text)
+                    .style('background', spell.background).attr('title', c2pRoundTip(open));
+            } else {
+                round.style('display', 'none');
+            }
+            var periods = c2pLuckPeriods(ls, pace.rounds, nowS, open, pace.noEffort);
+            [['#luck_seven_days', '7d', '7 days'], ['#luck_thirty_days', '30d', '30 days'],
+             ['#luck_ninety_days', '90d', '90 days']].forEach(function(d) {
+                var per = periods[d[1]], view = c2pPeriodView(per);
+                d3.select(d[0])
+                    .text(d[1] + ': ' + view.value + (view.detail ? ' ' + view.detail : ''))
+                    .style('background', per ? C2P_TONE_BG[view.tone] : 'var(--primary)')
+                    .attr('title', c2pPeriodTip(d[2], per));
+            });
+        }
+
+        // Luck inputs of a hashrate chart, shared by the compact and the
+        // fullscreen build: the pace of the ledger rows, the open round, the
+        // Luck series (the pooled luck of the last C2P_TREND_ROUNDS rounds, on
+        // the display scale) with its axis range, and the period lucks.
+        // The open round is the node's current_round. An older node has none:
+        // its current_luck_trend, else the expected round time from the
+        // freshest network difficulty and pool hashrate on the chart
+        // (net_diff * 2^32 / pool_hashrate), at-find values as fallback.
+        function c2pChartLuck(blocks, minTime, maxTime, values, netDiffData) {
+            var pace = c2pBlockPace(blocks, (window.currency_info && window.currency_info.symbol) || '');
+            var nowMs = Date.now(), last = pace.lastMain, open = null, live = null;
+            if (last) {
+                var liveNetDiff = null;
+                for (var nd = netDiffData.length - 1; nd >= 0; nd--) {
+                    if (netDiffData[nd][1] && netDiffData[nd][1] > 0) { liveNetDiff = netDiffData[nd][1]; break; }
+                }
+                if (!(liveNetDiff > 0)) liveNetDiff = last.network_difficulty;
+                var livePoolHr = 0;
+                for (var hv = values.length - 1; hv >= 0; hv--) {
+                    if (values[hv] > 0) { livePoolHr = values[hv]; break; }
+                }
+                if (!(livePoolHr > 0)) livePoolHr = last.pool_hashrate_at_find;
+                var fallbackExpected = 0;
+                if (liveNetDiff > 0 && livePoolHr > 0) {
+                    fallbackExpected = liveNetDiff * 4294967296 / livePoolHr;
+                } else if (last.expected_time > 0) {
+                    fallbackExpected = last.expected_time;
+                }
+                open = c2pOpenRound(window.c2pLuckStats, last.ts, nowMs / 1000, fallbackExpected);
+                // The tail ends on the round's effort so far: elapsed / effort
+                // per expected block, not the expected time at this instant.
+                if (open && open.pace_time > 0) {
+                    live = { x: Math.max(nowMs, maxTime), lastBlkMs: last.ts * 1000, expectedMs: open.pace_time * 1000 };
+                }
+            }
+            var trend = c2pLuckTrendPoints(pace.rounds, minTime, live, C2P_TREND_ROUNDS).map(function(p) {
+                return { x: p.x, y: c2pLuckDisplay(p.y), luck: p.y, n: p.n, expected: p.expected,
+                         open: !!p.open, marker: p.marker };
+            });
+            // The axis keeps 100 % centred.
+            var luckMin = 0, luckMax = 200;
+            if (trend.length > 0) {
+                var ys = trend.map(function(p) { return p.y; });
+                var dist = Math.max(Math.max.apply(null, ys) - 100, 100 - Math.min.apply(null, ys), 10) * 1.1;
+                luckMin = Math.max(0, 100 - dist);
+                luckMax = 100 + dist;
+            }
+            // A violet band over a dry spell: the open round past 2x, with
+            // the share of rounds that run at least as long (e^-effort).
+            var plotBands = [];
+            if (live && open.effort > C2P_SLOW && live.x > live.lastBlkMs) {
+                plotBands.push({
+                    id: 'c2p-dry-spell',
+                    from: Math.max(live.lastBlkMs, minTime),
+                    to: live.x,
+                    color: 'rgba(167, 139, 250, 0.10)',
+                    zIndex: 1,
+                    label: {
+                        text: 'dry ' + c2pFmtX(open.effort) + ' · ' + c2pFmtOdds(Math.exp(-open.effort)) + ' % of rounds',
+                        style: { color: '#a78bfa', fontSize: '10px' },
+                        align: 'right', textAlign: 'right', x: -4, y: 12
+                    }
+                });
+            }
+            return { pace: pace, open: open, trend: trend, luckMin: luckMin, luckMax: luckMax, plotBands: plotBands,
+                     periods: c2pLuckPeriods(window.c2pLuckStats, pace.rounds, nowMs / 1000, open, pace.noEffort) };
+        }
+        // Luck axis label, from the display scale back to luck %.
+        function c2pLuckAxisLabel(v) {
+            var luck = c2pLuckFromDisplay(v);
+            return luck > 1000 ? (luck / 1000).toFixed(1) + 'k%' : luck.toFixed(0) + '%';
+        }
+        // The Luck series' line of a chart tooltip.
+        function c2pLuckTrendTipHtml(point) {
+            var o = point.point || point;
+            var luck = o.luck != null ? o.luck : c2pLuckFromDisplay(point.y);
+            var s = '<br/><span style="color:' + point.color + '">●</span> Luck';
+            if (o.n > 0) s += ', last ' + o.n + (o.n === 1 ? ' round' : ' rounds') + (o.open ? ' + open round' : '');
+            s += ': <b>' + c2pFmtPct(luck) + '</b>';
+            if (o.n > 0 && o.expected > 0)
+                s += ' <span style="font-size:10px;color:#aaa">(' + o.n + ' found / ' + o.expected.toFixed(2) + ' expected)</span>';
+            return s;
+        }
+        // Marker fill by effort, at the bounds the luck colours had; a block
+        // with no effort is neutral, not green.
+        function c2pMarkerFill(p) {
+            var band = p ? c2pEffortBand(p.effort) : '';
+            return band === 'good' ? '#10b981' : band === 'mid' ? '#f59e0b' : band === 'poor' ? '#ef4444' : '#64748b';
+        }
+        // The Blocks series points. Pace cue: a ⚡ / 🐢 label over the
+        // marker; with more than C2P_PACE_LABEL_MAX markers the labels would
+        // pile up, so the marker's edge is coloured instead.
+        var C2P_PACE_LABEL_MAX = 60;
+        function c2pBlockSeriesData(blockMarkers, pace) {
+            var dense = blockMarkers.length > C2P_PACE_LABEL_MAX;
+            return blockMarkers.map(function(m) {
+                var p = pace.byHash[c2pRowHash(m.block)] || null;
+                var pt = {
+                    x: m.x,
+                    y: m.y,
+                    block: m.block,
+                    pace: p,
+                    marker: {
+                        fillColor: m.style.fillColor || '#10b981',
+                        lineColor: m.style.lineColor,
+                        symbol: m.style.symbol,
+                        radius: 6
+                    }
+                };
+                if (p && p.tag) {
+                    var color = c2pIsFast(p.tier) ? '#00d4ff' : '#a78bfa';
+                    if (dense) {
+                        pt.marker.lineColor = color;
+                    } else {
+                        pt.dataLabels = {
+                            enabled: true, format: p.tag, y: -6, padding: 0, color: color, allowOverlap: true,
+                            crop: false, overflow: 'allow',
+                            style: { fontSize: '10px', fontWeight: 'normal', textOutline: 'none' }
+                        };
+                    }
+                }
+                return pt;
+            });
+        }
+        // A dashed line joining the two blocks of a duplet, from marker edge
+        // to marker edge; a dashed ring round both when they are too close
+        // for a line to show (not on a dense chart, where the fast block's
+        // marker edge is coloured and rings would pile up). Drawn with the
+        // renderer on load and on every redraw, like drawDiffRatioBars.
+        function drawDupletLinks(chart) {
+            (chart.dupletLinks || []).forEach(function(el) { if (el && el.destroy) el.destroy(); });
+            chart.dupletLinks = [];
+            var series = chart.series.find(function(s) { return s.name === 'Blocks'; });
+            if (!series || !series.points || !series.visible) return;
+            var at = {};
+            series.points.forEach(function(pt) { if (pt.block) at[c2pRowHash(pt.block)] = pt; });
+            var style = { stroke: '#00d4ff', 'stroke-width': 1.5, dashstyle: 'ShortDash', fill: 'none', zIndex: 5 };
+            var markerR = 9, dense = series.points.length > C2P_PACE_LABEL_MAX;
+            series.points.forEach(function(pt) {
+                var d = pt.pace && pt.pace.duplet, other = d ? at[d['with']] : null;
+                if (!other || pt.plotX == null || other.plotX == null) return;
+                if (!chart.isInsidePlot(pt.plotX, pt.plotY) || !chart.isInsidePlot(other.plotX, other.plotY)) return;
+                var x1 = other.plotX + chart.plotLeft, y1 = other.plotY + chart.plotTop;
+                var x2 = pt.plotX + chart.plotLeft, y2 = pt.plotY + chart.plotTop;
+                var len = Math.sqrt((x2 - x1) * (x2 - x1) + (y2 - y1) * (y2 - y1));
+                var el;
+                if (len > 2 * markerR + 4) {
+                    var ux = (x2 - x1) / len, uy = (y2 - y1) / len;
+                    el = chart.renderer.path([
+                        ['M', x1 + ux * markerR, y1 + uy * markerR],
+                        ['L', x2 - ux * markerR, y2 - uy * markerR]
+                    ]);
+                } else if (!dense) {
+                    el = chart.renderer.circle((x1 + x2) / 2, (y1 + y2) / 2, len / 2 + markerR + 3);
+                }
+                if (el) chart.dupletLinks.push(el.attr(style).add());
+            });
+        }
+        // Effort, luck, round times and pace of a block, for its chart tooltip.
+        function block_luck_html(b, p) {
+            var s = '', t = c2pRoundTimes(b, p);
+            if (p && p.first) {
+                s += 'Effort: <b style="color:#888">1st block, counted as 100%</b><br/>';
+            } else if (p && p.effort !== null) {
+                var band = c2pEffortBand(p.effort);
+                var color = band === 'good' ? '#00ff88' : (band === 'mid' ? '#ffc107' : '#ff6b6b');
+                s += 'Effort: <b style="color:' + color + '">' + c2pFmtPct(p.effort * 100) + '</b> of expected ' +
+                     '<span style="font-size:10px;color:#aaa">(luck ' + c2pFmtPct(p.luck) + ')</span><br/>';
+            }
+            if (t.actual > 0) s += 'Found in: <b>' + format_dt(t.actual) + '</b><br/>';
+            if (t.expected > 0) s += 'Expected: <b>' + format_dt(t.expected) + '</b><br/>';
+            if (p && p.tag) {
+                var fast = c2pIsFast(p.tier);
+                s += 'Pace: <b style="color:' + (fast ? '#00d4ff' : '#a78bfa') + '">' + p.tag + (fast ? ' fast' : ' slow') +
+                     '</b> · ' + c2pFmtX(p.effort) + ' expected · ' +
+                     (fast ? c2pFmtOdds(1 - Math.exp(-C2P_FAST)) + ' % of blocks come in under ⅓ by chance'
+                           : c2pFmtOdds(Math.exp(-C2P_SLOW)) + ' % of blocks take over 2× by chance') + '<br/>';
+            }
+            if (p && p.duplet) {
+                s += 'Duplet with #' + p.duplet.withHeight + ' (' + c2pFmtDur(p.duplet.gap) + ' apart, ' +
+                     c2pFmtOdds(1 - Math.exp(-C2P_FAST)) + ' % of pairs by chance)<br/>';
+            }
+            return s;
+        }
+        // The Pool Luck stat under a chart: the period luck that matches the
+        // chart's period, with its 95 % interval and block count. The hour
+        // view shows the day (the node serves no shorter period) and the
+        // year view the whole ledger; the label names what is shown.
+        var C2P_GRAPH_PERIOD_LUCK = { hour: '1d', day: '1d', week: '7d', month: '30d', year: 'all' };
+        function c2pGraphLuckStat(statElId, labelElId, legendScopeSel, chartLuck) {
+            var key = C2P_GRAPH_PERIOD_LUCK[currentGraphPeriod] || 'all';
+            var labelEl = document.getElementById(labelElId);
+            if (labelEl) labelEl.textContent = 'Pool Luck ' + key;
+            // No round at all: the honest "accumulating" state, not a bare "-".
+            if (applyLuckEmptyState(statElId, legendScopeSel, chartLuck.trend.length > 0)) return;
+            var el = document.getElementById(statElId);
+            if (!el) return;
+            var per = chartLuck.periods[key], view = c2pPeriodView(per);
+            el.textContent = view.value;
+            el.style.color = view.tone === 'none' ? 'var(--text-muted)' : C2P_TONE_BG[view.tone];
+            el.title = c2pPeriodTip(key, per);
+            if (view.detail) {
+                var detail = document.createElement('span');
+                detail.className = 'luck-ci';
+                detail.textContent = view.detail;
+                el.appendChild(detail);
+            }
+        }
 
         // Honest luck empty-state. The luck line is composited client-side; it
         // legitimately has ZERO points when this node has observed no block with
@@ -8614,7 +9329,7 @@
         // a bare "-" over a clickable-but-empty legend chip reads as "broken".
         // Say it plainly instead: label the stat "accumulating" and grey the
         // Luck legend chip. Returns true when the empty-state was applied so the
-        // caller skips the numeric Avg-Luck path.
+        // caller skips the numeric Pool Luck path.
         function applyLuckEmptyState(statElId, legendScopeSel, hasSeries) {
             var statEl = document.getElementById(statElId);
             var chip = document.querySelector(legendScopeSel + ' .legend-item[data-series="lucktrend"]');
@@ -8632,7 +9347,7 @@
             }
             if (chip) {
                 chip.classList.remove('luck-empty');
-                chip.title = 'Click to toggle luck trend line';
+                chip.title = 'Click to toggle the luck line: the pooled luck of the last ' + C2P_TREND_ROUNDS + ' rounds (blocks found / blocks expected), the open round included';
             }
             if (statEl) { statEl.title = ''; }
             return false;
@@ -8766,8 +9481,6 @@
             
             // Process blocks - filter to exact time range for proper data alignment
             var blockMarkers = [];
-            var luckTrendData = [];
-            var validLucks = [];
             
             // graph_data 4-tuple: [ts_seconds, difficulty, bin_width, default].
             // Plot the RAW network difficulty on its own axis (yAxis 3). The
@@ -8783,6 +9496,10 @@
                 netDiffData.push([sampleTime, (diff && diff > 0) ? diff : null]);
             });
             
+            // Effort, pace and duplets of the ledger rows, the open round and
+            // the Luck series (c2pChartLuck).
+            var chartLuck = c2pChartLuck(blocks, minTime, maxTime, values, netDiffData);
+
             // Sort blocks by timestamp
             var sortedBlocks = blocks.slice().sort(function(a, b) { return a.ts - b.ts; });
             
@@ -8791,15 +9508,6 @@
                 
                 // Check if block is within selected time window (exact range for alignment)
                 if (blockTime >= minTime && blockTime <= maxTime) {
-                    // For luck trend, collect blocks with luck data within time window.
-                    // luck <= 0 means "never computed" (relay-learned row, or a row
-                    // recorded before the netdiff-at-find fix), NOT 0% luck -- plotting
-                    // it drew the 2026-08-05 production chart down to zero. Skip, don't draw.
-                    if (b.luck !== undefined && b.luck !== null && b.luck > 0) {
-                        luckTrendData.push([blockTime, b.luck]);
-                        validLucks.push(b.luck);
-                    }
-                    
                     // Find closest hashrate value for y position
                     var closestIdx = 0;
                     var closestDiff = Math.abs(data[0][0] * 1000 - blockTime);
@@ -8823,18 +9531,10 @@
                         yVal = yVal * heightMultiplier;
                     }
                     
-                    // Determine color based on luck
-                    var color = '#10b981'; // Default green (good luck >= 100%)
-                    if (b.luck !== undefined && b.luck !== null) {
-                        if (b.luck >= 100) {
-                            color = '#10b981'; // Green - good luck
-                        } else if (b.luck >= 75) {
-                            color = '#f59e0b'; // Yellow - medium luck
-                        } else {
-                            color = '#ef4444'; // Red - poor luck
-                        }
-                    }
-                    
+                    // Fill by effort: green up to 100 %, yellow up to 133 %
+                    // (luck 75 %), red above; neutral with no effort.
+                    var color = c2pMarkerFill(chartLuck.pace.byHash[c2pRowHash(b)]);
+
                     blockMarkers.push({
                         x: blockTime,
                         y: yVal,
@@ -8846,100 +9546,16 @@
             
             setGraphHistoryNote('hashrate-graph-note', blocks, minTime);
 
-            // Interpolate luck trend to align with hashrate time boundaries.
-            // Ephemeral final point: live-extrapolate the IN-PROGRESS round to
-            // the render wall-clock "now". luck-if-found-now =
-            //   expected_round_time / elapsed_since_last_block * 100
-            // (same formula as rest_luck_stats current_luck_trend). It reads
-            // high right after a block, decays hyperbolically (~1/elapsed), and
-            // crosses 100% exactly at the expected round duration.
-            // expected_round_time = net_diff * 2^32 / pool_hashrate.
-            var liveLuckPoint = null;
-            if (sortedBlocks.length > 0) {
-                var lastBlk = sortedBlocks[sortedBlocks.length - 1];
-                var lastBlkMs = lastBlk.ts * 1000;
-                var nowMs = Date.now();
-                // Clock skew / just-found: clamp elapsed to >= 1s.
-                var elapsedMs = Math.max(nowMs - lastBlkMs, 1000);
-                // Freshest inputs first, at-find values as fallback.
-                var liveNetDiff = null;
-                for (var nd = netDiffData.length - 1; nd >= 0; nd--) {
-                    if (netDiffData[nd][1] && netDiffData[nd][1] > 0) { liveNetDiff = netDiffData[nd][1]; break; }
-                }
-                if (!(liveNetDiff > 0)) liveNetDiff = lastBlk.network_difficulty;
-                var livePoolHr = 0;
-                for (var hv = values.length - 1; hv >= 0; hv--) {
-                    if (values[hv] > 0) { livePoolHr = values[hv]; break; }
-                }
-                if (!(livePoolHr > 0)) livePoolHr = lastBlk.pool_hashrate_at_find;
-                var expectedMs = 0;
-                if (liveNetDiff > 0 && livePoolHr > 0) {
-                    expectedMs = liveNetDiff * 4294967296 / livePoolHr * 1000;
-                } else if (lastBlk.expected_time > 0) {
-                    expectedMs = lastBlk.expected_time * 1000;
-                }
-                if (expectedMs > 0) {
-                    // Cap at 1000%: transformLuck maps 1000 -> 200 (axis top),
-                    // so a just-found block cannot blow up the centered scale.
-                    var liveLuck = Math.min((expectedMs / elapsedMs) * 100, 1000);
-                    liveLuckPoint = { x: Math.max(nowMs, maxTime), y: liveLuck, expectedMs: expectedMs, lastBlkMs: lastBlkMs };
-                }
-            }
-            luckTrendData = c2pLuckTrendPoints(luckTrendData, sortedBlocks, minTime, liveLuckPoint);
-            
-            // Convert simple array points to objects for luck trend
-            // Apply logarithmic compression to values above 100%
-            // This transforms actual luck (0-infinity) to display luck (0-200)
-            // where 100% stays at 100%, and values above compress logarithmically
-            var transformLuck = function(actualLuck) {
-                if (actualLuck <= 100) {
-                    // Linear below 100%: 0% → 0, 100% → 100
-                    return actualLuck;
-                } else {
-                    // Logarithmic above 100%: 100% → 100, 200% → 130, 500% → 170, 1000% → 200
-                    var distanceAbove = actualLuck - 100;
-                    var compressed = 100 * Math.log10(1 + distanceAbove / 100);
-                    return 100 + compressed;
-                }
-            };
-            
-            luckTrendData = luckTrendData.map(function(point) {
-                if (Array.isArray(point)) {
-                    return {x: point[0], y: transformLuck(point[1])};
-                }
-                return {x: point.x, y: transformLuck(point.y), marker: point.marker};
-            });
-            
+            // The Luck series: the pooled luck of the last rounds, the open
+            // round included, on the display scale (linear to 100 %,
+            // log-compressed above), its axis keeping 100 % centred.
+            var luckTrendData = chartLuck.trend;
+            var luckMin = chartLuck.luckMin, luckMax = chartLuck.luckMax;
+
             // Debug: log processed results
             console.log('Compact - blockMarkers:', blockMarkers.length, 'luckTrendData:', luckTrendData.length, 'minTime:', new Date(minTime), 'maxTime:', new Date(maxTime));
             if (blocks.length > 0) {
                 console.log('Block time:', new Date(blocks[0].ts * 1000));
-            }
-            
-            // Calculate dynamic luck Y-axis range to center 100%
-            var luckMin = 0, luckMax = 200;
-            if (luckTrendData.length > 0) {
-                var transformedValues = luckTrendData.map(function(p) { return p.y; });
-                var minTransformed = Math.min.apply(null, transformedValues);
-                var maxTransformed = Math.max.apply(null, transformedValues);
-                
-                console.log('Transformed luck range - min:', minTransformed.toFixed(1), 'max:', maxTransformed.toFixed(1));
-                
-                // Calculate the distance from 100% for the maximum transformed value
-                var distanceAbove = Math.max(0, maxTransformed - 100);
-                var distanceBelow = Math.max(0, 100 - minTransformed);
-                
-                // Use the larger distance to keep 100% centered
-                var maxDistance = Math.max(distanceAbove, distanceBelow);
-                
-                // Add 10% padding
-                maxDistance = maxDistance * 1.1;
-                
-                // Set symmetric range around 100%
-                luckMin = Math.max(0, 100 - maxDistance);
-                luckMax = 100 + maxDistance;
-                
-                console.log('Luck axis - min:', luckMin.toFixed(1), 'max:', luckMax.toFixed(1), '(100% centered)');
             }
             
             // Update stats
@@ -8947,10 +9563,6 @@
             var sum = values.reduce(function(a, b) { return a + b; }, 0);
             var avg = values.length > 0 ? sum / values.length : 0;
             var peak = Math.max.apply(null, values) || 0;
-            
-            // Calculate average luck from blocks within exact time range
-            var avgLuck = validLucks.length > 0 ? 
-                validLucks.reduce(function(a, b) { return a + b; }, 0) / validLucks.length : null;
             
             document.getElementById('graph-current').textContent = format_hashrate(current);
             document.getElementById('graph-average').textContent = format_hashrate(avg);
@@ -8973,21 +9585,8 @@
             currentUniqueMinerCount = (currentUniqueMinerCount === null || currentUniqueMinerCount === undefined) ? 0 : Math.round(currentUniqueMinerCount);
             document.getElementById('graph-miners').textContent = currentWorkerCount + '/' + currentUniqueMinerCount;
             
-            // luckTrendData empty => no observed block AND no live-extrapolation
-            // input: render the honest "accumulating" state, not a bare "-".
-            if (!applyLuckEmptyState('graph-luck', '.graph-legend.compact', luckTrendData.length > 0)) {
-                var luckEl = document.getElementById('graph-luck');
-                if (avgLuck !== null) {
-                    luckEl.textContent = d3.format('.0f')(avgLuck) + '%';
-                    luckEl.style.color = avgLuck >= 100 ? 'var(--success)' : (avgLuck >= 75 ? 'var(--warning)' : 'var(--danger)');
-                } else {
-                    // Series has only the live in-progress point (no completed
-                    // round in-window yet): the line draws, but there is no
-                    // block-average to report.
-                    luckEl.textContent = '-';
-                    luckEl.style.color = '';
-                }
-            }
+            // Pool Luck: the period luck that matches the chart's period.
+            c2pGraphLuckStat('graph-luck', 'graph-luck-label', '.graph-legend.compact', chartLuck);
             // CI95 effective-vs-reported band. lastNetDiff read defensively so
             // this is agnostic to the netdiff sample shape; k counts blocks WE
             // found in the window regardless of whether luck was computable --
@@ -9029,8 +9628,8 @@
                     panKey: 'shift',
                     zoomType: 'x',
                     events: {
-                        load: function() { drawDiffRatioBars(this); },
-                        redraw: function() { drawDiffRatioBars(this); }
+                        load: function() { drawDiffRatioBars(this); drawDupletLinks(this); },
+                        redraw: function() { drawDiffRatioBars(this); drawDupletLinks(this); }
                     }
                 },
                 credits: { enabled: false },
@@ -9043,7 +9642,8 @@
                         style: { color: '#e0e0e0', fontSize: '10px' }
                     },
                     gridLineColor: '#2a2a4a',
-                    gridLineWidth: 1
+                    gridLineWidth: 1,
+                    plotBands: chartLuck.plotBands
                 },
                 yAxis: [{
                     // Primary Y-axis for hashrate (linear with intelligent max)
@@ -9068,29 +9668,7 @@
                     tickColor: '#ffc107',
                     labels: {
                         style: { color: '#ffc107', fontSize: '10px' },
-                        formatter: function() {
-                            // Inverse transform: convert display value back to actual luck
-                            var displayValue = this.value;
-                            if (displayValue <= 100) {
-                                // Linear range: display = actual
-                                return displayValue.toFixed(0) + '%';
-                            } else {
-                                // Logarithmic range: need to reverse the compression
-                                var compressed = displayValue - 100;
-                                var actualLuck = 100 + 100 * (Math.pow(10, compressed / 100) - 1);
-                                
-                                // Show ∞ for the very highest value
-                                if (this.isLast && displayValue > luckMax * 0.98) {
-                                    return '∞';
-                                }
-                                
-                                // Show rounded value for readability
-                                if (actualLuck > 1000) {
-                                    return (actualLuck / 1000).toFixed(1) + 'k%';
-                                }
-                                return actualLuck.toFixed(0) + '%';
-                            }
-                        }
+                        formatter: function() { return c2pLuckAxisLabel(this.value); }
                     },
                     gridLineWidth: 0,
                     opposite: true,
@@ -9141,19 +9719,7 @@
                             var s = '<b>' + Highcharts.dateFormat('%b %e, %H:%M:%S', this.x) + '</b><br/>';
                             s += block_headline_html(b);
                             s += 'Height: <b>' + (b.number || '?') + '</b><br/>';
-                            if (b.luck !== undefined && b.luck !== null) {
-                                var luckColor = b.luck >= 100 ? '#00ff88' : (b.luck >= 75 ? '#ffc107' : '#ff6b6b');
-                                var luckFormat = b.luck < 1 ? d3.format('.2f')(b.luck) : b.luck < 1 ? d3.format('.2f')(b.luck) : d3.format('.0f')(b.luck);
-                                s += 'Luck: <b style="color:' + luckColor + '">' + luckFormat + '%</b><br/>';
-                            } else if (b.luck_method === 'first_block') {
-                                s += 'Luck: <b style="color:#888">1st block</b><br/>';
-                            }
-                            if (b.time_to_find) {
-                                s += 'Found in: <b>' + format_dt(b.time_to_find) + '</b><br/>';
-                            }
-                            if (b.expected_time) {
-                                s += 'Expected: <b>' + format_dt(b.expected_time) + '</b><br/>';
-                            }
+                            s += block_luck_html(b, this.point ? this.point.pace : this.pace);
                             if (b.network_difficulty) {
                                 s += 'Net Diff: <b style="color:#8888ff">' + diff_as_hashrate(b.network_difficulty) + '</b><br/>';
                                 s += '<span style="font-size:10px;color:#aaa">(' + diff_detail(b.network_difficulty) + ')</span><br/>';
@@ -9187,8 +9753,7 @@
                             if (point.series.name === 'Hashrate') goodVal = point.y;
                             if (point.series.name === 'Dead on arrival') doaVal = point.y;
                             if (point.series.name === 'Luck Trend') {
-                                s += '<br/><span style="color:' + point.color + '">●</span> ' + 
-                                     point.series.name + ': <b>' + d3.format('.0f')(point.y) + '%</b>';
+                                s += c2pLuckTrendTipHtml(point);
                             } else if (point.series.name === 'Workers' || point.series.name === 'Miners' || point.series.name === 'Connected') {
                                 s += '<br/><span style="color:' + point.color + '">●</span> ' + 
                                      point.series.name + ': <b>' + Math.round(point.y) + '</b>';
@@ -9260,19 +9825,8 @@
                 }, {
                     type: 'scatter',
                     name: 'Blocks',
-                    data: blockMarkers.map(function(m) {
-                        return {
-                            x: m.x,
-                            y: m.y,
-                            block: m.block,
-                            marker: {
-                                fillColor: m.style.fillColor || '#10b981',
-                                lineColor: m.style.lineColor,
-                                symbol: m.style.symbol,
-                                radius: 6
-                            }
-                        };
-                    }),
+                    data: c2pBlockSeriesData(blockMarkers, chartLuck.pace),
+                    turboThreshold: 0,
                     color: '#10b981',
                     visible: seriesVisibility.blocks,
                     yAxis: 0,
@@ -9281,18 +9835,7 @@
                             var b = this.block;
                             var s = block_headline_html(b);
                             s += 'Height: <b>' + (b.number || b.block_height || '?') + '</b><br/>';
-                            if (b.luck !== undefined && b.luck !== null) {
-                                var luckColor = b.luck >= 100 ? '#00ff88' : (b.luck >= 75 ? '#ffc107' : '#ff6b6b');
-                                s += 'Luck: <b style="color:' + luckColor + '">' + (b.luck < 1 ? d3.format('.2f')(b.luck) : d3.format('.0f')(b.luck)) + '%</b><br/>';
-                            } else if (b.luck_method === 'first_block') {
-                                s += 'Luck: <b style="color:#888">1st block</b><br/>';
-                            }
-                            if (b.time_to_find) {
-                                s += 'Found in: <b>' + format_dt(b.time_to_find) + '</b><br/>';
-                            }
-                            if (b.expected_time) {
-                                s += 'Expected: <b>' + format_dt(b.expected_time) + '</b><br/>';
-                            }
+                            s += block_luck_html(b, this.point ? this.point.pace : this.pace);
                             if (b.network_difficulty) {
                                 s += 'Net Diff: <b style="color:#8888ff">' + diff_as_hashrate(b.network_difficulty) + '</b><br/>';
                                 s += '<span style="font-size:10px;color:#aaa">(' + diff_detail(b.network_difficulty) + ')</span><br/>';
@@ -9342,9 +9885,10 @@
                     yAxis: 2,
                     visible: seriesVisibility.connected
                 }, {
-                    type: 'spline',
+                    type: 'line',
                     name: 'Luck Trend',
                     data: luckTrendData,
+                    turboThreshold: 0,
                     color: '#ffc107',
                     lineWidth: 2,
                     dashStyle: 'ShortDash',
@@ -9488,8 +10032,6 @@
             
             // Process blocks - filter to exact time range for proper data alignment
             var blockMarkers = [];
-            var luckTrendData = [];
-            var validLucks = [];
             
             // graph_data 4-tuple [ts_seconds, difficulty, bin_width, default];
             // raw difficulty on yAxis 3, leading 0.0 bins nulled (see compact).
@@ -9501,6 +10043,10 @@
                 netDiffData.push([sampleTime, (diff && diff > 0) ? diff : null]);
             });
             
+            // Effort, pace and duplets of the ledger rows, the open round and
+            // the Luck series (c2pChartLuck).
+            var chartLuck = c2pChartLuck(blocks, minTime, maxTime, values, netDiffData);
+
             // Sort blocks by timestamp
             var sortedBlocks = blocks.slice().sort(function(a, b) { return a.ts - b.ts; });
             
@@ -9509,15 +10055,6 @@
                 
                 // Check if block is within selected time window (exact range for alignment)
                 if (blockTime >= minTime && blockTime <= maxTime) {
-                    // For luck trend, collect blocks with luck data within time window.
-                    // luck <= 0 means "never computed" (relay-learned row, or a row
-                    // recorded before the netdiff-at-find fix), NOT 0% luck -- plotting
-                    // it drew the 2026-08-05 production chart down to zero. Skip, don't draw.
-                    if (b.luck !== undefined && b.luck !== null && b.luck > 0) {
-                        luckTrendData.push([blockTime, b.luck]);
-                        validLucks.push(b.luck);
-                    }
-                    
                     // Find closest hashrate value for y position
                     var closestIdx = 0;
                     var closestDiff = Math.abs(data[0][0] * 1000 - blockTime);
@@ -9541,18 +10078,10 @@
                         yVal = yVal * heightMultiplier;
                     }
                     
-                    // Determine color based on luck
-                    var color = '#10b981'; // Default green (good luck >= 100%)
-                    if (b.luck !== undefined && b.luck !== null) {
-                        if (b.luck >= 100) {
-                            color = '#10b981'; // Green - good luck
-                        } else if (b.luck >= 75) {
-                            color = '#f59e0b'; // Yellow - medium luck
-                        } else {
-                            color = '#ef4444'; // Red - poor luck
-                        }
-                    }
-                    
+                    // Fill by effort: green up to 100 %, yellow up to 133 %
+                    // (luck 75 %), red above; neutral with no effort.
+                    var color = c2pMarkerFill(chartLuck.pace.byHash[c2pRowHash(b)]);
+
                     blockMarkers.push({
                         x: blockTime,
                         y: yVal,
@@ -9564,81 +10093,10 @@
             
             setGraphHistoryNote('fs-graph-note', blocks, minTime);
 
-            // Interpolate luck trend to align with hashrate time boundaries.
-            // Ephemeral final point: live-extrapolate the IN-PROGRESS round to
-            // the render wall-clock "now". luck-if-found-now =
-            //   expected_round_time / elapsed_since_last_block * 100
-            // (same formula as rest_luck_stats current_luck_trend). It reads
-            // high right after a block, decays hyperbolically (~1/elapsed), and
-            // crosses 100% exactly at the expected round duration.
-            // expected_round_time = net_diff * 2^32 / pool_hashrate.
-            var liveLuckPoint = null;
-            if (sortedBlocks.length > 0) {
-                var lastBlk = sortedBlocks[sortedBlocks.length - 1];
-                var lastBlkMs = lastBlk.ts * 1000;
-                var nowMs = Date.now();
-                // Clock skew / just-found: clamp elapsed to >= 1s.
-                var elapsedMs = Math.max(nowMs - lastBlkMs, 1000);
-                // Freshest inputs first, at-find values as fallback.
-                var liveNetDiff = null;
-                for (var nd = netDiffData.length - 1; nd >= 0; nd--) {
-                    if (netDiffData[nd][1] && netDiffData[nd][1] > 0) { liveNetDiff = netDiffData[nd][1]; break; }
-                }
-                if (!(liveNetDiff > 0)) liveNetDiff = lastBlk.network_difficulty;
-                var livePoolHr = 0;
-                for (var hv = values.length - 1; hv >= 0; hv--) {
-                    if (values[hv] > 0) { livePoolHr = values[hv]; break; }
-                }
-                if (!(livePoolHr > 0)) livePoolHr = lastBlk.pool_hashrate_at_find;
-                var expectedMs = 0;
-                if (liveNetDiff > 0 && livePoolHr > 0) {
-                    expectedMs = liveNetDiff * 4294967296 / livePoolHr * 1000;
-                } else if (lastBlk.expected_time > 0) {
-                    expectedMs = lastBlk.expected_time * 1000;
-                }
-                if (expectedMs > 0) {
-                    // Cap at 1000%: transformLuck maps 1000 -> 200 (axis top),
-                    // so a just-found block cannot blow up the centered scale.
-                    var liveLuck = Math.min((expectedMs / elapsedMs) * 100, 1000);
-                    liveLuckPoint = { x: Math.max(nowMs, maxTime), y: liveLuck, expectedMs: expectedMs, lastBlkMs: lastBlkMs };
-                }
-            }
-            luckTrendData = c2pLuckTrendPoints(luckTrendData, sortedBlocks, minTime, liveLuckPoint);
-            
-            // Convert simple array points to objects for luck trend
-            // Apply logarithmic compression to values above 100% (same as compact chart)
-            var fsTransformLuck = function(actualLuck) {
-                if (actualLuck <= 100) {
-                    return actualLuck;
-                } else {
-                    var distanceAbove = actualLuck - 100;
-                    var compressed = 100 * Math.log10(1 + distanceAbove / 100);
-                    return 100 + compressed;
-                }
-            };
-            
-            luckTrendData = luckTrendData.map(function(point) {
-                if (Array.isArray(point)) {
-                    return {x: point[0], y: fsTransformLuck(point[1])};
-                }
-                return {x: point.x, y: fsTransformLuck(point.y), marker: point.marker};
-            });
-            
-            // Calculate dynamic luck Y-axis range to center 100% (fullscreen)
-            var fsLuckMin = 0, fsLuckMax = 200;
-            if (luckTrendData.length > 0) {
-                var transformedValues = luckTrendData.map(function(p) { return p.y; });
-                var minTransformed = Math.min.apply(null, transformedValues);
-                var maxTransformed = Math.max.apply(null, transformedValues);
-                
-                var distanceAbove = Math.max(0, maxTransformed - 100);
-                var distanceBelow = Math.max(0, 100 - minTransformed);
-                var maxDistance = Math.max(distanceAbove, distanceBelow) * 1.1;
-                
-                fsLuckMin = Math.max(0, 100 - maxDistance);
-                fsLuckMax = 100 + maxDistance;
-            }
-            
+            // The Luck series and its axis range, as on the compact chart.
+            var luckTrendData = chartLuck.trend;
+            var fsLuckMin = chartLuck.luckMin, fsLuckMax = chartLuck.luckMax;
+
             // Update fullscreen stats
             var current = values[values.length - 1] || 0;
             var sum = values.reduce(function(a, b) { return a + b; }, 0);
@@ -9647,10 +10105,6 @@
             var doaSum = doaValues.reduce(function(a, b) { return a + b; }, 0);
             var doaAvg = doaValues.length > 0 ? doaSum / doaValues.length : 0;
             var doaPercent = avg > 0 ? ((doaAvg / (avg + doaAvg)) * 100).toFixed(2) : '0.00';
-            
-            // Calculate average luck for fullscreen
-            var fsAvgLuck = validLucks.length > 0 ? 
-                validLucks.reduce(function(a, b) { return a + b; }, 0) / validLucks.length : null;
             
             document.getElementById('fs-graph-current').textContent = format_hashrate(current);
             document.getElementById('fs-graph-average').textContent = format_hashrate(avg);
@@ -9663,18 +10117,9 @@
             fsUniqueMinerCount = (fsUniqueMinerCount === null || fsUniqueMinerCount === undefined) ? 0 : Math.round(fsUniqueMinerCount);
             document.getElementById('fs-graph-miners').textContent = fsWorkerCount + '/' + fsUniqueMinerCount;
             
-            // Same honest empty-state as the compact chart, scoped to the
-            // fullscreen legend/stat.
-            if (!applyLuckEmptyState('fs-graph-luck', '.fullscreen-controls', luckTrendData.length > 0)) {
-                var luckEl = document.getElementById('fs-graph-luck');
-                if (fsAvgLuck !== null) {
-                    luckEl.textContent = d3.format('.0f')(fsAvgLuck) + '%';
-                    luckEl.style.color = fsAvgLuck >= 100 ? 'var(--success)' : (fsAvgLuck >= 75 ? 'var(--warning)' : 'var(--danger)');
-                } else {
-                    luckEl.textContent = '-';
-                    luckEl.style.color = '';
-                }
-            }
+            // Pool Luck, as on the compact chart, scoped to the fullscreen
+            // legend/stat.
+            c2pGraphLuckStat('fs-graph-luck', 'fs-graph-luck-label', '.fullscreen-controls', chartLuck);
             // CI95 effective-vs-reported band. lastNetDiff read defensively so
             // this is agnostic to the netdiff sample shape; k counts blocks WE
             // found in the window regardless of whether luck was computable --
@@ -9707,8 +10152,8 @@
                     panKey: 'shift',
                     zoomType: 'x',
                     events: {
-                        load: function() { drawDiffRatioBars(this); },
-                        redraw: function() { drawDiffRatioBars(this); }
+                        load: function() { drawDiffRatioBars(this); drawDupletLinks(this); },
+                        redraw: function() { drawDiffRatioBars(this); drawDupletLinks(this); }
                     }
                 },
                 credits: { enabled: false },
@@ -9719,7 +10164,8 @@
                     tickColor: '#3a3a5a',
                     labels: { style: { color: '#e0e0e0', fontSize: '11px' } },
                     gridLineColor: '#2a2a4a',
-                    gridLineWidth: 1
+                    gridLineWidth: 1,
+                    plotBands: chartLuck.plotBands
                 },
                 yAxis: [{
                     title: { text: null },
@@ -9741,24 +10187,7 @@
                     tickColor: '#ffc107',
                     labels: {
                         style: { color: '#ffc107', fontSize: '11px' },
-                        formatter: function() {
-                            // Inverse transform: convert display value back to actual luck
-                            var displayValue = this.value;
-                            if (displayValue <= 100) {
-                                return displayValue.toFixed(0) + '%';
-                            } else {
-                                var compressed = displayValue - 100;
-                                var actualLuck = 100 + 100 * (Math.pow(10, compressed / 100) - 1);
-                                
-                                if (this.isLast && displayValue > fsLuckMax * 0.98) {
-                                    return '∞';
-                                }
-                                if (actualLuck > 1000) {
-                                    return (actualLuck / 1000).toFixed(1) + 'k%';
-                                }
-                                return actualLuck.toFixed(0) + '%';
-                            }
-                        }
+                        formatter: function() { return c2pLuckAxisLabel(this.value); }
                     },
                     gridLineWidth: 0,
                     opposite: true,
@@ -9810,18 +10239,7 @@
                             var s = '<b>' + Highcharts.dateFormat('%b %e, %H:%M:%S', this.x) + '</b><br/>';
                             s += block_headline_html(b);
                             s += 'Height: <b>' + (b.number || '?') + '</b><br/>';
-                            if (b.luck !== undefined && b.luck !== null) {
-                                var luckColor = b.luck >= 100 ? '#00ff88' : (b.luck >= 75 ? '#ffc107' : '#ff6b6b');
-                                s += 'Luck: <b style="color:' + luckColor + '">' + b.luck < 1 ? d3.format('.2f')(b.luck) : d3.format('.0f')(b.luck) + '%</b><br/>';
-                            } else if (b.luck_method === 'first_block') {
-                                s += 'Luck: <b style="color:#888">1st block</b><br/>';
-                            }
-                            if (b.time_to_find) {
-                                s += 'Found in: <b>' + format_dt(b.time_to_find) + '</b><br/>';
-                            }
-                            if (b.expected_time) {
-                                s += 'Expected: <b>' + format_dt(b.expected_time) + '</b><br/>';
-                            }
+                            s += block_luck_html(b, this.point ? this.point.pace : this.pace);
                             if (b.network_difficulty) {
                                 s += 'Net Diff: <b style="color:#8888ff">' + diff_as_hashrate(b.network_difficulty) + '</b><br/>';
                                 s += '<span style="font-size:11px;color:#888">(Hashrate needed to solve in ' + format_duration(block_period_sec()) + ')</span><br/>';
@@ -9857,8 +10275,7 @@
                             if (point.series.name === 'Hashrate') goodVal = point.y;
                             if (point.series.name === 'Dead on arrival') doaVal = point.y;
                             if (point.series.name === 'Luck Trend') {
-                                s += '<br/><span style="color:' + point.color + '">●</span> ' + 
-                                     point.series.name + ': <b>' + d3.format('.0f')(point.y) + '%</b>';
+                                s += c2pLuckTrendTipHtml(point);
                             } else if (point.series.name === 'Workers' || point.series.name === 'Miners' || point.series.name === 'Connected') {
                                 s += '<br/><span style="color:' + point.color + '">●</span> ' + 
                                      point.series.name + ': <b>' + Math.round(point.y) + '</b>';
@@ -9942,19 +10359,8 @@
                 }, {
                     type: 'scatter',
                     name: 'Blocks',
-                    data: blockMarkers.map(function(m) {
-                        return {
-                            x: m.x,
-                            y: m.y,
-                            block: m.block,
-                            marker: {
-                                fillColor: m.style.fillColor || '#10b981',
-                                lineColor: m.style.lineColor,
-                                symbol: m.style.symbol,
-                                radius: 6
-                            }
-                        };
-                    }),
+                    data: c2pBlockSeriesData(blockMarkers, chartLuck.pace),
+                    turboThreshold: 0,
                     color: '#10b981',
                     visible: seriesVisibility.blocks,
                     yAxis: 0,
@@ -9963,18 +10369,7 @@
                             var b = this.block;
                             var s = block_headline_html(b);
                             s += 'Height: <b>' + (b.number || b.block_height || '?') + '</b><br/>';
-                            if (b.luck !== undefined && b.luck !== null) {
-                                var luckColor = b.luck >= 100 ? '#00ff88' : (b.luck >= 75 ? '#ffc107' : '#ff6b6b');
-                                s += 'Luck: <b style="color:' + luckColor + '">' + (b.luck < 1 ? d3.format('.2f')(b.luck) : d3.format('.0f')(b.luck)) + '%</b><br/>';
-                            } else if (b.luck_method === 'first_block') {
-                                s += 'Luck: <b style="color:#888">1st block</b><br/>';
-                            }
-                            if (b.time_to_find) {
-                                s += 'Found in: <b>' + format_dt(b.time_to_find) + '</b><br/>';
-                            }
-                            if (b.expected_time) {
-                                s += 'Expected: <b>' + format_dt(b.expected_time) + '</b><br/>';
-                            }
+                            s += block_luck_html(b, this.point ? this.point.pace : this.pace);
                             if (b.network_difficulty) {
                                 s += 'Net Diff: <b style="color:#8888ff">' + diff_as_hashrate(b.network_difficulty) + '</b><br/>';
                                 s += '<span style="font-size:10px;color:#aaa">(' + diff_detail(b.network_difficulty) + ')</span><br/>';
@@ -10024,9 +10419,10 @@
                     yAxis: 2,
                     visible: seriesVisibility.connected
                 }, {
-                    type: 'spline',
+                    type: 'line',
                     name: 'Luck Trend',
                     data: luckTrendData,
+                    turboThreshold: 0,
                     color: '#ffc107',
                     lineWidth: 2,
                     dashStyle: 'ShortDash',
