@@ -24,14 +24,15 @@ interface Round {
 interface PaceSet { byHash: Record<string, { effort: number | null; tag: string }>; rounds: Round[]; noEffort: number[]; lastMain: Row | null }
 interface Open {
   effort: number; elapsed: number | null; expected_time: number | null; source: string; since: string | null;
-  pace_time?: number | null; method?: string | null; coverage?: number | null; covered_effort?: number;
+  pace_time?: number | null; method?: string | null; coverage?: number | null; covered_effort?: number; lowCoverage?: boolean;
 }
 interface Period {
   k: number; blocks_expected: number; luck: number; ci95_low: number | null; ci95_high: number | null;
   span_s: number | null; source: string; skipped?: number;
 }
 type Periods = Record<'1d' | '7d' | '30d' | '90d' | 'all', Period | null>;
-interface Spell { state: string; text: string; background: string; hint: boolean }
+interface Spell { state: string; text: string; background: string; hint: boolean; color?: string }
+interface Band { id: string; from: number; to: number; color: string; label: { text: string } }
 interface Luck {
   c2pBlockPace(rows: unknown[], sym?: string): PaceSet;
   c2pLuckOf(k: number, expected: number): Period | null;
@@ -41,7 +42,8 @@ interface Luck {
   c2pLuckPeriods(luckStats: unknown, rounds: Round[], nowS: number, open: Open | null, noEffort?: number[]): Periods;
   c2pPeriodView(per: Period | null): { value: string; detail: string; tone: string };
   c2pPeriodTip(label: string, per: Period | null): string;
-  c2pDrySpell(e: number | null): Spell | null;
+  c2pDrySpell(e: number | null, low?: boolean): Spell | null;
+  c2pDrySpellBands(open: Open | null, lastBlkMs: number, minTime: number, endMs: number): Band[];
   c2pRoundTip(open: Open | null): string;
   c2pLuckTrendPoints(rounds: Round[], minTime: number, live: unknown, N?: number): { x: number; y: number }[];
 }
@@ -99,8 +101,8 @@ test('the open round: the node\'s current_round, else 100 / current_luck_trend, 
   const now = 1794800000, last = now - 7200;
   const served = { current_luck_trend: 1, current_round: { elapsed: 7100, expected_time: 3550, effort: 2, since_block_hash: 'aa' } };
   assert.deepEqual(L.c2pOpenRound(served, last, now, 999),
-                   { effort: 2, covered_effort: 2, elapsed: 7100, expected_time: 3550, pace_time: 3550, source: 'server', since: 'aa',
-                     method: null, coverage: null });
+                   { effort: 2, covered_effort: 2, elapsed: 7100, expected_time: 3550, pace_time: 3550, lowCoverage: false, source: 'server',
+                     since: 'aa', method: null, coverage: null });
   // The node's effort is integrated over the round and its expected_time is
   // the time to a block at the rate NOW: after a rate change they differ.
   // Where the rate history covers the round in part, the effort is scaled
@@ -123,12 +125,12 @@ test('the open round: the node\'s current_round, else 100 / current_luck_trend, 
   assert.equal(L.c2pOpenRound({ current_round: null, current_luck_trend: 40 }, last, now, 3600), null);
   // An older node: current_luck_trend = expected / elapsed * 100.
   assert.deepEqual(L.c2pOpenRound({ current_luck_trend: 40 }, last, now, 999),
-                   { effort: 2.5, covered_effort: 2.5, elapsed: 7200, expected_time: 2880, pace_time: 2880, source: 'server_trend', since: null,
-                     method: null, coverage: null });
+                   { effort: 2.5, covered_effort: 2.5, elapsed: 7200, expected_time: 2880, pace_time: 2880, lowCoverage: false,
+                     source: 'server_trend', since: null, method: null, coverage: null });
   // Neither: the round since the last block against the expected time given.
   assert.deepEqual(L.c2pOpenRound({ luck_available: true }, last, now, 3600),
-                   { effort: 2, covered_effort: 2, elapsed: 7200, expected_time: 3600, pace_time: 3600, source: 'client', since: null,
-                     method: null, coverage: null });
+                   { effort: 2, covered_effort: 2, elapsed: 7200, expected_time: 3600, pace_time: 3600, lowCoverage: false, source: 'client',
+                     since: null, method: null, coverage: null });
   assert.deepEqual(L.c2pOpenRound(null, last, now, 3600)!.effort, 2);
   for (const ls of [null, {}, { current_luck_trend: 0 }, { current_luck_trend: null }, { current_round: { effort: null } }])
     assert.equal(L.c2pOpenRound(ls, last, now, 0), null);
@@ -385,6 +387,52 @@ test('the Round tooltip gives the odds of a round this long, and no memory', () 
                /^This round has run 0\.5× its expected length\. 61 % of rounds run at least this long by chance \(Poisson\)\. The chance of a block within one expected round time from now is 63 %/);
   assert.doesNotMatch(long + L.c2pRoundTip(open), /overdue|is due|streak|more likely|catch/i);
   assert.equal(L.c2pRoundTip(null), '');
+});
+
+test('an open round the rate history covers for under half is called no dry spell: muted Round N×, no band', () => {
+  const now = 1794800000, last = now - 7200;
+  const cr = (coverage: number, effort_method = 'integrated', effort = 2.4) =>
+    ({ current_round: { elapsed: 7200, expected_time: 5400, effort, effort_method, history_coverage: coverage, since_block_hash: 'bb' } });
+  // The mark: the same rule as a row's, C2P_MIN_TAG_COVERAGE = 0.5.
+  assert.deepEqual([0.1, 0.3, 0.4999, 0.5, 0.9].map(c => L.c2pOpenRound(cr(c), last, now, 0)!.lowCoverage), [true, true, true, false, false]);
+  // A single sample is not scaled up from a part, and an older node carries no coverage.
+  assert.equal(L.c2pOpenRound(cr(0, 'single_sample'), last, now, 0)!.lowCoverage, false);
+  assert.equal(L.c2pOpenRound({ current_luck_trend: 40 }, last, now, 0)!.lowCoverage, false);
+  assert.equal(L.c2pOpenRound({}, last, now, 3600)!.lowCoverage, false);
+
+  // The badge: the figure, muted, whatever it reads; never a dry spell.
+  for (const [e, text] of [[0.6, 'Round 0.6×'], [1.6, 'Round 1.6×'], [2.4, 'Round 2.4×'], [3.1, 'Round 3.1×'], [5.5, 'Round 5.5×']] as const) {
+    assert.deepEqual(L.c2pDrySpell(e, true), { state: 'low', text, background: '#3a3a5a', color: 'var(--text-muted)', hint: false });
+  }
+  assert.equal(L.c2pDrySpell(2.4, false)!.text, '🏜️ Dry spell 2.4×');
+  assert.equal(L.c2pDrySpell(2.4)!.color, undefined, 'the other states keep the badge colour');
+
+  // The chart band: drawn over a measured dry spell, not over this one.
+  const low = L.c2pOpenRound(cr(0.3), last, now, 0)!, measured = L.c2pOpenRound(cr(0.9), last, now, 0)!;
+  const lastMs = last * 1000, nowMs = now * 1000, minTime = nowMs - 86400e3;
+  const bands = L.c2pDrySpellBands(measured, lastMs, minTime, nowMs);
+  assert.equal(bands.length, 1);
+  assert.deepEqual([bands[0]!.id, bands[0]!.from, bands[0]!.to, bands[0]!.label.text], ['c2p-dry-spell', lastMs, nowMs, 'dry 2.4× · 9.1 % of rounds']);
+  assert.deepEqual(L.c2pDrySpellBands(low, lastMs, minTime, nowMs), []);
+  // As before: none at or under 2x, none for a round that has not begun, and
+  // it starts at the window's left edge when the round is older.
+  assert.deepEqual(L.c2pDrySpellBands(L.c2pOpenRound(cr(0.9, 'integrated', 2), last, now, 0), lastMs, minTime, nowMs), []);
+  assert.deepEqual(L.c2pDrySpellBands(measured, nowMs, minTime, nowMs), []);
+  assert.deepEqual(L.c2pDrySpellBands(null, lastMs, minTime, nowMs), []);
+  assert.equal(L.c2pDrySpellBands(measured, minTime - 3600e3, minTime, nowMs)[0]!.from, minTime);
+
+  // The tooltip gives the coverage and quotes no odds on the figure.
+  const tip = L.c2pRoundTip(low);
+  assert.match(tip, /^This round reads 2\.4× its expected length \(2h 0m so far\), but the rate history covers 30 % of it: the figure is mostly extrapolation, so no dry spell is called\. /);
+  assert.doesNotMatch(tip, /of rounds run at least this long/);
+  // What is ahead does not depend on the round so far: that part stays.
+  assert.match(tip, /A block is expected every 1h 30m at the current rate: the chance of one in the next 1h 30m is 63 %/);
+  assert.doesNotMatch(L.c2pRoundTip(L.c2pOpenRound(cr(0.3, 'integrated', 5.5), last, now, 0)), /Rounds over 5×/);
+  assert.match(L.c2pRoundTip(measured), /^This round has run 2\.4× its expected length \(2h 0m so far\)\. 9\.1 % of rounds run at least this long/);
+
+  // The page passes the mark to the badge and takes the band from c2pDrySpellBands.
+  assert.match(html, /c2pDrySpell\(open\.effort, open\.lowCoverage\)/);
+  assert.match(html, /var plotBands = live \? c2pDrySpellBands\(open, live\.lastBlkMs, minTime, live\.x\) : \[\];/);
 });
 
 test('a period as shown: luck, its interval and block count; no block is not "0 %"', () => {

@@ -8563,7 +8563,8 @@
         // An integrated effort is the covered integral scaled up to the whole
         // round. With under this share of the round covered it is mostly
         // extrapolation: the value is shown, muted, and the round gets no
-        // fast / slow tag and closes no duplet.
+        // fast / slow tag and closes no duplet; the open round is called no
+        // dry spell and gets no dry-spell band.
         var C2P_MIN_TAG_COVERAGE = 0.5;
         var C2P_TREND_ROUNDS = 10;
         var C2P_LUCK_CAP = 1000;
@@ -8864,7 +8865,8 @@
         // history covers: what a pooled figure counts), elapsed (s),
         // expected_time (s to a block at the current rate), pace_time (s per
         // pooled expected block over the round so far: elapsed /
-        // covered_effort), source}.
+        // covered_effort), lowCoverage (the effort is mostly extrapolation,
+        // c2pLowCoverage), source}.
         // The node's current_round, its effort integrated over the round;
         // null there (no main-chain block yet) is no round. An older node has
         // no such field: its current_luck_trend, which is 100 / effort; else
@@ -8882,6 +8884,7 @@
                 expected = cr.expected_time > 0 ? cr.expected_time : (e > 0 && elapsed > 0 ? elapsed / e : null);
                 return { effort: e, covered_effort: covered, elapsed: elapsed, expected_time: expected,
                          pace_time: covered > 0 && elapsed > 0 ? elapsed / covered : null,
+                         lowCoverage: c2pLowCoverage(cr.effort_method, cr.history_coverage),
                          source: 'server', since: cr.since_block_hash || null,
                          method: cr.effort_method || null, coverage: c2pNum(cr.history_coverage) };
             }
@@ -8889,12 +8892,13 @@
                 e = 100 / ls.current_luck_trend;
                 expected = sinceLast !== null ? sinceLast / e : null;
                 return { effort: e, covered_effort: e, elapsed: sinceLast, expected_time: expected, pace_time: expected,
-                         source: 'server_trend', since: null, method: null, coverage: null };
+                         lowCoverage: false, source: 'server_trend', since: null, method: null, coverage: null };
             }
             if (sinceLast !== null && fallbackExpected > 0) {
                 e = sinceLast / fallbackExpected;
                 return { effort: e, covered_effort: e, elapsed: sinceLast, expected_time: fallbackExpected,
-                         pace_time: fallbackExpected, source: 'client', since: null, method: null, coverage: null };
+                         pace_time: fallbackExpected, lowCoverage: false, source: 'client', since: null, method: null,
+                         coverage: null };
             }
             return null;
         }
@@ -8954,14 +8958,37 @@
             return out;
         }
 
-        // The Round badge of the open round at effort e.
-        function c2pDrySpell(e) {
+        // The Round badge of the open round at effort e. `low`: the rate
+        // history covers under C2P_MIN_TAG_COVERAGE of the round, so e is
+        // mostly extrapolation. The figure is shown, muted, and no dry spell
+        // is called on it.
+        function c2pDrySpell(e, low) {
             if (c2pNum(e) === null || e < 0) return null;
             var x = c2pFmtX(e);
+            if (low) return { state: 'low', text: 'Round ' + x, background: '#3a3a5a', color: 'var(--text-muted)', hint: false };
             if (e > C2P_VERY_SLOW) return { state: 'long', text: '🏜️ Long dry spell ' + x, background: '#5b4b8a', hint: e > C2P_DRY_HINT };
             if (e > C2P_SLOW) return { state: 'dry', text: '🏜️ Dry spell ' + x, background: '#5b4b8a', hint: false };
             if (e >= 1) return { state: 'over', text: 'Round ' + x, background: '#3a3a5a', hint: false };
             return { state: 'round', text: 'Round ' + x, background: 'var(--primary)', hint: false };
+        }
+        // The violet band the charts lay over a dry spell: the open round
+        // past 2x, from its start (lastBlkMs, or the window's left edge) to
+        // endMs, with the share of rounds that run at least as long
+        // (e^-effort). None while the round's effort is mostly extrapolation.
+        function c2pDrySpellBands(open, lastBlkMs, minTime, endMs) {
+            if (!open || open.lowCoverage || !(open.effort > C2P_SLOW) || !(endMs > lastBlkMs)) return [];
+            return [{
+                id: 'c2p-dry-spell',
+                from: Math.max(lastBlkMs, minTime),
+                to: endMs,
+                color: 'rgba(167, 139, 250, 0.10)',
+                zIndex: 1,
+                label: {
+                    text: 'dry ' + c2pFmtX(open.effort) + ' · ' + c2pFmtOdds(Math.exp(-open.effort)) + ' % of rounds',
+                    style: { color: '#a78bfa', fontSize: '10px' },
+                    align: 'right', textAlign: 'right', x: -4, y: 12
+                }
+            }];
         }
 
         // The hashrate charts' Luck series: the pooled luck of the last
@@ -9194,16 +9221,21 @@
         }
         function c2pRoundTip(open) {
             if (!open || c2pNum(open.effort) === null || open.effort < 0) return '';
-            var e = open.effort, again = c2pFmtOdds(1 - Math.exp(-1));
-            var s = 'This round has run ' + c2pFmtX(e) + ' its expected length' +
-                (open.elapsed > 0 ? ' (' + c2pFmtDur(open.elapsed) + ' so far)' : '') + '. ' +
-                c2pFmtOdds(Math.exp(-e)) + ' % of rounds run at least this long by chance (Poisson). ';
+            var e = open.effort, again = c2pFmtOdds(1 - Math.exp(-1)), low = !!open.lowCoverage;
+            var sofar = open.elapsed > 0 ? ' (' + c2pFmtDur(open.elapsed) + ' so far)' : '';
+            // Mostly extrapolation: no odds are quoted on the figure and no
+            // dry spell is called.
+            var s = low
+                ? 'This round reads ' + c2pFmtX(e) + ' its expected length' + sofar + ', but the rate history covers ' +
+                  Math.round(open.coverage * 100) + ' % of it: the figure is mostly extrapolation, so no dry spell is called. '
+                : 'This round has run ' + c2pFmtX(e) + ' its expected length' + sofar + '. ' +
+                  c2pFmtOdds(Math.exp(-e)) + ' % of rounds run at least this long by chance (Poisson). ';
             s += open.expected_time > 0
                 ? 'A block is expected every ' + c2pFmtDur(open.expected_time) + ' at the current rate: the chance of one in the next ' +
                   c2pFmtDur(open.expected_time) + ' is ' + again + ' %, exactly as at the start of the round. Mining has no memory.'
                 : 'The chance of a block within one expected round time from now is ' + again +
                   ' %, exactly as at the start of the round. Mining has no memory.';
-            if (e > C2P_DRY_HINT) {
+            if (e > C2P_DRY_HINT && !low) {
                 s += '\nRounds over 5× happen ' + c2pFmtOdds(Math.exp(-C2P_DRY_HINT)) + ' % of the time. If the CI95 ' +
                     'check under the hashrate chart says the reported hashrate is above the band, look for lost ' +
                     'hashrate (outage, failover).';
@@ -9252,11 +9284,12 @@
             var nowS = Date.now() / 1000;
             // No main-chain block yet: there is no round to show.
             var open = pace.lastMain ? c2pOpenRound(ls, pace.lastMain.ts, nowS, 0) : null;
-            var spell = open ? c2pDrySpell(open.effort) : null;
+            var spell = open ? c2pDrySpell(open.effort, open.lowCoverage) : null;
             var round = d3.select('#luck_current_round');
             if (spell) {
                 round.style('display', null).text(spell.text)
-                    .style('background', spell.background).attr('title', c2pRoundTip(open));
+                    .style('background', spell.background).style('color', spell.color || null)
+                    .attr('title', c2pRoundTip(open));
             } else {
                 round.style('display', 'none');
             }
@@ -9428,23 +9461,8 @@
                 luckMin = Math.max(0, 100 - dist);
                 luckMax = 100 + dist;
             }
-            // A violet band over a dry spell: the open round past 2x, with
-            // the share of rounds that run at least as long (e^-effort).
-            var plotBands = [];
-            if (live && open.effort > C2P_SLOW && live.x > live.lastBlkMs) {
-                plotBands.push({
-                    id: 'c2p-dry-spell',
-                    from: Math.max(live.lastBlkMs, minTime),
-                    to: live.x,
-                    color: 'rgba(167, 139, 250, 0.10)',
-                    zIndex: 1,
-                    label: {
-                        text: 'dry ' + c2pFmtX(open.effort) + ' · ' + c2pFmtOdds(Math.exp(-open.effort)) + ' % of rounds',
-                        style: { color: '#a78bfa', fontSize: '10px' },
-                        align: 'right', textAlign: 'right', x: -4, y: 12
-                    }
-                });
-            }
+            // A violet band over a dry spell (c2pDrySpellBands).
+            var plotBands = live ? c2pDrySpellBands(open, live.lastBlkMs, minTime, live.x) : [];
             return { pace: pace, open: open, trend: trend, luckMin: luckMin, luckMax: luckMax, plotBands: plotBands,
                      periods: c2pLuckPeriods(window.c2pLuckStats, pace.rounds, nowMs / 1000, open, pace.noEffort) };
         }
