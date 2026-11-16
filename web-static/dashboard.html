@@ -4925,6 +4925,8 @@
                         .attr('class', function(b) { return c2pEffortClass(mergedPaceOf(b)); })
                         .each(function(b) {
                             var td = d3.select(this), p = mergedPaceOf(b);
+                            // Off the aux chain: the effort the node gives it, muted; it is no round.
+                            if (p && p.offChain && p.offEffort !== null) { td.text(c2pFmtPct(p.offEffort * 100)); return; }
                             if (!p || p.effort === null) { td.text('—'); return; }
                             if (p.tag) {
                                 td.append('span')
@@ -4939,12 +4941,7 @@
                                     .text('⁑ duplet');
                             }
                         })
-                        .attr('title', function(b) {
-                            var p = mergedPaceOf(b);
-                            if (p && (p.effort !== null || p.offChain)) return c2pEffortCellTip(b, p);
-                            return 'Effort needs the ' + (b.symbol || b.network || 'merged chain') +
-                                ' difficulty at find, which this node does not serve.';
-                        });
+                        .attr('title', function(b) { return c2pEffortCellTip(b, mergedPaceOf(b)); });
                     tr.append('td').append('a')
                         .attr('class', 'hash-link')
                         .attr('href', function(b) {
@@ -8587,12 +8584,16 @@
         function c2pRowChain(b) { return String(b.chain || b.symbol || b.network || '').toUpperCase(); }
         function c2pRowHash(b) { return (b && (b.hash || b.pow_hash)) || ''; }
         function c2pRowHeight(b) { return b.height != null ? b.height : b.number; }
-        // Off the coin chain. The node says so in `main_chain` (false also on
-        // a find that never confirmed); an older node has only the status:
-        // an orphaned or stale row. A merged row has no status;
-        // verified === false is its orphan mark.
+        // Off the coin chain. The node says so in `main_chain`: false on an
+        // orphaned or stale row, on a find that never confirmed, and on a
+        // merged block the aux chain refused. Without it: a merged submit
+        // that was refused (`accepted` false), an orphaned or stale status,
+        // and a merged row's orphan mark, verified === false. A refused
+        // merged submit that is none of these (verified null on a node
+        // without `main_chain`) cannot be told from a block.
         function c2pRowOffChain(b) {
             if (typeof b.main_chain === 'boolean') return !b.main_chain;
+            if (b.accepted === false) return true;
             if (b.status === 'orphaned' || b.status === 'stale') return true;
             return b.status == null && b.verified === false;
         }
@@ -9031,9 +9032,12 @@
         }
         function c2pEffortCellTip(b, p) {
             if (p && p.effort !== null) return c2pEffortTip(p);
+            // A /recent_merged_blocks row names its chain in `symbol`, not `chain`.
+            var aux = !b.chain && (b.symbol || b.network) ? String(b.symbol || b.network) : '';
             if (p && p.offChain) {
-                return 'Not on the coin chain (orphaned, stale or never confirmed): it ends no round of the pool, ' +
-                    'so it has no tag and is not counted in pool luck.' +
+                return (aux ? 'Not on the ' + aux + ' chain (orphaned, or refused by it)'
+                            : 'Not on the coin chain (orphaned, stale or never confirmed)') +
+                    ': it ends no round of the pool, so it has no tag and is not counted in pool luck.' +
                     (p.offEffort !== null ? ' Timed from the last main-chain block before it, it came at ' +
                         c2pFmtNum(p.offEffort * 100) + ' % of the expected time.' : '');
             }
@@ -9041,8 +9045,16 @@
                 return 'Effort unavailable -- no pool hashrate is known over this block\'s round';
             if (b.luck_method === 'relayed')
                 return 'Relayed from a peer over P2P -- this node has no local timing for it, so no effort is computed here';
-            if (b.luck_method === 'netdiff_unavailable')
-                return 'Effort unavailable -- the block header was never synced, so network difficulty at find time is unknown';
+            if (b.luck_method === 'netdiff_unavailable') {
+                // A merged row stored before the aux chain's own difficulty was
+                // recorded holds the parent's: the node serves none for it.
+                return aux
+                    ? 'Effort unavailable -- this block was recorded before the node stored the ' + aux +
+                      ' difficulty at find; it is filled in once the ' + aux + ' header chain names the block'
+                    : 'Effort unavailable -- the block header was never synced, so network difficulty at find time is unknown';
+            }
+            if (aux && !b.luck_method)
+                return 'Effort needs the ' + aux + ' difficulty at find, which this node does not serve (older build).';
             return 'Effort unknown: this node has no round time and expected time for this block' +
                 (b.luck_method ? ' [' + b.luck_method + ']' : '') + '.';
         }

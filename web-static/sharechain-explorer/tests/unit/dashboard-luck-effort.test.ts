@@ -13,7 +13,7 @@ import { readFileSync } from 'node:fs';
 
 interface Row {
   hash?: string; pow_hash?: string; ts: number; number?: number; height?: number;
-  chain?: string; symbol?: string; status?: string; verified?: boolean;
+  chain?: string; symbol?: string; status?: string; verified?: boolean | null; accepted?: boolean;
   luck?: number | null; luck_method?: string | null;
   time_to_find?: number | null; expected_time?: number | null;
   effort?: number | null; effort_method?: string | null; main_chain?: boolean;
@@ -324,6 +324,59 @@ test('duplets never pair rows across chains, the same height, or a block the nod
   assert.equal(paceOf(named, 3).duplet!.with, 'h2');
   assert.equal(paceOf(named, 4).duplet, null);
   assert.equal(paceOf(named, 4).tag, '⚡', 'still a fast block');
+});
+
+test('merged rows: a submit the aux chain refused is no round and closes no duplet', () => {
+  const aux = (height: number, seconds: number, more: Partial<Row>): Row =>
+    ({ pow_hash: 'd' + height, symbol: 'DOGE', height, ts: T0 + seconds, ...more });
+  // A DOGE block, then a submit DOGE refused 20 s later (verified null: it is
+  // not an orphan of the chain, it never was on it), then the next block.
+  const served = (flag: Partial<Row>): Row[] => [
+    aux(500, 0, { verified: true, effort: 1, effort_method: 'first_block' }),
+    aux(501, 3600, { verified: true, effort: 1.2, effort_method: 'integrated', prev_block_hash: 'd500' }),
+    aux(502, 3620, { verified: null, effort: 0.006, effort_method: 'integrated', prev_block_hash: 'd501', ...flag }),
+    aux(503, 5400, { verified: true, effort: 0.6, effort_method: 'integrated', prev_block_hash: 'd501' }),
+  ];
+  // The node's main_chain, a refused submit's accepted false, an orphaned
+  // status, and the merged orphan mark verified false: each takes it off.
+  for (const flag of [{ main_chain: false }, { accepted: false }, { status: 'orphaned' }, { verified: false }] as Partial<Row>[]) {
+    const rows = served(flag);
+    if (flag.main_chain === false) rows.forEach(r => { if (r.main_chain === undefined) r.main_chain = true; });
+    const set = L.c2pBlockPace(rows, 'DOGE');
+    const refused = set.byHash['d502']!;
+    assert.deepEqual([refused.offChain, refused.effort, refused.offEffort, refused.tag, refused.duplet],
+                     [true, null, 0.006, '', null], JSON.stringify(flag));
+    assert.deepEqual(set.rounds.map(r => r.height), [500, 501, 503]);
+    assert.equal(set.byHash['d501']!.dupletOpen, null, 'block 501 opens no duplet');
+    assert.equal(L.c2pEffortCellTip(rows[2]!, refused),
+      'Not on the DOGE chain (orphaned, or refused by it): it ends no round of the pool, so it has no tag and is not counted in pool luck. ' +
+      'Timed from the last main-chain block before it, it came at 0.60 % of the expected time.');
+  }
+  // main_chain wins over the other marks: the node has the aux chain's verdict.
+  const kept = L.c2pBlockPace(served({ main_chain: true, accepted: false }), 'DOGE');
+  assert.equal(kept.byHash['d502']!.offChain, false);
+  // With none of them the row cannot be told from a block: it is a round, a
+  // ⚡⚡ and a duplet. Only the node's main_chain settles it.
+  const blind = L.c2pBlockPace(served({}), 'DOGE').byHash['d502']!;
+  assert.deepEqual([blind.offChain, blind.tag, blind.duplet!.with], [false, '⚡⚡', 'd501']);
+});
+
+test('merged rows: why a row has no effort', () => {
+  const legacy: Row = { pow_hash: 'da27', symbol: 'DOGE', height: 6454700, ts: T0, verified: true, effort: null,
+                        luck_method: 'netdiff_unavailable', main_chain: true };
+  const tip = L.c2pEffortCellTip(legacy, L.c2pBlockPace([legacy]).byHash['da27']!);
+  assert.equal(tip, 'Effort unavailable -- this block was recorded before the node stored the DOGE difficulty at find; ' +
+                    'it is filled in once the DOGE header chain names the block');
+  assert.doesNotMatch(tip, /header was never synced/);
+  // An older node serves no luck fields on merged rows at all.
+  const old: Row = { pow_hash: 'da27', symbol: 'DOGE', height: 6454700, ts: T0, verified: true };
+  assert.equal(L.c2pEffortCellTip(old, L.c2pBlockPace([old]).byHash['da27']!),
+               'Effort needs the DOGE difficulty at find, which this node does not serve (older build).');
+  const norate: Row = { ...legacy, luck_method: 'hashrate_unavailable' };
+  assert.match(L.c2pEffortCellTip(norate, L.c2pBlockPace([norate]).byHash['da27']!), /no pool hashrate is known over this block's round/);
+  // A parent-chain row keeps its own reason.
+  const parent = row(7, 3, { effort: null, expected_time: null, luck_method: 'netdiff_unavailable' });
+  assert.match(L.c2pEffortCellTip(parent, null), /the block header was never synced/);
 });
 
 test('round times: the round as timed, and the expected time from what the row has', () => {
