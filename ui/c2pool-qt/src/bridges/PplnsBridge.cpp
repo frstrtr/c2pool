@@ -39,6 +39,21 @@ void PplnsBridge::getMinerDetail(int requestId, const QString& address)
     dispatch(requestId, QStringLiteral("/pplns/miner/") + encoded);
 }
 
+void PplnsBridge::getPayouts(int requestId)
+{
+    dispatch(requestId, QStringLiteral("/current_payouts"));
+}
+
+void PplnsBridge::getMergedPayouts(int requestId)
+{
+    dispatch(requestId, QStringLiteral("/current_merged_payouts"));
+}
+
+void PplnsBridge::getStratumStats(int requestId)
+{
+    dispatch(requestId, QStringLiteral("/stratum_stats"));
+}
+
 void PplnsBridge::cancelRequest(int requestId)
 {
     auto it = pending_.find(requestId);
