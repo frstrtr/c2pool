@@ -225,7 +225,6 @@ export class RealtimeOrchestrator {
   private _deltaInFlight = false;
   private _lastAppliedTip: string | null = null;
   private _pendingTip: string | null = null;
-  private _hasQueued = false;
   private _currentLayout: GridLayout | null = null;
   /** Bumped on every change that can alter the static frame (window,
    *  user context, animation reset). The DOM adapter repaints an idle
@@ -325,7 +324,9 @@ export class RealtimeOrchestrator {
     return {
       window: this.window,
       animating: this.anim.isRunning(),
-      hasQueued: this._hasQueued,
+      // Read from the controller: tick() dequeues on its own, so a
+      // mirror flag here went stale (stayed true forever).
+      hasQueued: this.anim.hasQueued(),
       started: this._started,
       shareCount: this.window.shares.length,
       lastAppliedTip: this._lastAppliedTip,
@@ -594,9 +595,11 @@ export class RealtimeOrchestrator {
       ...(this.window.tip !== undefined ? { tipHash: this.window.tip } : {}),
     });
     // A full rebuild replaces the window wholesale, so start a fresh
-    // animation rather than queueing behind a prior plan.
+    // animation rather than queueing behind a prior plan, and drop any
+    // plan still queued against the old window (it would otherwise
+    // play after this one ends).
+    this.anim.reset();
     this.anim.start(plan, this.nowMs());
-    this._hasQueued = false;
   }
 
   /** Per-share PPLNS weight fraction across the union of two share
@@ -857,10 +860,8 @@ export class RealtimeOrchestrator {
 
     if (this.anim.isRunning()) {
       this.anim.queueNext(plan);
-      this._hasQueued = true;
     } else {
       this.anim.start(plan, this.nowMs());
-      this._hasQueued = false;
     }
   }
 
