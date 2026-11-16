@@ -228,6 +228,18 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
     # hands ref_hash_fn that key), also on a node-fee job whose payout is the
     # operator's; a submission is judged by its job's own share bits
     # (core::stratum::pool_share_bits). Same fold-into-core_test reasoning as every TU here.
+    # pool_luck_test.cpp, web_server_luck_test.cpp, web_server_luck_inputs_test.cpp:
+    # pool luck as effort (core/pool_luck.hpp). The first pins the model on
+    # hand-computed fixtures (integrated effort over a piecewise-constant
+    # rate / difficulty, the predecessor by time, period luck and the exact
+    # Poisson interval against scipy). The second drives the endpoints
+    # (/recent_blocks, /luck_stats, /recent_merged_blocks, /global_stats,
+    # /web/graph_data) through API that predates the change, so it also
+    # builds against the old web_server.cpp and fails there. The third covers
+    # the inputs that arrive through hooks added with it (the aux chain's own
+    # difficulty, the rate history fed sample by sample). One KAT covers every
+    # coin: the ledger, the history and the endpoints are core. Same
+    # fold-into-core_test reasoning as every TU here.
     # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
     add_executable(core_test
         addr_store_save_test.cpp
@@ -263,6 +275,7 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
         pack_test.cpp
         packet_test.cpp
         payout_manager_rules_test.cpp
+        pool_luck_test.cpp
         random_choice_guard_test.cpp
         random_uniform_test.cpp
         reloaded_block_flag_test.cpp
@@ -293,6 +306,8 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
         web_server_local_hashps_test.cpp
         web_server_local_only_test.cpp
         web_server_local_share_hash_rates_test.cpp
+        web_server_luck_inputs_test.cpp
+        web_server_luck_test.cpp
         web_server_merged_drop_test.cpp
         web_server_merged_payout_source_test.cpp
         web_server_mweb_hogex_test.cpp

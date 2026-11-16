@@ -237,8 +237,11 @@ TEST(FoundBlockSubmit, HeaderChainCorrectsAnImpossibleHeight)
     EXPECT_TRUE(persisted.empty());
 }
 
-// A corrected height moves the row within its chain's order: every interval
-// of that chain is re-derived, not only the unknown ones.
+// A row stored at a wrong height never mis-times its neighbours: a round
+// runs from the previous main-chain block BY TIME, so the pre-fix row is a's
+// predecessor before its height is corrected and after. (Rounds used to
+// follow height order: out of order, a's interval reached back to c, 2000 s,
+// until the correction re-derived the chain's intervals.)
 TEST(FoundBlockSubmit, CorrectedHeightRederivesTheChainsIntervals)
 {
     MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
@@ -259,8 +262,8 @@ TEST(FoundBlockSubmit, CorrectedHeightRederivesTheChainsIntervals)
         [](const MiningInterface::FoundBlock&) { return true; },
         [&restored]() { return restored; });
     mi.load_persisted_found_blocks();
-    // Out of order, a's interval reached back to c.
-    EXPECT_DOUBLE_EQ(find_row(mi.rest_recent_blocks(), a)["time_to_find"].get<double>(), 2000.0);
+    // Out of height order, yet a's round already runs from the pre-fix row.
+    EXPECT_DOUBLE_EQ(find_row(mi.rest_recent_blocks(), a)["time_to_find"].get<double>(), 1000.0);
 
     mi.correct_found_block_heights([](const std::string& h) -> uint64_t {
         return h == kLtcBlock ? 3211872u : 0u;

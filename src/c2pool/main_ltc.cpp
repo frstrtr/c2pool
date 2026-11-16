@@ -3287,6 +3287,9 @@ int main(int argc, char* argv[]) {
                             // re-persists the row, so it survives a restart.
                             rec.parent_hash = blk.parent_hash;
                             rec.parent_height = blk.parent_height;
+                            // DOGE rows: network_difficulty is the aux chain's
+                            // own (fblk extension byte).
+                            rec.aux_difficulty_known = blk.aux_difficulty_known;
                             // A corrected height names the key it moved from.
                             return fblk_store->store(rec, blk.replaced_height);
                         },
@@ -3317,6 +3320,9 @@ int main(int argc, char* argv[]) {
                                 // #946: v1-v3 records leave the parent unknown (null).
                                 blk.parent_hash = rec.parent_hash;
                                 blk.parent_height = rec.parent_height;
+                                // false on a row written before the flag: its
+                                // stored difficulty is the parent's.
+                                blk.aux_difficulty_known = rec.aux_difficulty_known;
                                 result.push_back(std::move(blk));
                             }
                             return result;
@@ -5534,13 +5540,18 @@ int main(int argc, char* argv[]) {
                         row.subsidy = tmpl["coinbasevalue"].get<uint64_t>();
                 }
                 const uint64_t height = row.height;
+                // The block's own difficulty: the bits of the header it was
+                // found with (the live reading only if those are absent).
+                row.network_difficulty = ltc::dashboard::difficulty_from_bits(hdr.m_bits);
                 // Pool hashrate 0 -> record_found_block reads the sharechain
                 // pool estimator, the rate a peer records the same block with
                 // (this node's own stratum rate gave the finder and its peers
                 // luck values ~300x apart). No sharechain: the local rate.
                 mi->record_found_block(
                     height, block_hash, row.timestamp, row.chain,
-                    row.miner, row.share_hash, mi->get_network_difficulty(),
+                    row.miner, row.share_hash,
+                    ltc::dashboard::network_difficulty_at_find(
+                        row.network_difficulty, mi->get_network_difficulty()),
                     row.share_difficulty,
                     /*pool_hashrate=*/p2p_node ? 0.0 : mi->get_local_hashrate(),
                     row.subsidy,
@@ -6986,9 +6997,14 @@ int main(int argc, char* argv[]) {
                     // labelling peer here can never downgrade a local record.
                     // Pool hashrate 0 -> the sharechain pool estimator, the
                     // same rate the finder records with.
+                    // The block's own difficulty: the share's header is
+                    // the block's, so its bits are exact even for a block
+                    // recorded long after it was found.
                     mi->record_found_block(
                         row.height, block_hash, row.timestamp, row.chain,
-                        row.miner, row.share_hash, mi->get_network_difficulty(),
+                        row.miner, row.share_hash,
+                        ltc::dashboard::network_difficulty_at_find(
+                            row.network_difficulty, mi->get_network_difficulty()),
                         row.share_difficulty, /*pool_hashrate=*/0.0, row.subsidy,
                         core::MiningInterface::BlockAuthorship::sharechain_peer,
                         // BIP34 off the share's coinbase: it corrects a
@@ -7089,6 +7105,9 @@ int main(int argc, char* argv[]) {
                             blk.accepted = true;
                             blk.coinbase_value = entry.m_coinbase_value;
                             blk.miner = miner_addr;
+                            // The aux chain's own difficulty, off the aux
+                            // header's bits (display: the block's luck).
+                            blk.difficulty = chain::target_to_difficulty(target);
                             // Get real LTC block height from header chain
                             if (ltc_header_chain) {
                                 auto ltc_entry = ltc_header_chain->get_header(share_hash);
@@ -7107,6 +7126,7 @@ int main(int argc, char* argv[]) {
                                 rec.accepted = blk.accepted; rec.coinbase_value = blk.coinbase_value;
                                 rec.is_local = blk.is_local; rec.parent_height = blk.parent_height;
                                 rec.miner = blk.miner;
+                                rec.difficulty = blk.difficulty;
                                 ms->store(rec);
                             }
                         }
@@ -10151,6 +10171,27 @@ int main(int argc, char* argv[]) {
                                     embedded_view = header_view(doge_chain.get());
                                 else if (cid == 1 && nmc_chain)
                                     embedded_view = header_view(nmc_chain.get());
+                                // The aux block's own difficulty, off its
+                                // header's bits: the luck of a merged block
+                                // runs against the AUX chain's difficulty. It
+                                // fills the rows already held (stored with
+                                // the parent's) and later ones.
+                                auto header_difficulty = [](const auto* hc) {
+                                    return [hc](const std::string& hash_hex) -> double {
+                                        uint256 h;
+                                        h.SetHex(hash_hex);
+                                        auto e = hc->get_header(h);
+                                        if (!e) return 0.0;
+                                        return chain::target_to_difficulty(
+                                            chain::bits_to_target(e->header.m_bits));
+                                    };
+                                };
+                                if (cid == 98 && doge_chain)
+                                    mi_ptr->add_chain_block_difficulty_lookup(
+                                        sym, header_difficulty(doge_chain.get()));
+                                else if (cid == 1 && nmc_chain)
+                                    mi_ptr->add_chain_block_difficulty_lookup(
+                                        sym, header_difficulty(nmc_chain.get()));
                                 mi_ptr->add_chain_verify_fn(sym,
                                     [rpc_backend, mi_ptr, embedded_view](const std::string& hash_hex) -> int {
                                         uint256 h;
@@ -10902,6 +10943,8 @@ int main(int argc, char* argv[]) {
                         : static_cast<int64_t>(std::time(nullptr));
                     blk.accepted = true;
                     blk.miner = ctx.miner;
+                    // The DOGE block's own difficulty (display: its luck).
+                    blk.difficulty = chain::target_to_difficulty(doge_target);
                     // Request full DOGE block from P2P to get exact coinbase_value.
                     // The block arrives async — we set coinbase_value=0 now and update
                     // when the DOGE block arrives via the full_block callback.
@@ -10926,6 +10969,7 @@ int main(int argc, char* argv[]) {
                         rec.accepted = blk.accepted; rec.coinbase_value = blk.coinbase_value;
                         rec.is_local = blk.is_local; rec.parent_height = blk.parent_height;
                         rec.miner = blk.miner;
+                        rec.difficulty = blk.difficulty;
                         ms->store(rec);
                     }
 
@@ -11016,6 +11060,28 @@ int main(int argc, char* argv[]) {
                     return entry ? static_cast<uint64_t>(entry->height) : 0;
                 };
                 web_server.get_mining_interface()->backfill_found_block_heights(height_lookup);
+                // Kept for a row recorded at height 0 after this backfill:
+                // it learns its height when its block confirms.
+                web_server.get_mining_interface()->set_block_height_lookup(height_lookup);
+                // The stretch of time the header chain holds. With it the
+                // confirm lane can tell a pending block the chain does NOT
+                // hold -- the finds stored at the share absheight that never
+                // reached the chain: their hash is unknown although the
+                // chain spans their time -- from one it merely cannot judge
+                // (a chain rooted at a later checkpoint, or still syncing).
+                // A fast-start checkpoint is a root without a header: the
+                // first header above it dates the chain's start then.
+                web_server.get_mining_interface()->set_block_chain_span_fn(
+                    [hc]() -> std::pair<uint64_t, uint64_t> {
+                        const auto tip = hc->tip();
+                        const uint32_t low = hc->lowest_height();
+                        auto first = hc->get_header_by_height(low);
+                        if (!first || first->header.m_timestamp == 0)
+                            first = hc->get_header_by_height(low + 1);
+                        if (!tip || !first)
+                            return {0, 0};
+                        return {first->header.m_timestamp, tip->header.m_timestamp};
+                    });
                 // Only heights above the tip (no LTC block can sit there) are
                 // corrected: a header chain on a wrong checkpoint must not
                 // rewrite correct ones.
@@ -11050,6 +11116,7 @@ int main(int argc, char* argv[]) {
                         blk.is_local = rec.is_local;
                         blk.parent_height = rec.parent_height;
                         blk.miner = rec.miner;
+                        blk.difficulty = rec.difficulty;   // 0 on an older record
                         mm->add_discovered_block(blk);  // dedup handles duplicates
                         ++loaded;
                     }
