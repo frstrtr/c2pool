@@ -397,7 +397,7 @@ if(NOT C2POOL_DASH_BLS_AVAILABLE AND NOT C2POOL_DASH_ALLOW_NO_BLS)
         COMMAND ${CMAKE_COMMAND} -E false
         VERBATIM)
     add_dependencies(c2pool-dash c2pool_dash_requires_bls)
-    message(STATUS "c2pool-dash: dashbls not found and C2POOL_DASH_ALLOW_NO_BLS=OFF -- building the c2pool-dash target will FAIL (other targets are unaffected)")
+    message(STATUS "c2pool-dash: dashbls not linked (C2POOL_DASH_BLS=${C2POOL_DASH_BLS}) and C2POOL_DASH_ALLOW_NO_BLS=OFF -- building the c2pool-dash target will FAIL (other targets are unaffected)")
 endif()
 if(NOT C2POOL_DASH_BLS_AVAILABLE)
     add_custom_command(TARGET c2pool-dash POST_BUILD
