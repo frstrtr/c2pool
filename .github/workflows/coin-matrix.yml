@@ -195,11 +195,11 @@ jobs:
       - name: Configure
         if: steps.presence.outputs.exists == '1'
         run: |
-          # C2POOL_DASH_ALLOW_NO_BLS: the dash entries build c2pool-dash without
+          # C2POOL_DASH_BLS=OFF + C2POOL_DASH_ALLOW_NO_BLS: the dash entries build c2pool-dash without
           # dashbls (bls=stub); without the opt-in that target fails by design.
           cmake -S . -B build_${{ matrix.coin }} \
             -DCMAKE_TOOLCHAIN_FILE=build_${{ matrix.coin }}/conan_toolchain.cmake \
-            -DCMAKE_BUILD_TYPE=Release -DC2POOL_DASH_ALLOW_NO_BLS=ON
+            -DCMAKE_BUILD_TYPE=Release -DC2POOL_DASH_BLS=OFF -DC2POOL_DASH_ALLOW_NO_BLS=ON
 
       - name: Build c2pool-${{ matrix.coin }}
         if: steps.presence.outputs.exists == '1'

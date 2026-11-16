@@ -146,8 +146,12 @@ endif()
 # scripts/build_dashbls.sh and the README put it, so a plain source build of
 # c2pool-dash gets the real verifier without extra flags. An explicit
 # -DC2POOL_DASH_BLS=OFF (or a cache that already holds the option) is never
-# overridden. Not on MSVC, which has its own DLL flow below.
-if(NOT MSVC AND NOT DEFINED CACHE{C2POOL_DASH_BLS})
+# overridden. Not on MSVC, which has its own DLL flow below. Not under CI (the
+# CI environment variable, set by GitHub Actions): CI configures BLS
+# explicitly per job, and a self-hosted runner that has dashbls installed for
+# the real-BLS job must not silently turn every other job's stub build into a
+# BLS build (that registers BLS tests those jobs never build).
+if(NOT MSVC AND NOT DEFINED CACHE{C2POOL_DASH_BLS} AND NOT DEFINED ENV{CI})
     foreach(_c2p_bls_prefix IN ITEMS "${DASHBLS_ROOT}" "$ENV{DASHBLS_ROOT}"
                                      "$ENV{HOME}/.c2pool-deps/dashbls" "/usr/local" "/opt/dashbls")
         if(_c2p_bls_prefix AND EXISTS "${_c2p_bls_prefix}/include/dashbls/bls.hpp"
