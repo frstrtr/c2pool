@@ -9,7 +9,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import {
   offChainBlocks, withOffChainCells, offChainLines, isOffChainCell, mountSharechainGrid, createSelectionBus,
-  createGridLayout, parseCssColor, OFF_CHAIN_FILL, FLAG_DIM, type BlockRow, type GridShare, type Ctx2D,
+  createGridLayout, parseCssColor, safeExplorerUrl, OFF_CHAIN_FILL, FLAG_DIM, type BlockRow, type GridShare, type Ctx2D,
 } from '../../src/scene/index.js';
 
 const HTML = readFileSync(new URL('../../../dashboard.html', import.meta.url), 'utf8');
@@ -71,6 +71,16 @@ test('hover text: block height and coin, the agreed wording, never "block lost"'
   assert.ok(lines.includes('finder XoZc'));
   assert.ok(lines.includes('10 min ago'));
   assert.ok(!lines.join(' ').toLowerCase().includes('block lost'));
+});
+
+test('explorer link: http(s) only; javascript:, data: and the rest are refused', () => {
+  assert.equal(safeExplorerUrl('https://explorer.example/block/00ab'), 'https://explorer.example/block/00ab');
+  assert.equal(safeExplorerUrl('HTTP://explorer.example/b'), 'HTTP://explorer.example/b');
+  assert.equal(safeExplorerUrl('  https://x.example/b '), 'https://x.example/b');
+  for (const bad of ['javascript:alert(1)', ' JavaScript:alert(1)', 'data:text/html,<b>x</b>', 'vbscript:x',
+    '//evil.example/b', '/block/00ab', 'https:/x', '', null, undefined, 42, { href: 'https://x' }]) {
+    assert.equal(safeExplorerUrl(bad), null, String(bad));
+  }
 });
 
 function fakeDom() {
@@ -169,6 +179,9 @@ test('dashboard.html wires ▣ cells from the ledger, with a text-only tooltip',
   const tip = block.slice(block.indexOf('function c2pOffChainTip'), block.indexOf('function c2pFluidMount'));
   assert.match(tip, /d\.textContent = line;/);
   assert.doesNotMatch(tip, /innerHTML/, 'server fields never go through innerHTML');
+  assert.match(block, /var u = mod\.safeExplorerUrl\(s\.block\.explorer_url\);\s*\n\s*if \(u\) window\.open\(u, '_blank', 'noopener'\);/,
+    'a ▣ click opens only an http(s) explorer link');
+  assert.doesNotMatch(block, /window\.open\(s\.block\.explorer_url/, 'never the raw server string');
   assert.match(HTML, /window\.c2pRecentBlocks = blocks \|\| \[\];\s*\n\s*if \(window\.c2pFluidActive && typeof defrag\.render === 'function'\) defrag\.render\(\);/,
     'a /recent_blocks refresh re-renders Fluid');
   assert.match(block, /window\.c2pFluidActive = false;\s*\n\s*defrag\.render = classicRender;/, 'a failed load stops Fluid re-renders');

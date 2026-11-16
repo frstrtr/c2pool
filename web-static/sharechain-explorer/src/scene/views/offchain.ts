@@ -84,6 +84,13 @@ export function withOffChainCells(shares: readonly GridShare[], rows: readonly B
   return out;
 }
 
+/** A ledger row's explorer link, only when it is plain http(s). The value
+ *  comes from the node; a javascript: or data: URL would otherwise run in
+ *  a new window that inherits the dashboard's origin. */
+export function safeExplorerUrl(url: unknown): string | null {
+  return typeof url === 'string' && /^https?:\/\//i.test(url.trim()) ? url.trim() : null;
+}
+
 /** Hover text for a ▣ cell. Never says "block lost": the block was paid. */
 export function offChainLines(b: BlockRow, nowS: number): string[] {
   const lines = [

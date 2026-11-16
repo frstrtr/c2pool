@@ -7589,7 +7589,7 @@
         }
         function c2pFluidMount() {
             if (_fluidP) return _fluidP;
-            _fluidP = import('./sharechain-explorer/dist/scene.js?v=70470b3a').then(function(mod) {
+            _fluidP = import('./sharechain-explorer/dist/scene.js?v=3cc57625').then(function(mod) {
                 var canvas = document.getElementById('defrag-canvas');
                 var wrap = canvas.parentElement;
                 canvas.style.display = 'none';
@@ -7613,7 +7613,9 @@
                     },
                     onClick: function(s) {
                         if (mod.isOffChainCell(s)) {
-                            if (s.block.explorer_url) window.open(s.block.explorer_url, '_blank', 'noopener');
+                            // http(s) only: the URL is a server field.
+                            var u = mod.safeExplorerUrl(s.block.explorer_url);
+                            if (u) window.open(u, '_blank', 'noopener');
                         } else if (s.H) window.open('share.html#' + s.H, '_blank');
                     }
                 });
@@ -8023,7 +8025,7 @@
         }
         function c2pPplnsViewMount() {
             if (_pplnsViewP) return _pplnsViewP;
-            _pplnsViewP = import('./sharechain-explorer/dist/scene.js?v=70470b3a').then(function(mod) {
+            _pplnsViewP = import('./sharechain-explorer/dist/scene.js?v=3cc57625').then(function(mod) {
                 var ci = (typeof currency_info !== 'undefined' && currency_info) || {};
                 var grid = document.getElementById('pplns-main-grid');
                 grid.innerHTML = '';
