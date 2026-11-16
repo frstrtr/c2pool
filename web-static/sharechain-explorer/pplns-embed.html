@@ -199,10 +199,21 @@
         src.stratum = () => transport._call('getStratumStats', []);
       }
       let view = null;
+      let mountedMerged = '';
+      window.addEventListener('beforeunload', () => {
+        try { if (view !== null) view.destroy(); } catch {}
+      });
       const refresh = scene.coalesce(async () => {
         const r = await scene.loadPplnsSnapshot(src);
         if (r === null) { setStatus('no payouts yet', 'err'); return; }
+        // The coin toggle is built at mount. If the merged child (e.g.
+        // DOGE) first appears after the first snapshot, mount once more.
+        if (view !== null && r.mergedSymbol && !mountedMerged) {
+          try { view.destroy(); } catch {}
+          view = null;
+        }
         if (view === null) {
+          mountedMerged = r.mergedSymbol || '';
           tree.innerHTML = '';
           // Room above the view's own toolbar for #status (top-right).
           tree.style.marginTop = '22px';
@@ -211,9 +222,6 @@
           if (r.mergedSymbol) opts.mergedSymbol = r.mergedSymbol;
           view = scene.mountPplnsTreemap(opts);
           window.__pplnsQt = view;
-          window.addEventListener('beforeunload', () => {
-            try { view.destroy(); } catch {}
-          });
         }
         view.update(r.snapshot, r.special);
         setStatus('connected');
