@@ -765,7 +765,8 @@ if (BUILD_TESTING AND GTest_FOUND)
         test_dash_tx_version_rules.cpp    # Dash Core v23.1.9 A: negative nVersion + payload-gate parity (vs the vendored dashd codec)
         test_dash_protx_mempool_eviction.cpp  # Dash Core v23.1.8 B.8: block-connect ProTx eviction
         test_dash_utxo_full.cpp           # S2: full UTXO set from a pinned snapshot (lane, open rule, pin, status)
-        test_dash_utxo_scan.cpp)          # N1: GET /api/utxo/scan over the full set (rows, posture, tip moved, mempool)
+        test_dash_utxo_scan.cpp           # N1: GET /api/utxo/scan over the full set (rows, posture, tip moved, mempool)
+        test_dash_mempool_probe.cpp)      # GET /mempool_entry: one entry's template candidacy (fee-parity shadow)
     target_link_libraries(test_dash_mempool PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core core_utxo

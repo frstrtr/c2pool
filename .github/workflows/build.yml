@@ -268,6 +268,7 @@ jobs:
               c2pool-v37-btc-dash \
               c2pool-v37-w6-leveldb-compile-check \
               c2pool-v37-xmr \
+              coin_peer_dns_offthread_kat \
               coin_peer_rearm_kat \
               core_test \
               dash_hdr_backfill_window_kat \
@@ -1150,6 +1151,7 @@ jobs:
           cmake --build build_asan \
             --target c2pool \
                     coin_peer_rearm_kat \
+                    coin_peer_dns_offthread_kat \
                     boost_sentinel \
                     test_hardening test_share_messages \
                     test_redistribute_address test_redistribute test_auto_ratchet \

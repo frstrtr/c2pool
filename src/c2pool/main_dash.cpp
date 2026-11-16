@@ -93,6 +93,7 @@
 #include <impl/dash/coin/utxo_snapshot_import.hpp>  // S2: the full UTXO set from a pinned dumptxoutset snapshot
 #include <impl/dash/coin/utxo_status.hpp>            // S2: /local_stats utxo + [EMBED-STATUS] utxo=
 #include <impl/dash/coin/utxo_scan.hpp>              // N1: GET /api/utxo/scan (full-set script scan)
+#include <impl/dash/coin/mempool_probe_json.hpp>     // GET /mempool_entry (fee-parity shadow probe)
 #include <impl/dash/coin/inject_validate.hpp>        // N3: POST /api/tx-inject/validate reply
 #include <impl/dash/coin/header_chain.hpp>       // dash::coin::HeaderChain — SPV header/tip authority (E2a)
 #include <impl/dash/coin/block_confirm.hpp>      // dash::coin::block_confirm — post-broadcast confirm/orphan verdict
@@ -306,6 +307,12 @@ struct UtxoSnapshotCli {
     std::string import_file;          // --utxo-import FILE: import into the full-set dir and exit
 };
 UtxoSnapshotCli g_utxo_snapshot;
+
+// --mempool-entry-probe: wire GET /mempool_entry (fee-parity shadow tooling).
+// DEFAULT OFF: an unwired node answers 404, so a production node exposes
+// nothing new. Even on, the route answers only a direct local request.
+// File scope like g_utxo_snapshot: written once while parsing argv.
+bool g_mempool_entry_probe = false;
 
 // --embedded-mn-bridge-no-cursor (#91): DISABLE the bridge's resumable replay
 // cursor, so every process start replays the whole window from the pinned
@@ -632,6 +639,9 @@ void print_banner(const char* argv0)
         << "              running node that is not using that set; the next start opens it)\n"
         << "             (full UTXO set: import a pinned dumptxoutset into <net>/utxo_full_leveldb\n"
         << "              at start, then connect strictly from its base; alias --utxo-snapshot)\n"
+        << "           [--mempool-entry-probe]\n"
+        << "             (wire the direct-local GET /mempool_entry?txid= probe for the fee-parity\n"
+        << "              shadow; default off)\n"
         << "           [--embedded-tx-serve-own-set[=false]]\n"
         << "             (ALL embedded serving levers default ON when NO dashd arm is given —\n"
         << "              bare `--run` = daemonless, serves the FULL mempool + special txs (DIP\n"
@@ -3473,6 +3483,20 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             [source = utxo_scan_source](const std::string& query, const std::atomic<bool>& cancel) {
                 return source->handle(query, cancel);
             });
+        // GET /mempool_entry?txid=HEX (--mempool-entry-probe, direct-local,
+        // read-only): one entry's template candidacy for the fee-parity shadow
+        // comparator. Runs on the producer thread (thread_safe_wrap), so
+        // node_coin_state is alive. Off by default: unwired answers 404.
+        if (g_mempool_entry_probe) {
+            web_server->get_mining_interface()->set_mempool_entry_fn(
+                [&node_coin_state](std::string txid_hex) -> nlohmann::json {
+                    uint256 txid;
+                    txid.SetHex(txid_hex);
+                    return dash::coin::mempool_probe_json(
+                        txid, node_coin_state.mempool().probe(txid));
+                });
+            std::cout << "[run] --mempool-entry-probe: GET /mempool_entry wired (direct-local only)\n";
+        }
     }
     // ── IS/CL MINING-SAFETY HOLD arming (dashd TestPackageTransactions) ─────
     // dashd's miner refuses any not-yet-islocked tx with vins younger than 10
@@ -12891,6 +12915,8 @@ int main(int argc, char** argv)
             g_utxo_snapshot.full_off = true;        // S2: rollback to the accrual view
         else if (std::strcmp(argv[i], "--utxo-import") == 0 && i + 1 < argc)
             g_utxo_snapshot.import_file = argv[++i];  // S2: offline import, exits
+        else if (std::strcmp(argv[i], "--mempool-entry-probe") == 0)
+            g_mempool_entry_probe = true;
         else if (std::strcmp(argv[i], "--explorer") == 0)
             explorer_enabled = true;
         else if (std::strcmp(argv[i], "--no-explorer") == 0)

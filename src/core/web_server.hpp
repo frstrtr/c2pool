@@ -674,6 +674,16 @@ public:
     void set_embedded_template_fn(embedded_template_fn_t fn) { m_embedded_template_fn = thread_safe_wrap(std::move(fn)); }
     nlohmann::json rest_embedded_template();          // /embedded_template
 
+    // ── /mempool_entry?txid=HEX — READ-ONLY diagnosis of one mempool entry
+    // (fee-parity shadow tooling): in pool or not, when it arrived, whether
+    // its fee is known and fold-proven (the template selector's gate), and the
+    // first input no coin source could price. Direct-local only. The coin
+    // target binds it (main_dash.cpp); it runs on the producer thread.
+    using mempool_entry_fn_t = std::function<nlohmann::json(std::string)>;
+    void set_mempool_entry_fn(mempool_entry_fn_t fn) { m_mempool_entry_fn = thread_safe_wrap(std::move(fn)); }
+    bool has_mempool_entry_fn() const { return static_cast<bool>(m_mempool_entry_fn); }
+    nlohmann::json rest_mempool_entry(const std::string& txid_hex);   // /mempool_entry
+
     // ── Control-plane M1 (SAFE half): READ-ONLY resolved-config + catalog
     // schema, served over the existing web server via the same set-fn injection
     // pattern as /embedded_template. Both are pure reads of compiled-in /
@@ -1649,6 +1659,10 @@ public:
     // Returns "" if the fee script is not a 25-byte P2PKH.
     std::string get_node_fee_hash160() const;
 private:
+    // The primary coin's address of a scriptPubKey, the form /current_payouts
+    // keys its rows by: DASH and DOGE version bytes, else the LTC / BTC ones.
+    // "" for a script with no address form.
+    std::string primary_script_to_address(const std::vector<unsigned char>& script) const;
     void setup_methods();
     // Build Stratum-compatible coinb1/coinb2 from a live block template
     // Output ordering matches generate_share_transaction():
@@ -1877,6 +1891,7 @@ private:
     node_topology_fn_t m_node_topology_fn;  // D0.3 per-coin stats provider (optional)
     embedded_oracle_fn_t m_embedded_oracle_fn;  // /embedded_oracle shadow-validator stats (optional)
     embedded_template_fn_t m_embedded_template_fn;  // /embedded_template last-served snapshot (optional)
+    mempool_entry_fn_t     m_mempool_entry_fn;      // /mempool_entry one-entry diagnosis (optional)
     config_json_fn_t m_config_fn;         // GET /api/config — resolved launch config (optional)
     config_json_fn_t m_config_schema_fn;  // GET /api/config/schema — catalog schema (optional)
     config_apply_fn_t m_config_apply_fn;  // POST /api/config/apply — Slice A gated apply (optional; unwired => 503)

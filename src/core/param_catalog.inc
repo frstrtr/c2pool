@@ -14,6 +14,8 @@
 
 C2P_PARAM("meta.version", Meta, BOOL, COMPILE_TIME_READONLY, C_ALL, LIT, "false", NONE, "print version and exit")
   C2P_ALIAS("meta.version", BIN_DASH, "--version", FLAG)
+  C2P_ALIAS("meta.version", BIN_LTC, "--version", FLAG)
+  C2P_ALIAS("meta.version", BIN_BTC, "--version", FLAG)
   C2P_ALIAS("meta.version", BIN_DGB, "--version", FLAG)
   C2P_ALIAS("meta.version", BIN_BCH, "--version", FLAG)
   C2P_ALIAS("meta.version", BIN_BIP110, "--version", FLAG)
@@ -356,6 +358,9 @@ C2P_PARAM("web.external_ip", WebOps, STRING, LIVE, C_DASH|C_LTC, LIT, "", NONE, 
 C2P_PARAM("web.dashboard_dir", WebOps, PATH, RESTART, C_DASH|C_LTC, LIT, "web-static", NONE, "dashboard static asset dir")
   C2P_ALIAS("web.dashboard_dir", BIN_DASH, "--dashboard-dir", VALUE)
   C2P_ALIAS("web.dashboard_dir", BIN_LTC, "--dashboard-dir", VALUE)
+
+C2P_PARAM("web.mempool_entry_probe", WebOps, BOOL, RESTART, C_DASH, LIT, "false", NONE, "direct-local GET /mempool_entry probe (fee-parity shadow tooling)")
+  C2P_ALIAS("web.mempool_entry_probe", BIN_DASH, "--mempool-entry-probe", FLAG)
 
 C2P_PARAM("web.explorer", WebOps, TRISTATE_BOOL, RESTART, C_DASH|C_BIP110, NONE, "", NONE, "loopback-only /api/explorer surface (default on)")
   C2P_ALIAS("web.explorer", BIN_DASH, "--explorer", FLAG)

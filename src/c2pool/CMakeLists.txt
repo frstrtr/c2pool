@@ -383,6 +383,15 @@ target_link_libraries(c2pool-dash
     nlohmann_json::nlohmann_json
     ${Boost_LIBRARIES}
 )
+# A BLS-dark c2pool-dash must not finish its build silently (#1671): the
+# configure-time STATUS line in the root CMakeLists scrolls away long before
+# the link, so repeat it as the last line of the c2pool-dash build.
+if(NOT C2POOL_DASH_BLS_AVAILABLE)
+    add_custom_command(TARGET c2pool-dash POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E echo
+                "WARNING: c2pool-dash was built WITHOUT dashbls (bls=stub). A daemonless c2pool-dash --run refuses to start on this binary. Rebuild with -DC2POOL_DASH_BLS=ON -DDASHBLS_ROOT=<prefix> (scripts/build_dashbls.sh; README: Dash: build with BLS)."
+        VERBATIM)
+endif()
 
 # c2pool-bip110: Bitcoin Knots BLAKE2b hard fork (BIP-110) — M1 EMBEDDED lane.
 # BIP-110 swaps Bitcoin's SHA256d PoW for the BLAKE2b commitment pipeline
@@ -762,6 +771,24 @@ target_link_libraries(coin_peer_rearm_kat core ltc)
 target_link_libraries(coin_peer_rearm_kat c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage ltc_coin pool)
 target_link_libraries(coin_peer_rearm_kat nlohmann_json::nlohmann_json)
 add_test(NAME coin_peer_rearm_kat COMMAND coin_peer_rearm_kat)
+
+# ── KAT: DNS seed rounds never block the io_context (field freeze, 2026-11-15) ──
+# A getaddrinfo() interposer serves slow, NXDOMAIN and hung fake seeds; a 100 ms
+# timer must keep its cadence while every coin's peer manager resolves them from
+# start() in an io handler, from the emergency re-arm (60 s floor), and before
+# the loop runs; a round in flight at stop() or destruction is never delivered
+# (mode stop; its destroy legs need ASan to show a failure). Linux only: the
+# interposer needs ELF symbol preemption and dlsym(RTLD_NEXT).
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(coin_peer_dns_offthread_kat coin_peer_dns_offthread_kat.cpp)
+    target_link_libraries(coin_peer_dns_offthread_kat core ltc)
+    target_link_libraries(coin_peer_dns_offthread_kat c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage ltc_coin pool)
+    target_link_libraries(coin_peer_dns_offthread_kat nlohmann_json::nlohmann_json ${CMAKE_DL_LIBS})
+    foreach(mode start emergency preloop stop)
+        add_test(NAME coin_peer_dns_offthread_${mode} COMMAND coin_peer_dns_offthread_kat ${mode})
+        set_tests_properties(coin_peer_dns_offthread_${mode} PROPERTIES TIMEOUT 600)
+    endforeach()
+endif()
 
 # ── KAT: PR-0 ARRIVAL INSTRUMENTATION schema (dashd-cut coin-P2P foundation) ──
 # Locks the OffEmbeddedWindow arrival/fold split invariant

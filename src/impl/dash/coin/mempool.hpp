@@ -2206,6 +2206,86 @@ public:
         return m_pool.count(txid) > 0;
     }
 
+    /// Read-only diagnosis of one pool entry: is it a template candidate, and
+    /// if not, which input could no coin source price. Feeds GET
+    /// /mempool_entry (fee-parity shadow tooling: the comparator asks it for
+    /// every tx dashd mined and we did not). Mutates nothing, not even the
+    /// fee cache. The input walk mirrors compute_fee_locked's general path,
+    /// source for source: our UTXO view, an in-pool parent, the live fold
+    /// (fold_resolve), the fee-coin lookup.
+    struct Probe {
+        bool     in_pool{false};
+        time_t   time_added{0};
+        bool     fee_known{false};
+        bool     fee_fold_proven{false};  ///< what the template selector gates on
+        bool     in_feerate_index{false};
+        uint64_t fee{0};
+        uint64_t fee_delta{0};
+        uint32_t base_size{0};
+        int32_t  tx_type{0};
+        uint32_t n_vin{0};
+        uint32_t n_vin_unresolved{0};     ///< inputs no source can price now
+        // Coin sources wired on this node.
+        bool     utxo_view{false};
+        bool     fold_live{false};        ///< fold_resolve can answer (wired and at tip)
+        bool     fee_coin_lookup{false};
+        // The first input no source could price (n_vin_unresolved > 0).
+        uint32_t first_unresolved_vin{0};
+        uint256  first_unresolved_hash;
+        uint32_t first_unresolved_index{0};
+        bool     first_unresolved_parent_in_pool{false};  ///< parent held, index past its vouts
+        bool     first_unresolved_coin_spent{false};      ///< fee-coin lookup knows it, spent
+    };
+    Probe probe(const uint256& txid) const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        Probe p;
+        auto* utxo = m_utxo.load();
+        p.utxo_view       = utxo != nullptr;
+        p.fold_live       = fold_active();
+        p.fee_coin_lookup = static_cast<bool>(m_fee_coin_lookup);
+        auto it = m_pool.find(txid);
+        if (it == m_pool.end()) return p;
+        const MempoolEntry& e = it->second;
+        p.in_pool          = true;
+        p.time_added       = e.time_added;
+        p.fee_known        = e.fee_known;
+        p.fee_fold_proven  = e.fee_fold_proven;
+        p.fee              = e.fee;
+        p.fee_delta        = e.fee_delta;
+        p.base_size        = e.base_size;
+        p.tx_type          = static_cast<int32_t>(e.tx.type);
+        p.n_vin            = static_cast<uint32_t>(e.tx.vin.size());
+        p.in_feerate_index = e.fee_known
+            && m_feerate_index.count(FeeKey{e.modified_fee(), e.base_size, txid}) > 0;
+        for (uint32_t i = 0; i < e.tx.vin.size(); ++i) {
+            const auto& vin = e.tx.vin[i];
+            ::core::coin::Outpoint op(vin.prevout.hash, vin.prevout.index);
+            ::core::coin::Coin coin;
+            if (utxo && utxo->get_coin(op, coin)) continue;
+            auto pit = m_pool.find(vin.prevout.hash);
+            const bool parent_held = pit != m_pool.end();
+            if (parent_held && vin.prevout.index < pit->second.tx.vout.size()) continue;
+            if (fold_resolve(op, coin)) continue;
+            bool spent = false;
+            if (m_fee_coin_lookup) {
+                ::core::coin::Coin fc;
+                if (m_fee_coin_lookup(op, fc)) {
+                    if (!fc.is_spent()) continue;
+                    spent = true;
+                }
+            }
+            if (p.n_vin_unresolved++ == 0) {
+                p.first_unresolved_vin            = i;
+                p.first_unresolved_hash           = vin.prevout.hash;
+                p.first_unresolved_index          = vin.prevout.index;
+                p.first_unresolved_parent_in_pool = parent_held;
+                p.first_unresolved_coin_spent     = spent;
+            }
+        }
+        return p;
+    }
+
     /// The txids of `txids` the pool holds, read under one lock (one
     /// consistent view for a whole template body).
     std::set<uint256> contained(const std::set<uint256>& txids) const
