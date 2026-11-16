@@ -512,7 +512,16 @@ Check the last line of `--version`:
 | `--version` ends in | Meaning |
 |---|---|
 | `bls=dashbls` | BLS verification armed. This is what the release packages ship. |
-| `bls=stub` | Built without `-DC2POOL_DASH_BLS=ON`. Quorum/ChainLock/InstantSend/governance verification is inert, and the daemonless posture (a bare `c2pool-dash --run`) **refuses to start** with `[BLS-STUB] refusing to start` (exit 2). Only a dashd-attached node (`--coin-rpc`) runs on a stub build. `--allow-stub-bls` overrides the refusal for testing only — never in production. |
+| `bls=stub` | Built with `-DC2POOL_DASH_ALLOW_NO_BLS=ON` (see below). Quorum/ChainLock/InstantSend/governance verification is inert, and the daemonless posture (a bare `c2pool-dash --run`) **refuses to start** with `[BLS-STUB] refusing to start` (exit 2). Only a dashd-attached node (`--coin-rpc`) runs on a stub build. `--allow-stub-bls` overrides the refusal for testing only — never in production. |
+
+**dashbls is found automatically** on a fresh configure (one that does not pass
+`-DC2POOL_DASH_BLS` at all) when it is installed under `$DASHBLS_ROOT`,
+`$HOME/.c2pool-deps/dashbls` (where the command above puts it), `/usr/local`
+or `/opt/dashbls`; configure then prints `dashbls auto-detected at <prefix>`.
+**Without dashbls the `c2pool-dash` target fails to build** with a message that
+says how to fix it; every other binary builds as usual. A stub build is only
+for a node attached to its own dashd, or for CI: configure with
+`-DC2POOL_DASH_ALLOW_NO_BLS=ON`.
 
 `-DC2POOL_DASH_BLS=ON` with the library missing is a configure-time error, not
 a silent fallback. The script builds the `src/dashbls` subtree of the dash
