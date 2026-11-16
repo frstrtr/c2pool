@@ -1,0 +1,8 @@
+{
+ "source": "ltc.voidbind.com's /recent_blocks rows and graph rate history of 2026-11-16, run offline through the node's luck model (core/pool_luck.hpp, branch luck/effort-backend at 314f272d7); the result written under the luck API's field names",
+ "now_utc": 1794819700.0,
+ "chain": "LTC",
+ "history_first_utc": 1785318624.0,
+ "history_last_utc": 1794819592.0,
+ "note": "The rate history starts 2026-07-29, inside the round that ended at block 3160570: that round is covered for 13 %. Its row's effort (9.29) is the covered integral scaled up to the whole round; the node's periods count the covered integral alone (1.24). Rows 27588573 and 27272772 are finds that never confirmed (main_chain false). Not served by a node: the model's output for this data; hashes and heights are the node's."
+}
