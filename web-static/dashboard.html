@@ -5091,9 +5091,6 @@
 
         // Look up miner's share version from defrag data (cached per load)
         function getMinerVersion(addr) {
-            // Donation addresses always signal V36 during transition
-            if (addr && (addr.indexOf('LeD2f') === 0 || addr.indexOf('MLhSm') === 0))
-                return { ver: 35, dv: 36 };
             if (!defrag.shares || defrag.shares.length === 0) return { ver: 0, dv: 0 };
             var verCounts = {}, dvCounts = {};
             defrag.shares.forEach(function(s) {
@@ -5108,6 +5105,75 @@
             return { ver: topVer, dv: topDv || topVer };
         }
 
+        // BEGIN c2pPayoutRole (tested by sharechain-explorer/tests/unit/dashboard-payout-role.test.ts)
+        // Role of a "Current Payouts" row, from what the node publishes and
+        // never from an address prefix (the PPLNS treemap's classifyAddress
+        // rule): 'donation' = the coinbase donation output (not a miner, no
+        // share version), 'owner' = this node's owner fee payee, '' = a miner.
+        // `ci` is /web/currency_info; `entry` the /current_merged_payouts row
+        // (null on the /current_payouts fallback path).
+        function c2pPayoutRole(addr, entry, ci) {
+            ci = ci || {};
+            if (!addr) return '';
+            if (ci.donation_address && addr === ci.donation_address) return 'donation';
+            // A donation output no parent row took is listed under its own
+            // merged-chain address.
+            var mda = ci.merged_donation_addresses;
+            if (mda && typeof mda === 'object') {
+                for (var k in mda) if (mda[k] === addr) return 'donation';
+            }
+            // A node without the currency_info donation fields: the donation
+            // row's merged child carries source "donation".
+            var m = entry && entry.merged;
+            if (m && m.length) {
+                for (var i = 0; i < m.length; i++) if (m[i] && m[i].source === 'donation') return 'donation';
+            }
+            if (ci.node_owner_address && addr === ci.node_owner_address) return 'owner';
+            return '';
+        }
+        // A /current_merged_payouts child that is its chain's donation output.
+        function c2pMergedIsDonation(merged, ci) {
+            if (!merged) return false;
+            var mda = ci && ci.merged_donation_addresses;
+            var sym = String(merged.symbol || '').toUpperCase();
+            if (mda && sym && merged.address && mda[sym] === merged.address) return true;
+            return merged.source === 'donation';
+        }
+        // The V<thr>? cell of a payouts row; null while the share version is
+        // not known. The donation output has no shares: a neutral marker.
+        function c2pPayoutVersionHtml(role, mv, thr, staleTitle) {
+            if (role === 'donation')
+                return '<span style="color:var(--text-muted)" title="Donation output (protocol), not a miner — no share version">◇</span>';
+            mv = mv || {};
+            if (mv.ver >= thr)
+                return '<span style="color:#28a745;font-weight:700" title="V' + mv.ver + '">✓</span>';
+            if (mv.dv >= thr)
+                return '<span style="color:#0097a7;font-weight:700" title="V' + mv.ver + ' signaling V' + mv.dv + '">⇧</span>';
+            if (mv.ver > 0)
+                return '<span style="color:#dc3545;font-weight:700" title="' + staleTitle + '">✗</span>';
+            return null;
+        }
+        // Small muted label after a payouts address ({text, title} or null);
+        // `sym` is the chain of that output.
+        function c2pPayoutRoleLabel(role, sym) {
+            if (role === 'donation')
+                return { text: '◇ donation', title: 'Donation output of the coinbase for ' + sym };
+            if (role === 'owner')
+                return { text: '⚑ node fee', title: 'Node-owner fee address of this node: its fee shares pay here' };
+            return null;
+        }
+        // END c2pPayoutRole
+        function appendPayoutRoleLabel(td, role, sym) {
+            var lb = c2pPayoutRoleLabel(role, sym);
+            if (!lb) return;
+            td.append('span')
+                .style('color', 'var(--text-muted)')
+                .style('font-size', '0.6rem')
+                .style('margin-left', '4px')
+                .attr('title', lb.title)
+                .text(lb.text);
+        }
+
         // Re-render V36 column in existing payouts table rows
         function refreshPayoutsV36() {
             d3.selectAll('#payouts tbody tr').each(function() {
@@ -5119,16 +5185,14 @@
                 var v36Cell = d3.select(cells[0][1]);
                 var link = addrCell.select('a');
                 if (link.empty()) return;
-                var addr = link.attr('title') || link.text();
+                // The link text is the address; the title is "SYM: address"
+                // on the merged path, which matched no share.
+                var addr = link.text();
+                var pd = window.payoutsData;
+                var role = c2pPayoutRole(addr, pd && pd.mergedPays ? pd.mergedPays[addr] : null, currency_info);
                 var mv = getMinerVersion(addr);
-                var vthr = explorerVersionThreshold();
-                if (mv.ver >= vthr) {
-                    v36Cell.html('<span style="color:#28a745;font-weight:700" title="V' + mv.ver + '">✓</span>');
-                } else if (mv.dv >= vthr) {
-                    v36Cell.html('<span style="color:#0097a7;font-weight:700" title="V' + mv.ver + ' signaling V' + mv.dv + '">⇧</span>');
-                } else if (mv.ver > 0) {
-                    v36Cell.html('<span style="color:#dc3545;font-weight:700" title="' + staleVersionTitle(mv.ver) + '">✗</span>');
-                }
+                var html = c2pPayoutVersionHtml(role, mv, explorerVersionThreshold(), staleVersionTitle(mv.ver));
+                if (html) v36Cell.html(html);
             });
         }
 
@@ -5161,20 +5225,14 @@
                     .attr('target', '_blank')
                     .attr('title', (((typeof currency_info !== 'undefined' && currency_info.symbol) || 'LTC')) + ': ' + addr)
                     .text(addr);
+                var role = c2pPayoutRole(addr, entry, currency_info);
+                appendPayoutRoleLabel(addrTd, role, currency_info.symbol || 'COIN');
 
                 // Version column — look up miner version from defrag share data
                 var v36Td = mainRow.append('td').style('text-align', 'center');
                 var minerVer = getMinerVersion(addr);
-                var verThr = explorerVersionThreshold();
-                if (minerVer.ver >= verThr) {
-                    v36Td.html('<span style="color:#28a745;font-weight:700" title="V' + minerVer.ver + '">✓</span>');
-                } else if (minerVer.dv >= verThr) {
-                    v36Td.html('<span style="color:#0097a7;font-weight:700" title="V' + minerVer.ver + ' signaling V' + minerVer.dv + '">⇧</span>');
-                } else if (minerVer.ver > 0) {
-                    v36Td.html('<span style="color:#dc3545;font-weight:700" title="' + staleVersionTitle(minerVer.ver) + '">✗</span>');
-                } else {
-                    v36Td.text('-');
-                }
+                var verHtml = c2pPayoutVersionHtml(role, minerVer, explorerVersionThreshold(), staleVersionTitle(minerVer.ver));
+                if (verHtml) v36Td.html(verHtml); else v36Td.text('-');
 
                 mainRow.append('td')
                     .style('text-align', 'right')
@@ -5210,7 +5268,9 @@
                         // merged chain only to its own merged address, else to its
                         // own parent key.
                         var _psym = (typeof currency_info !== 'undefined' && currency_info.symbol) || 'LTC';
-                        if (merged.source === 'auto-convert') {
+                        if (c2pMergedIsDonation(merged, currency_info)) {
+                            appendPayoutRoleLabel(addrCell, 'donation', merged.symbol);
+                        } else if (merged.source === 'auto-convert') {
                             addrCell.append('span')
                                 .style('color', '#b08800')
                                 .style('font-size', '0.6rem')
@@ -5441,25 +5501,20 @@
             
             display.forEach(function(addr) {
                 var tr = tbody.append('tr');
-                tr.append('td').append('a')
+                var addrTd = tr.append('td');
+                addrTd.append('a')
                     .attr('class', 'hash-link')
                     .attr('href', currency_info.address_explorer_url_prefix + addr)
                     .attr('target', '_blank')
                     .attr('title', addr)
                     .text(addr);
+                var role = c2pPayoutRole(addr, null, currency_info);
+                appendPayoutRoleLabel(addrTd, role, currency_info.symbol || 'COIN');
                 // Version column
                 var v36Td = tr.append('td').style('text-align', 'center');
                 var mv = getMinerVersion(addr);
-                var vThr = explorerVersionThreshold();
-                if (mv.ver >= vThr) {
-                    v36Td.html('<span style="color:#28a745;font-weight:700" title="V' + mv.ver + '">✓</span>');
-                } else if (mv.dv >= vThr) {
-                    v36Td.html('<span style="color:#0097a7;font-weight:700" title="V' + mv.ver + ' signaling V' + mv.dv + '">⇧</span>');
-                } else if (mv.ver > 0) {
-                    v36Td.html('<span style="color:#dc3545;font-weight:700" title="' + staleVersionTitle(mv.ver) + '">✗</span>');
-                } else {
-                    v36Td.text('-');
-                }
+                var verHtml = c2pPayoutVersionHtml(role, mv, explorerVersionThreshold(), staleVersionTitle(mv.ver));
+                if (verHtml) v36Td.html(verHtml); else v36Td.text('-');
                 tr.append('td')
                     .style('text-align', 'right')
                     .attr('class', 'amount')
