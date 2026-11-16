@@ -2598,7 +2598,12 @@ int run_node(const core::CoinParams& params, bool testnet,
                     height, block_hash, static_cast<uint64_t>(std::time(nullptr)),
                     /*chain=*/"DGB", /*miner=*/"", /*share_hash=*/block_hash.GetHex(),
                     mi->get_network_difficulty(), /*share_difficulty=*/0.0,
-                    mi->get_local_hashrate(), /*subsidy=*/0);
+                    // Pool hashrate 0 -> record_found_block reads the
+                    // sharechain pool estimator. This site passed
+                    // get_local_hashrate(): this node's OWN stratum rate in a
+                    // field named pool_hashrate_at_find, so a block's luck
+                    // was measured against one node's miners, not the pool.
+                    /*pool_hashrate=*/0.0, /*subsidy=*/0);
                 // Arm the post-broadcast confirm/orphan poller. Telemetry only.
                 mi->schedule_block_verification(block_hash.GetHex());
                 std::cout << "[DGB] recorded found block hash="

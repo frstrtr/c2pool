@@ -2430,7 +2430,13 @@ int run_embedded(bool coin_p2p_discover,
                         /*chain=*/"BIP110", /*miner=*/"",
                         /*share_hash=*/id.GetHex(),
                         mi->get_network_difficulty(), /*share_difficulty=*/0.0,
-                        mi->get_local_hashrate(), /*subsidy=*/0,
+                        // Pool hashrate 0 -> record_found_block reads the
+                        // sharechain pool estimator. This site passed
+                        // get_local_hashrate(): this node's OWN stratum rate
+                        // in a field named pool_hashrate_at_find, so a
+                        // block's luck was measured against one node's
+                        // miners, not the pool.
+                        /*pool_hashrate=*/0.0, /*subsidy=*/0,
                         core::MiningInterface::BlockAuthorship::this_node);
                     mi->schedule_block_verification(id.GetHex());
                     LOG_INFO << "[EMB-BIP110] recorded found block h=" << height

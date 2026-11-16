@@ -913,7 +913,12 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
         work_source->set_on_found_block_fn(
             [mi](uint32_t height, const uint256& block_hash,
                  const std::string& miner, bool reached_network) {
-                const double pool_hr = mi->get_local_hashrate();
+                // Pool hashrate 0 -> record_found_block reads the sharechain
+                // pool estimator. This site passed get_local_hashrate(): this
+                // node's OWN stratum rate in a field named
+                // pool_hashrate_at_find, so a block's luck was measured
+                // against one node's miners, not the pool.
+                const double pool_hr = 0.0;
                 uint64_t     subsidy = 0;
                 auto tmpl = mi->get_current_work_template();
                 if (!tmpl.is_null() && tmpl.contains("coinbasevalue"))
