@@ -144,7 +144,7 @@ Each frame the engine passes the view's `labels(placedTiles)` for the tiles as p
 
 | View | Mount | Notes |
 |---|---|---|
-| Share-chain grid, "Fluid (experimental)" (`views/sharechain-grid.ts`) | `mountSharechainGrid({ container, colorOf, blockKindOf?, bus?, onHover?, onClick? })`, then `grid.update(shares)` (newest first) | Shares are keyed by full hash, so a new tip slides every cell one slot and evicted shares fade at the tail. Colours and block kinds come from the host (dashboard.html passes Classic's `getColor`). A miner pinned or hovered in another view keeps full colour and the rest dim. Hover and click go back to the host (Classic tooltip and zoom). |
+| Share-chain grid, "Fluid (experimental)" (`views/sharechain-grid.ts`) | `mountSharechainGrid({ container, colorOf, blockKindOf?, bus?, onHover?, onClick? })`, then `grid.update(shares, { offChain })` (newest first) | Shares are keyed by full hash, so a new tip slides every cell one slot and evicted shares fade at the tail. Colours and block kinds come from the host (dashboard.html passes Classic's `getColor`). A miner pinned or hovered in another view keeps full colour and the rest dim. Hover and click go back to the host (Classic tooltip and zoom). `offChain` takes `offChainBlocks(ledger, shares, symbol)` from `views/offchain.ts`, the same rows the "Blocks in Window" panel counts as off-chain (a parity test runs the dashboard's own `c2pWindowBlocks`). Each becomes a ▣ cell placed by timestamp; the hour axis counts those cells too. |
 | PPLNS treemap (`views/pplns-treemap.ts` + pure `views/pplns-model.ts`) | `mountPplnsTreemap({ container, symbol, mergedSymbol?, bus?, special?, facts?, addressUrl? })`, then `view.update({ payouts, merged }, special?)` | See below. |
 
 **PPLNS treemap.**

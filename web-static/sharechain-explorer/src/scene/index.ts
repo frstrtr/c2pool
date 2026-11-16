@@ -50,3 +50,6 @@ export { createGridLayout } from './layouts/grid.js';
 export type { GridOptions, GridLayoutPlugin } from './layouts/grid.js';
 export { mountSharechainGrid, parseCssColor, hourAxisLabels, keyOfShare, BLOCK_MARK } from './views/sharechain-grid.js';
 export type { SharechainGrid, SharechainGridOptions, GridShare, BlockKind } from './views/sharechain-grid.js';
+export { OFF_CHAIN_FILL, OFF_CHAIN_MARK } from './views/sharechain-grid.js';
+export { offChainBlocks, withOffChainCells, offChainLines, isOffChainCell } from './views/offchain.js';
+export type { BlockRow, OffChainCell } from './views/offchain.js';

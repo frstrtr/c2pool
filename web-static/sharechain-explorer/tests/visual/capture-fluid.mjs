@@ -1,13 +1,16 @@
 // Real-browser check + screenshots of the "Fluid (experimental)" share-chain
 // grid (dashboard.html?explorer-anim=fluid) against the mock server
-// (MOCK_PAYOUTS=1 so the PPLNS treemap is live for the bus link). Not a gate.
+// (MOCK_PAYOUTS=1 so the PPLNS treemap is live for the bus link,
+// MOCK_OFFCHAIN=1 for a ▣ off-chain block-share cell). Not a gate.
 //
 //   CHROME_BIN=… node tests/visual/capture-fluid.mjs
 //
 // Checks: the default page has no Fluid stage; with the flag the engine grid
 // mounts in place of the Classic canvas; hovering a cell shows the Classic
-// tooltip; pinning a miner in the treemap dims the other miners' cells.
-// Writes out/fluid-grid.png and out/fluid-linked.png. Exits 1 on a failed check.
+// tooltip; the off-chain ledger row gets a ▣ cell with its own tooltip and
+// matches the panel's count; pinning a miner in the treemap dims the other
+// miners' cells. Writes out/fluid-grid.png, out/fluid-offchain.png and
+// out/fluid-linked.png. Exits 1 on a failed check.
 
 import puppeteer from 'puppeteer-core';
 import { spawn } from 'node:child_process';
@@ -24,7 +27,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const portFile = join(OUT, 'fluid-mock.port');
 rmSync(portFile, { force: true });
 const server = spawn(process.execPath, [join(HERE, 'mock-server.mjs'), '0', portFile], {
-  env: { ...process.env, MOCK_PAYOUTS: '1' }, stdio: 'ignore',
+  env: { ...process.env, MOCK_PAYOUTS: '1', MOCK_OFFCHAIN: '1' }, stdio: 'ignore',
 });
 async function pageClip(page, handle, extraH = 0, maxH = 900) {
   return page.evaluate((el, extra, max) => {
@@ -74,6 +77,37 @@ try {
     }), 'Fluid: hovering a cell shows the Classic tooltip');
     await page.screenshot({ path: join(OUT, 'fluid-grid.png'), clip: await pageClip(page, stage, 0, 520) });
     console.log('→ out/fluid-grid.png');
+    // ▣: the mock ledger has one block whose share is off the window. Find
+    // its cell with the page's own scene.js (same layout as the view), hover
+    // it, and check the panel counts the same row.
+    const offc = await page.evaluate(async () => {
+      if (typeof defrag === 'undefined') return { err: 'no defrag global' };
+      const url = performance.getEntriesByType('resource').map((e) => e.name).find((n) => /dist\/scene\.js\?v=/.test(n));
+      const mod = await import(url);
+      const ci = (typeof currency_info !== 'undefined' && currency_info) || {};
+      const rows = mod.offChainBlocks(window.c2pRecentBlocks, defrag.shares, ci.symbol || 'COIN');
+      const laid = mod.withOffChainCells(defrag.shares, rows);
+      const i = laid.findIndex(mod.isOffChainCell);
+      const st = document.querySelector('#defrag-fluid > div');
+      const g = mod.createGridLayout().metrics(laid.length, { x: 0, y: 0, w: st.clientWidth, h: st.clientHeight });
+      const r = st.getBoundingClientRect();
+      return {
+        rows: rows.length, index: i, cell: g.cellSize,
+        x: r.left + g.marginLeft + (i % g.cols) * g.step + g.cellSize / 2,
+        y: r.top + Math.floor(i / g.cols) * g.step + g.cellSize / 2,
+        panel: document.getElementById('defrag-blocks').textContent,
+      };
+    });
+    check(offc.rows === 1 && offc.index > 0, `▣: one off-chain row placed in the grid (${JSON.stringify(offc)})`);
+    check(/\(1 by off-chain share\)/.test(offc.panel || ''), `▣: the "Blocks in Window" panel counts the same row (${offc.panel})`);
+    await page.mouse.move(offc.x, offc.y);
+    await sleep(400);
+    const tipText = await page.evaluate(() => document.getElementById('defrag-tooltip').textContent);
+    check(tipText.startsWith('▣ solved block 2573244') && tipText.includes('share not on the best sharechain'),
+      `▣: hovering the cell shows the off-chain tooltip (${tipText.slice(0, 60)}…)`);
+    const oc = await pageClip(page, stage, 0, 360);
+    await page.screenshot({ path: join(OUT, 'fluid-offchain.png'), clip: { ...oc, width: 1280 - oc.x } });  // room for the tooltip
+    console.log('→ out/fluid-offchain.png');
     // Pin the biggest treemap tile; the grid dims the other miners.
     await page.mouse.move(2, 2);
     const tm = await page.$('#pplns-main-grid .c2p-pplns-treemap > div:nth-child(2)');

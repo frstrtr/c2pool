@@ -4607,6 +4607,7 @@
                 // The window panel's "Blocks in Window" reads the whole ledger
                 // (c2pWindowBlocks), not only the 10 rows the table shows.
                 window.c2pRecentBlocks = blocks || [];
+                if (window.c2pFluidActive && typeof defrag.render === 'function') defrag.render();
                 d3.select('#blocks_loading').style('display', 'none');
                 // Clear existing rows before adding new data
                 d3.select('#blocks tbody').selectAll('tr').remove();
@@ -7567,9 +7568,28 @@
             } catch (e) { location.reload(); }
         }
         var _fluidP = null;
+        function c2pOffChainTip(mod, cell, ev) {
+            var tip = defrag.tooltip;
+            if (!tip) return;
+            while (tip.firstChild) tip.removeChild(tip.firstChild);
+            mod.offChainLines(cell.block, Date.now() / 1000).forEach(function(line, i) {
+                var d = document.createElement('div');
+                d.textContent = line;
+                if (i === 0) { d.style.fontWeight = '700'; d.style.color = '#ffd700'; }
+                else if (i > 1) { d.style.color = 'var(--text-muted)'; d.style.wordBreak = 'break-all'; }
+                tip.appendChild(d);
+            });
+            if (defrag.zoomPanel) defrag.zoomPanel.style.display = 'none';
+            tip.style.display = 'block';
+            var x = ev.clientX + 14, y = ev.clientY + 14;
+            if (x + 330 > window.innerWidth) x = ev.clientX - 334;
+            if (y + tip.offsetHeight + 8 > window.innerHeight) y = ev.clientY - tip.offsetHeight - 14;
+            tip.style.left = Math.max(8, x) + 'px';
+            tip.style.top = Math.max(8, y) + 'px';
+        }
         function c2pFluidMount() {
             if (_fluidP) return _fluidP;
-            _fluidP = import('./sharechain-explorer/dist/scene.js?v=7d6e2905').then(function(mod) {
+            _fluidP = import('./sharechain-explorer/dist/scene.js?v=70470b3a').then(function(mod) {
                 var canvas = document.getElementById('defrag-canvas');
                 var wrap = canvas.parentElement;
                 canvas.style.display = 'none';
@@ -7579,7 +7599,7 @@
                 host.style.cssText = 'position:absolute;inset:0';
                 wrap.appendChild(host);
                 if (!window.c2pSelectionBus) window.c2pSelectionBus = mod.createSelectionBus();
-                return mod.mountSharechainGrid({
+                var view = mod.mountSharechainGrid({
                     container: host,
                     bus: window.c2pSelectionBus,
                     colorOf: function(s) { return defrag.getColor(s); },
@@ -7587,11 +7607,17 @@
                         return blockMarkKind(c2pIsBlockShare(defrag.blockSet, s), !!defrag.dogeSet[s.h]);
                     },
                     onHover: function(s, ev) {
-                        if (s) { defrag.showTooltip(s, ev); defrag.showZoom(s, ev); }
+                        if (s && mod.isOffChainCell(s)) c2pOffChainTip(mod, s, ev);
+                        else if (s) { defrag.showTooltip(s, ev); defrag.showZoom(s, ev); }
                         else defrag.hideTooltip();
                     },
-                    onClick: function(s) { if (s.H) window.open('share.html#' + s.H, '_blank'); }
+                    onClick: function(s) {
+                        if (mod.isOffChainCell(s)) {
+                            if (s.block.explorer_url) window.open(s.block.explorer_url, '_blank', 'noopener');
+                        } else if (s.H) window.open('share.html#' + s.H, '_blank');
+                    }
                 });
+                return { mod: mod, view: view };
             });
             return _fluidP;
         }
@@ -7601,11 +7627,20 @@
             if (chip) { chip.style.fontWeight = '700'; chip.style.color = 'var(--primary)'; }
             if (window.__c2pBundledExplorer || mode !== 'fluid') return;
             var classicRender = defrag.render, classicAnimate = defrag._animate3D;
+            window.c2pFluidActive = true;
             defrag.render = function() {
-                c2pFluidMount().then(function(view) { view.update(defrag.shares); })
+                c2pFluidMount().then(function(f) {
+                    var ci = (typeof currency_info !== 'undefined' && currency_info) || {};
+                    // ▣: ledger blocks whose share is off the best sharechain
+                    // (the same rows "Blocks in Window" counts as off-chain).
+                    f.view.update(defrag.shares, {
+                        offChain: f.mod.offChainBlocks(window.c2pRecentBlocks, defrag.shares, ci.symbol || 'COIN')
+                    });
+                })
                     .catch(function(err) {
                         // scene.js unavailable: fall back to Classic for good.
                         console.error('[c2pool] Fluid grid failed to load; using Classic', err);
+                        window.c2pFluidActive = false;
                         defrag.render = classicRender;
                         defrag._animate3D = classicAnimate;
                         var c = document.getElementById('defrag-canvas');
@@ -7988,7 +8023,7 @@
         }
         function c2pPplnsViewMount() {
             if (_pplnsViewP) return _pplnsViewP;
-            _pplnsViewP = import('./sharechain-explorer/dist/scene.js?v=7d6e2905').then(function(mod) {
+            _pplnsViewP = import('./sharechain-explorer/dist/scene.js?v=70470b3a').then(function(mod) {
                 var ci = (typeof currency_info !== 'undefined' && currency_info) || {};
                 var grid = document.getElementById('pplns-main-grid');
                 grid.innerHTML = '';
