@@ -41,12 +41,13 @@ Two further limitations today:
   serve embedded templates rather than guessing a payee.
 - **A stale anchor is refused, not worked around.** The bridge refuses to
   start more than `--embedded-mn-bridge-max` blocks behind the tip (default
-  20000, ≈34 days). The distance is measured from where the bridge starts: the
+  40000, ≈69 days). The distance is measured from where the bridge starts: the
   anchor on a cold start (empty data directory), the persisted cursor when a
   node resumes. A running node persists its cursor as it follows the chain, so
   the limit bites only on a cold start or after a stop longer than the limit:
   with the h=2,563,800 anchor, a cold start is refused once the tip passes
-  2,583,800. A release cut long ago will not
+  2,603,800 (2,583,800 under the earlier 20000 default). A release cut long
+  ago will not
   daemonlessly cold-start DASH without a fresher build, a larger
   `--embedded-mn-bridge-max`, or `--coin-rpc-*`.
 
