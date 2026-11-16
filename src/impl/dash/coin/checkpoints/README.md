@@ -99,8 +99,9 @@ refuses to serve templates and logs at `ERROR`:
 * the **digest** does not match the contents;
 * the **chain position** disagrees with our header chain;
 * the anchor is **more than `--embedded-mn-bridge-max` blocks behind the
-  tip** (default 20000, ≈34 days) — a stale anchor is refused rather than
-  ground through;
+  tip** (default 40000, ≈69 days; a resuming node measures from its
+  persisted cursor instead) — a stale anchor is refused rather than ground
+  through;
 * the forward replay hits a **gap** or a **payee desync**.
 
 In every one of those cases templates keep routing to the dashd fallback arm

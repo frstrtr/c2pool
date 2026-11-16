@@ -1169,7 +1169,7 @@ dashd-attached default OFF)
 | `--embedded-utxo-immature-serve-empty` | Serve coinbase-only until the UTXO view is mature. |
 | `--embedded-creditpool-publish-at-serve-tip` | Publish the derived credit pool at the serve tip (money path, default OFF). |
 | `--embedded-mined-commitment-index` | Arm the mined-commitment store on live tips. |
-| `--embedded-mn-bridge-max N` | Max blocks the pinned masternode anchor may lag the tip before the bridge refuses it as stale (default 20000, `mn_checkpoint_lane.hpp`). |
+| `--embedded-mn-bridge-max N` | Max blocks the pinned masternode anchor (or, on a resume, the persisted cursor) may lag the tip before the bridge refuses it as stale (default 40000, ≈69 days, `mn_checkpoint_lane.hpp`). |
 | `--embedded-mn-bridge-no-cursor` | Replay the whole window from the anchor on every start instead of resuming the saved cursor. |
 | `--embedded-fold-live PATH` + `--embedded-fold-live-expect HASH`, `--embedded-fold-checkscripts` | Wire a full-history UTXO fold store as the live input-pricing view (store hash must match); consensus-exact input-script check. |
 | `--embedded-utxo-fold-fees DBPATH` + `--embedded-utxo-fold-expect HEX` | Graduated fold fee pricing; both required together. |
