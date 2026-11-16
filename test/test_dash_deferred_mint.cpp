@@ -45,7 +45,11 @@
 
 #include <atomic>
 #include <chrono>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <memory>
+#include <string>
 #include <shared_mutex>
 #include <stdexcept>
 #include <thread>
@@ -370,8 +374,102 @@ TEST(DeferredMinter, NothingIsMintedAfterShutdown)
     EXPECT_TRUE(s.calls.empty()) << "nothing is minted once the node stops";
     EXPECT_EQ(late.outcome.result, MintResult::Dropped);
     EXPECT_EQ(late.outcome.why, MintDropReason::shutdown);
-    EXPECT_EQ(drops(m->counters(), MintDropReason::shutdown), 2u);
-    EXPECT_EQ(m->snapshot().counters.dropped_total(), 2u);
+    ASSERT_EQ(s.lost.size(), 3u) << "a late solve also reaches the drop hook";
+    EXPECT_EQ(s.lost[2], std::make_pair(3, MintDropReason::shutdown));
+    EXPECT_EQ(drops(m->counters(), MintDropReason::shutdown), 3u);
+    EXPECT_EQ(m->snapshot().counters.dropped_total(), 3u);
+}
+
+// OWNER THREAD (all builds): a call from another thread never touches the
+// queue. on_solve takes the old synchronous path, drain_point is a no-op, and
+// both are counted.
+TEST(DeferredMinter, OffOwnerThreadCallsTakeTheOldPathAndNeverTouchTheQueue)
+{
+    ScriptedMint s;
+    bool lock_busy = true;
+    s.outcome = [&](int i) { return lock_busy ? busy() : minted(i); };
+    auto m = s.make(true);                       // owner = this (test) thread
+    EXPECT_TRUE(m->on_solve(1, false).queued);
+    s.calls.clear();
+    DeferredMinter<int>::SolveResult off;
+    std::thread t([&] {
+        off = m->on_solve(2, false);
+        m->drain_point();
+    });
+    t.join();
+    EXPECT_FALSE(off.queued);
+    ASSERT_EQ(s.calls.size(), 1u);
+    EXPECT_EQ(s.calls[0].first, 2);
+    EXPECT_TRUE(s.calls[0].second.think_after) << "the old path";
+    EXPECT_FALSE(s.calls[0].second.deferrable);
+    EXPECT_EQ(m->depth(), 1u) << "the queue was not touched";
+    EXPECT_EQ(m->off_thread_calls(), 2u);
+    EXPECT_EQ(m->snapshot().off_thread, 2u);
+
+    // bind_owner_thread hands ownership to another thread: the test thread is
+    // now off-owner.
+    std::thread::id other;
+    std::thread([&] { other = std::this_thread::get_id(); }).join();
+    m->bind_owner_thread(other);
+    lock_busy = false;
+    m->drain_point();
+    EXPECT_EQ(m->depth(), 1u);
+    EXPECT_EQ(m->off_thread_calls(), 3u);
+}
+
+// The optional per-drain time budget stops a drain like the item cap and
+// leaves the rest for the next drain point.
+TEST(DeferredMintQueue, TimeBudgetStopsTheDrainAndKeepsTheRest)
+{
+    DeferredMintQueue<int> q;
+    for (int i = 1; i <= 5; ++i) ASSERT_TRUE(q.push_back(i));
+    const auto slow = [](int i) { std::this_thread::sleep_for(3ms); return minted(i); };
+    const auto st = q.drain(slow, {}, 16, std::chrono::steady_clock::now(), 5000us);
+    EXPECT_TRUE(st.stopped_budget);
+    EXPECT_GE(st.minted, 1u);
+    EXPECT_LE(st.minted, 2u) << "3 ms per item against a 5 ms budget";
+    EXPECT_EQ(q.size(), 5u - st.minted);
+    EXPECT_EQ(q.counters().budget_stops, 1u);
+    const auto rest = q.drain(slow);   // no budget: everything left mints
+    EXPECT_EQ(rest.minted + st.minted, 5u);
+    EXPECT_FALSE(rest.stopped_budget);
+}
+
+// DEFAULT OFF (DIRECTOR 11-17): the binary ships with the queue off until a
+// soak and a production canary have measured it; --deferred-mint turns it on.
+// Pins the constant, that main_dash takes its default from it and parses both
+// spellings, the catalog entry, and that the default constructs the old path.
+TEST(DashDeferredMintDefault, IsOffAndTheBinaryUsesIt)
+{
+    EXPECT_FALSE(dash::mint::kDeferredMintDefault);
+
+    std::ifstream in(DASH_MAIN_SRC);
+    ASSERT_TRUE(in.good()) << "cannot open " << DASH_MAIN_SRC;
+    const std::string src((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    EXPECT_NE(src.find("bool g_deferred_mint = dash::mint::kDeferredMintDefault;"), std::string::npos);
+    EXPECT_NE(src.find(R"("--deferred-mint") == 0)
+            g_deferred_mint = true;)"), std::string::npos);
+    EXPECT_NE(src.find(R"("--no-deferred-mint") == 0)
+            g_deferred_mint = false;)"), std::string::npos);
+
+    const auto cat_path = std::filesystem::path(DASH_MAIN_SRC).parent_path().parent_path()
+                          / "core" / "param_catalog.inc";
+    std::ifstream cin_(cat_path);
+    ASSERT_TRUE(cin_.good()) << "cannot open " << cat_path;
+    std::string line, entry;
+    while (std::getline(cin_, line))
+        if (line.find(R"(C2P_PARAM("sharechain.deferred_mint")") != std::string::npos) entry = line;
+    ASSERT_FALSE(entry.empty());
+    EXPECT_NE(entry.find("default off"), std::string::npos) << entry;
+
+    ScriptedMint s;
+    s.outcome = [](int) { return busy(); };
+    auto m = s.make(dash::mint::kDeferredMintDefault);
+    EXPECT_FALSE(m->on_solve(1, false).queued) << "by default a busy tracker declines, as before";
+    ASSERT_EQ(s.calls.size(), 1u);
+    EXPECT_TRUE(s.calls[0].second.think_after);
+    EXPECT_FALSE(s.calls[0].second.deferrable);
+    EXPECT_FALSE(m->snapshot().enabled);
 }
 
 // Shares a drain already minted keep their think even if the fresh attempt
@@ -431,7 +529,7 @@ TEST(DashDeferredMintClassify, StatsJsonShape)
     EXPECT_EQ(j.at("prev_was_tip").at("minted"), 1);
     EXPECT_EQ(j.at("prev_was_tip").at("pending"), 1);
     EXPECT_EQ(j.at("prev_was_behind").at("minted"), 0);
-    for (const char* k : {"busy_stops", "max_depth", "max_age_ms_at_mint"})
+    for (const char* k : {"busy_stops", "budget_stops", "off_thread", "max_depth", "max_age_ms_at_mint"})
         EXPECT_TRUE(j.contains(k)) << k;
 }
 

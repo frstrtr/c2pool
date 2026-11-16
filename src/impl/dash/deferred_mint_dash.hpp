@@ -35,6 +35,11 @@
 
 namespace dash::mint {
 
+/// The binary's default for the deferred-mint queue (main_dash g_deferred_mint,
+/// catalog sharechain.deferred_mint). OFF until a soak and a production canary
+/// have measured it: --deferred-mint turns it on. Flipping this is its own PR.
+inline constexpr bool kDeferredMintDefault = false;
+
 /// One queued solve: self-contained (no pointer into the tracker, the job
 /// registry or a stratum session).
 struct DeferredSolve {
@@ -162,6 +167,8 @@ inline nlohmann::json mint_defer_json(const core::DeferredMintSnapshot& snap,
     d["minted"]             = snap.counters.minted;
     d["busy_stops"]         = snap.counters.busy_stops;
     d["batch_thinks"]       = snap.thinks;
+    d["off_thread"]         = snap.off_thread;
+    d["budget_stops"]       = snap.counters.budget_stops;
     d["max_depth"]          = snap.counters.max_depth;
     d["max_age_ms_at_mint"] = snap.counters.max_age_ms_at_mint;
     nlohmann::json dropped = nlohmann::json::object();

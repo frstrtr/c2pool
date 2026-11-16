@@ -315,11 +315,12 @@ UtxoSnapshotCli g_utxo_snapshot;
 // File scope like g_utxo_snapshot: written once while parsing argv.
 bool g_mempool_entry_probe = false;
 
-// --no-deferred-mint: KILL SWITCH for the deferred-mint queue
-// (core/deferred_mint.hpp). Default ON: a solve the busy tracker declines is
-// queued and minted at the next point the lock is free instead of being lost.
-// --no-deferred-mint restores the old single try-and-decline exactly.
-bool g_deferred_mint = true;
+// --deferred-mint / --no-deferred-mint: the deferred-mint queue
+// (core/deferred_mint.hpp). ON, a solve the busy tracker declines is queued and
+// minted at the next point the lock is free instead of being lost. OFF (the
+// default until a soak and a canary have measured it) is the old single
+// try-and-decline, exactly.
+bool g_deferred_mint = dash::mint::kDeferredMintDefault;
 
 // --embedded-mn-bridge-no-cursor (#91): DISABLE the bridge's resumable replay
 // cursor, so every process start replays the whole window from the pinned
@@ -646,10 +647,10 @@ void print_banner(const char* argv0)
         << "              running node that is not using that set; the next start opens it)\n"
         << "             (full UTXO set: import a pinned dumptxoutset into <net>/utxo_full_leveldb\n"
         << "              at start, then connect strictly from its base; alias --utxo-snapshot)\n"
-        << "           [--no-deferred-mint]\n"
-        << "             (kill switch: decline a solve the busy tracker cannot take, as\n"
-        << "              before, instead of queueing it for the next free lock; default\n"
-        << "              is to queue)\n"
+        << "           [--deferred-mint | --no-deferred-mint]\n"
+        << "             (queue a solve the busy tracker cannot take and mint it at the next\n"
+        << "              free lock instead of declining it; default off: --no-deferred-mint\n"
+        << "              is the old single try-and-decline)\n"
         << "           [--mempool-entry-probe]\n"
         << "             (wire the direct-local GET /mempool_entry?txid= probe for the fee-parity\n"
         << "              shadow; default off)\n"
@@ -1687,7 +1688,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // A solve the busy tracker declines is queued and minted at the next point
     // the lock is free: both IO-phase epilogues (think slot still held, so the
     // batch gets one think) and the 2 s advert tick. The stratum thread never
-    // waits. --no-deferred-mint is the kill switch (the old decline, exactly).
+    // waits. Opt-in (--deferred-mint); off is the old decline, exactly.
     // Two extra display-only ledgers settle the shares minted FROM THE QUEUE,
     // split by whether the solve's prev was the tip when it arrived (only those
     // can land on the best chain; the others are siblings that lose the tie).
@@ -1721,6 +1722,9 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 LOG_INFO << "[MINT-DEFER] queued solve dropped (" << core::to_string(why)
                          << ") prev=" << s.in.prev_share_hash.GetHex().substr(0, 16);
         });
+    // Owner = this thread: run_node's own thread is the one that runs ioc.run()
+    // (the stratum seam, both IO epilogues and the advert tick all run there).
+    deferred_minter->bind_owner_thread();
     // io thread only: the prev of the newest solve we minted or queued (see
     // dash::mint::classify_prev_was_tip).
     auto last_claimed_prev = std::make_shared<uint256>();
@@ -1735,8 +1739,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                          << (st.stopped_busy ? " (tracker busy again)" : "");
         });
     std::cout << "[run] deferred mint "
-              << (g_deferred_mint ? "ON (busy-tracker solves are queued; --no-deferred-mint disables)"
-                                  : "OFF (--no-deferred-mint: busy-tracker solves are declined)")
+              << (g_deferred_mint ? "ON (--deferred-mint: busy-tracker solves are queued)"
+                                  : "OFF (busy-tracker solves are declined; --deferred-mint enables)")
               << "\n";
 
     // ── Hashing on another node (failback): ONE sharechain read ───────────
@@ -12994,6 +12998,8 @@ int main(int argc, char** argv)
             g_utxo_snapshot.import_file = argv[++i];  // S2: offline import, exits
         else if (std::strcmp(argv[i], "--mempool-entry-probe") == 0)
             g_mempool_entry_probe = true;
+        else if (std::strcmp(argv[i], "--deferred-mint") == 0)
+            g_deferred_mint = true;
         else if (std::strcmp(argv[i], "--no-deferred-mint") == 0)
             g_deferred_mint = false;
         else if (std::strcmp(argv[i], "--explorer") == 0)

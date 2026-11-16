@@ -25,7 +25,7 @@
 #include <core/uint256.hpp>
 
 #include <array>
-#include <cassert>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -82,6 +82,7 @@ struct DeferredMintCounters {
     uint64_t deferred{0};       ///< items pushed
     uint64_t minted{0};         ///< items minted from the queue
     uint64_t busy_stops{0};     ///< drains stopped because the tracker was busy
+    uint64_t budget_stops{0};   ///< drains stopped by the per-drain time budget
     std::array<uint64_t, static_cast<size_t>(MintDropReason::count_)> dropped{};
     uint64_t max_depth{0};
     int64_t  max_age_ms_at_mint{0};
@@ -97,6 +98,7 @@ struct DrainStats {
     size_t minted{0};
     size_t dropped{0};
     bool   stopped_busy{false};
+    bool   stopped_budget{false};   ///< the per-drain time budget ran out
 };
 
 template <class Item>
@@ -145,13 +147,18 @@ public:
 
     /// Mint up to `max_items` items in order. Busy puts the item back at the
     /// front and stops; Dropped / Minted continue. Never throws out of a
-    /// try_mint (counted as `threw`).
+    /// try_mint (counted as `threw`). `max_time` (0 = off) bounds the drain's
+    /// wall-clock time: checked after each attempt, it stops like the item cap
+    /// and leaves the rest for the next drain point (a coin whose mint is
+    /// expensive on the io thread). `now` is the TTL clock (injectable).
     template <class TryMint>
     DrainStats drain(TryMint&& try_mint, const OnDrop& on_drop = {}, size_t max_items = 16,
-                     clock::time_point now = clock::now())
+                     clock::time_point now = clock::now(),
+                     std::chrono::microseconds max_time = std::chrono::microseconds(0))
     {
         DrainStats st;
         size_t processed = 0;
+        const auto wall0 = clock::now();
         while (!m_q.empty() && processed < max_items) {
             Entry e = std::move(m_q.front());
             m_q.pop_front();
@@ -183,6 +190,11 @@ public:
             } else {
                 drop(e.item, out.why == MintDropReason::none ? MintDropReason::other : out.why, on_drop);
                 ++st.dropped;
+            }
+            if (max_time.count() > 0 && !m_q.empty() && clock::now() - wall0 >= max_time) {
+                ++m_counters.budget_stops;
+                st.stopped_budget = true;
+                break;
             }
         }
         return st;
@@ -244,13 +256,14 @@ struct DeferredMintSnapshot {
     bool                 enabled{false};
     size_t               depth{0};
     uint64_t             thinks{0};      ///< batch thinks the minter requested
+    uint64_t             off_thread{0};  ///< calls from a non-owner thread (old path taken)
     DeferredMintCounters counters;
 };
 
 /// The policy around a DeferredMintQueue for one coin's io thread.
 ///
-///   on_solve(item)  a fresh stratum solve. Disabled (the kill switch): the old
-///                   path, one synchronous attempt with its own think.
+///   on_solve(item)  a fresh stratum solve. Disabled: the old path, one
+///                   synchronous attempt with its own think.
 ///                   Enabled: drain what is queued first (order kept), then
 ///                   try the new solve; a busy tracker queues it; anything
 ///                   minted gets ONE think afterwards.
@@ -260,10 +273,18 @@ struct DeferredMintSnapshot {
 ///
 /// A block-winning solve keeps its synchronous bounded wait (mint_once sees
 /// from_queue=false); only if that expires is it queued, at the FRONT.
-/// on_dropped is told about every queued item that is finally lost (including
-/// queue_full and shutdown), so a coin can log a lost block-winning share loudly.
+/// on_dropped is told about every solve that is finally lost once it reached
+/// the minter (queue_full, ttl, gate, ..., shutdown, a late solve after
+/// shutdown), so a coin can log a lost block-winning share in one place.
 ///
-/// io-thread-confined except snapshot(), which any thread may call.
+/// OWNER THREAD. The queue is touched only by its owner: the thread that
+/// constructed the minter, or the one bind_owner_thread() names (call it once,
+/// before the owner starts running, if the minter is built elsewhere). A call
+/// from any other thread NEVER touches the queue, in every build: on_solve
+/// takes the old synchronous path (what the coin did before the queue) and
+/// drain_point is a no-op; both count `off_thread`. snapshot() is the only
+/// call meant for other threads. shutdown() runs on the owner, or after the
+/// owner has stopped running.
 template <class Item>
 class DeferredMinter
 {
@@ -282,22 +303,39 @@ public:
     DeferredMinter(bool enabled, MintOnce mint_once, Think think, OnDropped on_dropped = {},
                    size_t capacity = 64,
                    std::chrono::milliseconds ttl = std::chrono::milliseconds(20000),
-                   size_t max_per_drain = 16)
-        : m_enabled(enabled), m_mint_once(std::move(mint_once)), m_think(std::move(think)),
-          m_on_dropped(std::move(on_dropped)), m_queue(capacity, ttl), m_max_per_drain(max_per_drain)
+                   size_t max_per_drain = 16,
+                   std::chrono::microseconds max_drain_time = std::chrono::microseconds(0))
+        : m_enabled(enabled), m_owner(std::this_thread::get_id()),
+          m_mint_once(std::move(mint_once)), m_think(std::move(think)),
+          m_on_dropped(std::move(on_dropped)), m_queue(capacity, ttl),
+          m_max_per_drain(max_per_drain), m_max_drain_time(max_drain_time)
     {
         publish();
+    }
+
+    /// Name the owner thread (default: the calling thread). Call once, before
+    /// the owner starts running and before any other thread can call in.
+    void bind_owner_thread(std::thread::id id = std::this_thread::get_id())
+    {
+        m_owner.store(id);
     }
 
     bool enabled() const { return m_enabled; }
 
     SolveResult on_solve(Item item, bool won_block, clock::time_point now = clock::now())
     {
-        check_thread();
         SolveResult r;
-        if (m_stopped) {
+        if (!on_owner_thread()) {
+            // Never touch the queue off the owner thread: the old path.
+            r.outcome = m_mint_once(item, MintAttempt{true, false, false});
+            return r;
+        }
+        if (m_stopped.load()) {
             // The node is stopping: a share minted now could not be broadcast.
+            m_queue.count_drop(MintDropReason::shutdown);
+            notify_dropped(item, MintDropReason::shutdown);
             r.outcome = MintOutcome{MintResult::Dropped, MintDropReason::shutdown, uint256()};
+            publish();
             return r;
         }
         if (!m_enabled) {
@@ -320,7 +358,7 @@ public:
             if (!m_queue.empty()) {
                 minted += drain_queue(now).minted;
                 if (!m_queue.empty()) {
-                    // Still blocked (or the per-drain cap hit): keep arrival order.
+                    // Still blocked (or a per-drain cap hit): keep arrival order.
                     r.outcome = MintOutcome{MintResult::Busy, MintDropReason::none, uint256()};
                     r.behind_queue = true;
                     r.queued = push_back_or_drop(item, now);
@@ -344,8 +382,9 @@ public:
 
     DrainStats drain_point(clock::time_point now = clock::now())
     {
-        check_thread();
-        if (!m_enabled || m_stopped || m_queue.empty())
+        if (!on_owner_thread())
+            return {};
+        if (!m_enabled || m_stopped.load() || m_queue.empty())
             return {};
         const DrainStats st = drain_queue(now);
         finish(st.minted);
@@ -354,8 +393,7 @@ public:
 
     size_t shutdown()
     {
-        check_thread();
-        m_stopped = true;
+        m_stopped.store(true);
         const size_t n = m_queue.clear_for_shutdown(m_on_dropped);
         publish();
         return n;
@@ -364,19 +402,39 @@ public:
     size_t depth() const { return m_queue.size(); }
     const DeferredMintCounters& counters() const { return m_queue.counters(); }
     uint64_t thinks_requested() const { return m_thinks; }
+    uint64_t off_thread_calls() const { return m_off_thread.load(); }
 
     DeferredMintSnapshot snapshot() const
     {
-        std::lock_guard<std::mutex> lk(m_pub_mutex);
-        return m_published;
+        DeferredMintSnapshot s;
+        {
+            std::lock_guard<std::mutex> lk(m_pub_mutex);
+            s = m_published;
+        }
+        s.off_thread = m_off_thread.load();
+        return s;
     }
 
 private:
+    bool on_owner_thread()
+    {
+        if (m_owner.load() == std::this_thread::get_id())
+            return true;
+        m_off_thread.fetch_add(1);
+        return false;
+    }
+
     DrainStats drain_queue(clock::time_point now)
     {
         return m_queue.drain(
             [this](const Item& it) { return m_mint_once(it, MintAttempt{false, true, true}); },
-            m_on_dropped, m_max_per_drain, now);
+            m_on_dropped, m_max_per_drain, now, m_max_drain_time);
+    }
+
+    void notify_dropped(const Item& item, MintDropReason why)
+    {
+        if (!m_on_dropped) return;
+        try { m_on_dropped(item, why); } catch (...) {}
     }
 
     bool push_back_or_drop(Item& item, clock::time_point now)
@@ -384,21 +442,8 @@ private:
         if (m_queue.push_back(std::move(item), now))   // moved from only when accepted
             return true;
         // queue_full is already counted by the queue; tell the coin.
-        if (m_on_dropped) {
-            try { m_on_dropped(item, MintDropReason::queue_full); } catch (...) {}
-        }
+        notify_dropped(item, MintDropReason::queue_full);
         return false;
-    }
-
-    // io-thread confinement, checked (debug builds) rather than assumed: the
-    // first caller owns the minter; any other thread would race on the deque.
-    void check_thread()
-    {
-        const auto me = std::this_thread::get_id();
-        if (m_owner == std::thread::id())
-            m_owner = me;
-        assert(m_owner == me && "DeferredMinter is io-thread-confined");
-        (void)me;
     }
 
     void finish(size_t minted)
@@ -421,17 +466,19 @@ private:
         m_published = s;
     }
 
-    bool                     m_enabled;
-    bool                     m_stopped{false};
-    std::thread::id          m_owner;
-    MintOnce                 m_mint_once;
-    Think                    m_think;
-    OnDropped                m_on_dropped;
-    DeferredMintQueue<Item>  m_queue;
-    size_t                   m_max_per_drain;
-    uint64_t                 m_thinks{0};
-    mutable std::mutex       m_pub_mutex;
-    DeferredMintSnapshot     m_published;
+    const bool                    m_enabled;
+    std::atomic<bool>             m_stopped{false};
+    std::atomic<std::thread::id>  m_owner;
+    std::atomic<uint64_t>         m_off_thread{0};
+    MintOnce                      m_mint_once;
+    Think                         m_think;
+    OnDropped                     m_on_dropped;
+    DeferredMintQueue<Item>       m_queue;
+    size_t                        m_max_per_drain;
+    std::chrono::microseconds     m_max_drain_time;
+    uint64_t                      m_thinks{0};
+    mutable std::mutex            m_pub_mutex;
+    DeferredMintSnapshot          m_published;
 };
 
 } // namespace core
