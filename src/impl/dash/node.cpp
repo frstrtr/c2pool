@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #include "node.hpp"
+#include "diag_lock_hold.hpp"   // DIAG ONLY: tracker exclusive-lock hold timing
 #include "share.hpp"
 #include "mint_runloop.hpp"   // dash::mint::elect_best_share (election policy SSOT)
 #include "known_txs_retention.hpp"  // dash::retain_template_txs / all_txs_backable (F1/F3)
@@ -244,6 +245,7 @@ void NodeImpl::add_verified_shares(HandleSharesData& data, NetService addr)
             return;
         }
         // Lock held for the whole insertion below.
+        dash::diag::LockHoldScope diag_hold("add_verified");
 
         int32_t new_count = 0;
         int32_t dup_count = 0;
@@ -810,6 +812,7 @@ void NodeImpl::run_think()
 
         try {
             std::unique_lock lock(m_tracker_mutex);   // exclusive — IO defers
+            dash::diag::LockHoldScope diag_hold("think");
 
             // Bootstrap: no verified chain yet → verify everything in one
             // pass (p2pool think() runs synchronously during initial sync).
@@ -838,12 +841,14 @@ void NodeImpl::run_think()
                             << " granting bounded elevated verify budget + 2*CL+10 backfill";
             }
 
+            diag_hold.mark("pre_supersede");
             auto t0 = std::chrono::steady_clock::now();
             result = m_tracker.think(block_rel_height,
                                      /*previous_block=*/uint256(),
                                      /*bits=*/0, bootstrap, supersede);
             think_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - t0).count();
+            diag_hold.mark("think");
 
             m_last_top5_heads = std::move(result.top5_heads);
             if (!result.best.IsNull()) {
@@ -870,8 +875,10 @@ void NodeImpl::run_think()
 
             needs_continue = m_tracker.m_think_needs_continue
                           || m_tracker.m_think_walk_needs_continue;
+            diag_hold.mark("post_publish");
 
             flush_verified_to_leveldb();
+            diag_hold.mark("flush_leveldb");
         } catch (const std::exception& e) {
             LOG_ERROR << "run_think() failed on compute thread: " << e.what();
         } catch (...) {
@@ -1359,6 +1366,7 @@ void NodeImpl::clean_tracker()
       bool bootstrap = false;
       try {
         std::unique_lock lock(m_tracker_mutex);  // exclusive
+        dash::diag::LockHoldScope diag_hold("clean");
 
         // #854: the tip AS THE CLEAN CYCLE FOUND IT. clean_best_changed is
         // decided against this, not against the value Step 1 has already
@@ -1397,6 +1405,7 @@ void NodeImpl::clean_tracker()
         const auto now_sec = static_cast<int64_t>(std::time(nullptr));
         const auto CL = static_cast<int32_t>(SharechainConfig::chain_length());
 
+        diag_hold.mark("step1_think");
         // Step 2: eat stale heads (p2pool node.py:358-378). Three guards
         // protect useful heads: top-5 scored, seen <300s ago, unverified
         // heads whose tail has recent (<120s) child activity.
@@ -1460,6 +1469,7 @@ void NodeImpl::clean_tracker()
             }
         }
 
+        diag_hold.mark("step2_heads");
         // Step 3: drop tails — remove ALL children of tails whose every head
         // is at least 2*CHAIN_LENGTH+10 high (p2pool node.py:382-398; only
         // shares far beyond the PPLNS window are removed).
@@ -1527,6 +1537,7 @@ void NodeImpl::clean_tracker()
                          << " heads=" << m_tracker.chain.get_heads().size();
         }
 
+        diag_hold.mark("step3_tails");
         // Step 4: re-score after pruning (inline, still holding the lock).
         {
             // Restart-reorg: re-detect after pruning and pass the hint so the
@@ -1555,6 +1566,7 @@ void NodeImpl::clean_tracker()
             flush_verified_to_leveldb();
         }
 
+        diag_hold.mark("step4_think");
         // Step 5: flush pruned shares from LevelDB (p2pool main.py:269-270).
         if (!m_removal_flush_buf.empty() && m_storage && m_storage->is_available())
         {
@@ -1900,6 +1912,7 @@ NodeImpl::LocalAddResult NodeImpl::add_local_share_ex(ShareType share, bool bloc
             // only if the queued share is finally lost.
             return {uint256::ZERO, LocalAddStatus::busy};
         }
+        dash::diag::LockHoldScope diag_hold("add_local");
         if (m_chain->contains(hash)) {
             LOG_WARNING << "[MINT] duplicate local share " << hash.GetHex().substr(0, 16);
             return {uint256::ZERO, LocalAddStatus::duplicate};
