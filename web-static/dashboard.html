@@ -713,6 +713,20 @@
             white-space: nowrap;
             cursor: help;
         }
+        /* The p2pool.info (2012) luck line under the Recent Blocks badges. */
+        .classic-luck {
+            width: 100%;
+            font-family: monospace;
+            font-size: 12px;
+            line-height: 1.6;
+            color: var(--text-muted);
+        }
+        .classic-luck .luck-up { color: var(--success); font-weight: 600; cursor: help; }
+        .classic-luck .luck-down { color: var(--danger); font-weight: 600; cursor: help; }
+        .classic-luck .luck-none { cursor: help; }
+        .classic-luck .caption { font-size: 10px; font-style: italic; opacity: 0.75; }
+        .classic-luck .glyphs span { cursor: help; }
+        .classic-luck label { margin-left: 12px; cursor: pointer; user-select: none; white-space: nowrap; }
         .luck-ci { margin-left: 4px; font-size: 0.7em; font-weight: 400; color: var(--text-muted); }
         
         /* Collapsible Miner Rows */
@@ -1738,6 +1752,8 @@
             border-radius: 6px;
             cursor: pointer;
             font-size: 1rem;
+            flex: none;
+            white-space: nowrap;
         }
         
         .graph-fullscreen-overlay .fullscreen-close:hover {
@@ -1753,8 +1769,11 @@
         
         .graph-fullscreen-overlay .fullscreen-controls {
             display: flex;
+            flex-wrap: wrap;
+            align-items: center;
             gap: 10px;
             margin-bottom: 15px;
+            min-width: 0;
         }
         
         .graph-fullscreen-overlay .fullscreen-stats {
@@ -2029,6 +2048,7 @@
                         <div class="legend-item" data-series="miners" onclick="toggleSeries('miners', this)" title="Click to toggle unique miner addresses"><span class="legend-color" style="background: #673ab7;"></span><span>Miners</span></div>
                         <div class="legend-item" data-series="connected" onclick="toggleSeries('connected', this)" title="Click to toggle connected miners (all connections)"><span class="legend-color" style="background: #e91e63;"></span><span>Connected</span></div>
                         <div class="legend-item" data-series="lucktrend" onclick="toggleSeries('lucktrend', this)" title="Click to toggle the luck line: the pooled luck of the last 10 rounds (blocks found / blocks expected), the open round included"><span class="legend-color" style="background: #ffc107;"></span><span>Luck</span></div>
+                        <div class="legend-item disabled" data-toggle="classiclines" onclick="toggleClassicLines()" title="Classic block lines: a faint vertical line at each pool block, as p2pool.info drew them in 2012. Off by default."><span class="legend-color" style="background: rgba(255, 255, 255, 0.5);"></span><span>Classic lines</span></div>
                         <div class="legend-item disabled" data-series="netdiff" onclick="toggleSeries('netdiff', this)" title="Click to toggle network difficulty"><span class="legend-color" style="background: #8b5cf6;"></span><span>Net Diff</span></div>
                         <div class="legend-item" data-series="local" onclick="toggleSeries('local', this)" title="Click to toggle THIS node's own hashrate (as distinct from the pool total)"><span class="legend-color" style="background: #00d4ff;"></span><span>Local</span></div>
                         <div class="legend-item disabled" data-series="localdoa" onclick="toggleSeries('localdoa', this)" title="Click to toggle this node's dead-on-arrival hashrate"><span class="legend-color" style="background: #ff8800;"></span><span>Local DOA</span></div>
@@ -2065,6 +2085,7 @@
                     <div class="legend-item disabled" data-series="workers" onclick="toggleSeries('workers', this)" title="Click to toggle worker connections" style="font-size: 14px; padding: 6px 12px;"><span class="legend-color" style="background: #9c27b0; width: 14px; height: 14px;"></span><span>Workers</span></div>
                     <div class="legend-item" data-series="miners" onclick="toggleSeries('miners', this)" title="Click to toggle unique miner addresses" style="font-size: 14px; padding: 6px 12px;"><span class="legend-color" style="background: #673ab7; width: 14px; height: 14px;"></span><span>Miners</span></div>
                     <div class="legend-item" data-series="lucktrend" onclick="toggleSeries('lucktrend', this)" title="Click to toggle the luck line: the pooled luck of the last 10 rounds (blocks found / blocks expected), the open round included" style="font-size: 14px; padding: 6px 12px;"><span class="legend-color" style="background: #ffc107; width: 14px; height: 14px;"></span><span>Luck</span></div>
+                    <div class="legend-item disabled" data-toggle="classiclines" onclick="toggleClassicLines()" title="Classic block lines: a faint vertical line at each pool block, as p2pool.info drew them in 2012. Off by default." style="font-size: 14px; padding: 6px 12px;"><span class="legend-color" style="background: rgba(255, 255, 255, 0.5); width: 14px; height: 14px;"></span><span>Classic lines</span></div>
                     <div class="legend-item disabled" data-series="netdiff" onclick="toggleSeries('netdiff', this)" title="Click to toggle network difficulty" style="font-size: 14px; padding: 6px 12px;"><span class="legend-color" style="background: #8b5cf6; width: 14px; height: 14px;"></span><span>Net Diff</span></div>
                     <div class="legend-item" data-series="local" onclick="toggleSeries('local', this)" title="Click to toggle THIS node's own hashrate (as distinct from the pool total)" style="font-size: 14px; padding: 6px 12px;"><span class="legend-color" style="background: #00d4ff; width: 14px; height: 14px;"></span><span>Local</span></div>
                     <div class="legend-item disabled" data-series="localdoa" onclick="toggleSeries('localdoa', this)" title="Click to toggle this node's dead-on-arrival hashrate" style="font-size: 14px; padding: 6px 12px;"><span class="legend-color" style="background: #ff8800; width: 14px; height: 14px;"></span><span>Local DOA</span></div>
@@ -2135,6 +2156,16 @@
                         <span class="badge" id="luck_seven_days" style="background: var(--primary); cursor: help;" title="Pool luck, 7 days">7d: —</span>
                         <span class="badge" id="luck_thirty_days" style="background: var(--primary); cursor: help;" title="Pool luck, 30 days">30d: —</span>
                         <span class="badge" id="luck_ninety_days" style="background: var(--primary); cursor: help;" title="Pool luck, 90 days">90d: —</span>
+                    </div>
+                    <div class="classic-luck" id="classic_luck_strip">
+                        <div><span title="How many blocks were produced relative to how many were expected in each window (p2pool.info, 2012). Numbers larger than 100% mean the pool was lucky.">Pool Luck (7 days, 30 days, 90 days):</span>
+                            <span id="classic_luck_7d" class="luck-none">—</span>
+                            <span id="classic_luck_30d" class="luck-none">—</span>
+                            <span id="classic_luck_90d" class="luck-none">—</span>
+                            <span class="caption">à la p2pool.info, 2012</span></div>
+                        <div><span title="One glyph per round, oldest first: ⚡ found in under ⅓ of the expected time, 🐢 took over 2×, · neither. A fair pool shows ⚡ on 28 % of rounds and 🐢 on 13.5 %, in no pattern.">last 40 rounds:</span>
+                            <span class="glyphs" id="classic_luck_glyphs">—</span>
+                            <label title="Play a short cha-ching when the pool finds a block, as p2pool.info offered. Off by default; remembered in this browser."><input type="checkbox" id="chaching_toggle" onchange="toggleChaChing(this.checked)"> cha-ching</label></div>
                     </div>
                 </div>
                 <div class="table-scroll">
@@ -4659,6 +4690,8 @@
                 var pace = c2pBlockPace(window.c2pRecentBlocks, (window.currency_info && window.currency_info.symbol) || '');
                 window.c2pPace = pace;
                 var paceOf = function(b) { return pace.byHash[c2pRowHash(b)] || null; };
+                // A failed load is not a ledger: it must not reset what was seen.
+                if (blocks) c2pChaChingOnBlocks(pace);
                 c2pRenderLuckSummary();
                 d3.select('#blocks_loading').style('display', 'none');
                 // Clear existing rows before adding new data
@@ -9080,6 +9113,26 @@
             }
             return s;
         }
+
+        // The p2pool.info nods: the glyph strip of its luck line, and what
+        // counts as a new block for the cha-ching.
+        var C2P_STRIP_ROUNDS = 40;
+        // The last `count` rounds as one glyph each, oldest first: ⚡ fast,
+        // 🐢 slow, · neither.
+        function c2pGlyphStrip(rounds, count) {
+            return (rounds || []).slice(-(count || C2P_STRIP_ROUNDS)).map(function(r) {
+                var tier = r.first ? '' : c2pPaceTier(r.effort);
+                return { glyph: c2pIsFast(tier) ? '⚡' : c2pIsSlow(tier) ? '🐢' : '·', tier: tier,
+                         height: r.height, hash: r.hash, effort: r.effort, first: !!r.first };
+            });
+        }
+        // Whether a /recent_blocks load shows a pool block newer than the
+        // last one seen. prev, cur: {hash, ts} of the newest main-chain row
+        // (both null with no block); prev is null on the first load.
+        function c2pIsNewBlock(prev, cur) {
+            if (!prev || !cur || !cur.hash || cur.hash === prev.hash) return false;
+            return prev.ts === null || cur.ts > prev.ts;
+        }
         // END c2pLuck
 
         // The Recent Blocks luck badges, from the last /luck_stats
@@ -9109,7 +9162,116 @@
                     .style('background', per ? C2P_TONE_BG[view.tone] : 'var(--primary)')
                     .attr('title', c2pPeriodTip(d[2], per));
             });
+            c2pRenderClassicLuck(periods, pace);
         }
+
+        // The p2pool.info (2012) line under the badges: "Pool Luck (7 days,
+        // 30 days, 90 days)", green at 100 % and over and red under it as
+        // there, and the last rounds as one glyph each.
+        function c2pRenderClassicLuck(periods, pace) {
+            [['#classic_luck_7d', '7d', '7 days'], ['#classic_luck_30d', '30d', '30 days'],
+             ['#classic_luck_90d', '90d', '90 days']].forEach(function(d) {
+                var per = periods[d[1]], view = c2pPeriodView(per), found = per && per.k > 0;
+                d3.select(d[0])
+                    .text(found ? view.value : '—')
+                    .attr('class', found ? (view.tone === 'up' ? 'luck-up' : 'luck-down') : 'luck-none')
+                    .attr('title', c2pPeriodTip(d[2], per));
+            });
+            var glyphs = d3.select('#classic_luck_glyphs');
+            glyphs.selectAll('span').remove();
+            var strip = c2pGlyphStrip(pace.rounds, C2P_STRIP_ROUNDS);
+            glyphs.text(strip.length ? '' : '—');
+            strip.forEach(function(g) {
+                glyphs.append('span')
+                    .attr('class', c2pIsFast(g.tier) ? 'pace-fast' : (c2pIsSlow(g.tier) ? 'pace-slow' : null))
+                    .attr('title', '#' + g.height + ': effort ' + c2pFmtNum(g.effort * 100) + ' %' +
+                        (g.first ? ' (first block, counted as 100 %)' : '') +
+                        (g.tier ? '\n' + c2pPaceTip(g) : ''))
+                    .text(g.glyph);
+            });
+        }
+
+        // The two retro toggles, both off by default and remembered in this
+        // browser: a cha-ching when the pool finds a block (p2pool.info
+        // played newblock.mp3), and p2pool.info's vertical block lines on
+        // the hashrate charts.
+        function c2pPrefGet(key) {
+            try { return localStorage.getItem(key) === '1'; } catch (e) { return false; }
+        }
+        function c2pPrefSet(key, on) {
+            try { if (on) localStorage.setItem(key, '1'); else localStorage.removeItem(key); } catch (e) {}
+        }
+        var c2pChaChing = { on: c2pPrefGet('c2p_cha_ching'), ctx: null, last: null };
+        var c2pClassicLines = c2pPrefGet('c2p_classic_block_lines');
+        // Two short bell notes, synthesised: no audio file to ship.
+        function c2pPlayChaChing() {
+            try {
+                var AC = window.AudioContext || window.webkitAudioContext;
+                if (!AC) return;
+                var ctx = c2pChaChing.ctx || (c2pChaChing.ctx = new AC());
+                if (ctx.state === 'suspended' && ctx.resume) ctx.resume();
+                var t0 = ctx.currentTime;
+                [[1318.5, 0, 0.12], [2093, 0.11, 0.5]].forEach(function(n) {
+                    var osc = ctx.createOscillator(), gain = ctx.createGain();
+                    osc.type = 'triangle';
+                    osc.frequency.value = n[0];
+                    gain.gain.setValueAtTime(0.0001, t0 + n[1]);
+                    gain.gain.exponentialRampToValueAtTime(0.2, t0 + n[1] + 0.01);
+                    gain.gain.exponentialRampToValueAtTime(0.0001, t0 + n[1] + n[2]);
+                    osc.connect(gain);
+                    gain.connect(ctx.destination);
+                    osc.start(t0 + n[1]);
+                    osc.stop(t0 + n[1] + n[2] + 0.02);
+                });
+            } catch (e) {}
+        }
+        function toggleChaChing(on) {
+            c2pChaChing.on = !!on;
+            c2pPrefSet('c2p_cha_ching', c2pChaChing.on);
+            // The click lets the browser start audio; it also previews the sound.
+            if (c2pChaChing.on) c2pPlayChaChing();
+        }
+        // With the pace of each /recent_blocks load: one cha-ching when the
+        // newest main-chain block is newer than the last one seen. Never on
+        // the first load.
+        function c2pChaChingOnBlocks(pace) {
+            var last = pace && pace.lastMain;
+            var cur = { hash: last ? c2pRowHash(last) : null, ts: last ? last.ts : null };
+            if (c2pChaChing.on && c2pIsNewBlock(c2pChaChing.last, cur)) c2pPlayChaChing();
+            c2pChaChing.last = cur;
+        }
+        // p2pool.info drew each block as a faint vertical line. Lines are
+        // plot lines of the charts' x axis, at the main-chain blocks drawn.
+        function c2pClassicPlotLines(times) {
+            return (times || []).map(function(t) {
+                return { id: 'c2p-classic-line', value: t, color: 'rgba(255, 255, 255, 0.08)', width: 1, zIndex: 1 };
+            });
+        }
+        // Times of the main-chain blocks drawn, for the classic block lines.
+        function c2pMainBlockTimes(blockMarkers) {
+            return blockMarkers.filter(function(m) { return !c2pRowOffChain(m.block); })
+                               .map(function(m) { return m.x; });
+        }
+        function c2pSyncRetroToggles() {
+            document.querySelectorAll('.legend-item[data-toggle="classiclines"]').forEach(function(el) {
+                if (c2pClassicLines) el.classList.remove('disabled'); else el.classList.add('disabled');
+            });
+            var box = document.getElementById('chaching_toggle');
+            if (box) box.checked = c2pChaChing.on;
+        }
+        function toggleClassicLines() {
+            c2pClassicLines = !c2pClassicLines;
+            c2pPrefSet('c2p_classic_block_lines', c2pClassicLines);
+            c2pSyncRetroToggles();
+            [hashrateChart, fullscreenChart].forEach(function(chart) {
+                if (!chart || !chart.xAxis || !chart.xAxis[0]) return;
+                chart.xAxis[0].removePlotLine('c2p-classic-line');
+                if (c2pClassicLines) {
+                    c2pClassicPlotLines(chart.c2pBlockTimes).forEach(function(line) { chart.xAxis[0].addPlotLine(line); });
+                }
+            });
+        }
+        c2pSyncRetroToggles();
 
         // Luck inputs of a hashrate chart, shared by the compact and the
         // fullscreen build: the pace of the ledger rows, the open round, the
@@ -9643,7 +9805,8 @@
                     },
                     gridLineColor: '#2a2a4a',
                     gridLineWidth: 1,
-                    plotBands: chartLuck.plotBands
+                    plotBands: chartLuck.plotBands,
+                    plotLines: c2pClassicLines ? c2pClassicPlotLines(c2pMainBlockTimes(blockMarkers)) : []
                 },
                 yAxis: [{
                     // Primary Y-axis for hashrate (linear with intelligent max)
@@ -9936,6 +10099,8 @@
                 }]
             });
             
+            hashrateChart.c2pBlockTimes = c2pMainBlockTimes(blockMarkers);
+
             // Also update fullscreen if open
             if (isFullscreen) {
                 renderFullscreenGraph(data, minerData, uniqueMinersData, connectedData, blocks, networkDiffSamples, localSamples, localDeadSamples);
@@ -10165,7 +10330,8 @@
                     labels: { style: { color: '#e0e0e0', fontSize: '11px' } },
                     gridLineColor: '#2a2a4a',
                     gridLineWidth: 1,
-                    plotBands: chartLuck.plotBands
+                    plotBands: chartLuck.plotBands,
+                    plotLines: c2pClassicLines ? c2pClassicPlotLines(c2pMainBlockTimes(blockMarkers)) : []
                 },
                 yAxis: [{
                     title: { text: null },
@@ -10469,6 +10635,7 @@
                     zIndex: 4
                 }]
             });
+            fullscreenChart.c2pBlockTimes = c2pMainBlockTimes(blockMarkers);
         }
         
         // Resize handler
