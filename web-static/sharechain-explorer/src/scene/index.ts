@@ -46,3 +46,7 @@ export type {
 export { hash160OfAddress } from './views/address-hash.js';
 export { loadPplnsSnapshot, mergedSymbolOf, coalesce } from './views/pplns-feed.js';
 export type { PayoutSource, LoadedSnapshot } from './views/pplns-feed.js';
+export { createGridLayout } from './layouts/grid.js';
+export type { GridOptions, GridLayoutPlugin } from './layouts/grid.js';
+export { mountSharechainGrid, parseCssColor, hourAxisLabels, keyOfShare, BLOCK_MARK } from './views/sharechain-grid.js';
+export type { SharechainGrid, SharechainGridOptions, GridShare, BlockKind } from './views/sharechain-grid.js';

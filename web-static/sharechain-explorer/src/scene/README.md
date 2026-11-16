@@ -73,7 +73,7 @@ interface Layout<D> {
 | Layout | id | Status |
 |---|---|---|
 | `createTreemapLayout()` | `treemap` | Squarified (`src/pplns/squarify.ts`, minStrip 0), so each **cell** (the rect before the `gap` inset) has area ∝ weight. That is the weights gate. The drawn tile is the cell inset by `gap/2` per side, so a 4×4 cell draws 3×3. Small tiles therefore *look* smaller than their weight; hovers state the true %. Also "N others" aggregation (`othersFraction`, `minTileArea`), `expandOthers`, and an optional `scale: 'log'` (non-proportional, must be labelled). |
-| grid | `grid` | P2 ("Fluid", replaces the inline defrag renderer). |
+| `createGridLayout()` | `grid` | One square cell per item, row-major in item order. Cells are auto-fitted with `computeGridLayout`, the Classic share-chain grid's maths, so positions match Classic cell for cell. A left margin is kept for the axis. Weight is ignored. `metrics(count, viewport)` returns the geometry. |
 | roundabout | `roundabout` | P2 prototype, on the agreed v37 data model only. |
 
 ## Renderer contract
@@ -144,6 +144,7 @@ Each frame the engine passes the view's `labels(placedTiles)` for the tiles as p
 
 | View | Mount | Notes |
 |---|---|---|
+| Share-chain grid, "Fluid (experimental)" (`views/sharechain-grid.ts`) | `mountSharechainGrid({ container, colorOf, blockKindOf?, bus?, onHover?, onClick? })`, then `grid.update(shares)` (newest first) | Shares are keyed by full hash, so a new tip slides every cell one slot and evicted shares fade at the tail. Colours and block kinds come from the host (dashboard.html passes Classic's `getColor`). A miner pinned or hovered in another view keeps full colour and the rest dim. Hover and click go back to the host (Classic tooltip and zoom). |
 | PPLNS treemap (`views/pplns-treemap.ts` + pure `views/pplns-model.ts`) | `mountPplnsTreemap({ container, symbol, mergedSymbol?, bus?, special?, facts?, addressUrl? })`, then `view.update({ payouts, merged }, special?)` | See below. |
 
 **PPLNS treemap.**
