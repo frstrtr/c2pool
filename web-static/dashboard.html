@@ -2004,7 +2004,7 @@
                         <div class="graph-stat" title="Worker connections / Unique payout addresses"><div class="graph-stat-label">Workers/Miners</div><div class="graph-stat-value" id="graph-miners">-</div></div>
                         <div class="graph-stat"><div class="graph-stat-label">Avg Luck</div><div class="graph-stat-value" id="graph-luck">-</div></div>
                     </div>
-                    <div class="graph-diagnostic" id="hashrate-diagnostic" style="margin: 6px 0 2px; font-size: 12px; color: var(--text-muted);" title="Effective hashrate the pool's found blocks imply (Bayesian 95% credible interval on block rate), versus the hashrate the miners report. If reported sits outside the interval, the rigs are not delivering what they claim.">-</div>
+                    <div class="graph-diagnostic" id="hashrate-diagnostic" style="margin: 6px 0 2px; font-size: 12px; color: var(--text-muted);" title="Effective hashrate the pool's found blocks imply (exact Poisson 95% confidence interval on the block rate), versus the hashrate the miners report. If reported sits outside the interval, the rigs are not delivering what they claim.">-</div>
                 </div>
             </div>
         </div>
@@ -8379,43 +8379,37 @@
 
         // ── CI95 "Effective vs reported" hashrate diagnostic ──────────────────
         // Ported from our p2pool-dash fork's updateHashrateDiagnostic, WITH its
-        // verdict logic corrected.
+        // verdict logic corrected and its interval made exact.
         //
         // MODEL. Block finding is a Poisson process with rate lambda
-        // (blocks/sec). Gamma is conjugate to Poisson, so with a prior
-        // Gamma(a0, b0) centred on the REPORTED hashrate and k blocks found over
-        // windowSec seconds, the posterior is Gamma(a0+k, b0+windowSec) in
-        // closed form. The 95% band is the normal approximation mean +/- 1.96 sd
-        // clipped at 0, converted back to H/s via netDiff * 2^32.
+        // (blocks/sec). With k blocks found over windowSec seconds, the exact
+        // (Garwood) 95% confidence interval of lambda * windowSec is
+        // [chi2(.025; 2k) / 2, chi2(.975; 2k + 2) / 2], i.e. Gamma quantiles
+        // (c2pEffectiveHashrateCI), converted to H/s via netDiff * 2^32.
+        // No prior: the fork's Gamma(5, .) prior centred on the REPORTED
+        // hashrate pulled the band toward the very figure it was testing, and
+        // its normal approximation was off at the small k this runs at.
         //
         // The reported hashrate is what the miners CLAIM; the band is what the
         // blocks they actually found IMPLY. It answers "are the rigs delivering
         // the hashrate they claim?" -- a misconfiguration / fraud detector. A
-        // 95% band on LUCK would be [~27%, ~3950%] and useless; a band on
-        // effective hashrate over shares/blocks is tight enough to act on.
+        // 95% band on the LUCK of one block would be [~27%, ~3950%] and
+        // useless; a band on effective hashrate over the window's blocks is
+        // tight enough to act on.
         //
         // Every input is already fetched by the dashboard (bucket-a).
         function updateHashrateDiagnostic(containerId, avgHashrate, blocksInWindow, windowSec, netDiff, labelPrefix) {
             var el = document.getElementById(containerId);
             if (!el) return;
-            if (!netDiff || netDiff <= 0 || !windowSec || windowSec <= 0) {
+            var k = blocksInWindow;
+            var band = c2pEffectiveHashrateCI(k, windowSec, netDiff);
+            if (!band) {
                 el.textContent = labelPrefix + 'Not enough data yet';
                 el.style.color = 'var(--text-muted)';
                 return;
             }
-            var blockHashes = netDiff * 4294967296; // 2^32 expected hashes/block
             var reported = avgHashrate || 0;
-            var k = blocksInWindow;
-            var expectedLambdaPrior = (reported > 0) ? (reported / blockHashes) : 0.0000001;
-            var alpha0 = 5;                                  // prior strength ~5 blocks
-            var beta0  = (expectedLambdaPrior > 0) ? (alpha0 / expectedLambdaPrior) : 1e9;
-            var alpha  = alpha0 + k;
-            var beta   = beta0 + windowSec;
-            var meanLambda = alpha / beta;
-            var stdLambda  = Math.sqrt(alpha / (beta * beta));
-            var z = 1.96;
-            var effLow  = Math.max(0, meanLambda - z * stdLambda) * blockHashes;
-            var effHigh = (meanLambda + z * stdLambda) * blockHashes;
+            var effLow = band.low, effHigh = band.high;
 
             var statusText = labelPrefix + 'CI95 ' + format_hashrate(effLow) + ' \u2013 ' +
                              format_hashrate(effHigh) + ' vs reported ' + format_hashrate(reported);
@@ -8447,6 +8441,73 @@
             el.textContent = statusText + ' \u2022 ' + verdict;
             el.style.color = color;
         }
+
+        // BEGIN c2pLuck (tested by sharechain-explorer/tests/unit/dashboard-luck-*.test.ts)
+        // The exact Poisson interval behind the CI95 diagnostic above.
+        // ln Gamma(x), x > 0: shifted up to x >= 10, then Stirling's series.
+        function c2pLogGamma(x) {
+            var shift = 0;
+            while (x < 10) { shift += Math.log(x); x += 1; }
+            var x2 = x * x;
+            return (x - 0.5) * Math.log(x) - x + 0.9189385332046727 - shift
+                 + 1 / (12 * x) - 1 / (360 * x * x2) + 1 / (1260 * x * x2 * x2) - 1 / (1680 * x * x2 * x2 * x2);
+        }
+        // The regularised lower incomplete gamma function P(a, x): the series
+        // below a + 1, the continued fraction of Q above.
+        function c2pGammaP(a, x) {
+            if (!(x > 0)) return 0;
+            var front = Math.exp(a * Math.log(x) - x - c2pLogGamma(a)), i;
+            if (x < a + 1) {
+                var ap = a, del = 1 / a, sum = del;
+                for (i = 0; i < 100000; i++) {
+                    ap += 1;
+                    del *= x / ap;
+                    sum += del;
+                    if (del < sum * 1e-16) break;
+                }
+                return Math.min(1, sum * front);
+            }
+            var b = x + 1 - a, c = 1e300, d = 1 / b, h = d;
+            for (i = 1; i < 100000; i++) {
+                var an = -i * (i - a);
+                b += 2;
+                d = an * d + b;
+                if (Math.abs(d) < 1e-300) d = 1e-300;
+                c = b + an / c;
+                if (Math.abs(c) < 1e-300) c = 1e-300;
+                d = 1 / d;
+                var step = d * c;
+                h *= step;
+                if (Math.abs(step - 1) < 1e-16) break;
+            }
+            return Math.max(0, 1 - front * h);
+        }
+        // x with P(shape, x) = p: the p-quantile of Gamma(shape, 1), which is
+        // half the chi-squared quantile with 2 * shape degrees of freedom.
+        function c2pGammaQuantile(p, shape) {
+            if (!(shape > 0) || !(p > 0)) return 0;
+            if (p >= 1) return Infinity;
+            var lo = 0, hi = shape + 10 * Math.sqrt(shape) + 40;
+            for (var i = 0; i < 200 && hi - lo > 1e-13 * hi; i++) {
+                var mid = (lo + hi) / 2;
+                if (c2pGammaP(shape, mid) < p) lo = mid; else hi = mid;
+            }
+            return (lo + hi) / 2;
+        }
+        // Exact (Garwood) 95 % interval for a Poisson mean, k events seen:
+        // [chi2(.025; 2k) / 2, chi2(.975; 2k + 2) / 2].
+        function c2pPoissonCI(k) {
+            return { low: k > 0 ? c2pGammaQuantile(0.025, k) : 0, high: c2pGammaQuantile(0.975, k + 1) };
+        }
+        // The 95 % interval of the hashrate that k blocks found in windowSec
+        // seconds imply, at netDiff: the exact Poisson interval on the block
+        // rate, times the hashes per block. No prior.
+        function c2pEffectiveHashrateCI(k, windowSec, netDiff) {
+            if (!(windowSec > 0) || !(netDiff > 0) || !(k >= 0)) return null;
+            var ci = c2pPoissonCI(k), perBlock = netDiff * 4294967296;
+            return { low: ci.low / windowSec * perBlock, high: ci.high / windowSec * perBlock };
+        }
+        // END c2pLuck
 
         // BEGIN c2pLuckTrend (tested by sharechain-explorer/tests/unit/dashboard-luck-trend.test.ts)
         // The hashrate charts' Luck series, in raw luck % (the caller applies
