@@ -44,3 +44,5 @@ export type {
   SpecialAddresses, MinerDatum, MinerFacts, TooltipLine,
 } from './views/pplns-model.js';
 export { hash160OfAddress } from './views/address-hash.js';
+export { loadPplnsSnapshot, mergedSymbolOf, coalesce } from './views/pplns-feed.js';
+export type { PayoutSource, LoadedSnapshot } from './views/pplns-feed.js';
