@@ -231,7 +231,8 @@ struct PeeringConfig {
     uint16_t    listen_port = 0;           // 0 => sharechain SSOT default (8999/18999; 8998 under --net dash-v36)
     bool        listen_set  = false;
     std::vector<NetService> addnodes;      // --addnode HOST:PORT (persistent outbound)
-    std::vector<NetService> connects;      // --connect HOST:PORT (connect-only; no listen/discovery)
+    std::vector<NetService> connects;      // --connect HOST:PORT: outbound dials ONLY the configured peers
+                                           // (no addr-gossip dialing); no inbound listener unless --listen
 };
 
 // Parse "HOST:PORT" (PORT mandatory; IPv4/hostname single-colon form).
@@ -590,7 +591,8 @@ void report_peering(const PeeringConfig& peer, bool testnet)
     const uint16_t bind = peer.listen_port ? peer.listen_port : ssot;
     if (!peer.connects.empty() && !peer.listen_set) {
         std::cout << "[run] sharechain peering: --connect mode ("
-                  << peer.connects.size() << " peer[s]); listen + discovery suppressed\n";
+                  << peer.connects.size() << " peer[s]); outbound dials ONLY the configured"
+                     " peers (no addr-gossip dialing); inbound listener suppressed\n";
     } else {
         std::cout << "[run] sharechain peering: listen " << peer.listen_host << ":" << bind
                   << (peer.listen_set ? " (--listen)\n" : " (sharechain SSOT default)\n");
@@ -1657,6 +1659,13 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // think()'s desired-set dispatch rides run_think). This is what lets an
     // EMPTY node JOIN an established p2pool-dash chain instead of only
     // serving inbound peers.
+    // --connect: outbound dials go only to the explicitly configured peers
+    // (--connect plus any --addnode), never to addresses learned from gossip.
+    if (!peer.connects.empty()) {
+        std::vector<NetService> configured(peer.connects);
+        configured.insert(configured.end(), peer.addnodes.begin(), peer.addnodes.end());
+        p2p_node.set_connect_only(configured);
+    }
     p2p_node.start_outbound_connections();
     if (!config.pool()->m_bootstrap_addrs.empty())
         std::cout << "[run] outbound dialing started ("
