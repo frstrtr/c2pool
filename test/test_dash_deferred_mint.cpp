@@ -594,6 +594,11 @@ TEST(DashDeferredMint, SlotFreeDrainMintsTheWholeBatchBeforeAnyThink)
         EXPECT_EQ(w.m->depth(), 2u);
         hold.release();
     }
+    // The child's on_solve already retried the queued parent once (busy) before
+    // queueing itself behind it: count only this drain's attempts.
+    ASSERT_EQ(w.queue_attempts->size(), 1u);
+    EXPECT_EQ(w.queue_attempts->front(), k.t.g) << "the queue head is retried before a new solve";
+    w.queue_attempts->clear();
     k.a.node->run_deferred_mint_drain();   // what the advert tick calls
     EXPECT_EQ(w.m->counters().minted, 2u) << "both minted in one drain";
     EXPECT_EQ(w.m->depth(), 0u);
