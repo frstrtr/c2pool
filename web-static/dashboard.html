@@ -8461,33 +8461,47 @@
         // luck-if-found-now = expected / elapsed * 100, capped at 1000: a
         // hyperbola, so it is sampled, not drawn as a chord. It starts at the
         // last block when that block is in the series (at minTime only when
-        // the block is older). A last block with no computed luck gets no luck
-        // value: the line breaks there and the curve starts at its time, from
-        // the cap (elapsed -> 0). Curve samples have no marker.
+        // the block is older). The node's first known block (luck_method
+        // "first_block": no earlier block to time its round from) counts as
+        // 100 % here, a point like any other. A last block with no computed
+        // luck otherwise gets no luck value: the line breaks there and the
+        // curve starts at its time, from the cap (elapsed -> 0). Curve samples
+        // have no marker.
         var C2P_LUCK_CAP = 1000;
         var C2P_LUCK_SAMPLES = 32;
         function c2pLuckTrendPoints(observed, sortedBlocks, minTime, live) {
-            var pts = observed.slice().sort(function(a, b) { return a[0] - b[0]; });
-            // Blocks after the last observed one (found after the last graph
-            // sample) are still inside this series: their luck is a point too.
-            var lastObs = pts.length > 0 ? pts[pts.length - 1][0] : -Infinity;
+            var trendLuck = function(b) {
+                return b.luck > 0 ? b.luck : (b.luck_method === 'first_block' ? 100 : 0);
+            };
+            var pts = observed.slice();
+            var lastObs = -Infinity, firstBlockMs = null;
+            pts.forEach(function(p) { lastObs = Math.max(lastObs, p[0]); });
+            // The first block (never in observed: its luck is null), and the
+            // blocks after the last observed one (found after the last graph
+            // sample, still inside this series): their luck is a point too.
             sortedBlocks.forEach(function(b) {
                 var t = b.ts * 1000;
-                if (t >= minTime && t > lastObs && b.luck > 0) pts.push([t, b.luck]);
+                var luck = trendLuck(b);
+                if (t >= minTime && luck > 0 && (t > lastObs || !(b.luck > 0))) {
+                    pts.push([t, luck]);
+                    if (!(b.luck > 0)) firstBlockMs = t;
+                }
             });
+            pts.sort(function(a, b) { return a[0] - b[0]; });
             // Start at minTime: the luck of the last block before the window,
-            // else the first in-window point's.
-            if (pts.length > 0 && pts[0][0] > minTime && sortedBlocks.length > 0) {
+            // else the first in-window point's. Nothing came before the node's
+            // first block: when it is the first point, the line starts at it.
+            if (pts.length > 0 && pts[0][0] > minTime && pts[0][0] !== firstBlockMs && sortedBlocks.length > 0) {
                 var prevBlock = null;
                 for (var i = 0; i < sortedBlocks.length; i++) {
                     var bt = sortedBlocks[i].ts * 1000;
-                    if (bt < minTime && sortedBlocks[i].luck > 0) {
+                    if (bt < minTime && trendLuck(sortedBlocks[i]) > 0) {
                         prevBlock = sortedBlocks[i];
                     } else if (bt >= minTime) {
                         break;
                     }
                 }
-                pts.unshift([minTime, prevBlock ? prevBlock.luck : pts[0][1]]);
+                pts.unshift([minTime, prevBlock ? trendLuck(prevBlock) : pts[0][1]]);
             }
             if (!live) return pts;
             var last = sortedBlocks[sortedBlocks.length - 1] || {};
@@ -8500,7 +8514,7 @@
             var lastX = pts.length > 0 ? pts[pts.length - 1][0] : -Infinity;
             var startMs = Math.max(blkMs, minTime);
             if (blkMs >= minTime) {
-                if (last.luck > 0) {
+                if (trendLuck(last) > 0) {
                     startMs = blkMs + 1000;  // just after the block's own point
                 } else if (pts.length > 0) {
                     // Its round has no luck: break the line instead of

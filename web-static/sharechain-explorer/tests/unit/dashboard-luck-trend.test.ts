@@ -2,15 +2,16 @@
 // the c2pLuckTrend block). Completed rounds are points at their luck. The
 // in-progress round, luck-if-found-now = expected / elapsed * 100 capped at
 // 1000, is a sampled hyperbola that starts at the last block when that block
-// is in the window and at the window's left edge only when it is older. A
-// block with no computed luck gets no luck value. Runs the function extracted
-// from dashboard.html itself.
+// is in the window and at the window's left edge only when it is older. The
+// node's first known block (luck_method "first_block") counts as 100 %; any
+// other block with no computed luck gets no luck value. Runs the function
+// extracted from dashboard.html itself.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 
-interface Block { ts: number; luck?: number | null }
+interface Block { ts: number; luck?: number | null; luck_method?: string }
 interface Live { x: number; y: number; expectedMs: number; lastBlkMs: number }
 type Pt = [number, number | null] | { x: number; y: number; marker?: { enabled: boolean } };
 type Build = (observed: [number, number][], sortedBlocks: Block[], minTime: number, live: Live | null) => Pt[];
@@ -63,25 +64,63 @@ function assertCurve(pts: Pt[], lv: Live, fromX: number) {
   assert.deepEqual(curve[curve.length - 1], [lv.x, onCurve(lv, lv.x)], 'ends at the live point, on the curve');
 }
 
-test('field case: the only in-window block has null luck, the curve starts at that block', () => {
-  // kr1z1s LTC node, 1W view: block 84024db9 at 1794498365, luck null
-  // (first_block), expected_time 1921406 s; history starts ~3 d before it;
-  // current_luck_trend ~688 %.
-  const blk: Block = { ts: 1794498365, luck: null };
-  const blkMs = blk.ts * 1000, nowMs = blkMs + 279274e3, minTime = blkMs - 3 * D;
-  const lv = live(blkMs, nowMs, nowMs - 30e3, 1921406e3);
-  assert.ok(Math.abs(lv.y - 688) < 0.01);
-  const pts = build(observedOf([blk], minTime, nowMs - 30e3), [blk], minTime, lv);
+// kr1z1s LTC node, 1W view: block 84024db9 at 1794498365, luck null,
+// luck_method first_block, expected_time 1921406 s; history starts ~3 d
+// before it; current_luck_trend ~688 %.
+const FIELD_TS = 1794498365, FIELD_EXPECTED = 1921406e3;
+function fieldCase(blk: Block, earlier: Block[] = []) {
+  const blkMs = blk.ts * 1000, nowMs = blkMs + 279274e3, minTime = blkMs - 3 * D, maxTime = nowMs - 30e3;
+  const blocks = earlier.concat([blk]);
+  const lv = live(blkMs, nowMs, maxTime, FIELD_EXPECTED);
+  return { blkMs, minTime, lv, pts: build(observedOf(blocks, minTime, maxTime), blocks, minTime, lv) };
+}
 
+test('field case: the node\'s first block counts as 100 %, then the curve starts just after it', () => {
+  const { blkMs, lv, pts } = fieldCase({ ts: FIELD_TS, luck: null, luck_method: 'first_block' });
+  assert.ok(Math.abs(lv.y - 688) < 0.01);
   assert.ok(pts.every(p => xOf(p) >= blkMs), 'no luck line before the block');
-  assert.equal(xOf(pts[0]!), blkMs);
-  assert.equal(yOf(pts[0]!), CAP, 'starts from the cap: luck-if-found-now at elapsed -> 0');
-  assert.equal(hasMarker(pts[0]!), false, 'the null-luck block gets no luck point of its own');
+  assert.deepEqual(pts[0], [blkMs, 100], 'the first block is a point at 100 %, with the series marker');
+  assert.deepEqual(pts[1], { x: blkMs + 1000, y: CAP, marker: { enabled: false } });
   // Flat at the cap until expected/10 after the block, then falling.
-  const knee = blkMs + 1921406e3 / 10;
-  assert.ok(pts.filter(p => xOf(p) <= knee).every(p => yOf(p) === CAP));
+  const knee = blkMs + FIELD_EXPECTED / 10;
+  assert.ok(pts.slice(1).filter(p => xOf(p) <= knee).every(p => yOf(p) === CAP));
   assert.ok(pts.some(p => xOf(p) > knee && (yOf(p) as number) < CAP && (yOf(p) as number) > lv.y));
-  assertCurve(pts, lv, blkMs);
+  assertCurve(pts, lv, blkMs + 1);
+});
+
+test('a null-luck block that is not the first block still gets no luck value: the curve starts at it, after a break', () => {
+  for (const luck_method of [undefined, 'relayed', 'netdiff_unavailable', 'interval_unavailable']) {
+    const blk: Block = { ts: FIELD_TS, luck: null };
+    if (luck_method) blk.luck_method = luck_method;
+    {
+      const { blkMs, lv, pts } = fieldCase(blk);
+      assert.ok(pts.every(p => xOf(p) >= blkMs), `${luck_method}: no luck line before the block`);
+      assert.deepEqual(pts[0], { x: blkMs, y: CAP, marker: { enabled: false } }, `${luck_method}: no point of its own`);
+      assertCurve(pts, lv, blkMs);
+    }
+    {
+      // After a real-luck block: a break, no ramp from 85 % up to the cap.
+      const prevMs = FIELD_TS * 1000 - D;
+      const { blkMs, minTime, lv, pts } = fieldCase(blk, [{ ts: prevMs / 1000, luck: 85 }]);
+      assert.deepEqual(pts.slice(0, 4), [[minTime, 85], [prevMs, 85], [blkMs, null],
+                                         { x: blkMs, y: CAP, marker: { enabled: false } }], `${luck_method}`);
+      assertCurve(pts, lv, blkMs);
+    }
+  }
+});
+
+test('the first block counts as 100 % wherever it sits; inside the window nothing is drawn before it', () => {
+  const nowMs = 1794777600e3, minTime = nowMs - D, maxTime = nowMs - 30e3, lastMs = nowMs - 6 * H;
+  for (const firstMs of [nowMs - 20 * H, nowMs - 30 * H]) {
+    const blocks: Block[] = [{ ts: firstMs / 1000, luck: null, luck_method: 'first_block' }, { ts: lastMs / 1000, luck: 120 }];
+    const lv = live(lastMs, nowMs, maxTime, 4 * H);
+    const pts = build(observedOf(blocks, minTime, maxTime), blocks, minTime, lv);
+    assert.deepEqual(pts.slice(0, 3), firstMs >= minTime
+      ? [[firstMs, 100], [lastMs, 120], { x: lastMs + 1000, y: CAP, marker: { enabled: false } }]
+      : [[minTime, 100], [lastMs, 120], { x: lastMs + 1000, y: CAP, marker: { enabled: false } }]);
+    assert.ok(pts.every(p => yOf(p) !== null), 'no break');
+    assertCurve(pts, lv, lastMs + 1);
+  }
 });
 
 test('real-luck blocks keep their points and the minTime start; the curve starts just after the last block', () => {
