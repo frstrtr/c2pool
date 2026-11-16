@@ -78,6 +78,11 @@ const server = createServer((req, res) => {
     const merged = JSON.parse(readFileSync(join(FIXTURES, 'merged_payouts.json'), 'utf8'));
     return serveJson(res, Object.fromEntries(Object.entries(merged).map(([a, v]) => [a, v.amount])));
   }
+  if (process.env.MOCK_PAYOUTS === '1' && path === '/pplns/current') {
+    // The classic PPLNS View accepts the legacy merged-payouts shape.
+    const raw = readFileSync(join(FIXTURES, 'merged_payouts.json'), 'utf8');
+    return serveJson(res, raw);
+  }
   if (process.env.MOCK_PAYOUTS === '1' && path === '/stratum_stats') {
     return serveJson(res, { pool: {}, workers: { 'XMINEADDRESS.rig1': {}, 'XminerDDDDD4.s19': {} } });
   }
