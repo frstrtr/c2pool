@@ -126,33 +126,58 @@ TEST(DashboardData, LuckIsComputedFromTheLiveTemplateWhenTheCacheIsCold)
     EXPECT_DOUBLE_EQ(blk["pool_hashrate_at_find"].get<double>(), 4294967296.0);
 }
 
-// The FIRST block of a ledger has no predecessor, hence no time_to_find and
-// no luck MEASUREMENT. That must surface as null ("not computed"), never as
-// a numeric 0 the chart will draw — 0% luck is a catastrophe claim, and the
-// production chart made exactly that claim out of unmeasured rows.
+// A luck that was not computed must never surface as a numeric 0 the chart
+// will draw — 0% luck is a catastrophe claim, and the production chart made
+// exactly that claim out of unmeasured rows.
+//
+// 2026-11-16, luck as effort (operator ruling): the FIRST block of a ledger
+// has no predecessor, hence no time_to_find; it is effort 1.0 / luck 100 % by
+// definition. A LATER block whose inputs cannot be had (no network
+// difficulty: no template, no cache, no header) is null ("not computed").
 TEST(DashboardData, UncomputedLuckIsNullNeverZero)
 {
     MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
                        c2pool::address::Blockchain::DASH);
-    wire_dash_template(mi);
-    const std::string h =
+    const std::string h1 =
         "5555555555555555555555555555555555555555555555555555555555555555";
-    mi.record_found_block(2516911, uint256S(h), 1785955172, "DASH",
-                          "XoZcEFbqwnty5secW7HYjdQEZYfubMkURu", h,
+    const std::string h2 =
+        "5555555555555555555555555555555555555555555555555555555555555556";
+    mi.record_found_block(2516911, uint256S(h1), 1785955172, "DASH",
+                          "XoZcEFbqwnty5secW7HYjdQEZYfubMkURu", h1,
+                          0.0, 240228.0, 0.0, 0);
+    mi.record_found_block(2516914, uint256S(h2), 1785955174, "DASH",
+                          "XoZcEFbqwnty5secW7HYjdQEZYfubMkURu", h2,
                           0.0, 240228.0, 0.0, 0);
 
-    auto blk = find_block(mi.rest_recent_blocks(), h);
-    ASSERT_TRUE(blk.is_object());
-    EXPECT_TRUE(blk["luck"].is_null())
-        << "a first block has no luck measurement; 0 is a fabricated one";
-    EXPECT_TRUE(blk["time_to_find"].is_null());
-    EXPECT_EQ(blk["luck_method"].get<std::string>(), "first_block");
+    auto arr = mi.rest_recent_blocks();
+    auto first = find_block(arr, h1);
+    ASSERT_TRUE(first.is_object());
+    ASSERT_TRUE(first["luck"].is_number());
+    EXPECT_DOUBLE_EQ(first["luck"].get<double>(), 100.0)
+        << "a first block is one found for one expected, never 0";
+    EXPECT_TRUE(first["time_to_find"].is_null());
+    EXPECT_EQ(first["luck_method"].get<std::string>(), "first_block");
+
+    auto second = find_block(arr, h2);
+    ASSERT_TRUE(second.is_object());
+    EXPECT_TRUE(second["luck"].is_null())
+        << "no network difficulty was ever had; 0 is a fabricated measurement";
+    EXPECT_TRUE(second["effort"].is_null());
+    EXPECT_EQ(second["luck_method"].get<std::string>(), "netdiff_unavailable");
 
     // /luck_stats feeds the trend chart: same rule there.
     auto luck = mi.rest_luck_stats();
-    ASSERT_FALSE(luck["blocks"].empty());
-    EXPECT_TRUE(luck["blocks"][0]["luck"].is_null())
-        << "the trend chart must SKIP unmeasured rows, not draw them at 0";
+    ASSERT_EQ(luck["blocks"].size(), 2u);
+    for (const auto& b : luck["blocks"]) {
+        if (b["hash"].get<std::string>() == h2)
+            EXPECT_TRUE(b["luck"].is_null())
+                << "the trend chart must SKIP unmeasured rows, not draw them at 0";
+        else
+            EXPECT_DOUBLE_EQ(b["luck"].get<double>(), 100.0);
+    }
+    // The unmeasured round is left out of the pool's luck on both sides.
+    EXPECT_EQ(luck["periods"]["all"]["k"].get<uint64_t>(), 1u);
+    EXPECT_EQ(luck["periods"]["all"]["k_unmeasured"].get<uint64_t>(), 1u);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -861,7 +886,9 @@ TEST(DashboardData, RecentBlocksCarriesOracleParityResidualFields)
                           "XoZcEFbqwnty5secW7HYjdQEZYfubMkURu", h2,
                           0.0, 240228.0, 0.0, 0);
 
-    auto arr = mi.rest_recent_blocks();
+    // As of the second block's own time, so the open round after it adds
+    // nothing to the pool aggregate below.
+    auto arr = mi.rest_recent_blocks_at(1785955174.0);
     auto blk = find_block(arr, h2);
     ASSERT_TRUE(blk.is_object());
 
@@ -890,13 +917,16 @@ TEST(DashboardData, RecentBlocksCarriesOracleParityResidualFields)
     EXPECT_EQ(blk["diff_samples_used"].get<int>(), 1);
 
     // First-row pool luck aggregate: the array is newest-first, so arr[0] is
-    // h2 and carries the summary keys. One computed luck (50%), classified
+    // h2 and carries the summary keys. One measured luck (50%), classified
     // honestly as single_hashrate/approximate -- never accurate/simple_avg.
+    // pool_avg_luck is blocks found over blocks expected (2026-11-16): the
+    // first block is 1 found / 1 expected, the second 1 found / 2 expected,
+    // so 2 / 3 -- not the mean of the per-block values.
     ASSERT_FALSE(arr.empty());
     const auto& agg = arr[0];
     ASSERT_TRUE(agg["pool_avg_luck"].is_number());
-    EXPECT_DOUBLE_EQ(agg["pool_avg_luck"].get<double>(), 50.0);
-    EXPECT_EQ(agg["blocks_for_luck"].get<uint64_t>(), 1u);
+    EXPECT_NEAR(agg["pool_avg_luck"].get<double>(), 100.0 * 2.0 / 3.0, 1e-9);
+    EXPECT_EQ(agg["blocks_for_luck"].get<uint64_t>(), 2u);
     EXPECT_EQ(agg["single_hashrate_luck_count"].get<uint64_t>(), 1u);
     EXPECT_EQ(agg["approximate_luck_count"].get<uint64_t>(), 1u);
     EXPECT_EQ(agg["accurate_luck_count"].get<uint64_t>(), 0u);
@@ -906,9 +936,9 @@ TEST(DashboardData, RecentBlocksCarriesOracleParityResidualFields)
 }
 
 // Honest-null on the residual fields: an unmeasured row emits null, never a
-// fabricated 0 or a dead link. A single first block has no luck, so
-// luck_approximate is null and the pool aggregate reports zero contributors
-// with a null average.
+// fabricated 0 or a dead link. A single first block has no MEASURED luck, so
+// luck_approximate is null and no measured-luck counter moves; the pool
+// aggregate counts it as one block found for one expected (2026-11-16).
 TEST(DashboardData, RecentBlocksResidualFieldsHonorHonestNull)
 {
     MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
@@ -935,9 +965,11 @@ TEST(DashboardData, RecentBlocksResidualFieldsHonorHonestNull)
               "https://blockchair.com/dash/block/" + h);
 
     ASSERT_FALSE(arr.empty());
-    EXPECT_TRUE(arr[0]["pool_avg_luck"].is_null());
-    EXPECT_EQ(arr[0]["blocks_for_luck"].get<uint64_t>(), 0u);
+    ASSERT_TRUE(arr[0]["pool_avg_luck"].is_number());
+    EXPECT_DOUBLE_EQ(arr[0]["pool_avg_luck"].get<double>(), 100.0);
+    EXPECT_EQ(arr[0]["blocks_for_luck"].get<uint64_t>(), 1u);
     EXPECT_EQ(arr[0]["single_hashrate_luck_count"].get<uint64_t>(), 0u);
+    EXPECT_EQ(arr[0]["approximate_luck_count"].get<uint64_t>(), 0u);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1110,10 +1142,14 @@ TEST(DashboardData, ConfirmationRepairsNetdiffAndComputesLuck)
         EXPECT_TRUE(blk["luck"].is_null());
     }
 
-    // The header chain is available by the time the confirm lane runs.
+    // The header chain is available by the time the confirm lane runs. The
+    // lane checks every found block; the earlier one is confirmed too (a
+    // block left pending for good while a later one confirms never got a
+    // verdict, and would stop being the later block's predecessor).
     mi.set_block_field_lookups(fixed_diff_lookup(1.0), null_ts_lookup());
     mi.set_block_verify_fn([](const std::string&) -> int { return 6; });
 
+    EXPECT_GT(mi.run_block_verification_now(h1), 0);
     int v = mi.run_block_verification_now(h2);
     EXPECT_GT(v, 0);
 
@@ -1685,6 +1721,8 @@ TEST(FoundBlockExplorer, ParentFieldsAreFillOnly)
 // that order, found no predecessor, and /recent_blocks labelled it
 // "first_block" -- the chart then said "1st block" for a block with 23 earlier
 // rows. A row with an earlier same-chain row is not the first block.
+// 2026-11-16: a round runs from the previous main-chain block BY TIME, so the
+// height-0 row has its predecessor and its luck whatever its height.
 TEST(DashboardData, RowWithEarlierBlocksIsNeverLabelledFirstBlock)
 {
     MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
@@ -1726,10 +1764,12 @@ TEST(DashboardData, RowWithEarlierBlocksIsNeverLabelledFirstBlock)
     EXPECT_EQ(first["luck_method"].get<std::string>(), "first_block")
         << "the genuinely first block keeps its label";
     EXPECT_EQ(second["luck_method"].get<std::string>(), "simple_avg");
-    EXPECT_TRUE(stale["luck"].is_null());
     EXPECT_NE(stale["luck_method"].get<std::string>(), "first_block")
         << "a block with earlier same-chain rows is not the pool's first";
-    EXPECT_EQ(stale["luck_method"].get<std::string>(), "interval_unavailable");
+    EXPECT_EQ(stale["luck_method"].get<std::string>(), "simple_avg");
+    EXPECT_EQ(stale["prev_block_hash"].get<std::string>(), h_second);
+    EXPECT_DOUBLE_EQ(stale["time_to_find"].get<double>(), 1792954341.0 - 1792945704.0);
+    ASSERT_TRUE(stale["luck"].is_number());
 }
 
 // The confirm/orphan verdict runs with the blocks lock released, and every
