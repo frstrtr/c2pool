@@ -325,17 +325,22 @@ public:
     SolveResult on_solve(Item item, bool won_block, clock::time_point now = clock::now())
     {
         SolveResult r;
+        if (m_stopped.load()) {
+            // The node is stopping: a share minted now could not be broadcast,
+            // whichever thread the solve came from. Only the owner touches the
+            // queue's counters; an off-owner caller is counted as off_thread.
+            const bool owner = on_owner_thread();
+            if (owner)
+                m_queue.count_drop(MintDropReason::shutdown);
+            notify_dropped(item, MintDropReason::shutdown);
+            r.outcome = MintOutcome{MintResult::Dropped, MintDropReason::shutdown, uint256()};
+            if (owner)
+                publish();
+            return r;
+        }
         if (!on_owner_thread()) {
             // Never touch the queue off the owner thread: the old path.
             r.outcome = m_mint_once(item, MintAttempt{true, false, false});
-            return r;
-        }
-        if (m_stopped.load()) {
-            // The node is stopping: a share minted now could not be broadcast.
-            m_queue.count_drop(MintDropReason::shutdown);
-            notify_dropped(item, MintDropReason::shutdown);
-            r.outcome = MintOutcome{MintResult::Dropped, MintDropReason::shutdown, uint256()};
-            publish();
             return r;
         }
         if (!m_enabled) {

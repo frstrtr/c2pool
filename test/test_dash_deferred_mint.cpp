@@ -417,6 +417,25 @@ TEST(DeferredMinter, OffOwnerThreadCallsTakeTheOldPathAndNeverTouchTheQueue)
     EXPECT_EQ(m->off_thread_calls(), 3u);
 }
 
+// After shutdown nothing mints, from ANY thread: an off-owner solve (e.g. an
+// HTTP submit during shutdown) is dropped as shutdown, not minted the old way.
+TEST(DeferredMinter, OffOwnerSolveAfterShutdownIsDroppedNotMinted)
+{
+    ScriptedMint s;
+    s.outcome = [](int i) { return minted(i); };
+    auto m = s.make(true);
+    m->shutdown();
+    DeferredMinter<int>::SolveResult off;
+    std::thread t([&] { off = m->on_solve(7, false); });
+    t.join();
+    EXPECT_TRUE(s.calls.empty()) << "no mint attempt after shutdown";
+    EXPECT_EQ(off.outcome.result, MintResult::Dropped);
+    EXPECT_EQ(off.outcome.why, MintDropReason::shutdown);
+    ASSERT_EQ(s.lost.size(), 1u);
+    EXPECT_EQ(s.lost[0], std::make_pair(7, MintDropReason::shutdown));
+    EXPECT_EQ(m->off_thread_calls(), 1u);
+}
+
 // The optional per-drain time budget stops a drain like the item cap and
 // leaves the rest for the next drain point.
 TEST(DeferredMintQueue, TimeBudgetStopsTheDrainAndKeepsTheRest)
