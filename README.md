@@ -597,7 +597,7 @@ It is not implemented today.
 
 **Fail-closed by design.** If the anchor is missing, corrupt, for the wrong
 network, in the wrong chain position, further behind the tip than
-`--embedded-mn-bridge-max` (default 20000 blocks, ≈34 days; measured from the
+`--embedded-mn-bridge-max` (default 40000 blocks, ≈69 days; measured from the
 persisted cursor when a node resumes, so in practice this only stops a cold
 start from an old release), or contradicted
 by a replayed block, c2pool logs the refusal at `ERROR` and **refuses to serve
