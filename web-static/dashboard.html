@@ -8448,6 +8448,70 @@
             el.style.color = color;
         }
 
+        // BEGIN c2pLuckTrend (tested by sharechain-explorer/tests/unit/dashboard-luck-trend.test.ts)
+        // The hashrate charts' Luck series, in raw luck % (the caller applies
+        // the display transform). observed: [ms, luck] of the in-window blocks
+        // with a computed luck (> 0). sortedBlocks: all blocks, oldest first.
+        // live: the in-progress round {x: now ms, y: luck %, expectedMs,
+        // lastBlkMs}, or null.
+        // A completed round is a point at its luck. The in-progress round is
+        // luck-if-found-now = expected / elapsed * 100, capped at 1000: a
+        // hyperbola, so it is sampled, not drawn as a chord. It starts at the
+        // last block when that block is in the window (at the window's left
+        // edge only when the block is older). A last block with no computed
+        // luck gets no luck value of its own: the line breaks there and the
+        // curve starts at its time, from the cap (elapsed -> 0). Curve samples
+        // have no marker.
+        var C2P_LUCK_CAP = 1000;
+        var C2P_LUCK_SAMPLES = 32;
+        function c2pLuckTrendPoints(observed, sortedBlocks, minTime, live) {
+            var pts = observed.slice().sort(function(a, b) { return a[0] - b[0]; });
+            // Start at minTime: the luck of the last block before the window,
+            // else the first in-window point's.
+            if (pts.length > 0 && pts[0][0] > minTime && sortedBlocks.length > 0) {
+                var prevBlock = null;
+                for (var i = 0; i < sortedBlocks.length; i++) {
+                    var bt = sortedBlocks[i].ts * 1000;
+                    if (bt < minTime && sortedBlocks[i].luck > 0) {
+                        prevBlock = sortedBlocks[i];
+                    } else if (bt >= minTime) {
+                        break;
+                    }
+                }
+                pts.unshift([minTime, prevBlock ? prevBlock.luck : pts[0][1]]);
+            }
+            if (!live) return pts;
+            var luckAt = function(elapsedMs) {
+                return Math.min((live.expectedMs / Math.max(elapsedMs, 1000)) * 100, C2P_LUCK_CAP);
+            };
+            var lastX = pts.length > 0 ? pts[pts.length - 1][0] : -Infinity;
+            var e0 = Math.max(live.lastBlkMs, minTime) - live.lastBlkMs;
+            var e1 = live.x - live.lastBlkMs;
+            if (lastX >= live.lastBlkMs) e0 += 1000;  // just after the block's own point
+            var elapsed = [];
+            if (e0 < e1) {
+                // The round ending at a no-luck block has no luck: break the
+                // line there instead of ramping the previous point up to the cap.
+                if (e0 === 0 && pts.length > 0) pts.push([live.lastBlkMs, null]);
+                elapsed.push(e0);
+                // Flat at the cap up to the knee, then geometric steps: the
+                // curve is 1/elapsed, so equal ratios keep it smooth.
+                var d0 = Math.max(e0, live.expectedMs * 100 / C2P_LUCK_CAP);
+                if (d0 < e1) {
+                    if (d0 > e0) elapsed.push(d0);
+                    var ratio = Math.pow(e1 / d0, 1 / C2P_LUCK_SAMPLES);
+                    for (var k = 1; k < C2P_LUCK_SAMPLES; k++) elapsed.push(d0 * Math.pow(ratio, k));
+                }
+            }
+            elapsed.forEach(function(e) {
+                pts.push({x: live.lastBlkMs + e, y: luckAt(e), marker: {enabled: false}});
+                lastX = live.lastBlkMs + e;
+            });
+            if (live.x > lastX) pts.push([live.x, live.y]);
+            return pts;
+        }
+        // END c2pLuckTrend
+
         // Honest luck empty-state. The luck line is composited client-side; it
         // legitimately has ZERO points when this node has observed no block with
         // a computable luck (needs netdiff + pool hashrate at find) AND there is
@@ -8728,43 +8792,7 @@
                     liveLuckPoint = { x: Math.max(nowMs, maxTime), y: liveLuck, expectedMs: expectedMs, lastBlkMs: lastBlkMs };
                 }
             }
-            if (luckTrendData.length > 0) {
-                // Sort by time
-                luckTrendData.sort(function(a, b) { return a[0] - b[0]; });
-
-                // Add interpolated point at minTime if first point is after minTime
-                if (luckTrendData[0][0] > minTime && sortedBlocks.length > 0) {
-                    // Find the last block before minTime for interpolation
-                    var prevBlock = null;
-                    for (var i = 0; i < sortedBlocks.length; i++) {
-                        var bt = sortedBlocks[i].ts * 1000;
-                        if (bt < minTime && sortedBlocks[i].luck) {
-                            prevBlock = sortedBlocks[i];
-                        } else if (bt >= minTime) {
-                            break;
-                        }
-                    }
-
-                    if (prevBlock) {
-                        // Use the previous block's luck value at minTime
-                        luckTrendData.unshift([minTime, prevBlock.luck]);
-                    } else {
-                        // No previous block, use first point's value at minTime
-                        luckTrendData.unshift([minTime, luckTrendData[0][1]]);
-                    }
-                }
-
-                // Append the live in-progress extrapolation at x = now.
-                if (liveLuckPoint && liveLuckPoint.x > luckTrendData[luckTrendData.length - 1][0]) {
-                    luckTrendData.push([liveLuckPoint.x, liveLuckPoint.y]);
-                }
-            } else if (sortedBlocks.length > 0 && liveLuckPoint) {
-                // No blocks inside the window: draw the same hyperbola across it.
-                var edgeElapsedMs = Math.max(minTime - liveLuckPoint.lastBlkMs, 1000);
-                var edgeLuck = Math.min((liveLuckPoint.expectedMs / edgeElapsedMs) * 100, 1000);
-                luckTrendData.push([minTime, edgeLuck]);
-                luckTrendData.push([liveLuckPoint.x, liveLuckPoint.y]);
-            }
+            luckTrendData = c2pLuckTrendPoints(luckTrendData, sortedBlocks, minTime, liveLuckPoint);
             
             // Convert simple array points to objects for luck trend
             // Apply logarithmic compression to values above 100%
@@ -8786,7 +8814,7 @@
                 if (Array.isArray(point)) {
                     return {x: point[0], y: transformLuck(point[1])};
                 }
-                return {x: point.x, y: transformLuck(point.y)};
+                return {x: point.x, y: transformLuck(point.y), marker: point.marker};
             });
             
             // Debug: log processed results
@@ -9482,43 +9510,7 @@
                     liveLuckPoint = { x: Math.max(nowMs, maxTime), y: liveLuck, expectedMs: expectedMs, lastBlkMs: lastBlkMs };
                 }
             }
-            if (luckTrendData.length > 0) {
-                // Sort by time
-                luckTrendData.sort(function(a, b) { return a[0] - b[0]; });
-
-                // Add interpolated point at minTime if first point is after minTime
-                if (luckTrendData[0][0] > minTime && sortedBlocks.length > 0) {
-                    // Find the last block before minTime for interpolation
-                    var prevBlock = null;
-                    for (var i = 0; i < sortedBlocks.length; i++) {
-                        var bt = sortedBlocks[i].ts * 1000;
-                        if (bt < minTime && sortedBlocks[i].luck) {
-                            prevBlock = sortedBlocks[i];
-                        } else if (bt >= minTime) {
-                            break;
-                        }
-                    }
-
-                    if (prevBlock) {
-                        // Use the previous block's luck value at minTime
-                        luckTrendData.unshift([minTime, prevBlock.luck]);
-                    } else {
-                        // No previous block, use first point's value at minTime
-                        luckTrendData.unshift([minTime, luckTrendData[0][1]]);
-                    }
-                }
-
-                // Append the live in-progress extrapolation at x = now.
-                if (liveLuckPoint && liveLuckPoint.x > luckTrendData[luckTrendData.length - 1][0]) {
-                    luckTrendData.push([liveLuckPoint.x, liveLuckPoint.y]);
-                }
-            } else if (sortedBlocks.length > 0 && liveLuckPoint) {
-                // No blocks inside the window: draw the same hyperbola across it.
-                var edgeElapsedMs = Math.max(minTime - liveLuckPoint.lastBlkMs, 1000);
-                var edgeLuck = Math.min((liveLuckPoint.expectedMs / edgeElapsedMs) * 100, 1000);
-                luckTrendData.push([minTime, edgeLuck]);
-                luckTrendData.push([liveLuckPoint.x, liveLuckPoint.y]);
-            }
+            luckTrendData = c2pLuckTrendPoints(luckTrendData, sortedBlocks, minTime, liveLuckPoint);
             
             // Convert simple array points to objects for luck trend
             // Apply logarithmic compression to values above 100% (same as compact chart)
@@ -9536,7 +9528,7 @@
                 if (Array.isArray(point)) {
                     return {x: point[0], y: fsTransformLuck(point[1])};
                 }
-                return {x: point.x, y: fsTransformLuck(point.y)};
+                return {x: point.x, y: fsTransformLuck(point.y), marker: point.marker};
             });
             
             // Calculate dynamic luck Y-axis range to center 100% (fullscreen)
