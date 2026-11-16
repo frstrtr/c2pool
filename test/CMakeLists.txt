@@ -255,6 +255,7 @@ if (BUILD_TESTING AND GTest_FOUND)
     # fixture — the [BULK] MERKLE-BIND FAIL livelock the bulk-replay lane
     # wedged on. DASH_FIXTURE_DIR feeds its fixture loader.
     add_executable(test_dash_block_replay test_dash_block_replay.cpp
+                   test_dash_compact_block_receive.cpp
                    test_dash_tx_version_gate.cpp)
     target_compile_definitions(test_dash_block_replay PRIVATE
         DASH_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
@@ -383,7 +384,7 @@ if (BUILD_TESTING AND GTest_FOUND)
     # rather than a standalone executable: a fresh target would need a build.yml
     # --target edit and would trip CI's NOT_BUILT sentinel until it had one
     # (#143/#883/#893). Header-only pure function -- needs no extra link deps.
-    add_executable(test_dash_share_tracker test_dash_share_tracker.cpp test_dash_share_remove_owns_data.cpp test_dash_pool_rate_head_select.cpp)
+    add_executable(test_dash_share_tracker test_dash_share_tracker.cpp test_dash_share_remove_owns_data.cpp test_dash_pool_rate_head_select.cpp test_dash_head_score_block_solution.cpp)
     target_link_libraries(test_dash_share_tracker PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core
@@ -764,7 +765,8 @@ if (BUILD_TESTING AND GTest_FOUND)
         test_dash_tx_version_rules.cpp    # Dash Core v23.1.9 A: negative nVersion + payload-gate parity (vs the vendored dashd codec)
         test_dash_protx_mempool_eviction.cpp  # Dash Core v23.1.8 B.8: block-connect ProTx eviction
         test_dash_utxo_full.cpp           # S2: full UTXO set from a pinned snapshot (lane, open rule, pin, status)
-        test_dash_utxo_scan.cpp)          # N1: GET /api/utxo/scan over the full set (rows, posture, tip moved, mempool)
+        test_dash_utxo_scan.cpp           # N1: GET /api/utxo/scan over the full set (rows, posture, tip moved, mempool)
+        test_dash_mempool_probe.cpp)      # GET /mempool_entry: one entry's template candidacy (fee-parity shadow)
     target_link_libraries(test_dash_mempool PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core core_utxo
@@ -1401,6 +1403,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         test_dash_tx_serve_referee.cpp
         test_dash_submit_gate_scaling.cpp
         test_dash_serve_staleness_seam.cpp
+        test_dash_share_gate_frozen_bits.cpp
         test_dash_serve_staleness_unit.cpp
         test_dash_gbt_quorum_staleness.cpp
         ${CMAKE_SOURCE_DIR}/src/impl/dash/coin/zmq_tip_notify.cpp)
@@ -1635,7 +1638,7 @@ if (BUILD_TESTING AND GTest_FOUND)
     # --target allowlist AND already compiles coin/replay_bulk_fetch.hpp, so its
     # link set resolves BulkBlockScheduler/bulkpolicy with no new deps; a
     # standalone executable was a NOT_BUILT/"Not Run" CTest sentinel.
-    add_executable(test_dash_p2p_node test_dash_p2p_node.cpp test_dash_coin_p2p_client.cpp test_dash_coin_peer_manager.cpp test_dash_coin_p2p_pool.cpp test_dash_qrinfo_wire.cpp test_dash_coin_peer_rearm.cpp test_dash_replay_bulk_fetch.cpp test_dash_spork.cpp test_dash_bulk_local_primary_kat.cpp test_dash_restart_reorg_supersede_kat.cpp)
+    add_executable(test_dash_p2p_node test_dash_p2p_node.cpp test_dash_coin_p2p_client.cpp test_dash_coin_peer_manager.cpp test_dash_coin_p2p_pool.cpp test_dash_qrinfo_wire.cpp test_dash_coin_peer_rearm.cpp test_dash_replay_bulk_fetch.cpp test_dash_spork.cpp test_dash_bulk_local_primary_kat.cpp test_dash_restart_reorg_supersede_kat.cpp test_dash_cmpct_client.cpp)
     target_compile_definitions(test_dash_p2p_node PRIVATE
         DASH_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
     target_link_libraries(test_dash_p2p_node PRIVATE

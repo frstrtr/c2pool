@@ -20,6 +20,7 @@
 #include <csignal>
 #include <ctime>
 #include <optional>
+#include <mutex>
 #include <memory>
 #include <vector>
 #ifndef _WIN32
@@ -60,6 +61,7 @@
 // LTC implementation
 #include <impl/ltc/share.hpp>
 #include <impl/ltc/share_check.hpp>
+#include <impl/ltc/dashboard_found_block.hpp>  // one /recent_blocks row shape: finder + peers
 #include <impl/ltc/auto_ratchet.hpp>
 #include <impl/ltc/solo_payouts.hpp>
 #include <impl/ltc/share_messages.hpp>
@@ -529,6 +531,7 @@ void print_help() {
     std::cout << "COMMAND LINE OPTIONS:\n";
     std::cout << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
     std::cout << "  --help, -h                Show this help message and exit\n";
+    std::cout << "  --version                 Print \"c2pool-ltc <version> embedded=<coins>\" and exit\n";
     std::cout << "  --data-dir PATH           Root all per-instance state here (default: ~/.c2pool)\n";
     std::cout << "                            (isolates co-located instances)\n";
     std::cout << "  --testnet                 Use testnet instead of mainnet\n";
@@ -810,6 +813,26 @@ static int dump_doge_schedule_anchors(const std::string& dir, const std::string&
 }
 
 int main(int argc, char* argv[]) {
+    // --version: a pure query, answered before anything else runs (data dir,
+    // crash handlers, logger, the RLIMIT notice, settings, network), so stdout
+    // carries exactly this one line on every platform. Same shape as
+    // c2pool-dash's `c2pool-dash <version> bls=<backend>`: the version, then a
+    // build-feature token, last so `--version | grep -oE 'embedded=[a-z,]+'`
+    // reads it. embedded= names the coins with an embedded (daemonless) node
+    // compiled into this binary: the LTC parent and the DOGE and NMC
+    // merged-mining aux chains.
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--version") {
+#ifdef C2POOL_VERSION
+            std::cout << "c2pool-ltc " << C2POOL_VERSION << " embedded=ltc,doge,nmc\n";
+#else
+            std::cout << "c2pool-ltc dev embedded=ltc,doge,nmc\n";
+#endif
+            return 0;
+        }
+    }
+
     // Pre-scan for --data-dir BEFORE anything reads config_path() — the
     // Settings ctor (Fileconfig captures its path at construction) and the
     // file-log sink both resolve through it. Redirecting the chokepoint here
@@ -2415,6 +2438,24 @@ int main(int argc, char* argv[]) {
 
             // Phase 4 embedded objects (alive for the duration of integrated mode)
             std::unique_ptr<ltc::coin::HeaderChain>     embedded_chain;
+            // Head scoring's block-solution credit reads the header chain
+            // through this oracle (the tracker's m_expected_block_bits).
+            // Declared after embedded_chain, so it is destroyed first: it
+            // detaches under the oracle's mutex, after which a think() cycle
+            // gets nullopt (no credit) instead of reading freed headers; a
+            // call in flight finishes before the detach.
+            struct BlockBitsOracle {
+                std::mutex m;
+                const ltc::coin::HeaderChain* hc{nullptr};
+            };
+            struct BlockBitsOracleDetach {
+                std::shared_ptr<BlockBitsOracle> oracle = std::make_shared<BlockBitsOracle>();
+                ~BlockBitsOracleDetach()
+                {
+                    std::lock_guard<std::mutex> lk(oracle->m);
+                    oracle->hc = nullptr;
+                }
+            } block_bits_oracle;
             std::unique_ptr<ltc::coin::Mempool>         embedded_pool;
             std::unique_ptr<c2pool::merged::CoinBroadcaster> embedded_broadcaster;
             // The MWEB extension's source and its getblocktemplate poller
@@ -3246,7 +3287,8 @@ int main(int argc, char* argv[]) {
                             // re-persists the row, so it survives a restart.
                             rec.parent_hash = blk.parent_hash;
                             rec.parent_height = blk.parent_height;
-                            return fblk_store->store(rec);
+                            // A corrected height names the key it moved from.
+                            return fblk_store->store(rec, blk.replaced_height);
                         },
                         [fblk_store, fblk_leveldb]() -> std::vector<MI::FoundBlock> {
                             auto records = fblk_store->load_all();
@@ -5208,6 +5250,26 @@ int main(int argc, char* argv[]) {
                         });
                 }
 
+                // Head scoring credits a block-solution share only when its
+                // header bits are the network target for its parent block, as
+                // the embedded LTC header chain computes it (Litecoin retarget
+                // over a complete window on our best chain), and that parent is
+                // at most BLOCK_CREDIT_MAX_PARENT_DEPTH below our tip. Without an
+                // embedded header chain (--no-embedded-ltc: litecoind RPC) the
+                // oracle stays empty: no block-solution credit.
+                if (embedded_ltc) {
+                    std::lock_guard<std::mutex> lk(block_bits_oracle.oracle->m);
+                    block_bits_oracle.oracle->hc = embedded_chain.get();
+                }
+                p2p_node->tracker().m_expected_block_bits =
+                    [oracle = block_bits_oracle.oracle](const uint256& prev_block, int64_t block_time)
+                        -> std::optional<uint32_t> {
+                        std::lock_guard<std::mutex> lk(oracle->m);
+                        if (!oracle->hc) return std::nullopt;
+                        return oracle->hc->expected_bits_after(prev_block, block_time,
+                                                               ltc::BLOCK_CREDIT_MAX_PARENT_DEPTH);
+                    };
+
                 // Begin actively connecting to outbound peers from bootstrap list / addr store
                 p2p_node->start_outbound_connections();
                 LOG_INFO << "Outbound peer connection loop started";
@@ -5428,7 +5490,7 @@ int main(int argc, char* argv[]) {
                 // up in the header chain — this gives the ACTUAL block height, not the
                 // live template height (which changes rapidly during sync).
                 uint256 block_hash = Hash(ParseHex(header_hex.substr(0, 160)));
-                uint64_t height = 0;
+                uint64_t chain_height = 0;
                 {
                     // prev_block is at bytes 4..36 of the 80-byte header (LE uint256)
                     auto hdr_bytes = ParseHex(header_hex.substr(0, 160));
@@ -5438,33 +5500,56 @@ int main(int argc, char* argv[]) {
                         if (embedded_chain_ptr) {
                             auto entry = embedded_chain_ptr->get_header(prev_block);
                             if (entry.has_value())
-                                height = entry->height + 1;
+                                chain_height = entry->height + 1;
                         }
                     }
-                    // Fallback to template height if header chain lookup fails
-                    if (height == 0) {
-                        auto tmpl = web_server.get_mining_interface()->get_current_work_template();
-                        if (!tmpl.is_null() && tmpl.contains("height"))
-                            height = tmpl["height"].get<uint64_t>();
-                    }
                 }
-                // Capture enriched data for dashboard /recent_blocks
+                // The row every peer derives from the gossiped share
+                // (ltc::dashboard::row_from_share): the stratum submit that
+                // minted the share hands over its hash (== this block's hash),
+                // payout address, BIP34 height and committed coinbase value.
+                // The sharechain BEST share was recorded here before -- the
+                // winner's PARENT, the new share not being best yet -- and the
+                // node's own --address as the miner ("" on a node without one).
                 auto* mi = web_server.get_mining_interface();
-                double net_diff = mi->get_network_difficulty();
-                double pool_hr = mi->get_local_hashrate();
-                uint64_t block_subsidy = 0;
-                {
+                auto row = ltc::dashboard::row_from_submit(
+                    block_hash, hdr.m_timestamp, chain_height,
+                    core::MiningInterface::found_block_submit_context(), is_testnet);
+                // The header chain's prev + 1 or the share's BIP34 push: the
+                // block's own height (the template's below is not).
+                const bool height_from_block = row.height != 0;
+                if (row.height == 0) {
+                    // Last resort: the live template (it may build on a newer tip).
+                    auto tmpl = mi->get_current_work_template();
+                    if (!tmpl.is_null() && tmpl.contains("height"))
+                        row.height = tmpl["height"].get<uint64_t>();
+                }
+                // No stratum context (a JSON-RPC submitblock from a GBT miner):
+                // the block pays this node's template, i.e. its own address.
+                if (row.miner.empty())
+                    row.miner = mi->get_payout_address();
+                if (row.subsidy == 0) {
                     auto tmpl = mi->get_current_work_template();
                     if (!tmpl.is_null() && tmpl.contains("coinbasevalue"))
-                        block_subsidy = tmpl["coinbasevalue"].get<uint64_t>();
+                        row.subsidy = tmpl["coinbasevalue"].get<uint64_t>();
                 }
-                std::string miner_addr = mi->get_payout_address();
-                std::string share_h;
-                if (auto fn = mi->get_best_share_hash_fn())
-                    share_h = fn().GetHex();
+                const uint64_t height = row.height;
+                // Pool hashrate 0 -> record_found_block reads the sharechain
+                // pool estimator, the rate a peer records the same block with
+                // (this node's own stratum rate gave the finder and its peers
+                // luck values ~300x apart). No sharechain: the local rate.
                 mi->record_found_block(
-                    height, block_hash, 0, is_testnet ? "tLTC" : "LTC",
-                    miner_addr, share_h, net_diff, 0, pool_hr, block_subsidy);
+                    height, block_hash, row.timestamp, row.chain,
+                    row.miner, row.share_hash, mi->get_network_difficulty(),
+                    row.share_difficulty,
+                    /*pool_hashrate=*/p2p_node ? 0.0 : mi->get_local_hashrate(),
+                    row.subsidy,
+                    // Local dispatch: THIS node built the template and submitted
+                    // the block. Authorship only climbs, so the sharechain hook
+                    // (sharechain_peer, when the winning share verifies here)
+                    // can never downgrade it.
+                    core::MiningInterface::BlockAuthorship::this_node,
+                    height_from_block);
                 // Verify every found block against the best chain, a stale
                 // or refused one too: it is orphaned once the chain is 6 deep
                 // from its height, never left pending.
@@ -6443,9 +6528,12 @@ int main(int argc, char* argv[]) {
                 std::vector<std::string> found_full;
                 if (mi) {
                     for (const auto& fb : mi->get_found_blocks()) {
-                        if (!fb.share_hash.empty()) {
-                            blocks_arr.push_back(fb.share_hash.substr(0, 16));
-                            found_full.push_back(fb.share_hash);
+                        // found_block_share_hash: a pre-fix finder row names
+                        // the winner's PARENT share; it marks nothing.
+                        const std::string sh = mi->found_block_share_hash(fb);
+                        if (!sh.empty()) {
+                            blocks_arr.push_back(sh.substr(0, 16));
+                            found_full.push_back(sh);
                         }
                     }
                 }
@@ -6626,11 +6714,13 @@ int main(int argc, char* argv[]) {
                 nlohmann::json blocks_arr = nlohmann::json::array();
                 std::vector<std::string> found_full;
                 if (mi) {
-                    for (const auto& fb : mi->get_found_blocks())
-                        if (!fb.share_hash.empty()) {
-                            blocks_arr.push_back(fb.share_hash.substr(0, 16));
-                            found_full.push_back(fb.share_hash);
+                    for (const auto& fb : mi->get_found_blocks()) {
+                        const std::string sh = mi->found_block_share_hash(fb);
+                        if (!sh.empty()) {
+                            blocks_arr.push_back(sh.substr(0, 16));
+                            found_full.push_back(sh);
                         }
+                    }
                 }
                 // Only the found blocks among this delta's new shares; omitted
                 // when there are none (the client accumulates them).
@@ -6716,7 +6806,12 @@ int main(int argc, char* argv[]) {
                         }
                     }
                     if (is_ltc_block) {
+                        // The LTC row only: a merged (DOGE) row names this
+                        // share as its share too, and sorts first (higher
+                        // height), so the finder answered the DOGE height and
+                        // confirmations here.
                         for (const auto& fb : mi->get_found_blocks()) {
+                            if (!mi->is_primary_found_block(fb)) continue;
                             if (fb.hash == hash.GetHex() ||
                                 (!fb.share_hash.empty() && fb.share_hash == hash.GetHex())) {
                                 result["ltc_block_height"] = fb.height;
@@ -6872,31 +6967,33 @@ int main(int argc, char* argv[]) {
                 if (!chain.contains(share_hash)) return;
 
                 chain.get(share_hash).share.invoke([&](auto* s) {
-                    uint64_t height = s->m_absheight;
-                    uint256 block_hash = s->m_hash;  // share hash = block header hash
-                    double net_diff = mi->get_network_difficulty();
-                    double share_diff = chain::target_to_difficulty(chain::bits_to_target(s->m_bits));
-                    double pool_hr = mi->get_local_hashrate();
-
-                    std::string miner_addr;
-                    if constexpr (requires { s->m_address; })
-                        miner_addr = HexStr(s->m_address.m_data);
-                    else if constexpr (requires { s->m_pubkey_hash; })
-                        miner_addr = s->m_pubkey_hash.GetHex();
+                    // The finder records the same block from its stratum
+                    // submit (row_from_submit); both rows come from the share's
+                    // own fields, so every node shows the same facts. This site
+                    // recorded the sharechain ABSHEIGHT as the block height and
+                    // the raw pubkey-hash hex (byte-reversed) as the miner.
+                    const auto row = ltc::dashboard::row_from_share(share_hash, *s, is_testnet);
+                    const uint256& block_hash = row.block_hash;  // share hash = block header hash
 
                     LOG_INFO << "GOT BLOCK FROM PEER! share=" << share_hash.GetHex().substr(0,16)
-                             << " miner=" << miner_addr.substr(0,16)
-                             << " height=" << height;
+                             << " miner=" << row.miner
+                             << " height=" << row.height
+                             << " (share absheight " << s->m_absheight << ")";
 
                     // sharechain_peer: this hook fires for ANY verified share
                     // meeting the block target. For our own find the submit
                     // path records this_node and authorship only climbs, so
                     // labelling peer here can never downgrade a local record.
+                    // Pool hashrate 0 -> the sharechain pool estimator, the
+                    // same rate the finder records with.
                     mi->record_found_block(
-                        height, block_hash, s->m_min_header.m_timestamp,
-                        is_testnet ? "tLTC" : "LTC",
-                        miner_addr, share_hash.GetHex(), net_diff, share_diff, pool_hr, 0,
-                        core::MiningInterface::BlockAuthorship::sharechain_peer);
+                        row.height, block_hash, row.timestamp, row.chain,
+                        row.miner, row.share_hash, mi->get_network_difficulty(),
+                        row.share_difficulty, /*pool_hashrate=*/0.0, row.subsidy,
+                        core::MiningInterface::BlockAuthorship::sharechain_peer,
+                        // BIP34 off the share's coinbase: it corrects a
+                        // pre-fix row stored at the share absheight.
+                        /*height_from_block=*/row.height != 0);
                     // coinbase_txid = the gentx hash the share commits to.
                     // tx_count stays null: v34+ shares carry no tx list.
                     try {
@@ -7156,6 +7253,7 @@ int main(int argc, char* argv[]) {
                     const uint256& frozen_prev_share,
                     const std::vector<unsigned char>& coinbase_scriptSig,
                     const std::vector<unsigned char>& payout_script,
+                    const core::stratum::PayoutKey& rate_key,
                     uint64_t subsidy, uint32_t bits, uint32_t timestamp,
                     bool segwit_active, const std::string& witness_commitment_hex,
                     const uint256& witness_root,
@@ -7206,84 +7304,50 @@ int main(int argc, char* argv[]) {
                     params.donation = static_cast<uint16_t>(std::round(65535.0 * dev_donation / 100.0));
                     params.desired_version = desired_ver;
 
-                    // Per-miner desired_target — matches p2pool work.py:2490-2505.
-                    // 1) Start with 2^256-1 (easiest possible)
-                    // 2) Cap to 1.67% of pool shares by local hashrate
-                    // 3) Dust threshold: if expected payout < DUST, use block-proportional target
-                    // Result: clips to [pre_target3/30, pre_target3] in compute_share_target.
-                    auto desired_target = uint256S("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
-
-                    // Extract pubkey_hash from payout_script for hashrate lookup
-                    std::array<uint8_t, 20> miner_pubkey{};
-                    if (payout_script.size() == 25 && payout_script[0] == 0x76) {
-                        std::copy(payout_script.begin() + 3, payout_script.begin() + 23, miner_pubkey.begin());
-                    } else if (payout_script.size() == 23 && payout_script[0] == 0xa9) {
-                        std::copy(payout_script.begin() + 2, payout_script.begin() + 22, miner_pubkey.begin());
-                    } else if (payout_script.size() == 22 && payout_script[0] == 0x00) {
-                        std::copy(payout_script.begin() + 2, payout_script.begin() + 22, miner_pubkey.begin());
-                    }
-
-                    // p2pool work.py:2488-2505: per-miner desired_target computation
+                    // Per-miner desired_target (p2pool-merged-v36 work.py get_work
+                    // 3013-3028): Cap 1 (1.67% of pool shares) and Cap 2 (dust)
+                    // from the local rate of the miner the job is for, then
+                    // compute_share_target clips it into [pre_target3/30,
+                    // pre_target3]. The miner is rate_key (IWorkSource::
+                    // build_connection_coinbase_for): the stratum connection's
+                    // login key, NOT the key of payout_script, which
+                    // decide_job_payout replaces with the operator's on a
+                    // node-fee job. The operator's key has no
+                    // local rate: a fee job sized by it got the easiest share
+                    // target (pre_target3, 30x easier than its miner's at the
+                    // hard edge), its shares weighed 1/30 of their work and it
+                    // ended at its first, quick share, so the operator got a
+                    // fraction of the fee.
                     LOG_TRACE << "[ref_hash_fn] getting local_addr_rates...";
                     auto local_addr_rates = web_server.get_local_addr_rates();
                     LOG_TRACE << "[ref_hash_fn] got " << local_addr_rates.size() << " addr rates";
-                    double local_hash_rate = 0.0;
-                    {
-                        auto rate_it = local_addr_rates.find(miner_pubkey);
-                        if (rate_it != local_addr_rates.end())
-                            local_hash_rate = rate_it->second;
-                    }
+                    const double local_hash_rate = ltc::stratum::job_local_hash_rate(local_addr_rates, rate_key);
 
-                    // Cap 1: limit to 1.67% of pool shares (work.py:2492-2495)
-                    // desired_target = min(desired_target,
-                    //   average_attempts_to_target(local_hash_rate * SHARE_PERIOD / 0.0167))
-                    if (local_hash_rate > 0.0) {
-                        double avg_attempts = local_hash_rate * ltc::PoolConfig::share_period() / 0.0167;
-                        if (avg_attempts > 1.0) {
-                            // #859: saturating narrowing (ltc::stratum helper) --
-                            // avoids UB / a "Division by zero" throw for avg >= 2^64.
-                            uint256 cap_target = ltc::stratum::average_attempts_to_target(avg_attempts);
-                            if (cap_target < desired_target)
-                                desired_target = cap_target;
-                        }
-                    }
-
-                    // Cap 2: dust threshold (work.py:2497-2505)
-                    // If expected payout per block < DUST_THRESHOLD, ease the target
-                    // so small miners still get meaningful payouts.
+                    ltc::stratum::JobTargetInputs target_in;
+                    target_in.local_hash_rate = local_hash_rate;
+                    target_in.share_period = ltc::PoolConfig::share_period();
+                    target_in.subsidy = subsidy;
+                    target_in.donation_percent = dev_donation;
+                    target_in.dust_threshold = ltc::PoolConfig::dust_threshold();
+                    target_in.spread = ltc::PoolConfig::SPREAD;
+                    target_in.block_bits = bits;
+                    // Cap 2's pool rate: over the last hour of shares at the
+                    // prev share, once the chain is that deep; whatever the
+                    // job's local rate (p2pool applies the dust rule at no
+                    // rate too: its expected payout, 0, is below DUST).
                     {
                         auto& trk = *guard;
                         if (!frozen_prev_share.IsNull() && trk.chain.contains(frozen_prev_share)) {
                             int32_t lookbehind = 3600 / ltc::PoolConfig::share_period();
                             auto height = trk.chain.get_acc_height(frozen_prev_share);
-                            if (height > lookbehind && local_hash_rate > 0.0) {
+                            if (height > lookbehind) {
                                 auto pool_aps = trk.get_pool_attempts_per_second(
                                     frozen_prev_share, lookbehind, /*min_work=*/false);
-                                double pool_aps_d = static_cast<double>(pool_aps.GetLow64());
-                                if (pool_aps_d > 0.0) {
-                                    double expected_payout = (local_hash_rate / pool_aps_d)
-                                        * subsidy * (1.0 - dev_donation / 100.0);
-                                    if (expected_payout < ltc::PoolConfig::dust_threshold()) {
-                                        // p2pool: average_attempts_to_target(
-                                        //   target_to_average_attempts(block_target) * SPREAD * DUST / subsidy)
-                                        uint256 block_target = chain::bits_to_target(bits);
-                                        uint288 block_aps = chain::target_to_average_attempts(block_target);
-                                        // Use double arithmetic to avoid uint288 overflow
-                                        double dust_avg = static_cast<double>(block_aps.GetLow64())
-                                            * ltc::PoolConfig::SPREAD
-                                            * ltc::PoolConfig::dust_threshold()
-                                            / static_cast<double>(subsidy);
-                                        if (dust_avg > 1.0) {
-                                            // #859 sibling: same saturating helper.
-                                            uint256 dust_target = ltc::stratum::average_attempts_to_target(dust_avg);
-                                            if (dust_target < desired_target)
-                                                desired_target = dust_target;
-                                        }
-                                    }
-                                }
+                                target_in.pool_aps = static_cast<double>(pool_aps.GetLow64());
                             }
                         }
                     }
+                    const uint256 desired_target = ltc::stratum::job_desired_share_target(target_in);
                     // With fork shares excluded from verified, best_share (= frozen_prev)
                     // is always the main chain head. CST walks the main chain directly.
                     LOG_TRACE << "[ref_hash_fn] calling compute_share_target...";
@@ -9902,6 +9966,7 @@ int main(int argc, char* argv[]) {
                         return ltc::ShareTracker::merged_payout_outputs(*w, coinbase_value,
                                                                          combined_donation);
                     };
+                    out.origins = [w]() { return ltc::ShareTracker::merged_payout_origins(*w); };
                     return out;
                 };
 
@@ -9965,6 +10030,31 @@ int main(int argc, char* argv[]) {
                     if (result.empty())
                         c2pool::merged::MergedMiningManager::note_payout_miss(miss.empty() ? "empty" : miss);
                     return result;
+                });
+
+                // The same payouts with their origins (from the same weights),
+                // for the web payouts view: which parent address each merged
+                // output is paid for, and whether the shares gave the merged
+                // address or it is derived from the parent key. Never waits
+                // for the tracker lock.
+                mm_manager->set_payout_detail_provider(
+                    [&p2p_node, merged_payout_source, merged_weights](
+                        uint32_t chain_id, uint64_t coinbase_value)
+                    -> c2pool::merged::MergedPayoutDetail
+                {
+                    auto best = p2p_node->best_share_hash();
+                    if (best.IsNull())
+                        return {};
+                    std::string miss;
+                    return merged_payout_source->get_detail(
+                        best, chain_id, coinbase_value, /*may_wait=*/false,
+                        [&]() -> std::optional<c2pool::merged::MergedPayoutSource::Weights> {
+                            auto guard = p2p_node->read_tracker();
+                            if (!guard)
+                                return std::nullopt;
+                            return merged_weights(*guard, best, chain_id);
+                        },
+                        miss);
                 });
               } // end MM payout provider
 
@@ -10913,6 +11003,24 @@ int main(int argc, char* argv[]) {
                 // runs, whose luck point the one-shot backfill can never reach.
                 web_server.get_mining_interface()->set_block_field_lookups(
                     diff_lookup, ts_lookup);
+                // The height of each row's block in the header chain: fills a
+                // row stored at height 0 and corrects one the header chain
+                // contradicts. Pre-fix peer rows hold the share ABSHEIGHT
+                // (27707625 for LTC block 3211872), which also left them
+                // "pending" forever: the verdict waited for the chain to reach
+                // that height. Runs before the re-verification below.
+                auto height_lookup = [hc](const std::string& block_hash_hex) -> uint64_t {
+                    uint256 h;
+                    h.SetHex(block_hash_hex);
+                    auto entry = hc->get_header(h);
+                    return entry ? static_cast<uint64_t>(entry->height) : 0;
+                };
+                web_server.get_mining_interface()->backfill_found_block_heights(height_lookup);
+                // Only heights above the tip (no LTC block can sit there) are
+                // corrected: a header chain on a wrong checkpoint must not
+                // rewrite correct ones.
+                web_server.get_mining_interface()->correct_found_block_heights(
+                    height_lookup, static_cast<uint64_t>(hc->height()));
             }
 
             // #159 (G2): re-verify any found block that was still pending at the

@@ -103,3 +103,12 @@ on branch `explorer-module` must not regress measurable pixels against
 that anchor in **inline-mode** (flag off). Bundled-mode (flag on) is
 the diff target against *inline at the same fixture* — it's a parity
 measurement, not an anchor.
+
+## PPLNS view screenshots (not a gate)
+
+`CHROME_BIN=… node tests/visual/capture-pplns.mjs` starts the mock server with
+`MOCK_PAYOUTS=1` (serves `/current_payouts` and a `/stratum_stats` with two
+local workers; off by default, so the pixel gate is unaffected), opens
+`dashboard.html?pplns-view=1` and writes `out/pplns-view.png` (hover +
+tooltip), `out/pplns-grid-before.png` and `out/pplns-linked.png` (a pinned
+miner: the share-chain grid dims everyone else).

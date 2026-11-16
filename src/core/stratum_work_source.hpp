@@ -145,6 +145,30 @@ public:
         const std::vector<unsigned char>& payout_script,
         const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs) const = 0;
 
+    /// build_connection_coinbase for the stratum connection whose login key is
+    /// `login_key`: the key its pseudoshares are recorded under
+    /// (StratumServer::record_pseudoshare), all zero for a login without one
+    /// (empty, P2WSH, P2TR), whose pseudoshares are recorded under the zero
+    /// key. `payout_script` is the job's, after decide_job_payout. A work
+    /// source that sizes a job's share target by its miner's local hash rate
+    /// (p2pool get_work: desired_share_target) reads the rate of `login_key`,
+    /// never of the job's payout: decide_job_payout gives a job to the node
+    /// operator (the node fee) or redistributes it by replacing its payout,
+    /// and sized by the operator's key (no local rate of its own here) a fee
+    /// job got the easiest share the band allows, 30x easier than its miner's
+    /// at the hard edge: its shares weighed 1/30 of the work behind them and
+    /// it ended at its first, quick share. Sized by the login, a fee job is
+    /// the job it replaced but for its payout. Default: the plain build.
+    virtual CoinbaseResult build_connection_coinbase_for(
+        const PayoutKey& /*login_key*/,
+        const uint256& prev_share_hash,
+        const std::string& extranonce1_hex,
+        const std::vector<unsigned char>& payout_script,
+        const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs) const
+    {
+        return build_connection_coinbase(prev_share_hash, extranonce1_hex, payout_script, merged_addrs);
+    }
+
     // ── Share submission (the hot path) ──────────────────────────────────
 
     /// Process a `mining.submit` from a stratum session. Validates the

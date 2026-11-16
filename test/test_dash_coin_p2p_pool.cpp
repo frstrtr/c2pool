@@ -1380,6 +1380,17 @@ TEST(DashCoinP2PPool, lost_body_first_peer_stalls_recovers_from_the_second_peer)
     dash::coin::BlockType blk;
     blk.m_version = 0x20000000;
     blk.m_timestamp = 1'700'000'000u;
+    // #968a: a body must bind to its header (merkle root over its txs) to be
+    // accepted at all, so the block carries one tx and commits to it.
+    {
+        dash::coin::MutableTransaction cb;
+        cb.locktime = 1;
+        bitcoin_family::coin::TxOut out;
+        out.value = 1;
+        cb.vout.push_back(out);
+        blk.m_txs.push_back(cb);
+        blk.m_merkle_root = dash::coin::compute_merkle_root({dash::coin::dash_txid(cb)});
+    }
     auto packed_hdr =
         pack(static_cast<const dash::coin::BlockHeaderType&>(blk));
     const uint256 bh = dash::crypto::hash_x11(packed_hdr.get_span());
@@ -1429,6 +1440,17 @@ TEST(DashCoinP2PPool, body_arrival_disarms_the_watchdog)
     dash::coin::BlockType blk;
     blk.m_version = 0x20000000;
     blk.m_timestamp = 1'700'000'000u;
+    // #968a: a body must bind to its header (merkle root over its txs) to be
+    // accepted at all, so the block carries one tx and commits to it.
+    {
+        dash::coin::MutableTransaction cb;
+        cb.locktime = 1;
+        bitcoin_family::coin::TxOut out;
+        out.value = 1;
+        cb.vout.push_back(out);
+        blk.m_txs.push_back(cb);
+        blk.m_merkle_root = dash::coin::compute_merkle_root({dash::coin::dash_txid(cb)});
+    }
     auto packed_hdr =
         pack(static_cast<const dash::coin::BlockHeaderType&>(blk));
     const uint256 bh = dash::crypto::hash_x11(packed_hdr.get_span());
@@ -2239,9 +2261,10 @@ TEST(DashCoinP2PPool, archival_rotation_is_bounded_and_never_churns_a_healthy_po
 // ── E-SUPERBLOCK C4: per-object vote sync — once per (peer, object) window ────
 // Dash Core v24 net_governance.cpp:116-133 records a per-object vote sync as a
 // fulfilled request and answers a repeat inside nFulfilledRequestExpireTime
-// (mainnet 1 h, testnet 5 min) with Misbehaving(20). Re-syncs at H - window
-// and H - 1 must therefore never re-ask the same peer for the same object
-// inside the window, while a DIFFERENT object or an expired window is fine.
+// (mainnet 1 h, testnet 5 min) with Misbehaving(20). Re-syncs at H - window,
+// H - late lead and H - 2 must therefore never re-ask the same peer for the
+// same object inside the window, while a DIFFERENT object or an expired
+// window is fine.
 TEST(DashCoinP2PPool, govsync_vote_sync_once_per_peer_object_window)
 {
     PoolRig rig;

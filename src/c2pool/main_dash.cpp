@@ -65,6 +65,7 @@
 #include <impl/dash/coin/rpc_conf.hpp>     // dash.conf creds resolution (rpcpassword off argv)
 #include <impl/dash/coin/node_interface.hpp>
 #include <impl/dash/coin/p2p_client.hpp>   // dash::coin::p2p::CoinClient — OPT-IN coin-network dial (E1, --coin-p2p-connect)
+#include <impl/dash/coin/compact_mempool_provider.hpp> // dash::coin::CompactMempoolBinding — #968a cmpctblock short ids vs the embedded mempool
 #include <impl/dash/coin/coin_peer_manager.hpp> // dash::coin::DashCoinPeerManager — DASH-ISOLATED scored/diverse peer discovery (--coin-p2p-discover; network-standalone gate)
 #include <impl/dash/coin/chain_seeds.hpp>  // dash::coin::dash_dns_seeds / dash_fixed_seeds — DASH mainnet/testnet seed bootstrap
 #include <impl/dash/coin/won_block_dispatch.hpp> // dash::coin::broadcast_won_block — S8 dual-path won-block dispatcher (embedded P2P primary + submitblock RPC backup)
@@ -92,6 +93,7 @@
 #include <impl/dash/coin/utxo_snapshot_import.hpp>  // S2: the full UTXO set from a pinned dumptxoutset snapshot
 #include <impl/dash/coin/utxo_status.hpp>            // S2: /local_stats utxo + [EMBED-STATUS] utxo=
 #include <impl/dash/coin/utxo_scan.hpp>              // N1: GET /api/utxo/scan (full-set script scan)
+#include <impl/dash/coin/mempool_probe_json.hpp>     // GET /mempool_entry (fee-parity shadow probe)
 #include <impl/dash/coin/inject_validate.hpp>        // N3: POST /api/tx-inject/validate reply
 #include <impl/dash/coin/header_chain.hpp>       // dash::coin::HeaderChain — SPV header/tip authority (E2a)
 #include <impl/dash/coin/block_confirm.hpp>      // dash::coin::block_confirm — post-broadcast confirm/orphan verdict
@@ -305,6 +307,12 @@ struct UtxoSnapshotCli {
     std::string import_file;          // --utxo-import FILE: import into the full-set dir and exit
 };
 UtxoSnapshotCli g_utxo_snapshot;
+
+// --mempool-entry-probe: wire GET /mempool_entry (fee-parity shadow tooling).
+// DEFAULT OFF: an unwired node answers 404, so a production node exposes
+// nothing new. Even on, the route answers only a direct local request.
+// File scope like g_utxo_snapshot: written once while parsing argv.
+bool g_mempool_entry_probe = false;
 
 // --embedded-mn-bridge-no-cursor (#91): DISABLE the bridge's resumable replay
 // cursor, so every process start replays the whole window from the pinned
@@ -631,12 +639,17 @@ void print_banner(const char* argv0)
         << "              running node that is not using that set; the next start opens it)\n"
         << "             (full UTXO set: import a pinned dumptxoutset into <net>/utxo_full_leveldb\n"
         << "              at start, then connect strictly from its base; alias --utxo-snapshot)\n"
+        << "           [--mempool-entry-probe]\n"
+        << "             (wire the direct-local GET /mempool_entry?txid= probe for the fee-parity\n"
+        << "              shadow; default off)\n"
         << "           [--embedded-tx-serve-own-set[=false]]\n"
         << "             (ALL embedded serving levers default ON when NO dashd arm is given —\n"
         << "              bare `--run` = daemonless, serves the FULL mempool + special txs (DIP\n"
         << "              types 1-4) + funded superblocks, reward-safe; =false opts each out)\n"
         << "           [--embedded-fresh-datum-race] [--embedded-fresh-datum-race-k N]\n"
         << "           [--embedded-getmnlistd-tracker]\n"
+        << "           [--embedded-compact-blocks[=false]]  (BIP 152 compact-block receive for new\n"
+        << "              tip bodies, default ON; =false fetches every body whole)\n"
         << "           [--embedded-fold-live PATH] [--embedded-fold-live-expect HASH]\n"
         << "           [--embedded-fold-checkscripts[=false]]\n"
         << "           [--embedded-tx-inject] [--embedded-tx-inject-hex FILE]\n"
@@ -3016,6 +3029,14 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // => the coin client keeps its stall-only rotation (byte-identical to
         // master); the setter only flips a member bool.
         coin_p2p->set_proactive_rotate_enabled(embedded_proactive_rotate);
+        // #968a: the operator's --coin-p2p-connect targets (the pinned local
+        // dashd among them) are never disconnected by Misbehaving(); neither
+        // is any loopback / private-LAN peer (p2p_client.hpp is_protected_peer).
+        {
+            std::set<std::string> protected_keys;
+            for (const auto& t : coin_p2p_targets) protected_keys.insert(t.to_string());
+            coin_p2p->set_protected_peer_keys(std::move(protected_keys));
+        }
 
         if (coin_p2p_discover_eff) {
             // ── Network-standalone arm: seed-discovered, SCORED, group-diverse
@@ -3462,6 +3483,20 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             [source = utxo_scan_source](const std::string& query, const std::atomic<bool>& cancel) {
                 return source->handle(query, cancel);
             });
+        // GET /mempool_entry?txid=HEX (--mempool-entry-probe, direct-local,
+        // read-only): one entry's template candidacy for the fee-parity shadow
+        // comparator. Runs on the producer thread (thread_safe_wrap), so
+        // node_coin_state is alive. Off by default: unwired answers 404.
+        if (g_mempool_entry_probe) {
+            web_server->get_mining_interface()->set_mempool_entry_fn(
+                [&node_coin_state](std::string txid_hex) -> nlohmann::json {
+                    uint256 txid;
+                    txid.SetHex(txid_hex);
+                    return dash::coin::mempool_probe_json(
+                        txid, node_coin_state.mempool().probe(txid));
+                });
+            std::cout << "[run] --mempool-entry-probe: GET /mempool_entry wired (direct-local only)\n";
+        }
     }
     // ── IS/CL MINING-SAFETY HOLD arming (dashd TestPackageTransactions) ─────
     // dashd's miner refuses any not-yet-islocked tx with vins younger than 10
@@ -3492,6 +3527,20 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         arm_is_hold();   // seed posture now (mainnet seed: both active)
         coin_p2p->set_spork_change_callback(arm_is_hold);
     }
+    // #968a slice 3b: BIP 152 cmpctblock short ids are matched against THIS
+    // node's embedded Mempool (compact_mempool_provider.hpp), so a compact
+    // block whose txs we already hold completes without a getblocktxn round
+    // trip. A wrong tx that matches by short id is caught by the receiver's
+    // merkle bind, and the full block is fetched. Declared AFTER
+    // node_coin_state, so it is destroyed BEFORE it: the destructor takes the
+    // provider out of coin_p2p while the Mempool is still alive. coin_p2p is
+    // declared earlier and can outlive this scope (set_lifetime pins it per
+    // async op), so without this it would keep a provider pointing into a
+    // freed Mempool. No coin-P2P arm => nothing is bound.
+    dash::coin::CompactMempoolBinding<dash::coin::p2p::CoinClient<dash::Config>>
+        cmpct_mempool_binding;
+    if (coin_p2p)
+        cmpct_mempool_binding.bind(coin_p2p, node_coin_state.mempool());
     // #107 PHASE 2 (--embedded-accrue-asset-locks): DEFAULT OFF. When ON the
     // embedded CbTx creditPoolBalance accrues the pending type-8 asset-lock term
     // dashd commits, so the gbt-xcheck-modulo-special-explained swap stops
@@ -5502,6 +5551,12 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // subscriptions -> lane -> maintainer -> header_chain.
     std::unique_ptr<dash::coin::MnCheckpointLane> mn_ckpt_lane;
     std::vector<std::shared_ptr<EventDisposable>> coin_feed_subs;
+    // #968a: the header chain the cmpctblock gate reads. Declared AFTER
+    // header_chain, so it is destroyed BEFORE it: the destructor takes the
+    // view out of coin_p2p (which can outlive this scope, see
+    // cmpct_mempool_binding above) while the chain is still alive.
+    dash::coin::CompactChainViewBinding<dash::coin::p2p::CoinClient<dash::Config>>
+        cmpct_chain_binding;
     // ── W2 replay bulk-fetch locals (--replay-bulk; replay_bulk_fetch.hpp) ──
     // Declared AFTER header_chain (they read it) so they unwind FIRST at
     // return; the timer is last so its callbacks stop before the lane dies.
@@ -5622,6 +5677,27 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         }
     } v24_status_uninstall{testnet ? dash::coin::DashNetwork::TESTNET
                                    : dash::coin::DashNetwork::MAINNET, nullptr, nullptr};
+    // Head scoring's block-solution credit reads the header chain through this
+    // oracle (the tracker's m_expected_block_bits). Declared after
+    // header_chain, so it is destroyed first: it detaches under the oracle's
+    // mutex, after which a think() cycle gets nullopt (no credit) instead of
+    // reading freed headers; a call in flight finishes before the detach.
+    struct BlockBitsOracle {
+        std::mutex m;
+        const dash::coin::HeaderChain* hc{nullptr};
+    };
+    struct BlockBitsOracleDetach {
+        std::shared_ptr<BlockBitsOracle> oracle = std::make_shared<BlockBitsOracle>();
+        ~BlockBitsOracleDetach()
+        {
+            std::lock_guard<std::mutex> lk(oracle->m);
+            oracle->hc = nullptr;
+        }
+    } block_bits_oracle;
+    if (!coin_p2p)
+        LOG_WARNING << "[HEAD-SCORE] block-solution credit OFF: no coin header chain on this node"
+                       " (no coin-P2P feed), so a block-solving share scores as a plain share here"
+                       " while nodes with a header chain prefer it";
     if (coin_p2p) {
         const auto dash_params = testnet
             ? dash::coin::make_dash_chain_params_testnet()
@@ -5630,6 +5706,24 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             / net_subdir / "dash_headers").string();
         header_chain = std::make_unique<dash::coin::HeaderChain>(dash_params, hdr_db);
         header_chain->init();
+
+        // Head scoring credits a block-solution share only when its header
+        // bits are the network target for its parent block, as this header
+        // chain computes it (DGW over a complete window on our best chain).
+        {
+            std::lock_guard<std::mutex> lk(block_bits_oracle.oracle->m);
+            block_bits_oracle.oracle->hc = header_chain.get();
+        }
+        p2p_node.tracker().m_expected_block_bits =
+            [oracle = block_bits_oracle.oracle](const uint256& prev_block, int64_t block_time)
+                -> std::optional<uint32_t> {
+                std::lock_guard<std::mutex> lk(oracle->m);
+                if (!oracle->hc) return std::nullopt;
+                return oracle->hc->expected_bits_after(prev_block, block_time,
+                                                       dash::BLOCK_CREDIT_MAX_PARENT_DEPTH);
+            };
+        LOG_INFO << "[HEAD-SCORE] block-solution credit ARMED: a block-solving share's header"
+                    " bits are checked against this node's header chain";
 
         // CROSS-LANE ASYMMETRY CLOSED: HeaderChain::is_synced() was DEFINED
         // AND NEVER CALLED on the DASH path (bch 13 callers, ltc 12, nmc 12,
@@ -6558,7 +6652,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 node_coin_state.set_require_superblock_provider(embedded_superblock);
                 // C4: chainparams nSuperblockMaturityWindow (Dash Core v24
                 // chainparams.cpp: mainnet 1662, testnet 8) — the per-trigger
-                // vote re-sync fires at tip H - window and H - 1.
+                // vote re-sync fires at tip H - window, H - late lead and
+                // H - 2 (after the deferred 24.0.1 NO votes; never H - 1).
                 maintainer->set_superblock_maturity_window(
                     testnet ? dash::coin::DASH_SUPERBLOCK_MATURITY_WINDOW_TESTNET
                             : dash::coin::DASH_SUPERBLOCK_MATURITY_WINDOW_MAINNET);
@@ -7926,6 +8021,12 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // Node::block_connected, driving leg 3 + the E2b UTXO lane.
         coin_feed_subs.push_back(
             dash::coin::wire_full_block_ingest(coin_state, *header_chain));
+        // #968a: BIP 152 compact blocks need the header chain (the cmpctblock
+        // gate: parent known, PoW, header connected before the body) and the
+        // mempool (short ids, bound above). With both wired, a new tip body is
+        // requested as MSG_CMPCT_BLOCK and up to three peers that served us
+        // tips are asked to push cmpctblock (p2p_client.hpp).
+        cmpct_chain_binding.bind(coin_p2p, *header_chain);
 
         // ── PR-C1 (embedded-fold-live) LIVE tip-tracking wiring ──────────────
         // Armed only when --embedded-fold-live opened + VERIFIED a store above.
@@ -8879,9 +8980,10 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             });
 
         // E-SUPERBLOCK C4: the maintainer re-requests each held trigger's
-        // votes at tip H - maturity window and H - 1 (per-object govsync with
-        // a non-empty filter — never the nProp=0 full sync) and fetches the
-        // parent object of any orphan FUNDING YES vote. The client enforces
+        // votes at tip H - maturity window, H - late lead and H - 2
+        // (per-object govsync with a non-empty filter — never the nProp=0
+        // full sync) and fetches the parent object of any orphan FUNDING YES
+        // vote. The client enforces
         // the once-per-(peer, object) window dashd v24 tracks as a fulfilled
         // request (repeat => Misbehaving(20)): nFulfilledRequestExpireTime is
         // 3600 s on mainnet and 300 s on testnet (chainparams.cpp), + margin.
@@ -12813,6 +12915,8 @@ int main(int argc, char** argv)
             g_utxo_snapshot.full_off = true;        // S2: rollback to the accrual view
         else if (std::strcmp(argv[i], "--utxo-import") == 0 && i + 1 < argc)
             g_utxo_snapshot.import_file = argv[++i];  // S2: offline import, exits
+        else if (std::strcmp(argv[i], "--mempool-entry-probe") == 0)
+            g_mempool_entry_probe = true;
         else if (std::strcmp(argv[i], "--explorer") == 0)
             explorer_enabled = true;
         else if (std::strcmp(argv[i], "--no-explorer") == 0)
@@ -12879,6 +12983,14 @@ int main(int argc, char** argv)
             dash::coin::set_embedded_getmnlistd_tracker_enabled(true);
         else if (std::strcmp(argv[i], "--embedded-getmnlistd-tracker=false") == 0)
             dash::coin::set_embedded_getmnlistd_tracker_enabled(false);
+        // #968a --embedded-compact-blocks[=false] (default ON): ask for a new
+        // tip body as getdata(MSG_CMPCT_BLOCK) and rebuild it from the mempool.
+        // =false is the canary kill switch: every body is fetched whole, any
+        // cmpctblock is dropped. Process-wide flag (compact_negotiation.hpp).
+        else if (std::strcmp(argv[i], "--embedded-compact-blocks") == 0)
+            dash::coin::set_embedded_compact_blocks_enabled(true);
+        else if (std::strcmp(argv[i], "--embedded-compact-blocks=false") == 0)
+            dash::coin::set_embedded_compact_blocks_enabled(false);
         else if (std::strcmp(argv[i], "--embedded-asn-diversity") == 0)
             embedded_asn_diversity = true;   // PR-4: require racing set to span >=2 ASNs
         else if (std::strcmp(argv[i], "--embedded-asn-diversity=false") == 0)

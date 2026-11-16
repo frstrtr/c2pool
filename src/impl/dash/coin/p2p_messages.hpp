@@ -143,6 +143,12 @@ BEGIN_MESSAGE(blocktxn)
     }
 END_MESSAGE()
 
+// Dash Core protocol.h GetDataMsg: MSG_CMPCT_BLOCK = 20 (BIP 152, "defined in
+// BIP152"; Dash renumbered it, Bitcoin uses 4). bitcoin_family's
+// inventory_type::cmpct_block is Bitcoin's 4 and must never go on a Dash wire.
+inline constexpr inventory_type::inv_type DASH_MSG_CMPCT_BLOCK =
+    static_cast<inventory_type::inv_type>(20);
+
 BEGIN_MESSAGE(clsig)
     MESSAGE_FIELDS
     (

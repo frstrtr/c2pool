@@ -7,6 +7,9 @@
     <link rel="shortcut icon" type="image/x-icon" href="favicon.ico" />
     <script type="text/javascript" src="d3.v2.min.js"></script>
     <script type="text/javascript" src="multipool.js"></script>
+    <!-- The one squarify (sharechain-explorer/src/pplns/squarify.ts) as a
+         classic script: defines C2PLayout. ?v= = content hash (npm run stamp). -->
+    <script type="text/javascript" src="sharechain-explorer/dist/layout.js?v=be69538d"></script>
     <style>
         :root {
             --primary: #008de4;
@@ -369,7 +372,6 @@
             <h1 style="font-size: 1.3rem; font-weight: 600; color: #008de4; margin: 0;">c2pool Share</h1>
             <nav style="display:flex;gap:8px;flex-wrap:wrap">
                 <a href="dashboard.html" style="color:#e0e0e0;text-decoration:none;padding:6px 14px;border-radius:6px;font-size:0.85rem;background:#16162a">Dashboard</a>
-                <a href="graphs.html" style="color:#e0e0e0;text-decoration:none;padding:6px 14px;border-radius:6px;font-size:0.85rem;background:#16162a">Graphs</a>
                 <a href="stratum.html" style="color:#e0e0e0;text-decoration:none;padding:6px 14px;border-radius:6px;font-size:0.85rem;background:#16162a">Stratum</a>
                 <a href="miners.html" style="color:#e0e0e0;text-decoration:none;padding:6px 14px;border-radius:6px;font-size:0.85rem;background:#16162a">Miners</a>
             </nav>
@@ -802,6 +804,11 @@
                     grid.style.height = h + 'px';
                     grid.innerHTML = '';
 
+                    if (typeof C2PLayout === 'undefined' || typeof C2PLayout.squarify !== 'function') {
+                        grid.innerHTML = '<div style="padding:12px;color:#ff6b6b">'
+                            + 'Treemap layout module failed to load (sharechain-explorer/dist/layout.js).</div>';
+                        return;
+                    }
                     var rects = pplnsTreemap(_shareEntries, 0, 0, w, h);
                     var minerAddr = _shareMinerAddr;
                     var addrPrefix = ci.address_explorer_url_prefix || '';
@@ -987,56 +994,15 @@
             return ((h % 360) + 360) % 360;
         }
 
+        // Squarified treemap via the one squarify in web-static
+        // (C2PLayout, sharechain-explorer/dist/layout.js), keeping this
+        // view's 1 px minimum strip.
         function pplnsTreemap(data, x, y, w, h) {
-            var rects = [];
-            var items = data.map(function(d) { return { addr: d.addr, pct: d.pct, amt: d.amt, doge: d.doge || 0, dogeAddr: d.dogeAddr || '', area: d.pct }; });
-            _tmLayout(items, x, y, w, h, rects);
-            return rects;
-        }
-
-        function _tmLayout(items, x, y, w, h, rects) {
-            if (items.length === 0 || w <= 0 || h <= 0) return;
-            var totalArea = 0;
-            items.forEach(function(it) { totalArea += it.area; });
-            if (totalArea <= 0) return;
-            var vertical = w >= h;
-            var mainSize = vertical ? h : w;
-            var crossSize = vertical ? w : h;
-            var row = [], rowArea = 0, remaining = items.slice();
-
-            while (remaining.length > 0) {
-                row.push(remaining[0]);
-                rowArea += remaining[0].area;
-                remaining.shift();
-                if (remaining.length === 0) break;
-                var stripNow = (rowArea / totalArea) * crossSize;
-                var stripNext = ((rowArea + remaining[0].area) / totalArea) * crossSize;
-                var worstNow = _tmWorst(row, rowArea, stripNow, mainSize);
-                var worstNext = _tmWorst(row.concat([remaining[0]]), rowArea + remaining[0].area, stripNext, mainSize);
-                if (worstNext > worstNow && row.length >= 1) break;
-            }
-            var stripSize = Math.max(1, (rowArea / totalArea) * crossSize);
-            var offset = 0;
-            for (var i = 0; i < row.length; i++) {
-                var sz = (row[i].area / rowArea) * mainSize;
-                if (vertical) rects.push({ x: x, y: y+offset, w: stripSize, h: sz, addr: row[i].addr, pct: row[i].pct, amt: row[i].amt, doge: row[i].doge, dogeAddr: row[i].dogeAddr });
-                else rects.push({ x: x+offset, y: y, w: sz, h: stripSize, addr: row[i].addr, pct: row[i].pct, amt: row[i].amt, doge: row[i].doge, dogeAddr: row[i].dogeAddr });
-                offset += sz;
-            }
-            if (remaining.length > 0) {
-                if (vertical) _tmLayout(remaining, x+stripSize, y, w-stripSize, h, rects);
-                else _tmLayout(remaining, x, y+stripSize, w, h-stripSize, rects);
-            }
-        }
-
-        function _tmWorst(row, rowArea, strip, main) {
-            var worst = 0;
-            for (var i = 0; i < row.length; i++) {
-                var sz = (row[i].area / rowArea) * main;
-                var a = Math.max(sz / strip, strip / sz);
-                if (a > worst) worst = a;
-            }
-            return worst;
+            return C2PLayout.squarify(data.map(function(d) { return { area: d.pct, data: d }; }), x, y, w, h, { minStrip: 1 })
+                .map(function(r) {
+                    var d = r.data;
+                    return { x: r.x, y: r.y, w: r.w, h: r.h, addr: d.addr, pct: d.pct, amt: d.amt, doge: d.doge || 0, dogeAddr: d.dogeAddr || '' };
+                });
         }
 
         function reload(currency_info) {

@@ -56,3 +56,37 @@ TEST(LtcWorkTarget, AverageAttemptsToTargetSaturatesAboveU64)
     EXPECT_NO_THROW((void)average_attempts_to_target(1e18));
     EXPECT_NO_THROW((void)average_attempts_to_target(1e30));
 }
+
+// Cap 2 (dust) applies at a zero local rate, as p2pool's get_work does
+// (work.py 3020-3028: expected_payout_per_block = local_addr_rates.get(
+// pubkey_hash, 0) / pool_aps * subsidy * (1 - donation) = 0 < DUST, whatever
+// the rate). c2pool applied it only to a rate > 0, so a job without a rate
+// (a new connection, no pseudoshare recorded yet) got the easiest target
+// instead of the dust one. LTC mainnet: block bits 0x192d56b7 (difficulty
+// ~94.7M), subsidy 6.25537917 LTC, DUST 0.03 LTC, SPREAD 3. Derive (python3):
+//   t = 0x2d56b7 << 8*(0x19-3); a = 2**256 // (t+1)
+//   n = int(float(a) * 3 * 3000000.0 / 625537917.0)
+//   "%064x" % (2**256 // n - 1)
+TEST(LtcWorkTarget, DustRuleAppliesAtZeroRate)
+{
+    JobTargetInputs in;
+    in.local_hash_rate = 0.0;
+    in.share_period = 15;
+    in.pool_aps = 1.455e11;
+    in.subsidy = 625537917;
+    in.donation_percent = 1.0;
+    in.dust_threshold = 3000000;
+    in.spread = 3;
+    in.block_bits = 0x192d56b7;
+    const char* DUST_HEX = "0000000000000c4f3b94aabd0a821d4c4d169a5f7f3743232985928b86e61c38";
+    EXPECT_EQ(job_desired_share_target(in).GetHex(), DUST_HEX) << "no rate: the dust target, not 2**256-1";
+
+    // A rate too small for Cap 1 and for DUST: the same target.
+    in.local_hash_rate = 1e-6;
+    EXPECT_EQ(job_desired_share_target(in).GetHex(), DUST_HEX);
+
+    // No chain an hour deep (no pool rate): no Cap 2; no rate: no Cap 1.
+    in.local_hash_rate = 0.0;
+    in.pool_aps = 0.0;
+    EXPECT_EQ(job_desired_share_target(in).GetHex(), MAX_TARGET_HEX);
+}

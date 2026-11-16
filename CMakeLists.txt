@@ -6,6 +6,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Reproducible builds: remap source/build/Conan-cache absolute paths in compiled
 # output (docs/xmr-lane/REPRODUCIBLE-BUILD.md). Before any add_subdirectory().
 include(${CMAKE_SOURCE_DIR}/cmake/ReproducibleBuild.cmake)
+# c2pool_linux_package_runpath(): $ORIGIN-relative RUNPATH for the binaries and
+# shared objects the Linux release tarball ships (see the module header).
+include(${CMAKE_SOURCE_DIR}/cmake/LinuxPackageRunpath.cmake)
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Release)
@@ -258,6 +261,17 @@ if(C2POOL_DASH_BLS AND NOT C2POOL_DASH_BLS_AVAILABLE)
     else()
         message(FATAL_ERROR ${_dashbls_miss})
     endif()
+endif()
+# Say it at configure time, not only at runtime (#1671): without dashbls the
+# c2pool-dash target still builds, as bls=stub, and that binary refuses the
+# daemonless posture (a bare `c2pool-dash --run`). The release packages ship
+# bls=dashbls. Other coins are unaffected. src/c2pool/CMakeLists.txt repeats
+# this after c2pool-dash links, so it is the last thing such a build prints.
+if(NOT C2POOL_DASH_BLS_AVAILABLE)
+    message(STATUS "c2pool-dash: dashbls NOT linked -> bls=stub (daemonless start "
+                   "refused). For a production DASH node configure with "
+                   "-DC2POOL_DASH_BLS=ON -DDASHBLS_ROOT=<prefix> "
+                   "(scripts/build_dashbls.sh; README \"Dash: build with BLS\").")
 endif()
 
 # Enable testing only if GTest is found

@@ -9,6 +9,10 @@
     <script src="multipool.js"></script>
     <script src="highcharts.js"></script>
     <script src="highcharts-exporting.js"></script>
+    <!-- The one squarify (sharechain-explorer/src/pplns/squarify.ts) as a
+         classic script: defines C2PLayout for the treemaps below. The ?v=
+         stamp is the file's content hash (npm run stamp). -->
+    <script src="sharechain-explorer/dist/layout.js?v=be69538d"></script>
     <style>
         :root {
             --primary: #008de4;
@@ -1752,7 +1756,6 @@
                     <a href="dashboard.html" class="active">Dashboard</a>
                     <a href="#pplns-section">PPLNS</a>
                     <a href="#sharechain-section">Sharechain</a>
-                    <a href="graphs.html">Graphs</a>
                     <a href="stratum.html">Stratum</a>
                     <a href="miners.html">Miners</a>
                     <a href="javascript:manualRefresh()" class="refresh-btn" title="Refresh data">🔄 Refresh</a>
@@ -2104,8 +2107,8 @@
                                 <th>Block Hash</th>
                                 <th>Luck</th>
                                 <th title="Time to find block (actual/expected)">Round</th>
-                                <th title="Network difficulty target">Net Diff</th>
-                                <th title="Actual hash difficulty">Hash Diff</th>
+                                <th title="Network difficulty, shown as the hashrate it implies at this coin's block time (hover a cell for the difficulty)">Net Diff</th>
+                                <th title="Difficulty the found block hash met, shown as the hashrate it implies at this coin's block time (hover a cell for the difficulty)">Hash Diff</th>
                                 <th title="Block status">✓</th>
                             </tr>
                         </thead>
@@ -2456,6 +2459,26 @@
     </footer>
     
     <script>
+        // BEGIN c2pLayout
+        // Treemap layout: the one squarify in web-static, loaded in <head>
+        // as sharechain-explorer/dist/layout.js (global C2PLayout). The
+        // legacy views keep the 1 px minimum strip they always had, so
+        // sub-pixel miners still show as a sliver.
+        function c2pLayoutReady() {
+            return typeof C2PLayout !== 'undefined' && typeof C2PLayout.squarify === 'function';
+        }
+        function c2pSquarify(items, x, y, w, h) {
+            if (!c2pLayoutReady()) {
+                if (!c2pSquarify._warned) {
+                    c2pSquarify._warned = true;
+                    console.error('[c2pool] sharechain-explorer/dist/layout.js did not load; treemaps are disabled');
+                }
+                return [];
+            }
+            return C2PLayout.squarify(items, x, y, w, h, { minStrip: 1 });
+        }
+        // END c2pLayout
+
         // Utility functions
         function format_dt(dt) {
             if (dt < 0) dt = 0;
@@ -2491,6 +2514,28 @@
             if (d < 1000) return d3.format('.2f')(d) + ' T';
             d = d / 1000;
             return d3.format('.2f')(d) + ' P';
+        }
+
+        // A block's difficulty SHOWN as the hashrate it implies (difficulty x 2^32 /
+        // block period), so miners can compare it with their own PH/s. The block
+        // period is the coin's own (currency_info.block_period; 150 s until loaded).
+        function block_period_sec() {
+            return (typeof parentBlockPeriodMs !== 'undefined' && parentBlockPeriodMs > 0)
+                ? parentBlockPeriodMs / 1000 : 150;
+        }
+        function diff_as_hashrate(diff) {
+            return format_hashrate(Math.floor(diff * Math.pow(2, 32) / block_period_sec()));
+        }
+        // "pdiff" (difficulty x 65536) is the Scrypt pool-difficulty convention
+        // (LTC/DOGE). X11 (DASH) and SHA256 coins have no such factor.
+        function is_scrypt_coin() {
+            var sym = (window.currency_info && window.currency_info.symbol) || '';
+            return /^t?(LTC|DOGE)$/i.test(sym);
+        }
+        function diff_detail(diff) {
+            var s = 'difficulty ' + d3.format(',.2f')(diff) + ' (' + format_difficulty(diff) + ')';
+            if (is_scrypt_coin()) s += ', pdiff ' + d3.format('.2e')(diff * 65536);
+            return s;
         }
 
         // Coin-generic finder attribution for a /recent_blocks row (#901).
@@ -3265,8 +3310,12 @@
                 legendNative: 'V36 (others)', legendSignaling: 'V36 signaling',
                 legendStale: 'V35 only'
             },
+            // DASH's share version is the network's: V16 on the legacy chain,
+            // V36 on the v36 network. fromLive: the labels and the cutoff
+            // follow /v36_status auto_ratchet.live_share_version once it is
+            // known (liveShareVersionDescriptor); V16 is the default until then.
             DASH: {
-                threshold: 16, signaling: false,
+                threshold: 16, signaling: false, fromLive: true,
                 statNative: 'V16 Current', statSignaling: null,
                 legendNative: 'V16 (others)', legendSignaling: null,
                 legendStale: 'Below V16'
@@ -3285,6 +3334,48 @@
         function shareVersionDescriptor(sym) {
             return SHARE_VERSION_DESCRIPTORS[(sym || '').toUpperCase()]
                 || SHARE_VERSION_DESCRIPTORS.LTC;
+        }
+        // BEGIN c2pLiveShareVersion (tested by sharechain-explorer/tests/unit/dashboard-window-blocks.test.ts)
+        // A fromLive descriptor (DASH) named after the live share version:
+        // "V36 Current" / "V36 (others)" / "Below V36" on a V36 chain. Any
+        // other descriptor, or no live version yet, is returned unchanged.
+        function liveShareVersionDescriptor(base, live) {
+            if (!base || !base.fromLive || typeof live !== 'number' || !(live > 0)) return base;
+            return {
+                threshold: live, signaling: false, fromLive: true,
+                statNative: 'V' + live + ' Current', statSignaling: null,
+                legendNative: 'V' + live + ' (others)', legendSignaling: null,
+                legendStale: 'Below V' + live
+            };
+        }
+        // END c2pLiveShareVersion
+        // The live share version from /v36_status (null until it arrives).
+        window.__liveShareVersion = null;
+        // Write a descriptor's stat/legend labels and make it the active one.
+        function applyShareVersionDescriptor(vdesc) {
+            window.__shareVersionDescriptor = vdesc;
+            function setText(id, txt) {
+                var el = document.getElementById(id);
+                if (el && typeof txt === 'string') el.textContent = txt;
+            }
+            setText('stat-native-label', vdesc.statNative);
+            setText('legend-native-label', vdesc.legendNative);
+            setText('legend-stale-label', vdesc.legendStale);
+            var sr = document.getElementById('stat-signaling-row');
+            var li = document.getElementById('legend-signaling-item');
+            if (vdesc.signaling) {
+                setText('stat-signaling-label', vdesc.statSignaling);
+                setText('legend-signaling-label', vdesc.legendSignaling);
+                if (sr) sr.style.display = '';
+                if (li) li.style.display = '';
+            } else {
+                // No pending version boundary — hide signaling stat + legend.
+                if (sr) sr.style.display = 'none';
+                if (li) li.style.display = 'none';
+            }
+            // Payouts version-column header follows the coin threshold too
+            // (LTC family keeps "V36?", DASH renders its live version).
+            setText('payouts-version-th', 'V' + vdesc.threshold + '?');
         }
         // Effective descriptor for the active coin; defaults to LTC until
         // currency_info resolves. Read by defrag.updateStats for the
@@ -3363,32 +3454,8 @@
             // Drives the native/signaling/stale entries off the coin's own
             // version descriptor so a coin without LTC's V35->V36 crossing
             // (e.g. DASH's V16 tip) never renders LTC's version scheme.
-            var vdesc = shareVersionDescriptor(sym);
-            window.__shareVersionDescriptor = vdesc;
-            function setText(id, txt) {
-                var el = document.getElementById(id);
-                if (el && typeof txt === 'string') el.textContent = txt;
-            }
-            setText('stat-native-label', vdesc.statNative);
-            setText('legend-native-label', vdesc.legendNative);
-            setText('legend-stale-label', vdesc.legendStale);
-            if (vdesc.signaling) {
-                setText('stat-signaling-label', vdesc.statSignaling);
-                setText('legend-signaling-label', vdesc.legendSignaling);
-                var sr = document.getElementById('stat-signaling-row');
-                if (sr) sr.style.display = '';
-                var li = document.getElementById('legend-signaling-item');
-                if (li) li.style.display = '';
-            } else {
-                // No pending version boundary — hide signaling stat + legend.
-                var sr2 = document.getElementById('stat-signaling-row');
-                if (sr2) sr2.style.display = 'none';
-                var li2 = document.getElementById('legend-signaling-item');
-                if (li2) li2.style.display = 'none';
-            }
-            // Payouts version-column header follows the coin threshold too
-            // (LTC family keeps "V36?", DASH renders "V16?").
-            setText('payouts-version-th', 'V' + vdesc.threshold + '?');
+            applyShareVersionDescriptor(
+                liveShareVersionDescriptor(shareVersionDescriptor(sym), window.__liveShareVersion));
 
             d3.select('#parent_chain_peers_title').text(chainName);
             if (info && info.block_period) {
@@ -3514,6 +3581,14 @@
             var pct = sc.v36_percentage;          // work-weighted signalling %
             var live = ar.live_share_version;
             var active = ar.v36_active;
+            if (typeof live === 'number' && live !== window.__liveShareVersion) {
+                window.__liveShareVersion = live;
+                var csym = (window.currency_info && window.currency_info.symbol) || '';
+                if (csym) {
+                    var cbase = shareVersionDescriptor(csym);
+                    if (cbase.fromLive) applyShareVersionDescriptor(liveShareVersionDescriptor(cbase, live));
+                }
+            }
             // Visibility gate (operator design point on #921): show the crossing card
             // ONLY while a cross is genuinely underway or done. A quiet pre-crossing
             // node (voting, 0% signalled, not latched) must not render a card at all --
@@ -4528,6 +4603,9 @@
         
         function loadBlocks() {
             d3.json('../recent_blocks', function(blocks) {
+                // The window panel's "Blocks in Window" reads the whole ledger
+                // (c2pWindowBlocks), not only the 10 rows the table shows.
+                window.c2pRecentBlocks = blocks || [];
                 d3.select('#blocks_loading').style('display', 'none');
                 // Clear existing rows before adding new data
                 d3.select('#blocks tbody').selectAll('tr').remove();
@@ -4622,16 +4700,11 @@
                             expected = (b.network_difficulty * Math.pow(2, 32)) / b.pool_hashrate_at_find;
                         }
                         
-                        var formatTime = function(seconds) {
-                            var hours = Math.floor(seconds / 3600);
-                            var mins = Math.floor((seconds % 3600) / 60);
-                            return ('0' + hours).slice(-2) + ':' + ('0' + mins).slice(-2);
-                        };
-                        
-                        var exp = expected > 0 ? formatTime(expected) : '--:--';
-                        var act = actual > 0 ? formatTime(actual) : '--:--';
+                        // Adaptive units: a 107 s find reads "1m 47s", not a truncated "00:01".
+                        var exp = expected > 0 ? format_duration(expected) : '-';
+                        var act = actual > 0 ? format_duration(actual) : '-';
                         // Display as actual/expected since that's more intuitive (time taken vs time expected)
-                        return act + '/' + exp;
+                        return act + ' / ' + exp;
                     })
                     .attr('title', function(b) {
                         var actual = b.time_to_find || 0;
@@ -4649,27 +4722,31 @@
                         var act = actual > 0 ? format_dt(actual) : 'unknown';
                         return 'Actual: ' + act + '\nExpected: ' + exp;
                     });
+                // Net Diff / Hash Diff are SHOWN as a hashrate (diff_as_hashrate) so
+                // miners can compare them with their own PH/s; the tooltip carries the
+                // difficulty itself.
                 tr.append('td')
                     .text(function(b) {
                         if (!b.network_difficulty) return '-';
-                        var hashrate = Math.floor(b.network_difficulty * Math.pow(2, 32) / 150);
-                        return format_hashrate(hashrate);
+                        return diff_as_hashrate(b.network_difficulty);
                     })
                     .attr('title', function(b) {
                         if (!b.network_difficulty) return '';
-                        var pdiff = b.network_difficulty * 65536;
-                        return 'bdiff: ' + d3.format(',.2f')(b.network_difficulty) + '\npdiff: ' + d3.format('.2e')(pdiff);
+                        return 'Network ' + diff_detail(b.network_difficulty) +
+                            '\nShown as hashrate: difficulty x 2^32 / ' + block_period_sec() + ' s block time';
                     });
                 tr.append('td')
                     .text(function(b) {
                         if (!b.actual_hash_difficulty) return '-';
-                        var hashrate = Math.floor(b.actual_hash_difficulty * Math.pow(2, 32) / 150);
-                        return format_hashrate(hashrate);
+                        return diff_as_hashrate(b.actual_hash_difficulty);
                     })
                     .attr('title', function(b) {
                         if (!b.actual_hash_difficulty) return '';
-                        var pdiff = b.actual_hash_difficulty * 65536;
-                        return 'bdiff: ' + d3.format(',.2f')(b.actual_hash_difficulty) + '\npdiff: ' + d3.format('.2e')(pdiff);
+                        return 'Block hash ' + diff_detail(b.actual_hash_difficulty) +
+                            (b.network_difficulty
+                                ? '\n' + d3.format('.2f')(b.actual_hash_difficulty / b.network_difficulty) + 'x the network difficulty'
+                                : '') +
+                            '\nShown as hashrate: difficulty x 2^32 / ' + block_period_sec() + ' s block time';
                     });
                 tr.append('td')
                     .attr('class', function(b) {
@@ -5125,21 +5202,62 @@
                             .attr('target', '_blank')
                             .attr('title', merged.symbol + ': ' + merged.address)
                             .text(merged.address);
-                        // p2pool-style source labels
+                        // Source labels (/current_merged_payouts "source"):
+                        // explicit = the miner's shares gave this merged address
+                        // (stratum login PARENT,MERGED); auto-convert = derived from
+                        // the parent address key (same hash160), no merged address
+                        // in the login. From the 3601 flag day each share pays a
+                        // merged chain only to its own merged address, else to its
+                        // own parent key.
+                        var _psym = (typeof currency_info !== 'undefined' && currency_info.symbol) || 'LTC';
                         if (merged.source === 'auto-convert') {
                             addrCell.append('span')
                                 .style('color', '#b08800')
                                 .style('font-size', '0.6rem')
                                 .style('margin-left', '4px')
-                                .attr('title', 'Auto-converted from parent chain address (same pubkey hash). During V35\u2192V36 transition, all merged addresses are auto-converted since V35 shares cannot carry explicit merged addresses.')
+                                .attr('title', 'Derived from this miner\'s ' + _psym + ' address key (same hash160): no '
+                                    + merged.symbol + ' address was given in the login. The coins belong to the owner of the '
+                                    + _psym + ' key. To be paid to your own ' + merged.symbol + ' wallet, log in as '
+                                    + _psym + '_ADDRESS,' + merged.symbol + '_ADDRESS.worker')
                                 .text('\u26A0 auto');
+                            if (merged.parent_p2sh) {
+                                // A P2SH parent paid as the same P2SH on the merged chain:
+                                // a segwit-wrapped wallet address (M...) becomes spendable
+                                // by anyone there (no segwit) once its redeem script is public.
+                                addrCell.append('div')
+                                    .style('color', '#dc3545')
+                                    .style('font-size', '0.65rem')
+                                    .style('font-weight', 'bold')
+                                    .style('margin-left', '20px')
+                                    .attr('title', 'The ' + _psym + ' address is a P2SH address, paid as the same P2SH on '
+                                        + merged.symbol + '. If it is a segwit-wrapped wallet address (P2SH-P2WPKH/P2WSH, e.g. M...), '
+                                        + 'give your ' + merged.symbol + ' address explicitly (' + _psym + '_ADDRESS,' + merged.symbol
+                                        + '_ADDRESS); on ' + merged.symbol + ' (no segwit) such an output becomes spendable by anyone '
+                                        + 'once the redeem script is public.')
+                                    .text('\u2757 P2SH ' + _psym + ' address: give your ' + merged.symbol + ' address explicitly ('
+                                        + _psym + '_ADDRESS,' + merged.symbol + '_ADDRESS)');
+                            }
                         } else if (merged.source === 'explicit') {
                             addrCell.append('span')
                                 .style('color', '#28a745')
                                 .style('font-size', '0.6rem')
                                 .style('margin-left', '4px')
-                                .attr('title', 'Explicit merged chain address provided by miner via stratum username')
+                                .attr('title', 'Explicit ' + merged.symbol + ' address given by the miner in the stratum login ('
+                                    + _psym + '_ADDRESS,' + merged.symbol + '_ADDRESS.worker)')
                                 .text('\u2713 explicit');
+                        }
+                        if (merged.fraction !== undefined && merged.output_amount !== undefined) {
+                            // One merged address given by several parent addresses:
+                            // this row is this parent's part of the output by PPLNS weight.
+                            addrCell.append('span')
+                                .style('color', 'var(--text-muted)')
+                                .style('font-size', '0.6rem')
+                                .style('margin-left', '4px')
+                                .attr('title', 'This ' + merged.symbol + ' address is also given by other '
+                                    + _psym + ' addresses: the output is '
+                                    + d3.format(',.8f')(merged.output_amount) + ' ' + merged.symbol
+                                    + '; this row is this ' + _psym + ' address\'s part by PPLNS weight.')
+                                .text('(' + d3.format('.1%')(merged.fraction) + ' of output)');
                         }
                         
                         subRow.append('td'); // V36 column spacer
@@ -5750,6 +5868,52 @@
             return tipShort || '';
         }
         // END c2pBlockMarks
+        // BEGIN c2pWindowBlocks (tested by sharechain-explorer/tests/unit/dashboard-window-blocks.test.ts)
+        // "Blocks in Window": the blocks found since the oldest share in the
+        // window. The window marks the blocks whose solving share is among its
+        // shares (c2pMarkBlocks). The found-block ledger (/recent_blocks, the
+        // rows the hashrate chart marks) also has blocks whose solving share
+        // is NOT on the best sharechain: a same-parent sibling share won the
+        // head race, so the block is on the coin chain but its share is an
+        // orphaned head the grid cannot show. Those are counted apart
+        // ("off-chain") instead of silently missing, so the panel and the
+        // chart agree. Ledger rows of another chain (a merged child) are left
+        // to their own counter. A share without its full hash (an older node)
+        // is matched on the 16-hex short hash. Keys follow c2pShareKey.
+        function c2pWindowBlocks(blocks, shares, set, sym) {
+            var onChain = {}, inFull = {}, inShort = {}, oldest = Infinity;
+            (shares || []).forEach(function(s) {
+                if (s.H) inFull[s.H] = true;
+                else if (s.h) inShort[s.h] = true;
+                if (set && set[c2pShareKey(s)]) onChain[c2pShareKey(s)] = true;
+                if (typeof s.t === 'number' && s.t > 0 && s.t < oldest) oldest = s.t;
+            });
+            var offChain = 0, seen = {};
+            (blocks || []).forEach(function(b) {
+                if (!b || typeof b.ts !== 'number' || !(b.ts >= oldest)) return;
+                if (b.chain && sym && String(b.chain).toUpperCase() !== String(sym).toUpperCase()) return;
+                var key = b.share || b.hash;
+                if (!key || seen[key]) return;
+                seen[key] = true;
+                var hit = inFull[key] ? key
+                        : (b.hash && inFull[b.hash]) ? b.hash
+                        : inShort[key.substr(0, 16)] ? key.substr(0, 16)
+                        : null;
+                if (hit) onChain[hit] = true;
+                else offChain++;
+            });
+            var on = Object.keys(onChain).length;
+            return { total: on + offChain, onChain: on, offChain: offChain,
+                     oldest: oldest === Infinity ? null : oldest };
+        }
+        // "<n> <SYM>", plus "(<k> by off-chain share[s])" when k > 0.
+        function c2pWindowBlocksText(r, sym) {
+            var t = r.total + ' ' + sym;
+            if (r.offChain > 0)
+                t += ' (' + r.offChain + ' by off-chain share' + (r.offChain === 1 ? '' : 's') + ')';
+            return t;
+        }
+        // END c2pWindowBlocks
         function blockMarkKind(isPrimary, isChild) {
             if (isPrimary && isChild) return 'twin';
             if (isPrimary) return 'primary';
@@ -5899,6 +6063,9 @@
                     }
                     self.shares = data.shares;
                     self.myAddress = data.my_address || '';
+                    // Node-owner fee payee as a hash160 (LTC; "" without --fee).
+                    // Used only to mark the owner's tile in the PPLNS view.
+                    self.feeHash160 = typeof data.fee_hash160 === 'string' ? data.fee_hash160 : '';
                     // Build the self-identity set: single my_address ∪ the
                     // my_addresses array (node-owner ∪ local stratum workers).
                     // Backward-compatible — a lane emitting only my_address
@@ -6101,9 +6268,13 @@
                     var x = ml + col * step;
                     var y = row * step;
 
-                    // Fill color
+                    // Fill color. With the PPLNS view on, a miner pinned or
+                    // hovered there keeps full colour and the rest dim.
+                    var dimCell = !!this.focusMiner && share.m !== this.focusMiner;
+                    if (dimCell) ctx.globalAlpha = 0.25;
                     ctx.fillStyle = this.getColor(share);
                     ctx.fillRect(x, y, cs, cs);
+                    if (dimCell) ctx.globalAlpha = 1;
 
                     var isLtcBlock = c2pIsBlockShare(this.blockSet, share);
                     var isDogeBlock = !!this.dogeSet[share.h];
@@ -6178,6 +6349,9 @@
                     // Update data
                     self.shares = data.shares;
                     self.myAddress = data.my_address || '';
+                    // Node-owner fee payee as a hash160 (LTC; "" without --fee).
+                    // Used only to mark the owner's tile in the PPLNS view.
+                    self.feeHash160 = typeof data.fee_hash160 === 'string' ? data.fee_hash160 : '';
                     // Build the self-identity set: single my_address ∪ the
                     // my_addresses array (node-owner ∪ local stratum workers).
                     // Backward-compatible — a lane emitting only my_address
@@ -6884,6 +7058,9 @@
                 if (idx !== this.hoveredIdx) {
                     var prevIdx = this.hoveredIdx;
                     this.hoveredIdx = idx;
+                    if (window.c2pSelectionBus) {
+                        window.c2pSelectionBus.hover(idx >= 0 && this.shares[idx] ? this.shares[idx].m : null, 'grid');
+                    }
                     this.render();
 
                     if (idx >= 0) {
@@ -7224,86 +7401,11 @@
                 return ((hash % 360) + 360) % 360;
             },
 
-            // Squarified treemap: place items into rows trying to keep aspect ratio ~1
+            // Squarified treemap of the per-share PPLNS (shared C2PLayout
+            // squarify, keeping this view's 1 px minimum strip).
             treemap: function(data, x, y, w, h) {
-                var rects = [];
-                var items = data.map(function(d) { return { addr: d.addr, pct: d.pct, area: d.pct }; });
-                this._layoutRow(items, x, y, w, h, rects);
-                return rects;
-            },
-
-            _layoutRow: function(items, x, y, w, h, rects) {
-                if (items.length === 0) return;
-                var totalArea = 0;
-                items.forEach(function(it) { totalArea += it.area; });
-                if (totalArea <= 0) return;
-
-                // Lay out along the shorter axis
-                var vertical = w >= h;
-                var mainSize = vertical ? h : w;
-                var crossSize = vertical ? w : h;
-
-                var row = [];
-                var rowArea = 0;
-                var remaining = items.slice();
-
-                while (remaining.length > 0) {
-                    row.push(remaining[0]);
-                    rowArea += remaining[0].area;
-                    remaining.shift();
-
-                    if (remaining.length === 0) break;
-
-                    // Check if adding next item worsens aspect ratio
-                    var nextArea = rowArea + remaining[0].area;
-                    var rowFraction = rowArea / totalArea;
-                    var nextFraction = nextArea / totalArea;
-                    var stripSize = rowFraction * crossSize;
-                    var nextStripSize = nextFraction * crossSize;
-
-                    var worstCurrent = this._worstAspect(row, rowArea, stripSize, mainSize, totalArea);
-                    var testRow = row.concat([remaining[0]]);
-                    var worstNext = this._worstAspect(testRow, nextArea, nextStripSize, mainSize, totalArea);
-
-                    if (worstNext > worstCurrent && row.length >= 1) {
-                        // Current row is better, lay it out
-                        break;
-                    }
-                }
-
-                // Lay out the row
-                var rowFraction = rowArea / totalArea;
-                var stripSize = Math.max(1, rowFraction * crossSize);
-                var offset = 0;
-                for (var i = 0; i < row.length; i++) {
-                    var itemFraction = row[i].area / rowArea;
-                    var itemSize = itemFraction * mainSize;
-                    if (vertical) {
-                        rects.push({ x: x, y: y + offset, w: stripSize, h: itemSize, addr: row[i].addr, pct: row[i].pct });
-                    } else {
-                        rects.push({ x: x + offset, y: y, w: itemSize, h: stripSize, addr: row[i].addr, pct: row[i].pct });
-                    }
-                    offset += itemSize;
-                }
-
-                // Recurse on remaining
-                if (remaining.length > 0) {
-                    if (vertical) {
-                        this._layoutRow(remaining, x + stripSize, y, w - stripSize, h, rects);
-                    } else {
-                        this._layoutRow(remaining, x, y + stripSize, w, h - stripSize, rects);
-                    }
-                }
-            },
-
-            _worstAspect: function(row, rowArea, stripSize, mainSize, totalArea) {
-                var worst = 0;
-                for (var i = 0; i < row.length; i++) {
-                    var itemSize = (row[i].area / rowArea) * mainSize;
-                    var aspect = Math.max(itemSize / stripSize, stripSize / itemSize);
-                    if (aspect > worst) worst = aspect;
-                }
-                return worst;
+                return c2pSquarify(data.map(function(d) { return { area: d.pct, data: d }; }), x, y, w, h)
+                    .map(function(r) { return { x: r.x, y: r.y, w: r.w, h: r.h, addr: r.data.addr, pct: r.data.pct }; });
             },
 
             bitsToDifficulty: function(bits) {
@@ -7330,7 +7432,7 @@
             updateStats: function(data) {
                 var shares = data.shares || [];
                 var mine = 0, stale = 0, dead = 0, verified = 0, fee = 0, v36sig = 0, v36native = 0;
-                var ltcBlocks = 0, dogeBlocks = 0;
+                var dogeBlocks = 0;
                 var self = this;
                 // Native-version threshold is coin-specific (LTC=36, DASH=16);
                 // read it from the active coin's share-version descriptor.
@@ -7343,7 +7445,6 @@
                     if (s.fee) fee++;
                     if (s.V >= vthr) v36native++;
                     else if (s.dv && s.dv >= vthr) v36sig++;
-                    if (c2pIsBlockShare(self.blockSet, s)) ltcBlocks++;
                     if (self.dogeSet[s.h]) dogeBlocks++;
                 });
 
@@ -7367,33 +7468,43 @@
                 // have none, so no "/ 0 DOGE" tail leaks onto them.
                 var ci = currency_info || {};
                 var psym = ci.symbol || 'COIN';
-                var blocksText = ltcBlocks + ' ' + psym;
+                // Blocks since the oldest window share: the window's own block
+                // shares plus the ledger's blocks whose share is off the best
+                // sharechain, shown apart (the hashrate chart marks both).
+                var wb = c2pWindowBlocks(window.c2pRecentBlocks, shares, self.blockSet, psym);
+                var blocksText = c2pWindowBlocksText(wb, psym);
                 if (ci.merged_child_symbol) {
                     blocksText += ' / ' + dogeBlocks + ' ' + ci.merged_child_symbol;
                 }
                 document.getElementById('defrag-blocks').textContent = blocksText;
-                setBlocksScopeTitle(shares);
+                setBlocksScopeTitle(shares, wb);
                 document.getElementById('defrag-fee').textContent = fee;
                 document.getElementById('defrag-v36native').textContent = v36native;
                 document.getElementById('defrag-v36sig').textContent = v36sig;
             }
         };
 
-        // "Blocks in Window" counts the shares IN THE SHOWN WINDOW that solved
-        // a block — the same scope as Shares / Verified / Orphan above it, not
-        // the node's whole found-block history. The window covers the last
-        // window_size shares, so its time span depends on the share rate;
-        // the tooltip states the actual span.
-        function setBlocksScopeTitle(shares) {
+        // "Blocks in Window" counts the blocks found since the oldest share IN
+        // THE SHOWN WINDOW — the same scope as Shares / Verified / Orphan above
+        // it, not the node's whole found-block history. A block whose solving
+        // share is off the best sharechain is counted too, and named apart
+        // (c2pWindowBlocks). The window covers the last window_size shares, so
+        // its time span depends on the share rate; the tooltip states it.
+        function setBlocksScopeTitle(shares, wb) {
             var n = shares ? shares.length : 0;
             var span = '';
             if (n > 1 && shares[0].t && shares[n - 1].t) {
                 var hrs = Math.abs(shares[0].t - shares[n - 1].t) / 3600;
                 span = ' (spanning ' + (hrs >= 1 ? hrs.toFixed(1) + ' h' : Math.round(hrs * 60) + ' min') + ')';
             }
-            var title = 'Shares that solved a block, counted over the ' + n
-                + ' shares in this window' + span + '. Blocks found before the'
-                + ' oldest share in the window are not counted.';
+            var title = 'Blocks found since the oldest of the ' + n
+                + ' shares in this window' + span + '.';
+            if (wb && wb.offChain > 0)
+                title += ' ' + wb.onChain + ' were solved by shares in this window; '
+                    + wb.offChain + ' by shares that are not on the best sharechain'
+                    + ' (a same-parent sibling share won the head race), so the grid'
+                    + ' does not show them.';
+            title += ' Blocks found before the oldest share in the window are not counted.';
             var l = document.getElementById('defrag-blocks-label');
             var v = document.getElementById('defrag-blocks');
             if (l) l.title = title;
@@ -7408,12 +7519,9 @@
         // (c2pool-explorer-plugin-architecture.md §16.2) says the
         // inline path stays until pixel-diff parity is confirmed.
         //
-        // Known limitations while the flag is on:
-        //   - Right-hand stats panel stays at "-" (bundled path does
-        //     not yet update #defrag-total etc).
-        //   - RealTime toggle button is inert (bundled is always live).
-        //   - Hover-zoom + per-share PPLNS treemap not yet ported.
-        // These land in subsequent Phase B commits.
+        // With the flag on, the bootstrap at the end of this file wires
+        // the stats panel (Phase B #10), the per-share PPLNS hover zoom
+        // (#12) and the RealTime toggle (#13) to the bundled renderer.
         window.__c2pBundledExplorer = (function() {
             try {
                 var p = new URLSearchParams(location.search);
@@ -7574,41 +7682,17 @@
                 var w = grid.clientWidth;
                 var h = Math.max(grid.clientHeight, 240);
 
-                // Squarified treemap layout (standalone — carries all fields)
-                var rects = [];
-                var items = entries.map(function(d) { return { addr:d.addr, pct:d.pct, amt:d.amt, doge:d.doge, dogeAddr:d.dogeAddr, area:d.pct }; });
-                function tmLayout(items, x, y, w, h) {
-                    if (!items.length || w <= 0 || h <= 0) return;
-                    var tot = 0; items.forEach(function(it) { tot += it.area; });
-                    if (tot <= 0) return;
-                    var vert = w >= h, main = vert ? h : w, cross = vert ? w : h;
-                    var row = [], rowA = 0, rem = items.slice();
-                    while (rem.length) {
-                        row.push(rem[0]); rowA += rem[0].area; rem.shift();
-                        if (!rem.length) break;
-                        var sNow = (rowA/tot)*cross, sNext = ((rowA+rem[0].area)/tot)*cross;
-                        var wNow = 0, wNext = 0;
-                        row.forEach(function(r) { var s=(r.area/rowA)*main; var a=Math.max(s/sNow,sNow/s); if(a>wNow)wNow=a; });
-                        var testRow = row.concat([rem[0]]), testA = rowA+rem[0].area;
-                        testRow.forEach(function(r) { var s=(r.area/testA)*main; var a=Math.max(s/sNext,sNext/s); if(a>wNext)wNext=a; });
-                        if (wNext > wNow && row.length >= 1) break;
-                    }
-                    var strip = Math.max(1, (rowA/tot)*cross), off = 0;
-                    for (var i = 0; i < row.length; i++) {
-                        var sz = (row[i].area/rowA)*main;
-                        var r = vert
-                            ? { x:x, y:y+off, w:strip, h:sz }
-                            : { x:x+off, y:y, w:sz, h:strip };
-                        r.addr=row[i].addr; r.pct=row[i].pct; r.amt=row[i].amt; r.doge=row[i].doge; r.dogeAddr=row[i].dogeAddr;
-                        rects.push(r);
-                        off += sz;
-                    }
-                    if (rem.length) {
-                        if (vert) tmLayout(rem, x+strip, y, w-strip, h);
-                        else tmLayout(rem, x, y+strip, w, h-strip);
-                    }
+                // Squarified treemap layout (shared C2PLayout squarify).
+                if (!c2pLayoutReady()) {
+                    grid.innerHTML = '<div style="padding:12px;color:#ff6b6b">'
+                        + 'Treemap layout module failed to load (sharechain-explorer/dist/layout.js).</div>';
+                    return;
                 }
-                tmLayout(items, 0, 0, w, h);
+                var rects = c2pSquarify(entries.map(function(d) { return { area: d.pct, data: d }; }), 0, 0, w, h)
+                    .map(function(r) {
+                        var d = r.data;
+                        return { x: r.x, y: r.y, w: r.w, h: r.h, addr: d.addr, pct: d.pct, amt: d.amt, doge: d.doge, dogeAddr: d.dogeAddr };
+                    });
 
                 var addrPrefix = (typeof currency_info !== 'undefined' && currency_info.address_explorer_url_prefix)
                     ? currency_info.address_explorer_url_prefix : 'https://blockchair.com/litecoin/address/';
@@ -7785,7 +7869,116 @@
         // retry above. Keeps the existing #pplns-loading placeholder visible
         // (renderMainPPLNS only hides it on success).
         var _pplnsLoadMaxRetries = 3;
+
+        // BEGIN c2pPplnsView
+        // Interactive PPLNS treemap on the scene engine (dist/scene.js),
+        // opt-in with ?pplns-view=1 or localStorage c2p_pplns_view=1.
+        // Tile weight = /current_payouts (what the payout code pays);
+        // merged children from /current_merged_payouts; ★ = addresses this
+        // node's stratum serves; ⚑ = the node owner (explicit address, or
+        // the window's fee_hash160); ◇ = an explicit donation address only.
+        // Hover/pin link with the share-chain grid through one bus.
+        function c2pPplnsViewEnabled() {
+            try {
+                var q = new URLSearchParams(location.search);
+                if (q.has('pplns-view')) return q.get('pplns-view') !== '0';
+            } catch (e) { /* old browser */ }
+            try { return localStorage.getItem('c2p_pplns_view') === '1'; } catch (e) { return false; }
+        }
+        var _pplnsViewP = null;
+        var _pplnsFacts = null;
+        function c2pPplnsFacts() {
+            var shares = (defrag && defrag.shares) || [];
+            var n = shares.length, counts = {}, last = {};
+            for (var i = 0; i < n; i++) {
+                var s = shares[i];
+                if (!s || !s.m) continue;
+                counts[s.m] = (counts[s.m] || 0) + 1;
+                if (typeof s.t === 'number' && !(last[s.m] >= s.t)) last[s.m] = s.t;
+            }
+            var nowS = Date.now() / 1000;
+            return function(addr) {
+                var out = {};
+                if (n > 0) { out.shares = counts[addr] || 0; out.countFraction = (counts[addr] || 0) / n; }
+                if (last[addr]) out.lastShareAgeS = Math.max(0, nowS - last[addr]);
+                var hr = defrag.minerHashrates ? defrag.minerHashrates[addr] : 0;
+                if (hr > 0) out.hashrate = format_hashrate(hr);
+                var mv = getMinerVersion(addr);
+                if (mv && mv.ver) out.version = (mv.dv && mv.dv !== mv.ver) ? ('V' + mv.ver + ' \u2192 V' + mv.dv) : ('V' + mv.ver);
+                return out;
+            };
+        }
+        function c2pPplnsViewMount() {
+            if (_pplnsViewP) return _pplnsViewP;
+            _pplnsViewP = import('./sharechain-explorer/dist/scene.js?v=e1410b9f').then(function(mod) {
+                var ci = (typeof currency_info !== 'undefined' && currency_info) || {};
+                var grid = document.getElementById('pplns-main-grid');
+                grid.innerHTML = '';
+                var bus = mod.createSelectionBus();
+                window.c2pSelectionBus = bus;
+                var child = (ci.merged_child_symbol || '').toUpperCase();
+                var opts = {
+                    container: grid,
+                    symbol: ci.symbol || 'COIN',
+                    bus: bus,
+                    facts: function(a) { return _pplnsFacts ? _pplnsFacts(a) : undefined; },
+                    addressUrl: function(a) {
+                        return ci.address_explorer_url_prefix ? ci.address_explorer_url_prefix + a : undefined;
+                    }
+                };
+                if (child) opts.mergedSymbol = child;
+                var view = mod.mountPplnsTreemap(opts);
+                // A miner pinned (or hovered in the treemap) keeps full
+                // colour in the grid; the rest dim.
+                bus.subscribe(function(st) {
+                    var focus = st.pinned || (st.source !== 'grid' ? st.hover : null);
+                    if (defrag.focusMiner !== focus) {
+                        defrag.focusMiner = focus;
+                        if (typeof defrag.render === 'function') defrag.render();
+                    }
+                });
+                return { mod: mod, view: view };
+            });
+            return _pplnsViewP;
+        }
+        // The three feeds are fetched in parallel. Payouts are required;
+        // merged children and the stratum workers (for ★) are optional,
+        // so a failure there still renders the treemap.
+        function c2pFetchJSON(url) {
+            return new Promise(function(resolve) {
+                d3.json(url, function(d) { resolve(d && typeof d === 'object' ? d : null); });
+            });
+        }
+        function loadPplnsView() {
+            c2pPplnsViewMount().then(function(h) {
+                return Promise.all([
+                    c2pFetchJSON('../current_payouts'),
+                    c2pFetchJSON('../current_merged_payouts'),
+                    c2pFetchJSON('../stratum_stats')
+                ]).then(function(r) {
+                    var payouts = r[0], merged = r[1], ss = r[2];
+                    if (!payouts) return;
+                    var ci = (typeof currency_info !== 'undefined' && currency_info) || {};
+                    var special = { thisNode: h.mod.addressesFromWorkers(ss && ss.workers) };
+                    if (ci.node_owner_address) special.ownerAddresses = [ci.node_owner_address];
+                    if (defrag.feeHash160) special.ownerHash160 = defrag.feeHash160;
+                    if (ci.donation_address) special.donationAddresses = [ci.donation_address];
+                    _pplnsFacts = c2pPplnsFacts();
+                    h.view.update({ payouts: payouts, merged: merged || {} }, special);
+                    var pl = document.getElementById('pplns-loading');
+                    if (pl) pl.style.display = 'none';
+                });
+            }).catch(function(err) {
+                console.error('[c2pool] PPLNS view failed to load', err);
+                var grid = document.getElementById('pplns-main-grid');
+                if (grid) grid.innerHTML = '<div style="padding:12px;color:#ff6b6b">'
+                    + 'PPLNS view failed to load (sharechain-explorer/dist/scene.js).</div>';
+            });
+        }
+        // END c2pPplnsView
+
         function loadMainPPLNS(_attempt) {
+            if (c2pPplnsViewEnabled()) { loadPplnsView(); return; }
             var attempt = _attempt || 0;
             d3.json('../current_merged_payouts', function(payouts) {
                 if (!payouts || typeof payouts !== 'object') {
@@ -8067,8 +8260,8 @@
             
             // This node's OWN hashrate, as distinct from the pool total.
             // Both sources are already served by rest_web_graph_data() and are
-            // populated on every coin -- see web-static/graphs.html, which has
-            // plotted them on a separate legacy page since the p2pool port.
+            // populated on every coin (the same /web/graph_data endpoints the
+            // removed legacy p2pool Graphs page plotted).
             var localEndpoints = {
                 'hour': '../web/graph_data/local_hash_rate/last_hour',
                 'day': '../web/graph_data/local_hash_rate/last_day',
@@ -8841,16 +9034,12 @@
                                 s += 'Expected: <b>' + format_dt(b.expected_time) + '</b><br/>';
                             }
                             if (b.network_difficulty) {
-                                var netHashrate = Math.floor(b.network_difficulty * Math.pow(2, 32) / 150);
-                                var netPdiff = b.network_difficulty * 65536;
-                                s += 'Net Diff: <b style="color:#8888ff">' + format_hashrate(netHashrate) + '</b><br/>';
-                                s += '<span style="font-size:10px;color:#aaa">(bdiff: ' + d3.format(',.2f')(b.network_difficulty) + ', pdiff: ' + d3.format('.2e')(netPdiff) + ')</span><br/>';
+                                s += 'Net Diff: <b style="color:#8888ff">' + diff_as_hashrate(b.network_difficulty) + '</b><br/>';
+                                s += '<span style="font-size:10px;color:#aaa">(' + diff_detail(b.network_difficulty) + ')</span><br/>';
                             }
                             if (b.actual_hash_difficulty) {
-                                var actualHashrate = Math.floor(b.actual_hash_difficulty * Math.pow(2, 32) / 150);
-                                var actualPdiff = b.actual_hash_difficulty * 65536;
-                                s += 'Hash Diff: <b style="color:#00d4ff">' + format_hashrate(actualHashrate) + '</b><br/>';
-                                s += '<span style="font-size:10px;color:#aaa">(bdiff: ' + d3.format(',.2f')(b.actual_hash_difficulty) + ', pdiff: ' + d3.format('.2e')(actualPdiff) + ')</span><br/>';
+                                s += 'Hash Diff: <b style="color:#00d4ff">' + diff_as_hashrate(b.actual_hash_difficulty) + '</b><br/>';
+                                s += '<span style="font-size:10px;color:#aaa">(' + diff_detail(b.actual_hash_difficulty) + ')</span><br/>';
                             }
                             // Show Hash/Net difficulty ratio (how many more leading zeroes than required)
                             if (b.actual_hash_difficulty && b.network_difficulty && b.network_difficulty > 0) {
@@ -8984,16 +9173,12 @@
                                 s += 'Expected: <b>' + format_dt(b.expected_time) + '</b><br/>';
                             }
                             if (b.network_difficulty) {
-                                var netHashrate = Math.floor(b.network_difficulty * Math.pow(2, 32) / 150);
-                                var netPdiff = b.network_difficulty * 65536;
-                                s += 'Net Diff: <b style="color:#8888ff">' + format_hashrate(netHashrate) + '</b><br/>';
-                                s += '<span style="font-size:10px;color:#aaa">(bdiff: ' + d3.format(',.2f')(b.network_difficulty) + ', pdiff: ' + d3.format('.2e')(netPdiff) + ')</span><br/>';
+                                s += 'Net Diff: <b style="color:#8888ff">' + diff_as_hashrate(b.network_difficulty) + '</b><br/>';
+                                s += '<span style="font-size:10px;color:#aaa">(' + diff_detail(b.network_difficulty) + ')</span><br/>';
                             }
                             if (b.actual_hash_difficulty) {
-                                var actualHashrate = Math.floor(b.actual_hash_difficulty * Math.pow(2, 32) / 150);
-                                var actualPdiff = b.actual_hash_difficulty * 65536;
-                                s += 'Hash Diff: <b style="color:#00d4ff">' + format_hashrate(actualHashrate) + '</b><br/>';
-                                s += '<span style="font-size:10px;color:#aaa">(bdiff: ' + d3.format(',.2f')(b.actual_hash_difficulty) + ', pdiff: ' + d3.format('.2e')(actualPdiff) + ')</span><br/>';
+                                s += 'Hash Diff: <b style="color:#00d4ff">' + diff_as_hashrate(b.actual_hash_difficulty) + '</b><br/>';
+                                s += '<span style="font-size:10px;color:#aaa">(' + diff_detail(b.actual_hash_difficulty) + ')</span><br/>';
                             }
                             // Show Hash/Net difficulty ratio (how many more leading zeroes than required)
                             if (b.actual_hash_difficulty && b.network_difficulty && b.network_difficulty > 0) {
@@ -9553,18 +9738,14 @@
                                 s += 'Expected: <b>' + format_dt(b.expected_time) + '</b><br/>';
                             }
                             if (b.network_difficulty) {
-                                var netHashrate = Math.floor(b.network_difficulty * Math.pow(2, 32) / 150);
-                                var netPdiff = b.network_difficulty * 65536;
-                                s += 'Net Diff: <b style="color:#8888ff">' + format_hashrate(netHashrate) + '</b><br/>';
-                                s += '<span style="font-size:11px;color:#888">(Hashrate needed to solve in 2.5 min)</span><br/>';
-                                s += '<span style="font-size:11px;color:#aaa">bdiff: ' + d3.format(',.2f')(b.network_difficulty) + ', pdiff: ' + d3.format('.2e')(netPdiff) + '</span><br/>';
+                                s += 'Net Diff: <b style="color:#8888ff">' + diff_as_hashrate(b.network_difficulty) + '</b><br/>';
+                                s += '<span style="font-size:11px;color:#888">(Hashrate needed to solve in ' + format_duration(block_period_sec()) + ')</span><br/>';
+                                s += '<span style="font-size:11px;color:#aaa">' + diff_detail(b.network_difficulty) + '</span><br/>';
                             }
                             if (b.actual_hash_difficulty) {
-                                var actualHashrate = Math.floor(b.actual_hash_difficulty * Math.pow(2, 32) / 150);
-                                var actualPdiff = b.actual_hash_difficulty * 65536;
-                                s += 'Hash Diff: <b style="color:#00d4ff">' + format_hashrate(actualHashrate) + '</b><br/>';
+                                s += 'Hash Diff: <b style="color:#00d4ff">' + diff_as_hashrate(b.actual_hash_difficulty) + '</b><br/>';
                                 s += '<span style="font-size:11px;color:#888">(Hashrate equivalent of found hash)</span><br/>';
-                                s += '<span style="font-size:11px;color:#aaa">bdiff: ' + d3.format(',.2f')(b.actual_hash_difficulty) + ', pdiff: ' + d3.format('.2e')(actualPdiff) + '</span><br/>';
+                                s += '<span style="font-size:11px;color:#aaa">' + diff_detail(b.actual_hash_difficulty) + '</span><br/>';
                             }
                             // Show Hash/Net difficulty ratio
                             if (b.actual_hash_difficulty && b.network_difficulty && b.network_difficulty > 0) {
@@ -9710,16 +9891,12 @@
                                 s += 'Expected: <b>' + format_dt(b.expected_time) + '</b><br/>';
                             }
                             if (b.network_difficulty) {
-                                var netHashrate = Math.floor(b.network_difficulty * Math.pow(2, 32) / 150);
-                                var netPdiff = b.network_difficulty * 65536;
-                                s += 'Net Diff: <b style="color:#8888ff">' + format_hashrate(netHashrate) + '</b><br/>';
-                                s += '<span style="font-size:10px;color:#aaa">(bdiff: ' + d3.format(',.2f')(b.network_difficulty) + ', pdiff: ' + d3.format('.2e')(netPdiff) + ')</span><br/>';
+                                s += 'Net Diff: <b style="color:#8888ff">' + diff_as_hashrate(b.network_difficulty) + '</b><br/>';
+                                s += '<span style="font-size:10px;color:#aaa">(' + diff_detail(b.network_difficulty) + ')</span><br/>';
                             }
                             if (b.actual_hash_difficulty) {
-                                var actualHashrate = Math.floor(b.actual_hash_difficulty * Math.pow(2, 32) / 150);
-                                var actualPdiff = b.actual_hash_difficulty * 65536;
-                                s += 'Hash Diff: <b style="color:#00d4ff">' + format_hashrate(actualHashrate) + '</b><br/>';
-                                s += '<span style="font-size:10px;color:#aaa">(bdiff: ' + d3.format(',.2f')(b.actual_hash_difficulty) + ', pdiff: ' + d3.format('.2e')(actualPdiff) + ')</span><br/>';
+                                s += 'Hash Diff: <b style="color:#00d4ff">' + diff_as_hashrate(b.actual_hash_difficulty) + '</b><br/>';
+                                s += '<span style="font-size:10px;color:#aaa">(' + diff_detail(b.actual_hash_difficulty) + ')</span><br/>';
                             }
                             // Show Hash/Net difficulty ratio
                             if (b.actual_hash_difficulty && b.network_difficulty && b.network_difficulty > 0) {
@@ -10127,7 +10304,7 @@
          are unchanged for default users. -->
     <script type="module">
         if (window.__c2pBundledExplorer) {
-            import('./sharechain-explorer/dist/sharechain-explorer.js')
+            import('./sharechain-explorer/dist/sharechain-explorer.js?v=fc03fa60')
                 .then(function(mod) {
                     var canvas = document.getElementById('defrag-canvas');
                     var wrap = canvas && canvas.parentElement;
@@ -10175,21 +10352,17 @@
                     }
                     function onMouseMove(ev) {
                         if (!window.__explorerBundled) return;
+                        // A cached bundle older than this page lacks the API.
+                        if (typeof window.__explorerBundled.cellAtPoint !== 'function') return;
                         var state = window.__explorerBundled.getState();
                         var shares = state.window.shares;
                         if (shares.length === 0) return;
-                        var layout = mod.computeGridLayout({
-                            shareCount: shares.length,
-                            containerWidth: wrap.clientWidth,
-                            cellSize: 10,
-                            gap: 1,
-                            marginLeft: 38,
-                            minHeight: 40,
-                        });
+                        // Hit-test against the layout the renderer actually
+                        // painted (auto-fit cell size), not a fixed 10 px grid.
                         var rect = canvas.getBoundingClientRect();
                         var x = ev.clientX - rect.left;
                         var y = ev.clientY - rect.top;
-                        var idx = mod.cellAtPoint(layout, x, y);
+                        var idx = window.__explorerBundled.cellAtPoint(x, y);
                         if (idx === null) {
                             if (hoveredIdx !== -1) { hoveredIdx = -1; hoverPanel.hide(); }
                             return;
@@ -10298,12 +10471,15 @@
                             // parent (LTC->DOGE), never on DASH/BTC/DGB.
                             var bci = window.currency_info || {};
                             var bsym = bci.symbol || 'COIN';
-                            var bt = s.primaryBlocks + ' ' + bsym;
+                            var bwb = c2pWindowBlocks(window.c2pRecentBlocks, state.window.shares, null, bsym);
+                            var bwr = { total: s.primaryBlocks + bwb.offChain,
+                                        onChain: s.primaryBlocks, offChain: bwb.offChain };
+                            var bt = c2pWindowBlocksText(bwr, bsym);
                             if (bci.merged_child_symbol) {
                                 bt += ' / ' + s.dogeBlocks + ' ' + bci.merged_child_symbol;
                             }
                             statEls.blocks.textContent = bt;
-                            setBlocksScopeTitle(state.window.shares);
+                            setBlocksScopeTitle(state.window.shares, bwr);
                         }
                     }
                     window.addEventListener('beforeunload', function() {

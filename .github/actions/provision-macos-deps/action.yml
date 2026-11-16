@@ -1,0 +1,215 @@
+name: Provision macOS dependencies
+description: >
+  Make every third-party library a macOS c2pool build links available for ONE
+  target architecture (arm64 or x86_64), on an Apple Silicon host.
+
+  All macOS builds run on Apple Silicon. The arm64 slice builds natively; the
+  x86_64 slice is cross-compiled (Conan host profile arch=x86_64, build profile
+  armv8; clang -arch x86_64). Both slices take their libraries from the same
+  pinned sources as the Linux and Windows lanes:
+
+    - conanfile.txt + conan.lock (boost, leveldb, yaml-cpp, nlohmann_json,
+      zeromq, gtest), built with ci/conan/macos-clang.profile;
+    - scripts/ci/build_macos_deps.sh (secp256k1, gmp), static, per arch.
+
+  Homebrew supplies build TOOLS only (cmake, conan, autotools, pkg-config). No
+  Homebrew library is linked into either slice: Homebrew publishes arm64-only
+  bottles, so linking them would make the two slices of the universal binary
+  differ in library versions and leave thin dylibs in the package.
+
+  The caller's job must set MACOSX_DEPLOYMENT_TARGET (the pinned minimum macOS
+  of every slice); it has to equal os.version in ci/conan/macos-clang.profile,
+  and this action fails when it does not.
+
+  No path of the build host may end up in a shipped binary: every build here
+  maps its source, build and cache directories to neutral names with
+  -ffile-prefix-map (Conan packages via tools.build:cflags/cxxflags, which the
+  Conan toolchain also applies to c2pool itself).
+
+  Exports to $GITHUB_ENV:
+    CONAN_HOME                 Conan cache (persistent on self-hosted)
+    C2POOL_MACOS_ARCH          the target arch (arm64|x86_64)
+    C2POOL_MACOS_DEPS          prefix holding libsecp256k1.a + libgmp.a for it
+    C2POOL_CONAN_TOOLCHAIN     <output-folder>/conan_toolchain.cmake
+    C2POOL_PREFIX_MAP_FLAGS    -ffile-prefix-map flags for the c2pool build
+
+  Configure c2pool with:
+    CFLAGS="$C2POOL_PREFIX_MAP_FLAGS" CXXFLAGS="$C2POOL_PREFIX_MAP_FLAGS" \
+    cmake ... -DCMAKE_TOOLCHAIN_FILE="$C2POOL_CONAN_TOOLCHAIN"
+              -DCMAKE_OSX_DEPLOYMENT_TARGET="$MACOSX_DEPLOYMENT_TARGET"
+              -DCMAKE_PREFIX_PATH="$C2POOL_MACOS_DEPS"
+              -DCMAKE_IGNORE_PREFIX_PATH="/opt/homebrew;/usr/local"
+
+inputs:
+  arch:
+    description: "Target architecture: arm64 or x86_64."
+    required: true
+  output-folder:
+    description: "Conan --output-folder (receives conan_toolchain.cmake)."
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve target arch, Conan home and deps prefix
+      shell: bash
+      run: |
+        set -euo pipefail
+        case "${{ inputs.arch }}" in
+          arm64)  conan_arch=armv8 ;;
+          x86_64) conan_arch=x86_64 ;;
+          *) echo "::error::provision-macos-deps: unknown arch '${{ inputs.arch }}'"; exit 1 ;;
+        esac
+        host="$(uname -m)"
+        if [ "$host" != "arm64" ]; then
+          echo "::error::provision-macos-deps expects an Apple Silicon host (uname -m = $host)"
+          exit 1
+        fi
+        # One pinned minimum macOS for every slice: the job-level
+        # MACOSX_DEPLOYMENT_TARGET and the Conan profile's os.version.
+        profile_min="$(awk -F= '$1=="os.version"{print $2}' ci/conan/macos-clang.profile)"
+        if [ -z "${MACOSX_DEPLOYMENT_TARGET:-}" ]; then
+          echo "::error::MACOSX_DEPLOYMENT_TARGET is not set; set it at job level to $profile_min (os.version in ci/conan/macos-clang.profile)"
+          exit 1
+        fi
+        if [ "$MACOSX_DEPLOYMENT_TARGET" != "$profile_min" ]; then
+          echo "::error::MACOSX_DEPLOYMENT_TARGET=$MACOSX_DEPLOYMENT_TARGET but ci/conan/macos-clang.profile has os.version=$profile_min"
+          exit 1
+        fi
+        # Self-hosted: a persistent Conan home, so boost and friends are built
+        # once per pin, not once per job. The path is deliberately neutral (no
+        # runner or host name). Conan's cache is not safe for two concurrent
+        # jobs; the build host runs a single runner, so they never overlap.
+        # GitHub-hosted: ephemeral, restored from the Actions cache below.
+        if [ "${{ runner.environment }}" = "github-hosted" ]; then
+          conan_home="$RUNNER_TEMP/conan2"
+        else
+          conan_home="$HOME/.c2pool-deps/conan2-macos"
+        fi
+        deps="$HOME/.c2pool-deps/macos-deps-${{ inputs.arch }}"
+        key="$(bash scripts/ci/build_macos_deps.sh --key "${{ inputs.arch }}")"
+        # Neutral names for every host directory a compiler can see, so
+        # __FILE__ strings (Boost.Log, ZeroMQ, c2pool's own) carry no host path.
+        maps="-ffile-prefix-map=$conan_home=conan-home"
+        maps="$maps -ffile-prefix-map=$HOME/.c2pool-deps=c2pool-deps"
+        maps="$maps -ffile-prefix-map=$GITHUB_WORKSPACE=c2pool"
+        maps="$maps -ffile-prefix-map=$RUNNER_TEMP=runner-temp"
+        {
+          echo "CONAN_HOME=$conan_home"
+          echo "C2POOL_MACOS_ARCH=${{ inputs.arch }}"
+          echo "C2POOL_MACOS_DEPS=$deps"
+          echo "C2POOL_MACOS_DEPS_KEY=$key"
+          echo "C2POOL_CONAN_ARCH=$conan_arch"
+          echo "C2POOL_PREFIX_MAP_FLAGS=$maps"
+        } >> "$GITHUB_ENV"
+        echo "target=${{ inputs.arch }} (conan arch=$conan_arch) on host=$host, minimum macOS $MACOSX_DEPLOYMENT_TARGET"
+        echo "CONAN_HOME=$conan_home"
+        echo "deps prefix=$deps key=$key"
+
+    - name: Ensure build tools (Homebrew)
+      shell: bash
+      run: |
+        set -euo pipefail
+        # Tools only. Install just what is missing, so a warm self-hosted runner
+        # does not pull a Homebrew upgrade in the middle of a release build.
+        missing=""
+        for t in cmake conan autoconf automake glibtoolize pkg-config; do
+          command -v "$t" > /dev/null 2>&1 || missing="$missing $t"
+        done
+        if [ -n "$missing" ]; then
+          pkgs=""
+          for t in $missing; do
+            case "$t" in
+              glibtoolize) pkgs="$pkgs libtool" ;;
+              *)           pkgs="$pkgs $t" ;;
+            esac
+          done
+          echo "installing missing build tools:$pkgs"
+          brew install $pkgs
+        fi
+        cmake --version | head -1
+        conan --version
+        clang --version | head -1
+
+    # The x86_64 slice is cross-compiled, so every job runs it under Rosetta 2
+    # before it ships; without Rosetta those checks fail. The self-hosted build
+    # host has it installed; a fresh GitHub-hosted image may not.
+    - name: Ensure Rosetta 2 (github-hosted only)
+      if: runner.environment == 'github-hosted'
+      shell: bash
+      run: |
+        if arch -x86_64 /usr/bin/true 2>/dev/null; then
+          echo "Rosetta 2 present"
+        else
+          sudo softwareupdate --install-rosetta --agree-to-license
+          arch -x86_64 /usr/bin/true
+        fi
+
+    - name: Restore Conan cache (github-hosted only)
+      if: runner.environment == 'github-hosted'
+      uses: actions/cache@v5
+      with:
+        path: ${{ runner.temp }}/conan2
+        key: conan2-macos-${{ inputs.arch }}-${{ hashFiles('conanfile.txt', 'conan.lock', 'ci/conan/macos-clang.profile', '.github/actions/provision-macos-deps/action.yml') }}
+        restore-keys: |
+          conan2-macos-${{ inputs.arch }}-
+
+    - name: Restore deps prefix (github-hosted only)
+      if: runner.environment == 'github-hosted'
+      uses: actions/cache@v5
+      with:
+        path: ~/.c2pool-deps/macos-deps-${{ inputs.arch }}
+        key: macos-deps-${{ inputs.arch }}-${{ hashFiles('scripts/ci/build_macos_deps.sh') }}
+
+    - name: Build secp256k1 + gmp if the prefix is cold or stale
+      shell: bash
+      run: |
+        set -euo pipefail
+        marker="$C2POOL_MACOS_DEPS/.deps-key"
+        if [ "$(cat "$marker" 2>/dev/null || true)" = "$C2POOL_MACOS_DEPS_KEY" ]; then
+          echo "deps $C2POOL_MACOS_DEPS_KEY already at $C2POOL_MACOS_DEPS - reusing"
+          exit 0
+        fi
+        case "$C2POOL_MACOS_DEPS" in
+          "$HOME"/.c2pool-deps/macos-deps-*) ;;
+          *) echo "::error::refusing to remove unexpected prefix $C2POOL_MACOS_DEPS"; exit 1 ;;
+        esac
+        rm -rf "$C2POOL_MACOS_DEPS"
+        JOBS="${BUILD_J:-4}" bash scripts/ci/build_macos_deps.sh "$C2POOL_MACOS_ARCH" "$C2POOL_MACOS_DEPS"
+
+    - name: Conan install (${{ inputs.arch }})
+      shell: bash
+      run: |
+        set -euo pipefail
+        # -pr:a pins both contexts to the committed profile (armv8 = this host);
+        # -s:h arch= retargets only the HOST context, so x86_64 is a proper
+        # Conan cross build (build tools such as b2 stay native arm64).
+        conan profile show -pr:a=ci/conan/macos-clang.profile -s:h arch="$C2POOL_CONAN_ARCH"
+        # The prefix map goes into every Conan-built package (and, through the
+        # generated toolchain, into the c2pool build). Confs are not part of
+        # the package id, so a cache built with other flags is emptied first
+        # rather than silently reused.
+        map="-ffile-prefix-map=$CONAN_HOME=conan-home"
+        mkdir -p "$CONAN_HOME"
+        flags_marker="$CONAN_HOME/.c2pool-build-flags"
+        if [ "$(cat "$flags_marker" 2>/dev/null || true)" != "$map" ]; then
+          echo "Conan cache built with other flags (or new): removing its packages"
+          conan remove "*" -c > /dev/null 2>&1 || true
+          printf '%s\n' "$map" > "$flags_marker"
+        fi
+        conan install . \
+          -pr:a=ci/conan/macos-clang.profile \
+          -s:h arch="$C2POOL_CONAN_ARCH" \
+          -c tools.build:jobs="${BUILD_J:-4}" \
+          -c "tools.build:cflags=['$map']" \
+          -c "tools.build:cxxflags=['$map']" \
+          --lockfile=conan.lock \
+          --build=missing \
+          --output-folder="${{ inputs.output-folder }}"
+        # Drop build trees (several GB for a from-source boost, never reused).
+        # Keep the extracted sources: they are shared by both arches, so the
+        # other arch's cold build does not download boost again.
+        conan cache clean "*" --build --temp
+        tc="$(cd "${{ inputs.output-folder }}" && pwd)/conan_toolchain.cmake"
+        [ -f "$tc" ] || { echo "::error::conan did not produce $tc"; exit 1; }
+        echo "C2POOL_CONAN_TOOLCHAIN=$tc" >> "$GITHUB_ENV"

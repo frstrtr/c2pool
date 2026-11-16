@@ -12,23 +12,24 @@
 namespace ltc {
 namespace coin {
 
-/// DNS seeds for Litecoin mainnet.
+/// DNS seeds for Litecoin mainnet: the Litecoin Core seeds that answer.
+/// Dropped 2026-11-15, each one a getaddrinfo() failure (up to 14.7 s):
+///   dnsseed.litecointools.com  NXDOMAIN
+///   dnsseed.litecoinpool.org   no A/AAAA (the name is not delegated to a seeder)
+///   dnsseed.koin-project.com   SERVFAIL (its nameserver 94.242.209.124 does not answer)
 inline std::vector<c2pool::dns::DnsSeed> ltc_mainnet_dns_seeds()
 {
     return {
         {"seed-a.litecoin.loshan.co.uk", 9333},
         {"dnsseed.thrasher.io",          9333},
-        {"dnsseed.litecointools.com",    9333},
-        {"dnsseed.litecoinpool.org",     9333},
-        {"dnsseed.koin-project.com",     9333},
     };
 }
 
-/// DNS seeds for Litecoin testnet.
+/// DNS seeds for Litecoin testnet. testnet-seed.litecointools.com was dropped
+/// 2026-11-15: NXDOMAIN.
 inline std::vector<c2pool::dns::DnsSeed> ltc_testnet_dns_seeds()
 {
     return {
-        {"testnet-seed.litecointools.com",   19335},
         {"seed-b.litecoin.loshan.co.uk",     19335},
         {"dnsseed-testnet.thrasher.io",      19335},
     };
