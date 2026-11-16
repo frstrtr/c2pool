@@ -1487,11 +1487,13 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
 
     // Best-share dashboard feed: every ACCEPTED pseudoshare's real (X11/scrypt)
     // difficulty is a candidate for the "Best Share" card (highest-difficulty
-    // share seen — how close a miner got to a block). Default no-op; a work
-    // source whose dashboard is a separate object (c2pool-dash) overrides this
-    // to forward into the dashboard's best-share tracker. share_difficulty is
-    // the true per-hash difficulty computed above; pass the raw submit fields so
-    // the implementor can recover the exact pow-hash. Display only.
+    // share seen — how close a miner got to a block), once per accepted
+    // submission, a pool share included (p2pool work.py got_response). It is
+    // the ACHIEVED difficulty, independent of the pool-share gate below (the
+    // job's frozen share bits). Default no-op; MiningInterface (LTC) and
+    // DASHWorkSource override it. share_difficulty is the true per-hash
+    // difficulty computed above; pass the raw submit fields so the implementor
+    // can recover the exact pow-hash. Display only.
     mining_interface_->record_best_pseudoshare(
         share_difficulty, username_,
         job.payload->coinb1, job.payload->coinb2,

@@ -2291,10 +2291,23 @@ struct RecordingWorkSource : core::stratum::IWorkSource {
     uint32_t get_share_bits() const override { return live_bits; }
     uint32_t get_share_max_bits() const override { return 0x207fffff; }
     double compute_share_difficulty(const std::string&, const std::string&, const std::string&, const std::string&,
-                                    const std::string&, const std::string&, uint32_t, const std::string&,
+                                    const std::string&, const std::string& nonce, uint32_t, const std::string&,
                                     const std::string&, const std::vector<std::string>&) const override
     {
-        return submit_difficulty;
+        const auto it = nonce_difficulty.find(nonce);
+        return it != nonce_difficulty.end() ? it->second : submit_difficulty;
+    }
+    // Per-nonce achieved difficulty (set before a connection), else submit_difficulty.
+    std::map<std::string, double> nonce_difficulty;
+    // The Best Share feed: the difficulty of every record_best_pseudoshare call.
+    std::vector<double> best_diffs;
+    void record_best_pseudoshare(double d, const std::string&, const std::string&, const std::string&,
+                                 const std::string&, const std::string&, const std::string&, const std::string&,
+                                 uint32_t, const std::string&, const std::string&,
+                                 const std::vector<std::string>&) override
+    {
+        std::lock_guard<std::mutex> l(mu);
+        best_diffs.push_back(d);
     }
     size_t count() const
     {
@@ -2569,6 +2582,51 @@ TEST(NodeFeeStratumSession, SubmitIsJudgedByItsJobsShareBits)
     std::lock_guard<std::mutex> l(rig.ws->mu);
     ASSERT_EQ(rig.ws->submits.size(), 1u) << "a share at its job's own bits was dropped (judged by the last job built)";
     EXPECT_EQ(rig.ws->submit_share_bits[0], easy) << "the work source classifies it against its job's bits";
+}
+
+// The Best Share card's feed (PR #2201): every accepted submission reaches
+// record_best_pseudoshare exactly once with its ACHIEVED difficulty, a
+// pseudoshare under its job's share bits and a pool share alike (p2pool
+// work.py got_response update_best_difficulty, :4133/:4183). The pool-share
+// gate (its job's frozen bits) neither drops nor repeats it; a low-difficulty
+// reject never reaches it.
+TEST(StratumBestShare, EveryAcceptedSubmitFeedsItOnceAtItsAchievedDifficulty)
+{
+    using namespace std::chrono_literals;
+    constexpr uint32_t easy = 0x1c0bc28d, hard = 0x1b6477da;   // field: diff ~21.8 and ~652
+    SessionRig rig({98});
+    rig.ws->frozen_bits = hard;          // this job's share bits
+    rig.ws->live_bits = easy;            // the last job built: must not make 100 a pool share
+    rig.ws->block_bits = "1a0fffff";     // no block (difficulty ~1e6)
+    rig.ws->nonce_difficulty = {{"00000001", 100.0},    // pseudoshare: under the job's ~652
+                                {"00000002", 1000.0},   // pool share
+                                {"00000003", 0.0}};     // under vardiff: rejected
+    LineClient c(rig.port);
+    rig.step(c, 1, "mining.subscribe", nlohmann::json::array());
+    ASSERT_TRUE(rig.step(c, 2, "mining.authorize", {b58(48, 0x01), "x"}));
+    ASSERT_FALSE(c.last_job.empty());
+    const std::string job = c.last_job;   // one job: its issued difficulty bounds the vardiff gate
+    const auto submit = [&](int id, const char* nonce) {
+        c.send({{"id", id}, {"method", "mining.submit"}, {"params", {"w", job, "00000000", "6ae2a090", nonce}}});
+        return c.wait_id(id);
+    };
+    const auto r1 = submit(3, "00000001");
+    const auto r2 = submit(4, "00000002");
+    const auto r3 = submit(5, "00000003");
+    ASSERT_TRUE(r1 && r2 && r3);
+    EXPECT_TRUE((*r1)["result"].is_boolean() && (*r1)["result"].get<bool>());
+    EXPECT_TRUE((*r2)["result"].is_boolean() && (*r2)["result"].get<bool>());
+    EXPECT_FALSE((*r3)["result"].is_boolean() && (*r3)["result"].get<bool>()) << "0 is under any vardiff";
+    const auto nsub = [&rig] {
+        std::lock_guard<std::mutex> l(rig.ws->mu);
+        return rig.ws->submits.size();
+    };
+    for (int i = 0; i < 100 && nsub() == 0; ++i) std::this_thread::sleep_for(5ms);
+    std::lock_guard<std::mutex> l(rig.ws->mu);
+    EXPECT_EQ(rig.ws->submits.size(), 1u) << "only the 1000 meets its job's share bits";
+    ASSERT_EQ(rig.ws->best_diffs.size(), 2u) << "each accepted submission once; the reject never";
+    EXPECT_DOUBLE_EQ(rig.ws->best_diffs[0], 100.0) << "the achieved difficulty, not a target";
+    EXPECT_DOUBLE_EQ(rig.ws->best_diffs[1], 1000.0) << "a pool share feeds the card too";
 }
 
 // Merged chains configured but not attached yet: a login is refused (it would

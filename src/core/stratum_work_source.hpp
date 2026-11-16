@@ -230,11 +230,11 @@ public:
     /// The stratum session invokes this for EVERY accepted pseudoshare (the
     /// vardiff-gate acceptance path), passing the already-computed X11/scrypt
     /// share difficulty plus the raw submit fields so an implementor that wants
-    /// the exact pow-hash can recompute it. Default no-op — only work sources
-    /// whose dashboard is a separate object (c2pool-dash: the DASHWorkSource
-    /// drives its own stratum acceptor, distinct from the WebServer's
-    /// MiningInterface) override this to forward to the dashboard's best-share
-    /// tracker. Display only — never affects acceptance, target, or payout.
+    /// the exact pow-hash can recompute it. Default no-op. Overridden by
+    /// MiningInterface (LTC + merged DOGE: it is both the work source and the
+    /// dashboard) and by DASHWorkSource (c2pool-dash: its own stratum acceptor,
+    /// forwarding to the dashboard's MiningInterface). Display only — never
+    /// affects acceptance, target, or payout.
     virtual void record_best_pseudoshare(
         double /*share_difficulty*/, const std::string& /*miner*/,
         const std::string& /*coinb1*/, const std::string& /*coinb2*/,
