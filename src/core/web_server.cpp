@@ -8127,9 +8127,13 @@ nlohmann::json MiningInterface::rest_best_share()
     double net_diff = m_network_difficulty.load(std::memory_order_relaxed);
     result["network_difficulty"] = net_diff;
 
+    // Read under the lock: the stratum handlers (io thread) raise the merged
+    // legs while this runs on the HTTP thread.
+    double merged_all_time_seen = 0.0;
     {
         std::lock_guard<std::mutex> lock(m_best_diff_mutex);
         auto now_ts = static_cast<uint64_t>(std::time(nullptr));
+        merged_all_time_seen = m_best_difficulty.merged_all_time;
 
         // Honest-absent: until a real record share is seen, best-share
         // difficulty reads 0. We deliberately do NOT substitute the sharechain
@@ -8185,7 +8189,7 @@ nlohmann::json MiningInterface::rest_best_share()
         }
     }
 
-    if (merged_net_diff > 0 || m_best_difficulty.merged_all_time > 0) {
+    if (merged_net_diff > 0 || merged_all_time_seen > 0) {
         std::lock_guard<std::mutex> lock(m_best_diff_mutex);
         auto pct = [](double d, double nd) { return nd > 0 ? d / nd * 100.0 : 0.0; };
         result["merged"] = {
@@ -11524,6 +11528,20 @@ void MiningInterface::load_stat_log()
 // lived only in memory — every restart re-founded "all time", and the card
 // silently redefined the word. Only the all-time legs (primary + merged) are persisted: session
 // and round are honestly per-process / per-round and must reset.
+//
+// Sidecar "v": 2 comes from the build whose LTC card is fed by local achieved
+// hashes (record_best_pseudoshare). A v1 file (no "v") on LTC holds a share
+// TARGET: its only feed was the sharechain verify hook, which reported every
+// pool miner's share target, and the stratum's achieved difficulty never
+// reached it. Field (2026-11): a peer's target 21631 was the "all time" record
+// on two unrelated nodes, and the raise-only load would keep it until a local
+// hash beat it (hours to days for a small miner). On LTC a v1 primary leg is
+// dropped (a v1 file has no merged leg). Other coins' feeds did not change at
+// v2, so their v1 files load as before.
+namespace {
+constexpr int kBestShareSidecarVersion = 2;
+}  // namespace
+
 void MiningInterface::save_best_share_all_time()
 {
     const std::string path = best_share_db_path();
@@ -11533,7 +11551,8 @@ void MiningInterface::save_best_share_all_time()
         std::lock_guard<std::mutex> lock(m_best_diff_mutex);
         if (m_best_difficulty.all_time <= 0.0
             && m_best_difficulty.merged_all_time <= 0.0) return;   // nothing measured
-        j = {{"difficulty", m_best_difficulty.all_time},
+        j = {{"v", kBestShareSidecarVersion},
+             {"difficulty", m_best_difficulty.all_time},
              {"miner", m_best_difficulty.all_time_miner},
              {"hash", m_best_difficulty.all_time_hash},
              {"ts", m_best_difficulty.all_time_ts}};
@@ -11563,6 +11582,14 @@ void MiningInterface::load_best_share_all_time()
             (std::istreambuf_iterator<char>(f)),
             std::istreambuf_iterator<char>()));
         if (!j.is_object()) return;
+        const int v = j.value("v", 1);
+        if (v < kBestShareSidecarVersion && m_blockchain == Blockchain::LITECOIN) {
+            LOG_INFO << "[BestShare] v" << v << " sidecar " << path
+                     << " dropped: its all-time difficulty="
+                     << j.value("difficulty", 0.0)
+                     << " is a sharechain share target, not a hash this node found";
+            return;
+        }
         const double d = j.value("difficulty", 0.0);
         std::lock_guard<std::mutex> lock(m_best_diff_mutex);
         if (j.contains("merged") && j["merged"].is_object()) {

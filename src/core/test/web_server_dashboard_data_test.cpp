@@ -1927,3 +1927,95 @@ TEST(DashboardData, MergedAllTimeBestShareSurvivesARestart)
     std::remove(log_path.c_str());
     std::remove((log_path + ".best.json").c_str());
 }
+
+// The record's hash is the scrypt pow-hash of the submitted header: the same
+// bytes the stratum gate hashed (calculate_share_difficulty), so the hash read
+// back as a difficulty is the record's difficulty.
+TEST(DashboardData, BestPseudoshareHashIsItsHeadersPowHash)
+{
+    const std::string coinb1 = "01000000", coinb2 = "00000000";
+    const std::string en1 = "00000000", en2 = "00000000";
+    const std::string ntime = "6ae2a090", nonce = "00000000";
+    const std::string prev(64, '1'), nbits = "1a0fffff";
+    const uint32_t version = 0x20000000;
+    const double d = MiningInterface::calculate_share_difficulty(
+        coinb1, coinb2, en1, en2, ntime, nonce, version, prev, nbits, {});
+    ASSERT_GT(d, 0.0);
+
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::LITECOIN);
+    mi.record_best_pseudoshare(d, "w1", coinb1, coinb2, en1, en2, ntime, nonce,
+                               version, prev, nbits, {});
+    const auto bs = mi.rest_best_share();
+    const std::string hash = bs["round"]["hash"].get<std::string>();
+    ASSERT_EQ(hash.size(), 64u);
+    EXPECT_EQ(bs["all_time"]["hash"].get<std::string>(), hash);
+    uint256 h;
+    h.SetHex(hash);
+    double hv = 0.0;
+    for (int i = 31; i >= 0; --i) hv = hv * 256.0 + static_cast<double>(h.data()[i]);
+    ASSERT_GT(hv, 0.0);
+    static const double truediffone =
+        26959535291011309493156476344723991336010898738574164086137773096960.0;
+    EXPECT_NEAR(truediffone / hv, d, d * 1e-9)
+        << "the card's hash is not the hash its difficulty was measured on";
+}
+
+// A v1 sidecar (no "v") on LTC holds a sharechain share TARGET: the LTC card's
+// only feed was the verify hook, which reported every pool miner's share
+// target. It must not come back as this node's all-time record (field 2026-11:
+// a peer's 21631 on two unrelated nodes). DASH's feeds did not change, so its
+// v1 files keep loading.
+TEST(DashboardData, PreFixLtcBestShareSidecarIsDropped)
+{
+    const std::string log_path = "/tmp/c2pool_test_bestshare_v1_statlog.json";
+    const std::string side = log_path + ".best.json";
+    const auto write_v1 = [&side] {
+        std::ofstream f(side, std::ios::trunc);
+        f << R"({"difficulty":21631.0,"miner":"5d1f0e9a7c3b2a1908f7e6d5c4b3a29180706050","hash":"","ts":1793000000})";
+    };
+    std::remove(log_path.c_str());
+
+    write_v1();
+    {
+        MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                           c2pool::address::Blockchain::LITECOIN);
+        mi.set_stat_log_path(log_path);
+        mi.load_stat_log();
+        const auto bs = mi.rest_best_share();
+        EXPECT_DOUBLE_EQ(bs["all_time"]["difficulty"].get<double>(), 0.0)
+            << "a peer's share target came back as this node's record";
+        EXPECT_FALSE(bs["has_best_share"].get<bool>());
+        // The first local hash starts the record; the file is rewritten as v2.
+        best_pseudoshare(mi, 900.0, "w1");
+        mi.save_stat_log();
+    }
+    {
+        std::ifstream f(side);
+        const auto j = nlohmann::json::parse(f);
+        EXPECT_EQ(j.value("v", 0), 2);
+        EXPECT_DOUBLE_EQ(j.value("difficulty", 0.0), 900.0);
+    }
+    {
+        MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                           c2pool::address::Blockchain::LITECOIN);
+        mi.set_stat_log_path(log_path);
+        mi.load_stat_log();
+        const auto bs = mi.rest_best_share();
+        EXPECT_DOUBLE_EQ(bs["all_time"]["difficulty"].get<double>(), 900.0)
+            << "a v2 file is this node's own record";
+        EXPECT_EQ(bs["all_time"]["miner"].get<std::string>(), "w1");
+    }
+
+    write_v1();
+    {
+        MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                           c2pool::address::Blockchain::DASH);
+        mi.set_stat_log_path(log_path);
+        mi.load_stat_log();
+        EXPECT_DOUBLE_EQ(mi.rest_best_share()["all_time"]["difficulty"].get<double>(), 21631.0)
+            << "DASH's feeds are unchanged; its v1 files load as before";
+    }
+    std::remove(log_path.c_str());
+    std::remove(side.c_str());
+}
