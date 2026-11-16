@@ -28,6 +28,7 @@ interface Fns {
   c2pMergedIsDonation(merged: MergedChild, ci: CurrencyInfo | undefined): boolean;
   c2pPayoutVersionHtml(role: string, mv: Ver, thr: number, staleTitle: string): string | null;
   c2pPayoutRoleLabel(role: string, sym: string): { text: string; title: string } | null;
+  c2pPayoutRowSymbol(addr: string, entry: Row | null, ci: CurrencyInfo | undefined): string;
 }
 
 const html = readFileSync(new URL('../../../dashboard.html', import.meta.url), 'utf8');
@@ -41,7 +42,7 @@ function section(name: string): string {
 
 // eslint-disable-next-line @typescript-eslint/no-implied-eval
 const f = new Function(section('c2pPayoutRole')
-  + '\nreturn { c2pPayoutRole, c2pMergedIsDonation, c2pPayoutVersionHtml, c2pPayoutRoleLabel };')() as Fns;
+  + '\nreturn { c2pPayoutRole, c2pMergedIsDonation, c2pPayoutVersionHtml, c2pPayoutRoleLabel, c2pPayoutRowSymbol };')() as Fns;
 
 const DON_LTC = 'MLhSmVQxMusLE3pjGFvp4unFckgjeD8LUA';
 const DON_DOGE = 'A5EZCT4tUrtoKuvJaWbtVQADzdUKdtsqpr';
@@ -133,6 +134,17 @@ test('a donation output no parent row took is its own row, keyed by its merged a
   assert.equal(f.c2pPayoutRole(DON_DOGE, row, CI_OLD), 'donation');
   // A lower-case symbol is matched against the upper-case currency_info keys.
   assert.equal(f.c2pMergedIsDonation({ symbol: 'doge', address: DON_DOGE }, CI_NEW), true);
+  // Its label names the chain the output is on, not the parent coin.
+  assert.equal(f.c2pPayoutRowSymbol(DON_DOGE, row, CI_NEW), 'DOGE');
+  assert.equal(f.c2pPayoutRowSymbol(DON_DOGE, row, CI_OLD), 'DOGE', 'older node: its own child\'s symbol');
+  assert.equal(f.c2pPayoutRowSymbol(DON_DOGE, null, CI_NEW), 'DOGE', 'from merged_donation_addresses alone');
+  assert.equal(f.c2pPayoutRoleLabel('donation', f.c2pPayoutRowSymbol(DON_DOGE, row, CI_NEW))!.title,
+    'Donation output of the coinbase for DOGE');
+  // A parent row stays on the parent coin.
+  assert.equal(f.c2pPayoutRowSymbol(DON_LTC, LTC_MERGED[DON_LTC]!, CI_NEW), 'LTC');
+  assert.equal(f.c2pPayoutRowSymbol(DON_LTC, LTC_MERGED[DON_LTC]!, CI_OLD), 'LTC');
+  assert.equal(f.c2pPayoutRowSymbol('LVypi56LPcT9jR3e5Y5AdoVc5EGdrVk26F', LTC_MERGED.LVypi56LPcT9jR3e5Y5AdoVc5EGdrVk26F!, CI_NEW), 'LTC');
+  assert.equal(f.c2pPayoutRowSymbol('XmMiner', null, {}), 'COIN');
 });
 
 test('⚑ node fee: the published node-owner address; the donation outranks it', () => {

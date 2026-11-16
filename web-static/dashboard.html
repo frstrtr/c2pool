@@ -5162,6 +5162,21 @@
                 return { text: '⚑ node fee', title: 'Node-owner fee address of this node: its fee shares pay here' };
             return null;
         }
+        // The chain a main row's output is on: a donation output no parent row
+        // took is keyed by its merged-chain address (the merged_donation_addresses
+        // key, or on an older node its own child's symbol); else the parent coin.
+        function c2pPayoutRowSymbol(addr, entry, ci) {
+            ci = ci || {};
+            var mda = ci.merged_donation_addresses;
+            if (mda && typeof mda === 'object') {
+                for (var k in mda) if (mda[k] === addr) return k;
+            }
+            var m = entry && entry.merged;
+            if (m && m.length) {
+                for (var i = 0; i < m.length; i++) if (m[i] && m[i].address === addr && m[i].symbol) return m[i].symbol;
+            }
+            return ci.symbol || 'COIN';
+        }
         // END c2pPayoutRole
         function appendPayoutRoleLabel(td, role, sym) {
             var lb = c2pPayoutRoleLabel(role, sym);
@@ -5226,7 +5241,7 @@
                     .attr('title', (((typeof currency_info !== 'undefined' && currency_info.symbol) || 'LTC')) + ': ' + addr)
                     .text(addr);
                 var role = c2pPayoutRole(addr, entry, currency_info);
-                appendPayoutRoleLabel(addrTd, role, currency_info.symbol || 'COIN');
+                appendPayoutRoleLabel(addrTd, role, c2pPayoutRowSymbol(addr, entry, currency_info));
 
                 // Version column — look up miner version from defrag share data
                 var v36Td = mainRow.append('td').style('text-align', 'center');
@@ -5509,7 +5524,7 @@
                     .attr('title', addr)
                     .text(addr);
                 var role = c2pPayoutRole(addr, null, currency_info);
-                appendPayoutRoleLabel(addrTd, role, currency_info.symbol || 'COIN');
+                appendPayoutRoleLabel(addrTd, role, c2pPayoutRowSymbol(addr, null, currency_info));
                 // Version column
                 var v36Td = tr.append('td').style('text-align', 'center');
                 var mv = getMinerVersion(addr);
