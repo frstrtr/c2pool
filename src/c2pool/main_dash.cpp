@@ -231,7 +231,8 @@ struct PeeringConfig {
     uint16_t    listen_port = 0;           // 0 => sharechain SSOT default (8999/18999; 8998 under --net dash-v36)
     bool        listen_set  = false;
     std::vector<NetService> addnodes;      // --addnode HOST:PORT (persistent outbound)
-    std::vector<NetService> connects;      // --connect HOST:PORT (connect-only; no listen/discovery)
+    std::vector<NetService> connects;      // --connect HOST:PORT: outbound dials ONLY the configured peers
+                                           // (no addr-gossip dialing); no inbound listener unless --listen
 };
 
 // Parse "HOST:PORT" (PORT mandatory; IPv4/hostname single-colon form).
@@ -590,7 +591,8 @@ void report_peering(const PeeringConfig& peer, bool testnet)
     const uint16_t bind = peer.listen_port ? peer.listen_port : ssot;
     if (!peer.connects.empty() && !peer.listen_set) {
         std::cout << "[run] sharechain peering: --connect mode ("
-                  << peer.connects.size() << " peer[s]); listen + discovery suppressed\n";
+                  << peer.connects.size() << " peer[s]); outbound dials ONLY the configured"
+                     " peers (no addr-gossip dialing); inbound listener suppressed\n";
     } else {
         std::cout << "[run] sharechain peering: listen " << peer.listen_host << ":" << bind
                   << (peer.listen_set ? " (--listen)\n" : " (sharechain SSOT default)\n");
@@ -1657,6 +1659,13 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // think()'s desired-set dispatch rides run_think). This is what lets an
     // EMPTY node JOIN an established p2pool-dash chain instead of only
     // serving inbound peers.
+    // --connect: outbound dials go only to the explicitly configured peers
+    // (--connect plus any --addnode), never to addresses learned from gossip.
+    if (!peer.connects.empty()) {
+        std::vector<NetService> configured(peer.connects);
+        configured.insert(configured.end(), peer.addnodes.begin(), peer.addnodes.end());
+        p2p_node.set_connect_only(configured);
+    }
     p2p_node.start_outbound_connections();
     if (!config.pool()->m_bootstrap_addrs.empty())
         std::cout << "[run] outbound dialing started ("
@@ -5728,6 +5737,22 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             };
         LOG_INFO << "[HEAD-SCORE] block-solution credit ARMED: a block-solving share's header"
                     " bits are checked against this node's header chain";
+
+        // Dashboard network hashrate from chain work over the last 576 headers
+        // (Dash Core getnetworkhashps(576)) instead of the tip difficulty, which
+        // DarkGravityWave swings ~2x within hours (11-16: tip formula 5.6 PH/s,
+        // getnetworkhashps 3.25 PH/s). Same oracle as the block-bits credit: it
+        // detaches before header_chain is destroyed, so a late web request gets
+        // 0 (the web server falls back to its formula) instead of freed headers.
+        if (web_server) {
+            web_server->get_mining_interface()->set_network_hashrate_fn(
+                [oracle = block_bits_oracle.oracle]() -> double {
+                    std::lock_guard<std::mutex> lk(oracle->m);
+                    return oracle->hc ? oracle->hc->network_hashps(576) : 0.0;
+                });
+            LOG_INFO << "[WEB] network hashrate = chain work over the last 576 headers"
+                        " (getnetworkhashps-equivalent)";
+        }
 
         // CROSS-LANE ASYMMETRY CLOSED: HeaderChain::is_synced() was DEFINED
         // AND NEVER CALLED on the DASH path (bch 13 callers, ltc 12, nmc 12,
@@ -11733,13 +11758,16 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             // the work source read the job's own height) takes its height from
             // the header chain when the chain holds that header; the re-verify
             // pass below then resolves it at that height.
-            cache_mi->backfill_found_block_heights(
-                [hc](const std::string& block_hash_hex) -> uint64_t {
-                    uint256 h;
-                    h.SetHex(block_hash_hex);
-                    auto e = hc->get_header(h);
-                    return e ? static_cast<uint64_t>(e->height) : 0;
-                });
+            auto height_lookup = [hc](const std::string& block_hash_hex) -> uint64_t {
+                uint256 h;
+                h.SetHex(block_hash_hex);
+                auto e = hc->get_header(h);
+                return e ? static_cast<uint64_t>(e->height) : 0;
+            };
+            cache_mi->backfill_found_block_heights(height_lookup);
+            // Kept for a row recorded at height 0 after this backfill: it
+            // learns its height when its block confirms.
+            cache_mi->set_block_height_lookup(height_lookup);
             // Retain the same lookups so the record + confirm paths can fill a
             // missing network_difficulty for blocks won AFTER this backfill runs
             // (sharechain-replay / relay wins recorded seconds into boot), whose

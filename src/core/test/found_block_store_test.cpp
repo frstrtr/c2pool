@@ -55,6 +55,11 @@ struct Bytes {
     Bytes& dbl(double d) { uint64_t b; std::memcpy(&b, &d, 8); return u64(b); }
 };
 
+// The bytes each serializer writes after its last versioned tail: the fblk
+// extension byte (aux_difficulty_known) and the mblk aux difficulty (a u64).
+constexpr size_t kFblkExt = 1;
+constexpr size_t kMblkExt = 8;
+
 // Two 64-char hashes sharing their first 16 chars (the part the key keeps).
 const std::string kHashA = std::string(16, '5') + std::string(48, 'a');
 const std::string kHashB = std::string(16, '5') + std::string(48, 'b');
@@ -201,9 +206,9 @@ TEST(FoundBlockStoreKat, TruncatedTailLeavesTxCountUnknown)
     FoundBlockRecord f = FoundBlockRecord::deserialize(fblk_v2_record().v);
     f.tx_count = 7;
     auto fb = f.serialize();
-    // Cuts the v3 tail: drops the empty v4 parent tail (len + flag + u64) and
-    // the last 2 bytes of the tx_count u32.
-    fb.resize(fb.size() - (1 + 1 + 8) - 2);
+    // Cuts the v3 tail: drops the extension byte, the empty v4 parent tail
+    // (len + flag + u64) and the last 2 bytes of the tx_count u32.
+    fb.resize(fb.size() - kFblkExt - (1 + 1 + 8) - 2);
     auto back = FoundBlockRecord::deserialize(fb);
     EXPECT_EQ(back.block_hash, kHashA);
     EXPECT_FALSE(back.tx_count.has_value());
@@ -213,7 +218,7 @@ TEST(FoundBlockStoreKat, TruncatedTailLeavesTxCountUnknown)
     MergedBlockRecord m = MergedBlockRecord::deserialize(mblk_v1_record(98, 1, kHashA).v);
     m.tx_count = 7;
     auto mb = m.serialize();
-    mb.resize(mb.size() - 2);
+    mb.resize(mb.size() - kMblkExt - 2);   // the difficulty, then 2 of tx_count
     EXPECT_FALSE(MergedBlockRecord::deserialize(mb).tx_count.has_value());
 }
 
@@ -226,7 +231,7 @@ TEST(FoundBlockStoreKat, CutTxCountDoesNotLeakIntoTheParentTail)
     for (auto [tx_count, kept] : {std::pair<uint32_t, size_t>{1, 2}, {1, 3}, {258, 3}}) {
         f.tx_count = tx_count;
         auto fb = f.serialize();
-        fb.resize(fb.size() - (1 + 1 + 8) - (4 - kept));
+        fb.resize(fb.size() - kFblkExt - (1 + 1 + 8) - (4 - kept));
         auto back = FoundBlockRecord::deserialize(fb);
         EXPECT_EQ(back.block_hash, kHashA) << tx_count << "/" << kept;
         EXPECT_FALSE(back.tx_count.has_value()) << tx_count << "/" << kept;
@@ -318,8 +323,49 @@ TEST(FoundBlockStoreKat, FblkV4CarriesTheMergedParent)
     // A cut parent_height stays unknown, never 0.
     rec.parent_height = 2900001;
     auto cut = rec.serialize();
-    cut.resize(cut.size() - 3);
+    cut.resize(cut.size() - kFblkExt - 3);
     EXPECT_FALSE(FoundBlockRecord::deserialize(cut).parent_height.has_value());
+}
+
+// The byte after the v4 tail says a merged row's network_difficulty is the
+// AUX chain's own (a row written before it holds the parent's). It is an
+// extension WITHOUT a version bump: a build that predates it refuses any
+// version above 4 and would lose the row, but stops reading after the v4 tail
+// and so never sees the byte.
+TEST(FoundBlockStoreKat, FblkExtensionByteCarriesTheAuxDifficultyFlag)
+{
+    FoundBlockRecord rec = FoundBlockRecord::deserialize(fblk_v2_record().v);
+    rec.chain = "DOGE";
+    rec.parent_hash = hash_n(0x17c);
+    rec.network_difficulty = 33000000.0;
+
+    // Written before the flag existed: no byte, not known.
+    auto old_row = rec.serialize();
+    ASSERT_EQ(old_row[0], 4) << "no version bump";
+    old_row.resize(old_row.size() - kFblkExt);
+    auto back = FoundBlockRecord::deserialize(old_row);
+    EXPECT_EQ(back.block_hash, kHashA);
+    EXPECT_EQ(back.parent_hash, hash_n(0x17c));
+    EXPECT_FALSE(back.aux_difficulty_known);
+
+    // Default false round-trips false; set, it round-trips true.
+    EXPECT_FALSE(FoundBlockRecord::deserialize(rec.serialize()).aux_difficulty_known);
+    rec.aux_difficulty_known = true;
+    const auto with_flag = rec.serialize();
+    back = FoundBlockRecord::deserialize(with_flag);
+    EXPECT_TRUE(back.aux_difficulty_known);
+    EXPECT_DOUBLE_EQ(back.network_difficulty, 33000000.0);
+    EXPECT_EQ(back.parent_hash, hash_n(0x17c));
+
+    // The row is the pre-extension row plus one byte: an earlier build reads
+    // the same bytes up to the v4 tail and gets every field it knows.
+    ASSERT_EQ(with_flag.size(), old_row.size() + kFblkExt);
+    EXPECT_TRUE(std::equal(old_row.begin(), old_row.end(), with_flag.begin()));
+
+    // A cut v4 tail never turns leftover bytes into the flag.
+    auto cut = with_flag;
+    cut.resize(cut.size() - kFblkExt - 3);
+    EXPECT_FALSE(FoundBlockRecord::deserialize(cut).aux_difficulty_known);
 }
 
 TEST(FoundBlockStoreKat, UnknownVersionsAreRejected)
@@ -416,6 +462,39 @@ TEST(MergedBlockStoreKat, MblkV2IsAPureAppendAndRoundTrips)
     EXPECT_EQ(*back.tx_count, 0u);
     EXPECT_EQ(back.miner, "Dminer");
     EXPECT_EQ(back.parent_height, 2900000u);
+}
+
+// The aux chain's own difficulty rides after the v2 tail, again without a
+// version bump (an earlier build stops after its tail and keeps the record).
+TEST(MergedBlockStoreKat, MblkExtensionCarriesTheAuxDifficulty)
+{
+    auto rec = MergedBlockRecord::deserialize(mblk_v1_record(98, 5400000, kHashA).v);
+    EXPECT_DOUBLE_EQ(rec.difficulty, 0.0) << "a v1 record has none";
+    rec.share_hash = hash_n(0x5a);
+    rec.tx_count = 7;
+
+    // Written before the difficulty existed: nothing after the v2 tail.
+    auto old_row = rec.serialize();
+    ASSERT_EQ(old_row[0], 2) << "no version bump";
+    old_row.resize(old_row.size() - kMblkExt);
+    auto back = MergedBlockRecord::deserialize(old_row);
+    EXPECT_EQ(back.block_hash, kHashA);
+    EXPECT_DOUBLE_EQ(back.difficulty, 0.0);
+    ASSERT_TRUE(back.tx_count.has_value());
+    EXPECT_EQ(*back.tx_count, 7u);
+
+    rec.difficulty = 33412345.678;
+    const auto with_difficulty = rec.serialize();
+    back = MergedBlockRecord::deserialize(with_difficulty);
+    EXPECT_DOUBLE_EQ(back.difficulty, 33412345.678);
+    EXPECT_EQ(back.share_hash, hash_n(0x5a));
+    ASSERT_EQ(with_difficulty.size(), old_row.size() + kMblkExt);
+    EXPECT_TRUE(std::equal(old_row.begin(), old_row.end(), with_difficulty.begin()));
+
+    // A cut difficulty is not known, never a number made of leftover bytes.
+    auto cut = with_difficulty;
+    cut.resize(cut.size() - 3);
+    EXPECT_DOUBLE_EQ(MergedBlockRecord::deserialize(cut).difficulty, 0.0);
 }
 
 TEST(MergedBlockStoreKat, UpdateCoinbaseReachesTheNewestPast1000)

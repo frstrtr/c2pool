@@ -195,11 +195,17 @@ cmake --build . --target c2pool-dash -j$(nproc)
 ./src/c2pool/c2pool-dash --version   # the last line must end in: bls=dashbls
 ```
 
-Without `-DC2POOL_DASH_BLS=ON` the target still builds, but as `bls=stub`:
-configure prints `c2pool-dash: dashbls NOT linked -> bls=stub`, the build ends
-with a `WARNING: c2pool-dash was built WITHOUT dashbls` line, and the binary
-refuses a daemonless `c2pool-dash --run` with `[BLS-STUB] refusing to start`
-(exit 2). Only a dashd-attached node (`--coin-rpc`) runs on a stub build.
+A fresh configure that does not pass `-DC2POOL_DASH_BLS` at all finds dashbls
+by itself under `$DASHBLS_ROOT`, `$HOME/.c2pool-deps/dashbls`, `/usr/local` or
+`/opt/dashbls` (`dashbls auto-detected at <prefix>`).
+
+Without dashbls the `c2pool-dash` target **fails to build** and prints how to
+fix it; every other target builds. To build a `bls=stub` binary on purpose
+(only for a dashd-attached node, or CI), configure with
+`-DC2POOL_DASH_ALLOW_NO_BLS=ON`: the build then ends with a
+`WARNING: c2pool-dash was built WITHOUT dashbls` line, and the binary refuses a
+daemonless `c2pool-dash --run` with `[BLS-STUB] refusing to start` (exit 2).
+Only a dashd-attached node (`--coin-rpc`) runs on a stub build.
 `-DC2POOL_DASH_BLS=ON` with the library missing is a configure error, not a
 silent fallback. Running options: README
 [c2pool-dash — Dash (X11)](../README.md#c2pool-dash--dash-x11).

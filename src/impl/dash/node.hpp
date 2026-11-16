@@ -499,6 +499,8 @@ protected:
     static constexpr size_t DEFAULT_TARGET_OUTBOUND_PEERS = 8;
     size_t m_max_peers = 30;
     size_t m_target_outbound_peers = DEFAULT_TARGET_OUTBOUND_PEERS;
+    /// set_connect_only: when non-empty, the ONLY addresses try_connect_peers dials.
+    std::set<NetService> m_connect_only;
     std::unique_ptr<core::Timer> m_connect_timer;   // 30s dial maintenance
     // Periodic have_tx/losing_tx delta sweep (core/tx_advertiser.hpp). Cadence
     // mirrors the canonical known-tx removal loop, node.py:298 t.start(10).
@@ -1708,6 +1710,20 @@ public:
     }
 
     void set_target_outbound_peers(size_t count) { m_target_outbound_peers = count; }
+
+    /// --connect (bitcoind -connect semantics): outbound dials go ONLY to the
+    /// explicitly configured peers (`addrs` = the --connect set plus any
+    /// --addnode). Addr gossip may still fill the AddrStore, but no maintenance
+    /// pass dials an address learned that way. The outbound target becomes the
+    /// size of the set. Empty (the default) keeps normal discovery.
+    void set_connect_only(const std::vector<NetService>& addrs)
+    {
+        m_connect_only.clear();
+        m_connect_only.insert(addrs.begin(), addrs.end());
+        if (!m_connect_only.empty())
+            m_target_outbound_peers = m_connect_only.size();
+    }
+    bool connect_only() const { return !m_connect_only.empty(); }
     void set_max_peers(size_t count) { m_max_peers = count; }
 
     // Completes a pending async share request when a sharereply arrives.

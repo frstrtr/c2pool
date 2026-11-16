@@ -386,6 +386,19 @@ target_link_libraries(c2pool-dash
 # A BLS-dark c2pool-dash must not finish its build silently (#1671): the
 # configure-time STATUS line in the root CMakeLists scrolls away long before
 # the link, so repeat it as the last line of the c2pool-dash build.
+if(NOT C2POOL_DASH_BLS_AVAILABLE AND NOT C2POOL_DASH_ALLOW_NO_BLS)
+    # The target itself fails (other targets build): a bls=stub c2pool-dash
+    # refuses a daemonless --run, so building one by accident only produces a
+    # node that will not start. Opt out explicitly for a dashd-attached node or
+    # CI's stub-honesty gate.
+    add_custom_target(c2pool_dash_requires_bls
+        COMMAND ${CMAKE_COMMAND} -E echo
+            "ERROR: c2pool-dash needs dashbls. Build it once with scripts/build_dashbls.sh $HOME/.c2pool-deps/dashbls (picked up automatically on a fresh configure) or configure with -DC2POOL_DASH_BLS=ON -DDASHBLS_ROOT=<prefix>; see README: Dash: build with BLS. Only for a dashd-attached node or CI: -DC2POOL_DASH_ALLOW_NO_BLS=ON."
+        COMMAND ${CMAKE_COMMAND} -E false
+        VERBATIM)
+    add_dependencies(c2pool-dash c2pool_dash_requires_bls)
+    message(STATUS "c2pool-dash: dashbls not linked (C2POOL_DASH_BLS=${C2POOL_DASH_BLS}) and C2POOL_DASH_ALLOW_NO_BLS=OFF -- building the c2pool-dash target will FAIL (other targets are unaffected)")
+endif()
 if(NOT C2POOL_DASH_BLS_AVAILABLE)
     add_custom_command(TARGET c2pool-dash POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E echo

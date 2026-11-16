@@ -45,12 +45,15 @@ constexpr uint64_t kHeight    = 3211872;
 constexpr uint32_t kAbsheight = 27707625;
 constexpr uint64_t kSubsidy   = 625549157;     // gentx value 6.25549157 LTC
 constexpr uint32_t kShareBits = 461335236;     // share_data.target
+constexpr uint32_t kBlockBits = 0x192d56b7;    // block 3211872's header nBits
+constexpr double   kBlockDifficulty = 94729203.34146552;   // what those bits state
 
 // The winning share (v36), field values.
 ltc::MergedMiningShare field_share()
 {
     ltc::MergedMiningShare s(uint256S(kBlock), uint256S(kParent));
     s.m_min_header.m_timestamp = kTimestamp;
+    s.m_min_header.m_bits = kBlockBits;
     s.m_coinbase = BaseScript(ParseHex(kScriptSigHex));
     // The peers' raw miner value IS this field's GetHex().
     s.m_pubkey_hash.SetHex("085cdff070d752d9e137e82396e387ec1641fd75");
@@ -93,6 +96,34 @@ TEST(LtcDashboardRow, PeerRowCarriesBlockFactsNotShareFacts)
     EXPECT_GT(row.share_difficulty, 0.0);
 
     EXPECT_EQ(ltc::dashboard::row_from_share(uint256S(kBlock), s, /*testnet=*/true).chain, "tLTC");
+}
+
+// The block's network difficulty is what its header's nBits state: the share
+// header IS the block header, so a block recorded after the fact (a
+// sharechain replay) keeps the difficulty it was mined at, not the live
+// template's at record time.
+TEST(LtcDashboardRow, PeerRowCarriesTheBlocksOwnDifficulty)
+{
+    const auto s = field_share();
+    const auto row = ltc::dashboard::row_from_share(uint256S(kBlock), s, /*testnet=*/false);
+    EXPECT_NEAR(row.network_difficulty, kBlockDifficulty, kBlockDifficulty * 1e-12)
+        << "block 3211872: bits 0x192d56b7";
+    EXPECT_NEAR(ltc::dashboard::difficulty_from_bits(kBlockBits), kBlockDifficulty,
+                kBlockDifficulty * 1e-12);
+    EXPECT_DOUBLE_EQ(ltc::dashboard::difficulty_from_bits(0), 0.0);
+
+    // The header's difficulty stands against a live reading of another
+    // moment; without a header value the live reading stands.
+    using ltc::dashboard::network_difficulty_at_find;
+    EXPECT_DOUBLE_EQ(network_difficulty_at_find(kBlockDifficulty, 96737553.66), kBlockDifficulty);
+    EXPECT_DOUBLE_EQ(network_difficulty_at_find(kBlockDifficulty, 0.0), kBlockDifficulty);
+    EXPECT_DOUBLE_EQ(network_difficulty_at_find(0.0, 96737553.66), 96737553.66);
+    // A share minted with no block bits carries its SHARE bits in the header
+    // (difficulty in the hundreds): not a network difficulty.
+    const double share_diff = ltc::dashboard::difficulty_from_bits(kShareBits);
+    ASSERT_GT(share_diff, 0.0);
+    ASSERT_LT(share_diff, 1.0e6);
+    EXPECT_DOUBLE_EQ(network_difficulty_at_find(share_diff, 96737553.66), 96737553.66);
 }
 
 // A v34/v35 share carries its address as a string.

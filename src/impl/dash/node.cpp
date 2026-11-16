@@ -1256,6 +1256,25 @@ void NodeImpl::try_connect_peers()
     if (outbound >= m_target_outbound_peers || m_connections.size() >= m_max_peers)
         return;
 
+    // --connect: dial the configured set and nothing else. Without this branch
+    // the pass below drew from the whole AddrStore, which addr gossip fills, so
+    // a "connect-only" node dialed every peer its one peer told it about.
+    if (!m_connect_only.empty())
+    {
+        for (const auto& addr : m_connect_only)
+        {
+            if (m_connections.size() >= m_max_peers)
+                break;
+            if (m_connections.contains(addr) || m_pending_outbound.contains(addr)
+                || is_banned(addr))
+                continue;
+            LOG_INFO << "[Pool] Dialing outbound peer " << addr.to_string() << " (--connect)";
+            m_pending_outbound.insert(addr);
+            core::Client::connect(addr);
+        }
+        return;
+    }
+
     size_t needed = m_target_outbound_peers - outbound;
     // Ask for a few extra in case some are already connected.
     for (auto& ap : get_good_peers(needed + 4))
