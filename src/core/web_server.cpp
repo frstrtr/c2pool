@@ -3313,6 +3313,10 @@ double MiningInterface::coin_block_period() const
 
 nlohmann::json MiningInterface::rest_global_rate()
 {
+    if (m_network_hashrate_fn) {
+        const double hr = m_network_hashrate_fn();
+        if (hr > 0) return hr;   // the coin's chain-work estimate (DASH)
+    }
     double net_diff = m_network_difficulty.load(std::memory_order_relaxed);
     if (net_diff > 0) {
         // network_hashrate = net_difficulty * 2^32 / block_period, at THIS
@@ -4278,6 +4282,14 @@ nlohmann::json MiningInterface::rest_global_stats()
         // coin's block interval. It was a fixed 150 s (LTC's): 4x too high
         // on BTC / BCH (600 s), 2x too low on a DGB algo (75 s).
         net_hashrate = net_diff * 4294967296.0 / coin_block_period();
+    }
+    // A coin that knows its chain work over a window replaces the tip-difficulty
+    // estimate (DASH: DarkGravityWave swings the tip difficulty ~2x within hours,
+    // so the formula above read the network at 5.6 PH/s while Dash Core's
+    // getnetworkhashps said 3.25 PH/s on 2026-11-16).
+    if (m_network_hashrate_fn) {
+        const double hr = m_network_hashrate_fn();
+        if (hr > 0) net_hashrate = hr;
     }
 
     // p2pool field names the dashboard expects

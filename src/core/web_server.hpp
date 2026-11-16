@@ -857,6 +857,11 @@ public:
 
     // Pool hashrate (H/s) — from P2P node's get_pool_attempts_per_second
     void set_pool_hashrate_fn(std::function<double()> fn) { m_pool_hashrate_fn = thread_safe_wrap(std::move(fn)); }
+    /// Optional network hashrate (H/s) from the coin's own chain, e.g. chain
+    /// work over a window (Dash Core getnetworkhashps). When it returns > 0 it
+    /// replaces the tip-difficulty estimate (difficulty * 2^32 / 150) in
+    /// /global_stats and /rate. Unset (every coin but DASH today) => unchanged.
+    void set_network_hashrate_fn(std::function<double()> fn) { m_network_hashrate_fn = thread_safe_wrap(std::move(fn)); }
 
     // Bypass the is_node_ready() + has_work gating. Used by coin targets
     // (e.g. c2pool-dash) that drive their own work pipeline and don't rely
@@ -2332,6 +2337,7 @@ private:
     uint16_t m_cached_miner_count{0};
     double m_cached_pool_hashrate{0};
     std::function<double()> m_pool_hashrate_fn;
+    std::function<double()> m_network_hashrate_fn;   // optional; see set_network_hashrate_fn
     std::atomic<bool> m_dashboard_always_ready{false};
     std::atomic<int> m_protocol_version{3600};
 
