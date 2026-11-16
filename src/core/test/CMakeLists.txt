@@ -263,6 +263,7 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
         pack_test.cpp
         packet_test.cpp
         payout_manager_rules_test.cpp
+        pool_luck_test.cpp
         random_choice_guard_test.cpp
         random_uniform_test.cpp
         reloaded_block_flag_test.cpp
