@@ -25,12 +25,14 @@
 #include <core/uint256.hpp>
 
 #include <array>
+#include <cassert>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <functional>
 #include <mutex>
+#include <thread>
 #include <utility>
 
 namespace core {
@@ -43,7 +45,8 @@ enum class MintDropReason : uint8_t {
     duplicate,      ///< the chain already holds this share
     not_backable,   ///< template txs no longer retained (cannot be relayed)
     gate,           ///< the producer rebuild refused it (identity / target)
-    stale_parent,   ///< the share's parent is gone
+    stale_parent,   ///< the share's parent is gone (a coin that can tell; DASH
+                    ///< reports a missing parent as `gate`)
     threw,          ///< try_mint threw
     shutdown,       ///< still queued when the node stopped
     queue_full,     ///< the queue was full when it was pushed
@@ -101,32 +104,51 @@ class DeferredMintQueue
 {
 public:
     using clock = std::chrono::steady_clock;
+    /// Told about every item that leaves the queue without being minted
+    /// (ttl, threw, a Dropped attempt, shutdown). May be empty.
+    using OnDrop = std::function<void(const Item&, MintDropReason)>;
 
     explicit DeferredMintQueue(size_t capacity = 64,
                                std::chrono::milliseconds ttl = std::chrono::milliseconds(20000))
         : m_capacity(capacity), m_ttl(ttl) {}
 
     /// Queue a solve behind the others. false (and counted as queue_full) when
-    /// the queue is full: the caller declines as before.
-    bool push_back(Item item, clock::time_point now = clock::now())
+    /// the queue is full: the caller declines as before, and `item` is left
+    /// untouched (it is moved from only when accepted).
+    bool push_back(Item&& item, clock::time_point now = clock::now())
     {
-        return push(std::move(item), now, /*front=*/false);
+        if (m_q.size() >= m_capacity) {
+            count_drop(MintDropReason::queue_full);
+            return false;
+        }
+        m_q.push_back(Entry{std::move(item), now});
+        note_push();
+        return true;
     }
-    /// Queue a solve AHEAD of the others (a block-winning share whose bounded
-    /// wait expired: the block is already submitted, its share is the most
-    /// valuable one to land).
-    bool push_front(Item item, clock::time_point now = clock::now())
+    bool push_back(const Item& item, clock::time_point now = clock::now())
     {
-        return push(std::move(item), now, /*front=*/true);
+        Item copy(item);
+        return push_back(std::move(copy), now);
+    }
+    /// Queue a solve AHEAD of the others: a block-winning share whose bounded
+    /// wait expired (the block is already submitted; its share is the most
+    /// valuable one to land). Never refused for capacity: at most one per
+    /// won block, so it cannot grow the queue without bound.
+    void push_front(Item item, clock::time_point now = clock::now())
+    {
+        m_q.push_front(Entry{std::move(item), now});
+        note_push();
     }
 
     bool   empty() const { return m_q.empty(); }
     size_t size() const { return m_q.size(); }
 
     /// Mint up to `max_items` items in order. Busy puts the item back at the
-    /// front and stops; Dropped / Minted continue. Never throws.
+    /// front and stops; Dropped / Minted continue. Never throws out of a
+    /// try_mint (counted as `threw`).
     template <class TryMint>
-    DrainStats drain(TryMint&& try_mint, size_t max_items = 16, clock::time_point now = clock::now())
+    DrainStats drain(TryMint&& try_mint, const OnDrop& on_drop = {}, size_t max_items = 16,
+                     clock::time_point now = clock::now())
     {
         DrainStats st;
         size_t processed = 0;
@@ -134,7 +156,7 @@ public:
             Entry e = std::move(m_q.front());
             m_q.pop_front();
             if (now - e.arrival > m_ttl) {
-                count_drop(MintDropReason::ttl);
+                drop(e.item, MintDropReason::ttl, on_drop);
                 ++st.dropped;
                 ++processed;
                 continue;
@@ -159,7 +181,7 @@ public:
                     now - e.arrival).count();
                 if (age > m_counters.max_age_ms_at_mint) m_counters.max_age_ms_at_mint = age;
             } else {
-                count_drop(out.why == MintDropReason::none ? MintDropReason::other : out.why);
+                drop(e.item, out.why == MintDropReason::none ? MintDropReason::other : out.why, on_drop);
                 ++st.dropped;
             }
         }
@@ -167,15 +189,20 @@ public:
     }
 
     /// The node is stopping: nothing is minted any more; count what is left.
-    size_t clear_for_shutdown()
+    size_t clear_for_shutdown(const OnDrop& on_drop = {})
     {
         const size_t n = m_q.size();
-        m_counters.dropped[static_cast<size_t>(MintDropReason::shutdown)] += n;
+        for (const auto& e : m_q)
+            drop(e.item, MintDropReason::shutdown, on_drop);
         m_q.clear();
         return n;
     }
 
     const DeferredMintCounters& counters() const { return m_counters; }
+
+    /// Count a drop that happened outside the queue (e.g. queue_full seen by
+    /// the caller). Internal use by DeferredMinter.
+    void count_drop(MintDropReason r) { ++m_counters.dropped[static_cast<size_t>(r)]; }
 
 private:
     struct Entry {
@@ -183,20 +210,18 @@ private:
         clock::time_point arrival;
     };
 
-    bool push(Item item, clock::time_point now, bool front)
+    void note_push()
     {
-        if (m_q.size() >= m_capacity) {
-            count_drop(MintDropReason::queue_full);
-            return false;
-        }
-        if (front) m_q.push_front(Entry{std::move(item), now});
-        else       m_q.push_back(Entry{std::move(item), now});
         ++m_counters.deferred;
         if (m_q.size() > m_counters.max_depth) m_counters.max_depth = m_q.size();
-        return true;
     }
 
-    void count_drop(MintDropReason r) { ++m_counters.dropped[static_cast<size_t>(r)]; }
+    void drop(const Item& item, MintDropReason r, const OnDrop& on_drop)
+    {
+        count_drop(r);
+        if (!on_drop) return;
+        try { on_drop(item, r); } catch (...) {}
+    }
 
     std::deque<Entry>          m_q;
     size_t                     m_capacity;
@@ -208,6 +233,10 @@ private:
 struct MintAttempt {
     bool think_after{true};   ///< false: the caller runs ONE think for the batch
     bool from_queue{false};   ///< a retry from the queue: never a bounded wait
+    /// true when a Busy result will be QUEUED (the minter is on). The coin's
+    /// mint body uses it only for wording: with the kill switch it keeps the
+    /// old "declined" / FORFEIT log lines exactly.
+    bool deferrable{false};
 };
 
 /// Point-in-time copy for readers on other threads (web/HTTP).
@@ -220,8 +249,8 @@ struct DeferredMintSnapshot {
 
 /// The policy around a DeferredMintQueue for one coin's io thread.
 ///
-///   on_solve(item)  a fresh stratum solve. Disabled (the kill switch): exactly
-///                   the old path, one synchronous attempt with its own think.
+///   on_solve(item)  a fresh stratum solve. Disabled (the kill switch): the old
+///                   path, one synchronous attempt with its own think.
 ///                   Enabled: drain what is queued first (order kept), then
 ///                   try the new solve; a busy tracker queues it; anything
 ///                   minted gets ONE think afterwards.
@@ -231,27 +260,31 @@ struct DeferredMintSnapshot {
 ///
 /// A block-winning solve keeps its synchronous bounded wait (mint_once sees
 /// from_queue=false); only if that expires is it queued, at the FRONT.
+/// on_dropped is told about every queued item that is finally lost (including
+/// queue_full and shutdown), so a coin can log a lost block-winning share loudly.
 ///
 /// io-thread-confined except snapshot(), which any thread may call.
 template <class Item>
 class DeferredMinter
 {
 public:
-    using clock    = std::chrono::steady_clock;
-    using MintOnce = std::function<MintOutcome(const Item&, const MintAttempt&)>;
-    using Think    = std::function<void()>;
+    using clock     = std::chrono::steady_clock;
+    using MintOnce  = std::function<MintOutcome(const Item&, const MintAttempt&)>;
+    using Think     = std::function<void()>;
+    using OnDropped = std::function<void(const Item&, MintDropReason)>;
 
     struct SolveResult {
-        MintOutcome outcome;      ///< the new solve's own attempt (Busy if it never ran)
+        MintOutcome outcome;            ///< the new solve's own attempt (Busy if it never ran)
         bool        queued{false};
+        bool        behind_queue{false}; ///< queued untried, behind earlier solves
     };
 
-    DeferredMinter(bool enabled, MintOnce mint_once, Think think,
+    DeferredMinter(bool enabled, MintOnce mint_once, Think think, OnDropped on_dropped = {},
                    size_t capacity = 64,
                    std::chrono::milliseconds ttl = std::chrono::milliseconds(20000),
                    size_t max_per_drain = 16)
         : m_enabled(enabled), m_mint_once(std::move(mint_once)), m_think(std::move(think)),
-          m_queue(capacity, ttl), m_max_per_drain(max_per_drain)
+          m_on_dropped(std::move(on_dropped)), m_queue(capacity, ttl), m_max_per_drain(max_per_drain)
     {
         publish();
     }
@@ -260,55 +293,70 @@ public:
 
     SolveResult on_solve(Item item, bool won_block, clock::time_point now = clock::now())
     {
+        check_thread();
         SolveResult r;
-        if (!m_enabled || m_stopped) {
-            r.outcome = m_mint_once(item, MintAttempt{true, false});
+        if (m_stopped) {
+            // The node is stopping: a share minted now could not be broadcast.
+            r.outcome = MintOutcome{MintResult::Dropped, MintDropReason::shutdown, uint256()};
             return r;
         }
-        if (won_block) {
-            // The bounded wait happens inside mint_once; the block itself was
-            // submitted before the mint seam. Never behind ordinary solves.
-            r.outcome = m_mint_once(item, MintAttempt{true, false});
-            if (r.outcome.result == MintResult::Busy)
-                r.queued = m_queue.push_front(std::move(item), now);
-            publish();
+        if (!m_enabled) {
+            r.outcome = m_mint_once(item, MintAttempt{true, false, false});
             return r;
         }
         size_t minted = 0;
-        if (!m_queue.empty()) {
-            minted += drain_queue(now).minted;
-            if (!m_queue.empty()) {
-                // Still blocked (or the per-drain cap hit): keep arrival order.
-                r.outcome = MintOutcome{MintResult::Busy, MintDropReason::none, uint256()};
-                r.queued = m_queue.push_back(std::move(item), now);
-                if (minted > 0) think();
+        try {
+            if (won_block) {
+                // The bounded wait happens inside mint_once; the block itself
+                // was submitted before the mint seam. Never behind ordinary solves.
+                r.outcome = m_mint_once(item, MintAttempt{true, false, true});
+                if (r.outcome.result == MintResult::Busy) {
+                    m_queue.push_front(std::move(item), now);
+                    r.queued = true;
+                }
                 publish();
                 return r;
             }
+            if (!m_queue.empty()) {
+                minted += drain_queue(now).minted;
+                if (!m_queue.empty()) {
+                    // Still blocked (or the per-drain cap hit): keep arrival order.
+                    r.outcome = MintOutcome{MintResult::Busy, MintDropReason::none, uint256()};
+                    r.behind_queue = true;
+                    r.queued = push_back_or_drop(item, now);
+                    finish(minted);
+                    return r;
+                }
+            }
+            r.outcome = m_mint_once(item, MintAttempt{false, false, true});
+            if (r.outcome.result == MintResult::Busy)
+                r.queued = push_back_or_drop(item, now);
+            if (r.outcome.result == MintResult::Minted) ++minted;
+        } catch (...) {
+            // The fresh attempt threw: shares the drain above already minted
+            // still get their think.
+            finish(minted);
+            throw;
         }
-        r.outcome = m_mint_once(item, MintAttempt{false, false});
-        if (r.outcome.result == MintResult::Busy)
-            r.queued = m_queue.push_back(std::move(item), now);
-        if (r.outcome.result == MintResult::Minted) ++minted;
-        if (minted > 0) think();
-        publish();
+        finish(minted);
         return r;
     }
 
     DrainStats drain_point(clock::time_point now = clock::now())
     {
+        check_thread();
         if (!m_enabled || m_stopped || m_queue.empty())
             return {};
         const DrainStats st = drain_queue(now);
-        if (st.minted > 0) think();
-        publish();
+        finish(st.minted);
         return st;
     }
 
     size_t shutdown()
     {
+        check_thread();
         m_stopped = true;
-        const size_t n = m_queue.clear_for_shutdown();
+        const size_t n = m_queue.clear_for_shutdown(m_on_dropped);
         publish();
         return n;
     }
@@ -327,14 +375,39 @@ private:
     DrainStats drain_queue(clock::time_point now)
     {
         return m_queue.drain(
-            [this](const Item& it) { return m_mint_once(it, MintAttempt{false, true}); },
-            m_max_per_drain, now);
+            [this](const Item& it) { return m_mint_once(it, MintAttempt{false, true, true}); },
+            m_on_dropped, m_max_per_drain, now);
     }
 
-    void think()
+    bool push_back_or_drop(Item& item, clock::time_point now)
     {
-        ++m_thinks;
-        if (m_think) m_think();
+        if (m_queue.push_back(std::move(item), now))   // moved from only when accepted
+            return true;
+        // queue_full is already counted by the queue; tell the coin.
+        if (m_on_dropped) {
+            try { m_on_dropped(item, MintDropReason::queue_full); } catch (...) {}
+        }
+        return false;
+    }
+
+    // io-thread confinement, checked (debug builds) rather than assumed: the
+    // first caller owns the minter; any other thread would race on the deque.
+    void check_thread()
+    {
+        const auto me = std::this_thread::get_id();
+        if (m_owner == std::thread::id())
+            m_owner = me;
+        assert(m_owner == me && "DeferredMinter is io-thread-confined");
+        (void)me;
+    }
+
+    void finish(size_t minted)
+    {
+        if (minted > 0) {
+            ++m_thinks;
+            if (m_think) m_think();
+        }
+        publish();
     }
 
     void publish()
@@ -350,8 +423,10 @@ private:
 
     bool                     m_enabled;
     bool                     m_stopped{false};
+    std::thread::id          m_owner;
     MintOnce                 m_mint_once;
     Think                    m_think;
+    OnDropped                m_on_dropped;
     DeferredMintQueue<Item>  m_queue;
     size_t                   m_max_per_drain;
     uint64_t                 m_thinks{0};

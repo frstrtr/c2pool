@@ -1711,7 +1711,19 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             }
             return out;
         },
-        [node = &p2p_node]() { node->run_think(); });
+        [node = &p2p_node]() { node->run_think(); },
+        // Every queued solve that is finally NOT minted. A block-winning one is
+        // a forfeit: loud and counted, exactly like the bounded-wait expiry.
+        [node = &p2p_node](const dash::mint::DeferredSolve& s, core::MintDropReason why) {
+            if (s.in.won_block)
+                node->record_block_share_forfeit(s.in.pow_hash, core::to_string(why));
+            else
+                LOG_INFO << "[MINT-DEFER] queued solve dropped (" << core::to_string(why)
+                         << ") prev=" << s.in.prev_share_hash.GetHex().substr(0, 16);
+        });
+    // io thread only: the prev of the newest solve we minted or queued (see
+    // dash::mint::classify_prev_was_tip).
+    auto last_claimed_prev = std::make_shared<uint256>();
     p2p_node.set_deferred_mint_drain(
         [w = std::weak_ptr<DashDeferredMinter>(deferred_minter)]() {
             auto m = w.lock();
@@ -2263,34 +2275,11 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     out["local_orphan_rate"]     = lm.orphan_rate;
                 }
                 // Deferred mint (core/deferred_mint.hpp): queue counters and
-                // the on-best-chain outcome of the shares minted from it.
-                {
-                    const auto snap = deferred_minter->snapshot();
-                    nlohmann::json d;
-                    d["enabled"]             = snap.enabled;
-                    d["depth"]               = snap.depth;
-                    d["deferred"]            = snap.counters.deferred;
-                    d["minted"]              = snap.counters.minted;
-                    d["busy_stops"]          = snap.counters.busy_stops;
-                    d["batch_thinks"]        = snap.thinks;
-                    d["max_depth"]           = snap.counters.max_depth;
-                    d["max_age_ms_at_mint"]  = snap.counters.max_age_ms_at_mint;
-                    nlohmann::json dropped = nlohmann::json::object();
-                    for (size_t i = 1; i < snap.counters.dropped.size(); ++i)
-                        if (snap.counters.dropped[i] > 0)
-                            dropped[core::to_string(static_cast<core::MintDropReason>(i))] =
-                                snap.counters.dropped[i];
-                    d["dropped"] = dropped;
-                    const auto ledger_json = [](const dash::mint::LocalMintLedger& l) {
-                        const auto st = l.stats();
-                        return nlohmann::json{{"minted", st.minted}, {"on_chain", st.on_chain},
-                                              {"orphaned", st.orphaned}, {"pending", st.pending},
-                                              {"gone", st.gone}, {"orphan_rate", st.orphan_rate}};
-                    };
-                    d["prev_was_tip"]    = ledger_json(*deferred_ledger_tip);
-                    d["prev_was_behind"] = ledger_json(*deferred_ledger_behind);
-                    out["mint_defer"] = d;
-                }
+                // the on-best-chain outcome of the shares minted from it, per
+                // cause. Lock-free (own mutexes), so the busy-cache path below
+                // refreshes it too. Served raw at /sharechain/stats.
+                out["mint_defer"] = dash::mint::mint_defer_json(
+                    deferred_minter->snapshot(), *deferred_ledger_tip, *deferred_ledger_behind);
 
                 // Protocol-floor gauge inputs (v16→v36 crossing). The live accept-floor
                 // is the ratchet output (1700 pre-crossing → 3600 once ≥95% v36-weighted);
@@ -2328,6 +2317,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                         cached["local_pending_shares"]  = out["local_pending_shares"];
                         cached["local_gone_shares"]     = out["local_gone_shares"];
                         cached["local_orphan_rate"]     = out["local_orphan_rate"];
+                        cached["mint_defer"]            = out["mint_defer"];
                         return cached;
                     }
                     out["chain_height"] = snap.chain_count;
@@ -5065,7 +5055,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // commitment, deterministic producer rebuild (X11 identity gate +
         // pow<=target ban-safety gate inside), tracker insert + broadcast.
         work_source->set_mint_share_fn(
-            [node_ptr, mint_registry, deferred_minter](
+            [node_ptr, mint_registry, deferred_minter, last_claimed_prev](
                 const dash::stratum::DASHWorkSource::MintShareInputs& in) -> uint256
             {
                 if (in.ref_hash.IsNull()) {
@@ -5095,20 +5085,29 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 // mining_submit -> mint seam; verified lock-free end to end).
                 // mint_solve_once scopes and RELEASES its read guard before
                 // add_local_share_ex takes the exclusive lock — never nested.
-                dash::mint::DeferredSolve solve{
-                    in, std::move(*frozen),
-                    in.prev_share_hash == node_ptr->snapshot_best_share()};
+                // The soak metric's cause split; only the queue uses it, so the
+                // kill switch skips the extra snapshot read.
+                const bool prev_was_tip = deferred_minter->enabled()
+                    && dash::mint::classify_prev_was_tip(
+                           in.prev_share_hash, node_ptr->snapshot_best_share(), *last_claimed_prev);
+                dash::mint::DeferredSolve solve{in, std::move(*frozen), prev_was_tip};
                 const auto r = deferred_minter->on_solve(std::move(solve), in.won_block);
+                if (r.outcome.result == core::MintResult::Minted || r.queued)
+                    *last_claimed_prev = in.prev_share_hash;
                 if (r.outcome.result == core::MintResult::Minted)
                     return r.outcome.hash;
-                if (r.outcome.result == core::MintResult::Busy) {
-                    if (r.queued)
-                        LOG_INFO << "[MINT-DEFER] tracker busy — solve queued (depth="
-                                 << deferred_minter->depth() << ")"
-                                 << (in.won_block ? " BLOCK-WINNING share at the front" : "");
-                    else if (!in.won_block)
-                        LOG_WARNING << "[MINT] tracker busy — solve declined (retry on next share)"
-                                    << (deferred_minter->enabled() ? " [deferred-mint queue full]" : "");
+                if (r.queued) {
+                    LOG_INFO << "[MINT-DEFER] "
+                             << (r.behind_queue ? "solve queued behind earlier queued solve(s)"
+                                                : "tracker busy — solve queued")
+                             << " (depth=" << deferred_minter->depth() << ")"
+                             << (in.won_block ? " BLOCK-WINNING share at the front" : "");
+                } else if (r.outcome.result == core::MintResult::Busy && deferred_minter->enabled()
+                           && !in.won_block) {
+                    // Queue full. (With the kill switch the mint body already
+                    // logged the old "declined" line.)
+                    LOG_WARNING << "[MINT] tracker busy — solve declined (retry on next share)"
+                                   " [deferred-mint queue full]";
                 }
                 return uint256();
             });

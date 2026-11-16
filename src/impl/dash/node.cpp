@@ -1797,10 +1797,39 @@ std::vector<uint256> NodeImpl::send_shares(peer_ptr peer,
 uint256 NodeImpl::add_local_share(ShareType share, bool block_winning)
 {
     const auto r = add_local_share_ex(share, block_winning, /*think_after=*/true);
-    if (r.status == LocalAddStatus::busy && !block_winning)
-        LOG_WARNING << "[MINT] tracker busy — local share "
-                    << share.hash().GetHex().substr(0, 16) << " declined (retry on next solve)";
+    if (r.status == LocalAddStatus::busy) {
+        if (block_winning)
+            record_block_share_forfeit(share.hash());
+        else
+            LOG_WARNING << "[MINT] tracker busy — local share "
+                        << share.hash().GetHex().substr(0, 16) << " declined (retry on next solve)";
+    }
     return r.hash;
+}
+
+void NodeImpl::record_block_share_forfeit(const uint256& hash, const char* queue_reason)
+{
+    // LOUD + COUNTED. A silent drop is precisely the defect; this is the only
+    // remaining way a won block can go unseen, and it must be impossible to
+    // miss in a log or a dashboard.
+    m_block_share_lock_forfeits.fetch_add(1, std::memory_order_relaxed);
+    if (queue_reason) {
+        LOG_ERROR << "[MINT-BLOCK] FORFEIT — BLOCK-WINNING share "
+                  << hash.GetHex().substr(0, 16)
+                  << " lost from the deferred-mint queue (" << queue_reason
+                  << "). The block itself was already submitted, but no p2pool "
+                     "peer will see it and its PPLNS weight is lost. forfeits="
+                  << m_block_share_lock_forfeits.load(std::memory_order_relaxed);
+        return;
+    }
+    LOG_ERROR << "[MINT-BLOCK] FORFEIT — tracker still busy after "
+              << tracker_acquire::BLOCK_SHARE_LOCK_BUDGET.count()
+              << "ms; BLOCK-WINNING share "
+              << hash.GetHex().substr(0, 16)
+              << " NOT minted. The block itself was already "
+                 "submitted, but no p2pool peer will see it and its "
+                 "PPLNS weight is lost. forfeits="
+              << m_block_share_lock_forfeits.load(std::memory_order_relaxed);
 }
 
 NodeImpl::LocalAddResult NodeImpl::add_local_share_ex(ShareType share, bool block_winning,
@@ -1846,23 +1875,10 @@ NodeImpl::LocalAddResult NodeImpl::add_local_share_ex(ShareType share, bool bloc
         auto lock = tracker_acquire::exclusive(m_tracker_mutex, urgency,
                                                is_compute_thread());
         if (!lock.owns_lock()) {
-            if (block_winning) {
-                // LOUD + COUNTED. A silent drop is precisely the defect; this
-                // is the only remaining way a won block can go unseen, and it
-                // must be impossible to miss in a log or a dashboard.
-                m_block_share_lock_forfeits.fetch_add(1, std::memory_order_relaxed);
-                LOG_ERROR << "[MINT-BLOCK] FORFEIT — tracker still busy after "
-                          << tracker_acquire::BLOCK_SHARE_LOCK_BUDGET.count()
-                          << "ms; BLOCK-WINNING share "
-                          << hash.GetHex().substr(0, 16)
-                          << " NOT minted. The block itself was already "
-                             "submitted, but no p2pool peer will see it and its "
-                             "PPLNS weight is lost. forfeits="
-                          << m_block_share_lock_forfeits.load(std::memory_order_relaxed);
-            }
-            // The ordinary busy case is logged by the caller: add_local_share()
-            // keeps today's "declined" warning; the deferred-mint binding
-            // queues the solve instead.
+            // Logged (and, for a block-winning share, COUNTED as a forfeit) by
+            // the caller: add_local_share() keeps today's lines exactly; the
+            // deferred-mint binding queues the solve and records a forfeit
+            // only if the queued share is finally lost.
             return {uint256::ZERO, LocalAddStatus::busy};
         }
         if (m_chain->contains(hash)) {

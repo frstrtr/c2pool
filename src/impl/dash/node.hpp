@@ -1322,6 +1322,11 @@ public:
         LocalAddStatus status{LocalAddStatus::null_hash};
     };
     LocalAddResult add_local_share_ex(ShareType share, bool block_winning, bool think_after);
+    /// #889: a block-winning share was finally NOT minted (busy past the
+    /// bounded wait, or lost from the deferred-mint queue: `queue_reason` set).
+    /// Counts it in block_share_lock_forfeits() and logs [MINT-BLOCK] FORFEIT
+    /// at ERROR.
+    void record_block_share_forfeit(const uint256& hash, const char* queue_reason = nullptr);
 
     /// Deferred mint: the coin binding's drain (main_dash.cpp). Called on the
     /// IO thread in both IO-phase epilogues, while the think slot is still
