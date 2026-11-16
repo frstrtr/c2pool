@@ -181,6 +181,17 @@ inline bool check_pow(const uint256& pow_hash, uint32_t bits, const uint256& pow
     return pow_hash <= target;
 }
 
+/// Dash Core GetNetworkHashPS arithmetic (rpc/mining.cpp): the chain work
+/// between the window's base and tip divided by the span between the earliest
+/// and latest block time in the window. 0 when the work does not grow or the
+/// span is not positive (dashd returns 0 for minTime == maxTime).
+inline double network_hashps_from(const uint256& tip_work, const uint256& base_work,
+                                  int64_t min_time, int64_t max_time)
+{
+    if (tip_work <= base_work || max_time <= min_time) return 0.0;
+    return (tip_work - base_work).getdouble() / static_cast<double>(max_time - min_time);
+}
+
 inline uint256 get_block_proof(uint32_t bits) {
     bool negative, overflow;
     uint256 target;
@@ -407,6 +418,30 @@ public:
     uint256 cumulative_work() const {
         std::lock_guard<std::mutex> lock(m_mutex);
         return m_best_work;
+    }
+
+    /// Dash Core getnetworkhashps(lookup): the chain work of the last `lookup`
+    /// blocks divided by the span between the earliest and latest timestamp in
+    /// that window (rpc/mining.cpp GetNetworkHashPS). The tip difficulty alone
+    /// is a poor estimate on Dash: DarkGravityWave follows rented hashrate, so
+    /// difficulty swings ~2x within hours. 0 when fewer than `lookup` headers
+    /// sit above the fast-start anchor (the caller falls back), or the span is
+    /// not positive.
+    double network_hashps(uint32_t lookup = 576) const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_tip.IsNull() || lookup == 0 || m_tip_height <= lookup) return 0.0;
+        const auto tip = get_header_by_height_internal(m_tip_height);
+        const auto base = get_header_by_height_internal(m_tip_height - lookup);
+        if (!tip || !base || tip->chain_work <= base->chain_work) return 0.0;
+        int64_t min_time = tip->header.m_timestamp, max_time = min_time;
+        for (uint32_t h = m_tip_height - lookup; h < m_tip_height; ++h) {   // base included, as dashd
+            const auto e = get_header_by_height_internal(h);
+            if (!e) return 0.0;   // a hole in the window: no estimate
+            const int64_t t = e->header.m_timestamp;
+            if (t < min_time) min_time = t;
+            if (t > max_time) max_time = t;
+        }
+        return network_hashps_from(tip->chain_work, base->chain_work, min_time, max_time);
     }
 
     // Phase C-TEMPLATE step 9: bits the next block must satisfy.

@@ -5729,6 +5729,22 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         LOG_INFO << "[HEAD-SCORE] block-solution credit ARMED: a block-solving share's header"
                     " bits are checked against this node's header chain";
 
+        // Dashboard network hashrate from chain work over the last 576 headers
+        // (Dash Core getnetworkhashps(576)) instead of the tip difficulty, which
+        // DarkGravityWave swings ~2x within hours (11-16: tip formula 5.6 PH/s,
+        // getnetworkhashps 3.25 PH/s). Same oracle as the block-bits credit: it
+        // detaches before header_chain is destroyed, so a late web request gets
+        // 0 (the web server falls back to its formula) instead of freed headers.
+        if (web_server) {
+            web_server->get_mining_interface()->set_network_hashrate_fn(
+                [oracle = block_bits_oracle.oracle]() -> double {
+                    std::lock_guard<std::mutex> lk(oracle->m);
+                    return oracle->hc ? oracle->hc->network_hashps(576) : 0.0;
+                });
+            LOG_INFO << "[WEB] network hashrate = chain work over the last 576 headers"
+                        " (getnetworkhashps-equivalent)";
+        }
+
         // CROSS-LANE ASYMMETRY CLOSED: HeaderChain::is_synced() was DEFINED
         // AND NEVER CALLED on the DASH path (bch 13 callers, ltc 12, nmc 12,
         // btc 6, dgb 6, dash 0) -- a predicate nothing invokes is a lie about
