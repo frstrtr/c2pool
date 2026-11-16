@@ -19,24 +19,36 @@ and replays blocks forward from it.
 **You are trusting the release build** for the set contents at the anchor
 height. The node does independently verify the anchor's chain position against
 its own PoW-validated header chain, its SHA-256 integrity digest, and every
-replayed block's coinbase against the projected payee — a wrong anchor is
-falsified within a few blocks and fails closed — but nothing available to the
-node can prove the set itself.
+replayed block's coinbase against the projected payee. That last check proves
+the payout state of every masternode paid inside the replayed window, and a
+wrong entry there fails the bridge closed. A wrong `scriptPayout` or
+`nLastPaidHeight` of a masternode NOT yet paid in the window surfaces only at
+its first payment: our block then carries the wrong payee, the network rejects
+it (`bad-cb-payee`) and that block's reward is lost. Nothing is paid to a wrong
+address, because every node checks the payee. Nothing available to the node can
+prove the set itself; anyone with a synced dashd can reproduce it (README,
+"Verifying the anchor yourself").
 
 A fully trustless DIP-3-height replay (~1.5M block bodies) is planned as a
 later **opt-in verify-mode**; it is not implemented.
 
 Two further limitations today:
 
-- **The shipped mainnet and testnet anchors are UNPINNED.** Pinning requires
-  RPC access to a synced dashd and is a release-time step
-  (`tools/dash/gen_mn_checkpoint.py pin`). Until an anchor is pinned,
-  daemonless DASH **fails closed** — it logs at `ERROR` and refuses to serve
-  embedded templates rather than guessing a payee.
-- **A stale anchor is refused, not worked around.** An anchor more than
-  `--embedded-mn-bridge-max` blocks behind the tip (default 20000, ≈34 days)
-  is rejected. A release cut long ago will not daemonlessly mine DASH without
-  either a fresher build or `--coin-rpc-*`.
+- **The mainnet anchor is pinned at h=2,563,800; the testnet anchor is
+  UNPINNED.** Pinning is a release-time step (see
+  `src/impl/dash/coin/checkpoints/README.md`). Without a pinned anchor,
+  daemonless DASH testnet **fails closed**: it logs at `ERROR` and refuses to
+  serve embedded templates rather than guessing a payee.
+- **A stale anchor is refused, not worked around.** The bridge refuses to
+  start more than `--embedded-mn-bridge-max` blocks behind the tip (default
+  20000, ≈34 days). The distance is measured from where the bridge starts: the
+  anchor on a cold start (empty data directory), the persisted cursor when a
+  node resumes. A running node persists its cursor as it follows the chain, so
+  the limit bites only on a cold start or after a stop longer than the limit:
+  with the h=2,563,800 anchor, a cold start is refused once the tip passes
+  2,583,800. A release cut long ago will not
+  daemonlessly cold-start DASH without a fresher build, a larger
+  `--embedded-mn-bridge-max`, or `--coin-rpc-*`.
 
 Background: README section "DASH daemonless masternode-set checkpoint — trust
 anchor" and `src/impl/dash/coin/checkpoints/README.md`.

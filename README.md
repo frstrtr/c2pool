@@ -578,8 +578,15 @@ to the current tip.
   check on the file, *not* a signature: whoever can change the source can
   recompute the digest — it catches accidents, not malice);
 - **forward consistency** — every block replayed from the anchor re-derives
-  the projected payee and compares it against that block's real coinbase, so a
-  wrong anchor is falsified within a few blocks.
+  the projected payee and compares it against that block's real coinbase, and
+  a contradiction fails the bridge closed. This proves the payout state of
+  every masternode **paid inside the replayed window**. A wrong `scriptPayout`
+  or `nLastPaidHeight` of an eligible masternode not yet paid there surfaces
+  only at its first payment: our block names the wrong payee, the network
+  rejects it (`bad-cb-payee`), and that block's reward is lost. Nothing is paid
+  to a wrong address, because every node checks the payee. One full payment
+  cycle (every eligible masternode paid once, about 3,100 blocks on mainnet in
+  November 2026) covers the whole eligible set.
 
 **What you are trusting:** the membership and payout state of the masternode
 set *at the anchor height*. Nothing available to the node can prove it.
@@ -590,7 +597,9 @@ It is not implemented today.
 
 **Fail-closed by design.** If the anchor is missing, corrupt, for the wrong
 network, in the wrong chain position, further behind the tip than
-`--embedded-mn-bridge-max` (default 20000 blocks, ≈34 days), or contradicted
+`--embedded-mn-bridge-max` (default 20000 blocks, ≈34 days; measured from the
+persisted cursor when a node resumes, so in practice this only stops a cold
+start from an old release), or contradicted
 by a replayed block, c2pool logs the refusal at `ERROR` and **refuses to serve
 embedded DASH templates**. It falls back to a configured dashd, or serves
 nothing. It never guesses a masternode payee.
@@ -609,6 +618,62 @@ of the chain's. Carrying banned masternodes as **present but ineligible**
 
 Details, provenance of the shipped anchor, and the release-time re-pinning
 procedure: [`src/impl/dash/coin/checkpoints/README.md`](src/impl/dash/coin/checkpoints/README.md).
+
+#### Verifying the anchor yourself
+
+Each level reduces the trust the anchor needs; the last one removes it.
+
+| Level | What it proves | Status |
+|---|---|---|
+| 1. Reproduce | The pinned set equals what your own synced dashd reports at the anchor height, in all 17 columns of every masternode. | Available: `tools/dash/gen_mn_checkpoint.py compare` (below). |
+| 2. Attest | Several independent masternode operators reproduced the same content digest and signed it with a key tied to their masternode. | Procedure below; no round has been run yet. |
+| 3. Payout-verified window | Before the first template, every eligible masternode has been paid at least once in a replayed, PoW-validated block, so each `scriptPayout` and `nLastPaidHeight` is confirmed by a real coinbase. | Not enforced by code; a design is under review. Today a cold start from the h=2,563,800 anchor replays more than one full payment cycle before serving. |
+| 4. Full replay | No trust: the set is rebuilt from DIP-3 activation (~1.5M blocks). | Planned opt-in verify-mode; not implemented. |
+
+The anchor in this tree: height 2,563,800, blockhash
+`0000000000000016a129aa626ea761e08a389af18b4a64a2f8556596edd08e22`, content
+digest `a2fbc0b51258f8cf479a3035887c6927ae6e3c425f1b3eabdd16f212b6c9a6fc`.
+
+**How an operator attests an anchor**
+
+1. Check out the release tag and print the anchor's height, blockhash and
+   digests:
+
+   ```bash
+   python3 tools/dash/gen_mn_checkpoint.py verify \
+       src/impl/dash/coin/checkpoints/dash_mn_checkpoint_mainnet.inc --network mainnet
+   ```
+
+2. Compare it with your own synced dashd (Dash Core 24 or later):
+
+   ```bash
+   python3 tools/dash/gen_mn_checkpoint.py compare \
+       src/impl/dash/coin/checkpoints/dash_mn_checkpoint_mainnet.inc --network mainnet \
+       --rpc-url http://127.0.0.1:9998 --rpc-user <user> --rpc-password <password>
+   ```
+
+   The result must be `MATCH`, with the same content digest on both lines. Do
+   not compare the FILE digest with one you generate yourself: it also covers
+   the provenance lines and the key encoding, so it differs even when every row
+   agrees. The content digest does not.
+   [`checkpoints/README.md`](src/impl/dash/coin/checkpoints/README.md#reproducing-an-anchor-compare-and-the-content-digest)
+   has an offline variant from `dash-cli` captures.
+
+3. Publish the height, blockhash, content digest, your Dash Core version and
+   the result, signed with a key tied to your masternode. For example, with
+   the owner or collateral address in your wallet:
+
+   ```bash
+   dash-cli signmessage <address> "c2pool-dash anchor mainnet 2563800 <blockhash> content <content digest> MATCH"
+   ```
+
+   Anyone can check it with `dash-cli verifymessage <address> <signature>
+   "<message>"` and `dash-cli protx info <proTxHash>` (the address must be that
+   masternode's owner or collateral address).
+
+4. A release counts as attested when at least N independent operators have
+   published matching content digests (N: to be set by the project). Release
+   notes link the attestations.
 
 ### Startup examples
 

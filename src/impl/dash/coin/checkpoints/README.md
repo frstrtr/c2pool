@@ -51,9 +51,18 @@ Verified locally, no trust required:
   malice.
 * **Forward consistency.** Every block replayed from the anchor to the
   current tip re-derives the projected payee and compares it against that
-  block's real coinbase. A wrong anchor desyncs within a few blocks and the
-  bridge fails closed permanently — it never publishes, so a wrong anchor
-  cannot reach a template.
+  block's real coinbase. A wrong entry for a masternode that is PAID inside
+  the replayed window desyncs the bridge at that block, and the bridge fails
+  closed permanently: it never publishes. This proves the payout state
+  (`scriptPayout`, `nLastPaidHeight`) only of masternodes paid in the window.
+  A wrong entry for an eligible masternode not yet paid there surfaces only at
+  its first payment: our block then names the wrong payee, the network rejects
+  it (`bad-cb-payee`), and that block's reward is lost. Nothing is paid to a
+  wrong address, because every node checks the payee. A window of one full
+  payment cycle (every eligible masternode paid once: about 3,100 blocks on
+  mainnet in November 2026, evonodes taking 4 blocks each) covers the whole
+  eligible set. A cold start from the anchor below replays more than that
+  before its first template, but no code enforces a minimum window yet.
 
 Trusted, and not checkable by any means available to the node:
 
@@ -194,6 +203,49 @@ depend on a file the operator could lose, swap, or forget to install.
 Pinning requires RPC access to a synced dashd on the corresponding network,
 which is a release-time step, not a build-time one. Until then the mechanism
 is present and refuses to serve, which is the intended safe default.
+
+The mainnet anchor at a glance (`gen_mn_checkpoint.py verify` prints these):
+
+| | |
+|---|---|
+| height | 2563800 |
+| blockhash | `0000000000000016a129aa626ea761e08a389af18b4a64a2f8556596edd08e22` |
+| file digest | `8306ea59766f12f55eaa06e41ad42b92c3c578661c8841e78dbc31241757f902` |
+| content digest | `a2fbc0b51258f8cf479a3035887c6927ae6e3c425f1b3eabdd16f212b6c9a6fc` |
+| source | self-derived by `c2pool --replay-bulk` (#2176, merged 2026-11-08) |
+| reproduced | `compare` against Dash Core 24.0.2 `protx list registered true 2563800`: all 3005 masternodes equal in all 17 columns (by the maintainers, 2026-11-16; not yet an independent attestation) |
+
+## Reproducing an anchor (`compare`) and the content digest
+
+The FILE digest is an integrity check and covers the provenance lines
+(`source`, `generated`) too. Two correct checkpoints of the same set can carry
+different file digests: a self-derived anchor stores the operator keys of
+version-1 masternodes in canonical BASIC BLS encoding, while dashd prints them
+in LEGACY (the runtime accepts both and converts at load). The same G1 point
+keeps the same compressed x; only the flag bits of byte 0 differ (LEGACY bit 7
+is the sign; BASIC sets bit 7 = compressed and moves the sign to bit 5).
+
+The CONTENT digest is the digest of the set itself: network, height,
+blockhash, count and every row, sorted by proTxHash, with operator keys in
+BASIC and a null key as `-`. One set has one content digest, whoever produced
+the file. To reproduce an anchor with your own synced dashd:
+
+```bash
+python3 tools/dash/gen_mn_checkpoint.py compare \
+    src/impl/dash/coin/checkpoints/dash_mn_checkpoint_mainnet.inc --network mainnet \
+    --rpc-url http://127.0.0.1:9998 --rpc-user <user> --rpc-password <password>
+
+# or offline, from captures made with dash-cli:
+#   dash-cli getblockhash 2563800
+#   dash-cli protx list registered true 2563800 > set-2563800.json
+python3 tools/dash/gen_mn_checkpoint.py compare \
+    src/impl/dash/coin/checkpoints/dash_mn_checkpoint_mainnet.inc --network mainnet \
+    --protx-json set-2563800.json --blockhash <the hash getblockhash printed>
+```
+
+`compare` checks the blockhash, then every masternode in all 17 columns, and
+prints both content digests. It exits 0 and prints `MATCH` only when they are
+equal; anything else is listed column by column, and the exit code is 1.
 
 The 2513000 anchor's 2068 payee-eligible records are byte-identical to the
 previous `valid`-based pin at the same height; the re-pin is purely additive
