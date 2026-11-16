@@ -636,3 +636,169 @@ TEST(DashBodyTopology, BuilderCpfpTemplatePassesTheGateAndFailsItWithoutTheParen
     EXPECT_FALSE(st.embedded_template_emit_ok(cut, &why));
     EXPECT_EQ(why.cause, "emit-tx-spends-unserved-mempool-parent");
 }
+
+// ════════════════════════════════════════════════════════════════════════
+// GBT-xcheck LABEL: an MN-root difference explained EXACTLY by the
+// collateral spends the builder excludes (testnet h=1592649: dashd took a
+// type-0 spend of MN 8448db99…'s collateral, the embedded template excluded
+// it, the roots legitimately differed). Classification only — serving is
+// unchanged (stratum/work_source.cpp still swaps to dashd on ANY root diff).
+// ════════════════════════════════════════════════════════════════════════
+
+#include <impl/dash/coin/gbt_xcheck_collateral.hpp>
+
+namespace {
+
+using dash::coin::MnRootXcheck;
+using dash::coin::MnRootXcheckInput;
+using dash::coin::classify_mnroot_xcheck;
+
+CSimplifiedMNList two_entry_sml(bool with_victim) {
+    std::vector<CSimplifiedMNListEntry> entries;
+    for (uint8_t b : {0x01, 0x02}) {
+        if (b == 0x02 && !with_victim) continue;
+        CSimplifiedMNListEntry e;
+        e.nVersion = CSimplifiedMNListEntry::VER_BASIC_BLS;
+        e.proRegTxHash = raw256(b);
+        e.confirmedHash = raw256(0x77);
+        e.isValid = true;
+        entries.push_back(e);
+    }
+    return CSimplifiedMNList(std::move(entries));
+}
+
+DashWorkData build_daemonless(const MnStateMachine& mnstates, Mempool& mp,
+                              const CSimplifiedMNList& sml,
+                              dash::coin::QuorumManager& qmgr) {
+    return build_embedded_workdata(
+        H - 1, raw256(0xAB), mnstates, mp, 0x1b104be3u, 1'700'000'000u,
+        DASH_PUBKEY_VER, DASH_P2SH_VER, 1'700'000'100u, 0x20000000u, nullptr,
+        &sml, &qmgr, 0, dash::coin::k_zero_cl_sig, 0, nullptr, nullptr,
+        dash::coin::DASH_MN_RR_HEIGHT_MAINNET, nullptr,
+        dash::coin::DASH_MN_MIN_CONFIRMATIONS_MAINNET, /*suppress=*/false,
+        "utxo-immature-serving", nullptr, false, nullptr,
+        /*include_mn_special_txs=*/true, nullptr, nullptr, nullptr,
+        /*v24_active=*/false, nullptr, nullptr);
+}
+
+uint256 committed_mnroot(const DashWorkData& w) {
+    dash::coin::vendor::CCbTx cb;
+    EXPECT_TRUE(dash::coin::vendor::parse_cbtx(w.m_coinbase_payload, cb));
+    return cb.merkleRootMNList;
+}
+
+} // namespace
+
+// RED on master (the builder records no alternative root): the builder's own
+// fold, with the excluded spend chain appended, removes the victim MN — and
+// ONLY that — so the alternative root is the root of the list without it,
+// while the committed root still carries it.
+TEST(DashXcheckCollateral, BuilderRecordsTheRootDashdCommitsWithTheExcludedSpend) {
+    UTXOViewCache utxo(nullptr);
+    Mempool mp;
+    mp.set_utxo(&utxo);
+    const uint256 p0 = mint_hash(0x50);
+    utxo.add_coin(Outpoint(p0, 0), Coin(100'000, {}, 1, false));
+    const auto innocent = make_spend(p0, 0, 90'000, /*salt=*/1);
+    const uint256 collat = raw256(0xC0);
+    utxo.add_coin(Outpoint(collat, 0), Coin(100'000'000'000LL, {}, 1, false));
+    const auto spend = make_spend(collat, 0, 99'999'950'000LL, /*salt=*/2);
+    const auto child = make_spend(dash::coin::dash_txid(spend), 0, 99'999'940'000LL, /*salt=*/3);
+    ASSERT_TRUE(mp.add_tx(innocent));
+    ASSERT_TRUE(mp.add_tx(spend));
+    ASSERT_TRUE(mp.add_tx(child));
+
+    const auto sml = two_entry_sml(/*with_victim=*/true);
+    dash::coin::QuorumManager qmgr;
+    const auto mnstates = mn_set_with_collateral(collat, 0);
+    const auto w = build_daemonless(mnstates, mp, sml, qmgr);
+
+    // Served body unchanged by this PR: only the innocent tx rides.
+    ASSERT_EQ(w.m_tx_hashes.size(), 1u);
+    EXPECT_EQ(w.m_tx_hashes[0], dash::coin::dash_txid(innocent));
+    // Committed root = the list WITH the victim (nothing removed it).
+    EXPECT_EQ(committed_mnroot(w), two_entry_sml(true).CalcMerkleRoot());
+    // Alternative root = the list WITHOUT the victim, by the builder's fold.
+    ASSERT_FALSE(w.m_xcheck_collateral_alt_mnroot.IsNull())
+        << "builder recorded no alternative root for its excluded collateral spend";
+    EXPECT_EQ(w.m_xcheck_collateral_alt_mnroot, two_entry_sml(false).CalcMerkleRoot());
+    EXPECT_NE(w.m_xcheck_collateral_alt_mnroot, committed_mnroot(w));
+    // The excluded set, in selection order: the spend and its child.
+    ASSERT_EQ(w.m_xcheck_collateral_excluded_txids.size(), 2u);
+    EXPECT_EQ(w.m_xcheck_collateral_excluded_txids[0], dash::coin::dash_txid(spend));
+    EXPECT_EQ(w.m_xcheck_collateral_excluded_txids[1], dash::coin::dash_txid(child));
+}
+
+// Guard: nothing excluded => nothing recorded (no alternative root to match).
+TEST(DashXcheckCollateral, NoExcludedSpendRecordsNoAlternativeRoot) {
+    UTXOViewCache utxo(nullptr);
+    Mempool mp;
+    mp.set_utxo(&utxo);
+    const uint256 p0 = mint_hash(0x50);
+    utxo.add_coin(Outpoint(p0, 0), Coin(100'000, {}, 1, false));
+    ASSERT_TRUE(mp.add_tx(make_spend(p0, 0, 90'000, /*salt=*/1)));
+    const auto sml = two_entry_sml(true);
+    dash::coin::QuorumManager qmgr;
+    const auto w = build_daemonless(mn_set_with_collateral(raw256(0xC1), 0), mp, sml, qmgr);
+    EXPECT_TRUE(w.m_xcheck_collateral_alt_mnroot.IsNull());
+    EXPECT_TRUE(w.m_xcheck_collateral_excluded_txids.empty());
+}
+
+// ── The pure classifier (gbt_xcheck_collateral.hpp) ─────────────────────
+namespace {
+struct XcheckCase {
+    uint256 emb = raw256(0x11), dashd = raw256(0x22), alt = raw256(0x22);
+    bool quorums_equal = true;
+    std::vector<uint256> excluded{raw256(0x90)};
+    std::vector<uint256> ours{raw256(0x80)};
+    std::vector<uint256> theirs{raw256(0x80), raw256(0x90)};
+    MnRootXcheck run() const {
+        return classify_mnroot_xcheck(MnRootXcheckInput{
+            emb, dashd, quorums_equal, alt, &excluded, &ours, &theirs});
+    }
+};
+} // namespace
+
+// RED on master (the classifier does not exist; every MN-root diff was a
+// hard mismatch): the h=1592649 shape is explained.
+TEST(DashXcheckCollateral, ExactCollateralExplanationIsLabelledExplained) {
+    EXPECT_EQ(XcheckCase{}.run(), MnRootXcheck::CollateralExplained);
+}
+
+TEST(DashXcheckCollateral, QuorumRootDifferenceIsNeverExplained) {
+    XcheckCase c;
+    c.quorums_equal = false;
+    EXPECT_EQ(c.run(), MnRootXcheck::Mismatch);
+}
+
+TEST(DashXcheckCollateral, NoAlternativeRootIsAMismatch) {
+    XcheckCase c;
+    c.alt = uint256();
+    EXPECT_EQ(c.run(), MnRootXcheck::Mismatch);
+}
+
+TEST(DashXcheckCollateral, AlternativeRootNotEqualToDashdIsAMismatch) {
+    XcheckCase c;
+    c.alt = raw256(0x33);   // the removal does not account for dashd's root
+    EXPECT_EQ(c.run(), MnRootXcheck::Mismatch);
+}
+
+TEST(DashXcheckCollateral, ExcludedSpendDashdDidNotTakeIsAMismatch) {
+    XcheckCase c;
+    c.theirs = {raw256(0x80)};
+    EXPECT_EQ(c.run(), MnRootXcheck::Mismatch);
+}
+
+// DIRECTOR's case: the spend is present in BOTH sets, yet the roots differ —
+// the spend cannot explain that difference.
+TEST(DashXcheckCollateral, SpendPresentInBothSetsYetRootsDifferIsAMismatch) {
+    XcheckCase c;
+    c.ours.push_back(raw256(0x90));
+    EXPECT_EQ(c.run(), MnRootXcheck::Mismatch);
+}
+
+TEST(DashXcheckCollateral, NothingExcludedIsAMismatch) {
+    XcheckCase c;
+    c.excluded.clear();
+    EXPECT_EQ(c.run(), MnRootXcheck::Mismatch);
+}

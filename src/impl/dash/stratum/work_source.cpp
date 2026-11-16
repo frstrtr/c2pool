@@ -47,6 +47,7 @@
 #include <impl/dash/coin/special_tx_pool_delta.hpp> // #107: explain the pool delta
 #include <impl/dash/coin/tx_serve_referee.hpp>  // tx-serve internal-consistency referee (own-set vs dashd-parity)
 #include <impl/dash/coin/gbt_quorum_staleness.hpp>   // GBT-xcheck quorumroot-dashd-stale classifier
+#include <impl/dash/coin/gbt_xcheck_collateral.hpp>  // GBT-xcheck modulo-collateral label
 #include <impl/dash/coin/serve_staleness.hpp> // serve-staleness sentinel (steady_now_ms + the incident catalogue)
 
 #include <core/address_utils.hpp>             // core::address_to_script (mint payout from username)
@@ -1278,6 +1279,30 @@ void DASHWorkSource::resource_template_now(CoinStateArm arm) const
                                     " (swapping would serve a bad-cbtx-"
                                     "quorummerkleroot template)";
                     } else {
+                    // MN-root difference explained EXACTLY by the collateral
+                    // spends the embedded builder excludes by design
+                    // (gbt_xcheck_collateral.hpp)? LABEL ONLY: the swap to
+                    // dashd's template below happens either way.
+                    const bool collateral_explained = !quorums_differ
+                        && coin::classify_mnroot_xcheck(coin::MnRootXcheckInput{
+                               emb_cb.merkleRootMNList, dref_cb.merkleRootMNList,
+                               /*quorum_roots_equal=*/true,
+                               sel.work.m_xcheck_collateral_alt_mnroot,
+                               &sel.work.m_xcheck_collateral_excluded_txids,
+                               &sel.work.m_tx_hashes, &dref.m_tx_hashes})
+                           == coin::MnRootXcheck::CollateralExplained;
+                    if (collateral_explained) {
+                        LOG_INFO << "[DASH-STRATUM-GBT] GBT-xcheck MATCH-MODULO-COLLATERAL at h="
+                                 << sel.work.m_height << " embedded mnlist="
+                                 << emb_cb.merkleRootMNList.GetHex().substr(0, 16)
+                                 << " dashd mnlist="
+                                 << dref_cb.merkleRootMNList.GetHex().substr(0, 16)
+                                 << " == embedded body + "
+                                 << sel.work.m_xcheck_collateral_excluded_txids.size()
+                                 << " excluded MN-collateral spend(s) dashd includes"
+                                    " (same fold, byte-equal root) — serving dashd"
+                                    " template; classification only";
+                    } else {
                     LOG_WARNING << "[DASH-STRATUM-GBT] GBT-xcheck "
                                 << (quorums_differ ? "merkleRootQuorums"
                                                    : "merkleRootMNList")
@@ -1290,14 +1315,23 @@ void DASHWorkSource::resource_template_now(CoinStateArm arm) const
                                 << emb_cb.merkleRootMNList.GetHex().substr(0, 16)
                                 << " dashd mnlist="
                                 << dref_cb.merkleRootMNList.GetHex().substr(0, 16)
+                                << " collateral-aid alt="
+                                << (sel.work.m_xcheck_collateral_alt_mnroot.IsNull()
+                                        ? std::string("none")
+                                        : sel.work.m_xcheck_collateral_alt_mnroot.GetHex().substr(0, 16))
+                                << " excluded="
+                                << sel.work.m_xcheck_collateral_excluded_txids.size()
                                 << " — serving dashd template (reward-safety backstop:"
                                    " a wrong quorum/MN root is the bad-cbtx-"
                                    "quorummerkleroot reject vector)";
+                    }
                     coin::DeclineReport xcheck;
                     xcheck.viable    = false;
                     xcheck.cause     = quorums_differ
                                            ? "gbt-xcheck-quorumroot-mismatch"
-                                           : "gbt-xcheck-mnroot-mismatch";
+                                           : (collateral_explained
+                                                  ? "gbt-xcheck-modulo-collateral-explained"
+                                                  : "gbt-xcheck-mnroot-mismatch");
                     xcheck.value     = (quorums_differ ? emb_cb.merkleRootQuorums
                                                        : emb_cb.merkleRootMNList).GetHex();
                     xcheck.threshold = (quorums_differ ? dref_cb.merkleRootQuorums
