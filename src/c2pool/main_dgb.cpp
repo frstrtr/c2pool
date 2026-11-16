@@ -2619,6 +2619,50 @@ int run_node(const core::CoinParams& params, bool testnet,
         // only ever return pending today and would be inert-until-fed -- it lands
         // with the header-ingest slice, not as dead code now. The LIVE verdict
         // source is the external digibyted getblockheader RPC (rpc.cpp).
+        // The block's OWN difficulty and time, by hash: a recorded block's
+        // network difficulty is its header's nBits (the record above passes
+        // the live reading, which record_found_block replaces as soon as the
+        // header can be had). The embedded header chain keeps no by-hash
+        // index and is not fed yet (M3), so, like the verdict below, the
+        // source is digibyted getblockheader; without an RPC the lookups
+        // answer 0 and the live reading stands. Display only.
+        {
+            auto header_field = [rp = rpc.get()](const std::string& hash_hex,
+                                                 const char* field) -> nlohmann::json {
+                if (!rp) return nullptr;
+                uint256 h; h.SetHex(hash_hex);
+                try {
+                    auto j = rp->getblockheader(h, /*verbose=*/true);
+                    if (j.is_object() && j.contains(field)) return j[field];
+                } catch (...) { /* unknown to the daemon / transport error */ }
+                return nullptr;
+            };
+            mi->set_block_field_lookups(
+                [header_field](const std::string& hash_hex) -> double {
+                    // "bits": the compact target as 8 hex digits.
+                    auto bits = header_field(hash_hex, "bits");
+                    if (!bits.is_string()) return 0.0;
+                    try {
+                        const uint32_t nbits = static_cast<uint32_t>(
+                            std::stoul(bits.get<std::string>(), nullptr, 16));
+                        if (nbits == 0) return 0.0;
+                        return chain::target_to_difficulty(chain::bits_to_target(nbits));
+                    } catch (...) { return 0.0; }
+                },
+                [header_field](const std::string& hash_hex) -> uint32_t {
+                    auto t = header_field(hash_hex, "time");
+                    return t.is_number_unsigned() ? t.get<uint32_t>() : 0;
+                });
+            // The found-block record above stores header_chain's next height,
+            // which is its base (0) until the header ingest lands: the row
+            // takes its real height from digibyted once the block confirms.
+            mi->set_block_height_lookup(
+                [header_field](const std::string& hash_hex) -> uint64_t {
+                    auto h = header_field(hash_hex, "height");
+                    return h.is_number_unsigned() ? h.get<uint64_t>() : 0;
+                });
+        }
+
         mi->set_block_verify_fn(
             [rp = rpc.get()](const std::string& hash_hex) -> int {
                 if (!rp) return 0;   // no digibyted RPC -> cannot ask the chain -> pending

@@ -11729,13 +11729,16 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             // the work source read the job's own height) takes its height from
             // the header chain when the chain holds that header; the re-verify
             // pass below then resolves it at that height.
-            cache_mi->backfill_found_block_heights(
-                [hc](const std::string& block_hash_hex) -> uint64_t {
-                    uint256 h;
-                    h.SetHex(block_hash_hex);
-                    auto e = hc->get_header(h);
-                    return e ? static_cast<uint64_t>(e->height) : 0;
-                });
+            auto height_lookup = [hc](const std::string& block_hash_hex) -> uint64_t {
+                uint256 h;
+                h.SetHex(block_hash_hex);
+                auto e = hc->get_header(h);
+                return e ? static_cast<uint64_t>(e->height) : 0;
+            };
+            cache_mi->backfill_found_block_heights(height_lookup);
+            // Kept for a row recorded at height 0 after this backfill: it
+            // learns its height when its block confirms.
+            cache_mi->set_block_height_lookup(height_lookup);
             // Retain the same lookups so the record + confirm paths can fill a
             // missing network_difficulty for blocks won AFTER this backfill runs
             // (sharechain-replay / relay wins recorded seconds into boot), whose

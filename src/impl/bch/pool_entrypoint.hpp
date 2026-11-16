@@ -80,6 +80,7 @@
 #include <core/web_server.hpp>       // H-STATS.944: operator dashboard + graph_db persist
 #include <core/config_endpoint.hpp>  // M1 control-plane READ-ONLY endpoints
 #include <core/filesystem.hpp>      // config_path() for the graph_db location
+#include <core/found_block_lookups.hpp> // header-bits difficulty by block hash
 #include <functional>
 #include <ctime>       // std::time (found-block record timestamp)
 #include <limits>       // std::numeric_limits (RPC-fallback sentinel)
@@ -935,6 +936,17 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
                     LOG_WARNING << "[BCH-POOL] recorded found block height=" << height
                                 << " that reached NO network sink";
             });
+
+        // The block's OWN difficulty and time, by hash, off the embedded
+        // header chain: a recorded block's network difficulty is its header's
+        // nBits (the record above passes the live template's reading, which
+        // record_found_block replaces as soon as the header is held).
+        // Display only.
+        {
+            auto lookups = core::header_chain_block_lookups(&daemon.chain());
+            mi->set_block_field_lookups(lookups.first, lookups.second);
+            mi->set_block_height_lookup(core::header_chain_height_lookup(&daemon.chain()));
+        }
 
         mi->set_block_verify_fn(
             [mi, &daemon](const std::string& hash_hex) -> int {

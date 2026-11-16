@@ -50,6 +50,7 @@
 
 #include <core/uint256.hpp>
 #include <core/target_utils.hpp>
+#include <core/found_block_lookups.hpp>
 #include <core/address_utils.hpp>
 #include <core/netaddress.hpp>
 #include <core/stratum_server.hpp>
@@ -2443,6 +2444,17 @@ int run_embedded(bool coin_p2p_discover,
                              << " id=" << id.GetHex().substr(0, 16)
                              << " -- confirm/orphan poller armed";
                 };
+
+            // The block's OWN difficulty and time, by its identity hash, off
+            // the embedded header chain: a recorded block's network difficulty
+            // is its header's nBits (the record above passes the live
+            // template's reading, which record_found_block replaces as soon
+            // as the header is held). Display only.
+            {
+                auto lookups = core::header_chain_block_lookups(&header_chain);
+                mi->set_block_field_lookups(lookups.first, lookups.second);
+                mi->set_block_height_lookup(core::header_chain_height_lookup(&header_chain));
+            }
 
             mi->set_block_verify_fn(
                 [mi, &header_chain, &coin_node](const std::string& hash_hex) -> int {
