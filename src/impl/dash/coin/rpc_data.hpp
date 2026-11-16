@@ -197,6 +197,23 @@ struct DashWorkData {
     uint32_t m_mempool_tx_first_index{0};
     uint32_t m_mempool_tx_count{0};
 
+    // ── GBT-XCHECK CLASSIFICATION AID: EXCLUDED COLLATERAL SPENDS ─────────
+    // The embedded builder EXCLUDES every type-0 tx that spends a masternode
+    // collateral (sml_projection.hpp tx_spends_mn_collateral), plus its
+    // in-body descendants. dashd's miner includes such a tx and removes the
+    // MN, so the two templates' merkleRootMNList legitimately differ while
+    // the spend sits in the mempool (testnet h=1592649).
+    //
+    // m_xcheck_collateral_alt_mnroot is the root the builder's OWN fold
+    // (fold_mn_special_txs, same projected list, same fold context as the
+    // committed root) gives for the served body PLUS those excluded txs; null
+    // when nothing was excluded or the fold path was not armed. The GBT-xcheck
+    // uses it ONLY to LABEL an MN-root difference (gbt_xcheck_collateral.hpp):
+    // serving is unchanged, any root difference still swaps to dashd. No
+    // consensus path reads these fields.
+    uint256              m_xcheck_collateral_alt_mnroot;
+    std::vector<uint256> m_xcheck_collateral_excluded_txids;
+
     // Per-entry "this tx spends an output of an EARLIER entry of the same
     // probe set" flag, parallel to whichever probe set is populated (the
     // served range above, or the candidate set). dashd's testmempoolaccept
