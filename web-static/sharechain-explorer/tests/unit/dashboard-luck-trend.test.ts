@@ -41,6 +41,10 @@ const xOf = (p: Pt) => (Array.isArray(p) ? p[0] : p.x);
 const yOf = (p: Pt) => (Array.isArray(p) ? p[1] : p.y);
 const hasMarker = (p: Pt) => Array.isArray(p) || p.marker?.enabled !== false;
 
+// luck-if-found-now at x, as the end point and every curve sample must read.
+function onCurve(lv: Live, x: number): number {
+  return Math.min((lv.expectedMs / Math.max(x - lv.lastBlkMs, 1000)) * 100, CAP);
+}
 // The curve samples: luck-if-found-now at each x, falling, between start and the live point.
 function assertCurve(pts: Pt[], lv: Live, fromX: number) {
   const curve = pts.filter(p => xOf(p) >= fromX && yOf(p) !== null) as Pt[];
@@ -52,12 +56,11 @@ function assertCurve(pts: Pt[], lv: Live, fromX: number) {
       assert.ok((yOf(p) as number) <= (yOf(curve[i - 1]!) as number) + 1e-9, 'luck-if-found-now never rises');
     }
     if (i < curve.length - 1) {
-      const want = Math.min(lv.expectedMs / Math.max(xOf(p) - lv.lastBlkMs, 1000) * 100, CAP);
-      assert.ok(Math.abs((yOf(p) as number) - want) < 1e-6, `sample at ${xOf(p)} is on the hyperbola`);
+      assert.ok(Math.abs((yOf(p) as number) - onCurve(lv, xOf(p))) < 1e-6, `sample at ${xOf(p)} is on the hyperbola`);
       assert.equal(hasMarker(p), false, 'curve samples have no marker');
     }
   }
-  assert.deepEqual(curve[curve.length - 1], [lv.x, lv.y], 'ends at the live point');
+  assert.deepEqual(curve[curve.length - 1], [lv.x, onCurve(lv, lv.x)], 'ends at the live point, on the curve');
 }
 
 test('field case: the only in-window block has null luck, the curve starts at that block', () => {
@@ -138,4 +141,59 @@ test('a round still inside the cap knee stays at the cap to the live point', () 
   const lv = live(blkMs, nowMs, nowMs, 1 * D);  // 1 min into a 1 d round: capped
   const pts = build([], [{ ts: blkMs / 1000, luck: null }], blkMs - D, lv);
   assert.deepEqual(pts, [{ x: blkMs, y: CAP, marker: { enabled: false } }, [nowMs, CAP]]);
+});
+
+// The day view's last graph sample is up to a minute old, the year view's up
+// to ~14.6 h: a block found since is after maxTime, outside the observed
+// filter, but inside the series, which runs to now.
+test('a real-luck block found after the last graph sample keeps its luck point, not a break', () => {
+  const nowMs = 1794777600e3;
+  {
+    // Day view: luck 130 found 40 s ago, last sample 60 s ago.
+    const minTime = nowMs - D, maxTime = nowMs - 60e3, blkMs = nowMs - 40e3;
+    const blocks: Block[] = [{ ts: (nowMs - 10 * H) / 1000, luck: 85 }, { ts: blkMs / 1000, luck: 130 }];
+    const lv = live(blkMs, nowMs, maxTime, 4 * H);
+    const pts = build(observedOf(blocks, minTime, maxTime), blocks, minTime, lv);
+    assert.deepEqual(pts, [[minTime, 85], [nowMs - 10 * H, 85], [blkMs, 130],
+                           { x: blkMs + 1000, y: CAP, marker: { enabled: false } }, [nowMs, CAP]]);
+  }
+  {
+    // Year view: two real-luck blocks after a 14 h old last sample.
+    const minTime = nowMs - 365 * D, maxTime = nowMs - 14 * H, blkMs = nowMs - 3 * H;
+    const blocks: Block[] = [{ ts: (nowMs - 20 * H) / 1000, luck: 85 }, { ts: (nowMs - 10 * H) / 1000, luck: 130 },
+                             { ts: blkMs / 1000, luck: 90 }];
+    const lv = live(blkMs, nowMs, maxTime, 4 * H);
+    const pts = build(observedOf(blocks, minTime, maxTime), blocks, minTime, lv);
+    assert.deepEqual(pts.slice(0, 4), [[minTime, 85], [nowMs - 20 * H, 85], [nowMs - 10 * H, 130], [blkMs, 90]]);
+    assert.ok(pts.every(p => yOf(p) !== null), 'no break: every block here has a luck');
+    assert.deepEqual(pts[4], { x: blkMs + 1000, y: CAP, marker: { enabled: false } });
+    assertCurve(pts, lv, blkMs + 1);
+  }
+});
+
+test('server clock ahead (maxTime > now): the end point is on the curve, and a block ahead of now ends the series', () => {
+  const nowMs = 1794777600e3, minTime = nowMs - D;
+  {
+    // The last graph sample 10 min ahead of this clock: the series ends at it,
+    // read off the curve there, not the value computed for now.
+    const maxTime = nowMs + 10 * 60e3, blkMs = nowMs - 10 * H;
+    const blocks: Block[] = [{ ts: (nowMs - 20 * H) / 1000, luck: 85 }, { ts: blkMs / 1000, luck: null }];
+    const lv = live(blkMs, nowMs, maxTime, 4 * H);
+    const pts = build(observedOf(blocks, minTime, maxTime), blocks, minTime, lv);
+    assert.equal(lv.x, maxTime);
+    assert.notEqual(onCurve(lv, maxTime), lv.y);
+    assert.deepEqual(pts[pts.length - 1], [maxTime, onCurve(lv, maxTime)]);
+    assertCurve(pts, lv, blkMs);
+  }
+  // A block stamped after maxTime and after now: no chord up to the cap
+  // before the block; the series ends at the block.
+  const maxTime = nowMs + 5 * 60e3, blkMs = nowMs + 8 * 60e3;
+  for (const luck of [130, null]) {
+    const blocks: Block[] = [{ ts: (nowMs - 10 * H) / 1000, luck: 85 }, { ts: blkMs / 1000, luck }];
+    const lv = live(blkMs, nowMs, maxTime, 4 * H);
+    const pts = build(observedOf(blocks, minTime, maxTime), blocks, minTime, lv);
+    assert.deepEqual(pts, luck
+      ? [[minTime, 85], [nowMs - 10 * H, 85], [blkMs, 130]]
+      : [[minTime, 85], [nowMs - 10 * H, 85], [blkMs, null], [blkMs, CAP]]);
+  }
 });

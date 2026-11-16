@@ -8450,22 +8450,31 @@
 
         // BEGIN c2pLuckTrend (tested by sharechain-explorer/tests/unit/dashboard-luck-trend.test.ts)
         // The hashrate charts' Luck series, in raw luck % (the caller applies
-        // the display transform). observed: [ms, luck] of the in-window blocks
-        // with a computed luck (> 0). sortedBlocks: all blocks, oldest first.
-        // live: the in-progress round {x: now ms, y: luck %, expectedMs,
-        // lastBlkMs}, or null.
+        // the display transform). observed: [ms, luck] of the blocks with a
+        // computed luck (> 0) between minTime and the last graph sample.
+        // sortedBlocks: all blocks, oldest first. live: the in-progress round
+        // {x: now ms, expectedMs, lastBlkMs}, or null; its y is not read, every
+        // point here is computed at its own x.
+        // The series runs from minTime to max(live.x, last block), past the
+        // last graph sample, so a block found after that sample is a point too.
         // A completed round is a point at its luck. The in-progress round is
         // luck-if-found-now = expected / elapsed * 100, capped at 1000: a
         // hyperbola, so it is sampled, not drawn as a chord. It starts at the
-        // last block when that block is in the window (at the window's left
-        // edge only when the block is older). A last block with no computed
-        // luck gets no luck value of its own: the line breaks there and the
-        // curve starts at its time, from the cap (elapsed -> 0). Curve samples
-        // have no marker.
+        // last block when that block is in the series (at minTime only when
+        // the block is older). A last block with no computed luck gets no luck
+        // value: the line breaks there and the curve starts at its time, from
+        // the cap (elapsed -> 0). Curve samples have no marker.
         var C2P_LUCK_CAP = 1000;
         var C2P_LUCK_SAMPLES = 32;
         function c2pLuckTrendPoints(observed, sortedBlocks, minTime, live) {
             var pts = observed.slice().sort(function(a, b) { return a[0] - b[0]; });
+            // Blocks after the last observed one (found after the last graph
+            // sample) are still inside this series: their luck is a point too.
+            var lastObs = pts.length > 0 ? pts[pts.length - 1][0] : -Infinity;
+            sortedBlocks.forEach(function(b) {
+                var t = b.ts * 1000;
+                if (t >= minTime && t > lastObs && b.luck > 0) pts.push([t, b.luck]);
+            });
             // Start at minTime: the luck of the last block before the window,
             // else the first in-window point's.
             if (pts.length > 0 && pts[0][0] > minTime && sortedBlocks.length > 0) {
@@ -8481,33 +8490,42 @@
                 pts.unshift([minTime, prevBlock ? prevBlock.luck : pts[0][1]]);
             }
             if (!live) return pts;
-            var luckAt = function(elapsedMs) {
-                return Math.min((live.expectedMs / Math.max(elapsedMs, 1000)) * 100, C2P_LUCK_CAP);
+            var last = sortedBlocks[sortedBlocks.length - 1] || {};
+            var blkMs = live.lastBlkMs;
+            // Never end before the round starts (a block ahead of this clock).
+            var endMs = Math.max(live.x, blkMs);
+            var luckAt = function(x) {
+                return Math.min((live.expectedMs / Math.max(x - blkMs, 1000)) * 100, C2P_LUCK_CAP);
             };
             var lastX = pts.length > 0 ? pts[pts.length - 1][0] : -Infinity;
-            var e0 = Math.max(live.lastBlkMs, minTime) - live.lastBlkMs;
-            var e1 = live.x - live.lastBlkMs;
-            if (lastX >= live.lastBlkMs) e0 += 1000;  // just after the block's own point
-            var elapsed = [];
-            if (e0 < e1) {
-                // The round ending at a no-luck block has no luck: break the
-                // line there instead of ramping the previous point up to the cap.
-                if (e0 === 0 && pts.length > 0) pts.push([live.lastBlkMs, null]);
-                elapsed.push(e0);
-                // Flat at the cap up to the knee, then geometric steps: the
-                // curve is 1/elapsed, so equal ratios keep it smooth.
-                var d0 = Math.max(e0, live.expectedMs * 100 / C2P_LUCK_CAP);
-                if (d0 < e1) {
-                    if (d0 > e0) elapsed.push(d0);
-                    var ratio = Math.pow(e1 / d0, 1 / C2P_LUCK_SAMPLES);
-                    for (var k = 1; k < C2P_LUCK_SAMPLES; k++) elapsed.push(d0 * Math.pow(ratio, k));
+            var startMs = Math.max(blkMs, minTime);
+            if (blkMs >= minTime) {
+                if (last.luck > 0) {
+                    startMs = blkMs + 1000;  // just after the block's own point
+                } else if (pts.length > 0) {
+                    // Its round has no luck: break the line instead of
+                    // ramping the previous point up to the cap.
+                    pts.push([blkMs, null]);
                 }
             }
-            elapsed.forEach(function(e) {
-                pts.push({x: live.lastBlkMs + e, y: luckAt(e), marker: {enabled: false}});
-                lastX = live.lastBlkMs + e;
+            var xs = [];
+            if (startMs < endMs) {
+                xs.push(startMs);
+                // Flat at the cap up to the knee, then geometric steps: the
+                // curve is 1/elapsed, so equal ratios keep it smooth.
+                var e1 = endMs - blkMs;
+                var d0 = Math.max(startMs - blkMs, live.expectedMs * 100 / C2P_LUCK_CAP);
+                if (d0 < e1) {
+                    if (blkMs + d0 > startMs) xs.push(blkMs + d0);
+                    var ratio = Math.pow(e1 / d0, 1 / C2P_LUCK_SAMPLES);
+                    for (var k = 1; k < C2P_LUCK_SAMPLES; k++) xs.push(blkMs + d0 * Math.pow(ratio, k));
+                }
+            }
+            xs.forEach(function(x) {
+                pts.push({x: x, y: luckAt(x), marker: {enabled: false}});
+                lastX = x;
             });
-            if (live.x > lastX) pts.push([live.x, live.y]);
+            if (endMs > lastX) pts.push([endMs, luckAt(endMs)]);
             return pts;
         }
         // END c2pLuckTrend
