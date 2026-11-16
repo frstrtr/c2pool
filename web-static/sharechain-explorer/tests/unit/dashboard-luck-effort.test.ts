@@ -25,12 +25,13 @@ interface Duplet { with: string; withHeight: number; gap: number; prevEffort: nu
 interface Pace {
   hash: string; chain: string; ts: number; height: number; offChain: boolean;
   effort: number | null; offEffort: number | null; luck: number | null; first: boolean; source: string | null; method: string | null;
-  coverage: number | null; covered: number | null; measured: boolean; gap: number | null; expected: number | null; gapFixed: boolean;
+  coverage: number | null; lowCoverage: boolean; covered: number | null; measured: boolean; gap: number | null; expected: number | null;
+  gapFixed: boolean;
   tier: string; tag: string; prev: string | null; duplet: Duplet | null; dupletOpen: string | null;
 }
 interface Round {
   ts: number; effort: number; first: boolean; hash: string; height: number; gap: number | null;
-  covered: number; measured: boolean;
+  covered: number; measured: boolean; low: boolean;
 }
 interface PaceSet {
   byHash: Record<string, Pace>; chains: Record<string, Round[]>; chain: string | null;
@@ -48,6 +49,8 @@ interface Luck {
   c2pDupletTip(p: Pace): string;
   c2pEffortTip(p: Pace): string;
   c2pEffortCellTip(b: Row, p: Pace | null): string;
+  c2pLowCoverage(method: string | null, coverage: number | null): boolean;
+  c2pGlyphStrip?(rounds: Round[], count?: number): { glyph: string; tier: string }[];
   c2pFmtX(e: number): string;
   c2pFmtPct(v: number): string;
 }
@@ -244,6 +247,63 @@ test('a block the node could not rate has no effort: hashrate_unavailable, netdi
   assert.deepEqual([paceOf(set, 4).effort, paceOf(set, 4).tag, paceOf(set, 4).duplet!.with], [0.1, '⚡', 'h3']);
 });
 
+test('a round the rate history covers for under half gets no tag and closes no duplet: its effort is extrapolation', () => {
+  // The threshold is a named constant of the page, 0.5.
+  assert.match(readFileSync(new URL('../../../dashboard.html', import.meta.url), 'utf8'), /var C2P_MIN_TAG_COVERAGE = 0\.5;/);
+  assert.deepEqual([0, 0.13, 0.4999, 0.5, 0.51, 1].map(c => L.c2pLowCoverage('integrated', c)), [true, true, true, false, false, false]);
+  // Only an integrated effort is scaled up from the covered part.
+  assert.equal(L.c2pLowCoverage('single_sample', 0), false);
+  assert.equal(L.c2pLowCoverage('first_block', null), false);
+  assert.equal(L.c2pLowCoverage('integrated', null), false);
+  assert.equal(L.c2pLowCoverage(null, 0.1), false);
+
+  const served = (h: number, hours: number, effort: number, coverage: number, more: Partial<Row> = {}): Row =>
+    row(h, hours, { effort, effort_method: 'integrated', history_coverage: coverage, main_chain: true, prev_block_hash: 'h' + (h - 1), ...more });
+  const rows: Row[] = [
+    row(1, 0, { effort: 1, effort_method: 'first_block', main_chain: true }),
+    served(2, 90, 9.3, 0.13),      // would be 🐢🐢
+    served(3, 91, 0.1, 0.49),      // would be ⚡ and a duplet with block 2
+    served(4, 92, 0.1, 0.5),       // half covered: tagged
+    served(5, 93, 0.05, 1),        // fully covered: ⚡⚡, after a low-coverage block
+    served(6, 120, 2.7, 0.97),
+    row(7, 121, { effort: 0.1, effort_method: 'single_sample', history_coverage: 0, main_chain: true, prev_block_hash: 'h6' }),
+  ];
+  const set = L.c2pBlockPace(rows, 'DASH');
+  assert.deepEqual([2, 3, 4, 5, 6, 7].map(h => [paceOf(set, h).lowCoverage, paceOf(set, h).tag]),
+                   [[true, ''], [true, ''], [false, '⚡'], [false, '⚡⚡'], [false, '🐢'], [false, '⚡']]);
+  // The value is still there, shown muted; the tooltip gives the coverage.
+  assert.deepEqual([paceOf(set, 2).effort, paceOf(set, 3).effort], [9.3, 0.1]);
+  assert.deepEqual([2, 3, 4, 6].map(h => L.c2pEffortClass(paceOf(set, h))),
+                   ['effort-unknown', 'effort-unknown', 'status-confirmed', 'status-orphaned']);
+  const tip = L.c2pEffortTip(paceOf(set, 2));
+  assert.match(tip, /^Effort 930 % of expected/);
+  assert.match(tip, /history covers 13 % of the round; the rest is taken at its mean, and pooled luck counts the covered part only\)\./);
+  assert.match(tip, /Under half of the round is measured: the figure is mostly extrapolation, so it has no fast \/ slow tag\.$/);
+  assert.doesNotMatch(tip, /Slow block|Fast block/);
+  assert.doesNotMatch(L.c2pEffortTip(paceOf(set, 4)), /mostly extrapolation/);
+  // No duplet is closed by a low-coverage round, fast as its figure reads.
+  assert.equal(paceOf(set, 3).duplet, null);
+  assert.equal(paceOf(set, 2).dupletOpen, null);
+  // The block after one can close a duplet with it, but its "wait" is not
+  // quoted and it is not a dry-spell pair: that effort was not measured.
+  assert.deepEqual(paceOf(set, 4).duplet, { with: 'h3', withHeight: 3, gap: 1 * H, prevEffort: null, kind: 'plain' });
+  const afterLong = L.c2pBlockPace([rows[0]!, served(2, 90, 9.3, 0.13), served(3, 91, 0.1, 1)], 'DASH');
+  assert.deepEqual(paceOf(afterLong, 3).duplet, { with: 'h2', withHeight: 2, gap: 1 * H, prevEffort: null, kind: 'plain' });
+  assert.doesNotMatch(L.c2pDupletTip(paceOf(afterLong, 3)), /after this 9\.3× wait|Long wait then a quick pair/);
+  // Measured, the same pair is the dry-spell one.
+  const measured = L.c2pBlockPace([rows[0]!, served(2, 90, 9.3, 0.9), served(3, 91, 0.1, 1)], 'DASH');
+  assert.deepEqual([paceOf(measured, 2).tag, paceOf(measured, 3).duplet!.kind, paceOf(measured, 3).duplet!.prevEffort], ['🐢🐢', 'dry', 9.3]);
+  // The rounds carry the mark, so the glyph strip shows no glyph for them.
+  assert.deepEqual(set.rounds.map(r => r.low), [false, true, true, false, false, false, false]);
+  if (L.c2pGlyphStrip) assert.equal(L.c2pGlyphStrip(set.rounds).map(g => g.glyph).join(''), '···⚡⚡🐢⚡');
+  // It is still a round: pooled luck counts its covered part.
+  assert.ok(Math.abs(set.rounds[1]!.covered - 9.3 * 0.13) < 1e-12);
+
+  // An older node's rows carry no coverage: nothing changes for them.
+  const old = L.c2pBlockPace(olderNode([row(1, 0), row(2, 90), row(3, 91)]), 'DASH');
+  assert.deepEqual([paceOf(old, 2).tag, paceOf(old, 3).tag, paceOf(old, 3).duplet!.kind], ['🐢🐢', '⚡', 'dry']);
+});
+
 test('duplet: a fast block and the main-chain block before it', () => {
   // efforts: 1st, 1.0, 0.2 (plain), 0.05 (two fast in a row), 2.5, 0.3 (after a dry spell)
   const set = L.c2pBlockPace(olderNode([row(1, 0), row(2, 10), row(3, 12), row(4, 12.5), row(5, 37.5), row(6, 40.5)]), 'DASH');
@@ -403,7 +463,7 @@ test('outside LTC node (older build): its one block is the first block, 100 %', 
   const p = set.byHash[rows[0]!.hash!]!;
   assert.deepEqual([p.effort, p.luck, p.first, p.source, p.tag, p.duplet], [1, 100, true, 'first_block', '', null]);
   assert.deepEqual(set.rounds, [{ ts: 1794498365, effort: 1, first: true, hash: rows[0]!.hash, height: 3211872, gap: null,
-                                 covered: 1, measured: true }]);
+                                 covered: 1, measured: true, low: false }]);
   assert.match(L.c2pEffortTip(p), /First block known to this node.*counts as effort 100 %/s);
   // Its merged DOGE row has no difficulty at find: no effort, no tag.
   const merged = L.c2pBlockPace([{ pow_hash: 'da2714c8', symbol: 'DOGE', height: 6454700, ts: 1794498370, verified: true }]);

@@ -19,7 +19,10 @@ interface Trend {
   c2pLuckTrendPoints(rounds: Round[] | null, minTime: number, live: Live | null, N?: number): Pt[];
   c2pLuckDisplay(luck: number): number;
   c2pLuckFromDisplay(v: number): number;
-  c2pBlockPace(rows: unknown[], sym?: string): { rounds: Round[]; noEffort: number[]; lastMain: { ts: number } | null };
+  c2pBlockPace(rows: unknown[], sym?: string): {
+    rounds: Round[]; noEffort: number[]; lastMain: { ts: number } | null;
+    byHash: Record<string, { height: number; tag: string; lowCoverage: boolean; offChain: boolean }>;
+  };
   c2pOpenRound(luckStats: unknown, lastMainTs: number, nowS: number, fallbackExpected: number):
     { effort: number; covered_effort: number; pace_time: number } | null;
   c2pLuckPeriods(luckStats: unknown, rounds: Round[], nowS: number, open: unknown, noEffort?: number[]):
@@ -191,6 +194,10 @@ test('rate history with gaps: the series pools covered effort only and ends on t
   // the 13 % round shows its effort scaled up to the whole round, 9.29.
   assert.deepEqual(set.rounds.map(r => [Math.round(r.effort * 100) / 100, Math.round(r.covered! * 100) / 100, r.measured]),
                    [[1, 1, true], [9.29, 1.24, true], [3.35, 3.24, true], [0.52, 0.52, true]]);
+  // That row gets no tag (its 929 % is extrapolated from 13 % of the round);
+  // the 335 % round, covered for 97 %, keeps its own.
+  assert.deepEqual(Object.values(set.byHash).filter(p => !p.offChain).sort((a, b) => a.height - b.height).map(p => [p.height, p.tag, p.lowCoverage]),
+                   [[3085349, '', false], [3160570, '', true], [3204796, '🐢🐢', false], [3211872, '', false]]);
   const open = T.c2pOpenRound(stats, set.lastMain!.ts, nowS, 0)!;
   assert.ok(near(open.covered_effort, stats.current_round.effort * stats.current_round.history_coverage));
   const live: Live = { x: nowS * 1000, lastBlkMs: set.lastMain!.ts * 1000, expectedMs: open.pace_time * 1000 };

@@ -8560,6 +8560,11 @@
         // and unknown (a dash) when they are not. Nothing here falls back to
         // a mean of per-block luck.
         var C2P_FAST = 1 / 3, C2P_VERY_FAST = 0.1, C2P_SLOW = 2, C2P_VERY_SLOW = 3, C2P_DRY_HINT = 5;
+        // An integrated effort is the covered integral scaled up to the whole
+        // round. With under this share of the round covered it is mostly
+        // extrapolation: the value is shown, muted, and the round gets no
+        // fast / slow tag and closes no duplet.
+        var C2P_MIN_TAG_COVERAGE = 0.5;
         var C2P_TREND_ROUNDS = 10;
         var C2P_LUCK_CAP = 1000;
         var C2P_LUCK_SAMPLES = 16;
@@ -8644,6 +8649,13 @@
             if (own !== null && own >= 0) return own;
             return method === 'integrated' && c2pNum(coverage) !== null ? effort * coverage : effort;
         }
+        // Whether an effort is mostly extrapolation: integrated over a rate
+        // history that covers less than C2P_MIN_TAG_COVERAGE of the round. A
+        // single sample, the first block and an older node's row are not
+        // scaled up from a part, and carry no coverage to judge by.
+        function c2pLowCoverage(method, coverage) {
+            return method === 'integrated' && c2pNum(coverage) !== null && coverage < C2P_MIN_TAG_COVERAGE;
+        }
         // What a round adds to a pooled figure: its covered effort to the
         // blocks expected, and its block to the blocks found unless it was
         // found in a gap of the history (`measured` false).
@@ -8669,7 +8681,9 @@
         // is the gap to it, the round is timed from the previous main-chain
         // block instead.
         // duplet: a fast block (effort under 1/3) and the main-chain block
-        // before it. The first block and a row with no effort close none.
+        // before it. The first block, a row with no effort and a round the
+        // rate history covers for under C2P_MIN_TAG_COVERAGE (no tag) close
+        // none.
         function c2pBlockPace(rows, sym) {
             var byHash = {}, lists = {}, chains = {}, lastMain = {}, noEffort = {};
             (rows || []).forEach(function(b) {
@@ -8679,7 +8693,7 @@
                 var c = c2pRowChain(b);
                 byHash[h] = { hash: h, chain: c, ts: b.ts, height: c2pRowHeight(b), offChain: c2pRowOffChain(b),
                               effort: null, offEffort: null, luck: null, first: false, source: null, method: null,
-                              coverage: null, covered: null, measured: true,
+                              coverage: null, lowCoverage: false, covered: null, measured: true,
                               gap: null, expected: null, gapFixed: false, tier: '', tag: '',
                               prev: null, duplet: null, dupletOpen: null };
                 (lists[c] = lists[c] || []).push(b);
@@ -8724,12 +8738,13 @@
                     p.coverage = c2pNum(b.history_coverage);
                     if (p.effort !== null) {
                         p.luck = 100 / p.effort;
-                        if (!p.first) p.tier = c2pPaceTier(p.effort);
+                        p.lowCoverage = c2pLowCoverage(p.method, p.coverage);
+                        if (!p.first && !p.lowCoverage) p.tier = c2pPaceTier(p.effort);
                         p.tag = c2pPaceTag(p.tier);
                         p.covered = c2pCoveredEffort(p.effort, p.method, p.coverage, b.effort_covered);
                         p.measured = b.measured !== false;
                         rounds.push({ ts: b.ts, effort: p.effort, first: p.first, hash: p.hash, height: p.height, gap: p.gap,
-                                      covered: p.covered, measured: p.measured });
+                                      covered: p.covered, measured: p.measured, low: p.lowCoverage });
                     } else {
                         unknown.push(b.ts);
                     }
@@ -8739,7 +8754,8 @@
                     if (prev && (prev.offChain || prev.chain !== c || prev.hash === p.hash)) prev = null;
                     if (prev) p.prev = prev.hash;
                     if (prev && c2pIsFast(p.tier) && (prev.height == null || prev.height !== p.height)) {
-                        var measured = prev.effort !== null && !prev.first;
+                        // The wait before the pair is quoted only when it was measured.
+                        var measured = prev.effort !== null && !prev.first && !prev.lowCoverage;
                         p.duplet = {
                             'with': prev.hash,
                             withHeight: prev.height,
@@ -9026,6 +9042,8 @@
         // 100 % is a convention, not a measurement: it keeps the amber it had.
         function c2pEffortClass(p) {
             if (p && p.first) return 'status-pending';
+            // Mostly extrapolation: shown, but muted.
+            if (p && p.lowCoverage) return 'effort-unknown';
             var band = p ? c2pEffortBand(p.effort) : '';
             return band === 'good' ? 'status-confirmed' : band === 'mid' ? 'status-pending'
                  : band === 'poor' ? 'status-orphaned' : 'effort-unknown';
@@ -9087,6 +9105,7 @@
                     (p.coverage !== null && p.coverage < 0.995
                         ? ' (history covers ' + Math.round(p.coverage * 100) + ' % of the round; the rest is taken at its mean, ' +
                           'and pooled luck counts the covered part only).' : '.') +
+                    (p.lowCoverage ? ' Under half of the round is measured: the figure is mostly extrapolation, so it has no fast / slow tag.' : '') +
                     (p.measured === false ? ' The block was found in a gap of the history: pooled luck leaves it out.' : '');
             }
             if (p.source === 'client') {
@@ -9209,7 +9228,7 @@
         // 🐢 slow, · neither.
         function c2pGlyphStrip(rounds, count) {
             return (rounds || []).slice(-(count || C2P_STRIP_ROUNDS)).map(function(r) {
-                var tier = r.first ? '' : c2pPaceTier(r.effort);
+                var tier = r.first || r.low ? '' : c2pPaceTier(r.effort);
                 return { glyph: c2pIsFast(tier) ? '⚡' : c2pIsSlow(tier) ? '🐢' : '·', tier: tier,
                          height: r.height, hash: r.hash, effort: r.effort, first: !!r.first };
             });
@@ -9449,9 +9468,10 @@
             return s;
         }
         // Marker fill by effort, at the bounds the luck colours had; a block
-        // with no effort is neutral, not green.
+        // with no effort, or with one that is mostly extrapolation, is
+        // neutral, not green.
         function c2pMarkerFill(p) {
-            var band = p ? c2pEffortBand(p.effort) : '';
+            var band = p && !p.lowCoverage ? c2pEffortBand(p.effort) : '';
             return band === 'good' ? '#10b981' : band === 'mid' ? '#f59e0b' : band === 'poor' ? '#ef4444' : '#64748b';
         }
         // The Blocks series points. Pace cue: a ⚡ / 🐢 label over the
@@ -9530,9 +9550,13 @@
                 s += 'Effort: <b style="color:#888">1st block, counted as 100%</b><br/>';
             } else if (p && p.effort !== null) {
                 var band = c2pEffortBand(p.effort);
-                var color = band === 'good' ? '#00ff88' : (band === 'mid' ? '#ffc107' : '#ff6b6b');
+                var color = p.lowCoverage ? '#888' : (band === 'good' ? '#00ff88' : (band === 'mid' ? '#ffc107' : '#ff6b6b'));
                 s += 'Effort: <b style="color:' + color + '">' + c2pFmtPct(p.effort * 100) + '</b> of expected ' +
                      '<span style="font-size:10px;color:#aaa">(luck ' + c2pFmtPct(p.luck) + ')</span><br/>';
+                if (p.lowCoverage) {
+                    s += '<span style="font-size:10px;color:#aaa">(rate history covers ' + Math.round(p.coverage * 100) +
+                         ' % of the round: mostly extrapolation, no tag)</span><br/>';
+                }
             }
             if (t.actual > 0) s += 'Found in: <b>' + format_dt(t.actual) + '</b><br/>';
             if (t.expected > 0) s += 'Expected: <b>' + format_dt(t.expected) + '</b><br/>';
