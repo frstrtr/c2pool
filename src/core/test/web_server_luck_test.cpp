@@ -22,6 +22,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <ctime>
@@ -259,10 +260,21 @@ TEST(PoolLuckEndpoints, CorruptRowsHealOnLoad)
     TempDir tmp("core_luck_heal_kat");
     const double now = std::floor(now_s());
     const double day = 86400.0;
-    // An hourly rate history over the last 26 days: ~180 GH/s, D = 9.5e7.
+    const double t0 = now - 25 * day, t1 = now - 22 * day, t2 = now - 14 * day, t3 = now - 2 * day;
+    // The rate history of the last 26 days: ~180 GH/s, D = 9.5e7. Hourly here
+    // (the fixture stands for the node's minute samples), and by the minute
+    // around each block: a stored rate is rewritten only against a sample of
+    // the block's own minute that the samples next to it bear out. (No two
+    // readings in a row are the same: a run of identical ones is a frozen
+    // estimator, and the stat log purges it on load.)
     std::vector<Sample> samples;
     for (int i = 26 * 24; i >= 0; --i)
         samples.push_back({now - i * 3600.0, 1.8e11 + 1.0e6 * (i % 7), 0.0, 9.5e7});
+    for (double block : {t0, t1, t2, t3})
+        for (int j = 0; j < 12; ++j)
+            samples.push_back({block - 330.0 + 60.0 * j, 1.8e11 + 1.0e5 * (1 + j % 5), 0.0, 9.5e7});
+    std::sort(samples.begin(), samples.end(),
+              [](const Sample& a, const Sample& b) { return a.t < b.t; });
     write_stat_log(tmp.path("graph_db"), samples);
 
     using FB = MiningInterface::FoundBlock;
@@ -280,7 +292,6 @@ TEST(PoolLuckEndpoints, CorruptRowsHealOnLoad)
         b.authorship = MiningInterface::BlockAuthorship::sharechain_peer;
         return b;
     };
-    const double t0 = now - 25 * day, t1 = now - 22 * day, t2 = now - 14 * day, t3 = now - 2 * day;
     const std::vector<FB> on_disk = {
         stored_row(3160570, 0xa0, t0, 90789408.8, 0.0, MiningInterface::BlockStatus::confirmed, false),
         stored_row(27588573, 0xa1, t1, 91737839.6, 4030409.5, MiningInterface::BlockStatus::pending, true),

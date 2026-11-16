@@ -1262,6 +1262,10 @@ public:
         // time and does not hold its hash. Never set because a verdict is
         // merely missing. Re-derived at every check; gone with the process.
         bool        not_on_chain{false};
+        // IN MEMORY ONLY: how many checks of the row have started. A check
+        // reads the chain with the ledger unlocked and applies what it found
+        // only if no later check has started meanwhile (verify_found_block).
+        uint64_t    verify_pass{0};
     };
 
     // Block acceptance verification: schedule async checks at +10s, +30s, +120s.
@@ -1701,10 +1705,10 @@ private:
     /// the block's own time is left as recorded; beyond it the sample's
     /// replaces it (repair_found_block_inputs_locked).
     static constexpr double kLuckRateRepairTolerance = 0.25;
-    /// The longest stretch a history reading may speak for and still count
-    /// as "a sample of the block's own time" for that comparison: five
-    /// stat-log periods. A sample taken after a restart reaches back up to an
-    /// hour; it is a reading of the estimator, not of that minute.
+    /// The longest stretch a history reading may speak for and still vouch
+    /// for a rewrite of a stored rate: five stat-log periods. A sample taken
+    /// after a restart reaches back up to an hour; it is a reading of the
+    /// estimator, not of that minute.
     static constexpr double kLuckRepairSampleSpan = 300.0;
     /// How far from a block's time the history may be and still serve as the
     /// yardstick for its recorded rate (core::luck::rate_at_find_plausible):
@@ -1760,11 +1764,12 @@ private:
     /// The difficulty a row's luck runs against: its own chain's (a merged
     /// row that only holds the parent's has none).
     double found_block_luck_difficulty(const FoundBlock& b) const;
-    /// Rewrite the rate a row stored at find against a SAMPLE of the rate
-    /// history at the block's own time: where the stored value is missing or
-    /// not plausibly a pool rate, or where a sample of the block's own minute
-    /// contradicts it. Never against binned history (a mean is not a reading
-    /// of a moment). Returns the rows changed, to persist.
+    /// Rewrite the rate a row stored at find where a sample of the block's
+    /// OWN MINUTE says it is wrong: missing, not plausibly a pool rate, or
+    /// more than kLuckRateRepairTolerance away. Own minute: a sample (never
+    /// a bin) that speaks for at most kLuckRepairSampleSpan, was taken no
+    /// more than a stat period after the block's time, and is borne out by
+    /// the samples next to it. Returns the rows changed, to persist.
     /// CALLER MUST HOLD m_blocks_mutex.
     std::vector<FoundBlock> repair_found_block_inputs_locked();
     /// Period luck of the node's own chain.

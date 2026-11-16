@@ -316,6 +316,7 @@ public:
         double rate{0.0};      ///< gross rate; 0 = the moment is not covered
         bool   binned{false};  ///< a mean over a stretch, not a sample of the moment
         double span{0.0};      ///< length of the stretch the reading speaks for, seconds
+        double end{0.0};       ///< where that stretch ends: when the sample was taken
     };
     Reading at(double t) const
     {
@@ -326,35 +327,66 @@ public:
         r.rate = it->rate;
         r.binned = it->binned;
         r.span = it->t1 - it->t0;
+        r.end = it->t1;
         return r;
     }
 
+    /// Is the reading at `t` one of a run of periodic samples that bear each
+    /// other out? The segment that covers `t` and its neighbour on each side
+    /// (the one after it, once there is one) are samples, not bins; none
+    /// speaks for more than `max_span` seconds; they follow one another
+    /// without a gap; and each neighbour's rate is within `tolerance` of its
+    /// own. A sample taken after a restart is none of that -- it reaches back
+    /// over the outage, and the estimator behind it is still filling its
+    /// window -- nor is a one-off reading the samples around it do not repeat.
+    bool steady_at(double t, double max_span, double tolerance) const
+    {
+        auto it = first_ending_after(t);
+        if (it == m_segments.end() || it->t0 > t || it == m_segments.begin())
+            return false;
+        auto sample = [max_span](const RateSegment& s) {
+            return !s.binned && s.t1 - s.t0 <= max_span;
+        };
+        auto bears_out = [&](const RateSegment& s) {
+            return sample(s) && std::fabs(s.rate - it->rate) <= tolerance * it->rate;
+        };
+        if (!sample(*it))
+            return false;
+        const auto prev = it - 1;
+        if (prev->t1 != it->t0 || !bears_out(*prev))
+            return false;
+        const auto next = it + 1;
+        return next == m_segments.end() || (next->t0 == it->t1 && bears_out(*next));
+    }
+
     /// The rate of the segment that covers `t`, else of the segment nearest
-    /// to it in time if that is within `max_distance` seconds (0 = none). A
-    /// yardstick for what order of magnitude the pool's rate has, not a
-    /// reading of the moment.
+    /// to it in time if that is within `max_distance` seconds (0 = none).
     double nearest_rate(double t,
                         double max_distance = std::numeric_limits<double>::infinity()) const
     {
-        if (m_segments.empty())
+        const auto it = nearest(t, max_distance);
+        return it == m_segments.end() ? 0.0 : it->rate;
+    }
+
+    /// The yardstick for a rate recorded at `t`: what order of magnitude the
+    /// pool's rate has there. The LOWEST of the reading nearest `t`
+    /// (nearest_rate) and the readings next to it on each side, so that one
+    /// stray reading -- a sample taken while the estimator fills its window
+    /// after a restart can read a hundred times high -- does not make the
+    /// rates recorded around it look implausibly small. 0 = no history within
+    /// `max_distance`.
+    double yardstick_rate(double t,
+                          double max_distance = std::numeric_limits<double>::infinity()) const
+    {
+        const auto it = nearest(t, max_distance);
+        if (it == m_segments.end())
             return 0.0;
-        auto it = first_ending_after(t);
-        if (it != m_segments.end() && it->t0 <= t)
-            return it->rate;
-        // Not covered: the segment before `t` and the one after it.
-        double best = 0.0, best_distance = std::numeric_limits<double>::infinity();
-        if (it != m_segments.end()) {
-            best = it->rate;
-            best_distance = it->t0 - t;
-        }
-        if (it != m_segments.begin()) {
-            const auto prev = it - 1;
-            if (t - prev->t1 <= best_distance) {
-                best = prev->rate;
-                best_distance = t - prev->t1;
-            }
-        }
-        return best_distance <= max_distance ? best : 0.0;
+        double rate = it->rate;
+        if (it != m_segments.begin())
+            rate = std::min(rate, (it - 1)->rate);
+        if (it + 1 != m_segments.end())
+            rate = std::min(rate, (it + 1)->rate);
+        return rate;
     }
 
     /// Integrate rate / (D * 2^32) over [a, b].
@@ -398,6 +430,32 @@ private:
                                 [](double v, const RateSegment& s) { return v < s.t1; });
     }
 
+    /// The segment that covers `t`, else the one nearest to it in time if
+    /// that is within `max_distance` seconds; end() = none.
+    std::vector<RateSegment>::const_iterator nearest(double t, double max_distance) const
+    {
+        if (m_segments.empty())
+            return m_segments.end();
+        auto it = first_ending_after(t);
+        if (it != m_segments.end() && it->t0 <= t)
+            return it;
+        // Not covered: the segment before `t` or the one after it.
+        auto best = m_segments.end();
+        double best_distance = std::numeric_limits<double>::infinity();
+        if (it != m_segments.end()) {
+            best = it;
+            best_distance = it->t0 - t;
+        }
+        if (it != m_segments.begin()) {
+            const auto prev = it - 1;
+            if (t - prev->t1 <= best_distance) {
+                best = prev;
+                best_distance = t - prev->t1;
+            }
+        }
+        return best_distance <= max_distance ? best : m_segments.end();
+    }
+
     std::vector<RateSegment> m_segments;
     double m_last_stale_prop{0.0};
     double m_last_rate{0.0};
@@ -419,8 +477,10 @@ private:
 ///     share difficulty * 2^32 / kShareWorkBoundSeconds
 /// is not that pool's rate. (A pool so small that its share difficulty sits
 /// at the chain's floor -- a regtest rig -- is the one place the first line
-/// does not hold; the floor is 2^20 hashes a share on the scrypt and X11
-/// lanes, a bound of 58 H/s.)
+/// does not hold. The floor is 2^20 hashes a share on the scrypt and X11
+/// lanes and a share may carry 30x that, so there the bound asks for
+/// 2^20 / 18000 = 58 H/s behind a share at the floor and up to
+/// 30 * 2^20 / 18000 = 1748 H/s behind one at 30x it.)
 inline constexpr double kShareWorkBoundSeconds = 30.0 * 60.0 * 10.0;   // 18000
 
 /// A rate recorded at find below this share of the rate the node's own
@@ -435,8 +495,8 @@ inline constexpr double kImplausibleRateShare = 0.01;
 /// above 100 MH/s). One such row as a single sample is an effort of ~1e-4:
 /// a block found for nothing expected.
 ///   share_difficulty  the winning share's difficulty; 0 = not known
-///   reference_rate    the history's rate at or near the block's time;
-///                     0 = no history near it
+///   reference_rate    the history's rate at or near the block's time
+///                     (RateHistory::yardstick_rate); 0 = no history near it
 /// With neither yardstick the rate stands as recorded.
 inline bool rate_at_find_plausible(double rate, double share_difficulty, double reference_rate)
 {

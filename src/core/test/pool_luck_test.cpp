@@ -331,6 +331,84 @@ TEST(PoolLuck, CoarseningKeepsTheEffortOfARound)
     EXPECT_GT(h.nearest_rate(-50.0), 0.0);
 }
 
+// Which reading of the history may vouch for the rate of one moment. A
+// minute sample in a run of them that agree does; the first sample after a
+// restart does not (it reaches back over the outage, and reads whatever the
+// estimator has while its window fills); nor does a one-off the samples
+// around it do not repeat; nor a bin.
+TEST(PoolLuck, OnlyASteadySampleVouchesForItsMinute)
+{
+    luck::RateHistory h;
+    const double R = kT32, D = 1000.0;
+    // Ten steady minutes, [0, 600].
+    for (int i = 1; i <= 10; ++i) h.add_sample(60.0 * i, R, 0.0, D);
+    // A 240 s outage; the first sample after it reads 0.7 R.
+    h.add_sample(840.0, 0.7 * R, 0.0, D);
+    // Steady again, but for one minute that reads 150 R.
+    for (int i = 1; i <= 10; ++i)
+        h.add_sample(840.0 + 60.0 * i, i == 5 ? 150.0 * R : R, 0.0, D);
+    // A six-hour outage; the first sample after it reaches one hour back.
+    h.add_sample(1440.0 + 6 * 3600.0, 150.0 * R, 0.0, D);
+
+    // at(): the stretch a reading speaks for, and when it was taken.
+    EXPECT_NEAR(h.at(330.0).span, 60.0, 1e-9);
+    EXPECT_NEAR(h.at(330.0).end, 360.0, 1e-9);
+    EXPECT_NEAR(h.at(700.0).span, 240.0, 1e-9);
+    EXPECT_NEAR(h.at(700.0).end, 840.0, 1e-9);
+    EXPECT_NEAR(h.at(20000.0).span, 3600.0, 1e-9);
+
+    const double span = 300.0, tol = 0.25;
+    EXPECT_TRUE(h.steady_at(330.0, span, tol)) << "a minute among minutes that agree";
+    EXPECT_FALSE(h.steady_at(30.0, span, tol)) << "the first segment: nothing before it bears it out";
+    EXPECT_FALSE(h.steady_at(700.0, span, tol)) << "the restart sample: 0.7 R among R";
+    EXPECT_FALSE(h.steady_at(830.0, span, tol)) << "its last minute is still the restart sample";
+    EXPECT_FALSE(h.steady_at(870.0, span, tol)) << "the minute after it has it for a neighbour";
+    EXPECT_TRUE(h.steady_at(930.0, span, tol));
+    EXPECT_FALSE(h.steady_at(1110.0, span, tol)) << "the one-off: 150 R among R";
+    EXPECT_FALSE(h.steady_at(1050.0, span, tol)) << "the minute before the one-off";
+    EXPECT_FALSE(h.steady_at(1170.0, span, tol)) << "the minute after the one-off";
+    EXPECT_TRUE(h.steady_at(1230.0, span, tol));
+    EXPECT_FALSE(h.steady_at(1430.0, span, tol))
+        << "the last minute before the outage: the sample after it is an hour long";
+    EXPECT_FALSE(h.steady_at(20000.0, span, tol)) << "an hour-long reading";
+    EXPECT_FALSE(h.steady_at(5000.0, span, tol)) << "not covered";
+    // The newest sample has no successor yet: the one before it bears it out.
+    {
+        luck::RateHistory g;
+        for (int i = 1; i <= 3; ++i) g.add_sample(60.0 * i, R, 0.0, D);
+        EXPECT_TRUE(g.steady_at(150.0, span, tol));
+        g.add_sample(240.0, 2.0 * R, 0.0, D);
+        EXPECT_FALSE(g.steady_at(150.0, span, tol)) << "its successor now says otherwise";
+    }
+    // A bin is a mean, never a sample of a minute.
+    {
+        luck::RateHistory g;
+        for (int i = 1; i <= 240; ++i) g.add_sample(60.0 * i, R, 0.0, D);
+        ASSERT_TRUE(g.steady_at(3630.0, span, tol));
+        g.coarsen_before(7200.0, 3600.0);
+        EXPECT_FALSE(g.steady_at(3630.0, span, tol));
+        EXPECT_FALSE(g.steady_at(7230.0, span, tol)) << "the minute after a bin";
+        EXPECT_TRUE(g.steady_at(7290.0, span, tol));
+    }
+
+    // The yardstick for a recorded rate: the lowest of the nearest reading
+    // and its neighbours, so a stray high reading does not make the rates
+    // recorded around it look a hundred times too small.
+    EXPECT_NEAR(h.yardstick_rate(330.0), R, 1.0);
+    EXPECT_NEAR(h.yardstick_rate(1110.0), R, 1.0) << "the one-off minute reads 150 R";
+    EXPECT_NEAR(h.nearest_rate(1110.0), 150.0 * R, 150.0);
+    EXPECT_NEAR(h.yardstick_rate(20000.0), R, 1.0) << "the hour-long 150 R reading";
+    EXPECT_NEAR(h.yardstick_rate(700.0), 0.7 * R, 1.0);
+    EXPECT_NEAR(h.yardstick_rate(5000.0, 4000.0), R, 1.0) << "not covered: the nearest, 3560 s back";
+    EXPECT_DOUBLE_EQ(h.yardstick_rate(5000.0, 3000.0), 0.0) << "nothing near enough";
+    EXPECT_DOUBLE_EQ(luck::RateHistory{}.yardstick_rate(5.0), 0.0);
+    // So the rate a block recorded in the stray minute stands, and a node's
+    // own 1e-5 of it is still refused.
+    EXPECT_TRUE(luck::rate_at_find_plausible(R, 0.0, h.yardstick_rate(1110.0)));
+    EXPECT_FALSE(luck::rate_at_find_plausible(R, 0.0, h.nearest_rate(1110.0)));
+    EXPECT_FALSE(luck::rate_at_find_plausible(1e-5 * R, 0.0, h.yardstick_rate(1110.0)));
+}
+
 // The rate recorded "at find" is used only if it is plausibly a POOL rate.
 // The LTC canary holds rows recorded at the node's own ~4 MH/s; the winning
 // shares of those very rows (difficulty 500-700) put the pool above

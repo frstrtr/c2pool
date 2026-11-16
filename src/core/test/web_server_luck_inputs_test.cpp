@@ -23,6 +23,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <ctime>
 #include <future>
 #include <memory>
@@ -194,6 +195,7 @@ TEST(PoolLuckInputs, PeerLearnedMergedBlockIsMeasuredAgainstItsOwnBits)
         blk.difficulty = difficulty;
         mm.add_discovered_block(blk);
     };
+    peer_block(6453900, 0xd0, t1 - 3600.0, doge_diff, /*accepted=*/false);   // refused, before any block
     peer_block(6454000, 0xd1, t1, doge_diff, true);
     peer_block(6454400, 0xd2, t2, doge_diff, /*accepted=*/false);   // refused by the aux daemon
     peer_block(6454700, 0xd3, t3, doge_diff, true);
@@ -228,6 +230,21 @@ TEST(PoolLuckInputs, PeerLearnedMergedBlockIsMeasuredAgainstItsOwnBits)
     EXPECT_TRUE(row["main_chain"].get<bool>());
     EXPECT_TRUE(row.value("measured", false));
     EXPECT_TRUE(find_row(merged, "pow_hash", hash_of(0xd1))["main_chain"].get<bool>());
+
+    // A refused submit with no block of the aux chain before it has no round
+    // at all: no luck, and the label a parent row has in that case -- not
+    // "first_block", and not a missing difficulty (it has one).
+    const auto early = find_row(merged, "pow_hash", hash_of(0xd0));
+    ASSERT_TRUE(early.is_object());
+    EXPECT_FALSE(early["main_chain"].get<bool>());
+    EXPECT_TRUE(early["luck"].is_null()) << early.dump(1);
+    EXPECT_TRUE(early["effort"].is_null());
+    EXPECT_TRUE(early["effort_method"].is_null());
+    EXPECT_TRUE(early["time_to_find"].is_null());
+    EXPECT_NEAR(num(early, "network_difficulty"), doge_diff, 1e-6);
+    EXPECT_EQ(early["luck_method"].get<std::string>(), "interval_unavailable");
+    EXPECT_EQ(find_row(merged, "pow_hash", hash_of(0xd1))["luck_method"].get<std::string>(),
+              "first_block");
 }
 
 // F1, the ledger side: this node's own merged find that its aux chain
@@ -573,14 +590,97 @@ TEST(PoolLuckInputs, HeaderLookupsRunWithTheLedgerUnlocked)
     EXPECT_EQ(mi.run_block_verification_now(h3), 0);
     EXPECT_GT(calls.load(), at_record) << "the confirm lane asks the header too";
 
+    // The startup backfill asks the same two lookups about every row.
+    const int at_backfill = calls.load();
+    mi.backfill_block_fields(
+        [&](const std::string&) { probe(); return 3000.0; },
+        [&](const std::string&) { probe(); return uint32_t(0); });
+    EXPECT_EQ(calls.load() - at_backfill, 6) << "difficulty and time of each of the 3 rows";
+    EXPECT_NEAR(num(mi.rest_found_block(h1), "network_difficulty"), 3000.0, 1e-9)
+        << "and the backfill's answers landed";
+
     for (auto& t : probes) t.join();
     EXPECT_EQ(under_lock.load(), 0)
         << under_lock.load() << " of " << calls.load()
         << " header lookups were made with the ledger locked";
-    // And the lookups' answers landed.
+    // And the confirm lane's answers landed (the height; the difficulty is
+    // the backfill's by now).
     const auto row = mi.rest_found_block(h2);
     EXPECT_EQ(row["height"].get<uint64_t>(), 21000250u);
-    EXPECT_NEAR(num(row, "network_difficulty"), 2000.0, 1e-9);
+    EXPECT_NEAR(num(row, "network_difficulty"), 3000.0, 1e-9);
+}
+
+// A check of a pending row reads the chain with the ledger unlocked, so two
+// checks of one row can overlap and finish out of order. The older one must
+// not apply what it found over the newer one's: here the first check asks
+// while the header chain does not hold the block yet and is held up in its
+// last lookup; the second runs start to finish against a chain that does hold
+// it; then the first comes back with "the chain does not hold it".
+TEST(PoolLuckInputs, OlderCheckDoesNotOverrideANewerOne)
+{
+    MiningInterface mi(false, nullptr, Blockchain::LITECOIN);
+    const double now = now_s(), day = 86400.0;
+    record(mi, "LTC", 100, 1, now - 40 * day, 1000.0, kT32);
+    record(mi, "LTC", 101, 2, now - 30 * day, 1000.0, kT32);
+    record(mi, "LTC", 102, 3, now - 20 * day, 1000.0, kT32);
+    mi.set_block_verify_fn([](const std::string& hash) { return hash == hash_of(2) ? 0 : 6; });
+
+    std::mutex m;
+    std::condition_variable cv;
+    int asked = 0;            // lookups of the pending block so far
+    bool held = false;        // the first check is inside its last lookup
+    bool release = false;     // ... and may come back
+    mi.set_block_height_lookup([&](const std::string& hash) -> uint64_t {
+        if (hash != hash_of(2)) return 3200000u;   // the pool's blocks around it
+        std::unique_lock<std::mutex> l(m);
+        const int n = ++asked;
+        if (n == 1) return 0u;                     // first check, first ask: not held
+        if (n == 2) {                              // first check, asked again: held up
+            held = true;
+            cv.notify_all();
+            cv.wait(l, [&] { return release; });
+            return 0u;                             // still its old answer
+        }
+        return 3200000u;                           // from now on the chain holds it
+    });
+    mi.run_block_verification_now(hash_of(1));
+    mi.run_block_verification_now(hash_of(3));
+
+    std::thread older([&] { mi.run_block_verification_now(hash_of(2)); });
+    bool reached = false;
+    {
+        std::unique_lock<std::mutex> l(m);
+        reached = cv.wait_for(l, std::chrono::seconds(30), [&] { return held; });
+    }
+    EXPECT_TRUE(reached) << "the first check never asked for the block a second time";
+    if (reached) {
+        // The newer check, start to finish: the chain holds the block.
+        EXPECT_EQ(mi.run_block_verification_now(hash_of(2)), 0);
+        const auto row = find_row(mi.rest_recent_blocks(), "hash", hash_of(2));
+        EXPECT_EQ(row.value("main_chain", false), true) << row.dump(1);
+    }
+    {
+        std::lock_guard<std::mutex> l(m);
+        release = true;
+    }
+    cv.notify_all();
+    older.join();
+    EXPECT_EQ(asked, 3);
+
+    const auto recent = mi.rest_recent_blocks();
+    const auto row = find_row(recent, "hash", hash_of(2));
+    EXPECT_EQ(str(row, "status"), "pending");
+    EXPECT_EQ(row.value("main_chain", false), true)
+        << "the older check's 'absent' was applied over the newer 'present': " << row.dump(1);
+    EXPECT_EQ(str(find_row(recent, "hash", hash_of(3)), "prev_block_hash"), hash_of(2));
+
+    // Alone again, a check applies what it finds: the chain loses the block.
+    mi.set_block_height_lookup([](const std::string& hash) -> uint64_t {
+        return hash == hash_of(2) ? 0u : 3200000u;
+    });
+    mi.run_block_verification_now(hash_of(2));
+    EXPECT_EQ(find_row(mi.rest_recent_blocks(), "hash", hash_of(2)).value("main_chain", true),
+              false);
 }
 
 // L2-1. A row's `effort` is the best estimate for its own round: where the
@@ -661,25 +761,38 @@ TEST(PoolLuckInputs, RowsServeWhatAPeriodCountsOfThem)
 }
 
 
-// F2, the samples' side. A stored rate is rewritten on disk only when
-//   - it is missing or not plausibly a pool rate (judged against a sample of
-//     the block's own time), or
-//   - a sample of the block's own MINUTE contradicts it by more than 25 %.
-// A sample taken after a restart speaks for up to the hour before it: it is
-// the estimator's reading, not the rate of any one minute in that hour, and
-// a rate recorded at find 30 % away from it stands.
+// F2, the samples' side. A stored rate is rewritten on disk -- for good --
+// only against a sample of the block's OWN MINUTE: a sample (not a bin) that
+// speaks for at most 300 s, was taken no more than 60 s after the block's
+// time, and is borne out by the samples next to it. Against that a stored
+// value is wrong when it is missing, not plausibly a pool rate, or more than
+// 25 % away. Everything else leaves the disk alone, and at most stands in in
+// memory:
+//
+//   steady minutes at R ................ [T - 2 h, T + 2 h]
+//   a 240 s outage; the first sample after it reads 0.7 R (the estimator's
+//     window is still filling): T1 = T + 2 h + 240 s
+//   steady minutes at R ................ (T1, T1 + 1 h], but for ONE minute
+//     that reads 150 R (ends at T1 + 30 min)
+//   a 6 h outage; the first sample after it, an hour long, reads 150 R: T2
+//   steady minutes at R ................ (T2, T2 + 10 min]
 TEST(PoolLuckInputs, StoredRateIsRewrittenOnlyAgainstASampleOfItsOwnMinute)
 {
     using FB = MiningInterface::FoundBlock;
     const double R = 2.0e11, D = 9.5e7;
     const double T = 1.0e9;
     MiningInterface mi(false, nullptr, Blockchain::LITECOIN);
-    // Minute samples over [T - 2 h, T + 2 h]; then the node is down for six
-    // hours; then one sample, which reaches an hour back.
     for (double t = T - 7200.0; t <= T + 7200.0; t += 60.0)
         mi.add_luck_rate_sample(t, R, 0.0, D);
-    const double restart = T + 7200.0 + 6 * 3600.0;
-    mi.add_luck_rate_sample(restart, R, 0.0, D);
+    const double T1 = T + 7200.0 + 240.0;
+    mi.add_luck_rate_sample(T1, 0.7 * R, 0.0, D);
+    const double stray = T1 + 1800.0;                     // the minute (stray - 60, stray]
+    for (double t = T1 + 60.0; t <= T1 + 3600.0; t += 60.0)
+        mi.add_luck_rate_sample(t, t == stray ? 150.0 * R : R, 0.0, D);
+    const double T2 = T1 + 3600.0 + 6 * 3600.0;
+    mi.add_luck_rate_sample(T2, 150.0 * R, 0.0, D);
+    for (double t = T2 + 60.0; t <= T2 + 600.0; t += 60.0)
+        mi.add_luck_rate_sample(t, R, 0.0, D);
 
     auto stored_row = [&](uint64_t height, unsigned tag, double ts, double rate) {
         FB b;
@@ -695,13 +808,23 @@ TEST(PoolLuckInputs, StoredRateIsRewrittenOnlyAgainstASampleOfItsOwnMinute)
         return b;
     };
     const std::vector<FB> on_disk = {
-        stored_row(3200000, 0x10, T - 3000.0, 1.2 * R),          // its minute agrees: kept
-        stored_row(3200010, 0x11, T - 1000.0, 1.3 * R),          // its minute contradicts: rewritten
-        stored_row(3200020, 0x12, T + 1000.0, 0.0),              // never recorded: filled in
-        stored_row(3200030, 0x13, restart - 3000.0, 1.3 * R),    // only the restart sample: kept
-        stored_row(3200040, 0x14, restart - 2000.0, 0.7 * R),    // only the restart sample: kept
-        stored_row(3200050, 0x15, restart - 1000.0, 4.0e6),      // not a pool rate: rewritten
-        stored_row(3200060, 0x16, T + 3 * 3600.0, 1.3 * R),      // no history at its time: kept
+        // In the steady minutes: the block's own minute speaks.
+        stored_row(3200000, 0x10, T - 3000.0 + 30.0, 1.2 * R),   // agrees: kept
+        stored_row(3200010, 0x11, T - 1000.0 + 30.0, 1.3 * R),   // contradicted: rewritten
+        stored_row(3200020, 0x12, T + 1000.0 + 30.0, 0.0),       // never recorded: filled in
+        stored_row(3200030, 0x13, T + 2000.0 + 30.0, 4.0e6),     // not a pool rate: rewritten
+        // (a) Under the 240 s restart sample at 0.7 R. It is short enough to
+        // pass for a sample, and 30 % off the R these rows recorded.
+        stored_row(3200040, 0x14, T + 7200.0 + 30.0, R),         // found 210 s before it was taken
+        stored_row(3200050, 0x15, T1 - 20.0, R),                 // found 20 s before it was taken
+        stored_row(3200060, 0x16, T1 - 100.0, 0.0),              // never recorded
+        // The one-off minute at 150 R: R is "under 1 %" of it.
+        stored_row(3200070, 0x17, stray - 30.0, R),
+        // (b) Under the hour-long restart sample at 150 R.
+        stored_row(3200080, 0x18, T2 - 1000.0, R),
+        stored_row(3200090, 0x19, T2 - 2000.0, 4.0e6),           // not a pool rate
+        // In the outage: no history at its time.
+        stored_row(3200100, 0x1a, T1 + 3600.0 + 3600.0, 1.3 * R),
     };
     std::vector<FB> written;
     mi.set_found_block_persistence(
@@ -718,21 +841,38 @@ TEST(PoolLuckInputs, StoredRateIsRewrittenOnlyAgainstASampleOfItsOwnMinute)
     EXPECT_DOUBLE_EQ(written_rate(0x10), -1.0);
     EXPECT_NEAR(written_rate(0x11), R, R * 1e-9);
     EXPECT_NEAR(written_rate(0x12), R, R * 1e-9);
-    EXPECT_DOUBLE_EQ(written_rate(0x13), -1.0) << "30 % from a reading that spans an hour";
-    EXPECT_DOUBLE_EQ(written_rate(0x14), -1.0);
-    EXPECT_NEAR(written_rate(0x15), R, R * 1e-9);
-    EXPECT_DOUBLE_EQ(written_rate(0x16), -1.0);
+    EXPECT_NEAR(written_rate(0x13), R, R * 1e-9);
+    EXPECT_DOUBLE_EQ(written_rate(0x14), -1.0)
+        << "(a) rewritten against a sample taken 210 s after the block, after a restart";
+    EXPECT_DOUBLE_EQ(written_rate(0x15), -1.0)
+        << "(a) rewritten against the restart sample: the samples around it read R";
+    EXPECT_DOUBLE_EQ(written_rate(0x16), -1.0) << "(a) filled in from the restart sample";
+    EXPECT_DOUBLE_EQ(written_rate(0x17), -1.0) << "rewritten against a one-off reading";
+    EXPECT_DOUBLE_EQ(written_rate(0x18), -1.0)
+        << "(b) rewritten against a 150x reading that spans an hour";
+    EXPECT_DOUBLE_EQ(written_rate(0x19), -1.0) << "(b) rewritten against an hour-long reading";
+    EXPECT_DOUBLE_EQ(written_rate(0x1a), -1.0);
+    EXPECT_EQ(written.size(), 3u);
 
-    const auto recent = mi.rest_recent_blocks_at(restart + 60.0);
-    auto served = [&](unsigned tag) {
-        return num(find_row(recent, "hash", hash_of(tag)), "pool_hashrate_at_find");
+    // What is served. A recorded rate that is plausibly the pool's stands,
+    // next to a stray reading too; a missing or implausible one is stood in
+    // for by the history's reading at the block's time, in memory.
+    const auto recent = mi.rest_recent_blocks_at(T2 + 600.0);
+    struct Want { unsigned tag; double rate; const char* source; };
+    const Want wants[] = {
+        {0x10, 1.2 * R, "recorded"}, {0x11, R, "recorded"}, {0x12, R, "recorded"},
+        {0x13, R, "recorded"},
+        {0x14, R, "recorded"}, {0x15, R, "recorded"}, {0x16, 0.7 * R, "history"},
+        {0x17, R, "recorded"},
+        {0x18, R, "recorded"}, {0x19, 150.0 * R, "history"},
+        {0x1a, 1.3 * R, "recorded"},
     };
-    EXPECT_NEAR(served(0x10), 1.2 * R, R * 1e-9);
-    EXPECT_NEAR(served(0x11), R, R * 1e-9);
-    EXPECT_NEAR(served(0x13), 1.3 * R, R * 1e-9);
-    EXPECT_NEAR(served(0x14), 0.7 * R, R * 1e-9);
-    EXPECT_NEAR(served(0x15), R, R * 1e-9);
-    EXPECT_NEAR(served(0x16), 1.3 * R, R * 1e-9);
+    for (const auto& w : wants) {
+        const auto row = find_row(recent, "hash", hash_of(w.tag));
+        ASSERT_TRUE(row.is_object()) << "tag " << w.tag;
+        EXPECT_NEAR(num(row, "pool_hashrate_at_find"), w.rate, R * 1e-9) << "tag " << w.tag;
+        EXPECT_EQ(str(row, "pool_hashrate_source"), w.source) << "tag " << w.tag;
+    }
 }
 
 // F6. The node feeds the history a sample a minute and kept every one for
@@ -748,11 +888,15 @@ TEST(PoolLuckInputs, SamplesOlderThanAMonthAreFoldedIntoHourlyBins)
     const double hour = 3600.0, day = 86400.0;
     MiningInterface mi(false, nullptr, Blockchain::LITECOIN);
     // 34 days, a sample a minute. Within every hour the rate climbs from
-    // 1.0 to 1.983 x 2^32 H/s: the hour's mean is 1.4916(6) x 2^32.
+    // 1.0 to 2.0 x 2^32 H/s over the first half and comes back down over the
+    // second (1/30 a minute): the hour's mean is 1.5 x 2^32.
     const int minutes = 34 * 24 * 60;
-    for (int i = 1; i <= minutes; ++i)
-        mi.add_luck_rate_sample(T0 + 60.0 * i, (1.0 + ((i - 1) % 60) / 60.0) * kT32, 0.0, D);
-    const double mean = 1.0 + 29.5 / 60.0;
+    for (int i = 1; i <= minutes; ++i) {
+        const int m = (i - 1) % 60;
+        const double x = 1.0 + (m < 30 ? m : 60 - m) / 30.0;
+        mi.add_luck_rate_sample(T0 + 60.0 * i, x * kT32, 0.0, D);
+    }
+    const double mean = 1.5;
 
     // 31 to 32 days of minute samples, the rest in hourly bins (unfolded:
     // 48,960 segments here, 576,000 after 400 days).
@@ -761,7 +905,7 @@ TEST(PoolLuckInputs, SamplesOlderThanAMonthAreFoldedIntoHourlyBins)
     EXPECT_GE(held, static_cast<size_t>(31 * 1440));
 
     // Stored rows: each found in the first minute of an hour (the sample of
-    // that minute reads 1.0 x 2^32) and stored at the hour's mean, 49 % up.
+    // that minute reads 1.0 x 2^32) and stored at the hour's mean, 50 % up.
     auto stored_row = [&](uint64_t height, unsigned tag, double ts) {
         FB b;
         b.height = height;
