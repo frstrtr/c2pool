@@ -242,8 +242,23 @@ TEST(PoolLuck, SamplesBecomeSegmentsOfTheGrossRate)
     // A sample after a long gap covers one hour back, no more.
     h.add_sample(30000.0, 0.9 * kT32, 0.1, 1000.0);
     EXPECT_DOUBLE_EQ(h.segments()[2].t0, 30000.0 - 3600.0);
-    EXPECT_DOUBLE_EQ(h.rate_at(20000.0), 0.0);
-    EXPECT_NEAR(h.rate_at(29000.0), kT32, 1.0);
+    EXPECT_DOUBLE_EQ(h.at(20000.0).rate, 0.0);
+    EXPECT_NEAR(h.at(29000.0).rate, kT32, 1.0);
+    EXPECT_FALSE(h.at(29000.0).binned) << "a sample of the moment";
+    // The nearest reading in time, for a moment the history does not cover:
+    // 20000 is 9880 s after the segment ending at 10120, 6400 s before the
+    // one starting at 26400.
+    EXPECT_NEAR(h.nearest_rate(20000.0), kT32, 1.0);
+    EXPECT_NEAR(h.nearest_rate(12000.0), 2.0 * kT32, 1.0);
+    EXPECT_NEAR(h.nearest_rate(1.0), kT32, 1.0);
+    EXPECT_NEAR(h.nearest_rate(99999.0), kT32, 1.0);
+    // ... if it is near enough to say anything about that moment.
+    EXPECT_NEAR(h.nearest_rate(20000.0, 6400.0), kT32, 1.0);
+    EXPECT_DOUBLE_EQ(h.nearest_rate(20000.0, 6399.0), 0.0);
+    EXPECT_NEAR(h.nearest_rate(29000.0, 0.0), kT32, 1.0) << "covered: no distance at all";
+    EXPECT_NEAR(h.at(29000.0).span, 3600.0, 1e-9);
+    EXPECT_NEAR(h.at(10100.0).span, 120.0, 1e-9);
+    EXPECT_DOUBLE_EQ(luck::RateHistory{}.nearest_rate(5.0), 0.0);
 
     EXPECT_DOUBLE_EQ(luck::gross_rate(100.0, 0.0), 100.0);
     EXPECT_DOUBLE_EQ(luck::gross_rate(90.0, 0.1), 100.0);
@@ -267,6 +282,141 @@ TEST(PoolLuck, OlderBinsAreWeightedAndNeverOverlapTheFineSamples)
     // 2000 s * 0.25 covered at 4.0 -> 2.0; 1000 s at 2.0 -> 2.0; 1000 s at 1.0 -> 1.0
     EXPECT_NEAR(in.effort, 5.0, 1e-12);
     EXPECT_NEAR(in.covered, 500.0 + 1000.0 + 1000.0, 1e-9);
+}
+
+// Old minute samples are folded into hourly bins so a long-running node
+// does not hold 400 days of minute segments. A bin keeps the covered time,
+// the mean rate and the difficulty that leaves its effort unchanged: a round
+// over whole bins integrates to exactly what the samples gave.
+TEST(PoolLuck, CoarseningKeepsTheEffortOfARound)
+{
+    luck::RateHistory h;
+    // Three hours of minute samples, rate and difficulty both moving, with a
+    // 20-minute hole in the second hour (no sample covers 4800..6000).
+    for (int i = 1; i <= 180; ++i) {
+        const double t = 60.0 * i;
+        if (t > 4800.0 && t < 6000.0) continue;
+        const double rate = (1.0 + 0.5 * std::sin(i * 0.1)) * kT32;
+        const double diff = 1000.0 * (1.0 + 0.3 * std::cos(i * 0.07));
+        h.add_segment({t - 60.0, t, rate, diff, 1.0});
+    }
+    const size_t before = h.size();
+    const auto hours = h.integrate(0.0, 10800.0, 0.0, 0.0);
+    const auto second_hour = h.integrate(3600.0, 7200.0, 0.0, 0.0);
+    ASSERT_NEAR(second_hour.covered, 3600.0 - 1200.0 + 60.0, 1e-9);
+
+    // Fold the first two hours (101 minute segments into 2 bins); the third
+    // stays at sample resolution.
+    const size_t folded = h.coarsen_before(7200.0, 3600.0);
+    EXPECT_EQ(folded, 99u);
+    EXPECT_EQ(h.size(), before - folded);
+    EXPECT_TRUE(h.at(1800.0).binned) << "a mean over the hour, not a reading of the moment";
+    EXPECT_TRUE(h.at(4000.0).binned);
+    EXPECT_FALSE(h.at(9000.0).binned);
+    EXPECT_NEAR(h.fine_start(), 7200.0, 1e-9);
+
+    const auto after = h.integrate(0.0, 10800.0, 0.0, 0.0);
+    EXPECT_NEAR(after.effort, hours.effort, hours.effort * 1e-12);
+    EXPECT_NEAR(after.covered, hours.covered, 1e-6);
+    EXPECT_NEAR(after.hashes, hours.hashes, hours.hashes * 1e-12);
+    const auto second_after = h.integrate(3600.0, 7200.0, 0.0, 0.0);
+    EXPECT_NEAR(second_after.effort, second_hour.effort, second_hour.effort * 1e-12);
+    EXPECT_NEAR(second_after.covered, second_hour.covered, 1e-6)
+        << "the hole in the hour is not filled in";
+
+    // Folding again finds nothing left to fold, and nothing moves.
+    EXPECT_EQ(h.coarsen_before(7200.0, 3600.0), 0u);
+    EXPECT_EQ(h.size(), before - folded);
+    // The yardstick readings still work across the seam.
+    EXPECT_GT(h.nearest_rate(-50.0), 0.0);
+}
+
+// The rate recorded "at find" is used only if it is plausibly a POOL rate.
+// The LTC canary holds rows recorded at the node's own ~4 MH/s; the winning
+// shares of those very rows (difficulty 500-700) put the pool above
+// 100 MH/s: share difficulty * 2^32 / 18000 s.
+TEST(PoolLuck, RateAtFindMustBePlausiblyAPoolRate)
+{
+    using luck::rate_at_find_plausible;
+    // The three corrupt rows, by their own share difficulty alone.
+    EXPECT_FALSE(rate_at_find_plausible(4030409.5, 693.5440248241151, 0.0));
+    EXPECT_FALSE(rate_at_find_plausible(4123391.6, 709.9291624908818, 0.0));
+    EXPECT_FALSE(rate_at_find_plausible(3939911.9, 514.3346070441622, 0.0));
+    // The same ledger's 14.8 GH/s row, and the rates the pool really had.
+    EXPECT_TRUE(rate_at_find_plausible(14818454121.0, 785.1381125177094, 0.0));
+    EXPECT_TRUE(rate_at_find_plausible(1.94e11, 693.5440248241151, 0.0));
+    // DASH: a share 30x the minimum on a 4.4e13 H/s pool.
+    EXPECT_TRUE(rate_at_find_plausible(4.4e13, 240228.0, 0.0));
+    // The bound itself: difficulty 18000 puts the floor at exactly 2^32 H/s.
+    EXPECT_TRUE(rate_at_find_plausible(kT32, 18000.0, 0.0));
+    EXPECT_FALSE(rate_at_find_plausible(kT32 * 0.999, 18000.0, 0.0));
+
+    // No share difficulty on the row: the node's own history is the
+    // yardstick. Two orders of magnitude under it is not the pool's rate; a
+    // rate that merely moved (DASH at find: 4.4e13 .. 6.06e13) is.
+    EXPECT_FALSE(rate_at_find_plausible(4.0e6, 0.0, 1.8e11));
+    EXPECT_FALSE(rate_at_find_plausible(1.7e9, 0.0, 1.8e11));
+    EXPECT_TRUE(rate_at_find_plausible(1.9e9, 0.0, 1.8e11));
+    EXPECT_TRUE(rate_at_find_plausible(4.4e13, 0.0, 6.06e13));
+    EXPECT_TRUE(rate_at_find_plausible(6.06e13, 0.0, 4.4e13));
+
+    // Nothing to judge it by: it stands as recorded. No rate: no rate.
+    EXPECT_TRUE(rate_at_find_plausible(4.0e6, 0.0, 0.0));
+    EXPECT_FALSE(rate_at_find_plausible(0.0, 0.0, 0.0));
+    EXPECT_FALSE(rate_at_find_plausible(0.0, 693.5, 1.8e11));
+}
+
+// What a period counts of one round, row by row: the pair a consumer sums to
+// arrive at the server's period luck.
+TEST(PoolLuck, PeriodEffortAndCountOfARound)
+{
+    luck::RateHistory h;
+    h.add_segment({3000.0, 5000.0, kT32, 1000.0, 1.0});   // watching [3000, 5000]
+    const std::vector<luck::RoundInput> rows = {
+        row(1000.0, 1, true, 1000.0, 0.0),     // first block
+        row(5000.0, 2, true, 1000.0, 0.0),     // history covers half its round
+        row(9000.0, 3, true, 1000.0, kT32),    // found in the dark, 4000 s after the history ends
+        row(9500.0, 4, false, 1000.0, kT32),   // orphan
+        row(12000.0, 5, true, 1000.0, kT32),   // no history at all: single sample
+        row(13000.0, 6, true, 1000.0, 0.0),    // nothing to go by
+    };
+    const auto res = luck::compute_rounds(rows, h);
+    EXPECT_DOUBLE_EQ(luck::period_effort(res[0]), 1.0);
+    EXPECT_TRUE(luck::counts_in_period(rows[0], res[0]));
+
+    EXPECT_NEAR(res[1].effort, 4.0, 1e-12);                    // scaled to the round
+    EXPECT_NEAR(luck::period_effort(res[1]), 2.0, 1e-12);      // what was watched
+    EXPECT_TRUE(luck::counts_in_period(rows[1], res[1]));
+
+    // [5000, 9000]: no history over it at all -> its single sample.
+    EXPECT_EQ(res[2].method, luck::EffortMethod::single_sample);
+    EXPECT_NEAR(luck::period_effort(res[2]), 4.0, 1e-12);
+    EXPECT_TRUE(luck::counts_in_period(rows[2], res[2]));
+
+    EXPECT_FALSE(luck::counts_in_period(rows[3], res[3])) << "an orphan is not a block found";
+
+    EXPECT_EQ(res[4].method, luck::EffortMethod::single_sample);
+    EXPECT_NEAR(luck::period_effort(res[4]), 3.0, 1e-12);
+    EXPECT_TRUE(luck::counts_in_period(rows[4], res[4]));
+
+    EXPECT_DOUBLE_EQ(luck::period_effort(res[5]), 0.0);
+    EXPECT_FALSE(luck::counts_in_period(rows[5], res[5]));
+
+    // The rows sum to the period: sum(counted) / sum(period_effort).
+    const luck::RoundOptions opt;
+    const auto open = luck::open_round(rows, h, opt, 13000.0, 0.0, 0.0);
+    const auto all = luck::period_luck(rows, res, h, opt, open, 0.0, 13000.0);
+    uint64_t k = 0;
+    double expected = 0.0;
+    for (size_t i = 0; i < rows.size(); ++i) {
+        if (luck::counts_in_period(rows[i], res[i])) ++k;
+        if (rows[i].main_chain) expected += luck::period_effort(res[i]);
+    }
+    EXPECT_EQ(all.k, k);
+    EXPECT_EQ(all.k, 4u);
+    EXPECT_NEAR(all.expected, expected, 1e-12);
+    EXPECT_NEAR(all.expected, 1.0 + 2.0 + 4.0 + 3.0, 1e-12);
+    EXPECT_EQ(all.unmeasured, 1u);
 }
 
 // The exact (Garwood) Poisson interval, against scipy:

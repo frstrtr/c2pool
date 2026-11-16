@@ -48,6 +48,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <utility>
@@ -78,6 +79,11 @@ struct RateSegment {
     double rate{0.0};         ///< gross pool rate, H/s (> 0)
     double difficulty{0.0};   ///< network difficulty; 0 = not sampled
     double weight{1.0};       ///< share of [t0, t1] the samples behind it cover
+    /// false: one periodic sample, as taken. true: a MEAN over many samples
+    /// (an hourly bin of older samples, a ~29 h bin of the year-scale graph
+    /// store). A mean says what the pool did over the stretch; it does not
+    /// say what the rate was at any one moment inside it.
+    bool   binned{false};
 };
 
 /// The pool's rate / difficulty history as non-overlapping segments in time
@@ -198,6 +204,7 @@ public:
             if (s.t1 > limit) s.t1 = limit;
             if (!(s.t1 > s.t0))
                 continue;
+            s.binned = true;
             end = s.t1;
             out.push_back(s);
         }
@@ -205,21 +212,149 @@ public:
         m_segments = std::move(out);
     }
 
-    /// Drop everything that ended before `t`.
+    /// Fold every sample-resolution segment that ends at or before `cut`
+    /// into bins of `bin_seconds` (aligned to multiples of it). A bin keeps
+    /// what an integral over it needs: the covered time (as its weight), the
+    /// time-weighted mean rate, and the difficulty that leaves the bin's
+    /// effort -- the sum of rate / D over the covered time -- unchanged. So a
+    /// round older than `cut` integrates to the same effort as before, at a
+    /// fraction of the memory: a minute sample is 60 segments an hour, a bin
+    /// is one. Returns the number of segments folded away.
+    size_t coarsen_before(double cut, double bin_seconds)
+    {
+        if (!(bin_seconds > 0.0) || m_segments.empty())
+            return 0;
+        // The run of fine segments to fold: from the first fine one up to the
+        // last that ends at or before `cut`.
+        size_t first = 0;
+        while (first < m_segments.size() && m_segments[first].binned) ++first;
+        size_t last = first;
+        while (last < m_segments.size() && !m_segments[last].binned
+               && m_segments[last].t1 <= cut)
+            ++last;
+        if (last - first < 2)
+            return 0;
+
+        // hashes_d / effort: only the stretches a difficulty was sampled for.
+        struct Acc {
+            double covered{0}, hashes{0}, hashes_d{0}, effort{0}, t0{0}, t1{0};
+            bool any{false};
+        };
+        std::vector<RateSegment> bins;
+        Acc acc;
+        double bin_start = 0.0;
+        auto flush = [&]() {
+            if (!acc.any || !(acc.covered > 0.0)) { acc = Acc{}; return; }
+            RateSegment b;
+            b.t0 = acc.t0;
+            b.t1 = acc.t1;
+            b.rate = acc.hashes / acc.covered;
+            // The difficulty at which a rate yields the effort the samples
+            // did (0 when no difficulty was sampled in the bin).
+            b.difficulty = acc.effort > 0.0 ? acc.hashes_d / acc.effort : 0.0;
+            b.weight = std::min(1.0, acc.covered / (b.t1 - b.t0));
+            b.binned = true;
+            if (b.rate > 0.0 && b.t1 > b.t0 && b.weight > 0.0)
+                bins.push_back(b);
+            acc = Acc{};
+        };
+        for (size_t i = first; i < last; ++i) {
+            const RateSegment& seg = m_segments[i];
+            double lo = seg.t0;
+            while (lo < seg.t1) {
+                const double start = std::floor(lo / bin_seconds) * bin_seconds;
+                if (!acc.any || start != bin_start) {
+                    flush();
+                    bin_start = start;
+                }
+                const double hi = std::min(seg.t1, start + bin_seconds);
+                if (!(hi > lo)) break;   // a segment too short to resolve
+                const double w = (hi - lo) * seg.weight;
+                if (!acc.any) { acc.any = true; acc.t0 = lo; }
+                acc.t1 = hi;
+                acc.covered += w;
+                acc.hashes += w * seg.rate;
+                if (seg.difficulty > 0.0) {
+                    acc.hashes_d += w * seg.rate;
+                    acc.effort += w * seg.rate / seg.difficulty;
+                }
+                lo = hi;
+            }
+        }
+        flush();
+        const size_t n = last - first;
+        const size_t folded = bins.size() < n ? n - bins.size() : 0;
+        m_segments.erase(m_segments.begin() + static_cast<std::ptrdiff_t>(first),
+                         m_segments.begin() + static_cast<std::ptrdiff_t>(last));
+        m_segments.insert(m_segments.begin() + static_cast<std::ptrdiff_t>(first),
+                          bins.begin(), bins.end());
+        return folded;
+    }
+
+    /// Drop everything that ended before `t`. Nothing to drop is O(1): no
+    /// element moves.
     void trim_before(double t)
     {
+        if (m_segments.empty() || m_segments.front().t1 > t)
+            return;
         auto it = std::find_if(m_segments.begin(), m_segments.end(),
                                [t](const RateSegment& s) { return s.t1 > t; });
         m_segments.erase(m_segments.begin(), it);
     }
 
-    /// The gross rate the history holds at `t` (0 = `t` is not covered).
-    double rate_at(double t) const
+    /// Where the sample-resolution part of the history starts (0 = it has
+    /// none): everything before it is binned.
+    double fine_start() const
     {
+        for (const auto& seg : m_segments)
+            if (!seg.binned) return seg.t0;
+        return 0.0;
+    }
+
+    /// What the history holds at one moment.
+    struct Reading {
+        double rate{0.0};      ///< gross rate; 0 = the moment is not covered
+        bool   binned{false};  ///< a mean over a stretch, not a sample of the moment
+        double span{0.0};      ///< length of the stretch the reading speaks for, seconds
+    };
+    Reading at(double t) const
+    {
+        Reading r;
         auto it = first_ending_after(t);
         if (it == m_segments.end() || it->t0 > t)
+            return r;
+        r.rate = it->rate;
+        r.binned = it->binned;
+        r.span = it->t1 - it->t0;
+        return r;
+    }
+
+    /// The rate of the segment that covers `t`, else of the segment nearest
+    /// to it in time if that is within `max_distance` seconds (0 = none). A
+    /// yardstick for what order of magnitude the pool's rate has, not a
+    /// reading of the moment.
+    double nearest_rate(double t,
+                        double max_distance = std::numeric_limits<double>::infinity()) const
+    {
+        if (m_segments.empty())
             return 0.0;
-        return it->rate;
+        auto it = first_ending_after(t);
+        if (it != m_segments.end() && it->t0 <= t)
+            return it->rate;
+        // Not covered: the segment before `t` and the one after it.
+        double best = 0.0, best_distance = std::numeric_limits<double>::infinity();
+        if (it != m_segments.end()) {
+            best = it->rate;
+            best_distance = it->t0 - t;
+        }
+        if (it != m_segments.begin()) {
+            const auto prev = it - 1;
+            if (t - prev->t1 <= best_distance) {
+                best = prev->rate;
+                best_distance = t - prev->t1;
+            }
+        }
+        return best_distance <= max_distance ? best : 0.0;
     }
 
     /// Integrate rate / (D * 2^32) over [a, b].
@@ -268,6 +403,52 @@ private:
     double m_last_rate{0.0};
     double m_last_difficulty{0.0};
 };
+
+// ---------------------------------------------------------------------------
+// The rate sampled at find
+// ---------------------------------------------------------------------------
+
+/// The share chain itself bounds the pool's rate from below. A share's
+/// difficulty is at most 30x the chain's minimum (the share target is clipped
+/// to [max_target / 30, max_target]), and the minimum is retargeted to one
+/// share per share period at the pool's rate, so
+///     pool rate >= share difficulty * 2^32 / (30 * share period).
+/// The longest share period of any lane is 60 s (BCH); a further 10x allows
+/// for the retarget lagging a falling pool and for estimator noise. A rate
+/// recorded "at find" below
+///     share difficulty * 2^32 / kShareWorkBoundSeconds
+/// is not that pool's rate. (A pool so small that its share difficulty sits
+/// at the chain's floor -- a regtest rig -- is the one place the first line
+/// does not hold; the floor is 2^20 hashes a share on the scrypt and X11
+/// lanes, a bound of 58 H/s.)
+inline constexpr double kShareWorkBoundSeconds = 30.0 * 60.0 * 10.0;   // 18000
+
+/// A rate recorded at find below this share of the rate the node's own
+/// history holds nearest in time is not the pool's rate either.
+inline constexpr double kImplausibleRateShare = 0.01;
+
+/// Is `rate`, recorded with a found block as the pool's rate at find,
+/// plausibly a POOL rate? It is the fallback of a round no history covers,
+/// and rows exist that hold something else there: an earlier build recorded
+/// the NODE's own stratum rate (three LTC rows at ~4 MH/s on a ~180 GH/s
+/// pool, whose winning shares alone -- difficulty 500-700 -- put the pool
+/// above 100 MH/s). One such row as a single sample is an effort of ~1e-4:
+/// a block found for nothing expected.
+///   share_difficulty  the winning share's difficulty; 0 = not known
+///   reference_rate    the history's rate at or near the block's time;
+///                     0 = no history near it
+/// With neither yardstick the rate stands as recorded.
+inline bool rate_at_find_plausible(double rate, double share_difficulty, double reference_rate)
+{
+    if (!(rate > 0.0) || !std::isfinite(rate))
+        return false;
+    if (share_difficulty > 0.0
+        && rate * kShareWorkBoundSeconds < share_difficulty * kHashesPerDifficulty)
+        return false;
+    if (reference_rate > 0.0 && rate < kImplausibleRateShare * reference_rate)
+        return false;
+    return true;
+}
 
 // ---------------------------------------------------------------------------
 // Rounds
@@ -419,6 +600,35 @@ inline std::vector<RoundResult> compute_rounds(const std::vector<RoundInput>& ro
             last_main = i;
     }
     return out;
+}
+
+/// What a round adds to a period's blocks_expected when all of it lies in
+/// the period (period_luck): one for a first block, the integral over the
+/// time the history covers for an integrated round (NOT scaled up to the
+/// whole round), the single-sample effort for a round with no history.
+inline double period_effort(const RoundResult& r)
+{
+    switch (r.method) {
+    case EffortMethod::first_block:   return 1.0;
+    case EffortMethod::integrated:    return r.covered_effort;
+    case EffortMethod::single_sample: return r.effort;
+    default:                          return 0.0;
+    }
+}
+
+/// Does the row's block count in a period's k (period_luck)? A main-chain
+/// block with an effort; for an integrated round, only if the history was
+/// watching when the block was found.
+inline bool counts_in_period(const RoundInput& row, const RoundResult& r)
+{
+    if (!row.main_chain)
+        return false;
+    switch (r.method) {
+    case EffortMethod::first_block:
+    case EffortMethod::single_sample: return true;
+    case EffortMethod::integrated:    return r.end_covered;
+    default:                          return false;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -602,18 +812,16 @@ inline PeriodLuck period_luck(const std::vector<RoundInput>& rows,
         any = true;
         if (row.ts < w0) continue;
         const RoundResult& r = res[i];
+        // Counted, or left out (no effort, or found while the history was
+        // not watching).
+        if (counts_in_period(row, r)) ++p.k;
+        else ++p.unmeasured;
         if (r.method == EffortMethod::first_block) {
-            ++p.k;
             p.expected += 1.0;
-        } else if (r.method == EffortMethod::none || r.prev < 0) {
-            ++p.unmeasured;
-        } else {
+        } else if (r.method != EffortMethod::none && r.prev >= 0) {
             const double from = rows[r.prev].ts;
-            const bool integrated = r.method == EffortMethod::integrated;
-            p.expected += part(r.method, integrated ? r.covered_effort : r.effort, from, row.ts,
+            p.expected += part(r.method, period_effort(r), from, row.ts,
                                std::max(from, w0), row.ts, row.difficulty);
-            if (!integrated || r.end_covered) ++p.k;
-            else ++p.unmeasured;   // found while the history was not watching
         }
     }
     if (open.since >= 0 && open.effort > 0.0 && open.since < static_cast<int>(rows.size())) {

@@ -5607,7 +5607,7 @@ std::vector<MiningInterface::FoundBlock> MiningInterface::repair_found_block_inp
     if (m_luck_history.empty())
         return changed;
     for (auto& b : m_found_blocks) {
-        const double at = m_luck_history.rate_at(static_cast<double>(b.ts));
+        const double at = m_luck_history.at(static_cast<double>(b.ts)).rate;
         if (!(at > 0.0))
             continue;
         const double have = b.pool_hashrate;
