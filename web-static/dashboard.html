@@ -2321,6 +2321,7 @@
             <div class="section-header" style="display:flex;justify-content:space-between;align-items:center">
                 <h2>Sharechain Transparency Explorer</h2>
                 <div style="display:flex;gap:12px;align-items:center">
+                    <span id="explorer-anim-chip" style="font-size:0.8rem;color:var(--text-muted)" title="Fluid draws the share chain on the scene engine: cells slide as shares arrive. Experimental; Classic is the default.">Animation: <a href="javascript:c2pSetExplorerAnim('classic')" id="anim-classic" style="color:inherit">Classic</a> | <a href="javascript:c2pSetExplorerAnim('fluid')" id="anim-fluid" style="color:inherit">Fluid (experimental)</a></span>
                     <a href="javascript:toggleRealTime()" id="realtime-btn" style="padding:4px 12px;border-radius:4px;font-size:0.8rem;font-weight:600;cursor:pointer;text-decoration:none;background:var(--card-bg);color:var(--text-muted);border:1px solid var(--border)">RealTime: OFF</a>
                     <a href="#" style="color:var(--text-muted);font-size:0.8rem;text-decoration:none">Back to top</a>
                 </div>
@@ -7540,6 +7541,83 @@
             console.info('[c2pool] bundled Explorer enabled — inline defrag disarmed');
         }
 
+        // BEGIN c2pFluidGrid
+        // "Fluid (experimental)": the share-chain grid on the scene engine
+        // (dist/scene.js). Opt-in with ?explorer-anim=fluid or the
+        // Animation chip (localStorage c2p_explorer_anim); Classic stays
+        // the default. Classic's data pipeline (window, SSE deltas, stats)
+        // is reused unchanged: render / _animate3D feed the engine view
+        // instead of drawing on the canvas, and hover reuses Classic's
+        // tooltip and PPLNS zoom. Grid and PPLNS treemap share one
+        // selection bus (window.c2pSelectionBus).
+        function c2pExplorerAnim() {
+            try {
+                var q = new URLSearchParams(location.search);
+                if (q.has('explorer-anim')) return q.get('explorer-anim') === 'fluid' ? 'fluid' : 'classic';
+            } catch (e) { /* old browser */ }
+            try { return localStorage.getItem('c2p_explorer_anim') === 'fluid' ? 'fluid' : 'classic'; }
+            catch (e) { return 'classic'; }
+        }
+        function c2pSetExplorerAnim(mode) {
+            try { localStorage.setItem('c2p_explorer_anim', mode === 'fluid' ? 'fluid' : 'classic'); } catch (e) { /* private mode */ }
+            try {
+                var u = new URL(location.href);
+                u.searchParams.delete('explorer-anim');
+                location.href = u.toString();
+            } catch (e) { location.reload(); }
+        }
+        var _fluidP = null;
+        function c2pFluidMount() {
+            if (_fluidP) return _fluidP;
+            _fluidP = import('./sharechain-explorer/dist/scene.js?v=7d6e2905').then(function(mod) {
+                var canvas = document.getElementById('defrag-canvas');
+                var wrap = canvas.parentElement;
+                canvas.style.display = 'none';
+                if (getComputedStyle(wrap).position === 'static') wrap.style.position = 'relative';
+                var host = document.createElement('div');
+                host.id = 'defrag-fluid';
+                host.style.cssText = 'position:absolute;inset:0';
+                wrap.appendChild(host);
+                if (!window.c2pSelectionBus) window.c2pSelectionBus = mod.createSelectionBus();
+                return mod.mountSharechainGrid({
+                    container: host,
+                    bus: window.c2pSelectionBus,
+                    colorOf: function(s) { return defrag.getColor(s); },
+                    blockKindOf: function(s) {
+                        return blockMarkKind(c2pIsBlockShare(defrag.blockSet, s), !!defrag.dogeSet[s.h]);
+                    },
+                    onHover: function(s, ev) {
+                        if (s) { defrag.showTooltip(s, ev); defrag.showZoom(s, ev); }
+                        else defrag.hideTooltip();
+                    },
+                    onClick: function(s) { if (s.H) window.open('share.html#' + s.H, '_blank'); }
+                });
+            });
+            return _fluidP;
+        }
+        (function() {
+            var mode = c2pExplorerAnim();
+            var chip = document.getElementById('anim-' + mode);
+            if (chip) { chip.style.fontWeight = '700'; chip.style.color = 'var(--primary)'; }
+            if (window.__c2pBundledExplorer || mode !== 'fluid') return;
+            var classicRender = defrag.render, classicAnimate = defrag._animate3D;
+            defrag.render = function() {
+                c2pFluidMount().then(function(view) { view.update(defrag.shares); })
+                    .catch(function(err) {
+                        // scene.js unavailable: fall back to Classic for good.
+                        console.error('[c2pool] Fluid grid failed to load; using Classic', err);
+                        defrag.render = classicRender;
+                        defrag._animate3D = classicAnimate;
+                        var c = document.getElementById('defrag-canvas');
+                        if (c) c.style.display = '';
+                        defrag.render();
+                    });
+            };
+            // The engine animates arrivals and departures itself.
+            defrag._animate3D = function() { defrag._oldPositions = {}; defrag.render(); };
+        })();
+        // END c2pFluidGrid
+
         // Initialize defrag viewer on page load (no-op when flag on).
         defrag.init();
 
@@ -7910,11 +7988,11 @@
         }
         function c2pPplnsViewMount() {
             if (_pplnsViewP) return _pplnsViewP;
-            _pplnsViewP = import('./sharechain-explorer/dist/scene.js?v=ec047c7d').then(function(mod) {
+            _pplnsViewP = import('./sharechain-explorer/dist/scene.js?v=7d6e2905').then(function(mod) {
                 var ci = (typeof currency_info !== 'undefined' && currency_info) || {};
                 var grid = document.getElementById('pplns-main-grid');
                 grid.innerHTML = '';
-                var bus = mod.createSelectionBus();
+                var bus = window.c2pSelectionBus || mod.createSelectionBus();
                 window.c2pSelectionBus = bus;
                 var child = (ci.merged_child_symbol || '').toUpperCase();
                 var opts = {
