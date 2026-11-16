@@ -1778,6 +1778,9 @@ struct MergedMiningManager::SubmitJob
     uint256                              block_hash;
     int                                  height{0};
     uint64_t                             coinbase_value{0};
+    // The block's own difficulty, from the bits its header carries. Display
+    // only: it rides to the found-block record for the block's luck.
+    double                               difficulty{0.0};
     SubmitVerdict                        verdict;
 };
 
@@ -2131,6 +2134,7 @@ void MergedMiningManager::try_submit_merged_blocks(
         job.block_hash = committed_block_hash;
         job.height = snapshot_height;
         job.coinbase_value = tmpl.value("coinbasevalue", chain.current_work.coinbase_value);
+        job.difficulty = chain::target_to_difficulty(chain::bits_to_target(nbits));
         jobs.push_back(std::move(job));
       } catch (const std::exception& e) {
         ++m_block_refusals_by_code[chain.config.symbol + ":assembly_error"];
@@ -2185,7 +2189,7 @@ void MergedMiningManager::run_submit_jobs(std::vector<SubmitJob>& jobs, const st
             for (const auto& chain : m_chains)
                 if (chain.config.chain_id == j.chain_id) {
                     record_discovered_block(chain, j.verdict, parent_hash_hex, j.block_hash, j.height,
-                                            j.coinbase_value);
+                                            j.coinbase_value, j.difficulty);
                     break;
                 }
         } catch (const std::exception& e) {
@@ -3154,12 +3158,14 @@ void MergedMiningManager::record_discovered_block(
                             accepted ? SubmitVerdict::of(SubmitVerdict::Kind::accepted)
                                      : SubmitVerdict::of(SubmitVerdict::Kind::rejected, "rejected"),
                             parent_hash, chain.current_work.block_hash,
-                            chain.current_work.height, chain.current_work.coinbase_value);
+                            chain.current_work.height, chain.current_work.coinbase_value,
+                            chain.current_work.target.IsNull()
+                                ? 0.0 : chain::target_to_difficulty(chain.current_work.target));
 }
 
 void MergedMiningManager::record_discovered_block(
     const ChainState& chain, const SubmitVerdict& verdict, const std::string& parent_hash,
-    const uint256& block_hash, int height, uint64_t coinbase_value)
+    const uint256& block_hash, int height, uint64_t coinbase_value, double difficulty)
 {
     // Caller must hold m_mutex
     // A block found again (a share on a job whose block is already out: the
@@ -3171,6 +3177,8 @@ void MergedMiningManager::record_discovered_block(
             continue;
         const bool was_accepted = old.accepted;
         const bool was_held = was_accepted || old.verdict == "inconclusive" || old.verdict.rfind("unknown: ", 0) == 0;
+        if (old.difficulty <= 0.0 && difficulty > 0.0)
+            old.difficulty = difficulty;
         if (verdict.accepted() && !was_accepted) {
             old.accepted = true;
             old.verdict = verdict.label();
@@ -3201,6 +3209,7 @@ void MergedMiningManager::record_discovered_block(
     blk.verdict        = verdict.label();
     blk.coinbase_value = coinbase_value;
     blk.is_local       = true;  // our own submission
+    blk.difficulty     = difficulty > 0.0 ? difficulty : 0.0;
 
     m_discovered_blocks.push_back(std::move(blk));
     m_blocks_per_chain[chain.config.chain_id]++;
