@@ -12,15 +12,20 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 
-interface Round { ts: number; effort: number; first?: boolean }
+interface Round { ts: number; effort: number; first?: boolean; covered?: number; measured?: boolean; gap?: number | null }
 interface Live { x: number; lastBlkMs: number; expectedMs: number }
-interface Pt { x: number; y: number; n: number; expected: number; open?: boolean; marker?: { enabled: boolean } }
+interface Pt { x: number; y: number; n: number; expected: number; skipped: number; open?: boolean; marker?: { enabled: boolean } }
 interface Trend {
   c2pLuckTrendPoints(rounds: Round[] | null, minTime: number, live: Live | null, N?: number): Pt[];
   c2pLuckDisplay(luck: number): number;
   c2pLuckFromDisplay(v: number): number;
-  c2pBlockPace(rows: unknown[], sym?: string): { rounds: Round[]; lastMain: { ts: number } | null };
-  c2pOpenRound(luckStats: unknown, lastMainTs: number, nowS: number, fallbackExpected: number): { effort: number; pace_time: number } | null;
+  c2pBlockPace(rows: unknown[], sym?: string): { rounds: Round[]; noEffort: number[]; lastMain: { ts: number } | null };
+  c2pOpenRound(luckStats: unknown, lastMainTs: number, nowS: number, fallbackExpected: number):
+    { effort: number; covered_effort: number; pace_time: number } | null;
+  c2pLuckPeriods(luckStats: unknown, rounds: Round[], nowS: number, open: unknown, noEffort?: number[]):
+    Record<string, { k: number; blocks_expected: number; luck: number; skipped: number; source: string } | null>;
+  c2pPeriodLuck(rounds: Round[], nowS: number, spanS: number | null, open: unknown, noEffort?: number[]):
+    { k: number; blocks_expected: number; luck: number; skipped: number } | null;
 }
 
 function load(): Trend {
@@ -66,10 +71,10 @@ test('each round is a point at the pooled luck of the last N rounds: n / sum(eff
   const rounds = [at(NOW - 40 * H, 1, true), at(NOW - 30 * H, 0.5), at(NOW - 20 * H, 2), at(NOW - 10 * H, 0.25)];
   const pts = build(rounds, NOW - 3 * D, null, 3);
   assert.deepEqual(pts, [
-    { x: NOW - 40 * H, y: 100, n: 1, expected: 1 },
-    { x: NOW - 30 * H, y: 100 * 2 / 1.5, n: 2, expected: 1.5 },
-    { x: NOW - 20 * H, y: 100 * 3 / 3.5, n: 3, expected: 3.5 },
-    { x: NOW - 10 * H, y: 100 * 3 / 2.75, n: 3, expected: 2.75 },   // the first block left the window
+    { x: NOW - 40 * H, y: 100, n: 1, expected: 1, skipped: 0 },
+    { x: NOW - 30 * H, y: 100 * 2 / 1.5, n: 2, expected: 1.5, skipped: 0 },
+    { x: NOW - 20 * H, y: 100 * 3 / 3.5, n: 3, expected: 3.5, skipped: 0 },
+    { x: NOW - 10 * H, y: 100 * 3 / 2.75, n: 3, expected: 2.75, skipped: 0 },   // the first block left the window
   ]);
   // Not the per-block lucks 100, 200, 50, 400 joined up.
   assert.notDeepEqual(pts.map(p => p.y), [100, 200, 50, 400]);
@@ -94,9 +99,9 @@ test('the line starts at the window\'s left edge with the value of the last roun
   const rounds = [at(NOW - 50 * H, 1, true), at(NOW - 30 * H, 0.25), at(NOW - 20 * H, 2), at(NOW - 10 * H, 1)];
   const pts = build(rounds, minTime, null);
   assert.deepEqual(pts, [
-    { x: minTime, y: 100 * 2 / 1.25, n: 2, expected: 1.25, marker: { enabled: false } },
-    { x: NOW - 20 * H, y: 100 * 3 / 3.25, n: 3, expected: 3.25 },
-    { x: NOW - 10 * H, y: 100 * 4 / 4.25, n: 4, expected: 4.25 },
+    { x: minTime, y: 100 * 2 / 1.25, n: 2, expected: 1.25, skipped: 0, marker: { enabled: false } },
+    { x: NOW - 20 * H, y: 100 * 3 / 3.25, n: 3, expected: 3.25, skipped: 0 },
+    { x: NOW - 10 * H, y: 100 * 4 / 4.25, n: 4, expected: 4.25, skipped: 0 },
   ]);
   // A round exactly at the edge is a point, not a start value.
   assert.deepEqual(xy(build([at(minTime, 0.5)], minTime, null)), [[minTime, 200]]);
@@ -108,9 +113,9 @@ test('the open round is in the pool: from the last block the series runs on, fal
   const live: Live = { x: NOW, lastBlkMs: lastMs, expectedMs: 4 * H };
   const pts = build(rounds, minTime, live);
   assert.deepEqual(pts.slice(0, 3), [
-    { x: minTime, y: 100 / 0.8, n: 1, expected: 0.8, marker: { enabled: false } },
-    { x: NOW - 20 * H, y: 200, n: 2, expected: 1 },
-    { x: lastMs, y: 150, n: 3, expected: 2 },
+    { x: minTime, y: 100 / 0.8, n: 1, expected: 0.8, skipped: 0, marker: { enabled: false } },
+    { x: NOW - 20 * H, y: 200, n: 2, expected: 1, skipped: 0 },
+    { x: lastMs, y: 150, n: 3, expected: 2, skipped: 0 },
   ]);
   assert.equal(pts.length, 3 + SAMPLES);
   assertTail(pts, live, lastMs + 1, 3, 2);
@@ -133,7 +138,7 @@ test('field case: an older node\'s one block, the first, then 100 / (1 + open ef
   assert.ok(near(open.effort, 100 / 663.7500811361269));
   const live: Live = { x: nowS * 1000, lastBlkMs: blkMs, expectedMs: open.pace_time * 1000 };
   const pts = build(set.rounds, blkMs - 3 * D, live);
-  assert.deepEqual(pts[0], { x: blkMs, y: 100, n: 1, expected: 1 });
+  assert.deepEqual(pts[0], { x: blkMs, y: 100, n: 1, expected: 1, skipped: 0 });
   assert.ok(pts.every(p => p.x >= blkMs), 'no luck line before the block');
   assertTail(pts, live, blkMs + 1, 1, 1);
   assert.ok(near(pts[pts.length - 1]!.y, 100 / (1 + open.effort)));
@@ -146,7 +151,7 @@ test('no block in the window: the line spans it, the open round counted from its
   const live: Live = { x: NOW, lastBlkMs: lastMs, expectedMs: 5 * D };
   const pts = build(rounds, minTime, live);
   // At the left edge the round is 2 d old: 2 blocks / (2 + 2/5) expected.
-  assert.deepEqual(pts[0], { x: minTime, y: 100 * 2 / 2.4, n: 2, expected: 2.4, marker: { enabled: false }, open: true });
+  assert.deepEqual(pts[0], { x: minTime, y: 100 * 2 / 2.4, n: 2, expected: 2.4, skipped: 0, marker: { enabled: false }, open: true });
   assert.equal(pts.length, SAMPLES + 1);
   assertTail(pts, live, minTime, 2, 2);
   assert.ok(near(pts[pts.length - 1]!.y, 100 * 2 / 2.6));
@@ -158,12 +163,88 @@ test('a last block with no effort adds no point: the tail starts at it, level wi
   const live: Live = { x: NOW, lastBlkMs: lastMs, expectedMs: 4 * H };
   const pts = build(rounds, minTime, live);
   assert.deepEqual(pts.slice(0, 3), [
-    { x: minTime, y: 100, n: 1, expected: 1, marker: { enabled: false } },
-    { x: lastEffortMs, y: 160, n: 2, expected: 1.25 },
-    { x: lastMs, y: 160, n: 2, expected: 1.25, marker: { enabled: false }, open: true },
+    { x: minTime, y: 100, n: 1, expected: 1, skipped: 0, marker: { enabled: false } },
+    { x: lastEffortMs, y: 160, n: 2, expected: 1.25, skipped: 0 },
+    { x: lastMs, y: 160, n: 2, expected: 1.25, skipped: 0, marker: { enabled: false }, open: true },
   ]);
   assertTail(pts, live, lastMs, 2, 1.25);
   assert.ok(pts.every(p => p.y !== null && isFinite(p.y)), 'no break, no cap');
+});
+
+// ltc.voidbind's ledger through the node's luck model (fixtures/
+// ltc-voidbind-20261116): its rate history starts inside the round that
+// ended at block 3160570, which it covers for 13 %.
+interface GapFixture { rows: Record<string, unknown>[] }
+interface GapStats {
+  current_round: { effort: number; history_coverage: number; elapsed: number };
+  periods: Record<string, { k: number; blocks_expected: number; luck: number; k_unmeasured: number }>;
+}
+const fixture = <F>(name: string) =>
+  JSON.parse(readFileSync(new URL(`./fixtures/ltc-voidbind-20261116/${name}`, import.meta.url), 'utf8')) as F;
+
+test('rate history with gaps: the series pools covered effort only and ends on the "all" period luck', () => {
+  const rows = fixture<GapFixture>('recent_blocks_luck.json').rows;
+  const stats = fixture<GapStats>('luck_stats.json');
+  const nowS = fixture<{ now_utc: number }>('META.json').now_utc;
+  const set = T.c2pBlockPace(rows, 'LTC');
+  // Four rounds (two finds never confirmed and are no round). The row of
+  // the 13 % round shows its effort scaled up to the whole round, 9.29.
+  assert.deepEqual(set.rounds.map(r => [Math.round(r.effort * 100) / 100, Math.round(r.covered! * 100) / 100, r.measured]),
+                   [[1, 1, true], [9.29, 1.24, true], [3.35, 3.24, true], [0.52, 0.52, true]]);
+  const open = T.c2pOpenRound(stats, set.lastMain!.ts, nowS, 0)!;
+  assert.ok(near(open.covered_effort, stats.current_round.effort * stats.current_round.history_coverage));
+  const live: Live = { x: nowS * 1000, lastBlkMs: set.lastMain!.ts * 1000, expectedMs: open.pace_time * 1000 };
+  const pts = build(set.rounds, 0, live);
+  const last = pts[pts.length - 1]!;
+  // The node's "all" period: 4 blocks / 6.14 expected = 65 %.
+  const all = stats.periods['all']!;
+  assert.deepEqual([all.k, Math.round(all.luck)], [4, 65]);
+  assert.equal(last.n, all.k);
+  assert.ok(near(last.expected, all.blocks_expected), `${last.expected} vs ${all.blocks_expected}`);
+  assert.ok(near(last.y, all.luck), `${last.y} vs ${all.luck}`);
+  // The badge shows that period as served, and the page's own pooling of
+  // the rows gives the same figure.
+  assert.equal(T.c2pLuckPeriods(stats, set.rounds, nowS, open, set.noEffort)['all']!.luck, all.luck);
+  const own = T.c2pPeriodLuck(set.rounds, nowS, null, open, set.noEffort)!;
+  assert.ok(near(own.luck, all.luck) && own.k === all.k && own.skipped === all.k_unmeasured);
+  // Summing the rows' scaled efforts instead read 28 %.
+  const scaled = set.rounds.reduce((a, r) => a + r.effort, 0) + open.effort;
+  assert.equal(Math.round(100 * all.k / scaled), 28);
+  // Each point is the same pooling up to its round.
+  assert.deepEqual(pts.filter(p => !p.open).map(p => [p.n, Math.round(p.expected * 100) / 100, Math.round(p.y)]),
+                   [[1, 1, 100], [2, 2.24, 89], [3, 5.48, 55], [4, 6, 67]]);
+});
+
+test('a block found in a gap of the rate history is left out of the blocks found; its covered effort still counts', () => {
+  // Round 2 is covered for a quarter and its block came while the history
+  // was not watching; round 3 is whole.
+  const rounds: Round[] = [
+    { ...at(NOW - 30 * H, 1, true) },
+    { ...at(NOW - 20 * H, 2), covered: 0.5, measured: false, gap: 10 * 3600 },
+    { ...at(NOW - 10 * H, 0.5), covered: 0.5, measured: true, gap: 10 * 3600 },
+  ];
+  const pts = build(rounds, NOW - 3 * D, null);
+  assert.deepEqual(pts, [
+    { x: NOW - 30 * H, y: 100, n: 1, expected: 1, skipped: 0 },
+    { x: NOW - 20 * H, y: 100 * 1 / 1.5, n: 1, expected: 1.5, skipped: 1 },
+    { x: NOW - 10 * H, y: 100, n: 2, expected: 2, skipped: 1 },
+  ]);
+  // The periods pool the same way: the series' last point is the "all" luck.
+  const all = T.c2pPeriodLuck(rounds, NOW / 1000, null, null)!;
+  assert.deepEqual([all.k, all.blocks_expected, all.luck, all.skipped], [2, 2, 100, 1]);
+  // Rows as the node serves them: `measured` false, the covered part from
+  // effort * history_coverage, or the node's own effort_covered.
+  const row = (h: number, hours: number, more: object) =>
+    ({ hash: 'h' + h, number: h, ts: (NOW - hours * H) / 1000, chain: 'LTC', status: 'confirmed', main_chain: true, ...more });
+  const set = T.c2pBlockPace([
+    row(1, 30, { effort: 1, effort_method: 'first_block' }),
+    row(2, 20, { effort: 2, effort_method: 'integrated', history_coverage: 0.25, measured: false }),
+    row(3, 10, { effort: 0.5, effort_method: 'integrated', history_coverage: 1, effort_covered: 0.5 }),
+    row(4, 5, { effort: 0.3, effort_method: 'single_sample', history_coverage: 0 }),
+  ], 'LTC');
+  assert.deepEqual(set.rounds.map(r => [r.covered, r.measured]), [[1, true], [0.5, false], [0.5, true], [0.3, true]]);
+  const served = build(set.rounds, 0, null);
+  assert.deepEqual(served.map(p => [p.n, p.expected, p.skipped]), [[1, 1, 0], [1, 1.5, 1], [2, 2, 1], [3, 2.3, 1]]);
 });
 
 test('no round with an effort: no series, open round or not', () => {
@@ -187,7 +268,7 @@ test('a block found after the last graph sample is a point, and the tail starts 
   const rounds = [at(NOW - 10 * H, 1), at(blkMs, 0.5)];
   const live: Live = { x: NOW, lastBlkMs: blkMs, expectedMs: 4 * H };
   const pts = build(rounds, NOW - D, live);
-  assert.deepEqual(pts.slice(0, 2), [{ x: NOW - 10 * H, y: 100, n: 1, expected: 1 }, { x: blkMs, y: 100 * 2 / 1.5, n: 2, expected: 1.5 }]);
+  assert.deepEqual(pts.slice(0, 2), [{ x: NOW - 10 * H, y: 100, n: 1, expected: 1, skipped: 0 }, { x: blkMs, y: 100 * 2 / 1.5, n: 2, expected: 1.5, skipped: 0 }]);
   assertTail(pts, live, blkMs + 1, 2, 1.5);
 });
 

@@ -17,11 +17,14 @@ interface Row {
   luck: number | null; luck_method: string | null; time_to_find: number | null; expected_time: number | null;
   effort?: number; effort_method?: string;
 }
-interface Round { ts: number; effort: number; first: boolean; hash: string; height: number; gap?: number | null }
+interface Round {
+  ts: number; effort: number; first: boolean; hash: string; height: number; gap?: number | null;
+  covered?: number; measured?: boolean;
+}
 interface PaceSet { byHash: Record<string, { effort: number | null; tag: string }>; rounds: Round[]; noEffort: number[]; lastMain: Row | null }
 interface Open {
   effort: number; elapsed: number | null; expected_time: number | null; source: string; since: string | null;
-  pace_time?: number | null; method?: string | null; coverage?: number | null;
+  pace_time?: number | null; method?: string | null; coverage?: number | null; covered_effort?: number;
 }
 interface Period {
   k: number; blocks_expected: number; luck: number; ci95_low: number | null; ci95_high: number | null;
@@ -96,13 +99,23 @@ test('the open round: the node\'s current_round, else 100 / current_luck_trend, 
   const now = 1794800000, last = now - 7200;
   const served = { current_luck_trend: 1, current_round: { elapsed: 7100, expected_time: 3550, effort: 2, since_block_hash: 'aa' } };
   assert.deepEqual(L.c2pOpenRound(served, last, now, 999),
-                   { effort: 2, elapsed: 7100, expected_time: 3550, pace_time: 3550, source: 'server', since: 'aa', method: null, coverage: null });
+                   { effort: 2, covered_effort: 2, elapsed: 7100, expected_time: 3550, pace_time: 3550, source: 'server', since: 'aa',
+                     method: null, coverage: null });
   // The node's effort is integrated over the round and its expected_time is
   // the time to a block at the rate NOW: after a rate change they differ.
-  // pace_time is the round's own elapsed / effort.
+  // Where the rate history covers the round in part, the effort is scaled
+  // up to the whole round and a pooled figure counts the covered part:
+  // effort * history_coverage. pace_time is elapsed over that part.
   const moved = L.c2pOpenRound({ current_round: { elapsed: 7200, expected_time: 5400, effort: 2.4, effort_method: 'integrated',
                                                   history_coverage: 0.8, since_block_hash: 'bb' } }, last, now, 0)!;
-  assert.deepEqual([moved.effort, moved.expected_time, moved.pace_time, moved.method, moved.coverage], [2.4, 5400, 3000, 'integrated', 0.8]);
+  assert.deepEqual([moved.effort, moved.expected_time, moved.method, moved.coverage], [2.4, 5400, 'integrated', 0.8]);
+  assert.ok(near(moved.covered_effort!, 1.92) && near(moved.pace_time!, 3750));
+  // The node's own covered figure, when it serves one, is taken as it is.
+  assert.equal(L.c2pOpenRound({ current_round: { elapsed: 7200, effort: 2.4, effort_method: 'integrated', history_coverage: 0.8,
+                                                 effort_covered: 1.5 } }, last, now, 0)!.covered_effort, 1.5);
+  // A single sample has no history behind it: all of it counts.
+  assert.equal(L.c2pOpenRound({ current_round: { elapsed: 7200, effort: 2.4, effort_method: 'single_sample', history_coverage: 0 } },
+                              last, now, 0)!.covered_effort, 2.4);
   // No expected_time served: elapsed / effort.
   assert.equal(L.c2pOpenRound({ current_round: { elapsed: 7200, effort: 2.4 } }, last, now, 0)!.expected_time, 3000);
   assert.equal(L.c2pOpenRound({ current_round: { elapsed: 0, effort: 0 } }, last, now, 0)!.effort, 0, 'a round just begun');
@@ -110,10 +123,12 @@ test('the open round: the node\'s current_round, else 100 / current_luck_trend, 
   assert.equal(L.c2pOpenRound({ current_round: null, current_luck_trend: 40 }, last, now, 3600), null);
   // An older node: current_luck_trend = expected / elapsed * 100.
   assert.deepEqual(L.c2pOpenRound({ current_luck_trend: 40 }, last, now, 999),
-                   { effort: 2.5, elapsed: 7200, expected_time: 2880, pace_time: 2880, source: 'server_trend', since: null, method: null, coverage: null });
+                   { effort: 2.5, covered_effort: 2.5, elapsed: 7200, expected_time: 2880, pace_time: 2880, source: 'server_trend', since: null,
+                     method: null, coverage: null });
   // Neither: the round since the last block against the expected time given.
   assert.deepEqual(L.c2pOpenRound({ luck_available: true }, last, now, 3600),
-                   { effort: 2, elapsed: 7200, expected_time: 3600, pace_time: 3600, source: 'client', since: null, method: null, coverage: null });
+                   { effort: 2, covered_effort: 2, elapsed: 7200, expected_time: 3600, pace_time: 3600, source: 'client', since: null,
+                     method: null, coverage: null });
   assert.deepEqual(L.c2pOpenRound(null, last, now, 3600)!.effort, 2);
   for (const ls of [null, {}, { current_luck_trend: 0 }, { current_luck_trend: null }, { current_round: { effort: null } }])
     assert.equal(L.c2pOpenRound(ls, last, now, 0), null);
@@ -160,6 +175,23 @@ test('period luck is pooled: k / (sum of effort + the open round so far)', () =>
   assert.equal(L.c2pPeriodLuck([round(100, 0.5)], NOW, D, null), null);
 });
 
+test('the fallback pools as the node does: the covered part of an effort, no block for one found in a gap', () => {
+  // A round the rate history covers for a quarter, its block found in the
+  // gap: 0.5 of its 2 expected count, the block does not.
+  const rounds: Round[] = [
+    round(100, 1, true),
+    { ...round(60, 2), covered: 0.5, measured: false },
+    { ...round(20, 0.5), covered: 0.5, measured: true },
+  ];
+  const open: Open = { effort: 0.4, covered_effort: 0.3, elapsed: 7200, expected_time: 18000, source: 'server', since: null };
+  const all = L.c2pPeriodLuck(rounds, NOW, null, open)!;
+  assert.deepEqual([all.k, all.blocks_expected, all.skipped], [2, 1 + 0.5 + 0.5 + 0.3, 1]);
+  assert.ok(near(all.luck, 100 * 2 / 2.3));
+  assert.match(L.c2pPeriodTip('all', all), /1 block is left out of the blocks found: found in a gap of the rate history, or with no effort known\./);
+  // Alone in its period, such a block gives no figure rather than "0 blocks".
+  assert.equal(L.c2pPeriodLuck([{ ...round(60, 2), covered: 0.5, measured: false }], NOW, null, null), null);
+});
+
 test('a block with no effort is left out with its round, and alone gives no figure', () => {
   const open: Open = { effort: 0.25, elapsed: 7200, expected_time: 28800, source: 'client', since: null };
   const noEffort = [NOW - 3 * 3600];
@@ -167,7 +199,7 @@ test('a block with no effort is left out with its round, and alone gives no figu
   assert.equal(L.c2pPeriodLuck([round(100, 0.5)], NOW, D, open, noEffort), null);
   const week = L.c2pPeriodLuck([round(100, 0.5)], NOW, 7 * D, open, noEffort)!;
   assert.deepEqual([week.k, week.blocks_expected, week.skipped], [1, 0.75, 1]);
-  assert.match(L.c2pPeriodTip('7 days', week), /1 block has no known effort and is left out with its round\./);
+  assert.match(L.c2pPeriodTip('7 days', week), /1 block is left out of the blocks found: found in a gap of the rate history, or with no effort known\./);
 });
 
 test('the node\'s periods are shown as served; an older node gets the fallback, period by period', () => {
@@ -182,7 +214,7 @@ test('the node\'s periods are shown as served; an older node gets the fallback, 
   };
   const p = L.c2pLuckPeriods(served, rounds, NOW, open);
   assert.deepEqual(p['1d'], { k: 1, blocks_expected: 0.9, luck: 111.1, ci95_low: 2.8, ci95_high: 619.1, span_s: 86400, skipped: 2, source: 'server' });
-  assert.match(L.c2pPeriodTip('1d', p['1d']), /2 blocks have no known effort and are left out with their rounds\./);
+  assert.match(L.c2pPeriodTip('1d', p['1d']), /2 blocks are left out of the blocks found: found in a gap of the rate history, or with no effort known\./);
   assert.doesNotMatch(L.c2pPeriodTip('1d', p['1d']), /older node/);
   assert.equal(p['7d']!.skipped, 0);
   assert.deepEqual([p['7d']!.k, p['7d']!.luck, p['7d']!.source], [30, 90.09, 'server'], 'not recomputed from the rows');
@@ -348,7 +380,7 @@ test('the Round tooltip gives the odds of a round this long, and no memory', () 
   assert.doesNotMatch(L.c2pRoundTip(open), /Rounds over 5×/);
   assert.match(L.c2pRoundTip({ ...open, source: 'server_trend' }), /From this node's current_luck_trend \(older node\)/);
   assert.match(L.c2pRoundTip({ ...open, method: 'integrated', coverage: 0.8 }),
-               /Effort integrated over the open round from the pool hashrate and difficulty history \(history covers 80 % of it; the rest is taken at its mean\)\.$/);
+               /Effort integrated over the open round from the pool hashrate and difficulty history \(history covers 80 % of it; the rest is taken at its mean, and pooled luck counts the covered part only\)\.$/);
   assert.match(L.c2pRoundTip({ effort: 0.5, elapsed: null, expected_time: null, source: 'server', since: null }),
                /^This round has run 0\.5× its expected length\. 61 % of rounds run at least this long by chance \(Poisson\)\. The chance of a block within one expected round time from now is 63 %/);
   assert.doesNotMatch(long + L.c2pRoundTip(open), /overdue|is due|streak|more likely|catch/i);

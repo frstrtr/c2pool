@@ -17,6 +17,7 @@ interface Row {
   luck?: number | null; luck_method?: string | null;
   time_to_find?: number | null; expected_time?: number | null;
   effort?: number | null; effort_method?: string | null; main_chain?: boolean;
+  effort_covered?: number | null; measured?: boolean;
   prev_block_hash?: string | null; history_coverage?: number | null;
   network_difficulty?: number; pool_hashrate_at_find?: number;
 }
@@ -24,10 +25,13 @@ interface Duplet { with: string; withHeight: number; gap: number; prevEffort: nu
 interface Pace {
   hash: string; chain: string; ts: number; height: number; offChain: boolean;
   effort: number | null; offEffort: number | null; luck: number | null; first: boolean; source: string | null; method: string | null;
-  coverage: number | null; gap: number | null; expected: number | null; gapFixed: boolean;
+  coverage: number | null; covered: number | null; measured: boolean; gap: number | null; expected: number | null; gapFixed: boolean;
   tier: string; tag: string; prev: string | null; duplet: Duplet | null; dupletOpen: string | null;
 }
-interface Round { ts: number; effort: number; first: boolean; hash: string; height: number; gap: number | null }
+interface Round {
+  ts: number; effort: number; first: boolean; hash: string; height: number; gap: number | null;
+  covered: number; measured: boolean;
+}
 interface PaceSet {
   byHash: Record<string, Pace>; chains: Record<string, Round[]>; chain: string | null;
   rounds: Round[]; noEffort: number[]; lastMain: Row | null;
@@ -398,7 +402,8 @@ test('outside LTC node (older build): its one block is the first block, 100 %', 
   const set = L.c2pBlockPace(rows, 'LTC');
   const p = set.byHash[rows[0]!.hash!]!;
   assert.deepEqual([p.effort, p.luck, p.first, p.source, p.tag, p.duplet], [1, 100, true, 'first_block', '', null]);
-  assert.deepEqual(set.rounds, [{ ts: 1794498365, effort: 1, first: true, hash: rows[0]!.hash, height: 3211872, gap: null }]);
+  assert.deepEqual(set.rounds, [{ ts: 1794498365, effort: 1, first: true, hash: rows[0]!.hash, height: 3211872, gap: null,
+                                 covered: 1, measured: true }]);
   assert.match(L.c2pEffortTip(p), /First block known to this node.*counts as effort 100 %/s);
   // Its merged DOGE row has no difficulty at find: no effort, no tag.
   const merged = L.c2pBlockPace([{ pow_hash: 'da2714c8', symbol: 'DOGE', height: 6454700, ts: 1794498370, verified: true }]);
@@ -494,7 +499,7 @@ test('tooltips give the Poisson odds and claim no pattern', () => {
   assert.match(tip, /Computed in the browser from this node's time_to_find \/ expected_time \(older node\)/);
   const served = L.c2pBlockPace([row(1, 0, { effort: 1, effort_method: 'first_block' }),
                                  row(2, 5, { effort: 0.5, effort_method: 'integrated', time_to_find: 5 * H, history_coverage: 0.5 })], 'DASH');
-  assert.match(L.c2pEffortTip(paceOf(served, 2)), /Effort integrated over the round from the pool hashrate and difficulty history \(history covers 50 % of the round; the rest is taken at its mean\)\.$/);
+  assert.match(L.c2pEffortTip(paceOf(served, 2)), /Effort integrated over the round from the pool hashrate and difficulty history \(history covers 50 % of the round; the rest is taken at its mean, and pooled luck counts the covered part only\)\.$/);
   const whole = L.c2pBlockPace([row(1, 0, { effort: 1, effort_method: 'first_block' }),
                                 row(2, 5, { effort: 0.5, effort_method: 'integrated', time_to_find: 5 * H, history_coverage: 1 })], 'DASH');
   assert.match(L.c2pEffortTip(paceOf(whole, 2)), /difficulty history\.$/);
