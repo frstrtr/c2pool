@@ -285,6 +285,9 @@ protected:
     boost::asio::thread_pool m_think_pool{1};
     std::atomic<bool> m_think_running{false};
     std::atomic<bool> m_clean_running{false};
+    // A run_think() skipped because a cycle held m_think_running: the cycle's
+    // epilogue posts one run_think() for it (think_gate.hpp).
+    std::atomic<bool> m_rethink_pending{false};
     mutable std::shared_mutex m_tracker_mutex;
 
     // ── think()/clean watchdog (mirrors btc/node) ────────────────────────

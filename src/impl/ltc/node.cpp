@@ -5,6 +5,7 @@
 
 #include "share_tx_refs.hpp"
 #include "persisted_reload.hpp"
+#include "think_gate.hpp"
 
 #include <core/reloaded_block_flag.hpp>   // core::restore_block_flag (a reloaded share keeps its block flag)
 #include <core/common.hpp>
@@ -2920,10 +2921,16 @@ void NodeImpl::run_think()
 {
     // Skip if a think() is already running on the compute thread.
     // The atomic flag serializes: only one think() in flight at a time.
-    if (m_think_running.exchange(true)) {
+    // A skipped request is remembered (m_rethink_pending) and the cycle that
+    // holds the slot posts one run_think() from its epilogue: the slot is
+    // still held after the compute thread released the tracker lock, so a
+    // share minted or received in that window (notify_local_share,
+    // processing_shares_phase2) was in the chain but never elected.
+    if (!ltc::think::acquire_think_slot(m_think_running, m_rethink_pending)) {
         static int skip_log = 0;
         if (skip_log++ % 20 == 0)
-            LOG_INFO << "[ASYNC-THINK] skipped — compute thread busy (skip_count=" << skip_log << ")";
+            LOG_INFO << "[ASYNC-THINK] skipped — compute thread busy, re-think queued (skip_count="
+                     << skip_log << ")";
         return;
     }
 
@@ -3081,6 +3088,15 @@ void NodeImpl::run_think()
       // The mutex is NOT held — IO thread can acquire it for drain_pending.
       boost::asio::post(*m_context, [this, result = std::move(result),
                                       best_changed, needs_continue]() {
+        // Release the think slot once, on whichever path gets there first: a
+        // second release could clear the slot of a cycle started since.
+        bool slot_released = false;
+        auto release_slot = [this, &slot_released]() -> bool {
+            if (slot_released)
+                return false;
+            slot_released = true;
+            return ltc::think::release_think_slot(m_think_running, m_rethink_pending);
+        };
         try {
             // think() returned normally — disarm the watchdog for this cycle.
             disarm_think_watchdog();
@@ -3192,20 +3208,27 @@ void NodeImpl::run_think()
 
             // Clear flag AFTER drain — prevents new think() from starting
             // while deferred shares are still being added to the tracker.
-            m_think_running.store(false);
-            LOG_INFO << "[ASYNC-THINK] cycle complete — IO thread free";
+            // The release reports whether a run_think() was skipped while
+            // this cycle held the slot (a share minted or drained above):
+            // serve it, once, or its election waits for some later trigger.
+            const bool rethink_owed = release_slot();
+            LOG_INFO << "[ASYNC-THINK] cycle complete — IO thread free"
+                     << (rethink_owed ? " (re-think queued)" : "");
 
             // If verification budget was exhausted, schedule continuation.
             // The IO thread processes network I/O between verification batches.
-            if (needs_continue) {
+            // One post serves both.
+            if (needs_continue || rethink_owed) {
                 boost::asio::post(*m_context, [this]() { run_think(); });
             }
         } catch (const std::exception& e) {
             LOG_ERROR << "run_think() IO phase failed: " << e.what();
-            m_think_running.store(false);
+            if (release_slot())
+                boost::asio::post(*m_context, [this]() { run_think(); });
         } catch (...) {
             LOG_ERROR << "run_think() IO phase failed: unknown error";
-            m_think_running.store(false);
+            if (release_slot())
+                boost::asio::post(*m_context, [this]() { run_think(); });
         }
       });
     });
@@ -3405,7 +3428,10 @@ void NodeImpl::clean_tracker()
         return;
 
     // Skip if think() is already in flight — the 5s timer will retry.
-    if (m_think_running.load()) {
+    // Taking the slot is one compare-exchange (it blocks think() re-entry
+    // during clean): a run_think() from another thread (the HTTP submit path)
+    // cannot take it between a check and a store.
+    if (!ltc::think::acquire_clean_slot(m_think_running)) {
         m_clean_running.store(false);
         return;
     }
@@ -3413,7 +3439,6 @@ void NodeImpl::clean_tracker()
     // Post the entire clean_tracker body to the compute thread.
     // This guarantees chain modifications happen under exclusive lock,
     // never concurrent with think() or IO-thread reads.
-    m_think_running.store(true);  // block think() re-entry during clean
 
     // clean_tracker runs think()+the removal walk under the same exclusive
     // lock — arm the watchdog here too (disarmed in this path's IO-phase).
@@ -3424,12 +3449,19 @@ void NodeImpl::clean_tracker()
 
       bool clean_best_changed = false;
       bool bootstrap = false;
+      // The tip when this cycle took the lock, and after the last step that
+      // set it. Step 1 and Step 4 both run think() and set the best share;
+      // the change the miners must hear about is entry -> exit, wherever in
+      // the cycle it happened (a Step-1 move used to be compared away).
+      uint256 best_at_entry;
+      uint256 best_at_exit;
       // v36-0.24 #25(B): the missing parents think() still wants (its `desired`
       // set), captured from Step-1's think() result and consulted by Step-2's head
       // GC so a head we are ACTIVELY downloading toward is not purged mid-catch-up.
       std::set<uint256> desired_parents;
       try {
         std::unique_lock lock(m_tracker_mutex);  // exclusive
+        best_at_entry = best_at_exit = m_best_share_hash;
 
         // Step 1: Run think() inline (already holds the lock)
         {
@@ -3467,6 +3499,7 @@ void NodeImpl::clean_tracker()
 
             if (!result.best.IsNull()) {
                 m_best_share_hash = result.best;
+                best_at_exit = m_best_share_hash;
                 // Same critical section as the decision: the merged payouts
                 // for this best share are available before the prune below
                 // (which can hold the lock for a long time).
@@ -3701,8 +3734,8 @@ void NodeImpl::clean_tracker()
                                       m_supersede_hint);
         m_last_top5_heads = std::move(result.top5_heads);
         if (!result.best.IsNull()) {
-            clean_best_changed = (m_best_share_hash != result.best);
             m_best_share_hash = result.best;
+            best_at_exit = m_best_share_hash;
         }
         publish_snapshot();
         flush_verified_to_leveldb();
@@ -3781,21 +3814,38 @@ void NodeImpl::clean_tracker()
       } catch (...) {
         LOG_ERROR << "[CLEAN] failed on compute thread: unknown error";
       }
+      // Entry against exit: a best share Step 1 moved and Step 4 kept is a
+      // change (it was compared Step 4 against Step 1 and never notified),
+      // and one a later step threw past still is. Notified once, below.
+      clean_best_changed = ltc::think::clean_cycle_best_changed(best_at_entry, best_at_exit);
       // Lock released — post work refresh + drain to IO thread.
       // Work refresh (1-5s) runs WITHOUT any lock so shared_lock readers
       // (handle_get_share, send_shares) are never blocked.
       boost::asio::post(*m_context, [this, clean_best_changed]() {
-        disarm_think_watchdog();
-        // Enforce the cache_max_* limits. This is the ONLY call site: the code
-        // that used to do it (prune_shares) was never called at all.
-        evict_caches_io_phase();
-        if (clean_best_changed && m_on_best_share_changed) {
-            LOG_INFO << "[CLEAN] IO-phase: work refresh (best changed)";
-            m_on_best_share_changed();
+        // A throw here used to leave m_think_running and m_clean_running set
+        // for good (no think, no clean, until a watchdog that this very
+        // handler disarmed): the flags are released after the try.
+        try {
+            disarm_think_watchdog();
+            // Enforce the cache_max_* limits. This is the ONLY call site: the code
+            // that used to do it (prune_shares) was never called at all.
+            evict_caches_io_phase();
+            if (clean_best_changed && m_on_best_share_changed) {
+                LOG_INFO << "[CLEAN] IO-phase: work refresh (best changed)";
+                m_on_best_share_changed();
+            }
+            drain_pending_adds();
+        } catch (const std::exception& e) {
+            LOG_ERROR << "[CLEAN] IO phase failed: " << e.what();
+        } catch (...) {
+            LOG_ERROR << "[CLEAN] IO phase failed: unknown error";
         }
-        drain_pending_adds();
-        m_think_running.store(false);
+        // The clean cycle holds the think slot too: a run_think() skipped
+        // during it (a mint, a peer batch) is served now.
+        const bool rethink_owed = ltc::think::release_think_slot(m_think_running, m_rethink_pending);
         m_clean_running.store(false);
+        if (rethink_owed)
+            boost::asio::post(*m_context, [this]() { run_think(); });
       });
     }); // end of m_think_pool lambda
 }
