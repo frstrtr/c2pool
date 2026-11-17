@@ -216,7 +216,10 @@ static bool n8(std::string& note) {
     rig.tick_monero();
     if (rig.mine(*A, 0, 0x7100).action != pb::NodeAction::Placed) return false;
     const pb::Hash32 c = A->best();
-    const bool placed = wait_until([&] { return Cn->best() == c; }, 10000ms);
+    // P-15 counts a placement after the node lock is released (valid_count after the placement): a tip seen under
+    // the lock may not be counted yet, so wait for the count instead of reading it once
+    const bool placed = wait_until([&] { return Cn->best() == c; }, 10000ms) &&
+                        wait_until([&] { return Cn->st().p15_counted.load() >= 1; }, 10000ms);
     const bool again = wait_until([&] { return Cn->count_logs("RandomX hashes again") == 1; }, 3000ms);
     const std::size_t lines = Cn->count_logs("RandomX");
     note = "rx failures " + std::to_string(Cn->st().rx_failures.load()) + ", alarm lines " + std::to_string(lines) +
@@ -244,13 +247,18 @@ static bool n9(std::string& note) {
     const std::optional<pb::PathbJob> j = rig.job(*A, 1, 0x91);
     if (!j || rig.mine(*A, 0, 0x7200).action != pb::NodeAction::Placed) return false;
     if (!wait_until([&] { return Cn->best() == A->best(); }, 5000ms)) return false;
+    // P-15 counts a placement after the node lock is released (valid_count), so neither the tip nor the held
+    // receipt seen under the lock says the count is in: wait for each count instead of reading it once. The
+    // baseline first: the carrier's own count (once, as in N8), so it cannot land inside the receipt's delta.
+    if (!wait_until([&] { return Cn->st().p15_counted.load() >= 1; }, 10000ms)) return false;
     const std::uint64_t counted0 = Cn->st().p15_counted.load();
     throws->store(1);
     const pb::NodeEventResult r = rig.share(*A, *j, 0x7300);
     if (r.action != pb::NodeAction::Pending) return false;
     const pb::Hash32 id = r.admit.id;
     const auto held = [&] { return Cn->r().with_node([&](pb::PathbNode& n) { return n.pending().holds(id); }); };
-    const bool ok = wait_until(held, 10000ms);
+    const bool ok = wait_until(held, 10000ms) &&
+                    wait_until([&] { return Cn->st().p15_counted.load() - counted0 >= 1; }, 10000ms);
     const std::uint64_t counted = Cn->st().p15_counted.load() - counted0;
     note = "rx failures " + std::to_string(Cn->st().rx_failures.load()) + ", strikes " +
            std::to_string(Cn->st().strikes.load()) + ", bans " + std::to_string(Cn->st().bans.load()) +

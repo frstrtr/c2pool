@@ -3,7 +3,12 @@
 [![CI](https://github.com/frstrtr/c2pool/actions/workflows/build.yml/badge.svg)](https://github.com/frstrtr/c2pool/actions/workflows/build.yml)
 [![Claude for Open Source](https://img.shields.io/badge/Claude%20for%20Open%20Source-supported-D97757?logo=claude&logoColor=white)](https://claude.com/contact-sales/claude-for-oss)
 
-C++ reimplementation of [forrestv/p2pool](https://github.com/p2pool/p2pool) targeting the **V36 share format**, with **per-coin binaries** for six parent chains and their merged-mining children: **Litecoin** (flagship — LTC + DOGE, PEP, BELLS, LKY, JKC, SHIC), **Bitcoin** (+ Namecoin), **DigiByte** (Scrypt), **Bitcoin Cash**, **Dash**, and **BIP-110** (the Bitcoin Knots BLAKE2b minority hard fork — embedded daemonless, experimental). See [Supported chains](#supported-chains) for the full matrix and status.
+C++ reimplementation of [forrestv/p2pool](https://github.com/p2pool/p2pool) targeting the **V36 share format**, with **per-coin binaries** for six parent chains and their merged-mining children. Two of them are in production use:
+
+- **Litecoin**, with **DOGE** merged mining in production on the V36 share chain (embedded DOGE node). More Scrypt AuxPoW chains (PEP, LKY, SHIC, BELLS, JKC) can be added through external daemons. They are not production-tested, and segwit aux chains (BELLS, JKC) are not supported yet.
+- **Dash**, with a daemonless embedded node in production. It needs no dashd and is ready for Dash Core 24 (v24). It covers compact blocks (BIP 152), superblock governance and the full UTXO set from a pinned snapshot.
+
+The other parent chains are **Bitcoin** (+ Namecoin), **DigiByte** (Scrypt), **Bitcoin Cash**, and **BIP-110** (the Bitcoin Knots BLAKE2b minority hard fork; embedded daemonless, experimental). See [Supported chains](#supported-chains) for the full matrix and status.
 
 Bitcoin wiki: <https://en.bitcoin.it/wiki/P2Pool>
 
@@ -11,6 +16,10 @@ Original forum thread: <https://bitcointalk.org/index.php?topic=18313>
 
 ## Latest releases
 
+- **[v0.2.12.7](https://github.com/frstrtr/c2pool/releases/tag/v0.2.12.7)** — LTC: `--fee` pays the node owner the configured fee (v0.2.12–v0.2.12.6 paid about 1/12 of it), and a smaller miner's shares count at their full weight next to a bigger miner. DASH: on a node with several miners, each submission is judged by its own job's share target (a smaller miner could keep as little as 1/30 of its shares). LTC dashboard: one found block shows as the same row on every node, and merged blocks appear only under Merged Mining Blocks. Linux packages run without `start.sh`.
+- **[v0.2.12.6](https://github.com/frstrtr/c2pool/releases/tag/v0.2.12.6)** — LTC + DASH: a share that solves a block wins its head race against an equal-work sibling, as in p2pool. Dashboard fixes.
+- **[v0.2.12.5](https://github.com/frstrtr/c2pool/releases/tag/v0.2.12.5)** — DASH: superblock trigger votes are re-synced right before the superblock, for the Dash Core 24.0.1 voting change. Upgrade before superblock 2,575,480.
+- **[v0.2.12.4](https://github.com/frstrtr/c2pool/releases/tag/v0.2.12.4)** — LTC: a restarted node reconnects to the live share chain; share-store fixes for all coins; the dashboard shows whether each merged (DOGE) payout address was given by the miner or derived from the LTC address; universal macOS packages again (Apple Silicon + Intel).
 - **[v0.2.12.3](https://github.com/frstrtr/c2pool/releases/tag/v0.2.12.3)** — LTC: a node serves every share it holds (no gaps for peers after a dropped connection); the node fee is taken at exactly the configured rate. DASH: compact-block (BIP 152) receive, superblock governance sync, block bodies checked against the header including the v24 asset-unlock root. macOS packages in this release are Apple Silicon only; universal again from the next release.
 - **[v0.2.12.2](https://github.com/frstrtr/c2pool/releases/tag/v0.2.12.2)** — LTC: the built-in bootstrap list holds V36 share-chain nodes only.
 - **[v0.2.12.1](https://github.com/frstrtr/c2pool/releases/tag/v0.2.12.1)** — LTC + merged mining: [share version 3601](#share-version-3601-flag-day), active since 2026-11-13 00:00:00 UTC. Nodes older than v0.2.12.1 and Python p2pool are no longer on the LTC share chain. Several aux chains at once, job-time payouts. (v0.2.12 had an earlier date, 2026-11-11 12:00 UTC: do not run it.)
@@ -27,9 +36,11 @@ administrative access to a daemon.
 c2pool-dash builds valid Dash mainnet blocks from embedded coin-state. The
 deterministic masternode list, LLMQ quorums, ChainLocks and the DIP-4 coinbase
 are reconstructed inside c2pool. No Dash Core node is required on the serve path.
-Dash Core 24 (hard fork, earliest activation at block 2,580,480) is supported
-from v0.2.11.1: the v24 rules are built into the node, so a daemon-less pool
-has no dashd to upgrade.
+Dash Core 24 (hard fork) is supported from v0.2.11.1: the v24 rules are built
+into the node, so a daemon-less pool has no dashd to upgrade. The activation
+signal was not mined by block 2,572,415, so the earliest v24 activation is now
+block 2,584,512 (around 2026-12-06). c2pool is compatible with Dash Core 24.0.2
+peers.
 Blocks built this way have been accepted on Dash mainnet, including the pool
 development-fee split. A bare `c2pool-dash --run` is daemonless: with no
 `--coin-rpc` given, every embedded serving lever defaults ON
@@ -161,17 +172,18 @@ c2pool builds one binary per **parent chain** (`c2pool-<coin>`). Several parents
 
 | Parent chain | Algorithm | Merged-mining children | Status |
 |---|---|---|---|
-| **Litecoin** (LTC) | Scrypt | DOGE, PEP, BELLS, LKY, JKC, SHIC — external daemons | **Production** (V36; live LTC+DOGE blocks) — `c2pool-ltc` |
+| **Litecoin** (LTC) | Scrypt | DOGE (embedded); PEP, LKY, SHIC via external daemons (untested); BELLS, JKC not yet (segwit) | **Production** (V36; live LTC+DOGE blocks) — `c2pool-ltc` |
+| **Dash** (DASH) | X11 | — | **Production**, daemonless (`c2pool-dash --run`; dash.voidbind.com): v24-ready, compact blocks, superblock governance, full UTXO set; dashd-attached posture via `--coin-rpc` still supported |
 | **Bitcoin** (BTC) | SHA256d | Namecoin (NMC) | Live, daemonless (`c2pool-btc --coin-p2p-discover`; btc.voidbind.com); NMC embedded merged mining in development |
 | **DigiByte** (DGB) | Scrypt¹ | DOGE (embedded, `-DAUX_DOGE`) | Live, daemonless (`c2pool-dgb --run --coin-p2p-discover`; dgb.voidbind.com) — mainnet only, no testnet mode |
 | **Bitcoin Cash** (BCH) | SHA256d | — | Live, daemonless (`c2pool-bch --pool`; bch.voidbind.com) |
-| **Dash** (DASH) | X11 | — | Live, daemonless (`c2pool-dash --run`; dash.voidbind.com); dashd-attached posture via `--coin-rpc` still supported |
 | **BIP-110** (Knots BLAKE2b fork) | BLAKE2b² (SHA256d until height 961640) | — | **Experimental** (new fork; daemonless embedded; live on bip110.voidbind.com) — `c2pool-bip110 --run` |
 | **Monero** (XMR) | RandomX | none | **Experimental**, stagenet only (v37 lane; daemonless, several nodes, one owed ledger; `c2pool-v37-xmr`); mainnet fenced, see [docs/xmr-lane](docs/xmr-lane/README.md) |
 
 "Live" means a public voidbind node runs that per-coin binary with no coin
 daemon on the serve path. It is not a production-maturity claim: only the LTC
-line has the crossing-soak record behind it. Each binary's real flag surface is
+and Dash lines are in production use (LTC with the V35→V36 crossing-soak record,
+Dash as a daemonless node finding mainnet blocks). Each binary's real flag surface is
 in [Per-binary launch reference](#per-binary-launch-reference).
 
 ¹ DigiByte is a MultiAlgo chain; c2pool runs its **Scrypt** algorithm as a standalone parent — it is **not** an AuxPoW child of Litecoin.
@@ -325,6 +337,8 @@ c2pool is an independent C++ implementation of the P2Pool sharechain concept ori
 
 Development is supported by Anthropic's [Claude for Open Source](https://claude.com/contact-sales/claude-for-oss) program (2026). The design, the consensus rules, and responsibility for every byte shipped remain with the maintainers.
 
+> **Two Dash blocks in a row from the daemonless pool** (2026-11-15 03:40:39 and 03:42:26 UTC) — [#2572489](https://blockchair.com/dash/block/2572489) and [#2572490](https://blockchair.com/dash/block/2572490), 107 seconds apart. Both were built from embedded coin-state with no Dash Core node on the serve path, and both are confirmed.
+>
 > **First LTC + DOGE twin block found by c2pool in production** (2026-11-12 15:46:10 UTC) LTC [#3211872](https://blockchair.com/litecoin/block/3211872) + DOGE [#6454700](https://blockchair.com/dogecoin/block/6454700) — one proof of work, 6.256 LTC + 10,001 DOGE, found by a public V36 pool node (about 210 GH/s) eleven hours after it moved from Python p2pool to c2pool v0.2.12.2.
 >
 > **LTC share chain on share version 3601** (2026-11-13 00:00:00 UTC) — the flag day passed without a split. Python p2pool and c2pool before v0.2.12.1 can no longer join the share chain; the nodes on it run c2pool.
@@ -416,13 +430,14 @@ All release binaries are built from the tagged git commit. To verify a binary ma
 
 **Linux (Ubuntu 24.04)**
 ```bash
-sudo apt-get install -y g++ cmake make libleveldb-dev libsecp256k1-dev python3-pip
+sudo apt-get update
+sudo apt-get install -y g++ cmake make git libleveldb-dev libsecp256k1-dev python3-pip
 pip install "conan>=2.0,<3.0" --break-system-packages
 export PATH="$PATH:$HOME/.local/bin"   # so `conan` is on PATH (add to ~/.bashrc to persist)
 conan profile detect --force
 
 git clone https://github.com/frstrtr/c2pool.git
-cd c2pool && git checkout v0.2.12.1   # or the newest tag on the Releases page; omit to build master
+cd c2pool && git checkout v0.2.12.7   # or the newest tag on the Releases page; omit to build master
 mkdir build && cd build
 conan install .. --build=missing --output-folder=. --settings=build_type=Release
 cmake .. -DCMAKE_TOOLCHAIN_FILE=conan_toolchain.cmake -DCMAKE_BUILD_TYPE=Release
@@ -430,10 +445,13 @@ cmake --build . --target c2pool-ltc -j$(nproc)
 ./src/c2pool/c2pool-ltc
 ```
 
-This builds the LTC node (`c2pool-ltc`, the binary the release packages ship).
-For another coin use its target (`c2pool-dash`, `c2pool-btc`, … — see
-[Build targets](#build-targets)). The target `c2pool` is a dev alias of the
-same LTC node. For a production node, prefer the signed binaries from
+This builds the LTC node (`c2pool-ltc`). Every coin has its own target
+(`c2pool-dash`, `c2pool-btc`, … — see [Build targets](#build-targets)), and the
+release packages ship one binary per coin (`c2pool-<coin>-VERSION-…`). The
+target `c2pool` is a dev alias of the LTC node. **For Dash, build with BLS** —
+see [Dash: build with BLS](#dash-build-with-bls) below; the plain
+`--target c2pool-dash` build is BLS-dark. For a production node, prefer the
+signed binaries from
 [Releases](https://github.com/frstrtr/c2pool/releases) (see
 [Verify downloads](#verify-downloads)), or build **Release** as above: a Debug
 build (`build_type=Debug` + `--preset conan-debug`) is several times larger
@@ -471,6 +489,46 @@ shares before opening stratum to miners.
 
 Miners connect to stratum and set their LTC payout address as the username
 (p2pool convention). No `--address` flag needed.
+
+### Dash: build with BLS
+
+`c2pool-dash` verifies Dash quorum commitments, ChainLocks, InstantSend locks
+and governance votes with **dashbls** — the BLS12-381 library dashd itself
+links. It is not on ConanCenter, so it is built once from dash's own
+`src/dashbls` subtree by `scripts/build_dashbls.sh`. Continue from the Linux
+quick start above (still inside `build/`):
+
+```bash
+sudo apt-get install -y autoconf automake libtool libgmp-dev
+../scripts/build_dashbls.sh "$HOME/.c2pool-deps/dashbls"
+cmake .. -DCMAKE_TOOLCHAIN_FILE=conan_toolchain.cmake -DCMAKE_BUILD_TYPE=Release \
+  -DC2POOL_DASH_BLS=ON -DDASHBLS_ROOT="$HOME/.c2pool-deps/dashbls"
+cmake --build . --target c2pool-dash -j$(nproc)
+./src/c2pool/c2pool-dash --version   # the last line must end in: bls=dashbls
+```
+
+Check the last line of `--version`:
+
+| `--version` ends in | Meaning |
+|---|---|
+| `bls=dashbls` | BLS verification armed. This is what the release packages ship. |
+| `bls=stub` | Built with `-DC2POOL_DASH_ALLOW_NO_BLS=ON` (see below). Quorum/ChainLock/InstantSend/governance verification is inert, and the daemonless posture (a bare `c2pool-dash --run`) **refuses to start** with `[BLS-STUB] refusing to start` (exit 2). Only a dashd-attached node (`--coin-rpc`) runs on a stub build. `--allow-stub-bls` overrides the refusal for testing only — never in production. |
+
+**dashbls is found automatically** on a fresh configure (one that does not pass
+`-DC2POOL_DASH_BLS` at all) when it is installed under `$DASHBLS_ROOT`,
+`$HOME/.c2pool-deps/dashbls` (where the command above puts it), `/usr/local`
+or `/opt/dashbls`; configure then prints `dashbls auto-detected at <prefix>`.
+**Without dashbls the `c2pool-dash` target fails to build** with a message that
+says how to fix it; every other binary builds as usual. A stub build is only
+for a node attached to its own dashd, or for CI: configure with
+`-DC2POOL_DASH_ALLOW_NO_BLS=ON`.
+
+`-DC2POOL_DASH_BLS=ON` with the library missing is a configure-time error, not
+a silent fallback. The script builds the `src/dashbls` subtree of the dash
+release tag pinned in it (`DASH_REF`, currently `v23.1.7`) — dashd's own BLS
+code, not the standalone bls-signatures repo. It clones into
+`/tmp/dashbls-build`, so `git` and network access are needed. On macOS install the same tools with
+`brew install autoconf automake libtool gmp`.
 
 Full step-by-step guides: [Linux](doc/build-unix.md) | [macOS](doc/build-macos.md) | [Windows](doc/build-windows.md)
 
@@ -529,8 +587,15 @@ to the current tip.
   check on the file, *not* a signature: whoever can change the source can
   recompute the digest — it catches accidents, not malice);
 - **forward consistency** — every block replayed from the anchor re-derives
-  the projected payee and compares it against that block's real coinbase, so a
-  wrong anchor is falsified within a few blocks.
+  the projected payee and compares it against that block's real coinbase, and
+  a contradiction fails the bridge closed. This proves the payout state of
+  every masternode **paid inside the replayed window**. A wrong `scriptPayout`
+  or `nLastPaidHeight` of an eligible masternode not yet paid there surfaces
+  only at its first payment: our block names the wrong payee, the network
+  rejects it (`bad-cb-payee`), and that block's reward is lost. Nothing is paid
+  to a wrong address, because every node checks the payee. One full payment
+  cycle (every eligible masternode paid once, about 3,100 blocks on mainnet in
+  November 2026) covers the whole eligible set.
 
 **What you are trusting:** the membership and payout state of the masternode
 set *at the anchor height*. Nothing available to the node can prove it.
@@ -541,7 +606,9 @@ It is not implemented today.
 
 **Fail-closed by design.** If the anchor is missing, corrupt, for the wrong
 network, in the wrong chain position, further behind the tip than
-`--embedded-mn-bridge-max` (default 20000 blocks, ≈34 days), or contradicted
+`--embedded-mn-bridge-max` (default 40000 blocks, ≈69 days; measured from the
+persisted cursor when a node resumes, so in practice this only stops a cold
+start from an old release), or contradicted
 by a replayed block, c2pool logs the refusal at `ERROR` and **refuses to serve
 embedded DASH templates**. It falls back to a configured dashd, or serves
 nothing. It never guesses a masternode payee.
@@ -560,6 +627,62 @@ of the chain's. Carrying banned masternodes as **present but ineligible**
 
 Details, provenance of the shipped anchor, and the release-time re-pinning
 procedure: [`src/impl/dash/coin/checkpoints/README.md`](src/impl/dash/coin/checkpoints/README.md).
+
+#### Verifying the anchor yourself
+
+Each level reduces the trust the anchor needs; the last one removes it.
+
+| Level | What it proves | Status |
+|---|---|---|
+| 1. Reproduce | The pinned set equals what your own synced dashd reports at the anchor height, in all 17 columns of every masternode. | Available: `tools/dash/gen_mn_checkpoint.py compare` (below). |
+| 2. Attest | Several independent masternode operators reproduced the same content digest and signed it with a key tied to their masternode. | Procedure below; no round has been run yet. |
+| 3. Payout-verified window | Before the first template, every eligible masternode has been paid at least once in a replayed, PoW-validated block, so each `scriptPayout` and `nLastPaidHeight` is confirmed by a real coinbase. | Not enforced by code; a design is under review. Today a cold start from the h=2,563,800 anchor replays more than one full payment cycle before serving. |
+| 4. Full replay | No trust: the set is rebuilt from DIP-3 activation (~1.5M blocks). | Planned opt-in verify-mode; not implemented. |
+
+The anchor in this tree: height 2,563,800, blockhash
+`0000000000000016a129aa626ea761e08a389af18b4a64a2f8556596edd08e22`, content
+digest `a2fbc0b51258f8cf479a3035887c6927ae6e3c425f1b3eabdd16f212b6c9a6fc`.
+
+**How an operator attests an anchor**
+
+1. Check out the release tag and print the anchor's height, blockhash and
+   digests:
+
+   ```bash
+   python3 tools/dash/gen_mn_checkpoint.py verify \
+       src/impl/dash/coin/checkpoints/dash_mn_checkpoint_mainnet.inc --network mainnet
+   ```
+
+2. Compare it with your own synced dashd (Dash Core 24 or later):
+
+   ```bash
+   python3 tools/dash/gen_mn_checkpoint.py compare \
+       src/impl/dash/coin/checkpoints/dash_mn_checkpoint_mainnet.inc --network mainnet \
+       --rpc-url http://127.0.0.1:9998 --rpc-user <user> --rpc-password <password>
+   ```
+
+   The result must be `MATCH`, with the same content digest on both lines. Do
+   not compare the FILE digest with one you generate yourself: it also covers
+   the provenance lines and the key encoding, so it differs even when every row
+   agrees. The content digest does not.
+   [`checkpoints/README.md`](src/impl/dash/coin/checkpoints/README.md#reproducing-an-anchor-compare-and-the-content-digest)
+   has an offline variant from `dash-cli` captures.
+
+3. Publish the height, blockhash, content digest, your Dash Core version and
+   the result, signed with a key tied to your masternode. For example, with
+   the owner or collateral address in your wallet:
+
+   ```bash
+   dash-cli signmessage <address> "c2pool-dash anchor mainnet 2563800 <blockhash> content <content digest> MATCH"
+   ```
+
+   Anyone can check it with `dash-cli verifymessage <address> <signature>
+   "<message>"` and `dash-cli protx info <proTxHash>` (the address must be that
+   masternode's owner or collateral address).
+
+4. A release counts as attested when at least N independent operators have
+   published matching content digests (N: to be set by the project). Release
+   notes link the attestations.
 
 ### Startup examples
 
@@ -921,6 +1044,7 @@ legacy YAML key set.
 
 | CLI flag | YAML key | Default | Description |
 |----------|----------|---------|-------------|
+| `--version` | -- | | Print `c2pool-ltc <version> embedded=ltc,doge,nmc` (the coins with an embedded node in this binary) and exit |
 | `--integrated` | `integrated` | **true** | Full P2P pool mode |
 | `--solo` | `solo` | false | Solo pool (no sharechain) |
 | `--custodial` | `custodial` | false | Custodial pool (single-address coinbase) |
@@ -1119,7 +1243,7 @@ dashd-attached default OFF)
 | `--embedded-utxo-immature-serve-empty` | Serve coinbase-only until the UTXO view is mature. |
 | `--embedded-creditpool-publish-at-serve-tip` | Publish the derived credit pool at the serve tip (money path, default OFF). |
 | `--embedded-mined-commitment-index` | Arm the mined-commitment store on live tips. |
-| `--embedded-mn-bridge-max N` | Max blocks the pinned masternode anchor may lag the tip before the bridge refuses it as stale (default 20000, `mn_checkpoint_lane.hpp`). |
+| `--embedded-mn-bridge-max N` | Max blocks the pinned masternode anchor (or, on a resume, the persisted cursor) may lag the tip before the bridge refuses it as stale (default 40000, ≈69 days, `mn_checkpoint_lane.hpp`). |
 | `--embedded-mn-bridge-no-cursor` | Replay the whole window from the anchor on every start instead of resuming the saved cursor. |
 | `--embedded-fold-live PATH` + `--embedded-fold-live-expect HASH`, `--embedded-fold-checkscripts` | Wire a full-history UTXO fold store as the live input-pricing view (store hash must match); consensus-exact input-script check. |
 | `--embedded-utxo-fold-fees DBPATH` + `--embedded-utxo-fold-expect HEX` | Graduated fold fee pricing; both required together. |
@@ -1160,9 +1284,9 @@ dashd-attached default OFF)
 ### c2pool-btc — Bitcoin (SHA256d)
 
 Source: `src/c2pool/main_btc.cpp` — `print_usage()` and the `main()` parse
-loop. Unknown argument → `unknown arg: …` + usage, exit 1. There is **no
-`--version`** flag on this binary. A coin source is mandatory: without
-`--bitcoind` **or** `--coin-p2p-discover` the binary prints usage and exits 1.
+loop. Unknown argument → `unknown arg: …` + usage, exit 1. A coin source is
+mandatory: without `--bitcoind` **or** `--coin-p2p-discover` the binary prints
+usage and exits 1.
 
 ```bash
 # Daemonless public pool (btc.voidbind.com posture)
@@ -1178,6 +1302,7 @@ loop. Unknown argument → `unknown arg: …` + usage, exit 1. There is **no
 | Flag | Default | Meaning |
 |------|---------|---------|
 | `-h` / `--help` | | Usage and exit 0. |
+| `--version` | | Print `c2pool-btc <version>` and exit 0. |
 | `--data-dir PATH`, `--settings PATH`, `--dump-resolved-config`, `--ack-money-settings` | | Control plane, see [Settings file](#settings-file-toml--all-binaries). `--dump-resolved-config` runs before the mandatory-coin-source check, so it works with no endpoint. |
 | `--testnet` / `--testnet4` / `--regtest` | mainnet | Chain selection (testnet4 also sets the testnet flag). |
 | `--bitcoind HOST:PORT` | — | bitcoind **P2P** endpoint (8333 / 18333 / 48333 testnet4 / 18443 regtest). Required unless `--coin-p2p-discover`. |
@@ -1448,7 +1573,7 @@ See [above](#configuration-reference) for details.
 | `c2pool-btc` | Bitcoin parent (`src/c2pool/main_btc.cpp`) |
 | `c2pool-dgb` | DigiByte Scrypt parent (`src/c2pool/main_dgb.cpp`; `-DAUX_DOGE` for embedded DOGE) |
 | `c2pool-bch` | Bitcoin Cash parent (`src/c2pool/main_bch.cpp`) |
-| `c2pool-dash` | Dash parent (`src/c2pool/main_dash.cpp`) |
+| `c2pool-dash` | Dash parent (`src/c2pool/main_dash.cpp`); configure with `-DC2POOL_DASH_BLS=ON` — see [Dash: build with BLS](#dash-build-with-bls) |
 | `c2pool-bip110` | BIP-110 BLAKE2b fork (`src/c2pool/main_bip110.cpp`) |
 | `test_hardening` | Softfork gate + reply-matcher regression tests |
 | `test_share_messages` | V36 authority message decrypt/verify tests |

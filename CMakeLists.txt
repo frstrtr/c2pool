@@ -6,6 +6,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Reproducible builds: remap source/build/Conan-cache absolute paths in compiled
 # output (docs/xmr-lane/REPRODUCIBLE-BUILD.md). Before any add_subdirectory().
 include(${CMAKE_SOURCE_DIR}/cmake/ReproducibleBuild.cmake)
+# c2pool_linux_package_runpath(): $ORIGIN-relative RUNPATH for the binaries and
+# shared objects the Linux release tarball ships (see the module header).
+include(${CMAKE_SOURCE_DIR}/cmake/LinuxPackageRunpath.cmake)
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Release)
@@ -138,7 +141,36 @@ endif()
 # build without BLS, and ON means the caller has asserted the backend must be
 # linked. Set -DC2POOL_DASH_BLS_OPTIONAL=ON to restore the old warn-and-degrade
 # behaviour for a local probe build (never in CI or release).
+# AUTO-DETECT (operator 2026-11-16): a configure that does not mention
+# C2POOL_DASH_BLS turns it ON when dashbls is installed where
+# scripts/build_dashbls.sh and the README put it, so a plain source build of
+# c2pool-dash gets the real verifier without extra flags. An explicit
+# -DC2POOL_DASH_BLS=OFF (or a cache that already holds the option) is never
+# overridden. Not on MSVC, which has its own DLL flow below. Not under CI (the
+# CI environment variable, set by GitHub Actions): CI configures BLS
+# explicitly per job, and a self-hosted runner that has dashbls installed for
+# the real-BLS job must not silently turn every other job's stub build into a
+# BLS build (that registers BLS tests those jobs never build).
+if(NOT MSVC AND NOT DEFINED CACHE{C2POOL_DASH_BLS} AND NOT DEFINED ENV{CI})
+    foreach(_c2p_bls_prefix IN ITEMS "${DASHBLS_ROOT}" "$ENV{DASHBLS_ROOT}"
+                                     "$ENV{HOME}/.c2pool-deps/dashbls" "/usr/local" "/opt/dashbls")
+        if(_c2p_bls_prefix AND EXISTS "${_c2p_bls_prefix}/include/dashbls/bls.hpp"
+           AND (EXISTS "${_c2p_bls_prefix}/lib/libdashbls.a" OR EXISTS "${_c2p_bls_prefix}/lib/libbls-dash.a"))
+            set(C2POOL_DASH_BLS ON CACHE BOOL
+                "Link dashbls (BLS12-381) for E1 Phase-L real quorum-commitment verify")
+            if(NOT DASHBLS_ROOT)
+                set(DASHBLS_ROOT "${_c2p_bls_prefix}" CACHE PATH "dashbls install prefix")
+            endif()
+            message(STATUS "dashbls auto-detected at ${_c2p_bls_prefix}: C2POOL_DASH_BLS=ON")
+            break()
+        endif()
+    endforeach()
+endif()
 option(C2POOL_DASH_BLS "Link dashbls (BLS12-381) for E1 Phase-L real quorum-commitment verify" OFF)
+# A c2pool-dash WITHOUT BLS is a build error (the target fails; every other
+# target builds). It exists only for a node attached to its own dashd and for
+# CI's stub-honesty gate (#1671); both opt in with this flag.
+option(C2POOL_DASH_ALLOW_NO_BLS "Allow building c2pool-dash without dashbls (bls=stub; dashd-attached nodes and CI only)" OFF)
 option(C2POOL_DASH_BLS_OPTIONAL "Downgrade a missing dashbls under C2POOL_DASH_BLS=ON from FATAL_ERROR to a warning (local probe builds only)" OFF)
 set(C2POOL_DASH_BLS_AVAILABLE OFF)
 if(C2POOL_DASH_BLS AND MSVC)
@@ -258,6 +290,17 @@ if(C2POOL_DASH_BLS AND NOT C2POOL_DASH_BLS_AVAILABLE)
     else()
         message(FATAL_ERROR ${_dashbls_miss})
     endif()
+endif()
+# Say it at configure time, not only at runtime (#1671): without dashbls the
+# c2pool-dash target still builds, as bls=stub, and that binary refuses the
+# daemonless posture (a bare `c2pool-dash --run`). The release packages ship
+# bls=dashbls. Other coins are unaffected. src/c2pool/CMakeLists.txt repeats
+# this after c2pool-dash links, so it is the last thing such a build prints.
+if(NOT C2POOL_DASH_BLS_AVAILABLE)
+    message(STATUS "c2pool-dash: dashbls NOT linked -> bls=stub (daemonless start "
+                   "refused). For a production DASH node configure with "
+                   "-DC2POOL_DASH_BLS=ON -DDASHBLS_ROOT=<prefix> "
+                   "(scripts/build_dashbls.sh; README \"Dash: build with BLS\").")
 endif()
 
 # Enable testing only if GTest is found

@@ -20,15 +20,22 @@
 // ten empty-but-numeric fields as if they were measured.
 //
 // The honesty rule these lock, in both directions:
-//   * RELAY-LEARNED (no share_hash, no miner): found_locally is false,
-//     luck_method is "relayed", and the timing-derived fields (luck,
-//     time_to_find, expected_time) are honest-absent null, never 0.
+//   * RELAY-LEARNED (no share_hash, no miner): found_locally is false and
+//     luck_method is "relayed" (provenance); a field with nothing behind it
+//     is honest-absent null, never 0.
 //   * LOCALLY-FOUND (share_hash + miner present): found_locally is true,
 //     luck_method is a real timing label, and luck is a genuine number.
 //
 // Both FAIL WITHOUT THE FIX: before it there is no found_locally key at all,
 // the relay block reports luck_method=="first_block" not "relayed", and its
 // luck is 0.0 rather than null.
+//
+// 2026-11-16, luck as effort (operator ruling): the FIRST block of a chain is
+// effort 1.0 / luck 100 % by definition, and every later block -- a relayed
+// one too -- has a round and a luck (web_server_luck_test.cpp,
+// RelayedRowGetsALuck). What stays null is what cannot be had: a first
+// block's time_to_find (it has no round), and an expected time with no
+// difficulty or rate behind it.
 // ---------------------------------------------------------------------------
 
 namespace {
@@ -44,7 +51,9 @@ nlohmann::json find_block(const nlohmann::json& arr, const std::string& hash) {
 } // namespace
 
 // RELAY-LEARNED: no local share/miner -> found_locally false, luck_method
-// "relayed", timing fields honest-absent null (never a fabricated 0).
+// "relayed". It is the ledger's first block here: luck 100 % by definition,
+// and the fields with nothing behind them honest-absent null (never a
+// fabricated 0).
 TEST(RelayBlockHonesty, RelayLearnedBlockIsHonestlyLabelled) {
     core::MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
                              c2pool::address::Blockchain::LITECOIN);
@@ -66,12 +75,14 @@ TEST(RelayBlockHonesty, RelayLearnedBlockIsHonestlyLabelled) {
     EXPECT_EQ(blk["luck_method"].get<std::string>(), "relayed")
         << "must not fabricate a computed-luck label for a relay-learned block";
 
-    EXPECT_TRUE(blk["luck"].is_null())
-        << "relay-learned luck is unknown -- honest-absent null, not 0";
+    EXPECT_EQ(blk["effort_method"].get<std::string>(), "first_block");
+    ASSERT_TRUE(blk["luck"].is_number());
+    EXPECT_DOUBLE_EQ(blk["luck"].get<double>(), 100.0)
+        << "the first block is one found for one expected, never 0";
     EXPECT_TRUE(blk["time_to_find"].is_null())
-        << "relay-learned time_to_find is unknown -- honest-absent null, not 0";
+        << "a first block has no round -- honest-absent null, not 0";
     EXPECT_TRUE(blk["expected_time"].is_null())
-        << "relay-learned expected_time is unknown -- honest-absent null, not 0";
+        << "no difficulty and no rate were recorded -- honest-absent null, not 0";
 }
 
 // LOCALLY-FOUND: real share + miner -> found_locally true, real timing label,
@@ -99,13 +110,17 @@ TEST(RelayBlockHonesty, LocallyFoundBlockKeepsRealTiming) {
         << "a locally-found block must carry a real timing label, not 'relayed'";
 
     // 2026-08-05 revision: this block is the FIRST in its ledger, so no
-    // time_to_find exists and no luck was ever computed. The original
-    // assertion pinned that fabricated 0.0 as "a genuine measured number" —
+    // time_to_find exists and no luck was ever MEASURED. The original
+    // assertion pinned a fabricated 0.0 as "a genuine measured number" —
     // and the production node's luck-trend chart faithfully drew those zeros as a
-    // catastrophe. An uncomputed luck is honest-absent null on found blocks
-    // too; luck_method=first_block is the label that says why.
-    EXPECT_TRUE(blk["luck"].is_null())
-        << "a first block has no luck measurement; 0 would be a fabricated one";
+    // catastrophe. 2026-11-16 (operator ruling): the first block is effort
+    // 1.0 / luck 100 % by definition; luck_method=first_block says why, and
+    // luck_approximate stays null because nothing was measured.
+    ASSERT_TRUE(blk["luck"].is_number());
+    EXPECT_DOUBLE_EQ(blk["luck"].get<double>(), 100.0)
+        << "a first block is one found for one expected; 0 would be a fabricated loss";
+    EXPECT_TRUE(blk["time_to_find"].is_null());
+    EXPECT_TRUE(blk["luck_approximate"].is_null());
     EXPECT_EQ(blk["luck_method"].get<std::string>(), "first_block");
 }
 

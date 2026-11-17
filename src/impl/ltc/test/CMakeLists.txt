@@ -218,6 +218,17 @@ if (BUILD_TESTING AND GTest_FOUND)
     # tip is not a confirmation, a best-chain block confirms once 6 deep.
     # Same folding rule.
     #
+    # dashboard_found_block_test.cpp: one LTC find -> the same /recent_blocks
+    # row on the finder (ltc::dashboard::row_from_submit, fed by the stratum
+    # submit that minted the share) and on every peer (row_from_share, off the
+    # gossiped share): BIP34 block height (never the share absheight), the
+    # payout address (never raw pubkey-hash hex), the share's own hash (never
+    # the winner's parent). Field share of LTC 3211872. Same folding rule.
+    #
+    # found_block_wiring_test.cpp: source-structural guard that main_ltc.cpp's
+    # two LTC record sites use those builders and label the finder this_node.
+    # Same folding rule.
+    #
     # merged_found_record_test.cpp: a merged find on a stale job is recorded
     # as the block the share committed to (its hash and height from the
     # frozen snapshot), not the current work. Same folding rule.
@@ -403,6 +414,22 @@ if (BUILD_TESTING AND GTest_FOUND)
     # solo_payouts_test.cpp: --solo pays each miner to its login's own script
     # (P2SH, P2WPKH, P2WSH, P2TR; never P2PKH of a script hash, never the zero
     # key) and the outputs add up to the subsidy. Same folding rule.
+    #
+    # head_score_block_solution_test.cpp: think() head selection as in
+    # p2pool-merged-v36 (data.py:1690-1696, 2933-2967): a head whose share
+    # solved an LTC block is punish -1, one share of work ahead of an
+    # equal-work sibling and level with a branch one share longer; a full tie
+    # goes to the larger hash; Phase 5 walks back only while punish > 0; a
+    # merged-only (DOGE) solution earns nothing. REAL ShareTracker::think().
+    # Same folding rule.
+    #
+    # node_fee_job_target_test.cpp: --fee pays the operator the fee. A node-fee
+    # job (decide_job_payout gave its payout to the operator) has its miner's
+    # share bits (the login's rate key -> job_desired_share_target ->
+    # the REAL ShareTracker::compute_share_target band clip), and over many
+    # seeded jobs the operator's expected PPLNS weight equals the jobs the fee
+    # drew (was ~0.64 of them; field 0.08% of the block for --fee 1). Same
+    # folding rule.
     # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
     add_executable(share_test
         auto_ratchet_blocked_by_test.cpp
@@ -419,6 +446,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         cmpct_v3_mweb_state_test.cpp
         compact_block_merkle_test.cpp
         compact_block_mweb_relay_test.cpp
+        dashboard_found_block_test.cpp
         desired_request_pacer_test.cpp
         desired_version_tally_test.cpp
         doge_auxpow_witness_test.cpp
@@ -440,7 +468,9 @@ if (BUILD_TESTING AND GTest_FOUND)
         f11_donation_invariance_test.cpp
         found_block_peer_txid_test.cpp
         found_block_verify_test.cpp
+        found_block_wiring_test.cpp
         head_retention_test.cpp
+        head_score_block_solution_test.cpp
         header_pow_always_test.cpp
         hogaddr_spend_guard_test.cpp
         ingest_bounds_test.cpp
@@ -470,6 +500,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         mweb_next_header_test.cpp
         mweb_state_hash_binding_test.cpp
         mweb_tx_wire_test.cpp
+        node_fee_job_target_test.cpp
         own_share_reject_marks_test.cpp
         parent_fetch_rotation_test.cpp
         peer_block_pow_carry_test.cpp

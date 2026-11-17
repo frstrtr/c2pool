@@ -14,6 +14,8 @@
 
 C2P_PARAM("meta.version", Meta, BOOL, COMPILE_TIME_READONLY, C_ALL, LIT, "false", NONE, "print version and exit")
   C2P_ALIAS("meta.version", BIN_DASH, "--version", FLAG)
+  C2P_ALIAS("meta.version", BIN_LTC, "--version", FLAG)
+  C2P_ALIAS("meta.version", BIN_BTC, "--version", FLAG)
   C2P_ALIAS("meta.version", BIN_DGB, "--version", FLAG)
   C2P_ALIAS("meta.version", BIN_BCH, "--version", FLAG)
   C2P_ALIAS("meta.version", BIN_BIP110, "--version", FLAG)
@@ -191,6 +193,10 @@ C2P_PARAM("sharechain.no_p2p_relay", Sharechain, BOOL, RESTART, C_DASH|C_DGB, LI
   C2P_ALIAS("sharechain.no_p2p_relay", BIN_DASH, "--no-p2p-relay", FLAG)
   C2P_ALIAS("sharechain.no_p2p_relay", BIN_DGB, "--no-p2p-relay", FLAG)
 
+C2P_PARAM("sharechain.deferred_mint", Sharechain, TRISTATE_BOOL, RESTART, C_DASH, NONE, "", NONE, "queue a solve a busy tracker declines and mint it when the lock frees (default off; --deferred-mint enables)")
+  C2P_ALIAS("sharechain.deferred_mint", BIN_DASH, "--deferred-mint", FLAG)
+  C2P_ALIAS("sharechain.deferred_mint", BIN_DASH, "--no-deferred-mint", FLAG_NO_PREFIX)
+
 C2P_PARAM("sharechain.max_conns", Sharechain, INT64, RESTART, C_LTC, LIT, "0", NONE, "max connections")
   C2P_ALIAS("sharechain.max_conns", BIN_LTC, "--max-conns", VALUE)
 
@@ -357,6 +363,9 @@ C2P_PARAM("web.external_ip", WebOps, STRING, LIVE, C_DASH|C_LTC, LIT, "", NONE, 
 C2P_PARAM("web.dashboard_dir", WebOps, PATH, RESTART, C_DASH|C_LTC, LIT, "web-static", NONE, "dashboard static asset dir")
   C2P_ALIAS("web.dashboard_dir", BIN_DASH, "--dashboard-dir", VALUE)
   C2P_ALIAS("web.dashboard_dir", BIN_LTC, "--dashboard-dir", VALUE)
+
+C2P_PARAM("web.mempool_entry_probe", WebOps, BOOL, RESTART, C_DASH, LIT, "false", NONE, "direct-local GET /mempool_entry probe (fee-parity shadow tooling)")
+  C2P_ALIAS("web.mempool_entry_probe", BIN_DASH, "--mempool-entry-probe", FLAG)
 
 C2P_PARAM("web.explorer", WebOps, TRISTATE_BOOL, RESTART, C_DASH|C_BIP110, NONE, "", NONE, "loopback-only /api/explorer surface (default on)")
   C2P_ALIAS("web.explorer", BIN_DASH, "--explorer", FLAG)

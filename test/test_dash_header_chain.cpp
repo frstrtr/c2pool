@@ -907,3 +907,142 @@ TEST(DashHeaderChain, TestnetMinDifficultyBitsFollowTheBlockTime)
     EXPECT_EQ(dgw_bits_for_block_time(dgw, prev_bits, prev_time, prev_time + 7201, mn), dgw);
     EXPECT_EQ(dgw_bits_for_block_time(dgw, prev_bits, prev_time, prev_time + 605, mn), dgw);
 }
+
+// Head scoring's block-solution credit asks the header chain for the network
+// target of a block on top of a given parent (expected_bits_after): for any
+// parent on our best chain, not only the tip; nothing for an unknown parent,
+// a parent off the best chain, or an incomplete retarget window (where
+// dark_gravity_wave would answer powLimit, which is no target to check
+// against).
+TEST(DashHeaderChain, ExpectedBitsAfterAnyBestChainParent)
+{
+    auto mc = build_mined_chain(30, 1'800'000'000u);
+    auto& hc = *mc.hc;
+    const int64_t t = mc.tip_time + 150;
+
+    // The tip: the same answer as next_work_required_at.
+    const auto at_tip = hc.expected_bits_after(mc.hashes[30], t);
+    ASSERT_TRUE(at_tip.has_value());
+    EXPECT_EQ(*at_tip, hc.next_work_required_at(mc.hashes[30], t));
+
+    // A parent below the tip: DGW over the window ending at it, with its own
+    // bits and time for the min-difficulty rule.
+    const auto p29 = hc.get_header(mc.hashes[29]);
+    ASSERT_TRUE(p29.has_value());
+    const int64_t t29 = static_cast<int64_t>(p29->header.m_timestamp) + 150;
+    const auto below = hc.expected_bits_after(mc.hashes[29], t29);
+    ASSERT_TRUE(below.has_value());
+    auto anc = [&](uint32_t hh) { return hc.get_header_by_height(hh); };
+    EXPECT_EQ(*below, dgw_bits_for_block_time(dark_gravity_wave(anc, 29, mc.params),
+                                              p29->header.m_bits, p29->header.m_timestamp,
+                                              t29, mc.params));
+
+    // Unknown parent.
+    uint256 unknown;
+    unknown.SetHex("ab");
+    EXPECT_FALSE(hc.expected_bits_after(unknown, t).has_value());
+
+    // Fewer than DGW_PAST_BLOCKS headers ending at the parent.
+    EXPECT_FALSE(hc.expected_bits_after(mc.hashes[10], t).has_value());
+    EXPECT_FALSE(hc.expected_bits_after(mc.hashes[22], t).has_value());
+    EXPECT_FALSE(hc.expected_bits_after(mc.hashes[23], t).has_value())
+        << "below height DGW_PAST_BLOCKS Core answers powLimit: no target to check against";
+    EXPECT_TRUE(hc.expected_bits_after(mc.hashes[24], t).has_value()) << "heights 1..24: a full window";
+
+    // A parent off the best chain: a mined sibling of hashes[29].
+    const auto fork = mine_header(mc.hashes[28], p29->header.m_timestamp + 1,
+                                  mc.params.pow_limit.GetCompact(), mc.params.pow_limit);
+    ASSERT_TRUE(hc.add_header(fork));
+    ASSERT_TRUE(hc.has_header(x11_hash(fork)));
+    EXPECT_EQ(hc.get_header_by_height(30)->hash, mc.hashes[30]) << "the tip did not move";
+    EXPECT_FALSE(hc.expected_bits_after(x11_hash(fork), t).has_value());
+}
+
+// A chain seeded from a fast-start anchor: the anchor entry is synthetic
+// (bits 0, time 0). A retarget window that still contains it is no network
+// target (dark_gravity_wave would average a zero target in and answer a far
+// easier one), so expected_bits_after gives nothing until the window is 24
+// real headers above the anchor.
+TEST(DashHeaderChain, ExpectedBitsAfterSkipsWindowsWithTheSyntheticAnchor)
+{
+    auto params = make_easy_test_params();
+    DashChainParams::Checkpoint cp{};
+    cp.height = 1000;
+    cp.hash.SetHex("00000000000000000000000000000000000000000000000000000000000000cc");
+    params.fast_start_checkpoint = cp;
+    HeaderChain hc(params, /*db_path=*/"");
+    ASSERT_TRUE(hc.init());
+    ASSERT_EQ(hc.height(), 1000u);
+    std::vector<uint256> hashes{cp.hash};
+    uint32_t t = 1'800'000'000u;
+    for (int i = 0; i < 30; ++i) {
+        t += 150u;
+        auto h = mine_header(hashes.back(), t, params.pow_limit.GetCompact(), params.pow_limit);
+        ASSERT_TRUE(hc.add_header(h)) << "mined header " << (i + 1) << " above the anchor";
+        hashes.push_back(x11_hash(h));
+    }
+    ASSERT_EQ(hc.height(), 1030u);
+    EXPECT_FALSE(hc.expected_bits_after(hashes[0], t).has_value()) << "the anchor itself";
+    EXPECT_FALSE(hc.expected_bits_after(hashes[23], t).has_value())
+        << "anchor + 23: the window still holds the synthetic anchor";
+    EXPECT_TRUE(hc.expected_bits_after(hashes[24], t).has_value())
+        << "anchor + 24: 24 real headers";
+}
+
+// An old parent is refused: the block-solution credit checks a share's
+// header bits against its parent's expected bits, and an old parent's
+// historic bits are easier whenever the difficulty rose since. With
+// max_depth only parents within that many blocks of the tip are answered.
+TEST(DashHeaderChain, ExpectedBitsAfterRefusesAParentDeeperThanMaxDepth)
+{
+    auto mc = build_mined_chain(40, 1'800'000'000u);
+    auto& hc = *mc.hc;
+    const int64_t t = mc.tip_time + 150;
+    EXPECT_TRUE(hc.expected_bits_after(mc.hashes[40], t, 6).has_value()) << "the tip";
+    EXPECT_TRUE(hc.expected_bits_after(mc.hashes[34], t, 6).has_value()) << "6 below the tip";
+    EXPECT_FALSE(hc.expected_bits_after(mc.hashes[33], t, 6).has_value()) << "7 below the tip";
+    EXPECT_TRUE(hc.expected_bits_after(mc.hashes[33], t).has_value()) << "no depth bound by default";
+}
+
+// ─── network hashrate (Dash Core getnetworkhashps) ─────────────────────────
+// The dashboard used tip difficulty * 2^32 / 150, which DarkGravityWave swings
+// ~2x within hours on Dash (11-16: 5.6 PH/s against getnetworkhashps 3.25
+// PH/s). HeaderChain::network_hashps is Dash Core's GetNetworkHashPS: chain
+// work over the window divided by the window's max - min block time.
+
+// RED on master (no helper): Dash Core's own answer at mainnet h=2573376.
+// Vector from a Dash Core 24.0.2 node: getnetworkhashps 576 2573376 =
+// 3251162766216974, chainwork at 2573376 and 2572800, and the min / max block
+// time over 2572800..2573376.
+TEST(DashNetworkHashps, MatchesDashCoreGetNetworkHashpsAtMainnetHeight)
+{
+    uint256 tip, base;
+    tip.SetHex("00000000000000000000000000000000000000000000c274b3be21c35c4e1f9f");
+    base.SetHex("00000000000000000000000000000000000000000000c264dc173e55c7f73f67");
+    const double hps = network_hashps_from(tip, base, 1794763522, 1794853410);
+    EXPECT_NEAR(hps, 3251162766216974.0, 1.0);
+}
+
+TEST(DashNetworkHashps, NoGrowthOrNoTimeSpanIsZero)
+{
+    uint256 a, b;
+    a.SetHex("0000000000000000000000000000000000000000000000000000000000001000");
+    b.SetHex("0000000000000000000000000000000000000000000000000000000000002000");
+    EXPECT_EQ(network_hashps_from(b, a, 100, 100), 0.0) << "min == max time (dashd returns 0)";
+    EXPECT_EQ(network_hashps_from(b, a, 200, 100), 0.0) << "inverted span";
+    EXPECT_EQ(network_hashps_from(a, b, 100, 200), 0.0) << "work does not grow";
+    EXPECT_EQ(network_hashps_from(a, a, 100, 200), 0.0) << "equal work";
+    EXPECT_GT(network_hashps_from(b, a, 100, 200), 0.0);
+}
+
+// The HeaderChain method walks a real (mined) window: 10 blocks at the
+// pow-limit target, 150 s apart => 10 * proof / 1500 s.
+TEST(DashNetworkHashps, HeaderChainWindowOverAMinedChain)
+{
+    auto mc = build_mined_chain(40, 1'800'000'000u);
+    const auto& hc = *mc.hc;
+    const double proof = get_block_proof(mc.params.pow_limit.GetCompact()).getdouble();
+    EXPECT_NEAR(hc.network_hashps(10), 10.0 * proof / 1500.0, 10.0 * proof / 1500.0 * 1e-12);
+    EXPECT_EQ(hc.network_hashps(40), 0.0) << "the window must lie above the chain's first entry";
+    EXPECT_EQ(hc.network_hashps(0), 0.0);
+}
