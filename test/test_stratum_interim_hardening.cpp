@@ -51,6 +51,14 @@
 //      windowed DOA rate the miner page shows leaves them out; a genuinely
 //      expired job of this connection still counts. The window rolls off.
 //
+//   8. ZOMBIE SESSIONS ON LTC — the LTC node's StratumConfig
+//      (ltc::default_stratum_config, what main_ltc.cpp starts from) turns on
+//      the BTC/DASH protections; under it a connection that never authorizes
+//      is dropped at the deadline, and an unauthorized session silent past
+//      the idle timeout is reaped while a quiet authorized rig stays. The
+//      deadlines are cut to test size where they are on and left off where
+//      they are off.
+//
 // WIRE SAFETY / BYTE-PARITY: everything here is admission/eviction/memory
 // only — no notify param, coinbase (coinb1‖en1‖en2‖coinb2), or share byte
 // changes. The notify/coinbase/share BYTE-PARITY KAT is NOT this file: for
@@ -73,6 +81,7 @@
 #include <core/stratum_work_source.hpp>
 #include <core/uint256.hpp>
 #include <core/web_server.hpp>   // MiningInterface: worker registry + /miner_stats
+#include <impl/ltc/stratum_defaults.hpp>   // the LTC node's StratumConfig (main_ltc.cpp)
 
 #include <atomic>
 #include <chrono>
@@ -280,6 +289,7 @@ public:
         sock_.connect(tcp::endpoint(asio::ip::make_address("127.0.0.1"), port), ec);
         return !ec;
     }
+
 
     void send_json(const json& j)
     {
@@ -1005,4 +1015,134 @@ TEST(StratumInterimHardening, DrainHooksRefuseAndDropExactly)
     Client c4;
     ASSERT_TRUE(c4.connect(h.port));
     EXPECT_TRUE(c4.subscribe()) << "accepting=true must restore the accept path";
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Zombie sessions on LTC (+ merged DOGE). Field: an LTC node held 100/100
+// stratum slots and refused every real miner (refused_total=264674) because
+// LTC left every StratumConfig zombie protection off: a half-open NAT-dead
+// socket or a connection that never authorizes kept its slot forever.
+// ════════════════════════════════════════════════════════════════════════════
+namespace {
+
+// The LTC node's compiled StratumConfig with each deadline that is ON cut to a
+// test-sized value; a deadline that is OFF stays off. So these KATs see the
+// node LTC actually runs: where LTC leaves a protection off, they see it off.
+core::stratum::StratumConfig ltc_config_short(uint32_t handshake_s, uint32_t idle_s,
+                                              uint32_t keepalive_notify_s)
+{
+    auto c = ltc::default_stratum_config();
+    if (c.handshake_timeout_sec) c.handshake_timeout_sec = handshake_s;
+    if (c.session_idle_timeout_sec) c.session_idle_timeout_sec = idle_s;
+    if (c.keepalive_notify_sec) c.keepalive_notify_sec = keepalive_notify_s;
+    return c;
+}
+
+double seconds_since(std::chrono::steady_clock::time_point t0)
+{
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+}
+
+// The session behind c is still open and served: read what is already
+// buffered (a closed socket shows here, after its buffered lines), then one
+// more notify must arrive after a notify_all.
+bool still_served(ServerHarness& h, Client& c)
+{
+    for (int i = 0; i < 200 && c.read_line(300ms); ++i) {}
+    if (c.was_closed_by_peer()) return false;
+    const size_t had = c.jobs.size();
+    h.notify_storm(1);
+    return c.collect_notifies(had + 1, 5000ms) && !c.was_closed_by_peer();
+}
+
+}  // namespace
+
+// The config main_ltc.cpp starts from (before CLI/YAML) has the BTC/DASH
+// protections on, with the BTC/DASH values.
+TEST(LtcStratumZombie, DefaultsTurnTheProtectionsOn)
+{
+    const auto c = ltc::default_stratum_config();
+    EXPECT_EQ(c.coin_symbol, "LTC");
+    EXPECT_TRUE(c.tcp_keepalive_enabled);
+    EXPECT_EQ(c.tcp_keepalive_idle_sec, 60u);
+    EXPECT_EQ(c.tcp_keepalive_interval_sec, 10u);
+    EXPECT_EQ(c.tcp_keepalive_count, 3u);
+    EXPECT_EQ(c.handshake_timeout_sec, 30u);
+    EXPECT_EQ(c.session_idle_timeout_sec, 1800u);
+    EXPECT_EQ(c.max_write_queue_depth, 256u);
+    EXPECT_EQ(c.keepalive_notify_sec, 25u);
+    EXPECT_EQ(c.max_stratum_connections, 100u);
+}
+
+// A connection that never authorizes -- a bare TCP probe, or one that
+// subscribes and stops -- is closed at the authorize deadline. A miner that
+// authorizes is kept past it.
+TEST(LtcStratumZombie, NeverAuthorizingConnectionIsDroppedAtTheDeadline)
+{
+    ServerHarness h;
+    h.ws->cfg = ltc_config_short(/*handshake*/ 1, /*idle*/ 1800, /*keepalive notify*/ 25);
+    ASSERT_TRUE(h.start());
+
+    Client miner;
+    ASSERT_TRUE(miner.connect(h.port));
+    ASSERT_TRUE(miner.subscribe());
+    ASSERT_TRUE(miner.authorize("ltcminer1"));
+
+    const auto t0 = std::chrono::steady_clock::now();
+    Client probe;                       // connects, sends nothing
+    ASSERT_TRUE(probe.connect(h.port));
+    Client subscriber;                  // subscribes, never authorizes
+    ASSERT_TRUE(subscriber.connect(h.port));
+    ASSERT_TRUE(subscriber.subscribe());
+
+    EXPECT_TRUE(probe.wait_closed(6000ms)) << "a bare probe must not keep its slot";
+    EXPECT_TRUE(subscriber.wait_closed(6000ms)) << "a never-authorizing session must not keep its slot";
+    EXPECT_GE(seconds_since(t0), 0.9) << "closed at the deadline, not on accept";
+
+    // The authorized miner is past the deadline too and still served.
+    EXPECT_TRUE(still_served(h, miner)) << "authorize must disarm the deadline";
+}
+
+// The idle reaper counts INBOUND lines only. An unauthorized session that
+// sends nothing is reaped although the node keeps sending it keepalive
+// notifies; an unauthorized session that keeps talking is kept; an authorized
+// rig that sends nothing (a low hashrate on a high fixed difficulty) is kept,
+// because TCP keepalive -- on for LTC -- vouches for its socket.
+TEST(LtcStratumZombie, IdleReaperReapsInboundSilenceButKeepsAQuietRig)
+{
+    ServerHarness h;
+    // No authorize deadline here, so only the reaper can close a session. The
+    // reaper sweeps every max(15 s, min(60 s, timeout / 2)): first sweep at 15 s.
+    h.ws->cfg = ltc_config_short(/*handshake*/ 0, /*idle*/ 2, /*keepalive notify*/ 1);
+    ASSERT_TRUE(h.start());
+
+    Client rig;          // authorized, then silent
+    ASSERT_TRUE(rig.connect(h.port));
+    ASSERT_TRUE(rig.subscribe());
+    ASSERT_TRUE(rig.authorize("ltcminer1"));
+    Client zombie;       // subscribed, then silent (receives keepalive notifies)
+    ASSERT_TRUE(zombie.connect(h.port));
+    ASSERT_TRUE(zombie.subscribe());
+    Client talker;       // subscribed, never authorizes, keeps sending lines
+    ASSERT_TRUE(talker.connect(h.port));
+    ASSERT_TRUE(talker.subscribe());
+
+    const auto t0 = std::chrono::steady_clock::now();
+    bool zombie_closed = false;
+    int zombie_notifies = 0;
+    int ping = 100;
+    while (!zombie_closed && seconds_since(t0) < 22.0) {
+        talker.send_json({{"id", ping++}, {"method", "mining.extranonce.subscribe"},
+                          {"params", json::array()}});
+        const auto line = zombie.read_line(400ms);
+        if (line && line->find("mining.notify") != std::string::npos)
+            ++zombie_notifies;
+        zombie_closed = zombie.was_closed_by_peer();
+    }
+    EXPECT_TRUE(zombie_closed) << "an unauthorized session silent past the idle timeout must be reaped";
+    EXPECT_GE(zombie_notifies, 3) << "the zombie was sent keepalive notifies meanwhile";
+
+    // The quiet rig and the talker were swept over too and are still served.
+    EXPECT_TRUE(still_served(h, rig)) << "a quiet authorized rig must not be reaped";
+    EXPECT_TRUE(still_served(h, talker)) << "inbound lines must keep a session";
 }

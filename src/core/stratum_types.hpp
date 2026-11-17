@@ -107,9 +107,10 @@ struct StratumConfig {
     // immortal subscribed session that keeps drawing full per-notify job builds
     // (observed: 66 sockets for ~23 rigs). At the default cap these zombies also
     // lock real rigs out (admission control). These knobs bound that leak. ALL
-    // default OFF/neutral so LTC/BTC/DGB behaviour is BYTE-UNCHANGED; DASH opts
-    // in (impl/dash/stratum/work_source.cpp ctor). Transport/liveness only --
-    // zero wire-byte change and consensus-neutral.
+    // default OFF/neutral; DASH, BTC and LTC opt in (impl/dash/stratum/
+    // work_source.cpp, impl/btc/stratum/work_source.cpp,
+    // impl/ltc/stratum_defaults.hpp). Transport/liveness only -- zero
+    // wire-byte change and consensus-neutral.
     //
     // (a) OS TCP keepalive: the kernel probes an idle peer and errors the
     //     pending async_read on a dead NAT path, which runs the normal
