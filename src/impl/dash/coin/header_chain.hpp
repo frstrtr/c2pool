@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <functional>
 #include <iomanip>
 #include <map>
@@ -178,6 +179,17 @@ inline bool check_pow(const uint256& pow_hash, uint32_t bits, const uint256& pow
     if (negative || target.IsNull() || overflow || target > pow_limit)
         return false;
     return pow_hash <= target;
+}
+
+/// Dash Core GetNetworkHashPS arithmetic (rpc/mining.cpp): the chain work
+/// between the window's base and tip divided by the span between the earliest
+/// and latest block time in the window. 0 when the work does not grow or the
+/// span is not positive (dashd returns 0 for minTime == maxTime).
+inline double network_hashps_from(const uint256& tip_work, const uint256& base_work,
+                                  int64_t min_time, int64_t max_time)
+{
+    if (tip_work <= base_work || max_time <= min_time) return 0.0;
+    return (tip_work - base_work).getdouble() / static_cast<double>(max_time - min_time);
 }
 
 inline uint256 get_block_proof(uint32_t bits) {
@@ -408,6 +420,30 @@ public:
         return m_best_work;
     }
 
+    /// Dash Core getnetworkhashps(lookup): the chain work of the last `lookup`
+    /// blocks divided by the span between the earliest and latest timestamp in
+    /// that window (rpc/mining.cpp GetNetworkHashPS). The tip difficulty alone
+    /// is a poor estimate on Dash: DarkGravityWave follows rented hashrate, so
+    /// difficulty swings ~2x within hours. 0 when fewer than `lookup` headers
+    /// sit above the fast-start anchor (the caller falls back), or the span is
+    /// not positive.
+    double network_hashps(uint32_t lookup = 576) const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_tip.IsNull() || lookup == 0 || m_tip_height <= lookup) return 0.0;
+        const auto tip = get_header_by_height_internal(m_tip_height);
+        const auto base = get_header_by_height_internal(m_tip_height - lookup);
+        if (!tip || !base || tip->chain_work <= base->chain_work) return 0.0;
+        int64_t min_time = tip->header.m_timestamp, max_time = min_time;
+        for (uint32_t h = m_tip_height - lookup; h < m_tip_height; ++h) {   // base included, as dashd
+            const auto e = get_header_by_height_internal(h);
+            if (!e) return 0.0;   // a hole in the window: no estimate
+            const int64_t t = e->header.m_timestamp;
+            if (t < min_time) min_time = t;
+            if (t > max_time) max_time = t;
+        }
+        return network_hashps_from(tip->chain_work, base->chain_work, min_time, max_time);
+    }
+
     // Phase C-TEMPLATE step 9: bits the next block must satisfy.
     // Wraps DarkGravityWave3 over the current tip + 24-block window.
     // Returns 0 when we don't yet have enough headers to retarget
@@ -435,6 +471,39 @@ public:
         const auto tip = get_header_by_height_internal(m_tip_height);
         if (!tip) return 0;
         return dgw_bits_for_block_time(dgw, tip->header.m_bits, tip->header.m_timestamp,
+                                       block_time, m_params);
+    }
+
+    /// The bits a block on top of `prev_hash` must carry at `block_time`
+    /// (Dash Core GetNextWorkRequired(pindexPrev, pblock)) for any `prev_hash`
+    /// on our best chain, not only the tip. nullopt when `prev_hash` is
+    /// unknown, off the best chain, below height DGW_PAST_BLOCKS (Core
+    /// answers powLimit there), or any of the DGW_PAST_BLOCKS headers ending
+    /// at it is missing (below a fast-start anchor) or is the synthetic
+    /// anchor itself (bits 0, time 0: dark_gravity_wave would average a zero
+    /// target into the window). None of those is a network target to check
+    /// against. `max_depth`: nullopt also when `prev_hash` is more than this
+    /// many blocks below our tip, so a caller can refuse an old parent whose
+    /// historic bits are easier than today's.
+    std::optional<uint32_t> expected_bits_after(const uint256& prev_hash, int64_t block_time,
+                                                uint32_t max_depth = UINT32_MAX) const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        auto it = m_headers.find(prev_hash);
+        if (it == m_headers.end()) return std::nullopt;
+        const uint32_t h = it->second.height;
+        auto at = m_height_index.find(h);
+        if (at == m_height_index.end() || at->second != prev_hash) return std::nullopt;
+        if (h > m_tip_height || m_tip_height - h > max_depth) return std::nullopt;
+        if (h < static_cast<uint32_t>(DGW_PAST_BLOCKS)) return std::nullopt;
+        for (uint32_t n = 0; n < static_cast<uint32_t>(DGW_PAST_BLOCKS); ++n) {
+            const auto e = get_header_by_height_internal(h - n);
+            if (!e || e->header.m_bits == 0) return std::nullopt;
+        }
+        auto get_ancestor = [this](uint32_t hh) -> std::optional<IndexEntry> {
+            return this->get_header_by_height_internal(hh);
+        };
+        const uint32_t dgw = dark_gravity_wave(get_ancestor, h, m_params);
+        return dgw_bits_for_block_time(dgw, it->second.header.m_bits, it->second.header.m_timestamp,
                                        block_time, m_params);
     }
 

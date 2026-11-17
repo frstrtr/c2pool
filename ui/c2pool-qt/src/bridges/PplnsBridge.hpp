@@ -31,6 +31,17 @@ public:
     Q_INVOKABLE void getCurrentPayouts(int requestId);
     Q_INVOKABLE void getMinerDetail(int requestId, const QString& address);
 
+    // ── Feeds of the scene-engine PPLNS treemap (dist/scene.js) ─────
+    // Tile weight = /current_payouts {address: coins}, i.e. what the
+    // payout code pays; merged children from /current_merged_payouts;
+    // ★ marks from the /stratum_stats worker keys. Same reply path as
+    // above (responseReady / responseFailed by requestId).
+    // getCurrentPayouts (/pplns/current) stays for the legacy view.
+
+    Q_INVOKABLE void getPayouts(int requestId);
+    Q_INVOKABLE void getMergedPayouts(int requestId);
+    Q_INVOKABLE void getStratumStats(int requestId);
+
     // ── Cancellation (delta v1 §A.1) ────────────────────────────────
 
     Q_INVOKABLE void cancelRequest(int requestId);

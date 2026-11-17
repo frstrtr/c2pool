@@ -20,6 +20,14 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <string>
+
+#ifndef _WIN32
+#include <arpa/inet.h>
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <netinet/in.h>
+#endif
 
 #include <boost/asio.hpp>
 
@@ -110,6 +118,139 @@ TEST(ListenerFamily, AutoAcceptsIPv4Client)
     ctx.run_for(std::chrono::seconds(2));
     EXPECT_FALSE(cec) << "IPv4 client connect: " << cec.message();
     EXPECT_TRUE(got) << "acceptor did not accept the IPv4 client";
+}
+
+// ── --listen HOST:PORT honours HOST (DASH, 2026-11-17) ───────────────────────
+// main_dash parsed --listen [HOST:]PORT but bound every interface: a node
+// started with --listen 127.0.0.1:N was reachable on its LAN address while its
+// startup line said 127.0.0.1. bind_listener_at binds exactly one address.
+
+// A non-loopback IPv4 address of this host, or "" when there is none (a
+// network-less container): the reachability half of the KAT then skips.
+std::string non_loopback_ipv4()
+{
+#ifndef _WIN32
+    ifaddrs* ifs = nullptr;
+    if (getifaddrs(&ifs) != 0) return "";
+    std::string out;
+    for (ifaddrs* i = ifs; i; i = i->ifa_next) {
+        if (!i->ifa_addr || i->ifa_addr->sa_family != AF_INET) continue;
+        if (i->ifa_flags & IFF_LOOPBACK) continue;
+        if (!(i->ifa_flags & IFF_UP)) continue;
+        char buf[INET_ADDRSTRLEN] = {};
+        const auto* sin = reinterpret_cast<const sockaddr_in*>(i->ifa_addr);
+        if (inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof(buf))) { out = buf; break; }
+    }
+    freeifaddrs(ifs);
+    return out;
+#else
+    return "";
+#endif
+}
+
+// A bounded connect (2 s): a refused, unreachable or filtered address is "no",
+// never a hang.
+bool connects(io::io_context& ctx, const std::string& ip, uint16_t port)
+{
+    io::ip::tcp::socket client(ctx);
+    bool done = false, ok = false;
+    client.async_connect(io::ip::tcp::endpoint(io::ip::make_address(ip), port),
+                         [&](boost::system::error_code ec) { done = true; ok = !ec; });
+    ctx.restart();
+    ctx.run_for(std::chrono::seconds(2));
+    if (!done) {
+        boost::system::error_code ig;
+        client.close(ig);
+        ctx.restart();
+        ctx.run_for(std::chrono::milliseconds(100));
+    }
+    return done && ok;
+}
+
+TEST(ListenerHost, LoopbackHostIsNotReachableOnTheLanAddress)
+{
+    io::io_context ctx;
+    io::ip::tcp::acceptor a(ctx);
+    boost::system::error_code ec;
+    const auto r = core::bind_listener_at(a, "127.0.0.1", 0, ec);
+    ASSERT_TRUE(r.ok) << ec.message();
+    EXPECT_FALSE(r.ipv6);
+    EXPECT_EQ(a.local_endpoint().address().to_string(), "127.0.0.1")
+        << "bound to exactly the requested address, not the wildcard";
+    a.listen(io::socket_base::max_listen_connections, ec);
+    ASSERT_FALSE(ec) << ec.message();
+
+    EXPECT_TRUE(connects(ctx, "127.0.0.1", r.port)) << "reachable on the address it was asked for";
+    const std::string lan = non_loopback_ipv4();
+    if (lan.empty()) GTEST_SKIP() << "no non-loopback IPv4 on this runner";
+
+    // Control first: a wildcard listener IS reachable on that address. If it
+    // is not (a firewall), the refusal below would prove nothing: skip.
+    io::ip::tcp::acceptor w(ctx);
+    const auto rw = core::bind_listener(w, 0, core::ListenFamily::V4, ec);
+    ASSERT_TRUE(rw.ok) << ec.message();
+    w.listen(io::socket_base::max_listen_connections, ec);
+    ASSERT_FALSE(ec);
+    if (!connects(ctx, lan, rw.port))
+        GTEST_SKIP() << "the wildcard control is not reachable on " << lan << " (filtered runner)";
+
+    EXPECT_FALSE(connects(ctx, lan, r.port))
+        << "a 127.0.0.1 listener must not accept on the LAN address " << lan;
+}
+
+TEST(ListenerHost, IPv6LiteralWithBracketsBindsThatAddress)
+{
+    if (!ipv6_available()) GTEST_SKIP() << "no IPv6 loopback on this runner";
+    io::io_context ctx;
+    io::ip::tcp::acceptor a(ctx);
+    boost::system::error_code ec;
+    const auto r = core::bind_listener_at(a, "[::1]", 0, ec);
+    ASSERT_TRUE(r.ok) << ec.message();
+    EXPECT_TRUE(r.ipv6);
+    EXPECT_FALSE(r.ipv4_mapped) << "a specific IPv6 address is bound v6-only";
+    EXPECT_EQ(a.local_endpoint().address().to_string(), "::1");
+}
+
+TEST(ListenerHost, HostnameOrForeignAddressIsRefusedNotWidened)
+{
+    io::io_context ctx;
+    boost::system::error_code ec;
+    {
+        io::ip::tcp::acceptor a(ctx);
+        const auto r = core::bind_listener_at(a, "localhost", 0, ec);
+        EXPECT_FALSE(r.ok) << "a hostname is refused (numeric address required)";
+        EXPECT_TRUE(ec);
+        EXPECT_FALSE(a.is_open());
+    }
+    {
+        io::ip::tcp::acceptor a(ctx);
+        ec.clear();
+        // TEST-NET-3 (RFC 5737): never an address of this host.
+        const auto r = core::bind_listener_at(a, "203.0.113.7", 0, ec);
+        EXPECT_FALSE(r.ok) << "an address this host does not have cannot be bound";
+        EXPECT_FALSE(a.is_open()) << "and nothing is left listening anywhere else";
+    }
+}
+
+// Every spelling of the unspecified address is the wildcard (the unchanged
+// every-interface path), and bind_listener_at refuses it rather than binding
+// every interface IPv6-only.
+TEST(ListenerHost, WildcardSpellings)
+{
+    for (const char* h : {"", "*", "0.0.0.0", "::", "[::]", "::0", "[::0]", "0:0:0:0:0:0:0:0"})
+        EXPECT_TRUE(core::is_wildcard_listen_host(h)) << "'" << h << "'";
+    for (const char* h : {"127.0.0.1", "::1", "[::1]", "192.168.1.5", "localhost"})
+        EXPECT_FALSE(core::is_wildcard_listen_host(h)) << h;
+
+    io::io_context ctx;
+    for (const char* h : {"::0", "[::]", "0.0.0.0"}) {
+        io::ip::tcp::acceptor a(ctx);
+        boost::system::error_code ec;
+        const auto r = core::bind_listener_at(a, h, 0, ec);
+        EXPECT_FALSE(r.ok) << h << ": a wildcard is not a single address";
+        EXPECT_TRUE(ec) << h;
+        EXPECT_FALSE(a.is_open()) << h;
+    }
 }
 
 }  // namespace

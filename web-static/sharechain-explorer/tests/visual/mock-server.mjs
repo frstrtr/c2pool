@@ -70,6 +70,39 @@ const server = createServer((req, res) => {
     const raw = readFileSync(join(FIXTURES, 'merged_payouts.json'), 'utf8');
     return serveJson(res, raw);
   }
+  // MOCK_PAYOUTS=1 (tests/visual/capture-pplns.mjs only): serve the
+  // PPLNS view's inputs. /current_payouts mirrors the merged fixture's
+  // parent amounts; two miners are "on this node". Off by default, so
+  // the pixel-diff gate sees exactly what it always did.
+  if (process.env.MOCK_PAYOUTS === '1' && path === '/current_payouts') {
+    const merged = JSON.parse(readFileSync(join(FIXTURES, 'merged_payouts.json'), 'utf8'));
+    return serveJson(res, Object.fromEntries(Object.entries(merged).map(([a, v]) => [a, v.amount])));
+  }
+  if (process.env.MOCK_PAYOUTS === '1' && path === '/pplns/current') {
+    // The classic PPLNS View accepts the legacy merged-payouts shape.
+    const raw = readFileSync(join(FIXTURES, 'merged_payouts.json'), 'utf8');
+    return serveJson(res, raw);
+  }
+  if (process.env.MOCK_PAYOUTS === '1' && path === '/stratum_stats') {
+    return serveJson(res, { pool: {}, workers: { 'XMINEADDRESS.rig1': {}, 'XminerDDDDD4.s19': {} } });
+  }
+  // MOCK_OFFCHAIN=1 (tests/visual/capture-fluid.mjs only): a found-block
+  // ledger with one block whose share is NOT in the window (an off-chain
+  // share, drawn as a ▣ cell in Fluid), one on-chain block and one older
+  // than the window. Rows are derived from the window fixture. Off by
+  // default, so the pixel-diff gate is unaffected.
+  if (process.env.MOCK_OFFCHAIN === '1' && path === '/recent_blocks') {
+    const { shares } = JSON.parse(readFileSync(join(FIXTURES, 'window.json'), 'utf8'));
+    const oldest = Math.min(...shares.map((s) => s.t));
+    return serveJson(res, [
+      { hash: '0000000000000019' + 'f'.repeat(48), share: 'feedface' + 'e'.repeat(56), ts: shares[10].t - 1,
+        height: 2573244, miner: shares[10].m, status: 'confirmed' },
+      { hash: '000000000000001a' + 'a'.repeat(48), share: shares[40].H, ts: shares[40].t,
+        height: 2573240, miner: shares[40].m, status: 'confirmed' },
+      { hash: '000000000000001b' + 'b'.repeat(48), share: 'old0' + '0'.repeat(60), ts: oldest - 600,
+        height: 2573200, miner: shares[0].m, status: 'confirmed' },
+    ]);
+  }
   if (path === '/sharechain/stream') {
     // Minimal SSE: hello + keep-alive only. No tips fired = no animation
     // churn during the screenshot window.

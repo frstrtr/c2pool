@@ -41,6 +41,11 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
     # per-coin protocol_legacy.cpp / protocol_actual.cpp addrme+addrs handlers.
     # Same reasoning as above: FOLDED into the EXISTING allowlisted core_test
     # target, never a new add_executable.
+    # random_uniform_test.cpp: random_float / random_double are continuous
+    # [min, max) draws (they were integer draws: random_float(0, 100) gave only
+    # 0..100, so the node-fee draw took ceil(fee)/101 and every peer-selection
+    # random_float(0, 1) < 0.8 held 50%). Fixed-seed, wide-tolerance hit rates
+    # for the fee draw. FOLDED into core_test, never a new add_executable.
     # p2p_message_stats_test.cpp: the p2p wire observability layer
     # (core/p2p_message_stats.hpp) -- command -> message-type mapping including
     # the NUL-padded wire form, the per-direction counters, and the embedded-
@@ -150,9 +155,23 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
     # nor the share's merged_coinbase_info (a V36 peer rejects info without
     # mm_data). Real MiningInterface + MergedMiningManager; same
     # fold-into-core_test reasoning as every TU here (c2pool_merged_mining linked).
+    # web_server_currency_info_payees_test.cpp: /web/currency_info names the
+    # node-owner fee payee and the donation outputs (parent and merged chains)
+    # as the /current_payouts and /current_merged_payouts row keys, for the
+    # PPLNS treemap; "" / {} where the node pays none. Same fold-into-core_test
+    # reasoning as every TU here (c2pool_merged_mining linked).
+    # web_server_merged_payout_source_test.cpp: /current_merged_payouts labels
+    # each merged output explicit / auto-convert / donation from the payout
+    # provider's origins and shows it under the parent address it is paid for
+    # (one DOGE address of two LTC addresses: its part under each). Same
+    # fold-into-core_test reasoning as every TU here.
     # leveldb_store_lock_test.cpp: LevelDBStore::open on a DB whose LOCK is
     # held (another process, another handle) fails and leaves LOCK alone; an
     # unheld LOCK file opens. Same fold-into-core_test reasoning as every TU here.
+    # sharechain_height_index_test.cpp: the sharechain store keeps every share of
+    # an absheight (`height:` one hash as before, the others under `hsib:`),
+    # removing one share never drops another's, and the index is rebuilt when an
+    # earlier binary may have written it since (dirty != 2). Same reasoning.
     # template_refresh_on_tx_test.cpp: the transaction-triggered template
     # refresh (#2137 S1): core::TxRefreshPacer (coalesce within 1 s of the
     # last rebuild, rebuild at once after a quiet interval, skip what another
@@ -194,6 +213,33 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
     # count, retain self-heal, set_last_build no-op on an absent txid, ChainLock
     # round-trip). Header-only over core/uint256. Same fold-into-core_test
     # reasoning as every TU here.
+    # web_server_block_rows_test.cpp: one find, one story on every node -- a
+    # merged (DOGE) find never lists as a /recent_blocks row, counts toward no
+    # parent luck/round/miner total, and is on the finder's own
+    # /recent_merged_blocks; pre-fix persisted rows render honestly. Uses only
+    # the pre-fix public API, so it also runs red against the old code.
+    # found_block_submit_test.cpp: the pieces those rows are built from
+    # (core/found_block_submit.hpp BIP34 height + stratum submit context, the
+    # parent-vs-merged predicate, the pre-fix miner display, the header-chain
+    # height correction, fill-only second records). Same fold-into-core_test
+    # reasoning as every TU here.
+    # job_rate_key_test.cpp: a stratum job's share target is sized by its
+    # connection's login key (MiningInterface::build_connection_coinbase_for
+    # hands ref_hash_fn that key), also on a node-fee job whose payout is the
+    # operator's; a submission is judged by its job's own share bits
+    # (core::stratum::pool_share_bits). Same fold-into-core_test reasoning as every TU here.
+    # pool_luck_test.cpp, web_server_luck_test.cpp, web_server_luck_inputs_test.cpp:
+    # pool luck as effort (core/pool_luck.hpp). The first pins the model on
+    # hand-computed fixtures (integrated effort over a piecewise-constant
+    # rate / difficulty, the predecessor by time, period luck and the exact
+    # Poisson interval against scipy). The second drives the endpoints
+    # (/recent_blocks, /luck_stats, /recent_merged_blocks, /global_stats,
+    # /web/graph_data) through API that predates the change, so it also
+    # builds against the old web_server.cpp and fails there. The third covers
+    # the inputs that arrive through hooks added with it (the aux chain's own
+    # difficulty, the rate history fed sample by sample). One KAT covers every
+    # coin: the ledger, the history and the endpoints are core. Same
+    # fold-into-core_test reasoning as every TU here.
     # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
     add_executable(core_test
         addr_store_save_test.cpp
@@ -212,10 +258,12 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
         factory_connect_failed_uaf_test.cpp
         filesystem_test.cpp
         found_block_store_test.cpp
+        found_block_submit_test.cpp
         graph_history_test.cpp
         host_port_test.cpp
         inject_ledger_obs_test.cpp
         inject_status_test.cpp
+        job_rate_key_test.cpp
         known_txs_backing_test.cpp
         known_txs_eviction_test.cpp
         leveldb_store_lock_test.cpp
@@ -227,8 +275,11 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
         pack_test.cpp
         packet_test.cpp
         payout_manager_rules_test.cpp
+        pool_luck_test.cpp
         random_choice_guard_test.cpp
+        random_uniform_test.cpp
         reloaded_block_flag_test.cpp
+        sharechain_height_index_test.cpp
         socket_write_queue_test.cpp
         socket_read_empty_prefix_test.cpp
         template_refresh_on_tx_test.cpp
@@ -242,7 +293,9 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
         version_gate_test.cpp
         web_server_aux_template_test.cpp
         web_server_block_budget_test.cpp
+        web_server_block_rows_test.cpp
         web_server_config_endpoint_test.cpp
+        web_server_currency_info_payees_test.cpp
         web_server_current_payouts_test.cpp
         web_server_daemonless_graph_feed_test.cpp
         web_server_dashboard_data_test.cpp
@@ -253,7 +306,10 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
         web_server_local_hashps_test.cpp
         web_server_local_only_test.cpp
         web_server_local_share_hash_rates_test.cpp
+        web_server_luck_inputs_test.cpp
+        web_server_luck_test.cpp
         web_server_merged_drop_test.cpp
+        web_server_merged_payout_source_test.cpp
         web_server_mweb_hogex_test.cpp
         web_server_pplns_no_burn_test.cpp
         web_server_redistribute_type_test.cpp

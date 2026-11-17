@@ -353,10 +353,15 @@ public:
         uint256  as_of_hash;   // block folded at as_of; null = look it up
     };
 
-    /// ~34 days of DASH blocks at 2.5 min spacing. Chosen so a release cut
-    /// within the last month bridges in minutes over the coin-P2P feed, and
-    /// anything older is refused loudly instead of grinding.
-    static constexpr uint32_t kDefaultMaxBridgeBlocks = 20000;
+    /// ~69 days of DASH blocks at 2.5 min spacing. Chosen so a release cut
+    /// within the last two months bridges in minutes over the coin-P2P feed,
+    /// and anything older is refused loudly instead of grinding. The bound is
+    /// about REPLAY DURATION, not anchor trust (see the staleness gate in
+    /// pump()). Raised from 20000 (~34 days): with the 2563800 anchor that
+    /// limit refused a cold start from tip 2,583,800, before the earliest Dash
+    /// Core v24 activation (2,584,512), exactly when new nodes join. A resumed
+    /// node measures from its persisted cursor and is unaffected either way.
+    static constexpr uint32_t kDefaultMaxBridgeBlocks = 40000;
 
     /// How many block bodies to keep requested ahead of the apply cursor.
     /// Responses to getdata come back in request order on the single ordered
@@ -616,7 +621,7 @@ public:
 
     /// Emit at most one progress line per `blocks` of replay OR per `ms` of
     /// wall clock, whichever comes first. Defaults are sized so a full
-    /// 20000-block bridge costs ~40 lines, not 20000.
+    /// 40000-block bridge costs ~80 lines, not 40000.
     void set_progress_throttle(uint64_t blocks, int64_t ms)
     {
         m_progress = diag::ProgressReporter(blocks, ms);
@@ -2070,10 +2075,10 @@ public:
             // headroom; kOnDemandFoldBase = 8 covers a SHORT bridge, where
             // the ratio term contributes nothing but a burst can still land.
             //
-            // At the default 20000-block bridge bound that is 8 + 80 = 88
-            // round trips worst case, which is negligible against the 20000
+            // At the default 40000-block bridge bound that is 8 + 160 = 168
+            // round trips worst case, which is negligible against the 40000
             // getdata the same bridge already issues — while a runaway
-            // stops after 88 instead of after 20000.
+            // stops after 168 instead of after 40000.
             // (both sized by size_window_budgets(), re-evaluated every pump)
             LOG_INFO << "[MN-CKPT] bridge START: replaying h=" << m_next
                      << ".." << tip << " (" << (tip - m_next + 1)
@@ -3166,15 +3171,17 @@ public:
 
     /// -- Ceilings for the window-sized budgets --------------------------
     /// The replay window is ALREADY bounded by the staleness gate
-    /// (max_bridge_blocks, default 20000), which at the default puts the three
-    /// formulas at 208 / 88 / 24 -- so under stock settings no ceiling is ever
-    /// reached. They exist so that raising --embedded-mn-bridge-max cannot
-    /// silently turn the arm into an unbounded round-trip crawl, and so the
-    /// bound is STATED here instead of being an emergent property of another
-    /// knob. Reaching one is logged, never silent.
-    static constexpr size_t   kReviveProbeCapMax    = 256;
-    static constexpr size_t   kOnDemandFoldCapMax   = 128;
-    static constexpr size_t   kSmlRecoveryCapMax    = 32;
+    /// (max_bridge_blocks, default 40000), which at the default puts the three
+    /// formulas at 408 / 168 / 44 -- so under stock settings no ceiling is ever
+    /// reached (pinned by DashMnCheckpointBudgets.AtTheDefaultBridgeBound
+    /// NoCeilingIsReached). They exist so that raising
+    /// --embedded-mn-bridge-max cannot silently turn the arm into an unbounded
+    /// round-trip crawl, and so the bound is STATED here instead of being an
+    /// emergent property of another knob. Reaching one is logged, never
+    /// silent. Raised with the default bound (was 256 / 128 / 32 at 20000).
+    static constexpr size_t   kReviveProbeCapMax    = 448;
+    static constexpr size_t   kOnDemandFoldCapMax   = 192;
+    static constexpr size_t   kSmlRecoveryCapMax    = 48;
 
     /// The next height at or after `cursor` at which we want a snapshot, or
     /// nullopt when none remains before `tip`. Always includes the tip so the
@@ -4890,8 +4897,8 @@ public:
     /// deterministically instead of sleeping.
     std::function<int64_t()> m_now{&diag::steady_now_ms};
     std::function<size_t(const BlockType&)> m_wire_size;
-    /// 500 blocks OR 15 s, whichever first. A 20000-block bridge therefore
-    /// costs ~40 lines, and a bridge crawling at 1 blk/s still reports every
+    /// 500 blocks OR 15 s, whichever first. A 40000-block bridge therefore
+    /// costs ~80 lines, and a bridge crawling at 1 blk/s still reports every
     /// 15 s instead of going quiet for an hour.
     diag::ProgressReporter m_progress{500, 15000};
     /// 90 s of NO cursor movement is a freeze worth naming, repeated every

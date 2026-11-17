@@ -56,6 +56,12 @@ inline constexpr int DASH_V20_HEIGHT_TESTNET       = 905'100;
 inline constexpr int DASH_MN_RR_HEIGHT_TESTNET     = 1'066'900;
 inline constexpr int DASH_SUPERBLOCK_CYCLE_MAINNET = 16616;
 inline constexpr int DASH_SUPERBLOCK_CYCLE_TESTNET = 24;   // dashcore testnet nSuperblockCycle
+/// chainparams nSuperblockMaturityWindow (Dash Core v24 chainparams.cpp:174
+/// mainnet "~3 days before actual Superblock is emitted", :386 testnet):
+/// masternodes create triggers for H only from tip H - window on
+/// (governance/signing.cpp CreateSuperblockCandidate).
+inline constexpr int DASH_SUPERBLOCK_MATURITY_WINDOW_MAINNET = 1662;
+inline constexpr int DASH_SUPERBLOCK_MATURITY_WINDOW_TESTNET = 8;
 
 /// Returns the BLOCK reward (excluding tx fees) for a block at height
 /// `height` on Dash mainnet. Equivalent to dashcore's

@@ -60,21 +60,22 @@ inline CTransactionRef MakeTransactionRef(::dash::coin::MutableTransaction&& tx)
 using CBlockHeader = ::dash::coin::BlockHeaderType;
 using CBlock       = ::dash::coin::BlockType;
 
-// ── Mempool snapshot provider ──────────────────────────────────────────────
+// ── Mempool short-id provider ──────────────────────────────────────────────
 //
 // Replaces the raw `CTxMemPool*` dashcore threads through
-// PartiallyDownloadedBlock. The provider returns a snapshot of
-// (instance hash, tx) pairs for the reassembler to try matching against the
-// compact block's short IDs (Dash Core v24 vTxHashes: GetInstanceHash, which
-// equals the txid for every tx but a version-2 asset unlock). Dashcore iterates `pool->vTxHashes`
-// directly under its mempool lock; we ask the caller for a vector so
-// the mempool-lock policy stays on their side.
+// PartiallyDownloadedBlock. Dash Core InitData walks pool->vTxHashes under
+// LOCK(pool->cs): (instance hash, entry) pairs, keyed by GetInstanceHash, which
+// equals the txid for every tx but a version-2 asset unlock. The provider does
+// the same walk: it calls the visitor once per pooled tx, under the pool's own
+// lock, with the tx by reference (no snapshot, no copy). InitData copies only a
+// tx whose short id matches. The visitor returns false to stop the walk (Dash
+// Core's early exit once every short id is filled).
 //
-// Phase M (mempool) returns a real snapshot here; pre-Phase-M the
-// provider is null and every cmpctblock falls through to a full
-// getblocktxn round-trip.
-using MempoolShortIdProvider =
-    std::function<std::vector<std::pair<uint256, CTransactionRef>>()>;
+// A null provider means no mempool (blocks-only): every non-prefilled tx is
+// fetched by getblocktxn.
+using MempoolTxVisitor =
+    std::function<bool(const uint256& instance_hash, const ::dash::coin::MutableTransaction& tx)>;
+using MempoolShortIdProvider = std::function<void(const MempoolTxVisitor&)>;
 
 // ── Formatters bridging dashcore idioms to pack.hpp ────────────────────────
 

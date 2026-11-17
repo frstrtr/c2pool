@@ -67,6 +67,18 @@ BlockType make_block(size_t n_txs) {
     b.m_nonce = 42;
     for (size_t i = 0; i < n_txs; ++i)
         b.m_txs.push_back(make_tx(static_cast<uint32_t>(1000 + i)));
+    // The coinbase gets an input and an output: Dash Core InitData refuses a
+    // prefilled tx with neither (CTransaction::IsNull).
+    if (!b.m_txs.empty()) {
+        TxIn in;
+        in.prevout.hash.SetNull();
+        in.prevout.index = 0xffffffff;
+        in.sequence = 0xffffffff;
+        b.m_txs[0].vin.push_back(in);
+        TxOut out;
+        out.value = 500000000;
+        b.m_txs[0].vout.push_back(out);
+    }
     return b;
 }
 
@@ -74,7 +86,9 @@ BlockType make_block(size_t n_txs) {
 // getblocktxn. The constructor accepts a null std::function.
 v::MempoolShortIdProvider no_mempool() { return nullptr; }
 
-constexpr size_t kMaxBlockTxCount = 100000;  // generous bound; not under test here
+// The bound is Dash Core's MaxBlockSize() in BYTES; InitData divides it by
+// MIN_TRANSACTION_SIZE. Not under test here.
+constexpr size_t kMaxBlockTxCount = 2'000'000;
 
 // Assert two blocks have identical transaction sets (by serialized hash) and
 // matching header identity fields.
@@ -150,8 +164,8 @@ TEST(DashBlockReplay, MempoolProviderSatisfiesShortId) {
 
     // Provide tx at index 1 from the "mempool".
     const MutableTransaction& mem_tx = block.m_txs[1];
-    auto provider = [mem_tx]() -> std::vector<std::pair<uint256, v::CTransactionRef>> {
-        return {{tx_hash(mem_tx), v::MakeTransactionRef(mem_tx)}};
+    v::MempoolShortIdProvider provider = [mem_tx](const v::MempoolTxVisitor& visit) {
+        visit(tx_hash(mem_tx), mem_tx);
     };
 
     v::CBlockHeaderAndShortTxIDs cmpct(block);

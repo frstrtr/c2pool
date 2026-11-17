@@ -23,6 +23,7 @@
 #include <core/uint256.hpp>
 #include <memory>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdint>
@@ -178,6 +179,43 @@ struct StratumConfig {
     // refused (#961) — for work sources that do not redistribute.
     bool redistribute_unusable_logins{false};
 };
+
+/// The 20-byte key of a payout: the hash160 (P2PKH, P2SH) or witness program
+/// (P2WPKH) its script pays. The per-address hashrate map
+/// (StratumServer::get_local_addr_rates, p2pool get_local_addr_rates) is keyed
+/// by it.
+using PayoutKey = std::array<uint8_t, 20>;
+
+/// The key a P2PKH / P2SH / P2WPKH payout script pays; all zero for any
+/// other script.
+inline PayoutKey payout_script_key(const std::vector<unsigned char>& script)
+{
+    PayoutKey key{};
+    if (script.size() == 25 && script[0] == 0x76)
+        std::copy(script.begin() + 3, script.begin() + 23, key.begin());
+    else if (script.size() == 23 && script[0] == 0xa9)
+        std::copy(script.begin() + 2, script.begin() + 22, key.begin());
+    else if (script.size() == 22 && script[0] == 0x00)
+        std::copy(script.begin() + 2, script.begin() + 22, key.begin());
+    return key;
+}
+
+/// The share bits a submission is judged by when deciding whether it makes a
+/// share (StratumSession::handle_submit's pool-share gate): its job's own,
+/// frozen when the job was built, the bits the share it makes carries (p2pool
+/// got_response: pow_hash <= share_info['bits'].target, of that job).
+/// `live_bits` (the work source's get_share_bits(): the bits of the last job
+/// built for ANY connection) only for a job built without frozen bits. Judged
+/// by the live bits, a job's share was dropped whenever the last job built
+/// was a harder one (another miner's, or any job after a node-fee job sized
+/// by the operator's key), and a harder job's submission went to share
+/// creation, which refused its PoW, whenever the last job built was easier.
+/// The work source's mining_submit gets the same bits (JobSnapshot::share_bits;
+/// BTC/BCH classify the submission against them).
+inline uint32_t pool_share_bits(uint32_t job_frozen_bits, uint32_t live_bits)
+{
+    return job_frozen_bits != 0 ? job_frozen_bits : live_bits;
+}
 
 /// Frozen share-construction fields returned by ref_hash_fn. These
 /// capture the share-tracker state at the moment a job was assembled

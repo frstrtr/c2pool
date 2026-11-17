@@ -11,19 +11,19 @@
 namespace doge {
 namespace coin {
 
-/// DNS seeds for Dogecoin mainnet.
-/// Note: multidoge.org and dogecoin.com seeds are dead as of 2026-04.
-/// Kept for future recovery; fixed seeds below provide actual connectivity.
+/// DNS seeds for Dogecoin mainnet: the Dogecoin Core seeds that answer
+/// (both multidoge.org seeds returned 25 addresses on 2026-11-15).
+/// Dropped 2026-11-15:
+///   seed.doger.dogecoin.com  no A/AAAA (a TXT "v=spf1 -all" only)
+///   seed.dogecoin.com        no A/AAAA (the name is not delegated to a seeder)
+///   seed.mophides.com        NXDOMAIN (mophides.com is not registered)
+///   seed.dglibrary.org       NXDOMAIN
+///   seed.dogechain.info      NXDOMAIN
 inline std::vector<c2pool::dns::DnsSeed> doge_mainnet_dns_seeds()
 {
     return {
         {"seed.multidoge.org",        22556},
         {"seed2.multidoge.org",       22556},
-        {"seed.doger.dogecoin.com",   22556},
-        {"seed.dogecoin.com",         22556},
-        {"seed.mophides.com",         22556},
-        {"seed.dglibrary.org",        22556},
-        {"seed.dogechain.info",       22556},
     };
 }
 

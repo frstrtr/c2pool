@@ -126,6 +126,9 @@ TEST(RedistributeType, NoRecipientOrAnUnknownTypeCreatesNoShare)
 TEST(RedistributeType, TheNodeFeeDrawPaysTheOperatorsOwnScriptType)
 {
     Rig r;
+    // Fee 100% takes every share: the draw is a continuous [0, 100) roll
+    // compared as double, so this is deterministic (the old integer draw
+    // returned 100 one time in 101 and this test flaked).
     // a P2SH operator, every share drawn (100%), a P2PKH miner
     r.mi.set_node_fee(100.0, p2sh(0x0e));
     r.submit("mvFaiHPVU5dYAnKcw4knKpZyzoW8UoaheA");

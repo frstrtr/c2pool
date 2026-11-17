@@ -1,0 +1,108 @@
+# c2pool-bch -- example settings file (TOML), checked against release 0.2.12.1
+#
+# WHAT THIS IS
+#   Launch settings for the c2pool-bch node (Bitcoin Cash, SHA256d). The upper
+#   part sets the keys this binary applies from a file. The REFERENCE block at
+#   the end lists the keys the file loader accepts but this release does not
+#   apply (use their CLI flags instead).
+#
+# WHERE TO PUT IT
+#   Either name it on the command line:
+#     c2pool-bch --pool --stratum 0.0.0.0:9534 --settings /etc/c2pool/c2pool-bch.toml
+#   or copy it to <data-dir>/c2pool.toml (data dir default: ~/.c2pool, or the
+#   one given with --data-dir); that file is loaded when --settings is absent.
+#   An explicit --settings path that does not exist is fatal (exit 78).
+#   Two things are command-line only in this release: --pool (the pool
+#   run-loop; without it the binary runs its self-test and exits) and
+#   --stratum [HOST:]PORT (Stratum is off unless given). Run the binary from
+#   the unpacked release directory (the dashboard serves ./web-static), not
+#   through start.sh: it adds --stratum 9348 --http 8080 on the command line,
+#   and command-line flags override this file.
+#
+# PRECEDENCE
+#   compiled defaults  <  this file  <  command-line flags
+#   A flag on the command line always wins over the same key in this file.
+#
+# CHECK IT BEFORE YOU RUN
+#   c2pool-bch --settings c2pool-bch.toml --dump-resolved-config
+#   prints "key=value source=compiled|file|cli" for each resolved key and
+#   exits 0 without starting the node. A key left at its compiled default is
+#   usually not printed. "source=file" proves the file was read, not that the
+#   key is used: keys from the REFERENCE block also print as source=file.
+#
+# MONEY GATE
+#   Keys marked [money] (fees, donation, payout addresses, network identity)
+#   are never accepted from a file without your explicit acknowledgement:
+#     1. uncomment the key(s) and enter your own value(s);
+#     2. run  c2pool-bch --settings c2pool-bch.toml --ack-money-settings
+#        it exits 0; the last line of its output is the hash (64 hex chars);
+#     3. put that hash in [gate] money_ack_hash at the end of this file;
+#     4. run --dump-resolved-config again: exit 0, money keys show source=file.
+#   Without a matching hash the node refuses to start, names the money keys
+#   and exits 78. Changing, adding or removing any money key changes the hash:
+#   repeat steps 2 and 3. The same values given as CLI flags need no hash.
+#
+# FORMAT
+#   Keys live in [bch.<section>] tables. A misspelled key in a [bch.*] table
+#   is fatal (exit 78). Tables for other coins are ignored by this binary, but
+#   use one file per binary all the same: [gate] holds a single money_ack_hash.
+#
+# POSTURE
+#   Daemonless: coin_p2p.discover = true finds Bitcoin Cash network peers by
+#   itself, so no BCHN node is needed. --pool refuses to start unless either
+#   coin_p2p.discover is true or a coin peer is named (coin_p2p.connect or
+#   --peer); this file's discover = true satisfies it.
+#
+# PORTS (one host running ltc, dash, btc, dgb and bch from these examples)
+#   bch: sharechain 9349 (fixed), Stratum 9534 (via --stratum), web 8085
+#   ltc 9326/9327/8080, dash 8999/7903/8082, btc 9333/9334/8083,
+#   dgb 5024/9434/8084 (sharechain/Stratum/web)
+
+[bch.coin_p2p]
+discover = true             # daemonless Bitcoin Cash peer discovery; default false. Must be exactly true (lower case)
+# connect = "203.0.113.10:8333"   # one explicit BCHN peer HOST[:PORT] (CLI --peer); default none. Port omitted = network default (8333 mainnet); port 0 = no explicit peer, use the seed ladder
+
+[bch.web]
+port = 8085                 # dashboard TCP port; default 0 (off). For a specific bind address use the CLI: --http 127.0.0.1:8085
+
+[bch.embedded]
+anchor = 0                  # cold-start ABLA floor anchor, a block HEIGHT (integer); default 0. The catalog help text says H:HASH, but the binary reads a plain height
+
+[bch.daemon_rpc]
+# auth_file = "/home/<user>/.bitcoin/bitcoin.conf"   # BCHN bitcoin.conf (rpcuser/rpcpassword) for the external-RPC fallback, endpoint 127.0.0.1:<rpcport> (CLI --rpc-conf); default none
+
+[bch.money]
+# give_author_pct = 0.1                        # [money] author donation, percent 0-100; default 0.1
+# node_owner_fee_pct = 1.0                     # [money] node-owner fee, percent 0-100; default 0 (off); needs node_owner_address
+# node_owner_address = "<your-BCH-address>"    # [money] where the node-owner fee is paid; default none
+
+[gate]
+# money_ack_hash = "<64-hex output of: c2pool-bch --settings THIS_FILE --ack-money-settings>"   # needed only when a [money] key is uncommented
+
+# ---------------------------------------------------------------------------
+# REFERENCE: keys the loader ACCEPTS but c2pool-bch 0.2.12.1 does NOT apply
+# ---------------------------------------------------------------------------
+# The loader knows these keys (so they are not refused as typos) and
+# --dump-resolved-config shows them as source=file when set, but this release
+# copies only the keys above into the running node. Setting one of these here
+# has no effect: use the CLI flag shown. A [money] key still trips the money
+# gate. Defaults are not repeated here; see "Per-binary launch reference" in
+# README.md. Form:  key [money] -- meaning (CLI flag)
+# [bch.meta]
+#   data_dir -- data directory; cannot work from a file, the file itself is found through the data dir (CLI: --data-dir)
+#   selftest -- run self-test (CLI: --selftest)
+#   ibd -- initial block download harness (CLI: --ibd)
+#   with_peer_verify -- peer-verify harness (CLI: --with-peer-verify)
+#   pool -- pool mode harness (CLI: --pool)
+#   near_tip -- near-tip harness (CLI: --near-tip)
+#   auto_kick -- auto-kick harness (CLI: --auto-kick)
+#   max_seconds -- harness max seconds (CLI: --max-seconds)
+# [bch.network]
+#   testnet [money] -- testnet network identity (CLI: --testnet)
+#   regtest [money] -- regtest network identity (CLI: --regtest)
+#   testnet4 [money] -- testnet4 network identity (CLI: --testnet4)
+# [bch.sharechain]
+#   listen -- sharechain P2P bind [HOST:]PORT (no CLI flag: the BCH sharechain port is fixed at 9349; the catalog maps --p2p-port here, but that flag is the leg-C regtest coin port)
+#   addnodes -- persistent outbound sharechain peers (CLI: --sharechain-addnode)
+# [bch.stratum]
+#   bind -- stratum bind [HOST:]PORT (0=off) (CLI: --stratum)

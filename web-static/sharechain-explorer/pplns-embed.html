@@ -16,6 +16,13 @@
   guaranteed.
 
   CSP matches the Explorer embed (delta v1 §B.3).
+
+  Default view: the interactive PPLNS treemap on the scene engine
+  (./dist/scene.js, loaded with a dynamic import), fed by the bridge's
+  getPayouts / getMergedPayouts / getStratumStats and refreshed on each
+  tip. The classic PplnsView (above transport, /pplns/current) is the
+  fallback: with ?legacy=1, on a binary whose PplnsBridge lacks those
+  methods, or when scene.js is not in its qrc.
 -->
 <html lang="en">
 <head>
@@ -181,6 +188,52 @@
     }
 
     // ── Boot ─────────────────────────────────────────────────────────
+    // Scene-engine treemap: weights from /current_payouts, merged
+    // children from /current_merged_payouts, ★ from /stratum_stats.
+    function startSceneView(scene, transport, pplnsBridge, coinSymbol) {
+      const src = {
+        payouts: () => transport._call('getPayouts', []),
+        merged:  () => transport._call('getMergedPayouts', []),
+      };
+      if (typeof pplnsBridge.getStratumStats === 'function') {
+        src.stratum = () => transport._call('getStratumStats', []);
+      }
+      let view = null;
+      let mountedMerged = '';
+      window.addEventListener('beforeunload', () => {
+        try { if (view !== null) view.destroy(); } catch {}
+      });
+      const refresh = scene.coalesce(async () => {
+        const r = await scene.loadPplnsSnapshot(src);
+        if (r === null) { setStatus('no payouts yet', 'err'); return; }
+        // The coin toggle is built at mount. If the merged child (e.g.
+        // DOGE) first appears after the first snapshot, mount once more.
+        if (view !== null && r.mergedSymbol && !mountedMerged) {
+          try { view.destroy(); } catch {}
+          view = null;
+        }
+        if (view === null) {
+          mountedMerged = r.mergedSymbol || '';
+          tree.innerHTML = '';
+          // Room above the view's own toolbar for #status (top-right).
+          tree.style.marginTop = '22px';
+          tree.style.height = 'calc(100vh - 82px)';
+          const opts = { container: tree, symbol: coinSymbol };
+          if (r.mergedSymbol) opts.mergedSymbol = r.mergedSymbol;
+          view = scene.mountPplnsTreemap(opts);
+          window.__pplnsQt = view;
+        }
+        view.update(r.snapshot, r.special);
+        setStatus('connected');
+      });
+      refresh();
+      transport.subscribeStream(
+        () => { refresh(); },
+        (err) => log('error', err && err.message ? err.message : String(err)),
+        () => { refresh(); });
+      log('info', 'PPLNS treemap (scene engine) started', { coin: coinSymbol });
+    }
+
     function startPplnsView(transport, coinSymbol) {
       const ctrl = PplnsView.init({
         container: tree,
@@ -215,13 +268,30 @@
         return;
       }
       const transport = new QtPplnsTransport(pplnsBridge, shareBridge);
+      let legacy = false;
+      try { legacy = new URLSearchParams(window.location.search).get('legacy') === '1'; } catch (e) { /* no location */ }
+      // An older binary's PplnsBridge has no getPayouts: keep the classic view.
+      const sceneCapable = !legacy
+        && typeof pplnsBridge.getPayouts === 'function'
+        && typeof pplnsBridge.getMergedPayouts === 'function';
       const boot = (symbol) => {
-        try {
-          startPplnsView(transport, symbol || resolveCoin());
-        } catch (err) {
-          setStatus('failed to start', 'err');
-          log('error', String(err && err.message ? err.message : err));
-        }
+        const coin = symbol || resolveCoin();
+        const classic = () => {
+          try {
+            startPplnsView(transport, coin);
+          } catch (err) {
+            setStatus('failed to start', 'err');
+            log('error', String(err && err.message ? err.message : err));
+          }
+        };
+        if (!sceneCapable) { classic(); return; }
+        import('./dist/scene.js')
+          .then((scene) => startSceneView(scene, transport, pplnsBridge, coin))
+          .catch((err) => {
+            log('warn', 'scene view unavailable, using the classic view',
+                { err: String(err && err.message ? err.message : err) });
+            classic();
+          });
       };
       // Prefer the authoritative active-coin descriptor from CoinBridge.
       // QWebChannel invokables resolve asynchronously; fall back to
