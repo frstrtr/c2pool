@@ -312,3 +312,23 @@ test('controller: reset drops plan + queue', () => {
   assert.equal(c.isRunning(), false);
   assert.equal(c.tick(1000), null);
 });
+
+test('controller.hasQueued: set by queueNext, cleared when tick() starts the queued plan or on reset', () => {
+  type Plan = Parameters<ReturnType<typeof createAnimationController>['start']>[0];
+  const plan = (tEnd: number): Plan => ({
+    tEnd,
+    frameAt: () => ({ cells: [], particles: [], cards: [], axisLabels: [], axisLines: [], backgroundColor: '#000', layout: {} }),
+  }) as unknown as Plan;
+  const c = createAnimationController();
+  c.start(plan(100), 0);
+  assert.equal(c.hasQueued(), false);
+  c.queueNext(plan(100));
+  assert.equal(c.hasQueued(), true);
+  c.tick(150);  // the first plan ends; tick starts the queued one
+  assert.equal(c.hasQueued(), false);
+  assert.equal(c.isRunning(), true);
+  c.queueNext(plan(100));
+  c.reset();
+  assert.equal(c.hasQueued(), false);
+  assert.equal(c.isRunning(), false);
+});

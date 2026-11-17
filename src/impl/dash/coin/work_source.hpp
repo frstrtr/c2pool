@@ -216,6 +216,11 @@ struct EmbeddedWorkInputs {
     /// Dash Core's CheckMNHFTx environment for type-7 signals
     /// (NodeCoinState::set_mnhf_check_env). nullptr => no signal rides.
     const MnhfCheckEnv* mnhf_check_env{nullptr};
+    // GBT-xcheck label aid (gbt_xcheck_dashd_only_collateral.hpp): keep the
+    // committed fold in DashWorkData::m_xcheck_collateral_aid. Set by
+    // NodeCoinState::set_xcheck_collateral_aid on a node that runs the
+    // GBT-xcheck; false => nothing kept (a daemonless node pays nothing).
+    bool want_xcheck_aid{false};
 
     bool viable() const {
         return has_state && mnstates != nullptr && mempool != nullptr;
@@ -368,7 +373,9 @@ inline WorkSelection select_dash_work(
                 // Dash Core's full provider-tx checks (null => none rides).
                 emb.protx_check_env,
                 // Dash Core's CheckMNHFTx for type-7 signals (null => none rides).
-                emb.mnhf_check_env);
+                emb.mnhf_check_env,
+                // GBT-xcheck label aid (false => nothing kept).
+                emb.want_xcheck_aid);
             // Testnet min-difficulty: bits for the template's own curtime.
             if (emb.bits_at_time)
                 if (auto b = emb.bits_at_time(w.m_previous_block, w.m_curtime)) w.m_bits = *b;

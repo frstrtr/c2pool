@@ -27,7 +27,7 @@ import type {
 } from '../transport/types.js';
 import type { ExplorerError } from '../errors.js';
 import type { GridLayout } from './grid-layout.js';
-import { computeGridLayout } from './grid-layout.js';
+import { cellAtPoint, computeGridLayout } from './grid-layout.js';
 import type {
   ColorPalette,
   ShareForClassify,
@@ -225,8 +225,12 @@ export class RealtimeOrchestrator {
   private _deltaInFlight = false;
   private _lastAppliedTip: string | null = null;
   private _pendingTip: string | null = null;
-  private _hasQueued = false;
   private _currentLayout: GridLayout | null = null;
+  /** Bumped on every change that can alter the static frame (window,
+   *  user context, animation reset). The DOM adapter repaints an idle
+   *  canvas only when this, the container size or the DPR moved. */
+  private _revision = 0;
+  private _onChange: (() => void) | null = null;
   private _statsCache: RealtimeStats | null = null;
   private _statsTipAtCompute: string | null = null;
   /** Effective userContext used for rendering. Server-provided
@@ -296,6 +300,18 @@ export class RealtimeOrchestrator {
     this.subscription?.unsubscribe();
     this.subscription = null;
     this.anim.reset();
+    this.touch();
+  }
+
+  /** Monotonic change counter for the static frame. See `_revision`. */
+  get revision(): number {
+    return this._revision;
+  }
+
+  /** Register the single change listener (the DOM adapter uses it to
+   *  wake an idle render loop). Pass null to clear. */
+  setChangeListener(fn: (() => void) | null): void {
+    this._onChange = fn;
   }
 
   /** Force a full window re-fetch (e.g. operator clicked refresh). */
@@ -308,7 +324,9 @@ export class RealtimeOrchestrator {
     return {
       window: this.window,
       animating: this.anim.isRunning(),
-      hasQueued: this._hasQueued,
+      // Read from the controller: tick() dequeues on its own, so a
+      // mirror flag here went stale (stayed true forever).
+      hasQueued: this.anim.hasQueued(),
       started: this._started,
       shareCount: this.window.shares.length,
       lastAppliedTip: this._lastAppliedTip,
@@ -365,6 +383,13 @@ export class RealtimeOrchestrator {
     if (animFrame !== null) return animFrame;
     // Idle: emit a static frame so the renderer can re-paint on resize.
     return this.buildStaticFrame();
+  }
+
+  /** Advance the animation and return its frame at `now`, or null when
+   *  no animation is running. Unlike currentFrame() it never builds a
+   *  static frame, so an idle caller can skip painting altogether. */
+  animationFrame(now: number): FrameSpec | null {
+    return this.anim.tick(now);
   }
 
   /** Return the PPLNS distribution for a specific share, falling back
@@ -513,6 +538,7 @@ export class RealtimeOrchestrator {
       this._lastAppliedTip = tip ?? null;
       this._statsCache = null;  // invalidate cache for new window
       this.animateRebuildDiff(oldShares, oldLayout, shares);
+      this.touch();
     } catch (err) {
       this.emitError(err);
     }
@@ -569,9 +595,11 @@ export class RealtimeOrchestrator {
       ...(this.window.tip !== undefined ? { tipHash: this.window.tip } : {}),
     });
     // A full rebuild replaces the window wholesale, so start a fresh
-    // animation rather than queueing behind a prior plan.
+    // animation rather than queueing behind a prior plan, and drop any
+    // plan still queued against the old window (it would otherwise
+    // play after this one ends).
+    this.anim.reset();
     this.anim.start(plan, this.nowMs());
-    this._hasQueued = false;
   }
 
   /** Per-share PPLNS weight fraction across the union of two share
@@ -791,6 +819,9 @@ export class RealtimeOrchestrator {
     };
     this._lastAppliedTip = newTip ?? null;
     this._statsCache = null;  // invalidate cache after merge
+    // The listener only schedules a repaint, so it is safe to fire
+    // before the animation (if any) is started below.
+    this.touch();
 
     if (merge.added.length === 0 && merge.evicted.length === 0) {
       // Tip advance with no window-visible change — skip animation.
@@ -829,10 +860,8 @@ export class RealtimeOrchestrator {
 
     if (this.anim.isRunning()) {
       this.anim.queueNext(plan);
-      this._hasQueued = true;
     } else {
       this.anim.start(plan, this.nowMs());
-      this._hasQueued = false;
     }
   }
 
@@ -854,6 +883,11 @@ export class RealtimeOrchestrator {
     if (typeof obj.window_size === 'number') out.window_size = obj.window_size;
     if (obj.fork_switch === true) out.fork_switch = true;
     return out;
+  }
+
+  private touch(): void {
+    this._revision++;
+    this._onChange?.();
   }
 
   private emitError(err: unknown): void {
@@ -884,7 +918,21 @@ export interface RealtimeController {
   getState(): Readonly<RealtimeState>;
   /** PPLNS distribution for a specific share (hover-zoom lookup). */
   getPPLNSForShare(shortHash: string | undefined): readonly PPLNSEntry[];
+  /** Index into getState().window.shares of the cell under (x, y),
+   *  in CSS px relative to the canvas, or null. Hit-tests against the
+   *  layout that was last PAINTED, so it always agrees with what the
+   *  operator sees (auto-fit cell size included). */
+  cellAtPoint(x: number, y: number): number | null;
+  /** The grid layout of the last painted frame, or null before the
+   *  first paint. */
+  getLayout(): GridLayout | null;
+  /** Request one repaint of an idle canvas (e.g. after the host
+   *  changed the container's size by means no resize event reports). */
+  invalidate(): void;
 }
+
+/** Idle repaint cadence for the wall-clock hour axis. */
+const AXIS_CLOCK_MS = 60_000;
 
 export function createRealtime(opts: RealtimeDOMOptions): RealtimeController {
   const orchestrator = new RealtimeOrchestrator(opts);
@@ -893,39 +941,134 @@ export function createRealtime(opts: RealtimeDOMOptions): RealtimeController {
   if (ctx2d === null) throw new Error('createRealtime: canvas context unavailable');
   const getDpr = opts.getDevicePixelRatio ?? (() => window.devicePixelRatio || 1);
   let raf: number | null = null;
-  let stopped = false;
+  let stopped = true;
+  // Key of the static frame on the canvas; null forces the next idle
+  // tick to paint (set after every animation frame and by invalidate).
+  let paintedKey: string | null = null;
+  let paintedLayout: GridLayout | null = null;
+  let cssW = -1, cssH = -1, backingW = -1, backingH = -1;
+  let resizeObserver: { disconnect(): void } | null = null;
+  // The static frame's hour-axis labels are computed from wall-clock
+  // age, so a quiet chain still gets one repaint a minute.
+  let clockTimer: ReturnType<typeof setInterval> | null = null;
 
-  const loop = (now: number): void => {
-    if (stopped) return;
-    const frame = orchestrator.currentFrame(now);
-    if (frame !== null) {
-      const dpr = getDpr();
-      opts.canvas.style.width = `${frame.layout.cssWidth}px`;
-      opts.canvas.style.height = `${frame.layout.cssHeight}px`;
-      opts.canvas.width = Math.round(frame.layout.cssWidth * dpr);
-      opts.canvas.height = Math.round(frame.layout.cssHeight * dpr);
-      const program: PaintCommand[] = buildAnimatedPaintProgram(frame, dpr);
-      executePaintProgram(ctx2d as unknown as import('./grid-paint.js').CanvasLike, program);
-    }
+  const schedule = (): void => {
+    if (stopped || raf !== null) return;
     raf = window.requestAnimationFrame(loop);
+  };
+
+  const staticKey = (dpr: number): string => {
+    const h = opts.containerHeight ? opts.containerHeight() : -1;
+    return `${orchestrator.revision}|${opts.containerWidth()}|${h}|${dpr}`;
+  };
+
+  const paint = (frame: FrameSpec, dpr: number): void => {
+    const { cssWidth, cssHeight } = frame.layout;
+    if (cssWidth !== cssW || cssHeight !== cssH) {
+      opts.canvas.style.width = `${cssWidth}px`;
+      opts.canvas.style.height = `${cssHeight}px`;
+      cssW = cssWidth; cssH = cssHeight;
+    }
+    // Assigning canvas.width/height reallocates and clears the backing
+    // store, so only do it when the size really changes. Every paint
+    // program starts with setTransform + a full background fill, so an
+    // unchanged backing store needs no clearing.
+    const bw = Math.round(cssWidth * dpr);
+    const bh = Math.round(cssHeight * dpr);
+    if (bw !== backingW || bh !== backingH) {
+      opts.canvas.width = bw;
+      opts.canvas.height = bh;
+      backingW = bw; backingH = bh;
+    }
+    const program: PaintCommand[] = buildAnimatedPaintProgram(frame, dpr);
+    executePaintProgram(ctx2d as unknown as import('./grid-paint.js').CanvasLike, program);
+    paintedLayout = frame.layout;
+  };
+
+  // rAF runs only while something changes: an animation is in flight,
+  // or the static frame's inputs (orchestrator revision, container size,
+  // DPR) differ from what is on the canvas. An idle canvas costs nothing.
+  const loop = (now: number): void => {
+    raf = null;
+    if (stopped) return;
+    const dpr = getDpr();
+    const animFrame = orchestrator.animationFrame(now);
+    if (animFrame !== null) {
+      paint(animFrame, dpr);
+      paintedKey = null;  // repaint the settled static frame after the last tick
+      schedule();
+      return;
+    }
+    const key = staticKey(dpr);
+    if (key === paintedKey) return;  // nothing changed: let the loop stop
+    const frame = orchestrator.buildStaticFrame();
+    if (frame !== null) paint(frame, dpr);
+    paintedKey = key;
+  };
+
+  const onResize = (): void => schedule();
+
+  /** Undo everything start() attached (also when start() fails). */
+  const detach = (): void => {
+    stopped = true;
+    if (raf !== null) window.cancelAnimationFrame(raf);
+    raf = null;
+    if (typeof window.removeEventListener === 'function') {
+      window.removeEventListener('resize', onResize);
+    }
+    resizeObserver?.disconnect();
+    resizeObserver = null;
+    if (clockTimer !== null) clearInterval(clockTimer);
+    clockTimer = null;
+    orchestrator.setChangeListener(null);
   };
 
   return {
     async start() {
       stopped = false;
-      await orchestrator.start();
-      raf = window.requestAnimationFrame(loop);
+      paintedKey = null;
+      orchestrator.setChangeListener(schedule);
+      if (typeof window.addEventListener === 'function') {
+        window.addEventListener('resize', onResize);
+      }
+      const RO = (globalThis as unknown as { ResizeObserver?: new (cb: () => void) => {
+        observe(el: Element): void; disconnect(): void;
+      } }).ResizeObserver;
+      const container = opts.canvas.parentElement;
+      if (RO !== undefined && container !== null && resizeObserver === null) {
+        const ro = new RO(onResize);
+        ro.observe(container);
+        resizeObserver = ro;
+      }
+      if (clockTimer === null) {
+        clockTimer = setInterval(() => { paintedKey = null; schedule(); }, AXIS_CLOCK_MS);
+        // Never keep a non-browser host (tests, SSR) alive on this timer.
+        (clockTimer as unknown as { unref?: () => void }).unref?.();
+      }
+      try {
+        await orchestrator.start();
+      } catch (err) {
+        detach();  // a failed start leaves no listener, observer or timer behind
+        throw err;
+      }
+      schedule();
     },
     async stop() {
-      stopped = true;
-      if (raf !== null) window.cancelAnimationFrame(raf);
-      raf = null;
+      detach();
       await orchestrator.stop();
       renderer.destroy();
     },
     refresh: () => orchestrator.refresh(),
     getState: () => orchestrator.getState(),
     getPPLNSForShare: (h) => orchestrator.getPPLNSForShare(h),
+    cellAtPoint(x, y) {
+      return paintedLayout === null ? null : cellAtPoint(paintedLayout, x, y);
+    },
+    getLayout: () => paintedLayout,
+    invalidate() {
+      paintedKey = null;
+      schedule();
+    },
   };
 }
 

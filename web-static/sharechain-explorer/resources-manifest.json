@@ -1,30 +1,42 @@
 {
   "version": "0.1.0-alpha",
-  "generated": "2026-10-24T08:56:44.548Z",
+  "generated": "2026-11-16T20:12:25.287Z",
   "files": [
+    "layout.js",
     "pplns-view.js",
+    "scene.js",
     "sharechain-explorer.js",
     "shared-core.js"
   ],
   "filesDev": [
+    "layout.js.map",
     "pplns-view.js.map",
+    "scene.js.map",
     "sharechain-explorer.js.map",
     "shared-core.js.map"
   ],
   "integrity": {
-    "pplns-view.js": "sha384-/cHI3U+QO74fSFbk0Es5ETWJMR1ZoT9gzRCGJNB1bPlprrz+o6AzuKRYTkRxdgtp",
-    "pplns-view.js.map": "sha384-J4jHvn3U6ZFjUtKDE5Y8h+AMx52ASTFtlaaS4qYsg3t8N00LlONyNWaagbofgda9",
-    "sharechain-explorer.js": "sha384-pQEmURV82e/JBXMAFoY9M7ElfnREAORiimrI7htdtrFstBQec3ziiQBYdN2AfcRk",
-    "sharechain-explorer.js.map": "sha384-n08ICGJTah8aZeFO6UpbhqmsxOdlpra9Q2x8Nk36V+W8h0m+7oW3eZCIcYpe9p/t",
-    "shared-core.js": "sha384-ipfy2tdWEJ1Abd5eM+9rad7vgI2AYVtjWtC2hoPKX+SYV30U1pH3UWVtQdO3h/LT",
-    "shared-core.js.map": "sha384-h/CtoHST4knUYeVo+rPk/UQ3LdmWyDAmKSel1UjUnOs4czHLCdkgsl7rdMrwCxn0"
+    "layout.js": "sha384-rznDQ7GymZsiXsx0M6XkdytffpQXO+CNx+4zJNjZ4+va0cOxu+Brnb5yIZm/Nx8m",
+    "layout.js.map": "sha384-uJB6MoaokCgUadLKQ8f8iKypssZ9gfnzJKBp/JxA9lfdvmFn9Fb0Df8gxqcOaGYr",
+    "pplns-view.js": "sha384-NjHhKQeff+IRCogCuPAheyw+SjqO4kJ+d8/vJ8MnonqacLoEKT31DFXX7NnzIpJj",
+    "pplns-view.js.map": "sha384-u0IcyEfgptNxkEzoFtHXIKk1MA4WzxqgqXIZ/lwyRwl6iYgWFux92qYuSSyhi8a5",
+    "scene.js": "sha384-vQa0JjZSxu5nlLALtFn/wtZOiu4mz9+5hvW5uMYpnrHqlQuKDiwaxILBDjdshYhQ",
+    "scene.js.map": "sha384-jhtoykjZDayAkM+XMQ3E1ZrRg2y0jn5TGp62G6iHjc5RV6aqJZW23UUMgW6nFPNF",
+    "sharechain-explorer.js": "sha384-tSVTmIOo/Li3vCA7XRq0TP04jxBbOFQLxu7KLJdGNgNc4gROgvYayN0KCEeXIUDF",
+    "sharechain-explorer.js.map": "sha384-JMU9ASm6Z/F7ZXL+9d0YUsLtV94ULcxOvuAJahEZe5Y3gNgFgqdPkh3YJ3VPI/sw",
+    "shared-core.js": "sha384-WaH4sIhVIyNuRMNgoN1ysxpl2iraZzc+UE+nv6j/rAdNY/TACXN9daLxfr0APLLY",
+    "shared-core.js.map": "sha384-VH28vuULY6fs/wyk/4X0DCMSb2AuttuvmeNswcNvr2ZhPfqPvWUJ/wTcSpzQjw7Z"
   },
   "sizes": {
-    "pplns-view.js": 32954,
-    "pplns-view.js.map": 128604,
-    "sharechain-explorer.js": 60053,
-    "sharechain-explorer.js.map": 287576,
-    "shared-core.js": 25695,
-    "shared-core.js.map": 114315
+    "layout.js": 1510,
+    "layout.js.map": 9110,
+    "pplns-view.js": 32751,
+    "pplns-view.js.map": 129625,
+    "scene.js": 33847,
+    "scene.js.map": 171809,
+    "sharechain-explorer.js": 61455,
+    "sharechain-explorer.js.map": 300205,
+    "shared-core.js": 25949,
+    "shared-core.js.map": 118924
   }
 }

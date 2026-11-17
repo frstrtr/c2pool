@@ -25,6 +25,11 @@ public:
     CSHA256(uint32_t* custom_init, std::vector<unsigned char> _buf = {}, uint64_t _length = 0);
     CSHA256& Write(const unsigned char* data, size_t len);
     void Finalize(unsigned char hash[OUTPUT_SIZE]);
+    // NOT the digest: copies the eight internal state words in host byte
+    // order (each 4-byte group reversed on little-endian), without the
+    // big-endian write Finalize(unsigned char*) does. A c2pool core uint256's
+    // begin() is a uint32_t*, so Finalize(x.begin()) silently lands here; use
+    // Finalize(x.data()) for a digest (the #968a BIP 152 short-id bug).
     void Finalize(uint32_t hash[OUTPUT_SIZE / 4]);
     CSHA256& Reset();
 };

@@ -5,9 +5,13 @@
 #include <leveldb/filter_policy.h>
 #include <leveldb/cache.h>
 #include <core/leveldb_pread_env.hpp>
+#include <algorithm>
 #include <cstring>
 #include <filesystem>
+#include <limits>
+#include <map>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <thread>
 #include <sstream>
@@ -54,6 +58,135 @@ void unregister(std::string& key)
     std::lock_guard<std::mutex> lock(registry_mutex());
     registry().erase(key);
     key.clear();
+}
+
+// The height index (leveldb_store.hpp): `height:<h>` holds ONE 32-byte hash,
+// exactly as every earlier binary wrote and reads it (the primary); every
+// other stored share of absheight h has a key of its own, `hsib:<h><hash>`.
+constexpr size_t kHashBytes = 32;
+const std::string kHeightPrefix = "height:";
+const std::string kSiblingPrefix = "hsib:";
+
+std::string height_digits(uint64_t height)
+{
+    std::ostringstream oss;
+    oss << std::setfill('0') << std::setw(16) << height;
+    return oss.str();
+}
+
+std::string sibling_prefix(uint64_t height) { return kSiblingPrefix + height_digits(height); }
+
+std::string sibling_key(uint64_t height, const uint256& hash) { return sibling_prefix(height) + hash.ToString(); }
+
+std::vector<uint8_t> hash_bytes(const uint256& hash)
+{
+    return std::vector<uint8_t>(hash.data(), hash.data() + kHashBytes);
+}
+
+uint256 hash_from_bytes(const uint8_t* p)
+{
+    std::vector<unsigned char> v(p, p + kHashBytes);
+    return uint256(v);
+}
+
+// Every stored share of one absheight, as the store holds it and as it held
+// it when read (only the difference is written back).
+struct HeightSlot
+{
+    std::optional<uint256> primary, primary0;
+    std::set<uint256> siblings, siblings0;
+
+    void add(const uint256& hash)
+    {
+        if (!primary)
+            primary = hash;
+        else if (*primary != hash)
+            siblings.insert(hash);
+    }
+    // Removes `hash` and only it. A removed primary is replaced by a sibling:
+    // the `height:` key goes only with the last share of the height.
+    void erase(const uint256& hash)
+    {
+        if (primary && *primary == hash) {
+            primary.reset();
+            if (!siblings.empty()) {
+                primary = *siblings.begin();
+                siblings.erase(siblings.begin());
+            }
+        } else {
+            siblings.erase(hash);
+        }
+    }
+};
+
+// Reads the slot of `height`. False on a read error (an absent key is not one).
+bool load_height_slot(LevelDBStore& store, const std::string& height_key, uint64_t height, HeightSlot& slot)
+{
+    std::vector<uint8_t> value;
+    bool found = false;
+    if (!store.lookup(height_key, value, found))
+        return false;
+    if (found && value.size() == kHashBytes)
+        slot.primary = hash_from_bytes(value.data());
+    const std::string prefix = sibling_prefix(height);
+    const bool scanned = store.for_each_prefix(prefix, [&](const std::string& key, const std::vector<uint8_t>&) {
+        if (key.size() == prefix.size() + 64) {
+            uint256 hash;
+            hash.SetHex(key.substr(prefix.size()));
+            if (!slot.primary || *slot.primary != hash)
+                slot.siblings.insert(hash);
+        }
+        return true;
+    });
+    if (!scanned)
+        return false;
+    slot.primary0 = slot.primary;
+    slot.siblings0 = slot.siblings;
+    if (!slot.primary && !slot.siblings.empty()) {   // not a state this store leaves: repair
+        slot.primary = *slot.siblings.begin();
+        slot.siblings.erase(slot.siblings.begin());
+    }
+    return true;
+}
+
+void stage_height_slot(LevelDBStore::BatchWriter& batch, const std::string& height_key, uint64_t height,
+                       const HeightSlot& slot)
+{
+    if (slot.primary != slot.primary0) {
+        if (slot.primary)
+            batch.put(height_key, hash_bytes(*slot.primary));
+        else
+            batch.remove(height_key);
+    }
+    for (const auto& hash : slot.siblings0)
+        if (!slot.siblings.count(hash))
+            batch.remove(sibling_key(height, hash));
+    for (const auto& hash : slot.siblings)
+        if (!slot.siblings0.count(hash))
+            batch.put(sibling_key(height, hash), hash_bytes(hash));
+}
+
+// The parent, absheight and verified flag of an `index:` record (see
+// store_share for its layout; the verified byte is absent in the oldest).
+bool parse_index_value(const std::vector<uint8_t>& meta, uint256& prev, uint64_t& height, bool& is_verified)
+{
+    try {
+        PackStream ps(std::span<const std::byte>(
+            reinterpret_cast<const std::byte*>(meta.data()), meta.size()));
+        uint256 work, target;
+        uint64_t ts = 0;
+        uint8_t orphan = 0;
+        ps >> prev >> height >> ts >> work >> target >> orphan;
+        is_verified = false;
+        try {
+            uint8_t verified = 0;
+            ps >> verified;
+            is_verified = verified != 0;
+        } catch (...) {}
+        return true;
+    } catch (...) {
+        return false;
+    }
 }
 
 } // namespace
@@ -259,6 +392,29 @@ bool LevelDBStore::get(const std::string& key, std::vector<uint8_t>& value)
     }
 
     value.assign(raw_value.begin(), raw_value.end());
+    return true;
+}
+
+bool LevelDBStore::lookup(const std::string& key, std::vector<uint8_t>& value, bool& found)
+{
+    found = false;
+    value.clear();
+    if (!m_db) {
+        LOG_ERROR << "LevelDB store not open";
+        return false;
+    }
+    leveldb::ReadOptions read_options;
+    read_options.verify_checksums = m_options.verify_checksums;
+    std::string raw_value;
+    leveldb::Status status = m_db->Get(read_options, key, &raw_value);
+    if (status.IsNotFound())
+        return true;
+    if (!status.ok()) {
+        LOG_ERROR << "Failed to get key '" << key << "': " << status.ToString();
+        return false;
+    }
+    value.assign(raw_value.begin(), raw_value.end());
+    found = true;
     return true;
 }
 
@@ -556,59 +712,23 @@ bool SharechainLevelDBStore::open()
     // Load metadata
     load_metadata();
 
-    // Check dirty flag — if set, previous shutdown was ungraceful.
-    // Rebuild height index from share data to ensure consistency.
+    // The dirty flag: 1 while open (an ungraceful shutdown leaves it), and the
+    // value close() writes. This binary writes kCleanClose (2); every earlier
+    // binary writes 0 and treats only 1 as dirty. So anything but 2 means the
+    // height index was last written by a binary that does not keep every
+    // share of a height in it (or the shutdown was ungraceful): rebuild it
+    // from the share records, as the ungraceful-shutdown path always did.
     std::vector<uint8_t> dirty_data;
     bool was_dirty = false;
-    if (m_store->get("dirty", dirty_data) && !dirty_data.empty() && dirty_data[0] == 1) {
+    const bool has_flag = m_store->get("dirty", dirty_data) && !dirty_data.empty();
+    const uint8_t flag = has_flag ? dirty_data[0] : 0;
+    if (flag == 1) {
         was_dirty = true;
         LOG_WARNING << "SharechainLevelDB: dirty flag set — previous shutdown was ungraceful";
-        LOG_INFO << "SharechainLevelDB: rebuilding height index...";
-        // Scan all index: keys, re-read metadata, rebuild height: keys
-        auto all_keys = m_store->list_keys("index:", std::numeric_limits<size_t>::max());
-        int rebuilt = 0, removed_stale = 0;
-        auto batch = m_store->create_batch();
-        // First: remove all existing height: keys
-        auto old_heights = m_store->list_keys("height:", std::numeric_limits<size_t>::max());
-        for (const auto& hk : old_heights)
-            batch.remove(hk);
-        // Then: rebuild from index metadata
-        for (const auto& idx_key : all_keys) {
-            // idx_key = "index:<hash_hex>"
-            std::string hash_hex = idx_key.substr(6);
-            uint256 hash;
-            hash.SetHex(hash_hex);
-            std::string share_key = make_share_key(hash);
-            if (!m_store->exists(share_key)) {
-                // Stale index entry — share data missing
-                batch.remove(idx_key);
-                ++removed_stale;
-                continue;
-            }
-            std::vector<uint8_t> meta_data;
-            if (!m_store->get(idx_key, meta_data)) continue;
-            try {
-                PackStream ps(std::span<const std::byte>(
-                    reinterpret_cast<const std::byte*>(meta_data.data()), meta_data.size()));
-                uint256 prev; uint64_t height, ts; uint256 work, target; uint8_t orphan;
-                ps >> prev >> height >> ts >> work >> target >> orphan;
-                if (height > 0) {
-                    std::string hk = make_height_key(height);
-                    std::vector<uint8_t> hash_data(hash.data(), hash.data() + 32);
-                    batch.put(hk, hash_data);
-                    ++rebuilt;
-                }
-            } catch (...) {
-                batch.remove(idx_key);
-                ++removed_stale;
-            }
-        }
-        batch.commit();
-        // Update metadata
-        m_metadata.total_shares = rebuilt;
-        save_metadata();
-        LOG_INFO << "SharechainLevelDB: rebuilt " << rebuilt << " height entries"
-                 << " (removed " << removed_stale << " stale)";
+        rebuild_height_index("ungraceful shutdown");
+    } else if (flag != kCleanClose && !m_store->list_keys("index:", 1).empty()) {
+        rebuild_height_index(has_flag ? "last closed by a binary without the per-share height index"
+                                      : "no close recorded");
     }
 
     // Set dirty flag — cleared on graceful close()
@@ -644,8 +764,9 @@ bool SharechainLevelDBStore::open_waiting(int attempts, std::chrono::millisecond
 void SharechainLevelDBStore::close()
 {
     if (m_store && m_store->is_open()) {
-        // Clear dirty flag — marks clean shutdown
-        std::vector<uint8_t> flag = {0};
+        // Clean shutdown by this binary (see open()): kCleanClose, not the 0
+        // earlier binaries write, so a later open can tell they ran.
+        std::vector<uint8_t> flag = {kCleanClose};
         m_store->put("dirty", flag);
         save_metadata();
         m_store->close();
@@ -668,6 +789,121 @@ std::string SharechainLevelDBStore::make_height_key(uint64_t height) const
     std::ostringstream oss;
     oss << "height:" << std::setfill('0') << std::setw(16) << height;
     return oss.str();
+}
+
+void SharechainLevelDBStore::rebuild_height_index(const char* why)
+{
+    LOG_INFO << "SharechainLevelDB: rebuilding height index (" << why << ")...";
+    const auto t0 = std::chrono::steady_clock::now();
+    struct Row { uint256 hash; uint256 prev; uint64_t height; bool verified; };
+    std::vector<Row> rows;
+    std::vector<std::string> stale;
+    const bool scanned = m_store->for_each_prefix(
+        "index:", [&](const std::string& idx_key, const std::vector<uint8_t>& meta) {
+            // idx_key = "index:<hash_hex>"
+            Row row{};
+            row.hash.SetHex(idx_key.substr(6));
+            // Share data missing, or metadata unreadable: a stale index entry.
+            if (!m_store->exists(make_share_key(row.hash))
+                || !parse_index_value(meta, row.prev, row.height, row.verified)) {
+                stale.push_back(idx_key);
+                return true;
+            }
+            rows.push_back(row);
+            return true;
+        });
+    if (!scanned) {
+        LOG_ERROR << "SharechainLevelDB: index scan failed; height index left as it was";
+        return;
+    }
+
+    // The primary of a height (its `height:` key, the one share every earlier
+    // binary reads) is the share on the best chain: the longest run of parent
+    // links through the stored shares, ties to the higher tip. Off that chain,
+    // a verified share, else the first by hash.
+    std::map<uint256, size_t> pos;
+    for (size_t i = 0; i < rows.size(); ++i)
+        pos.emplace(rows[i].hash, i);
+    std::vector<uint64_t> depth(rows.size(), 0);
+    for (size_t i = 0; i < rows.size(); ++i) {
+        if (depth[i])
+            continue;
+        std::vector<size_t> path;
+        size_t cur = i;
+        uint64_t base = 0;
+        while (true) {
+            path.push_back(cur);
+            auto it = pos.find(rows[cur].prev);
+            if (it == pos.end())
+                break;
+            if (depth[it->second]) {
+                base = depth[it->second];
+                break;
+            }
+            if (path.size() > rows.size())   // a parent cycle: not a chain
+                break;
+            cur = it->second;
+        }
+        for (size_t k = path.size(); k-- > 0;)
+            if (!depth[path[k]])
+                depth[path[k]] = ++base;
+    }
+    std::vector<bool> on_best(rows.size(), false);
+    size_t best_len = 0;
+    if (!rows.empty()) {
+        size_t tip = 0;
+        for (size_t i = 1; i < rows.size(); ++i)
+            if (depth[i] > depth[tip] || (depth[i] == depth[tip] && rows[i].height > rows[tip].height))
+                tip = i;
+        for (size_t cur = tip;;) {
+            if (on_best[cur])
+                break;
+            on_best[cur] = true;
+            ++best_len;
+            auto it = pos.find(rows[cur].prev);
+            if (it == pos.end())
+                break;
+            cur = it->second;
+        }
+    }
+    std::map<uint64_t, std::vector<size_t>> by_height;
+    for (size_t i = 0; i < rows.size(); ++i)
+        if (rows[i].height > 0)
+            by_height[rows[i].height].push_back(i);
+
+    auto batch = m_store->create_batch();
+    for (const auto& key : m_store->list_keys(kHeightPrefix, std::numeric_limits<size_t>::max()))
+        batch.remove(key);
+    for (const auto& key : m_store->list_keys(kSiblingPrefix, std::numeric_limits<size_t>::max()))
+        batch.remove(key);
+    size_t with_siblings = 0;
+    for (const auto& [height, idx] : by_height) {
+        size_t primary = idx.front();
+        for (size_t i : idx)
+            if (on_best[i]) { primary = i; break; }
+        if (!on_best[primary])
+            for (size_t i : idx)
+                if (rows[i].verified) { primary = i; break; }
+        batch.put(make_height_key(height), hash_bytes(rows[primary].hash));
+        for (size_t i : idx)
+            if (i != primary)
+                batch.put(sibling_key(height, rows[i].hash), hash_bytes(rows[i].hash));
+        with_siblings += idx.size() > 1 ? 1 : 0;
+    }
+    for (const auto& idx_key : stale)
+        batch.remove(idx_key);
+    if (!batch.commit()) {
+        LOG_ERROR << "SharechainLevelDB: height index rebuild failed to commit";
+        return;
+    }
+    m_metadata.total_shares = rows.size();
+    save_metadata();
+    LOG_INFO << "SharechainLevelDB: rebuilt height index: " << rows.size() << " shares at "
+             << by_height.size() << " heights (" << with_siblings << " with more than one share; best chain "
+             << best_len << " shares; removed " << stale.size() << " stale) in "
+             << std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - t0).count()
+             << " ms";
 }
 
 bool SharechainLevelDBStore::store_share(const uint256& hash, const std::vector<uint8_t>& serialized_share, const ShareMetadata& metadata)
@@ -704,11 +940,18 @@ bool SharechainLevelDBStore::store_share(const uint256& hash, const std::vector<
         );
         batch.put(index_key, metadata_data);
 
-        // Store height -> hash mapping for chain traversal
+        // Height index: the share joins its height's slot (the `height:` key
+        // when it is the first share of the height, else a `hsib:` key).
         if (metadata.height > 0) {
-            std::string height_key = make_height_key(metadata.height);
-            std::vector<uint8_t> hash_data(hash.data(), hash.data() + 32);
-            batch.put(height_key, hash_data);
+            const std::string height_key = make_height_key(metadata.height);
+            HeightSlot slot;
+            if (!load_height_slot(*m_store, height_key, metadata.height, slot)) {
+                LOG_ERROR << "Failed to store share " << hash.ToString()
+                          << ": height index unreadable at " << metadata.height;
+                return false;
+            }
+            slot.add(hash);
+            stage_height_slot(batch, height_key, metadata.height, slot);
         }
         
         if (!batch.commit()) {
@@ -738,6 +981,9 @@ bool SharechainLevelDBStore::store_shares_batch(const std::vector<BatchShareEntr
 
     try {
         auto batch = m_store->create_batch();
+        // The height slots this batch changes, read once from the store and
+        // then kept here: a batch's own puts are not visible to reads.
+        std::map<uint64_t, HeightSlot> heights;
 
         for (const auto& e : entries) {
             // Share data
@@ -759,12 +1005,20 @@ bool SharechainLevelDBStore::store_shares_batch(const std::vector<BatchShareEntr
                 reinterpret_cast<const uint8_t*>(span.data()) + span.size());
             batch.put(make_index_key(e.hash), metadata_data);
 
-            // Height mapping
+            // Height index (see store_share)
             if (e.metadata.height > 0) {
-                std::vector<uint8_t> hash_data(e.hash.data(), e.hash.data() + 32);
-                batch.put(make_height_key(e.metadata.height), hash_data);
+                auto [it, fresh] = heights.try_emplace(e.metadata.height);
+                if (fresh && !load_height_slot(*m_store, make_height_key(e.metadata.height),
+                                               e.metadata.height, it->second)) {
+                    LOG_ERROR << "Failed to store share batch (" << entries.size()
+                              << " shares): height index unreadable at " << e.metadata.height;
+                    return false;
+                }
+                it->second.add(e.hash);
             }
         }
+        for (const auto& [height, slot] : heights)
+            stage_height_slot(batch, make_height_key(height), height, slot);
 
         if (!batch.commit()) {
             LOG_ERROR << "Failed to commit share batch (" << entries.size() << " shares)";
@@ -878,9 +1132,21 @@ bool SharechainLevelDBStore::remove_share(const uint256& hash)
         batch.remove(make_share_key(hash));
         batch.remove(make_index_key(hash));
         
-        // Remove height mapping if we have metadata
+        // Only this share leaves its height's slot: a removed `height:` share is
+        // replaced by another share of the height, and the key goes only with
+        // the last one. Deleting the key whatever it held dropped the other
+        // shares of the height with it — the main-chain share whenever a fork
+        // share of its height was pruned.
         if (had_metadata && metadata.height > 0) {
-            batch.remove(make_height_key(metadata.height));
+            const std::string height_key = make_height_key(metadata.height);
+            HeightSlot slot;
+            if (!load_height_slot(*m_store, height_key, metadata.height, slot)) {
+                LOG_ERROR << "Failed to remove share " << hash.ToString()
+                          << ": height index unreadable at " << metadata.height;
+                return false;
+            }
+            slot.erase(hash);
+            stage_height_slot(batch, height_key, metadata.height, slot);
         }
         
         if (!batch.commit()) {
@@ -909,6 +1175,8 @@ bool SharechainLevelDBStore::remove_shares_batch(const std::vector<uint256>& has
     try {
         auto batch = m_store->create_batch();
         size_t removed = 0;
+        // The height slots this batch changes (see store_shares_batch).
+        std::map<uint64_t, HeightSlot> heights;
 
         for (const auto& hash : hashes)
         {
@@ -919,10 +1187,21 @@ bool SharechainLevelDBStore::remove_shares_batch(const std::vector<uint256>& has
 
             batch.remove(make_share_key(hash));
             batch.remove(make_index_key(hash));
-            if (had_meta && metadata.height > 0)
-                batch.remove(make_height_key(metadata.height));
+            // Only this share leaves its height's slot (see remove_share).
+            if (had_meta && metadata.height > 0) {
+                auto [it, fresh] = heights.try_emplace(metadata.height);
+                if (fresh && !load_height_slot(*m_store, make_height_key(metadata.height),
+                                               metadata.height, it->second)) {
+                    LOG_ERROR << "[LevelDB] batch remove failed (" << hashes.size()
+                              << " shares): height index unreadable at " << metadata.height;
+                    return false;
+                }
+                it->second.erase(hash);
+            }
             ++removed;
         }
+        for (const auto& [height, slot] : heights)
+            stage_height_slot(batch, make_height_key(height), height, slot);
 
         if (!batch.commit()) {
             LOG_ERROR << "[LevelDB] batch remove failed, count=" << hashes.size();
@@ -1058,15 +1337,26 @@ std::vector<uint256> SharechainLevelDBStore::get_chain_hashes(const uint256& sta
             if (forward) {
                 // Move forward in chain (higher height)
                 current_height++;
-                std::string height_key = make_height_key(current_height);
-                std::vector<uint8_t> hash_data;
-                
-                if (!m_store->get(height_key, hash_data) || hash_data.size() != 32) {
+                HeightSlot slot;
+                if (!load_height_slot(*m_store, make_height_key(current_height), current_height, slot)
+                    || !slot.primary) {
                     break; // No more shares in chain
                 }
                 
-                std::vector<unsigned char> hash_char_data(hash_data.begin(), hash_data.end());
-                current_hash = uint256(hash_char_data);
+                // The share of the next height whose parent is this one.
+                std::vector<uint256> candidates{*slot.primary};
+                candidates.insert(candidates.end(), slot.siblings.begin(), slot.siblings.end());
+                bool found = false;
+                for (const auto& next : candidates) {
+                    ShareMetadata next_meta;
+                    if (load_share(next, dummy_data, next_meta) && next_meta.prev_hash == current_hash) {
+                        current_hash = next;
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found)
+                    break;
             } else {
                 // Move backward in chain (follow prev_hash)
                 ShareMetadata metadata;
@@ -1114,33 +1404,68 @@ std::vector<uint256> SharechainLevelDBStore::get_shares_by_height_range(uint64_t
         return hashes;
     }
 
-    // Use LevelDB iterator with seek — O(stored shares) not O(max_height).
-    // Old code did point lookups for every height 0..max_height (26M+ lookups).
-    // Height keys are "height:XXXXXXXXXXXXXXXX" with zero-padded 16-digit height,
-    // so lexicographic iteration gives us sorted height order.
+    // Every stored share of each height in the range, in height order: the
+    // `height:` share first, then the `hsib:` shares of that height. Height
+    // keys are zero-padded to 16 digits, so key order is height order.
     try {
-        std::string start_key = make_height_key(start_height);
-        std::string end_key = make_height_key(end_height);
-        std::string prefix = "height:";
-
-        // Seek to start_key, iterate while keys have "height:" prefix and <= end_key
-        auto all_height_keys = m_store->list_keys(prefix, std::numeric_limits<size_t>::max());
-        for (const auto& key : all_height_keys) {
+        std::map<uint64_t, std::vector<uint256>> by_height;
+        const std::string start_key = make_height_key(start_height);
+        const std::string end_key = make_height_key(end_height);
+        for (const auto& key : m_store->list_keys(kHeightPrefix, std::numeric_limits<size_t>::max())) {
+            if (key.size() != kHeightPrefix.size() + 16) continue;   // not a key this store writes
             if (key < start_key) continue;
             if (key > end_key) break;
             std::vector<uint8_t> hash_data;
-            if (m_store->get(key, hash_data) && hash_data.size() == 32) {
-                std::vector<unsigned char> hash_char_data(hash_data.begin(), hash_data.end());
-                uint256 hash(hash_char_data);
-                hashes.push_back(hash);
-            }
+            if (m_store->get(key, hash_data) && hash_data.size() == kHashBytes)
+                by_height[std::stoull(key.substr(kHeightPrefix.size()))].push_back(hash_from_bytes(hash_data.data()));
         }
+        for (const auto& key : m_store->list_keys(kSiblingPrefix, std::numeric_limits<size_t>::max())) {
+            if (key.size() != kSiblingPrefix.size() + 16 + 64)
+                continue;
+            const uint64_t height = std::stoull(key.substr(kSiblingPrefix.size(), 16));
+            if (height < start_height || height > end_height)
+                continue;
+            uint256 hash;
+            hash.SetHex(key.substr(kSiblingPrefix.size() + 16));
+            auto& at = by_height[height];
+            if (std::find(at.begin(), at.end(), hash) == at.end())
+                at.push_back(hash);
+        }
+        for (const auto& [height, at] : by_height)
+            hashes.insert(hashes.end(), at.begin(), at.end());
     } catch (const std::exception& e) {
         LOG_ERROR << "Exception getting shares by height range: " << e.what();
         hashes.clear();
     }
 
     return hashes;
+}
+
+bool SharechainLevelDBStore::scan_share_index(std::vector<IndexEntry>& out)
+{
+    out.clear();
+    if (!m_store || !m_store->is_open())
+        return false;
+    const std::string prefix = "index:";
+    const bool ok = m_store->for_each_prefix(
+        prefix, [&](const std::string& key, const std::vector<uint8_t>& meta) {
+            if (key.size() != prefix.size() + 64)
+                return true;   // not a key this store wrote
+            IndexEntry e;
+            e.hash.SetHex(key.substr(prefix.size()));
+            uint256 prev;
+            if (parse_index_value(meta, prev, e.height, e.is_verified))
+                out.push_back(e);
+            return true;
+        });
+    if (!ok) {
+        out.clear();
+        return false;
+    }
+    std::sort(out.begin(), out.end(), [](const IndexEntry& a, const IndexEntry& b) {
+        return a.height != b.height ? a.height < b.height : a.hash < b.hash;
+    });
+    return true;
 }
 
 void SharechainLevelDBStore::compact()

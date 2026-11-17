@@ -385,7 +385,8 @@ TEST(DashSpork, HandshakeSendsGetSporks)
     ASSERT_NE(p, nullptr);
     // Exactly three writes this session: our version on attach, the verack
     // ack, and the getsporks pull on handshake completion. (promote_primary
-    // writes nothing; no discovery consumer is registered.)
+    // writes nothing; no discovery consumer is registered. #968a sends no
+    // blanket sendcmpct at verack: compact_negotiation.hpp.)
     EXPECT_EQ(p->msgs_sent, 3u)
         << "expected version + verack + getsporks by handshake completion";
 }

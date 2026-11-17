@@ -60,6 +60,7 @@
 
 #include <impl/dash/coin/dash_deployments.hpp>
 #include <impl/dash/coin/ehf_tracker.hpp>
+#include <impl/dash/coin/v24_activation.hpp>
 #include <impl/dash/coin/versionbits.hpp>
 
 #include <core/log.hpp>
@@ -108,18 +109,21 @@ enum class V24CrossCheck : uint8_t
 /// What a contradiction refuted (the latch level).
 enum class V24Latch : uint8_t { NONE, EXACT, BOUND };
 
-/// Validate an operator activation pin: it must be a period boundary (Core
-/// activates only at the first block of a period) and not below the earliest
-/// activation the parameters allow. Returns an error text, or empty.
+/// Validate an operator activation pin: it must be a height the network can
+/// activate v24 at (v24_activation_height_refusal, the same rule the block
+/// folds apply): the buried height where the network has one, otherwise the
+/// first block of a period, not below the earliest activation the
+/// parameters allow (mainnet 2,580,480, not just two periods). The height
+/// the chain will actually reach is not known at startup; a pin that turns
+/// out wrong is refuted by the live CbTx cross-check and the status drops
+/// to UNKNOWN, so this check only rules out impossible heights. Returns an
+/// error text, or empty.
 inline std::string validate_v24_activation_pin(DashNetwork net, int64_t pin)
 {
-    const auto& p = dash_deployment_params(net);
-    const int64_t P = vb_period(p, p.dep(DashDeployment::V24));
     if (pin <= 0) return "must be a positive height";
-    if (pin % P != 0)
-        return "must be a multiple of the " + std::to_string(P) + "-block window (activation is at a period start)";
-    // Activation needs at least STARTED and LOCKED_IN periods before it.
-    if (pin < 2 * P) return "is below the earliest possible activation";
+    if (pin >= static_cast<int64_t>(kV24HeightUnknown)) return "is not a block height";
+    if (auto why = v24_activation_height_refusal(net, static_cast<uint32_t>(pin)))
+        return "is " + *why;
     return {};
 }
 

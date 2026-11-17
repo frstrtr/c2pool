@@ -14,6 +14,8 @@
 
 C2P_PARAM("meta.version", Meta, BOOL, COMPILE_TIME_READONLY, C_ALL, LIT, "false", NONE, "print version and exit")
   C2P_ALIAS("meta.version", BIN_DASH, "--version", FLAG)
+  C2P_ALIAS("meta.version", BIN_LTC, "--version", FLAG)
+  C2P_ALIAS("meta.version", BIN_BTC, "--version", FLAG)
   C2P_ALIAS("meta.version", BIN_DGB, "--version", FLAG)
   C2P_ALIAS("meta.version", BIN_BCH, "--version", FLAG)
   C2P_ALIAS("meta.version", BIN_BIP110, "--version", FLAG)
@@ -190,6 +192,10 @@ C2P_PARAM("sharechain.no_p2p_relay", Sharechain, BOOL, RESTART, C_DASH|C_DGB, LI
   C2P_ALIAS("sharechain.no_p2p_relay", BIN_DASH, "--no-p2p-relay", FLAG)
   C2P_ALIAS("sharechain.no_p2p_relay", BIN_DGB, "--no-p2p-relay", FLAG)
 
+C2P_PARAM("sharechain.deferred_mint", Sharechain, TRISTATE_BOOL, RESTART, C_DASH, NONE, "", NONE, "queue a solve a busy tracker declines and mint it when the lock frees (default off; --deferred-mint enables)")
+  C2P_ALIAS("sharechain.deferred_mint", BIN_DASH, "--deferred-mint", FLAG)
+  C2P_ALIAS("sharechain.deferred_mint", BIN_DASH, "--no-deferred-mint", FLAG_NO_PREFIX)
+
 C2P_PARAM("sharechain.max_conns", Sharechain, INT64, RESTART, C_LTC, LIT, "0", NONE, "max connections")
   C2P_ALIAS("sharechain.max_conns", BIN_LTC, "--max-conns", VALUE)
 
@@ -356,6 +362,9 @@ C2P_PARAM("web.external_ip", WebOps, STRING, LIVE, C_DASH|C_LTC, LIT, "", NONE, 
 C2P_PARAM("web.dashboard_dir", WebOps, PATH, RESTART, C_DASH|C_LTC, LIT, "web-static", NONE, "dashboard static asset dir")
   C2P_ALIAS("web.dashboard_dir", BIN_DASH, "--dashboard-dir", VALUE)
   C2P_ALIAS("web.dashboard_dir", BIN_LTC, "--dashboard-dir", VALUE)
+
+C2P_PARAM("web.mempool_entry_probe", WebOps, BOOL, RESTART, C_DASH, LIT, "false", NONE, "direct-local GET /mempool_entry probe (fee-parity shadow tooling)")
+  C2P_ALIAS("web.mempool_entry_probe", BIN_DASH, "--mempool-entry-probe", FLAG)
 
 C2P_PARAM("web.explorer", WebOps, TRISTATE_BOOL, RESTART, C_DASH|C_BIP110, NONE, "", NONE, "loopback-only /api/explorer surface (default on)")
   C2P_ALIAS("web.explorer", BIN_DASH, "--explorer", FLAG)
@@ -591,6 +600,9 @@ C2P_PARAM("embedded.superblock", Embedded, BOOL, RESTART, C_DASH, LIT, "false", 
 C2P_PARAM("embedded.govsync", Embedded, BOOL, RESTART, C_DASH, LIT, "false", NONE, "observe-only governance store")
   C2P_ALIAS("embedded.govsync", BIN_DASH, "--embedded-govsync", FLAG)
 
+C2P_PARAM("embedded.superblock_unfunded_mainnet", Embedded, BOOL, RESTART, C_DASH, LIT, "false", NONE, "TEST/SOAK ONLY - never set on a production mainnet node: serve a superblock height the node believes unfunded with a normal coinbase (default off = refuse; testnet always on)")
+  C2P_ALIAS("embedded.superblock_unfunded_mainnet", BIN_DASH, "--embedded-superblock-unfunded-mainnet", FLAG)
+
 C2P_PARAM("embedded.serve_mempool_txs", Embedded, TRISTATE_BOOL, RESTART, C_DASH|C_BIP110|C_DGB, NONE, "", NONE, "fee-carrying templates (daemonless default ON; DGB: advisory GBT only -- the mined stratum job stays coinbase-only until the S2 job-commit lands)")
   C2P_ALIAS("embedded.serve_mempool_txs", BIN_DASH, "--embedded-serve-mempool-txs", FLAG_OPT_EQFALSE)
   C2P_ALIAS("embedded.serve_mempool_txs", BIN_DGB, "--embedded-serve-mempool-txs", FLAG_OPT_EQFALSE)
@@ -632,6 +644,9 @@ C2P_PARAM("embedded.fresh_datum_race_k", Embedded, INT64, LIVE, C_DASH, LIT, "2"
 
 C2P_PARAM("embedded.getmnlistd_tracker", Embedded, TRISTATE_BOOL, LIVE, C_DASH, NONE, "", NONE, "10s slot re-ask tracker (default ON)")
   C2P_ALIAS("embedded.getmnlistd_tracker", BIN_DASH, "--embedded-getmnlistd-tracker", FLAG_OPT_EQFALSE)
+
+C2P_PARAM("embedded.compact_blocks", Embedded, TRISTATE_BOOL, RESTART, C_DASH, NONE, "", NONE, "BIP 152 compact-block receive for new tip bodies (default ON; =false fetches every body whole)")
+  C2P_ALIAS("embedded.compact_blocks", BIN_DASH, "--embedded-compact-blocks", FLAG_OPT_EQFALSE)
 
 C2P_PARAM("embedded.asn_diversity", Embedded, TRISTATE_BOOL, LIVE, C_DASH, NONE, "", NONE, "require >=2 ASNs in racing set")
   C2P_ALIAS("embedded.asn_diversity", BIN_DASH, "--embedded-asn-diversity", FLAG_OPT_EQFALSE)

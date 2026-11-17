@@ -29,6 +29,7 @@
 // ---------------------------------------------------------------------------
 
 #include <impl/dash/coin/dash_txid.hpp>
+#include <impl/dash/coin/vendor/cbtx.hpp>     // CCbTx, parse_cbtx (merkleRootAssetUnlocks bind)
 #include "rpc_data.hpp"                       // dash::coin::DashWorkData
 #include "block.hpp"                          // dash::coin::BlockType (body↔header binding)
 #include <impl/dash/crypto/hash_x11.hpp>      // dash::crypto::hash_x11
@@ -80,6 +81,36 @@ inline uint256 compute_merkle_root(const std::vector<uint256>& txids)
     return layer[0];
 }
 
+// Dash Core v24.0.0 CheckMerkleRoot (validation.cpp), second half: a version-2
+// asset unlock's txid excludes its quorum signing bytes, so the tx merkle root
+// does not commit to them; a CbTx of version >= 4 commits the unlocks' INSTANCE
+// hashes instead (merkleRootAssetUnlocks). A mismatch is a mutation, rejected as
+// BLOCK_MUTATED "bad-cbtx-assetunlockmerkleroot": signing-info bytes a middleman
+// altered without breaking the merkle root.
+// Core's condition: vtx[0] is a type-5 coinbase whose payload deserializes as a
+// CCbTx (GetTxPayload, assert_type false; a payload that does not skips the
+// check) with nVersion >= MERKLE_ROOT_ASSETUNLOCKS. There is no deployment test:
+// the CbTx version decides. Our parse_cbtx is a little laxer than GetTxPayload
+// (no MAX_SIZE range on the bestCLHeightDiff CompactSize, no G2 validity check of
+// bestCLSignature), so for such a payload we check where Core skips. Core rejects
+// that block anyway (bad-cbtx-payload in specialtxman), so this refuses nothing
+// on a valid chain; it only calls an invalid block "mutated, re-fetch".
+// The root is CalcCbTxMerkleRootAssetUnlocks: the instance hashes of the
+// unlocks with a stable txid, in block order, ComputeMerkleRoot (null when none).
+inline bool block_asset_unlock_root_binds(const BlockType& block)
+{
+    if (block.m_txs.empty()) return false;
+    const auto& cb = block.m_txs.front();
+    if (cb.type != 5) return true;           // not a CbTx coinbase: no commitment
+    vendor::CCbTx cbtx;
+    if (!vendor::parse_cbtx(cb.extra_payload, cbtx)) return true;
+    if (cbtx.nVersion < vendor::CCbTx::VERSION_MERKLE_ROOT_ASSETUNLOCKS) return true;
+    std::vector<uint256> leaves;
+    for (const auto& tx : block.m_txs)
+        if (is_asset_unlock_with_stable_txid(tx)) leaves.push_back(dash_instance_hash(tx));
+    return compute_merkle_root(leaves) == cbtx.merkleRootAssetUnlocks;
+}
+
 // Body↔header binding (reward-critical, E2 finding A). The P2P layer validates
 // HEADERS (X11 PoW + DarkGravityWave) but delivers block BODIES cryptographically
 // UNBOUND: nothing checks the tx set against the header's committed merkle root.
@@ -93,6 +124,7 @@ inline uint256 compute_merkle_root(const std::vector<uint256>& txids)
 // padded with duplicate txids yields the same root but is consensus-INVALID, so
 // we reject it too (never false-ACCEPT a mutated body). Matches dashcore block
 // acceptance byte-for-byte. txid = sha256d(canonical tx bytes) == dash_txid.
+// Then the second half of Core's CheckMerkleRoot: block_asset_unlock_root_binds.
 inline bool block_body_binds_to_header(const BlockType& block)
 {
     if (block.m_txs.empty()) return false;   // a real block always carries a coinbase
@@ -118,7 +150,8 @@ inline bool block_body_binds_to_header(const BlockType& block)
         layer.swap(next);
     }
     if (mutated) return false;               // mutated body — consensus-invalid, fail closed
-    return layer[0] == block.m_merkle_root;
+    if (layer[0] != block.m_merkle_root) return false;
+    return block_asset_unlock_root_binds(block);
 }
 
 // Compact nBits -> 256-bit target (Bitcoin/Dash compact form). uint256 carries

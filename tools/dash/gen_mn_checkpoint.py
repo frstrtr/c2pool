@@ -25,7 +25,22 @@ re-validates that checkpoint file.
             holds them PRESENT but INELIGIBLE (mn_checkpoint.hpp derives
             isValid as poseBanHeight == 0) and the revive path works as written.
   verify -- re-derive the digest of an existing .inc and confirm every structural
-            rule the runtime parser enforces (mn_checkpoint.hpp).
+            rule the runtime parser enforces (mn_checkpoint.hpp). Also prints
+            the CONTENT digest (below).
+  compare -- compare a checkpoint with YOUR dashd's `protx list registered
+            true <its height>`: the blockhash, then all 17 columns of every
+            masternode, operator keys compared in one encoding. Prints the
+            content digest of both sides; exit 0 only when they are equal.
+            This is how an independent operator reproduces an anchor.
+
+            Why not just compare the file digest: it also covers the
+            provenance lines (`source`, `generated`), and a self-derived
+            anchor stores version-1 operator keys in canonical BASIC BLS
+            encoding while dashd prints them in LEGACY. Both forms are valid
+            (the runtime converts at load), so two correct checkpoints of one
+            set can carry different file digests. The CONTENT digest covers
+            network, height, blockhash, count and every row with operator keys
+            in BASIC, and nothing else: one set, one content digest.
 
 Authoritative format spec: src/impl/dash/coin/mn_checkpoint.hpp header comment and
 src/impl/dash/coin/checkpoints/README.md. The field conversions here MIRROR
@@ -47,6 +62,12 @@ import sys
 import urllib.request
 
 MAGIC = "c2pool-dash-mn-checkpoint/1"
+CONTENT_MAGIC = "c2pool-dash-mn-content/1"
+# The 17 fields of an `mn` record, in order (mn_checkpoint.hpp).
+MN_COLUMNS = ("proTxHash", "collateralHash", "collateralIndex", "type", "version",
+              "registeredHeight", "lastPaidHeight", "poseRevivedHeight", "poseBanHeight",
+              "consecutivePayments", "revocationReason", "operatorReward", "scriptPayout",
+              "scriptOperatorPayout", "keyIDOwner", "keyIDVoting", "pubKeyOperator")
 
 # Coin address version bytes (governance_object.hpp / chainparams):
 #   mainnet PUBKEY_ADDRESS=76 ('X'), SCRIPT_ADDRESS=16 ('7')
@@ -351,6 +372,65 @@ def parse_checkpoint(payload, expected_network=None):
     return have
 
 
+# ── operator-key encoding + content digest (mn_checkpoint.hpp P-3) ──────────
+# Dash Core prints an operator key in its entry's OWN scheme: LEGACY for a
+# version-1 entry, BASIC for version 2. A self-derived checkpoint (`source
+# self-derived ...`) stores every key in canonical BASIC; any other checkpoint
+# holds the keys as dashd prints them, and the runtime converts version-1 keys
+# at load. One G1 point, two byte forms: the compressed x is the same and only
+# the flag bits of byte 0 differ. BASIC: bit 7 = compressed (always set), bit 6
+# = infinity, bit 5 = sign. LEGACY: bit 7 = the same sign, bits 6-5 clear.
+# Checked against all 1,301 non-null version-1 keys of the mainnet set at
+# h=2563800 (Dash Core 24.0.2 against the shipped anchor): x equal in every
+# pair, flags 0x00 <-> 0x80 and 0x80 <-> 0xa0, nothing else. This maps
+# ENCODINGS for comparison; it does not validate the point (the node does, at
+# load).
+def opkey_legacy_to_basic(hex_key):
+    if hex_key == "-":
+        return hex_key
+    b = bytearray(bytes.fromhex(hex_key))
+    if len(b) != BLS_PUBKEY_HEXLEN // 2:
+        raise ValueError("operator key is not %d bytes" % (BLS_PUBKEY_HEXLEN // 2))
+    if not any(b):
+        return "-"                          # a null (revoked) key stays null
+    if b[0] & 0x60:
+        raise ValueError("not a canonical LEGACY G1 encoding (byte 0 bits 6-5 set)")
+    b[0] = 0x80 | (0x20 if b[0] & 0x80 else 0x00) | (b[0] & 0x1F)
+    return bytes(b).hex()
+
+
+def keys_are_basic(cp):
+    """The runtime's rule (mn_checkpoint.hpp): a self-derived checkpoint holds
+    BASIC keys, any other one holds them as dashd prints them."""
+    return cp.get("source", "").startswith("self-derived")
+
+
+def normalized_rows(entries, basic):
+    """{proTxHash: 17 fields} with every operator key in canonical BASIC."""
+    out = {}
+    for f in entries:
+        f = list(f)
+        # A null key is written `-` by c2pool's dumpers and as 96 zeros by
+        # dashd; the runtime reads both as the all-zero key.
+        if f[16] != "-" and set(f[16]) == {"0"}:
+            f[16] = "-"
+        elif not basic and f[4] == "1":
+            f[16] = opkey_legacy_to_basic(f[16])
+        out[f[0]] = f
+    return out
+
+
+def content_digest(network, height, blockhash, rows):
+    """SHA-256 over the set itself: network, height, blockhash, count and every
+    row (sorted by proTxHash, operator keys in BASIC). The provenance lines are
+    not in it, so a self-derived and a dashd-derived checkpoint of one set
+    carry one content digest."""
+    lines = [CONTENT_MAGIC, "network " + network, "height %d" % int(height),
+             "blockhash " + blockhash.lower(), "count %d" % len(rows)]
+    lines += ["mn " + " ".join(rows[pro]) for pro in sorted(rows)]
+    return hashlib.sha256(("\n".join(lines) + "\n").encode("ascii")).hexdigest()
+
+
 # ── RPC ────────────────────────────────────────────────────────────────────
 def rpc_call(url, user, password, method, params):
     body = json.dumps({"jsonrpc": "1.0", "id": "gen", "method": method, "params": params}).encode()
@@ -460,6 +540,91 @@ def cmd_verify(args):
              len(cp["_entries"]) - banned, banned))
     print("    blockhash=%s" % cp["blockhash"])
     print("    digest=%s (recomputed, matches)" % cp["digest"])
+    rows = normalized_rows(cp["_entries"], keys_are_basic(cp))
+    print("    content digest=%s (operator keys in BASIC; the same for every"
+          " correct checkpoint of this set -- see `compare`)"
+          % content_digest(cp["network"], cp["height"], cp["blockhash"], rows))
+
+
+def cmd_compare(args):
+    with open(args.file) as f:
+        payload = unwrap_inc(f.read())
+    try:
+        cp = parse_checkpoint(payload, expected_network=args.network)
+    except ValueError as ex:
+        die("REFUSED: %s\n  (%s)" % (ex, args.file))
+    network, height, blockhash = cp["network"], int(cp["height"]), cp["blockhash"].lower()
+    pubkey_ver, p2sh_ver = NETWORK_VERSIONS[network]
+
+    if args.protx_json:
+        if not args.blockhash:
+            die("--protx-json needs --blockhash: what YOUR dashd answers to"
+                " `getblockhash %d`" % height)
+        with open(args.protx_json) as f:
+            protx_list = json.load(f)
+        their_hash = args.blockhash.lower()
+        origin = "offline capture %s" % os.path.basename(args.protx_json)
+    elif args.rpc_url:
+        def call(method, params):
+            return rpc_call(args.rpc_url, args.rpc_user, args.rpc_password, method, params)
+        their_hash = call("getblockhash", [height]).lower()
+        protx_list = call("protx", ["list", "registered", True, height])
+        try:
+            origin = "dashd %s" % call("getnetworkinfo", []).get("subversion", "?")
+        except SystemExit:
+            origin = "dashd"
+    else:
+        die("compare needs --rpc-url (your synced dashd) or --protx-json + --blockhash")
+
+    theirs_lines = records_from_protx(protx_list, pubkey_ver, p2sh_ver)
+    try:
+        theirs = normalized_rows([l.split()[1:] for l in theirs_lines], basic=False)
+    except ValueError as ex:
+        die("your dashd's set: %s" % ex)
+    try:
+        ours = normalized_rows(cp["_entries"], keys_are_basic(cp))
+    except ValueError as ex:
+        die("REFUSED: %s" % ex)
+
+    print("checkpoint : %s" % args.file)
+    print("             network=%s height=%d count=%d source=%r"
+          % (network, height, len(ours), cp.get("source", "")))
+    print("compared to: %s, `protx list registered true %d` (%d masternodes)"
+          % (origin, height, len(theirs)))
+
+    problems = []
+    if their_hash != blockhash:
+        problems.append("blockhash differs: checkpoint %s, yours %s (another chain or fork:"
+                        " the rows below are not comparable)" % (blockhash, their_hash))
+    only_ours = sorted(set(ours) - set(theirs))
+    only_theirs = sorted(set(theirs) - set(ours))
+    if only_ours:
+        problems.append("%d masternode(s) only in the checkpoint, e.g. %s"
+                        % (len(only_ours), only_ours[0]))
+    if only_theirs:
+        problems.append("%d masternode(s) only in your dashd's set, e.g. %s"
+                        % (len(only_theirs), only_theirs[0]))
+    col_diffs = {}
+    for pro in sorted(set(ours) & set(theirs)):
+        for i, name in enumerate(MN_COLUMNS):
+            if ours[pro][i] != theirs[pro][i]:
+                col_diffs.setdefault(name, []).append(pro)
+    for name, pros in col_diffs.items():
+        problems.append("column %s differs for %d masternode(s), e.g. %s: checkpoint %s, yours %s"
+                        % (name, len(pros), pros[0], ours[pros[0]][MN_COLUMNS.index(name)],
+                           theirs[pros[0]][MN_COLUMNS.index(name)]))
+
+    d_ours = content_digest(network, height, blockhash, ours)
+    d_theirs = content_digest(network, height, their_hash, theirs)
+    print("content digest, checkpoint : %s" % d_ours)
+    print("content digest, your dashd : %s" % d_theirs)
+    if problems or d_ours != d_theirs:
+        print("MISMATCH")
+        for pr in problems:
+            print("  - " + pr)
+        sys.exit(1)
+    print("MATCH: all %d masternodes equal in all %d columns at height %d (%s)"
+          % (len(ours), len(MN_COLUMNS), height, blockhash))
 
 
 def _default_inc_path(network):
@@ -517,6 +682,19 @@ def main(argv=None):
     vp.add_argument("file")
     vp.add_argument("--network", help="assert the checkpoint is for this network")
     vp.set_defaults(func=cmd_verify)
+
+    cp = sub.add_parser("compare", help="compare a checkpoint with your dashd's set at its"
+                                        " height; print the content digest")
+    cp.add_argument("file")
+    cp.add_argument("--network", help="assert the checkpoint is for this network")
+    cp.add_argument("--rpc-url", help="your synced dashd, e.g. http://127.0.0.1:9998")
+    cp.add_argument("--rpc-user")
+    cp.add_argument("--rpc-password")
+    cp.add_argument("--protx-json",
+                    help="offline: your saved `protx list registered true <height>` JSON")
+    cp.add_argument("--blockhash",
+                    help="offline: your dashd's `getblockhash <height>` (with --protx-json)")
+    cp.set_defaults(func=cmd_compare)
 
     args = p.parse_args(argv)
     args.func(args)
