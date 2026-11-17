@@ -1112,7 +1112,7 @@ legacy YAML key set.
 | `--coinbase-text` | `coinbase_text` | see below | Custom coinbase scriptSig text |
 | `--message-blob-hex` | -- | -- | V36 authority message blob |
 | `--doge-testnet4alpha` | `doge_testnet4alpha` | false | Use DOGE testnet4alpha |
-| `--import-found-blocks FILE` | `import_found_blocks` | -- | Restore the pool's found-block history from another node's `/recent_blocks` (see [Restore found-block history](#restore-found-block-history)) |
+| `--import-found-blocks FILE` (repeatable, or `A,B`) | `import_found_blocks` (path or list) | -- | Restore the pool's found-block history from another node's `/recent_blocks` and `/recent_merged_blocks` (see [Restore found-block history](#restore-found-block-history)) |
 
 ---
 
@@ -1441,32 +1441,49 @@ Recent Blocks list, and its luck and effort start from there. The pool's
 history is on every other node. To bring it in (`c2pool-ltc`):
 
 ```bash
-# 1. Take the history from any node of the pool (its dashboard / web port):
-curl -s http://<other-node>:<web-port>/recent_blocks -o blocks.json
+# 1. Take the history from any node of the pool (its dashboard / web URL):
+#    the LTC blocks, and the merged (DOGE) blocks.
+curl -s https://ltc.voidbind.com/recent_blocks -o blocks.json
+curl -s https://ltc.voidbind.com/recent_merged_blocks -o merged.json
 
-# 2. Start your node once with the file (or YAML: import_found_blocks: blocks.json):
-./c2pool-ltc <your usual options> --import-found-blocks blocks.json
+# 2. Start your node once with both files, imported in this order:
+./c2pool-ltc <your usual options> \
+    --import-found-blocks blocks.json --import-found-blocks merged.json
 ```
 
-The import runs at startup, after the embedded LTC header chain is synced (it
-waits for the sync and says so in the log), then logs one summary line:
-`found-block import DONE: N rows: imported ..., already held ..., rejected ...
-(reason=count ...)`. It is safe to run again: a block the ledger already holds
-only gains the fields it lacks, nothing the node recorded itself is replaced.
-There is no HTTP write endpoint for this, on purpose.
+`--import-found-blocks` may be given more than once or as a comma list
+(`--import-found-blocks blocks.json,merged.json`); in the legacy YAML,
+`import_found_blocks: [blocks.json, merged.json]` or a single path. Any node of
+the pool will do: `http://<node>:<web-port>/recent_blocks` (8080 by default).
+
+The import runs at startup, after the embedded header chains are synced (it
+waits for the sync and says so in the log). Each file gets a summary line, then
+the run a total, counted per chain:
+
+```
+found-block import merged.json: 9 rows: imported 8 (DOGE 8), ..., rejected 1 (DOGE: below_header_chain=1); ...
+found-block import DONE (2 files): 15 rows: imported 12 (DOGE 8, LTC 4), ..., rejected 3 (DOGE: below_header_chain=1; LTC: not_on_chain=2); ...
+```
+
+It is safe to run again: a block the ledger already holds only gains the
+fields it lacks, nothing the node recorded itself is replaced. There is no HTTP
+write endpoint for this, on purpose.
 
 What gets in:
 
-- **Only blocks of this chain.** Each row's hash must be on the best chain of
-  the node's own LTC header chain; its height, time and difficulty are then
-  taken from that header (a wrong height in the file is repaired). A hash the
-  chain does not hold (`not_on_chain`), a side-branch block (`not_main_chain`),
-  another chain's row (`other_chain`), a duplicate and a malformed entry are
-  refused and counted. Blocks below the header chain's starting checkpoint
-  (`--header-checkpoint`, by default LTC 3,088,000) cannot be checked and are
-  skipped (`below_header_chain`). Merged (DOGE) rows, e.g. from
-  `/recent_merged_blocks`, get in only if the embedded DOGE header chain holds
-  them (`merged_unvalidated` otherwise).
+- **Only blocks of their chain.** Each row's hash must be on the best chain of
+  the node's own header chain for that chain: LTC rows against the embedded LTC
+  header chain, merged (DOGE) rows from `/recent_merged_blocks` against the
+  embedded DOGE header chain. Height, time and difficulty are then taken from
+  that header (a wrong height in the file is repaired). A hash the chain does
+  not hold (`not_on_chain`), a side-branch block (`not_main_chain`), another
+  chain's row (`other_chain`), a duplicate and a malformed entry are refused
+  and counted against the chain they name. Blocks below a header chain's
+  starting checkpoint cannot be checked and are skipped as
+  `below_header_chain` of that chain: LTC below `--header-checkpoint` (by
+  default 3,088,000), DOGE below `--doge-header-checkpoint` (by default
+  6,160,000). Merged rows on a node without the embedded DOGE header chain are
+  `merged_unvalidated`.
 - **Pool blocks on the source's word.** Where the node still has the block's
   body (the lite explorer's recent blocks) its coinbase must pay the p2pool
   donation script (`not_pool_block` otherwise). For older blocks it cannot be

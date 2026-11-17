@@ -220,6 +220,21 @@ Parsed read_file(const std::string& path)
     return parse(ss.str());
 }
 
+std::vector<std::string> split_paths(const std::string& list)
+{
+    std::vector<std::string> out;
+    size_t start = 0;
+    while (start <= list.size()) {
+        const size_t comma = list.find(',', start);
+        const size_t end = comma == std::string::npos ? list.size() : comma;
+        std::string item = trim(list.substr(start, end - start));
+        if (!item.empty()) out.push_back(std::move(item));
+        if (comma == std::string::npos) break;
+        start = comma + 1;
+    }
+    return out;
+}
+
 void Report::add(const Report& pass)
 {
     // `rows` counts each row once: a deferred row is counted by the pass that
@@ -233,23 +248,36 @@ void Report::add(const Report& pass)
     pool_verified    += pass.pool_verified;
     rate_refused     += pass.rate_refused;
     pending          += pass.pending;
+    for (const auto& [chain, n] : pass.imported_by_chain) imported_by_chain[chain] += n;
     for (const auto& [reason, n] : pass.rejected) rejected[reason] += n;
-    deferred = pass.deferred;
+    for (const auto& [chain, reasons] : pass.rejected_by_chain)
+        for (const auto& [reason, n] : reasons) rejected_by_chain[chain][reason] += n;
+    deferred.insert(deferred.end(), pass.deferred.begin(), pass.deferred.end());
 }
 
 std::string Report::summary() const
 {
     std::ostringstream os;
     os << rows << " rows: imported " << imported;
-    if (imported_aux) os << " (" << imported_aux << " merged-chain)";
-    os << ", already held " << (merged + unchanged) << " (" << merged
-       << " gained a missing field), rejected " << rejected_total();
-    if (!rejected.empty()) {
+    if (!imported_by_chain.empty()) {
         os << " (";
         bool first = true;
-        for (const auto& [reason, n] : rejected) {
-            os << (first ? "" : " ") << reason << "=" << n;
+        for (const auto& [chain, n] : imported_by_chain) {
+            os << (first ? "" : ", ") << chain << " " << n;
             first = false;
+        }
+        os << ")";
+    }
+    os << ", already held " << (merged + unchanged) << " (" << merged
+       << " gained a missing field), rejected " << rejected_total();
+    if (!rejected_by_chain.empty()) {
+        // Per chain: "(LTC: not_on_chain=2; DOGE: below_header_chain=1)".
+        os << " (";
+        bool first_chain = true;
+        for (const auto& [chain, reasons] : rejected_by_chain) {
+            os << (first_chain ? "" : "; ") << chain << ":";
+            for (const auto& [reason, n] : reasons) os << " " << reason << "=" << n;
+            first_chain = false;
         }
         os << ")";
     }

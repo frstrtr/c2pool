@@ -35,6 +35,7 @@
 #include <chrono>
 #include <cmath>
 #include <ctime>
+#include <fstream>
 #include <functional>
 #include <map>
 #include <memory>
@@ -150,6 +151,15 @@ uint64_t rejected(const fbi::Report& r, const char* reason)
 {
     auto it = r.rejected.find(reason);
     return it == r.rejected.end() ? 0 : it->second;
+}
+
+/// Rows of `chain` refused for `reason`.
+uint64_t rejected_on(const fbi::Report& r, const std::string& chain, const char* reason)
+{
+    auto c = r.rejected_by_chain.find(chain);
+    if (c == r.rejected_by_chain.end()) return 0;
+    auto it = c->second.find(reason);
+    return it == c->second.end() ? 0 : it->second;
 }
 
 // The pool every fixture runs: LTC difficulty D, a rate that finds one block
@@ -591,13 +601,17 @@ TEST(FoundBlockImport, ImportWaitsUntilTheHeaderChainIsReady)
 // ── Merged (DOGE) rows ───────────────────────────────────────────────────────
 // A merged row gets in only if the AUX header chain holds it; its difficulty
 // is the aux header's, its parent the LTC block this node's chain holds. It is
-// a /recent_merged_blocks row, never a /recent_blocks one.
+// a /recent_merged_blocks row, never a /recent_blocks one. What the DOGE chain
+// refuses is counted as DOGE's, against the DOGE chain's own root
+// (checkpoint 6,160,000): 6154761 is below it.
 TEST(FoundBlockImport, MergedRowsNeedTheAuxHeaderChain)
 {
     FakeChain ltc, doge;
+    ltc.lowest = 3088000;
     ltc.add(hash_of(0x91), 3200001, kT0, kD);
     ltc.tip = 3200100;
     const double doge_diff = 3.3e7;
+    doge.lowest = 6160000;
     doge.add(hash_of(0xd1), 6454700, kT0 + 5, doge_diff);
     doge.tip = 6455000;
     auto src = source_over(ltc);
@@ -607,13 +621,26 @@ TEST(FoundBlockImport, MergedRowsNeedTheAuxHeaderChain)
     nlohmann::json file = nlohmann::json::array({
         {{"pow_hash", hash_of(0xd1)}, {"symbol", "DOGE"}, {"height", 6454700},
          {"parent_hash", hash_of(0x91)}, {"network_difficulty", 9.5e7}},
-        {{"pow_hash", hash_of(0xd2)}, {"symbol", "DOGE"}, {"height", 6454800}},
+        {{"pow_hash", hash_of(0xd2)}, {"symbol", "DOGE"}, {"height", 6454800}},   // phantom
+        {{"pow_hash", hash_of(0xd3)}, {"symbol", "DOGE"}, {"height", 6154761}},   // below the root
     });
     MiningInterface mi(false, nullptr, Blockchain::LITECOIN);
     const auto rep = import_text(mi, file.dump(), src);
     EXPECT_EQ(rep.imported, 1u) << rep.summary();
     EXPECT_EQ(rep.imported_aux, 1u);
-    EXPECT_EQ(rejected(rep, fbi::kMergedUnvalidated), 1u);
+    EXPECT_EQ(rep.imported_by_chain.at("DOGE"), 1u);
+    EXPECT_EQ(rejected_on(rep, "DOGE", fbi::kNotOnChain), 1u) << rep.summary();
+    EXPECT_EQ(rejected_on(rep, "DOGE", fbi::kBelowHeaderChain), 1u);
+    EXPECT_EQ(rejected_on(rep, "LTC", fbi::kBelowHeaderChain), 0u)
+        << "6154761 is a DOGE height: the LTC root says nothing about it";
+    EXPECT_NE(rep.summary().find("DOGE: below_header_chain=1 not_on_chain=1"), std::string::npos)
+        << rep.summary();
+
+    // A node without the DOGE header chain cannot check any of them.
+    MiningInterface no_doge(false, nullptr, Blockchain::LITECOIN);
+    const auto r2 = import_text(no_doge, file.dump(), source_over(ltc));
+    EXPECT_EQ(r2.imported, 0u);
+    EXPECT_EQ(rejected_on(r2, "DOGE", fbi::kMergedUnvalidated), 3u) << r2.summary();
 
     EXPECT_TRUE(mi.rest_recent_blocks().empty()) << "a merged find is not a block of this chain";
     const auto r = row_of(mi.rest_recent_merged_blocks(), "pow_hash", hash_of(0xd1));
@@ -627,6 +654,110 @@ TEST(FoundBlockImport, MergedRowsNeedTheAuxHeaderChain)
     EXPECT_TRUE(blocks[0].aux_difficulty_known);
     ASSERT_TRUE(blocks[0].parent_height.has_value());
     EXPECT_EQ(*blocks[0].parent_height, 3200001u);
+}
+
+// ── Two files in one run: the parent chain's and the merged chain's ────────
+// What an outside operator does against a public node:
+//   curl .../recent_blocks > blocks.json; curl .../recent_merged_blocks > merged.json
+//   --import-found-blocks blocks.json --import-found-blocks merged.json
+// Both dumps are real ones of another node shaped like ltc.voidbind.com's:
+// 6 LTC rows, 2 of them phantoms (stored at the share absheight, never on the
+// chain); 9 DOGE rows 6154761..6454700, the first below the DOGE header
+// chain's checkpoint 6,160,000. Each file gets its summary, then the total;
+// every refusal is counted against its own chain.
+TEST(FoundBlockImport, ParentAndMergedFilesImportInOneRun)
+{
+    MiningInterface other(false, nullptr, Blockchain::LITECOIN);
+    FakeChain ltc, doge;
+    ltc.lowest = 3088000;
+    doge.lowest = 6160000;
+    const double doge_diff = 3.3e7;
+    for (unsigned i = 0; i < 4; ++i) {
+        const std::string h = hash_of(0x100 + i);
+        other.record_found_block(3200001 + i, uint256S(h), kT0 + i * 86400, "LTC", kMinerA, h,
+                                 kD, kShareDiff, kRate, 625000000,
+                                 MiningInterface::BlockAuthorship::sharechain_peer);
+        ltc.add(h, 3200001 + i, kT0 + i * 86400, kD);
+    }
+    for (unsigned i = 0; i < 2; ++i) {   // phantoms: the share absheight, no such block
+        const std::string h = hash_of(0x1f0 + i);
+        other.record_found_block(27588573 + i * 27, uint256S(h), kT0 + 3600 + i * 600, "LTC",
+                                 kMinerA, h, kD, kShareDiff, kRate, 625000000,
+                                 MiningInterface::BlockAuthorship::sharechain_peer);
+    }
+    ltc.tip = 3200200;
+    const uint64_t doge_heights[9] = {6154761, 6200000, 6250000, 6300000, 6350000,
+                                      6400000, 6430000, 6450000, 6454700};
+    for (unsigned i = 0; i < 9; ++i) {
+        const std::string h = hash_of(0xd00 + i);
+        other.record_found_block(doge_heights[i], uint256S(h), kT0 + i * 7200, "DOGE", kMinerA, "",
+                                 doge_diff, 0.0, 0.0, 1000000000000ULL,
+                                 MiningInterface::BlockAuthorship::sharechain_peer);
+        if (doge_heights[i] >= doge.lowest)
+            doge.add(h, doge_heights[i], kT0 + i * 7200, doge_diff);
+    }
+    doge.tip = 6455000;
+    const auto blocks_rows = other.rest_recent_blocks();
+    const auto merged_rows = other.rest_recent_merged_blocks();
+    ASSERT_EQ(blocks_rows.size(), 6u);
+    ASSERT_EQ(merged_rows.size(), 9u);
+
+    const std::string dir = testing::TempDir();
+    const std::string blocks_path = dir + "/fbi_blocks.json";
+    const std::string merged_path = dir + "/fbi_merged.json";
+    { std::ofstream(blocks_path) << blocks_rows.dump(); }
+    { std::ofstream(merged_path) << merged_rows.dump(); }
+
+    // The CLI's list: given twice, or as one comma list -- the same two files.
+    const auto paths = fbi::split_paths(" " + blocks_path + " ," + merged_path + ",");
+    ASSERT_EQ(paths.size(), 2u);
+    EXPECT_EQ(paths[0], blocks_path);
+    EXPECT_EQ(paths[1], merged_path);
+    std::vector<fbi::File> files;
+    for (const auto& p : paths) files.push_back({p, fbi::read_file(p)});
+
+    boost::asio::io_context ioc;
+    MiningInterface mi(false, nullptr, Blockchain::LITECOIN);
+    mi.set_io_context(&ioc);
+    auto src = source_over(ltc);
+    src.aux["DOGE"] = doge.lookup();
+    std::optional<fbi::Report> done;
+    mi.start_found_block_import(std::move(files), src, std::chrono::milliseconds(5),
+                                [&done](const fbi::Report& r) { done = r; });
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!done && std::chrono::steady_clock::now() < deadline)
+        ioc.run_for(std::chrono::milliseconds(20));
+    ASSERT_TRUE(done.has_value());
+    const fbi::Report& t = *done;
+    EXPECT_EQ(t.rows, 15u);
+    EXPECT_EQ(t.imported, 12u) << t.summary();
+    EXPECT_EQ(t.imported_by_chain.at("LTC"), 4u);
+    EXPECT_EQ(t.imported_by_chain.at("DOGE"), 8u);
+    EXPECT_EQ(t.rejected_total(), 3u);
+    EXPECT_EQ(rejected_on(t, "LTC", fbi::kNotOnChain), 2u) << t.summary();
+    EXPECT_EQ(rejected_on(t, "DOGE", fbi::kBelowHeaderChain), 1u) << t.summary();
+    EXPECT_EQ(rejected_on(t, "LTC", fbi::kBelowHeaderChain), 0u);
+    EXPECT_EQ(rejected_on(t, "DOGE", fbi::kNotOnChain), 0u);
+    EXPECT_NE(t.summary().find("imported 12 (DOGE 8, LTC 4)"), std::string::npos) << t.summary();
+    EXPECT_NE(t.summary().find("DOGE: below_header_chain=1; LTC: not_on_chain=2"),
+              std::string::npos) << t.summary();
+
+    EXPECT_EQ(mi.rest_recent_blocks().size(), 4u);
+    EXPECT_EQ(mi.rest_recent_merged_blocks().size(), 8u);
+    const auto d = row_of(mi.rest_recent_merged_blocks(), "pow_hash", hash_of(0xd08));
+    EXPECT_EQ(d["height"].get<uint64_t>(), 6454700u);
+    EXPECT_NEAR(num(d, "network_difficulty"), doge_diff, 1e-6);
+
+    // Again: nothing new, nothing refused that was not refused before.
+    std::vector<fbi::File> again;
+    for (const auto& p : paths) again.push_back({p, fbi::read_file(p)});
+    done.reset();
+    mi.start_found_block_import(std::move(again), src, std::chrono::milliseconds(5),
+                                [&done](const fbi::Report& r) { done = r; });
+    ASSERT_TRUE(done.has_value()) << "every chain is ready: no wait";
+    EXPECT_EQ(done->imported, 0u);
+    EXPECT_EQ(done->unchanged, 12u) << done->summary();
+    EXPECT_EQ(done->rejected_total(), 3u);
 }
 
 // ── Is it a POOL block? ──────────────────────────────────────────────────────

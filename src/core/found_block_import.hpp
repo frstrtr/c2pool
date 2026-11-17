@@ -8,21 +8,24 @@
 // a node that joins the pool late (or lost its found_blocks_db) shows one
 // block, and its Recent Blocks, luck and effort start from there. The pool's
 // history is on every other node: its /recent_blocks rows. This is the
-// one-shot that brings them in (--import-found-blocks FILE, YAML
-// import_found_blocks), never an HTTP write endpoint: a public node must not
-// let a stranger write its ledger.
+// one-shot that brings them in (--import-found-blocks FILE, repeatable or a
+// comma list; YAML import_found_blocks), never an HTTP write endpoint: a
+// public node must not let a stranger write its ledger.
 //
-// INPUT (parse): the /recent_blocks JSON array, as served --
+// INPUT (parse): the /recent_blocks JSON array, as served, and the
+// /recent_merged_blocks one (pow_hash / symbol) for the merged chains --
 //     curl http://<node>:<web-port>/recent_blocks > blocks.json
-// (/recent_merged_blocks rows are read too: pow_hash / symbol), or block
-// hashes, one per line or as a JSON array of strings. A row needs its hash;
+//     curl http://<node>:<web-port>/recent_merged_blocks > merged.json
+//     --import-found-blocks blocks.json --import-found-blocks merged.json
+// -- or block hashes, one per line or as a JSON array of strings. A row needs its hash;
 // height, ts, chain, network_difficulty, share_difficulty,
 // pool_hashrate_at_find, share, miner, subsidy, coinbase_txid, tx_count and
 // parent_hash are taken when present and well-formed.
 //
 // TRUST: only the HASH is taken on trust, and only as a question to the
-// node's own header chain. A row gets in when that chain holds the hash on
-// its best chain; the height, time and difficulty are then the header's (a
+// node's own header chain for the row's chain (LTC; DOGE for a merged row),
+// each against its own root: what it refuses is counted per chain. A row gets
+// in when that chain holds the hash on its best chain; the height, time and difficulty are then the header's (a
 // height that disagrees is repaired, a missing one filled), never the file's.
 // Anything else is refused and counted by reason. Whether the block is a
 // POOL block can be checked only where the node has the block's coinbase
@@ -79,6 +82,17 @@ Parsed parse(const std::string& text);
 /// Read and parse `path`; Parsed::error says why a file cannot be read.
 Parsed read_file(const std::string& path);
 
+/// One file of an import run (imported in the order given).
+struct File {
+    std::string name;   ///< for the log (the path)
+    Parsed parsed;
+};
+
+/// A comma-separated path list ("blocks.json,merged.json") as paths; blanks
+/// around each are dropped, empty items skipped. --import-found-blocks may
+/// also be given more than once.
+std::vector<std::string> split_paths(const std::string& list);
+
 /// What a node's header chain says of one block hash.
 struct Header {
     bool     known{false};       ///< the chain holds the header
@@ -123,6 +137,8 @@ inline constexpr const char* kBelowHeaderChain  = "below_header_chain";
 inline constexpr const char* kNotMainChain      = "not_main_chain";
 inline constexpr const char* kNotPoolBlock      = "not_pool_block";
 inline constexpr const char* kMergedUnvalidated = "merged_unvalidated";
+/// Report::rejected_by_chain key of what parsing refused (no chain read yet).
+inline constexpr const char* kUnparsedChain     = "file";
 
 /// What an import did.
 struct Report {
@@ -136,17 +152,29 @@ struct Report {
     uint64_t pool_verified{0};     ///< coinbase checked: pays the pool's donation
     uint64_t rate_refused{0};      ///< pool_hashrate_at_find not plausibly the pool's
     uint64_t pending{0};           ///< imported less than 6 deep: verified like a find
-    std::map<std::string, uint64_t> rejected;   ///< reason -> rows
+    std::map<std::string, uint64_t> imported_by_chain;   ///< chain label -> new rows
+    std::map<std::string, uint64_t> rejected;            ///< reason -> rows, every chain
+    /// chain label (the row's: "LTC", "DOGE", "BTC"; kUnparsedChain for what
+    /// parsing refused) -> reason -> rows. A DOGE row below the DOGE header
+    /// chain's checkpoint is DOGE below_header_chain, never LTC's.
+    std::map<std::string, std::map<std::string, uint64_t>> rejected_by_chain;
     std::vector<Row> deferred;     ///< waiting for a header chain to be ready
 
-    void reject(const char* reason, uint64_t n = 1) { if (n) rejected[reason] += n; }
+    void reject(const char* reason, const std::string& chain, uint64_t n = 1)
+    {
+        if (!n) return;
+        rejected[reason] += n;
+        rejected_by_chain[chain][reason] += n;
+    }
     uint64_t rejected_total() const
     {
         uint64_t n = 0;
         for (const auto& [reason, count] : rejected) n += count;
         return n;
     }
-    /// Fold a later pass in (its `deferred` replaces this one's).
+    /// Fold a later pass (or another file's report) in: counts add up and
+    /// `deferred` rows are appended. `rows` is the caller's: a deferred row
+    /// comes back in a later pass and must not be counted twice.
     void add(const Report& pass);
     /// One line for the log.
     std::string summary() const;

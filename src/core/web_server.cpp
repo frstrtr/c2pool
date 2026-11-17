@@ -6068,15 +6068,21 @@ MiningInterface::import_found_blocks(const std::vector<core::found_block_import:
     std::set<std::string> seen;
     size_t corrected_logged = 0;
     for (const auto& r : rows) {
-        if (r.hash.empty()) { rep.reject(fbi::kMalformed); continue; }
-        if (!seen.insert(r.hash).second) { rep.reject(fbi::kDuplicate); continue; }
+        // The chain the row names, as the summary counts it: this node's own
+        // label for its own chain (or no label), a merged chain's label as
+        // the source lists it.
+        std::string named = r.chain.empty() || same_label(r.chain, primary_label)
+            ? primary_label : r.chain;
+        for (const auto& kv : source.aux)
+            if (same_label(kv.first, named)) named = kv.first;
+        if (r.hash.empty()) { rep.reject(fbi::kMalformed, named); continue; }
+        if (!seen.insert(r.hash).second) { rep.reject(fbi::kDuplicate, named); continue; }
 
         bool primary = true;
         std::string chain = primary_label;
         const fbi::ChainLookup* lookup = &source.primary;
-        if (!r.chain.empty() && !same_label(r.chain, primary_label)) {
-            auto it = std::find_if(source.aux.begin(), source.aux.end(),
-                [&](const auto& kv) { return same_label(kv.first, r.chain); });
+        if (named != primary_label) {
+            auto it = source.aux.find(named);
             if (it == source.aux.end()) {
                 // A merged chain this node does not follow (or cannot check)
                 // -- a row naming its parent block (#946), or a merged chain
@@ -6085,7 +6091,7 @@ MiningInterface::import_found_blocks(const std::vector<core::found_block_import:
                 const bool merged_row = !found_block_chain_is_primary(r.chain, "", node_symbol())
                     && (!r.parent_hash.empty() || same_label(r.chain, "DOGE")
                         || same_label(r.chain, "NMC"));
-                rep.reject(merged_row ? fbi::kMergedUnvalidated : fbi::kOtherChain);
+                rep.reject(merged_row ? fbi::kMergedUnvalidated : fbi::kOtherChain, named);
                 continue;
             }
             primary = false;
@@ -6093,7 +6099,7 @@ MiningInterface::import_found_blocks(const std::vector<core::found_block_import:
             lookup = &it->second;
         }
         if (!*lookup) {
-            rep.reject(primary ? fbi::kNoHeaderChain : fbi::kMergedUnvalidated);
+            rep.reject(primary ? fbi::kNoHeaderChain : fbi::kMergedUnvalidated, chain);
             continue;
         }
         if (!ready(*lookup)) {
@@ -6101,26 +6107,27 @@ MiningInterface::import_found_blocks(const std::vector<core::found_block_import:
             continue;
         }
 
+        // The row's OWN chain judges it: the LTC header chain an LTC row, the
+        // aux (DOGE) header chain a merged row -- each against its own root.
         fbi::Header h;
         try { h = lookup->header(r.hash); } catch (...) { h = fbi::Header{}; }
         if (!h.known) {
-            if (!primary) { rep.reject(fbi::kMergedUnvalidated); continue; }
             uint64_t lowest = 0;
             if (lookup->lowest_height) {
                 try { lowest = lookup->lowest_height(); } catch (...) { lowest = 0; }
             }
             // Below the chain's root the chain cannot say; anywhere else a
-            // hash it does not hold is not a block of this chain.
+            // hash it does not hold is not a block of that chain.
             rep.reject(r.height && lowest > 0 && *r.height < lowest
-                           ? fbi::kBelowHeaderChain : fbi::kNotOnChain);
+                           ? fbi::kBelowHeaderChain : fbi::kNotOnChain, chain);
             continue;
         }
         if (!h.main_chain || h.height == 0) {
-            rep.reject(primary ? fbi::kNotMainChain : fbi::kMergedUnvalidated);
+            rep.reject(fbi::kNotMainChain, chain);
             continue;
         }
         const uint64_t ts = h.ts != 0 ? h.ts : r.ts;
-        if (ts == 0) { rep.reject(fbi::kMalformed); continue; }
+        if (ts == 0) { rep.reject(fbi::kMalformed, chain); continue; }
 
         // A POOL block? Only the coinbase can say, and only where its body is
         // at hand; elsewhere the source is trusted (provenance "imported").
@@ -6128,7 +6135,7 @@ MiningInterface::import_found_blocks(const std::vector<core::found_block_import:
         if (primary && source.pays_pool) {
             std::optional<bool> pays;
             try { pays = source.pays_pool(r.hash, h.height); } catch (...) { pays.reset(); }
-            if (pays && !*pays) { rep.reject(fbi::kNotPoolBlock); continue; }
+            if (pays && !*pays) { rep.reject(fbi::kNotPoolBlock, chain); continue; }
             verified = pays.has_value();
         }
         if (verified) ++rep.pool_verified;
@@ -6252,6 +6259,7 @@ MiningInterface::import_found_blocks(const std::vector<core::found_block_import:
                 m_found_blocks.push_back(in);
                 to_persist.push_back(in);
                 ++rep.imported;
+                ++rep.imported_by_chain[in.chain];
                 if (!c.primary) ++rep.imported_aux;
                 if (c.pending) {
                     ++rep.pending;
@@ -6334,73 +6342,116 @@ void MiningInterface::start_found_block_import(
     std::chrono::milliseconds retry,
     std::function<void(const core::found_block_import::Report&)> on_done)
 {
+    std::vector<core::found_block_import::File> files;
+    files.push_back({std::string(), std::move(parsed)});
+    start_found_block_import(std::move(files), std::move(source), retry, std::move(on_done));
+}
+
+void MiningInterface::start_found_block_import(
+    std::vector<core::found_block_import::File> files,
+    core::found_block_import::Source source,
+    std::chrono::milliseconds retry,
+    std::function<void(const core::found_block_import::Report&)> on_done)
+{
     namespace fbi = core::found_block_import;
+    // One file after the other, in the order given; each to the end (its
+    // waits included) before the next starts.
     struct State {
-        fbi::Report total;
+        std::vector<fbi::File> files;
+        size_t index{0};
+        bool started{false};          // files[index] has begun
+        std::vector<fbi::Row> rows;   // the next pass's rows
+        uint64_t passes{0};           // of files[index]
+        fbi::Report file_total;       // files[index]'s
+        fbi::Report total;            // every file's
         fbi::Source source;
-        std::chrono::milliseconds retry;
+        std::chrono::milliseconds retry{0};
         std::function<void(const fbi::Report&)> on_done;
-        uint64_t passes{0};
     };
-    if (!parsed.error.empty()) {
-        LOG_ERROR << "[Pool] found-block import: " << parsed.error << "; nothing imported";
-        fbi::Report none;
-        if (on_done) on_done(none);
-        return;
-    }
     auto st = std::make_shared<State>();
-    st->total.rows = parsed.rows.size() + parsed.malformed;
-    st->total.reject(fbi::kMalformed, parsed.malformed);
+    st->files = std::move(files);
     st->source = std::move(source);
     st->retry = retry;
     st->on_done = std::move(on_done);
-    for (const auto& p : parsed.problems)
-        LOG_WARNING << "[Pool] found-block import: skipped " << p;
 
-    // One pass over `rows`; arms the next for what still waits.
-    auto pass = std::make_shared<std::function<void(std::vector<fbi::Row>)>>();
-    std::weak_ptr<std::function<void(std::vector<fbi::Row>)>> weak_pass = pass;
-    *pass = [this, st, weak_pass](std::vector<fbi::Row> rows) {
-        ++st->passes;
-        const fbi::Report r = import_found_blocks(rows, st->source);
-        st->total.add(r);
-        // A run that had to wait logs each pass that decided anything.
-        if ((st->passes > 1 || !r.deferred.empty()) && rows.size() > r.deferred.size())
-            LOG_INFO << "[Pool] found-block import, pass " << st->passes << ": " << r.summary();
-        if (!st->total.deferred.empty()) {
-            if (!m_context) {
-                LOG_WARNING << "[Pool] found-block import: " << st->total.deferred.size()
-                            << " rows wait for a header chain and no event loop runs to"
-                               " retry them; they are NOT imported";
-            } else {
-                auto next = weak_pass.lock();
-                if (next) {
+    // While a retry is armed its timer holds the step function (the function
+    // itself holds only a weak reference: no cycle); nothing else does.
+    auto step = std::make_shared<std::function<void()>>();
+    std::weak_ptr<std::function<void()>> weak_step = step;
+    *step = [this, st, weak_step]() {
+        for (;;) {
+            if (st->index >= st->files.size()) {
+                LOG_INFO << "[Pool] found-block import DONE (" << st->files.size()
+                         << (st->files.size() == 1 ? " file): " : " files): ")
+                         << st->total.summary()
+                         << ". Imported rows carry provenance \"imported\": each hash is a"
+                            " block of this node's header chain for its chain; that it is a"
+                            " pool block is the source's word unless coinbase-verified.";
+                if (st->on_done) st->on_done(st->total);
+                return;
+            }
+            fbi::File& f = st->files[st->index];
+            const std::string name = f.name.empty() ? std::string("input") : f.name;
+            if (!st->started) {
+                st->started = true;
+                st->passes = 0;
+                st->file_total = fbi::Report{};
+                if (!f.parsed.error.empty()) {
+                    LOG_ERROR << "[Pool] found-block import " << name << ": " << f.parsed.error
+                              << "; nothing imported from it";
+                    ++st->index;
+                    st->started = false;
+                    continue;
+                }
+                for (const auto& p : f.parsed.problems)
+                    LOG_WARNING << "[Pool] found-block import " << name << ": skipped " << p;
+                st->file_total.rows = f.parsed.rows.size() + f.parsed.malformed;
+                st->file_total.reject(fbi::kMalformed, fbi::kUnparsedChain, f.parsed.malformed);
+                st->rows = std::move(f.parsed.rows);
+                f.parsed.rows.clear();
+            }
+
+            ++st->passes;
+            std::vector<fbi::Row> rows = std::move(st->rows);
+            st->rows.clear();
+            const fbi::Report r = import_found_blocks(rows, st->source);
+            st->file_total.add(r);
+            // A file that had to wait logs each pass that decided anything.
+            if ((st->passes > 1 || !r.deferred.empty()) && rows.size() > r.deferred.size())
+                LOG_INFO << "[Pool] found-block import " << name << ", pass " << st->passes
+                         << ": " << r.summary();
+            if (!st->file_total.deferred.empty()) {
+                auto self = weak_step.lock();
+                if (m_context && self) {
                     // The first pass, then every tenth, says why it waits.
                     if (st->passes == 1 || st->passes % 10 == 0)
-                        LOG_INFO << "[Pool] found-block import: " << st->total.deferred.size()
-                                 << " rows wait for the header chain to sync before they can"
-                                    " be validated; retrying every "
+                        LOG_INFO << "[Pool] found-block import " << name << ": "
+                                 << st->file_total.deferred.size()
+                                 << " rows wait for their header chain to sync before they"
+                                    " can be validated; retrying every "
                                  << st->retry.count() / 1000.0 << " s";
+                    st->rows = std::move(st->file_total.deferred);
+                    st->file_total.deferred.clear();
                     auto timer = std::make_shared<boost::asio::steady_timer>(*m_context, st->retry);
-                    timer->async_wait([next, st, timer](boost::system::error_code ec) {
-                        if (ec) return;
-                        auto rows = std::move(st->total.deferred);
-                        st->total.deferred.clear();
-                        (*next)(std::move(rows));
+                    timer->async_wait([self, timer](boost::system::error_code ec) {
+                        if (!ec) (*self)();
                     });
                     return;
                 }
+                LOG_WARNING << "[Pool] found-block import " << name << ": "
+                            << st->file_total.deferred.size()
+                            << " rows wait for a header chain and no event loop runs to retry"
+                               " them; they are NOT imported";
             }
+            LOG_INFO << "[Pool] found-block import " << name << ": "
+                     << st->file_total.summary();
+            st->total.rows += st->file_total.rows;
+            st->total.add(st->file_total);
+            ++st->index;
+            st->started = false;
         }
-        LOG_INFO << "[Pool] found-block import DONE: " << st->total.summary()
-                 << ". Imported rows carry provenance \"imported\": each hash is a block"
-                    " of this node's header chain; that it is a pool block is the source's"
-                    " word unless coinbase-verified.";
-        if (st->on_done) st->on_done(st->total);
     };
-    // While a retry is armed its timer holds the pass function (the function
-    // itself holds only a weak reference: no cycle); nothing else does.
-    (*pass)(std::move(parsed.rows));
+    (*step)();
 }
 
 void MiningInterface::load_persisted_found_blocks()

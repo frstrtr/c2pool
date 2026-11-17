@@ -1547,10 +1547,17 @@ public:
         const std::vector<core::found_block_import::Row>& rows,
         const core::found_block_import::Source& source);
 
-    /// The startup one-shot (--import-found-blocks): import_found_blocks now,
+    /// The startup one-shot (--import-found-blocks): the files in the order
+    /// given, each to the end before the next -- import_found_blocks now,
     /// then every `retry` on the io_context for the rows still waiting for a
-    /// header chain, until none wait. Logs each pass and the total;
-    /// `on_done` (optional) gets the total.
+    /// header chain, until none wait. Logs a summary line per file and the
+    /// total; `on_done` (optional) gets the total.
+    void start_found_block_import(
+        std::vector<core::found_block_import::File> files,
+        core::found_block_import::Source source,
+        std::chrono::milliseconds retry = std::chrono::seconds(30),
+        std::function<void(const core::found_block_import::Report&)> on_done = {});
+    /// One file.
     void start_found_block_import(
         core::found_block_import::Parsed parsed,
         core::found_block_import::Source source,

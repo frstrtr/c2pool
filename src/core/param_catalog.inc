@@ -557,7 +557,7 @@ C2P_PARAM("utility.ltc_utxo_stats", Meta, PATH, COMPILE_TIME_READONLY, C_LTC, LI
 // CLI and the legacy YAML key import_found_blocks only; compile-time readonly
 // so a settings file is refused rather than silently ignored, and nothing is
 // mirrored into the resolved config.
-C2P_PARAM("utility.import_found_blocks", Meta, PATH, COMPILE_TIME_READONLY, C_LTC, LIT, "", NONE, "import found-block history from FILE (another node's /recent_blocks JSON, or block hashes one per line), each block validated against the LTC header chain")
+C2P_PARAM("utility.import_found_blocks", Meta, PATH, COMPILE_TIME_READONLY, C_LTC, LIT, "", NONE, "import found-block history from FILE (repeatable or FILE,FILE: another node's /recent_blocks and /recent_merged_blocks JSON, or block hashes one per line), each block validated against its own chain's header chain")
   C2P_ALIAS("utility.import_found_blocks", BIN_LTC, "--import-found-blocks", VALUE)
 
 C2P_PARAM("embedded.ltc_cmpct_v3", Embedded, TRISTATE_BOOL, RESTART, C_LTC, NONE, "", NONE, "ask LTC MWEB peers for v3 compact blocks (default on)")

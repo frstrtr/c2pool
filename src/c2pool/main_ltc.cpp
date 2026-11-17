@@ -635,11 +635,16 @@ void print_help() {
     std::cout << "  --ltc-utxo-stats DIR      Print gettxoutsetinfo for the UTXO LevelDB at DIR (Litecoin\n";
     std::cout << "                            Core 0.21.4's fields and hash_serialized_2) and exit\n";
     std::cout << "  --import-found-blocks FILE  Restore the pool's found-block history (Recent Blocks,\n";
-    std::cout << "                            luck, effort) from FILE: another node's /recent_blocks JSON\n";
-    std::cout << "                            (curl http://NODE:WEBPORT/recent_blocks > FILE) or block\n";
-    std::cout << "                            hashes, one per line. Each block is validated against this\n";
-    std::cout << "                            node's LTC header chain once it is synced; rows already\n";
-    std::cout << "                            held only gain missing fields. YAML import_found_blocks\n";
+    std::cout << "                            luck, effort) from FILE: another node's /recent_blocks or\n";
+    std::cout << "                            /recent_merged_blocks JSON, or block hashes one per line.\n";
+    std::cout << "                            Repeatable or FILE,FILE; imported in order, e.g.\n";
+    std::cout << "                              curl http://NODE:WEBPORT/recent_blocks > blocks.json\n";
+    std::cout << "                              curl http://NODE:WEBPORT/recent_merged_blocks > merged.json\n";
+    std::cout << "                              --import-found-blocks blocks.json --import-found-blocks merged.json\n";
+    std::cout << "                            Each block is validated against this node's own header chain\n";
+    std::cout << "                            for its chain (LTC, DOGE) once it is synced; rows already held\n";
+    std::cout << "                            only gain missing fields. YAML import_found_blocks (a path\n";
+    std::cout << "                            or a list)\n";
     std::cout << "  --ltc-connect IP[:PORT]   Dial only this LTC peer (repeatable): no peer DB, DNS /\n";
     std::cout << "                            fixed / HTTP seeds or addr gossip (Core's -connect)\n";
     std::cout << "  --doge-connect IP[:PORT]  Dial only this DOGE peer (repeatable), as --ltc-connect\n";
@@ -963,9 +968,11 @@ int main(int argc, char* argv[]) {
     // other (no peer DB, DNS / fixed / HTTP seeds, addr gossip). HOST[:PORT].
     std::vector<std::string> ltc_connect;
     std::vector<std::string> doge_connect;
-    // --import-found-blocks FILE: a one-shot import of found-block history
-    // (core/found_block_import.hpp), run once the header chain is wired.
-    std::string import_found_blocks_path;
+    // --import-found-blocks FILE[,FILE...] (repeatable; YAML import_found_blocks:
+    // a path, a comma list or a list): a one-shot import of found-block
+    // history (core/found_block_import.hpp), the files in order, run once
+    // the header chains are wired.
+    std::vector<std::string> import_found_blocks_paths;
     int doge_p2p_port = 0;                   // --doge-p2p-port PORT
     // Embedded LTC block relay (MWEB state at block announce):
     //   ltc_cmpct_v3          announce sendcmpct (true,3) then (false,2): MWEB peers
@@ -1367,7 +1374,8 @@ int main(int argc, char* argv[]) {
             cli_explicit.insert("doge_connect");
         }
         else if (arg == "--import-found-blocks" && i + 1 < argc) {
-            import_found_blocks_path = argv[++i];
+            for (auto& p : core::found_block_import::split_paths(argv[++i]))
+                import_found_blocks_paths.push_back(std::move(p));
             cli_explicit.insert("import_found_blocks");
         }
         else if (arg == "--dump-doge-schedule-anchors" && i + 1 < argc) {
@@ -1899,8 +1907,17 @@ int main(int argc, char* argv[]) {
                 ltc_utxo_full = cfg["ltc_utxo_full"].as<bool>();
             if (!cli_explicit.count("ltc_utxo_full_dir") && cfg["ltc_utxo_full_dir"])
                 ltc_utxo_full_dir = cfg["ltc_utxo_full_dir"].as<std::string>();
-            if (!cli_explicit.count("import_found_blocks") && cfg["import_found_blocks"])
-                import_found_blocks_path = cfg["import_found_blocks"].as<std::string>();
+            if (!cli_explicit.count("import_found_blocks") && cfg["import_found_blocks"]) {
+                const auto node = cfg["import_found_blocks"];
+                std::vector<std::string> items;
+                if (node.IsSequence())
+                    for (const auto& e : node) items.push_back(e.as<std::string>());
+                else
+                    items.push_back(node.as<std::string>());
+                for (const auto& item : items)
+                    for (auto& p : core::found_block_import::split_paths(item))
+                        import_found_blocks_paths.push_back(std::move(p));
+            }
 
             // Embedded LTC block relay (see the declarations)
             if (!cli_explicit.count("ltc_cmpct_v3") && cfg["ltc_cmpct_v3"])
@@ -11117,7 +11134,7 @@ int main(int argc, char* argv[]) {
             // node (core/found_block_import.hpp). Every block is validated
             // against the embedded header chains wired above, once they are
             // synced; rows the ledger holds only gain missing fields.
-            if (!import_found_blocks_path.empty()) {
+            if (!import_found_blocks_paths.empty()) {
                 namespace fbi = core::found_block_import;
                 fbi::Source src;
                 src.primary_chain = ltc::dashboard::chain_label(settings->m_testnet);
@@ -11131,12 +11148,16 @@ int main(int argc, char* argv[]) {
                     LOG_ERROR << "[Pool] --import-found-blocks validates every block against"
                                  " the embedded LTC header chain, which this node does not run"
                                  " (--no-embedded-ltc): nothing can be imported";
-                auto parsed = fbi::read_file(import_found_blocks_path);
-                LOG_INFO << "[Pool] found-block import from " << import_found_blocks_path
-                         << ": " << parsed.rows.size() << " rows ("
-                         << (parsed.format.empty() ? "unreadable" : parsed.format) << ")";
+                std::vector<fbi::File> files;
+                for (const auto& path : import_found_blocks_paths) {
+                    fbi::File f{path, fbi::read_file(path)};
+                    LOG_INFO << "[Pool] found-block import from " << path << ": "
+                             << f.parsed.rows.size() << " rows ("
+                             << (f.parsed.format.empty() ? "unreadable" : f.parsed.format) << ")";
+                    files.push_back(std::move(f));
+                }
                 web_server.get_mining_interface()->start_found_block_import(
-                    std::move(parsed), std::move(src));
+                    std::move(files), std::move(src));
             }
 
             // Load persisted merged blocks into mm_manager BEFORE block scan.
