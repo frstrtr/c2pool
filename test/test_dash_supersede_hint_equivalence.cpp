@@ -240,13 +240,25 @@ TEST(DashSupersedeHintEquivalence, RandomForestsGiveTheIdenticalHint)
 TEST(DashSupersedeHintEquivalence, DescendsFromEqualsIsChildOfOnEveryPair)
 {
     size_t pairs = 0, trues = 0;
-    for (int round = 0; round < 40; ++round) {
+    for (int round = 0; round < 25; ++round) {
         dash::ShareTracker t;
         const auto f = build_forest(t, 777u + static_cast<uint32_t>(round), 1000 + round);
-        std::vector<uint256> nodes = f.all;
+        // Shapes build_forest never makes: a SECOND rooted tree (both trees'
+        // get_last is null) and two segments off ONE shared missing parent.
+        Builder extra{t, 5000 + static_cast<size_t>(round) * 4};
+        const auto root2 = extra.run(8, uint256(), kBitsNormal);
+        char shared[24];
+        std::snprintf(shared, sizeof(shared), "5ead%04x", round);
+        const auto sib1 = extra.run(5, hx(shared), kBitsNormal);
+        const auto sib2 = extra.run(7, hx(shared), kBitsNormal);
+        // The special nodes FIRST, so the bound below never cuts them: the
+        // null hash, every missing parent, a hash in no segment, the new shapes.
+        std::vector<uint256> nodes{uint256(), hx("beef1234"), hx(shared)};
         nodes.insert(nodes.end(), f.parents.begin(), f.parents.end());
-        nodes.push_back(hx("beef1234"));   // in no segment at all
-        if (nodes.size() > 160) nodes.resize(160);   // keep the pair count bounded
+        for (const auto* seg : {&root2, &sib1, &sib2})
+            nodes.insert(nodes.end(), seg->begin(), seg->end());
+        nodes.insert(nodes.end(), f.all.begin(), f.all.end());
+        if (nodes.size() > 120) nodes.resize(120);   // keep the pair count bounded
         for (const auto& a : nodes)
             for (const auto& b : nodes) {
                 const bool slow = t.chain.is_child_of(a, b);
