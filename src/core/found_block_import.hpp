@@ -93,6 +93,20 @@ struct File {
 /// also be given more than once.
 std::vector<std::string> split_paths(const std::string& list);
 
+/// Caps. An import file larger than kMaxFileBytes, or holding more than
+/// kMaxRows entries, is refused whole (Parsed::error): a pool's history is a
+/// few thousand blocks, and a hostile list of millions must not stall a
+/// node's start. The ledger merge itself is indexed by hash.
+inline constexpr uint64_t kMaxFileBytes = 64ull << 20;   // 64 MiB
+inline constexpr size_t   kMaxRows = 100000;
+
+/// Why `value` cannot be an import file, checked when the flag is parsed;
+/// "" = it can. A value that starts with '-' is the next OPTION (the flag
+/// must not swallow --testnet); a missing, non-regular, unreadable or
+/// over-cap file is refused before the node starts, not at the end of a
+/// header sync.
+std::string file_problem(const std::string& value);
+
 /// What a node's header chain says of one block hash.
 struct Header {
     bool     known{false};       ///< the chain holds the header

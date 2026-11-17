@@ -5,6 +5,7 @@
 
 #include <cctype>
 #include <cmath>
+#include <filesystem>
 #include <fstream>
 #include <limits>
 #include <set>
@@ -151,6 +152,11 @@ void parse_entry(const nlohmann::json& e, size_t index, Parsed& out)
 Parsed parse(const std::string& text_in)
 {
     Parsed out;
+    if (text_in.size() > kMaxFileBytes) {
+        out.error = std::to_string(text_in.size()) + " bytes, above the cap of "
+            + std::to_string(kMaxFileBytes) + " bytes per file";
+        return out;
+    }
     std::string text = text_in;
     if (text.size() >= 3 && static_cast<unsigned char>(text[0]) == 0xEF
         && static_cast<unsigned char>(text[1]) == 0xBB
@@ -184,6 +190,11 @@ Parsed parse(const std::string& text_in)
                 return out;
             }
         }
+        if (arr->size() > kMaxRows) {
+            out.error = std::to_string(arr->size()) + " entries, above the cap of "
+                + std::to_string(kMaxRows) + " rows per file";
+            return out;
+        }
         size_t i = 0;
         for (const auto& e : *arr)
             parse_entry(e, i++, out);
@@ -199,6 +210,13 @@ Parsed parse(const std::string& text_in)
         ++n;
         line = trim(line);
         if (line.empty() || line[0] == '#') continue;
+        if (out.rows.size() + out.malformed >= kMaxRows) {
+            out = Parsed{};
+            out.format = "hash_list";
+            out.error = "more than " + std::to_string(kMaxRows) + " entries, above the cap of "
+                + std::to_string(kMaxRows) + " rows per file";
+            return out;
+        }
         Row r;
         r.hash = hash_hex(line);
         if (r.hash.empty()) { note(out, "line " + std::to_string(n) + ": not a block hash"); continue; }
@@ -207,8 +225,41 @@ Parsed parse(const std::string& text_in)
     return out;
 }
 
+std::string file_problem(const std::string& value)
+{
+    if (value.empty())
+        return "no file named";
+    if (value[0] == '-')
+        return "'" + value + "' is an option, not a file (the flag needs a FILE)";
+    std::error_code ec;
+    const std::filesystem::path p(value);
+    if (!std::filesystem::exists(p, ec))
+        return "no such file";
+    if (!std::filesystem::is_regular_file(p, ec))
+        return "not a regular file";
+    const auto size = std::filesystem::file_size(p, ec);
+    if (ec)
+        return "cannot read its size";
+    if (size > kMaxFileBytes)
+        return std::to_string(size) + " bytes, above the cap of "
+            + std::to_string(kMaxFileBytes) + " bytes per file";
+    std::ifstream f(value, std::ios::binary);
+    if (!f)
+        return "cannot be opened for reading";
+    return {};
+}
+
 Parsed read_file(const std::string& path)
 {
+    // The cap before the read: a file is never loaded whole past it.
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(std::filesystem::path(path), ec);
+    if (!ec && size > kMaxFileBytes) {
+        Parsed out;
+        out.error = path + ": " + std::to_string(size) + " bytes, above the cap of "
+            + std::to_string(kMaxFileBytes) + " bytes per file";
+        return out;
+    }
     std::ifstream f(path, std::ios::binary);
     if (!f) {
         Parsed out;

@@ -156,5 +156,35 @@ money_e2e dash dash.money
 money_e2e btc  btc.money
 money_e2e dgb  dgb.money
 
+# c2pool-ltc --import-found-blocks FILE: a bad value is refused while the flags
+# are parsed (exit 1, no dump), never swallowed. `--import-found-blocks
+# --testnet` dropped network.testnet=true (a mainnet node), and a second file
+# given without its own flag became the positional RPC user.
+echo "== ltc --import-found-blocks values (bad value => exit 1, no dump) =="
+if [ -x "$BINDIR/c2pool-ltc" ]; then
+  fbi_dd="$(mktemp -d)"
+  printf '[]' > "$fbi_dd/a.json"; printf '[]' > "$fbi_dd/b.json"
+  fbi_case() {  # want_rc label args...
+    local want="$1" label="$2"; shift 2
+    local out; out="$("$BINDIR/c2pool-ltc" --data-dir "$fbi_dd" "$@" --dump-resolved-config 2>/dev/null)"
+    local rc=$?
+    local dumped=0; printf '%s' "$out" | grep -q "$BEGIN" && dumped=1
+    local ok=0   # a refusal prints no dump; an accepted value dumps
+    if [ "$want" -eq 0 ]; then [ "$dumped" -eq 1 ] && ok=1; else [ "$dumped" -eq 0 ] && ok=1; fi
+    if [ "$rc" -eq "$want" ] && [ "$ok" -eq 1 ]; then
+      echo "ok   ltc $label (exit $rc)"
+    else
+      echo "FAIL ltc $label exit=$rc (want $want) dumped=$dumped"; fails=$((fails+1))
+    fi
+  }
+  fbi_case 1 "value is an option (--testnet)" --import-found-blocks --testnet
+  fbi_case 1 "missing file" --import-found-blocks "$fbi_dd/none.json"
+  fbi_case 1 "a directory" --import-found-blocks "$fbi_dd"
+  fbi_case 1 "second file without its own flag" --import-found-blocks "$fbi_dd/a.json" "$fbi_dd/b.json"
+  fbi_case 0 "two files, flag twice" --import-found-blocks "$fbi_dd/a.json" --import-found-blocks "$fbi_dd/b.json"
+  fbi_case 0 "two files, comma list" --import-found-blocks "$fbi_dd/a.json,$fbi_dd/b.json"
+  rm -rf "$fbi_dd"
+fi
+
 if [ "$fails" -eq 0 ]; then echo; echo "golden_resolved_config: ALL PASS"; exit 0; fi
 echo; echo "golden_resolved_config: $fails FAILURE(S)"; exit 1

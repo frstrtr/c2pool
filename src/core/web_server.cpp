@@ -6251,11 +6251,24 @@ MiningInterface::import_found_blocks(const std::vector<core::found_block_import:
             }
         }
 
+        // The ledger by (hash, chain), built once: a lookup per row, not a
+        // scan of the ledger per row under the lock.
+        auto key_of = [](const std::string& hash, const std::string& chain) {
+            std::string k;
+            k.reserve(hash.size() + 1 + chain.size());
+            k.append(hash).push_back('\x1f');
+            k.append(chain);
+            return k;
+        };
+        std::unordered_map<std::string, size_t> held;
+        held.reserve(m_found_blocks.size() + cands.size());
+        for (size_t i = 0; i < m_found_blocks.size(); ++i)
+            held.emplace(key_of(m_found_blocks[i].hash, m_found_blocks[i].chain), i);
         for (auto& c : cands) {
             FoundBlock& in = c.blk;
-            auto it = std::find_if(m_found_blocks.begin(), m_found_blocks.end(),
-                [&](const FoundBlock& x) { return x.hash == in.hash && x.chain == in.chain; });
-            if (it == m_found_blocks.end()) {
+            auto found = held.find(key_of(in.hash, in.chain));
+            if (found == held.end()) {
+                held.emplace(key_of(in.hash, in.chain), m_found_blocks.size());
                 m_found_blocks.push_back(in);
                 to_persist.push_back(in);
                 ++rep.imported;
@@ -6267,10 +6280,12 @@ MiningInterface::import_found_blocks(const std::vector<core::found_block_import:
                 }
                 continue;
             }
-            // A block the ledger holds: FILL-ONLY. Nothing this node recorded
-            // is replaced -- not its status, its authorship, its rate or its
-            // time; a field it lacks is filled from the validated import.
-            FoundBlock& ex = *it;
+            // A block the ledger holds: STRICTLY FILL-ONLY. Nothing this node
+            // recorded is replaced -- not its status, its authorship, its
+            // finder, its rate or its time, not even a value that does not
+            // render (a pre-fix raw-hex miner stays the node's own); only a
+            // field it holds no value for is filled from the import.
+            FoundBlock& ex = m_found_blocks[found->second];
             bool dirty = false;
             if (ex.height == 0 && in.height != 0) { ex.height = in.height; dirty = true; }
             if (ex.ts == 0) { ex.ts = in.ts; dirty = true; }
@@ -6286,10 +6301,7 @@ MiningInterface::import_found_blocks(const std::vector<core::found_block_import:
                 ex.pool_hashrate = in.pool_hashrate; dirty = true;
             }
             if (ex.subsidy == 0 && in.subsidy != 0) { ex.subsidy = in.subsidy; dirty = true; }
-            if ((ex.miner.empty() || found_block_miner_display(ex.miner) != ex.miner)
-                && !in.miner.empty() && in.miner != ex.miner) {
-                ex.miner = in.miner; dirty = true;
-            }
+            if (ex.miner.empty() && !in.miner.empty()) { ex.miner = in.miner; dirty = true; }
             if (ex.share_hash.empty() && !in.share_hash.empty()) {
                 ex.share_hash = in.share_hash; dirty = true;
             }

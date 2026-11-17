@@ -35,6 +35,7 @@
 #include <chrono>
 #include <cmath>
 #include <ctime>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <map>
@@ -43,6 +44,8 @@
 #include <sstream>
 #include <string>
 #include <vector>
+
+#include <unistd.h>
 
 #include <boost/asio/io_context.hpp>
 #include <nlohmann/json.hpp>
@@ -758,6 +761,125 @@ TEST(FoundBlockImport, ParentAndMergedFilesImportInOneRun)
     EXPECT_EQ(done->imported, 0u);
     EXPECT_EQ(done->unchanged, 12u) << done->summary();
     EXPECT_EQ(done->rejected_total(), 3u);
+}
+
+// ── The flag's value, checked when it is parsed ─────────────────────────────
+// main_ltc refuses (exit 1) what file_problem names, before the node starts:
+// --import-found-blocks --testnet must not swallow --testnet and start a
+// MAINNET node; a missing, unreadable or over-cap file must not surface only
+// after the header sync. ci/golden_resolved_config.sh runs the binary on
+// the same cases.
+TEST(FoundBlockImport, FlagValueIsCheckedBeforeTheNodeStarts)
+{
+    const std::filesystem::path dir = std::filesystem::path(testing::TempDir()) /
+        ("fbi_flag_" + std::to_string(static_cast<long long>(::getpid())));
+    std::filesystem::create_directories(dir);
+    const std::string ok = (dir / "blocks.json").string();
+    { std::ofstream(ok) << "[]"; }
+    const std::string big = (dir / "huge.json").string();
+    { std::ofstream(big) << "["; }
+    std::filesystem::resize_file(big, fbi::kMaxFileBytes + 1);   // sparse
+
+    EXPECT_EQ(fbi::file_problem(ok), "");
+    EXPECT_NE(fbi::file_problem("--testnet"), "") << "an option is not a file";
+    EXPECT_NE(fbi::file_problem("-h"), "");
+    EXPECT_NE(fbi::file_problem(""), "");
+    EXPECT_EQ(fbi::file_problem((dir / "none.json").string()), "no such file");
+    EXPECT_EQ(fbi::file_problem(dir.string()), "not a regular file");
+    EXPECT_NE(fbi::file_problem(big).find("above the cap"), std::string::npos)
+        << fbi::file_problem(big);
+    // read_file refuses it without reading it whole.
+    EXPECT_NE(fbi::read_file(big).error.find("above the cap"), std::string::npos);
+
+    const auto paths = fbi::split_paths(ok + ",," + ok + " , ");
+    EXPECT_EQ(paths.size(), 2u);
+    EXPECT_TRUE(fbi::split_paths(" , ").empty());
+
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+}
+
+// ── Caps ─────────────────────────────────────────────────────────────────────
+// A file of more than kMaxRows entries is refused whole, as text or JSON;
+// exactly kMaxRows is a file like any other.
+TEST(FoundBlockImport, OverCapFilesAreRefusedWhole)
+{
+    std::string list;
+    list.reserve((fbi::kMaxRows + 1) * 65);
+    for (size_t i = 0; i < fbi::kMaxRows; ++i) {
+        list += hash_of(static_cast<unsigned>(0x100000 + i));
+        list += '\n';
+    }
+    const auto at_cap = fbi::parse(list);
+    EXPECT_TRUE(at_cap.error.empty()) << at_cap.error;
+    EXPECT_EQ(at_cap.rows.size(), fbi::kMaxRows);
+
+    list += hash_of(0x1);
+    list += '\n';
+    const auto over = fbi::parse(list);
+    EXPECT_NE(over.error.find("above the cap"), std::string::npos) << over.error;
+    EXPECT_TRUE(over.rows.empty()) << "refused whole, not truncated";
+
+    nlohmann::json arr = nlohmann::json::array();
+    for (size_t i = 0; i <= fbi::kMaxRows; ++i)
+        arr.push_back(hash_of(static_cast<unsigned>(0x100000 + i)));
+    const auto json_over = fbi::parse(arr.dump());
+    EXPECT_NE(json_over.error.find("above the cap"), std::string::npos) << json_over.error;
+    EXPECT_TRUE(json_over.rows.empty());
+
+    EXPECT_NE(fbi::parse(std::string(fbi::kMaxFileBytes + 1, ' ')).error.find("above the cap"),
+              std::string::npos);
+}
+
+// A large import merges by an index, and its rows are all there once.
+TEST(FoundBlockImport, LargeImportMergesEachRowOnce)
+{
+    FakeChain ltc;
+    constexpr unsigned kN = 20000;
+    std::string list;
+    for (unsigned i = 0; i < kN; ++i) {
+        const std::string h = hash_of(0x200000 + i);
+        ltc.add(h, 2000000 + i, kT0 + i * 150ull, kD);
+        list += h + "\n";
+    }
+    ltc.tip = 2000000 + kN + 100;
+    MiningInterface mi(false, nullptr, Blockchain::LITECOIN);
+    const auto first = import_text(mi, list, source_over(ltc));
+    EXPECT_EQ(first.imported, kN);
+    const auto again = import_text(mi, list, source_over(ltc));
+    EXPECT_EQ(again.imported, 0u);
+    EXPECT_EQ(again.unchanged, kN);
+    EXPECT_EQ(mi.get_found_blocks().size(), kN);
+}
+
+// ── Strictly fill-only ───────────────────────────────────────────────────────
+// A pre-fix LTC peer row holds its miner as raw hex (it renders through
+// found_block_miner_display). That is still the node's own record: the file
+// does not replace it.
+TEST(FoundBlockImport, NodeRecordedMinerIsNeverReplacedByTheFile)
+{
+    const std::string h = hash_of(0x4d1);
+    std::string raw_hex;
+    for (unsigned char c : kMinerA) {
+        static const char* digits = "0123456789abcdef";
+        raw_hex += digits[c >> 4];
+        raw_hex += digits[c & 0xf];
+    }
+    MiningInterface mi(false, nullptr, Blockchain::LITECOIN);
+    mi.record_found_block(3200001, uint256S(h), kT0, "LTC", raw_hex, h, kD, kShareDiff, kRate,
+                          625000000, MiningInterface::BlockAuthorship::sharechain_peer);
+    ASSERT_EQ(mi.get_found_blocks().at(0).miner, raw_hex);
+
+    FakeChain ltc;
+    ltc.add(h, 3200001, kT0, kD);
+    ltc.tip = 3200100;
+    nlohmann::json file = nlohmann::json::array({{{"hash", h}, {"miner", kMinerB},
+                                                  {"coinbase_txid", hash_of(0x4d2)}}});
+    const auto rep = import_text(mi, file.dump(), source_over(ltc));
+    EXPECT_EQ(rep.merged, 1u) << "the missing coinbase_txid is filled";
+    EXPECT_EQ(mi.get_found_blocks().at(0).miner, raw_hex) << "the node's own miner stays";
+    EXPECT_EQ(str(row_of(mi.rest_recent_blocks(), "hash", h), "miner"), kMinerA)
+        << "and still renders as the address it encodes";
 }
 
 // ── Is it a POOL block? ──────────────────────────────────────────────────────

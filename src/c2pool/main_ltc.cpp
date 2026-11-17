@@ -1373,9 +1373,39 @@ int main(int argc, char* argv[]) {
             doge_connect.push_back(argv[++i]);
             cli_explicit.insert("doge_connect");
         }
-        else if (arg == "--import-found-blocks" && i + 1 < argc) {
-            for (auto& p : core::found_block_import::split_paths(argv[++i]))
-                import_found_blocks_paths.push_back(std::move(p));
+        else if (arg == "--import-found-blocks") {
+            // Refused here, before anything starts: a missing value must not
+            // swallow the next option (--import-found-blocks --testnet would
+            // start a MAINNET node), a missing or unreadable file must not
+            // surface only after the header sync, and a second file given
+            // without its own flag must not fall through to the positional
+            // RPC user.
+            const std::string value = i + 1 < argc ? argv[i + 1] : "";
+            if (value.empty() || value[0] == '-') {
+                LOG_ERROR << "--import-found-blocks needs a FILE (or FILE,FILE), got "
+                          << (value.empty() ? std::string("nothing") : "'" + value + "'");
+                return 1;
+            }
+            ++i;
+            const auto paths = core::found_block_import::split_paths(value);
+            if (paths.empty()) {
+                LOG_ERROR << "--import-found-blocks '" << value << "': no file named";
+                return 1;
+            }
+            for (const auto& p : paths) {
+                const std::string why = core::found_block_import::file_problem(p);
+                if (!why.empty()) {
+                    LOG_ERROR << "--import-found-blocks " << p << ": " << why;
+                    return 1;
+                }
+                import_found_blocks_paths.push_back(p);
+            }
+            if (i + 1 < argc && argv[i + 1][0] != '-'
+                && core::found_block_import::file_problem(argv[i + 1]).empty()) {
+                LOG_ERROR << "--import-found-blocks takes one FILE (or FILE,FILE): give "
+                          << argv[i + 1] << " its own --import-found-blocks";
+                return 1;
+            }
             cli_explicit.insert("import_found_blocks");
         }
         else if (arg == "--dump-doge-schedule-anchors" && i + 1 < argc) {
@@ -1915,8 +1945,14 @@ int main(int argc, char* argv[]) {
                 else
                     items.push_back(node.as<std::string>());
                 for (const auto& item : items)
-                    for (auto& p : core::found_block_import::split_paths(item))
+                    for (auto& p : core::found_block_import::split_paths(item)) {
+                        const std::string why = core::found_block_import::file_problem(p);
+                        if (!why.empty()) {
+                            LOG_ERROR << "import_found_blocks " << p << ": " << why;
+                            return 1;
+                        }
                         import_found_blocks_paths.push_back(std::move(p));
+                    }
             }
 
             // Embedded LTC block relay (see the declarations)
