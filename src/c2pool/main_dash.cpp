@@ -1636,7 +1636,19 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // a share-load crash (the throw lands right after the "Loaded N
         // persisted shares" lines). Fail CLEANLY with the actual reason.
         try {
-            p2p_node.core::Server::listen(bind_port);
+            if (core::is_wildcard_listen_host(peer.listen_host)) {
+                // Every interface (the default 0.0.0.0, or ::): unchanged.
+                p2p_node.core::Server::listen(bind_port);
+            } else if (!p2p_node.core::Server::listen_on(peer.listen_host, bind_port)) {
+                // --listen HOST:PORT used to ignore HOST and bind every
+                // interface while this log line named HOST. Bind exactly HOST,
+                // or stop: never listen somewhere the operator did not ask for.
+                std::cerr << "[run] FATAL: cannot bind sharechain P2P listener to "
+                          << peer.listen_host << ":" << bind_port
+                          << " (HOST must be a numeric address of this host, and the "
+                             "port free)\n";
+                return 1;
+            }
         } catch (const std::exception& e) {
             std::cerr << "[run] FATAL: cannot bind sharechain P2P port "
                       << bind_port << ": " << e.what()
