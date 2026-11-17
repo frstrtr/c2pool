@@ -848,18 +848,29 @@ public:
         uint256 best_ch;
         uint288 best_ch_work;
         bool found = false;
+        // Cheapest filters first, is_child_of LAST: it walks the chain four
+        // times per head (get_height/get_last of both ends, O(chain) each) and
+        // was most of this function's cost on a full tracker. Every filter is
+        // a side-effect-free `continue`, so their order does not change the
+        // candidate set; the argmax runs over the candidates in the same head
+        // order with the same strict `>`, so the hint is identical. The work
+        // pre-check cannot change the result either: the hint only goes active
+        // for a candidate with STRICTLY more work than the incumbent, and every
+        // such candidate is kept (KAT: test_dash_supersede_hint_equivalence).
         for (auto& [head, tail] : chain.get_heads())
         {
             if (head == incumbent_best) continue;
             if (!chain.contains(head)) continue;
+            uint288 w;
+            try { w = chain.get_work(head); } catch (...) { continue; }
+            // Cannot out-work the incumbent: can never be the active target.
+            if (!(incumbent_work < w)) continue;
+            // Already a full-length verified chain — Phase-3 scoring handles it.
+            if (verified.get_acc_height(head) >= CL) continue;
             // Extension of our own best chain (not a fork) — the ordinary
             // budgeted Phase-2 verifies it; never treat it as a challenger.
             try { if (chain.is_child_of(incumbent_best, head)) continue; }
             catch (...) { /* concurrent trim — treat as fork candidate */ }
-            // Already a full-length verified chain — Phase-3 scoring handles it.
-            if (verified.get_acc_height(head) >= CL) continue;
-            uint288 w;
-            try { w = chain.get_work(head); } catch (...) { continue; }
             if (!found || w > best_ch_work) { best_ch_work = w; best_ch = head; found = true; }
         }
 
