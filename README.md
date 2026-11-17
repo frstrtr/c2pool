@@ -1112,6 +1112,7 @@ legacy YAML key set.
 | `--coinbase-text` | `coinbase_text` | see below | Custom coinbase scriptSig text |
 | `--message-blob-hex` | -- | -- | V36 authority message blob |
 | `--doge-testnet4alpha` | `doge_testnet4alpha` | false | Use DOGE testnet4alpha |
+| `--import-found-blocks FILE` | `import_found_blocks` | -- | Restore the pool's found-block history from another node's `/recent_blocks` (see [Restore found-block history](#restore-found-block-history)) |
 
 ---
 
@@ -1429,6 +1430,61 @@ cd /opt/c2pool-bip110 && ./c2pool-bip110 --run --coin-p2p-discover \
 | `--node-owner-address ADDR` (alias `--donation`) | — | Node-owner fee destination and subsidy fallback when a miner's username has no resolvable address. |
 | `--give-author PCT` (alias `--dev-donation`) | 0.1 (catalog `money.give_author_pct`) | Author donation percent. |
 | `-f` / `--fee PCT` | 0 | Node-owner fee percent. |
+
+---
+
+## Restore found-block history
+
+A node's found-block ledger only holds the blocks the node saw itself, so a
+node that joined the pool late (or lost its `found_blocks_db`) shows a short
+Recent Blocks list, and its luck and effort start from there. The pool's
+history is on every other node. To bring it in (`c2pool-ltc`):
+
+```bash
+# 1. Take the history from any node of the pool (its dashboard / web port):
+curl -s http://<other-node>:<web-port>/recent_blocks -o blocks.json
+
+# 2. Start your node once with the file (or YAML: import_found_blocks: blocks.json):
+./c2pool-ltc <your usual options> --import-found-blocks blocks.json
+```
+
+The import runs at startup, after the embedded LTC header chain is synced (it
+waits for the sync and says so in the log), then logs one summary line:
+`found-block import DONE: N rows: imported ..., already held ..., rejected ...
+(reason=count ...)`. It is safe to run again: a block the ledger already holds
+only gains the fields it lacks, nothing the node recorded itself is replaced.
+There is no HTTP write endpoint for this, on purpose.
+
+What gets in:
+
+- **Only blocks of this chain.** Each row's hash must be on the best chain of
+  the node's own LTC header chain; its height, time and difficulty are then
+  taken from that header (a wrong height in the file is repaired). A hash the
+  chain does not hold (`not_on_chain`), a side-branch block (`not_main_chain`),
+  another chain's row (`other_chain`), a duplicate and a malformed entry are
+  refused and counted. Blocks below the header chain's starting checkpoint
+  (`--header-checkpoint`, by default LTC 3,088,000) cannot be checked and are
+  skipped (`below_header_chain`). Merged (DOGE) rows, e.g. from
+  `/recent_merged_blocks`, get in only if the embedded DOGE header chain holds
+  them (`merged_unvalidated` otherwise).
+- **Pool blocks on the source's word.** Where the node still has the block's
+  body (the lite explorer's recent blocks) its coinbase must pay the p2pool
+  donation script (`not_pool_block` otherwise). For older blocks it cannot be
+  checked, and the row says where it came from: `"provenance": "imported"` on
+  `/recent_blocks` (and `found_locally: false`, `luck_method: "relayed"`).
+- **Luck and effort** count the imported rows like any other (core/pool_luck.hpp):
+  integrated over the node's own rate history where it covers a round,
+  otherwise a single sample at the pool rate the source recorded at find
+  (`pool_hashrate_at_find`). A rate that is not plausibly the pool's is not
+  stored, and that round reads `hashrate_unavailable` instead of an absurd
+  luck: below the share chain's floor for the winning share's difficulty,
+  below 1 % of the node's own rate history near the block (or of the median
+  of the file's rates where that history does not reach), or above the whole
+  network's rate.
+
+A plain list of block hashes (one per line, `#` comments allowed, or a JSON
+array of strings) works too; those rows carry no pool rate, so their rounds
+have no luck unless the node's own history covers them.
 
 ---
 

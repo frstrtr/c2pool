@@ -120,6 +120,14 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
     # new tails are pure appends with null-not-zero unknowns, update_coinbase
     # reaches past 1000 records, and find_by_hash needs the full hash. Folded
     # into core_test for the same #769 reason.
+    # found_block_import_test.cpp: --import-found-blocks
+    # (core/found_block_import.hpp): another node's /recent_blocks (or a hash
+    # list) imported into the found-block ledger, each block validated against
+    # a map-backed header chain -- valid file, idempotent re-import, phantom /
+    # foreign / malformed rows refused by reason, height repaired from the
+    # header, fill-only merge, period luck over the imported rows, the wait
+    # for the header chain, merged rows, the coinbase pool check, and the
+    # provenance across a restart. Folded into core_test for the same reason.
     # web_server_http_cap_test.cpp: the HTTP session cap (the HTTP share of
     # the node's fd plan): a connection beyond it closed at once, a slot freed
     # when its connection ends. Same fold-into-core_test reasoning.
@@ -257,6 +265,7 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
         events_test.cpp
         factory_connect_failed_uaf_test.cpp
         filesystem_test.cpp
+        found_block_import_test.cpp
         found_block_store_test.cpp
         found_block_submit_test.cpp
         graph_history_test.cpp
