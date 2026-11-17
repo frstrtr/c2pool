@@ -603,7 +603,8 @@ void print_help() {
     std::cout << "  --stratum-target-time N   Target seconds per pseudoshare (default: 3)\n";
     std::cout << "  --no-vardiff              Disable automatic difficulty adjustment\n";
     std::cout << "  --max-coinbase-outputs N  Max coinbase outputs per block (default: 4000, matches p2pool)\n";
-    std::cout << "  --max-stratum-connections N  Max concurrent miners on this node (default: 100, 0 = unlimited)\n\n";
+    std::cout << "  --max-stratum-connections N  Max concurrent miners on this node (default: 100, 0 = unlimited)\n";
+    std::cout << "  --max-stratum-connections-per-ip N  Max concurrent miners from one IP address (default: 0 = unlimited)\n\n";
 
     std::cout << "EMBEDDED NODE OPTIONS:\n";
     std::cout << "  --embedded-ltc            Use embedded LTC SPV node (no daemon needed)\n";
@@ -1682,6 +1683,10 @@ int main(int argc, char* argv[]) {
             stratum_config.max_stratum_connections = static_cast<size_t>(std::stoul(argv[++i]));
             cli_explicit.insert("max_stratum_connections");
         }
+        else if (arg == "--max-stratum-connections-per-ip" && i + 1 < argc) {
+            stratum_config.max_stratum_connections_per_ip = static_cast<size_t>(std::stoul(argv[++i]));
+            cli_explicit.insert("max_stratum_connections_per_ip");
+        }
         // Operational tuning
         else if (arg == "--log-file" && i + 1 < argc) {
             log_file = argv[++i];
@@ -1949,6 +1954,8 @@ int main(int argc, char* argv[]) {
                 stratum_config.max_coinbase_outputs = cfg["max_coinbase_outputs"].as<size_t>();
             if (!cli_explicit.count("max_stratum_connections") && cfg["max_stratum_connections"])
                 stratum_config.max_stratum_connections = cfg["max_stratum_connections"].as<size_t>();
+            if (!cli_explicit.count("max_stratum_connections_per_ip") && cfg["max_stratum_connections_per_ip"])
+                stratum_config.max_stratum_connections_per_ip = cfg["max_stratum_connections_per_ip"].as<size_t>();
 
             // Operational tuning
             if (!cli_explicit.count("log_file") && cfg["log_file"])
@@ -3224,6 +3231,7 @@ int main(int argc, char* argv[]) {
                      << " vardiff=" << (stratum_config.vardiff_enabled ? "on" : "off")
                      << " max_cb_outputs=" << stratum_config.max_coinbase_outputs
                      << " max_stratum_connections=" << stratum_config.max_stratum_connections
+                     << " per_ip=" << stratum_config.max_stratum_connections_per_ip
                      << " keepalive=" << (stratum_config.tcp_keepalive_enabled ? "on" : "off")
                      << " handshake_timeout=" << stratum_config.handshake_timeout_sec << "s"
                      << " idle_timeout=" << stratum_config.session_idle_timeout_sec << "s";

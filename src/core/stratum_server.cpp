@@ -197,31 +197,73 @@ void StratumServer::handle_accept(boost::system::error_code ec, tcp::socket sock
         // WARN, bump the refused counter, and keep accepting. 0 = unlimited.
         // Dead sessions are normally pruned lazily in notify_all(); prune here
         // too when at cap so lingering closed sockets never starve real miners.
-        const size_t cap = mining_interface_
-            ? mining_interface_->get_stratum_config().max_stratum_connections
-            : 0;
+        // The per-source-IP cap (max_stratum_connections_per_ip, 0 = unlimited)
+        // is checked the same way after the node cap.
+        // At either cap, live sessions the hygiene knobs already condemn
+        // (StratumSession::reclaim_reason: no authorize by the handshake
+        // deadline, or idle past the idle timeout) are closed here as well:
+        // their timer / the next reaper sweep would close them a little later,
+        // and until then a real miner would be refused.
+        const core::stratum::StratumConfig* cfg =
+            mining_interface_ ? &mining_interface_->get_stratum_config() : nullptr;
+        const size_t cap = cfg ? cfg->max_stratum_connections : 0;
+        const size_t ip_cap = cfg ? cfg->max_stratum_connections_per_ip : 0;
+        boost::system::error_code ep_ec;
+        const auto ep = socket.remote_endpoint(ep_ec);
+        const bool per_ip = ip_cap > 0 && !ep_ec;
         size_t live = 0;
-        if (cap > 0) {
+        size_t from_ip = 0;
+        std::vector<std::pair<std::shared_ptr<StratumSession>, const char*>> reclaimed;
+        if (cap > 0 || per_ip) {
             std::lock_guard<std::mutex> lock(sessions_mutex_);
-            if (sessions_.size() >= cap) {
+            auto count_from_ip = [&] {
+                size_t n = 0;
+                for (const auto& s : sessions_)
+                    if (s->is_connected() && s->peer_address() == ep.address())
+                        ++n;
+                return n;
+            };
+            if ((cap > 0 && sessions_.size() >= cap)
+                || (per_ip && count_from_ip() >= ip_cap)) {
                 for (auto it = sessions_.begin(); it != sessions_.end(); ) {
-                    if (!(*it)->is_connected())
+                    if (!(*it)->is_connected()) {
                         it = sessions_.erase(it);
-                    else
+                    } else if (const char* why = (*it)->reclaim_reason(*cfg)) {
+                        reclaimed.emplace_back(*it, why);
+                        it = sessions_.erase(it);
+                    } else {
                         ++it;
+                    }
                 }
             }
             live = sessions_.size();
+            if (per_ip)
+                from_ip = count_from_ip();
         }
+        // Closed outside sessions_mutex_ (as drop_sessions does): each close
+        // runs the normal disconnect path, which may re-take the mutex.
+        for (auto& [s, why] : reclaimed)
+            s->drop_stale(why);
+        if (!reclaimed.empty())
+            LOG_INFO << "[Stratum] at a connection cap: closed " << reclaimed.size()
+                     << " stale session(s) before admitting a new one";
+        const std::string peer = ep_ec ? std::string{}
+            : " peer=" + ep.address().to_string() + ":" + std::to_string(ep.port());
         if (cap > 0 && live >= cap) {
             refused_connections_.fetch_add(1);
-            boost::system::error_code ep_ec;
-            const auto ep = socket.remote_endpoint(ep_ec);
             LOG_WARNING << "Stratum connection refused: node at miner cap "
                         << live << "/" << cap << " (max_stratum_connections)"
-                        << (ep_ec ? std::string{} : " peer=" + ep.address().to_string()
-                                        + ":" + std::to_string(ep.port()))
+                        << peer
                         << " refused_total=" << refused_connections_.load();
+            boost::system::error_code ignore;
+            socket.shutdown(tcp::socket::shutdown_both, ignore);
+            socket.close(ignore);
+        } else if (per_ip && from_ip >= ip_cap) {
+            refused_per_ip_.fetch_add(1);
+            LOG_WARNING << "Stratum connection refused: " << from_ip << "/" << ip_cap
+                        << " sessions from this address (max_stratum_connections_per_ip)"
+                        << peer
+                        << " refused_per_ip_total=" << refused_per_ip_.load();
             boost::system::error_code ignore;
             socket.shutdown(tcp::socket::shutdown_both, ignore);
             socket.close(ignore);
@@ -431,8 +473,8 @@ void StratumServer::start_idle_reaper()
     // Zombie-session reaper (belt-and-suspenders alongside OS TCP keepalive):
     // periodically close sessions that have sent no inbound line past the idle
     // timeout. A live miner submits shares far inside the window; a half-open
-    // NAT-dead peer sends nothing. No-op (never re-armed) unless the DASH-set
-    // StratumConfig::session_idle_timeout_sec > 0 -> other coins unchanged.
+    // NAT-dead peer sends nothing. No-op (never re-armed) unless the coin set
+    // StratumConfig::session_idle_timeout_sec > 0 (DASH, BTC, LTC).
     const auto& cfg0 = mining_interface_ ? mining_interface_->get_stratum_config()
                                          : core::stratum::StratumConfig{};
     const uint32_t timeout = cfg0.session_idle_timeout_sec;
@@ -455,19 +497,8 @@ void StratumServer::start_idle_reaper()
         for (auto& s : snapshot) {
             if (!s->is_connected())
                 continue;   // socket already dead -> notify_all prunes it
-            if (s->seconds_since_activity() <= timeout)
-                continue;   // recently active
-            // KEEPALIVE-AWARE: when OS TCP keepalive is enabled it is the
-            // liveness authority -- a still-open socket means keepalive has NOT
-            // declared the peer dead (it force-closes dead NAT paths, which the
-            // is_connected() guard above then catches). Do NOT reap an idle-but-
-            // keepalive-validated AUTHORIZED rig: a high fixed-diff suffix
-            // (ADDR+N) can legitimately exceed the idle window between submits,
-            // and reaping it would drop a LIVE, paying miner. Idle-time reaping
-            // is the FALLBACK only where keepalive is unavailable; unauthorized
-            // sessions (never completed handshake) are always fair game.
-            if (keepalive_on && s->is_authorized())
-                continue;
+            if (!s->idle_reapable(timeout, keepalive_on))
+                continue;   // recently active, or a keepalive-validated rig
             s->drop_stale("idle timeout (no inbound share/line)");
             ++reaped;
         }
@@ -493,6 +524,12 @@ StratumSession::StratumSession(tcp::socket socket, std::shared_ptr<IWorkSource> 
     subscription_id_ = generate_subscription_id();
     extranonce1_ = generate_extranonce1();
     session_id_ = subscription_id_;  // unique session key
+    {
+        boost::system::error_code ep_ec;
+        const auto ep = socket_.remote_endpoint(ep_ec);
+        if (!ep_ec)
+            peer_address_ = ep.address();
+    }
 
     // Apply stratum tuning from MiningInterface config (populated from CLI/YAML)
     const auto& cfg = mining_interface_->get_stratum_config();
@@ -2326,6 +2363,39 @@ void StratumSession::arm_handshake_timer()
         if (!self->authorized_ && self->is_connected())
             self->drop_stale("handshake (authorize) deadline");
     });
+}
+
+bool StratumSession::idle_reapable(uint32_t timeout, bool keepalive_on) const
+{
+    if (timeout == 0)
+        return false;
+    // last_activity_ moves on every INBOUND line only (process_message): the
+    // notifies this server sends never make a dead peer look alive.
+    if (seconds_since_activity() <= timeout)
+        return false;   // recently active
+    // KEEPALIVE-AWARE: when OS TCP keepalive is enabled it is the liveness
+    // authority -- a still-open socket means keepalive has NOT declared the
+    // peer dead (it force-closes dead NAT paths, which an is_connected() check
+    // then catches). Do NOT reap an idle-but-keepalive-validated AUTHORIZED
+    // rig: a high fixed-diff suffix (ADDR+N) can legitimately exceed the idle
+    // window between submits, and reaping it would drop a LIVE, paying miner.
+    // Idle-time reaping is the FALLBACK only where keepalive is unavailable;
+    // unauthorized sessions (never completed handshake) are always fair game.
+    return !(keepalive_on && authorized_);
+}
+
+const char* StratumSession::reclaim_reason(const core::stratum::StratumConfig& cfg) const
+{
+    // The authorize deadline, measured from the accept: the same instant the
+    // handshake timer (arm_handshake_timer) fires at, so this only matters
+    // for a session whose timer has not run yet or was disarmed by an
+    // authorize that then failed (a refused payout address).
+    if (!authorized_ && cfg.handshake_timeout_sec > 0
+        && seconds_since_connect() >= static_cast<double>(cfg.handshake_timeout_sec))
+        return "handshake (authorize) deadline";
+    if (idle_reapable(cfg.session_idle_timeout_sec, cfg.tcp_keepalive_enabled))
+        return "idle timeout (no inbound share/line)";
+    return nullptr;
 }
 
 void StratumSession::drop_stale(const char* reason)

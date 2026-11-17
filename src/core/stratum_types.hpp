@@ -56,6 +56,12 @@ struct StratumConfig {
     // max_stratum_connections (YAML) / --max-stratum-connections (CLI).
     // Admission control only — zero wire-byte change for admitted sessions.
     size_t max_stratum_connections = 100;
+    // Per-source-IP share of that cap: at most this many live sessions from
+    // one remote address, so one host cannot take every slot. A refused
+    // connection is closed cleanly and counted apart from the node cap
+    // (StratumServer::get_refused_per_ip). 0 = unlimited (the default, so
+    // every coin is unchanged; a farm behind one NAT address shares it).
+    size_t max_stratum_connections_per_ip = 0;
     // Runtime coin tag for coin-agnostic core log lines (e.g. the "waiting
     // for block template" warning). Set by each coin's work source / main so
     // a DASH binary never logs "[LTC]" (issue #732 secondary defect). Empty
@@ -109,8 +115,9 @@ struct StratumConfig {
     // lock real rigs out (admission control). These knobs bound that leak. ALL
     // default OFF/neutral; DASH, BTC and LTC opt in (impl/dash/stratum/
     // work_source.cpp, impl/btc/stratum/work_source.cpp,
-    // impl/ltc/stratum_defaults.hpp). Transport/liveness only -- zero
-    // wire-byte change and consensus-neutral.
+    // impl/ltc/stratum_defaults.hpp). At the miner cap the same deadlines also
+    // free a slot on the spot (StratumSession::reclaim_reason). Transport/
+    // liveness only -- zero wire-byte change and consensus-neutral.
     //
     // (a) OS TCP keepalive: the kernel probes an idle peer and errors the
     //     pending async_read on a dead NAT path, which runs the normal
