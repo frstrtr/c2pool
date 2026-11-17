@@ -11170,8 +11170,10 @@ int main(int argc, char* argv[]) {
                         LOG_INFO << "[BLOCK-SCAN] Scanning " << scan_depth << " shares from "
                                  << heads.size() << " head(s) (latest block ts=" << latest_block_ts
                                  << ", existing=" << existing.size() << ")";
+                        // Through the node: the hooks read under this guard
+                        // (no second shared lock on this thread).
                         for (const auto& [head_hash, _] : heads)
-                            guard->scan_chain_for_blocks(head_hash, scan_depth);
+                            p2p_node->scan_chain_for_blocks(guard, head_hash, scan_depth);
                     }
                     } // guard
                 }

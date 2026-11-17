@@ -1847,7 +1847,7 @@ void NodeImpl::notify_local_share(const uint256& share_hash)
     {
         std::unique_lock lock(m_tracker_mutex, std::try_to_lock);
         if (lock.owns_lock()) {
-            ExclusiveHolderMark holder(m_exclusive_holder_id);   // ends before the unlock
+            TrackerLockHolderMark holder(this);   // ends before the unlock
             if (m_tracker.chain.contains(share_hash))
                 m_tracker.attempt_verify(share_hash);
         }
@@ -3834,6 +3834,10 @@ void NodeImpl::clean_tracker()
                 LOG_INFO << "[CLEAN] IO-phase: work refresh (best changed)";
                 m_on_best_share_changed();
             }
+            // Peers learn the new best share the way they do after a think
+            // (run_think's IO phase): re-push the head walk.
+            if (clean_best_changed && !m_peers.empty())
+                readvertise_best_share();
             drain_pending_adds();
         } catch (const std::exception& e) {
             LOG_ERROR << "[CLEAN] IO phase failed: " << e.what();

@@ -24,6 +24,10 @@
 //   - The think path: a best change made by run_think() is notified exactly
 //     once, and a cycle that changes nothing notifies nothing (GREEN before
 //     and after; it pins that the fixes add no spurious refresh).
+//   - Peers learn a best share moved by a clean the way they learn one moved
+//     by a think: the clean's IO phase re-pushes the head walk
+//     (readvertise_best_share) to a connected peer, here a real loopback
+//     socket. RED before: nothing reached the peer.
 //
 // Folded into the EXISTING allowlisted `share_test` target (the #769 trap).
 // ---------------------------------------------------------------------------
@@ -36,13 +40,19 @@
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
+#include <source_location>
 #include <stdexcept>
+#include <string>
 #include <thread>
+#include <vector>
 
-#include <boost/asio/io_context.hpp>
+#include <boost/asio.hpp>
 #include <boost/log/core.hpp>
 
+#include <core/netaddress.hpp>
+#include <core/socket.hpp>
 #include <core/uint256.hpp>
+#include <impl/ltc/config_pool.hpp>
 #include <impl/ltc/node.hpp>
 #include <impl/ltc/share.hpp>
 
@@ -79,6 +89,7 @@ struct ThinkNode : public ltc::NodeImpl
     using ltc::NodeImpl::m_think_running;
     using ltc::NodeImpl::m_clean_running;
     using ltc::NodeImpl::m_think_generation;
+    using ltc::NodeImpl::m_peers;
 
     /// A verified share on `prev` (the caller holds the tracker lock, or no
     /// cycle is running).
@@ -341,4 +352,114 @@ TEST(LtcThinkBestChangeNotify, RunThinkSkippedDuringCleanRunsAfterIt)
     ASSERT_TRUE(settle(*f.node, f.ioc));
     EXPECT_EQ(f.node->best_locked(), H(11));
     EXPECT_EQ(f.notified.load(), 2);
+}
+
+// ── a clean best change re-advertises the head, as a think's does ──────────
+
+namespace {
+
+using boost::asio::ip::tcp;
+
+const std::vector<std::byte>& test_prefix()
+{
+    static const std::vector<std::byte> prefix{
+        std::byte{0xfc}, std::byte{0xc1}, std::byte{0xb7}, std::byte{0xdc}};
+    return prefix;
+}
+
+struct StubCommunicator : public core::ICommunicator
+{
+    void error(const message_error_type&, const NetService&,
+               const std::source_location = std::source_location::current()) override {}
+    void error(const boost::system::error_code&, const NetService&,
+               const std::source_location = std::source_location::current()) override {}
+    void handle(std::unique_ptr<RawMessage>, const NetService&) override {}
+    const std::vector<std::byte>& get_prefix() const override { return test_prefix(); }
+};
+
+// One connected peer on a real loopback socket (on the node's io_context);
+// `theirs` is the far end, read to see what the node pushed.
+struct PeerFixture {
+    boost::asio::io_context ioc;
+    StubCommunicator stub;
+    std::unique_ptr<tcp::socket> theirs;
+    std::unique_ptr<ThinkNode> node;      // destroyed first
+    std::atomic<int> notified{0};
+
+    PeerFixture()
+    {
+        tcp::acceptor acceptor(ioc, tcp::endpoint(boost::asio::ip::make_address("127.0.0.1"), 0));
+        acceptor.listen();
+        auto ours = std::make_unique<tcp::socket>(ioc);
+        ours->connect(acceptor.local_endpoint());
+        theirs = std::make_unique<tcp::socket>(acceptor.accept());
+        theirs->non_blocking(true);
+
+        node = std::make_unique<ThinkNode>(ioc);
+        node->set_on_best_share_changed([this] { notified.fetch_add(1); });
+        auto sock = std::make_shared<core::Socket>(
+            std::move(ours), core::outgoing, &stub,
+            std::weak_ptr<core::INetwork>{}, /*was_managed=*/false);
+        sock->init();
+        auto peer = std::make_shared<ltc::NodeImpl::peer_t>(sock);
+        peer->m_other_version = ltc::PoolConfig::V3601_PROTOCOL_VERSION;
+        peer->m_nonce = 0x5151;
+        node->m_peers[0x5151] = peer;
+    }
+
+    // Everything the node wrote to the peer since the last call.
+    std::string wire()
+    {
+        std::string out;
+        char buf[65536];
+        for (;;) {
+            boost::system::error_code ec;
+            const std::size_t n = theirs->read_some(boost::asio::buffer(buf), ec);
+            if (ec || n == 0)
+                break;
+            out.append(buf, n);
+        }
+        return out;
+    }
+};
+
+bool carries_shares(const std::string& wire) { return wire.find("shares") != std::string::npos; }
+
+} // namespace
+
+TEST(LtcThinkBestChangeNotify, CleanStep1MoveReadvertisesTheNewBest)
+{
+    QuietLog quiet;
+    PeerFixture f;
+    const uint256 tip = f.node->build_trunk(12);
+    f.node->m_best_share_hash = H(11);
+
+    f.node->clean_tracker();
+    ASSERT_TRUE(settle(*f.node, f.ioc));
+    EXPECT_EQ(f.node->best_locked(), tip);
+    EXPECT_EQ(f.notified.load(), 1);
+    EXPECT_TRUE(carries_shares(f.wire()))
+        << "a best share moved by clean_tracker must be re-advertised to the peers, "
+           "as run_think's IO phase does (nothing reached the peer)";
+
+    // No change, no re-advertisement.
+    f.node->clean_tracker();
+    ASSERT_TRUE(settle(*f.node, f.ioc));
+    EXPECT_EQ(f.notified.load(), 1);
+    EXPECT_EQ(f.wire(), std::string());
+}
+
+// The think path it mirrors (GREEN before and after).
+TEST(LtcThinkBestChangeNotify, RunThinkMoveReadvertisesTheNewBest)
+{
+    QuietLog quiet;
+    PeerFixture f;
+    const uint256 tip = f.node->build_trunk(12);
+    f.node->m_best_share_hash = H(11);
+
+    f.node->run_think();
+    ASSERT_TRUE(settle(*f.node, f.ioc));
+    EXPECT_EQ(f.node->best_locked(), tip);
+    EXPECT_EQ(f.notified.load(), 1);
+    EXPECT_TRUE(carries_shares(f.wire()));
 }

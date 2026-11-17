@@ -26,6 +26,14 @@
 // try-locks, and fails while the verify holds the lock), and the mark ends
 // with the exclusive section.
 //
+// The startup block scan (main_ltc) fires the same hooks from
+// scan_chain_for_blocks while it holds a read_tracker() SHARED guard; the
+// hooks' read_tracker() took a second shared lock on that thread (undefined
+// behaviour, granted by glibc's reader-preferring rwlock, so no runtime
+// failure to show on master: the main_ltc call site is pinned structurally).
+// Now the scan goes through NodeImpl::scan_chain_for_blocks(held, ...), and
+// the hooks read under the scan's guard, in scan order, with the share link.
+//
 // Folded into the EXISTING allowlisted `share_test` target (the #769 trap).
 // ---------------------------------------------------------------------------
 
@@ -33,6 +41,8 @@
 
 #include <atomic>
 #include <ctime>
+#include <fstream>
+#include <sstream>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -236,4 +246,123 @@ TEST(LtcLocalShareBlockHook, OnlyTheHoldingThreadSkipsTheLock)
     }
     release = true;
     writer.join();
+}
+
+// ── the startup block scan ──────────────────────────────────────────────────
+
+namespace {
+
+uint256 S(uint64_t n) { return uint256(0x200000 + n); }
+
+constexpr uint32_t kScanBlockBits = 0x1b0fffff;
+
+// A verified trunk S(1)..S(n) with cached PoW hashes, as a reload leaves it:
+// the shares in `blocks` meet the block target, the rest do not.
+uint256 build_scanned_trunk(HookNode& node, int n, const std::vector<int>& blocks)
+{
+    const uint256 block_target = chain::bits_to_target(kScanBlockBits);
+    uint256 prev;
+    for (int i = 1; i <= n; ++i) {
+        auto* sh = new ltc::MergedMiningShare();
+        sh->m_hash = S(i);
+        sh->m_prev_hash = prev;
+        sh->m_desired_version = 36;
+        sh->m_bits = 0x1e0fffff;
+        sh->m_max_bits = 0x1e0fffff;
+        sh->m_min_header.m_bits = kScanBlockBits;
+        sh->m_min_header.m_timestamp = 1'700'000'000u + static_cast<uint32_t>(i);
+        ltc::ShareType st;
+        st = sh;
+        node.m_tracker.add(st);
+        node.m_tracker.verified.add(node.m_tracker.chain.get_share(S(i)));
+        bool is_block = false;
+        for (int b : blocks)
+            is_block = is_block || b == i;
+        node.m_tracker.chain.get_index(S(i))->pow_hash = is_block ? block_target : ~uint256();
+        prev = S(i);
+    }
+    return prev;
+}
+
+} // namespace
+
+TEST(LtcLocalShareBlockHook, StartupScanHooksReadUnderTheScansGuard)
+{
+    QuietLog quiet;
+    HookNode node;
+    const uint256 tip = build_scanned_trunk(node, 10, {9, 4});
+
+    struct Hit { uint256 hash; bool marked; bool guard_ok; std::string row_share; };
+    std::vector<Hit> block_hits;
+    std::vector<uint256> merged_hits;
+    int merged_refused = 0;
+    node.m_tracker.m_on_block_found = [&](const uint256& h) {
+        Hit hit{h, node.holds_tracker_lock(), false, {}};
+        auto guard = node.read_tracker();
+        hit.guard_ok = static_cast<bool>(guard);
+        if (guard && guard->chain.contains(h))
+            guard->chain.get(h).share.invoke([&](auto* s) {
+                hit.row_share = ltc::dashboard::row_from_share(h, *s, /*testnet=*/false).share_hash;
+            });
+        block_hits.push_back(hit);
+    };
+    node.m_tracker.m_on_merged_block_check = [&](const uint256& h, const uint256&) {
+        auto guard = node.read_tracker();
+        if (!guard) { ++merged_refused; return; }
+        merged_hits.push_back(h);
+    };
+
+    {
+        auto guard = node.read_tracker();   // main_ltc's scan guard (shared)
+        ASSERT_TRUE(guard);
+        EXPECT_FALSE(node.holds_tracker_lock()) << "a plain reader is not marked";
+        node.scan_chain_for_blocks(guard, tip, 10);
+    }
+
+    ASSERT_EQ(block_hits.size(), 2u);
+    EXPECT_EQ(block_hits[0].hash, S(9)) << "scan order: tip first";
+    EXPECT_EQ(block_hits[1].hash, S(4));
+    for (const auto& hit : block_hits) {
+        EXPECT_TRUE(hit.marked) << "the hook reads under the scan's guard, no second lock";
+        EXPECT_TRUE(hit.guard_ok);
+        EXPECT_EQ(hit.row_share, hit.hash.GetHex()) << "the row's share link";
+    }
+    EXPECT_EQ(merged_refused, 0);
+    EXPECT_EQ(merged_hits.size(), 10u) << "every share with a cached PoW hash";
+    EXPECT_FALSE(node.holds_tracker_lock()) << "the mark ends with the scan";
+
+    // A failed guard scans nothing (no unlocked reads, no hooks).
+    std::atomic<bool> holding{false}, release{false};
+    std::thread writer([&] {
+        std::unique_lock<std::shared_mutex> lk(node.tracker_mutex());
+        holding = true;
+        while (!release.load())
+            std::this_thread::yield();
+    });
+    while (!holding.load())
+        std::this_thread::yield();
+    {
+        auto guard = node.read_tracker();
+        EXPECT_FALSE(guard);
+        node.scan_chain_for_blocks(guard, tip, 10);
+    }
+    release = true;
+    writer.join();
+    EXPECT_EQ(block_hits.size(), 2u);
+    EXPECT_EQ(merged_hits.size(), 10u);
+}
+
+// main_ltc's startup scan goes through the node, holding its guard, never
+// straight into the tracker under it (RED before: guard->scan_chain_for_blocks).
+TEST(LtcLocalShareBlockHook, MainLtcStartupScanGoesThroughTheNode)
+{
+    std::ifstream in(std::string(C2POOL_IMPL_DIR) + "/../c2pool/main_ltc.cpp");
+    ASSERT_TRUE(in.good());
+    std::stringstream ss;
+    ss << in.rdbuf();
+    const std::string src = ss.str();
+    EXPECT_EQ(src.find("guard->scan_chain_for_blocks("), std::string::npos)
+        << "the startup scan calls the tracker under its own read guard: the hooks "
+           "then take a second shared lock on this thread";
+    EXPECT_NE(src.find("p2p_node->scan_chain_for_blocks(guard,"), std::string::npos);
 }

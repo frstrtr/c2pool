@@ -435,12 +435,15 @@ if (BUILD_TESTING AND GTest_FOUND)
     # block reaches the found-block and merged-block hooks with the share
     # readable. notify_local_share verifies under its own EXCLUSIVE lock and
     # the hooks read through read_tracker(): a shared try-lock by the owning
-    # thread (undefined; glibc refuses it) made them bail. REAL NodeImpl, REAL
-    # minted and verified share. Same folding rule.
+    # thread (undefined; glibc refuses it) made them bail. The startup block
+    # scan fires the same hooks under its own shared guard and now reads
+    # through it too. REAL NodeImpl, REAL minted and verified share. Same
+    # folding rule.
     #
     # think_best_change_notify_test.cpp + think_gate_test.cpp: every
     # best-share change reaches m_on_best_share_changed once — one made by
-    # clean_tracker Step 1 (compared away by Step 4) included — and a
+    # clean_tracker Step 1 (compared away by Step 4) included, re-advertised
+    # to the peers as after a think — and a
     # run_think() skipped while a cycle holds the slot is served by one think
     # from the cycle's epilogue (the #854 pending re-think, ported from DASH).
     # REAL NodeImpl with its compute thread and a test io_context, plus the
