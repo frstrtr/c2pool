@@ -2,6 +2,7 @@
 #pragma once
 #include <boost/asio.hpp>
 #include <optional>
+#include <string>
 
 #include <core/log.hpp>
 #include <core/dial.hpp>
@@ -169,6 +170,51 @@ inline ListenResult bind_listener(io::ip::tcp::acceptor& acc, uint16_t port,
     return r;
 }
 
+// The spellings of "every interface" for a [HOST:]PORT listen option. A
+// wildcard host keeps the bind_listener Auto path above, byte-unchanged.
+inline bool is_wildcard_listen_host(const std::string& host)
+{
+    return host.empty() || host == "0.0.0.0" || host == "::" || host == "[::]" || host == "*";
+}
+
+// Bind `acc` to ONE local address (a numeric IPv4 or IPv6 literal; brackets
+// around an IPv6 literal are accepted) and `port`. Only that address accepts
+// connections: a 127.0.0.1 listener is not reachable on the host's LAN
+// address. An IPv6 address is bound v6-only (no IPv4-mapped traffic).
+// Never throws; on failure returns {ok=false} with `ec` set (a hostname is
+// refused with invalid_argument: give a numeric address) and the acceptor
+// CLOSED. On success `ec` is cleared and the acceptor is open+bound (the caller
+// issues listen()).
+inline ListenResult bind_listener_at(io::ip::tcp::acceptor& acc, const std::string& host,
+                                     uint16_t port, boost::system::error_code& ec)
+{
+    ListenResult r;
+    std::string h = host;
+    if (h.size() >= 2 && h.front() == '[' && h.back() == ']')
+        h = h.substr(1, h.size() - 2);
+    const io::ip::address addr = io::ip::make_address(h, ec);
+    if (ec) return r;
+    const io::ip::tcp::endpoint ep(addr, port);
+    acc.open(ep.protocol(), ec);
+    if (ec) return r;
+    boost::system::error_code ig;
+    acc.set_option(io::socket_base::reuse_address(true), ig);   // best-effort
+    if (addr.is_v6())
+        acc.set_option(io::ip::v6_only(true), ig);
+    acc.bind(ep, ec);
+    if (ec) {
+        boost::system::error_code ignore;
+        acc.close(ignore);
+        return r;
+    }
+    r.ok = true;
+    r.ipv6 = addr.is_v6();
+    r.ipv4_mapped = false;
+    r.port = acc.local_endpoint().port();
+    ec.clear();
+    return r;
+}
+
 
 class Server
 {
@@ -265,6 +311,33 @@ public:
 
         LOG_INFO << "Factory listening on port " << r.port
                  << " [" << r.families() << "]";
+    }
+
+    /// Listen on ONE local address (bind_listener_at). For a wildcard host use
+    /// listen(port). Returns false, with the reason logged, when nothing was
+    /// bound (not a numeric address, address not on this host, port in use),
+    /// so a caller that was asked for a specific address can fail loudly
+    /// instead of silently listening somewhere else.
+    bool listen_on(const std::string& host, uint16_t listen_port)
+    {
+        if (!m_acceptor)
+        {
+            LOG_ERROR << "listen_on() called on a context-less Server";
+            return false;
+        }
+        boost::system::error_code ec;
+        const ListenResult r = bind_listener_at(*m_acceptor, host, listen_port, ec);
+        if (!r.ok)
+        {
+            LOG_ERROR << "listen_on() failed to bind " << host << ":" << listen_port
+                      << ": " << ec.message();
+            return false;
+        }
+        m_acceptor->listen();
+        accept();
+        LOG_INFO << "Factory listening on " << host << " port " << r.port
+                 << " [" << r.families() << "]";
+        return true;
     }
 
 	uint16_t listen_port() const { return m_acceptor->local_endpoint().port(); }
