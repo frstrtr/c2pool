@@ -1834,10 +1834,22 @@ void NodeImpl::notify_local_share(const uint256& share_hash)
     // chain nodes -> SIGSEGV (kr1z1s LTC/DGB). try_to_lock keeps the IO thread
     // non-blocking; if think()/clean holds the lock we skip the inline verify —
     // the share is already in-chain and run_think() below will score it next cycle.
+    //
+    // attempt_verify fires the tracker hooks synchronously, under this lock:
+    // m_on_block_found and m_on_merged_block_check (main_ltc) read the share
+    // through read_tracker(). This thread owns the mutex exclusively, and a
+    // shared try-lock by its owner is undefined behaviour (glibc refuses it),
+    // so the hooks bailed: a block our own share solved got no found-block
+    // row from this path, a DOGE one no merged row. The mark makes
+    // read_tracker() on this thread read under the lock already held, as on
+    // the compute thread, where the same hooks fire for every verified share.
     {
         std::unique_lock lock(m_tracker_mutex, std::try_to_lock);
-        if (lock.owns_lock() && m_tracker.chain.contains(share_hash))
-            m_tracker.attempt_verify(share_hash);
+        if (lock.owns_lock()) {
+            ExclusiveHolderMark holder(m_exclusive_holder_id);   // ends before the unlock
+            if (m_tracker.chain.contains(share_hash))
+                m_tracker.attempt_verify(share_hash);
+        }
     }
 
     // Trigger async think() — will pick up the local share through scoring.
@@ -1847,8 +1859,9 @@ void NodeImpl::notify_local_share(const uint256& share_hash)
 uint256 NodeImpl::best_share_hash()
 {
     // Reader discipline (m_tracker_mutex, node.hpp): never block, never read
-    // the tracker unlocked. The compute thread already holds the lock.
-    if (is_compute_thread())
+    // the tracker unlocked. The compute thread already holds the lock, and so
+    // does a thread inside notify_local_share's exclusive verify.
+    if (holds_tracker_lock())
         return best_share_hash_and_publish();
     std::shared_lock<std::shared_mutex> lock(m_tracker_mutex, std::try_to_lock);
     if (!lock.owns_lock())
@@ -1979,7 +1992,7 @@ uint256 NodeImpl::advertised_best_share()
     // nothing to advertise yet; the re-advert timer and the next best-share
     // change push the head once the lock is free.
     std::shared_lock<std::shared_mutex> lock(m_tracker_mutex, std::defer_lock);
-    if (!is_compute_thread() && !lock.try_lock())
+    if (!holds_tracker_lock() && !lock.try_lock())
         return uint256::ZERO;
     if (m_chain && m_chain->size() > 0) {
         uint256 best;
