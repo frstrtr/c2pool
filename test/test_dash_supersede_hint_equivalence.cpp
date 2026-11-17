@@ -15,13 +15,15 @@
 // (the acc_height >= CHAIN_LENGTH filter), the new function returns a hint
 // field-for-field equal to the previous implementation, kept below verbatim as
 // the reference. A timing comparison on a full-length chain with stale fork
-// heads is printed (not asserted).
+// heads is printed (not asserted). descends_from (the cheap descendant walk
+// that replaced is_child_of there) equals is_child_of on every pair of a forest.
 //
 // Folded into test_dash_p2p_node (beside test_dash_restart_reorg_supersede_kat).
 
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <functional>
 #include <iostream>
 #include <random>
 #include <string>
@@ -143,60 +145,173 @@ uint32_t pick_bits(std::mt19937& rng) {
 } // namespace
 
 // Hundreds of random forests: the hint is identical, field for field, and the
-// active case is actually exercised (not only the inactive one).
+// active case is actually exercised (not only the inactive one). The reference
+// and the new function each run on their OWN identically built tracker, so
+// neither sees a height/work memo the other one warmed.
+namespace {
+struct Forest {
+    uint256 incumbent;
+    bool    other_incumbent{false};   ///< not the rooted verified tip
+    std::vector<uint256> all;         ///< every share hash added
+    std::vector<uint256> parents;     ///< the missing parents used
+};
+Forest build_forest(dash::ShareTracker& t, uint32_t seed, int round)
+{
+    std::mt19937 rng(seed);
+    Builder b{t};
+    auto inc = b.run(10 + static_cast<int32_t>(rng() % 50), uint256(), kBitsNormal);
+    verify(t, inc, inc.size());
+    std::vector<std::vector<uint256>> segs{inc};
+    const int extra = static_cast<int>(rng() % 10);
+    for (int k = 0; k < extra; ++k) {
+        const int32_t n = 1 + static_cast<int32_t>(rng() % 60);
+        const uint32_t bits = pick_bits(rng);
+        std::vector<uint256> seg;
+        switch (rng() % 4) {
+        case 0:  // extension of the incumbent tip (a child, not a fork)
+            seg = b.run(n, inc.back(), bits);
+            break;
+        case 1: {  // fork off a random incumbent ancestor
+            const auto& base = inc[rng() % inc.size()];
+            seg = b.run(n, base, bits);
+            break;
+        }
+        case 2: {  // disconnected segment: its parent is missing
+            char buf[24];
+            std::snprintf(buf, sizeof(buf), "dead%04x%04x", round, k);
+            seg = b.run(n, hx(buf), bits);
+            break;
+        }
+        default: {  // extension of an earlier segment
+            const auto& sg = segs[rng() % segs.size()];
+            seg = b.run(n, sg.back(), bits);
+            break;
+        }
+        }
+        if (rng() % 3 == 0)
+            verify(t, seg, rng() % (seg.size() + 1));
+        segs.push_back(std::move(seg));
+    }
+    // Incumbent: usually our verified tip; one round in four another segment,
+    // fully verified first, so the "incumbent is not the rooted tip" case runs.
+    Forest f;
+    f.incumbent = inc.back();
+    if (rng() % 4 == 0) {
+        const auto& sg = segs[rng() % segs.size()];
+        verify(t, sg, sg.size());
+        if (t.verified.contains(sg.back()) && sg.back() != inc.back()) {
+            f.incumbent = sg.back();
+            f.other_incumbent = true;
+        }
+    }
+    for (const auto& sg : segs) f.all.insert(f.all.end(), sg.begin(), sg.end());
+    for (const auto& sg : segs)
+        if (!sg.empty()) {
+            const uint256 prev = t.chain.get_index(sg.front())->tail;
+            if (!prev.IsNull() && !t.chain.contains(prev)) f.parents.push_back(prev);
+        }
+    return f;
+}
+} // namespace
+
 TEST(DashSupersedeHintEquivalence, RandomForestsGiveTheIdenticalHint)
 {
-    std::mt19937 rng(20261117);
-    int active_cases = 0, inactive_cases = 0;
+    int active_cases = 0, inactive_cases = 0, other_incumbent = 0;
     for (int round = 0; round < 400; ++round) {
-        dash::ShareTracker t;
-        Builder b{t};
-        auto inc = b.run(10 + static_cast<int32_t>(rng() % 50), uint256(), kBitsNormal);
-        verify(t, inc, inc.size());
-        std::vector<std::vector<uint256>> segs{inc};
-        const int extra = static_cast<int>(rng() % 10);
-        for (int k = 0; k < extra; ++k) {
-            const int32_t n = 1 + static_cast<int32_t>(rng() % 60);
-            const uint32_t bits = pick_bits(rng);
-            std::vector<uint256> seg;
-            switch (rng() % 4) {
-            case 0:  // extension of the incumbent tip (a child, not a fork)
-                seg = b.run(n, inc.back(), bits);
-                break;
-            case 1: {  // fork off a random incumbent ancestor
-                const auto& base = inc[rng() % inc.size()];
-                seg = b.run(n, base, bits);
-                break;
-            }
-            case 2: {  // disconnected segment: its parent is missing
-                char buf[24];
-                std::snprintf(buf, sizeof(buf), "dead%04x%04x", round, k);
-                seg = b.run(n, hx(buf), bits);
-                break;
-            }
-            default: {  // extension of an earlier segment
-                const auto& s = segs[rng() % segs.size()];
-                seg = b.run(n, s.back(), bits);
-                break;
-            }
-            }
-            if (rng() % 3 == 0)
-                verify(t, seg, rng() % (seg.size() + 1));
-            segs.push_back(std::move(seg));
-        }
-        // Incumbent: usually our verified tip, sometimes another verified head.
-        uint256 incumbent = inc.back();
-        if (rng() % 5 == 0) {
-            const auto& s = segs[rng() % segs.size()];
-            if (t.verified.contains(s.back())) incumbent = s.back();
-        }
-        const auto ref = reference_hint(t, incumbent, 400);
-        const auto now = t.compute_supersede_hint(incumbent, 400);
+        const uint32_t seed = 20261117u + static_cast<uint32_t>(round);
+        dash::ShareTracker t_ref, t_new;
+        const auto f_ref = build_forest(t_ref, seed, round);
+        const auto f_new = build_forest(t_new, seed, round);
+        ASSERT_EQ(f_ref.incumbent, f_new.incumbent);
+        const auto ref = reference_hint(t_ref, f_ref.incumbent, 400);
+        const auto now = t_new.compute_supersede_hint(f_new.incumbent, 400);
         ASSERT_TRUE(same_hint(ref, now)) << "round " << round;
         (ref.active ? active_cases : inactive_cases)++;
+        if (f_ref.other_incumbent) ++other_incumbent;
     }
     EXPECT_GT(active_cases, 20) << "the active path must be exercised";
     EXPECT_GT(inactive_cases, 20);
+    EXPECT_GT(other_incumbent, 20) << "an incumbent other than the rooted tip must be exercised";
+}
+
+// descends_from (the cheap walk) answers exactly like chain.is_child_of on
+// EVERY ordered pair of a forest: shares, the segments' missing parents, a
+// hash that is in no segment, and each element with itself.
+TEST(DashSupersedeHintEquivalence, DescendsFromEqualsIsChildOfOnEveryPair)
+{
+    size_t pairs = 0, trues = 0;
+    for (int round = 0; round < 40; ++round) {
+        dash::ShareTracker t;
+        const auto f = build_forest(t, 777u + static_cast<uint32_t>(round), 1000 + round);
+        std::vector<uint256> nodes = f.all;
+        nodes.insert(nodes.end(), f.parents.begin(), f.parents.end());
+        nodes.push_back(hx("beef1234"));   // in no segment at all
+        if (nodes.size() > 160) nodes.resize(160);   // keep the pair count bounded
+        for (const auto& a : nodes)
+            for (const auto& b : nodes) {
+                const bool slow = t.chain.is_child_of(a, b);
+                const bool fast = t.descends_from(a, b);
+                ASSERT_EQ(fast, slow) << "round " << round << " item=" << a.GetHex().substr(48)
+                                      << " possible_child=" << b.GetHex().substr(48);
+                ++pairs;
+                trues += slow ? 1 : 0;
+            }
+    }
+    EXPECT_GT(trues, pairs / 50) << "the true case must be well exercised";
+}
+
+// Deterministic edge cases the random forests reach only by chance.
+TEST(DashSupersedeHintEquivalence, TiesAndChildPlusForkCases)
+{
+    struct Case {
+        const char* name;
+        std::function<uint256(Builder&, dash::ShareTracker&, const std::vector<uint256>&)> extra;
+        bool active;
+    };
+    // Each case starts from a 30-share verified incumbent; `extra` adds the
+    // rest and returns the expected target head (null when inactive).
+    const std::vector<Case> cases = {
+        {"fork with work EQUAL to the incumbent -> inactive",
+         [](Builder& b, dash::ShareTracker&, const std::vector<uint256>&) {
+             b.run(30, hx("dead0101"), kBitsNormal);
+             return uint256();
+         }, false},
+        {"two equal-work forks above the incumbent -> the same (first) one wins",
+         [](Builder& b, dash::ShareTracker&, const std::vector<uint256>&) {
+             b.run(40, hx("dead0201"), kBitsNormal);
+             b.run(40, hx("dead0202"), kBitsNormal);
+             return uint256();   // target checked by equality with the reference only
+         }, true},
+        {"higher-work child + lower-work fork -> inactive",
+         [](Builder& b, dash::ShareTracker&, const std::vector<uint256>& inc) {
+             b.run(5, inc.back(), kBitsNormal);
+             b.run(3, inc[10], kBitsNormal);
+             return uint256();
+         }, false},
+        {"higher-work child + higher-work fork -> the fork wins",
+         [](Builder& b, dash::ShareTracker&, const std::vector<uint256>& inc) {
+             b.run(5, inc.back(), kBitsNormal);
+             return b.run(60, inc[5], kBitsNormal).back();
+         }, true},
+    };
+    for (const auto& c : cases) {
+        SCOPED_TRACE(c.name);
+        dash::ShareTracker t_ref, t_new;
+        uint256 target_ref, target_new, inc_ref, inc_new;
+        for (auto* t : {&t_ref, &t_new}) {
+            Builder b{*t};
+            auto inc = b.run(30, uint256(), kBitsNormal);
+            verify(*t, inc, inc.size());
+            const uint256 target = c.extra(b, *t, inc);
+            (t == &t_ref ? target_ref : target_new) = target;
+            (t == &t_ref ? inc_ref : inc_new) = inc.back();
+        }
+        const auto ref = reference_hint(t_ref, inc_ref, 400);
+        const auto now = t_new.compute_supersede_hint(inc_new, 400);
+        EXPECT_TRUE(same_hint(ref, now));
+        EXPECT_EQ(now.active, c.active);
+        if (!target_new.IsNull()) EXPECT_EQ(now.target_head, target_new);
+    }
 }
 
 // The acc_height >= CHAIN_LENGTH filter: a full-length verified head with more
@@ -209,16 +324,25 @@ TEST(DashSupersedeHintEquivalence, FullLengthVerifiedHeadsGiveTheIdenticalHint)
     Builder b{t};
     auto inc = b.run(CL + 10, uint256(), kBitsNormal);
     verify(t, inc, inc.size());
-    auto full = b.run(CL + 20, uint256(), kBitsNormal);   // a second rooted chain, more work
+    // A second rooted, fully verified chain that OUT-WORKS the challenger: only
+    // the acc_height >= CHAIN_LENGTH filter keeps it from being the target.
+    auto full = b.run(CL + 60, uint256(), kBitsNormal);
     verify(t, full, full.size());
     auto ch = b.run(CL + 40, hx("dead7777"), kBitsNormal);   // unverified challenger
     ASSERT_GE(t.verified.get_acc_height(full.back()), CL);
-    for (const uint256& incumbent : {inc.back(), full.back()}) {
-        const auto ref = reference_hint(t, incumbent, 400);
-        const auto now = t.compute_supersede_hint(incumbent, 400);
+    ASSERT_TRUE(t.chain.get_work(ch.back()) < t.chain.get_work(full.back()));
+    {
+        const auto ref = reference_hint(t, inc.back(), 400);
+        const auto now = t.compute_supersede_hint(inc.back(), 400);
         EXPECT_TRUE(same_hint(ref, now));
         EXPECT_TRUE(now.active);
-        EXPECT_EQ(now.target_head, ch.back());
+        EXPECT_EQ(now.target_head, ch.back()) << "the full-length verified head is never the target";
+    }
+    {   // incumbent = the full chain: nothing out-works it
+        const auto ref = reference_hint(t, full.back(), 400);
+        const auto now = t.compute_supersede_hint(full.back(), 400);
+        EXPECT_TRUE(same_hint(ref, now));
+        EXPECT_FALSE(now.active);
     }
 }
 
@@ -237,18 +361,29 @@ TEST(DashSupersedeHintEquivalence, CostOnAFullTrackerWithStaleForks)
     b.run(2, inc.back(), kBitsNormal);   // one unverified extension of the tip
     const uint256 incumbent = inc.back();
 
+    // Warm the height/work memo with both once, then alternate 5 timed runs
+    // each and report the fastest, so neither side pays the other's cold cache.
     using clk = std::chrono::steady_clock;
-    const auto t0 = clk::now();
-    const auto ref = reference_hint(t, incumbent, 400);
-    const auto t1 = clk::now();
-    const auto now = t.compute_supersede_hint(incumbent, 400);
-    const auto t2 = clk::now();
+    const auto us = [](auto d) { return std::chrono::duration_cast<std::chrono::microseconds>(d).count(); };
+    auto ref = reference_hint(t, incumbent, 400);
+    auto now = t.compute_supersede_hint(incumbent, 400);
     EXPECT_TRUE(same_hint(ref, now));
     EXPECT_FALSE(now.active);
-    const auto us = [](auto d) { return std::chrono::duration_cast<std::chrono::microseconds>(d).count(); };
+    long long best_prev = -1, best_now = -1;
+    for (int i = 0; i < 5; ++i) {
+        const auto a0 = clk::now();
+        ref = reference_hint(t, incumbent, 400);
+        const auto a1 = clk::now();
+        now = t.compute_supersede_hint(incumbent, 400);
+        const auto a2 = clk::now();
+        EXPECT_TRUE(same_hint(ref, now));
+        const long long p = us(a1 - a0), n = us(a2 - a1);
+        if (best_prev < 0 || p < best_prev) best_prev = p;
+        if (best_now < 0 || n < best_now) best_now = n;
+    }
     std::cout << "[supersede-hint cost] heads=" << t.chain.get_heads().size()
-              << " chain=" << t.chain.size() << " previous=" << us(t1 - t0)
-              << "us now=" << us(t2 - t1) << "us\n";
-    RecordProperty("previous_us", std::to_string(us(t1 - t0)));
-    RecordProperty("now_us", std::to_string(us(t2 - t1)));
+              << " chain=" << t.chain.size() << " previous=" << best_prev
+              << "us now=" << best_now << "us (fastest of 5, warm)\n";
+    RecordProperty("previous_us", std::to_string(best_prev));
+    RecordProperty("now_us", std::to_string(best_now));
 }
