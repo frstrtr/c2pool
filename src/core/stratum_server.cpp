@@ -98,6 +98,7 @@ StratumServer::StratumServer(net::io_context& ioc, const std::string& address, u
     , port_(port)
     , running_(false)
     , idle_reap_timer_(ioc)
+    , refusal_log_timer_(ioc)
 {
 }
 
@@ -141,6 +142,7 @@ void StratumServer::stop()
         acceptor_.cancel(ec);
         acceptor_.close(ec);
         idle_reap_timer_.cancel();     // stop the zombie-session reaper
+        refusal_log_timer_.cancel();   // a pending refusal summary is dropped at shutdown
         running_ = false;
 
         // Snapshot + clear the live-sessions set under the mutex, then close
@@ -247,23 +249,26 @@ void StratumServer::handle_accept(boost::system::error_code ec, tcp::socket sock
         if (!reclaimed.empty())
             LOG_INFO << "[Stratum] at a connection cap: closed " << reclaimed.size()
                      << " stale session(s) before admitting a new one";
+        const std::string peer_ip = ep_ec ? std::string{} : ep.address().to_string();
         const std::string peer = ep_ec ? std::string{}
-            : " peer=" + ep.address().to_string() + ":" + std::to_string(ep.port());
+            : " peer=" + peer_ip + ":" + std::to_string(ep.port());
+        // Refusal WARN lines are rate-limited per cap (log_refusal); the
+        // counters count every refusal.
         if (cap > 0 && live >= cap) {
-            refused_connections_.fetch_add(1);
-            LOG_WARNING << "Stratum connection refused: node at miner cap "
-                        << live << "/" << cap << " (max_stratum_connections)"
-                        << peer
-                        << " refused_total=" << refused_connections_.load();
+            const uint64_t total = refused_connections_.fetch_add(1) + 1;
+            log_refusal(cap_refusal_log_, peer_ip, peer,
+                        "node at miner cap " + std::to_string(live) + "/" + std::to_string(cap)
+                            + " (max_stratum_connections)",
+                        "refused_total", total);
             boost::system::error_code ignore;
             socket.shutdown(tcp::socket::shutdown_both, ignore);
             socket.close(ignore);
         } else if (per_ip && from_ip >= ip_cap) {
-            refused_per_ip_.fetch_add(1);
-            LOG_WARNING << "Stratum connection refused: " << from_ip << "/" << ip_cap
-                        << " sessions from this address (max_stratum_connections_per_ip)"
-                        << peer
-                        << " refused_per_ip_total=" << refused_per_ip_.load();
+            const uint64_t total = refused_per_ip_.fetch_add(1) + 1;
+            log_refusal(per_ip_refusal_log_, peer_ip, peer,
+                        std::to_string(from_ip) + "/" + std::to_string(ip_cap)
+                            + " sessions from one address (max_stratum_connections_per_ip)",
+                        "refused_per_ip_total", total);
             boost::system::error_code ignore;
             socket.shutdown(tcp::socket::shutdown_both, ignore);
             socket.close(ignore);
@@ -281,6 +286,71 @@ void StratumServer::handle_accept(boost::system::error_code ec, tcp::socket sock
     if (running_) {
         accept_connections();
     }
+}
+
+void StratumServer::log_refusal(RefusalLogLimiter& lim, const std::string& peer_ip,
+                                const std::string& peer, const std::string& detail,
+                                const char* total_name, uint64_t total)
+{
+    const uint32_t interval = mining_interface_
+        ? mining_interface_->get_stratum_config().refusal_log_interval_sec : 10;
+    lim.set_window(std::chrono::seconds(interval));
+    const auto now = RefusalLogLimiter::clock::now();
+    // A due summary goes out first, so a new window starts counting after it.
+    if (auto summary = lim.flush(now)) {
+        LOG_WARNING << "Stratum connections refused: " << *summary
+                    << " " << total_name << "=" << (total - 1);
+        refusal_lines_logged_.fetch_add(1);
+    }
+    if (lim.record(now, peer_ip, detail)) {
+        LOG_WARNING << "Stratum connection refused: " << detail << peer
+                    << " " << total_name << "=" << total
+                    << (interval > 0 ? " (further refusals summarised every "
+                                           + std::to_string(interval) + " s)"
+                                     : std::string{});
+        refusal_lines_logged_.fetch_add(1);
+        return;
+    }
+    // Counted into a summary: written when its window ends, even if no
+    // further refusal arrives.
+    arm_refusal_log_timer();
+}
+
+void StratumServer::arm_refusal_log_timer()
+{
+    if (!running_)
+        return;
+    std::optional<RefusalLogLimiter::clock::time_point> next;
+    for (const auto* lim : {&cap_refusal_log_, &per_ip_refusal_log_})
+        if (auto d = lim->due(); d && (!next || *d < *next))
+            next = d;
+    // Armed already for this summary or an earlier one: keep it.
+    if (!next || (refusal_log_timer_due_ && *refusal_log_timer_due_ <= *next))
+        return;
+    // expires_at() aborts an armed wait (its handler sees operation_aborted).
+    refusal_log_timer_due_ = next;
+    refusal_log_timer_.expires_at(*next);
+    refusal_log_timer_.async_wait([this](const boost::system::error_code& ec) {
+        if (ec) return;   // re-armed earlier, or cancelled at shutdown
+        refusal_log_timer_due_.reset();
+        flush_refusal_logs();
+    });
+}
+
+void StratumServer::flush_refusal_logs()
+{
+    const auto now = RefusalLogLimiter::clock::now();
+    if (auto summary = cap_refusal_log_.flush(now)) {
+        LOG_WARNING << "Stratum connections refused: " << *summary
+                    << " refused_total=" << refused_connections_.load();
+        refusal_lines_logged_.fetch_add(1);
+    }
+    if (auto summary = per_ip_refusal_log_.flush(now)) {
+        LOG_WARNING << "Stratum connections refused: " << *summary
+                    << " refused_per_ip_total=" << refused_per_ip_.load();
+        refusal_lines_logged_.fetch_add(1);
+    }
+    arm_refusal_log_timer();   // the other cap's summary may fall due later
 }
 
 void StratumServer::register_session(std::shared_ptr<StratumSession> s)

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 #include "merged_chain_addr.hpp"
+#include "stratum_refusal_log.hpp"
 
 #include <memory>
 #include <string>
@@ -458,6 +459,20 @@ class StratumServer
     boost::asio::steady_timer idle_reap_timer_;
     void start_idle_reaper();
 
+    // Rate-limited refusal WARN lines (StratumConfig::refusal_log_interval_sec):
+    // one limiter per cap; the timer emits a pending summary when its window
+    // ends even if no further refusal arrives. io-thread state.
+    RefusalLogLimiter cap_refusal_log_;
+    RefusalLogLimiter per_ip_refusal_log_;
+    boost::asio::steady_timer refusal_log_timer_;
+    std::optional<RefusalLogLimiter::clock::time_point> refusal_log_timer_due_;   // armed for
+    std::atomic<uint64_t> refusal_lines_logged_{0};
+    void log_refusal(RefusalLogLimiter& lim, const std::string& peer_ip,
+                     const std::string& peer, const std::string& detail,
+                     const char* total_name, uint64_t total);
+    void flush_refusal_logs();
+    void arm_refusal_log_timer();
+
 public:
     StratumServer(net::io_context& ioc, const std::string& address, uint16_t port, std::shared_ptr<IWorkSource> mining_interface);
     ~StratumServer();
@@ -508,6 +523,9 @@ public:
     uint64_t get_refused_connections() const { return refused_connections_.load(); }
     /// Connections refused by the per-source-IP cap.
     uint64_t get_refused_per_ip() const { return refused_per_ip_.load(); }
+    /// Refusal WARN lines written (full + summary), both caps: rate-limited,
+    /// unlike the refusal counters.
+    uint64_t get_refusal_lines_logged() const { return refusal_lines_logged_.load(); }
     /// Sessions dropped for an over-length line (no '\n' within the cap).
     uint64_t get_oversized_line_drops() const { return oversized_line_drops_.load(); }
     void record_oversized_line_drop() { oversized_line_drops_.fetch_add(1); }

@@ -59,7 +59,8 @@
 //      miner cap such a zombie is closed at once so a new miner is admitted.
 //      The deadlines are cut to test size where they are on and left off
 //      where they are off. Plus the per-source-IP cap
-//      (max_stratum_connections_per_ip, default 0 = unlimited).
+//      (max_stratum_connections_per_ip, default 0 = unlimited), and the
+//      rate limit on the refusal WARN lines (refusal_log_interval_sec).
 //
 // WIRE SAFETY / BYTE-PARITY: everything here is admission/eviction/memory
 // only — no notify param, coinbase (coinb1‖en1‖en2‖coinb2), or share byte
@@ -1250,4 +1251,48 @@ TEST(StratumPerIpCap, OneAddressCannotTakeEverySlot)
     ASSERT_TRUE(again.connect(h.port));
     EXPECT_TRUE(again.subscribe()) << "a freed slot admits the address again";
     EXPECT_EQ(h.on_io([&] { return h.server->get_refused_per_ip(); }), 1u);
+}
+
+// Refusal WARN lines are rate-limited (StratumConfig::refusal_log_interval_sec,
+// core/stratum_refusal_log.hpp): a reconnect storm against a full node gets
+// its first refusal logged at once and the rest in one summary line when the
+// window ends, while the refusal counter still counts every one.
+TEST(StratumRefusalLog, CapStormCountsEveryRefusalButLogsTwoLines)
+{
+    ServerHarness h;
+    h.ws->cfg.max_stratum_connections = 1;
+    h.ws->cfg.refusal_log_interval_sec = 3;
+    ASSERT_TRUE(h.start());
+
+    Client miner;
+    ASSERT_TRUE(miner.connect(h.port));
+    ASSERT_TRUE(miner.subscribe());
+
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < 20; ++i) {
+        Client c;
+        ASSERT_TRUE(c.connect(h.port));
+        ASSERT_TRUE(c.wait_closed(3000ms)) << "connection " << i << " must be refused";
+    }
+    const double storm_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    EXPECT_EQ(h.on_io([&] { return h.server->get_refused_connections(); }), 20u)
+        << "every refusal is counted";
+    if (storm_s < 2.5) {   // the storm fit in one window (it takes milliseconds)
+        EXPECT_EQ(h.on_io([&] { return h.server->get_refusal_lines_logged(); }), 1u)
+            << "only the first refusal is logged at once";
+    }
+
+    // The summary of the other 19 is written when the window ends, with no
+    // further refusal to trigger it.
+    uint64_t lines = 0;
+    for (int i = 0; i < 60 && lines < 2; ++i) {
+        std::this_thread::sleep_for(100ms);
+        lines = h.on_io([&] { return h.server->get_refusal_lines_logged(); });
+    }
+    std::this_thread::sleep_for(500ms);
+    lines = h.on_io([&] { return h.server->get_refusal_lines_logged(); });
+    if (storm_s < 2.5)
+        EXPECT_EQ(lines, 2u) << "one summary line for the rest of the window";
+    EXPECT_LE(lines, 3u) << "20 refusals must not write 20 lines";
+    EXPECT_EQ(h.on_io([&] { return h.server->get_refused_connections(); }), 20u);
 }

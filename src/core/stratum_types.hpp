@@ -62,6 +62,12 @@ struct StratumConfig {
     // (StratumServer::get_refused_per_ip). 0 = unlimited (the default, so
     // every coin is unchanged; a farm behind one NAT address shares it).
     size_t max_stratum_connections_per_ip = 0;
+    // The refusal WARN lines of either cap: the first one after a quiet
+    // window is logged at once, then at most one summary line per window per
+    // cap (core/stratum_refusal_log.hpp). The refusal counters still count
+    // every refusal. 0 = a line per refusal (the old behaviour). Log-volume
+    // only.
+    uint32_t refusal_log_interval_sec = 10;
     // Runtime coin tag for coin-agnostic core log lines (e.g. the "waiting
     // for block template" warning). Set by each coin's work source / main so
     // a DASH binary never logs "[LTC]" (issue #732 secondary defect). Empty
