@@ -60,7 +60,9 @@
 //      The deadlines are cut to test size where they are on and left off
 //      where they are off. Plus the per-source-IP cap
 //      (max_stratum_connections_per_ip, default 0 = unlimited), and the
-//      rate limit on the refusal WARN lines (refusal_log_interval_sec).
+//      rate limit on the refusal WARN lines (refusal_log_interval_sec), the
+//      TCP liveness options on an accepted socket (TCP_USER_TIMEOUT), and the
+//      per-IP key (an IPv6 address counts by its /64).
 //
 // WIRE SAFETY / BYTE-PARITY: everything here is admission/eviction/memory
 // only — no notify param, coinbase (coinb1‖en1‖en2‖coinb2), or share byte
@@ -96,6 +98,12 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+#ifdef __linux__
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/socket.h>
+#endif
 
 namespace asio = boost::asio;
 using tcp = asio::ip::tcp;
@@ -1295,4 +1303,57 @@ TEST(StratumRefusalLog, CapStormCountsEveryRefusalButLogsTwoLines)
         EXPECT_EQ(lines, 2u) << "one summary line for the rest of the window";
     EXPECT_LE(lines, 3u) << "20 refusals must not write 20 lines";
     EXPECT_EQ(h.on_io([&] { return h.server->get_refused_connections(); }), 20u);
+}
+
+// TCP liveness on an accepted stratum socket (core::apply_stratum_tcp_liveness,
+// which StratumSession::start() runs). Linux sends no keepalive probe while
+// sent data is unacknowledged, and an authorized rig is fed a notify every
+// keepalive_notify_sec, so behind a dead NAT only TCP_USER_TIMEOUT ends such
+// a session in minutes rather than after tcp_retries2 (~15 min). The default
+// applies to every coin that turns keepalive on (BTC and DASH leave it as is).
+TEST(StratumTcpLiveness, KeepaliveSocketGetsProbeTimingAndUserTimeout)
+{
+    EXPECT_EQ(core::stratum::StratumConfig{}.tcp_user_timeout_sec, 120u);
+    EXPECT_EQ(ltc::default_stratum_config().tcp_user_timeout_sec, 120u);
+#ifndef __linux__
+    GTEST_SKIP() << "per-probe tuning and TCP_USER_TIMEOUT are Linux socket options";
+#else
+    asio::io_context io;
+    tcp::acceptor acc(io, tcp::endpoint(asio::ip::make_address("127.0.0.1"), 0));
+    tcp::socket client(io);
+    tcp::socket server(io);
+    client.connect(acc.local_endpoint());
+    acc.accept(server);
+    const auto get = [&](int level, int opt) {
+        int v = -1;
+        socklen_t len = sizeof v;
+        if (::getsockopt(server.native_handle(), level, opt, &v, &len) != 0) return -2;
+        return v;
+    };
+
+    core::apply_stratum_tcp_liveness(server, core::stratum::StratumConfig{});   // keepalive off (DGB, BCH)
+    EXPECT_EQ(get(SOL_SOCKET, SO_KEEPALIVE), 0) << "keepalive off: the socket is left alone";
+    EXPECT_EQ(get(IPPROTO_TCP, TCP_USER_TIMEOUT), 0);
+
+    core::apply_stratum_tcp_liveness(server, ltc::default_stratum_config());
+    EXPECT_NE(get(SOL_SOCKET, SO_KEEPALIVE), 0);
+    EXPECT_EQ(get(IPPROTO_TCP, TCP_KEEPIDLE), 60);
+    EXPECT_EQ(get(IPPROTO_TCP, TCP_KEEPINTVL), 10);
+    EXPECT_EQ(get(IPPROTO_TCP, TCP_KEEPCNT), 3);
+    EXPECT_EQ(get(IPPROTO_TCP, TCP_USER_TIMEOUT), 120000)
+        << "unacknowledged data (the keepalive notifies) must not keep a dead peer for tcp_retries2";
+#endif
+}
+
+// The per-IP cap counts an IPv6 address by its /64 (one host is handed a whole
+// /64 and could rotate through it), an IPv4-mapped address as its IPv4
+// address, and an IPv4 address as itself.
+TEST(StratumPerIpCap, Ipv6CountsByItsSlash64)
+{
+    const auto key = [](const char* a) { return core::per_ip_cap_key(asio::ip::make_address(a)); };
+    EXPECT_EQ(key("2001:db8:1:2::10"), key("2001:db8:1:2:aaaa:bbbb:cccc:dddd"));
+    EXPECT_NE(key("2001:db8:1:2::10"), key("2001:db8:1:3::10"));
+    EXPECT_EQ(key("::ffff:203.0.113.7"), key("203.0.113.7"));
+    EXPECT_NE(key("203.0.113.7"), key("203.0.113.8"));
+    EXPECT_EQ(key("203.0.113.7"), asio::ip::make_address("203.0.113.7"));
 }

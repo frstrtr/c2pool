@@ -604,7 +604,9 @@ void print_help() {
     std::cout << "  --no-vardiff              Disable automatic difficulty adjustment\n";
     std::cout << "  --max-coinbase-outputs N  Max coinbase outputs per block (default: 4000, matches p2pool)\n";
     std::cout << "  --max-stratum-connections N  Max concurrent miners on this node (default: 100, 0 = unlimited)\n";
-    std::cout << "  --max-stratum-connections-per-ip N  Max concurrent miners from one IP address (default: 0 = unlimited)\n\n";
+    std::cout << "  --max-stratum-connections-per-ip N  Max concurrent miners from one IP address, one /64 for IPv6\n";
+    std::cout << "                            (default: 0 = unlimited). Rigs behind one NAT share an address:\n";
+    std::cout << "                            set N to at least the most rigs behind any one address.\n\n";
 
     std::cout << "EMBEDDED NODE OPTIONS:\n";
     std::cout << "  --embedded-ltc            Use embedded LTC SPV node (no daemon needed)\n";

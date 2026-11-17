@@ -20,6 +20,7 @@
 #include <cstring>
 #include <boost/algorithm/string.hpp>
 #ifdef __linux__
+#include <cerrno>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -213,6 +214,7 @@ void StratumServer::handle_accept(boost::system::error_code ec, tcp::socket sock
         boost::system::error_code ep_ec;
         const auto ep = socket.remote_endpoint(ep_ec);
         const bool per_ip = ip_cap > 0 && !ep_ec;
+        const auto ip_key = per_ip ? per_ip_cap_key(ep.address()) : boost::asio::ip::address{};
         size_t live = 0;
         size_t from_ip = 0;
         std::vector<std::pair<std::shared_ptr<StratumSession>, const char*>> reclaimed;
@@ -221,7 +223,7 @@ void StratumServer::handle_accept(boost::system::error_code ec, tcp::socket sock
             auto count_from_ip = [&] {
                 size_t n = 0;
                 for (const auto& s : sessions_)
-                    if (s->is_connected() && s->peer_address() == ep.address())
+                    if (s->is_connected() && per_ip_cap_key(s->peer_address()) == ip_key)
                         ++n;
                 return n;
             };
@@ -267,7 +269,7 @@ void StratumServer::handle_accept(boost::system::error_code ec, tcp::socket sock
             const uint64_t total = refused_per_ip_.fetch_add(1) + 1;
             log_refusal(per_ip_refusal_log_, peer_ip, peer,
                         std::to_string(from_ip) + "/" + std::to_string(ip_cap)
-                            + " sessions from one address (max_stratum_connections_per_ip)",
+                            + " sessions from one address, IPv6 /64 (max_stratum_connections_per_ip)",
                         "refused_per_ip_total", total);
             boost::system::error_code ignore;
             socket.shutdown(tcp::socket::shutdown_both, ignore);
@@ -332,6 +334,7 @@ void StratumServer::arm_refusal_log_timer()
     refusal_log_timer_.expires_at(*next);
     refusal_log_timer_.async_wait([this](const boost::system::error_code& ec) {
         if (ec) return;   // re-armed earlier, or cancelled at shutdown
+        if (!running_) return;
         refusal_log_timer_due_.reset();
         flush_refusal_logs();
     });
@@ -2379,41 +2382,68 @@ void StratumSession::cancel_timers()
 
 void StratumSession::apply_socket_keepalive()
 {
-    // Enable OS TCP keepalive so the kernel actively probes an idle peer and
-    // errors the pending async_read when a NAT path has gone dead (the peer
-    // never sent FIN/RST). This is THE root fix for immortal subscribed
-    // sessions -- socket_.is_open() alone never falsifies for a half-open NAT
-    // drop. No-op unless the (DASH-set) StratumConfig knob is enabled, so
-    // LTC/BTC/DGB behaviour is unchanged.
-    const auto& cfg = mining_interface_->get_stratum_config();
+    // OS TCP liveness (keepalive + user timeout) so a peer whose NAT path went
+    // dead without FIN/RST errors the pending async_read, which runs the
+    // normal disconnect -- socket_.is_open() alone never falsifies for a
+    // half-open drop. No-op unless the coin enabled tcp_keepalive_enabled
+    // (DASH, BTC, LTC).
+    apply_stratum_tcp_liveness(socket_, mining_interface_->get_stratum_config());
+}
+
+void apply_stratum_tcp_liveness(tcp::socket& socket, const core::stratum::StratumConfig& cfg)
+{
     if (!cfg.tcp_keepalive_enabled) return;
 
     boost::system::error_code ec;
-    socket_.set_option(boost::asio::socket_base::keep_alive(true), ec);   // portable (asio)
+    socket.set_option(boost::asio::socket_base::keep_alive(true), ec);   // portable (asio)
     if (ec) {
         LOG_WARNING << "[Stratum] SO_KEEPALIVE set failed: " << ec.message();
         return;
     }
-    // Per-probe tuning (idle/interval/count) is Linux-specific -- Windows tunes
-    // keepalive via WSAIoctl(SIO_KEEPALIVE_VALS) and macOS via TCP_KEEPALIVE, so
-    // guard exactly like sample_tcp_rtt_ms() above (#ifdef __linux__). Off-Linux
-    // the portable keep_alive(true) above still arms keepalive with OS defaults;
-    // the DASH deploy target is Linux, where the 60/10/3 tuning (~90 s detect)
-    // applies. This keeps core building on the Windows/macOS CI lanes.
+    // Per-probe tuning (idle/interval/count) and TCP_USER_TIMEOUT are Linux
+    // socket options -- Windows tunes keepalive via WSAIoctl(SIO_KEEPALIVE_VALS)
+    // and macOS via TCP_KEEPALIVE -- so guard exactly like sample_tcp_rtt_ms()
+    // above (#ifdef __linux__). Off-Linux the portable keep_alive(true) above
+    // still arms keepalive with OS defaults. This keeps core building on the
+    // Windows/macOS CI lanes.
 #ifdef __linux__
-    const int fd = socket_.native_handle();
+    const int fd = socket.native_handle();
     int idle  = static_cast<int>(cfg.tcp_keepalive_idle_sec);
     int intvl = static_cast<int>(cfg.tcp_keepalive_interval_sec);
     int cnt   = static_cast<int>(cfg.tcp_keepalive_count);
     ::setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE,  &idle,  sizeof(idle));
     ::setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
     ::setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT,   &cnt,   sizeof(cnt));
+    // Keepalive probes are not sent while data is unacknowledged, and an
+    // authorized rig is fed a notify every keepalive_notify_sec: bound how long
+    // sent data may stay unacknowledged instead of waiting out tcp_retries2.
+    unsigned int user_timeout_ms = 0;
+    if (cfg.tcp_user_timeout_sec > 0) {
+        user_timeout_ms = cfg.tcp_user_timeout_sec * 1000u;
+        if (::setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT,
+                         &user_timeout_ms, sizeof(user_timeout_ms)) != 0)
+            LOG_WARNING << "[Stratum] TCP_USER_TIMEOUT set failed (errno " << errno << ")";
+    }
     LOG_TRACE << "[Stratum] TCP keepalive armed (idle=" << idle
-              << "s interval=" << intvl << "s count=" << cnt << ")";
+              << "s interval=" << intvl << "s count=" << cnt
+              << " user_timeout=" << user_timeout_ms / 1000u << "s)";
 #else
     LOG_TRACE << "[Stratum] TCP keepalive armed (OS-default probe timing; "
-                 "per-probe tuning is Linux-only)";
+                 "per-probe tuning and TCP_USER_TIMEOUT are Linux-only)";
 #endif
+}
+
+boost::asio::ip::address per_ip_cap_key(const boost::asio::ip::address& a)
+{
+    if (!a.is_v6())
+        return a;
+    const auto v6 = a.to_v6();
+    if (v6.is_v4_mapped())
+        return boost::asio::ip::make_address_v4(boost::asio::ip::v4_mapped, v6);
+    auto bytes = v6.to_bytes();
+    for (size_t i = 8; i < bytes.size(); ++i)
+        bytes[i] = 0;   // keep the /64
+    return boost::asio::ip::address_v6(bytes);
 }
 
 void StratumSession::arm_handshake_timer()

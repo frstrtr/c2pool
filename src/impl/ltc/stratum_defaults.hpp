@@ -32,7 +32,11 @@ inline core::stratum::StratumConfig default_stratum_config()
     c.tcp_keepalive_enabled      = true;   // kernel probes dead NAT paths (the root fix)
     c.tcp_keepalive_idle_sec     = 60;
     c.tcp_keepalive_interval_sec = 10;
-    c.tcp_keepalive_count        = 3;      // ~90 s to detect a dead peer
+    c.tcp_keepalive_count        = 3;
+    // tcp_user_timeout_sec keeps its StratumConfig default (120 s). A rig fed
+    // keepalive notifies has data in flight, which suppresses keepalive
+    // probes; the user timeout ends it behind a dead NAT, and it also sets
+    // when failed probes end an idle one: a dead peer goes in ~2 min either way.
     c.handshake_timeout_sec      = 30;     // drop a connection that never authorizes
     // Idle reaper: a BACKSTOP to TCP keepalive. It counts INBOUND lines only,
     // and with keepalive on it never reaps an authorized session (core::

@@ -1088,6 +1088,8 @@ legacy YAML key set.
 | `--stratum-target-time` | `target_time` | 3.0 | Seconds between pseudoshares |
 | `--no-vardiff` | `vardiff_enabled` | true | Disable auto-difficulty |
 | `--max-coinbase-outputs` | `max_coinbase_outputs` | 4000 | Max coinbase outputs |
+| `--max-stratum-connections` | `max_stratum_connections` | 100 | Max concurrent miners on this node (0 = unlimited) |
+| `--max-stratum-connections-per-ip` | `max_stratum_connections_per_ip` | 0 | Max concurrent miners from one IP address (0 = unlimited). An IPv6 address counts by its /64, since one host can be handed a whole /64. Rigs behind one NAT share an address, so set it to at least the most rigs behind any one address. |
 | `--network-id` | `network_id` | 0 | Private chain identifier (hex) |
 | `--v3601-activation-time` | `sharechain.v3601_activation_time` | compiled | Share version 3601 flag day, unix time — testnet or a private `--network-id` chain only (see [Share version 3601](#share-version-3601-flag-day)) |
 | `--log-level` | `log_level` | trace | trace/debug/info/warning/error |

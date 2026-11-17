@@ -132,6 +132,17 @@ struct StratumConfig {
     uint32_t tcp_keepalive_idle_sec     = 60;   // begin probing after 60 s idle
     uint32_t tcp_keepalive_interval_sec = 10;   // 10 s between probes
     uint32_t tcp_keepalive_count        = 3;    // drop after 3 failed probes
+    //     Linux sends no keepalive probe while sent data is unacknowledged, and
+    //     the idle keepalive-notify (e) keeps data in flight to an authorized
+    //     rig: behind a dead NAT such a session would otherwise only fail on
+    //     retransmission exhaustion (tcp_retries2, ~15 min), and the reaper
+    //     skips it meanwhile. TCP_USER_TIMEOUT aborts the connection once
+    //     sent data stays unacknowledged this long; while set, it also
+    //     decides when failed keepalive probes end an idle connection
+    //     (instead of tcp_keepalive_count). A dead peer then goes in ~2 min
+    //     whether it was idle or being fed notifies. Linux only, set with
+    //     keepalive; 0 = leave the kernel default.
+    uint32_t tcp_user_timeout_sec       = 120;
     // (b) Handshake deadline: drop a session that has not completed
     //     mining.authorize within N s (a live rig authorizes in << 1 s). 0=off.
     uint32_t handshake_timeout_sec      = 0;

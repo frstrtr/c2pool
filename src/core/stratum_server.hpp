@@ -408,6 +408,19 @@ private:
                                   std::set<uint32_t>* slash_chains = nullptr);
 };
 
+/// OS TCP liveness for one accepted stratum socket under cfg; a no-op unless
+/// cfg.tcp_keepalive_enabled. SO_KEEPALIVE everywhere; on Linux also the probe
+/// timing (TCP_KEEPIDLE/INTVL/CNT) and TCP_USER_TIMEOUT
+/// (StratumConfig::tcp_user_timeout_sec). Best-effort: an option the OS
+/// refuses is logged and skipped.
+void apply_stratum_tcp_liveness(tcp::socket& socket, const core::stratum::StratumConfig& cfg);
+
+/// What the per-IP cap (StratumConfig::max_stratum_connections_per_ip) counts
+/// by: the IPv4 address (an IPv4-mapped IPv6 address counts as its IPv4
+/// address), or the /64 of an IPv6 address -- one host is handed a whole /64
+/// and could otherwise rotate through it.
+boost::asio::ip::address per_ip_cap_key(const boost::asio::ip::address& a);
+
 /// Stratum Server — accepts TCP connections and spawns StratumSession per miner.
 class StratumServer
 {

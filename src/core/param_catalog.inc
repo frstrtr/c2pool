@@ -341,7 +341,7 @@ C2P_PARAM("stratum.max_coinbase_outputs", Stratum, INT64, LIVE, C_LTC, LIT, "0",
 C2P_PARAM("stratum.max_connections", Stratum, INT64, LIVE, C_LTC, LIT, "0", NONE, "max stratum connections")
   C2P_ALIAS("stratum.max_connections", BIN_LTC, "--max-stratum-connections", VALUE)
 
-C2P_PARAM("stratum.max_connections_per_ip", Stratum, INT64, LIVE, C_LTC, LIT, "0", NONE, "max stratum connections per source IP (0=unlimited)")
+C2P_PARAM("stratum.max_connections_per_ip", Stratum, INT64, LIVE, C_LTC, LIT, "0", NONE, "max stratum connections per source IP, one /64 for IPv6 (0=unlimited; rigs behind one NAT share an address)")
   C2P_ALIAS("stratum.max_connections_per_ip", BIN_LTC, "--max-stratum-connections-per-ip", VALUE)
 
 C2P_PARAM("web.port", WebOps, UINT16, RESTART, C_ALL, FROM_POOL_CONFIG, "", PORT_RANGE, "dashboard/web bind port (0=off)")
