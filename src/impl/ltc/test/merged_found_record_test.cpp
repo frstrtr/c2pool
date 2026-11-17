@@ -95,12 +95,10 @@ TEST(MergedMining, StaleJobFindRecordsTheCommittedBlock)
         s.push_back(0xac);
         return std::vector<std::pair<std::vector<unsigned char>, uint64_t>>{{s, value}};
     });
-    struct Found { std::string symbol; int height; std::string hash; double difficulty; };
+    struct Found { std::string symbol; int height; std::string hash; };
     std::vector<Found> found;
     mm.set_on_merged_block_found([&found](const std::string& sym, int h, const std::string& hash,
-                                          bool, uint64_t, double difficulty) {
-        found.push_back({sym, h, hash, difficulty});
-    });
+                                          bool, uint64_t) { found.push_back({sym, h, hash}); });
 
     // Job A: the DOGE block at 5,000,001; the share's LTC coinbase commits to it.
     mm.refresh_aux_work();
@@ -146,12 +144,6 @@ TEST(MergedMining, StaleJobFindIsPricedAtItsOwnTarget)
         s.push_back(0xac);
         return std::vector<std::pair<std::vector<unsigned char>, uint64_t>>{{s, value}};
     });
-    std::vector<double> priced;
-    mm.set_on_merged_block_found([&priced](const std::string&, int, const std::string&, bool,
-                                           uint64_t, double difficulty) {
-        priced.push_back(difficulty);
-    });
-
     // Job A at bits A; the share's LTC coinbase commits to it.
     const uint32_t bits_a = 0x1a01d2c3;
     b->bits = bits_a;
@@ -176,7 +168,9 @@ TEST(MergedMining, StaleJobFindIsPricedAtItsOwnTarget)
     mm.try_submit_merged_blocks(std::string(160, 'd'), parent_cb, {}, 0, parent_hash);
 
     ASSERT_EQ(b->submits, 1);
-    ASSERT_EQ(priced.size(), 1u);
-    EXPECT_DOUBLE_EQ(priced[0], diff_a) << "priced at the job the share solved";
-    EXPECT_NE(priced[0], diff_b) << "not at current_work's target";
+    // The record carries the difficulty the web layer prices the row with.
+    const auto rec = mm.get_discovered_blocks();
+    ASSERT_EQ(rec.size(), 1u);
+    EXPECT_DOUBLE_EQ(rec[0].difficulty, diff_a) << "priced at the job the share solved";
+    EXPECT_NE(rec[0].difficulty, diff_b) << "not at current_work's target";
 }

@@ -1,13 +1,30 @@
 # Committed Conan profile — macOS / apple-clang lane (cppstd=20), per the Boost
-# root-fix plan (§B). NOTE: release.yml's macOS lanes currently build against
-# Homebrew deps, NOT Conan, so this profile is not yet wired into release.yml.
-# It is committed for provenance and for a future macOS->Conan migration; arch
-# is per-runner (armv8 on Apple Silicon, x86_64 on Intel), override with -s arch=.
+# root-fix plan (§B). Used by .github/actions/provision-macos-deps for every
+# macOS build (release.yml and build.yml). All macOS builds run on an Apple
+# Silicon host, so both contexts default to armv8; the x86_64 slice is a Conan
+# cross build that retargets only the host context with -s:h arch=x86_64.
+# compiler.version is the Apple clang of the build host; every macOS package is
+# built from source there, so the value labels the binaries in the runner's
+# own cache rather than selecting prebuilt ones.
+#
+# os.version is the minimum macOS of every shipped slice (the deployment
+# target). It is pinned, not left to the build host's SDK default: if the host
+# moves to a macOS release that has no Intel version, an unpinned x86_64 slice
+# would silently stop running on every Intel Mac. The macOS jobs in
+# release.yml and build.yml set MACOSX_DEPLOYMENT_TARGET to the same value and
+# .github/actions/provision-macos-deps fails when the two differ. 26.0 is the
+# minimum the packages have had since the universal build started.
 [settings]
 os=Macos
+os.version=26.0
 arch=armv8
 build_type=Release
 compiler=apple-clang
-compiler.version=16
+compiler.version=21
 compiler.cppstd=20
 compiler.libcxx=libc++
+
+[options]
+# Boost.Locale is unused by c2pool, and on macOS it would pull libiconv, which
+# conan.lock (resolved on Linux, where iconv is part of glibc) does not pin.
+boost/*:without_locale=True

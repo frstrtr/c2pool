@@ -136,6 +136,7 @@ TEST(WebLocalOnly, LoopbackPeerBehindProxyIsNotLocal)
     EXPECT_FALSE(core::is_direct_local_request(lo, with_header("X-Real-IP", "203.0.113.7")));
     EXPECT_FALSE(core::is_direct_local_request(lo, with_header("X-Forwarded-Host", "pool.example")));
     EXPECT_FALSE(core::is_direct_local_request(lo, with_header("X-Forwarded-Proto", "https")));
+    EXPECT_FALSE(core::is_direct_local_request(lo, with_header("Via", "1.1 caddy")));
     // Even a proxy that forwards a loopback client is still a proxy.
     EXPECT_FALSE(core::is_direct_local_request(lo, with_header("X-Forwarded-For", "127.0.0.1")));
     EXPECT_FALSE(core::is_direct_local_request(lo, with_header("X-Forwarded-For", "")));
@@ -185,6 +186,46 @@ TEST(WebLocalOnly, ConfigApiRefusesProxiedRequest)
     EXPECT_EQ(get_status(port, "/api/config", {{"X-Forwarded-For", "203.0.113.7"}}), 403);
     EXPECT_EQ(get_status(port, "/api/config/schema", {{"X-Forwarded-For", "203.0.113.7"}}), 403);
     EXPECT_EQ(get_status(port, "/api/admin/pool/bans/list", {{"X-Forwarded-For", "203.0.113.7"}}), 403);
+}
+
+// GET /mempool_entry (fee-parity shadow probe): a direct local request only,
+// and nothing at all on a node that did not wire it (--mempool-entry-probe).
+TEST(WebLocalOnly, MempoolEntryProbeIsDirectLocalOnly)
+{
+    const std::string txid(64, 'a');
+    const std::string target = "/mempool_entry?txid=" + txid;
+    {
+        net::io_context ioc;
+        auto ws = make_server(ioc);
+        const uint16_t port = ws->bound_port();
+        EXPECT_EQ(get_status(port, target), 404) << "unwired: the route serves nothing";
+    }
+    net::io_context ioc;
+    auto ws = make_server(ioc);
+    std::string seen;
+    ws->get_mining_interface()->set_mempool_entry_fn([&seen](std::string hex) -> nlohmann::json {
+        seen = hex;
+        return {{"in_pool", false}, {"reason", "not-in-pool"}};
+    });
+    const uint16_t port = ws->bound_port();
+
+    EXPECT_EQ(get_status(port, target), 200);
+    EXPECT_EQ(seen, txid);
+    EXPECT_NE(get_body(port, target).find("not-in-pool"), std::string::npos);
+    EXPECT_EQ(get_status(port, "/mempool_entry?txid=xyz"), 400);
+    EXPECT_EQ(get_status(port, "/mempool_entry"), 400);
+
+    // Behind a same-host reverse proxy the peer is 127.0.0.1 too: refused.
+    seen.clear();
+    for (const auto& h : Headers{{"X-Forwarded-For", "203.0.113.7"},
+                                 {"X-Real-IP", "203.0.113.7"},
+                                 {"Forwarded", "for=203.0.113.7"},
+                                 {"Via", "1.1 caddy"}}) {
+        EXPECT_EQ(get_status(port, target, {h}), 403) << h.first;
+        EXPECT_NE(get_body(port, target, {h}).find("mempool-entry-local-only"), std::string::npos)
+            << h.first;
+    }
+    EXPECT_TRUE(seen.empty()) << "a refused request never reaches the node";
 }
 
 // ── With an auth token set: the token is required, local or not ────────────

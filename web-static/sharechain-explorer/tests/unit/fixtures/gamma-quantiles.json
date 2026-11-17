@@ -1,0 +1,15 @@
+{
+ "note": "Quantiles of Gamma(k, 1), which are chi-squared quantiles with 2k degrees of freedom, halved. Computed apart from the dashboard: for an integer shape the Gamma CDF is 1 - sum_{j<k} e^-x x^j / j!, summed in 60-digit decimal arithmetic (Python decimal) and inverted by bisection. The k = 1 row is -ln(0.975), -ln(0.025). The exact (Garwood) 95 % interval for a Poisson mean with k events is [q(.025; k), q(.975; k + 1)].",
+ "columns": ["k", "q(.025; k)", "q(.975; k)", "q(.975; k + 1)"],
+ "rows": [
+  [1, 0.025317807984, 3.688879454114, 5.571643390939],
+  [2, 0.242209278544, 5.571643390939, 7.224687667724],
+  [3, 0.618672122896, 7.224687667724, 8.767273069742],
+  [5, 1.623486390118, 10.241588675404, 11.668332079323],
+  [10, 4.795388696132, 17.084803451419, 18.390356042018],
+  [30, 20.240874021421, 41.648837438587, 42.826865394808],
+  [78, 61.655763205020, 96.236788500123, 97.347530050870],
+  [229, 200.298571648740, 259.595138544986, 260.659852996490],
+  [1000, 938.973018407695, 1062.921151224888, 1063.952136016302]
+ ]
+}

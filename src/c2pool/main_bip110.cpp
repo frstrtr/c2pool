@@ -50,6 +50,7 @@
 
 #include <core/uint256.hpp>
 #include <core/target_utils.hpp>
+#include <core/found_block_lookups.hpp>
 #include <core/address_utils.hpp>
 #include <core/netaddress.hpp>
 #include <core/stratum_server.hpp>
@@ -2430,13 +2431,30 @@ int run_embedded(bool coin_p2p_discover,
                         /*chain=*/"BIP110", /*miner=*/"",
                         /*share_hash=*/id.GetHex(),
                         mi->get_network_difficulty(), /*share_difficulty=*/0.0,
-                        mi->get_local_hashrate(), /*subsidy=*/0,
+                        // Pool hashrate 0 -> record_found_block reads the
+                        // sharechain pool estimator. This site passed
+                        // get_local_hashrate(): this node's OWN stratum rate
+                        // in a field named pool_hashrate_at_find, so a
+                        // block's luck was measured against one node's
+                        // miners, not the pool.
+                        /*pool_hashrate=*/0.0, /*subsidy=*/0,
                         core::MiningInterface::BlockAuthorship::this_node);
                     mi->schedule_block_verification(id.GetHex());
                     LOG_INFO << "[EMB-BIP110] recorded found block h=" << height
                              << " id=" << id.GetHex().substr(0, 16)
                              << " -- confirm/orphan poller armed";
                 };
+
+            // The block's OWN difficulty and time, by its identity hash, off
+            // the embedded header chain: a recorded block's network difficulty
+            // is its header's nBits (the record above passes the live
+            // template's reading, which record_found_block replaces as soon
+            // as the header is held). Display only.
+            {
+                auto lookups = core::header_chain_block_lookups(&header_chain);
+                mi->set_block_field_lookups(lookups.first, lookups.second);
+                mi->set_block_height_lookup(core::header_chain_height_lookup(&header_chain));
+            }
 
             mi->set_block_verify_fn(
                 [mi, &header_chain, &coin_node](const std::string& hash_hex) -> int {

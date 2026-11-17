@@ -1318,6 +1318,35 @@ inline FoldVerdict fold_one_v24(vendor::CSimplifiedMNList& folded, const vendor:
 
 } // namespace detail
 
+/// Collateral outpoint → proTxHash of every masternode in a fold's RESULT
+/// list, each resolved by the fold's own lookup (the overlay's
+/// collateral_owner after every body tx). Exported by fold_mn_special_txs on
+/// request; the input of apply_appended_collateral_spends.
+using CollateralOwnerIndex = std::map<MnFoldContext::Outpoint, uint256, TxPrevOutLess>;
+
+namespace detail {
+
+/// Fill `out` for the fold result `list`: an entry is indexed only when the
+/// overlay's own collateral_owner answers it for its collateral outpoint, so
+/// the index says exactly what the fold's collateral loop would resolve.
+/// `own_collateral(pro)` is the outpoint the evolving list holds for `pro`.
+template <typename Overlay, typename OwnCollateralFn>
+inline void export_collateral_owners(const Overlay& ov, const MnFoldContext& ctx,
+                                     const std::vector<vendor::CSimplifiedMNListEntry>& list,
+                                     OwnCollateralFn&& own_collateral,
+                                     CollateralOwnerIndex& out)
+{
+    out.clear();
+    for (const auto& e : list) {
+        const std::optional<MnFoldContext::Outpoint> op = own_collateral(e.proRegTxHash);
+        if (!op) continue;
+        const auto owner = ov.collateral_owner(ctx, *op);
+        if (owner && *owner == e.proRegTxHash) out.emplace(*op, e.proRegTxHash);
+    }
+}
+
+} // namespace detail
+
 /// The serving-path fold: fold every type 1-4 tx in `body_txs` (block order,
 /// the coinbase excluded) onto a COPY of `base` with the pre-block context
 /// `ctx`, then remove every MN whose collateral a non-refused body tx spends
@@ -1325,11 +1354,16 @@ inline FoldVerdict fold_one_v24(vendor::CSimplifiedMNList& folded, const vendor:
 /// list and their inputs are not counted as spends — the caller drops them,
 /// so the served body never carries them. With `ctx.v24_rules` the v24 fold
 /// above runs instead, for types 1-4 and 10-12.
+///
+/// `collateral_owners_out` (optional, default null => unchanged): the fold's
+/// collateral index for the returned list (CollateralOwnerIndex). Read only by
+/// the GBT-xcheck label aid; it never changes the fold.
 template <typename TxRange, typename TxidFn>
 inline SmlSpecialFold fold_mn_special_txs(const vendor::CSimplifiedMNList& base,
                                           const TxRange& body_txs,
                                           TxidFn&& txid_of,
-                                          const MnFoldContext& ctx)
+                                          const MnFoldContext& ctx,
+                                          CollateralOwnerIndex* collateral_owners_out = nullptr)
 {
     SmlSpecialFold out;
     out.sml = base;                         // COPY — never the follower's list
@@ -1359,6 +1393,15 @@ inline SmlSpecialFold fold_mn_special_txs(const vendor::CSimplifiedMNList& base,
                 }
             }
         }
+        if (collateral_owners_out != nullptr)
+            detail::export_collateral_owners(
+                ov, ctx, out.sml.mnList,
+                [&](const uint256& pro) -> std::optional<MnFoldContext::Outpoint> {
+                    if (auto t = ov.touched.find(pro); t != ov.touched.end())
+                        return t->second.collateralOutpoint;
+                    return ctx.collateral_of(pro);
+                },
+                *collateral_owners_out);
         out.sml.sort();                     // dashd memcmp(proRegTxHash) order
         return out;
     }
@@ -1387,7 +1430,43 @@ inline SmlSpecialFold fold_mn_special_txs(const vendor::CSimplifiedMNList& base,
             }
         }
     }
+    if (collateral_owners_out != nullptr)
+        detail::export_collateral_owners(
+            ov, ctx, out.sml.mnList,
+            [&](const uint256& pro) -> std::optional<MnFoldContext::Outpoint> {
+                for (const auto& [op, owner] : ov.added_collateral)
+                    if (owner == pro) return op;
+                return ctx.collateral_of(pro);
+            },
+            *collateral_owners_out);
     out.sml.sort();                         // dashd memcmp(proRegTxHash) order
+    return out;
+}
+
+/// The collateral loop of fold_mn_special_txs for txs APPENDED after the
+/// folded body. The special-tx loop never applies a classic tx, so appending
+/// one changes the fold only here: every MN whose collateral it spends
+/// leaves the list. `owners` is the index the fold exported for `folded`
+/// (collateral_owners_out); an MN is removed once. The caller passes classic
+/// txs only (a provider tx would also change leaves the special-tx loop owns).
+/// Returns the re-sorted list; `removed_out` (optional) counts the removals.
+template <typename TxRange>
+inline vendor::CSimplifiedMNList apply_appended_collateral_spends(
+    const vendor::CSimplifiedMNList& folded, const CollateralOwnerIndex& owners,
+    const TxRange& txs, unsigned* removed_out = nullptr)
+{
+    vendor::CSimplifiedMNList out = folded;   // COPY — never the template's list
+    std::set<uint256> removed;
+    for (const auto& tx : txs) {
+        for (const auto& in : tx.vin) {
+            const auto it = owners.find(in.prevout);
+            if (it == owners.end() || !removed.insert(it->second).second) continue;
+            for (auto e = out.mnList.begin(); e != out.mnList.end(); ++e)
+                if (e->proRegTxHash == it->second) { out.mnList.erase(e); break; }
+        }
+    }
+    if (removed_out != nullptr) *removed_out = static_cast<unsigned>(removed.size());
+    out.sort();                               // dashd memcmp(proRegTxHash) order
     return out;
 }
 

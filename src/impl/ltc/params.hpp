@@ -88,17 +88,12 @@ inline core::CoinParams make_coin_params(bool testnet)
 
     // Bootstrap
     p.bootstrap_addrs = {
-        "ml.toom.im",
+        "ltc.voidbind.com",
+        "109.123.238.32",
+        "p2p-spb.xyz",
         "usa.p2p-spb.xyz",
-        "102.160.209.121",
-        "5.188.104.245",
-        "20.127.82.115",
+        "83.221.211.116",
         "31.25.241.224",
-        "20.113.157.65",
-        "20.106.76.227",
-        "15.218.180.55",
-        "173.79.139.224",
-        "174.60.78.162",
     };
 
     // Donation scripts (consensus-critical, must match p2pool data.py)

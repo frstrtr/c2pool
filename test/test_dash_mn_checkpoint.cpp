@@ -6903,7 +6903,7 @@ TEST(DashMnCheckpointBudgets, AClampedBudgetIsAnnouncedOncePerBridgeNotOncePerPu
     using Lane = MnCheckpointLane;
     BridgeHarness h;
     h.auto_deliver = false;
-    const uint32_t kWide = 40000;      // 8+400 / 8+160 / 4+40 -- all three clamp
+    const uint32_t kWide = 80000;      // 8+800 / 8+320 / 4+80 -- all three clamp
     fill_headers(h, kAnchorHeight, kAnchorHeight + kWide + 2000);
     h.tip = kAnchorHeight + 1;
 
@@ -6936,6 +6936,35 @@ TEST(DashMnCheckpointBudgets, AClampedBudgetIsAnnouncedOncePerBridgeNotOncePerPu
     // A re-arm is a NEW bridge: the announcement is owed again.
     h.lane.arm(good_checkpoint());
     EXPECT_EQ(h.lane.budget_ceiling_warnings(), 0u);
+}
+
+// The other half of the stated bound: at the DEFAULT bridge bound no ceiling
+// is reached. A bridge that is allowed to start must get its full window-sized
+// budgets; if the default limit outgrows the ceilings, the clamp turns into an
+// everyday event and the "UNMEASURED" counts it leaves behind stop meaning
+// anything. Raising kDefaultMaxBridgeBlocks without its ceilings fails here.
+TEST(DashMnCheckpointBudgets, AtTheDefaultBridgeBoundNoCeilingIsReached)
+{
+    using Lane = MnCheckpointLane;
+    BridgeHarness h;
+    h.auto_deliver = false;
+    const uint32_t kMax = Lane::kDefaultMaxBridgeBlocks;
+    fill_headers(h, kAnchorHeight, kAnchorHeight + kMax + 10);
+    h.tip = kAnchorHeight + 1;
+
+    h.lane.arm(good_checkpoint());          // the stock bound: no set_max_bridge_blocks
+    h.lane.pump();
+    h.tip = kAnchorHeight + kMax;           // the widest window the default allows
+    h.lane.pump();
+
+    EXPECT_EQ(h.lane.budget_ceiling_warnings(), 0u)
+        << "a window-sized budget is clamped at the default bridge bound";
+    EXPECT_EQ(h.lane.revive_probe_cap(), Lane::kReviveProbeBase + kMax / Lane::kReviveProbePerBlocks);
+    EXPECT_EQ(h.lane.ondemand_cap(),     Lane::kOnDemandFoldBase + kMax / Lane::kOnDemandFoldPerBlocks);
+    EXPECT_EQ(h.lane.sml_recovery_cap(), static_cast<size_t>(4 + kMax / 1000));
+    EXPECT_LT(h.lane.revive_probe_cap(), Lane::kReviveProbeCapMax);
+    EXPECT_LT(h.lane.ondemand_cap(),     Lane::kOnDemandFoldCapMax);
+    EXPECT_LT(h.lane.sml_recovery_cap(), Lane::kSmlRecoveryCapMax);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

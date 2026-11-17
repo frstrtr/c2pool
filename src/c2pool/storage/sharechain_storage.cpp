@@ -226,6 +226,14 @@ std::vector<uint256> SharechainStorage::get_shares_by_height_range(uint64_t star
     return m_leveldb_store->get_shares_by_height_range(start_height, end_height);
 }
 
+bool SharechainStorage::scan_share_index(std::vector<core::SharechainLevelDBStore::IndexEntry>& out)
+{
+    out.clear();
+    if (!m_leveldb_store)
+        return false;
+    return m_leveldb_store->scan_share_index(out);
+}
+
 // Template method bodies (save_sharechain, load_sharechain, schedule_periodic_save)
 // live in the header so any coin's ShareChain type gets implicit instantiation.
 

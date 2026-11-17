@@ -2,18 +2,24 @@
 
 ## Option 1: Pre-built binary (recommended)
 
-Download `c2pool-VERSION-linux-x86_64.tar.gz` from the
-[Releases page](https://github.com/frstrtr/c2pool/releases).
+Each coin ships as its own package, `c2pool-<coin>-VERSION-linux-x86_64.tar.gz`,
+on the [Releases page](https://github.com/frstrtr/c2pool/releases). Take the
+newest tag from that page:
 
 ```bash
-VERSION="0.1.1-alpha"
-wget https://github.com/frstrtr/c2pool/releases/download/v${VERSION}/c2pool-${VERSION}-linux-x86_64.tar.gz
-tar xzf c2pool-${VERSION}-linux-x86_64.tar.gz
-cd c2pool-${VERSION}-linux-x86_64
-./start.sh
+COIN="ltc"            # or: dash, btc, dgb, bch, bip110
+VERSION="0.2.12.7"    # newest tag on the Releases page, without the "v"
+wget https://github.com/frstrtr/c2pool/releases/download/v${VERSION}/c2pool-${COIN}-${VERSION}-linux-x86_64.tar.gz
+tar xzf c2pool-${COIN}-${VERSION}-linux-x86_64.tar.gz
+cd c2pool-${COIN}-${VERSION}-linux-x86_64
+./start.sh            # extra node flags go after it, e.g. ./start.sh --node-owner-address <your-address>
 ```
 
-Dashboard: `http://localhost:8080` — Stratum: `stratum+tcp://YOUR_IP:9327`
+Dashboard: `http://localhost:8080`. Stratum: `stratum+tcp://YOUR_IP:<port>`, where
+`start.sh` binds 9327 (LTC), 7903 (DASH), 9332 (BTC), 5025 (DGB) or 9348 (BCH);
+`c2pool-bip110 --run` binds 9336 by default.
+The packaged `c2pool-dash` is built with BLS (`./c2pool-dash --version` ends in
+`bls=dashbls`).
 
 ---
 
@@ -38,7 +44,7 @@ The same steps work on Ubuntu 22.04 and Debian 12 with minor version differences
 > Other Ubuntu/Debian versions may work but are untested.
 
 > **Low-RAM warning**: if compilation is killed mid-way, reduce parallelism:
-> `cmake --build . --target c2pool -j1`
+> `cmake --build . --target c2pool-ltc -j1`
 
 ---
 
@@ -130,6 +136,7 @@ conan profile show
 ```bash
 git clone https://github.com/frstrtr/c2pool.git
 cd c2pool
+git checkout v0.2.12.7   # or the newest tag on the Releases page; omit to build master
 ```
 
 > No submodules — a plain `git clone` is sufficient.
@@ -144,11 +151,15 @@ cd build
 conan install .. \
     --build=missing \
     --output-folder=. \
-    --settings=build_type=Debug
+    --settings=build_type=Release
 ```
 
 This downloads and compiles all managed dependencies into `~/.conan2/` and
 generates `conan_toolchain.cmake` and `CMakePresets.json` in `build/`.
+
+> **Release vs Debug.** Build **Release** for any node you run. A Debug build
+> (`--settings=build_type=Debug`, then `cmake .. --preset conan-debug`) is
+> several times larger and slower and is for development only.
 
 **First run**: ~15–20 min (Boost 1.90 compiles from source if no pre-built binary exists).  
 **Subsequent runs**: seconds (packages are cached in `~/.conan2/`).
@@ -159,27 +170,82 @@ generates `conan_toolchain.cmake` and `CMakePresets.json` in `build/`.
 
 ```bash
 # still inside build/
-cmake .. --preset conan-debug
-cmake --build . --target c2pool -j$(nproc)
+cmake .. -DCMAKE_TOOLCHAIN_FILE=conan_toolchain.cmake -DCMAKE_BUILD_TYPE=Release
+cmake --build . --target c2pool-ltc -j$(nproc)
 ```
 
-The compiled binary is at `build/src/c2pool/c2pool`.
+The compiled binary is at `build/src/c2pool/c2pool-ltc`. Every coin has its own
+target and binary: `c2pool-ltc`, `c2pool-dash`, `c2pool-btc`, `c2pool-dgb`,
+`c2pool-bch`, `c2pool-bip110`. The target `c2pool` is a dev alias of the LTC
+node.
+
+### Dash: build with BLS
+
+`c2pool-dash` needs **dashbls** (the BLS12-381 library dashd links) to verify
+quorum commitments, ChainLocks, InstantSend locks and governance votes. Build
+it once with `scripts/build_dashbls.sh`, then configure with it:
+
+```bash
+# still inside build/
+sudo apt-get install -y autoconf automake libtool libgmp-dev
+../scripts/build_dashbls.sh "$HOME/.c2pool-deps/dashbls"
+cmake .. -DCMAKE_TOOLCHAIN_FILE=conan_toolchain.cmake -DCMAKE_BUILD_TYPE=Release \
+    -DC2POOL_DASH_BLS=ON -DDASHBLS_ROOT="$HOME/.c2pool-deps/dashbls"
+cmake --build . --target c2pool-dash -j$(nproc)
+./src/c2pool/c2pool-dash --version   # the last line must end in: bls=dashbls
+```
+
+A fresh configure that does not pass `-DC2POOL_DASH_BLS` at all finds dashbls
+by itself under `$DASHBLS_ROOT`, `$HOME/.c2pool-deps/dashbls`, `/usr/local` or
+`/opt/dashbls` (`dashbls auto-detected at <prefix>`).
+
+Without dashbls the `c2pool-dash` target **fails to build** and prints how to
+fix it; every other target builds. To build a `bls=stub` binary on purpose
+(only for a dashd-attached node, or CI), configure with
+`-DC2POOL_DASH_ALLOW_NO_BLS=ON`: the build then ends with a
+`WARNING: c2pool-dash was built WITHOUT dashbls` line, and the binary refuses a
+daemonless `c2pool-dash --run` with `[BLS-STUB] refusing to start` (exit 2).
+Only a dashd-attached node (`--coin-rpc`) runs on a stub build.
+`-DC2POOL_DASH_BLS=ON` with the library missing is a configure error, not a
+silent fallback. Running options: README
+[c2pool-dash — Dash (X11)](../README.md#c2pool-dash--dash-x11).
 
 ### Build the test suite (optional)
 
+A quick check builds three test targets and runs them directly:
+
 ```bash
+# still inside build/
 cmake --build . \
     --target test_hardening test_share_messages test_coin_broadcaster \
     -j$(nproc)
-ctest --output-on-failure -j$(nproc)
-# Expected: 94 tests, 0 failures
+./test/test_hardening && ./test/test_share_messages && ./test/test_coin_broadcaster
+# Expected at v0.2.12.7: 20 + 9 + 68 = 97 tests, each binary ends in [  PASSED  ]
 ```
+
+Do not run `ctest` after building only these three. `ctest` runs the whole
+registered suite (5,550 tests across all coins at v0.2.12.7) and reports every
+test whose target was not built as *Not Run* or `…_NOT_BUILT`. For the full
+suite, build all targets first (a long build), then run it:
+
+```bash
+cmake --build . -j$(nproc)
+ctest --output-on-failure -j$(nproc)
+```
+
+The Dash BLS tests only run in a `-DC2POOL_DASH_BLS=ON` build (see
+[Dash: build with BLS](#dash-build-with-bls)); in a stub build they compile out.
 
 ---
 
 ## 6. Running
 
-All examples assume you are in the repository root.
+All examples assume you are in the repository root. They run the LTC node;
+each other coin's command line is in the README
+([c2pool-dash](../README.md#c2pool-dash--dash-x11),
+[c2pool-btc](../README.md#c2pool-btc--bitcoin-sha256d),
+[c2pool-dgb](../README.md#c2pool-dgb--digibyte-scrypt),
+[c2pool-bch](../README.md#c2pool-bch--bitcoin-cash-sha256d)).
 
 ### Integrated mode — embedded SPV (no daemon required)
 
@@ -187,7 +253,7 @@ The default mode uses embedded LTC and DOGE SPV nodes. No litecoind or
 dogecoind installation needed.
 
 ```bash
-./build/src/c2pool/c2pool --integrated --net litecoin --embedded-ltc --embedded-doge --dashboard-dir web-static
+./build/src/c2pool/c2pool-ltc --integrated --net litecoin --embedded-ltc --embedded-doge --dashboard-dir web-static
 ```
 
 - Dashboard: `http://localhost:8080`
@@ -199,7 +265,7 @@ dogecoind installation needed.
 If you run a local litecoind, add it as a priority peer for faster sync:
 
 ```bash
-./build/src/c2pool/c2pool --integrated --net litecoin \
+./build/src/c2pool/c2pool-ltc --integrated --net litecoin \
     --embedded-ltc --embedded-doge \
     --dashboard-dir web-static \
     --coind-p2p-port 9333
@@ -208,7 +274,7 @@ If you run a local litecoind, add it as a priority peer for faster sync:
 ### With YAML config file
 
 ```bash
-./build/src/c2pool/c2pool --config config/c2pool_mainnet.yaml --dashboard-dir web-static
+./build/src/c2pool/c2pool-ltc --config config/c2pool_mainnet.yaml --dashboard-dir web-static
 ```
 
 See `config/c2pool_mainnet.yaml` for all available options with documentation.
@@ -216,7 +282,7 @@ See `config/c2pool_mainnet.yaml` for all available options with documentation.
 ### Full option reference
 
 ```bash
-./build/src/c2pool/c2pool --help
+./build/src/c2pool/c2pool-ltc --help
 ```
 
 **Default ports**
@@ -258,7 +324,7 @@ See `config/c2pool_mainnet.yaml` for all available options with documentation.
 ### Compilation killed (out of memory)
 
 ```bash
-cmake --build . --target c2pool -j1
+cmake --build . --target c2pool-ltc -j1
 ```
 
 ### `libleveldb.so` not found at runtime

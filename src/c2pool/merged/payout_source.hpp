@@ -49,6 +49,29 @@
 namespace c2pool {
 namespace merged {
 
+/// Where (part of) one merged payout output comes from: the parent-chain
+/// payout script of the shares it is paid for, and whether those shares named
+/// the merged address (explicit: Tier 1, or Tier 1.5 for V36 shares) or it is
+/// the parent key's own script on the merged chain (derived: auto-convert).
+/// `fraction` is this parent's part of the output's PPLNS weight; the parts of
+/// one output sum to 1. Display only (the web payouts view): the amounts never
+/// read it. The donation output's own part (donation weight + rounding) has
+/// no origin.
+struct PayoutOrigin {
+    std::vector<unsigned char> script;          // the merged payout script
+    std::vector<unsigned char> parent_script;   // the parent (e.g. LTC) payout script
+    bool explicit_address{false};
+    double fraction{0};
+};
+using PayoutOrigins = std::vector<PayoutOrigin>;
+
+/// The merged payouts of one coinbase value with their origins (empty when
+/// the provider does not know them).
+struct MergedPayoutDetail {
+    std::vector<std::pair<std::vector<unsigned char>, uint64_t>> payouts;
+    PayoutOrigins origins;
+};
+
 class MergedPayoutSource {
 public:
     using Payouts = std::vector<std::pair<std::vector<unsigned char>, uint64_t>>;
@@ -60,6 +83,9 @@ public:
         uint32_t chain_id{0};
         int32_t chain_len{0};
         Derive derive;   // empty: no weights for this best share (no payouts)
+        // The origins of the payouts derive() gives, from the same weights
+        // (computed when asked; empty: not known).
+        std::function<PayoutOrigins()> origins;
     };
 
     struct Stats {
@@ -93,29 +119,23 @@ public:
     Payouts get(const uint256& best, uint32_t chain_id, uint64_t value, bool may_wait,
                 TryCompute&& try_compute, std::string& miss)
     {
-        miss.clear();
-        const auto deadline = std::chrono::steady_clock::now() + (may_wait ? m_max_wait : std::chrono::milliseconds(0));
-        for (;;) {
-            if (auto w = find(best, chain_id)) {
-                bump(&Stats::from_weights);
-                return derive(*w, value, miss);
-            }
-            if (auto computed = try_compute()) {
-                bump(&Stats::computed);
-                Weights w = std::move(*computed);
-                if (w.derive) {
-                    std::lock_guard<std::mutex> lock(m_mutex);
-                    store_locked(w, /*authoritative=*/false);
-                }
-                return derive(w, value, miss);
-            }
-            if (std::chrono::steady_clock::now() >= deadline)
-                break;
-            std::this_thread::sleep_for(m_step);
-        }
-        bump(&Stats::busy);
-        miss = "tracker_busy";
-        return {};
+        auto w = weights_for(best, chain_id, may_wait, std::forward<TryCompute>(try_compute), miss);
+        return w ? derive(*w, value, miss) : Payouts{};
+    }
+
+    /// get(), with the payouts' origins from the same weights.
+    template <typename TryCompute>
+    MergedPayoutDetail get_detail(const uint256& best, uint32_t chain_id, uint64_t value, bool may_wait,
+                                  TryCompute&& try_compute, std::string& miss)
+    {
+        MergedPayoutDetail d;
+        auto w = weights_for(best, chain_id, may_wait, std::forward<TryCompute>(try_compute), miss);
+        if (!w)
+            return d;
+        d.payouts = derive(*w, value, miss);
+        if (!d.payouts.empty() && w->origins)
+            d.origins = w->origins();
+        return d;
     }
 
     Stats stats() const
@@ -125,6 +145,36 @@ public:
     }
 
 private:
+    /// The weights for `best` (see get()); nullopt with miss = "tracker_busy"
+    /// when there are none and the lock stayed busy.
+    template <typename TryCompute>
+    std::optional<Weights> weights_for(const uint256& best, uint32_t chain_id, bool may_wait,
+                                       TryCompute&& try_compute, std::string& miss)
+    {
+        miss.clear();
+        const auto deadline = std::chrono::steady_clock::now() + (may_wait ? m_max_wait : std::chrono::milliseconds(0));
+        for (;;) {
+            if (auto w = find(best, chain_id)) {
+                bump(&Stats::from_weights);
+                return w;
+            }
+            if (auto computed = try_compute()) {
+                bump(&Stats::computed);
+                if (computed->derive) {
+                    std::lock_guard<std::mutex> lock(m_mutex);
+                    store_locked(*computed, /*authoritative=*/false);
+                }
+                return computed;
+            }
+            if (std::chrono::steady_clock::now() >= deadline)
+                break;
+            std::this_thread::sleep_for(m_step);
+        }
+        bump(&Stats::busy);
+        miss = "tracker_busy";
+        return std::nullopt;
+    }
+
     static Payouts derive(const Weights& w, uint64_t value, std::string& miss)
     {
         Payouts p = w.derive ? w.derive(value) : Payouts{};

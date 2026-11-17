@@ -12,6 +12,7 @@
 #
 # It also runs the negative gates in the same instrument:
 #   * unknown-flag rejection (exit 1) on every binary,
+#   * --version (exit 0, `c2pool-<coin> <version>[ key=value...]`) on every binary,
 #   * the money-gate end-to-end (an unacked money key in a settings file =>
 #     exit 78, no dump markers), on dash + btc + dgb.
 #
@@ -119,6 +120,22 @@ for coin in dash ltc btc dgb bch; do
   "$bin" --this-is-not-a-real-flag >/dev/null 2>&1; rc=$?
   if [ "$rc" -eq 1 ]; then echo "ok   $coin rejects unknown flag (exit 1)"; \
   else echo "FAIL $coin unknown-flag exit=$rc (want 1)"; fails=$((fails+1)); fi
+done
+
+echo "== --version (expect exit 0, 'c2pool-<coin> <version>[ key=value...]') =="
+# The version line is the last stdout line; dash prints its [init] lines before
+# it, the other binaries print that line only.
+for coin in dash ltc btc dgb bch; do
+  bin="$BINDIR/c2pool-$coin"; [ -x "$bin" ] || continue
+  out="$("$bin" --version 2>/dev/null)"; rc=$?
+  last="$(printf '%s\n' "$out" | tail -n 1)"
+  nlines="$(printf '%s\n' "$out" | wc -l | tr -d ' ')"
+  if [ "$rc" -eq 0 ] && printf '%s\n' "$last" | grep -qE "^c2pool-$coin [^ ]+( [a-z]+=[^ ]+)*\$" \
+     && { [ "$coin" = dash ] || [ "$nlines" -eq 1 ]; }; then
+    echo "ok   $coin --version: $last"
+  else
+    echo "FAIL $coin --version exit=$rc lines=$nlines last='$last'"; fails=$((fails+1))
+  fi
 done
 
 echo "== money-gate end-to-end (unacked money key => exit 78, no dump) =="

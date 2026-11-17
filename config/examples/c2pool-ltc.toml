@@ -1,0 +1,177 @@
+# c2pool-ltc -- example settings file (TOML), checked against release 0.2.12.1
+#
+# WHAT THIS IS
+#   Launch settings for the c2pool-ltc node (Litecoin parent chain, with
+#   merged-mined Dogecoin). The upper part sets the keys this binary applies
+#   from a file. The REFERENCE block at the end lists the keys the file loader
+#   accepts but this release does not apply (use their CLI flags instead).
+#
+# WHERE TO PUT IT
+#   Either name it on the command line:
+#     c2pool-ltc --settings /etc/c2pool/c2pool-ltc.toml
+#   or copy it to <data-dir>/c2pool.toml (data dir default: ~/.c2pool, or the
+#   one given with --data-dir); that file is loaded when --settings is absent.
+#   An explicit --settings path that does not exist is fatal (exit 78).
+#   Do not also pass the legacy --config YAML: when both are present the YAML
+#   wins and this file is skipped with a warning. start.sh adds --config when
+#   config/c2pool_mainnet.yaml exists, so run the binary directly.
+#
+# PRECEDENCE
+#   compiled defaults  <  this file  <  command-line flags
+#   A flag on the command line always wins over the same key in this file.
+#
+# CHECK IT BEFORE YOU RUN
+#   c2pool-ltc --settings c2pool-ltc.toml --dump-resolved-config
+#   prints "key=value source=compiled|file|cli" for each resolved key and
+#   exits 0 without starting the node. Keys at their plain compiled default
+#   are not printed. "source=file" proves the file was read, not that the key
+#   is used: keys from the REFERENCE block also print as source=file.
+#
+# MONEY GATE
+#   Keys marked [money] (fees, donation, payout addresses, network identity)
+#   are never accepted from a file without your explicit acknowledgement:
+#     1. uncomment the key(s) and enter your own value(s);
+#     2. run  c2pool-ltc --settings c2pool-ltc.toml --ack-money-settings
+#        it exits 0; the last line of its output is the hash (64 hex chars);
+#     3. put that hash in [gate] money_ack_hash at the end of this file;
+#     4. run --dump-resolved-config again: exit 0, money keys show source=file.
+#   Without a matching hash the node refuses to start, names the money keys
+#   and exits 78. Changing, adding or removing any money key changes the hash:
+#   repeat steps 2 and 3. The same values given as CLI flags need no hash.
+#
+# FORMAT
+#   Keys live in [ltc.<section>] tables. A misspelled key in an [ltc.*] table
+#   is fatal (exit 78). Tables for other coins ([dash.*], [btc.*], ...) are
+#   ignored by this binary, but use one file per binary all the same:
+#   [gate] holds a single money_ack_hash.
+#
+# POSTURE
+#   Daemonless by default: the embedded Litecoin and Dogecoin SPV nodes are on
+#   (compiled default), so no litecoind or dogecoind is needed and nothing has
+#   to be set for it here. Integrated pool mode is the default mode.
+#
+# PORTS (one host running ltc, dash, btc, dgb and bch from these examples)
+#   ltc: sharechain 9326, Stratum 9327, web 8080
+#   dash 8999/7903/8082, btc 9333/9334/8083, dgb 5024/9434/8084,
+#   bch 9349/9534/8085 (sharechain/Stratum/web)
+
+[ltc.web]
+port = 8080                 # dashboard + JSON API TCP port; default 8080
+host = "0.0.0.0"            # dashboard bind address; default 0.0.0.0 (all interfaces); "127.0.0.1" = this host only
+
+[ltc.stratum]
+bind = "0.0.0.0:9327"       # Stratum (miner) listener; default port 9327. c2pool-ltc uses only the PORT part of this value
+
+[ltc.money]
+# Not read from this file in 0.2.12.1: merged-chain (DOGE) payout addresses.
+# Pass them on the command line: --node-owner-merged-address <DOGE-address>
+# and --merged-payout-address SYMBOL:ADDRESS (see the REFERENCE block).
+# give_author_pct = 0.1                        # [money] author donation, percent 0-100; default 0.1
+# node_owner_fee_pct = 1.0                     # [money] node-owner fee, percent 0-100; default 0 (off)
+# node_owner_address = "<your-LTC-address>"    # [money] where the node-owner fee is paid; default none
+# payout_address = "<your-LTC-address>"        # [money] node operator payout address (CLI --address); default none
+
+[ltc.sharechain]
+# v3601_activation_time = 1800000000           # [money] share version 3601 flag day, unix seconds; default: compiled flag day. Testnet or a private --network-id chain ONLY: on mainnet the node exits 1 if this is set
+
+[gate]
+# money_ack_hash = "<64-hex output of: c2pool-ltc --settings THIS_FILE --ack-money-settings>"   # needed only when a [money] key is uncommented
+
+# ---------------------------------------------------------------------------
+# REFERENCE: keys the loader ACCEPTS but c2pool-ltc 0.2.12.1 does NOT apply
+# ---------------------------------------------------------------------------
+# The loader knows these keys (so they are not refused as typos) and
+# --dump-resolved-config shows them as source=file when set, but this release
+# copies only the keys above into the running node. Setting one of these here
+# has no effect: use the CLI flag shown. A [money] key still trips the money
+# gate. Defaults are not repeated here; see "Per-binary launch reference" in
+# README.md. Form:  key [money] -- meaning (CLI flag)
+# [ltc.meta]
+#   data_dir -- data directory; cannot work from a file, the file itself is found through the data dir (CLI: --data-dir)
+#   blockchain -- select chain (ltc/doge/...) (CLI: --net / --blockchain)
+#   mode_integrated -- integrated mode (default on) (CLI: --integrated)
+#   mode_solo -- solo mode (CLI: --solo)
+#   mode_custodial -- custodial mode (CLI: --custodial)
+#   mode_sharechain -- sharechain mode (CLI: --sharechain)
+#   mode_standalone -- standalone mode (CLI: --standalone)
+#   mode_genesis -- genesis mode (CLI: --genesis)
+#   wait_for_peers -- wait for peers on startup (CLI: --wait-for-peers)
+#   startup_mode -- startup mode auto/genesis/wait (CLI: --startup-mode)
+#   startup_timeout -- startup timeout seconds (CLI: --startup-timeout)
+#   config_yaml -- DEPRECATED legacy YAML config overlay (CLI: --config)
+# [ltc.network]
+#   testnet [money] -- testnet network identity (CLI: --testnet)
+#   doge_testnet4alpha [money] -- doge testnet4alpha identity (CLI: --doge-testnet4alpha)
+# [ltc.sharechain]
+#   listen -- sharechain P2P bind [HOST:]PORT (CLI: --p2pool-port / --p2p-port / --port)
+#   seeds -- seed nodes (repeatable) (CLI: -n)
+#   max_conns -- max connections (CLI: --max-conns)
+#   outgoing_conns -- outgoing connections (CLI: --outgoing-conns)
+#   disable_upnp -- disable UPnP (CLI: --disable-upnp)
+#   p2p_max_peers -- p2p max peers (CLI: --p2p-max-peers)
+#   ban_duration -- ban duration seconds (CLI: --ban-duration)
+#   network_id [money] -- private sharechain identifier (forks chain) (CLI: --network-id / --chain-id)
+#   prefix [money] -- private sharechain prefix (CLI: --prefix)
+# [ltc.coin_p2p]
+#   doge_address -- doge coin-P2P address (CLI: --doge-p2p-address)
+#   doge_port -- doge coin-P2P port (CLI: --doge-p2p-port)
+#   address -- coind P2P address (CLI: --coind-p2p-address)
+#   ltc_connect -- dial only this LTC peer IP[:PORT] (repeatable; Core -connect; no names) (CLI: --ltc-connect)
+#   doge_connect -- dial only this DOGE peer IP[:PORT] (repeatable; Core -connect; no names) (CLI: --doge-connect)
+#   port -- coind P2P port (-1 auto,0 off) (CLI: --coind-p2p-port / --bitcoind-p2p-port)
+# [ltc.daemon_rpc]
+#   host -- coind RPC host (CLI: --coind-address / --rpchost / --bitcoind-address)
+#   port -- coind RPC port (0=auto) (CLI: --coind-rpc-port / --rpcport / --bitcoind-rpc-port)
+#   user -- coind RPC user (CLI: --rpcuser)
+#   password -- coind RPC password (never persisted to file) (CLI: --rpcpassword)
+# [ltc.stratum]
+#   min_diff -- stratum min difficulty (CLI: --stratum-min-diff)
+#   max_diff -- stratum max difficulty (CLI: --stratum-max-diff)
+#   target_time -- stratum vardiff target seconds (CLI: --stratum-target-time)
+#   vardiff -- vardiff (default on; --no-vardiff disables) (CLI: --no-vardiff)
+#   max_coinbase_outputs -- max coinbase outputs (CLI: --max-coinbase-outputs)
+#   max_connections -- max stratum connections (CLI: --max-stratum-connections)
+# [ltc.web]
+#   external_ip -- miner-facing host for stratum URL (CLI: --external-ip)
+#   dashboard_dir -- dashboard static asset dir (CLI: --dashboard-dir)
+#   cors_origin -- CORS origin (CLI: --cors-origin)
+#   analytics_id -- analytics id (CLI: --analytics-id)
+# [ltc.global]
+#   rss_limit_mb -- RSS limit MB (abort over) (CLI: --rss-limit-mb)
+#   storage_save_interval -- storage save interval seconds (CLI: --storage-save-interval)
+#   payout_window [money] -- PPLNS payout window seconds (CLI: --payout-window)
+#   log_level -- log verbosity (CLI: --log-level / --debug / --loglevel-trace / --loglevel-debug / --loglevel-info / --loglevel-warning / --loglevel-error / --loglevel-critical)
+#   log_file -- log file path (CLI: --log-file)
+#   log_rotation_mb -- log rotation MB (CLI: --log-rotation-mb)
+#   log_max_mb -- log max MB (CLI: --log-max-mb)
+#   message_blob_hex -- authority message blob hex (CLI: --message-blob-hex)
+# [ltc.money]
+#   node_owner_script [money] -- node-owner output script (CLI: --node-owner-script)
+#   merged_operator_address [money] -- merged (doge) fee address (CLI: --node-owner-merged-address / --merged-operator-address)
+#   auto_detect_wallet [money] -- auto-detect wallet (default on) (CLI: --auto-detect-wallet / --no-auto-detect-wallet)
+#   redistribute [money] -- unnamed-share redistribution (CLI: --redistribute)
+#   coinbase_text [money] -- coinbase attribution text (CLI: --coinbase-text)
+# [ltc.merged]
+#   spec -- merged-mining spec SYMBOL:CHAIN:HOST:PORT:USER:PASS (CLI: --merged)
+#   payout_addresses [money] -- per-chain SYMBOL:ADDRESS for createauxblock (repeatable) (CLI: --merged-payout-address)
+#   coind_address -- merged coind address (CLI: --merged-coind-address)
+#   coind_rpc_port -- merged coind RPC port (CLI: --merged-coind-rpc-port)
+#   coind_rpc_user -- merged coind RPC user (CLI: --merged-coind-rpc-user)
+#   coind_rpc_password -- merged coind RPC password (CLI: --merged-coind-rpc-password)
+#   coind_p2p_port -- merged coind P2P port (CLI: --merged-coind-p2p-port)
+#   coind_p2p_address -- merged coind P2P address (CLI: --merged-coind-p2p-address)
+# [ltc.embedded]
+#   ltc_enabled -- embedded LTC SPV (default on) (CLI: --embedded-ltc / --no-embedded-ltc)
+#   doge_enabled -- embedded DOGE SPV (default on) (CLI: --embedded-doge / --no-embedded-doge)
+#   header_checkpoint -- LTC header checkpoint H:HASH (CLI: --header-checkpoint)
+#   doge_header_checkpoint -- DOGE header checkpoint H:HASH (CLI: --doge-header-checkpoint)
+#   doge_utxo_full -- embedded DOGE full UTXO set built from genesis (default on) (CLI: --doge-utxo-full / --no-doge-utxo-full)
+#   doge_utxo_full_dir -- the full DOGE UTXO set's LevelDB (default <data-dir>/dogecoin/utxo_full_leveldb) (CLI: --doge-utxo-full-dir)
+#   ltc_utxo_full -- embedded LTC full UTXO set built from genesis (default off) (CLI: --ltc-utxo-full / --no-ltc-utxo-full)
+#   ltc_utxo_full_dir -- the full LTC UTXO set's LevelDB (default <data-dir>/litecoin/utxo_full_leveldb) (CLI: --ltc-utxo-full-dir)
+#   ltc_cmpct_v3 -- ask LTC MWEB peers for v3 compact blocks (default on) (CLI: --ltc-cmpct-v3 / --no-ltc-cmpct-v3)
+#   ltc_cmpct_hb_peers -- LTC peers asked for high-bandwidth compact block pushes (0 = all) (CLI: --ltc-cmpct-hb-peers)
+#   ltc_mweb_fetch_retry -- fetch the LTC tip's full block once until its MWEB state is in (default on) (CLI: --ltc-mweb-fetch-retry / --no-ltc-mweb-fetch-retry)
+#   ltc_mweb_cmpct_provisional -- reserved: MWEB state from an unverified compact block (not implemented) (CLI: --ltc-mweb-cmpct-provisional)
+#   template_tx_check -- LTC template transaction check: strict (refuse / HOLD) or warn (log and count only) (CLI: --template-tx-check)
+#   ltc_mweb_ext -- LTC MWEB extension source: none (empty body, daemonless) or litecoind (the local litecoind's, checked against c2pool's MWEB state; needs the LTC RPC settings) (CLI: --ltc-mweb-ext)

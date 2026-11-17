@@ -594,13 +594,14 @@ public:
         , periodicity_(NetPeriodicity::for_net(cfg_.testnet))
     {
         load_graduation_state();
-        // A fallback/dev/no-git commit string (empty, "dev", or the CMake
-        // "0.1.0-alpha" default) can be shared across DIFFERENT binaries, so it
+        // A fallback/dev/no-git commit string (empty, "dev", the CMake
+        // "unknown" default, or the older "0.1.0-alpha" one) can be shared across DIFFERENT binaries, so it
         // must NEVER inherit a prior streak (review nit c). `--dirty` in the git
         // describe (CMakeLists) covers tag-exact dirty rebuilds; this covers the
         // no-git fallbacks.
         const bool fallback_commit = cfg_.c2pool_commit.empty()
-            || cfg_.c2pool_commit == "dev" || cfg_.c2pool_commit == "0.1.0-alpha";
+            || cfg_.c2pool_commit == "dev" || cfg_.c2pool_commit == "unknown"
+            || cfg_.c2pool_commit == "0.1.0-alpha";
         // Streak-invalidation on identity change (§6 cond. 4).
         if (fallback_commit
             || ledger_.key_comparator != kOracleComparatorVersion
