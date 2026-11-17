@@ -19,6 +19,7 @@ import { createSelectionBus, type SelectionBus } from '../selection.js';
 import { rgba } from '../colour.js';
 import { FLAG_DIM, FLAG_MATCH } from '../renderer.js';
 import type { Label, PlacedTile, SceneItem, Tile, TileStyle } from '../types.js';
+import { isOffChainCell, withOffChainCells, type BlockRow } from './offchain.js';
 
 /** The share fields the grid reads (a /sharechain/window share). */
 export interface GridShare {
@@ -63,8 +64,10 @@ export interface SharechainGridOptions {
 }
 
 export interface SharechainGrid {
-  /** The window, newest share first. Held while a tween runs. */
-  update(shares: readonly GridShare[], opts?: { immediate?: boolean }): void;
+  /** The window, newest share first. Held while a tween runs.
+   *  `offChain`: ledger rows of block shares not on the best sharechain
+   *  (offChainBlocks), shown as ▣ cells placed by timestamp. */
+  update(shares: readonly GridShare[], opts?: { immediate?: boolean; offChain?: readonly BlockRow[] }): void;
   /** Re-run colours (e.g. after the host's colour inputs changed). */
   restyle(): void;
   readonly scene: Scene<GridShare>;
@@ -75,6 +78,9 @@ export interface SharechainGrid {
 const SOURCE = 'grid';
 const BG = rgba(13, 13, 26);
 const FALLBACK = rgba(85, 85, 119);
+/** ▣ off-chain block-share cells: muted violet fill, gold ▣ pip. */
+export const OFF_CHAIN_FILL = '#4a3a6e';
+export const OFF_CHAIN_MARK = '#ffd700';
 
 /** Ring and core of a block cell, as in the Classic grid's BLOCK_MARK. */
 export const BLOCK_MARK: Record<BlockKind, { ring: string; core: string }> = {
@@ -150,6 +156,10 @@ export function mountSharechainGrid(opts: SharechainGridOptions): SharechainGrid
   });
 
   let shares: readonly GridShare[] = [];
+  /** What the scene lays out: the window plus ▣ cells, duplicates dropped.
+   *  The hour axis reads this list so its rows match the cells. */
+  let laid: readonly GridShare[] = [];
+  let offChainSig = '';
   let axis: Label[] = [];
   let tipKey: string | null = null;
   let viewport = { x: 0, y: 0, w: 0, h: 0 };
@@ -163,8 +173,14 @@ export function mountSharechainGrid(opts: SharechainGridOptions): SharechainGrid
   const style = (tile: Tile<GridShare>): TileStyle => {
     const s = shareOf(tile);
     if (s === undefined) return { color: FALLBACK, flags: 0 };
-    let color = parseCssColor(opts.colorOf(s)) ?? FALLBACK;
     let flags = 0;
+    if (isOffChainCell(s)) {
+      const sel0 = bus.get();
+      const focus0 = sel0.pinned ?? (sel0.source !== SOURCE ? sel0.hover : null);
+      if (focus0 !== null && subjectOf(s) !== focus0) flags |= FLAG_DIM;
+      return { color: parseCssColor(tile.w >= 8 ? OFF_CHAIN_FILL : OFF_CHAIN_MARK) ?? FALLBACK, flags };
+    }
+    let color = parseCssColor(opts.colorOf(s)) ?? FALLBACK;
     const kind = opts.blockKindOf?.(s);
     if (kind) {
       const big = tile.w >= 8;
@@ -182,6 +198,13 @@ export function mountSharechainGrid(opts: SharechainGridOptions): SharechainGrid
     for (const t of tiles) {
       const s = shareOf(t);
       if (s === undefined || t.w < 8) continue;
+      if (isOffChainCell(s)) {
+        out.push({
+          text: '▣', x: t.x + t.w / 2, y: t.y + t.h / 2, color: OFF_CHAIN_MARK,
+          font: `${Math.max(7, Math.round(t.w * 0.6))}px sans-serif`,
+        });
+        continue;
+      }
       const kind = opts.blockKindOf?.(s);
       if (kind) {
         out.push({
@@ -210,8 +233,8 @@ export function mountSharechainGrid(opts: SharechainGridOptions): SharechainGrid
   });
 
   const rebuildAxis = (): void => {
-    const g = layout.metrics(shares.length, viewport);
-    axis = hourAxisLabels(shares, g, nowS(), viewport.y);
+    const g = layout.metrics(laid.length, viewport);
+    axis = hourAxisLabels(laid, g, nowS(), viewport.y);
   };
 
   const toItems = (list: readonly GridShare[]): SceneItem<GridShare>[] => {
@@ -274,13 +297,18 @@ export function mountSharechainGrid(opts: SharechainGridOptions): SharechainGrid
 
   return {
     update(next, o) {
-      // Same array as last time: nothing moved, only styles may differ
-      // (hosts replace the window array on every data change).
-      if (next === shares && next.length > 0) { scene.restyle(); return; }
+      const rows = o?.offChain ?? [];
+      const sig = rows.map((b) => b.share || b.hash || '').join(',');
+      // Same window array and same off-chain rows: nothing moved, only
+      // styles may differ (hosts replace the window array on every change).
+      if (next === shares && sig === offChainSig && next.length > 0) { scene.restyle(); return; }
+      offChainSig = sig;
+      const items = toItems(withOffChainCells(next, rows));
       shares = next;
+      laid = items.map((it) => it.data!);
       tipKey = next.length > 0 ? keyOfShare(next[0]!, 0) : null;
       rebuildAxis();
-      scene.setItems(toItems(next), o?.immediate === true ? { immediate: true } : undefined);
+      scene.setItems(items, o?.immediate === true ? { immediate: true } : undefined);
     },
     restyle: () => scene.restyle(),
     scene,
