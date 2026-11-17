@@ -222,11 +222,39 @@ jobs:
         # the real CamelCase gtest suites (gtest_add_tests AUTO): DashBlockReplay
         # in test_dash_block_replay + DashReplay*/DashMnCheckpoint*/DashMnPayee*/
         # DashMnAnchor*/DashMnBridge* in test_dash_mn_state, plus ReplayUtxo* fold.
+        #
+        # NARROW BUILD: build only the test executables the selector needs, not the
+        # whole tree (a full-tree rebuild on a shared runner read as a hang on #2261).
+        # The target list is read from ctest's configure-time registry
+        # (CTestTestfile.cmake add_test lines), so it follows the selector and cannot
+        # drift from it. Discover-mode (gtest_discover_tests) test_dash_* targets only
+        # show up as <target>_NOT_BUILT placeholders before build, so they are built
+        # too; otherwise their tests would silently drop out. An empty list fails loud.
+        # timeout-minutes turns a stuck build/test into a named failure, not a hang.
+        timeout-minutes: 30
+        shell: bash
         run: |
-          cmake --build build_${{ matrix.coin }} -j"${BUILD_J:-4}"
-          ctest --test-dir build_${{ matrix.coin }} \
+          set -euo pipefail
+          B=build_${{ matrix.coin }}
+          SEL='^(DashBlockReplay|DashReplay|DashMnCheckpoint|DashMnPayee|DashMnAnchor|DashMnBridge|ReplayUtxo)'
+          mapfile -t TGTS < <(
+            {
+              grep -rhoE 'add_test\(\[=\[[^]]+\]=\] "[^"]+"' --include=CTestTestfile.cmake "$B" \
+                | sed -E 's/^add_test\(\[=\[([^]]+)\]=\] "([^"]+)"$/\1 \2/' \
+                | awk -v sel="$SEL" '$1 ~ sel { n = split($2, p, "/"); print p[n] }'
+              ctest --test-dir "$B" -N \
+                | sed -nE 's/.*Test +#[0-9]+: (test_dash_[A-Za-z0-9_]+)_NOT_BUILT$/\1/p'
+            } | sort -u
+          )
+          if [ "${#TGTS[@]}" -eq 0 ]; then
+            echo "::error::selector resolved to zero test executables; refusing to fake-green"
+            exit 1
+          fi
+          echo "Building ${#TGTS[@]} test targets: ${TGTS[*]}"
+          cmake --build "$B" -j"${BUILD_J:-4}" --target "${TGTS[@]}"
+          ctest --test-dir "$B" \
             --output-on-failure --no-tests=error \
-            -R '^(DashBlockReplay|DashReplay|DashMnCheckpoint|DashMnPayee|DashMnAnchor|DashMnBridge|ReplayUtxo)'
+            -R "$SEL"
 
       - name: Upload build artifacts on failure
         if: failure() && steps.presence.outputs.exists == '1'
