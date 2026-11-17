@@ -102,6 +102,12 @@ public:
     // MWEB fields put into every WorkSnapshot (defaults: a non-MWEB coin).
     std::string snap_mweb;
     bool        snap_mweb_active{false};
+    // Share bits frozen into every WorkSnapshot (the job's pool-share
+    // difficulty; 0 = none) and the difficulty every submission hashes to.
+    std::atomic<uint32_t> snap_share_bits{0};
+    std::atomic<double>   hash_diff{1.0e12};
+    // mining_submit calls (pool shares and blocks).
+    std::atomic<int>      submit_calls{0};
     // The JobSnapshot the last mining_submit received (io thread only).
     std::optional<core::stratum::JobSnapshot> last_job;
     // Optional worker registry the session bookkeeping is forwarded to, so a
@@ -169,6 +175,7 @@ public:
         r.snapshot.tx_data = tx_data_;
         r.snapshot.mweb = snap_mweb;
         r.snapshot.mweb_active = snap_mweb_active;
+        r.snapshot.frozen_ref.bits = snap_share_bits.load();
         return r;
     }
 
@@ -179,6 +186,7 @@ public:
                                  const std::map<uint32_t, std::vector<unsigned char>>&,
                                  const core::stratum::JobSnapshot* job) override
     {
+        ++submit_calls;
         if (job) last_job = *job;
         json r;
         r["result"] = true;
@@ -195,8 +203,11 @@ public:
                                     uint32_t, const std::string&, const std::string&,
                                     const std::vector<std::string>&) const override
     {
-        return 1.0e12;  // always above vardiff → submission accepted
+        return hash_diff.load();  // default 1e12: always above vardiff → accepted
     }
+
+    // Block bits of the template (call before the server starts).
+    void set_block_bits(const std::string& bits) { tmpl_["bits"] = bits; }
 
 private:
     nlohmann::json tmpl_;
@@ -346,8 +357,12 @@ public:
     }
     bool authorize(const std::string& user, int id = 2)
     {
+        return authorize_with(user, "x", id);
+    }
+    bool authorize_with(const std::string& user, const std::string& password, int id = 2)
+    {
         send_json({{"id", id}, {"method", "mining.authorize"},
-                   {"params", json::array({user, "x"})}});
+                   {"params", json::array({user, password})}});
         auto resp = wait_response(id);
         return resp && (*resp)["result"].is_boolean() && (*resp)["result"].get<bool>();
     }
@@ -397,18 +412,68 @@ public:
         return wait_response(id);
     }
 
+    // Pipeline n submits against one job in a single write (a rig's burst),
+    // then read until all n replies arrive. Returns the number accepted, -1
+    // on timeout.
+    int submit_burst(const std::string& user, const std::string& job_id, int n, int first_id,
+                     std::chrono::milliseconds timeout = 20000ms)
+    {
+        std::string bytes;
+        for (int i = 0; i < n; ++i)
+            bytes += json({{"id", first_id + i}, {"method", "mining.submit"},
+                           {"params", json::array({user, job_id, "00000000", last_ntime, "12345678"})}})
+                         .dump() + "\n";
+        send_raw(bytes);
+        int replies = 0, accepted = 0;
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (replies < n && std::chrono::steady_clock::now() < deadline) {
+            auto line = read_line(500ms);
+            if (!line) {
+                if (was_closed_by_peer()) return -1;
+                continue;
+            }
+            json j = json::parse(*line, nullptr, false);
+            if (j.is_discarded()) continue;
+            record_notify(j);
+            if (j.contains("id") && j["id"].is_number_integer()) {
+                const int id = j["id"].get<int>();
+                if (id >= first_id && id < first_id + n) {
+                    ++replies;
+                    if (j["result"].is_boolean() && j["result"].get<bool>()) ++accepted;
+                }
+            }
+        }
+        return replies == n ? accepted : -1;
+    }
+
+    // Read whatever arrives within `quiet` (notifies, set_difficulty).
+    void drain(std::chrono::milliseconds quiet = 300ms)
+    {
+        while (auto line = read_line(quiet)) {
+            json j = json::parse(*line, nullptr, false);
+            if (!j.is_discarded()) record_notify(j);
+        }
+    }
+
     std::vector<std::string> jobs;         // job ids, in notify order
     std::vector<bool> clean_flags;         // clean_jobs (params[8]) per notify, in order
     std::string last_ntime = "65a812c0";   // overwritten by record_notify
+    std::vector<double> set_diffs;         // mining.set_difficulty values (wire), in order
+    std::vector<double> diff_at_notify;    // the last set_difficulty before each notify (-1: none)
 
 private:
     void record_notify(const json& j)
     {
+        if (j.contains("method") && j["method"] == "mining.set_difficulty"
+            && j.contains("params") && j["params"].is_array() && !j["params"].empty()
+            && j["params"][0].is_number())
+            set_diffs.push_back(j["params"][0].get<double>());
         if (j.contains("method") && j["method"] == "mining.notify"
             && j.contains("params") && j["params"].is_array()
             && j["params"].size() >= 9) {
             jobs.push_back(j["params"][0].get<std::string>());
             clean_flags.push_back(j["params"][8].get<bool>());
+            diff_at_notify.push_back(set_diffs.empty() ? -1.0 : set_diffs.back());
             last_ntime = j["params"][7].get<std::string>();
         }
     }
@@ -825,6 +890,328 @@ TEST(StratumInterimHardening, JobSnapshotCarriesMwebFields)
         ASSERT_TRUE(seen.has_value()) << "mining_submit never saw the job";
         EXPECT_EQ(seen->mweb_active, cs.active) << "mweb_active lost in the job freeze";
         EXPECT_EQ(seen->mweb, cs.mweb);
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// KAT 6b — Vardiff runaway + pool-share bound (core: LTC, BTC and DASH serve
+// miners through this one server). Field (LTC, 2026-11): a restarted node's 15
+// ASIC rigs all came up at max_difficulty 65536; four stayed. Each started at
+// the 0.0005 floor and sent a burst of floor shares before applying the first
+// raise; the issued-difficulty grace accepted them, and every accepted share
+// was timed as if found at the CURRENT difficulty: 10x per 12 shares, 0.0005 ->
+// 65536 in ~109 floor shares. At 65536 a 15 GH/s rig finds a pseudoshare every
+// ~5 h, and it withholds every pool share under 65536 (~99% of its PPLNS
+// weight; the pool-share difficulty was ~660). Covered here on the wire:
+//   - a floor burst on the old job no longer ramps the session;
+//   - no job is issued, and no set_difficulty sent, above the job's pool-share
+//     difficulty (p2pool: target = max(target, share target)), and a share at
+//     exactly the pool-share difficulty reaches share creation;
+//   - a rig ramped high comes back within one share period (the next job) and
+//     steps down after one share at the bound;
+//   - "d=N" in the password (start, wire units), "+N" on the login (fixed,
+//     wire units), their bound and their precedence over
+//     mining.suggest_difficulty.
+// Each coin case runs the same code: LTC (wire = 65536 x internal, ratio
+// vardiff), BTC (wire = internal, ratio vardiff), DASH (wire = internal,
+// hashrate vardiff, 10 s target).
+// ════════════════════════════════════════════════════════════════════════════
+namespace {
+
+constexpr uint32_t kPoolBitsDiff1 = 0x1d00ffff;   // pool-share difficulty 1.0 (the diff-1 target)
+constexpr double   kPoolDiff1 = 1.0;
+constexpr const char* kHardBlockBits = "1a00ffff"; // block difficulty 2^24: a pool share is not a block
+
+struct CoinCase { const char* name; double mult; bool hashrate_vardiff; double target; };
+const CoinCase kLtcCase{"LTC", 65536.0, false, 3.0};
+const CoinCase kBtcCase{"BTC", 1.0, false, 3.0};
+const CoinCase kDashCase{"DASH", 1.0, true, 10.0};
+
+void apply_case(ServerHarness& h, const CoinCase& cc)
+{
+    h.ws->cfg.set_difficulty_multiplier = cc.mult;
+    h.ws->cfg.use_hashrate_vardiff = cc.hashrate_vardiff;
+    h.ws->cfg.target_time = cc.target;
+    h.ws->set_block_bits(kHardBlockBits);
+}
+
+// subscribe (its set_difficulty + job), then authorize and its job.
+bool login(Client& c, const std::string& user, const std::string& password = "x")
+{
+    if (!c.subscribe() || !c.collect_notifies(1, 5000ms))
+        return false;
+    const size_t n = c.jobs.size();
+    return c.authorize_with(user, password) && c.collect_notifies(n + 1, 5000ms);
+}
+
+// A rig that applies every raise at once: bursts of 13 on the newest job until
+// the advertised difficulty reaches `wire_goal` or `rounds` run out.
+void ramp(Client& c, const std::string& user, double wire_goal, int rounds, int& id)
+{
+    for (int r = 0; r < rounds && !(c.set_diffs.back() >= wire_goal); ++r) {
+        ASSERT_EQ(c.submit_burst(user, c.jobs.back(), 13, id), 13);
+        id += 13;
+    }
+}
+
+bool accepted(const std::optional<json>& resp)
+{
+    return resp && (*resp)["result"].is_boolean() && (*resp)["result"].get<bool>();
+}
+
+}  // namespace
+
+// KAT 1 (+5): 120 accepted submits of the start job (issued at 0.0005) in one
+// burst. Master: LTC/BTC end at 65536.
+TEST(StratumVardiff, FloorBurstOnOldJobDoesNotRunAway)
+{
+    for (const CoinCase& cc : {kLtcCase, kBtcCase, kDashCase}) {
+        SCOPED_TRACE(cc.name);
+        ServerHarness h;
+        apply_case(h, cc);
+        h.ws->hash_diff = 0.001;   // a floor share
+        ASSERT_TRUE(h.start());
+
+        Client c;
+        ASSERT_TRUE(c.connect(h.port));
+        const std::string user = "vardiffburstworker";
+        ASSERT_TRUE(login(c, user));
+        ASSERT_DOUBLE_EQ(c.diff_at_notify.back(), 0.0005 * cc.mult) << "start job at the floor";
+
+        const auto t0 = std::chrono::steady_clock::now();
+        ASSERT_EQ(c.submit_burst(user, c.jobs.back(), 120, 1000), 120);
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - t0).count();
+        c.drain(200ms);
+        const double internal = c.set_diffs.back() / cc.mult;
+        printf("[%s] 120-share floor burst answered in %lld ms; difficulty now %g (internal)\n",
+               cc.name, static_cast<long long>(ms), internal);
+        if (cc.hashrate_vardiff)
+            EXPECT_LE(internal, 0.0625) << "hashrate vardiff: bounded by the credited work";
+        else
+            EXPECT_LE(internal, 0.005 * (1.0 + 1e-9)) << "floor burst ran the vardiff away";
+    }
+}
+
+// KAT 2 (+5): a rig fast enough for any difficulty is never issued one above
+// its job's pool-share difficulty, and a share at exactly that difficulty is
+// accepted and goes to share creation. Master: ramps to 65536, the share is
+// rejected "Low difficulty share".
+TEST(StratumVardiff, NeverIssuedAbovePoolShareDifficulty)
+{
+    for (const CoinCase& cc : {kLtcCase, kBtcCase, kDashCase}) {
+        SCOPED_TRACE(cc.name);
+        ServerHarness h;
+        apply_case(h, cc);
+        h.ws->snap_share_bits = kPoolBitsDiff1;
+        h.ws->hash_diff = 1.0e6;
+        ASSERT_TRUE(h.start());
+
+        Client c;
+        ASSERT_TRUE(c.connect(h.port));
+        const std::string user = "vardiffboundworker";
+        ASSERT_TRUE(login(c, user));
+        const double pool_wire = kPoolDiff1 * cc.mult;
+        int id = 1000;
+        ramp(c, user, 65536.0 * cc.mult, 40, id);
+        c.drain(200ms);
+
+        for (double d : c.set_diffs)
+            EXPECT_LE(d, pool_wire) << "set_difficulty above the pool-share difficulty";
+        for (double d : c.diff_at_notify)
+            EXPECT_LE(d, pool_wire) << "a job issued above the pool-share difficulty";
+        EXPECT_DOUBLE_EQ(c.set_diffs.back(), pool_wire) << "a fast rig sits at the bound";
+
+        const int before = h.ws->submit_calls.load();
+        h.ws->hash_diff = kPoolDiff1;
+        EXPECT_TRUE(accepted(c.submit(user, c.jobs.back(), id++)))
+            << "a share at the pool-share difficulty was rejected";
+        EXPECT_EQ(h.ws->submit_calls.load(), before + 1) << "the pool share never reached share creation";
+    }
+}
+
+// KAT 3: a rig ramped to 65536 while no pool-share bits were known. The next
+// job (one sharechain share later) carries them: set_difficulty at the bound
+// goes out ahead of it, the rig's next share at the bound is a pool share,
+// and that one share brings the vardiff down. Test-sized target time (50 ms),
+// so "past 10 x 2 x target" is 1 s.
+TEST(StratumVardiff, MisRampedRigComesBackWithinOneShare)
+{
+    for (const CoinCase& cc : {kLtcCase, kBtcCase}) {
+        SCOPED_TRACE(cc.name);
+        ServerHarness h;
+        apply_case(h, cc);
+        h.ws->cfg.target_time = 0.05;
+        h.ws->hash_diff = 1.0e6;
+        ASSERT_TRUE(h.start());
+
+        Client c;
+        ASSERT_TRUE(c.connect(h.port));
+        const std::string user = "vardiffmisrampworker";
+        ASSERT_TRUE(login(c, user));
+        int id = 1000;
+        ramp(c, user, 65536.0 * cc.mult, 60, id);
+        ASSERT_DOUBLE_EQ(c.set_diffs.back(), 65536.0 * cc.mult) << "precondition: ramped to max";
+
+        h.ws->snap_share_bits = kPoolBitsDiff1;
+        const size_t jobs_before = c.jobs.size();
+        h.on_io([&] { h.server->notify_all(false); return 0; });
+        ASSERT_TRUE(c.collect_notifies(jobs_before + 1, 5000ms));
+        EXPECT_DOUBLE_EQ(c.diff_at_notify.back(), kPoolDiff1 * cc.mult)
+            << "the next job must be issued (and announced) at the pool-share difficulty";
+
+        std::this_thread::sleep_for(1200ms);   // the rig's share interval at the bound
+        const int before = h.ws->submit_calls.load();
+        h.ws->hash_diff = kPoolDiff1;
+        EXPECT_TRUE(accepted(c.submit(user, c.jobs.back(), id++)));
+        EXPECT_EQ(h.ws->submit_calls.load(), before + 1) << "the share at the bound is a pool share";
+        c.drain(200ms);
+        EXPECT_LT(c.set_diffs.back(), kPoolDiff1 * cc.mult)
+            << "one share at the bound must bring the vardiff down";
+    }
+}
+
+// "d=4096" in the password: the session's start difficulty in WIRE units, sent
+// with set_difficulty at authorize, ahead of the first job; the floor job's
+// burst does not move it (ratio vardiff) or only lowers it (hashrate vardiff).
+TEST(StratumVardiff, PasswordStartDifficultySentAtOnce)
+{
+    for (const CoinCase& cc : {kLtcCase, kBtcCase, kDashCase}) {
+        SCOPED_TRACE(cc.name);
+        ServerHarness h;
+        apply_case(h, cc);
+        h.ws->hash_diff = 0.001;
+        ASSERT_TRUE(h.start());
+
+        Client c;
+        ASSERT_TRUE(c.connect(h.port));
+        const std::string user = "vardiffpasswordworker";
+        ASSERT_TRUE(c.subscribe());
+        ASSERT_TRUE(c.collect_notifies(1, 5000ms));
+        const std::string floor_job = c.jobs.back();
+        const size_t sd = c.set_diffs.size(), nj = c.jobs.size();
+        ASSERT_TRUE(c.authorize_with(user, "x,d=4096"));
+        ASSERT_TRUE(c.collect_notifies(nj + 1, 5000ms));
+        ASSERT_GT(c.set_diffs.size(), sd) << "no set_difficulty after authorize";
+        EXPECT_DOUBLE_EQ(c.set_diffs[sd], 4096.0) << "d=4096 is wire units";
+        EXPECT_DOUBLE_EQ(c.diff_at_notify.back(), 4096.0);
+
+        ASSERT_EQ(c.submit_burst(user, floor_job, 120, 1000), 120);
+        c.drain(200ms);
+        if (cc.hashrate_vardiff)
+            EXPECT_LE(c.set_diffs.back(), 4096.0);
+        else
+            EXPECT_DOUBLE_EQ(c.set_diffs.back(), 4096.0) << "the floor burst moved the start difficulty";
+    }
+    // The other separator and order.
+    ServerHarness h;
+    ASSERT_TRUE(h.start());
+    Client c;
+    ASSERT_TRUE(c.connect(h.port));
+    ASSERT_TRUE(login(c, "vardiffpasswordworker2", "d=8192;x"));
+    EXPECT_DOUBLE_EQ(c.diff_at_notify.back(), 8192.0);
+}
+
+// "d=" above the pool-share difficulty is issued at it.
+TEST(StratumVardiff, PasswordStartDifficultyBoundedByPoolShare)
+{
+    for (const CoinCase& cc : {kLtcCase, kBtcCase, kDashCase}) {
+        SCOPED_TRACE(cc.name);
+        ServerHarness h;
+        apply_case(h, cc);
+        h.ws->snap_share_bits = kPoolBitsDiff1;
+        ASSERT_TRUE(h.start());
+        Client c;
+        ASSERT_TRUE(c.connect(h.port));
+        ASSERT_TRUE(login(c, "vardiffpwboundworker", "d=100000000"));
+        EXPECT_DOUBLE_EQ(c.diff_at_notify.back(), kPoolDiff1 * cc.mult);
+        for (double d : c.set_diffs)
+            EXPECT_LE(d, kPoolDiff1 * cc.mult);
+    }
+}
+
+// Garbage, zero, negative, non-finite and empty "d=" values are ignored: the
+// login succeeds and the difficulty stays where it was.
+TEST(StratumVardiff, PasswordGarbageIgnored)
+{
+    for (const char* pw : {"d=abc", "d=-5", "d=0", "d=", "d=inf", "d=nan", "x,d=1e999", "d=0x10"}) {
+        SCOPED_TRACE(pw);
+        ServerHarness h;
+        ASSERT_TRUE(h.start());
+        Client c;
+        ASSERT_TRUE(c.connect(h.port));
+        ASSERT_TRUE(login(c, "vardiffgarbageworker", pw)) << "a bad d= must not fail the login";
+        c.drain(200ms);
+        for (double d : c.set_diffs)
+            EXPECT_DOUBLE_EQ(d, 0.0005 * 65536.0);
+    }
+}
+
+// "ADDR+N": a fixed difficulty in WIRE units, sent at authorize, bounded by
+// the pool-share difficulty, and not moved by vardiff.
+TEST(StratumVardiff, PlusSuffixIsFixedSentAndBounded)
+{
+    {
+        ServerHarness h;
+        h.ws->hash_diff = 1.0e6;
+        ASSERT_TRUE(h.start());
+        Client c;
+        ASSERT_TRUE(c.connect(h.port));
+        const std::string user = "vardiffplusworker";
+        ASSERT_TRUE(c.subscribe());
+        ASSERT_TRUE(c.collect_notifies(1, 5000ms));
+        const size_t sd = c.set_diffs.size(), nj = c.jobs.size();
+        ASSERT_TRUE(c.authorize(user + "+4096"));
+        ASSERT_TRUE(c.collect_notifies(nj + 1, 5000ms));
+        ASSERT_GT(c.set_diffs.size(), sd) << "+4096 never sent";
+        EXPECT_DOUBLE_EQ(c.set_diffs[sd], 4096.0);
+        EXPECT_DOUBLE_EQ(c.diff_at_notify.back(), 4096.0);
+        int id = 1000;
+        for (int r = 0; r < 4; ++r, id += 13)
+            ASSERT_EQ(c.submit_burst(user, c.jobs.back(), 13, id), 13);
+        c.drain(200ms);
+        EXPECT_DOUBLE_EQ(c.set_diffs.back(), 4096.0) << "vardiff moved a fixed +N";
+    }
+    {
+        ServerHarness h;
+        h.ws->snap_share_bits = kPoolBitsDiff1;
+        ASSERT_TRUE(h.start());
+        Client c;
+        ASSERT_TRUE(c.connect(h.port));
+        ASSERT_TRUE(login(c, "vardiffplusworker+1000000"));
+        EXPECT_DOUBLE_EQ(c.diff_at_notify.back(), kPoolDiff1 * 65536.0) << "+N above the pool-share difficulty";
+        for (double d : c.set_diffs)
+            EXPECT_LE(d, kPoolDiff1 * 65536.0);
+    }
+}
+
+// Precedence: "+N" is fixed (d=N and mining.suggest_difficulty ignored);
+// without it, d=N starts the session and a later suggest_difficulty wins.
+TEST(StratumVardiff, PlusSuffixOverPasswordOverNothing)
+{
+    auto suggest = [](Client& c, double wire, int id) {
+        c.send_json({{"id", id}, {"method", "mining.suggest_difficulty"}, {"params", json::array({wire})}});
+        return c.wait_response(id).has_value();
+    };
+    {
+        ServerHarness h;
+        ASSERT_TRUE(h.start());
+        Client c;
+        ASSERT_TRUE(c.connect(h.port));
+        ASSERT_TRUE(login(c, "vardiffprecworker+2048", "d=8192"));
+        EXPECT_DOUBLE_EQ(c.diff_at_notify.back(), 2048.0) << "+N must win over d=N";
+        ASSERT_TRUE(suggest(c, 16384.0, 50));
+        EXPECT_DOUBLE_EQ(c.set_diffs.back(), 2048.0) << "+N must win over suggest_difficulty";
+    }
+    {
+        ServerHarness h;
+        ASSERT_TRUE(h.start());
+        Client c;
+        ASSERT_TRUE(c.connect(h.port));
+        ASSERT_TRUE(login(c, "vardiffprecworker", "d=8192"));
+        EXPECT_DOUBLE_EQ(c.diff_at_notify.back(), 8192.0);
+        ASSERT_TRUE(suggest(c, 16384.0, 50));
+        EXPECT_DOUBLE_EQ(c.set_diffs.back(), 16384.0) << "a later suggest_difficulty is honoured";
     }
 }
 

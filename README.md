@@ -753,6 +753,38 @@ In **custodial** mode, miner stratum usernames are used for accounting only
 and never appear in coinbase outputs. The backoffice polls `/stratum_stats`
 for per-worker hashrate, accepted shares, and connection time.
 
+### Stratum difficulty (`+N`, `d=N`, `mining.suggest_difficulty`)
+
+Every connection has its own pseudoshare difficulty (vardiff). It starts at
+the vardiff floor and moves toward one pseudoshare every target time (3 s;
+10 s on `c2pool-dash`). A miner can set it in three ways, all in **wire
+units**: the number the miner sees in `mining.set_difficulty` (on scrypt
+coins that is 65536 × the node's internal difficulty, p2pool's
+`DUMB_SCRYPT_DIFF`; on SHA256d and X11 coins the two are the same).
+
+| Where | Example | Effect |
+|-------|---------|--------|
+| Username suffix `+N` | `ADDRESS+4096`, `ADDRESS.rig+4096` | Fixed difficulty N for the connection; vardiff is off. `c2pool-dash` rounds N down to a power of two, as its vardiff does. |
+| Password `d=N` | `d=4096`, `x,d=4096`, `d=4096;x` | Start difficulty N; vardiff continues from it. |
+| `mining.suggest_difficulty` | `[4096]` | Sets the difficulty when it arrives; vardiff continues from it. |
+
+- `+N` wins. With it, `d=N` and `mining.suggest_difficulty` are ignored.
+- Without `+N`, `d=N` and `mining.suggest_difficulty` each set the
+  difficulty when they arrive, and the later one wins. `d=N` is read once
+  per connection, at the first successful `mining.authorize`. In the
+  password it can be the whole value or one `key=value` token separated by
+  `,` or `;`.
+- A value that is not a positive finite number is ignored, and the node logs
+  it once per connection.
+
+Each value, whether a miner set it or vardiff computed it, stays within the
+vardiff floor and ceiling (`--stratum-min-diff` / `--stratum-max-diff` on
+`c2pool-ltc`). It also never goes above the pool-share difficulty of the job,
+as in p2pool. So a hash that would make a sharechain share is always worth
+submitting, and a miner never withholds one. The node sends
+`mining.set_difficulty` before any job whose difficulty differs from the
+last one it sent.
+
 ---
 
 ## Defaults

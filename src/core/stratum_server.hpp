@@ -287,6 +287,17 @@ private:
     // value > 0. Parsed here only; consumers wire it per coin.
     std::optional<double> share_difficulty_override_;
 
+    // Difficulty last sent with mining.set_difficulty (internal units; 0 =
+    // none yet). send_notify_work() sends set_difficulty ahead of any job
+    // whose issued difficulty differs from it, so the miner hashes every job
+    // at the difficulty the job is judged and credited at.
+    double advertised_difficulty_ = 0.0;
+    // "d=N" in the mining.authorize password: the session's start difficulty,
+    // taken from the first successful authorize only; a bad value is logged
+    // once per session.
+    bool password_diff_applied_ = false;
+    bool password_diff_logged_ = false;
+
     // Periodic work-push timer — member (not shared_ptr) so RAII guarantees
     // the timer outlives all its callbacks.  Matches p2pool Twisted semantics
     // where the transport/protocol object owns its timers.

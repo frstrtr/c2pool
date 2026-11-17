@@ -228,6 +228,12 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
     # hands ref_hash_fn that key), also on a node-fee job whose payout is the
     # operator's; a submission is judged by its job's own share bits
     # (core::stratum::pool_share_bits). Same fold-into-core_test reasoning as every TU here.
+    # hashrate_vardiff_test.cpp: per-connection vardiff (c2pool/hashrate/tracker)
+    # on simulated clocks: a floor burst on the old job does not ramp the
+    # session, the job's pool-share difficulty bounds every difficulty, a rig
+    # ramped high comes back after one share at the bound, a steady rig with
+    # apply latency converges and stays. One KAT covers every coin served by
+    # core::StratumServer. Same fold-into-core_test reasoning as every TU here.
     # pool_luck_test.cpp, web_server_luck_test.cpp, web_server_luck_inputs_test.cpp:
     # pool luck as effort (core/pool_luck.hpp). The first pins the model on
     # hand-computed fixtures (integrated effort over a piecewise-constant
@@ -260,6 +266,7 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
         found_block_store_test.cpp
         found_block_submit_test.cpp
         graph_history_test.cpp
+        hashrate_vardiff_test.cpp
         host_port_test.cpp
         inject_ledger_obs_test.cpp
         inject_status_test.cpp

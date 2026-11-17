@@ -6,7 +6,7 @@
 // unit tests exercise (test/test_stratum_username.cpp).
 //
 // Login grammar handled here:
-//   ADDR+<pseudo_diff>                 fixed pseudoshare difficulty
+//   ADDR+<pseudo_diff>                 fixed pseudoshare difficulty (wire units)
 //   ADDR/<share_diff>                  per-miner share difficulty (p2pool
 //                                      "ADDR/diff", work.py get_user_details)
 //   ADDR/CHAIN_ID:ADDR[/CHAIN_ID:ADDR] explicit merged-chain addresses
@@ -99,6 +99,47 @@ inline std::string strip_worker_suffix(std::string& username)
         username = username.substr(0, underscore_pos);
     }
     return worker;
+}
+
+// "d=N" in the mining.authorize password (params[1]), the common pool
+// convention for a start difficulty: the whole password, or one of its
+// key=value tokens separated by ',' or ';' ("x,d=4096", "d=4096;x"). N is in
+// WIRE units (what the miner sees in mining.set_difficulty). The last "d="
+// token decides: `diff` is its value when parse_positive_finite_diff accepts
+// it; `bad` is set when that token is present but its value is not (garbage,
+// "0", negative, "inf", "nan", empty).
+struct PasswordDiff {
+    std::optional<double> diff;
+    bool bad = false;
+};
+
+inline PasswordDiff parse_password_start_diff(const std::string& password)
+{
+    auto trim = [](const std::string& s) {
+        const char* ws = " \t\r\n";
+        const auto b = s.find_first_not_of(ws);
+        if (b == std::string::npos)
+            return std::string();
+        return s.substr(b, s.find_last_not_of(ws) - b + 1);
+    };
+    PasswordDiff out;
+    size_t start = 0;
+    while (start <= password.size()) {
+        size_t end = password.find_first_of(",;", start);
+        if (end == std::string::npos)
+            end = password.size();
+        const std::string token = password.substr(start, end - start);
+        const auto eq = token.find('=');
+        if (eq != std::string::npos) {
+            const std::string key = trim(token.substr(0, eq));
+            if (key == "d" || key == "D") {
+                out.diff = parse_positive_finite_diff(trim(token.substr(eq + 1)));
+                out.bad = !out.diff.has_value();
+            }
+        }
+        start = end + 1;
+    }
+    return out;
 }
 
 struct SlashParse {
