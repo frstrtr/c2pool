@@ -39,6 +39,7 @@
 #include <c2pool/hashrate/tracker.hpp>
 #include <core/address_utils.hpp>
 #include <core/found_block_submit.hpp>
+#include <core/found_block_import.hpp>
 #include <core/graph_history.hpp>
 #include <core/pool_luck.hpp>
 #include <core/template_refresh.hpp>
@@ -1230,6 +1231,12 @@ public:
         // false: its difficulty is unknown until the aux header chain names
         // it. Persisted (fblk extension byte). Meaningless on a parent row.
         bool aux_difficulty_known{false};
+        // The row came from an import of another node's history
+        // (import_found_blocks), not from this node's own observation of
+        // the block: served as provenance "imported", found_locally false.
+        // A later record of the block by this node clears it. Persisted (fblk
+        // extension byte).
+        bool imported{false};
         // ── Luck (core/pool_luck.hpp). DERIVED, never persisted: recomputed
         // from the inputs above and the pool rate history on every insert,
         // load, input repair and read, so a stored bad input heals. effort is
@@ -1525,6 +1532,37 @@ public:
     /// verification is scheduled.
     void correct_found_block_heights(const block_height_lookup_fn& height_fn,
                                      uint64_t tip_height);
+
+    /// Import found-block history from another node (core/found_block_import.hpp):
+    /// ONE pass. A row gets in only when the source's header chain for its
+    /// chain holds its hash on the best chain; height, time and difficulty
+    /// are then the header's. A block the ledger holds is merged fill-only.
+    /// Rows whose header chain is not ready come back in Report::deferred.
+    /// New rows are provenance "imported", confirmed when 6 deep (pending and
+    /// verified like a find before), and take part in luck like any row; an
+    /// at-find pool rate that is not plausibly the pool's is not stored.
+    /// Persists what it changes; records no checkpoint and ends no round.
+    /// NO LOCK MAY BE HELD (the lookups run with the ledger unlocked).
+    core::found_block_import::Report import_found_blocks(
+        const std::vector<core::found_block_import::Row>& rows,
+        const core::found_block_import::Source& source);
+
+    /// The startup one-shot (--import-found-blocks): the files in the order
+    /// given, each to the end before the next -- import_found_blocks now,
+    /// then every `retry` on the io_context for the rows still waiting for a
+    /// header chain, until none wait. Logs a summary line per file and the
+    /// total; `on_done` (optional) gets the total.
+    void start_found_block_import(
+        std::vector<core::found_block_import::File> files,
+        core::found_block_import::Source source,
+        std::chrono::milliseconds retry = std::chrono::seconds(30),
+        std::function<void(const core::found_block_import::Report&)> on_done = {});
+    /// One file.
+    void start_found_block_import(
+        core::found_block_import::Parsed parsed,
+        core::found_block_import::Source source,
+        std::chrono::milliseconds retry = std::chrono::seconds(30),
+        std::function<void(const core::found_block_import::Report&)> on_done = {});
 
     /// A found-block row of THIS node's own (parent) chain, as opposed to a
     /// merged/aux child (DOGE on an LTC node) that rides the same ledger. A

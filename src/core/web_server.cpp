@@ -3654,7 +3654,10 @@ nlohmann::json MiningInterface::found_block_row_locked(const FoundBlock& b) cons
     // own field (b.authorship, emitted as found_by) set at the call site
     // that knows. The wire key `found_locally` keeps its existing meaning
     // and its existing consumers; read `found_by` for authorship.
-    const bool have_local_record = !(b.share_hash.empty() && b.miner.empty());
+    // An imported row (import_found_blocks) holds another node's record, not
+    // this node's: it is learned, like a relayed one.
+    const bool have_local_record = !b.imported
+        && !(b.share_hash.empty() && b.miner.empty());
     // luck_method keeps its values; what they say after the effort rework:
     //   relayed              the row was learned from a peer with no local
     //                        record (found_locally false) and HAS a luck.
@@ -3818,6 +3821,11 @@ nlohmann::json MiningInterface::found_block_row_locked(const FoundBlock& b) cons
         {"block_reward", block_reward},
         {"explorer_url", explorer_url(b.hash)},
         {"from_history", b.from_history},
+        // Where the row came from: "imported" from another node's history
+        // (--import-found-blocks; its hash validated against this node's
+        // header chain, the rest trusted from the source), "recorded" by
+        // this node.
+        {"provenance", b.imported ? "imported" : "recorded"},
         // true: a measured luck from a single sample or a partly covered
         // round; false: integrated over a (nearly) fully covered round; null
         // (not false) when no luck was measured, so the UI renders '-'
@@ -5037,6 +5045,14 @@ void MiningInterface::record_found_block(uint64_t height, const uint256& hash, u
             bool row_dirty = false;      // any field changed -> persist once
             bool luck_input_changed = false;  // netdiff/hashrate -> recompute luck
 
+            // This node has now recorded the block itself: its own record
+            // supersedes the imported provenance (what the import brought
+            // stays, and the fills below never replace a known value).
+            if (existing.imported) {
+                existing.imported = false;
+                row_dirty = true;
+            }
+
             const bool authorship_raised = authorship > existing.authorship;
             if (authorship_raised) {
                 existing.authorship = authorship;
@@ -6005,6 +6021,449 @@ void MiningInterface::correct_found_block_heights(const block_height_lookup_fn& 
     for (const auto& b : corrected)
         if (b.status == BlockStatus::pending)
             schedule_block_verification(b.hash);
+}
+
+core::found_block_import::Report
+MiningInterface::import_found_blocks(const std::vector<core::found_block_import::Row>& rows,
+                                     const core::found_block_import::Source& source)
+{
+    namespace fbi = core::found_block_import;
+    fbi::Report rep;
+    rep.rows = rows.size();
+
+    // The label this node records its own blocks under ("LTC", "tLTC").
+    const std::string primary_label = !source.primary_chain.empty()
+        ? source.primary_chain : node_symbol();
+    auto same_label = [](const std::string& a, const std::string& b) {
+        if (a.size() != b.size()) return false;
+        for (size_t i = 0; i < a.size(); ++i)
+            if (std::toupper(static_cast<unsigned char>(a[i]))
+                != std::toupper(static_cast<unsigned char>(b[i])))
+                return false;
+        return true;
+    };
+
+    // Each lookup is asked whether it can judge a block once per pass.
+    std::map<const fbi::ChainLookup*, bool> ready_of;
+    auto ready = [&ready_of](const fbi::ChainLookup& l) {
+        auto it = ready_of.find(&l);
+        if (it != ready_of.end()) return it->second;
+        bool r = true;
+        if (l.ready) {
+            try { r = l.ready(); } catch (...) { r = false; }
+        }
+        ready_of[&l] = r;
+        return r;
+    };
+
+    // ── Validate, with the ledger UNLOCKED (the lookups read header chains
+    // with locks of their own). Only what the node's own header chain says
+    // of a hash makes a row: its height, its time, its difficulty.
+    struct Candidate {
+        FoundBlock blk{};
+        bool primary{true};
+        bool pending{false};   // < 6 deep: verified like a find
+    };
+    std::vector<Candidate> cands;
+    std::set<std::string> seen;
+    size_t corrected_logged = 0;
+    for (const auto& r : rows) {
+        // The chain the row names, as the summary counts it: this node's own
+        // label for its own chain (or no label), a merged chain's label as
+        // the source lists it.
+        std::string named = r.chain.empty() || same_label(r.chain, primary_label)
+            ? primary_label : r.chain;
+        for (const auto& kv : source.aux)
+            if (same_label(kv.first, named)) named = kv.first;
+        if (r.hash.empty()) { rep.reject(fbi::kMalformed, named); continue; }
+        if (!seen.insert(r.hash).second) { rep.reject(fbi::kDuplicate, named); continue; }
+
+        bool primary = true;
+        std::string chain = primary_label;
+        const fbi::ChainLookup* lookup = &source.primary;
+        if (named != primary_label) {
+            auto it = source.aux.find(named);
+            if (it == source.aux.end()) {
+                // A merged chain this node does not follow (or cannot check)
+                // -- a row naming its parent block (#946), or a merged chain
+                // of the LTC binary -- is skipped as such; anything else,
+                // this coin on another network included, is another chain.
+                const bool merged_row = !found_block_chain_is_primary(r.chain, "", node_symbol())
+                    && (!r.parent_hash.empty() || same_label(r.chain, "DOGE")
+                        || same_label(r.chain, "NMC"));
+                rep.reject(merged_row ? fbi::kMergedUnvalidated : fbi::kOtherChain, named);
+                continue;
+            }
+            primary = false;
+            chain = it->first;
+            lookup = &it->second;
+        }
+        if (!*lookup) {
+            rep.reject(primary ? fbi::kNoHeaderChain : fbi::kMergedUnvalidated, chain);
+            continue;
+        }
+        if (!ready(*lookup)) {
+            rep.deferred.push_back(r);
+            continue;
+        }
+
+        // The row's OWN chain judges it: the LTC header chain an LTC row, the
+        // aux (DOGE) header chain a merged row -- each against its own root.
+        fbi::Header h;
+        try { h = lookup->header(r.hash); } catch (...) { h = fbi::Header{}; }
+        if (!h.known) {
+            uint64_t lowest = 0;
+            if (lookup->lowest_height) {
+                try { lowest = lookup->lowest_height(); } catch (...) { lowest = 0; }
+            }
+            // Below the chain's root the chain cannot say; anywhere else a
+            // hash it does not hold is not a block of that chain.
+            rep.reject(r.height && lowest > 0 && *r.height < lowest
+                           ? fbi::kBelowHeaderChain : fbi::kNotOnChain, chain);
+            continue;
+        }
+        if (!h.main_chain || h.height == 0) {
+            rep.reject(fbi::kNotMainChain, chain);
+            continue;
+        }
+        const uint64_t ts = h.ts != 0 ? h.ts : r.ts;
+        if (ts == 0) { rep.reject(fbi::kMalformed, chain); continue; }
+
+        // A POOL block? Only the coinbase can say, and only where its body is
+        // at hand; elsewhere the source is trusted (provenance "imported").
+        bool verified = false;
+        if (primary && source.pays_pool) {
+            std::optional<bool> pays;
+            try { pays = source.pays_pool(r.hash, h.height); } catch (...) { pays.reset(); }
+            if (pays && !*pays) { rep.reject(fbi::kNotPoolBlock, chain); continue; }
+            verified = pays.has_value();
+        }
+        if (verified) ++rep.pool_verified;
+
+        if (!r.height) {
+            ++rep.height_filled;
+        } else if (*r.height != h.height) {
+            ++rep.height_corrected;
+            if (corrected_logged++ < 5)
+                LOG_WARNING << "[Pool] found-block import: " << chain << " block "
+                            << r.hash.substr(0, 16) << " is at height " << h.height
+                            << " in the header chain, not " << *r.height
+                            << " as the file says; imported at " << h.height;
+        }
+
+        Candidate c;
+        c.primary = primary;
+        FoundBlock& b = c.blk;
+        b.height = h.height;
+        b.hash = r.hash;
+        b.ts = ts;
+        b.chain = chain;
+        const uint64_t depth = h.tip_height >= h.height ? h.tip_height - h.height + 1 : 0;
+        // The confirm lane's rule: final at 6 deep (ltc::coin::found_block::
+        // kDepth); a shallower block is pending and checked like a find.
+        if (depth >= 6) {
+            b.status = BlockStatus::confirmed;
+            b.confirmations = static_cast<uint32_t>(std::min<uint64_t>(depth, UINT32_MAX));
+        } else {
+            b.status = BlockStatus::pending;
+            c.pending = true;
+        }
+        b.authorship = BlockAuthorship::unknown;   // which node found it is not known here
+        b.imported = true;
+        if (primary) {
+            // The header's bits; the file's value only without them.
+            b.network_difficulty = h.difficulty > 0.0 ? h.difficulty : r.network_difficulty;
+            // A parent row's share IS its block (p2pool: share hash ==
+            // header hash); anything else is not this block's share.
+            if (r.share_hash == r.hash) b.share_hash = r.share_hash;
+            // A share above the block's own difficulty would be a block
+            // itself: not a share difficulty.
+            if (r.share_difficulty > 0.0
+                && (b.network_difficulty <= 0.0 || r.share_difficulty <= b.network_difficulty))
+                b.share_difficulty = r.share_difficulty;
+        } else {
+            // The AUX chain's own difficulty, off the aux header; a file's
+            // value may be the parent's (#1738), so none without the header.
+            b.network_difficulty = h.difficulty > 0.0 ? h.difficulty : 0.0;
+            b.aux_difficulty_known = h.difficulty > 0.0;
+            b.share_hash = r.share_hash;
+            b.share_difficulty = r.share_difficulty;
+            // The parent block the aux solve rode, if this node's parent
+            // header chain holds it on its best chain.
+            if (!r.parent_hash.empty() && source.primary) {
+                fbi::Header ph;
+                try { ph = source.primary.header(r.parent_hash); } catch (...) { ph = fbi::Header{}; }
+                if (ph.known && ph.main_chain && ph.height != 0) {
+                    b.parent_hash = r.parent_hash;
+                    b.parent_height = ph.height;
+                }
+            }
+        }
+        if (!r.miner.empty() && found_block_miner_display(r.miner) == r.miner)
+            b.miner = r.miner;
+        b.pool_hashrate = r.pool_hashrate;
+        b.subsidy = r.subsidy;
+        b.coinbase_txid = r.coinbase_txid;
+        b.tx_count = r.tx_count;
+        cands.push_back(std::move(c));
+    }
+
+    // ── Apply under the ledger lock.
+    std::vector<FoundBlock> to_persist;
+    std::vector<std::string> to_verify;
+    if (!cands.empty()) {
+        std::lock_guard<std::mutex> lock(m_blocks_mutex);
+        {
+            // The pool rate at find, checked as luck checks a recorded one
+            // (core::luck::rate_at_find_plausible): the share difficulty
+            // bounds it from below, and so does the rate history near the
+            // block -- or, where the history does not reach (the usual case
+            // for history from before this node), the median of the file's
+            // own rates. A pool never hashes above its whole network.
+            std::vector<double> file_rates;
+            for (const auto& c : cands)
+                if (c.primary && c.blk.pool_hashrate > 0.0)
+                    file_rates.push_back(c.blk.pool_hashrate);
+            double file_median = 0.0;
+            if (file_rates.size() >= 3) {
+                std::nth_element(file_rates.begin(),
+                                 file_rates.begin() + static_cast<std::ptrdiff_t>(file_rates.size() / 2),
+                                 file_rates.end());
+                file_median = file_rates[file_rates.size() / 2];
+            }
+            const double period = coin_block_period();
+            std::lock_guard<std::mutex> hlock(m_luck_history_mutex);
+            for (auto& c : cands) {
+                FoundBlock& b = c.blk;
+                if (!(b.pool_hashrate > 0.0)) continue;
+                double yardstick = m_luck_history.yardstick_rate(static_cast<double>(b.ts),
+                                                                 kLuckYardstickSeconds);
+                if (!(yardstick > 0.0) && c.primary) yardstick = file_median;
+                bool ok = core::luck::rate_at_find_plausible(b.pool_hashrate,
+                                                             b.share_difficulty, yardstick);
+                if (ok && c.primary && b.network_difficulty > 0.0 && period > 0.0)
+                    ok = b.pool_hashrate
+                         <= b.network_difficulty * core::luck::kHashesPerDifficulty / period;
+                if (!ok) {
+                    b.pool_hashrate = 0.0;
+                    ++rep.rate_refused;
+                }
+            }
+        }
+
+        // The ledger by (hash, chain), built once: a lookup per row, not a
+        // scan of the ledger per row under the lock.
+        auto key_of = [](const std::string& hash, const std::string& chain) {
+            std::string k;
+            k.reserve(hash.size() + 1 + chain.size());
+            k.append(hash).push_back('\x1f');
+            k.append(chain);
+            return k;
+        };
+        std::unordered_map<std::string, size_t> held;
+        held.reserve(m_found_blocks.size() + cands.size());
+        for (size_t i = 0; i < m_found_blocks.size(); ++i)
+            held.emplace(key_of(m_found_blocks[i].hash, m_found_blocks[i].chain), i);
+        for (auto& c : cands) {
+            FoundBlock& in = c.blk;
+            auto found = held.find(key_of(in.hash, in.chain));
+            if (found == held.end()) {
+                held.emplace(key_of(in.hash, in.chain), m_found_blocks.size());
+                m_found_blocks.push_back(in);
+                to_persist.push_back(in);
+                ++rep.imported;
+                ++rep.imported_by_chain[in.chain];
+                if (!c.primary) ++rep.imported_aux;
+                if (c.pending) {
+                    ++rep.pending;
+                    to_verify.push_back(in.hash);
+                }
+                continue;
+            }
+            // A block the ledger holds: STRICTLY FILL-ONLY. Nothing this node
+            // recorded is replaced -- not its status, its authorship, its
+            // finder, its rate or its time, not even a value that does not
+            // render (a pre-fix raw-hex miner stays the node's own); only a
+            // field it holds no value for is filled from the import.
+            FoundBlock& ex = m_found_blocks[found->second];
+            bool dirty = false;
+            if (ex.height == 0 && in.height != 0) { ex.height = in.height; dirty = true; }
+            if (ex.ts == 0) { ex.ts = in.ts; dirty = true; }
+            if (ex.network_difficulty <= 0.0 && in.network_difficulty > 0.0) {
+                ex.network_difficulty = in.network_difficulty;
+                if (!c.primary) ex.aux_difficulty_known = in.aux_difficulty_known;
+                dirty = true;
+            }
+            if (ex.share_difficulty <= 0.0 && in.share_difficulty > 0.0) {
+                ex.share_difficulty = in.share_difficulty; dirty = true;
+            }
+            if (ex.pool_hashrate <= 0.0 && in.pool_hashrate > 0.0) {
+                ex.pool_hashrate = in.pool_hashrate; dirty = true;
+            }
+            if (ex.subsidy == 0 && in.subsidy != 0) { ex.subsidy = in.subsidy; dirty = true; }
+            if (ex.miner.empty() && !in.miner.empty()) { ex.miner = in.miner; dirty = true; }
+            if (ex.share_hash.empty() && !in.share_hash.empty()) {
+                ex.share_hash = in.share_hash; dirty = true;
+            }
+            if (ex.coinbase_txid.empty() && !in.coinbase_txid.empty()) {
+                ex.coinbase_txid = in.coinbase_txid; dirty = true;
+            }
+            if (!ex.tx_count && in.tx_count) { ex.tx_count = in.tx_count; dirty = true; }
+            if (!c.primary && ex.parent_hash.empty() && !in.parent_hash.empty()) {
+                ex.parent_hash = in.parent_hash;
+                if (!ex.parent_height) ex.parent_height = in.parent_height;
+                dirty = true;
+            }
+            if (dirty) {
+                ++rep.merged;
+                to_persist.push_back(ex);   // derived fields are not persisted
+            } else {
+                ++rep.unchanged;
+            }
+        }
+        // The order record_found_block keeps (newest first by height, ts
+        // breaks ties), and every derived field from the inputs: an imported
+        // block before a held one becomes its predecessor, and every round
+        // of the chain is re-derived.
+        std::sort(m_found_blocks.begin(), m_found_blocks.end(),
+            [](const FoundBlock& a, const FoundBlock& b) {
+                if (a.height != b.height) return a.height > b.height;
+                return a.ts > b.ts;
+            });
+        recompute_found_block_luck_locked();
+    }
+
+    // Outside m_blocks_mutex: m_persist_block_fn is the LevelDB writer.
+    if (m_persist_block_fn) {
+        for (const auto& b : to_persist) {
+            try { m_persist_block_fn(b); }
+            catch (const std::exception& e) {
+                LOG_WARNING << "[Pool] Failed to persist imported found block: " << e.what();
+            }
+        }
+    }
+    // Scheduling takes m_blocks_mutex; it needs the io_context.
+    for (const auto& h : to_verify)
+        schedule_block_verification(h);
+    return rep;
+}
+
+void MiningInterface::start_found_block_import(
+    core::found_block_import::Parsed parsed,
+    core::found_block_import::Source source,
+    std::chrono::milliseconds retry,
+    std::function<void(const core::found_block_import::Report&)> on_done)
+{
+    std::vector<core::found_block_import::File> files;
+    files.push_back({std::string(), std::move(parsed)});
+    start_found_block_import(std::move(files), std::move(source), retry, std::move(on_done));
+}
+
+void MiningInterface::start_found_block_import(
+    std::vector<core::found_block_import::File> files,
+    core::found_block_import::Source source,
+    std::chrono::milliseconds retry,
+    std::function<void(const core::found_block_import::Report&)> on_done)
+{
+    namespace fbi = core::found_block_import;
+    // One file after the other, in the order given; each to the end (its
+    // waits included) before the next starts.
+    struct State {
+        std::vector<fbi::File> files;
+        size_t index{0};
+        bool started{false};          // files[index] has begun
+        std::vector<fbi::Row> rows;   // the next pass's rows
+        uint64_t passes{0};           // of files[index]
+        fbi::Report file_total;       // files[index]'s
+        fbi::Report total;            // every file's
+        fbi::Source source;
+        std::chrono::milliseconds retry{0};
+        std::function<void(const fbi::Report&)> on_done;
+    };
+    auto st = std::make_shared<State>();
+    st->files = std::move(files);
+    st->source = std::move(source);
+    st->retry = retry;
+    st->on_done = std::move(on_done);
+
+    // While a retry is armed its timer holds the step function (the function
+    // itself holds only a weak reference: no cycle); nothing else does.
+    auto step = std::make_shared<std::function<void()>>();
+    std::weak_ptr<std::function<void()>> weak_step = step;
+    *step = [this, st, weak_step]() {
+        for (;;) {
+            if (st->index >= st->files.size()) {
+                LOG_INFO << "[Pool] found-block import DONE (" << st->files.size()
+                         << (st->files.size() == 1 ? " file): " : " files): ")
+                         << st->total.summary()
+                         << ". Imported rows carry provenance \"imported\": each hash is a"
+                            " block of this node's header chain for its chain; that it is a"
+                            " pool block is the source's word unless coinbase-verified.";
+                if (st->on_done) st->on_done(st->total);
+                return;
+            }
+            fbi::File& f = st->files[st->index];
+            const std::string name = f.name.empty() ? std::string("input") : f.name;
+            if (!st->started) {
+                st->started = true;
+                st->passes = 0;
+                st->file_total = fbi::Report{};
+                if (!f.parsed.error.empty()) {
+                    LOG_ERROR << "[Pool] found-block import " << name << ": " << f.parsed.error
+                              << "; nothing imported from it";
+                    ++st->index;
+                    st->started = false;
+                    continue;
+                }
+                for (const auto& p : f.parsed.problems)
+                    LOG_WARNING << "[Pool] found-block import " << name << ": skipped " << p;
+                st->file_total.rows = f.parsed.rows.size() + f.parsed.malformed;
+                st->file_total.reject(fbi::kMalformed, fbi::kUnparsedChain, f.parsed.malformed);
+                st->rows = std::move(f.parsed.rows);
+                f.parsed.rows.clear();
+            }
+
+            ++st->passes;
+            std::vector<fbi::Row> rows = std::move(st->rows);
+            st->rows.clear();
+            const fbi::Report r = import_found_blocks(rows, st->source);
+            st->file_total.add(r);
+            // A file that had to wait logs each pass that decided anything.
+            if ((st->passes > 1 || !r.deferred.empty()) && rows.size() > r.deferred.size())
+                LOG_INFO << "[Pool] found-block import " << name << ", pass " << st->passes
+                         << ": " << r.summary();
+            if (!st->file_total.deferred.empty()) {
+                auto self = weak_step.lock();
+                if (m_context && self) {
+                    // The first pass, then every tenth, says why it waits.
+                    if (st->passes == 1 || st->passes % 10 == 0)
+                        LOG_INFO << "[Pool] found-block import " << name << ": "
+                                 << st->file_total.deferred.size()
+                                 << " rows wait for their header chain to sync before they"
+                                    " can be validated; retrying every "
+                                 << st->retry.count() / 1000.0 << " s";
+                    st->rows = std::move(st->file_total.deferred);
+                    st->file_total.deferred.clear();
+                    auto timer = std::make_shared<boost::asio::steady_timer>(*m_context, st->retry);
+                    timer->async_wait([self, timer](boost::system::error_code ec) {
+                        if (!ec) (*self)();
+                    });
+                    return;
+                }
+                LOG_WARNING << "[Pool] found-block import " << name << ": "
+                            << st->file_total.deferred.size()
+                            << " rows wait for a header chain and no event loop runs to retry"
+                               " them; they are NOT imported";
+            }
+            LOG_INFO << "[Pool] found-block import " << name << ": "
+                     << st->file_total.summary();
+            st->total.rows += st->file_total.rows;
+            st->total.add(st->file_total);
+            ++st->index;
+            st->started = false;
+        }
+    };
+    (*step)();
 }
 
 void MiningInterface::load_persisted_found_blocks()

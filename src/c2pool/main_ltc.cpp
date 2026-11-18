@@ -63,6 +63,7 @@
 #include <impl/ltc/share.hpp>
 #include <impl/ltc/share_check.hpp>
 #include <impl/ltc/dashboard_found_block.hpp>  // one /recent_blocks row shape: finder + peers
+#include <impl/ltc/found_block_pool_check.hpp> // --import-found-blocks: coinbase pays the donation
 #include <impl/ltc/auto_ratchet.hpp>
 #include <impl/ltc/solo_payouts.hpp>
 #include <impl/ltc/share_messages.hpp>
@@ -637,6 +638,17 @@ void print_help() {
     std::cout << "                            Core 1.14.9's fields and hash_serialized) and exit\n";
     std::cout << "  --ltc-utxo-stats DIR      Print gettxoutsetinfo for the UTXO LevelDB at DIR (Litecoin\n";
     std::cout << "                            Core 0.21.4's fields and hash_serialized_2) and exit\n";
+    std::cout << "  --import-found-blocks FILE  Restore the pool's found-block history (Recent Blocks,\n";
+    std::cout << "                            luck, effort) from FILE: another node's /recent_blocks or\n";
+    std::cout << "                            /recent_merged_blocks JSON, or block hashes one per line.\n";
+    std::cout << "                            Repeatable or FILE,FILE; imported in order, e.g.\n";
+    std::cout << "                              curl http://NODE:WEBPORT/recent_blocks > blocks.json\n";
+    std::cout << "                              curl http://NODE:WEBPORT/recent_merged_blocks > merged.json\n";
+    std::cout << "                              --import-found-blocks blocks.json --import-found-blocks merged.json\n";
+    std::cout << "                            Each block is validated against this node's own header chain\n";
+    std::cout << "                            for its chain (LTC, DOGE) once it is synced; rows already held\n";
+    std::cout << "                            only gain missing fields. YAML import_found_blocks (a path\n";
+    std::cout << "                            or a list)\n";
     std::cout << "  --ltc-connect IP[:PORT]   Dial only this LTC peer (repeatable): no peer DB, DNS /\n";
     std::cout << "                            fixed / HTTP seeds or addr gossip (Core's -connect)\n";
     std::cout << "  --doge-connect IP[:PORT]  Dial only this DOGE peer (repeatable), as --ltc-connect\n";
@@ -960,6 +972,12 @@ int main(int argc, char* argv[]) {
     // other (no peer DB, DNS / fixed / HTTP seeds, addr gossip). HOST[:PORT].
     std::vector<std::string> ltc_connect;
     std::vector<std::string> doge_connect;
+    // --import-found-blocks FILE[,FILE...] (repeatable; YAML import_found_blocks:
+    // a path, a comma list or a list): a one-shot import of found-block
+    // history (core/found_block_import.hpp), the files in order, run once
+    // the header chains are wired. Holds CANONICAL paths only
+    // (core::found_block_import::open_import_file).
+    std::vector<std::string> import_found_blocks_paths;
     int doge_p2p_port = 0;                   // --doge-p2p-port PORT
     // Embedded LTC block relay (MWEB state at block announce):
     //   ltc_cmpct_v3          announce sendcmpct (true,3) then (false,2): MWEB peers
@@ -1167,8 +1185,58 @@ int main(int argc, char* argv[]) {
         return {};  // unknown chain — P2P broadcast disabled
     };
     
+    // --import-found-blocks FILE[,FILE...]: taken out of argv here, with a
+    // cursor of its own, before the main parse loop (which skips the values
+    // taken). Every value is refused or canonicalized now, before anything
+    // starts, through core::found_block_import::open_import_file: a missing
+    // value must not swallow the next option (--import-found-blocks
+    // --testnet would start a MAINNET node), a missing / non-regular /
+    // over-cap file must not surface only after the header sync, and a
+    // second file given without its own flag must not fall through to the
+    // positional RPC user. Only the canonical paths are kept.
+    std::vector<bool> import_found_blocks_value_at(static_cast<size_t>(argc > 0 ? argc : 0), false);
+    {
+        int cur = 1;
+        while (cur < argc) {
+            if (std::string(argv[cur]) != "--import-found-blocks") {
+                ++cur;
+                continue;
+            }
+            const std::string value = cur + 1 < argc ? argv[cur + 1] : "";
+            if (value.empty() || value[0] == '-') {
+                LOG_ERROR << "--import-found-blocks needs a FILE (or FILE,FILE), got "
+                          << (value.empty() ? std::string("nothing") : "'" + value + "'");
+                return 1;
+            }
+            import_found_blocks_value_at[static_cast<size_t>(cur + 1)] = true;
+            const auto paths = core::found_block_import::split_paths(value);
+            if (paths.empty()) {
+                LOG_ERROR << "--import-found-blocks '" << value << "': no file named";
+                return 1;
+            }
+            for (const auto& p : paths) {
+                const auto file = core::found_block_import::open_import_file(p);
+                if (!file.error.empty()) {
+                    LOG_ERROR << "--import-found-blocks " << p << ": " << file.error;
+                    return 1;
+                }
+                import_found_blocks_paths.push_back(file.path);
+            }
+            const int after = cur + 2;
+            if (after < argc && argv[after][0] != '-'
+                && core::found_block_import::open_import_file(argv[after]).error.empty()) {
+                LOG_ERROR << "--import-found-blocks takes one FILE (or FILE,FILE): give "
+                          << argv[after] << " its own --import-found-blocks";
+                return 1;
+            }
+            cur = after;
+        }
+    }
+
     // Parse command line arguments
     for (int i = 1; i < argc; ++i) {
+        if (import_found_blocks_value_at[static_cast<size_t>(i)])
+            continue;   // an --import-found-blocks value (the pass above)
         std::string arg = argv[i];
         
         if (arg == "--help" || arg == "-h") {
@@ -1353,6 +1421,11 @@ int main(int argc, char* argv[]) {
         else if (arg == "--doge-connect" && i + 1 < argc) {
             doge_connect.push_back(argv[++i]);
             cli_explicit.insert("doge_connect");
+        }
+        else if (arg == "--import-found-blocks") {
+            // Taken, checked and canonicalized by the pass before this loop
+            // (its value is skipped above).
+            cli_explicit.insert("import_found_blocks");
         }
         else if (arg == "--dump-doge-schedule-anchors" && i + 1 < argc) {
             // The anchors of a complete hash schedule (no node is started);
@@ -1887,6 +1960,23 @@ int main(int argc, char* argv[]) {
                 ltc_utxo_full = cfg["ltc_utxo_full"].as<bool>();
             if (!cli_explicit.count("ltc_utxo_full_dir") && cfg["ltc_utxo_full_dir"])
                 ltc_utxo_full_dir = cfg["ltc_utxo_full_dir"].as<std::string>();
+            if (!cli_explicit.count("import_found_blocks") && cfg["import_found_blocks"]) {
+                const auto node = cfg["import_found_blocks"];
+                std::vector<std::string> items;
+                if (node.IsSequence())
+                    for (const auto& e : node) items.push_back(e.as<std::string>());
+                else
+                    items.push_back(node.as<std::string>());
+                for (const auto& item : items)
+                    for (const auto& p : core::found_block_import::split_paths(item)) {
+                        const auto file = core::found_block_import::open_import_file(p);
+                        if (!file.error.empty()) {
+                            LOG_ERROR << "import_found_blocks " << p << ": " << file.error;
+                            return 1;
+                        }
+                        import_found_blocks_paths.push_back(file.path);   // canonical
+                    }
+            }
 
             // Embedded LTC block relay (see the declarations)
             if (!cli_explicit.count("ltc_cmpct_v3") && cfg["ltc_cmpct_v3"])
@@ -3298,6 +3388,7 @@ int main(int argc, char* argv[]) {
                             // DOGE rows: network_difficulty is the aux chain's
                             // own (fblk extension byte).
                             rec.aux_difficulty_known = blk.aux_difficulty_known;
+                            rec.imported = blk.imported;   // --import-found-blocks row
                             // A corrected height names the key it moved from.
                             return fblk_store->store(rec, blk.replaced_height);
                         },
@@ -3331,6 +3422,7 @@ int main(int argc, char* argv[]) {
                                 // false on a row written before the flag: its
                                 // stored difficulty is the parent's.
                                 blk.aux_difficulty_known = rec.aux_difficulty_known;
+                                blk.imported = rec.imported;
                                 result.push_back(std::move(blk));
                             }
                             return result;
@@ -11102,6 +11194,36 @@ int main(int argc, char* argv[]) {
             // so a restored pending row now gets confirm/orphan checks instead
             // of staying "pending" on the dashboard forever.
             web_server.get_mining_interface()->reverify_pending_found_blocks();
+
+            // --import-found-blocks: the pool's found-block history from another
+            // node (core/found_block_import.hpp). Every block is validated
+            // against the embedded header chains wired above, once they are
+            // synced; rows the ledger holds only gain missing fields.
+            if (!import_found_blocks_paths.empty()) {
+                namespace fbi = core::found_block_import;
+                fbi::Source src;
+                src.primary_chain = ltc::dashboard::chain_label(settings->m_testnet);
+                src.primary = fbi::header_chain_lookup(embedded_chain.get());
+                if (doge_chain)
+                    src.aux["DOGE"] = fbi::header_chain_lookup(doge_chain.get());
+                if (explorer_enabled && embedded_chain && ltc_utxo_db)
+                    src.pays_pool = ltc::found_block::raw_block_pool_check(
+                        embedded_chain.get(), ltc_utxo_db.get());
+                if (!embedded_chain)
+                    LOG_ERROR << "[Pool] --import-found-blocks validates every block against"
+                                 " the embedded LTC header chain, which this node does not run"
+                                 " (--no-embedded-ltc): nothing can be imported";
+                std::vector<fbi::File> files;
+                for (const auto& path : import_found_blocks_paths) {
+                    fbi::File f{path, fbi::read_file(path)};
+                    LOG_INFO << "[Pool] found-block import from " << path << ": "
+                             << f.parsed.rows.size() << " rows ("
+                             << (f.parsed.format.empty() ? "unreadable" : f.parsed.format) << ")";
+                    files.push_back(std::move(f));
+                }
+                web_server.get_mining_interface()->start_found_block_import(
+                    std::move(files), std::move(src));
+            }
 
             // Load persisted merged blocks into mm_manager BEFORE block scan.
             {

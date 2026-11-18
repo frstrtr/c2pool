@@ -57,9 +57,16 @@ struct FoundBlockRecord {
     // PARENT's difficulty there (#1738) and reads false: its difficulty is
     // not known. Meaningless on a parent-chain row.
     bool                    aux_difficulty_known{false};
+    // The row came from an import of another node's history
+    // (MiningInterface::import_found_blocks, --import-found-blocks), not from
+    // this node's own observation. Same extension byte, no version bump: a
+    // build that predates the bit reads the row and ignores it (it writes the
+    // row back without the bit, which reads as "recorded" here).
+    bool                    imported{false};
 
     // Bits of the extension byte that follows the v4 tail.
     static constexpr uint8_t kExtAuxDifficultyKnown = 0x01;
+    static constexpr uint8_t kExtImported           = 0x02;
 
     // Serialize to bytes for LevelDB storage
     std::vector<uint8_t> serialize() const
@@ -136,7 +143,8 @@ struct FoundBlockRecord {
         ps << has_parent_height;
         ps << static_cast<uint64_t>(parent_height.value_or(0));
         // --- v4 extension byte ---
-        uint8_t ext = aux_difficulty_known ? kExtAuxDifficultyKnown : 0;
+        uint8_t ext = (aux_difficulty_known ? kExtAuxDifficultyKnown : 0)
+                    | (imported ? kExtImported : 0);
         ps << ext;
 
         auto span = ps.get_span();
@@ -242,8 +250,11 @@ struct FoundBlockRecord {
             uint64_t ph = read_u64();
             if (has_parent_height && whole) rec.parent_height = ph;
             // --- v4 extension byte (absent on rows written before it) ---
-            if (whole && pos < data.size())
-                rec.aux_difficulty_known = (read_u8() & kExtAuxDifficultyKnown) != 0;
+            if (whole && pos < data.size()) {
+                const uint8_t ext = read_u8();
+                rec.aux_difficulty_known = (ext & kExtAuxDifficultyKnown) != 0;
+                rec.imported = (ext & kExtImported) != 0;
+            }
         }
 
         return rec;
