@@ -2440,8 +2440,8 @@ private:
     }
 
     void learn_refs(const ReceiptBodyV3& r) {
-        (*refs_)[r.side.payee] = r.payee;
-        if (r.owner) (*refs_)[r.side.owner] = *r.owner;
+        (*refs_)[key_ref_identity(r.payee)] = r.payee;
+        if (r.owner) (*refs_)[key_ref_identity(*r.owner)] = *r.owner;
     }
     // The key references of a served bucket taken back into the store (each bound to its rows by the store).
     void learn_bucket_refs(const std::vector<XmrKeyRef>& refs) {

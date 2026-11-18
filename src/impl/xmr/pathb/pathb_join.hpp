@@ -507,8 +507,8 @@ public:
 
     // The references a body brings (its payee and owner keys).
     void learn_refs(const ReceiptBodyV3& r) {
-        refs.emplace(r.side.payee, r.payee);
-        if (r.owner && !(r.side.owner == kZeroHash)) refs.emplace(r.side.owner, *r.owner);
+        refs.emplace(key_ref_identity(r.payee), r.payee);
+        if (r.owner && !(r.side.owner == kZeroHash)) refs.emplace(key_ref_identity(*r.owner), *r.owner);
     }
 
     // The window at a tip at hf 16 reads a leaf adopted from a served bucket.
