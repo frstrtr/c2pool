@@ -66,8 +66,67 @@ jobs:
             binary: dash
             gate_file: src/impl/dash/coin/replay_fold_engine.hpp
             gtest: "1"
+          # LTC / DOGE daemonless gtest cells. Both run the hermetic offline
+          # share_test suites (embedded LTC parent + embedded DOGE aux; no
+          # litecoind/dogecoind, no --coin-rpc, no egress). DOGE has no
+          # c2pool-doge binary: it is embedded in c2pool-ltc and its tests live
+          # in src/impl/ltc/test, so both cells build the ltc binary.
+          # gtest_sel picks gtest Suite.Test names only ([.] requires the dot),
+          # so the standalone LtcG3aPopulated regtest harness is never selected.
+          # paths_re scopes each cell to changes that can affect it; see the
+          # "Path scope" step.
+          - coin: ltc-daemonless
+            binary: ltc
+            gate_file: src/impl/ltc/coin/header_chain.hpp
+            gtest: narrow
+            gtest_sel: '^(Ltc[A-Za-z0-9]*|LTC_[A-Za-z0-9_]*)[.]'
+            paths_re: '^(src/impl/(ltc|doge|bitcoin_family)/|\.github/workflows/coin-matrix\.yml$)'
+          - coin: doge-daemonless
+            binary: ltc
+            gate_file: src/impl/doge/coin/aux_chain_embedded.hpp
+            gtest: narrow
+            gtest_sel: '^Doge[A-Za-z0-9]*[.]'
+            paths_re: '^(src/impl/(ltc|doge|bitcoin_family)/|\.github/workflows/coin-matrix\.yml$)'
     steps:
       - uses: actions/checkout@v6
+
+      # Path scope for cells that set paths_re (ltc-/doge-daemonless). Other
+      # cells always get run=1. The diff is a tree diff against the PR base
+      # (pull_request, also when called from ci-required) or the pre-push tip
+      # (push). Anything that cannot be diffed (other events, a new branch, a
+      # base that will not fetch) runs the cell: the scope may only skip on a
+      # positive "nothing relevant changed".
+      - name: Path scope
+        id: scope
+        shell: bash
+        env:
+          PATHS_RE: ${{ matrix.paths_re }}
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          set -uo pipefail
+          if [ -z "$PATHS_RE" ]; then echo "run=1" >> "$GITHUB_OUTPUT"; exit 0; fi
+          case "$EVENT" in
+            pull_request|pull_request_target) BASE="$PR_BASE" ;;
+            push) BASE="$PUSH_BEFORE" ;;
+            *) BASE="" ;;
+          esac
+          if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ]; then
+            echo "::notice::no diff base for event $EVENT; running the cell"
+            echo "run=1" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if ! git fetch --no-tags --depth=1 origin "$BASE" \
+             || ! CHANGED=$(git diff --name-only "$BASE" HEAD); then
+            echo "::notice::could not diff against $BASE; running the cell"
+            echo "run=1" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if printf '%s\n' "$CHANGED" | grep -qE "$PATHS_RE"; then
+            echo "run=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::no change matches $PATHS_RE; skipping ${{ matrix.coin }}"
+            echo "run=0" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Acquire VM905 build-host heavy-leg semaphore
         uses: ./.github/actions/heavy-leg-lock
@@ -114,18 +173,18 @@ jobs:
           fi
 
       - name: Install system dependencies
-        if: steps.presence.outputs.exists == '1' && runner.environment == 'github-hosted'
+        if: steps.presence.outputs.exists == '1' && steps.scope.outputs.run == '1' && runner.environment == 'github-hosted'
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
             g++ cmake make libleveldb-dev libsecp256k1-dev
 
       - uses: actions/setup-python@v6
-        if: steps.presence.outputs.exists == '1'
+        if: steps.presence.outputs.exists == '1' && steps.scope.outputs.run == '1'
         with: { python-version: '3.12' }
 
       - name: Install Conan 2
-        if: steps.presence.outputs.exists == '1'
+        if: steps.presence.outputs.exists == '1' && steps.scope.outputs.run == '1'
         run: |
           if [ "${{ runner.environment }}" = "github-hosted" ]; then
             pip install "conan>=2.0,<3.0"
@@ -135,11 +194,11 @@ jobs:
           fi
 
       - name: Show committed Conan profile
-        if: steps.presence.outputs.exists == '1'
+        if: steps.presence.outputs.exists == '1' && steps.scope.outputs.run == '1'
         run: conan profile show -pr:a=ci/conan/linux-gcc13.profile
 
       - name: Restore Conan cache (github-hosted only)
-        if: runner.environment == 'github-hosted' && steps.presence.outputs.exists == '1'
+        if: runner.environment == 'github-hosted' && steps.presence.outputs.exists == '1' && steps.scope.outputs.run == '1'
         uses: actions/cache@v5
         with:
           path: ${{ runner.temp }}/conan2
@@ -149,11 +208,11 @@ jobs:
             conan2-ubuntu24-gcc13-
 
       - name: Clean stale build dir (self-hosted workspace is reused)
-        if: steps.presence.outputs.exists == '1' && runner.environment != 'github-hosted'
+        if: steps.presence.outputs.exists == '1' && steps.scope.outputs.run == '1' && runner.environment != 'github-hosted'
         run: rm -rf build_${{ matrix.coin }}
 
       - name: Clear orphaned Conan download tempfiles (self-hosted cache is reused)
-        if: steps.presence.outputs.exists == '1' && runner.environment != 'github-hosted'
+        if: steps.presence.outputs.exists == '1' && steps.scope.outputs.run == '1' && runner.environment != 'github-hosted'
         # An interrupted or racing conan download can leave a partial conan_package.tgz
         # in $CONAN_HOME that makes the next `conan install` abort with
         # "the file to download already exists". Delete these staging archives so a
@@ -164,7 +223,7 @@ jobs:
       # Conan prime: the ONLY step here that reaches out to conancenter; bounded
       # retry+backoff warms the cache, the install below runs --no-remote.
       - name: Conan prime (only conancenter egress)
-        if: steps.presence.outputs.exists == '1'
+        if: steps.presence.outputs.exists == '1' && steps.scope.outputs.run == '1'
         run: |
           for attempt in 1 2 3; do
             if \
@@ -182,7 +241,7 @@ jobs:
           exit 1
 
       - name: Conan install (offline; --no-remote)
-        if: steps.presence.outputs.exists == '1'
+        if: steps.presence.outputs.exists == '1' && steps.scope.outputs.run == '1'
         run: |
           conan install . \
             -pr:a=ci/conan/linux-gcc13.profile \
@@ -193,7 +252,7 @@ jobs:
             -nr
 
       - name: Configure
-        if: steps.presence.outputs.exists == '1'
+        if: steps.presence.outputs.exists == '1' && steps.scope.outputs.run == '1'
         run: |
           # C2POOL_DASH_BLS=OFF + C2POOL_DASH_ALLOW_NO_BLS: the dash entries build c2pool-dash without
           # dashbls (bls=stub); without the opt-in that target fails by design.
@@ -202,18 +261,18 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release -DC2POOL_DASH_BLS=OFF -DC2POOL_DASH_ALLOW_NO_BLS=ON
 
       - name: Build c2pool-${{ matrix.coin }}
-        if: steps.presence.outputs.exists == '1'
+        if: steps.presence.outputs.exists == '1' && steps.scope.outputs.run == '1'
         run: cmake --build build_${{ matrix.coin }} --target c2pool-${{ matrix.binary || matrix.coin }} -j"${BUILD_J:-4}"
 
       - name: Smoke test (--help)
-        if: steps.presence.outputs.exists == '1' && matrix.gtest != '1'
+        if: steps.presence.outputs.exists == '1' && steps.scope.outputs.run == '1' && !matrix.gtest
         run: |
           BIN=build_${{ matrix.coin }}/src/c2pool/c2pool-${{ matrix.binary || matrix.coin }}
           file "$BIN"
           "$BIN" --help 2>&1 | head -5 || true
 
       - name: Embedded daemonless gtest (no --coin-rpc; self-derive path)
-        if: steps.presence.outputs.exists == '1' && matrix.gtest == '1'
+        if: steps.presence.outputs.exists == '1' && steps.scope.outputs.run == '1' && matrix.gtest == '1'
         # PRE-STAGED: runs the dashd-cut replay/fold gtests that exercise the
         # daemonless self-derive path with NO --coin-rpc arm. Selector is pinned
         # to the #1293 dashd-cut family (test_dash_replay_*, test_dash_mn_checkpoint,
@@ -228,8 +287,40 @@ jobs:
             --output-on-failure --no-tests=error \
             -R '^(DashBlockReplay|DashReplay|DashMnCheckpoint|DashMnPayee|DashMnAnchor|DashMnBridge|ReplayUtxo)'
 
+      - name: Embedded daemonless gtest, narrow build (${{ matrix.coin }})
+        if: steps.presence.outputs.exists == '1' && steps.scope.outputs.run == '1' && matrix.gtest == 'narrow'
+        # Same narrowing as the DASH step in #2262: build only the test
+        # executables whose ctest names match gtest_sel, read from the
+        # configure-time registry (CTestTestfile.cmake add_test lines), so the
+        # target list follows the selector and cannot drift. For LTC/DOGE that
+        # resolves to share_test (gtest_add_tests AUTO, so names exist before
+        # the build). An empty list or an empty selector match fails loud;
+        # timeout-minutes turns a stuck build into a named failure.
+        timeout-minutes: 30
+        shell: bash
+        env:
+          SEL: ${{ matrix.gtest_sel }}
+        run: |
+          set -euo pipefail
+          B=build_${{ matrix.coin }}
+          mapfile -t TGTS < <(
+            grep -rhoE 'add_test\(\[=\[[^]]+\]=\] "[^"]+"' --include=CTestTestfile.cmake "$B" \
+              | sed -E 's/^add_test\(\[=\[([^]]+)\]=\] "([^"]+)"$/\1 \2/' \
+              | awk -v sel="$SEL" '$1 ~ sel { n = split($2, p, "/"); print p[n] }' \
+              | sort -u
+          )
+          if [ "${#TGTS[@]}" -eq 0 ]; then
+            echo "::error::selector $SEL resolved to zero test executables; refusing to fake-green"
+            exit 1
+          fi
+          echo "Building ${#TGTS[@]} test targets: ${TGTS[*]}"
+          cmake --build "$B" -j"${BUILD_J:-4}" --target "${TGTS[@]}"
+          ctest --test-dir "$B" \
+            --output-on-failure --no-tests=error \
+            -R "$SEL"
+
       - name: Upload build artifacts on failure
-        if: failure() && steps.presence.outputs.exists == '1'
+        if: failure() && steps.presence.outputs.exists == '1' && steps.scope.outputs.run == '1'
         uses: actions/upload-artifact@v7
         with:
           name: coin-matrix-${{ matrix.coin }}-fail
