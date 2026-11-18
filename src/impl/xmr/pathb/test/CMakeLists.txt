@@ -75,6 +75,13 @@
 #   v37_xmr_ring_c1_golden           v37_xmr_ring_c1_golden_gen reproduces golden/ring_c1_window.golden
 #   v37_xmr_ring_node_golden         v37_xmr_ring_node_golden_gen reproduces golden/ring_node.golden
 #
+# Roundabouts slice C-2 (pathb_ring.hpp: the ring key and the partition; unwired):
+#   v37_xmr_ring_key_kat             preimage bytes and keys under the TEST tag, first-bit order,
+#                                    ring_of 0..7, child / parent, the ruled rule's fields,
+#                                    entry = row = payee, no key at depth 0 or under None
+#   v37_xmr_ring_partition_kat       every key / row in exactly one ring per depth; children
+#                                    partition the parent
+#
 # Slice S3b-3 KAT (pathb_bucket_wire.hpp; unwired):
 #   v37_xmr_pathb_bucket_wire_kat    FC_GETBUCKETS / FC_BUCKETS codec, verifier, paging,
 #                                    serving rule, per-peer budget
@@ -159,7 +166,9 @@ if (BUILD_TESTING)
             v37_xmr_pathb_node_kat
             v37_xmr_pathb_node_join_kat
             v37_xmr_ring_window_kat
-            v37_xmr_ring_gate_off_kat)
+            v37_xmr_ring_gate_off_kat
+            v37_xmr_ring_key_kat
+            v37_xmr_ring_partition_kat)
         add_executable(${_pathb_kat} ${_pathb_kat}.cpp)
         target_include_directories(${_pathb_kat} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
         target_link_libraries(${_pathb_kat} PRIVATE xmr_pathb)
