@@ -27,6 +27,7 @@
 // Folded into test_dash_p2p_node (beside test_dash_supersede_hint_equivalence).
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <functional>
@@ -40,6 +41,7 @@
 
 #include <core/uint256.hpp>
 #include <impl/dash/clean_drop_tails.hpp>
+#include <impl/dash/config_pool.hpp>
 #include <impl/dash/share.hpp>
 #include <impl/dash/share_tracker.hpp>
 
@@ -350,6 +352,15 @@ TEST(DashCleanDropTails, RandomForestsCappedReachUncappedState)
         };
 
         const auto ref = reference_drop(un, threshold, exempt_for(un));
+        {   // uncapped drop_tails (head-height cache) == the previous loop, step for step
+            dash::ShareTracker sq;
+            std::vector<uint256> all_s, seq;
+            (void)build(sq, all_s);
+            const auto r = dash::drop_tails(sq, threshold, 0, exempt_for(sq), &seq);
+            ASSERT_EQ(seq, ref) << "removed-hash sequence differs, seed " << seed;
+            EXPECT_EQ(r.dropped, static_cast<int>(ref.size()));
+            EXPECT_TRUE(same_state(snapshot(un, all_u), snapshot(sq, all_s))) << "seed " << seed;
+        }
         const auto win_before = windows(cp, threshold - 1);
         int total = 0, passes = 0;
         for (;;) {
@@ -423,4 +434,124 @@ TEST(DashCleanDropTails, ExemptSegmentNeverDropped)
     EXPECT_TRUE(t.chain.contains(inc.all.front()));
     // Without it, the same pass drops (so the zero above is the exemption's doing).
     EXPECT_GT(dash::drop_tails(t, 60, dash::kCleanDropTailsMaxPerPass, no_exempt).dropped, 0);
+}
+
+TEST(DashCleanDropTails, RealChainLengthIncidentSequenceIdentity)
+{
+    // Production size: threshold 2*CHAIN_LENGTH+10, 200 droppable under 5 heads
+    // (the 11-18 lab incident shape; the full 800 is in the DISABLED bench). Same removed-hash sequence and state as the
+    // previous loop; the cached pass is also timed against it (printed).
+    const auto CL = static_cast<int32_t>(dash::SharechainConfig::chain_length());
+    const int32_t thr = 2 * CL + 10;
+    dash::ShareTracker a, b;
+    Incident ia, ib;
+    ia.build(a, thr, 200);   // 200 droppable keeps the reference loop short in sanitizer builds
+    ib.build(b, thr, 200);
+    const auto t0 = std::chrono::steady_clock::now();
+    const auto ref = reference_drop(a, thr, no_exempt);
+    const auto t1 = std::chrono::steady_clock::now();
+    std::vector<uint256> got;
+    const auto r = dash::drop_tails(b, thr, 0, no_exempt, &got);
+    const auto t2 = std::chrono::steady_clock::now();
+    ASSERT_GE(ref.size(), 200u);
+    EXPECT_EQ(got, ref);
+    EXPECT_EQ(r.dropped, static_cast<int>(ref.size()));
+    EXPECT_TRUE(same_state(snapshot(a, ia.all), snapshot(b, ib.all)));
+    std::printf("[DashCleanDropTails] real-CL 200-drop: previous loop %.1f ms, drop_tails %.1f ms (%zu shares)\n",
+                std::chrono::duration<double, std::milli>(t1 - t0).count(),
+                std::chrono::duration<double, std::milli>(t2 - t1).count(), ref.size());
+}
+
+// Out-of-order arrival (children before parents, as backfill delivers them):
+// the forest is generated first, then added in a random permutation. The
+// cached drop_tails must still match the previous loop step for step, and so
+// must the uncached fallback (cache switched off).
+TEST(DashCleanDropTails, OutOfOrderArrivalSequenceIdentityCachedAndUncached)
+{
+    struct Item { uint256 h, prev; };
+    for (uint32_t seed = 1; seed <= 200; ++seed) {
+        std::mt19937 rng(seed * 104729u);
+        const int32_t threshold = 15 + static_cast<int32_t>(rng() % 30);
+        std::vector<Item> items;
+        uint64_t id = 1;
+        const int nseg = 1 + static_cast<int>(rng() % 3);
+        for (int s = 0; s < nseg; ++s) {
+            uint256 prev = make_hash(0xfffffff400ULL + s);
+            const uint256 root = prev;
+            std::vector<uint256> seg;
+            const int32_t len = threshold + static_cast<int32_t>(rng() % 80);
+            for (int32_t i = 0; i < len; ++i) { const uint256 h = make_hash(id++); items.push_back({h, prev}); seg.push_back(h); prev = h; }
+            if (rng() % 2) {   // bottom sibling
+                uint256 p2 = root;
+                for (int32_t i = 0, n = 1 + static_cast<int32_t>(rng() % (threshold + 30)); i < n; ++i) { const uint256 h = make_hash(id++); items.push_back({h, p2}); p2 = h; }
+            }
+            for (int f = 0, nf = static_cast<int>(rng() % 4); f < nf; ++f) {
+                uint256 p3 = seg[rng() % seg.size()];
+                for (int32_t i = 0, n = 1 + static_cast<int32_t>(rng() % (threshold + 20)); i < n; ++i) { const uint256 h = make_hash(id++); items.push_back({h, p3}); p3 = h; }
+            }
+        }
+        std::vector<size_t> order(items.size());
+        for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+        std::shuffle(order.begin(), order.end(), rng);
+        const uint32_t vseed = rng();
+        auto build = [&](dash::ShareTracker& t, std::vector<uint256>& all) {
+            for (size_t k : order) {
+                auto* sh = new dash::DashShare();
+                sh->m_hash = items[k].h; sh->m_prev_hash = items[k].prev; sh->m_desired_version = 16;
+                sh->m_bits = kBits; sh->m_max_bits = kBits;
+                dash::ShareType st; st = sh;
+                t.add(st);
+                all.push_back(items[k].h);
+            }
+            std::mt19937 vr(vseed);   // the same random partial verification on every tracker
+            for (const auto& it : items)
+                if (vr() % 3 == 0 && t.chain.contains(it.h) && !t.verified.contains(it.h))
+                    t.verified.add(t.chain.get_share(it.h));
+        };
+        dash::ShareTracker ref_t, cached_t, uncached_t;
+        std::vector<uint256> all_r, all_c, all_u;
+        build(ref_t, all_r); build(cached_t, all_c); build(uncached_t, all_u);
+        const auto ref = reference_drop(ref_t, threshold, no_exempt);
+        std::vector<uint256> got_c, got_u;
+        const auto rc = dash::drop_tails(cached_t, threshold, 0, no_exempt, &got_c);
+        dash::drop_tails_height_cache_disabled().store(true);
+        dash::drop_tails(uncached_t, threshold, 0, no_exempt, &got_u);
+        dash::drop_tails_height_cache_disabled().store(false);
+        ASSERT_EQ(got_c, ref) << "cached: seed " << seed;
+        ASSERT_EQ(got_u, ref) << "uncached: seed " << seed;
+        EXPECT_FALSE(rc.cache_mismatch) << "seed " << seed;
+        EXPECT_TRUE(same_state(snapshot(ref_t, all_r), snapshot(cached_t, all_c))) << "seed " << seed;
+    }
+    EXPECT_FALSE(dash::drop_tails_height_cache_disabled().load());
+}
+
+// The cap clean_tracker uses follows the cache: 512 while the head-height cache
+// is on, back to 32 once the safety net has switched it off (an uncached pass
+// under 512 would be a multi-second exclusive hold on a slow host).
+TEST(DashCleanDropTails, EffectiveCapFollowsHeightCacheState)
+{
+    ASSERT_FALSE(dash::drop_tails_height_cache_disabled().load());
+    EXPECT_EQ(dash::clean_drop_tails_effective_cap(), dash::kCleanDropTailsMaxPerPassCached);
+    EXPECT_EQ(dash::kCleanDropTailsMaxPerPassCached, 512);
+
+    // cache on: one pass of the recorded 800-shape drops at most 512
+    {
+        dash::ShareTracker t; Incident inc; inc.build(t, 60, 800);
+        const auto r = dash::drop_tails(t, 60, dash::clean_drop_tails_effective_cap(), no_exempt);
+        EXPECT_EQ(r.dropped, 512);
+        EXPECT_TRUE(r.capped);
+    }
+    // cache forced off (as after a cache_mismatch): the effective cap is 32
+    dash::drop_tails_height_cache_disabled().store(true);
+    EXPECT_EQ(dash::clean_drop_tails_effective_cap(), dash::kCleanDropTailsMaxPerPass);
+    EXPECT_EQ(dash::kCleanDropTailsMaxPerPass, 32);
+    {
+        dash::ShareTracker t; Incident inc; inc.build(t, 60, 800);
+        const auto r = dash::drop_tails(t, 60, dash::clean_drop_tails_effective_cap(), no_exempt);
+        EXPECT_EQ(r.dropped, 32);
+        EXPECT_TRUE(r.capped);
+        EXPECT_FALSE(r.cache_mismatch);   // the uncached path does no cache check
+    }
+    dash::drop_tails_height_cache_disabled().store(false);
+    EXPECT_EQ(dash::clean_drop_tails_effective_cap(), 512);
 }

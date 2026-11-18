@@ -1464,7 +1464,7 @@ void NodeImpl::clean_tracker()
         // Step 3: drop tails — remove ALL children of tails whose every head
         // is at least 2*CHAIN_LENGTH+10 high (p2pool node.py:382-398; only
         // shares far beyond the PPLNS window are removed). At most
-        // kCleanDropTailsMaxPerPass per pass: a removal costs milliseconds on a
+        // clean_drop_tails_effective_cap() per pass: a removal costs milliseconds on a
         // full tracker and this runs under the exclusive lock, so a large
         // backlog (hundreds of shares after a supersede flip) drains over the
         // next clean ticks instead of in one multi-second hold
@@ -1484,11 +1484,19 @@ void NodeImpl::clean_tracker()
                 } catch (...) {}
                 return false;
             };
-            const auto dt = dash::drop_tails(m_tracker, 2 * CL + 10,
-                                             dash::kCleanDropTailsMaxPerPass, exempt_tail);
+            // 512 per pass while the head-height cache is on, 32 once the
+            // safety net has switched it off (clean_drop_tails_effective_cap).
+            const int cap = dash::clean_drop_tails_effective_cap();
+            const bool cache_on = !dash::drop_tails_height_cache_disabled().load();
+            const auto dt = dash::drop_tails(m_tracker, 2 * CL + 10, cap, exempt_tail);
+            if (dt.cache_mismatch)
+                LOG_ERROR << "[clean-drop-tails] HEAD-HEIGHT CACHE MISMATCH after dropping "
+                          << dt.dropped << " shares — the tails/heads invariant drop_tails relies on"
+                             " is broken; height caching is now OFF for this process (please report)";
             if (dt.dropped > 0)
                 LOG_INFO << "[clean-drop-tails] dropped " << dt.dropped << " shares"
                          << (dt.capped ? " (per-pass cap reached; any rest next tick)" : "")
+                         << " cap=" << cap << " height_cache=" << (cache_on ? "on" : "off")
                          << " chain_size=" << m_tracker.chain.size()
                          << " heads=" << m_tracker.chain.get_heads().size();
         }
