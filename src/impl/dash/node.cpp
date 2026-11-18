@@ -1488,7 +1488,7 @@ void NodeImpl::clean_tracker()
                                              dash::kCleanDropTailsMaxPerPass, exempt_tail);
             if (dt.dropped > 0)
                 LOG_INFO << "[clean-drop-tails] dropped " << dt.dropped << " shares"
-                         << (dt.capped ? " (per-pass cap reached; the rest next tick)" : "")
+                         << (dt.capped ? " (per-pass cap reached; any rest next tick)" : "")
                          << " chain_size=" << m_tracker.chain.size()
                          << " heads=" << m_tracker.chain.get_heads().size();
         }
