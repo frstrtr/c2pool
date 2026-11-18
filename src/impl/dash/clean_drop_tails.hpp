@@ -25,6 +25,7 @@
 #include <core/uint256.hpp>
 
 #include <cstdint>
+#include <map>
 #include <vector>
 
 namespace dash {
@@ -40,12 +41,42 @@ struct DropTailsResult {
 /// `exempt_tail(tail_hash)` -> true keeps that tail's children this pass (the
 /// restart-reorg challenger segment). `removed_out`, when given, receives the
 /// removed hashes in removal order (tests).
+///
+/// HEAD-HEIGHT CACHE (the per-share cost). chain.get_height(head) is an
+/// uncached O(chain) walk; the loop needs every head's height once per layer,
+/// so a full-tracker pass cost heads x chain lookups per dropped share (the
+/// 11-18 191 measurement: 99-100% of Step 3). Heights are now computed once per
+/// call and kept exact by this invariant:
+///   * a head's height falls by 1 exactly when a share in its ancestry is
+///     removed, and the only shares removed here are children of tails;
+///   * after chain.remove(c) succeeds, tails[c] is precisely the set of heads
+///     whose ancestry contained c (remove() branch 3, sole child: all heads of
+///     the old tail; branch 4, forked bottom: the heads through c) — so those,
+///     and only those, are decremented: keyed per tail -> head set, never
+///     globally;
+///   * if c was itself a head (branch 1) it leaves the cache; a failed or
+///     aborted removal changes nothing and decrements nothing;
+///   * the cache lives for one call; nothing else mutates the tracker during it
+///     (exclusive lock), so a tail set that changes mid-pass only changes
+///     through these removals.
+/// The removal decisions, their order and the result are identical to
+/// recomputing every height (pinned against the previous loop, verbatim, in
+/// test_dash_clean_drop_tails). The exemption predicate needs no cache: the
+/// caller's check is O(1).
 template <typename ExemptTailFn>
 DropTailsResult drop_tails(ShareTracker& tracker, int32_t min_head_height,
                            int max_drop, ExemptTailFn&& exempt_tail,
                            std::vector<uint256>* removed_out = nullptr)
 {
     DropTailsResult r;
+    std::map<uint256, int32_t> head_height;   // see HEAD-HEIGHT CACHE above
+    auto height_of = [&](const uint256& head) -> int32_t {
+        auto it = head_height.find(head);
+        if (it != head_height.end()) return it->second;
+        const int32_t h = tracker.chain.get_height(head);
+        head_height.emplace(head, h);
+        return h;
+    };
     for (int iter = 0; iter < 1000; ++iter)
     {
         if (max_drop > 0 && r.dropped >= max_drop) { r.capped = true; break; }
@@ -60,7 +91,7 @@ DropTailsResult drop_tails(ShareTracker& tracker, int32_t min_head_height,
             int32_t min_height = 0;  // 0 -> skip if no valid heads
             for (auto& hh : head_hashes) {
                 if (!tracker.chain.contains(hh)) continue;
-                auto h = tracker.chain.get_height(hh);
+                auto h = height_of(hh);
                 if (min_height == 0 || h < min_height)
                     min_height = h;
             }
@@ -89,9 +120,19 @@ DropTailsResult drop_tails(ShareTracker& tracker, int32_t min_head_height,
                     continue;
                 if (tracker.verified.contains(aftertail))
                     tracker.verified.remove(aftertail, /*owns_data=*/false);
-                tracker.chain.remove(aftertail);
+                const bool removed = tracker.chain.remove(aftertail);
                 ++r.dropped;
                 if (removed_out) removed_out->push_back(aftertail);
+                if (removed) {
+                    head_height.erase(aftertail);   // it may have been a head
+                    const auto& tails = tracker.chain.get_tails();
+                    auto above = tails.find(aftertail);
+                    if (above != tails.end())
+                        for (const auto& h : above->second) {
+                            auto c = head_height.find(h);
+                            if (c != head_height.end()) --c->second;
+                        }
+                }
             } catch (...) {}
         }
         if (r.capped) break;

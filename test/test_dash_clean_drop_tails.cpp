@@ -27,6 +27,7 @@
 // Folded into test_dash_p2p_node (beside test_dash_supersede_hint_equivalence).
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <functional>
@@ -40,6 +41,7 @@
 
 #include <core/uint256.hpp>
 #include <impl/dash/clean_drop_tails.hpp>
+#include <impl/dash/config_pool.hpp>
 #include <impl/dash/share.hpp>
 #include <impl/dash/share_tracker.hpp>
 
@@ -347,6 +349,15 @@ TEST(DashCleanDropTails, RandomForestsCappedReachUncappedState)
         };
 
         const auto ref = reference_drop(un, threshold, exempt_for(un));
+        {   // uncapped drop_tails (head-height cache) == the previous loop, step for step
+            dash::ShareTracker sq;
+            std::vector<uint256> all_s, seq;
+            (void)build(sq, all_s);
+            const auto r = dash::drop_tails(sq, threshold, 0, exempt_for(sq), &seq);
+            ASSERT_EQ(seq, ref) << "removed-hash sequence differs, seed " << seed;
+            EXPECT_EQ(r.dropped, static_cast<int>(ref.size()));
+            EXPECT_TRUE(same_state(snapshot(un, all_u), snapshot(sq, all_s))) << "seed " << seed;
+        }
         const auto win_before = windows(cp, threshold - 1);
         int total = 0, passes = 0;
         for (;;) {
@@ -418,4 +429,30 @@ TEST(DashCleanDropTails, ExemptSegmentNeverDropped)
     EXPECT_TRUE(t.chain.contains(inc.all.front()));
     // Without it, the same pass drops (so the zero above is the exemption's doing).
     EXPECT_GT(dash::drop_tails(t, 60, dash::kCleanDropTailsMaxPerPass, no_exempt).dropped, 0);
+}
+
+TEST(DashCleanDropTails, RealChainLengthIncidentSequenceIdentity)
+{
+    // Production size: threshold 2*CHAIN_LENGTH+10, 800 droppable under 5 heads
+    // (the 11-18 05:26 lab incident). Same removed-hash sequence and state as the
+    // previous loop; the cached pass is also timed against it (printed).
+    const auto CL = static_cast<int32_t>(dash::SharechainConfig::chain_length());
+    const int32_t thr = 2 * CL + 10;
+    dash::ShareTracker a, b;
+    Incident ia, ib;
+    ia.build(a, thr, 800);
+    ib.build(b, thr, 800);
+    const auto t0 = std::chrono::steady_clock::now();
+    const auto ref = reference_drop(a, thr, no_exempt);
+    const auto t1 = std::chrono::steady_clock::now();
+    std::vector<uint256> got;
+    const auto r = dash::drop_tails(b, thr, 0, no_exempt, &got);
+    const auto t2 = std::chrono::steady_clock::now();
+    ASSERT_GE(ref.size(), 800u);
+    EXPECT_EQ(got, ref);
+    EXPECT_EQ(r.dropped, static_cast<int>(ref.size()));
+    EXPECT_TRUE(same_state(snapshot(a, ia.all), snapshot(b, ib.all)));
+    std::printf("[DashCleanDropTails] real-CL 800-drop: previous loop %.1f ms, drop_tails %.1f ms (%zu shares)\n",
+                std::chrono::duration<double, std::milli>(t1 - t0).count(),
+                std::chrono::duration<double, std::milli>(t2 - t1).count(), ref.size());
 }
