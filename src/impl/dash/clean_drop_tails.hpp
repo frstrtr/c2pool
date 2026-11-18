@@ -12,11 +12,16 @@
 // flip = 8-9 s exclusive; prod drops of 168-422 shares about hourly). A pass
 // now removes at most `max_drop` shares (kCleanDropTailsMaxPerPass) and leaves
 // the rest to the next clean tick (15 s). Nothing else changes: the same rule
-// selects the same shares in the same order, so repeated capped passes reach
-// the IDENTICAL tracker state as one uncapped pass (pinned by
-// test_dash_clean_drop_tails). The backlog is bounded: 32 per 15 s drains far
-// faster than shares arrive. Only shares outside the PPLNS window are ever
-// touched, so share acceptance and payout math are unaffected.
+// selects the same shares. With no other tracker change between passes,
+// repeated capped passes reach the IDENTICAL state as one uncapped pass (pinned
+// by test_dash_clean_drop_tails). Shares that arrive in between can differ:
+// one attaching to a backlog share becomes a short head that pauses its tree's
+// drain until Step 2 eats it — the same effect any fork inside the kept window
+// already has; the cap only widens that zone by the backlog. The drain is 32 per
+// clean that RUNS (a clean finding the think slot busy is skipped), far above
+// the ~3-7 shares/min inflow. Only shares outside the PPLNS window are ever
+// touched (the rule never cuts below 2*CHAIN_LENGTH+9; PPLNS reads
+// CHAIN_LENGTH), so share acceptance and payout math are unaffected.
 //
 // max_drop <= 0 means uncapped (the previous behaviour; tests use it as the
 // reference).
@@ -34,7 +39,7 @@ inline constexpr int kCleanDropTailsMaxPerPass = 32;
 
 struct DropTailsResult {
     int  dropped{0};
-    bool capped{false};   // stopped at max_drop with eligible shares possibly left
+    bool capped{false};   // stopped at max_drop (eligible shares may or may not be left)
 };
 
 /// `exempt_tail(tail_hash)` -> true keeps that tail's children this pass (the

@@ -334,7 +334,10 @@ TEST(DashCleanDropTails, RandomForestsCappedReachUncappedState)
         // An exemption on a random segment, by segment id: its missing parent,
         // which is exactly the key of its entry in the tails map. (drop_tails
         // takes any predicate; this one really exempts, so the exempt path is
-        // exercised on both sides.)
+        // exercised on both sides. NOTE: node.cpp's own predicate never fires
+        // today — it requires chain.contains(tails key), which is always false;
+        // tracked in #2263 — so this pins drop_tails' plumbing, not production
+        // exemption behaviour.)
         uint256 exempt_last;
         if (hint_on) {
             const auto& seg = segs_u[rng() % segs_u.size()];
@@ -404,6 +407,8 @@ TEST(DashCleanDropTails, BacklogBoundedAndDrainsWithInflow)
 
 TEST(DashCleanDropTails, ExemptSegmentNeverDropped)
 {
+    // drop_tails honours whatever predicate it is given (node.cpp's is dead
+    // today, #2263): this pins the plumbing only.
     dash::ShareTracker t;
     Incident inc;
     inc.build(t, 60, 300);
