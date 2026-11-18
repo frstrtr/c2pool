@@ -8,7 +8,8 @@
 // Path B, slice S3b-1b: window(t, v) on t's own chain. [C38, C13, C41, C35]
 //
 //   TipBins(store, t)   the bins of t's window newest first, from b = H(pos(t))
-//                       + Fresh down to b0, read on view_at(t):
+//                       + Fresh down to b0, read on view_at(t), as a depth-0
+//                       unit source (peek / pull; OPEN and WHOLE-BUCKET units):
 //                         sealed at t (H(pos(t)) >= b + F): its bucket; a bucket
 //                           not held -> MissingBucket(b);
 //                         open at t: the live placements of b with q <= pos(t)
@@ -69,6 +70,24 @@ public:
     ViewStatus status() const noexcept { return v_.status(); }
     const LaneView& view() const noexcept { return v_; }
 
+    // The unit source: End exactly where operator() returns BinPull{}, else the
+    // raw work of the non-empty units pulled.
+    ClockPeek peek() const {
+        if (done_ || next_ < b0_) return ClockPeek{};
+        return ClockPeek{PeekKind::Clock, clock_};
+    }
+    UnitPull pull() {
+        BinPull b = (*this)();
+        UnitPull p;
+        p.kind = b.kind;
+        p.missing_bin = b.missing_bin;
+        if (b.kind == PullKind::Bin) {
+            p.unit = detail_win::unit_of(std::move(b.bin));
+            if (!detail_win::unit_empty(p.unit)) clock_ += p.unit.raw;
+        }
+        return p;
+    }
+
     BinPull operator()() {
         if (done_ || next_ < b0_) return BinPull{};
         const std::uint64_t b = next_;
@@ -101,6 +120,7 @@ private:
     std::uint64_t h_t_ = 0;
     std::uint64_t next_ = 0;
     bool done_ = false;
+    Work clock_{};
 };
 
 // Every bin of t's window down to b0, newest first; stops at the first bin not
@@ -181,6 +201,10 @@ struct TipWindow {
     bool n_dropped_bins = false;
     bool n_cut_position = false;
     bool merged_back = false;
+    // output only (never a digest, verdict, coinbase or wire value): the smallest bin in the window (0: none); the
+    // window's W after step 1, before the N rule
+    std::uint64_t min_bin = 0;
+    Work W1{};
 
     bool ok() const noexcept { return defer == WindowDefer::None && window != nullptr; }
 };
@@ -225,6 +249,8 @@ inline TipWindow tip_window(const BinStore& s, const Hash32& t, const WindowPara
     WinEval e = window_from(src, wp.d_net, wp.B, wp.f_spend, wp.N, wp.author);
     out.bins_read = e.read;
     out.oldest_bin = e.oldest_bin;
+    out.min_bin = e.min_bin;
+    out.W1 = e.W1;
     out.n_dropped_bins = e.n_dropped_bins;
     out.n_cut_position = e.n_cut_position;
     out.merged_back = e.window.merged_back;
