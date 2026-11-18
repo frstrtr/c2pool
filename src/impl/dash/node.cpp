@@ -1486,6 +1486,10 @@ void NodeImpl::clean_tracker()
             };
             const auto dt = dash::drop_tails(m_tracker, 2 * CL + 10,
                                              dash::kCleanDropTailsMaxPerPass, exempt_tail);
+            if (dt.cache_mismatch)
+                LOG_ERROR << "[clean-drop-tails] HEAD-HEIGHT CACHE MISMATCH after dropping "
+                          << dt.dropped << " shares — the tails/heads invariant drop_tails relies on"
+                             " is broken; height caching is now OFF for this process (please report)";
             if (dt.dropped > 0)
                 LOG_INFO << "[clean-drop-tails] dropped " << dt.dropped << " shares"
                          << (dt.capped ? " (per-pass cap reached; any rest next tick)" : "")

@@ -29,6 +29,7 @@
 #include <impl/dash/share_tracker.hpp>
 #include <core/uint256.hpp>
 
+#include <atomic>
 #include <cstdint>
 #include <map>
 #include <vector>
@@ -41,7 +42,17 @@ inline constexpr int kCleanDropTailsMaxPerPass = 32;
 struct DropTailsResult {
     int  dropped{0};
     bool capped{false};   // stopped at max_drop (eligible shares may or may not be left)
+    bool cache_mismatch{false};  // the end-of-call height check failed (cache now off)
 };
+
+/// Safety net for the head-height cache: set (process-wide, sticky) when the
+/// end-of-call check finds a cached height that disagrees with a fresh walk —
+/// i.e. a future code path broke the tails/heads invariant the cache relies on.
+/// From then on drop_tails recomputes every height (the previous behaviour).
+inline std::atomic<bool>& drop_tails_height_cache_disabled() {
+    static std::atomic<bool> off{false};
+    return off;
+}
 
 /// `exempt_tail(tail_hash)` -> true keeps that tail's children this pass (the
 /// restart-reorg challenger segment). `removed_out`, when given, receives the
@@ -66,8 +77,12 @@ struct DropTailsResult {
 ///     through these removals.
 /// The removal decisions, their order and the result are identical to
 /// recomputing every height (pinned against the previous loop, verbatim, in
-/// test_dash_clean_drop_tails). The exemption predicate needs no cache: the
-/// caller's check is O(1).
+/// test_dash_clean_drop_tails, incl. out-of-order arrival). The exemption
+/// predicate needs no cache: the caller's check is O(1).
+/// SAFETY NET: after a call that removed anything, every cached head still in
+/// the chain is re-walked once (about one uncached layer); a mismatch sets
+/// result.cache_mismatch (logged as an error by the caller) and turns the cache
+/// off for the rest of the process (drop_tails_height_cache_disabled).
 template <typename ExemptTailFn>
 DropTailsResult drop_tails(ShareTracker& tracker, int32_t min_head_height,
                            int max_drop, ExemptTailFn&& exempt_tail,
@@ -75,7 +90,9 @@ DropTailsResult drop_tails(ShareTracker& tracker, int32_t min_head_height,
 {
     DropTailsResult r;
     std::map<uint256, int32_t> head_height;   // see HEAD-HEIGHT CACHE above
+    const bool use_cache = !drop_tails_height_cache_disabled().load(std::memory_order_relaxed);
     auto height_of = [&](const uint256& head) -> int32_t {
+        if (!use_cache) return tracker.chain.get_height(head);
         auto it = head_height.find(head);
         if (it != head_height.end()) return it->second;
         const int32_t h = tracker.chain.get_height(head);
@@ -126,8 +143,6 @@ DropTailsResult drop_tails(ShareTracker& tracker, int32_t min_head_height,
                 if (tracker.verified.contains(aftertail))
                     tracker.verified.remove(aftertail, /*owns_data=*/false);
                 const bool removed = tracker.chain.remove(aftertail);
-                ++r.dropped;
-                if (removed_out) removed_out->push_back(aftertail);
                 if (removed) {
                     head_height.erase(aftertail);   // it may have been a head
                     const auto& tails = tracker.chain.get_tails();
@@ -138,9 +153,25 @@ DropTailsResult drop_tails(ShareTracker& tracker, int32_t min_head_height,
                             if (c != head_height.end()) --c->second;
                         }
                 }
+                ++r.dropped;
+                if (removed_out) removed_out->push_back(aftertail);
             } catch (...) {}
         }
         if (r.capped) break;
+    }
+    // Safety net: if anything was removed, re-walk every cached head still in
+    // the chain once (about one uncached layer). A disagreement means the
+    // invariant above no longer holds; the caller logs it loudly and every
+    // later call recomputes heights.
+    if (use_cache && r.dropped > 0) {
+        for (const auto& [head, cached] : head_height) {
+            if (!tracker.chain.contains(head)) continue;
+            if (tracker.chain.get_height(head) != cached) {
+                r.cache_mismatch = true;
+                drop_tails_height_cache_disabled().store(true, std::memory_order_relaxed);
+                break;
+            }
+        }
     }
     return r;
 }
