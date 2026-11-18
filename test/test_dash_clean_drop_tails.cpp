@@ -19,9 +19,10 @@
 //   - With shares arriving between passes, the capped chain is never larger
 //     than the uncapped twin by more than the starting backlog, and the
 //     difference drains to 0.
-//   - The PPLNS input never changes: for every head, the window of ancestors
-//     below the threshold is present and identical in both trackers at every
-//     pass (the rule only ever removes shares beyond it).
+//   - The PPLNS input never changes: for every head, its newest
+//     min_head_height-1 ancestors are present and identical at every pass and
+//     in both trackers (the rule only ever removes shares beyond them; in
+//     production the PPLNS window is CHAIN_LENGTH < 2*CHAIN_LENGTH+9).
 //
 // Folded into test_dash_p2p_node (beside test_dash_supersede_hint_equivalence).
 
@@ -202,8 +203,10 @@ State snapshot(dash::ShareTracker& t, const std::vector<uint256>& all) {
 }
 
 // For every head: its `window` most recent ancestors (head included), walked by
-// prev hash. Shares the rule may drop are older than min_head_height, so any
-// window <= min_head_height is the untouched PPLNS input.
+// prev hash. The rule drops a tail's children only while EVERY head above it is
+// >= min_head_height tall, so it stops with the shortest head min_head_height-1
+// tall: any window <= min_head_height-1 is untouched. In production that is the
+// PPLNS window CHAIN_LENGTH against 2*CHAIN_LENGTH+9.
 std::map<uint256, std::vector<uint256>> windows(dash::ShareTracker& t, int32_t window) {
     std::map<uint256, std::vector<uint256>> out;
     for (const auto& [head, tl] : t.chain.get_heads()) {
@@ -266,12 +269,12 @@ TEST(DashCleanDropTails, RecordedShape800CappedReachesUncappedState)
     const auto ref = reference_drop(un, 60, no_exempt);
     ASSERT_GE(ref.size(), 800u);
 
-    const auto win_before = windows(cap, 60);
+    const auto win_before = windows(cap, 60 - 1);
     int passes = 0, total = 0;
     for (;;) {
         const auto r = dash::drop_tails(cap, 60, dash::kCleanDropTailsMaxPerPass, no_exempt);
         ASSERT_LE(r.dropped, dash::kCleanDropTailsMaxPerPass);
-        EXPECT_EQ(windows(cap, 60), win_before) << "PPLNS window changed at pass " << passes;
+        EXPECT_EQ(windows(cap, 60 - 1), win_before) << "PPLNS window changed at pass " << passes;
         ++passes;
         total += r.dropped;
         if (r.dropped == 0) break;
@@ -282,7 +285,7 @@ TEST(DashCleanDropTails, RecordedShape800CappedReachesUncappedState)
                                 / dash::kCleanDropTailsMaxPerPass + 1;   // + the empty pass
     EXPECT_EQ(passes, expected_passes);
     EXPECT_TRUE(same_state(snapshot(un, iu.all), snapshot(cap, ic.all)));
-    EXPECT_EQ(windows(un, 60), win_before);
+    EXPECT_EQ(windows(un, 60 - 1), win_before);
 }
 
 TEST(DashCleanDropTails, RandomForestsCappedReachUncappedState)
@@ -344,12 +347,12 @@ TEST(DashCleanDropTails, RandomForestsCappedReachUncappedState)
         };
 
         const auto ref = reference_drop(un, threshold, exempt_for(un));
-        const auto win_before = windows(cp, threshold);
+        const auto win_before = windows(cp, threshold - 1);
         int total = 0, passes = 0;
         for (;;) {
             const auto r = dash::drop_tails(cp, threshold, cap, exempt_for(cp));
             ASSERT_LE(r.dropped, cap) << "seed " << seed;
-            ASSERT_EQ(windows(cp, threshold), win_before) << "seed " << seed << " pass " << passes;
+            ASSERT_EQ(windows(cp, threshold - 1), win_before) << "seed " << seed << " pass " << passes;
             total += r.dropped;
             ++passes;
             if (r.dropped == 0) break;
