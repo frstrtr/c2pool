@@ -79,7 +79,8 @@ struct Parsed {
 
 /// Parse an import file's text (see the top of this file).
 Parsed parse(const std::string& text);
-/// Read and parse `path`; Parsed::error says why a file cannot be read.
+/// Open (open_import_file) and parse `path`; Parsed::error says why a file
+/// is refused.
 Parsed read_file(const std::string& path);
 
 /// One file of an import run (imported in the order given).
@@ -100,11 +101,28 @@ std::vector<std::string> split_paths(const std::string& list);
 inline constexpr uint64_t kMaxFileBytes = 64ull << 20;   // 64 MiB
 inline constexpr size_t   kMaxRows = 100000;
 
-/// Why `value` cannot be an import file, checked when the flag is parsed;
-/// "" = it can. A value that starts with '-' is the next OPTION (the flag
-/// must not swallow --testnet); a missing, non-regular, unreadable or
-/// over-cap file is refused before the node starts, not at the end of a
-/// header sync.
+/// An import file, opened the one way any import file is opened.
+struct OpenedFile {
+    std::string path;       ///< canonical: absolute, symlinks resolved
+    std::string contents;   ///< the whole file (at most kMaxFileBytes)
+    std::string error;      ///< non-empty: refused; path / contents empty
+};
+
+/// THE place an import file is opened (the flag check at parse time and
+/// the read at import time both go through it). `value` is the path as the
+/// operator gave it; it is used for nothing but to compute the canonical
+/// path (std::filesystem::weakly_canonical of the absolute path: ".." and
+/// every symlink resolved), and only that is checked and opened. Refused:
+/// no value; a value that starts with '-' (the next OPTION: the flag must
+/// not swallow --testnet); a path that does not resolve to an existing
+/// file; a final target that is not a regular file -- a directory, a
+/// device such as /dev/null, a FIFO or a socket, also behind a symlink;
+/// a file above kMaxFileBytes (checked before it is opened, and again while
+/// it is read). Opened read-only, in binary mode.
+OpenedFile open_import_file(const std::string& value);
+
+/// Why `value` cannot be an import file ("" = it can): open_import_file's
+/// error.
 std::string file_problem(const std::string& value);
 
 /// What a node's header chain says of one block hash.

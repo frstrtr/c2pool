@@ -55,8 +55,10 @@ std::optional<uint64_t> whole(const nlohmann::json& v)
         return std::nullopt;
     }
     if (v.is_number_float()) {
+        // Whole when nothing is left above its floor (ordered comparisons:
+        // no float equality).
         const double d = v.get<double>();
-        if (std::isfinite(d) && d >= 0.0 && d == std::floor(d) && d < 1.8e19)
+        if (std::isfinite(d) && d >= 0.0 && d < 1.8e19 && !(d - std::floor(d) > 0.0))
             return static_cast<uint64_t>(d);
     }
     return std::nullopt;
@@ -225,50 +227,97 @@ Parsed parse(const std::string& text_in)
     return out;
 }
 
+OpenedFile open_import_file(const std::string& value)
+{
+    namespace fs = std::filesystem;
+    OpenedFile out;
+    if (value.empty()) {
+        out.error = "no file named";
+        return out;
+    }
+    if (value[0] == '-') {
+        out.error = "'" + value + "' is an option, not a file (the flag needs a FILE)";
+        return out;
+    }
+    // From here on only the CANONICAL path is used: absolute, "." and ".."
+    // folded, every symlink followed to its final target.
+    std::error_code ec;
+    const fs::path absolute = fs::absolute(fs::path(value), ec);
+    if (ec) {
+        out.error = "cannot resolve the path";
+        return out;
+    }
+    const fs::path canonical = fs::weakly_canonical(absolute, ec);
+    if (ec || canonical.empty()) {
+        out.error = "cannot resolve the path";
+        return out;
+    }
+    const fs::file_status st = fs::status(canonical, ec);
+    if (st.type() == fs::file_type::not_found) {
+        out.error = "no such file";
+        return out;
+    }
+    if (ec || !fs::exists(st)) {
+        out.error = "cannot read its status";
+        return out;
+    }
+    // A directory, a device (/dev/null, /dev/zero: endless), a FIFO (a read
+    // would block the start) or a socket is never an import file -- also
+    // not behind a symlink, which `canonical` has already followed.
+    if (!fs::is_regular_file(st)) {
+        out.error = "not a regular file";
+        return out;
+    }
+    const auto size = fs::file_size(canonical, ec);
+    if (ec) {
+        out.error = "cannot read its size";
+        return out;
+    }
+    if (size > kMaxFileBytes) {
+        out.error = std::to_string(size) + " bytes, above the cap of "
+            + std::to_string(kMaxFileBytes) + " bytes per file";
+        return out;
+    }
+    std::ifstream f(canonical, std::ios::in | std::ios::binary);   // read-only
+    if (!f) {
+        out.error = "cannot be opened for reading";
+        return out;
+    }
+    // The cap holds while reading too: a file that grew since its size was
+    // read is refused, never loaded past the cap.
+    std::string contents;
+    contents.reserve(static_cast<size_t>(size));
+    char buf[65536];
+    while (f.read(buf, sizeof(buf)) || f.gcount() > 0) {
+        contents.append(buf, static_cast<size_t>(f.gcount()));
+        if (contents.size() > kMaxFileBytes) {
+            out.error = "above the cap of " + std::to_string(kMaxFileBytes) + " bytes per file";
+            return out;
+        }
+    }
+    if (f.bad()) {
+        out.error = "read error";
+        return out;
+    }
+    out.path = canonical.string();
+    out.contents = std::move(contents);
+    return out;
+}
+
 std::string file_problem(const std::string& value)
 {
-    if (value.empty())
-        return "no file named";
-    if (value[0] == '-')
-        return "'" + value + "' is an option, not a file (the flag needs a FILE)";
-    std::error_code ec;
-    const std::filesystem::path p(value);
-    if (!std::filesystem::exists(p, ec))
-        return "no such file";
-    if (!std::filesystem::is_regular_file(p, ec))
-        return "not a regular file";
-    const auto size = std::filesystem::file_size(p, ec);
-    if (ec)
-        return "cannot read its size";
-    if (size > kMaxFileBytes)
-        return std::to_string(size) + " bytes, above the cap of "
-            + std::to_string(kMaxFileBytes) + " bytes per file";
-    std::ifstream f(value, std::ios::binary);
-    if (!f)
-        return "cannot be opened for reading";
-    return {};
+    return open_import_file(value).error;
 }
 
 Parsed read_file(const std::string& path)
 {
-    // The cap before the read: a file is never loaded whole past it.
-    std::error_code ec;
-    const auto size = std::filesystem::file_size(std::filesystem::path(path), ec);
-    if (!ec && size > kMaxFileBytes) {
+    OpenedFile file = open_import_file(path);
+    if (!file.error.empty()) {
         Parsed out;
-        out.error = path + ": " + std::to_string(size) + " bytes, above the cap of "
-            + std::to_string(kMaxFileBytes) + " bytes per file";
+        out.error = path + ": " + file.error;
         return out;
     }
-    std::ifstream f(path, std::ios::binary);
-    if (!f) {
-        Parsed out;
-        out.error = "cannot open " + path;
-        return out;
-    }
-    std::ostringstream ss;
-    ss << f.rdbuf();
-    return parse(ss.str());
+    return parse(file.contents);
 }
 
 std::vector<std::string> split_paths(const std::string& list)

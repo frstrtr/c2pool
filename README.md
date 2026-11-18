@@ -1455,10 +1455,12 @@ curl -s https://ltc.voidbind.com/recent_merged_blocks -o merged.json
 (`--import-found-blocks blocks.json,merged.json`); in the legacy YAML,
 `import_found_blocks: [blocks.json, merged.json]` or a single path. Any node of
 the pool will do: `http://<node>:<web-port>/recent_blocks` (8080 by default).
-Each file is checked when the options are read: a missing or unreadable file,
-a value that is another option (`--import-found-blocks --testnet`), a second
-file without its own flag, or a file above 64 MiB or 100,000 entries stops
-the node at once with an error (exit 1).
+Each file is checked when the options are read, at its canonical path (a
+symlink is followed to its target, which must be a regular file): a missing
+or unreadable file, a directory, a device or FIFO, a value that is another
+option (`--import-found-blocks --testnet`), a second file without its own
+flag, or a file above 64 MiB or 100,000 entries stops the node at once with
+an error (exit 1).
 
 The import runs at startup, after the embedded header chains are synced (it
 waits for the sync and says so in the log). Each file gets a summary line, then

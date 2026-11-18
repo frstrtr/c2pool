@@ -45,6 +45,7 @@
 #include <string>
 #include <vector>
 
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <boost/asio/io_context.hpp>
@@ -797,6 +798,77 @@ TEST(FoundBlockImport, FlagValueIsCheckedBeforeTheNodeStarts)
 
     std::error_code ec;
     std::filesystem::remove_all(dir, ec);
+}
+
+// ── open_import_file: the one place an import file is opened ───────────────
+// Only the canonical path (absolute, symlinks followed) is checked and
+// opened, and its final target must be a regular file: a directory, a device
+// (/dev/null, also behind a symlink), a FIFO (a read would block the start)
+// and a socket are refused without being opened.
+TEST(FoundBlockImport, ImportFileIsCanonicalAndRegular)
+{
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::weakly_canonical(fs::path(testing::TempDir())) /
+        ("fbi_open_" + std::to_string(static_cast<long long>(::getpid())));
+    fs::remove_all(dir);
+    fs::create_directories(dir / "sub");
+    const fs::path real = dir / "blocks.json";
+    { std::ofstream(real) << "[\"" << hash_of(0x1) << "\"]"; }
+
+    // A regular file: its canonical path and its contents.
+    const auto opened = fbi::open_import_file(real.string());
+    ASSERT_EQ(opened.error, "");
+    EXPECT_EQ(opened.path, fs::canonical(real).string());
+    EXPECT_EQ(fbi::parse(opened.contents).rows.size(), 1u);
+
+    // A relative path, and one through "..", come back absolute and canonical.
+    const fs::path cwd = fs::current_path();
+    fs::current_path(dir / "sub");
+    const auto rel = fbi::open_import_file("../blocks.json");
+    const auto rel2 = fbi::open_import_file("./../sub/../blocks.json");
+    fs::current_path(cwd);
+    ASSERT_EQ(rel.error, "");
+    EXPECT_TRUE(fs::path(rel.path).is_absolute()) << rel.path;
+    EXPECT_EQ(rel.path, fs::canonical(real).string());
+    EXPECT_EQ(rel2.path, fs::canonical(real).string());
+
+    // A symlink to a regular file is the file it points at.
+    fs::create_symlink(real, dir / "link.json");
+    const auto via_link = fbi::open_import_file((dir / "link.json").string());
+    ASSERT_EQ(via_link.error, "");
+    EXPECT_EQ(via_link.path, fs::canonical(real).string()) << "followed to the target";
+
+    // A directory, and a symlink to one.
+    EXPECT_EQ(fbi::open_import_file((dir / "sub").string()).error, "not a regular file");
+    fs::create_directory_symlink(dir / "sub", dir / "dirlink");
+    EXPECT_EQ(fbi::open_import_file((dir / "dirlink").string()).error, "not a regular file");
+
+    // A device behind a symlink: /dev/null.
+    if (fs::exists("/dev/null")) {
+        EXPECT_EQ(fbi::open_import_file("/dev/null").error, "not a regular file");
+        fs::create_symlink("/dev/null", dir / "null.json");
+        const auto null_link = fbi::open_import_file((dir / "null.json").string());
+        EXPECT_EQ(null_link.error, "not a regular file");
+        EXPECT_TRUE(null_link.path.empty());
+        EXPECT_TRUE(null_link.contents.empty());
+    }
+
+    // A FIFO, and a symlink to one: refused without being opened (an open
+    // would block until a writer came).
+    const fs::path fifo = dir / "pipe.json";
+    ASSERT_EQ(::mkfifo(fifo.c_str(), 0600), 0);
+    EXPECT_EQ(fbi::open_import_file(fifo.string()).error, "not a regular file");
+    fs::create_symlink(fifo, dir / "pipelink.json");
+    EXPECT_EQ(fbi::open_import_file((dir / "pipelink.json").string()).error,
+              "not a regular file");
+    EXPECT_NE(fbi::read_file(fifo.string()).error.find("not a regular file"), std::string::npos);
+
+    // A dangling symlink resolves to nothing.
+    fs::create_symlink(dir / "gone.json", dir / "dangling.json");
+    EXPECT_EQ(fbi::open_import_file((dir / "dangling.json").string()).error, "no such file");
+
+    std::error_code ec;
+    fs::remove_all(dir, ec);
 }
 
 // ── Caps ─────────────────────────────────────────────────────────────────────

@@ -971,7 +971,8 @@ int main(int argc, char* argv[]) {
     // --import-found-blocks FILE[,FILE...] (repeatable; YAML import_found_blocks:
     // a path, a comma list or a list): a one-shot import of found-block
     // history (core/found_block_import.hpp), the files in order, run once
-    // the header chains are wired.
+    // the header chains are wired. Holds CANONICAL paths only
+    // (core::found_block_import::open_import_file).
     std::vector<std::string> import_found_blocks_paths;
     int doge_p2p_port = 0;                   // --doge-p2p-port PORT
     // Embedded LTC block relay (MWEB state at block announce):
@@ -1186,8 +1187,58 @@ int main(int argc, char* argv[]) {
         return {};  // unknown chain — P2P broadcast disabled
     };
     
+    // --import-found-blocks FILE[,FILE...]: taken out of argv here, with a
+    // cursor of its own, before the main parse loop (which skips the values
+    // taken). Every value is refused or canonicalized now, before anything
+    // starts, through core::found_block_import::open_import_file: a missing
+    // value must not swallow the next option (--import-found-blocks
+    // --testnet would start a MAINNET node), a missing / non-regular /
+    // over-cap file must not surface only after the header sync, and a
+    // second file given without its own flag must not fall through to the
+    // positional RPC user. Only the canonical paths are kept.
+    std::vector<bool> import_found_blocks_value_at(static_cast<size_t>(argc > 0 ? argc : 0), false);
+    {
+        int cur = 1;
+        while (cur < argc) {
+            if (std::string(argv[cur]) != "--import-found-blocks") {
+                ++cur;
+                continue;
+            }
+            const std::string value = cur + 1 < argc ? argv[cur + 1] : "";
+            if (value.empty() || value[0] == '-') {
+                LOG_ERROR << "--import-found-blocks needs a FILE (or FILE,FILE), got "
+                          << (value.empty() ? std::string("nothing") : "'" + value + "'");
+                return 1;
+            }
+            import_found_blocks_value_at[static_cast<size_t>(cur + 1)] = true;
+            const auto paths = core::found_block_import::split_paths(value);
+            if (paths.empty()) {
+                LOG_ERROR << "--import-found-blocks '" << value << "': no file named";
+                return 1;
+            }
+            for (const auto& p : paths) {
+                const auto file = core::found_block_import::open_import_file(p);
+                if (!file.error.empty()) {
+                    LOG_ERROR << "--import-found-blocks " << p << ": " << file.error;
+                    return 1;
+                }
+                import_found_blocks_paths.push_back(file.path);
+            }
+            const int after = cur + 2;
+            if (after < argc && argv[after][0] != '-'
+                && core::found_block_import::open_import_file(argv[after]).error.empty()) {
+                LOG_ERROR << "--import-found-blocks takes one FILE (or FILE,FILE): give "
+                          << argv[after] << " its own --import-found-blocks";
+                return 1;
+            }
+            cur = after;
+        }
+    }
+
     // Parse command line arguments
     for (int i = 1; i < argc; ++i) {
+        if (import_found_blocks_value_at[static_cast<size_t>(i)])
+            continue;   // an --import-found-blocks value (the pass above)
         std::string arg = argv[i];
         
         if (arg == "--help" || arg == "-h") {
@@ -1374,38 +1425,8 @@ int main(int argc, char* argv[]) {
             cli_explicit.insert("doge_connect");
         }
         else if (arg == "--import-found-blocks") {
-            // Refused here, before anything starts: a missing value must not
-            // swallow the next option (--import-found-blocks --testnet would
-            // start a MAINNET node), a missing or unreadable file must not
-            // surface only after the header sync, and a second file given
-            // without its own flag must not fall through to the positional
-            // RPC user.
-            const std::string value = i + 1 < argc ? argv[i + 1] : "";
-            if (value.empty() || value[0] == '-') {
-                LOG_ERROR << "--import-found-blocks needs a FILE (or FILE,FILE), got "
-                          << (value.empty() ? std::string("nothing") : "'" + value + "'");
-                return 1;
-            }
-            ++i;
-            const auto paths = core::found_block_import::split_paths(value);
-            if (paths.empty()) {
-                LOG_ERROR << "--import-found-blocks '" << value << "': no file named";
-                return 1;
-            }
-            for (const auto& p : paths) {
-                const std::string why = core::found_block_import::file_problem(p);
-                if (!why.empty()) {
-                    LOG_ERROR << "--import-found-blocks " << p << ": " << why;
-                    return 1;
-                }
-                import_found_blocks_paths.push_back(p);
-            }
-            if (i + 1 < argc && argv[i + 1][0] != '-'
-                && core::found_block_import::file_problem(argv[i + 1]).empty()) {
-                LOG_ERROR << "--import-found-blocks takes one FILE (or FILE,FILE): give "
-                          << argv[i + 1] << " its own --import-found-blocks";
-                return 1;
-            }
+            // Taken, checked and canonicalized by the pass before this loop
+            // (its value is skipped above).
             cli_explicit.insert("import_found_blocks");
         }
         else if (arg == "--dump-doge-schedule-anchors" && i + 1 < argc) {
@@ -1945,13 +1966,13 @@ int main(int argc, char* argv[]) {
                 else
                     items.push_back(node.as<std::string>());
                 for (const auto& item : items)
-                    for (auto& p : core::found_block_import::split_paths(item)) {
-                        const std::string why = core::found_block_import::file_problem(p);
-                        if (!why.empty()) {
-                            LOG_ERROR << "import_found_blocks " << p << ": " << why;
+                    for (const auto& p : core::found_block_import::split_paths(item)) {
+                        const auto file = core::found_block_import::open_import_file(p);
+                        if (!file.error.empty()) {
+                            LOG_ERROR << "import_found_blocks " << p << ": " << file.error;
                             return 1;
                         }
-                        import_found_blocks_paths.push_back(std::move(p));
+                        import_found_blocks_paths.push_back(file.path);   // canonical
                     }
             }
 
