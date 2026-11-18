@@ -23,6 +23,14 @@
 //     rows); both give the same window (ruling 20 Q-K). The bins are read
 //     newest first from a source that may name a bin it does not hold
 //     (MissingBucket / MissingEntries): the window is then not evaluated.
+//   Units: a source offers peek() (its clock, or End; reads no cell) and
+//     pull() (the next unit). A unit is OPEN (entries), WHOLE-BUCKET (sealed,
+//     depth 0; no atoms) or RING-ROWS (rows, depth > 0); it carries RAW values
+//     and one shift: every weight and datum is raw << shift. Test (i) reads the
+//     peeked clock; test (ii) takes w = raw << shift and the bin-wide datum
+//     d_min_bin << shift. A failing first unit: WHOLE-BUCKET -> SealedCut;
+//     OPEN / RING-ROWS -> cut over its atoms (order_atoms()), each atom on its
+//     own datum. ListedBins and TipBins are depth-0 sources (shift 0, no rows).
 //   shares: w_owner = floor(work x p / 10000), w_author = floor(work x ga /
 //     10000), w_miner = work - w_owner - w_author. [K15, K16]
 //   merge_back: identity X whose TOTAL window weight w_X (miner + owner + author
@@ -82,6 +90,36 @@ struct WinBin {
     const L1Bucket* sealed = nullptr;  // sealed bin: its bucket (raw_sum, d_min, rows); entries empty
 };
 
+// A ring: index < 2^depth; {0, 0} = the pool.
+struct RingId {
+    std::uint8_t depth = 0;
+    std::uint8_t index = 0;
+
+    friend bool operator==(const RingId&, const RingId&) = default;
+};
+
+// What a window source yields: one cell of one ring. Exactly one form:
+//   OPEN          entries: the ring's live receipts of the bin;
+//   WHOLE-BUCKET  sealed: a sealed bin at depth 0 (taken whole or SealedCut; no atoms);
+//   RING-ROWS     rows: a sealed cell of one ring at depth > 0 (sealed == nullptr).
+// raw: the cell's raw work (WHOLE-BUCKET: the bucket's raw_sum; RING-ROWS: the sum of its
+// rows); d_min_bin: the bin-wide minimum over every ring's live receipts (raw); every
+// weight and datum of the unit is raw << shift.
+struct WinUnit {
+    std::uint64_t bin = 0;             // origin bin of the cell
+    RingId ring{};                     // the ring of the walker that read the cell (logs only)
+    std::vector<WinEntry> entries;     // OPEN
+    const L1Bucket* sealed = nullptr;  // WHOLE-BUCKET
+    std::vector<BucketRow> rows;       // RING-ROWS
+    Work raw{};
+    std::uint64_t d_min_bin = 0;
+    std::uint8_t shift = 0;
+
+    // The cut order of the atoms. OPEN: carrier position descending, then id
+    // ascending. RING-ROWS: the order the source hands the rows in.
+    void order_atoms();
+};
+
 // shares of one receipt's raw work (S3.1 item 10). The shares are defined iff
 // p + give_author_bp <= 10000: then w_owner + w_author <= work and the three
 // shares sum to the work exactly. A receipt with p + give_author_bp > 10000 is
@@ -114,7 +152,26 @@ struct Window {
 
 namespace detail_win {
 
-inline bool bin_empty(const WinBin& b) { return b.sealed != nullptr ? b.sealed->rows.empty() : b.entries.empty(); }
+// An empty unit: a WHOLE-BUCKET unit whose bucket has no row; an OPEN or RING-ROWS
+// unit with no entry and no row.
+inline bool unit_empty(const WinUnit& u) {
+    return u.sealed != nullptr ? u.sealed->rows.empty() : (u.rows.empty() && u.entries.empty());
+}
+
+// w << shift (shift < 256).
+inline Work scaled(const Work& w, std::uint8_t shift) noexcept {
+    if (shift == 0) return w;
+    Work out;
+    const unsigned limbs = shift / 64, bits = shift % 64;
+    for (int i = 3; i >= 0; --i) {
+        const int src = i - static_cast<int>(limbs);
+        if (src < 0) continue;
+        std::uint64_t v = w.v[static_cast<std::size_t>(src)] << bits;
+        if (bits != 0 && src > 0) v |= w.v[static_cast<std::size_t>(src - 1)] >> (64 - bits);
+        out.v[static_cast<std::size_t>(i)] = v;
+    }
+    return out;
+}
 
 // Raw live-work sum and the smallest live receipt-entry work of a bin (a sealed
 // bin: its bucket's raw_sum and d_min).
@@ -154,33 +211,41 @@ inline std::vector<BucketRow> rows_of(const std::vector<WinEntry>& entries) {
     return out;
 }
 
-// The rows of a set of bins: open entries after shares and sealed bucket rows,
-// aggregated by (miner, owner); W = their raw work.
-inline std::vector<BucketRow> rows_of_bins(const std::vector<WinBin>& bins, Work& W) {
+// The rows of a set of units, aggregated by (miner, owner); W = the sum of their
+// weights. OPEN: the shares of each entry's RAW work, each part << shift, and the
+// entry's weight raw << shift; WHOLE-BUCKET: the bucket's rows << shift, weight
+// raw_sum << shift; RING-ROWS: the unit's rows << shift, each row weighing the sum
+// of its parts << shift.
+inline std::vector<BucketRow> rows_of_units(const std::vector<WinUnit>& units, Work& W) {
     std::map<std::pair<Hash32, Hash32>, BucketRow> by;
     W = Work{};
-    for (const WinBin& b : bins) {
-        if (b.sealed != nullptr) {
-            for (const BucketRow& r : b.sealed->rows) {
-                auto& row = by[{r.miner, r.owner}];
-                row.miner = r.miner;
-                row.owner = r.owner;
-                row.w_miner += r.w_miner;
-                row.w_owner += r.w_owner;
-                row.w_author += r.w_author;
-            }
-            W += b.sealed->raw_sum;
+    auto add_row = [&](const BucketRow& r, std::uint8_t shift) {
+        auto& row = by[{r.miner, r.owner}];
+        row.miner = r.miner;
+        row.owner = r.owner;
+        row.w_miner += scaled(r.w_miner, shift);
+        row.w_owner += scaled(r.w_owner, shift);
+        row.w_author += scaled(r.w_author, shift);
+    };
+    for (const WinUnit& u : units) {
+        if (u.sealed != nullptr) {
+            for (const BucketRow& r : u.sealed->rows) add_row(r, u.shift);
+            W += scaled(u.sealed->raw_sum, u.shift);
             continue;
         }
-        for (const WinEntry& e : b.entries) {
+        for (const BucketRow& r : u.rows) {
+            add_row(r, u.shift);
+            W += scaled(r.w_miner + r.w_owner + r.w_author, u.shift);
+        }
+        for (const WinEntry& e : u.entries) {
             const Shares s = shares_of(e.work, e.p, e.give_author_bp);
             auto& row = by[{e.miner, e.owner}];
             row.miner = e.miner;
             row.owner = e.owner;
-            row.w_miner += Work(s.w_miner);
-            row.w_owner += Work(s.w_owner);
-            row.w_author += Work(s.w_author);
-            W += Work(e.work);
+            row.w_miner += scaled(Work(s.w_miner), u.shift);
+            row.w_owner += scaled(Work(s.w_owner), u.shift);
+            row.w_author += scaled(Work(s.w_author), u.shift);
+            W += scaled(Work(e.work), u.shift);
         }
     }
     std::vector<BucketRow> out;
@@ -244,20 +309,20 @@ inline Window resolve_rows(std::vector<BucketRow> rows, const Work& W, std::uint
     return w;
 }
 
-// Shares + merge-back over a set of window bins.
-inline Window resolve_bins(const std::vector<WinBin>& bins, std::uint64_t B, std::uint64_t f_spend,
-                           const Hash32& author) {
+// Shares + merge-back over a set of window units.
+inline Window resolve_units(const std::vector<WinUnit>& units, std::uint64_t B, std::uint64_t f_spend,
+                            const Hash32& author) {
     Work W;
-    std::vector<BucketRow> rows = rows_of_bins(bins, W);
+    std::vector<BucketRow> rows = rows_of_units(units, W);
     return resolve_rows(std::move(rows), W, B, f_spend, author);
 }
 
 // Shares + merge-back over a set of live entries.
 inline Window resolve(const std::vector<WinEntry>& entries, std::uint64_t B, std::uint64_t f_spend,
                       const Hash32& author) {
-    std::vector<WinBin> one(1);
+    std::vector<WinUnit> one(1);
     one.front().entries = entries;
-    return resolve_bins(one, B, f_spend, author);
+    return resolve_units(one, B, f_spend, author);
 }
 
 // Distinct identity count the N rule bounds (the window payees).
@@ -282,12 +347,15 @@ public:
         if (!(r.owner == kZeroHash) && !r.w_owner.is_zero()) ids_.insert(r.owner);
         if (have_author_ && !r.w_author.is_zero()) ids_.insert(author_);
     }
-    void add_bin(const WinBin& b) {
-        if (b.sealed != nullptr) {
-            for (const BucketRow& r : b.sealed->rows) add_row(r);
+    // A whole unit: WHOLE-BUCKET, the bucket's rows; RING-ROWS, the unit's own rows;
+    // OPEN, its entries.
+    void add_unit(const WinUnit& u) {
+        if (u.sealed != nullptr) {
+            for (const BucketRow& r : u.sealed->rows) add_row(r);
             return;
         }
-        for (const WinEntry& e : b.entries) add_entry(e);
+        for (const BucketRow& r : u.rows) add_row(r);
+        for (const WinEntry& e : u.entries) add_entry(e);
     }
     std::size_t count() const noexcept { return ids_.size(); }
 
@@ -311,23 +379,89 @@ inline void sort_newest_first(std::vector<WinEntry>& e) {
     });
 }
 
-// W_max over a prefix: W x f_spend <= B x d_min.
-inline bool within_w_max(const Work& W, std::uint64_t d_min, std::uint64_t B, std::uint64_t f_spend) {
-    return !(wide::mul_u64_u64(B, d_min) < wide::mul_u256_u64(W, f_spend));
+// W_max over a prefix: W x f_spend <= B x d_min, both sides U320.
+inline bool within_w_max(const Work& W, const Work& d_min, std::uint64_t B, std::uint64_t f_spend) {
+    return !(wide::mul_u256_u64(d_min, B) < wide::mul_u256_u64(W, f_spend));
+}
+
+// The atoms of an OPEN unit (its entries) or a RING-ROWS unit (its rows); a
+// WHOLE-BUCKET unit has none. An atom's weight is also its datum: OPEN,
+// work << shift; RING-ROWS, (w_miner + w_owner + w_author) << shift.
+inline std::size_t atom_count(const WinUnit& u) { return u.sealed != nullptr ? 0 : u.entries.size() + u.rows.size(); }
+
+inline Work atom_weight(const WinUnit& u, std::size_t i) {
+    if (!u.rows.empty()) {
+        const BucketRow& r = u.rows[i];
+        return scaled(r.w_miner + r.w_owner + r.w_author, u.shift);
+    }
+    return scaled(Work(u.entries[i].work), u.shift);
+}
+
+inline void count_atom(PayeeCount& c, const WinUnit& u, std::size_t i) {
+    if (!u.rows.empty())
+        c.add_row(u.rows[i]);
+    else
+        c.add_entry(u.entries[i]);
+}
+
+inline void keep_atoms(WinUnit& u, std::size_t keep) {
+    if (!u.rows.empty())
+        u.rows.resize(keep);
+    else
+        u.entries.resize(keep);
+}
+
+// A depth-0 unit of a listed or stored bin: OPEN or WHOLE-BUCKET, shift 0, ring
+// {0, 0}; raw and d_min_bin as bin_stats returns them.
+inline WinUnit unit_of(WinBin b) {
+    WinUnit u;
+    u.bin = b.bin;
+    u.sealed = b.sealed;
+    bin_stats(b, u.raw, u.d_min_bin);
+    u.entries = std::move(b.entries);
+    return u;
+}
+
+// The listed bin of a depth-0 unit.
+inline WinBin bin_of(WinUnit u) {
+    WinBin b;
+    b.bin = u.bin;
+    b.entries = std::move(u.entries);
+    b.sealed = u.sealed;
+    return b;
 }
 
 }  // namespace detail_win
 
+inline void WinUnit::order_atoms() {
+    if (sealed == nullptr && rows.empty()) detail_win::sort_newest_first(entries);
+}
+
 // ---------------------------------------------------------------------------
-// The bins of a window are read newest first from a source: a Bin, the End of
+// The units of a window are read from a source: peek() gives the source's clock
+// (or End) and reads no cell; pull() gives a unit (PullKind::Bin), the End of
 // the lane, or a bin the source does not hold (its bucket, or the placements of
-// an open bin). A window is never evaluated over a partial bin list.
+// an open bin). A window is never evaluated over a partial unit list. An empty
+// cell is a unit with no entry and no row.
 // ---------------------------------------------------------------------------
 enum class PullKind : std::uint8_t { Bin, End, MissingBucket, MissingEntries };
 
 struct BinPull {
     PullKind kind = PullKind::End;
     WinBin bin;
+    std::uint64_t missing_bin = 0;
+};
+
+enum class PeekKind : std::uint8_t { Clock, End };
+
+struct ClockPeek {
+    PeekKind kind = PeekKind::End;
+    Work clock{};
+};
+
+struct UnitPull {
+    PullKind kind = PullKind::End;
+    WinUnit unit;
     std::uint64_t missing_bin = 0;
 };
 
@@ -341,80 +475,97 @@ enum class WinStatus : std::uint8_t {
 struct WinSelect {
     WinStatus status = WinStatus::Ok;
     std::uint64_t missing_bin = 0;
-    std::vector<WinBin> bins;  // selected, newest first
-    std::uint64_t read = 0;    // bins read from the source
+    std::vector<WinUnit> units;  // selected, in the source's order
+    std::uint64_t read = 0;      // units pulled from the source
+    Work W1{};                   // the window's W after step 1
 };
 
-// step 1 of window(): select whole bins back to COVERAGE x D_net, never past
-// W_max per entry ((W + w_b) x f_spend <= B x min(d_min, d_min(b))), no decay.
-// The newest non-empty bin failing W_max on its own is cut by carrier position
-// while W_kept x f_spend <= B x d_min(kept) (R-12). pull() yields the next bin.
-template <class Pull>
-inline WinSelect select_window_bins_from(Pull&& pull, DNet D_net, std::uint64_t B, std::uint64_t f_spend) {
+// step 1 of window(): take whole units while the peeked clock is below COVERAGE
+// x D_net, never past W_max per entry ((W + w) x f_spend <= B x min(d_min,
+// delta)), no decay. A first non-empty unit failing W_max on its own: a
+// WHOLE-BUCKET unit -> SealedCut; an OPEN or RING-ROWS unit is cut over its atoms
+// while W_kept x f_spend <= B x d_min(kept) (R-12).
+template <class Source>
+inline WinSelect select_window_bins_from(Source&& src, DNet D_net, std::uint64_t B, std::uint64_t f_spend) {
     Work coverage_target;
     const Work d_net = Work::from_u128(D_net);
     for (std::uint64_t i = 0; i < kCoverage; ++i) coverage_target += d_net;
     WinSelect out;
-    Work cum;              // running raw work == running W
-    std::uint64_t d_min_g = 0;
+    Work W;                // the taken units' weights
+    Work d_min_g;          // the smallest datum of the taken units
     bool have_dmin = false;
     for (;;) {
-        if (!(cum < coverage_target)) break;  // reached coverage
-        BinPull p = pull();
+        const ClockPeek pk = src.peek();
+        if (pk.kind == PeekKind::End) break;
+        if (!(pk.clock < coverage_target)) break;  // reached coverage
+        UnitPull p = src.pull();
         if (p.kind == PullKind::End) break;
         ++out.read;
         if (p.kind == PullKind::MissingBucket || p.kind == PullKind::MissingEntries) {
             out.status = p.kind == PullKind::MissingBucket ? WinStatus::MissingBucket : WinStatus::MissingEntries;
             out.missing_bin = p.missing_bin;
-            out.bins.clear();
+            out.units.clear();
             return out;
         }
-        WinBin& b = p.bin;
-        if (detail_win::bin_empty(b)) continue;
-        Work bin_raw;
-        std::uint64_t bin_dmin = 0;
-        detail_win::bin_stats(b, bin_raw, bin_dmin);
-        const Work W_new = cum + bin_raw;
-        const std::uint64_t dmin_new = have_dmin ? std::min(d_min_g, bin_dmin) : bin_dmin;
-        // W_max per entry: (W + w_b) x f_spend <= B x min(d_min, d_min(b)).
+        WinUnit& u = p.unit;
+        if (detail_win::unit_empty(u)) continue;
+        const Work w = detail_win::scaled(u.raw, u.shift);
+        const Work delta = detail_win::scaled(Work(u.d_min_bin), u.shift);
+        const Work W_new = W + w;
+        const Work dmin_new = have_dmin ? std::min(d_min_g, delta) : delta;
+        // W_max per entry: (W + w) x f_spend <= B x min(d_min, delta).
         if (!detail_win::within_w_max(W_new, dmin_new, B, f_spend)) {
-            if (out.bins.empty()) {  // the newest bin alone fails W_max: cut it (R-12)
-                if (b.sealed != nullptr) {
+            if (out.units.empty()) {  // the first unit alone fails W_max
+                if (u.sealed != nullptr) {
                     out.status = WinStatus::SealedCut;
-                    out.missing_bin = b.bin;
+                    out.missing_bin = u.bin;
                     return out;
                 }
-                std::vector<WinEntry>& e = b.entries;
-                detail_win::sort_newest_first(e);
-                Work W;
-                std::uint64_t d = 0;
+                u.order_atoms();  // cut over the atoms (R-12)
+                Work Wk;
+                Work d;
                 std::size_t keep = 0;
-                for (std::size_t i = 0; i < e.size(); ++i) {
-                    W += Work(e[i].work);
-                    d = i == 0 ? e[i].work : std::min(d, e[i].work);
-                    if (!detail_win::within_w_max(W, d, B, f_spend)) break;  // monotone in the prefix
+                const std::size_t n = detail_win::atom_count(u);
+                for (std::size_t i = 0; i < n; ++i) {
+                    const Work a = detail_win::atom_weight(u, i);
+                    Wk += a;
+                    d = i == 0 ? a : std::min(d, a);
+                    if (!detail_win::within_w_max(Wk, d, B, f_spend)) break;  // monotone in the prefix
                     keep = i + 1;
+                    W = Wk;
                 }
-                e.resize(keep);
-                if (keep > 0) out.bins.push_back(std::move(b));
+                detail_win::keep_atoms(u, keep);
+                if (keep > 0) out.units.push_back(std::move(u));
             }
             break;
         }
-        out.bins.push_back(std::move(b));
-        cum = W_new;
+        out.units.push_back(std::move(u));
+        W = W_new;
         d_min_g = dmin_new;
         have_dmin = true;
     }
+    out.W1 = W;
     return out;
 }
 
-// A source over bins already listed newest first.
+// A depth-0 source over bins already listed newest first: OPEN and WHOLE-BUCKET
+// units; its clock is the raw work of the non-empty units pulled.
 struct ListedBins {
     const std::vector<WinBin>& bins;
     std::size_t next = 0;
-    BinPull operator()() {
-        if (next == bins.size()) return BinPull{};
-        return BinPull{PullKind::Bin, bins[next++], 0};
+    Work clock{};
+
+    ClockPeek peek() const {
+        if (next == bins.size()) return ClockPeek{};
+        return ClockPeek{PeekKind::Clock, clock};
+    }
+    UnitPull pull() {
+        if (next == bins.size()) return UnitPull{};
+        UnitPull p;
+        p.kind = PullKind::Bin;
+        p.unit = detail_win::unit_of(bins[next++]);
+        if (!detail_win::unit_empty(p.unit)) clock += p.unit.raw;
+        return p;
     }
 };
 
@@ -423,7 +574,10 @@ struct ListedBins {
 inline std::vector<WinBin> select_window_bins(const std::vector<WinBin>& bins_newest_first, DNet D_net,
                                               std::uint64_t B, std::uint64_t f_spend) {
     WinSelect s = select_window_bins_from(ListedBins{bins_newest_first}, D_net, B, f_spend);
-    return std::move(s.bins);
+    std::vector<WinBin> out;
+    out.reserve(s.units.size());
+    for (WinUnit& u : s.units) out.push_back(detail_win::bin_of(std::move(u)));
+    return out;
 }
 
 // A window evaluated from a source, or the bin that stopped it.
@@ -431,44 +585,49 @@ struct WinEval {
     WinStatus status = WinStatus::Ok;
     std::uint64_t missing_bin = 0;
     Window window;
-    std::uint64_t read = 0;        // bins read from the source
-    std::uint64_t oldest_bin = 0;  // the oldest bin left in the window (0: none)
+    std::uint64_t read = 0;        // units read from the source
+    std::uint64_t oldest_bin = 0;  // the bin of the last unit left in the window (0: none)
     // output only (logs; never a digest, verdict, coinbase or wire value): the N rule dropped the oldest bins; the
     // newest bin was cut by carrier position
     bool n_dropped_bins = false;
     bool n_cut_position = false;
+    // output only (never a digest, verdict, coinbase or wire value): the smallest bin among the units left in the
+    // window (0: none); the window's W after step 1, before the N rule
+    std::uint64_t min_bin = 0;
+    Work W1{};
 };
 
 // window(source, D_net, B, f_spend, N, author): the whole payout window (D2.7
-// steps 0-6) over the bins the source yields newest first.
-template <class Pull>
-inline WinEval window_from(Pull&& pull, DNet D_net, std::uint64_t B, std::uint64_t f_spend, std::uint64_t N,
+// steps 0-6) over the units the source yields.
+template <class Source>
+inline WinEval window_from(Source&& src, DNet D_net, std::uint64_t B, std::uint64_t f_spend, std::uint64_t N,
                            const Hash32& author) {
     WinEval out;
-    // --- step 1: select whole bins back to COVERAGE x D_net, never past W_max ---
-    WinSelect s = select_window_bins_from(std::forward<Pull>(pull), D_net, B, f_spend);
+    // --- step 1: select whole units back to COVERAGE x D_net, never past W_max ---
+    WinSelect s = select_window_bins_from(std::forward<Source>(src), D_net, B, f_spend);
     out.read = s.read;
+    out.W1 = s.W1;
     if (s.status != WinStatus::Ok) {
         out.status = s.status;
         out.missing_bin = s.missing_bin;
         return out;
     }
-    std::vector<WinBin>& sel = s.bins;
+    std::vector<WinUnit>& sel = s.units;
 
-    // --- steps 3-4: N rule. Drop the OLDEST bin while the payees (R-13) exceed
-    // N: keep the longest newest prefix whose count stays <= N (the count is
-    // monotone); the newest bin alone over N -> cut it by carrier position
-    // (newest first, then id ascending), keeping the longest prefix within N. ---
+    // --- steps 3-4: N rule. Drop the OLDEST unit while the payees (R-13) exceed
+    // N: keep the longest prefix whose count stays <= N (the count is monotone);
+    // the first unit alone over N: a WHOLE-BUCKET unit -> SealedCut; an OPEN or
+    // RING-ROWS unit is cut over its atoms, keeping the longest prefix within N. ---
     if (N >= 1 && !sel.empty()) {
         detail_win::PayeeCount pc(author);
         std::size_t k = 0;
         for (; k < sel.size(); ++k) {
-            pc.add_bin(sel[k]);
+            pc.add_unit(sel[k]);
             if (pc.count() > N) break;
         }
         if (k >= 1) {
             if (k < sel.size()) out.n_dropped_bins = true;
-            sel.resize(k);  // the oldest bins leave the window
+            sel.resize(k);  // the oldest units leave the window
         } else {
             if (sel.size() > 1) out.n_dropped_bins = true;
             sel.resize(1);
@@ -477,23 +636,26 @@ inline WinEval window_from(Pull&& pull, DNet D_net, std::uint64_t B, std::uint64
                 out.missing_bin = sel.front().bin;
                 return out;
             }
-            std::vector<WinEntry>& e = sel.front().entries;
-            detail_win::sort_newest_first(e);
+            WinUnit& u = sel.front();
+            u.order_atoms();
             detail_win::PayeeCount cut(author);
             std::size_t keep = 0;
-            for (std::size_t i = 0; i < e.size(); ++i) {
-                cut.add_entry(e[i]);
+            const std::size_t n = detail_win::atom_count(u);
+            for (std::size_t i = 0; i < n; ++i) {
+                detail_win::count_atom(cut, u, i);
                 if (cut.count() > N) break;  // monotone: once over N, no later prefix fits
                 keep = i + 1;
             }
-            if (keep < e.size()) out.n_cut_position = true;
-            e.resize(keep);
+            if (keep < n) out.n_cut_position = true;
+            detail_win::keep_atoms(u, keep);
         }
     }
 
-    // --- step 5: shares + merge-back over the surviving bins. ---
+    // --- step 5: shares + merge-back over the surviving units. ---
     out.oldest_bin = sel.empty() ? 0 : sel.back().bin;
-    out.window = detail_win::resolve_bins(sel, B, f_spend, author);
+    for (const WinUnit& u : sel)
+        if (out.min_bin == 0 || u.bin < out.min_bin) out.min_bin = u.bin;
+    out.window = detail_win::resolve_units(sel, B, f_spend, author);
     if (out.window.weight.empty()) out.window.empty_finder_only = true;
     return out;
 }

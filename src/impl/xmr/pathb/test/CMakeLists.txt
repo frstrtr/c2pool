@@ -68,6 +68,13 @@
 #   v37_xmr_pathb_hello_kat          rules block TLV golden, trailer codec; the Path B
 #                                    tail (S3b-3), forbidden-literal scan
 #
+# Roundabouts slice C-1 (pathb_window.hpp, pathb_window_chain.hpp: the window over units):
+#   v37_xmr_ring_window_kat          WIN over a hand-built unit source: one vector per place (1)-(9), V1
+#   v37_xmr_ring_gate_off_kat        depth 0: min_bin / W1 on every golden vector, the lazy read, Fresh
+#                                    bins, V2, a whole sealed bin, one implementation
+#   v37_xmr_ring_c1_golden           v37_xmr_ring_c1_golden_gen reproduces golden/ring_c1_window.golden
+#   v37_xmr_ring_node_golden         v37_xmr_ring_node_golden_gen reproduces golden/ring_node.golden
+#
 # Slice S3b-3 KAT (pathb_bucket_wire.hpp; unwired):
 #   v37_xmr_pathb_bucket_wire_kat    FC_GETBUCKETS / FC_BUCKETS codec, verifier, paging,
 #                                    serving rule, per-peer budget
@@ -150,7 +157,9 @@ if (BUILD_TESTING)
             v37_xmr_relay_family_c_kat
             v37_xmr_pathb_store_kat
             v37_xmr_pathb_node_kat
-            v37_xmr_pathb_node_join_kat)
+            v37_xmr_pathb_node_join_kat
+            v37_xmr_ring_window_kat
+            v37_xmr_ring_gate_off_kat)
         add_executable(${_pathb_kat} ${_pathb_kat}.cpp)
         target_include_directories(${_pathb_kat} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
         target_link_libraries(${_pathb_kat} PRIVATE xmr_pathb)
@@ -168,6 +177,9 @@ if (BUILD_TESTING)
     target_compile_definitions(xmr_carrier_timestamp_kat PRIVATE
             PATHB_SRC_DIR="${CMAKE_CURRENT_SOURCE_DIR}/..")
     target_compile_definitions(v37_xmr_pathb_hello_kat PRIVATE
+            PATHB_SRC_DIR="${CMAKE_CURRENT_SOURCE_DIR}/..")
+    # v37_xmr_ring_gate_off_kat scans the Path B headers for a second copy of the window's steps.
+    target_compile_definitions(v37_xmr_ring_gate_off_kat PRIVATE
             PATHB_SRC_DIR="${CMAKE_CURRENT_SOURCE_DIR}/..")
     # v37_xmr_pathb_store_kat also runs its store through the LevelDB archive.
     target_link_libraries(v37_xmr_pathb_store_kat PRIVATE xmr_pathb_store)
@@ -220,4 +232,28 @@ if (BUILD_TESTING)
     target_link_libraries(v37_xmr_pathb_node_kat PRIVATE xmr_node Threads::Threads)
     # v37_xmr_pathb_node_join_kat drives a restarted joined node through the relay node as well.
     target_link_libraries(v37_xmr_pathb_node_join_kat PRIVATE Threads::Threads)
+    # v37_xmr_ring_c1_golden_gen / v37_xmr_ring_node_golden_gen: the K = 1 window and node goldens
+    # (test-only generators; the sha256 of their sources is compiled into each golden's header).
+    file(SHA256 ${CMAKE_CURRENT_SOURCE_DIR}/v37_xmr_ring_c1_golden_gen.cpp _ring_c1_gen_sha)
+    file(SHA256 ${CMAKE_CURRENT_SOURCE_DIR}/v37_xmr_ring_c1_vectors.hpp _ring_c1_vec_sha)
+    file(SHA256 ${CMAKE_CURRENT_SOURCE_DIR}/v37_xmr_ring_node_golden_gen.cpp _ring_node_gen_sha)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+            ${CMAKE_CURRENT_SOURCE_DIR}/v37_xmr_ring_c1_golden_gen.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/v37_xmr_ring_c1_vectors.hpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/v37_xmr_ring_node_golden_gen.cpp)
+    add_executable(v37_xmr_ring_c1_golden_gen v37_xmr_ring_c1_golden_gen.cpp)
+    target_include_directories(v37_xmr_ring_c1_golden_gen PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(v37_xmr_ring_c1_golden_gen PRIVATE xmr_pathb)
+    target_compile_definitions(v37_xmr_ring_c1_golden_gen PRIVATE
+            RING_C1_GEN_SHA256="${_ring_c1_gen_sha}" RING_C1_VEC_SHA256="${_ring_c1_vec_sha}")
+    add_executable(v37_xmr_ring_node_golden_gen v37_xmr_ring_node_golden_gen.cpp)
+    target_include_directories(v37_xmr_ring_node_golden_gen PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(v37_xmr_ring_node_golden_gen PRIVATE xmr_pathb xmr_node Threads::Threads)
+    target_compile_definitions(v37_xmr_ring_node_golden_gen PRIVATE
+            RING_NODE_GEN_SHA256="${_ring_node_gen_sha}" RING_C1_VEC_SHA256="${_ring_c1_vec_sha}")
+    # v37_xmr_ring_c1_golden / v37_xmr_ring_node_golden: each generator reproduces its golden byte for byte.
+    add_test(NAME v37_xmr_ring_c1_golden
+            COMMAND v37_xmr_ring_c1_golden_gen --check=${CMAKE_CURRENT_SOURCE_DIR}/golden/ring_c1_window.golden)
+    add_test(NAME v37_xmr_ring_node_golden
+            COMMAND v37_xmr_ring_node_golden_gen --check=${CMAKE_CURRENT_SOURCE_DIR}/golden/ring_node.golden)
 endif()
