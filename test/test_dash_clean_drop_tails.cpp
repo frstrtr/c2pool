@@ -524,3 +524,34 @@ TEST(DashCleanDropTails, OutOfOrderArrivalSequenceIdentityCachedAndUncached)
     }
     EXPECT_FALSE(dash::drop_tails_height_cache_disabled().load());
 }
+
+// The cap clean_tracker uses follows the cache: 512 while the head-height cache
+// is on, back to 32 once the safety net has switched it off (an uncached pass
+// under 512 would be a multi-second exclusive hold on a slow host).
+TEST(DashCleanDropTails, EffectiveCapFollowsHeightCacheState)
+{
+    ASSERT_FALSE(dash::drop_tails_height_cache_disabled().load());
+    EXPECT_EQ(dash::clean_drop_tails_effective_cap(), dash::kCleanDropTailsMaxPerPassCached);
+    EXPECT_EQ(dash::kCleanDropTailsMaxPerPassCached, 512);
+
+    // cache on: one pass of the recorded 800-shape drops at most 512
+    {
+        dash::ShareTracker t; Incident inc; inc.build(t, 60, 800);
+        const auto r = dash::drop_tails(t, 60, dash::clean_drop_tails_effective_cap(), no_exempt);
+        EXPECT_EQ(r.dropped, 512);
+        EXPECT_TRUE(r.capped);
+    }
+    // cache forced off (as after a cache_mismatch): the effective cap is 32
+    dash::drop_tails_height_cache_disabled().store(true);
+    EXPECT_EQ(dash::clean_drop_tails_effective_cap(), dash::kCleanDropTailsMaxPerPass);
+    EXPECT_EQ(dash::kCleanDropTailsMaxPerPass, 32);
+    {
+        dash::ShareTracker t; Incident inc; inc.build(t, 60, 800);
+        const auto r = dash::drop_tails(t, 60, dash::clean_drop_tails_effective_cap(), no_exempt);
+        EXPECT_EQ(r.dropped, 32);
+        EXPECT_TRUE(r.capped);
+        EXPECT_FALSE(r.cache_mismatch);   // the uncached path does no cache check
+    }
+    dash::drop_tails_height_cache_disabled().store(false);
+    EXPECT_EQ(dash::clean_drop_tails_effective_cap(), 512);
+}

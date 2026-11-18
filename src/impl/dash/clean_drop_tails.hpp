@@ -54,6 +54,22 @@ inline std::atomic<bool>& drop_tails_height_cache_disabled() {
     return off;
 }
 
+/// Per-pass cap while the head-height cache is active: a removal then costs
+/// microseconds (191 bench: 813 shares in ~1.4 ms at real CHAIN_LENGTH), so
+/// the cap bounds only remove() and its watchers, and a larger cap shortens the
+/// backlog window (drain pauses, a lingering tree's work, supersede-key churn).
+inline constexpr int kCleanDropTailsMaxPerPassCached = 512;
+
+/// The cap clean_tracker uses: 512 while the cache is on; back to
+/// kCleanDropTailsMaxPerPass (32) once the safety net has switched the cache
+/// off — the uncached path costs milliseconds per share (5-11 ms measured on
+/// VM504), and 512 of those would be a multi-second exclusive hold.
+inline int clean_drop_tails_effective_cap() {
+    return drop_tails_height_cache_disabled().load(std::memory_order_relaxed)
+        ? kCleanDropTailsMaxPerPass
+        : kCleanDropTailsMaxPerPassCached;
+}
+
 /// `exempt_tail(tail_hash)` -> true keeps that tail's children this pass (the
 /// restart-reorg challenger segment). `removed_out`, when given, receives the
 /// removed hashes in removal order (tests).
