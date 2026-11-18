@@ -51,6 +51,19 @@
 //      windowed DOA rate the miner page shows leaves them out; a genuinely
 //      expired job of this connection still counts. The window rolls off.
 //
+//   8. ZOMBIE SESSIONS ON LTC — the LTC node's StratumConfig
+//      (ltc::default_stratum_config, what main_ltc.cpp starts from) turns on
+//      the BTC/DASH protections; under it a connection that never authorizes
+//      is dropped at the deadline, an unauthorized session silent past the
+//      idle timeout is reaped while a quiet authorized rig stays, and at the
+//      miner cap such a zombie is closed at once so a new miner is admitted.
+//      The deadlines are cut to test size where they are on and left off
+//      where they are off. Plus the per-source-IP cap
+//      (max_stratum_connections_per_ip, default 0 = unlimited), and the
+//      rate limit on the refusal WARN lines (refusal_log_interval_sec), the
+//      TCP liveness options on an accepted socket (TCP_USER_TIMEOUT), and the
+//      per-IP key (an IPv6 address counts by its /64).
+//
 // WIRE SAFETY / BYTE-PARITY: everything here is admission/eviction/memory
 // only — no notify param, coinbase (coinb1‖en1‖en2‖coinb2), or share byte
 // changes. The notify/coinbase/share BYTE-PARITY KAT is NOT this file: for
@@ -73,16 +86,24 @@
 #include <core/stratum_work_source.hpp>
 #include <core/uint256.hpp>
 #include <core/web_server.hpp>   // MiningInterface: worker registry + /miner_stats
+#include <impl/ltc/stratum_defaults.hpp>   // the LTC node's StratumConfig (main_ltc.cpp)
 
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <future>
+#include <iostream>
 #include <memory>
 #include <optional>
 #include <string>
 #include <thread>
 #include <vector>
+
+#ifdef __linux__
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/socket.h>
+#endif
 
 namespace asio = boost::asio;
 using tcp = asio::ip::tcp;
@@ -278,6 +299,21 @@ public:
     {
         boost::system::error_code ec;
         sock_.connect(tcp::endpoint(asio::ip::make_address("127.0.0.1"), port), ec);
+        return !ec;
+    }
+
+    // Connect from a given loopback source address (127.0.0.2 is another
+    // client address on Linux). false when the address cannot be bound.
+    bool connect_from(uint16_t port, const char* source)
+    {
+        boost::system::error_code ec;
+        sock_.open(tcp::v4(), ec);
+        if (!ec) sock_.bind(tcp::endpoint(asio::ip::make_address(source), 0), ec);
+        if (!ec) sock_.connect(tcp::endpoint(asio::ip::make_address("127.0.0.1"), port), ec);
+        if (ec) {
+            boost::system::error_code ignore;
+            sock_.close(ignore);
+        }
         return !ec;
     }
 
@@ -1005,4 +1041,319 @@ TEST(StratumInterimHardening, DrainHooksRefuseAndDropExactly)
     Client c4;
     ASSERT_TRUE(c4.connect(h.port));
     EXPECT_TRUE(c4.subscribe()) << "accepting=true must restore the accept path";
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Zombie sessions on LTC (+ merged DOGE). Field: an LTC node held 100/100
+// stratum slots and refused every real miner (refused_total=264674) because
+// LTC left every StratumConfig zombie protection off: a half-open NAT-dead
+// socket or a connection that never authorizes kept its slot forever.
+// ════════════════════════════════════════════════════════════════════════════
+namespace {
+
+// The LTC node's compiled StratumConfig with each deadline that is ON cut to a
+// test-sized value; a deadline that is OFF stays off. So these KATs see the
+// node LTC actually runs: where LTC leaves a protection off, they see it off.
+core::stratum::StratumConfig ltc_config_short(uint32_t handshake_s, uint32_t idle_s,
+                                              uint32_t keepalive_notify_s)
+{
+    auto c = ltc::default_stratum_config();
+    if (c.handshake_timeout_sec) c.handshake_timeout_sec = handshake_s;
+    if (c.session_idle_timeout_sec) c.session_idle_timeout_sec = idle_s;
+    if (c.keepalive_notify_sec) c.keepalive_notify_sec = keepalive_notify_s;
+    return c;
+}
+
+double seconds_since(std::chrono::steady_clock::time_point t0)
+{
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+}
+
+// The session behind c is still open and served: read what is already
+// buffered (a closed socket shows here, after its buffered lines), then one
+// more notify must arrive after a notify_all.
+bool still_served(ServerHarness& h, Client& c)
+{
+    for (int i = 0; i < 200 && c.read_line(300ms); ++i) {}
+    if (c.was_closed_by_peer()) return false;
+    const size_t had = c.jobs.size();
+    h.notify_storm(1);
+    return c.collect_notifies(had + 1, 5000ms) && !c.was_closed_by_peer();
+}
+
+}  // namespace
+
+// The config main_ltc.cpp starts from (before CLI/YAML) has the BTC/DASH
+// protections on, with the BTC/DASH values; the per-IP cap stays opt-in.
+TEST(LtcStratumZombie, DefaultsTurnTheProtectionsOn)
+{
+    const auto c = ltc::default_stratum_config();
+    EXPECT_EQ(c.coin_symbol, "LTC");
+    EXPECT_TRUE(c.tcp_keepalive_enabled);
+    EXPECT_EQ(c.tcp_keepalive_idle_sec, 60u);
+    EXPECT_EQ(c.tcp_keepalive_interval_sec, 10u);
+    EXPECT_EQ(c.tcp_keepalive_count, 3u);
+    EXPECT_EQ(c.handshake_timeout_sec, 30u);
+    EXPECT_EQ(c.session_idle_timeout_sec, 1800u);
+    EXPECT_EQ(c.max_write_queue_depth, 256u);
+    EXPECT_EQ(c.keepalive_notify_sec, 25u);
+    EXPECT_EQ(c.max_stratum_connections, 100u);
+    EXPECT_EQ(c.max_stratum_connections_per_ip, 0u);
+}
+
+// A connection that never authorizes -- a bare TCP probe, or one that
+// subscribes and stops -- is closed at the authorize deadline. A miner that
+// authorizes is kept past it.
+TEST(LtcStratumZombie, NeverAuthorizingConnectionIsDroppedAtTheDeadline)
+{
+    ServerHarness h;
+    h.ws->cfg = ltc_config_short(/*handshake*/ 1, /*idle*/ 1800, /*keepalive notify*/ 25);
+    ASSERT_TRUE(h.start());
+
+    Client miner;
+    ASSERT_TRUE(miner.connect(h.port));
+    ASSERT_TRUE(miner.subscribe());
+    ASSERT_TRUE(miner.authorize("ltcminer1"));
+
+    const auto t0 = std::chrono::steady_clock::now();
+    Client probe;                       // connects, sends nothing
+    ASSERT_TRUE(probe.connect(h.port));
+    Client subscriber;                  // subscribes, never authorizes
+    ASSERT_TRUE(subscriber.connect(h.port));
+    ASSERT_TRUE(subscriber.subscribe());
+
+    EXPECT_TRUE(probe.wait_closed(6000ms)) << "a bare probe must not keep its slot";
+    EXPECT_TRUE(subscriber.wait_closed(6000ms)) << "a never-authorizing session must not keep its slot";
+    EXPECT_GE(seconds_since(t0), 0.9) << "closed at the deadline, not on accept";
+
+    // The authorized miner is past the deadline too and still served.
+    EXPECT_TRUE(still_served(h, miner)) << "authorize must disarm the deadline";
+}
+
+// The idle reaper counts INBOUND lines only. An unauthorized session that
+// sends nothing is reaped although the node keeps sending it keepalive
+// notifies; an unauthorized session that keeps talking is kept; an authorized
+// rig that sends nothing (a low hashrate on a high fixed difficulty) is kept,
+// because TCP keepalive -- on for LTC -- vouches for its socket.
+TEST(LtcStratumZombie, IdleReaperReapsInboundSilenceButKeepsAQuietRig)
+{
+    ServerHarness h;
+    // No authorize deadline here, so only the reaper can close a session. The
+    // reaper sweeps every max(15 s, min(60 s, timeout / 2)): first sweep at 15 s.
+    h.ws->cfg = ltc_config_short(/*handshake*/ 0, /*idle*/ 2, /*keepalive notify*/ 1);
+    ASSERT_TRUE(h.start());
+
+    Client rig;          // authorized, then silent
+    ASSERT_TRUE(rig.connect(h.port));
+    ASSERT_TRUE(rig.subscribe());
+    ASSERT_TRUE(rig.authorize("ltcminer1"));
+    Client zombie;       // subscribed, then silent (receives keepalive notifies)
+    ASSERT_TRUE(zombie.connect(h.port));
+    ASSERT_TRUE(zombie.subscribe());
+    Client talker;       // subscribed, never authorizes, keeps sending lines
+    ASSERT_TRUE(talker.connect(h.port));
+    ASSERT_TRUE(talker.subscribe());
+
+    const auto t0 = std::chrono::steady_clock::now();
+    bool zombie_closed = false;
+    int zombie_notifies = 0;
+    int ping = 100;
+    while (!zombie_closed && seconds_since(t0) < 22.0) {
+        talker.send_json({{"id", ping++}, {"method", "mining.extranonce.subscribe"},
+                          {"params", json::array()}});
+        const auto line = zombie.read_line(400ms);
+        if (line && line->find("mining.notify") != std::string::npos)
+            ++zombie_notifies;
+        zombie_closed = zombie.was_closed_by_peer();
+    }
+    EXPECT_TRUE(zombie_closed) << "an unauthorized session silent past the idle timeout must be reaped";
+    EXPECT_GE(zombie_notifies, 3) << "the zombie was sent keepalive notifies meanwhile";
+
+    // The quiet rig and the talker were swept over too and are still served.
+    EXPECT_TRUE(still_served(h, rig)) << "a quiet authorized rig must not be reaped";
+    EXPECT_TRUE(still_served(h, talker)) << "inbound lines must keep a session";
+}
+
+// At the miner cap a zombie (here: unauthorized and silent past the idle
+// timeout, before the 15 s reaper sweep and the 30 s authorize deadline) is
+// closed the moment a new connection arrives, and the new miner is admitted.
+// A live quiet rig is not touched, and a fresh session is not a zombie.
+TEST(LtcStratumZombie, AtTheCapAZombieMakesRoomForANewMiner)
+{
+    ServerHarness h;
+    h.ws->cfg = ltc_config_short(/*handshake*/ 30, /*idle*/ 2, /*keepalive notify*/ 25);
+    h.ws->cfg.max_stratum_connections = 2;
+    ASSERT_TRUE(h.start());
+
+    Client rig;
+    ASSERT_TRUE(rig.connect(h.port));
+    ASSERT_TRUE(rig.subscribe());
+    ASSERT_TRUE(rig.authorize("ltcminer1"));
+    Client zombie;
+    ASSERT_TRUE(zombie.connect(h.port));
+    ASSERT_TRUE(zombie.subscribe());
+
+    // Not idle yet: the cap holds.
+    Client early;
+    ASSERT_TRUE(early.connect(h.port));
+    EXPECT_FALSE(early.subscribe());
+    EXPECT_TRUE(early.was_closed_by_peer()) << "a session inside its idle window is not a zombie";
+    EXPECT_EQ(h.on_io([&] { return h.server->get_refused_connections(); }), 1u);
+
+    std::this_thread::sleep_for(2600ms);   // the zombie is now idle past 2 s
+
+    Client miner;
+    ASSERT_TRUE(miner.connect(h.port));
+    EXPECT_TRUE(miner.subscribe()) << "at the cap a zombie must make room for a new miner";
+    EXPECT_TRUE(miner.authorize("ltcminer2"));
+    EXPECT_TRUE(zombie.wait_closed(3000ms)) << "the zombie was the one closed";
+    EXPECT_EQ(h.on_io([&] { return h.server->get_refused_connections(); }), 1u);
+
+    EXPECT_TRUE(still_served(h, rig)) << "a quiet authorized rig is not a zombie";
+
+    // Both slots now hold live miners: the next connection is refused.
+    Client late;
+    ASSERT_TRUE(late.connect(h.port));
+    EXPECT_FALSE(late.subscribe());
+    EXPECT_TRUE(late.was_closed_by_peer());
+    EXPECT_EQ(h.on_io([&] { return h.server->get_refused_connections(); }), 2u);
+}
+
+// max_stratum_connections_per_ip: 0 (the default) leaves one address
+// unlimited; N refuses that address's (N+1)th live session, counted apart
+// from the node cap, while another address is still admitted and a freed
+// slot admits the address again.
+TEST(StratumPerIpCap, OneAddressCannotTakeEverySlot)
+{
+    ServerHarness h;
+    ASSERT_TRUE(h.start());
+
+    std::vector<std::unique_ptr<Client>> same;
+    for (int i = 0; i < 3; ++i) {
+        auto c = std::make_unique<Client>();
+        ASSERT_TRUE(c->connect(h.port));
+        ASSERT_TRUE(c->subscribe()) << "default per-IP cap 0 = unlimited (connection " << i << ")";
+        same.push_back(std::move(c));
+    }
+
+    // The server reads the config on the io thread at each accept.
+    h.on_io([&] { h.ws->cfg.max_stratum_connections_per_ip = 3; return 0; });
+    Client fourth;
+    ASSERT_TRUE(fourth.connect(h.port));
+    EXPECT_FALSE(fourth.subscribe());
+    EXPECT_TRUE(fourth.was_closed_by_peer()) << "a 4th session from one address must be refused";
+    EXPECT_EQ(h.on_io([&] { return h.server->get_refused_per_ip(); }), 1u);
+    EXPECT_EQ(h.on_io([&] { return h.server->get_refused_connections(); }), 0u)
+        << "per-IP refusals are not node-cap refusals";
+
+    Client other;
+    if (other.connect_from(h.port, "127.0.0.2")) {
+        EXPECT_TRUE(other.subscribe()) << "another address is still admitted";
+    } else {
+        std::cout << "[ SKIPPED part ] 127.0.0.2 not bindable here: other-address admission not checked\n";
+    }
+
+    same.front().reset();                 // free one of this address's slots
+    std::this_thread::sleep_for(300ms);   // let the server see the close
+    Client again;
+    ASSERT_TRUE(again.connect(h.port));
+    EXPECT_TRUE(again.subscribe()) << "a freed slot admits the address again";
+    EXPECT_EQ(h.on_io([&] { return h.server->get_refused_per_ip(); }), 1u);
+}
+
+// Refusal WARN lines are rate-limited (StratumConfig::refusal_log_interval_sec,
+// core/stratum_refusal_log.hpp): a reconnect storm against a full node gets
+// its first refusal logged at once and the rest in one summary line when the
+// window ends, while the refusal counter still counts every one.
+TEST(StratumRefusalLog, CapStormCountsEveryRefusalButLogsTwoLines)
+{
+    ServerHarness h;
+    h.ws->cfg.max_stratum_connections = 1;
+    h.ws->cfg.refusal_log_interval_sec = 3;
+    ASSERT_TRUE(h.start());
+
+    Client miner;
+    ASSERT_TRUE(miner.connect(h.port));
+    ASSERT_TRUE(miner.subscribe());
+
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < 20; ++i) {
+        Client c;
+        ASSERT_TRUE(c.connect(h.port));
+        ASSERT_TRUE(c.wait_closed(3000ms)) << "connection " << i << " must be refused";
+    }
+    const double storm_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    EXPECT_EQ(h.on_io([&] { return h.server->get_refused_connections(); }), 20u)
+        << "every refusal is counted";
+    if (storm_s < 2.5) {   // the storm fit in one window (it takes milliseconds)
+        EXPECT_EQ(h.on_io([&] { return h.server->get_refusal_lines_logged(); }), 1u)
+            << "only the first refusal is logged at once";
+    }
+
+    // The summary of the other 19 is written when the window ends, with no
+    // further refusal to trigger it.
+    uint64_t lines = 0;
+    for (int i = 0; i < 60 && lines < 2; ++i) {
+        std::this_thread::sleep_for(100ms);
+        lines = h.on_io([&] { return h.server->get_refusal_lines_logged(); });
+    }
+    std::this_thread::sleep_for(500ms);
+    lines = h.on_io([&] { return h.server->get_refusal_lines_logged(); });
+    if (storm_s < 2.5)
+        EXPECT_EQ(lines, 2u) << "one summary line for the rest of the window";
+    EXPECT_LE(lines, 3u) << "20 refusals must not write 20 lines";
+    EXPECT_EQ(h.on_io([&] { return h.server->get_refused_connections(); }), 20u);
+}
+
+// TCP liveness on an accepted stratum socket (core::apply_stratum_tcp_liveness,
+// which StratumSession::start() runs). Linux sends no keepalive probe while
+// sent data is unacknowledged, and an authorized rig is fed a notify every
+// keepalive_notify_sec, so behind a dead NAT only TCP_USER_TIMEOUT ends such
+// a session in minutes rather than after tcp_retries2 (~15 min). The default
+// applies to every coin that turns keepalive on (BTC and DASH leave it as is).
+TEST(StratumTcpLiveness, KeepaliveSocketGetsProbeTimingAndUserTimeout)
+{
+    EXPECT_EQ(core::stratum::StratumConfig{}.tcp_user_timeout_sec, 120u);
+    EXPECT_EQ(ltc::default_stratum_config().tcp_user_timeout_sec, 120u);
+#ifndef __linux__
+    GTEST_SKIP() << "per-probe tuning and TCP_USER_TIMEOUT are Linux socket options";
+#else
+    asio::io_context io;
+    tcp::acceptor acc(io, tcp::endpoint(asio::ip::make_address("127.0.0.1"), 0));
+    tcp::socket client(io);
+    tcp::socket server(io);
+    client.connect(acc.local_endpoint());
+    acc.accept(server);
+    const auto get = [&](int level, int opt) {
+        int v = -1;
+        socklen_t len = sizeof v;
+        if (::getsockopt(server.native_handle(), level, opt, &v, &len) != 0) return -2;
+        return v;
+    };
+
+    core::apply_stratum_tcp_liveness(server, core::stratum::StratumConfig{});   // keepalive off (DGB, BCH)
+    EXPECT_EQ(get(SOL_SOCKET, SO_KEEPALIVE), 0) << "keepalive off: the socket is left alone";
+    EXPECT_EQ(get(IPPROTO_TCP, TCP_USER_TIMEOUT), 0);
+
+    core::apply_stratum_tcp_liveness(server, ltc::default_stratum_config());
+    EXPECT_NE(get(SOL_SOCKET, SO_KEEPALIVE), 0);
+    EXPECT_EQ(get(IPPROTO_TCP, TCP_KEEPIDLE), 60);
+    EXPECT_EQ(get(IPPROTO_TCP, TCP_KEEPINTVL), 10);
+    EXPECT_EQ(get(IPPROTO_TCP, TCP_KEEPCNT), 3);
+    EXPECT_EQ(get(IPPROTO_TCP, TCP_USER_TIMEOUT), 120000)
+        << "unacknowledged data (the keepalive notifies) must not keep a dead peer for tcp_retries2";
+#endif
+}
+
+// The per-IP cap counts an IPv6 address by its /64 (one host is handed a whole
+// /64 and could rotate through it), an IPv4-mapped address as its IPv4
+// address, and an IPv4 address as itself.
+TEST(StratumPerIpCap, Ipv6CountsByItsSlash64)
+{
+    const auto key = [](const char* a) { return core::per_ip_cap_key(asio::ip::make_address(a)); };
+    EXPECT_EQ(key("2001:db8:1:2::10"), key("2001:db8:1:2:aaaa:bbbb:cccc:dddd"));
+    EXPECT_NE(key("2001:db8:1:2::10"), key("2001:db8:1:3::10"));
+    EXPECT_EQ(key("::ffff:203.0.113.7"), key("203.0.113.7"));
+    EXPECT_NE(key("203.0.113.7"), key("203.0.113.8"));
+    EXPECT_EQ(key("203.0.113.7"), asio::ip::make_address("203.0.113.7"));
 }

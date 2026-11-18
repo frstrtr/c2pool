@@ -45,6 +45,7 @@
 #include <core/settings_cli.hpp>          // M0b control-plane wiring
 #include <core/config_endpoint.hpp>       // M1 control-plane READ-ONLY endpoints
 #include <impl/ltc/catalog_defaults.hpp>  // M0b L0 compiled defaults
+#include <impl/ltc/stratum_defaults.hpp>  // LTC StratumConfig before CLI/YAML (zombie protections)
 #include <core/log.hpp>
 #include <core/uint256.hpp>
 #include <core/web_server.hpp>
@@ -602,7 +603,10 @@ void print_help() {
     std::cout << "  --stratum-target-time N   Target seconds per pseudoshare (default: 3)\n";
     std::cout << "  --no-vardiff              Disable automatic difficulty adjustment\n";
     std::cout << "  --max-coinbase-outputs N  Max coinbase outputs per block (default: 4000, matches p2pool)\n";
-    std::cout << "  --max-stratum-connections N  Max concurrent miners on this node (default: 100, 0 = unlimited)\n\n";
+    std::cout << "  --max-stratum-connections N  Max concurrent miners on this node (default: 100, 0 = unlimited)\n";
+    std::cout << "  --max-stratum-connections-per-ip N  Max concurrent miners from one IP address, one /64 for IPv6\n";
+    std::cout << "                            (default: 0 = unlimited). Rigs behind one NAT share an address:\n";
+    std::cout << "                            set N to at least the most rigs behind any one address.\n\n";
 
     std::cout << "EMBEDDED NODE OPTIONS:\n";
     std::cout << "  --embedded-ltc            Use embedded LTC SPV node (no daemon needed)\n";
@@ -1017,17 +1021,11 @@ int main(int argc, char* argv[]) {
     // Redistribute mode for shares from unnamed/broken miners
     std::string redistribute_mode_str = "pplns";
 
-    // Stratum tuning (configurable via CLI or YAML)
-    core::StratumConfig stratum_config;  // defaults: min=0.0005, max=65536, target=3.0s, vardiff=true
-    stratum_config.coin_symbol = "LTC";  // runtime coin tag for coin-agnostic core log lines
-    // Idle keepalive-notify (cross-coin reuse of DASH's D9 mitigation): many
-    // ASIC/proxy clients drop a pool connection that receives no mining.notify
-    // within ~60 s (LTC/DOGE ~2.5 min block cadence gives long idle gaps at high
-    // fixed diff). 25 s is safely under any reasonable client watchdog and kept
-    // identical to the other coins for consistency. Re-notify the CURRENT job
-    // (non-clean, so no ASIC work reset and NO work-generation bump); this is
-    // transport/liveness only -- ZERO wire-byte and consensus change.
-    stratum_config.keepalive_notify_sec = 25;
+    // Stratum tuning (configurable via CLI or YAML). The compiled defaults --
+    // coin tag, idle keepalive-notify, and the zombie-session protections
+    // (TCP keepalive, authorize deadline, idle reaper, write backlog cap) --
+    // come from impl/ltc/stratum_defaults.hpp, which the KATs read too.
+    core::StratumConfig stratum_config = ltc::default_stratum_config();
 
     // Operational tuning (configurable via CLI or YAML)
     std::string log_file;                        // empty = default "debug.log"
@@ -1687,6 +1685,10 @@ int main(int argc, char* argv[]) {
             stratum_config.max_stratum_connections = static_cast<size_t>(std::stoul(argv[++i]));
             cli_explicit.insert("max_stratum_connections");
         }
+        else if (arg == "--max-stratum-connections-per-ip" && i + 1 < argc) {
+            stratum_config.max_stratum_connections_per_ip = static_cast<size_t>(std::stoul(argv[++i]));
+            cli_explicit.insert("max_stratum_connections_per_ip");
+        }
         // Operational tuning
         else if (arg == "--log-file" && i + 1 < argc) {
             log_file = argv[++i];
@@ -1954,6 +1956,8 @@ int main(int argc, char* argv[]) {
                 stratum_config.max_coinbase_outputs = cfg["max_coinbase_outputs"].as<size_t>();
             if (!cli_explicit.count("max_stratum_connections") && cfg["max_stratum_connections"])
                 stratum_config.max_stratum_connections = cfg["max_stratum_connections"].as<size_t>();
+            if (!cli_explicit.count("max_stratum_connections_per_ip") && cfg["max_stratum_connections_per_ip"])
+                stratum_config.max_stratum_connections_per_ip = cfg["max_stratum_connections_per_ip"].as<size_t>();
 
             // Operational tuning
             if (!cli_explicit.count("log_file") && cfg["log_file"])
@@ -3228,7 +3232,11 @@ int main(int argc, char* argv[]) {
                      << " target_time=" << stratum_config.target_time << "s"
                      << " vardiff=" << (stratum_config.vardiff_enabled ? "on" : "off")
                      << " max_cb_outputs=" << stratum_config.max_coinbase_outputs
-                     << " max_stratum_connections=" << stratum_config.max_stratum_connections;
+                     << " max_stratum_connections=" << stratum_config.max_stratum_connections
+                     << " per_ip=" << stratum_config.max_stratum_connections_per_ip
+                     << " keepalive=" << (stratum_config.tcp_keepalive_enabled ? "on" : "off")
+                     << " handshake_timeout=" << stratum_config.handshake_timeout_sec << "s"
+                     << " idle_timeout=" << stratum_config.session_idle_timeout_sec << "s";
             LOG_INFO << "Operational config: p2p_max_peers=" << p2p_max_peers
                      << " ban_duration=" << p2p_ban_duration << "s"
                      << " rss_limit=" << rss_limit_mb << "MB"

@@ -240,6 +240,9 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
     # difficulty, the rate history fed sample by sample). One KAT covers every
     # coin: the ledger, the history and the endpoints are core. Same
     # fold-into-core_test reasoning as every TU here.
+    # stratum_refusal_log_test.cpp: the rate limit on the stratum server's
+    # "connection refused" WARN lines (core/stratum_refusal_log.hpp, header
+    # only): first refusal at once, then one summary per window. Same folding.
     # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
     add_executable(core_test
         addr_store_save_test.cpp
@@ -282,6 +285,7 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
         sharechain_height_index_test.cpp
         socket_write_queue_test.cpp
         socket_read_empty_prefix_test.cpp
+        stratum_refusal_log_test.cpp
         template_refresh_on_tx_test.cpp
         template_txs_check_test.cpp
         tx_advertiser_test.cpp
