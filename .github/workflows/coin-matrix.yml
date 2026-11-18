@@ -153,7 +153,6 @@ jobs:
 
       - name: Check source presence
         id: presence
-        if: steps.scope.outputs.run == '1'
         run: |
           GATE="${{ matrix.gate_file }}"
           if [ -n "$GATE" ]; then
@@ -174,18 +173,18 @@ jobs:
           fi
 
       - name: Install system dependencies
-        if: steps.presence.outputs.exists == '1' && runner.environment == 'github-hosted'
+        if: steps.presence.outputs.exists == '1' && steps.scope.outputs.run == '1' && runner.environment == 'github-hosted'
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
             g++ cmake make libleveldb-dev libsecp256k1-dev
 
       - uses: actions/setup-python@v6
-        if: steps.presence.outputs.exists == '1'
+        if: steps.presence.outputs.exists == '1' && steps.scope.outputs.run == '1'
         with: { python-version: '3.12' }
 
       - name: Install Conan 2
-        if: steps.presence.outputs.exists == '1'
+        if: steps.presence.outputs.exists == '1' && steps.scope.outputs.run == '1'
         run: |
           if [ "${{ runner.environment }}" = "github-hosted" ]; then
             pip install "conan>=2.0,<3.0"
@@ -195,11 +194,11 @@ jobs:
           fi
 
       - name: Show committed Conan profile
-        if: steps.presence.outputs.exists == '1'
+        if: steps.presence.outputs.exists == '1' && steps.scope.outputs.run == '1'
         run: conan profile show -pr:a=ci/conan/linux-gcc13.profile
 
       - name: Restore Conan cache (github-hosted only)
-        if: runner.environment == 'github-hosted' && steps.presence.outputs.exists == '1'
+        if: runner.environment == 'github-hosted' && steps.presence.outputs.exists == '1' && steps.scope.outputs.run == '1'
         uses: actions/cache@v5
         with:
           path: ${{ runner.temp }}/conan2
@@ -209,11 +208,11 @@ jobs:
             conan2-ubuntu24-gcc13-
 
       - name: Clean stale build dir (self-hosted workspace is reused)
-        if: steps.presence.outputs.exists == '1' && runner.environment != 'github-hosted'
+        if: steps.presence.outputs.exists == '1' && steps.scope.outputs.run == '1' && runner.environment != 'github-hosted'
         run: rm -rf build_${{ matrix.coin }}
 
       - name: Clear orphaned Conan download tempfiles (self-hosted cache is reused)
-        if: steps.presence.outputs.exists == '1' && runner.environment != 'github-hosted'
+        if: steps.presence.outputs.exists == '1' && steps.scope.outputs.run == '1' && runner.environment != 'github-hosted'
         # An interrupted or racing conan download can leave a partial conan_package.tgz
         # in $CONAN_HOME that makes the next `conan install` abort with
         # "the file to download already exists". Delete these staging archives so a
@@ -224,7 +223,7 @@ jobs:
       # Conan prime: the ONLY step here that reaches out to conancenter; bounded
       # retry+backoff warms the cache, the install below runs --no-remote.
       - name: Conan prime (only conancenter egress)
-        if: steps.presence.outputs.exists == '1'
+        if: steps.presence.outputs.exists == '1' && steps.scope.outputs.run == '1'
         run: |
           for attempt in 1 2 3; do
             if \
@@ -242,7 +241,7 @@ jobs:
           exit 1
 
       - name: Conan install (offline; --no-remote)
-        if: steps.presence.outputs.exists == '1'
+        if: steps.presence.outputs.exists == '1' && steps.scope.outputs.run == '1'
         run: |
           conan install . \
             -pr:a=ci/conan/linux-gcc13.profile \
@@ -253,7 +252,7 @@ jobs:
             -nr
 
       - name: Configure
-        if: steps.presence.outputs.exists == '1'
+        if: steps.presence.outputs.exists == '1' && steps.scope.outputs.run == '1'
         run: |
           # C2POOL_DASH_BLS=OFF + C2POOL_DASH_ALLOW_NO_BLS: the dash entries build c2pool-dash without
           # dashbls (bls=stub); without the opt-in that target fails by design.
@@ -262,18 +261,18 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release -DC2POOL_DASH_BLS=OFF -DC2POOL_DASH_ALLOW_NO_BLS=ON
 
       - name: Build c2pool-${{ matrix.coin }}
-        if: steps.presence.outputs.exists == '1'
+        if: steps.presence.outputs.exists == '1' && steps.scope.outputs.run == '1'
         run: cmake --build build_${{ matrix.coin }} --target c2pool-${{ matrix.binary || matrix.coin }} -j"${BUILD_J:-4}"
 
       - name: Smoke test (--help)
-        if: steps.presence.outputs.exists == '1' && !matrix.gtest
+        if: steps.presence.outputs.exists == '1' && steps.scope.outputs.run == '1' && !matrix.gtest
         run: |
           BIN=build_${{ matrix.coin }}/src/c2pool/c2pool-${{ matrix.binary || matrix.coin }}
           file "$BIN"
           "$BIN" --help 2>&1 | head -5 || true
 
       - name: Embedded daemonless gtest (no --coin-rpc; self-derive path)
-        if: steps.presence.outputs.exists == '1' && matrix.gtest == '1'
+        if: steps.presence.outputs.exists == '1' && steps.scope.outputs.run == '1' && matrix.gtest == '1'
         # PRE-STAGED: runs the dashd-cut replay/fold gtests that exercise the
         # daemonless self-derive path with NO --coin-rpc arm. Selector is pinned
         # to the #1293 dashd-cut family (test_dash_replay_*, test_dash_mn_checkpoint,
@@ -289,7 +288,7 @@ jobs:
             -R '^(DashBlockReplay|DashReplay|DashMnCheckpoint|DashMnPayee|DashMnAnchor|DashMnBridge|ReplayUtxo)'
 
       - name: Embedded daemonless gtest, narrow build (${{ matrix.coin }})
-        if: steps.presence.outputs.exists == '1' && matrix.gtest == 'narrow'
+        if: steps.presence.outputs.exists == '1' && steps.scope.outputs.run == '1' && matrix.gtest == 'narrow'
         # Same narrowing as the DASH step in #2262: build only the test
         # executables whose ctest names match gtest_sel, read from the
         # configure-time registry (CTestTestfile.cmake add_test lines), so the
@@ -297,7 +296,7 @@ jobs:
         # resolves to share_test (gtest_add_tests AUTO, so names exist before
         # the build). An empty list or an empty selector match fails loud;
         # timeout-minutes turns a stuck build into a named failure.
-        timeout-minutes: 40
+        timeout-minutes: 30
         shell: bash
         env:
           SEL: ${{ matrix.gtest_sel }}
@@ -321,7 +320,7 @@ jobs:
             -R "$SEL"
 
       - name: Upload build artifacts on failure
-        if: failure() && steps.presence.outputs.exists == '1'
+        if: failure() && steps.presence.outputs.exists == '1' && steps.scope.outputs.run == '1'
         uses: actions/upload-artifact@v7
         with:
           name: coin-matrix-${{ matrix.coin }}-fail
