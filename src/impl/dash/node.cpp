@@ -1477,12 +1477,7 @@ void NodeImpl::clean_tracker()
             // lifts once it verifies to CHAIN_LENGTH and the hint deactivates.
             // Matched by segment id.
             auto exempt_tail = [this](const uint256& tail_hash) -> bool {
-                if (!m_supersede_hint.active) return false;
-                try {
-                    return m_tracker.chain.contains(tail_hash) &&
-                           m_tracker.chain.get_last(tail_hash) == m_supersede_hint.target_segment_last;
-                } catch (...) {}
-                return false;
+                return dash::supersede_exempt_tail(m_supersede_hint, tail_hash);
             };
             const auto dt = dash::drop_tails(m_tracker, 2 * CL + 10,
                                              dash::kCleanDropTailsMaxPerPass, exempt_tail);

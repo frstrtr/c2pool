@@ -32,6 +32,29 @@ namespace dash {
 /// Shares one clean pass may drop (Step 3). See the header comment.
 inline constexpr int kCleanDropTailsMaxPerPass = 32;
 
+/// Restart-reorg exemption for Step 3: keep the converging challenger
+/// segment's bottom while the supersede hint is active. An unrooted challenger
+/// needs its FULL ~2*CL depth to reach CHAIN_LENGTH verified shares; trimming
+/// its bottom mid-verification silently restarts convergence.
+///
+/// A key of the tails map is the segment's MISSING PARENT
+/// (calculate_head_tail: resolved_tail = get_last(prev); remove() branches 3/4
+/// re-key by the share just erased) — never a share in the chain. And
+/// hint.target_segment_last = chain.get_last(target_head) is that same missing
+/// parent. So the segment is matched by plain equality. (The check this
+/// replaces also required chain.contains(tail_hash), which is false for every
+/// tails key, so the exemption never fired.)
+///
+/// The exemption lives exactly as long as the hint: gate_supersede_convergence
+/// clears it once the challenger verifies to CHAIN_LENGTH or wins, and after
+/// SUPERSEDE_STALL_LIMIT cycles without verified progress (then denylisted),
+/// after which normal trimming resumes — the exempt segment cannot grow
+/// unbounded.
+inline bool supersede_exempt_tail(const SupersedeHint& hint, const uint256& tail_hash)
+{
+    return hint.active && tail_hash == hint.target_segment_last;
+}
+
 struct DropTailsResult {
     int  dropped{0};
     bool capped{false};   // stopped at max_drop with eligible shares possibly left
