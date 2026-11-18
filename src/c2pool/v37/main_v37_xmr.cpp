@@ -1587,7 +1587,7 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
             }
             const pb::LaneView lv = n.store().view_at(b.id);
             v.leaf_count = lv.ok() ? lv.leaf_count() : 0;
-            v.coinbase_internal = n.alarms().count_of(pb::RowId::R12, pb::Missing::NodeInternal);
+            v.coinbase_internal = pb::coinbase_internal_count(n.alarms());
             v.sw = n.switch_counts();
             v.own_carriers = n.own_carriers();
             v.own_orphaned = n.own_orphaned();
