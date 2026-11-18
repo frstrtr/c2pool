@@ -285,6 +285,9 @@ protected:
     boost::asio::thread_pool m_think_pool{1};
     std::atomic<bool> m_think_running{false};
     std::atomic<bool> m_clean_running{false};
+    // A run_think() skipped because a cycle held m_think_running: the cycle's
+    // epilogue posts one run_think() for it (think_gate.hpp).
+    std::atomic<bool> m_rethink_pending{false};
     mutable std::shared_mutex m_tracker_mutex;
 
     // ── think()/clean watchdog (mirrors btc/node) ────────────────────────
@@ -520,6 +523,30 @@ protected:
     // Used by TrackerReadGuard to skip shared_lock when the caller is
     // already on the compute thread (which holds exclusive lock).
     std::atomic<std::thread::id> m_compute_thread_id{};
+    // The node whose m_tracker_mutex THIS thread holds, outside the compute
+    // thread, while it runs tracker code that fires the tracker hooks:
+    // notify_local_share's inline attempt_verify (exclusive; the io thread, or
+    // the HTTP thread for a JSON-RPC submit) and the startup block scan
+    // (shared, scan_chain_for_blocks(held, ...)). Per thread, so any number of
+    // shared holders mark independently. Set after the lock is taken, cleared
+    // before it is released (TrackerLockHolderMark). Constant-initialized
+    // inline thread_local: no TLS wrapper (see web_server.hpp
+    // t_direct_local_request).
+    inline static thread_local const NodeImpl* t_tracker_lock_holder = nullptr;
+    // Marks the calling thread as holding `node`'s tracker lock for its scope
+    // (nests: the previous mark is restored). The caller must already hold
+    // m_tracker_mutex, in either mode, for longer than the mark.
+    class TrackerLockHolderMark {
+        const NodeImpl* prev_;
+    public:
+        explicit TrackerLockHolderMark(const NodeImpl* node) : prev_(t_tracker_lock_holder)
+        {
+            t_tracker_lock_holder = node;
+        }
+        ~TrackerLockHolderMark() { t_tracker_lock_holder = prev_; }
+        TrackerLockHolderMark(const TrackerLockHolderMark&) = delete;
+        TrackerLockHolderMark& operator=(const TrackerLockHolderMark&) = delete;
+    };
 
     // Pending share batches queued while think() holds the mutex.
     // Drained on the IO thread after think() releases the lock.
@@ -747,7 +774,8 @@ public:
 
     /// RAII guard for IO-thread tracker reads.
     /// - IO thread: acquires shared_lock(try_to_lock). Returns falsy if busy.
-    /// - Compute thread: skips locking (exclusive already held). Always truthy.
+    /// - Compute thread, or a thread marked as holding the lock
+    ///   (holds_tracker_lock): skips locking (already held). Always truthy.
     /// Guard lifetime = lock lifetime. No way to hold a dangling reference.
     class TrackerReadGuard {
         std::shared_lock<std::shared_mutex> lock_;
@@ -779,12 +807,39 @@ public:
         return std::this_thread::get_id() == m_compute_thread_id.load(std::memory_order_relaxed);
     }
 
+    /// True if the calling thread already holds m_tracker_mutex: the compute
+    /// thread (exclusive), or a thread marked by TrackerLockHolderMark
+    /// (notify_local_share's inline verify, exclusive; the startup block scan,
+    /// shared). A std::shared_mutex must not be shared-locked by a thread that
+    /// owns it in either mode (undefined behaviour; under an exclusive hold
+    /// glibc refuses the try-lock), so readers on such a thread read directly.
+    bool holds_tracker_lock() const {
+        return is_compute_thread() || t_tracker_lock_holder == this;
+    }
+
     /// Preferred tracker accessor for IO-thread callbacks.
     /// Returns a guard that:
     ///   - On IO thread: acquires shared_lock(try_to_lock). Check `if (!guard)` before use.
-    ///   - On compute thread: skips locking (exclusive lock already held). Always valid.
+    ///   - On compute thread, or on a thread marked as holding the lock
+    ///     (notify_local_share's exclusive verify, the startup block scan: the
+    ///     tracker hooks they fire): skips locking (already held). Always valid.
     TrackerReadGuard read_tracker() {
-        return TrackerReadGuard(m_tracker_mutex, m_tracker, is_compute_thread());
+        return TrackerReadGuard(m_tracker_mutex, m_tracker, holds_tracker_lock());
+    }
+
+    /// ShareTracker::scan_chain_for_blocks for a caller that holds the tracker
+    /// lock through `held` (read_tracker(): the startup block scan). The hooks
+    /// it fires (m_on_block_found, m_on_merged_block_check) read through
+    /// read_tracker() on this thread, which took a SECOND shared lock of the
+    /// mutex this thread already held: undefined behaviour (glibc's
+    /// reader-preferring rwlock happens to grant it). They read under `held`,
+    /// in the same order. A failed guard scans nothing.
+    void scan_chain_for_blocks(const TrackerReadGuard& held, const uint256& tip, int max_shares)
+    {
+        if (!held)
+            return;
+        TrackerLockHolderMark mark(this);
+        m_tracker.scan_chain_for_blocks(tip, max_shares);
     }
 
     /// Acquire shared (reader) lock on the tracker mutex — BLOCKING.
