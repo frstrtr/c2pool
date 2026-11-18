@@ -5,6 +5,7 @@
 #include "known_txs_retention.hpp"  // dash::retain_template_txs / all_txs_backable (F1/F3)
 #include "coin/transaction.hpp"  // coin::TX_WITH_WITNESS (remembered_tx_size, #950)
 #include "think_gate.hpp"     // dash::think:: think-slot protocol + clean-cycle tip decision (#854)
+#include "clean_drop_tails.hpp"  // dash::drop_tails (clean Step 3, per-pass cap)
 
 #include <cassert>
 
@@ -1462,67 +1463,32 @@ void NodeImpl::clean_tracker()
 
         // Step 3: drop tails — remove ALL children of tails whose every head
         // is at least 2*CHAIN_LENGTH+10 high (p2pool node.py:382-398; only
-        // shares far beyond the PPLNS window are removed).
+        // shares far beyond the PPLNS window are removed). At most
+        // kCleanDropTailsMaxPerPass per pass: a removal costs milliseconds on a
+        // full tracker and this runs under the exclusive lock, so a large
+        // backlog (hundreds of shares after a supersede flip) drains over the
+        // next clean ticks instead of in one multi-second hold
+        // (clean_drop_tails.hpp).
         {
-            int total_dropped = 0;
-            for (int iter = 0; iter < 1000; ++iter)
-            {
-                std::vector<uint256> to_remove;
-                auto tails_copy = m_tracker.chain.get_tails();
-                for (auto& [tail_hash, head_hashes] : tails_copy)
-                {
-                    // Restart-reorg: never drop the tail of the converging
-                    // challenger segment. An unrooted challenger needs its FULL
-                    // ~2*CL depth to reach CHAIN_LENGTH verified shares; trimming
-                    // its bottom mid-verification silently restarts convergence.
-                    // The exemption lifts once it verifies to CHAIN_LENGTH and the
-                    // hint deactivates. Matched by segment id.
-                    if (m_supersede_hint.active) {
-                        try {
-                            if (m_tracker.chain.contains(tail_hash) &&
-                                m_tracker.chain.get_last(tail_hash) == m_supersede_hint.target_segment_last)
-                                continue;
-                        } catch (...) {}
-                    }
-
-                    int32_t min_height = 0;  // 0 → skip if no valid heads
-                    for (auto& hh : head_hashes) {
-                        if (!m_tracker.chain.contains(hh)) continue;
-                        auto h = m_tracker.chain.get_height(hh);
-                        if (min_height == 0 || h < min_height)
-                            min_height = h;
-                    }
-                    if (min_height < 2 * CL + 10) continue;
-
-                    // p2pool node.py:386: to_remove.update(reverse.get(tail))
-                    auto& rev = m_tracker.chain.get_reverse();
-                    auto rev_it = rev.find(tail_hash);
-                    if (rev_it != rev.end()) {
-                        for (const auto& child : rev_it->second)
-                            to_remove.push_back(child);
-                    }
-                }
-
-                if (to_remove.empty()) break;
-
-                for (const auto& aftertail : to_remove)
-                {
-                    try {
-                        if (!m_tracker.chain.contains(aftertail)) continue;
-                        // p2pool node.py:393: previous_hash must still be a tail.
-                        auto* idx = m_tracker.chain.get_index(aftertail);
-                        if (!idx) continue;
-                        if (!m_tracker.chain.get_tails().count(idx->tail))
-                            continue;
-                        if (m_tracker.verified.contains(aftertail))
-                            m_tracker.verified.remove(aftertail, /*owns_data=*/false);
-                        m_tracker.chain.remove(aftertail);
-                        ++total_dropped;
-                    } catch (...) {}
-                }
-            }
-            if (total_dropped > 0)
-                LOG_INFO << "[clean-drop-tails] dropped " << total_dropped << " shares"
+            // Restart-reorg: never drop the tail of the converging challenger
+            // segment. An unrooted challenger needs its FULL ~2*CL depth to
+            // reach CHAIN_LENGTH verified shares; trimming its bottom
+            // mid-verification silently restarts convergence. The exemption
+            // lifts once it verifies to CHAIN_LENGTH and the hint deactivates.
+            // Matched by segment id.
+            auto exempt_tail = [this](const uint256& tail_hash) -> bool {
+                if (!m_supersede_hint.active) return false;
+                try {
+                    return m_tracker.chain.contains(tail_hash) &&
+                           m_tracker.chain.get_last(tail_hash) == m_supersede_hint.target_segment_last;
+                } catch (...) {}
+                return false;
+            };
+            const auto dt = dash::drop_tails(m_tracker, 2 * CL + 10,
+                                             dash::kCleanDropTailsMaxPerPass, exempt_tail);
+            if (dt.dropped > 0)
+                LOG_INFO << "[clean-drop-tails] dropped " << dt.dropped << " shares"
+                         << (dt.capped ? " (per-pass cap reached; any rest next tick)" : "")
                          << " chain_size=" << m_tracker.chain.size()
                          << " heads=" << m_tracker.chain.get_heads().size();
         }
