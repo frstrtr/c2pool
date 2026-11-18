@@ -757,16 +757,26 @@ for per-worker hashrate, accepted shares, and connection time.
 
 Every connection has its own pseudoshare difficulty (vardiff). It starts at
 the vardiff floor and moves toward one pseudoshare every target time (3 s;
-10 s on `c2pool-dash`). A miner can set it in three ways, all in **wire
-units**: the number the miner sees in `mining.set_difficulty` (on scrypt
-coins that is 65536 × the node's internal difficulty, p2pool's
-`DUMB_SCRYPT_DIFF`; on SHA256d and X11 coins the two are the same).
+10 s on `c2pool-dash`). A miner can set it in three ways. They use two
+different units:
 
-| Where | Example | Effect |
-|-------|---------|--------|
-| Username suffix `+N` | `ADDRESS+4096`, `ADDRESS.rig+4096` | Fixed difficulty N for the connection; vardiff is off. `c2pool-dash` rounds N down to a power of two, as its vardiff does. |
-| Password `d=N` | `d=4096`, `x,d=4096`, `d=4096;x` | Start difficulty N; vardiff continues from it. |
-| `mining.suggest_difficulty` | `[4096]` | Sets the difficulty when it arrives; vardiff continues from it. |
+- **Internal units**: the node's difficulty, as python p2pool reads
+  `ADDRESS+N`. Logins carried over from p2pool keep their meaning.
+- **Wire units**: the number the miner sees in `mining.set_difficulty`.
+  On scrypt coins (`c2pool-ltc`, `c2pool-dgb`) wire = 65536 × internal,
+  p2pool's `DUMB_SCRYPT_DIFF`. On `c2pool-btc` (SHA256d) and `c2pool-dash`
+  (X11) the two are the same.
+
+| Where | Units | Example | Effect |
+|-------|-------|---------|--------|
+| Username suffix `+N` | internal | `ADDRESS+1`, `ADDRESS.rig+1` | Fixed difficulty N for the connection; vardiff is off. `c2pool-dash` rounds N down to a power of two, as its vardiff does. |
+| Password `d=N` | wire | `d=65536`, `x,d=65536`, `d=65536;x` | Start difficulty N; vardiff continues from it. |
+| `mining.suggest_difficulty` | wire | `[65536]` | Sets the difficulty when it arrives; vardiff continues from it. |
+
+On a scrypt coin, `ADDRESS+1` and `d=65536` both send the miner
+`mining.set_difficulty` 65536. The difference is that `+1` stays fixed,
+while `d=65536` is where vardiff starts. On BTC or DASH, `ADDRESS+4096` and
+`d=4096` both send 4096.
 
 - `+N` wins. With it, `d=N` and `mining.suggest_difficulty` are ignored.
 - Without `+N`, `d=N` and `mining.suggest_difficulty` each set the

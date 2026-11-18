@@ -6,7 +6,8 @@
 // unit tests exercise (test/test_stratum_username.cpp).
 //
 // Login grammar handled here:
-//   ADDR+<pseudo_diff>                 fixed pseudoshare difficulty (wire units)
+//   ADDR+<pseudo_diff>                 fixed pseudoshare difficulty (internal units,
+//                                      as p2pool's difficulty_to_target(float(N)))
 //   ADDR/<share_diff>                  per-miner share difficulty (p2pool
 //                                      "ADDR/diff", work.py get_user_details)
 //   ADDR/CHAIN_ID:ADDR[/CHAIN_ID:ADDR] explicit merged-chain addresses

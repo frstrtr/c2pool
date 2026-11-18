@@ -910,8 +910,8 @@ TEST(StratumInterimHardening, JobSnapshotCarriesMwebFields)
 //   - a rig ramped high comes back within one share period (the next job) and
 //     steps down after one share at the bound;
 //   - "d=N" in the password (start, wire units), "+N" on the login (fixed,
-//     wire units), their bound and their precedence over
-//     mining.suggest_difficulty.
+//     internal units as in python p2pool), their bound and their precedence
+//     over mining.suggest_difficulty.
 // Each coin case runs the same code: LTC (wire = 65536 x internal, ratio
 // vardiff), BTC (wire = internal, ratio vardiff), DASH (wire = internal,
 // hashrate vardiff, 10 s target).
@@ -1147,30 +1147,36 @@ TEST(StratumVardiff, PasswordGarbageIgnored)
     }
 }
 
-// "ADDR+N": a fixed difficulty in WIRE units, sent at authorize, bounded by
-// the pool-share difficulty, and not moved by vardiff.
+// "ADDR+N": a fixed difficulty in INTERNAL units, as python p2pool reads it
+// (difficulty_to_target(float(N))), so the miner is sent N x the wire
+// multiplier: "+1" is 65536 on LTC, "+4" is 4 on BTC and DASH. Sent at
+// authorize, bounded by the pool-share difficulty, not moved by vardiff.
 TEST(StratumVardiff, PlusSuffixIsFixedSentAndBounded)
 {
-    {
+    for (const CoinCase& cc : {kLtcCase, kBtcCase, kDashCase}) {
+        SCOPED_TRACE(cc.name);
         ServerHarness h;
+        apply_case(h, cc);
         h.ws->hash_diff = 1.0e6;
         ASSERT_TRUE(h.start());
         Client c;
         ASSERT_TRUE(c.connect(h.port));
         const std::string user = "vardiffplusworker";
+        const bool scrypt = cc.mult > 1.0;
+        const double wire = scrypt ? 1.0 * cc.mult : 4.0;   // "+1" on LTC, "+4" on BTC/DASH
         ASSERT_TRUE(c.subscribe());
         ASSERT_TRUE(c.collect_notifies(1, 5000ms));
         const size_t sd = c.set_diffs.size(), nj = c.jobs.size();
-        ASSERT_TRUE(c.authorize(user + "+4096"));
+        ASSERT_TRUE(c.authorize(user + (scrypt ? "+1" : "+4")));
         ASSERT_TRUE(c.collect_notifies(nj + 1, 5000ms));
-        ASSERT_GT(c.set_diffs.size(), sd) << "+4096 never sent";
-        EXPECT_DOUBLE_EQ(c.set_diffs[sd], 4096.0);
-        EXPECT_DOUBLE_EQ(c.diff_at_notify.back(), 4096.0);
+        ASSERT_GT(c.set_diffs.size(), sd) << "+N never sent";
+        EXPECT_DOUBLE_EQ(c.set_diffs[sd], wire) << "+N is internal units: wire = N x multiplier";
+        EXPECT_DOUBLE_EQ(c.diff_at_notify.back(), wire);
         int id = 1000;
         for (int r = 0; r < 4; ++r, id += 13)
             ASSERT_EQ(c.submit_burst(user, c.jobs.back(), 13, id), 13);
         c.drain(200ms);
-        EXPECT_DOUBLE_EQ(c.set_diffs.back(), 4096.0) << "vardiff moved a fixed +N";
+        EXPECT_DOUBLE_EQ(c.set_diffs.back(), wire) << "vardiff moved a fixed +N";
     }
     {
         ServerHarness h;
@@ -1182,6 +1188,35 @@ TEST(StratumVardiff, PlusSuffixIsFixedSentAndBounded)
         EXPECT_DOUBLE_EQ(c.diff_at_notify.back(), kPoolDiff1 * 65536.0) << "+N above the pool-share difficulty";
         for (double d : c.set_diffs)
             EXPECT_LE(d, kPoolDiff1 * 65536.0);
+    }
+}
+
+// The two units side by side: "+N" internal, "d=N" wire. On scrypt "+1" and
+// "d=65536" send the same difficulty; on BTC "+4096" and "d=4096" do.
+TEST(StratumVardiff, PlusSuffixInternalPasswordWire)
+{
+    for (const CoinCase& cc : {kLtcCase, kBtcCase}) {
+        SCOPED_TRACE(cc.name);
+        const bool scrypt = cc.mult > 1.0;
+        const double wire = scrypt ? 65536.0 : 4096.0;
+        {
+            ServerHarness h;
+            apply_case(h, cc);
+            ASSERT_TRUE(h.start());
+            Client c;
+            ASSERT_TRUE(c.connect(h.port));
+            ASSERT_TRUE(login(c, std::string("vardiffunitsworker") + (scrypt ? "+1" : "+4096")));
+            EXPECT_DOUBLE_EQ(c.diff_at_notify.back(), wire);
+        }
+        {
+            ServerHarness h;
+            apply_case(h, cc);
+            ASSERT_TRUE(h.start());
+            Client c;
+            ASSERT_TRUE(c.connect(h.port));
+            ASSERT_TRUE(login(c, "vardiffunitsworker", scrypt ? "d=65536" : "d=4096"));
+            EXPECT_DOUBLE_EQ(c.diff_at_notify.back(), wire);
+        }
     }
 }
 
@@ -1198,10 +1233,10 @@ TEST(StratumVardiff, PlusSuffixOverPasswordOverNothing)
         ASSERT_TRUE(h.start());
         Client c;
         ASSERT_TRUE(c.connect(h.port));
-        ASSERT_TRUE(login(c, "vardiffprecworker+2048", "d=8192"));
-        EXPECT_DOUBLE_EQ(c.diff_at_notify.back(), 2048.0) << "+N must win over d=N";
+        ASSERT_TRUE(login(c, "vardiffprecworker+1", "d=8192"));   // LTC: +1 internal = 65536 wire
+        EXPECT_DOUBLE_EQ(c.diff_at_notify.back(), 65536.0) << "+N must win over d=N";
         ASSERT_TRUE(suggest(c, 16384.0, 50));
-        EXPECT_DOUBLE_EQ(c.set_diffs.back(), 2048.0) << "+N must win over suggest_difficulty";
+        EXPECT_DOUBLE_EQ(c.set_diffs.back(), 65536.0) << "+N must win over suggest_difficulty";
     }
     {
         ServerHarness h;

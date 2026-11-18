@@ -682,11 +682,13 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
 
         // ─── Step 1: Strip fixed difficulty suffix (+N) before any parsing ───
         // Format: "ADDRESS+1024" or "ADDR,ADDR+512": a fixed pseudoshare
-        // difficulty N in WIRE units (as mining.set_difficulty carries it),
-        // applied once the login is accepted (below).
+        // difficulty N in INTERNAL units, as python p2pool reads it
+        // (difficulty_to_target(float(N)); the miner is sent
+        // N * set_difficulty_multiplier), applied once the login is accepted
+        // (below).
         // "+0", negatives, "+inf" and "+nan" set no difficulty (std::stod
         // accepts inf/nan, so a bare "> 0" check let "+inf" through).
-        const std::optional<double> fixed_wire_diff =
+        const std::optional<double> fixed_diff =
             stratum_username::strip_fixed_diff_suffix(username_);
 
         // ─── Step 2: Strip worker name suffix ───
@@ -859,10 +861,12 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
         login_primary_ = username_;
         login_given_ = std::move(given_now);
 
-        // ─── Login difficulty (WIRE units, / set_difficulty_multiplier) ───
-        // "+N" is fixed for the session: vardiff stops, and "d=N" and
+        // ─── Login difficulty ───
+        // "+N" (INTERNAL units, as python p2pool and earlier c2pool read it)
+        // is fixed for the session: vardiff stops, and "d=N" and
         // mining.suggest_difficulty are ignored (p2pool desired_pseudoshare_
-        // target: fixed_target). Otherwise "d=N" in the password is the start
+        // target: fixed_target). Otherwise "d=N" in the password (WIRE units,
+        // the pool convention: / set_difficulty_multiplier) is the start
         // difficulty vardiff continues from (the first successful authorize
         // only), and mining.suggest_difficulty sets the difficulty when it
         // arrives, as before. Every value is bounded by [min, max] and by the
@@ -873,10 +877,10 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
             const double mult = mult_cfg > 0.0 ? mult_cfg : 1.0;
             const std::string who = (username_.empty() ? std::string("(empty login)") : username_)
                                     + (worker_name_.empty() ? "" : "." + worker_name_);
-            if (fixed_wire_diff) {
-                hashrate_tracker_.set_fixed_difficulty(*fixed_wire_diff / mult);
-                LOG_INFO << "[Stratum] " << who << ": fixed difficulty +" << *fixed_wire_diff
-                         << " (internal " << *fixed_wire_diff / mult << ", issued "
+            if (fixed_diff) {
+                hashrate_tracker_.set_fixed_difficulty(*fixed_diff);
+                LOG_INFO << "[Stratum] " << who << ": fixed difficulty +" << *fixed_diff
+                         << " (internal; wire " << *fixed_diff * mult << ", issued "
                          << hashrate_tracker_.get_current_difficulty() << ")";
             } else {
                 hashrate_tracker_.set_fixed_difficulty(0.0);  // re-authorize without "+N": vardiff resumes
@@ -885,9 +889,9 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
                 const auto pd = stratum_username::parse_password_start_diff(params[1].get<std::string>());
                 if (pd.diff) {
                     password_diff_applied_ = true;
-                    if (fixed_wire_diff) {
+                    if (fixed_diff) {
                         LOG_INFO << "[Stratum] " << who << ": password d=" << *pd.diff
-                                 << " ignored, the login's +" << *fixed_wire_diff << " is fixed";
+                                 << " ignored, the login's +" << *fixed_diff << " is fixed";
                     } else {
                         hashrate_tracker_.set_difficulty_hint(*pd.diff / mult);
                         LOG_INFO << "[Stratum] " << who << ": start difficulty d=" << *pd.diff
