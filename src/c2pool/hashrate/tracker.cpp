@@ -8,6 +8,12 @@ namespace c2pool {
 namespace hashrate {
 
 void HashrateTracker::record_mining_share_submission(double difficulty, bool accepted) {
+    record_mining_share_submission_at(difficulty, accepted, clock::now(),
+                                      static_cast<double>(std::time(nullptr)));
+}
+
+void HashrateTracker::record_mining_share_submission_at(double difficulty, bool accepted,
+                                                        time_point steady_now, double epoch_now) {
     std::lock_guard<std::mutex> lock(shares_mutex_);
 
     uint64_t now = static_cast<uint64_t>(std::time(nullptr));
@@ -24,18 +30,25 @@ void HashrateTracker::record_mining_share_submission(double difficulty, bool acc
         total_mining_shares_accepted_++;
         total_work_done_ += difficulty;
 
-        // Only accepted shares inform vardiff timing (matching p2pool).
-        // Stale-job submissions arrive in bursts and would make vardiff
-        // think the miner is 10-100x faster → difficulty spikes.
-        auto tp = clock::now();
-        recent_share_times_.push_back(tp);
+        // Only accepted shares inform vardiff timing (matching p2pool), and
+        // only those credited at (at least) the CURRENT difficulty: the ratio
+        // below assumes every timed share was found at it. A share of a job
+        // issued at an older, lower difficulty (the issued-difficulty grace
+        // accepts it and credits it at that difficulty) says nothing about
+        // the rate at the current one. Timed anyway, the burst a rig sends at
+        // the start difficulty before it applies the first raise read as
+        // 10x per 12 shares: 0.0005 -> 65536 in ~109 floor shares, after
+        // which the rig found a pseudoshare every few hours.
+        if (difficulty >= current_difficulty_ * (1.0 - 1e-9))
+            recent_share_times_.push_back(steady_now);
         // Feed the hashrate-based vardiff estimator with the issued difficulty
-        // of this accepted share (only when that path is active).
+        // of this accepted share (only when that path is active): it weighs
+        // each share by its own difficulty, so every accepted share counts.
         if (use_hashrate_vardiff_)
-            record_share_for_hashrate(difficulty, static_cast<double>(now));
+            record_share_for_hashrate(difficulty, epoch_now);
     }
 
-    adjust_difficulty();
+    adjust_difficulty(steady_now, epoch_now);
 }
 
 void HashrateTracker::record_mining_share(const uint256& hash, uint64_t difficulty, uint64_t timestamp) {
@@ -68,8 +81,14 @@ double HashrateTracker::get_current_hashrate_unlocked() const {
         }
     }
 
-    if (time_window > 0) {
-        return work_done / time_window * 4294967296.0; // 2^32
+    // The work above spans at most the tracker's age: a session younger than
+    // the window is divided by its age (floored like get_recent_hashrate, so
+    // the first seconds cannot divide by ~0), not by 600 s.
+    const double age = now > created_at_ ? static_cast<double>(now - created_at_) : 0.0;
+    const double span = std::min(static_cast<double>(time_window),
+                                 std::max(age, 2.0 * target_time_per_mining_share_));
+    if (span > 0.0) {
+        return work_done / span * 4294967296.0; // 2^32
     }
     return 0.0;
 }
@@ -124,13 +143,73 @@ void HashrateTracker::enable_vardiff(bool enabled) {
     vardiff_enabled_ = enabled;
 }
 
+double HashrateTracker::bounded_unlocked(double difficulty) const {
+    double d = std::max(min_difficulty_, std::min(max_difficulty_, difficulty));
+    if (ceiling_ > 0.0)
+        d = std::min(d, ceiling_);
+    return d;
+}
+
+double HashrateTracker::fixed_unlocked() const {
+    double d = bounded_unlocked(fixed_request_);
+    // The hashrate vardiff's power-of-two grid (firmware rounds an advertised
+    // difficulty down to it): a fixed difficulty is rounded down onto it too.
+    if (use_hashrate_vardiff_)
+        d = std::exp2(std::floor(std::log2(d)));
+    return d;
+}
+
 void HashrateTracker::set_difficulty_hint(double hint) {
     std::lock_guard<std::mutex> lock(shares_mutex_);
-    double clamped = std::max(min_difficulty_, std::min(max_difficulty_, hint));
+    if (fixed_) {
+        LOG_INFO << "[Stratum] Difficulty hint " << hint << " ignored: fixed difficulty "
+                 << current_difficulty_;
+        return;
+    }
+    double clamped = bounded_unlocked(hint);
     if (std::abs(clamped - current_difficulty_) > 1e-9) {
         LOG_INFO << "[Stratum] Applying difficulty hint: " << current_difficulty_ << " -> " << clamped;
         current_difficulty_ = clamped;
     }
+}
+
+void HashrateTracker::set_fixed_difficulty(double difficulty) {
+    std::lock_guard<std::mutex> lock(shares_mutex_);
+    if (!(difficulty > 0.0)) {
+        fixed_ = false;
+        fixed_request_ = 0.0;
+        return;
+    }
+    fixed_ = true;
+    fixed_request_ = difficulty;
+    current_difficulty_ = fixed_unlocked();
+}
+
+bool HashrateTracker::is_fixed_difficulty() const {
+    std::lock_guard<std::mutex> lock(shares_mutex_);
+    return fixed_;
+}
+
+void HashrateTracker::set_difficulty_ceiling(double ceiling) {
+    std::lock_guard<std::mutex> lock(shares_mutex_);
+    double c = (ceiling > 0.0 && std::isfinite(ceiling)) ? ceiling : 0.0;
+    // The hashrate vardiff advertises only powers of two (firmware grid):
+    // its bound is the largest one at or below the pool-share difficulty.
+    if (c > 0.0 && use_hashrate_vardiff_)
+        c = std::exp2(std::floor(std::log2(c)));
+    ceiling_ = c;
+    if (fixed_) {
+        current_difficulty_ = fixed_unlocked();
+    } else if (ceiling_ > 0.0 && current_difficulty_ > ceiling_) {
+        LOG_INFO << "[Stratum] VARDIFF: " << current_difficulty_ << " -> " << ceiling_
+                 << " (pool-share difficulty bound)";
+        current_difficulty_ = ceiling_;
+    }
+}
+
+double HashrateTracker::get_difficulty_ceiling() const {
+    std::lock_guard<std::mutex> lock(shares_mutex_);
+    return ceiling_;
 }
 
 // Matches p2pool's stratum vardiff algorithm (stratum.py:546-573).
@@ -199,6 +278,11 @@ void HashrateTracker::set_difficulty_from_hashrate(double now) {
     // 0.0005), preserving the round-DOWN cadence invariant.
     double d_q = std::max(std::exp2(std::floor(std::log2(min_difficulty_))),
                           std::exp2(std::floor(std::log2(d_ideal))));
+    // Never above the pool-share bound (already on the grid), the floor's
+    // grid step included. Applied here, not to d_ideal: a rig whose ideal is
+    // above the bound must still leave the hysteresis band below it.
+    if (ceiling_ > 0.0)
+        d_q = std::min(d_q, ceiling_);
 
     // Hysteresis around the current power-of-two bucket. After the firmware-grid
     // fix quantizes advertised diff to powers of two, both d_q and
@@ -236,14 +320,14 @@ void HashrateTracker::set_difficulty_from_hashrate(double now) {
     current_difficulty_ = d_q;  // downstream notify + stratum 1% resend guard unchanged
 }
 
-void HashrateTracker::adjust_difficulty() {
-    if (!vardiff_enabled_)
+void HashrateTracker::adjust_difficulty(time_point steady_now, double epoch_now) {
+    if (!vardiff_enabled_ || fixed_)
         return;
 
     // Stable-by-construction path (DASH): derive difficulty from smoothed
     // hashrate, no ratio feedback → no oscillation. Legacy path below unchanged.
     if (use_hashrate_vardiff_) {
-        set_difficulty_from_hashrate(static_cast<double>(std::time(nullptr)));
+        set_difficulty_from_hashrate(epoch_now);
         return;
     }
 
@@ -251,7 +335,7 @@ void HashrateTracker::adjust_difficulty() {
     if (num_shares == 0)
         return;
 
-    auto now = clock::now();
+    auto now = steady_now;
 
     double elapsed = std::chrono::duration<double>(now - recent_share_times_.front()).count();
 
@@ -284,7 +368,7 @@ void HashrateTracker::adjust_difficulty() {
     ratio = std::max(MIN_ADJUST, std::min(MAX_ADJUST, ratio));
 
     double new_difficulty = current_difficulty_ / ratio;
-    new_difficulty = std::max(min_difficulty_, std::min(max_difficulty_, new_difficulty));
+    new_difficulty = bounded_unlocked(new_difficulty);
 
     if (std::abs(new_difficulty - current_difficulty_) / std::max(current_difficulty_, 0.001) > 0.01) {
         LOG_INFO << "[Stratum] VARDIFF: " << current_difficulty_ << " -> " << new_difficulty

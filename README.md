@@ -753,6 +753,48 @@ In **custodial** mode, miner stratum usernames are used for accounting only
 and never appear in coinbase outputs. The backoffice polls `/stratum_stats`
 for per-worker hashrate, accepted shares, and connection time.
 
+### Stratum difficulty (`+N`, `d=N`, `mining.suggest_difficulty`)
+
+Every connection has its own pseudoshare difficulty (vardiff). It starts at
+the vardiff floor and moves toward one pseudoshare every target time (3 s;
+10 s on `c2pool-dash`). A miner can set it in three ways. They use two
+different units:
+
+- **Internal units**: the node's difficulty, as python p2pool reads
+  `ADDRESS+N`. Logins carried over from p2pool keep their meaning.
+- **Wire units**: the number the miner sees in `mining.set_difficulty`.
+  On scrypt coins (`c2pool-ltc`, `c2pool-dgb`) wire = 65536 × internal,
+  p2pool's `DUMB_SCRYPT_DIFF`. On `c2pool-btc` (SHA256d) and `c2pool-dash`
+  (X11) the two are the same.
+
+| Where | Units | Example | Effect |
+|-------|-------|---------|--------|
+| Username suffix `+N` | internal | `ADDRESS+1`, `ADDRESS.rig+1` | Fixed difficulty N for the connection; vardiff is off. `c2pool-dash` rounds N down to a power of two, as its vardiff does. |
+| Password `d=N` | wire | `d=65536`, `x,d=65536`, `d=65536;x` | Start difficulty N; vardiff continues from it. |
+| `mining.suggest_difficulty` | wire | `[65536]` | Sets the difficulty when it arrives; vardiff continues from it. |
+
+On a scrypt coin, `ADDRESS+1` and `d=65536` both send the miner
+`mining.set_difficulty` 65536. The difference is that `+1` stays fixed,
+while `d=65536` is where vardiff starts. On BTC or DASH, `ADDRESS+4096` and
+`d=4096` both send 4096.
+
+- `+N` wins. With it, `d=N` and `mining.suggest_difficulty` are ignored.
+- Without `+N`, `d=N` and `mining.suggest_difficulty` each set the
+  difficulty when they arrive, and the later one wins. `d=N` is read once
+  per connection, at the first successful `mining.authorize`. In the
+  password it can be the whole value or one `key=value` token separated by
+  `,` or `;`.
+- A value that is not a positive finite number is ignored, and the node logs
+  it once per connection.
+
+Each value, whether a miner set it or vardiff computed it, stays within the
+vardiff floor and ceiling (`--stratum-min-diff` / `--stratum-max-diff` on
+`c2pool-ltc`). It also never goes above the pool-share difficulty of the job,
+as in p2pool. So a hash that would make a sharechain share is always worth
+submitting, and a miner never withholds one. The node sends
+`mining.set_difficulty` before any job whose difficulty differs from the
+last one it sent.
+
 ---
 
 ## Defaults

@@ -715,11 +715,11 @@ void StratumSession::process_message(std::size_t bytes_read)
         // After subscribe response is sent, follow up with difficulty + work.
         // p2pool: pseudoshare difficulty starts low and VARDIFF ramps it up.
         // Do NOT floor at pool share_bits — that defeats VARDIFF.
+        // A mining.suggest_difficulty received before subscribe is already
+        // in the tracker (handle_suggest_difficulty), so the difficulty
+        // advertised here is the one the first job is issued at.
         if (method == "mining.subscribe") {
-            double initial_diff = (suggested_difficulty_ > 0.0)
-                ? suggested_difficulty_
-                : hashrate_tracker_.get_current_difficulty();
-            send_set_difficulty(initial_diff);
+            send_set_difficulty(hashrate_tracker_.get_current_difficulty());
             send_notify_work();
             // Idle keepalive only: arm the periodic work-push / keepalive timer
             // as soon as the session is subscribed -- a backup pool connection
@@ -791,14 +791,15 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
         handshake_timer_.cancel();
 
         // ─── Step 1: Strip fixed difficulty suffix (+N) before any parsing ───
-        // Format: "ADDRESS+1024" or "ADDR,ADDR+512"  →  suggested_difficulty_=N
+        // Format: "ADDRESS+1024" or "ADDR,ADDR+512": a fixed pseudoshare
+        // difficulty N in INTERNAL units, as python p2pool reads it
+        // (difficulty_to_target(float(N)); the miner is sent
+        // N * set_difficulty_multiplier), applied once the login is accepted
+        // (below).
         // "+0", negatives, "+inf" and "+nan" set no difficulty (std::stod
         // accepts inf/nan, so a bare "> 0" check let "+inf" through).
-        if (auto fixed_diff = stratum_username::strip_fixed_diff_suffix(username_)) {
-            suggested_difficulty_ = *fixed_diff;
-            hashrate_tracker_.set_difficulty_hint(*fixed_diff);
-            LOG_INFO << "[Stratum] Fixed difficulty from username: " << *fixed_diff;
-        }
+        const std::optional<double> fixed_diff =
+            stratum_username::strip_fixed_diff_suffix(username_);
 
         // ─── Step 2: Strip worker name suffix ───
         // Separators: "." and "_" (Python compat)
@@ -969,6 +970,52 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
         LOG_INFO << "[Stratum] Mining authorization successful for: " << username_;
         login_primary_ = username_;
         login_given_ = std::move(given_now);
+
+        // ─── Login difficulty ───
+        // "+N" (INTERNAL units, as python p2pool and earlier c2pool read it)
+        // is fixed for the session: vardiff stops, and "d=N" and
+        // mining.suggest_difficulty are ignored (p2pool desired_pseudoshare_
+        // target: fixed_target). Otherwise "d=N" in the password (WIRE units,
+        // the pool convention: / set_difficulty_multiplier) is the start
+        // difficulty vardiff continues from (the first successful authorize
+        // only), and mining.suggest_difficulty sets the difficulty when it
+        // arrives, as before. Every value is bounded by [min, max] and by the
+        // pool-share difficulty of the jobs (the tracker's ceiling), and the
+        // miner is sent it at once.
+        {
+            const double mult_cfg = mining_interface_->get_stratum_config().set_difficulty_multiplier;
+            const double mult = mult_cfg > 0.0 ? mult_cfg : 1.0;
+            const std::string who = (username_.empty() ? std::string("(empty login)") : username_)
+                                    + (worker_name_.empty() ? "" : "." + worker_name_);
+            if (fixed_diff) {
+                hashrate_tracker_.set_fixed_difficulty(*fixed_diff);
+                LOG_INFO << "[Stratum] " << who << ": fixed difficulty +" << *fixed_diff
+                         << " (internal; wire " << *fixed_diff * mult << ", issued "
+                         << hashrate_tracker_.get_current_difficulty() << ")";
+            } else {
+                hashrate_tracker_.set_fixed_difficulty(0.0);  // re-authorize without "+N": vardiff resumes
+            }
+            if (!password_diff_applied_ && params.size() >= 2 && params[1].is_string()) {
+                const auto pd = stratum_username::parse_password_start_diff(params[1].get<std::string>());
+                if (pd.diff) {
+                    password_diff_applied_ = true;
+                    if (fixed_diff) {
+                        LOG_INFO << "[Stratum] " << who << ": password d=" << *pd.diff
+                                 << " ignored, the login's +" << *fixed_diff << " is fixed";
+                    } else {
+                        hashrate_tracker_.set_difficulty_hint(*pd.diff / mult);
+                        LOG_INFO << "[Stratum] " << who << ": start difficulty d=" << *pd.diff
+                                 << " (internal " << *pd.diff / mult << ", issued "
+                                 << hashrate_tracker_.get_current_difficulty() << ")";
+                    }
+                } else if (pd.bad && !password_diff_logged_) {
+                    password_diff_logged_ = true;
+                    LOG_WARNING << "[Stratum] " << who << ": password d= ignored (not a finite number > 0)";
+                }
+            }
+            if (subscribed_ && hashrate_tracker_.get_current_difficulty() != advertised_difficulty_)
+                send_set_difficulty(hashrate_tracker_.get_current_difficulty());
+        }
 
         // Auto-derive: for each configured merged chain without an explicit address,
         // reuse the primary address hash160 (works because chains share secp256k1 keys).
@@ -1194,11 +1241,12 @@ nlohmann::json StratumSession::handle_suggest_difficulty(const nlohmann::json& p
             mining_interface_->get_stratum_config().set_difficulty_multiplier;
         double internal_diff = suggested / diff_multiplier;
         suggested_difficulty_ = internal_diff;
-        // If already subscribed, apply immediately via VARDIFF hint
-        if (subscribed_) {
-            hashrate_tracker_.set_difficulty_hint(internal_diff);
+        // Into the tracker at once (ignored under a fixed "+N"), so the jobs
+        // are issued at the difficulty the miner is told. Before subscribe
+        // the subscribe reply's set_difficulty carries it.
+        hashrate_tracker_.set_difficulty_hint(internal_diff);
+        if (subscribed_)
             send_set_difficulty(hashrate_tracker_.get_current_difficulty());
-        }
         LOG_INFO << "[Stratum] Miner suggested difficulty: " << suggested
                  << " (internal: " << internal_diff << ")";
     }
@@ -1755,6 +1803,7 @@ void StratumSession::send_set_difficulty(double difficulty)
 
     LOG_INFO << "[Stratum] set_difficulty: internal=" << difficulty
              << " wire=" << (difficulty * diff_multiplier);
+    advertised_difficulty_ = difficulty;
     send_response(notification);
 }
 
@@ -2202,6 +2251,24 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
         active_jobs_.erase(job_order_.front());
         evict_oldest();
     }
+    // ── Pool-share bound on the issued difficulty (money guard) ──
+    // p2pool work.py: target = max(target, share_info['bits'].target) -- a
+    // pseudoshare difficulty above the job's pool-share difficulty makes the
+    // miner withhold every share between the two (its PPLNS weight; a rig
+    // ramped to max_difficulty withheld ~99%). Bound it by the difficulty of
+    // the bits the submit gate judges this job's shares by (its frozen share
+    // bits, core::stratum::pool_share_bits), and tell the miner before the
+    // job when that changes what it was last sent. Unknown bits (0): no share
+    // can be made, no bound.
+    {
+        const uint32_t job_sb = core::stratum::pool_share_bits(
+            cbr.snapshot.frozen_ref.bits, mining_interface_->get_share_bits());
+        hashrate_tracker_.set_difficulty_ceiling(
+            job_sb != 0 ? chain::target_to_difficulty(chain::bits_to_target(job_sb)) : 0.0);
+    }
+    const double issued_difficulty = hashrate_tracker_.get_current_difficulty();
+    if (issued_difficulty != advertised_difficulty_)
+        send_set_difficulty(issued_difficulty);
     {
         JobEntry je;
         je.prevhash = prevhash;
@@ -2215,7 +2282,7 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
         // Freeze the vardiff advertised with this job so the submit gate can
         // validate a share against the target the miner actually received
         // (p2pool-dash work.py:477 grace), immune to later vardiff retargets.
-        je.issued_difficulty = hashrate_tracker_.get_current_difficulty();
+        je.issued_difficulty = issued_difficulty;
         je.has_payout = job_has_payout;
         je.payout_script = std::move(job_payout_script);
         je.merged_scripts = std::move(job_merged_scripts);
@@ -2265,7 +2332,8 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
         je.tx_data = std::move(cbr.snapshot.tx_data);
     }
 
-    // VARDIFF: do NOT override per-connection difficulty with pool share_bits.
+    // VARDIFF: do NOT override per-connection difficulty with pool share_bits
+    // (it is only bounded by them, above).
     // p2pool sends pseudoshare difficulty (VARDIFF) to miners, NOT pool target.
     // Miners submit many pseudoshares at low difficulty; only those meeting
     // share_bits become P2P shares. This gives smooth hashrate estimation.
