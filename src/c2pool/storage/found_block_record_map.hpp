@@ -6,9 +6,12 @@
 // persisted field, in one place, so the LTC node's persistence callbacks and
 // the KATs that pin them map the same fields. Only the INPUTS are stored;
 // every derived luck field is recomputed on load.
+//
+// Templates over the row type, so the storage layer does not depend on the
+// web layer (core/web_server.hpp): a caller names the row type,
+//     found_block_of<core::MiningInterface::FoundBlock>(rec).
 
 #include <c2pool/storage/found_block_store.hpp>
-#include <core/web_server.hpp>
 
 #include <cstdint>
 
@@ -16,8 +19,8 @@ namespace c2pool {
 namespace storage {
 
 /// The record of a ledger row, `last_checked` = when it is written.
-inline FoundBlockRecord found_block_record_of(const core::MiningInterface::FoundBlock& blk,
-                                              uint64_t last_checked)
+template <class FoundBlockT>
+FoundBlockRecord found_block_record_of(const FoundBlockT& blk, uint64_t last_checked)
 {
     FoundBlockRecord rec;
     rec.chain = blk.chain;
@@ -56,14 +59,14 @@ inline FoundBlockRecord found_block_record_of(const core::MiningInterface::Found
 
 /// The ledger row of a stored record (what an older record lacks stays at
 /// its default: unknown).
-inline core::MiningInterface::FoundBlock found_block_of(const FoundBlockRecord& rec)
+template <class FoundBlockT>
+FoundBlockT found_block_of(const FoundBlockRecord& rec)
 {
-    using MI = core::MiningInterface;
-    MI::FoundBlock blk{};
+    FoundBlockT blk{};
     blk.height = rec.height;
     blk.hash = rec.block_hash;
     blk.ts = rec.timestamp;
-    blk.status = static_cast<MI::BlockStatus>(rec.status);
+    blk.status = static_cast<decltype(blk.status)>(rec.status);
     blk.check_count = rec.check_count;
     blk.chain = rec.chain;
     blk.confirmations = rec.confirmations;
@@ -74,7 +77,7 @@ inline core::MiningInterface::FoundBlock found_block_of(const FoundBlockRecord& 
     blk.share_difficulty = rec.share_difficulty;
     blk.pool_hashrate = rec.pool_hashrate;
     blk.share_hash = rec.share_hash;
-    blk.authorship = static_cast<MI::BlockAuthorship>(rec.authorship);
+    blk.authorship = static_cast<decltype(blk.authorship)>(rec.authorship);
     // #946: v1/v2 records leave these unknown (null).
     blk.coinbase_txid = rec.coinbase_txid;
     blk.tx_count = rec.tx_count;

@@ -3379,7 +3379,7 @@ int main(int argc, char* argv[]) {
                             std::vector<MI::FoundBlock> result;
                             result.reserve(records.size());
                             for (const auto& rec : records)
-                                result.push_back(c2pool::storage::found_block_of(rec));
+                                result.push_back(c2pool::storage::found_block_of<MI::FoundBlock>(rec));
                             return result;
                         }
                     );

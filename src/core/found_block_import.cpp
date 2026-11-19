@@ -369,6 +369,7 @@ void Report::add(const Report& pass)
     effort_taken     += pass.effort_taken;
     effort_refused   += pass.effort_refused;
     effort_not_used  += pass.effort_not_used;
+    effort_not_judged += pass.effort_not_judged;
     pending          += pass.pending;
     for (const auto& [chain, n] : pass.imported_by_chain) imported_by_chain[chain] += n;
     for (const auto& [reason, n] : pass.rejected) rejected[reason] += n;
@@ -408,7 +409,7 @@ std::string Report::summary() const
        << ", corrected " << height_corrected
        << "; pool_hashrate_at_find refused " << rate_refused
        << "; source effort taken " << effort_taken << ", refused " << effort_refused
-       << ", not used " << effort_not_used
+       << ", not used " << effort_not_used << ", not judged " << effort_not_judged
        << "; coinbase-verified " << pool_verified;
     if (pending) os << "; pending (<6 deep) " << pending;
     return os.str();

@@ -8774,7 +8774,9 @@
         // round. With under this share of the round covered it is mostly
         // extrapolation: the value is shown, muted, and the round gets no
         // fast / slow tag and closes no duplet; the open round is called no
-        // dry spell and gets no dry-spell band.
+        // dry spell and gets no dry-spell band. The node takes another
+        // node's figure (--import-found-blocks) only at or above the same
+        // share (core::luck::kImportedCoverageFloor).
         var C2P_MIN_TAG_COVERAGE = 0.5;
         var C2P_TREND_ROUNDS = 10;
         var C2P_LUCK_CAP = 1000;

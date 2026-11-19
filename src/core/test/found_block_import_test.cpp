@@ -38,6 +38,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -1144,7 +1145,7 @@ TEST(FoundBlockImport, SourceEffortSurvivesARestart)
             [&]() {
                 std::vector<FB> out;
                 for (const auto& [k, bytes] : disk)
-                    out.push_back(c2pool::storage::found_block_of(
+                    out.push_back(c2pool::storage::found_block_of<FB>(
                         FoundBlockRecord::deserialize(bytes)));
                 return out;
             });
@@ -1218,4 +1219,234 @@ TEST(FoundBlockImport, SourceEffortSurvivesARestart)
     EXPECT_EQ(again.effort_taken, 0u);
     EXPECT_EQ(again.effort_not_used, 2u) << "both rows hold one already";
     EXPECT_EQ(writes, 0);
+}
+
+// ── The source's effort: what a hostile or stale file cannot do ──────────────
+// Regression KATs from the independent verification of the first cut of this
+// change (each asserted the hole then; each asserts it closed now).
+namespace {
+
+const double kOneADay = kD * kT32 / 86400.0;   // the pool rate of one block a day
+
+nlohmann::json ltc_file_row(const std::string& h, uint64_t height, uint64_t t,
+                            bool with_rate = true)
+{
+    nlohmann::json r{{"hash", h}, {"chain", "LTC"}, {"height", height}, {"ts", t}};
+    if (with_rate) {
+        r["pool_hashrate_at_find"] = kOneADay;
+        r["share_difficulty"] = kShareDiff;
+    }
+    return r;
+}
+
+MiningInterface::FoundBlock mi_row(const MiningInterface& mi, const std::string& hash)
+{
+    for (const auto& b : mi.get_found_blocks())
+        if (b.hash == hash) return b;
+    return MiningInterface::FoundBlock{};
+}
+
+void offer_effort(nlohmann::json& r, double effort, double coverage, const std::string& prev)
+{
+    r["effort_method"] = "integrated";
+    r["measured"] = true;
+    r["effort"] = effort;
+    r["history_coverage"] = coverage;
+    r["prev_block_hash"] = prev;
+}
+
+} // namespace
+
+// Four blocks a day apart at one block a day: 4 found, 4 expected. A file
+// that claims each round integrated over 1e-12 of it (an effort of 1.0,
+// perfectly plausible) would replace each single sample and count its block
+// against ~0 expected (effort x coverage): 400 % all-time luck. Under half of
+// the round measured, a source figure does not compete.
+TEST(FoundBlockImport, SourceEffortOverATinyCoverageIsNotUsed)
+{
+    const double now = static_cast<double>(kT0) + 3 * 86400.0 + 60.0;
+    FakeChain ltc;
+    ltc.tip = 3300000;
+    nlohmann::json file = nlohmann::json::array();
+    for (unsigned i = 0; i < 4; ++i) {
+        const std::string h = hash_of(0x300 + i);
+        const uint64_t t = kT0 + i * 86400ull;
+        ltc.add(h, 3200000 + i, t, kD);
+        auto r = ltc_file_row(h, 3200000 + i, t);
+        if (i > 0) offer_effort(r, 1.0, 1e-12, hash_of(0x300 + i - 1));
+        file.push_back(r);
+    }
+    MiningInterface node(false, nullptr, Blockchain::LITECOIN);
+    const auto rep = import_text(node, file.dump(), source_over(ltc));
+    EXPECT_EQ(rep.imported, 4u) << rep.summary();
+    EXPECT_EQ(rep.effort_taken, 0u) << rep.summary();
+    EXPECT_EQ(rep.effort_not_used, 3u);
+    EXPECT_EQ(str(row_of(node.rest_recent_blocks_at(now), "hash", hash_of(0x302)), "effort_method"),
+              "single_sample");
+    const auto all = node.rest_luck_stats_at(now)["periods"]["all"];
+    EXPECT_EQ(all["k"].get<uint64_t>(), 4u) << all.dump();
+    EXPECT_NEAR(all["blocks_expected"].get<double>(), 4.0, 1e-6);
+    EXPECT_NEAR(all["luck"].get<double>(), 100.0, 1e-4);
+}
+
+// The node's own history covers the last ~60 % of a one-day round at one
+// block a day: its own effort is ~1.0. A file claiming the whole round at
+// effort 50 -- a mean pool rate 50x what the node itself measured over most
+// of the same round -- passes every absolute bound (share floor, 1 % of the
+// yardstick, the network's rate: up to effort 576 here). It is refused: an
+// imported figure must agree with the node's own measurement within
+// kImportedRateBand. One 3x off is refused; one 2x off is taken.
+TEST(FoundBlockImport, SourceEffortFarFromTheNodesOwnRateIsRefused)
+{
+    FakeChain ltc;
+    ltc.tip = 3300000;
+    const std::string P = hash_of(0x400), X = hash_of(0x401);
+    const uint64_t tP = kT0, tX = kT0 + 86400;
+    ltc.add(P, 3200000, tP, kD);
+    ltc.add(X, 3200001, tX, kD);
+    auto own_node = [&](MiningInterface& node) {
+        for (double t = tP + 0.4 * 86400.0 + 3600.0; t <= tX + 3600.0; t += 3600.0)
+            node.add_luck_rate_sample(t, kOneADay, 0.0, kD);
+        nlohmann::json plain = nlohmann::json::array({ltc_file_row(P, 3200000, tP),
+                                                      ltc_file_row(X, 3200001, tX)});
+        ASSERT_EQ(import_text(node, plain.dump(), source_over(ltc)).imported, 2u);
+        const auto own = row_of(node.rest_recent_blocks(), "hash", X);
+        ASSERT_EQ(str(own, "effort_method"), "integrated");
+        ASSERT_NEAR(num(own, "effort"), 1.0, 0.05);
+        ASSERT_GT(num(own, "history_coverage"), 0.5);
+        ASSERT_LT(num(own, "history_coverage"), 0.7);
+    };
+    auto offered = [&](double effort) {
+        nlohmann::json f = nlohmann::json::array({ltc_file_row(P, 3200000, tP),
+                                                  ltc_file_row(X, 3200001, tX)});
+        offer_effort(f[1], effort, 1.0, P);
+        return f.dump();
+    };
+    for (double forged : {50.0, 3.2, 0.3}) {
+        MiningInterface node(false, nullptr, Blockchain::LITECOIN);
+        own_node(node);
+        const auto rep = import_text(node, offered(forged), source_over(ltc));
+        EXPECT_EQ(rep.effort_taken, 0u) << forged << " " << rep.summary();
+        EXPECT_EQ(rep.effort_refused, 1u) << forged;
+        const auto after = row_of(node.rest_recent_blocks(), "hash", X);
+        EXPECT_EQ(str(after, "effort_method"), "integrated") << forged << " " << after.dump();
+        EXPECT_NEAR(num(after, "effort"), 1.0, 0.05);
+        EXPECT_TRUE(after["luck_approximate"].get<bool>()) << "60 % covered: approximate";
+    }
+    MiningInterface node(false, nullptr, Blockchain::LITECOIN);
+    own_node(node);
+    const auto rep = import_text(node, offered(2.0), source_over(ltc));
+    EXPECT_EQ(rep.effort_taken, 1u) << rep.summary();
+    EXPECT_EQ(str(row_of(node.rest_recent_blocks(), "hash", X), "effort_method"), "imported");
+}
+
+// No history, two rows, no rate and no share difficulty in the file: no
+// yardstick at all. An effort of 1e-300 would be a luck of 1e302 %; the
+// smallest denormal a luck of inf, served as null under a method claiming a
+// value. Out of its absolute bounds, a figure is refused whatever the
+// yardstick; the row is what the node can say of it alone
+// (hashrate_unavailable, a null luck under the label that says why). A rate
+// at find of 1e-300 in the same file shape is no pool rate either.
+TEST(FoundBlockImport, SourceEffortOutsideItsBoundsIsRefusedWithoutAYardstick)
+{
+    for (double effort : {1e-300, std::numeric_limits<double>::denorm_min(), 1e-7, 2e6}) {
+        FakeChain ltc;
+        ltc.tip = 3300000;
+        const std::string P = hash_of(0x500), X = hash_of(0x501);
+        const uint64_t tP = kT0, tX = kT0 + 86400;
+        ltc.add(P, 3200000, tP, kD);
+        ltc.add(X, 3200001, tX, kD);
+        nlohmann::json file = nlohmann::json::array({ltc_file_row(P, 3200000, tP, false),
+                                                     ltc_file_row(X, 3200001, tX, false)});
+        offer_effort(file[1], effort, 1.0, P);
+        MiningInterface node(false, nullptr, Blockchain::LITECOIN);
+        const auto rep = import_text(node, file.dump(), source_over(ltc));
+        EXPECT_EQ(rep.effort_taken, 0u) << effort << " " << rep.summary();
+        EXPECT_EQ(rep.effort_refused, 1u) << effort;
+        const auto r = row_of(node.rest_recent_blocks(), "hash", X);
+        EXPECT_EQ(str(r, "luck_method"), "hashrate_unavailable") << effort << " " << r.dump();
+        EXPECT_TRUE(r["luck"].is_null());
+        EXPECT_TRUE(r["effort_method"].is_null());
+    }
+    FakeChain ltc;
+    ltc.tip = 3300000;
+    const std::string P = hash_of(0x510), X = hash_of(0x511);
+    ltc.add(P, 3200000, kT0, kD);
+    ltc.add(X, 3200001, kT0 + 86400, kD);
+    nlohmann::json file = nlohmann::json::array({ltc_file_row(P, 3200000, kT0, false),
+                                                 ltc_file_row(X, 3200001, kT0 + 86400, false)});
+    file[1]["pool_hashrate_at_find"] = 1e-300;
+    MiningInterface node(false, nullptr, Blockchain::LITECOIN);
+    const auto rep = import_text(node, file.dump(), source_over(ltc));
+    EXPECT_EQ(rep.rate_refused, 1u) << rep.summary();
+    const auto r = row_of(node.rest_recent_blocks(), "hash", X);
+    EXPECT_EQ(str(r, "luck_method"), "hashrate_unavailable") << r.dump();
+    EXPECT_TRUE(r["luck"].is_null());
+}
+
+// File A has P, X: X takes the source's effort over P -> X. File B, a later
+// and fuller snapshot, has P, Q, X: X's round now runs from Q, the figure it
+// holds applies to nothing, and B's valid Q -> X figure takes its place.
+// Importing B again changes nothing.
+TEST(FoundBlockImport, SourceEffortOfARoundThatChangedMakesWayForAValidOne)
+{
+    FakeChain ltc;
+    ltc.tip = 3300000;
+    const std::string P = hash_of(0x600), Q = hash_of(0x601), X = hash_of(0x602);
+    const uint64_t tP = kT0, tQ = kT0 + 86400, tX = kT0 + 2 * 86400;
+    ltc.add(P, 3200000, tP, kD);
+    ltc.add(Q, 3200001, tQ, kD);
+    ltc.add(X, 3200002, tX, kD);
+    MiningInterface node(false, nullptr, Blockchain::LITECOIN);
+
+    nlohmann::json a = nlohmann::json::array({ltc_file_row(P, 3200000, tP),
+                                              ltc_file_row(X, 3200002, tX)});
+    offer_effort(a[1], 2.2, 1.0, P);
+    EXPECT_EQ(import_text(node, a.dump(), source_over(ltc)).effort_taken, 1u);
+    EXPECT_EQ(str(row_of(node.rest_recent_blocks(), "hash", X), "effort_method"), "imported");
+
+    nlohmann::json b = nlohmann::json::array({ltc_file_row(P, 3200000, tP),
+                                              ltc_file_row(Q, 3200001, tQ),
+                                              ltc_file_row(X, 3200002, tX)});
+    offer_effort(b[1], 1.1, 1.0, P);
+    offer_effort(b[2], 1.15, 1.0, Q);
+    const auto rb = import_text(node, b.dump(), source_over(ltc));
+    EXPECT_EQ(rb.effort_taken, 2u) << rb.summary();
+    EXPECT_EQ(rb.effort_not_used, 0u);
+    const auto x = row_of(node.rest_recent_blocks(), "hash", X);
+    EXPECT_EQ(str(x, "effort_method"), "imported") << x.dump();
+    EXPECT_DOUBLE_EQ(num(x, "effort"), 1.15);
+    EXPECT_EQ(str(x, "prev_block_hash"), Q);
+    const auto held = mi_row(node, X);
+    EXPECT_EQ(held.imported_prev_hash, Q);
+
+    const auto again = import_text(node, b.dump(), source_over(ltc));
+    EXPECT_EQ(again.effort_taken, 0u) << again.summary();
+    EXPECT_EQ(again.effort_not_used, 2u) << "both hold one for their round now";
+    EXPECT_EQ(again.merged, 0u);
+}
+
+// A row whose own difficulty this node does not know (a merged row stored
+// before the aux difficulty was, with no aux header to name it) has no round
+// the figure can be judged on: counted as not judged, not as refused.
+TEST(FoundBlockImport, SourceEffortThatCannotBeJudgedIsCountedApart)
+{
+    FakeChain ltc, doge;
+    ltc.tip = 3300000;
+    const std::string D1 = hash_of(0x6d0), D2 = hash_of(0x6d1);
+    doge.add(D1, 6454000, kT0, 0.0);           // headers without a difficulty
+    doge.add(D2, 6454100, kT0 + 86400, 0.0);
+    doge.tip = 6460000;
+    auto src = source_over(ltc);
+    src.aux["DOGE"] = doge.lookup();
+    nlohmann::json file = nlohmann::json::array({
+        {{"pow_hash", D1}, {"symbol", "DOGE"}, {"height", 6454000}, {"ts", kT0}},
+        {{"pow_hash", D2}, {"symbol", "DOGE"}, {"height", 6454100}, {"ts", kT0 + 86400}}});
+    offer_effort(file[1], 1.2, 1.0, D1);
+    MiningInterface node(false, nullptr, Blockchain::LITECOIN);
+    const auto rep = import_text(node, file.dump(), src);
+    EXPECT_EQ(rep.imported, 2u) << rep.summary();
+    EXPECT_EQ(rep.effort_not_judged, 1u) << rep.summary();
+    EXPECT_EQ(rep.effort_refused, 0u);
+    EXPECT_NE(rep.summary().find("not judged 1"), std::string::npos) << rep.summary();
 }

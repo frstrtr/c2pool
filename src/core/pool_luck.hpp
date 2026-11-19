@@ -497,10 +497,14 @@ inline constexpr double kImplausibleRateShare = 0.01;
 ///   share_difficulty  the winning share's difficulty; 0 = not known
 ///   reference_rate    the history's rate at or near the block's time
 ///                     (RateHistory::yardstick_rate); 0 = no history near it
-/// With neither yardstick the rate stands as recorded.
+/// With neither yardstick the rate stands as recorded -- if it is at least
+/// kMinPoolRate: below one hash a second there is no pool, and a value like
+/// 1e-300 would put a luck of 1e300 % on the page.
+inline constexpr double kMinPoolRate = 1.0;
+
 inline bool rate_at_find_plausible(double rate, double share_difficulty, double reference_rate)
 {
-    if (!(rate > 0.0) || !std::isfinite(rate))
+    if (!(rate >= kMinPoolRate) || !std::isfinite(rate))
         return false;
     if (share_difficulty > 0.0
         && rate * kShareWorkBoundSeconds < share_difficulty * kHashesPerDifficulty)
@@ -618,6 +622,15 @@ inline RoundResult effort_over(const RateHistory& hist, const RoundOptions& opt,
         r.missing = difficulty > 0.0 ? MissingInput::rate : MissingInput::difficulty;
         return r;
     }
+    // An effort so small that its luck is not a number (a denormal rate, a
+    // degenerate history) is no measurement: never a luck of inf -- served as
+    // null under a method that claims a value.
+    if (!std::isnormal(r.effort) || !std::isfinite(100.0 / r.effort)) {
+        RoundResult none;
+        none.time_to_find = t;
+        none.missing = MissingInput::rate;
+        return none;
+    }
     r.luck = 100.0 / r.effort;
     r.expected_time = t / r.effort;
     return r;
@@ -640,21 +653,70 @@ inline RoundResult effort_over(const RateHistory& hist, const RoundOptions& opt,
 //     better. A single sample, or no effort at all, covers nothing.
 //   * the first block keeps its 1.0: by the operator's ruling it is one block
 //     found for one expected, on every node.
+//   * it is a figure at all: an effort in [kImportedEffortMin,
+//     kImportedEffortMax] and a coverage in (0, 1] (imported_effort_valid);
+//   * the other node measured at least kImportedCoverageFloor of the round --
+//     the dashboard's own line under which a figure is "mostly
+//     extrapolation" (C2P_MIN_TAG_COVERAGE). Below it the figure is an
+//     extrapolation too, and a period would count its block against almost
+//     nothing expected (effort * coverage);
+//   * where this node measured part of the round itself, the figure agrees
+//     with that: the mean pool rate it implies is within kImportedRateBand of
+//     the mean rate this node measured over the part it covers
+//     (imported_effort_agrees). A file cannot overrule what the node saw.
 // Only an integrated figure is taken: another node's single sample is its
 // rate at find times the round, which this node computes itself from the
 // same rate (pool_hashrate_at_find).
+//
+// KNOWN LIMIT: a period window that cuts an imported round counts it linear
+// in time (period_luck), as a single sample. Which part of the round the
+// other node's history covered is not known here; the "all" period is exact,
+// the 1d / 7d / 30d windows may over- or under-count the one straddling
+// round by up to its uncovered share.
 
 /// Two coverages closer than this are a tie (the same history, summed over
 /// differently clipped segments, differs in the last bits).
 inline constexpr double kCoverageTie = 1e-6;
+/// An imported effort is a number of blocks expected over one round: a
+/// millionth of a block, or a million blocks, is no pool's round.
+inline constexpr double kImportedEffortMin = 1e-6;
+inline constexpr double kImportedEffortMax = 1e6;
+/// The least share of the round the other node must have measured.
+inline constexpr double kImportedCoverageFloor = 0.5;
+/// How far the mean rate an imported effort implies may be from the mean
+/// rate this node measured over the same round: a factor of 3 either way. A
+/// pool's mean rate over one round does not move 3x between two parts of it
+/// as a rule (DOGE 6454700: 1.41 between the source's whole round and the
+/// 5.2 % the outside operator's node saw).
+inline constexpr double kImportedRateBand = 3.0;
+
+/// Is (effort, coverage) a figure at all? Normal finite numbers, the effort
+/// within [kImportedEffortMin, kImportedEffortMax], the coverage in (0, 1].
+inline bool imported_effort_valid(double effort, double coverage)
+{
+    return std::isnormal(effort) && effort >= kImportedEffortMin && effort <= kImportedEffortMax
+        && std::isnormal(coverage) && coverage > 0.0 && coverage <= 1.0;
+}
+
+/// Does `effort` agree with what this node measured of the round itself? Both
+/// run against the round's own difficulty over the same time, so the ratio of
+/// the efforts is the ratio of the mean rates. A round this node did not
+/// integrate (a single sample, nothing) has nothing to agree with.
+inline bool imported_effort_agrees(const RoundResult& local, double effort)
+{
+    if (local.method != EffortMethod::integrated || !(local.effort > 0.0))
+        return true;
+    const double ratio = effort / local.effort;
+    return ratio >= 1.0 / kImportedRateBand && ratio <= kImportedRateBand;
+}
 
 /// Does another node's effort of a round, with `coverage` of it measured,
 /// beat `local`, this node's own result for the same round?
 inline bool imported_effort_wins(const RoundResult& local, double effort, double coverage)
 {
-    if (!(effort > 0.0) || !std::isfinite(effort))
+    if (!imported_effort_valid(effort, coverage) || coverage < kImportedCoverageFloor)
         return false;
-    if (!(coverage > 0.0) || !(coverage <= 1.0))
+    if (!imported_effort_agrees(local, effort))
         return false;
     switch (local.method) {
     case EffortMethod::none:
@@ -691,14 +753,19 @@ inline void use_imported_effort(RoundResult& r, double effort, double coverage)
 /// rate over the round, effort * D * 2^32 / round -- is held to the bounds a
 /// rate recorded at find is held to (rate_at_find_plausible: the share
 /// difficulty from below, 1 % of the history's yardstick), and to
-/// `max_rate` (the whole network's rate, 0 = no bound) from above. A forged
-/// figure can only change a display number; this keeps it within what this
-/// pool can have done. Without a round or a difficulty it cannot be judged.
+/// `max_rate` (the whole network's rate, 0 = no bound) from above, and the
+/// effort itself to [kImportedEffortMin, kImportedEffortMax]. A forged figure
+/// can only change a display number. These bounds, the coverage floor and
+/// the agreement with this node's own measurement (imported_effort_wins) keep
+/// it near what this pool can have done; with no yardstick at all (no
+/// history, no share difficulty, no rates in the file) only the absolute
+/// bounds stand. Without a round or a difficulty it cannot be judged: the
+/// caller counts that apart (it is no refusal).
 inline bool imported_effort_plausible(double effort, double round_seconds, double difficulty,
                                       double share_difficulty, double reference_rate,
                                       double max_rate)
 {
-    if (!(effort > 0.0) || !std::isfinite(effort))
+    if (!std::isnormal(effort) || effort < kImportedEffortMin || effort > kImportedEffortMax)
         return false;
     if (!(round_seconds > 0.0) || !(difficulty > 0.0) || !std::isfinite(difficulty))
         return false;

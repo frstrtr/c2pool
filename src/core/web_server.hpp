@@ -1745,6 +1745,11 @@ public:
     /// after it was found (the startup scan of the share chain) is not
     /// measured at today's rate. What a merged block learned from a peer is
     /// stored with (DiscoveredMergedBlock::pool_hashrate).
+    /// KNOWN LIMIT: on a FRESH node's first share-chain sync a block whose
+    /// share is under kLiveRateAtFindMaxLag old gets the estimator's reading
+    /// over a chain still filling its lookbehind; nothing checks it when it
+    /// is stored, and without rate history the display lets it stand (one
+    /// row, display only; a restart never re-stores a held block).
     double gross_pool_hashrate_at(double block_ts, double now) const;
     /// How far a block's time may be from now for the live rate to stand as
     /// its rate at find.

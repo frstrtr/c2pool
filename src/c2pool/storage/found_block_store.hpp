@@ -11,6 +11,7 @@
 #include <core/uint256.hpp>
 #include <core/log.hpp>
 #include <core/pack.hpp>
+#include <core/pool_luck.hpp>
 
 namespace c2pool {
 namespace storage {
@@ -80,13 +81,14 @@ struct FoundBlockRecord {
     static constexpr uint8_t kExtImported           = 0x02;
     static constexpr uint8_t kExtImportedEffort     = 0x04;   // the tail follows
 
-    /// An imported effort a reader may use: positive and finite, a coverage
-    /// in (0, 1], the block it was timed from.
+    /// An imported effort a reader may use: within its absolute bounds with a
+    /// coverage in (0, 1] (core::luck::imported_effort_valid), and the full
+    /// hash of the block it was timed from (a cut or corrupt length byte reads
+    /// as none, never as a short hash that matches no round).
     bool has_imported_effort() const
     {
-        return imported_effort > 0.0 && std::isfinite(imported_effort)
-            && imported_coverage > 0.0 && imported_coverage <= 1.0
-            && !imported_prev_hash.empty();
+        return core::luck::imported_effort_valid(imported_effort, imported_coverage)
+            && imported_prev_hash.size() == 64;
     }
 
     // Serialize to bytes for LevelDB storage
