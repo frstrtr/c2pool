@@ -11752,10 +11752,12 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 // a row pending forever. Fall through to the header chain.
                 uint32_t found_height = 0;
                 bool have_height = false;
+                int64_t found_ts = 0;
                 for (const auto& b : mi->get_found_blocks()) {
                     if (b.hash == hash_hex) {
                         found_height = static_cast<uint32_t>(b.height);
                         have_height = found_height != 0;
+                        found_ts = static_cast<int64_t>(b.ts);
                         break;
                     }
                 }
@@ -11778,8 +11780,19 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                         return dash::coin::block_confirm::resolve_status(
                             winner_at, hc->height(), h, found_height);
                     }
-                    // header chain present but height unknown → still pending
-                    return 0;
+                    // Height unknown AND the header chain does not hold the
+                    // hash (not even on a side branch). If the chain spans the
+                    // found time with a margin on both sides, a block that had
+                    // been on the best chain in that window would be indexed:
+                    // orphaned. Otherwise pending (chain rooted later / not
+                    // far enough yet). Used to stay pending forever.
+                    return dash::coin::block_confirm::resolve_unknown_height(
+                        [hc](uint32_t hh) -> std::optional<int64_t> {
+                            if (auto e = hc->get_header_by_height(hh))
+                                return static_cast<int64_t>(e->header.m_timestamp);
+                            return std::nullopt;
+                        },
+                        hc->height(), found_ts);
                 }
 
                 // Fallback arm (no embedded chain): dashd getblockheader.
