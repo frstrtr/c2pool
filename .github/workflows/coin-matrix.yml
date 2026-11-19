@@ -207,10 +207,9 @@ jobs:
 
       - name: Smoke test (--help)
         if: steps.presence.outputs.exists == '1' && matrix.gtest != '1'
-        run: |
-          BIN=build_${{ matrix.coin }}/src/c2pool/c2pool-${{ matrix.binary || matrix.coin }}
-          file "$BIN"
-          "$BIN" --help 2>&1 | head -5 || true
+        # Fails when the binary is missing or not executable, when --help exits
+        # non-zero, or when it prints no usage text (was `|| true`: never failed).
+        run: bash ci/coin_help_smoke.sh build_${{ matrix.coin }}/src/c2pool/c2pool-${{ matrix.binary || matrix.coin }}
 
       - name: Embedded daemonless gtest (no --coin-rpc; self-derive path)
         if: steps.presence.outputs.exists == '1' && matrix.gtest == '1'
