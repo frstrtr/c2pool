@@ -78,6 +78,12 @@
 //                     and the node's own horizon; the tree re-rooted, bodies
 //                     and records below the floors dropped, the headers below
 //                     the bodies kept as prefix headers; one store batch
+//   K-step book       one per lane state (the own state, or the adopted
+//                     state's): synced (kbook_sync) at an extension, after a
+//                     switch's AR appends and at an adoption, only when the
+//                     compiled table has a K step; its rows ride in the batch
+//                     of their AR rows (K_KSTEP); a sync that cannot read a
+//                     step's record poisons the store
 //
 // Header-only.
 // ---------------------------------------------------------------------------
@@ -490,6 +496,7 @@ public:
           own_tree_(std::move(loaded.tree)),
           own_store_(std::move(loaded.store)),
           own_ar_(std::move(loaded.ar)),
+          own_kbook_(std::move(loaded.kbook)),
           own_bodies_(std::move(loaded.bodies)),
           pending_(cfg.pending_cap ? cfg.pending_cap : relay_horizons(cfg.p).pending_cap),
           deferred_(cfg.waiting_cap ? cfg.waiting_cap : waiting_cap_default()),
@@ -2388,6 +2395,7 @@ private:
         tree_ = &*own_tree_;
         store_ = &*own_store_;
         ar_ = &own_ar_;
+        kbook_ = &own_kbook_;
         bodies_ = &own_bodies_;
         headers_ = &own_headers_;
         windows_ = &own_windows_;
@@ -2503,7 +2511,8 @@ private:
                         io_.seed_of,
                         [this](const HashingBlob& b, std::uint64_t d, const Hash32& s) { return verify_memo(b, d, s); },
                         alarm_,
-                        claims_};
+                        claims_,
+                        kbook_};
     }
 
     // P_t of the tree's lowest node: P_0 at position 0; a pruned tree's root, its own body's.
@@ -3028,6 +3037,7 @@ private:
         tree_ = &*js->tree;
         store_ = &*js->store;
         ar_ = &js->ar;
+        kbook_ = &js->kbook;
         bodies_ = &js->bodies;
         headers_ = &js->headers;
         windows_ = &js->windows();
@@ -3039,6 +3049,7 @@ private:
         own_tree_.reset();
         own_store_.reset();
         own_ar_ = ActivationRecord{};
+        own_kbook_ = KStepBook{};
         own_bodies_ = CarrierBodies{};
         own_headers_ = HeaderIndex{};
         own_windows_ = WindowCache{};
@@ -3080,11 +3091,19 @@ private:
         first_round_ = first_round_open_ = false;
         reset_delivery();
         ++generation_;
+        // the adopted state's K-step book, above its joiner seed (from position 1 on a young chain)
+        if (kstep_gate_) {
+            const std::optional<std::uint64_t> p0 = js->ar.joiner_p0();
+            if (!kbook_sync(js->kbook, js->ar, cfg_.T, *js->store, cfg_.p.fresh_max, p0 ? *p0 - 1 : 0)) {
+                poison(store_->best_tip());
+                return true;
+            }
+        }
         if (kv_ == nullptr) return true;
         LaneBatch b;
         const bool cleared = clear_store_batch(*kv_, cfg_.record_chain, b);
         const std::optional<LaneBatch> ab = adoption_batch(cfg_.record_chain, head_, *tree_, *store_, *bodies_, *ar_,
-                                                           js->young ? 0 : js->x0 - 1, &js->prefix_headers);
+                                                           js->young ? 0 : js->x0 - 1, &js->prefix_headers, kbook_);
         if (ab) b.ops.insert(b.ops.end(), ab->ops.begin(), ab->ops.end());
         put_sides(b, cfg_.record_chain, *tree_, *store_, *bodies_);  // the adopted tree's side carriers (K_PSIDE)
         // the lower edge of A's bound work (x1 + 1), read at a restart (K_BLO)
@@ -3357,9 +3376,21 @@ private:
             case WriteOutcome::Extended: {
                 out.action = NodeAction::Placed;
                 ++generation_;
+                // the K-step book at the new tip x: its row at x, if x is a K step
+                KStepOps ko;
+                if (kstep_gate_) {
+                    std::optional<KStepOps> s =
+                            kbook_sync(*kbook_, *ar_, cfg_.T, *store_, cfg_.p.fresh_max, store_->tip_pos() - 1);
+                    if (!s) {
+                        poison(r.id);
+                        out.action = NodeAction::NodeInternal;
+                        return out;
+                    }
+                    ko = std::move(*s);
+                }
                 if (PathbKv* kv = store_kv()) {
                     const LaneBatch b = extension_batch(cfg_.record_chain, head_, *tree_, *store_, *bodies_, r.id,
-                                                        std::move(w.batch), w.ar_row);
+                                                        std::move(w.batch), w.ar_row, ko);
                     if (!commit_lane_batch(*kv, b)) {
                         poison(r.id);
                         out.action = NodeAction::NodeInternal;
@@ -3675,9 +3706,20 @@ private:
                     return out;
                 }
         }
+        // the K-step book above the fork, after the rewind and the appends
+        KStepOps ko;
+        if (kstep_gate_) {
+            std::optional<KStepOps> s = kbook_sync(*kbook_, *ar_, cfg_.T, *store_, cfg_.p.fresh_max, fork);
+            if (!s) {
+                poison(new_tip);  // nothing committed
+                out.internal = true;
+                return out;
+            }
+            ko = std::move(*s);
+        }
         if (PathbKv* kv = store_kv()) {
             LaneBatch b = switch_batch(cfg_.record_chain, head_, *tree_, *store_, *bodies_, fork, old_pos, ar_before, *ar_,
-                                       std::move(lane));
+                                       std::move(lane), ko);
             side_moves(b, cfg_.record_chain, *tree_, *store_, *bodies_, undone, added_ids);  // the abandoned branch kept
             if (!commit_lane_batch(*kv, b)) {
                 poison(new_tip);
@@ -3726,11 +3768,14 @@ private:
     }
 
     PathbNodeConfig cfg_;
+    // The compiled table has a K step (computed once; false at K = 1: no K-step book is synced).
+    const bool kstep_gate_ = table_has_k_step(cfg_.T);
     PathbNodeIo io_;
     // The node's state: its own (a full node: launched here or loaded) or, after a join, the adopted state's.
     std::optional<CarrierTree> own_tree_;
     std::optional<BinStore> own_store_;
     ActivationRecord own_ar_;
+    KStepBook own_kbook_;  // the own state's K-step book (K_KSTEP)
     CarrierBodies own_bodies_;
     HeaderIndex own_headers_;
     WindowCache own_windows_;
@@ -3741,6 +3786,7 @@ private:
     CarrierTree* tree_ = nullptr;
     BinStore* store_ = nullptr;
     ActivationRecord* ar_ = nullptr;
+    KStepBook* kbook_ = nullptr;
     CarrierBodies* bodies_ = nullptr;
     HeaderIndex* headers_ = nullptr;
     WindowCache* windows_ = nullptr;

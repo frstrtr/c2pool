@@ -445,7 +445,7 @@ void kind2() {
     const pb::RatchetParams R = P;  // regtest default set
     const pb::Deployment k2 = fixed2(1, kR1, 0, GRACE);
     pb::EpochTable up = release({});
-    up.compiled.push_back(pb::CompiledEpoch{1, kR1, std::nullopt});
+    up.compiled.push_back(pb::CompiledEpoch{1, kR1, pb::epoch0_lane_rules(pb::LaneNet::Regtest)});
     pb::EpochTable lacks = release({});
     const std::vector<pb::Deployment> file{k2};
     check(pb::merge_configured_deployments(pb::LaneNet::Regtest, up, file).ok
@@ -487,7 +487,7 @@ void kind2() {
     check(pb::step(R, N.S, GRACE + 1, N.T, *pb::own_attempt(N.T, 1)) == pb::DeploymentState::Failed,
           "10 FAILED: x > fixed without the activation");
     pb::EpochTable later = release({});
-    later.compiled.push_back(pb::CompiledEpoch{1, kR1, std::nullopt});
+    later.compiled.push_back(pb::CompiledEpoch{1, kR1, pb::epoch0_lane_rules(pb::LaneNet::Regtest)});
     std::vector<pb::Deployment> f2{fixed2(1, kR1, 100, 100 + GRACE)};
     pb::merge_configured_deployments(pb::LaneNet::Regtest, later, f2);
     check(pb::step(R, pb::genesis_ratchet_state(kG), 50, later, later.attempts[0]) == pb::DeploymentState::Defined, "10 DEFINED before start");

@@ -1661,7 +1661,7 @@ void contract() {
         {
             KatNet anet;
             pb::EpochTable T = kat_table(anet);
-            T.compiled.push_back(pb::CompiledEpoch{1, seq32(0x7d), std::nullopt});
+            T.compiled.push_back(pb::CompiledEpoch{1, seq32(0x7d), pb::epoch0_lane_rules(pb::LaneNet::Regtest)});
             T.attempts.push_back(pb::Deployment{1, seq32(0x7d), pb::kKindFixed, 0, 1000000, 20});
             KatNode an(anet, kJ0, pb::kRuledRatchetParams, T);
             const std::vector<pb::Hash32> ac = pipeline_chain(an, 19);

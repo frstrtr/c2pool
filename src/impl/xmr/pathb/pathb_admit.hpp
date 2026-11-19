@@ -67,6 +67,7 @@
 #include "pathb_header_index.hpp"
 #include "pathb_header_rules.hpp"
 #include "pathb_joiner.hpp"  // journal_j0
+#include "pathb_kstep.hpp"   // KStepBook
 #include "pathb_params.hpp"
 #include "pathb_ratchet_activation.hpp"
 #include "pathb_receipt_admission.hpp"
@@ -211,6 +212,7 @@ struct AdmitEnv {
     std::function<bool(const HashingBlob&, std::uint64_t d, const Hash32& seed)> randomx;
     AlarmSink& alarm;
     const ClaimView* claims = nullptr;  // the claim extension point: nullptr = the full node
+    const KStepBook* kbook = nullptr;   // the lane state's K-step book (nullptr: none)
 };
 
 // ---------------------------------------------------------------------------

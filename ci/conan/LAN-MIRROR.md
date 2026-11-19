@@ -75,6 +75,10 @@ Exported from a warm CI cache, so it tracks `conanfile.txt` + `conan.lock`:
   **gcc-15** (the host-default detect as it was before oplex7020 was pinned to
   gcc-13). Keeping both means a host flipping its default compiler is a cache
   hit either way.
+- a third set, **RelWithDebInfo**, from
+  `ci/conan/linux-gcc13-relwithdebinfo.profile`: the closure of the ring-lane
+  workflow (`.github/workflows/xmr-ring-test-epochs.yml`, job
+  `ring-test-epochs`), which installs it with `--build=never`.
 
 ## Refresh — when, who, how
 
@@ -85,6 +89,13 @@ host's default compiler changes** (a new `compiler.version` is a new
 **Symptom of staleness:** a job logs `Building from source` or downloads from
 `conancenter` for a package the mirror was supposed to serve. That is a
 degraded-but-correct state — nothing breaks, it is just slow again.
+
+**The RelWithDebInfo set is not degraded-but-correct when stale.** Its job,
+`ring-test-epochs`, installs with `--build=never`: a dependency bump, a
+`conan.lock` change or a runner compiler the mirror lacks turns that job red
+until the set is rebuilt and uploaded again. No CI runner rebuilds it. It is
+built cold, from source, into a scratch `CONAN_HOME` on one build host, and
+uploaded from there; it is never exported from a CI runner's cache.
 
 **Trigger:** whoever lands a dependency bump (the PR that edits `conanfile.txt`
 or regenerates `conan.lock`) refreshes the mirror in the same change. There is

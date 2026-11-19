@@ -27,7 +27,9 @@ set -uo pipefail
 
 # Binary remotes (conan_server v2 API), searched in this order and both ahead of
 # conancenter. Each serves prebuilt binaries for BOTH profiles in use —
-# ci/conan/linux-gcc13.profile and the host-default `conan profile detect`.
+# ci/conan/linux-gcc13.profile and the host-default `conan profile detect` —
+# and a third set, ci/conan/linux-gcc13-relwithdebinfo.profile (the ring-lane
+# workflow, --build=never; built cold and uploaded, see LAN-MIRROR.md).
 # Read access is anonymous, so no credentials live in this repo.
 #   lan    = VM104 git-mirror   — PRIMARY
 #   lan905 = VM905 c2pool-build — FALLBACK, kept until VM104 has proven itself

@@ -439,6 +439,7 @@ public:
     std::optional<CarrierTree> tree;
     std::optional<BinStore> store;
     ActivationRecord ar;
+    KStepBook kbook;  // empty while an attempt runs; synced over `ar` at the adoption
     HeaderIndex headers;
     CarrierBodies bodies;
     std::map<Hash32, XmrKeyRef> refs;          // served references and the span bodies' references
@@ -502,7 +503,8 @@ public:
                         in_->seed_of,
                         in_->randomx,
                         alarm,
-                        &claims_};
+                        &claims_,
+                        &kbook};
     }
 
     // The references a body brings (its payee and owner keys).

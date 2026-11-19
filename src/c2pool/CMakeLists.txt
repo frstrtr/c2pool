@@ -929,6 +929,7 @@ target_link_libraries(c2pool-v37-w6-leveldb-compile-check PRIVATE core Threads::
 # gate. The V37Engine/OwedLedger consensus stays header-only + untouched.
 # The Path B coinbase and block assembly are header-only (src/impl/xmr/pathb/,
 # src/impl/xmr/template/xmr_block_assembly.hpp).
+if (NOT V37_XMR_RING_TEST_EPOCHS)  # the daemon is never built with the ring test epochs
 add_executable(c2pool-v37-xmr
     v37/main_v37_xmr.cpp
     ${CMAKE_SOURCE_DIR}/src/impl/xmr/stratum/xmr_stratum.cpp
@@ -941,6 +942,7 @@ target_include_directories(c2pool-v37-xmr PRIVATE
 target_compile_definitions(c2pool-v37-xmr PRIVATE V37_XMR_HAVE_MONERO_CRYPTO)
 c2pool_xmr_drops_default(c2pool-v37-xmr)   # V37_XMR_DROPS_DEFAULT (default OFF; see the helper)
 target_compile_features(c2pool-v37-xmr PRIVATE cxx_std_20)
+endif()
 # xmr_template carries the clean-room block template + the authored primitive
 # seam bodies (xmr_coin_primitives.cpp). Link it EXACTLY ONCE.
 # M2 (--xmr-template-source native): the embedded native-minimal Monero node.
@@ -950,8 +952,10 @@ target_compile_features(c2pool-v37-xmr PRIVATE cxx_std_20)
 # header-only and arrives through main_v37_xmr's include of the backend. Boost
 # is header-only asio at the pinned 1.90, so this adds a link edge and an
 # include path, not a new runtime dependency.
+if (NOT V37_XMR_RING_TEST_EPOCHS)  # the daemon is never built with the ring test epochs
 target_link_libraries(c2pool-v37-xmr PRIVATE xmr_template xmr_node xmr_coin
                                              xmr_native_txpool Threads::Threads)
+endif()
 # XMR-WEB (--web-port, OFF by default): the read-only provider behind the shared
 # core::WebServer dashboard (the same web server + web-static UI every coin
 # binary serves). A STATIC archive that links core PRIVATE, so the daemon TU
@@ -981,7 +985,9 @@ endif()
 target_link_libraries(xmr_web_dashboard PRIVATE ${XMR_WEB_SECP256K1_STATIC}
                                                 core c2pool_merged_mining c2pool_payout
                                                 c2pool_hashrate ltc_coin)
+if (NOT V37_XMR_RING_TEST_EPOCHS)  # the daemon is never built with the ring test epochs
 target_link_libraries(c2pool-v37-xmr PRIVATE xmr_web_dashboard)
+endif()
 # RELAY-DISCOVERY: the relay's persistent peer book on core::AddrStore
 # (v37/xmr/relay/xmr_relay_peerstore.hpp). Same pattern as xmr_web_dashboard:
 # a STATIC archive linking core PRIVATE, behind a core-free header, so the
@@ -990,7 +996,9 @@ add_library(xmr_relay_peerstore STATIC v37/xmr/relay/xmr_relay_peerstore.cpp)
 target_compile_features(xmr_relay_peerstore PRIVATE cxx_std_20)
 target_include_directories(xmr_relay_peerstore PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(xmr_relay_peerstore PRIVATE core)
+if (NOT V37_XMR_RING_TEST_EPOCHS)  # the daemon is never built with the ring test epochs
 target_link_libraries(c2pool-v37-xmr PRIVATE xmr_relay_peerstore)
+endif()
 # PATHB-STORE: the Path B store archive (v37/xmr/pathb/xmr_pathb_store.hpp),
 # a STATIC archive linking core PRIVATE behind a core-free header, as above.
 # Linked into the daemon (which never defines W6_ENABLE_LEVELDB) and by its KAT.
@@ -998,12 +1006,15 @@ add_library(xmr_pathb_store STATIC v37/xmr/pathb/xmr_pathb_store.cpp)
 target_compile_features(xmr_pathb_store PRIVATE cxx_std_20)
 target_include_directories(xmr_pathb_store PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(xmr_pathb_store PRIVATE core)
+if (NOT V37_XMR_RING_TEST_EPOCHS)  # the daemon is never built with the ring test epochs
 target_link_libraries(c2pool-v37-xmr PRIVATE xmr_pathb_store)
+endif()
 # Reproducible release (docs/xmr-lane/REPRODUCIBLE-BUILD.md): the daemon links
 # only static archives, Boost headers and system libs, so the build RUNPATH CMake
 # derives from the Conan link dirs (<CONAN_HOME>/p/boost.../p/lib, which holds no
 # shared object) is never used to resolve anything -- but it bakes the builder's
 # $CONAN_HOME into .dynamic. Do not emit it.
+if (NOT V37_XMR_RING_TEST_EPOCHS)  # the daemon is never built with the ring test epochs
 set_target_properties(c2pool-v37-xmr PROPERTIES SKIP_BUILD_RPATH ON)
 if (TARGET Boost::headers)
     target_link_libraries(c2pool-v37-xmr PRIVATE Boost::headers)
@@ -1022,6 +1033,7 @@ if (XMR_BUILD_RANDOMX AND TARGET randomx)
     # one has no RandomX) and an illegitimate accident.
     target_compile_definitions(c2pool-v37-xmr PRIVATE
         V37_XMR_O2_WITH_RANDOMX XMR_NATIVE_NODE_HAVE_RANDOMX=1)
+endif()
 endif()
 # ── Track A2 / Milestone A-BTC: the live BITCOIN-FAMILY single-node daemon ────
 # c2pool-v37-btc: the single-node DASH-regtest/devnet-capable (LTC testnet4

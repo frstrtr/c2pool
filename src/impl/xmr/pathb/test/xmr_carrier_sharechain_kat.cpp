@@ -809,7 +809,7 @@ int main() {
         const pb::Hash32 G = seq32(0x47), D1 = seq32(0xa1);
         pb::EpochTable T;
         T.compiled.push_back(pb::CompiledEpoch{0, G, std::nullopt});
-        T.compiled.push_back(pb::CompiledEpoch{1, D1, std::nullopt});
+        T.compiled.push_back(pb::CompiledEpoch{1, D1, pb::epoch0_lane_rules(pb::LaneNet::Regtest)});
         T.attempts.push_back(pb::Deployment{1, D1, pb::kKindFixed, 0, 0, 20});
         pb::CarrierTree t(P, kGenesis, kGenesisHeight, T, {}, R, G);
         const CarriedGen one = [](std::uint64_t pos) {

@@ -11,7 +11,8 @@
 //   3  merge_configured_deployments (--pathb-deployments; test networks)
 //   4  deployment_table_valid (its first check is K30's W_R <= 4, on every
 //      network, regtest included)
-//   5  lane_rules_valid
+//   5  lane_rules_valid (a build with V37_XMR_RING_TEST_EPOCHS: then
+//      ring_rules_valid)
 //   6  check_relay_buffers
 //   7  the pool identity: the headline, the raw form on mainnet, a raw form
 //      without its height
@@ -35,6 +36,9 @@
 #include "impl/xmr/pathb/pathb_joiner.hpp"
 #include "impl/xmr/pathb/pathb_pool_identity.hpp"
 #include "impl/xmr/pathb/pathb_ratchet_activation.hpp"
+#ifdef V37_XMR_RING_TEST_EPOCHS
+#include "impl/xmr/pathb/pathb_kstep.hpp"  // ring_rules_valid (test builds only)
+#endif
 
 namespace c2pool::xmr::pathb {
 
@@ -127,6 +131,9 @@ inline StartupResult startup_checks(const StartupInputs& in) {
     if (const StartupCheck c = deployment_table_valid(in.rp, in.net, out.T); !c.ok)
         return refuse(StartupStep::DeploymentTable, c.why);
     if (const StartupCheck c = lane_rules_valid(in.net, out.T); !c.ok) return refuse(StartupStep::LaneRules, c.why);
+#ifdef V37_XMR_RING_TEST_EPOCHS
+    if (const StartupCheck c = ring_rules_valid(in.net, out.T); !c.ok) return refuse(StartupStep::LaneRules, c.why);
+#endif
     // 6
     switch (check_relay_buffers(in.hf, in.z_lt_view, in.p.r_max, in.buffers)) {
         case BufferCheck::Ok: break;
