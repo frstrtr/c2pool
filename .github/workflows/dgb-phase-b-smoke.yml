@@ -57,6 +57,11 @@ jobs:
             echo "CONAN_HOME=$HOME/.conan2-ci/$RUNNER_NAME" >> "$GITHUB_ENV"
           fi
 
+      # ccache for the gate script's cmake configure (self-hosted only; a
+      # runner without ccache builds as before).
+      - name: ccache launcher (when installed)
+        uses: ./.github/actions/ccache-launcher
+
       - name: Check DGB Phase-B source presence
         id: presence
         run: |
@@ -111,6 +116,12 @@ jobs:
         env:
           BUILD_DIR: ${{ github.workspace }}/build_dgb_smoke
         run: bash tests/gates/dgb_phase_b_smoke.sh
+
+      - name: ccache hits and misses for this job
+        if: always()
+        uses: ./.github/actions/ccache-launcher
+        with:
+          report: 'true'
 
       # Steady-state disk hygiene on the VM905 self-hosted runners: drop the
       # checkout payload and _temp, keep _actions/_tool/_update. Always runs.
