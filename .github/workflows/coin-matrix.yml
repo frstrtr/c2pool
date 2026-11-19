@@ -222,11 +222,13 @@ jobs:
         # the real CamelCase gtest suites (gtest_add_tests AUTO): DashBlockReplay
         # in test_dash_block_replay + DashReplay*/DashMnCheckpoint*/DashMnPayee*/
         # DashMnAnchor*/DashMnBridge* in test_dash_mn_state, plus ReplayUtxo* fold.
-        run: |
-          cmake --build build_${{ matrix.coin }} -j"${BUILD_J:-4}"
-          ctest --test-dir build_${{ matrix.coin }} \
-            --output-on-failure --no-tests=error \
-            -R '^(DashBlockReplay|DashReplay|DashMnCheckpoint|DashMnPayee|DashMnAnchor|DashMnBridge|ReplayUtxo)'
+        # Builds ONLY the six executables behind that selector (was: every
+        # target in the repo, ~973 objects, 45-90 min on the shared 905 host).
+        # The script's guard fails the step if the selector matches 0 tests, if
+        # any selected test's executable was not built, if the executables
+        # behind the selection drift from its TARGETS list, or if ctest ran a
+        # different number of tests than it listed: no hollow green.
+        run: bash ci/dash_daemonless_gtest.sh build_${{ matrix.coin }} "${BUILD_J:-4}"
 
       - name: Upload build artifacts on failure
         if: failure() && steps.presence.outputs.exists == '1'
