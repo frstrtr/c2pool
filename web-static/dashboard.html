@@ -2156,6 +2156,7 @@
                         <span class="badge" id="luck_seven_days" style="background: var(--primary); cursor: help;" title="Pool luck, 7 days">7d: —</span>
                         <span class="badge" id="luck_thirty_days" style="background: var(--primary); cursor: help;" title="Pool luck, 30 days">30d: —</span>
                         <span class="badge" id="luck_ninety_days" style="background: var(--primary); cursor: help;" title="Pool luck, 90 days">90d: —</span>
+                        <a class="badge" id="cz_extraction_link" style="display: none; background: var(--primary); text-decoration: none;" href="https://chainz.cryptoid.info/dash/extraction.dws?30.htm" target="_blank" rel="noopener" title="Who mined Dash blocks in the last 30 days, by pool (chainz / CryptoID). c2pool blocks are listed there as P2Pool-DASH.">Pools on chainz ↗</a>
                     </div>
                     <div class="classic-luck" id="classic_luck_strip">
                         <div><span title="How many blocks were produced relative to how many were expected in each window (p2pool.info, 2012). Numbers larger than 100% mean the pool was lucky.">Pool Luck (7 days, 30 days, 90 days):</span>
@@ -4765,12 +4766,31 @@
                             .text('⁑ duplet');
                     }
                 });
-                tr.append('td').append('a')
+                var hashTd = tr.append('td');
+                hashTd.append('a')
                     .attr('class', 'hash-link')
                     .attr('href', function(b) { return currency_info.block_explorer_url_prefix + b.hash; })
                     .attr('target', '_blank')
                     .attr('title', function(b) { return b.hash; })
                     .text(function(b) { return '...' + b.hash.substr(-8); });
+                // DASH: a second explorer next to the configured one, so a lagging
+                // explorer index ("block not found" minutes after the find) has a
+                // fallback one click away.
+                var isDashChain = ((currency_info && currency_info.symbol) || '').toUpperCase() === 'DASH'
+                    && !/testnet/i.test((currency_info && currency_info.block_explorer_url_prefix) || '');   // chainz links are mainnet
+                d3.select('#cz_extraction_link').style('display', isDashChain ? null : 'none');
+                if (isDashChain) {
+                    hashTd.filter(function(b) { return /^[0-9a-f]{64}$/i.test(b.hash || ''); })
+                        .append('a')
+                        .attr('class', 'hash-link')
+                        .attr('href', function(b) { return 'https://chainz.cryptoid.info/dash/block.dws?' + b.hash + '.htm'; })
+                        .attr('target', '_blank')
+                        .attr('rel', 'noopener')
+                        .attr('title', 'Open this block on chainz (CryptoID)')
+                        .style('margin-left', '6px')
+                        .style('font-size', '0.8em')
+                        .text('cz');
+                }
                 // Effort: round duration vs. expected, coloured at the bounds
                 // the luck colours had (luck = 1 / effort is in the tooltip).
                 tr.append('td')
