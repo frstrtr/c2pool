@@ -78,6 +78,12 @@
 #include "pathb_params.hpp"
 #include "pathb_ratchet_state.hpp"
 
+#ifdef V37_XMR_RING_TEST_EPOCHS
+#include <map>
+
+#include "pathb_ring_rule.hpp"  // RingRule (test builds only)
+#endif
+
 namespace c2pool::xmr::pathb {
 
 // Highest epoch_no a ballot can name (15 bits).
@@ -153,6 +159,9 @@ struct CompiledEpoch {
 struct EpochTable {
     std::vector<CompiledEpoch> compiled;  // ascending epoch_no, epoch 0 first
     std::vector<Deployment> attempts;     // ascending (epoch_no, start); the last of an epoch_no is the own attempt
+#ifdef V37_XMR_RING_TEST_EPOCHS
+    std::map<std::uint16_t, RingRule> ring_rules;  // test builds only: by epoch_no, an epoch whose K17 != 1
+#endif
 };
 
 inline const Deployment* own_attempt(const EpochTable& T, std::uint32_t e) noexcept {
@@ -576,6 +585,19 @@ inline std::optional<std::uint64_t> spacing_threshold(const RatchetParams& p, co
     return a.timeout + p.grace;
 }
 
+// The release gate: a build without V37_XMR_RING_TEST_EPOCHS refuses a compiled rule set whose payment_groups
+// (K17) is not kPaymentGroups on every network; a test build refuses it off regtest.
+#ifdef V37_XMR_RING_TEST_EPOCHS
+inline constexpr bool kRingTestEpochsBuilt = true;
+#else
+inline constexpr bool kRingTestEpochsBuilt = false;
+#endif
+inline constexpr bool ring_k17_built(LaneNet net) noexcept { return kRingTestEpochsBuilt && net == LaneNet::Regtest; }
+inline std::string ring_k17_not_built(std::uint8_t k17) {
+    return "payment_groups " + std::to_string(k17) + " != " + std::to_string(kPaymentGroups) + " is not built" +
+           (kRingTestEpochsBuilt ? " off regtest" : "");
+}
+
 inline StartupCheck deployment_table_valid(const RatchetParams& p, LaneNet net, const EpochTable& T) {
     auto refuse = [](std::string why) { return StartupCheck{false, std::move(why)}; };
     if (!ratchet_params_valid(p)) return refuse("K30: W_R above the kept windows");
@@ -615,6 +637,17 @@ inline StartupCheck deployment_table_valid(const RatchetParams& p, LaneNet net, 
             if (!th.has_value() || a.start < *th) return refuse(at + ": start before timeout + GRACE of an earlier attempt");
         }
     }
+    // the release gate: a kind-1 attempt naming a compiled rule set (its digest verified) whose K17 is not 1
+    if (!ring_k17_built(net))
+        for (std::size_t i = 0; i < T.attempts.size(); ++i) {
+            const Deployment& a = T.attempts[i];
+            if (a.kind != kKindVote) continue;
+            for (const CompiledEpoch& c : T.compiled)
+                if (c.rules && rules_digest(*c.rules) == c.digest && c.digest == a.rules_digest &&
+                    c.rules->payment_groups != kPaymentGroups)
+                    return refuse("attempt " + std::to_string(i) + " (epoch " + std::to_string(a.epoch_no) +
+                                  "): a rule set with " + ring_k17_not_built(c.rules->payment_groups));
+        }
     return StartupCheck{};
 }
 
@@ -641,6 +674,14 @@ inline StartupCheck lane_rules_valid(LaneNet net, const EpochTable& T) {
         if (!c.has_value() || *c != a.rules_digest)
             return refuse("own attempt of epoch " + std::to_string(a.epoch_no) + " is not the compiled rules");
     }
+    // the release gate: a compiled epoch whose K17 is not 1
+    if (!ring_k17_built(net))
+        for (std::size_t i = 1; i < T.compiled.size(); ++i) {
+            const CompiledEpoch& c = T.compiled[i];
+            if (c.rules->payment_groups != kPaymentGroups)
+                return refuse("compiled epoch " + std::to_string(c.epoch_no) + ": " +
+                              ring_k17_not_built(c.rules->payment_groups));
+        }
     return StartupCheck{};
 }
 

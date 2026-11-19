@@ -14,6 +14,14 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
+option(V37_XMR_RING_TEST_EPOCHS "test-only: K > 1 test epochs, ring rules and their regtest start-up path; never in a release" OFF)
+if (V37_XMR_RING_TEST_EPOCHS)
+    if (CMAKE_CONFIGURATION_TYPES OR NOT CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
+        message(FATAL_ERROR "V37_XMR_RING_TEST_EPOCHS: built only as single-config RelWithDebInfo")
+    endif()
+    add_compile_definitions(V37_XMR_RING_TEST_EPOCHS=1)
+endif()
+
 if(MSVC)
     # Suppress common MSVC warnings for POSIX names and unsafe CRT functions
     add_compile_definitions(_CRT_SECURE_NO_WARNINGS _WINSOCK_DEPRECATED_NO_WARNINGS)

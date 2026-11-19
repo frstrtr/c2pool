@@ -2267,7 +2267,7 @@ void ratchet() {
     const pb::Hash32 r1 = seq32(0xA1);
     pb::EpochTable T;
     T.compiled.push_back(pb::CompiledEpoch{0, net.rules_g, std::nullopt});
-    T.compiled.push_back(pb::CompiledEpoch{1, r1, std::nullopt});
+    T.compiled.push_back(pb::CompiledEpoch{1, r1, pb::epoch0_lane_rules(pb::LaneNet::Regtest)});
     T.attempts.push_back(pb::Deployment{1, r1, pb::kKindVote, 0, 26000, 0});
     const std::uint64_t h_act = pb::window_h_act(rp, 0);  // locked in window 0: GRACE ends at 1,499 (x0 = 1,265 inside)
     KatNode a(net, kJ0, rp, T);

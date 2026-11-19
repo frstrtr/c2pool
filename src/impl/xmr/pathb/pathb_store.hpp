@@ -59,13 +59,19 @@
 //                  P-51's body floor binds: n >= 4,489 on a mature chain
 //                  (k x 72.2 MB), up to about 5,640 on a young chain
 //                  (k x 90.7 MB).)
+//   22 K_KSTEP     v37s:kstep:<chain>:<h_act %020u> u16 e | u64 h_act | u64 at_bin
+//                  (a K step of the best chain: an activation whose epoch's
+//                  depth differs from the depth of the epoch before it;
+//                  at_bin = H(h_act - 1) + 1 + Fresh; written in the batch of
+//                  its K_AR row, deleted with it, never pruned; none while the
+//                  compiled table has no K step)
 //   The poison mark v37s:poison:<chain> (one byte): a store write failed.
 //   The directory of a store is named by its pool_id and G (store_dir_name).
 //
 //   One batch per new best-chain position: K_PCARRIER(x), the lane records
-//   sealed at x and K_BMMR (BinStore), K_AR if x activates, K_PHEAD. A switch
-//   is one batch: K_PCARRIER and K_AR above the fork deleted, the new branch
-//   written. A joined store (with its K_BLO, x1 + 1) and the first batch of a
+//   sealed at x and K_BMMR (BinStore), K_AR if x activates (and K_KSTEP if
+//   that activation is a K step), K_PHEAD. A switch is one batch: K_PCARRIER,
+//   K_AR and K_KSTEP above the fork deleted, the new branch written. A joined store (with its K_BLO, x1 + 1) and the first batch of a
 //   pool launched here are written into an empty store (every key of its
 //   prefixes deleted in the same batch). A failed write leaves the poison mark
 //   (a batch of its own). A
@@ -85,6 +91,12 @@
 //        ids with rs_root(S_{tip - 1});
 //     4. AR: ascending, at or below the tip, consistent with S_tip (or the
 //        joiner seed of a joined store, at or below its root);
+//     4b. only when the compiled table has a K step: each K_KSTEP row
+//        decodes under its key, names a non-seed AR row (epoch, h_act) at
+//        h_act >= 1 whose pair is not of two known equal depths, and holds
+//        at_bin_of(H(h_act - 1)) when that record is held; every non-seed AR
+//        row whose pair is a known step has its row (any failure: KStep); the
+//        rows form the book;
 //     5. q0 = max(base_pos + 1, tip - J + 1); phase 1 (positions s1 .. q0 - 1,
 //        s1 = the first position above the root with H(x) > H(q0 - 1) - F -
 //        Fresh): the stored placements whose bin is open at q0 - 1, with their
@@ -126,6 +138,7 @@
 #include "pathb_admit.hpp"           // placement_of, CarrierBodies, carrier_frame
 #include "pathb_bin_store.hpp"
 #include "pathb_fork_choice.hpp"
+#include "pathb_kstep.hpp"
 #include "pathb_kv.hpp"
 #include "pathb_pool_identity.hpp"
 #include "pathb_ratchet_activation.hpp"
@@ -144,6 +157,8 @@ inline constexpr std::uint8_t K_NCU = 20;  // a node-local store layout kind, th
                                            // digest, frame or verdict reads it
 inline constexpr std::uint8_t K_PSIDE = 21;  // a node-local store layout kind, the next after K_NCU; no chain byte,
                                              // digest, frame or verdict reads it
+inline constexpr std::uint8_t K_KSTEP = 22;  // a node-local store layout kind, the next after K_PSIDE; no chain byte,
+                                             // digest, frame or verdict reads it
 
 namespace store_keys {
 inline std::string phead(std::uint32_t c) { return "v37s:phead:" + lane_keys::chain_fmt(c); }
@@ -161,6 +176,8 @@ inline std::string pside_prefix(std::uint32_t c) { return "v37s:pside:" + lane_k
 inline std::string pside(std::uint32_t c, const Hash32& id) { return pside_prefix(c) + pid_detail::hex(id); }
 // a torn K_PSIDE row moved aside (kept, never read)
 inline std::string pside_aside_prefix(std::uint32_t c) { return "v37s:psideaside:" + lane_keys::chain_fmt(c) + ":"; }
+inline std::string kstep_prefix(std::uint32_t c) { return "v37s:kstep:" + lane_keys::chain_fmt(c) + ":"; }
+inline std::string kstep(std::uint32_t c, std::uint64_t h_act) { return kstep_prefix(c) + lane_keys::index_fmt(h_act); }
 // The poison mark: a store write failed; the next load is a load failure.
 inline std::string poison(std::uint32_t c) { return "v37s:poison:" + lane_keys::chain_fmt(c); }
 }  // namespace store_keys
@@ -410,6 +427,32 @@ inline std::optional<ActivationRow> decode_ar_row(const std::string& v) {
     return a;
 }
 
+// ---------------------------------------------------------------------------
+// K_KSTEP
+// ---------------------------------------------------------------------------
+inline std::string encode_kstep_row(const KStepRecord& k) {
+    lane_rec::Writer w;
+    w.hdr(K_KSTEP);
+    w.u8(static_cast<std::uint8_t>(k.epoch & 0xffu));
+    w.u8(static_cast<std::uint8_t>(k.epoch >> 8));
+    w.u64(k.h_act);
+    w.u64(k.at_bin);
+    return w.s;
+}
+
+inline std::optional<KStepRecord> decode_kstep_row(const std::string& v) {
+    lane_rec::Reader r(v);
+    if (!lane_rec::read_hdr(r, K_KSTEP)) return std::nullopt;
+    KStepRecord k;
+    const std::uint32_t e_lo = r.u8();
+    const std::uint32_t e_hi = r.u8();
+    k.epoch = static_cast<std::uint16_t>(e_lo | (e_hi << 8));
+    k.h_act = r.u64();
+    k.at_bin = r.u64();
+    if (!r.done()) return std::nullopt;
+    return k;
+}
+
 inline std::string encode_bwork(std::uint64_t h, const ::c2pool::xmr::native::U128& w_) {
     lane_rec::Writer w;
     w.hdr(K_BWORK);
@@ -500,6 +543,12 @@ inline void delete_above(LaneBatch& b, std::uint32_t chain, std::uint64_t fork, 
 
 inline void put_head(LaneBatch& b, std::uint32_t chain, const StoreHead& h) { b.put(store_keys::phead(chain), encode_phead(h)); }
 
+// The K-step ops of a site: the erased entries' rows deleted, the entries put.
+inline void put_ksteps(LaneBatch& b, std::uint32_t chain, const KStepOps& ko) {
+    for (const std::uint64_t h : ko.del) b.del(store_keys::kstep(chain, h));
+    for (const KStepRecord& k : ko.put) b.put(store_keys::kstep(chain, k.h_act), encode_kstep_row(k));
+}
+
 // The record of a placed carrier at its position: the tree node's values,
 // the body and the placements as the store holds them.
 inline CarrierRecord record_of(const CarrierNode& n, const CarrierBodyV3* body, const LaneDelta* delta) {
@@ -570,12 +619,14 @@ inline LaneBatch genesis_batch(std::uint32_t chain, StoreHead& head, const Carri
 }
 
 // The batch of one new best-chain position (place_admitted Extended): its lane
-// records (`lane`, filled by switch_best), K_PCARRIER(x), the AR row of x, K_PHEAD.
+// records (`lane`, filled by switch_best), K_PCARRIER(x), the AR row of x, the
+// K-step ops of the book's sync (`ko`), K_PHEAD.
 inline LaneBatch extension_batch(std::uint32_t chain, StoreHead& head, const CarrierTree& tree, const BinStore& store,
                                  const CarrierBodies& bodies, const Hash32& id, LaneBatch lane,
-                                 const std::optional<ActivationRow>& row) {
+                                 const std::optional<ActivationRow>& row, const KStepOps& ko = {}) {
     const CarrierNode* n = tree.find(id);
     if (n != nullptr) put_position(lane, chain, record_of(*n, bodies.get(id), store.delta(id)), row);
+    put_ksteps(lane, chain, ko);
     head_at_tip(head, store);
     put_head(lane, chain, head);
     return lane;
@@ -584,10 +635,12 @@ inline LaneBatch extension_batch(std::uint32_t chain, StoreHead& head, const Car
 // The batch of a switch by the journal from old_tip to the store's new best
 // tip forking at `fork`: its lane records (`lane`, filled by switch_best),
 // K_PCARRIER and K_AR above the fork deleted (AR before the rewind), the new
-// branch written (`ar_after`: AR after the replay), K_PHEAD.
+// branch written (`ar_after`: AR after the replay), the K-step ops of the book's
+// sync above the fork (`ko`), K_PHEAD.
 inline LaneBatch switch_batch(std::uint32_t chain, StoreHead& head, const CarrierTree& tree, const BinStore& store,
                               const CarrierBodies& bodies, std::uint64_t fork, std::uint64_t old_tip,
-                              const ActivationRecord& ar_before, const ActivationRecord& ar_after, LaneBatch lane) {
+                              const ActivationRecord& ar_before, const ActivationRecord& ar_after, LaneBatch lane,
+                              const KStepOps& ko = {}) {
     delete_above(lane, chain, fork, old_tip, ar_before);
     for (std::uint64_t x = fork + 1; x <= store.tip_pos(); ++x) {
         const std::optional<Hash32> id = store.best_at(x);
@@ -598,6 +651,7 @@ inline LaneBatch switch_batch(std::uint32_t chain, StoreHead& head, const Carrie
             if (a.h_act == x) row = a;
         put_position(lane, chain, record_of(*n, bodies.get(*id), store.delta(*id)), row);
     }
+    put_ksteps(lane, chain, ko);
     head_at_tip(head, store);
     put_head(lane, chain, head);
     return lane;
@@ -615,12 +669,13 @@ inline LaneBatch switch_batch(std::uint32_t chain, StoreHead& head, const Carrie
 // restart replays the positions the session's journal held, from q0 =
 // max(root + 1, L - J + 1), its journal base the session's, max(L - J, root);
 // base_leaf_count = first_leaf() = lc(H(x0 - 1)) and base_peaks its peaks (0
-// and none on a young chain), S_base = S_L. nullopt: a position the store
-// names that the tree does not hold.
+// and none on a young chain), S_base = S_L; the adopted state's K-step book
+// (`kbook`). nullopt: a position the store names that the tree does not hold.
 inline std::optional<LaneBatch> adoption_batch(std::uint32_t chain, StoreHead& head, const CarrierTree& tree,
                                                const BinStore& store, const CarrierBodies& bodies,
                                                const ActivationRecord& ar, std::uint64_t root_pos,
-                                               const std::map<std::uint64_t, CarrierHeader>* prefix = nullptr) {
+                                               const std::map<std::uint64_t, CarrierHeader>* prefix = nullptr,
+                                               const KStepBook* kbook = nullptr) {
     LaneBatch b;
     store.write_all(b);
     // the open-bin placements by carrier (a position below the journal holds no delta)
@@ -663,6 +718,8 @@ inline std::optional<LaneBatch> adoption_batch(std::uint32_t chain, StoreHead& h
         put_position(b, chain, c, std::nullopt);
     }
     for (const ActivationRow& a : ar.rows()) b.put(store_keys::ar(chain, a.h_act), encode_ar_row(a));
+    if (kbook != nullptr)
+        for (const auto& [h, k] : *kbook) b.put(store_keys::kstep(chain, h), encode_kstep_row(k));
     head_at_tip(head, store);
     head.first_pos = first;
     head.root_pos = root_pos;
@@ -739,7 +796,8 @@ inline std::vector<std::string> store_prefixes(std::uint32_t chain) {
     return {store_keys::phead(chain),        store_keys::pcarrier_prefix(chain), store_keys::ar_prefix(chain),
             lane_keys::bmmr(chain),          lane_keys::blhash_prefix(chain),    lane_keys::bleaf_prefix(chain),
             store_keys::bwork_prefix(chain), store_keys::blo(chain),            store_keys::bclaim_prefix(chain),
-            store_keys::ncu(chain),          store_keys::poison(chain),          store_keys::pside_prefix(chain)};
+            store_keys::ncu(chain),          store_keys::poison(chain),          store_keys::pside_prefix(chain),
+            store_keys::kstep_prefix(chain)};
 }
 
 // The prune's K_PSIDE part at floors.sides: the rows at positions below `sides_floor`, and the rows of the carriers the
@@ -794,6 +852,8 @@ enum class StoreFault : std::uint8_t {
     Poisoned,   // the store's poison mark: a write failed before the last stop
     Work,       // a K_BWORK / K_BCLAIM record torn, not under its key or (K_BCLAIM) out of range; a K_BLO torn, out of
                 // range, or absent (joined); a K_NCU torn
+    KStep,      // a K_KSTEP row torn, not under its key, naming no non-seed AR row, naming a pair of two known equal
+                // depths, or holding another at_bin; a known K step without its row
 };
 
 struct LoadInputs {
@@ -821,6 +881,7 @@ struct LoadedState {
     std::size_t side_loaded = 0;   // K_PSIDE: side carriers placed again
     std::size_t side_skipped = 0;  // K_PSIDE: rows that did not place (parent not held, a check failed)
     std::size_t side_aside = 0;    // K_PSIDE: torn rows moved aside
+    KStepBook kbook;               // K_KSTEP: the book (only when the compiled table has a K step)
 };
 
 struct LoadResult {
@@ -1103,6 +1164,41 @@ inline LoadResult pathb_load(PathbKv& kv, const Hash32& dir_pool_id, const Hash3
             return fail(StoreFault::Ar);
     }
 
+    // 4b. K_KSTEP, only when the compiled table has a K step
+    KStepBook kbook;
+    if (table_has_k_step(in.T)) {
+        LaneKv kskv;
+        if (!store_detail::scan(kv, store_keys::kstep_prefix(in.chain), kskv)) return fail(StoreFault::Scan);
+        const std::size_t first_row = joined ? 1 : 0;  // a joined store's seed row has no pair
+        // the depths of row i's pair: the row before it (epoch 0 before a full store's first row) and the row
+        const auto pair_of = [&](std::size_t i) {
+            const std::optional<std::uint8_t> before =
+                    i == 0 ? std::optional<std::uint8_t>(kEpoch0Depth)
+                           : depth_of_epoch(in.T, rows[i - 1].epoch, rows[i - 1].rules_digest);
+            return std::make_pair(before, depth_of_epoch(in.T, rows[i].epoch, rows[i].rules_digest));
+        };
+        std::map<std::uint64_t, std::size_t> row_at;
+        for (std::size_t i = 0; i < rows.size(); ++i) row_at[rows[i].h_act] = i;
+        for (const auto& [k, v] : kskv) {
+            const std::optional<KStepRecord> r = decode_kstep_row(v);
+            if (!r || k != store_keys::kstep(in.chain, r->h_act)) return fail(StoreFault::KStep);
+            const auto it = row_at.find(r->h_act);
+            if (it == row_at.end() || it->second < first_row || rows[it->second].epoch != r->epoch)
+                return fail(StoreFault::KStep);
+            const auto [before, after] = pair_of(it->second);
+            if (before && after && *before == *after) return fail(StoreFault::KStep);
+            if (r->h_act == 0) return fail(StoreFault::KStep);  // no H(h_act - 1)
+            if (r->h_act - 1 >= H.first_pos &&
+                r->at_bin != at_bin_of(records[r->h_act - 1 - H.first_pos], p.fresh_max))
+                return fail(StoreFault::KStep);
+            kbook[r->h_act] = *r;
+        }
+        for (std::size_t i = first_row; i < rows.size(); ++i) {
+            const auto [before, after] = pair_of(i);
+            if (before && after && *before != *after && kbook.count(rows[i].h_act) == 0) return fail(StoreFault::KStep);
+        }
+    }
+
     // 5. phase 1: positions below q0 (the placements a judged tip's window may read)
     const std::uint64_t root = q0 - 1;
     const std::uint64_t H_root = rec_at(root).H;
@@ -1268,6 +1364,7 @@ inline LoadResult pathb_load(PathbKv& kv, const Hash32& dir_pool_id, const Hash3
         if (sb)
             for (const XmrKeyRef& ref : sb->refs) refs[key_ref_identity(ref)] = ref;
     LoadedState st{H, std::move(*tree), std::move(*store), std::move(ar), std::move(bodies), q0, s1, std::move(refs), {}, {}, 0, {}};
+    st.kbook = std::move(kbook);
     // a joined store's claimed prefix headers (header records at or below the root)
     for (std::uint64_t x = H.first_pos; x <= std::min(H.root_pos, tip); ++x) {
         const CarrierRecord& c = rec_at(x);

@@ -1,0 +1,290 @@
+name: xmr-ring-test-epochs
+
+# The roundabouts' test epochs and the release gate, on the ring-lane runners only:
+#   ring-test-epochs  a build with V37_XMR_RING_TEST_EPOCHS (RelWithDebInfo, no daemon target): the guard that refuses
+#                     the option in a Release build, the include proof, the ring and lane KATs;
+#   ring-gate-off     the ordinary build (Release, option off): the release-gate KAT, the K = 1 goldens, the lane KATs.
+# Each job holds the ring-lane lock (one ring-lane job per host), then the heavy-leg semaphore.
+on:
+  push:
+    branches: [pathb/roundabouts]
+    paths:
+      - 'src/impl/xmr/pathb/**'
+      - 'src/c2pool/v37/xmr/**'
+      - 'src/c2pool/v37/main_v37_xmr.cpp'
+      - 'CMakeLists.txt'
+      - 'src/c2pool/CMakeLists.txt'
+      - 'ci/conan/**'
+      - 'conanfile.txt'
+      - 'conan.lock'
+      - '.github/workflows/xmr-ring-test-epochs.yml'
+  pull_request:
+    branches: [pathb/roundabouts, master]
+    paths:
+      - 'src/impl/xmr/pathb/**'
+      - 'src/c2pool/v37/xmr/**'
+      - 'src/c2pool/v37/main_v37_xmr.cpp'
+      - 'CMakeLists.txt'
+      - 'src/c2pool/CMakeLists.txt'
+      - 'ci/conan/**'
+      - 'conanfile.txt'
+      - 'conan.lock'
+      - '.github/workflows/xmr-ring-test-epochs.yml'
+
+# A newer run on the same ref cancels a superseded PR run; a push run is never cancelled.
+concurrency:
+  group: xmr-ring-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'push' }}
+
+env:
+  GIT_HTTP_LOW_SPEED_LIMIT: '1000'
+  GIT_HTTP_LOW_SPEED_TIME: '20'
+
+jobs:
+  ring-test-epochs:
+    name: ring-test-epochs
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, c2pool-rb-lane]
+    steps:
+      - uses: actions/checkout@v6
+
+      # One ring-lane job per host, taken before the heavy-leg semaphore.
+      - name: Acquire the ring-lane lock
+        uses: ./.github/actions/heavy-leg-lock
+        with:
+          lock-file: /tmp/c2pool-rb-lane.lock
+          holder-file: /tmp/c2pool-rb-lane.holder
+          slots: "1"
+          holder-env: RB_LANE_LOCK_HOLDER
+      - name: Acquire VM905 build-host heavy-leg semaphore
+        uses: ./.github/actions/heavy-leg-lock
+        with:
+          lock-file: /tmp/c2pool-build-heavy-leg.lock
+          holder-file: /tmp/c2pool-build-heavy-leg.holder
+          slots: "3"
+      - name: Set per-job Conan home
+        run: |
+          # github-hosted: ephemeral per-job home, warmed by actions/cache below.
+          # self-hosted:   PERSISTENT home keyed on the runner instance. A runner
+          # executes one job at a time, so this home is never contended (no
+          # sqlite "failed to acquire database lock in 20s") while still keeping
+          # the per-job isolation of #704/#710 -- no two concurrent jobs share it.
+          # Being persistent, it also takes the GH cache-service restore off the
+          # hot path: that restore times out on VM905 ("Failed to restore: The
+          # operation cannot be completed in timeout") and its miss cascaded into
+          # a cold from-source Boost rebuild on all 8 runners at once.
+          if [ "${{ runner.environment }}" = "github-hosted" ]; then
+            echo "CONAN_HOME=$RUNNER_TEMP/conan2" >> "$GITHUB_ENV"
+          else
+            echo "CONAN_HOME=$HOME/.conan2-ci/$RUNNER_NAME" >> "$GITHUB_ENV"
+          fi
+
+      - name: Install Conan 2
+        run: |
+          if [ "${{ runner.environment }}" = "github-hosted" ]; then
+            pip install "conan>=2.0,<3.0"
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          else
+            conan --version   # pre-provisioned at /usr/local/bin on self-hosted
+          fi
+
+      - name: Prefer LAN Conan remote
+        run: bash ci/conan/lan-remote.sh
+
+      - name: Clean stale build dir (self-hosted workspace is reused)
+        if: runner.environment != 'github-hosted'
+        run: rm -rf build_ci
+
+      # The option is accepted only in a single-config build whose build type is exactly RelWithDebInfo.
+      - name: Release guard
+        shell: bash
+        run: |
+          for bt in "-DCMAKE_BUILD_TYPE=Release" "" "-DCMAKE_BUILD_TYPE=MinSizeRel" "-DCMAKE_BUILD_TYPE=release" \
+                    "-DCMAKE_BUILD_TYPE=relwithdebinfo" "-DCMAKE_BUILD_TYPE=Debug" "-DCMAKE_BUILD_TYPE=Production" \
+                    "-DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CONFIGURATION_TYPES=RelWithDebInfo"; do
+            d="$(mktemp -d "$RUNNER_TEMP/ring-guard.XXXXXX")"
+            if cmake -S . -B "$d" $bt -DV37_XMR_RING_TEST_EPOCHS=ON > "$d.log" 2>&1; then
+              echo "::error::a configure with V37_XMR_RING_TEST_EPOCHS=ON and '${bt:-no build type}' succeeded"
+              exit 1
+            fi
+            grep -F "V37_XMR_RING_TEST_EPOCHS: built only as single-config RelWithDebInfo" "$d.log"
+          done
+
+      # The RelWithDebInfo closure: --build=never.
+      - name: Conan prime (only conancenter egress)
+        run: |
+          for attempt in 1 2 3; do
+            if conan install . -pr:a=ci/conan/linux-gcc13-relwithdebinfo.profile --build=never --output-folder=build_ci; then exit 0; fi
+            echo "conan prime failed (attempt $attempt/3); retrying in $((attempt * 15))s"
+            sleep $((attempt * 15))
+          done
+          echo "conan prime failed after 3 attempts" >&2
+          exit 1
+
+      - name: Conan install (offline; --no-remote)
+        run: conan install . -pr:a=ci/conan/linux-gcc13-relwithdebinfo.profile --build=never --output-folder=build_ci -nr
+
+      - name: Configure (RelWithDebInfo, V37_XMR_RING_TEST_EPOCHS=ON)
+        run: cmake -S . -B build_ci -DCMAKE_TOOLCHAIN_FILE=build_ci/conan_toolchain.cmake -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_BUILD_TYPE=RelWithDebInfo -DC2POOL_DASH_BLS=OFF -DC2POOL_DASH_ALLOW_NO_BLS=ON -DCOIN_DGB=ON -DXMR_BUILD_RANDOMX=ON -DXMR_BUILD_OPTION_B_KATS=ON -DV37_XMR_RING_TEST_EPOCHS=ON -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+
+      # The include proof: every RelWithDebInfo include directory a lane TU needs (Boost through xmr_pathb; yaml-cpp
+      # and nlohmann_json through core for the store archive) is an include flag of that TU. And no daemon target.
+      - name: Include proof and no daemon target
+        shell: bash
+        run: |
+          python3 - <<'EOF'
+          import glob, json, os, re, shlex, sys
+          b = "build_ci"
+          inc = {}
+          for f in glob.glob(f"{b}/*-relwithdebinfo-*-data.cmake"):
+              s = open(f).read()
+              for m in re.finditer(r'set\(([A-Za-z0-9_.+-]+?)_PACKAGE_FOLDER_RELWITHDEBINFO "([^"]*)"\)', s):
+                  pkg, folder = m.group(1), m.group(2)
+                  d = re.search(r'set\(' + re.escape(pkg) + r'_INCLUDE_DIRS_RELWITHDEBINFO "([^"]*)"\)', s)
+                  if d:
+                      v = d.group(1).replace("${" + pkg + "_PACKAGE_FOLDER_RELWITHDEBINFO}", folder)
+                      inc[pkg] = [os.path.normpath(x) for x in re.split(r"[;\s]+", v) if x]
+          need = {
+              "src/impl/xmr/pathb/test/v37_xmr_ring_ksteps_kat.cpp": ["boost"],
+              "src/impl/xmr/pathb/test/v37_xmr_pathb_store_kat.cpp": ["boost"],
+              "src/c2pool/v37/xmr/pathb/xmr_pathb_store.cpp": ["boost", "yaml-cpp", "nlohmann_json"],
+          }
+          cc = json.load(open(f"{b}/compile_commands.json"))
+          bad = 0
+          for tu, pkgs in need.items():
+              cmds = [e for e in cc if os.path.normpath(e["file"]).endswith(os.path.normpath(tu))]
+              if len(cmds) != 1:
+                  print(f"::error::{tu}: {len(cmds)} compile commands"); bad += 1; continue
+              e = cmds[0]
+              args = e.get("arguments") or shlex.split(e["command"])
+              flags = set()
+              for i, a in enumerate(args):
+                  if a in ("-I", "-isystem") and i + 1 < len(args):
+                      flags.add(os.path.normpath(args[i + 1]))
+                  elif a.startswith("-isystem") and len(a) > len("-isystem"):
+                      flags.add(os.path.normpath(a[len("-isystem"):]))
+                  elif a.startswith("-I") and len(a) > len("-I"):
+                      flags.add(os.path.normpath(a[len("-I"):]))
+              for pkg in pkgs:
+                  dirs = inc.get(pkg)
+                  if not dirs:
+                      print(f"::error::{pkg}: no {pkg}_INCLUDE_DIRS_RELWITHDEBINFO in {b}"); bad += 1; continue
+                  for d in dirs:
+                      ok = d in flags
+                      print(f"{'ok' if ok else 'MISSING'}: {tu}: {pkg} {d}")
+                      bad += 0 if ok else 1
+          sys.exit(1 if bad else 0)
+          EOF
+          grep -qE '/CMakeFiles/v37_xmr_ring_ksteps_kat\.dir$' build_ci/CMakeFiles/TargetDirectories.txt
+          if grep -qE '/CMakeFiles/c2pool-v37-xmr\.dir$' build_ci/CMakeFiles/TargetDirectories.txt; then
+            echo "::error::the c2pool-v37-xmr target exists with V37_XMR_RING_TEST_EPOCHS=ON"
+            exit 1
+          fi
+
+      - name: Build
+        run: |
+          cmake --build build_ci -j"${BUILD_J:-8}" --target \
+              v37_xmr_ring_epoch_kat v37_xmr_ring_ksteps_kat v37_xmr_ring_release_gate_kat \
+              v37_xmr_ring_c1_golden_gen v37_xmr_ring_node_golden_gen v37_xmr_ring_store_golden_gen \
+              v37_xmr_ring_window_kat v37_xmr_ring_gate_off_kat v37_xmr_ring_key_kat v37_xmr_ring_partition_kat \
+              v37_xmr_pathb_admit_kat v37_xmr_pathb_body_v3_kat v37_xmr_pathb_branch_kat v37_xmr_pathb_bucket_wire_kat \
+              v37_xmr_pathb_coinbase_kat v37_xmr_pathb_e2e_kat v37_xmr_pathb_headers_first_kat v37_xmr_pathb_hello_kat \
+              v37_xmr_pathb_journal_kat v37_xmr_pathb_miner_tx_kat v37_xmr_pathb_node_join_kat v37_xmr_pathb_node_kat \
+              v37_xmr_pathb_pbx1_kat v37_xmr_pathb_store_kat \
+              v37_xmr_epoch_kat
+
+      - name: Run tests
+        run: ctest --test-dir build_ci --output-on-failure --no-tests=error -j8 -R '^(v37_xmr_ring_|v37_xmr_pathb_|v37_xmr_epoch_kat$)'
+
+      - name: Prune runner workspace
+        if: always()
+        uses: ./.github/actions/prune-runner-workspace
+
+  ring-gate-off:
+    name: ring-gate-off
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, c2pool-rb-lane]
+    steps:
+      - uses: actions/checkout@v6
+
+      # One ring-lane job per host, taken before the heavy-leg semaphore.
+      - name: Acquire the ring-lane lock
+        uses: ./.github/actions/heavy-leg-lock
+        with:
+          lock-file: /tmp/c2pool-rb-lane.lock
+          holder-file: /tmp/c2pool-rb-lane.holder
+          slots: "1"
+          holder-env: RB_LANE_LOCK_HOLDER
+      - name: Acquire VM905 build-host heavy-leg semaphore
+        uses: ./.github/actions/heavy-leg-lock
+        with:
+          lock-file: /tmp/c2pool-build-heavy-leg.lock
+          holder-file: /tmp/c2pool-build-heavy-leg.holder
+          slots: "3"
+      - name: Set per-job Conan home
+        run: |
+          # github-hosted: ephemeral per-job home, warmed by actions/cache below.
+          # self-hosted:   PERSISTENT home keyed on the runner instance. A runner
+          # executes one job at a time, so this home is never contended (no
+          # sqlite "failed to acquire database lock in 20s") while still keeping
+          # the per-job isolation of #704/#710 -- no two concurrent jobs share it.
+          # Being persistent, it also takes the GH cache-service restore off the
+          # hot path: that restore times out on VM905 ("Failed to restore: The
+          # operation cannot be completed in timeout") and its miss cascaded into
+          # a cold from-source Boost rebuild on all 8 runners at once.
+          if [ "${{ runner.environment }}" = "github-hosted" ]; then
+            echo "CONAN_HOME=$RUNNER_TEMP/conan2" >> "$GITHUB_ENV"
+          else
+            echo "CONAN_HOME=$HOME/.conan2-ci/$RUNNER_NAME" >> "$GITHUB_ENV"
+          fi
+
+      - name: Install Conan 2
+        run: |
+          if [ "${{ runner.environment }}" = "github-hosted" ]; then
+            pip install "conan>=2.0,<3.0"
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          else
+            conan --version   # pre-provisioned at /usr/local/bin on self-hosted
+          fi
+
+      - name: Prefer LAN Conan remote
+        run: bash ci/conan/lan-remote.sh
+
+      - name: Clean stale build dir (self-hosted workspace is reused)
+        if: runner.environment != 'github-hosted'
+        run: rm -rf build_ci
+
+      - name: Conan prime (only conancenter egress)
+        run: |
+          for attempt in 1 2 3; do
+            if conan install . -pr:a=ci/conan/linux-gcc13.profile --build=missing --output-folder=build_ci; then exit 0; fi
+            echo "conan prime failed (attempt $attempt/3); retrying in $((attempt * 15))s"
+            sleep $((attempt * 15))
+          done
+          echo "conan prime failed after 3 attempts" >&2
+          exit 1
+
+      - name: Conan install (offline; --no-remote)
+        run: conan install . -pr:a=ci/conan/linux-gcc13.profile --build=missing --output-folder=build_ci -nr
+
+      - name: Configure
+        run: cmake -S . -B build_ci -DCMAKE_TOOLCHAIN_FILE=build_ci/conan_toolchain.cmake -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_BUILD_TYPE=Release -DC2POOL_DASH_BLS=OFF -DC2POOL_DASH_ALLOW_NO_BLS=ON -DCOIN_DGB=ON -DXMR_BUILD_RANDOMX=ON -DXMR_BUILD_OPTION_B_KATS=ON
+
+      - name: Build
+        run: |
+          cmake --build build_ci -j"${BUILD_J:-8}" --target \
+              v37_xmr_ring_release_gate_kat v37_xmr_ring_store_golden_gen \
+              v37_xmr_ring_c1_golden_gen v37_xmr_ring_node_golden_gen v37_xmr_ring_window_kat v37_xmr_ring_gate_off_kat \
+              v37_xmr_ring_key_kat v37_xmr_ring_partition_kat \
+              v37_xmr_pathb_admit_kat v37_xmr_pathb_body_v3_kat v37_xmr_pathb_branch_kat v37_xmr_pathb_bucket_wire_kat \
+              v37_xmr_pathb_coinbase_kat v37_xmr_pathb_e2e_kat v37_xmr_pathb_headers_first_kat v37_xmr_pathb_hello_kat \
+              v37_xmr_pathb_journal_kat v37_xmr_pathb_miner_tx_kat v37_xmr_pathb_node_join_kat v37_xmr_pathb_node_kat \
+              v37_xmr_pathb_pbx1_kat v37_xmr_pathb_store_kat \
+              v37_xmr_epoch_kat v37_xmr_joiner_kat xmr_carrier_sharechain_kat
+
+      - name: Run tests
+        run: ctest --test-dir build_ci --output-on-failure --no-tests=error -j8 -R '^(v37_xmr_ring_|v37_xmr_pathb_|v37_xmr_epoch_kat$|v37_xmr_joiner_kat|xmr_carrier_sharechain_kat$)' -E '^v37_xmr_pathb_regtest_smoke$'
+
+      - name: Prune runner workspace
+        if: always()
+        uses: ./.github/actions/prune-runner-workspace

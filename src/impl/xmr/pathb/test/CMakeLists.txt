@@ -82,6 +82,18 @@
 #   v37_xmr_ring_partition_kat       every key / row in exactly one ring per depth; children
 #                                    partition the parent
 #
+# Roundabouts slice C-3 (pathb_kstep.hpp: depth, at_bin, the K-step list and book; the release gate):
+#   v37_xmr_ring_release_gate_kat    the one compiled epoch of main_v37_xmr.cpp, no ring_rules without the
+#                                    option, no K-step call at K = 1 (a process-wide counter), the store's
+#                                    prefixes, the headless load, a K17 = 2 epoch refused (off regtest with
+#                                    the option), each counted function adds one per call, a K_KSTEP row at
+#                                    h_act 0 refused; built with libstdc++ assertions
+#   v37_xmr_ring_store_golden        v37_xmr_ring_store_golden_gen reproduces golden/ring_store.golden
+#   v37_xmr_ring_epoch_kat           (option only) at_bin, depths, the ring rules' refusals, sigma and
+#                                    merge_delta values
+#   v37_xmr_ring_ksteps_kat          (option only) the K-step list of every tip against an oracle node,
+#                                    the book at each site, the restart's K-step rows
+#
 # Slice S3b-3 KAT (pathb_bucket_wire.hpp; unwired):
 #   v37_xmr_pathb_bucket_wire_kat    FC_GETBUCKETS / FC_BUCKETS codec, verifier, paging,
 #                                    serving rule, per-peer budget
@@ -168,7 +180,8 @@ if (BUILD_TESTING)
             v37_xmr_ring_window_kat
             v37_xmr_ring_gate_off_kat
             v37_xmr_ring_key_kat
-            v37_xmr_ring_partition_kat)
+            v37_xmr_ring_partition_kat
+            v37_xmr_ring_release_gate_kat)
         add_executable(${_pathb_kat} ${_pathb_kat}.cpp)
         target_include_directories(${_pathb_kat} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
         target_link_libraries(${_pathb_kat} PRIVATE xmr_pathb)
@@ -241,6 +254,10 @@ if (BUILD_TESTING)
     target_link_libraries(v37_xmr_pathb_node_kat PRIVATE xmr_node Threads::Threads)
     # v37_xmr_pathb_node_join_kat drives a restarted joined node through the relay node as well.
     target_link_libraries(v37_xmr_pathb_node_join_kat PRIVATE Threads::Threads)
+    # v37_xmr_ring_release_gate_kat runs persisted nodes and a second thread, and reads main_v37_xmr.cpp.
+    target_link_libraries(v37_xmr_ring_release_gate_kat PRIVATE xmr_node Threads::Threads)
+    target_compile_definitions(v37_xmr_ring_release_gate_kat PRIVATE _GLIBCXX_ASSERTIONS
+            V37_MAIN_SRC="${CMAKE_SOURCE_DIR}/src/c2pool/v37/main_v37_xmr.cpp")
     # v37_xmr_ring_c1_golden_gen / v37_xmr_ring_node_golden_gen: the K = 1 window and node goldens
     # (test-only generators; the sha256 of their sources is compiled into each golden's header).
     file(SHA256 ${CMAKE_CURRENT_SOURCE_DIR}/v37_xmr_ring_c1_golden_gen.cpp _ring_c1_gen_sha)
@@ -260,9 +277,30 @@ if (BUILD_TESTING)
     target_link_libraries(v37_xmr_ring_node_golden_gen PRIVATE xmr_pathb xmr_node Threads::Threads)
     target_compile_definitions(v37_xmr_ring_node_golden_gen PRIVATE
             RING_NODE_GEN_SHA256="${_ring_node_gen_sha}" RING_C1_VEC_SHA256="${_ring_c1_vec_sha}")
+    # v37_xmr_ring_store_golden_gen: the K = 1 store golden (test-only; the sha256 of its source is compiled into
+    # the golden's header).
+    file(SHA256 ${CMAKE_CURRENT_SOURCE_DIR}/v37_xmr_ring_store_golden_gen.cpp _ring_store_gen_sha)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+            ${CMAKE_CURRENT_SOURCE_DIR}/v37_xmr_ring_store_golden_gen.cpp)
+    add_executable(v37_xmr_ring_store_golden_gen v37_xmr_ring_store_golden_gen.cpp)
+    target_include_directories(v37_xmr_ring_store_golden_gen PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(v37_xmr_ring_store_golden_gen PRIVATE xmr_pathb xmr_node Threads::Threads)
+    target_compile_definitions(v37_xmr_ring_store_golden_gen PRIVATE RING_STORE_GEN_SHA256="${_ring_store_gen_sha}")
     # v37_xmr_ring_c1_golden / v37_xmr_ring_node_golden: each generator reproduces its golden byte for byte.
     add_test(NAME v37_xmr_ring_c1_golden
             COMMAND v37_xmr_ring_c1_golden_gen --check=${CMAKE_CURRENT_SOURCE_DIR}/golden/ring_c1_window.golden)
     add_test(NAME v37_xmr_ring_node_golden
             COMMAND v37_xmr_ring_node_golden_gen --check=${CMAKE_CURRENT_SOURCE_DIR}/golden/ring_node.golden)
+    add_test(NAME v37_xmr_ring_store_golden
+            COMMAND v37_xmr_ring_store_golden_gen --check=${CMAKE_CURRENT_SOURCE_DIR}/golden/ring_store.golden)
+    # Test builds only (V37_XMR_RING_TEST_EPOCHS): the K > 1 test epochs.
+    if (V37_XMR_RING_TEST_EPOCHS)
+        foreach(_ring_kat v37_xmr_ring_epoch_kat v37_xmr_ring_ksteps_kat)
+            add_executable(${_ring_kat} ${_ring_kat}.cpp)
+            target_include_directories(${_ring_kat} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+            target_link_libraries(${_ring_kat} PRIVATE xmr_pathb)
+            add_test(NAME ${_ring_kat} COMMAND ${_ring_kat})
+        endforeach()
+        target_link_libraries(v37_xmr_ring_ksteps_kat PRIVATE xmr_node Threads::Threads)
+    endif()
 endif()
