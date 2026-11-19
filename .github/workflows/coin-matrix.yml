@@ -214,6 +214,8 @@ jobs:
 
       - name: Embedded daemonless gtest (no --coin-rpc; self-derive path)
         if: steps.presence.outputs.exists == '1' && matrix.gtest == '1'
+        # A stuck build or test becomes a named failure, not a job-long hang.
+        timeout-minutes: 45
         # PRE-STAGED: runs the dashd-cut replay/fold gtests that exercise the
         # daemonless self-derive path with NO --coin-rpc arm. Selector is pinned
         # to the #1293 dashd-cut family (test_dash_replay_*, test_dash_mn_checkpoint,
@@ -222,12 +224,14 @@ jobs:
         # the real CamelCase gtest suites (gtest_add_tests AUTO): DashBlockReplay
         # in test_dash_block_replay + DashReplay*/DashMnCheckpoint*/DashMnPayee*/
         # DashMnAnchor*/DashMnBridge* in test_dash_mn_state, plus ReplayUtxo* fold.
-        # Builds ONLY the six executables behind that selector (was: every
-        # target in the repo, ~973 objects, 45-90 min on the shared 905 host).
-        # The script's guard fails the step if the selector matches 0 tests, if
-        # any selected test's executable was not built, if the executables
-        # behind the selection drift from its TARGETS list, or if ctest ran a
-        # different number of tests than it listed: no hollow green.
+        # Builds ONLY the six executables behind that selector plus every
+        # discover-mode test target (was: every target in the repo, ~973
+        # objects, 45-90 min on the shared 905 host). The script's guard fails
+        # the step if a discover-mode target stays unlisted, if the selector
+        # matches 0 tests, if any selected test's executable was not built, if
+        # the executables behind the selection drift from its TARGETS list, or
+        # if ctest ran (plus DISABLED_) a different number of tests than it
+        # listed: no hollow green.
         run: bash ci/dash_daemonless_gtest.sh build_${{ matrix.coin }} "${BUILD_J:-4}"
 
       - name: Upload build artifacts on failure
