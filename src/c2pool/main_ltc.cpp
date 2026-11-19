@@ -98,6 +98,7 @@
 #include <c2pool/difficulty/adjustment_engine.hpp>
 #include <c2pool/storage/sharechain_storage.hpp>
 #include <c2pool/storage/found_block_store.hpp>
+#include <c2pool/storage/found_block_record_map.hpp>
 #include <c2pool/payout/payout_manager.hpp>
 
 // --- Platform-specific crash handler ---
@@ -647,7 +648,11 @@ void print_help() {
     std::cout << "                              --import-found-blocks blocks.json --import-found-blocks merged.json\n";
     std::cout << "                            Each block is validated against this node's own header chain\n";
     std::cout << "                            for its chain (LTC, DOGE) once it is synced; rows already held\n";
-    std::cout << "                            only gain missing fields. YAML import_found_blocks (a path\n";
+    std::cout << "                            only gain missing fields. A row's effort measured by the\n";
+    std::cout << "                            source over more of its round than this node's own history\n";
+    std::cout << "                            covers is kept with it (effort_method \"imported\"); a\n";
+    std::cout << "                            second import of the same file fills it on rows a build\n";
+    std::cout << "                            without it imported. YAML import_found_blocks (a path\n";
     std::cout << "                            or a list)\n";
     std::cout << "  --ltc-connect IP[:PORT]   Dial only this LTC peer (repeatable): no peer DB, DNS /\n";
     std::cout << "                            fixed / HTTP seeds or addr gossip (Core's -connect)\n";
@@ -3360,35 +3365,12 @@ int main(int argc, char* argv[]) {
                     using MI = core::MiningInterface;
                     mi->set_found_block_persistence(
                         [fblk_store, fblk_leveldb](const MI::FoundBlock& blk) -> bool {
-                            c2pool::storage::FoundBlockRecord rec;
-                            rec.chain = blk.chain;
-                            rec.height = blk.height;
-                            rec.block_hash = blk.hash;
-                            rec.timestamp = blk.ts;
-                            rec.status = static_cast<uint8_t>(blk.status);
-                            rec.check_count = blk.check_count;
-                            rec.confirmations = blk.confirmations;
-                            rec.last_checked = static_cast<uint64_t>(std::time(nullptr));
-                            // #159: persist dashboard-enrichment fields so a
-                            // restored row keeps its full detail after a restart.
-                            rec.finder_address = blk.miner;
-                            rec.reward_satoshis = blk.subsidy;
-                            rec.network_difficulty = blk.network_difficulty;
-                            rec.share_difficulty = blk.share_difficulty;
-                            rec.pool_hashrate = blk.pool_hashrate;
-                            rec.share_hash = blk.share_hash;
-                            rec.authorship = static_cast<uint8_t>(blk.authorship);
-                            // #946: explorer fields (fblk v3).
-                            rec.coinbase_txid = blk.coinbase_txid;
-                            rec.tx_count = blk.tx_count;
-                            // #946: DOGE parent (fblk v4); set_found_block_parent
-                            // re-persists the row, so it survives a restart.
-                            rec.parent_hash = blk.parent_hash;
-                            rec.parent_height = blk.parent_height;
-                            // DOGE rows: network_difficulty is the aux chain's
-                            // own (fblk extension byte).
-                            rec.aux_difficulty_known = blk.aux_difficulty_known;
-                            rec.imported = blk.imported;   // --import-found-blocks row
+                            // Every persisted field (#159 enrichment, #946
+                            // explorer + DOGE parent, the extension byte and
+                            // the imported-effort tail):
+                            // c2pool/storage/found_block_record_map.hpp.
+                            const auto rec = c2pool::storage::found_block_record_of(
+                                blk, static_cast<uint64_t>(std::time(nullptr)));
                             // A corrected height names the key it moved from.
                             return fblk_store->store(rec, blk.replaced_height);
                         },
@@ -3396,35 +3378,8 @@ int main(int argc, char* argv[]) {
                             auto records = fblk_store->load_all();
                             std::vector<MI::FoundBlock> result;
                             result.reserve(records.size());
-                            for (const auto& rec : records) {
-                                MI::FoundBlock blk;
-                                blk.height = rec.height;
-                                blk.hash = rec.block_hash;
-                                blk.ts = rec.timestamp;
-                                blk.status = static_cast<MI::BlockStatus>(rec.status);
-                                blk.check_count = rec.check_count;
-                                blk.chain = rec.chain;
-                                blk.confirmations = rec.confirmations;
-                                // #159: restore enrichment (v1 records => 0).
-                                blk.miner = rec.finder_address;
-                                blk.subsidy = rec.reward_satoshis;
-                                blk.network_difficulty = rec.network_difficulty;
-                                blk.share_difficulty = rec.share_difficulty;
-                                blk.pool_hashrate = rec.pool_hashrate;
-                                blk.share_hash = rec.share_hash;
-                                blk.authorship = static_cast<MI::BlockAuthorship>(rec.authorship);
-                                // #946: v1/v2 records leave these unknown (null).
-                                blk.coinbase_txid = rec.coinbase_txid;
-                                blk.tx_count = rec.tx_count;
-                                // #946: v1-v3 records leave the parent unknown (null).
-                                blk.parent_hash = rec.parent_hash;
-                                blk.parent_height = rec.parent_height;
-                                // false on a row written before the flag: its
-                                // stored difficulty is the parent's.
-                                blk.aux_difficulty_known = rec.aux_difficulty_known;
-                                blk.imported = rec.imported;
-                                result.push_back(std::move(blk));
-                            }
+                            for (const auto& rec : records)
+                                result.push_back(c2pool::storage::found_block_of(rec));
                             return result;
                         }
                     );
@@ -7208,6 +7163,14 @@ int main(int argc, char* argv[]) {
                             // The aux chain's own difficulty, off the aux
                             // header's bits (display: the block's luck).
                             blk.difficulty = chain::target_to_difficulty(target);
+                            // The pool rate at find (display: the block's
+                            // pool_hashrate_at_find and single-sample luck):
+                            // the live estimator for a share relayed as it
+                            // is found, none for one the startup scan of the
+                            // share chain meets long after.
+                            blk.pool_hashrate = mi->gross_pool_hashrate_at(
+                                static_cast<double>(share_ts),
+                                static_cast<double>(std::time(nullptr)));
                             // Get real LTC block height from header chain
                             if (ltc_header_chain) {
                                 auto ltc_entry = ltc_header_chain->get_header(share_hash);
@@ -7227,6 +7190,8 @@ int main(int argc, char* argv[]) {
                                 rec.is_local = blk.is_local; rec.parent_height = blk.parent_height;
                                 rec.miner = blk.miner;
                                 rec.difficulty = blk.difficulty;
+                                // A held rate is kept (MergedBlockStore::store).
+                                rec.pool_hashrate = blk.pool_hashrate;
                                 ms->store(rec);
                             }
                         }
@@ -11045,6 +11010,12 @@ int main(int argc, char* argv[]) {
                     blk.miner = ctx.miner;
                     // The DOGE block's own difficulty (display: its luck).
                     blk.difficulty = chain::target_to_difficulty(doge_target);
+                    // The pool rate at find, when the share is this recent
+                    // (MiningInterface::gross_pool_hashrate_at).
+                    if (ctx.share_ts > 0)
+                        blk.pool_hashrate = mi_ptr_for_merge->gross_pool_hashrate_at(
+                            static_cast<double>(ctx.share_ts),
+                            static_cast<double>(std::time(nullptr)));
                     // Request full DOGE block from P2P to get exact coinbase_value.
                     // The block arrives async — we set coinbase_value=0 now and update
                     // when the DOGE block arrives via the full_block callback.
@@ -11070,6 +11041,7 @@ int main(int argc, char* argv[]) {
                         rec.is_local = blk.is_local; rec.parent_height = blk.parent_height;
                         rec.miner = blk.miner;
                         rec.difficulty = blk.difficulty;
+                        rec.pool_hashrate = blk.pool_hashrate;   // a held one is kept
                         ms->store(rec);
                     }
 
@@ -11247,6 +11219,7 @@ int main(int argc, char* argv[]) {
                         blk.parent_height = rec.parent_height;
                         blk.miner = rec.miner;
                         blk.difficulty = rec.difficulty;   // 0 on an older record
+                        blk.pool_hashrate = rec.pool_hashrate;   // 0: not known
                         mm->add_discovered_block(blk);  // dedup handles duplicates
                         ++loaded;
                     }

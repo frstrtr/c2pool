@@ -1237,6 +1237,19 @@ public:
         // A later record of the block by this node clears it. Persisted (fblk
         // extension byte).
         bool imported{false};
+        // Another node's measured effort of the round that ends in this block
+        // (import_found_blocks: the source row's effort / history_coverage /
+        // prev_block_hash; taken only where it was integrated, the source was
+        // watching when the block was found, it is plausibly the pool's, and
+        // it covered more of the same round than this node's own history
+        // did). An INPUT, kept when the node later records the block itself:
+        // luck uses it while it still covers more of the round than this
+        // node's own integral and the round still runs from
+        // imported_prev_hash (core::luck::imported_effort_wins). 0 = none.
+        // Persisted (fblk extension tail, behind an extension-byte bit).
+        double      imported_effort{0};
+        double      imported_coverage{0};   // the source's history_coverage, (0, 1]
+        std::string imported_prev_hash;     // the block the source timed the round from
         // ── Luck (core/pool_luck.hpp). DERIVED, never persisted: recomputed
         // from the inputs above and the pool rate history on every insert,
         // load, input repair and read, so a stored bad input heals. effort is
@@ -1726,6 +1739,16 @@ public:
     /// The gross pool rate right now: the estimator's non-stale rate over
     /// (1 - the newest sampled stale proportion). 0 = no estimator reading.
     double gross_pool_hashrate() const;
+    /// The gross pool rate as a reading AT `block_ts`: gross_pool_hashrate()
+    /// when the block is no more than kLiveRateAtFindMaxLag from `now` (a
+    /// peer's share relayed as it is found), else 0 -- a block learned long
+    /// after it was found (the startup scan of the share chain) is not
+    /// measured at today's rate. What a merged block learned from a peer is
+    /// stored with (DiscoveredMergedBlock::pool_hashrate).
+    double gross_pool_hashrate_at(double block_ts, double now) const;
+    /// How far a block's time may be from now for the live rate to stand as
+    /// its rate at find.
+    static constexpr double kLiveRateAtFindMaxLag = 600.0;
 
 private:
     /// The luck rate history is bounded like the year-scale graph store that
@@ -1776,6 +1799,10 @@ private:
     /// plausibly a pool rate, else the history's at the block's own time,
     /// else none. CALLER MUST HOLD m_luck_history_mutex.
     RateAtFind rate_at_find_locked(const FoundBlock& b) const;
+    /// The same for a rate `recorded` with a block of time `ts` whose
+    /// winning share had `share_difficulty` (0 = not known): a merged block
+    /// the merged manager holds. CALLER MUST HOLD m_luck_history_mutex.
+    RateAtFind rate_at_find_locked(double recorded, double share_difficulty, double ts) const;
     /// The aux header chain's difficulty for a merged block (0 = no lookup
     /// wired for the chain, or it does not hold the header). Takes
     /// m_blocks_mutex for the lookup, calls it with the lock released.

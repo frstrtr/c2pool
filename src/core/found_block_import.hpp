@@ -22,6 +22,21 @@
 // pool_hashrate_at_find, share, miner, subsidy, coinbase_txid, tx_count and
 // parent_hash are taken when present and well-formed.
 //
+// THE SOURCE'S EFFORT. The pool rate luck integrates is the SHARE CHAIN's,
+// the same on every node of the pool, so a round the source's history
+// covered is a measurement for every node. A row's effort, history_coverage
+// and prev_block_hash are offered where the source integrated it
+// (effort_method "integrated", or "imported" from a node that did) and was
+// watching when the block was found (measured true). It is kept with the row
+// (FoundBlock::imported_effort) only where it is a better measurement of the
+// SAME round than this node's own: the round here runs from the same block,
+// the node's own history covers less of it (a tie keeps the node's own), and
+// it is not the node's first block (1.0 by definition). Before that it must
+// be plausibly the pool's: the mean rate it implies over the round (from
+// this node's own block times and difficulty) is held to the bounds a rate
+// at find is held to (core::luck::imported_effort_plausible). What is
+// refused is counted (Report::effort_refused). Display only, like the rest.
+//
 // TRUST: only the HASH is taken on trust, and only as a question to the
 // node's own header chain for the row's chain (LTC; DOGE for a merged row),
 // each against its own root: what it refuses is counted per chain. A row gets
@@ -35,7 +50,11 @@
 //
 // IDEMPOTENT: a block the ledger already holds is merged, fill-only: a field
 // the row lacks is filled, nothing the node recorded itself is replaced.
-// Importing the same file twice changes nothing the second time.
+// Importing the same file twice changes nothing the second time. The
+// source's effort is such a field: a row imported by a build that did not
+// take it (0.2.12.10) gains it on the next import of the same file, once;
+// a row that holds one, or whose own measurement covers as much of the
+// round, is left as it is.
 
 #include <core/target_utils.hpp>
 #include <core/uint256.hpp>
@@ -66,6 +85,14 @@ struct Row {
     std::string             coinbase_txid;
     std::optional<uint32_t> tx_count;
     std::string             parent_hash;            ///< merged (aux) rows only
+    /// The source's measured effort of the round (see the top of this file):
+    /// offered when the row says it was integrated (effort_method
+    /// "integrated" / "imported") and measured. The numbers are as the file
+    /// has them (a non-number reads NaN); import_found_blocks judges them.
+    bool                    effort_offered{false};
+    double                  effort{0.0};            ///< effort
+    double                  effort_coverage{0.0};   ///< history_coverage
+    std::string             effort_prev_hash;       ///< prev_block_hash ("" = not a hash)
 };
 
 /// A parsed import file.
@@ -183,6 +210,14 @@ struct Report {
     uint64_t height_corrected{0};  ///< rows whose height the header contradicted
     uint64_t pool_verified{0};     ///< coinbase checked: pays the pool's donation
     uint64_t rate_refused{0};      ///< pool_hashrate_at_find not plausibly the pool's
+    uint64_t effort_taken{0};      ///< rows given the source's measured effort
+    /// The source's effort refused: malformed (no finite effort > 0, no
+    /// coverage in (0, 1], no prev_block_hash) or not plausibly the pool's.
+    uint64_t effort_refused{0};
+    /// Offered, plausible or not judged, and not taken: the row holds one
+    /// already, the node's own measurement covers as much of the round, the
+    /// round here runs from another block, or it is the node's first block.
+    uint64_t effort_not_used{0};
     uint64_t pending{0};           ///< imported less than 6 deep: verified like a find
     std::map<std::string, uint64_t> imported_by_chain;   ///< chain label -> new rows
     std::map<std::string, uint64_t> rejected;            ///< reason -> rows, every chain

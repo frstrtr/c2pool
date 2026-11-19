@@ -368,6 +368,90 @@ TEST(FoundBlockStoreKat, FblkExtensionByteCarriesTheAuxDifficultyFlag)
     EXPECT_FALSE(FoundBlockRecord::deserialize(cut).aux_difficulty_known);
 }
 
+// The source node's measured effort of an imported row's round rides a tail
+// AFTER the extension byte, behind its bit 0x04 -- no version bump. A row
+// without one is byte for byte what the earlier writer wrote; with one it is
+// that row plus the tail. Every earlier build stops reading at (or before)
+// the extension byte, so it loads such a row with every field it knows; when
+// it writes the row back it drops the tail and the bit, which reads here as
+// "no imported effort".
+TEST(FoundBlockStoreKat, ImportedEffortRidesATailBehindItsExtensionBit)
+{
+    FoundBlockRecord rec = FoundBlockRecord::deserialize(fblk_v2_record().v);
+    rec.chain = "DOGE";
+    rec.parent_hash = hash_n(0x17c);
+    rec.parent_height = 3211872;
+    rec.aux_difficulty_known = true;
+    rec.imported = true;
+    const auto without = rec.serialize();
+    ASSERT_EQ(without[0], 4) << "no version bump";
+    EXPECT_EQ(without.back(),
+              FoundBlockRecord::kExtAuxDifficultyKnown | FoundBlockRecord::kExtImported);
+    auto back = FoundBlockRecord::deserialize(without);
+    EXPECT_FALSE(back.has_imported_effort());
+    EXPECT_DOUBLE_EQ(back.imported_effort, 0.0);
+
+    // DOGE 6454700 as ltc.voidbind.com measured it.
+    rec.imported_effort = 1.3911304960028799;
+    rec.imported_coverage = 1.0;
+    rec.imported_prev_hash = hash_n(0xb9ed3c3d);
+    const auto with = rec.serialize();
+    ASSERT_EQ(with[0], 4);
+    ASSERT_EQ(with.size(), without.size() + 8 + 8 + 1 + 64);
+    EXPECT_TRUE(std::equal(without.begin(), without.end() - 1, with.begin()))
+        << "the earlier row up to its extension byte";
+    EXPECT_EQ(with[without.size() - 1],
+              FoundBlockRecord::kExtAuxDifficultyKnown | FoundBlockRecord::kExtImported
+                  | FoundBlockRecord::kExtImportedEffort);
+    back = FoundBlockRecord::deserialize(with);
+    EXPECT_DOUBLE_EQ(back.imported_effort, 1.3911304960028799);
+    EXPECT_DOUBLE_EQ(back.imported_coverage, 1.0);
+    EXPECT_EQ(back.imported_prev_hash, hash_n(0xb9ed3c3d));
+    EXPECT_TRUE(back.aux_difficulty_known);
+    EXPECT_TRUE(back.imported);
+    EXPECT_EQ(back.parent_hash, hash_n(0x17c));
+    ASSERT_TRUE(back.parent_height.has_value());
+    EXPECT_EQ(*back.parent_height, 3211872u);
+    EXPECT_EQ(back.serialize(), with) << "round-trips byte for byte";
+
+    // What an earlier build writes back: its fields, its bits, no tail.
+    auto rewritten = std::vector<uint8_t>(with.begin(), with.begin() + without.size());
+    rewritten.back() &= static_cast<uint8_t>(~FoundBlockRecord::kExtImportedEffort);
+    EXPECT_EQ(rewritten, without);
+    EXPECT_FALSE(FoundBlockRecord::deserialize(rewritten).has_imported_effort());
+
+    // A cut tail is no imported effort -- never leftover bytes -- and the
+    // rest of the row stands.
+    for (size_t cut : {size_t(1), size_t(30), size_t(64), size_t(66), size_t(80)}) {
+        auto c = with;
+        c.resize(with.size() - cut);
+        const auto r = FoundBlockRecord::deserialize(c);
+        EXPECT_EQ(r.block_hash, kHashA) << cut;
+        EXPECT_FALSE(r.has_imported_effort()) << cut;
+        EXPECT_DOUBLE_EQ(r.imported_effort, 0.0) << cut;
+        EXPECT_TRUE(r.imported) << cut;
+        EXPECT_TRUE(r.aux_difficulty_known) << cut;
+    }
+    // A figure out of range is neither written nor read.
+    for (double coverage : {0.0, 1.5, std::nan("")}) {
+        FoundBlockRecord bad = rec;
+        bad.imported_coverage = coverage;
+        EXPECT_EQ(bad.serialize(), without) << coverage;
+    }
+    {
+        auto forged = with;
+        double big = 7.0;   // coverage 7 in the tail
+        std::memcpy(&forged[without.size() + 8], &big, sizeof(big));
+        EXPECT_FALSE(FoundBlockRecord::deserialize(forged).has_imported_effort());
+    }
+    // Rows from before the extension byte, and from before the tail, load
+    // with no imported effort.
+    auto pre_ext = without;
+    pre_ext.pop_back();
+    EXPECT_FALSE(FoundBlockRecord::deserialize(pre_ext).has_imported_effort());
+    EXPECT_FALSE(FoundBlockRecord::deserialize(fblk_v2_record().v).has_imported_effort());
+}
+
 TEST(FoundBlockStoreKat, UnknownVersionsAreRejected)
 {
     auto f = fblk_v2_record().v; f[0] = 5;
@@ -495,6 +579,87 @@ TEST(MergedBlockStoreKat, MblkExtensionCarriesTheAuxDifficulty)
     auto cut = with_difficulty;
     cut.resize(cut.size() - 3);
     EXPECT_DOUBLE_EQ(MergedBlockRecord::deserialize(cut).difficulty, 0.0);
+}
+
+// The pool rate at find follows the difficulty, written only when known: a
+// record without it is byte for byte the earlier one, and an earlier build
+// (which stops after the difficulty) keeps a record with it.
+TEST(MergedBlockStoreKat, RateAtFindFollowsTheDifficultyWhenKnown)
+{
+    auto rec = MergedBlockRecord::deserialize(mblk_v1_record(98, 6463962, kHashA).v);
+    EXPECT_DOUBLE_EQ(rec.pool_hashrate, 0.0) << "a v1 record has none";
+    rec.difficulty = 42136316.98663563;
+    const auto without = rec.serialize();
+    EXPECT_DOUBLE_EQ(MergedBlockRecord::deserialize(without).pool_hashrate, 0.0);
+
+    rec.pool_hashrate = 1.48e11;
+    const auto with = rec.serialize();
+    ASSERT_EQ(with[0], 2) << "no version bump";
+    ASSERT_EQ(with.size(), without.size() + 8);
+    EXPECT_TRUE(std::equal(without.begin(), without.end(), with.begin()));
+    auto back = MergedBlockRecord::deserialize(with);
+    EXPECT_DOUBLE_EQ(back.pool_hashrate, 1.48e11);
+    EXPECT_DOUBLE_EQ(back.difficulty, 42136316.98663563);
+    EXPECT_EQ(back.miner, "Dminer");
+    EXPECT_EQ(back.serialize(), with);
+
+    // A cut rate is not known; the difficulty before it stands.
+    auto cut = with;
+    cut.resize(cut.size() - 3);
+    back = MergedBlockRecord::deserialize(cut);
+    EXPECT_DOUBLE_EQ(back.pool_hashrate, 0.0);
+    EXPECT_DOUBLE_EQ(back.difficulty, 42136316.98663563);
+    // A record from before the difficulty has neither.
+    auto pre = without;
+    pre.resize(pre.size() - kMblkExt);
+    back = MergedBlockRecord::deserialize(pre);
+    EXPECT_EQ(back.block_hash, kHashA);
+    EXPECT_DOUBLE_EQ(back.difficulty, 0.0);
+    EXPECT_DOUBLE_EQ(back.pool_hashrate, 0.0);
+}
+
+// The same block stored again without a rate -- learned again long after its
+// find, by the startup scan of the share chain -- keeps the rate read when it
+// was found; everything else the new record says is taken.
+TEST(MergedBlockStoreKat, StoreKeepsAHeldRateAtFind)
+{
+    TempDb t("mblk_rate_keep");
+    ASSERT_TRUE(t.db.open());
+    MergedBlockStore store(t.db);
+    MergedBlockRecord r;
+    r.chain_id = 98; r.symbol = "DOGE"; r.height = 6463962; r.block_hash = kHashA;
+    r.timestamp = 1795083273; r.difficulty = 42136316.98663563; r.pool_hashrate = 1.48e11;
+    ASSERT_TRUE(store.store(r));
+
+    MergedBlockRecord again = r;
+    again.pool_hashrate = 0.0;
+    again.coinbase_value = 1000000000000ULL;
+    ASSERT_TRUE(store.store(again));
+    auto all = store.load_all();
+    ASSERT_EQ(all.size(), 1u);
+    EXPECT_DOUBLE_EQ(all[0].pool_hashrate, 1.48e11);
+    EXPECT_EQ(all[0].coinbase_value, 1000000000000ULL);
+
+    // A known rate is stored as given; the updaters keep it.
+    again.pool_hashrate = 1.5e11;
+    ASSERT_TRUE(store.store(again));
+    ASSERT_TRUE(store.update_coinbase(kHashA, 98, 777));
+    ASSERT_TRUE(store.update_body(kHashA, 98, hash_n(0xcb), 3));
+    all = store.load_all();
+    ASSERT_EQ(all.size(), 1u);
+    EXPECT_DOUBLE_EQ(all[0].pool_hashrate, 1.5e11);
+    EXPECT_EQ(all[0].coinbase_value, 777u);
+
+    // Another block under the same 16-char key prefix is not "held".
+    MergedBlockRecord other = r;
+    other.block_hash = kHashB;
+    other.pool_hashrate = 0.0;
+    ASSERT_TRUE(store.store(other));
+    std::vector<uint8_t> raw;
+    ASSERT_TRUE(t.db.get(mblk_key(98, 6463962, kHashB), raw));
+    const auto o = MergedBlockRecord::deserialize(raw);
+    EXPECT_EQ(o.block_hash, kHashB);
+    EXPECT_DOUBLE_EQ(o.pool_hashrate, 0.0);
 }
 
 TEST(MergedBlockStoreKat, UpdateCoinbaseReachesTheNewestPast1000)

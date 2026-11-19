@@ -51,6 +51,7 @@
 #include <boost/asio/io_context.hpp>
 #include <nlohmann/json.hpp>
 
+#include <c2pool/storage/found_block_record_map.hpp>
 #include <c2pool/storage/found_block_store.hpp>
 #include <core/found_block_import.hpp>
 #include <core/uint256.hpp>
@@ -1119,4 +1120,102 @@ TEST(FoundBlockImport, ShallowBlockIsImportedPending)
     const auto r2 = row_of(rows, "hash", hash_of(0xe2));
     EXPECT_EQ(str(r2, "status"), "pending");
     EXPECT_TRUE(r2["main_chain"].get<bool>());
+}
+
+// ── The source's effort survives a restart ───────────────────────────────────
+// It is kept with the row (FoundBlock::imported_effort) and persisted in the
+// fblk extension tail, through the same mapping the LTC node's persistence
+// callbacks use (c2pool/storage/found_block_record_map.hpp). After a restart
+// the rows still serve it, and importing the file again changes nothing.
+TEST(FoundBlockImport, SourceEffortSurvivesARestart)
+{
+    using c2pool::storage::FoundBlockRecord;
+    using FB = MiningInterface::FoundBlock;
+    std::map<std::string, std::vector<uint8_t>> disk;
+    int writes = 0;
+    auto wire = [&](MiningInterface& mi) {
+        mi.set_found_block_persistence(
+            [&](const FB& b) {
+                disk[b.chain + ":" + b.hash] =
+                    c2pool::storage::found_block_record_of(b, 0).serialize();
+                ++writes;
+                return true;
+            },
+            [&]() {
+                std::vector<FB> out;
+                for (const auto& [k, bytes] : disk)
+                    out.push_back(c2pool::storage::found_block_of(
+                        FoundBlockRecord::deserialize(bytes)));
+                return out;
+            });
+    };
+
+    const double doge_diff = 3.3e7;
+    FakeChain ltc, doge;
+    ltc.tip = 3200100;
+    nlohmann::json file = nlohmann::json::array();
+    const double coverage[3] = {0.0, 1.0, 0.7};
+    const double effort[3] = {1.0, 1.1, 0.4};
+    for (unsigned i = 0; i < 3; ++i) {
+        const std::string h = hash_of(0xf10 + i);
+        const uint64_t t = kT0 + i * 86400;
+        doge.add(h, 6454000 + i, t, doge_diff);
+        nlohmann::json r{{"pow_hash", h}, {"symbol", "DOGE"}, {"height", 6454000 + i}, {"ts", t},
+                         {"pool_hashrate_at_find", kRate}, {"measured", true},
+                         {"effort", effort[i]}};
+        if (i == 0) {
+            r["effort_method"] = "first_block";
+        } else {
+            r["effort_method"] = "integrated";
+            r["history_coverage"] = coverage[i];
+            r["prev_block_hash"] = hash_of(0xf10 + i - 1);
+        }
+        file.push_back(r);
+    }
+    doge.tip = 6455000;
+    auto src = source_over(ltc);
+    src.aux["DOGE"] = doge.lookup();
+    {
+        MiningInterface mi(false, nullptr, Blockchain::LITECOIN);
+        wire(mi);
+        const auto rep = import_text(mi, file.dump(), src);
+        EXPECT_EQ(rep.imported, 3u);
+        EXPECT_EQ(rep.effort_taken, 2u) << rep.summary();
+        EXPECT_EQ(rep.effort_refused, 0u);
+        EXPECT_EQ(rep.effort_not_used, 0u);
+    }
+    ASSERT_EQ(disk.size(), 3u);
+    const auto rec = FoundBlockRecord::deserialize(disk.at("DOGE:" + hash_of(0xf11)));
+    EXPECT_EQ(disk.at("DOGE:" + hash_of(0xf11))[0], 4) << "no version bump";
+    EXPECT_DOUBLE_EQ(rec.imported_effort, 1.1);
+    EXPECT_DOUBLE_EQ(rec.imported_coverage, 1.0);
+    EXPECT_EQ(rec.imported_prev_hash, hash_of(0xf10));
+    EXPECT_DOUBLE_EQ(rec.pool_hashrate, kRate);
+    EXPECT_FALSE(FoundBlockRecord::deserialize(disk.at("DOGE:" + hash_of(0xf10)))
+                     .has_imported_effort()) << "the first block took none";
+
+    MiningInterface restarted(false, nullptr, Blockchain::LITECOIN);
+    wire(restarted);
+    restarted.load_persisted_found_blocks();
+    const auto rows = restarted.rest_recent_merged_blocks();
+    const auto r1 = row_of(rows, "pow_hash", hash_of(0xf11));
+    EXPECT_EQ(str(r1, "effort_method"), "imported") << r1.dump();
+    EXPECT_DOUBLE_EQ(num(r1, "effort"), 1.1);
+    EXPECT_DOUBLE_EQ(num(r1, "history_coverage"), 1.0);
+    const auto r2 = row_of(rows, "pow_hash", hash_of(0xf12));
+    EXPECT_EQ(str(r2, "effort_method"), "imported");
+    EXPECT_DOUBLE_EQ(num(r2, "effort"), 0.4);
+    EXPECT_DOUBLE_EQ(num(r2, "history_coverage"), 0.7);
+    EXPECT_NEAR(num(r2, "effort_covered"), 0.28, 1e-12);
+    EXPECT_NEAR(num(r2, "pool_hashrate_at_find"), kRate, 1e-3);
+    // /found_block/<hash> serves the ledger row the same way.
+    EXPECT_EQ(str(restarted.rest_found_block(hash_of(0xf12)), "effort_method"), "imported");
+
+    writes = 0;
+    const auto again = import_text(restarted, file.dump(), src);
+    EXPECT_EQ(again.imported + again.merged, 0u) << again.summary();
+    EXPECT_EQ(again.unchanged, 3u);
+    EXPECT_EQ(again.effort_taken, 0u);
+    EXPECT_EQ(again.effort_not_used, 2u) << "both rows hold one already";
+    EXPECT_EQ(writes, 0);
 }

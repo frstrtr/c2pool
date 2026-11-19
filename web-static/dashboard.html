@@ -686,6 +686,9 @@
         .pace-slow { color: var(--pace-slow); }
         .pace-strong { font-weight: 700; }
         .effort-unknown { color: var(--text-muted); }
+        /* An effort measured by the node the history was imported from
+           (effort_method "imported"): a small mark with its own tooltip. */
+        .effort-imported { margin-left: 3px; font-size: 10px; color: var(--text-muted); cursor: help; }
         /* Duplet bracket down the first cell of the pair's rows: a dashed
            edge, with a tick on the later (upper) and the earlier (lower) row. */
         td.duplet-edge { position: relative; border-left: 2px dashed var(--pace-fast); }
@@ -4806,6 +4809,7 @@
                         if (b.luck_method === 'netdiff_unavailable' || b.luck_method === 'hashrate_unavailable') return 'n/a';
                         return '—';
                     })
+                    .each(function(b) { c2pImportedMark(d3.select(this), paceOf(b)); })
                     .attr('title', function(b) { return c2pEffortCellTip(b, paceOf(b)); });
                 tr.append('td')
                     .attr('style', 'font-family: monospace; font-size: 11px;')
@@ -4985,6 +4989,7 @@
                                     .text(p.tag + ' ');
                             }
                             td.append('span').text((p.first ? '1st ' : '') + c2pFmtPct(p.effort * 100));
+                            c2pImportedMark(td, p);
                             if (p.duplet) {
                                 td.append('span').attr('class', 'duplet-pill')
                                     .attr('title', c2pDupletTip(p))
@@ -8853,14 +8858,36 @@
         function c2pCoveredEffort(effort, method, coverage, served) {
             var own = c2pNum(served);
             if (own !== null && own >= 0) return own;
-            return method === 'integrated' && c2pNum(coverage) !== null ? effort * coverage : effort;
+            return c2pIntegratedMethod(method) && c2pNum(coverage) !== null ? effort * coverage : effort;
+        }
+        // An integral over a rate history: this node's own ('integrated'), or
+        // that of the node the history was imported from ('imported', where
+        // it covers more of the round; history_coverage is then that node's).
+        function c2pIntegratedMethod(method) {
+            return method === 'integrated' || method === 'imported';
         }
         // Whether an effort is mostly extrapolation: integrated over a rate
         // history that covers less than C2P_MIN_TAG_COVERAGE of the round. A
         // single sample, the first block and an older node's row are not
         // scaled up from a part, and carry no coverage to judge by.
         function c2pLowCoverage(method, coverage) {
-            return method === 'integrated' && c2pNum(coverage) !== null && coverage < C2P_MIN_TAG_COVERAGE;
+            return c2pIntegratedMethod(method) && c2pNum(coverage) !== null && coverage < C2P_MIN_TAG_COVERAGE;
+        }
+        // The note on an effort measured by the source node of an import.
+        function c2pImportedNote(p) {
+            if (!p || p.method !== 'imported') return '';
+            return 'Measured by the source node of this node\'s imported block history ' +
+                '(--import-found-blocks): its pool hashrate history covers ' +
+                (p.coverage !== null ? Math.round(p.coverage * 100) + ' %' : 'part') +
+                ' of the round, more than this node\'s own does. The pool hashrate is the share chain\'s, ' +
+                'the same on every node, so its figure stands for the pool.';
+        }
+        // The small mark after an imported effort, with that note as its tooltip.
+        function c2pImportedMark(td, p) {
+            if (!p || p.method !== 'imported' || p.effort === null) return;
+            td.append('span').attr('class', 'effort-imported')
+                .attr('title', c2pImportedNote(p))
+                .text('⇣');
         }
         // What a round adds to a pooled figure: its covered effort to the
         // blocks expected, and its block to the blocks found unless it was
@@ -9332,6 +9359,11 @@
                 return 'First block known to this node: there is no earlier block to time its round from, ' +
                     'so it counts as effort 100 % (luck 100 %).';
             }
+            if (p.source === 'server' && p.method === 'imported') {
+                return c2pImportedNote(p) +
+                    (p.coverage !== null && p.coverage < 0.995 ? ' The rest of the round is taken at its mean.' : '') +
+                    (p.lowCoverage ? ' Under half of the round is measured: the figure is mostly extrapolation, so it has no fast / slow tag.' : '');
+            }
             if (p.source === 'server' && p.method === 'integrated') {
                 return 'Effort integrated over the round from the pool hashrate and difficulty history' +
                     (p.coverage !== null && p.coverage < 0.995
@@ -9776,6 +9808,10 @@
                 var color = p.lowCoverage ? '#888' : (band === 'good' ? '#00ff88' : (band === 'mid' ? '#ffc107' : '#ff6b6b'));
                 s += 'Effort: <b style="color:' + color + '">' + c2pFmtPct(p.effort * 100) + '</b> of expected ' +
                      '<span style="font-size:10px;color:#aaa">(luck ' + c2pFmtPct(p.luck) + ')</span><br/>';
+                if (p.method === 'imported') {
+                    s += '<span style="font-size:10px;color:#aaa">(measured by the import source node; its rate history covers ' +
+                         (p.coverage !== null ? Math.round(p.coverage * 100) + ' %' : 'part') + ' of the round)</span><br/>';
+                }
                 if (p.lowCoverage) {
                     s += '<span style="font-size:10px;color:#aaa">(rate history covers ' + Math.round(p.coverage * 100) +
                          ' % of the round: mostly extrapolation, no tag)</span><br/>';
