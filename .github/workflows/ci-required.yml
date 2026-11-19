@@ -50,9 +50,40 @@ jobs:
     uses: ./.github/workflows/btc-embedded-standalone-smoke.yml
     secrets: inherit
 
+  # ------------------------------------------------------------------------
+  # TLA model-check lane (path-filtered). The TLA+ specs under proto/tla/ are
+  # the only input TLC verifies, so this lane runs only on PRs that touch
+  # them. tla-changes is the dorny/paths-filter gate (same idiom as
+  # build.yml's 'changes' job); on a PR that does not touch proto/tla/** the
+  # tlc lane is job-skipped (result 'skipped') and never occupies a build
+  # runner. A broken PathBRatchet / PathBSealRNP invariant fails tlc, which
+  # the aggregate below turns into a failure. Mirrors the skip-safe handling
+  # already applied to the path-skipped coin lanes.
+  tla-changes:
+    name: TLA model-check path filter
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      tla: ${{ steps.filter.outputs.tla }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            tla:
+              - 'proto/tla/**'
+  tlc:
+    needs: tla-changes
+    if: ${{ needs.tla-changes.outputs.tla == 'true' || github.event_name != 'pull_request' }}
+    uses: ./.github/workflows/tla-model-check.yml
+    secrets: inherit
+
   aggregate:
     name: aggregate
-    needs: [param-catalog-tripwire, proto-harness, coin-matrix, dash-g1, dash-g3a, dgb-phase-b, bch-g3a, bch-g3b, btc-daemonless-smoke]
+    needs: [param-catalog-tripwire, proto-harness, coin-matrix, dash-g1, dash-g3a, dgb-phase-b, bch-g3a, bch-g3b, btc-daemonless-smoke, tla-changes, tlc]
     if: always()
     runs-on: ubuntu-24.04
     steps:
