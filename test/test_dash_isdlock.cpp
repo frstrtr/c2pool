@@ -649,10 +649,50 @@ TEST(DashIsdlockN2, OnlyTheVerifiedLaneArmsTheBeltAndTheRefreshSink)
     EXPECT_FALSE(mp.verified_islock_conflict_in(served_b, {dash_txid(B)}).has_value());
 
     // (5) The outpoint confirmed in a block: the entry is resolved and pruned.
+    ASSERT_EQ(mp.verified_islock_outpoint_count(), 2u);
     mp.remove_for_block(make_block({make_coinbase({1}, 5), B}, /*salt=*/5));
     EXPECT_EQ(mp.verified_islock_outpoint_count(), 1u) << "only O:1 was spent";
     mp.clear();
     EXPECT_EQ(mp.verified_islock_outpoint_count(), 0u);
+}
+
+// The relay lane never overrides an outpoint a VERIFIED lock owns: it does not
+// rewrite the entry and does not evict the verified tx. Otherwise selection
+// (G4) and the emit belt (verified map) disagree and every freshly built
+// template is refused.
+TEST(DashIsdlockN2, ARelayLaneLockCannotOverrideAVerifiedOutpoint)
+{
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+    Mempool& mp = st.mempool();
+    UtxoLane lane;
+    ASSERT_TRUE(lane.open(""));
+    lane.attach(mp);
+    auto cb = make_coinbase({100'000, 90'000}, /*salt=*/6);
+    lane.on_block_connected(make_block({cb}, /*salt=*/6), /*height=*/1);
+    const uint256 cbid = dash_txid(cb);
+    const std::pair<uint256, uint32_t> O{cbid, 0u};
+    const auto A = make_spend(cbid, 0, 90'000, /*salt=*/61);
+    const uint256 a = dash_txid(A);
+    ASSERT_TRUE(mp.add_tx(A));
+    std::array<uint8_t, 96> sig{}; sig.fill(0xab);
+    m.set_islock_verify_fn(
+        [](const std::vector<std::pair<uint256, uint32_t>>&, const uint256&,
+           const uint256&, const std::array<uint8_t, 96>&) { return true; });
+    m.on_islock(a, {O});
+    m.on_new_isdlock({O}, a, raw256(0x33), sig);
+    ASSERT_TRUE(selected_contains(mp, a));
+
+    // A relay-lane lock claiming O for T: A stays (not evicted, still selected).
+    const auto T = make_spend(cbid, 0, 80'000, /*salt=*/62);
+    const uint256 t = dash_txid(T);
+    m.on_islock(t, {O});
+    EXPECT_TRUE(selected_contains(mp, a)) << "a relay-lane lock evicted or excluded the verified tx";
+
+    // T itself (if admitted) is never selected: O belongs to the verified A.
+    (void)mp.add_tx(T);
+    EXPECT_FALSE(selected_contains(mp, t))
+        << "selection admitted a tx the emit belt refuses (verified lock on its outpoint)";
 }
 
 TEST(DashIsdlockN2, RefreshCoalescerFiresOncePerGapWithOneTrailing)
