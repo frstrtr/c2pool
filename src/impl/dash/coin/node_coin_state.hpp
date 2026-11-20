@@ -284,6 +284,9 @@ public:
     /// the single-threaded ioc, so a plain uint64 needs no lock — do not add
     /// one. Exposed read-only as a test seam.
     uint64_t root_memo_epoch() const { return m_root_memo_epoch; }
+    /// Folded-root (P-2 superset arm) memo misses: how many evaluations ran
+    /// the projection + fold + root hash. Test/diagnostic only.
+    uint64_t fold_root_computes_dbg() const { return m_fold_root_computes; }
 
     /// Mark whether a valid SML is present (set by the maintainer after the
     /// first accepted mnlistdiff yields a non-empty list). When require_sml
@@ -461,7 +464,9 @@ public:
     /// (types 1-4) into the served body and fold them into the committed
     /// merkleRootMNList. Default OFF (canary phase); the emit gate re-derives
     /// the folded root over the served body and refuses on any mismatch.
-    void set_include_mn_special_txs(bool v) { m_include_mn_special_txs = v; }
+    // The fold-config setters below bump the root-memo epoch: each is an input
+    // of the folded root, and none is in the folded-root memo key on its own.
+    void set_include_mn_special_txs(bool v) { m_include_mn_special_txs = v; bump_root_memo_epoch(); }
     bool include_mn_special_txs() const { return m_include_mn_special_txs; }
 
     /// GBT-xcheck label aid (gbt_xcheck_dashd_only_collateral.hpp): the
@@ -478,13 +483,14 @@ public:
     void set_protx_operator_sig_verifier(MnFoldContext::OperatorSigFn fn)
     {
         m_protx_sig_verifier = std::move(fn);
+        bump_root_memo_epoch();
     }
 
     /// Dash Core's full CheckPro*Tx for template selection (protx_check.hpp):
     /// the network and the ECDSA verifier. The builder and the emit gate run
     /// it on every provider tx they fold. UNSET (default) => no provider tx is
     /// checkable, so none rides the template (fail closed).
-    void set_protx_check_env(ProTxCheckEnv env) { m_protx_check_env = std::move(env); }
+    void set_protx_check_env(ProTxCheckEnv env) { m_protx_check_env = std::move(env); bump_root_memo_epoch(); }
 
     /// Dash Core's CheckMNHFTx for type-7 signals (mnhf_check.hpp): the chain
     /// lookup, the quorum keys, the BLS verifier and the EHF tracker's staged
@@ -512,8 +518,8 @@ public:
     /// refuses the embedded template (cause v24-state-unknown): every v24 rule
     /// of the block being built depends on it.
     using V24StateFn = std::function<V24State(uint32_t height)>;
-    void set_v24_state_fn(V24StateFn fn) { m_v24_state_fn = std::move(fn); }
-    void set_v24_network(DashNetwork net) { m_v24_net = net; }
+    void set_v24_state_fn(V24StateFn fn) { m_v24_state_fn = std::move(fn); bump_root_memo_epoch(); }
+    void set_v24_network(DashNetwork net) { m_v24_net = net; bump_root_memo_epoch(); }
 
     /// #143 / Dash Core v24: type-9 admission for the template at `height`
     /// on `prev_hash` (credit_pool_lane.hpp admit). Null result => every
@@ -2071,36 +2077,108 @@ public:
         // above, at exactly the height a proven ban is being served.
         uint256 expected_mn_root = m_sml_root_memo;
         if (m_include_mn_special_txs) {
-            auto proj = project_sml_confirmations(m_sml, m_prev_height,
-                                                  m_prev_hash, m_mnstates,
-                                                  m_mn_min_confirmations);
-            if (!proj.ok)
-                return reject("emit-mn-confirm-rollover-pending",
-                              "protx=" + proj.unprojectable_protx.GetHex().substr(0, 12),
-                              "known-registration-height");
-            apply_qc_pose_bans(proj.sml, pose_bans);
-            // The SAME context the builder folded with
-            // (make_template_fold_context): pre-block list, collateral proofs,
-            // operator-signature verifier.
-            const MnFoldContext fold_ctx = make_template_fold_context(
-                m_mnstates, m_mempool,
-                m_protx_sig_verifier ? &m_protx_sig_verifier : nullptr,
-                m_protx_check_env ? &*m_protx_check_env : nullptr, next_h,
-                v24_state_for(next_h) == V24State::ACTIVE);
-            auto fold = fold_mn_special_txs(
-                proj.sml, w.m_txs,
-                [](const Transaction& t) {
-                    return dash::coin::dash_txid(MutableTransaction(t));
-                },
-                fold_ctx);
-            if (!fold.clean())
-                return reject("emit-mnlist-fold-refused",
-                              std::to_string(fold.refused)
-                                  + (fold.refused_reasons.empty()
-                                         ? std::string()
-                                         : ":" + fold.refused_reasons.front()),
-                              "0-refused");
-            expected_mn_root = fold.sml.CalcMerkleRoot();
+            // D2 for the SUPERSET arm. Without this memo every evaluation
+            // re-ran the projection (a fresh ~450 KB SML copy), the fold and
+            // the full root hash — ~3 times per session per notify on the io
+            // thread: the D2 freeze shape, which is why the P-2 hotel flip
+            // was held. The key:
+            //   - m_root_memo_epoch: any SML / MnStateMachine / quorum write,
+            //     and every fold-config setter (P-2 arm, operator-sig
+            //     verifier, ProTxCheckEnv, v24 state fn / network);
+            //   - m_prev_hash: the tip the block builds on;
+            //   - the v24-active bit for the next height (the fold's rules);
+            //   - pose_bans: the exact ban list applied before the fold;
+            //   - the body's txids in order: the special txs the fold applies
+            //     and any in-body collateral they reference.
+            // NOT in the key: the chain-coin view behind collateral proofs
+            // (Mempool::prove_chain_coin: the recent-spend ring, the UTXO
+            // view, the replay fold). It can move without a new tip or a list
+            // write, so a fold that consulted it is NOT memoized (its root is
+            // used for this evaluation only); that is the rare body carrying
+            // a provider tx with an external collateral.
+            // The builder's txids are used when they line up with the body
+            // (same rule as the parent-topology check above). PRECONDITION:
+            // every producer that reaches this gate pushes dash_txid(tx) in
+            // step with the tx (embedded_gbt.hpp) and never edits a built body;
+            // the dashd path never reaches it. Only a CLEAN fold is stored: a
+            // refusal is re-evaluated every time, so a fact that becomes
+            // provable later is never masked. The memoized root is
+            // byte-identical to the fresh one (test_dash_root_memo P2-*).
+            const bool ids_aligned = w.m_tx_hashes.size() == w.m_txs.size();
+            const bool v24_next = v24_state_for(next_h) == V24State::ACTIVE;
+            auto body_matches = [&]() {
+                if (ids_aligned) return m_fold_root_memo_body == w.m_tx_hashes;
+                if (m_fold_root_memo_body.size() != w.m_txs.size()) return false;
+                for (size_t i = 0; i < w.m_txs.size(); ++i)
+                    if (m_fold_root_memo_body[i]
+                        != dash::coin::dash_txid(MutableTransaction(w.m_txs[i])))
+                        return false;
+                return true;
+            };
+            if (!(m_fold_root_memo_valid
+                  && m_fold_root_memo_epoch == m_root_memo_epoch
+                  && m_fold_root_memo_prev == m_prev_hash
+                  && m_fold_root_memo_v24 == v24_next
+                  && m_fold_root_memo_bans == pose_bans
+                  && body_matches())) {
+                m_fold_root_memo_valid = false;   // no half-written key can hit
+                ++m_fold_root_computes;
+                auto proj = project_sml_confirmations(m_sml, m_prev_height,
+                                                      m_prev_hash, m_mnstates,
+                                                      m_mn_min_confirmations);
+                if (!proj.ok)
+                    return reject("emit-mn-confirm-rollover-pending",
+                                  "protx=" + proj.unprojectable_protx.GetHex().substr(0, 12),
+                                  "known-registration-height");
+                apply_qc_pose_bans(proj.sml, pose_bans);
+                // The SAME context the builder folded with
+                // (make_template_fold_context): pre-block list, collateral
+                // proofs, operator-signature verifier.
+                const MnFoldContext fold_ctx = make_template_fold_context(
+                    m_mnstates, m_mempool,
+                    m_protx_sig_verifier ? &m_protx_sig_verifier : nullptr,
+                    m_protx_check_env ? &*m_protx_check_env : nullptr, next_h,
+                    v24_next);
+                const uint64_t coin_proofs_before = m_mempool.chain_coin_proofs();
+                auto fold = fold_mn_special_txs(
+                    proj.sml, w.m_txs,
+                    [](const Transaction& t) {
+                        return dash::coin::dash_txid(MutableTransaction(t));
+                    },
+                    fold_ctx);
+                if (!fold.clean())
+                    return reject("emit-mnlist-fold-refused",
+                                  std::to_string(fold.refused)
+                                      + (fold.refused_reasons.empty()
+                                             ? std::string()
+                                             : ":" + fold.refused_reasons.front()),
+                                  "0-refused");
+                const uint256 folded = fold.sml.CalcMerkleRoot();
+                if (m_mempool.chain_coin_proofs() != coin_proofs_before) {
+                    // The fold read the chain-coin view: use this root for
+                    // this evaluation only (see the key note above).
+                    expected_mn_root = folded;
+                } else {
+                    m_fold_root_memo       = folded;
+                    m_fold_root_memo_epoch = m_root_memo_epoch;
+                    m_fold_root_memo_prev  = m_prev_hash;
+                    m_fold_root_memo_v24   = v24_next;
+                    m_fold_root_memo_bans  = pose_bans;
+                    if (ids_aligned) {
+                        m_fold_root_memo_body = w.m_tx_hashes;
+                    } else {
+                        m_fold_root_memo_body.clear();
+                        m_fold_root_memo_body.reserve(w.m_txs.size());
+                        for (const auto& t : w.m_txs)
+                            m_fold_root_memo_body.push_back(
+                                dash::coin::dash_txid(MutableTransaction(t)));
+                    }
+                    m_fold_root_memo_valid = true;
+                    expected_mn_root = m_fold_root_memo;
+                }
+            } else {
+                expected_mn_root = m_fold_root_memo;
+            }
         } else if (!pose_bans.empty()) {
             if (!(m_ban_root_memo_valid
                   && m_ban_root_memo_epoch == m_root_memo_epoch
@@ -2944,6 +3022,19 @@ private:
     mutable uint64_t             m_ban_root_memo_epoch{0};
     mutable std::vector<uint256> m_ban_root_memo_bans;
     mutable uint256              m_ban_root_memo;
+    // SUPERSET-arm (--embedded-include-mn-special-txs, P-2) FOLDED root,
+    // keyed on (epoch incl. fold config, the tip it builds on, the v24 bit,
+    // the exact ban list, the body's txids in order). A fold that read the
+    // chain-coin view is never stored (see the emit gate). Only a CLEAN fold is
+    // stored; a refused fold stays re-evaluated (fail-closed).
+    mutable bool                 m_fold_root_memo_valid{false};
+    mutable uint64_t             m_fold_root_memo_epoch{0};
+    mutable uint256              m_fold_root_memo_prev;
+    mutable bool                 m_fold_root_memo_v24{false};
+    mutable std::vector<uint256> m_fold_root_memo_bans;
+    mutable std::vector<uint256> m_fold_root_memo_body;
+    mutable uint256              m_fold_root_memo;
+    mutable uint64_t             m_fold_root_computes{0};   // misses (test/diag)
     mutable bool     m_quorum_root_memo_valid{false};
     mutable uint64_t m_quorum_root_memo_epoch{0};
     mutable uint256  m_quorum_root_memo;      // plain active-set quorum root

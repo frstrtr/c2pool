@@ -327,9 +327,19 @@ public:
         std::lock_guard<std::mutex> lock(m_mutex);
         return m_recent_chain_spend_blocks.size();
     }
+    /// How many chain-coin proofs have been asked for (any answer). The emit
+    /// gate samples it around the provider fold: a fold that consulted the
+    /// chain-coin view depends on state that can move without a new tip or a
+    /// list write (the recent-spend ring, the UTXO view, the replay fold), so
+    /// its root is not memoized (node_coin_state.hpp, folded-root memo).
+    uint64_t chain_coin_proofs() const
+    {
+        return m_chain_coin_proofs.load(std::memory_order_relaxed);
+    }
     CoinProof prove_chain_coin(const ::core::coin::Outpoint& op,
                                ::core::coin::Coin& out) const
     {
+        m_chain_coin_proofs.fetch_add(1, std::memory_order_relaxed);
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             if (m_recent_chain_spends.count({op.txid, op.index}))
@@ -3156,6 +3166,9 @@ private:
     std::map<uint256, MempoolEntry>                    m_pool;
     std::multimap<time_t, uint256>                     m_time_index;
     std::map<std::pair<uint256, uint32_t>, uint256>    m_spent_outputs;
+    // prove_chain_coin calls (chain_coin_proofs()); a relaxed counter, read by
+    // the emit gate around one fold on the same thread.
+    mutable std::atomic<uint64_t>                      m_chain_coin_proofs{0};
     // Step 2: feerate-sorted index. greater<double> means begin() =
     // highest feerate, so iteration is best-first.
     std::set<FeeKey>                                   m_feerate_index;
