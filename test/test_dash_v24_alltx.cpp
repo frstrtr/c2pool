@@ -2244,7 +2244,7 @@ TEST(DashV24AllTx, P2FoldMemoServesTheFoldedRootForAListChangingProviderTx)
     const uint64_t proofs0 = st.mempool().chain_coin_proofs();
     ASSERT_TRUE(st.embedded_template_emit_ok(wd, &why)) << why.cause << " " << why.value;
     ASSERT_EQ(st.mempool().chain_coin_proofs(), proofs0)
-        << "fixture: this fold must not read the chain-coin view (else it is never memoized)";
+        << "fixture: this fold must not read the chain-coin view (it pins the answer-free memo hit)";
     const uint64_t folds0 = st.fold_root_computes_dbg();
     ASSERT_TRUE(st.embedded_template_emit_ok(wd, &why)) << why.cause << " " << why.value;
     EXPECT_EQ(st.fold_root_computes_dbg() - folds0, 0u) << "the warm evaluation must be a memo hit";
@@ -3023,6 +3023,18 @@ TEST(DashV24AllTx, P2FoldMemoServesAChainCoinFoldOnlyWhileItsAnswersHold)
     ASSERT_TRUE(st.embedded_template_emit_ok(wd, &why)) << why.cause << " " << why.value;
     ASSERT_TRUE(st.embedded_template_emit_ok(wd, &why)) << why.cause << " " << why.value;
     EXPECT_EQ(st.fold_root_computes_dbg() - folds0, 3u);
+
+    // A DIFFERENT coin at the same outpoint (same proof, Unspent; one duff
+    // short of the collateral): the answer changed, so the memo must not hit,
+    // and the re-fold refuses. Pins that the comparison covers the coin, not
+    // only the proof.
+    ASSERT_TRUE(utxo.spend_coin(::core::coin::Outpoint(coll_hash, 1)).has_value());
+    ::core::coin::Coin short_coin = *spent;
+    short_coin.value -= 1;
+    utxo.add_coin(::core::coin::Outpoint(coll_hash, 1), short_coin);
+    EXPECT_FALSE(st.embedded_template_emit_ok(wd, &why))
+        << "a collateral one duff short still passed off the memo";
+    EXPECT_EQ(st.fold_root_computes_dbg() - folds0, 4u);
 }
 
 #endif  // C2POOL_DASH_BLS

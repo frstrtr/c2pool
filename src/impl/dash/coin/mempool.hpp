@@ -347,9 +347,10 @@ public:
     /// Records every prove_chain_coin answer given ON THIS THREAD while the
     /// recorder is alive (nested recorders restore the outer one).
     ///
-    /// The P-2 folded-root memo (node_coin_state.hpp) needs it. A provider tx
-    /// with an external collateral (a ProRegTx reusing an existing coin) makes
-    /// the fold ask the chain-coin view: the recent-spend ring, the UTXO view
+    /// The P-2 folded-root memo (node_coin_state.hpp) needs it. Some provider
+    /// txs make the fold ask the chain-coin view (a ProRegTx reusing an
+    /// existing coin as its collateral; a ProUpRegTx, whose Dash Core check
+    /// reads its masternode's collateral): the recent-spend ring, the UTXO view
     /// and the replay fold. Those move without a new tip or a list write, so
     /// the memo key alone cannot tell a stale root from a good one. Instead of
     /// tracking every way those three can change, the memo stores the answers

@@ -2095,9 +2095,11 @@ public:
             //     replay fold). That view moves without a new tip or a list
             //     write, so a hit re-asks every recorded outpoint and needs
             //     the same answer (Mempool::chain_coin_answers_unchanged). A
-            //     body with no external-collateral provider tx records none,
-            //     so the check is free; one that has a few costs a few map
-            //     and view lookups instead of the projection, fold and root.
+            //     body whose provider txs read no chain coin records none, so
+            //     the check is free; one that does (a ProRegTx reusing an
+            //     external collateral, a ProUpRegTx: Dash Core's check reads
+            //     its masternode's collateral) costs a few map and view
+            //     lookups instead of the projection, fold and root.
             // The builder's txids are used when they line up with the body
             // (same rule as the parent-topology check above). PRECONDITION:
             // every producer that reaches this gate pushes dash_txid(tx) in
