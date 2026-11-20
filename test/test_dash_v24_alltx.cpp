@@ -2187,71 +2187,6 @@ TEST(DashV24AllTx, EmitGateFoldsAProDisTxInsteadOfRefusingItsCollateralSpend)
     EXPECT_EQ(why.cause, "emit-collateral-spend-in-template");
 }
 
-// The P-2 folded-root memo must never cache a fold that read the chain-coin
-// view: the collateral proof (Mempool::prove_chain_coin) can move with no new
-// tip and no list write. Here the ProDisTx's collateral is spent in the UTXO
-// view between two evaluations of the SAME template on the SAME tip: the
-// second must re-fold and refuse, not pass off a memo. RED on a memo keyed
-// only on (epoch, tip, bans, body); master (no memo) passes it trivially.
-TEST(DashV24AllTx, P2FoldMemoNeverCachesAFoldThatReadTheChainCoinView)
-{
-    V24World w;
-    const uint256 prev = h256(0xAB);
-    ::core::coin::UTXOViewCache utxo(nullptr);
-    dash::coin::NodeCoinState st;
-    st.set_v24_state_fn([](uint32_t) { return dash::coin::V24State::ACTIVE; });
-    st.set_require_sml(true);
-    st.sml() = w.base_sml();
-    st.set_have_sml(true);
-    st.set_sml_current_hash(prev);
-    {
-        MNState shared = w.shared, regular = w.regular;
-        shared.payoutSplitProvenance = MNState::SPLIT_KNOWN;
-        regular.payoutSplitProvenance = MNState::SPLIT_KNOWN;
-        st.mnstates().load({{w.S, shared}, {w.R, regular}}, V24World::H - 1);
-    }
-    st.set_include_mn_special_txs(true);
-    dash::coin::ProTxCheckEnv env;
-    env.net = dash::coin::DashNetwork::MAINNET;
-    env.ecdsa = &dash::coin::protx_ecdsa_verify_hash;
-    st.set_protx_check_env(env);
-    const dash::coin::MnFoldContext::OperatorSigFn sigfn = &v::verify_protx_operator_sig;
-    st.set_protx_operator_sig_verifier(sigfn);
-    st.mempool().set_utxo(&utxo);
-    st.set_tip(V24World::H - 1, prev, 0x1b104be3u, 1'800'000'000u, 76, 16, 1'800'000'100u, 0x20000000u);
-    utxo.add_coin(::core::coin::Outpoint(w.S, 0),
-                  ::core::coin::Coin(kColl, script_of(dash::coin::v24::shared_collateral_script()), 1, false));
-    const auto dis = w.dissolve_tx();
-    ASSERT_TRUE(st.mempool().add_tx(dis));
-    const auto wd = dash::coin::build_embedded_workdata(
-        V24World::H - 1, prev, std::as_const(st).mnstates(), st.mempool(), 0x1b104be3u,
-        1'800'000'000u, 76, 16, 1'800'000'100u, 0x20000000u, nullptr, &std::as_const(st).sml(),
-        &std::as_const(st).qmgr(), 0, dash::coin::k_zero_cl_sig, 0, nullptr, nullptr,
-        dash::coin::DASH_MN_RR_HEIGHT_MAINNET, nullptr, dash::coin::DASH_MN_MIN_CONFIRMATIONS_MAINNET,
-        /*suppress=*/false, "utxo-immature-serving", nullptr, false, nullptr,
-        /*include_mn_special_txs=*/true, nullptr, nullptr, &sigfn, /*v24_active=*/true, &env, nullptr);
-    bool rides = false;
-    for (const auto& h : wd.m_tx_hashes) rides = rides || h == txid(dis);
-    ASSERT_TRUE(rides) << "fixture: the ProDisTx must ride the template";
-
-    dash::coin::DeclineReport why;
-    const uint64_t proofs0 = st.mempool().chain_coin_proofs();
-    const uint64_t folds0 = st.fold_root_computes_dbg();
-    ASSERT_TRUE(st.embedded_template_emit_ok(wd, &why)) << why.cause << " " << why.value;
-    ASSERT_GT(st.mempool().chain_coin_proofs(), proofs0)
-        << "fixture: the fold must consult the chain-coin view, or this test proves nothing";
-    ASSERT_TRUE(st.embedded_template_emit_ok(wd, &why)) << why.cause << " " << why.value;
-    EXPECT_EQ(st.fold_root_computes_dbg() - folds0, 2u)
-        << "a fold that read the chain-coin view was served off the memo";
-
-    // The collateral leaves the view: same template, same tip, same epoch.
-    const uint64_t epoch = st.root_memo_epoch();
-    ASSERT_TRUE(utxo.spend_coin(::core::coin::Outpoint(w.S, 0)).has_value());
-    ASSERT_EQ(st.root_memo_epoch(), epoch);
-    EXPECT_FALSE(st.embedded_template_emit_ok(wd, &why))
-        << "the ProDisTx's collateral is gone from the view, yet the template still passed";
-}
-
 // The P-2 memo on a body whose provider tx CHANGES the list (a shared-
 // registrar update: new operator key -> a different SML root). The folded
 // root differs from the projected root, the warm evaluation is a memo hit,
@@ -2983,6 +2918,100 @@ TEST(DashV24AllTx, RealMainnetCollateralReuseProRegTxRidesOurTemplate)
     EXPECT_TRUE(r.ok) << r.error;
     EXPECT_EQ(eng.find(old_pro), nullptr) << "replaced";
     EXPECT_NE(eng.find(txid(tx)), nullptr) << "registered";
+}
+
+// The P-2 folded-root memo must never cache a fold that read the chain-coin
+// view. The real mainnet ProRegTx above reuses an EXTERNAL collateral: Dash
+// Core's CheckProRegTx reads that coin, so our fold asks
+// Mempool::prove_chain_coin, whose answer can move with no new tip and no
+// list write (the UTXO view, the recent-spend ring, the replay fold). Here
+// the collateral leaves the UTXO view between two evaluations of the SAME
+// template on the SAME tip and epoch: the second must re-fold and refuse,
+// not pass off a memo. RED with the "do not store" branch disabled (the
+// mutation run in the PR); master (no memo) passes it trivially.
+TEST(DashV24AllTx, P2FoldMemoNeverCachesAFoldThatReadTheChainCoinView)
+{
+    constexpr uint32_t kH = 2'569'332;
+    const auto tx = tx_from_hex(kMainProReg);
+    const uint256 old_pro = u256("6544976109c4e181344fa61595c68424e0e336292882f68129f84f1a54893305");
+    const uint256 coll_hash = u256("eaf3185b4391dfc8f260f90747f042da09b04d383528e2c373faceeae02e8b7a");
+    MNState old;
+    old.nVersion = v::ProTxVersion::BASIC_BLS;
+    old.nType = v::MnType::REGULAR;
+    old.collateralOutpoint.hash = coll_hash;
+    old.collateralOutpoint.index = 1;
+    old.keyIDOwner = u160_from_p2pkh("76a91488b281127b8911ed78356a3ce1322490d20d155188ac");
+    old.keyIDVoting = old.keyIDOwner;
+    old.pubKeyOperator = arr_hex<48>(
+        "826b5d2455e2eae4810888658eb68e2c53b7706ae7dba242b00b1071f0e8ed7558b647cd6a0fd324f2a4b36df803a01a");
+    old.netInfo = ipv4(43, 224, 35, 163, 9999);
+    old.scriptPayout = script_of(unhex("76a914084229eacbab19b23f72607bf22c594e4b9fabce88ac"));
+    old.nRegisteredHeight = 2'568'790;
+    old.isValid = false;
+    old.nPoSeBanHeight = 2'569'290;
+    old.payoutSplitProvenance = MNState::SPLIT_KNOWN;
+    V24World w;
+    MNState other = w.regular;
+    other.nRegisteredHeight = 2'500'000;
+    other.payoutSplitProvenance = MNState::SPLIT_KNOWN;
+    const std::vector<std::pair<uint256, ReplayMNState>> states = {{old_pro, to_replay(old_pro, old, h256(0x62))},
+                                                                   {w.R, to_replay(w.R, other, h256(0x61))}};
+    std::vector<v::CSimplifiedMNListEntry> leaves;
+    for (const auto& [pro, s] : states) leaves.push_back(s.to_sml_entry(pro));
+    v::CSimplifiedMNList sml(std::move(leaves));
+    sml.sort();
+
+    const uint256 prev = h256(0xAB);
+    ::core::coin::UTXOViewCache utxo(nullptr);
+    utxo.add_coin(::core::coin::Outpoint(u256("401350de0d7da5cbe0c76ce5f2d404017a14f75fed9e3e1a712d67387437a98e"), 2),
+                  ::core::coin::Coin(77'071'322, script_of(unhex("76a91488b281127b8911ed78356a3ce1322490d20d155188ac")),
+                                     2'560'957, false));
+    utxo.add_coin(::core::coin::Outpoint(coll_hash, 1),
+                  ::core::coin::Coin(kColl, script_of(unhex("76a914332e2bab0ef016af7102f42db2866cf44f21033488ac")),
+                                     1'302'450, false));
+    dash::coin::NodeCoinState st;
+    st.set_v24_state_fn([](uint32_t) { return dash::coin::V24State::INACTIVE; });
+    st.set_require_sml(true);
+    st.sml() = sml;
+    st.set_have_sml(true);
+    st.set_sml_current_hash(prev);
+    st.mnstates().load({{old_pro, old}, {w.R, other}}, kH - 1);
+    st.set_include_mn_special_txs(true);
+    dash::coin::ProTxCheckEnv env;
+    env.net = dash::coin::DashNetwork::MAINNET;
+    env.ecdsa = &dash::coin::protx_ecdsa_verify_hash;
+    st.set_protx_check_env(env);
+    const dash::coin::MnFoldContext::OperatorSigFn sigfn = &v::verify_protx_operator_sig;
+    st.set_protx_operator_sig_verifier(sigfn);
+    st.mempool().set_utxo(&utxo);
+    st.set_tip(kH - 1, prev, 0x191ca6f1u, 1'794'215'316u, 76, 16, 1'794'215'564u, 0x20000000u);
+    ASSERT_TRUE(st.mempool().add_tx(tx));
+    const auto wd = dash::coin::build_embedded_workdata(
+        kH - 1, prev, std::as_const(st).mnstates(), st.mempool(), 0x191ca6f1u, 1'794'215'316u, 76, 16,
+        1'794'215'564u, 0x20000000u, nullptr, &std::as_const(st).sml(), &std::as_const(st).qmgr(), 0,
+        dash::coin::k_zero_cl_sig, 0, nullptr, nullptr, dash::coin::DASH_MN_RR_HEIGHT_MAINNET, nullptr,
+        dash::coin::DASH_MN_MIN_CONFIRMATIONS_MAINNET, /*suppress=*/false, "utxo-immature-serving", nullptr, false,
+        nullptr, /*include_mn_special_txs=*/true, nullptr, nullptr, &sigfn, /*v24_active=*/false, &env, nullptr);
+    bool rides = false;
+    for (const auto& h : wd.m_tx_hashes) rides = rides || h == txid(tx);
+    ASSERT_TRUE(rides) << "fixture: the external-collateral ProRegTx must ride the template";
+
+    dash::coin::DeclineReport why;
+    const uint64_t proofs0 = st.mempool().chain_coin_proofs();
+    const uint64_t folds0 = st.fold_root_computes_dbg();
+    ASSERT_TRUE(st.embedded_template_emit_ok(wd, &why)) << why.cause << " " << why.value << " / " << why.threshold;
+    ASSERT_GT(st.mempool().chain_coin_proofs(), proofs0)
+        << "fixture: the fold must consult the chain-coin view, or this test proves nothing";
+    ASSERT_TRUE(st.embedded_template_emit_ok(wd, &why)) << why.cause << " " << why.value;
+    EXPECT_EQ(st.fold_root_computes_dbg() - folds0, 2u)
+        << "a fold that read the chain-coin view was served off the memo";
+
+    // The collateral leaves the view: same template, same tip, same epoch.
+    const uint64_t epoch = st.root_memo_epoch();
+    ASSERT_TRUE(utxo.spend_coin(::core::coin::Outpoint(coll_hash, 1)).has_value());
+    ASSERT_EQ(st.root_memo_epoch(), epoch);
+    EXPECT_FALSE(st.embedded_template_emit_ok(wd, &why))
+        << "the ProRegTx's external collateral is gone from the view, yet the template still passed";
 }
 
 #endif  // C2POOL_DASH_BLS
