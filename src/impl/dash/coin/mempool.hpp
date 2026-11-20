@@ -2041,6 +2041,19 @@ public:
                     const std::vector<std::pair<uint256, uint32_t>>& inputs)
     {
         std::lock_guard<std::mutex> lock(m_mutex);
+        add_islock_locked(locked_txid, inputs, /*verified=*/false);
+    }
+
+    /// add_islock's body. An UNVERIFIED (relay-lane) lock never overrides an
+    /// outpoint a VERIFIED lock owns: it neither rewrites that entry nor
+    /// evicts the pool entry spending it. Otherwise the G4 selection guard
+    /// (which then reads the rewritten entry) and the emit gate's belt (which
+    /// reads the verified map) would disagree, and every freshly built
+    /// template would be refused.
+    void add_islock_locked(const uint256& locked_txid,
+                           const std::vector<std::pair<uint256, uint32_t>>& inputs,
+                           bool verified)
+    {
         // Locked-TXID index — dashd's IsLocked(txid) equivalent for the IS
         // mining-safety hold: a tx WITH a known islock is safe to mine
         // immediately (TestPackageTransactions skips the 10-min hold for it).
@@ -2055,6 +2068,11 @@ public:
         // Feed-liveness tick for the hold's ISLOCK_FEED_FRESH_SECS gate.
         m_last_islock_seen = std::time(nullptr);
         for (const auto& in : inputs) {
+            if (!verified) {
+                const auto v = m_verified_islock_outpoints.find(in);
+                if (v != m_verified_islock_outpoints.end() && v->second != locked_txid)
+                    continue;   // a verified lock owns this outpoint
+            }
             // Bound the tracking map (relay is untrusted input): evict the
             // oldest registration once over cap. 100k outpoints ≈ a few MB.
             while (m_islock_order.size() >= MAX_ISLOCK_OUTPOINTS
@@ -2103,8 +2121,8 @@ public:
     void add_verified_islock(const uint256& locked_txid,
                              const std::vector<std::pair<uint256, uint32_t>>& inputs)
     {
-        add_islock(locked_txid, inputs);
         std::lock_guard<std::mutex> lock(m_mutex);
+        add_islock_locked(locked_txid, inputs, /*verified=*/true);
         for (const auto& in : inputs) {
             // Same bounded-FIFO posture as the unverified map.
             while (m_verified_islock_order.size() >= MAX_ISLOCK_OUTPOINTS
@@ -3079,9 +3097,16 @@ public:
 
                     // G4: islock conflict — the outpoint is locked to a
                     // different txid; packing this tx is conflict-tx-lock.
-                    auto lk = m_islock_outpoints.find(opkey);
-                    if (lk != m_islock_outpoints.end()
-                        && lk->second != e->txid) {
+                    //     A VERIFIED entry outranks the relay-lane one
+                    //     (the emit gate's belt reads the verified map).
+                    const uint256* locked_to = nullptr;
+                    if (auto vk = m_verified_islock_outpoints.find(opkey);
+                        vk != m_verified_islock_outpoints.end())
+                        locked_to = &vk->second;
+                    else if (auto lk = m_islock_outpoints.find(opkey);
+                             lk != m_islock_outpoints.end())
+                        locked_to = &lk->second;
+                    if (locked_to != nullptr && *locked_to != e->txid) {
                         ok = false;
                         break;
                     }

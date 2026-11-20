@@ -4360,28 +4360,29 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             // N2: a won block carrying a tx that conflicts with a VERIFIED
             // islock is conflict-tx-lock on every non-IBD Dash Core node
             // (v24.0.2 validation.cpp:2811-2829) unless it is already
-            // ChainLocked, which a fresh block never is. It still goes out
-            // (our lock view could be wrong, and relaying costs nothing), but
-            // the loss is named here instead of surfacing later as an
-            // unexplained orphan. Won blocks are rare; the decode is cheap.
-            try {
-                dash::coin::BlockType blk;
-                ::PackStream s(block_bytes);
-                s >> blk;
-                if (const auto c = node_coin_state.mempool().verified_islock_conflict_in(
-                        blk.m_txs, std::vector<uint256>{}))
-                    LOG_ERROR << "[ISLOCK-CONFLICT] won block height=" << height
-                              << " carries tx " << c->txid.GetHex().substr(0, 16)
-                              << " spending " << c->outpoint.first.GetHex().substr(0, 16)
-                              << ":" << c->outpoint.second
-                              << ", locked by a VERIFIED islock to "
-                              << c->locked_txid.GetHex().substr(0, 16)
-                              << " -- Dash Core will reject it (conflict-tx-lock);"
-                                 " dispatching anyway";
-            } catch (const std::exception& e) {
-                LOG_WARNING << "[ISLOCK-CONFLICT] won-block islock check skipped:"
-                               " block decode failed (" << e.what() << ")";
-            }
+            // ChainLocked, which a fresh block never is. Checked AFTER dispatch
+            // (never delay a won block) and only while the verified lane holds
+            // locks; it names the loss instead of leaving an unexplained orphan.
+            auto name_islock_conflict = [&]() {
+                if (node_coin_state.mempool().verified_islock_outpoint_count() == 0) return;
+                try {
+                    dash::coin::BlockType blk;
+                    ::PackStream s(block_bytes);
+                    s >> blk;
+                    if (const auto c = node_coin_state.mempool().verified_islock_conflict_in(
+                            blk.m_txs, std::vector<uint256>{}))
+                        LOG_ERROR << "[ISLOCK-CONFLICT] won block height=" << height
+                                  << " carries tx " << c->txid.GetHex().substr(0, 16)
+                                  << " spending " << c->outpoint.first.GetHex().substr(0, 16)
+                                  << ":" << c->outpoint.second
+                                  << ", locked by a VERIFIED islock to "
+                                  << c->locked_txid.GetHex().substr(0, 16)
+                                  << " -- Dash Core will reject it (conflict-tx-lock)";
+                } catch (...) {
+                    LOG_WARNING << "[ISLOCK-CONFLICT] won-block islock check skipped:"
+                                   " block decode failed";
+                }
+            };
             const std::string block_hex = HexStr(block_bytes);
             std::cout << "[DASH-STRATUM-BLOCK] won block height=" << height
                       << " bytes=" << block_bytes.size()
@@ -4412,12 +4413,14 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                                  "(no embedded P2P peer AND no dashd RPC creds) -- "
                                  "won block NOT broadcast\n";
                 }
+                name_islock_conflict();
                 return false;
             }
             std::cout << "[DASH-STRATUM-BLOCK] relayed: p2p="
                       << (bcast.p2p_sent ? "sent" : "off")
                       << " rpc=" << (bcast.rpc_ok ? "ok" : "off")
                       << " landed_first=" << bcast.landed_first << "\n";
+            name_islock_conflict();
             return true;
         };
 
@@ -7973,8 +7976,10 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                         trailing->expires_after(d.delay);
                         trailing->async_wait(
                             [coalescer, fire](const boost::system::error_code& ec) {
-                                if (ec) return;   // cancelled (shutdown)
+                                // Clear the pending flag either way: a cancelled
+                                // wait must not leave the coalescer stuck.
                                 coalescer->on_trailing_fired(std::chrono::steady_clock::now());
+                                if (ec) return;   // cancelled (shutdown)
                                 fire();
                             });
                         break;
