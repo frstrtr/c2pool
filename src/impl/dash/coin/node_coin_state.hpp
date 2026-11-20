@@ -1972,6 +1972,18 @@ public:
                 in_body.insert(id);
             }
         }
+        // N2 belt: no body tx may spend an outpoint a VERIFIED islock assigns
+        // to a different txid. Dash Core rejects such a block unless it is
+        // already ChainLocked (v24.0.2 validation.cpp:2811-2829,
+        // conflict-tx-lock). Selection already excludes these from NEW
+        // templates; this catches a template built before the lock arrived
+        // when it is served again from cache. Verified locks only: the
+        // unverified relay lane must not be able to refuse templates.
+        if (const auto c = m_mempool.verified_islock_conflict_in(w.m_txs, w.m_tx_hashes))
+            return reject("emit-islock-conflict",
+                          "tx=" + c->txid.GetHex().substr(0, 12)
+                              + ":locked-to=" + c->locked_txid.GetHex().substr(0, 12),
+                          "no-body-tx-conflicts-with-a-verified-islock");
         // MNHF signals (type 7): every one the body carries must pass Dash
         // Core's CheckMNHFTx and the block's duplicate rules (mnhf_check.hpp).
         // A signal never pays a fee, so this re-check only refuses.

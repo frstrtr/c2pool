@@ -1231,10 +1231,19 @@ public:
     /// our templates — the same threat model as the ChainLock coinbase fields
     /// (on_new_chainlock above). When no verifier is installed, or
     /// verification FAILS, we adopt NOTHING: the map stays exactly as it was
-    /// and selection is unchanged (the pre-existing behaviour). A refusal
-    /// costs only parity with dashd's conflict handling — islock exclusion is
-    /// an optimization, not consensus for us; an erroneous acceptance costs
-    /// template fees on demand.
+    /// and selection is unchanged (the pre-existing behaviour). An erroneous
+    /// acceptance costs template fees on demand.
+    ///
+    /// Islock exclusion is NOT only an optimization: Dash Core rejects a block
+    /// carrying a tx that conflicts with a known islock unless that block is
+    /// already ChainLocked (v24.0.2 validation.cpp:2811-2829,
+    /// conflict-tx-lock), and a freshly found block never is. A VERIFIED
+    /// adoption therefore also goes into the mempool's verified map (the emit
+    /// gate refuses a body conflicting with it) and is handed to the
+    /// on_verified_islock sink, which main_dash points at a forced clean work
+    /// refresh when the SERVED template spends one of the locked outpoints
+    /// (N2: a template built before the lock arrived). Only this verified
+    /// lane may drive those two actions.
     void on_new_isdlock(const std::vector<std::pair<uint256, uint32_t>>& inputs,
                         const uint256& txid, const uint256& cycle_hash,
                         const std::array<uint8_t, 96>& sig) {
@@ -1248,7 +1257,19 @@ public:
         LOG_INFO << "[ISLOCK] adopted VERIFIED isdlock txid="
                  << txid.GetHex().substr(0, 16) << "... inputs="
                  << inputs.size();
-        on_islock(txid, inputs);
+        m_state.mempool().add_verified_islock(txid, inputs);
+        if (m_on_verified_islock) m_on_verified_islock(txid, inputs);
+    }
+
+    /// N2 sink: called after every VERIFIED isdlock adoption with the locked
+    /// txid and outpoints. main_dash checks the served template against them
+    /// and forces a clean work refresh on a conflict. Unset (KAT posture) is a
+    /// no-op.
+    using VerifiedIslockFn = std::function<void(
+        const uint256& locked_txid,
+        const std::vector<std::pair<uint256, uint32_t>>& inputs)>;
+    void set_on_verified_islock(VerifiedIslockFn fn) {
+        m_on_verified_islock = std::move(fn);
     }
 
     /// Verifier seam for DSTX adoption (W5-B CoinJoin broadcast tx):
@@ -3505,6 +3526,7 @@ private:
         m_on_new_quorum_commitments;
     ChainLockVerifyFn     m_chainlock_verify; // unset => live ChainLocks never adopted (fail closed)
     IslockVerifyFn        m_islock_verify;    // unset => isdlocks never adopted (fail closed, G4 stays dormant)
+    VerifiedIslockFn      m_on_verified_islock;  // N2: verified adoption -> served-template conflict check
     DstxVerifyFn          m_dstx_verify;      // unset => DSTX-es never admitted (fail closed, W5-B stays dormant)
     // E2: independent DIP-0027 credit-pool accrual, advanced per ingested block
     // (on_block_connected) and re-anchored per accepted mnlistdiff. Verified
