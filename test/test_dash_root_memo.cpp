@@ -491,9 +491,10 @@ TEST(DashRootMemo, P2SmlMutationInvalidatesFoldedRoot)
         << "cause=" << why.cause << " value=" << why.value;
 }
 
-// P2-T3 — tip key: the same template evaluated on a different tip re-derives
-// (the fold's height, v24 state and chain-coin views are per tip), even when
-// nothing bumped the epoch.
+// P2-T3 — a new tip re-derives the folded root exactly once, then memoizes it.
+// set_tip() also bumps the epoch, so this pins "a new tip re-derives" through
+// either key; the m_prev_hash key is a second guard no public setter can
+// reach without the epoch.
 TEST(DashRootMemo, P2TipChangeRecomputesFoldedRoot)
 {
     Rig rig(BELOW_THRESHOLD_REG);
