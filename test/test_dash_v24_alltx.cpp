@@ -2920,16 +2920,16 @@ TEST(DashV24AllTx, RealMainnetCollateralReuseProRegTxRidesOurTemplate)
     EXPECT_NE(eng.find(txid(tx)), nullptr) << "registered";
 }
 
-// The P-2 folded-root memo must never cache a fold that read the chain-coin
-// view. The real mainnet ProRegTx above reuses an EXTERNAL collateral: Dash
-// Core's CheckProRegTx reads that coin, so our fold asks
-// Mempool::prove_chain_coin, whose answer can move with no new tip and no
-// list write (the UTXO view, the recent-spend ring, the replay fold). Here
-// the collateral leaves the UTXO view between two evaluations of the SAME
-// template on the SAME tip and epoch: the second must re-fold and refuse,
-// not pass off a memo. RED with the "do not store" branch disabled (the
-// mutation run in the PR); master (no memo) passes it trivially.
-TEST(DashV24AllTx, P2FoldMemoNeverCachesAFoldThatReadTheChainCoinView)
+// The P-2 folded-root memo serves a fold that read the chain-coin view only
+// while every answer it got still holds. The real mainnet ProRegTx above
+// reuses an EXTERNAL collateral: Dash Core's CheckProRegTx reads that coin,
+// so our fold asks Mempool::prove_chain_coin, whose answer can move with no
+// new tip and no list write (the UTXO view, the recent-spend ring, the replay
+// fold). Repeated evaluations of the same template (one per session per
+// notify) fold ONCE; when the collateral leaves the UTXO view on the SAME tip
+// and epoch, the next evaluation must re-fold and refuse, not pass off the
+// memo. RED with the answer re-check disabled (the mutation run in the PR).
+TEST(DashV24AllTx, P2FoldMemoServesAChainCoinFoldOnlyWhileItsAnswersHold)
 {
     constexpr uint32_t kH = 2'569'332;
     const auto tx = tx_from_hex(kMainProReg);
@@ -3002,16 +3002,27 @@ TEST(DashV24AllTx, P2FoldMemoNeverCachesAFoldThatReadTheChainCoinView)
     ASSERT_TRUE(st.embedded_template_emit_ok(wd, &why)) << why.cause << " " << why.value << " / " << why.threshold;
     ASSERT_GT(st.mempool().chain_coin_proofs(), proofs0)
         << "fixture: the fold must consult the chain-coin view, or this test proves nothing";
-    ASSERT_TRUE(st.embedded_template_emit_ok(wd, &why)) << why.cause << " " << why.value;
-    EXPECT_EQ(st.fold_root_computes_dbg() - folds0, 2u)
-        << "a fold that read the chain-coin view was served off the memo";
+    // 30 sessions re-evaluating the same template on a notify: one fold.
+    for (int i = 0; i < 30; ++i)
+        ASSERT_TRUE(st.embedded_template_emit_ok(wd, &why)) << why.cause << " " << why.value;
+    EXPECT_EQ(st.fold_root_computes_dbg() - folds0, 1u)
+        << "a fold whose chain-coin answers still hold must be served off the memo";
 
     // The collateral leaves the view: same template, same tip, same epoch.
     const uint64_t epoch = st.root_memo_epoch();
-    ASSERT_TRUE(utxo.spend_coin(::core::coin::Outpoint(coll_hash, 1)).has_value());
+    const auto spent = utxo.spend_coin(::core::coin::Outpoint(coll_hash, 1));
+    ASSERT_TRUE(spent.has_value());
     ASSERT_EQ(st.root_memo_epoch(), epoch);
     EXPECT_FALSE(st.embedded_template_emit_ok(wd, &why))
         << "the ProRegTx's external collateral is gone from the view, yet the template still passed";
+    EXPECT_EQ(st.fold_root_computes_dbg() - folds0, 2u) << "the changed answer must force a re-fold";
+
+    // The coin comes back (a reorg undo): the refusal was never memoized, so
+    // the template passes again after one more fold, then off the memo.
+    utxo.add_coin(::core::coin::Outpoint(coll_hash, 1), *spent);
+    ASSERT_TRUE(st.embedded_template_emit_ok(wd, &why)) << why.cause << " " << why.value;
+    ASSERT_TRUE(st.embedded_template_emit_ok(wd, &why)) << why.cause << " " << why.value;
+    EXPECT_EQ(st.fold_root_computes_dbg() - folds0, 3u);
 }
 
 #endif  // C2POOL_DASH_BLS
