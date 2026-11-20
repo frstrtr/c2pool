@@ -35,6 +35,7 @@
 #include <vector>
 
 #include "c2pool/v37/xmr/xmr_o2_randomx_verify.hpp"
+#include "c2pool/v37/xmr/xmr_node_rx_verify.hpp"
 
 using namespace c2pool::v37n::xmr::o2;
 
@@ -299,6 +300,81 @@ void suite_b(const Vector& kat) {
 #endif
 }
 
+// ---------------------------------------------------------------------------
+// Suite C — NodeRxVerifier (the Path B node's verifier) under node_rx_policy:
+//   a hash never builds a cache: a seed not keyed answers NotKeyed, prefetches stay 0, while a resident seed hashes
+//   (the KAT PoW); key() builds and installs: two pinned seeds and one other resident at once; a new other seed
+//   replaces the other one, never a pin; set_pins: a pinned seed in the third slot is promoted in place, the departed
+//   pin keeps its seed; a pin whose seed height names another id is released; a new pin takes the released slot.
+// ---------------------------------------------------------------------------
+struct NodeRxCfg {
+    bool randomx_enabled = true;
+    bool randomx_large_pages = false;
+};
+
+void suite_c(const Vector& kat) {
+    std::printf("== (C) NodeRxVerifier ==\n");
+    const std::vector<uint8_t>& blob = kat.blob;
+    {
+        NodeRxVerifier v;
+        RandomXPolicy p;
+        p.enabled = false;
+        check(!v.init(p) && !v.ready(), "node: disabled -> not ready");
+        Hash32 h{};
+        check(v.hash(blob, kat.seed, h) == NodeRxVerifier::Hashed::NotReady, "node: disabled -> NotReady");
+    }
+#if defined(V37_XMR_O2_WITH_RANDOMX)
+    NodeRxVerifier v;
+    check(v.init(node_rx_policy(NodeRxCfg{})) && v.ready() && !v.policy().lazy_prefetch_on_miss,
+          "node: init under node_rx_policy (lazy 0)");
+    Seed32 other = kat.seed;
+    other[0] ^= 0x5a;
+    Hash32 h{};
+    // a frame on a resident seed while another frame's seed waits for its keying: no build inside a hash
+    check(v.key(kat.seed), "node: key(KAT seed)");
+    check(v.hash(blob, other, h) == NodeRxVerifier::Hashed::NotKeyed && v.stats().prefetches == 0,
+          "node: a seed not keyed -> NotKeyed, prefetches 0");
+    check(v.hash(blob, kat.seed, h) == NodeRxVerifier::Hashed::Ok && h == kat.want, "node: the resident seed -> the KAT PoW");
+    check(v.key(other) && v.hash(blob, other, h) == NodeRxVerifier::Hashed::Ok && v.stats().prefetches == 0
+                  && v.stats().adopted == 2,
+          "node: keyed off the hash -> hashes; prefetches 0, adopted 2");
+    std::printf("  %s\n", v.describe().c_str());
+
+    // three slots: two pins and one other
+    const auto seed_of = [&](uint8_t k) {
+        Seed32 s = kat.seed;
+        s[1] ^= k;
+        return s;
+    };
+    const Seed32 A = seed_of(1), B = seed_of(2), C = seed_of(3), D = seed_of(4), E = seed_of(5);
+    NodeRxVerifier w;
+    check(w.init(node_rx_policy(NodeRxCfg{})), "node: second instance init");
+    w.set_pins({{2048, A}, {4096, B}});
+    const bool keyed = w.key(A) && w.key(B) && w.key(C);
+    const auto all = [&](std::initializer_list<Seed32> ss) {
+        for (const Seed32& s : ss)
+            if (!w.resident(s)) return false;
+        return true;
+    };
+    bool hashed = true;
+    for (const Seed32& s : {A, B, C}) hashed = hashed && w.hash(blob, s, h) == NodeRxVerifier::Hashed::Ok;
+    check(keyed && all({A, B, C}) && hashed && w.stats().prefetches == 0, "node: pins A, B and C resident; each hashes, no build");
+    check(w.key(D) && all({A, B, D}) && !w.resident(C), "node: D replaces C in the third slot; the pins stay");
+    // D pinned (the set moved to {B, D}): promoted in place; A keeps its slot (the third now)
+    const std::uint64_t adopted = w.stats().adopted;
+    w.set_pins({{4096, B}, {6144, D}});
+    check(all({A, B, D}) && w.stats().promoted == 1 && w.stats().adopted == adopted, "node: D promoted in place, A kept");
+    // the id at 6144 changed (E): D released; E keyed into its slot; A and B stay
+    w.set_pins({{4096, B}, {6144, E}});
+    check(!w.resident(D) && w.stats().released == 1 && all({A, B}), "node: the id at 6144 changed -> D released");
+    check(w.key(E) && all({A, B, E}), "node: E keyed into the released slot; A, B stay");
+    int pins = 0;
+    for (const auto& [pin, s] : w.slots()) pins += pin ? 1 : 0;
+    check(w.slots().size() == 3 && pins == 2, "node: three slots, two pins");
+    std::printf("  %s\n", w.describe().c_str());
+#endif
+}
+
 } // namespace
 
 int main() {
@@ -311,6 +387,7 @@ int main() {
                 static_cast<unsigned long long>(kHeight));
     suite_a(kat);
     suite_b(kat);
+    suite_c(kat);
     std::printf("== %s (%d failures) ==\n", fails ? "FAIL" : "OK", fails);
     return fails ? 1 : 0;
 }

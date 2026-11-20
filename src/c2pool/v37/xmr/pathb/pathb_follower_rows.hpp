@@ -248,6 +248,13 @@ public:
         if (it == kept_.end() || it->second.height + alt_keep_ < tip_h) return std::nullopt;
         return it->second;
     }
+    // A kept row by id at the index tip height `tip_h` (the kept part of block()): the table mutex only, no index call.
+    std::optional<BranchBlock> kept_row(const Hash32& id, std::uint64_t tip_h) const {
+        std::lock_guard<std::mutex> lk(mu_);
+        const auto it = kept_.find(id);
+        if (it == kept_.end() || it->second.height + alt_keep_ < tip_h) return std::nullopt;
+        return it->second;
+    }
     std::optional<BranchBlock> block_at_or_below_anchor(std::uint64_t height) const override {
         if (index_ == nullptr) return std::nullopt;
         const auto d = index_->seeded_row_at(height);

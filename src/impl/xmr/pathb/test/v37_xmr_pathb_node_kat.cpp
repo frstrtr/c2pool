@@ -368,6 +368,7 @@
 #include "c2pool/v37/xmr/pathb/pathb_job_source.hpp"
 #include "c2pool/v37/xmr/pathb/pathb_relay_links.hpp"
 #include "c2pool/v37/xmr/pathb/pathb_relay_node.hpp"
+#include "c2pool/v37/xmr/pathb/pathb_node_rx.hpp"
 #include "c2pool/v37/xmr/pathb/pathb_startup.hpp"
 #include "c2pool/v37/xmr/pathb/pathb_status.hpp"
 #include "pathb_kat_join.hpp"
@@ -15023,6 +15024,305 @@ void catchctx() {
 }
 
 // ---------------------------------------------------------------------------
+// seedbranch / seednokey / seedmemo: the seed of P_r's branch through the node's RandomX wiring (pathb_node_rx.hpp:
+// the walk, the memo, node_hash, the keying worker; the KATs' engine hashes to the seed itself, and the PoW word is
+// that hash against the seed of P_r's branch on the net's rows).
+//   seedbranch  L's Monero main chain leaves V's at 3000319 (branch 2, its own block at the seed height 3000320, up to
+//               3000460); L mines to h 3000420; V (main on the other chain) catches up L's chain headers first, then
+//               a frame of L: placed, judged with the seed of each P_r's branch (3000320 on branch 2), no strike, no
+//               ban, L's link kept
+//   seednokey   the same with V's engine holding the main seeds only: the work on branch 2's seed waits for its keying
+//               (no RandomX alarm, no token), is resumed when it is keyed (one keying), and is judged
+//   seedmemo    40 kept rows off the index (3000461 .. 3000500) whose parent at 3000460 nobody holds, 3 P_r on them:
+//               after the first walk each call looks up one id (the stopping id) until it arrives; then the walks
+//               resume from it and end on the main chain's seed at 3000320; the row event's drops
+// ---------------------------------------------------------------------------
+constexpr std::uint8_t kBr2Tag = 0x42;
+constexpr std::uint64_t kSeedEdge = 3000320;  // 2048 x 1465
+constexpr std::uint64_t kBr2Top = 3000460;
+pb::Hash32 br2_block(std::uint64_t h) { return block_id(kBr2Tag, h); }
+
+// The id at the seed height of height(P_r) + 1 on P_r's branch (below the net's rows: the shared main chain).
+pb::Hash32 branch_seed(const KatMoneroRows& rows, const pb::Hash32& p_r) {
+    const std::optional<pb::BranchBlock> b0 = rows.block(p_r);
+    if (!b0) return pb::Hash32{};
+    const std::uint64_t s = ::xmr::coin::rx_seedheight(b0->height + 1);
+    pb::Hash32 cur = p_r;
+    while (const std::optional<pb::BranchBlock> b = rows.block(cur)) {
+        if (b->height == s) return b->id;
+        if (b->height < s) break;
+        cur = b->prev_id;
+    }
+    return mon_block(s);
+}
+
+// A node's rows for the walk: the net's rows with the node's own main chain, and kept rows; lookups counted.
+struct KatSeedRows final : pb::ISeedRows {
+    const KatMoneroRows* rows = nullptr;
+    bool br2_main = false;
+    std::uint64_t tip = kMonTop;
+    std::map<pb::Hash32, pb::BranchBlock> kept_rows;
+    std::set<pb::Hash32> hidden;
+    mutable std::uint64_t lookups = 0;
+    mutable std::set<pb::Hash32> looked;  // the ids looked up (held or kept) since the caller cleared it
+    std::optional<pb::Hash32> main_at(std::uint64_t h) const {
+        if (br2_main && h >= kSeedEdge) return h <= kBr2Top ? std::optional<pb::Hash32>(br2_block(h)) : std::nullopt;
+        return h <= kMonTop ? std::optional<pb::Hash32>(mon_block(h)) : std::nullopt;
+    }
+    std::optional<pb::SeedRow> held(const pb::Hash32& id) const override {
+        ++lookups;
+        looked.insert(id);
+        if (hidden.count(id) != 0) return std::nullopt;
+        const std::optional<pb::BranchBlock> b = rows->block(id);
+        if (!b) return std::nullopt;
+        const std::optional<pb::Hash32> m = main_at(b->height);
+        return pb::SeedRow{b->id, b->prev_id, b->height, m && *m == id};
+    }
+    std::optional<pb::SeedRow> kept(const pb::Hash32& id, std::uint64_t) const override {
+        ++lookups;
+        looked.insert(id);
+        const auto it = kept_rows.find(id);
+        if (it == kept_rows.end()) return std::nullopt;
+        return pb::SeedRow{it->second.id, it->second.prev_id, it->second.height, false};
+    }
+    std::optional<pb::Hash32> main_id_at(std::uint64_t h) const override { return main_at(h); }
+    std::optional<pb::Hash32> seed_id_for(std::uint64_t h_child) const override {
+        return main_at(::xmr::coin::rx_seedheight(h_child));
+    }
+    std::uint64_t tip_height() const override { return tip; }
+    pb::SeedRowsHold hold() const {
+        return [this](const std::function<void(const pb::ISeedRows&)>& fn) { fn(*this); };
+    }
+};
+
+// The KATs' RandomX engine: a hash is the seed itself; `any`: every seed keyed.
+struct KatRxEngine final : pb::INodeRxEngine {
+    std::set<pb::Hash32> keyed;
+    bool any = true;
+    std::uint64_t keys = 0, not_keyed = 0;
+    std::vector<std::pair<std::uint64_t, pb::Hash32>> pins;
+    bool ready() const override { return true; }
+    std::string mode_name() const override { return "kat"; }
+    bool resident(const pb::Hash32& s) const override { return any || keyed.count(s) != 0; }
+    pb::RxHash hash(const std::vector<std::uint8_t>&, const pb::Hash32& seed, pb::Hash32& pow) override {
+        if (!resident(seed)) {
+            ++not_keyed;
+            return pb::RxHash::NotKeyed;
+        }
+        pow = seed;
+        return pb::RxHash::Hashed;
+    }
+    bool key(const pb::Hash32& s) override {
+        ++keys;
+        keyed.insert(s);
+        return true;
+    }
+    void set_pins(const std::vector<std::pair<std::uint64_t, pb::Hash32>>& p) override { pins = p; }
+};
+
+struct KatRxNode {
+    KatSeedRows rows;
+    KatRxEngine eng;
+    pb::NodeRxIo io;
+    std::uint64_t judged = 0, judged_edge = 0;  // PoW words; with branch 2's seed at 3000320
+};
+
+// The node's I/O through make_node_rx_io (manual keying); L: its template P_r on branch 2 from the seed edge.
+std::function<void(pb::PathbNodeIo&)> rx_io(KatRxNode& k, const KatNet& net) {
+    return [&k, &net](pb::PathbNodeIo& io) {
+        pb::NodeRxWiring w;
+        w.engine = &k.eng;
+        w.rows = k.rows.hold();
+        w.manual = true;
+        w.judge = [&k, &net](const pb::Hash32& pow, std::uint64_t, const pb::HashingBlob& b, const pb::Hash32&) {
+            const pb::Hash32 s = branch_seed(net.rows, b.prev_id);
+            ++k.judged;
+            if (s == br2_block(kSeedEdge)) ++k.judged_edge;
+            return pow == s;
+        };
+        k.io = pb::make_node_rx_io(std::move(w));
+        io.seed_of = k.io.seed_of;
+        io.verify = k.io.verify;
+        if (k.rows.br2_main)
+            io.monero_block_at = [](std::uint64_t h) -> std::optional<pb::Hash32> {
+                return h >= kSeedEdge ? br2_block(h) : mon_block(h);
+            };
+    };
+}
+
+void seedbranch_run(bool nokey) {
+    const std::string tag = nokey ? "seednokey: " : "seedbranch: ";
+    KatNet net;
+    {
+        const pb::RowWeights rwt = rw(kTailAgc, 300000, 300000);
+        pb::Hash32 p = mon_block(kSeedEdge - 1);
+        for (std::uint64_t hh = kSeedEdge; hh <= kBr2Top; ++hh) p = net.rows.add(kBr2Tag, hh, p, mon_ts(hh), kMonDiff, rwt, false);
+    }
+    Harness h(net);
+    FakeWire w;
+    KatRxNode L, V;
+    L.rows.rows = &net.rows;
+    L.rows.br2_main = true;
+    L.rows.tip = kBr2Top;
+    V.rows.rows = &net.rows;
+    if (nokey) {
+        V.eng.any = false;
+        V.eng.keyed = {mon_block(2998272), mon_block(kSeedEdge)};
+    }
+    KatRelay l = kat_relay(h, w, table0(net), true, false, nullptr, nullptr, rx_io(L, net));
+    KatRelay v = kat_relay(h, w, table0(net), false, false, nullptr, nullptr, rx_io(V, net));
+    V.io.keyer->set_on_adopted([r = v.relay.get()](const pb::Hash32& s) { r->on_seed_keyed(s); });
+    h.mon_tip = kBr2Top;
+    bool mined = true;
+    std::uint32_t n = 0;
+    while (mined && h[l.node].tree().best().h < 3000420 && n < 400) {
+        const std::optional<pb::PathbJob> j = h.job(l.node, n % 5, 7000 + n);
+        mined = j && h[l.node].on_own_share(*j, 7000 + n, pb::Hash32{}).action == pb::NodeAction::Placed;
+        if (!mined) std::printf("  %smine %u stopped: %s\n", tag.c_str(), n, j ? "not placed" : "no job");
+        ++n;
+    }
+    const pb::Hash32 tip_l = h[l.node].tree().best().id;
+    const std::uint64_t h_l = h[l.node].tree().best().h;
+    w.connect(0, 1);
+    w.run();
+    // the relays on the harness clock; V's keying requests built as soon as they are queued
+    std::uint64_t rounds = 0;
+    int secs = 0;
+    for (; secs < 600 && h[v.node].tree().best().id != tip_l; ++secs) {
+        if (V.io.keyer->queued() > 0) {
+            ++rounds;
+            (void)V.io.keyer->pump();
+        }
+        h.now += 1;
+        for (pb::PathbRelayNode* r : {l.relay.get(), v.relay.get()}) {
+            r->tick();
+            r->pump();
+        }
+        while (w.step()) {
+        }
+    }
+    pb::PathbRelayNode& rv = *v.relay;
+    const std::uint64_t pl = 1;  // L at V
+    std::printf("  %sL mined %u to h %llu; after %d s V at %llu (L at %llu); V judged %llu (%llu on branch 2's seed); "
+                "keyings %llu rounds %llu; not keyed %llu, rx alarms %llu, held now %zu; V strikes %llu bans %llu\n",
+                tag.c_str(), n, (unsigned long long)h_l, secs, (unsigned long long)h[v.node].tree().best().pos,
+                (unsigned long long)h[l.node].tree().best().pos, (unsigned long long)V.judged,
+                (unsigned long long)V.judged_edge, (unsigned long long)V.eng.keys, (unsigned long long)rounds,
+                (unsigned long long)rv.stats().rx_not_keyed.load(), (unsigned long long)rv.stats().rx_failures.load(),
+                rv.seed_held(), (unsigned long long)rv.strikes_of(pl), (unsigned long long)rv.stats().bans.load());
+    check(mined && h_l >= 3000420 && h[v.node].tree().best().id == tip_l && V.judged_edge > 0 && rv.strikes_of(pl) == 0
+                  && rv.stats().bans.load() == 0 && rv.hello_ok(pl),
+          tag + "V catches up L's chain (h " + std::to_string(h_l) + "): placed, judged with branch 2's seed, 0 strikes, "
+                "0 bans, L's link kept");
+    if (nokey)
+        check(rv.stats().rx_failures.load() == 0 && rv.stats().rx_not_keyed.load() > 0 && V.eng.not_keyed > 0
+                      && V.eng.keys == 1 && V.eng.keyed.count(br2_block(kSeedEdge)) == 1 && rv.seed_held() == 0,
+              tag + "the catch-up on branch 2's seed waited for its keying: no RandomX alarm, one keying, nothing held after");
+    // a frame of L on its frame path (seednokey: branch 2's seed gone from V's engine first)
+    if (nokey) V.eng.keyed.erase(br2_block(kSeedEdge));
+    const std::uint64_t judged0 = V.judged, nk0 = rv.stats().rx_not_keyed.load();
+    const std::optional<pb::PathbJob> j = h.job(l.node, 3, 9000);
+    const bool placed = j && h[l.node].on_own_share(*j, 9000, pb::Hash32{}).action == pb::NodeAction::Placed;
+    w.run();
+    const std::size_t held = rv.seed_held(br2_block(kSeedEdge));
+    const bool waited = h[v.node].tree().best().id != h[l.node].tree().best().id;
+    const std::uint64_t keyed0 = V.eng.keys;
+    if (nokey) {
+        (void)V.io.keyer->pump();
+        w.run();
+    }
+    std::printf("  %sframe: held by seed %zu, not placed before the keying %d, keyings %llu -> %llu\n", tag.c_str(), held,
+                waited ? 1 : 0, (unsigned long long)keyed0, (unsigned long long)V.eng.keys);
+    check(placed && h[v.node].tree().best().id == h[l.node].tree().best().id && V.judged > judged0 && rv.strikes_of(pl) == 0
+                  && rv.stats().bans.load() == 0,
+          tag + "a frame of L at h " + std::to_string(h[l.node].tree().best().h) + ": placed at V, 0 strikes, 0 bans");
+    if (nokey)
+        check(held == 1 && waited && rv.stats().rx_not_keyed.load() == nk0 + 1 && rv.stats().rx_failures.load() == 0
+                      && rv.seed_held() == 0 && rv.stats().seed_held_released.load() >= 1,
+              tag + "the frame on a seed not keyed: held by its seed (no alarm, no token), run at its keying, placed");
+}
+void seedbranch() { seedbranch_run(false); }
+void seednokey() { seedbranch_run(true); }
+
+void seedmemo() {
+    KatNet net;
+    KatSeedRows r;
+    r.rows = &net.rows;
+    const pb::Hash32 gone = block_id(0x44, 3000460);
+    pb::Hash32 p = gone;
+    std::vector<pb::Hash32> kept;
+    for (std::uint64_t hh = 3000461; hh <= 3000500; ++hh) {
+        pb::BranchBlock b;
+        b.id = block_id(0x43, hh);
+        b.prev_id = p;
+        b.height = hh;
+        b.timestamp = mon_ts(hh);
+        r.kept_rows[b.id] = b;
+        kept.push_back(b.id);
+        p = b.id;
+    }
+    const std::vector<pb::Hash32> keys = {kept[39], kept[34], kept[29]};
+    KatRxEngine eng;
+    pb::NodeRxWiring wr;
+    wr.engine = &eng;
+    wr.rows = r.hold();
+    wr.manual = true;
+    const pb::NodeRxIo io = pb::make_node_rx_io(std::move(wr));
+    // one pass of the re-run gate over the parked keys: the ids each call looks up (most), the seeds found
+    const auto pass = [&] {
+        std::size_t most = 0, seeds = 0;
+        for (const pb::Hash32& k : keys) {
+            r.looked.clear();
+            seeds += io.seed_of(k) == std::optional<pb::Hash32>(mon_block(kSeedEdge)) ? 1 : 0;
+            most = std::max(most, r.looked.size());
+        }
+        return std::make_pair(most, seeds);
+    };
+    const auto first = pass();
+    bool waits = true;
+    std::size_t most_wait = 0;
+    for (int i = 0; i < 4; ++i) {
+        io.on_rows_event();
+        const auto pw = pass();
+        most_wait = std::max(most_wait, pw.first);
+        waits = waits && pw.first == 1 && pw.second == 0;
+    }
+    std::printf("  seedmemo: first pass %zu ids per call; waiting passes at most %zu id per call; memo walks %llu waits %llu\n",
+                first.first, most_wait, (unsigned long long)io.memo->stats().walks, (unsigned long long)io.memo->stats().waits);
+    check(first.second == 0 && first.first > 40 && io.memo->defers() == 3 && io.memo->stop_of(keys[0]) == gone && waits
+                  && io.memo->stats().walks == 3 && io.memo->stats().waits == 12,
+          "seedmemo: 3 P_r on kept rows whose walk runs out at 3000460: one walk each, then one id per call per pass");
+    // the stopping row arrives (kept; its parent the main row at 3000459): the walks resume there and end on the seed
+    pb::BranchBlock g;
+    g.id = gone;
+    g.prev_id = mon_block(3000459);
+    g.height = 3000460;
+    r.kept_rows[gone] = g;
+    io.on_rows_event();
+    const auto resumed = pass();
+    std::printf("  seedmemo: resumed: at most %zu ids per call, %zu seeds; resumes %llu\n", resumed.first, resumed.second,
+                (unsigned long long)io.memo->stats().resumes);
+    check(resumed.second == 3 && resumed.first <= 3 && io.memo->stats().resumes == 3 && io.memo->stats().walks == 3
+                  && io.memo->defers() == 0 && io.memo->seeds() == 0,
+          "seedmemo: the stopping row arrives: each walk resumes from it (3 ids at most) and ends on 3000320's id; "
+          "kept-row P_r not memoised");
+    // a held P_r: its seed memoised while it is held; a DEFER not asked again goes at the second row event
+    const pb::Hash32 held_pr = mon_block(3000450);
+    const bool s1 = io.seed_of(held_pr) == std::optional<pb::Hash32>(mon_block(kSeedEdge));
+    const std::size_t memo1 = io.memo->seeds();
+    r.hidden.insert(held_pr);
+    io.on_rows_event();
+    const std::size_t memo2 = io.memo->seeds();
+    (void)io.seed_of(block_id(0x45, 3000450));  // nobody holds it: a DEFER
+    const std::size_t d1 = io.memo->defers();
+    io.on_rows_event();
+    const std::size_t d2 = io.memo->defers();
+    io.on_rows_event();
+    check(s1 && memo1 == 1 && memo2 == 0 && d1 == 1 && d2 == 1 && io.memo->defers() == 0,
+          "seedmemo: a held P_r's seed kept while held, dropped at the row event after; a DEFER not asked goes");
+}
+
+// ---------------------------------------------------------------------------
 // floorpr: the floor reading of #9 (operator ruling), through the node's P_r resolution (resolve_pr_on_branch):
 //   fa      A builds on S with S's weights; B holds S verified without them (a bodiless alternative): B resolves S on
 //           the floor and admits A's carriers on it (B follows A's branch);
@@ -17587,6 +17887,9 @@ int main(int argc, char** argv) {
                                 {"catchheavy", catchheavy, 0},
                                 {"catchctx", catchctx, 0},
                                 {"floorpr", floorpr, 0},
+                                {"seedbranch", seedbranch, 2},
+                                {"seednokey", seednokey, 2},
+                                {"seedmemo", seedmemo, 0},
                                 {"viins", viins, 1},
                                 {"viishort", viishort, 1},
                                 {"viibig", viibig, 1},

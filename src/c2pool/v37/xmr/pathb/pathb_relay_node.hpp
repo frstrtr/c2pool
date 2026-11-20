@@ -232,6 +232,8 @@ struct PathbRelayStats {
     std::atomic<std::uint64_t> bucket_requests{0}, parked_reruns{0}, rewalks{0}, solicited_jobs{0};
     std::atomic<std::uint64_t> owner_queue_hwm{0}, owner_waits{0};  // the owner's event queue: high-water mark; reader waits
     std::atomic<std::uint64_t> stale_events{0}, reoffer_paused{0}, p15_drops{0}, p15_counted{0}, rx_failures{0};
+    // RandomX on a seed not keyed (no alarm): the jobs held by seed, run again when it is keyed, evicted at the cap
+    std::atomic<std::uint64_t> rx_not_keyed{0}, seed_held_released{0}, seed_held_evicted{0};
     std::atomic<std::uint64_t> tip_header_requests{0}, body_set_requests{0}, body_sets{0}, walk_placed{0};
     std::atomic<std::uint64_t> headers_ctx_deferred{0}, headers_ctx_reasks{0};  // header replies deferred on a P_r; asked again
     // replies to header requests retired at P-53, DROPped; header requests merged with an equal one in flight or waiting
@@ -789,6 +791,56 @@ public:
         for (const Job& j : parked_)
             if (j.frame == frame) return true;
         return false;
+    }
+    // The jobs held for a seed's keying (`seed`: for that seed only).
+    std::size_t seed_held(const std::optional<Hash32>& seed = std::nullopt) const {
+        std::lock_guard<std::mutex> lk(vmtx_);
+        if (!seed) return seed_held_n_;
+        const auto it = seed_held_.find(*seed);
+        return it == seed_held_.end() ? 0 : it->second.size();
+    }
+    // The node verifier keyed `seed` (the keying worker, any thread): the jobs held for it run again now; a join
+    // attempt and a catch-up comparison that stopped on it go on (on the owner).
+    void on_seed_keyed(const Hash32& seed) {
+        std::size_t n = 0;
+        {
+            std::lock_guard<std::mutex> lk(vmtx_);
+            n = release_seed_held_locked(seed);
+        }
+        st_.seed_held_released += n;
+        if (n > 0) vcv_.notify_all();
+        post([this, seed] { resume_on_seed(seed); });
+    }
+    void resume_on_seed(const Hash32& seed) {
+        bool join = false;
+        std::vector<std::uint64_t> peers;
+        {
+            std::lock_guard<std::mutex> lk(nkmtx_);
+            if (join_wait_seed_ && *join_wait_seed_ == seed) {
+                join_wait_seed_.reset();
+                join = true;
+            }
+            for (auto it = fold_wait_.begin(); it != fold_wait_.end();) {
+                if (it->second != seed) {
+                    ++it;
+                    continue;
+                }
+                peers.push_back(it->first);
+                it = fold_wait_.erase(it);
+            }
+        }
+        if (!peers.empty()) {
+            const NodeGuard g(*this);
+            std::lock_guard<std::mutex> lk(cumtx_);
+            for (const std::uint64_t p : peers) {
+                const auto it = catchup_.find(p);
+                if (it != catchup_.end() && it->second.fetch_tip == Hash32{}) catchup_ask_locked(p, it->second);
+            }
+        }
+        if (join) {
+            join_not_before_ms_ = 0;
+            signal_join();
+        }
     }
 
     const PathbRelayStats& stats() const noexcept { return st_; }
@@ -1695,6 +1747,7 @@ private:
         if (o_.parked_max > 0) parked_.push_back(std::move(j));
     }
     void due_parked_locked() {
+        (void)release_seed_held_locked(std::nullopt);
         const std::uint64_t t = now_ms();
         for (auto it = parked_.begin(); it != parked_.end();) {
             if (it->not_before_ms <= t) {
@@ -1754,6 +1807,7 @@ private:
             std::uint64_t fresh = 0;
             bool rx_fail = false;
             std::string rx_why;
+            std::optional<Hash32> nk;
             {
                 const NodeGuard g(*this);
                 if (!running_) {
@@ -1766,10 +1820,12 @@ private:
                 } catch (const RandomxFailure& e) {
                     rx_fail = true;
                     rx_why = e.what();
+                    nk = not_keyed_seed(e);
                 }
             }
             if (rx_fail) {
-                rx_failed(std::move(j), "carrier", rx_why);
+                if (nk) not_keyed(std::move(j), *nk);
+                else rx_failed(std::move(j), "carrier", rx_why);
                 return;
             }
             // the token stays spent for a STRIKE or a BAN (begin_carrier's verdict is final for both); a solicited
@@ -1789,6 +1845,7 @@ private:
         Effects fx;
         bool rx_fail = false;
         std::string rx_why;
+        std::optional<Hash32> nk;
         std::uint64_t fresh = 0;
         {
             const NodeGuard g(*this);
@@ -1801,6 +1858,7 @@ private:
             } catch (const RandomxFailure& e) {
                 rx_fail = true;
                 rx_why = e.what();
+                nk = not_keyed_seed(e);
             }
             if (!rx_fail)
                 for (const NodeEventResult& r : rs) {
@@ -1818,7 +1876,8 @@ private:
                 }
         }
         if (rx_fail) {
-            rx_failed(std::move(j), "receipt", rx_why);
+            if (nk) not_keyed(std::move(j), *nk);
+            else rx_failed(std::move(j), "receipt", rx_why);
             return;
         }
         if (!j.solicited && fresh > 0) valid_count(j.peer, fresh);  // its first placement, a re-run or not
@@ -1839,6 +1898,7 @@ private:
         Effects fx;
         bool rx_fail = false;
         std::string rx_why;
+        std::optional<Hash32> nk;
         {
             const NodeGuard g(*this);
             try {
@@ -1846,15 +1906,17 @@ private:
             } catch (const RandomxFailure& e) {
                 rx_fail = true;
                 rx_why = e.what();
+                nk = not_keyed_seed(e);
             }
             if (!rx_fail) after_result_locked(peer, r, digest, fx, !solicited);
             take_rx_failed_locked(fx);
         }
         if (rx_fail) {
-            rx_alarm("carrier placement", rx_why);
+            if (!nk) rx_alarm("carrier placement", rx_why);
             Job j{Job::Kind::Carrier, peer, src_of(peer), std::move(frame), 0, solicited, true};
             j.arrival = arrival;
-            park_job(std::move(j), now_ms() + kParkRetryMs);
+            if (nk) hold_by_seed(std::move(j), *nk);
+            else park_job(std::move(j), now_ms() + kParkRetryMs);
             run_effects(fx);
             return;
         }
@@ -1885,6 +1947,83 @@ private:
         refund(j);
         j.rerun = true;  // run again (not gated again; counted at its first placement)
         park_job(std::move(j), now_ms() + kParkRetryMs);
+    }
+    // ... on a seed not keyed: no alarm; the token goes back; the job held by its seed.
+    void not_keyed(Job j, const Hash32& seed) {
+        refund(j);
+        j.rerun = true;
+        hold_by_seed(std::move(j), seed);
+    }
+    static std::optional<Hash32> not_keyed_seed(const RandomxFailure& e) {
+        if (const auto* nk = dynamic_cast<const RandomxNotKeyed*>(&e)) return nk->seed;
+        return std::nullopt;
+    }
+    // The jobs waiting for a seed's keying, by seed, under one cap for the whole set (parked_max); when it is full the
+    // source with the most jobs loses its oldest. Each runs again after kParkRetryMs, and at once when its seed is
+    // keyed (on_seed_keyed). Under vmtx_.
+    void hold_by_seed(Job j, const Hash32& seed) {
+        st_.rx_not_keyed++;
+        std::lock_guard<std::mutex> lk(vmtx_);
+        j.not_before_ms = now_ms() + kParkRetryMs;
+        if (o_.parked_max == 0) return;
+        if (seed_held_n_ >= o_.parked_max) evict_seed_held_locked();
+        const std::uint64_t q = ++seed_seq_;
+        seed_src_[j.src].emplace_back(q, seed);
+        seed_held_[seed].push_back(SeedHeld{q, std::move(j)});
+        ++seed_held_n_;
+    }
+    void evict_seed_held_locked() {
+        auto top = seed_src_.end();
+        for (auto it = seed_src_.begin(); it != seed_src_.end(); ++it)
+            if (top == seed_src_.end() || it->second.size() > top->second.size()) top = it;
+        if (top == seed_src_.end()) return;
+        const auto [q, seed] = top->second.front();
+        top->second.pop_front();
+        if (top->second.empty()) seed_src_.erase(top);
+        const auto s = seed_held_.find(seed);
+        if (s != seed_held_.end()) {
+            for (auto it = s->second.begin(); it != s->second.end(); ++it)
+                if (it->seq == q) {
+                    s->second.erase(it);
+                    break;
+                }
+            if (s->second.empty()) seed_held_.erase(s);
+        }
+        --seed_held_n_;
+        st_.seed_held_evicted++;
+        st_.queue_dropped++;
+    }
+    // Into the verify queue: every job held for `seed`, or (nullopt) every job due.
+    std::size_t release_seed_held_locked(const std::optional<Hash32>& seed) {
+        const std::uint64_t t = now_ms();
+        std::size_t n = 0;
+        for (auto s = seed_held_.begin(); s != seed_held_.end();) {
+            if (seed && s->first != *seed) {
+                ++s;
+                continue;
+            }
+            for (auto it = s->second.begin(); it != s->second.end();) {
+                if (!seed && it->job.not_before_ms > t) {
+                    ++it;
+                    continue;
+                }
+                const auto src = seed_src_.find(it->job.src);
+                if (src != seed_src_.end()) {
+                    for (auto e = src->second.begin(); e != src->second.end(); ++e)
+                        if (e->first == it->seq) {
+                            src->second.erase(e);
+                            break;
+                        }
+                    if (src->second.empty()) seed_src_.erase(src);
+                }
+                vq_.push_front(std::move(it->job));
+                it = s->second.erase(it);
+                --seed_held_n_;
+                ++n;
+            }
+            s = s->second.empty() ? seed_held_.erase(s) : std::next(s);
+        }
+        return n;
     }
     // The alarm: every failure counted; a log line when RandomX starts failing (where, and the failure's reason) and
     // one when a hash is computed again (rx_tick).
@@ -1974,6 +2113,7 @@ private:
         std::vector<std::uint64_t> strikes;                 // servers of walked body sets struck once
         std::vector<ParkedFrame> rx_retry;                  // frames whose admission failed with a RandomX failure
         std::vector<ParkedFrame> rx_rerun;                  // frames to run again after a counted RandomX failure
+        std::vector<std::pair<ParkedFrame, Hash32>> rx_not_keyed;  // ... failed on a seed not keyed: (frame, seed)
         std::vector<std::pair<std::uint64_t, std::uint64_t>> p15;  // released carriers placed: (peer, objects)
         std::vector<std::string> lines;                     // the STRIKE / REFUSE lines of the drained carriers
         std::vector<PathbNode::DrainedResult> penalties;    // the STRIKE and BAN verdicts of the drained carriers
@@ -1982,7 +2122,10 @@ private:
     // the node placed on its own (a drain's released carriers, a bind's walked carriers), counted as received frames are,
     // and their STRIKE and BAN verdicts charged to their senders as a received frame's are (run_effects).
     void take_rx_failed_locked(Effects& fx) {
-        for (ParkedFrame& f : node_->take_rx_failed()) fx.rx_retry.push_back(std::move(f));
+        for (auto& [f, nk] : node_->take_rx_failed_seeded()) {
+            if (nk) fx.rx_not_keyed.emplace_back(std::move(f), *nk);
+            else fx.rx_retry.push_back(std::move(f));
+        }
         for (const PathbNode::PlacedRelease& c : node_->take_placed_released()) fx.p15.emplace_back(c.peer, c.objects);
         for (const PathbNode::DrainedResult& d : node_->take_drained()) {
             account_locked(d.peer, d.action, d.row, d.verdict, d.omitted, d.repended, d.lost);
@@ -2101,11 +2244,14 @@ private:
                 const PathbNode::WalkBind wb = node_->bind_walked_branch(r.admit.bind);
                 if (wb.rx_failed) {
                     // node-internal (the walk stopped at a RandomX failure; what it found stays): the alarm; the
-                    // parked frame runs again after kParkRetryMs (no token)
-                    rx_alarm("walked carrier");
+                    // parked frame runs again after kParkRetryMs (no token); a seed not keyed: no alarm, held by seed
+                    if (!wb.rx_not_keyed) rx_alarm("walked carrier");
                     if (d) {
                         parked_by_cause_[m].erase(*d);
-                        if (std::optional<ParkedFrame> f = node_->take_parked(*d)) fx.rx_rerun.push_back(std::move(*f));
+                        if (std::optional<ParkedFrame> f = node_->take_parked(*d)) {
+                            if (wb.rx_not_keyed) fx.rx_not_keyed.emplace_back(std::move(*f), *wb.rx_not_keyed);
+                            else fx.rx_rerun.push_back(std::move(*f));
+                        }
                     }
                 }
                 st_.walk_placed += wb.placed.size();
@@ -2370,6 +2516,9 @@ private:
         for (ParkedFrame& f : fx.rx_rerun)
             park_job(Job{Job::Kind::Carrier, f.peer, src_of(f.peer), std::move(f.frame), 0, f.solicited, true},
                      now_ms() + kParkRetryMs);
+        for (auto& [f, seed] : fx.rx_not_keyed)  // no alarm: held by seed (no token)
+            hold_by_seed(Job{Job::Kind::Carrier, f.peer, src_of(f.peer), std::move(f.frame), 0, f.solicited, true}, seed);
+        fx.rx_not_keyed.clear();
         for (const auto& [peer, n] : fx.p15) valid_count(peer, n);  // a released carrier's first placement (P-15)
         fx.rx_retry.clear();
         fx.rx_rerun.clear();
@@ -3017,7 +3166,7 @@ private:
     bool inbound_idle() const {
         if (rx_events_.load() != 0) return false;
         std::lock_guard<std::mutex> lk(vmtx_);
-        return vq_.empty() && parked_.empty() && vbusy_.load() == 0;
+        return vq_.empty() && parked_.empty() && seed_held_n_ == 0 && vbusy_.load() == 0;
     }
     // Under the node lock and cumtx_: a catch-up handed to the joiner (an empty reply from position 0, JoinerPath)
     // whose tip is still not held and whose (tip, server) pair lives; a held one ended by its done test, one whose pair
@@ -3102,7 +3251,13 @@ private:
                 o = node_->on_headers(p, f, now_s(), arrival);
             } catch (const RandomxFailure& e) {  // node-internal, a local alarm; no token, no ban; a comparison
                                                  // past its first checked header pauses (its next request resumes it)
-                rx_alarm("headers of peer " + std::to_string(p), e.what());
+                if (const std::optional<Hash32> nk = not_keyed_seed(e)) {  // no alarm: resumed when the seed is keyed
+                    st_.rx_not_keyed++;
+                    std::lock_guard<std::mutex> lk(nkmtx_);
+                    fold_wait_[p] = *nk;
+                } else {
+                    rx_alarm("headers of peer " + std::to_string(p), e.what());
+                }
                 log("relay: peer " + std::to_string(p) + " FC_HEADERS not judged: " + e.what() + " (no token, no ban)");
                 return;
             }
@@ -3513,7 +3668,15 @@ private:
             }
             // a RandomX failure in the attempt: node-internal, the alarm; no token; the pair re-queued, tried again as
             // after a non-service
-            if (s->report->end == AttemptEnd::NodeInternal) rx_alarm("join attempt", s->report->what);
+            if (s->report->end == AttemptEnd::NodeInternal) {
+                if (s->report->not_keyed) {  // no alarm: the next attempt when the seed is keyed
+                    st_.rx_not_keyed++;
+                    std::lock_guard<std::mutex> lk(nkmtx_);
+                    join_wait_seed_ = s->report->not_keyed;
+                } else {
+                    rx_alarm("join attempt", s->report->what);
+                }
+            }
             if (s->report->end == AttemptEnd::NotServed || s->report->end == AttemptEnd::NodeInternal)
                 join_not_before_ms_ = now_ms() + abandon_s_ * 1000;
         }
@@ -4470,7 +4633,8 @@ private:
                             },
                             w.bound, ctx_.rx, o_.ctx_block_cap);
                 } catch (const RandomxFailure& e) {  // node-internal, a local alarm; the context is judged again later
-                    rx_alarm("context " + hex_short(id), e.what());
+                    if (not_keyed_seed(e)) st_.rx_not_keyed++;
+                    else rx_alarm("context " + hex_short(id), e.what());
                     return false;
                 }
             } else {
@@ -4732,6 +4896,17 @@ private:
     std::condition_variable vcv_;
     std::deque<Job> vq_;
     std::deque<Job> parked_;
+    struct SeedHeld {
+        std::uint64_t seq = 0;
+        Job job;
+    };
+    std::map<Hash32, std::deque<SeedHeld>> seed_held_;                              // under vmtx_
+    std::map<std::uint64_t, std::deque<std::pair<std::uint64_t, Hash32>>> seed_src_;  // per source: (seq, seed), oldest first
+    std::size_t seed_held_n_ = 0;
+    std::uint64_t seed_seq_ = 0;
+    std::mutex nkmtx_;                                     // fold_wait_, join_wait_seed_ (a leaf lock)
+    std::map<std::uint64_t, Hash32> fold_wait_;            // a catch-up comparison stopped on a seed not keyed
+    std::optional<Hash32> join_wait_seed_;                 // a join attempt ended on a seed not keyed
     std::atomic<std::size_t> vbusy_{0};        // verify jobs taken from vq_ and still running (taken under vmtx_)
     std::atomic<std::int64_t> rx_events_{0};   // owner events of received frames posted and not run yet (E-193)
     std::atomic<bool> caught_due_{false};      // every HELLO catch-up ended; K_NCU's end waits for the drain (E-193)

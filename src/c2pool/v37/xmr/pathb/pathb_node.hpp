@@ -1049,7 +1049,19 @@ public:
     // The parked frames marked for a re-walk (data they walked arrived), taken out of the deferred store.
     // The released carriers whose admission failed with a RandomX failure (drain_released): the caller runs them
     // again.
-    std::vector<ParkedFrame> take_rx_failed() { return std::exchange(rx_failed_, {}); }
+    std::vector<ParkedFrame> take_rx_failed() {
+        rx_failed_nk_.clear();
+        return std::exchange(rx_failed_, {});
+    }
+    // ... each with the seed not keyed when that was the failure.
+    std::vector<std::pair<ParkedFrame, std::optional<Hash32>>> take_rx_failed_seeded() {
+        std::vector<std::pair<ParkedFrame, std::optional<Hash32>>> out;
+        for (std::size_t i = 0; i < rx_failed_.size(); ++i)
+            out.emplace_back(std::move(rx_failed_[i]), i < rx_failed_nk_.size() ? rx_failed_nk_[i] : std::nullopt);
+        rx_failed_.clear();
+        rx_failed_nk_.clear();
+        return out;
+    }
     // The unsolicited released carriers placed by a drain (their first placement): the sender and the objects to
     // count in P-15 (the carrier and its carried bodies not pending here).
     struct PlacedRelease {
@@ -1112,6 +1124,7 @@ public:
         std::vector<std::uint64_t> struck;
         std::vector<Hash32> need_bodies;  // bound, carrying bodies, no body set held
         bool rx_failed = false;           // a Closure admission failed with RandomxFailure: the walk stopped there
+        std::optional<Hash32> rx_not_keyed;  // ... on a seed not keyed: the seed
     };
     WalkBind bind_walked_branch(const std::vector<Hash32>& ids) {
         WalkBind out;
@@ -1171,8 +1184,9 @@ public:
                     AdmitResult r;
                     try {
                         r = admit_frame_from(env(), servers[k], *frame, CarrierRole::Closure);
-                    } catch (const RandomxFailure&) {  // node-internal: the walk stops; what it found so far stays
+                    } catch (const RandomxFailure& e) {  // node-internal: the walk stops; what it found so far stays
                         out.rx_failed = true;
+                        if (const auto* nk = dynamic_cast<const RandomxNotKeyed*>(&e)) out.rx_not_keyed = nk->seed;
                         break;
                     }
                     if (r.verdict == AdmitVerdict::AdmitCarrier) {
@@ -3063,6 +3077,7 @@ private:
         closed_.clear();
         release_q_.clear();
         rx_failed_.clear();
+        rx_failed_nk_.clear();
         placed_released_.clear();
         drained_.clear();
         resumed_x1_.reset();
@@ -3296,7 +3311,10 @@ private:
                     if (!f.solicited && (r.action == NodeAction::Placed || r.action == NodeAction::SideBranch ||
                                          r.action == NodeAction::Switched || r.action == NodeAction::JoinerPath))
                         placed_released_.push_back(PlacedRelease{f.peer, 1 + fresh});  // its first placement (P-15)
-                } catch (const RandomxFailure&) {
+                } catch (const RandomxFailure& e) {
+                    const auto* nk = dynamic_cast<const RandomxNotKeyed*>(&e);
+                    rx_failed_nk_.resize(rx_failed_.size());
+                    rx_failed_nk_.push_back(nk ? std::optional<Hash32>(nk->seed) : std::nullopt);
                     rx_failed_.push_back(std::move(f));
                 }
             }
@@ -3963,6 +3981,7 @@ private:
     std::set<std::uint64_t> hold_conns_;
     std::deque<ParkedFrame> release_q_;
     std::vector<ParkedFrame> rx_failed_;  // released carriers whose admission failed with a RandomX failure
+    std::vector<std::optional<Hash32>> rx_failed_nk_;  // ... the seed not keyed of each (when that was the failure)
     std::vector<PlacedRelease> placed_released_;  // unsolicited released carriers placed by a drain (P-15)
     std::vector<DrainedResult> drained_;          // the outcomes of the drained and walk-bound carriers (take_drained)
     std::vector<Hash32> repended_out_;  // re-pended by a switch, not yet taken for the relay (take_repended)

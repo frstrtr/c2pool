@@ -75,6 +75,7 @@
 #include "xmr/xmr_node_config.hpp"
 #include "xmr/xmr_live_transport.hpp"
 #include "xmr/xmr_o2_randomx_verify.hpp"
+#include "xmr/xmr_node_rx_verify.hpp"
 #include "xmr/xmr_live_submit.hpp"
 #include "xmr/xmr_stratum_listener.hpp"
 #include "xmr/xmr_web_dashboard.hpp"
@@ -93,6 +94,7 @@
 #include "xmr/pathb/pathb_stratum_hooks.hpp"
 #include "xmr/pathb/pathb_policy.hpp"
 #include "xmr/pathb/pathb_follower_rows.hpp"
+#include "xmr/pathb/pathb_node_rx.hpp"
 #include "xmr/pathb/pathb_job_source.hpp"
 #include "xmr/pathb/pathb_own_share.hpp"
 #include "xmr/pathb/xmr_pathb_store.hpp"
@@ -942,12 +944,8 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
                     "randomx is %s\n", o2::O2RandomXVerifier::to_string(rx.mode()));
         return 3;
     }
-    o2::O2RandomXVerifier node_rx;
-    {
-        o2::RandomXPolicy np = o2::RandomXPolicy::from_config(cfg);
-        np.lazy_prefetch_on_miss = true;
-        node_rx.init(np);
-    }
+    o2::NodeRxVerifier node_rx;
+    node_rx.init(o2::node_rx_policy(cfg));
     std::printf("randomx: stratum %s; node %s\n", rx.describe().c_str(), node_rx.describe().c_str());
 
     // ---- the follower rows and the native Monero node ----
@@ -1110,27 +1108,15 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
         return pb::resolve_pr_on_branch(view, rows, p_r,
                                         [nn](const pb::Hash32& id) { return nn->index().verified_child_version(id); });
     };
-    io.seed_of = [&view, nn](const pb::Hash32& p_r) -> std::optional<pb::Hash32> {
-        const std::optional<pb::BranchBlock> b = view.block(p_r);
-        if (!b) return std::nullopt;
-        return nn->index().seed_hash_for_height(b->height + 1);
-    };
-    // RandomX on the node's verifier: the hash, or false with the reason it computed none
-    const auto node_hash = [&node_rx](const std::vector<std::uint8_t>& bytes, const pb::Hash32& seed, pb::Hash32& pow,
-                                      std::string& why) {
-        if (node_rx.randomx_hash(bytes.data(), bytes.size(), 0, seed, pow)) return true;
-        if (!node_rx.ready())
-            why = std::string("the node verifier is not ready (") + o2::O2RandomXVerifier::to_string(node_rx.mode()) + ")";
-        else if (!node_rx.seed_resident(seed))
-            why = "the seed " + hex_of(seed).substr(0, 16) + " is not keyed (its cache could not be built)";
-        else
-            why = "the VM gave no hash with the seed " + hex_of(seed).substr(0, 16);
-        return false;
-    };
-    // a hash not computed leaves as RandomxFailure (node-internal), never as a PoW verdict
-    io.verify = [node_hash](const pb::HashingBlob& b, std::uint64_t d, const pb::Hash32& seed) {
-        return pb::verify_rx_at_d(node_hash, b, d, seed);
-    };
+    // the seed of P_r's branch; RandomX on the node's verifier: a hash not computed leaves as RandomxFailure
+    // (node-internal), never as a PoW verdict; a seed not keyed posts its keying request (RandomxNotKeyed)
+    pb::VerifierEngine<o2::NodeRxVerifier> node_rx_engine(node_rx);
+    pb::NodeRxWiring rxw;
+    rxw.engine = &node_rx_engine;
+    rxw.rows = pb::index_seed_rows(nn->index(), rows);
+    pb::NodeRxIo rxio = pb::make_node_rx_io(std::move(rxw));
+    io.seed_of = rxio.seed_of;
+    io.verify = rxio.verify;
     io.monero_tip = [nn]() -> std::optional<std::uint64_t> {
         const auto t = nn->index().tip();
         if (!t) return std::nullopt;
@@ -1241,10 +1227,11 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
             return true;
         };
         // a hash not computed leaves as RandomxFailure (the relay's alarm; the context judged again later)
-        cs.rx = [node_hash](const std::vector<std::uint8_t>& blob, const ::v37::bytes32& seed, ::v37::bytes32& pow) {
+        cs.rx = [ctx_hash = rxio.ctx_hash](const std::vector<std::uint8_t>& blob, const ::v37::bytes32& seed,
+                                           ::v37::bytes32& pow) {
             pb::Hash32 s{}, out{};
             std::memcpy(s.data(), seed.data(), 32);
-            pb::rx_hash_or_fail(node_hash, blob, s, out);
+            ctx_hash(blob, s, out);
             std::memcpy(pow.data(), out.data(), 32);
             return true;
         };
@@ -1260,10 +1247,21 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
         };
         relay->set_ctx_source(std::move(cs));
     }
+    // the keying worker: the jobs held for a seed run again when it is keyed; the pinned main seeds keyed before the
+    // links open
+    rxio.keyer->set_on_adopted([r = relay.get()](const pb::Hash32& s) { r->on_seed_keyed(s); });
+    rxio.keyer->start();
+    struct KeyerStop {
+        pb::RxKeyer* k;
+        ~KeyerStop() { k->stop(); }
+    } keyer_stop{rxio.keyer.get()};  // before the relay goes (every return)
+    rxio.repin();
+    rxio.keyer->wait_idle();
     {
         std::string why;
         if (!relay->start(why)) {
             std::printf("REFUSED: %s\n", why.c_str());
+            rxio.keyer->stop();
             backend->stop();
             return 2;
         }
@@ -1413,6 +1411,7 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
     });
     if (const std::string e = listener.bind(); !e.empty()) {
         std::printf("REFUSED: %s\n", e.c_str());
+        rxio.keyer->stop();
         relay->stop();
         backend->stop();
         return 2;
@@ -1622,8 +1621,13 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
         }
         // a Monero tip change or a new RowWeights record: the frames parked on a Monero input run again (the relay
         // node's on_monero_tip, called here outside the node lock)
+        if (tip_moved) rxio.repin();  // the pinned main seeds of the new tip, keyed ahead (off the node lock)
         if (tip_moved || rows.recorded() != last_rows_recorded) {
             last_rows_recorded = rows.recorded();
+            relay->with_node([&](pb::PathbNode&) {  // the seed memo's row event, under the node lock
+                rxio.on_rows_event();
+                return 0;
+            });
             relay->on_monero_tip();
         }
         for (const pb::NodeEventResult& r : own_runner.run_kept()) count_own(r);  // the kept own shares
@@ -2101,6 +2105,7 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
     }
 #endif
     listener.stop();
+    rxio.keyer->stop();
     relay->stop();
     {
         std::string w;

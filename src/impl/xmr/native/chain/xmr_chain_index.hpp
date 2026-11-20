@@ -614,6 +614,46 @@ public:
         if (a == nullptr || !a->resolved || !a->has_entry) return std::nullopt;
         return HeldRow{a->id, a->prev_id, a->height, alt_timestamp_(*a), a->cumulative_difficulty, false};
     }
+    // The held rows read under ONE hold of the index mutex: with_held_rows(fn) calls fn(reader) once. The reader's
+    // held_row, seed_hash_for_height and tip_height are the bodies of held_row, seed_hash_for_height and tip without
+    // their locks; main_row_at is a main-chain row by height. fn calls no public member of the index and keeps no copy
+    // of the reader; nothing is raised or flushed.
+    class HeldRowsReader {
+    public:
+        HeldRowsReader(const HeldRowsReader&) = delete;
+        HeldRowsReader& operator=(const HeldRowsReader&) = delete;
+        std::optional<HeldRow> held_row(const Hash& id) const {
+            if (const RowRecord* r = ix_.rows_.by_id(id))
+                return HeldRow{r->row.id, r->row.prev_id, r->row.height, r->row.timestamp, r->row.cumulative_difficulty, true};
+            const AltBlock* a = ix_.alt_.find(id);
+            if (a == nullptr || !a->resolved || !a->has_entry) return std::nullopt;
+            return HeldRow{a->id, a->prev_id, a->height, ix_.alt_timestamp_(*a), a->cumulative_difficulty, false};
+        }
+        std::optional<Hash> seed_hash_for_height(std::uint64_t h) const {
+            return ix_.rows_.id_at_epoch_height(rx_seedheight(h));
+        }
+        std::optional<Hash> main_row_at(std::uint64_t h) const {
+            const RowRecord* r = ix_.rows_.by_height(h);
+            if (r == nullptr) return std::nullopt;
+            return r->row.id;
+        }
+        std::uint64_t tip_height() const {
+            const RowRecord* t = ix_.rows_.tip();
+            return t ? t->row.height : 0;
+        }
+
+    private:
+        friend class ChainIndex;
+        explicit HeldRowsReader(const ChainIndex& ix) : ix_(ix) {}
+        const ChainIndex& ix_;
+    };
+    template <class Fn>
+    decltype(auto) with_held_rows(Fn&& fn) const {
+        std::lock_guard<std::mutex> lk(mu_);
+        const HeldRowsReader r(*this);
+        return std::forward<Fn>(fn)(r);
+    }
+
     // The oldest main-chain row held.
     std::optional<HeldRow> oldest_row() const {
         std::lock_guard<std::mutex> lk(mu_);

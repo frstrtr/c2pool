@@ -76,6 +76,7 @@
 // ---------------------------------------------------------------------------
 
 #include <algorithm>
+#include <atomic>
 #include <cstdarg>
 #include <cstdio>
 #include <filesystem>
@@ -84,6 +85,7 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "impl/xmr/native/chain/xmr_chain_index.hpp"
@@ -93,6 +95,7 @@
 #include "impl/xmr/native/consensus/xmr_reward.hpp"
 #include "impl/xmr/native/contracts/fakes/fake_fetcher.hpp"
 #include "c2pool/v37/xmr/pathb/pathb_follower_rows.hpp"
+#include "c2pool/v37/xmr/pathb/pathb_node_rx.hpp"
 
 using namespace c2pool::xmr::native;
 
@@ -953,7 +956,7 @@ static void test_alt_rows_restart() {
     std::optional<c2pool::xmr::pathb::RowWeights> w_before;
     std::vector<std::uint8_t> snap;
     ChainIndexOptions sopts;
-    Hash m9{};
+    Hash m9{}, m80{};
     {
         Rig f(8);
         sopts = f.opts;
@@ -978,6 +981,7 @@ static void test_alt_rows_restart() {
             checkf(rh.outcome == OfferOutcome::Connected, "altrestart: main block %llu", static_cast<unsigned long long>(h));
             prev = rh.id;
         }
+        m80 = prev;
         checkf(w_before.has_value() && rows.save(why), "altrestart: P weighted and the table saved (%s)", why.c_str());
         checkf(f.idx->save_snapshot(snap, why), "altrestart: the native snapshot saved (%s)", why.c_str());
     }
@@ -1019,6 +1023,50 @@ static void test_alt_rows_restart() {
         checkf(ok && !g8.idx->held_row(m9).has_value() && kb.has_value() && kb->height == 9 && kb->prev_id == g8.main_ids[7]
                        && rows.weights(m9).has_value(),
                "altrestart: a main-chain row the restarted index does not hold is served as kept (%s)", why.c_str());
+    }
+    {
+        // the seed walk under one hold of the index (with_held_rows) through the kept rows (kept_row): the restarted
+        // index ends at 8; from 80 the walk reads 80 .. 9 as kept rows, then the main row at 8, and returns the
+        // index's row at the seed height 0; then the same while another thread connects the rows 9 .. 40 (each row
+        // sink: the index mutex, then the table's)
+        Rig g8(8);
+        c2pool::xmr::pathb::PathbFollowerRows rows(table);
+        rows.bind(g8.idx);
+        g8.idx->subscribe_rows([&rows](const ConsensusState& st, const ChainRow& row, bool seeded) { rows.on_row(st, row, seeded); });
+        std::string why;
+        const bool ok = rows.load(why);
+        const Hash g0 = genesis_row().id;
+        c2pool::xmr::pathb::SeedMemo memo;
+        const c2pool::xmr::pathb::SeedRowsHold hold = c2pool::xmr::pathb::index_seed_rows(*g8.idx, rows);
+        const auto seed80 = [&] {
+            std::optional<Hash> s;
+            hold([&](const c2pool::xmr::pathb::ISeedRows& r) { s = memo.seed_of(r, m80); });
+            return s;
+        };
+        const std::optional<Hash> s = seed80();
+        checkf(ok && !g8.idx->held_row(m80).has_value() && s == std::optional<Hash>(g0) && memo.seeds() == 0,
+               "seedwalk: from a kept row at 80 through the kept rows to the main row at 8: the seed at 0 (%s)", why.c_str());
+        std::atomic<bool> done{false};
+        std::uint64_t connected = 0;
+        std::thread t([&] {
+            Hash prev = g8.main_ids[7];
+            for (std::uint64_t h = 9; h <= 40; ++h) {
+                const OfferResult r = g8.idx->offer_block(nullptr, Rig::block_for(prev, h, agc_at(*g8.idx, h - 1), 0, 0), true);
+                if (r.outcome != OfferOutcome::Connected) break;
+                prev = r.id;
+                ++connected;
+            }
+            done = true;
+        });
+        std::uint64_t calls = 0, found = 0;
+        while (!done.load()) {
+            ++calls;
+            found += seed80() == std::optional<Hash>(g0) ? 1 : 0;
+        }
+        t.join();
+        checkf(connected == 32 && calls > 0 && found == calls && seed80() == std::optional<Hash>(g0),
+               "seedwalk: beside a thread connecting 9 .. 40 (%llu): %llu walks, each the seed at 0",
+               static_cast<unsigned long long>(connected), static_cast<unsigned long long>(calls));
     }
     {
         Rig g(8);  // the restarted node: the same main chain, P not held

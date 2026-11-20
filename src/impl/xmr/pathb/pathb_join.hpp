@@ -84,6 +84,13 @@ namespace c2pool::xmr::pathb {
 
 using ::c2pool::xmr::native::U128;
 
+// A RandomX failure on a seed the node's verifier has not keyed: node-internal, with the seed (its keying request is
+// posted; the work waiting on it is released when it is keyed).
+struct RandomxNotKeyed : RandomxFailure {
+    Hash32 seed{};
+    RandomxNotKeyed(const std::string& what, const Hash32& s) : RandomxFailure(what), seed(s) {}
+};
+
 // ---------------------------------------------------------------------------
 // Bound work (E-77 as ruling 45 amends it): Monero height h(c) -> the sum of
 // d of the carriers there whose S1.3 #9 this node computed (receipts never
@@ -1048,6 +1055,7 @@ struct AttemptReport {
     std::uint32_t strike = 0;              // tokens of computed rows on the server's own bytes
     std::uint64_t alarms = 0;              // local alarms raised (claims, node-internal)
     std::string what;                      // a short reason
+    std::optional<Hash32> not_keyed;       // NodeInternal on a seed not keyed: the seed
     SpanBounds span;
     std::shared_ptr<const BoundWork> a_profile;  // A's bound work, read when the attempt took its L
     bool a_profile_read = false;
@@ -2150,6 +2158,7 @@ public:
                 rep.candidate = p->candidate;
                 rep.alarms = 1;
                 rep.what = e.what();
+                if (const auto* nk = dynamic_cast<const RandomxNotKeyed*>(&e)) rep.not_keyed = nk->seed;
                 return Attempted{*p, std::move(rep)};
             }
         }
