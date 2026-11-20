@@ -2309,6 +2309,50 @@ TEST(DashQcPoseGate, ProvenBanRootIsMemoizedAcrossEmitEvaluations) {
     EXPECT_TRUE(st.embedded_template_emit_ok(sel2.work, &why)) << why.one_line();
 }
 
+// The same proven-ban height with the SUPERSET arm on (P-2,
+// --embedded-include-mn-special-txs): the expected root is the FOLDED root
+// (projection -> bans -> provider fold over the body). Its memo is keyed on
+// (epoch, tip, ban list, body txids). Pinned here: warm evaluations do no
+// root work (RED on pre-memo master: N calls == N roots), and the BAN LIST
+// key moves the memo by itself (the oracle calls do not bump the epoch).
+TEST(DashQcPoseGate, P2FoldedRootMemoIsWarmAndMovesWithTheBanList) {
+    using dash::coin::vendor::sml_calc_merkle_root_count;
+    NodeCoinState st;
+    seed_real_qc_serving(st, make_real_qc(/*punish_listed_member=*/true));
+    st.set_include_mn_special_txs(true);
+    wire_oracle(st, 50, 50);
+
+    WorkSelection sel = st.select_work([] { return DashWorkData{}; });
+    ASSERT_EQ(sel.source, WorkSource::Embedded) << sel.decline.one_line();
+    DeclineReport why;
+    ASSERT_TRUE(st.embedded_template_emit_ok(sel.work, &why)) << why.one_line();
+
+    const uint64_t roots0 = sml_calc_merkle_root_count();
+    const uint64_t folds0 = st.fold_root_computes_dbg();
+    constexpr int N = 100;
+    for (int i = 0; i < N; ++i)
+        ASSERT_TRUE(st.embedded_template_emit_ok(sel.work, nullptr));
+    EXPECT_EQ(sml_calc_merkle_root_count() - roots0, 0u)
+        << N << " warm P-2 evaluations at a banning height re-derived the"
+                " folded root (pre-memo: " << N << ")";
+    EXPECT_EQ(st.fold_root_computes_dbg() - folds0, 0u);
+
+    // The oracle stops proving the ban (same epoch): the ban-list key moves,
+    // the folded root is re-derived without the ban, and the banned-root
+    // template is refused instead of served off the memo.
+    wire_oracle(st, 0, 0);
+    EXPECT_FALSE(st.embedded_template_emit_ok(sel.work, &why));
+    EXPECT_EQ(why.cause, "emit-mnlist-root-drift") << why.one_line();
+    EXPECT_EQ(st.fold_root_computes_dbg() - folds0, 1u);
+
+    // The ban is proven again: one re-derivation for the new key, then warm.
+    wire_oracle(st, 50, 50);
+    ASSERT_TRUE(st.embedded_template_emit_ok(sel.work, &why)) << why.one_line();
+    EXPECT_EQ(st.fold_root_computes_dbg() - folds0, 2u);
+    ASSERT_TRUE(st.embedded_template_emit_ok(sel.work, nullptr));
+    EXPECT_EQ(st.fold_root_computes_dbg() - folds0, 2u);
+}
+
 // KAT 10 — fail closed with no oracle (the PR-A production posture): the
 // refusal names stage=penalty-unknown, and an oracle that is not at THIS tip
 // names oracle-not-at-tip — both at viability and at emit.
