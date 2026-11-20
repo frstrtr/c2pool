@@ -1249,9 +1249,18 @@ public:
                         const std::array<uint8_t, 96>& sig) {
         if (!m_islock_verify) return;                     // no verifier => fail closed
         if (!m_islock_verify(inputs, txid, cycle_hash, sig)) {
+            // The relay lane (on_islock) has already applied this lock,
+            // unverified, a moment ago in the same isdlock handler. Undo that:
+            // a refused lock keeps neither the hold short-circuit nor its
+            // outpoint exclusion (Mempool::revoke_unverified_islock). The
+            // feed-liveness tick stays.
+            const auto rv = m_state.mempool().revoke_unverified_islock(txid, inputs);
             LOG_WARNING << "[ISLOCK] rejected unverified isdlock txid="
                         << txid.GetHex().substr(0, 16) << "... cycle="
-                        << cycle_hash.GetHex().substr(0, 16) << "...";
+                        << cycle_hash.GetHex().substr(0, 16) << "... -- relay-lane"
+                        << " effects revoked (hold_restored=" << rv.hold_restored
+                        << " g4_cleared=" << rv.g4_cleared
+                        << " g4_restored=" << rv.g4_restored << ")";
             return;
         }
         LOG_INFO << "[ISLOCK] adopted VERIFIED isdlock txid="

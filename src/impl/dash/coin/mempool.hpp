@@ -1664,6 +1664,7 @@ public:
         // add_islock erases them from the (already-pruned) set as it pops.
         for (const auto& mtx : block.m_txs) {
             m_islock_txids.erase(dash_txid(mtx));
+            m_verified_islock_txids.erase(dash_txid(mtx));
             for (const auto& vin : mtx.vin) {
                 m_islock_outpoints.erase(
                     std::make_pair(vin.prevout.hash, vin.prevout.index));
@@ -2114,6 +2115,77 @@ public:
             auto [it, inserted] = m_verified_islock_outpoints.insert_or_assign(in, locked_txid);
             if (inserted) m_verified_islock_order.push_back(in);
         }
+        while (m_verified_islock_txid_order.size() >= MAX_ISLOCK_OUTPOINTS
+               && !m_verified_islock_txid_order.empty()) {
+            m_verified_islock_txids.erase(m_verified_islock_txid_order.front());
+            m_verified_islock_txid_order.pop_front();
+        }
+        if (m_verified_islock_txids.insert(locked_txid).second)
+            m_verified_islock_txid_order.push_back(locked_txid);
+    }
+
+    /// What revoke_unverified_islock undid.
+    struct IslockRevoke {
+        bool   hold_restored{false};       // txid left m_islock_txids (the hold applies again)
+        size_t g4_cleared{0};              // outpoint entries this lock wrote, removed
+        size_t g4_restored{0};             // entries it had overwritten, back to the verified lock
+    };
+
+    /// Lane 2 REFUSED this lock (BLS verification failed): undo what the
+    /// unverified relay lane (on_islock -> add_islock) did with it. Dash Core
+    /// only ever acts on locks it verified (its IsLocked short-circuit of
+    /// IsTxSafeForMining, miner.cpp:430-436), so a refused lock must not keep
+    /// a tx out of the 600 s mining-safety hold or keep its outpoints excluded.
+    /// Both lanes run synchronously in one isdlock handler (p2p_client.hpp:
+    /// new_islock, then new_isdlock), so the revoke lands before any template
+    /// can be built in between.
+    ///
+    ///   * txid: removed from m_islock_txids unless a VERIFIED lock holds the
+    ///     same txid (a forged copy naming a verified txid changes nothing);
+    ///   * each input: an entry this lock wrote (still mapped to its txid) is
+    ///     removed, or set back to the VERIFIED lock's txid when the forged
+    ///     lock had overwritten a verified entry (otherwise G4 would stop
+    ///     excluding a tx the emit belt still refuses);
+    ///   * the feed-liveness tick (m_last_islock_seen) is left alone: a
+    ///     revocation must not make the feed look dark and disarm the hold.
+    ///
+    /// Not undone: a pool entry add_islock already EVICTED stays evicted (it is
+    /// re-relayed or mined elsewhere; the cost is fees, never a block).
+    IslockRevoke revoke_unverified_islock(const uint256& locked_txid,
+                                          const std::vector<std::pair<uint256, uint32_t>>& inputs)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        IslockRevoke r;
+        if (!m_verified_islock_txids.count(locked_txid) && m_islock_txids.erase(locked_txid))
+            r.hold_restored = true;   // stale order-deque entries are harmless (FIFO erase)
+        for (const auto& in : inputs) {
+            auto it = m_islock_outpoints.find(in);
+            const auto v = m_verified_islock_outpoints.find(in);
+            if (v != m_verified_islock_outpoints.end()) {
+                if (it == m_islock_outpoints.end()) {
+                    m_islock_outpoints.emplace(in, v->second);
+                    m_islock_order.push_back(in);
+                    ++r.g4_restored;
+                } else if (it->second != v->second) {
+                    it->second = v->second;
+                    ++r.g4_restored;
+                }
+                continue;
+            }
+            if (it != m_islock_outpoints.end() && it->second == locked_txid) {
+                m_islock_outpoints.erase(it);
+                ++r.g4_cleared;
+            }
+        }
+        return r;
+    }
+
+    /// Hold short-circuit probe (dashd IsLocked(txid) equivalent) for KATs
+    /// and diagnostics.
+    bool islock_txid_known(const uint256& txid) const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_islock_txids.count(txid) > 0;
     }
 
     /// First tx of an already-built body that spends an outpoint a VERIFIED
@@ -2168,6 +2240,8 @@ public:
         m_islock_order.clear();
         m_verified_islock_outpoints.clear();
         m_verified_islock_order.clear();
+        m_verified_islock_txids.clear();
+        m_verified_islock_txid_order.clear();
         m_islock_txids.clear();
         m_islock_txid_order.clear();
         m_last_islock_seen = 0;
@@ -3248,6 +3322,10 @@ private:
     // (add_verified_islock). Drives the emit belt and the forced refresh.
     std::map<std::pair<uint256, uint32_t>, uint256>    m_verified_islock_outpoints;
     std::deque<std::pair<uint256, uint32_t>>           m_verified_islock_order;
+    // Txids holding a VERIFIED lock: revoke_unverified_islock never strips
+    // their hold short-circuit.
+    std::set<uint256>                                  m_verified_islock_txids;
+    std::deque<uint256>                                m_verified_islock_txid_order;
     // IS mining-safety hold: txids holding a known islock (dashd
     // IsLocked(txid)) — such a tx bypasses the 10-minute hold. Same bounded-
     // FIFO posture as the outpoint map (relay is untrusted input).
