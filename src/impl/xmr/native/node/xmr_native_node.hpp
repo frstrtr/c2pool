@@ -2164,8 +2164,8 @@ private:
             else        outputs_.disable_resolution();
         });
         if (!ok) {
-            note_("[snapshot] REFUSED: " + load_why + "; starting from the "
-                + (cfg_.boot == BootMode::Anchor ? "confirmed anchor" : "genesis"));
+            note_("[snapshot] REFUSED: " + load_why + "; image sha256 " + anchor_codec::to_hex(bind)
+                + "; starting from the " + (cfg_.boot == BootMode::Anchor ? "confirmed anchor" : "genesis"));
             return true;
         }
         if (!tip_ok) {
@@ -2251,7 +2251,7 @@ private:
             else        outputs_.disable_resolution();
         });
         if (!ok) {
-            note_("[snapshot] REFUSED: " + load_why + fallback);
+            note_("[snapshot] REFUSED: " + load_why + "; image sha256 " + anchor_codec::to_hex(bind) + fallback);
             return;
         }
         // The pair was captured at one tip and bound by digest, so the resumed

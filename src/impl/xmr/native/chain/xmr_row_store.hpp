@@ -115,6 +115,13 @@ public:
         return true;
     }
 
+    // The test install() applies, with no store to change: heights contiguous, ascending.
+    static bool contiguous(const std::vector<RowRecord>& rows) noexcept {
+        for (std::size_t i = 1; i < rows.size(); ++i)
+            if (rows[i].row.height != rows[i - 1].row.height + 1) return false;
+        return true;
+    }
+
     // Install a restored window wholesale (snapshot resume). Heights must be
     // contiguous and ascending; anything else is refused, because a store with a
     // hole in it answers burial questions wrongly and silently.
