@@ -407,8 +407,9 @@ if (BUILD_TESTING)
     # the production LightVerifier + librandomx) reproducing the X8 KAT vector
     # (mainnet block 3,000,000 PoW) through the MERGED XmrStratumServer's
     # handle_login/handle_submit, plus the exact 128-bit network gate, the
-    # strict no-Argon2d-on-submit invariant, the seed mailbox and the
-    # fail-closed disabled/compiled-out modes. HEAVY (2 x 256 MiB caches) and
+    # strict no-Argon2d-on-submit invariant, the seed mailbox, the
+    # fail-closed disabled/compiled-out modes and the node verifier's
+    # keyings (lazy, two slots) in two seed orders. HEAVY (2 x 256 MiB caches) and
     # JIT: like xmr_randomx_verify_kat it is built ONLY under XMR_BUILD_RANDOMX
     # (the non-sanitizer CI leg) and is listed in that leg's --target list.
     if (XMR_BUILD_RANDOMX AND TARGET randomx)

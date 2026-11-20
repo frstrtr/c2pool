@@ -91,6 +91,9 @@
 #   v37_xmr_pathb_ref_identity_kat   payee and owner key references held under their own
 #                                    identity: the node's map, a join attempt's map, the
 #                                    load's map
+#   v37_xmr_pathb_recovery_trace_kat the relay node's handling of honest objects in fixed
+#                                    scenarios, traced step by step (placements, requests,
+#                                    penalties, re-runs) and compared with golden digests
 #
 # DRIFT-GUARD: this tree is outside the glob of
 # tools/ci/check_test_target_allowlist.py, so every target below is listed by
@@ -154,7 +157,8 @@ if (BUILD_TESTING)
             v37_xmr_pathb_store_kat
             v37_xmr_pathb_node_kat
             v37_xmr_pathb_node_join_kat
-            v37_xmr_pathb_ref_identity_kat)
+            v37_xmr_pathb_ref_identity_kat
+            v37_xmr_pathb_recovery_trace_kat)
         add_executable(${_pathb_kat} ${_pathb_kat}.cpp)
         target_include_directories(${_pathb_kat} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
         target_link_libraries(${_pathb_kat} PRIVATE xmr_pathb)
@@ -226,4 +230,6 @@ if (BUILD_TESTING)
     target_link_libraries(v37_xmr_pathb_node_join_kat PRIVATE Threads::Threads)
     # v37_xmr_pathb_ref_identity_kat runs relay nodes in manual mode.
     target_link_libraries(v37_xmr_pathb_ref_identity_kat PRIVATE Threads::Threads)
+    # v37_xmr_pathb_recovery_trace_kat runs relay nodes in manual mode.
+    target_link_libraries(v37_xmr_pathb_recovery_trace_kat PRIVATE Threads::Threads)
 endif()

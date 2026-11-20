@@ -11,7 +11,7 @@
 // The runtime RandomX IPowVerifier (xmr/xmr_o2_randomx_verify.hpp:
 // O2RandomXVerifier over the production LightVerifier + librandomx) against the
 // X8 KAT vector — Monero mainnet block 3,000,000 (seed = block id at 2,998,272,
-// difficulty 308739704685, PoW 309e84a7…) — in two suites:
+// difficulty 308739704685, PoW 309e84a7…) — in three suites:
 //   (A) the verifier alone: fail-closed disabled/compiled-out modes, JIT ->
 //       interpreter init, the STRICT no-Argon2d-on-submit invariant (I2), the
 //       main-thread -> listener seed mailbox, randomx_hash == the KAT PoW, the
@@ -23,11 +23,16 @@
 //       "Couldn't check PoW" before the template hook, the O-2 flow (hook ->
 //       prefetch -> login -> winning submit -> submit_network_block -> exact
 //       gate Accept, 1 hash total), a wrong nonce = lane share only, and the
-//       disabled verifier never reaching the sink.
+//       disabled verifier never reaching the sink;
+//   (C) the node's verifier (lazy keying, two cache slots, as the pool node
+//       builds it) driven one call at a time through randomx_hash with three
+//       seeds L, J1, J2 in two fixed orders: each call's keyings (prefetches)
+//       equal the order's golden.
 // HEAVY: 2 x 256 MiB light caches per verifier instance (light mode only,
 // never the 2 GiB dataset). Built only under XMR_BUILD_RANDOMX (the
 // non-sanitizer CI leg). Nonzero exit on any failure.
 // ===========================================================================
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <optional>
@@ -299,6 +304,67 @@ void suite_b(const Vector& kat) {
 #endif
 }
 
+// ---------------------------------------------------------------------------
+// Suite C — the node verifier's keyings. An O2RandomXVerifier built as the pool
+// node builds its own (RandomX on, lazy keying on a miss; two cache slots),
+// driven from one thread through randomx_hash as the node's verify does
+// (height 0). Seeds: L (the KAT seed) and J1, J2 (test data: the KAT seed with
+// its first byte changed). `prefetches` is read before and after every call.
+//   order (A): L J1 L J2 L J1 L J2 (L hashed between the J seeds);
+//   order (B): L J1 J2 L J1 J2 L (two J seeds in a row).
+// Each order runs on a fresh verifier; each call's increment equals the
+// order's golden. In both orders the keyings at L calls after the first are at
+// most the keyings at J calls; in (B) at least one L call after the first keys.
+// ---------------------------------------------------------------------------
+const std::vector<std::uint64_t> kRekeyGoldenA = {1, 1, 0, 1, 0, 1, 0, 1};  // golden: taken on master by run
+const std::vector<std::uint64_t> kRekeyGoldenB = {1, 1, 1, 1, 1, 1, 1};  // golden: taken on master by run
+
+void suite_c(const Vector& kat) {
+    std::printf("== (C) the node verifier's keyings (lazy, two slots) ==\n");
+#if defined(V37_XMR_O2_WITH_RANDOMX)
+    Seed32 seeds[3] = {kat.seed, kat.seed, kat.seed};
+    seeds[1][0] ^= 0x01;
+    seeds[2][0] ^= 0x02;
+    // the per-call keyings of one order; live / join: the keyings at L calls after the first / at J calls
+    const auto run = [&](const char* name, const std::vector<int>& order, const std::vector<std::uint64_t>& golden,
+                         std::uint64_t& live, std::uint64_t& join) {
+        O2RandomXVerifier v;
+        RandomXPolicy np;
+        np.enabled = true;
+        np.lazy_prefetch_on_miss = true;
+        const bool up = v.init(np);
+        check(up, (std::string("rekey ") + name + ": the node verifier is ready").c_str());
+        if (!up) return;
+        std::vector<std::uint64_t> inc;
+        bool hashed = true;
+        std::string line;
+        live = join = 0;
+        for (std::size_t i = 0; i < order.size(); ++i) {
+            const std::uint64_t p0 = v.stats().prefetches;
+            Hash32 h{};
+            hashed = v.randomx_hash(kat.blob.data(), kat.blob.size(), 0, seeds[order[i]], h) && hashed;
+            const std::uint64_t d = v.stats().prefetches - p0;
+            inc.push_back(d);
+            if (order[i] != 0) join += d;
+            else if (i > 0) live += d;
+            line += (i ? "," : "") + std::to_string(d);
+        }
+        std::printf("  rekey %s: keyings per call %s (live re-keys %llu, join keyings %llu)\n", name, line.c_str(),
+                    static_cast<unsigned long long>(live), static_cast<unsigned long long>(join));
+        check(hashed, (std::string("rekey ") + name + ": every call hashed").c_str());
+        check(inc == golden, (std::string("rekey ") + name + ": the keyings per call equal the golden").c_str());
+        check(live <= join, (std::string("rekey ") + name + ": live re-keys <= join keyings").c_str());
+    };
+    std::uint64_t la = 0, ja = 0, lb = 0, jb = 0;
+    run("(A)", {0, 1, 0, 2, 0, 1, 0, 2}, kRekeyGoldenA, la, ja);
+    run("(B)", {0, 1, 2, 0, 1, 2, 0}, kRekeyGoldenB, lb, jb);
+    check(lb >= 1, "rekey (B): at least one live re-key");
+#else
+    (void)kat;
+    std::printf("  (skipped: RandomX compiled out)\n");
+#endif
+}
+
 } // namespace
 
 int main() {
@@ -311,6 +377,7 @@ int main() {
                 static_cast<unsigned long long>(kHeight));
     suite_a(kat);
     suite_b(kat);
+    suite_c(kat);
     std::printf("== %s (%d failures) ==\n", fails ? "FAIL" : "OK", fails);
     return fails ? 1 : 0;
 }
