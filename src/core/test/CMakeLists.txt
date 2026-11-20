@@ -242,6 +242,14 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
     # ramped high comes back after one share at the bound, a steady rig with
     # apply latency converges and stays. One KAT covers every coin served by
     # core::StratumServer. Same fold-into-core_test reasoning as every TU here.
+    # found_block_import_effort_test.cpp: --import-found-blocks and the source
+    # node's measured effort -- /recent_merged_blocks serves (and the import
+    # takes) pool_hashrate_at_find; an imported row takes the source's
+    # integrated effort where this node's own covers less of the same round,
+    # keeps its own where it covers as much, refuses and counts an implausible
+    # one; the outside operator's re-import fills once, a third changes
+    # nothing. Only API that predates the change, so it builds (and fails)
+    # against the earlier code. Same fold-into-core_test reasoning.
     # pool_luck_test.cpp, web_server_luck_test.cpp, web_server_luck_inputs_test.cpp:
     # pool luck as effort (core/pool_luck.hpp). The first pins the model on
     # hand-computed fixtures (integrated effort over a piecewise-constant
@@ -274,6 +282,7 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
         events_test.cpp
         factory_connect_failed_uaf_test.cpp
         filesystem_test.cpp
+        found_block_import_effort_test.cpp
         found_block_import_test.cpp
         found_block_store_test.cpp
         found_block_submit_test.cpp

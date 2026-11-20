@@ -146,6 +146,25 @@ void parse_entry(const nlohmann::json& e, size_t index, Parsed& out)
         if (v && *v > 0 && *v <= std::numeric_limits<uint32_t>::max())
             r.tx_count = static_cast<uint32_t>(*v);
     }
+    // The source's measured effort of the round: offered when it says it
+    // integrated it ("imported": a node that took another's integral) and
+    // was watching when the block was found. A first block's 1.0 and a
+    // single sample are no such measurement (the single sample is this
+    // node's own to compute, from pool_hashrate_at_find).
+    const std::string method = string_field(e, "effort_method");
+    auto measured = e.find("measured");
+    if ((method == "integrated" || method == "imported")
+        && measured != e.end() && measured->is_boolean() && measured->get<bool>()) {
+        auto number = [&e](const char* key) {
+            auto it = e.find(key);
+            return (it != e.end() && it->is_number()) ? it->get<double>()
+                                                      : std::numeric_limits<double>::quiet_NaN();
+        };
+        r.effort_offered   = true;
+        r.effort           = number("effort");
+        r.effort_coverage  = number("history_coverage");
+        r.effort_prev_hash = hash_hex(string_field(e, "prev_block_hash"));
+    }
     out.rows.push_back(std::move(r));
 }
 
@@ -347,6 +366,10 @@ void Report::add(const Report& pass)
     height_corrected += pass.height_corrected;
     pool_verified    += pass.pool_verified;
     rate_refused     += pass.rate_refused;
+    effort_taken     += pass.effort_taken;
+    effort_refused   += pass.effort_refused;
+    effort_not_used  += pass.effort_not_used;
+    effort_not_judged += pass.effort_not_judged;
     pending          += pass.pending;
     for (const auto& [chain, n] : pass.imported_by_chain) imported_by_chain[chain] += n;
     for (const auto& [reason, n] : pass.rejected) rejected[reason] += n;
@@ -385,6 +408,8 @@ std::string Report::summary() const
     os << "; heights from the header chain: filled " << height_filled
        << ", corrected " << height_corrected
        << "; pool_hashrate_at_find refused " << rate_refused
+       << "; source effort taken " << effort_taken << ", refused " << effort_refused
+       << ", not used " << effort_not_used << ", not judged " << effort_not_judged
        << "; coinbase-verified " << pool_verified;
     if (pending) os << "; pending (<6 deep) " << pending;
     return os.str();

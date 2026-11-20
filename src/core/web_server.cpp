@@ -3678,7 +3678,11 @@ nlohmann::json MiningInterface::found_block_row_locked(const FoundBlock& b) cons
     // at height 0, the LTC rows stored at the share absheight) is timed like
     // any other.
     const bool first_block = b.effort_method == core::luck::EffortMethod::first_block;
-    const bool has_effort = b.effort > 0.0 && b.luck > 0.0;
+    // Finite numbers only: a luck the JSON would render as null never goes
+    // out under a method that claims a value (core::luck::effort_over drops
+    // such an effort already).
+    const bool has_effort = b.effort > 0.0 && b.luck > 0.0
+        && std::isfinite(b.effort) && std::isfinite(b.luck);
     // A row with NO luck names the input that cannot be had, whatever its
     // provenance: that is the one thing a reader of a null needs to know.
     std::string method;
@@ -3700,15 +3704,18 @@ nlohmann::json MiningInterface::found_block_row_locked(const FoundBlock& b) cons
     // found_locally row means "not computed" (first block, or recorded
     // with no difficulty), never "0% lucky": also null.
     auto num_or_null = [](double v) {
-        return v > 0.0 ? nlohmann::json(v) : nlohmann::json(nullptr);
+        return v > 0.0 && std::isfinite(v) ? nlohmann::json(v) : nlohmann::json(nullptr);
     };
     // A MEASURED luck: an effort computed over a real round. The first
     // block's 100 % is a definition, not a measurement, so it carries no
     // luck_approximate. A measured luck is approximate unless the pool rate
     // history covers (nearly) the whole round.
     const bool luck_measured = has_effort && !first_block;
+    // An imported effort is another node's integral over the same round:
+    // accurate on the same terms, by the coverage of that node's history.
+    const bool imported_effort = b.effort_method == core::luck::EffortMethod::imported;
     const bool luck_accurate = luck_measured
-        && b.effort_method == core::luck::EffortMethod::integrated
+        && (b.effort_method == core::luck::EffortMethod::integrated || imported_effort)
         && b.history_coverage >= kLuckAccurateCoverage;
     // The network difficulty of the row's OWN chain. A merged (aux) row
     // stored before the aux difficulty was recorded holds the parent's, which
@@ -3727,16 +3734,25 @@ nlohmann::json MiningInterface::found_block_row_locked(const FoundBlock& b) cons
     // the mean network difficulty behind the effort: over the rate history
     // segments of the round (effort_method "integrated"), or the one reading
     // captured at find time ("single_sample" / first block). 0 samples and
-    // null when the input was never measured (honest-null, #942).
-    const double rate_used = b.rate_used > 0.0 ? b.rate_used : b.rate_at_find.value;
-    const double diff_used = b.difficulty_used > 0.0 ? b.difficulty_used : own_difficulty;
-    const uint32_t rate_samples = b.rate_used > 0.0 ? std::max<uint32_t>(b.luck_samples, 1)
+    // null when the input was never measured (honest-null, #942) -- and for
+    // an imported effort, which no rate or difficulty of this node's is
+    // behind.
+    const double rate_used = imported_effort ? 0.0
+        : b.rate_used > 0.0 ? b.rate_used : b.rate_at_find.value;
+    const double diff_used = imported_effort ? 0.0
+        : b.difficulty_used > 0.0 ? b.difficulty_used : own_difficulty;
+    const uint32_t rate_samples = imported_effort ? 0
+                                : b.rate_used > 0.0 ? std::max<uint32_t>(b.luck_samples, 1)
                                 : b.rate_at_find.value > 0.0 ? 1 : 0;
-    const uint32_t diff_samples = b.difficulty_used > 0.0 ? std::max<uint32_t>(b.luck_samples, 1)
+    const uint32_t diff_samples = imported_effort ? 0
+                                : b.difficulty_used > 0.0 ? std::max<uint32_t>(b.luck_samples, 1)
                                 : own_difficulty > 0.0 ? 1 : 0;
+    // The share of the round measured behind the effort shown: this node's
+    // rate history's, or, for an imported effort, the source node's.
     nlohmann::json history_coverage = nullptr;
     if (b.effort_method == core::luck::EffortMethod::integrated
-        || b.effort_method == core::luck::EffortMethod::single_sample)
+        || b.effort_method == core::luck::EffortMethod::single_sample
+        || imported_effort)
         history_coverage = b.history_coverage;
     return {
         {"ts", b.ts},
@@ -3794,6 +3810,10 @@ nlohmann::json MiningInterface::found_block_row_locked(const FoundBlock& b) cons
         {"luck", num_or_null(b.luck)},
         {"luck_method", method},
         {"effort", num_or_null(b.effort)},
+        // "integrated" | "single_sample" | "first_block", or "imported": the
+        // node this history was imported from (--import-found-blocks)
+        // integrated the same round over more of it than this node's own
+        // history covers; history_coverage is then THAT node's coverage.
         {"effort_method", b.effort_method == core::luck::EffortMethod::none
                               ? nlohmann::json(nullptr)
                               : nlohmann::json(core::luck::effort_method_name(b.effort_method))},
@@ -3858,7 +3878,7 @@ nlohmann::json MiningInterface::rest_recent_blocks_at(double now)
     nlohmann::json arr = nlohmann::json::array();
 
     // How each measured luck was derived (first-row counts below).
-    uint64_t integrated = 0, single_sample = 0, accurate = 0, approximate = 0;
+    uint64_t integrated = 0, single_sample = 0, imported = 0, accurate = 0, approximate = 0;
 
     std::lock_guard<std::mutex> lock(m_blocks_mutex);
     // Derived fields are recomputed from the inputs on every read: the rate
@@ -3880,6 +3900,7 @@ nlohmann::json MiningInterface::rest_recent_blocks_at(double now)
         if (row["luck_approximate"].is_boolean()) {
             if (row["luck_approximate"].get<bool>()) ++approximate; else ++accurate;
             if (b.effort_method == core::luck::EffortMethod::integrated) ++integrated;
+            else if (b.effort_method == core::luck::EffortMethod::imported) ++imported;
             else ++single_sample;
         }
         arr.push_back(std::move(row));
@@ -3909,15 +3930,18 @@ nlohmann::json MiningInterface::rest_recent_blocks_at(double now)
         arr[0]["time_weighted_luck_count"]   = integrated;
         arr[0]["simple_avg_luck_count"]      = 0;
         arr[0]["single_hashrate_luck_count"] = single_sample;
+        arr[0]["imported_luck_count"]        = imported;
         arr[0]["luck_note"] =
             "Luck is 100 / effort. Effort is the number of blocks the pool "
             "expected to find over the round: the gross pool hashrate over "
             "network difficulty, integrated from the previous main-chain block "
             "(effort_method \"integrated\"; history_coverage is the share of the "
             "round the rate history covers), or one sample taken at find time "
-            "where no history covers the round (\"single_sample\"). The first "
-            "block counts as 1 found for 1 expected. pool_avg_luck is blocks "
-            "found over blocks expected, never a mean of per-block luck.";
+            "where no history covers the round (\"single_sample\"), or the "
+            "integral of the node the history was imported from where it covers "
+            "more of the round (\"imported\"; history_coverage is that node's). "
+            "The first block counts as 1 found for 1 expected. pool_avg_luck is "
+            "blocks found over blocks expected, never a mean of per-block luck.";
     }
     return arr;
 }
@@ -5495,6 +5519,14 @@ bool MiningInterface::found_block_luck_main_chain(const FoundBlock& b)
 MiningInterface::RateAtFind MiningInterface::rate_at_find_locked(const FoundBlock& b) const
 {
     // CALLER HOLDS m_luck_history_mutex.
+    return rate_at_find_locked(b.pool_hashrate, b.share_difficulty, static_cast<double>(b.ts));
+}
+
+MiningInterface::RateAtFind MiningInterface::rate_at_find_locked(double recorded,
+                                                                 double share_difficulty,
+                                                                 double ts) const
+{
+    // CALLER HOLDS m_luck_history_mutex.
     // The rate sampled at find, as far as it can be trusted. A recorded value
     // that is not plausibly a POOL rate (core::luck::rate_at_find_plausible:
     // the node's own stratum rate of an earlier build) is not used. Where
@@ -5502,12 +5534,11 @@ MiningInterface::RateAtFind MiningInterface::rate_at_find_locked(const FoundBloc
     // a missing or implausible one -- in memory only: what is stored is
     // rewritten only by repair_found_block_inputs_locked, under its own
     // stricter rule.
-    const double ts = static_cast<double>(b.ts);
     RateAtFind rate;
     if (core::luck::rate_at_find_plausible(
-            b.pool_hashrate, b.share_difficulty,
+            recorded, share_difficulty,
             m_luck_history.yardstick_rate(ts, kLuckYardstickSeconds))) {
-        rate.value = b.pool_hashrate;
+        rate.value = recorded;
         rate.source = RateAtFindSource::recorded;
     } else if (const auto at = m_luck_history.at(ts); at.rate > 0.0) {
         rate.value = at.rate;
@@ -5537,9 +5568,28 @@ MiningInterface::LuckRows MiningInterface::luck_rows_locked(bool primary,
         in.difficulty = found_block_luck_difficulty(b);
         const RateAtFind rate = rate_at_find_locked(b);
         in.rate_at_find = rate.value;
+        in.imported_effort = b.imported_effort;
+        in.imported_coverage = b.imported_coverage;
         out.rows.push_back(in);
         out.index.push_back(i);
         out.rates.push_back(rate);
+    }
+    // An imported effort measured the round from imported_prev_hash: name
+    // that row, if this chain holds it (compute_rounds uses the figure only
+    // while this node's round runs from the same block).
+    bool any_imported = false;
+    for (const auto& in : out.rows)
+        if (in.imported_effort > 0.0) { any_imported = true; break; }
+    if (!any_imported)
+        return out;
+    std::unordered_map<std::string, int> row_of_hash;
+    for (size_t k = 0; k < out.index.size(); ++k)
+        row_of_hash.emplace(m_found_blocks[out.index[k]].hash, static_cast<int>(k));
+    for (size_t k = 0; k < out.index.size(); ++k) {
+        const FoundBlock& b = m_found_blocks[out.index[k]];
+        if (!(b.imported_effort > 0.0) || b.imported_prev_hash.empty()) continue;
+        auto it = row_of_hash.find(b.imported_prev_hash);
+        if (it != row_of_hash.end()) out.rows[k].imported_prev = it->second;
     }
     return out;
 }
@@ -5639,6 +5689,13 @@ double MiningInterface::gross_pool_hashrate() const
     }
     std::lock_guard<std::mutex> hlock(m_luck_history_mutex);
     return core::luck::gross_rate(nonstale, m_luck_history.last_stale_prop());
+}
+
+double MiningInterface::gross_pool_hashrate_at(double block_ts, double now) const
+{
+    if (!(block_ts > 0.0) || !(std::fabs(now - block_ts) <= kLiveRateAtFindMaxLag))
+        return 0.0;
+    return gross_pool_hashrate();
 }
 
 void MiningInterface::add_luck_rate_sample(double t, double nonstale_rate, double stale_prop,
@@ -6063,6 +6120,12 @@ MiningInterface::import_found_blocks(const std::vector<core::found_block_import:
         FoundBlock blk{};
         bool primary{true};
         bool pending{false};   // < 6 deep: verified like a find
+        // The source's measured effort of the round, well-formed (judged on
+        // this node's own round once the rows are in, below).
+        bool   effort_offered{false};
+        double effort{0.0};
+        double effort_coverage{0.0};
+        std::string effort_prev_hash;
     };
     std::vector<Candidate> cands;
     std::set<std::string> seen;
@@ -6205,6 +6268,21 @@ MiningInterface::import_found_blocks(const std::vector<core::found_block_import:
         b.subsidy = r.subsidy;
         b.coinbase_txid = r.coinbase_txid;
         b.tx_count = r.tx_count;
+        // The source's effort: an effort within its absolute bounds and a
+        // coverage in (0, 1] (core::luck::imported_effort_valid), the block
+        // the round was timed from (not this one).
+        if (r.effort_offered) {
+            const bool well_formed = core::luck::imported_effort_valid(r.effort, r.effort_coverage)
+                && r.effort_prev_hash.size() == 64 && r.effort_prev_hash != r.hash;
+            if (well_formed) {
+                c.effort_offered = true;
+                c.effort = r.effort;
+                c.effort_coverage = r.effort_coverage;
+                c.effort_prev_hash = r.effort_prev_hash;
+            } else {
+                ++rep.effort_refused;
+            }
+        }
         cands.push_back(std::move(c));
     }
 
@@ -6213,32 +6291,43 @@ MiningInterface::import_found_blocks(const std::vector<core::found_block_import:
     std::vector<std::string> to_verify;
     if (!cands.empty()) {
         std::lock_guard<std::mutex> lock(m_blocks_mutex);
+        // The median of the file's own rates at find: the yardstick where the
+        // rate history does not reach (the usual case for history from
+        // before this node). A merged row's rate is the parent pool's too.
+        double file_median = 0.0;
         {
-            // The pool rate at find, checked as luck checks a recorded one
-            // (core::luck::rate_at_find_plausible): the share difficulty
-            // bounds it from below, and so does the rate history near the
-            // block -- or, where the history does not reach (the usual case
-            // for history from before this node), the median of the file's
-            // own rates. A pool never hashes above its whole network.
             std::vector<double> file_rates;
             for (const auto& c : cands)
-                if (c.primary && c.blk.pool_hashrate > 0.0)
+                if (c.blk.pool_hashrate > 0.0)
                     file_rates.push_back(c.blk.pool_hashrate);
-            double file_median = 0.0;
             if (file_rates.size() >= 3) {
                 std::nth_element(file_rates.begin(),
                                  file_rates.begin() + static_cast<std::ptrdiff_t>(file_rates.size() / 2),
                                  file_rates.end());
                 file_median = file_rates[file_rates.size() / 2];
             }
-            const double period = coin_block_period();
+        }
+        // A pool never hashes above its whole network: the rate a chain's
+        // difficulty stands for over its block interval.
+        const double period = coin_block_period();
+        auto network_rate = [&](bool primary, const FoundBlock& b) -> double {
+            const double d = found_block_luck_difficulty(b);
+            const double t = primary ? period
+                                     : static_cast<double>(found_block_chain_block_time(b.chain));
+            return d > 0.0 && t > 0.0 ? d * core::luck::kHashesPerDifficulty / t : 0.0;
+        };
+        {
+            // The pool rate at find, checked as luck checks a recorded one
+            // (core::luck::rate_at_find_plausible): the share difficulty
+            // bounds it from below, and so does the rate history near the
+            // block -- or the file's median.
             std::lock_guard<std::mutex> hlock(m_luck_history_mutex);
             for (auto& c : cands) {
                 FoundBlock& b = c.blk;
                 if (!(b.pool_hashrate > 0.0)) continue;
                 double yardstick = m_luck_history.yardstick_rate(static_cast<double>(b.ts),
                                                                  kLuckYardstickSeconds);
-                if (!(yardstick > 0.0) && c.primary) yardstick = file_median;
+                if (!(yardstick > 0.0)) yardstick = file_median;
                 bool ok = core::luck::rate_at_find_plausible(b.pool_hashrate,
                                                              b.share_difficulty, yardstick);
                 if (ok && c.primary && b.network_difficulty > 0.0 && period > 0.0)
@@ -6264,13 +6353,20 @@ MiningInterface::import_found_blocks(const std::vector<core::found_block_import:
         held.reserve(m_found_blocks.size() + cands.size());
         for (size_t i = 0; i < m_found_blocks.size(); ++i)
             held.emplace(key_of(m_found_blocks[i].hash, m_found_blocks[i].chain), i);
-        for (auto& c : cands) {
+        // What each candidate did to the ledger: a new row, or a held one
+        // that gained a field (counted and persisted once the source's
+        // effort, below, has had its say).
+        struct Applied { size_t cand; bool fresh; bool dirty; };
+        std::vector<Applied> applied;
+        applied.reserve(cands.size());
+        for (size_t ci = 0; ci < cands.size(); ++ci) {
+            Candidate& c = cands[ci];
             FoundBlock& in = c.blk;
             auto found = held.find(key_of(in.hash, in.chain));
             if (found == held.end()) {
                 held.emplace(key_of(in.hash, in.chain), m_found_blocks.size());
                 m_found_blocks.push_back(in);
-                to_persist.push_back(in);
+                applied.push_back({ci, true, true});
                 ++rep.imported;
                 ++rep.imported_by_chain[in.chain];
                 if (!c.primary) ++rep.imported_aux;
@@ -6293,6 +6389,15 @@ MiningInterface::import_found_blocks(const std::vector<core::found_block_import:
                 ex.network_difficulty = in.network_difficulty;
                 if (!c.primary) ex.aux_difficulty_known = in.aux_difficulty_known;
                 dirty = true;
+            } else if (!c.primary && !ex.aux_difficulty_known && in.aux_difficulty_known
+                       && in.network_difficulty > 0.0) {
+                // A merged row stored before the aux difficulty was recorded
+                // holds the PARENT's (#1738), which is no value of its own
+                // chain: the aux header's fills it, as a later record of the
+                // block does (record_found_block).
+                ex.network_difficulty = in.network_difficulty;
+                ex.aux_difficulty_known = true;
+                dirty = true;
             }
             if (ex.share_difficulty <= 0.0 && in.share_difficulty > 0.0) {
                 ex.share_difficulty = in.share_difficulty; dirty = true;
@@ -6314,12 +6419,7 @@ MiningInterface::import_found_blocks(const std::vector<core::found_block_import:
                 if (!ex.parent_height) ex.parent_height = in.parent_height;
                 dirty = true;
             }
-            if (dirty) {
-                ++rep.merged;
-                to_persist.push_back(ex);   // derived fields are not persisted
-            } else {
-                ++rep.unchanged;
-            }
+            applied.push_back({ci, false, dirty});
         }
         // The order record_found_block keeps (newest first by height, ts
         // breaks ties), and every derived field from the inputs: an imported
@@ -6331,6 +6431,103 @@ MiningInterface::import_found_blocks(const std::vector<core::found_block_import:
                 return a.ts > b.ts;
             });
         recompute_found_block_luck_locked();
+
+        // Where each candidate's row is now (the sort moved them).
+        std::unordered_map<std::string, size_t> at;
+        at.reserve(m_found_blocks.size());
+        for (size_t i = 0; i < m_found_blocks.size(); ++i)
+            at.emplace(key_of(m_found_blocks[i].hash, m_found_blocks[i].chain), i);
+
+        // ── The source's measured effort, judged on THIS node's round of the
+        // row, as just derived from everything the ledger now holds. Kept
+        // with the row -- a field it lacks, filled once -- only where it is
+        // a better measurement of the same round (see found_block_import.hpp).
+        // A merged row is judged on the LEDGER's rounds; /recent_merged_blocks
+        // shows it on the union with the merged manager's rows and re-checks
+        // the round there (KNOWN LIMIT in found_block_import.hpp).
+        bool effort_filled = false;
+        {
+            std::lock_guard<std::mutex> hlock(m_luck_history_mutex);
+            for (auto& a : applied) {
+                const Candidate& c = cands[a.cand];
+                if (!c.effort_offered) continue;
+                auto pos = at.find(key_of(c.blk.hash, c.blk.chain));
+                if (pos == at.end()) continue;   // cannot happen: just put there
+                FoundBlock& b = m_found_blocks[pos->second];
+                // Holds one already for this very round (fill-only), is no
+                // round of the chain here, or this node's round runs from
+                // another block (the first block runs from none). A held
+                // figure of a round that has since changed (a block learned
+                // between: imported_prev_hash is no longer the round's start)
+                // applies to nothing (compute_rounds) and is no reason to
+                // keep a valid figure of the round as it is now out.
+                const bool holds = b.imported_effort > 0.0
+                    && b.imported_prev_hash == b.prev_block_hash;
+                if (holds || !b.luck_main_chain || b.prev_block_hash != c.effort_prev_hash) {
+                    ++rep.effort_not_used;
+                    continue;
+                }
+                // Measured over too little of the round to stand for it.
+                if (c.effort_coverage < core::luck::kImportedCoverageFloor) {
+                    ++rep.effort_not_used;
+                    continue;
+                }
+                // Without the row's own difficulty (a merged row whose aux
+                // difficulty is not known) or a round of any length, the
+                // figure cannot be judged: counted apart, it is no refusal.
+                const double difficulty = found_block_luck_difficulty(b);
+                if (!(difficulty > 0.0) || !(b.time_to_find > 0.0)) {
+                    ++rep.effort_not_judged;
+                    continue;
+                }
+                // Plausibly the pool's, over this node's own round: the round
+                // between two blocks of its ledger, against the block's own
+                // difficulty, judged as a rate at find is.
+                double yardstick = m_luck_history.yardstick_rate(static_cast<double>(b.ts),
+                                                                 kLuckYardstickSeconds);
+                if (!(yardstick > 0.0)) yardstick = file_median;
+                if (!core::luck::imported_effort_plausible(
+                        c.effort, b.time_to_find, difficulty,
+                        b.share_difficulty, yardstick, network_rate(c.primary, b))) {
+                    ++rep.effort_refused;
+                    continue;
+                }
+                // This node's own measurement of the round, as just derived.
+                core::luck::RoundResult own;
+                own.method = b.effort_method;
+                own.coverage = b.history_coverage;
+                own.effort = b.effort;
+                // Where the node integrated part of the round itself, the
+                // figure must agree with what it saw (kImportedRateBand).
+                if (!core::luck::imported_effort_agrees(own, c.effort)) {
+                    ++rep.effort_refused;
+                    continue;
+                }
+                // Better than this node's own measurement of the round.
+                if (!core::luck::imported_effort_wins(own, c.effort, c.effort_coverage)) {
+                    ++rep.effort_not_used;
+                    continue;
+                }
+                b.imported_effort = c.effort;
+                b.imported_coverage = c.effort_coverage;
+                b.imported_prev_hash = c.effort_prev_hash;
+                a.dirty = true;
+                effort_filled = true;
+                ++rep.effort_taken;
+            }
+        }
+        if (effort_filled)
+            recompute_found_block_luck_locked();
+
+        for (const auto& a : applied) {
+            if (!a.fresh) {
+                if (a.dirty) ++rep.merged; else ++rep.unchanged;
+            }
+            if (!a.dirty) continue;
+            auto pos = at.find(key_of(cands[a.cand].blk.hash, cands[a.cand].blk.chain));
+            if (pos != at.end())
+                to_persist.push_back(m_found_blocks[pos->second]);   // derived fields are not persisted
+        }
     }
 
     // Outside m_blocks_mutex: m_persist_block_fn is the LevelDB writer.
@@ -11012,6 +11209,8 @@ nlohmann::json MiningInterface::rest_recent_merged_blocks()
         std::string symbol, hash;
         core::luck::RoundInput in;
         const FoundBlock* own{nullptr};   // its ledger row, if it has one
+        double recorded_rate{0.0};        // the manager's rate at find (0 = none)
+        RateAtFind rate;                  // the rate at find luck uses and the row serves
     };
     std::vector<AuxLuckRow> aux_rows;
     auto aux_row = [&aux_rows](const std::string& hash) -> AuxLuckRow* {
@@ -11032,6 +11231,10 @@ nlohmann::json MiningInterface::rest_recent_merged_blocks()
         r.in.main_chain = d.accepted || d.verdict == "inconclusive"
                           || d.verdict.rfind("unknown: ", 0) == 0;
         r.in.difficulty = d.difficulty > 0.0 ? d.difficulty : 0.0;
+        // The pool rate the node read when a peer's share brought the block
+        // (DiscoveredMergedBlock::pool_hashrate); 0 on a record from before
+        // it was kept, or one learned long after the find.
+        r.recorded_rate = d.pool_hashrate > 0.0 ? d.pool_hashrate : 0.0;
         aux_rows.push_back(std::move(r));
     }
     for (const auto& b : ledger) {
@@ -11066,6 +11269,7 @@ nlohmann::json MiningInterface::rest_recent_merged_blocks()
         std::string prev_hash;
         bool main_chain{true};
         bool measured{false};
+        RateAtFind rate;
     };
     std::map<std::string, AuxLuck> aux_luck;   // by aux block hash
     {
@@ -11074,14 +11278,37 @@ nlohmann::json MiningInterface::rest_recent_merged_blocks()
         core::luck::RoundOptions opt;
         opt.history_difficulty = false;   // the history's difficulty is the parent's
         std::lock_guard<std::mutex> hlock(m_luck_history_mutex);
-        // The rate recorded with a ledger row, as far as it is a pool rate.
-        for (auto& r : aux_rows)
-            if (r.own) r.in.rate_at_find = rate_at_find_locked(*r.own).value;
+        // The rate at find, as far as it is a pool rate: the ledger row's,
+        // else the one the manager recorded, else the history's reading at
+        // the block's own time (rate_at_find_locked) -- as /recent_blocks.
+        for (auto& r : aux_rows) {
+            if (r.own) r.rate = rate_at_find_locked(*r.own);
+            if (!(r.rate.value > 0.0) && (r.recorded_rate > 0.0 || !r.own))
+                r.rate = rate_at_find_locked(r.recorded_rate,
+                                             r.own ? r.own->share_difficulty : 0.0, r.in.ts);
+            r.in.rate_at_find = r.rate.value;
+            // Another node's measurement of the round (an imported row).
+            if (r.own) {
+                r.in.imported_effort = r.own->imported_effort;
+                r.in.imported_coverage = r.own->imported_coverage;
+            }
+        }
         for (const auto& symbol : symbols) {
             std::vector<core::luck::RoundInput> in;
             std::vector<const AuxLuckRow*> who;
             for (const auto& r : aux_rows)
                 if (r.symbol == symbol) { in.push_back(r.in); who.push_back(&r); }
+            // The row an imported effort was timed from, among this chain's.
+            for (size_t i = 0; i < in.size(); ++i) {
+                const FoundBlock* own = who[i]->own;
+                if (!own || !(own->imported_effort > 0.0) || own->imported_prev_hash.empty())
+                    continue;
+                for (size_t k = 0; k < who.size(); ++k)
+                    if (who[k]->hash == own->imported_prev_hash) {
+                        in[i].imported_prev = static_cast<int>(k);
+                        break;
+                    }
+            }
             const auto res = core::luck::compute_rounds(in, m_luck_history, opt);
             for (size_t i = 0; i < res.size(); ++i) {
                 AuxLuck l;
@@ -11089,6 +11316,7 @@ nlohmann::json MiningInterface::rest_recent_merged_blocks()
                 l.difficulty = in[i].difficulty;
                 l.main_chain = in[i].main_chain;
                 l.measured = core::luck::counts_in_period(in[i], res[i]);
+                l.rate = who[i]->rate;
                 if (res[i].prev >= 0)
                     l.prev_hash = who[static_cast<size_t>(res[i].prev)]->hash;
                 aux_luck[who[i]->hash] = std::move(l);
@@ -11097,7 +11325,7 @@ nlohmann::json MiningInterface::rest_recent_merged_blocks()
     }
     auto add_luck = [&aux_luck](nlohmann::json& j, const std::string& hash) {
         auto num = [](double v) {
-            return v > 0.0 ? nlohmann::json(v) : nlohmann::json(nullptr);
+            return v > 0.0 && std::isfinite(v) ? nlohmann::json(v) : nlohmann::json(nullptr);
         };
         auto it = aux_luck.find(hash);
         const AuxLuck none{};
@@ -11116,9 +11344,23 @@ nlohmann::json MiningInterface::rest_recent_merged_blocks()
             : nlohmann::json(core::luck::effort_method_name(m));
         j["prev_block_hash"]    = l.prev_hash.empty() ? nlohmann::json(nullptr)
                                                       : nlohmann::json(l.prev_hash);
+        // effort_method "imported": the node this history was imported from
+        // integrated the same round over more of it (history_coverage is that
+        // node's coverage), as on /recent_blocks.
         j["history_coverage"]   = (m == core::luck::EffortMethod::integrated
-                                   || m == core::luck::EffortMethod::single_sample)
+                                   || m == core::luck::EffortMethod::single_sample
+                                   || m == core::luck::EffortMethod::imported)
             ? nlohmann::json(l.res.coverage) : nlohmann::json(nullptr);
+        // The pool rate at find, as /recent_blocks serves it: the GROSS
+        // parent-chain pool rate (the hashes that find an aux block are the
+        // parent's), "recorded" with the block or read off the rate
+        // "history" at its time; null when neither. What another node's
+        // --import-found-blocks takes for the row's single-sample effort.
+        j["pool_hashrate_at_find"] = num(l.rate.value);
+        j["pool_hashrate_source"]  =
+              l.rate.source == RateAtFindSource::recorded ? nlohmann::json("recorded")
+            : l.rate.source == RateAtFindSource::history  ? nlohmann::json("history")
+                                                           : nlohmann::json(nullptr);
         // The row is a block of the aux chain for luck: it ends a round and
         // is a predecessor. false for a submit the aux daemon refused, an
         // orphaned or stale ledger row, and a pending one the aux chain does
