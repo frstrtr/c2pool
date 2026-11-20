@@ -1956,6 +1956,52 @@ void p49() {
 }
 
 // ---------------------------------------------------------------------------
+// Rows 5 / 19 with 8 / 23: P_r held on resolve_pr_on_branch, a main row 30 below P_r neither held nor seeded
+// ---------------------------------------------------------------------------
+void median_short() {
+    run_part("rows 5 / 19 median", [] {
+        KatNet net;
+        KatNode n(net, kJ0);
+        const std::vector<pb::Hash32> chain = pipeline_chain(n, 12);
+        if (chain.empty()) return;  // the harness printed its FAIL line
+        const pb::Hash32 L = chain.back();
+        const std::uint64_t hc = h_pos(13);
+        const pb::Hash32 p_r = mon_block(hc - 1);
+        KatMoneroRows holed = net.rows;
+        const std::size_t erased = holed.rows.erase(mon_block(hc - 31));
+        const pb::FollowerBranchView hv(holed), fv(net.rows);
+        const auto on_branch = [](const pb::FollowerBranchView& v, const KatMoneroRows& rows) {
+            return [vp = &v, rp = &rows](const pb::Hash32& id) {
+                return pb::resolve_pr_on_branch(*vp, *rp, id, [vp](const pb::Hash32& x) -> std::optional<std::uint8_t> {
+                    return vp->block(x) ? std::optional<std::uint8_t>(16) : std::nullopt;
+                });
+            };
+        };
+        const pb::PrInfo ph = on_branch(hv, holed)(p_r), pf = on_branch(fv, net.rows)(p_r);
+        check(erased == 1 && ph.status == pb::PrInfo::Status::Held && !ph.in.median60.has_value()
+                      && pf.status == pb::PrInfo::Status::Held && pf.in.median60.has_value() && ph.height == pf.height,
+              "row 5: P_r held, its parent 30 below not held -> Held, no median; held -> median60");
+        pb::AdmitEnv eh = n.env();
+        eh.resolve_pr = on_branch(hv, holed);
+        pb::AdmitEnv ef = n.env();
+        ef.resolve_pr = on_branch(fv, net.rows);
+        const Tweak low = [&](pb::ReceiptBodyV3& r) { r.blob.timestamp = mon_ts(hc - 41); };
+        const std::vector<std::uint8_t> f = frame_of(carrier_on(n, L, hc, {}, 1, 9950, low));
+        const pb::AdmitResult ch = pb::admit_carrier(eh, f, CarrierRole::Frame);
+        const pb::AdmitResult cf = pb::admit_carrier(ef, f, CarrierRole::Frame);
+        check(ch.row != RowId::R5 && ch.row != RowId::R8 && ch.strike == 0,
+              "row 5 / 8: no median -> judged on (" + desc(ch) + ")");
+        check(is(cf, AdmitVerdict::Strike, RowId::R8), "row 8: timestamp below median60 -> STRIKE (" + desc(cf) + ")");
+        const std::vector<std::uint8_t> rb = bytes_of(body_on(n, L, hc, 2, 9951, low));
+        const pb::AdmitResult rh = pb::admit_receipt(eh, rb, pb::Role::Pending);
+        const pb::AdmitResult rf = pb::admit_receipt(ef, rb, pb::Role::Pending);
+        check(rh.row != RowId::R19 && rh.row != RowId::R23 && rh.strike == 0,
+              "row 19 / 23: no median -> judged on (" + desc(rh) + ")");
+        check(is(rf, AdmitVerdict::Strike, RowId::R23), "row 23: timestamp below median60 -> STRIKE (" + desc(rf) + ")");
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Rows 18, 19, the window inputs on P_t's branch, the bucket fetch
 // ---------------------------------------------------------------------------
 void rows_more() {
@@ -1984,9 +2030,33 @@ void rows_more() {
         if (side.empty()) return;  // the harness printed its FAIL line
         const pb::Hash32 sp = side.back();  // position 58 on the side branch
         const pb::ReceiptBodyV3 rs = body_on(m, side[25], m.node(side[25]).h + 1, 12, 9804);
-        const pb::AdmitResult a = admit(m, carrier_on(m, sp, m.node(sp).H, {rs}, 1, 9805));
-        check(deferred(a, Missing::EpochGrace) && a.strike == 0,
-              "row 3 / 18: x > f + GRACE -> DEFER although t's branch is held (" + desc(a) + ")");
+        const pb::CarrierBodyV3 cs = carrier_on(m, sp, m.node(sp).H, {rs}, 1, 9805);
+        const pb::AdmitResult a = admit(m, cs);
+        check(is(a, AdmitVerdict::Defer, RowId::R3) && deferred(a, Missing::EpochGrace) && a.strike == 0,
+              "row 3: x > f + GRACE -> DEFER EpochGrace, strike 0 (" + desc(a) + ")");
+        // the receipt on side[25] unsolicited: x 57, f 30
+        const pb::AdmitResult u = pb::admit_receipt(m.env(), bytes_of(rs), pb::Role::Pending);
+        check(is(u, AdmitVerdict::Defer, RowId::R18) && deferred(u, Missing::EpochGrace) && u.strike == 0
+                      && u.peer_tokens.empty() && u.fetch == pb::Hash32{},
+              "row 18: unsolicited, x > f + GRACE -> DEFER EpochGrace, strike 0, no fetch (" + desc(u) + ")");
+        // w: the side branch made heavier (to 62), its best
+        KatNode w(m);
+        const std::vector<pb::Hash32> ext = scaffold_chain(w, sp, 4, 0x27, h_pos, 3);
+        if (ext.empty()) return;  // the harness printed its FAIL line
+        pb::LaneBatch wb;  // the switch place_admitted leaves to its caller (SwitchToCaller)
+        const bool bests = w.tree.best().id == ext.back() && w.store.switch_best(ext.back(), &wb) == pb::SwitchVerdict::Switched
+                           && w.store.best_tip() == ext.back() && m.store.best_tip() == L;
+        const pb::AdmitResult aw = admit(w, cs);
+        check(bests && aw.verdict == AdmitVerdict::AdmitCarrier && aw.strike == 0,
+              "row 3: the same frame, best on the side branch at 62 -> CARRIER (" + desc(aw) + ")");
+        // c on L (60) carrying the receipt on side[25]: w.f 30, x 57
+        const pb::CarrierBodyV3 cx = carrier_on(m, L, hc, {rs}, 1, 9807);
+        const pb::AdmitResult ax = admit(m, cx), awx = admit(w, cx);
+        check(is(ax, AdmitVerdict::Defer, RowId::R18) && deferred(ax, Missing::EpochGrace) && ax.body == 1
+                      && ax.strike == 0 && ax.peer_tokens.empty(),
+              "row 18: carried, x > f + GRACE -> DEFER EpochGrace, strike 0 (" + desc(ax) + ")");
+        check(is(awx, AdmitVerdict::Defer, RowId::R3) && deferred(awx, Missing::EpochGrace) && awx.strike == 0,
+              "row 3: the same frame, best on the side branch at 62 -> DEFER EpochGrace, strike 0 (" + desc(awx) + ")");
         // CLAIMED below a joiner's p0 (an AR seeded by seed_joiner)
         KatNode j(n);
         j.ar.seed_joiner(j.node(L).rs, j.node(L).pos + 1);
@@ -2290,6 +2360,7 @@ int main(int argc, char** argv) {
     run("contract", contract);
     run("p49", p49);
     run("rows_more", rows_more);
+    run("median_short", median_short);
     run("deep_walk", deep_walk);
     run("coinbase_internal", coinbase_internal);
     return finish("v37_xmr_pathb_admit_kat");
