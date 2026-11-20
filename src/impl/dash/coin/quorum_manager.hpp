@@ -122,24 +122,33 @@ public:
         ApplyResult r;
 
         if (!tail.deletedQuorums.empty()) {
+            auto is_deleted = [&](const Entry& e) {
+                for (const auto& [t, h] : tail.deletedQuorums) {
+                    if (e.key.llmqType == t
+                        && e.key.quorumHash == h) {
+                        return true;
+                    }
+                }
+                return false;
+            };
+            std::vector<Entry> gone;
+            for (const auto& e : m_active)
+                if (is_deleted(e)) gone.push_back(e);
+            retire(gone);
             auto before = m_active.size();
             m_active.erase(
-                std::remove_if(m_active.begin(), m_active.end(),
-                    [&](const Entry& e) {
-                        for (const auto& [t, h] : tail.deletedQuorums) {
-                            if (e.key.llmqType == t
-                                && e.key.quorumHash == h) {
-                                return true;
-                            }
-                        }
-                        return false;
-                    }),
+                std::remove_if(m_active.begin(), m_active.end(), is_deleted),
                 m_active.end());
             r.deleted = before - m_active.size();
         }
 
         for (const auto& nq : tail.newQuorums) {
             ActiveKey k{nq.llmqType, nq.quorumHash};
+            // Back in the active set: no longer a retired entry.
+            m_retired.erase(
+                std::remove_if(m_retired.begin(), m_retired.end(),
+                    [&](const Entry& e) { return e.key == k; }),
+                m_retired.end());
             auto it = std::find_if(m_active.begin(), m_active.end(),
                 [&](const Entry& e) { return e.key == k; });
             if (it != m_active.end()) {
@@ -182,6 +191,17 @@ public:
     // selecting the signing quorum.
     const std::vector<Entry>& active_entries() const { return m_active; }
 
+    // The entries the most recent diff that deleted quorums of a type removed,
+    // per type: a later deletion of the same type replaces them (so for the
+    // rotated InstantSend type this is exactly the previous cycle). Used only
+    // by the isdlock verifier's second pass (islock_verify.hpp
+    // verify_islock_two_pass, mirroring Dash Core's "previous active set"
+    // check); NOT part of the active set, the quorum root, the fold stamp or
+    // persistence. Emptied by clear() and replace_state(): after a restart or
+    // a reorg wipe, pass 2 has nothing until the next rotation, which only
+    // costs the refusals it was added to avoid.
+    const std::vector<Entry>& retired_entries() const { return m_retired; }
+
     // Per-type counts for logging / dashboard.
     std::unordered_map<uint8_t, size_t> active_by_type() const
     {
@@ -193,6 +213,7 @@ public:
     void clear()
     {
         m_active.clear();
+        m_retired.clear();
         m_latest_cl_sigs.clear();
         ++m_fold_seq;   // #127: clear mutates the active set
     }
@@ -219,6 +240,7 @@ public:
                        std::vector<CLSig>&& cl_sigs)
     {
         m_active        = std::move(active);
+        m_retired.clear();
         m_latest_cl_sigs = std::move(cl_sigs);
         ++m_fold_seq;   // #127: warm-load mutates the active set
     }
@@ -232,7 +254,26 @@ public:
     uint64_t fold_seq() const { return m_fold_seq; }
 
 private:
+    // Replace the retired entries of every type in `gone` with `gone`'s.
+    void retire(const std::vector<Entry>& gone)
+    {
+        if (gone.empty()) return;
+        std::vector<uint8_t> types;
+        for (const auto& e : gone)
+            if (std::find(types.begin(), types.end(), e.key.llmqType) == types.end())
+                types.push_back(e.key.llmqType);
+        m_retired.erase(
+            std::remove_if(m_retired.begin(), m_retired.end(),
+                [&](const Entry& e) {
+                    return std::find(types.begin(), types.end(), e.key.llmqType)
+                           != types.end();
+                }),
+            m_retired.end());
+        m_retired.insert(m_retired.end(), gone.begin(), gone.end());
+    }
+
     std::vector<Entry> m_active;
+    std::vector<Entry> m_retired;   // see retired_entries()
 
     // Most-recent diff's quorumsCLSigs — kept verbatim for Phase L's
     // cycle-shuffle verifier. Indices reference m_active positions of

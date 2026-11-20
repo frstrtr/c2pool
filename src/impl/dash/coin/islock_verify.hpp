@@ -212,6 +212,63 @@ build_islock_sign_target(const LlmqParamsView& p,
     return t;
 }
 
+/// Which quorum set verified an isdlock (None = refused).
+enum class IslockVerifyPass : uint8_t { None = 0, Active = 1, Previous = 2 };
+
+/// How long a retired rotated quorum stays usable for pass 2: its base block
+/// may be at most this far below the tip. The previous cycle's quorums sit at
+/// cycleHeight_prev + quorumIndex and retire about one dkgInterval later (at
+/// the next rotation diff); pass 2 is needed only for the few blocks after
+/// that, while the network still signs at tip - SIGN_HEIGHT_OFFSET. Two
+/// intervals plus the 64-block margin covers that with room to spare and drops
+/// a set that a missed rotation diff left behind.
+inline uint32_t previous_cycle_max_age(const LlmqParamsView& p)
+{
+    return 2u * p.dkg_interval + 64u;
+}
+
+/// Dash Core verifies an isdlock in TWO passes (v24.0.2
+/// src/instantsend/net_instantsend.cpp:340-354, ProcessPendingISLocks):
+/// first against the current active quorum set, and the locks that fail
+/// against the PREVIOUS active set (signOffset = dkgInterval); only a failure
+/// of both is bad. For a few blocks after a rotation the network keeps
+/// signing with the previous cycle, so a verifier with only the current set
+/// refuses every one of those locks (on mainnet 11-20: the 8 blocks after each
+/// rotation, ~224 refusals per node per cycle).
+///
+/// `active` are the current rotated quorums, `previous` the ones the last
+/// rotation retired (QuorumManager::retired_entries); retired candidates whose
+/// base block is more than previous_cycle_max_age() below `tip_height` are
+/// ignored. Selection is keyed on the lock's own cycle (base_height ==
+/// cycle_height + quorumIndex), and the two sets hold different cycles, so a
+/// lock selects a quorum in at most one of them: pass 2 never adds a second
+/// BLS verification for the same lock. `verify(pubkey, sign_hash)` is the BLS
+/// check.
+template <typename VerifyFn>
+IslockVerifyPass
+verify_islock_two_pass(const LlmqParamsView& p,
+                       const std::vector<RotatedQuorumCandidate>& active,
+                       const std::vector<RotatedQuorumCandidate>& previous,
+                       uint32_t tip_height, uint32_t cycle_height,
+                       const std::vector<std::pair<uint256, uint32_t>>& inputs,
+                       const uint256& txid, VerifyFn&& verify)
+{
+    if (auto t = build_islock_sign_target(p, active, cycle_height, inputs, txid);
+        t && verify(t->quorum.quorum_public_key, t->sign_hash))
+        return IslockVerifyPass::Active;
+
+    std::vector<RotatedQuorumCandidate> recent;
+    recent.reserve(previous.size());
+    const uint32_t max_age = previous_cycle_max_age(p);
+    for (const auto& c : previous)
+        if (c.base_height <= tip_height && tip_height - c.base_height <= max_age)
+            recent.push_back(c);
+    if (auto t = build_islock_sign_target(p, recent, cycle_height, inputs, txid);
+        t && verify(t->quorum.quorum_public_key, t->sign_hash))
+        return IslockVerifyPass::Previous;
+    return IslockVerifyPass::None;
+}
+
 /// The LLMQ type used for DIP-24 deterministic InstantSend signing:
 /// llmqTypeDIP0024InstantSend = LLMQ_60_75 on BOTH mainnet and testnet
 /// (dashcore src/chainparams.cpp).
