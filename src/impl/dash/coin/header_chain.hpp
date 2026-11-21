@@ -867,6 +867,11 @@ private:
         // Genesis
         if (header.m_previous_block.IsNull()) {
             if (bhash != m_params.genesis_hash) return false;
+            // Only an EMPTY store starts from the genesis header: the branch
+            // below sets the tip, its height and the best work. A store that
+            // already has a tip (a fast-start anchor, or any chain) keeps it.
+            // Pre-anchor history is the backfill walk's.
+            if (!m_tip.IsNull()) return false;
             IndexEntry entry;
             entry.header = header;
             entry.hash = bhash;
