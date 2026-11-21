@@ -953,11 +953,11 @@ inline bool load_side_carriers(PathbKv& kv, std::uint32_t chain, const LaneParam
         }
         st.bodies.put(c.id, *b);
         for (const ReceiptBodyV3& r : b->carried) {
-            st.refs[r.side.payee] = r.payee;
-            if (r.owner) st.refs[r.side.owner] = *r.owner;
+            st.refs[key_ref_identity(r.payee)] = r.payee;
+            if (r.owner) st.refs[key_ref_identity(*r.owner)] = *r.owner;
         }
-        st.refs[b->own.side.payee] = b->own.payee;
-        if (b->own.owner) st.refs[b->own.side.owner] = *b->own.owner;
+        st.refs[key_ref_identity(b->own.payee)] = b->own.payee;
+        if (b->own.owner) st.refs[key_ref_identity(*b->own.owner)] = *b->own.owner;
         ++st.side_loaded;
     }
     return true;
@@ -1256,8 +1256,8 @@ inline LoadResult pathb_load(PathbKv& kv, const Hash32& dir_pool_id, const Hash3
 
     std::map<Hash32, XmrKeyRef> refs;
     const auto learn = [&refs](const ReceiptBodyV3& r) {
-        refs[r.side.payee] = r.payee;
-        if (r.owner) refs[r.side.owner] = *r.owner;
+        refs[key_ref_identity(r.payee)] = r.payee;
+        if (r.owner) refs[key_ref_identity(*r.owner)] = *r.owner;
     };
     for (std::uint64_t x = s1; x <= tip; ++x)
         if (const CarrierBodyV3* b = bodies.get(rec_at(x).id)) {

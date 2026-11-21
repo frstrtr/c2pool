@@ -479,7 +479,7 @@ if (BUILD_TESTING AND GTest_FOUND)
     # (disconnect, inbound refusal, decay, per-offence weights, public-network
     # oracle parity, whitelist). Same harness and link set; folded in for the
     # same reason.
-    add_executable(test_dash_node test_dash_node.cpp test_dash_dashboard_found_block.cpp test_dash_addrme.cpp test_dash_standing_forget.cpp test_dash_block_confirm_lane.cpp test_dash_dashboard_views.cpp test_dash_dashboard_pplns.cpp test_dash_shutdown_order.cpp test_dash_v36_live_variant.cpp test_dash_reload_block_flag.cpp test_dash_v36_flip.cpp test_dash_v36_e2e.cpp test_dash_v36_template_txs.cpp test_dash_v36_finder_block.cpp test_dash_share_precheck.cpp test_dash_outbound_redial.cpp test_dash_peer_misbehaviour.cpp test_dash_self_connection_ban.cpp)
+    add_executable(test_dash_node test_dash_node.cpp test_dash_dashboard_found_block.cpp test_dash_addrme.cpp test_dash_standing_forget.cpp test_dash_block_confirm_lane.cpp test_dash_dashboard_views.cpp test_dash_dashboard_pplns.cpp test_dash_shutdown_order.cpp test_dash_v36_live_variant.cpp test_dash_reload_block_flag.cpp test_dash_v36_flip.cpp test_dash_v36_e2e.cpp test_dash_v36_template_txs.cpp test_dash_v36_finder_block.cpp test_dash_share_precheck.cpp test_dash_outbound_redial.cpp test_dash_peer_misbehaviour.cpp test_dash_self_connection_ban.cpp test_dash_deferred_mint.cpp test_dash_listen_host.cpp)
     target_link_libraries(test_dash_node PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core
@@ -1638,7 +1638,7 @@ if (BUILD_TESTING AND GTest_FOUND)
     # --target allowlist AND already compiles coin/replay_bulk_fetch.hpp, so its
     # link set resolves BulkBlockScheduler/bulkpolicy with no new deps; a
     # standalone executable was a NOT_BUILT/"Not Run" CTest sentinel.
-    add_executable(test_dash_p2p_node test_dash_p2p_node.cpp test_dash_coin_p2p_client.cpp test_dash_coin_peer_manager.cpp test_dash_coin_p2p_pool.cpp test_dash_qrinfo_wire.cpp test_dash_coin_peer_rearm.cpp test_dash_replay_bulk_fetch.cpp test_dash_spork.cpp test_dash_bulk_local_primary_kat.cpp test_dash_restart_reorg_supersede_kat.cpp test_dash_cmpct_client.cpp)
+    add_executable(test_dash_p2p_node test_dash_p2p_node.cpp test_dash_coin_p2p_client.cpp test_dash_coin_peer_manager.cpp test_dash_coin_p2p_pool.cpp test_dash_qrinfo_wire.cpp test_dash_coin_peer_rearm.cpp test_dash_replay_bulk_fetch.cpp test_dash_spork.cpp test_dash_bulk_local_primary_kat.cpp test_dash_restart_reorg_supersede_kat.cpp test_dash_supersede_hint_equivalence.cpp test_dash_clean_drop_tails.cpp test_dash_drop_tails_bench.cpp test_dash_cmpct_client.cpp)
     target_compile_definitions(test_dash_p2p_node PRIVATE
         DASH_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
     target_link_libraries(test_dash_p2p_node PRIVATE

@@ -1,12 +1,18 @@
-// Van Wijk squarified treemap — pure function.
+// Van Wijk squarified treemap — pure function. THE only squarify in
+// web-static: the PPLNS View, the bundled hover zoom (via the
+// shared.treemap.squarified plugin adapter) and the inline pages
+// (dashboard.html hover zoom + "PPLNS Distribution", share.html, via
+// the classic-script bundle dist/layout.js → window.C2PLayout) all call
+// this. tests/unit/squarify-parity.test.ts pins it against the five
+// copies it replaced.
 //
 // Numerical hardening per frstrtr/the/docs/c2pool-pplns-view-module-task.md
 // §4.4:
 //   - total ≤ 0 → return empty
-//   - item.area ≤ 0 → filter out
+//   - item.area ≤ 0 or non-finite → filter out
 //   - w*h ≤ 0 → return empty
 //   - guard aspect-ratio NaN/Infinity
-//   - stable ordering for ties
+//   - stable ordering for ties (sorted by area, descending)
 
 export interface SquarifyItem<T> {
   /** Area fraction (caller normalises so items sum to ≤ 1.0, or passes
@@ -24,14 +30,28 @@ export interface SquarifyRect<T> {
   data: T;
 }
 
+export interface SquarifyOptions {
+  /** Minimum thickness, in px, of every laid-out row (strip). Default 0:
+   *  tile areas stay exactly proportional to the weights. The legacy
+   *  inline treemaps used 1 so that sub-pixel miners still get a
+   *  visible sliver; a clamped row then takes more than its share and
+   *  the rows after it are renormalised into the space that is left.
+   *  Views that aggregate small tiles ("N others") should keep 0. */
+  minStrip?: number;
+}
+
+/** Lay `items` out in the rect (x, y, w, h). Items are sorted by area,
+ *  descending (ties keep input order); rects come back in that order. */
 export function squarify<T>(
   items: readonly SquarifyItem<T>[],
   x: number,
   y: number,
   w: number,
   h: number,
+  opts?: SquarifyOptions,
 ): SquarifyRect<T>[] {
-  if (w <= 0 || h <= 0) return [];
+  if (!(w > 0) || !(h > 0)) return [];
+  const minStrip = opts?.minStrip !== undefined && opts.minStrip > 0 ? opts.minStrip : 0;
   // Preserve input order for stable ties — sort descending by area while
   // keeping the original index as secondary key.
   const positive: Array<{ item: SquarifyItem<T>; origIndex: number }> = [];
@@ -46,104 +66,85 @@ export function squarify<T>(
     if (b.item.area !== a.item.area) return b.item.area - a.item.area;
     return a.origIndex - b.origIndex;
   });
-
-  let total = 0;
-  for (const p of positive) total += p.item.area;
-  if (!(total > 0)) return [];
-
-  // Scale areas → actual pixel area.
-  const areaScale = (w * h) / total;
-  const scaled = positive.map((p) => ({
-    area: p.item.area * areaScale,
-    data: p.item.data,
-  }));
-
+  const areas = positive.map((p) => p.item.area);
   const out: SquarifyRect<T>[] = [];
-  squarifyInner(scaled, x, y, w, h, out);
+  layout(areas, x, y, w, h, minStrip, (i, rx, ry, rw, rh) => {
+    out.push({ x: rx, y: ry, w: rw, h: rh, data: positive[i]!.item.data });
+  });
   return out;
 }
 
-function squarifyInner<T>(
-  items: Array<{ area: number; data: T }>,
+/** Core layout over a descending `areas` array (any positive scale).
+ *  Each level fills the remaining rect: rows run along the short side
+ *  and grow while the worst aspect ratio does not get worse. Ratios are
+ *  computed relative to the level's own total, exactly as the legacy
+ *  inline copies did, so a `minStrip` clamp renormalises the rest. */
+function layout(
+  areas: readonly number[],
   x: number,
   y: number,
   w: number,
   h: number,
-  out: SquarifyRect<T>[],
+  minStrip: number,
+  emit: (index: number, x: number, y: number, w: number, h: number) => void,
 ): void {
-  if (items.length === 0 || w <= 0 || h <= 0) return;
+  let start = 0;
+  const n = areas.length;
+  while (start < n && w > 0 && h > 0) {
+    let total = 0;
+    for (let i = start; i < n; i++) total += areas[i]!;
+    if (!(total > 0)) return;
+    const vertical = w >= h;      // rows are vertical strips when wide
+    const main = vertical ? h : w;  // the side a row runs along (short side)
+    const cross = vertical ? w : h;
 
-  if (items.length === 1) {
-    out.push({ x, y, w, h, data: items[0]!.data });
-    return;
-  }
-
-  const short = Math.min(w, h);
-  // Greedy row-building: grow the row while the worst aspect improves.
-  const row: Array<{ area: number; data: T }> = [];
-  let rowArea = 0;
-  let i = 0;
-  while (i < items.length) {
-    const candidate = items[i]!;
-    const nextArea = rowArea + candidate.area;
-    const currentWorst = row.length > 0 ? worstAspect(row, rowArea, short) : Infinity;
-    const candidateWorst = worstAspect(
-      [...row, candidate],
-      nextArea,
-      short,
-    );
-    if (row.length === 0 || candidateWorst <= currentWorst) {
-      row.push(candidate);
+    // Greedy row: add the next item while the row's worst aspect ratio
+    // does not increase. Item lengths are monotone in area, so the
+    // worst ratio of a row is set by its smallest and largest item.
+    let end = start + 1;
+    let rowArea = areas[start]!;
+    let maxA = rowArea;
+    let minA = rowArea;
+    while (end < n) {
+      const next = areas[end]!;
+      const worstNow = worstAspect(maxA, minA, rowArea, total, main, cross);
+      const nextArea = rowArea + next;
+      const worstNext = worstAspect(
+        Math.max(maxA, next), Math.min(minA, next), nextArea, total, main, cross);
+      if (worstNext > worstNow) break;
       rowArea = nextArea;
-      i++;
-    } else {
-      break;
+      if (next > maxA) maxA = next;
+      if (next < minA) minA = next;
+      end++;
     }
-  }
 
-  // Lay out `row` in the short direction.
-  if (w >= h) {
-    // Rows go top-to-bottom, each row is vertical strip of width rowW.
-    const rowW = rowArea / h;
-    let yy = y;
-    for (const r of row) {
-      const rh = r.area / rowW;
-      out.push({ x, y: yy, w: rowW, h: rh, data: r.data });
-      yy += rh;
+    const strip = Math.max(minStrip, (rowArea / total) * cross);
+    let off = 0;
+    for (let i = start; i < end; i++) {
+      const size = (areas[i]! / rowArea) * main;
+      if (vertical) emit(i, x, y + off, strip, size);
+      else emit(i, x + off, y, size, strip);
+      off += size;
     }
-    squarifyInner(items.slice(i), x + rowW, y, w - rowW, h, out);
-  } else {
-    // Rows go left-to-right, each row is horizontal strip of height rowH.
-    const rowH = rowArea / w;
-    let xx = x;
-    for (const r of row) {
-      const rw = r.area / rowH;
-      out.push({ x: xx, y, w: rw, h: rowH, data: r.data });
-      xx += rw;
-    }
-    squarifyInner(items.slice(i), x, y + rowH, w, h - rowH, out);
+    if (vertical) { x += strip; w -= strip; }
+    else          { y += strip; h -= strip; }
+    start = end;
   }
 }
 
-/** Max aspect ratio (worst = farthest from 1.0) among rectangles
- *  when `row` is laid out along a strip of the given short side. */
-function worstAspect<T>(
-  row: ReadonlyArray<{ area: number; data: T }>,
+/** Worst (largest) aspect ratio among the row's items when the row
+ *  holds `rowArea` of the level's `total`. Infinity when degenerate. */
+function worstAspect(
+  maxA: number,
+  minA: number,
   rowArea: number,
-  short: number,
+  total: number,
+  main: number,
+  cross: number,
 ): number {
-  if (!(rowArea > 0) || !(short > 0)) return Infinity;
-  let maxArea = -Infinity;
-  let minArea = Infinity;
-  for (const r of row) {
-    if (r.area > maxArea) maxArea = r.area;
-    if (r.area < minArea) minArea = r.area;
-  }
-  if (!(minArea > 0)) return Infinity;
-  const s2 = short * short;
-  const sum2 = rowArea * rowArea;
-  const worstMax = (s2 * maxArea) / sum2;
-  const worstMin = sum2 / (s2 * minArea);
-  const w = Math.max(worstMax, worstMin);
-  return Number.isFinite(w) ? w : Infinity;
+  const strip = (rowArea / total) * cross;
+  const longest = (maxA / rowArea) * main;
+  const shortest = (minA / rowArea) * main;
+  const worst = Math.max(longest / strip, strip / longest, shortest / strip, strip / shortest);
+  return Number.isFinite(worst) ? worst : Infinity;
 }

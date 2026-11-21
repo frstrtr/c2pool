@@ -430,6 +430,24 @@ if (BUILD_TESTING AND GTest_FOUND)
     # seeded jobs the operator's expected PPLNS weight equals the jobs the fee
     # drew (was ~0.64 of them; field 0.08% of the block for --fee 1). Same
     # folding rule.
+    #
+    # local_share_block_hook_test.cpp: a locally minted share that solves a
+    # block reaches the found-block and merged-block hooks with the share
+    # readable. notify_local_share verifies under its own EXCLUSIVE lock and
+    # the hooks read through read_tracker(): a shared try-lock by the owning
+    # thread (undefined; glibc refuses it) made them bail. The startup block
+    # scan fires the same hooks under its own shared guard and now reads
+    # through it too. REAL NodeImpl, REAL minted and verified share. Same
+    # folding rule.
+    #
+    # think_best_change_notify_test.cpp + think_gate_test.cpp: every
+    # best-share change reaches m_on_best_share_changed once — one made by
+    # clean_tracker Step 1 (compared away by Step 4) included, re-advertised
+    # to the peers as after a think — and a
+    # run_think() skipped while a cycle holds the slot is served by one think
+    # from the cycle's epilogue (the #854 pending re-think, ported from DASH).
+    # REAL NodeImpl with its compute thread and a test io_context, plus the
+    # slot protocol under thread contention. Same folding rule.
     # drop_tails_asan_kat_test.cpp ([L-KR1Z1S]): drives the clean_tracker Step 3
     # tail-drop loop (ltc::drop_tails, drop_tails.hpp) over a REAL ~18k-share
     # ShareTracker for 300+ drop iterations while a concurrent build_stops
@@ -485,6 +503,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         invalid_pow_score_test.cpp
         legacy_addrme_self_probe_test.cpp
         listen_port_guard_test.cpp
+        local_share_block_hook_test.cpp
         ltc_fd_plan_test.cpp
         ltc_full_view_prices_old_inputs_test.cpp
         ltc_gentx_golden_kat_test.cpp
@@ -531,6 +550,8 @@ if (BUILD_TESTING AND GTest_FOUND)
         template_mweb_ext_merge_test.cpp
         template_sigop_budget_test.cpp
         template_topology_spend_test.cpp
+        think_best_change_notify_test.cpp
+        think_gate_test.cpp
         utxo_order_test.cpp
         utxo_view_stats_test.cpp
         version_switch_floor_test.cpp

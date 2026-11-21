@@ -9,6 +9,10 @@
     <script src="multipool.js"></script>
     <script src="highcharts.js"></script>
     <script src="highcharts-exporting.js"></script>
+    <!-- The one squarify (sharechain-explorer/src/pplns/squarify.ts) as a
+         classic script: defines C2PLayout for the treemaps below. The ?v=
+         stamp is the file's content hash (npm run stamp). -->
+    <script src="sharechain-explorer/dist/layout.js?v=be69538d"></script>
     <style>
         :root {
             --primary: #008de4;
@@ -22,6 +26,8 @@
             --text: #e0e0e0;
             --text-muted: #8888a0;
             --border: #3a3a5a;
+            --pace-fast: #00d4ff;
+            --pace-slow: #a78bfa;
         }
         
         * {
@@ -672,6 +678,59 @@
             color: var(--warning);
             font-weight: 600;
         }
+
+        /* Block pace (effort = time taken / expected time): a fast block is
+           cyan, a slow one violet. Slow is not red: a long round is chance,
+           not a fault. */
+        .pace-fast { color: var(--pace-fast); }
+        .pace-slow { color: var(--pace-slow); }
+        .pace-strong { font-weight: 700; }
+        .effort-unknown { color: var(--text-muted); }
+        /* An effort measured by the node the history was imported from
+           (effort_method "imported"): a small mark with its own tooltip. */
+        .effort-imported { margin-left: 3px; font-size: 10px; color: var(--text-muted); cursor: help; }
+        /* Duplet bracket down the first cell of the pair's rows: a dashed
+           edge, with a tick on the later (upper) and the earlier (lower) row. */
+        td.duplet-edge { position: relative; border-left: 2px dashed var(--pace-fast); }
+        /* The tags and the pill widen the Recent Blocks table: in a narrow
+           panel the Round cell wraps, not the time or the difficulties. */
+        #blocks td:first-child, #blocks td:nth-child(6), #blocks td:nth-child(7) { white-space: nowrap; }
+        td.duplet-top::before, td.duplet-bottom::after {
+            content: '';
+            position: absolute;
+            left: 0;
+            width: 9px;
+            border-top: 2px dashed var(--pace-fast);
+        }
+        td.duplet-top::before { top: 0; }
+        td.duplet-bottom::after { bottom: 0; }
+        .duplet-pill {
+            display: inline-block;
+            margin-left: 6px;
+            padding: 0 6px;
+            border: 1px dashed var(--pace-fast);
+            border-radius: 10px;
+            color: var(--pace-fast);
+            font-size: 10px;
+            font-weight: 400;
+            white-space: nowrap;
+            cursor: help;
+        }
+        /* The p2pool.info (2012) luck line under the Recent Blocks badges. */
+        .classic-luck {
+            width: 100%;
+            font-family: monospace;
+            font-size: 12px;
+            line-height: 1.6;
+            color: var(--text-muted);
+        }
+        .classic-luck .luck-up { color: var(--success); font-weight: 600; cursor: help; }
+        .classic-luck .luck-down { color: var(--danger); font-weight: 600; cursor: help; }
+        .classic-luck .luck-none { cursor: help; }
+        .classic-luck .caption { font-size: 10px; font-style: italic; opacity: 0.75; }
+        .classic-luck .glyphs span { cursor: help; }
+        .classic-luck label { margin-left: 12px; cursor: pointer; user-select: none; white-space: nowrap; }
+        .luck-ci { margin-left: 4px; font-size: 0.7em; font-weight: 400; color: var(--text-muted); }
         
         /* Collapsible Miner Rows */
         .miner-row {
@@ -1696,6 +1755,8 @@
             border-radius: 6px;
             cursor: pointer;
             font-size: 1rem;
+            flex: none;
+            white-space: nowrap;
         }
         
         .graph-fullscreen-overlay .fullscreen-close:hover {
@@ -1711,8 +1772,11 @@
         
         .graph-fullscreen-overlay .fullscreen-controls {
             display: flex;
+            flex-wrap: wrap;
+            align-items: center;
             gap: 10px;
             margin-bottom: 15px;
+            min-width: 0;
         }
         
         .graph-fullscreen-overlay .fullscreen-stats {
@@ -1986,7 +2050,8 @@
                         <div class="legend-item disabled" data-series="workers" onclick="toggleSeries('workers', this)" title="Click to toggle worker connections"><span class="legend-color" style="background: #9c27b0;"></span><span>Workers</span></div>
                         <div class="legend-item" data-series="miners" onclick="toggleSeries('miners', this)" title="Click to toggle unique miner addresses"><span class="legend-color" style="background: #673ab7;"></span><span>Miners</span></div>
                         <div class="legend-item" data-series="connected" onclick="toggleSeries('connected', this)" title="Click to toggle connected miners (all connections)"><span class="legend-color" style="background: #e91e63;"></span><span>Connected</span></div>
-                        <div class="legend-item" data-series="lucktrend" onclick="toggleSeries('lucktrend', this)" title="Click to toggle luck trend line"><span class="legend-color" style="background: #ffc107;"></span><span>Luck</span></div>
+                        <div class="legend-item" data-series="lucktrend" onclick="toggleSeries('lucktrend', this)" title="Click to toggle the luck line: the pooled luck of the last 10 rounds (blocks found / blocks expected), the open round included"><span class="legend-color" style="background: #ffc107;"></span><span>Luck</span></div>
+                        <div class="legend-item disabled" data-toggle="classiclines" onclick="toggleClassicLines()" title="Classic block lines: a faint vertical line at each pool block, as p2pool.info drew them in 2012. Off by default."><span class="legend-color" style="background: rgba(255, 255, 255, 0.5);"></span><span>Classic lines</span></div>
                         <div class="legend-item disabled" data-series="netdiff" onclick="toggleSeries('netdiff', this)" title="Click to toggle network difficulty"><span class="legend-color" style="background: #8b5cf6;"></span><span>Net Diff</span></div>
                         <div class="legend-item" data-series="local" onclick="toggleSeries('local', this)" title="Click to toggle THIS node's own hashrate (as distinct from the pool total)"><span class="legend-color" style="background: #00d4ff;"></span><span>Local</span></div>
                         <div class="legend-item disabled" data-series="localdoa" onclick="toggleSeries('localdoa', this)" title="Click to toggle this node's dead-on-arrival hashrate"><span class="legend-color" style="background: #ff8800;"></span><span>Local DOA</span></div>
@@ -1998,9 +2063,9 @@
                         <div class="graph-stat"><div class="graph-stat-label">Average</div><div class="graph-stat-value" id="graph-average">-</div></div>
                         <div class="graph-stat"><div class="graph-stat-label">Peak</div><div class="graph-stat-value" id="graph-peak">-</div></div>
                         <div class="graph-stat" title="Worker connections / Unique payout addresses"><div class="graph-stat-label">Workers/Miners</div><div class="graph-stat-value" id="graph-miners">-</div></div>
-                        <div class="graph-stat"><div class="graph-stat-label">Avg Luck</div><div class="graph-stat-value" id="graph-luck">-</div></div>
+                        <div class="graph-stat"><div class="graph-stat-label" id="graph-luck-label">Pool Luck</div><div class="graph-stat-value" id="graph-luck">-</div></div>
                     </div>
-                    <div class="graph-diagnostic" id="hashrate-diagnostic" style="margin: 6px 0 2px; font-size: 12px; color: var(--text-muted);" title="Effective hashrate the pool's found blocks imply (Bayesian 95% credible interval on block rate), versus the hashrate the miners report. If reported sits outside the interval, the rigs are not delivering what they claim.">-</div>
+                    <div class="graph-diagnostic" id="hashrate-diagnostic" style="margin: 6px 0 2px; font-size: 12px; color: var(--text-muted);" title="Effective hashrate the pool's found blocks imply (exact Poisson 95% confidence interval on the block rate), versus the hashrate the miners report. If reported sits outside the interval, the rigs are not delivering what they claim.">-</div>
                 </div>
             </div>
         </div>
@@ -2022,7 +2087,8 @@
                     <div class="legend-item legend-key" title="Orphaned block: another block won its height" style="font-size: 14px; padding: 6px 12px;"><span class="legend-color legend-orphan" style="width: 14px; height: 14px;"></span><span>Orphaned</span></div>
                     <div class="legend-item disabled" data-series="workers" onclick="toggleSeries('workers', this)" title="Click to toggle worker connections" style="font-size: 14px; padding: 6px 12px;"><span class="legend-color" style="background: #9c27b0; width: 14px; height: 14px;"></span><span>Workers</span></div>
                     <div class="legend-item" data-series="miners" onclick="toggleSeries('miners', this)" title="Click to toggle unique miner addresses" style="font-size: 14px; padding: 6px 12px;"><span class="legend-color" style="background: #673ab7; width: 14px; height: 14px;"></span><span>Miners</span></div>
-                    <div class="legend-item" data-series="lucktrend" onclick="toggleSeries('lucktrend', this)" title="Click to toggle luck trend line" style="font-size: 14px; padding: 6px 12px;"><span class="legend-color" style="background: #ffc107; width: 14px; height: 14px;"></span><span>Luck</span></div>
+                    <div class="legend-item" data-series="lucktrend" onclick="toggleSeries('lucktrend', this)" title="Click to toggle the luck line: the pooled luck of the last 10 rounds (blocks found / blocks expected), the open round included" style="font-size: 14px; padding: 6px 12px;"><span class="legend-color" style="background: #ffc107; width: 14px; height: 14px;"></span><span>Luck</span></div>
+                    <div class="legend-item disabled" data-toggle="classiclines" onclick="toggleClassicLines()" title="Classic block lines: a faint vertical line at each pool block, as p2pool.info drew them in 2012. Off by default." style="font-size: 14px; padding: 6px 12px;"><span class="legend-color" style="background: rgba(255, 255, 255, 0.5); width: 14px; height: 14px;"></span><span>Classic lines</span></div>
                     <div class="legend-item disabled" data-series="netdiff" onclick="toggleSeries('netdiff', this)" title="Click to toggle network difficulty" style="font-size: 14px; padding: 6px 12px;"><span class="legend-color" style="background: #8b5cf6; width: 14px; height: 14px;"></span><span>Net Diff</span></div>
                     <div class="legend-item" data-series="local" onclick="toggleSeries('local', this)" title="Click to toggle THIS node's own hashrate (as distinct from the pool total)" style="font-size: 14px; padding: 6px 12px;"><span class="legend-color" style="background: #00d4ff; width: 14px; height: 14px;"></span><span>Local</span></div>
                     <div class="legend-item disabled" data-series="localdoa" onclick="toggleSeries('localdoa', this)" title="Click to toggle this node's dead-on-arrival hashrate" style="font-size: 14px; padding: 6px 12px;"><span class="legend-color" style="background: #ff8800; width: 14px; height: 14px;"></span><span>Local DOA</span></div>
@@ -2036,7 +2102,7 @@
                 <div class="fullscreen-stat"><div class="fullscreen-stat-label">Average</div><div class="fullscreen-stat-value" id="fs-graph-average">-</div></div>
                 <div class="fullscreen-stat"><div class="fullscreen-stat-label">Peak</div><div class="fullscreen-stat-value" id="fs-graph-peak">-</div></div>
                 <div class="fullscreen-stat" title="Worker connections / Unique payout addresses"><div class="fullscreen-stat-label">Workers/Miners</div><div class="fullscreen-stat-value" id="fs-graph-miners">-</div></div>
-                <div class="fullscreen-stat"><div class="fullscreen-stat-label">Avg Luck</div><div class="fullscreen-stat-value" id="fs-graph-luck">-</div></div>
+                <div class="fullscreen-stat"><div class="fullscreen-stat-label" id="fs-graph-luck-label">Pool Luck</div><div class="fullscreen-stat-value" id="fs-graph-luck">-</div></div>
             </div>
             <div class="fullscreen-diagnostic" id="fs-hashrate-diagnostic" style="margin: 8px 16px; font-size: 13px; color: var(--text-muted);">-</div>
         </div>
@@ -2089,9 +2155,21 @@
                     <h2>🏆 Recent Blocks</h2>
                     <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
                         <span class="badge" id="blocks_count">0</span>
-                        <span class="badge" id="luck_current_round" style="background: var(--primary);" title="Current round luck">Round: -</span>
-                        <span class="badge" id="luck_seven_days" style="background: var(--primary);" title="7-day average luck">7d: -</span>
-                        <span class="badge" id="luck_thirty_days" style="background: var(--primary);" title="30-day average luck">30d: -</span>
+                        <span class="badge" id="luck_current_round" style="display: none; background: var(--primary); cursor: help;" title="Open round: time since the last pool block against the expected time">Round —</span>
+                        <span class="badge" id="luck_seven_days" style="background: var(--primary); cursor: help;" title="Pool luck, 7 days">7d: —</span>
+                        <span class="badge" id="luck_thirty_days" style="background: var(--primary); cursor: help;" title="Pool luck, 30 days">30d: —</span>
+                        <span class="badge" id="luck_ninety_days" style="background: var(--primary); cursor: help;" title="Pool luck, 90 days">90d: —</span>
+                        <a class="badge" id="cz_extraction_link" style="display: none; background: var(--primary); text-decoration: none;" href="https://chainz.cryptoid.info/dash/extraction.dws?30.htm" target="_blank" rel="noopener" title="Dash blocks that chainz (CryptoID) attributes to P2Pool-DASH, over the chain's history (page id 30, not 30 days). The line counts every p2pool-dash-compatible pool: c2pool's blocks carry /P2Pool-DASH/c2pool/ in the coinbase, legacy p2pool-dash nodes only /P2Pool-DASH/.">P2Pool-DASH on chainz ↗</a>
+                    </div>
+                    <div class="classic-luck" id="classic_luck_strip">
+                        <div><span title="How many blocks were produced relative to how many were expected in each window (p2pool.info, 2012). Numbers larger than 100% mean the pool was lucky.">Pool Luck (7 days, 30 days, 90 days):</span>
+                            <span id="classic_luck_7d" class="luck-none">—</span>
+                            <span id="classic_luck_30d" class="luck-none">—</span>
+                            <span id="classic_luck_90d" class="luck-none">—</span>
+                            <span class="caption">à la p2pool.info, 2012</span></div>
+                        <div><span title="One glyph per round, oldest first: ⚡ found in under ⅓ of the expected time, 🐢 took over 2×, · neither. A fair pool shows ⚡ on 28 % of rounds and 🐢 on 13.5 %, in no pattern.">last 40 rounds:</span>
+                            <span class="glyphs" id="classic_luck_glyphs">—</span>
+                            <label title="Play a short cha-ching when the pool finds a block, as p2pool.info offered. Off by default; remembered in this browser."><input type="checkbox" id="chaching_toggle" onchange="toggleChaChing(this.checked)"> cha-ching</label></div>
                     </div>
                 </div>
                 <div class="table-scroll">
@@ -2101,8 +2179,8 @@
                                 <th>Time</th>
                                 <th>Height</th>
                                 <th>Block Hash</th>
-                                <th>Luck</th>
-                                <th title="Time to find block (actual/expected)">Round</th>
+                                <th title="Round duration vs. expected (p2pool.info: 'vs. Expected'). Under 100% the round was faster than expected, i.e. lucky. Luck = 1 / effort is in each cell's tooltip.">Effort</th>
+                                <th title="Round duration: actual / expected. ⚡ under ⅓ of the expected time, 🐢 over 2×.">Round</th>
                                 <th title="Network difficulty, shown as the hashrate it implies at this coin's block time (hover a cell for the difficulty)">Net Diff</th>
                                 <th title="Difficulty the found block hash met, shown as the hashrate it implies at this coin's block time (hover a cell for the difficulty)">Hash Diff</th>
                                 <th title="Block status">✓</th>
@@ -2131,6 +2209,7 @@
                                 <th>Time</th>
                                 <th>Network</th>
                                 <th>Height</th>
+                                <th title="Round duration vs. expected on this merged chain, at its own difficulty. Under 100% the round was faster than expected.">Effort</th>
                                 <th>Block Hash</th>
                                 <th>Miner</th>
                                 <th title="Block status">✓</th>
@@ -2317,6 +2396,7 @@
             <div class="section-header" style="display:flex;justify-content:space-between;align-items:center">
                 <h2>Sharechain Transparency Explorer</h2>
                 <div style="display:flex;gap:12px;align-items:center">
+                    <span id="explorer-anim-chip" style="font-size:0.8rem;color:var(--text-muted)" title="Fluid draws the share chain on the scene engine: cells slide as shares arrive. Experimental; Classic is the default.">Animation: <a href="javascript:c2pSetExplorerAnim('classic')" id="anim-classic" style="color:inherit">Classic</a> | <a href="javascript:c2pSetExplorerAnim('fluid')" id="anim-fluid" style="color:inherit">Fluid (experimental)</a></span>
                     <a href="javascript:toggleRealTime()" id="realtime-btn" style="padding:4px 12px;border-radius:4px;font-size:0.8rem;font-weight:600;cursor:pointer;text-decoration:none;background:var(--card-bg);color:var(--text-muted);border:1px solid var(--border)">RealTime: OFF</a>
                     <a href="#" style="color:var(--text-muted);font-size:0.8rem;text-decoration:none">Back to top</a>
                 </div>
@@ -2455,6 +2535,26 @@
     </footer>
     
     <script>
+        // BEGIN c2pLayout
+        // Treemap layout: the one squarify in web-static, loaded in <head>
+        // as sharechain-explorer/dist/layout.js (global C2PLayout). The
+        // legacy views keep the 1 px minimum strip they always had, so
+        // sub-pixel miners still show as a sliver.
+        function c2pLayoutReady() {
+            return typeof C2PLayout !== 'undefined' && typeof C2PLayout.squarify === 'function';
+        }
+        function c2pSquarify(items, x, y, w, h) {
+            if (!c2pLayoutReady()) {
+                if (!c2pSquarify._warned) {
+                    c2pSquarify._warned = true;
+                    console.error('[c2pool] sharechain-explorer/dist/layout.js did not load; treemaps are disabled');
+                }
+                return [];
+            }
+            return C2PLayout.squarify(items, x, y, w, h, { minStrip: 1 });
+        }
+        // END c2pLayout
+
         // Utility functions
         function format_dt(dt) {
             if (dt < 0) dt = 0;
@@ -2492,12 +2592,40 @@
             return d3.format('.2f')(d) + ' P';
         }
 
+        // BEGIN c2pDiffPeriod (tested by sharechain-explorer/tests/unit/dashboard-diff-period.test.ts)
+        // The block period a difficulty is turned into a hashrate at
+        // (difficulty x 2^32 / period): the block interval of the algorithm
+        // the difficulty belongs to. The node serves it as
+        // currency_info.algo_block_period where it is not the chain's
+        // block_period: on DGB each of five algorithms retargets to 75 s under
+        // a 15 s chain, and the node's own network_hashrate uses the 75 s.
+        // Else the chain's block_period; null when the node serves neither.
+        function c2pDifficultyBlockPeriod(info) {
+            if (info && info.algo_block_period > 0) return info.algo_block_period;
+            if (info && info.block_period > 0) return info.block_period;
+            return null;
+        }
+        // "N s block time", naming the algorithm's interval where it is not the chain's.
+        function c2pDifficultyBlockPeriodNote(info) {
+            var period = c2pDifficultyBlockPeriod(info);
+            if (period === null) return '';
+            if (info.block_period > 0 && info.block_period !== period)
+                return period + ' s, the block time of this algorithm (the chain\'s is ' + info.block_period + ' s)';
+            return period + ' s block time';
+        }
+        // END c2pDiffPeriod
+
         // A block's difficulty SHOWN as the hashrate it implies (difficulty x 2^32 /
         // block period), so miners can compare it with their own PH/s. The block
-        // period is the coin's own (currency_info.block_period; 150 s until loaded).
+        // period is the coin's own (c2pDifficultyBlockPeriod; 150 s until loaded).
         function block_period_sec() {
+            var own = c2pDifficultyBlockPeriod(window.currency_info);
+            if (own !== null) return own;
             return (typeof parentBlockPeriodMs !== 'undefined' && parentBlockPeriodMs > 0)
                 ? parentBlockPeriodMs / 1000 : 150;
+        }
+        function block_period_note() {
+            return c2pDifficultyBlockPeriodNote(window.currency_info) || (block_period_sec() + ' s block time');
         }
         function diff_as_hashrate(diff) {
             return format_hashrate(Math.floor(diff * Math.pow(2, 32) / block_period_sec()));
@@ -2552,10 +2680,15 @@
         function block_is_stale(b) {
             return !!b && b.status === 'stale';
         }
+        // A find the node says is not on the coin chain (`main_chain` false)
+        // though neither orphaned nor stale: it never confirmed.
+        function block_is_unconfirmed_find(b) {
+            return !!b && b.main_chain === false && !block_is_orphaned(b) && !block_is_stale(b);
+        }
         function block_marker_style(b, luckColor) {
             if (block_is_orphaned(b))
                 return { fillColor: '#6b7280', lineColor: '#ef4444', symbol: 'triangle-down' };
-            if (block_is_stale(b))
+            if (block_is_stale(b) || block_is_unconfirmed_find(b))
                 return { fillColor: '#4b5563', lineColor: '#9ca3af', symbol: 'square' };
             return { fillColor: luckColor, lineColor: '#00ff88', symbol: 'diamond' };
         }
@@ -2564,6 +2697,8 @@
                 return '<span style="color:#ef4444">▼</span> <b>Block Orphaned</b><br/>';
             if (block_is_stale(b))
                 return '<span style="color:#9ca3af">■</span> <b>Stale Block</b><br/>';
+            if (block_is_unconfirmed_find(b))
+                return '<span style="color:#9ca3af">■</span> <b>Not on the coin chain</b><br/>';
             return '<span style="color:#00ff88">◆</span> <b>Block Found!</b><br/>';
         }
         function block_status_html(b) {
@@ -4582,6 +4717,16 @@
                 // The window panel's "Blocks in Window" reads the whole ledger
                 // (c2pWindowBlocks), not only the 10 rows the table shows.
                 window.c2pRecentBlocks = blocks || [];
+                if (window.c2pFluidActive && typeof defrag.render === 'function') defrag.render();
+                // Pace (effort, ⚡/🐢, duplets) over the whole ledger, before
+                // the table keeps its 10 rows, so the oldest row shown still
+                // has its predecessor.
+                var pace = c2pBlockPace(window.c2pRecentBlocks, (window.currency_info && window.currency_info.symbol) || '');
+                window.c2pPace = pace;
+                var paceOf = function(b) { return pace.byHash[c2pRowHash(b)] || null; };
+                // A failed load is not a ledger: it must not reset what was seen.
+                if (blocks) c2pChaChingOnBlocks(pace);
+                c2pRenderLuckSummary();
                 d3.select('#blocks_loading').style('display', 'none');
                 // Clear existing rows before adding new data
                 d3.select('#blocks tbody').selectAll('tr').remove();
@@ -4608,95 +4753,85 @@
                     
                     d3.select('#blocks tbody').selectAll('tr').remove();
                     var tr = d3.select('#blocks tbody').selectAll('tr').data(displayBlocks).enter().append('tr');
-                tr.append('td').text(function(b) { return format_time_short(b.ts); });
-                tr.append('td').text(function(b) { return b.number; });
-                tr.append('td').append('a')
+                // Duplet bracket: a dashed edge on both rows of the pair.
+                tr.append('td')
+                    .attr('class', function(b) {
+                        var p = paceOf(b);
+                        return c2pDupletEdgeClass(p);
+                    })
+                    .text(function(b) { return format_time_short(b.ts); });
+                tr.append('td').each(function(b) {
+                    var td = d3.select(this), p = paceOf(b);
+                    td.append('span').text(b.number);
+                    if (p && p.duplet) {
+                        td.append('span').attr('class', 'duplet-pill')
+                            .attr('title', c2pDupletTip(p))
+                            .text('⁑ duplet');
+                    }
+                });
+                var hashTd = tr.append('td');
+                hashTd.append('a')
                     .attr('class', 'hash-link')
                     .attr('href', function(b) { return currency_info.block_explorer_url_prefix + b.hash; })
                     .attr('target', '_blank')
                     .attr('title', function(b) { return b.hash; })
                     .text(function(b) { return '...' + b.hash.substr(-8); });
+                // DASH: a second explorer next to the configured one, so a lagging
+                // explorer index ("block not found" minutes after the find) has a
+                // fallback one click away.
+                var isDashChain = ((currency_info && currency_info.symbol) || '').toUpperCase() === 'DASH'
+                    && !/testnet/i.test((currency_info && currency_info.block_explorer_url_prefix) || '');   // chainz links are mainnet
+                d3.select('#cz_extraction_link').style('display', isDashChain ? null : 'none');
+                if (isDashChain) {
+                    hashTd.filter(function(b) { return /^[0-9a-f]{64}$/i.test(b.hash || ''); })
+                        .append('a')
+                        .attr('class', 'hash-link')
+                        .attr('href', function(b) { return 'https://chainz.cryptoid.info/dash/block.dws?' + b.hash + '.htm'; })
+                        .attr('target', '_blank')
+                        .attr('rel', 'noopener')
+                        .attr('title', 'Open this block on chainz (CryptoID)')
+                        .style('margin-left', '6px')
+                        .style('font-size', '0.8em')
+                        .text('cz');
+                }
+                // Effort: round duration vs. expected, coloured at the bounds
+                // the luck colours had (luck = 1 / effort is in the tooltip).
                 tr.append('td')
-                    .attr('class', function(b) {
-                        // #1138: honor the full backend luck_method taxonomy. 'relayed'
-                        // (peer-learned, no local timing) and 'netdiff_unavailable' (header
-                        // never synced) are NOT this pool's pending first block -- render
-                        // them neutral so relay rows stop masquerading as our own blocks.
-                        if (b.luck_method === 'relayed' || b.luck_method === 'netdiff_unavailable') return '';
-                        if (b.luck_method === 'first_block') return 'status-pending';  // genuine first block - no luck calc
-                        if (!b.luck) return '';
-                        if (b.luck >= 100) return 'status-confirmed';
-                        if (b.luck >= 75) return 'status-pending';
-                        return 'status-orphaned';
-                    })
+                    .attr('class', function(b) { return c2pEffortClass(paceOf(b)); })
                     .text(function(b) {
-                        // #1138: distinct glyphs per method so only a GENUINE first block
-                        // reads '1st'; relay-learned and header-unavailable rows are honest.
+                        var p = paceOf(b);
+                        if (p && p.effort !== null) return (p.first ? '1st ' : '') + c2pFmtPct(p.effort * 100);
+                        // Off the coin chain: the effort the node gives it, muted; it is no round.
+                        if (p && p.offChain && p.offEffort !== null) return c2pFmtPct(p.offEffort * 100);
+                        // #1138: distinct glyphs per method; relay-learned and
+                        // header-unavailable rows are honest about why.
                         if (b.luck_method === 'relayed') return '↗';   // relay-learned from a peer
-                        if (b.luck_method === 'netdiff_unavailable') return 'n/a';
-                        if (b.luck_method === 'first_block') return '1st';  // genuine first block indicator
-                        if (b.luck === undefined || b.luck === null) return '-';
-                        // Show decimal for very small luck values
-                        if (b.luck < 1) return d3.format('.2f')(b.luck) + '%';
-                        return b.luck < 1 ? d3.format('.2f')(b.luck) : d3.format('.0f')(b.luck) + '%';
+                        if (b.luck_method === 'netdiff_unavailable' || b.luck_method === 'hashrate_unavailable') return 'n/a';
+                        return '—';
                     })
-                    .attr('title', function(b) {
-                        if (b.luck_method === 'relayed')
-                            return 'Relayed from a peer over P2P -- this node has no local timing, so no luck is computed here';
-                        if (b.luck_method === 'netdiff_unavailable')
-                            return 'Luck unavailable -- the block header was never synced, so network difficulty at find time is unknown';
-                        if (b.luck_method === 'first_block') {
-                            var tip = 'First block - no previous block for luck calculation';
-                            if (b.expected_time) tip += '\nExpected time was: ' + format_dt(b.expected_time);
-                            return tip;
-                        }
-                        if (!b.time_to_find) return '';
-                        var tip = 'Found in ' + format_dt(b.time_to_find);
-                        if (b.expected_time) tip += ' (expected: ' + format_dt(b.expected_time) + ')';
-                        if (b.luck_method === 'time_weighted_avg') tip += '\n[Precise: ' + b.hashrate_samples_used + ' samples]';
-                        else if (b.luck_method === 'simple_avg') tip += '\n[Avg of block hashrates]';
-                        else if (b.luck_method) tip += '\n[' + b.luck_method + ']';
-                        return tip;
-                    });
+                    .each(function(b) { c2pImportedMark(d3.select(this), paceOf(b)); })
+                    .attr('title', function(b) { return c2pEffortCellTip(b, paceOf(b)); });
                 tr.append('td')
                     .attr('style', 'font-family: monospace; font-size: 11px;')
-                    .text(function(b) {
-                        var actual = b.time_to_find || 0;
-                        
-                        // Calculate expected time - prioritize backend value, then derive from luck
-                        var expected = 0;
-                        if (b.expected_time) {
-                            // Use backend-calculated expected time (most accurate)
-                            expected = b.expected_time;
-                        } else if (b.luck && b.luck > 0 && actual > 0) {
-                            // Derive from luck: luck = (expected / actual) * 100
-                            expected = (actual * b.luck) / 100;
-                        } else if (b.network_difficulty && b.pool_hashrate_at_find && b.pool_hashrate_at_find > 0) {
-                            // Fallback calculation: expected_hashes / hashrate = time
-                            expected = (b.network_difficulty * Math.pow(2, 32)) / b.pool_hashrate_at_find;
+                    .each(function(b) {
+                        var td = d3.select(this), p = paceOf(b), t = c2pRoundTimes(b, p);
+                        if (p && p.tag) {
+                            td.append('span')
+                                .attr('class', (c2pIsFast(p.tier) ? 'pace-fast' : 'pace-slow') +
+                                               (p.tier === 'fast2' || p.tier === 'slow2' ? ' pace-strong' : ''))
+                                .text(p.tag + ' ');
                         }
-                        
                         // Adaptive units: a 107 s find reads "1m 47s", not a truncated "00:01".
-                        var exp = expected > 0 ? format_duration(expected) : '-';
-                        var act = actual > 0 ? format_duration(actual) : '-';
-                        // Display as actual/expected since that's more intuitive (time taken vs time expected)
-                        return act + ' / ' + exp;
+                        // Actual / expected: time taken vs time expected.
+                        td.append('span').text((t.actual > 0 ? format_duration(t.actual) : '-') + ' / ' +
+                                               (t.expected > 0 ? format_duration(t.expected) : '-'));
                     })
                     .attr('title', function(b) {
-                        var actual = b.time_to_find || 0;
-                        var expected = 0;
-                        if (b.expected_time) {
-                            expected = b.expected_time;
-                        } else if (b.luck && b.luck > 0 && actual > 0) {
-                            // Derive from luck: luck = (expected / actual) * 100
-                            expected = (actual * b.luck) / 100;
-                        } else if (b.network_difficulty && b.pool_hashrate_at_find && b.pool_hashrate_at_find > 0) {
-                            expected = (b.network_difficulty * Math.pow(2, 32)) / b.pool_hashrate_at_find;
-                        }
-                        
-                        var exp = expected > 0 ? format_dt(expected) : 'unknown';
-                        var act = actual > 0 ? format_dt(actual) : 'unknown';
-                        return 'Actual: ' + act + '\nExpected: ' + exp;
+                        var p = paceOf(b), t = c2pRoundTimes(b, p);
+                        var tip = 'Actual: ' + (t.actual > 0 ? format_dt(t.actual) : 'unknown') +
+                                  '\nExpected: ' + (t.expected > 0 ? format_dt(t.expected) : 'unknown');
+                        if (p && p.tag) tip += '\n' + c2pPaceTip(p) + '\n' + c2pEffortSourceNote(p);
+                        return tip;
                     });
                 // Net Diff / Hash Diff are SHOWN as a hashrate (diff_as_hashrate) so
                 // miners can compare them with their own PH/s; the tooltip carries the
@@ -4709,7 +4844,7 @@
                     .attr('title', function(b) {
                         if (!b.network_difficulty) return '';
                         return 'Network ' + diff_detail(b.network_difficulty) +
-                            '\nShown as hashrate: difficulty x 2^32 / ' + block_period_sec() + ' s block time';
+                            '\nShown as hashrate: difficulty x 2^32 / ' + block_period_note();
                     });
                 tr.append('td')
                     .text(function(b) {
@@ -4722,7 +4857,7 @@
                             (b.network_difficulty
                                 ? '\n' + d3.format('.2f')(b.actual_hash_difficulty / b.network_difficulty) + 'x the network difficulty'
                                 : '') +
-                            '\nShown as hashrate: difficulty x 2^32 / ' + block_period_sec() + ' s block time';
+                            '\nShown as hashrate: difficulty x 2^32 / ' + block_period_note();
                     });
                 tr.append('td')
                     .attr('class', function(b) {
@@ -4790,6 +4925,11 @@
                 // Clear existing rows
                 d3.select('#merged_blocks tbody').selectAll('tr').remove();
                 
+                // Pace per merged chain, over all rows, when the node serves
+                // the merged chain's own effort (never paired across chains).
+                var mergedPace = c2pBlockPace(blocks, '');
+                var mergedPaceOf = function(b) { return mergedPace.byHash[c2pRowHash(b)] || null; };
+
                 // Store only 10 most recent merged blocks for table display
                 window.allMergedBlocks = blocks.slice().sort(function(a,b){var ha=(a.height!=null?a.height:a.number)||0,hb=(b.height!=null?b.height:b.number)||0;return hb-ha;}).slice(0, 10);
                 window.mergedBlocksDisplayCount = Math.min(10, window.allMergedBlocks.length);
@@ -4809,7 +4949,12 @@
                     d3.select('#merged_blocks tbody').selectAll('tr').remove();
                     var tr = d3.select('#merged_blocks tbody').selectAll('tr').data(displayBlocks).enter().append('tr');
                     
-                    tr.append('td').text(function(b) { return format_time_short(b.ts); });
+                    tr.append('td')
+                        .attr('class', function(b) {
+                            var p = mergedPaceOf(b);
+                            return c2pDupletEdgeClass(p);
+                        })
+                        .text(function(b) { return format_time_short(b.ts); });
                     tr.append('td')
                         .style('font-weight', 'bold')
                         .style('color', '#6f42c1')
@@ -4827,6 +4972,31 @@
                                 .attr('title', (b.symbol || 'AUX') + ' block #' + b.height)
                                 .text('#' + b.height);
                         });
+                    // Effort on the merged chain, with the same ⚡ / 🐢 tags
+                    // and duplet mark as the parent rows. A dash until the
+                    // node serves the merged chain's difficulty at find.
+                    tr.append('td')
+                        .attr('class', function(b) { return c2pEffortClass(mergedPaceOf(b)); })
+                        .each(function(b) {
+                            var td = d3.select(this), p = mergedPaceOf(b);
+                            // Off the aux chain: the effort the node gives it, muted; it is no round.
+                            if (p && p.offChain && p.offEffort !== null) { td.text(c2pFmtPct(p.offEffort * 100)); return; }
+                            if (!p || p.effort === null) { td.text('—'); return; }
+                            if (p.tag) {
+                                td.append('span')
+                                    .attr('class', (c2pIsFast(p.tier) ? 'pace-fast' : 'pace-slow') +
+                                                   (p.tier === 'fast2' || p.tier === 'slow2' ? ' pace-strong' : ''))
+                                    .text(p.tag + ' ');
+                            }
+                            td.append('span').text((p.first ? '1st ' : '') + c2pFmtPct(p.effort * 100));
+                            c2pImportedMark(td, p);
+                            if (p.duplet) {
+                                td.append('span').attr('class', 'duplet-pill')
+                                    .attr('title', c2pDupletTip(p))
+                                    .text('⁑ duplet');
+                            }
+                        })
+                        .attr('title', function(b) { return c2pEffortCellTip(b, mergedPaceOf(b)); });
                     tr.append('td').append('a')
                         .attr('class', 'hash-link')
                         .attr('href', function(b) {
@@ -5023,53 +5193,16 @@
         
         function loadPoolLuck() {
             d3.json('../luck_stats', function(luckData) {
-                if (!luckData || !luckData.luck_available) {
-                    return;
-                }
-
-                // Current round luck (current luck trend)
-                if (luckData.current_luck_trend) {
-                    var currentLuck = luckData.current_luck_trend;
-                    d3.select('#luck_current_round')
-                        .text('Round: ' + d3.format('.0f')(currentLuck) + '%')
-                        .style('background', currentLuck >= 100 ? 'var(--success)' : (currentLuck >= 75 ? 'var(--warning)' : 'var(--danger)'));
-                } else {
-                    d3.select('#luck_current_round').text('Round: -').style('background', 'var(--primary)');
-                }
-
-                // Calculate 7-day and 30-day luck from blocks
-                var now = Date.now() / 1000;
-                var sevenDaysAgo = now - (7 * 24 * 60 * 60);
-                var thirtyDaysAgo = now - (30 * 24 * 60 * 60);
-
-                var sevenDayBlocks = luckData.blocks.filter(function(b) { return b.ts >= sevenDaysAgo && b.luck; });
-                var thirtyDayBlocks = luckData.blocks.filter(function(b) { return b.ts >= thirtyDaysAgo && b.luck; });
-
-                if (sevenDayBlocks.length > 0) {
-                    var sevenDayLuck = d3.sum(sevenDayBlocks, function(b) { return b.luck; }) / sevenDayBlocks.length;
-                    d3.select('#luck_seven_days')
-                        .text('7d: ' + d3.format('.0f')(sevenDayLuck) + '%')
-                        .style('background', sevenDayLuck >= 100 ? 'var(--success)' : (sevenDayLuck >= 75 ? 'var(--warning)' : 'var(--danger)'));
-                } else {
-                    d3.select('#luck_seven_days').text('7d: -').style('background', 'var(--primary)');
-                }
-
-                if (thirtyDayBlocks.length > 0) {
-                    var thirtyDayLuck = d3.sum(thirtyDayBlocks, function(b) { return b.luck; }) / thirtyDayBlocks.length;
-                    d3.select('#luck_thirty_days')
-                        .text('30d: ' + d3.format('.0f')(thirtyDayLuck) + '%')
-                        .style('background', thirtyDayLuck >= 100 ? 'var(--success)' : (thirtyDayLuck >= 75 ? 'var(--warning)' : 'var(--danger)'));
-                } else {
-                    d3.select('#luck_thirty_days').text('30d: -').style('background', 'var(--primary)');
-                }
+                // Kept whole: the luck badges and the hashrate charts read
+                // `periods` and `current_round` from it (c2pRenderLuckSummary,
+                // c2pChartLuck). A failed load keeps the last one.
+                if (luckData) window.c2pLuckStats = luckData;
+                c2pRenderLuckSummary();
             });
         }
 
         // Look up miner's share version from defrag data (cached per load)
         function getMinerVersion(addr) {
-            // Donation addresses always signal V36 during transition
-            if (addr && (addr.indexOf('LeD2f') === 0 || addr.indexOf('MLhSm') === 0))
-                return { ver: 35, dv: 36 };
             if (!defrag.shares || defrag.shares.length === 0) return { ver: 0, dv: 0 };
             var verCounts = {}, dvCounts = {};
             defrag.shares.forEach(function(s) {
@@ -5084,6 +5217,90 @@
             return { ver: topVer, dv: topDv || topVer };
         }
 
+        // BEGIN c2pPayoutRole (tested by sharechain-explorer/tests/unit/dashboard-payout-role.test.ts)
+        // Role of a "Current Payouts" row, from what the node publishes and
+        // never from an address prefix (the PPLNS treemap's classifyAddress
+        // rule): 'donation' = the coinbase donation output (not a miner, no
+        // share version), 'owner' = this node's owner fee payee, '' = a miner.
+        // `ci` is /web/currency_info; `entry` the /current_merged_payouts row
+        // (null on the /current_payouts fallback path).
+        function c2pPayoutRole(addr, entry, ci) {
+            ci = ci || {};
+            if (!addr) return '';
+            if (ci.donation_address && addr === ci.donation_address) return 'donation';
+            // A donation output no parent row took is listed under its own
+            // merged-chain address.
+            var mda = ci.merged_donation_addresses;
+            if (mda && typeof mda === 'object') {
+                for (var k in mda) if (mda[k] === addr) return 'donation';
+            }
+            // A node without the currency_info donation fields: the donation
+            // row's merged child carries source "donation".
+            var m = entry && entry.merged;
+            if (m && m.length) {
+                for (var i = 0; i < m.length; i++) if (m[i] && m[i].source === 'donation') return 'donation';
+            }
+            if (ci.node_owner_address && addr === ci.node_owner_address) return 'owner';
+            return '';
+        }
+        // A /current_merged_payouts child that is its chain's donation output.
+        function c2pMergedIsDonation(merged, ci) {
+            if (!merged) return false;
+            var mda = ci && ci.merged_donation_addresses;
+            var sym = String(merged.symbol || '').toUpperCase();
+            if (mda && sym && merged.address && mda[sym] === merged.address) return true;
+            return merged.source === 'donation';
+        }
+        // The V<thr>? cell of a payouts row; null while the share version is
+        // not known. The donation output has no shares: a neutral marker.
+        function c2pPayoutVersionHtml(role, mv, thr, staleTitle) {
+            if (role === 'donation')
+                return '<span style="color:var(--text-muted)" title="Donation output (protocol), not a miner — no share version">◇</span>';
+            mv = mv || {};
+            if (mv.ver >= thr)
+                return '<span style="color:#28a745;font-weight:700" title="V' + mv.ver + '">✓</span>';
+            if (mv.dv >= thr)
+                return '<span style="color:#0097a7;font-weight:700" title="V' + mv.ver + ' signaling V' + mv.dv + '">⇧</span>';
+            if (mv.ver > 0)
+                return '<span style="color:#dc3545;font-weight:700" title="' + staleTitle + '">✗</span>';
+            return null;
+        }
+        // Small muted label after a payouts address ({text, title} or null);
+        // `sym` is the chain of that output.
+        function c2pPayoutRoleLabel(role, sym) {
+            if (role === 'donation')
+                return { text: '◇ donation', title: 'Donation output of the coinbase for ' + sym };
+            if (role === 'owner')
+                return { text: '⚑ node fee', title: 'Node-owner fee address of this node: its fee shares pay here' };
+            return null;
+        }
+        // The chain a main row's output is on: a donation output no parent row
+        // took is keyed by its merged-chain address (the merged_donation_addresses
+        // key, or on an older node its own child's symbol); else the parent coin.
+        function c2pPayoutRowSymbol(addr, entry, ci) {
+            ci = ci || {};
+            var mda = ci.merged_donation_addresses;
+            if (mda && typeof mda === 'object') {
+                for (var k in mda) if (mda[k] === addr) return k;
+            }
+            var m = entry && entry.merged;
+            if (m && m.length) {
+                for (var i = 0; i < m.length; i++) if (m[i] && m[i].address === addr && m[i].symbol) return m[i].symbol;
+            }
+            return ci.symbol || 'COIN';
+        }
+        // END c2pPayoutRole
+        function appendPayoutRoleLabel(td, role, sym) {
+            var lb = c2pPayoutRoleLabel(role, sym);
+            if (!lb) return;
+            td.append('span')
+                .style('color', 'var(--text-muted)')
+                .style('font-size', '0.6rem')
+                .style('margin-left', '4px')
+                .attr('title', lb.title)
+                .text(lb.text);
+        }
+
         // Re-render V36 column in existing payouts table rows
         function refreshPayoutsV36() {
             d3.selectAll('#payouts tbody tr').each(function() {
@@ -5095,16 +5312,14 @@
                 var v36Cell = d3.select(cells[0][1]);
                 var link = addrCell.select('a');
                 if (link.empty()) return;
-                var addr = link.attr('title') || link.text();
+                // The link text is the address; the title is "SYM: address"
+                // on the merged path, which matched no share.
+                var addr = link.text();
+                var pd = window.payoutsData;
+                var role = c2pPayoutRole(addr, pd && pd.mergedPays ? pd.mergedPays[addr] : null, currency_info);
                 var mv = getMinerVersion(addr);
-                var vthr = explorerVersionThreshold();
-                if (mv.ver >= vthr) {
-                    v36Cell.html('<span style="color:#28a745;font-weight:700" title="V' + mv.ver + '">✓</span>');
-                } else if (mv.dv >= vthr) {
-                    v36Cell.html('<span style="color:#0097a7;font-weight:700" title="V' + mv.ver + ' signaling V' + mv.dv + '">⇧</span>');
-                } else if (mv.ver > 0) {
-                    v36Cell.html('<span style="color:#dc3545;font-weight:700" title="' + staleVersionTitle(mv.ver) + '">✗</span>');
-                }
+                var html = c2pPayoutVersionHtml(role, mv, explorerVersionThreshold(), staleVersionTitle(mv.ver));
+                if (html) v36Cell.html(html);
             });
         }
 
@@ -5137,20 +5352,14 @@
                     .attr('target', '_blank')
                     .attr('title', (((typeof currency_info !== 'undefined' && currency_info.symbol) || 'LTC')) + ': ' + addr)
                     .text(addr);
+                var role = c2pPayoutRole(addr, entry, currency_info);
+                appendPayoutRoleLabel(addrTd, role, c2pPayoutRowSymbol(addr, entry, currency_info));
 
                 // Version column — look up miner version from defrag share data
                 var v36Td = mainRow.append('td').style('text-align', 'center');
                 var minerVer = getMinerVersion(addr);
-                var verThr = explorerVersionThreshold();
-                if (minerVer.ver >= verThr) {
-                    v36Td.html('<span style="color:#28a745;font-weight:700" title="V' + minerVer.ver + '">✓</span>');
-                } else if (minerVer.dv >= verThr) {
-                    v36Td.html('<span style="color:#0097a7;font-weight:700" title="V' + minerVer.ver + ' signaling V' + minerVer.dv + '">⇧</span>');
-                } else if (minerVer.ver > 0) {
-                    v36Td.html('<span style="color:#dc3545;font-weight:700" title="' + staleVersionTitle(minerVer.ver) + '">✗</span>');
-                } else {
-                    v36Td.text('-');
-                }
+                var verHtml = c2pPayoutVersionHtml(role, minerVer, explorerVersionThreshold(), staleVersionTitle(minerVer.ver));
+                if (verHtml) v36Td.html(verHtml); else v36Td.text('-');
 
                 mainRow.append('td')
                     .style('text-align', 'right')
@@ -5186,7 +5395,9 @@
                         // merged chain only to its own merged address, else to its
                         // own parent key.
                         var _psym = (typeof currency_info !== 'undefined' && currency_info.symbol) || 'LTC';
-                        if (merged.source === 'auto-convert') {
+                        if (c2pMergedIsDonation(merged, currency_info)) {
+                            appendPayoutRoleLabel(addrCell, 'donation', merged.symbol);
+                        } else if (merged.source === 'auto-convert') {
                             addrCell.append('span')
                                 .style('color', '#b08800')
                                 .style('font-size', '0.6rem')
@@ -5417,25 +5628,20 @@
             
             display.forEach(function(addr) {
                 var tr = tbody.append('tr');
-                tr.append('td').append('a')
+                var addrTd = tr.append('td');
+                addrTd.append('a')
                     .attr('class', 'hash-link')
                     .attr('href', currency_info.address_explorer_url_prefix + addr)
                     .attr('target', '_blank')
                     .attr('title', addr)
                     .text(addr);
+                var role = c2pPayoutRole(addr, null, currency_info);
+                appendPayoutRoleLabel(addrTd, role, c2pPayoutRowSymbol(addr, null, currency_info));
                 // Version column
                 var v36Td = tr.append('td').style('text-align', 'center');
                 var mv = getMinerVersion(addr);
-                var vThr = explorerVersionThreshold();
-                if (mv.ver >= vThr) {
-                    v36Td.html('<span style="color:#28a745;font-weight:700" title="V' + mv.ver + '">✓</span>');
-                } else if (mv.dv >= vThr) {
-                    v36Td.html('<span style="color:#0097a7;font-weight:700" title="V' + mv.ver + ' signaling V' + mv.dv + '">⇧</span>');
-                } else if (mv.ver > 0) {
-                    v36Td.html('<span style="color:#dc3545;font-weight:700" title="' + staleVersionTitle(mv.ver) + '">✗</span>');
-                } else {
-                    v36Td.text('-');
-                }
+                var verHtml = c2pPayoutVersionHtml(role, mv, explorerVersionThreshold(), staleVersionTitle(mv.ver));
+                if (verHtml) v36Td.html(verHtml); else v36Td.text('-');
                 tr.append('td')
                     .style('text-align', 'right')
                     .attr('class', 'amount')
@@ -6039,6 +6245,9 @@
                     }
                     self.shares = data.shares;
                     self.myAddress = data.my_address || '';
+                    // Node-owner fee payee as a hash160 (LTC; "" without --fee).
+                    // Used only to mark the owner's tile in the PPLNS view.
+                    self.feeHash160 = typeof data.fee_hash160 === 'string' ? data.fee_hash160 : '';
                     // Build the self-identity set: single my_address ∪ the
                     // my_addresses array (node-owner ∪ local stratum workers).
                     // Backward-compatible — a lane emitting only my_address
@@ -6241,9 +6450,13 @@
                     var x = ml + col * step;
                     var y = row * step;
 
-                    // Fill color
+                    // Fill color. With the PPLNS view on, a miner pinned or
+                    // hovered there keeps full colour and the rest dim.
+                    var dimCell = !!this.focusMiner && share.m !== this.focusMiner;
+                    if (dimCell) ctx.globalAlpha = 0.25;
                     ctx.fillStyle = this.getColor(share);
                     ctx.fillRect(x, y, cs, cs);
+                    if (dimCell) ctx.globalAlpha = 1;
 
                     var isLtcBlock = c2pIsBlockShare(this.blockSet, share);
                     var isDogeBlock = !!this.dogeSet[share.h];
@@ -6318,6 +6531,9 @@
                     // Update data
                     self.shares = data.shares;
                     self.myAddress = data.my_address || '';
+                    // Node-owner fee payee as a hash160 (LTC; "" without --fee).
+                    // Used only to mark the owner's tile in the PPLNS view.
+                    self.feeHash160 = typeof data.fee_hash160 === 'string' ? data.fee_hash160 : '';
                     // Build the self-identity set: single my_address ∪ the
                     // my_addresses array (node-owner ∪ local stratum workers).
                     // Backward-compatible — a lane emitting only my_address
@@ -7024,6 +7240,9 @@
                 if (idx !== this.hoveredIdx) {
                     var prevIdx = this.hoveredIdx;
                     this.hoveredIdx = idx;
+                    if (window.c2pSelectionBus) {
+                        window.c2pSelectionBus.hover(idx >= 0 && this.shares[idx] ? this.shares[idx].m : null, 'grid');
+                    }
                     this.render();
 
                     if (idx >= 0) {
@@ -7364,86 +7583,11 @@
                 return ((hash % 360) + 360) % 360;
             },
 
-            // Squarified treemap: place items into rows trying to keep aspect ratio ~1
+            // Squarified treemap of the per-share PPLNS (shared C2PLayout
+            // squarify, keeping this view's 1 px minimum strip).
             treemap: function(data, x, y, w, h) {
-                var rects = [];
-                var items = data.map(function(d) { return { addr: d.addr, pct: d.pct, area: d.pct }; });
-                this._layoutRow(items, x, y, w, h, rects);
-                return rects;
-            },
-
-            _layoutRow: function(items, x, y, w, h, rects) {
-                if (items.length === 0) return;
-                var totalArea = 0;
-                items.forEach(function(it) { totalArea += it.area; });
-                if (totalArea <= 0) return;
-
-                // Lay out along the shorter axis
-                var vertical = w >= h;
-                var mainSize = vertical ? h : w;
-                var crossSize = vertical ? w : h;
-
-                var row = [];
-                var rowArea = 0;
-                var remaining = items.slice();
-
-                while (remaining.length > 0) {
-                    row.push(remaining[0]);
-                    rowArea += remaining[0].area;
-                    remaining.shift();
-
-                    if (remaining.length === 0) break;
-
-                    // Check if adding next item worsens aspect ratio
-                    var nextArea = rowArea + remaining[0].area;
-                    var rowFraction = rowArea / totalArea;
-                    var nextFraction = nextArea / totalArea;
-                    var stripSize = rowFraction * crossSize;
-                    var nextStripSize = nextFraction * crossSize;
-
-                    var worstCurrent = this._worstAspect(row, rowArea, stripSize, mainSize, totalArea);
-                    var testRow = row.concat([remaining[0]]);
-                    var worstNext = this._worstAspect(testRow, nextArea, nextStripSize, mainSize, totalArea);
-
-                    if (worstNext > worstCurrent && row.length >= 1) {
-                        // Current row is better, lay it out
-                        break;
-                    }
-                }
-
-                // Lay out the row
-                var rowFraction = rowArea / totalArea;
-                var stripSize = Math.max(1, rowFraction * crossSize);
-                var offset = 0;
-                for (var i = 0; i < row.length; i++) {
-                    var itemFraction = row[i].area / rowArea;
-                    var itemSize = itemFraction * mainSize;
-                    if (vertical) {
-                        rects.push({ x: x, y: y + offset, w: stripSize, h: itemSize, addr: row[i].addr, pct: row[i].pct });
-                    } else {
-                        rects.push({ x: x + offset, y: y, w: itemSize, h: stripSize, addr: row[i].addr, pct: row[i].pct });
-                    }
-                    offset += itemSize;
-                }
-
-                // Recurse on remaining
-                if (remaining.length > 0) {
-                    if (vertical) {
-                        this._layoutRow(remaining, x + stripSize, y, w - stripSize, h, rects);
-                    } else {
-                        this._layoutRow(remaining, x, y + stripSize, w, h - stripSize, rects);
-                    }
-                }
-            },
-
-            _worstAspect: function(row, rowArea, stripSize, mainSize, totalArea) {
-                var worst = 0;
-                for (var i = 0; i < row.length; i++) {
-                    var itemSize = (row[i].area / rowArea) * mainSize;
-                    var aspect = Math.max(itemSize / stripSize, stripSize / itemSize);
-                    if (aspect > worst) worst = aspect;
-                }
-                return worst;
+                return c2pSquarify(data.map(function(d) { return { area: d.pct, data: d }; }), x, y, w, h)
+                    .map(function(r) { return { x: r.x, y: r.y, w: r.w, h: r.h, addr: r.data.addr, pct: r.data.pct }; });
             },
 
             bitsToDifficulty: function(bits) {
@@ -7557,12 +7701,9 @@
         // (c2pool-explorer-plugin-architecture.md §16.2) says the
         // inline path stays until pixel-diff parity is confirmed.
         //
-        // Known limitations while the flag is on:
-        //   - Right-hand stats panel stays at "-" (bundled path does
-        //     not yet update #defrag-total etc).
-        //   - RealTime toggle button is inert (bundled is always live).
-        //   - Hover-zoom + per-share PPLNS treemap not yet ported.
-        // These land in subsequent Phase B commits.
+        // With the flag on, the bootstrap at the end of this file wires
+        // the stats panel (Phase B #10), the per-share PPLNS hover zoom
+        // (#12) and the RealTime toggle (#13) to the bundled renderer.
         window.__c2pBundledExplorer = (function() {
             try {
                 var p = new URLSearchParams(location.search);
@@ -7580,6 +7721,119 @@
             });
             console.info('[c2pool] bundled Explorer enabled — inline defrag disarmed');
         }
+
+        // BEGIN c2pFluidGrid
+        // "Fluid (experimental)": the share-chain grid on the scene engine
+        // (dist/scene.js). Opt-in with ?explorer-anim=fluid or the
+        // Animation chip (localStorage c2p_explorer_anim); Classic stays
+        // the default. Classic's data pipeline (window, SSE deltas, stats)
+        // is reused unchanged: render / _animate3D feed the engine view
+        // instead of drawing on the canvas, and hover reuses Classic's
+        // tooltip and PPLNS zoom. Grid and PPLNS treemap share one
+        // selection bus (window.c2pSelectionBus).
+        function c2pExplorerAnim() {
+            try {
+                var q = new URLSearchParams(location.search);
+                if (q.has('explorer-anim')) return q.get('explorer-anim') === 'fluid' ? 'fluid' : 'classic';
+            } catch (e) { /* old browser */ }
+            try { return localStorage.getItem('c2p_explorer_anim') === 'fluid' ? 'fluid' : 'classic'; }
+            catch (e) { return 'classic'; }
+        }
+        function c2pSetExplorerAnim(mode) {
+            try { localStorage.setItem('c2p_explorer_anim', mode === 'fluid' ? 'fluid' : 'classic'); } catch (e) { /* private mode */ }
+            try {
+                var u = new URL(location.href);
+                u.searchParams.delete('explorer-anim');
+                location.href = u.toString();
+            } catch (e) { location.reload(); }
+        }
+        var _fluidP = null;
+        function c2pOffChainTip(mod, cell, ev) {
+            var tip = defrag.tooltip;
+            if (!tip) return;
+            while (tip.firstChild) tip.removeChild(tip.firstChild);
+            mod.offChainLines(cell.block, Date.now() / 1000).forEach(function(line, i) {
+                var d = document.createElement('div');
+                d.textContent = line;
+                if (i === 0) { d.style.fontWeight = '700'; d.style.color = '#ffd700'; }
+                else if (i > 1) { d.style.color = 'var(--text-muted)'; d.style.wordBreak = 'break-all'; }
+                tip.appendChild(d);
+            });
+            if (defrag.zoomPanel) defrag.zoomPanel.style.display = 'none';
+            tip.style.display = 'block';
+            var x = ev.clientX + 14, y = ev.clientY + 14;
+            if (x + 330 > window.innerWidth) x = ev.clientX - 334;
+            if (y + tip.offsetHeight + 8 > window.innerHeight) y = ev.clientY - tip.offsetHeight - 14;
+            tip.style.left = Math.max(8, x) + 'px';
+            tip.style.top = Math.max(8, y) + 'px';
+        }
+        function c2pFluidMount() {
+            if (_fluidP) return _fluidP;
+            _fluidP = import('./sharechain-explorer/dist/scene.js?v=3cc57625').then(function(mod) {
+                var canvas = document.getElementById('defrag-canvas');
+                var wrap = canvas.parentElement;
+                canvas.style.display = 'none';
+                if (getComputedStyle(wrap).position === 'static') wrap.style.position = 'relative';
+                var host = document.createElement('div');
+                host.id = 'defrag-fluid';
+                host.style.cssText = 'position:absolute;inset:0';
+                wrap.appendChild(host);
+                if (!window.c2pSelectionBus) window.c2pSelectionBus = mod.createSelectionBus();
+                var view = mod.mountSharechainGrid({
+                    container: host,
+                    bus: window.c2pSelectionBus,
+                    colorOf: function(s) { return defrag.getColor(s); },
+                    blockKindOf: function(s) {
+                        return blockMarkKind(c2pIsBlockShare(defrag.blockSet, s), !!defrag.dogeSet[s.h]);
+                    },
+                    onHover: function(s, ev) {
+                        if (s && mod.isOffChainCell(s)) c2pOffChainTip(mod, s, ev);
+                        else if (s) { defrag.showTooltip(s, ev); defrag.showZoom(s, ev); }
+                        else defrag.hideTooltip();
+                    },
+                    onClick: function(s) {
+                        if (mod.isOffChainCell(s)) {
+                            // http(s) only: the URL is a server field.
+                            var u = mod.safeExplorerUrl(s.block.explorer_url);
+                            if (u) window.open(u, '_blank', 'noopener');
+                        } else if (s.H) window.open('share.html#' + s.H, '_blank');
+                    }
+                });
+                return { mod: mod, view: view };
+            });
+            return _fluidP;
+        }
+        (function() {
+            var mode = c2pExplorerAnim();
+            var chip = document.getElementById('anim-' + mode);
+            if (chip) { chip.style.fontWeight = '700'; chip.style.color = 'var(--primary)'; }
+            if (window.__c2pBundledExplorer || mode !== 'fluid') return;
+            var classicRender = defrag.render, classicAnimate = defrag._animate3D;
+            window.c2pFluidActive = true;
+            defrag.render = function() {
+                c2pFluidMount().then(function(f) {
+                    var ci = (typeof currency_info !== 'undefined' && currency_info) || {};
+                    // ▣: ledger blocks whose share is off the best sharechain
+                    // (the same rows "Blocks in Window" counts as off-chain).
+                    f.view.update(defrag.shares, {
+                        offChain: f.mod.offChainBlocks(window.c2pRecentBlocks, defrag.shares, ci.symbol || 'COIN')
+                    });
+                })
+                    .catch(function(err) {
+                        // scene.js unavailable: fall back to Classic for good.
+                        console.error('[c2pool] Fluid grid failed to load; using Classic', err);
+                        window.c2pFluidActive = false;
+                        defrag.render = classicRender;
+                        defrag._animate3D = classicAnimate;
+                        var c = document.getElementById('defrag-canvas');
+                        if (c) c.style.display = '';
+                        defrag.render();
+                    });
+            };
+            // The engine animates arrivals and departures itself.
+            defrag._animate3D = function() { defrag._oldPositions = {}; defrag.render(); };
+        })();
+        // END c2pFluidGrid
 
         // Initialize defrag viewer on page load (no-op when flag on).
         defrag.init();
@@ -7723,41 +7977,17 @@
                 var w = grid.clientWidth;
                 var h = Math.max(grid.clientHeight, 240);
 
-                // Squarified treemap layout (standalone — carries all fields)
-                var rects = [];
-                var items = entries.map(function(d) { return { addr:d.addr, pct:d.pct, amt:d.amt, doge:d.doge, dogeAddr:d.dogeAddr, area:d.pct }; });
-                function tmLayout(items, x, y, w, h) {
-                    if (!items.length || w <= 0 || h <= 0) return;
-                    var tot = 0; items.forEach(function(it) { tot += it.area; });
-                    if (tot <= 0) return;
-                    var vert = w >= h, main = vert ? h : w, cross = vert ? w : h;
-                    var row = [], rowA = 0, rem = items.slice();
-                    while (rem.length) {
-                        row.push(rem[0]); rowA += rem[0].area; rem.shift();
-                        if (!rem.length) break;
-                        var sNow = (rowA/tot)*cross, sNext = ((rowA+rem[0].area)/tot)*cross;
-                        var wNow = 0, wNext = 0;
-                        row.forEach(function(r) { var s=(r.area/rowA)*main; var a=Math.max(s/sNow,sNow/s); if(a>wNow)wNow=a; });
-                        var testRow = row.concat([rem[0]]), testA = rowA+rem[0].area;
-                        testRow.forEach(function(r) { var s=(r.area/testA)*main; var a=Math.max(s/sNext,sNext/s); if(a>wNext)wNext=a; });
-                        if (wNext > wNow && row.length >= 1) break;
-                    }
-                    var strip = Math.max(1, (rowA/tot)*cross), off = 0;
-                    for (var i = 0; i < row.length; i++) {
-                        var sz = (row[i].area/rowA)*main;
-                        var r = vert
-                            ? { x:x, y:y+off, w:strip, h:sz }
-                            : { x:x+off, y:y, w:sz, h:strip };
-                        r.addr=row[i].addr; r.pct=row[i].pct; r.amt=row[i].amt; r.doge=row[i].doge; r.dogeAddr=row[i].dogeAddr;
-                        rects.push(r);
-                        off += sz;
-                    }
-                    if (rem.length) {
-                        if (vert) tmLayout(rem, x+strip, y, w-strip, h);
-                        else tmLayout(rem, x, y+strip, w, h-strip);
-                    }
+                // Squarified treemap layout (shared C2PLayout squarify).
+                if (!c2pLayoutReady()) {
+                    grid.innerHTML = '<div style="padding:12px;color:#ff6b6b">'
+                        + 'Treemap layout module failed to load (sharechain-explorer/dist/layout.js).</div>';
+                    return;
                 }
-                tmLayout(items, 0, 0, w, h);
+                var rects = c2pSquarify(entries.map(function(d) { return { area: d.pct, data: d }; }), 0, 0, w, h)
+                    .map(function(r) {
+                        var d = r.data;
+                        return { x: r.x, y: r.y, w: r.w, h: r.h, addr: d.addr, pct: d.pct, amt: d.amt, doge: d.doge, dogeAddr: d.dogeAddr };
+                    });
 
                 var addrPrefix = (typeof currency_info !== 'undefined' && currency_info.address_explorer_url_prefix)
                     ? currency_info.address_explorer_url_prefix : 'https://blockchair.com/litecoin/address/';
@@ -7934,7 +8164,116 @@
         // retry above. Keeps the existing #pplns-loading placeholder visible
         // (renderMainPPLNS only hides it on success).
         var _pplnsLoadMaxRetries = 3;
+
+        // BEGIN c2pPplnsView
+        // Interactive PPLNS treemap on the scene engine (dist/scene.js),
+        // opt-in with ?pplns-view=1 or localStorage c2p_pplns_view=1.
+        // Tile weight = /current_payouts (what the payout code pays);
+        // merged children from /current_merged_payouts; ★ = addresses this
+        // node's stratum serves; ⚑ = the node owner (explicit address, or
+        // the window's fee_hash160); ◇ = an explicit donation address only.
+        // Hover/pin link with the share-chain grid through one bus.
+        function c2pPplnsViewEnabled() {
+            try {
+                var q = new URLSearchParams(location.search);
+                if (q.has('pplns-view')) return q.get('pplns-view') !== '0';
+            } catch (e) { /* old browser */ }
+            try { return localStorage.getItem('c2p_pplns_view') === '1'; } catch (e) { return false; }
+        }
+        var _pplnsViewP = null;
+        var _pplnsFacts = null;
+        function c2pPplnsFacts() {
+            var shares = (defrag && defrag.shares) || [];
+            var n = shares.length, counts = {}, last = {};
+            for (var i = 0; i < n; i++) {
+                var s = shares[i];
+                if (!s || !s.m) continue;
+                counts[s.m] = (counts[s.m] || 0) + 1;
+                if (typeof s.t === 'number' && !(last[s.m] >= s.t)) last[s.m] = s.t;
+            }
+            var nowS = Date.now() / 1000;
+            return function(addr) {
+                var out = {};
+                if (n > 0) { out.shares = counts[addr] || 0; out.countFraction = (counts[addr] || 0) / n; }
+                if (last[addr]) out.lastShareAgeS = Math.max(0, nowS - last[addr]);
+                var hr = defrag.minerHashrates ? defrag.minerHashrates[addr] : 0;
+                if (hr > 0) out.hashrate = format_hashrate(hr);
+                var mv = getMinerVersion(addr);
+                if (mv && mv.ver) out.version = (mv.dv && mv.dv !== mv.ver) ? ('V' + mv.ver + ' \u2192 V' + mv.dv) : ('V' + mv.ver);
+                return out;
+            };
+        }
+        function c2pPplnsViewMount() {
+            if (_pplnsViewP) return _pplnsViewP;
+            _pplnsViewP = import('./sharechain-explorer/dist/scene.js?v=3cc57625').then(function(mod) {
+                var ci = (typeof currency_info !== 'undefined' && currency_info) || {};
+                var grid = document.getElementById('pplns-main-grid');
+                grid.innerHTML = '';
+                var bus = window.c2pSelectionBus || mod.createSelectionBus();
+                window.c2pSelectionBus = bus;
+                var child = (ci.merged_child_symbol || '').toUpperCase();
+                var opts = {
+                    container: grid,
+                    symbol: ci.symbol || 'COIN',
+                    bus: bus,
+                    facts: function(a) { return _pplnsFacts ? _pplnsFacts(a) : undefined; },
+                    addressUrl: function(a) {
+                        return ci.address_explorer_url_prefix ? ci.address_explorer_url_prefix + a : undefined;
+                    }
+                };
+                if (child) opts.mergedSymbol = child;
+                var view = mod.mountPplnsTreemap(opts);
+                // A miner pinned (or hovered in the treemap) keeps full
+                // colour in the grid; the rest dim.
+                bus.subscribe(function(st) {
+                    var focus = st.pinned || (st.source !== 'grid' ? st.hover : null);
+                    if (defrag.focusMiner !== focus) {
+                        defrag.focusMiner = focus;
+                        if (typeof defrag.render === 'function') defrag.render();
+                    }
+                });
+                return { mod: mod, view: view };
+            });
+            return _pplnsViewP;
+        }
+        // The three feeds are fetched in parallel. Payouts are required;
+        // merged children and the stratum workers (for ★) are optional,
+        // so a failure there still renders the treemap.
+        function c2pFetchJSON(url) {
+            return new Promise(function(resolve) {
+                d3.json(url, function(d) { resolve(d && typeof d === 'object' ? d : null); });
+            });
+        }
+        function loadPplnsView() {
+            c2pPplnsViewMount().then(function(h) {
+                return Promise.all([
+                    c2pFetchJSON('../current_payouts'),
+                    c2pFetchJSON('../current_merged_payouts'),
+                    c2pFetchJSON('../stratum_stats')
+                ]).then(function(r) {
+                    var payouts = r[0], merged = r[1], ss = r[2];
+                    if (!payouts) return;
+                    var ci = (typeof currency_info !== 'undefined' && currency_info) || {};
+                    var special = { thisNode: h.mod.addressesFromWorkers(ss && ss.workers) };
+                    if (ci.node_owner_address) special.ownerAddresses = [ci.node_owner_address];
+                    if (defrag.feeHash160) special.ownerHash160 = defrag.feeHash160;
+                    if (ci.donation_address) special.donationAddresses = [ci.donation_address];
+                    _pplnsFacts = c2pPplnsFacts();
+                    h.view.update({ payouts: payouts, merged: merged || {} }, special);
+                    var pl = document.getElementById('pplns-loading');
+                    if (pl) pl.style.display = 'none';
+                });
+            }).catch(function(err) {
+                console.error('[c2pool] PPLNS view failed to load', err);
+                var grid = document.getElementById('pplns-main-grid');
+                if (grid) grid.innerHTML = '<div style="padding:12px;color:#ff6b6b">'
+                    + 'PPLNS view failed to load (sharechain-explorer/dist/scene.js).</div>';
+            });
+        }
+        // END c2pPplnsView
+
         function loadMainPPLNS(_attempt) {
+            if (c2pPplnsViewEnabled()) { loadPplnsView(); return; }
             var attempt = _attempt || 0;
             d3.json('../current_merged_payouts', function(payouts) {
                 if (!payouts || typeof payouts !== 'object') {
@@ -8129,7 +8468,7 @@
             
             function tryRender() {
                 loadCount++;
-                if (loadCount === 8) {  // hashrate, worker_count, unique_miner_count, connected_miners, blocks, network_difficulty, local_hash_rate, local_dead_hash_rate
+                if (loadCount === 9) {  // hashrate, worker_count, unique_miner_count, connected_miners, blocks, luck_stats, network_difficulty, local_hash_rate, local_dead_hash_rate
                     graphData = hashrateData;
                     graphMinerData = minerCountData;
                     graphUniqueMinersData = uniqueMinerCountData;
@@ -8197,7 +8536,15 @@
                 blocksData = blocks || [];
                 tryRender();
             });
-            
+
+            // The open round and the period lucks the chart shows
+            // (c2pChartLuck reads window.c2pLuckStats). An older node serves
+            // neither; a failed load keeps the last one.
+            d3.json('../luck_stats', function(luckData) {
+                if (luckData) window.c2pLuckStats = luckData;
+                tryRender();
+            });
+
             // Net Diff follows the period selector through the same binned
             // graph_data source as every other series. The old
             // /network_difficulty?period= ring was sparse (#1140) AND the
@@ -8335,43 +8682,37 @@
 
         // ── CI95 "Effective vs reported" hashrate diagnostic ──────────────────
         // Ported from our p2pool-dash fork's updateHashrateDiagnostic, WITH its
-        // verdict logic corrected.
+        // verdict logic corrected and its interval made exact.
         //
         // MODEL. Block finding is a Poisson process with rate lambda
-        // (blocks/sec). Gamma is conjugate to Poisson, so with a prior
-        // Gamma(a0, b0) centred on the REPORTED hashrate and k blocks found over
-        // windowSec seconds, the posterior is Gamma(a0+k, b0+windowSec) in
-        // closed form. The 95% band is the normal approximation mean +/- 1.96 sd
-        // clipped at 0, converted back to H/s via netDiff * 2^32.
+        // (blocks/sec). With k blocks found over windowSec seconds, the exact
+        // (Garwood) 95% confidence interval of lambda * windowSec is
+        // [chi2(.025; 2k) / 2, chi2(.975; 2k + 2) / 2], i.e. Gamma quantiles
+        // (c2pEffectiveHashrateCI), converted to H/s via netDiff * 2^32.
+        // No prior: the fork's Gamma(5, .) prior centred on the REPORTED
+        // hashrate pulled the band toward the very figure it was testing, and
+        // its normal approximation was off at the small k this runs at.
         //
         // The reported hashrate is what the miners CLAIM; the band is what the
         // blocks they actually found IMPLY. It answers "are the rigs delivering
         // the hashrate they claim?" -- a misconfiguration / fraud detector. A
-        // 95% band on LUCK would be [~27%, ~3950%] and useless; a band on
-        // effective hashrate over shares/blocks is tight enough to act on.
+        // 95% band on the LUCK of one block would be [~27%, ~3950%] and
+        // useless; a band on effective hashrate over the window's blocks is
+        // tight enough to act on.
         //
         // Every input is already fetched by the dashboard (bucket-a).
         function updateHashrateDiagnostic(containerId, avgHashrate, blocksInWindow, windowSec, netDiff, labelPrefix) {
             var el = document.getElementById(containerId);
             if (!el) return;
-            if (!netDiff || netDiff <= 0 || !windowSec || windowSec <= 0) {
+            var k = blocksInWindow;
+            var band = c2pEffectiveHashrateCI(k, windowSec, netDiff);
+            if (!band) {
                 el.textContent = labelPrefix + 'Not enough data yet';
                 el.style.color = 'var(--text-muted)';
                 return;
             }
-            var blockHashes = netDiff * 4294967296; // 2^32 expected hashes/block
             var reported = avgHashrate || 0;
-            var k = blocksInWindow;
-            var expectedLambdaPrior = (reported > 0) ? (reported / blockHashes) : 0.0000001;
-            var alpha0 = 5;                                  // prior strength ~5 blocks
-            var beta0  = (expectedLambdaPrior > 0) ? (alpha0 / expectedLambdaPrior) : 1e9;
-            var alpha  = alpha0 + k;
-            var beta   = beta0 + windowSec;
-            var meanLambda = alpha / beta;
-            var stdLambda  = Math.sqrt(alpha / (beta * beta));
-            var z = 1.96;
-            var effLow  = Math.max(0, meanLambda - z * stdLambda) * blockHashes;
-            var effHigh = (meanLambda + z * stdLambda) * blockHashes;
+            var effLow = band.low, effHigh = band.high;
 
             var statusText = labelPrefix + 'CI95 ' + format_hashrate(effLow) + ' \u2013 ' +
                              format_hashrate(effHigh) + ' vs reported ' + format_hashrate(reported);
@@ -8404,6 +8745,1120 @@
             el.style.color = color;
         }
 
+        // BEGIN c2pLuck (tested by sharechain-explorer/tests/unit/dashboard-luck-*.test.ts)
+        // Pool luck on the effort model.
+        //
+        // The effort of a round is the number of blocks expected over it:
+        // time taken / expected time. Under 1 the round was faster than
+        // expected. For a fair pool it is Exp(1): mean 1, median 0.69, and no
+        // memory. Per-block luck = 100 / effort is a per-block figure only.
+        // It is never averaged: E[1 / effort] is infinite, so a mean of
+        // per-block lucks reads far above 100 % for a fair pool. Every figure
+        // over several rounds is pooled, blocks found / blocks expected
+        // = k / sum(effort), the open round's effort so far included.
+        //
+        // Where the node's rate history covers a round only in part, the row's
+        // effort is the covered integral scaled up to the whole round (its
+        // best estimate for that round), and a pooled figure extrapolates
+        // nothing: it takes the covered integral alone, and leaves out a block
+        // found while the history was not watching. The periods, the Luck
+        // series and the fallback periods all pool that way (c2pRoundShare).
+        //
+        // The node serves `effort` per row, and `periods` and `current_round`
+        // in /luck_stats. An older node serves none of them: the effort of a
+        // row is then its time_to_find / expected_time when both are there,
+        // and unknown (a dash) when they are not. Nothing here falls back to
+        // a mean of per-block luck.
+        var C2P_FAST = 1 / 3, C2P_VERY_FAST = 0.1, C2P_SLOW = 2, C2P_VERY_SLOW = 3, C2P_DRY_HINT = 5;
+        // An integrated effort is the covered integral scaled up to the whole
+        // round. With under this share of the round covered it is mostly
+        // extrapolation: the value is shown, muted, and the round gets no
+        // fast / slow tag and closes no duplet; the open round is called no
+        // dry spell and gets no dry-spell band. The node takes another
+        // node's figure (--import-found-blocks) only at or above the same
+        // share (core::luck::kImportedCoverageFloor).
+        var C2P_MIN_TAG_COVERAGE = 0.5;
+        var C2P_TREND_ROUNDS = 10;
+        var C2P_LUCK_CAP = 1000;
+        var C2P_LUCK_SAMPLES = 16;
+        var C2P_PERIODS = [['1d', 86400], ['7d', 604800], ['30d', 2592000], ['90d', 7776000], ['all', null]];
+
+        function c2pNum(v) { return typeof v === 'number' && isFinite(v) ? v : null; }
+
+        // ⚡ under 1/3 of the expected time, ⚡⚡ under 0.1; 🐢 over 2x, 🐢🐢
+        // over 3x. The bounds themselves are untagged.
+        function c2pPaceTier(e) {
+            if (!(e > 0)) return '';
+            if (e < C2P_VERY_FAST) return 'fast2';
+            if (e < C2P_FAST) return 'fast';
+            if (e > C2P_VERY_SLOW) return 'slow2';
+            if (e > C2P_SLOW) return 'slow';
+            return '';
+        }
+        function c2pPaceTag(tier) {
+            return tier === 'fast2' ? '⚡⚡' : tier === 'fast' ? '⚡'
+                 : tier === 'slow2' ? '🐢🐢' : tier === 'slow' ? '🐢' : '';
+        }
+        function c2pIsFast(tier) { return tier === 'fast' || tier === 'fast2'; }
+        function c2pIsSlow(tier) { return tier === 'slow' || tier === 'slow2'; }
+        // The colour band of an effort, at the bounds the luck colours always
+        // had: luck >= 100 %, >= 75 %, below.
+        function c2pEffortBand(e) {
+            if (!(e > 0)) return '';
+            return e <= 1 ? 'good' : (e <= 4 / 3 ? 'mid' : 'poor');
+        }
+
+        function c2pFmtX(e) {
+            if (c2pNum(e) === null || e < 0) return '—';
+            if (e > 0 && e < 0.01) return '<0.01×';
+            return (e < 0.095 ? e.toFixed(2) : e < 9.95 ? e.toFixed(1) : e.toFixed(0)) + '×';
+        }
+        function c2pFmtNum(v) {
+            if (c2pNum(v) === null || v < 0) return '—';
+            if (v === 0) return '0';
+            return v >= 9.95 ? v.toFixed(0) : v >= 0.95 ? v.toFixed(1) : v.toFixed(2);
+        }
+        function c2pFmtPct(v) { return c2pNum(v) !== null && v >= 0 ? c2pFmtNum(v) + '%' : '—'; }
+        // Odds, from a probability: "28", "13.5", "0.67".
+        function c2pFmtOdds(p) {
+            var v = p * 100;
+            return v >= 20 ? v.toFixed(0) : v >= 1 ? v.toFixed(1) : v.toFixed(2);
+        }
+        function c2pFmtDur(s) {
+            if (c2pNum(s) === null || s < 0) return '?';
+            var d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600);
+            var m = Math.floor((s % 3600) / 60), sec = Math.floor(s % 60);
+            if (d > 0) return d + 'd ' + h + 'h';
+            if (h > 0) return h + 'h ' + m + 'm';
+            if (m > 0) return m + 'm ' + sec + 's';
+            return sec + 's';
+        }
+
+        function c2pRowChain(b) { return String(b.chain || b.symbol || b.network || '').toUpperCase(); }
+        function c2pRowHash(b) { return (b && (b.hash || b.pow_hash)) || ''; }
+        function c2pRowHeight(b) { return b.height != null ? b.height : b.number; }
+        // Off the coin chain. The node says so in `main_chain`: false on an
+        // orphaned or stale row, on a find that never confirmed, and on a
+        // merged block the aux chain refused. Without it: a merged submit
+        // that was refused (`accepted` false), an orphaned or stale status,
+        // and a merged row's orphan mark, verified === false. A refused
+        // merged submit that is none of these (verified null on a node
+        // without `main_chain`) cannot be told from a block.
+        function c2pRowOffChain(b) {
+            if (typeof b.main_chain === 'boolean') return !b.main_chain;
+            if (b.accepted === false) return true;
+            if (b.status === 'orphaned' || b.status === 'stale') return true;
+            return b.status == null && b.verified === false;
+        }
+
+        // The part of an effort the rate history covers: what a pooled figure
+        // counts. The node's own figure when it serves one; else, for an
+        // integrated effort, effort * history_coverage (the effort is the
+        // covered integral * round / covered); else all of it (a single
+        // sample, the first block's 1, an older node's time_to_find /
+        // expected_time).
+        function c2pCoveredEffort(effort, method, coverage, served) {
+            var own = c2pNum(served);
+            if (own !== null && own >= 0) return own;
+            return c2pIntegratedMethod(method) && c2pNum(coverage) !== null ? effort * coverage : effort;
+        }
+        // An integral over a rate history: this node's own ('integrated'), or
+        // that of the node the history was imported from ('imported', where
+        // it covers more of the round; history_coverage is then that node's).
+        function c2pIntegratedMethod(method) {
+            return method === 'integrated' || method === 'imported';
+        }
+        // Whether an effort is mostly extrapolation: integrated over a rate
+        // history that covers less than C2P_MIN_TAG_COVERAGE of the round. A
+        // single sample, the first block and an older node's row are not
+        // scaled up from a part, and carry no coverage to judge by.
+        function c2pLowCoverage(method, coverage) {
+            return c2pIntegratedMethod(method) && c2pNum(coverage) !== null && coverage < C2P_MIN_TAG_COVERAGE;
+        }
+        // The note on an effort measured by the source node of an import.
+        function c2pImportedNote(p) {
+            if (!p || p.method !== 'imported') return '';
+            return 'Measured by the source node of this node\'s imported block history ' +
+                '(--import-found-blocks): its pool hashrate history covers ' +
+                (p.coverage !== null ? Math.round(p.coverage * 100) + ' %' : 'part') +
+                ' of the round, more than this node\'s own does. The pool hashrate is the share chain\'s, ' +
+                'the same on every node, so its figure stands for the pool.';
+        }
+        // The small mark after an imported effort, with that note as its tooltip.
+        function c2pImportedMark(td, p) {
+            if (!p || p.method !== 'imported' || p.effort === null) return;
+            td.append('span').attr('class', 'effort-imported')
+                .attr('title', c2pImportedNote(p))
+                .text('⇣');
+        }
+        // What a round adds to a pooled figure: its covered effort to the
+        // blocks expected, and its block to the blocks found unless it was
+        // found in a gap of the history (`measured` false).
+        function c2pRoundShare(r) {
+            return { expected: c2pNum(r.covered) !== null ? r.covered : r.effort, found: r.measured === false ? 0 : 1 };
+        }
+
+        // The pace of every ledger row (/recent_blocks, /recent_merged_blocks),
+        // keyed by block hash, and the rounds of each chain, oldest first.
+        // A round ends at a main-chain block; rows off the chain (orphaned,
+        // stale, never confirmed) are never a round, a tag, a duplet member or
+        // a predecessor: the effort the node serves on one is kept for
+        // display only (offEffort). Chains are never mixed. `sym` names the
+        // chain whose rounds are returned as
+        // `rounds` (the chain with the most rows when it is not there);
+        // `noEffort` has the times of its main-chain rows with no effort.
+        //
+        // effort: the row's own `effort`; else 1 for the node's first block
+        // (it has no earlier block to time its round from and counts as
+        // 100 %); else time_to_find / expected_time; else null.
+        // An older node times a round from the previous ledger row, orphans
+        // included: when that row is an orphan and the served time_to_find
+        // is the gap to it, the round is timed from the previous main-chain
+        // block instead.
+        // duplet: a fast block (effort under 1/3) and the main-chain block
+        // before it. The first block, a row with no effort and a round the
+        // rate history covers for under C2P_MIN_TAG_COVERAGE (no tag) close
+        // none.
+        function c2pBlockPace(rows, sym) {
+            var byHash = {}, lists = {}, chains = {}, lastMain = {}, noEffort = {};
+            (rows || []).forEach(function(b) {
+                if (!b || typeof b.ts !== 'number') return;
+                var h = c2pRowHash(b);
+                if (!h || byHash[h]) return;
+                var c = c2pRowChain(b);
+                byHash[h] = { hash: h, chain: c, ts: b.ts, height: c2pRowHeight(b), offChain: c2pRowOffChain(b),
+                              effort: null, offEffort: null, luck: null, first: false, source: null, method: null,
+                              coverage: null, lowCoverage: false, covered: null, measured: true,
+                              gap: null, expected: null, gapFixed: false, tier: '', tag: '',
+                              prev: null, duplet: null, dupletOpen: null };
+                (lists[c] = lists[c] || []).push(b);
+            });
+            Object.keys(lists).forEach(function(c) {
+                var list = lists[c].sort(function(a, b) {
+                    return a.ts - b.ts || (c2pRowHeight(a) || 0) - (c2pRowHeight(b) || 0);
+                });
+                var rounds = chains[c] = [], unknown = noEffort[c] = [];
+                var prevMain = null, prevRow = null;
+                list.forEach(function(b) {
+                    var p = byHash[c2pRowHash(b)];
+                    var eff = c2pNum(b.effort), ttf = c2pNum(b.time_to_find), exp = c2pNum(b.expected_time);
+                    if (p.offChain) {
+                        if (eff !== null && eff > 0) p.offEffort = eff;
+                        prevRow = b;
+                        return;
+                    }
+                    if (eff !== null && eff > 0) {
+                        p.effort = eff;
+                        p.source = 'server';
+                        p.method = b.effort_method || null;
+                        p.first = b.effort_method === 'first_block';
+                        p.gap = ttf > 0 ? ttf : null;
+                    } else if (b.effort_method === 'first_block' || b.luck_method === 'first_block') {
+                        p.effort = 1;
+                        p.first = true;
+                        p.source = 'first_block';
+                        p.method = 'first_block';
+                    } else if (ttf > 0 && exp > 0) {
+                        p.gap = ttf;
+                        if (prevRow && prevMain && c2pRowOffChain(prevRow) && b.ts - prevMain.ts > 0 &&
+                                Math.abs(ttf - (b.ts - prevRow.ts)) <= 2) {
+                            p.gap = b.ts - prevMain.ts;
+                            p.gapFixed = true;
+                        }
+                        p.effort = p.gap / exp;
+                        p.source = 'client';
+                        p.method = 'single_sample';
+                    }
+                    p.expected = exp > 0 ? exp : null;
+                    p.coverage = c2pNum(b.history_coverage);
+                    if (p.effort !== null) {
+                        p.luck = 100 / p.effort;
+                        p.lowCoverage = c2pLowCoverage(p.method, p.coverage);
+                        if (!p.first && !p.lowCoverage) p.tier = c2pPaceTier(p.effort);
+                        p.tag = c2pPaceTag(p.tier);
+                        p.covered = c2pCoveredEffort(p.effort, p.method, p.coverage, b.effort_covered);
+                        p.measured = b.measured !== false;
+                        rounds.push({ ts: b.ts, effort: p.effort, first: p.first, hash: p.hash, height: p.height, gap: p.gap,
+                                      covered: p.covered, measured: p.measured, low: p.lowCoverage });
+                    } else {
+                        unknown.push(b.ts);
+                    }
+                    // The round's start: the block the node names, else the
+                    // previous main-chain row by time.
+                    var prev = b.prev_block_hash ? byHash[b.prev_block_hash] : (prevMain ? byHash[c2pRowHash(prevMain)] : null);
+                    if (prev && (prev.offChain || prev.chain !== c || prev.hash === p.hash)) prev = null;
+                    if (prev) p.prev = prev.hash;
+                    if (prev && c2pIsFast(p.tier) && (prev.height == null || prev.height !== p.height)) {
+                        // The wait before the pair is quoted only when it was measured.
+                        var measured = prev.effort !== null && !prev.first && !prev.lowCoverage;
+                        p.duplet = {
+                            'with': prev.hash,
+                            withHeight: prev.height,
+                            gap: b.ts - prev.ts > 0 ? b.ts - prev.ts : p.gap,
+                            prevEffort: measured ? prev.effort : null,
+                            kind: measured && prev.effort > C2P_SLOW ? 'dry' : (c2pIsFast(prev.tier) ? 'triple' : 'plain')
+                        };
+                        prev.dupletOpen = p.hash;
+                    }
+                    prevMain = b;
+                    prevRow = b;
+                });
+                lastMain[c] = prevMain;
+            });
+            var want = String(sym || '').toUpperCase(), pick = chains[want] ? want : null;
+            if (pick === null) {
+                Object.keys(lists).forEach(function(c) {
+                    if (pick === null || lists[c].length > lists[pick].length) pick = c;
+                });
+            }
+            return { byHash: byHash, chains: chains, chain: pick,
+                     rounds: (pick !== null && chains[pick]) || [],
+                     noEffort: (pick !== null && noEffort[pick]) || [],
+                     lastMain: (pick !== null && lastMain[pick]) || null };
+        }
+
+        // ln Gamma(x), x > 0: shifted up to x >= 10, then Stirling's series.
+        function c2pLogGamma(x) {
+            var shift = 0;
+            while (x < 10) { shift += Math.log(x); x += 1; }
+            var x2 = x * x;
+            return (x - 0.5) * Math.log(x) - x + 0.9189385332046727 - shift
+                 + 1 / (12 * x) - 1 / (360 * x * x2) + 1 / (1260 * x * x2 * x2) - 1 / (1680 * x * x2 * x2 * x2);
+        }
+        // The regularised lower incomplete gamma function P(a, x): the series
+        // below a + 1, the continued fraction of Q above.
+        function c2pGammaP(a, x) {
+            if (!(x > 0)) return 0;
+            var front = Math.exp(a * Math.log(x) - x - c2pLogGamma(a)), i;
+            if (x < a + 1) {
+                var ap = a, del = 1 / a, sum = del;
+                for (i = 0; i < 100000; i++) {
+                    ap += 1;
+                    del *= x / ap;
+                    sum += del;
+                    if (del < sum * 1e-16) break;
+                }
+                return Math.min(1, sum * front);
+            }
+            var b = x + 1 - a, c = 1e300, d = 1 / b, h = d;
+            for (i = 1; i < 100000; i++) {
+                var an = -i * (i - a);
+                b += 2;
+                d = an * d + b;
+                if (Math.abs(d) < 1e-300) d = 1e-300;
+                c = b + an / c;
+                if (Math.abs(c) < 1e-300) c = 1e-300;
+                d = 1 / d;
+                var step = d * c;
+                h *= step;
+                if (Math.abs(step - 1) < 1e-16) break;
+            }
+            return Math.max(0, 1 - front * h);
+        }
+        // x with P(shape, x) = p: the p-quantile of Gamma(shape, 1), which is
+        // half the chi-squared quantile with 2 * shape degrees of freedom.
+        function c2pGammaQuantile(p, shape) {
+            if (!(shape > 0) || !(p > 0)) return 0;
+            if (p >= 1) return Infinity;
+            var lo = 0, hi = shape + 10 * Math.sqrt(shape) + 40;
+            for (var i = 0; i < 200 && hi - lo > 1e-13 * hi; i++) {
+                var mid = (lo + hi) / 2;
+                if (c2pGammaP(shape, mid) < p) lo = mid; else hi = mid;
+            }
+            return (lo + hi) / 2;
+        }
+        // Exact (Garwood) 95 % interval for a Poisson mean, k events seen:
+        // [chi2(.025; 2k) / 2, chi2(.975; 2k + 2) / 2].
+        function c2pPoissonCI(k) {
+            return { low: k > 0 ? c2pGammaQuantile(0.025, k) : 0, high: c2pGammaQuantile(0.975, k + 1) };
+        }
+        // Luck % and its exact 95 % interval for k blocks found against
+        // `expected` blocks. null when nothing was expected.
+        function c2pLuckOf(k, expected) {
+            if (!(expected > 0) || !(k >= 0)) return null;
+            var ci = c2pPoissonCI(k);
+            return { k: k, blocks_expected: expected, luck: 100 * k / expected,
+                     ci95_low: 100 * ci.low / expected, ci95_high: 100 * ci.high / expected };
+        }
+        // Where the pooled luck of k rounds of a FAIR pool lands 95 % of the
+        // time: k / Gamma(k, 1). 5 blocks: 49-308 %, 30 blocks: 72-148 %.
+        function c2pFairBand(k) {
+            if (!(k >= 1)) return null;
+            return { low: 100 * k / c2pGammaQuantile(0.975, k), high: 100 * k / c2pGammaQuantile(0.025, k) };
+        }
+        // The 95 % interval of the hashrate that k blocks found in windowSec
+        // seconds imply, at netDiff: the exact Poisson interval on the block
+        // rate, times the hashes per block. No prior.
+        function c2pEffectiveHashrateCI(k, windowSec, netDiff) {
+            if (!(windowSec > 0) || !(netDiff > 0) || !(k >= 0)) return null;
+            var ci = c2pPoissonCI(k), perBlock = netDiff * 4294967296;
+            return { low: ci.low / windowSec * perBlock, high: ci.high / windowSec * perBlock };
+        }
+
+        // The open round: {effort, covered_effort (the part of it the rate
+        // history covers: what a pooled figure counts), elapsed (s),
+        // expected_time (s to a block at the current rate), pace_time (s per
+        // pooled expected block over the round so far: elapsed /
+        // covered_effort), lowCoverage (the effort is mostly extrapolation,
+        // c2pLowCoverage), source}.
+        // The node's current_round, its effort integrated over the round;
+        // null there (no main-chain block yet) is no round. An older node has
+        // no such field: its current_luck_trend, which is 100 / effort; else
+        // the round since lastMainTs against fallbackExpected seconds. null
+        // when none works.
+        function c2pOpenRound(luckStats, lastMainTs, nowS, fallbackExpected) {
+            var ls = luckStats || {}, cr = ls.current_round;
+            var sinceLast = lastMainTs > 0 && nowS >= lastMainTs ? nowS - lastMainTs : null;
+            var e, elapsed, expected;
+            if (cr === null && 'current_round' in ls) return null;
+            if (cr && c2pNum(cr.effort) !== null && cr.effort >= 0) {
+                e = cr.effort;
+                elapsed = c2pNum(cr.elapsed) !== null ? cr.elapsed : sinceLast;
+                var covered = c2pCoveredEffort(e, cr.effort_method, cr.history_coverage, cr.effort_covered);
+                expected = cr.expected_time > 0 ? cr.expected_time : (e > 0 && elapsed > 0 ? elapsed / e : null);
+                return { effort: e, covered_effort: covered, elapsed: elapsed, expected_time: expected,
+                         pace_time: covered > 0 && elapsed > 0 ? elapsed / covered : null,
+                         lowCoverage: c2pLowCoverage(cr.effort_method, cr.history_coverage),
+                         source: 'server', since: cr.since_block_hash || null,
+                         method: cr.effort_method || null, coverage: c2pNum(cr.history_coverage) };
+            }
+            if (c2pNum(ls.current_luck_trend) !== null && ls.current_luck_trend > 0) {
+                e = 100 / ls.current_luck_trend;
+                expected = sinceLast !== null ? sinceLast / e : null;
+                return { effort: e, covered_effort: e, elapsed: sinceLast, expected_time: expected, pace_time: expected,
+                         lowCoverage: false, source: 'server_trend', since: null, method: null, coverage: null };
+            }
+            if (sinceLast !== null && fallbackExpected > 0) {
+                e = sinceLast / fallbackExpected;
+                return { effort: e, covered_effort: e, elapsed: sinceLast, expected_time: fallbackExpected,
+                         pace_time: fallbackExpected, lowCoverage: false, source: 'client', since: null, method: null,
+                         coverage: null };
+            }
+            return null;
+        }
+
+        // Pooled luck over the last spanS seconds (over every round when
+        // spanS is null), as the node computes its `periods`: k = the blocks
+        // found in the span, expected = the covered effort of the span's
+        // rounds (c2pRoundShare), each clipped to the span (the round that
+        // straddles its start counts for the part inside, the open round for
+        // its part so far). The fallback for a node that serves no `periods`.
+        // `skipped` counts the blocks left out of k: found in a gap of the
+        // rate history, or with no effort at all (noEffort; such a round adds
+        // nothing). A period with such blocks and no block counted has no
+        // luck to give.
+        function c2pPeriodLuck(rounds, nowS, spanS, open, noEffort) {
+            var k = 0, expected = 0, from = spanS ? nowS - spanS : -Infinity, oldest = null;
+            var skipped = (noEffort || []).filter(function(ts) { return ts >= from; }).length;
+            (rounds || []).forEach(function(r) {
+                if (r.ts < from || !(r.effort > 0)) return;
+                var share = c2pRoundShare(r);
+                k += share.found;
+                skipped += 1 - share.found;
+                expected += r.gap > 0 && r.ts - r.gap < from ? share.expected * (r.ts - from) / r.gap : share.expected;
+                if (oldest === null || r.ts < oldest) oldest = r.ts;
+            });
+            if (k === 0 && skipped > 0) return null;
+            var openEffort = open ? (c2pNum(open.covered_effort) !== null ? open.covered_effort : open.effort) : 0;
+            if (openEffort > 0) {
+                var part = spanS && open.elapsed > spanS ? spanS / open.elapsed : 1;
+                expected += openEffort * part;
+            }
+            var out = c2pLuckOf(k, expected);
+            if (!out) return null;
+            out.span_s = spanS || (oldest !== null ? Math.max(0, nowS - oldest) : null);
+            out.skipped = skipped;
+            out.source = 'client';
+            return out;
+        }
+        // The periods to show: the node's own where it serves them, else
+        // c2pPeriodLuck. {'1d': {k, blocks_expected, luck, ci95_low,
+        // ci95_high, span_s, source} | null, '7d': ..., 'all': ...}. A served
+        // period with no luck or no block count is a dash, not recomputed.
+        function c2pLuckPeriods(luckStats, rounds, nowS, open, noEffort) {
+            var served = (luckStats && luckStats.periods) || {}, out = {};
+            C2P_PERIODS.forEach(function(def) {
+                var s = served[def[0]];
+                if (s && typeof s === 'object') {
+                    out[def[0]] = c2pNum(s.luck) === null || c2pNum(s.k) === null ? null : {
+                        k: s.k, blocks_expected: c2pNum(s.blocks_expected), luck: s.luck,
+                        ci95_low: c2pNum(s.ci95_low), ci95_high: c2pNum(s.ci95_high),
+                        span_s: c2pNum(s.span_s), skipped: c2pNum(s.k_unmeasured) || 0, source: 'server'
+                    };
+                } else {
+                    out[def[0]] = c2pPeriodLuck(rounds, nowS, def[1], open, noEffort);
+                }
+            });
+            return out;
+        }
+
+        // The Round badge of the open round at effort e. `low`: the rate
+        // history covers under C2P_MIN_TAG_COVERAGE of the round, so e is
+        // mostly extrapolation. The figure is shown, muted, and no dry spell
+        // is called on it.
+        function c2pDrySpell(e, low) {
+            if (c2pNum(e) === null || e < 0) return null;
+            var x = c2pFmtX(e);
+            if (low) return { state: 'low', text: 'Round ' + x, background: '#3a3a5a', color: 'var(--text-muted)', hint: false };
+            if (e > C2P_VERY_SLOW) return { state: 'long', text: '🏜️ Long dry spell ' + x, background: '#5b4b8a', hint: e > C2P_DRY_HINT };
+            if (e > C2P_SLOW) return { state: 'dry', text: '🏜️ Dry spell ' + x, background: '#5b4b8a', hint: false };
+            if (e >= 1) return { state: 'over', text: 'Round ' + x, background: '#3a3a5a', hint: false };
+            return { state: 'round', text: 'Round ' + x, background: 'var(--primary)', hint: false };
+        }
+        // The violet band the charts lay over a dry spell: the open round
+        // past 2x, from its start (lastBlkMs, or the window's left edge) to
+        // endMs, with the share of rounds that run at least as long
+        // (e^-effort). None while the round's effort is mostly extrapolation.
+        function c2pDrySpellBands(open, lastBlkMs, minTime, endMs) {
+            if (!open || open.lowCoverage || !(open.effort > C2P_SLOW) || !(endMs > lastBlkMs)) return [];
+            return [{
+                id: 'c2p-dry-spell',
+                from: Math.max(lastBlkMs, minTime),
+                to: endMs,
+                color: 'rgba(167, 139, 250, 0.10)',
+                zIndex: 1,
+                label: {
+                    text: 'dry ' + c2pFmtX(open.effort) + ' · ' + c2pFmtOdds(Math.exp(-open.effort)) + ' % of rounds',
+                    style: { color: '#a78bfa', fontSize: '10px' },
+                    align: 'right', textAlign: 'right', x: -4, y: 12
+                }
+            }];
+        }
+
+        // The hashrate charts' Luck series: the pooled luck of the last
+        // C2P_TREND_ROUNDS rounds, in raw luck % (the caller applies the
+        // display transform). rounds: c2pBlockPace(...).rounds. Each round
+        // from minTime on is a point at blocks found / blocks expected over
+        // the up to N rounds ending at it, pooled as the periods are
+        // (c2pRoundShare: covered effort, and no block for one found in a gap
+        // of the rate history), so the series and the "all" period agree
+        // while the ledger has no more than N rounds. The node's first block,
+        // effort 1, is a point at 100 %. The line starts at minTime with the
+        // value of the last round before the window; nothing is drawn before
+        // the first round there is.
+        // live: the open round {x: end ms, lastBlkMs, expectedMs}, or null.
+        // It is in the pool too: from the last block the series runs on as
+        // n / (expected + elapsed / expectedMs), sampled (no markers) up to
+        // a marked end point. Points are {x, y, n (blocks found), expected,
+        // skipped (blocks left out)}, y capped at C2P_LUCK_CAP.
+        function c2pLuckTrendPoints(rounds, minTime, live, N) {
+            N = N > 0 ? N : C2P_TREND_ROUNDS;
+            rounds = rounds || [];
+            var pts = [], before = null, sum = 0, n = 0, skipped = 0;
+            var point = function(x, expected, extra) {
+                var p = { x: x, y: Math.min(100 * n / expected, C2P_LUCK_CAP), n: n, expected: expected, skipped: skipped };
+                for (var key in extra) p[key] = extra[key];
+                return p;
+            };
+            rounds.forEach(function(r, i) {
+                var lo = Math.max(0, i - N + 1);
+                n = 0;
+                sum = 0;
+                for (var j = lo; j <= i; j++) {
+                    var share = c2pRoundShare(rounds[j]);
+                    n += share.found;
+                    sum += share.expected;
+                }
+                skipped = i - lo + 1 - n;
+                if (!(sum > 0)) return;
+                var t = r.ts * 1000;
+                if (t >= minTime) pts.push(point(t, sum, {}));
+                else before = point(minTime, sum, { marker: { enabled: false } });
+            });
+            if (before) pts.unshift(before);
+            if (!live || !(sum > 0) || !(live.expectedMs > 0)) return pts;
+            var blkMs = live.lastBlkMs, endMs = Math.max(live.x, blkMs), startMs = Math.max(blkMs, minTime);
+            var at = function(x, extra) {
+                extra.open = true;
+                return point(x, sum + Math.max(x - blkMs, 0) / live.expectedMs, extra);
+            };
+            // The round began before the window: the start value has the
+            // part of it that came before minTime.
+            if (blkMs < minTime && before) pts.shift();
+            var lastX = pts.length > 0 ? pts[pts.length - 1].x : -Infinity;
+            if (startMs > lastX) { pts.push(at(startMs, { marker: { enabled: false } })); lastX = startMs; }
+            for (var s = 1; s < C2P_LUCK_SAMPLES; s++) {
+                var x = startMs + (endMs - startMs) * s / C2P_LUCK_SAMPLES;
+                if (x > lastX) { pts.push(at(x, { marker: { enabled: false } })); lastX = x; }
+            }
+            if (endMs > lastX) pts.push(at(endMs, {}));
+            return pts;
+        }
+        // The luck axis: linear to 100 %, log-compressed above it.
+        function c2pLuckDisplay(luck) {
+            return luck <= 100 ? luck : 100 + 100 * Math.log10(1 + (luck - 100) / 100);
+        }
+        function c2pLuckFromDisplay(v) {
+            return v <= 100 ? v : 100 + 100 * (Math.pow(10, (v - 100) / 100) - 1);
+        }
+
+        // The first-cell class of a row in a duplet: the later block of the
+        // pair is the upper row of the newest-first tables.
+        function c2pDupletEdgeClass(p) {
+            if (!p || !(p.duplet || p.dupletOpen)) return null;
+            return 'duplet-edge' + (p.duplet && !p.dupletOpen ? ' duplet-top' : '') +
+                                   (p.dupletOpen && !p.duplet ? ' duplet-bottom' : '');
+        }
+        // The Recent Blocks cell class of a row's effort. The first block's
+        // 100 % is a convention, not a measurement: it keeps the amber it had.
+        function c2pEffortClass(p) {
+            if (p && p.first) return 'status-pending';
+            // Mostly extrapolation: shown, but muted.
+            if (p && p.lowCoverage) return 'effort-unknown';
+            var band = p ? c2pEffortBand(p.effort) : '';
+            return band === 'good' ? 'status-confirmed' : band === 'mid' ? 'status-pending'
+                 : band === 'poor' ? 'status-orphaned' : 'effort-unknown';
+        }
+        // Round duration and expected time of a row, in seconds (0: unknown).
+        function c2pRoundTimes(b, p) {
+            var actual = p && p.gap > 0 ? p.gap : (b.time_to_find > 0 ? b.time_to_find : 0);
+            var expected = 0;
+            if (b.expected_time > 0) expected = b.expected_time;
+            else if (p && p.effort > 0 && !p.first && actual > 0) expected = actual / p.effort;
+            else if (b.network_difficulty > 0 && b.pool_hashrate_at_find > 0)
+                expected = b.network_difficulty * 4294967296 / b.pool_hashrate_at_find;
+            return { actual: actual, expected: expected };
+        }
+        // Tooltip texts. Each gives the Poisson odds of what it names, and
+        // none suggests a pattern: our study of 50,707 blocks found none.
+        function c2pPaceTip(p) {
+            if (!p || !p.tier) return '';
+            if (c2pIsFast(p.tier)) {
+                return '⚡ Fast block: found in ' + c2pFmtX(p.effort) + ' the expected time. About ' +
+                    c2pFmtOdds(1 - Math.exp(-C2P_FAST)) + ' % of blocks come in under ⅓ of it' +
+                    (p.tier === 'fast2' ? ' (' + c2pFmtOdds(1 - Math.exp(-C2P_VERY_FAST)) + ' % under 0.1×)' : '') +
+                    ' by pure chance (Poisson). It does not predict the next block.';
+            }
+            return '🐢 Slow block: took ' + c2pFmtX(p.effort) + ' the expected time. About ' +
+                c2pFmtOdds(Math.exp(-C2P_SLOW)) + ' % of blocks take over 2× (' +
+                c2pFmtOdds(Math.exp(-C2P_VERY_SLOW)) + ' % over 3×) by chance. ' +
+                'Mining has no memory, so the pool was never "due" a block.';
+        }
+        function c2pDupletTip(p) {
+            if (!p || !p.duplet) return '';
+            var d = p.duplet, fast = c2pFmtOdds(1 - Math.exp(-C2P_FAST));
+            var s = 'Duplet: 2 blocks ' + c2pFmtDur(d.gap) + ' apart (' + c2pFmtX(p.effort) + ' the expected time). ' +
+                'In a fair Poisson process ' + fast + ' % of consecutive blocks are within ⅓ of the expected time, and ' +
+                c2pFmtOdds(1 - Math.exp(-2 * C2P_FAST)) + ' % of blocks have a neighbour that close. ' +
+                'A dry spell does not speed up the next block: ' +
+                (d.prevEffort > 0 ? 'after this ' + c2pFmtX(d.prevEffort) + ' wait' : 'after any wait') +
+                ' the chance of a quick follow-up was still ' + fast + ' %. ' +
+                'Our study of 50,707 LTC+DASH p2pool blocks (2012-2026) found no excess.';
+            if (d.kind === 'dry') {
+                var pair = Math.exp(-C2P_SLOW) * (1 - Math.exp(-C2P_FAST));
+                s += '\nLong wait then a quick pair: ' + c2pFmtOdds(pair) + ' % of block pairs, about 1 in ' +
+                    Math.round(1 / pair) + '. In any 20 blocks you will see one about half the time.';
+            } else if (d.kind === 'triple') {
+                s += '\nTwo fast blocks in a row: ' + c2pFmtOdds(Math.pow(1 - Math.exp(-C2P_FAST), 2)) +
+                    ' % of consecutive pairs by chance.';
+            }
+            return s;
+        }
+        // How the effort of a row was measured.
+        function c2pEffortSourceNote(p) {
+            if (!p || p.effort === null) return '';
+            if (p.first) {
+                return 'First block known to this node: there is no earlier block to time its round from, ' +
+                    'so it counts as effort 100 % (luck 100 %).';
+            }
+            if (p.source === 'server' && p.method === 'imported') {
+                return c2pImportedNote(p) +
+                    (p.coverage !== null && p.coverage < 0.995 ? ' The rest of the round is taken at its mean.' : '') +
+                    (p.lowCoverage ? ' Under half of the round is measured: the figure is mostly extrapolation, so it has no fast / slow tag.' : '');
+            }
+            if (p.source === 'server' && p.method === 'integrated') {
+                return 'Effort integrated over the round from the pool hashrate and difficulty history' +
+                    (p.coverage !== null && p.coverage < 0.995
+                        ? ' (history covers ' + Math.round(p.coverage * 100) + ' % of the round; the rest is taken at its mean, ' +
+                          'and pooled luck counts the covered part only).' : '.') +
+                    (p.lowCoverage ? ' Under half of the round is measured: the figure is mostly extrapolation, so it has no fast / slow tag.' : '') +
+                    (p.measured === false ? ' The block was found in a gap of the history: pooled luck leaves it out.' : '');
+            }
+            if (p.source === 'client') {
+                return 'Computed in the browser from this node\'s time_to_find / expected_time (older node). ' +
+                    'Expected time uses the pool hashrate sampled at find time (approximate).' +
+                    (p.gapFixed ? ' Timed from the previous main-chain block: the node timed it from an orphaned block.' : '');
+            }
+            return 'Expected time uses the pool hashrate sampled at find time (approximate).';
+        }
+        function c2pEffortTip(p) {
+            if (!p || p.effort === null) return '';
+            var s = 'Effort ' + c2pFmtNum(p.effort * 100) + ' % of expected';
+            if (!p.first && p.gap > 0 && p.expected > 0)
+                s += ': found in ' + c2pFmtDur(p.gap) + ', expected ' + c2pFmtDur(p.expected);
+            s += '.\nLuck = 1 / effort = ' + c2pFmtNum(p.luck) + ' %.';
+            var pace = c2pPaceTip(p);
+            if (pace) s += '\n' + pace;
+            return s + '\n' + c2pEffortSourceNote(p);
+        }
+        function c2pEffortCellTip(b, p) {
+            if (p && p.effort !== null) return c2pEffortTip(p);
+            // A /recent_merged_blocks row names its chain in `symbol`, not `chain`.
+            var aux = !b.chain && (b.symbol || b.network) ? String(b.symbol || b.network) : '';
+            if (p && p.offChain) {
+                return (aux ? 'Not on the ' + aux + ' chain (orphaned, or refused by it)'
+                            : 'Not on the coin chain (orphaned, stale or never confirmed)') +
+                    ': it ends no round of the pool, so it has no tag and is not counted in pool luck.' +
+                    (p.offEffort !== null ? ' Timed from the last main-chain block before it, it came at ' +
+                        c2pFmtNum(p.offEffort * 100) + ' % of the expected time.' : '');
+            }
+            if (b.luck_method === 'hashrate_unavailable')
+                return 'Effort unavailable -- no pool hashrate is known over this block\'s round';
+            if (b.luck_method === 'relayed')
+                return 'Relayed from a peer over P2P -- this node has no local timing for it, so no effort is computed here';
+            if (b.luck_method === 'netdiff_unavailable') {
+                // A merged row stored before the aux chain's own difficulty was
+                // recorded holds the parent's: the node serves none for it.
+                return aux
+                    ? 'Effort unavailable -- this block was recorded before the node stored the ' + aux +
+                      ' difficulty at find; it is filled in once the ' + aux + ' header chain names the block'
+                    : 'Effort unavailable -- the block header was never synced, so network difficulty at find time is unknown';
+            }
+            if (aux && !b.luck_method)
+                return 'Effort needs the ' + aux + ' difficulty at find, which this node does not serve (older build).';
+            return 'Effort unknown: this node has no round time and expected time for this block' +
+                (b.luck_method ? ' [' + b.luck_method + ']' : '') + '.';
+        }
+        function c2pPeriodTip(label, per) {
+            if (!per) return 'Pool luck, ' + label + ': no round with a known effort in this period.';
+            var s = 'Pool luck, ' + label + ': ' + per.k + (per.k === 1 ? ' block' : ' blocks') + ' found / ' +
+                (c2pNum(per.blocks_expected) !== null ? per.blocks_expected.toFixed(2) : '?') + ' expected = ' +
+                c2pFmtNum(per.luck) + ' %.';
+            if (per.ci95_low !== null && per.ci95_high !== null)
+                s += '\n95 % interval for the pool\'s true luck: ' + c2pFmtNum(per.ci95_low) + ' – ' +
+                    c2pFmtNum(per.ci95_high) + ' % (exact Poisson).';
+            if (per.k === 0 && per.blocks_expected > 0)
+                s += '\nWith ' + per.blocks_expected.toFixed(2) + ' blocks expected, a fair pool finds none ' +
+                    c2pFmtOdds(Math.exp(-per.blocks_expected)) + ' % of the time (Poisson).';
+            var band = c2pFairBand(per.k);
+            if (band)
+                s += '\nA fair pool lands in ' + c2pFmtNum(band.low) + ' – ' + c2pFmtNum(band.high) +
+                    ' % 95 % of the time with this many blocks.';
+            s += '\nPooled: blocks found / blocks expected, the open round included. Never a mean of per-block luck.';
+            if (per.source === 'client')
+                s += '\nComputed in the browser from this node\'s time_to_find / expected_time (older node).';
+            if (per.skipped > 0)
+                s += '\n' + per.skipped + (per.skipped === 1 ? ' block is' : ' blocks are') +
+                    ' left out of the blocks found: found in a gap of the rate history, or with no effort known.';
+            return s;
+        }
+        // A period as the badges and the chart stat show it: the luck, its
+        // interval and block count, and a tone.
+        function c2pPeriodView(per) {
+            if (!per) return { value: '—', detail: '', tone: 'none' };
+            var ci = per.ci95_low !== null && per.ci95_high !== null
+                ? '[' + c2pFmtNum(per.ci95_low) + '–' + c2pFmtNum(per.ci95_high) + '] ' : '';
+            // No block: the blocks expected say more than an interval from 0.
+            if (per.k === 0) {
+                return { value: '0 blk', tone: 'none',
+                         detail: c2pNum(per.blocks_expected) !== null ? '/ ' + per.blocks_expected.toFixed(2) + ' exp.' : '' };
+            }
+            // The tone follows the figure as shown: 99.6 % reads "100%".
+            var shown = +c2pFmtNum(per.luck);
+            return { value: c2pFmtPct(per.luck), detail: ci + 'k=' + per.k,
+                     tone: shown >= 100 ? 'up' : (shown >= 75 ? 'mid' : 'down') };
+        }
+        function c2pRoundTip(open) {
+            if (!open || c2pNum(open.effort) === null || open.effort < 0) return '';
+            var e = open.effort, again = c2pFmtOdds(1 - Math.exp(-1)), low = !!open.lowCoverage;
+            var sofar = open.elapsed > 0 ? ' (' + c2pFmtDur(open.elapsed) + ' so far)' : '';
+            // Mostly extrapolation: no odds are quoted on the figure and no
+            // dry spell is called.
+            var s = low
+                ? 'This round reads ' + c2pFmtX(e) + ' its expected length' + sofar + ', but the rate history covers ' +
+                  Math.round(open.coverage * 100) + ' % of it: the figure is mostly extrapolation, so no dry spell is called. '
+                : 'This round has run ' + c2pFmtX(e) + ' its expected length' + sofar + '. ' +
+                  c2pFmtOdds(Math.exp(-e)) + ' % of rounds run at least this long by chance (Poisson). ';
+            s += open.expected_time > 0
+                ? 'A block is expected every ' + c2pFmtDur(open.expected_time) + ' at the current rate: the chance of one in the next ' +
+                  c2pFmtDur(open.expected_time) + ' is ' + again + ' %, exactly as at the start of the round. Mining has no memory.'
+                : 'The chance of a block within one expected round time from now is ' + again +
+                  ' %, exactly as at the start of the round. Mining has no memory.';
+            if (e > C2P_DRY_HINT && !low) {
+                s += '\nRounds over 5× happen ' + c2pFmtOdds(Math.exp(-C2P_DRY_HINT)) + ' % of the time. If the CI95 ' +
+                    'check under the hashrate chart says the reported hashrate is above the band, look for lost ' +
+                    'hashrate (outage, failover).';
+            }
+            if (open.source === 'server' && open.method === 'integrated') {
+                s += '\nEffort integrated over the open round from the pool hashrate and difficulty history' +
+                    (open.coverage !== null && open.coverage < 0.995
+                        ? ' (history covers ' + Math.round(open.coverage * 100) + ' % of it; the rest is taken at its mean, ' +
+                          'and pooled luck counts the covered part only).' : '.');
+            } else if (open.source === 'server_trend') {
+                s += '\nFrom this node\'s current_luck_trend (older node): elapsed / expected time at the current pool hashrate and difficulty.';
+            } else if (open.source === 'client') {
+                s += '\nExpected time at the latest pool hashrate and network difficulty (approximate).';
+            }
+            return s;
+        }
+
+        // The p2pool.info nods: the glyph strip of its luck line, and what
+        // counts as a new block for the cha-ching.
+        var C2P_STRIP_ROUNDS = 40;
+        // The last `count` rounds as one glyph each, oldest first: ⚡ fast,
+        // 🐢 slow, · neither.
+        function c2pGlyphStrip(rounds, count) {
+            return (rounds || []).slice(-(count || C2P_STRIP_ROUNDS)).map(function(r) {
+                var tier = r.first || r.low ? '' : c2pPaceTier(r.effort);
+                return { glyph: c2pIsFast(tier) ? '⚡' : c2pIsSlow(tier) ? '🐢' : '·', tier: tier,
+                         height: r.height, hash: r.hash, effort: r.effort, first: !!r.first };
+            });
+        }
+        // Whether a /recent_blocks load shows a pool block newer than the
+        // last one seen. prev, cur: {hash, ts} of the newest main-chain row
+        // (both null with no block); prev is null on the first load.
+        function c2pIsNewBlock(prev, cur) {
+            if (!prev || !cur || !cur.hash || cur.hash === prev.hash) return false;
+            return prev.ts === null || cur.ts > prev.ts;
+        }
+        // END c2pLuck
+
+        // The Recent Blocks luck badges, from the last /luck_stats
+        // (window.c2pLuckStats) and the pace of the last /recent_blocks
+        // (window.c2pPace). Run after either loads.
+        var C2P_TONE_BG = { up: 'var(--success)', mid: 'var(--warning)', down: 'var(--danger)', none: '#3a3a5a' };
+        function c2pRenderLuckSummary() {
+            var ls = window.c2pLuckStats || null;
+            var pace = window.c2pPace || c2pBlockPace(window.c2pRecentBlocks || [], '');
+            var nowS = Date.now() / 1000;
+            // No main-chain block yet: there is no round to show.
+            var open = pace.lastMain ? c2pOpenRound(ls, pace.lastMain.ts, nowS, 0) : null;
+            var spell = open ? c2pDrySpell(open.effort, open.lowCoverage) : null;
+            var round = d3.select('#luck_current_round');
+            if (spell) {
+                round.style('display', null).text(spell.text)
+                    .style('background', spell.background).style('color', spell.color || null)
+                    .attr('title', c2pRoundTip(open));
+            } else {
+                round.style('display', 'none');
+            }
+            var periods = c2pLuckPeriods(ls, pace.rounds, nowS, open, pace.noEffort);
+            [['#luck_seven_days', '7d', '7 days'], ['#luck_thirty_days', '30d', '30 days'],
+             ['#luck_ninety_days', '90d', '90 days']].forEach(function(d) {
+                var per = periods[d[1]], view = c2pPeriodView(per);
+                d3.select(d[0])
+                    .text(d[1] + ': ' + view.value + (view.detail ? ' ' + view.detail : ''))
+                    .style('background', per ? C2P_TONE_BG[view.tone] : 'var(--primary)')
+                    .attr('title', c2pPeriodTip(d[2], per));
+            });
+            c2pRenderClassicLuck(periods, pace);
+        }
+
+        // The p2pool.info (2012) line under the badges: "Pool Luck (7 days,
+        // 30 days, 90 days)", green at 100 % and over and red under it as
+        // there, and the last rounds as one glyph each.
+        function c2pRenderClassicLuck(periods, pace) {
+            [['#classic_luck_7d', '7d', '7 days'], ['#classic_luck_30d', '30d', '30 days'],
+             ['#classic_luck_90d', '90d', '90 days']].forEach(function(d) {
+                var per = periods[d[1]], view = c2pPeriodView(per), found = per && per.k > 0;
+                d3.select(d[0])
+                    .text(found ? view.value : '—')
+                    .attr('class', found ? (view.tone === 'up' ? 'luck-up' : 'luck-down') : 'luck-none')
+                    .attr('title', c2pPeriodTip(d[2], per));
+            });
+            var glyphs = d3.select('#classic_luck_glyphs');
+            glyphs.selectAll('span').remove();
+            var strip = c2pGlyphStrip(pace.rounds, C2P_STRIP_ROUNDS);
+            glyphs.text(strip.length ? '' : '—');
+            strip.forEach(function(g) {
+                glyphs.append('span')
+                    .attr('class', c2pIsFast(g.tier) ? 'pace-fast' : (c2pIsSlow(g.tier) ? 'pace-slow' : null))
+                    .attr('title', '#' + g.height + ': effort ' + c2pFmtNum(g.effort * 100) + ' %' +
+                        (g.first ? ' (first block, counted as 100 %)' : '') +
+                        (g.tier ? '\n' + c2pPaceTip(g) : ''))
+                    .text(g.glyph);
+            });
+        }
+
+        // The two retro toggles, both off by default and remembered in this
+        // browser: a cha-ching when the pool finds a block (p2pool.info
+        // played newblock.mp3), and p2pool.info's vertical block lines on
+        // the hashrate charts.
+        function c2pPrefGet(key) {
+            try { return localStorage.getItem(key) === '1'; } catch (e) { return false; }
+        }
+        function c2pPrefSet(key, on) {
+            try { if (on) localStorage.setItem(key, '1'); else localStorage.removeItem(key); } catch (e) {}
+        }
+        var c2pChaChing = { on: c2pPrefGet('c2p_cha_ching'), ctx: null, last: null };
+        var c2pClassicLines = c2pPrefGet('c2p_classic_block_lines');
+        // Two short bell notes, synthesised: no audio file to ship.
+        function c2pPlayChaChing() {
+            try {
+                var AC = window.AudioContext || window.webkitAudioContext;
+                if (!AC) return;
+                var ctx = c2pChaChing.ctx || (c2pChaChing.ctx = new AC());
+                if (ctx.state === 'suspended' && ctx.resume) ctx.resume();
+                var t0 = ctx.currentTime;
+                [[1318.5, 0, 0.12], [2093, 0.11, 0.5]].forEach(function(n) {
+                    var osc = ctx.createOscillator(), gain = ctx.createGain();
+                    osc.type = 'triangle';
+                    osc.frequency.value = n[0];
+                    gain.gain.setValueAtTime(0.0001, t0 + n[1]);
+                    gain.gain.exponentialRampToValueAtTime(0.2, t0 + n[1] + 0.01);
+                    gain.gain.exponentialRampToValueAtTime(0.0001, t0 + n[1] + n[2]);
+                    osc.connect(gain);
+                    gain.connect(ctx.destination);
+                    osc.start(t0 + n[1]);
+                    osc.stop(t0 + n[1] + n[2] + 0.02);
+                });
+            } catch (e) {}
+        }
+        function toggleChaChing(on) {
+            c2pChaChing.on = !!on;
+            c2pPrefSet('c2p_cha_ching', c2pChaChing.on);
+            // The click lets the browser start audio; it also previews the sound.
+            if (c2pChaChing.on) c2pPlayChaChing();
+        }
+        // With the pace of each /recent_blocks load: one cha-ching when the
+        // newest main-chain block is newer than the last one seen. Never on
+        // the first load.
+        function c2pChaChingOnBlocks(pace) {
+            var last = pace && pace.lastMain;
+            var cur = { hash: last ? c2pRowHash(last) : null, ts: last ? last.ts : null };
+            if (c2pChaChing.on && c2pIsNewBlock(c2pChaChing.last, cur)) c2pPlayChaChing();
+            c2pChaChing.last = cur;
+        }
+        // p2pool.info drew each block as a faint vertical line. Lines are
+        // plot lines of the charts' x axis, at the main-chain blocks drawn.
+        function c2pClassicPlotLines(times) {
+            return (times || []).map(function(t) {
+                return { id: 'c2p-classic-line', value: t, color: 'rgba(255, 255, 255, 0.08)', width: 1, zIndex: 1 };
+            });
+        }
+        // Times of the main-chain blocks drawn, for the classic block lines.
+        function c2pMainBlockTimes(blockMarkers) {
+            return blockMarkers.filter(function(m) { return !c2pRowOffChain(m.block); })
+                               .map(function(m) { return m.x; });
+        }
+        function c2pSyncRetroToggles() {
+            document.querySelectorAll('.legend-item[data-toggle="classiclines"]').forEach(function(el) {
+                if (c2pClassicLines) el.classList.remove('disabled'); else el.classList.add('disabled');
+            });
+            var box = document.getElementById('chaching_toggle');
+            if (box) box.checked = c2pChaChing.on;
+        }
+        function toggleClassicLines() {
+            c2pClassicLines = !c2pClassicLines;
+            c2pPrefSet('c2p_classic_block_lines', c2pClassicLines);
+            c2pSyncRetroToggles();
+            [hashrateChart, fullscreenChart].forEach(function(chart) {
+                if (!chart || !chart.xAxis || !chart.xAxis[0]) return;
+                chart.xAxis[0].removePlotLine('c2p-classic-line');
+                if (c2pClassicLines) {
+                    c2pClassicPlotLines(chart.c2pBlockTimes).forEach(function(line) { chart.xAxis[0].addPlotLine(line); });
+                }
+            });
+        }
+        c2pSyncRetroToggles();
+
+        // Luck inputs of a hashrate chart, shared by the compact and the
+        // fullscreen build: the pace of the ledger rows, the open round, the
+        // Luck series (the pooled luck of the last C2P_TREND_ROUNDS rounds, on
+        // the display scale) with its axis range, and the period lucks.
+        // The open round is the node's current_round. An older node has none:
+        // its current_luck_trend, else the expected round time from the
+        // freshest network difficulty and pool hashrate on the chart
+        // (net_diff * 2^32 / pool_hashrate), at-find values as fallback.
+        function c2pChartLuck(blocks, minTime, maxTime, values, netDiffData) {
+            var pace = c2pBlockPace(blocks, (window.currency_info && window.currency_info.symbol) || '');
+            var nowMs = Date.now(), last = pace.lastMain, open = null, live = null;
+            if (last) {
+                var liveNetDiff = null;
+                for (var nd = netDiffData.length - 1; nd >= 0; nd--) {
+                    if (netDiffData[nd][1] && netDiffData[nd][1] > 0) { liveNetDiff = netDiffData[nd][1]; break; }
+                }
+                if (!(liveNetDiff > 0)) liveNetDiff = last.network_difficulty;
+                var livePoolHr = 0;
+                for (var hv = values.length - 1; hv >= 0; hv--) {
+                    if (values[hv] > 0) { livePoolHr = values[hv]; break; }
+                }
+                if (!(livePoolHr > 0)) livePoolHr = last.pool_hashrate_at_find;
+                var fallbackExpected = 0;
+                if (liveNetDiff > 0 && livePoolHr > 0) {
+                    fallbackExpected = liveNetDiff * 4294967296 / livePoolHr;
+                } else if (last.expected_time > 0) {
+                    fallbackExpected = last.expected_time;
+                }
+                open = c2pOpenRound(window.c2pLuckStats, last.ts, nowMs / 1000, fallbackExpected);
+                // The tail ends on what the periods count of the round so far:
+                // elapsed / covered effort per expected block, not the expected
+                // time at this instant.
+                if (open && open.pace_time > 0) {
+                    live = { x: Math.max(nowMs, maxTime), lastBlkMs: last.ts * 1000, expectedMs: open.pace_time * 1000 };
+                }
+            }
+            var trend = c2pLuckTrendPoints(pace.rounds, minTime, live, C2P_TREND_ROUNDS).map(function(p) {
+                return { x: p.x, y: c2pLuckDisplay(p.y), luck: p.y, n: p.n, expected: p.expected, skipped: p.skipped,
+                         open: !!p.open, marker: p.marker };
+            });
+            // The axis keeps 100 % centred.
+            var luckMin = 0, luckMax = 200;
+            if (trend.length > 0) {
+                var ys = trend.map(function(p) { return p.y; });
+                var dist = Math.max(Math.max.apply(null, ys) - 100, 100 - Math.min.apply(null, ys), 10) * 1.1;
+                luckMin = Math.max(0, 100 - dist);
+                luckMax = 100 + dist;
+            }
+            // A violet band over a dry spell (c2pDrySpellBands).
+            var plotBands = live ? c2pDrySpellBands(open, live.lastBlkMs, minTime, live.x) : [];
+            return { pace: pace, open: open, trend: trend, luckMin: luckMin, luckMax: luckMax, plotBands: plotBands,
+                     periods: c2pLuckPeriods(window.c2pLuckStats, pace.rounds, nowMs / 1000, open, pace.noEffort) };
+        }
+        // Luck axis label, from the display scale back to luck %.
+        function c2pLuckAxisLabel(v) {
+            var luck = c2pLuckFromDisplay(v);
+            return luck > 1000 ? (luck / 1000).toFixed(1) + 'k%' : luck.toFixed(0) + '%';
+        }
+        // The Luck series' line of a chart tooltip.
+        function c2pLuckTrendTipHtml(point) {
+            var o = point.point || point;
+            var luck = o.luck != null ? o.luck : c2pLuckFromDisplay(point.y);
+            var s = '<br/><span style="color:' + point.color + '">●</span> Luck';
+            var roundCount = (o.n || 0) + (o.skipped || 0);
+            if (roundCount > 0) s += ', last ' + roundCount + (roundCount === 1 ? ' round' : ' rounds') + (o.open ? ' + open round' : '');
+            s += ': <b>' + c2pFmtPct(luck) + '</b>';
+            if (o.expected > 0) {
+                s += ' <span style="font-size:10px;color:#aaa">(' + o.n + ' found / ' + o.expected.toFixed(2) + ' expected' +
+                     (o.skipped > 0 ? '; ' + o.skipped + ' found in a gap of the rate history left out' : '') + ')</span>';
+            }
+            return s;
+        }
+        // Marker fill by effort, at the bounds the luck colours had; a block
+        // with no effort, or with one that is mostly extrapolation, is
+        // neutral, not green.
+        function c2pMarkerFill(p) {
+            var band = p && !p.lowCoverage ? c2pEffortBand(p.effort) : '';
+            return band === 'good' ? '#10b981' : band === 'mid' ? '#f59e0b' : band === 'poor' ? '#ef4444' : '#64748b';
+        }
+        // The Blocks series points. Pace cue: a ⚡ / 🐢 label over the
+        // marker; with more than C2P_PACE_LABEL_MAX markers the labels would
+        // pile up, so the marker's edge is coloured instead.
+        var C2P_PACE_LABEL_MAX = 60;
+        function c2pBlockSeriesData(blockMarkers, pace) {
+            var dense = blockMarkers.length > C2P_PACE_LABEL_MAX;
+            return blockMarkers.map(function(m) {
+                var p = pace.byHash[c2pRowHash(m.block)] || null;
+                var pt = {
+                    x: m.x,
+                    y: m.y,
+                    block: m.block,
+                    pace: p,
+                    marker: {
+                        fillColor: m.style.fillColor || '#10b981',
+                        lineColor: m.style.lineColor,
+                        symbol: m.style.symbol,
+                        radius: 6
+                    }
+                };
+                if (p && p.tag) {
+                    var color = c2pIsFast(p.tier) ? '#00d4ff' : '#a78bfa';
+                    if (dense) {
+                        pt.marker.lineColor = color;
+                    } else {
+                        pt.dataLabels = {
+                            enabled: true, format: p.tag, y: -6, padding: 0, color: color, allowOverlap: true,
+                            crop: false, overflow: 'allow',
+                            style: { fontSize: '10px', fontWeight: 'normal', textOutline: 'none' }
+                        };
+                    }
+                }
+                return pt;
+            });
+        }
+        // A dashed line joining the two blocks of a duplet, from marker edge
+        // to marker edge; a dashed ring round both when they are too close
+        // for a line to show (not on a dense chart, where the fast block's
+        // marker edge is coloured and rings would pile up). Drawn with the
+        // renderer on load and on every redraw, like drawDiffRatioBars.
+        function drawDupletLinks(chart) {
+            (chart.dupletLinks || []).forEach(function(el) { if (el && el.destroy) el.destroy(); });
+            chart.dupletLinks = [];
+            var series = chart.series.find(function(s) { return s.name === 'Blocks'; });
+            if (!series || !series.points || !series.visible) return;
+            var at = {};
+            series.points.forEach(function(pt) { if (pt.block) at[c2pRowHash(pt.block)] = pt; });
+            var style = { stroke: '#00d4ff', 'stroke-width': 1.5, dashstyle: 'ShortDash', fill: 'none', zIndex: 5 };
+            var markerR = 9, dense = series.points.length > C2P_PACE_LABEL_MAX;
+            series.points.forEach(function(pt) {
+                var d = pt.pace && pt.pace.duplet, other = d ? at[d['with']] : null;
+                if (!other || pt.plotX == null || other.plotX == null) return;
+                if (!chart.isInsidePlot(pt.plotX, pt.plotY) || !chart.isInsidePlot(other.plotX, other.plotY)) return;
+                var x1 = other.plotX + chart.plotLeft, y1 = other.plotY + chart.plotTop;
+                var x2 = pt.plotX + chart.plotLeft, y2 = pt.plotY + chart.plotTop;
+                var len = Math.sqrt((x2 - x1) * (x2 - x1) + (y2 - y1) * (y2 - y1));
+                var el;
+                if (len > 2 * markerR + 4) {
+                    var ux = (x2 - x1) / len, uy = (y2 - y1) / len;
+                    el = chart.renderer.path([
+                        ['M', x1 + ux * markerR, y1 + uy * markerR],
+                        ['L', x2 - ux * markerR, y2 - uy * markerR]
+                    ]);
+                } else if (!dense) {
+                    el = chart.renderer.circle((x1 + x2) / 2, (y1 + y2) / 2, len / 2 + markerR + 3);
+                }
+                if (el) chart.dupletLinks.push(el.attr(style).add());
+            });
+        }
+        // Effort, luck, round times and pace of a block, for its chart tooltip.
+        function block_luck_html(b, p) {
+            var s = '', t = c2pRoundTimes(b, p);
+            if (p && p.first) {
+                s += 'Effort: <b style="color:#888">1st block, counted as 100%</b><br/>';
+            } else if (p && p.effort !== null) {
+                var band = c2pEffortBand(p.effort);
+                var color = p.lowCoverage ? '#888' : (band === 'good' ? '#00ff88' : (band === 'mid' ? '#ffc107' : '#ff6b6b'));
+                s += 'Effort: <b style="color:' + color + '">' + c2pFmtPct(p.effort * 100) + '</b> of expected ' +
+                     '<span style="font-size:10px;color:#aaa">(luck ' + c2pFmtPct(p.luck) + ')</span><br/>';
+                if (p.method === 'imported') {
+                    s += '<span style="font-size:10px;color:#aaa">(measured by the import source node; its rate history covers ' +
+                         (p.coverage !== null ? Math.round(p.coverage * 100) + ' %' : 'part') + ' of the round)</span><br/>';
+                }
+                if (p.lowCoverage) {
+                    s += '<span style="font-size:10px;color:#aaa">(rate history covers ' + Math.round(p.coverage * 100) +
+                         ' % of the round: mostly extrapolation, no tag)</span><br/>';
+                }
+            }
+            if (t.actual > 0) s += 'Found in: <b>' + format_dt(t.actual) + '</b><br/>';
+            if (t.expected > 0) s += 'Expected: <b>' + format_dt(t.expected) + '</b><br/>';
+            if (p && p.tag) {
+                var fast = c2pIsFast(p.tier);
+                s += 'Pace: <b style="color:' + (fast ? '#00d4ff' : '#a78bfa') + '">' + p.tag + (fast ? ' fast' : ' slow') +
+                     '</b> · ' + c2pFmtX(p.effort) + ' expected · ' +
+                     (fast ? c2pFmtOdds(1 - Math.exp(-C2P_FAST)) + ' % of blocks come in under ⅓ by chance'
+                           : c2pFmtOdds(Math.exp(-C2P_SLOW)) + ' % of blocks take over 2× by chance') + '<br/>';
+            }
+            if (p && p.duplet) {
+                s += 'Duplet with #' + p.duplet.withHeight + ' (' + c2pFmtDur(p.duplet.gap) + ' apart, ' +
+                     c2pFmtOdds(1 - Math.exp(-C2P_FAST)) + ' % of pairs by chance)<br/>';
+            }
+            return s;
+        }
+        // The Pool Luck stat under a chart: the period luck that matches the
+        // chart's period, with its 95 % interval and block count. The hour
+        // view shows the day (the node serves no shorter period) and the
+        // year view the whole ledger; the label names what is shown.
+        var C2P_GRAPH_PERIOD_LUCK = { hour: '1d', day: '1d', week: '7d', month: '30d', year: 'all' };
+        function c2pGraphLuckStat(statElId, labelElId, legendScopeSel, chartLuck) {
+            var key = C2P_GRAPH_PERIOD_LUCK[currentGraphPeriod] || 'all';
+            var labelEl = document.getElementById(labelElId);
+            if (labelEl) labelEl.textContent = 'Pool Luck ' + key;
+            // No round at all: the honest "accumulating" state, not a bare "-".
+            if (applyLuckEmptyState(statElId, legendScopeSel, chartLuck.trend.length > 0)) return;
+            var el = document.getElementById(statElId);
+            if (!el) return;
+            var per = chartLuck.periods[key], view = c2pPeriodView(per);
+            el.textContent = view.value;
+            el.style.color = view.tone === 'none' ? 'var(--text-muted)' : C2P_TONE_BG[view.tone];
+            el.title = c2pPeriodTip(key, per);
+            if (view.detail) {
+                var detail = document.createElement('span');
+                detail.className = 'luck-ci';
+                detail.textContent = view.detail;
+                el.appendChild(detail);
+            }
+        }
+
         // Honest luck empty-state. The luck line is composited client-side; it
         // legitimately has ZERO points when this node has observed no block with
         // a computable luck (needs netdiff + pool hashrate at find) AND there is
@@ -8413,7 +9868,7 @@
         // a bare "-" over a clickable-but-empty legend chip reads as "broken".
         // Say it plainly instead: label the stat "accumulating" and grey the
         // Luck legend chip. Returns true when the empty-state was applied so the
-        // caller skips the numeric Avg-Luck path.
+        // caller skips the numeric Pool Luck path.
         function applyLuckEmptyState(statElId, legendScopeSel, hasSeries) {
             var statEl = document.getElementById(statElId);
             var chip = document.querySelector(legendScopeSel + ' .legend-item[data-series="lucktrend"]');
@@ -8431,7 +9886,7 @@
             }
             if (chip) {
                 chip.classList.remove('luck-empty');
-                chip.title = 'Click to toggle luck trend line';
+                chip.title = 'Click to toggle the luck line: the pooled luck of the last ' + C2P_TREND_ROUNDS + ' rounds (blocks found / blocks expected), the open round included';
             }
             if (statEl) { statEl.title = ''; }
             return false;
@@ -8565,8 +10020,6 @@
             
             // Process blocks - filter to exact time range for proper data alignment
             var blockMarkers = [];
-            var luckTrendData = [];
-            var validLucks = [];
             
             // graph_data 4-tuple: [ts_seconds, difficulty, bin_width, default].
             // Plot the RAW network difficulty on its own axis (yAxis 3). The
@@ -8582,6 +10035,10 @@
                 netDiffData.push([sampleTime, (diff && diff > 0) ? diff : null]);
             });
             
+            // Effort, pace and duplets of the ledger rows, the open round and
+            // the Luck series (c2pChartLuck).
+            var chartLuck = c2pChartLuck(blocks, minTime, maxTime, values, netDiffData);
+
             // Sort blocks by timestamp
             var sortedBlocks = blocks.slice().sort(function(a, b) { return a.ts - b.ts; });
             
@@ -8590,15 +10047,6 @@
                 
                 // Check if block is within selected time window (exact range for alignment)
                 if (blockTime >= minTime && blockTime <= maxTime) {
-                    // For luck trend, collect blocks with luck data within time window.
-                    // luck <= 0 means "never computed" (relay-learned row, or a row
-                    // recorded before the netdiff-at-find fix), NOT 0% luck -- plotting
-                    // it drew the 2026-08-05 production chart down to zero. Skip, don't draw.
-                    if (b.luck !== undefined && b.luck !== null && b.luck > 0) {
-                        luckTrendData.push([blockTime, b.luck]);
-                        validLucks.push(b.luck);
-                    }
-                    
                     // Find closest hashrate value for y position
                     var closestIdx = 0;
                     var closestDiff = Math.abs(data[0][0] * 1000 - blockTime);
@@ -8622,18 +10070,10 @@
                         yVal = yVal * heightMultiplier;
                     }
                     
-                    // Determine color based on luck
-                    var color = '#10b981'; // Default green (good luck >= 100%)
-                    if (b.luck !== undefined && b.luck !== null) {
-                        if (b.luck >= 100) {
-                            color = '#10b981'; // Green - good luck
-                        } else if (b.luck >= 75) {
-                            color = '#f59e0b'; // Yellow - medium luck
-                        } else {
-                            color = '#ef4444'; // Red - poor luck
-                        }
-                    }
-                    
+                    // Fill by effort: green up to 100 %, yellow up to 133 %
+                    // (luck 75 %), red above; neutral with no effort.
+                    var color = c2pMarkerFill(chartLuck.pace.byHash[c2pRowHash(b)]);
+
                     blockMarkers.push({
                         x: blockTime,
                         y: yVal,
@@ -8645,136 +10085,16 @@
             
             setGraphHistoryNote('hashrate-graph-note', blocks, minTime);
 
-            // Interpolate luck trend to align with hashrate time boundaries.
-            // Ephemeral final point: live-extrapolate the IN-PROGRESS round to
-            // the render wall-clock "now". luck-if-found-now =
-            //   expected_round_time / elapsed_since_last_block * 100
-            // (same formula as rest_luck_stats current_luck_trend). It reads
-            // high right after a block, decays hyperbolically (~1/elapsed), and
-            // crosses 100% exactly at the expected round duration.
-            // expected_round_time = net_diff * 2^32 / pool_hashrate.
-            var liveLuckPoint = null;
-            if (sortedBlocks.length > 0) {
-                var lastBlk = sortedBlocks[sortedBlocks.length - 1];
-                var lastBlkMs = lastBlk.ts * 1000;
-                var nowMs = Date.now();
-                // Clock skew / just-found: clamp elapsed to >= 1s.
-                var elapsedMs = Math.max(nowMs - lastBlkMs, 1000);
-                // Freshest inputs first, at-find values as fallback.
-                var liveNetDiff = null;
-                for (var nd = netDiffData.length - 1; nd >= 0; nd--) {
-                    if (netDiffData[nd][1] && netDiffData[nd][1] > 0) { liveNetDiff = netDiffData[nd][1]; break; }
-                }
-                if (!(liveNetDiff > 0)) liveNetDiff = lastBlk.network_difficulty;
-                var livePoolHr = 0;
-                for (var hv = values.length - 1; hv >= 0; hv--) {
-                    if (values[hv] > 0) { livePoolHr = values[hv]; break; }
-                }
-                if (!(livePoolHr > 0)) livePoolHr = lastBlk.pool_hashrate_at_find;
-                var expectedMs = 0;
-                if (liveNetDiff > 0 && livePoolHr > 0) {
-                    expectedMs = liveNetDiff * 4294967296 / livePoolHr * 1000;
-                } else if (lastBlk.expected_time > 0) {
-                    expectedMs = lastBlk.expected_time * 1000;
-                }
-                if (expectedMs > 0) {
-                    // Cap at 1000%: transformLuck maps 1000 -> 200 (axis top),
-                    // so a just-found block cannot blow up the centered scale.
-                    var liveLuck = Math.min((expectedMs / elapsedMs) * 100, 1000);
-                    liveLuckPoint = { x: Math.max(nowMs, maxTime), y: liveLuck, expectedMs: expectedMs, lastBlkMs: lastBlkMs };
-                }
-            }
-            if (luckTrendData.length > 0) {
-                // Sort by time
-                luckTrendData.sort(function(a, b) { return a[0] - b[0]; });
+            // The Luck series: the pooled luck of the last rounds, the open
+            // round included, on the display scale (linear to 100 %,
+            // log-compressed above), its axis keeping 100 % centred.
+            var luckTrendData = chartLuck.trend;
+            var luckMin = chartLuck.luckMin, luckMax = chartLuck.luckMax;
 
-                // Add interpolated point at minTime if first point is after minTime
-                if (luckTrendData[0][0] > minTime && sortedBlocks.length > 0) {
-                    // Find the last block before minTime for interpolation
-                    var prevBlock = null;
-                    for (var i = 0; i < sortedBlocks.length; i++) {
-                        var bt = sortedBlocks[i].ts * 1000;
-                        if (bt < minTime && sortedBlocks[i].luck) {
-                            prevBlock = sortedBlocks[i];
-                        } else if (bt >= minTime) {
-                            break;
-                        }
-                    }
-
-                    if (prevBlock) {
-                        // Use the previous block's luck value at minTime
-                        luckTrendData.unshift([minTime, prevBlock.luck]);
-                    } else {
-                        // No previous block, use first point's value at minTime
-                        luckTrendData.unshift([minTime, luckTrendData[0][1]]);
-                    }
-                }
-
-                // Append the live in-progress extrapolation at x = now.
-                if (liveLuckPoint && liveLuckPoint.x > luckTrendData[luckTrendData.length - 1][0]) {
-                    luckTrendData.push([liveLuckPoint.x, liveLuckPoint.y]);
-                }
-            } else if (sortedBlocks.length > 0 && liveLuckPoint) {
-                // No blocks inside the window: draw the same hyperbola across it.
-                var edgeElapsedMs = Math.max(minTime - liveLuckPoint.lastBlkMs, 1000);
-                var edgeLuck = Math.min((liveLuckPoint.expectedMs / edgeElapsedMs) * 100, 1000);
-                luckTrendData.push([minTime, edgeLuck]);
-                luckTrendData.push([liveLuckPoint.x, liveLuckPoint.y]);
-            }
-            
-            // Convert simple array points to objects for luck trend
-            // Apply logarithmic compression to values above 100%
-            // This transforms actual luck (0-infinity) to display luck (0-200)
-            // where 100% stays at 100%, and values above compress logarithmically
-            var transformLuck = function(actualLuck) {
-                if (actualLuck <= 100) {
-                    // Linear below 100%: 0% → 0, 100% → 100
-                    return actualLuck;
-                } else {
-                    // Logarithmic above 100%: 100% → 100, 200% → 130, 500% → 170, 1000% → 200
-                    var distanceAbove = actualLuck - 100;
-                    var compressed = 100 * Math.log10(1 + distanceAbove / 100);
-                    return 100 + compressed;
-                }
-            };
-            
-            luckTrendData = luckTrendData.map(function(point) {
-                if (Array.isArray(point)) {
-                    return {x: point[0], y: transformLuck(point[1])};
-                }
-                return {x: point.x, y: transformLuck(point.y)};
-            });
-            
             // Debug: log processed results
             console.log('Compact - blockMarkers:', blockMarkers.length, 'luckTrendData:', luckTrendData.length, 'minTime:', new Date(minTime), 'maxTime:', new Date(maxTime));
             if (blocks.length > 0) {
                 console.log('Block time:', new Date(blocks[0].ts * 1000));
-            }
-            
-            // Calculate dynamic luck Y-axis range to center 100%
-            var luckMin = 0, luckMax = 200;
-            if (luckTrendData.length > 0) {
-                var transformedValues = luckTrendData.map(function(p) { return p.y; });
-                var minTransformed = Math.min.apply(null, transformedValues);
-                var maxTransformed = Math.max.apply(null, transformedValues);
-                
-                console.log('Transformed luck range - min:', minTransformed.toFixed(1), 'max:', maxTransformed.toFixed(1));
-                
-                // Calculate the distance from 100% for the maximum transformed value
-                var distanceAbove = Math.max(0, maxTransformed - 100);
-                var distanceBelow = Math.max(0, 100 - minTransformed);
-                
-                // Use the larger distance to keep 100% centered
-                var maxDistance = Math.max(distanceAbove, distanceBelow);
-                
-                // Add 10% padding
-                maxDistance = maxDistance * 1.1;
-                
-                // Set symmetric range around 100%
-                luckMin = Math.max(0, 100 - maxDistance);
-                luckMax = 100 + maxDistance;
-                
-                console.log('Luck axis - min:', luckMin.toFixed(1), 'max:', luckMax.toFixed(1), '(100% centered)');
             }
             
             // Update stats
@@ -8782,10 +10102,6 @@
             var sum = values.reduce(function(a, b) { return a + b; }, 0);
             var avg = values.length > 0 ? sum / values.length : 0;
             var peak = Math.max.apply(null, values) || 0;
-            
-            // Calculate average luck from blocks within exact time range
-            var avgLuck = validLucks.length > 0 ? 
-                validLucks.reduce(function(a, b) { return a + b; }, 0) / validLucks.length : null;
             
             document.getElementById('graph-current').textContent = format_hashrate(current);
             document.getElementById('graph-average').textContent = format_hashrate(avg);
@@ -8808,21 +10124,8 @@
             currentUniqueMinerCount = (currentUniqueMinerCount === null || currentUniqueMinerCount === undefined) ? 0 : Math.round(currentUniqueMinerCount);
             document.getElementById('graph-miners').textContent = currentWorkerCount + '/' + currentUniqueMinerCount;
             
-            // luckTrendData empty => no observed block AND no live-extrapolation
-            // input: render the honest "accumulating" state, not a bare "-".
-            if (!applyLuckEmptyState('graph-luck', '.graph-legend.compact', luckTrendData.length > 0)) {
-                var luckEl = document.getElementById('graph-luck');
-                if (avgLuck !== null) {
-                    luckEl.textContent = d3.format('.0f')(avgLuck) + '%';
-                    luckEl.style.color = avgLuck >= 100 ? 'var(--success)' : (avgLuck >= 75 ? 'var(--warning)' : 'var(--danger)');
-                } else {
-                    // Series has only the live in-progress point (no completed
-                    // round in-window yet): the line draws, but there is no
-                    // block-average to report.
-                    luckEl.textContent = '-';
-                    luckEl.style.color = '';
-                }
-            }
+            // Pool Luck: the period luck that matches the chart's period.
+            c2pGraphLuckStat('graph-luck', 'graph-luck-label', '.graph-legend.compact', chartLuck);
             // CI95 effective-vs-reported band. lastNetDiff read defensively so
             // this is agnostic to the netdiff sample shape; k counts blocks WE
             // found in the window regardless of whether luck was computable --
@@ -8864,8 +10167,8 @@
                     panKey: 'shift',
                     zoomType: 'x',
                     events: {
-                        load: function() { drawDiffRatioBars(this); },
-                        redraw: function() { drawDiffRatioBars(this); }
+                        load: function() { drawDiffRatioBars(this); drawDupletLinks(this); },
+                        redraw: function() { drawDiffRatioBars(this); drawDupletLinks(this); }
                     }
                 },
                 credits: { enabled: false },
@@ -8878,7 +10181,9 @@
                         style: { color: '#e0e0e0', fontSize: '10px' }
                     },
                     gridLineColor: '#2a2a4a',
-                    gridLineWidth: 1
+                    gridLineWidth: 1,
+                    plotBands: chartLuck.plotBands,
+                    plotLines: c2pClassicLines ? c2pClassicPlotLines(c2pMainBlockTimes(blockMarkers)) : []
                 },
                 yAxis: [{
                     // Primary Y-axis for hashrate (linear with intelligent max)
@@ -8903,29 +10208,7 @@
                     tickColor: '#ffc107',
                     labels: {
                         style: { color: '#ffc107', fontSize: '10px' },
-                        formatter: function() {
-                            // Inverse transform: convert display value back to actual luck
-                            var displayValue = this.value;
-                            if (displayValue <= 100) {
-                                // Linear range: display = actual
-                                return displayValue.toFixed(0) + '%';
-                            } else {
-                                // Logarithmic range: need to reverse the compression
-                                var compressed = displayValue - 100;
-                                var actualLuck = 100 + 100 * (Math.pow(10, compressed / 100) - 1);
-                                
-                                // Show ∞ for the very highest value
-                                if (this.isLast && displayValue > luckMax * 0.98) {
-                                    return '∞';
-                                }
-                                
-                                // Show rounded value for readability
-                                if (actualLuck > 1000) {
-                                    return (actualLuck / 1000).toFixed(1) + 'k%';
-                                }
-                                return actualLuck.toFixed(0) + '%';
-                            }
-                        }
+                        formatter: function() { return c2pLuckAxisLabel(this.value); }
                     },
                     gridLineWidth: 0,
                     opposite: true,
@@ -8976,19 +10259,7 @@
                             var s = '<b>' + Highcharts.dateFormat('%b %e, %H:%M:%S', this.x) + '</b><br/>';
                             s += block_headline_html(b);
                             s += 'Height: <b>' + (b.number || '?') + '</b><br/>';
-                            if (b.luck !== undefined && b.luck !== null) {
-                                var luckColor = b.luck >= 100 ? '#00ff88' : (b.luck >= 75 ? '#ffc107' : '#ff6b6b');
-                                var luckFormat = b.luck < 1 ? d3.format('.2f')(b.luck) : b.luck < 1 ? d3.format('.2f')(b.luck) : d3.format('.0f')(b.luck);
-                                s += 'Luck: <b style="color:' + luckColor + '">' + luckFormat + '%</b><br/>';
-                            } else if (b.luck_method === 'first_block') {
-                                s += 'Luck: <b style="color:#888">1st block</b><br/>';
-                            }
-                            if (b.time_to_find) {
-                                s += 'Found in: <b>' + format_dt(b.time_to_find) + '</b><br/>';
-                            }
-                            if (b.expected_time) {
-                                s += 'Expected: <b>' + format_dt(b.expected_time) + '</b><br/>';
-                            }
+                            s += block_luck_html(b, this.point ? this.point.pace : this.pace);
                             if (b.network_difficulty) {
                                 s += 'Net Diff: <b style="color:#8888ff">' + diff_as_hashrate(b.network_difficulty) + '</b><br/>';
                                 s += '<span style="font-size:10px;color:#aaa">(' + diff_detail(b.network_difficulty) + ')</span><br/>';
@@ -9022,8 +10293,7 @@
                             if (point.series.name === 'Hashrate') goodVal = point.y;
                             if (point.series.name === 'Dead on arrival') doaVal = point.y;
                             if (point.series.name === 'Luck Trend') {
-                                s += '<br/><span style="color:' + point.color + '">●</span> ' + 
-                                     point.series.name + ': <b>' + d3.format('.0f')(point.y) + '%</b>';
+                                s += c2pLuckTrendTipHtml(point);
                             } else if (point.series.name === 'Workers' || point.series.name === 'Miners' || point.series.name === 'Connected') {
                                 s += '<br/><span style="color:' + point.color + '">●</span> ' + 
                                      point.series.name + ': <b>' + Math.round(point.y) + '</b>';
@@ -9095,19 +10365,8 @@
                 }, {
                     type: 'scatter',
                     name: 'Blocks',
-                    data: blockMarkers.map(function(m) {
-                        return {
-                            x: m.x,
-                            y: m.y,
-                            block: m.block,
-                            marker: {
-                                fillColor: m.style.fillColor || '#10b981',
-                                lineColor: m.style.lineColor,
-                                symbol: m.style.symbol,
-                                radius: 6
-                            }
-                        };
-                    }),
+                    data: c2pBlockSeriesData(blockMarkers, chartLuck.pace),
+                    turboThreshold: 0,
                     color: '#10b981',
                     visible: seriesVisibility.blocks,
                     yAxis: 0,
@@ -9116,18 +10375,7 @@
                             var b = this.block;
                             var s = block_headline_html(b);
                             s += 'Height: <b>' + (b.number || b.block_height || '?') + '</b><br/>';
-                            if (b.luck !== undefined && b.luck !== null) {
-                                var luckColor = b.luck >= 100 ? '#00ff88' : (b.luck >= 75 ? '#ffc107' : '#ff6b6b');
-                                s += 'Luck: <b style="color:' + luckColor + '">' + (b.luck < 1 ? d3.format('.2f')(b.luck) : d3.format('.0f')(b.luck)) + '%</b><br/>';
-                            } else if (b.luck_method === 'first_block') {
-                                s += 'Luck: <b style="color:#888">1st block</b><br/>';
-                            }
-                            if (b.time_to_find) {
-                                s += 'Found in: <b>' + format_dt(b.time_to_find) + '</b><br/>';
-                            }
-                            if (b.expected_time) {
-                                s += 'Expected: <b>' + format_dt(b.expected_time) + '</b><br/>';
-                            }
+                            s += block_luck_html(b, this.point ? this.point.pace : this.pace);
                             if (b.network_difficulty) {
                                 s += 'Net Diff: <b style="color:#8888ff">' + diff_as_hashrate(b.network_difficulty) + '</b><br/>';
                                 s += '<span style="font-size:10px;color:#aaa">(' + diff_detail(b.network_difficulty) + ')</span><br/>';
@@ -9177,9 +10425,10 @@
                     yAxis: 2,
                     visible: seriesVisibility.connected
                 }, {
-                    type: 'spline',
+                    type: 'line',
                     name: 'Luck Trend',
                     data: luckTrendData,
+                    turboThreshold: 0,
                     color: '#ffc107',
                     lineWidth: 2,
                     dashStyle: 'ShortDash',
@@ -9227,6 +10476,8 @@
                 }]
             });
             
+            hashrateChart.c2pBlockTimes = c2pMainBlockTimes(blockMarkers);
+
             // Also update fullscreen if open
             if (isFullscreen) {
                 renderFullscreenGraph(data, minerData, uniqueMinersData, connectedData, blocks, networkDiffSamples, localSamples, localDeadSamples);
@@ -9323,8 +10574,6 @@
             
             // Process blocks - filter to exact time range for proper data alignment
             var blockMarkers = [];
-            var luckTrendData = [];
-            var validLucks = [];
             
             // graph_data 4-tuple [ts_seconds, difficulty, bin_width, default];
             // raw difficulty on yAxis 3, leading 0.0 bins nulled (see compact).
@@ -9336,6 +10585,10 @@
                 netDiffData.push([sampleTime, (diff && diff > 0) ? diff : null]);
             });
             
+            // Effort, pace and duplets of the ledger rows, the open round and
+            // the Luck series (c2pChartLuck).
+            var chartLuck = c2pChartLuck(blocks, minTime, maxTime, values, netDiffData);
+
             // Sort blocks by timestamp
             var sortedBlocks = blocks.slice().sort(function(a, b) { return a.ts - b.ts; });
             
@@ -9344,15 +10597,6 @@
                 
                 // Check if block is within selected time window (exact range for alignment)
                 if (blockTime >= minTime && blockTime <= maxTime) {
-                    // For luck trend, collect blocks with luck data within time window.
-                    // luck <= 0 means "never computed" (relay-learned row, or a row
-                    // recorded before the netdiff-at-find fix), NOT 0% luck -- plotting
-                    // it drew the 2026-08-05 production chart down to zero. Skip, don't draw.
-                    if (b.luck !== undefined && b.luck !== null && b.luck > 0) {
-                        luckTrendData.push([blockTime, b.luck]);
-                        validLucks.push(b.luck);
-                    }
-                    
                     // Find closest hashrate value for y position
                     var closestIdx = 0;
                     var closestDiff = Math.abs(data[0][0] * 1000 - blockTime);
@@ -9376,18 +10620,10 @@
                         yVal = yVal * heightMultiplier;
                     }
                     
-                    // Determine color based on luck
-                    var color = '#10b981'; // Default green (good luck >= 100%)
-                    if (b.luck !== undefined && b.luck !== null) {
-                        if (b.luck >= 100) {
-                            color = '#10b981'; // Green - good luck
-                        } else if (b.luck >= 75) {
-                            color = '#f59e0b'; // Yellow - medium luck
-                        } else {
-                            color = '#ef4444'; // Red - poor luck
-                        }
-                    }
-                    
+                    // Fill by effort: green up to 100 %, yellow up to 133 %
+                    // (luck 75 %), red above; neutral with no effort.
+                    var color = c2pMarkerFill(chartLuck.pace.byHash[c2pRowHash(b)]);
+
                     blockMarkers.push({
                         x: blockTime,
                         y: yVal,
@@ -9399,117 +10635,10 @@
             
             setGraphHistoryNote('fs-graph-note', blocks, minTime);
 
-            // Interpolate luck trend to align with hashrate time boundaries.
-            // Ephemeral final point: live-extrapolate the IN-PROGRESS round to
-            // the render wall-clock "now". luck-if-found-now =
-            //   expected_round_time / elapsed_since_last_block * 100
-            // (same formula as rest_luck_stats current_luck_trend). It reads
-            // high right after a block, decays hyperbolically (~1/elapsed), and
-            // crosses 100% exactly at the expected round duration.
-            // expected_round_time = net_diff * 2^32 / pool_hashrate.
-            var liveLuckPoint = null;
-            if (sortedBlocks.length > 0) {
-                var lastBlk = sortedBlocks[sortedBlocks.length - 1];
-                var lastBlkMs = lastBlk.ts * 1000;
-                var nowMs = Date.now();
-                // Clock skew / just-found: clamp elapsed to >= 1s.
-                var elapsedMs = Math.max(nowMs - lastBlkMs, 1000);
-                // Freshest inputs first, at-find values as fallback.
-                var liveNetDiff = null;
-                for (var nd = netDiffData.length - 1; nd >= 0; nd--) {
-                    if (netDiffData[nd][1] && netDiffData[nd][1] > 0) { liveNetDiff = netDiffData[nd][1]; break; }
-                }
-                if (!(liveNetDiff > 0)) liveNetDiff = lastBlk.network_difficulty;
-                var livePoolHr = 0;
-                for (var hv = values.length - 1; hv >= 0; hv--) {
-                    if (values[hv] > 0) { livePoolHr = values[hv]; break; }
-                }
-                if (!(livePoolHr > 0)) livePoolHr = lastBlk.pool_hashrate_at_find;
-                var expectedMs = 0;
-                if (liveNetDiff > 0 && livePoolHr > 0) {
-                    expectedMs = liveNetDiff * 4294967296 / livePoolHr * 1000;
-                } else if (lastBlk.expected_time > 0) {
-                    expectedMs = lastBlk.expected_time * 1000;
-                }
-                if (expectedMs > 0) {
-                    // Cap at 1000%: transformLuck maps 1000 -> 200 (axis top),
-                    // so a just-found block cannot blow up the centered scale.
-                    var liveLuck = Math.min((expectedMs / elapsedMs) * 100, 1000);
-                    liveLuckPoint = { x: Math.max(nowMs, maxTime), y: liveLuck, expectedMs: expectedMs, lastBlkMs: lastBlkMs };
-                }
-            }
-            if (luckTrendData.length > 0) {
-                // Sort by time
-                luckTrendData.sort(function(a, b) { return a[0] - b[0]; });
+            // The Luck series and its axis range, as on the compact chart.
+            var luckTrendData = chartLuck.trend;
+            var fsLuckMin = chartLuck.luckMin, fsLuckMax = chartLuck.luckMax;
 
-                // Add interpolated point at minTime if first point is after minTime
-                if (luckTrendData[0][0] > minTime && sortedBlocks.length > 0) {
-                    // Find the last block before minTime for interpolation
-                    var prevBlock = null;
-                    for (var i = 0; i < sortedBlocks.length; i++) {
-                        var bt = sortedBlocks[i].ts * 1000;
-                        if (bt < minTime && sortedBlocks[i].luck) {
-                            prevBlock = sortedBlocks[i];
-                        } else if (bt >= minTime) {
-                            break;
-                        }
-                    }
-
-                    if (prevBlock) {
-                        // Use the previous block's luck value at minTime
-                        luckTrendData.unshift([minTime, prevBlock.luck]);
-                    } else {
-                        // No previous block, use first point's value at minTime
-                        luckTrendData.unshift([minTime, luckTrendData[0][1]]);
-                    }
-                }
-
-                // Append the live in-progress extrapolation at x = now.
-                if (liveLuckPoint && liveLuckPoint.x > luckTrendData[luckTrendData.length - 1][0]) {
-                    luckTrendData.push([liveLuckPoint.x, liveLuckPoint.y]);
-                }
-            } else if (sortedBlocks.length > 0 && liveLuckPoint) {
-                // No blocks inside the window: draw the same hyperbola across it.
-                var edgeElapsedMs = Math.max(minTime - liveLuckPoint.lastBlkMs, 1000);
-                var edgeLuck = Math.min((liveLuckPoint.expectedMs / edgeElapsedMs) * 100, 1000);
-                luckTrendData.push([minTime, edgeLuck]);
-                luckTrendData.push([liveLuckPoint.x, liveLuckPoint.y]);
-            }
-            
-            // Convert simple array points to objects for luck trend
-            // Apply logarithmic compression to values above 100% (same as compact chart)
-            var fsTransformLuck = function(actualLuck) {
-                if (actualLuck <= 100) {
-                    return actualLuck;
-                } else {
-                    var distanceAbove = actualLuck - 100;
-                    var compressed = 100 * Math.log10(1 + distanceAbove / 100);
-                    return 100 + compressed;
-                }
-            };
-            
-            luckTrendData = luckTrendData.map(function(point) {
-                if (Array.isArray(point)) {
-                    return {x: point[0], y: fsTransformLuck(point[1])};
-                }
-                return {x: point.x, y: fsTransformLuck(point.y)};
-            });
-            
-            // Calculate dynamic luck Y-axis range to center 100% (fullscreen)
-            var fsLuckMin = 0, fsLuckMax = 200;
-            if (luckTrendData.length > 0) {
-                var transformedValues = luckTrendData.map(function(p) { return p.y; });
-                var minTransformed = Math.min.apply(null, transformedValues);
-                var maxTransformed = Math.max.apply(null, transformedValues);
-                
-                var distanceAbove = Math.max(0, maxTransformed - 100);
-                var distanceBelow = Math.max(0, 100 - minTransformed);
-                var maxDistance = Math.max(distanceAbove, distanceBelow) * 1.1;
-                
-                fsLuckMin = Math.max(0, 100 - maxDistance);
-                fsLuckMax = 100 + maxDistance;
-            }
-            
             // Update fullscreen stats
             var current = values[values.length - 1] || 0;
             var sum = values.reduce(function(a, b) { return a + b; }, 0);
@@ -9518,10 +10647,6 @@
             var doaSum = doaValues.reduce(function(a, b) { return a + b; }, 0);
             var doaAvg = doaValues.length > 0 ? doaSum / doaValues.length : 0;
             var doaPercent = avg > 0 ? ((doaAvg / (avg + doaAvg)) * 100).toFixed(2) : '0.00';
-            
-            // Calculate average luck for fullscreen
-            var fsAvgLuck = validLucks.length > 0 ? 
-                validLucks.reduce(function(a, b) { return a + b; }, 0) / validLucks.length : null;
             
             document.getElementById('fs-graph-current').textContent = format_hashrate(current);
             document.getElementById('fs-graph-average').textContent = format_hashrate(avg);
@@ -9534,18 +10659,9 @@
             fsUniqueMinerCount = (fsUniqueMinerCount === null || fsUniqueMinerCount === undefined) ? 0 : Math.round(fsUniqueMinerCount);
             document.getElementById('fs-graph-miners').textContent = fsWorkerCount + '/' + fsUniqueMinerCount;
             
-            // Same honest empty-state as the compact chart, scoped to the
-            // fullscreen legend/stat.
-            if (!applyLuckEmptyState('fs-graph-luck', '.fullscreen-controls', luckTrendData.length > 0)) {
-                var luckEl = document.getElementById('fs-graph-luck');
-                if (fsAvgLuck !== null) {
-                    luckEl.textContent = d3.format('.0f')(fsAvgLuck) + '%';
-                    luckEl.style.color = fsAvgLuck >= 100 ? 'var(--success)' : (fsAvgLuck >= 75 ? 'var(--warning)' : 'var(--danger)');
-                } else {
-                    luckEl.textContent = '-';
-                    luckEl.style.color = '';
-                }
-            }
+            // Pool Luck, as on the compact chart, scoped to the fullscreen
+            // legend/stat.
+            c2pGraphLuckStat('fs-graph-luck', 'fs-graph-luck-label', '.fullscreen-controls', chartLuck);
             // CI95 effective-vs-reported band. lastNetDiff read defensively so
             // this is agnostic to the netdiff sample shape; k counts blocks WE
             // found in the window regardless of whether luck was computable --
@@ -9578,8 +10694,8 @@
                     panKey: 'shift',
                     zoomType: 'x',
                     events: {
-                        load: function() { drawDiffRatioBars(this); },
-                        redraw: function() { drawDiffRatioBars(this); }
+                        load: function() { drawDiffRatioBars(this); drawDupletLinks(this); },
+                        redraw: function() { drawDiffRatioBars(this); drawDupletLinks(this); }
                     }
                 },
                 credits: { enabled: false },
@@ -9590,7 +10706,9 @@
                     tickColor: '#3a3a5a',
                     labels: { style: { color: '#e0e0e0', fontSize: '11px' } },
                     gridLineColor: '#2a2a4a',
-                    gridLineWidth: 1
+                    gridLineWidth: 1,
+                    plotBands: chartLuck.plotBands,
+                    plotLines: c2pClassicLines ? c2pClassicPlotLines(c2pMainBlockTimes(blockMarkers)) : []
                 },
                 yAxis: [{
                     title: { text: null },
@@ -9612,24 +10730,7 @@
                     tickColor: '#ffc107',
                     labels: {
                         style: { color: '#ffc107', fontSize: '11px' },
-                        formatter: function() {
-                            // Inverse transform: convert display value back to actual luck
-                            var displayValue = this.value;
-                            if (displayValue <= 100) {
-                                return displayValue.toFixed(0) + '%';
-                            } else {
-                                var compressed = displayValue - 100;
-                                var actualLuck = 100 + 100 * (Math.pow(10, compressed / 100) - 1);
-                                
-                                if (this.isLast && displayValue > fsLuckMax * 0.98) {
-                                    return '∞';
-                                }
-                                if (actualLuck > 1000) {
-                                    return (actualLuck / 1000).toFixed(1) + 'k%';
-                                }
-                                return actualLuck.toFixed(0) + '%';
-                            }
-                        }
+                        formatter: function() { return c2pLuckAxisLabel(this.value); }
                     },
                     gridLineWidth: 0,
                     opposite: true,
@@ -9681,18 +10782,7 @@
                             var s = '<b>' + Highcharts.dateFormat('%b %e, %H:%M:%S', this.x) + '</b><br/>';
                             s += block_headline_html(b);
                             s += 'Height: <b>' + (b.number || '?') + '</b><br/>';
-                            if (b.luck !== undefined && b.luck !== null) {
-                                var luckColor = b.luck >= 100 ? '#00ff88' : (b.luck >= 75 ? '#ffc107' : '#ff6b6b');
-                                s += 'Luck: <b style="color:' + luckColor + '">' + b.luck < 1 ? d3.format('.2f')(b.luck) : d3.format('.0f')(b.luck) + '%</b><br/>';
-                            } else if (b.luck_method === 'first_block') {
-                                s += 'Luck: <b style="color:#888">1st block</b><br/>';
-                            }
-                            if (b.time_to_find) {
-                                s += 'Found in: <b>' + format_dt(b.time_to_find) + '</b><br/>';
-                            }
-                            if (b.expected_time) {
-                                s += 'Expected: <b>' + format_dt(b.expected_time) + '</b><br/>';
-                            }
+                            s += block_luck_html(b, this.point ? this.point.pace : this.pace);
                             if (b.network_difficulty) {
                                 s += 'Net Diff: <b style="color:#8888ff">' + diff_as_hashrate(b.network_difficulty) + '</b><br/>';
                                 s += '<span style="font-size:11px;color:#888">(Hashrate needed to solve in ' + format_duration(block_period_sec()) + ')</span><br/>';
@@ -9728,8 +10818,7 @@
                             if (point.series.name === 'Hashrate') goodVal = point.y;
                             if (point.series.name === 'Dead on arrival') doaVal = point.y;
                             if (point.series.name === 'Luck Trend') {
-                                s += '<br/><span style="color:' + point.color + '">●</span> ' + 
-                                     point.series.name + ': <b>' + d3.format('.0f')(point.y) + '%</b>';
+                                s += c2pLuckTrendTipHtml(point);
                             } else if (point.series.name === 'Workers' || point.series.name === 'Miners' || point.series.name === 'Connected') {
                                 s += '<br/><span style="color:' + point.color + '">●</span> ' + 
                                      point.series.name + ': <b>' + Math.round(point.y) + '</b>';
@@ -9813,19 +10902,8 @@
                 }, {
                     type: 'scatter',
                     name: 'Blocks',
-                    data: blockMarkers.map(function(m) {
-                        return {
-                            x: m.x,
-                            y: m.y,
-                            block: m.block,
-                            marker: {
-                                fillColor: m.style.fillColor || '#10b981',
-                                lineColor: m.style.lineColor,
-                                symbol: m.style.symbol,
-                                radius: 6
-                            }
-                        };
-                    }),
+                    data: c2pBlockSeriesData(blockMarkers, chartLuck.pace),
+                    turboThreshold: 0,
                     color: '#10b981',
                     visible: seriesVisibility.blocks,
                     yAxis: 0,
@@ -9834,18 +10912,7 @@
                             var b = this.block;
                             var s = block_headline_html(b);
                             s += 'Height: <b>' + (b.number || b.block_height || '?') + '</b><br/>';
-                            if (b.luck !== undefined && b.luck !== null) {
-                                var luckColor = b.luck >= 100 ? '#00ff88' : (b.luck >= 75 ? '#ffc107' : '#ff6b6b');
-                                s += 'Luck: <b style="color:' + luckColor + '">' + (b.luck < 1 ? d3.format('.2f')(b.luck) : d3.format('.0f')(b.luck)) + '%</b><br/>';
-                            } else if (b.luck_method === 'first_block') {
-                                s += 'Luck: <b style="color:#888">1st block</b><br/>';
-                            }
-                            if (b.time_to_find) {
-                                s += 'Found in: <b>' + format_dt(b.time_to_find) + '</b><br/>';
-                            }
-                            if (b.expected_time) {
-                                s += 'Expected: <b>' + format_dt(b.expected_time) + '</b><br/>';
-                            }
+                            s += block_luck_html(b, this.point ? this.point.pace : this.pace);
                             if (b.network_difficulty) {
                                 s += 'Net Diff: <b style="color:#8888ff">' + diff_as_hashrate(b.network_difficulty) + '</b><br/>';
                                 s += '<span style="font-size:10px;color:#aaa">(' + diff_detail(b.network_difficulty) + ')</span><br/>';
@@ -9895,9 +10962,10 @@
                     yAxis: 2,
                     visible: seriesVisibility.connected
                 }, {
-                    type: 'spline',
+                    type: 'line',
                     name: 'Luck Trend',
                     data: luckTrendData,
+                    turboThreshold: 0,
                     color: '#ffc107',
                     lineWidth: 2,
                     dashStyle: 'ShortDash',
@@ -9944,6 +11012,7 @@
                     zIndex: 4
                 }]
             });
+            fullscreenChart.c2pBlockTimes = c2pMainBlockTimes(blockMarkers);
         }
         
         // Resize handler
@@ -10260,7 +11329,7 @@
          are unchanged for default users. -->
     <script type="module">
         if (window.__c2pBundledExplorer) {
-            import('./sharechain-explorer/dist/sharechain-explorer.js')
+            import('./sharechain-explorer/dist/sharechain-explorer.js?v=10b8f190')
                 .then(function(mod) {
                     var canvas = document.getElementById('defrag-canvas');
                     var wrap = canvas && canvas.parentElement;
@@ -10308,21 +11377,17 @@
                     }
                     function onMouseMove(ev) {
                         if (!window.__explorerBundled) return;
+                        // A cached bundle older than this page lacks the API.
+                        if (typeof window.__explorerBundled.cellAtPoint !== 'function') return;
                         var state = window.__explorerBundled.getState();
                         var shares = state.window.shares;
                         if (shares.length === 0) return;
-                        var layout = mod.computeGridLayout({
-                            shareCount: shares.length,
-                            containerWidth: wrap.clientWidth,
-                            cellSize: 10,
-                            gap: 1,
-                            marginLeft: 38,
-                            minHeight: 40,
-                        });
+                        // Hit-test against the layout the renderer actually
+                        // painted (auto-fit cell size), not a fixed 10 px grid.
                         var rect = canvas.getBoundingClientRect();
                         var x = ev.clientX - rect.left;
                         var y = ev.clientY - rect.top;
-                        var idx = mod.cellAtPoint(layout, x, y);
+                        var idx = window.__explorerBundled.cellAtPoint(x, y);
                         if (idx === null) {
                             if (hoveredIdx !== -1) { hoveredIdx = -1; hoverPanel.hide(); }
                             return;

@@ -31,6 +31,7 @@ set(source
     addr_store.hpp addr_store.cpp
     p2p_message_stats.hpp
     web_server.hpp web_server.cpp
+    found_block_import.hpp found_block_import.cpp
     graph_history.hpp graph_history.cpp
     http_session.cpp
     ip_mask.hpp ip_mask.cpp

@@ -1,0 +1,38 @@
+{
+ "source": "https://dash.voidbind.com/recent_blocks and /luck_stats (public endpoints, c2pool-dash relay node, a build that serves no effort/periods/current_round)",
+ "captured_utc": 1794816885,
+ "chain": "DASH",
+ "rows": 230,
+ "current_luck_trend": 101.13572753704139,
+ "note": "recent_blocks rows reduced to the columns the luck code reads; hash = last 16 hex digits; expected_time rounded to 1 ms, luck to 4 decimals",
+ "mean_of_per_block_luck_30d": 1280.718,
+ "mean_of_per_block_luck_7d": 521.8735,
+ "pooled_reference": {
+  "1d": {
+   "k": 11,
+   "blocks_expected": 9.636549766,
+   "luck": 114.148738571
+  },
+  "7d": {
+   "k": 78,
+   "blocks_expected": 66.031893284,
+   "luck": 118.12473658
+  },
+  "30d": {
+   "k": 229,
+   "blocks_expected": 227.979749971,
+   "luck": 100.44751783
+  },
+  "90d": {
+   "k": 229,
+   "blocks_expected": 227.979749971,
+   "luck": 100.44751783
+  },
+  "all": {
+   "k": 229,
+   "blocks_expected": 227.979749971,
+   "luck": 100.44751783
+  }
+ },
+ "reference_note": "pooled_reference computed independently in Python, the way the node computes its periods: k = main-chain blocks in the span; expected = sum of time_to_find / expected_time over them, the round that straddles the start of the span counted for the part inside it, plus the open round effort 100 / current_luck_trend; a round the node timed from an orphaned row is timed from the previous main-chain block; the first block is effort 1"
+}

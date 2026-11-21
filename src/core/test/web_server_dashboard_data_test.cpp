@@ -43,6 +43,14 @@ nlohmann::json find_block(const nlohmann::json& arr, const std::string& hash)
     return nlohmann::json(nullptr);
 }
 
+// The winning share's difficulty in the fixtures that run a pool of 2^32 H/s.
+// It has to be one such a pool could mine: a share's difficulty bounds its
+// pool's rate from below (core::luck::rate_at_find_plausible -- a rate
+// recorded "at find" under that bound is some node's own stratum rate, not
+// the pool's), and the 240228 a real DASH share carries belongs to a pool of
+// ~5e13 H/s.
+constexpr double kShareDifficulty = 240.0;
+
 // Wire a live coin template the way main_dash does: netdiff 1.0 and a pool
 // hashrate of exactly 2^32 H/s make expected_time == 1 s, so the luck
 // arithmetic is checkable by eye. (MiningInterface is neither movable nor
@@ -92,13 +100,13 @@ TEST(DashboardData, LuckIsComputedFromTheLiveTemplateWhenTheCacheIsCold)
     mi.record_found_block(2516911, uint256S(h1), /*ts=*/1785955172, "DASH",
                           "XoZcEFbqwnty5secW7HYjdQEZYfubMkURu", h1,
                           /*network_difficulty=*/0.0,
-                          /*share_difficulty=*/240228.0,
+                          /*share_difficulty=*/kShareDifficulty,
                           /*pool_hashrate=*/0.0, /*subsidy=*/0);
     // Second block 2 s later: expected_time = 1.0 * 2^32 / 2^32 = 1 s,
     // time_to_find = 2 s, luck = 50%.
     mi.record_found_block(2516914, uint256S(h2), /*ts=*/1785955174, "DASH",
                           "XoZcEFbqwnty5secW7HYjdQEZYfubMkURu", h2,
-                          0.0, 240228.0, 0.0, 0);
+                          0.0, kShareDifficulty, 0.0, 0);
 
     auto blk = find_block(mi.rest_recent_blocks(), h2);
     ASSERT_TRUE(blk.is_object());
@@ -126,33 +134,58 @@ TEST(DashboardData, LuckIsComputedFromTheLiveTemplateWhenTheCacheIsCold)
     EXPECT_DOUBLE_EQ(blk["pool_hashrate_at_find"].get<double>(), 4294967296.0);
 }
 
-// The FIRST block of a ledger has no predecessor, hence no time_to_find and
-// no luck MEASUREMENT. That must surface as null ("not computed"), never as
-// a numeric 0 the chart will draw — 0% luck is a catastrophe claim, and the
-// production chart made exactly that claim out of unmeasured rows.
+// A luck that was not computed must never surface as a numeric 0 the chart
+// will draw — 0% luck is a catastrophe claim, and the production chart made
+// exactly that claim out of unmeasured rows.
+//
+// 2026-11-16, luck as effort (operator ruling): the FIRST block of a ledger
+// has no predecessor, hence no time_to_find; it is effort 1.0 / luck 100 % by
+// definition. A LATER block whose inputs cannot be had (no network
+// difficulty: no template, no cache, no header) is null ("not computed").
 TEST(DashboardData, UncomputedLuckIsNullNeverZero)
 {
     MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
                        c2pool::address::Blockchain::DASH);
-    wire_dash_template(mi);
-    const std::string h =
+    const std::string h1 =
         "5555555555555555555555555555555555555555555555555555555555555555";
-    mi.record_found_block(2516911, uint256S(h), 1785955172, "DASH",
-                          "XoZcEFbqwnty5secW7HYjdQEZYfubMkURu", h,
-                          0.0, 240228.0, 0.0, 0);
+    const std::string h2 =
+        "5555555555555555555555555555555555555555555555555555555555555556";
+    mi.record_found_block(2516911, uint256S(h1), 1785955172, "DASH",
+                          "XoZcEFbqwnty5secW7HYjdQEZYfubMkURu", h1,
+                          0.0, kShareDifficulty, 0.0, 0);
+    mi.record_found_block(2516914, uint256S(h2), 1785955174, "DASH",
+                          "XoZcEFbqwnty5secW7HYjdQEZYfubMkURu", h2,
+                          0.0, kShareDifficulty, 0.0, 0);
 
-    auto blk = find_block(mi.rest_recent_blocks(), h);
-    ASSERT_TRUE(blk.is_object());
-    EXPECT_TRUE(blk["luck"].is_null())
-        << "a first block has no luck measurement; 0 is a fabricated one";
-    EXPECT_TRUE(blk["time_to_find"].is_null());
-    EXPECT_EQ(blk["luck_method"].get<std::string>(), "first_block");
+    auto arr = mi.rest_recent_blocks();
+    auto first = find_block(arr, h1);
+    ASSERT_TRUE(first.is_object());
+    ASSERT_TRUE(first["luck"].is_number());
+    EXPECT_DOUBLE_EQ(first["luck"].get<double>(), 100.0)
+        << "a first block is one found for one expected, never 0";
+    EXPECT_TRUE(first["time_to_find"].is_null());
+    EXPECT_EQ(first["luck_method"].get<std::string>(), "first_block");
+
+    auto second = find_block(arr, h2);
+    ASSERT_TRUE(second.is_object());
+    EXPECT_TRUE(second["luck"].is_null())
+        << "no network difficulty was ever had; 0 is a fabricated measurement";
+    EXPECT_TRUE(second["effort"].is_null());
+    EXPECT_EQ(second["luck_method"].get<std::string>(), "netdiff_unavailable");
 
     // /luck_stats feeds the trend chart: same rule there.
     auto luck = mi.rest_luck_stats();
-    ASSERT_FALSE(luck["blocks"].empty());
-    EXPECT_TRUE(luck["blocks"][0]["luck"].is_null())
-        << "the trend chart must SKIP unmeasured rows, not draw them at 0";
+    ASSERT_EQ(luck["blocks"].size(), 2u);
+    for (const auto& b : luck["blocks"]) {
+        if (b["hash"].get<std::string>() == h2)
+            EXPECT_TRUE(b["luck"].is_null())
+                << "the trend chart must SKIP unmeasured rows, not draw them at 0";
+        else
+            EXPECT_DOUBLE_EQ(b["luck"].get<double>(), 100.0);
+    }
+    // The unmeasured round is left out of the pool's luck on both sides.
+    EXPECT_EQ(luck["periods"]["all"]["k"].get<uint64_t>(), 1u);
+    EXPECT_EQ(luck["periods"]["all"]["k_unmeasured"].get<uint64_t>(), 1u);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -856,12 +889,14 @@ TEST(DashboardData, RecentBlocksCarriesOracleParityResidualFields)
     // Two blocks 2 s apart -> the newer row computes a luck (single-hashrate).
     mi.record_found_block(2516911, uint256S(h1), 1785955172, "DASH",
                           "XoZcEFbqwnty5secW7HYjdQEZYfubMkURu", h1,
-                          0.0, 240228.0, 0.0, 0);
+                          0.0, kShareDifficulty, 0.0, 0);
     mi.record_found_block(2516914, uint256S(h2), 1785955174, "DASH",
                           "XoZcEFbqwnty5secW7HYjdQEZYfubMkURu", h2,
-                          0.0, 240228.0, 0.0, 0);
+                          0.0, kShareDifficulty, 0.0, 0);
 
-    auto arr = mi.rest_recent_blocks();
+    // As of the second block's own time, so the open round after it adds
+    // nothing to the pool aggregate below.
+    auto arr = mi.rest_recent_blocks_at(1785955174.0);
     auto blk = find_block(arr, h2);
     ASSERT_TRUE(blk.is_object());
 
@@ -890,13 +925,16 @@ TEST(DashboardData, RecentBlocksCarriesOracleParityResidualFields)
     EXPECT_EQ(blk["diff_samples_used"].get<int>(), 1);
 
     // First-row pool luck aggregate: the array is newest-first, so arr[0] is
-    // h2 and carries the summary keys. One computed luck (50%), classified
+    // h2 and carries the summary keys. One measured luck (50%), classified
     // honestly as single_hashrate/approximate -- never accurate/simple_avg.
+    // pool_avg_luck is blocks found over blocks expected (2026-11-16): the
+    // first block is 1 found / 1 expected, the second 1 found / 2 expected,
+    // so 2 / 3 -- not the mean of the per-block values.
     ASSERT_FALSE(arr.empty());
     const auto& agg = arr[0];
     ASSERT_TRUE(agg["pool_avg_luck"].is_number());
-    EXPECT_DOUBLE_EQ(agg["pool_avg_luck"].get<double>(), 50.0);
-    EXPECT_EQ(agg["blocks_for_luck"].get<uint64_t>(), 1u);
+    EXPECT_NEAR(agg["pool_avg_luck"].get<double>(), 100.0 * 2.0 / 3.0, 1e-9);
+    EXPECT_EQ(agg["blocks_for_luck"].get<uint64_t>(), 2u);
     EXPECT_EQ(agg["single_hashrate_luck_count"].get<uint64_t>(), 1u);
     EXPECT_EQ(agg["approximate_luck_count"].get<uint64_t>(), 1u);
     EXPECT_EQ(agg["accurate_luck_count"].get<uint64_t>(), 0u);
@@ -906,9 +944,9 @@ TEST(DashboardData, RecentBlocksCarriesOracleParityResidualFields)
 }
 
 // Honest-null on the residual fields: an unmeasured row emits null, never a
-// fabricated 0 or a dead link. A single first block has no luck, so
-// luck_approximate is null and the pool aggregate reports zero contributors
-// with a null average.
+// fabricated 0 or a dead link. A single first block has no MEASURED luck, so
+// luck_approximate is null and no measured-luck counter moves; the pool
+// aggregate counts it as one block found for one expected (2026-11-16).
 TEST(DashboardData, RecentBlocksResidualFieldsHonorHonestNull)
 {
     MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
@@ -935,9 +973,11 @@ TEST(DashboardData, RecentBlocksResidualFieldsHonorHonestNull)
               "https://blockchair.com/dash/block/" + h);
 
     ASSERT_FALSE(arr.empty());
-    EXPECT_TRUE(arr[0]["pool_avg_luck"].is_null());
-    EXPECT_EQ(arr[0]["blocks_for_luck"].get<uint64_t>(), 0u);
+    ASSERT_TRUE(arr[0]["pool_avg_luck"].is_number());
+    EXPECT_DOUBLE_EQ(arr[0]["pool_avg_luck"].get<double>(), 100.0);
+    EXPECT_EQ(arr[0]["blocks_for_luck"].get<uint64_t>(), 1u);
     EXPECT_EQ(arr[0]["single_hashrate_luck_count"].get<uint64_t>(), 0u);
+    EXPECT_EQ(arr[0]["approximate_luck_count"].get<uint64_t>(), 0u);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -989,10 +1029,10 @@ TEST(DashboardData, HeaderLookupFillsNetdiffWhenTemplateAndCacheAreCold)
     // call shape of the replay hook: netdiff 0, pool_hashrate 0, subsidy 0.
     mi.record_found_block(2531045, uint256S(h1), /*ts=*/1788182946, "DASH",
                           "XghFtkZ8W3vhEHejUBbD3n387hemVJ6Pt4", h1,
-                          0.0, 240228.0, 0.0, 0);
+                          0.0, kShareDifficulty, 0.0, 0);
     mi.record_found_block(2531046, uint256S(h2), /*ts=*/1788182948, "DASH",
                           "XghFtkZ8W3vhEHejUBbD3n387hemVJ6Pt4", h2,
-                          0.0, 240228.0, 0.0, 0);
+                          0.0, kShareDifficulty, 0.0, 0);
 
     auto blk = find_block(mi.rest_recent_blocks(), h2);
     ASSERT_TRUE(blk.is_object());
@@ -1024,10 +1064,10 @@ TEST(DashboardData, NetdiffUnavailableLabelIsDistinctFromFirstBlock)
         "2222222222222222222222222222222222222222222222222222222222220002";
     mi.record_found_block(2531045, uint256S(h1), 1788182946, "DASH",
                           "XghFtkZ8W3vhEHejUBbD3n387hemVJ6Pt4", h1,
-                          0.0, 240228.0, 0.0, 0);
+                          0.0, kShareDifficulty, 0.0, 0);
     mi.record_found_block(2531046, uint256S(h2), 1788182948, "DASH",
                           "XghFtkZ8W3vhEHejUBbD3n387hemVJ6Pt4", h2,
-                          0.0, 240228.0, 0.0, 0);
+                          0.0, kShareDifficulty, 0.0, 0);
 
     auto arr = mi.rest_recent_blocks();
     auto b1 = find_block(arr, h1);
@@ -1059,9 +1099,9 @@ TEST(DashboardData, EnrichmentFillsNetdiffOnAlreadyAttributedRow)
     // Predecessor, then the attributed win with NO netdiff (no header, no
     // template) — lands attributed but luck-less.
     mi.record_found_block(2531045, uint256S(h1), 1788182946, "DASH",
-                          "Xminer", h1, 0.0, 240228.0, 0.0, 0);
+                          "Xminer", h1, 0.0, kShareDifficulty, 0.0, 0);
     mi.record_found_block(2531046, uint256S(h2), 1788182948, "DASH",
-                          "Xminer", h2, 0.0, 240228.0, 0.0, 0);
+                          "Xminer", h2, 0.0, kShareDifficulty, 0.0, 0);
     {
         auto blk = find_block(mi.rest_recent_blocks(), h2);
         ASSERT_TRUE(blk["found_locally"].get<bool>());
@@ -1071,7 +1111,7 @@ TEST(DashboardData, EnrichmentFillsNetdiffOnAlreadyAttributedRow)
     // A later attributed record for the same block carries the real netdiff.
     mi.record_found_block(2531046, uint256S(h2), 1788182948, "DASH",
                           "Xminer", h2, /*network_difficulty=*/1.0,
-                          240228.0, 4294967296.0, 0);
+                          kShareDifficulty, 4294967296.0, 0);
 
     auto arr = mi.rest_recent_blocks();
     int copies = 0;
@@ -1101,9 +1141,9 @@ TEST(DashboardData, ConfirmationRepairsNetdiffAndComputesLuck)
         "4444444444444444444444444444444444444444444444444444444444440002";
     // Predecessor + winning block, both with netdiff 0 and NO lookup yet.
     mi.record_found_block(2531045, uint256S(h1), 1788182946, "DASH",
-                          "Xminer", h1, 0.0, 240228.0, 4294967296.0, 0);
+                          "Xminer", h1, 0.0, kShareDifficulty, 4294967296.0, 0);
     mi.record_found_block(2531046, uint256S(h2), 1788182948, "DASH",
-                          "Xminer", h2, 0.0, 240228.0, 4294967296.0, 0);
+                          "Xminer", h2, 0.0, kShareDifficulty, 4294967296.0, 0);
     {
         auto blk = find_block(mi.rest_recent_blocks(), h2);
         EXPECT_TRUE(blk["network_difficulty"].is_null());
@@ -1153,7 +1193,7 @@ TEST(DashboardData, BackfillPersistsRepairedRows)
         b.chain = "DASH"; b.confirmations = 300;
         b.miner = "Xminer"; b.share_hash = hash;
         b.network_difficulty = 0.0;      // the defect
-        b.share_difficulty = 240228.0;
+        b.share_difficulty = kShareDifficulty;
         b.pool_hashrate = 4294967296.0;
         return b;
     };
@@ -1685,6 +1725,8 @@ TEST(FoundBlockExplorer, ParentFieldsAreFillOnly)
 // that order, found no predecessor, and /recent_blocks labelled it
 // "first_block" -- the chart then said "1st block" for a block with 23 earlier
 // rows. A row with an earlier same-chain row is not the first block.
+// 2026-11-16: a round runs from the previous main-chain block BY TIME, so the
+// height-0 row has its predecessor and its luck whatever its height.
 TEST(DashboardData, RowWithEarlierBlocksIsNeverLabelledFirstBlock)
 {
     MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
@@ -1726,10 +1768,12 @@ TEST(DashboardData, RowWithEarlierBlocksIsNeverLabelledFirstBlock)
     EXPECT_EQ(first["luck_method"].get<std::string>(), "first_block")
         << "the genuinely first block keeps its label";
     EXPECT_EQ(second["luck_method"].get<std::string>(), "simple_avg");
-    EXPECT_TRUE(stale["luck"].is_null());
     EXPECT_NE(stale["luck_method"].get<std::string>(), "first_block")
         << "a block with earlier same-chain rows is not the pool's first";
-    EXPECT_EQ(stale["luck_method"].get<std::string>(), "interval_unavailable");
+    EXPECT_EQ(stale["luck_method"].get<std::string>(), "simple_avg");
+    EXPECT_EQ(stale["prev_block_hash"].get<std::string>(), h_second);
+    EXPECT_DOUBLE_EQ(stale["time_to_find"].get<double>(), 1792954341.0 - 1792945704.0);
+    ASSERT_TRUE(stale["luck"].is_number());
 }
 
 // The confirm/orphan verdict runs with the blocks lock released, and every
@@ -1803,4 +1847,219 @@ TEST(DashboardData, ScheduledChecksFollowTheBlockAcrossAnInsert)
         << "the first scheduled check must verify the scheduled block";
     EXPECT_EQ(st_new, MiningInterface::BlockStatus::pending);
     EXPECT_EQ(checks_new, 0u) << "the newcomer was never scheduled";
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Best Share = this node's achieved hash difficulty, not a peer share target
+// ═══════════════════════════════════════════════════════════════════════════
+
+// THE INCIDENT (LTC+DOGE, 2026-11): ~150 GH/s for 12 h, the card read round
+// 511 — a peer's share TARGET from the sharechain verify hook — while the
+// local stratum's achieved scrypt difficulties (best ~1.5e6) never reached it
+// (record_best_pseudoshare was the IWorkSource no-op on MiningInterface).
+// p2pool work.py:4132/4182 records target_to_difficulty(pow_hash) of local
+// submits only.
+namespace {
+void best_pseudoshare(MiningInterface& mi, double diff, const std::string& who)
+{
+    mi.record_best_pseudoshare(diff, who, "", "", "", "", "", "", 0, "", "", {});
+}
+}  // namespace
+
+TEST(DashboardData, BestShareIsFedByLocalPseudoshares)
+{
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::LITECOIN);
+    mi.update_network_difficulty(94.7e6, "test");
+
+    best_pseudoshare(mi, 1.5e6, "w1");
+
+    auto bs = mi.rest_best_share();
+    EXPECT_DOUBLE_EQ(bs["session"]["difficulty"].get<double>(), 1.5e6);
+    EXPECT_DOUBLE_EQ(bs["round"]["difficulty"].get<double>(), 1.5e6);
+    EXPECT_DOUBLE_EQ(bs["all_time"]["difficulty"].get<double>(), 1.5e6);
+    EXPECT_EQ(bs["round"]["miner"].get<std::string>(), "w1");
+    EXPECT_NEAR(bs["round"]["pct_of_block"].get<double>(), 1.584, 1e-3);
+    EXPECT_TRUE(bs["has_best_share"].get<bool>());
+    ASSERT_TRUE(bs.contains("merged"));
+    EXPECT_DOUBLE_EQ(bs["merged"]["round"]["difficulty"].get<double>(), 1.5e6);
+    EXPECT_DOUBLE_EQ(bs["merged"]["all_time"]["difficulty"].get<double>(), 1.5e6);
+
+    // A lower pseudoshare never lowers a leg.
+    best_pseudoshare(mi, 9.0e5, "w2");
+    bs = mi.rest_best_share();
+    EXPECT_DOUBLE_EQ(bs["round"]["difficulty"].get<double>(), 1.5e6);
+    EXPECT_EQ(bs["round"]["miner"].get<std::string>(), "w1");
+}
+
+TEST(DashboardData, SharechainShareTargetsDoNotReachBestShare)
+{
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::LITECOIN);
+    mi.update_network_difficulty(94.7e6, "test");
+    best_pseudoshare(mi, 1.5e6, "w1");
+
+    // A verified peer share far above the local best (startup re-verify of a
+    // big-target share) feeds the ring only.
+    mi.record_share_difficulty(21631.0, "peer", "", /*update_best=*/false);
+    mi.record_share_difficulty(5.0e6, "peer", "", /*update_best=*/false);
+
+    auto bs = mi.rest_best_share();
+    EXPECT_DOUBLE_EQ(bs["all_time"]["difficulty"].get<double>(), 1.5e6);
+    EXPECT_DOUBLE_EQ(bs["session"]["difficulty"].get<double>(), 1.5e6);
+    EXPECT_DOUBLE_EQ(bs["round"]["difficulty"].get<double>(), 1.5e6);
+    EXPECT_EQ(bs["round"]["miner"].get<std::string>(), "w1");
+    EXPECT_DOUBLE_EQ(bs["merged"]["round"]["difficulty"].get<double>(), 1.5e6);
+
+    // Default (DASH / bip110 callers) still raises the PRIMARY legs only.
+    mi.record_share_difficulty(2.0e6, "dash", "ab");
+    bs = mi.rest_best_share();
+    EXPECT_DOUBLE_EQ(bs["round"]["difficulty"].get<double>(), 2.0e6);
+    EXPECT_DOUBLE_EQ(bs["merged"]["round"]["difficulty"].get<double>(), 1.5e6);
+}
+
+TEST(DashboardData, BestShareMedianRowIsTheWindowMedian)
+{
+    EXPECT_DOUBLE_EQ(MiningInterface::median_share_difficulty({}), 0.0);
+    EXPECT_DOUBLE_EQ(MiningInterface::median_share_difficulty({511.0}), 511.0);
+    // Odd: middle of the sorted window, not the mean (5401.6).
+    EXPECT_DOUBLE_EQ(MiningInterface::median_share_difficulty(
+                         {21631.0, 511.0, 600.0, 4000.0, 266.0}), 600.0);
+    // Even: mean of the two middle values (web.py:1606).
+    EXPECT_DOUBLE_EQ(MiningInterface::median_share_difficulty(
+                         {400.0, 100.0, 300.0, 200.0}), 250.0);
+
+    // rest_best_share prefers median_difficulty over the window average.
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::LITECOIN);
+    mi.update_network_difficulty(1000.0, "test");
+    mi.set_sharechain_stats_fn([]() {
+        return nlohmann::json{{"average_difficulty", 500.0},
+                              {"median_difficulty", 100.0}};
+    });
+    EXPECT_DOUBLE_EQ(mi.rest_best_share()["median_pct"].get<double>(), 10.0);
+    mi.set_sharechain_stats_fn([]() {
+        return nlohmann::json{{"average_difficulty", 500.0}};
+    });
+    EXPECT_DOUBLE_EQ(mi.rest_best_share()["median_pct"].get<double>(), 50.0)
+        << "coins without a median keep the average";
+}
+
+TEST(DashboardData, MergedAllTimeBestShareSurvivesARestart)
+{
+    const std::string log_path = "/tmp/c2pool_test_bestshare_merged_statlog.json";
+    std::remove(log_path.c_str());
+    std::remove((log_path + ".best.json").c_str());
+    {
+        MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                           c2pool::address::Blockchain::LITECOIN);
+        mi.set_stat_log_path(log_path);
+        best_pseudoshare(mi, 1.5e6, "w1");
+        mi.save_stat_log();
+    }
+    MiningInterface mi2(/*testnet=*/false, /*node=*/nullptr,
+                        c2pool::address::Blockchain::LITECOIN);
+    mi2.set_stat_log_path(log_path);
+    mi2.load_stat_log();
+    auto bs = mi2.rest_best_share();
+    EXPECT_DOUBLE_EQ(bs["all_time"]["difficulty"].get<double>(), 1.5e6);
+    ASSERT_TRUE(bs.contains("merged"));
+    EXPECT_DOUBLE_EQ(bs["merged"]["all_time"]["difficulty"].get<double>(), 1.5e6);
+    EXPECT_EQ(bs["merged"]["all_time"]["miner"].get<std::string>(), "w1");
+    EXPECT_DOUBLE_EQ(bs["merged"]["round"]["difficulty"].get<double>(), 0.0)
+        << "round is per-process";
+    std::remove(log_path.c_str());
+    std::remove((log_path + ".best.json").c_str());
+}
+
+// The record's hash is the scrypt pow-hash of the submitted header: the same
+// bytes the stratum gate hashed (calculate_share_difficulty), so the hash read
+// back as a difficulty is the record's difficulty.
+TEST(DashboardData, BestPseudoshareHashIsItsHeadersPowHash)
+{
+    const std::string coinb1 = "01000000", coinb2 = "00000000";
+    const std::string en1 = "00000000", en2 = "00000000";
+    const std::string ntime = "6ae2a090", nonce = "00000000";
+    const std::string prev(64, '1'), nbits = "1a0fffff";
+    const uint32_t version = 0x20000000;
+    const double d = MiningInterface::calculate_share_difficulty(
+        coinb1, coinb2, en1, en2, ntime, nonce, version, prev, nbits, {});
+    ASSERT_GT(d, 0.0);
+
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::LITECOIN);
+    mi.record_best_pseudoshare(d, "w1", coinb1, coinb2, en1, en2, ntime, nonce,
+                               version, prev, nbits, {});
+    const auto bs = mi.rest_best_share();
+    const std::string hash = bs["round"]["hash"].get<std::string>();
+    ASSERT_EQ(hash.size(), 64u);
+    EXPECT_EQ(bs["all_time"]["hash"].get<std::string>(), hash);
+    uint256 h;
+    h.SetHex(hash);
+    double hv = 0.0;
+    for (int i = 31; i >= 0; --i) hv = hv * 256.0 + static_cast<double>(h.data()[i]);
+    ASSERT_GT(hv, 0.0);
+    static const double truediffone =
+        26959535291011309493156476344723991336010898738574164086137773096960.0;
+    EXPECT_NEAR(truediffone / hv, d, d * 1e-9)
+        << "the card's hash is not the hash its difficulty was measured on";
+}
+
+// A v1 sidecar (no "v") on LTC holds a sharechain share TARGET: the LTC card's
+// only feed was the verify hook, which reported every pool miner's share
+// target. It must not come back as this node's all-time record (field 2026-11:
+// a peer's 21631 on two unrelated nodes). DASH's feeds did not change, so its
+// v1 files keep loading.
+TEST(DashboardData, PreFixLtcBestShareSidecarIsDropped)
+{
+    const std::string log_path = "/tmp/c2pool_test_bestshare_v1_statlog.json";
+    const std::string side = log_path + ".best.json";
+    const auto write_v1 = [&side] {
+        std::ofstream f(side, std::ios::trunc);
+        f << R"({"difficulty":21631.0,"miner":"5d1f0e9a7c3b2a1908f7e6d5c4b3a29180706050","hash":"","ts":1793000000})";
+    };
+    std::remove(log_path.c_str());
+
+    write_v1();
+    {
+        MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                           c2pool::address::Blockchain::LITECOIN);
+        mi.set_stat_log_path(log_path);
+        mi.load_stat_log();
+        const auto bs = mi.rest_best_share();
+        EXPECT_DOUBLE_EQ(bs["all_time"]["difficulty"].get<double>(), 0.0)
+            << "a peer's share target came back as this node's record";
+        EXPECT_FALSE(bs["has_best_share"].get<bool>());
+        // The first local hash starts the record; the file is rewritten as v2.
+        best_pseudoshare(mi, 900.0, "w1");
+        mi.save_stat_log();
+    }
+    {
+        std::ifstream f(side);
+        const auto j = nlohmann::json::parse(f);
+        EXPECT_EQ(j.value("v", 0), 2);
+        EXPECT_DOUBLE_EQ(j.value("difficulty", 0.0), 900.0);
+    }
+    {
+        MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                           c2pool::address::Blockchain::LITECOIN);
+        mi.set_stat_log_path(log_path);
+        mi.load_stat_log();
+        const auto bs = mi.rest_best_share();
+        EXPECT_DOUBLE_EQ(bs["all_time"]["difficulty"].get<double>(), 900.0)
+            << "a v2 file is this node's own record";
+        EXPECT_EQ(bs["all_time"]["miner"].get<std::string>(), "w1");
+    }
+
+    write_v1();
+    {
+        MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                           c2pool::address::Blockchain::DASH);
+        mi.set_stat_log_path(log_path);
+        mi.load_stat_log();
+        EXPECT_DOUBLE_EQ(mi.rest_best_share()["all_time"]["difficulty"].get<double>(), 21631.0)
+            << "DASH's feeds are unchanged; its v1 files load as before";
+    }
+    std::remove(log_path.c_str());
+    std::remove(side.c_str());
 }

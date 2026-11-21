@@ -34,6 +34,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <map>
+#include <set>
 #include <memory>
 #include <string>
 #include <system_error>
@@ -229,4 +230,96 @@ TEST(DashOutboundRedial, OwnerReleasedMidDialHookRunsOnLiveNodeThenNodeIsFreed)
         << "the node must be released once the failed dial's handler returns";
     EXPECT_EQ(failures_for(*failures, dead), 1)
         << "the dial failure must be delivered to the (still live) node exactly once";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// --connect is connect-only (2026-11-16): a measurement node started with one
+// --connect peer and no --listen still dialed every address its peer advertised
+// by addr gossip, because the maintenance pass drew from the whole AddrStore.
+// With set_connect_only, no pass may dial anything outside the configured set,
+// over several maintenance cycles, even while gossip-learned addresses sit in
+// the store.
+// ─────────────────────────────────────────────────────────────────────────────
+namespace {
+
+class ConnectOnlyProbeNode : public RedialProbeNode
+{
+public:
+    using RedialProbeNode::RedialProbeNode;
+    // What handle_addrs does for an address a peer advertised.
+    void learn(const NetService& addr)
+    {
+        const auto now = core::timestamp();
+        m_addrs.add(addr, {0, now, now});
+    }
+};
+
+} // namespace
+
+TEST(DashConnectOnly, MaintenancePassesDialOnlyTheConnectSet)
+{
+    boost::asio::io_context ioc;
+    ConfigDirCleanup cleanup{unique_config_name("connectonly")};
+    dash::Config cfg{cleanup.name};
+
+    const NetService seed("127.0.0.1", refused_loopback_port());
+    cfg.pool()->m_bootstrap_addrs = {seed};
+
+    auto node = std::make_shared<ConnectOnlyProbeNode>(&ioc, &cfg);
+    node->set_lifetime(node);
+    auto failures = node->failures;
+
+    // Three addresses learned by gossip (refused loopback ports, so a dial to
+    // any of them would surface as a connect_failed within the budget). The
+    // ports are kept distinct from each other and from the seed's.
+    std::set<std::uint16_t> used{seed.port()};
+    auto fresh_port = [&used] {
+        for (;;) { const auto p = refused_loopback_port(); if (used.insert(p).second) return p; }
+    };
+    const NetService g1("127.0.0.1", fresh_port());
+    const NetService g2("127.0.0.1", fresh_port());
+    const NetService g3("127.0.0.1", fresh_port());
+    node->learn(g1);
+    node->learn(g2);
+    node->learn(g3);
+
+    node->set_connect_only({seed});
+    ASSERT_TRUE(node->connect_only());
+
+    for (int pass = 1; pass <= 3; ++pass) {
+        node->try_connect_peers();
+        EXPECT_TRUE(node->is_pending(seed)) << "pass " << pass << " must dial the --connect peer";
+        EXPECT_FALSE(node->is_pending(g1) || node->is_pending(g2) || node->is_pending(g3))
+            << "pass " << pass << " dialed an address learned by gossip";
+        ASSERT_TRUE(pump_until(ioc, [&] { return failures_for(*failures, seed) >= pass; }, kDialBudget))
+            << "harness: the --connect dial must resolve (refused) each pass";
+    }
+    EXPECT_EQ(failures_for(*failures, seed), 3);
+    EXPECT_EQ(failures_for(*failures, g1) + failures_for(*failures, g2) + failures_for(*failures, g3), 0)
+        << "zero outbound dials beyond the --connect set over three maintenance cycles";
+}
+
+// Control: without set_connect_only (an --addnode node) the same pass DOES
+// dial gossip-learned addresses, i.e. discovery is unchanged for --addnode.
+TEST(DashConnectOnly, WithoutConnectOnlyGossipAddressesAreStillDialed)
+{
+    boost::asio::io_context ioc;
+    ConfigDirCleanup cleanup{unique_config_name("discovery")};
+    dash::Config cfg{cleanup.name};
+
+    const NetService seed("127.0.0.1", refused_loopback_port());
+    cfg.pool()->m_bootstrap_addrs = {seed};
+
+    auto node = std::make_shared<ConnectOnlyProbeNode>(&ioc, &cfg);
+    node->set_lifetime(node);
+
+    std::uint16_t gport = refused_loopback_port();
+    while (gport == seed.port()) gport = refused_loopback_port();
+    const NetService g1("127.0.0.1", gport);
+    node->learn(g1);
+    ASSERT_FALSE(node->connect_only());
+
+    node->try_connect_peers();
+    EXPECT_TRUE(node->is_pending(seed));
+    EXPECT_TRUE(node->is_pending(g1)) << "an --addnode node keeps dialing gossip-learned peers";
 }

@@ -356,6 +356,15 @@ struct DiscoveredMergedBlock
     bool        is_local{false};  // true = our own submission, false = detected from peer share
     uint32_t    parent_height{0}; // parent (LTC) block height (absheight)
     std::string miner;            // miner address who found the block
+    // The aux chain's own network difficulty at find, read off the aux
+    // block's bits (0 = not known). Display only (the block's luck).
+    double      difficulty{0.0};
+    // The GROSS parent-chain pool rate when the block was found (the
+    // sharechain estimator, MiningInterface::gross_pool_hashrate_at); 0 = not
+    // known: a record from before it was kept, or a block learned long after
+    // its find. Display only: served as pool_hashrate_at_find, the
+    // single-sample fallback of the block's luck.
+    double      pool_hashrate{0.0};
 };
 
 // ─── Integrated Merged Mining Manager ────────────────────────────────────────
@@ -873,9 +882,10 @@ private:
     // The block a share actually committed to: its hash, height and coinbase
     // value from the frozen snapshot the block was built from (a stale job's
     // is not the current work).
+    // `difficulty`: the block's own, from its bits (0 = not known). Display only.
     void record_discovered_block(const ChainState& chain, const SubmitVerdict& verdict,
                                  const std::string& parent_hash, const uint256& block_hash,
-                                 int height, uint64_t coinbase_value);
+                                 int height, uint64_t coinbase_value, double difficulty = 0.0);
 
     // recursive_mutex: rebuild_cached_blocks() acquires/releases m_mutex
     // in phases (snapshot → payout_fn → re-acquire to store).  poll_loop

@@ -1003,3 +1003,46 @@ TEST(DashHeaderChain, ExpectedBitsAfterRefusesAParentDeeperThanMaxDepth)
     EXPECT_FALSE(hc.expected_bits_after(mc.hashes[33], t, 6).has_value()) << "7 below the tip";
     EXPECT_TRUE(hc.expected_bits_after(mc.hashes[33], t).has_value()) << "no depth bound by default";
 }
+
+// ─── network hashrate (Dash Core getnetworkhashps) ─────────────────────────
+// The dashboard used tip difficulty * 2^32 / 150, which DarkGravityWave swings
+// ~2x within hours on Dash (11-16: 5.6 PH/s against getnetworkhashps 3.25
+// PH/s). HeaderChain::network_hashps is Dash Core's GetNetworkHashPS: chain
+// work over the window divided by the window's max - min block time.
+
+// RED on master (no helper): Dash Core's own answer at mainnet h=2573376.
+// Vector from a Dash Core 24.0.2 node: getnetworkhashps 576 2573376 =
+// 3251162766216974, chainwork at 2573376 and 2572800, and the min / max block
+// time over 2572800..2573376.
+TEST(DashNetworkHashps, MatchesDashCoreGetNetworkHashpsAtMainnetHeight)
+{
+    uint256 tip, base;
+    tip.SetHex("00000000000000000000000000000000000000000000c274b3be21c35c4e1f9f");
+    base.SetHex("00000000000000000000000000000000000000000000c264dc173e55c7f73f67");
+    const double hps = network_hashps_from(tip, base, 1794763522, 1794853410);
+    EXPECT_NEAR(hps, 3251162766216974.0, 1.0);
+}
+
+TEST(DashNetworkHashps, NoGrowthOrNoTimeSpanIsZero)
+{
+    uint256 a, b;
+    a.SetHex("0000000000000000000000000000000000000000000000000000000000001000");
+    b.SetHex("0000000000000000000000000000000000000000000000000000000000002000");
+    EXPECT_EQ(network_hashps_from(b, a, 100, 100), 0.0) << "min == max time (dashd returns 0)";
+    EXPECT_EQ(network_hashps_from(b, a, 200, 100), 0.0) << "inverted span";
+    EXPECT_EQ(network_hashps_from(a, b, 100, 200), 0.0) << "work does not grow";
+    EXPECT_EQ(network_hashps_from(a, a, 100, 200), 0.0) << "equal work";
+    EXPECT_GT(network_hashps_from(b, a, 100, 200), 0.0);
+}
+
+// The HeaderChain method walks a real (mined) window: 10 blocks at the
+// pow-limit target, 150 s apart => 10 * proof / 1500 s.
+TEST(DashNetworkHashps, HeaderChainWindowOverAMinedChain)
+{
+    auto mc = build_mined_chain(40, 1'800'000'000u);
+    const auto& hc = *mc.hc;
+    const double proof = get_block_proof(mc.params.pow_limit.GetCompact()).getdouble();
+    EXPECT_NEAR(hc.network_hashps(10), 10.0 * proof / 1500.0, 10.0 * proof / 1500.0 * 1e-12);
+    EXPECT_EQ(hc.network_hashps(40), 0.0) << "the window must lie above the chain's first entry";
+    EXPECT_EQ(hc.network_hashps(0), 0.0);
+}

@@ -33,6 +33,7 @@
 // non-broadcaster shape suitable for B2-net smoke testing.
 
 #include <impl/btc/coin/header_chain.hpp>
+#include <core/found_block_lookups.hpp>           // header-bits difficulty by block hash
 #include <impl/btc/coin/template_builder.hpp> // btc::coin::get_block_subsidy — zero-rig block-value projection (dashboard cards)
 #include <impl/btc/coin/tip_reconcile_gate.hpp> // B5b: TipReconcileGate SSOT (10s re-poll cadence + fire predicate) shared with tip_reconcile_test.cpp
 #include <impl/btc/coin/mempool.hpp>
@@ -115,6 +116,7 @@ static void print_usage()
         "Usage: c2pool-btc [--testnet | --testnet4 | --regtest] --bitcoind HOST:PORT\n"
         "                  [--p2pool HOST:PORT]\n"
         "\n"
+        "  --version       print \"c2pool-btc <version>\" and exit\n"
         "  --testnet       BTC testnet3 chain (genesis 000000000933ea01...)\n"
         "  --testnet4      BTC testnet4 chain (genesis 00000000da84f2ba...)\n"
         "  --regtest       BTC regtest chain (genesis 0f9188f13cb7b2c7...)\n"
@@ -236,6 +238,15 @@ int main(int argc, char* argv[])
         if (arg == "-h" || arg == "--help")
         {
             print_usage();
+            return 0;
+        }
+        else if (arg == "--version")
+        {
+#ifdef C2POOL_VERSION
+            std::cout << "c2pool-btc " << C2POOL_VERSION << "\n";
+#else
+            std::cout << "c2pool-btc dev\n";
+#endif
             return 0;
         }
         else if (arg == "--settings" && i + 1 < argc)
@@ -3172,12 +3183,32 @@ int main(int argc, char* argv[])
                     height, block_hash, static_cast<uint64_t>(std::time(nullptr)),
                     /*chain=*/"BTC", /*miner=*/"", /*share_hash=*/block_hash.GetHex(),
                     mi->get_network_difficulty(), /*share_difficulty=*/0.0,
-                    mi->get_local_hashrate(), /*subsidy=*/0);
+                    // Pool hashrate 0 -> record_found_block reads the
+                    // sharechain pool estimator. This site passed
+                    // get_local_hashrate(): this node's OWN stratum rate in a
+                    // field named pool_hashrate_at_find, so a block's luck
+                    // was measured against one node's miners, not the pool.
+                    /*pool_hashrate=*/0.0, /*subsidy=*/0);
                 mi->schedule_block_verification(block_hash.GetHex());
                 LOG_INFO << "[BTC] recorded found block hash="
                          << block_hash.GetHex().substr(0, 16)
                          << " -- confirm/orphan poller armed";
             };
+
+        // The block's OWN difficulty and time, by hash, off the embedded
+        // header chain: a recorded block's network difficulty is its header's
+        // nBits (the record above passes the live template's reading, which
+        // record_found_block replaces as soon as the header is held, at
+        // record time or at the confirm verdict). Merged NMC blocks likewise,
+        // off the embedded NMC header chain. Display only.
+        {
+            auto lookups = core::header_chain_block_lookups(&header_chain);
+            mi->set_block_field_lookups(lookups.first, lookups.second);
+            mi->set_block_height_lookup(core::header_chain_height_lookup(&header_chain));
+            if (nmc_chain)
+                mi->add_chain_block_difficulty_lookup(
+                    "NMC", core::header_chain_block_lookups(nmc_chain.get()).first);
+        }
 
         // VERDICT. Resolve a recorded found block against the chain: >0 accepted
         // (best-chain depth), <0 orphaned (off the active chain), 0 pending (not

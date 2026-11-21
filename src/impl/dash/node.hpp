@@ -327,6 +327,8 @@ protected:
         NetService addr;
     };
     std::vector<PendingShareBatch> m_pending_adds;
+    // Deferred mint drain hook (set_deferred_mint_drain). IO-thread-only.
+    std::function<void()> m_deferred_mint_drain;
 
     // ── think() watchdog + backpressure (livelock defense-in-depth) ──
     // If a think() cycle exceeds THINK_WATCHDOG_SECONDS the watchdog (slice D)
@@ -499,6 +501,8 @@ protected:
     static constexpr size_t DEFAULT_TARGET_OUTBOUND_PEERS = 8;
     size_t m_max_peers = 30;
     size_t m_target_outbound_peers = DEFAULT_TARGET_OUTBOUND_PEERS;
+    /// set_connect_only: when non-empty, the ONLY addresses try_connect_peers dials.
+    std::set<NetService> m_connect_only;
     std::unique_ptr<core::Timer> m_connect_timer;   // 30s dial maintenance
     // Periodic have_tx/losing_tx delta sweep (core/tx_advertiser.hpp). Cadence
     // mirrors the canonical known-tx removal loop, node.py:298 t.start(10).
@@ -1307,6 +1311,36 @@ public:
     /// against explicitly inside.
     uint256 add_local_share(ShareType share, bool block_winning = false);
 
+    /// Deferred mint (core/deferred_mint.hpp): add_local_share with the REASON
+    /// it did not insert, so a caller can tell a busy tracker (retry later)
+    /// from a share that can never be inserted (drop). `think_after` false
+    /// skips the trailing run_think(): a caller minting a BATCH runs one think
+    /// for all of it (a think per item would take the lock between items and
+    /// make the next one busy). add_local_share() == add_local_share_ex(share,
+    /// block_winning, true) plus the old busy warning.
+    enum class LocalAddStatus { added, busy, duplicate, not_backable, null_hash };
+    struct LocalAddResult {
+        uint256        hash;      ///< set only when status == added
+        LocalAddStatus status{LocalAddStatus::null_hash};
+    };
+    LocalAddResult add_local_share_ex(ShareType share, bool block_winning, bool think_after);
+    /// #889: a block-winning share was finally NOT minted because of the lock.
+    /// Either the exclusive add stayed busy past the bounded wait (deferred
+    /// mint off), or the share went to the deferred-mint queue and was finally
+    /// lost there for any reason but duplicate (`queue_reason` set). Counts it
+    /// in block_share_lock_forfeits() and logs [MINT-BLOCK] FORFEIT at ERROR.
+    void record_block_share_forfeit(const uint256& hash, const char* queue_reason = nullptr);
+
+    /// Deferred mint: the coin binding's drain (main_dash.cpp). Called on the
+    /// IO thread in both IO-phase epilogues, while the think slot is still
+    /// held (a drained mint's run_think() is queued as the pending re-think and
+    /// served once for the whole batch), and on the 2 s advert tick as a
+    /// backstop. Set before the io_context runs; empty = no drain.
+    void set_deferred_mint_drain(std::function<void()> fn) { m_deferred_mint_drain = std::move(fn); }
+    /// Runs the drain hook and never throws (an exception is logged): it sits
+    /// in front of drain_pending_adds() and inside the advert timer.
+    void run_deferred_mint_drain();
+
     /// #889 observability: block-winning mints lost because the bounded wait on
     /// the tracker expired. MUST stay 0 in production — every increment is one
     /// won block that is invisible to the whole p2pool network. Each one also
@@ -1708,6 +1742,20 @@ public:
     }
 
     void set_target_outbound_peers(size_t count) { m_target_outbound_peers = count; }
+
+    /// --connect (bitcoind -connect semantics): outbound dials go ONLY to the
+    /// explicitly configured peers (`addrs` = the --connect set plus any
+    /// --addnode). Addr gossip may still fill the AddrStore, but no maintenance
+    /// pass dials an address learned that way. The outbound target becomes the
+    /// size of the set. Empty (the default) keeps normal discovery.
+    void set_connect_only(const std::vector<NetService>& addrs)
+    {
+        m_connect_only.clear();
+        m_connect_only.insert(addrs.begin(), addrs.end());
+        if (!m_connect_only.empty())
+            m_target_outbound_peers = m_connect_only.size();
+    }
+    bool connect_only() const { return !m_connect_only.empty(); }
     void set_max_peers(size_t count) { m_max_peers = count; }
 
     // Completes a pending async share request when a sharereply arrives.

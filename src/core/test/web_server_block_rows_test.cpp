@@ -145,8 +145,11 @@ TEST(FoundBlockRows, LuckAndCountsIgnoreMergedRows)
 
     const auto recent = mi.rest_recent_blocks();
     ASSERT_EQ(recent.size(), 2u) << recent.dump(1);
-    EXPECT_EQ(recent[0]["blocks_for_luck"].get<uint64_t>(), 1u)
-        << "only the second LTC block has an interval, so only it has a luck";
+    // Both LTC blocks count toward the pool's luck: the first as one found
+    // for one expected (operator ruling 2026-11-16), the second with its
+    // round. Neither DOGE block does.
+    EXPECT_EQ(recent[0]["blocks_for_luck"].get<uint64_t>(), 2u)
+        << "the two LTC blocks, and no merged one";
 
     const auto luck = mi.rest_luck_stats();
     ASSERT_TRUE(luck["blocks"].is_array());

@@ -1,0 +1,58 @@
+{
+ "luck_available": true,
+ "current_round": {
+  "elapsed": 321335.0,
+  "expected_time": 1876089.2889105764,
+  "effort": 0.1435387919058135,
+  "effort_method": "integrated",
+  "history_coverage": 0.9996639021581838,
+  "since_block_hash": "84024db9063696eabf560504fa15737d6ab15a560441e5bab7fd51bd03571223"
+ },
+ "periods": {
+  "1d": {
+   "k": 0,
+   "blocks_expected": 0.03979178912809831,
+   "luck": 0.0,
+   "ci95_low": 0.0,
+   "ci95_high": 9270.453867351112,
+   "span_s": 86400.0,
+   "k_unmeasured": 0
+  },
+  "30d": {
+   "k": 2,
+   "blocks_expected": 1.3349615072846772,
+   "luck": 149.8170538316132,
+   "ci95_low": 18.143540261069024,
+   "ci95_high": 541.1907106159869,
+   "span_s": 2592000.0,
+   "k_unmeasured": 0
+  },
+  "7d": {
+   "k": 1,
+   "blocks_expected": 0.27727603281106017,
+   "luck": 360.6514381578065,
+   "ci95_low": 9.130903860537043,
+   "ci95_high": 2009.4212018446158,
+   "span_s": 604800.0,
+   "k_unmeasured": 0
+  },
+  "90d": {
+   "k": 2,
+   "blocks_expected": 3.7059166074569907,
+   "luck": 53.96775512907197,
+   "ci95_low": 6.5357455172250605,
+   "ci95_high": 194.95008746787295,
+   "span_s": 7776000.0,
+   "k_unmeasured": 0
+  },
+  "all": {
+   "k": 4,
+   "blocks_expected": 6.139775785861968,
+   "luck": 65.14895884652304,
+   "ci95_low": 17.750898593657976,
+   "ci95_high": 166.8072097842234,
+   "span_s": 19328406.0,
+   "k_unmeasured": 0
+  }
+ }
+}

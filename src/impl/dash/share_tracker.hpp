@@ -821,6 +821,27 @@ public:
         return {static_cast<int32_t>(SharechainConfig::chain_length()), score_res};
     }
 
+    /// Is `possible_child` equal to `item` or a descendant of it? The same
+    /// answer as chain.is_child_of(item, possible_child) on a consistent share
+    /// forest (one parent per share, no cycles, lines shorter than get_last's
+    /// 100,000-step guard; a DASH chain is pruned to 2*CHAIN_LENGTH+10): walk
+    /// from `possible_child` along the parent links; reaching `item` (also when
+    /// `item` is the segment's missing parent, as is_child_of counts it) is
+    /// true, running off the chain is false. Costs the distance walked instead
+    /// of is_child_of's four full-chain walks (KAT:
+    /// test_dash_supersede_hint_equivalence, every pair of a forest).
+    bool descends_from(const uint256& item, const uint256& possible_child)
+    {
+        uint256 cur = possible_child;
+        const size_t guard = chain.size() + 1;   // a consistent forest never needs more
+        for (size_t steps = 0; steps <= guard; ++steps) {
+            if (cur == item) return true;
+            if (cur.IsNull() || !chain.contains(cur)) return false;
+            cur = chain.get_index(cur)->tail;
+        }
+        return false;
+    }
+
     // -- Restart-reorg supersede detector (see SupersedeHint) --
     // Returns an ACTIVE hint iff a genuine competing fork exists whose RECEIVED
     // cumulative work is STRICTLY greater than the incumbent best's VERIFIED
@@ -848,18 +869,35 @@ public:
         uint256 best_ch;
         uint288 best_ch_work;
         bool found = false;
+        // Cheapest filters first, the descendant check LAST. It used to be
+        // chain.is_child_of, which walks the chain four times per head
+        // (get_height/get_last of both ends, O(chain) each) and was most of
+        // this function's cost on a full tracker; descends_from gives the same
+        // answer walking only from the head back. Every filter is
+        // a `continue` whose only side effect is value-transparent memoisation
+        // (the TrackerView height/work memo), so their order does not change the
+        // candidate set; the argmax runs over the candidates in the same head
+        // order with the same strict `>`, so the hint is identical. The work
+        // pre-check cannot change the result either: the hint only goes active
+        // for a candidate with STRICTLY more work than the incumbent, and every
+        // such candidate is kept (KAT: test_dash_supersede_hint_equivalence).
         for (auto& [head, tail] : chain.get_heads())
         {
             if (head == incumbent_best) continue;
             if (!chain.contains(head)) continue;
-            // Extension of our own best chain (not a fork) — the ordinary
-            // budgeted Phase-2 verifies it; never treat it as a challenger.
-            try { if (chain.is_child_of(incumbent_best, head)) continue; }
-            catch (...) { /* concurrent trim — treat as fork candidate */ }
-            // Already a full-length verified chain — Phase-3 scoring handles it.
-            if (verified.get_acc_height(head) >= CL) continue;
             uint288 w;
             try { w = chain.get_work(head); } catch (...) { continue; }
+            // Cannot out-work the incumbent: can never be the active target.
+            if (!(incumbent_work < w)) continue;
+            // Already a full-length verified chain — Phase-3 scoring handles it.
+            if (verified.get_acc_height(head) >= CL) continue;
+            // Extension of our own best chain (not a fork) — the ordinary
+            // budgeted Phase-2 verifies it; never treat it as a challenger.
+            // descends_from == chain.is_child_of on a share forest, but walks
+            // only from `head` back to the incumbent (1-2 steps for the usual
+            // just-received extension) instead of four full-chain walks.
+            try { if (descends_from(incumbent_best, head)) continue; }
+            catch (...) { /* defensive: treat as fork candidate (as before) */ }
             if (!found || w > best_ch_work) { best_ch_work = w; best_ch = head; found = true; }
         }
 

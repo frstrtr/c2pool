@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 #include "merged_chain_addr.hpp"
+#include "stratum_refusal_log.hpp"
 
 #include <memory>
 #include <string>
@@ -238,6 +239,9 @@ private:
     // to connected_at_.
     std::chrono::steady_clock::time_point last_notify_at_;
     std::string session_id_;
+    // Remote address, read once at construction (the socket is connected
+    // then; remote_endpoint() fails after close). Keys the per-IP cap.
+    boost::asio::ip::address peer_address_;
 
     // Reject-reason diagnostics throttle: emit the low-diff (P5) and
     // malformed-params (P1) reject lines at most once per REJECT_LOG_INTERVAL
@@ -287,6 +291,17 @@ private:
     // value > 0. Parsed here only; consumers wire it per coin.
     std::optional<double> share_difficulty_override_;
 
+    // Difficulty last sent with mining.set_difficulty (internal units; 0 =
+    // none yet). send_notify_work() sends set_difficulty ahead of any job
+    // whose issued difficulty differs from it, so the miner hashes every job
+    // at the difficulty the job is judged and credited at.
+    double advertised_difficulty_ = 0.0;
+    // "d=N" in the mining.authorize password: the session's start difficulty,
+    // taken from the first successful authorize only; a bad value is logged
+    // once per session.
+    bool password_diff_applied_ = false;
+    bool password_diff_logged_ = false;
+
     // Periodic work-push timer — member (not shared_ptr) so RAII guarantees
     // the timer outlives all its callbacks.  Matches p2pool Twisted semantics
     // where the transport/protocol object owns its timers.
@@ -331,6 +346,23 @@ public:
         return std::chrono::duration<double>(
                    std::chrono::steady_clock::now() - last_notify_at_).count();
     }
+    // Seconds since the TCP connection was accepted (handshake deadline).
+    double seconds_since_connect() const {
+        return std::chrono::duration<double>(
+                   std::chrono::steady_clock::now() - connected_at_).count();
+    }
+    const boost::asio::ip::address& peer_address() const { return peer_address_; }
+    // The idle reaper's rule (StratumConfig::session_idle_timeout_sec): no
+    // INBOUND line for more than timeout s (notifies sent to the miner do not
+    // count). With OS TCP keepalive on, an authorized session is never idle-
+    // reaped: keepalive is the liveness authority, and a rig on a high fixed
+    // difficulty can legitimately stay quiet past the window. 0 = off.
+    bool idle_reapable(uint32_t timeout, bool keepalive_on) const;
+    // Why this session may be closed now under cfg's hygiene knobs: past the
+    // handshake deadline without an authorize, or idle_reapable. nullptr =
+    // keep it. The miner cap uses it to free a slot at the moment a new
+    // connection would be refused (between reaper sweeps and timer firings).
+    const char* reclaim_reason(const core::stratum::StratumConfig& cfg) const;
     // Reap a stale/zombie session: cancel timers + close the socket. The pending
     // async_read then fails and runs the normal disconnect path. Idempotent.
     void drop_stale(const char* reason);
@@ -387,6 +419,19 @@ private:
                                   std::set<uint32_t>* slash_chains = nullptr);
 };
 
+/// OS TCP liveness for one accepted stratum socket under cfg; a no-op unless
+/// cfg.tcp_keepalive_enabled. SO_KEEPALIVE everywhere; on Linux also the probe
+/// timing (TCP_KEEPIDLE/INTVL/CNT) and TCP_USER_TIMEOUT
+/// (StratumConfig::tcp_user_timeout_sec). Best-effort: an option the OS
+/// refuses is logged and skipped.
+void apply_stratum_tcp_liveness(tcp::socket& socket, const core::stratum::StratumConfig& cfg);
+
+/// What the per-IP cap (StratumConfig::max_stratum_connections_per_ip) counts
+/// by: the IPv4 address (an IPv4-mapped IPv6 address counts as its IPv4
+/// address), or the /64 of an IPv6 address -- one host is handed a whole /64
+/// and could otherwise rotate through it.
+boost::asio::ip::address per_ip_cap_key(const boost::asio::ip::address& a);
+
 /// Stratum Server — accepts TCP connections and spawns StratumSession per miner.
 class StratumServer
 {
@@ -404,6 +449,9 @@ class StratumServer
     // STRICT per-node miner cap (interim hardening fix #5): connections refused
     // because sessions_.size() >= StratumConfig::max_stratum_connections.
     std::atomic<uint64_t> refused_connections_{0};
+    // Connections refused by StratumConfig::max_stratum_connections_per_ip
+    // (one remote address already holds that many live sessions).
+    std::atomic<uint64_t> refused_per_ip_{0};
 
     // Drain-mode admission gate (#866 action 2). Default true = the legacy
     // accept path, unchanged. false refuses every new connection regardless of
@@ -434,6 +482,20 @@ class StratumServer
     // Disarmed (never scheduled) when the timeout is 0 -> legacy no-op.
     boost::asio::steady_timer idle_reap_timer_;
     void start_idle_reaper();
+
+    // Rate-limited refusal WARN lines (StratumConfig::refusal_log_interval_sec):
+    // one limiter per cap; the timer emits a pending summary when its window
+    // ends even if no further refusal arrives. io-thread state.
+    RefusalLogLimiter cap_refusal_log_;
+    RefusalLogLimiter per_ip_refusal_log_;
+    boost::asio::steady_timer refusal_log_timer_;
+    std::optional<RefusalLogLimiter::clock::time_point> refusal_log_timer_due_;   // armed for
+    std::atomic<uint64_t> refusal_lines_logged_{0};
+    void log_refusal(RefusalLogLimiter& lim, const std::string& peer_ip,
+                     const std::string& peer, const std::string& detail,
+                     const char* total_name, uint64_t total);
+    void flush_refusal_logs();
+    void arm_refusal_log_timer();
 
 public:
     StratumServer(net::io_context& ioc, const std::string& address, uint16_t port, std::shared_ptr<IWorkSource> mining_interface);
@@ -483,6 +545,11 @@ public:
 
     /// Connections refused by the strict per-node miner cap (fix #5).
     uint64_t get_refused_connections() const { return refused_connections_.load(); }
+    /// Connections refused by the per-source-IP cap.
+    uint64_t get_refused_per_ip() const { return refused_per_ip_.load(); }
+    /// Refusal WARN lines written (full + summary), both caps: rate-limited,
+    /// unlike the refusal counters.
+    uint64_t get_refusal_lines_logged() const { return refusal_lines_logged_.load(); }
     /// Sessions dropped for an over-length line (no '\n' within the cap).
     uint64_t get_oversized_line_drops() const { return oversized_line_drops_.load(); }
     void record_oversized_line_drop() { oversized_line_drops_.fetch_add(1); }

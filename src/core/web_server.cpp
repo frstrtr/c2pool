@@ -32,6 +32,8 @@
 #include <crypto/sha256.h>      // CSHA256 for P2PK→P2PKH conversion
 #include <crypto/ripemd160.h>   // CRIPEMD160 for Hash160
 #include <c2pool/merged/merged_mining.hpp>  // Integrated merged mining
+#include <c2pool/merged/aux_chain_params.hpp>  // merged-chain address versions (/web/currency_info)
+#include <core/donation.hpp>                    // COMBINED_DONATION_SCRIPT (merged donation address)
 #include <impl/ltc/config_pool.hpp>          // PoolConfig::is_testnet for donation addr
 
 #include <iomanip>
@@ -3286,12 +3288,40 @@ nlohmann::json MiningInterface::rest_local_rate()
     return rate;
 }
 
+double MiningInterface::coin_block_period() const
+{
+    // The block interval the node's network difficulty is tuned to, so that
+    // difficulty * 2^32 / period is the network's rate ON THAT ALGORITHM.
+    // Label first, then the enum (as /web/currency_info does): BCH, NMC and
+    // BIP110 share the BITCOIN enum.
+    std::string label = m_coin_label;
+    for (auto& ch : label)
+        if (ch >= 'a' && ch <= 'z') ch = static_cast<char>(ch - 32);
+    if (label == "BCH" || label == "NMC" || label == "BIP110")
+        return 600.0;
+    switch (m_blockchain) {
+    case Blockchain::LITECOIN: return 150.0;
+    case Blockchain::BITCOIN:  return 600.0;
+    case Blockchain::DOGECOIN: return 60.0;
+    case Blockchain::DASH:     return 150.0;
+    // DigiByte: a block every 15 s over FIVE algorithms, each retargeted to
+    // one block in 75 s. The node's difficulty is its own algorithm's.
+    case Blockchain::DIGIBYTE: return 75.0;
+    default:                   return 150.0;
+    }
+}
+
 nlohmann::json MiningInterface::rest_global_rate()
 {
+    if (m_network_hashrate_fn) {
+        const double hr = m_network_hashrate_fn();
+        if (hr > 0) return hr;   // the coin's chain-work estimate (DASH)
+    }
     double net_diff = m_network_difficulty.load(std::memory_order_relaxed);
     if (net_diff > 0) {
-        // network_hashrate = net_difficulty * 2^32 / block_period (150s for LTC)
-        return net_diff * 4294967296.0 / 150.0;
+        // network_hashrate = net_difficulty * 2^32 / block_period, at THIS
+        // coin's block interval (coin_block_period), not LTC's 150 s.
+        return net_diff * 4294967296.0 / coin_block_period();
     }
     double rate = 0.0;
     {
@@ -3302,10 +3332,31 @@ nlohmann::json MiningInterface::rest_global_rate()
     return rate;
 }
 
+std::string MiningInterface::primary_script_to_address(const std::vector<unsigned char>& s) const
+{
+    // Chain-specific version bytes, so Dash payouts render as 'X...' not
+    // Bitcoin '1...'.
+    if (m_blockchain == Blockchain::DASH) {
+        uint8_t p2pkh = m_testnet ? 140 : 76;   // Dash: 'y' / 'X'
+        uint8_t p2sh  = m_testnet ?  19 : 16;   // Dash: '7'
+        return core::script_to_address(s, "", p2pkh, p2sh);
+    }
+    if (m_blockchain == Blockchain::DOGECOIN) {
+        // DOGE version bytes: mainnet 0x1e ('D') / 0x16, testnet 0x71 / 0xc4.
+        // Without this arm a primary-DOGE node falls through to the bool
+        // overload's BTC branch (is_ltc==false) and renders DOGE payouts as
+        // Bitcoin '1...' addresses. Display-only, reward-safe (scripts and
+        // amounts are unchanged; only the human-readable address string is).
+        uint8_t p2pkh = m_testnet ? 0x71 : 0x1e;
+        uint8_t p2sh  = m_testnet ? 0xc4 : 0x16;
+        return core::script_to_address(s, "", p2pkh, p2sh);
+    }
+    return core::script_to_address(s, m_blockchain == Blockchain::LITECOIN, m_testnet);
+}
+
 nlohmann::json MiningInterface::rest_current_payouts()
 {
     nlohmann::json result = nlohmann::json::object();
-    bool is_ltc = (m_blockchain == Blockchain::LITECOIN);
 
     // #939: authoritative direct source, when a coin wires one (DASH has no
     // coinbase-builder PPLNS cache feeding this endpoint, so it returned {} on
@@ -3318,25 +3369,10 @@ nlohmann::json MiningInterface::rest_current_payouts()
             return direct;
     }
 
-    // Script-to-address resolver — picks chain-specific version bytes so
-    // Dash payouts render as 'X...' not Bitcoin '1...'.
-    auto resolve_addr = [this, is_ltc](const std::vector<unsigned char>& s) -> std::string {
-        if (m_blockchain == Blockchain::DASH) {
-            uint8_t p2pkh = m_testnet ? 140 : 76;   // Dash: 'y' / 'X'
-            uint8_t p2sh  = m_testnet ?  19 : 16;   // Dash: '7'
-            return core::script_to_address(s, "", p2pkh, p2sh);
-        }
-        if (m_blockchain == Blockchain::DOGECOIN) {
-            // DOGE version bytes: mainnet 0x1e ('D') / 0x16, testnet 0x71 / 0xc4.
-            // Without this arm a primary-DOGE node falls through to the bool
-            // overload's BTC branch (is_ltc==false) and renders DOGE payouts as
-            // Bitcoin '1...' addresses. Display-only, reward-safe (scripts and
-            // amounts are unchanged; only the human-readable address string is).
-            uint8_t p2pkh = m_testnet ? 0x71 : 0x1e;
-            uint8_t p2sh  = m_testnet ? 0xc4 : 0x16;
-            return core::script_to_address(s, "", p2pkh, p2sh);
-        }
-        return core::script_to_address(s, is_ltc, m_testnet);
+    // Script-to-address resolver (the row keys; /web/currency_info renders
+    // the node-owner and donation addresses with the same one).
+    auto resolve_addr = [this](const std::vector<unsigned char>& s) -> std::string {
+        return primary_script_to_address(s);
     };
 
     // Primary source: cached PPLNS outputs from the coinbase builder.
@@ -3551,6 +3587,13 @@ std::string MiningInterface::found_block_miner_display(const std::string& stored
     return decoded;
 }
 
+namespace {
+// A measured luck is "accurate" when the pool rate history covers at least
+// this share of its round; below it the uncovered part was filled in at the
+// covered mean, and the row is flagged approximate.
+constexpr double kLuckAccurateCoverage = 0.9;
+} // namespace
+
 nlohmann::json MiningInterface::found_block_row_locked(const FoundBlock& b) const
 {
     static const char* status_str[] = {"pending", "confirmed", "orphaned", "stale"};
@@ -3611,36 +3654,47 @@ nlohmann::json MiningInterface::found_block_row_locked(const FoundBlock& b) cons
     // own field (b.authorship, emitted as found_by) set at the call site
     // that knows. The wire key `found_locally` keeps its existing meaning
     // and its existing consumers; read `found_by` for authorship.
-    const bool have_local_record = !(b.share_hash.empty() && b.miner.empty());
-    // "first_block" is a claim about the HISTORY: no same-chain block was
-    // found before this one. A missing interval alone does not make it so. A
-    // row recorded at height 0 (unknown) sorts after every real row, so the
-    // restore-time recompute finds no predecessor for it; the stale-job block
-    // of 2026-10-25 (23 earlier rows) was drawn on the chart as "1st block"
-    // that way. Such a row reads "interval_unavailable".
-    bool has_earlier_row = false;
-    for (const auto& other : m_found_blocks) {
-        if (other.chain == b.chain && other.ts < b.ts) {
-            has_earlier_row = true;
-            break;
-        }
-    }
+    // An imported row (import_found_blocks) holds another node's record, not
+    // this node's: it is learned, like a relayed one.
+    const bool have_local_record = !b.imported
+        && !(b.share_hash.empty() && b.miner.empty());
+    // luck_method keeps its values; what they say after the effort rework:
+    //   relayed              the row was learned from a peer with no local
+    //                        record (found_locally false) and HAS a luck.
+    //                        PROVENANCE only: its effort and luck are computed
+    //                        like any other row's.
+    //   first_block          no earlier main-chain block of the chain: effort
+    //                        1.0 / luck 100 by definition (effort_method says
+    //                        the same).
+    //   simple_avg           a computed luck (effort_method says how:
+    //                        "integrated" or "single_sample").
+    //   netdiff_unavailable  no luck: the block's network difficulty cannot be
+    //                        had (no header, none stored, none in the history).
+    //   hashrate_unavailable no luck: no pool rate for the round (no history
+    //                        over it and none sampled at find).
+    //   interval_unavailable no luck for any other reason (not expected).
+    // The predecessor is the previous main-chain block BY TIME, so a row at
+    // an unknown or wrong height (the stale-job block of 2026-10-25 recorded
+    // at height 0, the LTC rows stored at the share absheight) is timed like
+    // any other.
+    const bool first_block = b.effort_method == core::luck::EffortMethod::first_block;
+    // Finite numbers only: a luck the JSON would render as null never goes
+    // out under a method that claims a value (core::luck::effort_over drops
+    // such an effort already).
+    const bool has_effort = b.effort > 0.0 && b.luck > 0.0
+        && std::isfinite(b.effort) && std::isfinite(b.luck);
+    // A row with NO luck names the input that cannot be had, whatever its
+    // provenance: that is the one thing a reader of a null needs to know.
     std::string method;
-    if (!have_local_record)                    method = "relayed";
-    else if (b.time_to_find > 0 && b.luck > 0) method = "simple_avg";
-    else if (b.time_to_find > 0)               method = "netdiff_unavailable";
-    else if (has_earlier_row)                  method = "interval_unavailable";
-    else                                       method = "first_block";
-    // "netdiff_unavailable" vs "first_block": the old else-branch collapsed
-    // two distinct rows. A genuine first block has no earlier same-chain row,
-    // so time_to_find is 0 and no luck can exist. A row with time_to_find>0
-    // but no luck HAS a predecessor — its luck was uncomputable only because
-    // network_difficulty was never captured at find time. Labelling the
-    // second case "first_block" made the UI tooltip claim it was the pool's
-    // first block, which is false for any row after the first. The netdiff
-    // repair paths normally fill that difficulty and this row becomes
-    // "simple_avg"; the label survives only for a row whose header is still
-    // unavailable (never synced), where it correctly reads "unavailable".
+    if (first_block || has_effort)
+        method = !have_local_record ? "relayed"
+               : first_block        ? "first_block" : "simple_avg";
+    else if (b.luck_missing == core::luck::MissingInput::difficulty)
+        method = "netdiff_unavailable";
+    else if (b.luck_missing == core::luck::MissingInput::rate)
+        method = "hashrate_unavailable";
+    else
+        method = "interval_unavailable";
     // #942 second slice, extended to EVERY unmeasured field (production node,
     // 2026-08-05): the primary's rows for our own blocks rendered
     // network_difficulty=0.0, subsidy=0, pool_hashrate=0.0 as if they
@@ -3650,13 +3704,23 @@ nlohmann::json MiningInterface::found_block_row_locked(const FoundBlock& b) cons
     // found_locally row means "not computed" (first block, or recorded
     // with no difficulty), never "0% lucky": also null.
     auto num_or_null = [](double v) {
-        return v > 0.0 ? nlohmann::json(v) : nlohmann::json(nullptr);
+        return v > 0.0 && std::isfinite(v) ? nlohmann::json(v) : nlohmann::json(nullptr);
     };
-    // A luck value exists only on a row we hold locally that actually
-    // computed one (time_to_find>0 && luck>0). Those rows feed both the
-    // per-row luck_approximate flag and rest_recent_blocks' pool aggregate.
-    const bool luck_present = have_local_record && b.luck > 0.0
-                              && b.time_to_find > 0.0;
+    // A MEASURED luck: an effort computed over a real round. The first
+    // block's 100 % is a definition, not a measurement, so it carries no
+    // luck_approximate. A measured luck is approximate unless the pool rate
+    // history covers (nearly) the whole round.
+    const bool luck_measured = has_effort && !first_block;
+    // An imported effort is another node's integral over the same round:
+    // accurate on the same terms, by the coverage of that node's history.
+    const bool imported_effort = b.effort_method == core::luck::EffortMethod::imported;
+    const bool luck_accurate = luck_measured
+        && (b.effort_method == core::luck::EffortMethod::integrated || imported_effort)
+        && b.history_coverage >= kLuckAccurateCoverage;
+    // The network difficulty of the row's OWN chain. A merged (aux) row
+    // stored before the aux difficulty was recorded holds the parent's, which
+    // is not this block's: null.
+    const double own_difficulty = found_block_luck_difficulty(b);
     // block_reward: the raw-duff subsidy expressed in whole coins, kept
     // ALONGSIDE the existing integer `subsidy` field. 1e8 base units per
     // coin holds for every lane this build serves (DASH/LTC/DOGE/BTC/DGB).
@@ -3666,10 +3730,30 @@ nlohmann::json MiningInterface::found_block_row_locked(const FoundBlock& b) cons
     auto str_or_null = [](const std::string& s) {
         return s.empty() ? nlohmann::json(nullptr) : nlohmann::json(s);
     };
-    // Sample-count provenance. c2pool derives luck from ONE difficulty and
-    // ONE hashrate reading captured at find time, so the "average used" is
-    // that single value and the sample count is 1 when present, 0 when the
-    // input was never measured (honest-null, #942).
+    // Sample-count provenance. avg_*_used are the mean gross pool rate and
+    // the mean network difficulty behind the effort: over the rate history
+    // segments of the round (effort_method "integrated"), or the one reading
+    // captured at find time ("single_sample" / first block). 0 samples and
+    // null when the input was never measured (honest-null, #942) -- and for
+    // an imported effort, which no rate or difficulty of this node's is
+    // behind.
+    const double rate_used = imported_effort ? 0.0
+        : b.rate_used > 0.0 ? b.rate_used : b.rate_at_find.value;
+    const double diff_used = imported_effort ? 0.0
+        : b.difficulty_used > 0.0 ? b.difficulty_used : own_difficulty;
+    const uint32_t rate_samples = imported_effort ? 0
+                                : b.rate_used > 0.0 ? std::max<uint32_t>(b.luck_samples, 1)
+                                : b.rate_at_find.value > 0.0 ? 1 : 0;
+    const uint32_t diff_samples = imported_effort ? 0
+                                : b.difficulty_used > 0.0 ? std::max<uint32_t>(b.luck_samples, 1)
+                                : own_difficulty > 0.0 ? 1 : 0;
+    // The share of the round measured behind the effort shown: this node's
+    // rate history's, or, for an imported effort, the source node's.
+    nlohmann::json history_coverage = nullptr;
+    if (b.effort_method == core::luck::EffortMethod::integrated
+        || b.effort_method == core::luck::EffortMethod::single_sample
+        || imported_effort)
+        history_coverage = b.history_coverage;
     return {
         {"ts", b.ts},
         {"hash", b.hash},
@@ -3696,29 +3780,82 @@ nlohmann::json MiningInterface::found_block_row_locked(const FoundBlock& b) cons
                          ? "this_node"
                          : b.authorship == BlockAuthorship::sharechain_peer
                                ? "sharechain_peer" : "unknown"},
-        {"network_difficulty", num_or_null(b.network_difficulty)},
+        {"network_difficulty", num_or_null(own_difficulty)},
         {"actual_hash_difficulty", actual_hash_difficulty(b.hash)},
         {"share_difficulty", num_or_null(b.share_difficulty)},
-        {"pool_hashrate_at_find", num_or_null(b.pool_hashrate)},
+        // The GROSS pool rate sampled when the block was recorded (the
+        // sharechain estimator over 1 - stale proportion) -- as far as it can
+        // be trusted. pool_hashrate_source says which:
+        //   "recorded"  the stored value;
+        //   "history"   the rate history's reading at the block's own time,
+        //               standing in (in memory, never on disk) for a stored
+        //               value that is missing or is not plausibly a pool
+        //               rate (core::luck::rate_at_find_plausible);
+        //   null        neither: no usable rate at find.
+        {"pool_hashrate_at_find", num_or_null(b.rate_at_find.value)},
+        {"pool_hashrate_source",
+             b.rate_at_find.source == RateAtFindSource::recorded ? nlohmann::json("recorded")
+           : b.rate_at_find.source == RateAtFindSource::history  ? nlohmann::json("history")
+                                                                  : nlohmann::json(nullptr)},
         {"subsidy", b.subsidy != 0 ? nlohmann::json(b.subsidy)
                                    : nlohmann::json(nullptr)},
-        {"expected_time", have_local_record ? num_or_null(b.expected_time) : nlohmann::json(nullptr)},
-        {"time_to_find", have_local_record ? num_or_null(b.time_to_find) : nlohmann::json(nullptr)},
-        {"luck", have_local_record ? num_or_null(b.luck) : nlohmann::json(nullptr)},
+        // Luck as effort (core/pool_luck.hpp). time_to_find runs from
+        // prev_block_hash, the previous MAIN-CHAIN block of the chain by
+        // time; expected_time = time_to_find / effort; luck = 100 / effort.
+        // Every row gets them, a peer-learned ("relayed") one too. null only
+        // when an input cannot be had (luck_method names it) -- and
+        // time_to_find on a first block, which has no round.
+        {"expected_time", num_or_null(b.expected_time)},
+        {"time_to_find", num_or_null(b.time_to_find)},
+        {"luck", num_or_null(b.luck)},
         {"luck_method", method},
+        {"effort", num_or_null(b.effort)},
+        // "integrated" | "single_sample" | "first_block", or "imported": the
+        // node this history was imported from (--import-found-blocks)
+        // integrated the same round over more of it than this node's own
+        // history covers; history_coverage is then THAT node's coverage.
+        {"effort_method", b.effort_method == core::luck::EffortMethod::none
+                              ? nlohmann::json(nullptr)
+                              : nlohmann::json(core::luck::effort_method_name(b.effort_method))},
+        {"prev_block_hash", str_or_null(b.prev_block_hash)},
+        {"history_coverage", history_coverage},
+        // The row is a block of the main chain for luck: it ends a round, is
+        // a predecessor and counts as found. false when orphaned or stale,
+        // and when still pending while the node's header chain, which spans
+        // the block's time, does not hold it.
+        {"main_chain", b.luck_main_chain},
+        // What a PERIOD counts of this row, so a consumer summing rows gets
+        // the server's period luck: luck = sum(measured) / sum(effort_covered)
+        // (+ current_round.effort_covered).
+        //   effort_covered  the round's contribution to blocks_expected: the
+        //                   integral over the time the rate history covers
+        //                   (NOT scaled to the whole round, unlike `effort`);
+        //                   the whole effort for a single_sample round; 1.0
+        //                   for a first block; null without an effort.
+        //   measured        the block counts in k: on the main chain, with
+        //                   an effort, and (integrated) found while the
+        //                   history was watching.
+        {"effort_covered", num_or_null(b.effort_covered)},
+        {"measured", b.luck_measured},
         // #57 oracle-parity residual fields (all DISPLAY-ONLY, honest-null):
         {"block_reward", block_reward},
         {"explorer_url", explorer_url(b.hash)},
         {"from_history", b.from_history},
-        // The luck value is a single-sample approximation whenever it
-        // exists; null (not false) when no luck was computed, so the UI
-        // renders '-' rather than claiming a precise measurement.
-        {"luck_approximate", luck_present ? nlohmann::json(true)
-                                          : nlohmann::json(nullptr)},
-        {"avg_hashrate_used", num_or_null(b.pool_hashrate)},
-        {"hashrate_samples_used", b.pool_hashrate > 0.0 ? 1 : 0},
-        {"avg_difficulty_used", num_or_null(b.network_difficulty)},
-        {"diff_samples_used", b.network_difficulty > 0.0 ? 1 : 0},
+        // Where the row came from: "imported" from another node's history
+        // (--import-found-blocks; its hash validated against this node's
+        // header chain, the rest trusted from the source), "recorded" by
+        // this node.
+        {"provenance", b.imported ? "imported" : "recorded"},
+        // true: a measured luck from a single sample or a partly covered
+        // round; false: integrated over a (nearly) fully covered round; null
+        // (not false) when no luck was measured, so the UI renders '-'
+        // rather than claiming a precise measurement.
+        {"luck_approximate", luck_measured ? nlohmann::json(!luck_accurate)
+                                           : nlohmann::json(nullptr)},
+        {"avg_hashrate_used", num_or_null(rate_used)},
+        {"hashrate_samples_used", rate_samples},
+        {"avg_difficulty_used", num_or_null(diff_used)},
+        {"diff_samples_used", diff_samples},
         // #946 explorer fields. Missing = null, never "" or 0 (restored
         // pre-#946 records included).
         {"parent_hash", str_or_null(b.parent_hash)},
@@ -3733,17 +3870,23 @@ nlohmann::json MiningInterface::found_block_row_locked(const FoundBlock& b) cons
 
 nlohmann::json MiningInterface::rest_recent_blocks()
 {
+    return rest_recent_blocks_at(static_cast<double>(std::time(nullptr)));
+}
+
+nlohmann::json MiningInterface::rest_recent_blocks_at(double now)
+{
     nlohmann::json arr = nlohmann::json::array();
 
-    // Pool luck aggregate, accumulated over the rows as we build them. c2pool
-    // derives each block's luck from ONE network-difficulty and ONE pool-
-    // hashrate reading sampled at find time -- it does not interval-average
-    // between blocks the way the p2pool-dash oracle does -- so every computed
-    // luck is honestly the "single_hashrate" method and is approximate.
-    double luck_sum = 0.0;
-    uint64_t luck_count = 0;
+    // How each measured luck was derived (first-row counts below).
+    uint64_t integrated = 0, single_sample = 0, imported = 0, accurate = 0, approximate = 0;
 
     std::lock_guard<std::mutex> lock(m_blocks_mutex);
+    // Derived fields are recomputed from the inputs on every read: the rate
+    // history grows by a sample a minute, and a row's round is whatever the
+    // rows around it say it is right now. One pass yields the rows and the
+    // pool luck below.
+    PoolLuck pl;
+    derive_found_block_luck_locked(&pl, now);
     for (const auto& b : m_found_blocks) {
         // THIS chain's blocks only. A merged (aux) find shares the ledger --
         // record_merged_found_block keeps it there for verification and
@@ -3754,32 +3897,51 @@ nlohmann::json MiningInterface::rest_recent_blocks()
         // only into the merged list, did not.
         if (!is_primary_found_block(b)) continue;
         auto row = found_block_row_locked(b);
-        // luck_approximate is true exactly on the rows that computed a luck,
-        // so those rows feed the first-row pool aggregate below.
-        if (row["luck_approximate"].is_boolean()) { luck_sum += b.luck; ++luck_count; }
+        if (row["luck_approximate"].is_boolean()) {
+            if (row["luck_approximate"].get<bool>()) ++approximate; else ++accurate;
+            if (b.effort_method == core::luck::EffortMethod::integrated) ++integrated;
+            else if (b.effort_method == core::luck::EffortMethod::imported) ++imported;
+            else ++single_sample;
+        }
         arr.push_back(std::move(row));
     }
 
-    // First-row pool luck aggregate (#57), mirroring the oracle shape: the
-    // summary keys ride on arr[0] so a consumer reads them without a second
-    // request. Every c2pool luck is the single-hashrate method (approximate),
-    // never the interval-averaged method the oracle labels accurate/simple_avg
-    // -- reporting it as anything else would fabricate a measurement we did not
-    // make. Empty counts and a null average when nothing was computed.
+    // First-row pool luck (#57): the summary keys ride on arr[0] so a
+    // consumer reads them without a second request.
+    //
+    // pool_avg_luck is the PERIOD luck over all time: blocks found over
+    // blocks expected, k / sum(effort), the open round's effort so far
+    // included (the same figure as /luck_stats periods.all). It was the
+    // arithmetic mean of the per-block luck values: E[1/effort] is infinite,
+    // so that mean read 1281 % on DASH (true 101 %) and 4,416,464 % on an LTC
+    // node holding three rows recorded at its own 4 MH/s.
     if (!arr.empty()) {
-        arr[0]["blocks_for_luck"]            = luck_count;
-        arr[0]["pool_avg_luck"]              = luck_count > 0
-            ? nlohmann::json(luck_sum / static_cast<double>(luck_count))
-            : nlohmann::json(nullptr);
-        arr[0]["accurate_luck_count"]        = 0;
-        arr[0]["approximate_luck_count"]     = luck_count;
-        arr[0]["time_weighted_luck_count"]   = 0;
+        auto pct = [](bool has, double v) {
+            return has ? nlohmann::json(v) : nlohmann::json(nullptr);
+        };
+        arr[0]["blocks_for_luck"]            = pl.all.k;
+        arr[0]["pool_avg_luck"]              = pct(pl.all.has_luck, pl.all.luck);
+        arr[0]["blocks_found"]               = pl.all.k;
+        arr[0]["blocks_expected"]            = pct(pl.all.has_luck, pl.all.expected);
+        arr[0]["pool_luck_ci95_low"]         = pct(pl.all.has_luck, pl.all.ci_low);
+        arr[0]["pool_luck_ci95_high"]        = pct(pl.all.has_luck, pl.all.ci_high);
+        arr[0]["accurate_luck_count"]        = accurate;
+        arr[0]["approximate_luck_count"]     = approximate;
+        arr[0]["time_weighted_luck_count"]   = integrated;
         arr[0]["simple_avg_luck_count"]      = 0;
-        arr[0]["single_hashrate_luck_count"] = luck_count;
+        arr[0]["single_hashrate_luck_count"] = single_sample;
+        arr[0]["imported_luck_count"]        = imported;
         arr[0]["luck_note"] =
-            "Luck derived from network difficulty and pool hashrate sampled at "
-            "block-find time (single sample per block, approximate; not "
-            "interval-averaged between blocks).";
+            "Luck is 100 / effort. Effort is the number of blocks the pool "
+            "expected to find over the round: the gross pool hashrate over "
+            "network difficulty, integrated from the previous main-chain block "
+            "(effort_method \"integrated\"; history_coverage is the share of the "
+            "round the rate history covers), or one sample taken at find time "
+            "where no history covers the round (\"single_sample\"), or the "
+            "integral of the node the history was imported from where it covers "
+            "more of the round (\"imported\"; history_coverage is that node's). "
+            "The first block counts as 1 found for 1 expected. pool_avg_luck is "
+            "blocks found over blocks expected, never a mean of per-block luck.";
     }
     return arr;
 }
@@ -3791,6 +3953,7 @@ nlohmann::json MiningInterface::rest_found_block(const std::string& hash)
     for (auto& c : want)
         c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     std::lock_guard<std::mutex> lock(m_blocks_mutex);
+    recompute_found_block_luck_locked();
     for (const auto& b : m_found_blocks)
         if (b.hash == want)
             return found_block_row_locked(b);
@@ -4147,9 +4310,18 @@ nlohmann::json MiningInterface::rest_global_stats()
     double net_diff = m_network_difficulty.load(std::memory_order_relaxed);
     double net_hashrate = 0.0;
     if (net_diff > 0) {
-        // network_hashrate = net_difficulty * 2^32 / block_period
-        double block_period = 150.0;  // LTC default 2.5 min
-        net_hashrate = net_diff * 4294967296.0 / block_period;
+        // network_hashrate = net_difficulty * 2^32 / block_period, at THIS
+        // coin's block interval. It was a fixed 150 s (LTC's): 4x too high
+        // on BTC / BCH (600 s), 2x too low on a DGB algo (75 s).
+        net_hashrate = net_diff * 4294967296.0 / coin_block_period();
+    }
+    // A coin that knows its chain work over a window replaces the tip-difficulty
+    // estimate (DASH: DarkGravityWave swings the tip difficulty ~2x within hours,
+    // so the formula above read the network at 5.6 PH/s while Dash Core's
+    // getnetworkhashps said 3.25 PH/s on 2026-11-16).
+    if (m_network_hashrate_fn) {
+        const double hr = m_network_hashrate_fn();
+        if (hr > 0) net_hashrate = hr;
     }
 
     // p2pool field names the dashboard expects
@@ -4815,6 +4987,29 @@ void MiningInterface::record_found_block(uint64_t height, const uint256& hash, u
     if (ts == 0) ts = static_cast<uint64_t>(std::time(nullptr));
     std::string hash_hex = hash.GetHex();
 
+    // A row of this node's own chain, or of a merged (aux) chain riding the
+    // same ledger. The node's template, its difficulty cache and its header
+    // chain all speak for the PARENT: none of them is a fallback for an aux
+    // row, whose difficulty is the aux chain's own (record_merged_found_block
+    // passes it; 0 = not known).
+    const bool own_chain = found_block_chain_is_primary(chain, /*parent_hash=*/"", node_symbol());
+
+    // THE BLOCK'S OWN BITS FIRST. The difficulty a caller passes is the
+    // node's reading at RECORD time (the live template); a block recorded
+    // after the fact -- a sharechain replay, a win learned from a peer -- is
+    // then stored with the difficulty of a later moment. Its header, when the
+    // header chain already holds it, carries the exact one.
+    bool difficulty_from_header = false;
+    if (own_chain && m_block_diff_lookup_fn) {
+        try {
+            double d = m_block_diff_lookup_fn(hash_hex);
+            if (d > 0.0) {
+                network_difficulty = d;
+                difficulty_from_header = true;
+            }
+        } catch (...) {}
+    }
+
     // ── MEASUREMENT FALLBACKS (production node, 2026-08-05) ────────────────────────
     // Both record paths passed mi->get_network_difficulty(), which reads a
     // cache that is only refreshed when somebody polls /local_stats — so a
@@ -4825,7 +5020,7 @@ void MiningInterface::record_found_block(uint64_t height, const uint256& hash, u
     // difficulty at find time; ask it before accepting a zero. Same for a
     // zero subsidy on the primary chain (row 2516914 recorded subsidy=0
     // because the embedded arm leaves get_current_work_template() empty).
-    if (network_difficulty <= 0.0 || subsidy == 0) {
+    if (own_chain && (network_difficulty <= 0.0 || subsidy == 0)) {
         CoinWorkInfo cw;
         if (m_coin_work_fn) cw = m_coin_work_fn();
         if (cw.valid) {
@@ -4837,21 +5032,11 @@ void MiningInterface::record_found_block(uint64_t height, const uint256& hash, u
         if (network_difficulty <= 0.0)
             network_difficulty =
                 m_network_difficulty.load(std::memory_order_relaxed);
-        // FINAL fallback: the block's OWN header carries the exact difficulty in
-        // its nBits. The live-template and cache fallbacks above are both empty
-        // when a block is recorded off the fast path — a sharechain-replay or
-        // relayed win recorded early in boot, before the first template exists
-        // and before any /local_stats poll refreshed the cache. That is exactly
-        // the case (block won during a fork/crash window, learned via replay 37s
-        // after restart) that persisted network_difficulty=0 and lost the luck
-        // point for the winning block. Ask the header chain by hash; it is the
-        // authoritative, purely-daemonless source and needs no live state.
-        if (network_difficulty <= 0.0 && m_block_diff_lookup_fn) {
-            try {
-                double d = m_block_diff_lookup_fn(hash_hex);
-                if (d > 0.0) network_difficulty = d;
-            } catch (...) {}
-        }
+        // The block's OWN header (its nBits) was asked first, above: when the
+        // live template and the cache are both empty -- a sharechain-replay or
+        // relayed win recorded early in boot, the case that persisted
+        // network_difficulty=0 and lost the luck point of a winning block --
+        // the header chain's answer is already in network_difficulty.
     }
 
     // Runtime dedup — with ENRICHMENT. Measured (primary node): rows for
@@ -4883,6 +5068,14 @@ void MiningInterface::record_found_block(uint64_t height, const uint256& hash, u
             // this red before the fix.
             bool row_dirty = false;      // any field changed -> persist once
             bool luck_input_changed = false;  // netdiff/hashrate -> recompute luck
+
+            // This node has now recorded the block itself: its own record
+            // supersedes the imported provenance (what the import brought
+            // stays, and the fills below never replace a known value).
+            if (existing.imported) {
+                existing.imported = false;
+                row_dirty = true;
+            }
 
             const bool authorship_raised = authorship > existing.authorship;
             if (authorship_raised) {
@@ -4968,16 +5161,27 @@ void MiningInterface::record_found_block(uint64_t height, const uint256& hash, u
             // record that carries one, or from the block's own header, whenever
             // the stored value is still absent. This is the general form of the
             // enrichment fill, lifted out of the unattributed-only branch.
-            if (existing.network_difficulty <= 0.0) {
-                double nd = network_difficulty > 0.0 ? network_difficulty : 0.0;
-                if (nd <= 0.0 && m_block_diff_lookup_fn) {
-                    try {
-                        double d = m_block_diff_lookup_fn(existing.hash);
-                        if (d > 0.0) nd = d;
-                    } catch (...) {}
-                }
+            // A stored difficulty the block's own header contradicts (a
+            // reading taken at record time, after the fact) is replaced too:
+            // the header's bits are the block's difficulty.
+            const bool header_contradicts = difficulty_from_header
+                && existing.network_difficulty > 0.0
+                && std::fabs(existing.network_difficulty - network_difficulty)
+                       > 1e-9 * network_difficulty;
+            // A merged (aux) row that only holds the parent's difficulty
+            // (stored before the aux chain's own was recorded) takes the aux
+            // difficulty a later record of the block carries.
+            const bool aux_unknown = !own_chain && !existing.aux_difficulty_known
+                && network_difficulty > 0.0;
+            if (existing.network_difficulty <= 0.0 || header_contradicts || aux_unknown) {
+                // The header chain was asked for this hash before the lock
+                // was taken (a lookup can be an RPC): its answer, when it had
+                // one, is network_difficulty.
+                const double nd = network_difficulty > 0.0 ? network_difficulty : 0.0;
                 if (nd > 0.0) {
                     existing.network_difficulty = nd;
+                    if (!own_chain)
+                        existing.aux_difficulty_known = true;
                     row_dirty = true;
                     luck_input_changed = true;
                     LOG_INFO << "[Pool] found-block network_difficulty filled: h="
@@ -4986,10 +5190,9 @@ void MiningInterface::record_found_block(uint64_t height, const uint256& hash, u
                 }
             }
 
-            // A changed luck input means the derived expected_time/luck are now
-            // computable (or stale); recompute the whole series while we hold the
-            // lock. Only fills fields still at 0, so it never clobbers a live
-            // value on any other row.
+            // A changed luck input means the derived effort/luck are now
+            // computable (or stale); recompute the whole series while we hold
+            // the lock.
             if (luck_input_changed)
                 recompute_found_block_luck_locked();
 
@@ -5047,29 +5250,20 @@ void MiningInterface::record_found_block(uint64_t height, const uint256& hash, u
                    miner, share_hash, network_difficulty, share_difficulty,
                    pool_hashrate, subsidy, 0, 0, 0, authorship};
 
-    // Compute time_to_find from previous block, then derive expected_time and luck
+    // The pool rate sampled at find. A caller that passes 0 gets the
+    // sharechain pool estimator, GROSS (over 1 - stale proportion): the rate
+    // every node records the same block with, and the rate luck is defined
+    // over. It is the round's rate only where no rate history covers the
+    // round (effort_method "single_sample").
+    if (blk.pool_hashrate <= 0.0)
+        blk.pool_hashrate = gross_pool_hashrate();
+    // A merged (aux) row recorded with a difficulty carries the aux chain's
+    // own (record_merged_found_block); the flag tells it from a row stored
+    // earlier, which holds the parent's.
+    blk.aux_difficulty_known = !own_chain && network_difficulty > 0.0;
+
     {
         std::lock_guard<std::mutex> lock(m_blocks_mutex);
-        // Find previous block in the same chain for time_to_find
-        for (const auto& prev : m_found_blocks) {
-            if (prev.chain == chain) {
-                blk.time_to_find = static_cast<double>(ts) - static_cast<double>(prev.ts);
-                break;
-            }
-        }
-        // Fallback: if caller passed 0 pool hashrate, use live pool hashrate
-        double hr = pool_hashrate;
-        if (hr <= 0 && m_pool_hashrate_fn)
-            hr = m_pool_hashrate_fn();
-        blk.pool_hashrate = hr;
-        // expected_time = network_difficulty * 2^32 / pool_hashrate
-        if (hr > 0 && network_difficulty > 0) {
-            blk.expected_time = network_difficulty * 4294967296.0 / hr;
-        }
-        // luck = expected / actual * 100 (>100 = lucky)
-        if (blk.time_to_find > 0 && blk.expected_time > 0) {
-            blk.luck = blk.expected_time / blk.time_to_find * 100.0;
-        }
         // Keep found-blocks ordered newest-first by chain height (canonical
         // chain order). Height is monotonic on-chain, so it is immune to the
         // block-header timestamp skew that can reverse a same-day cluster
@@ -5080,6 +5274,9 @@ void MiningInterface::record_found_block(uint64_t height, const uint256& hash, u
                 if (a.height != b.height) return a.height > b.height;
                 return a.ts > b.ts;
             });
+        // Every derived field of every row, from the inputs: the new block
+        // closes a round, and one learned late splits the round it fell in.
+        recompute_found_block_luck_locked();
     }
 
     // Persist to LevelDB (Layer +2 — never pruned)
@@ -5240,10 +5437,27 @@ void MiningInterface::record_merged_found_block(const std::string& symbol, int h
     if (miner.empty())
         miner = (ctx && !ctx->miner.empty()) ? ctx->miner : get_payout_address();
     // share = the one this submit minted; "" (JSON null) when the solve
-    // missed the share target. Network difficulty is still the parent's (#1738).
+    // missed the share target.
     const std::string share = ctx ? ctx->share_hash : std::string();
+    // The AUX chain's own difficulty at find (#1738: it was the parent's, so
+    // a DOGE block was measured against LTC's ~3x higher difficulty). The
+    // merged manager read it off the bits of the aux block it just submitted;
+    // failing that, the aux header chain names it by hash. 0 = not known --
+    // never the parent's.
+    double aux_difficulty = 0.0;
+    if (m_mm_manager) {
+        for (const auto& d : m_mm_manager->get_discovered_blocks())
+            if (d.block_hash == h.GetHex() && d.symbol == symbol && d.difficulty > 0.0) {
+                aux_difficulty = d.difficulty;
+                break;
+            }
+    }
+    if (aux_difficulty <= 0.0)
+        aux_difficulty = chain_block_difficulty(symbol, h.GetHex());
+    // Pool rate 0 -> the sharechain pool estimator: a merged block is found
+    // by the whole pool's parent-chain hashing, not this node's own miners.
     record_found_block(static_cast<uint64_t>(height), h, 0, symbol,
-                       miner, share, get_network_difficulty(), 0, get_local_hashrate(),
+                       miner, share, aux_difficulty, 0, /*pool_hashrate=*/0.0,
                        coinbase_value, BlockAuthorship::this_node);
     if (ctx) {
         std::optional<uint64_t> parent_height = ctx->parent_height;
@@ -5267,35 +5481,465 @@ void MiningInterface::set_found_block_persistence(block_store_fn_t persist_fn, b
     m_load_blocks_fn = std::move(load_fn);
 }
 
+double MiningInterface::found_block_luck_difficulty(const FoundBlock& b) const
+{
+    if (is_primary_found_block(b) || b.aux_difficulty_known)
+        return b.network_difficulty;
+    return 0.0;   // a merged row holding only the parent's difficulty
+}
+
+namespace {
+// The block interval the verification schedule spaces its checks by, for a
+// found-block chain label (the testnet "t" prefix allowed).
+int found_block_chain_block_time(const std::string& chain_name)
+{
+    std::string cn = chain_name;
+    if (cn.size() > 1 && cn[0] == 't')   // strip testnet prefix (tLTC, tBTC, ...)
+        cn = cn.substr(1);
+    if (cn == "LTC")  return 150;   // 2.5 min
+    if (cn == "DOGE") return 60;    // 1 min
+    if (cn == "BTC")  return 600;   // 10 min
+    if (cn == "BCH")  return 600;   // 10 min
+    if (cn == "DASH") return 150;   // 2.5 min
+    if (cn == "DGB")  return 15;    // ~15 s
+    return 60;                      // safe fallback
+}
+} // namespace
+
+bool MiningInterface::found_block_luck_main_chain(const FoundBlock& b)
+{
+    if (!found_block_is_main_chain(b))
+        return false;
+    // A pending row stands as a block of the chain unless the chain itself
+    // says otherwise (not_on_chain: verify_found_block's evidence). A row
+    // that is pending only because nobody can judge it stays.
+    return !(b.status == BlockStatus::pending && b.not_on_chain);
+}
+
+MiningInterface::RateAtFind MiningInterface::rate_at_find_locked(const FoundBlock& b) const
+{
+    // CALLER HOLDS m_luck_history_mutex.
+    return rate_at_find_locked(b.pool_hashrate, b.share_difficulty, static_cast<double>(b.ts));
+}
+
+MiningInterface::RateAtFind MiningInterface::rate_at_find_locked(double recorded,
+                                                                 double share_difficulty,
+                                                                 double ts) const
+{
+    // CALLER HOLDS m_luck_history_mutex.
+    // The rate sampled at find, as far as it can be trusted. A recorded value
+    // that is not plausibly a POOL rate (core::luck::rate_at_find_plausible:
+    // the node's own stratum rate of an earlier build) is not used. Where
+    // the history holds the rate at the block's own time, that stands in for
+    // a missing or implausible one -- in memory only: what is stored is
+    // rewritten only by repair_found_block_inputs_locked, under its own
+    // stricter rule.
+    RateAtFind rate;
+    if (core::luck::rate_at_find_plausible(
+            recorded, share_difficulty,
+            m_luck_history.yardstick_rate(ts, kLuckYardstickSeconds))) {
+        rate.value = recorded;
+        rate.source = RateAtFindSource::recorded;
+    } else if (const auto at = m_luck_history.at(ts); at.rate > 0.0) {
+        rate.value = at.rate;
+        rate.source = RateAtFindSource::history;
+    }
+    return rate;
+}
+
+MiningInterface::LuckRows MiningInterface::luck_rows_locked(bool primary,
+                                                           const std::string& aux_chain) const
+{
+    // CALLER HOLDS m_blocks_mutex AND m_luck_history_mutex.
+    LuckRows out;
+    // The node's own chain runs against the difficulty sampled with the pool
+    // rate; a merged chain against each block's own (the history's is the
+    // parent's).
+    out.options.history_difficulty = primary;
+    for (size_t i = 0; i < m_found_blocks.size(); ++i) {
+        const FoundBlock& b = m_found_blocks[i];
+        const bool is_primary = is_primary_found_block(b);
+        if (primary ? !is_primary : (is_primary || b.chain != aux_chain))
+            continue;
+        core::luck::RoundInput in;
+        in.ts = static_cast<double>(b.ts);
+        in.height = b.height;
+        in.main_chain = found_block_luck_main_chain(b);
+        in.difficulty = found_block_luck_difficulty(b);
+        const RateAtFind rate = rate_at_find_locked(b);
+        in.rate_at_find = rate.value;
+        in.imported_effort = b.imported_effort;
+        in.imported_coverage = b.imported_coverage;
+        out.rows.push_back(in);
+        out.index.push_back(i);
+        out.rates.push_back(rate);
+    }
+    // An imported effort measured the round from imported_prev_hash: name
+    // that row, if this chain holds it (compute_rounds uses the figure only
+    // while this node's round runs from the same block).
+    bool any_imported = false;
+    for (const auto& in : out.rows)
+        if (in.imported_effort > 0.0) { any_imported = true; break; }
+    if (!any_imported)
+        return out;
+    std::unordered_map<std::string, int> row_of_hash;
+    for (size_t k = 0; k < out.index.size(); ++k)
+        row_of_hash.emplace(m_found_blocks[out.index[k]].hash, static_cast<int>(k));
+    for (size_t k = 0; k < out.index.size(); ++k) {
+        const FoundBlock& b = m_found_blocks[out.index[k]];
+        if (!(b.imported_effort > 0.0) || b.imported_prev_hash.empty()) continue;
+        auto it = row_of_hash.find(b.imported_prev_hash);
+        if (it != row_of_hash.end()) out.rows[k].imported_prev = it->second;
+    }
+    return out;
+}
+
 void MiningInterface::recompute_found_block_luck_locked()
 {
-    // CALLER HOLDS m_blocks_mutex. Reconstruct the DERIVED fields
-    // (time_to_find, expected_time, luck) that record_found_block computes at
-    // record time but that are NOT persisted, so a restored history keeps its
-    // luck trend instead of emitting null for every row. Only fills fields
-    // still at 0 — never clobbers a value that is already present. Inputs that
-    // are genuinely unknown (e.g. a v1 record with pool_hashrate==0) leave luck
-    // at 0, which rest_luck_stats renders as null rather than a fabricated 0%.
-    // The list is kept sorted newest-first by height, so the previous (older)
-    // block on the same chain is the NEXT same-chain element.
-    for (size_t i = 0; i < m_found_blocks.size(); ++i) {
-        auto& blk = m_found_blocks[i];
-        if (blk.time_to_find <= 0.0) {
-            for (size_t j = i + 1; j < m_found_blocks.size(); ++j) {
-                if (m_found_blocks[j].chain == blk.chain) {
-                    blk.time_to_find = static_cast<double>(blk.ts)
-                                     - static_cast<double>(m_found_blocks[j].ts);
-                    break;
-                }
+    derive_found_block_luck_locked(nullptr, 0.0);
+}
+
+void MiningInterface::derive_found_block_luck_locked(PoolLuck* pool, double now)
+{
+    // CALLER HOLDS m_blocks_mutex. Every derived field of every row, from the
+    // stored inputs and the pool rate history; nothing survives from an
+    // earlier pass. See core/pool_luck.hpp for the model. With `pool`, the
+    // pool luck of the node's own chain as of `now` comes out of the SAME
+    // rounds: a read computes them once.
+
+    // The live rate and difficulty: what the open round falls back to where
+    // the history does not reach, and what its expected time is quoted at.
+    // Read before the history lock (gross_pool_hashrate takes it itself).
+    double live_rate = pool ? gross_pool_hashrate() : 0.0;
+    const double live_difficulty = m_network_difficulty.load(std::memory_order_relaxed);
+
+    std::lock_guard<std::mutex> hlock(m_luck_history_mutex);
+    auto apply = [this](const LuckRows& lr, const std::vector<core::luck::RoundResult>& res) {
+        for (size_t i = 0; i < lr.index.size(); ++i) {
+            FoundBlock& b = m_found_blocks[lr.index[i]];
+            const core::luck::RoundResult& r = res[i];
+            b.effort           = r.effort;
+            b.effort_method    = r.method;
+            b.luck_missing     = r.missing;
+            b.luck             = r.luck;
+            b.expected_time    = r.expected_time;
+            b.time_to_find     = r.prev >= 0 ? r.time_to_find : 0.0;
+            b.history_coverage = r.coverage;
+            b.prev_block_hash  = r.prev >= 0 ? m_found_blocks[lr.index[r.prev]].hash
+                                             : std::string();
+            b.rate_used        = r.rate_used;
+            b.difficulty_used  = r.difficulty_used;
+            b.luck_samples     = r.samples;
+            b.luck_main_chain  = lr.rows[i].main_chain;
+            b.effort_covered   = core::luck::period_effort(r);
+            b.luck_measured    = core::luck::counts_in_period(lr.rows[i], r);
+            b.rate_at_find     = lr.rates[i];
+        }
+    };
+
+    // The node's own chain.
+    {
+        const LuckRows lr = luck_rows_locked(/*primary=*/true, "");
+        const auto res = core::luck::compute_rounds(lr.rows, m_luck_history, lr.options);
+        apply(lr, res);
+        if (pool) {
+            *pool = PoolLuck{};
+            for (const auto& r : lr.rows)
+                if (r.main_chain) { pool->any = true; break; }
+        }
+        if (pool && pool->any) {
+            // No estimator reading right now (it goes silent when its
+            // sharechain snapshot is over 10 min old): the newest sampled
+            // rate stands in while it is still fresh.
+            if (!(live_rate > 0.0) && now - m_luck_history.last_time() <= kLuckLiveRateMaxAge)
+                live_rate = m_luck_history.last_rate();
+            pool->open = core::luck::open_round(lr.rows, m_luck_history, lr.options, now,
+                                                live_rate, live_difficulty);
+            if (pool->open.since >= 0)
+                pool->since_block_hash = m_found_blocks[lr.index[pool->open.since]].hash;
+            auto period = [&](double seconds) {
+                return core::luck::period_luck(lr.rows, res, m_luck_history, lr.options,
+                                               pool->open, seconds > 0.0 ? now - seconds : 0.0,
+                                               now);
+            };
+            pool->d1  = period(86400.0);
+            pool->d7  = period(7.0 * 86400.0);
+            pool->d30 = period(30.0 * 86400.0);
+            pool->d90 = period(90.0 * 86400.0);
+            pool->all = period(0.0);
+        }
+    }
+
+    // Each merged (aux) chain riding the ledger.
+    std::set<std::string> aux_chains;
+    for (const auto& b : m_found_blocks)
+        if (!is_primary_found_block(b))
+            aux_chains.insert(b.chain);
+    for (const auto& chain : aux_chains) {
+        const LuckRows lr = luck_rows_locked(/*primary=*/false, chain);
+        apply(lr, core::luck::compute_rounds(lr.rows, m_luck_history, lr.options));
+    }
+}
+
+double MiningInterface::gross_pool_hashrate() const
+{
+    double nonstale = 0.0;
+    if (m_pool_hashrate_fn) {
+        try { nonstale = m_pool_hashrate_fn(); } catch (...) { nonstale = 0.0; }
+    }
+    std::lock_guard<std::mutex> hlock(m_luck_history_mutex);
+    return core::luck::gross_rate(nonstale, m_luck_history.last_stale_prop());
+}
+
+double MiningInterface::gross_pool_hashrate_at(double block_ts, double now) const
+{
+    if (!(block_ts > 0.0) || !(std::fabs(now - block_ts) <= kLiveRateAtFindMaxLag))
+        return 0.0;
+    return gross_pool_hashrate();
+}
+
+void MiningInterface::add_luck_rate_sample(double t, double nonstale_rate, double stale_prop,
+                                           double network_difficulty)
+{
+    std::lock_guard<std::mutex> hlock(m_luck_history_mutex);
+    m_luck_history.add_sample(t, nonstale_rate, stale_prop, network_difficulty);
+    // Minute resolution is kept for kLuckFineSeconds (what the persisted stat
+    // log holds); older samples are folded into hourly bins, a day's worth at
+    // a time, so a long-running node holds ~45k minute segments and ~9k
+    // hourly ones instead of 576k minute segments. Nothing moves in memory on
+    // the other 1439 minutes of the day.
+    const double fine_start = m_luck_history.fine_start();
+    if (fine_start > 0.0 && fine_start < t - (kLuckFineSeconds + kLuckCoarsenSlack))
+        m_luck_history.coarsen_before(
+            std::floor((t - kLuckFineSeconds) / kLuckBinSeconds) * kLuckBinSeconds,
+            kLuckBinSeconds);
+    // Bounded like the year-scale graph store that seeds it.
+    m_luck_history.trim_before(t - kLuckHistorySeconds);
+}
+
+size_t MiningInterface::luck_rate_history_size() const
+{
+    std::lock_guard<std::mutex> hlock(m_luck_history_mutex);
+    return m_luck_history.size();
+}
+
+std::vector<MiningInterface::FoundBlock> MiningInterface::repair_found_block_inputs_locked()
+{
+    // CALLER HOLDS m_blocks_mutex. The pool rate sampled "at find" is a
+    // stored input: the fallback of a round the rate history does not cover,
+    // and what the row shows as pool_hashrate_at_find. Rows exist that hold a
+    // wrong one -- this node's OWN stratum rate (the pre-fix LTC record paths:
+    // three rows at ~4 MH/s on a ~180 GH/s pool), or the rate of the moment a
+    // block was recorded long after it was found.
+    //
+    // A stored value is REWRITTEN (and written back to disk) only against a
+    // sample of THE BLOCK'S OWN MINUTE. That is a reading which
+    //   - is a sample, not a bin (the hourly bins of samples older than 31
+    //     days, the ~29 h bins of the year-scale graph store: a bin is a
+    //     mean, and a legitimate instantaneous rate sits well away from it --
+    //     DASH at find: 4.4e13 .. 6.06e13 within days);
+    //   - speaks for at most kLuckRepairSampleSpan seconds. The first sample
+    //     after a restart reaches back over the outage, up to an hour;
+    //   - was taken no more than one stat period after the block's time: a
+    //     sample that reaches back over the block from minutes later is a
+    //     reading of a later moment;
+    //   - is borne out by the samples next to it (RateHistory::steady_at):
+    //     the estimator fills its window after a restart, and what it reads
+    //     meanwhile -- low, or a hundred times high -- is no pool rate.
+    // Against such a sample a stored value is wrong when it is missing, not
+    // plausibly a pool rate at all (core::luck::rate_at_find_plausible), or
+    // more than kLuckRateRepairTolerance away from it: the same estimator at
+    // the same moment says otherwise. The write is for good, so everything
+    // short of that leaves the disk alone: a row keeps what was recorded, and
+    // where that is missing or implausible the history's reading stands in
+    // IN MEMORY (rate_at_find_locked).
+    std::vector<FoundBlock> changed;
+    std::lock_guard<std::mutex> hlock(m_luck_history_mutex);
+    if (m_luck_history.empty())
+        return changed;
+    for (auto& b : m_found_blocks) {
+        const double ts = static_cast<double>(b.ts);
+        const auto at = m_luck_history.at(ts);
+        const bool own_minute = at.rate > 0.0 && !at.binned
+            && at.span <= kLuckRepairSampleSpan
+            && at.end - ts <= kStatLogPeriodSeconds
+            && m_luck_history.steady_at(ts, kLuckRepairSampleSpan, kLuckRateRepairTolerance);
+        if (!own_minute)
+            continue;
+        const double have = b.pool_hashrate;
+        const bool implausible =
+            !core::luck::rate_at_find_plausible(have, b.share_difficulty, at.rate);
+        const bool contradicted =
+            std::fabs(have - at.rate) > kLuckRateRepairTolerance * at.rate;
+        if (!implausible && !contradicted)
+            continue;
+        // Never replace it with a rate the row's own share rules out.
+        if (!core::luck::rate_at_find_plausible(at.rate, b.share_difficulty, 0.0))
+            continue;
+        LOG_INFO << "[Pool] found-block pool rate at find repaired from the sample"
+                    " of its own minute: h=" << b.height << " hash=" << b.hash.substr(0, 16)
+                 << " " << have << " -> " << at.rate << " H/s ("
+                 << (implausible ? "not a pool rate" : "contradicted by its own minute") << ")";
+        b.pool_hashrate = at.rate;
+        changed.push_back(b);
+    }
+    return changed;
+}
+
+void MiningInterface::rebuild_luck_history()
+{
+    // The fine samples: the flat stat log, one a minute over the last 31 days.
+    struct Sample { double t, rate, stale, diff; };
+    std::vector<Sample> samples;
+    {
+        std::lock_guard<std::mutex> lock(m_stat_log_mutex);
+        samples.reserve(m_stat_log.size());
+        for (const auto& e : m_stat_log)
+            samples.push_back({e.time, e.pool_hash_rate, e.pool_stale_prop,
+                               e.network_difficulty});
+    }
+    core::luck::RateHistory fresh;
+    for (const auto& x : samples)
+        fresh.add_sample(x.t, x.rate, x.stale, x.diff);
+
+    // Before them: the year-scale graph bins (a bin is the MEAN of the
+    // samples that fell in it), for a round older than the flat log. Coarse
+    // -- a bin is ~29 h -- but a measured mean over the round's own days.
+    // Only a store adopted from its sidecar holds more than the flat log; a
+    // freshly seeded one is still being filled on another thread and holds
+    // nothing older, so it is not read.
+    std::vector<core::luck::RateSegment> older;
+    if (m_views_ready.load(std::memory_order_acquire)
+        && !m_views_freshly_seeded.load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> hlock(m_history_mutex);
+        auto year = [this](const char* name) -> const core::graph::DataView* {
+            const auto* stream = m_history.stream(name);
+            return stream ? stream->view("last_year") : nullptr;
+        };
+        const auto* rate_v = year("pool_hash_rate");
+        const auto* stale_v = year("pool_stale_prop");
+        const auto* diff_v = year("network_difficulty");
+        // A scalar stream keeps its value under the key "null".
+        auto mean_at = [](const core::graph::DataView* v, double t) -> double {
+            if (!v || !(v->desc.bin_width > 0.0)) return 0.0;
+            const double idx = std::floor((v->last_bin_end - t) / v->desc.bin_width);
+            if (idx < 0.0 || idx >= static_cast<double>(v->bins.size())) return 0.0;
+            const auto& bin = v->bins[static_cast<size_t>(idx)];
+            auto it = bin.find("null");
+            if (it == bin.end() || !(it->second.second > 0.0)) return 0.0;
+            return it->second.first / it->second.second;
+        };
+        if (rate_v && rate_v->desc.bin_width > 0.0) {
+            const double bw = rate_v->desc.bin_width;
+            for (size_t i = 0; i < rate_v->bins.size(); ++i) {
+                auto it = rate_v->bins[i].find("null");
+                if (it == rate_v->bins[i].end() || !(it->second.second > 0.0))
+                    continue;
+                const double mean = it->second.first / it->second.second;
+                core::luck::RateSegment seg;
+                seg.t1 = rate_v->last_bin_end - bw * static_cast<double>(i);
+                seg.t0 = seg.t1 - bw;
+                const double mid = 0.5 * (seg.t0 + seg.t1);
+                seg.rate = core::luck::gross_rate(mean, mean_at(stale_v, mid));
+                seg.difficulty = mean_at(diff_v, mid);
+                // The share of the bin its samples cover (one a minute).
+                seg.weight = std::min(1.0, it->second.second * kStatLogPeriodSeconds / bw);
+                older.push_back(seg);
             }
         }
-        if (blk.expected_time <= 0.0 && blk.network_difficulty > 0.0
-            && blk.pool_hashrate > 0.0) {
-            blk.expected_time =
-                blk.network_difficulty * 4294967296.0 / blk.pool_hashrate;
+    }
+    fresh.prepend_older(std::move(older));
+
+    {
+        std::lock_guard<std::mutex> hlock(m_luck_history_mutex);
+        m_luck_history = std::move(fresh);
+    }
+
+    // The history is an input of every row's luck, and the judge of the rate
+    // each row stored at find.
+    std::vector<FoundBlock> repaired;
+    {
+        std::lock_guard<std::mutex> lock(m_blocks_mutex);
+        repaired = repair_found_block_inputs_locked();
+        recompute_found_block_luck_locked();
+    }
+    // Outside m_blocks_mutex: m_persist_block_fn is the LevelDB writer.
+    if (m_persist_block_fn) {
+        for (const auto& b : repaired) {
+            try { m_persist_block_fn(b); }
+            catch (const std::exception& e) {
+                LOG_WARNING << "[Pool] Failed to persist repaired found block: " << e.what();
+            }
         }
-        if (blk.luck <= 0.0 && blk.time_to_find > 0.0 && blk.expected_time > 0.0) {
-            blk.luck = blk.expected_time / blk.time_to_find * 100.0;
+    }
+}
+
+double MiningInterface::chain_block_difficulty(const std::string& chain,
+                                               const std::string& block_hash)
+{
+    block_diff_lookup_fn fn;
+    {
+        std::lock_guard<std::mutex> lock(m_blocks_mutex);
+        auto it = m_chain_diff_lookups.find(chain);
+        if (it != m_chain_diff_lookups.end())
+            fn = it->second;
+    }
+    if (!fn) return 0.0;
+    try {
+        const double d = fn(block_hash);
+        return d > 0.0 ? d : 0.0;
+    } catch (...) {
+        return 0.0;
+    }
+}
+
+void MiningInterface::add_chain_block_difficulty_lookup(const std::string& chain,
+                                                        block_diff_lookup_fn diff_fn)
+{
+    // Snapshot the chain's merged rows, ask the aux header chain with the
+    // lock released (it has locks of its own), as backfill_found_block_heights
+    // does.
+    std::vector<std::string> hashes;
+    {
+        std::lock_guard<std::mutex> lock(m_blocks_mutex);
+        m_chain_diff_lookups[chain] = diff_fn;
+        for (const auto& b : m_found_blocks)
+            if (b.chain == chain && !is_primary_found_block(b) && !b.hash.empty())
+                hashes.push_back(b.hash);
+    }
+    if (!diff_fn || hashes.empty())
+        return;
+    std::vector<FoundBlock> repaired;
+    for (const auto& hash : hashes) {
+        double d = 0.0;
+        try { d = diff_fn(hash); } catch (...) { d = 0.0; }
+        if (!(d > 0.0)) continue;
+        std::lock_guard<std::mutex> lock(m_blocks_mutex);
+        for (auto& b : m_found_blocks) {
+            if (b.hash != hash || b.chain != chain) continue;
+            if (b.aux_difficulty_known
+                && std::fabs(b.network_difficulty - d) <= 1e-9 * d)
+                break;
+            b.network_difficulty = d;
+            b.aux_difficulty_known = true;
+            repaired.push_back(b);
+            break;
+        }
+    }
+    if (repaired.empty())
+        return;
+    LOG_INFO << "[Pool] " << chain << " found blocks given the aux chain's own"
+                " difficulty from its header chain: " << repaired.size();
+    {
+        std::lock_guard<std::mutex> lock(m_blocks_mutex);
+        recompute_found_block_luck_locked();
+    }
+    if (m_persist_block_fn) {
+        for (const auto& b : repaired) {
+            try { m_persist_block_fn(b); }
+            catch (const std::exception& e) {
+                LOG_WARNING << "[Pool] Failed to persist aux difficulty: " << e.what();
+            }
         }
     }
 }
@@ -5436,10 +6080,594 @@ void MiningInterface::correct_found_block_heights(const block_height_lookup_fn& 
             schedule_block_verification(b.hash);
 }
 
+core::found_block_import::Report
+MiningInterface::import_found_blocks(const std::vector<core::found_block_import::Row>& rows,
+                                     const core::found_block_import::Source& source)
+{
+    namespace fbi = core::found_block_import;
+    fbi::Report rep;
+    rep.rows = rows.size();
+
+    // The label this node records its own blocks under ("LTC", "tLTC").
+    const std::string primary_label = !source.primary_chain.empty()
+        ? source.primary_chain : node_symbol();
+    auto same_label = [](const std::string& a, const std::string& b) {
+        if (a.size() != b.size()) return false;
+        for (size_t i = 0; i < a.size(); ++i)
+            if (std::toupper(static_cast<unsigned char>(a[i]))
+                != std::toupper(static_cast<unsigned char>(b[i])))
+                return false;
+        return true;
+    };
+
+    // Each lookup is asked whether it can judge a block once per pass.
+    std::map<const fbi::ChainLookup*, bool> ready_of;
+    auto ready = [&ready_of](const fbi::ChainLookup& l) {
+        auto it = ready_of.find(&l);
+        if (it != ready_of.end()) return it->second;
+        bool r = true;
+        if (l.ready) {
+            try { r = l.ready(); } catch (...) { r = false; }
+        }
+        ready_of[&l] = r;
+        return r;
+    };
+
+    // ── Validate, with the ledger UNLOCKED (the lookups read header chains
+    // with locks of their own). Only what the node's own header chain says
+    // of a hash makes a row: its height, its time, its difficulty.
+    struct Candidate {
+        FoundBlock blk{};
+        bool primary{true};
+        bool pending{false};   // < 6 deep: verified like a find
+        // The source's measured effort of the round, well-formed (judged on
+        // this node's own round once the rows are in, below).
+        bool   effort_offered{false};
+        double effort{0.0};
+        double effort_coverage{0.0};
+        std::string effort_prev_hash;
+    };
+    std::vector<Candidate> cands;
+    std::set<std::string> seen;
+    size_t corrected_logged = 0;
+    for (const auto& r : rows) {
+        // The chain the row names, as the summary counts it: this node's own
+        // label for its own chain (or no label), a merged chain's label as
+        // the source lists it.
+        std::string named = r.chain.empty() || same_label(r.chain, primary_label)
+            ? primary_label : r.chain;
+        for (const auto& kv : source.aux)
+            if (same_label(kv.first, named)) named = kv.first;
+        if (r.hash.empty()) { rep.reject(fbi::kMalformed, named); continue; }
+        if (!seen.insert(r.hash).second) { rep.reject(fbi::kDuplicate, named); continue; }
+
+        bool primary = true;
+        std::string chain = primary_label;
+        const fbi::ChainLookup* lookup = &source.primary;
+        if (named != primary_label) {
+            auto it = source.aux.find(named);
+            if (it == source.aux.end()) {
+                // A merged chain this node does not follow (or cannot check)
+                // -- a row naming its parent block (#946), or a merged chain
+                // of the LTC binary -- is skipped as such; anything else,
+                // this coin on another network included, is another chain.
+                const bool merged_row = !found_block_chain_is_primary(r.chain, "", node_symbol())
+                    && (!r.parent_hash.empty() || same_label(r.chain, "DOGE")
+                        || same_label(r.chain, "NMC"));
+                rep.reject(merged_row ? fbi::kMergedUnvalidated : fbi::kOtherChain, named);
+                continue;
+            }
+            primary = false;
+            chain = it->first;
+            lookup = &it->second;
+        }
+        if (!*lookup) {
+            rep.reject(primary ? fbi::kNoHeaderChain : fbi::kMergedUnvalidated, chain);
+            continue;
+        }
+        if (!ready(*lookup)) {
+            rep.deferred.push_back(r);
+            continue;
+        }
+
+        // The row's OWN chain judges it: the LTC header chain an LTC row, the
+        // aux (DOGE) header chain a merged row -- each against its own root.
+        fbi::Header h;
+        try { h = lookup->header(r.hash); } catch (...) { h = fbi::Header{}; }
+        if (!h.known) {
+            uint64_t lowest = 0;
+            if (lookup->lowest_height) {
+                try { lowest = lookup->lowest_height(); } catch (...) { lowest = 0; }
+            }
+            // Below the chain's root the chain cannot say; anywhere else a
+            // hash it does not hold is not a block of that chain.
+            rep.reject(r.height && lowest > 0 && *r.height < lowest
+                           ? fbi::kBelowHeaderChain : fbi::kNotOnChain, chain);
+            continue;
+        }
+        if (!h.main_chain || h.height == 0) {
+            rep.reject(fbi::kNotMainChain, chain);
+            continue;
+        }
+        const uint64_t ts = h.ts != 0 ? h.ts : r.ts;
+        if (ts == 0) { rep.reject(fbi::kMalformed, chain); continue; }
+
+        // A POOL block? Only the coinbase can say, and only where its body is
+        // at hand; elsewhere the source is trusted (provenance "imported").
+        bool verified = false;
+        if (primary && source.pays_pool) {
+            std::optional<bool> pays;
+            try { pays = source.pays_pool(r.hash, h.height); } catch (...) { pays.reset(); }
+            if (pays && !*pays) { rep.reject(fbi::kNotPoolBlock, chain); continue; }
+            verified = pays.has_value();
+        }
+        if (verified) ++rep.pool_verified;
+
+        if (!r.height) {
+            ++rep.height_filled;
+        } else if (*r.height != h.height) {
+            ++rep.height_corrected;
+            if (corrected_logged++ < 5)
+                LOG_WARNING << "[Pool] found-block import: " << chain << " block "
+                            << r.hash.substr(0, 16) << " is at height " << h.height
+                            << " in the header chain, not " << *r.height
+                            << " as the file says; imported at " << h.height;
+        }
+
+        Candidate c;
+        c.primary = primary;
+        FoundBlock& b = c.blk;
+        b.height = h.height;
+        b.hash = r.hash;
+        b.ts = ts;
+        b.chain = chain;
+        const uint64_t depth = h.tip_height >= h.height ? h.tip_height - h.height + 1 : 0;
+        // The confirm lane's rule: final at 6 deep (ltc::coin::found_block::
+        // kDepth); a shallower block is pending and checked like a find.
+        if (depth >= 6) {
+            b.status = BlockStatus::confirmed;
+            b.confirmations = static_cast<uint32_t>(std::min<uint64_t>(depth, UINT32_MAX));
+        } else {
+            b.status = BlockStatus::pending;
+            c.pending = true;
+        }
+        b.authorship = BlockAuthorship::unknown;   // which node found it is not known here
+        b.imported = true;
+        if (primary) {
+            // The header's bits; the file's value only without them.
+            b.network_difficulty = h.difficulty > 0.0 ? h.difficulty : r.network_difficulty;
+            // A parent row's share IS its block (p2pool: share hash ==
+            // header hash); anything else is not this block's share.
+            if (r.share_hash == r.hash) b.share_hash = r.share_hash;
+            // A share above the block's own difficulty would be a block
+            // itself: not a share difficulty.
+            if (r.share_difficulty > 0.0
+                && (b.network_difficulty <= 0.0 || r.share_difficulty <= b.network_difficulty))
+                b.share_difficulty = r.share_difficulty;
+        } else {
+            // The AUX chain's own difficulty, off the aux header; a file's
+            // value may be the parent's (#1738), so none without the header.
+            b.network_difficulty = h.difficulty > 0.0 ? h.difficulty : 0.0;
+            b.aux_difficulty_known = h.difficulty > 0.0;
+            b.share_hash = r.share_hash;
+            b.share_difficulty = r.share_difficulty;
+            // The parent block the aux solve rode, if this node's parent
+            // header chain holds it on its best chain.
+            if (!r.parent_hash.empty() && source.primary) {
+                fbi::Header ph;
+                try { ph = source.primary.header(r.parent_hash); } catch (...) { ph = fbi::Header{}; }
+                if (ph.known && ph.main_chain && ph.height != 0) {
+                    b.parent_hash = r.parent_hash;
+                    b.parent_height = ph.height;
+                }
+            }
+        }
+        if (!r.miner.empty() && found_block_miner_display(r.miner) == r.miner)
+            b.miner = r.miner;
+        b.pool_hashrate = r.pool_hashrate;
+        b.subsidy = r.subsidy;
+        b.coinbase_txid = r.coinbase_txid;
+        b.tx_count = r.tx_count;
+        // The source's effort: an effort within its absolute bounds and a
+        // coverage in (0, 1] (core::luck::imported_effort_valid), the block
+        // the round was timed from (not this one).
+        if (r.effort_offered) {
+            const bool well_formed = core::luck::imported_effort_valid(r.effort, r.effort_coverage)
+                && r.effort_prev_hash.size() == 64 && r.effort_prev_hash != r.hash;
+            if (well_formed) {
+                c.effort_offered = true;
+                c.effort = r.effort;
+                c.effort_coverage = r.effort_coverage;
+                c.effort_prev_hash = r.effort_prev_hash;
+            } else {
+                ++rep.effort_refused;
+            }
+        }
+        cands.push_back(std::move(c));
+    }
+
+    // ── Apply under the ledger lock.
+    std::vector<FoundBlock> to_persist;
+    std::vector<std::string> to_verify;
+    if (!cands.empty()) {
+        std::lock_guard<std::mutex> lock(m_blocks_mutex);
+        // The median of the file's own rates at find: the yardstick where the
+        // rate history does not reach (the usual case for history from
+        // before this node). A merged row's rate is the parent pool's too.
+        double file_median = 0.0;
+        {
+            std::vector<double> file_rates;
+            for (const auto& c : cands)
+                if (c.blk.pool_hashrate > 0.0)
+                    file_rates.push_back(c.blk.pool_hashrate);
+            if (file_rates.size() >= 3) {
+                std::nth_element(file_rates.begin(),
+                                 file_rates.begin() + static_cast<std::ptrdiff_t>(file_rates.size() / 2),
+                                 file_rates.end());
+                file_median = file_rates[file_rates.size() / 2];
+            }
+        }
+        // A pool never hashes above its whole network: the rate a chain's
+        // difficulty stands for over its block interval.
+        const double period = coin_block_period();
+        auto network_rate = [&](bool primary, const FoundBlock& b) -> double {
+            const double d = found_block_luck_difficulty(b);
+            const double t = primary ? period
+                                     : static_cast<double>(found_block_chain_block_time(b.chain));
+            return d > 0.0 && t > 0.0 ? d * core::luck::kHashesPerDifficulty / t : 0.0;
+        };
+        {
+            // The pool rate at find, checked as luck checks a recorded one
+            // (core::luck::rate_at_find_plausible): the share difficulty
+            // bounds it from below, and so does the rate history near the
+            // block -- or the file's median.
+            std::lock_guard<std::mutex> hlock(m_luck_history_mutex);
+            for (auto& c : cands) {
+                FoundBlock& b = c.blk;
+                if (!(b.pool_hashrate > 0.0)) continue;
+                double yardstick = m_luck_history.yardstick_rate(static_cast<double>(b.ts),
+                                                                 kLuckYardstickSeconds);
+                if (!(yardstick > 0.0)) yardstick = file_median;
+                bool ok = core::luck::rate_at_find_plausible(b.pool_hashrate,
+                                                             b.share_difficulty, yardstick);
+                if (ok && c.primary && b.network_difficulty > 0.0 && period > 0.0)
+                    ok = b.pool_hashrate
+                         <= b.network_difficulty * core::luck::kHashesPerDifficulty / period;
+                if (!ok) {
+                    b.pool_hashrate = 0.0;
+                    ++rep.rate_refused;
+                }
+            }
+        }
+
+        // The ledger by (hash, chain), built once: a lookup per row, not a
+        // scan of the ledger per row under the lock.
+        auto key_of = [](const std::string& hash, const std::string& chain) {
+            std::string k;
+            k.reserve(hash.size() + 1 + chain.size());
+            k.append(hash).push_back('\x1f');
+            k.append(chain);
+            return k;
+        };
+        std::unordered_map<std::string, size_t> held;
+        held.reserve(m_found_blocks.size() + cands.size());
+        for (size_t i = 0; i < m_found_blocks.size(); ++i)
+            held.emplace(key_of(m_found_blocks[i].hash, m_found_blocks[i].chain), i);
+        // What each candidate did to the ledger: a new row, or a held one
+        // that gained a field (counted and persisted once the source's
+        // effort, below, has had its say).
+        struct Applied { size_t cand; bool fresh; bool dirty; };
+        std::vector<Applied> applied;
+        applied.reserve(cands.size());
+        for (size_t ci = 0; ci < cands.size(); ++ci) {
+            Candidate& c = cands[ci];
+            FoundBlock& in = c.blk;
+            auto found = held.find(key_of(in.hash, in.chain));
+            if (found == held.end()) {
+                held.emplace(key_of(in.hash, in.chain), m_found_blocks.size());
+                m_found_blocks.push_back(in);
+                applied.push_back({ci, true, true});
+                ++rep.imported;
+                ++rep.imported_by_chain[in.chain];
+                if (!c.primary) ++rep.imported_aux;
+                if (c.pending) {
+                    ++rep.pending;
+                    to_verify.push_back(in.hash);
+                }
+                continue;
+            }
+            // A block the ledger holds: STRICTLY FILL-ONLY. Nothing this node
+            // recorded is replaced -- not its status, its authorship, its
+            // finder, its rate or its time, not even a value that does not
+            // render (a pre-fix raw-hex miner stays the node's own); only a
+            // field it holds no value for is filled from the import.
+            FoundBlock& ex = m_found_blocks[found->second];
+            bool dirty = false;
+            if (ex.height == 0 && in.height != 0) { ex.height = in.height; dirty = true; }
+            if (ex.ts == 0) { ex.ts = in.ts; dirty = true; }
+            if (ex.network_difficulty <= 0.0 && in.network_difficulty > 0.0) {
+                ex.network_difficulty = in.network_difficulty;
+                if (!c.primary) ex.aux_difficulty_known = in.aux_difficulty_known;
+                dirty = true;
+            } else if (!c.primary && !ex.aux_difficulty_known && in.aux_difficulty_known
+                       && in.network_difficulty > 0.0) {
+                // A merged row stored before the aux difficulty was recorded
+                // holds the PARENT's (#1738), which is no value of its own
+                // chain: the aux header's fills it, as a later record of the
+                // block does (record_found_block).
+                ex.network_difficulty = in.network_difficulty;
+                ex.aux_difficulty_known = true;
+                dirty = true;
+            }
+            if (ex.share_difficulty <= 0.0 && in.share_difficulty > 0.0) {
+                ex.share_difficulty = in.share_difficulty; dirty = true;
+            }
+            if (ex.pool_hashrate <= 0.0 && in.pool_hashrate > 0.0) {
+                ex.pool_hashrate = in.pool_hashrate; dirty = true;
+            }
+            if (ex.subsidy == 0 && in.subsidy != 0) { ex.subsidy = in.subsidy; dirty = true; }
+            if (ex.miner.empty() && !in.miner.empty()) { ex.miner = in.miner; dirty = true; }
+            if (ex.share_hash.empty() && !in.share_hash.empty()) {
+                ex.share_hash = in.share_hash; dirty = true;
+            }
+            if (ex.coinbase_txid.empty() && !in.coinbase_txid.empty()) {
+                ex.coinbase_txid = in.coinbase_txid; dirty = true;
+            }
+            if (!ex.tx_count && in.tx_count) { ex.tx_count = in.tx_count; dirty = true; }
+            if (!c.primary && ex.parent_hash.empty() && !in.parent_hash.empty()) {
+                ex.parent_hash = in.parent_hash;
+                if (!ex.parent_height) ex.parent_height = in.parent_height;
+                dirty = true;
+            }
+            applied.push_back({ci, false, dirty});
+        }
+        // The order record_found_block keeps (newest first by height, ts
+        // breaks ties), and every derived field from the inputs: an imported
+        // block before a held one becomes its predecessor, and every round
+        // of the chain is re-derived.
+        std::sort(m_found_blocks.begin(), m_found_blocks.end(),
+            [](const FoundBlock& a, const FoundBlock& b) {
+                if (a.height != b.height) return a.height > b.height;
+                return a.ts > b.ts;
+            });
+        recompute_found_block_luck_locked();
+
+        // Where each candidate's row is now (the sort moved them).
+        std::unordered_map<std::string, size_t> at;
+        at.reserve(m_found_blocks.size());
+        for (size_t i = 0; i < m_found_blocks.size(); ++i)
+            at.emplace(key_of(m_found_blocks[i].hash, m_found_blocks[i].chain), i);
+
+        // ── The source's measured effort, judged on THIS node's round of the
+        // row, as just derived from everything the ledger now holds. Kept
+        // with the row -- a field it lacks, filled once -- only where it is
+        // a better measurement of the same round (see found_block_import.hpp).
+        // A merged row is judged on the LEDGER's rounds; /recent_merged_blocks
+        // shows it on the union with the merged manager's rows and re-checks
+        // the round there (KNOWN LIMIT in found_block_import.hpp).
+        bool effort_filled = false;
+        {
+            std::lock_guard<std::mutex> hlock(m_luck_history_mutex);
+            for (auto& a : applied) {
+                const Candidate& c = cands[a.cand];
+                if (!c.effort_offered) continue;
+                auto pos = at.find(key_of(c.blk.hash, c.blk.chain));
+                if (pos == at.end()) continue;   // cannot happen: just put there
+                FoundBlock& b = m_found_blocks[pos->second];
+                // Holds one already for this very round (fill-only), is no
+                // round of the chain here, or this node's round runs from
+                // another block (the first block runs from none). A held
+                // figure of a round that has since changed (a block learned
+                // between: imported_prev_hash is no longer the round's start)
+                // applies to nothing (compute_rounds) and is no reason to
+                // keep a valid figure of the round as it is now out.
+                const bool holds = b.imported_effort > 0.0
+                    && b.imported_prev_hash == b.prev_block_hash;
+                if (holds || !b.luck_main_chain || b.prev_block_hash != c.effort_prev_hash) {
+                    ++rep.effort_not_used;
+                    continue;
+                }
+                // Measured over too little of the round to stand for it.
+                if (c.effort_coverage < core::luck::kImportedCoverageFloor) {
+                    ++rep.effort_not_used;
+                    continue;
+                }
+                // Without the row's own difficulty (a merged row whose aux
+                // difficulty is not known) or a round of any length, the
+                // figure cannot be judged: counted apart, it is no refusal.
+                const double difficulty = found_block_luck_difficulty(b);
+                if (!(difficulty > 0.0) || !(b.time_to_find > 0.0)) {
+                    ++rep.effort_not_judged;
+                    continue;
+                }
+                // Plausibly the pool's, over this node's own round: the round
+                // between two blocks of its ledger, against the block's own
+                // difficulty, judged as a rate at find is.
+                double yardstick = m_luck_history.yardstick_rate(static_cast<double>(b.ts),
+                                                                 kLuckYardstickSeconds);
+                if (!(yardstick > 0.0)) yardstick = file_median;
+                if (!core::luck::imported_effort_plausible(
+                        c.effort, b.time_to_find, difficulty,
+                        b.share_difficulty, yardstick, network_rate(c.primary, b))) {
+                    ++rep.effort_refused;
+                    continue;
+                }
+                // This node's own measurement of the round, as just derived.
+                core::luck::RoundResult own;
+                own.method = b.effort_method;
+                own.coverage = b.history_coverage;
+                own.effort = b.effort;
+                // Where the node integrated part of the round itself, the
+                // figure must agree with what it saw (kImportedRateBand).
+                if (!core::luck::imported_effort_agrees(own, c.effort)) {
+                    ++rep.effort_refused;
+                    continue;
+                }
+                // Better than this node's own measurement of the round.
+                if (!core::luck::imported_effort_wins(own, c.effort, c.effort_coverage)) {
+                    ++rep.effort_not_used;
+                    continue;
+                }
+                b.imported_effort = c.effort;
+                b.imported_coverage = c.effort_coverage;
+                b.imported_prev_hash = c.effort_prev_hash;
+                a.dirty = true;
+                effort_filled = true;
+                ++rep.effort_taken;
+            }
+        }
+        if (effort_filled)
+            recompute_found_block_luck_locked();
+
+        for (const auto& a : applied) {
+            if (!a.fresh) {
+                if (a.dirty) ++rep.merged; else ++rep.unchanged;
+            }
+            if (!a.dirty) continue;
+            auto pos = at.find(key_of(cands[a.cand].blk.hash, cands[a.cand].blk.chain));
+            if (pos != at.end())
+                to_persist.push_back(m_found_blocks[pos->second]);   // derived fields are not persisted
+        }
+    }
+
+    // Outside m_blocks_mutex: m_persist_block_fn is the LevelDB writer.
+    if (m_persist_block_fn) {
+        for (const auto& b : to_persist) {
+            try { m_persist_block_fn(b); }
+            catch (const std::exception& e) {
+                LOG_WARNING << "[Pool] Failed to persist imported found block: " << e.what();
+            }
+        }
+    }
+    // Scheduling takes m_blocks_mutex; it needs the io_context.
+    for (const auto& h : to_verify)
+        schedule_block_verification(h);
+    return rep;
+}
+
+void MiningInterface::start_found_block_import(
+    core::found_block_import::Parsed parsed,
+    core::found_block_import::Source source,
+    std::chrono::milliseconds retry,
+    std::function<void(const core::found_block_import::Report&)> on_done)
+{
+    std::vector<core::found_block_import::File> files;
+    files.push_back({std::string(), std::move(parsed)});
+    start_found_block_import(std::move(files), std::move(source), retry, std::move(on_done));
+}
+
+void MiningInterface::start_found_block_import(
+    std::vector<core::found_block_import::File> files,
+    core::found_block_import::Source source,
+    std::chrono::milliseconds retry,
+    std::function<void(const core::found_block_import::Report&)> on_done)
+{
+    namespace fbi = core::found_block_import;
+    // One file after the other, in the order given; each to the end (its
+    // waits included) before the next starts.
+    struct State {
+        std::vector<fbi::File> files;
+        size_t index{0};
+        bool started{false};          // files[index] has begun
+        std::vector<fbi::Row> rows;   // the next pass's rows
+        uint64_t passes{0};           // of files[index]
+        fbi::Report file_total;       // files[index]'s
+        fbi::Report total;            // every file's
+        fbi::Source source;
+        std::chrono::milliseconds retry{0};
+        std::function<void(const fbi::Report&)> on_done;
+    };
+    auto st = std::make_shared<State>();
+    st->files = std::move(files);
+    st->source = std::move(source);
+    st->retry = retry;
+    st->on_done = std::move(on_done);
+
+    // While a retry is armed its timer holds the step function (the function
+    // itself holds only a weak reference: no cycle); nothing else does.
+    auto step = std::make_shared<std::function<void()>>();
+    std::weak_ptr<std::function<void()>> weak_step = step;
+    *step = [this, st, weak_step]() {
+        for (;;) {
+            if (st->index >= st->files.size()) {
+                LOG_INFO << "[Pool] found-block import DONE (" << st->files.size()
+                         << (st->files.size() == 1 ? " file): " : " files): ")
+                         << st->total.summary()
+                         << ". Imported rows carry provenance \"imported\": each hash is a"
+                            " block of this node's header chain for its chain; that it is a"
+                            " pool block is the source's word unless coinbase-verified.";
+                if (st->on_done) st->on_done(st->total);
+                return;
+            }
+            fbi::File& f = st->files[st->index];
+            const std::string name = f.name.empty() ? std::string("input") : f.name;
+            if (!st->started) {
+                st->started = true;
+                st->passes = 0;
+                st->file_total = fbi::Report{};
+                if (!f.parsed.error.empty()) {
+                    LOG_ERROR << "[Pool] found-block import " << name << ": " << f.parsed.error
+                              << "; nothing imported from it";
+                    ++st->index;
+                    st->started = false;
+                    continue;
+                }
+                for (const auto& p : f.parsed.problems)
+                    LOG_WARNING << "[Pool] found-block import " << name << ": skipped " << p;
+                st->file_total.rows = f.parsed.rows.size() + f.parsed.malformed;
+                st->file_total.reject(fbi::kMalformed, fbi::kUnparsedChain, f.parsed.malformed);
+                st->rows = std::move(f.parsed.rows);
+                f.parsed.rows.clear();
+            }
+
+            ++st->passes;
+            std::vector<fbi::Row> rows = std::move(st->rows);
+            st->rows.clear();
+            const fbi::Report r = import_found_blocks(rows, st->source);
+            st->file_total.add(r);
+            // A file that had to wait logs each pass that decided anything.
+            if ((st->passes > 1 || !r.deferred.empty()) && rows.size() > r.deferred.size())
+                LOG_INFO << "[Pool] found-block import " << name << ", pass " << st->passes
+                         << ": " << r.summary();
+            if (!st->file_total.deferred.empty()) {
+                auto self = weak_step.lock();
+                if (m_context && self) {
+                    // The first pass, then every tenth, says why it waits.
+                    if (st->passes == 1 || st->passes % 10 == 0)
+                        LOG_INFO << "[Pool] found-block import " << name << ": "
+                                 << st->file_total.deferred.size()
+                                 << " rows wait for their header chain to sync before they"
+                                    " can be validated; retrying every "
+                                 << st->retry.count() / 1000.0 << " s";
+                    st->rows = std::move(st->file_total.deferred);
+                    st->file_total.deferred.clear();
+                    auto timer = std::make_shared<boost::asio::steady_timer>(*m_context, st->retry);
+                    timer->async_wait([self, timer](boost::system::error_code ec) {
+                        if (!ec) (*self)();
+                    });
+                    return;
+                }
+                LOG_WARNING << "[Pool] found-block import " << name << ": "
+                            << st->file_total.deferred.size()
+                            << " rows wait for a header chain and no event loop runs to retry"
+                               " them; they are NOT imported";
+            }
+            LOG_INFO << "[Pool] found-block import " << name << ": "
+                     << st->file_total.summary();
+            st->total.rows += st->file_total.rows;
+            st->total.add(st->file_total);
+            ++st->index;
+            st->started = false;
+        }
+    };
+    (*step)();
+}
+
 void MiningInterface::load_persisted_found_blocks()
 {
     if (!m_load_blocks_fn) return;
 
+    std::vector<FoundBlock> repaired;   // rows to persist AFTER unlocking
     try {
         auto blocks = m_load_blocks_fn();
         if (blocks.empty()) return;
@@ -5483,13 +6711,29 @@ void MiningInterface::load_persisted_found_blocks()
                 return a.ts > b.ts;
             });
 
-        // #159 (G3): reconstruct the derived luck series for the restored rows.
+        // #159 (G3): derive the luck series of the restored rows. Nothing
+        // derived is stored, so whatever an earlier build computed from a
+        // bad input (or a predecessor picked in height order) is gone here.
+        // The rate stored at find is checked against the rate history here
+        // and when that is loaded (rebuild_luck_history), whichever comes
+        // second: a row recorded at this node's own stratum rate is put
+        // right, and written back below.
+        repaired = repair_found_block_inputs_locked();
         recompute_found_block_luck_locked();
 
         LOG_INFO << "[Pool] Loaded " << blocks.size() << " found blocks from persistent storage";
     }
     catch (const std::exception& e) {
         LOG_WARNING << "[Pool] Failed to load found blocks: " << e.what();
+    }
+    // Outside m_blocks_mutex: m_persist_block_fn is the LevelDB writer.
+    if (m_persist_block_fn) {
+        for (const auto& b : repaired) {
+            try { m_persist_block_fn(b); }
+            catch (const std::exception& e) {
+                LOG_WARNING << "[Pool] Failed to persist repaired found block: " << e.what();
+            }
+        }
     }
 
     // Rows still pending from before the restart were never given a verdict
@@ -5606,25 +6850,70 @@ void MiningInterface::set_block_field_lookups(block_diff_lookup_fn diff_fn, bloc
     m_block_ts_lookup_fn = std::move(ts_fn);
 }
 
+void MiningInterface::set_block_height_lookup(block_height_lookup_fn height_fn)
+{
+    m_block_height_lookup_fn = std::move(height_fn);
+}
+
+void MiningInterface::set_block_chain_span_fn(block_chain_span_fn span_fn)
+{
+    m_block_chain_span_fn = std::move(span_fn);
+}
+
 void MiningInterface::backfill_block_fields(block_diff_lookup_fn diff_fn, block_ts_lookup_fn ts_fn)
 {
+    // Snapshot the rows, ask the header chain with the ledger UNLOCKED (a
+    // lookup can be an RPC, and a header chain has locks of its own), then
+    // re-lock and apply by (hash, chain): the list may have been re-sorted or
+    // grown meanwhile, and a row that is gone is skipped.
+    struct Ask {
+        std::string hash, chain;
+        double   diff{0.0};   // 0 = the lookup does not hold the header
+        uint32_t ts{0};
+    };
+    std::vector<Ask> asks;
+    {
+        std::lock_guard<std::mutex> lock(m_blocks_mutex);
+        asks.reserve(m_found_blocks.size());
+        for (const auto& blk : m_found_blocks)
+            if (!blk.hash.empty())
+                asks.push_back({blk.hash, blk.chain});
+    }
+    for (auto& a : asks) {
+        if (diff_fn) {
+            try { a.diff = diff_fn(a.hash); } catch (...) { a.diff = 0.0; }
+        }
+        if (ts_fn) {
+            try { a.ts = ts_fn(a.hash); } catch (...) { a.ts = 0; }
+        }
+    }
+
     std::vector<FoundBlock> repaired;   // snapshot rows to persist AFTER unlocking
     {
         std::lock_guard<std::mutex> lock(m_blocks_mutex);
         int diff_filled = 0, ts_filled = 0;
-        for (auto& blk : m_found_blocks) {
-            if (!blk.hash.empty()) {
-                bool changed = false;
-                if (diff_fn && blk.network_difficulty == 0.0) {
-                    double diff = diff_fn(blk.hash);
-                    if (diff > 0) { blk.network_difficulty = diff; ++diff_filled; changed = true; }
-                }
-                if (ts_fn) {
-                    uint32_t ts = ts_fn(blk.hash);
-                    if (ts > 0 && blk.ts != ts) { blk.ts = ts; ++ts_filled; changed = true; }
-                }
-                if (changed) repaired.push_back(blk);
+        for (const auto& a : asks) {
+            if (!(a.diff > 0.0) && a.ts == 0)
+                continue;
+            auto it = std::find_if(m_found_blocks.begin(), m_found_blocks.end(),
+                [&a](const FoundBlock& blk) { return blk.hash == a.hash && blk.chain == a.chain; });
+            if (it == m_found_blocks.end())
+                continue;
+            FoundBlock& blk = *it;
+            bool changed = false;
+            // The header's bits are the block's difficulty: they fill a
+            // missing value and replace one they contradict (a reading
+            // taken at record time for a block recorded after the fact).
+            // The lookup is the parent chain's and does not know a merged
+            // (aux) block, whose row is left alone.
+            if (a.diff > 0.0
+                && std::fabs(blk.network_difficulty - a.diff) > 1e-9 * a.diff) {
+                blk.network_difficulty = a.diff;
+                ++diff_filled;
+                changed = true;
             }
+            if (a.ts > 0 && blk.ts != a.ts) { blk.ts = a.ts; ++ts_filled; changed = true; }
+            if (changed) repaired.push_back(blk);
         }
         if (diff_filled > 0)
             LOG_INFO << "[Pool] Backfilled network_difficulty on " << diff_filled << " found block(s)";
@@ -5666,6 +6955,49 @@ void MiningInterface::add_chain_verify_fn(const std::string& chain, block_verify
     m_chain_verify_fns[chain] = std::move(fn);
 }
 
+bool MiningInterface::found_block_absent_from_chain(const std::string& hash, uint64_t ts,
+                                                    const std::string& earlier_hash,
+                                                    const std::string& later_hash) const
+{
+    // NO LOCK HELD: the lookups may be RPCs.
+    // 1 = the header chain holds the block, 0 = it does not answer for it
+    // (not held -- or a lookup that swallowed its own failure), -1 = nobody
+    // to ask: no by-hash lookup is wired, or it threw.
+    auto known = [this](const std::string& h) -> int {
+        try {
+            if (m_block_height_lookup_fn) return m_block_height_lookup_fn(h) != 0 ? 1 : 0;
+            if (m_block_diff_lookup_fn)   return m_block_diff_lookup_fn(h) > 0.0 ? 1 : 0;
+        } catch (...) {}
+        return -1;
+    };
+    if (known(hash) != 0)
+        return false;   // held -- or nobody to ask
+    // "Does not answer" is evidence only if the chain demonstrably reaches
+    // over the block's time; otherwise it is a chain rooted later, a chain
+    // still syncing, or a lookup that is down.
+    bool reaches = false;
+    if (m_block_chain_span_fn) {
+        // The header chain's own span, a clear margin on each side.
+        try {
+            const auto span = m_block_chain_span_fn();
+            const double t = static_cast<double>(ts);
+            reaches = span.first > 0
+                && static_cast<double>(span.first) + kChainSpanMargin <= t
+                && static_cast<double>(span.second) >= t + kChainSpanMargin;
+        } catch (...) {}
+    }
+    // Or: the same lookup finds a confirmed block of the pool from well
+    // before this one and one from well after -- it works, and the chain it
+    // reads is contiguous between the two.
+    if (!reaches)
+        reaches = !earlier_hash.empty() && !later_hash.empty()
+            && known(earlier_hash) == 1 && known(later_hash) == 1;
+    // Asked once more, after the lookup has just been seen working: a
+    // lookup that failed for the one call above (an RPC that timed out and
+    // answered "nothing") is not evidence.
+    return reaches && known(hash) == 0;
+}
+
 void MiningInterface::verify_found_block(const std::string& block_hash)
 {
     // The row is found by hash under the lock each time it is touched: the
@@ -5673,6 +7005,12 @@ void MiningInterface::verify_found_block(const std::string& block_hash)
     // on every insert, so no index survives from one lock to the next.
     const std::string hash = block_hash;
     std::string chain;
+    // What the unlocked lookups below need of the row and its neighbours.
+    bool primary = false;
+    bool height_unknown = false;
+    uint64_t row_ts = 0;
+    uint64_t pass = 0;                      // this check's number on the row
+    std::string earlier_hash, later_hash;   // confirmed blocks of the chain around it
     {
         std::lock_guard<std::mutex> lock(m_blocks_mutex);
         auto it = std::find_if(m_found_blocks.begin(), m_found_blocks.end(),
@@ -5680,7 +7018,28 @@ void MiningInterface::verify_found_block(const std::string& block_hash)
         if (it == m_found_blocks.end()) return;
         if (it->status != BlockStatus::pending) return;
         it->check_count++;
+        pass = ++it->verify_pass;
         chain = it->chain;
+        primary = is_primary_found_block(*it);
+        height_unknown = it->height == 0;
+        row_ts = it->ts;
+        // The nearest confirmed blocks of the same chain a clear margin
+        // before and after it (found_block_absent_from_chain).
+        uint64_t earlier_ts = 0, later_ts = 0;
+        const auto margin = static_cast<uint64_t>(kChainSpanMargin);
+        for (const auto& b : m_found_blocks) {
+            if (b.chain != chain || b.status != BlockStatus::confirmed
+                || is_primary_found_block(b) != primary)
+                continue;
+            if (b.ts + margin <= row_ts && (earlier_hash.empty() || b.ts > earlier_ts)) {
+                earlier_hash = b.hash;
+                earlier_ts = b.ts;
+            }
+            if (b.ts >= row_ts + margin && (later_hash.empty() || b.ts < later_ts)) {
+                later_hash = b.hash;
+                later_ts = b.ts;
+            }
+        }
     }
 
     // Select chain-specific verifier, fall back to default
@@ -5697,38 +7056,78 @@ void MiningInterface::verify_found_block(const std::string& block_hash)
     int result = 0;
     try { result = verify_fn(hash); } catch (...) {}
 
+    // The header chain's word on the block, asked with the lock RELEASED. On
+    // a lane whose lookups are RPCs (DGB: digibyted getblockheader) they ran
+    // under m_blocks_mutex, and a slow daemon stalled every reader of the
+    // ledger -- every /recent_blocks, /luck_stats and found-block record.
+    // The parent header chain answers for the node's own chain only.
+    double header_difficulty = 0.0;
+    uint64_t header_height = 0;
+    bool absent_from_chain = false;
+    if (primary && result > 0) {
+        // VERDICT-TIME LUCK REPAIR. A block confirmed by the header chain has,
+        // by definition, an on-chain header now — so its exact difficulty is
+        // available even if it was not at record time. This closes the case the
+        // record-path fallback cannot: a win learned via replay/relay whose
+        // header had not yet synced when the row was created (network_difficulty
+        // persisted as 0, luck lost). The header's bits also replace a stored
+        // reading they contradict.
+        if (m_block_diff_lookup_fn) {
+            try { header_difficulty = m_block_diff_lookup_fn(hash); }
+            catch (...) { header_difficulty = 0.0; }
+        }
+        // HEIGHT OUT OF 0 at the verdict: a row still at height 0 (recorded by
+        // a lane that did not know the height of the block it found) takes
+        // its height from the header, instead of waiting for the startup
+        // backfill of the next run.
+        if (height_unknown && m_block_height_lookup_fn) {
+            try { header_height = m_block_height_lookup_fn(hash); }
+            catch (...) { header_height = 0; }
+        }
+    } else if (primary && result == 0) {
+        // No verdict. Is that "nobody can tell", or does the chain say the
+        // block is not on it?
+        absent_from_chain = found_block_absent_from_chain(hash, row_ts, earlier_hash,
+                                                          later_hash);
+    }
+
     std::lock_guard<std::mutex> lock(m_blocks_mutex);
     auto row = std::find_if(m_found_blocks.begin(), m_found_blocks.end(),
         [&](const FoundBlock& b) { return b.hash == hash && b.chain == chain; });
     if (row == m_found_blocks.end()) return;
     auto& blk = *row;
     if (blk.status != BlockStatus::pending) return;
+    // Everything above was read with the lock released. If another check of
+    // this row has started since the snapshot, what this one found is older
+    // than what that one will find (or has found already): drop it. Applied
+    // out of order, a slow "the chain does not hold it" overrode the later
+    // "it does".
+    if (blk.verify_pass != pass) return;
 
     const auto& cn = blk.chain.empty() ? std::string("unknown") : blk.chain;
     auto prev_status = blk.status;
+    bool difficulty_repaired = false;
+    // The evidence stands for as long as the row is pending and is re-read
+    // at every check: a header that turns up later withdraws it.
+    const bool evidence_changed = blk.not_on_chain != absent_from_chain;
+    if (absent_from_chain && !blk.not_on_chain)
+        LOG_WARNING << "[Pool] found block " << cn << " h=" << blk.height << " hash="
+                    << blk.hash.substr(0, 16) << " is NOT on the chain: the header chain"
+                       " spans its time and does not hold it. The row stays pending"
+                       " (no verdict at its recorded height) and no longer counts as"
+                       " a block for luck.";
+    blk.not_on_chain = absent_from_chain;
 
     if (result > 0) {
         blk.confirmations = static_cast<uint32_t>(result);
 
-        // VERDICT-TIME LUCK REPAIR. A block confirmed by the header chain has,
-        // by definition, an on-chain header now — so its exact difficulty is
-        // available even if it was not at record time. This closes the case the
-        // record-path fallback cannot: a win learned via replay/relay whose
-        // header had not yet synced when the row was created (network_difficulty
-        // persisted as 0, luck lost). Fill it on confirmation and recompute the
-        // derived luck series; the status change below triggers the persist that
-        // makes it durable.
-        if (blk.network_difficulty <= 0.0 && m_block_diff_lookup_fn) {
-            try {
-                double d = m_block_diff_lookup_fn(blk.hash);
-                if (d > 0.0) {
-                    blk.network_difficulty = d;
-                    recompute_found_block_luck_locked();
-                    LOG_INFO << "[Pool] found-block network_difficulty filled at"
-                                " confirmation: h=" << blk.height << " hash="
-                             << blk.hash.substr(0, 16) << " diff=" << d;
-                }
-            } catch (...) {}
+        if (header_difficulty > 0.0
+            && std::fabs(blk.network_difficulty - header_difficulty) > 1e-9 * header_difficulty) {
+            blk.network_difficulty = header_difficulty;
+            difficulty_repaired = true;
+            LOG_INFO << "[Pool] found-block network_difficulty set from"
+                        " its header at confirmation: h=" << blk.height
+                     << " hash=" << blk.hash.substr(0, 16) << " diff=" << header_difficulty;
         }
 
         if (blk.status == BlockStatus::pending) {
@@ -5804,10 +7203,26 @@ void MiningInterface::verify_found_block(const std::string& block_hash)
     // result == 0: still pending, keep checking
 
     // Persist any status/confirmation change to LevelDB
-    if ((blk.status != prev_status || blk.confirmations > 0) && m_persist_block_fn)
+    const bool status_changed = blk.status != prev_status;
+    if ((status_changed || blk.confirmations > 0 || difficulty_repaired) && m_persist_block_fn)
     {
         try { m_persist_block_fn(blk); }
         catch (...) {}
+    }
+    // A verdict moves rounds: an orphaned block stops being the predecessor
+    // of the block after it and no longer counts as found.
+    if (status_changed || difficulty_repaired || evidence_changed)
+        recompute_found_block_luck_locked();
+
+    // HEIGHT OUT OF 0 at the verdict (header_height, asked above with the
+    // lock released). The re-sort invalidates `blk`: nothing reads it past
+    // this point.
+    if (result > 0 && blk.height == 0 && header_height != 0) {
+        if (auto learned = learn_found_block_height_locked(hash, chain, header_height)) {
+            if (m_persist_block_fn) {
+                try { m_persist_block_fn(*learned); } catch (...) {}
+            }
+        }
     }
 }
 
@@ -5880,17 +7295,7 @@ void MiningInterface::schedule_block_verification(const std::string& block_hash)
     // genuine found block on a slow chain (BTC/BCH ~10 min) exhausted all 6
     // confirmation checks inside ~1 real block and was falsely marked orphaned.
     // A dashboard must never lie that a real found block was lost.
-    std::string cn = chain_name;
-    if (cn.size() > 1 && cn[0] == 't')   // strip testnet prefix (tLTC, tBTC, ...)
-        cn = cn.substr(1);
-    int block_time_sec;
-    if      (cn == "LTC")  block_time_sec = 150;   // 2.5 min
-    else if (cn == "DOGE") block_time_sec = 60;    // 1 min
-    else if (cn == "BTC")  block_time_sec = 600;   // 10 min
-    else if (cn == "BCH")  block_time_sec = 600;   // 10 min
-    else if (cn == "DASH") block_time_sec = 150;   // 2.5 min
-    else if (cn == "DGB")  block_time_sec = 15;    // ~15 s
-    else                   block_time_sec = 60;    // safe fallback
+    const int block_time_sec = found_block_chain_block_time(chain_name);
 
     // Check at: first_check, then every block_time for 6 blocks, at 10
     // blocks, then while still pending (a verdict needs the chain 6 deep
@@ -6697,6 +8102,52 @@ nlohmann::json MiningInterface::rest_coin_peers(const std::string& remote_ip)
     return m_coin_peers_fn();
 }
 
+namespace {
+// The P2PKH script of a P2PK script's pubkey (p2pool shows a P2PK output by
+// its key's P2PKH address, as /current_payouts keys the pre-V36 donation);
+// empty for any other script.
+std::vector<unsigned char> p2pk_as_p2pkh(const std::vector<unsigned char>& s)
+{
+    if (s.size() < 35 || s.back() != 0xac || static_cast<size_t>(s[0]) + 2 != s.size()
+        || (s[0] != 33 && s[0] != 65))
+        return {};
+    unsigned char sha[32], rip[20];
+    CSHA256().Write(&s[1], s[0]).Finalize(sha);
+    CRIPEMD160().Write(sha, 32).Finalize(rip);
+    std::vector<unsigned char> p2pkh = {0x76, 0xa9, 0x14};
+    p2pkh.insert(p2pkh.end(), rip, rip + 20);
+    p2pkh.push_back(0x88);
+    p2pkh.push_back(0xac);
+    return p2pkh;
+}
+
+// A merged chain's address of a script on the node's network, from the
+// chain's own versions in c2pool::merged::aux_chain_params_table (the table
+// main_ltc sets each AuxChainConfig's address_version / p2sh_version from,
+// i.e. the bytes /current_merged_payouts renders its merged rows with). ""
+// for a chain c2pool has no address parameters for, or a script with no
+// address form.
+std::string merged_chain_script_to_address(const std::vector<unsigned char>& script,
+                                           const std::string& symbol, bool testnet)
+{
+    const auto* p = c2pool::merged::find_aux_chain_params(symbol);
+    if (!p)
+        return {};
+    const auto& v = testnet ? p->test : p->main;
+    if (v.p2pkh.empty() || v.p2sh.empty())
+        return {};
+    return core::script_to_address(script, v.hrps.empty() ? std::string() : v.hrps.front(),
+                                   v.p2pkh.front(), v.p2sh.front());
+}
+
+std::string upper_symbol(std::string s)
+{
+    for (auto& ch : s)
+        if (ch >= 'a' && ch <= 'z') ch = static_cast<char>(ch - 32);
+    return s;
+}
+} // namespace
+
 nlohmann::json MiningInterface::rest_web_currency_info()
 {
     nlohmann::json result = nlohmann::json::object();
@@ -6870,6 +8321,16 @@ nlohmann::json MiningInterface::rest_web_currency_info()
         break;
     }
 
+    // algo_block_period: the block interval of the ALGORITHM this node mines,
+    // i.e. what turns its network difficulty into a network rate
+    // (difficulty * 2^32 / algo_block_period, as /global_stats
+    // network_hashrate does). It equals block_period on every coin but
+    // DigiByte, whose chain makes a block every 15 s over five algorithms,
+    // each retargeted to one block in 75 s: a consumer that divided by
+    // block_period there read the scrypt network 5x high.
+    if (result.contains("block_period"))
+        result["algo_block_period"] = static_cast<int>(coin_block_period());
+
     // Expose explorer state so dashboard JS can link to internal explorer
     result["explorer_enabled"] = m_explorer_enabled;
     if (m_explorer_enabled && !m_explorer_url.empty())
@@ -6966,6 +8427,95 @@ nlohmann::json MiningInterface::rest_web_currency_info()
             }
         }
         result["coins"] = coins;
+    }
+
+    // ─── Payee identities for the PPLNS treemap (node-owner fee, donation) ───
+    // Explicit fields so the dashboard never guesses an output's role from an
+    // address prefix. Each is rendered from the script the node actually pays,
+    // in the form /current_payouts and /current_merged_payouts key their rows
+    // by, so a tile is matched by string equality. "" / {} when the node pays
+    // no such output, and on a coin this function has no address form for
+    // (BCH CashAddr, DGB, NMC, BIP110: an empty field, never a Bitcoin-format
+    // address the chain does not pay).
+    {
+        bool parent_renderable = false;
+        if (coin_label_uc != "BCH" && coin_label_uc != "NMC" && coin_label_uc != "BIP110") {
+            switch (m_blockchain) {
+            case Blockchain::LITECOIN:
+            case Blockchain::BITCOIN:
+            case Blockchain::DOGECOIN:
+            case Blockchain::DASH:
+                parent_renderable = true;
+                break;
+            default:
+                break;
+            }
+        }
+        auto parent_address = [&](const std::vector<unsigned char>& s) -> std::string {
+            if (!parent_renderable || s.empty())
+                return {};
+            auto a = primary_script_to_address(s);
+            if (a.empty()) {
+                const auto p2pkh = p2pk_as_p2pkh(s);
+                if (!p2pkh.empty())
+                    a = primary_script_to_address(p2pkh);
+            }
+            return a;
+        };
+
+        const auto chain_infos = m_mm_manager ? m_mm_manager->get_chain_infos()
+                                              : std::vector<c2pool::merged::MergedMiningManager::ChainInfo>{};
+
+        // node_owner_address: the --node-owner-address the --fee shares are
+        // minted to (set_node_fee_from_address). "" without a fee.
+        std::string owner;
+        if (m_node_fee_percent > 0.0)
+            owner = parent_address(m_node_fee_script);
+        result["node_owner_address"] = owner;
+
+        // node_owner_merged_addresses: per merged chain this node mines, the
+        // address the fee shares carry there (set_operator_merged_scripts: the
+        // effective one of resolve_operator_merged_script's cascade, i.e.
+        // --node-owner-merged-address for DOGE when it is set, else the one
+        // derived from the owner key, else the donation script). A chain that
+        // is not configured, or is disabled, is not named.
+        nlohmann::json owner_merged = nlohmann::json::object();
+        if (!owner.empty()) {
+            for (const auto& ci : chain_infos) {
+                if (!ci.config_error.empty())
+                    continue;
+                const auto op = m_operator_merged_scripts.find(ci.chain_id);
+                if (op == m_operator_merged_scripts.end())
+                    continue;
+                const auto addr = merged_chain_script_to_address(op->second, ci.symbol, m_testnet);
+                if (!addr.empty())
+                    owner_merged[upper_symbol(ci.symbol)] = addr;
+            }
+        }
+        result["node_owner_merged_addresses"] = owner_merged;
+
+        // donation_address: the parent coinbase's donation output (the
+        // donation script the share version's coinbase pays, kept current by
+        // the coin's PPLNS hook). A pre-V36 P2PK donation is shown by its
+        // key's P2PKH address, as /current_payouts does.
+        result["donation_address"] = parent_address(m_donation_script);
+
+        // merged_donation_addresses: every merged chain whose block c2pool
+        // builds itself (multiaddress; build_pplns_coinbase_hex always pays
+        // the V36 combined donation P2SH) and that is not disabled. A
+        // createauxblock-mode chain's coinbase is the daemon's, with no
+        // donation output: not listed.
+        nlohmann::json donation_merged = nlohmann::json::object();
+        const std::vector<unsigned char> combined_donation(core::donation::COMBINED_DONATION_SCRIPT.begin(),
+                                                           core::donation::COMBINED_DONATION_SCRIPT.end());
+        for (const auto& ci : chain_infos) {
+            if (!ci.multiaddress || !ci.config_error.empty())
+                continue;
+            const auto addr = merged_chain_script_to_address(combined_donation, ci.symbol, m_testnet);
+            if (!addr.empty())
+                donation_merged[upper_symbol(ci.symbol)] = addr;
+        }
+        result["merged_donation_addresses"] = donation_merged;
     }
 
     return result;
@@ -7749,54 +9299,116 @@ nlohmann::json MiningInterface::rest_node_info()
 
 nlohmann::json MiningInterface::rest_luck_stats()
 {
+    return rest_luck_stats_at(static_cast<double>(std::time(nullptr)));
+}
+
+nlohmann::json MiningInterface::rest_luck_stats_at(double now)
+{
     nlohmann::json result = nlohmann::json::object();
     std::lock_guard<std::mutex> lock(m_blocks_mutex);
+    // One pass: the rows' derived fields and the pool luck, from one set of
+    // rounds.
+    PoolLuck pl;
+    derive_found_block_luck_locked(&pl, now);
 
-    // THIS chain's blocks only (the /recent_blocks rule). A merged (aux) row's
-    // luck is computed against the PARENT's network difficulty and the aux
-    // chain's own inter-find gaps -- meaningless -- and it polluted the 7d/30d
-    // averages. Worse, the open round was timed from m_found_blocks.front(),
-    // the highest-HEIGHT row: on an LTC finder that is any DOGE row (DOGE
-    // heights ~6.4M sit above LTC's ~3.2M), so "Round: N%" restarted at every
-    // local DOGE find. The round runs from the newest parent block by time.
-    uint64_t last_primary_ts = 0;
+    // THIS chain's blocks only (the /recent_blocks rule). A merged (aux) row
+    // has its own chain's rounds and difficulty and is served, with its luck,
+    // on /recent_merged_blocks. The open round runs from the newest
+    // MAIN-CHAIN parent block by time -- never from the highest-height row
+    // (on an LTC finder that is any DOGE row), never from an orphan.
     bool any_primary = false;
     nlohmann::json blocks = nlohmann::json::array();
     for (const auto& b : m_found_blocks) {
         if (!is_primary_found_block(b)) continue;
         any_primary = true;
-        if (b.ts > last_primary_ts) last_primary_ts = b.ts;
-        // luck==0 is "never computed" (relay-learned row, or recorded with
-        // no network difficulty), not "0% lucky". The chart previously drew
-        // those as 0-value points, which is exactly the wrong-luck-trend the
-        // production dashboards showed on 2026-08-05: emit null so the trend
-        // SKIPS them instead of plotting a fabricated catastrophe.
+        // null = no luck could be computed (an input cannot be had), so the
+        // trend SKIPS the point instead of plotting a fabricated 0 %.
         blocks.push_back({{"ts", b.ts}, {"hash", b.hash},
                           {"luck", b.luck > 0.0 ? nlohmann::json(b.luck)
-                                                : nlohmann::json(nullptr)}});
+                                                : nlohmann::json(nullptr)},
+                          {"effort", b.effort > 0.0 ? nlohmann::json(b.effort)
+                                                    : nlohmann::json(nullptr)},
+                          // false: the row ends no round and is not a block
+                          // found (orphaned, stale, or a pending row the
+                          // chain demonstrably does not hold).
+                          {"main_chain", b.luck_main_chain},
+                          // What a period counts of this row (see
+                          // /recent_blocks rows): the same pair the periods
+                          // below are sums of.
+                          {"effort_covered", b.effort_covered > 0.0
+                                                 ? nlohmann::json(b.effort_covered)
+                                                 : nlohmann::json(nullptr)},
+                          {"measured", b.luck_measured}});
     }
     result["luck_available"] = any_primary;
     result["blocks"] = blocks;
 
-    // Current round luck: expected_time / time_since_last_block * 100
-    // Matches p2pool: shows how the ongoing round compares to expectation
-    nlohmann::json current_luck_val = nullptr;
-    if (any_primary && last_primary_ts > 0) {
-        auto now_ts = static_cast<double>(std::time(nullptr));
-        double time_since_last = now_ts - static_cast<double>(last_primary_ts);
+    auto num = [](bool has, double v) {
+        return has ? nlohmann::json(v) : nlohmann::json(nullptr);
+    };
 
-        // Get LIVE pool hashrate and network difficulty
-        double pool_hr = m_pool_hashrate_fn ? m_pool_hashrate_fn() : 0;
-        double net_diff = m_network_difficulty.load(std::memory_order_relaxed);
-
-        double expected = 0;
-        if (net_diff > 0 && pool_hr > 0)
-            expected = net_diff * 4294967296.0 / pool_hr;
-
-        if (expected > 0 && time_since_last > 1)
-            current_luck_val = (expected / time_since_last) * 100.0;
+    // The round in progress. effort is the number of blocks the pool has
+    // expected to find since the last main-chain block (integrated over the
+    // rate history; 1.0 = the round has run its expected length);
+    // expected_time is the expected time to a block at the live gross pool
+    // rate and network difficulty.
+    nlohmann::json round = nullptr;
+    if (pl.any && pl.open.since >= 0) {
+        const bool has_effort = pl.open.effort > 0.0;
+        round = {
+            {"elapsed", pl.open.elapsed},
+            {"expected_time", num(pl.open.expected_time > 0.0, pl.open.expected_time)},
+            {"effort", num(has_effort, pl.open.effort)},
+            // What the periods count of the open round: the integral over the
+            // time the rate history covers, not scaled up to the whole round
+            // (the single-sample effort when no history covers it).
+            {"effort_covered", num(has_effort,
+                 pl.open.method == core::luck::EffortMethod::integrated
+                     ? pl.open.covered_effort : pl.open.effort)},
+            {"since_block_hash", pl.since_block_hash},
+            {"effort_method", has_effort
+                 ? nlohmann::json(core::luck::effort_method_name(pl.open.method))
+                 : nlohmann::json(nullptr)},
+            {"history_coverage", has_effort ? nlohmann::json(pl.open.coverage)
+                                            : nlohmann::json(nullptr)},
+        };
     }
-    result["current_luck_trend"] = current_luck_val;
+    result["current_round"] = round;
+
+    // DEPRECATED, kept for pages that predate current_round: the open
+    // round's luck so far, 100 / current_round.effort. It starts in the
+    // thousands of percent and falls through 100 at the expected time.
+    result["current_luck_trend"] =
+        (pl.any && pl.open.effort > 0.0 && pl.open.elapsed > 1.0)
+            ? nlohmann::json(100.0 / pl.open.effort) : nlohmann::json(nullptr);
+
+    // Period luck: blocks found over blocks expected in the window, with the
+    // exact Poisson 95 % interval. blocks_expected is the effort of the
+    // window's rounds (each clipped to the window), the open round included
+    // -- over the time the rate history covers: nothing is extrapolated
+    // across a gap, and a block found in one is left out with it
+    // (k_unmeasured). See core::luck::period_luck.
+    auto period = [&num](const core::luck::PeriodLuck& p) {
+        return nlohmann::json{
+            {"k", p.k},
+            {"blocks_expected", num(p.has_luck, p.expected)},
+            {"luck", num(p.has_luck, p.luck)},
+            {"ci95_low", num(p.has_luck, p.ci_low)},
+            {"ci95_high", num(p.has_luck, p.ci_high)},
+            {"span_s", p.span},
+            // Main-chain blocks in the window left out of k: the round has
+            // no effort (an input cannot be had), or the block was found
+            // while the rate history was not watching.
+            {"k_unmeasured", p.unmeasured},
+        };
+    };
+    result["periods"] = {
+        {"1d", period(pl.d1)},
+        {"7d", period(pl.d7)},
+        {"30d", period(pl.d30)},
+        {"90d", period(pl.d90)},
+        {"all", period(pl.all)},
+    };
     return result;
 }
 
@@ -7984,9 +9596,13 @@ nlohmann::json MiningInterface::rest_best_share()
     double net_diff = m_network_difficulty.load(std::memory_order_relaxed);
     result["network_difficulty"] = net_diff;
 
+    // Read under the lock: the stratum handlers (io thread) raise the merged
+    // legs while this runs on the HTTP thread.
+    double merged_all_time_seen = 0.0;
     {
         std::lock_guard<std::mutex> lock(m_best_diff_mutex);
         auto now_ts = static_cast<uint64_t>(std::time(nullptr));
+        merged_all_time_seen = m_best_difficulty.merged_all_time;
 
         // Honest-absent: until a real record share is seen, best-share
         // difficulty reads 0. We deliberately do NOT substitute the sharechain
@@ -8042,7 +9658,7 @@ nlohmann::json MiningInterface::rest_best_share()
         }
     }
 
-    if (merged_net_diff > 0 || m_best_difficulty.merged_all_time > 0) {
+    if (merged_net_diff > 0 || merged_all_time_seen > 0) {
         std::lock_guard<std::mutex> lock(m_best_diff_mutex);
         auto pct = [](double d, double nd) { return nd > 0 ? d / nd * 100.0 : 0.0; };
         result["merged"] = {
@@ -8062,26 +9678,23 @@ nlohmann::json MiningInterface::rest_best_share()
                 {"started", m_best_difficulty.merged_round_start}
             }}
         };
-        // Merged median (same share difficulties, different network target)
-        if (m_sharechain_stats_fn) {
-            auto sc = m_sharechain_stats_fn();
-            double avg = sc.value("average_difficulty", 0.0);
-            if (avg > 0 && merged_net_diff > 0)
-                result["median_merged_pct"] = avg / merged_net_diff * 100.0;
-        }
     }
 
-    // ── Median share % (approximate from average difficulty in skiplist) ──
+    // ── Median share % (p2pool web.py: median of the window's share targets) ──
+    // median_difficulty is published by coins whose stats fn walks the window
+    // (LTC); others fall back to the window average.
+    double window_diff = 0.0;
     if (m_sharechain_stats_fn) {
         auto sc = m_sharechain_stats_fn();
-        double avg = sc.value("average_difficulty", 0.0);
-        if (avg > 0 && net_diff > 0)
-            result["median_pct"] = avg / net_diff * 100.0;
-        else
-            result["median_pct"] = 0.0;
-    } else {
-        result["median_pct"] = 0.0;
+        window_diff = sc.value("median_difficulty", 0.0);
+        if (!(window_diff > 0.0))
+            window_diff = sc.value("average_difficulty", 0.0);
     }
+    result["median_pct"] = (window_diff > 0 && net_diff > 0)
+        ? window_diff / net_diff * 100.0 : 0.0;
+    // Merged median (same share difficulties, different network target)
+    if (result.contains("merged") && window_diff > 0 && merged_net_diff > 0)
+        result["median_merged_pct"] = window_diff / merged_net_diff * 100.0;
 
     return result;
 }
@@ -9558,10 +11171,15 @@ nlohmann::json MiningInterface::rest_recent_merged_blocks()
                 ledger.push_back(b);
     }
     std::vector<c2pool::merged::MergedMiningManager::ChainInfo> infos;
-    std::vector<c2pool::merged::DiscoveredMergedBlock> discovered;
+    std::vector<c2pool::merged::DiscoveredMergedBlock> discovered;      // the rows served
+    std::vector<c2pool::merged::DiscoveredMergedBlock> discovered_all;  // every round's block
     if (m_mm_manager) {
         infos = m_mm_manager->get_chain_infos();
-        discovered = m_mm_manager->get_recent_blocks(kLimit);
+        discovered_all = m_mm_manager->get_discovered_blocks();
+        discovered = discovered_all;
+        if (discovered.size() > kLimit)
+            discovered.erase(discovered.begin(),
+                             discovered.end() - static_cast<std::ptrdiff_t>(kLimit));
     }
     auto chain_id_of = [&infos](const std::string& symbol) -> nlohmann::json {
         for (const auto& ci : infos)
@@ -9577,6 +11195,191 @@ nlohmann::json MiningInterface::rest_recent_merged_blocks()
         for (const auto& b : ledger)
             if (b.hash == hash) return &b;
         return nullptr;
+    };
+
+    // ── Luck of the merged chain (core/pool_luck.hpp) ────────────────────
+    // The same definitions as the parent chain, on the aux chain's own
+    // rounds: the predecessor is the previous main-chain block of the SAME
+    // aux chain by time, the rate is the pool's parent-chain rate (the hashes
+    // that find an aux block are the parent's), the difficulty is the aux
+    // block's own. Computed over the union of the manager's records and the
+    // ledger rows -- every block, not only the kLimit rows served, so the
+    // oldest served row still has its predecessor.
+    struct AuxLuckRow {
+        std::string symbol, hash;
+        core::luck::RoundInput in;
+        const FoundBlock* own{nullptr};   // its ledger row, if it has one
+        double recorded_rate{0.0};        // the manager's rate at find (0 = none)
+        RateAtFind rate;                  // the rate at find luck uses and the row serves
+    };
+    std::vector<AuxLuckRow> aux_rows;
+    auto aux_row = [&aux_rows](const std::string& hash) -> AuxLuckRow* {
+        for (auto& r : aux_rows)
+            if (r.hash == hash) return &r;
+        return nullptr;
+    };
+    for (const auto& d : discovered_all) {
+        if (d.block_hash.empty() || aux_row(d.block_hash)) continue;
+        AuxLuckRow r;
+        r.symbol = d.symbol;
+        r.hash = d.block_hash;
+        r.in.ts = static_cast<double>(d.timestamp);
+        r.in.height = d.height > 0 ? static_cast<uint64_t>(d.height) : 0;
+        // Held by the aux daemon (accepted, a duplicate, or no clear answer):
+        // a block of the aux chain until a verdict says otherwise. A refused
+        // submit never was one.
+        r.in.main_chain = d.accepted || d.verdict == "inconclusive"
+                          || d.verdict.rfind("unknown: ", 0) == 0;
+        r.in.difficulty = d.difficulty > 0.0 ? d.difficulty : 0.0;
+        // The pool rate the node read when a peer's share brought the block
+        // (DiscoveredMergedBlock::pool_hashrate); 0 on a record from before
+        // it was kept, or one learned long after the find.
+        r.recorded_rate = d.pool_hashrate > 0.0 ? d.pool_hashrate : 0.0;
+        aux_rows.push_back(std::move(r));
+    }
+    for (const auto& b : ledger) {
+        if (b.hash.empty()) continue;
+        AuxLuckRow* r = aux_row(b.hash);
+        if (!r) {
+            AuxLuckRow fresh;
+            fresh.symbol = b.chain;
+            fresh.hash = b.hash;
+            fresh.in.ts = static_cast<double>(b.ts);
+            fresh.in.height = b.height;
+            aux_rows.push_back(std::move(fresh));
+            r = &aux_rows.back();
+            r->in.main_chain = found_block_luck_main_chain(b);
+        } else if (!found_block_luck_main_chain(b)) {
+            r->in.main_chain = false;   // the ledger row carries the chain's verdict
+        } else if (b.status == BlockStatus::confirmed) {
+            r->in.main_chain = true;
+        }
+        if (b.aux_difficulty_known && b.network_difficulty > 0.0)
+            r->in.difficulty = b.network_difficulty;
+        r->own = &b;   // `ledger` is not touched again: the pointer stays good
+    }
+    // A difficulty nobody recorded: the aux header chain names it by hash.
+    for (auto& r : aux_rows)
+        if (!(r.in.difficulty > 0.0))
+            r.in.difficulty = chain_block_difficulty(r.symbol, r.hash);
+
+    struct AuxLuck {
+        core::luck::RoundResult res;
+        double difficulty{0.0};
+        std::string prev_hash;
+        bool main_chain{true};
+        bool measured{false};
+        RateAtFind rate;
+    };
+    std::map<std::string, AuxLuck> aux_luck;   // by aux block hash
+    {
+        std::set<std::string> symbols;
+        for (const auto& r : aux_rows) symbols.insert(r.symbol);
+        core::luck::RoundOptions opt;
+        opt.history_difficulty = false;   // the history's difficulty is the parent's
+        std::lock_guard<std::mutex> hlock(m_luck_history_mutex);
+        // The rate at find, as far as it is a pool rate: the ledger row's,
+        // else the one the manager recorded, else the history's reading at
+        // the block's own time (rate_at_find_locked) -- as /recent_blocks.
+        for (auto& r : aux_rows) {
+            if (r.own) r.rate = rate_at_find_locked(*r.own);
+            if (!(r.rate.value > 0.0) && (r.recorded_rate > 0.0 || !r.own))
+                r.rate = rate_at_find_locked(r.recorded_rate,
+                                             r.own ? r.own->share_difficulty : 0.0, r.in.ts);
+            r.in.rate_at_find = r.rate.value;
+            // Another node's measurement of the round (an imported row).
+            if (r.own) {
+                r.in.imported_effort = r.own->imported_effort;
+                r.in.imported_coverage = r.own->imported_coverage;
+            }
+        }
+        for (const auto& symbol : symbols) {
+            std::vector<core::luck::RoundInput> in;
+            std::vector<const AuxLuckRow*> who;
+            for (const auto& r : aux_rows)
+                if (r.symbol == symbol) { in.push_back(r.in); who.push_back(&r); }
+            // The row an imported effort was timed from, among this chain's.
+            for (size_t i = 0; i < in.size(); ++i) {
+                const FoundBlock* own = who[i]->own;
+                if (!own || !(own->imported_effort > 0.0) || own->imported_prev_hash.empty())
+                    continue;
+                for (size_t k = 0; k < who.size(); ++k)
+                    if (who[k]->hash == own->imported_prev_hash) {
+                        in[i].imported_prev = static_cast<int>(k);
+                        break;
+                    }
+            }
+            const auto res = core::luck::compute_rounds(in, m_luck_history, opt);
+            for (size_t i = 0; i < res.size(); ++i) {
+                AuxLuck l;
+                l.res = res[i];
+                l.difficulty = in[i].difficulty;
+                l.main_chain = in[i].main_chain;
+                l.measured = core::luck::counts_in_period(in[i], res[i]);
+                l.rate = who[i]->rate;
+                if (res[i].prev >= 0)
+                    l.prev_hash = who[static_cast<size_t>(res[i].prev)]->hash;
+                aux_luck[who[i]->hash] = std::move(l);
+            }
+        }
+    }
+    auto add_luck = [&aux_luck](nlohmann::json& j, const std::string& hash) {
+        auto num = [](double v) {
+            return v > 0.0 && std::isfinite(v) ? nlohmann::json(v) : nlohmann::json(nullptr);
+        };
+        auto it = aux_luck.find(hash);
+        const AuxLuck none{};
+        const AuxLuck& l = it != aux_luck.end() ? it->second : none;
+        const auto m = l.res.method;
+        // The aux chain's own difficulty at find; null when nobody recorded
+        // it and the aux header chain does not hold the block.
+        j["network_difficulty"] = num(l.difficulty);
+        j["time_to_find"]       = l.res.prev >= 0 ? num(l.res.time_to_find)
+                                                  : nlohmann::json(nullptr);
+        j["expected_time"]      = num(l.res.expected_time);
+        j["effort"]             = num(l.res.effort);
+        j["luck"]               = num(l.res.luck);
+        j["effort_method"]      = m == core::luck::EffortMethod::none
+            ? nlohmann::json(nullptr)
+            : nlohmann::json(core::luck::effort_method_name(m));
+        j["prev_block_hash"]    = l.prev_hash.empty() ? nlohmann::json(nullptr)
+                                                      : nlohmann::json(l.prev_hash);
+        // effort_method "imported": the node this history was imported from
+        // integrated the same round over more of it (history_coverage is that
+        // node's coverage), as on /recent_blocks.
+        j["history_coverage"]   = (m == core::luck::EffortMethod::integrated
+                                   || m == core::luck::EffortMethod::single_sample
+                                   || m == core::luck::EffortMethod::imported)
+            ? nlohmann::json(l.res.coverage) : nlohmann::json(nullptr);
+        // The pool rate at find, as /recent_blocks serves it: the GROSS
+        // parent-chain pool rate (the hashes that find an aux block are the
+        // parent's), "recorded" with the block or read off the rate
+        // "history" at its time; null when neither. What another node's
+        // --import-found-blocks takes for the row's single-sample effort.
+        j["pool_hashrate_at_find"] = num(l.rate.value);
+        j["pool_hashrate_source"]  =
+              l.rate.source == RateAtFindSource::recorded ? nlohmann::json("recorded")
+            : l.rate.source == RateAtFindSource::history  ? nlohmann::json("history")
+                                                           : nlohmann::json(nullptr);
+        // The row is a block of the aux chain for luck: it ends a round and
+        // is a predecessor. false for a submit the aux daemon refused, an
+        // orphaned or stale ledger row, and a pending one the aux chain does
+        // not hold. A row with main_chain false still carries an effort and
+        // a luck (timed from the last block that IS one): a consumer that
+        // builds rounds from these rows must skip it, as the server does.
+        j["main_chain"]         = l.main_chain;
+        // What a period would count of the row (as on /recent_blocks rows).
+        j["effort_covered"]     = num(core::luck::period_effort(l.res));
+        j["measured"]           = l.measured;
+        // Why there is no luck, when there is none.
+        // (interval_unavailable: no round at all -- a row that is not a
+        // block of the aux chain, with no block of the chain before it; the
+        // label a parent row has in that case.)
+        j["luck_method"] = m == core::luck::EffortMethod::first_block   ? "first_block"
+            : m != core::luck::EffortMethod::none                       ? "simple_avg"
+            : l.res.missing == core::luck::MissingInput::rate           ? "hashrate_unavailable"
+            : l.res.missing == core::luck::MissingInput::difficulty     ? "netdiff_unavailable"
+                                                                        : "interval_unavailable";
     };
 
     std::set<std::string> served;
@@ -9601,6 +11404,7 @@ nlohmann::json MiningInterface::rest_recent_merged_blocks()
         j["verified"]    = (blk.accepted || (own && own->status == BlockStatus::confirmed))
                                ? nlohmann::json(true) : nlohmann::json(nullptr);
         j["explorer_url"] = explorer_of(blk.symbol, blk.block_hash);
+        add_luck(j, blk.block_hash);
         served.insert(blk.block_hash);
         arr.push_back(std::move(j));
     }
@@ -9623,6 +11427,7 @@ nlohmann::json MiningInterface::rest_recent_merged_blocks()
                          : b.status == BlockStatus::orphaned  ? nlohmann::json(false)
                                                               : nlohmann::json(nullptr);
         j["explorer_url"] = explorer_of(b.chain, b.hash);
+        add_luck(j, b.hash);
         arr.push_back(std::move(j));
     }
     return arr;
@@ -10196,6 +12001,23 @@ nlohmann::json MiningInterface::rest_web_log_json()
     return arr;
 }
 
+namespace {
+// The "pool_rates" graph series from one stat-log sample, as p2pool's
+// get_stale_counts(rates=True) defines them: "good" is the work rate of the
+// shares that made the chain -- which IS the pool estimator's reading
+// (get_pool_attempts_per_second sums exactly those shares) -- and "orphan" is
+// the stale work on top of it, so good + orphan is the gross pool rate
+// (/global_stats pool_hash_rate). "good" was the estimator's reading times
+// (1 - stale_prop): the non-stale rate discounted for stales a second time.
+// Returns (good, orphan).
+std::pair<double, double> pool_rates_split(double nonstale_rate, double stale_prop)
+{
+    if (!(nonstale_rate > 0.0))
+        return {0.0, 0.0};
+    return {nonstale_rate, core::luck::gross_rate(nonstale_rate, stale_prop) - nonstale_rate};
+}
+} // namespace
+
 nlohmann::json MiningInterface::rest_web_graph_data(const std::string& source, const std::string& view)
 {
     // p2pool-compatible graph data: array of [timestamp, value, width, default] 4-tuples.
@@ -10234,8 +12056,9 @@ nlohmann::json MiningInterface::rest_web_graph_data(const std::string& source, c
 
         if (source == "pool_rates") {
             nlohmann::json val = nlohmann::json::object();
-            val["good"] = entry.pool_hash_rate * (1.0 - entry.pool_stale_prop);
-            val["orphan"] = entry.pool_hash_rate * entry.pool_stale_prop;
+            const auto rates = pool_rates_split(entry.pool_hash_rate, entry.pool_stale_prop);
+            val["good"] = rates.first;
+            val["orphan"] = rates.second;
             val["dead"] = 0.0;
             result.push_back({entry.time, val, bin_width, 0});
         }
@@ -10362,7 +12185,8 @@ void MiningInterface::reset_best_difficulty_round(uint64_t ts)
 }
 
 void MiningInterface::record_share_difficulty(double difficulty, const std::string& miner,
-                                              const std::string& share_hash)
+                                              const std::string& share_hash,
+                                              bool update_best)
 {
     // Feed the rolling-hashrate ring. Independent of the best-diff
     // tracking below; the ring has its own internal lock.
@@ -10381,25 +12205,49 @@ void MiningInterface::record_share_difficulty(double difficulty, const std::stri
     if (difficulty > 0)
         m_recent_share_difficulty.store(difficulty, std::memory_order_relaxed);
 
+    // Primary legs only: the callers that still feed the card through here
+    // (DASH stratum + tracker, bip110 tracker) never fed the merged legs.
+    if (update_best)
+        update_best_difficulty(difficulty, miner, share_hash, /*update_merged=*/false);
+}
+
+void MiningInterface::update_best_difficulty(double difficulty, const std::string& miner,
+                                             const std::string& pow_hash_hex,
+                                             bool update_merged)
+{
+    if (!(difficulty > 0.0)) return;
     std::lock_guard<std::mutex> lock(m_best_diff_mutex);
     auto now_ts = static_cast<uint64_t>(std::time(nullptr));
     if (difficulty > m_best_difficulty.all_time) {
         m_best_difficulty.all_time = difficulty;
         m_best_difficulty.all_time_miner = miner;
-        m_best_difficulty.all_time_hash = share_hash;
+        m_best_difficulty.all_time_hash = pow_hash_hex;
         m_best_difficulty.all_time_ts = now_ts;
     }
     if (difficulty > m_best_difficulty.session) {
         m_best_difficulty.session = difficulty;
         m_best_difficulty.session_miner = miner;
-        m_best_difficulty.session_hash = share_hash;
+        m_best_difficulty.session_hash = pow_hash_hex;
         m_best_difficulty.session_ts = now_ts;
     }
     if (difficulty > m_best_difficulty.round) {
         m_best_difficulty.round = difficulty;
         m_best_difficulty.miner = miner;
-        m_best_difficulty.hash = share_hash;
+        m_best_difficulty.hash = pow_hash_hex;
         m_best_difficulty.timestamp = now_ts;
+    }
+    if (!update_merged) return;
+    // Merged (aux) chain: the same scrypt pow-hash, read against the aux
+    // network difficulty by rest_best_share (work.py merged_best_difficulty).
+    if (difficulty > m_best_difficulty.merged_all_time) {
+        m_best_difficulty.merged_all_time = difficulty;
+        m_best_difficulty.merged_all_time_miner = miner;
+        m_best_difficulty.merged_all_time_ts = now_ts;
+    }
+    if (difficulty > m_best_difficulty.merged_round) {
+        m_best_difficulty.merged_round = difficulty;
+        m_best_difficulty.merged_round_miner = miner;
+        m_best_difficulty.merged_round_ts = now_ts;
     }
 }
 
@@ -10417,6 +12265,52 @@ void MiningInterface::record_merged_share_difficulty(double difficulty, const st
         m_best_difficulty.merged_round_miner = miner;
         m_best_difficulty.merged_round_ts = now_ts;
     }
+}
+
+void MiningInterface::record_best_pseudoshare(
+    double share_difficulty, const std::string& miner,
+    const std::string& coinb1, const std::string& coinb2,
+    const std::string& extranonce1, const std::string& extranonce2,
+    const std::string& ntime, const std::string& nonce,
+    uint32_t version, const std::string& prevhash_hex,
+    const std::string& nbits_hex,
+    const std::vector<std::string>& merkle_branches)
+{
+    if (!(share_difficulty > 0.0)) return;
+    // Cheap gate: almost every pseudoshare is below every leg, so skip the
+    // second scrypt pass unless this share can set some record.
+    {
+        std::lock_guard<std::mutex> lock(m_best_diff_mutex);
+        const auto& b = m_best_difficulty;
+        if (!(share_difficulty > b.round || share_difficulty > b.session
+              || share_difficulty > b.all_time || share_difficulty > b.merged_round
+              || share_difficulty > b.merged_all_time))
+            return;
+    }
+    // The exact pow-hash for the card's hash field: the same header bytes the
+    // vardiff gate hashed (calculate_share_difficulty). Empty on bad input.
+    std::string pow_hex;
+    const uint256 merkle_root =
+        reconstruct_merkle_root(coinb1 + extranonce1 + extranonce2 + coinb2, merkle_branches);
+    const auto header =
+        build_header_bytes(version, prevhash_hex, merkle_root, ntime, nbits_hex, nonce);
+    if (header.size() == 80) {
+        char out[32];
+        scrypt_1024_1_1_256(reinterpret_cast<const char*>(header.data()), out);
+        uint256 pow_hash;
+        memcpy(pow_hash.begin(), out, 32);
+        pow_hex = pow_hash.GetHex();
+    }
+    update_best_difficulty(share_difficulty, miner, pow_hex, /*update_merged=*/true);
+}
+
+/*static*/
+double MiningInterface::median_share_difficulty(std::vector<double> diffs)
+{
+    const size_t n = diffs.size();
+    if (n == 0) return 0.0;
+    std::sort(diffs.begin(), diffs.end());
+    return (n % 2 == 1) ? diffs[n / 2] : (diffs[n / 2 - 1] + diffs[n / 2]) / 2.0;
 }
 
 void MiningInterface::update_stat_log()
@@ -10789,6 +12683,11 @@ void MiningInterface::update_stat_log()
         feed_history_entry(entry);
         m_views_watermark = entry.time;
     }
+
+    // The same sample feeds the rate history pool luck is integrated over
+    // (its own leaf lock).
+    add_luck_rate_sample(entry.time, entry.pool_hash_rate, entry.pool_stale_prop,
+                         entry.network_difficulty);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -10896,11 +12795,13 @@ void MiningInterface::feed_history_entry(const StatLogEntry& e)
     // Caller holds m_history_mutex.
     const double t = e.time;
 
-    // pool_rates — SAME derivation the flat path uses at rest_web_graph_data:
-    // good = phr*(1-stale), orphan = phr*stale, dead = 0.
+    // pool_rates — SAME derivation the flat path uses at rest_web_graph_data
+    // (pool_rates_split): good = the estimator's non-stale rate, orphan = the
+    // stale work on top of it, dead = 0.
+    const auto rates = pool_rates_split(e.pool_hash_rate, e.pool_stale_prop);
     m_history.add_multi("pool_rates", t, {
-        {"good",   e.pool_hash_rate * (1.0 - e.pool_stale_prop)},
-        {"orphan", e.pool_hash_rate * e.pool_stale_prop},
+        {"good",   rates.first},
+        {"orphan", rates.second},
         {"dead",   0.0},
     });
 
@@ -11305,14 +13206,35 @@ void MiningInterface::load_stat_log()
     // any failure degrades to serving week/month/year from the flat fallback and
     // never aborts load_stat_log or crashes startup.
     load_graph_views();
+
+    // The rate history pool luck is integrated over, from what was just
+    // loaded; found blocks restored earlier are re-derived against it.
+    try { rebuild_luck_history(); }
+    catch (const std::exception& ex) {
+        LOG_WARNING << "[Luck] rate history rebuild failed: " << ex.what();
+    }
 }
 
 // ── ALL-TIME best share: survives restarts ──────────────────────────────
 // Measured (primary node, 2026-08-05, uptime 36 min): /local_stats
 // best_share reported all_time == session == round because the all-time leg
 // lived only in memory — every restart re-founded "all time", and the card
-// silently redefined the word. Only the all-time leg is persisted: session
+// silently redefined the word. Only the all-time legs (primary + merged) are persisted: session
 // and round are honestly per-process / per-round and must reset.
+//
+// Sidecar "v": 2 comes from the build whose LTC card is fed by local achieved
+// hashes (record_best_pseudoshare). A v1 file (no "v") on LTC holds a share
+// TARGET: its only feed was the sharechain verify hook, which reported every
+// pool miner's share target, and the stratum's achieved difficulty never
+// reached it. Field (2026-11): a peer's target 21631 was the "all time" record
+// on two unrelated nodes, and the raise-only load would keep it until a local
+// hash beat it (hours to days for a small miner). On LTC a v1 primary leg is
+// dropped (a v1 file has no merged leg). Other coins' feeds did not change at
+// v2, so their v1 files load as before.
+namespace {
+constexpr int kBestShareSidecarVersion = 2;
+}  // namespace
+
 void MiningInterface::save_best_share_all_time()
 {
     const std::string path = best_share_db_path();
@@ -11320,11 +13242,18 @@ void MiningInterface::save_best_share_all_time()
     nlohmann::json j;
     {
         std::lock_guard<std::mutex> lock(m_best_diff_mutex);
-        if (m_best_difficulty.all_time <= 0.0) return;   // nothing measured
-        j = {{"difficulty", m_best_difficulty.all_time},
+        if (m_best_difficulty.all_time <= 0.0
+            && m_best_difficulty.merged_all_time <= 0.0) return;   // nothing measured
+        j = {{"v", kBestShareSidecarVersion},
+             {"difficulty", m_best_difficulty.all_time},
              {"miner", m_best_difficulty.all_time_miner},
              {"hash", m_best_difficulty.all_time_hash},
              {"ts", m_best_difficulty.all_time_ts}};
+        // Merged (aux) all-time leg rides in the same sidecar.
+        if (m_best_difficulty.merged_all_time > 0.0)
+            j["merged"] = {{"difficulty", m_best_difficulty.merged_all_time},
+                           {"miner", m_best_difficulty.merged_all_time_miner},
+                           {"ts", m_best_difficulty.merged_all_time_ts}};
     }
     try {
         const std::string tmp = path + ".new";
@@ -11345,9 +13274,28 @@ void MiningInterface::load_best_share_all_time()
         auto j = nlohmann::json::parse(std::string(
             (std::istreambuf_iterator<char>(f)),
             std::istreambuf_iterator<char>()));
+        if (!j.is_object()) return;
+        const int v = j.value("v", 1);
+        if (v < kBestShareSidecarVersion && m_blockchain == Blockchain::LITECOIN) {
+            LOG_INFO << "[BestShare] v" << v << " sidecar " << path
+                     << " dropped: its all-time difficulty="
+                     << j.value("difficulty", 0.0)
+                     << " is a sharechain share target, not a hash this node found";
+            return;
+        }
         const double d = j.value("difficulty", 0.0);
-        if (d <= 0.0) return;
         std::lock_guard<std::mutex> lock(m_best_diff_mutex);
+        if (j.contains("merged") && j["merged"].is_object()) {
+            const auto& m = j["merged"];
+            const double md = m.value("difficulty", 0.0);
+            // Same raise-only rule as the primary leg below.
+            if (md > m_best_difficulty.merged_all_time) {
+                m_best_difficulty.merged_all_time       = md;
+                m_best_difficulty.merged_all_time_miner = m.value("miner", std::string());
+                m_best_difficulty.merged_all_time_ts    = m.value("ts", uint64_t(0));
+            }
+        }
+        if (d <= 0.0) return;
         // Only ever RAISE: a persisted record must never overwrite a better
         // share found before the load ran.
         if (d > m_best_difficulty.all_time) {

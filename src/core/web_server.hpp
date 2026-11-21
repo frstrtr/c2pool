@@ -39,7 +39,9 @@
 #include <c2pool/hashrate/tracker.hpp>
 #include <core/address_utils.hpp>
 #include <core/found_block_submit.hpp>
+#include <core/found_block_import.hpp>
 #include <core/graph_history.hpp>
+#include <core/pool_luck.hpp>
 #include <core/template_refresh.hpp>
 
 // Forward declaration for merged mining integration
@@ -214,6 +216,9 @@ public:
     nlohmann::json rest_users();
     nlohmann::json rest_fee();
     nlohmann::json rest_recent_blocks();
+    /// /recent_blocks as of `now` (the first row's pool luck includes the
+    /// open round up to there).
+    nlohmann::json rest_recent_blocks_at(double now);
     // GET /found_block/<hash> (#946): one row in the /recent_blocks shape, or
     // JSON null when the hash is not a recorded found block (route answers 404).
     nlohmann::json rest_found_block(const std::string& hash);
@@ -307,6 +312,9 @@ public:
     nlohmann::json rest_stale_rates();              // /stale_rates — {good,orphan,dead} rate breakdown
     nlohmann::json rest_node_info();                // /node_info — {external_ip,worker_port,p2p_port,network,symbol}
     nlohmann::json rest_luck_stats();               // /luck_stats — pool luck statistics
+    /// /luck_stats as of `now` (unix seconds): the open round and the period
+    /// windows end there. rest_luck_stats() is this at the wall clock.
+    nlohmann::json rest_luck_stats_at(double now);
     nlohmann::json rest_ban_stats(bool reveal_ips = false);  // /ban_stats — current ban statistics (IP targets masked, #1985)
     nlohmann::json rest_stratum_security();         // /stratum_security — DDoS detection metrics (stub)
     nlohmann::json rest_miner_stats(const std::string& address);  // /miner_stats/<addr> — detailed per-miner stats
@@ -850,6 +858,11 @@ public:
 
     // Pool hashrate (H/s) — from P2P node's get_pool_attempts_per_second
     void set_pool_hashrate_fn(std::function<double()> fn) { m_pool_hashrate_fn = thread_safe_wrap(std::move(fn)); }
+    /// Optional network hashrate (H/s) from the coin's own chain, e.g. chain
+    /// work over a window (Dash Core getnetworkhashps). When it returns > 0 it
+    /// replaces the tip-difficulty estimate (difficulty * 2^32 / 150) in
+    /// /global_stats and /rate. Unset (every coin but DASH today) => unchanged.
+    void set_network_hashrate_fn(std::function<double()> fn) { m_network_hashrate_fn = thread_safe_wrap(std::move(fn)); }
 
     // Bypass the is_node_ready() + has_work gating. Used by coin targets
     // (e.g. c2pool-dash) that drive their own work pipeline and don't rely
@@ -1155,6 +1168,17 @@ public:
         orphaned  = 2,  // replaced by another block at same height
         stale     = 3,  // submitted with stale prev_block
     };
+    /// Where a found block's pool rate "at find" comes from (FoundBlock::
+    /// rate_at_find; served as pool_hashrate_source).
+    enum class RateAtFindSource : uint8_t {
+        none = 0,   // no usable rate at find
+        recorded,   // the stored value
+        history,    // the rate history's reading at the block's own time
+    };
+    struct RateAtFind {
+        double value{0.0};
+        RateAtFindSource source{RateAtFindSource::none};
+    };
     struct FoundBlock {
         uint64_t    height;
         std::string hash;
@@ -1201,6 +1225,72 @@ public:
         // row carries its height, so the persistence callback passes this to
         // FoundBlockStore::store to drop the record at the old key.
         uint64_t replaced_height{0};
+        // Merged (aux) rows: network_difficulty is the AUX chain's own, read
+        // off the aux block's bits at find. A row stored before this flag
+        // existed holds the PARENT's difficulty there (#1738) and has it
+        // false: its difficulty is unknown until the aux header chain names
+        // it. Persisted (fblk extension byte). Meaningless on a parent row.
+        bool aux_difficulty_known{false};
+        // The row came from an import of another node's history
+        // (import_found_blocks), not from this node's own observation of
+        // the block: served as provenance "imported", found_locally false.
+        // A later record of the block by this node clears it. Persisted (fblk
+        // extension byte).
+        bool imported{false};
+        // Another node's measured effort of the round that ends in this block
+        // (import_found_blocks: the source row's effort / history_coverage /
+        // prev_block_hash; taken only where it was integrated, the source was
+        // watching when the block was found, it is plausibly the pool's, and
+        // it covered more of the same round than this node's own history
+        // did). An INPUT, kept when the node later records the block itself:
+        // luck uses it while it still covers more of the round than this
+        // node's own integral and the round still runs from
+        // imported_prev_hash (core::luck::imported_effort_wins). 0 = none.
+        // Persisted (fblk extension tail, behind an extension-byte bit).
+        double      imported_effort{0};
+        double      imported_coverage{0};   // the source's history_coverage, (0, 1]
+        std::string imported_prev_hash;     // the block the source timed the round from
+        // ── Luck (core/pool_luck.hpp). DERIVED, never persisted: recomputed
+        // from the inputs above and the pool rate history on every insert,
+        // load, input repair and read, so a stored bad input heals. effort is
+        // the blocks the pool expected to find over the round (1.0 on
+        // average); luck above is 100 / effort; time_to_find runs from the
+        // previous MAIN-CHAIN block of the chain by time (prev_block_hash).
+        double      effort{0};             // 0 = not computable
+        core::luck::EffortMethod effort_method{core::luck::EffortMethod::none};
+        core::luck::MissingInput luck_missing{core::luck::MissingInput::nothing};
+        double      history_coverage{0};   // share of the round the rate history covers
+        std::string prev_block_hash;       // "" = none (first block)
+        double      rate_used{0};          // mean gross pool rate behind effort
+        double      difficulty_used{0};    // mean network difficulty behind effort
+        uint32_t    luck_samples{0};       // history segments behind effort (1 = find sample)
+        // The row counts as a block of the main chain for luck: it ends a
+        // round, is a predecessor, and is a block found. False when orphaned
+        // or stale -- and when still pending while the chain itself says the
+        // block is not on it (not_on_chain; found_block_luck_main_chain).
+        bool        luck_main_chain{true};
+        // What a PERIOD counts of the row (core::luck::period_effort /
+        // counts_in_period): the round's contribution to blocks_expected --
+        // the integral over the time the rate history covers, not scaled up
+        // to the whole round like `effort` -- and whether its block counts
+        // in k.
+        double      effort_covered{0};
+        bool        luck_measured{false};
+        // The pool rate at find as luck uses it and the row shows it: the
+        // stored pool_hashrate when that is plausibly a pool rate, else the
+        // rate history's reading at the block's time (in memory only), else
+        // nothing.
+        RateAtFind  rate_at_find;
+        // IN MEMORY ONLY, set by the confirm lane (verify_found_block) while
+        // the row is pending: positive evidence that the block is not on the
+        // chain -- the node's header chain demonstrably spans the block's
+        // time and does not hold its hash. Never set because a verdict is
+        // merely missing. Re-derived at every check; gone with the process.
+        bool        not_on_chain{false};
+        // IN MEMORY ONLY: how many checks of the row have started. A check
+        // reads the chain with the ledger unlocked and applies what it found
+        // only if no later check has started meanwhile (verify_found_block).
+        uint64_t    verify_pass{0};
     };
 
     // Block acceptance verification: schedule async checks at +10s, +30s, +120s.
@@ -1456,6 +1546,37 @@ public:
     void correct_found_block_heights(const block_height_lookup_fn& height_fn,
                                      uint64_t tip_height);
 
+    /// Import found-block history from another node (core/found_block_import.hpp):
+    /// ONE pass. A row gets in only when the source's header chain for its
+    /// chain holds its hash on the best chain; height, time and difficulty
+    /// are then the header's. A block the ledger holds is merged fill-only.
+    /// Rows whose header chain is not ready come back in Report::deferred.
+    /// New rows are provenance "imported", confirmed when 6 deep (pending and
+    /// verified like a find before), and take part in luck like any row; an
+    /// at-find pool rate that is not plausibly the pool's is not stored.
+    /// Persists what it changes; records no checkpoint and ends no round.
+    /// NO LOCK MAY BE HELD (the lookups run with the ledger unlocked).
+    core::found_block_import::Report import_found_blocks(
+        const std::vector<core::found_block_import::Row>& rows,
+        const core::found_block_import::Source& source);
+
+    /// The startup one-shot (--import-found-blocks): the files in the order
+    /// given, each to the end before the next -- import_found_blocks now,
+    /// then every `retry` on the io_context for the rows still waiting for a
+    /// header chain, until none wait. Logs a summary line per file and the
+    /// total; `on_done` (optional) gets the total.
+    void start_found_block_import(
+        std::vector<core::found_block_import::File> files,
+        core::found_block_import::Source source,
+        std::chrono::milliseconds retry = std::chrono::seconds(30),
+        std::function<void(const core::found_block_import::Report&)> on_done = {});
+    /// One file.
+    void start_found_block_import(
+        core::found_block_import::Parsed parsed,
+        core::found_block_import::Source source,
+        std::chrono::milliseconds retry = std::chrono::seconds(30),
+        std::function<void(const core::found_block_import::Report&)> on_done = {});
+
     /// A found-block row of THIS node's own (parent) chain, as opposed to a
     /// merged/aux child (DOGE on an LTC node) that rides the same ledger. A
     /// merged row carries its parent block (#946 parent_hash) or a chain
@@ -1572,13 +1693,183 @@ public:
     /// backfill_block_fields (same header chain, same lambdas).
     void set_block_field_lookups(block_diff_lookup_fn diff_fn, block_ts_lookup_fn ts_fn);
 
+    /// Retain the by-hash HEIGHT lookup too. backfill_found_block_heights
+    /// runs once, at startup; a row recorded at height 0 during the process's
+    /// own uptime (a lane whose work source does not know the height of the
+    /// block it found) kept 0 until the next restart. The confirm lane asks
+    /// this when it finds such a row's block in the chain. Coin-generic.
+    void set_block_height_lookup(block_height_lookup_fn height_fn);
+
+    /// The stretch of time the header chain's best chain holds: (time of its
+    /// oldest header, time of its tip), unix seconds; {0, 0} = not known.
+    /// With it the confirm lane can tell a pending block the chain does NOT
+    /// hold (its hash is unknown although the chain spans its time) from one
+    /// nobody can judge (found_block_absent_from_chain). Optional: without
+    /// it only a confirmed pool block on each side of the row proves the span.
+    using block_chain_span_fn = std::function<std::pair<uint64_t, uint64_t>()>;
+    void set_block_chain_span_fn(block_chain_span_fn span_fn);
+
+    /// The difficulty lookup of a MERGED (aux) chain, keyed by its
+    /// found-block chain label ("DOGE", "NMC"): the aux chain's own header
+    /// chain answers for an aux block hash, the parent's never does. Fills
+    /// the aux difficulty of the rows already held (a row recorded before the
+    /// aux difficulty was stored holds the parent's) and is kept for blocks
+    /// recorded later. Wire once the aux header chain exists.
+    void add_chain_block_difficulty_lookup(const std::string& chain,
+                                           block_diff_lookup_fn diff_fn);
+
+    // ── Pool luck (core/pool_luck.hpp) ───────────────────────────────────
+    /// One sample of the pool rate history luck is integrated over: the
+    /// estimator's NON-STALE rate, the stale proportion and the network
+    /// difficulty read at `t`. update_stat_log feeds one a minute; the stat
+    /// log and the year-scale graph bins seed it at start.
+    void add_luck_rate_sample(double t, double nonstale_rate, double stale_prop,
+                              double network_difficulty);
+    /// How many segments the luck rate history holds (diagnostics): minute
+    /// samples for the last kLuckFineSeconds, hourly bins before that, the
+    /// year-scale graph bins before those.
+    size_t luck_rate_history_size() const;
+    /// Rebuild the luck rate history from the stat log (and, for the time
+    /// before it, the year-scale graph bins), repair found-block inputs it
+    /// contradicts, and re-derive every row's luck.
+    void rebuild_luck_history();
+    /// This coin's target block interval, seconds (network hashrate =
+    /// difficulty * 2^32 / block period).
+    double coin_block_period() const;
+    /// The gross pool rate right now: the estimator's non-stale rate over
+    /// (1 - the newest sampled stale proportion). 0 = no estimator reading.
+    double gross_pool_hashrate() const;
+    /// The gross pool rate as a reading AT `block_ts`: gross_pool_hashrate()
+    /// when the block is no more than kLiveRateAtFindMaxLag from `now` (a
+    /// peer's share relayed as it is found), else 0 -- a block learned long
+    /// after it was found (the startup scan of the share chain) is not
+    /// measured at today's rate. What a merged block learned from a peer is
+    /// stored with (DiscoveredMergedBlock::pool_hashrate).
+    /// KNOWN LIMIT: on a FRESH node's first share-chain sync a block whose
+    /// share is under kLiveRateAtFindMaxLag old gets the estimator's reading
+    /// over a chain still filling its lookbehind; nothing checks it when it
+    /// is stored, and without rate history the display lets it stand (one
+    /// row, display only; a restart never re-stores a held block).
+    double gross_pool_hashrate_at(double block_ts, double now) const;
+    /// How far a block's time may be from now for the live rate to stand as
+    /// its rate at find.
+    static constexpr double kLiveRateAtFindMaxLag = 600.0;
+
 private:
-    /// #159 (G3): recompute the DERIVED found-block fields (time_to_find,
-    /// expected_time, luck) that are never persisted, from the height-ordered
-    /// timestamps + network_difficulty + pool_hashrate that ARE restored. Only
-    /// fills fields still at 0 so it never clobbers a live-computed value.
-    /// CALLER MUST HOLD m_blocks_mutex. Coin-generic; run at load and again
-    /// after backfill_block_fields fills a previously-missing network_difficulty.
+    /// The luck rate history is bounded like the year-scale graph store that
+    /// seeds it (older rounds fall back to the sample taken at find).
+    static constexpr double kLuckHistorySeconds = 400.0 * 86400.0;
+    /// Minute samples are kept at full resolution for as long as the
+    /// persisted stat log holds them; older ones are folded into bins of
+    /// kLuckBinSeconds, kLuckCoarsenSlack worth at a time.
+    static constexpr double kLuckFineSeconds = 31.0 * 86400.0;
+    static constexpr double kLuckBinSeconds = 3600.0;
+    static constexpr double kLuckCoarsenSlack = 86400.0;
+    /// How far the header chain must reach on EACH side of a block's time
+    /// before "it does not hold the hash" means "the block is not on the
+    /// chain". A header's time may sit up to 2 h ahead of real time and
+    /// lag it by the median-time-past window; 4 h clears both.
+    static constexpr double kChainSpanMargin = 4.0 * 3600.0;
+    /// How long the newest sampled rate stands in for a silent estimator.
+    static constexpr double kLuckLiveRateMaxAge = 900.0;
+    /// A rate stored at find within this share of the minute sample taken at
+    /// the block's own time is left as recorded; beyond it the sample's
+    /// replaces it (repair_found_block_inputs_locked).
+    static constexpr double kLuckRateRepairTolerance = 0.25;
+    /// The longest stretch a history reading may speak for and still vouch
+    /// for a rewrite of a stored rate: five stat-log periods. A sample taken
+    /// after a restart reaches back up to an hour; it is a reading of the
+    /// estimator, not of that minute.
+    static constexpr double kLuckRepairSampleSpan = 300.0;
+    /// How far from a block's time the history may be and still serve as the
+    /// yardstick for its recorded rate (core::luck::rate_at_find_plausible):
+    /// a pool does not change a hundredfold within a month.
+    static constexpr double kLuckYardstickSeconds = 31.0 * 86400.0;
+    /// The stat-log cadence (WebServer's stat timer).
+    static constexpr double kStatLogPeriodSeconds = 60.0;
+
+    /// The rows of ONE chain as luck inputs, with the index of each in
+    /// m_found_blocks. CALLER MUST HOLD m_blocks_mutex.
+    struct LuckRows {
+        std::vector<core::luck::RoundInput> rows;
+        std::vector<size_t> index;          // rows[i] is m_found_blocks[index[i]]
+        std::vector<RateAtFind> rates;      // the rate at find behind rows[i]
+        core::luck::RoundOptions options;
+    };
+    /// primary: every row of the node's own chain. Otherwise the merged rows
+    /// labelled `aux_chain`. CALLER MUST HOLD m_blocks_mutex AND
+    /// m_luck_history_mutex (the rate at find is checked against the history).
+    LuckRows luck_rows_locked(bool primary, const std::string& aux_chain) const;
+    /// The pool rate at find a row's luck may use: the recorded one if it is
+    /// plausibly a pool rate, else the history's at the block's own time,
+    /// else none. CALLER MUST HOLD m_luck_history_mutex.
+    RateAtFind rate_at_find_locked(const FoundBlock& b) const;
+    /// The same for a rate `recorded` with a block of time `ts` whose
+    /// winning share had `share_difficulty` (0 = not known): a merged block
+    /// the merged manager holds. CALLER MUST HOLD m_luck_history_mutex.
+    RateAtFind rate_at_find_locked(double recorded, double share_difficulty, double ts) const;
+    /// The aux header chain's difficulty for a merged block (0 = no lookup
+    /// wired for the chain, or it does not hold the header). Takes
+    /// m_blocks_mutex for the lookup, calls it with the lock released.
+    double chain_block_difficulty(const std::string& chain, const std::string& block_hash);
+    /// A row with no verdict against it: not orphaned, not stale.
+    static bool found_block_is_main_chain(const FoundBlock& b) {
+        return b.status != BlockStatus::orphaned && b.status != BlockStatus::stale;
+    }
+    /// A row counts as a main-chain block for luck. Not orphaned, not stale
+    /// -- and not a PENDING row with positive evidence against it
+    /// (FoundBlock::not_on_chain). On the LTC nodes such rows are finds that
+    /// never reached the chain, stored at the share absheight (27,588,573),
+    /// which the verdict lane waits for the chain to reach: counting them
+    /// made two of six "blocks" on one node phantoms, each the predecessor
+    /// of a real one. A row that is pending only because nobody can judge it
+    /// (no lookup, a header chain rooted later, an RPC or header outage
+    /// however long) is KEPT.
+    static bool found_block_luck_main_chain(const FoundBlock& b);
+    /// Positive evidence that a pending block is not on the chain: the
+    /// by-hash header lookup does not hold `hash`, AND the chain it reads
+    /// demonstrably spans the block's time `ts` by kChainSpanMargin on each
+    /// side -- by the chain-span lookup, or because the same by-hash lookup
+    /// holds a confirmed block of the pool from before (`earlier_hash`) and
+    /// from after (`later_hash`). False when it cannot be shown.
+    /// NO LOCK MAY BE HELD: the lookups can be RPCs.
+    bool found_block_absent_from_chain(const std::string& hash, uint64_t ts,
+                                       const std::string& earlier_hash,
+                                       const std::string& later_hash) const;
+    /// The difficulty a row's luck runs against: its own chain's (a merged
+    /// row that only holds the parent's has none).
+    double found_block_luck_difficulty(const FoundBlock& b) const;
+    /// Rewrite the rate a row stored at find where a sample of the block's
+    /// OWN MINUTE says it is wrong: missing, not plausibly a pool rate, or
+    /// more than kLuckRateRepairTolerance away. Own minute: a sample (never
+    /// a bin) that speaks for at most kLuckRepairSampleSpan, was taken no
+    /// more than a stat period after the block's time, and is borne out by
+    /// the samples next to it. Returns the rows changed, to persist.
+    /// CALLER MUST HOLD m_blocks_mutex.
+    std::vector<FoundBlock> repair_found_block_inputs_locked();
+    /// Period luck of the node's own chain.
+    struct PoolLuck {
+        bool any{false};                          // a main-chain block exists
+        core::luck::OpenRound open;
+        std::string since_block_hash;
+        core::luck::PeriodLuck d1, d7, d30, d90, all;
+    };
+    /// ONE pass over the ledger: every derived field of every row and, with
+    /// `pool`, the pool luck of the node's own chain as of `now` -- out of
+    /// the same rounds, so a read computes them once.
+    /// CALLER MUST HOLD m_blocks_mutex.
+    void derive_found_block_luck_locked(PoolLuck* pool, double now);
+    /// Recompute EVERY derived found-block field (time_to_find, effort,
+    /// expected_time, luck, prev_block_hash, history_coverage, ...) from the
+    /// inputs that are stored (ts, status, network_difficulty, the pool rate
+    /// sampled at find) and the pool rate history. Nothing derived survives
+    /// from an earlier pass: a row whose stored inputs were bad, or whose
+    /// predecessor changed (a block orphaned, a block learned late), heals on
+    /// the next call. Each chain separately; the predecessor of a row is the
+    /// previous MAIN-CHAIN row of its chain by time.
+    /// CALLER MUST HOLD m_blocks_mutex. Coin-generic; run on every insert,
+    /// load, input repair, verdict and read (derive_found_block_luck_locked
+    /// without the pool luck).
     void recompute_found_block_luck_locked();
     /// Give the row (hash, chain) `height` if it is still at 0 (unknown).
     /// Height only ever climbs out of 0; a known height is never changed --
@@ -1659,6 +1950,10 @@ public:
     // Returns "" if the fee script is not a 25-byte P2PKH.
     std::string get_node_fee_hash160() const;
 private:
+    // The primary coin's address of a scriptPubKey, the form /current_payouts
+    // keys its rows by: DASH and DOGE version bytes, else the LTC / BTC ones.
+    // "" for a script with no address form.
+    std::string primary_script_to_address(const std::vector<unsigned char>& script) const;
     void setup_methods();
     // Build Stratum-compatible coinb1/coinb2 from a live block template
     // Output ordering matches generate_share_transaction():
@@ -2112,6 +2407,7 @@ private:
     uint16_t m_cached_miner_count{0};
     double m_cached_pool_hashrate{0};
     std::function<double()> m_pool_hashrate_fn;
+    std::function<double()> m_network_hashrate_fn;   // optional; see set_network_hashrate_fn
     std::atomic<bool> m_dashboard_always_ready{false};
     std::atomic<int> m_protocol_version{3600};
 
@@ -2164,6 +2460,17 @@ private:
     // m_blocks_mutex at the call sites (same discipline as backfill_block_fields).
     block_diff_lookup_fn m_block_diff_lookup_fn;
     block_ts_lookup_fn   m_block_ts_lookup_fn;
+    block_height_lookup_fn m_block_height_lookup_fn;   // set_block_height_lookup
+    block_chain_span_fn    m_block_chain_span_fn;      // set_block_chain_span_fn
+    // The difficulty lookups of merged (aux) chains, by chain label
+    // (add_chain_block_difficulty_lookup). Guarded by m_blocks_mutex.
+    std::map<std::string, block_diff_lookup_fn> m_chain_diff_lookups;
+
+    // The pool rate history luck is integrated over (core/pool_luck.hpp).
+    // m_luck_history_mutex is a LEAF lock: nothing else is taken while it is
+    // held, and it may be taken under m_blocks_mutex.
+    core::luck::RateHistory m_luck_history;
+    mutable std::mutex m_luck_history_mutex;
 
     std::shared_ptr<void> m_merged_block_store;  // MergedBlockStore (opaque)
     coin_peer_info_fn m_ltc_peer_info_fn;
@@ -2408,9 +2715,37 @@ public:
     // share_hash: optional pow-hash of the record-setting share (display only;
     // DASH stratum submit path supplies it so the Best Share card can show the
     // exact hash that got closest to net difficulty).
+    // update_best=false: feed only the hashrate ring, the share counter and the
+    // recent-share-difficulty snapshot. LTC passes false for every verified
+    // sharechain share: those carry the share TARGET difficulty of any pool
+    // miner, which is not an achieved hash and must not reach the Best Share
+    // card (p2pool work.py records target_to_difficulty(pow_hash) of local
+    // submits only).
     void record_share_difficulty(double difficulty, const std::string& miner,
-                                 const std::string& share_hash = "");
+                                 const std::string& share_hash = "",
+                                 bool update_best = true);
     void record_merged_share_difficulty(double difficulty, const std::string& miner);
+    // Best Share card legs only (no ring / counters). Raises the primary
+    // all_time / session / round legs and, when update_merged, the merged
+    // all_time / round legs. Python p2pool work.py update_best_difficulty.
+    void update_best_difficulty(double difficulty, const std::string& miner,
+                                const std::string& pow_hash_hex = "",
+                                bool update_merged = true);
+    // Median of the per-share target difficulties in a sharechain window
+    // (p2pool web.py best_share median_pct). 0 for an empty window.
+    static double median_share_difficulty(std::vector<double> diffs);
+    /// IWorkSource override: the LTC stratum path (this class is its work
+    /// source) reports the achieved scrypt difficulty of every accepted
+    /// pseudoshare here. It feeds the Best Share legs only; the pow-hash is
+    /// recomputed only when the share can set a record. Display only.
+    void record_best_pseudoshare(
+        double share_difficulty, const std::string& miner,
+        const std::string& coinb1, const std::string& coinb2,
+        const std::string& extranonce1, const std::string& extranonce2,
+        const std::string& ntime, const std::string& nonce,
+        uint32_t version, const std::string& prevhash_hex,
+        const std::string& nbits_hex,
+        const std::vector<std::string>& merkle_branches) override;
     // A pool block was won -> the sharechain round boundary moved. Reset the
     // round-level best-share tracker (all_time / session are left untouched).
     // See #922: round previously only ever raised, degenerating into a
@@ -2511,7 +2846,7 @@ private:
     // best_share showed all_time == session == round — the "all-time" leg
     // reset on every restart because it lived only in memory, so the card
     // was quietly lying about what "all time" means. Persisted as a small
-    // sidecar JSON next to the stat log (all_time leg ONLY: session and
+    // sidecar JSON next to the stat log (all_time + merged all_time legs ONLY: session and
     // round are honestly per-process/per-round). Display only.
     std::string best_share_db_path() const {
         return m_stat_log_path.empty() ? std::string()

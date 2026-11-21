@@ -14,6 +14,8 @@
 
 C2P_PARAM("meta.version", Meta, BOOL, COMPILE_TIME_READONLY, C_ALL, LIT, "false", NONE, "print version and exit")
   C2P_ALIAS("meta.version", BIN_DASH, "--version", FLAG)
+  C2P_ALIAS("meta.version", BIN_LTC, "--version", FLAG)
+  C2P_ALIAS("meta.version", BIN_BTC, "--version", FLAG)
   C2P_ALIAS("meta.version", BIN_DGB, "--version", FLAG)
   C2P_ALIAS("meta.version", BIN_BCH, "--version", FLAG)
   C2P_ALIAS("meta.version", BIN_BIP110, "--version", FLAG)
@@ -190,6 +192,10 @@ C2P_PARAM("sharechain.no_p2p_relay", Sharechain, BOOL, RESTART, C_DASH|C_DGB, LI
   C2P_ALIAS("sharechain.no_p2p_relay", BIN_DASH, "--no-p2p-relay", FLAG)
   C2P_ALIAS("sharechain.no_p2p_relay", BIN_DGB, "--no-p2p-relay", FLAG)
 
+C2P_PARAM("sharechain.deferred_mint", Sharechain, TRISTATE_BOOL, RESTART, C_DASH, NONE, "", NONE, "queue a solve a busy tracker declines and mint it when the lock frees (default off; --deferred-mint enables)")
+  C2P_ALIAS("sharechain.deferred_mint", BIN_DASH, "--deferred-mint", FLAG)
+  C2P_ALIAS("sharechain.deferred_mint", BIN_DASH, "--no-deferred-mint", FLAG_NO_PREFIX)
+
 C2P_PARAM("sharechain.max_conns", Sharechain, INT64, RESTART, C_LTC, LIT, "0", NONE, "max connections")
   C2P_ALIAS("sharechain.max_conns", BIN_LTC, "--max-conns", VALUE)
 
@@ -334,6 +340,9 @@ C2P_PARAM("stratum.max_coinbase_outputs", Stratum, INT64, LIVE, C_LTC, LIT, "0",
 
 C2P_PARAM("stratum.max_connections", Stratum, INT64, LIVE, C_LTC, LIT, "0", NONE, "max stratum connections")
   C2P_ALIAS("stratum.max_connections", BIN_LTC, "--max-stratum-connections", VALUE)
+
+C2P_PARAM("stratum.max_connections_per_ip", Stratum, INT64, LIVE, C_LTC, LIT, "0", NONE, "max stratum connections per source IP, one /64 for IPv6 (0=unlimited; rigs behind one NAT share an address)")
+  C2P_ALIAS("stratum.max_connections_per_ip", BIN_LTC, "--max-stratum-connections-per-ip", VALUE)
 
 C2P_PARAM("web.port", WebOps, UINT16, RESTART, C_ALL, FROM_POOL_CONFIG, "", PORT_RANGE, "dashboard/web bind port (0=off)")
   C2P_ALIAS("web.port", BIN_DASH, "--web-port", VALUE)
@@ -544,6 +553,15 @@ C2P_PARAM("utility.utxo_stats", Meta, PATH, COMPILE_TIME_READONLY, C_LTC|C_DOGE,
 
 C2P_PARAM("utility.ltc_utxo_stats", Meta, PATH, COMPILE_TIME_READONLY, C_LTC, LIT, "", NONE, "print gettxoutsetinfo (Litecoin Core 0.21.4 GetUTXOStats, hash_serialized_2) for the UTXO LevelDB at DIR, then exit")
   C2P_ALIAS("utility.ltc_utxo_stats", BIN_LTC, "--ltc-utxo-stats", VALUE)
+
+// One-shot on a RUNNING node (not print-and-exit): import found-block history
+// (core/found_block_import.hpp) from another node's /recent_blocks JSON or a
+// list of block hashes, each block validated against the LTC header chain.
+// CLI and the legacy YAML key import_found_blocks only; compile-time readonly
+// so a settings file is refused rather than silently ignored, and nothing is
+// mirrored into the resolved config.
+C2P_PARAM("utility.import_found_blocks", Meta, PATH, COMPILE_TIME_READONLY, C_LTC, LIT, "", NONE, "import found-block history from FILE (repeatable or FILE,FILE: another node's /recent_blocks and /recent_merged_blocks JSON, or block hashes one per line), each block validated against its own chain's header chain")
+  C2P_ALIAS("utility.import_found_blocks", BIN_LTC, "--import-found-blocks", VALUE)
 
 C2P_PARAM("embedded.ltc_cmpct_v3", Embedded, TRISTATE_BOOL, RESTART, C_LTC, NONE, "", NONE, "ask LTC MWEB peers for v3 compact blocks (default on)")
   C2P_ALIAS("embedded.ltc_cmpct_v3", BIN_LTC, "--ltc-cmpct-v3", FLAG)
