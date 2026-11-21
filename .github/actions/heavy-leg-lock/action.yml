@@ -2,9 +2,10 @@ name: heavy-leg-lock
 description: >-
   Acquire a per-host slotted flock semaphore (reap-guard) governing a RAM- or
   disk-heavy CI leg. Holds a disowned slot that auto-frees when the runner-worker
-  dies at job end; stale holders from dead jobs are reaped at acquire. Same proven
-  logic as the inline pre-checkout RAM lock in build.yml (which cannot use this
-  action because it must run before checkout).
+  dies at job end; stale holders from dead jobs are reaped at acquire. Every
+  heavy-leg lock in build.yml and codeql-analysis.yml goes through this action;
+  callers that must lock before their full checkout sparse-check-out
+  .github/actions/heavy-leg-lock first.
 inputs:
   lock-file:
     description: Base path of the per-slot lock files.
@@ -20,6 +21,12 @@ inputs:
       (the default everywhere) this input is used unchanged, and an invalid
       value falls back to it with a warning.
     default: "2"
+  mem-gb-per-slot:
+    description: >-
+      Host-RAM clamp: cap slots at (host MemTotal GB / this value), minimum 1,
+      applied after any host override. "0" (the default) disables it. The RAM
+      lock uses "20" (one ASan/CodeQL leg's budget).
+    default: "0"
   wait:
     description: Max seconds to wait for a free slot before failing.
     default: "5400"
@@ -37,6 +44,7 @@ runs:
         HEAVY_LEG_LOCK: ${{ inputs.lock-file }}
         HEAVY_LEG_HOLDERFILE: ${{ inputs.holder-file }}
         HEAVY_LEG_SLOTS: ${{ inputs.slots }}
+        HEAVY_LEG_MEM_GB_PER_SLOT: ${{ inputs.mem-gb-per-slot }}
         HEAVY_LEG_WAIT: ${{ inputs.wait }}
         HEAVY_LEG_TTL: ${{ inputs.ttl }}
         HEAVY_LEG_HOLDER_ENV: ${{ inputs.holder-env }}
