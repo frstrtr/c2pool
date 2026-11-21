@@ -180,6 +180,28 @@ inline bool found_block_may_fire(FoundBlockBits v)
     return v == FoundBlockBits::Match || v == FoundBlockBits::NoOracle;
 }
 
+/// Whether a block-solving share's header time lets the found-block hook fire.
+/// The coin network accepts a block only with a time above its parent's
+/// median-time-past ("time-too-old" otherwise); `floor` is that MTP + 1 from
+/// the header-chain oracle (m_block_time_floor), nullopt when unknown. Only a
+/// KNOWN floor refuses: below it => no fire; an unknown floor or no oracle =>
+/// fire (the bits check, which runs first, already needs the parent on our
+/// header chain). This gates only the hook (relay and record), never the share.
+enum class FoundBlockTime { AtOrAboveFloor, BelowFloor, UnknownFloor, NoOracle };
+
+inline FoundBlockTime found_block_time(uint32_t header_time, bool have_oracle,
+                                       std::optional<uint32_t> floor)
+{
+    if (!have_oracle) return FoundBlockTime::NoOracle;
+    if (!floor.has_value()) return FoundBlockTime::UnknownFloor;
+    return header_time >= *floor ? FoundBlockTime::AtOrAboveFloor : FoundBlockTime::BelowFloor;
+}
+
+inline bool found_block_time_may_fire(FoundBlockTime v)
+{
+    return v != FoundBlockTime::BelowFloor;
+}
+
 /// p2pool Phase 4 head key. work is the verified work up to the head's 5th
 /// parent; attempts is ata(target) of the head itself (its index `work`).
 /// work - min(punish,1)*attempts: a punished head (punish > 0) is one share
@@ -503,6 +525,11 @@ public:
     // tools, a node with no header chain) => no block-solution credit at all.
     std::function<std::optional<uint32_t>(const uint256& prev_block, int64_t block_time)>
         m_expected_block_bits;
+    // The earliest header time a block built on `prev_block` may carry: the
+    // coin network's median-time-past of `prev_block` + 1, from the coin header
+    // chain (HeaderChain::median_time_past_at); nullopt when unknown. Gates
+    // only the found-block hook (fire_block_found_checked), never the share.
+    std::function<std::optional<uint32_t>(const uint256& prev_block)> m_block_time_floor;
     // Callback fired when a verified share meets a merged chain target (DOGE block)
     // Args: share_hash, pow_hash (for target comparison by caller)
     std::function<void(const uint256&, const uint256&)> m_on_merged_block_check;
@@ -516,7 +543,9 @@ public:
 
     // Fire m_on_block_found for a block-solving share only when its header
     // bits are the ones the coin network requires after its parent block
-    // (found_block_bits). Returns whether the hook fired. A refusal is logged,
+    // (found_block_bits) and its header time is not at or below the parent's
+    // known median-time-past (found_block_time). The share itself is never
+    // affected. Returns whether the hook fired. A refusal is logged,
     // never silent; the log is throttled (the first 3, then every 10th) since
     // each refused share is one verified share.
     //
@@ -537,8 +566,27 @@ public:
         const auto verdict = found_block_bits(header_bits,
                                               static_cast<bool>(m_expected_block_bits), expected);
         if (found_block_may_fire(verdict)) {
-            m_on_block_found(share_hash);
-            return true;
+            // The header time must be above the parent's median-time-past.
+            std::optional<uint32_t> floor;
+            if (m_block_time_floor)
+                floor = m_block_time_floor(prev_block);
+            const auto tv = found_block_time(header_time,
+                                             static_cast<bool>(m_block_time_floor), floor);
+            if (found_block_time_may_fire(tv)) {
+                m_on_block_found(share_hash);
+                return true;
+            }
+            // Only a known floor refuses (BelowFloor; *floor is engaged).
+            const uint64_t n = ++m_found_block_refusals;
+            if (n > 3 && n % 10 != 0)
+                return false;
+            LOG_ERROR << "[BLOCK-FOUND] share " << share_hash.GetHex().substr(0, 16)
+                      << " meets its header target, but its header time " << header_time
+                      << " is below the network's minimum " << *floor << " after block "
+                      << prev_block.GetHex().substr(0, 16)
+                      << " (median-time-past + 1) -- the block is invalid on the network;"
+                         " NOT relayed, NOT recorded (the share stays) (refusal #" << n << ")";
+            return false;
         }
         const uint64_t n = ++m_found_block_refusals;
         if (n > 3 && n % 10 != 0)

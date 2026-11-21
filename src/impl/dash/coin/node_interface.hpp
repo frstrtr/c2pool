@@ -37,6 +37,11 @@ struct TipAdvance
     uint8_t  address_p2sh_version{0};
     uint32_t curtime{0};
     uint32_t version{0};
+    // mtp_at_tip is over the full 11-header window of the tip. When false
+    // (e.g. right after a cold start) the template's mintime is 0: no submit
+    // floor from an MTP over fewer headers, which can be later than the
+    // network's. mtp_at_tip keeps its other uses (lock-time cutoff, MNHF).
+    bool     mtp_window_complete{true};
 };
 
 /// Header/think path payload: a block was connected to the active chain. The

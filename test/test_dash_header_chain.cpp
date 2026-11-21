@@ -1046,3 +1046,86 @@ TEST(DashNetworkHashps, HeaderChainWindowOverAMinedChain)
     EXPECT_EQ(hc.network_hashps(40), 0.0) << "the window must lie above the chain's first entry";
     EXPECT_EQ(hc.network_hashps(0), 0.0);
 }
+
+// ─── median_time_past_at: the found-block relay gate's time floor ───────────
+// Dash Core GetMedianTimePast of a given block: the median of its own and its
+// 10 ancestors' timestamps. A block built on it needs a time above that.
+
+TEST(DashHeaderChainMtp, MedianOfTheBlockAndItsTenAncestors)
+{
+    // Heights 1..15 at tip_time - (15 - h) * 150 s.
+    auto mc = build_mined_chain(15, 1'800'000'000u);
+    const uint32_t t7 = mc.tip_time - (15u - 7u) * 150u;
+    const auto m12 = mc.hc->median_time_past_at(mc.hashes[12]);
+    ASSERT_TRUE(m12.has_value());
+    EXPECT_EQ(*m12, t7) << "the median of heights 2..12 is height 7's time";
+    const auto m15 = mc.hc->median_time_past_at(mc.hashes[15]);
+    ASSERT_TRUE(m15.has_value());
+    EXPECT_EQ(*m15, mc.hc->median_time_past()) << "at the tip it is the tip's MTP";
+}
+
+TEST(DashHeaderChainMtp, UnknownTooDeepOrTooShortIsUnknown)
+{
+    auto mc = build_mined_chain(15, 1'800'000'000u);
+    uint256 unknown;
+    unknown.SetHex("00000000000000000000000000000000000000000000000000000000000abcde");
+    EXPECT_FALSE(mc.hc->median_time_past_at(unknown).has_value()) << "not in the header chain";
+    EXPECT_FALSE(mc.hc->median_time_past_at(mc.hashes[12], /*max_depth=*/2).has_value())
+        << "3 blocks below the tip, deeper than max_depth";
+    EXPECT_TRUE(mc.hc->median_time_past_at(mc.hashes[12], /*max_depth=*/3).has_value());
+    EXPECT_FALSE(mc.hc->median_time_past_at(mc.hashes[9]).has_value())
+        << "fewer than 11 headers up to height 9";
+}
+
+// Above a fast-start anchor the synthetic anchor (time 0) is never counted:
+// the window must be 11 real headers above it.
+TEST(DashHeaderChainMtp, WindowWithTheSyntheticAnchorIsUnknown)
+{
+    auto params = make_easy_test_params();
+    DashChainParams::Checkpoint cp{};
+    cp.height = 1000;
+    cp.hash.SetHex("00000000000000000000000000000000000000000000000000000000000000cc");
+    params.fast_start_checkpoint = cp;
+    HeaderChain hc(params, /*db_path=*/"");
+    ASSERT_TRUE(hc.init());
+    std::vector<uint256> hashes{cp.hash};
+    uint32_t t = 1'800'000'000u;
+    for (int i = 0; i < 15; ++i) {
+        t += 150u;
+        auto h = mine_header(hashes.back(), t, params.pow_limit.GetCompact(), params.pow_limit);
+        ASSERT_TRUE(hc.add_header(h)) << "mined header " << (i + 1) << " above the anchor";
+        hashes.push_back(x11_hash(h));
+    }
+    EXPECT_FALSE(hc.median_time_past_at(hashes[0]).has_value()) << "the anchor itself";
+    EXPECT_FALSE(hc.median_time_past_at(hashes[10]).has_value())
+        << "anchor + 10: the window still holds the synthetic anchor";
+    const auto m11 = hc.median_time_past_at(hashes[11]);
+    ASSERT_TRUE(m11.has_value()) << "anchor + 11: 11 real headers";
+    EXPECT_EQ(*m11, 1'800'000'000u + 6u * 150u) << "the median of anchor+1..anchor+11 is anchor+6";
+}
+
+// Timestamps out of order (each above its own window's MTP, as the network
+// allows): the answer is the median, not the 6th header back.
+TEST(DashHeaderChainMtp, MedianOfUnorderedTimestamps)
+{
+    auto params = make_easy_test_params();
+    HeaderChain hc(params, /*db_path=*/"");
+    ASSERT_TRUE(hc.init());
+    std::vector<uint256> hashes{params.genesis_hash};
+    std::vector<uint32_t> times{0};
+    const uint32_t base = 1'800'000'000u;
+    for (uint32_t h = 1; h <= 15; ++h) {
+        // Up 600 s, then back 300 s: never below the previous window's median.
+        const uint32_t t = base + h * 150u + ((h % 2) ? 300u : 0u);
+        auto hdr = mine_header(hashes.back(), t, params.pow_limit.GetCompact(), params.pow_limit);
+        ASSERT_TRUE(hc.add_header(hdr)) << "header " << h;
+        hashes.push_back(x11_hash(hdr));
+        times.push_back(t);
+    }
+    std::vector<uint32_t> w(times.begin() + 2, times.begin() + 13);   // heights 2..12
+    std::sort(w.begin(), w.end());
+    const auto m12 = hc.median_time_past_at(hashes[12]);
+    ASSERT_TRUE(m12.has_value());
+    EXPECT_EQ(*m12, w[5]);
+    EXPECT_NE(*m12, times[7]) << "the window is out of order, so position and median differ";
+}

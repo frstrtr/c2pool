@@ -645,7 +645,9 @@ public:
     void set_tip(uint32_t prev_height, const uint256& prev_hash,
                  uint32_t bits_for_next, uint32_t mtp_at_tip,
                  uint8_t address_version, uint8_t address_p2sh_version,
-                 uint32_t curtime = 0, uint32_t version = 0) {
+                 uint32_t curtime = 0, uint32_t version = 0,
+                 bool mtp_window_complete = true) {
+        m_mtp_window_complete  = mtp_window_complete;
         // D2: prev_height/prev_hash are inputs of the confirmation-pass
         // projection (confirmations = prev_height - reg_height; confirmedHash
         // = prev_hash), so a tip move invalidates the memoized projected root.
@@ -2430,6 +2432,7 @@ public:
         e.bits_for_next        = m_bits_for_next;
         e.bits_at_time         = m_bits_at_time_fn;
         e.mtp_at_tip           = m_mtp_at_tip;
+        e.mtp_window_complete  = m_mtp_window_complete;
         e.address_version      = m_address_version;
         e.address_p2sh_version = m_address_p2sh_version;
         e.curtime              = m_curtime;
@@ -3199,6 +3202,7 @@ private:
     uint256  m_prev_hash;
     uint32_t m_bits_for_next{0};
     uint32_t m_mtp_at_tip{0};
+    bool     m_mtp_window_complete{true};   // false => the template's mintime is 0
     uint8_t  m_address_version{0};
     uint8_t  m_address_p2sh_version{0};
     uint32_t m_curtime{0};
