@@ -445,102 +445,6 @@ TEST(DashIslockVerify, SelectionFailsClosedOnEveryUncertainty)
                      .has_value());
 }
 
-// ═══ 3. USE — the G4 red/green KAT ════════════════════════════════════════════
-
-// THE KAT. One mempool, two priced txs:
-//   X spends outpoint O            (the coinbase's output 0)
-//   Y spends a different outpoint  (the coinbase's output 1)
-// A verified isdlock arrives claiming O is locked to a DIFFERENT txid.
-//
-// WITHOUT the feed, the selected template contains BOTH X and Y — asserted
-// below as the baseline (this exact assertion pair is what was observed to
-// FAIL — RED — when the feed ran and to hold on master where the feed cannot
-// run; and conversely the exclusion assertions are RED without the feed).
-// WITH the feed through the REAL maintainer path, X is EXCLUDED and Y stays.
-TEST(DashIsdlockG4, VerifiedIsdlockExcludesConflictKeepsNonConflict)
-{
-    NodeCoinState st;
-    CoinStateMaintainer m(st);
-    Mempool& mp = st.mempool();
-
-    UtxoLane lane;
-    ASSERT_TRUE(lane.open(""));          // ephemeral cache-only (synthetic mode)
-    lane.attach(mp);
-
-    auto cb = make_coinbase({100'000, 90'000}, /*salt=*/1);
-    lane.on_block_connected(make_block({cb}, /*salt=*/1), /*height=*/1);
-    const uint256 cb_txid = dash_txid(cb);
-    const std::pair<uint256, uint32_t> O{cb_txid, 0u};
-
-    auto X = make_spend(cb_txid, 0, 90'000, /*salt=*/11);   // spends O, fee 10k
-    auto Y = make_spend(cb_txid, 1, 80'000, /*salt=*/12);   // no conflict, fee 10k
-    ASSERT_TRUE(mp.add_tx(X));
-    ASSERT_TRUE(mp.add_tx(Y));
-    const uint256 x_txid = dash_txid(X);
-    const uint256 y_txid = dash_txid(Y);
-
-    // ── BASELINE (no feed): both selected, map empty. The two X-assertions
-    // here are the ones the feed flips — they are the "red without the feed"
-    // proof in executable form. ──────────────────────────────────────────────
-    EXPECT_EQ(mp.islock_outpoint_count(), 0u);
-    ASSERT_TRUE(selected_contains(mp, x_txid))
-        << "baseline: without an isdlock the conflicting spend is a normal tx";
-    ASSERT_TRUE(selected_contains(mp, y_txid));
-
-    // ── FEED: a VERIFIED isdlock locking O to a txid that is NOT X. Stub
-    // verifier == true stands in for the BLS gate (the BLS half has its own
-    // suite below); the point here is the USE path is the REAL one:
-    // on_new_isdlock -> on_islock -> Mempool::add_islock -> G4 guard. ────────
-    const uint256 locked_txid = raw256(0x77);   // the network's winner, != X
-    m.set_islock_verify_fn(
-        [](const std::vector<std::pair<uint256, uint32_t>>&, const uint256&,
-           const uint256&, const std::array<uint8_t, 96>&) { return true; });
-    std::array<uint8_t, 96> sig{}; sig.fill(0xab);
-    m.on_new_isdlock({O}, locked_txid, raw256(0x33), sig);
-
-    // ── GREEN: X (conflicts with the lock) is OUT — evicted by add_islock's
-    // defence 1 AND excluded by the G4 selection guard; Y is UNAFFECTED. ─────
-    EXPECT_EQ(mp.islock_outpoint_count(), 1u);
-    EXPECT_FALSE(selected_contains(mp, x_txid))
-        << "G4: a tx spending an outpoint islocked to a DIFFERENT txid must "
-           "not be packed (dashd validation.cpp conflict-tx-lock)";
-    EXPECT_TRUE(selected_contains(mp, y_txid))
-        << "the guard is exclusion-only: a non-conflicting tx must survive";
-}
-
-// The same feed with NO verifier registered, and with a REFUSING verifier:
-// nothing is adopted, selection is byte-identical to the baseline.
-TEST(DashIsdlockG4, UnverifiedIsdlockChangesNothing)
-{
-    NodeCoinState st;
-    CoinStateMaintainer m(st);
-    Mempool& mp = st.mempool();
-
-    UtxoLane lane;
-    ASSERT_TRUE(lane.open(""));
-    lane.attach(mp);
-    auto cb = make_coinbase({100'000}, /*salt=*/2);
-    lane.on_block_connected(make_block({cb}, /*salt=*/2), /*height=*/1);
-    auto X = make_spend(dash_txid(cb), 0, 90'000, /*salt=*/21);
-    ASSERT_TRUE(mp.add_tx(X));
-    const uint256 x_txid = dash_txid(X);
-    std::array<uint8_t, 96> sig{}; sig.fill(0xab);
-
-    // (a) no verifier registered => fail closed, adopt nothing.
-    m.on_new_isdlock({{dash_txid(cb), 0u}}, raw256(0x77), raw256(0x33), sig);
-    EXPECT_EQ(mp.islock_outpoint_count(), 0u);
-    EXPECT_TRUE(selected_contains(mp, x_txid));
-
-    // (b) verifier REFUSES => same.
-    m.set_islock_verify_fn(
-        [](const std::vector<std::pair<uint256, uint32_t>>&, const uint256&,
-           const uint256&, const std::array<uint8_t, 96>&) { return false; });
-    m.on_new_isdlock({{dash_txid(cb), 0u}}, raw256(0x77), raw256(0x33), sig);
-    EXPECT_EQ(mp.islock_outpoint_count(), 0u)
-        << "a refused isdlock must leave the map EXACTLY as it was";
-    EXPECT_TRUE(selected_contains(mp, x_txid));
-}
-
 // ═══ Retained quorums — locks signed by the previous rotation cycle ══════════
 //
 // A lock names its signing quorum's own cycle, and for a few blocks after a
@@ -732,6 +636,102 @@ TEST(DashIsdlockPass2, TwoPassSelectsThePreviousCycleOnlyWhenTheLockNamesIt)
     EXPECT_EQ(verify_islock_two_pass(*p, active, previous, late_tip, prev_cycle, inputs, txid, signed_by(0xA0)),
               IslockVerifyPass::None);
     EXPECT_EQ(calls, 0);
+}
+
+// ═══ 3. USE — the G4 red/green KAT ════════════════════════════════════════════
+
+// THE KAT. One mempool, two priced txs:
+//   X spends outpoint O            (the coinbase's output 0)
+//   Y spends a different outpoint  (the coinbase's output 1)
+// A verified isdlock arrives claiming O is locked to a DIFFERENT txid.
+//
+// WITHOUT the feed, the selected template contains BOTH X and Y — asserted
+// below as the baseline (this exact assertion pair is what was observed to
+// FAIL — RED — when the feed ran and to hold on master where the feed cannot
+// run; and conversely the exclusion assertions are RED without the feed).
+// WITH the feed through the REAL maintainer path, X is EXCLUDED and Y stays.
+TEST(DashIsdlockG4, VerifiedIsdlockExcludesConflictKeepsNonConflict)
+{
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+    Mempool& mp = st.mempool();
+
+    UtxoLane lane;
+    ASSERT_TRUE(lane.open(""));          // ephemeral cache-only (synthetic mode)
+    lane.attach(mp);
+
+    auto cb = make_coinbase({100'000, 90'000}, /*salt=*/1);
+    lane.on_block_connected(make_block({cb}, /*salt=*/1), /*height=*/1);
+    const uint256 cb_txid = dash_txid(cb);
+    const std::pair<uint256, uint32_t> O{cb_txid, 0u};
+
+    auto X = make_spend(cb_txid, 0, 90'000, /*salt=*/11);   // spends O, fee 10k
+    auto Y = make_spend(cb_txid, 1, 80'000, /*salt=*/12);   // no conflict, fee 10k
+    ASSERT_TRUE(mp.add_tx(X));
+    ASSERT_TRUE(mp.add_tx(Y));
+    const uint256 x_txid = dash_txid(X);
+    const uint256 y_txid = dash_txid(Y);
+
+    // ── BASELINE (no feed): both selected, map empty. The two X-assertions
+    // here are the ones the feed flips — they are the "red without the feed"
+    // proof in executable form. ──────────────────────────────────────────────
+    EXPECT_EQ(mp.islock_outpoint_count(), 0u);
+    ASSERT_TRUE(selected_contains(mp, x_txid))
+        << "baseline: without an isdlock the conflicting spend is a normal tx";
+    ASSERT_TRUE(selected_contains(mp, y_txid));
+
+    // ── FEED: a VERIFIED isdlock locking O to a txid that is NOT X. Stub
+    // verifier == true stands in for the BLS gate (the BLS half has its own
+    // suite below); the point here is the USE path is the REAL one:
+    // on_new_isdlock -> on_islock -> Mempool::add_islock -> G4 guard. ────────
+    const uint256 locked_txid = raw256(0x77);   // the network's winner, != X
+    m.set_islock_verify_fn(
+        [](const std::vector<std::pair<uint256, uint32_t>>&, const uint256&,
+           const uint256&, const std::array<uint8_t, 96>&) { return true; });
+    std::array<uint8_t, 96> sig{}; sig.fill(0xab);
+    m.on_new_isdlock({O}, locked_txid, raw256(0x33), sig);
+
+    // ── GREEN: X (conflicts with the lock) is OUT — evicted by add_islock's
+    // defence 1 AND excluded by the G4 selection guard; Y is UNAFFECTED. ─────
+    EXPECT_EQ(mp.islock_outpoint_count(), 1u);
+    EXPECT_FALSE(selected_contains(mp, x_txid))
+        << "G4: a tx spending an outpoint islocked to a DIFFERENT txid must "
+           "not be packed (dashd validation.cpp conflict-tx-lock)";
+    EXPECT_TRUE(selected_contains(mp, y_txid))
+        << "the guard is exclusion-only: a non-conflicting tx must survive";
+}
+
+// The same feed with NO verifier registered, and with a REFUSING verifier:
+// nothing is adopted, selection is byte-identical to the baseline.
+TEST(DashIsdlockG4, UnverifiedIsdlockChangesNothing)
+{
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+    Mempool& mp = st.mempool();
+
+    UtxoLane lane;
+    ASSERT_TRUE(lane.open(""));
+    lane.attach(mp);
+    auto cb = make_coinbase({100'000}, /*salt=*/2);
+    lane.on_block_connected(make_block({cb}, /*salt=*/2), /*height=*/1);
+    auto X = make_spend(dash_txid(cb), 0, 90'000, /*salt=*/21);
+    ASSERT_TRUE(mp.add_tx(X));
+    const uint256 x_txid = dash_txid(X);
+    std::array<uint8_t, 96> sig{}; sig.fill(0xab);
+
+    // (a) no verifier registered => fail closed, adopt nothing.
+    m.on_new_isdlock({{dash_txid(cb), 0u}}, raw256(0x77), raw256(0x33), sig);
+    EXPECT_EQ(mp.islock_outpoint_count(), 0u);
+    EXPECT_TRUE(selected_contains(mp, x_txid));
+
+    // (b) verifier REFUSES => same.
+    m.set_islock_verify_fn(
+        [](const std::vector<std::pair<uint256, uint32_t>>&, const uint256&,
+           const uint256&, const std::array<uint8_t, 96>&) { return false; });
+    m.on_new_isdlock({{dash_txid(cb), 0u}}, raw256(0x77), raw256(0x33), sig);
+    EXPECT_EQ(mp.islock_outpoint_count(), 0u)
+        << "a refused isdlock must leave the map EXACTLY as it was";
+    EXPECT_TRUE(selected_contains(mp, x_txid));
 }
 
 // ═══ 4. FAIL-CLOSED — real BLS (gated on the dashbls backend) ════════════════
