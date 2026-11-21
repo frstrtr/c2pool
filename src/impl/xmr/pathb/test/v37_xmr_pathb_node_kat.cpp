@@ -15040,6 +15040,8 @@ void catchctx() {
 //               other source's job is placed
 //   seedkeyfail a failed keying: the RandomX alarm; the held job not run on the clock, once at the tip event
 //   seedthread  seednokey with the keying worker on its own thread
+//   seedrace    a hold overlapping its seed's keying: the job runs at the release (a), or at the next tip event (b)
+//   parkretry   the relay starts with a park retry of 100 .. 2000 ms only
 //   seedmemo    40 kept rows off the index (3000461 .. 3000500) whose parent at 3000460 nobody holds, 3 P_r on them:
 //               after the first walk each call looks up one id (the stopping id) until it arrives; then the walks
 //               resume from it and end on the main chain's seed at 3000320; the row event's drops
@@ -15108,6 +15110,15 @@ struct KatRxEngine final : pb::INodeRxEngine {
     mutable std::mutex mu;
     std::set<pb::Hash32> keyed;
     bool any = true, silent = false, fail = false;
+    mutable std::function<void()> on_miss_once;  // run once, after a residency query answers "not keyed"
+    void add(const pb::Hash32& s) {
+        std::lock_guard<std::mutex> lk(mu);
+        keyed.insert(s);
+    }
+    void arm(std::function<void()> f) {
+        std::lock_guard<std::mutex> lk(mu);
+        on_miss_once = std::move(f);
+    }
     std::uint64_t keys = 0, not_keyed = 0;
     std::vector<std::pair<std::uint64_t, pb::Hash32>> pins;
     void set(bool a, std::set<pb::Hash32> k = {}) {
@@ -15139,8 +15150,15 @@ struct KatRxEngine final : pb::INodeRxEngine {
     bool ready() const override { return true; }
     std::string mode_name() const override { return "kat"; }
     bool resident(const pb::Hash32& s) const override {
-        std::lock_guard<std::mutex> lk(mu);
-        return any || keyed.count(s) != 0;
+        bool r = false;
+        std::function<void()> hook;
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            r = any || keyed.count(s) != 0;
+            if (!r && on_miss_once) hook = std::exchange(on_miss_once, nullptr);
+        }
+        if (hook) hook();
+        return r;
     }
     pb::RxHash hash(const std::vector<std::uint8_t>&, const pb::Hash32& seed, pb::Hash32& pow) override {
         std::lock_guard<std::mutex> lk(mu);
@@ -15421,16 +15439,17 @@ void seedrulec() {
     for (std::size_t i = 2; i < cap; ++i) rv.test_hold(px, fx1, seed);
     const bool full = rv.seed_held() == cap && rv.stats().seed_held_evicted.load() == 0;
     rv.test_hold(px, fx1, seed);
-    const bool rule_c = rv.stats().seed_held_evicted.load() == 1 && rv.seed_held() == cap && rv.seed_held_has(fy)
-                        && !rv.seed_held_has(fx0) && rv.seed_held_has(fx1);
+    const bool y_held = rv.seed_held_has(fy), x0_held = rv.seed_held_has(fx0);
+    const bool rule_c = rv.stats().seed_held_evicted.load() == 1 && rv.seed_held() == cap && y_held && !x0_held
+                        && rv.seed_held_has(fx1);
     (void)V.io.keyer->request(seed);
     (void)V.io.keyer->pump();
     w.run();
     std::printf("  seedrulec: cap %zu (frame buffer %llu B); full %d; after one more of X: evicted %llu, Y held %d, X's "
                 "oldest held %d; at the keying V at %llu (Y's carrier at %llu); strikes Y %llu X %llu, bans %llu\n",
                 cap, (unsigned long long)h[v.node].config().buffers.frame, full ? 1 : 0,
-                (unsigned long long)rv.stats().seed_held_evicted.load(), rv.seed_held_has(fy) ? 1 : 0,
-                rv.seed_held_has(fx0) ? 1 : 0, (unsigned long long)h[v.node].tree().best().pos,
+                (unsigned long long)rv.stats().seed_held_evicted.load(), y_held ? 1 : 0, x0_held ? 1 : 0,
+                (unsigned long long)h[v.node].tree().best().pos,
                 (unsigned long long)h[l.node].tree().best().pos, (unsigned long long)rv.strikes_of(pl),
                 (unsigned long long)rv.strikes_of(px), (unsigned long long)rv.stats().bans.load());
     check(n > 0 && caught && mined && !fy.empty() && !fx0.empty() && fx0 != fx1 && full && rule_c
@@ -15482,23 +15501,117 @@ void seedkeyfail() {
         while (w.step()) {
         }
     }
-    const bool quiet = V.eng.misses() == m0 && rv.seed_held(seed) == 1;
+    const std::uint64_t quiet_misses = V.eng.misses() - m0;
+    const bool quiet = quiet_misses == 0 && rv.seed_held(seed) == 1;
     rv.on_monero_tip();
     w.run();
-    const bool once = V.eng.misses() == m0 + 1 && rv.seed_held(seed) == 1 && V.io.keyer->queued() == 1;
+    const std::uint64_t tip_misses = V.eng.misses() - m0 - quiet_misses;
+    const bool asked = V.io.keyer->queued() == 1;
+    const bool once = tip_misses == 1 && rv.seed_held(seed) == 1 && asked;
     V.eng.failing(false);
     (void)V.io.keyer->pump();
     w.run();
     std::printf("  seedkeyfail: held %zu; alarms +%llu, failed keyings %llu; misses over 5 s +%llu; at the tip event +%llu, "
                 "asked again %d; keyed: V at %llu (L at %llu)\n",
                 held1, (unsigned long long)(rv.stats().rx_failures.load() - alarms0),
-                (unsigned long long)rv.stats().seed_key_failed.load(), (unsigned long long)(quiet ? 0 : 1),
-                (unsigned long long)(once ? 1 : 0), once ? 1 : 0, (unsigned long long)h[v.node].tree().best().pos,
+                (unsigned long long)rv.stats().seed_key_failed.load(), (unsigned long long)quiet_misses,
+                (unsigned long long)tip_misses, asked ? 1 : 0, (unsigned long long)h[v.node].tree().best().pos,
                 (unsigned long long)h[l.node].tree().best().pos);
     check(n > 0 && caught && mined && held1 == 1 && alarmed && quiet && once && h[v.node].tree().best().id == c_new
                   && rv.seed_held() == 0 && rv.strikes_of(1) == 0 && rv.stats().bans.load() == 0,
           "seedkeyfail: a failed keying raises the RandomX alarm; its held job is not run on the clock, runs once at the "
           "tip event, and is placed once the seed is keyed");
+}
+
+// seedrace: a hold overlapping its seed's keying. (a) The hold's residency read answers "not keyed", then the keying
+// is installed and its release runs on another thread before the hold inserts the job: the job runs at that release,
+// before any tip event. (b) The keying is installed after the hold's read and no release follows: the job is held
+// with its seed keyed and runs at the next tip event. Both placed, no alarm.
+void seedrace() {
+    const pb::Hash32 seed = br2_block(kSeedEdge);
+    KatNet net;
+    add_branch2(net);
+    Harness h(net);
+    FakeWire w;
+    KatRxNode L, V;
+    L.rows.rows = &net.rows;
+    L.rows.br2_main = true;
+    L.rows.tip = kBr2Top;
+    V.rows.rows = &net.rows;
+    KatRelay l = kat_relay(h, w, table0(net), true, false, nullptr, nullptr, rx_io(L, net));
+    KatRelay v = kat_relay(h, w, table0(net), false, false, nullptr, nullptr, rx_io(V, net));
+    pb::PathbRelayNode& rv = *v.relay;
+    rx_wire(V, rv);
+    const std::uint32_t n = mine_br2(h, l.node, 7000);
+    w.connect(0, 1);
+    (void)rx_catch_up(h, w, l, v, V, false);
+    const bool caught = h[v.node].tree().best().id == h[l.node].tree().best().id;
+    const auto same = [&] { return h[v.node].tree().best().id == h[l.node].tree().best().id; };
+    // (a)
+    V.eng.drop(seed);
+    std::thread kt;
+    std::atomic<bool> done{false};
+    int done_in_hook = -1;
+    V.eng.arm([&] {
+        kt = std::thread([&] {
+            V.eng.add(seed);
+            rv.on_seed_keyed(seed);
+            done = true;
+        });
+        for (int i = 0; i < 200 && !done.load(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        done_in_hook = done.load() ? 1 : 0;
+    });
+    const std::optional<pb::PathbJob> ja = h.job(l.node, 3, 9300);
+    const bool mined_a = ja && h[l.node].on_own_share(*ja, 9300, pb::Hash32{}).action == pb::NodeAction::Placed;
+    w.run();
+    if (kt.joinable()) kt.join();
+    w.run();
+    const bool a_before_tip = same();
+    const std::size_t a_held = rv.seed_held();
+    rv.on_monero_tip();
+    w.run();
+    const bool a_after_tip = same() && rv.seed_held() == 0;
+    // (b)
+    V.eng.drop(seed);
+    V.eng.arm([&] { V.eng.add(seed); });
+    const std::optional<pb::PathbJob> jb = h.job(l.node, 3, 9301);
+    const bool mined_b = jb && h[l.node].on_own_share(*jb, 9301, pb::Hash32{}).action == pb::NodeAction::Placed;
+    w.run();
+    const bool b_before_tip = same();
+    const std::size_t b_held = rv.seed_held(seed);
+    rv.on_monero_tip();
+    w.run();
+    const bool b_after_tip = same() && rv.seed_held() == 0;
+    std::printf("  seedrace: (a) the release done while the hold read the residency %d, done after %d; placed before the tip event %d (held %zu), "
+                "after it %d; (b) placed before the tip event %d (held %zu, keyed %d), after it %d: V at %llu (L at %llu); "
+                "rx alarms %llu\n",
+                done_in_hook, done.load() ? 1 : 0, a_before_tip ? 1 : 0, a_held, a_after_tip ? 1 : 0, b_before_tip ? 1 : 0,
+                b_held, V.eng.resident(seed) ? 1 : 0, b_after_tip ? 1 : 0, (unsigned long long)h[v.node].tree().best().pos,
+                (unsigned long long)h[l.node].tree().best().pos, (unsigned long long)rv.stats().rx_failures.load());
+    check(n > 0 && caught && mined_a && done.load() && a_before_tip && a_held == 0 && a_after_tip,
+          "seedrace (a): a keying released while the hold reads its residency: the job runs at that release, placed");
+    check(mined_b && !b_before_tip && b_held == 1 && b_after_tip && rv.stats().rx_failures.load() == 0
+                  && rv.strikes_of(1) == 0 && rv.stats().bans.load() == 0,
+          "seedrace (b): a job held with its seed keyed and no release runs at the next tip event, placed; no alarm, "
+          "no strike");
+}
+
+// parkretry: the relay refuses to start with park_retry_ms outside 100 .. 2000 ms; at the bounds it starts.
+void parkretry() {
+    const KatNet net;
+    const auto starts = [&net](std::uint32_t ms) {
+        Harness h(net);
+        FakeWire w;
+        try {
+            (void)kat_relay(h, w, table0(net), false, false, [ms](pb::PathbRelayOptions& o) { o.park_retry_ms = ms; });
+            return true;
+        } catch (const std::runtime_error&) {
+            return false;
+        }
+    };
+    const bool lo = starts(99), lo_ok = starts(100), hi_ok = starts(2000), hi = starts(2001), zero = starts(0);
+    std::printf("  parkretry: starts at 0 %d, 99 %d, 100 %d, 2000 %d, 2001 %d\n", zero, lo, lo_ok, hi_ok, hi);
+    check(!zero && !lo && lo_ok && hi_ok && !hi, "parkretry: the relay starts with a park retry of 100 .. 2000 ms only");
 }
 
 // seedthread: seednokey with V's keyer on its own thread: the keying and on_seed_keyed run beside the relays' pump.
@@ -18195,6 +18308,8 @@ int main(int argc, char** argv) {
                                 {"seedrulec", seedrulec, 3},
                                 {"seedkeyfail", seedkeyfail, 2},
                                 {"seedthread", seedthread, 2},
+                                {"seedrace", seedrace, 2},
+                                {"parkretry", parkretry, 0},
                                 {"seedmemo", seedmemo, 0},
                                 {"viins", viins, 1},
                                 {"viishort", viishort, 1},

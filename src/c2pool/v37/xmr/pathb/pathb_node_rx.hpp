@@ -348,7 +348,6 @@ private:
         {
             std::lock_guard<std::mutex> lk(mu_);
             pending_.erase(s);
-            busy_ = false;
             if (ok) ++st_.built;
             else ++st_.failed;
             cb = cb_;
@@ -356,6 +355,10 @@ private:
         }
         if (ok && cb) cb(s);
         if (!ok && fcb) fcb(s);
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            busy_ = false;  // after the callbacks: idle means their work is posted
+        }
         idle_cv_.notify_all();
         return ok;
     }

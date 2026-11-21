@@ -947,7 +947,11 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
         return 3;
     }
     o2::NodeRxVerifier node_rx;
-    node_rx.init(o2::node_rx_policy(cfg));
+    if (!node_rx.init(o2::node_rx_policy(cfg))) {
+        std::printf("REFUSED: the pool node's verifier needs RandomX: randomx is %s\n",
+                    o2::O2RandomXVerifier::to_string(node_rx.mode()));
+        return 3;
+    }
     std::printf("randomx: stratum %s; node %s\n", rx.describe().c_str(), node_rx.describe().c_str());
 
     // ---- the follower rows and the native Monero node ----
@@ -2353,7 +2357,7 @@ static void print_help() {
             "  --relay-ban-seconds <s>      address ban\n"
             "  --relay-verify-threads <n>   RandomX verify workers (0 = auto)\n"
             "  --relay-solicited-credits <n>  --relay-parked-max <n>\n"
-            "  --relay-park-retry-ms <ms>   a parked job's wait before its next try (default 500; >= 1)\n"
+            "  --relay-park-retry-ms <ms>   a parked job's wait before its next try (default 500; 100 .. 2000)\n"
             "  --relay-keepalive-ms <ms>    PING interval (default 5000; 0 = off)\n"
             "  --relay-silence-timeout-ms <ms>  drop a silent link (default 25000; 0 = never)\n"
             "  --relay-peer-valid-rate <r>  valid objects per peer per second (default and floor 1.7; raise only)\n"
@@ -2567,7 +2571,9 @@ int main(int argc, char** argv) {
             else if (a == "--relay-parked-max") g_relay_parked_max = static_cast<std::size_t>(u64());
             else if (a == "--relay-park-retry-ms") {
                 g_relay_park_retry_ms = u32();
-                if (*g_relay_park_retry_ms == 0) throw cs::UsageError(a + " wants an integer >= 1");
+                if (*g_relay_park_retry_ms < pb::kParkRetryMsMin || *g_relay_park_retry_ms > pb::kParkRetryMsMax)
+                    throw cs::UsageError(a + " wants an integer " + std::to_string(pb::kParkRetryMsMin) + " .. " +
+                                         std::to_string(pb::kParkRetryMsMax));
             }
             else if (a == "--relay-keepalive-ms") g_relay_keepalive_ms = u32();
             else if (a == "--relay-silence-timeout-ms") g_relay_silence_ms = u32();

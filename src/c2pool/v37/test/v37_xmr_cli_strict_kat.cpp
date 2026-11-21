@@ -222,6 +222,8 @@ void bad_rows() {
         // relay / stratum node policy
         {{"--relay-rx-global", "0"},           "--relay-rx-global",     "a global RandomX refill of 0"},
         {{"--relay-park-retry-ms", "0"},       "--relay-park-retry-ms", "a park retry of 0 ms"},
+        {{"--relay-park-retry-ms", "99"},      "--relay-park-retry-ms", "a park retry below 100 ms"},
+        {{"--relay-park-retry-ms", "2001"},    "--relay-park-retry-ms", "a park retry above 2000 ms"},
         {{"--relay-ban-seconds", "1.5"},       "--relay-ban-seconds",   "a fractional relay ban"},
         {{"--stratum-share-rate", "0"},        "--stratum-share-rate",  "a share-rate target of 0"},
         {{"--stratum-share-rate", "x"},        "--stratum-share-rate",  "a non-numeric share-rate target"},
@@ -475,7 +477,7 @@ const std::vector<FlagRow>& flag_table() {
         {"--pathb-side-keep", Cls::New, {{"4096"}, {"1"}}},
         {"--relay-peer-valid-rate", Cls::New, {{"1.7"}, {"40"}}},
         {"--relay-pending-cap", Cls::New, {{"18432"}, {"40000"}}},
-        {"--relay-park-retry-ms", Cls::New, {{"500"}, {"1"}}},
+        {"--relay-park-retry-ms", Cls::New, {{"500"}, {"100"}, {"2000"}}},
         {"--relay-send-queue-bytes", Cls::New, {{"16777216"}}},
         {"--relay-ctx-block-cap", Cls::New, {{"600051"}}},
         {"--pathb-regtest-k30", Cls::New, {{"4,8,40"}}},

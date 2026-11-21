@@ -169,7 +169,10 @@ public:
     // the third slot). true: the seed is resident.
     bool key(const Seed& seed) {
 #if defined(V37_XMR_O2_WITH_RANDOMX)
-        if (!ready()) return false;
+        if (!ready()) {
+            m_key_failed.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
         {
             std::lock_guard<std::mutex> lk(m_mu);
             if (slot_of_(seed) >= 0) return true;
@@ -185,6 +188,7 @@ public:
         return true;
 #else
         (void)seed;
+        m_key_failed.fetch_add(1, std::memory_order_relaxed);
         return false;
 #endif
     }

@@ -126,6 +126,9 @@ struct RelayClock {
 // P-40 (policy, ruling 23): the peers whose HELLO tails name the candidates before a join (two independent best-tip
 // claims); flag --join-min-peers.
 inline constexpr std::size_t kJoinMinPeersDefault = 2;
+// --relay-park-retry-ms: its bounds (ms)
+inline constexpr std::uint32_t kParkRetryMsMin = 100;
+inline constexpr std::uint32_t kParkRetryMsMax = 2000;
 
 // ---------------------------------------------------------------------------
 // Options (the generic transport values of the old relay node, kept)
@@ -457,6 +460,11 @@ public:
     bool start(std::string& why) {
         if (node_ == nullptr) {
             why = "relay: no node attached";
+            return false;
+        }
+        if (o_.park_retry_ms < kParkRetryMsMin || o_.park_retry_ms > kParkRetryMsMax) {
+            why = "relay: park retry " + std::to_string(o_.park_retry_ms) + " ms outside " + std::to_string(kParkRetryMsMin) +
+                  " .. " + std::to_string(kParkRetryMsMax) + " ms";
             return false;
         }
         if (o_.send_queue_bytes < 2 * (headers_frame_ + 4)) {
@@ -812,20 +820,17 @@ public:
         std::size_t n = 0;
         {
             std::lock_guard<std::mutex> lk(vmtx_);
-            seed_failed_.erase(seed);
             n = release_seed_held_locked(seed);
         }
         st_.seed_held_released += n;
         if (n > 0) vcv_.notify_all();
         post([this, seed] { resume_on_seed(seed); });
     }
-    // The keying of `seed` failed (the keying worker, any thread): the RandomX alarm; its held jobs wait for the next
-    // Monero tip event (on_monero_tip) or its keying.
+    // The keying of `seed` failed (the keying worker, any thread): the RandomX alarm; its held jobs run again at the
+    // next Monero tip event (on_monero_tip), which asks for the seed again.
     void on_seed_key_failed(const Hash32& seed) {
         st_.seed_key_failed++;
         rx_alarm("keying", "the seed " + hex_short(seed) + " could not be keyed");
-        std::lock_guard<std::mutex> lk(vmtx_);
-        seed_failed_.insert(seed);
     }
     // KATs: a carrier frame of `peer` held for `seed` as a job failed on it; whether a frame is held.
     void test_hold(std::uint64_t peer, const std::vector<std::uint8_t>& frame, const Hash32& seed) {
@@ -957,10 +962,9 @@ public:
             return;
         }
         std::size_t n = 0;
-        {  // the jobs held for a seed whose keying failed run once (their seeds asked again)
+        {  // every job held for a seed runs once: keyed now, it runs; not keyed, it is held again and its seed asked
             std::lock_guard<std::mutex> lk(vmtx_);
-            n = release_seed_held_locked(std::nullopt);
-            seed_failed_.clear();
+            n = release_all_seed_held_locked();
         }
         st_.seed_held_released += n;
         if (n > 0) vcv_.notify_all();
@@ -2000,14 +2004,14 @@ private:
         return std::nullopt;
     }
     // The jobs waiting for a seed's keying, by seed, under one cap for the whole set (parked_max); when it is full the
-    // source with the most jobs loses its oldest. They run again when their seed is keyed (on_seed_keyed), after a
-    // failed keying at the next Monero tip event (on_monero_tip), and at once when the seed is keyed already.
+    // source with the most jobs loses its oldest. They run again when their seed is keyed (on_seed_keyed), at once
+    // when it is keyed already (read under vmtx_, which on_seed_keyed takes after the keying is installed), and all
+    // of them at each Monero tip event (on_monero_tip).
     void hold_by_seed(Job j, const Hash32& seed) {
         st_.rx_not_keyed++;
-        const bool keyed = seed_resident_ && seed_resident_(seed);
         {
             std::lock_guard<std::mutex> lk(vmtx_);
-            if (keyed && seed_failed_.count(seed) == 0) {  // keyed meanwhile: runs now
+            if (seed_resident_ && seed_resident_(seed)) {  // keyed meanwhile: runs now
                 vq_.push_back(std::move(j));
             } else if (o_.parked_max == 0) {
                 st_.queue_dropped++;
@@ -2044,11 +2048,24 @@ private:
         st_.seed_held_evicted++;
         st_.queue_dropped++;
     }
-    // Into the verify queue: every job held for `seed`, or (nullopt) every job held for a seed whose keying failed.
-    std::size_t release_seed_held_locked(const std::optional<Hash32>& seed) {
+    // Into the verify queue: every job held for any seed.
+    std::size_t release_all_seed_held_locked() {
+        std::size_t n = 0;
+        for (auto& [s, dq] : seed_held_)
+            for (SeedHeld& h : dq) {
+                vq_.push_front(std::move(h.job));
+                ++n;
+            }
+        seed_held_.clear();
+        seed_src_.clear();
+        seed_held_n_ = 0;
+        return n;
+    }
+    // Into the verify queue: every job held for `seed`.
+    std::size_t release_seed_held_locked(const Hash32& seed) {
         std::size_t n = 0;
         for (auto s = seed_held_.begin(); s != seed_held_.end();) {
-            if (seed ? s->first != *seed : seed_failed_.count(s->first) == 0) {
+            if (s->first != seed) {
                 ++s;
                 continue;
             }
@@ -3208,7 +3225,7 @@ private:
         if (kept_due_.load()) kept_locked();
     }
     // E-193: the node holds no frame this relay received and has not given it to judge (an owner event of a frame,
-    // a verify job queued, parked for a token or running).
+    // a verify job queued, parked for a token, held for a seed's keying or running).
     bool inbound_idle() const {
         if (rx_events_.load() != 0) return false;
         std::lock_guard<std::mutex> lk(vmtx_);
@@ -4956,7 +4973,6 @@ private:
     std::map<std::uint64_t, std::deque<std::pair<std::uint64_t, Hash32>>> seed_src_;  // per source: (seq, seed), oldest first
     std::size_t seed_held_n_ = 0;
     std::uint64_t seed_seq_ = 0;
-    std::set<Hash32> seed_failed_;                                                   // under vmtx_
     std::function<bool(const Hash32&)> seed_resident_;
     std::mutex nkmtx_;                                     // fold_wait_, join_wait_seed_ (a leaf lock)
     std::map<std::uint64_t, Hash32> fold_wait_;            // a catch-up comparison stopped on a seed not keyed
