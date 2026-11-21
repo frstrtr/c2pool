@@ -1573,11 +1573,13 @@ public:
     void on_new_tip(uint32_t prev_height, const uint256& prev_hash,
                     uint32_t bits_for_next, uint32_t mtp_at_tip,
                     uint8_t address_version, uint8_t address_p2sh_version,
-                    uint32_t curtime = 0, uint32_t version = 0) {
+                    uint32_t curtime = 0, uint32_t version = 0,
+                    bool mtp_window_complete = true) {
         m_hdr_prev_height          = prev_height;
         m_hdr_prev_hash            = prev_hash;
         m_hdr_bits_for_next        = bits_for_next;
         m_hdr_mtp_at_tip           = mtp_at_tip;
+        m_hdr_mtp_window_complete  = mtp_window_complete;
         m_hdr_address_version      = address_version;
         m_hdr_address_p2sh_version = address_p2sh_version;
         m_hdr_curtime              = curtime;
@@ -3234,6 +3236,7 @@ private:
         m_prev_hash            = m_hdr_prev_hash;
         m_bits_for_next        = m_hdr_bits_for_next;
         m_mtp_at_tip           = m_hdr_mtp_at_tip;
+        m_mtp_window_complete  = m_hdr_mtp_window_complete;
         m_address_version      = m_hdr_address_version;
         m_address_p2sh_version = m_hdr_address_p2sh_version;
         m_curtime              = m_hdr_curtime;
@@ -3447,7 +3450,7 @@ private:
         if (m_have_tip && m_have_mn)
             m_state.set_tip(m_prev_height, m_prev_hash, m_bits_for_next,
                             m_mtp_at_tip, m_address_version, m_address_p2sh_version,
-                            m_curtime, m_version);
+                            m_curtime, m_version, m_mtp_window_complete);
         // DASHBOARD ONLY: publish the header-tip work bits for the daemonless
         // network-difficulty graph feed. Runs on the coin-p2p io thread; the
         // web/think thread reads it via published_bits_for_next() (atomic). Does
@@ -3594,6 +3597,7 @@ private:
     uint256  m_prev_hash;
     uint32_t m_bits_for_next{0};
     uint32_t m_mtp_at_tip{0};
+    bool     m_mtp_window_complete{true};
     uint8_t  m_address_version{0};
     uint8_t  m_address_p2sh_version{0};
     uint32_t m_curtime{0};
@@ -3613,6 +3617,7 @@ private:
     uint256  m_hdr_prev_hash;
     uint32_t m_hdr_bits_for_next{0};
     uint32_t m_hdr_mtp_at_tip{0};
+    bool     m_hdr_mtp_window_complete{true};
     uint8_t  m_hdr_address_version{0};
     uint8_t  m_hdr_address_p2sh_version{0};
     uint32_t m_hdr_curtime{0};

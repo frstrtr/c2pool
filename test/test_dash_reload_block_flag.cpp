@@ -22,6 +22,7 @@
 
 #include <impl/dash/dashboard_views.hpp>
 
+#include <functional>
 #include <mutex>
 #include <optional>
 
@@ -129,11 +130,18 @@ struct VerifiedFire
     uint256 oracle_prev;
     int64_t oracle_time = 0;
     bool flagged = false;
+    bool verified = false;
     uint256 header_prev;
     uint32_t header_time = 0;
+    int floor_calls = 0;
+    uint256 floor_prev;
 };
 
-VerifiedFire verify_block_share_with_oracle(const char* dir, std::optional<uint32_t> answer)
+// `floor_of` (optional) binds the time-floor oracle: it gets the share's header
+// time and returns the floor to answer with.
+VerifiedFire verify_block_share_with_oracle(
+    const char* dir, std::optional<uint32_t> answer,
+    std::function<std::optional<uint32_t>(uint32_t header_time)> floor_of = {})
 {
     IdentityGuard guard;
     DataDirGuard dd(dir);
@@ -162,6 +170,15 @@ VerifiedFire verify_block_share_with_oracle(const char* dir, std::optional<uint3
         if (h == hg)
             ++r.fired;
     };
+    if (floor_of) {
+        n.node->tracker().m_block_time_floor =
+            [&](const uint256& prev) -> std::optional<uint32_t> {
+                std::lock_guard<std::mutex> lk(m);
+                ++r.floor_calls;
+                r.floor_prev = prev;
+                return floor_of(r.header_time);
+            };
+    }
     n.receive({{36, wire_of(gen.share)}});
     EXPECT_TRUE(n.pump_until([&](dash::ShareTracker& t) { return t.chain.contains(hg); }));
     auto& t = n.quiesce();
@@ -172,6 +189,7 @@ VerifiedFire verify_block_share_with_oracle(const char* dir, std::optional<uint3
     if (!t.verified.contains(hg))
         EXPECT_TRUE(t.attempt_verify(hg));
     EXPECT_TRUE(t.verified.contains(hg));
+    r.verified = t.verified.contains(hg);
     r.flagged = t.chain.contains(hg) && t.chain.get_index(hg)->is_block_solution;
     return r;
 }
@@ -202,4 +220,41 @@ TEST(DashReloadBlockFlag, AVerifiedBlockOnAParentTheOracleCannotAnswerDoesNotFir
     EXPECT_GE(r.oracle_calls, 1);
     EXPECT_EQ(r.fired, 0) << "nothing to check the bits against: not relayed from this node";
     EXPECT_TRUE(r.flagged);
+}
+
+// The time floor on the verify path: with the bits right, a header time at or
+// below the parent's median-time-past is not relayed, and the share itself is
+// still verified, in the chain and flagged (it keeps its PPLNS credit).
+TEST(DashReloadBlockFlag, AVerifiedBlockAtTheTimeFloorFires)
+{
+    const auto r = verify_block_share_with_oracle(
+        "c2pool_dash_found_time_at_floor", EASY_BITS,
+        [](uint32_t t) -> std::optional<uint32_t> { return t; });
+    EXPECT_GE(r.fired, 1) << "header time == MTP + 1: the found-block hook fires";
+    EXPECT_GE(r.floor_calls, 1);
+    EXPECT_EQ(r.floor_prev, r.header_prev) << "the floor is asked for the share's parent block";
+}
+
+// A peer's share (received over the share-chain wire) whose block time is at or
+// below the parent's known median-time-past: not relayed; the share stays.
+TEST(DashReloadBlockFlag, AVerifiedBlockBelowTheTimeFloorDoesNotFireAndTheShareStays)
+{
+    const auto r = verify_block_share_with_oracle(
+        "c2pool_dash_found_time_below_floor", EASY_BITS,
+        [](uint32_t t) -> std::optional<uint32_t> { return t + 1; });
+    EXPECT_GE(r.floor_calls, 1);
+    EXPECT_EQ(r.fired, 0) << "a time-too-old block must be neither recorded nor relayed";
+    EXPECT_TRUE(r.verified) << "the share itself is accepted";
+    EXPECT_TRUE(r.flagged) << "and keeps its block flag";
+}
+
+// Only a KNOWN floor refuses: with the bits right, an unknown floor fires.
+TEST(DashReloadBlockFlag, AVerifiedBlockWithAnUnknownTimeFloorFires)
+{
+    const auto r = verify_block_share_with_oracle(
+        "c2pool_dash_found_time_unknown_floor", EASY_BITS,
+        [](uint32_t) -> std::optional<uint32_t> { return std::nullopt; });
+    EXPECT_GE(r.floor_calls, 1);
+    EXPECT_GE(r.fired, 1) << "an unknown floor does not refuse";
+    EXPECT_TRUE(r.verified);
 }

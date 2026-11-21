@@ -55,7 +55,7 @@ wire_tip_ingest(::dash::interfaces::Node& node,
         {
             maint.on_new_tip(t.prev_height, t.prev_hash, t.bits_for_next,
                              t.mtp_at_tip, t.address_version, t.address_p2sh_version,
-                             t.curtime, t.version);
+                             t.curtime, t.version, t.mtp_window_complete);
         });
 }
 
