@@ -153,7 +153,9 @@ inline BlockBroadcast broadcast_won_block(const P2pRelaySink& p2p_relay,
     // (no rpc_submit) falls through to the relay-first path below unchanged --
     // the relay is then the only route to the network.
     if (prefer_rpc_first && rpc_submit) {
-        // ARM B first: the local dashd validates the block.
+        // ARM B first: the local dashd validates the block. A THROW is no
+        // verdict (dashd unreachable / timed out), unlike a REJECTION.
+        bool rpc_threw = false;
         try {
             r.rpc_ok = rpc_submit(block_hex);
             if (r.rpc_ok) r.landed_first = "rpc";
@@ -161,27 +163,36 @@ inline BlockBroadcast broadcast_won_block(const P2pRelaySink& p2p_relay,
                      << (r.rpc_ok ? "ACCEPTED" : "REJECTED")
                      << " -- local dashd is the authority at the block's real height.";
         } catch (const std::exception& e) {
+            rpc_threw = true;
             LOG_ERROR << "[EMB-DASH] height-race won-block: RPC-first submitblock threw ("
-                      << e.what() << ") -- treating as no-ack; NOT relaying to peers.";
+                      << e.what() << ") -- no verdict; falling back to the embedded P2P relay.";
         } catch (...) {
+            rpc_threw = true;
             LOG_ERROR << "[EMB-DASH] height-race won-block: RPC-first submitblock threw "
-                         "(non-std) -- treating as no-ack; NOT relaying to peers.";
+                         "(non-std) -- no verdict; falling back to the embedded P2P relay.";
         }
 
-        // ARM A only when dashd ACCEPTED: never relay an unvalidated/rejected
-        // race block to a coin-P2P peer (avoids DoS-scoring/ban of our identity).
-        if (r.rpc_ok && p2p_relay) {
+        // ARM A when dashd ACCEPTED, or when dashd gave NO verdict (threw): our
+        // own won block must not depend on a reachable dashd, and the relay is
+        // then its only route to the network (as on a daemonless node). A
+        // REJECTION is a verdict: the block is invalid at its real height and is
+        // never relayed to a coin-P2P peer (no peer-ban exposure).
+        if ((r.rpc_ok || rpc_threw) && p2p_relay) {
             try {
                 const bool relayed = p2p_relay(block_bytes);
                 if (relayed) {
                     r.p2p_sent = true;
-                    LOG_INFO << "[EMB-DASH] height-race won-block: dashd-accepted, "
-                                "embedded P2P relay issued (" << block_bytes.size()
+                    if (!r.rpc_ok) r.landed_first = "p2p";
+                    LOG_INFO << "[EMB-DASH] height-race won-block: "
+                             << (r.rpc_ok ? "dashd-accepted" : "dashd unreachable")
+                             << ", embedded P2P relay issued (" << block_bytes.size()
                              << " bytes) -- racing the network.";
                 } else {
-                    LOG_WARNING << "[EMB-DASH] height-race won-block: dashd-accepted but "
-                                   "embedded P2P relay NOT sent (peer not "
-                                   "connected/handshaked) -- dashd already carries it.";
+                    LOG_WARNING << "[EMB-DASH] height-race won-block: "
+                                << (r.rpc_ok ? "dashd-accepted" : "dashd unreachable")
+                                << " but embedded P2P relay NOT sent (peer not "
+                                   "connected/handshaked)"
+                                << (r.rpc_ok ? " -- dashd already carries it." : ".");
                 }
             } catch (const std::exception& e) {
                 LOG_ERROR << "[EMB-DASH] height-race won-block: P2P relay threw ("
