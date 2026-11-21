@@ -301,6 +301,32 @@ TEST(DashWonBlockDualPath, HeightRaceRejectedByDashdIsNotRelayedToPeers)
     EXPECT_STREQ(r.landed_first, "none");
 }
 
+// 9b) HEIGHT-RACE, DASHD UNREACHABLE: the RPC-first submit THROWS (no verdict,
+//     unlike a rejection). Our own won block must not depend on a reachable
+//     dashd: the coin-P2P relay carries it, as on a daemonless node.
+TEST(DashWonBlockDualPath, HeightRaceDashdUnreachableFallsBackToRelay)
+{
+    const auto block = make_block_bytes();
+    const std::string block_hex = to_hex(block);
+
+    RpcSubmitSink rpc = [&](const std::string&) -> bool {
+        throw std::runtime_error("dashd RPC: connection refused");
+    };
+    std::vector<unsigned char> relayed;
+    P2pRelaySink p2p = [&](const std::vector<unsigned char>& b) -> bool {
+        relayed = b; return true;
+    };
+
+    const auto r = broadcast_won_block(p2p, rpc, block, block_hex,
+                                       /*prefer_rpc_first=*/true);
+
+    EXPECT_FALSE(r.rpc_ok);
+    EXPECT_TRUE(r.p2p_sent) << "no dashd verdict: the relay is the block's route out";
+    EXPECT_EQ(relayed, block);
+    EXPECT_STREQ(r.landed_first, "p2p");
+    EXPECT_TRUE(r.any());
+}
+
 // 10) HEIGHT-RACE DAEMONLESS: no RPC arm to validate against, so the RPC-first
 //     gate does NOT apply -- ARM A relays anyway (it is the ONLY route to the
 //     network; dropping a winnable block would be a guaranteed loss).
