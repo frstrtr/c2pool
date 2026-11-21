@@ -22,6 +22,9 @@
 
 #include <impl/dash/dashboard_views.hpp>
 
+#include <mutex>
+#include <optional>
+
 namespace {
 
 // A v36 share that is also a block: its header carries the share's own easy
@@ -109,4 +112,94 @@ TEST(DashReloadBlockFlag, AReloadedBlockSolutionKeepsItsFlagAndFiresNoEvent)
     node->hold_think_slot(false);
     node->shutdown_persistence();
     node.reset();
+}
+
+// The verify path fires the found-block hook (which records and relays the
+// block) only for header bits the coin network accepts after the share's
+// parent, once main_dash's header-chain oracle (m_expected_block_bits) is
+// bound. The share keeps its block flag either way. Head scoring asks the
+// same oracle for a block-solving head, so the oracle-call assertions only
+// pin what it is asked; `fired` is what proves the gate.
+namespace {
+
+struct VerifiedFire
+{
+    int fired = 0;
+    int oracle_calls = 0;
+    uint256 oracle_prev;
+    int64_t oracle_time = 0;
+    bool flagged = false;
+    uint256 header_prev;
+    uint32_t header_time = 0;
+};
+
+VerifiedFire verify_block_share_with_oracle(const char* dir, std::optional<uint32_t> answer)
+{
+    IdentityGuard guard;
+    DataDirGuard dd(dir);
+    const auto p = iso_params(36);
+    const std::string sub = SharechainConfig::data_subdir(false);
+
+    dash::ShareChain scratch;
+    const auto gen = mine_v36_block(scratch, p, info(uint256(), 1, 0xaa, 36));
+    const uint256 hg = gen.share.m_hash;
+
+    VerifiedFire r;
+    r.header_prev = gen.share.m_min_header.m_previous_block;
+    r.header_time = gen.share.m_min_header.m_timestamp;
+    std::mutex m;   // the hook and the oracle run on the verify/compute threads
+    LiveNode n(p, sub);
+    n.node->tracker().m_expected_block_bits =
+        [&](const uint256& prev, int64_t time) -> std::optional<uint32_t> {
+            std::lock_guard<std::mutex> lk(m);
+            ++r.oracle_calls;
+            r.oracle_prev = prev;
+            r.oracle_time = time;
+            return answer;
+        };
+    n.node->tracker().m_on_block_found = [&](const uint256& h) {
+        std::lock_guard<std::mutex> lk(m);
+        if (h == hg)
+            ++r.fired;
+    };
+    n.receive({{36, wire_of(gen.share)}});
+    EXPECT_TRUE(n.pump_until([&](dash::ShareTracker& t) { return t.chain.contains(hg); }));
+    auto& t = n.quiesce();
+    if (!t.chain.contains(hg)) {
+        ADD_FAILURE() << "the block share never reached the chain";
+        return r;
+    }
+    if (!t.verified.contains(hg))
+        EXPECT_TRUE(t.attempt_verify(hg));
+    EXPECT_TRUE(t.verified.contains(hg));
+    r.flagged = t.chain.contains(hg) && t.chain.get_index(hg)->is_block_solution;
+    return r;
+}
+
+} // namespace
+
+TEST(DashReloadBlockFlag, AVerifiedBlockAtTheNetworksBitsFires)
+{
+    const auto r = verify_block_share_with_oracle("c2pool_dash_found_bits_match", EASY_BITS);
+    EXPECT_GE(r.fired, 1) << "header bits equal the network's: the found-block hook fires";
+    EXPECT_TRUE(r.flagged);
+    EXPECT_GE(r.oracle_calls, 1);
+    EXPECT_EQ(r.oracle_prev, r.header_prev) << "the oracle is asked about the share's parent block";
+    EXPECT_EQ(r.oracle_time, static_cast<int64_t>(r.header_time)) << "...at the share's header time";
+}
+
+TEST(DashReloadBlockFlag, AVerifiedBlockAtOtherThanTheNetworksBitsDoesNotFire)
+{
+    const auto r = verify_block_share_with_oracle("c2pool_dash_found_bits_mismatch", 0x1b0404cbu);
+    EXPECT_GE(r.oracle_calls, 1);
+    EXPECT_EQ(r.fired, 0) << "a block the network rejects must be neither recorded nor relayed";
+    EXPECT_TRUE(r.flagged) << "the share keeps its block flag; head scoring checks bits on its own";
+}
+
+TEST(DashReloadBlockFlag, AVerifiedBlockOnAParentTheOracleCannotAnswerDoesNotFire)
+{
+    const auto r = verify_block_share_with_oracle("c2pool_dash_found_bits_unknown", std::nullopt);
+    EXPECT_GE(r.oracle_calls, 1);
+    EXPECT_EQ(r.fired, 0) << "nothing to check the bits against: not relayed from this node";
+    EXPECT_TRUE(r.flagged);
 }
