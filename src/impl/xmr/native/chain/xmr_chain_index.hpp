@@ -3678,6 +3678,32 @@ private:
         }
         if (r.bad) { why = "snapshot is truncated"; return false; }
 
+        // --- validate fully, before anything changes ------------------------------------
+        // Every test the install below applies, run on the image and a scratch consensus
+        // state: a refusal returns with the index as it was (no reset, no event, no row sink).
+        std::vector<RowRecord> all = below;
+        all.push_back(base);
+        if (!RowStore::contiguous(all)) { why = "snapshot rows are not contiguous"; return false; }
+        {
+            ConsensusState dry = view_.state();
+            dry.seed_direct(base.row, dwin, st, lt, ts);
+            for (const Above& a : above) {
+                EvaluatedBlock ev;
+                std::string    w;
+                if (evaluate_block(a.entry, ev, w) != EvalStatus::Ok) {
+                    why = "a snapshotted block no longer evaluates: " + w;
+                    return false;
+                }
+                ev.input.pow_verified = a.pow;
+                ChainRow    row;
+                ConnectUndo undo;
+                if (dry.connect(ev.input, /*now=*/0, row, undo, w) != ConnectStatus::Ok) {
+                    why = "a snapshotted block no longer connects: " + w;
+                    return false;
+                }
+            }
+        }
+
         // --- install ------------------------------------------------------------------
         reset_locked_();
         // COLD-BOOT-4: the tail comes back, and every row the install / replay
@@ -3687,9 +3713,10 @@ private:
         bound_booking_tail_locked_();
         struct LoadingFlag { bool& f; explicit LoadingFlag(bool& x) : f(x) { f = true; } ~LoadingFlag() { f = false; } } loading(tail_loading_);
         view_.seed_direct(base.row, dwin, st, lt, ts, seeds);
-        std::vector<RowRecord> all = below;
-        all.push_back(base);
-        if (!rows_.install(all)) { why = "snapshot rows are not contiguous"; return false; }
+        if (!rows_.install(all)) {
+            why = "internal invariant failure: snapshot rows are not contiguous after the pre-check passed";
+            return false;
+        }
         for (const auto& s : seeds) rows_.remember_seed_anchor(s.first, s.second);
         rows_.seed_pre_window(base.row.height, dwin);
         seed_long_mirror_(lt);
@@ -3701,13 +3728,15 @@ private:
             EvaluatedBlock ev;
             std::string    w;
             if (evaluate_block(a.entry, ev, w) != EvalStatus::Ok) {
-                why = "a snapshotted block no longer evaluates: " + w;
+                why = "internal invariant failure: a snapshotted block no longer evaluates after the pre-check passed: "
+                    + w;
                 return false;
             }
             const ChainStateView::ConnectOutcome co =
                 view_.connect(a.entry, a.pow, /*now=*/0, a.own, w);
             if (!co.ok) {
-                why = "a snapshotted block no longer connects: " + w;
+                why = "internal invariant failure: a snapshotted block no longer connects after the pre-check passed: "
+                    + w;
                 return false;
             }
             rows_.push(co.row, a.own, a.pow_hash);
