@@ -327,19 +327,93 @@ public:
         std::lock_guard<std::mutex> lock(m_mutex);
         return m_recent_chain_spend_blocks.size();
     }
-    /// How many chain-coin proofs have been asked for (any answer). The emit
-    /// gate samples it around the provider fold: a fold that consulted the
-    /// chain-coin view depends on state that can move without a new tip or a
-    /// list write (the recent-spend ring, the UTXO view, the replay fold), so
-    /// its root is not memoized (node_coin_state.hpp, folded-root memo).
+    /// How many chain-coin proofs have been asked for (any answer). A
+    /// diagnostic counter (and a KAT probe that a fold really consulted the
+    /// chain-coin view); the folded-root memo keys on the recorded ANSWERS
+    /// instead (ChainCoinRecorder below).
     uint64_t chain_coin_proofs() const
     {
         return m_chain_coin_proofs.load(std::memory_order_relaxed);
     }
+
+    /// One prove_chain_coin answer: the outpoint asked, the proof, and the
+    /// coin (Unspent only; a default coin otherwise).
+    struct ChainCoinAnswer {
+        ::core::coin::Outpoint op;
+        CoinProof              proof{CoinProof::Unknown};
+        ::core::coin::Coin     coin;
+    };
+
+    /// Records every prove_chain_coin answer given ON THIS THREAD while the
+    /// recorder is alive (nested recorders restore the outer one).
+    ///
+    /// The P-2 folded-root memo (node_coin_state.hpp) needs it. Some provider
+    /// txs make the fold ask the chain-coin view (a ProRegTx reusing an
+    /// existing coin as its collateral; a ProUpRegTx, whose Dash Core check
+    /// reads its masternode's collateral): the recent-spend ring, the UTXO view
+    /// and the replay fold. Those move without a new tip or a list write, so
+    /// the memo key alone cannot tell a stale root from a good one. Instead of
+    /// tracking every way those three can change, the memo stores the answers
+    /// the fold got and, on a hit, asks the same outpoints again
+    /// (chain_coin_answers_unchanged): the fold is a function of the list
+    /// state (keyed), the body (keyed) and these answers, so identical answers
+    /// mean an identical root. Thread-local: selection on another thread asks
+    /// the same view without landing in this record.
+    class ChainCoinRecorder {
+    public:
+        explicit ChainCoinRecorder(std::vector<ChainCoinAnswer>& out)
+            : m_prev(recorder_slot())
+        {
+            recorder_slot() = &out;
+        }
+        ~ChainCoinRecorder() { recorder_slot() = m_prev; }
+        ChainCoinRecorder(const ChainCoinRecorder&) = delete;
+        ChainCoinRecorder& operator=(const ChainCoinRecorder&) = delete;
+
+    private:
+        std::vector<ChainCoinAnswer>* m_prev;
+    };
+
+    /// Ask each recorded outpoint again; true iff every answer (proof, and for
+    /// Unspent the whole coin) is the same as recorded. Not counted in
+    /// chain_coin_proofs() and never recorded.
+    bool chain_coin_answers_unchanged(const std::vector<ChainCoinAnswer>& answers) const
+    {
+        for (const auto& a : answers) {
+            ::core::coin::Coin c;
+            const CoinProof p = prove_chain_coin_uncounted(a.op, c);
+            if (p != a.proof) return false;
+            if (p == CoinProof::Unspent
+                && !(c.value == a.coin.value
+                     && c.scriptPubKey.m_data == a.coin.scriptPubKey.m_data
+                     && c.height == a.coin.height
+                     && c.coinbase == a.coin.coinbase
+                     && c.pegout == a.coin.pegout))
+                return false;
+        }
+        return true;
+    }
+
     CoinProof prove_chain_coin(const ::core::coin::Outpoint& op,
                                ::core::coin::Coin& out) const
     {
         m_chain_coin_proofs.fetch_add(1, std::memory_order_relaxed);
+        const CoinProof p = prove_chain_coin_uncounted(op, out);
+        if (auto* rec = recorder_slot())
+            rec->push_back(ChainCoinAnswer{op, p, p == CoinProof::Unspent ? out : ::core::coin::Coin{}});
+        return p;
+    }
+
+private:
+    static std::vector<ChainCoinAnswer>*& recorder_slot()
+    {
+        static thread_local std::vector<ChainCoinAnswer>* slot = nullptr;
+        return slot;
+    }
+
+    CoinProof prove_chain_coin_uncounted(const ::core::coin::Outpoint& op,
+                                         ::core::coin::Coin& out) const
+    {
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             if (m_recent_chain_spends.count({op.txid, op.index}))
@@ -360,6 +434,7 @@ public:
         return CoinProof::Unknown;
     }
 
+public:
     /// blockmintxfee-equivalent knob (dashd -blockmintxfee / BlockAssembler
     /// Options::blockMinFeeRate, miner.cpp:100). Sets the min ancestor-package
     /// feerate in duffs/kB used by the blockMinFeeRate early-return in

@@ -2090,12 +2090,16 @@ public:
             //   - pose_bans: the exact ban list applied before the fold;
             //   - the body's txids in order: the special txs the fold applies
             //     and any in-body collateral they reference.
-            // NOT in the key: the chain-coin view behind collateral proofs
-            // (Mempool::prove_chain_coin: the recent-spend ring, the UTXO
-            // view, the replay fold). It can move without a new tip or a list
-            // write, so a fold that consulted it is NOT memoized (its root is
-            // used for this evaluation only); that is the rare body carrying
-            // a provider tx with an external collateral.
+            //   - the chain-coin ANSWERS the fold got (Mempool::
+            //     prove_chain_coin: the recent-spend ring, the UTXO view, the
+            //     replay fold). That view moves without a new tip or a list
+            //     write, so a hit re-asks every recorded outpoint and needs
+            //     the same answer (Mempool::chain_coin_answers_unchanged). A
+            //     body whose provider txs read no chain coin records none, so
+            //     the check is free; one that does (a ProRegTx reusing an
+            //     external collateral, a ProUpRegTx: Dash Core's check reads
+            //     its masternode's collateral) costs a few map and view
+            //     lookups instead of the projection, fold and root.
             // The builder's txids are used when they line up with the body
             // (same rule as the parent-topology check above). PRECONDITION:
             // every producer that reaches this gate pushes dash_txid(tx) in
@@ -2120,9 +2124,15 @@ public:
                   && m_fold_root_memo_prev == m_prev_hash
                   && m_fold_root_memo_v24 == v24_next
                   && m_fold_root_memo_bans == pose_bans
-                  && body_matches())) {
+                  && body_matches()
+                  && m_mempool.chain_coin_answers_unchanged(m_fold_root_memo_coins))) {
                 m_fold_root_memo_valid = false;   // no half-written key can hit
                 ++m_fold_root_computes;
+                // Every chain-coin answer from here to the fold's end lands in
+                // coin_answers (this thread only).
+                std::vector<Mempool::ChainCoinAnswer> coin_answers;
+                std::optional<Mempool::ChainCoinRecorder> recorder;
+                recorder.emplace(coin_answers);
                 auto proj = project_sml_confirmations(m_sml, m_prev_height,
                                                       m_prev_hash, m_mnstates,
                                                       m_mn_min_confirmations);
@@ -2139,13 +2149,13 @@ public:
                     m_protx_sig_verifier ? &m_protx_sig_verifier : nullptr,
                     m_protx_check_env ? &*m_protx_check_env : nullptr, next_h,
                     v24_next);
-                const uint64_t coin_proofs_before = m_mempool.chain_coin_proofs();
                 auto fold = fold_mn_special_txs(
                     proj.sml, w.m_txs,
                     [](const Transaction& t) {
                         return dash::coin::dash_txid(MutableTransaction(t));
                     },
                     fold_ctx);
+                recorder.reset();
                 if (!fold.clean())
                     return reject("emit-mnlist-fold-refused",
                                   std::to_string(fold.refused)
@@ -2153,29 +2163,23 @@ public:
                                              ? std::string()
                                              : ":" + fold.refused_reasons.front()),
                                   "0-refused");
-                const uint256 folded = fold.sml.CalcMerkleRoot();
-                if (m_mempool.chain_coin_proofs() != coin_proofs_before) {
-                    // The fold read the chain-coin view: use this root for
-                    // this evaluation only (see the key note above).
-                    expected_mn_root = folded;
+                m_fold_root_memo       = fold.sml.CalcMerkleRoot();
+                m_fold_root_memo_epoch = m_root_memo_epoch;
+                m_fold_root_memo_prev  = m_prev_hash;
+                m_fold_root_memo_v24   = v24_next;
+                m_fold_root_memo_bans  = pose_bans;
+                m_fold_root_memo_coins = std::move(coin_answers);
+                if (ids_aligned) {
+                    m_fold_root_memo_body = w.m_tx_hashes;
                 } else {
-                    m_fold_root_memo       = folded;
-                    m_fold_root_memo_epoch = m_root_memo_epoch;
-                    m_fold_root_memo_prev  = m_prev_hash;
-                    m_fold_root_memo_v24   = v24_next;
-                    m_fold_root_memo_bans  = pose_bans;
-                    if (ids_aligned) {
-                        m_fold_root_memo_body = w.m_tx_hashes;
-                    } else {
-                        m_fold_root_memo_body.clear();
-                        m_fold_root_memo_body.reserve(w.m_txs.size());
-                        for (const auto& t : w.m_txs)
-                            m_fold_root_memo_body.push_back(
-                                dash::coin::dash_txid(MutableTransaction(t)));
-                    }
-                    m_fold_root_memo_valid = true;
-                    expected_mn_root = m_fold_root_memo;
+                    m_fold_root_memo_body.clear();
+                    m_fold_root_memo_body.reserve(w.m_txs.size());
+                    for (const auto& t : w.m_txs)
+                        m_fold_root_memo_body.push_back(
+                            dash::coin::dash_txid(MutableTransaction(t)));
                 }
+                m_fold_root_memo_valid = true;
+                expected_mn_root = m_fold_root_memo;
             } else {
                 expected_mn_root = m_fold_root_memo;
             }
@@ -3033,6 +3037,8 @@ private:
     mutable bool                 m_fold_root_memo_v24{false};
     mutable std::vector<uint256> m_fold_root_memo_bans;
     mutable std::vector<uint256> m_fold_root_memo_body;
+    // The chain-coin answers the memoized fold got; re-asked on every hit.
+    mutable std::vector<Mempool::ChainCoinAnswer> m_fold_root_memo_coins;
     mutable uint256              m_fold_root_memo;
     mutable uint64_t             m_fold_root_computes{0};   // misses (test/diag)
     mutable bool     m_quorum_root_memo_valid{false};
