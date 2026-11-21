@@ -415,6 +415,14 @@ if (BUILD_TESTING AND GTest_FOUND)
     # (P2SH, P2WPKH, P2WSH, P2TR; never P2PKH of a script hash, never the zero
     # key) and the outputs add up to the subsidy. Same folding rule.
     #
+    # fill_budget_kat_test.cpp: G2 fill-budget token bucket (underfill ramp, port
+    # of p2pool-merged-v36 fillbudget.py) -- grant() is a pure read, settle() the
+    # one debit, floor = legacy 50 kB in every state. Same folding rule.
+    #
+    # fill_budget_runtime_kat_test.cpp: G2 runtime owner (EmbeddedCoinNode) --
+    # grant per work event, settle on share FOUND, reset on parent change, ramp
+    # back above the floor; settle key == core ShareCreationParams branch.
+    #
     # head_score_block_solution_test.cpp: think() head selection as in
     # p2pool-merged-v36 (data.py:1690-1696, 2933-2967): a head whose share
     # solved an LTC block is punish -1, one share of work ahead of an
@@ -484,6 +492,8 @@ if (BUILD_TESTING AND GTest_FOUND)
         doge_utxo_lane_test.cpp
         emergency_decay_overflow_test.cpp
         f11_donation_invariance_test.cpp
+        fill_budget_kat_test.cpp
+        fill_budget_runtime_kat_test.cpp
         found_block_peer_txid_test.cpp
         found_block_verify_test.cpp
         found_block_wiring_test.cpp
