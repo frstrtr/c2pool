@@ -164,6 +164,7 @@ struct PathbRelayOptions {
     std::size_t verify_threads = 1;
     std::size_t verify_queue_max = 4096;
     std::size_t parked_max = kRuledLaneParams.open_bins * (1 + kRuledLaneParams.r_max);  // --relay-parked-max
+    std::uint32_t park_retry_ms = 500;  // --relay-park-retry-ms: a parked job's wait before its next try
     // liveness (0: no PING sent or answered, no silence timeout)
     std::uint32_t keepalive_ms = 5000;
     std::uint32_t silence_timeout_ms = 25000;
@@ -233,7 +234,7 @@ struct PathbRelayStats {
     std::atomic<std::uint64_t> owner_queue_hwm{0}, owner_waits{0};  // the owner's event queue: high-water mark; reader waits
     std::atomic<std::uint64_t> stale_events{0}, reoffer_paused{0}, p15_drops{0}, p15_counted{0}, rx_failures{0};
     // RandomX on a seed not keyed (no alarm): the jobs held by seed, run again when it is keyed, evicted at the cap
-    std::atomic<std::uint64_t> rx_not_keyed{0}, seed_held_released{0}, seed_held_evicted{0};
+    std::atomic<std::uint64_t> rx_not_keyed{0}, seed_held_released{0}, seed_held_evicted{0}, seed_key_failed{0};
     std::atomic<std::uint64_t> tip_header_requests{0}, body_set_requests{0}, body_sets{0}, walk_placed{0};
     std::atomic<std::uint64_t> headers_ctx_deferred{0}, headers_ctx_reasks{0};  // header replies deferred on a P_r; asked again
     // replies to header requests retired at P-53, DROPped; header requests merged with an equal one in flight or waiting
@@ -688,6 +689,10 @@ public:
             peers_.erase(p);
             up_done_.erase(p);
         }
+        {
+            std::lock_guard<std::mutex> lk(nkmtx_);
+            fold_wait_.erase(p);
+        }
         on_peer_down(p, src != 0 ? src : p);
     }
 
@@ -799,18 +804,42 @@ public:
         const auto it = seed_held_.find(*seed);
         return it == seed_held_.end() ? 0 : it->second.size();
     }
+    // Whether the node verifier holds a seed keyed now (main: the node verifier's residency). Before start().
+    void set_seed_resident(std::function<bool(const Hash32&)> f) { seed_resident_ = std::move(f); }
     // The node verifier keyed `seed` (the keying worker, any thread): the jobs held for it run again now; a join
     // attempt and a catch-up comparison that stopped on it go on (on the owner).
     void on_seed_keyed(const Hash32& seed) {
         std::size_t n = 0;
         {
             std::lock_guard<std::mutex> lk(vmtx_);
+            seed_failed_.erase(seed);
             n = release_seed_held_locked(seed);
         }
         st_.seed_held_released += n;
         if (n > 0) vcv_.notify_all();
         post([this, seed] { resume_on_seed(seed); });
     }
+    // The keying of `seed` failed (the keying worker, any thread): the RandomX alarm; its held jobs wait for the next
+    // Monero tip event (on_monero_tip) or its keying.
+    void on_seed_key_failed(const Hash32& seed) {
+        st_.seed_key_failed++;
+        rx_alarm("keying", "the seed " + hex_short(seed) + " could not be keyed");
+        std::lock_guard<std::mutex> lk(vmtx_);
+        seed_failed_.insert(seed);
+    }
+    // KATs: a carrier frame of `peer` held for `seed` as a job failed on it; whether a frame is held.
+    void test_hold(std::uint64_t peer, const std::vector<std::uint8_t>& frame, const Hash32& seed) {
+        hold_by_seed(Job{Job::Kind::Carrier, peer, src_of(peer), frame, 0}, seed);
+    }
+    bool seed_held_has(const std::vector<std::uint8_t>& frame) const {
+        std::lock_guard<std::mutex> lk(vmtx_);
+        for (const auto& [s, dq] : seed_held_)
+            for (const SeedHeld& h : dq)
+                if (h.job.frame == frame) return true;
+        return false;
+    }
+    // KATs: the join gate (the next attempt allowed now).
+    bool join_gate_open() const { return now_ms() >= join_not_before_ms_.load(); }
     void resume_on_seed(const Hash32& seed) {
         bool join = false;
         std::vector<std::uint64_t> peers;
@@ -834,13 +863,19 @@ public:
             std::lock_guard<std::mutex> lk(cumtx_);
             for (const std::uint64_t p : peers) {
                 const auto it = catchup_.find(p);
-                if (it != catchup_.end() && it->second.fetch_tip == Hash32{}) catchup_ask_locked(p, it->second);
+                if (it == catchup_.end()) continue;
+                it->second.asked_ms = 0;  // a page in flight or a request still open: the tick asks once they end
+                if (it->second.fetch_tip == Hash32{}) catchup_ask_locked(p, it->second);
             }
         }
         if (join) {
             join_not_before_ms_ = 0;
             signal_join();
         }
+    }
+    // After a wait on `seed` was recorded: the seed keyed meanwhile resumes it now.
+    void resume_if_keyed(const Hash32& seed) {
+        if (seed_resident_ && seed_resident_(seed)) post([this, seed] { resume_on_seed(seed); });
     }
 
     const PathbRelayStats& stats() const noexcept { return st_; }
@@ -921,6 +956,14 @@ public:
             post([this] { on_monero_tip(); });
             return;
         }
+        std::size_t n = 0;
+        {  // the jobs held for a seed whose keying failed run once (their seeds asked again)
+            std::lock_guard<std::mutex> lk(vmtx_);
+            n = release_seed_held_locked(std::nullopt);
+            seed_failed_.clear();
+        }
+        st_.seed_held_released += n;
+        if (n > 0) vcv_.notify_all();
         rerun_ready_ctx(std::nullopt);
     }
     // A peer's re-offer queue: the ids queued, and whether each is queued once.
@@ -1251,7 +1294,6 @@ private:
         std::uint64_t origin_h = 0;  // a parked receipt's origin height h(r) (0: its P_r not held yet)
         PathbNode::Arrival arrival{};  // a reply to the node's own FC_GETCARRIER: its arrival (E-194)
     };
-    static constexpr std::uint64_t kParkRetryMs = 500;  // a job with no token waits this long before its next try
     static constexpr std::size_t kRependLogIds = 16;  // the re-pended ids named on one re-pend offer line
     static constexpr std::size_t kAskedMax = 256;       // asked carrier ids kept per peer
     struct Ticket {
@@ -1747,7 +1789,6 @@ private:
         if (o_.parked_max > 0) parked_.push_back(std::move(j));
     }
     void due_parked_locked() {
-        (void)release_seed_held_locked(std::nullopt);
         const std::uint64_t t = now_ms();
         for (auto it = parked_.begin(); it != parked_.end();) {
             if (it->not_before_ms <= t) {
@@ -1799,7 +1840,7 @@ private:
         if (granted && j.solicited) st_.solicited_jobs++;
         if (!granted) {
             st_.rx_deferred++;
-            park_job(std::move(j), now_ms() + kParkRetryMs);
+            park_job(std::move(j), now_ms() + o_.park_retry_ms);
             return;
         }
         if (j.kind == Job::Kind::Carrier) {
@@ -1916,7 +1957,7 @@ private:
             Job j{Job::Kind::Carrier, peer, src_of(peer), std::move(frame), 0, solicited, true};
             j.arrival = arrival;
             if (nk) hold_by_seed(std::move(j), *nk);
-            else park_job(std::move(j), now_ms() + kParkRetryMs);
+            else park_job(std::move(j), now_ms() + o_.park_retry_ms);
             run_effects(fx);
             return;
         }
@@ -1946,7 +1987,7 @@ private:
         rx_alarm(where, why);
         refund(j);
         j.rerun = true;  // run again (not gated again; counted at its first placement)
-        park_job(std::move(j), now_ms() + kParkRetryMs);
+        park_job(std::move(j), now_ms() + o_.park_retry_ms);
     }
     // ... on a seed not keyed: no alarm; the token goes back; the job held by its seed.
     void not_keyed(Job j, const Hash32& seed) {
@@ -1959,18 +2000,28 @@ private:
         return std::nullopt;
     }
     // The jobs waiting for a seed's keying, by seed, under one cap for the whole set (parked_max); when it is full the
-    // source with the most jobs loses its oldest. Each runs again after kParkRetryMs, and at once when its seed is
-    // keyed (on_seed_keyed). Under vmtx_.
+    // source with the most jobs loses its oldest. They run again when their seed is keyed (on_seed_keyed), after a
+    // failed keying at the next Monero tip event (on_monero_tip), and at once when the seed is keyed already.
     void hold_by_seed(Job j, const Hash32& seed) {
         st_.rx_not_keyed++;
-        std::lock_guard<std::mutex> lk(vmtx_);
-        j.not_before_ms = now_ms() + kParkRetryMs;
-        if (o_.parked_max == 0) return;
-        if (seed_held_n_ >= o_.parked_max) evict_seed_held_locked();
-        const std::uint64_t q = ++seed_seq_;
-        seed_src_[j.src].emplace_back(q, seed);
-        seed_held_[seed].push_back(SeedHeld{q, std::move(j)});
-        ++seed_held_n_;
+        const bool keyed = seed_resident_ && seed_resident_(seed);
+        {
+            std::lock_guard<std::mutex> lk(vmtx_);
+            if (keyed && seed_failed_.count(seed) == 0) {  // keyed meanwhile: runs now
+                vq_.push_back(std::move(j));
+            } else if (o_.parked_max == 0) {
+                st_.queue_dropped++;
+                return;
+            } else {
+                if (seed_held_n_ >= o_.parked_max) evict_seed_held_locked();
+                const std::uint64_t q = ++seed_seq_;
+                seed_src_[j.src].emplace_back(q, seed);
+                seed_held_[seed].push_back(SeedHeld{q, std::move(j)});
+                ++seed_held_n_;
+                return;
+            }
+        }
+        vcv_.notify_one();
     }
     void evict_seed_held_locked() {
         auto top = seed_src_.end();
@@ -1993,20 +2044,15 @@ private:
         st_.seed_held_evicted++;
         st_.queue_dropped++;
     }
-    // Into the verify queue: every job held for `seed`, or (nullopt) every job due.
+    // Into the verify queue: every job held for `seed`, or (nullopt) every job held for a seed whose keying failed.
     std::size_t release_seed_held_locked(const std::optional<Hash32>& seed) {
-        const std::uint64_t t = now_ms();
         std::size_t n = 0;
         for (auto s = seed_held_.begin(); s != seed_held_.end();) {
-            if (seed && s->first != *seed) {
+            if (seed ? s->first != *seed : seed_failed_.count(s->first) == 0) {
                 ++s;
                 continue;
             }
             for (auto it = s->second.begin(); it != s->second.end();) {
-                if (!seed && it->job.not_before_ms > t) {
-                    ++it;
-                    continue;
-                }
                 const auto src = seed_src_.find(it->job.src);
                 if (src != seed_src_.end()) {
                     for (auto e = src->second.begin(); e != src->second.end(); ++e)
@@ -2244,7 +2290,7 @@ private:
                 const PathbNode::WalkBind wb = node_->bind_walked_branch(r.admit.bind);
                 if (wb.rx_failed) {
                     // node-internal (the walk stopped at a RandomX failure; what it found stays): the alarm; the
-                    // parked frame runs again after kParkRetryMs (no token); a seed not keyed: no alarm, held by seed
+                    // parked frame runs again after park_retry_ms (no token); a seed not keyed: no alarm, held by seed
                     if (!wb.rx_not_keyed) rx_alarm("walked carrier");
                     if (d) {
                         parked_by_cause_[m].erase(*d);
@@ -2511,11 +2557,11 @@ private:
         for (ParkedFrame& f : fx.rx_retry) {  // parked and run again (no token)
             rx_alarm("released carrier");
             park_job(Job{Job::Kind::Carrier, f.peer, src_of(f.peer), std::move(f.frame), 0, f.solicited, true},
-                     now_ms() + kParkRetryMs);
+                     now_ms() + o_.park_retry_ms);
         }
         for (ParkedFrame& f : fx.rx_rerun)
             park_job(Job{Job::Kind::Carrier, f.peer, src_of(f.peer), std::move(f.frame), 0, f.solicited, true},
-                     now_ms() + kParkRetryMs);
+                     now_ms() + o_.park_retry_ms);
         for (auto& [f, seed] : fx.rx_not_keyed)  // no alarm: held by seed (no token)
             hold_by_seed(Job{Job::Kind::Carrier, f.peer, src_of(f.peer), std::move(f.frame), 0, f.solicited, true}, seed);
         fx.rx_not_keyed.clear();
@@ -3253,8 +3299,11 @@ private:
                                                  // past its first checked header pauses (its next request resumes it)
                 if (const std::optional<Hash32> nk = not_keyed_seed(e)) {  // no alarm: resumed when the seed is keyed
                     st_.rx_not_keyed++;
-                    std::lock_guard<std::mutex> lk(nkmtx_);
-                    fold_wait_[p] = *nk;
+                    {
+                        std::lock_guard<std::mutex> lk(nkmtx_);
+                        fold_wait_[p] = *nk;
+                    }
+                    resume_if_keyed(*nk);
                 } else {
                     rx_alarm("headers of peer " + std::to_string(p), e.what());
                 }
@@ -3668,17 +3717,20 @@ private:
             }
             // a RandomX failure in the attempt: node-internal, the alarm; no token; the pair re-queued, tried again as
             // after a non-service
+            if (s->report->end == AttemptEnd::NotServed || s->report->end == AttemptEnd::NodeInternal)
+                join_not_before_ms_ = now_ms() + abandon_s_ * 1000;
             if (s->report->end == AttemptEnd::NodeInternal) {
                 if (s->report->not_keyed) {  // no alarm: the next attempt when the seed is keyed
                     st_.rx_not_keyed++;
-                    std::lock_guard<std::mutex> lk(nkmtx_);
-                    join_wait_seed_ = s->report->not_keyed;
+                    {
+                        std::lock_guard<std::mutex> lk(nkmtx_);
+                        join_wait_seed_ = s->report->not_keyed;
+                    }
+                    resume_if_keyed(*s->report->not_keyed);
                 } else {
                     rx_alarm("join attempt", s->report->what);
                 }
             }
-            if (s->report->end == AttemptEnd::NotServed || s->report->end == AttemptEnd::NodeInternal)
-                join_not_before_ms_ = now_ms() + abandon_s_ * 1000;
         }
         {  // the attempt's end: a hand-over whose pair it ended (excluded, gone, not queued again) holds nothing
             const NodeGuard g(*this);
@@ -4904,6 +4956,8 @@ private:
     std::map<std::uint64_t, std::deque<std::pair<std::uint64_t, Hash32>>> seed_src_;  // per source: (seq, seed), oldest first
     std::size_t seed_held_n_ = 0;
     std::uint64_t seed_seq_ = 0;
+    std::set<Hash32> seed_failed_;                                                   // under vmtx_
+    std::function<bool(const Hash32&)> seed_resident_;
     std::mutex nkmtx_;                                     // fold_wait_, join_wait_seed_ (a leaf lock)
     std::map<std::uint64_t, Hash32> fold_wait_;            // a catch-up comparison stopped on a seed not keyed
     std::optional<Hash32> join_wait_seed_;                 // a join attempt ended on a seed not keyed

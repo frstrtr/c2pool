@@ -262,6 +262,7 @@ public:
         o += " adopted=" + std::to_string(s.adopted);
         o += " promoted=" + std::to_string(s.promoted);
         o += " released=" + std::to_string(s.released);
+        o += " key_failed=" + std::to_string(s.key_failed);
         return o;
     }
 

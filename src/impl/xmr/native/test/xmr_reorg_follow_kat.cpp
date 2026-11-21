@@ -83,7 +83,9 @@
 #include <fstream>
 #include <unistd.h>
 #include <map>
+#include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -1067,6 +1069,59 @@ static void test_alt_rows_restart() {
         checkf(connected == 32 && calls > 0 && found == calls && seed80() == std::optional<Hash>(g0),
                "seedwalk: beside a thread connecting 9 .. 40 (%llu): %llu walks, each the seed at 0",
                static_cast<unsigned long long>(connected), static_cast<unsigned long long>(calls));
+        // the factory's seed_of over the index's rows from two threads, beside the keying thread (start, two requests,
+        // wait_idle, stop; its adoption callback on its own thread)
+        struct Eng final : c2pool::xmr::pathb::INodeRxEngine {
+            mutable std::mutex mu;
+            std::set<Hash> keyed;
+            bool ready() const override { return true; }
+            std::string mode_name() const override { return "kat"; }
+            bool resident(const Hash& s) const override {
+                std::lock_guard<std::mutex> lk(mu);
+                return keyed.count(s) != 0;
+            }
+            c2pool::xmr::pathb::RxHash hash(const std::vector<std::uint8_t>&, const Hash& s, Hash& pow) override {
+                std::lock_guard<std::mutex> lk(mu);
+                if (keyed.count(s) == 0) return c2pool::xmr::pathb::RxHash::NotKeyed;
+                pow = s;
+                return c2pool::xmr::pathb::RxHash::Hashed;
+            }
+            bool key(const Hash& s) override {
+                std::lock_guard<std::mutex> lk(mu);
+                keyed.insert(s);
+                return true;
+            }
+            void set_pins(const std::vector<std::pair<std::uint64_t, Hash>>&) override {}
+        } eng;
+        c2pool::xmr::pathb::NodeRxWiring wr;
+        wr.engine = &eng;
+        wr.rows = hold;
+        wr.manual = false;
+        const c2pool::xmr::pathb::NodeRxIo io = c2pool::xmr::pathb::make_node_rx_io(std::move(wr));
+        std::atomic<std::uint64_t> adopted{0}, wrong{0}, asked{0};
+        io.keyer->set_on_adopted([&adopted](const Hash&) { ++adopted; });
+        io.keyer->start();
+        (void)io.keyer->request(g0);
+        std::vector<Hash> prs(g8.main_ids.begin(), g8.main_ids.end());
+        prs.push_back(m80);
+        const auto worker = [&] {
+            for (int i = 0; i < 200; ++i)
+                for (const Hash& pr : prs) {
+                    ++asked;
+                    if (io.seed_of(pr) != std::optional<Hash>(g0)) ++wrong;
+                }
+        };
+        std::thread ta(worker), tb(worker);
+        (void)io.keyer->request(m9);
+        ta.join();
+        tb.join();
+        const std::uint64_t failed = io.keyer->wait_idle();
+        io.keyer->stop();
+        checkf(wrong.load() == 0 && asked.load() == 2 * 200 * prs.size() && failed == 0 && adopted.load() == 2
+                       && io.memo->seeds() == g8.main_ids.size(),
+               "seedwalk: two threads x %llu seed_of calls over the index's rows beside the keying thread: each the seed "
+               "at 0; 2 keyed, 0 failed; the held P_r memoised (%zu)",
+               static_cast<unsigned long long>(asked.load() / 2), io.memo->seeds());
     }
     {
         Rig g(8);  // the restarted node: the same main chain, P not held

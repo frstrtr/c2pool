@@ -166,6 +166,7 @@ static std::optional<std::uint32_t> g_relay_ban_seconds; // --relay-ban-seconds 
 static std::uint32_t g_relay_verify_threads = 0;         // --relay-verify-threads N (0 = auto)
 static std::optional<std::uint32_t> g_relay_solicited;   // --relay-solicited-credits N
 static std::size_t   g_relay_parked_max = 0;             // --relay-parked-max N (0 = the relay node's default)
+static std::optional<std::uint32_t> g_relay_park_retry_ms;  // --relay-park-retry-ms MS
 static std::optional<std::uint32_t> g_relay_keepalive_ms;   // --relay-keepalive-ms MS
 static std::optional<std::uint32_t> g_relay_silence_ms;     // --relay-silence-timeout-ms MS
 static std::optional<double> g_relay_peer_valid_rate;    // --relay-peer-valid-rate R (P-15; raise only)
@@ -684,6 +685,7 @@ static bool relay_options_of(const XmrNodeConfig& cfg, pb::PathbRelayOptions& ro
     ro.discovery = g_relay_discovery;
     if (g_relay_solicited) ro.solicited_credits = *g_relay_solicited;
     if (g_relay_parked_max) ro.parked_max = g_relay_parked_max;
+    if (g_relay_park_retry_ms) ro.park_retry_ms = *g_relay_park_retry_ms;
     if (g_relay_keepalive_ms) ro.keepalive_ms = *g_relay_keepalive_ms;
     if (g_relay_silence_ms) ro.silence_timeout_ms = *g_relay_silence_ms;
     if (g_relay_peer_valid_rate) ro.peer_valid_rate = *g_relay_peer_valid_rate;  // P-15 (its capacity follows P-09)
@@ -1114,6 +1116,8 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
     pb::NodeRxWiring rxw;
     rxw.engine = &node_rx_engine;
     rxw.rows = pb::index_seed_rows(nn->index(), rows);
+    rxw.open_heights = nc.p.open_bins + nc.p.fresh_max;
+    rxw.walk_bound = pb::kept_rows_cap(cfg.alt_max_blocks ? cfg.alt_max_blocks : native::ChainIndexOptions{}.alt_max_blocks);
     pb::NodeRxIo rxio = pb::make_node_rx_io(std::move(rxw));
     io.seed_of = rxio.seed_of;
     io.verify = rxio.verify;
@@ -1249,14 +1253,20 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
     }
     // the keying worker: the jobs held for a seed run again when it is keyed; the pinned main seeds keyed before the
     // links open
+    relay->set_seed_resident([e = rxio.engine](const pb::Hash32& s) { return e->resident(s); });
     rxio.keyer->set_on_adopted([r = relay.get()](const pb::Hash32& s) { r->on_seed_keyed(s); });
+    rxio.keyer->set_on_failed([r = relay.get()](const pb::Hash32& s) { r->on_seed_key_failed(s); });
     rxio.keyer->start();
     struct KeyerStop {
         pb::RxKeyer* k;
         ~KeyerStop() { k->stop(); }
     } keyer_stop{rxio.keyer.get()};  // before the relay goes (every return)
-    rxio.repin();
-    rxio.keyer->wait_idle();
+    {
+        const std::vector<std::pair<std::uint64_t, pb::Hash32>> pins = rxio.repin();
+        if (const std::uint64_t failed = rxio.keyer->wait_idle())
+            std::printf("randomx: node: %llu of %zu pinned seeds could not be keyed at start (%s)\n",
+                        static_cast<unsigned long long>(failed), pins.size(), node_rx.describe().c_str());
+    }
     {
         std::string why;
         if (!relay->start(why)) {
@@ -2343,6 +2353,7 @@ static void print_help() {
             "  --relay-ban-seconds <s>      address ban\n"
             "  --relay-verify-threads <n>   RandomX verify workers (0 = auto)\n"
             "  --relay-solicited-credits <n>  --relay-parked-max <n>\n"
+            "  --relay-park-retry-ms <ms>   a parked job's wait before its next try (default 500; >= 1)\n"
             "  --relay-keepalive-ms <ms>    PING interval (default 5000; 0 = off)\n"
             "  --relay-silence-timeout-ms <ms>  drop a silent link (default 25000; 0 = never)\n"
             "  --relay-peer-valid-rate <r>  valid objects per peer per second (default and floor 1.7; raise only)\n"
@@ -2554,6 +2565,10 @@ int main(int argc, char** argv) {
             else if (a == "--relay-verify-threads") g_relay_verify_threads = u32();
             else if (a == "--relay-solicited-credits") g_relay_solicited = u32();
             else if (a == "--relay-parked-max") g_relay_parked_max = static_cast<std::size_t>(u64());
+            else if (a == "--relay-park-retry-ms") {
+                g_relay_park_retry_ms = u32();
+                if (*g_relay_park_retry_ms == 0) throw cs::UsageError(a + " wants an integer >= 1");
+            }
             else if (a == "--relay-keepalive-ms") g_relay_keepalive_ms = u32();
             else if (a == "--relay-silence-timeout-ms") g_relay_silence_ms = u32();
             else if (a == "--relay-peer-valid-rate") {

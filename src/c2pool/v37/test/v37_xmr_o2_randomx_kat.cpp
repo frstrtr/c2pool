@@ -347,8 +347,25 @@ void suite_c(const Vector& kat) {
         return s;
     };
     const Seed32 A = seed_of(1), B = seed_of(2), C = seed_of(3), D = seed_of(4), E = seed_of(5);
+    // the reference hash of each seed: an instance keyed with that seed alone
+    NodeRxVerifier ref;
+    check(ref.init(node_rx_policy(NodeRxCfg{})), "node: reference instance init");
+    const auto ref_hash = [&](const Seed32& s) {
+        Hash32 o{};
+        return ref.key(s) && ref.hash(blob, s, o) == NodeRxVerifier::Hashed::Ok ? o : Hash32{};
+    };
+    const Hash32 hA = ref_hash(A), hB = ref_hash(B), hC = ref_hash(C), hD = ref_hash(D), hE = ref_hash(E);
+    check(hA != Hash32{} && hA != hB && hB != hC && hC != hD && hD != hE && hA != hE, "node: five reference hashes, distinct");
     NodeRxVerifier w;
     check(w.init(node_rx_policy(NodeRxCfg{})), "node: second instance init");
+    const auto same = [&](std::initializer_list<std::pair<Seed32, Hash32>> ps) {
+        for (int round = 0; round < 2; ++round)
+            for (const auto& [s, want] : ps) {
+                Hash32 o{};
+                if (w.hash(blob, s, o) != NodeRxVerifier::Hashed::Ok || o != want) return false;
+            }
+        return true;
+    };
     w.set_pins({{2048, A}, {4096, B}});
     const bool keyed = w.key(A) && w.key(B) && w.key(C);
     const auto all = [&](std::initializer_list<Seed32> ss) {
@@ -356,18 +373,20 @@ void suite_c(const Vector& kat) {
             if (!w.resident(s)) return false;
         return true;
     };
-    bool hashed = true;
-    for (const Seed32& s : {A, B, C}) hashed = hashed && w.hash(blob, s, h) == NodeRxVerifier::Hashed::Ok;
-    check(keyed && all({A, B, C}) && hashed && w.stats().prefetches == 0, "node: pins A, B and C resident; each hashes, no build");
-    check(w.key(D) && all({A, B, D}) && !w.resident(C), "node: D replaces C in the third slot; the pins stay");
+    check(keyed && all({A, B, C}) && same({{A, hA}, {B, hB}, {C, hC}}) && w.stats().prefetches == 0,
+          "node: pins A, B and C resident; each hash its reference, no build");
+    check(w.key(D) && all({A, B, D}) && !w.resident(C) && same({{D, hD}, {A, hA}, {B, hB}}),
+          "node: D replaces C in the third slot; the pins stay; each hash its reference");
     // D pinned (the set moved to {B, D}): promoted in place; A keeps its slot (the third now)
     const std::uint64_t adopted = w.stats().adopted;
     w.set_pins({{4096, B}, {6144, D}});
-    check(all({A, B, D}) && w.stats().promoted == 1 && w.stats().adopted == adopted, "node: D promoted in place, A kept");
+    check(all({A, B, D}) && w.stats().promoted == 1 && w.stats().adopted == adopted && same({{B, hB}, {D, hD}, {A, hA}}),
+          "node: D promoted in place, A kept; each hash its reference");
     // the id at 6144 changed (E): D released; E keyed into its slot; A and B stay
     w.set_pins({{4096, B}, {6144, E}});
     check(!w.resident(D) && w.stats().released == 1 && all({A, B}), "node: the id at 6144 changed -> D released");
-    check(w.key(E) && all({A, B, E}), "node: E keyed into the released slot; A, B stay");
+    check(w.key(E) && all({A, B, E}) && same({{E, hE}, {A, hA}, {B, hB}}),
+          "node: E keyed into the released slot; A, B stay; each hash its reference");
     int pins = 0;
     for (const auto& [pin, s] : w.slots()) pins += pin ? 1 : 0;
     check(w.slots().size() == 3 && pins == 2, "node: three slots, two pins");

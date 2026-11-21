@@ -13,10 +13,11 @@
 //                    Any other end: no seed (DEFER Seed), with the stopping id.
 //   SeedMemo         a seed per P_r the index holds, kept while it holds it; per P_r without a seed, the walk's
 //                    stopping id: one lookup per call until that id is held or kept, then the walk resumes from it.
-//                    Called under the node lock; the row event drops the entries no longer held or no longer asked.
+//                    Called inside the rows hold (main: the index mutex); the row event drops the entries no longer
+//                    held or no longer asked. A P_r neither held nor kept gets no entry.
 //   INodeRxEngine    the node's RandomX engine (main: NodeRxVerifier, xmr_node_rx_verify.hpp)
-//   RxKeyer          the keying worker: one thread, one request in flight per seed, the adoption callback; manual
-//                    mode: the caller pumps it
+//   RxKeyer          the keying worker: one thread, one request in flight per seed, the adoption and the failure
+//                    callbacks; manual mode: the caller pumps it
 //   node_hash        RandomX on the engine; a seed not keyed posts its keying request and leaves as RandomxNotKeyed
 //   main_seed_pins   the main-chain seeds the open heights name: seed(t + 1), and seed(t + 1 - (F + Fresh)) when it
 //                    differs, else the next epoch's once t + 1 is within the lag; at most two
@@ -136,7 +137,7 @@ public:
         }
         SeedWalk w;
         const auto d = defers_.find(p_r);
-        if (d != defers_.end() && d->second.h_child != 0) {
+        if (d != defers_.end()) {
             d->second.touched = epoch_;
             const Hash32 stop = d->second.stop;
             if (!r.held(stop) && !r.kept(stop, r.tip_height())) {
@@ -154,6 +155,10 @@ public:
             defers_.erase(p_r);
             if (w.start_held) seeds_[p_r] = *w.seed;
             return w.seed;
+        }
+        if (w.h_child == 0) {  // P_r neither held nor kept
+            defers_.erase(p_r);
+            return std::nullopt;
         }
         defers_[p_r] = Defer{w.stop, w.steps, w.h_child, epoch_};
         return std::nullopt;
@@ -233,6 +238,7 @@ private:
 class RxKeyer {
 public:
     using Adopted = std::function<void(const Hash32& seed)>;
+    using Failed = std::function<void(const Hash32& seed)>;
     struct Stats {
         std::uint64_t requests = 0;
         std::uint64_t built = 0;
@@ -246,6 +252,10 @@ public:
     void set_on_adopted(Adopted cb) {
         std::lock_guard<std::mutex> lk(mu_);
         cb_ = std::move(cb);
+    }
+    void set_on_failed(Failed cb) {
+        std::lock_guard<std::mutex> lk(mu_);
+        fail_cb_ = std::move(cb);
     }
     void start() {
         if (manual_) return;
@@ -288,14 +298,21 @@ public:
             if (build_(s)) ++n;
         }
     }
-    // Until the queue is empty and no build runs (manual mode: pump()).
-    void wait_idle() {
+    // Until the queue is empty and no build runs (manual mode: pump()); the builds that failed meanwhile.
+    std::uint64_t wait_idle() {
+        std::uint64_t f0 = 0;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            f0 = st_.failed;
+        }
         if (manual_) {
             (void)pump();
-            return;
+        } else {
+            std::unique_lock<std::mutex> lk(mu_);
+            idle_cv_.wait(lk, [this] { return (q_.empty() && !busy_) || stop_; });
         }
-        std::unique_lock<std::mutex> lk(mu_);
-        idle_cv_.wait(lk, [this] { return (q_.empty() && !busy_) || stop_; });
+        std::lock_guard<std::mutex> lk(mu_);
+        return st_.failed - f0;
     }
     bool pending(const Hash32& seed) const {
         std::lock_guard<std::mutex> lk(mu_);
@@ -327,6 +344,7 @@ private:
     bool build_(const Hash32& s) {
         const bool ok = e_.key(s);
         Adopted cb;
+        Failed fcb;
         {
             std::lock_guard<std::mutex> lk(mu_);
             pending_.erase(s);
@@ -334,9 +352,11 @@ private:
             if (ok) ++st_.built;
             else ++st_.failed;
             cb = cb_;
+            fcb = fail_cb_;
         }
-        idle_cv_.notify_all();
         if (ok && cb) cb(s);
+        if (!ok && fcb) fcb(s);
+        idle_cv_.notify_all();
         return ok;
     }
 
@@ -349,6 +369,7 @@ private:
     bool busy_ = false;
     bool stop_ = false;
     Adopted cb_;
+    Failed fail_cb_;
     Stats st_;
     std::thread th_;
 };
@@ -418,6 +439,7 @@ struct NodeRxIo {
     std::function<void()> on_rows_event;
     std::shared_ptr<RxKeyer> keyer;
     std::shared_ptr<SeedMemo> memo;
+    INodeRxEngine* engine = nullptr;
 };
 
 inline NodeRxIo make_node_rx_io(NodeRxWiring w) {
@@ -427,6 +449,7 @@ inline NodeRxIo make_node_rx_io(NodeRxWiring w) {
     o.memo = std::make_shared<SeedMemo>(w.walk_bound);
     RxKeyer* const k = o.keyer.get();
     SeedMemo* const m = o.memo.get();
+    o.engine = e;
     const SeedRowsHold rows = w.rows;
     o.seed_of = [rows, m](const Hash32& p_r) {
         std::optional<Hash32> out;
