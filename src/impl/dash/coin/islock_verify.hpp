@@ -84,6 +84,7 @@
 
 #include <impl/dash/coin/chainlock_verify.hpp>   // sha256d_of, build_sign_hash, QuorumCandidate
 #include <impl/dash/coin/dkg_commitments.hpp>    // LlmqParamsView, kLlmq60_75, LlmqNetwork
+#include <type_traits>
 
 #include <core/pack.hpp>
 #include <core/uint256.hpp>
@@ -149,9 +150,9 @@ inline uint64_t rotated_signer_index(const LlmqParamsView& p,
 /// cycle_height + quorum_index, the rotated-commitment invariant
 /// dashcore/src/llmq/commitment.cpp:52 enforces), the one whose quorumIndex
 /// equals the requestId-derived signer index. Fail-closed nullopt on: params
-/// not rotated, cycle not at a dkgInterval boundary, signer index out of the
-/// candidate range (upstream's own `signer > quorums.size()` guard,
-/// quorumsman.cpp:706), or no candidate at that index.
+/// not rotated, cycle not at a dkgInterval boundary, signer index outside the
+/// signing set (upstream's `signer > quorums.size()` guard, quorumsman.cpp:706,
+/// taken against the full list), or no candidate at that index.
 inline std::optional<RotatedQuorumCandidate>
 select_rotated_quorum(const LlmqParamsView& p,
                       const std::vector<RotatedQuorumCandidate>& candidates,
@@ -172,9 +173,14 @@ select_rotated_quorum(const LlmqParamsView& p,
     if (cycle_set.empty()) return std::nullopt;
 
     const uint64_t signer = rotated_signer_index(p, request_id);
-    // Upstream guard kept as-is (quorumsman.cpp:706-708; note `>`, not `>=` —
-    // the find_if below is what actually decides membership).
-    if (signer > cycle_set.size()) return std::nullopt;
+    // Upstream's `signer > quorums.size()` guard (quorumsman.cpp:706-708) is
+    // taken against the FULL signing list (signingActiveQuorumCount entries),
+    // where it never fires. Our cycle_set is a filtered subset (only the
+    // candidates we hold), so comparing against its size would refuse a valid
+    // index whenever some of the cycle's quorums are missing (e.g. a failed
+    // DKG leaves one index on the previous cycle). Compare against the full
+    // count; the loop below decides membership.
+    if (signer >= p.signing_active_quorum_count) return std::nullopt;
     for (const auto* c : cycle_set)
         if (static_cast<uint64_t>(c->quorum_index) == signer) return *c;
     return std::nullopt;
@@ -210,6 +216,82 @@ build_islock_sign_target(const LlmqParamsView& p,
     t.sign_hash  = chainlock::build_sign_hash(p.type, q->quorum_hash,
                                               request_id, txid);
     return t;
+}
+
+/// Which quorum set verified an isdlock (None = refused).
+enum class IslockVerifyPass : uint8_t { None = 0, Active = 1, Previous = 2 };
+
+/// How long a retired rotated quorum stays usable as a candidate: its base
+/// block may be at most this far below the tip. A cycle's quorums sit at
+/// cycleHeight + quorumIndex and retire about one dkgInterval later (at the
+/// next rotation diff); they are needed only for the few blocks after that,
+/// while the network still signs at tip - SIGN_HEIGHT_OFFSET. Two intervals
+/// plus a 64-block margin covers that with room to spare.
+inline uint32_t previous_cycle_max_age(const LlmqParamsView& p)
+{
+    return 2u * p.dkg_interval + 64u;
+}
+
+/// A lock names its signing quorum's own cycle (cycleHash). Signers pick the
+/// quorum at tip - SIGN_HEIGHT_OFFSET, so for a few blocks after a rotation
+/// they still sign with the previous cycle, and Dash Core verifies such a lock
+/// against the cycle it names (v24.0.2 net_instantsend.cpp:136-145: an old
+/// cycle is resolved at cycleHeight + dkgInterval - 1). Our active set drops
+/// that cycle at the rotation diff, so a verifier with only the active set
+/// refused every one of those locks (mainnet 11-20: the 8 blocks after each
+/// rotation, ~224 refusals per node per cycle).
+///
+/// Pass 1 selects among `active` (the current rotated quorums); only if that
+/// fails, pass 2 selects among the retained ones `previous()` returns
+/// (QuorumManager::retired_entries, collected lazily), ignoring any whose base
+/// block is more than previous_cycle_max_age() below `tip_height`. Selection
+/// is keyed on the lock's own cycle (base_height == cycle_height +
+/// quorumIndex) and the two sets hold different quorums, so a lock selects a
+/// quorum for at most one BLS verification in practice. This is NOT Dash
+/// Core's second pass (signOffset = dkgInterval, which re-checks against the
+/// cycle before the named one); it widens the candidate pool of Core's first
+/// pass to quorums we no longer hold as active. `verify(pubkey, sign_hash)` is
+/// the BLS check.
+template <typename PreviousFn, typename VerifyFn>
+    requires std::is_invocable_v<PreviousFn&>
+IslockVerifyPass
+verify_islock_two_pass(const LlmqParamsView& p,
+                       const std::vector<RotatedQuorumCandidate>& active,
+                       PreviousFn&& previous,
+                       uint32_t tip_height, uint32_t cycle_height,
+                       const std::vector<std::pair<uint256, uint32_t>>& inputs,
+                       const uint256& txid, VerifyFn&& verify)
+{
+    if (auto t = build_islock_sign_target(p, active, cycle_height, inputs, txid);
+        t && verify(t->quorum.quorum_public_key, t->sign_hash))
+        return IslockVerifyPass::Active;
+
+    const std::vector<RotatedQuorumCandidate> retained = previous();
+    std::vector<RotatedQuorumCandidate> recent;
+    recent.reserve(retained.size());
+    const uint32_t max_age = previous_cycle_max_age(p);
+    for (const auto& c : retained)
+        if (c.base_height <= tip_height && tip_height - c.base_height <= max_age)
+            recent.push_back(c);
+    if (auto t = build_islock_sign_target(p, recent, cycle_height, inputs, txid);
+        t && verify(t->quorum.quorum_public_key, t->sign_hash))
+        return IslockVerifyPass::Previous;
+    return IslockVerifyPass::None;
+}
+
+/// Convenience overload: the retained candidates as a ready vector.
+template <typename VerifyFn>
+IslockVerifyPass
+verify_islock_two_pass(const LlmqParamsView& p,
+                       const std::vector<RotatedQuorumCandidate>& active,
+                       const std::vector<RotatedQuorumCandidate>& previous,
+                       uint32_t tip_height, uint32_t cycle_height,
+                       const std::vector<std::pair<uint256, uint32_t>>& inputs,
+                       const uint256& txid, VerifyFn&& verify)
+{
+    return verify_islock_two_pass(p, active, [&previous] { return previous; },
+                                  tip_height, cycle_height, inputs, txid,
+                                  std::forward<VerifyFn>(verify));
 }
 
 /// The LLMQ type used for DIP-24 deterministic InstantSend signing:
