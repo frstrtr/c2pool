@@ -12559,7 +12559,9 @@ void MiningInterface::update_stat_log()
     // set_current_payouts_fn instead (DASH, BTC, BIP-110: #939). /current_payouts
     // reads it, but this sampler only read the cache, so the "Predicted Payout
     // History" series of those coins stayed empty. Same source, same shape
-    // (address -> coins), only when the cache gave nothing.
+    // (address -> coins), only when the cache gave nothing. This runs on the
+    // io thread every 60 s: m_current_payouts_fn must not block (the wired
+    // ones read the tracker through a try-lock and return {} when it is busy).
     if (entry.current_payouts.empty() && m_current_payouts_fn) {
         const auto direct = m_current_payouts_fn();
         if (direct.is_object()) {
