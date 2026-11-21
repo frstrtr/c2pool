@@ -1249,9 +1249,18 @@ public:
                         const std::array<uint8_t, 96>& sig) {
         if (!m_islock_verify) return;                     // no verifier => fail closed
         if (!m_islock_verify(inputs, txid, cycle_hash, sig)) {
+            // The relay lane (on_islock) has already applied this lock,
+            // unverified, a moment ago in the same isdlock handler. Undo that:
+            // a refused lock keeps neither the hold short-circuit nor its
+            // outpoint exclusion (Mempool::revoke_unverified_islock). The
+            // feed-liveness tick stays.
+            const auto rv = m_state.mempool().revoke_unverified_islock(txid, inputs);
             LOG_WARNING << "[ISLOCK] rejected unverified isdlock txid="
                         << txid.GetHex().substr(0, 16) << "... cycle="
-                        << cycle_hash.GetHex().substr(0, 16) << "...";
+                        << cycle_hash.GetHex().substr(0, 16) << "... -- relay-lane"
+                        << " effects revoked (hold_restored=" << rv.hold_restored
+                        << " g4_cleared=" << rv.g4_cleared
+                        << " g4_restored=" << rv.g4_restored << ")";
             return;
         }
         LOG_INFO << "[ISLOCK] adopted VERIFIED isdlock txid="
@@ -1487,6 +1496,10 @@ public:
     /// behaviour is unchanged (empty map, hold self-disarmed).
     void on_islock(const uint256& locked_txid,
                    const std::vector<std::pair<uint256, uint32_t>>& inputs) {
+        // Dash Core's TriviallyValid refusals: a lock with no inputs or a null
+        // txid is never applied (it could never be verified, so nothing would
+        // ever revoke it).
+        if (inputs.empty() || locked_txid.IsNull()) return;
         m_state.mempool().add_islock(locked_txid, inputs);
     }
 
