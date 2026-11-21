@@ -706,6 +706,15 @@ private:
                             << " expected=" << m_params.genesis_hash.GetHex().substr(0, 16);
                 return false; // wrong genesis
             }
+            // The genesis header is accepted only while the store has no tip
+            // (the check is on the tip, not on the entries).
+            if (!m_tip.IsNull()) {
+                const uint64_t n = ++m_genesis_not_taken;
+                if (n <= GENESIS_NOT_TAKEN_LOG_FIRST || n % GENESIS_NOT_TAKEN_LOG_EVERY == 0)
+                    LOG_INFO << "[EMB-LTC] Genesis header not taken: the header chain has a tip at height "
+                             << m_tip_height << " (" << n << " so far)";
+                return false;
+            }
 
             IndexEntry entry;
             entry.header = header;
@@ -1153,6 +1162,12 @@ private:
 
     // Pinned checkpoints (height, hash): a header at the height must be it.
     std::vector<std::pair<uint32_t, uint256>> m_pins;
+
+    // Genesis headers not taken while the chain has a tip (m_mutex).
+    uint64_t m_genesis_not_taken{0};
+    // First 3 refusals logged in full, then 1 in 100.
+    static constexpr uint64_t GENESIS_NOT_TAKEN_LOG_FIRST = 3;
+    static constexpr uint64_t GENESIS_NOT_TAKEN_LOG_EVERY = 100;
 
 public:
     /// Headers added per lock hold in add_headers (each runs scrypt).
