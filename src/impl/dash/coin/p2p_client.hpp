@@ -5529,6 +5529,21 @@ private:
                             << static_cast<int>(msg->m_version);
             return;
         }
+        // Structural refusals dashd makes in TriviallyValid + version check
+        // (instantsend/lock.cpp): empty inputs, null txid, non-96-byte sig
+        // (version==1 already gated above). Checked BEFORE either lane: a
+        // malformed lock never reaches the BLS lane, so if the relay lane
+        // applied it there would be nothing to undo it. Local drop + log; no
+        // ban.
+        if (msg->m_inputs.empty()
+            || msg->m_txid.IsNull() || msg->m_sig.size() != 96) {
+            LOG_INFO << "[" << m_chain_label << "] isdlock from "
+                     << (m_active ? m_active->key : std::string("?"))
+                     << " REFUSED (version=" << static_cast<int>(msg->m_version)
+                     << " inputs=" << msg->m_inputs.size()
+                     << " sig_bytes=" << msg->m_sig.size() << ")";
+            return;
+        }
         {
             ::dash::interfaces::Node::IslockSeen ev;
             ev.txid = msg->m_txid;
@@ -5552,20 +5567,7 @@ private:
                             << " (--embedded-ingest-isdlock off)";
             return;
         }
-        // Structural refusals dashd makes in TriviallyValid + version check
-        // (instantsend/lock.cpp): empty inputs, null txid, non-96-byte sig
-        // (version==1 already gated above). Local drop + log; no ban; the
-        // unverified lane above has already fired — this refusal only keeps
-        // a malformed payload out of the verified adoption path.
-        if (msg->m_inputs.empty()
-            || msg->m_txid.IsNull() || msg->m_sig.size() != 96) {
-            LOG_INFO << "[" << m_chain_label << "] isdlock from "
-                     << (m_active ? m_active->key : std::string("?"))
-                     << " REFUSED (version=" << static_cast<int>(msg->m_version)
-                     << " inputs=" << msg->m_inputs.size()
-                     << " sig_bytes=" << msg->m_sig.size() << ")";
-            return;
-        }
+        // (Structural refusals: checked above, before either lane.)
         ::dash::interfaces::Node::IsdLockEvent ev;
         ev.version    = msg->m_version;
         ev.txid       = msg->m_txid;

@@ -3075,6 +3075,7 @@ public:
                 //     construction.
                 if (is_hold_active && !e->tx.vin.empty()
                     && !m_islock_txids.count(e->txid)
+                    && !m_verified_islock_txids.count(e->txid)
                     && now_ts - e->time_added < WAIT_FOR_ISLOCK_TIMEOUT_SECS) {
                     ok = false;
                     break;

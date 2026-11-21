@@ -1496,6 +1496,10 @@ public:
     /// behaviour is unchanged (empty map, hold self-disarmed).
     void on_islock(const uint256& locked_txid,
                    const std::vector<std::pair<uint256, uint32_t>>& inputs) {
+        // Dash Core's TriviallyValid refusals: a lock with no inputs or a null
+        // txid is never applied (it could never be verified, so nothing would
+        // ever revoke it).
+        if (inputs.empty() || locked_txid.IsNull()) return;
         m_state.mempool().add_islock(locked_txid, inputs);
     }
 

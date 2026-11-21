@@ -777,7 +777,11 @@ TEST(DashIsdlockRevoke, AForgedLockCannotLiftTheHoldOffAYoungTx)
     EXPECT_FALSE(mp.islock_txid_known(a)) << "the refused lock must not stay a hold short-circuit";
     EXPECT_FALSE(selected_contains(mp, a))
         << "a refused lock must not lift the 600 s hold";
-    EXPECT_TRUE(mp.instantsend_mining_hold()) << "the hold stays armed";
+    // The hold is still ARMED (the revocation did not make the feed look
+    // dark): another young unlocked tx is held too.
+    const auto Y = make_spend(r.cbid, 3, 60'000, /*salt=*/72);
+    ASSERT_TRUE(mp.add_tx(Y));
+    EXPECT_FALSE(selected_contains(mp, dash_txid(Y))) << "a revocation disarmed the hold";
 
     // The same lock, VERIFIED: A is safe to mine at once (dashd IsLocked).
     r.verifier(true);
@@ -789,6 +793,27 @@ TEST(DashIsdlockRevoke, AForgedLockCannotLiftTheHoldOffAYoungTx)
     r.deliver(a, {{raw256(0x66), 3u}});
     EXPECT_TRUE(mp.islock_txid_known(a));
     EXPECT_TRUE(selected_contains(mp, a));
+}
+
+TEST(DashIsdlockRevoke, AMalformedLockIsNeverApplied)
+{
+    RevokeRig r(10);
+    Mempool& mp = r.st.mempool();
+    mp.set_instantsend_mining_hold(true);
+    r.m.on_islock(raw256(0x44), {{raw256(0x45), 0u}});   // live feed
+    const auto A = make_spend(r.cbid, 0, 90'000, /*salt=*/101);
+    ASSERT_TRUE(mp.add_tx(A));
+    const uint256 a = dash_txid(A);
+    // No inputs: Dash Core's TriviallyValid refuses it; it must not become a
+    // hold short-circuit (it never reaches the BLS lane, so nothing revokes it).
+    r.m.on_islock(a, {});
+    EXPECT_FALSE(mp.islock_txid_known(a));
+    EXPECT_FALSE(selected_contains(mp, a));
+    // Null txid: no eviction, no exclusion.
+    r.m.on_islock(uint256{}, {{r.cbid, 0u}});
+    EXPECT_EQ(mp.islock_outpoint_count(), 1u) << "only the live-feed lock's entry";
+    mp.set_instantsend_mining_hold(false);
+    EXPECT_TRUE(selected_contains(mp, a)) << "a null-txid lock evicted or excluded a tx";
 }
 
 TEST(DashIsdlockRevoke, AForgedLocksOutpointExclusionIsCleared)
@@ -823,8 +848,9 @@ TEST(DashIsdlockRevoke, AForgedLockCannotOverwriteAVerifiedOutpoint)
     r.deliver(x, {O});
     ASSERT_EQ(mp.verified_islock_outpoint_count(), 1u);
 
-    // A forged lock rewrites O to W in the relay-lane map; the refusal must
-    // put X back, or G4 would admit a tx the emit belt still refuses.
+    // A refused lock claiming O for W: the relay lane leaves a verified
+    // outpoint alone, and after the refusal O still points at X (G4 keeps
+    // excluding what the emit belt refuses).
     r.verifier(false);
     r.deliver(raw256(0x99), {O});
     const auto T = make_spend(r.cbid, 2, 70'000, /*salt=*/91);   // spends O, txid != X
