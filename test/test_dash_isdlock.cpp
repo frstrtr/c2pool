@@ -923,6 +923,149 @@ TEST(DashIsdlockN2, RefreshCoalescerFiresOncePerGapWithOneTrailing)
     EXPECT_EQ(co.on_trigger(t0 + seconds(3)).act, C::Act::FireNow);
 }
 
+// ═══ Revoke on reject — a refused lock keeps no relay-lane effect ════════════
+//
+// The relay lane applies every isdlock unverified (hold short-circuit, G4
+// outpoint exclusion, eviction) before the BLS lane checks it. Dash Core acts
+// only on locks it verified, so when the BLS lane refuses a lock its
+// relay-lane effects are undone (Mempool::revoke_unverified_islock). The real
+// path is driven: on_islock (relay lane) then on_new_isdlock (BLS lane), as the
+// isdlock handler does.
+
+namespace {
+
+struct RevokeRig {
+    NodeCoinState st;
+    CoinStateMaintainer m{st};
+    UtxoLane lane;
+    uint256 cbid;
+    std::array<uint8_t, 96> sig{};
+    explicit RevokeRig(uint32_t salt)
+    {
+        lane.open("");
+        lane.attach(st.mempool());
+        auto cb = make_coinbase({100'000, 90'000, 80'000, 70'000}, salt);
+        lane.on_block_connected(make_block({cb}, salt), /*height=*/1);
+        cbid = dash_txid(cb);
+        sig.fill(0xab);
+    }
+    void verifier(bool pass)
+    {
+        m.set_islock_verify_fn(
+            [pass](const std::vector<std::pair<uint256, uint32_t>>&, const uint256&,
+                   const uint256&, const std::array<uint8_t, 96>&) { return pass; });
+    }
+    // What the isdlock handler does with one lock: relay lane, then BLS lane.
+    void deliver(const uint256& txid, const std::vector<std::pair<uint256, uint32_t>>& in)
+    {
+        m.on_islock(txid, in);
+        m.on_new_isdlock(in, txid, raw256(0x33), sig);
+    }
+};
+
+} // namespace
+
+TEST(DashIsdlockRevoke, AForgedLockCannotLiftTheHoldOffAYoungTx)
+{
+    RevokeRig r(7);
+    Mempool& mp = r.st.mempool();
+    mp.set_instantsend_mining_hold(true);
+    // A live feed (an unrelated honest lock) arms the hold.
+    r.m.on_islock(raw256(0x44), {{raw256(0x45), 0u}});
+    const auto A = make_spend(r.cbid, 0, 90'000, /*salt=*/71);
+    ASSERT_TRUE(mp.add_tx(A));
+    const uint256 a = dash_txid(A);
+    ASSERT_FALSE(selected_contains(mp, a)) << "fixture: a young unlocked tx is held";
+
+    // A forged isdlock(A): the relay lane applies it, the BLS lane refuses it.
+    r.verifier(false);
+    r.deliver(a, {{r.cbid, 0u}});
+    EXPECT_FALSE(mp.islock_txid_known(a)) << "the refused lock must not stay a hold short-circuit";
+    EXPECT_FALSE(selected_contains(mp, a))
+        << "a refused lock must not lift the 600 s hold";
+    // The hold is still ARMED (the revocation did not make the feed look
+    // dark): another young unlocked tx is held too.
+    const auto Y = make_spend(r.cbid, 3, 60'000, /*salt=*/72);
+    ASSERT_TRUE(mp.add_tx(Y));
+    EXPECT_FALSE(selected_contains(mp, dash_txid(Y))) << "a revocation disarmed the hold";
+
+    // The same lock, VERIFIED: A is safe to mine at once (dashd IsLocked).
+    r.verifier(true);
+    r.deliver(a, {{r.cbid, 0u}});
+    EXPECT_TRUE(selected_contains(mp, a));
+
+    // A later forged copy naming the verified txid with junk inputs changes nothing.
+    r.verifier(false);
+    r.deliver(a, {{raw256(0x66), 3u}});
+    EXPECT_TRUE(mp.islock_txid_known(a));
+    EXPECT_TRUE(selected_contains(mp, a));
+}
+
+TEST(DashIsdlockRevoke, AMalformedLockIsNeverApplied)
+{
+    RevokeRig r(10);
+    Mempool& mp = r.st.mempool();
+    mp.set_instantsend_mining_hold(true);
+    r.m.on_islock(raw256(0x44), {{raw256(0x45), 0u}});   // live feed
+    const auto A = make_spend(r.cbid, 0, 90'000, /*salt=*/101);
+    ASSERT_TRUE(mp.add_tx(A));
+    const uint256 a = dash_txid(A);
+    // No inputs: Dash Core's TriviallyValid refuses it; it must not become a
+    // hold short-circuit (it never reaches the BLS lane, so nothing revokes it).
+    r.m.on_islock(a, {});
+    EXPECT_FALSE(mp.islock_txid_known(a));
+    EXPECT_FALSE(selected_contains(mp, a));
+    // Null txid: no eviction, no exclusion.
+    r.m.on_islock(uint256{}, {{r.cbid, 0u}});
+    EXPECT_EQ(mp.islock_outpoint_count(), 1u) << "only the live-feed lock's entry";
+    mp.set_instantsend_mining_hold(false);
+    EXPECT_TRUE(selected_contains(mp, a)) << "a null-txid lock evicted or excluded a tx";
+}
+
+TEST(DashIsdlockRevoke, AForgedLocksOutpointExclusionIsCleared)
+{
+    RevokeRig r(8);
+    Mempool& mp = r.st.mempool();
+    mp.set_instantsend_mining_hold(false);   // isolate G4 from the hold
+    const auto Y = make_spend(r.cbid, 1, 80'000, /*salt=*/81);
+    const uint256 y = dash_txid(Y);
+    ASSERT_TRUE(mp.add_tx(Y));
+    ASSERT_TRUE(selected_contains(mp, y));
+
+    // A forged lock claims Y's outpoint for another txid: the relay lane evicts
+    // Y (not undone: it is re-relayed) and excludes the outpoint; the refusal
+    // clears the exclusion.
+    r.verifier(false);
+    r.deliver(raw256(0x77), {{r.cbid, 1u}});
+    EXPECT_EQ(mp.islock_outpoint_count(), 0u) << "the forged lock's G4 entry must be cleared";
+    ASSERT_TRUE(mp.add_tx(Y)) << "re-relayed";
+    EXPECT_TRUE(selected_contains(mp, y)) << "a refused lock must not keep its outpoint excluded";
+}
+
+TEST(DashIsdlockRevoke, AForgedLockCannotOverwriteAVerifiedOutpoint)
+{
+    RevokeRig r(9);
+    Mempool& mp = r.st.mempool();
+    mp.set_instantsend_mining_hold(false);
+    const std::pair<uint256, uint32_t> O{r.cbid, 2u};
+    const uint256 x = raw256(0x88);            // the network's verified winner for O
+
+    r.verifier(true);
+    r.deliver(x, {O});
+    ASSERT_EQ(mp.verified_islock_outpoint_count(), 1u);
+
+    // A refused lock claiming O for W: the relay lane leaves a verified
+    // outpoint alone, and after the refusal O still points at X (G4 keeps
+    // excluding what the emit belt refuses).
+    r.verifier(false);
+    r.deliver(raw256(0x99), {O});
+    const auto T = make_spend(r.cbid, 2, 70'000, /*salt=*/91);   // spends O, txid != X
+    ASSERT_TRUE(mp.add_tx(T));
+    EXPECT_FALSE(selected_contains(mp, dash_txid(T)))
+        << "O's exclusion must point at the verified lock again after the forged one is refused";
+    EXPECT_EQ(mp.islock_outpoint_count(), 1u);
+}
+
 // ═══ 4. FAIL-CLOSED — real BLS (gated on the dashbls backend) ════════════════
 
 #ifdef C2POOL_DASH_BLS
