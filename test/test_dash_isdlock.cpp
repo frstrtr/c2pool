@@ -399,6 +399,18 @@ TEST(DashIslockVerify, SelectionPicksDesignatedIndexWithinCycle)
     ASSERT_TRUE(qp.has_value());
     EXPECT_EQ(qp->base_height, kCycle - 288 + kExpectSigner);
     EXPECT_NE(qp->quorum_hash, q->quorum_hash);
+
+    // Only the designated quorum of the cycle held (others missing, e.g. one
+    // index stayed on this cycle after a failed DKG while the rest rotated
+    // out): still selected. Upstream's `signer > quorums.size()` guard is
+    // taken against the full signing list, never against what we hold.
+    std::vector<RotatedQuorumCandidate> only;
+    for (const auto& c : synthetic_cycle(kCycle, 0x10))
+        if (c.quorum_index == kExpectSigner) only.push_back(c);
+    ASSERT_EQ(only.size(), 1u);
+    auto q1 = select_rotated_quorum(p60_75(), only, kCycle, rid);
+    ASSERT_TRUE(q1.has_value()) << "a held designated quorum refused because the held subset is small";
+    EXPECT_EQ(q1->quorum_index, kExpectSigner);
 }
 
 TEST(DashIslockVerify, SelectionFailsClosedOnEveryUncertainty)
@@ -529,14 +541,15 @@ TEST(DashIsdlockG4, UnverifiedIsdlockChangesNothing)
     EXPECT_TRUE(selected_contains(mp, x_txid));
 }
 
-// ═══ Pass 2 — the previous rotation cycle (Dash Core net_instantsend.cpp:340-354) ═
+// ═══ Retained quorums — locks signed by the previous rotation cycle ══════════
 //
-// Dash Core checks an isdlock against the current active set and, when that
-// fails, against the PREVIOUS active set. For a few blocks after a rotation
-// the network still signs with the previous cycle; with only the current set
-// every such lock was refused (mainnet 11-20: the 8 blocks after each
-// rotation). These pin the retained set (exactly the last retired batch per
-// type) and the two-pass selection, with a stub in place of the BLS check.
+// A lock names its signing quorum's own cycle, and for a few blocks after a
+// rotation the network still signs with the previous cycle; Dash Core resolves
+// the lock's own cycle (net_instantsend.cpp:136-145) and accepts it. Our
+// active set drops that cycle at the rotation diff, so every such lock was
+// refused (mainnet 11-20: the 8 blocks after each rotation). These pin the
+// retained set and the active-then-retained selection, with a stub in place
+// of the BLS check.
 
 using dash::coin::QuorumManager;
 using dash::coin::islock::IslockVerifyPass;
@@ -585,60 +598,70 @@ std::vector<RotatedQuorumCandidate> cycle(uint8_t tag, uint32_t cycle_height)
 
 } // namespace
 
-TEST(DashIsdlockPass2, QuorumManagerRetainsExactlyTheLastRetiredBatchPerType)
+TEST(DashIsdlockPass2, QuorumManagerRetainsRecentlyRetiredQuorumsPerType)
 {
     QuorumManager q;
     constexpr uint8_t kIs = 103;   // the rotated type's byte value is irrelevant here
     constexpr uint8_t kCl = 104;
+    auto rotate = [&](uint8_t from, uint8_t to, uint8_t first, uint8_t last) {
+        dash::coin::vendor::QuorumTail t;
+        for (uint8_t i = first; i <= last; ++i) {
+            t.deletedQuorums.emplace_back(kIs, qhash(from, i));
+            t.newQuorums.push_back(commit(kIs, to, i));
+        }
+        q.apply(t);
+    };
+    auto retired_of = [&](uint8_t tag) {
+        size_t n = 0;
+        for (const auto& e : q.retired_entries())
+            n += (e.key.llmqType == kIs && e.key.quorumHash.data()[0] == tag);
+        return n;
+    };
+
     dash::coin::vendor::QuorumTail t;
-    for (uint8_t i = 0; i < 3; ++i) t.newQuorums.push_back(commit(kIs, 0xA0, i));
+    for (uint8_t i = 0; i < 32; ++i) t.newQuorums.push_back(commit(kIs, 0xA0, i));
     t.newQuorums.push_back(commit(kCl, 0xC0, 0));
     q.apply(t);
     EXPECT_TRUE(q.retired_entries().empty());
 
-    // Rotation A -> B: the three A quorums retire.
-    dash::coin::vendor::QuorumTail r1;
-    for (uint8_t i = 0; i < 3; ++i) {
-        r1.deletedQuorums.emplace_back(kIs, qhash(0xA0, i));
-        r1.newQuorums.push_back(commit(kIs, 0xB0, i));
-    }
-    q.apply(r1);
-    ASSERT_EQ(q.retired_entries().size(), 3u);
-    for (const auto& e : q.retired_entries()) EXPECT_EQ(e.key.quorumHash.data()[0], 0xA0);
-    EXPECT_EQ(q.active_count(), 4u) << "retired entries are not in the active set";
+    // Rotation A -> B delivered in TWO diffs (31, then a late 1): the whole
+    // previous cycle is retained, not just the last diff's part.
+    rotate(0xA0, 0xB0, 0, 30);
+    rotate(0xA0, 0xB0, 31, 31);
+    EXPECT_EQ(retired_of(0xA0), 32u) << "a split rotation lost part of the previous cycle";
+    EXPECT_EQ(q.active_count(), 33u) << "retired entries are not in the active set";
 
-    // Another type retiring does not touch the rotated type's retained batch.
+    // Another type retiring does not touch the rotated type.
     dash::coin::vendor::QuorumTail r2;
     r2.deletedQuorums.emplace_back(kCl, qhash(0xC0, 0));
     q.apply(r2);
-    EXPECT_EQ(q.retired_entries().size(), 4u);
+    EXPECT_EQ(retired_of(0xA0), 32u);
+    EXPECT_EQ(q.retired_entries().size(), 33u);
 
-    // Rotation B -> C: B replaces A (A, two cycles back, is dropped).
-    dash::coin::vendor::QuorumTail r3;
-    for (uint8_t i = 0; i < 3; ++i) {
-        r3.deletedQuorums.emplace_back(kIs, qhash(0xB0, i));
-        r3.newQuorums.push_back(commit(kIs, 0xD0, i));
-    }
-    q.apply(r3);
-    size_t b = 0, a = 0;
-    for (const auto& e : q.retired_entries()) {
-        if (e.key.quorumHash.data()[0] == 0xB0) ++b;
-        if (e.key.quorumHash.data()[0] == 0xA0) ++a;
-    }
-    EXPECT_EQ(b, 3u);
-    EXPECT_EQ(a, 0u) << "the cycle before the previous one must be dropped at the next rotation";
+    // B -> D: both A and B retained (two cycles = the per-type cap of 64).
+    rotate(0xB0, 0xD0, 0, 31);
+    EXPECT_EQ(retired_of(0xA0), 32u);
+    EXPECT_EQ(retired_of(0xB0), 32u);
+
+    // D -> E: the oldest cycle (A) leaves; B and D stay.
+    rotate(0xD0, 0xE0, 0, 31);
+    EXPECT_EQ(retired_of(0xA0), 0u) << "the per-type cap must drop the oldest cycle";
+    EXPECT_EQ(retired_of(0xB0), 32u);
+    EXPECT_EQ(retired_of(0xD0), 32u);
 
     // A retired quorum that comes back is active again, not retired.
     dash::coin::vendor::QuorumTail r4;
     r4.newQuorums.push_back(commit(kIs, 0xB0, 1));
     q.apply(r4);
-    for (const auto& e : q.retired_entries()) EXPECT_FALSE(e.key == (QuorumManager::ActiveKey{kIs, qhash(0xB0, 1)}));
+    for (const auto& e : q.retired_entries())
+        EXPECT_FALSE(e.key == (QuorumManager::ActiveKey{kIs, qhash(0xB0, 1)}));
+    EXPECT_EQ(retired_of(0xB0), 31u);
 
     // A wipe and a warm load both empty the retained set.
     q.clear();
     EXPECT_TRUE(q.retired_entries().empty());
     q.apply(t);
-    q.apply(r1);
+    rotate(0xA0, 0xB0, 0, 31);
     ASSERT_FALSE(q.retired_entries().empty());
     q.replace_state({}, {});
     EXPECT_TRUE(q.retired_entries().empty());

@@ -191,13 +191,14 @@ public:
     // selecting the signing quorum.
     const std::vector<Entry>& active_entries() const { return m_active; }
 
-    // The entries the most recent diff that deleted quorums of a type removed,
-    // per type: a later deletion of the same type replaces them (so for the
-    // rotated InstantSend type this is exactly the previous cycle). Used only
-    // by the isdlock verifier's second pass (islock_verify.hpp
-    // verify_islock_two_pass, mirroring Dash Core's "previous active set"
-    // check); NOT part of the active set, the quorum root, the fold stamp or
-    // persistence. Emptied by clear() and replace_state(): after a restart or
+    // Quorums recently removed from the active set, per type: the last
+    // kRetiredPerType of each (two rotated cycles), oldest first. Used only
+    // as extra candidates by the isdlock verifier (islock_verify.hpp
+    // verify_islock_two_pass): a lock names its signing quorum's own cycle,
+    // and signers keep using the previous cycle for a few blocks after a
+    // rotation; the verifier additionally ignores retired quorums whose base
+    // block is too far below the tip. NOT part of the active set, the quorum
+    // root, the fold stamp or persistence. Emptied by clear() and replace_state(): after a restart or
     // a reorg wipe, pass 2 has nothing until the next rotation, which only
     // costs the refusals it was added to avoid.
     const std::vector<Entry>& retired_entries() const { return m_retired; }
@@ -254,22 +255,34 @@ public:
     uint64_t fold_seq() const { return m_fold_seq; }
 
 private:
-    // Replace the retired entries of every type in `gone` with `gone`'s.
+    // Append `gone` to the retired entries, then keep at most
+    // kRetiredPerType of each type (the oldest leave first). Accumulating
+    // rather than replacing matters: a rotation's deletions can arrive split
+    // over several diffs (a late commitment in the mining window), and
+    // replacing per diff would keep only the last part of the previous cycle.
+    static constexpr size_t kRetiredPerType = 64;   // two rotated cycles of 32
     void retire(const std::vector<Entry>& gone)
     {
         if (gone.empty()) return;
+        for (const auto& e : gone) {
+            m_retired.erase(
+                std::remove_if(m_retired.begin(), m_retired.end(),
+                    [&](const Entry& r) { return r.key == e.key; }),
+                m_retired.end());
+            m_retired.push_back(e);
+        }
         std::vector<uint8_t> types;
         for (const auto& e : gone)
             if (std::find(types.begin(), types.end(), e.key.llmqType) == types.end())
                 types.push_back(e.key.llmqType);
-        m_retired.erase(
-            std::remove_if(m_retired.begin(), m_retired.end(),
-                [&](const Entry& e) {
-                    return std::find(types.begin(), types.end(), e.key.llmqType)
-                           != types.end();
-                }),
-            m_retired.end());
-        m_retired.insert(m_retired.end(), gone.begin(), gone.end());
+        for (uint8_t t : types) {
+            size_t n = 0;
+            for (const auto& r : m_retired) n += (r.key.llmqType == t);
+            for (auto it = m_retired.begin(); n > kRetiredPerType && it != m_retired.end();) {
+                if (it->key.llmqType == t) { it = m_retired.erase(it); --n; }
+                else ++it;
+            }
+        }
     }
 
     std::vector<Entry> m_active;

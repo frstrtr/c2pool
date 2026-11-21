@@ -8033,13 +8033,14 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     }
                     return cands;
                 };
-                // Dash Core's two passes (net_instantsend.cpp:340-354): the
-                // current active set, then the previous cycle the last rotation
-                // retired. Without pass 2 every lock the network signs in the
-                // few blocks after a rotation is refused here.
+                // The active rotated quorums, then (only if that fails) the
+                // recently retired ones: a lock names its signing quorum's own
+                // cycle, and for a few blocks after a rotation the network
+                // still signs with the previous cycle, which Dash Core accepts
+                // (net_instantsend.cpp:136-145) but our active set has dropped.
                 const auto pass = dash::coin::islock::verify_islock_two_pass(
                     *p, collect(st->qmgr().active_entries()),
-                    collect(st->qmgr().retired_entries()), tip->height,
+                    [&] { return collect(st->qmgr().retired_entries()); }, tip->height,
                     cyc->height, inputs, txid,
                     [&sig](const auto& pubkey, const uint256& sign_hash) {
                         return dash::coin::vendor::verify_chainlock_sig(pubkey, sign_hash, sig);
@@ -8048,8 +8049,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     static std::atomic<uint64_t> previous_cycle_passes{0};
                     const uint64_t n = ++previous_cycle_passes;
                     if (n == 1 || n % 100 == 0)
-                        LOG_INFO << "[ISLOCK] verified against the PREVIOUS rotation"
-                                    " cycle (Dash Core pass 2): " << n << " so far";
+                        LOG_INFO << "[ISLOCK] verified against a RETAINED (recently"
+                                    " rotated-out) quorum: " << n << " so far";
                 }
                 return pass != dash::coin::islock::IslockVerifyPass::None;
             });
