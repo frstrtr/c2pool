@@ -153,6 +153,33 @@ inline bool block_solution_credit(bool is_block_solution, uint32_t header_bits,
     return is_block_solution && expected_bits.has_value() && *expected_bits == header_bits;
 }
 
+/// Whether a block-solving share may fire the found-block hook, which
+/// reconstructs the block and relays it to the coin network. A block is valid
+/// on the network only when its header bits are the target the network
+/// requires after its parent, so with the header-chain oracle bound
+/// (m_expected_block_bits) the hook fires only on an exact match:
+///  - Mismatch: the network would reject the block; nothing is relayed.
+///  - UnknownParent: the oracle has no answer (parent unknown, off our best
+///    chain, deeper than BLOCK_CREDIT_MAX_PARENT_DEPTH, or the retarget window
+///    is incomplete); nothing is relayed, the finder relays its own block.
+///  - NoOracle: no oracle bound (tests, tools, a node without a coin-P2P link
+///    and so without the P2P relay arm): the share's own bits are taken, as
+///    p2pool does (node.py:289).
+enum class FoundBlockBits { Match, Mismatch, UnknownParent, NoOracle };
+
+inline FoundBlockBits found_block_bits(uint32_t header_bits, bool have_oracle,
+                                       std::optional<uint32_t> expected_bits)
+{
+    if (!have_oracle) return FoundBlockBits::NoOracle;
+    if (!expected_bits.has_value()) return FoundBlockBits::UnknownParent;
+    return *expected_bits == header_bits ? FoundBlockBits::Match : FoundBlockBits::Mismatch;
+}
+
+inline bool found_block_may_fire(FoundBlockBits v)
+{
+    return v == FoundBlockBits::Match || v == FoundBlockBits::NoOracle;
+}
+
 /// p2pool Phase 4 head key. work is the verified work up to the head's 5th
 /// parent; attempts is ata(target) of the head itself (its index `work`).
 /// work - min(punish,1)*attempts: a punished head (punish > 0) is one share
@@ -451,6 +478,8 @@ private:
     // with no limit.  Counter is cleared on successful verification or
     // when the share is removed from the chain (on_removed signal).
     std::unordered_map<uint256, int, ShareHasher> m_verify_fail_count;
+    // Block-solving shares fire_block_found_checked refused (log throttle).
+    uint64_t m_found_block_refusals = 0;   // same writer context as m_verify_fail_count
 
     static int64_t now_seconds()
     {
@@ -485,6 +514,56 @@ public:
     std::function<void(double difficulty, const std::string& miner,
                        const uint256& share_hash)> m_on_share_difficulty;
 
+    // Fire m_on_block_found for a block-solving share only when its header
+    // bits are the ones the coin network requires after its parent block
+    // (found_block_bits). Returns whether the hook fired. A refusal is logged,
+    // never silent; the log is throttled (the first 3, then every 10th) since
+    // each refused share is one verified share.
+    //
+    // Trade-off of UnknownParent: the hook carries every arm (coin-P2P relay,
+    // the dashd submitblock backup when one is configured, the dashboard row),
+    // so a share whose parent the oracle cannot answer gets none of them on
+    // this node: a parent more than BLOCK_CREDIT_MAX_PARENT_DEPTH below our
+    // header-chain tip (history), off our best chain (a race), or a header
+    // chain that is not ready. The block's finder broadcasts it from its own
+    // stratum path, which this check does not touch.
+    bool fire_block_found_checked(const uint256& share_hash, const uint256& prev_block,
+                                  uint32_t header_bits, uint32_t header_time)
+    {
+        if (!m_on_block_found) return false;
+        std::optional<uint32_t> expected;
+        if (m_expected_block_bits)
+            expected = m_expected_block_bits(prev_block, static_cast<int64_t>(header_time));
+        const auto verdict = found_block_bits(header_bits,
+                                              static_cast<bool>(m_expected_block_bits), expected);
+        if (found_block_may_fire(verdict)) {
+            m_on_block_found(share_hash);
+            return true;
+        }
+        const uint64_t n = ++m_found_block_refusals;
+        if (n > 3 && n % 10 != 0)
+            return false;
+        if (verdict == FoundBlockBits::Mismatch) {
+            LOG_ERROR << "[BLOCK-FOUND] share " << share_hash.GetHex().substr(0, 16)
+                      << " meets its header target, but its header bits 0x" << std::hex
+                      << header_bits << " are not the network's 0x" << *expected << std::dec
+                      << " after block " << prev_block.GetHex().substr(0, 16)
+                      << " -- the block is invalid on the network; NOT relayed, NOT recorded"
+                      << " (refusal #" << n << ")";
+        } else {
+            LOG_WARNING << "[BLOCK-FOUND] share " << share_hash.GetHex().substr(0, 16)
+                        << " meets its header target, but the expected bits after block "
+                        << prev_block.GetHex().substr(0, 16)
+                        << " are unknown here (not within the last "
+                        << BLOCK_CREDIT_MAX_PARENT_DEPTH
+                        << " blocks of our best header chain, or the header chain is not"
+                           " ready), so its bits 0x" << std::hex << header_bits << std::dec
+                        << " cannot be checked -- NOT relayed or recorded by this node"
+                        << " (refusal #" << n << ")";
+        }
+        return false;
+    }
+
     // Scan the verified best chain for block solutions after startup.
     // Uses cached pow_hash from index (stored during original attempt_verify).
     // No scrypt recomputation needed — O(1) per share.
@@ -507,7 +586,10 @@ public:
                 uint256 block_target = chain::bits_to_target(s->m_min_header.m_bits);
                 if (!block_target.IsNull() && pow <= block_target) {
                     idx->is_block_solution = true;
-                    if (m_on_block_found) { m_on_block_found(pos); ++found_ltc; }
+                    if (fire_block_found_checked(pos, s->m_min_header.m_previous_block,
+                                                 s->m_min_header.m_bits,
+                                                 s->m_min_header.m_timestamp))
+                        ++found_ltc;
                 }
                 // Check merged targets (V36 shares carry exact data in m_merged_coinbase_info)
                 if (m_on_merged_block_check)
@@ -690,12 +772,22 @@ public:
         // solution (its PoW hash meets its header's block target). The index
         // flag feeds head scoring (head_punish_reason) whether or not a
         // found-block hook is bound; the hook fires as p2pool's
-        // tracker.verified.added watcher does (node.py:289).
+        // tracker.verified.added watcher does (node.py:289), and only for
+        // header bits the network accepts (fire_block_found_checked).
         if (g_last_init_is_block) {
             g_last_init_is_block = false;
             auto* idx = chain.get_index(share_hash);
             if (idx) idx->is_block_solution = true;
-            if (m_on_block_found) m_on_block_found(share_hash);
+            if (m_on_block_found) {
+                uint256 prev_block;
+                uint32_t bits = 0, ts = 0;
+                share_var.invoke([&](auto* obj) {
+                    prev_block = obj->m_min_header.m_previous_block;
+                    bits = obj->m_min_header.m_bits;
+                    ts = obj->m_min_header.m_timestamp;
+                });
+                fire_block_found_checked(share_hash, prev_block, bits, ts);
+            }
         }
 
         // Report share difficulty for best-share dashboard tracking.
