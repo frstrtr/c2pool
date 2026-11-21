@@ -69,12 +69,41 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Check source presence
+        id: presence
+        run: |
+          GATE="${{ matrix.gate_file }}"
+          if [ -n "$GATE" ]; then
+            # Daemonless entry: gate on the dashd-cut artifact (#1293 family).
+            if [ -f "$GATE" ]; then
+              echo "exists=1" >> "$GITHUB_OUTPUT"
+              echo "::notice::daemonless gate $GATE present — building/testing."
+            else
+              echo "exists=0" >> "$GITHUB_OUTPUT"
+              echo "::notice::daemonless gate $GATE not on this branch — skipping (expected until the dashd-cut family lands)."
+            fi
+          elif [ -f "src/c2pool/main_${{ matrix.coin }}.cpp" ] && [ -d "src/impl/${{ matrix.coin }}" ]; then
+            echo "exists=1" >> "$GITHUB_OUTPUT"
+            echo "::notice::c2pool-${{ matrix.coin }} source present — building."
+          else
+            echo "exists=0" >> "$GITHUB_OUTPUT"
+            echo "::notice::c2pool-${{ matrix.coin }} source not on this branch — skipping (expected until that coin's split lands)."
+          fi
+
       - name: Acquire VM905 build-host heavy-leg semaphore
+        # Only a cell that builds holds a slot (the doge cell self-skips: 167
+        # no-op holds in one week). The holder dies with the job, so a skipped
+        # acquire needs no release.
+        if: steps.presence.outputs.exists == '1'
         uses: ./.github/actions/heavy-leg-lock
         with:
           lock-file: /tmp/c2pool-build-heavy-leg.lock
           holder-file: /tmp/c2pool-build-heavy-leg.holder
-          slots: "3"
+          # Short leg (ccache-warm, minutes): may take build-host slots 1-4. Long
+          # legs (build.yml compile legs, CodeQL) pass "3" on the same lock, so at
+          # most 3 long legs co-reside and at most 4 heavy legs run on the host.
+          # Rollback: write 3 to ~/.config/c2pool-ci/c2pool-build-heavy-leg.lock.slots.
+          slots: "4"
       - name: Set per-job Conan home
         run: |
           # github-hosted: ephemeral per-job home, warmed by actions/cache below.
@@ -97,27 +126,6 @@ jobs:
       # each run, so without it every cell recompiles from scratch.
       - name: ccache launcher (when installed)
         uses: ./.github/actions/ccache-launcher
-
-      - name: Check source presence
-        id: presence
-        run: |
-          GATE="${{ matrix.gate_file }}"
-          if [ -n "$GATE" ]; then
-            # Daemonless entry: gate on the dashd-cut artifact (#1293 family).
-            if [ -f "$GATE" ]; then
-              echo "exists=1" >> "$GITHUB_OUTPUT"
-              echo "::notice::daemonless gate $GATE present — building/testing."
-            else
-              echo "exists=0" >> "$GITHUB_OUTPUT"
-              echo "::notice::daemonless gate $GATE not on this branch — skipping (expected until the dashd-cut family lands)."
-            fi
-          elif [ -f "src/c2pool/main_${{ matrix.coin }}.cpp" ] && [ -d "src/impl/${{ matrix.coin }}" ]; then
-            echo "exists=1" >> "$GITHUB_OUTPUT"
-            echo "::notice::c2pool-${{ matrix.coin }} source present — building."
-          else
-            echo "exists=0" >> "$GITHUB_OUTPUT"
-            echo "::notice::c2pool-${{ matrix.coin }} source not on this branch — skipping (expected until that coin's split lands)."
-          fi
 
       - name: Install system dependencies
         if: steps.presence.outputs.exists == '1' && runner.environment == 'github-hosted'

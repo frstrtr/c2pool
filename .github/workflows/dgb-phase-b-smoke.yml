@@ -39,7 +39,11 @@ jobs:
         with:
           lock-file: /tmp/c2pool-build-heavy-leg.lock
           holder-file: /tmp/c2pool-build-heavy-leg.holder
-          slots: "3"
+          # Short leg (ccache-warm, minutes): may take build-host slots 1-4. Long
+          # legs (build.yml compile legs, CodeQL) pass "3" on the same lock, so at
+          # most 3 long legs co-reside and at most 4 heavy legs run on the host.
+          # Rollback: write 3 to ~/.config/c2pool-ci/c2pool-build-heavy-leg.lock.slots.
+          slots: "4"
       - name: Set per-job Conan home
         run: |
           # github-hosted: ephemeral per-job home, warmed by actions/cache below.
