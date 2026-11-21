@@ -50,6 +50,7 @@
 #include <core/pack.hpp>
 #include <core/hash.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstring>
@@ -701,4 +702,140 @@ TEST(DashExclusionDiscipline, AlreadyConfirmedTxRejectedAndUnselectable)
     auto [sel, fees] = f.mp.get_sorted_txs_with_fees(1u << 20);
     for (const auto& s : sel) EXPECT_NE(dash_txid(s.tx), txid);
     EXPECT_EQ(fees, 0u);
+}
+
+// ─── Forced-fee re-proof (fee-parity shadow, 11-15) ─────────────────────────
+//
+// A DSTX admitted while one of its inputs could not be priced is FORCED
+// (fee_known=true, fee=0, fee_fold_proven=false) and so template-excluded.
+// recompute_unknown_fees used to skip every fee_known entry, so a forced DSTX
+// stayed excluded even after its inputs confirmed, until someone else mined
+// it (dashd includes it with the +0.1 DASH priority). A fee-unknown child also
+// waited for the next block connect even when its parent reached the pool.
+// The fix re-runs compute_fee_locked, the same proof the selector trusts, and
+// promotes only on success.
+
+// RED on master: the forced DSTX is never re-proved after its inputs confirm.
+TEST(DashForcedFeeReprove, ForcedDstxIsProvedWhenItsInputsConfirm)
+{
+    FeeLane f;
+    const std::vector<std::pair<int64_t, uint8_t>> outs{{kDenom, 0x01}, {kDenom, 0x02}, {kDenom, 0x03}};
+    const uint256 cb_txid = dash_txid(make_coinbase(outs, /*salt=*/11));   // FeeLane::seed's coinbase
+    auto dstx_tx = make_dstx_tx(cb_txid, /*salt=*/21);
+    const uint256 txid = dash_txid(dstx_tx);
+
+    ASSERT_TRUE(f.mp.add_dstx(dstx_tx));            // inputs not confirmed yet: forced
+    ASSERT_TRUE(f.mp.get_entry(txid)->fee_known);
+    ASSERT_FALSE(f.mp.get_entry(txid)->fee_fold_proven);
+    ASSERT_TRUE(selected_order(f.mp).empty());
+
+    f.seed(outs);                                    // the inputs confirm; the lane recomputes
+    auto e = f.mp.get_entry(txid);
+    ASSERT_TRUE(e.has_value());
+    EXPECT_TRUE(e->fee_fold_proven) << "a forced DSTX whose inputs now price must be re-proved";
+    EXPECT_EQ(e->fee, 0u) << "balanced DSTX: proven base fee 0";
+    EXPECT_EQ(e->fee_delta, Mempool::DSTX_FEE_DELTA);
+    auto [sel, fees] = f.mp.get_sorted_txs_with_fees(1u << 20);
+    ASSERT_EQ(sel.size(), 1u) << "the proven DSTX rides its +0.1 DASH priority into the template";
+    EXPECT_EQ(dash_txid(sel[0].tx), txid);
+    EXPECT_EQ(fees, 0u) << "the priority never reaches total_fees";
+}
+
+// RED on master: a forced entry with a real fee is re-keyed at its PROVEN fee.
+TEST(DashForcedFeeReprove, ForcedTxIsReKeyedAtItsProvenFee)
+{
+    FeeLane f;
+    const std::vector<std::pair<int64_t, uint8_t>> outs{
+        {kDenom + 100, 0x01}, {kDenom + 100, 0x02}, {kDenom + 100, 0x03}};
+    const uint256 cb_txid = dash_txid(make_coinbase(outs, /*salt=*/11));
+    auto tx = make_dstx_tx(cb_txid, /*salt=*/22);   // 3 x (kDenom+100) in, 3 x kDenom out
+    const uint256 txid = dash_txid(tx);
+
+    ASSERT_TRUE(f.mp.add_dstx(tx));
+    ASSERT_EQ(f.mp.get_entry(txid)->fee, 0u) << "forced: understated to 0";
+    f.seed(outs);
+
+    auto e = f.mp.get_entry(txid);
+    EXPECT_TRUE(e->fee_fold_proven);
+    EXPECT_EQ(e->fee, 300u) << "the proof's in-minus-out, not the forced 0";
+    auto [sel, fees] = f.mp.get_sorted_txs_with_fees(1u << 20);
+    ASSERT_EQ(sel.size(), 1u);
+    EXPECT_EQ(sel[0].fee, 300u);
+    EXPECT_EQ(fees, 300u) << "total_fees carries exactly the proven base fee";
+}
+
+// GUARD (green on both): promotion re-runs the proof; it is never a flag flip.
+// A forced money-creating tx stays forced and excluded after its inputs
+// confirm, because the proof (in_sum >= out_sum) still fails.
+TEST(DashForcedFeeReprove, FailedProofLeavesTheForcedEntryUntouched)
+{
+    FeeLane f;
+    const std::vector<std::pair<int64_t, uint8_t>> outs{{100'000, 0x04}};
+    const uint256 cb_txid = dash_txid(make_coinbase(outs, /*salt=*/11));
+    MutableTransaction tx;
+    tx.version = 1; tx.type = 0; tx.locktime = 23;
+    tx.vin.push_back(make_input(cb_txid, 0));                       // 100'000 in
+    tx.vout.push_back(make_output(200'000, p2pkh_script(0x53)));   // 200'000 out
+    const uint256 txid = dash_txid(tx);
+
+    ASSERT_TRUE(f.mp.add_dstx(tx));
+    f.seed(outs);
+    auto e = f.mp.get_entry(txid);
+    ASSERT_TRUE(e.has_value());
+    EXPECT_TRUE(e->fee_known) << "the forced relay state survives a failed proof";
+    EXPECT_EQ(e->fee, 0u);
+    EXPECT_FALSE(e->fee_fold_proven) << "in_sum < out_sum: never proven";
+    EXPECT_TRUE(selected_order(f.mp).empty());
+}
+
+// RED on master: a parent reaching the pool proves its waiting children at
+// once (CPFP), without a block connect: a fee-unknown child and a forced DSTX.
+TEST(DashForcedFeeReprove, ALateParentProvesItsPooledChildrenWithoutABlock)
+{
+    FeeLane f;
+    f.seed({{200'000, 0x04}, {3 * kDenom + 1'000, 0x05}});
+
+    MutableTransaction parent;                       // spends seed:0, fee 10'000
+    parent.version = 1; parent.type = 0; parent.locktime = 31;
+    parent.vin.push_back(make_input(f.cb_txid, 0));
+    parent.vout.push_back(make_output(100'000, p2pkh_script(0x60)));
+    parent.vout.push_back(make_output(90'000, p2pkh_script(0x61)));
+    const uint256 parent_id = dash_txid(parent);
+
+    MutableTransaction child;                        // spends parent:1, fee 10'000
+    child.version = 1; child.type = 0; child.locktime = 32;
+    child.vin.push_back(make_input(parent_id, 1));
+    child.vout.push_back(make_output(80'000, p2pkh_script(0x62)));
+    const uint256 child_id = dash_txid(child);
+
+    MutableTransaction mixer_in;                     // spends seed:1 into 3 denominations, fee 1'000
+    mixer_in.version = 1; mixer_in.type = 0; mixer_in.locktime = 33;
+    mixer_in.vin.push_back(make_input(f.cb_txid, 1));
+    for (uint8_t i = 0; i < 3; ++i)
+        mixer_in.vout.push_back(make_output(kDenom, p2pkh_script(0x70 + i)));
+    auto dstx_tx = make_dstx_tx(dash_txid(mixer_in), /*salt=*/34);
+    const uint256 dstx_id = dash_txid(dstx_tx);
+
+    // The children arrive first.
+    ASSERT_TRUE(f.mp.add_tx(child));
+    ASSERT_TRUE(f.mp.add_dstx(dstx_tx));
+    ASSERT_FALSE(f.mp.get_entry(child_id)->fee_known);
+    ASSERT_FALSE(f.mp.get_entry(dstx_id)->fee_fold_proven);
+
+    // Then their parents, with no block in between.
+    ASSERT_TRUE(f.mp.add_tx(parent));
+    ASSERT_TRUE(f.mp.add_tx(mixer_in));
+
+    auto c = f.mp.get_entry(child_id);
+    EXPECT_TRUE(c->fee_fold_proven) << "the child is priced the moment its parent is pooled";
+    EXPECT_EQ(c->fee, 10'000u);
+    auto d = f.mp.get_entry(dstx_id);
+    EXPECT_TRUE(d->fee_fold_proven) << "the forced DSTX is promoted the moment its input tx is pooled";
+    EXPECT_EQ(d->fee, 0u);
+
+    auto order = selected_order(f.mp);
+    auto pos = [&](const uint256& id) { return std::find(order.begin(), order.end(), id) - order.begin(); };
+    ASSERT_EQ(order.size(), 4u) << "parent, child, mixer input and DSTX are all template members";
+    EXPECT_LT(pos(parent_id), pos(child_id)) << "a parent precedes its child";
+    EXPECT_LT(pos(dash_txid(mixer_in)), pos(dstx_id));
 }
