@@ -183,9 +183,10 @@ inline bool found_block_may_fire(FoundBlockBits v)
 /// Whether a block-solving share's header time lets the found-block hook fire.
 /// The coin network accepts a block only with a time above its parent's
 /// median-time-past ("time-too-old" otherwise); `floor` is that MTP + 1 from
-/// the header-chain oracle (m_block_time_floor), nullopt when unknown. As with
-/// the bits: below the floor or unknown => no fire; no oracle => unchanged.
-/// This gates only the hook (relay and record), never the share itself.
+/// the header-chain oracle (m_block_time_floor), nullopt when unknown. Only a
+/// KNOWN floor refuses: below it => no fire; an unknown floor or no oracle =>
+/// fire (the bits check, which runs first, already needs the parent on our
+/// header chain). This gates only the hook (relay and record), never the share.
 enum class FoundBlockTime { AtOrAboveFloor, BelowFloor, UnknownFloor, NoOracle };
 
 inline FoundBlockTime found_block_time(uint32_t header_time, bool have_oracle,
@@ -198,7 +199,7 @@ inline FoundBlockTime found_block_time(uint32_t header_time, bool have_oracle,
 
 inline bool found_block_time_may_fire(FoundBlockTime v)
 {
-    return v == FoundBlockTime::AtOrAboveFloor || v == FoundBlockTime::NoOracle;
+    return v != FoundBlockTime::BelowFloor;
 }
 
 /// p2pool Phase 4 head key. work is the verified work up to the head's 5th
@@ -542,8 +543,8 @@ public:
 
     // Fire m_on_block_found for a block-solving share only when its header
     // bits are the ones the coin network requires after its parent block
-    // (found_block_bits) and its header time is above the parent's
-    // median-time-past (found_block_time). The share itself is never
+    // (found_block_bits) and its header time is not at or below the parent's
+    // known median-time-past (found_block_time). The share itself is never
     // affected. Returns whether the hook fired. A refusal is logged,
     // never silent; the log is throttled (the first 3, then every 10th) since
     // each refused share is one verified share.
@@ -575,24 +576,16 @@ public:
                 m_on_block_found(share_hash);
                 return true;
             }
+            // Only a known floor refuses (BelowFloor; *floor is engaged).
             const uint64_t n = ++m_found_block_refusals;
             if (n > 3 && n % 10 != 0)
                 return false;
-            if (tv == FoundBlockTime::BelowFloor) {
-                LOG_ERROR << "[BLOCK-FOUND] share " << share_hash.GetHex().substr(0, 16)
-                          << " meets its header target, but its header time " << header_time
-                          << " is below the network's minimum " << *floor << " after block "
-                          << prev_block.GetHex().substr(0, 16)
-                          << " (median-time-past + 1) -- the block is invalid on the network;"
-                             " NOT relayed, NOT recorded (the share stays) (refusal #" << n << ")";
-            } else {
-                LOG_WARNING << "[BLOCK-FOUND] share " << share_hash.GetHex().substr(0, 16)
-                            << " meets its header target, but the median-time-past of block "
-                            << prev_block.GetHex().substr(0, 16)
-                            << " is unknown here, so its header time " << header_time
-                            << " cannot be checked -- NOT relayed or recorded by this node"
-                            << " (refusal #" << n << ")";
-            }
+            LOG_ERROR << "[BLOCK-FOUND] share " << share_hash.GetHex().substr(0, 16)
+                      << " meets its header target, but its header time " << header_time
+                      << " is below the network's minimum " << *floor << " after block "
+                      << prev_block.GetHex().substr(0, 16)
+                      << " (median-time-past + 1) -- the block is invalid on the network;"
+                         " NOT relayed, NOT recorded (the share stays) (refusal #" << n << ")";
             return false;
         }
         const uint64_t n = ++m_found_block_refusals;

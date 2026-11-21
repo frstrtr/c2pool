@@ -539,7 +539,8 @@ TEST(DashDashboardFoundBlock, BlockBelowTheNetworksTimeFloorIsNotRecorded)
         << "the share keeps its block flag";
 }
 
-TEST(DashDashboardFoundBlock, BlockWithAnUnknownTimeFloorIsNotRecorded)
+// Only a KNOWN floor refuses: with the bits right, an unknown floor fires.
+TEST(DashDashboardFoundBlock, BlockWithAnUnknownTimeFloorIsRecorded)
 {
     Harness h;
     set_parent(h);
@@ -552,7 +553,7 @@ TEST(DashDashboardFoundBlock, BlockWithAnUnknownTimeFloorIsNotRecorded)
     h.fire_under_exclusive_lock();
 
     EXPECT_EQ(floor.calls, 1);
-    EXPECT_TRUE(h.rows.empty());
+    EXPECT_EQ(h.rows.size(), 1u) << "an unknown floor does not refuse";
 }
 
 TEST(DashDashboardFoundBlock, FoundBlockTimeVerdicts)
@@ -565,6 +566,7 @@ TEST(DashDashboardFoundBlock, FoundBlockTimeVerdicts)
     EXPECT_EQ(dash::found_block_time(HEADER_TIME, false, std::nullopt), FoundBlockTime::NoOracle);
     EXPECT_TRUE(dash::found_block_time_may_fire(FoundBlockTime::AtOrAboveFloor));
     EXPECT_TRUE(dash::found_block_time_may_fire(FoundBlockTime::NoOracle));
+    EXPECT_TRUE(dash::found_block_time_may_fire(FoundBlockTime::UnknownFloor))
+        << "only a known floor refuses";
     EXPECT_FALSE(dash::found_block_time_may_fire(FoundBlockTime::BelowFloor));
-    EXPECT_FALSE(dash::found_block_time_may_fire(FoundBlockTime::UnknownFloor));
 }

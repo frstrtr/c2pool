@@ -235,6 +235,8 @@ TEST(DashReloadBlockFlag, AVerifiedBlockAtTheTimeFloorFires)
     EXPECT_EQ(r.floor_prev, r.header_prev) << "the floor is asked for the share's parent block";
 }
 
+// A peer's share (received over the share-chain wire) whose block time is at or
+// below the parent's known median-time-past: not relayed; the share stays.
 TEST(DashReloadBlockFlag, AVerifiedBlockBelowTheTimeFloorDoesNotFireAndTheShareStays)
 {
     const auto r = verify_block_share_with_oracle(
@@ -246,12 +248,13 @@ TEST(DashReloadBlockFlag, AVerifiedBlockBelowTheTimeFloorDoesNotFireAndTheShareS
     EXPECT_TRUE(r.flagged) << "and keeps its block flag";
 }
 
-TEST(DashReloadBlockFlag, AVerifiedBlockWithAnUnknownTimeFloorDoesNotFire)
+// Only a KNOWN floor refuses: with the bits right, an unknown floor fires.
+TEST(DashReloadBlockFlag, AVerifiedBlockWithAnUnknownTimeFloorFires)
 {
     const auto r = verify_block_share_with_oracle(
         "c2pool_dash_found_time_unknown_floor", EASY_BITS,
         [](uint32_t) -> std::optional<uint32_t> { return std::nullopt; });
     EXPECT_GE(r.floor_calls, 1);
-    EXPECT_EQ(r.fired, 0);
+    EXPECT_GE(r.fired, 1) << "an unknown floor does not refuse";
     EXPECT_TRUE(r.verified);
 }
