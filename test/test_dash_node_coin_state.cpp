@@ -169,6 +169,40 @@ TEST(DashNodeCoinState, PopulatedRoutesEmbeddedByteEqualToDirectBuild) {
     expect_workdata_eq(sel.work, reference);
 }
 
+// The template's mintime (the submit floor, MTP + 1) is withheld (0) when the
+// tip's MTP is not over a full 11-header window (set_tip's last argument):
+// an MTP over fewer headers can be later than the network's. Everything else
+// in the template, including the lock-time cutoff from the same MTP, is
+// unchanged.
+TEST(DashNodeCoinState, IncompleteMtpWindowServesNoMintime) {
+    const uint256 prev_hash = raw256(0xAB);
+    const uint32_t bits = 0x1b104be3u;
+    const uint32_t mtp  = 1'700'000'000u;
+    auto never = [&]() -> DashWorkData {
+        ADD_FAILURE() << "a populated bundle must not reach the dashd fallback";
+        return DashWorkData{};
+    };
+
+    NodeCoinState full;
+    seed_single_mn(full, p2pkh_script(0x30));
+    full.set_tip(H - 1, prev_hash, bits, mtp, DASH_PUBKEY_VER, DASH_P2SH_VER,
+                 1'700'000'123u, 0x20000000u, /*mtp_window_complete=*/true);
+    const WorkSelection a = full.select_work(never);
+    ASSERT_EQ(a.source, WorkSource::Embedded);
+    EXPECT_EQ(a.work.m_mintime, mtp + 1) << "a full window: the floor is MTP + 1";
+
+    NodeCoinState partial;
+    seed_single_mn(partial, p2pkh_script(0x30));
+    partial.set_tip(H - 1, prev_hash, bits, mtp, DASH_PUBKEY_VER, DASH_P2SH_VER,
+                    1'700'000'123u, 0x20000000u, /*mtp_window_complete=*/false);
+    const WorkSelection b = partial.select_work(never);
+    ASSERT_EQ(b.source, WorkSource::Embedded);
+    EXPECT_EQ(b.work.m_mintime, 0u) << "an incomplete window: no floor";
+    EXPECT_EQ(b.work.m_height, a.work.m_height);
+    EXPECT_EQ(b.work.m_coinbase_value, a.work.m_coinbase_value);
+    EXPECT_EQ(b.work.m_txs.size(), a.work.m_txs.size()) << "only the floor changes";
+}
+
 // ════════════════════════════════════════════════════════════════════════
 // COLD arm (retained fallback): unpopulated / invalidated -> DashdFallback.
 // ════════════════════════════════════════════════════════════════════════

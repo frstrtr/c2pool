@@ -70,7 +70,13 @@ tip_advance_from_chain(const HeaderChain& chain,
     t.prev_height          = tip->height;
     t.prev_hash            = tip->hash;
     t.bits_for_next        = bits_for_next;
-    t.mtp_at_tip           = chain.median_time_past();
+    // The MTP of THIS tip, read for its hash under one lock (the tip may move
+    // between the two reads). nullopt while the 11-header window is incomplete:
+    // keep the tip-window median for the lock-time cutoff and MNHF, and mark
+    // the window incomplete so the template carries no mintime floor.
+    const auto mtp = chain.median_time_past_at(tip->hash);
+    t.mtp_at_tip           = mtp ? *mtp : chain.median_time_past();
+    t.mtp_window_complete  = mtp.has_value();
     t.address_version      = address_version;
     t.address_p2sh_version = address_p2sh_version;
     // curtime/version left 0 => build_embedded_workdata()'s SAFE-ADDITIVE defaults.

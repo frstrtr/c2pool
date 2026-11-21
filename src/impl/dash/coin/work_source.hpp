@@ -102,6 +102,9 @@ struct EmbeddedWorkInputs {
     const Mempool*        mempool{nullptr};
     uint32_t              bits_for_next{0};
     uint32_t              mtp_at_tip{0};
+    // false: mtp_at_tip is not over a full 11-header window, so the template
+    // carries mintime 0 (no submit floor) instead of mtp_at_tip + 1.
+    bool                  mtp_window_complete{true};
     uint8_t               address_version{0};
     uint8_t               address_p2sh_version{0};
     // Optional seams. 0 => use build_embedded_workdata's own SAFE-ADDITIVE
@@ -379,6 +382,10 @@ inline WorkSelection select_dash_work(
             // Testnet min-difficulty: bits for the template's own curtime.
             if (emb.bits_at_time)
                 if (auto b = emb.bits_at_time(w.m_previous_block, w.m_curtime)) w.m_bits = *b;
+            // An MTP over fewer than 11 headers can be later than the
+            // network's: no mintime floor from it (0 = unknown).
+            if (!emb.mtp_window_complete)
+                w.m_mintime = 0;
             return w;
         },
         dashd_fallback);
