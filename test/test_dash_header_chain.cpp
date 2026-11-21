@@ -989,6 +989,67 @@ TEST(DashHeaderChain, ExpectedBitsAfterSkipsWindowsWithTheSyntheticAnchor)
         << "anchor + 24: 24 real headers";
 }
 
+// A store that already has a tip (here a fast-start anchor, as on mainnet,
+// where no genesis stub is seeded) keeps it when the genesis header arrives.
+TEST(DashHeaderChain, GenesisHeaderDoesNotMoveAnAnchoredTip)
+{
+    auto params = make_easy_test_params();
+    // A real genesis header for these params: no parent, its X11 hash IS the
+    // configured genesis hash.
+    BlockHeaderType genesis;
+    genesis.m_version = 1;
+    genesis.m_merkle_root.SetHex("00000000000000000000000000000000000000000000000000000000000000dd");
+    genesis.m_timestamp = 1'700'000'000u;
+    genesis.m_bits = params.pow_limit.GetCompact();
+    genesis.m_nonce = 0;
+    params.genesis_hash = x11_hash(genesis);
+    DashChainParams::Checkpoint cp{};
+    cp.height = 1000;
+    cp.hash.SetHex("00000000000000000000000000000000000000000000000000000000000000cc");
+    params.fast_start_checkpoint = cp;
+    HeaderChain hc(params, /*db_path=*/"");
+    ASSERT_TRUE(hc.init());
+    std::vector<uint256> hashes{cp.hash};
+    uint32_t t = 1'800'000'000u;
+    for (int i = 0; i < 5; ++i) {
+        t += 150u;
+        auto h = mine_header(hashes.back(), t, params.pow_limit.GetCompact(), params.pow_limit);
+        ASSERT_TRUE(hc.add_header(h));
+        hashes.push_back(x11_hash(h));
+    }
+    ASSERT_EQ(hc.height(), 1005u);
+    ASSERT_FALSE(hc.has_header(params.genesis_hash)) << "an anchored store seeds no genesis stub";
+
+    EXPECT_FALSE(hc.add_header(genesis)) << "the genesis header is refused by an anchored store";
+    EXPECT_EQ(hc.height(), 1005u) << "the tip height did not move";
+    ASSERT_TRUE(hc.tip().has_value());
+    EXPECT_EQ(hc.tip()->hash, hashes.back()) << "the tip did not move";
+    EXPECT_FALSE(hc.has_header(params.genesis_hash));
+
+    // The chain keeps extending from the real tip.
+    auto next = mine_header(hashes.back(), t + 150u, params.pow_limit.GetCompact(), params.pow_limit);
+    EXPECT_TRUE(hc.add_header(next));
+    EXPECT_EQ(hc.height(), 1006u);
+}
+
+// An empty store still starts from the genesis header.
+TEST(DashHeaderChain, GenesisHeaderStartsAnEmptyStore)
+{
+    auto params = make_easy_test_params();
+    BlockHeaderType genesis;
+    genesis.m_version = 1;
+    genesis.m_merkle_root.SetHex("00000000000000000000000000000000000000000000000000000000000000dd");
+    genesis.m_timestamp = 1'700'000'000u;
+    genesis.m_bits = params.pow_limit.GetCompact();
+    genesis.m_nonce = 0;
+    params.genesis_hash = x11_hash(genesis);
+    HeaderChain hc(params, /*db_path=*/"");   // not init()'d: no stub, no anchor
+    EXPECT_TRUE(hc.add_header(genesis));
+    ASSERT_TRUE(hc.tip().has_value());
+    EXPECT_EQ(hc.tip()->hash, params.genesis_hash);
+    EXPECT_EQ(hc.height(), 0u);
+}
+
 // An old parent is refused: the block-solution credit checks a share's
 // header bits against its parent's expected bits, and an old parent's
 // historic bits are easier whenever the difficulty rose since. With
