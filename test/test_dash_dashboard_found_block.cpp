@@ -478,3 +478,93 @@ TEST(DashDashboardFoundBlock, FoundBlockBitsVerdicts)
     EXPECT_FALSE(dash::found_block_may_fire(FoundBlockBits::Mismatch));
     EXPECT_FALSE(dash::found_block_may_fire(FoundBlockBits::UnknownParent));
 }
+
+// ── The found-block hook and the network's time floor ──────────────────────
+// With the bits right, the hook still fires only for a header time above the
+// parent's median-time-past (m_block_time_floor answers MTP + 1). The share
+// keeps its block flag either way.
+
+namespace {
+
+struct FloorProbe
+{
+    int calls = 0;
+    uint256 prev;
+};
+
+void bind_time_floor(Harness& h, FloorProbe& probe, std::optional<uint32_t> floor)
+{
+    h.node.tracker().m_block_time_floor =
+        [&probe, floor](const uint256& prev) -> std::optional<uint32_t> {
+            ++probe.calls;
+            probe.prev = prev;
+            return floor;
+        };
+}
+
+} // namespace
+
+TEST(DashDashboardFoundBlock, BlockAtTheNetworksTimeFloorIsRecorded)
+{
+    Harness h;
+    set_parent(h);
+    h.bind(/*testnet=*/false);
+    OracleProbe bits;
+    bind_oracle(h, bits, BLOCK_BITS);
+    FloorProbe floor;
+    bind_time_floor(h, floor, HEADER_TIME);   // header time == MTP + 1: valid
+
+    h.fire_under_exclusive_lock();
+
+    EXPECT_EQ(h.rows.size(), 1u);
+    EXPECT_EQ(floor.calls, 1);
+    EXPECT_EQ(floor.prev, parent_block()) << "the floor is asked for the share's parent block";
+}
+
+TEST(DashDashboardFoundBlock, BlockBelowTheNetworksTimeFloorIsNotRecorded)
+{
+    Harness h;
+    set_parent(h);
+    h.bind(/*testnet=*/false);
+    OracleProbe bits;
+    bind_oracle(h, bits, BLOCK_BITS);
+    FloorProbe floor;
+    bind_time_floor(h, floor, HEADER_TIME + 1);   // header time <= MTP: time-too-old
+
+    h.fire_under_exclusive_lock();
+
+    EXPECT_EQ(floor.calls, 1);
+    EXPECT_TRUE(h.rows.empty()) << "a time-too-old block must be neither recorded nor relayed";
+    EXPECT_TRUE(h.node.tracker().chain.get_index(h.share_hash)->is_block_solution)
+        << "the share keeps its block flag";
+}
+
+TEST(DashDashboardFoundBlock, BlockWithAnUnknownTimeFloorIsNotRecorded)
+{
+    Harness h;
+    set_parent(h);
+    h.bind(/*testnet=*/false);
+    OracleProbe bits;
+    bind_oracle(h, bits, BLOCK_BITS);
+    FloorProbe floor;
+    bind_time_floor(h, floor, std::nullopt);
+
+    h.fire_under_exclusive_lock();
+
+    EXPECT_EQ(floor.calls, 1);
+    EXPECT_TRUE(h.rows.empty());
+}
+
+TEST(DashDashboardFoundBlock, FoundBlockTimeVerdicts)
+{
+    using dash::FoundBlockTime;
+    EXPECT_EQ(dash::found_block_time(HEADER_TIME, true, HEADER_TIME), FoundBlockTime::AtOrAboveFloor);
+    EXPECT_EQ(dash::found_block_time(HEADER_TIME + 1, true, HEADER_TIME), FoundBlockTime::AtOrAboveFloor);
+    EXPECT_EQ(dash::found_block_time(HEADER_TIME - 1, true, HEADER_TIME), FoundBlockTime::BelowFloor);
+    EXPECT_EQ(dash::found_block_time(HEADER_TIME, true, std::nullopt), FoundBlockTime::UnknownFloor);
+    EXPECT_EQ(dash::found_block_time(HEADER_TIME, false, std::nullopt), FoundBlockTime::NoOracle);
+    EXPECT_TRUE(dash::found_block_time_may_fire(FoundBlockTime::AtOrAboveFloor));
+    EXPECT_TRUE(dash::found_block_time_may_fire(FoundBlockTime::NoOracle));
+    EXPECT_FALSE(dash::found_block_time_may_fire(FoundBlockTime::BelowFloor));
+    EXPECT_FALSE(dash::found_block_time_may_fire(FoundBlockTime::UnknownFloor));
+}

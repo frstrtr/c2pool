@@ -5841,6 +5841,20 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 return oracle->hc->expected_bits_after(prev_block, block_time,
                                                        dash::BLOCK_CREDIT_MAX_PARENT_DEPTH);
             };
+        // A share-chain block solution is relayed and recorded only with a
+        // header time above its parent's median-time-past (the stratum arm's
+        // job-mintime floor, applied to the tracker arm). Same oracle object,
+        // same depth bound; the share itself is never affected.
+        p2p_node.tracker().m_block_time_floor =
+            [oracle = block_bits_oracle.oracle](const uint256& prev_block)
+                -> std::optional<uint32_t> {
+                std::lock_guard<std::mutex> lk(oracle->m);
+                if (!oracle->hc) return std::nullopt;
+                const auto mtp = oracle->hc->median_time_past_at(
+                    prev_block, dash::BLOCK_CREDIT_MAX_PARENT_DEPTH);
+                if (!mtp) return std::nullopt;
+                return *mtp + 1;
+            };
         LOG_INFO << "[HEAD-SCORE] block-solution credit ARMED: a block-solving share's header"
                     " bits are checked against this node's header chain";
 

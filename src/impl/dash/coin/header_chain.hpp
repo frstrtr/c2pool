@@ -537,6 +537,34 @@ public:
         return times[times.size() / 2];
     }
 
+    /// Median-time-past of the block `hash` (Dash Core GetMedianTimePast: the
+    /// median of its own and its 10 ancestors' timestamps). A block built on
+    /// `hash` is valid only with a time above it ("time-too-old" otherwise).
+    /// nullopt when `hash` is unknown, off our best chain, more than
+    /// `max_depth` blocks below our tip, below height 10, or any of the 11
+    /// headers is missing (below a fast-start anchor) or synthetic (time 0).
+    std::optional<uint32_t> median_time_past_at(const uint256& hash,
+                                                uint32_t max_depth = UINT32_MAX) const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        auto it = m_headers.find(hash);
+        if (it == m_headers.end()) return std::nullopt;
+        const uint32_t h = it->second.height;
+        auto at = m_height_index.find(h);
+        if (at == m_height_index.end() || at->second != hash) return std::nullopt;
+        if (h > m_tip_height || m_tip_height - h > max_depth) return std::nullopt;
+        static constexpr uint32_t MEDIAN_SPAN = 11;
+        if (h + 1 < MEDIAN_SPAN) return std::nullopt;
+        std::vector<uint32_t> times;
+        times.reserve(MEDIAN_SPAN);
+        for (uint32_t n = 0; n < MEDIAN_SPAN; ++n) {
+            const auto e = get_header_by_height_internal(h - n);
+            if (!e || e->header.m_timestamp == 0) return std::nullopt;
+            times.push_back(e->header.m_timestamp);
+        }
+        std::sort(times.begin(), times.end());
+        return times[MEDIAN_SPAN / 2];
+    }
+
     bool has_header(const uint256& hash) const {
         std::lock_guard<std::mutex> lock(m_mutex);
         return m_headers.count(hash) > 0;

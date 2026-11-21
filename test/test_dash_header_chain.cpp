@@ -1046,3 +1046,33 @@ TEST(DashNetworkHashps, HeaderChainWindowOverAMinedChain)
     EXPECT_EQ(hc.network_hashps(40), 0.0) << "the window must lie above the chain's first entry";
     EXPECT_EQ(hc.network_hashps(0), 0.0);
 }
+
+// ─── median_time_past_at: the found-block relay gate's time floor ───────────
+// Dash Core GetMedianTimePast of a given block: the median of its own and its
+// 10 ancestors' timestamps. A block built on it needs a time above that.
+
+TEST(DashHeaderChainMtp, MedianOfTheBlockAndItsTenAncestors)
+{
+    // Heights 1..15 at tip_time - (15 - h) * 150 s.
+    auto mc = build_mined_chain(15, 1'800'000'000u);
+    const uint32_t t7 = mc.tip_time - (15u - 7u) * 150u;
+    const auto m12 = mc.hc->median_time_past_at(mc.hashes[12]);
+    ASSERT_TRUE(m12.has_value());
+    EXPECT_EQ(*m12, t7) << "the median of heights 2..12 is height 7's time";
+    const auto m15 = mc.hc->median_time_past_at(mc.hashes[15]);
+    ASSERT_TRUE(m15.has_value());
+    EXPECT_EQ(*m15, mc.hc->median_time_past()) << "at the tip it is the tip's MTP";
+}
+
+TEST(DashHeaderChainMtp, UnknownTooDeepOrTooShortIsUnknown)
+{
+    auto mc = build_mined_chain(15, 1'800'000'000u);
+    uint256 unknown;
+    unknown.SetHex("00000000000000000000000000000000000000000000000000000000000abcde");
+    EXPECT_FALSE(mc.hc->median_time_past_at(unknown).has_value()) << "not in the header chain";
+    EXPECT_FALSE(mc.hc->median_time_past_at(mc.hashes[12], /*max_depth=*/2).has_value())
+        << "3 blocks below the tip, deeper than max_depth";
+    EXPECT_TRUE(mc.hc->median_time_past_at(mc.hashes[12], /*max_depth=*/3).has_value());
+    EXPECT_FALSE(mc.hc->median_time_past_at(mc.hashes[9]).has_value())
+        << "fewer than 11 headers up to height 9";
+}
