@@ -5856,7 +5856,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 return *mtp + 1;
             };
         LOG_INFO << "[HEAD-SCORE] block-solution credit ARMED: a block-solving share's header"
-                    " bits are checked against this node's header chain";
+                    " bits are checked against this node's header chain; its block is"
+                    " relayed only with those bits and a time above the parent's MTP";
 
         // Dashboard network hashrate from chain work over the last 576 headers
         // (Dash Core getnetworkhashps(576)) instead of the tip difficulty, which

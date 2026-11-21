@@ -171,9 +171,8 @@ TEST(DashNodeCoinState, PopulatedRoutesEmbeddedByteEqualToDirectBuild) {
 
 // The template's mintime (the submit floor, MTP + 1) is withheld (0) when the
 // tip's MTP is not over a full 11-header window (set_tip's last argument):
-// an MTP over fewer headers can be later than the network's. Everything else
-// in the template, including the lock-time cutoff from the same MTP, is
-// unchanged.
+// an MTP over fewer headers can be later than the network's. The flag
+// touches only the mintime (height, coinbase value and transactions match).
 TEST(DashNodeCoinState, IncompleteMtpWindowServesNoMintime) {
     const uint256 prev_hash = raw256(0xAB);
     const uint32_t bits = 0x1b104be3u;
@@ -201,6 +200,34 @@ TEST(DashNodeCoinState, IncompleteMtpWindowServesNoMintime) {
     EXPECT_EQ(b.work.m_height, a.work.m_height);
     EXPECT_EQ(b.work.m_coinbase_value, a.work.m_coinbase_value);
     EXPECT_EQ(b.work.m_txs.size(), a.work.m_txs.size()) << "only the floor changes";
+}
+
+// The same through the maintainer's production hops: on_new_tip carries the
+// flag to promote_serve_tip -> republish -> set_tip.
+TEST(DashNodeCoinState, MaintainerCarriesTheMtpWindowFlagToTheTemplate) {
+    const uint32_t mtp = 1'700'000'000u;
+    auto never = [&]() -> DashWorkData {
+        ADD_FAILURE() << "a populated bundle must not reach the dashd fallback";
+        return DashWorkData{};
+    };
+    MNState pm; pm.isValid = true; pm.nRegisteredHeight = 2'300'000;
+    pm.nLastPaidHeight = 0; pm.scriptPayout.m_data = p2pkh_script(0x30);
+    pm.payoutSplitProvenance = MNState::SPLIT_KNOWN;
+
+    for (const bool complete : {true, false}) {
+        NodeCoinState st;
+        CoinStateMaintainer maint(st);
+        maint.on_mn_list_update(
+            std::vector<std::pair<uint256, MNState>>{{raw256(0x01), pm}}, 0);
+        maint.on_new_tip(H - 1, raw256(0xAB), 0x1b104be3u, mtp,
+                         DASH_PUBKEY_VER, DASH_P2SH_VER, 1'700'000'123u, 0x20000000u,
+                         /*mtp_window_complete=*/complete);
+        ASSERT_TRUE(st.populated());
+        const WorkSelection sel = st.select_work(never);
+        ASSERT_EQ(sel.source, WorkSource::Embedded);
+        EXPECT_EQ(sel.work.m_mintime, complete ? mtp + 1 : 0u)
+            << (complete ? "a full window: MTP + 1" : "an incomplete window: no floor");
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════

@@ -70,10 +70,12 @@ tip_advance_from_chain(const HeaderChain& chain,
     t.prev_height          = tip->height;
     t.prev_hash            = tip->hash;
     t.bits_for_next        = bits_for_next;
-    // The MTP of THIS tip, read for its hash under one lock (the tip may move
-    // between the two reads). nullopt while the 11-header window is incomplete:
-    // keep the tip-window median for the lock-time cutoff and MNHF, and mark
-    // the window incomplete so the template carries no mintime floor.
+    // The MTP of THIS tip, read for its hash (the chain may extend between the
+    // two reads; the MTP still matches prev_hash). nullopt while the 11-header
+    // window is incomplete, or if a reorg moved the tip off the best chain in
+    // between: keep the tip-window median for the lock-time cutoff and MNHF,
+    // and mark the window incomplete so the template carries no mintime floor
+    // (the next tip advance corrects it).
     const auto mtp = chain.median_time_past_at(tip->hash);
     t.mtp_at_tip           = mtp ? *mtp : chain.median_time_past();
     t.mtp_window_complete  = mtp.has_value();
