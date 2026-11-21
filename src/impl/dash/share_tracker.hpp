@@ -502,6 +502,8 @@ private:
     std::unordered_map<uint256, int, ShareHasher> m_verify_fail_count;
     // Block-solving shares fire_block_found_checked refused (log throttle).
     uint64_t m_found_block_refusals = 0;   // same writer context as m_verify_fail_count
+    // Block-solving shares relayed with an unknown parent MTP (log throttle).
+    uint64_t m_found_block_unchecked_time = 0;
 
     static int64_t now_seconds()
     {
@@ -573,6 +575,16 @@ public:
             const auto tv = found_block_time(header_time,
                                              static_cast<bool>(m_block_time_floor), floor);
             if (found_block_time_may_fire(tv)) {
+                if (tv == FoundBlockTime::UnknownFloor) {
+                    // Fires, but say so (throttled like the refusals).
+                    const uint64_t u = ++m_found_block_unchecked_time;
+                    if (u <= 3 || u % 10 == 0)
+                        LOG_INFO << "[BLOCK-FOUND] share " << share_hash.GetHex().substr(0, 16)
+                                 << ": the median-time-past of block "
+                                 << prev_block.GetHex().substr(0, 16)
+                                 << " is unknown here; relayed without the time check"
+                                 << " (#" << u << ")";
+                }
                 m_on_block_found(share_hash);
                 return true;
             }
