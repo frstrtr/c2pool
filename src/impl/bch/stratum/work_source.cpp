@@ -196,6 +196,21 @@ void BCHWorkSource::update_stratum_worker(const std::string& session_id,
     it->second.stale         = stale;
 }
 
+void BCHWorkSource::update_stratum_worker_rtt(const std::string& session_id, double rtt_ms)
+{
+    std::lock_guard<std::mutex> lk(workers_mutex_);
+    auto it = workers_.find(session_id);
+    if (it == workers_.end()) return;  // update for an unregistered session: drop.
+    it->second.rtt_ms = rtt_ms;
+}
+
+std::map<std::string, core::stratum::WorkerInfo>
+BCHWorkSource::get_stratum_workers() const
+{
+    std::lock_guard<std::mutex> lk(workers_mutex_);
+    return workers_;
+}
+
 // -- IWorkSource: work generation (slice-c) -----------------------------------
 
 std::shared_ptr<const bch::coin::rpc::WorkData>
