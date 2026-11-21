@@ -322,11 +322,26 @@ private:
     // at most StratumConfig::job_hold_limit_sec since the hold began; past it
     // the session stops retrying (the miner keeps its last valid job) until
     // the next notify. hold_retry_clean_: a notify held meanwhile asked for
-    // clean jobs, so the retry does.
+    // clean jobs, so the next job sent does (the retry's, or one built first
+    // by another notify), also after the limit ended the retries.
     bool hold_retry_pending_ = false;
     bool hold_retry_clean_ = false;
     std::chrono::steady_clock::time_point hold_since_{};
     uint64_t hold_retries_ = 0;
+
+    // Work not ready (no template, a template without difficulty bits, or a
+    // job suppressed for want of an atomic snapshot / a real prevhash): one
+    // pending 1 s retry per session, however many notifies arrive meanwhile
+    // (template_retry_pending_ is set while its timer is armed and cleared
+    // only by its handler). template_waiting_: a wait is active (set by each
+    // not-ready exit, cleared once the work is ready); a retry that finds the
+    // wait over and nothing owed sends nothing. template_retry_clean_: a
+    // clean request is owed (made during the wait, or carried by a call that
+    // ended without a job), so the next job sent carries clean_jobs=true —
+    // the retry's, or one sent first by any other notify.
+    bool template_retry_pending_ = false;
+    bool template_waiting_ = false;
+    bool template_retry_clean_ = false;
 
 public:
     explicit StratumSession(tcp::socket socket, std::shared_ptr<IWorkSource> mining_interface,
@@ -406,6 +421,9 @@ public:
     // async handlers reference half-destroyed state when the io_context dies.
     void shutdown() { cancel_timers(); }
 private:
+    // The work is not ready: remember a clean request and arm the session's
+    // single 1 s retry unless one is already pending.
+    void retry_notify_when_work_ready(bool force_clean);
     void start_periodic_work_push();
     void schedule_work_push_timer();
     void cancel_timers();

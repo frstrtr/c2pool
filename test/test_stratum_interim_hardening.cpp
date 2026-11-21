@@ -95,6 +95,7 @@
 #include <iostream>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -138,6 +139,18 @@ public:
     // sharechain busy); every build_connection_coinbase call is counted.
     std::atomic<bool> hold{false};
     mutable std::atomic<int> build_calls{0};
+    // While set, there is no work template (a node still syncing headers);
+    // every get_current_work_template call is counted.
+    std::atomic<bool> no_template{false};
+    mutable std::atomic<int> template_calls{0};
+    // While set, every connection coinbase comes with the header fields frozen
+    // with it (WorkSnapshot::has_header), as a require_job_snapshot coin's do.
+    std::atomic<bool> snap_header{false};
+    // While set, the work template carries no difficulty bits (a broken work
+    // source: the session holds the work, it never fabricates bits).
+    std::atomic<bool> no_bits{false};
+    // While set, build_connection_coinbase throws (a failing work source).
+    std::atomic<bool> throw_on_build{false};
 
     FakeWorkSource()
     {
@@ -174,7 +187,18 @@ public:
         if (registry) registry->update_stratum_worker(sid, hr, dead, diff, acc, rej, stale);
     }
 
-    nlohmann::json get_current_work_template() const override { return tmpl_; }
+    nlohmann::json get_current_work_template() const override
+    {
+        ++template_calls;
+        if (no_template.load())
+            return nlohmann::json();
+        if (no_bits.load()) {
+            auto t = tmpl_;
+            t.erase("bits");
+            return t;
+        }
+        return tmpl_;
+    }
     std::vector<std::string> get_stratum_merkle_branches() const override { return {}; }
     std::pair<std::string, std::string> get_coinbase_parts() const override { return {"", ""}; }
 
@@ -184,6 +208,8 @@ public:
         const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>&) const override
     {
         ++build_calls;
+        if (throw_on_build.load())
+            throw std::runtime_error("test work source: coinbase build failed");
         core::stratum::CoinbaseResult r;
         if (hold.load()) {
             r.held = true;
@@ -197,6 +223,13 @@ public:
         r.snapshot.mweb = snap_mweb;
         r.snapshot.mweb_active = snap_mweb_active;
         r.snapshot.frozen_ref.bits = snap_share_bits.load();
+        if (snap_header.load()) {
+            r.snapshot.has_header = true;
+            r.snapshot.gbt_prevhash = tmpl_["previousblockhash"].get<std::string>();
+            r.snapshot.header_version = tmpl_["version"].get<uint32_t>();
+            r.snapshot.block_nbits_hex = tmpl_["bits"].get<std::string>();
+            r.snapshot.curtime = static_cast<uint32_t>(tmpl_["curtime"].get<uint64_t>());
+        }
         return r;
     }
 
@@ -803,6 +836,346 @@ TEST(StratumJobHold, TheHoldIsBoundedThenWaitsForTheNextNotify)
     EXPECT_GE(h.ws->build_calls.load() - calls0, bounded + 2);
     h.ws->hold = false;
     ASSERT_TRUE(c.collect_notifies(base + 1, 2000ms));
+}
+
+// A clean notify held, then the hold ends with a job another (non-clean)
+// notify builds before the held retry fires: that job is the clean one, and
+// the retry sends nothing (the hold is over).
+TEST(StratumJobHold, HeldCleanGoesOutWithTheJobAnotherNotifyBuilds)
+{
+    ServerHarness h;
+    ASSERT_TRUE(h.start());
+
+    Client c;
+    ASSERT_TRUE(c.connect(h.port));
+    ASSERT_TRUE(c.subscribe());
+    ASSERT_TRUE(c.authorize("interimtestworker1"));
+    ASSERT_TRUE(c.collect_notifies(1, 5000ms));
+    c.drain(200ms);
+    const size_t base = c.jobs.size();
+
+    h.ws->hold = true;
+    h.on_io([&] { h.server->notify_all(true); return 0; });   // held, retry in 500 ms
+    h.ws->hold = false;
+    h.on_io([&] { h.server->notify_all(false); return 0; });  // builds first
+    ASSERT_TRUE(c.collect_notifies(base + 1, 1000ms));
+    EXPECT_TRUE(c.clean_flags[base]) << "a clean notify was held: the first job sent is clean";
+    c.drain(800ms);
+    EXPECT_EQ(c.jobs.size(), base + 1) << "the hold ended with that job: no retry";
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Work not ready yet (no template, a template without difficulty bits, or a
+// require_job_snapshot job without its atomic snapshot): no job goes out and
+// the session retries every 1 s. A clean notify requested while the work was
+// not ready makes the job that finally goes out clean (mining.notify param 9,
+// clean_jobs), so the miner flushes its stale jobs; one pending retry per
+// session whatever the notify rate; a non-clean wait still retries non-clean.
+// ════════════════════════════════════════════════════════════════════════════
+TEST(StratumTemplateWait, CleanNotifyCarriedThroughTheRetry)
+{
+    ServerHarness h;
+    ASSERT_TRUE(h.start());
+
+    Client c;
+    ASSERT_TRUE(c.connect(h.port));
+    ASSERT_TRUE(c.subscribe());
+    ASSERT_TRUE(c.authorize("interimtestworker1"));
+    ASSERT_TRUE(c.collect_notifies(1, 5000ms));
+    c.drain(200ms);
+    const size_t base = c.jobs.size();
+
+    h.ws->no_template = true;
+    h.on_io([&] { h.server->notify_all(true); return 0; });
+    EXPECT_FALSE(c.collect_notifies(base + 1, 300ms)) << "no job without a template";
+    h.ws->no_template = false;
+    ASSERT_TRUE(c.collect_notifies(base + 1, 2000ms)) << "the pending retry sends the job";
+    EXPECT_TRUE(c.clean_flags[base])
+        << "a clean notify was requested while the template was not ready: the retry is clean";
+}
+
+TEST(StratumTemplateWait, OnePendingRetryPerSessionWhateverTheNotifyRate)
+{
+    ServerHarness h;
+    ASSERT_TRUE(h.start());
+
+    Client c;
+    ASSERT_TRUE(c.connect(h.port));
+    ASSERT_TRUE(c.subscribe());
+    ASSERT_TRUE(c.authorize("interimtestworker1"));
+    ASSERT_TRUE(c.collect_notifies(1, 5000ms));
+    c.drain(200ms);
+    const size_t base = c.jobs.size();
+
+    h.ws->no_template = true;
+    const int calls0 = h.ws->template_calls.load();
+    // a non-clean notify first, then nine clean ones while its retry is pending
+    h.on_io([&] { h.server->notify_all(false); return 0; });
+    h.on_io([&] { for (int i = 0; i < 9; ++i) h.server->notify_all(true); return 0; });
+    std::this_thread::sleep_for(1500ms);
+    const int waiting_calls = h.ws->template_calls.load() - calls0;
+    // ten notifies and the retry at 1 s; a timer per notify would make it 10 + 10
+    EXPECT_GE(waiting_calls, 11);
+    EXPECT_LE(waiting_calls, 12);
+    EXPECT_FALSE(c.collect_notifies(base + 1, 200ms)) << "no job without a template";
+
+    h.ws->no_template = false;
+    ASSERT_TRUE(c.collect_notifies(base + 1, 2000ms)) << "the pending retry sends the job";
+    c.drain(1500ms);
+    EXPECT_EQ(c.jobs.size(), base + 1) << "one job, not one per notify made during the wait";
+    EXPECT_TRUE(c.clean_flags.back()) << "a clean notify was made during the wait: the retry is clean";
+}
+
+TEST(StratumTemplateWait, NonCleanWaitRetriesNonClean)
+{
+    ServerHarness h;
+    ASSERT_TRUE(h.start());
+
+    Client c;
+    ASSERT_TRUE(c.connect(h.port));
+    ASSERT_TRUE(c.subscribe());
+    ASSERT_TRUE(c.authorize("interimtestworker1"));
+    ASSERT_TRUE(c.collect_notifies(1, 5000ms));
+    c.drain(200ms);
+    const size_t base = c.jobs.size();
+
+    h.ws->no_template = true;
+    h.on_io([&] { h.server->notify_all(false); return 0; });
+    EXPECT_FALSE(c.collect_notifies(base + 1, 300ms)) << "no job without a template";
+    h.ws->no_template = false;
+    ASSERT_TRUE(c.collect_notifies(base + 1, 2000ms)) << "the pending retry sends the job";
+    EXPECT_FALSE(c.clean_flags[base]) << "no clean notify was made: the retry is not clean";
+}
+
+// A clean notify requested during the wait, then the template is back and a
+// non-clean notify sends the first job before the retry fires: that job is
+// the clean one.
+TEST(StratumTemplateWait, OwedCleanGoesOutWithTheFirstJobSent)
+{
+    ServerHarness h;
+    ASSERT_TRUE(h.start());
+
+    Client c;
+    ASSERT_TRUE(c.connect(h.port));
+    ASSERT_TRUE(c.subscribe());
+    ASSERT_TRUE(c.authorize("interimtestworker1"));
+    ASSERT_TRUE(c.collect_notifies(1, 5000ms));
+    c.drain(200ms);
+    const size_t base = c.jobs.size();
+
+    h.ws->no_template = true;
+    h.on_io([&] { h.server->notify_all(true); return 0; });
+    std::this_thread::sleep_for(200ms);
+    h.ws->no_template = false;
+    h.on_io([&] { h.server->notify_all(false); return 0; });
+    ASSERT_TRUE(c.collect_notifies(base + 1, 1000ms));
+    EXPECT_TRUE(c.clean_flags[base])
+        << "a clean notify was requested during the wait: the first job sent is clean";
+}
+
+// The same wait on a require_job_snapshot coin whose job is suppressed for
+// want of an atomic header+coinbase snapshot.
+TEST(StratumTemplateWait, SuppressedJobRetryCarriesTheCleanFlag)
+{
+    ServerHarness h;
+    h.ws->cfg.require_job_snapshot = true;
+    h.ws->snap_header = true;
+    ASSERT_TRUE(h.start());
+
+    Client c;
+    ASSERT_TRUE(c.connect(h.port));
+    ASSERT_TRUE(c.subscribe());
+    ASSERT_TRUE(c.authorize("interimtestworker1"));
+    ASSERT_TRUE(c.collect_notifies(1, 5000ms));
+    c.drain(200ms);
+    const size_t base = c.jobs.size();
+
+    h.ws->snap_header = false;
+    const int calls0 = h.ws->build_calls.load();
+    h.on_io([&] { for (int i = 0; i < 3; ++i) h.server->notify_all(true); return 0; });
+    EXPECT_FALSE(c.collect_notifies(base + 1, 300ms)) << "no job without its snapshot";
+    EXPECT_EQ(h.ws->build_calls.load() - calls0, 3) << "the three notifies, no retry yet";
+    h.ws->snap_header = true;
+    ASSERT_TRUE(c.collect_notifies(base + 1, 2000ms)) << "the pending retry sends the job";
+    c.drain(1500ms);
+    EXPECT_EQ(c.jobs.size(), base + 1) << "one job, not one per suppressed notify";
+    EXPECT_TRUE(c.clean_flags[base])
+        << "a clean notify was suppressed: the retry is clean";
+}
+
+// Connect, subscribe, authorize, and read the jobs that follow.
+static bool connect_and_authorize(ServerHarness& h, Client& c)
+{
+    if (!c.connect(h.port) || !c.subscribe() || !c.authorize("interimtestworker1"))
+        return false;
+    if (!c.collect_notifies(1, 5000ms))
+        return false;
+    c.drain(200ms);
+    return true;
+}
+
+// The missing-bits arm of the wait: a template without difficulty bits is
+// held like no template, and a clean request made meanwhile is carried.
+TEST(StratumTemplateWait, MissingBitsWaitCarriesTheCleanFlag)
+{
+    ServerHarness h;
+    ASSERT_TRUE(h.start());
+    Client c;
+    ASSERT_TRUE(connect_and_authorize(h, c));
+    const size_t base = c.jobs.size();
+
+    h.ws->no_bits = true;
+    h.on_io([&] { for (int i = 0; i < 4; ++i) h.server->notify_all(true); return 0; });
+    EXPECT_FALSE(c.collect_notifies(base + 1, 300ms)) << "no job from a template without bits";
+    h.ws->no_bits = false;
+    ASSERT_TRUE(c.collect_notifies(base + 1, 2000ms)) << "the pending retry sends the job";
+    EXPECT_TRUE(c.clean_flags[base]) << "a clean notify was made during the wait: the retry is clean";
+    c.drain(1500ms);
+    EXPECT_EQ(c.jobs.size(), base + 1) << "one job, not one per notify made during the wait";
+}
+
+// Another notify sent the job the wait owed: the pending retry finds the wait
+// over and nothing owed, and sends nothing.
+TEST(StratumTemplateWait, NoRetryAfterTheOwedJobWentOut)
+{
+    ServerHarness h;
+    ASSERT_TRUE(h.start());
+    Client c;
+    ASSERT_TRUE(connect_and_authorize(h, c));
+    const size_t base = c.jobs.size();
+
+    h.ws->no_template = true;
+    h.on_io([&] { h.server->notify_all(true); return 0; });
+    std::this_thread::sleep_for(200ms);
+    h.ws->no_template = false;
+    const int calls0 = h.ws->template_calls.load();
+    h.on_io([&] { h.server->notify_all(false); return 0; });
+    ASSERT_TRUE(c.collect_notifies(base + 1, 1000ms));
+    EXPECT_TRUE(c.clean_flags[base]) << "the first job sent carries the owed clean request";
+    c.drain(1500ms);   // the pending retry fires at ~1 s
+    EXPECT_EQ(c.jobs.size(), base + 1) << "the wait ended with that job: the retry sends nothing";
+    EXPECT_EQ(h.ws->template_calls.load() - calls0, 1) << "the retry does not even fetch";
+}
+
+// The work goes away again while the first wait's retry is still pending: that
+// retry serves the new wait (on time, with its clean request); no second timer.
+TEST(StratumTemplateWait, ANewWaitIsServedByThePendingRetry)
+{
+    ServerHarness h;
+    ASSERT_TRUE(h.start());
+    Client c;
+    ASSERT_TRUE(connect_and_authorize(h, c));
+    const size_t base = c.jobs.size();
+
+    const auto t0 = std::chrono::steady_clock::now();
+    h.ws->no_template = true;
+    h.on_io([&] { h.server->notify_all(false); return 0; });  // retry at ~1 s
+    std::this_thread::sleep_for(200ms);
+    h.ws->no_template = false;
+    h.on_io([&] { h.server->notify_all(false); return 0; });  // the wait ends with this job
+    ASSERT_TRUE(c.collect_notifies(base + 1, 1000ms));
+    EXPECT_FALSE(c.clean_flags[base]);
+    h.ws->no_template = true;
+    h.on_io([&] { h.server->notify_all(true); return 0; });   // a new wait, clean owed
+    std::this_thread::sleep_for(300ms);
+    h.ws->no_template = false;
+    ASSERT_TRUE(c.collect_notifies(base + 2, 2000ms)) << "the pending retry serves the new wait";
+    EXPECT_TRUE(c.clean_flags[base + 1]) << "with the clean request made during it";
+    EXPECT_LT(std::chrono::steady_clock::now() - t0, 1600ms) << "at ~1 s, by the first timer";
+    c.drain(1500ms);
+    EXPECT_EQ(c.jobs.size(), base + 2);
+}
+
+// A clean request owed by the wait, then the template is back but the job is
+// held until the hold limit ends the retries: the clean request is still owed
+// to the next job sent.
+TEST(StratumTemplateWait, CleanOwedByTheWaitSurvivesTheHoldLimit)
+{
+    ServerHarness h;
+    h.ws->cfg.job_hold_limit_sec = 1;
+    ASSERT_TRUE(h.start());
+    Client c;
+    ASSERT_TRUE(connect_and_authorize(h, c));
+    const size_t base = c.jobs.size();
+
+    h.ws->no_template = true;
+    h.on_io([&] { h.server->notify_all(true); return 0; });   // retry at ~1 s, clean owed
+    h.ws->no_template = false;
+    h.ws->hold = true;                                          // that retry is held; limit ~2 s
+    std::this_thread::sleep_for(3000ms);
+    EXPECT_FALSE(c.collect_notifies(base + 1, 200ms)) << "no job while it is held";
+    h.ws->hold = false;
+    h.on_io([&] { h.server->notify_all(false); return 0; });
+    ASSERT_TRUE(c.collect_notifies(base + 1, 1000ms));
+    EXPECT_TRUE(c.clean_flags[base])
+        << "the clean request owed by the wait outlives the hold limit";
+}
+
+// A retry whose send_notify_work throws (a failing work source): the exception
+// stays inside the session (the server keeps serving) and the clean request
+// the retry carried is still owed to the next job sent.
+TEST(StratumTemplateWait, RetryThatThrowsKeepsTheCleanOwed)
+{
+    ServerHarness h;
+    ASSERT_TRUE(h.start());
+    Client c;
+    ASSERT_TRUE(connect_and_authorize(h, c));
+    const size_t base = c.jobs.size();
+
+    h.ws->no_template = true;
+    h.on_io([&] { h.server->notify_all(true); return 0; });   // retry at ~1 s, clean owed
+    h.ws->throw_on_build = true;
+    h.ws->no_template = false;
+    std::this_thread::sleep_for(1300ms);                        // the retry threw
+    EXPECT_FALSE(c.collect_notifies(base + 1, 200ms));
+    h.ws->throw_on_build = false;
+    h.on_io([&] { h.server->notify_all(false); return 0; });
+    ASSERT_TRUE(c.collect_notifies(base + 1, 1000ms)) << "the server still serves";
+    EXPECT_TRUE(c.clean_flags[base]) << "the clean request the failed retry carried is still owed";
+}
+
+// A clean notify held past job_hold_limit_sec: the session stops retrying,
+// and the next job sent (here from a non-clean notify) is the clean one.
+TEST(StratumJobHold, CleanOwedPastTheHoldLimitGoesOutWithTheNextJob)
+{
+    ServerHarness h;
+    h.ws->cfg.job_hold_limit_sec = 1;
+    ASSERT_TRUE(h.start());
+    Client c;
+    ASSERT_TRUE(connect_and_authorize(h, c));
+    const size_t base = c.jobs.size();
+
+    h.ws->hold = true;
+    h.on_io([&] { h.server->notify_all(true); return 0; });   // held, clean owed
+    std::this_thread::sleep_for(2000ms);                        // past the 1 s limit
+    EXPECT_FALSE(c.collect_notifies(base + 1, 200ms)) << "the miner keeps its last job";
+    h.ws->hold = false;
+    h.on_io([&] { h.server->notify_all(false); return 0; });
+    ASSERT_TRUE(c.collect_notifies(base + 1, 1000ms));
+    EXPECT_TRUE(c.clean_flags[base])
+        << "the held clean request outlives the hold limit: the next job sent is clean";
+}
+
+// The held retry's send_notify_work throws: the server keeps serving and the
+// clean request the retry carried is still owed to the next job sent.
+TEST(StratumJobHold, RetryThatThrowsKeepsTheCleanOwed)
+{
+    ServerHarness h;
+    ASSERT_TRUE(h.start());
+    Client c;
+    ASSERT_TRUE(connect_and_authorize(h, c));
+    const size_t base = c.jobs.size();
+
+    h.ws->hold = true;
+    h.on_io([&] { h.server->notify_all(true); return 0; });   // held, retry at ~0.5 s
+    h.ws->throw_on_build = true;
+    std::this_thread::sleep_for(800ms);                         // the retry threw
+    h.ws->hold = false;
+    h.ws->throw_on_build = false;
+    EXPECT_FALSE(c.collect_notifies(base + 1, 200ms)) << "no retry after the failed one";
+    h.on_io([&] { h.server->notify_all(false); return 0; });
+    ASSERT_TRUE(c.collect_notifies(base + 1, 1000ms)) << "the server still serves";
+    EXPECT_TRUE(c.clean_flags[base]) << "the clean request the failed retry carried is still owed";
 }
 
 // ════════════════════════════════════════════════════════════════════════════
