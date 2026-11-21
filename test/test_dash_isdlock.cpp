@@ -39,6 +39,7 @@
 #include <impl/dash/coin/node_coin_state.hpp>
 #include <impl/dash/coin/mempool.hpp>
 #include <impl/dash/coin/utxo_lane.hpp>
+#include <impl/dash/coin/quorum_manager.hpp>
 #include <impl/dash/coin/vendor/bls_verify.hpp>
 
 #include <core/uint256.hpp>
@@ -398,6 +399,18 @@ TEST(DashIslockVerify, SelectionPicksDesignatedIndexWithinCycle)
     ASSERT_TRUE(qp.has_value());
     EXPECT_EQ(qp->base_height, kCycle - 288 + kExpectSigner);
     EXPECT_NE(qp->quorum_hash, q->quorum_hash);
+
+    // Only the designated quorum of the cycle held (others missing, e.g. one
+    // index stayed on this cycle after a failed DKG while the rest rotated
+    // out): still selected. Upstream's `signer > quorums.size()` guard is
+    // taken against the full signing list, never against what we hold.
+    std::vector<RotatedQuorumCandidate> only;
+    for (const auto& c : synthetic_cycle(kCycle, 0x10))
+        if (c.quorum_index == kExpectSigner) only.push_back(c);
+    ASSERT_EQ(only.size(), 1u);
+    auto q1 = select_rotated_quorum(p60_75(), only, kCycle, rid);
+    ASSERT_TRUE(q1.has_value()) << "a held designated quorum refused because the held subset is small";
+    EXPECT_EQ(q1->quorum_index, kExpectSigner);
 }
 
 TEST(DashIslockVerify, SelectionFailsClosedOnEveryUncertainty)
@@ -430,6 +443,199 @@ TEST(DashIslockVerify, SelectionFailsClosedOnEveryUncertainty)
     //     arm only; the score-sort arm lives in chainlock_verify.hpp).
     EXPECT_FALSE(select_rotated_quorum(dash::coin::kLlmq400_60, cands, kCycle, rid)
                      .has_value());
+}
+
+// ═══ Retained quorums — locks signed by the previous rotation cycle ══════════
+//
+// A lock names its signing quorum's own cycle, and for a few blocks after a
+// rotation the network still signs with the previous cycle; Dash Core resolves
+// the lock's own cycle (net_instantsend.cpp:136-145) and accepts it. Our
+// active set drops that cycle at the rotation diff, so every such lock was
+// refused (mainnet 11-20: the 8 blocks after each rotation). These pin the
+// retained set and the active-then-retained selection, with a stub in place
+// of the BLS check.
+
+using dash::coin::QuorumManager;
+using dash::coin::islock::IslockVerifyPass;
+using dash::coin::islock::RotatedQuorumCandidate;
+using dash::coin::islock::verify_islock_two_pass;
+using dash::coin::islock::previous_cycle_max_age;
+
+namespace {
+
+uint256 qhash(uint8_t tag, uint8_t index)
+{
+    uint256 h;
+    h.data()[0] = tag;
+    h.data()[1] = index;
+    h.data()[31] = 0x5a;
+    return h;
+}
+
+dash::coin::vendor::CFinalCommitment commit(uint8_t type, uint8_t tag, uint8_t index)
+{
+    dash::coin::vendor::CFinalCommitment c;
+    c.llmqType = type;
+    c.quorumHash = qhash(tag, index);
+    c.quorumIndex = index;
+    c.quorumPublicKey[0] = tag;
+    c.quorumPublicKey[1] = index;
+    return c;
+}
+
+// A full rotated cycle: 32 quorums at base cycle_height + i, index i, and a
+// pubkey that names the cycle (byte 0) and the index (byte 1).
+std::vector<RotatedQuorumCandidate> cycle(uint8_t tag, uint32_t cycle_height)
+{
+    std::vector<RotatedQuorumCandidate> out;
+    for (uint8_t i = 0; i < 32; ++i) {
+        RotatedQuorumCandidate c;
+        c.quorum_hash = qhash(tag, i);
+        c.base_height = cycle_height + i;
+        c.quorum_index = i;
+        c.quorum_public_key[0] = tag;
+        c.quorum_public_key[1] = i;
+        out.push_back(c);
+    }
+    return out;
+}
+
+} // namespace
+
+TEST(DashIsdlockPass2, QuorumManagerRetainsRecentlyRetiredQuorumsPerType)
+{
+    QuorumManager q;
+    constexpr uint8_t kIs = 103;   // the rotated type's byte value is irrelevant here
+    constexpr uint8_t kCl = 104;
+    auto rotate = [&](uint8_t from, uint8_t to, uint8_t first, uint8_t last) {
+        dash::coin::vendor::QuorumTail t;
+        for (uint8_t i = first; i <= last; ++i) {
+            t.deletedQuorums.emplace_back(kIs, qhash(from, i));
+            t.newQuorums.push_back(commit(kIs, to, i));
+        }
+        q.apply(t);
+    };
+    auto retired_of = [&](uint8_t tag) {
+        size_t n = 0;
+        for (const auto& e : q.retired_entries())
+            n += (e.key.llmqType == kIs && e.key.quorumHash.data()[0] == tag);
+        return n;
+    };
+
+    dash::coin::vendor::QuorumTail t;
+    for (uint8_t i = 0; i < 32; ++i) t.newQuorums.push_back(commit(kIs, 0xA0, i));
+    t.newQuorums.push_back(commit(kCl, 0xC0, 0));
+    q.apply(t);
+    EXPECT_TRUE(q.retired_entries().empty());
+
+    // Rotation A -> B delivered in TWO diffs (31, then a late 1): the whole
+    // previous cycle is retained, not just the last diff's part.
+    rotate(0xA0, 0xB0, 0, 30);
+    rotate(0xA0, 0xB0, 31, 31);
+    EXPECT_EQ(retired_of(0xA0), 32u) << "a split rotation lost part of the previous cycle";
+    EXPECT_EQ(q.active_count(), 33u) << "retired entries are not in the active set";
+
+    // Another type retiring does not touch the rotated type.
+    dash::coin::vendor::QuorumTail r2;
+    r2.deletedQuorums.emplace_back(kCl, qhash(0xC0, 0));
+    q.apply(r2);
+    EXPECT_EQ(retired_of(0xA0), 32u);
+    EXPECT_EQ(q.retired_entries().size(), 33u);
+
+    // B -> D: both A and B retained (two cycles = the per-type cap of 64).
+    rotate(0xB0, 0xD0, 0, 31);
+    EXPECT_EQ(retired_of(0xA0), 32u);
+    EXPECT_EQ(retired_of(0xB0), 32u);
+
+    // D -> E: the oldest cycle (A) leaves; B and D stay.
+    rotate(0xD0, 0xE0, 0, 31);
+    EXPECT_EQ(retired_of(0xA0), 0u) << "the per-type cap must drop the oldest cycle";
+    EXPECT_EQ(retired_of(0xB0), 32u);
+    EXPECT_EQ(retired_of(0xD0), 32u);
+
+    // A retired quorum that comes back is active again, not retired.
+    dash::coin::vendor::QuorumTail r4;
+    r4.newQuorums.push_back(commit(kIs, 0xB0, 1));
+    q.apply(r4);
+    for (const auto& e : q.retired_entries())
+        EXPECT_FALSE(e.key == (QuorumManager::ActiveKey{kIs, qhash(0xB0, 1)}));
+    EXPECT_EQ(retired_of(0xB0), 31u);
+
+    // A wipe and a warm load both empty the retained set.
+    q.clear();
+    EXPECT_TRUE(q.retired_entries().empty());
+    q.apply(t);
+    rotate(0xA0, 0xB0, 0, 31);
+    ASSERT_FALSE(q.retired_entries().empty());
+    q.replace_state({}, {});
+    EXPECT_TRUE(q.retired_entries().empty());
+}
+
+TEST(DashIsdlockPass2, TwoPassSelectsThePreviousCycleOnlyWhenTheLockNamesIt)
+{
+    const auto* p = islock_params(LlmqNetwork::Mainnet);
+    ASSERT_NE(p, nullptr);
+    const uint32_t I = p->dkg_interval;
+    const uint32_t prev_cycle = I * 9000;          // the retired cycle
+    const uint32_t cur_cycle  = I * 9001;          // the active cycle
+    const uint32_t tip        = cur_cycle + 40;    // a few blocks after the rotation
+    const auto active   = cycle(0xB0, cur_cycle);
+    const auto previous = cycle(0xA0, prev_cycle);
+    const std::vector<std::pair<uint256, uint32_t>> inputs{{raw256(0x10), 1u}};
+    const uint256 txid = raw256(0x20);
+
+    // The stub "BLS check" passes for the quorum of the expected cycle only
+    // (pubkey byte 0 names the cycle), and counts how often it runs.
+    int calls = 0;
+    auto signed_by = [&](uint8_t tag) {
+        return [&calls, tag](const auto& pubkey, const uint256&) {
+            ++calls;
+            return pubkey[0] == tag;
+        };
+    };
+
+    // A lock signed by the current cycle: pass 1.
+    calls = 0;
+    EXPECT_EQ(verify_islock_two_pass(*p, active, previous, tip, cur_cycle, inputs, txid, signed_by(0xB0)),
+              IslockVerifyPass::Active);
+    EXPECT_EQ(calls, 1);
+
+    // A lock signed by the previous cycle: refused by pass 1 (no quorum of
+    // that cycle in the active set, so no BLS work), accepted by pass 2.
+    calls = 0;
+    EXPECT_EQ(verify_islock_two_pass(*p, active, previous, tip, prev_cycle, inputs, txid, signed_by(0xA0)),
+              IslockVerifyPass::Previous);
+    EXPECT_EQ(calls, 1) << "pass 2 must not add a second BLS check for the same lock";
+
+    // Without the retained set (master): the same lock is refused.
+    calls = 0;
+    EXPECT_EQ(verify_islock_two_pass(*p, active, {}, tip, prev_cycle, inputs, txid, signed_by(0xA0)),
+              IslockVerifyPass::None);
+    EXPECT_EQ(calls, 0);
+
+    // A bad signature naming either cycle: refused, one BLS check at most.
+    calls = 0;
+    EXPECT_EQ(verify_islock_two_pass(*p, active, previous, tip, cur_cycle, inputs, txid, signed_by(0xEE)),
+              IslockVerifyPass::None);
+    EXPECT_EQ(calls, 1);
+    calls = 0;
+    EXPECT_EQ(verify_islock_two_pass(*p, active, previous, tip, prev_cycle, inputs, txid, signed_by(0xEE)),
+              IslockVerifyPass::None);
+    EXPECT_EQ(calls, 1);
+
+    // A cycle in neither set: refused with no BLS work.
+    calls = 0;
+    EXPECT_EQ(verify_islock_two_pass(*p, active, previous, tip, I * 8000, inputs, txid, signed_by(0xA0)),
+              IslockVerifyPass::None);
+    EXPECT_EQ(calls, 0);
+
+    // The retained set ages out: base blocks more than previous_cycle_max_age()
+    // below the tip are ignored (a rotation diff that never arrived).
+    const uint32_t late_tip = prev_cycle + 31 + previous_cycle_max_age(*p) + 1;
+    calls = 0;
+    EXPECT_EQ(verify_islock_two_pass(*p, active, previous, late_tip, prev_cycle, inputs, txid, signed_by(0xA0)),
+              IslockVerifyPass::None);
+    EXPECT_EQ(calls, 0);
 }
 
 // ═══ 3. USE — the G4 red/green KAT ════════════════════════════════════════════

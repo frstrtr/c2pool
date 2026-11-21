@@ -8013,28 +8013,46 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 auto tip = hc->tip();
                 if (!tip || cyc->height > tip->height) return false;
 
-                // Collect the active ROTATED type-5 quorums, each with the
+                // Collect the ROTATED type-5 quorums of a set, each with the
                 // height of its base block (rotated invariant: baseHeight ==
                 // cycleHeight + quorumIndex; islock_verify.hpp filters on it).
-                std::vector<dash::coin::islock::RotatedQuorumCandidate> cands;
-                for (const auto& e : st->qmgr().active_entries()) {
-                    if (e.key.llmqType != p->type) continue;
-                    auto hdr = hc->get_header(e.key.quorumHash);
-                    if (!hdr) continue;          // base header not held => skip
-                    dash::coin::islock::RotatedQuorumCandidate c;
-                    c.quorum_hash       = e.key.quorumHash;
-                    c.base_height       = hdr->height;
-                    c.quorum_index      = static_cast<uint16_t>(
-                        e.commitment.quorumIndex < 0 ? 0xffff
-                                                     : e.commitment.quorumIndex);
-                    c.quorum_public_key = e.commitment.quorumPublicKey;
-                    cands.push_back(c);
+                auto collect = [&](const auto& entries) {
+                    std::vector<dash::coin::islock::RotatedQuorumCandidate> cands;
+                    for (const auto& e : entries) {
+                        if (e.key.llmqType != p->type) continue;
+                        auto hdr = hc->get_header(e.key.quorumHash);
+                        if (!hdr) continue;      // base header not held => skip
+                        dash::coin::islock::RotatedQuorumCandidate c;
+                        c.quorum_hash       = e.key.quorumHash;
+                        c.base_height       = hdr->height;
+                        c.quorum_index      = static_cast<uint16_t>(
+                            e.commitment.quorumIndex < 0 ? 0xffff
+                                                         : e.commitment.quorumIndex);
+                        c.quorum_public_key = e.commitment.quorumPublicKey;
+                        cands.push_back(c);
+                    }
+                    return cands;
+                };
+                // The active rotated quorums, then (only if that fails) the
+                // recently retired ones: a lock names its signing quorum's own
+                // cycle, and for a few blocks after a rotation the network
+                // still signs with the previous cycle, which Dash Core accepts
+                // (net_instantsend.cpp:136-145) but our active set has dropped.
+                const auto pass = dash::coin::islock::verify_islock_two_pass(
+                    *p, collect(st->qmgr().active_entries()),
+                    [&] { return collect(st->qmgr().retired_entries()); }, tip->height,
+                    cyc->height, inputs, txid,
+                    [&sig](const auto& pubkey, const uint256& sign_hash) {
+                        return dash::coin::vendor::verify_chainlock_sig(pubkey, sign_hash, sig);
+                    });
+                if (pass == dash::coin::islock::IslockVerifyPass::Previous) {
+                    static std::atomic<uint64_t> previous_cycle_passes{0};
+                    const uint64_t n = ++previous_cycle_passes;
+                    if (n == 1 || n % 100 == 0)
+                        LOG_INFO << "[ISLOCK] verified against a RETAINED (recently"
+                                    " rotated-out) quorum: " << n << " so far";
                 }
-                auto target = dash::coin::islock::build_islock_sign_target(
-                    *p, cands, cyc->height, inputs, txid);
-                if (!target) return false;       // no quorum selectable => fail closed
-                return dash::coin::vendor::verify_chainlock_sig(
-                    target->quorum.quorum_public_key, target->sign_hash, sig);
+                return pass != dash::coin::islock::IslockVerifyPass::None;
             });
 
         // W5-B DSTX verifier: BLS-verify the mixing masternode's OPERATOR
