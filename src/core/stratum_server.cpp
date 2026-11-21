@@ -18,6 +18,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <exception>
 #include <boost/algorithm/string.hpp>
 #ifdef __linux__
 #include <cerrno>
@@ -1834,11 +1835,36 @@ static std::string gbt_to_stratum_prevhash(const std::string& gbt_hex)
     return result;
 }
 
+// A notify retry run from a timer handler (a held job, or work not ready). An
+// exception must not escape the io_context: it is logged (at most once per
+// 30 s) and the session waits for the next notify; send_notify_work() keeps
+// the clean request the retry carried owed to the next job sent.
+static void run_notify_retry(StratumSession& session, bool clean)
+{
+    std::string what;
+    try {
+        session.send_notify_work(clean);
+        return;
+    } catch (const std::exception& e) {
+        what = e.what();
+    } catch (...) {
+        what = "unknown exception";
+    }
+    static std::atomic<int64_t> s_last_log_ms{0};
+    const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    int64_t prev = s_last_log_ms.load();
+    if (now_ms - prev > 30'000 && s_last_log_ms.compare_exchange_strong(prev, now_ms))
+        LOG_WARNING << "[Stratum] notify retry failed: " << what
+                    << " (no further retry until the next notify)";
+}
+
 void StratumSession::retry_notify_when_work_ready(bool force_clean)
 {
     // A clean notify requested while the work was not ready must make the
     // retried job clean: accumulate it, and keep ONE pending retry per session
     // (a timer per notify would send one job per notify made during the wait).
+    template_waiting_ = true;
     template_retry_clean_ = template_retry_clean_ || force_clean;
     if (template_retry_pending_)
         return;
@@ -1852,14 +1878,32 @@ void StratumSession::retry_notify_when_work_ready(bool force_clean)
         self->template_retry_pending_ = false;
         if (ec || !self->is_connected())
             return;
+        // The wait ended meanwhile (the work became ready and a notify took
+        // it on) and no clean request is owed: nothing to retry.
+        if (!self->template_waiting_ && !self->template_retry_clean_)
+            return;
         const bool clean = self->template_retry_clean_;
         self->template_retry_clean_ = false;
-        self->send_notify_work(clean);
+        run_notify_retry(*self, clean);
     });
 }
 
 void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_best_share)
 {
+    // Should an exception end this call before a job goes out (a malformed
+    // template, the work source), the clean request it carries (its own, or
+    // one owed and folded in below) stays owed to the next job sent.
+    struct KeepCleanOwedOnThrow {
+        StratumSession& session;
+        const bool& clean;
+        const int exceptions_on_entry = std::uncaught_exceptions();
+        ~KeepCleanOwedOnThrow()
+        {
+            if (std::uncaught_exceptions() > exceptions_on_entry)
+                session.template_retry_clean_ = session.template_retry_clean_ || clean;
+        }
+    } keep_clean_owed{*this, force_clean};
+
     // Don't send work until a valid block template is available
     auto tmpl = mining_interface_->get_current_work_template();
     // Fail-closed on a template that carries no difficulty bits. Every coin lane
@@ -1899,12 +1943,15 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
         return;
     }
 
-    // A clean notify requested while the work was not ready is owed to the
-    // first job that goes out, whichever notify sends it. Every exit below
-    // that sends no job hands force_clean on (the held retry, the suppressed-
-    // job retry), so the flag is not lost by taking it here.
+    // The work is ready: any template wait is over. A clean notify requested
+    // while the work was not ready is owed to the first job that goes out,
+    // whichever notify sends it. Every exit below that sends no job hands
+    // force_clean on (the held retry and its limit, the suppressed-job retry,
+    // the foreign-payout refusal, an exception), so the flag is not lost by
+    // taking it here.
     force_clean = force_clean || template_retry_clean_;
     template_retry_clean_ = false;
+    template_waiting_ = false;
 
     nlohmann::json notification;
     notification["id"] = nullptr;
@@ -2046,6 +2093,8 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
                                 << (scfg.coin_symbol.empty() ? "" : " " + scfg.coin_symbol)
                                 << " address and not a configured merged chain; "
                                    "no zero-payout share will be built (issue #961)";
+                    // No job: a clean request taken above stays owed.
+                    template_retry_clean_ = template_retry_clean_ || force_clean;
                     return;
                 }
                 // Accepted (own-coin OR configured-merged): byte-identical build.
@@ -2084,7 +2133,8 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
                 LOG_WARNING << "[Stratum] job held for " << limit.count() << " s (the sharechain stayed"
                             << " busy): no more retries, the miner keeps its last job until the next notify";
                 hold_retries_ = 0;
-                hold_retry_clean_ = false;
+                // hold_retry_clean_ is kept: a clean notify held meanwhile is
+                // still owed to the next job sent (folded where a hold ends).
                 return;
             }
             if (!hold_retry_pending_) {
@@ -2102,7 +2152,7 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
                         return;
                     const bool clean = self->hold_retry_clean_;
                     self->hold_retry_clean_ = false;
-                    self->send_notify_work(clean);
+                    run_notify_retry(*self, clean);
                 });
             }
             return;

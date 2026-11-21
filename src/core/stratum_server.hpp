@@ -323,7 +323,7 @@ private:
     // the session stops retrying (the miner keeps its last valid job) until
     // the next notify. hold_retry_clean_: a notify held meanwhile asked for
     // clean jobs, so the next job sent does (the retry's, or one built first
-    // by another notify).
+    // by another notify), also after the limit ended the retries.
     bool hold_retry_pending_ = false;
     bool hold_retry_clean_ = false;
     std::chrono::steady_clock::time_point hold_since_{};
@@ -333,10 +333,14 @@ private:
     // job suppressed for want of an atomic snapshot / a real prevhash): one
     // pending 1 s retry per session, however many notifies arrive meanwhile
     // (template_retry_pending_ is set while its timer is armed and cleared
-    // only by its handler). template_retry_clean_: a notify made meanwhile
-    // asked for clean jobs, so the next job sent carries clean_jobs=true —
+    // only by its handler). template_waiting_: a wait is active (set by each
+    // not-ready exit, cleared once the work is ready); a retry that finds the
+    // wait over and nothing owed sends nothing. template_retry_clean_: a
+    // clean request is owed (made during the wait, or carried by a call that
+    // ended without a job), so the next job sent carries clean_jobs=true —
     // the retry's, or one sent first by any other notify.
     bool template_retry_pending_ = false;
+    bool template_waiting_ = false;
     bool template_retry_clean_ = false;
 
 public:
