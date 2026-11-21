@@ -1834,6 +1834,30 @@ static std::string gbt_to_stratum_prevhash(const std::string& gbt_hex)
     return result;
 }
 
+void StratumSession::retry_notify_when_work_ready(bool force_clean)
+{
+    // A clean notify requested while the work was not ready must make the
+    // retried job clean: accumulate it, and keep ONE pending retry per session
+    // (a timer per notify would send one job per notify made during the wait).
+    template_retry_clean_ = template_retry_clean_ || force_clean;
+    if (template_retry_pending_)
+        return;
+    template_retry_pending_ = true;
+    auto timer = std::make_shared<boost::asio::steady_timer>(socket_.get_executor());
+    timer->expires_after(std::chrono::seconds(1));
+    timer->async_wait([weak_self = weak_from_this(), timer](boost::system::error_code ec) {
+        auto self = weak_self.lock();
+        if (!self)
+            return;
+        self->template_retry_pending_ = false;
+        if (ec || !self->is_connected())
+            return;
+        const bool clean = self->template_retry_clean_;
+        self->template_retry_clean_ = false;
+        self->send_notify_work(clean);
+    });
+}
+
 void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_best_share)
 {
     // Don't send work until a valid block template is available
@@ -1871,16 +1895,16 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
                                 << "] Waiting for block template (header sync in progress)...";
             }
         }
-        auto timer = std::make_shared<boost::asio::steady_timer>(socket_.get_executor());
-        timer->expires_after(std::chrono::seconds(1));
-        timer->async_wait([weak_self = weak_from_this(), timer](boost::system::error_code ec) {
-            if (ec) return;
-            auto self = weak_self.lock();
-            if (!self || !self->is_connected()) return;
-            self->send_notify_work();
-        });
+        retry_notify_when_work_ready(force_clean);
         return;
     }
+
+    // A clean notify requested while the work was not ready is owed to the
+    // first job that goes out, whichever notify sends it. Every exit below
+    // that sends no job hands force_clean on (the held retry, the suppressed-
+    // job retry), so the flag is not lost by taking it here.
+    force_clean = force_clean || template_retry_clean_;
+    template_retry_clean_ = false;
 
     nlohmann::json notification;
     notification["id"] = nullptr;
@@ -2083,7 +2107,10 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
             }
             return;
         }
+        // The hold is over. A clean notify held meanwhile is owed to this
+        // job even when another notify, not the held retry, builds it.
         hold_retries_ = 0;
+        force_clean = force_clean || hold_retry_clean_;
         hold_retry_clean_ = false;
         if (!cbr.coinb1.empty()) {
             coinb1 = std::move(cbr.coinb1);
@@ -2154,14 +2181,7 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
                         << (snapshot_missing ? "no atomic header+coinbase snapshot"
                                              : "empty/zero prevhash")
                         << ") — not serving unmineable/mixed work; retrying in 1s";
-            auto timer = std::make_shared<boost::asio::steady_timer>(socket_.get_executor());
-            timer->expires_after(std::chrono::seconds(1));
-            timer->async_wait([weak_self = weak_from_this(), timer](boost::system::error_code ec) {
-                if (ec) return;
-                auto self = weak_self.lock();
-                if (!self || !self->is_connected()) return;
-                self->send_notify_work();
-            });
+            retry_notify_when_work_ready(force_clean);
             return;
         }
     }
@@ -2183,7 +2203,8 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
             merkle_branches.push_back(h);
     }
 
-    // clean_jobs = true when prevhash changed OR forced (e.g. after authorize)
+    // clean_jobs = true when prevhash changed OR forced (e.g. after authorize,
+    // or a clean notify owed from a wait / a hold)
     bool clean_jobs = force_clean || (prevhash != last_prevhash_);
     last_prevhash_ = prevhash;
 
