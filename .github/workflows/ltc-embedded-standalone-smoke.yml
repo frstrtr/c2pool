@@ -1,0 +1,127 @@
+name: LTC embedded-standalone daemonless smoke
+
+# ci-steward 2026-11-12. First CI coverage of the ltc embedded-standalone
+# (daemonless) boot path: c2pool-ltc in its default integrated mode with the
+# embedded LTC SPV node, NO litecoind. Nothing else boots the binary
+# daemonless, so a regression on this path is otherwise invisible until prod.
+#
+# Builds the c2pool-ltc target, boots it daemonless, and asserts (bounded):
+# process stays up, the embedded HeaderChain initializes, the seed-based coin
+# broadcaster starts, and the HTTP engine endpoint /node_info returns 200. A
+# live coin peer is observed BEST-EFFORT (same #1469 downgrade as the dgb and
+# dash smokes). Runs github-hosted for real DNS + P2P egress. If no peer shows
+# up and the log shows egress failure, the gate emits a NAMED, logged skip, so
+# a silent skip can never read as green.
+#
+# Deliberately does NOT assert header-tip advance (dgb/dash precedent).
+#
+# Neutral-skip on branches without the ltc embedded-standalone sources
+# (PR #47 per-coin source-presence guard preserved — this job is an ADDITIVE
+# guard and does NOT relax the coin-matrix guard).
+
+on:
+  # additive: callable by ci-required.yml aggregator (no push/PR behaviour change)
+  workflow_call:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'src/c2pool/main_ltc.cpp'
+      - 'src/c2pool/merged/coin_broadcaster.hpp'
+      - 'src/core/dns_seeder.hpp'
+      - 'src/impl/ltc/coin/chain_seeds.hpp'
+      - 'src/impl/ltc/coin/header_chain.hpp'
+      - 'tests/gates/ltc_embedded_standalone_smoke.sh'
+      - '.github/workflows/ltc-embedded-standalone-smoke.yml'
+
+concurrency:
+  # See coin-matrix.yml: github.workflow is the CALLER name when reused, so
+  # scope the reused-path group to the run instance; direct triggers keep a
+  # stable per-ref group.
+  group: ltc-standalone-smoke-${{ github.ref }}-${{ github.workflow == 'LTC embedded-standalone daemonless smoke' && 'direct' || github.run_id }}
+  cancel-in-progress: ${{ github.event_name != 'push' }}
+
+jobs:
+  ltc-embedded-standalone-smoke:
+    name: LTC embedded-standalone daemonless smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check ltc embedded-standalone source presence
+        id: presence
+        run: |
+          if [ -f "src/c2pool/main_ltc.cpp" ] && [ -f "tests/gates/ltc_embedded_standalone_smoke.sh" ]; then
+            echo "exists=1" >> "$GITHUB_OUTPUT"
+            echo "::notice::ltc embedded-standalone sources present — running daemonless smoke."
+          else
+            echo "exists=0" >> "$GITHUB_OUTPUT"
+            echo "::notice::ltc embedded-standalone sources absent on this branch — neutral skip (PR #47 guard preserved)."
+          fi
+
+      - name: Set per-job Conan home
+        if: steps.presence.outputs.exists == '1'
+        run: echo "CONAN_HOME=$RUNNER_TEMP/conan2" >> "$GITHUB_ENV"
+
+      - name: Install system dependencies
+        if: steps.presence.outputs.exists == '1'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            g++ ccache cmake make libleveldb-dev libsecp256k1-dev
+
+      - uses: actions/setup-python@v6
+        if: steps.presence.outputs.exists == '1'
+        with: { python-version: '3.12' }
+
+      - name: Install Conan 2
+        if: steps.presence.outputs.exists == '1'
+        run: |
+          pip install "conan>=2.0,<3.0"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Restore Conan cache
+        if: steps.presence.outputs.exists == '1'
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/conan2
+          key: conan2-ubuntu24-gcc13-ltc-smoke-${{ hashFiles('conanfile.txt', 'ci/conan/linux-gcc13.profile', 'conan.lock') }}
+          restore-keys: |
+            conan2-ubuntu24-gcc13-ltc-smoke-
+            conan2-ubuntu24-gcc13-
+
+      # Match the green coin-matrix provisioning exactly: lockfile-pinned deps
+      # and an EXPLICIT build_type=Release.
+      - name: Conan install
+        if: steps.presence.outputs.exists == '1'
+        run: |
+          for attempt in 1 2 3; do
+            if conan install . \
+              -pr:a=ci/conan/linux-gcc13.profile \
+              --lockfile=conan.lock \
+              --build=missing \
+              --output-folder=build_ci \
+              --settings=build_type=Release; then exit 0; fi
+            echo "conan install failed (attempt $attempt/3); retrying in $((attempt * 15))s"
+            sleep $((attempt * 15))
+          done
+          exit 1
+
+      - name: Configure
+        if: steps.presence.outputs.exists == '1'
+        run: |
+          cmake -S . -B build_ci \
+            -DCMAKE_TOOLCHAIN_FILE=build_ci/conan_toolchain.cmake \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build c2pool-ltc target
+        if: steps.presence.outputs.exists == '1'
+        run: cmake --build build_ci --target c2pool-ltc -j"$(nproc)"
+
+      - name: Run ltc embedded-standalone daemonless smoke
+        if: steps.presence.outputs.exists == '1'
+        shell: bash
+        env:
+          BUILD_DIR: build_ci
+        run: bash tests/gates/ltc_embedded_standalone_smoke.sh
