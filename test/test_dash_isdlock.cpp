@@ -734,6 +734,195 @@ TEST(DashIsdlockG4, UnverifiedIsdlockChangesNothing)
     EXPECT_TRUE(selected_contains(mp, x_txid));
 }
 
+// ═══ N2 — a lock that arrives while a template carrying the conflict is served ═
+//
+// Dash Core v24.0.2 rejects a block whose tx conflicts with a known islock
+// unless that block is already ChainLocked (validation.cpp:2811-2829,
+// conflict-tx-lock). Eviction and the G4 guard above only shape the NEXT
+// template; a body built before the lock arrived still carries the tx. These
+// pin the three pieces that act on such a body: the pure body scan, the
+// verified-only map + sink (a forged relay-lane lock must drive neither), and
+// the once-per-second coalescer behind the forced refresh.
+
+using dash::coin::IslockRefreshCoalescer;
+using dash::coin::body_conflicts_with_lock;
+using dash::coin::Transaction;
+
+TEST(DashIsdlockN2, BodyScanNamesTheConflictingTxAndTheLock)
+{
+    auto cb = make_coinbase({100'000, 90'000}, /*salt=*/3);
+    const uint256 cbid = dash_txid(cb);
+    const auto A = make_spend(cbid, 0, 90'000, /*salt=*/31);
+    const auto Z = make_spend(cbid, 1, 80'000, /*salt=*/32);
+    const uint256 a = dash_txid(A);
+    const uint256 z = dash_txid(Z);
+    const std::vector<Transaction> body{Transaction(Z), Transaction(A)};
+    const std::vector<uint256> ids{z, a};
+    const std::vector<std::pair<uint256, uint32_t>> lockO{{cbid, 0u}};
+
+    // O locked to another txid: A (index 1) is the conflict.
+    const auto c = body_conflicts_with_lock(body, ids, raw256(0x77), lockO);
+    ASSERT_TRUE(c.has_value());
+    EXPECT_EQ(c->index, 1u);
+    EXPECT_EQ(c->txid, a);
+    EXPECT_EQ(c->locked_txid, raw256(0x77));
+    EXPECT_EQ(c->outpoint, lockO[0]);
+
+    // O locked to A itself: A IS the locked tx, nothing to do.
+    EXPECT_FALSE(body_conflicts_with_lock(body, ids, a, lockO).has_value());
+
+    // Ids not lined up with the body: computed, same verdicts.
+    const auto c2 = body_conflicts_with_lock(body, {}, raw256(0x77), lockO);
+    ASSERT_TRUE(c2.has_value());
+    EXPECT_EQ(c2->txid, a);
+    EXPECT_FALSE(body_conflicts_with_lock(body, {}, a, lockO).has_value());
+
+    // A lock on an outpoint the body does not spend: no conflict.
+    EXPECT_FALSE(body_conflicts_with_lock(body, ids, raw256(0x77),
+                                          {{raw256(0x99), 0u}}).has_value());
+}
+
+TEST(DashIsdlockN2, OnlyTheVerifiedLaneArmsTheBeltAndTheRefreshSink)
+{
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+    Mempool& mp = st.mempool();
+
+    UtxoLane lane;
+    ASSERT_TRUE(lane.open(""));
+    lane.attach(mp);
+    auto cb = make_coinbase({100'000, 90'000}, /*salt=*/4);
+    lane.on_block_connected(make_block({cb}, /*salt=*/4), /*height=*/1);
+    const uint256 cbid = dash_txid(cb);
+    const std::pair<uint256, uint32_t> O{cbid, 0u};
+    const auto A = make_spend(cbid, 0, 90'000, /*salt=*/41);
+    const uint256 a = dash_txid(A);
+
+    // The template being served was built before any lock: it carries A.
+    const std::vector<Transaction> served{Transaction(A)};
+    const std::vector<uint256> served_ids{a};
+
+    int sink_calls = 0;
+    uint256 sink_txid;
+    std::vector<std::pair<uint256, uint32_t>> sink_inputs;
+    m.set_on_verified_islock(
+        [&](const uint256& t, const std::vector<std::pair<uint256, uint32_t>>& in) {
+            ++sink_calls;
+            sink_txid = t;
+            sink_inputs = in;
+        });
+    std::array<uint8_t, 96> sig{}; sig.fill(0xab);
+
+    // (1) Relay lane (unverified, any peer): the eviction map fills, the
+    //     verified map does not, the sink is not called, the belt is quiet.
+    m.on_islock(raw256(0x77), {O});
+    EXPECT_EQ(mp.islock_outpoint_count(), 1u);
+    EXPECT_EQ(mp.verified_islock_outpoint_count(), 0u);
+    EXPECT_FALSE(mp.verified_islock_conflict_in(served, served_ids).has_value())
+        << "a forged relay-lane lock must not be able to refuse templates";
+    EXPECT_EQ(sink_calls, 0)
+        << "a forged relay-lane lock must not be able to force clean notifies";
+
+    // (2) BLS verifier refuses: same.
+    m.set_islock_verify_fn(
+        [](const std::vector<std::pair<uint256, uint32_t>>&, const uint256&,
+           const uint256&, const std::array<uint8_t, 96>&) { return false; });
+    m.on_new_isdlock({O}, raw256(0x77), raw256(0x33), sig);
+    EXPECT_EQ(mp.verified_islock_outpoint_count(), 0u);
+    EXPECT_EQ(sink_calls, 0);
+
+    // (3) Verified: map + sink (with the lock's own txid and outpoints); the
+    //     belt and the sink's served-template check both name A.
+    m.set_islock_verify_fn(
+        [](const std::vector<std::pair<uint256, uint32_t>>&, const uint256&,
+           const uint256&, const std::array<uint8_t, 96>&) { return true; });
+    m.on_new_isdlock({O}, raw256(0x77), raw256(0x33), sig);
+    EXPECT_EQ(mp.verified_islock_outpoint_count(), 1u);
+    ASSERT_EQ(sink_calls, 1);
+    EXPECT_EQ(sink_txid, raw256(0x77));
+    ASSERT_EQ(sink_inputs.size(), 1u);
+    EXPECT_EQ(sink_inputs[0], O);
+    const auto c = mp.verified_islock_conflict_in(served, served_ids);
+    ASSERT_TRUE(c.has_value());
+    EXPECT_EQ(c->txid, a);
+    EXPECT_EQ(c->locked_txid, raw256(0x77));
+    EXPECT_TRUE(body_conflicts_with_lock(served, served_ids, sink_txid, sink_inputs).has_value());
+
+    // (4) A verified lock on the served tx itself is not a conflict.
+    const auto B = make_spend(cbid, 1, 80'000, /*salt=*/42);
+    const std::vector<Transaction> served_b{Transaction(B)};
+    m.on_new_isdlock({{cbid, 1u}}, dash_txid(B), raw256(0x33), sig);
+    EXPECT_FALSE(mp.verified_islock_conflict_in(served_b, {dash_txid(B)}).has_value());
+
+    // (5) The outpoint confirmed in a block: the entry is resolved and pruned.
+    ASSERT_EQ(mp.verified_islock_outpoint_count(), 2u);
+    mp.remove_for_block(make_block({make_coinbase({1}, 5), B}, /*salt=*/5));
+    EXPECT_EQ(mp.verified_islock_outpoint_count(), 1u) << "only O:1 was spent";
+    mp.clear();
+    EXPECT_EQ(mp.verified_islock_outpoint_count(), 0u);
+}
+
+// The relay lane never overrides an outpoint a VERIFIED lock owns: it does not
+// rewrite the entry and does not evict the verified tx. Otherwise selection
+// (G4) and the emit belt (verified map) disagree and every freshly built
+// template is refused.
+TEST(DashIsdlockN2, ARelayLaneLockCannotOverrideAVerifiedOutpoint)
+{
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+    Mempool& mp = st.mempool();
+    UtxoLane lane;
+    ASSERT_TRUE(lane.open(""));
+    lane.attach(mp);
+    auto cb = make_coinbase({100'000, 90'000}, /*salt=*/6);
+    lane.on_block_connected(make_block({cb}, /*salt=*/6), /*height=*/1);
+    const uint256 cbid = dash_txid(cb);
+    const std::pair<uint256, uint32_t> O{cbid, 0u};
+    const auto A = make_spend(cbid, 0, 90'000, /*salt=*/61);
+    const uint256 a = dash_txid(A);
+    ASSERT_TRUE(mp.add_tx(A));
+    std::array<uint8_t, 96> sig{}; sig.fill(0xab);
+    m.set_islock_verify_fn(
+        [](const std::vector<std::pair<uint256, uint32_t>>&, const uint256&,
+           const uint256&, const std::array<uint8_t, 96>&) { return true; });
+    m.on_islock(a, {O});
+    m.on_new_isdlock({O}, a, raw256(0x33), sig);
+    ASSERT_TRUE(selected_contains(mp, a));
+
+    // A relay-lane lock claiming O for T: A stays (not evicted, still selected).
+    const auto T = make_spend(cbid, 0, 80'000, /*salt=*/62);
+    const uint256 t = dash_txid(T);
+    m.on_islock(t, {O});
+    EXPECT_TRUE(selected_contains(mp, a)) << "a relay-lane lock evicted or excluded the verified tx";
+
+    // T itself (if admitted) is never selected: O belongs to the verified A.
+    (void)mp.add_tx(T);
+    EXPECT_FALSE(selected_contains(mp, t))
+        << "selection admitted a tx the emit belt refuses (verified lock on its outpoint)";
+}
+
+TEST(DashIsdlockN2, RefreshCoalescerFiresOncePerGapWithOneTrailing)
+{
+    using C = IslockRefreshCoalescer;
+    using std::chrono::milliseconds;
+    using std::chrono::seconds;
+    C co(seconds(1));
+    const auto t0 = C::clock::time_point{} + std::chrono::hours(1);
+
+    EXPECT_EQ(co.on_trigger(t0).act, C::Act::FireNow);
+    const auto d = co.on_trigger(t0 + milliseconds(300));
+    EXPECT_EQ(d.act, C::Act::ScheduleTrailing);
+    EXPECT_TRUE(d.delay == milliseconds(700));
+    EXPECT_EQ(co.on_trigger(t0 + milliseconds(500)).act, C::Act::AlreadyPending)
+        << "triggers before the trailing refresh are absorbed";
+    co.on_trailing_fired(t0 + seconds(1));
+    EXPECT_FALSE(co.pending());
+    EXPECT_EQ(co.on_trigger(t0 + milliseconds(1500)).act, C::Act::ScheduleTrailing)
+        << "the trailing refresh counts as the last fire";
+    co.on_trailing_fired(t0 + seconds(2));
+    EXPECT_EQ(co.on_trigger(t0 + seconds(3)).act, C::Act::FireNow);
+}
+
 // ═══ 4. FAIL-CLOSED — real BLS (gated on the dashbls backend) ════════════════
 
 #ifdef C2POOL_DASH_BLS

@@ -4353,9 +4353,36 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     }
 
     dash::stratum::DASHWorkSource::SubmitBlockFn stratum_submit_fn =
-        [p2p_relay, rpc_submit](const std::vector<unsigned char>& block_bytes,
+        [p2p_relay, rpc_submit, &node_coin_state](
+                                const std::vector<unsigned char>& block_bytes,
                                 uint32_t height,
                                 bool height_race) -> bool {
+            // N2: a won block carrying a tx that conflicts with a VERIFIED
+            // islock is conflict-tx-lock on every non-IBD Dash Core node
+            // (v24.0.2 validation.cpp:2811-2829) unless it is already
+            // ChainLocked, which a fresh block never is. Checked AFTER dispatch
+            // (never delay a won block) and only while the verified lane holds
+            // locks; it names the loss instead of leaving an unexplained orphan.
+            auto name_islock_conflict = [&]() {
+                if (node_coin_state.mempool().verified_islock_outpoint_count() == 0) return;
+                try {
+                    dash::coin::BlockType blk;
+                    ::PackStream s(block_bytes);
+                    s >> blk;
+                    if (const auto c = node_coin_state.mempool().verified_islock_conflict_in(
+                            blk.m_txs, std::vector<uint256>{}))
+                        LOG_ERROR << "[ISLOCK-CONFLICT] won block height=" << height
+                                  << " carries tx " << c->txid.GetHex().substr(0, 16)
+                                  << " spending " << c->outpoint.first.GetHex().substr(0, 16)
+                                  << ":" << c->outpoint.second
+                                  << ", locked by a VERIFIED islock to "
+                                  << c->locked_txid.GetHex().substr(0, 16)
+                                  << " -- Dash Core will reject it (conflict-tx-lock)";
+                } catch (...) {
+                    LOG_WARNING << "[ISLOCK-CONFLICT] won-block islock check skipped:"
+                                   " block decode failed";
+                }
+            };
             const std::string block_hex = HexStr(block_bytes);
             std::cout << "[DASH-STRATUM-BLOCK] won block height=" << height
                       << " bytes=" << block_bytes.size()
@@ -4386,12 +4413,14 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                                  "(no embedded P2P peer AND no dashd RPC creds) -- "
                                  "won block NOT broadcast\n";
                 }
+                name_islock_conflict();
                 return false;
             }
             std::cout << "[DASH-STRATUM-BLOCK] relayed: p2p="
                       << (bcast.p2p_sent ? "sent" : "off")
                       << " rpc=" << (bcast.rpc_ok ? "ok" : "off")
                       << " landed_first=" << bcast.landed_first << "\n";
+            name_islock_conflict();
             return true;
         };
 
@@ -7895,6 +7924,68 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 [ws_dirty, &stratum_server]() {
                     if (auto ws = ws_dirty.lock()) ws->bump_work_generation();
                     if (stratum_server) stratum_server->notify_all();
+                });
+        }
+
+        // N2: a BLS-VERIFIED islock whose outpoint the SERVED template spends
+        // under another txid. Dash Core rejects a block carrying that tx unless
+        // the block is already ChainLocked (v24.0.2 validation.cpp:2811-2829,
+        // conflict-tx-lock), so the job miners hold can no longer win a block.
+        // Mempool eviction and the G4 selection guard only shape the NEXT
+        // template; drop the cached one and push clean work now (clean_jobs:
+        // the old work cannot produce a valid block, so rigs should discard
+        // what they have queued). Verified lane only — a forged lock on the
+        // unverified relay lane must not be able to force clean notifies — and
+        // coalesced to one refresh per second with one trailing refresh.
+        {
+            std::weak_ptr<dash::stratum::DASHWorkSource> ws_islock = work_source;
+            auto coalescer = std::make_shared<dash::coin::IslockRefreshCoalescer>(
+                std::chrono::seconds(1));
+            auto trailing = std::make_shared<io::steady_timer>(ioc);
+            auto fire = [ws_islock, &stratum_server]() {
+                if (auto ws = ws_islock.lock())
+                    ws->invalidate_template_cache("verified islock conflicts with the served template");
+                if (stratum_server) stratum_server->notify_all();
+            };
+            maintainer->set_on_verified_islock(
+                [ws_islock, coalescer, trailing, fire](
+                    const uint256& locked_txid,
+                    const std::vector<std::pair<uint256, uint32_t>>& inputs) {
+                    auto ws = ws_islock.lock();
+                    if (!ws) return;
+                    const auto c = ws->served_template_islock_conflict(locked_txid, inputs);
+                    if (!c) return;
+                    const auto d = coalescer->on_trigger(std::chrono::steady_clock::now());
+                    LOG_WARNING << "[ISLOCK-CONFLICT] served template carries tx "
+                                << c->txid.GetHex().substr(0, 16)
+                                << " spending " << c->outpoint.first.GetHex().substr(0, 16)
+                                << ":" << c->outpoint.second
+                                << ", now locked by a VERIFIED islock to "
+                                << locked_txid.GetHex().substr(0, 16)
+                                << " (a block on this job would be conflict-tx-lock) -- "
+                                << (d.act == dash::coin::IslockRefreshCoalescer::Act::FireNow
+                                        ? "forcing a clean work refresh"
+                                        : d.act == dash::coin::IslockRefreshCoalescer::Act::ScheduleTrailing
+                                              ? "clean work refresh scheduled (coalesced)"
+                                              : "clean work refresh already scheduled");
+                    switch (d.act) {
+                    case dash::coin::IslockRefreshCoalescer::Act::FireNow:
+                        fire();
+                        break;
+                    case dash::coin::IslockRefreshCoalescer::Act::ScheduleTrailing:
+                        trailing->expires_after(d.delay);
+                        trailing->async_wait(
+                            [coalescer, fire](const boost::system::error_code& ec) {
+                                // Clear the pending flag either way: a cancelled
+                                // wait must not leave the coalescer stuck.
+                                coalescer->on_trailing_fired(std::chrono::steady_clock::now());
+                                if (ec) return;   // cancelled (shutdown)
+                                fire();
+                            });
+                        break;
+                    case dash::coin::IslockRefreshCoalescer::Act::AlreadyPending:
+                        break;
+                    }
                 });
         }
 

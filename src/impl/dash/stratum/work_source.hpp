@@ -586,6 +586,17 @@ public:
     /// stratum session re-pull a FRESH template on its next heartbeat.
     void invalidate_template_cache(const char* reason = "reconnect");
 
+    /// N2: does the currently cached (served) template spend one of `inputs`
+    /// under a txid other than `locked_txid`? Called once per BLS-VERIFIED
+    /// isdlock adoption; main_dash invalidates the cache and pushes clean work
+    /// on a hit. nullopt when nothing is cached (the next serve re-sources
+    /// through the G4-guarded selection and the emit belt anyway). Any thread:
+    /// copies the snapshot pointer under template_mutex_ and scans the
+    /// immutable snapshot outside it.
+    std::optional<coin::IslockConflict>
+    served_template_islock_conflict(const uint256& locked_txid,
+                                    const std::vector<std::pair<uint256, uint32_t>>& inputs) const;
+
     /// Non-fetching read of the last DashWorkData sourced through the
     /// embedded/dashd selector. Returns the cached snapshot (or nullptr when
     /// none has been sourced yet) WITHOUT triggering a refresh -- safe to call

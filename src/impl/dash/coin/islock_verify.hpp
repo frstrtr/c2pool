@@ -12,10 +12,13 @@
 /// isdlock UNVERIFIED would let an arbitrary peer evict arbitrary mempool txs
 /// from our served templates (add_islock evicts conflicts immediately and the
 /// G4 guard excludes their outpoints from selection) — fee loss on demand.
-/// Refusal, by contrast, costs NOTHING but parity: islock exclusion is an
-/// optimization (dashd itself waives conflict-tx-lock once a block is
-/// chainlocked), so every failure mode below fails CLOSED to today's
-/// behaviour (empty map, unchanged selection).
+/// Refusal fails CLOSED to the behaviour without this lane (the unverified
+/// relay lane's map, unchanged selection). It is not free: dashd rejects a
+/// block carrying a tx that conflicts with a known islock unless that block
+/// is already ChainLocked (v24.0.2 validation.cpp:2811-2829), and only a
+/// VERIFIED lock may drive the emit-gate refusal and the forced work refresh
+/// that keep such a tx out of a template served before the lock arrived (N2,
+/// Mempool::add_verified_islock).
 ///
 /// REUSE-FIRST (operator mandate — mirror Dash Core, do not invent). Every
 /// step is dashcore v23.1.7, cited at the line it came from, cross-checked
