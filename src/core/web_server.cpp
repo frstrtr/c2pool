@@ -12555,6 +12555,19 @@ void MiningInterface::update_stat_log()
             entry.current_payouts[addr] = coin_amt;
         }
     }
+    // A coin whose payout split lives outside the coinbase-builder cache wires
+    // set_current_payouts_fn instead (DASH, BTC, BIP-110: #939). /current_payouts
+    // reads it, but this sampler only read the cache, so the "Predicted Payout
+    // History" series of those coins stayed empty. Same source, same shape
+    // (address -> coins), only when the cache gave nothing.
+    if (entry.current_payouts.empty() && m_current_payouts_fn) {
+        const auto direct = m_current_payouts_fn();
+        if (direct.is_object()) {
+            for (auto it = direct.begin(); it != direct.end(); ++it)
+                if (it.value().is_number())
+                    entry.current_payouts[it.key()] = it.value().get<double>();
+        }
+    }
 
     // Merged current payouts per miner (DOGE amounts keyed by LTC address)
     // Consistent with current_payouts: every miner in the LTC PPLNS gets a
