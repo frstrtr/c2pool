@@ -828,6 +828,9 @@ public:
         if (m_tip.IsNull()) return false;
         auto it = m_headers.find(m_tip);
         if (it == m_headers.end()) return false;
+        // A tip that does not run through the fast-start anchor is never a
+        // synced tip, however fresh its timestamp.
+        if (!descends_from_anchor_locked(it->second)) return false;
         auto now = static_cast<uint32_t>(std::time(nullptr));
         return (now - it->second.header.m_timestamp) < 86400; // 24 hours
     }
@@ -885,6 +888,38 @@ public:
     void set_on_tip_changed(TipChangedCallback cb) { m_on_tip_changed = std::move(cb); }
 
 private:
+    /// Does `e` lie on a chain through the fast-start anchor? Always true for
+    /// a store without one (it syncs from genesis). Caller holds m_mutex.
+    ///
+    /// The walk stops at the first ancestor that is on the current best chain
+    /// at its height, provided that chain itself runs through the anchor: the
+    /// tip only moves to descendants (this rule), so that is the usual case
+    /// and a linear extension costs one lookup. A side branch costs its depth.
+    bool descends_from_anchor_locked(const IndexEntry& e) const
+    {
+        if (!m_params.fast_start_checkpoint.has_value()) return true;
+        const auto& cp = m_params.fast_start_checkpoint.value();
+        if (e.height < cp.height) return false;
+        if (e.height == cp.height) return e.hash == cp.hash;
+        auto anchor_at = m_height_index.find(cp.height);
+        const bool best_runs_through_anchor =
+            m_tip_height >= cp.height && anchor_at != m_height_index.end()
+            && anchor_at->second == cp.hash;
+        uint256  h  = e.prev_hash;
+        uint32_t ht = e.height - 1;
+        while (true) {
+            if (ht == cp.height) return h == cp.hash;
+            if (best_runs_through_anchor && ht <= m_tip_height) {
+                auto at = m_height_index.find(ht);
+                if (at != m_height_index.end() && at->second == h) return true;
+            }
+            auto it = m_headers.find(h);
+            if (it == m_headers.end()) return false;
+            h = it->second.prev_hash;
+            --ht;
+        }
+    }
+
     bool add_header_internal(const BlockHeaderType& header) {
         // Dash: block identity = X11(header)
         uint256 bhash = x11_hash(header);
@@ -958,6 +993,22 @@ private:
         bool equal_at_tip = entry.chain_work == m_best_work
                          && new_height == m_tip_height
                          && bhash != m_tip;
+        // A store that started from the fast-start anchor keeps a best chain
+        // that runs through the anchor. A header that does not descend from
+        // it is stored (lookups keep working) but never competes for the tip,
+        // whatever its work: below the anchor the store holds no cumulative
+        // work to compare against.
+        if ((dominated || equal_at_tip) && !descends_from_anchor_locked(entry)) {
+            static uint64_t s_not_descending = 0;
+            if (++s_not_descending <= 5 || s_not_descending % 1000 == 0)
+                LOG_INFO << "[EMB-DASH] header h=" << new_height << " "
+                         << bhash.GetHex().substr(0, 16)
+                         << " does not descend from the fast-start anchor; it"
+                            " does not compete for the tip (#"
+                         << s_not_descending << ")";
+            dominated = false;
+            equal_at_tip = false;
+        }
         if (dominated || equal_at_tip) {
             uint32_t old_height = m_tip_height;
             uint256  old_tip = m_tip;

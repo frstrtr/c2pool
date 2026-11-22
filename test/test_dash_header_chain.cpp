@@ -1190,3 +1190,119 @@ TEST(DashHeaderChainMtp, MedianOfUnorderedTimestamps)
     EXPECT_EQ(*m12, w[5]);
     EXPECT_NE(*m12, times[7]) << "the window is out of order, so position and median differ";
 }
+
+// ── A store that started at the fast-start anchor keeps its best chain
+// through the anchor, and reaches the live chain from a locator resync. ──
+namespace {
+struct AnchoredNet {
+    DashChainParams params;
+    std::vector<BlockHeaderType> hdr;   // index = height
+    std::vector<uint256> hash;
+};
+AnchoredNet make_anchored_net(uint32_t K, uint32_t A)
+{
+    AnchoredNet n;
+    n.params = make_easy_test_params();
+    BlockHeaderType G;
+    G.m_version = 1;
+    G.m_merkle_root.SetHex("00000000000000000000000000000000000000000000000000000000000000dd");
+    G.m_timestamp = 1'500'000'000u;
+    G.m_bits = n.params.pow_limit.GetCompact();
+    G.m_nonce = 0;
+    n.params.genesis_hash = x11_hash(G);
+    n.hdr.push_back(G);
+    n.hash.push_back(n.params.genesis_hash);
+    const uint32_t now = static_cast<uint32_t>(std::time(nullptr));
+    for (uint32_t i = 1; i <= K; ++i) {
+        const uint32_t t = now - (K - i) * 60u - 30u;
+        auto h = mine_header(n.hash.back(), t, n.params.pow_limit.GetCompact(), n.params.pow_limit);
+        n.hdr.push_back(h);
+        n.hash.push_back(x11_hash(h));
+    }
+    DashChainParams::Checkpoint cp{};
+    cp.height = A;
+    cp.hash = n.hash[A];
+    n.params.fast_start_checkpoint = cp;
+    return n;
+}
+// A peer answering getheaders to the store's own locator (<= 2000 per reply),
+// until a reply adds nothing three times in a row.
+void resync_from_locator(HeaderChain& hc, const AnchoredNet& n, uint32_t K)
+{
+    int zero_rounds = 0;
+    for (int rounds = 0; rounds < 30; ++rounds) {
+        const auto loc = hc.get_locator();
+        uint32_t start = 0; bool found = false;
+        for (const auto& l : loc) {
+            for (uint32_t i = 0; i <= K; ++i)
+                if (n.hash[i] == l) { start = i + 1; found = true; break; }
+            if (found) break;
+        }
+        if (!found || start > K) return;
+        std::vector<BlockHeaderType> reply;
+        for (uint32_t i = start; i <= K && reply.size() < 2000; ++i) reply.push_back(n.hdr[i]);
+        if (hc.add_headers(reply) <= 0 && ++zero_rounds >= 3) return;
+    }
+}
+BlockHeaderType header_on(const AnchoredNet& n, const uint256& parent)
+{
+    const uint32_t now = static_cast<uint32_t>(std::time(nullptr));
+    return mine_header(parent, now - 10, n.params.pow_limit.GetCompact(), n.params.pow_limit);
+}
+} // namespace
+
+TEST(DashHeaderChainAnchor, S1AHeaderOnTheAnchorGivesWayToTheLiveChain)
+{
+    constexpr uint32_t A = 40, K = 50;
+    AnchoredNet n = make_anchored_net(K, A);
+    HeaderChain hc(n.params, "");
+    ASSERT_TRUE(hc.init());
+    ASSERT_EQ(hc.height(), A);
+    // It descends from the anchor, so it may hold the tip until the live
+    // chain arrives; the live chain then takes over.
+    hc.add_header(header_on(n, n.hash[A]));
+    resync_from_locator(hc, n, K);
+    ASSERT_TRUE(hc.tip().has_value());
+    EXPECT_EQ(hc.height(), K);
+    EXPECT_EQ(hc.tip()->hash, n.hash[K]);
+    EXPECT_TRUE(hc.is_synced());
+}
+
+TEST(DashHeaderChainAnchor, S2AHeaderOnAPreAnchorEntryDoesNotBecomeTheTip)
+{
+    constexpr uint32_t A = 40, K = 50;
+    AnchoredNet n = make_anchored_net(K, A);
+    HeaderChain hc(n.params, "");
+    ASSERT_TRUE(hc.init());
+    std::vector<BlockHeaderType> span(n.hdr.begin() + (A - 5), n.hdr.begin() + A + 1);
+    ASSERT_EQ(hc.install_preanchor_span(n.hash[A], span), 5u);
+
+    hc.add_header(header_on(n, n.hash[A - 3]));
+    EXPECT_EQ(hc.height(), A) << "the tip must stay on the anchor's chain";
+    ASSERT_TRUE(hc.tip().has_value());
+    EXPECT_EQ(hc.tip()->hash, n.hash[A]);
+
+    resync_from_locator(hc, n, K);
+    EXPECT_EQ(hc.height(), K);
+    EXPECT_TRUE(hc.is_synced());
+}
+
+TEST(DashHeaderChainAnchor, S3APreAnchorSpanLongerThanOneReplyStillReachesTheLiveChain)
+{
+    // The held span is longer than one getheaders reply (2000 headers).
+    constexpr uint32_t A = 2200, K = 2210;
+    AnchoredNet n = make_anchored_net(K, A);
+    HeaderChain hc(n.params, "");
+    ASSERT_TRUE(hc.init());
+    std::vector<BlockHeaderType> span(n.hdr.begin() + (A - 2100), n.hdr.begin() + A + 1);
+    ASSERT_EQ(hc.install_preanchor_span(n.hash[A], span), 2100u);
+
+    hc.add_header(header_on(n, n.hash[A - 2100]));
+    EXPECT_GE(hc.height(), A) << "the tip must never fall below the anchor";
+
+    resync_from_locator(hc, n, K);
+    ASSERT_TRUE(hc.tip().has_value());
+    EXPECT_EQ(hc.height(), K) << "the store must reach the live chain";
+    EXPECT_EQ(hc.tip()->hash, n.hash[K]);
+    EXPECT_TRUE(hc.is_synced());
+}
