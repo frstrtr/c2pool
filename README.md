@@ -1055,8 +1055,8 @@ listener's own non-loopback address; off when it binds `127.0.0.1` / `::1`
 behind a reverse proxy, binds one LAN or VPN address while the stratum port
 binds wider, binds `0.0.0.0` while the stratum port binds IPv6, or is disabled.
 `auto` cannot see a firewall, a cloud security group or a container that
-publishes only the stratum port: if the web port is closed that way, set
-`--stratum-http=false`. The startup log says which:
+publishes only the stratum port: if the web port is closed that way, do not
+use `auto`; keep `--stratum-http=false` (the default). The startup log says which:
 `stratum HTTP: ON (web bound to 0.0.0.0)` or
 `stratum HTTP: OFF (web bound to 10.8.0.1, stratum to 0.0.0.0)`.
 

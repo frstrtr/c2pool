@@ -2,7 +2,7 @@
 
 ## [Unreleased]
 
-### The REST API answers on the stratum port too (python p2pool parity)
+### With --stratum-http on, the REST API answers on the stratum port too
 - python p2pool served its web API on the worker port, and p2pool-aware
   trackers (miningpoolstats and others) poll `http://host:<worker port>/global_stats`.
   c2pool's stratum port answered such a request with a stratum "Invalid JSON"
@@ -51,14 +51,14 @@
   what is public), binds one LAN or VPN address while the stratum port binds
   wider, binds `0.0.0.0` while the stratum port binds IPv6, or is disabled. `auto`
   cannot see a firewall, a cloud security group or a container that
-  publishes only the stratum port: a node whose web port is closed that way
-  sets `--stratum-http=false`. Forced on without a web server, an HTTP
+  publishes only the stratum port: on a node whose web port is closed that
+  way, do not use `auto`; keep `--stratum-http=false` (the default). Forced on without a web server, an HTTP
   request gets a 503. The startup log names the result, e.g.
   `stratum HTTP: ON (web bound to 0.0.0.0)` or
   `stratum HTTP: OFF (web bound to 10.8.0.1, stratum to 0.0.0.0)`.
 - HEAD now works on the web port as well (it answered 405), except on the
-  routes that change state on GET (`/control/*`, `/api/admin/*`), which
-  answer HEAD with 405.
+  routes that change state on GET (`/control/*`, `/api/admin/*`) and
+  `/sharechain/stream`, which answer HEAD with 405.
 
 ### Linux packages: the binary starts without start.sh
 - `c2pool-<coin>` in the Linux tarball now loads its bundled libraries from
