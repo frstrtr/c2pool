@@ -72,8 +72,7 @@ adds:
 - cheap pre-checks before X11, plus size and count caps on incoming shares
   (PR #1850);
 - a graded misbehaviour score and ban for sharechain peers (PR #1858);
-- built-in seeds on port 8998, so a node started with `--net dash-v36` and no
-  `--addnode` finds the network by itself (PR #1859).
+- built-in seed support on port 8998 (PR #1859).
 The public v36 network has no deployed seed nodes yet; until it does, start
 with `--addnode` to a known v36 peer.
 
