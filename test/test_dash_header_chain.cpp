@@ -1612,3 +1612,125 @@ TEST(DashHeaderChainAnchor, AStoreBelowTheAnchorStartsFromItAndReachesTheLiveCha
     }
     std::filesystem::remove_all(dir);
 }
+
+namespace {
+// A fast-start anchor at height A that carries its pinned header with `bits`,
+// built on an arbitrary parent (the store never holds anything below it).
+struct PinnedAnchor {
+    DashChainParams params;
+    BlockHeaderType hdr;
+    uint256 hash;
+};
+PinnedAnchor make_pinned_anchor(uint32_t A, uint32_t bits, uint32_t ts, const char* parent_hex)
+{
+    PinnedAnchor a;
+    a.params = make_easy_test_params();
+    a.params.allow_min_difficulty = false;          // mainnet rules
+    uint256 parent;
+    parent.SetHex(parent_hex);
+    a.hdr = mine_header(parent, ts, bits, a.params.pow_limit);
+    a.hash = x11_hash(a.hdr);
+    DashChainParams::Checkpoint cp{};
+    cp.height = A;
+    cp.hash = a.hash;
+    cp.has_header = true;
+    cp.hdr_version = a.hdr.m_version;
+    cp.hdr_prev_block = a.hdr.m_previous_block;
+    cp.hdr_merkle_root = a.hdr.m_merkle_root;
+    cp.hdr_time = a.hdr.m_timestamp;
+    cp.hdr_bits = a.hdr.m_bits;
+    cp.hdr_nonce = a.hdr.m_nonce;
+    a.params.fast_start_checkpoint = cp;
+    return a;
+}
+// t = 2^244: 2t, 3t, 4t, 9t and the next compact value above 3t and 9t are exact.
+constexpr uint32_t kBitsT        = 0x1f100000u;   // t
+constexpr uint32_t kBits2T       = 0x1f200000u;   // 2t
+constexpr uint32_t kBits3T       = 0x1f300000u;   // 3t
+constexpr uint32_t kBitsAbove3T  = 0x1f300001u;   // 3t + 2^224
+constexpr uint32_t kBits4T       = 0x1f400000u;   // 4t
+constexpr uint32_t kBits9T       = 0x20009000u;   // 9t
+constexpr uint32_t kBitsAbove9T  = 0x20009001u;   // 9t + 2^232
+} // namespace
+
+// ── The near-anchor bound covers anchor+1 … anchor+24 and nothing else:
+// +24 is judged by the 3x bound (a 2x step accepted, 4x refused), and +25 by
+// the DGW bits of its own window (bits inside the bound but off DGW refused). ──
+TEST(DashHeaderChainAnchor, NearAnchorBoundEndsAtPlus24AndDgwStartsAtPlus25)
+{
+    constexpr uint32_t A = 34200;                  // past the DGW activation window
+    const uint32_t now = static_cast<uint32_t>(std::time(nullptr));
+    PinnedAnchor a = make_pinned_anchor(A, kBitsT, now - 60u * 150u,
+        "0000000000000000000000000000000000000000000000000000000000000c03");
+    HeaderChain hc(a.params, "");
+    ASSERT_TRUE(hc.init());
+    ASSERT_EQ(hc.height(), A);
+    uint256 prev = a.hash;
+    for (uint32_t i = 1; i <= 23; ++i) {
+        auto h = mine_header(prev, now - (60u - i) * 150u, kBitsT, a.params.pow_limit);
+        ASSERT_TRUE(hc.add_header(h)) << "h=A+" << i;
+        prev = x11_hash(h);
+    }
+    // +24: the bound is 3t (anchor and ancestors all at t).
+    auto over = mine_header(prev, now - 36u * 150u, kBits4T, a.params.pow_limit);
+    EXPECT_FALSE(hc.add_header(over)) << "4x at anchor+24 is outside the bound";
+    auto step = mine_header(prev, now - 36u * 150u, kBits2T, a.params.pow_limit);
+    EXPECT_TRUE(hc.add_header(step)) << "a 2x step at anchor+24 is inside the bound";
+    ASSERT_EQ(hc.height(), A + 24);
+    prev = x11_hash(step);
+
+    // +25: inside the bound (t <= 3 * 2t) but not this window's DGW bits.
+    const uint32_t want = hc.next_work_required();
+    ASSERT_NE(want, kBitsT) << "the KAT needs bits off this window's DGW";
+    auto off = mine_header(prev, now - 35u * 150u, kBitsT, a.params.pow_limit);
+    EXPECT_FALSE(hc.add_header(off)) << "anchor+25 is judged by DGW, not by the bound";
+    auto on = mine_header(prev, now - 35u * 150u, want, a.params.pow_limit);
+    EXPECT_TRUE(hc.add_header(on));
+    EXPECT_EQ(hc.height(), A + 25);
+}
+
+// ── The bound is exactly 3x the easiest of the pinned anchor and the header's
+// own ancestors above it: 3x accepted, the next value above refused, and an
+// easier ancestor raises the bound for the headers on it. ──
+TEST(DashHeaderChainAnchor, NearAnchorBoundIsThreeTimesTheEasiestKnownTarget)
+{
+    uint256 t;
+    t.SetCompact(kBitsT);
+    {
+        uint256 x = t; x *= 3u;
+        ASSERT_EQ(x.GetCompact(), kBits3T);
+        uint256 above; above.SetCompact(kBitsAbove3T);
+        uint256 four = t; four *= 4u;
+        ASSERT_TRUE(above > x);
+        ASSERT_TRUE(above < four);
+    }
+    {
+        uint256 x = t; x *= 9u;
+        ASSERT_EQ(x.GetCompact(), kBits9T);
+        uint256 above; above.SetCompact(kBitsAbove9T);
+        uint256 twelve = t; twelve *= 12u;
+        ASSERT_TRUE(above > x);
+        ASSERT_TRUE(above < twelve);
+    }
+
+    constexpr uint32_t A = 40;
+    const uint32_t now = static_cast<uint32_t>(std::time(nullptr));
+    PinnedAnchor a = make_pinned_anchor(A, kBitsT, now - 10u * 150u,
+        "0000000000000000000000000000000000000000000000000000000000000d04");
+    HeaderChain hc(a.params, "");
+    ASSERT_TRUE(hc.init());
+
+    // +1 on the anchor: the bound is 3t.
+    auto above3 = mine_header(a.hash, now - 9u * 150u, kBitsAbove3T, a.params.pow_limit);
+    EXPECT_FALSE(hc.add_header(above3)) << "just above 3x the anchor is refused";
+    auto at3 = mine_header(a.hash, now - 9u * 150u, kBits3T, a.params.pow_limit);
+    EXPECT_TRUE(hc.add_header(at3)) << "exactly 3x the anchor is accepted";
+    const uint256 h1 = x11_hash(at3);
+
+    // +2 on the 3t ancestor: the bound is 3 * 3t = 9t, above the anchor's 3t.
+    auto above9 = mine_header(h1, now - 8u * 150u, kBitsAbove9T, a.params.pow_limit);
+    EXPECT_FALSE(hc.add_header(above9)) << "just above 3x the easiest ancestor is refused";
+    auto at9 = mine_header(h1, now - 8u * 150u, kBits9T, a.params.pow_limit);
+    EXPECT_TRUE(hc.add_header(at9)) << "3x the easiest ancestor is accepted, though 9x the anchor";
+    EXPECT_EQ(hc.height(), A + 2);
+}
