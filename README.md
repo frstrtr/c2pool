@@ -16,6 +16,13 @@ Original forum thread: <https://bitcointalk.org/index.php?topic=18313>
 
 ## Latest releases
 
+- **[v0.2.12.12.2](https://github.com/frstrtr/c2pool/releases/tag/v0.2.12.12.2)** — LTC + DOGE: the embedded header chains accept the genesis header only into a header store that has no tip yet; check the LTC and DOGE header stores once after upgrading (steps in the release notes). Dashboard: Discovered Merged Blocks links the parent hash only when it is a parent-chain block. Recommended for every LTC/DOGE node.
+- **[v0.2.12.12.1](https://github.com/frstrtr/c2pool/releases/tag/v0.2.12.12.1)** — DASH: the header chain keeps its tip when the genesis header arrives. Recommended for every Dash node.
+- **[v0.2.12.12](https://github.com/frstrtr/c2pool/releases/tag/v0.2.12.12)** — DASH: InstantSend locks are checked against recently rotated quorums, and templates follow InstantSend locks; lower CPU with provider transactions in the template; share-chain block solutions are relayed at the network's difficulty only; a won block is not held back when the local Dash Core does not answer.
+- **[v0.2.12.11](https://github.com/frstrtr/c2pool/releases/tag/v0.2.12.11)** — DASH: lower CPU and no io-loop stalls when serving masternode special transactions; a found block recorded without a height no longer stays "pending"; chainz links on the dashboard.
+- **[v0.2.12.10](https://github.com/frstrtr/c2pool/releases/tag/v0.2.12.10)** — Stratum (all coins): no difficulty runaway after a restart, and the `d=N` / `+N` miner password options. LTC: dead stratum connections no longer fill the miner cap; `--import-found-blocks` restores the found-block history from another node. DASH: `--listen HOST:PORT` binds HOST; shorter tracker lock holds.
+- **[v0.2.12.9](https://github.com/frstrtr/c2pool/releases/tag/v0.2.12.9)** — All coins: dashboard luck is based on effort, and pool luck over a period is blocks found ÷ blocks expected with a 95% interval. LTC: Best Share shows your own miners' best hash. DASH: a new node keeps working through the Dash Core v24 activation; `--connect` is connect-only; `c2pool-dash` now requires dashbls.
+- **[v0.2.12.8](https://github.com/frstrtr/c2pool/releases/tag/v0.2.12.8)** — All coins: a fresh node no longer aborts while it looks up DNS seeds; source-archive builds show their real version; `--version` on LTC and BTC. Dashboard: an interactive PPLNS view.
 - **[v0.2.12.7](https://github.com/frstrtr/c2pool/releases/tag/v0.2.12.7)** — LTC: `--fee` pays the node owner the configured fee (v0.2.12–v0.2.12.6 paid about 1/12 of it), and a smaller miner's shares count at their full weight next to a bigger miner. DASH: on a node with several miners, each submission is judged by its own job's share target (a smaller miner could keep as little as 1/30 of its shares). LTC dashboard: one found block shows as the same row on every node, and merged blocks appear only under Merged Mining Blocks. Linux packages run without `start.sh`.
 - **[v0.2.12.6](https://github.com/frstrtr/c2pool/releases/tag/v0.2.12.6)** — LTC + DASH: a share that solves a block wins its head race against an equal-work sibling, as in p2pool. Dashboard fixes.
 - **[v0.2.12.5](https://github.com/frstrtr/c2pool/releases/tag/v0.2.12.5)** — DASH: superblock trigger votes are re-synced right before the superblock, for the Dash Core 24.0.1 voting change. Upgrade before superblock 2,575,480.
@@ -449,7 +456,7 @@ export PATH="$PATH:$HOME/.local/bin"   # so `conan` is on PATH (add to ~/.bashrc
 conan profile detect --force
 
 git clone https://github.com/frstrtr/c2pool.git
-cd c2pool && git checkout v0.2.12.7   # or the newest tag on the Releases page; omit to build master
+cd c2pool && git checkout v0.2.12.12.2   # or the newest tag on the Releases page; omit to build master
 mkdir build && cd build
 conan install .. --build=missing --output-folder=. --settings=build_type=Release
 cmake .. -DCMAKE_TOOLCHAIN_FILE=conan_toolchain.cmake -DCMAKE_BUILD_TYPE=Release
