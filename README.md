@@ -81,9 +81,9 @@ with `--addnode` to a known v36 peer.
 Daemonless-Dash finalization has not been funded by Dash on-chain governance yet.
 
 - **c2pool-daemonless-delivered** (252 DASH, one payment at superblock 2575480,
-  2026-11-20): at the voting cutoff it had 190 net yes votes, short of the
-  threshold of 10 percent of the masternode voting weight (317). Superblock 2575480 did
-  not pay it, and its window ends before the next superblock.
+  2026-11-20): at the voting cutoff it had 190 net yes votes (206 yes, 16 no),
+  short of the threshold of 10 percent of the masternode voting weight. Superblock
+  2575480 did not pay it, and its window ends before the next superblock.
   DashCentral: https://www.dashcentral.org/p/c2pool-daemonless-delivered;
   governance object c7b462b7c8d81df10ce34ebd4436afd715f288c25a7c949835f889015248b247;
   collateral 639a53cfa9f19f16414a9dd679ebfdc930633e18eedd8cd5f06ff4a90925b705, mined in
@@ -306,7 +306,7 @@ and does not yet exist, so the work can be judged on what it actually is.
   clean script becomes the default at the v37 boundary.
 
 ### v36 ratchet complete — the last generation shared with Python p2pool
-- **The LTC line ratcheted to V36** by August 2026. Since 2026-11-13 00:00:00 UTC
+- **The LTC line ratcheted to V36.** Since 2026-11-13 00:00:00 UTC
   the LTC share chain runs share version 3601 (the V36 share format under share
   type 3601). Only c2pool v0.2.12.1 and later are on it; Python `p2pool` nodes are
   not.
