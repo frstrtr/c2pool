@@ -251,6 +251,19 @@ and does not yet exist, so the work can be judged on what it actually is.
 - **Reference prototypes** under `proto/` (TLA⁺, MRR refimpl + goldens, the M4 sync
   feasibility harness, testbeds) and the v37 design-track spec/headers under
   `src/sharechain/v37/`. These are for study and reproduction, not deployment.
+- **Machine-checked proofs for the XMR lane's payout split (Path B), in
+  progress.** The payout arithmetic is being written as a Lean 4 model with
+  theorems: every paying block's outputs sum to exactly the block reward; no
+  intermediate value overflows its C++ width (64, 128, 256 or 320 bits) and no
+  division is by zero; a larger contribution never lowers that payee's output
+  within the window; and the order in which work arrives does not change the
+  outputs. The statements are fixed by the maintainer and locked with the
+  maintainer's signature, so the proofs cannot weaken them, and the proofs are
+  re-checked by several independent proof kernels in an isolated gate. A
+  differential fuzzer runs the model against the production C++ bit for bit:
+  over a million inputs so far, with no divergence. This proves the *model*; the
+  C++ is tied to it by fuzzing, not by proof. The Lean project will live under
+  `proto/lean/`, next to the TLA⁺ specs.
 - The production multi-coin pool code (v36 line) that c2pool actually runs.
 
 ### What does NOT yet exist — the honest gaps
