@@ -138,7 +138,9 @@ struct MnBridgeCursor
     // ── THE MACHINE'S MEASUREMENT LEDGERS for THIS set (v5). They describe
     // the entries below and nothing else, so they travel with them: a resumed
     // machine must know what a continuous one knows about which ban state was
-    // measured and which revives are still unmeasured.
+    // measured and which revives are still unmeasured. A record whose entries
+    // come from another machine (the live-follow and re-arm records) carries
+    // none (0 and empty), as a v4 record did.
     uint32_t    ban_state_measured_at{0};
     std::vector<std::pair<uint256, uint32_t>> unmeasured_revive_at;
 

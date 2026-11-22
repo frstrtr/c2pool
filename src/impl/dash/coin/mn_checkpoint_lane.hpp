@@ -858,6 +858,8 @@ public:
         if (!m_position_verified)
             return "header-tip-to-reach-anchor@h="
                    + std::to_string(m_anchor_height);
+        if (!m_restore_settled && m_pending_restore && m_r7_defers > 0)
+            return "restore-hold@h=" + std::to_string(m_pending_restore->cursor_height);
         if (m_requested_through >= m_next)
             return "block-bodies@h=" + std::to_string(m_next) + ".."
                    + std::to_string(m_requested_through);
@@ -3036,16 +3038,24 @@ private:
         rec.revive_probes      = static_cast<uint32_t>(m_revive_probes);
         rec.revive_unmeasured  = static_cast<uint32_t>(m_revive_unmeasured);
         rec.revive_declined    = static_cast<uint32_t>(m_revive_declined);
-        rec.sml_recovered      = static_cast<uint32_t>(m_sml_recovered);
+        // The count the demotion-walk cap reads, current at the moment the
+        // record is written (the lane's own total is added only after the
+        // block's persist).
+        rec.sml_recovered      = static_cast<uint32_t>(m_machine.sml_recovered_total());
         rec.pose_removed       = static_cast<uint32_t>(m_pose_removed);
         rec.pose_reinstated    = static_cast<uint32_t>(m_pose_reinstated);
         rec.tx_revived         = static_cast<uint32_t>(m_tx_revived);
         rec.revive_dropped     = static_cast<uint32_t>(m_revive_dropped);
         rec.registered         = static_cast<uint32_t>(m_registered);
         rec.spent              = static_cast<uint32_t>(m_spent);
-        rec.ban_state_measured_at = m_machine.ban_state_measured_at();
-        rec.unmeasured_revive_at.assign(m_machine.unmeasured_revive_at().begin(),
-                                        m_machine.unmeasured_revive_at().end());
+        // The measurement ledgers describe THIS machine's own set. A record
+        // built from another set (the live-follow and re-arm records pass the
+        // maintainer's entries) carries none, exactly as a v4 record did.
+        if (!entries) {
+            rec.ban_state_measured_at = m_machine.ban_state_measured_at();
+            rec.unmeasured_revive_at.assign(m_machine.unmeasured_revive_at().begin(),
+                                            m_machine.unmeasured_revive_at().end());
+        }
         if (entries) {
             rec.entries = *entries;
         } else {

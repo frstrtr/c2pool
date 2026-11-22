@@ -5867,6 +5867,8 @@ TEST(DashMnBridgeCursor, R7CursorAboveACatchingUpTipResumesWarm)
     EXPECT_TRUE(cs.exists()) << "a deferred record must not be erased";
     EXPECT_TRUE(r.h.requested.empty())
         << "nothing may be replayed while the cursor is being held";
+    EXPECT_NE(r.h.lane.waiting_for().find("restore-hold@h=1519545"), std::string::npos)
+        << "the hold must be named, not read as an idle lane: " << r.h.lane.waiting_for();
 
     // The headers come back past the cursor.
     r.h.tip = 1519546;
@@ -7443,4 +7445,52 @@ TEST(DashMnCheckpointGapReseed, Persist_EveryFoldAtTip)
     EXPECT_GE(r3.h.lane.persist_writes(), 3u)
         << "three folds within kPersistAtTipSlack of the tip: three records,"
            " not one per 250";
+}
+
+// ── 4e. A live-follow record is built from the maintainer's set, so it
+// carries none of the bridge machine's measurement ledgers; a resume from it
+// holds exactly what a continuous run's maintainer holds (none).
+TEST(DashMnBridgeCursor, LiveFollowRecordCarriesNoBridgeLedgers)
+{
+    TempCursorStore cs("liveledgers");
+    { CursorRun a(&cs.store, 1519544); a.run(); ASSERT_TRUE(a.h.published); }
+
+    // Give the bridge machine ledgers through a resume one block below the
+    // tip (a resume AT the tip holds until something new is fetched).
+    std::string why;
+    auto rec = cs.store.load(why);
+    ASSERT_TRUE(rec.has_value()) << why;
+    ASSERT_EQ(rec->cursor_height, 1519544u);
+    rec->ban_state_measured_at = 1519544;
+    rec->unmeasured_revive_at = { {uint256S(kQ1), 1519543u}, {uint256S(kQ2), 1519544u} };
+    ASSERT_TRUE(cs.store.store(*rec));
+
+    {
+        CursorRun r(&cs.store, 1519545);
+        r.run();
+        ASSERT_TRUE(r.h.lane.cursor_restored()) << r.h.lane.restore_verdict();
+        ASSERT_TRUE(r.h.published) << r.h.lane.status();
+        ASSERT_NE(r.h.lane.ban_state_measured_at(), 0u)
+            << "the bridge machine must hold a measurement for this KAT to mean anything";
+
+        // The maintainer folds the next block; that is the record now on disk.
+        const auto at46 = fold_forward(r.h.published_set, 1519545, r.h.blocks, 1519546);
+        r.h.lane.note_live_fold(std::map<uint256, MNState>(at46.begin(), at46.end()),
+                                1519546, synth_block_hash(1519546));
+        auto live = cs.store.load(why);
+        ASSERT_TRUE(live.has_value()) << why;
+        EXPECT_EQ(live->cursor_height, 1519546u);
+        EXPECT_EQ(live->ban_state_measured_at, 0u)
+            << "the bridge's measurement does not describe the maintainer's set";
+        EXPECT_TRUE(live->unmeasured_revive_at.empty())
+            << "the bridge's revive ledger does not describe the maintainer's set";
+    }
+
+    // A restart resumes from the live record and holds no ledgers.
+    CursorRun r2(&cs.store, 1519546);
+    r2.run();
+    ASSERT_TRUE(r2.h.lane.cursor_restored()) << r2.h.lane.restore_verdict();
+    EXPECT_EQ(r2.h.lane.restored_at(), 1519546u);
+    EXPECT_EQ(r2.h.lane.ban_state_measured_at(), 0u);
+    EXPECT_EQ(r2.h.lane.unmeasured_revives(), 0u);
 }

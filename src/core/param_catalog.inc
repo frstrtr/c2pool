@@ -642,6 +642,9 @@ C2P_PARAM("embedded.accrue_asset_unlocks", Embedded, BOOL, RESTART, C_DASH, LIT,
 C2P_PARAM("embedded.credit_pool_seed", Embedded, BOOL, RESTART, C_DASH, LIT, "false", NONE, "seed the credit-pool follower from the v20 floor (needed to admit asset unlocks)")
   C2P_ALIAS("embedded.credit_pool_seed", BIN_DASH, "--embedded-credit-pool-seed", FLAG)
 
+C2P_PARAM("embedded.header_dgw_log_only", Embedded, BOOL, MONEY_RESTART, C_DASH, LIT, "false", NONE, "coin header chain logs and accepts a header off its DGW bits instead of refusing it (CLI only)")
+  C2P_ALIAS("embedded.header_dgw_log_only", BIN_DASH, "--header-dgw-log-only", FLAG)
+
 C2P_PARAM("embedded.null_arm", Embedded, TRISTATE_BOOL, MONEY_RESTART, C_DASH, NONE, "", NONE, "optimistic null commitment (money/consensus)")
   C2P_ALIAS("embedded.null_arm", BIN_DASH, "--embedded-null-arm", FLAG_OPT_EQFALSE)
 

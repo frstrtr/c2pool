@@ -1251,7 +1251,7 @@ BlockHeaderType header_on(const AnchoredNet& n, const uint256& parent)
 }
 } // namespace
 
-TEST(DashHeaderChainAnchor, S1AHeaderOnTheAnchorGivesWayToTheLiveChain)
+TEST(DashHeaderChainAnchor, AHeaderOnTheAnchorGivesWayToTheLiveChain)
 {
     constexpr uint32_t A = 40, K = 50;
     AnchoredNet n = make_anchored_net(K, A);
@@ -1268,7 +1268,7 @@ TEST(DashHeaderChainAnchor, S1AHeaderOnTheAnchorGivesWayToTheLiveChain)
     EXPECT_TRUE(hc.is_synced());
 }
 
-TEST(DashHeaderChainAnchor, S2AHeaderOnAPreAnchorEntryDoesNotBecomeTheTip)
+TEST(DashHeaderChainAnchor, AHeaderOnAPreAnchorEntryDoesNotBecomeTheTip)
 {
     constexpr uint32_t A = 40, K = 50;
     AnchoredNet n = make_anchored_net(K, A);
@@ -1287,7 +1287,7 @@ TEST(DashHeaderChainAnchor, S2AHeaderOnAPreAnchorEntryDoesNotBecomeTheTip)
     EXPECT_TRUE(hc.is_synced());
 }
 
-TEST(DashHeaderChainAnchor, S3APreAnchorSpanLongerThanOneReplyStillReachesTheLiveChain)
+TEST(DashHeaderChainAnchor, APreAnchorSpanLongerThanOneReplyStillReachesTheLiveChain)
 {
     // The held span is longer than one getheaders reply (2000 headers).
     constexpr uint32_t A = 2200, K = 2210;
@@ -1359,7 +1359,7 @@ HardNet make_hard_net(uint32_t K, uint32_t A)
 }
 } // namespace
 
-TEST(DashHeaderChainAnchor, S1HeaderOnTheAnchorAtPowLimitIsRefused)
+TEST(DashHeaderChainAnchor, AHeaderOnTheAnchorAtPowLimitIsRefused)
 {
     constexpr uint32_t A = 40, K = 50;
     HardNet n = make_hard_net(K, A);
@@ -1383,7 +1383,7 @@ TEST(DashHeaderChainAnchor, S1HeaderOnTheAnchorAtPowLimitIsRefused)
     EXPECT_TRUE(hc.is_synced());
 }
 
-TEST(DashHeaderChainAnchor, S1NearAnchorBoundAllowsTheDgwClamp)
+TEST(DashHeaderChainAnchor, NearAnchorBoundAllowsTheDgwClamp)
 {
     // A real step down in difficulty within the clamp (2x easier) is accepted.
     constexpr uint32_t A = 40, K = 42;
@@ -1455,6 +1455,9 @@ TEST(DashHeaderChainAnchor, StoredTipOffTheAnchorIsReselectedAtLoad)
 // accepts it instead. ──
 TEST(DashHeaderChainAnchor, DgwMismatchIsRefusedByDefaultAndAcceptedWhenLogOnly)
 {
+    // The first height whose DGW window lies wholly above the anchor is
+    // anchor+25; from there mainnet checks the bits, also on a fresh store
+    // that holds only the anchor and the 24 headers above it.
     for (const bool refuse : {true, false}) {
         auto params = make_easy_test_params();
         params.allow_min_difficulty = false;          // mainnet rules
@@ -1473,26 +1476,139 @@ TEST(DashHeaderChainAnchor, DgwMismatchIsRefusedByDefaultAndAcceptedWhenLogOnly)
         hc.set_refuse_dgw_mismatch(refuse);
         ASSERT_TRUE(hc.init());
         uint256 prev = cp.hash;
-        for (uint32_t i = 1; i <= 33; ++i) {
+        for (uint32_t i = 1; i <= 24; ++i) {
             auto h = mine_header(prev, now - (60u - i) * 150u, bits, params.pow_limit);
             ASSERT_TRUE(hc.add_header(h)) << "refuse=" << refuse << " h=A+" << i;
             prev = x11_hash(h);
         }
-        ASSERT_EQ(hc.height(), A + 33);
+        ASSERT_EQ(hc.height(), A + 24);
 
         // Constant bits over 24 blocks spaced exactly target_spacing are NOT
         // the DGW bits (DGW measures 23 intervals against a 24-interval
         // target timespan), so this header is off its window's DGW bits.
         const uint32_t want = hc.next_work_required();
         ASSERT_NE(want, bits) << "the KAT needs a header off its DGW bits";
-        auto off = mine_header(prev, now - 26u * 150u, bits, params.pow_limit);
-        EXPECT_EQ(hc.add_header(off), !refuse) << "refuse=" << refuse;
+        auto off = mine_header(prev, now - 35u * 150u, bits, params.pow_limit);
+        EXPECT_EQ(hc.add_header(off), !refuse) << "refuse=" << refuse << " at anchor+25";
 
         if (refuse) {
             // The same window's DGW bits are accepted.
-            auto on = mine_header(prev, now - 26u * 150u, want, params.pow_limit);
+            auto on = mine_header(prev, now - 35u * 150u, want, params.pow_limit);
             EXPECT_TRUE(hc.add_header(on));
-            EXPECT_EQ(hc.height(), A + 34);
+            EXPECT_EQ(hc.height(), A + 25);
         }
     }
+}
+
+// ── A side-branch header is judged by the DGW window it actually extends,
+// not by the best chain's window at the same heights. ──
+TEST(DashHeaderChainAnchor, SideBranchIsJudgedByItsOwnDgwWindow)
+{
+    auto params = make_easy_test_params();
+    params.allow_min_difficulty = false;
+    constexpr uint32_t A = 34200, FORK = A + 20, TOP = A + 30;
+    const uint32_t bits = params.pow_limit.GetCompact();
+    const uint32_t now = static_cast<uint32_t>(std::time(nullptr));
+    uint256 seed;
+    seed.SetHex("0000000000000000000000000000000000000000000000000000000000000b02");
+    const auto anchor_hdr = mine_header(seed, now - 90u * 150u, bits, params.pow_limit);
+    DashChainParams::Checkpoint cp{};
+    cp.height = A;
+    cp.hash = x11_hash(anchor_hdr);
+    params.fast_start_checkpoint = cp;
+
+    // The best chain: 150 s apart, DGW bits from anchor+25 on.
+    HeaderChain hc(params, "");
+    ASSERT_TRUE(hc.init());
+    std::vector<uint256> main{cp.hash};
+    std::vector<BlockHeaderType> main_hdr{anchor_hdr};
+    for (uint32_t h = A + 1; h <= TOP; ++h) {
+        const uint32_t b = (h <= A + 24) ? bits : hc.next_work_required();
+        auto hd = mine_header(main.back(), now - (90u - (h - A)) * 150u, b, params.pow_limit);
+        ASSERT_TRUE(hc.add_header(hd)) << "main h=A+" << (h - A);
+        main.push_back(x11_hash(hd));
+        main_hdr.push_back(hd);
+    }
+    ASSERT_EQ(hc.height(), TOP);
+
+    // A side branch from FORK with blocks 600 s apart: its own window differs.
+    HeaderChain side(params, "");
+    ASSERT_TRUE(side.init());
+    for (uint32_t h = A + 1; h <= FORK; ++h) ASSERT_TRUE(side.add_header(main_hdr[h - A]));
+    std::vector<BlockHeaderType> branch;
+    uint256 prev = main[FORK - A];
+    uint32_t t = main_hdr[FORK - A].m_timestamp;
+    for (uint32_t h = FORK + 1; h <= A + 24; ++h) {
+        t += 600u;
+        auto hd = mine_header(prev, t, bits, params.pow_limit);
+        ASSERT_TRUE(side.add_header(hd));
+        branch.push_back(hd);
+        prev = x11_hash(hd);
+    }
+    const uint32_t side_bits = side.next_work_required();   // DGW of the branch's own window
+    // The best chain's DGW for the same height, from its own window.
+    HeaderChain best24(params, "");
+    ASSERT_TRUE(best24.init());
+    for (uint32_t h = A + 1; h <= A + 24; ++h) ASSERT_TRUE(best24.add_header(main_hdr[h - A]));
+    const uint32_t best_bits = best24.next_work_required();
+    ASSERT_NE(side_bits, best_bits) << "the two windows must differ for the KAT to mean anything";
+
+    // In the store where the best chain is longer, the branch's anchor+25 is
+    // accepted with ITS window's bits and refused with the best chain's.
+    for (const auto& hd : branch) ASSERT_TRUE(hc.add_header(hd));
+    t += 600u;
+    auto own = mine_header(prev, t, side_bits, params.pow_limit);
+    auto other = mine_header(prev, t + 1, best_bits, params.pow_limit);
+    EXPECT_TRUE(hc.add_header(own)) << "the branch's own DGW bits";
+    EXPECT_FALSE(hc.add_header(other)) << "the best chain's bits are not this branch's";
+    EXPECT_EQ(hc.height(), TOP) << "the shorter branch does not take the tip";
+}
+
+// ── A header at the anchor height that is not the anchor never takes the tip,
+// even when its parent is a held pre-anchor entry. ──
+TEST(DashHeaderChainAnchor, ASiblingOfTheAnchorDoesNotBecomeTheTip)
+{
+    constexpr uint32_t A = 40, K = 50;
+    AnchoredNet n = make_anchored_net(K, A);
+    HeaderChain hc(n.params, "");
+    ASSERT_TRUE(hc.init());
+    std::vector<BlockHeaderType> span(n.hdr.begin() + (A - 5), n.hdr.begin() + A + 1);
+    ASSERT_EQ(hc.install_preanchor_span(n.hash[A], span), 5u);
+    hc.add_header(header_on(n, n.hash[A - 1]));     // height A, not the anchor
+    ASSERT_TRUE(hc.tip().has_value());
+    EXPECT_EQ(hc.height(), A);
+    EXPECT_EQ(hc.tip()->hash, n.hash[A]);
+}
+
+// ── A store written before this anchor existed (its tip below the anchor, the
+// anchor not held) starts from the anchor at load and reaches the live chain. ──
+TEST(DashHeaderChainAnchor, AStoreBelowTheAnchorStartsFromItAndReachesTheLiveChain)
+{
+    constexpr uint32_t A = 2200, K = 2210, OLD = 100;
+    AnchoredNet n = make_anchored_net(K, A);
+    auto no_anchor = n.params;
+    no_anchor.fast_start_checkpoint.reset();
+    const auto dir = std::filesystem::temp_directory_path()
+        / ("c2pool-hc-below-anchor-" + std::to_string(::getpid()));
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    const std::string db = (dir / "dash_headers").string();
+    {
+        HeaderChain hc(no_anchor, db);
+        ASSERT_TRUE(hc.init());
+        std::vector<BlockHeaderType> early(n.hdr.begin() + 1, n.hdr.begin() + OLD + 1);
+        ASSERT_EQ(hc.add_headers(early), static_cast<int>(OLD));
+        ASSERT_EQ(hc.height(), OLD);
+    }
+    {
+        HeaderChain hc(n.params, db);
+        ASSERT_TRUE(hc.init());
+        ASSERT_TRUE(hc.tip().has_value());
+        EXPECT_EQ(hc.height(), A) << "the store starts from the anchor";
+        EXPECT_EQ(hc.tip()->hash, n.hash[A]);
+        resync_from_locator(hc, n, K);
+        EXPECT_EQ(hc.height(), K) << "and reaches the live chain";
+        EXPECT_TRUE(hc.is_synced());
+    }
+    std::filesystem::remove_all(dir);
 }

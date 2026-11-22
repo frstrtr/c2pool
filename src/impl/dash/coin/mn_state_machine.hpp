@@ -2671,9 +2671,11 @@ private:
     // dashd wrote nPoSeRevivedHeight = that height; we could not decide the
     // gate, so nPoSeRevivedHeight stayed 0 and the projection drifted ~one
     // queue length ahead. repair_unmeasured_revive_ordering() consumes this
-    // under height-exact confirmation. Transient (never persisted): a resume
-    // re-measures via the fold ladder, and a stale ledger must not license a
-    // revive-height write. Cleared by load().
+    // under height-exact confirmation. A stale ledger must not license a
+    // revive-height write, so it is persisted with the bridge cursor ONLY for
+    // records of this machine's own set (format v5) and re-adopted only with
+    // that same set; records built from another set carry none, and load()
+    // retires it, so a ledger never describes a set it was not written for.
     std::map<uint256, uint32_t> m_unmeasured_revive_at;
 
     /// Walk every ProUpServTx in a block, in tx order, handing the caller the
