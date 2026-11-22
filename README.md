@@ -1021,13 +1021,14 @@ the DGB pool. See [c2pool-dgb](#c2pool-dgb--digibyte-scrypt) below.
 | Port | Purpose |
 |------|---------|
 | 9326 | P2Pool sharechain (peer-to-peer) |
-| 9327 | Stratum mining (also answers the read-only REST API, see below) |
+| 9327 | Stratum mining (with `--stratum-http` on, also the read-only REST API; see below) |
 | 8080 | Web dashboard + REST API |
 
 **The REST API on the stratum port.** python p2pool served its web API on
 the worker port, and p2pool-aware trackers (miningpoolstats and others) poll
-`http://host:9327/global_stats`. c2pool answers such a request on the stratum
-port too: the stratum server looks at the first line of a connection, and an
+`http://host:9327/global_stats`. When `--stratum-http` is on, c2pool answers
+such a request on the stratum port too: the stratum server looks at the first
+line of a connection, and an
 HTTP request line hands the connection to the web server's own request
 handler. Same routes and JSON as the web port, but strictly read-only: GET and
 HEAD only (other methods get 405), every local-only, token-gated or

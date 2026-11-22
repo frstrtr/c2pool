@@ -3,8 +3,8 @@
 // HTTP on the stratum port.
 //
 // python p2pool answered its web API on the worker port (9327 on LTC), and
-// p2pool-aware trackers poll http://host:<worker port>/global_stats. c2pool
-// answers it there too:
+// p2pool-aware trackers poll http://host:<worker port>/global_stats. With
+// --stratum-http on, c2pool answers it there too:
 //
 // - The stratum server reads the first line of a new connection. An HTTP
 //   request line (METHOD SP target SP HTTP/1.x) hands the accepted socket,

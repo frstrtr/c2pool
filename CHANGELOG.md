@@ -7,8 +7,9 @@
   trackers (miningpoolstats and others) poll `http://host:<worker port>/global_stats`.
   c2pool's stratum port answered such a request with a stratum "Invalid JSON"
   error and logged `Error processing Stratum message: ... parse_error`.
-- The stratum port now hands a connection whose first line is an HTTP
-  request line (empty lines before it are skipped) to the web server's own
+- When `--stratum-http` is on, the stratum port hands a connection whose
+  first line is an HTTP request line (empty lines before it are skipped) to
+  the web server's own
   request handler, on the web server's HTTP thread: same routes, JSON and
   headers as the web port. It is strictly read-only there: GET and HEAD
   (other methods 405), every local-only, token-gated or state-changing route
