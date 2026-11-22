@@ -80,13 +80,34 @@
         td { padding: 5px 6px; border-bottom: 1px solid rgba(58,58,90,0.5); white-space: nowrap; }
         td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
         td.addr { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.8rem; overflow: hidden; text-overflow: ellipsis; max-width: 0; width: 70%; }
+        .connect { display: grid; grid-template-columns: max-content 1fr; gap: 7px 14px; align-items: center; font-size: 0.9rem; }
+        .connect .k { color: var(--text-muted); font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.04em; }
+        .connect code, .private code {
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.86rem;
+            background: var(--darker); border: 1px solid var(--border); border-radius: 6px; padding: 2px 8px;
+        }
+        .connect .url { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+        .connect .url code { color: var(--text); font-size: 0.95rem; }
+        .copy {
+            background: transparent; color: var(--text-muted); border: 1px solid var(--border);
+            border-radius: 6px; padding: 1px 9px; font-size: 0.78rem; cursor: pointer;
+        }
+        .copy.done { color: var(--success); border-color: var(--success); }
+        .connect-note { color: var(--text-muted); font-size: 0.82rem; margin-top: 10px; }
+        .private { font-size: 0.95rem; }
         .muted { color: var(--text-muted); }
         .good { color: var(--success); }
         .warn { color: var(--warning); }
         .err { color: #ff6b6b; }
+        .connect code { overflow-wrap: anywhere; }
+        /* Wide: row by row (both chains side by side). Narrow: one chain after the other. */
+        .grid > .card { order: var(--o-wide, 0); }
         @media (max-width: 900px) {
             .grid { grid-template-columns: 1fr; }
+            .grid > .card { order: var(--o-narrow, 0); }
             .tiles { grid-template-columns: repeat(2, 1fr); }
+            .connect { grid-template-columns: 1fr; gap: 2px; }
+            .connect .k { margin-top: 8px; }
         }
     </style>
 </head>
@@ -107,7 +128,7 @@
 (function () {
     'use strict';
     var COLORS = ['#008de4', '#a78bfa'];
-    var ROWS = ['head', 'tiles', 'chart', 'blocks', 'payouts'];
+    var ROWS = ['head', 'connect', 'tiles', 'chart', 'blocks', 'payouts'];
     var period = 'day';
     var pools = [];
 
@@ -152,6 +173,8 @@
             pools.forEach(function (p, i) {
                 var c = el('section', 'card');
                 c.id = row + '-' + p.id;
+                c.style.setProperty('--o-wide', String(ROWS.indexOf(row) * 10 + i));
+                c.style.setProperty('--o-narrow', String(i * 10 + ROWS.indexOf(row)));
                 if (row === 'head') {
                     var h = el('div', 'head');
                     var dot = el('span', 'dot'); dot.style.background = COLORS[i % COLORS.length];
@@ -166,6 +189,9 @@
                     h.appendChild(open);
                     c.appendChild(h);
                     if (p.note) { var n = el('div', 'meta muted', p.note); n.style.marginTop = '4px'; c.appendChild(n); }
+                } else if (row === 'connect') {
+                    c.appendChild(el('h2', '', 'How to connect'));
+                    c.appendChild(el('div', 'body'));
                 } else if (row === 'tiles') {
                     c.appendChild(el('div', 'tiles'));
                 } else if (row === 'chart') {
@@ -346,6 +372,79 @@
         body.appendChild(t);
     }
 
+    // ── how to connect ───────────────────────────────────────────────────
+    // A chain is shown as open only when its /api/pools entry says so: either
+    // "stratum": "stratum+tcp://host:port", or "connect": true (the URL is then
+    // built from the node's own /node_info, as the full dashboard does). Any
+    // other entry gets a private card ("connect_note" overrides its text), so
+    // the page never advertises an address its deployment did not publish.
+    var STRATUM_RE = /^stratum\+(tcp|ssl):\/\/[A-Za-z0-9.-]{1,253}:[0-9]{1,5}$/;
+    function stratumOf(p, ni) {
+        if (typeof p.stratum === 'string') return STRATUM_RE.test(p.stratum) ? p.stratum : null;
+        if (p.connect !== true || !ni) return null;
+        var port = Number(ni.worker_port);
+        if (!(port > 0 && port < 65536)) return null;
+        var host = (typeof ni.external_ip === 'string' && ni.external_ip && ni.external_ip !== '0.0.0.0')
+            ? ni.external_ip : window.location.hostname;
+        var u = 'stratum+tcp://' + host + ':' + port;
+        return STRATUM_RE.test(u) ? u : null;
+    }
+    function kv(box, k, v) { box.appendChild(el('div', 'k', k)); box.appendChild(v); return v; }
+    function code(t) { return el('code', '', t); }
+    function renderConnect(p) {
+        var body = document.querySelector('#connect-' + p.id + ' .body');
+        body.innerHTML = '';
+        var url = p._stratum;
+        if (!url) {
+            var msg = (typeof p.connect_note === 'string' && p.connect_note) ? p.connect_note
+                : 'Private pool: connections by invitation.';
+            body.appendChild(el('div', 'private', msg));
+            var open = pools.filter(function (q) { return q !== p && q._stratum; })[0];
+            if (open) {
+                var n = el('div', 'connect-note');
+                n.appendChild(document.createTextNode('Want to mine DASH now? '));
+                var a = el('a', '', 'Use the ' + (open.name || open.id) + ' chain →');
+                a.href = '#connect-' + open.id;
+                n.appendChild(a);
+                body.appendChild(n);
+            }
+            return;
+        }
+        var g = el('div', 'connect');
+        var u = el('div', 'url'); u.appendChild(code(url));
+        var cp = el('button', 'copy', 'Copy'); cp.type = 'button';
+        cp.addEventListener('click', function () {
+            if (!navigator.clipboard) return;
+            navigator.clipboard.writeText(url).then(function () {
+                cp.textContent = 'Copied'; cp.classList.add('done');
+                setTimeout(function () { cp.textContent = 'Copy'; cp.classList.remove('done'); }, 1500);
+            });
+        });
+        u.appendChild(cp);
+        kv(g, 'Stratum URL', u);
+        var user = el('div'); user.appendChild(code('<your DASH address>'));
+        user.appendChild(el('span', 'muted', ' or ')); user.appendChild(code('<address>.<worker>'));
+        kv(g, 'Username', user);
+        var pass = el('div'); pass.appendChild(code('x')); pass.appendChild(el('span', 'muted', ' (any value)'));
+        kv(g, 'Password', pass);
+        var diff = el('div'); diff.appendChild(el('span', 'muted', 'automatic; '));
+        diff.appendChild(code('<address>+<difficulty>')); diff.appendChild(el('span', 'muted', ' fixes it'));
+        kv(g, 'Difficulty', diff);
+        body.appendChild(g);
+        body.appendChild(el('div', 'connect-note',
+            'X11 ASIC miners. Every block this chain finds pays its miners directly in the coinbase, '
+            + 'in proportion to their recent shares: no account, no withdrawal.'));
+    }
+    function initConnect() {
+        Promise.all(pools.map(function (p) {
+            if (p.connect !== true || typeof p.stratum === 'string') return Promise.resolve(null);
+            return get('/api/' + p.id, '/node_info').catch(function () { return null; });
+        })).then(function (infos) {
+            pools.forEach(function (p, i) { p._stratum = stratumOf(p, infos[i]); });
+            pools.forEach(renderConnect);
+        });
+    }
+
     var GRAPH = { hour: 'last_hour', day: 'last_day', week: 'last_week', month: 'last_month' };
     function refreshChart(p, i) {
         var api = '/api/' + p.id;
@@ -384,6 +483,7 @@
             pools = (list || []).filter(function (p) { return p && /^[a-z0-9_-]{1,32}$/.test(p.id || ''); }).slice(0, 2);
             if (!pools.length) throw new Error('empty');
             layout();
+            initConnect();
             refresh();
             setInterval(refresh, 60000);
         })
