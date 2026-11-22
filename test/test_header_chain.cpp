@@ -9,18 +9,30 @@
 ///   5. HeaderChain: block locator generation
 ///   6. HeaderChain: LevelDB persistence round-trip
 ///   7. HeaderChain: rejection of invalid PoW and orphan headers
+///   8. HeaderChain: the genesis header is accepted only into a store with no tip
 
 #include <gtest/gtest.h>
 
 #include <impl/ltc/coin/header_chain.hpp>
+#include <impl/ltc/coin/header_sync.hpp>
 #include <impl/ltc/test/ltc_mined_headers.hpp>   // easy-limit testnet parameters, mine()
 #include <impl/ltc/coin/block.hpp>
 #include <core/uint256.hpp>
 #include <core/pack.hpp>
 #include <core/hash.hpp>
+#include <core/leveldb_store.hpp>
 
 #include <chrono>
+#include <ctime>
+#include <deque>
 #include <filesystem>
+#include <functional>
+#include <iostream>
+#include <map>
+#include <memory>
+#include <random>
+#include <sstream>
+#include <string>
 #include <thread>
 #include <vector>
 #include <cstdint>
@@ -696,4 +708,461 @@ TEST_F(HeaderChainTest, AKnownPrefixStillConnectsTheNewTail) {
     EXPECT_EQ(chain.add_headers(batch), 500);
     EXPECT_EQ(chain.height(), 2000u);
     EXPECT_EQ(chain.add_headers(batch), 0);
+}
+
+// ─── The genesis header and a store with no tip ────────────────────────────
+//
+// The genesis header is accepted only while the store has no tip. A store
+// with a tip (a checkpoint root, then headers above it) keeps its tip, height
+// and best work.
+
+namespace {
+
+/// Headers by height from the easy-limit testnet genesis
+/// (ltc_mined_headers.hpp): timestamps years old up to the checkpoint, within
+/// the last hour above it. getheaders returns heights up to `served`.
+struct HonestLtcChain {
+    std::vector<BlockHeaderType> headers;  // by height
+    std::map<uint256, uint32_t> height_of;
+    uint32_t cp;
+    uint32_t served;
+
+    HonestLtcChain(uint32_t cp_height, uint32_t top, uint32_t served_top)
+        : cp(cp_height), served(served_top)
+    {
+        const auto easy = ltc_test::easy_testnet_params();
+        const uint32_t now = static_cast<uint32_t>(std::time(nullptr));
+        headers.push_back(ltc_test::easy_testnet_genesis());
+        height_of[block_hash(headers[0])] = 0;
+        for (uint32_t h = 1; h <= top; ++h) {
+            BlockHeaderType x;
+            x.m_version = 0x20000000;
+            x.m_previous_block = block_hash(headers.back());
+            x.m_merkle_root.SetHex(std::to_string(5000 + h));
+            x.m_timestamp = h <= cp ? headers[0].m_timestamp + 150 * h : now - 60 - 150 * (top - h);
+            x.m_bits = ltc_test::kEasyBits;
+            x.m_nonce = h << 8;
+            ltc_test::mine(x, easy);
+            height_of[block_hash(x)] = h;
+            headers.push_back(x);
+        }
+    }
+
+    const BlockHeaderType& at(uint32_t h) const { return headers.at(h); }
+    uint256 hash(uint32_t h) const { return block_hash(headers.at(h)); }
+
+    /// getheaders as Litecoin Core answers it: the headers after the first
+    /// locator hash on this chain (none on it: after genesis), at most `max`.
+    std::vector<BlockHeaderType> getheaders(const std::vector<uint256>& locator, size_t max) const
+    {
+        if (locator.empty())
+            return {};
+        uint32_t from = 0;
+        for (const auto& l : locator) {
+            auto it = height_of.find(l);
+            if (it != height_of.end() && it->second <= served) {
+                from = it->second;
+                break;
+            }
+        }
+        std::vector<BlockHeaderType> out;
+        for (uint32_t h = from + 1; h <= served && out.size() < max; ++h)
+            out.push_back(headers[h]);
+        return out;
+    }
+
+    std::string name(const uint256& h) const
+    {
+        auto it = height_of.find(h);
+        if (it == height_of.end())
+            return "(unknown)";
+        if (it->second == 0)
+            return "genesis";
+        return "h" + std::to_string(it->second) + (it->second == cp ? " (checkpoint)" : "");
+    }
+};
+
+/// Headers per getheaders answer in these tests (Core: 2,000).
+constexpr size_t kPeerBatch = 8;
+
+/// A header chain and header sync (ltc/coin/header_sync.hpp) wired as in
+/// main_ltc; the header and IO queues are run by hand and each getheaders is
+/// answered from HonestLtcChain.
+struct LtcNode {
+    HeaderChain chain;
+    std::shared_ptr<HeaderSync> sync;
+    std::vector<std::function<void()>> worker_q, io_q;
+    std::deque<std::vector<uint256>> asks;  // the locators of the getheaders sent
+    std::chrono::steady_clock::time_point t = std::chrono::steady_clock::time_point{} + std::chrono::hours(1);
+
+    LtcNode(const LTCChainParams& p, const std::string& db) : chain(p, db) {}
+
+    void wire()
+    {
+        HeaderSyncHost hs;
+        hs.has_header = [this](const uint256& h) { return chain.has_header(h); };
+        hs.add_headers = [this](const std::vector<BlockHeaderType>& b) { return chain.add_headers(b); };
+        hs.post_worker = [this](std::function<void()> fn) { worker_q.push_back(std::move(fn)); };
+        hs.post_io = [this](std::function<void()> fn) { io_q.push_back(std::move(fn)); };
+        hs.locator = [this]() { return chain.get_locator(); };
+        hs.synced = [this]() { return chain.is_synced(); };
+        hs.height = [this]() { return chain.height(); };
+        hs.ask_one = [this](const std::vector<uint256>& loc, size_t, const std::string& peer) {
+            asks.push_back(loc);
+            return peer.empty() ? std::string("peer") : peer;
+        };
+        hs.ask_all = [this](const std::vector<uint256>& loc) { asks.push_back(loc); };
+        hs.now = [this]() { return t; };
+        sync = std::make_shared<HeaderSync>(std::move(hs));
+    }
+
+    void run()
+    {
+        while (!worker_q.empty() || !io_q.empty()) {
+            auto w = std::move(worker_q);
+            worker_q.clear();
+            for (auto& f : w)
+                f();
+            auto i = std::move(io_q);
+            io_q.clear();
+            for (auto& f : i)
+                f();
+        }
+    }
+
+    /// Every getheaders sent, and the ones they lead to, answered from `net`.
+    void answer(const HonestLtcChain& net)
+    {
+        for (int guard = 0; guard < 1000; ++guard) {
+            run();
+            if (asks.empty())
+                return;
+            const auto loc = asks.front();
+            asks.pop_front();
+            sync->on_headers("peer", net.getheaders(loc, kPeerBatch));
+        }
+        ADD_FAILURE() << "the header sync did not settle";
+    }
+
+    /// Two ticks of the periodic getheaders, each answered.
+    void poll(const HonestLtcChain& net)
+    {
+        for (int i = 0; i < 2; ++i) {
+            t += std::chrono::minutes(1);
+            sync->poll();
+            answer(net);
+        }
+    }
+};
+
+/// main_ltc's start of the header chain after init() at its defaults: the
+/// checkpoint (pinned; the root when above the tip), then genesis only when
+/// the store is empty.
+void ltc_start(HeaderChain& chain, const HonestLtcChain& net)
+{
+    chain.set_dynamic_checkpoint(net.cp, net.hash(net.cp));
+    if (chain.size() == 0)
+        chain.add_header(net.at(0));
+}
+
+/// The step's state, printed; then its tip, height, best work and "synced"
+/// checked, and that no genesis entry was stored.
+void expect_ltc_tip(const HeaderChain& chain, const HonestLtcChain& net, const std::string& step,
+                    uint32_t height, const uint256& work)
+{
+    const auto tip = chain.tip();
+    const bool synced = chain.is_synced();
+    std::cout << "[ ltc genesis ] " << step << ": tip=" << (tip ? net.name(tip->block_hash) : "(none)")
+              << " height=" << chain.height() << " best_work=" << chain.cumulative_work().GetLow64()
+              << " synced=" << synced << " genesis_stored=" << chain.has_header(net.hash(0))
+              << " size=" << chain.size() << std::endl;
+    ASSERT_TRUE(tip.has_value()) << step;
+    EXPECT_EQ(tip->block_hash, net.hash(height)) << step << ": the tip is " << net.name(tip->block_hash);
+    EXPECT_EQ(chain.height(), height) << step;
+    EXPECT_EQ(chain.cumulative_work(), work) << step;
+    EXPECT_TRUE(synced) << step;
+    EXPECT_FALSE(chain.has_header(net.hash(0))) << step << ": a genesis entry was stored";
+}
+
+struct LtcTempDir {
+    std::filesystem::path dir;
+    LtcTempDir()
+    {
+        std::mt19937_64 rng(std::random_device{}());
+        dir = std::filesystem::temp_directory_path() / ("ltc_genesis_store_" + std::to_string(rng()));
+    }
+    ~LtcTempDir()
+    {
+        std::error_code ec;
+        std::filesystem::remove_all(dir, ec);
+    }
+};
+
+} // namespace
+
+// An empty store accepts the genesis header and extends from it: with no
+// checkpoint, and with a pinned checkpoint (--ltc-utxo-full).
+TEST(LtcGenesisHeader, AnEmptyStoreStartsFromIt)
+{
+    HonestLtcChain net(40, 43, 43);
+    const auto params = ltc_test::easy_testnet_params();
+    const uint256 proof = get_block_proof(ltc_test::kEasyBits);
+    for (const bool pinned : {false, true}) {
+        SCOPED_TRACE(pinned ? "checkpoint pinned" : "no checkpoint");
+        HeaderChain chain(params);
+        ASSERT_TRUE(chain.init());
+        if (pinned)
+            chain.pin_checkpoint(net.cp, net.hash(net.cp));
+        ASSERT_EQ(chain.size(), 0u);
+        ASSERT_FALSE(chain.tip().has_value());
+        EXPECT_TRUE(chain.add_header(net.at(0)));
+        ASSERT_TRUE(chain.tip().has_value());
+        EXPECT_EQ(chain.tip()->block_hash, net.hash(0));
+        EXPECT_EQ(chain.height(), 0u);
+        EXPECT_EQ(chain.cumulative_work(), proof);
+        const std::vector<BlockHeaderType> next{net.at(1), net.at(2), net.at(3)};
+        EXPECT_EQ(chain.add_headers(next), 3);
+        EXPECT_EQ(chain.height(), 3u);
+    }
+    // A batch starting with the genesis header, into an empty store.
+    HeaderChain chain(params);
+    ASSERT_TRUE(chain.init());
+    EXPECT_EQ(chain.add_headers({net.at(0), net.at(1)}), 2);
+    EXPECT_EQ(chain.height(), 1u);
+}
+
+// A store with a tip (the checkpoint root alone, or with headers above it)
+// refuses the genesis header, alone or in a batch; its tip, height and best
+// work are unchanged and it extends from its tip.
+TEST(LtcGenesisHeader, AnAnchoredStoreRefusesIt)
+{
+    HonestLtcChain net(40, 46, 46);
+    const auto params = ltc_test::easy_testnet_params();
+    {
+        HeaderChain chain(params);
+        ASSERT_TRUE(chain.init());
+        ltc_start(chain, net);
+        ASSERT_EQ(chain.height(), net.cp);
+        EXPECT_FALSE(chain.add_header(net.at(0)));
+        EXPECT_EQ(chain.add_headers({net.at(0)}), 0);
+        ASSERT_TRUE(chain.tip().has_value());
+        EXPECT_EQ(chain.tip()->block_hash, net.hash(net.cp));
+        EXPECT_EQ(chain.height(), net.cp);
+        EXPECT_EQ(chain.cumulative_work(), uint256::ONE);
+        EXPECT_FALSE(chain.has_header(net.hash(0)));
+    }
+    HeaderChain chain(params);
+    ASSERT_TRUE(chain.init());
+    ltc_start(chain, net);
+    const std::vector<BlockHeaderType> above(net.headers.begin() + 41, net.headers.begin() + 46);
+    ASSERT_EQ(chain.add_headers(above), 5);
+    ASSERT_EQ(chain.height(), 45u);
+    const uint256 work = chain.cumulative_work();
+
+    EXPECT_FALSE(chain.add_header(net.at(0))) << "the genesis header is refused by an anchored store";
+    EXPECT_EQ(chain.add_headers({net.at(0)}), 0);
+    EXPECT_EQ(chain.add_headers({net.at(0), net.at(1)}), 0);
+    ASSERT_TRUE(chain.tip().has_value());
+    EXPECT_EQ(chain.tip()->block_hash, net.hash(45)) << "the tip did not move";
+    EXPECT_EQ(chain.height(), 45u);
+    EXPECT_EQ(chain.cumulative_work(), work);
+    EXPECT_TRUE(chain.is_synced());
+    EXPECT_FALSE(chain.has_header(net.hash(0)));
+    EXPECT_FALSE(chain.has_header(net.hash(1)));
+
+    EXPECT_TRUE(chain.add_header(net.at(46))) << "the chain keeps extending from its tip";
+    EXPECT_EQ(chain.height(), 46u);
+}
+
+// Setup: the checkpoint root at 40, headers 41..50, a synced tip. Steps: the
+// genesis header; getheaders from the locator answered until nothing new
+// comes, and the periodic getheaders; the header at 51; a reload with
+// main_ltc's start; the header at 52. Expected at each step: the tip, height,
+// best work of the anchored chain, extended by each new header; synced.
+TEST(LtcGenesisHeader, AnAnchoredTipHoldsThroughResyncLiveHeaderAndRestart)
+{
+    constexpr uint32_t kCp = 40, kTip = 50;
+    HonestLtcChain net(kCp, kTip + 2, kTip);
+    const auto params = ltc_test::easy_testnet_params();
+    const uint256 proof = get_block_proof(ltc_test::kEasyBits);
+    LtcTempDir tmp;
+    uint256 w0;
+    {
+        LtcNode node(params, tmp.dir.string());
+        ASSERT_TRUE(node.chain.init());
+        ltc_start(node.chain, net);
+        const std::vector<BlockHeaderType> above(net.headers.begin() + kCp + 1, net.headers.begin() + kTip + 1);
+        ASSERT_EQ(node.chain.add_headers(above), static_cast<int>(kTip - kCp));
+        node.wire();
+        w0 = node.chain.cumulative_work();
+        expect_ltc_tip(node.chain, net, "0 anchored", kTip, w0);
+
+        // 1. A headers message with the genesis header.
+        node.sync->on_headers("peer", {net.at(0)});
+        node.run();
+        expect_ltc_tip(node.chain, net, "1 genesis header", kTip, w0);
+
+        // 2. getheaders from the locator, answered until nothing new comes;
+        //    the periodic getheaders.
+        node.answer(net);
+        node.poll(net);
+        expect_ltc_tip(node.chain, net, "2 resync", kTip, w0);
+
+        // 3. The header at the tip + 1.
+        net.served = kTip + 1;
+        node.sync->on_headers("peer", {net.at(kTip + 1)});
+        node.answer(net);
+        node.poll(net);
+        expect_ltc_tip(node.chain, net, "3 live header", kTip + 1, w0 + proof);
+    }
+    // 4. Reload, main_ltc's start, the header at the tip + 1.
+    {
+        LtcNode node(params, tmp.dir.string());
+        ASSERT_TRUE(node.chain.init());
+        expect_ltc_tip(node.chain, net, "4 reload", kTip + 1, w0 + proof);
+        ltc_start(node.chain, net);
+        node.wire();
+        node.poll(net);
+        expect_ltc_tip(node.chain, net, "4 start", kTip + 1, w0 + proof);
+
+        net.served = kTip + 2;
+        node.sync->on_headers("peer", {net.at(kTip + 2)});
+        node.answer(net);
+        expect_ltc_tip(node.chain, net, "5 live header after the restart", kTip + 2, w0 + proof + proof);
+    }
+}
+
+// The same setup; the header at the tip + 1 arrives before the getheaders
+// answers. Expected: the tip extends to it and holds after the answers.
+TEST(LtcGenesisHeader, AnAnchoredTipHoldsWhenALiveHeaderComesFirst)
+{
+    constexpr uint32_t kCp = 40, kTip = 50;
+    HonestLtcChain net(kCp, kTip + 1, kTip);
+    const auto params = ltc_test::easy_testnet_params();
+    const uint256 proof = get_block_proof(ltc_test::kEasyBits);
+    LtcNode node(params, "");
+    ASSERT_TRUE(node.chain.init());
+    ltc_start(node.chain, net);
+    const std::vector<BlockHeaderType> above(net.headers.begin() + kCp + 1, net.headers.begin() + kTip + 1);
+    ASSERT_EQ(node.chain.add_headers(above), static_cast<int>(kTip - kCp));
+    node.wire();
+    const uint256 w0 = node.chain.cumulative_work();
+
+    node.sync->on_headers("peer", {net.at(0)});
+    node.run();
+    expect_ltc_tip(node.chain, net, "T1 genesis header", kTip, w0);
+
+    net.served = kTip + 1;
+    node.sync->on_headers("peer", {net.at(kTip + 1)});
+    node.run();
+    expect_ltc_tip(node.chain, net, "T2 live header before any answer", kTip + 1, w0 + proof);
+
+    node.answer(net);
+    node.poll(net);
+    expect_ltc_tip(node.chain, net, "T3 the answers", kTip + 1, w0 + proof);
+}
+
+// The same setup and genesis header, its getheaders answered; then a reload
+// with main_ltc's start, the header at tip + 1 not delivered, the header at
+// tip + 2 delivered alone, the periodic getheaders, the header at tip + 3.
+// Run with 10 and with 5 headers above the checkpoint (one answer is 8).
+// Expected: the tip stays on the anchored chain and reaches tip + 2, then
+// tip + 3.
+TEST(LtcGenesisHeader, AnAnchoredTipHoldsThroughARestartWithAMissedBlock)
+{
+    constexpr uint32_t kCp = 40;
+    const auto params = ltc_test::easy_testnet_params();
+    const uint256 proof = get_block_proof(ltc_test::kEasyBits);
+    for (const uint32_t top : {kCp + 10u, kCp + 5u}) {
+        const std::string tag = "[" + std::to_string(top - kCp) + " above] ";
+        SCOPED_TRACE(tag);
+        HonestLtcChain net(kCp, top + 3, top);
+        LtcTempDir tmp;
+        uint256 w0;
+        {
+            LtcNode node(params, tmp.dir.string());
+            ASSERT_TRUE(node.chain.init());
+            ltc_start(node.chain, net);
+            const std::vector<BlockHeaderType> above(net.headers.begin() + kCp + 1, net.headers.begin() + top + 1);
+            ASSERT_EQ(node.chain.add_headers(above), static_cast<int>(top - kCp));
+            node.wire();
+            w0 = node.chain.cumulative_work();
+            expect_ltc_tip(node.chain, net, tag + "M0 anchored", top, w0);
+
+            node.sync->on_headers("peer", {net.at(0)});
+            node.answer(net);
+            node.poll(net);
+            expect_ltc_tip(node.chain, net, tag + "M1 genesis header, resync", top, w0);
+        }
+        net.served = top + 1;  // between the two runs
+        {
+            LtcNode node(params, tmp.dir.string());
+            ASSERT_TRUE(node.chain.init());
+            expect_ltc_tip(node.chain, net, tag + "M2 reload", top, w0);
+            ltc_start(node.chain, net);
+            node.wire();
+            expect_ltc_tip(node.chain, net, tag + "M2 start", top, w0);
+
+            net.served = top + 2;
+            node.sync->on_headers("peer", {net.at(top + 2)});
+            node.answer(net);
+            expect_ltc_tip(node.chain, net, tag + "M3 live header at tip + 2", top + 2, w0 + proof + proof);
+            node.poll(net);
+            expect_ltc_tip(node.chain, net, tag + "M4 periodic getheaders", top + 2, w0 + proof + proof);
+
+            net.served = top + 3;
+            node.sync->on_headers("peer", {net.at(top + 3)});
+            node.answer(net);
+            node.poll(net);
+            expect_ltc_tip(node.chain, net, tag + "M5 next live header", top + 3, w0 + proof + proof + proof);
+        }
+    }
+}
+
+// A store loaded with entries but without its "tip" key: started with the
+// checkpoint, the root is the tip and the genesis header is refused; started
+// without a checkpoint, the genesis header is accepted.
+TEST(LtcGenesisHeader, AStoreWithEntriesButNoTip)
+{
+    HonestLtcChain net(40, 45, 45);
+    const auto params = ltc_test::easy_testnet_params();
+    LtcTempDir tmp;
+    const std::string dir = tmp.dir.string();
+    {
+        HeaderChain chain(params, dir);
+        ASSERT_TRUE(chain.init());
+        ltc_start(chain, net);
+        const std::vector<BlockHeaderType> above(net.headers.begin() + 41, net.headers.begin() + 46);
+        ASSERT_EQ(chain.add_headers(above), 5);
+    }
+    auto drop_tip = [&dir]() {
+        core::LevelDBStore db(dir, core::LevelDBOptions{});
+        ASSERT_TRUE(db.open());
+        db.remove("tip");
+        db.remove("height");
+    };
+    drop_tip();
+    {
+        HeaderChain chain(params, dir);
+        ASSERT_TRUE(chain.init());
+        ASSERT_FALSE(chain.tip().has_value());
+        ASSERT_EQ(chain.size(), 6u);
+        ltc_start(chain, net);  // the checkpoint seeds the root as the tip
+        EXPECT_EQ(chain.add_headers({net.at(0)}), 0);
+        ASSERT_TRUE(chain.tip().has_value());
+        EXPECT_EQ(chain.tip()->block_hash, net.hash(40));
+        EXPECT_FALSE(chain.has_header(net.hash(0)));
+    }
+    drop_tip();
+    {
+        HeaderChain chain(params, dir);
+        ASSERT_TRUE(chain.init());
+        ASSERT_FALSE(chain.tip().has_value());
+        ASSERT_EQ(chain.size(), 6u);  // not empty: no genesis seed at start
+        EXPECT_EQ(chain.add_headers({net.at(0)}), 1);
+        ASSERT_TRUE(chain.tip().has_value());
+        EXPECT_EQ(chain.tip()->block_hash, net.hash(0));
+        EXPECT_EQ(chain.height(), 0u);
+        EXPECT_EQ(chain.size(), 7u);
+    }
 }
