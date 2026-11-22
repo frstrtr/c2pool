@@ -178,7 +178,7 @@ c2pool builds one binary per **parent chain** (`c2pool-<coin>`). Several parents
 | **DigiByte** (DGB) | Scrypt¹ | DOGE (embedded, `-DAUX_DOGE`) | Live, daemonless (`c2pool-dgb --run --coin-p2p-discover`; dgb.voidbind.com) — mainnet only, no testnet mode |
 | **Bitcoin Cash** (BCH) | SHA256d | — | Live, daemonless (`c2pool-bch --pool`; bch.voidbind.com) |
 | **BIP-110** (Knots BLAKE2b fork) | BLAKE2b² (SHA256d until height 961640) | — | **Experimental** (new fork; daemonless embedded; live on bip110.voidbind.com) — `c2pool-bip110 --run` |
-| **Monero** (XMR) | RandomX | none | **Experimental** (v37 lane, Path B payouts; `c2pool-v37-xmr`, can run daemonless; not in the release packages): regtest, stagenet and testnet run a pool; mainnet runs only `--follow-only` and needs `--i-understand-mainnet` even for that; see [docs/xmr-lane](docs/xmr-lane/README.md) |
+| **Monero** (XMR) | RandomX | none | **Experimental** (v37 lane, Path B payouts; `c2pool-v37-xmr`, can run daemonless; not built by the release workflow): regtest, stagenet and testnet run a pool; mainnet runs only `--follow-only` and needs `--i-understand-mainnet` even for that; see [docs/xmr-lane](docs/xmr-lane/README.md) |
 
 "Live" means a public voidbind node runs that per-coin binary with no coin
 daemon on the serve path. It is not a production-maturity claim: only the LTC
