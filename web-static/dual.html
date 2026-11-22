@@ -70,6 +70,8 @@
         .chart svg { width: 100%; height: 100%; display: block; }
         .chart .axis { fill: var(--text-muted); font-size: 11px; }
         .chart .gridline { stroke: var(--border); stroke-width: 1; }
+        .chart .blk { cursor: pointer; }
+        .chart .blk:hover line { stroke-opacity: 1; stroke-width: 2; }
         .chart-stats { display: flex; gap: 22px; margin-top: 6px; font-size: 0.85rem; }
         .chart-stats .k { color: var(--text-muted); font-size: 0.72rem; text-transform: uppercase; }
         table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
@@ -132,6 +134,14 @@
         if (h) return h + 'h ' + m + 'm';
         return m + 'm';
     }
+    // An explorer link only for this chain's own (parent-chain) blocks with an
+    // https explorer URL, the same rule the full dashboard uses (#2298).
+    function blockLink(p, b) {
+        if (!b || typeof b.explorer_url !== 'string' || !/^https:\/\//.test(b.explorer_url)) return null;
+        if (b.chain && p.symbol && b.chain !== p.symbol) return null;
+        return b.explorer_url;
+    }
+    var lastGraph = {}, lastBlocks = {};
     function ago(ts) { var s = Date.now() / 1000 - ts; return s < 60 ? 'just now' : fmtDur(s) + ' ago'; }
 
     // ── layout: one grid row per widget, one cell per chain ─────────────
@@ -246,13 +256,48 @@
         var area = line + 'L' + x(t1).toFixed(1) + ',' + y(0) + 'L' + x(t0).toFixed(1) + ',' + y(0) + 'Z';
         add('path', { d: area, fill: color, 'fill-opacity': '0.18', stroke: 'none' });
         add('path', { d: line, fill: 'none', stroke: color, 'stroke-width': '1.6' });
+        // Found blocks inside the plotted period: a dashed line from the top
+        // of the plot to the axis, a dot on top, a tooltip, and an explorer
+        // link where the recent-blocks table has one.
+        var found = (lastBlocks[p.id] || []).filter(function (b) {
+            return b && typeof b.ts === 'number' && b.ts >= t0 && b.ts <= t1;
+        });
+        found.forEach(function (b) {
+            var bx = x(b.ts).toFixed(1), orphan = b.status === 'orphan';
+            var mc = orphan ? '#ff6b6b' : '#2ee59d';
+            var g = document.createElementNS(ns, 'g');
+            g.setAttribute('class', 'blk');
+            var ln = document.createElementNS(ns, 'line');
+            ln.setAttribute('x1', bx); ln.setAttribute('x2', bx);
+            ln.setAttribute('y1', T + 6); ln.setAttribute('y2', H - B);
+            ln.setAttribute('stroke', mc); ln.setAttribute('stroke-width', '1.2');
+            ln.setAttribute('stroke-dasharray', '3 3'); ln.setAttribute('stroke-opacity', '0.85');
+            var dot = document.createElementNS(ns, 'circle');
+            dot.setAttribute('cx', bx); dot.setAttribute('cy', T + 6); dot.setAttribute('r', '4.5');
+            dot.setAttribute('fill', mc); dot.setAttribute('stroke', '#16162a'); dot.setAttribute('stroke-width', '1.5');
+            var tip = document.createElementNS(ns, 'title');
+            tip.textContent = 'Block #' + (b.height || b.number) + ' \u00b7 '
+                + new Date(b.ts * 1000).toLocaleString() + (orphan ? ' \u00b7 orphan' : '');
+            g.appendChild(tip); g.appendChild(ln); g.appendChild(dot);
+            var href = blockLink(p, b);
+            if (href) {
+                var a = document.createElementNS(ns, 'a');
+                a.setAttribute('href', href); a.setAttribute('target', '_blank'); a.setAttribute('rel', 'noopener');
+                a.appendChild(g); svg.appendChild(a);
+            } else {
+                svg.appendChild(g);
+            }
+        });
         box.appendChild(svg);
         var vals = pts.map(function (q) { return q[1]; });
         var avg = vals.reduce(function (s, v) { return s + v; }, 0) / vals.length;
+        var nb = el('div'); nb.appendChild(el('div', 'k', 'Blocks'));
+        nb.appendChild(el('div', '', String(found.length) + ' in period'));
         [['Current', vals[vals.length - 1]], ['Average', avg], ['Peak', Math.max.apply(null, vals)]].forEach(function (kv) {
             var s = el('div'); s.appendChild(el('div', 'k', kv[0])); s.appendChild(el('div', '', fmtHash(kv[1])));
             stats.appendChild(s);
         });
+        stats.appendChild(nb);
         card.querySelector('h2 .s').textContent = { hour: 'last hour', day: 'last day', week: 'last week', month: 'last month' }[period];
     }
 
@@ -268,7 +313,8 @@
         list.forEach(function (b) {
             var r = el('tr');
             var c1 = el('td'); var a = el('a', '', String(b.height || b.number));
-            if (b.explorer_url) { a.href = b.explorer_url; a.target = '_blank'; a.rel = 'noopener'; }
+            var href = blockLink(p, b);
+            if (href) { a.href = href; a.target = '_blank'; a.rel = 'noopener'; }
             c1.appendChild(a); r.appendChild(c1);
             r.appendChild(el('td', 'muted', b.ts ? ago(b.ts) : '-'));
             var eff = (typeof b.effort === 'number') ? b.effort * 100
@@ -304,7 +350,7 @@
     function refreshChart(p, i) {
         var api = '/api/' + p.id;
         get(api, '/web/graph_data/pool_rates/' + GRAPH[period])
-            .then(function (d) { renderChart(p, d, COLORS[i % COLORS.length]); })
+            .then(function (d) { lastGraph[p.id] = d; renderChart(p, d, COLORS[i % COLORS.length]); })
             .catch(function () { renderChart(p, [], COLORS[i % COLORS.length]); });
     }
     function refresh() {
@@ -318,6 +364,8 @@
             ]).then(function (r) {
                 renderStats(p, r[0], r[1], r[2]);
                 renderBlocks(p, r[2]);
+                lastBlocks[p.id] = Array.isArray(r[2]) ? r[2] : [];
+                if (lastGraph[p.id]) renderChart(p, lastGraph[p.id], COLORS[i % COLORS.length]);
                 renderPayouts(p, r[3]);
             });
             refreshChart(p, i);
