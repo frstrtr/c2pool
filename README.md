@@ -17,7 +17,7 @@ Original forum thread: <https://bitcointalk.org/index.php?topic=18313>
 ## Latest releases
 
 - **[v0.2.12.12.2](https://github.com/frstrtr/c2pool/releases/tag/v0.2.12.12.2)** — LTC + DOGE: the embedded header chains accept the genesis header only into a header store that has no tip yet; check the LTC and DOGE header stores once after upgrading (steps in the release notes). Dashboard: Discovered Merged Blocks links the parent hash to the parent-chain explorer only when its parent height is known. Recommended for every LTC/DOGE node.
-- **[v0.2.12.12.1](https://github.com/frstrtr/c2pool/releases/tag/v0.2.12.12.1)** — DASH: the header chain keeps its tip when the genesis header arrives. Recommended for every Dash node.
+- **[v0.2.12.12.1](https://github.com/frstrtr/c2pool/releases/tag/v0.2.12.12.1)** — DASH: a header-chain robustness fix. Recommended for every Dash node.
 - **[v0.2.12.12](https://github.com/frstrtr/c2pool/releases/tag/v0.2.12.12)** — DASH: InstantSend locks are checked against recently rotated quorums, and templates follow InstantSend locks; lower CPU with provider transactions in the template; share-chain block solutions are relayed at the network's difficulty only; a won block is not held back when the local Dash Core does not answer.
 - **[v0.2.12.11](https://github.com/frstrtr/c2pool/releases/tag/v0.2.12.11)** — DASH: lower CPU and no io-loop stalls when serving masternode special transactions; a found block recorded without a height no longer stays "pending"; chainz links on the dashboard.
 - **[v0.2.12.10](https://github.com/frstrtr/c2pool/releases/tag/v0.2.12.10)** — Stratum (all coins): no difficulty runaway after a restart, and the `d=N` / `+N` miner password options. LTC: dead stratum connections no longer fill the miner cap; `--import-found-blocks` restores the found-block history from another node. DASH: `--listen HOST:PORT` binds HOST; shorter tracker lock holds.
@@ -46,7 +46,7 @@ are reconstructed inside c2pool. No Dash Core node is required on the serve path
 Dash Core 24 (hard fork) is supported from v0.2.11.1: the v24 rules are built
 into the node, so a daemon-less pool has no dashd to upgrade. v24 signalling
 started at block 2,576,448 (2026-11-22): the earliest lock-in is block 2,580,480
-and the earliest activation block 2,584,512 (around 2026-12-06). c2pool is
+and the earliest activation block 2,584,512 (around 2026-12-07). c2pool is
 compatible with Dash Core 24.0.2 peers.
 Blocks built this way have been accepted on Dash mainnet, including the pool
 development-fee split. A bare `c2pool-dash --run` is daemonless: with no
@@ -82,7 +82,7 @@ Daemonless-Dash finalization has not been funded by Dash on-chain governance yet
 
 - **c2pool-daemonless-delivered** (252 DASH, one payment at superblock 2575480,
   2026-11-20): at the voting cutoff it had 190 net yes votes, short of the
-  threshold of 10 percent of enabled masternodes (317). Superblock 2575480 did
+  threshold of 10 percent of the masternode voting weight (317). Superblock 2575480 did
   not pay it, and its window ends before the next superblock.
   DashCentral: https://www.dashcentral.org/p/c2pool-daemonless-delivered;
   governance object c7b462b7c8d81df10ce34ebd4436afd715f288c25a7c949835f889015248b247;
@@ -306,7 +306,7 @@ and does not yet exist, so the work can be judged on what it actually is.
   clean script becomes the default at the v37 boundary.
 
 ### v36 ratchet complete — the last generation shared with Python p2pool
-- **The LTC line ratcheted to V36** in August 2026. Since 2026-11-13 00:00:00 UTC
+- **The LTC line ratcheted to V36** by August 2026. Since 2026-11-13 00:00:00 UTC
   the LTC share chain runs share version 3601 (the V36 share format under share
   type 3601). Only c2pool v0.2.12.1 and later are on it; Python `p2pool` nodes are
   not.
@@ -1323,7 +1323,7 @@ dashd-attached default OFF)
 | `--embedded-utxo-full=false` | Open the accrual view instead of the full UTXO set. |
 | `--utxo-import FILE[,PART...]` [`--embedded-utxo-snapshot-pin PINFILE`] | Import into `<data-dir>/<net>/utxo_full_leveldb` and exit; the next start opens it. |
 | `--embedded-credit-pool-seed` | Seed the credit-pool follower from the v20 height over coin P2P. |
-| `--dash-v24-activation-height N` | Emergency pin of the Dash Core v24 activation height (a window boundary). It decides only where the versionbits/EHF tracker cannot, and the node refuses to serve where they disagree. |
+| `--dash-v24-activation-height N` | Emergency pin of the Dash Core v24 activation height (a window boundary). It decides only where the versionbits/EHF tracker cannot, and the node fails closed where they disagree. |
 
 **Web, money, misc**
 
