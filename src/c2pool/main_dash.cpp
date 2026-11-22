@@ -211,6 +211,10 @@ namespace {
 // run_node; see coin/deployment_status.hpp for how it combines with the
 // computed state.
 std::optional<uint32_t> g_v24_activation_pin;
+// --header-dgw-log-only: the coin header chain logs a header whose bits are
+// not the DGW bits of its own window and ACCEPTS it, instead of refusing it
+// (the mainnet default). An escape hatch, not a mode to run in.
+bool g_header_dgw_log_only = false;
 // --embedded-credit-pool-seed: seed the credit-pool follower from the v20
 // floor (every block since v20 over coin P2P, mainnet ~580k blocks, kept in
 // <net>/credit_pool_idx). The only seed that admits asset unlocks: Dash Core
@@ -632,6 +636,7 @@ void print_banner(const char* argv0)
         << "           [--stratum [HOST:]PORT] [--coin-p2p-connect HOST:PORT]... [--coin-p2p-discover]\n"
         << "           [--web-port PORT] [--web-host ADDR] [--dashboard-dir PATH]\n"
         << "           [--external-ip ADDR]\n"
+        << "           [--header-dgw-log-only]  (log, do not refuse, a header off its DGW bits)\n"
         << "           [--embedded-utxo[=false]] [--embedded-mainnet[=false]] [--embedded-null-arm[=false]]\n"
         << "           [--embedded-superblock[=false]] [--embedded-include-mn-special-txs[=false]]\n"
         << "           [--embedded-superblock-unfunded-mainnet]  (TEST/SOAK ONLY — MUST NEVER be set on a\n"
@@ -5824,6 +5829,11 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         const auto hdr_db = (core::filesystem::config_path()
             / net_subdir / "dash_headers").string();
         header_chain = std::make_unique<dash::coin::HeaderChain>(dash_params, hdr_db);
+        header_chain->set_refuse_dgw_mismatch(!g_header_dgw_log_only);
+        if (g_header_dgw_log_only)
+            LOG_WARNING << "[EMB-DASH] --header-dgw-log-only: a header whose bits"
+                           " are not the DGW bits of its window is logged and"
+                           " ACCEPTED";
         header_chain->init();
 
         // Head scoring credits a block-solution share only when its header
@@ -13197,6 +13207,8 @@ int main(int argc, char** argv)
             embedded_accrue_asset_unlocks = true; // #143 Variant B (type-9)
         else if (std::strcmp(argv[i], "--embedded-accrue-asset-unlocks=false") == 0)
             embedded_accrue_asset_unlocks_off = true; // good-citizen opt-out
+        else if (std::strcmp(argv[i], "--header-dgw-log-only") == 0)
+            g_header_dgw_log_only = true;   // log a DGW mismatch and accept the header
         else if (std::strcmp(argv[i], "--embedded-include-mn-special-txs") == 0)
             embedded_include_mn_special_txs = true;   // special-tx superset (DIP types 1-4)
         else if (std::strcmp(argv[i], "--embedded-include-mn-special-txs=false") == 0)
