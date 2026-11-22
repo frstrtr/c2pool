@@ -251,14 +251,17 @@ bool LevelDBStore::open()
         db_options.block_size = m_options.block_size;
         db_options.compression = m_options.use_compression ? leveldb::kSnappyCompression : leveldb::kNoCompression;
 
-        // Set up bloom filter for faster lookups
+        // Bloom filter and block cache: owned by the store (LevelDB never frees
+        // them). No DB is open here, so any left from a failed open go now.
+        m_filter_policy.reset();
+        m_block_cache.reset();
         if (m_options.bloom_filter_bits > 0) {
-            db_options.filter_policy = leveldb::NewBloomFilterPolicy(m_options.bloom_filter_bits);
+            m_filter_policy.reset(leveldb::NewBloomFilterPolicy(m_options.bloom_filter_bits));
+            db_options.filter_policy = m_filter_policy.get();
         }
-
-        // Set up block cache
         if (m_options.block_cache_size > 0) {
-            db_options.block_cache = leveldb::NewLRUCache(m_options.block_cache_size);
+            m_block_cache.reset(leveldb::NewLRUCache(m_options.block_cache_size));
+            db_options.block_cache = m_block_cache.get();
         }
 
         leveldb::DB* db_ptr;
@@ -344,6 +347,9 @@ void LevelDBStore::close()
         LOG_INFO << "Closing LevelDB store at: " << m_db_path;
         m_db.reset();
     }
+    // After the DB that used them.
+    m_block_cache.reset();
+    m_filter_policy.reset();
     unregister(m_registered);
 }
 

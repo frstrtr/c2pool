@@ -48,6 +48,11 @@ private:
     std::string m_db_path;
     LevelDBOptions m_options;
     std::unique_ptr<leveldb::DB> m_db;
+    // The bloom filter policy and the block cache the open DB uses. leveldb::Options
+    // only points at them and LevelDB never frees them, so the store owns them and
+    // frees them in close(), after the DB that uses them.
+    std::unique_ptr<const leveldb::FilterPolicy> m_filter_policy;
+    std::unique_ptr<leveldb::Cache> m_block_cache;
     std::string m_registered;   // the path this store holds in the process's registry
     bool m_lock_held{false};
     /// The open DB's live snapshots, shared with each Snapshot's release:
@@ -91,6 +96,10 @@ public:
     bool is_open() const { return m_db != nullptr; }
     /// The last open() failed because another open holds the DB.
     bool lock_held() const { return m_lock_held; }
+    /// The block cache / filter policy the store holds for its DB (null when
+    /// closed, or when the options ask for none).
+    const leveldb::Cache* block_cache() const { return m_block_cache.get(); }
+    const leveldb::FilterPolicy* filter_policy() const { return m_filter_policy.get(); }
     /// What an operator does about a held DB.
     static const char* held_advice()
     {
