@@ -11140,7 +11140,9 @@
         function _rtStartSSE() {
             if (!_rtActive) return;
             try {
-                _rtEventSource = new EventSource('../sharechain/stream');
+                _rtEventSource = new EventSource(window.multipoolApiBase
+                    ? window.multipoolApiBase + '/sharechain/stream'
+                    : '../sharechain/stream');
                 _rtEventSource.onmessage = function(event) {
                     try {
                         var tip = JSON.parse(event.data);
