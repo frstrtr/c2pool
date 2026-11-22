@@ -553,6 +553,24 @@ public:
         m_ban_state_measured_at = height;
     }
 
+    /// The unmeasured-revive ordering ledger, for the bridge cursor record.
+    const std::map<uint256, uint32_t>& unmeasured_revive_at() const
+    {
+        return m_unmeasured_revive_at;
+    }
+
+    /// Re-adopt the measurement ledgers a persisted record carried for the
+    /// SAME entries just load()ed from it (load() retires both because a new
+    /// set invalidates them; a resumed set is not a new set, so its own
+    /// ledgers come back with it).
+    void restore_measurement_ledgers(uint32_t ban_state_measured_at,
+                                     const std::vector<std::pair<uint256, uint32_t>>& revives)
+    {
+        m_ban_state_measured_at = ban_state_measured_at;
+        m_unmeasured_revive_at.clear();
+        for (const auto& [h, at] : revives) m_unmeasured_revive_at[h] = at;
+    }
+
     /// The proTxHashes in `block` whose revive outcome this machine cannot
     /// decide: a ProUpServTx for a masternode it HOLDS and believes NOT
     /// banned, at a height whose pre-block ban state was never measured.

@@ -909,6 +909,9 @@ public:
     /// all of them, and the ones that brought no new tip height (the counted
     /// ones; restore_defer_bound() of them end the wait COLD).
     uint32_t r7_defers() const { return m_r7_defers; }
+    /// The state machine's measurement ledgers (status / KATs).
+    uint32_t ban_state_measured_at() const { return m_machine.ban_state_measured_at(); }
+    size_t   unmeasured_revives() const { return m_machine.unmeasured_revive_at().size(); }
     uint32_t r7_stalled() const { return m_r7_stalled; }
     static constexpr uint32_t restore_defer_bound() { return kMaxRestoreDefers; }
 
@@ -2813,6 +2816,10 @@ private:
         // the one that must carry (the lane's m_sml_recovered below is the
         // same per-bridge count, kept for status).
         m_machine.restore_sml_recovery_spent(rec.sml_recovered);
+        // load() retired the measurement ledgers; the record carries the ones
+        // that describe exactly these entries (format v5).
+        m_machine.restore_measurement_ledgers(rec.ban_state_measured_at,
+                                              rec.unmeasured_revive_at);
         m_next              = rec.cursor_height + 1;
         m_applied           = 0;   // blocks applied BY THIS PROCESS
         m_restored_applied  = rec.applied;
@@ -3036,6 +3043,9 @@ private:
         rec.revive_dropped     = static_cast<uint32_t>(m_revive_dropped);
         rec.registered         = static_cast<uint32_t>(m_registered);
         rec.spent              = static_cast<uint32_t>(m_spent);
+        rec.ban_state_measured_at = m_machine.ban_state_measured_at();
+        rec.unmeasured_revive_at.assign(m_machine.unmeasured_revive_at().begin(),
+                                        m_machine.unmeasured_revive_at().end());
         if (entries) {
             rec.entries = *entries;
         } else {

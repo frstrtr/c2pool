@@ -135,6 +135,13 @@ struct MnBridgeCursor
     uint32_t    registered{0};
     uint32_t    spent{0};
 
+    // ── THE MACHINE'S MEASUREMENT LEDGERS for THIS set (v5). They describe
+    // the entries below and nothing else, so they travel with them: a resumed
+    // machine must know what a continuous one knows about which ban state was
+    // measured and which revives are still unmeasured.
+    uint32_t    ban_state_measured_at{0};
+    std::vector<std::pair<uint256, uint32_t>> unmeasured_revive_at;
+
     // ── THE SET ITSELF, as of `cursor_height`.
     std::vector<std::pair<uint256, MNState>> entries;
 
@@ -201,7 +208,12 @@ public:
     /// >= 3. A v3 record may hold such a row in the old layout (a pre-v24
     /// build seeded from a post-activation dashd list), which this layout
     /// would misread, so v3 is refused and the bridge replays COLD.
-    static constexpr uint32_t kFormatVersion = 4;
+    ///
+    /// v4 -> v5: the record carries the state machine's measurement ledgers
+    /// (ban_state_measured_at, unmeasured_revive_at). load() clears both, so a
+    /// v4 resume started with neither while a continuous run had them. A v4
+    /// record is refused and the bridge replays COLD, which rebuilds them.
+    static constexpr uint32_t kFormatVersion = 5;
 
     explicit MnBridgeCursorStore(std::string path) : m_path(std::move(path)) {}
 
@@ -439,6 +451,13 @@ private:
         wr_u32(o, c.registered);
         wr_u32(o, c.spent);
 
+        wr_u32(o, c.ban_state_measured_at);
+        wr_u64(o, c.unmeasured_revive_at.size());
+        for (const auto& [h, at] : c.unmeasured_revive_at) {
+            wr_hash(o, h);
+            wr_u32(o, at);
+        }
+
         wr_u64(o, c.entries.size());
         for (const auto& [h, st] : c.entries) {
             wr_hash(o, h);
@@ -487,6 +506,17 @@ private:
         c.revive_dropped    = r.u32();
         c.registered        = r.u32();
         c.spent             = r.u32();
+
+        c.ban_state_measured_at = r.u32();
+        const uint64_t revives = r.u64();
+        if (revives > 200000) throw std::runtime_error("revive ledger implausible");
+        c.unmeasured_revive_at.clear();
+        c.unmeasured_revive_at.reserve(static_cast<size_t>(revives));
+        for (uint64_t i = 0; i < revives; ++i) {
+            uint256 h = r.hash();
+            const uint32_t at = r.u32();
+            c.unmeasured_revive_at.emplace_back(h, at);
+        }
 
         const uint64_t count = r.u64();
         if (count > 200000) throw std::runtime_error("entry count implausible");

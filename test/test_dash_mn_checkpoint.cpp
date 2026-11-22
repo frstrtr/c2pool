@@ -5996,6 +5996,45 @@ TEST(DashMnBridgeCursor, ResumeCarriesTheSpentDemotionWalkBudget)
            " lets every restart buy a fresh budget";
 }
 
+// ── 4d. The machine's measurement ledgers travel with the set (format v5):
+// the record round-trips them, and a resumed machine holds exactly what the
+// previous process held, which load() alone would have cleared.
+TEST(DashMnBridgeCursor, ResumeCarriesTheMeasurementLedgers)
+{
+    TempCursorStore cs("ledgers");
+    { CursorRun a(&cs.store, 1519545); a.run(); ASSERT_TRUE(a.h.published); }
+
+    std::string why;
+    auto rec = cs.store.load(why);
+    ASSERT_TRUE(rec.has_value()) << why;
+    rec->ban_state_measured_at = 1519545;
+    rec->unmeasured_revive_at = {
+        {uint256S(kQ1), 1519544u},
+        {uint256S(kQ2), 1519545u},
+    };
+    ASSERT_TRUE(cs.store.store(*rec));
+
+    // The codec round-trips both.
+    std::string why2;
+    auto back = cs.store.load(why2);
+    ASSERT_TRUE(back.has_value()) << why2;
+    EXPECT_EQ(back->ban_state_measured_at, 1519545u);
+    ASSERT_EQ(back->unmeasured_revive_at.size(), 2u);
+    EXPECT_EQ(back->unmeasured_revive_at[0].second, 1519544u);
+    EXPECT_EQ(back->unmeasured_revive_at[1].second, 1519545u);
+
+    // A resume re-adopts them.
+    CursorRun r(&cs.store, 1519545);
+    r.run();
+    ASSERT_TRUE(r.h.lane.cursor_restored()) << r.h.lane.restore_verdict();
+    EXPECT_EQ(r.h.lane.ban_state_measured_at(), 1519545u)
+        << "load() retires the measurement; a resume of the SAME set must"
+           " bring it back";
+    EXPECT_EQ(r.h.lane.unmeasured_revives(), 2u)
+        << "the unmeasured-revive ledger is what lets the ordering repair act"
+           " after a restart";
+}
+
 // ── 5. R5: the anti-gap arithmetic ─────────────────────────────────────────
 TEST(DashMnBridgeCursor, ARecordThatSkippedHeightsIsRefusedNotResumed)
 {
