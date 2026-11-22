@@ -5091,12 +5091,26 @@
                     
                     tr.append('td').text(function(b) { return format_time_short(b.ts); });
                     tr.append('td').text(function(b) { return b.number || '-'; });
-                    tr.append('td').append('a')
-                        .attr('class', 'hash-link')
-                        .attr('href', function(b) { return currency_info.block_explorer_url_prefix + b.hash; })
-                        .attr('target', '_blank')
-                        .attr('title', function(b) { return b.hash; })
-                        .text(function(b) { return '...' + b.hash.substr(-8); });
+                    // The parent header is a parent-chain block only when the header chain
+                    // knows its height (b.number). Without it the header met the aux target
+                    // only, so there is no parent-chain block to link to.
+                    tr.append('td').each(function(b) {
+                        var td = d3.select(this);
+                        if (b.number) {
+                            td.append('a')
+                                .attr('class', 'hash-link')
+                                .attr('href', currency_info.block_explorer_url_prefix + b.hash)
+                                .attr('target', '_blank')
+                                .attr('title', b.hash)
+                                .text('...' + b.hash.substr(-8));
+                        } else {
+                            td.append('span')
+                                .style('font-family', 'monospace')
+                                .style('color', 'var(--text-muted)')
+                                .attr('title', 'Parent header ' + b.hash + ' (not a ' + ((currency_info && currency_info.symbol) || 'parent-chain') + ' block)')
+                                .text('...' + b.hash.substr(-8));
+                        }
+                    });
                     tr.append('td')
                         .style('color', '#6f42c1')
                         .style('font-weight', 'bold')
