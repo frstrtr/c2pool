@@ -855,6 +855,12 @@ public:
     /// Telemetry only; exposed so a KAT can prove the line fires without
     /// mining 2000 headers, and so an operator can tighten it during a debug
     /// session without a rebuild-and-redeploy.
+    /// Refuse (default) or log-and-accept a header whose bits are not the DGW
+    /// bits of its own window. The mismatch is logged either way; testnet
+    /// always accepts (its min-difficulty rules are not modelled).
+    void set_refuse_dgw_mismatch(bool refuse) { m_refuse_dgw_mismatch = refuse; }
+    bool refuse_dgw_mismatch() const { return m_refuse_dgw_mismatch; }
+
     void set_progress_throttle(uint64_t headers, int64_t ms)
     {
         m_hdr_progress = diag::ProgressReporter(headers, ms);
@@ -1185,8 +1191,9 @@ private:
                             << " expected=0x" << expected_bits << std::dec;
             // Mainnet refuses a header whose bits are not the DGW bits of its
             // own window. Testnet has min-difficulty rules this port does not
-            // model, so there a mismatch is logged and accepted as before.
-            return m_params.allow_min_difficulty;
+            // model, so there a mismatch is logged and accepted as before;
+            // set_refuse_dgw_mismatch(false) does the same on mainnet.
+            return m_params.allow_min_difficulty || !m_refuse_dgw_mismatch;
         }
 
         return true;
@@ -1317,6 +1324,7 @@ private:
     uint256  m_best_work;
 
     std::atomic<uint32_t> m_peer_tip_height{0};
+    bool m_refuse_dgw_mismatch{true};   // see set_refuse_dgw_mismatch()
     std::unique_ptr<core::LevelDBStore> m_db;
     std::set<uint256> m_dirty_headers;
 

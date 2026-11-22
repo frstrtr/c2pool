@@ -1449,3 +1449,50 @@ TEST(DashHeaderChainAnchor, StoredTipOffTheAnchorIsReselectedAtLoad)
     }
     std::filesystem::remove_all(dir);
 }
+
+// ── Mainnet refuses a header whose bits are not the DGW bits of its own
+// window; set_refuse_dgw_mismatch(false) (--header-dgw-log-only) logs and
+// accepts it instead. ──
+TEST(DashHeaderChainAnchor, DgwMismatchIsRefusedByDefaultAndAcceptedWhenLogOnly)
+{
+    for (const bool refuse : {true, false}) {
+        auto params = make_easy_test_params();
+        params.allow_min_difficulty = false;          // mainnet rules
+        constexpr uint32_t A = 34200;                 // past the DGW activation window
+        const uint32_t bits = params.pow_limit.GetCompact();
+        const uint32_t now = static_cast<uint32_t>(std::time(nullptr));
+        uint256 seed;
+        seed.SetHex("0000000000000000000000000000000000000000000000000000000000000a01");
+        const auto anchor_hdr = mine_header(seed, now - 60u * 150u, bits, params.pow_limit);
+        DashChainParams::Checkpoint cp{};
+        cp.height = A;
+        cp.hash = x11_hash(anchor_hdr);
+        params.fast_start_checkpoint = cp;
+
+        HeaderChain hc(params, "");
+        hc.set_refuse_dgw_mismatch(refuse);
+        ASSERT_TRUE(hc.init());
+        uint256 prev = cp.hash;
+        for (uint32_t i = 1; i <= 33; ++i) {
+            auto h = mine_header(prev, now - (60u - i) * 150u, bits, params.pow_limit);
+            ASSERT_TRUE(hc.add_header(h)) << "refuse=" << refuse << " h=A+" << i;
+            prev = x11_hash(h);
+        }
+        ASSERT_EQ(hc.height(), A + 33);
+
+        // Constant bits over 24 blocks spaced exactly target_spacing are NOT
+        // the DGW bits (DGW measures 23 intervals against a 24-interval
+        // target timespan), so this header is off its window's DGW bits.
+        const uint32_t want = hc.next_work_required();
+        ASSERT_NE(want, bits) << "the KAT needs a header off its DGW bits";
+        auto off = mine_header(prev, now - 26u * 150u, bits, params.pow_limit);
+        EXPECT_EQ(hc.add_header(off), !refuse) << "refuse=" << refuse;
+
+        if (refuse) {
+            // The same window's DGW bits are accepted.
+            auto on = mine_header(prev, now - 26u * 150u, want, params.pow_limit);
+            EXPECT_TRUE(hc.add_header(on));
+            EXPECT_EQ(hc.height(), A + 34);
+        }
+    }
+}
