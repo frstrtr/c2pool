@@ -145,6 +145,20 @@ static void print_usage()
         "                  e.g. --stratum 9332           (binds 0.0.0.0:9332)\n"
         "                       --stratum 127.0.0.1:9332 (loopback only)\n"
         "                  Omit to disable stratum listener.\n"
+        "  --stratum-http[=true|false|auto]  also answer the web API (GET/HEAD,\n"
+        "                  read-only) on the stratum port, as python p2pool did on\n"
+        "                  its worker port (trackers poll host:<stratum>/global_stats).\n"
+        "                  default false; auto = on when --http binds ::, binds\n"
+        "                  0.0.0.0 and --stratum is IPv4, or binds the --stratum\n"
+        "                  address (not loopback).\n"
+        "  --stratum-http-budget N  HTTP requests in progress on the stratum port\n"
+        "                  at once: at most N and at most max_stratum_connections - 1;\n"
+        "                  others are answered 503 (default 16; 0 = every HTTP\n"
+        "                  request on the stratum port is answered 503).\n"
+        "  --stratum-http-per-ip N  HTTP requests in progress on the stratum port\n"
+        "                  at once from one address, one /64 for IPv6: at most N;\n"
+        "                  others are answered 503 (default 6; 0 = no limit below\n"
+        "                  --stratum-http-budget).\n"
         "  --sharechain-port P  bind the sharechain (pool P2P) listener on\n"
         "                  port P instead of the default 9333, so a SECOND\n"
         "                  isolated c2pool-btc instance can run on one host\n"
@@ -419,6 +433,30 @@ int main(int argc, char* argv[])
             dev_donation    = std::strtod(argv[++i], nullptr);
             give_author_set = true;
         }
+        else if (arg == "--stratum-http" || arg.rfind("--stratum-http=", 0) == 0)
+        {
+            // --stratum-http[=true|false|auto]: the web API on the stratum port
+            // too (core/stratum_http.hpp).
+            if (!core::parse_stratum_http_flag(arg, core::stratum_http_mode_setting())) {
+                std::cerr << "bad value: " << arg << " (expected --stratum-http=true, false or auto)\n";
+                return 1;
+            }
+        }
+        // --stratum-http-budget N / --stratum-http-per-ip N (core/stratum_http.hpp).
+        else if (arg == "--stratum-http-budget" && i + 1 < argc)
+        {
+            if (!core::parse_stratum_http_count(argv[++i], core::stratum_http_limits_setting().budget)) {
+                std::cerr << "bad value: --stratum-http-budget " << argv[i] << " (expected a count)\n";
+                return 1;
+            }
+        }
+        else if (arg == "--stratum-http-per-ip" && i + 1 < argc)
+        {
+            if (!core::parse_stratum_http_count(argv[++i], core::stratum_http_limits_setting().per_ip)) {
+                std::cerr << "bad value: --stratum-http-per-ip " << argv[i] << " (expected a count)\n";
+                return 1;
+            }
+        }
         else
         {
             std::cerr << "unknown arg: " << arg << "\n";
@@ -464,6 +502,15 @@ int main(int argc, char* argv[])
             else { h = v.substr(0, c); p = static_cast<uint16_t>(std::stoi(v.substr(c + 1))); }
         };
         if (rc.file_set("web.port"))          http_port = static_cast<uint16_t>(rc.get_u16("web.port").value_or(http_port));
+        if (rc.file_set("stratum.http"))   // --stratum-http: true / false / auto
+            core::apply_stratum_http_setting(rc.get_string("stratum.http").value_or(""),
+                                             core::stratum_http_mode_setting());
+        if (rc.file_set("stratum.http_budget"))   // --stratum-http-budget
+            core::apply_stratum_http_count_setting("stratum.http_budget", rc.get_i64("stratum.http_budget"),
+                                                   core::stratum_http_limits_setting().budget);
+        if (rc.file_set("stratum.http_per_ip"))   // --stratum-http-per-ip
+            core::apply_stratum_http_count_setting("stratum.http_per_ip", rc.get_i64("stratum.http_per_ip"),
+                                                   core::stratum_http_limits_setting().per_ip);
         if (rc.file_set("stratum.bind"))      split_hostport(rc.get_string("stratum.bind").value_or(""), stratum_addr, stratum_port);
         if (rc.file_set("sharechain.listen")) { std::string hh; split_hostport(rc.get_string("sharechain.listen").value_or(""), hh, sharechain_port); }
         if (rc.file_set("daemon_rpc.endpoint")) split_hostport(rc.get_string("daemon_rpc.endpoint").value_or(""), bitcoind_host, bitcoind_port);
@@ -3322,6 +3369,11 @@ int main(int argc, char* argv[])
     } else {
         LOG_INFO << "[BTC-POOL] dashboard disabled (no --http bind given).";
     }
+    // HTTP on the stratum port (--stratum-http; auto follows the --http bind).
+    if (stratum_server_for_shutdown)
+        core::configure_stratum_http(*stratum_server_for_shutdown, web_server.get(),
+                                     core::stratum_http_mode_setting(),
+                                     core::stratum_http_limits_setting());
 
     // Periodic think/clean tick (every 5s, safety net) — mirrors the LTC/dash
     // tick (main_ltc.cpp think_timer). Without it, think() fired only on share

@@ -1021,8 +1021,44 @@ the DGB pool. See [c2pool-dgb](#c2pool-dgb--digibyte-scrypt) below.
 | Port | Purpose |
 |------|---------|
 | 9326 | P2Pool sharechain (peer-to-peer) |
-| 9327 | Stratum mining |
+| 9327 | Stratum mining (with `--stratum-http` on, also the read-only REST API; see below) |
 | 8080 | Web dashboard + REST API |
+
+**The REST API on the stratum port.** python p2pool served its web API on
+the worker port, and p2pool-aware trackers (miningpoolstats and others) poll
+`http://host:9327/global_stats`. When `--stratum-http` is on, c2pool answers
+such a request on the stratum port too: the stratum server looks at the first
+line of a connection, and an
+HTTP request line hands the connection to the web server's own request
+handler. Same routes and JSON as the web port, but strictly read-only: GET and
+HEAD only (other methods get 405), every local-only, token-gated or
+state-changing route (`/control/*`, `/web/log`, `/logs/export`,
+`/api/config*`, `/api/admin/*`, ...) answers 403 there whatever the client's
+address or `?token=`, the event stream answers 405, and the connection closes
+after one response. Stratum lines are served exactly as before. An HTTP
+connection is not a miner session, but it counts toward
+`--max-stratum-connections` and the per-IP cap while open. At the stratum
+handshake deadline the stratum side shuts the connection down and nothing more
+is read or written; the slot is released when the HTTP side closes it. The
+response write is closed at write start + the web idle timeout (30 s by
+default; 30 s when that timeout is 0) if that comes first. At most
+`--stratum-http-budget` (default 16, and at most
+`--max-stratum-connections` minus 1) HTTP requests are in progress on the
+stratum port at once, at most `--stratum-http-per-ip` (default 6) from one
+address (one /64 for IPv6); the others are answered 503 and close at once.
+`--stratum-http-budget 0` answers every HTTP request on the stratum port with
+503; `--stratum-http-per-ip 0` sets no limit below the budget.
+`--stratum-http=true|false|auto` (settings key `stratum.http`, same values;
+also on/off/yes/no/1/0), default `false`; `auto`: on when the web server binds `::`,
+binds `0.0.0.0` and the stratum listener an IPv4 address, or binds the stratum
+listener's own non-loopback address; off when it binds `127.0.0.1` / `::1`
+behind a reverse proxy, binds one LAN or VPN address while the stratum port
+binds wider, binds `0.0.0.0` while the stratum port binds IPv6, or is disabled.
+`auto` cannot see a firewall, a cloud security group or a container that
+publishes only the stratum port: if the web port is closed that way, do not
+use `auto`; keep `--stratum-http=false` (the default). The startup log says which:
+`stratum HTTP: ON (web bound to 0.0.0.0)` or
+`stratum HTTP: OFF (web bound to 10.8.0.1, stratum to 0.0.0.0)`.
 
 Per-coin binaries use their own defaults. For DASH: sharechain 8999 on the v16
 network and **8998** on the v36 network (`--net dash-v36`); a private
@@ -1120,6 +1156,9 @@ legacy YAML key set.
 | `-w` / `--worker-port` | `stratum_port` | 9327 | Stratum mining port |
 | `--web-port` | `web_port` | 8080 | HTTP API / dashboard port |
 | `--http-host` | `http_host` | 0.0.0.0 | HTTP bind address |
+| `--stratum-http[=true\|false\|auto]` | `stratum_http` | false | Also answer the read-only REST API on the stratum port (python p2pool parity); auto = on when the HTTP bind address is not loopback (the LTC stratum port binds the same address) |
+| `--stratum-http-budget N` | `stratum_http_budget` | 16 | HTTP requests in progress on the stratum port at once, at most N and at most max_stratum_connections - 1; others are answered 503 (0 = every HTTP request on the stratum port is answered 503) |
+| `--stratum-http-per-ip N` | `stratum_http_per_ip` | 6 | HTTP requests in progress on the stratum port at once from one address, one /64 for IPv6: at most N; others are answered 503 (0 = no limit below `--stratum-http-budget`) |
 | `--coind-address` | `ltc_rpc_host` | 127.0.0.1 | Coin daemon RPC host |
 | `--coind-rpc-port` | `ltc_rpc_port` | auto | Coin daemon RPC port |
 | `--rpcuser` | `ltc_rpc_user` | -- | RPC username |
@@ -1323,6 +1362,9 @@ dashd-attached default OFF)
 | `--stratum [HOST:]PORT` | off | Miner-facing Stratum listener. |
 | `--web-port PORT` (alias `--http-port`) | 8080 | Dashboard + JSON API; `0` disables. If it collides with the Stratum port it moves to stratum+1. |
 | `--web-host ADDR` | `0.0.0.0` | Dashboard bind interface. |
+| `--stratum-http[=true\|false\|auto]` | false | Also answer the read-only JSON API on the Stratum port (python p2pool parity); auto = on when `--web-host` is `::`, is `0.0.0.0` with an IPv4 Stratum bind, or is the same non-loopback address as the Stratum bind. |
+| `--stratum-http-budget N` | 16 | HTTP requests in progress on the Stratum port at once, at most N and at most max_stratum_connections - 1; others are answered 503 (0 = every HTTP request on the Stratum port is answered 503). |
+| `--stratum-http-per-ip N` | 6 | HTTP requests in progress on the Stratum port at once from one address, one /64 for IPv6: at most N; others are answered 503 (0 = no limit below `--stratum-http-budget`). |
 | `--dashboard-dir PATH` | `web-static` | Static dashboard root. |
 | `--external-ip ADDR` (aliases `--stratum-advertise`, `--public-host`) | auto-detect | Miner-facing host shown in the dashboard Stratum URL (NAT). |
 | `--explorer` / `--no-explorer` | on | Loopback-only `/api/explorer` surface + raw-block retention. |

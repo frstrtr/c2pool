@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 #include "merged_chain_addr.hpp"
+#include "stratum_http.hpp"
 #include "stratum_refusal_log.hpp"
 
 #include <memory>
@@ -239,6 +240,11 @@ private:
     // to connected_at_.
     std::chrono::steady_clock::time_point last_notify_at_;
     std::string session_id_;
+    // The first inbound line has been read: only that one is checked for an
+    // HTTP request line (try_http_handoff). Empty lines before it are skipped
+    // while HTTP is on (RFC 9112 2.2), at most 4.
+    bool first_line_seen_ = false;
+    int blank_lines_skipped_ = 0;
     // Remote address, read once at construction (the socket is connected
     // then; remote_endpoint() fails after close). Keys the per-IP cap.
     boost::asio::ip::address peer_address_;
@@ -394,6 +400,29 @@ private:
     std::string generate_subscription_id();
     void read_message();
     void process_message(std::size_t bytes_read);
+    // HTTP on the stratum port (core/stratum_http.hpp): when the first line
+    // (bytes_read bytes at the front of buffer_) is an HTTP request line and
+    // the server has it on, leave the miner sessions, take an HTTP slot under
+    // the caps, and hand the socket plus everything buffered to the server's
+    // HTTP handler within the hand-off budget; answer 503 over the budget or
+    // the per-address share (busy), or when there is no handler or it
+    // declines (not served). true: the connection is no longer this
+    // session's -- stop reading.
+    bool try_http_handoff(std::size_t bytes_read);
+    // The first line so far is an empty line (CRLF / LF) and HTTP is on:
+    // consume it and keep looking for the request line. true: skipped.
+    bool skip_leading_blank_line(std::size_t bytes_read);
+    // The stratum side's 503 for an HTTP connection (`kind` picks the body),
+    // written on req->socket's io_context, then the close; the write is
+    // closed at min(req->deadline, write start +
+    // kStratumHttpUnavailableWriteTimeout). `req` (and its slot) is released
+    // when both the write and its deadline have completed.
+    static void answer_http_unavailable(std::shared_ptr<StratumHttpRequest> req,
+                                        const std::string& method, const std::string& target,
+                                        StratumHttpUnavailable kind);
+    // Test access (core_test).
+    friend struct StratumSessionTestAccess;
+
 
     nlohmann::json handle_subscribe(const nlohmann::json& params, const nlohmann::json& request_id);
     nlohmann::json handle_authorize(const nlohmann::json& params, const nlohmann::json& request_id);
@@ -481,6 +510,21 @@ class StratumServer
     // StratumSession::kMaxStratumLineBytes without a '\n'.
     std::atomic<uint64_t> oversized_line_drops_{0};
 
+    // HTTP on the stratum port (core/stratum_http.hpp). Off until set_http().
+    // http_state_ counts the live HTTP connections (total and per cap key;
+    // the connection caps count them) and rate-limits their log lines; it is
+    // shared with each connection's slot.
+    struct HttpState;
+    std::shared_ptr<HttpState> http_state_;
+    mutable std::mutex http_mutex_;
+    bool http_on_ = false;
+    StratumHttpHandler http_handler_;
+    StratumHttpLimits http_limits_;
+    // HTTP requests answered 503 because the hand-off budget, or the
+    // per-address share, was in use.
+    std::atomic<uint64_t> refused_http_budget_{0};
+    std::atomic<uint64_t> refused_http_share_{0};
+
     // p2pool RateMonitor pair (work.py:223-226):
     //   local_rate_monitor: per-user hashrate (for get_local_rates)
     //   local_addr_rate_monitor: per-address hashrate (for get_local_addr_rates)
@@ -506,6 +550,8 @@ class StratumServer
     // ends even if no further refusal arrives. io-thread state.
     RefusalLogLimiter cap_refusal_log_;
     RefusalLogLimiter per_ip_refusal_log_;
+    RefusalLogLimiter http_budget_refusal_log_;
+    RefusalLogLimiter http_share_refusal_log_;
     boost::asio::steady_timer refusal_log_timer_;
     std::optional<RefusalLogLimiter::clock::time_point> refusal_log_timer_due_;   // armed for
     std::atomic<uint64_t> refusal_lines_logged_{0};
@@ -572,7 +618,73 @@ public:
     uint64_t get_oversized_line_drops() const { return oversized_line_drops_.load(); }
     void record_oversized_line_drop() { oversized_line_drops_.fetch_add(1); }
     /// Live session count (dead sessions pruned lazily — see notify_all()).
+    /// Miner sessions only: an HTTP request on the stratum port leaves the
+    /// sessions once its first line is read (get_http_connection_count).
     size_t get_session_count() const;
+
+    /// HTTP on the stratum port (core/stratum_http.hpp). on=false (the
+    /// default) keeps the legacy behaviour: an HTTP request line is just an
+    /// invalid stratum line. on=true with a handler hands HTTP connections to
+    /// it, within the hand-off budget of `limits` (stratum_http_budget); over
+    /// it, and with no handler (or one that declines), they are answered 503.
+    /// Any thread; applies to connections whose first line arrives after.
+    void set_http(bool on, StratumHttpHandler handler, StratumHttpLimits limits = {});
+    bool http_on() const;
+    struct HttpConfig {
+        bool on = false;
+        StratumHttpHandler handler;
+        StratumHttpLimits limits;
+    };
+    /// The switch, handler and limits as of now (sessions read them on the io
+    /// thread).
+    HttpConfig http_config() const;
+    /// max_stratum_connections as of now (0: no cap).
+    std::size_t connection_cap() const;
+    /// Live HTTP connections taken from this port (they count toward
+    /// max_stratum_connections and the per-IP cap, never as sessions).
+    size_t get_http_connection_count() const;
+    /// HTTP connections handed over (or answered 503) since start.
+    uint64_t get_http_requests() const;
+    /// HTTP log lines written (rate-limited: full + summary).
+    uint64_t get_http_log_lines() const;
+    /// Failed-request warning lines written (rate-limited: full + summary).
+    uint64_t get_http_error_log_lines() const;
+    /// One HTTP connection's place under the caps; a hand-off slot also holds
+    /// one unit of the hand-off budget, in total and for its per_ip_cap_key.
+    /// Released when its last owner drops it.
+    struct HttpSlot;
+    /// A slot for one HTTP connection from `peer` under the caps; released
+    /// when the returned pointer's last copy goes.
+    std::shared_ptr<void> acquire_http_slot(const boost::asio::ip::address& peer);
+    enum class HttpRefusal { None, Budget, Share };
+    struct HttpHandoff {
+        std::shared_ptr<void> slot;              // null when refused
+        HttpRefusal refusal = HttpRefusal::None;
+    };
+    /// One step under one lock: a hand-off slot for `peer` when fewer than
+    /// stratum_http_budget(cap, ...).handoffs hand-offs are in progress and
+    /// fewer than .per_key from per_ip_cap_key(peer); else the refusal kind
+    /// and no slot. A granted slot counts one request.
+    HttpHandoff try_acquire_http_handoff(const boost::asio::ip::address& peer, std::size_t cap,
+                                         const StratumHttpLimits& limits);
+    /// Count and log (rate-limited) one HTTP request answered 503 for
+    /// `refusal`. Call on the io thread.
+    void record_http_refusal(HttpRefusal refusal, const std::string& peer_ip, std::size_t cap,
+                             const StratumHttpLimits& limits);
+    /// HTTP requests answered 503 for the hand-off budget / the per-address
+    /// share since start.
+    uint64_t get_http_refused_budget() const { return refused_http_budget_.load(); }
+    uint64_t get_http_refused_share() const { return refused_http_share_.load(); }
+    /// Hand-offs in progress; the most at once since start; keys with one or
+    /// more in progress.
+    size_t get_http_handoffs() const;
+    size_t get_http_handoffs_peak() const;
+    size_t get_http_handoff_keys() const;
+    /// The per-request log callback for an HTTP connection from `peer_ip`.
+    std::function<void(const std::string&, const std::string&, unsigned)>
+    http_response_logger(const std::string& peer_ip) const;
+    /// The failed-request log callback for an HTTP connection from `peer_ip`.
+    std::function<void(const std::string&)> http_error_logger(const std::string& peer_ip) const;
 
     /// Drain-mode hooks (#866 action 2). Default-inert: while accepting is true
     /// (the default) nothing changes. set_accepting(false) closes each new

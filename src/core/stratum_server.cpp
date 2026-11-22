@@ -92,6 +92,76 @@ RateMonitor::get_datums_in_last(double dt) const {
 /// Static member definition
 std::atomic<uint64_t> StratumSession::job_counter_{0};
 
+// HTTP connections taken from the stratum port: how many are live (in total
+// and per cap key; both connection caps count them), the hand-offs in
+// progress (in total and per cap key; the hand-off budget counts them) and
+// the rate limit on their log lines. Shared with every connection's slot and
+// log callbacks.
+struct StratumServer::HttpState {
+    std::mutex mutex;
+    size_t live = 0;
+    std::map<boost::asio::ip::address, size_t> per_key;   // per_ip_cap_key -> live
+    size_t handoffs = 0;
+    size_t handoffs_peak = 0;
+    std::map<boost::asio::ip::address, size_t> handoff_per_key;   // per_ip_cap_key -> hand-offs
+    // At most one full line per 60 s; the requests in between are counted and
+    // summarised in one line written with the first request after the 60 s
+    // (there is no timer: with no later request, no summary). Failed requests
+    // (malformed, cut off, timed out) the same way, on their own limiter.
+    RefusalLogLimiter log{std::chrono::seconds(60)};
+    RefusalLogLimiter err_log{std::chrono::seconds(60)};
+    std::atomic<uint64_t> requests{0};
+    std::atomic<uint64_t> log_lines{0};
+    std::atomic<uint64_t> error_log_lines{0};
+
+    size_t from(const boost::asio::ip::address& key)
+    {
+        std::lock_guard<std::mutex> lk(mutex);
+        auto it = per_key.find(key);
+        return it == per_key.end() ? 0 : it->second;
+    }
+    size_t total()
+    {
+        std::lock_guard<std::mutex> lk(mutex);
+        return live;
+    }
+};
+
+// Constructed with st->mutex held; the destructor takes it. Entries at zero
+// are erased from both maps.
+struct StratumServer::HttpSlot {
+    std::shared_ptr<HttpState> st;
+    boost::asio::ip::address key;
+    bool handoff = false;
+
+    HttpSlot(std::shared_ptr<HttpState> s, boost::asio::ip::address k, bool h)
+        : st(std::move(s)), key(k), handoff(h)
+    {
+        ++st->live;
+        ++st->per_key[key];
+        if (handoff) {
+            ++st->handoff_per_key[key];
+            st->handoffs_peak = std::max(st->handoffs_peak, ++st->handoffs);
+        }
+    }
+    HttpSlot(const HttpSlot&) = delete;
+    HttpSlot& operator=(const HttpSlot&) = delete;
+    ~HttpSlot()
+    {
+        std::lock_guard<std::mutex> lk(st->mutex);
+        --st->live;
+        auto it = st->per_key.find(key);
+        if (it != st->per_key.end() && --it->second == 0)
+            st->per_key.erase(it);
+        if (handoff) {
+            --st->handoffs;
+            auto h = st->handoff_per_key.find(key);
+            if (h != st->handoff_per_key.end() && --h->second == 0)
+                st->handoff_per_key.erase(h);
+        }
+    }
+};
+
 StratumServer::StratumServer(net::io_context& ioc, const std::string& address, uint16_t port, std::shared_ptr<IWorkSource> mining_interface)
     : ioc_(ioc)
     , acceptor_(ioc)
@@ -99,9 +169,186 @@ StratumServer::StratumServer(net::io_context& ioc, const std::string& address, u
     , bind_address_(address)
     , port_(port)
     , running_(false)
+    , http_state_(std::make_shared<HttpState>())
     , idle_reap_timer_(ioc)
     , refusal_log_timer_(ioc)
 {
+}
+
+void StratumServer::set_http(bool on, StratumHttpHandler handler, StratumHttpLimits limits)
+{
+    std::lock_guard<std::mutex> lk(http_mutex_);
+    http_on_ = on;
+    http_handler_ = std::move(handler);
+    http_limits_ = limits;
+}
+
+bool StratumServer::http_on() const
+{
+    std::lock_guard<std::mutex> lk(http_mutex_);
+    return http_on_;
+}
+
+StratumServer::HttpConfig StratumServer::http_config() const
+{
+    std::lock_guard<std::mutex> lk(http_mutex_);
+    return {http_on_, http_handler_, http_limits_};
+}
+
+std::size_t StratumServer::connection_cap() const
+{
+    return mining_interface_ ? mining_interface_->get_stratum_config().max_stratum_connections : 0;
+}
+
+size_t StratumServer::get_http_connection_count() const
+{
+    return http_state_->total();
+}
+
+uint64_t StratumServer::get_http_requests() const
+{
+    return http_state_->requests.load();
+}
+
+uint64_t StratumServer::get_http_log_lines() const
+{
+    return http_state_->log_lines.load();
+}
+
+uint64_t StratumServer::get_http_error_log_lines() const
+{
+    return http_state_->error_log_lines.load();
+}
+
+std::shared_ptr<void> StratumServer::acquire_http_slot(const boost::asio::ip::address& peer)
+{
+    const auto key = per_ip_cap_key(peer);
+    std::shared_ptr<HttpSlot> slot;
+    {
+        std::lock_guard<std::mutex> lk(http_state_->mutex);
+        slot = std::make_shared<HttpSlot>(http_state_, key, false);
+    }
+    http_state_->requests.fetch_add(1);
+    return slot;
+}
+
+StratumServer::HttpHandoff StratumServer::try_acquire_http_handoff(const boost::asio::ip::address& peer,
+                                                                  std::size_t cap,
+                                                                  const StratumHttpLimits& limits)
+{
+    const auto budget = stratum_http_budget(cap, limits.budget, limits.per_ip);
+    const auto key = per_ip_cap_key(peer);
+    HttpHandoff r;
+    std::shared_ptr<HttpSlot> slot;
+    {
+        std::lock_guard<std::mutex> lk(http_state_->mutex);
+        if (http_state_->handoffs >= budget.handoffs) {
+            r.refusal = HttpRefusal::Budget;
+            return r;
+        }
+        const auto it = http_state_->handoff_per_key.find(key);
+        if ((it == http_state_->handoff_per_key.end() ? 0 : it->second) >= budget.per_key) {
+            r.refusal = HttpRefusal::Share;
+            return r;
+        }
+        slot = std::make_shared<HttpSlot>(http_state_, key, true);
+    }
+    http_state_->requests.fetch_add(1);
+    r.slot = std::move(slot);
+    return r;
+}
+
+void StratumServer::record_http_refusal(HttpRefusal refusal, const std::string& peer_ip, std::size_t cap,
+                                        const StratumHttpLimits& limits)
+{
+    const auto budget = stratum_http_budget(cap, limits.budget, limits.per_ip);
+    const std::string peer = peer_ip.empty() ? std::string{} : " peer=" + peer_ip;
+    if (refusal == HttpRefusal::Budget) {
+        const uint64_t total = refused_http_budget_.fetch_add(1) + 1;
+        log_refusal(http_budget_refusal_log_, peer_ip, peer,
+                    "HTTP request answered 503: " + std::to_string(budget.handoffs)
+                        + " HTTP requests in progress (--stratum-http-budget)",
+                    "refused_http_budget_total", total);
+    } else if (refusal == HttpRefusal::Share) {
+        const uint64_t total = refused_http_share_.fetch_add(1) + 1;
+        log_refusal(http_share_refusal_log_, peer_ip, peer,
+                    "HTTP request answered 503: " + std::to_string(budget.per_key)
+                        + " HTTP requests in progress from one address, IPv6 /64 (--stratum-http-per-ip)",
+                    "refused_http_share_total", total);
+    }
+}
+
+size_t StratumServer::get_http_handoffs() const
+{
+    std::lock_guard<std::mutex> lk(http_state_->mutex);
+    return http_state_->handoffs;
+}
+
+size_t StratumServer::get_http_handoffs_peak() const
+{
+    std::lock_guard<std::mutex> lk(http_state_->mutex);
+    return http_state_->handoffs_peak;
+}
+
+size_t StratumServer::get_http_handoff_keys() const
+{
+    std::lock_guard<std::mutex> lk(http_state_->mutex);
+    return http_state_->handoff_per_key.size();
+}
+
+namespace {
+// Printable ASCII only, at most `max` bytes.
+std::string printable(const std::string& in, std::size_t max)
+{
+    std::string out;
+    for (char c : in) {
+        if (out.size() >= max) { out += "..."; break; }
+        out += (c >= 0x20 && c < 0x7f) ? c : '?';
+    }
+    return out;
+}
+}  // namespace
+
+std::function<void(const std::string&, const std::string&, unsigned)>
+StratumServer::http_response_logger(const std::string& peer_ip) const
+{
+    return [st = http_state_, peer_ip](const std::string& method, const std::string& target,
+                                       unsigned status) {
+        const std::string what = printable(method, 16) + " " + printable(target, 120)
+                               + " -> " + std::to_string(status);
+        std::lock_guard<std::mutex> lk(st->mutex);
+        const auto now = RefusalLogLimiter::clock::now();
+        if (auto summary = st->log.flush(now)) {
+            LOG_INFO << "HTTP requests on stratum port: " << *summary;
+            st->log_lines.fetch_add(1);
+        }
+        if (st->log.record(now, peer_ip, what)) {
+            LOG_INFO << "HTTP request on stratum port from "
+                     << (peer_ip.empty() ? std::string("?") : peer_ip) << ": " << what
+                     << " (the next 60 s are counted, and summarised with the first request after)";
+            st->log_lines.fetch_add(1);
+        }
+    };
+}
+
+std::function<void(const std::string&)>
+StratumServer::http_error_logger(const std::string& peer_ip) const
+{
+    return [st = http_state_, peer_ip](const std::string& what_failed) {
+        const std::string what = printable(what_failed, 160);
+        std::lock_guard<std::mutex> lk(st->mutex);
+        const auto now = RefusalLogLimiter::clock::now();
+        if (auto summary = st->err_log.flush(now)) {
+            LOG_WARNING << "HTTP requests on stratum port failed: " << *summary;
+            st->error_log_lines.fetch_add(1);
+        }
+        if (st->err_log.record(now, peer_ip, what)) {
+            LOG_WARNING << "HTTP request on stratum port from "
+                        << (peer_ip.empty() ? std::string("?") : peer_ip) << " failed: " << what
+                        << " (the next 60 s are counted, and summarised with the first failure after)";
+            st->error_log_lines.fetch_add(1);
+        }
+    };
 }
 
 StratumServer::~StratumServer()
@@ -218,17 +465,22 @@ void StratumServer::handle_accept(boost::system::error_code ec, tcp::socket sock
         const auto ip_key = per_ip ? per_ip_cap_key(ep.address()) : boost::asio::ip::address{};
         size_t live = 0;
         size_t from_ip = 0;
+        // An HTTP connection taken from this port (core/stratum_http.hpp) is
+        // not a session; while open it counts toward both caps.
+        size_t http_live = 0;
         std::vector<std::pair<std::shared_ptr<StratumSession>, const char*>> reclaimed;
         if (cap > 0 || per_ip) {
             std::lock_guard<std::mutex> lock(sessions_mutex_);
+            http_live = http_state_->total();
+            const size_t http_from_ip = per_ip ? http_state_->from(ip_key) : 0;
             auto count_from_ip = [&] {
-                size_t n = 0;
+                size_t n = http_from_ip;
                 for (const auto& s : sessions_)
                     if (s->is_connected() && per_ip_cap_key(s->peer_address()) == ip_key)
                         ++n;
                 return n;
             };
-            if ((cap > 0 && sessions_.size() >= cap)
+            if ((cap > 0 && sessions_.size() + http_live >= cap)
                 || (per_ip && count_from_ip() >= ip_cap)) {
                 for (auto it = sessions_.begin(); it != sessions_.end(); ) {
                     if (!(*it)->is_connected()) {
@@ -241,7 +493,7 @@ void StratumServer::handle_accept(boost::system::error_code ec, tcp::socket sock
                     }
                 }
             }
-            live = sessions_.size();
+            live = sessions_.size() + http_live;
             if (per_ip)
                 from_ip = count_from_ip();
         }
@@ -261,6 +513,7 @@ void StratumServer::handle_accept(boost::system::error_code ec, tcp::socket sock
             const uint64_t total = refused_connections_.fetch_add(1) + 1;
             log_refusal(cap_refusal_log_, peer_ip, peer,
                         "node at miner cap " + std::to_string(live) + "/" + std::to_string(cap)
+                            + (http_live ? " incl. " + std::to_string(http_live) + " HTTP" : std::string{})
                             + " (max_stratum_connections)",
                         "refused_total", total);
             boost::system::error_code ignore;
@@ -324,7 +577,8 @@ void StratumServer::arm_refusal_log_timer()
     if (!running_)
         return;
     std::optional<RefusalLogLimiter::clock::time_point> next;
-    for (const auto* lim : {&cap_refusal_log_, &per_ip_refusal_log_})
+    for (const auto* lim : {&cap_refusal_log_, &per_ip_refusal_log_,
+                            &http_budget_refusal_log_, &http_share_refusal_log_})
         if (auto d = lim->due(); d && (!next || *d < *next))
             next = d;
     // Armed already for this summary or an earlier one: keep it.
@@ -352,6 +606,16 @@ void StratumServer::flush_refusal_logs()
     if (auto summary = per_ip_refusal_log_.flush(now)) {
         LOG_WARNING << "Stratum connections refused: " << *summary
                     << " refused_per_ip_total=" << refused_per_ip_.load();
+        refusal_lines_logged_.fetch_add(1);
+    }
+    if (auto summary = http_budget_refusal_log_.flush(now)) {
+        LOG_WARNING << "Stratum connections refused: " << *summary
+                    << " refused_http_budget_total=" << refused_http_budget_.load();
+        refusal_lines_logged_.fetch_add(1);
+    }
+    if (auto summary = http_share_refusal_log_.flush(now)) {
+        LOG_WARNING << "Stratum connections refused: " << *summary
+                    << " refused_http_share_total=" << refused_http_share_.load();
         refusal_lines_logged_.fetch_add(1);
     }
     arm_refusal_log_timer();   // the other cap's summary may fall due later
@@ -639,6 +903,17 @@ void StratumSession::read_message()
         [self](boost::system::error_code ec, std::size_t bytes_read)
         {
             if (!ec) {
+                if (!self->first_line_seen_) {
+                    // RFC 9112 2.2: empty lines before a request line are
+                    // ignored (at most 4, while HTTP is on).
+                    if (self->skip_leading_blank_line(bytes_read))
+                        return self->read_message();
+                    self->first_line_seen_ = true;
+                    // An HTTP request line: handed off, this session stops
+                    // reading.
+                    if (self->try_http_handoff(bytes_read))
+                        return;
+                }
                 self->process_message(bytes_read);
                 self->read_message();  // Continue reading
             } else {
@@ -738,6 +1013,151 @@ void StratumSession::process_message(std::size_t bytes_read)
         LOG_ERROR << "Error processing Stratum message: " << e.what();
         send_error(-2, "Invalid JSON", nlohmann::json{});
     }
+}
+
+bool StratumSession::skip_leading_blank_line(std::size_t bytes_read)
+{
+    static constexpr int kMaxLeadingBlankLines = 4;
+    if (!server_ || blank_lines_skipped_ >= kMaxLeadingBlankLines
+        || !(bytes_read == 1 || bytes_read == 2))
+        return false;
+    const char* bytes = static_cast<const char*>(buffer_.data().data());
+    const bool blank = bytes_read == 1 ? bytes[0] == '\n' : (bytes[0] == '\r' && bytes[1] == '\n');
+    if (!blank || !server_->http_on())
+        return false;
+    buffer_.consume(bytes_read);
+    ++blank_lines_skipped_;
+    return true;
+}
+
+bool StratumSession::try_http_handoff(std::size_t bytes_read)
+{
+    if (!server_)
+        return false;
+    // The first line is the front of buffer_ (async_read_until's bytes_read
+    // includes its '\n'); boost::asio::streambuf keeps its input contiguous.
+    const auto data = buffer_.data();
+    const char* bytes = static_cast<const char*>(data.data());
+    const std::size_t buffered = data.size();
+    std::string_view line(bytes, std::min(bytes_read, buffered));
+    if (!line.empty() && line.back() == '\n')
+        line.remove_suffix(1);
+    if (!looks_like_http_request_line(line))
+        return false;
+    auto http = server_->http_config();
+    if (!http.on)
+        return false;   // --stratum-http off: an invalid stratum line, as before
+
+    // Request line parts for the 503 answer and its log line.
+    std::string method, target;
+    {
+        std::string_view l = line;
+        if (!l.empty() && l.back() == '\r') l.remove_suffix(1);
+        const auto sp = l.find(' ');
+        const auto sp2 = l.rfind(' ');
+        method = std::string(l.substr(0, sp));
+        target = std::string(l.substr(sp + 1, sp2 - sp - 1));
+        const auto q = target.find('?');
+        if (q != std::string::npos) target.resize(q);   // never log a query (?token=)
+    }
+
+    // From here the connection is HTTP: its slot under the caps is taken
+    // before it leaves the sessions; it is not a miner session; the stratum
+    // timers are cancelled. With a web handler the slot is a hand-off slot
+    // when the hand-off budget and this address's share allow one
+    // (StratumServer::try_acquire_http_handoff), else a plain slot and a busy
+    // 503; with no handler, a plain slot and the not-served 503.
+    const auto& cfg = mining_interface_->get_stratum_config();
+    auto req = std::make_shared<StratumHttpRequest>(StratumHttpRequest{
+        tcp::socket(socket_.get_executor()), {}, {}, {}, {}, {}, {}});
+    const std::string peer_ip =
+        peer_address_.is_unspecified() ? std::string{} : peer_address_.to_string();
+    auto refusal = StratumServer::HttpRefusal::None;
+    if (http.handler) {
+        auto handoff = server_->try_acquire_http_handoff(peer_address_, cfg.max_stratum_connections,
+                                                         http.limits);
+        refusal = handoff.refusal;
+        req->slot = handoff.slot ? std::move(handoff.slot) : server_->acquire_http_slot(peer_address_);
+    } else {
+        req->slot = server_->acquire_http_slot(peer_address_);
+    }
+    req->on_response = server_->http_response_logger(peer_ip);
+    req->on_error = server_->http_error_logger(peer_ip);
+    server_->unregister_session(shared_from_this());
+    work_push_timer_.cancel();
+    handshake_timer_.cancel();
+
+    // The stratum handshake deadline, counted from the accept, ends the whole
+    // exchange: the request, its answer and the close. Already past: closed,
+    // nothing counted.
+    req->handed_off_at = std::chrono::steady_clock::now();
+    if (cfg.handshake_timeout_sec > 0) {
+        req->deadline = connected_at_ + std::chrono::seconds(cfg.handshake_timeout_sec);
+        if (*req->deadline <= req->handed_off_at) {
+            boost::system::error_code ignore;
+            socket_.close(ignore);
+            return true;
+        }
+    }
+
+    req->head.assign(bytes, buffered);
+    buffer_.consume(buffered);
+    req->socket = std::move(socket_);
+
+    if (refusal != StratumServer::HttpRefusal::None) {
+        server_->record_http_refusal(refusal, peer_ip, cfg.max_stratum_connections, http.limits);
+        answer_http_unavailable(std::move(req), method, target, StratumHttpUnavailable::Busy);
+        return true;
+    }
+    if (http.handler && http.handler(*req))
+        return true;
+    answer_http_unavailable(std::move(req), method, target, StratumHttpUnavailable::NotServed);
+    return true;
+}
+
+void StratumSession::answer_http_unavailable(std::shared_ptr<StratumHttpRequest> req,
+                                             const std::string& method,
+                                             const std::string& target,
+                                             StratumHttpUnavailable kind)
+{
+    // A fixed 503 of at most 300 bytes with the web port's security headers,
+    // then the close, written on this io_context. NotServed: no web server to
+    // answer (--stratum-http=true on a node without one, or it is stopping or
+    // declined). Busy: the hand-off budget or the per-address share is in use.
+    // The write is closed at min(req->deadline, write start +
+    // kStratumHttpUnavailableWriteTimeout).
+    const std::string body = stratum_http_unavailable_body(kind);
+    auto msg = std::make_shared<std::string>(
+        "HTTP/1.1 503 Service Unavailable\r\n"
+        "Content-Type: application/json\r\n"
+        "X-Content-Type-Options: nosniff\r\n"
+        "X-Frame-Options: DENY\r\n"
+        "Referrer-Policy: no-referrer\r\n"
+        "Content-Length: " + std::to_string(body.size()) + "\r\n"
+        "Connection: close\r\n"
+        "\r\n" + (method == "HEAD" ? std::string{} : body));
+    if (req->on_response)
+        req->on_response(method, target, 503);
+    auto& sock = req->socket;
+    auto timer = std::make_shared<boost::asio::steady_timer>(sock.get_executor());
+    auto at = std::chrono::steady_clock::now() + kStratumHttpUnavailableWriteTimeout;
+    if (req->deadline)
+        at = std::min(at, *req->deadline);
+    timer->expires_at(at);
+    timer->async_wait([req](boost::system::error_code ec) {
+        if (ec)
+            return;
+        boost::system::error_code ignore;
+        req->socket.shutdown(tcp::socket::shutdown_both, ignore);
+        req->socket.close(ignore);
+    });
+    boost::asio::async_write(sock, boost::asio::buffer(*msg),
+        [req, msg, timer](boost::system::error_code, std::size_t) {
+            timer->cancel();
+            boost::system::error_code ignore;
+            req->socket.shutdown(tcp::socket::shutdown_both, ignore);
+            req->socket.close(ignore);
+        });
 }
 
 nlohmann::json StratumSession::handle_subscribe(const nlohmann::json& params, const nlohmann::json& request_id)

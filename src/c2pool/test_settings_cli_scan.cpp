@@ -14,6 +14,7 @@
 #include <cstring>
 #include <iostream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "core/param_catalog.hpp"
@@ -133,6 +134,21 @@ int main() {
         scan_cli((int)p.size(), p.data(), Bin::BIN_DASH, tr, rc);
         CHECK(tr.has("utility.dump_mn_checkpoint"), "dash --dump-mn-checkpoint marks canon");
         CHECK(tr.has("meta.run"), "dash --run after TWO_ARGS still recognised (H FILE consumed)");
+    }
+
+    // (7) An enum row with the --flag / --flag=VALUE spelling (--stratum-http):
+    //     the bare flag mirrors "true", an inline value is kept as written.
+    for (const auto& [arg, want] : std::vector<std::pair<std::string, std::string>>{
+             {"--stratum-http", "true"}, {"--stratum-http=false", "false"},
+             {"--stratum-http=auto", "auto"}, {"--stratum-http=on", "on"}}) {
+        std::vector<std::string> s = {"prog", arg, "--web-port", "7"};
+        std::vector<char*> p; for (auto& x : s) p.push_back(const_cast<char*>(x.c_str()));
+        CliTracker tr; ResolvedConfig rc; rc.seed_compiled_defaults(C_LTC);
+        scan_cli((int)p.size(), p.data(), Bin::BIN_LTC, tr, rc);
+        CHECK(tr.has("stratum.http"), "ltc " + arg + " marks stratum.http");
+        CHECK(rc.get_string("stratum.http").value_or("") == want, "ltc " + arg + " -> stratum.http=" + want);
+        CHECK(rc.source_of("stratum.http") == Source::Cli, "ltc " + arg + " source=cli");
+        CHECK(rc.get_string("web.port").value_or("") == "7", "ltc " + arg + " consumes no value token");
     }
 
     if (g_fail == 0) std::cout << "\ntest_settings_cli_scan: ALL PASS\n";

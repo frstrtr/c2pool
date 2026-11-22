@@ -15,6 +15,7 @@
 #include <set>
 #include <map>
 #include <unordered_map>
+#include <vector>
 #include <array>
 #include <iomanip>
 #include <sstream>
@@ -33,6 +34,7 @@
 #include <core/hashrate_ring.hpp>
 #include <core/featured_node.hpp>
 #include <core/stratum_types.hpp>
+#include <core/stratum_http.hpp>
 #include <core/hashing_elsewhere.hpp>
 #include <core/stratum_work_source.hpp>
 #include <c2pool/payout/payout_manager.hpp>
@@ -67,16 +69,63 @@ using tcp = net::ip::tcp;
 class MiningInterface;
 class StratumServer;
 
+/// How an HttpSession serves its connection. The default is the web port.
+struct HttpSessionOptions {
+    /// The connection came in on the stratum port (core/stratum_http.hpp):
+    /// - GET and HEAD only; any other method 405 (Allow: GET, HEAD);
+    /// - no request is direct local, whatever the peer address: the local-only
+    ///   and loopback-only routes answer it as a remote client (403);
+    /// - /sharechain/stream: 405 with an empty Allow, never handed off;
+    /// - one response per connection; a body of at most kStratumPortBodyLimit
+    ///   bytes.
+    bool stratum_port = false;
+    /// The response write is closed at write start + write_timeout, whatever
+    /// it has sent: a whole-write bound counted from the write start stored
+    /// once per response, not a progress window. One term of the write
+    /// deadline's min(). 0: no term. On the stratum port
+    /// WebServer::adopt_stratum_http sets it to the web idle timeout, and to
+    /// 30 s when that is 0.
+    std::chrono::milliseconds write_timeout{0};
+    /// When the request started (the stratum hand-off): the read deadlines
+    /// count from here. {}: from run().
+    std::chrono::steady_clock::time_point started{};
+    /// The owner's end of the whole exchange (the stratum handshake deadline),
+    /// fixed at construction. Every expiry the session arms, reading or
+    /// writing, is min(that expiry, deadline); a session that runs at or
+    /// after it closes without reading. nullopt: none.
+    std::optional<std::chrono::steady_clock::time_point> deadline;
+    /// With `deadline`, on the stratum port: at the deadline a timer on the
+    /// stratum io_context shuts the connection down (both directions); the
+    /// session marks it closed before it closes the socket, and the slot is
+    /// released when it does.
+    std::shared_ptr<StratumHttpDeadlineShutdown> deadline_shutdown;
+    /// Called once per response with the method, the target without its
+    /// query string, and the status.
+    std::function<void(const std::string& method, const std::string& target, unsigned status)> on_response;
+    /// Called instead of the per-error warning with where and why the request
+    /// failed.
+    std::function<void(const std::string& what)> on_error;
+};
+
 /// HTTP Session handler for incoming connections
 class HttpSession : public std::enable_shared_from_this<HttpSession>
 {
-    // The session's place under WebServer's HTTP cap: declared first, so it
-    // is released after the socket is closed.
+    // The slot the session holds: on the web port its place under WebServer's
+    // HTTP cap, on the stratum port its place under the stratum caps
+    // (StratumServer::acquire_http_slot). Declared first: released after the
+    // socket is closed, when the session ends.
     std::shared_ptr<void> slot_;
     tcp::socket socket_;
     beast::flat_buffer buffer_;
     http::request<http::string_body> request_;
     std::shared_ptr<MiningInterface> mining_interface_;
+    HttpSessionOptions opts_;
+    bool head_request_{false};   // HEAD: the GET response's header, no body
+    // Writing the response: closed at the expiry arm_write_deadline() sets.
+    // write_started_: set once per response, by begin_write().
+    net::steady_timer write_deadline_;
+    std::chrono::steady_clock::time_point write_started_{};
+    bool writing_{false};
     // Reading the request: the parser (beast's default limits, as
     // http::async_read: an 8 KB head, a 1 MB body) and its deadlines. The
     // connection is closed when no byte arrives for idle_timeout_, or when
@@ -93,21 +142,52 @@ class HttpSession : public std::enable_shared_from_this<HttpSession>
 public:
     static constexpr std::chrono::milliseconds kIdleTimeout{30000};
     static constexpr std::chrono::milliseconds kRequestTimeout{120000};
+    /// Request body bound on the stratum port.
+    static constexpr std::uint64_t kStratumPortBodyLimit = 4096;
 
     explicit HttpSession(tcp::socket socket, std::shared_ptr<MiningInterface> mining_interface,
                          std::shared_ptr<void> slot = {},
                          std::chrono::milliseconds idle_timeout = kIdleTimeout,
-                         std::chrono::milliseconds request_timeout = kRequestTimeout);
-    void run();
+                         std::chrono::milliseconds request_timeout = kRequestTimeout,
+                         HttpSessionOptions options = {});
+    ~HttpSession();
+    HttpSession(const HttpSession&) = delete;
+    HttpSession& operator=(const HttpSession&) = delete;
+    /// Serve one request. `initial`: bytes already read from the socket (the
+    /// stratum port's sniff), parsed before anything more is read.
+    void run(std::string initial = {});
+    /// Close the connection and release its slot now. Called only once the
+    /// HTTP thread has been joined.
+    void abandon();
 
 private:
     void read_request();
+    // Feed buffer_ to the parser; then answer, read more, or end on an error.
+    void on_bytes(std::size_t bytes_transferred);
     void arm_deadline();
     void end_reading();
+    // `at`, or opts_.deadline when that is earlier.
+    std::chrono::steady_clock::time_point no_later_than_owner(
+        std::chrono::steady_clock::time_point at) const;
+    // Stores the write start, then arms the write deadline. Once per response.
+    void begin_write();
+    // The write deadline: min(opts_.deadline, write_started_ +
+    // opts_.write_timeout), each term when set; none when neither is. Every
+    // call gives the same expiry.
+    void arm_write_deadline();
+    void end_writing();
+    // Mark the connection closed (opts_.deadline_shutdown), then shut down and
+    // close the socket.
+    void close_socket();
     void process_request();
+    // The status line and headers every response carries (server, content
+    // type, CORS when configured, security headers).
+    http::response<http::string_body> base_response(http::status status) const;
     void send_response(http::response<http::string_body> response);
     void handle_error(beast::error_code ec, char const* what);
     bool is_direct_local() const;
+    // Test access (core_test).
+    friend struct HttpSessionTestAccess;
 };
 
 /// True when an HTTP request came straight from this host: the peer address
@@ -3123,7 +3203,7 @@ class WebServer
     std::string bind_address_;
     uint16_t port_;
     uint16_t stratum_port_;  // Explicit Stratum port configuration
-    bool running_;
+    std::atomic<bool> running_;   // read by the HTTP thread's loop
     bool rpc_refresh_armed_{false};
     uint256 last_parent_block_;   // refresh_on_parent_block dedup
     bool testnet_;
@@ -3137,6 +3217,22 @@ class WebServer
     std::atomic<int64_t> http_request_timeout_ms_{HttpSession::kRequestTimeout.count()};
     std::thread server_thread_;
     std::unique_ptr<StratumServer> stratum_server_;
+    // HTTP on the stratum port (core/stratum_http.hpp): the mode this
+    // server's own stratum acceptor resolves (--stratum-http), whether the
+    // HTTP thread is serving, and the gate a stratum server's handler goes
+    // through (cleared in stop(); a cleared gate declines).
+    StratumHttpMode stratum_http_mode_ = StratumHttpMode::Off;
+    StratumHttpLimits stratum_http_limits_{};
+    std::atomic<bool> http_serving_{false};
+    struct StratumHttpGate {
+        std::mutex mutex;
+        WebServer* web = nullptr;
+    };
+    std::shared_ptr<StratumHttpGate> stratum_http_gate_ = std::make_shared<StratumHttpGate>();
+    // The stratum-port sessions handed to the HTTP thread (weak): stop()
+    // closes the ones still open and releases their slots.
+    std::mutex stratum_http_sessions_mutex_;
+    std::vector<std::weak_ptr<HttpSession>> stratum_http_sessions_;
 
     // Solo mining configuration
     bool solo_mode_;
@@ -3216,6 +3312,24 @@ public:
     }
     size_t http_sessions() const { return http_live_->load(); }
 
+    /// --stratum-http for the stratum acceptor this server starts itself
+    /// (start() / start_solo(): the LTC lane). Set before start().
+    void set_stratum_http_mode(StratumHttpMode mode) { stratum_http_mode_ = mode; }
+    /// --stratum-http-budget / --stratum-http-per-ip for that acceptor. Set
+    /// before start().
+    void set_stratum_http_limits(StratumHttpLimits limits) { stratum_http_limits_ = limits; }
+    StratumHttpMode get_stratum_http_mode() const { return stratum_http_mode_; }
+    /// The HTTP listener is up and its thread is serving.
+    bool is_http_serving() const { return http_serving_.load(); }
+    const std::string& get_bind_address() const { return bind_address_; }
+    /// The handler a StratumServer hands HTTP connections to: each is served
+    /// by an HttpSession on this server's HTTP thread, in stratum-port mode
+    /// (HttpSessionOptions::stratum_port). It declines (false) while this
+    /// server is not serving or after it stopped.
+    StratumHttpHandler stratum_http_handler();
+    /// The stratum server's own StratumServer (null when not started).
+    StratumServer* get_stratum_server() const { return stratum_server_.get(); }
+
     // Dashboard directory for static file serving
     void set_dashboard_dir(const std::string& dir);
     void set_analytics_id(const std::string& id);
@@ -3279,6 +3393,8 @@ public:
 private:
     void accept_connections();
     void handle_accept(beast::error_code ec, tcp::socket socket);
+    // Move a stratum-port HTTP connection onto the HTTP thread and serve it.
+    bool adopt_stratum_http(StratumHttpRequest& req);
     // Body of a debounced work refresh (capture prev tip → refresh → caches →
     // SSE). Runs on the leading edge and on the trailing coalesced timer.
     void execute_debounced_work_refresh(core::RefreshCause cause);
@@ -3287,6 +3403,23 @@ private:
 };
 
 // StratumSession and StratumServer — see stratum_server.hpp
+
+/// Turn HTTP on the stratum port on or off for `stratum` (core/stratum_http.hpp)
+/// and log the resolved state ("stratum HTTP: ON (web bound to 0.0.0.0)"):
+/// `web` is the node's web server (null when it has none); auto follows its
+/// bind address and the stratum server's (resolve_stratum_http). Returns the
+/// decision. Call once both are set up (after web->start()); until then the
+/// stratum port keeps the legacy behaviour. `limits`: --stratum-http-budget
+/// and --stratum-http-per-ip (stratum_http_budget).
+StratumHttpDecision configure_stratum_http(StratumServer& stratum, WebServer* web,
+                                           StratumHttpMode mode,
+                                           StratumHttpLimits limits = StratumHttpLimits{});
+
+/// A timer on `stratum_executor` that calls shutdown->fire() at `at`;
+/// shutdown->mark_closed() cancels it.
+void arm_stratum_http_deadline_shutdown(const net::any_io_executor& stratum_executor,
+                                        std::chrono::steady_clock::time_point at,
+                                        std::shared_ptr<StratumHttpDeadlineShutdown> shutdown);
 
 /// Per-coin payout-scheme relabel of one served static text asset (used only
 /// when MiningInterface::get_payout_scheme_label() is non-empty). Every literal

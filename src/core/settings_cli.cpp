@@ -114,6 +114,13 @@ void scan_cli(int argc, char** argv, Bin bin, CliTracker& tracker,
             if (k == 0) first_value = argv[i];
         }
         bool eqfalse = has_eq && (optval == "false" || optval == "0" || optval == "off");
+        // An enum row spelled --flag / --flag=VALUE (--stratum-http): the bare
+        // flag is "true", the inline value is kept as written.
+        if (style == AliasStyle::FLAG_OPT_EQFALSE && row->type == PType::ENUM_STR) {
+            if (!row->is_compile_readonly())
+                rc.set(row->canon, has_eq ? optval : std::string("true"), Source::Cli);
+            continue;
+        }
         set_cli_value(rc, *row, style, first_value, eqfalse);
     }
 }
