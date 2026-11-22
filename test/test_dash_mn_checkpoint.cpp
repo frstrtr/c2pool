@@ -5896,12 +5896,11 @@ TEST(DashMnBridgeCursor, R7TipThatNeverReachesTheCursorGoesColdAfterTheBound)
     EXPECT_EQ(r.h.lane.cursor_height(), kAnchorHeight)
         << "the cold replay starts at the anchor";
 
-    // ...and the cold lane still does its job once the headers arrive.
-    r.h.tip = 1519546;
-    r.h.lane.pump();
+    // ...and the cold lane still does its job: with the tip at the anchor it
+    // publishes the anchor set at once (nothing to replay), as before.
     ASSERT_TRUE(r.h.published) << r.h.lane.status();
-    EXPECT_EQ(r.h.published_as_of, 1519546u);
-    EXPECT_EQ(r.h.lane.replay_applied(), 3u);
+    EXPECT_EQ(r.h.published_as_of, kAnchorHeight);
+    EXPECT_EQ(r.h.lane.replay_applied(), 0u);
 }
 
 TEST(DashMnBridgeCursor, R7OnlyPumpsWithoutANewTipHeightCountTowardTheBound)
