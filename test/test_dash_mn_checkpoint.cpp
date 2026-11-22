@@ -5667,6 +5667,18 @@ std::map<uint256, MNState> as_map(
     return std::map<uint256, MNState>(v.begin(), v.end());
 }
 
+/// Byte-exact MNState comparison through the record's own encoder. Unlike
+/// MNState::operator== it covers EVERY persisted field (collateralOutpoint,
+/// netInfo and the v24 block included), so a resume that drifts in a field
+/// operator== does not look at still fails here.
+std::vector<unsigned char> mnstate_bytes(const MNState& st)
+{
+    auto stream = ::pack(st);
+    auto sp = stream.get_span();
+    const auto* b = reinterpret_cast<const unsigned char*>(sp.data());
+    return std::vector<unsigned char>(b, b + sp.size());
+}
+
 } // namespace
 
 // ── 1. THE CLAIM: a restart RESUMES ────────────────────────────────────────
@@ -5745,6 +5757,10 @@ TEST(DashMnBridgeCursor, ResumedBridgePublishesExactlyWhatAContinuousOneDoes)
             << "resumed state differs for " << hash.GetHex().substr(0, 16)
             << " — nLastPaidHeight " << got.at(hash).nLastPaidHeight
             << " vs " << st.nLastPaidHeight;
+        EXPECT_EQ(mnstate_bytes(got.at(hash)), mnstate_bytes(st))
+            << "resumed state differs byte-for-byte for "
+            << hash.GetHex().substr(0, 16)
+            << " (a field outside MNState::operator==)";
     }
 
     // ...and so must the LIFETIME accounting. This is the half that catches a
