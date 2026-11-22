@@ -26,6 +26,19 @@
     // cross-origin pools (requires CORS headers, already present in web.py).
     window.multipoolApiBase = '';
 
+    // ── Pinned API base (?api=/api/<id>) ─────────────────────────────────
+    // A page opened with ?api=/api/<id> (dual.html frames each dashboard this
+    // way) talks to that one same-origin route only: no pool tabs, no stored
+    // pool switching. Anything that is not a plain /api/<id> path is ignored.
+    window._multipoolPinned = false;
+    try {
+        var pinned = new URLSearchParams(window.location.search).get('api');
+        if (pinned && /^\/api\/[a-z0-9_-]{1,32}$/.test(pinned)) {
+            window.multipoolApiBase = pinned;
+            window._multipoolPinned = true;
+        }
+    } catch (e) { /* no URLSearchParams: stay on the default */ }
+
     // ── d3.json override ─────────────────────────────────────────────────
     // Transparently routes relative API calls (../foo) and absolute path
     // calls (/foo) through the active pool's base URL when cross-origin
@@ -232,6 +245,13 @@
 
     // ── Auto-detect: try proxy first, then direct ────────────────────────
     function autoDetectCurrentPool() {
+        if (window._multipoolPinned) {
+            // One pool, fixed by the page URL: hide the tab strip and keep the
+            // header symbol filled from that pool's currency_info.
+            var tabs = document.getElementById('pool-tabs');
+            if (tabs) tabs.style.display = 'none';
+            return;
+        }
         var xhr = new XMLHttpRequest();
         xhr.open('GET', '/api/pools', true);
         xhr.timeout = 3000;
