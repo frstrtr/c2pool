@@ -430,6 +430,35 @@ TEST(StratumHttpSessions, AnHttpRequestIsNeverAStratumSession)
     EXPECT_TRUE(replied);
 }
 
+TEST(StratumHttpSwitch, AnUnsetFlagIsOff)
+{
+    // The default of --stratum-http is false: an HTTP request line on the
+    // stratum port is an invalid stratum line, as before. auto and true are
+    // unchanged.
+    EXPECT_EQ(core::stratum_http_mode_setting(), StratumHttpMode::Off);
+    {   // The web server's own stratum acceptor (the LTC lane), mode not set.
+        WebNode node;
+        node.mode = std::nullopt;
+        ASSERT_TRUE(node.start("0.0.0.0"));
+        EXPECT_EQ(node.web->get_stratum_http_mode(), StratumHttpMode::Off);
+        EXPECT_TRUE(answered_as_stratum("127.0.0.1", node.stratum_port));
+    }
+    {   // A separate stratum server (the other lanes), the process setting.
+        SplitNode node;
+        ASSERT_TRUE(node.start(true, core::stratum_http_mode_setting(), {}, "0.0.0.0", "0.0.0.0"));
+        EXPECT_FALSE(node.decision.on);
+        EXPECT_TRUE(answered_as_stratum("127.0.0.1", node.port));
+    }
+    for (const auto mode : {StratumHttpMode::Auto, StratumHttpMode::On}) {
+        WebNode node;
+        node.mode = mode;
+        ASSERT_TRUE(node.start("0.0.0.0"));
+        const auto r = exchange("127.0.0.1", node.stratum_port, request("GET", "/fee"));
+        ASSERT_TRUE(r.ok) << core::stratum_http_mode_name(mode) << ": '" << r.raw.substr(0, 120) << "'";
+        EXPECT_EQ(r.status, 200u) << core::stratum_http_mode_name(mode);
+    }
+}
+
 // ── The caps count HTTP connections ─────────────────────────────────────────
 
 TEST(StratumHttpCaps, NodeCapCountsAnOpenHttpRequest)

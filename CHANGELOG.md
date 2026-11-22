@@ -43,8 +43,8 @@
   treatment as one warning line per minute instead of one each.
 - `--stratum-http=true|false|auto` on every coin (settings key
   `stratum.http`, the same values, also on/off/yes/no/1/0; anything else is
-  refused with a warning and leaves the setting as it was), default `auto`:
-  on when the web server binds `::`, binds `0.0.0.0` and the stratum
+  refused with a warning and leaves the setting as it was), default `false`;
+  `auto`: on when the web server binds `::`, binds `0.0.0.0` and the stratum
   listener an IPv4 address, or binds the stratum listener's own non-loopback
   address; off when it binds loopback only (a reverse proxy in front decides
   what is public), binds one LAN or VPN address while the stratum port binds

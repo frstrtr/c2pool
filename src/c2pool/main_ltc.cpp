@@ -565,8 +565,8 @@ void print_help() {
     std::cout << "  --http-host HOST          HTTP server bind address (default: 0.0.0.0)\n";
     std::cout << "  --stratum-http[=true|false|auto]  Also answer the web API (GET/HEAD, read-only) on the\n";
     std::cout << "                            stratum port, as python p2pool did on its worker port; trackers\n";
-    std::cout << "                            poll http://host:<worker port>/global_stats (default: auto =\n";
-    std::cout << "                            on when the web server binds a non-loopback address)\n";
+    std::cout << "                            poll http://host:<worker port>/global_stats (default: false;\n";
+    std::cout << "                            auto = on when the web server binds a non-loopback address)\n";
     std::cout << "  --stratum-http-budget N   HTTP requests in progress on the stratum port at once: at most N\n";
     std::cout << "                            and at most max_stratum_connections - 1; others are answered 503\n";
     std::cout << "                            (default 16; 0 = every HTTP request on the stratum port is\n";
@@ -1061,7 +1061,7 @@ int main(int argc, char* argv[]) {
     // come from impl/ltc/stratum_defaults.hpp, which the KATs read too.
     core::StratumConfig stratum_config = ltc::default_stratum_config();
     // --stratum-http: the web API on the stratum port too (core/stratum_http.hpp)
-    core::StratumHttpMode stratum_http_mode = core::StratumHttpMode::Auto;
+    core::StratumHttpMode stratum_http_mode = core::StratumHttpMode::Off;
     // --stratum-http-budget / --stratum-http-per-ip (defaults 16 and 6)
     core::StratumHttpLimits stratum_http_limits;
 

@@ -344,7 +344,7 @@ C2P_PARAM("stratum.max_connections", Stratum, INT64, LIVE, C_LTC, LIT, "0", NONE
 C2P_PARAM("stratum.max_connections_per_ip", Stratum, INT64, LIVE, C_LTC, LIT, "0", NONE, "max stratum connections per source IP, one /64 for IPv6 (0=unlimited; rigs behind one NAT share an address)")
   C2P_ALIAS("stratum.max_connections_per_ip", BIN_LTC, "--max-stratum-connections-per-ip", VALUE)
 
-C2P_PARAM("stratum.http", Stratum, ENUM_STR, RESTART, C_ALL, NONE, "", ENUM_MEMBER, "also answer the web API (GET/HEAD, read-only) on the stratum port, as python p2pool did on its worker port: true, false or auto (also on/off/yes/no/1/0; unset = auto: on when the web server binds ::, binds 0.0.0.0 and the stratum listener an IPv4 address, or binds the stratum listener's own non-loopback address)")
+C2P_PARAM("stratum.http", Stratum, ENUM_STR, RESTART, C_ALL, LIT, "false", ENUM_MEMBER, "also answer the web API (GET/HEAD, read-only) on the stratum port, as python p2pool did on its worker port: true, false or auto (also on/off/yes/no/1/0; default false; auto: on when the web server binds ::, binds 0.0.0.0 and the stratum listener an IPv4 address, or binds the stratum listener's own non-loopback address)")
   C2P_ALIAS("stratum.http", BIN_DASH, "--stratum-http", FLAG_OPT_EQFALSE)
   C2P_ALIAS("stratum.http", BIN_LTC, "--stratum-http", FLAG_OPT_EQFALSE)
   C2P_ALIAS("stratum.http", BIN_BTC, "--stratum-http", FLAG_OPT_EQFALSE)

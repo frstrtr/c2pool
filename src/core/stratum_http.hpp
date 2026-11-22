@@ -16,7 +16,7 @@
 //   methods 405); no request is direct-local; every local-only, token-gated
 //   or state-changing route answers 403 whatever the token; the event stream
 //   answers 405; one response per connection.
-// - --stratum-http=true|false|auto (default auto). auto is on only when the
+// - --stratum-http=true|false|auto (default false). auto is on only when the
 //   stratum port reaches no interface the web server does not already listen
 //   on (resolve_stratum_http): off for a web server bound to loopback, to one
 //   LAN / VPN address while the stratum port binds wider or elsewhere, or to
@@ -132,10 +132,10 @@ inline bool is_loopback_bind_host(const std::string& host)
 
 /// The process's --stratum-http, for coin mains whose stratum and web servers
 /// are set up far from the command-line parse: the parse writes it, the
-/// wiring (configure_stratum_http) reads it. Default auto.
+/// wiring (configure_stratum_http) reads it. Default false (Off).
 inline StratumHttpMode& stratum_http_mode_setting()
 {
-    static StratumHttpMode mode = StratumHttpMode::Auto;
+    static StratumHttpMode mode = StratumHttpMode::Off;
     return mode;
 }
 

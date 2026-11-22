@@ -227,6 +227,7 @@ inline std::string request(const std::string& method, const std::string& target,
 
 /// A WebServer with its own stratum acceptor (the LTC lane's wiring, both on
 /// the web server's bind address); the stratum io_context runs on a thread.
+/// --stratum-http is `mode` (auto unless set; nullopt: the server's default).
 class WebNode {
 public:
     net::io_context ioc;
@@ -234,6 +235,7 @@ public:
     uint16_t web_port = 0;
     uint16_t stratum_port = 0;
     std::string bind;
+    std::optional<core::StratumHttpMode> mode = core::StratumHttpMode::Auto;
 
     /// configure: called after construction, before start() (stratum config,
     /// --stratum-http mode, ...).
@@ -245,6 +247,8 @@ public:
         for (int attempt = 0; attempt < 20; ++attempt) {
             stratum_port = free_port(bind_addr);
             web->set_stratum_port(stratum_port);
+            if (mode)
+                web->set_stratum_http_mode(*mode);
             configure(*web);
             if (web->start() && web->is_stratum_running())
                 break;

@@ -1048,7 +1048,7 @@ address (one /64 for IPv6); the others are answered 503 and close at once.
 `--stratum-http-budget 0` answers every HTTP request on the stratum port with
 503; `--stratum-http-per-ip 0` sets no limit below the budget.
 `--stratum-http=true|false|auto` (settings key `stratum.http`, same values;
-also on/off/yes/no/1/0), default `auto`: on when the web server binds `::`,
+also on/off/yes/no/1/0), default `false`; `auto`: on when the web server binds `::`,
 binds `0.0.0.0` and the stratum listener an IPv4 address, or binds the stratum
 listener's own non-loopback address; off when it binds `127.0.0.1` / `::1`
 behind a reverse proxy, binds one LAN or VPN address while the stratum port
@@ -1155,7 +1155,7 @@ legacy YAML key set.
 | `-w` / `--worker-port` | `stratum_port` | 9327 | Stratum mining port |
 | `--web-port` | `web_port` | 8080 | HTTP API / dashboard port |
 | `--http-host` | `http_host` | 0.0.0.0 | HTTP bind address |
-| `--stratum-http[=true\|false\|auto]` | `stratum_http` | auto | Also answer the read-only REST API on the stratum port (python p2pool parity); auto = on when the HTTP bind address is not loopback (the LTC stratum port binds the same address) |
+| `--stratum-http[=true\|false\|auto]` | `stratum_http` | false | Also answer the read-only REST API on the stratum port (python p2pool parity); auto = on when the HTTP bind address is not loopback (the LTC stratum port binds the same address) |
 | `--stratum-http-budget N` | `stratum_http_budget` | 16 | HTTP requests in progress on the stratum port at once, at most N and at most max_stratum_connections - 1; others are answered 503 (0 = every HTTP request on the stratum port is answered 503) |
 | `--stratum-http-per-ip N` | `stratum_http_per_ip` | 6 | HTTP requests in progress on the stratum port at once from one address, one /64 for IPv6: at most N; others are answered 503 (0 = no limit below `--stratum-http-budget`) |
 | `--coind-address` | `ltc_rpc_host` | 127.0.0.1 | Coin daemon RPC host |
@@ -1361,7 +1361,7 @@ dashd-attached default OFF)
 | `--stratum [HOST:]PORT` | off | Miner-facing Stratum listener. |
 | `--web-port PORT` (alias `--http-port`) | 8080 | Dashboard + JSON API; `0` disables. If it collides with the Stratum port it moves to stratum+1. |
 | `--web-host ADDR` | `0.0.0.0` | Dashboard bind interface. |
-| `--stratum-http[=true\|false\|auto]` | auto | Also answer the read-only JSON API on the Stratum port (python p2pool parity); auto = on when `--web-host` is `::`, is `0.0.0.0` with an IPv4 Stratum bind, or is the same non-loopback address as the Stratum bind. |
+| `--stratum-http[=true\|false\|auto]` | false | Also answer the read-only JSON API on the Stratum port (python p2pool parity); auto = on when `--web-host` is `::`, is `0.0.0.0` with an IPv4 Stratum bind, or is the same non-loopback address as the Stratum bind. |
 | `--stratum-http-budget N` | 16 | HTTP requests in progress on the Stratum port at once, at most N and at most max_stratum_connections - 1; others are answered 503 (0 = every HTTP request on the Stratum port is answered 503). |
 | `--stratum-http-per-ip N` | 6 | HTTP requests in progress on the Stratum port at once from one address, one /64 for IPv6: at most N; others are answered 503 (0 = no limit below `--stratum-http-budget`). |
 | `--dashboard-dir PATH` | `web-static` | Static dashboard root. |

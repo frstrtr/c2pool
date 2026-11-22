@@ -3221,7 +3221,7 @@ class WebServer
     // server's own stratum acceptor resolves (--stratum-http), whether the
     // HTTP thread is serving, and the gate a stratum server's handler goes
     // through (cleared in stop(); a cleared gate declines).
-    StratumHttpMode stratum_http_mode_ = StratumHttpMode::Auto;
+    StratumHttpMode stratum_http_mode_ = StratumHttpMode::Off;
     StratumHttpLimits stratum_http_limits_{};
     std::atomic<bool> http_serving_{false};
     struct StratumHttpGate {

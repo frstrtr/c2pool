@@ -20,8 +20,8 @@
 //   * a request whose headers never finish is closed at the stratum handshake
 //     deadline, with nothing written to it.
 //
-// They use only web server API that predates the stratum-port change; auto
-// (the default) is on for a web server bound to 0.0.0.0 or a LAN address.
+// WebNode sets --stratum-http=auto, which is on for a web server bound to
+// 0.0.0.0 or a LAN address.
 // The mode, the caps, the session accounting, the write deadline and the 503
 // path are covered by stratum_port_http_test.cpp.
 
