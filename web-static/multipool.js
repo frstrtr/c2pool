@@ -112,6 +112,7 @@
 
         if (window._multipoolProxyMode) {
             // In proxy mode, always use the proxy API route
+            if (!POOL_ID_RE.test(String(poolId))) return;
             window.multipoolApiBase = '/api/' + poolId;
         } else {
             // In direct mode, check if this pool is the current page's origin
@@ -272,7 +273,15 @@
         xhr.send();
     }
 
+    // A proxy pool id becomes part of a same-origin route (/api/<id>) and of
+    // element ids, so only plain ids are accepted; any other entry is skipped.
+    var POOL_ID_RE = /^[a-z0-9_-]{1,32}$/;
+
     function initFromProxy(proxyPools) {
+        proxyPools = proxyPools.filter(function(pool) {
+            return pool && typeof pool.id === 'string' && POOL_ID_RE.test(pool.id);
+        });
+        if (!proxyPools.length) { initFromDirect(); return; }
         window._multipoolProxyMode = true;
 
         // Register all pools from proxy with their backend URLs (for display)
@@ -291,7 +300,12 @@
             saveConfig(config);
         }
 
-        // Set API base to the active pool's proxy route
+        // Set API base to the active pool's proxy route (a stored id that is
+        // not a plain id falls back to the first listed pool).
+        if (!POOL_ID_RE.test(String(config.activePool))) {
+            config.activePool = proxyPools[0].id;
+            saveConfig(config);
+        }
         window.multipoolApiBase = '/api/' + config.activePool;
 
         renderTabs();
