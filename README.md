@@ -178,7 +178,7 @@ c2pool builds one binary per **parent chain** (`c2pool-<coin>`). Several parents
 | **DigiByte** (DGB) | Scrypt¹ | DOGE (embedded, `-DAUX_DOGE`) | Live, daemonless (`c2pool-dgb --run --coin-p2p-discover`; dgb.voidbind.com) — mainnet only, no testnet mode |
 | **Bitcoin Cash** (BCH) | SHA256d | — | Live, daemonless (`c2pool-bch --pool`; bch.voidbind.com) |
 | **BIP-110** (Knots BLAKE2b fork) | BLAKE2b² (SHA256d until height 961640) | — | **Experimental** (new fork; daemonless embedded; live on bip110.voidbind.com) — `c2pool-bip110 --run` |
-| **Monero** (XMR) | RandomX | none | **Experimental**, stagenet only (v37 lane; daemonless, several nodes, one owed ledger; `c2pool-v37-xmr`); mainnet fenced, see [docs/xmr-lane](docs/xmr-lane/README.md) |
+| **Monero** (XMR) | RandomX | none | **Experimental** (v37 lane, Path B payouts; `c2pool-v37-xmr`, can run daemonless; not in the release packages): regtest, stagenet and testnet run a pool; mainnet runs only `--follow-only` and needs `--i-understand-mainnet` even for that; see [docs/xmr-lane](docs/xmr-lane/README.md) |
 
 "Live" means a public voidbind node runs that per-coin binary with no coin
 daemon on the serve path. It is not a production-maturity claim: only the LTC
@@ -217,37 +217,40 @@ and does not yet exist, so the work can be judged on what it actually is.
   which does **not** touch the v37 consensus digest. Merged: the lane foundation
   (scaffold + vendored RandomX + X0 — PR #1500), buildable KAT-tested primitives
   (RandomX CI-gated — PR #1502), the monerod adapter + descriptor-finalize + receipt
-  envelope (PR #1503), and stratum + FCMP-fenced coinbase-settlement + carrier wire
-  (PR #1507). Goldens, real-RandomX verify, and the end-to-end KAT are **merged**
-  (PR #1512); a **single-node stagenet daemon is live** (monerod-bound, PRs
-  #1520 / #1529). Multi-node settlement commits one owed ledger (`owed_digest`)
-  with an on-chain credit cut (PRs #1697 / #1704); the earlier section-13
-  state-root draft (PR #1551) was closed in its favour. Every node recomputes the
-  lane coinbase and books a block that does not match as debit-only (PR #1884);
-  every consensus parameter is part of the pool identity (PR #1894); and old
-  balances drain from a capped slice of each block (PR #1895).
-  Since 2026-09-27 the lane also has: an installable node package with a
-  run-a-node guide (PR #1817, [docs/xmr-lane/RUN-A-NODE.md](docs/xmr-lane/RUN-A-NODE.md));
-  raindrops (sub-threshold work credited like shares) on by default (PR #1818); a built-in mainnet
-  bootstrap list, peer discovery and a persistent peer book (PRs #1819 / #1820);
-  repair below the vault horizon that survives restarts (PR #1824); a verify worker
-  pool for raindrops (PR #1839); a refusal of node-local settings that would split
-  the owed ledger on mainnet (PR #1872); and the node's fees disclosed in every
-  stratum login reply (PR #1880). The payout rules, fees and known limits are
-  written up in [docs/xmr-lane/payout-fairness.md](docs/xmr-lane/payout-fairness.md)
-  (PR #1879), and a public comparison with other decentralized pools is in
-  [docs/xmr-lane/comparison.md](docs/xmr-lane/comparison.md) (PR #1901).
-- **Rule upgrades without stopping the pool, voted by miners' work (designed, not
-  implemented).** Rule epochs are appended to the lane's history and activate by a
-  vote weighted by miners' finalized work. Each miner's work votes; by default the
-  vote is delegated to the node operator, and any miner can override it with one
-  word in a stock xmrig password. Old nodes hold instead of forking, and a fixed
-  constitution means earned balances cannot be reduced, delayed or redirected by
-  any vote. Today a rule change on the XMR lane is still a new pool genesis. The
-  design note is in PR #1908 (draft). The first slice, which fixes the pool identity
-  from a derived genesis and adds the epoch and vote sections to the wire and the
-  store, is in PR #1911 (draft). It is meant to be the last flag day before the
-  Monero mainnet genesis.
+  envelope (PR #1503), and stratum + carrier wire (PR #1507). Goldens,
+  real-RandomX verify, and the end-to-end KAT are **merged** (PR #1512).
+  Since the Path B flag day (PR #2010) the lane has one payout model, Path B: Work
+  Receipt Settlement (WRS), also called pay per receipt (PPR). There is no owed
+  ledger, no carried balance and no payout queue. Each pool block's coinbase pays
+  that block's full reward R, split across the Work Receipts in the block's
+  window, so the outputs sum to exactly R in every block. The window reaches back
+  from the block, in whole bins, until it holds work worth twice the Monero
+  network difficulty (less where a cap on its size applies). Each payee gets
+  floor(R × w_i / W), where w_i is its weight and W the window's total, and the
+  remainder goes one piconero each to the largest remainders. Every node rebuilds
+  each share's coinbase from the same window and rules (`src/impl/xmr/pathb/`,
+  PRs #1946 / #1950). The pool identity is derived from a Monero block and a
+  headline; the lane's rules are a separate digest that peers compare when they
+  connect. The node is `c2pool-v37-xmr` (`src/c2pool/v37/xmr/`, PRs #1992 /
+  #2010), and several nodes form one pool over its relay. The lane also has a
+  node package with a run-a-node guide (PR #1817,
+  [docs/xmr-lane/RUN-A-NODE.md](docs/xmr-lane/RUN-A-NODE.md)), peer discovery and
+  a persistent peer book (PR #1820), and the node's fees disclosed in every
+  stratum login reply (PR #1880). The earlier owed-ledger model and its rules
+  (PRs #1697 / #1704, #1872, #1884, #1894, #1895) are retired on this lane. Its
+  payout rules and a public comparison with other decentralized pools are in
+  [docs/xmr-lane/payout-fairness.md](docs/xmr-lane/payout-fairness.md) (PR #1879)
+  and [docs/xmr-lane/comparison.md](docs/xmr-lane/comparison.md) (PR #1901), both
+  written for the earlier owed-ledger model.
+- **Rule upgrades without stopping the pool, voted by miners' work (XMR lane).**
+  The lane's rules are numbered epochs. Each share carries a ballot, and the next
+  epoch activates only after shares holding three quarters of the work in one
+  vote window vote for it, and a grace period has passed. By default a node's
+  shares vote for an open upgrade unless its operator sets `--vote no`, and any
+  miner can override that with `vote=<n>` as the password in a stock xmrig. A
+  node that does not run the new rules holds instead of forking. The pool
+  identity does not change with the rules (PR #1962, wired at the Path B flag
+  day, PR #2010). Every build today compiles only the first epoch.
 - **Reference prototypes** under `proto/` (TLA⁺, MRR refimpl + goldens, the M4 sync
   feasibility harness, testbeds) and the v37 design-track spec/headers under
   `src/sharechain/v37/`. These are for study and reproduction, not deployment.
@@ -268,21 +271,23 @@ and does not yet exist, so the work can be judged on what it actually is.
 ### What does NOT yet exist — the honest gaps
 - **Not wired into a production node.** Outside the XMR lane, the v37 engine is a
   **reference/prototype behind CI** and nothing settles on a live network. The
-  XMR lane settles on Monero stagenet in the author's multi-node test runs; it is
+  XMR lane's node can run a pool on Monero regtest, stagenet and testnet; it is
   not in production anywhere.
-- **No public v37 network.** The XMR lane runs on Monero stagenet in test runs;
-  the other lanes exercise **simnet / loopback only**.
+- **No public v37 network.** The XMR lane's pool mode is for Monero's test
+  networks only; the other lanes exercise **simnet / loopback only**.
 - **No performance benchmark.** The only performance artifact is a Python
   *feasibility* harness (M4). There is **no benchmark of the real engine**;
   throughput, latency, and scaling claims are **unproven** until one exists.
-- **XMR lane is stagenet only.** Its RandomX verify runs CI-gated in light mode;
-  the XMR PayoutDescriptor kind-bytes (0x10 / 0x11) are activated add-only (PR
-  #1518). Three daemonless nodes have run together on stagenet in day-long
-  capstone tests (PRs #1697 / #1704 / #1857); no multi-node run has yet met the
-  full capstone bar. Attempt 9 started on 2026-10-03 at 09:36 UTC (24 hours).
-  Mainnet stays double-fenced. Funding for the mainnet milestone is requested in
-  Monero CCS proposal !699 (25 XMR), which is on the agenda of the Monero community
-  workgroup meeting of 2026-10-03.
+- **XMR lane has no mainnet pool mode.** Its RandomX verify runs CI-gated in
+  light mode; the XMR PayoutDescriptor kind-bytes (0x10 / 0x11) are activated
+  add-only (PR #1518). On mainnet the node runs only `--follow-only`, and needs
+  `--i-understand-mainnet` even for that. Mainnet pool mode is disabled in code.
+  Open items before mainnet are tracked privately; mainnet pool mode stays off
+  until they close and an independent review and a multi-node stagenet soak
+  pass.
+- **Monero CCS:** the funding proposal (MR !699) was withdrawn by its author on
+  2026-10-04 while the payout model is replaced by Work Receipts (Path B). No
+  funding application is open.
 - **No token, no production deployments.** There is no v37 token, and nothing v37 is
   deployed in production.
 - **Formal ≠ empirical.** Model-checking bounds behavior over small configurations;
