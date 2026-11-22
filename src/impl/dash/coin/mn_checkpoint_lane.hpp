@@ -2809,7 +2809,10 @@ private:
         // run, i.e. a node could buy extra overrides by restarting. Carrying
         // them makes restart-equivalence the default.
         m_machine.load(rec.entries, rec.cursor_height);
-        m_machine.reset_sml_recovery_budget();
+        // The demotion-walk cap reads the MACHINE's spent count, so that is
+        // the one that must carry (the lane's m_sml_recovered below is the
+        // same per-bridge count, kept for status).
+        m_machine.restore_sml_recovery_spent(rec.sml_recovered);
         m_next              = rec.cursor_height + 1;
         m_applied           = 0;   // blocks applied BY THIS PROCESS
         m_restored_applied  = rec.applied;

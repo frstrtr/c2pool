@@ -411,6 +411,12 @@ public:
     /// MnCheckpointLane::rearm() calls this, on exactly that boundary.
     void reset_sml_recovery_budget() { m_sml_recovered_total = 0; }
 
+    /// Carry the SPENT half of the per-bridge budget across a restart: a
+    /// resumed bridge is the SAME bridge, so it continues with what the
+    /// previous process already spent (the persisted record's count), never
+    /// with a fresh budget.
+    void restore_sml_recovery_spent(size_t spent) { m_sml_recovered_total = spent; }
+
     /// How deep pass 0's ranked candidate list goes. The recovery walk can
     /// never look past this depth, which bounds both the work and the blast
     /// radius: a genuine desync cannot be "walked off" by marching down an

@@ -5975,6 +5975,28 @@ TEST(DashMnBridgeCursor, R7ACursorAtOrBelowTheTipNeverDefers)
     EXPECT_EQ(r.h.lane.restored_at(), 1519545u);
 }
 
+// ── 4c. A resumed bridge continues with the demotion-walk budget the previous
+// process already spent; a restart must never hand it a fresh one.
+TEST(DashMnBridgeCursor, ResumeCarriesTheSpentDemotionWalkBudget)
+{
+    TempCursorStore cs("smlspent");
+    { CursorRun a(&cs.store, 1519545); a.run(); ASSERT_TRUE(a.h.published); }
+
+    std::string why;
+    auto rec = cs.store.load(why);
+    ASSERT_TRUE(rec.has_value()) << why;
+    rec->sml_recovered = 3;   // three demotions already spent by that bridge
+    ASSERT_TRUE(cs.store.store(*rec));
+
+    CursorRun r(&cs.store, 1519546);
+    r.run();
+    ASSERT_TRUE(r.h.lane.cursor_restored()) << r.h.lane.restore_verdict();
+    EXPECT_EQ(r.h.lane.sml_recovered(), 3u);
+    EXPECT_EQ(r.h.lane.sml_recovery_spent(), 3u)
+        << "the cap reads the machine's spent count: a resume that zeroes it"
+           " lets every restart buy a fresh budget";
+}
+
 // ── 5. R5: the anti-gap arithmetic ─────────────────────────────────────────
 TEST(DashMnBridgeCursor, ARecordThatSkippedHeightsIsRefusedNotResumed)
 {
