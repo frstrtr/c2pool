@@ -631,6 +631,8 @@ void print_banner(const char* argv0)
         << "           [--network-id HEX [--prefix HEX]]  (private sharechain identity)\n"
         << "           [--stratum [HOST:]PORT] [--coin-p2p-connect HOST:PORT]... [--coin-p2p-discover]\n"
         << "           [--web-port PORT] [--web-host ADDR] [--dashboard-dir PATH]\n"
+        << "           [--stratum-http[=true|false|auto]]\n"
+        << "           [--stratum-http-budget N] [--stratum-http-per-ip N]\n"
         << "           [--external-ip ADDR]\n"
         << "           [--embedded-utxo[=false]] [--embedded-mainnet[=false]] [--embedded-null-arm[=false]]\n"
         << "           [--embedded-superblock[=false]] [--embedded-include-mn-special-txs[=false]]\n"
@@ -815,6 +817,19 @@ void print_banner(const char* argv0)
         << "        --web-port PORT (alias --http-port, default 8080) serves the FULL\n"
         << "        c2pool web dashboard + JSON API on --web-host (default 0.0.0.0)\n"
         << "        from --dashboard-dir (default web-static); --web-port 0 disables.\n"
+        << "        --stratum-http[=true|false|auto] also answers that API (GET/HEAD,\n"
+        << "        read-only) on the stratum port, as python p2pool did on its\n"
+        << "        worker port (trackers poll host:<stratum>/global_stats); default\n"
+        << "        auto = on when --web-host is ::, is 0.0.0.0 and --stratum is\n"
+        << "        IPv4, or is the --stratum address (not loopback).\n"
+        << "        --stratum-http-budget N: HTTP requests in progress on the\n"
+        << "        stratum port at once, at most N and at most\n"
+        << "        max_stratum_connections - 1; others are answered 503 (default\n"
+        << "        16; 0 = every HTTP request on the stratum port is answered 503).\n"
+        << "        --stratum-http-per-ip N: HTTP requests in progress on the\n"
+        << "        stratum port at once from one address, one /64 for IPv6, at\n"
+        << "        most N; others are answered 503 (default 6; 0 = no limit below\n"
+        << "        --stratum-http-budget).\n"
         << "        --embedded-oracle-shadow runs the OBSERVE-only per-block dashd\n"
         << "        cross-check: dashd getblocktemplate{mode:proposal} is the VERDICT,\n"
         << "        regime-aware field-compare is the DIAGNOSIS; a persisted graduation\n"
@@ -5513,6 +5528,11 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     } else {
         std::cout << "[run] stratum disabled (no --stratum flag)\n";
     }
+    // HTTP on the stratum port (--stratum-http; auto follows --web-host).
+    if (stratum_server)
+        core::configure_stratum_http(*stratum_server, web_server.get(),
+                                     core::stratum_http_mode_setting(),
+                                     core::stratum_http_limits_setting());
 
     // ── Think loop: initial election + 15 s keep-fresh tick ───────────────
     // Share arrivals trigger run_think() themselves (add_verified_shares);
@@ -13530,6 +13550,29 @@ int main(int argc, char** argv)
         }
         else if (std::strcmp(argv[i], "--web-host") == 0 && i + 1 < argc)
             web_host = argv[++i];
+        // --stratum-http[=true|false|auto]: the web API on the stratum port too
+        // (core/stratum_http.hpp).
+        else if (std::strcmp(argv[i], "--stratum-http") == 0
+                 || std::strncmp(argv[i], "--stratum-http=", 15) == 0) {
+            if (!core::parse_stratum_http_flag(argv[i], core::stratum_http_mode_setting())) {
+                std::cout << "c2pool-dash: bad value: " << argv[i]
+                          << " (expected --stratum-http=true, false or auto)\n";
+                return 2;
+            }
+        }
+        // --stratum-http-budget N / --stratum-http-per-ip N (core/stratum_http.hpp).
+        else if (std::strcmp(argv[i], "--stratum-http-budget") == 0 && i + 1 < argc) {
+            if (!core::parse_stratum_http_count(argv[++i], core::stratum_http_limits_setting().budget)) {
+                std::cout << "c2pool-dash: bad value: --stratum-http-budget " << argv[i] << " (expected a count)\n";
+                return 2;
+            }
+        }
+        else if (std::strcmp(argv[i], "--stratum-http-per-ip") == 0 && i + 1 < argc) {
+            if (!core::parse_stratum_http_count(argv[++i], core::stratum_http_limits_setting().per_ip)) {
+                std::cout << "c2pool-dash: bad value: --stratum-http-per-ip " << argv[i] << " (expected a count)\n";
+                return 2;
+            }
+        }
         // Miner-facing host override for the dashboard Stratum URL. Both production
         // nodes NAT out through one gateway, so the auto-detected outbound IP
         // is NOT the address miners reach; the operator advertises the real
@@ -13625,6 +13668,15 @@ int main(int argc, char** argv)
         // file-set keys (present && source==File) are applied; CLI-set keys never
         // become File-sourced (the loader skips tracker keys), so the CLI wins.
         if (rc.file_set("web.port"))        web_port    = static_cast<uint16_t>(rc.get_u16("web.port").value_or(web_port));
+        if (rc.file_set("stratum.http"))   // --stratum-http: true / false / auto
+            core::apply_stratum_http_setting(rc.get_string("stratum.http").value_or(""),
+                                             core::stratum_http_mode_setting());
+        if (rc.file_set("stratum.http_budget"))   // --stratum-http-budget
+            core::apply_stratum_http_count_setting("stratum.http_budget", rc.get_i64("stratum.http_budget"),
+                                                   core::stratum_http_limits_setting().budget);
+        if (rc.file_set("stratum.http_per_ip"))   // --stratum-http-per-ip
+            core::apply_stratum_http_count_setting("stratum.http_per_ip", rc.get_i64("stratum.http_per_ip"),
+                                                   core::stratum_http_limits_setting().per_ip);
         if (rc.file_set("stratum.bind"))    parse_listen(rc.get_string("stratum.bind").value_or(""), stratum_host, stratum_port);
         if (rc.file_set("web.external_ip")) external_ip = rc.get_string("web.external_ip").value_or(external_ip);
         if (rc.file_set("web.dashboard_dir")) dashboard_dir = rc.get_string("web.dashboard_dir").value_or(dashboard_dir);

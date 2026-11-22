@@ -14142,6 +14142,9 @@ WebServer::WebServer(net::io_context& ioc, const std::string& address, uint16_t 
 WebServer::~WebServer()
 {
     stop();
+    // A stratum server's handler declines from here on.
+    std::lock_guard<std::mutex> lk(stratum_http_gate_->mutex);
+    stratum_http_gate_->web = nullptr;
 }
 
 std::size_t rewrite_payout_scheme_label(std::string& text, const std::string& label,
@@ -14205,6 +14208,14 @@ bool WebServer::start()
             }
             LOG_INFO << "[HTTP-thread] exiting";
         });
+
+        // The HTTP thread serves from here on: a stratum port may hand it
+        // HTTP connections (configure_stratum_http).
+        {
+            std::lock_guard<std::mutex> lk(stratum_http_gate_->mutex);
+            stratum_http_gate_->web = this;
+        }
+        http_serving_ = true;
 
         // Start stratum server if configured (stays on main ioc_)
         if (stratum_port_ > 0) {
@@ -14605,6 +14616,12 @@ bool WebServer::start_solo()
 
 void WebServer::stop()
 {
+    // Stratum-port HTTP hand-offs decline from here on (they answer 503).
+    http_serving_ = false;
+    {
+        std::lock_guard<std::mutex> lk(stratum_http_gate_->mutex);
+        stratum_http_gate_->web = nullptr;
+    }
     if (running_) {
         try {
             running_ = false;
@@ -14618,6 +14635,18 @@ void WebServer::stop()
             http_ioc_.stop();
             if (http_thread_.joinable())
                 http_thread_.join();
+            // Stratum-port sessions still open: closed here, their slots
+            // released (no thread runs the HTTP loop now).
+            std::vector<std::shared_ptr<HttpSession>> open;
+            {
+                std::lock_guard<std::mutex> lk(stratum_http_sessions_mutex_);
+                for (auto& w : stratum_http_sessions_)
+                    if (auto sp = w.lock())
+                        open.push_back(std::move(sp));
+                stratum_http_sessions_.clear();
+            }
+            for (auto& sp : open)
+                sp->abandon();
             stop_stratum_server();
             LOG_INFO << "WebServer stopped";
         } catch (const std::exception& e) {
@@ -14632,10 +14661,12 @@ bool WebServer::start_stratum_server()
         if (!stratum_server_) {
             stratum_server_ = std::make_unique<StratumServer>(ioc_, bind_address_, stratum_port_, mining_interface_);
         }
-        
         bool started = stratum_server_->start();
         if (started) {
             LOG_INFO << "Stratum server started on port " << stratum_port_;
+            // HTTP on the stratum port (--stratum-http): this server's own
+            // stratum acceptor binds the web server's address.
+            configure_stratum_http(*stratum_server_, this, stratum_http_mode_, stratum_http_limits_);
             // Wire stratum hashrate callback to MiningInterface
             auto* ss = stratum_server_.get();
             mining_interface_->set_stratum_hashrate_fn([ss]() -> double {
@@ -14718,6 +14749,136 @@ void WebServer::handle_accept(beast::error_code ec, tcp::socket socket)
     if (running_) {
         accept_connections();
     }
+}
+
+StratumHttpHandler WebServer::stratum_http_handler()
+{
+    return [gate = stratum_http_gate_](StratumHttpRequest& req) -> bool {
+        // Held for the hand-off only (a socket move and a post); stop() and
+        // the destructor take it to clear the gate.
+        std::lock_guard<std::mutex> lk(gate->mutex);
+        if (!gate->web || !gate->web->is_http_serving())
+            return false;
+        return gate->web->adopt_stratum_http(req);
+    };
+}
+
+bool WebServer::adopt_stratum_http(StratumHttpRequest& req)
+{
+    // The native socket moves from the stratum io_context to the HTTP
+    // io_context: the session runs on the HTTP thread, as every web-port
+    // session. Same kernel socket, same peer address; nothing is proxied.
+    boost::system::error_code ec;
+    const auto local = req.socket.local_endpoint(ec);
+    if (ec)
+        return false;
+    const auto protocol = local.protocol();
+    const auto stratum_executor = req.socket.get_executor();
+    auto native = req.socket.release(ec);
+    if (ec)
+        return false;   // still owned by req.socket: the caller answers 503
+    tcp::socket sock(http_ioc_);
+    sock.assign(protocol, native, ec);
+    if (ec) {
+        LOG_WARNING << "[stratum-http] could not move a connection to the HTTP thread: "
+                    << ec.message();
+#ifdef _WIN32
+        ::closesocket(native);
+#else
+        ::close(native);
+#endif
+        return true;   // handled: the connection is closed
+    }
+
+    // Stratum-port session:
+    // - the read deadlines count from the hand-off;
+    // - write_timeout = the web idle timeout (30 s default; 30 s when it is 0);
+    // - deadline = the stratum handshake deadline (handshake_timeout_sec after
+    //   the accept, 30 s on LTC), when set: no expiry the session arms is
+    //   later than it;
+    // - slot = the stratum slot (StratumServer::acquire_http_slot), never one
+    //   under this server's HTTP cap;
+    // - with a deadline: at the deadline a timer on the stratum io_context
+    //   shuts the connection down (both directions); the slot is released when
+    //   the session closes the socket.
+    const auto web_idle = std::chrono::milliseconds(http_idle_timeout_ms_.load());
+    const auto web_request = std::chrono::milliseconds(http_request_timeout_ms_.load());
+    HttpSessionOptions opts;
+    opts.stratum_port = true;
+    opts.write_timeout = web_idle.count() > 0 ? web_idle : HttpSession::kIdleTimeout;
+    opts.started = req.handed_off_at;
+    opts.deadline = req.deadline;
+    std::shared_ptr<StratumHttpDeadlineShutdown> deadline_shutdown;
+    if (req.deadline)
+        deadline_shutdown = std::make_shared<StratumHttpDeadlineShutdown>(native);
+    opts.deadline_shutdown = deadline_shutdown;
+    opts.on_response = std::move(req.on_response);
+    opts.on_error = std::move(req.on_error);
+
+    // Registered before it runs: stop() closes it either way.
+    auto session = std::make_shared<HttpSession>(std::move(sock), mining_interface_,
+                                                 std::move(req.slot), web_idle, web_request,
+                                                 std::move(opts));
+    {
+        std::lock_guard<std::mutex> lk(stratum_http_sessions_mutex_);
+        auto& v = stratum_http_sessions_;
+        v.erase(std::remove_if(v.begin(), v.end(),
+                               [](const std::weak_ptr<HttpSession>& w) { return w.expired(); }),
+                v.end());
+        v.push_back(session);
+    }
+    if (deadline_shutdown)
+        arm_stratum_http_deadline_shutdown(stratum_executor, *req.deadline, deadline_shutdown);
+    net::post(http_ioc_, [session, head = std::move(req.head)]() mutable {
+        session->run(std::move(head));
+    });
+    return true;
+}
+
+void arm_stratum_http_deadline_shutdown(const net::any_io_executor& stratum_executor,
+                                        std::chrono::steady_clock::time_point at,
+                                        std::shared_ptr<StratumHttpDeadlineShutdown> shutdown)
+{
+    // The timer and its cancel run on one strand of the stratum io_context.
+    // The stratum io_context outlives the web server (one lane io_context).
+    auto strand = net::make_strand(stratum_executor);
+    auto timer = std::make_shared<net::steady_timer>(strand, at);
+    std::weak_ptr<net::steady_timer> weak = timer;
+    shutdown->set_cancel([strand, weak] {
+        net::post(strand, [weak] {
+            if (auto t = weak.lock())
+                t->cancel();
+        });
+    });
+    timer->async_wait([timer, shutdown](beast::error_code ec) {
+        if (!ec)
+            shutdown->fire();
+    });
+}
+
+StratumHttpDecision configure_stratum_http(StratumServer& stratum, WebServer* web,
+                                           StratumHttpMode mode, StratumHttpLimits limits)
+{
+    const bool web_listening = web && web->is_http_serving();
+    const auto decision = resolve_stratum_http(mode, web_listening,
+                                               web ? web->get_bind_address() : std::string{},
+                                               stratum.get_bind_address());
+    stratum.set_http(decision.on,
+                     decision.on && decision.web ? web->stratum_http_handler() : StratumHttpHandler{},
+                     limits);
+    std::string budget;
+    if (decision.on && decision.web) {
+        const auto b = stratum_http_budget(stratum.connection_cap(), limits.budget, limits.per_ip);
+        budget = b.handoffs == 0
+            ? "; every HTTP request answered 503 (--stratum-http-budget "
+                  + std::to_string(limits.budget) + ", max_stratum_connections "
+                  + std::to_string(stratum.connection_cap()) + ")"
+            : "; at most " + std::to_string(b.handoffs) + " HTTP requests in progress, "
+                  + std::to_string(b.per_key) + " per address (IPv6 /64), others answered 503";
+    }
+    LOG_INFO << "stratum HTTP: " << decision.summary << " [stratum port " << stratum.get_port()
+             << (decision.on ? "; GET/HEAD of the web API, read-only" : "") << budget << "]";
+    return decision;
 }
 
 bool WebServer::is_stratum_running() const

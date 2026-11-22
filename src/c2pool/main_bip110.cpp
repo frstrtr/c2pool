@@ -119,6 +119,19 @@ void print_banner(const char* argv0)
         "  --fork-checkpoint    seed the Knots 961640 checkpoint for a fast proof\n"
         "  --http [HOST:]PORT   serve the shared coin-generic dashboard (HTML at\n"
         "                       \"/\", JSON /node_info for health probes)\n"
+        "  --stratum-http[=true|false|auto]  also answer the web API (GET/HEAD,\n"
+        "                       read-only) on the stratum port, as python p2pool did\n"
+        "                       on its worker port; default auto = on when --http\n"
+        "                       binds ::, binds 0.0.0.0 and --stratum is IPv4, or\n"
+        "                       binds the --stratum address (not loopback)\n"
+        "  --stratum-http-budget N  HTTP requests in progress on the stratum port at\n"
+        "                       once: at most N and at most max_stratum_connections\n"
+        "                       - 1; others are answered 503 (default 16; 0 = every\n"
+        "                       HTTP request on the stratum port is answered 503)\n"
+        "  --stratum-http-per-ip N  HTTP requests in progress on the stratum port at\n"
+        "                       once from one address, one /64 for IPv6: at most N;\n"
+        "                       others are answered 503 (default 6; 0 = no limit\n"
+        "                       below --stratum-http-budget)\n"
         "  --node-owner-address ADDR  subsidy fallback / donation payout when a\n"
         "                       miner has no resolvable payout address (base58/bech32)\n"
         "  --bip110-sharechain  ARM the M3 v36 sharechain MINT (DEFAULT OFF): start\n"
@@ -2533,6 +2546,11 @@ int run_embedded(bool coin_p2p_discover,
         }
         } // if (mi != nullptr)
     }
+    // HTTP on the stratum port (--stratum-http; auto follows the --http bind).
+    if (stratum_server)
+        core::configure_stratum_http(*stratum_server, web_server.get(),
+                                     core::stratum_http_mode_setting(),
+                                     core::stratum_http_limits_setting());
 
     // Periodic tip log — the live-proof capture line.
     auto tip_timer = std::make_shared<io::steady_timer>(ioc);
@@ -2759,6 +2777,27 @@ int main(int argc, char** argv)
             }
         }
         else if (arg == "--no-stratum") { stratum_port = 0; }
+        else if (arg == "--stratum-http" || arg.rfind("--stratum-http=", 0) == 0) {
+            // the web API on the stratum port too (core/stratum_http.hpp)
+            if (!core::parse_stratum_http_flag(arg, core::stratum_http_mode_setting())) {
+                std::fprintf(stderr, "bad value: %s (expected --stratum-http=true, false or auto)\n",
+                             arg.c_str());
+                return 1;
+            }
+        }
+        // --stratum-http-budget N / --stratum-http-per-ip N (core/stratum_http.hpp).
+        else if (arg == "--stratum-http-budget" && i + 1 < argc) {
+            if (!core::parse_stratum_http_count(argv[++i], core::stratum_http_limits_setting().budget)) {
+                std::fprintf(stderr, "bad value: --stratum-http-budget %s (expected a count)\n", argv[i]);
+                return 1;
+            }
+        }
+        else if (arg == "--stratum-http-per-ip" && i + 1 < argc) {
+            if (!core::parse_stratum_http_count(argv[++i], core::stratum_http_limits_setting().per_ip)) {
+                std::fprintf(stderr, "bad value: --stratum-http-per-ip %s (expected a count)\n", argv[i]);
+                return 1;
+            }
+        }
         else if ((arg == "--node-owner-address" || arg == "--donation") && i + 1 < argc) {
             donation_address = argv[++i];
         }

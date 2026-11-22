@@ -1044,6 +1044,11 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
     } else {
         LOG_INFO << "[BCH-POOL] dashboard disabled (no --http bind given).";
     }
+    // HTTP on the stratum port (--stratum-http; auto follows the --http bind).
+    if (stratum_server)
+        core::configure_stratum_http(*stratum_server, web_server.get(),
+                                     core::stratum_http_mode_setting(),
+                                     core::stratum_http_limits_setting());
 
     // Periodic think/clean tick (every 5s, safety net) — mirrors the LTC/dash
     // tick. Without it, think() fired only on share arrival: no stale-head

@@ -265,6 +265,12 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
     # stratum_refusal_log_test.cpp: the rate limit on the stratum server's
     # "connection refused" WARN lines (core/stratum_refusal_log.hpp, header
     # only): first refusal at once, then one summary per window. Same folding.
+    # stratum_port_http_test.cpp + stratum_port_http_wire_test.cpp: the web
+    # API on the stratum port, as python p2pool served it on its worker port
+    # (core/stratum_http.hpp): --stratum-http and its auto rule, the sniff,
+    # the hand-off to HttpSession on the web server's HTTP thread, read-only
+    # GET/HEAD, local-only routes, the caps and the session accounting, the
+    # handshake deadline, the 503 without a web server. Same folding.
     # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
     add_executable(core_test
         addr_store_save_test.cpp
@@ -310,6 +316,8 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
         sharechain_height_index_test.cpp
         socket_write_queue_test.cpp
         socket_read_empty_prefix_test.cpp
+        stratum_port_http_test.cpp
+        stratum_port_http_wire_test.cpp
         stratum_refusal_log_test.cpp
         template_refresh_on_tx_test.cpp
         template_txs_check_test.cpp

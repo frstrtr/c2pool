@@ -563,6 +563,17 @@ void print_help() {
     std::cout << "  -w / --worker-port PORT   Stratum/worker port (alias: --stratum-port; default: 9327)\n";
     std::cout << "  --web-port PORT           Web dashboard / JSON-RPC API port (alias: --http-port; default: 8080)\n";
     std::cout << "  --http-host HOST          HTTP server bind address (default: 0.0.0.0)\n";
+    std::cout << "  --stratum-http[=true|false|auto]  Also answer the web API (GET/HEAD, read-only) on the\n";
+    std::cout << "                            stratum port, as python p2pool did on its worker port; trackers\n";
+    std::cout << "                            poll http://host:<worker port>/global_stats (default: auto =\n";
+    std::cout << "                            on when the web server binds a non-loopback address)\n";
+    std::cout << "  --stratum-http-budget N   HTTP requests in progress on the stratum port at once: at most N\n";
+    std::cout << "                            and at most max_stratum_connections - 1; others are answered 503\n";
+    std::cout << "                            (default 16; 0 = every HTTP request on the stratum port is\n";
+    std::cout << "                            answered 503)\n";
+    std::cout << "  --stratum-http-per-ip N   HTTP requests in progress on the stratum port at once from one\n";
+    std::cout << "                            address, one /64 for IPv6: at most N; others are answered 503\n";
+    std::cout << "                            (default 6; 0 = no limit below --stratum-http-budget)\n";
     std::cout << "  --external-ip ADDR        Public IP or domain for stratum URL display (default: auto-detect)\n\n";
 
     std::cout << "PARENT COIN DAEMON:\n";
@@ -1049,6 +1060,10 @@ int main(int argc, char* argv[]) {
     // (TCP keepalive, authorize deadline, idle reaper, write backlog cap) --
     // come from impl/ltc/stratum_defaults.hpp, which the KATs read too.
     core::StratumConfig stratum_config = ltc::default_stratum_config();
+    // --stratum-http: the web API on the stratum port too (core/stratum_http.hpp)
+    core::StratumHttpMode stratum_http_mode = core::StratumHttpMode::Auto;
+    // --stratum-http-budget / --stratum-http-per-ip (defaults 16 and 6)
+    core::StratumHttpLimits stratum_http_limits;
 
     // Operational tuning (configurable via CLI or YAML)
     std::string log_file;                        // empty = default "debug.log"
@@ -1767,6 +1782,27 @@ int main(int argc, char* argv[]) {
             stratum_config.max_stratum_connections_per_ip = static_cast<size_t>(std::stoul(argv[++i]));
             cli_explicit.insert("max_stratum_connections_per_ip");
         }
+        else if (arg == "--stratum-http" || arg.rfind("--stratum-http=", 0) == 0) {
+            if (!core::parse_stratum_http_flag(arg, stratum_http_mode)) {
+                LOG_ERROR << "Bad value: " << arg << " (expected --stratum-http=true, false or auto)";
+                return 1;
+            }
+            cli_explicit.insert("stratum_http");
+        }
+        else if (arg == "--stratum-http-budget" && i + 1 < argc) {
+            if (!core::parse_stratum_http_count(argv[++i], stratum_http_limits.budget)) {
+                LOG_ERROR << "Bad value: --stratum-http-budget " << argv[i] << " (expected a count)";
+                return 1;
+            }
+            cli_explicit.insert("stratum_http_budget");
+        }
+        else if (arg == "--stratum-http-per-ip" && i + 1 < argc) {
+            if (!core::parse_stratum_http_count(argv[++i], stratum_http_limits.per_ip)) {
+                LOG_ERROR << "Bad value: --stratum-http-per-ip " << argv[i] << " (expected a count)";
+                return 1;
+            }
+            cli_explicit.insert("stratum_http_per_ip");
+        }
         // Operational tuning
         else if (arg == "--log-file" && i + 1 < argc) {
             log_file = argv[++i];
@@ -2053,6 +2089,14 @@ int main(int argc, char* argv[]) {
                 stratum_config.max_stratum_connections = cfg["max_stratum_connections"].as<size_t>();
             if (!cli_explicit.count("max_stratum_connections_per_ip") && cfg["max_stratum_connections_per_ip"])
                 stratum_config.max_stratum_connections_per_ip = cfg["max_stratum_connections_per_ip"].as<size_t>();
+            if (!cli_explicit.count("stratum_http") && cfg["stratum_http"])
+                core::apply_stratum_http_setting(cfg["stratum_http"].as<std::string>(), stratum_http_mode);
+            if (!cli_explicit.count("stratum_http_budget") && cfg["stratum_http_budget"])
+                core::apply_stratum_http_count_setting("stratum_http_budget", cfg["stratum_http_budget"].as<int64_t>(),
+                                                       stratum_http_limits.budget);
+            if (!cli_explicit.count("stratum_http_per_ip") && cfg["stratum_http_per_ip"])
+                core::apply_stratum_http_count_setting("stratum_http_per_ip", cfg["stratum_http_per_ip"].as<int64_t>(),
+                                                       stratum_http_limits.per_ip);
 
             // Operational tuning
             if (!cli_explicit.count("log_file") && cfg["log_file"])
@@ -2204,6 +2248,14 @@ int main(int argc, char* argv[]) {
         // Apply file-sourced (L1) values into the locals the node consumes.
         if (rc.file_set("web.port"))         http_port  = static_cast<int>(rc.get_u16("web.port").value_or(static_cast<uint16_t>(http_port)));
         if (rc.file_set("web.host"))         http_host  = rc.get_string("web.host").value_or(http_host);
+        if (rc.file_set("stratum.http") && !cli_explicit.count("stratum_http"))   // true / false / auto
+            core::apply_stratum_http_setting(rc.get_string("stratum.http").value_or(""), stratum_http_mode);
+        if (rc.file_set("stratum.http_budget") && !cli_explicit.count("stratum_http_budget"))
+            core::apply_stratum_http_count_setting("stratum.http_budget", rc.get_i64("stratum.http_budget"),
+                                                   stratum_http_limits.budget);
+        if (rc.file_set("stratum.http_per_ip") && !cli_explicit.count("stratum_http_per_ip"))
+            core::apply_stratum_http_count_setting("stratum.http_per_ip", rc.get_i64("stratum.http_per_ip"),
+                                                   stratum_http_limits.per_ip);
         if (rc.file_set("stratum.bind")) {
             std::string v = rc.get_string("stratum.bind").value_or("");
             auto colon = v.rfind(':'); std::string p = (colon == std::string::npos) ? v : v.substr(colon + 1);
@@ -2793,6 +2845,8 @@ int main(int argc, char* argv[]) {
                     address_explorer_prefix, block_explorer_prefix, tx_explorer_prefix);
             // Set stratum port BEFORE start() — start() launches the stratum listener.
             web_server.set_stratum_port(static_cast<uint16_t>(stratum_port));
+            web_server.set_stratum_http_mode(stratum_http_mode);
+            web_server.set_stratum_http_limits(stratum_http_limits);
             // Start HTTP server immediately so loading page is served during sync.
             // Stratum won't have valid work yet, but that's fine — miners retry.
             web_server.start();
@@ -11647,6 +11701,8 @@ int main(int argc, char* argv[]) {
             // Configure for solo mining mode
             solo_server.set_solo_mode(true);
             solo_server.set_stratum_port(static_cast<uint16_t>(stratum_port));  // Set the correct Stratum port
+            solo_server.set_stratum_http_mode(stratum_http_mode);   // no web server here: auto = off
+            solo_server.set_stratum_http_limits(stratum_http_limits);
             solo_server.get_mining_interface()->set_stratum_config(stratum_config);
             if (!solo_address.empty()) {
                 solo_server.set_solo_address(solo_address);

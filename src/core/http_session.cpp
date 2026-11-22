@@ -315,35 +315,60 @@ static bool is_valid_graph_param(const std::string& s)
 /// HttpSession Implementation
 HttpSession::HttpSession(tcp::socket socket, std::shared_ptr<MiningInterface> mining_interface,
                          std::shared_ptr<void> slot, std::chrono::milliseconds idle_timeout,
-                         std::chrono::milliseconds request_timeout)
+                         std::chrono::milliseconds request_timeout, HttpSessionOptions options)
     : slot_(std::move(slot))
     , socket_(std::move(socket))
     , mining_interface_(mining_interface)
+    , opts_(std::move(options))
+    , write_deadline_(socket_.get_executor())
     , deadline_(socket_.get_executor())
     , idle_timeout_(idle_timeout)
     , request_timeout_(request_timeout)
 {
 }
 
-void HttpSession::run()
+HttpSession::~HttpSession()
 {
+    // Before socket_ closes the descriptor.
+    if (opts_.deadline_shutdown)
+        opts_.deadline_shutdown->mark_closed();
+}
+
+void HttpSession::run(std::string initial)
+{
+    // At or after the owner's deadline: closed, nothing read or answered.
+    if (opts_.deadline && std::chrono::steady_clock::now() >= *opts_.deadline)
+        return close_socket();
     parser_.emplace();
-    read_started_ = std::chrono::steady_clock::now();
+    if (opts_.stratum_port)
+        parser_->body_limit(kStratumPortBodyLimit);
+    read_started_ = opts_.started != std::chrono::steady_clock::time_point{}
+        ? opts_.started : std::chrono::steady_clock::now();
     arm_deadline();
-    read_request();
+    if (initial.empty())
+        return read_request();
+    // `initial` is parsed before the first read.
+    auto dst = buffer_.prepare(initial.size());
+    net::buffer_copy(dst, net::buffer(initial));
+    buffer_.commit(initial.size());
+    on_bytes(0);
 }
 
 void HttpSession::arm_deadline()
 {
     // The next instant the request read gives up: idle_timeout_ after the
-    // last byte, and no later than request_timeout_ after the accept.
+    // last byte, no later than request_timeout_ after the accept, and no
+    // later than the owner's deadline (on every re-arm).
     using clock = std::chrono::steady_clock;
     const bool idle = idle_timeout_.count() > 0, whole = request_timeout_.count() > 0;
-    if (!idle && !whole)
+    if (!idle && !whole && !opts_.deadline)
         return;
-    clock::time_point at = idle ? clock::now() + idle_timeout_ : read_started_ + request_timeout_;
-    if (idle && whole)
+    clock::time_point at = clock::time_point::max();
+    if (idle)
+        at = clock::now() + idle_timeout_;
+    if (whole)
         at = std::min(at, read_started_ + request_timeout_);
+    at = no_later_than_owner(at);
     reading_ = true;
     deadline_.expires_at(at);   // cancels the wait armed before
     deadline_.async_wait([self = shared_from_this()](beast::error_code ec) {
@@ -352,10 +377,66 @@ void HttpSession::arm_deadline()
         if (ec || !self->reading_ || self->deadline_.expiry() > clock::now())
             return;
         // Closing cancels the pending read; its handler ends the session.
-        beast::error_code ignore;
-        self->socket_.shutdown(tcp::socket::shutdown_both, ignore);
-        self->socket_.close(ignore);
+        self->close_socket();
     });
+}
+
+std::chrono::steady_clock::time_point HttpSession::no_later_than_owner(
+    std::chrono::steady_clock::time_point at) const
+{
+    return opts_.deadline ? std::min(at, *opts_.deadline) : at;
+}
+
+void HttpSession::begin_write()
+{
+    write_started_ = std::chrono::steady_clock::now();
+    arm_write_deadline();
+}
+
+void HttpSession::arm_write_deadline()
+{
+    using clock = std::chrono::steady_clock;
+    const bool whole = opts_.write_timeout.count() > 0;
+    if (!whole && !opts_.deadline)
+        return;
+    clock::time_point at = clock::time_point::max();
+    if (whole)
+        at = write_started_ + opts_.write_timeout;
+    at = no_later_than_owner(at);
+    writing_ = true;
+    write_deadline_.expires_at(at);   // cancels the wait armed before
+    write_deadline_.async_wait([self = shared_from_this()](beast::error_code ec) {
+        // Cancelled, the write is over, or the expiry has moved.
+        if (ec || !self->writing_ || self->write_deadline_.expiry() > clock::now())
+            return;
+        // Closing fails the pending write; its handler ends the session.
+        self->close_socket();
+    });
+}
+
+void HttpSession::end_writing()
+{
+    writing_ = false;
+    write_deadline_.cancel();
+}
+
+void HttpSession::close_socket()
+{
+    if (opts_.deadline_shutdown)
+        opts_.deadline_shutdown->mark_closed();
+    beast::error_code ignore;
+    socket_.shutdown(tcp::socket::shutdown_both, ignore);
+    socket_.close(ignore);
+}
+
+void HttpSession::abandon()
+{
+    reading_ = false;
+    writing_ = false;
+    deadline_.cancel();
+    write_deadline_.cancel();
+    close_socket();
+    slot_.reset();   // after the socket is closed
 }
 
 void HttpSession::end_reading()
@@ -383,6 +464,9 @@ bool is_direct_local_request(const boost::asio::ip::address& peer,
 
 bool HttpSession::is_direct_local() const
 {
+    // The stratum port: never direct local, whatever the peer address.
+    if (opts_.stratum_port)
+        return false;
     boost::system::error_code ec;
     const auto ep = socket_.remote_endpoint(ec);
     if (ec)
@@ -407,37 +491,64 @@ void HttpSession::read_request()
                 return self->handle_error(ec, "read_request");
             }
             self->buffer_.commit(bytes_transferred);
-            beast::error_code pec;
-            while (self->buffer_.size() > 0 && !self->parser_->is_done()) {
-                const std::size_t used = self->parser_->put(self->buffer_.data(), pec);
-                self->buffer_.consume(used);
-                if (pec == http::error::need_more) {
-                    pec = {};
-                    break;
-                }
-                if (pec || used == 0)
-                    break;
-            }
-            if (pec) {
-                self->end_reading();
-                return self->handle_error(pec, "read_request");
-            }
-            if (!self->parser_->is_done()) {
-                if (bytes_transferred > 0)
-                    self->arm_deadline();   // bytes arrived: the idle window restarts
-                return self->read_request();
-            }
-            self->end_reading();
-            self->request_ = self->parser_->release();
-            self->parser_.reset();
-            self->process_request();
+            self->on_bytes(bytes_transferred);
         });
 }
 
-void HttpSession::process_request()
+void HttpSession::on_bytes(std::size_t bytes_transferred)
 {
-    // Create HTTP response
-    http::response<http::string_body> response{http::status::ok, request_.version()};
+    beast::error_code pec;
+    while (buffer_.size() > 0 && !parser_->is_done()) {
+        const std::size_t used = parser_->put(buffer_.data(), pec);
+        buffer_.consume(used);
+        if (pec == http::error::need_more) {
+            pec = {};
+            break;
+        }
+        if (pec || used == 0)
+            break;
+    }
+    if (pec == http::error::body_limit && opts_.stratum_port) {
+        // A body over kStratumPortBodyLimit on the stratum port, answered
+        // from the parsed head: 405 (Allow: GET, HEAD) for a method other
+        // than GET and HEAD, else 413.
+        end_reading();
+        const auto& h = parser_->get();
+        request_ = {};
+        request_.method(h.method());
+        request_.target(h.target());
+        request_.version(h.version());
+        parser_.reset();
+        const bool readable = request_.method() == http::verb::get
+                           || request_.method() == http::verb::head;
+        head_request_ = request_.method() == http::verb::head;
+        auto response = base_response(readable ? http::status::payload_too_large
+                                               : http::status::method_not_allowed);
+        if (!readable)
+            response.set(http::field::allow, "GET, HEAD");
+        response.body() = readable ? R"({"error":"Request body too large"})"
+                                   : R"({"error":"Method not allowed on the stratum port"})";
+        response.prepare_payload();
+        return send_response(std::move(response));
+    }
+    if (pec) {
+        end_reading();
+        return handle_error(pec, "read_request");
+    }
+    if (!parser_->is_done()) {
+        if (bytes_transferred > 0)
+            arm_deadline();   // bytes arrived: the idle window restarts
+        return read_request();
+    }
+    end_reading();
+    request_ = parser_->release();
+    parser_.reset();
+    process_request();
+}
+
+http::response<http::string_body> HttpSession::base_response(http::status status) const
+{
+    http::response<http::string_body> response{status, request_.version() ? request_.version() : 11};
     response.set(http::field::server, mining_interface_->get_pool_version());
     response.set(http::field::content_type, "application/json");
 
@@ -445,7 +556,9 @@ void HttpSession::process_request()
     const auto& cors_origin = mining_interface_->get_cors_origin();
     if (!cors_origin.empty()) {
         response.set(http::field::access_control_allow_origin, cors_origin);
-        response.set(http::field::access_control_allow_methods, "GET, POST, OPTIONS");
+        // The stratum port answers GET and HEAD only.
+        response.set(http::field::access_control_allow_methods,
+                     opts_.stratum_port ? "GET, HEAD" : "GET, POST, OPTIONS");
         response.set(http::field::access_control_allow_headers, "Content-Type");
     }
 
@@ -453,6 +566,26 @@ void HttpSession::process_request()
     response.set("X-Content-Type-Options", "nosniff");
     response.set("X-Frame-Options", "DENY");
     response.set("Referrer-Policy", "no-referrer");
+    return response;
+}
+
+void HttpSession::process_request()
+{
+    // Create HTTP response
+    http::response<http::string_body> response = base_response(http::status::ok);
+
+    // HEAD is a GET whose response is sent without its body (send_response).
+    head_request_ = request_.method() == http::verb::head;
+
+    // The stratum port is read-only: GET and HEAD, nothing else (no CORS
+    // preflight, no admin POST, no JSON-RPC).
+    if (opts_.stratum_port && request_.method() != http::verb::get && !head_request_) {
+        response.result(http::status::method_not_allowed);
+        response.set(http::field::allow, "GET, HEAD");
+        response.body() = R"({"error":"Method not allowed on the stratum port"})";
+        response.prepare_payload();
+        return send_response(std::move(response));
+    }
 
     // Admin endpoints accept both GET and POST so CLI tools can POST
     // mutations without falling through to the JSON-RPC handler.
@@ -466,7 +599,7 @@ void HttpSession::process_request()
             // Handle CORS preflight
             response_body = "";
         }
-        else if (request_.method() == http::verb::get
+        else if (request_.method() == http::verb::get || head_request_
                  || (is_admin_path && request_.method() == http::verb::post)) {
             // Path-based REST routing for p2pool-compatible endpoints
             std::string raw_target(request_.target());
@@ -501,7 +634,28 @@ void HttpSession::process_request()
             const bool needs_auth = (target.substr(0, 9) == "/control/"
                                   || target == "/web/log"
                                   || target == "/logs/export");
+            // HEAD on /control/* and /api/admin/* (routes that change state
+            // on GET): 405 on the web port; 403 on the stratum port (below).
+            if (head_request_ && !opts_.stratum_port
+                && (target.substr(0, 9) == "/control/" || target.substr(0, 11) == "/api/admin/")) {
+                response.result(http::status::method_not_allowed);
+                response.set(http::field::allow,
+                             target.substr(0, 11) == "/api/admin/" ? "GET, POST" : "GET");
+                response.body() = R"({"error":"Method not allowed"})";
+                response.prepare_payload();
+                send_response(std::move(response));
+                return;
+            }
             if (needs_auth) {
+                if (opts_.stratum_port) {
+                    // The stratum port: 403 whatever ?token= says (the web
+                    // port's text for a client that is not local).
+                    response.result(http::status::forbidden);
+                    response.body() = R"({"error":"Logs and control are local-only"})";
+                    response.prepare_payload();
+                    send_response(std::move(response));
+                    return;
+                }
                 if (mining_interface_->auth_required()) {
                     const std::string token = getQueryParam("token");
                     if (!mining_interface_->verify_auth_token(token)) {
@@ -583,6 +737,19 @@ void HttpSession::process_request()
                 } else {
                     rest_result = mining_interface_->rest_sharechain_delta(getQueryParam("since"));
                 }
+            }
+            else if (target == "/sharechain/stream" && opts_.stratum_port) {
+                // The stratum port: one response per connection. The event
+                // stream is never handed off there: 405, empty Allow (RFC 9110
+                // 10.2.1: no method is allowed on this target here).
+                response.result(http::status::method_not_allowed);
+                response.set(http::field::allow, "");
+                response_body = R"({"error":"The event stream is served on the web port only"})";
+            }
+            else if (target == "/sharechain/stream" && head_request_) {
+                response.result(http::status::method_not_allowed);
+                response.set(http::field::allow, "GET");
+                response_body = R"({"error":"Method not allowed"})";
             }
             else if (target == "/sharechain/stream") {
                 // Layer 4: SSE — send headers and keep connection open
@@ -1121,8 +1288,9 @@ void HttpSession::process_request()
                 // ── Explorer API endpoints (loopback-only) ────────────────
                 if (target.substr(0, 14) == "/api/explorer/") {
                     // Loopback guard: only accept requests from 127.0.0.1 / ::1
+                    // (never on the stratum port)
                     auto remote_addr = socket_.remote_endpoint().address();
-                    if (!remote_addr.is_loopback()) {
+                    if (opts_.stratum_port || !remote_addr.is_loopback()) {
                         response.result(http::status::forbidden);
                         response.body() = R"({"error":"Explorer API is local-only"})";
                         response.prepare_payload();
@@ -1615,7 +1783,19 @@ void HttpSession::process_request()
 
 void HttpSession::send_response(http::response<http::string_body> response)
 {
+    // At or after the owner's deadline: closed, nothing written.
+    if (opts_.deadline && std::chrono::steady_clock::now() >= *opts_.deadline)
+        return close_socket();
+
     auto self = shared_from_this();
+
+    if (opts_.on_response) {
+        std::string target(request_.target());
+        const auto q = target.find('?');
+        if (q != std::string::npos)
+            target.resize(q);   // logged without its query string
+        opts_.on_response(std::string(request_.method_string()), target, response.result_int());
+    }
 
     // We shut down the send side of this socket immediately after the write
     // completes (below), i.e. every response is the last one on its
@@ -1628,25 +1808,43 @@ void HttpSession::send_response(http::response<http::string_body> response)
     response.keep_alive(false);
 
     auto response_ptr = std::make_shared<http::response<http::string_body>>(std::move(response));
-    
-    http::async_write(socket_, *response_ptr,
-        [self, response_ptr](beast::error_code ec, std::size_t bytes_transferred)
-        {
-            boost::ignore_unused(bytes_transferred);
-            
-            if(ec)
-                return self->handle_error(ec, "send_response");
-                
-            // Gracefully close the connection
-            beast::error_code close_ec;
-            self->socket_.shutdown(tcp::socket::shutdown_send, close_ec);
-        });
+
+    // One write path for every session, web port and stratum port alike.
+    begin_write();
+
+    auto on_written = [self, response_ptr](beast::error_code ec, std::size_t bytes_transferred)
+    {
+        boost::ignore_unused(bytes_transferred);
+        // The write is over: the deadline's wait is cancelled at once.
+        self->end_writing();
+
+        if(ec)
+            return self->handle_error(ec, "send_response");
+
+        // Gracefully close the connection
+        beast::error_code close_ec;
+        self->socket_.shutdown(tcp::socket::shutdown_send, close_ec);
+    };
+
+    if (head_request_) {
+        // HEAD: the status line and headers of the GET response, Content-Length
+        // included, and no body (RFC 9110 9.3.2).
+        auto sr = std::make_shared<http::response_serializer<http::string_body>>(*response_ptr);
+        http::async_write_header(socket_, *sr,
+            [sr, on_written](beast::error_code ec, std::size_t n) { on_written(ec, n); });
+        return;
+    }
+
+    http::async_write(socket_, *response_ptr, std::move(on_written));
 }
 
 void HttpSession::handle_error(beast::error_code ec, char const* what)
 {
     if (ec != beast::errc::operation_canceled && ec != beast::errc::broken_pipe) {
-        LOG_WARNING << "HTTP Session error in " << what << ": " << ec.message();
+        if (opts_.on_error)   // the stratum port: its rate-limited log
+            opts_.on_error(std::string(what) + ": " + ec.message());
+        else
+            LOG_WARNING << "HTTP Session error in " << what << ": " << ec.message();
     }
 }
 
