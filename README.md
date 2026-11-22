@@ -57,11 +57,11 @@ when NO dashd arm is given"; resolver in
 `dash.voidbind.com` runs this posture with no dashd on the host. A node started
 with `--coin-rpc H:P` keeps dashd as the reward-safe fallback arm — the
 operator's private deployment still runs dashd-attached — so both postures are
-supported by the same binary. The remaining work is the daemonless-finalize item
-below (retiring the `--coin-rpc` fallback entirely). See
+supported by the same binary. The remaining work is retiring the `--coin-rpc`
+fallback entirely. See
 [Per-binary launch reference](#per-binary-launch-reference) for the flags.
 
-**DASH v36 network (code merged 2026-10-03, seed nodes not yet deployed).**
+**DASH v36 network (code merged 2026-10-03, no public seed nodes yet).**
 `c2pool-dash --net dash-v36` joins a separate DASH sharechain that uses the V36
 share format. It has its own identity (network id `ac2785363c0180b8`, protocol
 3601), so it never mixes with the v16 `p2pool-dash` sharechain, and its own P2P
@@ -74,34 +74,27 @@ adds:
 - a graded misbehaviour score and ban for sharechain peers (PR #1858);
 - built-in seeds on port 8998, so a node started with `--net dash-v36` and no
   `--addnode` finds the network by itself (PR #1859).
-The two public seed nodes are being deployed; until they listen on 8998, the
-v36 network has no public peers.
+The public v36 network has no deployed seed nodes yet; until it does, start
+with `--addnode` to a known v36 peer.
 
 ## Governance
 
-Daemonless-Dash finalization has a funding proposal in Dash on-chain governance:
-c2pool-daemonless-delivered, 252 DASH, paid once at superblock 2575480 (around
-2026-11-20). The voting cutoff is around 2026-11-17.
+Daemonless-Dash finalization has not been funded by Dash on-chain governance yet.
 
-- DashCentral: https://www.dashcentral.org/p/c2pool-daemonless-delivered
-- Governance object: c7b462b7c8d81df10ce34ebd4436afd715f288c25a7c949835f889015248b247
-- Collateral: 639a53cfa9f19f16414a9dd679ebfdc930633e18eedd8cd5f06ff4a90925b705, mined
-  in block 2565421 by this pool through runtime transaction injection (below)
-- Vote from a masternode:
+- **c2pool-daemonless-delivered** (252 DASH, one payment at superblock 2575480,
+  2026-11-20): at the voting cutoff it had 190 net yes votes, short of the
+  threshold of 10 percent of enabled masternodes (317). Superblock 2575480 did
+  not pay it, and its window ends before the next superblock.
+  DashCentral: https://www.dashcentral.org/p/c2pool-daemonless-delivered;
+  governance object c7b462b7c8d81df10ce34ebd4436afd715f288c25a7c949835f889015248b247;
+  collateral 639a53cfa9f19f16414a9dd679ebfdc930633e18eedd8cd5f06ff4a90925b705, mined in
+  block 2565421 by this pool through runtime transaction injection (below).
+- **c2pool-daemonless-finalize**
+  (fa758340f1bd2391d17bb43667f76c5d9070d737b68e018e42ed75b09c6ba631, 2 x 125.5 DASH)
+  reached the threshold only after the last superblock inside its window (2558864)
+  had passed. Its window ended on 2026-11-04, so it was never paid.
 
-  ```
-  dash-cli gobject vote-many c7b462b7c8d81df10ce34ebd4436afd715f288c25a7c949835f889015248b247 funding yes
-  ```
-
-Funding requires net yes votes equal to 10 percent of enabled masternodes by the
-superblock.
-
-The earlier proposal, c2pool-daemonless-finalize
-(fa758340f1bd2391d17bb43667f76c5d9070d737b68e018e42ed75b09c6ba631, 2 x 125.5 DASH),
-reached the threshold only after the last superblock inside its window (2558864)
-had passed. Its window ends on 2026-11-04, before superblock 2575480, so it will
-never be paid. The new amount is its 251 DASH plus the 1 DASH collateral it burned.
-Votes do not carry over to the new hash.
+Votes do not carry over to a new proposal hash.
 
 ## Runtime transaction injection and the offline signer
 
@@ -1273,6 +1266,8 @@ Only the daemonless trust anchor applies to a daemonless node — see
 | `--listen [HOST:]PORT` | `0.0.0.0:8999` | Sharechain (pool P2P) bind. |
 | `--addnode H:P` (repeatable) | — | Persistent outbound sharechain peers. |
 | `--connect H:P` (repeatable) | — | Connect-only sharechain peers. |
+| `--net dash-v36` | off (v16 sharechain) | Join the DASH v36 network: share v36 only, P2P port 8998. Mainnet only; cannot be combined with `--network-id`, `--prefix` or `--testnet`. |
+| `--network-id HEX` [`--prefix HEX`] | the public p2pool-dash identity | Private sharechain identifier (hex, 1–8 bytes) and prefix. A custom id never dials public seeds and keeps its state in its own `<data-dir>` subdirectory; `--prefix` requires `--network-id`. |
 | `--no-p2p-relay` | off | Suppress the embedded won-block P2P relay (isolates the RPC submit arm). |
 | `--coin-p2p-connect H:P` (repeatable) | — | Pin explicit DASH coin-network peers (port 9999). |
 | `--coin-p2p-discover` | off | Seed-based (dnsseed.dash.org + fixed), scored, group-diverse coin-peer discovery — the network-standalone arm. Pinned peers are kept alongside. |
@@ -1325,6 +1320,11 @@ dashd-attached default OFF)
 | `--replay-fold-prestate FILE`, `--replay-fold-quorums`, `--replay-fold-qsnapshot FILE`, `--replay-fold-worklists FILE` | Anchor-seeded DML fold driven by the bulk lane, with derived quorum member sets. |
 | `--replay-mnlist-seed-height H --replay-mnlist-seed-source getmnlistdiff --replay-mnlist-seed-file FILE` | Optional V20 `getmnlistdiff` seed instead of deriving from DIP3 (implies `--replay-bulk`). |
 | `--replay-mined-commitment-index` | Mined-commitment store fed from replay. |
+| `--embedded-utxo-snapshot FILE` (alias `--utxo-snapshot`), `--embedded-utxo-snapshot-pin PINFILE` | Full UTXO set: import a pinned `dumptxoutset` into `<net>/utxo_full_leveldb` at start, then connect strictly from its base. |
+| `--embedded-utxo-full=false` | Open the accrual view instead of the full UTXO set. |
+| `--utxo-import FILE[,PART...]` [`--embedded-utxo-snapshot-pin PINFILE`] | Import into `<data-dir>/<net>/utxo_full_leveldb` and exit; the next start opens it. |
+| `--embedded-credit-pool-seed` | Seed the credit-pool follower from the v20 height over coin P2P. |
+| `--dash-v24-activation-height N` | Emergency pin of the Dash Core v24 activation height (a window boundary). It decides only where the versionbits/EHF tracker cannot, and the node refuses to serve where they disagree. |
 
 **Web, money, misc**
 
@@ -1342,6 +1342,11 @@ dashd-attached default OFF)
 | `--redistribute pplns\|fee\|boost\|donate` | `pplns` | Unnamed-share redistribution. |
 | `--coinbase-text TEXT` | `/P2Pool-DASH/c2pool/` | Coinbase scriptSig text, max 64 bytes (see [Coinbase structure](#coinbase-structure)). |
 | `--message-blob-hex HEX` (alias `--transition-message`) | — | Encrypted authority message blob. |
+| `--deferred-mint` / `--no-deferred-mint` | off | A share solved while the tracker is busy is minted at the next free lock instead of being declined. |
+| `--mempool-entry-probe` | off | Wire the direct-local `GET /mempool_entry?txid=` probe. |
+| `--allow-stub-bls` | off | Run a `bls=stub` build in a configuration that relies on BLS. Testing only, never in production (see the BLS section above). |
+
+Alert relay: see `c2pool-dash --help`.
 
 ### c2pool-btc — Bitcoin (SHA256d)
 
@@ -1731,7 +1736,8 @@ cd build && ctest --output-on-failure -j$(nproc)
 |---|---|
 | V36 share format (LTC parent chain) | Production. Share version 3601 (V36 format) on mainnet since 2026-11-13 00:00:00 UTC (v0.2.12.1) |
 | V36 share format (DGB Scrypt parent chain) | Running — `c2pool-dgb` daemonless public node (dgb.voidbind.com), joined to the live DGB sharechain via `--sharechain-addnode` |
-| Daemonless per-coin nodes (BTC, BCH, DASH) | Running — public voidbind nodes with no coin daemon on the serve path |
+| Daemonless per-coin nodes (BTC, BCH) | Running — public voidbind nodes with no coin daemon on the serve path |
+| DASH (`c2pool-dash`) | Production on mainnet, daemonless by default (embedded coin state; `--coin-rpc` optional fallback) |
 | Merged mining | DOGE in production (embedded); PEP, LKY, SHIC through external daemons, not production-tested; BELLS, JKC (segwit) not supported yet |
 | Embedded LTC SPV node | Working |
 | Embedded DOGE SPV node | Working |
