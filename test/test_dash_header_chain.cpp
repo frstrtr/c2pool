@@ -1447,6 +1447,16 @@ TEST(DashHeaderChainAnchor, StoredTipOffTheAnchorIsReselectedAtLoad)
         EXPECT_EQ(hc.tip()->hash, n.hash[K]);
         EXPECT_TRUE(hc.is_synced());
     }
+
+    // The re-selected tip is on disk: a reopen that runs no re-select (no
+    // checkpoint) reads it back, not the old branch's tip.
+    {
+        HeaderChain hc(no_anchor, db);
+        ASSERT_TRUE(hc.init());
+        ASSERT_TRUE(hc.tip().has_value());
+        EXPECT_EQ(hc.height(), K) << "the re-selected tip must be durable";
+        EXPECT_EQ(hc.tip()->hash, n.hash[K]);
+    }
     std::filesystem::remove_all(dir);
 }
 
