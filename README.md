@@ -221,36 +221,22 @@ and does not yet exist, so the work can be judged on what it actually is.
   real-RandomX verify, and the end-to-end KAT are **merged** (PR #1512).
   Since the Path B flag day (PR #2010) the lane has one payout model, Path B: Work
   Receipt Settlement (WRS), also called pay per receipt (PPR). There is no owed
-  ledger, no carried balance and no payout queue. Each pool block's coinbase pays
-  that block's full reward R, split across the Work Receipts in the block's
-  window, so the outputs sum to exactly R in every block. The window reaches back
-  from the block, in whole bins, until it holds work worth twice the Monero
-  network difficulty (less where a cap on its size applies). Each payee gets
-  floor(R × w_i / W), where w_i is its weight and W the window's total, and the
-  remainder goes one piconero each to the largest remainders. Every node rebuilds
-  each share's coinbase from the same window and rules (`src/impl/xmr/pathb/`,
-  PRs #1946 / #1950). The pool identity is derived from a Monero block and a
-  headline; the lane's rules are a separate digest that peers compare when they
-  connect. The node is `c2pool-v37-xmr` (`src/c2pool/v37/xmr/`, PRs #1992 /
-  #2010), and several nodes form one pool over its relay. The lane also has a
-  node package with a run-a-node guide (PR #1817,
-  [docs/xmr-lane/RUN-A-NODE.md](docs/xmr-lane/RUN-A-NODE.md)), peer discovery and
-  a persistent peer book (PR #1820), and the node's fees disclosed in every
-  stratum login reply (PR #1880). The earlier owed-ledger model and its rules
-  (PRs #1697 / #1704, #1872, #1884, #1894, #1895) are retired on this lane. Its
-  payout rules and a public comparison with other decentralized pools are in
-  [docs/xmr-lane/payout-fairness.md](docs/xmr-lane/payout-fairness.md) (PR #1879)
-  and [docs/xmr-lane/comparison.md](docs/xmr-lane/comparison.md) (PR #1901), both
-  written for the earlier owed-ledger model.
-- **Rule upgrades without stopping the pool, voted by miners' work (XMR lane).**
-  The lane's rules are numbered epochs. Each share carries a ballot, and the next
-  epoch activates only after shares holding three quarters of the work in one
-  vote window vote for it, and a grace period has passed. By default a node's
-  shares vote for an open upgrade unless its operator sets `--vote no`, and any
-  miner can override that with `vote=<n>` as the password in a stock xmrig. A
-  node that does not run the new rules holds instead of forking. The pool
-  identity does not change with the rules (PR #1962, wired at the Path B flag
-  day, PR #2010). Every build today compiles only the first epoch.
+  ledger, no carried balance and no payout queue; each pool block's coinbase pays
+  that block's full reward to the Work Receipts in its window. The node is
+  `c2pool-v37-xmr` (`src/c2pool/v37/xmr/`, PRs #1992 / #2010), and several nodes
+  can run one pool together. The lane also has a node package with a run-a-node
+  guide (PR #1817, [docs/xmr-lane/RUN-A-NODE.md](docs/xmr-lane/RUN-A-NODE.md)),
+  peer discovery and a persistent peer book (PR #1820), and the node's fees
+  disclosed in every stratum login reply (PR #1880). The earlier owed-ledger
+  model and its rules (PRs #1697 / #1704, #1872, #1884, #1894, #1895) are retired
+  on this lane. Its payout rules and a public comparison with other decentralized
+  pools are in [docs/xmr-lane/payout-fairness.md](docs/xmr-lane/payout-fairness.md)
+  (PR #1879) and [docs/xmr-lane/comparison.md](docs/xmr-lane/comparison.md) (PR
+  #1901), both written for the earlier owed-ledger model.
+- **Rule upgrades (XMR lane).** Rule upgrades are voted by miners' work (PR
+  #1962, wired at PR #2010): a node operator can set `--vote no`; a miner can set
+  `vote=<n>` as the password in a stock xmrig. Every build today compiles only
+  the first epoch. The pool identity does not change with the rules.
 - **Reference prototypes** under `proto/` (TLA⁺, MRR refimpl + goldens, the M4 sync
   feasibility harness, testbeds) and the v37 design-track spec/headers under
   `src/sharechain/v37/`. These are for study and reproduction, not deployment.
