@@ -905,6 +905,12 @@ public:
     /// the attempt has run — including on success — because "resumed" and
     /// "refused, and here is which rule" are the same question to an operator.
     const std::string& restore_verdict() const { return m_restore_verdict; }
+    /// R7 deferrals of the persisted cursor while our header tip was below it:
+    /// all of them, and the ones that brought no new tip height (the counted
+    /// ones; restore_defer_bound() of them end the wait COLD).
+    uint32_t r7_defers() const { return m_r7_defers; }
+    uint32_t r7_stalled() const { return m_r7_stalled; }
+    static constexpr uint32_t restore_defer_bound() { return kMaxRestoreDefers; }
 
     /// TRUE while a RESTORED set is still unfalsified.
     ///
@@ -1208,6 +1214,9 @@ public:
                 m_pending_is_live = true;
                 m_restore_settled = false;
                 m_restore_defers  = 0;
+                m_r7_defers       = 0;
+                m_r7_stalled      = 0;
+                m_r7_tip_high     = 0;
             }
             m_status = "RE-ARMED after a payee APPLY GAP (gap re-arm "
                        + std::to_string(m_gap_rearms) + ", not counted against"
@@ -1612,6 +1621,9 @@ private:
         m_pending_is_live = false;
         m_restore_settled = false;
         m_restore_defers  = 0;
+        m_r7_defers       = 0;
+        m_r7_stalled      = 0;
+        m_r7_tip_high     = 0;
     }
 
 public:
@@ -2500,6 +2512,9 @@ private:
         m_pending_is_live = false;
         m_restore_settled = m_cursor_store == nullptr;
         m_restore_defers  = 0;
+        m_r7_defers       = 0;
+        m_r7_stalled      = 0;
+        m_r7_tip_high     = 0;
         m_restore_verdict.clear();
         if (!m_cursor_store) return;
         std::string why;
@@ -2689,15 +2704,44 @@ private:
         }
 
         // R7 — is this record even about the replay we are here to do?
+        //
+        // A header tip BELOW the cursor is DEFERRED, not refused, while the
+        // header chain is still climbing: a fresh header store fast-starts at
+        // the anchor and re-syncs to the live tip in seconds, and refusing at
+        // the first pump turned that into a full re-fold from the anchor.
+        // Only a pump that brings NO new tip height counts toward
+        // kMaxRestoreDefers (the same bound R4 uses, on its own counter);
+        // every other pump raises the tip by at least one, and the tip cannot
+        // pass the cursor without leaving this branch, so the whole wait is
+        // bounded by (cursor - first deferred tip) + kMaxRestoreDefers pumps.
+        // Nothing is accepted here: once the tip reaches the cursor, R4 below
+        // still decides whether our chain holds exactly the folded block.
         const uint32_t tip = m_tip_height ? m_tip_height() : 0;
         if (rec.cursor_height > tip) {
-            restore_cold(
-                "R7 cursor-above-tip",
-                "the record's cursor h=" + std::to_string(rec.cursor_height)
-                    + " is ABOVE our own header tip h=" + std::to_string(tip)
-                    + " — we cannot verify at a height we do not have, and a"
-                      " chain that lost ground is not a chain to resume onto");
-            return true;
+            const bool rising = m_r7_defers == 0 || tip > m_r7_tip_high;
+            if (tip > m_r7_tip_high) m_r7_tip_high = tip;
+            if (!rising && ++m_r7_stalled > kMaxRestoreDefers) {
+                restore_cold(
+                    "R7 cursor-above-tip",
+                    "the record's cursor h=" + std::to_string(rec.cursor_height)
+                        + " stayed ABOVE our own header tip h="
+                        + std::to_string(tip) + " across "
+                        + std::to_string(kMaxRestoreDefers)
+                        + " pumps that brought no new header height — we"
+                          " cannot verify at a height we do not have, and a"
+                          " chain that stopped short is not a chain to resume"
+                          " onto");
+                return true;
+            }
+            ++m_r7_defers;
+            if (m_r7_defers == 1 || m_r7_defers % 10 == 0 || !rising)
+                LOG_INFO << "[MN-CKPT] persisted cursor h=" << rec.cursor_height
+                         << " is above our header tip h=" << tip
+                         << " (deferral " << m_r7_defers << ", stalled "
+                         << m_r7_stalled << "/" << kMaxRestoreDefers
+                         << ") — waiting for the header chain to reach it,"
+                            " then R4 decides";
+            return false;   // defer this pump
         }
 
         // R4 — the reorg / fork guard. Deferred, not refused, while the header
@@ -4674,6 +4718,9 @@ public:
         m_persist_arith_warned = false;
         m_resume_hold_logged   = 0;
         m_restore_defers       = 0;
+        m_r7_defers            = 0;
+        m_r7_stalled           = 0;
+        m_r7_tip_high          = 0;
         // ── THE ADJUDICATION ITSELF, not merely its result. ───────────────
         //
         // m_restore_settled is the LATCH that says "this process no longer
@@ -4926,6 +4973,11 @@ public:
     std::optional<MnBridgeCursor> m_pending_restore;
     bool     m_restore_settled{true};    // true when no adjudication is owed
     uint32_t m_restore_defers{0};
+    /// R7 deferrals (header tip below the cursor): all of them, the ones that
+    /// brought no new tip height, and the highest tip seen while deferring.
+    uint32_t m_r7_defers{0};
+    uint32_t m_r7_stalled{0};
+    uint32_t m_r7_tip_high{0};
     std::string m_restore_verdict;
     uint32_t m_restored_at{0};           // height a restore resumed from
     /// Blocks / folds a PREVIOUS process contributed. Kept separate from

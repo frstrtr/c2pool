@@ -5827,6 +5827,154 @@ TEST(DashMnBridgeCursor, ReorgPastThePersistedCursorIsRefusedAndReplayedCold)
     EXPECT_EQ(r.h.lane.replay_applied(), 3u);
 }
 
+// ── 4b. R7: a header tip BELOW the cursor defers; it does not refuse ───────
+//
+// A fresh header store fast-starts AT the anchor and re-syncs to the live tip
+// within seconds. The cursor must survive that window: a refusal at the first
+// pump turned a seconds-long header catch-up into a full re-fold from the
+// anchor. Only pumps that bring no new tip height count toward the bound.
+
+TEST(DashMnBridgeCursor, R7CursorAboveACatchingUpTipResumesWarm)
+{
+    TempCursorStore cs("r7warm");
+    { CursorRun a(&cs.store, 1519545); a.run(); ASSERT_TRUE(a.h.published); }
+    ASSERT_TRUE(cs.exists());
+
+    // A fresh header store: the tip is back at the anchor.
+    CursorRun r(&cs.store, kAnchorHeight);
+    r.run();
+    EXPECT_FALSE(r.h.lane.cursor_restored());
+    EXPECT_TRUE(r.h.lane.restore_verdict().empty())
+        << "a deferral is not a verdict: " << r.h.lane.restore_verdict();
+    EXPECT_EQ(r.h.lane.r7_defers(), 1u);
+    EXPECT_EQ(r.h.lane.r7_stalled(), 0u);
+    EXPECT_TRUE(cs.exists()) << "a deferred record must not be erased";
+    EXPECT_TRUE(r.h.requested.empty())
+        << "nothing may be replayed while the cursor is being held";
+
+    // The headers come back past the cursor.
+    r.h.tip = 1519546;
+    r.h.lane.pump();
+
+    ASSERT_TRUE(r.h.lane.cursor_restored())
+        << "verdict: " << r.h.lane.restore_verdict();
+    EXPECT_EQ(r.h.lane.restored_at(), 1519545u);
+    ASSERT_TRUE(r.h.published) << r.h.lane.status();
+    EXPECT_EQ(r.h.published_as_of, 1519546u);
+    for (uint32_t asked : r.h.requested)
+        EXPECT_GT(asked, 1519545u)
+            << "h=" << asked << " was folded by the previous process; a warm"
+               " resume never asks for it again";
+    EXPECT_EQ(r.h.lane.replay_applied(), 1u);
+    EXPECT_EQ(r.h.lane.applied_lifetime(), 3u);
+}
+
+TEST(DashMnBridgeCursor, R7TipThatNeverReachesTheCursorGoesColdAfterTheBound)
+{
+    TempCursorStore cs("r7bound");
+    { CursorRun a(&cs.store, 1519545); a.run(); ASSERT_TRUE(a.h.published); }
+
+    CursorRun r(&cs.store, kAnchorHeight);
+    r.run();   // deferral 1: the first look is never a stall
+    const uint32_t bound = MnCheckpointLane::restore_defer_bound();
+    for (uint32_t i = 1; i <= bound; ++i) {
+        r.h.lane.pump();
+        ASSERT_EQ(r.h.lane.r7_stalled(), i);
+        ASSERT_FALSE(r.h.lane.cursor_restored());
+        ASSERT_TRUE(r.h.lane.restore_verdict().empty())
+            << "still inside the bound at stalled pump " << i << ": "
+            << r.h.lane.restore_verdict();
+        ASSERT_TRUE(cs.exists());
+    }
+    // One stalled pump past the bound: COLD, exactly as before this change.
+    r.h.lane.pump();
+    EXPECT_FALSE(r.h.lane.cursor_restored());
+    EXPECT_NE(r.h.lane.restore_verdict().find("R7 cursor-above-tip"),
+              std::string::npos)
+        << r.h.lane.restore_verdict();
+    EXPECT_FALSE(cs.exists()) << "a refused record is erased";
+    EXPECT_EQ(r.h.lane.cursor_height(), kAnchorHeight)
+        << "the cold replay starts at the anchor";
+
+    // ...and the cold lane still does its job once the headers arrive.
+    r.h.tip = 1519546;
+    r.h.lane.pump();
+    ASSERT_TRUE(r.h.published) << r.h.lane.status();
+    EXPECT_EQ(r.h.published_as_of, 1519546u);
+    EXPECT_EQ(r.h.lane.replay_applied(), 3u);
+}
+
+TEST(DashMnBridgeCursor, R7OnlyPumpsWithoutANewTipHeightCountTowardTheBound)
+{
+    TempCursorStore cs("r7rise");
+    { CursorRun a(&cs.store, 1519545); a.run(); ASSERT_TRUE(a.h.published); }
+
+    CursorRun r(&cs.store, kAnchorHeight);
+    r.run();
+    const uint32_t bound = MnCheckpointLane::restore_defer_bound();
+    for (uint32_t i = 1; i < bound; ++i) r.h.lane.pump();
+    ASSERT_EQ(r.h.lane.r7_stalled(), bound - 1);
+
+    // The tip climbs one height (still below the cursor): not a stall.
+    r.h.tip = kAnchorHeight + 1;
+    r.h.lane.pump();
+    EXPECT_EQ(r.h.lane.r7_stalled(), bound - 1);
+    EXPECT_TRUE(r.h.lane.restore_verdict().empty()) << r.h.lane.restore_verdict();
+
+    // A reorg-like dip back below the high-water mark is a stall, not progress.
+    r.h.tip = kAnchorHeight;
+    r.h.lane.pump();
+    EXPECT_EQ(r.h.lane.r7_stalled(), bound);
+    EXPECT_TRUE(r.h.lane.restore_verdict().empty()) << r.h.lane.restore_verdict();
+    r.h.lane.pump();
+    EXPECT_NE(r.h.lane.restore_verdict().find("R7"), std::string::npos)
+        << r.h.lane.restore_verdict();
+}
+
+TEST(DashMnBridgeCursor, R7TipThatCatchesUpOnADifferentChainIsRefusedByR4)
+{
+    TempCursorStore cs("r7fork");
+    { CursorRun a(&cs.store, 1519545); a.run(); ASSERT_TRUE(a.h.published); }
+
+    CursorRun r(&cs.store, kAnchorHeight);
+    r.h.auto_deliver = false;
+    r.run();
+    ASSERT_EQ(r.h.lane.r7_defers(), 1u);
+
+    // The tip reaches the cursor height, but on a chain that holds a
+    // different block there.
+    r.h.headers[1519545] = uint256S(
+        "00000000000000000000000000000000000000000000000000000000feedface");
+    r.h.tip = 1519546;
+    r.h.lane.pump();
+
+    EXPECT_FALSE(r.h.lane.cursor_restored());
+    EXPECT_NE(r.h.lane.restore_verdict().find("R4"), std::string::npos)
+        << r.h.lane.restore_verdict();
+    EXPECT_FALSE(cs.exists());
+    EXPECT_EQ(r.h.lane.cursor_height(), kAnchorHeight);
+
+    r.h.auto_deliver = true;
+    for (uint32_t ht = 1519544; ht <= 1519546; ++ht)
+        r.h.lane.on_block_connected(r.h.blocks.at(ht), ht);
+    ASSERT_TRUE(r.h.published) << r.h.lane.status();
+    EXPECT_EQ(r.h.published_as_of, 1519546u);
+    EXPECT_EQ(r.h.lane.replay_applied(), 3u);
+}
+
+TEST(DashMnBridgeCursor, R7ACursorAtOrBelowTheTipNeverDefers)
+{
+    TempCursorStore cs("r7none");
+    { CursorRun a(&cs.store, 1519545); a.run(); ASSERT_TRUE(a.h.published); }
+
+    CursorRun r(&cs.store, 1519546);
+    r.run();
+    ASSERT_TRUE(r.h.lane.cursor_restored()) << r.h.lane.restore_verdict();
+    EXPECT_EQ(r.h.lane.r7_defers(), 0u);
+    EXPECT_EQ(r.h.lane.r7_stalled(), 0u);
+    EXPECT_EQ(r.h.lane.restored_at(), 1519545u);
+}
+
 // ── 5. R5: the anti-gap arithmetic ─────────────────────────────────────────
 TEST(DashMnBridgeCursor, ARecordThatSkippedHeightsIsRefusedNotResumed)
 {
