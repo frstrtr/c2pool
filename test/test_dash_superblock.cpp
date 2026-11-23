@@ -43,6 +43,7 @@
 ///   9. R6 superblock desync cross-check: mismatched coinbase at a superblock
 ///      height clears + latches; no false-fire off superblock heights.
 
+#include <limits>
 #include <gtest/gtest.h>
 
 #include <impl/dash/coin/utxo_adapter.hpp>          // dash_txid (subsidy.hpp template dep)
@@ -482,6 +483,45 @@ TEST(DashSuperblock, OverBudgetRejected) {
     store.add_verified_funding_vote(hash_of(23), "mn-0", VOTE_OUTCOME_YES, 1);
     const int64_t budget = superblock_budget(1519824, DASH_SUPERBLOCK_CYCLE_TESTNET);
     EXPECT_FALSE(get_superblock_payments(store, 1519824, budget).has_value());
+}
+
+// ── 5e2. The schedule total against the budget ─────────────────────────────
+TEST(DashSuperblock, ScheduleTotalBoundedByBudget) {
+    const int64_t budget = superblock_budget(1519824, DASH_SUPERBLOCK_CYCLE_TESTNET);
+    ASSERT_EQ(budget, 1'428'625'704LL);   // 14.28625704 DASH
+    auto paid = [&](uint64_t id, const char* amts) {
+        GovernanceStore store;
+        store.set_funding_threshold(1);
+        store.set_vote_weight_fn(weight_all_regular);
+        const std::string addr = "yeRZBWYfeNE4yVUHV4ZLs83Ppn9aMRH57A";
+        auto trig = parse_superblock_trigger(
+            trigger_json(1519824, addr + "|" + addr, amts,
+                         std::string(kPropHash) + "|" + kPropHash),
+            hash_of(id), /*testnet=*/true);
+        EXPECT_TRUE(trig.has_value()) << amts;
+        if (!trig) return false;
+        EXPECT_TRUE(store.add_trigger(*trig));
+        store.add_verified_funding_vote(hash_of(id), "mn-0", VOTE_OUTCOME_YES, 1);
+        return get_superblock_payments(store, 1519824, budget).has_value();
+    };
+    EXPECT_TRUE(paid(31, "10.00000000|4.28625704")) << "a total exactly at the budget is paid";
+    EXPECT_FALSE(paid(32, "10.00000000|4.28625705")) << "one duff over the budget is refused";
+    EXPECT_FALSE(paid(33, "14.28625705|0.00000001")) << "the first entry alone over the budget is refused";
+}
+
+// ── 5e3. A trigger's total amount ────────────────────────────────────────────
+TEST(DashSuperblock, TriggerTotalAmountIsBounded) {
+    GovernanceTrigger t;
+    const std::vector<uint8_t> s = kScriptYeRZ;
+    t.payments = {{s, 7}, {s, 8}};
+    EXPECT_EQ(t.total_amount(), 15);
+    const int64_t max = std::numeric_limits<int64_t>::max();
+    t.payments = {{s, max - 5}, {s, 5}};
+    EXPECT_EQ(t.total_amount(), max);
+    t.payments = {{s, max - 5}, {s, 10}};
+    EXPECT_EQ(t.total_amount(), max);
+    t.payments = {{s, max}, {s, 1}, {s, 1}};
+    EXPECT_EQ(t.total_amount(), max);
 }
 
 // ── 5f. Highest-yes trigger wins among competitors ──────────────────────────
