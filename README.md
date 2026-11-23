@@ -80,9 +80,20 @@ with `--addnode` to a known v36 peer.
 
 Daemonless-Dash finalization has not been funded by Dash on-chain governance yet.
 
+- **c2pool-daemonless-dash** (current, submitted 2026-11-23): 50 DASH at each of six
+  superblocks, December 2026 to May 2027 (window 2026-11-22 to 2027-06-03), to
+  XdgF55wEHBRWwbuBniNYH4GvvaoYMgL84u. Each superblock is decided separately.
+  DashCentral: https://www.dashcentral.org/p/c2pool-daemonless-dash;
+  governance object fef748433af0d10120a4033f1e8edf2146b95d19d97fa63d47a71f556349342d;
+  collateral 41b080a7d6ae9ee1c37a7d31ccc3d99a984b663c630f0afcc3a9079b22da415e (zero fee,
+  242 inputs), mined in block 2577188 by this pool through runtime transaction
+  injection (below). Check the tally on any Dash Core node with
+  `dash-cli gobject get fef748433af0d10120a4033f1e8edf2146b95d19d97fa63d47a71f556349342d`.
 - **c2pool-daemonless-delivered** (252 DASH, one payment at superblock 2575480,
   2026-11-20): at the voting cutoff it had 190 net yes votes (206 yes, 16 no),
-  short of the threshold of 10 percent of the masternode voting weight. Superblock
+  short of the threshold of 10 percent of the masternode voting weight. It could not
+  have been paid there in any case: of that superblock's 6828.26 DASH budget,
+  6710.00 DASH went to 19 approved payments, leaving 118.26 DASH. Superblock
   2575480 did not pay it, and its window ends before the next superblock.
   DashCentral: https://www.dashcentral.org/p/c2pool-daemonless-delivered;
   governance object c7b462b7c8d81df10ce34ebd4436afd715f288c25a7c949835f889015248b247;
@@ -118,7 +129,9 @@ not relay. The node never holds keys; transactions are signed on an offline mach
   finds a block. A coinbase input must be mature in the block being built.
 - **Examples on mainnet.** Block 2565253 carries a zero-fee consolidation of 189 outputs
   (539aa4b7aeceeb17c302cd51f402f3371f527ef73178466b5e3c2f80b9b40a28). Block 2565421
-  carries the collateral of the proposal above.
+  carries the collateral of c2pool-daemonless-delivered. Block 2577188 carries the
+  collateral of c2pool-daemonless-dash: zero fee, 242 inputs, spending every output
+  of the payment address that was mature when it was built, 1-duff outputs included.
 
 Tools in this repository, under `ui/c2wallet-qt/` (see its README):
 
