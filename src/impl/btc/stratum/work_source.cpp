@@ -245,6 +245,8 @@ void BTCWorkSource::update_stratum_worker(const std::string& session_id,
     std::lock_guard<std::mutex> lk(workers_mutex_);
     auto it = workers_.find(session_id);
     if (it == workers_.end()) return;
+    if (accepted > it->second.accepted)
+        it->second.last_accepted_at = std::chrono::steady_clock::now();
     it->second.hashrate      = hashrate;
     it->second.dead_hashrate = dead_hashrate;
     it->second.difficulty    = difficulty;

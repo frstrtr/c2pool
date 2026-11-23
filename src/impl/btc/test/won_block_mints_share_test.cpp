@@ -32,6 +32,7 @@
 #include <core/stratum_types.hpp>
 #include <core/uint256.hpp>
 
+#include <chrono>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -182,4 +183,21 @@ TEST(BtcWonBlockMintsShare, PlainShareStillWritesAndDoesNotBroadcast)
     EXPECT_TRUE(result.get<bool>());
     EXPECT_TRUE(share_written);
     EXPECT_FALSE(fx.submit_called);
+}
+
+// The BTC registry stamps when a session's accepted counter last moved, so the
+// dashboard's liveness ages are exact rather than the poll-stamp fallback.
+TEST(BtcStratumWorkSource, UpdateStratumWorkerStampsLastAccepted)
+{
+    Fixture fx;
+    auto ws = fx.make();
+    core::stratum::WorkerInfo w;
+    w.username = "1FixtureMinerAddress";
+    ws->register_stratum_worker("s", w);
+    ws->update_stratum_worker("s", 1e9, 0.0, 1.0, 0, 1, 0);
+    EXPECT_EQ(ws->snapshot_stratum_workers().at("s").last_accepted_at,
+              std::chrono::steady_clock::time_point{});
+    const auto before = std::chrono::steady_clock::now();
+    ws->update_stratum_worker("s", 1e9, 0.0, 1.0, 3, 1, 0);
+    EXPECT_GE(ws->snapshot_stratum_workers().at("s").last_accepted_at, before);
 }

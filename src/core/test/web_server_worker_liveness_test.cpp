@@ -3,6 +3,9 @@
 
 #include <chrono>
 #include <ctime>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <map>
 #include <string>
 
@@ -517,4 +520,56 @@ TEST(WorkerLiveness, LocalRateDropsAfterSilenceAndReturnsOnNextShare) {
     const auto t3 = t2 + seconds(5);
     lv = mi.observe_worker_liveness(ws, t3);
     EXPECT_DOUBLE_EQ(sum(MiningInterface::submitting_miner_rates(ws, lv).first), 2e12);
+}
+
+// /miner_stats/<address> sums the same sessions: a failover session of the
+// address carrying a rate does not add to the address's hashrate.
+TEST(WorkerLiveness, MinerStatsRateCountsOnlySubmittingSessions) {
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::LITECOIN);
+    const auto now = Clock::now();
+    mi.register_stratum_worker("failover", worker(now - seconds(3600), 5e12));   // D2, never shares
+    auto hasher = worker(now - seconds(3600));
+    hasher.worker_name = "D4";
+    mi.register_stratum_worker("hasher", hasher);
+    mi.update_stratum_worker("hasher", 1e12, 0.0, 1.0, 10, 0, 0);
+
+    auto r = mi.rest_miner_stats("XaddrD9");
+    EXPECT_DOUBLE_EQ(r["hashrate"].get<double>(), 1e12);
+    EXPECT_DOUBLE_EQ(r["hashrate_periods"]["1h"]["hashrate"].get<double>(), 1e12);
+}
+
+// The local-rate graph fallback (no windowed rate source wired) records only
+// sessions that are currently submitting.
+TEST(WorkerLiveness, StatLogFallbackCountsOnlySubmittingSessions) {
+    const auto dir = std::filesystem::temp_directory_path() / "core_liveness_statlog_fallback";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    const std::string path = (dir / "graph_db").string();
+
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::LITECOIN);
+    mi.set_stat_log_path(path);
+    const auto now = Clock::now();
+    auto failover = worker(now - seconds(3600), 5e12);   // never shares
+    failover.username = "XaddrIdle";
+    mi.register_stratum_worker("failover", failover);
+    auto hasher = worker(now - seconds(3600));
+    hasher.worker_name = "D4";
+    mi.register_stratum_worker("hasher", hasher);
+    mi.update_stratum_worker("hasher", 1e12, 0.0, 1.0, 10, 0, 0);
+
+    mi.update_stat_log();
+    mi.save_stat_log();
+
+    std::ifstream f(path);
+    ASSERT_TRUE(static_cast<bool>(f));
+    const auto arr = nlohmann::json::parse(std::string((std::istreambuf_iterator<char>(f)),
+                                                       std::istreambuf_iterator<char>()));
+    ASSERT_EQ(arr.size(), 1u);
+    const auto& lhr = arr[0]["lhr"];
+    EXPECT_FALSE(lhr.contains("XaddrIdle"));
+    ASSERT_TRUE(lhr.contains("XaddrD9"));
+    EXPECT_DOUBLE_EQ(lhr["XaddrD9"].get<double>(), 1e12);
+    std::filesystem::remove_all(dir);
 }
