@@ -161,15 +161,26 @@ int main() {
     bool nobody = true;
     for (auto* n : all) nobody = nobody && !n->relay().book().is_good("127.0.0.1", X.port());
     C(nobody && X.links() == 0, "D3 no node of the pool holds X as good; X has no link");
-    std::this_thread::sleep_for(500ms);
-    bool saved_clean = true;
-    for (const auto& r : Y.saved_book()) saved_clean = saved_clean && r.port != X.port();
+    const auto t3 = std::chrono::steady_clock::now();
+    const bool saved_clean = wait_until([&] {
+        for (const auto& r : Y.saved_book()) if (r.port == X.port()) return false;
+        return true;
+    }, 1500ms, 50ms);
+    std::printf("    D3 wait %lld ms\n",
+                (long long)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t3).count());
     C(saved_clean, "D3 Y's persisted book does not contain X");
 
     std::printf("-- D4 restart n3 with n0 DOWN, no seed: the persisted book alone\n");
-    std::this_thread::sleep_for(700ms);   // > book_save_ms: n3's book is on "disk"
-    auto stored = ns[2]->saved_book();
-    std::size_t good = 0; for (const auto& r : stored) good += r.good ? 1 : 0;
+    std::vector<PeerRecord> stored;
+    std::size_t good = 0;
+    const auto t4 = std::chrono::steady_clock::now();
+    (void)wait_until([&] {
+        stored = ns[2]->saved_book();
+        good = 0; for (const auto& r : stored) good += r.good ? 1 : 0;
+        return good >= 3;
+    }, 1500ms, 50ms);
+    std::printf("    D4 wait %lld ms\n",
+                (long long)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t4).count());
     std::printf("    n3 persisted %zu entries, %zu good\n", stored.size(), good);
     C(good >= 3, "D4 n3 persisted >= 3 good peers");
     n0->relay().stop();
