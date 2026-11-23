@@ -3131,6 +3131,16 @@ public:
     //   stalled  -- shared on this connection, then went silent, and no
     //               evidence that it hashes elsewhere
     static const char* session_state(const WorkerLiveness& lv);
+    // Local hash rate counts only sessions that are currently submitting, i.e.
+    // in the "hashing" state above. A session's registry hashrate is updated
+    // only on an accepted share, so it stays frozen when the rig stops
+    // submitting; standby (failover, failback) and stalled sessions therefore
+    // contribute nothing. Returns {miner_hash_rates, miner_dead_hash_rates},
+    // keyed by the full stratum username (ADDRESS.worker, else ADDRESS).
+    static bool is_submitting(const WorkerLiveness& lv) { return lv.has_shared && !lv.silent; }
+    static std::pair<nlohmann::json, nlohmann::json> submitting_miner_rates(
+        const std::map<std::string, WorkerInfo>& workers,
+        const std::map<std::string, WorkerLiveness>& liveness);
     // Failback: set hashing_elsewhere on every session that is not hashing
     // here when the shared rule (core/hashing_elsewhere.hpp) holds for its
     // payout address: a share minted on another node newer than the session's

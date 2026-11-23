@@ -461,3 +461,60 @@ TEST(WorkerLiveness, ElsewhereWindowBoundaries) {
         EXPECT_EQ(lv.at("s").hashing_elsewhere, age >= 900);
     }
 }
+
+// Local hash rate counts only sessions that are currently submitting. A
+// failover session that never shared here keeps whatever rate its registry
+// entry carries, and it must not show up as local hash rate.
+TEST(WorkerLiveness, LocalRatesCountOnlySubmittingSessions) {
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::LITECOIN);
+    const auto now = Clock::now();
+    mi.register_stratum_worker("failover", worker(now - seconds(3600), 5e12));   // D2, never shares
+    auto hasher = worker(now - seconds(3600));
+    hasher.worker_name = "D4";
+    mi.register_stratum_worker("hasher", hasher);
+    mi.update_stratum_worker("hasher", 1e12, 0.0, 1.0, 10, 0, 0);
+
+    auto r = mi.rest_local_stats();
+    ASSERT_EQ(r["miner_hash_rates"].size(), 1u);
+    EXPECT_DOUBLE_EQ(r["miner_hash_rates"]["XaddrD9.D4"].get<double>(), 1e12);
+    EXPECT_FALSE(r["miner_hash_rates"].contains("XaddrD9.D2"));
+    EXPECT_DOUBLE_EQ(r["my_hash_rates_in_last_hour"]["actual"].get<double>(), 1e12);
+
+    auto s = mi.rest_stratum_stats();
+    EXPECT_DOUBLE_EQ(s["pool"]["hashrate"].get<double>(), 1e12);
+}
+
+// A session that stops submitting drops out of the local rate once it is
+// silent (no share within kSilentExpectedIntervals expected intervals, floor
+// kSilentFloorSeconds), and counts again on its next accepted share.
+TEST(WorkerLiveness, LocalRateDropsAfterSilenceAndReturnsOnNextShare) {
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::LITECOIN);
+    const auto t0 = Clock::now();
+    std::map<std::string, MiningInterface::WorkerInfo> ws{
+        {"s1", worker(t0 - seconds(3600), 2e12, 1.0, 5)}};
+    auto sum = [](const nlohmann::json& rates) {
+        double t = 0.0;
+        for (const auto& [k, v] : rates.items()) t += v.get<double>();
+        return t;
+    };
+
+    auto lv = mi.observe_worker_liveness(ws, t0);   // first sighting stamps t0
+    EXPECT_DOUBLE_EQ(sum(MiningInterface::submitting_miner_rates(ws, lv).first), 2e12);
+
+    const auto t1 = t0 + seconds(MiningInterface::kSilentFloorSeconds - 1);
+    lv = mi.observe_worker_liveness(ws, t1);
+    EXPECT_DOUBLE_EQ(sum(MiningInterface::submitting_miner_rates(ws, lv).first), 2e12)
+        << "still inside the silence threshold";
+
+    const auto t2 = t0 + seconds(MiningInterface::kSilentFloorSeconds);
+    lv = mi.observe_worker_liveness(ws, t2);
+    EXPECT_TRUE(MiningInterface::submitting_miner_rates(ws, lv).first.empty())
+        << "silent: the frozen registry rate must not count";
+
+    ws.at("s1").accepted = 6;                        // its next accepted share
+    const auto t3 = t2 + seconds(5);
+    lv = mi.observe_worker_liveness(ws, t3);
+    EXPECT_DOUBLE_EQ(sum(MiningInterface::submitting_miner_rates(ws, lv).first), 2e12);
+}

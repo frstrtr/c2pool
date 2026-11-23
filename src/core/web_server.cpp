@@ -4037,7 +4037,7 @@ nlohmann::json MiningInterface::rest_stratum_stats(bool reveal_ips)
             if (lv.hashing_elsewhere) ++connections_standby_elsewhere;
         }
         else ++connections_stalled;
-        total_hashrate += w.hashrate;
+        if (is_submitting(lv)) total_hashrate += w.hashrate;
         total_accepted += w.accepted;
         total_rejected += w.rejected;
         total_stale += w.stale;
@@ -7360,27 +7360,15 @@ nlohmann::json MiningInterface::rest_local_stats()
             result["peers"]["outgoing"] = hs["peer_count"];
     }
 
-    // miner_hash_rates / miner_dead_hash_rates — from stratum worker registry
-    nlohmann::json miner_rates = nlohmann::json::object();
-    nlohmann::json miner_dead  = nlohmann::json::object();
+    // miner_hash_rates / miner_dead_hash_rates — from stratum worker registry,
+    // sessions that are currently submitting only (submitting_miner_rates).
     {
-        auto workers = effective_stratum_workers();
-        for (const auto& [sid, w] : workers) {
-            // Key by the FULL stratum username (ADDRESS.worker) so each D9/worker
-            // gets its own bucket; fall back to the bare address when no worker
-            // suffix was supplied. Read/web-stats path only — pool-wide aggregates
-            // (poolhashps, shares, payouts) are unchanged.
-            std::string key = w.worker_name.empty()
-                                  ? w.username
-                                  : w.username + "." + w.worker_name;
-            double existing = miner_rates.value(key, 0.0);
-            miner_rates[key] = existing + w.hashrate;
-            double existing_dead = miner_dead.value(key, 0.0);
-            miner_dead[key] = existing_dead + w.dead_hashrate;
-        }
+        const auto workers = effective_stratum_workers();
+        const auto liveness = observe_worker_liveness(workers, std::chrono::steady_clock::now());
+        auto [miner_rates, miner_dead] = submitting_miner_rates(workers, liveness);
+        result["miner_hash_rates"] = std::move(miner_rates);
+        result["miner_dead_hash_rates"] = std::move(miner_dead);
     }
-    result["miner_hash_rates"] = miner_rates;
-    result["miner_dead_hash_rates"] = miner_dead;
 
     // #919 per-node LOCAL hashrate (local_hashps) -- the series a local-hashrate
     // graph polls over time. This is THIS node's own work rate, read from the
@@ -7894,11 +7882,15 @@ nlohmann::json MiningInterface::rest_local_stats()
     }
     result["attempts_to_merged_block"] = merged_attempts;
 
-    // p2pool-compat: my_hash_rates_in_last_hour — aggregate from all local workers
+    // p2pool-compat: my_hash_rates_in_last_hour — aggregate from the local
+    // workers that are currently submitting (submitting_miner_rates rule)
     double total_hr = 0, total_dead = 0;
     {
         auto workers = effective_stratum_workers();
+        const auto liveness = observe_worker_liveness(workers, std::chrono::steady_clock::now());
         for (const auto& [sid, w] : workers) {
+            const auto lv = liveness.find(sid);
+            if (lv == liveness.end() || !is_submitting(lv->second)) continue;
             total_hr += w.hashrate;
             total_dead += w.dead_hashrate;
         }
@@ -9464,14 +9456,19 @@ nlohmann::json MiningInterface::rest_miner_stats(const std::string& address)
     {
         const auto now = std::chrono::steady_clock::now();
         auto workers = effective_stratum_workers();
+        const auto liveness = observe_worker_liveness(workers, now);
         for (const auto& [sid, w] : workers) {
             // Match base address (strip worker suffix)
             std::string base = w.username;
             auto dot = base.find('.');
             if (dot != std::string::npos) base = base.substr(0, dot);
             if (base == address) {
-                total_hr += w.hashrate;
-                dead_hr += w.dead_hashrate;
+                // Rate: currently submitting sessions only (submitting_miner_rates).
+                const auto lv = liveness.find(sid);
+                if (lv != liveness.end() && is_submitting(lv->second)) {
+                    total_hr += w.hashrate;
+                    dead_hr += w.dead_hashrate;
+                }
                 diff = w.difficulty;  // last seen difficulty
                 accepted += w.accepted;
                 rejected += w.rejected;
@@ -11768,6 +11765,28 @@ MiningInterface::WorkerLiveness MiningInterface::classify_worker_liveness(
     return out;
 }
 
+std::pair<nlohmann::json, nlohmann::json> MiningInterface::submitting_miner_rates(
+    const std::map<std::string, WorkerInfo>& workers,
+    const std::map<std::string, WorkerLiveness>& liveness)
+{
+    nlohmann::json rates = nlohmann::json::object();
+    nlohmann::json dead  = nlohmann::json::object();
+    for (const auto& [sid, w] : workers) {
+        const auto lv = liveness.find(sid);
+        if (lv == liveness.end() || !is_submitting(lv->second)) continue;
+        // Key by the FULL stratum username (ADDRESS.worker) so each D9/worker
+        // gets its own bucket; fall back to the bare address when no worker
+        // suffix was supplied. Read/web-stats path only — pool-wide aggregates
+        // (poolhashps, shares, payouts) are unchanged.
+        const std::string key = w.worker_name.empty()
+                                    ? w.username
+                                    : w.username + "." + w.worker_name;
+        rates[key] = rates.value(key, 0.0) + w.hashrate;
+        dead[key]  = dead.value(key, 0.0) + w.dead_hashrate;
+    }
+    return {rates, dead};
+}
+
 const char* MiningInterface::session_state(const WorkerLiveness& lv)
 {
     if (!lv.has_shared) return "standby";
@@ -12403,7 +12422,11 @@ void MiningInterface::update_stat_log()
             for (const auto& [user, dhr] : dead_rates)
                 entry.local_dead_hash_rates[user] = dhr;
         } else {
+            // Same rule as /local_stats: only sessions that are currently submitting.
+            const auto liveness = observe_worker_liveness(workers, std::chrono::steady_clock::now());
             for (const auto& [sid, w] : workers) {
+                const auto lv = liveness.find(sid);
+                if (lv == liveness.end() || !is_submitting(lv->second)) continue;
                 double existing = entry.local_hash_rates.value(w.username, 0.0);
                 entry.local_hash_rates[w.username] = existing + w.hashrate;
                 double existing_dead = entry.local_dead_hash_rates.value(w.username, 0.0);
