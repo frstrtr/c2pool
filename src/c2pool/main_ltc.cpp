@@ -283,6 +283,7 @@ static void segfault_handler(int sig) {
 // Integrated merged mining
 #include <c2pool/merged/merged_mining.hpp>
 #include <c2pool/merged/aux_chain_params.hpp>
+#include <c2pool/ltc/doge_topology_sync_state.hpp>
 #include <c2pool/merged/aux_found_verdict.hpp>
 #include <c2pool/merged/payout_source.hpp>
 #include <c2pool/merged/coin_broadcaster.hpp>
@@ -9898,11 +9899,11 @@ int main(int argc, char* argv[]) {
                             // Register for /api/coin_peers endpoint
                             coin_peer_sources->push_back(broadcaster.get());
                             // D0.4 per-coin StatsProvider: DOGE plugs its REAL
-                            // synced flag from its embedded UTXO handle (migrated
-                            // off the topology special-case). DOGE exposes no
-                            // separate tip handle here, so height is omitted --
-                            // never fabricated. Guarded to DOGE since this loop is
-                            // generic over merged coins.
+                            // synced flag from its embedded UTXO handle and its
+                            // tip from the embedded DOGE header chain (D-DOGE
+                            // tip row). No header chain, or one with no tip yet,
+                            // writes no height -- never fabricated. Guarded to
+                            // DOGE since this loop is generic over merged coins.
                             {
                                 std::string msym = cfg.symbol;
                                 for (auto& ch : msym)
@@ -9910,14 +9911,14 @@ int main(int argc, char* argv[]) {
                                         ch = static_cast<char>(ch - 32);
                                 if (msym == "DOGE") {
                                     broadcaster->set_sync_state_fn(
-                                        [&doge_utxo_ptr]() -> nlohmann::json {
-                                            nlohmann::json r = nlohmann::json::object();
+                                        [&doge_utxo_ptr, &doge_chain]() -> nlohmann::json {
                                             int connected = doge_utxo_ptr
                                                 ? static_cast<int>(doge_utxo_ptr->blocks_connected())
                                                 : 0;
-                                            r["synced"] = connected >=
-                                                static_cast<int>(core::coin::DOGE_MINING_GATE_DEPTH);
-                                            return r;
+                                            return c2pool::topology::doge_topology_sync_state(
+                                                connected,
+                                                static_cast<int>(core::coin::DOGE_MINING_GATE_DEPTH),
+                                                doge_chain ? doge_chain->height() : 0u);
                                         });
                                 }
                             }
