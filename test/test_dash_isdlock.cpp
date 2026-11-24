@@ -571,6 +571,47 @@ TEST(DashIsdlockPass2, QuorumManagerRetainsRecentlyRetiredQuorumsPerType)
     EXPECT_TRUE(q.retired_entries().empty());
 }
 
+// The reorg wipe keeps the retained set and retires the wiped active entries;
+// the cold resync's full snapshot brings the current cycle back to the active
+// set and out of the retained one, leaving the previous cycle retained.
+TEST(DashIsdlockPass2, ReorgWipeKeepsTheRetainedSetThroughTheSnapshot)
+{
+    QuorumManager q;
+    constexpr uint8_t kIs = 103;
+    auto retired_of = [&](uint8_t tag) {
+        size_t n = 0;
+        for (const auto& e : q.retired_entries())
+            n += (e.key.llmqType == kIs && e.key.quorumHash.data()[0] == tag);
+        return n;
+    };
+    dash::coin::vendor::QuorumTail a;
+    for (uint8_t i = 0; i < 32; ++i) a.newQuorums.push_back(commit(kIs, 0xA0, i));
+    q.apply(a);
+    dash::coin::vendor::QuorumTail rot;
+    for (uint8_t i = 0; i < 32; ++i) {
+        rot.deletedQuorums.emplace_back(kIs, qhash(0xA0, i));
+        rot.newQuorums.push_back(commit(kIs, 0xB0, i));
+    }
+    q.apply(rot);
+    ASSERT_EQ(retired_of(0xA0), 32u);
+    const uint64_t seq = q.fold_seq();
+
+    q.clear_for_reorg();
+    EXPECT_EQ(q.active_count(), 0u) << "the wipe empties the active set";
+    EXPECT_GT(q.fold_seq(), seq) << "the wipe mutates the active set";
+    EXPECT_EQ(retired_of(0xA0), 32u) << "the previous cycle must survive the wipe";
+    EXPECT_EQ(retired_of(0xB0), 32u) << "the wiped active cycle is retained too";
+
+    // The snapshot path wipes again before applying a ZERO-base diff.
+    q.clear_for_reorg();
+    dash::coin::vendor::QuorumTail snap;
+    for (uint8_t i = 0; i < 32; ++i) snap.newQuorums.push_back(commit(kIs, 0xB0, i));
+    q.apply(snap);
+    EXPECT_EQ(q.active_count(), 32u);
+    EXPECT_EQ(retired_of(0xB0), 0u) << "a quorum back in the active set is not retained";
+    EXPECT_EQ(retired_of(0xA0), 32u);
+}
+
 TEST(DashIsdlockPass2, TwoPassSelectsThePreviousCycleOnlyWhenTheLockNamesIt)
 {
     const auto* p = islock_params(LlmqNetwork::Mainnet);
@@ -636,6 +677,62 @@ TEST(DashIsdlockPass2, TwoPassSelectsThePreviousCycleOnlyWhenTheLockNamesIt)
     EXPECT_EQ(verify_islock_two_pass(*p, active, previous, late_tip, prev_cycle, inputs, txid, signed_by(0xA0)),
               IslockVerifyPass::None);
     EXPECT_EQ(calls, 0);
+}
+
+// The live sequence: a rotation, then within a few blocks a reorg wipe and the
+// full-snapshot resync. A lock signed by the previous cycle after the reorg is
+// accepted by pass 2; with clear() at the wipe it is refused.
+TEST(DashIsdlockPass2, PreviousCycleLockVerifiesAfterAReorgWipeRightAfterARotation)
+{
+    const auto* p = islock_params(LlmqNetwork::Mainnet);
+    ASSERT_NE(p, nullptr);
+    const uint8_t T = static_cast<uint8_t>(p->type);
+    const uint32_t I = p->dkg_interval;
+    const uint32_t prev_cycle = I * 9000;
+    const uint32_t cur_cycle  = I * 9001;
+    const uint32_t tip        = cur_cycle + 40;
+    const std::vector<std::pair<uint256, uint32_t>> inputs{{raw256(0x10), 1u}};
+    const uint256 txid = raw256(0x20);
+    auto signed_by_prev = [](const auto& pubkey, const uint256&) { return pubkey[0] == 0xA0; };
+
+    // The node's candidate build: base height from the quorum's own cycle.
+    auto to_cands = [&](const std::vector<QuorumManager::Entry>& entries) {
+        std::vector<RotatedQuorumCandidate> out;
+        for (const auto& e : entries) {
+            if (e.key.llmqType != T) continue;
+            RotatedQuorumCandidate c;
+            c.quorum_hash = e.key.quorumHash;
+            c.base_height = (e.key.quorumHash.data()[0] == 0xA0 ? prev_cycle : cur_cycle)
+                            + e.key.quorumHash.data()[1];
+            c.quorum_index = static_cast<uint16_t>(e.commitment.quorumIndex);
+            c.quorum_public_key = e.commitment.quorumPublicKey;
+            out.push_back(c);
+        }
+        return out;
+    };
+    auto run = [&](bool keep_retained) {
+        QuorumManager q;
+        dash::coin::vendor::QuorumTail a;
+        for (uint8_t i = 0; i < 32; ++i) a.newQuorums.push_back(commit(T, 0xA0, i));
+        q.apply(a);
+        dash::coin::vendor::QuorumTail rot;
+        for (uint8_t i = 0; i < 32; ++i) {
+            rot.deletedQuorums.emplace_back(T, qhash(0xA0, i));
+            rot.newQuorums.push_back(commit(T, 0xB0, i));
+        }
+        q.apply(rot);
+        // The reorg wipe, then the ZERO-base snapshot (which wipes again).
+        for (int k = 0; k < 2; ++k) {
+            if (keep_retained) q.clear_for_reorg(); else q.clear();
+        }
+        dash::coin::vendor::QuorumTail snap;
+        for (uint8_t i = 0; i < 32; ++i) snap.newQuorums.push_back(commit(T, 0xB0, i));
+        q.apply(snap);
+        return verify_islock_two_pass(*p, to_cands(q.active_entries()), to_cands(q.retired_entries()),
+                                      tip, prev_cycle, inputs, txid, signed_by_prev);
+    };
+    EXPECT_EQ(run(true), IslockVerifyPass::Previous);
+    EXPECT_EQ(run(false), IslockVerifyPass::None) << "clear() at the wipe loses the previous cycle";
 }
 
 // ═══ 3. USE — the G4 red/green KAT ════════════════════════════════════════════
