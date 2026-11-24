@@ -953,7 +953,9 @@ public:
         // R1-guarded) forward full-resync over held state.
         if (diff.baseBlockHash.IsNull()) {
             m_state.sml().mnList.clear();
-            m_state.qmgr().clear();
+            // Keeps the retained (recently rotated-out) quorums for isdlock
+            // pass 2: the snapshot after a reorg wipe must not empty them.
+            m_state.qmgr().clear_for_reorg();
         }
 
         // 1) SML (merkleRootMNList). apply_diff erases deletedMNs, upserts
@@ -1356,7 +1358,7 @@ public:
                      << " block(s) no longer on the active chain"
                         " (external-collateral proof)";
         m_state.sml().mnList.clear();
-        m_state.qmgr().clear();
+        m_state.qmgr().clear_for_reorg();   // keeps the isdlock pass-2 retained set
         m_have_mn_sml = false;
         m_state.set_have_sml(false);
         // Drop the SML's current-at marker so (a) the freshness gate fails until

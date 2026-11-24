@@ -198,9 +198,10 @@ public:
     // and signers keep using the previous cycle for a few blocks after a
     // rotation; the verifier additionally ignores retired quorums whose base
     // block is too far below the tip. NOT part of the active set, the quorum
-    // root, the fold stamp or persistence. Emptied by clear() and replace_state(): after a restart or
-    // a reorg wipe, pass 2 has nothing until the next rotation, which only
-    // costs the refusals it was added to avoid.
+    // root, the fold stamp or persistence. Emptied by clear() and replace_state(): after a restart,
+    // pass 2 has nothing until the next rotation, which only costs the
+    // refusals it was added to avoid. A reorg wipe uses clear_for_reorg(),
+    // which keeps it.
     const std::vector<Entry>& retired_entries() const { return m_retired; }
 
     // Per-type counts for logging / dashboard.
@@ -217,6 +218,21 @@ public:
         m_retired.clear();
         m_latest_cl_sigs.clear();
         ++m_fold_seq;   // #127: clear mutates the active set
+    }
+
+    // The reorg wipe: the active set is emptied for the cold resync like
+    // clear(), but the retained set survives, and the wiped active entries
+    // join it. A reorg can land inside the few blocks after a rotation where
+    // signers still use the previous cycle; clear() would leave pass 2 with
+    // nothing until the next rotation. Entries the resync brings back leave
+    // the retained set again (apply), and the verifier's age bound applies as
+    // before, so only quorums that were recently active stay candidates.
+    void clear_for_reorg()
+    {
+        retire(m_active);
+        m_active.clear();
+        m_latest_cl_sigs.clear();
+        ++m_fold_seq;   // #127: the wipe mutates the active set
     }
 
     // Latest cached quorumsCLSigs from the most recent diff. Each entry

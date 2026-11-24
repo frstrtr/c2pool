@@ -559,6 +559,40 @@ TEST(DashCoinStateMaintainer, ReorgWipeZerosSmlCurrencyHashAndHeight) {
     EXPECT_EQ(st.sml_current_hash(), uint256::ZERO);
 }
 
+// The reorg wipe and the full snapshot after it keep the quorum manager's
+// retained (recently rotated-out) quorums that isdlock pass 2 verifies with.
+TEST(DashCoinStateMaintainer, ReorgWipeAndSnapshotKeepRetainedQuorums) {
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+    m.on_mnlistdiff(diff_with_seed(uint256::ZERO, raw256(0x54), 1518654,
+                                   111'000'000LL, sml_entry(0x40)));
+    ASSERT_TRUE(st.have_sml());
+
+    // Seed a retired entry directly: one rotated quorum in, then out.
+    constexpr uint8_t kIs = 103;
+    uint256 qh;
+    qh.data()[0] = 0xA0;
+    qh.data()[31] = 0x5a;
+    dash::coin::vendor::CFinalCommitment c;
+    c.llmqType = kIs;
+    c.quorumHash = qh;
+    dash::coin::vendor::QuorumTail in;
+    in.newQuorums.push_back(c);
+    st.qmgr().apply(in);
+    dash::coin::vendor::QuorumTail out;
+    out.deletedQuorums.emplace_back(kIs, qh);
+    st.qmgr().apply(out);
+    ASSERT_EQ(st.qmgr().retired_entries().size(), 1u);
+
+    m.on_sml_reorg();
+    EXPECT_EQ(st.qmgr().retired_entries().size(), 1u) << "the reorg wipe emptied the retained set";
+
+    m.on_mnlistdiff(diff_with_seed(uint256::ZERO, raw256(0x56), 1518656,
+                                   111'000'000LL, sml_entry(0x42)));
+    ASSERT_TRUE(st.have_sml()) << "the cold snapshot re-establishes the SML";
+    EXPECT_EQ(st.qmgr().retired_entries().size(), 1u) << "the ZERO-base snapshot emptied the retained set";
+}
+
 // The payee-desync / apply-gap path (on_block_connected -> wipe) is a PAYEE
 // wipe, not an SML wipe. It must leave the SML currency hash UNTOUCHED — the
 // SML axis stays valid and its hash keeps describing it accurately, so the
