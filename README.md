@@ -350,6 +350,8 @@ c2pool is an independent C++ implementation of the P2Pool sharechain concept ori
 
 Development is supported by Anthropic's [Claude for Open Source](https://claude.com/contact-sales/claude-for-oss) program (2026). The design, the consensus rules, and responsibility for every byte shipped remain with the maintainers.
 
+> **Two Dash blocks in a row from the daemonless pool, again** (2026-11-23 02:37:02 and 02:37:35 UTC) — [#2576844](https://blockchair.com/dash/block/2576844) and [#2576845](https://blockchair.com/dash/block/2576845), 33 seconds apart. Both were built from embedded coin-state with no Dash Core node on the serve path, and both are confirmed.
+>
 > **Two Dash blocks in a row from the daemonless pool** (2026-11-15 03:40:39 and 03:42:26 UTC) — [#2572489](https://blockchair.com/dash/block/2572489) and [#2572490](https://blockchair.com/dash/block/2572490), 107 seconds apart. Both were built from embedded coin-state with no Dash Core node on the serve path, and both are confirmed.
 >
 > **First LTC + DOGE twin block found by c2pool in production** (2026-11-12 15:46:10 UTC) LTC [#3211872](https://blockchair.com/litecoin/block/3211872) + DOGE [#6454700](https://blockchair.com/dogecoin/block/6454700) — one proof of work, 6.256 LTC + 10,001 DOGE, found by a public V36 pool node (about 210 GH/s) eleven hours after it moved from Python p2pool to c2pool v0.2.12.2.
