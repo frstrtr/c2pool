@@ -35,16 +35,24 @@
 # on real jobs at a 2^-13 work floor, one share per ~PACE_S+3 s per miner.
 #
 # Usage: ltc_g3b_vm220_harness.sh <c2pool-ltc binary> <out dir> [legs=123]
-#   env: PACE_S (default 8; two miners => ~4 s share period), CROSS_TIMEOUT_S (default 10800)
+#   env: PACE_S (default 8; two miners => ~4 s share period), CROSS_TIMEOUT_S (default+floor 10800; G3B_ALLOW_SHORT_TIMEOUT=1 to go below)
 set -u
 BIN=${1:?c2pool-ltc binary}; P=${2:?out dir}; LEGS=${3:-123}
 PACE_S=${PACE_S:-8}; CROSS_TIMEOUT_S=${CROSS_TIMEOUT_S:-10800}
+# L2 needs ACTIVATED (~45 min) plus the 800-share confirm window (~95 min at the
+# paced share rate) on BOTH nodes; anything under 3h times out mid-confirm and the
+# EXIT trap tears the nodes down. Clamp up unless G3B_ALLOW_SHORT_TIMEOUT=1.
+CROSS_TIMEOUT_FLOOR_S=10800
+if [ "$CROSS_TIMEOUT_S" -lt "$CROSS_TIMEOUT_FLOOR_S" ] && [ "${G3B_ALLOW_SHORT_TIMEOUT:-0}" != 1 ]; then
+  CROSS_TIMEOUT_REQ=$CROSS_TIMEOUT_S; CROSS_TIMEOUT_S=$CROSS_TIMEOUT_FLOOR_S
+fi
 MINER="$(cd "$(dirname "$0")" && pwd)/g3b_paced_scrypt_miner.py"
 mkdir -p "$P"; exec >>"$P/driver.log" 2>&1
 log(){ printf "[%s] %s\n" "$(date -u +%FT%TZ)" "$*"; }
 res(){ echo "$*" >> "$P/VERDICT"; log "RESULT $*"; }
 rm -f "$P/VERDICT"
 log "BIN=$BIN legs=$LEGS pace=${PACE_S}s cross_timeout=$CROSS_TIMEOUT_S"
+[ -n "${CROSS_TIMEOUT_REQ:-}" ] && log "CROSS_TIMEOUT_S=$CROSS_TIMEOUT_REQ below floor, clamped to $CROSS_TIMEOUT_S"
 [ -f "$MINER" ] || { echo "L0 FAIL missing $MINER" >> "$P/VERDICT"; exit 1; }
 "$BIN" --help 2>&1 | grep -q -- "--regtest" || { res "L0 FAIL binary lacks --regtest"; exit 1; }
 
