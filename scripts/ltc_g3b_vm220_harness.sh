@@ -52,7 +52,7 @@ log "BIN=$BIN legs=$LEGS pace=${PACE_S}s cross_timeout=$CROSS_TIMEOUT_S"
 rm -rf "$P"/{ltc,doge,ltcpeer,dogepeer,dataA,dataB}; mkdir -p "$P"/{ltc,doge,ltcpeer,dogepeer,dataA,dataB}
 pw(){ head -c16 /dev/urandom | od -An -tx1 | tr -d " \n"; }
 LP=$(pw); DP=$(pw)
-printf "regtest=1\nserver=1\ntxindex=1\n[regtest]\nrpcbind=127.0.0.1\nrpcallowip=127.0.0.1\nrpcport=19453\nport=19454\nlisten=1\nbind=127.0.0.1\nrpcuser=g3b\nrpcpassword=%s\nfallbackfee=0.0002\nmaxtxfee=100\nrpcworkqueue=64\n" "$LP" > "$P/ltc/litecoin.conf"
+printf "regtest=1\nserver=1\ntxindex=1\n[regtest]\nrpcbind=127.0.0.1\nrpcallowip=127.0.0.1\nrpcport=19453\nport=19454\nlisten=1\nbind=127.0.0.1\nrpcuser=g3b\nrpcpassword=%s\nfallbackfee=0.0002\nmaxtxfee=100\nrpcworkqueue=64\npersistmempool=0\n" "$LP" > "$P/ltc/litecoin.conf"
 printf "regtest=1\nserver=1\ntxindex=1\nlisten=1\nbind=127.0.0.1\nport=18557\nrpcuser=g3b\nrpcpassword=%s\nrpcport=18332\nrpcbind=127.0.0.1\nrpcallowip=127.0.0.1\nfallbackfee=0.01\nrpcthreads=8\n" "$DP" > "$P/doge/dogecoin.conf"
 # peer daemons: litecoind 0.21.4 regtest GBT refuses with 0 peers (-9 not connected)
 printf "regtest=1\nserver=1\n[regtest]\nlisten=0\nport=19455\nrpcport=19456\nrpcbind=127.0.0.1\nrpcallowip=127.0.0.1\nrpcuser=g3b\nrpcpassword=%s\nconnect=127.0.0.1:19454\n" "$LP" > "$P/ltcpeer/litecoin.conf"
@@ -88,11 +88,23 @@ pop(){
  A4=$(LW addmultisigaddress 2 "[\"$K1\",\"$K2\"]" "" bech32 | J "d['address']")
  echo "LTC $(LW sendtoaddress "$A1" 1.1) $(LW sendtoaddress "$A2" 1.2) $(LW sendtoaddress "$A3" 1.3) $(LW sendtoaddress "$A4" 1.4)"
  INS=$(LW listunspent 1 9999999 | python3 -c "
-import sys,json;u=sorted([x for x in json.load(sys.stdin) if x['spendable']],key=lambda x:x['amount'])[:3]
+import sys,json;u=sorted([x for x in json.load(sys.stdin) if x['spendable'] and x['amount']>=0.1],key=lambda x:x['amount'])[:3]
 print(json.dumps([{'txid':x['txid'],'vout':x['vout']} for x in u]));print(sum(x['amount'] for x in u))")
  IJ=$(echo "$INS"|sed -n 1p); IS=$(echo "$INS"|sed -n 2p); OUT=$(python3 -c "print(round($IS-0.001,8))")
- RAW=$(LW createrawtransaction "$IJ" "[{\"$(LW getnewaddress "" bech32)\":$OUT},{\"data\":\"6733622d706f70756c61746564\"}]")
- echo "LTC multi-in3+opreturn $(LC sendrawtransaction "$(LW signrawtransactionwithwallet "$RAW" | J "d['hex']")")"
+ # guard (legs1124 defect): send only with exactly 3 inputs, positive output, complete
+ # signature, decoded vin==3 and testmempoolaccept allowed. A vin-empty tx in the mempool
+ # breaks every later CreateNewBlock (bad-txns-vin-empty) and freezes the sharechain.
+ NIN=$(echo "$IJ" | J "len(d)" 2>/dev/null || echo 0)
+ if [ "$NIN" != 3 ] || ! python3 -c "import sys;sys.exit(0 if $OUT>0.01 else 1)" 2>/dev/null; then
+   echo "LTC multi-in3 SKIP nin=$NIN out=$OUT"
+ else
+   RAW=$(LW createrawtransaction "$IJ" "[{\"$(LW getnewaddress "" bech32)\":$OUT},{\"data\":\"6733622d706f70756c61746564\"}]") || RAW=""
+   SIG=""; [ -n "$RAW" ] && SIG=$(LW signrawtransactionwithwallet "$RAW" | J "d['hex'] if d.get('complete') else ''" 2>/dev/null)
+   VIN=0; [ -n "$SIG" ] && VIN=$(LC decoderawtransaction "$SIG" | J "len(d['vin'])" 2>/dev/null || echo 0)
+   OK=""; [ "$VIN" = 3 ] && OK=$(LC testmempoolaccept "[\"$SIG\"]" | J "d[0]['allowed']" 2>/dev/null)
+   if [ "$OK" = True ]; then echo "LTC multi-in3+opreturn $(LC sendrawtransaction "$SIG")"
+   else echo "LTC multi-in3 SKIP vin=$VIN accept=$OK"; fi
+ fi
  B1=$(DC getnewaddress); BM=$(DC addmultisigaddress 1 "[\"$B1\",\"$(DC getnewaddress)\"]")
  echo "DOGE $(DC sendtoaddress "$B1" 1000) $(DC sendtoaddress "$BM" 2000)"
 }
@@ -132,6 +144,9 @@ while :; do
     CROSS_LTC_H=$(LC getblockcount); log "CROSS A activated at ltc_h=$CROSS_LTC_H"; fi
   grep -q "\-> CONFIRMED" "$P/nodeA.log" && grep -q "\-> CONFIRMED" "$P/nodeB.log" && break
   [ "$el" -ge "$CROSS_TIMEOUT_S" ] && break
+  if LC getblocktemplate '{"rules":["segwit","mweb"]}' >/dev/null 2>"$P/gbt.err"; then GBTBAD=0
+  else GBTBAD=$(( ${GBTBAD:-0} + 1 )); log "GBT_UNHEALTHY #$GBTBAD $(head -c 200 "$P/gbt.err" | tr '\n' ' ')"
+    [ "$GBTBAD" -ge 4 ] && { res "L2 HARNESS-ABORT gbt unhealthy x4 (harness, not a c2pool verdict)"; break; }; fi
   kill -0 "$NA" 2>/dev/null && kill -0 "$NB" 2>/dev/null || { log "node died"; break; }
 done
 LX=$(LC getblockcount); DX=$(DC getblockcount)
