@@ -679,6 +679,42 @@ TEST(DashIsdlockPass2, TwoPassSelectsThePreviousCycleOnlyWhenTheLockNamesIt)
     EXPECT_EQ(calls, 0);
 }
 
+// The per-type cap holds at a wipe: with two rotated-out cycles already
+// retained (the cap of 64), the wipe's retired active cycle pushes out the
+// oldest one; the cycle just before the active one stays.
+TEST(DashIsdlockPass2, ReorgWipeKeepsThePerTypeCap)
+{
+    QuorumManager q;
+    constexpr uint8_t kIs = 103;
+    auto retired_of = [&](uint8_t tag) {
+        size_t n = 0;
+        for (const auto& e : q.retired_entries())
+            n += (e.key.llmqType == kIs && e.key.quorumHash.data()[0] == tag);
+        return n;
+    };
+    auto rotate = [&](uint8_t from, uint8_t to) {
+        dash::coin::vendor::QuorumTail t;
+        for (uint8_t i = 0; i < 32; ++i) {
+            t.deletedQuorums.emplace_back(kIs, qhash(from, i));
+            t.newQuorums.push_back(commit(kIs, to, i));
+        }
+        q.apply(t);
+    };
+    dash::coin::vendor::QuorumTail a;
+    for (uint8_t i = 0; i < 32; ++i) a.newQuorums.push_back(commit(kIs, 0xA0, i));
+    q.apply(a);
+    rotate(0xA0, 0xB0);
+    rotate(0xB0, 0xC0);
+    ASSERT_EQ(retired_of(0xA0), 32u);
+    ASSERT_EQ(retired_of(0xB0), 32u);
+
+    q.clear_for_reorg();
+    EXPECT_EQ(q.retired_entries().size(), 64u) << "the per-type cap must hold at a wipe";
+    EXPECT_EQ(retired_of(0xA0), 0u) << "the oldest cycle (N-2) leaves";
+    EXPECT_EQ(retired_of(0xB0), 32u) << "the cycle before the active one (N-1) stays";
+    EXPECT_EQ(retired_of(0xC0), 32u) << "the wiped active cycle is retained";
+}
+
 // The live sequence: a rotation, then within a few blocks a reorg wipe and the
 // full-snapshot resync. A lock signed by the previous cycle after the reorg is
 // accepted by pass 2; with clear() at the wipe it is refused.
