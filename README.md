@@ -1433,6 +1433,7 @@ usage and exits 1.
 | `-f` / `--fee PCT` | 0 | Node-owner fee as a committed payout-identity substitution (not a separate output). Requires `--node-owner-address`. |
 | `--node-owner-address ADDR` | — | Fee destination (P2PKH/P2SH/P2WPKH). Undecodable → fee disabled. |
 | `--give-author PCT` (alias `--dev-donation`) | 0.1 (`core::kAuthorFeeDefaultPct`) | Donation **amount** only; `0` allowed (dust-marker output still emitted). The donation script is never changed. |
+| `--import-found-blocks FILE` (repeatable, or `A,B`) | — | Restore the pool's found-block history from another node's `/recent_blocks` or a list of block hashes, each validated against the embedded BTC header chain; needs `--http` (see [Restore found-block history](#restore-found-block-history)). The ledger is kept across restarts in `<data-dir>/bitcoin/found_blocks_db` (`bitcoin_testnet`, `bitcoin_testnet4`, `bitcoin_regtest` on the test networks). |
 
 ### c2pool-dgb — DigiByte (Scrypt)
 
@@ -1621,6 +1622,23 @@ What gets in:
 A plain list of block hashes (one per line, `#` comments allowed, or a JSON
 array of strings) works too; those rows carry no pool rate, so their rounds
 have no luck unless the node's own history covers them.
+
+`c2pool-btc` takes the same flag (no YAML key): each row is checked against
+the embedded BTC header chain under the `BTC` label, and there is no merged
+chain to import and no coinbase check. The ledger lives in the dashboard, so
+the node needs `--http`. For example, the pool's two BTC blocks as a hash list:
+
+```bash
+cat > btc-blocks.txt <<'LIST'
+# 886688 (2025-03-07), 955609 (2026-06-27)
+00000000000000000001822dc3db70b75d281687f8baa10d1818d0703f49fec0
+00000000000000000000c9f3c1b80c0f3fd57d18a8fc223cbec004f92b716fb7
+LIST
+./c2pool-btc <your usual options> --import-found-blocks btc-blocks.txt
+```
+
+The rows are then kept in `<data-dir>/bitcoin/found_blocks_db` like the
+node's own finds, so the flag is needed once.
 
 ---
 

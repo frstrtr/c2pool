@@ -57,6 +57,7 @@
 #include <impl/btc/coin/reconstruct_won_block.hpp> // make_reconstruct_closure — faithful won-block body (#839)
 #include <impl/btc/coin/won_block_dispatch.hpp>    // make_on_block_found — dual-path won-block dispatch (#744)
 #include <impl/btc/coin/block_confirm.hpp>       // #995/#1155 found-block confirm/orphan resolver
+#include <impl/btc/found_block_ledger.hpp>       // found_blocks_db persistence + --import-found-blocks
 #include <impl/btc/coin/merged_spec.hpp>          // parse --merged SPEC -> AuxChainConfig (NMC PE host-wire slice 3)
 #include <impl/btc/coin/merged_backend.hpp>       // build aux backends + merged_addr payout seam (NMC PE host-wire slice 4)
 // PA/PB: embedded NMC SPV aux backend (daemonless --merged NMC) — mirrors the
@@ -191,7 +192,19 @@ static void print_usage()
         "  --give-author PCT  dev-donation percent (alias --dev-donation). Default\n"
         "                  is the built-in 0.1%; 0 allowed (donation output still\n"
         "                  emits per p2pool dust-marker semantics, amount 0). Changes\n"
-        "                  the donation AMOUNT only — the donation script is unchanged.\n";
+        "                  the donation AMOUNT only — the donation script is unchanged.\n"
+        "  --import-found-blocks FILE  Restore the pool's found-block history\n"
+        "                  (Recent Blocks, luck, effort) from FILE: another node's\n"
+        "                  /recent_blocks JSON, or block hashes one per line.\n"
+        "                  Repeatable or FILE,FILE; imported in order, e.g.\n"
+        "                    curl http://NODE:WEBPORT/recent_blocks > blocks.json\n"
+        "                    --import-found-blocks blocks.json\n"
+        "                  Each block is validated against this node's own embedded\n"
+        "                  BTC header chain once it is synced; rows already held only\n"
+        "                  gain missing fields. Needs --http (the ledger is the\n"
+        "                  dashboard's). The ledger is kept across restarts in\n"
+        "                  <data-dir>/bitcoin/found_blocks_db (bitcoin_testnet,\n"
+        "                  bitcoin_testnet4, bitcoin_regtest on the test networks).\n";
 }
 
 /// BTC wire-protocol magic bytes per network (pchMessageStart).
@@ -246,8 +259,25 @@ int main(int argc, char* argv[])
     bool        want_dump_config  = false; // --dump-resolved-config (M0b)
     bool        want_ack_money    = false; // --ack-money-settings (M0b)
 
+    // --import-found-blocks FILE[,FILE...]: taken out of argv here, before
+    // the parse loop below (which skips the values taken). Every value is
+    // refused or canonicalized now, before anything starts
+    // (core::found_block_import::open_import_file): a value must not swallow
+    // the next option (--import-found-blocks --testnet would start a MAINNET
+    // node), and a missing / non-regular / over-cap file must not surface
+    // only after the header sync.
+    const btc::found_block_ledger::ImportFlags import_found_blocks =
+        btc::found_block_ledger::take_import_flags(argc, argv);
+    if (!import_found_blocks.error.empty())
+    {
+        std::cerr << "error: " << import_found_blocks.error << "\n";
+        return 1;
+    }
+
     for (int i = 1; i < argc; ++i)
     {
+        if (import_found_blocks.is_value(i))
+            continue;   // an --import-found-blocks value (the pass above)
         std::string arg = argv[i];
         if (arg == "-h" || arg == "--help")
         {
@@ -301,6 +331,11 @@ int main(int argc, char* argv[])
         else if (arg == "--coin-p2p-discover")
         {
             coin_p2p_discover = true;
+        }
+        else if (arg == "--import-found-blocks")
+        {
+            // Taken, checked and canonicalized by the pass before this loop
+            // (its value is skipped above).
         }
         else if (arg == "--bitcoind" && i + 1 < argc)
         {
@@ -3228,7 +3263,8 @@ int main(int argc, char* argv[])
                 uint64_t height = static_cast<uint64_t>(header_chain.height()) + 1;
                 mi->record_found_block(
                     height, block_hash, static_cast<uint64_t>(std::time(nullptr)),
-                    /*chain=*/"BTC", /*miner=*/"", /*share_hash=*/block_hash.GetHex(),
+                    /*chain=*/btc::found_block_ledger::kChainLabel,
+                    /*miner=*/"", /*share_hash=*/block_hash.GetHex(),
                     mi->get_network_difficulty(), /*share_difficulty=*/0.0,
                     // Pool hashrate 0 -> record_found_block reads the
                     // sharechain pool estimator. This site passed
@@ -3338,6 +3374,33 @@ int main(int argc, char* argv[])
             LOG_INFO << "[BTC-POOL] graph_db stats persistence -> " << graph_db_path;
         }
 
+        // Found-block ledger persistence (LTC "Layer +2" parity): the
+        // /recent_blocks rows were held in memory only and lost on every
+        // restart. A LevelDB beside this network's embedded_headers
+        // (<data>/bitcoin/found_blocks_db; bitcoin_testnet, bitcoin_testnet4,
+        // bitcoin_regtest), never LTC's <data>/<net>/found_blocks_db.
+        // Restored after the stat log (the network-difficulty seed reads it)
+        // and after the verify fn above, so a row still pending at the last
+        // shutdown gets its confirm/orphan checks again. Display only.
+        {
+            const std::string fblk_db_path =
+                btc::found_block_ledger::db_path(net_dir).string();
+            if (btc::found_block_ledger::enable_persistence(*mi, fblk_db_path))
+                LOG_INFO << "[BTC-POOL] found-block persistence enabled at " << fblk_db_path
+                         << " (" << mi->get_found_blocks().size() << " rows restored)";
+            else
+                LOG_WARNING << "[BTC-POOL] found-block LevelDB at " << fblk_db_path
+                            << " could not be opened -- the ledger is kept in memory only";
+            mi->reverify_pending_found_blocks();
+        }
+
+        // --import-found-blocks: the pool's found-block history from another
+        // node (core/found_block_import.hpp). Every block is validated against
+        // the embedded BTC header chain, once it is synced; rows the ledger
+        // holds only gain missing fields. Display only.
+        if (!import_found_blocks.paths.empty())
+            btc::found_block_ledger::start_import(*mi, import_found_blocks.paths, &header_chain);
+
         if (web_server->start()) {
             // LTC-parity site 3/3: periodic save_stat_log every 100s (matches p2pool
             // graph_db + main_ltc.cpp:7429). Self-rescheduling steady_timer on the SAME
@@ -3368,6 +3431,9 @@ int main(int argc, char* argv[])
         } // if (mi != nullptr)
     } else {
         LOG_INFO << "[BTC-POOL] dashboard disabled (no --http bind given).";
+        if (!import_found_blocks.paths.empty())
+            LOG_WARNING << "[BTC-POOL] --import-found-blocks: the found-block ledger is the"
+                           " dashboard's and --http is not given; nothing is imported";
     }
     // HTTP on the stratum port (--stratum-http; auto follows the --http bind).
     if (stratum_server_for_shutdown)

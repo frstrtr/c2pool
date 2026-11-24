@@ -524,6 +524,23 @@ public:
         return lookup_header_internal(it->second);
     }
 
+    /// The lowest height the best chain holds a header for: 0 from genesis,
+    /// else the checkpoint it is rooted at (nothing below it). Read-only; the
+    /// LTC and DOGE header chains have the same accessor, which the
+    /// found-block import asks of a hash the chain does not hold
+    /// (core::found_block_import::header_chain_lookup).
+    uint32_t lowest_height() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_height_index.empty() || m_height_index.count(0) != 0) return 0;
+        bool first = true;
+        uint32_t low = 0;
+        for (const auto& kv : m_height_index) {
+            if (first || kv.first < low) low = kv.first;
+            first = false;
+        }
+        return low;
+    }
+
     /// Add a single header. Returns true if accepted (new + valid).
     bool add_header(const BlockHeaderType& header) {
         PendingTipChange ptc;
