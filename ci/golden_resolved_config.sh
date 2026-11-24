@@ -186,5 +186,33 @@ if [ -x "$BINDIR/c2pool-ltc" ]; then
   rm -rf "$fbi_dd"
 fi
 
+# c2pool-btc --import-found-blocks FILE: the same refusals, while the flags are
+# parsed (src/impl/btc/found_block_ledger.hpp take_import_flags).
+echo "== btc --import-found-blocks values (bad value => exit 1, no dump) =="
+if [ -x "$BINDIR/c2pool-btc" ]; then
+  fbb_dd="$(mktemp -d)"
+  printf '[]' > "$fbb_dd/a.json"; printf '[]' > "$fbb_dd/b.json"
+  fbb_case() {  # want_rc label args...
+    local want="$1" label="$2"; shift 2
+    local out; out="$("$BINDIR/c2pool-btc" --data-dir "$fbb_dd" "$@" --dump-resolved-config 2>/dev/null)"
+    local rc=$?
+    local dumped=0; printf '%s' "$out" | grep -q "$BEGIN" && dumped=1
+    local ok=0   # a refusal prints no dump; an accepted value dumps
+    if [ "$want" -eq 0 ]; then [ "$dumped" -eq 1 ] && ok=1; else [ "$dumped" -eq 0 ] && ok=1; fi
+    if [ "$rc" -eq "$want" ] && [ "$ok" -eq 1 ]; then
+      echo "ok   btc $label (exit $rc)"
+    else
+      echo "FAIL btc $label exit=$rc (want $want) dumped=$dumped"; fails=$((fails+1))
+    fi
+  }
+  fbb_case 1 "value is an option (--testnet)" --import-found-blocks --testnet
+  fbb_case 1 "missing file" --import-found-blocks "$fbb_dd/none.json"
+  fbb_case 1 "a directory" --import-found-blocks "$fbb_dd"
+  fbb_case 1 "second file without its own flag" --import-found-blocks "$fbb_dd/a.json" "$fbb_dd/b.json"
+  fbb_case 0 "two files, flag twice" --import-found-blocks "$fbb_dd/a.json" --import-found-blocks "$fbb_dd/b.json"
+  fbb_case 0 "two files, comma list" --import-found-blocks "$fbb_dd/a.json,$fbb_dd/b.json"
+  rm -rf "$fbb_dd"
+fi
+
 if [ "$fails" -eq 0 ]; then echo; echo "golden_resolved_config: ALL PASS"; exit 0; fi
 echo; echo "golden_resolved_config: $fails FAILURE(S)"; exit 1
