@@ -52,10 +52,13 @@ log "BIN=$BIN legs=$LEGS pace=${PACE_S}s cross_timeout=$CROSS_TIMEOUT_S"
 rm -rf "$P"/{ltc,doge,ltcpeer,dogepeer,dataA,dataB}; mkdir -p "$P"/{ltc,doge,ltcpeer,dogepeer,dataA,dataB}
 pw(){ head -c16 /dev/urandom | od -An -tx1 | tr -d " \n"; }
 LP=$(pw); DP=$(pw)
-printf "regtest=1\nserver=1\ntxindex=1\n[regtest]\nrpcbind=127.0.0.1\nrpcallowip=127.0.0.1\nrpcport=19453\nport=19454\nlisten=1\nbind=127.0.0.1\nrpcuser=g3b\nrpcpassword=%s\nfallbackfee=0.0002\nmaxtxfee=100\nrpcworkqueue=64\npersistmempool=0\n" "$LP" > "$P/ltc/litecoin.conf"
+printf "regtest=1\nserver=1\ntxindex=1\n[regtest]\nrpcbind=127.0.0.1\nrpcallowip=127.0.0.1\nrpcport=19453\nport=19454\nlisten=1\nbind=127.0.0.1\nrpcuser=g3b\nrpcpassword=%s\nfallbackfee=0.0002\nmaxtxfee=100\nrpcworkqueue=64\npersistmempool=0\nvbparams=mweb:9999999999:9999999999\n" "$LP" > "$P/ltc/litecoin.conf"
 printf "regtest=1\nserver=1\ntxindex=1\nlisten=1\nbind=127.0.0.1\nport=18557\nrpcuser=g3b\nrpcpassword=%s\nrpcport=18332\nrpcbind=127.0.0.1\nrpcallowip=127.0.0.1\nfallbackfee=0.01\nrpcthreads=8\n" "$DP" > "$P/doge/dogecoin.conf"
+# MWEB: regtest BIP9 window=144 -> MWEB ACTIVE at h432; the first HogEx (empty vin, fixed txid
+# 58338ec7) then fails TestBlockValidity bad-txns-vin-empty in litecoind CreateNewBlock and
+# GBT dies for good. Pin MWEB never-active on BOTH ltc daemons (consensus params must match).
 # peer daemons: litecoind 0.21.4 regtest GBT refuses with 0 peers (-9 not connected)
-printf "regtest=1\nserver=1\n[regtest]\nlisten=0\nport=19455\nrpcport=19456\nrpcbind=127.0.0.1\nrpcallowip=127.0.0.1\nrpcuser=g3b\nrpcpassword=%s\nconnect=127.0.0.1:19454\n" "$LP" > "$P/ltcpeer/litecoin.conf"
+printf "regtest=1\nserver=1\n[regtest]\nlisten=0\nport=19455\nrpcport=19456\nrpcbind=127.0.0.1\nrpcallowip=127.0.0.1\nrpcuser=g3b\nrpcpassword=%s\nconnect=127.0.0.1:19454\nvbparams=mweb:9999999999:9999999999\n" "$LP" > "$P/ltcpeer/litecoin.conf"
 printf "regtest=1\nserver=1\nlisten=0\nport=18558\nrpcport=18559\nrpcbind=127.0.0.1\nrpcallowip=127.0.0.1\nrpcuser=g3b\nrpcpassword=%s\nconnect=127.0.0.1:18557\n" "$DP" > "$P/dogepeer/dogecoin.conf"
 for d in ltc ltcpeer; do litecoind -datadir="$P/$d" -conf="$P/$d/litecoin.conf" -daemon; done
 for d in doge dogepeer; do dogecoind -datadir="$P/$d" -conf="$P/$d/dogecoin.conf" -daemon; done
