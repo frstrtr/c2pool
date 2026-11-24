@@ -954,7 +954,8 @@ public:
         if (diff.baseBlockHash.IsNull()) {
             m_state.sml().mnList.clear();
             // Keeps the retained (recently rotated-out) quorums for isdlock
-            // pass 2: the snapshot after a reorg wipe must not empty them.
+            // pass 2: any ZERO-base snapshot (after a reorg wipe or a forward
+            // full resync over held state) must not empty them.
             m_state.qmgr().clear_for_reorg();
         }
 
