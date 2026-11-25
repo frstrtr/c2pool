@@ -40,6 +40,8 @@
 #include <impl/btc/coin/mempool.hpp>
 #include <impl/btc/coin/node.hpp>
 #include <impl/btc/coin/coin_peer_manager.hpp> // btc::coin::BtcCoinPeerManager -- BTC-ISOLATED scored/diverse coin-network peer discovery (--coin-p2p-discover)
+#include <impl/btc/coin/coin_peer_pool.hpp>     // btc::coin::CoinPeerPool -- standalone multi-peer coin-network pool (no --bitcoind)
+#include <impl/btc/coin/coin_peer_pool_p2p.hpp> // btc::coin::NodeP2PPoolPeer -- one pooled connection over NodeP2P
 #include <impl/btc/coin/chain_seeds.hpp>        // btc::coin::btc_dns_seeds / btc_fixed_seeds
 #include <impl/btc/coin/node_interface.hpp>
 #include <impl/btc/coin/transaction.hpp>
@@ -1260,6 +1262,10 @@ int main(int argc, char* argv[])
     // sibling timers get theirs from a main-scope shared_ptr, so this driver
     // needs the same or its first tick would run once and never reschedule.
     std::shared_ptr<std::function<void()>> standalone_driver_keepalive;
+    // Network-standalone coin peer pool (no --bitcoind): declared after the
+    // peer manager it draws from, so it is destroyed first. Null with
+    // --bitcoind (the external arm owns coin_node's single connection).
+    std::unique_ptr<btc::coin::CoinPeerPool> coin_pool;
     if (coin_p2p_discover) {
         // BTC network default ports: 8333 mainnet / 18333 testnet3 /
         // 48333 testnet4 / 18444 regtest. Distinct from the stratum/P2P pool port.
@@ -1291,96 +1297,81 @@ int main(int argc, char* argv[])
                  << " peers=" << pm_stats.total
                  << " groups=" << pm_stats.unique_groups;
 
-        // ── Network-standalone header source ────────────────────────────────
+        // ── Network-standalone coin peer pool ───────────────────────────────
         // With no external bitcoind, the coin-network peer manager is the ONLY
         // header origin. It banks scored peer ADDRESSES but does not itself hold
-        // a header-streaming connection, so dial one discovered peer through the
-        // same NodeP2P broadcaster the external arm uses: the initial-getheaders
-        // timer and new_headers callback (both keyed on coin_node) are then fed
-        // by this peer exactly as they would be by an external bitcoind, and the
-        // header tip advances from genesis. A self-rescheduling failover timer
-        // re-dials a fresh candidate while the version/verack handshake has not
-        // completed (or has since dropped), so a dead first pick — or a peer
-        // that later disconnects — does not wedge header sync. When --bitcoind
-        // is ALSO supplied the external arm already owns coin_node, so this
-        // standalone dial is skipped and behaviour is unchanged.
+        // connections, so the pool (btc::coin::CoinPeerPool) keeps
+        // kCoinPoolTargetPeers outbound connections drawn from it, each a
+        // NodeP2P with its own event sink. Headers, block announcements,
+        // transactions and block bodies from any pooled peer feed coin_node's
+        // events (the same new_headers / new_tx / full_block subscribers the
+        // external arm feeds); a won block goes to every pooled peer. When
+        // --bitcoind is ALSO supplied the external arm already owns coin_node,
+        // so no pool is built and behaviour is unchanged.
         if (bitcoind_host.empty()) {
             // NOTE: deliberately do NOT enable_mempool_request() on the
-            // standalone arm. This is header-only sync against random public
-            // mainnet peers: a BIP 35 `mempool` request to a peer that has not
-            // granted us bloom/permission is exactly what Bitcoin Core drops
-            // peers for (the recurring ~60s EOF disconnects observed here), and
-            // a header-only node has no use for the peer's full mempool anyway.
+            // standalone arm. These are random public mainnet peers: a BIP 35
+            // `mempool` request to a peer that has not granted us
+            // bloom/permission is exactly what Bitcoin Core drops peers for.
             // The mempool pull stays armed ONLY on the external-bitcoind arm
-            // above (operator-controlled peer) and the submit arm — byte-
-            // identical there.
-            // Peers already dialed/attempted this run — passed to
-            // get_peers_to_connect() as the "connected" exclusion set so each
-            // failover draws the NEXT best-scored peer instead of re-picking a
-            // dead one; cleared to re-sweep once the banked set is exhausted.
-            auto standalone_tried = std::make_shared<std::set<std::string>>();
-            // The candidate dialed last, and whether it ever completed the
-            // handshake: on failover it is reported to the peer manager as a
-            // failed dial or a disconnect, so dead candidates age out of the
-            // working set and DNS-seeded peers can take their places.
-            auto standalone_current    = std::make_shared<std::string>();
-            auto standalone_handshaked = std::make_shared<bool>(false);
-            auto dial_standalone_peer =
-                [&coin_node, &coin_peer_mgr, standalone_tried, standalone_current,
-                 standalone_handshaked]() -> bool {
-                    auto cands = coin_peer_mgr->get_peers_to_connect(*standalone_tried);
-                    if (cands.empty()) {
-                        standalone_tried->clear();
-                        cands = coin_peer_mgr->get_peers_to_connect(*standalone_tried);
-                    }
-                    if (cands.empty()) {
-                        LOG_WARNING << "[BTC] standalone header source: no coin peers to dial yet";
-                        return false;
-                    }
-                    const auto& ep = cands.front();
-                    standalone_tried->insert(ep.to_string());
-                    *standalone_current    = ep.to_string();
-                    *standalone_handshaked = false;
-                    LOG_INFO << "[BTC] standalone header source: dialing coin peer "
-                             << ep.to_string() << " (no external bitcoind)";
-                    coin_node.start_p2p(ep.to_net_service());
-                    return true;
-                };
-            // Initial dial now so the 3s initial-getheaders timer finds a peer.
-            dial_standalone_peer();
+            // above (operator-controlled peer) -- byte-identical there.
+            btc::coin::CoinPeerPoolHost ph;
+            ph.dial = [&ioc, &config](const NetService& addr, btc::coin::PoolPeerHooks hooks)
+                -> std::unique_ptr<btc::coin::PoolPeer> {
+                return std::make_unique<btc::coin::NodeP2PPoolPeer<btc::Config>>(
+                    &ioc, &config, addr, std::move(hooks));
+            };
+            ph.candidates = [&coin_peer_mgr](const std::set<std::string>& exclude) {
+                return coin_peer_mgr->get_peers_to_connect(exclude);
+            };
+            // Peer-manager reporting: a completed handshake as connected; a
+            // dropped slot as disconnected if it ever handshaked, else as a
+            // failed dial (attempt++, backoff, score), so dead candidates age
+            // out of the working set.
+            ph.connected    = [&coin_peer_mgr](const std::string& k) { coin_peer_mgr->notify_connected(k); };
+            ph.disconnected = [&coin_peer_mgr](const std::string& k) { coin_peer_mgr->notify_disconnected(k); };
+            ph.dial_failed  = [&coin_peer_mgr](const std::string& k) { coin_peer_mgr->notify_dial_failed(k); };
+            ph.has_header = [&header_chain](const uint256& h) { return header_chain.has_header(h); };
+            // A full block locator (tip, then exponentially back to genesis):
+            // a peer that does not hold our tip answers from the fork point.
+            ph.locator = [&header_chain, &chain_params]() {
+                auto locator = header_chain.get_locator();
+                if (locator.empty())
+                    locator.push_back(chain_params.genesis_hash);
+                return locator;
+            };
+            ph.height    = [&header_chain]() { return header_chain.height(); };
+            ph.caught_up = [hdr_caught_up]() { return *hdr_caught_up; };
+            ph.on_empty_headers = [hdr_caught_up]() {
+                if (!*hdr_caught_up)
+                    LOG_INFO << "[BTC] Header sync caught up (a coin peer has no headers"
+                                " after our tip). Waiting on announcements.";
+                *hdr_caught_up = true;
+            };
+            ph.on_headers = [&coin_node](const std::vector<btc::coin::BlockHeaderType>& h) {
+                coin_node.new_headers.happened(h);
+            };
+            ph.on_block_announced = [&coin_node](const uint256& h) { coin_node.new_block.happened(h); };
+            ph.on_tx = [&coin_node](const btc::coin::Transaction& tx) { coin_node.new_tx.happened(tx); };
+            ph.on_full_block = [&coin_node](const btc::coin::BlockType& b) {
+                coin_node.full_block.happened(b);
+            };
+            coin_pool = std::make_unique<btc::coin::CoinPeerPool>(std::move(ph));
+            LOG_INFO << "[BTC] standalone coin peer pool: target "
+                     << coin_pool->target() << " outbound coin peers (no external bitcoind)";
+            // First dials now.
+            coin_pool->tick();
 
-            // ── Standalone header-sync driver ───────────────────────────────
-            // On the external-bitcoind arm header re-requests come for free:
-            // new_headers chains the next getheaders on every 2000-batch, and
-            // the B5b tip-reconcile poll re-issues while a submit is pending. A
-            // header-only standalone node MINES NOTHING, so pending_submits is
-            // ALWAYS empty and B5b never fires; and the single 3s initial
-            // getheaders is easily lost (sent before/at handshake, or on the
-            // first peer that then EOFs), after which nothing re-requests headers
-            // and the coin header chain wedges at genesis. This self-rescheduling
-            // timer closes that gap, entirely on this standalone arm:
-            //   (2) re-sends getheaders(locator=current tip) whenever a peer is
-            //       handshaked, we are NOT caught up, and the tip did NOT advance
-            //       since the last tick — kickstart at genesis + stall recovery;
-            //       silent during healthy IBD (new_headers already chains the
-            //       next batch) and silent once caught up (zero churn);
-            //   (3) re-sends getheaders immediately on a fresh handshake, so a
-            //       (re)connect — the 60s EOF auto-reconnect OR a failover dial —
-            //       always re-requests headers on the new connection;
-            //   (4) fails over to the NEXT best-scored candidate when the header
-            //       tip has made NO progress for kNoProgressFailoverSec while not
-            //       caught up, regardless of handshake state — a handshaked-but-
-            //       silent peer no longer wedges sync forever. Suspended once
-            //       caught up so the natural inter-block header gap never churns
-            //       peers. Weak self-ref avoids a shared_ptr cycle (mirrors the
-            //       B5 warn timer below).
-            constexpr int kDriverTickSec         = 12;
-            auto hdr_last_height    = std::make_shared<uint32_t>(header_chain.height());
-            auto hdr_last_progress  = std::make_shared<std::chrono::steady_clock::time_point>(
-                std::chrono::steady_clock::now());
-            auto hdr_was_handshaked = std::make_shared<bool>(false);
-            auto hdr_last_getheaders = std::make_shared<std::chrono::steady_clock::time_point>(
-                std::chrono::steady_clock::now());
+            // ── Standalone pool driver ──────────────────────────────────────
+            // Every kDriverTickSec: slot upkeep + refill from the peer
+            // manager, and the header-source step over the whole pool
+            // (header_source_step: progress = the header tip, from any peer).
+            // The step's getheaders goes to each freshly handshaked peer and,
+            // when due, to one peer (catching up) or every peer (caught up);
+            // its failover drops the pooled peer whose last headers message
+            // is oldest and the refill replaces it. Weak self-ref avoids a
+            // shared_ptr cycle (mirrors the B5 warn timer below).
+            constexpr int kDriverTickSec = 12;
             auto standalone_dial_timer =
                 std::make_shared<boost::asio::steady_timer>(ioc);
             auto schedule_standalone_dial = std::make_shared<std::function<void()>>();
@@ -1388,79 +1379,17 @@ int main(int argc, char* argv[])
             // the closure survives this block's exit and keeps rescheduling.
             standalone_driver_keepalive = schedule_standalone_dial;
             std::weak_ptr<std::function<void()>> weak_dial = schedule_standalone_dial;
+            auto* pool_ptr = coin_pool.get();
             *schedule_standalone_dial =
-                [standalone_dial_timer, weak_dial, &coin_node, &header_chain,
-                 &chain_params, &coin_peer_mgr, dial_standalone_peer, hdr_caught_up,
-                 hdr_last_height, hdr_last_progress, hdr_was_handshaked,
-                 hdr_last_getheaders, standalone_current, standalone_handshaked,
-                 kDriverTickSec]() {
+                [standalone_dial_timer, weak_dial, pool_ptr, kDriverTickSec]() {
                     standalone_dial_timer->expires_after(std::chrono::seconds(kDriverTickSec));
                     standalone_dial_timer->async_wait(
-                        [standalone_dial_timer, weak_dial, &coin_node, &header_chain,
-                         &chain_params, &coin_peer_mgr, dial_standalone_peer, hdr_caught_up,
-                         hdr_last_height, hdr_last_progress, hdr_was_handshaked,
-                         hdr_last_getheaders, standalone_current, standalone_handshaked]
-                        (const boost::system::error_code& ec) {
+                        [weak_dial, pool_ptr](const boost::system::error_code& ec) {
                             if (ec) return;
-                            constexpr uint32_t GETHEADERS_VERSION = 70016;
-                            const uint32_t h          = header_chain.height();
-                            const bool     handshaked  = coin_node.is_handshake_complete();
-                            const bool     caught_up   = *hdr_caught_up;
-                            const auto     now         = std::chrono::steady_clock::now();
-                            const bool     advanced    = (h > *hdr_last_height);
-                            if (advanced) {
-                                *hdr_last_height   = h;
-                                *hdr_last_progress = now;
-                            }
-
-                            // A full block locator (tip, then exponentially back to
-                            // genesis): a peer that does not hold our tip (a block
-                            // that lost a race) answers from the fork point, not
-                            // from genesis.
-                            auto send_locator_getheaders = [&]() {
-                                auto locator = header_chain.get_locator();
-                                if (locator.empty())
-                                    locator.push_back(chain_params.genesis_hash);
-                                LOG_INFO << "[BTC] standalone header-sync getheaders locator="
-                                         << locator.front().GetHex().substr(0, 16)
-                                         << " (" << locator.size() << " hashes)"
-                                         << " chain_height=" << h;
-                                coin_node.send_getheaders(
-                                    GETHEADERS_VERSION, locator, uint256::ZERO);
-                                *hdr_last_getheaders = now;
-                            };
-
-                            const bool fresh = handshaked && !*hdr_was_handshaked;
-                            if (fresh && !standalone_current->empty()) {
-                                coin_peer_mgr->notify_connected(*standalone_current);
-                                *standalone_handshaked = true;
-                            }
-                            const auto secs = [&](std::chrono::steady_clock::time_point t) {
-                                return static_cast<int64_t>(
-                                    std::chrono::duration_cast<std::chrono::seconds>(now - t).count());
-                            };
-                            const auto step = btc::coin::header_source_step(
-                                caught_up, handshaked, fresh, advanced,
-                                secs(*hdr_last_progress), secs(*hdr_last_getheaders));
-                            if (step.getheaders)
-                                send_locator_getheaders();
-                            *hdr_was_handshaked = handshaked;
-
-                            if (step.failover) {
-                                LOG_INFO << "[BTC] standalone header source: no header "
-                                            "progress for " << secs(*hdr_last_progress)
-                                         << "s (chain_height=" << h << ", handshaked="
-                                         << handshaked << ", caught_up=" << caught_up
-                                         << ") — failing over to next candidate";
-                                if (!standalone_current->empty()) {
-                                    if (*standalone_handshaked)
-                                        coin_peer_mgr->notify_disconnected(*standalone_current);
-                                    else
-                                        coin_peer_mgr->notify_dial_failed(*standalone_current);
-                                }
-                                dial_standalone_peer();
-                                *hdr_last_progress  = now;    // grace window for the new peer
-                                *hdr_was_handshaked = false;  // force getheaders on its handshake
+                            try {
+                                pool_ptr->tick();
+                            } catch (const std::exception& e) {
+                                LOG_WARNING << "[BTC] coin peer pool tick error: " << e.what();
                             }
                             if (auto self = weak_dial.lock()) (*self)();
                         });
@@ -1478,10 +1407,13 @@ int main(int argc, char* argv[])
     boost::asio::steady_timer initial_getheaders(ioc);
     initial_getheaders.expires_after(std::chrono::seconds(3));
     initial_getheaders.async_wait(
-        [&coin_node, &header_chain, &chain_params, header_block_hash]
+        [&coin_node, &header_chain, &chain_params, header_block_hash, &coin_pool]
         (const boost::system::error_code& ec)
         {
             if (ec) return;
+            // Standalone pool: each pooled peer is asked when its handshake
+            // completes (the pool driver), not by this one-shot.
+            if (coin_pool) return;
             if (!coin_node.has_p2p()) {
                 LOG_WARNING << "[BTC] initial getheaders: no P2P connection yet";
                 return;
@@ -1560,11 +1492,11 @@ int main(int argc, char* argv[])
     std::weak_ptr<std::function<void()>> weak_reconcile = schedule_reconcile;
     *schedule_reconcile = [reconcile_timer, &coin_node, &header_chain,
                            &chain_params, pending_mu, pending_submits,
-                           weak_reconcile, BTC_PROTOCOL_VERSION]() {
+                           weak_reconcile, BTC_PROTOCOL_VERSION, &coin_pool]() {
         reconcile_timer->expires_after(btc::coin::TipReconcileGate::kPollInterval);
         reconcile_timer->async_wait(
             [reconcile_timer, &coin_node, &header_chain, &chain_params,
-             pending_mu, pending_submits, weak_reconcile, BTC_PROTOCOL_VERSION]
+             pending_mu, pending_submits, weak_reconcile, BTC_PROTOCOL_VERSION, &coin_pool]
             (const boost::system::error_code& ec) {
                 if (ec) return;
                 bool have_pending;
@@ -1572,9 +1504,12 @@ int main(int argc, char* argv[])
                     std::lock_guard<std::mutex> lk(*pending_mu);
                     have_pending = !pending_submits->empty();
                 }
+                // Standalone pool: P2P is up when any pooled peer has a
+                // completed handshake (null pool: coin_node alone, as before).
+                const bool pool_up = coin_pool && coin_pool->live_count() > 0;
                 if (btc::coin::TipReconcileGate::evaluate(
-                        have_pending, coin_node.has_p2p(),
-                        coin_node.is_handshake_complete())
+                        have_pending, coin_node.has_p2p() || pool_up,
+                        coin_node.is_handshake_complete() || pool_up)
                     == btc::coin::TipReconcileGate::Action::Poll) {
                     auto locator = header_chain.get_locator();
                     if (locator.empty())
@@ -1585,6 +1520,8 @@ int main(int argc, char* argv[])
                              << " chain_height=" << header_chain.height();
                     coin_node.send_getheaders(
                         BTC_PROTOCOL_VERSION, locator, uint256::ZERO);
+                    if (coin_pool)
+                        coin_pool->ask_all(locator);
                 }
                 if (auto self = weak_reconcile.lock()) (*self)();
             });
@@ -1837,7 +1774,7 @@ int main(int argc, char* argv[])
     // + adds to B5's pending_submits map for roundtrip tracking. Lambda
     // captures by reference so it reuses the existing B5 infrastructure
     // instead of duplicating it.
-    auto stratum_submit_fn = [&coin_node, pending_mu, pending_submits]
+    auto stratum_submit_fn = [&coin_node, &coin_pool, pending_mu, pending_submits]
         (const std::vector<unsigned char>& block_bytes, uint32_t height) -> bool
     {
         // Compute block_hash for pending_submits tracking. BTC block_hash =
@@ -1863,7 +1800,19 @@ int main(int argc, char* argv[])
         // answers only for the last cmpctblock it sent on that connection, so
         // reconstruction is not guaranteed - the silent-loss this path closes.
         // BTC-fenced; cross-coin fallback intact.
-        return coin_node.submit_block_for_connect(block_bytes);
+        // Standalone pool: the block ALSO goes to every pooled coin peer with
+        // a completed handshake (first, for propagation); the arms above are
+        // unchanged.
+        bool pool_relayed = false;
+        if (coin_pool) {
+            try {
+                pool_relayed = coin_pool->broadcast_block(block_bytes) > 0;
+            } catch (const std::exception& e) {
+                LOG_WARNING << "[BTC-SUBMIT] pooled coin peer relay failed: " << e.what();
+            }
+        }
+        const bool reached = coin_node.submit_block_for_connect(block_bytes);
+        return reached || pool_relayed;
     };
 
     // Per-share template retention for the won-block reconstructor (slice 7/7).
@@ -2635,14 +2584,18 @@ int main(int argc, char* argv[])
 
         p2p_node_raw->tracker().m_on_block_found = btc::coin::make_on_block_found(
             /*reconstruct=*/std::move(reconstruct),
-            /*relay_p2p=*/[&ioc, coin = &coin_node](
+            /*relay_p2p=*/[&ioc, coin = &coin_node, pool = &coin_pool](
                               const std::vector<unsigned char>& block_bytes)
                               -> bool {
                 // NodeP2P is single-thread-confined to ioc — post the relay write.
-                io::post(ioc, [coin, b = block_bytes]() {
+                // Standalone pool: the same post also relays the block to every
+                // pooled coin peer with a completed handshake.
+                io::post(ioc, [coin, pool, b = block_bytes]() {
                     coin->submit_block_p2p_raw(b);
+                    if (*pool) (*pool)->broadcast_block(b);
                 });
-                return coin->has_p2p();   // arm available => not a lost subsidy
+                // arm available => not a lost subsidy
+                return coin->has_p2p() || (*pool && (*pool)->live_count() > 0);
             },
             /*submit_rpc=*/[&ioc, coin = &coin_node](const std::string& block_hex)
                                -> bool {
@@ -3217,11 +3170,14 @@ int main(int argc, char* argv[])
             for (auto& [id, w] : ws->snapshot_stratum_workers()) total += w.hashrate;
             return total;
         });
-        mi->set_node_topology_fn([&header_chain, &coin_node]() {
+        mi->set_node_topology_fn([&header_chain, &coin_node, &coin_pool]() {
             const uint32_t synced   = header_chain.height();
             const uint32_t peer_tip = header_chain.peer_tip_height();
             const bool     emb_p2p  = coin_node.has_p2p();
             const bool     ext_rpc  = coin_node.has_rpc();
+            // Standalone pool: its connected peers (coin_node then holds none).
+            const size_t   pool_live = coin_pool ? coin_pool->live_count() : 0;
+            const size_t   emb_peers = (emb_p2p ? 1 : 0) + pool_live;
             return nlohmann::json{
                 {"coin", "BTC"},
                 {"embedded", true},
@@ -3229,8 +3185,8 @@ int main(int argc, char* argv[])
                 {"synced_height", synced},
                 {"peer_tip_height", peer_tip},
                 {"sync_pct", (peer_tip > 0 ? 100.0 * synced / peer_tip : 0.0)},
-                {"embedded_peers", emb_p2p ? 1 : 0},
-                {"broadcast_route", emb_p2p ? "p2p" : (ext_rpc ? "rpc" : "none")},
+                {"embedded_peers", emb_peers},
+                {"broadcast_route", emb_peers > 0 ? "p2p" : (ext_rpc ? "rpc" : "none")},
             };
         });
 
@@ -3239,42 +3195,41 @@ int main(int argc, char* argv[])
         // target_height/sync_percent + connected_peers[].startingheight so
         // the dashboard sync cards render the REAL BTC header-chain tip --
         // never the sharechain height. Sources: the embedded HeaderChain tip
-        // + its version-advertised peer tip, plus the single embedded P2P
-        // peer's startingheight. Captured objects are main-scope and outlive
+        // + its version-advertised peer tip, plus the connected coin peers'
+        // startingheight (coin_node's single P2P peer with --bitcoind, every
+        // pooled peer standalone). Captured objects are main-scope and outlive
         // ioc.run(); all reads are display-only.
-        mi->set_coin_sync_status_fn([&header_chain, &coin_node, &coin_peer_mgr]() -> nlohmann::json {
+        mi->set_coin_sync_status_fn([&header_chain, &coin_node, &coin_peer_mgr, &coin_pool]() -> nlohmann::json {
             nlohmann::json s = nlohmann::json::object();
             const uint32_t hh = header_chain.height();
             uint32_t th = header_chain.peer_tip_height();
-            nlohmann::json peers = nlohmann::json::array();
+            // A private, loopback or local peer (a configured LAN node) is
+            // shown as "private", never by its address (coin_peer_rows).
+            std::vector<btc::coin::CoinPeerRow> live;
             auto* p2p = coin_node.p2p();
             if (p2p != nullptr && p2p->peer_version() > 0) {
-                const uint32_t sh = p2p->peer_start_height();
-                if (sh > th) th = sh;
-                // A private, loopback or local peer (a configured LAN node)
-                // is shown as "private", never by its address.
-                const bool live_public = is_routable(p2p->peer_service().address());
-                peers.push_back({
-                    {"addr", live_public ? p2p->peer_address() : std::string("private")},
-                    {"subver", p2p->peer_subver()},
-                    {"startingheight", sh},
-                    {"conntime", p2p->peer_uptime_sec()},
-                    {"connected", true},
-                });
+                btc::coin::CoinPeerRow r;
+                r.addr = p2p->peer_address();
+                r.routable = is_routable(p2p->peer_service().address());
+                r.subver = p2p->peer_subver();
+                r.start_height = p2p->peer_start_height();
+                r.conntime = p2p->peer_uptime_sec();
+                live.push_back(std::move(r));
+            }
+            if (coin_pool) {
+                for (auto& r : coin_pool->rows())
+                    live.push_back(std::move(r));
             }
             // The coin peer manager's other candidates, as idle rows (the
             // dashboard's "Known peers" counts connected + idle).
-            if (coin_peer_mgr) {
-                const std::string live = (p2p != nullptr && p2p->peer_version() > 0)
-                    ? p2p->peer_address() : std::string();
-                for (const auto& key : coin_peer_mgr->working_set_keys()) {
-                    if (key == live) continue;
-                    peers.push_back({{"addr", key}, {"connected", false}});
-                }
-            }
+            std::vector<std::string> idle;
+            if (coin_peer_mgr)
+                idle = coin_peer_mgr->working_set_keys();
+            auto rows = btc::coin::coin_peer_rows(live, idle);
+            if (rows.max_start_height > th) th = rows.max_start_height;
             s["header_height"] = hh;
             s["target_height"] = th;
-            s["peers"] = std::move(peers);
+            s["peers"] = std::move(rows.peers);
             return s;
         });
 
