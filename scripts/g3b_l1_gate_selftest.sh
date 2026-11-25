@@ -1,70 +1,105 @@
 #!/bin/bash
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Offline self-test of the G3b gate expressions: L1 reject regex, L1SUM gate,
-# L2 tip compare (ltc_g3b_vm220_harness.sh) and the L3 scorer's input checks
-# (g3b_l3_score.sh, same dir as the harness).
+# Offline self-test of the G3b gate expressions: L1 reject and DOGE-dropped regexes,
+# L1SUM gate, L2 tip compare (ltc_g3b_vm220_harness.sh) and the L3 scorer's input
+# checks (g3b_l3_score.sh, same dir as the harness).
 #
 # Usage: scripts/g3b_l1_gate_selftest.sh scripts/ltc_g3b_vm220_harness.sh [c2pool src root]
 #
 # Every log sample is the verbatim line the source emits, with the real core
 # prefix "[HH:MM:SS.ffffff][sev] " (src/core/log.cpp format "[%1%][%2%] %3%").
-# With a src root, each sample's literal is also looked up in the named source
-# file, so a sample the code cannot emit fails the test.
+# Each quoted literal must appear in the sample itself, and with a src root it is
+# also looked up in the named source file, so a sample the code cannot emit fails.
 H=$1; SRC=${2:-}
 L3S="$(cd "$(dirname "$H")" && pwd)/g3b_l3_score.sh"
 eval "$(grep -m1 '^REJ_RE=' "$H")"
+eval "$(grep -m1 '^DROP_RE=' "$H")"
 eval "$(grep -m1 '^l1sum_ok()' "$H")"
 eval "$(grep -m1 '^tipnorm()' "$H")"
 eval "$(grep -m1 '^hex64()' "$H")"
-[ -n "${REJ_RE:-}" ] && declare -F l1sum_ok tipnorm hex64 >/dev/null && [ -x "$L3S" ] \
+[ -n "${REJ_RE:-}" ] && [ -n "${DROP_RE:-}" ] && declare -F l1sum_ok tipnorm hex64 >/dev/null && [ -x "$L3S" ] \
   || { echo "SELFTEST could not extract gates"; exit 2; }
 fail=0
 chk(){ if [ "$1" = "$2" ]; then echo "ok   $3"; else echo "FAIL $3 (got $1 want $2)"; fail=1; fi; }
-# src FILE LITERAL: the sample's fixed text must appear in that source file
+# src FILE LITERAL: the literal must appear in that source file
 src(){ [ -z "$SRC" ] && return; grep -qF -- "$2" "$SRC/$1" && echo "ok   src $1 has $2" || { echo "FAIL src $1 lacks $2"; fail=1; }; }
 n(){ printf '%s\n' "$1" | grep -Ec "$REJ_RE"; }
+d(){ printf '%s\n' "$1" | grep -Ec "$DROP_RE"; }
+# c REJ DROP DESC SAMPLE [FILE LITERAL]...: the sample must count REJ times on REJ_RE and
+# DROP times on DROP_RE. A literal in double quotes is a C++ string literal: without its
+# quotes it must be a substring of the sample, and (with a src root) it must be in FILE.
+# A literal not in quotes is a code fragment and is only looked up in FILE.
+c(){ local r=$1 dr=$2 desc=$3 s=$4 f l in; shift 4
+  chk "$(n "$s")" "$r" "$desc (reject)"; chk "$(d "$s")" "$dr" "$desc (dropped)"
+  while [ $# -ge 2 ]; do f=$1; l=$2; shift 2
+    if [ "${l:0:1}" = '"' ] && [ "${l: -1}" = '"' ]; then in=${l:1:${#l}-2}
+      case $s in *"$in"*) echo "ok   sample has $in";; *) echo "FAIL sample for '$desc' lacks $in"; fail=1;; esac; fi
+    src "$f" "$l"; done; }
 MM=src/c2pool/merged/merged_mining.cpp; LR=src/impl/ltc/coin/rpc.cpp; WS=src/core/web_server.cpp
 
-# DOGE aux submit verdicts (merged_mining.cpp 858-876)
-chk "$(n '[08:15:08.662939][info] [MM:DOGE] submitblock ACCEPTED')" 0 "DOGE accepted (858) not counted"
-src $MM '"] submitblock ACCEPTED"'
-chk "$(n '[08:54:04.680109][info] [MM:DOGE] submitblock: duplicate (the daemon already has this block, valid)')" 0 "DOGE duplicate (861) not counted"
-src $MM '"] submitblock: duplicate (the daemon already has this block, valid)"'
-chk "$(n "[09:01:12.104233][warning] [MM:DOGE] submitblock INCONCLUSIVE (inconclusive): stored, not on the daemon's best chain")" 0 "DOGE INCONCLUSIVE (864) not counted (deliberate)"
-src $MM '"] submitblock INCONCLUSIVE ("'; src $MM "\"): stored, not on the daemon's best chain\""
-chk "$(n '[09:01:12.104233][error] [MM:DOGE] submitblock REJECTED by daemon: bad-cb-amount')" 1 "DOGE BIP22 reject (868) counted"
-src $MM '"] submitblock REJECTED by daemon: "'
-chk "$(n '[09:01:12.104233][error] [MM:DOGE] submitblock refused: -22: Block decode failed')" 1 "DOGE -22 decode failed (871) counted"
-src $MM '"] submitblock refused: "'; src $MM 'code == -22 ? K::error'
-chk "$(n '[09:01:12.104233][warning] [MM:DOGE] submitblock: no answer (no answer within 30000 ms): the chain decides (P2P relay sent it too)')" 1 "DOGE no answer (874) counted (deliberate)"
-src $MM '"] submitblock: no answer ("'; src $MM '"): the chain decides (P2P relay sent it too)"'
+# DOGE aux submit verdicts (merged_mining.cpp 858-876, 949)
+c 0 0 "DOGE accepted (858) not counted" '[08:15:08.662939][info] [MM:DOGE] submitblock ACCEPTED' \
+  $MM '"] submitblock ACCEPTED"'
+c 0 0 "DOGE duplicate (861) not counted" '[08:54:04.680109][info] [MM:DOGE] submitblock: duplicate (the daemon already has this block, valid)' \
+  $MM '"] submitblock: duplicate (the daemon already has this block, valid)"'
+c 0 0 "DOGE INCONCLUSIVE (864) not counted (deliberate)" "[09:01:12.104233][warning] [MM:DOGE] submitblock INCONCLUSIVE (inconclusive): stored, not on the daemon's best chain" \
+  $MM '"] submitblock INCONCLUSIVE ("' $MM "\"): stored, not on the daemon's best chain\""
+c 1 0 "DOGE BIP22 reject (868) counted" '[09:01:12.104233][error] [MM:DOGE] submitblock REJECTED by daemon: bad-cb-amount' \
+  $MM '"] submitblock REJECTED by daemon: "'
+c 1 0 "DOGE -22 decode failed (871) counted" '[09:01:12.104233][error] [MM:DOGE] submitblock refused: -22: Block decode failed' \
+  $MM '"] submitblock refused: "' $MM 'code == -22 ? K::error'
+c 1 0 "DOGE no answer (874) counted (deliberate)" '[09:01:12.104233][warning] [MM:DOGE] submitblock: no answer (no answer within 30000 ms): the chain decides (P2P relay sent it too)' \
+  $MM '"] submitblock: no answer ("' $MM '"): the chain decides (P2P relay sent it too)"'
+c 1 0 "DOGE submitauxblock fallback failure (949) counted" '[09:01:12.104233][warning] [MM:DOGE] submitauxblock failed: Connection refused' \
+  $MM '"] submitauxblock failed: "'
 # DOGE merged-block build/refuse paths
-chk "$(n '[09:01:12.104233][warning] [MM:DOGE] Merged block refused: leaf mismatch — committed root 7068263050cb28c1, not submitted')" 1 "DOGE commit refuse (1897) counted"
-src $MM '"] Merged block refused: "'
-chk "$(n '[09:01:12.104233][error] [MM:DOGE] Merged block REFUSED: stripped size 1100000 > 1000000 (1200000 bytes; auxpow 300 B, coinbase 200 B, 12 txs) — not submitted, not relayed')" 1 "DOGE oversize REFUSED (2079) counted"
-src $MM '"] Merged block REFUSED: "'
-chk "$(n '[09:01:12.104233][error] [MM:DOGE] Merged block assembly failed: bad coinbase — not submitted')" 1 "DOGE assembly failed (2141) counted"
-src $MM '"] Merged block assembly failed: "'
-chk "$(n '[09:01:12.104233][error] [MM:DOGE] submit threw: connect: Connection refused')" 1 "DOGE submit threw (2170) counted"
-src $MM '"] submit threw: "'
-chk "$(n '[09:01:12.104233][error] [MM:DOGE] submit threw an unknown exception')" 1 "DOGE submit threw unknown (2173) counted"
-src $MM '"] submit threw an unknown exception"'
-chk "$(n '[08:15:08.660652][info] [MM:DOGE] Merged block submitted (742 bytes, snapshot hash=7068263050cb28c1)')" 0 "DOGE submitted (2089) not counted"
-src $MM '"] Merged block submitted ("'
+c 1 0 "DOGE commit refuse (1897) counted" '[09:01:12.104233][warning] [MM:DOGE] Merged block refused: this chain has no block in that commitment — committed root 7068263050cb28c1, not submitted' \
+  $MM '"] Merged block refused: "' $MM '"this chain has no block in that commitment"' $MM '" — committed root "' $MM '", not submitted"'
+c 1 0 "DOGE oversize REFUSED (2079) counted" '[09:01:12.104233][error] [MM:DOGE] Merged block REFUSED: stripped size 1100000 > 1000000 (1200000 bytes; auxpow 300 B, coinbase 200 B, 12 txs) — not submitted, not relayed' \
+  $MM '"] Merged block REFUSED: "' $MM '" txs) — not submitted, not relayed"'
+c 1 0 "DOGE assembly failed (2141) counted" '[09:01:12.104233][error] [MM:DOGE] Merged block assembly failed: bad coinbase — not submitted' \
+  $MM '"] Merged block assembly failed: "' $MM '" — not submitted"'
+c 1 0 "DOGE submit threw (2170) counted" '[09:01:12.104233][error] [MM:DOGE] submit threw: connect: Connection refused' \
+  $MM '"] submit threw: "'
+c 1 0 "DOGE submit threw unknown (2173) counted" '[09:01:12.104233][error] [MM:DOGE] submit threw an unknown exception' \
+  $MM '"] submit threw an unknown exception"'
+c 0 0 "DOGE submitted (2089) not counted" '[08:15:08.660652][info] [MM:DOGE] Merged block submitted (742 bytes, snapshot hash=7068263050cb28c1)' \
+  $MM '"] Merged block submitted ("' $MM '", snapshot hash="'
+# DOGE blocks found but dropped before any submit: doge_dropped, never a reject
+c 0 1 "DOGE no_snapshot (1967) dropped" '[09:01:12.104233][warning] [MM:DOGE] No matching snapshot for committed hash 7068263050cb28c1 — history_size=8, skipping submission to avoid ban' \
+  $MM '"] No matching snapshot for committed hash "' $MM '" — history_size="' $MM '", skipping submission to avoid ban"'
+c 0 1 "DOGE root_mismatch (1980) dropped" '[09:01:12.104233][error] [MM:DOGE] BUG: recomputed chain merkle root 1a2b3c4d5e6f7a8b != committed 7068263050cb28c1 — skipping to avoid ban' \
+  $MM '"] BUG: recomputed chain merkle root "' $MM '" != committed "' $MM '" — skipping to avoid ban"'
+c 0 1 "DOGE snapshot bits (2022) dropped" "[09:01:12.104233][warning] [MM:DOGE] Parent PoW 00ffe1c2d3b4a596 does not meet the snapshot's bits 207fffff (block 7068263050cb28c1 on 3c2b1a0f9e8d7c6b) — not submitted" \
+  $MM '"] Parent PoW "' $MM "\" does not meet the snapshot's bits \"" $MM '" (block "' $MM '" on "' $MM '") — not submitted"'
+c 0 1 "DOGE rebuilt header hash (2042) dropped" '[09:01:12.104233][error] [MM:DOGE] BUG: rebuilt header hash 9f8e7d6c5b4a3928 != committed 7068263050cb28c1 — skipping to avoid ban' \
+  $MM '"] BUG: rebuilt header hash "' $MM '" != committed "' $MM '" — skipping to avoid ban"'
+c 0 1 "DOGE no fabe6d6d (1860) dropped" '[09:01:12.104233][warning] [MM:DOGE] fabe6d6d NOT FOUND in parent coinbase — cannot submit' \
+  $MM '"] fabe6d6d NOT FOUND in parent coinbase — cannot submit"'
+c 0 1 "DOGE short fabe6d6d (1867) dropped" '[09:01:12.104233][warning] [MM:DOGE] fabe6d6d found but insufficient bytes after magic' \
+  $MM '"] fabe6d6d found but insufficient bytes after magic"'
+c 0 0 "DOGE NULL target (1819) is not a found block" '[09:01:12.104233][warning] [MM:DOGE] Check #5 — target is NULL, no merged blocks can be found! (chain synced? work height=0)' \
+  $MM '" — target is NULL, no merged blocks can be found!"'
+c 0 0 "DOGE found banner (1837) not counted" '###  MERGED BLOCK FOUND! DOGE                                    ###' \
+  $MM '"###  MERGED BLOCK FOUND! "'
+# the harness must gate L1 PASS on doge_dropped == 0, not only compute it
+grep -q '\[ "\$DROP" -eq 0 \]' "$H" && echo "ok   L1 PASS requires doge_dropped=0" || { echo "FAIL L1 PASS does not gate on DROP"; fail=1; }
 # LTC parent submit (ltc/coin/rpc.cpp 470, 481, 483)
-chk "$(n '[09:01:12.104233][error] Block submittal result: 0("bad-txnmrklroot") Expected: 1')" 1 "LTC submit_block reject (470) counted"
-src $LR '"Block submittal result: "'
-chk "$(n '[09:01:12.104233][error] submit_block_hex result: "high-hash"')" 1 "LTC submit_block_hex reject (481) counted"
-src $LR '"submit_block_hex result: "'
-chk "$(n '[09:01:12.104233][info] submit_block_hex accepted')" 0 "LTC accepted (483) not counted"
-chk "$(n '[09:01:12.104233][info] submit_block_hex accepted ("duplicate")')" 0 "LTC accepted duplicate (483) not counted"
-chk "$(n '[09:32:58.259821][info] submit_block_hex accepted ("inconclusive")')" 0 "LTC accepted inconclusive (483) not counted"
-src $LR '"submit_block_hex accepted"'
+c 1 0 "LTC submit_block reject (470) counted" '[09:01:12.104233][error] Block submittal result: 0("bad-txnmrklroot") Expected: 1' \
+  $LR '"Block submittal result: "'
+c 1 0 "LTC submit_block_hex reject (481) counted" '[09:01:12.104233][error] submit_block_hex result: "high-hash"' \
+  $LR '"submit_block_hex result: "'
+c 0 0 "LTC accepted (483) not counted" '[09:01:12.104233][info] submit_block_hex accepted' \
+  $LR '"submit_block_hex accepted"'
+c 0 0 "LTC accepted duplicate (483) not counted" '[09:01:12.104233][info] submit_block_hex accepted ("duplicate")' \
+  $LR '"submit_block_hex accepted"'
+c 0 0 "LTC accepted inconclusive (483) not counted" '[09:32:58.259821][info] submit_block_hex accepted ("inconclusive")' \
+  $LR '"submit_block_hex accepted"'
 # core stratum submit path (web_server.cpp)
-chk "$(n '[09:01:12.104233][warning] submitblock: coin daemon rejected the block (or already had it)')" 1 "stratum daemon reject counted"
-src $WS '"submitblock: coin daemon rejected the block (or already had it)"'
-chk "$(n '[09:01:12.104233][error] submitblock failed: Connection refused')" 1 "stratum submit transport failure counted"
-src $WS '"submitblock failed: "'
+c 1 0 "stratum daemon reject counted" '[09:01:12.104233][warning] submitblock: coin daemon rejected the block (or already had it)' \
+  $WS '"submitblock: coin daemon rejected the block (or already had it)"'
+c 1 0 "stratum submit transport failure counted" '[09:01:12.104233][error] submitblock failed: Connection refused' \
+  $WS '"submitblock failed: "'
 
 # L1SUM gate: each claimed counter must be >=1; populated= must not be satisfied by doge_populated=
 G(){ l1sum_ok "$1" && echo 1 || echo 0; }

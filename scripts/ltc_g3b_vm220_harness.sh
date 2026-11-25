@@ -199,10 +199,12 @@ DACC=$(cat "$P"/node?.log | grep -c "\[MM:DOGE\] submitblock ACCEPTED")
 # Reject lines, verbatim from the source (core log prefix "[HH:MM:SS.ffffff][sev] "):
 #   LTC  ltc/coin/rpc.cpp   "submit_block_hex result: <json>", "Block submittal result: ..."
 #   core web_server.cpp     "submitblock: coin daemon rejected the block"; "[error] submitblock
-#                           failed: <what>" (stratum RPC transport; core only, DOGE never logs it)
+#                           failed: <what>" (stratum RPC transport, no [MM:] prefix, so the
+#                           regex anchors it on "] " and a DOGE line can match it too)
 #   DOGE merged_mining.cpp  "[MM:DOGE] submitblock REJECTED by daemon:" (BIP22 reject string),
 #                           "submitblock refused:" (JSON-RPC error, e.g. -22 Block decode failed),
 #                           "submitblock: no answer (" (timeout, unparsable, non -22 RPC error),
+#                           "submitauxblock failed:" (getauxblock/submitauxblock fallback),
 #                           "Merged block refused:" (commit check), "Merged block REFUSED:"
 #                           (oversize), "Merged block assembly failed:", "submit threw".
 # On purpose, "submitblock: no answer" COUNTS. Against a loopback regtest daemon it means the
@@ -212,15 +214,25 @@ DACC=$(cat "$P"/node?.log | grep -c "\[MM:DOGE\] submitblock ACCEPTED")
 # two-node race for one DOGE height (each node submits its own merged block), and the LTC side
 # treats "inconclusive" as accepted too (core::coin::submitblock_result_accepted). It is
 # reported as doge_inconclusive so the stale rate stays visible.
-REJ_RE="submit_block_hex result:|Block submittal result:|submitblock: coin daemon rejected|\] submitblock failed:|\[MM:[A-Z0-9]+\] (submitblock (REJECTED by daemon|refused):|submitblock: no answer \(|Merged block (refused|REFUSED):|Merged block assembly failed:|submit threw)|submitblock via RPC: REJECTED"
+REJ_RE="submit_block_hex result:|Block submittal result:|submitblock: coin daemon rejected|\] submitblock failed:|\[MM:[A-Z0-9]+\] (submitblock (REJECTED by daemon|refused):|submitblock: no answer \(|Merged block (refused|REFUSED):|Merged block assembly failed:|submit threw|submitauxblock failed:)|submitblock via RPC: REJECTED"
 REJ=$(cat "$P"/node?.log | grep -Ec "$REJ_RE")
+# DOGE blocks FOUND (the parent PoW met the aux target, after the "MERGED BLOCK FOUND" banner)
+# but dropped before any submit, so no submit verdict is ever logged for them
+# (merged_mining.cpp on master): "No matching snapshot for committed hash" (no_snapshot,
+# e.g. a stale job aged out of frozen_history), "BUG: recomputed chain merkle root"
+# (root_mismatch), "BUG: rebuilt header hash", "Parent PoW <h> does not meet the snapshot's
+# bits", "fabe6d6d NOT FOUND in parent coinbase", "fabe6d6d found but insufficient bytes
+# after magic". Counted apart as doge_dropped, which must be 0 for L1 PASS.
+DROP_RE="\[MM:[A-Z0-9]+\] (No matching snapshot for committed hash |BUG: recomputed chain merkle root |BUG: rebuilt header hash |Parent PoW [0-9a-f]+ does not meet the snapshot's bits |fabe6d6d NOT FOUND in parent coinbase|fabe6d6d found but insufficient bytes after magic)"
+DROP=$(cat "$P"/node?.log | grep -Ec "$DROP_RE")
 DINC=$(cat "$P"/node?.log | grep -c "\[MM:DOGE\] submitblock INCONCLUSIVE")
 S1=$(grep L1SUM "$P/extract.txt")
 # Every L1SUM counter that L1 PASS claims must be >=1. populated= is anchored, so
 # doge_populated= cannot satisfy it.
 l1sum_ok(){ local k; for k in populated auxcommit pays_both doge_auxpow doge_populated; do echo "$1" | grep -Eq "(^| )$k=[1-9]" || return 1; done; }
-if [ "$LACC" -ge 1 ] && [ "$DACC" -ge 1 ] && [ "$REJ" -eq 0 ] && l1sum_ok "$S1"; then
-  res "L1 PASS $S1 ltc_acc=$LACC doge_acc=$DACC rejects=$REJ doge_inconclusive=$DINC"; else res "L1 FAIL $S1 ltc_acc=$LACC doge_acc=$DACC rejects=$REJ doge_inconclusive=$DINC"; fi
+L1="$S1 ltc_acc=$LACC doge_acc=$DACC rejects=$REJ doge_dropped=$DROP doge_inconclusive=$DINC"
+if [ "$LACC" -ge 1 ] && [ "$DACC" -ge 1 ] && [ "$REJ" -eq 0 ] && [ "$DROP" -eq 0 ] && l1sum_ok "$S1"; then
+  res "L1 PASS $L1"; else res "L1 FAIL $L1"; fi
 
 # ---------------------------------------------------------------- L2 verdict
 if [[ $LEGS == *2* ]]; then
