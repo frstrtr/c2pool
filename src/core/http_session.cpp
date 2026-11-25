@@ -1079,6 +1079,17 @@ void HttpSession::process_request()
                 }
                 rest_result = mining_interface_->rest_miner_payouts(addr);
             }
+            else if (target.substr(0, 22) == "/merged_miner_payouts/") {
+                std::string addr = url_decode(target.substr(22));
+                if (!is_valid_address_chars(addr)) {
+                    response.result(http::status::bad_request);
+                    response.body() = R"({"error":"Invalid address parameter"})";
+                    response.prepare_payload();
+                    send_response(std::move(response));
+                    return;
+                }
+                rest_result = mining_interface_->rest_merged_miner_payouts(addr);
+            }
             else if (target.substr(0, 18) == "/patron_sendmany/") {
                 std::string total = url_decode(target.substr(18));
                 if (!is_valid_address_chars(total)) {

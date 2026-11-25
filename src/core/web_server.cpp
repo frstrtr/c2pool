@@ -9712,7 +9712,48 @@ std::vector<unsigned char> payee_script(const std::string& address)
     }
     return script;
 }
+
+// The 20-byte hash a P2PKH, P2WPKH or P2SH script pays to; nullptr otherwise.
+const unsigned char* script_hash160(const std::vector<unsigned char>& s)
+{
+    if (s.size() == 25 && s[0] == 0x76 && s[1] == 0xa9 && s[2] == 0x14
+        && s[23] == 0x88 && s[24] == 0xac)
+        return s.data() + 3;
+    if (s.size() == 22 && s[0] == 0x00 && s[1] == 0x14)
+        return s.data() + 2;
+    if (s.size() == 23 && s[0] == 0xa9 && s[1] == 0x14 && s[22] == 0x87)
+        return s.data() + 2;
+    return nullptr;
+}
 } // namespace
+
+bool MiningInterface::found_block_miner_pays(const std::string& stored,
+                                             const std::string& address)
+{
+    if (address.empty()) return true;
+    const std::string shown = found_block_miner_display(stored);
+    if (!shown.empty()) {
+        if (shown == address) return true;
+        const auto want = payee_script(address);
+        return !want.empty() && payee_script(shown) == want;
+    }
+    // A pre-fix v36 row: the share's pubkey hash as uint160::GetHex, i.e. the
+    // 20 script bytes in reverse order, with no script type.
+    if (stored.size() != 40) return false;
+    const auto want = payee_script(address);
+    const unsigned char* h = script_hash160(want);
+    if (!h) return false;
+    static const char* kHex = "0123456789abcdef";
+    const auto lc = [](char c) {
+        return static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    };
+    for (size_t i = 0; i < 20; ++i) {
+        const unsigned char byte = h[19 - i];
+        if (lc(stored[2 * i]) != kHex[byte >> 4] || lc(stored[2 * i + 1]) != kHex[byte & 0x0f])
+            return false;
+    }
+    return true;
+}
 
 nlohmann::json MiningInterface::rest_miner_payouts(const std::string& address)
 {
@@ -9767,18 +9808,14 @@ nlohmann::json MiningInterface::rest_miner_payouts(const std::string& address)
         }
 
         // One payee, however the address is spelled: compared by the script
-        // it pays (the row's miner as rendered; a pre-fix raw-hex one reads
-        // as the address it encodes, or not at all).
-        const auto want = payee_script(address);
+        // it pays (found_block_miner_pays; a pre-fix raw-hex row by the hash
+        // it holds).
         for (const auto& b : m_found_blocks) {
             // Parent-chain blocks only: a merged (DOGE) row counted as a block
             // this miner found, added its aux reward to the parent-coin totals
             // and linked its aux hash through the parent explorer.
             if (!is_primary_found_block(b)) continue;
-            const std::string row_miner = found_block_miner_display(b.miner);
-            const bool same_payee = address.empty() || row_miner == address
-                || (!want.empty() && !row_miner.empty() && payee_script(row_miner) == want);
-            if (same_payee) {
+            if (found_block_miner_pays(b.miner, address)) {
                 ++blocks_found;
                 double payout_estimate = b.subsidy > 0 ? static_cast<double>(b.subsidy) / 1e8 : 0;
                 if (b.status == BlockStatus::confirmed)
@@ -9807,6 +9844,117 @@ nlohmann::json MiningInterface::rest_miner_payouts(const std::string& address)
         result["maturing_rewards"] = maturing_rewards;
         result["blocks"] = blocks_arr;
     }
+    return result;
+}
+
+nlohmann::json MiningInterface::rest_merged_miner_payouts(const std::string& address)
+{
+    nlohmann::json result = nlohmann::json::object();
+    result["address"] = address;
+    result["symbol"] = nullptr;
+    result["blocks_found"] = 0;
+    result["total_estimated_rewards"] = 0.0;
+    result["confirmed_rewards"] = 0.0;
+    result["maturing_rewards"] = 0.0;
+    result["blocks"] = nlohmann::json::array();
+
+    // The rows /recent_merged_blocks serves, one per aux block hash: this
+    // node's own finds from the found-block ledger, the finds peers' shares
+    // carried from the merged manager. A ledger row keeps its status; the
+    // manager's row gives the miner where the ledger row has none.
+    struct Row {
+        std::string symbol, hash, miner, status;
+        uint64_t height{0};
+        uint64_t ts{0};
+        uint64_t reward{0};
+        uint32_t confirmations{0};
+    };
+    static const char* status_str[] = {"pending", "confirmed", "orphaned", "stale"};
+    std::vector<Row> rows;
+    {
+        std::lock_guard<std::mutex> lock(m_blocks_mutex);
+        for (const auto& b : m_found_blocks) {
+            if (is_primary_found_block(b) || b.hash.empty()) continue;
+            Row r;
+            r.symbol = b.chain;
+            r.hash = b.hash;
+            r.miner = b.miner;
+            r.status = status_str[static_cast<int>(b.status)];
+            r.height = b.height;
+            r.ts = b.ts;
+            r.reward = b.subsidy;
+            r.confirmations = b.confirmations;
+            rows.push_back(std::move(r));
+        }
+    }
+    if (m_mm_manager) {
+        for (const auto& d : m_mm_manager->get_discovered_blocks()) {
+            if (d.block_hash.empty()) continue;
+            auto it = std::find_if(rows.begin(), rows.end(),
+                                   [&d](const Row& r) { return r.hash == d.block_hash; });
+            if (it != rows.end()) {
+                if (!d.miner.empty()) it->miner = d.miner;
+                if (it->reward == 0 && d.coinbase_value > 0) it->reward = d.coinbase_value;
+                continue;
+            }
+            Row r;
+            r.symbol = d.symbol;
+            r.hash = d.block_hash;
+            r.miner = d.miner;
+            // As /discovered_merged_blocks labels it.
+            r.status = d.accepted ? "confirmed" : "orphaned";
+            r.height = d.height > 0 ? static_cast<uint64_t>(d.height) : 0;
+            r.ts = d.timestamp > 0 ? static_cast<uint64_t>(d.timestamp) : 0;
+            r.reward = d.coinbase_value;
+            rows.push_back(std::move(r));
+        }
+    }
+
+    std::vector<const Row*> mine;
+    std::map<std::string, int> per_symbol;
+    for (const auto& r : rows) {
+        if (!found_block_miner_pays(r.miner, address)) continue;
+        mine.push_back(&r);
+        ++per_symbol[r.symbol];
+    }
+    std::sort(mine.begin(), mine.end(),
+              [](const Row* a, const Row* b) { return a->ts > b->ts; });
+    // The totals are in one coin: the aux chain with the most of these blocks.
+    std::string symbol;
+    int most = 0;
+    for (const auto& [sym, n] : per_symbol)
+        if (n > most) { most = n; symbol = sym; }
+
+    double confirmed = 0.0, maturing = 0.0;
+    nlohmann::json blocks = nlohmann::json::array();
+    for (const Row* r : mine) {
+        const double reward = r->reward > 0 ? static_cast<double>(r->reward) / 1e8 : 0.0;
+        if (r->symbol == symbol) {
+            if (r->status == "confirmed") confirmed += reward;
+            else if (r->status == "pending") maturing += reward;
+        }
+        if (blocks.size() >= 20) continue;
+        const std::string prefix = merged_block_explorer_prefix(r->symbol, m_testnet);
+        blocks.push_back({
+            {"timestamp", r->ts},
+            {"symbol", r->symbol},
+            {"block_height", r->height},
+            {"block_hash", r->hash},
+            {"block_reward", reward},
+            {"estimated_payout", reward},
+            {"explorer_url", prefix.empty() ? nlohmann::json(nullptr)
+                                            : nlohmann::json(prefix + r->hash)},
+            {"status", r->status},
+            {"confirmations", r->confirmations},
+            {"confirmations_required", 240}
+        });
+    }
+    if (!symbol.empty()) result["symbol"] = symbol;
+    result["blocks_found"] = static_cast<int>(mine.size());
+    result["total_estimated_rewards"] = confirmed + maturing;
+    result["confirmed_rewards"] = confirmed;
+    result["maturing_rewards"] = maturing;
+    result["blocks"] = blocks;
     return result;
 }
 
