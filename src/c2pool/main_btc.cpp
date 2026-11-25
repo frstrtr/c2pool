@@ -1186,7 +1186,11 @@ int main(int argc, char* argv[])
     // MSG_WITNESS_BLOCK 0x40000002) so witness data arrives intact —
     // txid (non-witness) is what UTXO keys on, but the wire path needs
     // witness or peer drops us for advertising NODE_WITNESS yet not honoring it.
-    coin_node.full_block.subscribe(
+    // Standalone pool (no --bitcoind): the pool runs this UTXO connect itself,
+    // in chain order (on_body_in_order), and sets utxo_connect_by_pool; the
+    // full_block subscriber below then leaves it to the pool.
+    auto utxo_connect_by_pool = std::make_shared<bool>(false);
+    auto utxo_connect_block =
         [&header_chain, &utxo_cache, &utxo_db, btc_txid]
         (const btc::coin::BlockType& block)
         {
@@ -1226,6 +1230,12 @@ int main(int argc, char* argv[])
                             << " hash=" << block_hash.GetHex().substr(0, 16)
                             << ": " << e.what();
             }
+        };
+    coin_node.full_block.subscribe(
+        [utxo_connect_block, utxo_connect_by_pool](const btc::coin::BlockType& block)
+        {
+            if (*utxo_connect_by_pool) return;
+            utxo_connect_block(block);
         });
 
     // ── External-bitcoind P2P arm ────────────────────────────────────────────
@@ -1359,12 +1369,11 @@ int main(int argc, char* argv[])
             };
             ph.on_block_announced = [&coin_node](const uint256& h) { coin_node.new_block.happened(h); };
             ph.on_tx = [&coin_node](const btc::coin::Transaction& tx) { coin_node.new_tx.happened(tx); };
-            // A pooled block body reaches coin_node's full_block subscribers
-            // (UTXO connect, mempool cleanup) only if it was asked for, its
-            // header is in the chain and it matches that header (merkle root,
-            // BIP 141 witness commitment), and in chain order relative to the
-            // UTXO set's best height (the UTXO connect skips a height at or
-            // below its best).
+            // A pooled block body goes on only if it was asked for, its header
+            // is in the chain and it matches that header (merkle root, one
+            // coinbase, no 64-byte tx, BIP 141 witness commitment). The UTXO
+            // connect gets it in chain order relative to the UTXO set's best
+            // height (the connect skips a height at or below its best).
             ph.body_valid = [](const btc::coin::BlockType& b) {
                 return btc::coin::block_body_matches_header(b);
             };
@@ -1373,6 +1382,11 @@ int main(int argc, char* argv[])
                 if (best.first.IsNull()) return std::nullopt;
                 return best.second;
             };
+            // The UTXO connect in chain order; coin_node's full_block path
+            // (mempool cleanup, work refresh) on arrival, after the connect
+            // when the body is not held for its parent.
+            *utxo_connect_by_pool = true;
+            ph.on_body_in_order = utxo_connect_block;
             ph.on_full_block = [&coin_node](const btc::coin::BlockType& b) {
                 coin_node.full_block.happened(b);
             };

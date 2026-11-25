@@ -355,7 +355,10 @@ public:
         }
     }
 
-    /// Request a transaction via getdata (MSG_WITNESS_TX, BIP 144).
+    /// Request a transaction via getdata (MSG_WITNESS_TX, BIP 144) by its
+    /// txid. Correct while wtxidrelay (BIP 339) is not negotiated (this driver
+    /// never sends it): peers then announce, and look up, transactions by
+    /// txid. With wtxidrelay a wtxid would need MSG_WTX instead.
     void request_tx(const uint256& txid)
     {
         if (m_peer) {
@@ -696,9 +699,14 @@ private:
         for (auto& inv : msg->m_invs)
         {
             auto btype = inv.base_type();
-            // BIP 339: MSG_WTX (type 5) uses wtxid instead of txid.
-            // Request via MSG_WITNESS_TX (0x40000001) since getdata doesn't accept MSG_WTX.
-            // Reference: Bitcoin Core protocol.h line 447, net_processing.cpp line 3036
+            // BIP 339: an MSG_WTX (type 5) inv carries a wtxid, and the
+            // matching getdata is MSG_WTX with that wtxid (Bitcoin Core
+            // accepts MSG_WTX in getdata). A peer sends MSG_WTX invs only
+            // after both sides sent wtxidrelay before verack; this driver
+            // never sends wtxidrelay, so peers announce by txid (MSG_TX) and
+            // this branch is not reached. The MSG_WITNESS_TX request below
+            // would look the hash up as a txid: correct only for that
+            // txid-announced case.
             if (inv.m_type == inventory_type::wtx) {
                 if (wants_fetch(inv.m_hash, false))
                     vinv.push_back(inventory_type(inventory_type::witness_tx, inv.m_hash));

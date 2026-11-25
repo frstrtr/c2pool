@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 // btc::coin::block_body_matches_header -- a block body received from a coin
-// peer belongs to its header (which the header chain holds, PoW-checked):
-//   - at least one transaction, no two with the same txid (a duplicated
-//     subtree leaves the merkle root unchanged);
+// peer belongs to its header (which the header chain holds, PoW-checked); the
+// checks of Bitcoin Core's IsBlockMutated:
+//   - at least one transaction; the first is a coinbase and no other is;
+//   - no two with the same txid (a duplicated subtree leaves the merkle root
+//     unchanged);
+//   - no transaction whose serialization without witness is 64 bytes (it
+//     can stand in for an inner merkle node, CVE-2017-12842);
 //   - the txid merkle root equals the header's merkle root;
 //   - BIP 141: if the coinbase has a witness commitment output (the last
 //     output whose script starts 6a24aa21a9ed and is at least 38 bytes), the
@@ -11,7 +15,10 @@
 //     SHA256d(witness merkle root || that item) equals the committed hash;
 //     with no commitment, no transaction carries witness data.
 // The standalone coin peer pool passes a body to the coin node only when this
-// holds.
+// holds. The witness rules are applied whatever the block's height: the pool
+// fetches bodies only near the header tip (pool_body_wanted), and a block
+// before segwit activation carries no witness data and no commitment, which
+// passes.
 
 #include "block.hpp"
 #include "mempool.hpp"           // compute_txid
@@ -43,6 +50,13 @@ inline int witness_commitment_index(const MutableTransaction& coinbase)
     return idx;
 }
 
+/// A coinbase transaction: one input, spending the null outpoint.
+inline bool is_coinbase_tx(const MutableTransaction& tx)
+{
+    return tx.vin.size() == 1 && tx.vin.front().prevout.hash.IsNull()
+        && tx.vin.front().prevout.index == 0xffffffffu;
+}
+
 inline uint256 compute_wtxid(const MutableTransaction& tx)
 {
     auto packed = pack(TX_WITH_WITNESS(tx));
@@ -51,13 +65,19 @@ inline uint256 compute_wtxid(const MutableTransaction& tx)
 
 inline bool block_body_matches_header(const BlockType& block)
 {
-    if (block.m_txs.empty())
+    if (block.m_txs.empty() || !is_coinbase_tx(block.m_txs.front()))
         return false;
     std::vector<uint256> txids;
     txids.reserve(block.m_txs.size());
     std::set<uint256> unique;
-    for (const auto& tx : block.m_txs) {
-        txids.push_back(compute_txid(tx));
+    for (size_t i = 0; i < block.m_txs.size(); ++i) {
+        const auto& tx = block.m_txs[i];
+        if (i > 0 && is_coinbase_tx(tx))
+            return false;
+        auto packed = pack(TX_NO_WITNESS(tx));
+        if (packed.size() == 64)
+            return false;
+        txids.push_back(Hash(packed.get_span()));
         if (!unique.insert(txids.back()).second)
             return false;
     }

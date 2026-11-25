@@ -50,6 +50,8 @@ uint256 kat_hash(uint32_t n)
     return pool_header_hash(h);
 }
 
+size_t standalone_pos(const std::string& src) { return src.find("if (bitcoind_host.empty()) {"); }
+
 std::string main_src_code()
 {
     std::ifstream in(BTC_MAIN_SRC);
@@ -176,6 +178,22 @@ TEST(BtcCoinPeerPoolP2P, MainBtcWiresThePool)
     const auto best = src.find("ph.body_best_height = [&utxo_cache]");
     ASSERT_NE(best, std::string::npos);
     EXPECT_NE(src.find("utxo_cache.get_best()", best), std::string::npos);
+    // The UTXO connect: the existing full_block subscriber with --bitcoind,
+    // the pool's chain-ordered hook without it (and the subscriber then
+    // leaves it to the pool).
+    const auto connect_fn = src.find("auto utxo_connect_block =");
+    ASSERT_NE(connect_fn, std::string::npos);
+    const auto sub = src.find("[utxo_connect_block, utxo_connect_by_pool](const btc::coin::BlockType& block)",
+                              connect_fn);
+    ASSERT_NE(sub, std::string::npos);
+    const auto skip = src.find("if (*utxo_connect_by_pool) return;", sub);
+    ASSERT_NE(skip, std::string::npos);
+    EXPECT_LT(skip - sub, 200u);
+    EXPECT_NE(src.find("utxo_connect_block(block);", skip), std::string::npos);
+    const auto by_pool = src.find("*utxo_connect_by_pool = true;");
+    ASSERT_NE(by_pool, std::string::npos);
+    EXPECT_LT(standalone_pos(src), by_pool);
+    EXPECT_NE(src.find("ph.on_body_in_order = utxo_connect_block;", by_pool), std::string::npos);
     // Pool events into coin_node's existing subscribers.
     EXPECT_NE(src.find("coin_node.new_headers.happened(h);"), std::string::npos);
     EXPECT_NE(src.find("coin_node.full_block.happened(b);"), std::string::npos);
