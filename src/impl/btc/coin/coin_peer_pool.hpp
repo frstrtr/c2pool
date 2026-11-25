@@ -9,8 +9,9 @@
 //   - slots: up to the target; a slot that does not complete its handshake
 //     within kCoinPoolDialTimeoutSec is dropped as a failed dial, one whose
 //     link stays down for kCoinPoolLostGraceSec after a handshake is dropped
-//     as a disconnect (both reported to the peer manager); every tick refills
-//     from the manager's candidates;
+//     as a disconnect (both reported to the peer manager; a handshake is
+//     reported as connected once per slot); every tick refills from the
+//     manager's candidates;
 //   - headers: from any pooled peer. A batch that connects and carries a new
 //     last header goes to the header chain path; a full batch (2000) asks its
 //     sender for the next one. A small batch that does not connect, or an
@@ -18,16 +19,31 @@
 //     the chain's locator: not while a getheaders to it from an announcement
 //     is unanswered (kCoinPoolAskResponseSec), at most every
 //     kCoinPoolAskEverySec per peer, and while catching up only the first
-//     announcer of a block;
-//   - the header-source tick (header_source_step over the whole pool): a
-//     fresh handshake asks that peer; catching up, a tick without progress
-//     asks one peer (round robin); caught up, the refresh asks every peer; a
-//     failover drops the pooled peer whose last headers message is oldest;
-//   - bodies and transactions: an announced block body or transaction is
-//     fetched from its first announcer only; a block body that has not
-//     arrived after kCoinPoolBodyRetrySec is asked of another peer (at most
-//     kCoinPoolBodyMaxAsks asks); a block body reaches the coin node once;
-//   - a won block goes to every pooled peer with a completed handshake;
+//     announcer of a block. An empty headers answer from a peer whose version
+//     height equals the chain's height marks header sync caught up;
+//   - the header-source tick (header_source_step over the whole pool, every
+//     kCoinPoolTickSec): a fresh handshake asks that peer; catching up, a
+//     tick without progress asks one peer (round robin); caught up, the
+//     refresh asks every peer; a failover drops the pooled peer that moved
+//     the tip least recently (max of its last tip-moving headers message and
+//     its handshake; a peer handshaked less than kCoinPoolFailoverMinAgeSec
+//     ago is not dropped) and asks the rest (one catching up, all caught up);
+//   - block bodies: fetched only for a block whose header the chain holds,
+//     from its first announcer; at most kCoinPoolBodiesMax tracked. A body not
+//     received after kCoinPoolBodyRetrySec (kCoinPoolTipBodyRetrySec for the
+//     tip) is asked of another peer, kCoinPoolBodyMaxAsks asks in all. A body
+//     reaches the coin node only if it was asked for and matches its header
+//     (body_valid); one that does not is asked of another peer. Bodies reach
+//     the coin node in chain order: one more than one block above the
+//     body-consumer's best (body_best_height) waits for its parent, which is
+//     asked for, for at most kCoinPoolBodyHoldSec; a gap of more than
+//     kCoinPoolMaxBodyGap blocks is passed on as it is;
+//   - transactions: fetched from the first announcer; the others are kept,
+//     and one not received after kCoinPoolTxRetrySec is asked of the next.
+//     At most kCoinPoolSeenTxMax tracked, the oldest evicted first, each for
+//     kCoinPoolSeenTtlSec;
+//   - a won block goes to every pooled peer with a completed handshake, once
+//     per kCoinPoolRelayDedupSec per block;
 //   - the dashboard rows: one per pooled peer with a completed handshake.
 //
 // IO-thread only, except rows() and live_count() (any thread).
@@ -48,29 +64,42 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
 
 namespace btc::coin {
 
-inline constexpr size_t  kCoinPoolTargetPeers      = 8;
-inline constexpr int64_t kCoinPoolDialTimeoutSec   = 30;
-inline constexpr int64_t kCoinPoolLostGraceSec     = 90;
-inline constexpr size_t  kCoinPoolFullHeadersBatch = 2000;
-inline constexpr size_t  kCoinPoolAnnouncementMax  = 3;
-inline constexpr int64_t kCoinPoolAskResponseSec   = 120;
-inline constexpr int64_t kCoinPoolAskEverySec      = 2;
-inline constexpr int64_t kCoinPoolBodyRetrySec     = 20;
-inline constexpr int     kCoinPoolBodyMaxAsks      = 3;
-inline constexpr int64_t kCoinPoolSeenTtlSec       = 600;
-inline constexpr size_t  kCoinPoolSeenTxMax        = 50000;
+inline constexpr size_t  kCoinPoolTargetPeers       = 8;
+inline constexpr int64_t kCoinPoolTickSec           = 12;
+inline constexpr int64_t kCoinPoolPollSec           = 3;
+inline constexpr int64_t kCoinPoolDialTimeoutSec    = 30;
+inline constexpr int64_t kCoinPoolLostGraceSec      = 90;
+inline constexpr size_t  kCoinPoolFullHeadersBatch  = 2000;
+inline constexpr size_t  kCoinPoolAnnouncementMax   = 3;
+inline constexpr int64_t kCoinPoolAskResponseSec    = 120;
+inline constexpr int64_t kCoinPoolAskEverySec       = 2;
+inline constexpr int64_t kCoinPoolFailoverMinAgeSec = 40;
+inline constexpr int64_t kCoinPoolBodyRetrySec      = 20;
+inline constexpr int64_t kCoinPoolTipBodyRetrySec   = 3;
+inline constexpr int     kCoinPoolBodyMaxAsks       = 3;
+inline constexpr size_t  kCoinPoolBodiesMax         = 64;
+inline constexpr int64_t kCoinPoolBodyHoldSec       = 60;
+inline constexpr uint32_t kCoinPoolMaxBodyGap       = 6;
+inline constexpr int64_t kCoinPoolSeenTtlSec        = 600;
+inline constexpr int64_t kCoinPoolTxRetrySec        = 60;
+inline constexpr size_t  kCoinPoolTxAnnouncersMax   = 8;
+inline constexpr size_t  kCoinPoolSeenTxMax         = 50000;
+inline constexpr int64_t kCoinPoolRelayDedupSec     = 120;
 
 // ── Rules ────────────────────────────────────────────────────────────────────
 
@@ -127,6 +156,36 @@ inline bool pool_announce_asks(bool unanswered, int64_t since_ask_sec,
     if (!caught_up && same_block)
         return false;
     return true;
+}
+
+/// A headers message with `count` entries from a peer whose version height is
+/// `peer_height`: does it show header sync caught up? Only an empty answer
+/// from a peer at exactly the chain's height (a higher peer that answers with
+/// nothing is below its minimum chain work, or its height is wrong).
+inline bool pool_empty_headers_caught_up(size_t count, uint32_t peer_height,
+                                         uint32_t chain_height)
+{
+    return count == 0 && peer_height == chain_height;
+}
+
+/// Seconds before an asked-for block body is asked of another peer.
+inline int64_t pool_body_retry_sec(bool tip)
+{
+    return tip ? kCoinPoolTipBodyRetrySec : kCoinPoolBodyRetrySec;
+}
+
+enum class PoolBodyOrder { Deliver, Hold, DeliverWithGap };
+
+/// A valid block body at `height`; `best` = the body consumer's best height
+/// (nullopt: it holds nothing yet). The next one or anything at or below it
+/// is delivered; up to kCoinPoolMaxBodyGap missing blocks in between it
+/// waits for them; a larger gap is delivered as it is.
+inline PoolBodyOrder pool_body_order(std::optional<uint32_t> best, uint32_t height)
+{
+    if (!best || height <= *best + 1)
+        return PoolBodyOrder::Deliver;
+    return height - (*best + 1) <= kCoinPoolMaxBodyGap ? PoolBodyOrder::Hold
+                                                       : PoolBodyOrder::DeliverWithGap;
 }
 
 // ── Dashboard rows ───────────────────────────────────────────────────────────
@@ -197,8 +256,9 @@ public:
                                         const uint256& stop) = 0;
     /// Relay a serialized block; true iff it was written to the peer.
     virtual bool        relay_block(const std::vector<unsigned char>& block_bytes) = 0;
-    /// getdata for a block body.
+    /// getdata for a block body / a transaction.
     virtual void        request_block(const uint256& hash) = 0;
+    virtual void        request_tx(const uint256& txid) = 0;
 };
 
 /// What the pool needs from its surroundings.
@@ -217,12 +277,17 @@ struct CoinPeerPoolHost {
     std::function<bool(const uint256&)>      has_header;
     std::function<std::vector<uint256>()>    locator;
     std::function<uint32_t()>                height;
+    /// Height of a header the chain holds (optional; nullopt = unknown).
+    std::function<std::optional<uint32_t>(const uint256&)> header_height;
     /// Header sync caught up (the last batch was < 2000 headers).
     std::function<bool()>                    caught_up;
-    /// A pooled peer whose version height is at least the chain's answered
-    /// getheaders with no headers: it has nothing after the chain's tip
-    /// (a batch of 0 < 2000; optional).
+    /// pool_empty_headers_caught_up held for a headers message (optional).
     std::function<void()>                    on_empty_headers;
+    /// A block body matches its header (optional; unset = every body does).
+    std::function<bool(const BlockType&)>    body_valid;
+    /// The best height of the full_block consumer (the UTXO set); nullopt
+    /// while it holds no block (optional; unset = bodies go on as they come).
+    std::function<std::optional<uint32_t>()> body_best_height;
     /// Into the coin node's existing paths.
     std::function<void(const std::vector<BlockHeaderType>&)> on_headers;
     std::function<void(const uint256&)>                      on_block_announced;  // optional
@@ -262,19 +327,49 @@ public:
     void tick()
     {
         const auto t = now();
+        m_last_tick = t;
         std::vector<std::string> fresh;
         observe_slots(t, fresh);
         header_source(t, fresh);
         refill(t);
-        retry_bodies(t);
+        bodies(t);
+        retry_txs(t);
         prune_seen(t);
         publish_rows();
     }
 
+    /// Every kCoinPoolPollSec (IO thread): block-body retries and the ordering
+    /// hold; the full tick() once kCoinPoolTickSec passed since the last one.
+    void poll()
+    {
+        const auto t = now();
+        if (m_last_tick == Clock::time_point{} || secs(t - m_last_tick) >= kCoinPoolTickSec) {
+            tick();
+            return;
+        }
+        bodies(t);
+    }
+
     /// Relay a won block to every pooled peer with a completed handshake.
-    /// Returns the number it was written to.
+    /// Returns the number it was written to. The same block again within
+    /// kCoinPoolRelayDedupSec of a relay that reached a peer is not resent.
     size_t broadcast_block(const std::vector<unsigned char>& block_bytes)
     {
+        const auto t = now();
+        for (auto it = m_relayed.begin(); it != m_relayed.end();)
+            it = secs(t - it->second.first) >= kCoinPoolRelayDedupSec ? m_relayed.erase(it)
+                                                                      : std::next(it);
+        uint256 hash;
+        const bool hashed = block_bytes.size() >= 80;
+        if (hashed) {
+            hash = Hash(std::span<const unsigned char>(block_bytes.data(), 80));
+            auto it = m_relayed.find(hash);
+            if (it != m_relayed.end() && it->second.second > 0) {
+                LOG_INFO << m_tag << " won block " << hash.GetHex().substr(0, 16)
+                         << " already relayed to " << it->second.second << " pooled coin peers";
+                return it->second.second;
+            }
+        }
         size_t live = 0, sent = 0;
         for (auto& [key, s] : m_slots) {
             if (!s->peer->handshaked())
@@ -288,6 +383,8 @@ public:
                             << " failed: " << e.what();
             }
         }
+        if (hashed)
+            m_relayed[hash] = {t, sent};
         if (live == 0)
             LOG_WARNING << m_tag << " won block: no pooled coin peer has a completed handshake ("
                         << block_bytes.size() << " bytes not relayed by the pool)";
@@ -328,6 +425,10 @@ public:
         return out;
     }
 
+    /// Block bodies / transactions tracked (tests, diagnostics).
+    size_t tracked_bodies() const { return m_bodies.size(); }
+    size_t tracked_txs() const { return m_txs.size(); }
+
 private:
     struct Slot {
         uint64_t              id{0};
@@ -339,24 +440,43 @@ private:
         bool                  was_handshaked{false};
         Clock::time_point     handshaked_at{};
         Clock::time_point     lost_at{};
-        Clock::time_point     last_headers_at{};  // last headers message (epoch = none)
-        Clock::time_point     ask_sent{};         // last announcement getheaders (epoch = none)
+        Clock::time_point     last_headers_at{};      // last headers message (epoch = none)
+        Clock::time_point     last_tip_headers_at{};  // last one passed on (epoch = none)
+        Clock::time_point     ask_sent{};             // last announcement getheaders (epoch = none)
         bool                  ask_unanswered{false};
         std::string           subver;
         uint32_t              start_height{0};
     };
 
     struct Body {
-        Clock::time_point at{};       // asked / arrived
-        std::string       peer;       // asked of
-        int               asks{0};
-        bool              received{false};
+        Clock::time_point  at{};        // asked / arrived
+        uint64_t           asked{0};    // slot id asked last
+        std::string        asked_key;
+        int                asks{0};
+        bool               received{false};
+        bool               tip{false};  // the chain tip's block when first asked
+        std::set<uint64_t> bad;         // slots that sent a body not matching the header
+    };
+
+    struct Held {
+        BlockType          block;
+        uint32_t           height{0};
+        Clock::time_point  since{};
+    };
+
+    struct TxState {
+        Clock::time_point     asked_at{};
+        uint64_t              asked{0};
+        std::vector<uint64_t> announcers;   // not asked yet, in order
+        bool                  received{false};
     };
 
     struct PublishedRow {
         CoinPeerRow       row;
         Clock::time_point since{};
     };
+
+    using SlotMap = std::map<std::string, std::unique_ptr<Slot>>;
 
     static int64_t secs(Clock::duration d)
     {
@@ -367,12 +487,19 @@ private:
 
     bool caught_up() const { return m_host.caught_up ? m_host.caught_up() : false; }
 
+    uint32_t height() const { return m_host.height ? m_host.height() : 0; }
+
     std::vector<uint256> locator() const
     {
         return m_host.locator ? m_host.locator() : std::vector<uint256>{};
     }
 
     bool has_header(const uint256& h) const { return m_host.has_header && m_host.has_header(h); }
+
+    std::optional<uint32_t> header_height(const uint256& h) const
+    {
+        return m_host.header_height ? m_host.header_height(h) : std::nullopt;
+    }
 
     /// The slot `key` dialed as `id` (a dropped connection's late events
     /// find nothing).
@@ -384,13 +511,21 @@ private:
         return it->second.get();
     }
 
+    Slot* find_id(uint64_t id)
+    {
+        for (auto& [key, s] : m_slots)
+            if (s->id == id)
+                return s.get();
+        return nullptr;
+    }
+
     void report(const std::function<void(const std::string&)>& fn, const std::string& key)
     {
         if (fn)
             fn(key);
     }
 
-    void drop(std::map<std::string, std::unique_ptr<Slot>>::iterator it, const char* why)
+    void drop(SlotMap::iterator it, const char* why)
     {
         Slot& s = *it->second;
         LOG_INFO << m_tag << " coin peer pool: dropping " << s.key << " (" << why << ")";
@@ -423,15 +558,9 @@ private:
             s.was_handshaked = hs;
             const auto v = pool_slot_verdict(hs, s.ever_handshaked, secs(t - s.dialed_at),
                                              secs(t - s.lost_at));
-            if (v == PoolSlotVerdict::DialFailed) {
+            if (v != PoolSlotVerdict::Keep) {
                 auto next = std::next(it);
-                drop(it, "no handshake");
-                it = next;
-                continue;
-            }
-            if (v == PoolSlotVerdict::Disconnected) {
-                auto next = std::next(it);
-                drop(it, "link down");
+                drop(it, v == PoolSlotVerdict::DialFailed ? "no handshake" : "link down");
                 it = next;
                 continue;
             }
@@ -453,11 +582,30 @@ private:
         s.peer->send_getheaders(loc, uint256::ZERO);
     }
 
+    /// The failover victim: the live peer, handshaked at least
+    /// kCoinPoolFailoverMinAgeSec ago, whose last tip-moving headers message
+    /// (or its handshake, if later) is oldest. nullptr = none.
+    Slot* failover_victim(Clock::time_point t, const std::vector<Slot*>& live)
+    {
+        Slot* victim = nullptr;
+        Clock::time_point victim_rank{};
+        for (auto* s : live) {
+            if (secs(t - s->handshaked_at) < kCoinPoolFailoverMinAgeSec)
+                continue;
+            const auto rank = std::max(s->last_tip_headers_at, s->handshaked_at);
+            if (!victim || rank < victim_rank) {
+                victim = s;
+                victim_rank = rank;
+            }
+        }
+        return victim;
+    }
+
     /// header_source_step over the whole pool: progress is the chain tip,
     /// from any peer.
     void header_source(Clock::time_point t, const std::vector<std::string>& fresh)
     {
-        const uint32_t h = m_host.height ? m_host.height() : 0;
+        const uint32_t h = height();
         const bool cu = caught_up();
         const bool advanced = h > m_last_height;
         if (advanced) {
@@ -509,14 +657,10 @@ private:
                      << "s (chain_height=" << h << ", caught_up=" << cu << ", live="
                      << live.size() << ")";
             m_last_progress = t;   // grace window
-            if (live.empty())
-                return;
-            Slot* stalest = live.front();
-            for (auto* s : live)
-                if (s->last_headers_at < stalest->last_headers_at)
-                    stalest = s;
-            const std::string key = stalest->key;
-            drop(m_slots.find(key), "header source failover");
+            if (Slot* victim = failover_victim(t, live)) {
+                const std::string key = victim->key;
+                drop(m_slots.find(key), "header source failover");
+            }
             live = live_slots();
             if (live.empty())
                 return;
@@ -580,8 +724,7 @@ private:
             on_block_announced(key, id, hash);
         };
         hk.tx = [this, key, id](const Transaction& tx) {
-            if (find(key, id) && m_host.on_tx)
-                m_host.on_tx(tx);
+            on_tx(key, id, tx);
         };
         hk.full_block = [this, key, id](const BlockType& block) {
             on_full_block(key, id, block);
@@ -600,8 +743,8 @@ private:
             return;
         s->last_headers_at = now();
         s->ask_unanswered = false;
-        if (count == 0 && m_host.on_empty_headers
-            && s->peer->start_height() >= (m_host.height ? m_host.height() : 0))
+        if (m_host.on_empty_headers
+            && pool_empty_headers_caught_up(count, s->peer->start_height(), height()))
             m_host.on_empty_headers();
     }
 
@@ -621,10 +764,12 @@ private:
             announce(*s, last);
             return;
         case PoolHeadersVerdict::Forward:
+            s->last_tip_headers_at = now();
             if (m_host.on_headers)
                 m_host.on_headers(hdrs);
             return;
         case PoolHeadersVerdict::ForwardAndContinue:
+            s->last_tip_headers_at = now();
             if (m_host.on_headers)
                 m_host.on_headers(hdrs);
             // The next batch from the peer that sent this one.
@@ -636,10 +781,12 @@ private:
 
     void on_block_announced(const std::string& key, uint64_t id, const uint256& hash)
     {
+        Slot* s = find(key, id);
+        if (!s)
+            return;
         if (m_host.on_block_announced)
             m_host.on_block_announced(hash);
-        Slot* s = find(key, id);
-        if (!s || hash.IsNull() || has_header(hash))
+        if (hash.IsNull() || has_header(hash))
             return;
         announce(*s, hash);
     }
@@ -667,40 +814,235 @@ private:
 
     bool wants_fetch(const std::string& key, uint64_t id, const uint256& hash, bool is_block)
     {
-        if (!find(key, id))
+        Slot* s = find(key, id);
+        if (!s)
             return false;
         const auto t = now();
         if (is_block) {
-            if (m_bodies.count(hash))
+            // Only a block whose header the chain holds: an inv of an unknown
+            // block asks for headers instead, and the headers announcement
+            // fetches the body once its header connects.
+            if (!has_header(hash) || m_bodies.count(hash) || !make_room_for_body())
                 return false;
             Body b;
             b.at = t;
-            b.peer = key;
+            b.asked = s->id;
+            b.asked_key = s->key;
             b.asks = 1;
+            const auto hh = header_height(hash);
+            b.tip = hh && *hh >= height();
             m_bodies.emplace(hash, std::move(b));
             return true;
         }
-        if (m_seen_tx.size() >= kCoinPoolSeenTxMax)
-            return true;   // over the bound until the next prune: fetch
-        return m_seen_tx.emplace(hash, t).second;
+        auto it = m_txs.find(hash);
+        if (it != m_txs.end()) {
+            TxState& tx = it->second;
+            if (!tx.received && tx.asked != s->id
+                && tx.announcers.size() < kCoinPoolTxAnnouncersMax
+                && std::find(tx.announcers.begin(), tx.announcers.end(), s->id) == tx.announcers.end())
+                tx.announcers.push_back(s->id);
+            return false;
+        }
+        while (m_txs.size() >= kCoinPoolSeenTxMax && !m_tx_order.empty()) {
+            m_txs.erase(m_tx_order.front().second);   // the oldest first
+            m_tx_order.pop_front();
+        }
+        TxState tx;
+        tx.asked_at = t;
+        tx.asked = s->id;
+        m_txs.emplace(hash, std::move(tx));
+        m_tx_order.emplace_back(t, hash);
+        return true;
+    }
+
+    /// Room for one more tracked body: drop the oldest received one if at
+    /// the bound. False when every tracked body is still being fetched.
+    bool make_room_for_body()
+    {
+        if (m_bodies.size() < kCoinPoolBodiesMax)
+            return true;
+        auto oldest = m_bodies.end();
+        for (auto it = m_bodies.begin(); it != m_bodies.end(); ++it)
+            if (it->second.received && (oldest == m_bodies.end() || it->second.at < oldest->second.at))
+                oldest = it;
+        if (oldest == m_bodies.end())
+            return false;
+        m_bodies.erase(oldest);
+        return true;
+    }
+
+    void on_tx(const std::string& key, uint64_t id, const Transaction& tx)
+    {
+        if (!find(key, id))
+            return;
+        MutableTransaction mtx(tx);
+        auto packed = pack(TX_NO_WITNESS(mtx));
+        auto it = m_txs.find(Hash(packed.get_span()));
+        if (it == m_txs.end() && tx.HasWitness()) {
+            auto wpacked = pack(TX_WITH_WITNESS(mtx));
+            it = m_txs.find(Hash(wpacked.get_span()));
+        }
+        if (it != m_txs.end()) {
+            if (it->second.received)
+                return;   // already passed on
+            it->second.received = true;
+            it->second.announcers.clear();
+        }
+        if (m_host.on_tx)
+            m_host.on_tx(tx);
+    }
+
+    /// A transaction not received kCoinPoolTxRetrySec after it was asked for
+    /// is asked of its next announcer still in the pool.
+    void retry_txs(Clock::time_point t)
+    {
+        for (auto& [hash, tx] : m_txs) {
+            if (tx.received || tx.announcers.empty() || secs(t - tx.asked_at) < kCoinPoolTxRetrySec)
+                continue;
+            while (!tx.announcers.empty()) {
+                const uint64_t next = tx.announcers.front();
+                tx.announcers.erase(tx.announcers.begin());
+                Slot* s = find_id(next);
+                if (!s || !s->peer->handshaked())
+                    continue;
+                s->peer->request_tx(hash);
+                tx.asked = next;
+                tx.asked_at = t;
+                break;
+            }
+        }
+    }
+
+    void prune_seen(Clock::time_point t)
+    {
+        while (!m_tx_order.empty() && secs(t - m_tx_order.front().first) >= kCoinPoolSeenTtlSec) {
+            m_txs.erase(m_tx_order.front().second);
+            m_tx_order.pop_front();
+        }
     }
 
     void on_full_block(const std::string& key, uint64_t id, const BlockType& block)
     {
-        if (!find(key, id))
+        Slot* s = find(key, id);
+        if (!s)
             return;
+        const auto t = now();
         const uint256 hash = pool_header_hash(block);
-        auto& b = m_bodies[hash];
-        if (b.received)
-            return;   // already passed on
+        auto it = m_bodies.find(hash);
+        if (it == m_bodies.end() || it->second.received)
+            return;   // not asked for, or already passed on
+        Body& b = it->second;
+        if (!has_header(hash))
+            return;
+        if (m_host.body_valid && !m_host.body_valid(block)) {
+            LOG_WARNING << m_tag << " coin peer " << key << " sent block "
+                        << hash.GetHex().substr(0, 16)
+                        << " whose body does not match its header: dropped";
+            b.bad.insert(s->id);
+            ask_body_again(hash, b, t);
+            return;
+        }
         b.received = true;
-        b.at = now();
-        b.peer = key;
+        b.at = t;
+        deliver(hash, block, t);
+    }
+
+    /// Ask a block body of a live peer other than the one asked last and any
+    /// that sent a body not matching the header (round robin).
+    void ask_body_again(const uint256& hash, Body& b, Clock::time_point t)
+    {
+        auto live = live_slots();
+        Slot* other = nullptr;
+        for (size_t i = 0; i < live.size() && !other; ++i) {
+            Slot* c = live[(m_body_rr + i) % live.size()];
+            if (c->id != b.asked && !b.bad.count(c->id))
+                other = c;
+        }
+        ++m_body_rr;
+        b.at = t;
+        ++b.asks;
+        if (!other)
+            return;
+        other->peer->request_block(hash);
+        LOG_INFO << m_tag << " coin peer pool: block " << hash.GetHex().substr(0, 16)
+                 << " body not received from " << b.asked_key << ", asking " << other->key;
+        b.asked = other->id;
+        b.asked_key = other->key;
+    }
+
+    /// Pass a valid body on in chain order (pool_body_order).
+    void deliver(const uint256& hash, const BlockType& block, Clock::time_point t)
+    {
+        const auto hh = header_height(hash);
+        const std::optional<uint32_t> best =
+            m_host.body_best_height ? m_host.body_best_height() : std::nullopt;
+        const auto order = hh ? pool_body_order(best, *hh) : PoolBodyOrder::Deliver;
+        if (order == PoolBodyOrder::Hold && m_held.size() < kCoinPoolMaxBodyGap) {
+            Held held;
+            held.block = block;
+            held.height = *hh;
+            held.since = t;
+            m_held.emplace(hash, std::move(held));
+            LOG_INFO << m_tag << " coin peer pool: block " << hash.GetHex().substr(0, 16)
+                     << " (height " << *hh << ") waits for its parent (body best "
+                     << (best ? std::to_string(*best) : std::string("-")) << ")";
+            request_parent(block.m_previous_block, t);
+            return;
+        }
+        if (order != PoolBodyOrder::Deliver)
+            LOG_INFO << m_tag << " coin peer pool: block " << hash.GetHex().substr(0, 16)
+                     << " (height " << (hh ? *hh : 0) << ") passed on above a gap (body best "
+                     << (best ? std::to_string(*best) : std::string("-")) << ")";
+        forward(block);
+        release_held();
+    }
+
+    /// Ask for the body of a held block's parent (a block the chain holds,
+    /// not yet tracked).
+    void request_parent(const uint256& parent, Clock::time_point t)
+    {
+        if (!has_header(parent) || m_bodies.count(parent) || !make_room_for_body())
+            return;
+        auto live = live_slots();
+        if (live.empty())
+            return;
+        Slot* s = live[m_body_rr++ % live.size()];
+        Body b;
+        b.at = t;
+        b.asked = s->id;
+        b.asked_key = s->key;
+        b.asks = 1;
+        m_bodies.emplace(parent, std::move(b));
+        s->peer->request_block(parent);
+    }
+
+    void forward(const BlockType& block)
+    {
         if (m_host.on_full_block)
             m_host.on_full_block(block);
     }
 
-    void retry_bodies(Clock::time_point t)
+    /// Held bodies whose parent is now in, lowest first.
+    void release_held()
+    {
+        for (;;) {
+            const std::optional<uint32_t> best =
+                m_host.body_best_height ? m_host.body_best_height() : std::nullopt;
+            auto pick = m_held.end();
+            for (auto it = m_held.begin(); it != m_held.end(); ++it)
+                if (pool_body_order(best, it->second.height) == PoolBodyOrder::Deliver
+                    && (pick == m_held.end() || it->second.height < pick->second.height))
+                    pick = it;
+            if (pick == m_held.end())
+                return;
+            BlockType block = std::move(pick->second.block);
+            m_held.erase(pick);
+            forward(block);
+        }
+    }
+
+    /// Body retries, the ordering hold's time limit, the received-body TTL.
+    void bodies(Clock::time_point t)
     {
         for (auto it = m_bodies.begin(); it != m_bodies.end();) {
             Body& b = it->second;
@@ -711,7 +1053,7 @@ private:
                     ++it;
                 continue;
             }
-            if (secs(t - b.at) < kCoinPoolBodyRetrySec) {
+            if (secs(t - b.at) < pool_body_retry_sec(b.tip)) {
                 ++it;
                 continue;
             }
@@ -721,32 +1063,28 @@ private:
                 it = m_bodies.erase(it);
                 continue;
             }
-            Slot* other = nullptr;
-            auto live = live_slots();
-            for (size_t i = 0; i < live.size() && !other; ++i) {
-                Slot* c = live[(m_body_rr + i) % live.size()];
-                if (c->key != b.peer)
-                    other = c;
-            }
-            ++m_body_rr;
-            b.at = t;
-            ++b.asks;
-            if (other) {
-                other->peer->request_block(it->first);
-                LOG_INFO << m_tag << " coin peer pool: block " << it->first.GetHex().substr(0, 16)
-                         << " body not received from " << b.peer << ", asking " << other->key;
-                b.peer = other->key;
-            }
+            ask_body_again(it->first, b, t);
             ++it;
         }
-    }
-
-    void prune_seen(Clock::time_point t)
-    {
-        for (auto it = m_seen_tx.begin(); it != m_seen_tx.end();)
-            it = secs(t - it->second) >= kCoinPoolSeenTtlSec ? m_seen_tx.erase(it) : std::next(it);
-        if (m_seen_tx.size() >= kCoinPoolSeenTxMax)
-            m_seen_tx.clear();
+        bool expired = false;
+        for (const auto& [hash, held] : m_held)
+            if (secs(t - held.since) >= kCoinPoolBodyHoldSec)
+                expired = true;
+        if (!expired)
+            return;
+        // A parent that did not come: pass the held bodies on, lowest first.
+        std::vector<std::pair<uint32_t, uint256>> order;
+        for (const auto& [hash, held] : m_held)
+            order.emplace_back(held.height, hash);
+        std::sort(order.begin(), order.end());
+        LOG_WARNING << m_tag << " coin peer pool: " << order.size()
+                    << " block bodies passed on without their parent";
+        for (const auto& [h, hash] : order) {
+            auto it = m_held.find(hash);
+            BlockType block = std::move(it->second.block);
+            m_held.erase(it);
+            forward(block);
+        }
     }
 
     void publish_rows()
@@ -773,16 +1111,20 @@ private:
     std::string      m_tag;
 
     // IO thread only.
-    std::map<std::string, std::unique_ptr<Slot>> m_slots;   // key -> slot
+    SlotMap            m_slots;   // key -> slot
     uint64_t           m_next_id{0};
     size_t             m_rr{0};
     size_t             m_body_rr{0};
     uint32_t           m_last_height{0};
+    Clock::time_point  m_last_tick{};
     Clock::time_point  m_last_progress{};
     Clock::time_point  m_last_getheaders{};
     uint256            m_last_announced;
-    std::map<uint256, Body>              m_bodies;
-    std::map<uint256, Clock::time_point> m_seen_tx;
+    std::map<uint256, Body>    m_bodies;
+    std::map<uint256, Held>    m_held;
+    std::map<uint256, TxState> m_txs;
+    std::deque<std::pair<Clock::time_point, uint256>> m_tx_order;   // oldest first
+    std::map<uint256, std::pair<Clock::time_point, size_t>> m_relayed;
 
     // Any thread.
     std::atomic<size_t>        m_live{0};

@@ -42,6 +42,7 @@
 #include <impl/btc/coin/coin_peer_manager.hpp> // btc::coin::BtcCoinPeerManager -- BTC-ISOLATED scored/diverse coin-network peer discovery (--coin-p2p-discover)
 #include <impl/btc/coin/coin_peer_pool.hpp>     // btc::coin::CoinPeerPool -- standalone multi-peer coin-network pool (no --bitcoind)
 #include <impl/btc/coin/coin_peer_pool_p2p.hpp> // btc::coin::NodeP2PPoolPeer -- one pooled connection over NodeP2P
+#include <impl/btc/coin/block_body_check.hpp>   // btc::coin::block_body_matches_header -- pooled block bodies vs their header
 #include <impl/btc/coin/chain_seeds.hpp>        // btc::coin::btc_dns_seeds / btc_fixed_seeds
 #include <impl/btc/coin/node_interface.hpp>
 #include <impl/btc/coin/transaction.hpp>
@@ -1341,6 +1342,11 @@ int main(int argc, char* argv[])
                 return locator;
             };
             ph.height    = [&header_chain]() { return header_chain.height(); };
+            ph.header_height = [&header_chain](const uint256& h) -> std::optional<uint32_t> {
+                auto e = header_chain.get_header(h);
+                if (!e) return std::nullopt;
+                return e->height;
+            };
             ph.caught_up = [hdr_caught_up]() { return *hdr_caught_up; };
             ph.on_empty_headers = [hdr_caught_up]() {
                 if (!*hdr_caught_up)
@@ -1353,6 +1359,20 @@ int main(int argc, char* argv[])
             };
             ph.on_block_announced = [&coin_node](const uint256& h) { coin_node.new_block.happened(h); };
             ph.on_tx = [&coin_node](const btc::coin::Transaction& tx) { coin_node.new_tx.happened(tx); };
+            // A pooled block body reaches coin_node's full_block subscribers
+            // (UTXO connect, mempool cleanup) only if it was asked for, its
+            // header is in the chain and it matches that header (merkle root,
+            // BIP 141 witness commitment), and in chain order relative to the
+            // UTXO set's best height (the UTXO connect skips a height at or
+            // below its best).
+            ph.body_valid = [](const btc::coin::BlockType& b) {
+                return btc::coin::block_body_matches_header(b);
+            };
+            ph.body_best_height = [&utxo_cache]() -> std::optional<uint32_t> {
+                const auto best = utxo_cache.get_best();
+                if (best.first.IsNull()) return std::nullopt;
+                return best.second;
+            };
             ph.on_full_block = [&coin_node](const btc::coin::BlockType& b) {
                 coin_node.full_block.happened(b);
             };
@@ -1363,15 +1383,17 @@ int main(int argc, char* argv[])
             coin_pool->tick();
 
             // ── Standalone pool driver ──────────────────────────────────────
-            // Every kDriverTickSec: slot upkeep + refill from the peer
-            // manager, and the header-source step over the whole pool
-            // (header_source_step: progress = the header tip, from any peer).
-            // The step's getheaders goes to each freshly handshaked peer and,
-            // when due, to one peer (catching up) or every peer (caught up);
-            // its failover drops the pooled peer whose last headers message
-            // is oldest and the refill replaces it. Weak self-ref avoids a
-            // shared_ptr cycle (mirrors the B5 warn timer below).
-            constexpr int kDriverTickSec = 12;
+            // Every kCoinPoolPollSec the pool's poll(): block-body retries and
+            // the chain-order hold; every kCoinPoolTickSec its full tick: slot
+            // upkeep + refill from the peer manager, and the header-source
+            // step over the whole pool (header_source_step: progress = the
+            // header tip, from any peer). The step's getheaders goes to each
+            // freshly handshaked peer and, when due, to one peer (catching up)
+            // or every peer (caught up); its failover drops the pooled peer
+            // that moved the tip least recently and the refill replaces it.
+            // Weak self-ref avoids a shared_ptr cycle (mirrors the B5 warn
+            // timer below).
+            constexpr int kDriverTickSec = static_cast<int>(btc::coin::kCoinPoolPollSec);
             auto standalone_dial_timer =
                 std::make_shared<boost::asio::steady_timer>(ioc);
             auto schedule_standalone_dial = std::make_shared<std::function<void()>>();
@@ -1387,7 +1409,7 @@ int main(int argc, char* argv[])
                         [weak_dial, pool_ptr](const boost::system::error_code& ec) {
                             if (ec) return;
                             try {
-                                pool_ptr->tick();
+                                pool_ptr->poll();
                             } catch (const std::exception& e) {
                                 LOG_WARNING << "[BTC] coin peer pool tick error: " << e.what();
                             }

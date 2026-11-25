@@ -355,6 +355,16 @@ public:
         }
     }
 
+    /// Request a transaction via getdata (MSG_WITNESS_TX, BIP 144).
+    void request_tx(const uint256& txid)
+    {
+        if (m_peer) {
+            auto msg = message_getdata::make_raw(
+                {inventory_type(inventory_type::witness_tx, txid)});
+            m_peer->write(msg);
+        }
+    }
+
     /// Request a block via plain MSG_BLOCK (0x02) getdata.
     /// Works for any block regardless of MWEB support.
     void request_block(const uint256& block_hash)
