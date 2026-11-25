@@ -7,7 +7,7 @@
 # and left the crossing + aux-drop legs as log-only checkpoints).
 #
 # Legs (all against real litecoind/dogecoind -regtest, real cpuminer scrypt):
-#   L1 genuine blocks : c2pool-submitted populated LTC blocks + DOGE auxpow blocks
+#   L1 genuine blocks : c2pool-submitted populated LTC blocks + populated DOGE auxpow blocks
 #                       accepted, PPLNS coinbase pays both miners, 0 rejects.
 #   L2 v35->v36 cross : two peered c2pool nodes (A --genesis, B -n A) start in
 #                       AutoRatchet VOTING minting v35 (desired=36). Regtest pool
@@ -183,15 +183,18 @@ for h in range(LS+1,LE+1):
     k='post' if CX and h>CX else 'pre'; side[k][0]+=1; side[k][1]+=p2
     if h<LS+8 or (CX and abs(h-CX)<4) or h>LE-3:
         print(f"LTC h{h} {b['hash']} nTx={len(b['tx'])} aux={a} pays_M1+M2={p2}")
-dx=sum("auxpow" in json.load(open(f"{P}/doge{h}.json")) for h in range(DS+1,DE+1))
-print(f"L1SUM ltc_blocks={LE-LS} populated={pop} auxcommit={aux} pays_both={both} doge_blocks={DE-DS} doge_auxpow={dx}")
+dx=dp=0
+for h in range(DS+1,DE+1):
+    d=json.load(open(f"{P}/doge{h}.json")); x="auxpow" in d
+    dx+=x; dp+=x and len(d["tx"])>1   # DOGE G3a: a merged-mined DOGE block that carries txs
+print(f"L1SUM ltc_blocks={LE-LS} populated={pop} auxcommit={aux} pays_both={both} doge_blocks={DE-DS} doge_auxpow={dx} doge_populated={dp}")
 print(f"L2PAY pre_switch={side['pre'][1]}/{side['pre'][0]} post_switch={side['post'][1]}/{side['post'][0]}")
 PY
 LACC=$(grep -c "submit_block_hex accepted" "$P/nodeA.log" "$P/nodeB.log" | awk -F: '{s+=$2}END{print s}')
 DACC=$(cat "$P"/node?.log | grep -c "\[MM:DOGE\] submitblock ACCEPTED")
 REJ=$(cat "$P"/node?.log | grep -ci "submit_block_hex.*reject\|submitblock REJECT")
 S1=$(grep L1SUM "$P/extract.txt")
-if [ "$LACC" -ge 1 ] && [ "$DACC" -ge 1 ] && [ "$REJ" -eq 0 ] && echo "$S1" | grep -q "populated=[1-9]" && echo "$S1" | grep -q "doge_auxpow=[1-9]"; then
+if [ "$LACC" -ge 1 ] && [ "$DACC" -ge 1 ] && [ "$REJ" -eq 0 ] && echo "$S1" | grep -q "populated=[1-9]" && echo "$S1" | grep -q "doge_auxpow=[1-9]" && echo "$S1" | grep -q "doge_populated=[1-9]"; then
   res "L1 PASS $S1 ltc_acc=$LACC doge_acc=$DACC rejects=$REJ"; else res "L1 FAIL $S1 ltc_acc=$LACC doge_acc=$DACC rejects=$REJ"; fi
 
 # ---------------------------------------------------------------- L2 verdict
