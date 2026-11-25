@@ -828,6 +828,51 @@ TEST(BtcCoinPeerPool, JunkBodiesFromUnaskedOrAlreadyBadPeersAskNobody)
     EXPECT_EQ(live[2]->asked_for(x), 0u);   // a junk sender is not asked
 }
 
+TEST(BtcCoinPeerPool, TheOnlyPeerIsAskedAgainAfterABackOffOrANewHandshake)
+{
+    EXPECT_EQ(pool_same_peer_backoff_sec(0), 20);
+    EXPECT_EQ(pool_same_peer_backoff_sec(1), 60);
+    EXPECT_EQ(pool_same_peer_backoff_sec(2), 180);
+    EXPECT_EQ(pool_same_peer_backoff_sec(9), 180);
+
+    Harness hx(1);   // one peer in the pool
+    hx.caught_up = true;
+    hx.pool->tick();
+    handshake(hx, 1);
+    FakePeer* p = handshaked_peers(hx).front();
+    const auto tip = make_header(hx.root, 81);
+    hx.add(tip);
+    const uint256 th = pool_header_hash(tip);
+    ASSERT_TRUE(p->hooks.fetch(th, true));   // t0
+    hx.advance(3);
+    hx.pool->poll();   // due, but the only peer was just asked
+    EXPECT_EQ(p->asked_for(th), 0u);
+    hx.advance(17);
+    hx.pool->poll();   // t0+20: 20 s since the ask
+    EXPECT_EQ(p->asked_for(th), 1u);
+    hx.advance(59);
+    hx.pool->poll();   // t0+79: under 60 s since the last
+    EXPECT_EQ(p->asked_for(th), 1u);
+    hx.advance(4);
+    hx.pool->poll();   // t0+83
+    EXPECT_EQ(p->asked_for(th), 2u);
+    hx.advance(179);
+    hx.pool->poll();   // t0+262: under 180 s since t0+83
+    EXPECT_EQ(p->asked_for(th), 2u);
+    hx.advance(21);
+    hx.pool->poll();   // t0+283
+    EXPECT_EQ(p->asked_for(th), 3u);
+    // The link drops and the peer handshakes again: asked at the next retry,
+    // without the back-off.
+    p->hs = false;
+    hx.advance(12);
+    hx.pool->tick();
+    p->hs = true;
+    hx.advance(9);
+    hx.pool->tick();
+    EXPECT_EQ(p->asked_for(th), 4u);
+}
+
 TEST(BtcCoinPeerPool, TheTipIsTheTipBlockNotItsHeight)
 {
     Harness hx;
@@ -992,7 +1037,8 @@ TEST(BtcCoinPeerPool, BodiesAreConnectedInChainOrder)
     for (const auto& x : c)
         want.push_back(pool_header_hash(x));
     EXPECT_EQ(hf.connected_blocks, want);
-    EXPECT_EQ(hf.late_connects.size(), c.size() - 1);   // the six held ones
+    // One maintenance pass for the six held ones, after the last connect.
+    EXPECT_EQ(hf.late_connects, std::vector<uint256>{want.back()});
     // Room again: the side block is asked for once, connected, and its
     // full_block pass does not run a second time.
     hf.advance(kCoinPoolTipBodyRetrySec);
@@ -1002,7 +1048,30 @@ TEST(BtcCoinPeerPool, BodiesAreConnectedInChainOrder)
     again->hooks.full_block(body_of(side));
     EXPECT_EQ(hf.connected_blocks.back(), sh);
     EXPECT_EQ(std::count(hf.forwarded_blocks.begin(), hf.forwarded_blocks.end(), sh), 1);
-    EXPECT_EQ(hf.late_connects.back(), sh);
+    EXPECT_EQ(hf.late_connects, (std::vector<uint256>{want.back(), sh}));
+
+    // The hold limit with several held: they connect lowest first, one
+    // maintenance pass after the last.
+    Harness hm;
+    hm.caught_up = true;
+    hm.track_utxo = true;
+    hm.utxo_best = 100;
+    hm.pool->tick();
+    handshake(hm, 2);
+    auto mlive = handshaked_peers(hm);
+    const auto k = make_chain(hm.root, 3, 69);   // 101..103
+    for (const auto& x : k)
+        hm.add(x);
+    for (size_t i = 1; i < k.size(); ++i) {
+        ASSERT_TRUE(mlive[0]->hooks.fetch(pool_header_hash(k[i]), true));
+        mlive[0]->hooks.full_block(body_of(k[i]));
+    }
+    EXPECT_TRUE(hm.connected_blocks.empty());
+    hm.advance(kCoinPoolBodyHoldSec);
+    hm.pool->poll();
+    EXPECT_EQ(hm.connected_blocks,
+              (std::vector<uint256>{pool_header_hash(k[1]), pool_header_hash(k[2])}));
+    EXPECT_EQ(hm.late_connects, std::vector<uint256>{pool_header_hash(k[2])});
 }
 
 TEST(BtcCoinPeerPool, OnlyBodiesNearTheTipAreFetched)

@@ -44,7 +44,9 @@
 //     chain order: one more than one block above the UTXO set's best
 //     (body_best_height) waits for its parent, which is asked for, for at
 //     most kCoinPoolBodyHoldSec, and after its connect the UTXO-based mempool
-//     maintenance runs (after_late_connect); a gap of more than
+//     maintenance runs (after_late_connect, once per run of such connects);
+//     with no other peer to ask, the peer asked last is asked again only
+//     after pool_same_peer_backoff_sec or a new handshake; a gap of more than
 //     kCoinPoolMaxBodyGap blocks is passed on as it is;
 //     TODO: a header-tip jump of more than kCoinPoolMaxBodyGap + 1 blocks, or
 //     a large headers batch (no BIP 130 announcement), fetches no body, so
@@ -186,6 +188,14 @@ inline bool pool_empty_headers_caught_up(size_t count, uint32_t peer_height,
 inline int64_t pool_body_retry_sec(bool tip)
 {
     return tip ? kCoinPoolTipBodyRetrySec : kCoinPoolBodyRetrySec;
+}
+
+/// A block body asked again of the same peer (no other peer to ask) waits
+/// for this long since the last ask sent: 20 s, 60 s, then 180 s, by the
+/// number of such asks in a row so far. A new handshake of that peer lifts it.
+inline int64_t pool_same_peer_backoff_sec(int same_asks)
+{
+    return same_asks <= 0 ? 20 : (same_asks == 1 ? 60 : 180);
 }
 
 enum class PoolBodyRetry { Wait, Ask, GiveUp };
@@ -347,7 +357,8 @@ struct CoinPeerPoolHost {
     /// that is not held it runs before on_full_block.
     std::function<void(const BlockType&)>                    on_body_in_order;
     /// After the UTXO connect of a body whose on_full_block already ran (a
-    /// held body): the UTXO-based mempool maintenance and the work refresh
+    /// held body): the UTXO-based mempool maintenance and the work refresh,
+    /// once per run of such connects, with the last block connected
     /// (optional).
     std::function<void(const BlockType&)>                    after_late_connect;
     /// The clock (optional; tests drive it).
@@ -516,6 +527,9 @@ private:
         bool               passed{false};        // its on_full_block ran
         bool               awaiting_room{false}; // not held (hold full): asked again once it has room
         bool               loud{false};          // several bad bodies logged
+        Clock::time_point  sent{};      // last ask sent
+        Clock::time_point  asked_hs{};  // the asked peer's handshake when it was asked
+        int                same_asks{0};// asks in a row of the same peer
         std::set<uint64_t> bad;         // slots that sent a body not matching the header
     };
 
@@ -937,8 +951,10 @@ private:
         Body b;
         b.first = t;
         b.at = t;
+        b.sent = t;
         b.asked = s.id;
         b.asked_key = s.key;
+        b.asked_hs = s.handshaked_at;
         b.asks = 1;
         m_bodies.emplace(hash, std::move(b));
     }
@@ -1030,10 +1046,11 @@ private:
         if (!has_header(hash))
             return;
         if (m_host.body_valid && !m_host.body_valid(block)) {
-            LOG_WARNING << m_tag << " coin peer " << key << " sent block "
-                        << hash.GetHex().substr(0, 16)
-                        << " whose body does not match its header: dropped";
             const bool first_bad = b.bad.insert(s->id).second;
+            if (first_bad)   // once per peer and block
+                LOG_WARNING << m_tag << " coin peer " << key << " sent block "
+                            << hash.GetHex().substr(0, 16)
+                            << " whose body does not match its header: dropped";
             if (b.bad.size() >= 2 && !b.loud
                 && (m_last_bad_log == Clock::time_point{}
                     || secs(t - m_last_bad_log) >= kCoinPoolBadBodyLogSec)) {
@@ -1057,9 +1074,10 @@ private:
 
     /// Ask a block body of a live peer other than the one asked last and any
     /// that sent a body not matching the header (round robin); the one asked
-    /// last when it is the only such peer. `counts`: the ask counts toward
-    /// kCoinPoolBodyMaxAsks (a retry; not the re-ask after a body that did not
-    /// match). Nobody to ask: only the clock restarts.
+    /// last when it is the only such peer, if it handshaked again since it was
+    /// asked or after pool_same_peer_backoff_sec. `counts`: the ask counts
+    /// toward kCoinPoolBodyMaxAsks (a retry; not the re-ask after a body that
+    /// did not match). Nobody to ask: only the clock restarts.
     void ask_body_again(const uint256& hash, Body& b, Clock::time_point t, bool counts)
     {
         auto live = live_slots();
@@ -1074,8 +1092,15 @@ private:
             else
                 other = c;
         }
-        if (!other)
-            other = same;
+        bool again_same = false;
+        bool reconnected = false;
+        if (!other && same) {
+            reconnected = same->handshaked_at != b.asked_hs;
+            if (reconnected || secs(t - b.sent) >= pool_same_peer_backoff_sec(b.same_asks)) {
+                other = same;
+                again_same = true;
+            }
+        }
         ++m_body_rr;
         b.at = t;
         if (!other)
@@ -1087,6 +1112,9 @@ private:
                  << " body not received from " << b.asked_key << ", asking " << other->key;
         b.asked = other->id;
         b.asked_key = other->key;
+        b.asked_hs = other->handshaked_at;
+        b.sent = t;
+        b.same_asks = (again_same && !reconnected) ? b.same_asks + 1 : 0;
     }
 
     void connect_in_order(const BlockType& block)
@@ -1142,13 +1170,17 @@ private:
                      << " (height " << (hh ? *hh : 0) << ") passed on above a gap (body best "
                      << (best ? std::to_string(*best) : std::string("-")) << ")";
         connect_in_order(block);
-        if (b.passed) {
-            late_connect(block);
-        } else {
+        const bool late = b.passed;
+        if (!b.passed) {
             pass_on(block);
             b.passed = true;
         }
-        release_held();
+        // One maintenance pass for this connect and the held ones it releases.
+        auto released = release_held();
+        if (released)
+            late_connect(*released);
+        else if (late)
+            late_connect(block);
     }
 
     void late_connect(const BlockType& block)
@@ -1171,10 +1203,12 @@ private:
         s->peer->request_block(parent);
     }
 
-    /// Held bodies whose parent is now connected, lowest first (their
-    /// full_block pass already ran on arrival).
-    void release_held()
+    /// Connect the held bodies whose parent is now connected, lowest first
+    /// (their full_block pass already ran on arrival). Returns the last one
+    /// connected, if any (the caller runs after_late_connect once).
+    std::optional<BlockType> release_held()
     {
+        std::optional<BlockType> last;
         for (;;) {
             const std::optional<uint32_t> best = body_best();
             auto pick = m_held.end();
@@ -1183,11 +1217,11 @@ private:
                     && (pick == m_held.end() || it->second.height < pick->second.height))
                     pick = it;
             if (pick == m_held.end())
-                return;
+                return last;
             BlockType block = std::move(pick->second.block);
             m_held.erase(pick);
             connect_in_order(block);
-            late_connect(block);
+            last = std::move(block);
         }
     }
 
@@ -1242,13 +1276,16 @@ private:
         std::sort(order.begin(), order.end());
         LOG_WARNING << m_tag << " coin peer pool: " << order.size()
                     << " block bodies connected without their parent";
+        std::optional<BlockType> last;
         for (const auto& entry : order) {
             auto it = m_held.find(entry.second);
             BlockType block = std::move(it->second.block);
             m_held.erase(it);
             connect_in_order(block);
-            late_connect(block);
+            last = std::move(block);
         }
+        if (last)
+            late_connect(*last);   // one maintenance pass for them all
     }
 
     void publish_rows()
