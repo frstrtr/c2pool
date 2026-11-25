@@ -1277,6 +1277,10 @@ int main(int argc, char* argv[])
     // peer manager it draws from, so it is destroyed first. Null with
     // --bitcoind (the external arm owns coin_node's single connection).
     std::unique_ptr<btc::coin::CoinPeerPool> coin_pool;
+    // The pool's after_late_connect: the UTXO-based mempool maintenance and
+    // the work refresh after a held block body's UTXO connect. Bound below,
+    // once the mempool and the work source exist; unbound before shutdown.
+    auto pool_late_connect = std::make_shared<std::function<void()>>();
     if (coin_p2p_discover) {
         // BTC network default ports: 8333 mainnet / 18333 testnet3 /
         // 48333 testnet4 / 18444 regtest. Distinct from the stratum/P2P pool port.
@@ -1387,6 +1391,13 @@ int main(int argc, char* argv[])
             // when the body is not held for its parent.
             *utxo_connect_by_pool = true;
             ph.on_body_in_order = utxo_connect_block;
+            ph.after_late_connect = [pool_late_connect](const btc::coin::BlockType&) {
+                if (*pool_late_connect) (*pool_late_connect)();
+            };
+            ph.tip = [&header_chain]() {
+                auto tip = header_chain.tip();
+                return tip ? tip->block_hash : uint256();
+            };
             ph.on_full_block = [&coin_node](const btc::coin::BlockType& b) {
                 coin_node.full_block.happened(b);
             };
@@ -2678,6 +2689,19 @@ int main(int argc, char* argv[])
     coin_node.full_block.subscribe(
         [work_source](const btc::coin::BlockType&)
         { work_source->bump_work_generation(); });
+    // Standalone pool: a held block body's full_block pass (above: mempool
+    // remove_for_block + revalidate_inputs + recompute_unknown_fees, the work
+    // bump) ran on arrival, before its UTXO connect; after that connect, the
+    // UTXO-based passes and the work bump run again on the connected view.
+    *pool_late_connect = [&mempool, &utxo_cache, work_source]() {
+        const int evicted  = mempool.revalidate_inputs(&utxo_cache);
+        const int resolved = mempool.recompute_unknown_fees(&utxo_cache);
+        if (evicted > 0 || resolved > 0) {
+            LOG_INFO << "[EMB] post-connect mempool maintenance (held block): evicted="
+                     << evicted << " resolved_fees=" << resolved;
+        }
+        work_source->bump_work_generation();
+    };
 
     std::unique_ptr<core::StratumServer> stratum_server;
     if (stratum_port != 0) {
@@ -3561,6 +3585,7 @@ int main(int argc, char* argv[])
     LOG_INFO << "[BTC] Shutting down...";
     // #995/#1155: unbind the found-block reporter before mi/web_server die.
     if (found_block_report) *found_block_report = nullptr;
+    if (pool_late_connect) *pool_late_connect = nullptr;
     stratum_server_for_shutdown.reset();
     work_source_for_shutdown.reset();
     p2p_node.reset();

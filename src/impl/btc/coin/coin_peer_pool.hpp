@@ -36,13 +36,20 @@
 //     tip) is asked of another peer (pool_body_retry): kCoinPoolBodyMaxAsks
 //     asks sent, then kept for a late body until kCoinPoolBodyKeepSec after
 //     the first ask; the tip's block is never given up while it is the tip.
-//     A body that does not match its header (body_valid) is asked of another
-//     peer at once, without using up an ask. A valid body reaches the coin
-//     node's full_block path (mempool cleanup, work refresh) on arrival, and
-//     the UTXO connect (on_body_in_order) in chain order: one more than one
-//     block above the UTXO set's best (body_best_height) waits for its parent,
-//     which is asked for, for at most kCoinPoolBodyHoldSec; a gap of more than
+//     A body that does not match its header (body_valid) from the peer it was
+//     asked of is asked of another peer at once, without using up an ask
+//     (once per peer; a body nobody asked for is not followed up). A valid
+//     body reaches the coin node's full_block path (mempool cleanup, work
+//     refresh) once, on arrival, and the UTXO connect (on_body_in_order) in
+//     chain order: one more than one block above the UTXO set's best
+//     (body_best_height) waits for its parent, which is asked for, for at
+//     most kCoinPoolBodyHoldSec, and after its connect the UTXO-based mempool
+//     maintenance runs (after_late_connect); a gap of more than
 //     kCoinPoolMaxBodyGap blocks is passed on as it is;
+//     TODO: a header-tip jump of more than kCoinPoolMaxBodyGap + 1 blocks, or
+//     a large headers batch (no BIP 130 announcement), fetches no body, so
+//     after an outage the blocks it skipped get no mempool pass (their
+//     confirmed transactions leave the mempool only as they expire);
 //   - transactions: fetched from the first announcer; the others are kept,
 //     and one not received after kCoinPoolTxRetrySec is asked of the next.
 //     At most kCoinPoolSeenTxMax tracked, the oldest evicted first, each for
@@ -98,6 +105,7 @@ inline constexpr int64_t kCoinPoolBodyRetrySec      = 20;
 inline constexpr int64_t kCoinPoolTipBodyRetrySec   = 3;
 inline constexpr int     kCoinPoolBodyMaxAsks       = 3;
 inline constexpr int64_t kCoinPoolBodyKeepSec       = 60;
+inline constexpr int64_t kCoinPoolBadBodyLogSec     = 600;
 inline constexpr size_t  kCoinPoolBodiesMax         = 64;
 inline constexpr int64_t kCoinPoolBodyHoldSec       = 60;
 inline constexpr uint32_t kCoinPoolMaxBodyGap       = 6;
@@ -317,6 +325,9 @@ struct CoinPeerPoolHost {
     std::function<uint32_t()>                height;
     /// Height of a header the chain holds (optional; nullopt = unknown).
     std::function<std::optional<uint32_t>(const uint256&)> header_height;
+    /// The header tip's block hash (optional; unset = any block at the tip
+    /// height counts as the tip).
+    std::function<uint256()>                 tip;
     /// Header sync caught up (the last batch was < 2000 headers).
     std::function<bool()>                    caught_up;
     /// pool_empty_headers_caught_up held for a headers message (optional).
@@ -335,6 +346,10 @@ struct CoinPeerPoolHost {
     /// The same body in chain order (the UTXO connect; optional). For a body
     /// that is not held it runs before on_full_block.
     std::function<void(const BlockType&)>                    on_body_in_order;
+    /// After the UTXO connect of a body whose on_full_block already ran (a
+    /// held body): the UTXO-based mempool maintenance and the work refresh
+    /// (optional).
+    std::function<void(const BlockType&)>                    after_late_connect;
     /// The clock (optional; tests drive it).
     std::function<Clock::time_point()> now;
 };
@@ -498,6 +513,9 @@ private:
         std::string        asked_key;
         int                asks{0};     // asks sent
         bool               received{false};
+        bool               passed{false};        // its on_full_block ran
+        bool               awaiting_room{false}; // not held (hold full): asked again once it has room
+        bool               loud{false};          // several bad bodies logged
         std::set<uint64_t> bad;         // slots that sent a body not matching the header
     };
 
@@ -863,9 +881,12 @@ private:
         return m_host.body_best_height ? m_host.body_best_height() : std::nullopt;
     }
 
-    /// The block is the header tip's block (or above it) now.
+    /// The block is the header tip's block now (its hash; without the tip
+    /// hook, any block at the tip height).
     bool is_tip(const uint256& hash) const
     {
+        if (m_host.tip)
+            return hash == m_host.tip();
         const auto hh = header_height(hash);
         return hh && *hh >= height();
     }
@@ -884,7 +905,7 @@ private:
             const auto hh = header_height(hash);
             if (!hh || !has_header(hash) || m_bodies.count(hash)
                 || !pool_body_wanted(*hh, height(), body_best())
-                || !make_room_for_body(*hh >= height()))
+                || !make_room_for_body(is_tip(hash)))
                 return false;
             track_body(hash, *s, t);
             return true;
@@ -1012,28 +1033,49 @@ private:
             LOG_WARNING << m_tag << " coin peer " << key << " sent block "
                         << hash.GetHex().substr(0, 16)
                         << " whose body does not match its header: dropped";
-            b.bad.insert(s->id);
-            ask_body_again(hash, b, t, /*counts=*/false);   // not an ask used up
+            const bool first_bad = b.bad.insert(s->id).second;
+            if (b.bad.size() >= 2 && !b.loud
+                && (m_last_bad_log == Clock::time_point{}
+                    || secs(t - m_last_bad_log) >= kCoinPoolBadBodyLogSec)) {
+                b.loud = true;
+                m_last_bad_log = t;
+                LOG_ERROR << m_tag << " block " << hash.GetHex().substr(0, 16) << ": bodies from "
+                          << b.bad.size() << " coin peers do not match its header -- if the"
+                             " block is valid, the body check is rejecting it";
+            }
+            // Asked again only for the peer it was asked of, the first time
+            // that peer sends a bad one (junk from others asks nobody).
+            if (s->id == b.asked && first_bad)
+                ask_body_again(hash, b, t, /*counts=*/false);   // not an ask used up
             return;
         }
         b.received = true;
+        b.awaiting_room = false;
         b.at = t;
-        deliver(hash, block, t);
+        deliver(hash, b, block, t);
     }
 
     /// Ask a block body of a live peer other than the one asked last and any
-    /// that sent a body not matching the header (round robin). `counts`: the
-    /// ask counts toward kCoinPoolBodyMaxAsks (a retry; not the re-ask after a
-    /// body that did not match). Nobody to ask: only the clock restarts.
+    /// that sent a body not matching the header (round robin); the one asked
+    /// last when it is the only such peer. `counts`: the ask counts toward
+    /// kCoinPoolBodyMaxAsks (a retry; not the re-ask after a body that did not
+    /// match). Nobody to ask: only the clock restarts.
     void ask_body_again(const uint256& hash, Body& b, Clock::time_point t, bool counts)
     {
         auto live = live_slots();
         Slot* other = nullptr;
+        Slot* same = nullptr;
         for (size_t i = 0; i < live.size() && !other; ++i) {
             Slot* c = live[(m_body_rr + i) % live.size()];
-            if (c->id != b.asked && !b.bad.count(c->id))
+            if (b.bad.count(c->id))
+                continue;
+            if (c->id == b.asked)
+                same = c;
+            else
                 other = c;
         }
+        if (!other)
+            other = same;
         ++m_body_rr;
         b.at = t;
         if (!other)
@@ -1060,26 +1102,28 @@ private:
     }
 
     /// A valid body: the UTXO connect in chain order (pool_body_order), the
-    /// full_block path now (after the connect when the body is not held).
-    void deliver(const uint256& hash, const BlockType& block, Clock::time_point t)
+    /// full_block path once, now (after the connect when the body is not
+    /// held).
+    void deliver(const uint256& hash, Body& b, const BlockType& block, Clock::time_point t)
     {
         const auto hh = header_height(hash);
         const std::optional<uint32_t> best = body_best();
         const auto order = hh ? pool_body_order(best, *hh) : PoolBodyOrder::Deliver;
         if (order == PoolBodyOrder::Hold) {
             // Mempool cleanup and the work refresh do not wait for the parent.
-            pass_on(block);
+            if (!b.passed) {
+                pass_on(block);
+                b.passed = true;
+            }
             if (m_held.size() >= kCoinPoolMaxBodyGap) {
                 // No room to hold it: not connected out of order either; asked
-                // for again later (pool_body_retry), when the hold has drained.
-                auto it = m_bodies.find(hash);
-                if (it != m_bodies.end()) {
-                    it->second.received = false;
-                    it->second.at = t;
-                }
+                // for again (for the connect only) once the hold has room.
+                b.received = false;
+                b.awaiting_room = true;
+                b.at = t;
                 LOG_INFO << m_tag << " coin peer pool: block " << hash.GetHex().substr(0, 16)
                          << " (height " << *hh << ") not held (" << m_held.size()
-                         << " bodies already wait): asked for again later";
+                         << " bodies already wait): asked for again when there is room";
                 return;
             }
             Held held;
@@ -1098,8 +1142,19 @@ private:
                      << " (height " << (hh ? *hh : 0) << ") passed on above a gap (body best "
                      << (best ? std::to_string(*best) : std::string("-")) << ")";
         connect_in_order(block);
-        pass_on(block);
+        if (b.passed) {
+            late_connect(block);
+        } else {
+            pass_on(block);
+            b.passed = true;
+        }
         release_held();
+    }
+
+    void late_connect(const BlockType& block)
+    {
+        if (m_host.after_late_connect)
+            m_host.after_late_connect(block);
     }
 
     /// Ask for the body of a held block's parent (a block the chain holds,
@@ -1132,6 +1187,7 @@ private:
             BlockType block = std::move(pick->second.block);
             m_held.erase(pick);
             connect_in_order(block);
+            late_connect(block);
         }
     }
 
@@ -1146,6 +1202,16 @@ private:
                     it = m_bodies.erase(it);
                 else
                     ++it;
+                continue;
+            }
+            if (b.awaiting_room) {
+                // A valid body that found the hold full: asked again (for its
+                // connect; not an ask used up) once the hold has room.
+                if (m_held.size() < kCoinPoolMaxBodyGap) {
+                    b.awaiting_room = false;
+                    ask_body_again(it->first, b, t, /*counts=*/false);
+                }
+                ++it;
                 continue;
             }
             switch (pool_body_retry(is_tip(it->first), b.asks, secs(t - b.at), secs(t - b.first))) {
@@ -1181,6 +1247,7 @@ private:
             BlockType block = std::move(it->second.block);
             m_held.erase(it);
             connect_in_order(block);
+            late_connect(block);
         }
     }
 
@@ -1214,6 +1281,7 @@ private:
     size_t             m_body_rr{0};
     uint32_t           m_last_height{0};
     Clock::time_point  m_last_tick{};
+    Clock::time_point  m_last_bad_log{};
     Clock::time_point  m_last_progress{};
     Clock::time_point  m_last_getheaders{};
     uint256            m_last_announced;

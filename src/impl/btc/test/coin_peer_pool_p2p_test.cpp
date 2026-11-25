@@ -194,6 +194,23 @@ TEST(BtcCoinPeerPoolP2P, MainBtcWiresThePool)
     ASSERT_NE(by_pool, std::string::npos);
     EXPECT_LT(standalone_pos(src), by_pool);
     EXPECT_NE(src.find("ph.on_body_in_order = utxo_connect_block;", by_pool), std::string::npos);
+    // A held body's late connect: the UTXO-based mempool passes and the work
+    // bump, bound once the mempool and the work source exist, unbound at
+    // shutdown. The header tip is the chain's tip block.
+    EXPECT_NE(src.find("ph.after_late_connect = [pool_late_connect]"), std::string::npos);
+    const auto late = src.find("*pool_late_connect = [&mempool, &utxo_cache, work_source]()");
+    ASSERT_NE(late, std::string::npos);
+    const auto reval = src.find("mempool.revalidate_inputs(&utxo_cache);", late);
+    const auto fees = src.find("mempool.recompute_unknown_fees(&utxo_cache);", late);
+    const auto bump = src.find("work_source->bump_work_generation();", late);
+    ASSERT_NE(reval, std::string::npos);
+    ASSERT_NE(fees, std::string::npos);
+    ASSERT_NE(bump, std::string::npos);
+    EXPECT_LT(bump - late, 600u);
+    EXPECT_NE(src.find("if (pool_late_connect) *pool_late_connect = nullptr;"), std::string::npos);
+    const auto tip = src.find("ph.tip = [&header_chain]()");
+    ASSERT_NE(tip, std::string::npos);
+    EXPECT_NE(src.find("return tip ? tip->block_hash : uint256();", tip), std::string::npos);
     // Pool events into coin_node's existing subscribers.
     EXPECT_NE(src.find("coin_node.new_headers.happened(h);"), std::string::npos);
     EXPECT_NE(src.find("coin_node.full_block.happened(b);"), std::string::npos);

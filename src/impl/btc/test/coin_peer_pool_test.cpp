@@ -84,12 +84,14 @@ struct Harness {
     int empty_hints = 0;
     int announced = 0;
     uint256 root;
+    uint256 tip_hash;                         // the header tip's block
     std::set<uint256> bad_bodies;
     bool track_utxo = false;
     std::optional<uint32_t> utxo_best;
     std::vector<std::vector<BlockHeaderType>> forwarded;
     std::vector<uint256> forwarded_blocks;   // the full_block path (on arrival)
     std::vector<uint256> connected_blocks;   // the UTXO connect (in chain order)
+    std::vector<uint256> late_connects;      // after_late_connect
     int forwarded_txs = 0;
     std::unique_ptr<CoinPeerPool> pool;
 
@@ -106,8 +108,12 @@ struct Harness {
         if (it == chain.end())
             return;
         const uint32_t hh = it->second + 1;
-        chain.emplace(pool_header_hash(h), hh);
-        height = std::max(height, hh);
+        const uint256 bh = pool_header_hash(h);
+        chain.emplace(bh, hh);
+        if (hh > height) {   // more work: the new tip (a same-height sibling is not)
+            height = hh;
+            tip_hash = bh;
+        }
     }
 
     FakePeer* peer(const std::string& key)
@@ -171,6 +177,7 @@ struct FakePeer : PoolPeer {
 Harness::Harness(size_t n_candidates, size_t target)
 {
     root = some_hash(0);
+    tip_hash = root;
     chain.emplace(root, height);
     for (size_t i = 0; i < n_candidates; ++i)
         candidates.emplace_back("44.1." + std::to_string(i) + ".7", 8333);
@@ -201,6 +208,8 @@ Harness::Harness(size_t n_candidates, size_t target)
         return it->second;
     };
     h.locator = [this]() { return locator(); };
+    h.tip = [this]() { return tip_hash; };
+    h.after_late_connect = [this](const BlockType& b) { late_connects.push_back(pool_header_hash(b)); };
     h.height = [this]() { return height; };
     h.caught_up = [this]() { return caught_up; };
     h.on_empty_headers = [this]() { ++empty_hints; };
@@ -793,6 +802,54 @@ TEST(BtcCoinPeerPool, BodiesNotMatchingTheHeaderDoNotUseUpAsks)
     ASSERT_EQ(hx.forwarded_blocks.size(), 1u);
 }
 
+TEST(BtcCoinPeerPool, JunkBodiesFromUnaskedOrAlreadyBadPeersAskNobody)
+{
+    Harness hx;
+    hx.caught_up = true;
+    hx.pool->tick();
+    handshake(hx, 4);
+    auto live = handshaked_peers(hx);
+    const auto two = make_chain(hx.root, 2, 57);
+    hx.add(two[0]);
+    hx.add(two[1]);
+    const uint256 x = pool_header_hash(two[0]);
+    ASSERT_TRUE(live[0]->hooks.fetch(x, true));
+    hx.bad_bodies.insert(x);
+    // A peer nobody asked: no getdata, however many it sends.
+    for (int i = 0; i < 5; ++i)
+        live[2]->hooks.full_block(body_of(two[0]));
+    EXPECT_EQ(asks_for(hx, x), 0u);
+    // The asked peer: one re-ask, the first time only.
+    live[0]->hooks.full_block(body_of(two[0]));
+    EXPECT_EQ(asks_for(hx, x), 1u);
+    live[0]->hooks.full_block(body_of(two[0]));
+    live[2]->hooks.full_block(body_of(two[0]));
+    EXPECT_EQ(asks_for(hx, x), 1u);
+    EXPECT_EQ(live[2]->asked_for(x), 0u);   // a junk sender is not asked
+}
+
+TEST(BtcCoinPeerPool, TheTipIsTheTipBlockNotItsHeight)
+{
+    Harness hx;
+    hx.caught_up = true;
+    hx.pool->tick();
+    handshake(hx, 2);
+    auto live = handshaked_peers(hx);
+    const auto tip = make_header(hx.root, 58);
+    const auto sibling = make_header(hx.root, 59);   // the same height, not the tip
+    hx.add(tip);
+    hx.add(sibling);
+    ASSERT_EQ(hx.tip_hash, pool_header_hash(tip));
+    const uint256 sh = pool_header_hash(sibling);
+    ASSERT_TRUE(live[0]->hooks.fetch(sh, true));
+    hx.advance(kCoinPoolTipBodyRetrySec);
+    hx.pool->poll();
+    EXPECT_EQ(asks_for(hx, sh), 0u);   // not the tip's short retry
+    hx.advance(kCoinPoolBodyRetrySec - kCoinPoolTipBodyRetrySec);
+    hx.pool->poll();
+    EXPECT_EQ(asks_for(hx, sh), 1u);
+}
+
 TEST(BtcCoinPeerPool, BodyNotMatchingItsHeaderIsAskedOfAnotherPeer)
 {
     Harness hx;
@@ -853,6 +910,8 @@ TEST(BtcCoinPeerPool, BodiesAreConnectedInChainOrder)
     EXPECT_EQ(hx.connected_blocks, (std::vector<uint256>{h0, h1}));
     EXPECT_EQ(hx.forwarded_blocks, (std::vector<uint256>{h1, h0}));
     EXPECT_EQ(hx.utxo_best, std::optional<uint32_t>(102));
+    // The held one's UTXO-based mempool maintenance runs after its connect.
+    EXPECT_EQ(hx.late_connects, std::vector<uint256>{h1});
 
     // A parent that does not come: the held body connects after the hold limit.
     Harness hl;
@@ -875,6 +934,7 @@ TEST(BtcCoinPeerPool, BodiesAreConnectedInChainOrder)
     hl.advance(1);
     hl.pool->poll();
     EXPECT_EQ(hl.connected_blocks, std::vector<uint256>{m1});
+    EXPECT_EQ(hl.late_connects, std::vector<uint256>{m1});
 
     // A gap of more than kCoinPoolMaxBodyGap blocks (a node that was down):
     // connected as it is.
@@ -893,9 +953,11 @@ TEST(BtcCoinPeerPool, BodiesAreConnectedInChainOrder)
     gpeer->hooks.full_block(body_of(far.back()));
     EXPECT_EQ(gp.connected_blocks, std::vector<uint256>{top});
     EXPECT_EQ(gp.forwarded_blocks, std::vector<uint256>{top});
+    EXPECT_TRUE(gp.late_connects.empty());
 
-    // The hold full: one more body is not connected out of order; it is
-    // asked for again later.
+    // The hold full: one more body is not connected out of order; its
+    // full_block pass runs once, it is not downloaded again while the hold is
+    // full, and is asked for (its connect only) once the hold has room.
     Harness hf;
     hf.caught_up = true;
     hf.track_utxo = true;
@@ -919,6 +981,9 @@ TEST(BtcCoinPeerPool, BodiesAreConnectedInChainOrder)
     EXPECT_TRUE(hf.connected_blocks.empty());
     EXPECT_EQ(std::count(hf.forwarded_blocks.begin(), hf.forwarded_blocks.end(), sh), 1);
     EXPECT_FALSE(flive[1]->hooks.fetch(sh, true));   // still tracked: asked for again later
+    hf.advance(kCoinPoolTipBodyRetrySec);
+    hf.pool->poll();
+    EXPECT_EQ(asks_for(hf, sh), 0u);   // the hold is still full
     // The parent of the first held body arrives: all six connect in order.
     const uint256 c0 = pool_header_hash(c[0]);
     FakePeer* asked0 = flive[0]->asked_for(c0) ? flive[0] : flive[1];
@@ -927,6 +992,17 @@ TEST(BtcCoinPeerPool, BodiesAreConnectedInChainOrder)
     for (const auto& x : c)
         want.push_back(pool_header_hash(x));
     EXPECT_EQ(hf.connected_blocks, want);
+    EXPECT_EQ(hf.late_connects.size(), c.size() - 1);   // the six held ones
+    // Room again: the side block is asked for once, connected, and its
+    // full_block pass does not run a second time.
+    hf.advance(kCoinPoolTipBodyRetrySec);
+    hf.pool->poll();
+    ASSERT_EQ(asks_for(hf, sh), 1u);
+    FakePeer* again = flive[0]->asked_for(sh) ? flive[0] : flive[1];
+    again->hooks.full_block(body_of(side));
+    EXPECT_EQ(hf.connected_blocks.back(), sh);
+    EXPECT_EQ(std::count(hf.forwarded_blocks.begin(), hf.forwarded_blocks.end(), sh), 1);
+    EXPECT_EQ(hf.late_connects.back(), sh);
 }
 
 TEST(BtcCoinPeerPool, OnlyBodiesNearTheTipAreFetched)

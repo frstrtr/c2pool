@@ -3,11 +3,12 @@
 // btc::coin::block_body_matches_header -- a block body received from a coin
 // peer belongs to its header (which the header chain holds, PoW-checked); the
 // checks of Bitcoin Core's IsBlockMutated:
-//   - at least one transaction; the first is a coinbase and no other is;
+//   - at least one transaction; the first is a coinbase and no other is
+//     (Core tests for 64-byte transactions, CVE-2017-12842, only when the
+//     first one is not a coinbase, which this already rejects; a 64-byte
+//     transaction is valid by consensus and is accepted);
 //   - no two with the same txid (a duplicated subtree leaves the merkle root
 //     unchanged);
-//   - no transaction whose serialization without witness is 64 bytes (it
-//     can stand in for an inner merkle node, CVE-2017-12842);
 //   - the txid merkle root equals the header's merkle root;
 //   - BIP 141: if the coinbase has a witness commitment output (the last
 //     output whose script starts 6a24aa21a9ed and is at least 38 bytes), the
@@ -74,10 +75,7 @@ inline bool block_body_matches_header(const BlockType& block)
         const auto& tx = block.m_txs[i];
         if (i > 0 && is_coinbase_tx(tx))
             return false;
-        auto packed = pack(TX_NO_WITNESS(tx));
-        if (packed.size() == 64)
-            return false;
-        txids.push_back(Hash(packed.get_span()));
+        txids.push_back(compute_txid(tx));
         if (!unique.insert(txids.back()).second)
             return false;
     }

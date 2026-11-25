@@ -1,7 +1,7 @@
 // btc::coin::block_body_matches_header (impl/btc/coin/block_body_check.hpp):
 // a pooled block body is passed on only when it belongs to its header (one
-// coinbase, first; no repeated txid; no 64-byte transaction; txid merkle root;
-// the BIP 141 witness commitment). Positive vectors: blocks bitcoind produced
+// coinbase, first; no repeated txid; txid merkle root; the BIP 141 witness
+// commitment). A 64-byte transaction is valid by consensus and accepted. Positive vectors: blocks bitcoind produced
 // (the regtest segwit block of btc_regtest_cmpct_fixtures.hpp) and mainnet
 // block 170 (pre-segwit, two transactions), checked against its known hash.
 #include <gtest/gtest.h>
@@ -148,7 +148,7 @@ TEST(BtcBlockBodyCheck, MerkleRootAndDuplicates)
     EXPECT_FALSE(block_body_matches_header(dup));
 }
 
-TEST(BtcBlockBodyCheck, CoinbaseFirstAndOnlyAndNo64ByteTransaction)
+TEST(BtcBlockBodyCheck, CoinbaseFirstAndOnly64ByteTransactionsAccepted)
 {
     // The first transaction is not a coinbase.
     BlockType nocb;
@@ -162,20 +162,29 @@ TEST(BtcBlockBodyCheck, CoinbaseFirstAndOnlyAndNo64ByteTransaction)
     seal(two);
     EXPECT_FALSE(block_body_matches_header(two));
 
-    // A transaction of exactly 64 bytes without witness.
+    // A transaction of exactly 64 bytes without witness: valid by consensus,
+    // accepted after a coinbase.
     MutableTransaction t64 = spend(3, false);
     t64.vout.front().scriptPubKey.m_data = {0x51, 0x52, 0x53, 0x54};
     ASSERT_EQ(pack(TX_NO_WITNESS(t64)).size(), 64u);
     BlockType b64;
     b64.m_txs = {coinbase(3), t64};
     seal(b64);
-    EXPECT_FALSE(block_body_matches_header(b64));
-    // One byte more: fine.
-    t64.vout.front().scriptPubKey.m_data.push_back(0x55);
-    BlockType b65;
-    b65.m_txs = {coinbase(3), t64};
-    seal(b65);
-    EXPECT_TRUE(block_body_matches_header(b65));
+    EXPECT_TRUE(block_body_matches_header(b64));
+    // A 64-byte coinbase: accepted too.
+    MutableTransaction cb64 = coinbase(4);
+    cb64.vin.front().scriptSig.m_data = {0x03, 0x04, 0x01};
+    ASSERT_EQ(pack(TX_NO_WITNESS(cb64)).size(), 64u);
+    BlockType bcb64;
+    bcb64.m_txs = {cb64, spend(4, false)};
+    seal(bcb64);
+    EXPECT_TRUE(block_body_matches_header(bcb64));
+    // A 64-byte first transaction that is not a coinbase (Core's mutation
+    // case): rejected by the coinbase-first rule.
+    BlockType first64;
+    first64.m_txs = {t64, spend(5, false)};
+    seal(first64);
+    EXPECT_FALSE(block_body_matches_header(first64));
 }
 
 TEST(BtcBlockBodyCheck, RealBlocksMatch)
