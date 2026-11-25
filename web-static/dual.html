@@ -95,6 +95,11 @@
         .copy.done { color: var(--success); border-color: var(--success); }
         .connect-note { color: var(--text-muted); font-size: 0.82rem; margin-top: 10px; }
         .private { font-size: 0.95rem; }
+        .eps { display: flex; flex-direction: column; gap: 6px; }
+        .eps .rg { display: inline-block; min-width: 2.6em; font-weight: 600; color: var(--text); }
+        .own { margin-top: 14px; padding-top: 10px; border-top: 1px solid var(--border, rgba(127,127,127,0.25)); }
+        .own h4 { margin: 0 0 6px; font-size: 0.9rem; }
+        .own pre { white-space: pre-wrap; word-break: break-all; margin: 6px 0 0; font-size: 0.8rem; }
         .muted { color: var(--text-muted); }
         .good { color: var(--success); }
         .warn { color: var(--warning); }
@@ -391,6 +396,68 @@
     }
     function kv(box, k, v) { box.appendChild(el('div', 'k', k)); box.appendChild(v); return v; }
     function code(t) { return el('code', '', t); }
+    function copyBtn(text) {
+        var cp = el('button', 'copy', 'Copy'); cp.type = 'button';
+        cp.addEventListener('click', function () {
+            if (!navigator.clipboard) return;
+            navigator.clipboard.writeText(text).then(function () {
+                cp.textContent = 'Copied'; cp.classList.add('done');
+                setTimeout(function () { cp.textContent = 'Copy'; cp.classList.remove('done'); }, 1500);
+            });
+        });
+        return cp;
+    }
+    // "endpoints": [{"region": "UK", "stratum": "stratum+tcp://host:port"}, ...]
+    // lists every node of this chain that takes miners, so a miner can pick the
+    // closest one. Only well-formed entries the deployment published are shown.
+    var REGION_RE = /^[A-Za-z0-9 .()-]{1,24}$/;
+    var HEX16_RE = /^[0-9a-f]{16}$/;
+    var HOSTPORT_RE = /^[A-Za-z0-9.-]{1,253}:[0-9]{1,5}$/;
+    function endpointsOf(p) {
+        if (!Array.isArray(p.endpoints)) return [];
+        return p.endpoints.filter(function (e) {
+            return e && typeof e.region === 'string' && REGION_RE.test(e.region)
+                && typeof e.stratum === 'string' && STRATUM_RE.test(e.stratum);
+        }).slice(0, 8);
+    }
+    // "share_chain": {"network_id": hex16, "prefix": hex16, "default": bool,
+    // "addnodes": ["host:port", ...]}: what a miner needs to run their own
+    // c2pool-dash node on this chain, with their own fee and rules.
+    function renderOwnNode(p, body) {
+        var s = p.share_chain;
+        if (!s || typeof s !== 'object' || !HEX16_RE.test(s.network_id) || !HEX16_RE.test(s.prefix)) return;
+        var adds = (Array.isArray(s.addnodes) ? s.addnodes : []).filter(function (a) {
+            return typeof a === 'string' && HOSTPORT_RE.test(a);
+        }).slice(0, 8);
+        var box = el('div', 'own');
+        box.appendChild(el('h4', '', 'Run your own node'));
+        box.appendChild(el('div', 'connect-note',
+            'Prefer your own node? c2pool-dash joins this share chain from your machine, '
+            + 'with your own fee and rules. Point your miners at it instead.'));
+        var g = el('div', 'connect');
+        kv(g, 'Network ID', code(s.network_id));
+        kv(g, 'Prefix', code(s.prefix));
+        body.appendChild(box);
+        box.appendChild(g);
+        var cmd = 'c2pool-dash --run --embedded-mainnet --embedded-utxo'
+            + (s['default'] === true ? '' : ' --network-id ' + s.network_id + ' --prefix ' + s.prefix)
+            + adds.map(function (a) { return ' --addnode ' + a; }).join('')
+            + ' --fee <percent>';
+        var pre = el('pre'); pre.appendChild(code(cmd));
+        var row = el('div', 'url'); row.appendChild(copyBtn(cmd));
+        box.appendChild(pre); box.appendChild(row);
+        var n = el('div', 'connect-note');
+        if (s['default'] === true)
+            n.appendChild(document.createTextNode('This is the default p2pool-dash identity: the id and prefix flags are not needed. '));
+        var a = el('a', '', 'Download c2pool →');
+        a.href = 'https://github.com/frstrtr/c2pool/releases'; a.target = '_blank'; a.rel = 'noopener';
+        n.appendChild(a);
+        n.appendChild(document.createTextNode(' · '));
+        var r = el('a', '', 'all node flags (README) →');
+        r.href = 'https://github.com/frstrtr/c2pool#readme'; r.target = '_blank'; r.rel = 'noopener';
+        n.appendChild(r);
+        box.appendChild(n);
+    }
     function renderConnect(p) {
         var body = document.querySelector('#connect-' + p.id + ' .body');
         body.innerHTML = '';
@@ -408,20 +475,24 @@
                 n.appendChild(a);
                 body.appendChild(n);
             }
+            renderOwnNode(p, body);
             return;
         }
         var g = el('div', 'connect');
-        var u = el('div', 'url'); u.appendChild(code(url));
-        var cp = el('button', 'copy', 'Copy'); cp.type = 'button';
-        cp.addEventListener('click', function () {
-            if (!navigator.clipboard) return;
-            navigator.clipboard.writeText(url).then(function () {
-                cp.textContent = 'Copied'; cp.classList.add('done');
-                setTimeout(function () { cp.textContent = 'Copy'; cp.classList.remove('done'); }, 1500);
+        if (p._eps.length) {
+            var eps = el('div', 'eps');
+            p._eps.forEach(function (e) {
+                var r = el('div', 'url');
+                r.appendChild(el('span', 'rg', e.region));
+                r.appendChild(code(e.stratum));
+                r.appendChild(copyBtn(e.stratum));
+                eps.appendChild(r);
             });
-        });
-        u.appendChild(cp);
-        kv(g, 'Stratum URL', u);
+            kv(g, p._eps.length > 1 ? 'Stratum URLs' : 'Stratum URL', eps);
+        } else {
+            var u = el('div', 'url'); u.appendChild(code(url)); u.appendChild(copyBtn(url));
+            kv(g, 'Stratum URL', u);
+        }
         var user = el('div'); user.appendChild(code('<your DASH address>'));
         user.appendChild(el('span', 'muted', ' or ')); user.appendChild(code('<address>.<worker>'));
         kv(g, 'Username', user);
@@ -434,13 +505,21 @@
         body.appendChild(el('div', 'connect-note',
             'X11 ASIC miners. Every block this chain finds pays its miners directly in the coinbase, '
             + 'in proportion to their recent shares: no account, no withdrawal.'));
+        if (p._eps.length > 1)
+            body.appendChild(el('div', 'connect-note',
+                'Pick the node closest to you. All of them mine the same share chain, '
+                + 'so your payout does not depend on which one you use.'));
+        renderOwnNode(p, body);
     }
     function initConnect() {
         Promise.all(pools.map(function (p) {
             if (p.connect !== true || typeof p.stratum === 'string') return Promise.resolve(null);
             return get('/api/' + p.id, '/node_info').catch(function () { return null; });
         })).then(function (infos) {
-            pools.forEach(function (p, i) { p._stratum = stratumOf(p, infos[i]); });
+            pools.forEach(function (p, i) {
+                p._eps = endpointsOf(p);
+                p._stratum = p._eps.length ? p._eps[0].stratum : stratumOf(p, infos[i]);
+            });
             pools.forEach(renderConnect);
         });
     }

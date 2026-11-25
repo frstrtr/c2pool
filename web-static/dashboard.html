@@ -3653,7 +3653,62 @@
             } else {
                 document.getElementById('miner-url').textContent = 'unavailable';
             }
+            c2pDeploymentConnect();
         });
+
+        // A multi-pool deployment (/api/pools, e.g. the dual view's proxy) may
+        // publish, per chain, its stratum endpoints by region and its share
+        // chain identity. On such a page the Miner Configuration panel lists
+        // every endpoint (pick the closest) and how to run your own node.
+        // Without that entry the panel stays exactly as above.
+        function c2pDeploymentConnect() {
+            var m = /^\/api\/([a-z0-9_-]{1,32})$/.exec(String(window.multipoolApiBase || ''));
+            if (!m || !window.fetch || window.__c2pDeployConnect) return;
+            window.__c2pDeployConnect = true;
+            fetch('/api/pools').then(function(r) { return r.ok ? r.json() : null; }).then(function(pools) {
+                var p = Array.isArray(pools) && pools.filter(function(q) { return q && q.id === m[1]; })[0];
+                if (!p) return;
+                var SRE = /^stratum\+(tcp|ssl):\/\/[A-Za-z0-9.-]{1,253}:[0-9]{1,5}$/;
+                var RRE = /^[A-Za-z0-9 .()-]{1,24}$/, HEX = /^[0-9a-f]{16}$/, HP = /^[A-Za-z0-9.-]{1,253}:[0-9]{1,5}$/;
+                var eps = (Array.isArray(p.endpoints) ? p.endpoints : []).filter(function(e) {
+                    return e && RRE.test(String(e.region)) && SRE.test(String(e.stratum));
+                }).slice(0, 8);
+                var mu = document.getElementById('miner-url');
+                if (eps.length && mu) {
+                    mu.textContent = '';
+                    eps.forEach(function(e, i) {
+                        if (i) mu.appendChild(document.createTextNode('  |  '));
+                        var b = document.createElement('strong'); b.textContent = e.region + ' ';
+                        mu.appendChild(b); mu.appendChild(document.createTextNode(e.stratum));
+                    });
+                    if (eps.length > 1) {
+                        var hint = document.createElement('div');
+                        hint.style.cssText = 'margin-top:3px;color:#888;';
+                        hint.textContent = 'Pick the node closest to you; all mine the same share chain.';
+                        mu.parentNode.appendChild(hint);
+                    }
+                }
+                var s = p.share_chain, box = document.getElementById('miner-info');
+                if (box && s && HEX.test(String(s.network_id)) && HEX.test(String(s.prefix))) {
+                    var adds = (Array.isArray(s.addnodes) ? s.addnodes : []).filter(function(a) { return HP.test(String(a)); }).slice(0, 8);
+                    var own = document.createElement('div');
+                    own.style.cssText = 'font-size:0.8rem;margin-top:6px;';
+                    var t = document.createElement('div');
+                    t.textContent = 'Own node (your fee, your rules): network-id ' + s.network_id + ', prefix ' + s.prefix
+                        + (s['default'] === true ? ' (default p2pool-dash identity: no flags needed)' : '');
+                    var c = document.createElement('code');
+                    c.style.cssText = 'display:block;white-space:pre-wrap;word-break:break-all;margin-top:3px;';
+                    c.textContent = 'c2pool-dash --run --embedded-mainnet --embedded-utxo'
+                        + (s['default'] === true ? '' : ' --network-id ' + s.network_id + ' --prefix ' + s.prefix)
+                        + adds.map(function(a) { return ' --addnode ' + a; }).join('') + ' --fee <percent>';
+                    var a = document.createElement('a');
+                    a.href = 'https://github.com/frstrtr/c2pool/releases'; a.target = '_blank'; a.rel = 'noopener';
+                    a.textContent = 'Download c2pool →';
+                    own.appendChild(t); own.appendChild(c); own.appendChild(a);
+                    box.appendChild(own);
+                }
+            }).catch(function() { /* no deployment config: keep the default panel */ });
+        }
         
         function loadStats() {
             // Fetch all stats in parallel instead of nested sequential requests.
