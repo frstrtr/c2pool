@@ -720,6 +720,21 @@ public:
         return m_peers.size();
     }
 
+    /// The working set's publicly routable addresses (display: the
+    /// dashboard's idle peer rows; a private, loopback or local address --
+    /// a configured LAN peer -- is never listed).
+    std::vector<std::string> working_set_keys() const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        std::vector<std::string> keys;
+        keys.reserve(m_peers.size());
+        for (const auto& [key, peer] : m_peers) {
+            if (!is_routable(peer.address.address())) continue;
+            keys.push_back(key);
+        }
+        return keys;
+    }
+
     /// Counts of tried vs new peers, and unique network groups.
     struct PeerStats {
         int total{0};

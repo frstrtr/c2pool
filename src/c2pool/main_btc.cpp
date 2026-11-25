@@ -3242,7 +3242,7 @@ int main(int argc, char* argv[])
         // + its version-advertised peer tip, plus the single embedded P2P
         // peer's startingheight. Captured objects are main-scope and outlive
         // ioc.run(); all reads are display-only.
-        mi->set_coin_sync_status_fn([&header_chain, &coin_node]() -> nlohmann::json {
+        mi->set_coin_sync_status_fn([&header_chain, &coin_node, &coin_peer_mgr]() -> nlohmann::json {
             nlohmann::json s = nlohmann::json::object();
             const uint32_t hh = header_chain.height();
             uint32_t th = header_chain.peer_tip_height();
@@ -3251,12 +3251,26 @@ int main(int argc, char* argv[])
             if (p2p != nullptr && p2p->peer_version() > 0) {
                 const uint32_t sh = p2p->peer_start_height();
                 if (sh > th) th = sh;
+                // A private, loopback or local peer (a configured LAN node)
+                // is shown as "private", never by its address.
+                const bool live_public = is_routable(p2p->peer_service().address());
                 peers.push_back({
+                    {"addr", live_public ? p2p->peer_address() : std::string("private")},
                     {"subver", p2p->peer_subver()},
                     {"startingheight", sh},
                     {"conntime", p2p->peer_uptime_sec()},
                     {"connected", true},
                 });
+            }
+            // The coin peer manager's other candidates, as idle rows (the
+            // dashboard's "Known peers" counts connected + idle).
+            if (coin_peer_mgr) {
+                const std::string live = (p2p != nullptr && p2p->peer_version() > 0)
+                    ? p2p->peer_address() : std::string();
+                for (const auto& key : coin_peer_mgr->working_set_keys()) {
+                    if (key == live) continue;
+                    peers.push_back({{"addr", key}, {"connected", false}});
+                }
             }
             s["header_height"] = hh;
             s["target_height"] = th;
