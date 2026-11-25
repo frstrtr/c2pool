@@ -39,6 +39,7 @@ public:
     StratumTlsContext() : ssl(net::ssl::context::tls_server) {}
     net::ssl::context ssl;
     std::string description;
+    std::optional<std::string> validity_problem;   // "expired" / "not yet valid"
 };
 
 struct StratumStream::Tls {
@@ -95,11 +96,18 @@ std::string describe_certificate(SSL_CTX* h)
         }
         BIO_free(bio);
     }
-    if (X509_cmp_current_time(X509_get0_notAfter(x)) <= 0)
-        out += " (EXPIRED)";
-    else if (X509_cmp_current_time(X509_get0_notBefore(x)) > 0)
-        out += " (NOT YET VALID)";
     return out;
+}
+
+std::optional<std::string> certificate_validity_problem(SSL_CTX* h)
+{
+    X509* x = SSL_CTX_get0_certificate(h);
+    if (!x) return std::nullopt;
+    if (X509_cmp_current_time(X509_get0_notAfter(x)) <= 0)
+        return std::string("expired");
+    if (X509_cmp_current_time(X509_get0_notBefore(x)) > 0)
+        return std::string("not yet valid");
+    return std::nullopt;
 }
 
 }  // namespace
@@ -140,6 +148,8 @@ std::shared_ptr<StratumTlsContext> load_stratum_tls_context(const std::string& c
 #endif
     SSL_CTX_set_options(h, opts);
     SSL_CTX_set_session_cache_mode(h, SSL_SESS_CACHE_OFF);
+    // Idle connections (a rig between shares) hold no read/write buffers.
+    SSL_CTX_set_mode(h, SSL_MODE_RELEASE_BUFFERS);
 #if OPENSSL_VERSION_NUMBER >= 0x10101000L
     SSL_CTX_set_num_tickets(h, 0);
 #endif
@@ -167,10 +177,20 @@ std::shared_ptr<StratumTlsContext> load_stratum_tls_context(const std::string& c
         return nullptr;
     }
     c->description = describe_certificate(h);
+    c->validity_problem = certificate_validity_problem(h);
+    if (c->validity_problem)
+        c->description += " (" + *c->validity_problem + ")";
     return c;
 }
 
 std::string describe_stratum_tls_context(const StratumTlsContext& ctx) { return ctx.description; }
+
+std::optional<std::string> stratum_tls_validity_problem(const StratumTlsContext& ctx)
+{
+    return ctx.validity_problem;
+}
+
+void* stratum_tls_native_context(StratumTlsContext& ctx) { return ctx.ssl.native_handle(); }
 
 StratumStream::StratumStream(tcp::socket socket, std::shared_ptr<StratumTlsContext> tls)
     : socket_(std::move(socket))
@@ -216,6 +236,10 @@ std::shared_ptr<StratumTlsContext> load_stratum_tls_context(const std::string&, 
 
 std::string describe_stratum_tls_context(const StratumTlsContext&) { return {}; }
 
+std::optional<std::string> stratum_tls_validity_problem(const StratumTlsContext&) { return std::nullopt; }
+
+void* stratum_tls_native_context(StratumTlsContext&) { return nullptr; }
+
 StratumStream::StratumStream(tcp::socket socket, std::shared_ptr<StratumTlsContext>)
     : socket_(std::move(socket))
 {
@@ -243,6 +267,28 @@ void StratumStream::tls_write_some(net::const_buffer, IoHandler handler)
 #endif  // C2POOL_STRATUM_TLS
 
 StratumStream::~StratumStream() = default;
+
+std::optional<std::string> stratum_tls_key_permissions_problem(const std::string& key)
+{
+#ifdef _WIN32
+    (void)key;
+    return std::nullopt;
+#else
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const auto perms = fs::status(key, ec).permissions();
+    if (ec || perms == fs::perms::unknown)
+        return std::nullopt;
+    const auto open = perms & (fs::perms::group_read | fs::perms::group_write | fs::perms::others_read
+                               | fs::perms::others_write);
+    if (open == fs::perms::none)
+        return std::nullopt;
+    char mode[8];
+    std::snprintf(mode, sizeof(mode), "%03o", static_cast<unsigned>(perms) & 0777u);
+    return "the private key " + key + " is readable or writable by its group or by others (mode "
+         + mode + "); chmod 600 it";
+#endif
+}
 
 std::optional<std::string> check_stratum_tls_settings(const StratumTlsSettings& s, bool supported)
 {
@@ -327,10 +373,13 @@ std::shared_ptr<StratumTlsContext> StratumTlsCertStore::current()
     if (now == last_)
         return ctx_;
     std::string error;
-    if (reload_locked(now, error))
+    if (reload_locked(now, error)) {
         LOG_INFO << "stratum TLS: " << cert_ << " / " << key_ << " changed: reloaded ("
                  << describe_stratum_tls_context(*ctx_) << "); new connections use it";
-    else
+        if (auto problem = stratum_tls_validity_problem(*ctx_))
+            LOG_WARNING << "stratum TLS: the certificate " << cert_ << " is " << *problem
+                        << "; miners that verify it will refuse it";
+    } else
         LOG_WARNING << "stratum TLS: " << cert_ << " / " << key_ << " changed but did not load ("
                     << error << "); new connections keep the certificate loaded before";
     return ctx_;

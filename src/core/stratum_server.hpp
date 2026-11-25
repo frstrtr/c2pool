@@ -332,6 +332,9 @@ private:
     boost::asio::steady_timer tls_handshake_timer_;
     bool tls_handshake_done_ = false;
     bool tls_handshake_timed_out_ = false;
+    // The TLS listener's in-flight handshake slot (StratumTlsHandshakeGate):
+    // held from the accept until the handshake ends.
+    std::shared_ptr<void> tls_handshake_slot_;
 
     // A held job (CoinbaseResult::held): one pending retry per session, for
     // at most StratumConfig::job_hold_limit_sec since the hold began; past it
@@ -368,6 +371,10 @@ public:
 
     bool is_connected() const { return socket_.is_open(); }
     bool is_tls() const { return socket_.is_tls(); }
+    /// The TLS listener's in-flight handshake slot for this connection: held
+    /// until the TLS handshake ends (whatever the outcome) or the session
+    /// goes. Set before start().
+    void hold_tls_handshake_slot(std::shared_ptr<void> slot) { tls_handshake_slot_ = std::move(slot); }
     bool is_subscribed() const { return subscribed_; }
     bool is_authorized() const { return authorized_; }
     // Seconds since the last inbound stratum line (zombie-session reaper).
@@ -568,6 +575,7 @@ class StratumServer
     RefusalLogLimiter per_ip_refusal_log_;
     RefusalLogLimiter http_budget_refusal_log_;
     RefusalLogLimiter http_share_refusal_log_;
+    RefusalLogLimiter tls_refusal_log_;   // TLS accepts over the rate / handshake limits
     boost::asio::steady_timer refusal_log_timer_;
     std::optional<RefusalLogLimiter::clock::time_point> refusal_log_timer_due_;   // armed for
     std::atomic<uint64_t> refusal_lines_logged_{0};
@@ -733,6 +741,14 @@ public:
         std::string cert_file;      // PEM, the full chain
         std::string key_file;       // PEM
         std::chrono::milliseconds handshake_timeout = kStratumTlsHandshakeTimeout;
+        // Accepts before the handshake (StratumTlsAcceptLimiter,
+        // StratumTlsHandshakeGate); 0 = no limit.
+        double accept_rate = kStratumTlsAcceptRate;
+        double accept_burst = kStratumTlsAcceptBurst;
+        double accept_rate_per_ip = kStratumTlsAcceptRatePerIp;
+        double accept_burst_per_ip = kStratumTlsAcceptBurstPerIp;
+        std::size_t max_handshakes = kStratumTlsMaxHandshakes;
+        std::size_t max_handshakes_per_ip = kStratumTlsMaxHandshakesPerIp;
     };
     /// Open the TLS listener. Call after start(), on the io thread or before
     /// it runs, at most once. false and `error` set when this build has no
@@ -753,12 +769,28 @@ public:
     uint64_t get_tls_reloads() const;
     uint64_t get_tls_reload_failures() const;
     /// TLS handshakes completed / failed (or timed out) since start_tls().
+    /// A connection closed by stop() or reaped during its handshake is
+    /// neither.
     uint64_t get_tls_handshakes() const;
     uint64_t get_tls_handshake_failures() const;
+    /// Failed-handshake log lines written (one per minute at most, full or
+    /// summary).
+    uint64_t get_tls_handshake_log_lines() const;
+    /// TLS accepts closed before the handshake: over the accept rate, over
+    /// one address's accept rate, over the handshakes in progress (total or
+    /// one address's).
+    uint64_t get_tls_refused_rate() const;
+    uint64_t get_tls_refused_rate_per_ip() const;
+    uint64_t get_tls_refused_handshakes() const;
+    /// TLS handshakes in progress now.
+    std::size_t get_tls_handshakes_in_progress() const;
     std::chrono::milliseconds tls_handshake_timeout() const;
     /// The certificate new TLS connections get ("subject /CN=..., valid until
     /// ..."; "" when the listener is not open).
     std::string get_tls_certificate_summary() const;
+    /// "expired" / "not yet valid" for that certificate; nullopt when it is
+    /// within its validity period (or the listener is not open).
+    std::optional<std::string> get_tls_certificate_validity_problem() const;
     /// A session's TLS handshake ended: counted; a failure is logged at most
     /// once a minute (the others are counted into the next line). Call on the
     /// io thread.
@@ -770,7 +802,7 @@ private:
     // The admission path both listeners share (drain gate, node cap, per-IP
     // cap); `tls` non-null makes the session a TLS one.
     void admit(boost::system::error_code ec, tcp::socket socket,
-               std::shared_ptr<StratumTlsContext> tls);
+               std::shared_ptr<StratumTlsContext> tls, std::shared_ptr<void> tls_slot = nullptr);
 
     struct TlsListener;
     std::unique_ptr<TlsListener> tls_;

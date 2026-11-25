@@ -19,6 +19,14 @@
 // - A TLS handshake that does not complete within the handshake timeout
 //   (10 s) closes the connection, as does a failed one (a plaintext client
 //   on the TLS port); failures are counted and logged at most once a minute.
+// - A handshake costs the server CPU on the stratum io thread, and a client
+//   can open connections faster than the connection caps see them (each one
+//   closes after its failed handshake). New TLS connections are therefore
+//   limited before the handshake: a token bucket for all addresses and one
+//   per address (IPv6: per /64), and a bound on handshakes in progress, in
+//   total and per address. Over any of them the connection is closed at the
+//   accept, counted, and logged rate-limited. The plain listener is not
+//   affected.
 // - HTTP on the stratum port (--stratum-http) is served on the plain listener
 //   only: on a TLS connection an HTTP request line is an invalid stratum line.
 //
@@ -27,9 +35,12 @@
 // are refused.
 #pragma once
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <iterator>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -39,6 +50,7 @@
 
 #include <boost/asio/any_completion_handler.hpp>
 #include <boost/asio/buffer.hpp>
+#include <boost/asio/ip/address.hpp>
 #include <boost/asio/ip/tcp.hpp>
 
 namespace core {
@@ -64,6 +76,158 @@ inline StratumTlsSettings& stratum_tls_setting()
 /// A TLS connection whose handshake has not completed this long after the
 /// accept is closed (StratumServer::TlsOptions::handshake_timeout).
 inline constexpr std::chrono::milliseconds kStratumTlsHandshakeTimeout{10000};
+
+/// New TLS connections a second, from all addresses (token bucket rate), and
+/// the bucket size: at most kStratumTlsAcceptBurst at once after a quiet
+/// spell. 0 = no limit.
+inline constexpr double kStratumTlsAcceptRate = 200.0;
+inline constexpr double kStratumTlsAcceptBurst = 400.0;
+/// The same from one address (IPv4 address, IPv6 /64: per_ip_cap_key). The
+/// burst lets a farm behind one NAT reconnect 20 rigs at once.
+inline constexpr double kStratumTlsAcceptRatePerIp = 5.0;
+inline constexpr double kStratumTlsAcceptBurstPerIp = 20.0;
+/// TLS handshakes in progress at once, in total and from one address (an
+/// accept over either is closed). Separate from max_stratum_connections.
+/// 0 = no limit.
+inline constexpr std::size_t kStratumTlsMaxHandshakes = 32;
+inline constexpr std::size_t kStratumTlsMaxHandshakesPerIp = 8;
+
+/// A token bucket: `rate` tokens a second, at most `burst` held (it starts
+/// full). rate <= 0: every take() succeeds. Not thread-safe.
+class StratumTlsTokenBucket {
+public:
+    using clock = std::chrono::steady_clock;
+    StratumTlsTokenBucket(double rate, double burst, clock::time_point now)
+        : rate_(rate), burst_(std::max(burst, 1.0)), tokens_(std::max(burst, 1.0)), last_(now) {}
+    /// A token is there now.
+    bool ready(clock::time_point now)
+    {
+        refill(now);
+        return rate_ <= 0 || tokens_ >= 1.0;
+    }
+    /// Spend one token (call after ready()).
+    void take()
+    {
+        if (rate_ > 0) tokens_ -= 1.0;
+    }
+    /// Refilled to the brim: nothing to remember about this bucket.
+    bool full(clock::time_point now)
+    {
+        refill(now);
+        return rate_ <= 0 || tokens_ >= burst_;
+    }
+
+private:
+    void refill(clock::time_point now)
+    {
+        if (rate_ <= 0 || now <= last_) return;
+        tokens_ = std::min(burst_, tokens_ + rate_ * std::chrono::duration<double>(now - last_).count());
+        last_ = now;
+    }
+    double rate_, burst_, tokens_;
+    clock::time_point last_;
+};
+
+/// The accept rate limit of the TLS listener: one bucket for all addresses
+/// and one per key (per_ip_cap_key of the remote address). An accept takes a
+/// token from both or from neither. A refused accept never adds a key, so the
+/// per-key map grows at most at the global rate; keys whose bucket is full
+/// again are pruned. Not thread-safe (the stratum io thread).
+class StratumTlsAcceptLimiter {
+public:
+    using clock = std::chrono::steady_clock;
+    using address = boost::asio::ip::address;
+    enum class Verdict { Admit, Rate, RatePerIp };
+
+    StratumTlsAcceptLimiter(double rate, double burst, double per_ip_rate, double per_ip_burst,
+                            clock::time_point now = clock::now())
+        : global_(rate, burst, now), per_ip_rate_(per_ip_rate), per_ip_burst_(per_ip_burst) {}
+
+    Verdict admit(const address& key, clock::time_point now)
+    {
+        if (!global_.ready(now))
+            return Verdict::Rate;
+        auto it = per_key_.find(key);
+        if (it == per_key_.end()) {
+            prune(now);
+            it = per_key_.emplace(key, StratumTlsTokenBucket(per_ip_rate_, per_ip_burst_, now)).first;
+        }
+        if (!it->second.ready(now))
+            return Verdict::RatePerIp;
+        global_.take();
+        it->second.take();
+        return Verdict::Admit;
+    }
+    std::size_t keys() const { return per_key_.size(); }
+
+private:
+    // At most once a second, and only past kPruneAt keys: drop the buckets
+    // that are full again (their key has been quiet for burst/rate seconds).
+    void prune(clock::time_point now)
+    {
+        static constexpr std::size_t kPruneAt = 1024;
+        if (per_key_.size() < kPruneAt || now - last_prune_ < std::chrono::seconds(1))
+            return;
+        last_prune_ = now;
+        for (auto it = per_key_.begin(); it != per_key_.end();)
+            it = it->second.full(now) ? per_key_.erase(it) : std::next(it);
+    }
+    StratumTlsTokenBucket global_;
+    double per_ip_rate_, per_ip_burst_;
+    std::map<address, StratumTlsTokenBucket> per_key_;
+    clock::time_point last_prune_{};
+};
+
+/// Handshakes in progress on the TLS listener, in total and per key. A slot
+/// is held from the accept until the session's handshake ends (or the
+/// session goes); the counts live in shared state, so a slot may outlive the
+/// gate. Thread-safe.
+class StratumTlsHandshakeGate {
+public:
+    using address = boost::asio::ip::address;
+    StratumTlsHandshakeGate() : state_(std::make_shared<State>()) {}
+
+    /// A slot for one handshake from `key`, or nullptr when `max_total` are
+    /// in progress or `max_per_key` from `key` (0: no limit). Released when
+    /// its last copy goes.
+    std::shared_ptr<void> try_acquire(const address& key, std::size_t max_total, std::size_t max_per_key)
+    {
+        std::lock_guard<std::mutex> lk(state_->mutex);
+        if (max_total > 0 && state_->total >= max_total)
+            return nullptr;
+        auto& n = state_->per_key[key];   // a new key starts at 0 and is admitted
+        if (max_per_key > 0 && n >= max_per_key)
+            return nullptr;
+        ++n;
+        ++state_->total;
+        return std::shared_ptr<void>(static_cast<void*>(state_.get()), [st = state_, key](void*) {
+            std::lock_guard<std::mutex> lk(st->mutex);
+            --st->total;
+            auto it = st->per_key.find(key);
+            if (it != st->per_key.end() && --it->second == 0)
+                st->per_key.erase(it);
+        });
+    }
+    std::size_t in_progress() const
+    {
+        std::lock_guard<std::mutex> lk(state_->mutex);
+        return state_->total;
+    }
+    std::size_t in_progress_from(const address& key) const
+    {
+        std::lock_guard<std::mutex> lk(state_->mutex);
+        auto it = state_->per_key.find(key);
+        return it == state_->per_key.end() ? 0 : it->second;
+    }
+
+private:
+    struct State {
+        std::mutex mutex;
+        std::size_t total = 0;
+        std::map<address, std::size_t> per_key;
+    };
+    std::shared_ptr<State> state_;
+};
 
 /// This build has the TLS listener (OpenSSL linked, C2POOL_STRATUM_TLS).
 bool stratum_tls_supported();
@@ -124,6 +288,17 @@ std::shared_ptr<StratumTlsContext> load_stratum_tls_context(const std::string& c
 
 /// "subject /CN=pool.example, valid until Feb  1 12:00:00 2027 GMT".
 std::string describe_stratum_tls_context(const StratumTlsContext& ctx);
+
+/// "expired" / "not yet valid" when the certificate is outside its validity
+/// period now (it still loads; the caller warns); nullopt when within it.
+std::optional<std::string> stratum_tls_validity_problem(const StratumTlsContext& ctx);
+
+/// A warning text when `key` can be read by its group or by others (POSIX
+/// permissions); nullopt when not, or the permissions cannot be read.
+std::optional<std::string> stratum_tls_key_permissions_problem(const std::string& key);
+
+/// Test access: the context's OpenSSL SSL_CTX* (nullptr without TLS).
+void* stratum_tls_native_context(StratumTlsContext& ctx);
 
 /// The certificate and key a TLS listener hands to new connections, re-read
 /// when either file changes. Thread-safe.
