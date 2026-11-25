@@ -486,6 +486,11 @@
                 r.appendChild(el('span', 'rg', e.region));
                 r.appendChild(code(e.stratum));
                 r.appendChild(copyBtn(e.stratum));
+                if (typeof e.dashboard === 'string' && /^\/api\/[a-z0-9_-]{1,32}$/.test(e.dashboard)) {
+                    var d = el('a', 'muted', 'dashboard ↗');
+                    d.href = 'dashboard.html?api=' + encodeURIComponent(e.dashboard);
+                    r.appendChild(d);
+                }
                 eps.appendChild(r);
             });
             kv(g, p._eps.length > 1 ? 'Stratum URLs' : 'Stratum URL', eps);

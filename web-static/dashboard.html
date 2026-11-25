@@ -3680,6 +3680,12 @@
                         if (i) mu.appendChild(document.createTextNode('  |  '));
                         var b = document.createElement('strong'); b.textContent = e.region + ' ';
                         mu.appendChild(b); mu.appendChild(document.createTextNode(e.stratum));
+                        if (/^\/api\/[a-z0-9_-]{1,32}$/.test(String(e.dashboard)) && e.dashboard !== window.multipoolApiBase) {
+                            var dl = document.createElement('a');
+                            dl.href = 'dashboard.html?api=' + encodeURIComponent(e.dashboard);
+                            dl.textContent = ' (dashboard)';
+                            mu.appendChild(dl);
+                        }
                     });
                     if (eps.length > 1) {
                         var hint = document.createElement('div');
