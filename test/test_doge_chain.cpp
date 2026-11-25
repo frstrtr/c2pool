@@ -8,14 +8,26 @@
 ///   4. HeaderChain basics (genesis, locator, sync gate, AuxPoW PoW skip)
 ///   5. AuxPoW header parser
 ///   6. Block version derivation
+///   7. HeaderChain: the genesis header is accepted only into a store with no tip
 
 #include <gtest/gtest.h>
 
 #include <impl/doge/coin/chain_params.hpp>
 #include <impl/doge/coin/header_chain.hpp>
+#include <impl/doge/coin/header_sync.hpp>
+#include <core/leveldb_store.hpp>
 #include <impl/doge/coin/template_builder.hpp>
 #include <impl/doge/coin/auxpow_header.hpp>
 #include <impl/doge/coin/aux_block_assembler.hpp>
+
+#include <ctime>
+#include <deque>
+#include <filesystem>
+#include <iostream>
+#include <map>
+#include <random>
+#include <string>
+#include <vector>
 
 using namespace doge::coin;
 
@@ -1043,4 +1055,419 @@ TEST(DOGEAuxBlockAssemblerTest, FactoryClosureShape) {
     // Null provider -> nullopt.
     doge::coin::AuxDogeBlockAssembler empty = doge::coin::make_doge_aux_block_assembler({});
     EXPECT_FALSE(empty(win, "deadbeef").has_value());
+}
+
+// ─── The genesis header and a store with no tip ────────────────────────────
+//
+// The genesis header is accepted only while the store has no tip. A store
+// with a tip (a checkpoint root, then headers above it) keeps its tip, height
+// and best work.
+
+namespace {
+
+constexpr uint32_t kDogeEasyBits = 0x207fffff;
+
+/// Headers by height: mainnet's parameters (no AuxPoW, no DigiShield at these
+/// heights) with the most permissive PoW limit and a genesis at it;
+/// timestamps years old up to the checkpoint, within the last hour above it.
+/// getheaders returns heights up to `served`.
+struct HonestDogeChain {
+    DOGEChainParams params = DOGEChainParams::mainnet();
+    std::vector<BlockHeaderType> headers;  // by height
+    std::map<uint256, uint32_t> height_of;
+    uint32_t cp;
+    uint32_t served;
+
+    HonestDogeChain(uint32_t cp_height, uint32_t top, uint32_t served_top)
+        : cp(cp_height), served(served_top)
+    {
+        params.pow_limit.SetCompact(kDogeEasyBits);
+        BlockHeaderType g;
+        g.m_version = 1;
+        g.m_previous_block.SetNull();
+        g.m_merkle_root.SetHex("5b2a3f53f605d62c53e62932dac6925e3d74afa5a4b459745c36d42d0ed26a69");
+        g.m_timestamp = 1386325540;
+        g.m_bits = kDogeEasyBits;
+        g.m_nonce = 0;
+        params.genesis_hash = block_hash(g);
+        headers.push_back(g);
+        height_of[params.genesis_hash] = 0;
+        const uint32_t now = static_cast<uint32_t>(std::time(nullptr));
+        for (uint32_t h = 1; h <= top; ++h) {
+            BlockHeaderType x;
+            x.m_version = 1;
+            x.m_previous_block = block_hash(headers.back());
+            x.m_merkle_root.SetHex(std::to_string(6000 + h));
+            x.m_timestamp = h <= cp ? g.m_timestamp + 60 * h : now - 60 - 60 * (top - h);
+            x.m_bits = kDogeEasyBits;
+            x.m_nonce = h << 16;
+            while (!check_pow(scrypt_hash(x), x.m_bits, params.pow_limit))
+                ++x.m_nonce;
+            height_of[block_hash(x)] = h;
+            headers.push_back(x);
+        }
+    }
+
+    const BlockHeaderType& at(uint32_t h) const { return headers.at(h); }
+    uint256 hash(uint32_t h) const { return block_hash(headers.at(h)); }
+    std::string checkpoint() const { return std::to_string(cp) + ":" + hash(cp).GetHex(); }
+
+    /// getheaders as Dogecoin Core answers it: the headers after the first
+    /// locator hash on this chain (none on it: after genesis), at most `max`.
+    std::vector<BlockHeaderType> getheaders(const std::vector<uint256>& locator, size_t max) const
+    {
+        if (locator.empty())
+            return {};
+        uint32_t from = 0;
+        for (const auto& l : locator) {
+            auto it = height_of.find(l);
+            if (it != height_of.end() && it->second <= served) {
+                from = it->second;
+                break;
+            }
+        }
+        std::vector<BlockHeaderType> out;
+        for (uint32_t h = from + 1; h <= served && out.size() < max; ++h)
+            out.push_back(headers[h]);
+        return out;
+    }
+
+    std::string name(const uint256& h) const
+    {
+        auto it = height_of.find(h);
+        if (it == height_of.end())
+            return "(unknown)";
+        if (it->second == 0)
+            return "genesis";
+        return "h" + std::to_string(it->second) + (it->second == cp ? " (checkpoint)" : "");
+    }
+};
+
+/// Headers per getheaders answer in these tests (Core: 2,000).
+constexpr size_t kDogePeerBatch = 8;
+
+/// A DOGE header chain fed as main_ltc's DOGE headers handler feeds it on the
+/// header chain's route: add_headers, then a getheaders from the chain's
+/// locator when the batch had new headers (doge::coin::headers_follow_up);
+/// the periodic getheaders uses the chain's locator. Each getheaders is
+/// answered from HonestDogeChain.
+struct DogeNode {
+    HeaderChain chain;
+    std::deque<std::vector<uint256>> asks;  // the locators of the getheaders sent
+
+    DogeNode(const DOGEChainParams& p, const std::string& db) : chain(p, db) {}
+
+    void on_headers(const std::vector<BlockHeaderType>& hdrs)
+    {
+        const int accepted = chain.add_headers(hdrs);
+        if (doge::coin::headers_follow_up(accepted) == doge::coin::HeadersFollowUp::AskSender)
+            asks.push_back(chain.get_locator());
+    }
+
+    /// Every getheaders sent, and the ones they lead to, answered from `net`.
+    void answer(const HonestDogeChain& net)
+    {
+        for (int guard = 0; guard < 1000; ++guard) {
+            if (asks.empty())
+                return;
+            const auto loc = asks.front();
+            asks.pop_front();
+            on_headers(net.getheaders(loc, kDogePeerBatch));
+        }
+        ADD_FAILURE() << "the header sync did not settle";
+    }
+
+    /// Two ticks of the periodic getheaders, each answered.
+    void poll(const HonestDogeChain& net)
+    {
+        for (int i = 0; i < 2; ++i) {
+            asks.push_back(chain.get_locator());
+            answer(net);
+        }
+    }
+};
+
+/// The step's state, printed; then its tip, height, best work and "synced"
+/// checked, and that no genesis entry was stored.
+void expect_doge_tip(const HeaderChain& chain, const HonestDogeChain& net, const std::string& step,
+                     uint32_t height, const uint256& work)
+{
+    const auto tip = chain.tip();
+    const bool synced = chain.is_synced();
+    std::cout << "[ doge genesis ] " << step << ": tip=" << (tip ? net.name(tip->block_hash) : "(none)")
+              << " height=" << chain.height() << " best_work=" << chain.cumulative_work().GetLow64()
+              << " synced=" << synced << " genesis_stored=" << chain.has_header(net.hash(0))
+              << " size=" << chain.size() << std::endl;
+    ASSERT_TRUE(tip.has_value()) << step;
+    EXPECT_EQ(tip->block_hash, net.hash(height)) << step << ": the tip is " << net.name(tip->block_hash);
+    EXPECT_EQ(chain.height(), height) << step;
+    EXPECT_EQ(chain.cumulative_work(), work) << step;
+    EXPECT_TRUE(synced) << step;
+    EXPECT_FALSE(chain.has_header(net.hash(0))) << step << ": a genesis entry was stored";
+}
+
+struct DogeTempDir {
+    std::filesystem::path dir;
+    DogeTempDir()
+    {
+        std::mt19937_64 rng(std::random_device{}());
+        dir = std::filesystem::temp_directory_path() / ("doge_genesis_store_" + std::to_string(rng()));
+    }
+    ~DogeTempDir()
+    {
+        std::error_code ec;
+        std::filesystem::remove_all(dir, ec);
+    }
+};
+
+} // namespace
+
+// An empty store accepts the genesis header and extends from it: through
+// start_doge_chain with no checkpoint, and from a batch.
+TEST(DogeGenesisHeader, AnEmptyStoreStartsFromIt)
+{
+    HonestDogeChain net(40, 43, 43);
+    const uint256 proof = get_block_proof(kDogeEasyBits);
+    {
+        HeaderChain chain(net.params);
+        ASSERT_TRUE(chain.init());
+        ASSERT_EQ(chain.size(), 0u);
+        doge::coin::start_doge_chain(chain, std::string(), net.at(0));
+        ASSERT_TRUE(chain.tip().has_value());
+        EXPECT_EQ(chain.tip()->block_hash, net.hash(0));
+        EXPECT_EQ(chain.height(), 0u);
+        EXPECT_EQ(chain.cumulative_work(), proof);
+        EXPECT_EQ(chain.add_headers({net.at(1), net.at(2), net.at(3)}), 3);
+        EXPECT_EQ(chain.height(), 3u);
+    }
+    HeaderChain chain(net.params);
+    ASSERT_TRUE(chain.init());
+    EXPECT_EQ(chain.add_headers({net.at(0), net.at(1)}), 2);
+    EXPECT_EQ(chain.height(), 1u);
+}
+
+// A store with a tip (the checkpoint root alone, or with headers above it)
+// refuses the genesis header, alone or in a batch; its tip, height and best
+// work are unchanged and it extends from its tip.
+TEST(DogeGenesisHeader, AnAnchoredStoreRefusesIt)
+{
+    HonestDogeChain net(40, 46, 46);
+    {
+        HeaderChain chain(net.params);
+        ASSERT_TRUE(chain.init());
+        doge::coin::start_doge_chain(chain, net.checkpoint(), net.at(0));
+        ASSERT_EQ(chain.height(), net.cp);
+        EXPECT_FALSE(chain.add_header(net.at(0)));
+        EXPECT_EQ(chain.add_headers({net.at(0)}), 0);
+        ASSERT_TRUE(chain.tip().has_value());
+        EXPECT_EQ(chain.tip()->block_hash, net.hash(net.cp));
+        EXPECT_EQ(chain.height(), net.cp);
+        EXPECT_EQ(chain.cumulative_work(), uint256::ONE);
+        EXPECT_FALSE(chain.has_header(net.hash(0)));
+    }
+    HeaderChain chain(net.params);
+    ASSERT_TRUE(chain.init());
+    doge::coin::start_doge_chain(chain, net.checkpoint(), net.at(0));
+    const std::vector<BlockHeaderType> above(net.headers.begin() + 41, net.headers.begin() + 46);
+    ASSERT_EQ(chain.add_headers(above), 5);
+    ASSERT_EQ(chain.height(), 45u);
+    const uint256 work = chain.cumulative_work();
+
+    EXPECT_FALSE(chain.add_header(net.at(0))) << "the genesis header is refused by an anchored store";
+    EXPECT_EQ(chain.add_headers({net.at(0)}), 0);
+    EXPECT_EQ(chain.add_headers({net.at(0), net.at(1)}), 0);
+    ASSERT_TRUE(chain.tip().has_value());
+    EXPECT_EQ(chain.tip()->block_hash, net.hash(45)) << "the tip did not move";
+    EXPECT_EQ(chain.height(), 45u);
+    EXPECT_EQ(chain.cumulative_work(), work);
+    EXPECT_TRUE(chain.is_synced());
+    EXPECT_FALSE(chain.has_header(net.hash(0)));
+    EXPECT_FALSE(chain.has_header(net.hash(1)));
+
+    EXPECT_TRUE(chain.add_header(net.at(46))) << "the chain keeps extending from its tip";
+    EXPECT_EQ(chain.height(), 46u);
+}
+
+// Setup: the checkpoint root at 40, headers 41..50, a synced tip. Steps: the
+// genesis header; getheaders from the locator answered until nothing new
+// comes, and the periodic getheaders; the header at 51; a reload with
+// start_doge_chain; the header at 52. Expected at each step: the tip, height,
+// best work of the anchored chain, extended by each new header; synced.
+TEST(DogeGenesisHeader, AnAnchoredTipHoldsThroughResyncLiveHeaderAndRestart)
+{
+    constexpr uint32_t kCp = 40, kTip = 50;
+    HonestDogeChain net(kCp, kTip + 2, kTip);
+    const uint256 proof = get_block_proof(kDogeEasyBits);
+    DogeTempDir tmp;
+    uint256 w0;
+    {
+        DogeNode node(net.params, tmp.dir.string());
+        ASSERT_TRUE(node.chain.init());
+        doge::coin::start_doge_chain(node.chain, net.checkpoint(), net.at(0));
+        const std::vector<BlockHeaderType> above(net.headers.begin() + kCp + 1, net.headers.begin() + kTip + 1);
+        ASSERT_EQ(node.chain.add_headers(above), static_cast<int>(kTip - kCp));
+        w0 = node.chain.cumulative_work();
+        expect_doge_tip(node.chain, net, "0 anchored", kTip, w0);
+
+        // 1. A headers message with the genesis header.
+        node.on_headers({net.at(0)});
+        expect_doge_tip(node.chain, net, "1 genesis header", kTip, w0);
+
+        // 2. getheaders from the locator, answered until nothing new comes;
+        //    the periodic getheaders.
+        node.answer(net);
+        node.poll(net);
+        expect_doge_tip(node.chain, net, "2 resync", kTip, w0);
+
+        // 3. The header at the tip + 1.
+        net.served = kTip + 1;
+        node.on_headers({net.at(kTip + 1)});
+        node.answer(net);
+        node.poll(net);
+        expect_doge_tip(node.chain, net, "3 live header", kTip + 1, w0 + proof);
+    }
+    // 4. Reload, start_doge_chain, the header at the tip + 1.
+    {
+        DogeNode node(net.params, tmp.dir.string());
+        ASSERT_TRUE(node.chain.init());
+        expect_doge_tip(node.chain, net, "4 reload", kTip + 1, w0 + proof);
+        doge::coin::start_doge_chain(node.chain, net.checkpoint(), net.at(0));
+        node.poll(net);
+        expect_doge_tip(node.chain, net, "4 start", kTip + 1, w0 + proof);
+
+        net.served = kTip + 2;
+        node.on_headers({net.at(kTip + 2)});
+        node.answer(net);
+        expect_doge_tip(node.chain, net, "5 live header after the restart", kTip + 2, w0 + proof + proof);
+    }
+}
+
+// The same setup; the header at the tip + 1 arrives before the getheaders
+// answers. Expected: the tip extends to it and holds after the answers.
+TEST(DogeGenesisHeader, AnAnchoredTipHoldsWhenALiveHeaderComesFirst)
+{
+    constexpr uint32_t kCp = 40, kTip = 50;
+    HonestDogeChain net(kCp, kTip + 1, kTip);
+    const uint256 proof = get_block_proof(kDogeEasyBits);
+    DogeNode node(net.params, "");
+    ASSERT_TRUE(node.chain.init());
+    doge::coin::start_doge_chain(node.chain, net.checkpoint(), net.at(0));
+    const std::vector<BlockHeaderType> above(net.headers.begin() + kCp + 1, net.headers.begin() + kTip + 1);
+    ASSERT_EQ(node.chain.add_headers(above), static_cast<int>(kTip - kCp));
+    const uint256 w0 = node.chain.cumulative_work();
+
+    node.on_headers({net.at(0)});
+    expect_doge_tip(node.chain, net, "T1 genesis header", kTip, w0);
+
+    net.served = kTip + 1;
+    node.on_headers({net.at(kTip + 1)});
+    expect_doge_tip(node.chain, net, "T2 live header before any answer", kTip + 1, w0 + proof);
+
+    node.answer(net);
+    node.poll(net);
+    expect_doge_tip(node.chain, net, "T3 the answers", kTip + 1, w0 + proof);
+}
+
+// The same setup and genesis header, its getheaders answered; then a reload
+// with start_doge_chain, the header at tip + 1 not delivered, the header at
+// tip + 2 delivered alone, the periodic getheaders, the header at tip + 3.
+// Run with 10 and with 5 headers above the checkpoint (one answer is 8).
+// Expected: the tip stays on the anchored chain and reaches tip + 2, then
+// tip + 3.
+TEST(DogeGenesisHeader, AnAnchoredTipHoldsThroughARestartWithAMissedBlock)
+{
+    constexpr uint32_t kCp = 40;
+    const uint256 proof = get_block_proof(kDogeEasyBits);
+    for (const uint32_t top : {kCp + 10u, kCp + 5u}) {
+        const std::string tag = "[" + std::to_string(top - kCp) + " above] ";
+        SCOPED_TRACE(tag);
+        HonestDogeChain net(kCp, top + 3, top);
+        DogeTempDir tmp;
+        uint256 w0;
+        {
+            DogeNode node(net.params, tmp.dir.string());
+            ASSERT_TRUE(node.chain.init());
+            doge::coin::start_doge_chain(node.chain, net.checkpoint(), net.at(0));
+            const std::vector<BlockHeaderType> above(net.headers.begin() + kCp + 1, net.headers.begin() + top + 1);
+            ASSERT_EQ(node.chain.add_headers(above), static_cast<int>(top - kCp));
+            w0 = node.chain.cumulative_work();
+            expect_doge_tip(node.chain, net, tag + "M0 anchored", top, w0);
+
+            node.on_headers({net.at(0)});
+            node.answer(net);
+            node.poll(net);
+            expect_doge_tip(node.chain, net, tag + "M1 genesis header, resync", top, w0);
+        }
+        net.served = top + 1;  // between the two runs
+        {
+            DogeNode node(net.params, tmp.dir.string());
+            ASSERT_TRUE(node.chain.init());
+            expect_doge_tip(node.chain, net, tag + "M2 reload", top, w0);
+            doge::coin::start_doge_chain(node.chain, net.checkpoint(), net.at(0));
+            expect_doge_tip(node.chain, net, tag + "M2 start", top, w0);
+
+            net.served = top + 2;
+            node.on_headers({net.at(top + 2)});
+            node.answer(net);
+            node.poll(net);
+            expect_doge_tip(node.chain, net, tag + "M3 live header at tip + 2", top + 2, w0 + proof + proof);
+            node.poll(net);
+            expect_doge_tip(node.chain, net, tag + "M4 periodic getheaders", top + 2, w0 + proof + proof);
+
+            net.served = top + 3;
+            node.on_headers({net.at(top + 3)});
+            node.answer(net);
+            node.poll(net);
+            expect_doge_tip(node.chain, net, tag + "M5 next live header", top + 3, w0 + proof + proof + proof);
+        }
+    }
+}
+
+// A store loaded with entries but without its "tip" key: started with the
+// checkpoint, the root is the tip and the genesis header is refused; started
+// without a checkpoint, the genesis header is accepted.
+TEST(DogeGenesisHeader, AStoreWithEntriesButNoTip)
+{
+    HonestDogeChain net(40, 45, 45);
+    DogeTempDir tmp;
+    const std::string dir = tmp.dir.string();
+    {
+        HeaderChain chain(net.params, dir);
+        ASSERT_TRUE(chain.init());
+        doge::coin::start_doge_chain(chain, net.checkpoint(), net.at(0));
+        const std::vector<BlockHeaderType> above(net.headers.begin() + 41, net.headers.begin() + 46);
+        ASSERT_EQ(chain.add_headers(above), 5);
+    }
+    auto drop_tip = [&dir]() {
+        core::LevelDBStore db(dir, core::LevelDBOptions{});
+        ASSERT_TRUE(db.open());
+        db.remove("tip");
+        db.remove("height");
+    };
+    drop_tip();
+    {
+        HeaderChain chain(net.params, dir);
+        ASSERT_TRUE(chain.init());
+        ASSERT_FALSE(chain.tip().has_value());
+        ASSERT_EQ(chain.size(), 6u);
+        doge::coin::start_doge_chain(chain, net.checkpoint(), net.at(0));  // the root seeded as the tip
+        EXPECT_EQ(chain.add_headers({net.at(0)}), 0);
+        ASSERT_TRUE(chain.tip().has_value());
+        EXPECT_EQ(chain.tip()->block_hash, net.hash(40));
+        EXPECT_FALSE(chain.has_header(net.hash(0)));
+    }
+    drop_tip();
+    {
+        HeaderChain chain(net.params, dir);
+        ASSERT_TRUE(chain.init());
+        ASSERT_FALSE(chain.tip().has_value());
+        ASSERT_EQ(chain.size(), 6u);
+        doge::coin::start_doge_chain(chain, std::string(), net.at(0));  // not empty: no genesis seed
+        ASSERT_FALSE(chain.tip().has_value());
+        EXPECT_EQ(chain.add_headers({net.at(0)}), 1);
+        ASSERT_TRUE(chain.tip().has_value());
+        EXPECT_EQ(chain.tip()->block_hash, net.hash(0));
+        EXPECT_EQ(chain.height(), 0u);
+        EXPECT_EQ(chain.size(), 7u);
+    }
 }

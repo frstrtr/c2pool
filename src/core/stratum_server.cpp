@@ -18,8 +18,10 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <exception>
 #include <boost/algorithm/string.hpp>
 #ifdef __linux__
+#include <cerrno>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -90,6 +92,76 @@ RateMonitor::get_datums_in_last(double dt) const {
 /// Static member definition
 std::atomic<uint64_t> StratumSession::job_counter_{0};
 
+// HTTP connections taken from the stratum port: how many are live (in total
+// and per cap key; both connection caps count them), the hand-offs in
+// progress (in total and per cap key; the hand-off budget counts them) and
+// the rate limit on their log lines. Shared with every connection's slot and
+// log callbacks.
+struct StratumServer::HttpState {
+    std::mutex mutex;
+    size_t live = 0;
+    std::map<boost::asio::ip::address, size_t> per_key;   // per_ip_cap_key -> live
+    size_t handoffs = 0;
+    size_t handoffs_peak = 0;
+    std::map<boost::asio::ip::address, size_t> handoff_per_key;   // per_ip_cap_key -> hand-offs
+    // At most one full line per 60 s; the requests in between are counted and
+    // summarised in one line written with the first request after the 60 s
+    // (there is no timer: with no later request, no summary). Failed requests
+    // (malformed, cut off, timed out) the same way, on their own limiter.
+    RefusalLogLimiter log{std::chrono::seconds(60)};
+    RefusalLogLimiter err_log{std::chrono::seconds(60)};
+    std::atomic<uint64_t> requests{0};
+    std::atomic<uint64_t> log_lines{0};
+    std::atomic<uint64_t> error_log_lines{0};
+
+    size_t from(const boost::asio::ip::address& key)
+    {
+        std::lock_guard<std::mutex> lk(mutex);
+        auto it = per_key.find(key);
+        return it == per_key.end() ? 0 : it->second;
+    }
+    size_t total()
+    {
+        std::lock_guard<std::mutex> lk(mutex);
+        return live;
+    }
+};
+
+// Constructed with st->mutex held; the destructor takes it. Entries at zero
+// are erased from both maps.
+struct StratumServer::HttpSlot {
+    std::shared_ptr<HttpState> st;
+    boost::asio::ip::address key;
+    bool handoff = false;
+
+    HttpSlot(std::shared_ptr<HttpState> s, boost::asio::ip::address k, bool h)
+        : st(std::move(s)), key(k), handoff(h)
+    {
+        ++st->live;
+        ++st->per_key[key];
+        if (handoff) {
+            ++st->handoff_per_key[key];
+            st->handoffs_peak = std::max(st->handoffs_peak, ++st->handoffs);
+        }
+    }
+    HttpSlot(const HttpSlot&) = delete;
+    HttpSlot& operator=(const HttpSlot&) = delete;
+    ~HttpSlot()
+    {
+        std::lock_guard<std::mutex> lk(st->mutex);
+        --st->live;
+        auto it = st->per_key.find(key);
+        if (it != st->per_key.end() && --it->second == 0)
+            st->per_key.erase(it);
+        if (handoff) {
+            --st->handoffs;
+            auto h = st->handoff_per_key.find(key);
+            if (h != st->handoff_per_key.end() && --h->second == 0)
+                st->handoff_per_key.erase(h);
+        }
+    }
+};
+
 StratumServer::StratumServer(net::io_context& ioc, const std::string& address, uint16_t port, std::shared_ptr<IWorkSource> mining_interface)
     : ioc_(ioc)
     , acceptor_(ioc)
@@ -97,8 +169,186 @@ StratumServer::StratumServer(net::io_context& ioc, const std::string& address, u
     , bind_address_(address)
     , port_(port)
     , running_(false)
+    , http_state_(std::make_shared<HttpState>())
     , idle_reap_timer_(ioc)
+    , refusal_log_timer_(ioc)
 {
+}
+
+void StratumServer::set_http(bool on, StratumHttpHandler handler, StratumHttpLimits limits)
+{
+    std::lock_guard<std::mutex> lk(http_mutex_);
+    http_on_ = on;
+    http_handler_ = std::move(handler);
+    http_limits_ = limits;
+}
+
+bool StratumServer::http_on() const
+{
+    std::lock_guard<std::mutex> lk(http_mutex_);
+    return http_on_;
+}
+
+StratumServer::HttpConfig StratumServer::http_config() const
+{
+    std::lock_guard<std::mutex> lk(http_mutex_);
+    return {http_on_, http_handler_, http_limits_};
+}
+
+std::size_t StratumServer::connection_cap() const
+{
+    return mining_interface_ ? mining_interface_->get_stratum_config().max_stratum_connections : 0;
+}
+
+size_t StratumServer::get_http_connection_count() const
+{
+    return http_state_->total();
+}
+
+uint64_t StratumServer::get_http_requests() const
+{
+    return http_state_->requests.load();
+}
+
+uint64_t StratumServer::get_http_log_lines() const
+{
+    return http_state_->log_lines.load();
+}
+
+uint64_t StratumServer::get_http_error_log_lines() const
+{
+    return http_state_->error_log_lines.load();
+}
+
+std::shared_ptr<void> StratumServer::acquire_http_slot(const boost::asio::ip::address& peer)
+{
+    const auto key = per_ip_cap_key(peer);
+    std::shared_ptr<HttpSlot> slot;
+    {
+        std::lock_guard<std::mutex> lk(http_state_->mutex);
+        slot = std::make_shared<HttpSlot>(http_state_, key, false);
+    }
+    http_state_->requests.fetch_add(1);
+    return slot;
+}
+
+StratumServer::HttpHandoff StratumServer::try_acquire_http_handoff(const boost::asio::ip::address& peer,
+                                                                  std::size_t cap,
+                                                                  const StratumHttpLimits& limits)
+{
+    const auto budget = stratum_http_budget(cap, limits.budget, limits.per_ip);
+    const auto key = per_ip_cap_key(peer);
+    HttpHandoff r;
+    std::shared_ptr<HttpSlot> slot;
+    {
+        std::lock_guard<std::mutex> lk(http_state_->mutex);
+        if (http_state_->handoffs >= budget.handoffs) {
+            r.refusal = HttpRefusal::Budget;
+            return r;
+        }
+        const auto it = http_state_->handoff_per_key.find(key);
+        if ((it == http_state_->handoff_per_key.end() ? 0 : it->second) >= budget.per_key) {
+            r.refusal = HttpRefusal::Share;
+            return r;
+        }
+        slot = std::make_shared<HttpSlot>(http_state_, key, true);
+    }
+    http_state_->requests.fetch_add(1);
+    r.slot = std::move(slot);
+    return r;
+}
+
+void StratumServer::record_http_refusal(HttpRefusal refusal, const std::string& peer_ip, std::size_t cap,
+                                        const StratumHttpLimits& limits)
+{
+    const auto budget = stratum_http_budget(cap, limits.budget, limits.per_ip);
+    const std::string peer = peer_ip.empty() ? std::string{} : " peer=" + peer_ip;
+    if (refusal == HttpRefusal::Budget) {
+        const uint64_t total = refused_http_budget_.fetch_add(1) + 1;
+        log_refusal(http_budget_refusal_log_, peer_ip, peer,
+                    "HTTP request answered 503: " + std::to_string(budget.handoffs)
+                        + " HTTP requests in progress (--stratum-http-budget)",
+                    "refused_http_budget_total", total);
+    } else if (refusal == HttpRefusal::Share) {
+        const uint64_t total = refused_http_share_.fetch_add(1) + 1;
+        log_refusal(http_share_refusal_log_, peer_ip, peer,
+                    "HTTP request answered 503: " + std::to_string(budget.per_key)
+                        + " HTTP requests in progress from one address, IPv6 /64 (--stratum-http-per-ip)",
+                    "refused_http_share_total", total);
+    }
+}
+
+size_t StratumServer::get_http_handoffs() const
+{
+    std::lock_guard<std::mutex> lk(http_state_->mutex);
+    return http_state_->handoffs;
+}
+
+size_t StratumServer::get_http_handoffs_peak() const
+{
+    std::lock_guard<std::mutex> lk(http_state_->mutex);
+    return http_state_->handoffs_peak;
+}
+
+size_t StratumServer::get_http_handoff_keys() const
+{
+    std::lock_guard<std::mutex> lk(http_state_->mutex);
+    return http_state_->handoff_per_key.size();
+}
+
+namespace {
+// Printable ASCII only, at most `max` bytes.
+std::string printable(const std::string& in, std::size_t max)
+{
+    std::string out;
+    for (char c : in) {
+        if (out.size() >= max) { out += "..."; break; }
+        out += (c >= 0x20 && c < 0x7f) ? c : '?';
+    }
+    return out;
+}
+}  // namespace
+
+std::function<void(const std::string&, const std::string&, unsigned)>
+StratumServer::http_response_logger(const std::string& peer_ip) const
+{
+    return [st = http_state_, peer_ip](const std::string& method, const std::string& target,
+                                       unsigned status) {
+        const std::string what = printable(method, 16) + " " + printable(target, 120)
+                               + " -> " + std::to_string(status);
+        std::lock_guard<std::mutex> lk(st->mutex);
+        const auto now = RefusalLogLimiter::clock::now();
+        if (auto summary = st->log.flush(now)) {
+            LOG_INFO << "HTTP requests on stratum port: " << *summary;
+            st->log_lines.fetch_add(1);
+        }
+        if (st->log.record(now, peer_ip, what)) {
+            LOG_INFO << "HTTP request on stratum port from "
+                     << (peer_ip.empty() ? std::string("?") : peer_ip) << ": " << what
+                     << " (the next 60 s are counted, and summarised with the first request after)";
+            st->log_lines.fetch_add(1);
+        }
+    };
+}
+
+std::function<void(const std::string&)>
+StratumServer::http_error_logger(const std::string& peer_ip) const
+{
+    return [st = http_state_, peer_ip](const std::string& what_failed) {
+        const std::string what = printable(what_failed, 160);
+        std::lock_guard<std::mutex> lk(st->mutex);
+        const auto now = RefusalLogLimiter::clock::now();
+        if (auto summary = st->err_log.flush(now)) {
+            LOG_WARNING << "HTTP requests on stratum port failed: " << *summary;
+            st->error_log_lines.fetch_add(1);
+        }
+        if (st->err_log.record(now, peer_ip, what)) {
+            LOG_WARNING << "HTTP request on stratum port from "
+                        << (peer_ip.empty() ? std::string("?") : peer_ip) << " failed: " << what
+                        << " (the next 60 s are counted, and summarised with the first failure after)";
+            st->error_log_lines.fetch_add(1);
+        }
+    };
 }
 
 StratumServer::~StratumServer()
@@ -141,6 +391,7 @@ void StratumServer::stop()
         acceptor_.cancel(ec);
         acceptor_.close(ec);
         idle_reap_timer_.cancel();     // stop the zombie-session reaper
+        refusal_log_timer_.cancel();   // a pending refusal summary is dropped at shutdown
         running_ = false;
 
         // Snapshot + clear the live-sessions set under the mutex, then close
@@ -197,31 +448,83 @@ void StratumServer::handle_accept(boost::system::error_code ec, tcp::socket sock
         // WARN, bump the refused counter, and keep accepting. 0 = unlimited.
         // Dead sessions are normally pruned lazily in notify_all(); prune here
         // too when at cap so lingering closed sockets never starve real miners.
-        const size_t cap = mining_interface_
-            ? mining_interface_->get_stratum_config().max_stratum_connections
-            : 0;
+        // The per-source-IP cap (max_stratum_connections_per_ip, 0 = unlimited)
+        // is checked the same way after the node cap.
+        // At either cap, live sessions the hygiene knobs already condemn
+        // (StratumSession::reclaim_reason: no authorize by the handshake
+        // deadline, or idle past the idle timeout) are closed here as well:
+        // their timer / the next reaper sweep would close them a little later,
+        // and until then a real miner would be refused.
+        const core::stratum::StratumConfig* cfg =
+            mining_interface_ ? &mining_interface_->get_stratum_config() : nullptr;
+        const size_t cap = cfg ? cfg->max_stratum_connections : 0;
+        const size_t ip_cap = cfg ? cfg->max_stratum_connections_per_ip : 0;
+        boost::system::error_code ep_ec;
+        const auto ep = socket.remote_endpoint(ep_ec);
+        const bool per_ip = ip_cap > 0 && !ep_ec;
+        const auto ip_key = per_ip ? per_ip_cap_key(ep.address()) : boost::asio::ip::address{};
         size_t live = 0;
-        if (cap > 0) {
+        size_t from_ip = 0;
+        // An HTTP connection taken from this port (core/stratum_http.hpp) is
+        // not a session; while open it counts toward both caps.
+        size_t http_live = 0;
+        std::vector<std::pair<std::shared_ptr<StratumSession>, const char*>> reclaimed;
+        if (cap > 0 || per_ip) {
             std::lock_guard<std::mutex> lock(sessions_mutex_);
-            if (sessions_.size() >= cap) {
+            http_live = http_state_->total();
+            const size_t http_from_ip = per_ip ? http_state_->from(ip_key) : 0;
+            auto count_from_ip = [&] {
+                size_t n = http_from_ip;
+                for (const auto& s : sessions_)
+                    if (s->is_connected() && per_ip_cap_key(s->peer_address()) == ip_key)
+                        ++n;
+                return n;
+            };
+            if ((cap > 0 && sessions_.size() + http_live >= cap)
+                || (per_ip && count_from_ip() >= ip_cap)) {
                 for (auto it = sessions_.begin(); it != sessions_.end(); ) {
-                    if (!(*it)->is_connected())
+                    if (!(*it)->is_connected()) {
                         it = sessions_.erase(it);
-                    else
+                    } else if (const char* why = (*it)->reclaim_reason(*cfg)) {
+                        reclaimed.emplace_back(*it, why);
+                        it = sessions_.erase(it);
+                    } else {
                         ++it;
+                    }
                 }
             }
-            live = sessions_.size();
+            live = sessions_.size() + http_live;
+            if (per_ip)
+                from_ip = count_from_ip();
         }
+        // Closed outside sessions_mutex_ (as drop_sessions does): each close
+        // runs the normal disconnect path, which may re-take the mutex.
+        for (auto& [s, why] : reclaimed)
+            s->drop_stale(why);
+        if (!reclaimed.empty())
+            LOG_INFO << "[Stratum] at a connection cap: closed " << reclaimed.size()
+                     << " stale session(s) before admitting a new one";
+        const std::string peer_ip = ep_ec ? std::string{} : ep.address().to_string();
+        const std::string peer = ep_ec ? std::string{}
+            : " peer=" + peer_ip + ":" + std::to_string(ep.port());
+        // Refusal WARN lines are rate-limited per cap (log_refusal); the
+        // counters count every refusal.
         if (cap > 0 && live >= cap) {
-            refused_connections_.fetch_add(1);
-            boost::system::error_code ep_ec;
-            const auto ep = socket.remote_endpoint(ep_ec);
-            LOG_WARNING << "Stratum connection refused: node at miner cap "
-                        << live << "/" << cap << " (max_stratum_connections)"
-                        << (ep_ec ? std::string{} : " peer=" + ep.address().to_string()
-                                        + ":" + std::to_string(ep.port()))
-                        << " refused_total=" << refused_connections_.load();
+            const uint64_t total = refused_connections_.fetch_add(1) + 1;
+            log_refusal(cap_refusal_log_, peer_ip, peer,
+                        "node at miner cap " + std::to_string(live) + "/" + std::to_string(cap)
+                            + (http_live ? " incl. " + std::to_string(http_live) + " HTTP" : std::string{})
+                            + " (max_stratum_connections)",
+                        "refused_total", total);
+            boost::system::error_code ignore;
+            socket.shutdown(tcp::socket::shutdown_both, ignore);
+            socket.close(ignore);
+        } else if (per_ip && from_ip >= ip_cap) {
+            const uint64_t total = refused_per_ip_.fetch_add(1) + 1;
+            log_refusal(per_ip_refusal_log_, peer_ip, peer,
+                        std::to_string(from_ip) + "/" + std::to_string(ip_cap)
+                            + " sessions from one address, IPv6 /64 (max_stratum_connections_per_ip)",
+                        "refused_per_ip_total", total);
             boost::system::error_code ignore;
             socket.shutdown(tcp::socket::shutdown_both, ignore);
             socket.close(ignore);
@@ -239,6 +542,83 @@ void StratumServer::handle_accept(boost::system::error_code ec, tcp::socket sock
     if (running_) {
         accept_connections();
     }
+}
+
+void StratumServer::log_refusal(RefusalLogLimiter& lim, const std::string& peer_ip,
+                                const std::string& peer, const std::string& detail,
+                                const char* total_name, uint64_t total)
+{
+    const uint32_t interval = mining_interface_
+        ? mining_interface_->get_stratum_config().refusal_log_interval_sec : 10;
+    lim.set_window(std::chrono::seconds(interval));
+    const auto now = RefusalLogLimiter::clock::now();
+    // A due summary goes out first, so a new window starts counting after it.
+    if (auto summary = lim.flush(now)) {
+        LOG_WARNING << "Stratum connections refused: " << *summary
+                    << " " << total_name << "=" << (total - 1);
+        refusal_lines_logged_.fetch_add(1);
+    }
+    if (lim.record(now, peer_ip, detail)) {
+        LOG_WARNING << "Stratum connection refused: " << detail << peer
+                    << " " << total_name << "=" << total
+                    << (interval > 0 ? " (further refusals summarised every "
+                                           + std::to_string(interval) + " s)"
+                                     : std::string{});
+        refusal_lines_logged_.fetch_add(1);
+        return;
+    }
+    // Counted into a summary: written when its window ends, even if no
+    // further refusal arrives.
+    arm_refusal_log_timer();
+}
+
+void StratumServer::arm_refusal_log_timer()
+{
+    if (!running_)
+        return;
+    std::optional<RefusalLogLimiter::clock::time_point> next;
+    for (const auto* lim : {&cap_refusal_log_, &per_ip_refusal_log_,
+                            &http_budget_refusal_log_, &http_share_refusal_log_})
+        if (auto d = lim->due(); d && (!next || *d < *next))
+            next = d;
+    // Armed already for this summary or an earlier one: keep it.
+    if (!next || (refusal_log_timer_due_ && *refusal_log_timer_due_ <= *next))
+        return;
+    // expires_at() aborts an armed wait (its handler sees operation_aborted).
+    refusal_log_timer_due_ = next;
+    refusal_log_timer_.expires_at(*next);
+    refusal_log_timer_.async_wait([this](const boost::system::error_code& ec) {
+        if (ec) return;   // re-armed earlier, or cancelled at shutdown
+        if (!running_) return;
+        refusal_log_timer_due_.reset();
+        flush_refusal_logs();
+    });
+}
+
+void StratumServer::flush_refusal_logs()
+{
+    const auto now = RefusalLogLimiter::clock::now();
+    if (auto summary = cap_refusal_log_.flush(now)) {
+        LOG_WARNING << "Stratum connections refused: " << *summary
+                    << " refused_total=" << refused_connections_.load();
+        refusal_lines_logged_.fetch_add(1);
+    }
+    if (auto summary = per_ip_refusal_log_.flush(now)) {
+        LOG_WARNING << "Stratum connections refused: " << *summary
+                    << " refused_per_ip_total=" << refused_per_ip_.load();
+        refusal_lines_logged_.fetch_add(1);
+    }
+    if (auto summary = http_budget_refusal_log_.flush(now)) {
+        LOG_WARNING << "Stratum connections refused: " << *summary
+                    << " refused_http_budget_total=" << refused_http_budget_.load();
+        refusal_lines_logged_.fetch_add(1);
+    }
+    if (auto summary = http_share_refusal_log_.flush(now)) {
+        LOG_WARNING << "Stratum connections refused: " << *summary
+                    << " refused_http_share_total=" << refused_http_share_.load();
+        refusal_lines_logged_.fetch_add(1);
+    }
+    arm_refusal_log_timer();   // the other cap's summary may fall due later
 }
 
 void StratumServer::register_session(std::shared_ptr<StratumSession> s)
@@ -431,8 +811,8 @@ void StratumServer::start_idle_reaper()
     // Zombie-session reaper (belt-and-suspenders alongside OS TCP keepalive):
     // periodically close sessions that have sent no inbound line past the idle
     // timeout. A live miner submits shares far inside the window; a half-open
-    // NAT-dead peer sends nothing. No-op (never re-armed) unless the DASH-set
-    // StratumConfig::session_idle_timeout_sec > 0 -> other coins unchanged.
+    // NAT-dead peer sends nothing. No-op (never re-armed) unless the coin set
+    // StratumConfig::session_idle_timeout_sec > 0 (DASH, BTC, LTC).
     const auto& cfg0 = mining_interface_ ? mining_interface_->get_stratum_config()
                                          : core::stratum::StratumConfig{};
     const uint32_t timeout = cfg0.session_idle_timeout_sec;
@@ -455,19 +835,8 @@ void StratumServer::start_idle_reaper()
         for (auto& s : snapshot) {
             if (!s->is_connected())
                 continue;   // socket already dead -> notify_all prunes it
-            if (s->seconds_since_activity() <= timeout)
-                continue;   // recently active
-            // KEEPALIVE-AWARE: when OS TCP keepalive is enabled it is the
-            // liveness authority -- a still-open socket means keepalive has NOT
-            // declared the peer dead (it force-closes dead NAT paths, which the
-            // is_connected() guard above then catches). Do NOT reap an idle-but-
-            // keepalive-validated AUTHORIZED rig: a high fixed-diff suffix
-            // (ADDR+N) can legitimately exceed the idle window between submits,
-            // and reaping it would drop a LIVE, paying miner. Idle-time reaping
-            // is the FALLBACK only where keepalive is unavailable; unauthorized
-            // sessions (never completed handshake) are always fair game.
-            if (keepalive_on && s->is_authorized())
-                continue;
+            if (!s->idle_reapable(timeout, keepalive_on))
+                continue;   // recently active, or a keepalive-validated rig
             s->drop_stale("idle timeout (no inbound share/line)");
             ++reaped;
         }
@@ -493,6 +862,12 @@ StratumSession::StratumSession(tcp::socket socket, std::shared_ptr<IWorkSource> 
     subscription_id_ = generate_subscription_id();
     extranonce1_ = generate_extranonce1();
     session_id_ = subscription_id_;  // unique session key
+    {
+        boost::system::error_code ep_ec;
+        const auto ep = socket_.remote_endpoint(ep_ec);
+        if (!ep_ec)
+            peer_address_ = ep.address();
+    }
 
     // Apply stratum tuning from MiningInterface config (populated from CLI/YAML)
     const auto& cfg = mining_interface_->get_stratum_config();
@@ -528,6 +903,17 @@ void StratumSession::read_message()
         [self](boost::system::error_code ec, std::size_t bytes_read)
         {
             if (!ec) {
+                if (!self->first_line_seen_) {
+                    // RFC 9112 2.2: empty lines before a request line are
+                    // ignored (at most 4, while HTTP is on).
+                    if (self->skip_leading_blank_line(bytes_read))
+                        return self->read_message();
+                    self->first_line_seen_ = true;
+                    // An HTTP request line: handed off, this session stops
+                    // reading.
+                    if (self->try_http_handoff(bytes_read))
+                        return;
+                }
                 self->process_message(bytes_read);
                 self->read_message();  // Continue reading
             } else {
@@ -605,11 +991,11 @@ void StratumSession::process_message(std::size_t bytes_read)
         // After subscribe response is sent, follow up with difficulty + work.
         // p2pool: pseudoshare difficulty starts low and VARDIFF ramps it up.
         // Do NOT floor at pool share_bits — that defeats VARDIFF.
+        // A mining.suggest_difficulty received before subscribe is already
+        // in the tracker (handle_suggest_difficulty), so the difficulty
+        // advertised here is the one the first job is issued at.
         if (method == "mining.subscribe") {
-            double initial_diff = (suggested_difficulty_ > 0.0)
-                ? suggested_difficulty_
-                : hashrate_tracker_.get_current_difficulty();
-            send_set_difficulty(initial_diff);
+            send_set_difficulty(hashrate_tracker_.get_current_difficulty());
             send_notify_work();
             // Idle keepalive only: arm the periodic work-push / keepalive timer
             // as soon as the session is subscribed -- a backup pool connection
@@ -627,6 +1013,151 @@ void StratumSession::process_message(std::size_t bytes_read)
         LOG_ERROR << "Error processing Stratum message: " << e.what();
         send_error(-2, "Invalid JSON", nlohmann::json{});
     }
+}
+
+bool StratumSession::skip_leading_blank_line(std::size_t bytes_read)
+{
+    static constexpr int kMaxLeadingBlankLines = 4;
+    if (!server_ || blank_lines_skipped_ >= kMaxLeadingBlankLines
+        || !(bytes_read == 1 || bytes_read == 2))
+        return false;
+    const char* bytes = static_cast<const char*>(buffer_.data().data());
+    const bool blank = bytes_read == 1 ? bytes[0] == '\n' : (bytes[0] == '\r' && bytes[1] == '\n');
+    if (!blank || !server_->http_on())
+        return false;
+    buffer_.consume(bytes_read);
+    ++blank_lines_skipped_;
+    return true;
+}
+
+bool StratumSession::try_http_handoff(std::size_t bytes_read)
+{
+    if (!server_)
+        return false;
+    // The first line is the front of buffer_ (async_read_until's bytes_read
+    // includes its '\n'); boost::asio::streambuf keeps its input contiguous.
+    const auto data = buffer_.data();
+    const char* bytes = static_cast<const char*>(data.data());
+    const std::size_t buffered = data.size();
+    std::string_view line(bytes, std::min(bytes_read, buffered));
+    if (!line.empty() && line.back() == '\n')
+        line.remove_suffix(1);
+    if (!looks_like_http_request_line(line))
+        return false;
+    auto http = server_->http_config();
+    if (!http.on)
+        return false;   // --stratum-http off: an invalid stratum line, as before
+
+    // Request line parts for the 503 answer and its log line.
+    std::string method, target;
+    {
+        std::string_view l = line;
+        if (!l.empty() && l.back() == '\r') l.remove_suffix(1);
+        const auto sp = l.find(' ');
+        const auto sp2 = l.rfind(' ');
+        method = std::string(l.substr(0, sp));
+        target = std::string(l.substr(sp + 1, sp2 - sp - 1));
+        const auto q = target.find('?');
+        if (q != std::string::npos) target.resize(q);   // never log a query (?token=)
+    }
+
+    // From here the connection is HTTP: its slot under the caps is taken
+    // before it leaves the sessions; it is not a miner session; the stratum
+    // timers are cancelled. With a web handler the slot is a hand-off slot
+    // when the hand-off budget and this address's share allow one
+    // (StratumServer::try_acquire_http_handoff), else a plain slot and a busy
+    // 503; with no handler, a plain slot and the not-served 503.
+    const auto& cfg = mining_interface_->get_stratum_config();
+    auto req = std::make_shared<StratumHttpRequest>(StratumHttpRequest{
+        tcp::socket(socket_.get_executor()), {}, {}, {}, {}, {}, {}});
+    const std::string peer_ip =
+        peer_address_.is_unspecified() ? std::string{} : peer_address_.to_string();
+    auto refusal = StratumServer::HttpRefusal::None;
+    if (http.handler) {
+        auto handoff = server_->try_acquire_http_handoff(peer_address_, cfg.max_stratum_connections,
+                                                         http.limits);
+        refusal = handoff.refusal;
+        req->slot = handoff.slot ? std::move(handoff.slot) : server_->acquire_http_slot(peer_address_);
+    } else {
+        req->slot = server_->acquire_http_slot(peer_address_);
+    }
+    req->on_response = server_->http_response_logger(peer_ip);
+    req->on_error = server_->http_error_logger(peer_ip);
+    server_->unregister_session(shared_from_this());
+    work_push_timer_.cancel();
+    handshake_timer_.cancel();
+
+    // The stratum handshake deadline, counted from the accept, ends the whole
+    // exchange: the request, its answer and the close. Already past: closed,
+    // nothing counted.
+    req->handed_off_at = std::chrono::steady_clock::now();
+    if (cfg.handshake_timeout_sec > 0) {
+        req->deadline = connected_at_ + std::chrono::seconds(cfg.handshake_timeout_sec);
+        if (*req->deadline <= req->handed_off_at) {
+            boost::system::error_code ignore;
+            socket_.close(ignore);
+            return true;
+        }
+    }
+
+    req->head.assign(bytes, buffered);
+    buffer_.consume(buffered);
+    req->socket = std::move(socket_);
+
+    if (refusal != StratumServer::HttpRefusal::None) {
+        server_->record_http_refusal(refusal, peer_ip, cfg.max_stratum_connections, http.limits);
+        answer_http_unavailable(std::move(req), method, target, StratumHttpUnavailable::Busy);
+        return true;
+    }
+    if (http.handler && http.handler(*req))
+        return true;
+    answer_http_unavailable(std::move(req), method, target, StratumHttpUnavailable::NotServed);
+    return true;
+}
+
+void StratumSession::answer_http_unavailable(std::shared_ptr<StratumHttpRequest> req,
+                                             const std::string& method,
+                                             const std::string& target,
+                                             StratumHttpUnavailable kind)
+{
+    // A fixed 503 of at most 300 bytes with the web port's security headers,
+    // then the close, written on this io_context. NotServed: no web server to
+    // answer (--stratum-http=true on a node without one, or it is stopping or
+    // declined). Busy: the hand-off budget or the per-address share is in use.
+    // The write is closed at min(req->deadline, write start +
+    // kStratumHttpUnavailableWriteTimeout).
+    const std::string body = stratum_http_unavailable_body(kind);
+    auto msg = std::make_shared<std::string>(
+        "HTTP/1.1 503 Service Unavailable\r\n"
+        "Content-Type: application/json\r\n"
+        "X-Content-Type-Options: nosniff\r\n"
+        "X-Frame-Options: DENY\r\n"
+        "Referrer-Policy: no-referrer\r\n"
+        "Content-Length: " + std::to_string(body.size()) + "\r\n"
+        "Connection: close\r\n"
+        "\r\n" + (method == "HEAD" ? std::string{} : body));
+    if (req->on_response)
+        req->on_response(method, target, 503);
+    auto& sock = req->socket;
+    auto timer = std::make_shared<boost::asio::steady_timer>(sock.get_executor());
+    auto at = std::chrono::steady_clock::now() + kStratumHttpUnavailableWriteTimeout;
+    if (req->deadline)
+        at = std::min(at, *req->deadline);
+    timer->expires_at(at);
+    timer->async_wait([req](boost::system::error_code ec) {
+        if (ec)
+            return;
+        boost::system::error_code ignore;
+        req->socket.shutdown(tcp::socket::shutdown_both, ignore);
+        req->socket.close(ignore);
+    });
+    boost::asio::async_write(sock, boost::asio::buffer(*msg),
+        [req, msg, timer](boost::system::error_code, std::size_t) {
+            timer->cancel();
+            boost::system::error_code ignore;
+            req->socket.shutdown(tcp::socket::shutdown_both, ignore);
+            req->socket.close(ignore);
+        });
 }
 
 nlohmann::json StratumSession::handle_subscribe(const nlohmann::json& params, const nlohmann::json& request_id)
@@ -681,14 +1212,15 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
         handshake_timer_.cancel();
 
         // ─── Step 1: Strip fixed difficulty suffix (+N) before any parsing ───
-        // Format: "ADDRESS+1024" or "ADDR,ADDR+512"  →  suggested_difficulty_=N
+        // Format: "ADDRESS+1024" or "ADDR,ADDR+512": a fixed pseudoshare
+        // difficulty N in INTERNAL units, as python p2pool reads it
+        // (difficulty_to_target(float(N)); the miner is sent
+        // N * set_difficulty_multiplier), applied once the login is accepted
+        // (below).
         // "+0", negatives, "+inf" and "+nan" set no difficulty (std::stod
         // accepts inf/nan, so a bare "> 0" check let "+inf" through).
-        if (auto fixed_diff = stratum_username::strip_fixed_diff_suffix(username_)) {
-            suggested_difficulty_ = *fixed_diff;
-            hashrate_tracker_.set_difficulty_hint(*fixed_diff);
-            LOG_INFO << "[Stratum] Fixed difficulty from username: " << *fixed_diff;
-        }
+        const std::optional<double> fixed_diff =
+            stratum_username::strip_fixed_diff_suffix(username_);
 
         // ─── Step 2: Strip worker name suffix ───
         // Separators: "." and "_" (Python compat)
@@ -859,6 +1391,52 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
         LOG_INFO << "[Stratum] Mining authorization successful for: " << username_;
         login_primary_ = username_;
         login_given_ = std::move(given_now);
+
+        // ─── Login difficulty ───
+        // "+N" (INTERNAL units, as python p2pool and earlier c2pool read it)
+        // is fixed for the session: vardiff stops, and "d=N" and
+        // mining.suggest_difficulty are ignored (p2pool desired_pseudoshare_
+        // target: fixed_target). Otherwise "d=N" in the password (WIRE units,
+        // the pool convention: / set_difficulty_multiplier) is the start
+        // difficulty vardiff continues from (the first successful authorize
+        // only), and mining.suggest_difficulty sets the difficulty when it
+        // arrives, as before. Every value is bounded by [min, max] and by the
+        // pool-share difficulty of the jobs (the tracker's ceiling), and the
+        // miner is sent it at once.
+        {
+            const double mult_cfg = mining_interface_->get_stratum_config().set_difficulty_multiplier;
+            const double mult = mult_cfg > 0.0 ? mult_cfg : 1.0;
+            const std::string who = (username_.empty() ? std::string("(empty login)") : username_)
+                                    + (worker_name_.empty() ? "" : "." + worker_name_);
+            if (fixed_diff) {
+                hashrate_tracker_.set_fixed_difficulty(*fixed_diff);
+                LOG_INFO << "[Stratum] " << who << ": fixed difficulty +" << *fixed_diff
+                         << " (internal; wire " << *fixed_diff * mult << ", issued "
+                         << hashrate_tracker_.get_current_difficulty() << ")";
+            } else {
+                hashrate_tracker_.set_fixed_difficulty(0.0);  // re-authorize without "+N": vardiff resumes
+            }
+            if (!password_diff_applied_ && params.size() >= 2 && params[1].is_string()) {
+                const auto pd = stratum_username::parse_password_start_diff(params[1].get<std::string>());
+                if (pd.diff) {
+                    password_diff_applied_ = true;
+                    if (fixed_diff) {
+                        LOG_INFO << "[Stratum] " << who << ": password d=" << *pd.diff
+                                 << " ignored, the login's +" << *fixed_diff << " is fixed";
+                    } else {
+                        hashrate_tracker_.set_difficulty_hint(*pd.diff / mult);
+                        LOG_INFO << "[Stratum] " << who << ": start difficulty d=" << *pd.diff
+                                 << " (internal " << *pd.diff / mult << ", issued "
+                                 << hashrate_tracker_.get_current_difficulty() << ")";
+                    }
+                } else if (pd.bad && !password_diff_logged_) {
+                    password_diff_logged_ = true;
+                    LOG_WARNING << "[Stratum] " << who << ": password d= ignored (not a finite number > 0)";
+                }
+            }
+            if (subscribed_ && hashrate_tracker_.get_current_difficulty() != advertised_difficulty_)
+                send_set_difficulty(hashrate_tracker_.get_current_difficulty());
+        }
 
         // Auto-derive: for each configured merged chain without an explicit address,
         // reuse the primary address hash160 (works because chains share secp256k1 keys).
@@ -1084,11 +1662,12 @@ nlohmann::json StratumSession::handle_suggest_difficulty(const nlohmann::json& p
             mining_interface_->get_stratum_config().set_difficulty_multiplier;
         double internal_diff = suggested / diff_multiplier;
         suggested_difficulty_ = internal_diff;
-        // If already subscribed, apply immediately via VARDIFF hint
-        if (subscribed_) {
-            hashrate_tracker_.set_difficulty_hint(internal_diff);
+        // Into the tracker at once (ignored under a fixed "+N"), so the jobs
+        // are issued at the difficulty the miner is told. Before subscribe
+        // the subscribe reply's set_difficulty carries it.
+        hashrate_tracker_.set_difficulty_hint(internal_diff);
+        if (subscribed_)
             send_set_difficulty(hashrate_tracker_.get_current_difficulty());
-        }
         LOG_INFO << "[Stratum] Miner suggested difficulty: " << suggested
                  << " (internal: " << internal_diff << ")";
     }
@@ -1645,6 +2224,7 @@ void StratumSession::send_set_difficulty(double difficulty)
 
     LOG_INFO << "[Stratum] set_difficulty: internal=" << difficulty
              << " wire=" << (difficulty * diff_multiplier);
+    advertised_difficulty_ = difficulty;
     send_response(notification);
 }
 
@@ -1675,8 +2255,75 @@ static std::string gbt_to_stratum_prevhash(const std::string& gbt_hex)
     return result;
 }
 
+// A notify retry run from a timer handler (a held job, or work not ready). An
+// exception must not escape the io_context: it is logged (at most once per
+// 30 s) and the session waits for the next notify; send_notify_work() keeps
+// the clean request the retry carried owed to the next job sent.
+static void run_notify_retry(StratumSession& session, bool clean)
+{
+    std::string what;
+    try {
+        session.send_notify_work(clean);
+        return;
+    } catch (const std::exception& e) {
+        what = e.what();
+    } catch (...) {
+        what = "unknown exception";
+    }
+    static std::atomic<int64_t> s_last_log_ms{0};
+    const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    int64_t prev = s_last_log_ms.load();
+    if (now_ms - prev > 30'000 && s_last_log_ms.compare_exchange_strong(prev, now_ms))
+        LOG_WARNING << "[Stratum] notify retry failed: " << what
+                    << " (no further retry until the next notify)";
+}
+
+void StratumSession::retry_notify_when_work_ready(bool force_clean)
+{
+    // A clean notify requested while the work was not ready must make the
+    // retried job clean: accumulate it, and keep ONE pending retry per session
+    // (a timer per notify would send one job per notify made during the wait).
+    template_waiting_ = true;
+    template_retry_clean_ = template_retry_clean_ || force_clean;
+    if (template_retry_pending_)
+        return;
+    template_retry_pending_ = true;
+    auto timer = std::make_shared<boost::asio::steady_timer>(socket_.get_executor());
+    timer->expires_after(std::chrono::seconds(1));
+    timer->async_wait([weak_self = weak_from_this(), timer](boost::system::error_code ec) {
+        auto self = weak_self.lock();
+        if (!self)
+            return;
+        self->template_retry_pending_ = false;
+        if (ec || !self->is_connected())
+            return;
+        // The wait ended meanwhile (the work became ready and a notify took
+        // it on) and no clean request is owed: nothing to retry.
+        if (!self->template_waiting_ && !self->template_retry_clean_)
+            return;
+        const bool clean = self->template_retry_clean_;
+        self->template_retry_clean_ = false;
+        run_notify_retry(*self, clean);
+    });
+}
+
 void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_best_share)
 {
+    // Should an exception end this call before a job goes out (a malformed
+    // template, the work source), the clean request it carries (its own, or
+    // one owed and folded in below) stays owed to the next job sent.
+    struct KeepCleanOwedOnThrow {
+        StratumSession& session;
+        const bool& clean;
+        const int exceptions_on_entry = std::uncaught_exceptions();
+        ~KeepCleanOwedOnThrow()
+        {
+            if (std::uncaught_exceptions() > exceptions_on_entry)
+                session.template_retry_clean_ = session.template_retry_clean_ || clean;
+        }
+    } keep_clean_owed{*this, force_clean};
+
     // Don't send work until a valid block template is available
     auto tmpl = mining_interface_->get_current_work_template();
     // Fail-closed on a template that carries no difficulty bits. Every coin lane
@@ -1712,16 +2359,19 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
                                 << "] Waiting for block template (header sync in progress)...";
             }
         }
-        auto timer = std::make_shared<boost::asio::steady_timer>(socket_.get_executor());
-        timer->expires_after(std::chrono::seconds(1));
-        timer->async_wait([weak_self = weak_from_this(), timer](boost::system::error_code ec) {
-            if (ec) return;
-            auto self = weak_self.lock();
-            if (!self || !self->is_connected()) return;
-            self->send_notify_work();
-        });
+        retry_notify_when_work_ready(force_clean);
         return;
     }
+
+    // The work is ready: any template wait is over. A clean notify requested
+    // while the work was not ready is owed to the first job that goes out,
+    // whichever notify sends it. Every exit below that sends no job hands
+    // force_clean on (the held retry and its limit, the suppressed-job retry,
+    // the foreign-payout refusal, an exception), so the flag is not lost by
+    // taking it here.
+    force_clean = force_clean || template_retry_clean_;
+    template_retry_clean_ = false;
+    template_waiting_ = false;
 
     nlohmann::json notification;
     notification["id"] = nullptr;
@@ -1863,6 +2513,8 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
                                 << (scfg.coin_symbol.empty() ? "" : " " + scfg.coin_symbol)
                                 << " address and not a configured merged chain; "
                                    "no zero-payout share will be built (issue #961)";
+                    // No job: a clean request taken above stays owed.
+                    template_retry_clean_ = template_retry_clean_ || force_clean;
                     return;
                 }
                 // Accepted (own-coin OR configured-merged): byte-identical build.
@@ -1901,7 +2553,8 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
                 LOG_WARNING << "[Stratum] job held for " << limit.count() << " s (the sharechain stayed"
                             << " busy): no more retries, the miner keeps its last job until the next notify";
                 hold_retries_ = 0;
-                hold_retry_clean_ = false;
+                // hold_retry_clean_ is kept: a clean notify held meanwhile is
+                // still owed to the next job sent (folded where a hold ends).
                 return;
             }
             if (!hold_retry_pending_) {
@@ -1919,12 +2572,15 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
                         return;
                     const bool clean = self->hold_retry_clean_;
                     self->hold_retry_clean_ = false;
-                    self->send_notify_work(clean);
+                    run_notify_retry(*self, clean);
                 });
             }
             return;
         }
+        // The hold is over. A clean notify held meanwhile is owed to this
+        // job even when another notify, not the held retry, builds it.
         hold_retries_ = 0;
+        force_clean = force_clean || hold_retry_clean_;
         hold_retry_clean_ = false;
         if (!cbr.coinb1.empty()) {
             coinb1 = std::move(cbr.coinb1);
@@ -1995,14 +2651,7 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
                         << (snapshot_missing ? "no atomic header+coinbase snapshot"
                                              : "empty/zero prevhash")
                         << ") — not serving unmineable/mixed work; retrying in 1s";
-            auto timer = std::make_shared<boost::asio::steady_timer>(socket_.get_executor());
-            timer->expires_after(std::chrono::seconds(1));
-            timer->async_wait([weak_self = weak_from_this(), timer](boost::system::error_code ec) {
-                if (ec) return;
-                auto self = weak_self.lock();
-                if (!self || !self->is_connected()) return;
-                self->send_notify_work();
-            });
+            retry_notify_when_work_ready(force_clean);
             return;
         }
     }
@@ -2024,7 +2673,8 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
             merkle_branches.push_back(h);
     }
 
-    // clean_jobs = true when prevhash changed OR forced (e.g. after authorize)
+    // clean_jobs = true when prevhash changed OR forced (e.g. after authorize,
+    // or a clean notify owed from a wait / a hold)
     bool clean_jobs = force_clean || (prevhash != last_prevhash_);
     last_prevhash_ = prevhash;
 
@@ -2092,6 +2742,24 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
         active_jobs_.erase(job_order_.front());
         evict_oldest();
     }
+    // ── Pool-share bound on the issued difficulty (money guard) ──
+    // p2pool work.py: target = max(target, share_info['bits'].target) -- a
+    // pseudoshare difficulty above the job's pool-share difficulty makes the
+    // miner withhold every share between the two (its PPLNS weight; a rig
+    // ramped to max_difficulty withheld ~99%). Bound it by the difficulty of
+    // the bits the submit gate judges this job's shares by (its frozen share
+    // bits, core::stratum::pool_share_bits), and tell the miner before the
+    // job when that changes what it was last sent. Unknown bits (0): no share
+    // can be made, no bound.
+    {
+        const uint32_t job_sb = core::stratum::pool_share_bits(
+            cbr.snapshot.frozen_ref.bits, mining_interface_->get_share_bits());
+        hashrate_tracker_.set_difficulty_ceiling(
+            job_sb != 0 ? chain::target_to_difficulty(chain::bits_to_target(job_sb)) : 0.0);
+    }
+    const double issued_difficulty = hashrate_tracker_.get_current_difficulty();
+    if (issued_difficulty != advertised_difficulty_)
+        send_set_difficulty(issued_difficulty);
     {
         JobEntry je;
         je.prevhash = prevhash;
@@ -2105,7 +2773,7 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
         // Freeze the vardiff advertised with this job so the submit gate can
         // validate a share against the target the miner actually received
         // (p2pool-dash work.py:477 grace), immune to later vardiff retargets.
-        je.issued_difficulty = hashrate_tracker_.get_current_difficulty();
+        je.issued_difficulty = issued_difficulty;
         je.has_payout = job_has_payout;
         je.payout_script = std::move(job_payout_script);
         je.merged_scripts = std::move(job_merged_scripts);
@@ -2155,7 +2823,8 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
         je.tx_data = std::move(cbr.snapshot.tx_data);
     }
 
-    // VARDIFF: do NOT override per-connection difficulty with pool share_bits.
+    // VARDIFF: do NOT override per-connection difficulty with pool share_bits
+    // (it is only bounded by them, above).
     // p2pool sends pseudoshare difficulty (VARDIFF) to miners, NOT pool target.
     // Miners submit many pseudoshares at low difficulty; only those meeting
     // share_bits become P2P shares. This gives smooth hashrate estimation.
@@ -2272,41 +2941,68 @@ void StratumSession::cancel_timers()
 
 void StratumSession::apply_socket_keepalive()
 {
-    // Enable OS TCP keepalive so the kernel actively probes an idle peer and
-    // errors the pending async_read when a NAT path has gone dead (the peer
-    // never sent FIN/RST). This is THE root fix for immortal subscribed
-    // sessions -- socket_.is_open() alone never falsifies for a half-open NAT
-    // drop. No-op unless the (DASH-set) StratumConfig knob is enabled, so
-    // LTC/BTC/DGB behaviour is unchanged.
-    const auto& cfg = mining_interface_->get_stratum_config();
+    // OS TCP liveness (keepalive + user timeout) so a peer whose NAT path went
+    // dead without FIN/RST errors the pending async_read, which runs the
+    // normal disconnect -- socket_.is_open() alone never falsifies for a
+    // half-open drop. No-op unless the coin enabled tcp_keepalive_enabled
+    // (DASH, BTC, LTC).
+    apply_stratum_tcp_liveness(socket_, mining_interface_->get_stratum_config());
+}
+
+void apply_stratum_tcp_liveness(tcp::socket& socket, const core::stratum::StratumConfig& cfg)
+{
     if (!cfg.tcp_keepalive_enabled) return;
 
     boost::system::error_code ec;
-    socket_.set_option(boost::asio::socket_base::keep_alive(true), ec);   // portable (asio)
+    socket.set_option(boost::asio::socket_base::keep_alive(true), ec);   // portable (asio)
     if (ec) {
         LOG_WARNING << "[Stratum] SO_KEEPALIVE set failed: " << ec.message();
         return;
     }
-    // Per-probe tuning (idle/interval/count) is Linux-specific -- Windows tunes
-    // keepalive via WSAIoctl(SIO_KEEPALIVE_VALS) and macOS via TCP_KEEPALIVE, so
-    // guard exactly like sample_tcp_rtt_ms() above (#ifdef __linux__). Off-Linux
-    // the portable keep_alive(true) above still arms keepalive with OS defaults;
-    // the DASH deploy target is Linux, where the 60/10/3 tuning (~90 s detect)
-    // applies. This keeps core building on the Windows/macOS CI lanes.
+    // Per-probe tuning (idle/interval/count) and TCP_USER_TIMEOUT are Linux
+    // socket options -- Windows tunes keepalive via WSAIoctl(SIO_KEEPALIVE_VALS)
+    // and macOS via TCP_KEEPALIVE -- so guard exactly like sample_tcp_rtt_ms()
+    // above (#ifdef __linux__). Off-Linux the portable keep_alive(true) above
+    // still arms keepalive with OS defaults. This keeps core building on the
+    // Windows/macOS CI lanes.
 #ifdef __linux__
-    const int fd = socket_.native_handle();
+    const int fd = socket.native_handle();
     int idle  = static_cast<int>(cfg.tcp_keepalive_idle_sec);
     int intvl = static_cast<int>(cfg.tcp_keepalive_interval_sec);
     int cnt   = static_cast<int>(cfg.tcp_keepalive_count);
     ::setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE,  &idle,  sizeof(idle));
     ::setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
     ::setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT,   &cnt,   sizeof(cnt));
+    // Keepalive probes are not sent while data is unacknowledged, and an
+    // authorized rig is fed a notify every keepalive_notify_sec: bound how long
+    // sent data may stay unacknowledged instead of waiting out tcp_retries2.
+    unsigned int user_timeout_ms = 0;
+    if (cfg.tcp_user_timeout_sec > 0) {
+        user_timeout_ms = cfg.tcp_user_timeout_sec * 1000u;
+        if (::setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT,
+                         &user_timeout_ms, sizeof(user_timeout_ms)) != 0)
+            LOG_WARNING << "[Stratum] TCP_USER_TIMEOUT set failed (errno " << errno << ")";
+    }
     LOG_TRACE << "[Stratum] TCP keepalive armed (idle=" << idle
-              << "s interval=" << intvl << "s count=" << cnt << ")";
+              << "s interval=" << intvl << "s count=" << cnt
+              << " user_timeout=" << user_timeout_ms / 1000u << "s)";
 #else
     LOG_TRACE << "[Stratum] TCP keepalive armed (OS-default probe timing; "
-                 "per-probe tuning is Linux-only)";
+                 "per-probe tuning and TCP_USER_TIMEOUT are Linux-only)";
 #endif
+}
+
+boost::asio::ip::address per_ip_cap_key(const boost::asio::ip::address& a)
+{
+    if (!a.is_v6())
+        return a;
+    const auto v6 = a.to_v6();
+    if (v6.is_v4_mapped())
+        return boost::asio::ip::make_address_v4(boost::asio::ip::v4_mapped, v6);
+    auto bytes = v6.to_bytes();
+    for (size_t i = 8; i < bytes.size(); ++i)
+        bytes[i] = 0;   // keep the /64
+    return boost::asio::ip::address_v6(bytes);
 }
 
 void StratumSession::arm_handshake_timer()
@@ -2326,6 +3022,39 @@ void StratumSession::arm_handshake_timer()
         if (!self->authorized_ && self->is_connected())
             self->drop_stale("handshake (authorize) deadline");
     });
+}
+
+bool StratumSession::idle_reapable(uint32_t timeout, bool keepalive_on) const
+{
+    if (timeout == 0)
+        return false;
+    // last_activity_ moves on every INBOUND line only (process_message): the
+    // notifies this server sends never make a dead peer look alive.
+    if (seconds_since_activity() <= timeout)
+        return false;   // recently active
+    // KEEPALIVE-AWARE: when OS TCP keepalive is enabled it is the liveness
+    // authority -- a still-open socket means keepalive has NOT declared the
+    // peer dead (it force-closes dead NAT paths, which an is_connected() check
+    // then catches). Do NOT reap an idle-but-keepalive-validated AUTHORIZED
+    // rig: a high fixed-diff suffix (ADDR+N) can legitimately exceed the idle
+    // window between submits, and reaping it would drop a LIVE, paying miner.
+    // Idle-time reaping is the FALLBACK only where keepalive is unavailable;
+    // unauthorized sessions (never completed handshake) are always fair game.
+    return !(keepalive_on && authorized_);
+}
+
+const char* StratumSession::reclaim_reason(const core::stratum::StratumConfig& cfg) const
+{
+    // The authorize deadline, measured from the accept: the same instant the
+    // handshake timer (arm_handshake_timer) fires at, so this only matters
+    // for a session whose timer has not run yet or was disarmed by an
+    // authorize that then failed (a refused payout address).
+    if (!authorized_ && cfg.handshake_timeout_sec > 0
+        && seconds_since_connect() >= static_cast<double>(cfg.handshake_timeout_sec))
+        return "handshake (authorize) deadline";
+    if (idle_reapable(cfg.session_idle_timeout_sec, cfg.tcp_keepalive_enabled))
+        return "idle timeout (no inbound share/line)";
+    return nullptr;
 }
 
 void StratumSession::drop_stale(const char* reason)

@@ -953,3 +953,76 @@ TEST(PoolLuckInputs, SamplesOlderThanAMonthAreFoldedIntoHourlyBins)
     EXPECT_NEAR(num(fine_round, "effort"), long_effort, long_effort * 1e-9);
     EXPECT_NEAR(num(fine_round, "pool_hashrate_at_find"), kT32, kT32 * 1e-9);
 }
+
+// A merged block learned from a peer's share is stored with the pool rate the
+// node read as the share arrived (DiscoveredMergedBlock::pool_hashrate). Its
+// /recent_merged_blocks row serves that rate as pool_hashrate_at_find -- what
+// another node's --import-found-blocks takes -- and, where no rate history
+// covers the round, its luck is a single sample at it, as a /recent_blocks
+// row's is. Without a recorded rate the history's reading at the block's time
+// stands in (pool_hashrate_source "history"), else nothing.
+TEST(PoolLuckInputs, PeerLearnedMergedBlockServesItsRateAtFind)
+{
+    boost::asio::io_context ioc;
+    MergedMiningManager mm{ioc};
+    MiningInterface mi(false, nullptr, Blockchain::LITECOIN);
+    mi.set_merged_mining_manager(&mm);
+    const double doge_diff = 3.3e7, H = 1.9e11;
+    const double t1 = 1.0e9, t2 = t1 + 86400.0, t3 = t2 + 86400.0;
+    auto peer_block = [&](int height, unsigned tag, double ts, double rate) {
+        DiscoveredMergedBlock blk;
+        blk.chain_id = 98;
+        blk.symbol = "DOGE";
+        blk.height = height;
+        blk.block_hash = hash_of(tag);
+        blk.parent_hash = hash_of(0x100 + tag);
+        blk.timestamp = static_cast<int64_t>(ts);
+        blk.accepted = true;
+        blk.miner = kMiner;
+        blk.difficulty = doge_diff;
+        blk.pool_hashrate = rate;
+        mm.add_discovered_block(blk);
+    };
+    peer_block(6454000, 0xe1, t1, H);
+    peer_block(6454100, 0xe2, t2, H);
+    peer_block(6454200, 0xe3, t3, 0.0);   // learned long after its find: no rate
+
+    auto merged = mi.rest_recent_merged_blocks();
+    const auto r2 = find_row(merged, "pow_hash", hash_of(0xe2));
+    EXPECT_NEAR(num(r2, "pool_hashrate_at_find"), H, 1e-3) << r2.dump(1);
+    EXPECT_EQ(str(r2, "pool_hashrate_source"), "recorded");
+    EXPECT_EQ(str(r2, "effort_method"), "single_sample");
+    EXPECT_NEAR(num(r2, "effort"), 86400.0 * H / (doge_diff * kT32), 1e-12);
+    EXPECT_NEAR(num(r2, "history_coverage"), 0.0, 1e-12);
+    const auto r3 = find_row(merged, "pow_hash", hash_of(0xe3));
+    EXPECT_TRUE(r3["pool_hashrate_at_find"].is_null()) << r3.dump(1);
+    EXPECT_TRUE(r3["pool_hashrate_source"].is_null());
+    EXPECT_EQ(str(r3, "luck_method"), "hashrate_unavailable");
+
+    // With a rate history at its time, the history's reading stands in -- and
+    // the round, now covered, is integrated.
+    feed_history(mi, t2 + 3600.0, t3 + 3600.0, 1.1 * H, 9.5e7);
+    merged = mi.rest_recent_merged_blocks();
+    const auto h3 = find_row(merged, "pow_hash", hash_of(0xe3));
+    EXPECT_NEAR(num(h3, "pool_hashrate_at_find"), 1.1 * H, 1e-3) << h3.dump(1);
+    EXPECT_EQ(str(h3, "pool_hashrate_source"), "history");
+    EXPECT_EQ(str(h3, "effort_method"), "integrated");
+}
+
+// The rate a merged block from a peer is stored with is the live estimator's
+// only while the block is fresh: one the startup scan of the share chain meets
+// hours after its find is not measured at today's rate.
+TEST(PoolLuckInputs, LiveRateStandsForAFindOnlyWhileTheBlockIsFresh)
+{
+    MiningInterface mi(false, nullptr, Blockchain::LITECOIN);
+    const double now = 1.79e9;
+    EXPECT_DOUBLE_EQ(mi.gross_pool_hashrate_at(now, now), 0.0) << "no estimator yet";
+    mi.set_pool_hashrate_fn([] { return 2.0e11; });
+    EXPECT_DOUBLE_EQ(mi.gross_pool_hashrate_at(now, now), 2.0e11);
+    EXPECT_DOUBLE_EQ(mi.gross_pool_hashrate_at(now - 300.0, now), 2.0e11);
+    EXPECT_DOUBLE_EQ(mi.gross_pool_hashrate_at(now + 60.0, now), 2.0e11) << "a share's clock ahead";
+    EXPECT_DOUBLE_EQ(mi.gross_pool_hashrate_at(now - MiningInterface::kLiveRateAtFindMaxLag - 1.0,
+                                               now), 0.0);
+    EXPECT_DOUBLE_EQ(mi.gross_pool_hashrate_at(now - 6 * 3600.0, now), 0.0);
+    EXPECT_DOUBLE_EQ(mi.gross_pool_hashrate_at(0.0, now), 0.0);
+}

@@ -17,6 +17,7 @@
 #include <impl/bip110/params.hpp>
 #include <impl/bip110/pow.hpp>
 #include <impl/bip110/coin/header_chain.hpp>
+#include <impl/btc/coin/header_source_step.hpp>   // header-sync driver tick rule (shared with c2pool-btc)
 #include <impl/bip110/coin/template_builder.hpp>  // get_block_subsidy (dashboard block-value projection)
 #include <impl/bip110/coin/node.hpp>
 #include <impl/bip110/coin/node_interface.hpp>
@@ -86,10 +87,9 @@ namespace io = boost::asio;
 
 namespace {
 
-// Standalone header-sync driver cadence (file-scope so the nested async lambdas
-// use them as constant expressions without an explicit capture).
+// Standalone header-sync driver tick (file-scope so the nested async lambdas
+// use it as a constant expression without an explicit capture).
 constexpr int kTickSec = 10;
-constexpr int kNoProgressFailoverSec = 40;
 
 std::vector<unsigned char> from_hex(const std::string& s)
 {
@@ -119,6 +119,19 @@ void print_banner(const char* argv0)
         "  --fork-checkpoint    seed the Knots 961640 checkpoint for a fast proof\n"
         "  --http [HOST:]PORT   serve the shared coin-generic dashboard (HTML at\n"
         "                       \"/\", JSON /node_info for health probes)\n"
+        "  --stratum-http[=true|false|auto]  also answer the web API (GET/HEAD,\n"
+        "                       read-only) on the stratum port, as python p2pool did\n"
+        "                       on its worker port; default false; auto = on when\n"
+        "                       --http binds ::, binds 0.0.0.0 and --stratum is\n"
+        "                       IPv4, or binds the --stratum address (not loopback)\n"
+        "  --stratum-http-budget N  HTTP requests in progress on the stratum port at\n"
+        "                       once: at most N and at most max_stratum_connections\n"
+        "                       - 1; others are answered 503 (default 16; 0 = every\n"
+        "                       HTTP request on the stratum port is answered 503)\n"
+        "  --stratum-http-per-ip N  HTTP requests in progress on the stratum port at\n"
+        "                       once from one address, one /64 for IPv6: at most N;\n"
+        "                       others are answered 503 (default 6; 0 = no limit\n"
+        "                       below --stratum-http-budget)\n"
         "  --node-owner-address ADDR  subsidy fallback / donation payout when a\n"
         "                       miner has no resolvable payout address (base58/bech32)\n"
         "  --bip110-sharechain  ARM the M3 v36 sharechain MINT (DEFAULT OFF): start\n"
@@ -1391,15 +1404,16 @@ int run_embedded(bool coin_p2p_discover,
     auto last_height   = std::make_shared<uint32_t>(header_chain.height());
     auto last_progress = std::make_shared<std::chrono::steady_clock::time_point>(std::chrono::steady_clock::now());
     auto was_handshaked = std::make_shared<bool>(false);
+    auto last_getheaders = std::make_shared<std::chrono::steady_clock::time_point>(std::chrono::steady_clock::now());
     auto timer = std::make_shared<io::steady_timer>(ioc);
     auto driver = std::make_shared<std::function<void()>>();
     std::weak_ptr<std::function<void()>> weak_driver = driver;
     auto keepalive = driver;  // outlive this scope
     *driver = [timer, weak_driver, &coin_node, &header_chain, &chain_params,
-               dial_next, hdr_caught_up, last_height, last_progress, was_handshaked]() {
+               dial_next, hdr_caught_up, last_height, last_progress, was_handshaked, last_getheaders]() {
         timer->expires_after(std::chrono::seconds(kTickSec));
         timer->async_wait([timer, weak_driver, &coin_node, &header_chain, &chain_params,
-                           dial_next, hdr_caught_up, last_height, last_progress, was_handshaked]
+                           dial_next, hdr_caught_up, last_height, last_progress, was_handshaked, last_getheaders]
                           (const boost::system::error_code& ec) {
             if (ec) return;
             const uint32_t h = header_chain.height();
@@ -1409,22 +1423,33 @@ int run_embedded(bool coin_p2p_discover,
             const bool advanced = (h > *last_height);
             if (advanced) { *last_height = h; *last_progress = now; }
 
+            // A full block locator, so a peer that does not hold our tip
+            // answers from the fork point rather than from genesis.
             auto send_locator = [&]() {
-                uint256 loc;
-                if (auto tip = header_chain.tip(); tip) loc = tip->block_hash;
-                else loc = chain_params.genesis_hash;
-                LOG_INFO << "[EMB-BIP110] getheaders locator=" << loc.GetHex().substr(0, 16)
-                         << " height=" << h << (h >= chain_params.blake2b_height ? " [on BLAKE2b fork]" : "");
-                coin_node.send_getheaders(70016, {loc}, uint256::ZERO);
+                auto loc = header_chain.get_locator();
+                if (loc.empty()) loc.push_back(chain_params.genesis_hash);
+                LOG_INFO << "[EMB-BIP110] getheaders locator=" << loc.front().GetHex().substr(0, 16)
+                         << " (" << loc.size() << " hashes) height=" << h
+                         << (h >= chain_params.blake2b_height ? " [on BLAKE2b fork]" : "");
+                coin_node.send_getheaders(70016, loc, uint256::ZERO);
             };
-            if (handshaked && !caught_up) {
-                if (!*was_handshaked || !advanced) send_locator();
-            }
+            // Same tick rule as c2pool-btc (header_source_step.hpp): when
+            // caught up, a quiet tip is re-asked and then the peer replaced.
+            const auto secs = [&](std::chrono::steady_clock::time_point t) {
+                return static_cast<int64_t>(
+                    std::chrono::duration_cast<std::chrono::seconds>(now - t).count());
+            };
+            const bool fresh = handshaked && !*was_handshaked;
+            const auto step = btc::coin::header_source_step(
+                caught_up, handshaked, fresh, advanced,
+                secs(*last_progress), secs(*last_getheaders));
+            if (step.getheaders) { send_locator(); *last_getheaders = now; }
             *was_handshaked = handshaked;
 
-            if (!caught_up && now - *last_progress >= std::chrono::seconds(kNoProgressFailoverSec)) {
-                LOG_INFO << "[EMB-BIP110] no header progress for " << kNoProgressFailoverSec
-                         << "s (height=" << h << ", handshaked=" << handshaked << ") — failover";
+            if (step.failover) {
+                LOG_INFO << "[EMB-BIP110] no header progress for " << secs(*last_progress)
+                         << "s (height=" << h << ", handshaked=" << handshaked
+                         << ", caught_up=" << caught_up << ") — failover";
                 dial_next();
                 *last_progress = now;
                 *was_handshaked = false;
@@ -2533,6 +2558,11 @@ int run_embedded(bool coin_p2p_discover,
         }
         } // if (mi != nullptr)
     }
+    // HTTP on the stratum port (--stratum-http; auto follows the --http bind).
+    if (stratum_server)
+        core::configure_stratum_http(*stratum_server, web_server.get(),
+                                     core::stratum_http_mode_setting(),
+                                     core::stratum_http_limits_setting());
 
     // Periodic tip log — the live-proof capture line.
     auto tip_timer = std::make_shared<io::steady_timer>(ioc);
@@ -2759,6 +2789,27 @@ int main(int argc, char** argv)
             }
         }
         else if (arg == "--no-stratum") { stratum_port = 0; }
+        else if (arg == "--stratum-http" || arg.rfind("--stratum-http=", 0) == 0) {
+            // the web API on the stratum port too (core/stratum_http.hpp)
+            if (!core::parse_stratum_http_flag(arg, core::stratum_http_mode_setting())) {
+                std::fprintf(stderr, "bad value: %s (expected --stratum-http=true, false or auto)\n",
+                             arg.c_str());
+                return 1;
+            }
+        }
+        // --stratum-http-budget N / --stratum-http-per-ip N (core/stratum_http.hpp).
+        else if (arg == "--stratum-http-budget" && i + 1 < argc) {
+            if (!core::parse_stratum_http_count(argv[++i], core::stratum_http_limits_setting().budget)) {
+                std::fprintf(stderr, "bad value: --stratum-http-budget %s (expected a count)\n", argv[i]);
+                return 1;
+            }
+        }
+        else if (arg == "--stratum-http-per-ip" && i + 1 < argc) {
+            if (!core::parse_stratum_http_count(argv[++i], core::stratum_http_limits_setting().per_ip)) {
+                std::fprintf(stderr, "bad value: --stratum-http-per-ip %s (expected a count)\n", argv[i]);
+                return 1;
+            }
+        }
         else if ((arg == "--node-owner-address" || arg == "--donation") && i + 1 < argc) {
             donation_address = argv[++i];
         }

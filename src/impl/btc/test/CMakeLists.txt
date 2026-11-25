@@ -16,12 +16,14 @@ if (BUILD_TESTING AND GTest_FOUND)
         f10b_version_punish_removal_test.cpp
         f11_donation_invariance_test.cpp
         finder_fee_integer_exact_test.cpp
+        found_block_ledger_test.cpp
         found_block_verify_test.cpp
         g01_share_format_parity_test.cpp
         g0_share_wire_parity_test.cpp
         genesis_check_test.cpp
         gentx_coinbase_test.cpp
         gentx_unpack_test.cpp
+        header_source_step_test.cpp
         idle_progress_gate_test.cpp
         known_txs_retention_test.cpp
         legacy_addrme_self_probe_test.cpp
@@ -59,6 +61,12 @@ if (BUILD_TESTING AND GTest_FOUND)
     # not own — folded into this EXISTING allowlisted target (no new executable).
     target_compile_definitions(btc_share_test PRIVATE
         BTC_SHARE_TRACKER_SRC="${CMAKE_CURRENT_SOURCE_DIR}/../share_tracker.hpp")
+    # found_block_ledger_test.cpp: found_blocks_db across a restart, the
+    # --import-found-blocks argv pass and the import over a real in-memory
+    # btc::coin::HeaderChain (impl/btc/found_block_ledger.hpp), plus a
+    # source-structural guard that main_btc.cpp wires them.
+    target_compile_definitions(btc_share_test PRIVATE
+        BTC_MAIN_SRC="${CMAKE_CURRENT_SOURCE_DIR}/../../../c2pool/main_btc.cpp")
     # btc_stratum: won_block_mints_share_test.cpp (#887) constructs a live
     # BTCWorkSource and drives mining_submit. FOLDED into this EXISTING
     # allowlisted target rather than a new add_executable -- a new one would

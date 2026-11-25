@@ -15,6 +15,7 @@
 #include <set>
 #include <map>
 #include <unordered_map>
+#include <vector>
 #include <array>
 #include <iomanip>
 #include <sstream>
@@ -33,12 +34,14 @@
 #include <core/hashrate_ring.hpp>
 #include <core/featured_node.hpp>
 #include <core/stratum_types.hpp>
+#include <core/stratum_http.hpp>
 #include <core/hashing_elsewhere.hpp>
 #include <core/stratum_work_source.hpp>
 #include <c2pool/payout/payout_manager.hpp>
 #include <c2pool/hashrate/tracker.hpp>
 #include <core/address_utils.hpp>
 #include <core/found_block_submit.hpp>
+#include <core/found_block_import.hpp>
 #include <core/graph_history.hpp>
 #include <core/pool_luck.hpp>
 #include <core/template_refresh.hpp>
@@ -66,16 +69,63 @@ using tcp = net::ip::tcp;
 class MiningInterface;
 class StratumServer;
 
+/// How an HttpSession serves its connection. The default is the web port.
+struct HttpSessionOptions {
+    /// The connection came in on the stratum port (core/stratum_http.hpp):
+    /// - GET and HEAD only; any other method 405 (Allow: GET, HEAD);
+    /// - no request is direct local, whatever the peer address: the local-only
+    ///   and loopback-only routes answer it as a remote client (403);
+    /// - /sharechain/stream: 405 with an empty Allow, never handed off;
+    /// - one response per connection; a body of at most kStratumPortBodyLimit
+    ///   bytes.
+    bool stratum_port = false;
+    /// The response write is closed at write start + write_timeout, whatever
+    /// it has sent: a whole-write bound counted from the write start stored
+    /// once per response, not a progress window. One term of the write
+    /// deadline's min(). 0: no term. On the stratum port
+    /// WebServer::adopt_stratum_http sets it to the web idle timeout, and to
+    /// 30 s when that is 0.
+    std::chrono::milliseconds write_timeout{0};
+    /// When the request started (the stratum hand-off): the read deadlines
+    /// count from here. {}: from run().
+    std::chrono::steady_clock::time_point started{};
+    /// The owner's end of the whole exchange (the stratum handshake deadline),
+    /// fixed at construction. Every expiry the session arms, reading or
+    /// writing, is min(that expiry, deadline); a session that runs at or
+    /// after it closes without reading. nullopt: none.
+    std::optional<std::chrono::steady_clock::time_point> deadline;
+    /// With `deadline`, on the stratum port: at the deadline a timer on the
+    /// stratum io_context shuts the connection down (both directions); the
+    /// session marks it closed before it closes the socket, and the slot is
+    /// released when it does.
+    std::shared_ptr<StratumHttpDeadlineShutdown> deadline_shutdown;
+    /// Called once per response with the method, the target without its
+    /// query string, and the status.
+    std::function<void(const std::string& method, const std::string& target, unsigned status)> on_response;
+    /// Called instead of the per-error warning with where and why the request
+    /// failed.
+    std::function<void(const std::string& what)> on_error;
+};
+
 /// HTTP Session handler for incoming connections
 class HttpSession : public std::enable_shared_from_this<HttpSession>
 {
-    // The session's place under WebServer's HTTP cap: declared first, so it
-    // is released after the socket is closed.
+    // The slot the session holds: on the web port its place under WebServer's
+    // HTTP cap, on the stratum port its place under the stratum caps
+    // (StratumServer::acquire_http_slot). Declared first: released after the
+    // socket is closed, when the session ends.
     std::shared_ptr<void> slot_;
     tcp::socket socket_;
     beast::flat_buffer buffer_;
     http::request<http::string_body> request_;
     std::shared_ptr<MiningInterface> mining_interface_;
+    HttpSessionOptions opts_;
+    bool head_request_{false};   // HEAD: the GET response's header, no body
+    // Writing the response: closed at the expiry arm_write_deadline() sets.
+    // write_started_: set once per response, by begin_write().
+    net::steady_timer write_deadline_;
+    std::chrono::steady_clock::time_point write_started_{};
+    bool writing_{false};
     // Reading the request: the parser (beast's default limits, as
     // http::async_read: an 8 KB head, a 1 MB body) and its deadlines. The
     // connection is closed when no byte arrives for idle_timeout_, or when
@@ -92,21 +142,52 @@ class HttpSession : public std::enable_shared_from_this<HttpSession>
 public:
     static constexpr std::chrono::milliseconds kIdleTimeout{30000};
     static constexpr std::chrono::milliseconds kRequestTimeout{120000};
+    /// Request body bound on the stratum port.
+    static constexpr std::uint64_t kStratumPortBodyLimit = 4096;
 
     explicit HttpSession(tcp::socket socket, std::shared_ptr<MiningInterface> mining_interface,
                          std::shared_ptr<void> slot = {},
                          std::chrono::milliseconds idle_timeout = kIdleTimeout,
-                         std::chrono::milliseconds request_timeout = kRequestTimeout);
-    void run();
+                         std::chrono::milliseconds request_timeout = kRequestTimeout,
+                         HttpSessionOptions options = {});
+    ~HttpSession();
+    HttpSession(const HttpSession&) = delete;
+    HttpSession& operator=(const HttpSession&) = delete;
+    /// Serve one request. `initial`: bytes already read from the socket (the
+    /// stratum port's sniff), parsed before anything more is read.
+    void run(std::string initial = {});
+    /// Close the connection and release its slot now. Called only once the
+    /// HTTP thread has been joined.
+    void abandon();
 
 private:
     void read_request();
+    // Feed buffer_ to the parser; then answer, read more, or end on an error.
+    void on_bytes(std::size_t bytes_transferred);
     void arm_deadline();
     void end_reading();
+    // `at`, or opts_.deadline when that is earlier.
+    std::chrono::steady_clock::time_point no_later_than_owner(
+        std::chrono::steady_clock::time_point at) const;
+    // Stores the write start, then arms the write deadline. Once per response.
+    void begin_write();
+    // The write deadline: min(opts_.deadline, write_started_ +
+    // opts_.write_timeout), each term when set; none when neither is. Every
+    // call gives the same expiry.
+    void arm_write_deadline();
+    void end_writing();
+    // Mark the connection closed (opts_.deadline_shutdown), then shut down and
+    // close the socket.
+    void close_socket();
     void process_request();
+    // The status line and headers every response carries (server, content
+    // type, CORS when configured, security headers).
+    http::response<http::string_body> base_response(http::status status) const;
     void send_response(http::response<http::string_body> response);
     void handle_error(beast::error_code ec, char const* what);
     bool is_direct_local() const;
+    // Test access (core_test).
+    friend struct HttpSessionTestAccess;
 };
 
 /// True when an HTTP request came straight from this host: the peer address
@@ -319,6 +400,7 @@ public:
     nlohmann::json rest_miner_stats(const std::string& address);  // /miner_stats/<addr> — detailed per-miner stats
     nlohmann::json rest_best_share();               // /best_share — node-wide best share (BitAxe style)
     nlohmann::json rest_miner_payouts(const std::string& address); // /miner_payouts/<addr> — payout history per miner
+    nlohmann::json rest_merged_miner_payouts(const std::string& address); // /merged_miner_payouts/<addr> — merged (aux) blocks per miner
     nlohmann::json rest_version_signaling(const nlohmann::json* cached_sc = nullptr); // /version_signaling — V36 version tracking
     nlohmann::json rest_v36_status();                // /v36_status — V36 diagnostic
     nlohmann::json rest_patron_sendmany(const std::string& total); // /patron_sendmany/<total> — sendmany text
@@ -1230,6 +1312,25 @@ public:
         // false: its difficulty is unknown until the aux header chain names
         // it. Persisted (fblk extension byte). Meaningless on a parent row.
         bool aux_difficulty_known{false};
+        // The row came from an import of another node's history
+        // (import_found_blocks), not from this node's own observation of
+        // the block: served as provenance "imported", found_locally false.
+        // A later record of the block by this node clears it. Persisted (fblk
+        // extension byte).
+        bool imported{false};
+        // Another node's measured effort of the round that ends in this block
+        // (import_found_blocks: the source row's effort / history_coverage /
+        // prev_block_hash; taken only where it was integrated, the source was
+        // watching when the block was found, it is plausibly the pool's, and
+        // it covered more of the same round than this node's own history
+        // did). An INPUT, kept when the node later records the block itself:
+        // luck uses it while it still covers more of the round than this
+        // node's own integral and the round still runs from
+        // imported_prev_hash (core::luck::imported_effort_wins). 0 = none.
+        // Persisted (fblk extension tail, behind an extension-byte bit).
+        double      imported_effort{0};
+        double      imported_coverage{0};   // the source's history_coverage, (0, 1]
+        std::string imported_prev_hash;     // the block the source timed the round from
         // ── Luck (core/pool_luck.hpp). DERIVED, never persisted: recomputed
         // from the inputs above and the pool rate history on every insert,
         // load, input repair and read, so a stored bad input heals. effort is
@@ -1526,6 +1627,37 @@ public:
     void correct_found_block_heights(const block_height_lookup_fn& height_fn,
                                      uint64_t tip_height);
 
+    /// Import found-block history from another node (core/found_block_import.hpp):
+    /// ONE pass. A row gets in only when the source's header chain for its
+    /// chain holds its hash on the best chain; height, time and difficulty
+    /// are then the header's. A block the ledger holds is merged fill-only.
+    /// Rows whose header chain is not ready come back in Report::deferred.
+    /// New rows are provenance "imported", confirmed when 6 deep (pending and
+    /// verified like a find before), and take part in luck like any row; an
+    /// at-find pool rate that is not plausibly the pool's is not stored.
+    /// Persists what it changes; records no checkpoint and ends no round.
+    /// NO LOCK MAY BE HELD (the lookups run with the ledger unlocked).
+    core::found_block_import::Report import_found_blocks(
+        const std::vector<core::found_block_import::Row>& rows,
+        const core::found_block_import::Source& source);
+
+    /// The startup one-shot (--import-found-blocks): the files in the order
+    /// given, each to the end before the next -- import_found_blocks now,
+    /// then every `retry` on the io_context for the rows still waiting for a
+    /// header chain, until none wait. Logs a summary line per file and the
+    /// total; `on_done` (optional) gets the total.
+    void start_found_block_import(
+        std::vector<core::found_block_import::File> files,
+        core::found_block_import::Source source,
+        std::chrono::milliseconds retry = std::chrono::seconds(30),
+        std::function<void(const core::found_block_import::Report&)> on_done = {});
+    /// One file.
+    void start_found_block_import(
+        core::found_block_import::Parsed parsed,
+        core::found_block_import::Source source,
+        std::chrono::milliseconds retry = std::chrono::seconds(30),
+        std::function<void(const core::found_block_import::Report&)> on_done = {});
+
     /// A found-block row of THIS node's own (parent) chain, as opposed to a
     /// merged/aux child (DOGE on an LTC node) that rides the same ledger. A
     /// merged row carries its parent block (#946 parent_hash) or a chain
@@ -1547,6 +1679,12 @@ public:
     /// shares) decodes back to that address; a bare 20-byte pubkey hash
     /// (v36) cannot be rendered without its script type and reads "".
     static std::string found_block_miner_display(const std::string& stored);
+    /// A row's miner is this address's payee: the same address, another
+    /// spelling of the same script, or a pre-fix raw 20-byte pubkey hash
+    /// (uint160::GetHex, byte-reversed) that is the hash of the address's
+    /// P2PKH, P2WPKH or P2SH script. An empty address matches every row.
+    static bool found_block_miner_pays(const std::string& stored,
+                                       const std::string& address);
     /// Block-explorer prefix for a merged (aux) chain label ("" = none known,
     /// emitted as null). The parent prefix (block_explorer_prefix) must never
     /// link an aux hash: blockchair/litecoin answers "not found" for a DOGE id.
@@ -1688,6 +1826,21 @@ public:
     /// The gross pool rate right now: the estimator's non-stale rate over
     /// (1 - the newest sampled stale proportion). 0 = no estimator reading.
     double gross_pool_hashrate() const;
+    /// The gross pool rate as a reading AT `block_ts`: gross_pool_hashrate()
+    /// when the block is no more than kLiveRateAtFindMaxLag from `now` (a
+    /// peer's share relayed as it is found), else 0 -- a block learned long
+    /// after it was found (the startup scan of the share chain) is not
+    /// measured at today's rate. What a merged block learned from a peer is
+    /// stored with (DiscoveredMergedBlock::pool_hashrate).
+    /// KNOWN LIMIT: on a FRESH node's first share-chain sync a block whose
+    /// share is under kLiveRateAtFindMaxLag old gets the estimator's reading
+    /// over a chain still filling its lookbehind; nothing checks it when it
+    /// is stored, and without rate history the display lets it stand (one
+    /// row, display only; a restart never re-stores a held block).
+    double gross_pool_hashrate_at(double block_ts, double now) const;
+    /// How far a block's time may be from now for the live rate to stand as
+    /// its rate at find.
+    static constexpr double kLiveRateAtFindMaxLag = 600.0;
 
 private:
     /// The luck rate history is bounded like the year-scale graph store that
@@ -1738,6 +1891,10 @@ private:
     /// plausibly a pool rate, else the history's at the block's own time,
     /// else none. CALLER MUST HOLD m_luck_history_mutex.
     RateAtFind rate_at_find_locked(const FoundBlock& b) const;
+    /// The same for a rate `recorded` with a block of time `ts` whose
+    /// winning share had `share_difficulty` (0 = not known): a merged block
+    /// the merged manager holds. CALLER MUST HOLD m_luck_history_mutex.
+    RateAtFind rate_at_find_locked(double recorded, double share_difficulty, double ts) const;
     /// The aux header chain's difficulty for a merged block (0 = no lookup
     /// wired for the chain, or it does not hold the header). Takes
     /// m_blocks_mutex for the lookup, calls it with the lock released.
@@ -2981,6 +3138,16 @@ public:
     //   stalled  -- shared on this connection, then went silent, and no
     //               evidence that it hashes elsewhere
     static const char* session_state(const WorkerLiveness& lv);
+    // Local hash rate counts only sessions that are currently submitting, i.e.
+    // in the "hashing" state above. A session's registry hashrate is updated
+    // only on an accepted share, so it stays frozen when the rig stops
+    // submitting; standby (failover, failback) and stalled sessions therefore
+    // contribute nothing. Returns {miner_hash_rates, miner_dead_hash_rates},
+    // keyed by the full stratum username (ADDRESS.worker, else ADDRESS).
+    static bool is_submitting(const WorkerLiveness& lv) { return lv.has_shared && !lv.silent; }
+    static std::pair<nlohmann::json, nlohmann::json> submitting_miner_rates(
+        const std::map<std::string, WorkerInfo>& workers,
+        const std::map<std::string, WorkerLiveness>& liveness);
     // Failback: set hashing_elsewhere on every session that is not hashing
     // here when the shared rule (core/hashing_elsewhere.hpp) holds for its
     // payout address: a share minted on another node newer than the session's
@@ -3053,7 +3220,7 @@ class WebServer
     std::string bind_address_;
     uint16_t port_;
     uint16_t stratum_port_;  // Explicit Stratum port configuration
-    bool running_;
+    std::atomic<bool> running_;   // read by the HTTP thread's loop
     bool rpc_refresh_armed_{false};
     uint256 last_parent_block_;   // refresh_on_parent_block dedup
     bool testnet_;
@@ -3067,6 +3234,22 @@ class WebServer
     std::atomic<int64_t> http_request_timeout_ms_{HttpSession::kRequestTimeout.count()};
     std::thread server_thread_;
     std::unique_ptr<StratumServer> stratum_server_;
+    // HTTP on the stratum port (core/stratum_http.hpp): the mode this
+    // server's own stratum acceptor resolves (--stratum-http), whether the
+    // HTTP thread is serving, and the gate a stratum server's handler goes
+    // through (cleared in stop(); a cleared gate declines).
+    StratumHttpMode stratum_http_mode_ = StratumHttpMode::Off;
+    StratumHttpLimits stratum_http_limits_{};
+    std::atomic<bool> http_serving_{false};
+    struct StratumHttpGate {
+        std::mutex mutex;
+        WebServer* web = nullptr;
+    };
+    std::shared_ptr<StratumHttpGate> stratum_http_gate_ = std::make_shared<StratumHttpGate>();
+    // The stratum-port sessions handed to the HTTP thread (weak): stop()
+    // closes the ones still open and releases their slots.
+    std::mutex stratum_http_sessions_mutex_;
+    std::vector<std::weak_ptr<HttpSession>> stratum_http_sessions_;
 
     // Solo mining configuration
     bool solo_mode_;
@@ -3146,6 +3329,24 @@ public:
     }
     size_t http_sessions() const { return http_live_->load(); }
 
+    /// --stratum-http for the stratum acceptor this server starts itself
+    /// (start() / start_solo(): the LTC lane). Set before start().
+    void set_stratum_http_mode(StratumHttpMode mode) { stratum_http_mode_ = mode; }
+    /// --stratum-http-budget / --stratum-http-per-ip for that acceptor. Set
+    /// before start().
+    void set_stratum_http_limits(StratumHttpLimits limits) { stratum_http_limits_ = limits; }
+    StratumHttpMode get_stratum_http_mode() const { return stratum_http_mode_; }
+    /// The HTTP listener is up and its thread is serving.
+    bool is_http_serving() const { return http_serving_.load(); }
+    const std::string& get_bind_address() const { return bind_address_; }
+    /// The handler a StratumServer hands HTTP connections to: each is served
+    /// by an HttpSession on this server's HTTP thread, in stratum-port mode
+    /// (HttpSessionOptions::stratum_port). It declines (false) while this
+    /// server is not serving or after it stopped.
+    StratumHttpHandler stratum_http_handler();
+    /// The stratum server's own StratumServer (null when not started).
+    StratumServer* get_stratum_server() const { return stratum_server_.get(); }
+
     // Dashboard directory for static file serving
     void set_dashboard_dir(const std::string& dir);
     void set_analytics_id(const std::string& id);
@@ -3209,6 +3410,8 @@ public:
 private:
     void accept_connections();
     void handle_accept(beast::error_code ec, tcp::socket socket);
+    // Move a stratum-port HTTP connection onto the HTTP thread and serve it.
+    bool adopt_stratum_http(StratumHttpRequest& req);
     // Body of a debounced work refresh (capture prev tip → refresh → caches →
     // SSE). Runs on the leading edge and on the trailing coalesced timer.
     void execute_debounced_work_refresh(core::RefreshCause cause);
@@ -3217,6 +3420,23 @@ private:
 };
 
 // StratumSession and StratumServer — see stratum_server.hpp
+
+/// Turn HTTP on the stratum port on or off for `stratum` (core/stratum_http.hpp)
+/// and log the resolved state ("stratum HTTP: ON (web bound to 0.0.0.0)"):
+/// `web` is the node's web server (null when it has none); auto follows its
+/// bind address and the stratum server's (resolve_stratum_http). Returns the
+/// decision. Call once both are set up (after web->start()); until then the
+/// stratum port keeps the legacy behaviour. `limits`: --stratum-http-budget
+/// and --stratum-http-per-ip (stratum_http_budget).
+StratumHttpDecision configure_stratum_http(StratumServer& stratum, WebServer* web,
+                                           StratumHttpMode mode,
+                                           StratumHttpLimits limits = StratumHttpLimits{});
+
+/// A timer on `stratum_executor` that calls shutdown->fire() at `at`;
+/// shutdown->mark_closed() cancels it.
+void arm_stratum_http_deadline_shutdown(const net::any_io_executor& stratum_executor,
+                                        std::chrono::steady_clock::time_point at,
+                                        std::shared_ptr<StratumHttpDeadlineShutdown> shutdown);
 
 /// Per-coin payout-scheme relabel of one served static text asset (used only
 /// when MiningInterface::get_payout_scheme_label() is non-empty). Every literal

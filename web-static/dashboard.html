@@ -686,6 +686,9 @@
         .pace-slow { color: var(--pace-slow); }
         .pace-strong { font-weight: 700; }
         .effort-unknown { color: var(--text-muted); }
+        /* An effort measured by the node the history was imported from
+           (effort_method "imported"): a small mark with its own tooltip. */
+        .effort-imported { margin-left: 3px; font-size: 10px; color: var(--text-muted); cursor: help; }
         /* Duplet bracket down the first cell of the pair's rows: a dashed
            edge, with a tick on the later (upper) and the earlier (lower) row. */
         td.duplet-edge { position: relative; border-left: 2px dashed var(--pace-fast); }
@@ -2156,6 +2159,7 @@
                         <span class="badge" id="luck_seven_days" style="background: var(--primary); cursor: help;" title="Pool luck, 7 days">7d: —</span>
                         <span class="badge" id="luck_thirty_days" style="background: var(--primary); cursor: help;" title="Pool luck, 30 days">30d: —</span>
                         <span class="badge" id="luck_ninety_days" style="background: var(--primary); cursor: help;" title="Pool luck, 90 days">90d: —</span>
+                        <a class="badge" id="cz_extraction_link" style="display: none; background: var(--primary); text-decoration: none;" href="https://chainz.cryptoid.info/dash/extraction.dws?30.htm" target="_blank" rel="noopener" title="Dash blocks that chainz (CryptoID) attributes to P2Pool-DASH, over the chain's history (page id 30, not 30 days). The line counts every p2pool-dash-compatible pool: c2pool's blocks carry /P2Pool-DASH/c2pool/ in the coinbase, legacy p2pool-dash nodes only /P2Pool-DASH/.">P2Pool-DASH on chainz ↗</a>
                     </div>
                     <div class="classic-luck" id="classic_luck_strip">
                         <div><span title="How many blocks were produced relative to how many were expected in each window (p2pool.info, 2012). Numbers larger than 100% mean the pool was lucky.">Pool Luck (7 days, 30 days, 90 days):</span>
@@ -3649,7 +3653,68 @@
             } else {
                 document.getElementById('miner-url').textContent = 'unavailable';
             }
+            c2pDeploymentConnect();
         });
+
+        // A multi-pool deployment (/api/pools, e.g. the dual view's proxy) may
+        // publish, per chain, its stratum endpoints by region and its share
+        // chain identity. On such a page the Miner Configuration panel lists
+        // every endpoint (pick the closest) and how to run your own node.
+        // Without that entry the panel stays exactly as above.
+        function c2pDeploymentConnect() {
+            var m = /^\/api\/([a-z0-9_-]{1,32})$/.exec(String(window.multipoolApiBase || ''));
+            if (!m || !window.fetch || window.__c2pDeployConnect) return;
+            window.__c2pDeployConnect = true;
+            fetch('/api/pools').then(function(r) { return r.ok ? r.json() : null; }).then(function(pools) {
+                var p = Array.isArray(pools) && pools.filter(function(q) { return q && q.id === m[1]; })[0];
+                if (!p) return;
+                var SRE = /^stratum\+(tcp|ssl):\/\/[A-Za-z0-9.-]{1,253}:[0-9]{1,5}$/;
+                var RRE = /^[A-Za-z0-9 .()-]{1,24}$/, HEX = /^[0-9a-f]{16}$/, HP = /^[A-Za-z0-9.-]{1,253}:[0-9]{1,5}$/;
+                var eps = (Array.isArray(p.endpoints) ? p.endpoints : []).filter(function(e) {
+                    return e && RRE.test(String(e.region)) && SRE.test(String(e.stratum));
+                }).slice(0, 8);
+                var mu = document.getElementById('miner-url');
+                if (eps.length && mu) {
+                    mu.textContent = '';
+                    eps.forEach(function(e, i) {
+                        if (i) mu.appendChild(document.createTextNode('  |  '));
+                        var b = document.createElement('strong'); b.textContent = e.region + ' ';
+                        mu.appendChild(b); mu.appendChild(document.createTextNode(e.stratum));
+                        if (/^\/api\/[a-z0-9_-]{1,32}$/.test(String(e.dashboard)) && e.dashboard !== window.multipoolApiBase) {
+                            var dl = document.createElement('a');
+                            dl.href = 'dashboard.html?api=' + encodeURIComponent(e.dashboard);
+                            dl.textContent = ' (dashboard)';
+                            mu.appendChild(dl);
+                        }
+                    });
+                    if (eps.length > 1) {
+                        var hint = document.createElement('div');
+                        hint.style.cssText = 'margin-top:3px;color:#888;';
+                        hint.textContent = 'Pick the node closest to you; all mine the same share chain.';
+                        mu.parentNode.appendChild(hint);
+                    }
+                }
+                var s = p.share_chain, box = document.getElementById('miner-info');
+                if (box && s && HEX.test(String(s.network_id)) && HEX.test(String(s.prefix))) {
+                    var adds = (Array.isArray(s.addnodes) ? s.addnodes : []).filter(function(a) { return HP.test(String(a)); }).slice(0, 8);
+                    var own = document.createElement('div');
+                    own.style.cssText = 'font-size:0.8rem;margin-top:6px;';
+                    var t = document.createElement('div');
+                    t.textContent = 'Own node (your fee, your rules): network-id ' + s.network_id + ', prefix ' + s.prefix
+                        + (s['default'] === true ? ' (default p2pool-dash identity: no flags needed)' : '');
+                    var c = document.createElement('code');
+                    c.style.cssText = 'display:block;white-space:pre-wrap;word-break:break-all;margin-top:3px;';
+                    c.textContent = 'c2pool-dash --run --embedded-mainnet --embedded-utxo'
+                        + (s['default'] === true ? '' : ' --network-id ' + s.network_id + ' --prefix ' + s.prefix)
+                        + adds.map(function(a) { return ' --addnode ' + a; }).join('') + ' --fee <percent>';
+                    var a = document.createElement('a');
+                    a.href = 'https://github.com/frstrtr/c2pool/releases'; a.target = '_blank'; a.rel = 'noopener';
+                    a.textContent = 'Download c2pool →';
+                    own.appendChild(t); own.appendChild(c); own.appendChild(a);
+                    box.appendChild(own);
+                }
+            }).catch(function() { /* no deployment config: keep the default panel */ });
+        }
         
         function loadStats() {
             // Fetch all stats in parallel instead of nested sequential requests.
@@ -4765,12 +4830,31 @@
                             .text('⁑ duplet');
                     }
                 });
-                tr.append('td').append('a')
+                var hashTd = tr.append('td');
+                hashTd.append('a')
                     .attr('class', 'hash-link')
                     .attr('href', function(b) { return currency_info.block_explorer_url_prefix + b.hash; })
                     .attr('target', '_blank')
                     .attr('title', function(b) { return b.hash; })
                     .text(function(b) { return '...' + b.hash.substr(-8); });
+                // DASH: a second explorer next to the configured one, so a lagging
+                // explorer index ("block not found" minutes after the find) has a
+                // fallback one click away.
+                var isDashChain = ((currency_info && currency_info.symbol) || '').toUpperCase() === 'DASH'
+                    && !/testnet/i.test((currency_info && currency_info.block_explorer_url_prefix) || '');   // chainz links are mainnet
+                d3.select('#cz_extraction_link').style('display', isDashChain ? null : 'none');
+                if (isDashChain) {
+                    hashTd.filter(function(b) { return /^[0-9a-f]{64}$/i.test(b.hash || ''); })
+                        .append('a')
+                        .attr('class', 'hash-link')
+                        .attr('href', function(b) { return 'https://chainz.cryptoid.info/dash/block.dws?' + b.hash + '.htm'; })
+                        .attr('target', '_blank')
+                        .attr('rel', 'noopener')
+                        .attr('title', 'Open this block on chainz (CryptoID)')
+                        .style('margin-left', '6px')
+                        .style('font-size', '0.8em')
+                        .text('cz');
+                }
                 // Effort: round duration vs. expected, coloured at the bounds
                 // the luck colours had (luck = 1 / effort is in the tooltip).
                 tr.append('td')
@@ -4786,6 +4870,7 @@
                         if (b.luck_method === 'netdiff_unavailable' || b.luck_method === 'hashrate_unavailable') return 'n/a';
                         return '—';
                     })
+                    .each(function(b) { c2pImportedMark(d3.select(this), paceOf(b)); })
                     .attr('title', function(b) { return c2pEffortCellTip(b, paceOf(b)); });
                 tr.append('td')
                     .attr('style', 'font-family: monospace; font-size: 11px;')
@@ -4965,6 +5050,7 @@
                                     .text(p.tag + ' ');
                             }
                             td.append('span').text((p.first ? '1st ' : '') + c2pFmtPct(p.effort * 100));
+                            c2pImportedMark(td, p);
                             if (p.duplet) {
                                 td.append('span').attr('class', 'duplet-pill')
                                     .attr('title', c2pDupletTip(p))
@@ -5066,12 +5152,26 @@
                     
                     tr.append('td').text(function(b) { return format_time_short(b.ts); });
                     tr.append('td').text(function(b) { return b.number || '-'; });
-                    tr.append('td').append('a')
-                        .attr('class', 'hash-link')
-                        .attr('href', function(b) { return currency_info.block_explorer_url_prefix + b.hash; })
-                        .attr('target', '_blank')
-                        .attr('title', function(b) { return b.hash; })
-                        .text(function(b) { return '...' + b.hash.substr(-8); });
+                    // The parent header is a parent-chain block only when the header chain
+                    // knows its height (b.number). Without it the header met the aux target
+                    // only, so there is no parent-chain block to link to.
+                    tr.append('td').each(function(b) {
+                        var td = d3.select(this);
+                        if (b.number) {
+                            td.append('a')
+                                .attr('class', 'hash-link')
+                                .attr('href', currency_info.block_explorer_url_prefix + b.hash)
+                                .attr('target', '_blank')
+                                .attr('title', b.hash)
+                                .text('...' + b.hash.substr(-8));
+                        } else {
+                            td.append('span')
+                                .style('font-family', 'monospace')
+                                .style('color', 'var(--text-muted)')
+                                .attr('title', 'Parent header ' + b.hash + ' (not a ' + ((currency_info && currency_info.symbol) || 'parent-chain') + ' block)')
+                                .text('...' + b.hash.substr(-8));
+                        }
+                    });
                     tr.append('td')
                         .style('color', '#6f42c1')
                         .style('font-weight', 'bold')
@@ -8749,7 +8849,9 @@
         // round. With under this share of the round covered it is mostly
         // extrapolation: the value is shown, muted, and the round gets no
         // fast / slow tag and closes no duplet; the open round is called no
-        // dry spell and gets no dry-spell band.
+        // dry spell and gets no dry-spell band. The node takes another
+        // node's figure (--import-found-blocks) only at or above the same
+        // share (core::luck::kImportedCoverageFloor).
         var C2P_MIN_TAG_COVERAGE = 0.5;
         var C2P_TREND_ROUNDS = 10;
         var C2P_LUCK_CAP = 1000;
@@ -8833,14 +8935,36 @@
         function c2pCoveredEffort(effort, method, coverage, served) {
             var own = c2pNum(served);
             if (own !== null && own >= 0) return own;
-            return method === 'integrated' && c2pNum(coverage) !== null ? effort * coverage : effort;
+            return c2pIntegratedMethod(method) && c2pNum(coverage) !== null ? effort * coverage : effort;
+        }
+        // An integral over a rate history: this node's own ('integrated'), or
+        // that of the node the history was imported from ('imported', where
+        // it covers more of the round; history_coverage is then that node's).
+        function c2pIntegratedMethod(method) {
+            return method === 'integrated' || method === 'imported';
         }
         // Whether an effort is mostly extrapolation: integrated over a rate
         // history that covers less than C2P_MIN_TAG_COVERAGE of the round. A
         // single sample, the first block and an older node's row are not
         // scaled up from a part, and carry no coverage to judge by.
         function c2pLowCoverage(method, coverage) {
-            return method === 'integrated' && c2pNum(coverage) !== null && coverage < C2P_MIN_TAG_COVERAGE;
+            return c2pIntegratedMethod(method) && c2pNum(coverage) !== null && coverage < C2P_MIN_TAG_COVERAGE;
+        }
+        // The note on an effort measured by the source node of an import.
+        function c2pImportedNote(p) {
+            if (!p || p.method !== 'imported') return '';
+            return 'Measured by the source node of this node\'s imported block history ' +
+                '(--import-found-blocks): its pool hashrate history covers ' +
+                (p.coverage !== null ? Math.round(p.coverage * 100) + ' %' : 'part') +
+                ' of the round, more than this node\'s own does. The pool hashrate is the share chain\'s, ' +
+                'the same on every node, so its figure stands for the pool.';
+        }
+        // The small mark after an imported effort, with that note as its tooltip.
+        function c2pImportedMark(td, p) {
+            if (!p || p.method !== 'imported' || p.effort === null) return;
+            td.append('span').attr('class', 'effort-imported')
+                .attr('title', c2pImportedNote(p))
+                .text('⇣');
         }
         // What a round adds to a pooled figure: its covered effort to the
         // blocks expected, and its block to the blocks found unless it was
@@ -9312,6 +9436,11 @@
                 return 'First block known to this node: there is no earlier block to time its round from, ' +
                     'so it counts as effort 100 % (luck 100 %).';
             }
+            if (p.source === 'server' && p.method === 'imported') {
+                return c2pImportedNote(p) +
+                    (p.coverage !== null && p.coverage < 0.995 ? ' The rest of the round is taken at its mean.' : '') +
+                    (p.lowCoverage ? ' Under half of the round is measured: the figure is mostly extrapolation, so it has no fast / slow tag.' : '');
+            }
             if (p.source === 'server' && p.method === 'integrated') {
                 return 'Effort integrated over the round from the pool hashrate and difficulty history' +
                     (p.coverage !== null && p.coverage < 0.995
@@ -9756,6 +9885,10 @@
                 var color = p.lowCoverage ? '#888' : (band === 'good' ? '#00ff88' : (band === 'mid' ? '#ffc107' : '#ff6b6b'));
                 s += 'Effort: <b style="color:' + color + '">' + c2pFmtPct(p.effort * 100) + '</b> of expected ' +
                      '<span style="font-size:10px;color:#aaa">(luck ' + c2pFmtPct(p.luck) + ')</span><br/>';
+                if (p.method === 'imported') {
+                    s += '<span style="font-size:10px;color:#aaa">(measured by the import source node; its rate history covers ' +
+                         (p.coverage !== null ? Math.round(p.coverage * 100) + ' %' : 'part') + ' of the round)</span><br/>';
+                }
                 if (p.lowCoverage) {
                     s += '<span style="font-size:10px;color:#aaa">(rate history covers ' + Math.round(p.coverage * 100) +
                          ' % of the round: mostly extrapolation, no tag)</span><br/>';
@@ -11068,7 +11201,9 @@
         function _rtStartSSE() {
             if (!_rtActive) return;
             try {
-                _rtEventSource = new EventSource('../sharechain/stream');
+                _rtEventSource = new EventSource(window.multipoolApiBase
+                    ? window.multipoolApiBase + '/sharechain/stream'
+                    : '../sharechain/stream');
                 _rtEventSource.onmessage = function(event) {
                     try {
                         var tip = JSON.parse(event.data);

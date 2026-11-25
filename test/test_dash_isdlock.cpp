@@ -39,6 +39,7 @@
 #include <impl/dash/coin/node_coin_state.hpp>
 #include <impl/dash/coin/mempool.hpp>
 #include <impl/dash/coin/utxo_lane.hpp>
+#include <impl/dash/coin/quorum_manager.hpp>
 #include <impl/dash/coin/vendor/bls_verify.hpp>
 
 #include <core/uint256.hpp>
@@ -398,6 +399,18 @@ TEST(DashIslockVerify, SelectionPicksDesignatedIndexWithinCycle)
     ASSERT_TRUE(qp.has_value());
     EXPECT_EQ(qp->base_height, kCycle - 288 + kExpectSigner);
     EXPECT_NE(qp->quorum_hash, q->quorum_hash);
+
+    // Only the designated quorum of the cycle held (others missing, e.g. one
+    // index stayed on this cycle after a failed DKG while the rest rotated
+    // out): still selected. Upstream's `signer > quorums.size()` guard is
+    // taken against the full signing list, never against what we hold.
+    std::vector<RotatedQuorumCandidate> only;
+    for (const auto& c : synthetic_cycle(kCycle, 0x10))
+        if (c.quorum_index == kExpectSigner) only.push_back(c);
+    ASSERT_EQ(only.size(), 1u);
+    auto q1 = select_rotated_quorum(p60_75(), only, kCycle, rid);
+    ASSERT_TRUE(q1.has_value()) << "a held designated quorum refused because the held subset is small";
+    EXPECT_EQ(q1->quorum_index, kExpectSigner);
 }
 
 TEST(DashIslockVerify, SelectionFailsClosedOnEveryUncertainty)
@@ -430,6 +443,332 @@ TEST(DashIslockVerify, SelectionFailsClosedOnEveryUncertainty)
     //     arm only; the score-sort arm lives in chainlock_verify.hpp).
     EXPECT_FALSE(select_rotated_quorum(dash::coin::kLlmq400_60, cands, kCycle, rid)
                      .has_value());
+}
+
+// ═══ Retained quorums — locks signed by the previous rotation cycle ══════════
+//
+// A lock names its signing quorum's own cycle, and for a few blocks after a
+// rotation the network still signs with the previous cycle; Dash Core resolves
+// the lock's own cycle (net_instantsend.cpp:136-145) and accepts it. Our
+// active set drops that cycle at the rotation diff, so every such lock was
+// refused (mainnet 11-20: the 8 blocks after each rotation). These pin the
+// retained set and the active-then-retained selection, with a stub in place
+// of the BLS check.
+
+using dash::coin::QuorumManager;
+using dash::coin::islock::IslockVerifyPass;
+using dash::coin::islock::RotatedQuorumCandidate;
+using dash::coin::islock::verify_islock_two_pass;
+using dash::coin::islock::previous_cycle_max_age;
+
+namespace {
+
+uint256 qhash(uint8_t tag, uint8_t index)
+{
+    uint256 h;
+    h.data()[0] = tag;
+    h.data()[1] = index;
+    h.data()[31] = 0x5a;
+    return h;
+}
+
+dash::coin::vendor::CFinalCommitment commit(uint8_t type, uint8_t tag, uint8_t index)
+{
+    dash::coin::vendor::CFinalCommitment c;
+    c.llmqType = type;
+    c.quorumHash = qhash(tag, index);
+    c.quorumIndex = index;
+    c.quorumPublicKey[0] = tag;
+    c.quorumPublicKey[1] = index;
+    return c;
+}
+
+// A full rotated cycle: 32 quorums at base cycle_height + i, index i, and a
+// pubkey that names the cycle (byte 0) and the index (byte 1).
+std::vector<RotatedQuorumCandidate> cycle(uint8_t tag, uint32_t cycle_height)
+{
+    std::vector<RotatedQuorumCandidate> out;
+    for (uint8_t i = 0; i < 32; ++i) {
+        RotatedQuorumCandidate c;
+        c.quorum_hash = qhash(tag, i);
+        c.base_height = cycle_height + i;
+        c.quorum_index = i;
+        c.quorum_public_key[0] = tag;
+        c.quorum_public_key[1] = i;
+        out.push_back(c);
+    }
+    return out;
+}
+
+} // namespace
+
+TEST(DashIsdlockPass2, QuorumManagerRetainsRecentlyRetiredQuorumsPerType)
+{
+    QuorumManager q;
+    constexpr uint8_t kIs = 103;   // the rotated type's byte value is irrelevant here
+    constexpr uint8_t kCl = 104;
+    auto rotate = [&](uint8_t from, uint8_t to, uint8_t first, uint8_t last) {
+        dash::coin::vendor::QuorumTail t;
+        for (uint8_t i = first; i <= last; ++i) {
+            t.deletedQuorums.emplace_back(kIs, qhash(from, i));
+            t.newQuorums.push_back(commit(kIs, to, i));
+        }
+        q.apply(t);
+    };
+    auto retired_of = [&](uint8_t tag) {
+        size_t n = 0;
+        for (const auto& e : q.retired_entries())
+            n += (e.key.llmqType == kIs && e.key.quorumHash.data()[0] == tag);
+        return n;
+    };
+
+    dash::coin::vendor::QuorumTail t;
+    for (uint8_t i = 0; i < 32; ++i) t.newQuorums.push_back(commit(kIs, 0xA0, i));
+    t.newQuorums.push_back(commit(kCl, 0xC0, 0));
+    q.apply(t);
+    EXPECT_TRUE(q.retired_entries().empty());
+
+    // Rotation A -> B delivered in TWO diffs (31, then a late 1): the whole
+    // previous cycle is retained, not just the last diff's part.
+    rotate(0xA0, 0xB0, 0, 30);
+    rotate(0xA0, 0xB0, 31, 31);
+    EXPECT_EQ(retired_of(0xA0), 32u) << "a split rotation lost part of the previous cycle";
+    EXPECT_EQ(q.active_count(), 33u) << "retired entries are not in the active set";
+
+    // Another type retiring does not touch the rotated type.
+    dash::coin::vendor::QuorumTail r2;
+    r2.deletedQuorums.emplace_back(kCl, qhash(0xC0, 0));
+    q.apply(r2);
+    EXPECT_EQ(retired_of(0xA0), 32u);
+    EXPECT_EQ(q.retired_entries().size(), 33u);
+
+    // B -> D: both A and B retained (two cycles = the per-type cap of 64).
+    rotate(0xB0, 0xD0, 0, 31);
+    EXPECT_EQ(retired_of(0xA0), 32u);
+    EXPECT_EQ(retired_of(0xB0), 32u);
+
+    // D -> E: the oldest cycle (A) leaves; B and D stay.
+    rotate(0xD0, 0xE0, 0, 31);
+    EXPECT_EQ(retired_of(0xA0), 0u) << "the per-type cap must drop the oldest cycle";
+    EXPECT_EQ(retired_of(0xB0), 32u);
+    EXPECT_EQ(retired_of(0xD0), 32u);
+
+    // A retired quorum that comes back is active again, not retired.
+    dash::coin::vendor::QuorumTail r4;
+    r4.newQuorums.push_back(commit(kIs, 0xB0, 1));
+    q.apply(r4);
+    for (const auto& e : q.retired_entries())
+        EXPECT_FALSE(e.key == (QuorumManager::ActiveKey{kIs, qhash(0xB0, 1)}));
+    EXPECT_EQ(retired_of(0xB0), 31u);
+
+    // A wipe and a warm load both empty the retained set.
+    q.clear();
+    EXPECT_TRUE(q.retired_entries().empty());
+    q.apply(t);
+    rotate(0xA0, 0xB0, 0, 31);
+    ASSERT_FALSE(q.retired_entries().empty());
+    q.replace_state({}, {});
+    EXPECT_TRUE(q.retired_entries().empty());
+}
+
+// The reorg wipe keeps the retained set and retires the wiped active entries;
+// the cold resync's full snapshot brings the current cycle back to the active
+// set and out of the retained one, leaving the previous cycle retained.
+TEST(DashIsdlockPass2, ReorgWipeKeepsTheRetainedSetThroughTheSnapshot)
+{
+    QuorumManager q;
+    constexpr uint8_t kIs = 103;
+    auto retired_of = [&](uint8_t tag) {
+        size_t n = 0;
+        for (const auto& e : q.retired_entries())
+            n += (e.key.llmqType == kIs && e.key.quorumHash.data()[0] == tag);
+        return n;
+    };
+    dash::coin::vendor::QuorumTail a;
+    for (uint8_t i = 0; i < 32; ++i) a.newQuorums.push_back(commit(kIs, 0xA0, i));
+    q.apply(a);
+    dash::coin::vendor::QuorumTail rot;
+    for (uint8_t i = 0; i < 32; ++i) {
+        rot.deletedQuorums.emplace_back(kIs, qhash(0xA0, i));
+        rot.newQuorums.push_back(commit(kIs, 0xB0, i));
+    }
+    q.apply(rot);
+    ASSERT_EQ(retired_of(0xA0), 32u);
+    const uint64_t seq = q.fold_seq();
+
+    q.clear_for_reorg();
+    EXPECT_EQ(q.active_count(), 0u) << "the wipe empties the active set";
+    EXPECT_GT(q.fold_seq(), seq) << "the wipe mutates the active set";
+    EXPECT_EQ(retired_of(0xA0), 32u) << "the previous cycle must survive the wipe";
+    EXPECT_EQ(retired_of(0xB0), 32u) << "the wiped active cycle is retained too";
+
+    // The snapshot path wipes again before applying a ZERO-base diff.
+    q.clear_for_reorg();
+    dash::coin::vendor::QuorumTail snap;
+    for (uint8_t i = 0; i < 32; ++i) snap.newQuorums.push_back(commit(kIs, 0xB0, i));
+    q.apply(snap);
+    EXPECT_EQ(q.active_count(), 32u);
+    EXPECT_EQ(retired_of(0xB0), 0u) << "a quorum back in the active set is not retained";
+    EXPECT_EQ(retired_of(0xA0), 32u);
+}
+
+TEST(DashIsdlockPass2, TwoPassSelectsThePreviousCycleOnlyWhenTheLockNamesIt)
+{
+    const auto* p = islock_params(LlmqNetwork::Mainnet);
+    ASSERT_NE(p, nullptr);
+    const uint32_t I = p->dkg_interval;
+    const uint32_t prev_cycle = I * 9000;          // the retired cycle
+    const uint32_t cur_cycle  = I * 9001;          // the active cycle
+    const uint32_t tip        = cur_cycle + 40;    // a few blocks after the rotation
+    const auto active   = cycle(0xB0, cur_cycle);
+    const auto previous = cycle(0xA0, prev_cycle);
+    const std::vector<std::pair<uint256, uint32_t>> inputs{{raw256(0x10), 1u}};
+    const uint256 txid = raw256(0x20);
+
+    // The stub "BLS check" passes for the quorum of the expected cycle only
+    // (pubkey byte 0 names the cycle), and counts how often it runs.
+    int calls = 0;
+    auto signed_by = [&](uint8_t tag) {
+        return [&calls, tag](const auto& pubkey, const uint256&) {
+            ++calls;
+            return pubkey[0] == tag;
+        };
+    };
+
+    // A lock signed by the current cycle: pass 1.
+    calls = 0;
+    EXPECT_EQ(verify_islock_two_pass(*p, active, previous, tip, cur_cycle, inputs, txid, signed_by(0xB0)),
+              IslockVerifyPass::Active);
+    EXPECT_EQ(calls, 1);
+
+    // A lock signed by the previous cycle: refused by pass 1 (no quorum of
+    // that cycle in the active set, so no BLS work), accepted by pass 2.
+    calls = 0;
+    EXPECT_EQ(verify_islock_two_pass(*p, active, previous, tip, prev_cycle, inputs, txid, signed_by(0xA0)),
+              IslockVerifyPass::Previous);
+    EXPECT_EQ(calls, 1) << "pass 2 must not add a second BLS check for the same lock";
+
+    // Without the retained set (master): the same lock is refused.
+    calls = 0;
+    EXPECT_EQ(verify_islock_two_pass(*p, active, {}, tip, prev_cycle, inputs, txid, signed_by(0xA0)),
+              IslockVerifyPass::None);
+    EXPECT_EQ(calls, 0);
+
+    // A bad signature naming either cycle: refused, one BLS check at most.
+    calls = 0;
+    EXPECT_EQ(verify_islock_two_pass(*p, active, previous, tip, cur_cycle, inputs, txid, signed_by(0xEE)),
+              IslockVerifyPass::None);
+    EXPECT_EQ(calls, 1);
+    calls = 0;
+    EXPECT_EQ(verify_islock_two_pass(*p, active, previous, tip, prev_cycle, inputs, txid, signed_by(0xEE)),
+              IslockVerifyPass::None);
+    EXPECT_EQ(calls, 1);
+
+    // A cycle in neither set: refused with no BLS work.
+    calls = 0;
+    EXPECT_EQ(verify_islock_two_pass(*p, active, previous, tip, I * 8000, inputs, txid, signed_by(0xA0)),
+              IslockVerifyPass::None);
+    EXPECT_EQ(calls, 0);
+
+    // The retained set ages out: base blocks more than previous_cycle_max_age()
+    // below the tip are ignored (a rotation diff that never arrived).
+    const uint32_t late_tip = prev_cycle + 31 + previous_cycle_max_age(*p) + 1;
+    calls = 0;
+    EXPECT_EQ(verify_islock_two_pass(*p, active, previous, late_tip, prev_cycle, inputs, txid, signed_by(0xA0)),
+              IslockVerifyPass::None);
+    EXPECT_EQ(calls, 0);
+}
+
+// The per-type cap holds at a wipe: with two rotated-out cycles already
+// retained (the cap of 64), the wipe's retired active cycle pushes out the
+// oldest one; the cycle just before the active one stays.
+TEST(DashIsdlockPass2, ReorgWipeKeepsThePerTypeCap)
+{
+    QuorumManager q;
+    constexpr uint8_t kIs = 103;
+    auto retired_of = [&](uint8_t tag) {
+        size_t n = 0;
+        for (const auto& e : q.retired_entries())
+            n += (e.key.llmqType == kIs && e.key.quorumHash.data()[0] == tag);
+        return n;
+    };
+    auto rotate = [&](uint8_t from, uint8_t to) {
+        dash::coin::vendor::QuorumTail t;
+        for (uint8_t i = 0; i < 32; ++i) {
+            t.deletedQuorums.emplace_back(kIs, qhash(from, i));
+            t.newQuorums.push_back(commit(kIs, to, i));
+        }
+        q.apply(t);
+    };
+    dash::coin::vendor::QuorumTail a;
+    for (uint8_t i = 0; i < 32; ++i) a.newQuorums.push_back(commit(kIs, 0xA0, i));
+    q.apply(a);
+    rotate(0xA0, 0xB0);
+    rotate(0xB0, 0xC0);
+    ASSERT_EQ(retired_of(0xA0), 32u);
+    ASSERT_EQ(retired_of(0xB0), 32u);
+
+    q.clear_for_reorg();
+    EXPECT_EQ(q.retired_entries().size(), 64u) << "the per-type cap must hold at a wipe";
+    EXPECT_EQ(retired_of(0xA0), 0u) << "the oldest cycle (N-2) leaves";
+    EXPECT_EQ(retired_of(0xB0), 32u) << "the cycle before the active one (N-1) stays";
+    EXPECT_EQ(retired_of(0xC0), 32u) << "the wiped active cycle is retained";
+}
+
+// The live sequence: a rotation, then within a few blocks a reorg wipe and the
+// full-snapshot resync. A lock signed by the previous cycle after the reorg is
+// accepted by pass 2; with clear() at the wipe it is refused.
+TEST(DashIsdlockPass2, PreviousCycleLockVerifiesAfterAReorgWipeRightAfterARotation)
+{
+    const auto* p = islock_params(LlmqNetwork::Mainnet);
+    ASSERT_NE(p, nullptr);
+    const uint8_t T = static_cast<uint8_t>(p->type);
+    const uint32_t I = p->dkg_interval;
+    const uint32_t prev_cycle = I * 9000;
+    const uint32_t cur_cycle  = I * 9001;
+    const uint32_t tip        = cur_cycle + 40;
+    const std::vector<std::pair<uint256, uint32_t>> inputs{{raw256(0x10), 1u}};
+    const uint256 txid = raw256(0x20);
+    auto signed_by_prev = [](const auto& pubkey, const uint256&) { return pubkey[0] == 0xA0; };
+
+    // The node's candidate build: base height from the quorum's own cycle.
+    auto to_cands = [&](const std::vector<QuorumManager::Entry>& entries) {
+        std::vector<RotatedQuorumCandidate> out;
+        for (const auto& e : entries) {
+            if (e.key.llmqType != T) continue;
+            RotatedQuorumCandidate c;
+            c.quorum_hash = e.key.quorumHash;
+            c.base_height = (e.key.quorumHash.data()[0] == 0xA0 ? prev_cycle : cur_cycle)
+                            + e.key.quorumHash.data()[1];
+            c.quorum_index = static_cast<uint16_t>(e.commitment.quorumIndex);
+            c.quorum_public_key = e.commitment.quorumPublicKey;
+            out.push_back(c);
+        }
+        return out;
+    };
+    auto run = [&](bool keep_retained) {
+        QuorumManager q;
+        dash::coin::vendor::QuorumTail a;
+        for (uint8_t i = 0; i < 32; ++i) a.newQuorums.push_back(commit(T, 0xA0, i));
+        q.apply(a);
+        dash::coin::vendor::QuorumTail rot;
+        for (uint8_t i = 0; i < 32; ++i) {
+            rot.deletedQuorums.emplace_back(T, qhash(0xA0, i));
+            rot.newQuorums.push_back(commit(T, 0xB0, i));
+        }
+        q.apply(rot);
+        // The reorg wipe, then the ZERO-base snapshot (which wipes again).
+        for (int k = 0; k < 2; ++k) {
+            if (keep_retained) q.clear_for_reorg(); else q.clear();
+        }
+        dash::coin::vendor::QuorumTail snap;
+        for (uint8_t i = 0; i < 32; ++i) snap.newQuorums.push_back(commit(T, 0xB0, i));
+        q.apply(snap);
+        return verify_islock_two_pass(*p, to_cands(q.active_entries()), to_cands(q.retired_entries()),
+                                      tip, prev_cycle, inputs, txid, signed_by_prev);
+    };
+    EXPECT_EQ(run(true), IslockVerifyPass::Previous);
+    EXPECT_EQ(run(false), IslockVerifyPass::None) << "clear() at the wipe loses the previous cycle";
 }
 
 // ═══ 3. USE — the G4 red/green KAT ════════════════════════════════════════════
@@ -526,6 +865,338 @@ TEST(DashIsdlockG4, UnverifiedIsdlockChangesNothing)
     EXPECT_EQ(mp.islock_outpoint_count(), 0u)
         << "a refused isdlock must leave the map EXACTLY as it was";
     EXPECT_TRUE(selected_contains(mp, x_txid));
+}
+
+// ═══ N2 — a lock that arrives while a template carrying the conflict is served ═
+//
+// Dash Core v24.0.2 rejects a block whose tx conflicts with a known islock
+// unless that block is already ChainLocked (validation.cpp:2811-2829,
+// conflict-tx-lock). Eviction and the G4 guard above only shape the NEXT
+// template; a body built before the lock arrived still carries the tx. These
+// pin the three pieces that act on such a body: the pure body scan, the
+// verified-only map + sink (a forged relay-lane lock must drive neither), and
+// the once-per-second coalescer behind the forced refresh.
+
+using dash::coin::IslockRefreshCoalescer;
+using dash::coin::body_conflicts_with_lock;
+using dash::coin::Transaction;
+
+TEST(DashIsdlockN2, BodyScanNamesTheConflictingTxAndTheLock)
+{
+    auto cb = make_coinbase({100'000, 90'000}, /*salt=*/3);
+    const uint256 cbid = dash_txid(cb);
+    const auto A = make_spend(cbid, 0, 90'000, /*salt=*/31);
+    const auto Z = make_spend(cbid, 1, 80'000, /*salt=*/32);
+    const uint256 a = dash_txid(A);
+    const uint256 z = dash_txid(Z);
+    const std::vector<Transaction> body{Transaction(Z), Transaction(A)};
+    const std::vector<uint256> ids{z, a};
+    const std::vector<std::pair<uint256, uint32_t>> lockO{{cbid, 0u}};
+
+    // O locked to another txid: A (index 1) is the conflict.
+    const auto c = body_conflicts_with_lock(body, ids, raw256(0x77), lockO);
+    ASSERT_TRUE(c.has_value());
+    EXPECT_EQ(c->index, 1u);
+    EXPECT_EQ(c->txid, a);
+    EXPECT_EQ(c->locked_txid, raw256(0x77));
+    EXPECT_EQ(c->outpoint, lockO[0]);
+
+    // O locked to A itself: A IS the locked tx, nothing to do.
+    EXPECT_FALSE(body_conflicts_with_lock(body, ids, a, lockO).has_value());
+
+    // Ids not lined up with the body: computed, same verdicts.
+    const auto c2 = body_conflicts_with_lock(body, {}, raw256(0x77), lockO);
+    ASSERT_TRUE(c2.has_value());
+    EXPECT_EQ(c2->txid, a);
+    EXPECT_FALSE(body_conflicts_with_lock(body, {}, a, lockO).has_value());
+
+    // A lock on an outpoint the body does not spend: no conflict.
+    EXPECT_FALSE(body_conflicts_with_lock(body, ids, raw256(0x77),
+                                          {{raw256(0x99), 0u}}).has_value());
+}
+
+TEST(DashIsdlockN2, OnlyTheVerifiedLaneArmsTheBeltAndTheRefreshSink)
+{
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+    Mempool& mp = st.mempool();
+
+    UtxoLane lane;
+    ASSERT_TRUE(lane.open(""));
+    lane.attach(mp);
+    auto cb = make_coinbase({100'000, 90'000}, /*salt=*/4);
+    lane.on_block_connected(make_block({cb}, /*salt=*/4), /*height=*/1);
+    const uint256 cbid = dash_txid(cb);
+    const std::pair<uint256, uint32_t> O{cbid, 0u};
+    const auto A = make_spend(cbid, 0, 90'000, /*salt=*/41);
+    const uint256 a = dash_txid(A);
+
+    // The template being served was built before any lock: it carries A.
+    const std::vector<Transaction> served{Transaction(A)};
+    const std::vector<uint256> served_ids{a};
+
+    int sink_calls = 0;
+    uint256 sink_txid;
+    std::vector<std::pair<uint256, uint32_t>> sink_inputs;
+    m.set_on_verified_islock(
+        [&](const uint256& t, const std::vector<std::pair<uint256, uint32_t>>& in) {
+            ++sink_calls;
+            sink_txid = t;
+            sink_inputs = in;
+        });
+    std::array<uint8_t, 96> sig{}; sig.fill(0xab);
+
+    // (1) Relay lane (unverified, any peer): the eviction map fills, the
+    //     verified map does not, the sink is not called, the belt is quiet.
+    m.on_islock(raw256(0x77), {O});
+    EXPECT_EQ(mp.islock_outpoint_count(), 1u);
+    EXPECT_EQ(mp.verified_islock_outpoint_count(), 0u);
+    EXPECT_FALSE(mp.verified_islock_conflict_in(served, served_ids).has_value())
+        << "a forged relay-lane lock must not be able to refuse templates";
+    EXPECT_EQ(sink_calls, 0)
+        << "a forged relay-lane lock must not be able to force clean notifies";
+
+    // (2) BLS verifier refuses: same.
+    m.set_islock_verify_fn(
+        [](const std::vector<std::pair<uint256, uint32_t>>&, const uint256&,
+           const uint256&, const std::array<uint8_t, 96>&) { return false; });
+    m.on_new_isdlock({O}, raw256(0x77), raw256(0x33), sig);
+    EXPECT_EQ(mp.verified_islock_outpoint_count(), 0u);
+    EXPECT_EQ(sink_calls, 0);
+
+    // (3) Verified: map + sink (with the lock's own txid and outpoints); the
+    //     belt and the sink's served-template check both name A.
+    m.set_islock_verify_fn(
+        [](const std::vector<std::pair<uint256, uint32_t>>&, const uint256&,
+           const uint256&, const std::array<uint8_t, 96>&) { return true; });
+    m.on_new_isdlock({O}, raw256(0x77), raw256(0x33), sig);
+    EXPECT_EQ(mp.verified_islock_outpoint_count(), 1u);
+    ASSERT_EQ(sink_calls, 1);
+    EXPECT_EQ(sink_txid, raw256(0x77));
+    ASSERT_EQ(sink_inputs.size(), 1u);
+    EXPECT_EQ(sink_inputs[0], O);
+    const auto c = mp.verified_islock_conflict_in(served, served_ids);
+    ASSERT_TRUE(c.has_value());
+    EXPECT_EQ(c->txid, a);
+    EXPECT_EQ(c->locked_txid, raw256(0x77));
+    EXPECT_TRUE(body_conflicts_with_lock(served, served_ids, sink_txid, sink_inputs).has_value());
+
+    // (4) A verified lock on the served tx itself is not a conflict.
+    const auto B = make_spend(cbid, 1, 80'000, /*salt=*/42);
+    const std::vector<Transaction> served_b{Transaction(B)};
+    m.on_new_isdlock({{cbid, 1u}}, dash_txid(B), raw256(0x33), sig);
+    EXPECT_FALSE(mp.verified_islock_conflict_in(served_b, {dash_txid(B)}).has_value());
+
+    // (5) The outpoint confirmed in a block: the entry is resolved and pruned.
+    ASSERT_EQ(mp.verified_islock_outpoint_count(), 2u);
+    mp.remove_for_block(make_block({make_coinbase({1}, 5), B}, /*salt=*/5));
+    EXPECT_EQ(mp.verified_islock_outpoint_count(), 1u) << "only O:1 was spent";
+    mp.clear();
+    EXPECT_EQ(mp.verified_islock_outpoint_count(), 0u);
+}
+
+// The relay lane never overrides an outpoint a VERIFIED lock owns: it does not
+// rewrite the entry and does not evict the verified tx. Otherwise selection
+// (G4) and the emit belt (verified map) disagree and every freshly built
+// template is refused.
+TEST(DashIsdlockN2, ARelayLaneLockCannotOverrideAVerifiedOutpoint)
+{
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+    Mempool& mp = st.mempool();
+    UtxoLane lane;
+    ASSERT_TRUE(lane.open(""));
+    lane.attach(mp);
+    auto cb = make_coinbase({100'000, 90'000}, /*salt=*/6);
+    lane.on_block_connected(make_block({cb}, /*salt=*/6), /*height=*/1);
+    const uint256 cbid = dash_txid(cb);
+    const std::pair<uint256, uint32_t> O{cbid, 0u};
+    const auto A = make_spend(cbid, 0, 90'000, /*salt=*/61);
+    const uint256 a = dash_txid(A);
+    ASSERT_TRUE(mp.add_tx(A));
+    std::array<uint8_t, 96> sig{}; sig.fill(0xab);
+    m.set_islock_verify_fn(
+        [](const std::vector<std::pair<uint256, uint32_t>>&, const uint256&,
+           const uint256&, const std::array<uint8_t, 96>&) { return true; });
+    m.on_islock(a, {O});
+    m.on_new_isdlock({O}, a, raw256(0x33), sig);
+    ASSERT_TRUE(selected_contains(mp, a));
+
+    // A relay-lane lock claiming O for T: A stays (not evicted, still selected).
+    const auto T = make_spend(cbid, 0, 80'000, /*salt=*/62);
+    const uint256 t = dash_txid(T);
+    m.on_islock(t, {O});
+    EXPECT_TRUE(selected_contains(mp, a)) << "a relay-lane lock evicted or excluded the verified tx";
+
+    // T itself (if admitted) is never selected: O belongs to the verified A.
+    (void)mp.add_tx(T);
+    EXPECT_FALSE(selected_contains(mp, t))
+        << "selection admitted a tx the emit belt refuses (verified lock on its outpoint)";
+}
+
+TEST(DashIsdlockN2, RefreshCoalescerFiresOncePerGapWithOneTrailing)
+{
+    using C = IslockRefreshCoalescer;
+    using std::chrono::milliseconds;
+    using std::chrono::seconds;
+    C co(seconds(1));
+    const auto t0 = C::clock::time_point{} + std::chrono::hours(1);
+
+    EXPECT_EQ(co.on_trigger(t0).act, C::Act::FireNow);
+    const auto d = co.on_trigger(t0 + milliseconds(300));
+    EXPECT_EQ(d.act, C::Act::ScheduleTrailing);
+    EXPECT_TRUE(d.delay == milliseconds(700));
+    EXPECT_EQ(co.on_trigger(t0 + milliseconds(500)).act, C::Act::AlreadyPending)
+        << "triggers before the trailing refresh are absorbed";
+    co.on_trailing_fired(t0 + seconds(1));
+    EXPECT_FALSE(co.pending());
+    EXPECT_EQ(co.on_trigger(t0 + milliseconds(1500)).act, C::Act::ScheduleTrailing)
+        << "the trailing refresh counts as the last fire";
+    co.on_trailing_fired(t0 + seconds(2));
+    EXPECT_EQ(co.on_trigger(t0 + seconds(3)).act, C::Act::FireNow);
+}
+
+// ═══ Revoke on reject — a refused lock keeps no relay-lane effect ════════════
+//
+// The relay lane applies every isdlock unverified (hold short-circuit, G4
+// outpoint exclusion, eviction) before the BLS lane checks it. Dash Core acts
+// only on locks it verified, so when the BLS lane refuses a lock its
+// relay-lane effects are undone (Mempool::revoke_unverified_islock). The real
+// path is driven: on_islock (relay lane) then on_new_isdlock (BLS lane), as the
+// isdlock handler does.
+
+namespace {
+
+struct RevokeRig {
+    NodeCoinState st;
+    CoinStateMaintainer m{st};
+    UtxoLane lane;
+    uint256 cbid;
+    std::array<uint8_t, 96> sig{};
+    explicit RevokeRig(uint32_t salt)
+    {
+        lane.open("");
+        lane.attach(st.mempool());
+        auto cb = make_coinbase({100'000, 90'000, 80'000, 70'000}, salt);
+        lane.on_block_connected(make_block({cb}, salt), /*height=*/1);
+        cbid = dash_txid(cb);
+        sig.fill(0xab);
+    }
+    void verifier(bool pass)
+    {
+        m.set_islock_verify_fn(
+            [pass](const std::vector<std::pair<uint256, uint32_t>>&, const uint256&,
+                   const uint256&, const std::array<uint8_t, 96>&) { return pass; });
+    }
+    // What the isdlock handler does with one lock: relay lane, then BLS lane.
+    void deliver(const uint256& txid, const std::vector<std::pair<uint256, uint32_t>>& in)
+    {
+        m.on_islock(txid, in);
+        m.on_new_isdlock(in, txid, raw256(0x33), sig);
+    }
+};
+
+} // namespace
+
+TEST(DashIsdlockRevoke, AForgedLockCannotLiftTheHoldOffAYoungTx)
+{
+    RevokeRig r(7);
+    Mempool& mp = r.st.mempool();
+    mp.set_instantsend_mining_hold(true);
+    // A live feed (an unrelated honest lock) arms the hold.
+    r.m.on_islock(raw256(0x44), {{raw256(0x45), 0u}});
+    const auto A = make_spend(r.cbid, 0, 90'000, /*salt=*/71);
+    ASSERT_TRUE(mp.add_tx(A));
+    const uint256 a = dash_txid(A);
+    ASSERT_FALSE(selected_contains(mp, a)) << "fixture: a young unlocked tx is held";
+
+    // A forged isdlock(A): the relay lane applies it, the BLS lane refuses it.
+    r.verifier(false);
+    r.deliver(a, {{r.cbid, 0u}});
+    EXPECT_FALSE(mp.islock_txid_known(a)) << "the refused lock must not stay a hold short-circuit";
+    EXPECT_FALSE(selected_contains(mp, a))
+        << "a refused lock must not lift the 600 s hold";
+    // The hold is still ARMED (the revocation did not make the feed look
+    // dark): another young unlocked tx is held too.
+    const auto Y = make_spend(r.cbid, 3, 60'000, /*salt=*/72);
+    ASSERT_TRUE(mp.add_tx(Y));
+    EXPECT_FALSE(selected_contains(mp, dash_txid(Y))) << "a revocation disarmed the hold";
+
+    // The same lock, VERIFIED: A is safe to mine at once (dashd IsLocked).
+    r.verifier(true);
+    r.deliver(a, {{r.cbid, 0u}});
+    EXPECT_TRUE(selected_contains(mp, a));
+
+    // A later forged copy naming the verified txid with junk inputs changes nothing.
+    r.verifier(false);
+    r.deliver(a, {{raw256(0x66), 3u}});
+    EXPECT_TRUE(mp.islock_txid_known(a));
+    EXPECT_TRUE(selected_contains(mp, a));
+}
+
+TEST(DashIsdlockRevoke, AMalformedLockIsNeverApplied)
+{
+    RevokeRig r(10);
+    Mempool& mp = r.st.mempool();
+    mp.set_instantsend_mining_hold(true);
+    r.m.on_islock(raw256(0x44), {{raw256(0x45), 0u}});   // live feed
+    const auto A = make_spend(r.cbid, 0, 90'000, /*salt=*/101);
+    ASSERT_TRUE(mp.add_tx(A));
+    const uint256 a = dash_txid(A);
+    // No inputs: Dash Core's TriviallyValid refuses it; it must not become a
+    // hold short-circuit (it never reaches the BLS lane, so nothing revokes it).
+    r.m.on_islock(a, {});
+    EXPECT_FALSE(mp.islock_txid_known(a));
+    EXPECT_FALSE(selected_contains(mp, a));
+    // Null txid: no eviction, no exclusion.
+    r.m.on_islock(uint256{}, {{r.cbid, 0u}});
+    EXPECT_EQ(mp.islock_outpoint_count(), 1u) << "only the live-feed lock's entry";
+    mp.set_instantsend_mining_hold(false);
+    EXPECT_TRUE(selected_contains(mp, a)) << "a null-txid lock evicted or excluded a tx";
+}
+
+TEST(DashIsdlockRevoke, AForgedLocksOutpointExclusionIsCleared)
+{
+    RevokeRig r(8);
+    Mempool& mp = r.st.mempool();
+    mp.set_instantsend_mining_hold(false);   // isolate G4 from the hold
+    const auto Y = make_spend(r.cbid, 1, 80'000, /*salt=*/81);
+    const uint256 y = dash_txid(Y);
+    ASSERT_TRUE(mp.add_tx(Y));
+    ASSERT_TRUE(selected_contains(mp, y));
+
+    // A forged lock claims Y's outpoint for another txid: the relay lane evicts
+    // Y (not undone: it is re-relayed) and excludes the outpoint; the refusal
+    // clears the exclusion.
+    r.verifier(false);
+    r.deliver(raw256(0x77), {{r.cbid, 1u}});
+    EXPECT_EQ(mp.islock_outpoint_count(), 0u) << "the forged lock's G4 entry must be cleared";
+    ASSERT_TRUE(mp.add_tx(Y)) << "re-relayed";
+    EXPECT_TRUE(selected_contains(mp, y)) << "a refused lock must not keep its outpoint excluded";
+}
+
+TEST(DashIsdlockRevoke, AForgedLockCannotOverwriteAVerifiedOutpoint)
+{
+    RevokeRig r(9);
+    Mempool& mp = r.st.mempool();
+    mp.set_instantsend_mining_hold(false);
+    const std::pair<uint256, uint32_t> O{r.cbid, 2u};
+    const uint256 x = raw256(0x88);            // the network's verified winner for O
+
+    r.verifier(true);
+    r.deliver(x, {O});
+    ASSERT_EQ(mp.verified_islock_outpoint_count(), 1u);
+
+    // A refused lock claiming O for W: the relay lane leaves a verified
+    // outpoint alone, and after the refusal O still points at X (G4 keeps
+    // excluding what the emit belt refuses).
+    r.verifier(false);
+    r.deliver(raw256(0x99), {O});
+    const auto T = make_spend(r.cbid, 2, 70'000, /*salt=*/91);   // spends O, txid != X
+    ASSERT_TRUE(mp.add_tx(T));
+    EXPECT_FALSE(selected_contains(mp, dash_txid(T)))
+        << "O's exclusion must point at the verified lock again after the forged one is refused";
+    EXPECT_EQ(mp.islock_outpoint_count(), 1u);
 }
 
 // ═══ 4. FAIL-CLOSED — real BLS (gated on the dashbls backend) ════════════════

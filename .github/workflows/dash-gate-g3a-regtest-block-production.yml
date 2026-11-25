@@ -67,6 +67,11 @@ jobs:
             echo "CONAN_HOME=$HOME/.conan2-ci/$RUNNER_NAME" >> "$GITHUB_ENV"
           fi
 
+      # ccache for the gate script's cmake configure (self-hosted only; a
+      # runner without ccache builds as before).
+      - name: ccache launcher (when installed)
+        uses: ./.github/actions/ccache-launcher
+
       - name: Check gate entrypoint presence
         id: presence
         run: |
@@ -127,6 +132,12 @@ jobs:
           DASH_RPC_PASS: ${{ secrets.DASH_RPC_PASS }}
           DASH_RPC_AUTH: ${{ secrets.DASH_RPC_AUTH }}
         run: bash tests/gates/g3a_regtest_block_production.sh
+
+      - name: ccache hits and misses for this job
+        if: always()
+        uses: ./.github/actions/ccache-launcher
+        with:
+          report: 'true'
 
       # Steady-state disk hygiene on the VM905 self-hosted runners: drop the
       # checkout payload and _temp, keep _actions/_tool/_update. Always runs.

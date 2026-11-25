@@ -130,14 +130,18 @@ inline SuperblockResolution resolve_superblock_payments(
     if (auto best = store.get_best_superblock(height)) {
         if (best->payments.empty())
             return SuperblockResolution::unknown("trigger-invalid-best");
+        // The running total is bounded by the budget at every step: each
+        // amount must fit in the room left, so the total never exceeds the cap.
+        if (budget_cap <= 0)
+            return SuperblockResolution::unknown("trigger-invalid-best");
         int64_t total = 0;
         for (const auto& p : best->payments) {
             if (p.amount <= 0 || p.script.empty())
                 return SuperblockResolution::unknown("trigger-invalid-best");
+            if (p.amount > budget_cap - total)            // over budget => reject
+                return SuperblockResolution::unknown("trigger-invalid-best");
             total += p.amount;
         }
-        if (budget_cap <= 0 || total > budget_cap)        // over budget => reject
-            return SuperblockResolution::unknown("trigger-invalid-best");
         SuperblockResolution r;
         r.verdict  = SuperblockVerdict::Triggered;
         r.payments = best->payments;

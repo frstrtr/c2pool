@@ -12,6 +12,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <vector>
 
 #include <core/pool_luck.hpp>
@@ -442,6 +443,11 @@ TEST(PoolLuck, RateAtFindMustBePlausiblyAPoolRate)
     EXPECT_TRUE(rate_at_find_plausible(4.0e6, 0.0, 0.0));
     EXPECT_FALSE(rate_at_find_plausible(0.0, 0.0, 0.0));
     EXPECT_FALSE(rate_at_find_plausible(0.0, 693.5, 1.8e11));
+    // ... but under one hash a second there is no pool (1e-300 would be a
+    // luck of 1e300 % on a row no yardstick reaches).
+    EXPECT_TRUE(rate_at_find_plausible(luck::kMinPoolRate, 0.0, 0.0));
+    EXPECT_FALSE(rate_at_find_plausible(0.5, 0.0, 0.0));
+    EXPECT_FALSE(rate_at_find_plausible(1e-300, 0.0, 0.0));
 }
 
 // What a period counts of one round, row by row: the pair a consumer sums to
@@ -683,4 +689,179 @@ TEST(PoolLuck, NoBlocksNoLuck)
     EXPECT_EQ(all.k, 0u);
     EXPECT_FALSE(all.has_luck);
     EXPECT_DOUBLE_EQ(all.span, 0.0);
+}
+
+// ── Another node's measurement of the same round ─────────────────────────────
+// The pool rate is the share chain's, the same on every node: a round another
+// node integrated over more of it than this node's history covers is the
+// better figure for the round -- where the same two blocks bound it. Here the
+// history covers 200 s of the 4000 s round B (5 %), none of round C.
+TEST(PoolLuck, ImportedEffortStandsWhereItCoversMoreOfTheSameRound)
+{
+    luck::RateHistory h;
+    h.add_segment({4800.0, 5000.0, 0.5 * kT32, 1000.0, 1.0});
+    auto rows = std::vector<luck::RoundInput>{row(1000.0, 10), row(5000.0, 11), row(9000.0, 12)};
+    // This node's own: B integrated over 5 % (0.5 * 4000 / 2000 = 1.0), C a
+    // single sample at find (4000 * 0.5 / 2000 = 1.0).
+    auto own = luck::compute_rounds(rows, h);
+    ASSERT_EQ(own[1].method, luck::EffortMethod::integrated);
+    EXPECT_NEAR(own[1].coverage, 0.05, 1e-12);
+    ASSERT_EQ(own[2].method, luck::EffortMethod::single_sample);
+
+    // The source: B over all of it, C over 60 % of it.
+    rows[1].imported_effort = 1.375;  rows[1].imported_coverage = 1.0;  rows[1].imported_prev = 0;
+    rows[2].imported_effort = 0.8;    rows[2].imported_coverage = 0.6;  rows[2].imported_prev = 1;
+    // A first block keeps its 1.0 whatever it is offered.
+    rows[0].imported_effort = 3.0;    rows[0].imported_coverage = 1.0;
+    const auto res = luck::compute_rounds(rows, h);
+    EXPECT_EQ(res[0].method, luck::EffortMethod::first_block);
+    EXPECT_DOUBLE_EQ(res[0].effort, 1.0);
+
+    const auto& b = res[1];
+    EXPECT_EQ(b.method, luck::EffortMethod::imported);
+    EXPECT_STREQ(luck::effort_method_name(b.method), "imported");
+    EXPECT_EQ(b.prev, 0);
+    EXPECT_DOUBLE_EQ(b.time_to_find, 4000.0) << "this node's own round";
+    EXPECT_DOUBLE_EQ(b.effort, 1.375);
+    EXPECT_NEAR(b.luck, 100.0 / 1.375, 1e-12);
+    EXPECT_NEAR(b.expected_time, 4000.0 / 1.375, 1e-9);
+    EXPECT_DOUBLE_EQ(b.coverage, 1.0);
+    EXPECT_DOUBLE_EQ(b.covered_effort, 1.375);
+    EXPECT_EQ(b.samples, 0u) << "no rate of this node's is behind it";
+    EXPECT_DOUBLE_EQ(b.rate_used, 0.0);
+
+    const auto& c = res[2];
+    EXPECT_EQ(c.method, luck::EffortMethod::imported) << "a single sample covers nothing";
+    EXPECT_DOUBLE_EQ(c.effort, 0.8);
+    EXPECT_NEAR(c.covered_effort, 0.48, 1e-12) << "what the source's history watched";
+
+    // What a period counts: the source's covered integral, and the block.
+    EXPECT_DOUBLE_EQ(luck::period_effort(b), 1.375);
+    EXPECT_NEAR(luck::period_effort(c), 0.48, 1e-12);
+    EXPECT_TRUE(luck::counts_in_period(rows[1], b));
+    const auto p = luck::period_luck(rows, res, h, {}, luck::OpenRound{}, 0.0, 9000.0);
+    EXPECT_EQ(p.k, 3u);
+    EXPECT_NEAR(p.expected, 1.0 + 1.375 + 0.48, 1e-12);
+    // Clipped by a window, an imported round is taken linear in time.
+    const auto w = luck::period_luck(rows, res, h, {}, luck::OpenRound{}, 3000.0, 9000.0);
+    EXPECT_NEAR(w.expected, 1.375 * 2000.0 / 4000.0 + 0.48, 1e-12);
+}
+
+TEST(PoolLuck, ImportedEffortNeverReplacesAnEqualOrBetterOwnFigure)
+{
+    luck::RateHistory h;
+    h.add_segment({4800.0, 5000.0, 0.5 * kT32, 1000.0, 1.0});
+    auto rows = std::vector<luck::RoundInput>{row(1000.0, 10), row(5000.0, 11)};
+    auto with = [&](double effort, double coverage, int prev) {
+        auto r = rows;
+        r[1].imported_effort = effort;
+        r[1].imported_coverage = coverage;
+        r[1].imported_prev = prev;
+        return luck::compute_rounds(r, h)[1];
+    };
+    // This node's own: B integrated over 5 % at 2.0 (0.5 / 1000 over 200 s,
+    // scaled to 4000 s).
+    ASSERT_NEAR(luck::compute_rounds(rows, h)[1].effort, 2.0, 1e-12);
+    // The same coverage (a tie, to rounding), or less: this node's own.
+    EXPECT_EQ(with(1.375, 0.05, 0).method, luck::EffortMethod::integrated);
+    EXPECT_EQ(with(1.375, 0.05 + 1e-9, 0).method, luck::EffortMethod::integrated);
+    EXPECT_EQ(with(1.375, 0.04, 0).method, luck::EffortMethod::integrated);
+    // More of the round, but under half of it (kImportedCoverageFloor): an
+    // extrapolation as well, and it would count its block against almost
+    // nothing in a period.
+    EXPECT_EQ(with(1.375, 0.06, 0).method, luck::EffortMethod::integrated);
+    EXPECT_EQ(with(1.375, 0.49, 0).method, luck::EffortMethod::integrated);
+    EXPECT_EQ(with(1.375, luck::kImportedCoverageFloor, 0).method, luck::EffortMethod::imported);
+    // Against what this node measured over its 5 %: within 3x either way
+    // (kImportedRateBand) it stands, beyond it the node's own does.
+    EXPECT_EQ(with(5.9, 1.0, 0).method, luck::EffortMethod::imported);
+    EXPECT_EQ(with(0.7, 1.0, 0).method, luck::EffortMethod::imported);
+    EXPECT_EQ(with(6.1, 1.0, 0).method, luck::EffortMethod::integrated);
+    EXPECT_EQ(with(0.6, 1.0, 0).method, luck::EffortMethod::integrated);
+    EXPECT_EQ(with(100.0, 1.0, 0).method, luck::EffortMethod::integrated);
+    // Another round: the source timed it from a block this node does not
+    // hold (-1) ...
+    EXPECT_EQ(with(1.375, 1.0, -1).method, luck::EffortMethod::integrated);
+    // ... or from A, where this node holds a block X between A and B: its
+    // round runs from X, and the source's figure is of another round.
+    {
+        auto three = std::vector<luck::RoundInput>{row(1000.0, 10), row(3000.0, 105),
+                                                   row(5000.0, 11)};
+        three[2].imported_effort = 1.375;
+        three[2].imported_coverage = 1.0;
+        three[2].imported_prev = 0;
+        const auto r3 = luck::compute_rounds(three, h);
+        EXPECT_EQ(r3[2].prev, 1);
+        EXPECT_EQ(r3[2].method, luck::EffortMethod::integrated);
+    }
+    // Malformed figures are no figures.
+    EXPECT_EQ(with(std::nan(""), 1.0, 0).method, luck::EffortMethod::integrated);
+    EXPECT_EQ(with(-1.0, 1.0, 0).method, luck::EffortMethod::integrated);
+    EXPECT_EQ(with(1.375, 0.0, 0).method, luck::EffortMethod::integrated);
+    EXPECT_EQ(with(1.375, 1.5, 0).method, luck::EffortMethod::integrated);
+    EXPECT_FALSE(luck::imported_effort_valid(1e-300, 1.0));
+    EXPECT_FALSE(luck::imported_effort_valid(std::numeric_limits<double>::denorm_min(), 1.0));
+    EXPECT_FALSE(luck::imported_effort_valid(2e6, 1.0));
+    EXPECT_FALSE(luck::imported_effort_valid(1.0, std::numeric_limits<double>::denorm_min()));
+    EXPECT_FALSE(luck::imported_effort_valid(std::numeric_limits<double>::infinity(), 1.0));
+    EXPECT_TRUE(luck::imported_effort_valid(luck::kImportedEffortMin, 1.0));
+    EXPECT_TRUE(luck::imported_effort_valid(luck::kImportedEffortMax, 0.5));
+
+    // No effort of its own at all (no history, no rate at find): any
+    // measurement over half the round or more beats it; there is nothing
+    // of its own to agree with.
+    auto blind = rows;
+    blind[1].rate_at_find = 0.0;
+    blind[1].imported_effort = 2.0;
+    blind[1].imported_coverage = 0.6;
+    blind[1].imported_prev = 0;
+    const luck::RateHistory none;
+    blind[1].imported_effort = 0.0;
+    ASSERT_EQ(luck::compute_rounds(blind, none)[1].method, luck::EffortMethod::none);
+    blind[1].imported_effort = 2.0;
+    EXPECT_EQ(luck::compute_rounds(blind, none)[1].method, luck::EffortMethod::imported);
+}
+
+// The bounds a source's effort is held to: the mean pool rate it implies
+// over this node's round, effort * D * 2^32 / round, judged as a rate at
+// find is (rate_at_find_plausible), and never above the whole network.
+TEST(PoolLuck, ImportedEffortMustImplyAPlausiblePoolRate)
+{
+    const double D = 9.5e7, day = 86400.0;
+    const double rate = D * kT32 / day;            // effort 1.0 a day
+    const double network = D * kT32 / 150.0;
+    EXPECT_TRUE(luck::imported_effort_plausible(1.0, day, D, 500.0, rate, network));
+    EXPECT_TRUE(luck::imported_effort_plausible(18.4, day, D, 0.0, rate, network));
+    EXPECT_TRUE(luck::imported_effort_plausible(1.0, day, D, 0.0, 0.0, 0.0)) << "no yardstick";
+    // The pool above its whole network.
+    EXPECT_FALSE(luck::imported_effort_plausible(1.0e6, day, D, 500.0, rate, network));
+    // Below what its winning shares allow, or 1 % of the history's rate.
+    EXPECT_FALSE(luck::imported_effort_plausible(1.0e-6, day, D, 500.0, 0.0, network));
+    EXPECT_FALSE(luck::imported_effort_plausible(0.005, day, D, 0.0, rate, network));
+    // Out of its absolute bounds: no yardstick at all is needed for that.
+    EXPECT_FALSE(luck::imported_effort_plausible(1e-300, day, D, 0.0, 0.0, 0.0));
+    EXPECT_FALSE(luck::imported_effort_plausible(std::numeric_limits<double>::denorm_min(), day,
+                                                 D, 0.0, 0.0, 0.0));
+    EXPECT_FALSE(luck::imported_effort_plausible(1e7, day, D, 0.0, 0.0, 0.0));
+    // Nothing to judge it on.
+    EXPECT_FALSE(luck::imported_effort_plausible(1.0, 0.0, D, 0.0, rate, network));
+    EXPECT_FALSE(luck::imported_effort_plausible(1.0, day, 0.0, 0.0, rate, network));
+    EXPECT_FALSE(luck::imported_effort_plausible(-1.0, day, D, 0.0, rate, network));
+    EXPECT_FALSE(luck::imported_effort_plausible(std::nan(""), day, D, 0.0, rate, network));
+}
+
+// An effort whose luck is not a finite number is no measurement: never a
+// luck of inf, which JSON renders as null under a method claiming a value.
+TEST(PoolLuck, EffortWithoutAFiniteLuckIsNoEffort)
+{
+    const luck::RateHistory none;
+    auto rows = std::vector<luck::RoundInput>{row(1000.0, 10), row(5000.0, 11)};
+    rows[1].rate_at_find = std::numeric_limits<double>::denorm_min();
+    const auto r = luck::compute_rounds(rows, none)[1];
+    EXPECT_EQ(r.method, luck::EffortMethod::none);
+    EXPECT_EQ(r.missing, luck::MissingInput::rate);
+    EXPECT_DOUBLE_EQ(r.effort, 0.0);
+    EXPECT_DOUBLE_EQ(r.luck, 0.0);
+    EXPECT_EQ(r.prev, 0);
+    EXPECT_DOUBLE_EQ(r.time_to_find, 4000.0);
 }

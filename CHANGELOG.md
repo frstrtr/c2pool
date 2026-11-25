@@ -2,6 +2,64 @@
 
 ## [Unreleased]
 
+### With --stratum-http on, the REST API answers on the stratum port too
+- python p2pool served its web API on the worker port, and p2pool-aware
+  trackers (miningpoolstats and others) poll `http://host:<worker port>/global_stats`.
+  c2pool's stratum port answered such a request with a stratum "Invalid JSON"
+  error and logged `Error processing Stratum message: ... parse_error`.
+- When `--stratum-http` is on, the stratum port hands a connection whose
+  first line is an HTTP request line (empty lines before it are skipped) to
+  the web server's own
+  request handler, on the web server's HTTP thread: same routes, JSON and
+  headers as the web port. It is strictly read-only there: GET and HEAD
+  (other methods 405), every local-only, token-gated or state-changing route
+  answers 403 whatever the address or `?token=`, the event stream
+  (`/sharechain/stream`) answers 405, and the connection closes after one
+  response. A stratum line, or
+  anything else, takes the stratum path exactly as before, also when it
+  arrives in pieces.
+- An HTTP connection is not a miner session (not in the session count, the
+  miner list or the notify fan-out), but while it is open it counts toward
+  `max_stratum_connections` and the per-IP cap, and the stratum handshake
+  deadline, counted from the accept, ends it: nothing is read or written at or
+  after it, and at it the stratum side shuts the connection down; the slot is
+  released when the HTTP side closes the connection. The response write is
+  also closed at write start + the web idle timeout (30 s by default; 30 s when
+  that timeout is 0), whichever comes first. A 503 written by the stratum
+  side is closed at the handshake deadline or 30 s after it starts.
+- A bounded number of stratum-port HTTP requests is in progress at once, in
+  total and per address; others are answered 503
+  (`{"error":"busy, try again later"}`) and close at once:
+  `--stratum-http-budget N` (settings key `stratum.http_budget`, LTC YAML
+  `stratum_http_budget`; default 16) in total, at most
+  `max_stratum_connections` - 1 (0 = every HTTP request on the stratum port is
+  answered 503), and `--stratum-http-per-ip N` (`stratum.http_per_ip`,
+  `stratum_http_per_ip`; default 6) from one address, one /64 for IPv6
+  (0 = no limit below the budget). The startup line names the values in
+  force.
+  At most one info line per minute,
+  `HTTP request on stratum port from <ip>: GET /global_stats -> 200`; the
+  requests in between are counted and summarised with the first request
+  after the minute. Failed requests (malformed, cut off) get the same
+  treatment as one warning line per minute instead of one each.
+- `--stratum-http=true|false|auto` on every coin (settings key
+  `stratum.http`, the same values, also on/off/yes/no/1/0; anything else is
+  refused with a warning and leaves the setting as it was), default `false`;
+  `auto`: on when the web server binds `::`, binds `0.0.0.0` and the stratum
+  listener an IPv4 address, or binds the stratum listener's own non-loopback
+  address; off when it binds loopback only (a reverse proxy in front decides
+  what is public), binds one LAN or VPN address while the stratum port binds
+  wider, binds `0.0.0.0` while the stratum port binds IPv6, or is disabled. `auto`
+  cannot see a firewall, a cloud security group or a container that
+  publishes only the stratum port: on a node whose web port is closed that
+  way, do not use `auto`; keep `--stratum-http=false` (the default). Forced on without a web server, an HTTP
+  request gets a 503. The startup log names the result, e.g.
+  `stratum HTTP: ON (web bound to 0.0.0.0)` or
+  `stratum HTTP: OFF (web bound to 10.8.0.1, stratum to 0.0.0.0)`.
+- HEAD now works on the web port as well (it answered 405), except on the
+  routes that change state on GET (`/control/*`, `/api/admin/*`) and
+  `/sharechain/stream`, which answer HEAD with 405.
+
 ### Linux packages: the binary starts without start.sh
 - `c2pool-<coin>` in the Linux tarball now loads its bundled libraries from
   the package's `lib/` by itself (RUNPATH `$ORIGIN/lib`, and `$ORIGIN` on

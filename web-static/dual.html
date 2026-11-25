@@ -1,0 +1,578 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>c2pool DASH: two share chains</title>
+    <style>
+        /* Two DASH share chains side by side, row by row: every row holds the
+           same widget for both chains, so the two columns always line up.
+           The chains come from /api/pools; each column reads only its own
+           same-origin route /api/<id>/... (GET). */
+        :root {
+            --primary: #008de4;
+            --accent: #a78bfa;
+            --success: #28a745;
+            --warning: #ffc107;
+            --dark: #1a1a2e;
+            --darker: #16162a;
+            --card-bg: #252540;
+            --text: #e0e0e0;
+            --text-muted: #8888a0;
+            --border: #3a3a5a;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            background: linear-gradient(135deg, var(--dark) 0%, var(--darker) 100%);
+            color: var(--text);
+            min-height: 100vh;
+            line-height: 1.5;
+        }
+        a { color: var(--primary); text-decoration: none; }
+        a:hover { text-decoration: underline; }
+        .bar {
+            display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+            padding: 12px 20px; background: var(--card-bg); border-bottom: 1px solid var(--border);
+        }
+        .bar h1 { font-size: 1.2rem; font-weight: 600; }
+        .bar h1 span { color: var(--primary); }
+        .bar .hint { color: var(--text-muted); font-size: 0.85rem; }
+        .bar .spacer { flex: 1; }
+        .periods { display: flex; gap: 4px; }
+        .periods button {
+            background: transparent; color: var(--text-muted); border: 1px solid var(--border);
+            border-radius: 6px; padding: 3px 10px; font-size: 0.85rem; cursor: pointer;
+        }
+        .periods button.on { background: var(--primary); border-color: var(--primary); color: #fff; }
+        .grid {
+            display: grid; grid-template-columns: 1fr 1fr; gap: 14px 18px;
+            padding: 16px 20px 28px; max-width: 1900px; margin: 0 auto;
+        }
+        .card {
+            background: var(--card-bg); border: 1px solid var(--border); border-radius: 10px;
+            padding: 14px 16px; min-width: 0;
+        }
+        .head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+        .head .dot { width: 11px; height: 11px; border-radius: 50%; flex: none; }
+        .head .name { font-size: 1.15rem; font-weight: 600; }
+        .head .ver { font-size: 0.8rem; color: var(--text-muted); border: 1px solid var(--border); border-radius: 5px; padding: 1px 7px; }
+        .head .spacer { flex: 1; }
+        .head .meta { color: var(--text-muted); font-size: 0.85rem; }
+        .tiles { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+        .tile { background: var(--darker); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; }
+        .tile .k { color: var(--text-muted); font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.04em; }
+        .tile .v { font-size: 1.35rem; font-weight: 600; margin-top: 2px; }
+        .tile .s { color: var(--text-muted); font-size: 0.78rem; }
+        .card h2 { font-size: 1rem; font-weight: 600; margin-bottom: 8px; display: flex; gap: 8px; align-items: baseline; }
+        .card h2 .s { color: var(--text-muted); font-size: 0.8rem; font-weight: 400; }
+        .chart { width: 100%; height: 230px; }
+        .chart svg { width: 100%; height: 100%; display: block; }
+        .chart .axis { fill: var(--text-muted); font-size: 11px; }
+        .chart .gridline { stroke: var(--border); stroke-width: 1; }
+        .chart .blk { cursor: pointer; }
+        .chart .blk:hover line { stroke-opacity: 1; stroke-width: 2; }
+        .chart-stats { display: flex; gap: 22px; margin-top: 6px; font-size: 0.85rem; }
+        .chart-stats .k { color: var(--text-muted); font-size: 0.72rem; text-transform: uppercase; }
+        table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+        th { text-align: left; color: var(--text-muted); font-weight: 500; font-size: 0.75rem; text-transform: uppercase;
+             padding: 4px 6px; border-bottom: 1px solid var(--border); }
+        td { padding: 5px 6px; border-bottom: 1px solid rgba(58,58,90,0.5); white-space: nowrap; }
+        td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+        td.addr { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.8rem; overflow: hidden; text-overflow: ellipsis; max-width: 0; width: 70%; }
+        .connect { display: grid; grid-template-columns: max-content 1fr; gap: 7px 14px; align-items: center; font-size: 0.9rem; }
+        .connect .k { color: var(--text-muted); font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.04em; }
+        .connect code, .private code {
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.86rem;
+            background: var(--darker); border: 1px solid var(--border); border-radius: 6px; padding: 2px 8px;
+        }
+        .connect .url { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+        .connect .url code { color: var(--text); font-size: 0.95rem; }
+        .copy {
+            background: transparent; color: var(--text-muted); border: 1px solid var(--border);
+            border-radius: 6px; padding: 1px 9px; font-size: 0.78rem; cursor: pointer;
+        }
+        .copy.done { color: var(--success); border-color: var(--success); }
+        .connect-note { color: var(--text-muted); font-size: 0.82rem; margin-top: 10px; }
+        .private { font-size: 0.95rem; }
+        .eps { display: flex; flex-direction: column; gap: 6px; }
+        .eps .rg { display: inline-block; min-width: 2.6em; font-weight: 600; color: var(--text); }
+        .own { margin-top: 14px; padding-top: 10px; border-top: 1px solid var(--border, rgba(127,127,127,0.25)); }
+        .own h4 { margin: 0 0 6px; font-size: 0.9rem; }
+        .own pre { white-space: pre-wrap; word-break: break-all; margin: 6px 0 0; font-size: 0.8rem; }
+        .muted { color: var(--text-muted); }
+        .good { color: var(--success); }
+        .warn { color: var(--warning); }
+        .err { color: #ff6b6b; }
+        .connect code { overflow-wrap: anywhere; }
+        /* Wide: row by row (both chains side by side). Narrow: one chain after the other. */
+        .grid > .card { order: var(--o-wide, 0); }
+        @media (max-width: 900px) {
+            .grid { grid-template-columns: 1fr; }
+            .grid > .card { order: var(--o-narrow, 0); }
+            .tiles { grid-template-columns: repeat(2, 1fr); }
+            .connect { grid-template-columns: 1fr; gap: 2px; }
+            .connect .k { margin-top: 8px; }
+        }
+    </style>
+</head>
+<body>
+    <div class="bar">
+        <h1><span>c2pool</span> DASH &middot; two share chains</h1>
+        <span class="hint">Two independent share chains, side by side. Each column reads only its own node.</span>
+        <span class="spacer"></span>
+        <div class="periods" id="periods">
+            <button type="button" data-p="hour">1H</button>
+            <button type="button" data-p="day" class="on">1D</button>
+            <button type="button" data-p="week">1W</button>
+            <button type="button" data-p="month">1M</button>
+        </div>
+    </div>
+    <div class="grid" id="grid"><div class="card muted">Loading the share-chain list&hellip;</div></div>
+<script>
+(function () {
+    'use strict';
+    var COLORS = ['#008de4', '#a78bfa'];
+    var ROWS = ['head', 'connect', 'tiles', 'chart', 'blocks', 'payouts'];
+    var period = 'day';
+    var pools = [];
+
+    function el(tag, cls, text) {
+        var e = document.createElement(tag);
+        if (cls) e.className = cls;
+        if (text !== undefined && text !== null) e.textContent = text;
+        return e;
+    }
+    function get(api, path) {
+        return fetch(api + path, { headers: { 'Accept': 'application/json' } })
+            .then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); });
+    }
+    function fmtHash(h) {
+        if (!(h > 0)) return '0 H/s';
+        var u = ['H/s', 'kH/s', 'MH/s', 'GH/s', 'TH/s', 'PH/s', 'EH/s'], i = 0;
+        while (h >= 1000 && i < u.length - 1) { h /= 1000; i++; }
+        return h.toFixed(h >= 100 ? 1 : 2) + ' ' + u[i];
+    }
+    function fmtDur(s) {
+        if (!(s >= 0) || !isFinite(s)) return '-';
+        var d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60);
+        if (d) return d + 'd ' + h + 'h';
+        if (h) return h + 'h ' + m + 'm';
+        return m + 'm';
+    }
+    // An explorer link only for this chain's own (parent-chain) blocks with an
+    // https explorer URL, the same rule the full dashboard uses (#2298).
+    function blockLink(p, b) {
+        if (!b || typeof b.explorer_url !== 'string' || !/^https:\/\//.test(b.explorer_url)) return null;
+        if (b.chain && p.symbol && b.chain !== p.symbol) return null;
+        return b.explorer_url;
+    }
+    var lastGraph = {}, lastBlocks = {};
+    function ago(ts) { var s = Date.now() / 1000 - ts; return s < 60 ? 'just now' : fmtDur(s) + ' ago'; }
+
+    // ── layout: one grid row per widget, one cell per chain ─────────────
+    function layout() {
+        var grid = document.getElementById('grid');
+        grid.innerHTML = '';
+        ROWS.forEach(function (row) {
+            pools.forEach(function (p, i) {
+                var c = el('section', 'card');
+                c.id = row + '-' + p.id;
+                c.style.setProperty('--o-wide', String(ROWS.indexOf(row) * 10 + i));
+                c.style.setProperty('--o-narrow', String(i * 10 + ROWS.indexOf(row)));
+                if (row === 'head') {
+                    var h = el('div', 'head');
+                    var dot = el('span', 'dot'); dot.style.background = COLORS[i % COLORS.length];
+                    h.appendChild(dot);
+                    h.appendChild(el('span', 'name', p.name || p.id));
+                    var ver = el('span', 'ver', '…'); ver.id = 'ver-' + p.id; h.appendChild(ver);
+                    h.appendChild(el('span', 'spacer'));
+                    var meta = el('span', 'meta', ''); meta.id = 'meta-' + p.id; h.appendChild(meta);
+                    var open = el('a', '', 'Full dashboard ↗');
+                    open.href = 'dashboard.html?api=' + encodeURIComponent('/api/' + p.id);
+                    open.target = '_blank'; open.rel = 'noopener';
+                    h.appendChild(open);
+                    c.appendChild(h);
+                    if (p.note) { var n = el('div', 'meta muted', p.note); n.style.marginTop = '4px'; c.appendChild(n); }
+                } else if (row === 'connect') {
+                    c.appendChild(el('h2', '', 'How to connect'));
+                    c.appendChild(el('div', 'body'));
+                } else if (row === 'tiles') {
+                    c.appendChild(el('div', 'tiles'));
+                } else if (row === 'chart') {
+                    var t = el('h2'); t.appendChild(document.createTextNode('Pool hashrate'));
+                    t.appendChild(el('span', 's', ''));
+                    c.appendChild(t);
+                    c.appendChild(el('div', 'chart'));
+                    c.appendChild(el('div', 'chart-stats'));
+                } else if (row === 'blocks') {
+                    var tb = el('h2'); tb.appendChild(document.createTextNode('Recent blocks'));
+                    tb.appendChild(el('span', 's', '')); c.appendChild(tb);
+                    c.appendChild(el('div', 'body'));
+                } else if (row === 'payouts') {
+                    var tp = el('h2'); tp.appendChild(document.createTextNode('Current payouts'));
+                    tp.appendChild(el('span', 's', '')); c.appendChild(tp);
+                    c.appendChild(el('div', 'body'));
+                }
+                grid.appendChild(c);
+            });
+        });
+    }
+
+    function tile(k, v, s, cls) {
+        var t = el('div', 'tile');
+        t.appendChild(el('div', 'k', k));
+        var vv = el('div', 'v' + (cls ? ' ' + cls : ''), v); t.appendChild(vv);
+        t.appendChild(el('div', 's', s || ' '));
+        return t;
+    }
+
+    function renderStats(p, ls, gs, blocks) {
+        var ver = document.getElementById('ver-' + p.id);
+        ver.textContent = (ls && ls.version) || '?';
+        var peers = ls && ls.peers ? (ls.peers.outgoing + ls.peers.incoming) + ' peers' : '';
+        document.getElementById('meta-' + p.id).textContent =
+            [peers, ls && ls.uptime ? 'up ' + fmtDur(ls.uptime) : ''].filter(Boolean).join(' · ');
+        var box = document.querySelector('#tiles-' + p.id + ' .tiles');
+        box.innerHTML = '';
+        var pr = gs ? gs.pool_hash_rate : 0, nr = gs ? gs.network_hashrate : 0;
+        var share = nr > 0 ? pr / nr * 100 : 0;
+        var ttb = gs && pr > 0 ? gs.network_block_difficulty * 4294967296 / pr : NaN;
+        var last = blocks && blocks.length ? blocks[0] : null;
+        box.appendChild(tile('Pool hashrate', fmtHash(pr), 'stale ' + ((gs && gs.pool_stale_prop || 0) * 100).toFixed(1) + '%'));
+        box.appendChild(tile('Network share', share.toFixed(2) + '%', 'of ' + fmtHash(nr)));
+        box.appendChild(tile('Expected block', fmtDur(ttb), 'at the current hashrate'));
+        box.appendChild(tile('Last block', last ? ago(last.ts) : '-', last ? '#' + (last.height || last.number) : ''));
+        box.appendChild(tile('Shares in chain', gs ? String(gs.shares_in_chain) : '-', ''));
+        box.appendChild(tile('Miners', gs ? String(gs.unique_miners) : '-', gs && gs.local_workers ? gs.local_workers + ' on this node' : ''));
+    }
+
+    // ── chart: plain SVG area of good+dead+orphan over the period ────────
+    function renderChart(p, data, color) {
+        var card = document.getElementById('chart-' + p.id);
+        var box = card.querySelector('.chart'), stats = card.querySelector('.chart-stats');
+        box.innerHTML = ''; stats.innerHTML = '';
+        var pts = (data || []).map(function (r) {
+            var v = r[1] || {};
+            return [r[0], (v.good || 0) + (v.dead || 0) + (v.orphan || 0)];
+        }).filter(function (q) { return q[0] > 0; });
+        if (pts.length < 2) { box.appendChild(el('div', 'muted', 'No graph data for this period.')); return; }
+        var W = box.clientWidth || 600, H = box.clientHeight || 230, L = 64, R = 8, T = 8, B = 22;
+        var t0 = pts[0][0], t1 = pts[pts.length - 1][0];
+        var vmax = Math.max.apply(null, pts.map(function (q) { return q[1]; })) * 1.1 || 1;
+        function x(t) { return L + (t - t0) / ((t1 - t0) || 1) * (W - L - R); }
+        function y(v) { return T + (1 - v / vmax) * (H - T - B); }
+        var ns = 'http://www.w3.org/2000/svg';
+        var svg = document.createElementNS(ns, 'svg');
+        svg.setAttribute('viewBox', '0 0 ' + W + ' ' + H);
+        function add(tag, attrs, text) {
+            var e = document.createElementNS(ns, tag);
+            for (var k in attrs) e.setAttribute(k, attrs[k]);
+            if (text) e.textContent = text;
+            svg.appendChild(e); return e;
+        }
+        for (var g = 0; g <= 4; g++) {
+            var gv = vmax * g / 4, gy = y(gv);
+            add('line', { x1: L, x2: W - R, y1: gy, y2: gy, 'class': 'gridline' });
+            add('text', { x: L - 6, y: gy + 4, 'text-anchor': 'end', 'class': 'axis' }, fmtHash(gv).replace(' ', ' '));
+        }
+        for (var a = 0; a <= 4; a++) {
+            var tt = t0 + (t1 - t0) * a / 4, d = new Date(tt * 1000);
+            var lab = (period === 'hour' || period === 'day')
+                ? ('0' + d.getHours()).slice(-2) + ':' + ('0' + d.getMinutes()).slice(-2)
+                : (d.getMonth() + 1) + '/' + d.getDate();
+            add('text', { x: x(tt), y: H - 6, 'text-anchor': a === 0 ? 'start' : (a === 4 ? 'end' : 'middle'), 'class': 'axis' }, lab);
+        }
+        var line = pts.map(function (q, i) { return (i ? 'L' : 'M') + x(q[0]).toFixed(1) + ',' + y(q[1]).toFixed(1); }).join('');
+        var area = line + 'L' + x(t1).toFixed(1) + ',' + y(0) + 'L' + x(t0).toFixed(1) + ',' + y(0) + 'Z';
+        add('path', { d: area, fill: color, 'fill-opacity': '0.18', stroke: 'none' });
+        add('path', { d: line, fill: 'none', stroke: color, 'stroke-width': '1.6' });
+        // Found blocks inside the plotted period: a dashed line from the top
+        // of the plot to the axis, a dot on top, a tooltip, and an explorer
+        // link where the recent-blocks table has one.
+        var found = (lastBlocks[p.id] || []).filter(function (b) {
+            return b && typeof b.ts === 'number' && b.ts >= t0 && b.ts <= t1;
+        });
+        found.forEach(function (b) {
+            var bx = x(b.ts).toFixed(1), orphan = b.status === 'orphan';
+            var mc = orphan ? '#ff6b6b' : '#2ee59d';
+            var g = document.createElementNS(ns, 'g');
+            g.setAttribute('class', 'blk');
+            var ln = document.createElementNS(ns, 'line');
+            ln.setAttribute('x1', bx); ln.setAttribute('x2', bx);
+            ln.setAttribute('y1', T + 6); ln.setAttribute('y2', H - B);
+            ln.setAttribute('stroke', mc); ln.setAttribute('stroke-width', '1.2');
+            ln.setAttribute('stroke-dasharray', '3 3'); ln.setAttribute('stroke-opacity', '0.85');
+            var dot = document.createElementNS(ns, 'circle');
+            dot.setAttribute('cx', bx); dot.setAttribute('cy', T + 6); dot.setAttribute('r', '4.5');
+            dot.setAttribute('fill', mc); dot.setAttribute('stroke', '#16162a'); dot.setAttribute('stroke-width', '1.5');
+            var tip = document.createElementNS(ns, 'title');
+            tip.textContent = 'Block #' + (b.height || b.number) + ' \u00b7 '
+                + new Date(b.ts * 1000).toLocaleString() + (orphan ? ' \u00b7 orphan' : '');
+            g.appendChild(tip); g.appendChild(ln); g.appendChild(dot);
+            var href = blockLink(p, b);
+            if (href) {
+                var a = document.createElementNS(ns, 'a');
+                a.setAttribute('href', href); a.setAttribute('target', '_blank'); a.setAttribute('rel', 'noopener');
+                a.appendChild(g); svg.appendChild(a);
+            } else {
+                svg.appendChild(g);
+            }
+        });
+        box.appendChild(svg);
+        var vals = pts.map(function (q) { return q[1]; });
+        var avg = vals.reduce(function (s, v) { return s + v; }, 0) / vals.length;
+        var nb = el('div'); nb.appendChild(el('div', 'k', 'Blocks'));
+        nb.appendChild(el('div', '', String(found.length) + ' in period'));
+        [['Current', vals[vals.length - 1]], ['Average', avg], ['Peak', Math.max.apply(null, vals)]].forEach(function (kv) {
+            var s = el('div'); s.appendChild(el('div', 'k', kv[0])); s.appendChild(el('div', '', fmtHash(kv[1])));
+            stats.appendChild(s);
+        });
+        stats.appendChild(nb);
+        card.querySelector('h2 .s').textContent = { hour: 'last hour', day: 'last day', week: 'last week', month: 'last month' }[period];
+    }
+
+    function renderBlocks(p, blocks) {
+        var card = document.getElementById('blocks-' + p.id), body = card.querySelector('.body');
+        body.innerHTML = '';
+        var list = (blocks || []).slice(0, 10);
+        card.querySelector('h2 .s').textContent = blocks ? blocks.length + ' found' : '';
+        if (!list.length) { body.appendChild(el('div', 'muted', 'No blocks yet.')); return; }
+        var t = el('table'), hr = el('tr');
+        ['Height', 'Found', 'Effort', 'Status'].forEach(function (h, i) { hr.appendChild(el('th', i === 2 ? 'num' : '', h)); });
+        t.appendChild(hr);
+        list.forEach(function (b) {
+            var r = el('tr');
+            var c1 = el('td'); var a = el('a', '', String(b.height || b.number));
+            var href = blockLink(p, b);
+            if (href) { a.href = href; a.target = '_blank'; a.rel = 'noopener'; }
+            c1.appendChild(a); r.appendChild(c1);
+            r.appendChild(el('td', 'muted', b.ts ? ago(b.ts) : '-'));
+            var eff = (typeof b.effort === 'number') ? b.effort * 100
+                    : (typeof b.luck === 'number' && b.luck > 0 ? 10000 / b.luck : NaN);
+            r.appendChild(el('td', 'num ' + (eff > 150 ? 'warn' : ''), isFinite(eff) ? eff.toFixed(0) + '%' : '-'));
+            r.appendChild(el('td', b.status === 'orphan' ? 'err' : (b.status === 'confirmed' ? 'good' : 'muted'), b.status || ''));
+            t.appendChild(r);
+        });
+        body.appendChild(t);
+    }
+
+    function renderPayouts(p, pays) {
+        var card = document.getElementById('payouts-' + p.id), body = card.querySelector('.body');
+        body.innerHTML = '';
+        var rows = Object.keys(pays || {}).map(function (k) { return [k, pays[k]]; })
+            .sort(function (a, b) { return b[1] - a[1]; });
+        var total = rows.reduce(function (s, r) { return s + r[1]; }, 0);
+        card.querySelector('h2 .s').textContent = rows.length ? total.toFixed(4) + ' DASH to ' + rows.length + ' addresses' : '';
+        if (!rows.length) { body.appendChild(el('div', 'muted', 'No payouts in the current window.')); return; }
+        var t = el('table'), hr = el('tr');
+        hr.appendChild(el('th', '', 'Address')); hr.appendChild(el('th', 'num', 'Amount (DASH)'));
+        t.appendChild(hr);
+        rows.slice(0, 10).forEach(function (r) {
+            var tr = el('tr');
+            tr.appendChild(el('td', 'addr', r[0]));
+            tr.appendChild(el('td', 'num', r[1].toFixed(8)));
+            t.appendChild(tr);
+        });
+        body.appendChild(t);
+    }
+
+    // ── how to connect ───────────────────────────────────────────────────
+    // A chain is shown as open only when its /api/pools entry says so: either
+    // "stratum": "stratum+tcp://host:port", or "connect": true (the URL is then
+    // built from the node's own /node_info, as the full dashboard does). Any
+    // other entry gets a private card ("connect_note" overrides its text), so
+    // the page never advertises an address its deployment did not publish.
+    var STRATUM_RE = /^stratum\+(tcp|ssl):\/\/[A-Za-z0-9.-]{1,253}:[0-9]{1,5}$/;
+    function stratumOf(p, ni) {
+        if (typeof p.stratum === 'string') return STRATUM_RE.test(p.stratum) ? p.stratum : null;
+        if (p.connect !== true || !ni) return null;
+        var port = Number(ni.worker_port);
+        if (!(port > 0 && port < 65536)) return null;
+        var host = (typeof ni.external_ip === 'string' && ni.external_ip && ni.external_ip !== '0.0.0.0')
+            ? ni.external_ip : window.location.hostname;
+        var u = 'stratum+tcp://' + host + ':' + port;
+        return STRATUM_RE.test(u) ? u : null;
+    }
+    function kv(box, k, v) { box.appendChild(el('div', 'k', k)); box.appendChild(v); return v; }
+    function code(t) { return el('code', '', t); }
+    function copyBtn(text) {
+        var cp = el('button', 'copy', 'Copy'); cp.type = 'button';
+        cp.addEventListener('click', function () {
+            if (!navigator.clipboard) return;
+            navigator.clipboard.writeText(text).then(function () {
+                cp.textContent = 'Copied'; cp.classList.add('done');
+                setTimeout(function () { cp.textContent = 'Copy'; cp.classList.remove('done'); }, 1500);
+            });
+        });
+        return cp;
+    }
+    // "endpoints": [{"region": "UK", "stratum": "stratum+tcp://host:port"}, ...]
+    // lists every node of this chain that takes miners, so a miner can pick the
+    // closest one. Only well-formed entries the deployment published are shown.
+    var REGION_RE = /^[A-Za-z0-9 .()-]{1,24}$/;
+    var HEX16_RE = /^[0-9a-f]{16}$/;
+    var HOSTPORT_RE = /^[A-Za-z0-9.-]{1,253}:[0-9]{1,5}$/;
+    function endpointsOf(p) {
+        if (!Array.isArray(p.endpoints)) return [];
+        return p.endpoints.filter(function (e) {
+            return e && typeof e.region === 'string' && REGION_RE.test(e.region)
+                && typeof e.stratum === 'string' && STRATUM_RE.test(e.stratum);
+        }).slice(0, 8);
+    }
+    // "share_chain": {"network_id": hex16, "prefix": hex16, "default": bool,
+    // "addnodes": ["host:port", ...]}: what a miner needs to run their own
+    // c2pool-dash node on this chain, with their own fee and rules.
+    function renderOwnNode(p, body) {
+        var s = p.share_chain;
+        if (!s || typeof s !== 'object' || !HEX16_RE.test(s.network_id) || !HEX16_RE.test(s.prefix)) return;
+        var adds = (Array.isArray(s.addnodes) ? s.addnodes : []).filter(function (a) {
+            return typeof a === 'string' && HOSTPORT_RE.test(a);
+        }).slice(0, 8);
+        var box = el('div', 'own');
+        box.appendChild(el('h4', '', 'Run your own node'));
+        box.appendChild(el('div', 'connect-note',
+            'Prefer your own node? c2pool-dash joins this share chain from your machine, '
+            + 'with your own fee and rules. Point your miners at it instead.'));
+        var g = el('div', 'connect');
+        kv(g, 'Network ID', code(s.network_id));
+        kv(g, 'Prefix', code(s.prefix));
+        body.appendChild(box);
+        box.appendChild(g);
+        var cmd = 'c2pool-dash --run --embedded-mainnet --embedded-utxo'
+            + (s['default'] === true ? '' : ' --network-id ' + s.network_id + ' --prefix ' + s.prefix)
+            + adds.map(function (a) { return ' --addnode ' + a; }).join('')
+            + ' --fee <percent>';
+        var pre = el('pre'); pre.appendChild(code(cmd));
+        var row = el('div', 'url'); row.appendChild(copyBtn(cmd));
+        box.appendChild(pre); box.appendChild(row);
+        var n = el('div', 'connect-note');
+        if (s['default'] === true)
+            n.appendChild(document.createTextNode('This is the default p2pool-dash identity: the id and prefix flags are not needed. '));
+        var a = el('a', '', 'Download c2pool →');
+        a.href = 'https://github.com/frstrtr/c2pool/releases'; a.target = '_blank'; a.rel = 'noopener';
+        n.appendChild(a);
+        n.appendChild(document.createTextNode(' · '));
+        var r = el('a', '', 'all node flags (README) →');
+        r.href = 'https://github.com/frstrtr/c2pool#readme'; r.target = '_blank'; r.rel = 'noopener';
+        n.appendChild(r);
+        box.appendChild(n);
+    }
+    function renderConnect(p) {
+        var body = document.querySelector('#connect-' + p.id + ' .body');
+        body.innerHTML = '';
+        var url = p._stratum;
+        if (!url) {
+            var msg = (typeof p.connect_note === 'string' && p.connect_note) ? p.connect_note
+                : 'Private pool: connections by invitation.';
+            body.appendChild(el('div', 'private', msg));
+            var open = pools.filter(function (q) { return q !== p && q._stratum; })[0];
+            if (open) {
+                var n = el('div', 'connect-note');
+                n.appendChild(document.createTextNode('Want to mine DASH now? '));
+                var a = el('a', '', 'Use the ' + (open.name || open.id) + ' chain →');
+                a.href = '#connect-' + open.id;
+                n.appendChild(a);
+                body.appendChild(n);
+            }
+            renderOwnNode(p, body);
+            return;
+        }
+        var g = el('div', 'connect');
+        if (p._eps.length) {
+            var eps = el('div', 'eps');
+            p._eps.forEach(function (e) {
+                var r = el('div', 'url');
+                r.appendChild(el('span', 'rg', e.region));
+                r.appendChild(code(e.stratum));
+                r.appendChild(copyBtn(e.stratum));
+                if (typeof e.dashboard === 'string' && /^\/api\/[a-z0-9_-]{1,32}$/.test(e.dashboard)) {
+                    var d = el('a', 'muted', 'dashboard ↗');
+                    d.href = 'dashboard.html?api=' + encodeURIComponent(e.dashboard);
+                    r.appendChild(d);
+                }
+                eps.appendChild(r);
+            });
+            kv(g, p._eps.length > 1 ? 'Stratum URLs' : 'Stratum URL', eps);
+        } else {
+            var u = el('div', 'url'); u.appendChild(code(url)); u.appendChild(copyBtn(url));
+            kv(g, 'Stratum URL', u);
+        }
+        var user = el('div'); user.appendChild(code('<your DASH address>'));
+        user.appendChild(el('span', 'muted', ' or ')); user.appendChild(code('<address>.<worker>'));
+        kv(g, 'Username', user);
+        var pass = el('div'); pass.appendChild(code('x')); pass.appendChild(el('span', 'muted', ' (any value)'));
+        kv(g, 'Password', pass);
+        var diff = el('div'); diff.appendChild(el('span', 'muted', 'automatic; '));
+        diff.appendChild(code('<address>+<difficulty>')); diff.appendChild(el('span', 'muted', ' fixes it'));
+        kv(g, 'Difficulty', diff);
+        body.appendChild(g);
+        body.appendChild(el('div', 'connect-note',
+            'X11 ASIC miners. Every block this chain finds pays its miners directly in the coinbase, '
+            + 'in proportion to their recent shares: no account, no withdrawal.'));
+        if (p._eps.length > 1)
+            body.appendChild(el('div', 'connect-note',
+                'Pick the node closest to you. All of them mine the same share chain, '
+                + 'so your payout does not depend on which one you use.'));
+        renderOwnNode(p, body);
+    }
+    function initConnect() {
+        Promise.all(pools.map(function (p) {
+            if (p.connect !== true || typeof p.stratum === 'string') return Promise.resolve(null);
+            return get('/api/' + p.id, '/node_info').catch(function () { return null; });
+        })).then(function (infos) {
+            pools.forEach(function (p, i) {
+                p._eps = endpointsOf(p);
+                p._stratum = p._eps.length ? p._eps[0].stratum : stratumOf(p, infos[i]);
+            });
+            pools.forEach(renderConnect);
+        });
+    }
+
+    var GRAPH = { hour: 'last_hour', day: 'last_day', week: 'last_week', month: 'last_month' };
+    function refreshChart(p, i) {
+        var api = '/api/' + p.id;
+        get(api, '/web/graph_data/pool_rates/' + GRAPH[period])
+            .then(function (d) { lastGraph[p.id] = d; renderChart(p, d, COLORS[i % COLORS.length]); })
+            .catch(function () { renderChart(p, [], COLORS[i % COLORS.length]); });
+    }
+    function refresh() {
+        pools.forEach(function (p, i) {
+            var api = '/api/' + p.id;
+            Promise.all([
+                get(api, '/local_stats').catch(function () { return null; }),
+                get(api, '/global_stats').catch(function () { return null; }),
+                get(api, '/recent_blocks').catch(function () { return null; }),
+                get(api, '/current_payouts').catch(function () { return null; }),
+            ]).then(function (r) {
+                renderStats(p, r[0], r[1], r[2]);
+                renderBlocks(p, r[2]);
+                lastBlocks[p.id] = Array.isArray(r[2]) ? r[2] : [];
+                if (lastGraph[p.id]) renderChart(p, lastGraph[p.id], COLORS[i % COLORS.length]);
+                renderPayouts(p, r[3]);
+            });
+            refreshChart(p, i);
+        });
+    }
+
+    document.getElementById('periods').addEventListener('click', function (e) {
+        var b = e.target.closest('button'); if (!b) return;
+        period = b.getAttribute('data-p');
+        Array.prototype.forEach.call(this.querySelectorAll('button'), function (x) { x.classList.toggle('on', x === b); });
+        pools.forEach(refreshChart);
+    });
+
+    fetch('/api/pools').then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); })
+        .then(function (list) {
+            pools = (list || []).filter(function (p) { return p && /^[a-z0-9_-]{1,32}$/.test(p.id || ''); }).slice(0, 2);
+            if (!pools.length) throw new Error('empty');
+            layout();
+            initConnect();
+            refresh();
+            setInterval(refresh, 60000);
+        })
+        .catch(function () { window.location.replace('dashboard.html'); });   // a single-chain server: the normal page
+})();
+</script>
+</body>
+</html>

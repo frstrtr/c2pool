@@ -211,6 +211,10 @@ namespace {
 // run_node; see coin/deployment_status.hpp for how it combines with the
 // computed state.
 std::optional<uint32_t> g_v24_activation_pin;
+// --header-dgw-log-only: the coin header chain logs a header whose bits are
+// not the DGW bits of its own window and ACCEPTS it, instead of refusing it
+// (the mainnet default). An escape hatch, not a mode to run in.
+bool g_header_dgw_log_only = false;
 // --embedded-credit-pool-seed: seed the credit-pool follower from the v20
 // floor (every block since v20 over coin P2P, mainnet ~580k blocks, kept in
 // <net>/credit_pool_idx). The only seed that admits asset unlocks: Dash Core
@@ -631,7 +635,10 @@ void print_banner(const char* argv0)
         << "           [--network-id HEX [--prefix HEX]]  (private sharechain identity)\n"
         << "           [--stratum [HOST:]PORT] [--coin-p2p-connect HOST:PORT]... [--coin-p2p-discover]\n"
         << "           [--web-port PORT] [--web-host ADDR] [--dashboard-dir PATH]\n"
+        << "           [--stratum-http[=true|false|auto]]\n"
+        << "           [--stratum-http-budget N] [--stratum-http-per-ip N]\n"
         << "           [--external-ip ADDR]\n"
+        << "           [--header-dgw-log-only]  (log, do not refuse, a header off its DGW bits)\n"
         << "           [--embedded-utxo[=false]] [--embedded-mainnet[=false]] [--embedded-null-arm[=false]]\n"
         << "           [--embedded-superblock[=false]] [--embedded-include-mn-special-txs[=false]]\n"
         << "           [--embedded-superblock-unfunded-mainnet]  (TEST/SOAK ONLY — MUST NEVER be set on a\n"
@@ -815,6 +822,19 @@ void print_banner(const char* argv0)
         << "        --web-port PORT (alias --http-port, default 8080) serves the FULL\n"
         << "        c2pool web dashboard + JSON API on --web-host (default 0.0.0.0)\n"
         << "        from --dashboard-dir (default web-static); --web-port 0 disables.\n"
+        << "        --stratum-http[=true|false|auto] also answers that API (GET/HEAD,\n"
+        << "        read-only) on the stratum port, as python p2pool did on its\n"
+        << "        worker port (trackers poll host:<stratum>/global_stats); default\n"
+        << "        false; auto = on when --web-host is ::, is 0.0.0.0 and --stratum\n"
+        << "        is IPv4, or is the --stratum address (not loopback).\n"
+        << "        --stratum-http-budget N: HTTP requests in progress on the\n"
+        << "        stratum port at once, at most N and at most\n"
+        << "        max_stratum_connections - 1; others are answered 503 (default\n"
+        << "        16; 0 = every HTTP request on the stratum port is answered 503).\n"
+        << "        --stratum-http-per-ip N: HTTP requests in progress on the\n"
+        << "        stratum port at once from one address, one /64 for IPv6, at\n"
+        << "        most N; others are answered 503 (default 6; 0 = no limit below\n"
+        << "        --stratum-http-budget).\n"
         << "        --embedded-oracle-shadow runs the OBSERVE-only per-block dashd\n"
         << "        cross-check: dashd getblocktemplate{mode:proposal} is the VERDICT,\n"
         << "        regime-aware field-compare is the DIAGNOSIS; a persisted graduation\n"
@@ -4353,9 +4373,36 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     }
 
     dash::stratum::DASHWorkSource::SubmitBlockFn stratum_submit_fn =
-        [p2p_relay, rpc_submit](const std::vector<unsigned char>& block_bytes,
+        [p2p_relay, rpc_submit, &node_coin_state](
+                                const std::vector<unsigned char>& block_bytes,
                                 uint32_t height,
                                 bool height_race) -> bool {
+            // N2: a won block carrying a tx that conflicts with a VERIFIED
+            // islock is conflict-tx-lock on every non-IBD Dash Core node
+            // (v24.0.2 validation.cpp:2811-2829) unless it is already
+            // ChainLocked, which a fresh block never is. Checked AFTER dispatch
+            // (never delay a won block) and only while the verified lane holds
+            // locks; it names the loss instead of leaving an unexplained orphan.
+            auto name_islock_conflict = [&]() {
+                if (node_coin_state.mempool().verified_islock_outpoint_count() == 0) return;
+                try {
+                    dash::coin::BlockType blk;
+                    ::PackStream s(block_bytes);
+                    s >> blk;
+                    if (const auto c = node_coin_state.mempool().verified_islock_conflict_in(
+                            blk.m_txs, std::vector<uint256>{}))
+                        LOG_ERROR << "[ISLOCK-CONFLICT] won block height=" << height
+                                  << " carries tx " << c->txid.GetHex().substr(0, 16)
+                                  << " spending " << c->outpoint.first.GetHex().substr(0, 16)
+                                  << ":" << c->outpoint.second
+                                  << ", locked by a VERIFIED islock to "
+                                  << c->locked_txid.GetHex().substr(0, 16)
+                                  << " -- Dash Core will reject it (conflict-tx-lock)";
+                } catch (...) {
+                    LOG_WARNING << "[ISLOCK-CONFLICT] won-block islock check skipped:"
+                                   " block decode failed";
+                }
+            };
             const std::string block_hex = HexStr(block_bytes);
             std::cout << "[DASH-STRATUM-BLOCK] won block height=" << height
                       << " bytes=" << block_bytes.size()
@@ -4386,12 +4433,14 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                                  "(no embedded P2P peer AND no dashd RPC creds) -- "
                                  "won block NOT broadcast\n";
                 }
+                name_islock_conflict();
                 return false;
             }
             std::cout << "[DASH-STRATUM-BLOCK] relayed: p2p="
                       << (bcast.p2p_sent ? "sent" : "off")
                       << " rpc=" << (bcast.rpc_ok ? "ok" : "off")
                       << " landed_first=" << bcast.landed_first << "\n";
+            name_islock_conflict();
             return true;
         };
 
@@ -5484,6 +5533,11 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     } else {
         std::cout << "[run] stratum disabled (no --stratum flag)\n";
     }
+    // HTTP on the stratum port (--stratum-http; auto follows --web-host).
+    if (stratum_server)
+        core::configure_stratum_http(*stratum_server, web_server.get(),
+                                     core::stratum_http_mode_setting(),
+                                     core::stratum_http_limits_setting());
 
     // ── Think loop: initial election + 15 s keep-fresh tick ───────────────
     // Share arrivals trigger run_think() themselves (add_verified_shares);
@@ -5795,6 +5849,11 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         const auto hdr_db = (core::filesystem::config_path()
             / net_subdir / "dash_headers").string();
         header_chain = std::make_unique<dash::coin::HeaderChain>(dash_params, hdr_db);
+        header_chain->set_refuse_dgw_mismatch(!g_header_dgw_log_only);
+        if (g_header_dgw_log_only)
+            LOG_WARNING << "[EMB-DASH] --header-dgw-log-only: a header whose bits"
+                           " are not the DGW bits of its window is logged and"
+                           " ACCEPTED";
         header_chain->init();
 
         // Head scoring credits a block-solution share only when its header
@@ -5812,8 +5871,23 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 return oracle->hc->expected_bits_after(prev_block, block_time,
                                                        dash::BLOCK_CREDIT_MAX_PARENT_DEPTH);
             };
+        // A share-chain block solution is relayed and recorded only with a
+        // header time above its parent's median-time-past (the stratum arm's
+        // job-mintime floor, applied to the tracker arm). Same oracle object,
+        // same depth bound; the share itself is never affected.
+        p2p_node.tracker().m_block_time_floor =
+            [oracle = block_bits_oracle.oracle](const uint256& prev_block)
+                -> std::optional<uint32_t> {
+                std::lock_guard<std::mutex> lk(oracle->m);
+                if (!oracle->hc) return std::nullopt;
+                const auto mtp = oracle->hc->median_time_past_at(
+                    prev_block, dash::BLOCK_CREDIT_MAX_PARENT_DEPTH);
+                if (!mtp) return std::nullopt;
+                return *mtp + 1;
+            };
         LOG_INFO << "[HEAD-SCORE] block-solution credit ARMED: a block-solving share's header"
-                    " bits are checked against this node's header chain";
+                    " bits are checked against this node's header chain; its block is"
+                    " relayed only with those bits and a time above the parent's MTP";
 
         // Dashboard network hashrate from chain work over the last 576 headers
         // (Dash Core getnetworkhashps(576)) instead of the tip difficulty, which
@@ -7898,6 +7972,68 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 });
         }
 
+        // N2: a BLS-VERIFIED islock whose outpoint the SERVED template spends
+        // under another txid. Dash Core rejects a block carrying that tx unless
+        // the block is already ChainLocked (v24.0.2 validation.cpp:2811-2829,
+        // conflict-tx-lock), so the job miners hold can no longer win a block.
+        // Mempool eviction and the G4 selection guard only shape the NEXT
+        // template; drop the cached one and push clean work now (clean_jobs:
+        // the old work cannot produce a valid block, so rigs should discard
+        // what they have queued). Verified lane only — a forged lock on the
+        // unverified relay lane must not be able to force clean notifies — and
+        // coalesced to one refresh per second with one trailing refresh.
+        {
+            std::weak_ptr<dash::stratum::DASHWorkSource> ws_islock = work_source;
+            auto coalescer = std::make_shared<dash::coin::IslockRefreshCoalescer>(
+                std::chrono::seconds(1));
+            auto trailing = std::make_shared<io::steady_timer>(ioc);
+            auto fire = [ws_islock, &stratum_server]() {
+                if (auto ws = ws_islock.lock())
+                    ws->invalidate_template_cache("verified islock conflicts with the served template");
+                if (stratum_server) stratum_server->notify_all();
+            };
+            maintainer->set_on_verified_islock(
+                [ws_islock, coalescer, trailing, fire](
+                    const uint256& locked_txid,
+                    const std::vector<std::pair<uint256, uint32_t>>& inputs) {
+                    auto ws = ws_islock.lock();
+                    if (!ws) return;
+                    const auto c = ws->served_template_islock_conflict(locked_txid, inputs);
+                    if (!c) return;
+                    const auto d = coalescer->on_trigger(std::chrono::steady_clock::now());
+                    LOG_WARNING << "[ISLOCK-CONFLICT] served template carries tx "
+                                << c->txid.GetHex().substr(0, 16)
+                                << " spending " << c->outpoint.first.GetHex().substr(0, 16)
+                                << ":" << c->outpoint.second
+                                << ", now locked by a VERIFIED islock to "
+                                << locked_txid.GetHex().substr(0, 16)
+                                << " (a block on this job would be conflict-tx-lock) -- "
+                                << (d.act == dash::coin::IslockRefreshCoalescer::Act::FireNow
+                                        ? "forcing a clean work refresh"
+                                        : d.act == dash::coin::IslockRefreshCoalescer::Act::ScheduleTrailing
+                                              ? "clean work refresh scheduled (coalesced)"
+                                              : "clean work refresh already scheduled");
+                    switch (d.act) {
+                    case dash::coin::IslockRefreshCoalescer::Act::FireNow:
+                        fire();
+                        break;
+                    case dash::coin::IslockRefreshCoalescer::Act::ScheduleTrailing:
+                        trailing->expires_after(d.delay);
+                        trailing->async_wait(
+                            [coalescer, fire](const boost::system::error_code& ec) {
+                                // Clear the pending flag either way: a cancelled
+                                // wait must not leave the coalescer stuck.
+                                coalescer->on_trailing_fired(std::chrono::steady_clock::now());
+                                if (ec) return;   // cancelled (shutdown)
+                                fire();
+                            });
+                        break;
+                    case dash::coin::IslockRefreshCoalescer::Act::AlreadyPending:
+                        break;
+                    }
+                });
+        }
+
         // review PR #780 H-1 heal: on a malformed quorum tail the maintainer
         // wipes the base-relative SML/quorum state and asks for a FULL re-sync.
         // Reset the sml_base request tracker to ZERO and re-request a full
@@ -8013,28 +8149,46 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 auto tip = hc->tip();
                 if (!tip || cyc->height > tip->height) return false;
 
-                // Collect the active ROTATED type-5 quorums, each with the
+                // Collect the ROTATED type-5 quorums of a set, each with the
                 // height of its base block (rotated invariant: baseHeight ==
                 // cycleHeight + quorumIndex; islock_verify.hpp filters on it).
-                std::vector<dash::coin::islock::RotatedQuorumCandidate> cands;
-                for (const auto& e : st->qmgr().active_entries()) {
-                    if (e.key.llmqType != p->type) continue;
-                    auto hdr = hc->get_header(e.key.quorumHash);
-                    if (!hdr) continue;          // base header not held => skip
-                    dash::coin::islock::RotatedQuorumCandidate c;
-                    c.quorum_hash       = e.key.quorumHash;
-                    c.base_height       = hdr->height;
-                    c.quorum_index      = static_cast<uint16_t>(
-                        e.commitment.quorumIndex < 0 ? 0xffff
-                                                     : e.commitment.quorumIndex);
-                    c.quorum_public_key = e.commitment.quorumPublicKey;
-                    cands.push_back(c);
+                auto collect = [&](const auto& entries) {
+                    std::vector<dash::coin::islock::RotatedQuorumCandidate> cands;
+                    for (const auto& e : entries) {
+                        if (e.key.llmqType != p->type) continue;
+                        auto hdr = hc->get_header(e.key.quorumHash);
+                        if (!hdr) continue;      // base header not held => skip
+                        dash::coin::islock::RotatedQuorumCandidate c;
+                        c.quorum_hash       = e.key.quorumHash;
+                        c.base_height       = hdr->height;
+                        c.quorum_index      = static_cast<uint16_t>(
+                            e.commitment.quorumIndex < 0 ? 0xffff
+                                                         : e.commitment.quorumIndex);
+                        c.quorum_public_key = e.commitment.quorumPublicKey;
+                        cands.push_back(c);
+                    }
+                    return cands;
+                };
+                // The active rotated quorums, then (only if that fails) the
+                // recently retired ones: a lock names its signing quorum's own
+                // cycle, and for a few blocks after a rotation the network
+                // still signs with the previous cycle, which Dash Core accepts
+                // (net_instantsend.cpp:136-145) but our active set has dropped.
+                const auto pass = dash::coin::islock::verify_islock_two_pass(
+                    *p, collect(st->qmgr().active_entries()),
+                    [&] { return collect(st->qmgr().retired_entries()); }, tip->height,
+                    cyc->height, inputs, txid,
+                    [&sig](const auto& pubkey, const uint256& sign_hash) {
+                        return dash::coin::vendor::verify_chainlock_sig(pubkey, sign_hash, sig);
+                    });
+                if (pass == dash::coin::islock::IslockVerifyPass::Previous) {
+                    static std::atomic<uint64_t> previous_cycle_passes{0};
+                    const uint64_t n = ++previous_cycle_passes;
+                    if (n == 1 || n % 100 == 0)
+                        LOG_INFO << "[ISLOCK] verified against a RETAINED (recently"
+                                    " rotated-out) quorum: " << n << " so far";
                 }
-                auto target = dash::coin::islock::build_islock_sign_target(
-                    *p, cands, cyc->height, inputs, txid);
-                if (!target) return false;       // no quorum selectable => fail closed
-                return dash::coin::vendor::verify_chainlock_sig(
-                    target->quorum.quorum_public_key, target->sign_hash, sig);
+                return pass != dash::coin::islock::IslockVerifyPass::None;
             });
 
         // W5-B DSTX verifier: BLS-verify the mixing masternode's OPERATOR
@@ -11752,10 +11906,12 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 // a row pending forever. Fall through to the header chain.
                 uint32_t found_height = 0;
                 bool have_height = false;
+                int64_t found_ts = 0;
                 for (const auto& b : mi->get_found_blocks()) {
                     if (b.hash == hash_hex) {
                         found_height = static_cast<uint32_t>(b.height);
                         have_height = found_height != 0;
+                        found_ts = static_cast<int64_t>(b.ts);
                         break;
                     }
                 }
@@ -11778,8 +11934,19 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                         return dash::coin::block_confirm::resolve_status(
                             winner_at, hc->height(), h, found_height);
                     }
-                    // header chain present but height unknown → still pending
-                    return 0;
+                    // Height unknown AND the header chain does not hold the
+                    // hash (not even on a side branch). If the chain spans the
+                    // found time with a margin on both sides, a block that had
+                    // been on the best chain in that window would be indexed:
+                    // orphaned. Otherwise pending (chain rooted later / not
+                    // far enough yet). Used to stay pending forever.
+                    return dash::coin::block_confirm::resolve_unknown_height(
+                        [hc](uint32_t hh) -> std::optional<int64_t> {
+                            if (auto e = hc->get_header_by_height(hh))
+                                return static_cast<int64_t>(e->header.m_timestamp);
+                            return std::nullopt;
+                        },
+                        hc->height(), found_ts);
                 }
 
                 // Fallback arm (no embedded chain): dashd getblockheader.
@@ -13060,6 +13227,8 @@ int main(int argc, char** argv)
             embedded_accrue_asset_unlocks = true; // #143 Variant B (type-9)
         else if (std::strcmp(argv[i], "--embedded-accrue-asset-unlocks=false") == 0)
             embedded_accrue_asset_unlocks_off = true; // good-citizen opt-out
+        else if (std::strcmp(argv[i], "--header-dgw-log-only") == 0)
+            g_header_dgw_log_only = true;   // log a DGW mismatch and accept the header
         else if (std::strcmp(argv[i], "--embedded-include-mn-special-txs") == 0)
             embedded_include_mn_special_txs = true;   // special-tx superset (DIP types 1-4)
         else if (std::strcmp(argv[i], "--embedded-include-mn-special-txs=false") == 0)
@@ -13393,6 +13562,29 @@ int main(int argc, char** argv)
         }
         else if (std::strcmp(argv[i], "--web-host") == 0 && i + 1 < argc)
             web_host = argv[++i];
+        // --stratum-http[=true|false|auto]: the web API on the stratum port too
+        // (core/stratum_http.hpp).
+        else if (std::strcmp(argv[i], "--stratum-http") == 0
+                 || std::strncmp(argv[i], "--stratum-http=", 15) == 0) {
+            if (!core::parse_stratum_http_flag(argv[i], core::stratum_http_mode_setting())) {
+                std::cout << "c2pool-dash: bad value: " << argv[i]
+                          << " (expected --stratum-http=true, false or auto)\n";
+                return 2;
+            }
+        }
+        // --stratum-http-budget N / --stratum-http-per-ip N (core/stratum_http.hpp).
+        else if (std::strcmp(argv[i], "--stratum-http-budget") == 0 && i + 1 < argc) {
+            if (!core::parse_stratum_http_count(argv[++i], core::stratum_http_limits_setting().budget)) {
+                std::cout << "c2pool-dash: bad value: --stratum-http-budget " << argv[i] << " (expected a count)\n";
+                return 2;
+            }
+        }
+        else if (std::strcmp(argv[i], "--stratum-http-per-ip") == 0 && i + 1 < argc) {
+            if (!core::parse_stratum_http_count(argv[++i], core::stratum_http_limits_setting().per_ip)) {
+                std::cout << "c2pool-dash: bad value: --stratum-http-per-ip " << argv[i] << " (expected a count)\n";
+                return 2;
+            }
+        }
         // Miner-facing host override for the dashboard Stratum URL. Both production
         // nodes NAT out through one gateway, so the auto-detected outbound IP
         // is NOT the address miners reach; the operator advertises the real
@@ -13488,6 +13680,15 @@ int main(int argc, char** argv)
         // file-set keys (present && source==File) are applied; CLI-set keys never
         // become File-sourced (the loader skips tracker keys), so the CLI wins.
         if (rc.file_set("web.port"))        web_port    = static_cast<uint16_t>(rc.get_u16("web.port").value_or(web_port));
+        if (rc.file_set("stratum.http"))   // --stratum-http: true / false / auto
+            core::apply_stratum_http_setting(rc.get_string("stratum.http").value_or(""),
+                                             core::stratum_http_mode_setting());
+        if (rc.file_set("stratum.http_budget"))   // --stratum-http-budget
+            core::apply_stratum_http_count_setting("stratum.http_budget", rc.get_i64("stratum.http_budget"),
+                                                   core::stratum_http_limits_setting().budget);
+        if (rc.file_set("stratum.http_per_ip"))   // --stratum-http-per-ip
+            core::apply_stratum_http_count_setting("stratum.http_per_ip", rc.get_i64("stratum.http_per_ip"),
+                                                   core::stratum_http_limits_setting().per_ip);
         if (rc.file_set("stratum.bind"))    parse_listen(rc.get_string("stratum.bind").value_or(""), stratum_host, stratum_port);
         if (rc.file_set("web.external_ip")) external_ip = rc.get_string("web.external_ip").value_or(external_ip);
         if (rc.file_set("web.dashboard_dir")) dashboard_dir = rc.get_string("web.dashboard_dir").value_or(dashboard_dir);

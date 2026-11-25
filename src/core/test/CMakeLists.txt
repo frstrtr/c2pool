@@ -120,6 +120,14 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
     # new tails are pure appends with null-not-zero unknowns, update_coinbase
     # reaches past 1000 records, and find_by_hash needs the full hash. Folded
     # into core_test for the same #769 reason.
+    # found_block_import_test.cpp: --import-found-blocks
+    # (core/found_block_import.hpp): another node's /recent_blocks (or a hash
+    # list) imported into the found-block ledger, each block validated against
+    # a map-backed header chain -- valid file, idempotent re-import, phantom /
+    # foreign / malformed rows refused by reason, height repaired from the
+    # header, fill-only merge, period luck over the imported rows, the wait
+    # for the header chain, merged rows, the coinbase pool check, and the
+    # provenance across a restart. Folded into core_test for the same reason.
     # web_server_http_cap_test.cpp: the HTTP session cap (the HTTP share of
     # the node's fd plan): a connection beyond it closed at once, a slot freed
     # when its connection ends. Same fold-into-core_test reasoning.
@@ -228,6 +236,20 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
     # hands ref_hash_fn that key), also on a node-fee job whose payout is the
     # operator's; a submission is judged by its job's own share bits
     # (core::stratum::pool_share_bits). Same fold-into-core_test reasoning as every TU here.
+    # hashrate_vardiff_test.cpp: per-connection vardiff (c2pool/hashrate/tracker)
+    # on simulated clocks: a floor burst on the old job does not ramp the
+    # session, the job's pool-share difficulty bounds every difficulty, a rig
+    # ramped high comes back after one share at the bound, a steady rig with
+    # apply latency converges and stays. One KAT covers every coin served by
+    # core::StratumServer. Same fold-into-core_test reasoning as every TU here.
+    # found_block_import_effort_test.cpp: --import-found-blocks and the source
+    # node's measured effort -- /recent_merged_blocks serves (and the import
+    # takes) pool_hashrate_at_find; an imported row takes the source's
+    # integrated effort where this node's own covers less of the same round,
+    # keeps its own where it covers as much, refuses and counts an implausible
+    # one; the outside operator's re-import fills once, a third changes
+    # nothing. Only API that predates the change, so it builds (and fails)
+    # against the earlier code. Same fold-into-core_test reasoning.
     # pool_luck_test.cpp, web_server_luck_test.cpp, web_server_luck_inputs_test.cpp:
     # pool luck as effort (core/pool_luck.hpp). The first pins the model on
     # hand-computed fixtures (integrated effort over a piecewise-constant
@@ -240,6 +262,15 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
     # difficulty, the rate history fed sample by sample). One KAT covers every
     # coin: the ledger, the history and the endpoints are core. Same
     # fold-into-core_test reasoning as every TU here.
+    # stratum_refusal_log_test.cpp: the rate limit on the stratum server's
+    # "connection refused" WARN lines (core/stratum_refusal_log.hpp, header
+    # only): first refusal at once, then one summary per window. Same folding.
+    # stratum_port_http_test.cpp + stratum_port_http_wire_test.cpp: the web
+    # API on the stratum port, as python p2pool served it on its worker port
+    # (core/stratum_http.hpp): --stratum-http and its auto rule, the sniff,
+    # the hand-off to HttpSession on the web server's HTTP thread, read-only
+    # GET/HEAD, local-only routes, the caps and the session accounting, the
+    # handshake deadline, the 503 without a web server. Same folding.
     # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
     add_executable(core_test
         addr_store_save_test.cpp
@@ -257,9 +288,12 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
         events_test.cpp
         factory_connect_failed_uaf_test.cpp
         filesystem_test.cpp
+        found_block_import_effort_test.cpp
+        found_block_import_test.cpp
         found_block_store_test.cpp
         found_block_submit_test.cpp
         graph_history_test.cpp
+        hashrate_vardiff_test.cpp
         host_port_test.cpp
         inject_ledger_obs_test.cpp
         inject_status_test.cpp
@@ -282,6 +316,9 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
         sharechain_height_index_test.cpp
         socket_write_queue_test.cpp
         socket_read_empty_prefix_test.cpp
+        stratum_port_http_test.cpp
+        stratum_port_http_wire_test.cpp
+        stratum_refusal_log_test.cpp
         template_refresh_on_tx_test.cpp
         template_txs_check_test.cpp
         tx_advertiser_test.cpp

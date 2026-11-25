@@ -45,6 +45,7 @@
 #include <core/settings_cli.hpp>          // M0b control-plane wiring
 #include <core/config_endpoint.hpp>       // M1 control-plane READ-ONLY endpoints
 #include <impl/ltc/catalog_defaults.hpp>  // M0b L0 compiled defaults
+#include <impl/ltc/stratum_defaults.hpp>  // LTC StratumConfig before CLI/YAML (zombie protections)
 #include <core/log.hpp>
 #include <core/uint256.hpp>
 #include <core/web_server.hpp>
@@ -62,6 +63,7 @@
 #include <impl/ltc/share.hpp>
 #include <impl/ltc/share_check.hpp>
 #include <impl/ltc/dashboard_found_block.hpp>  // one /recent_blocks row shape: finder + peers
+#include <impl/ltc/found_block_pool_check.hpp> // --import-found-blocks: coinbase pays the donation
 #include <impl/ltc/auto_ratchet.hpp>
 #include <impl/ltc/solo_payouts.hpp>
 #include <impl/ltc/share_messages.hpp>
@@ -96,6 +98,7 @@
 #include <c2pool/difficulty/adjustment_engine.hpp>
 #include <c2pool/storage/sharechain_storage.hpp>
 #include <c2pool/storage/found_block_store.hpp>
+#include <c2pool/storage/found_block_record_map.hpp>
 #include <c2pool/payout/payout_manager.hpp>
 
 // --- Platform-specific crash handler ---
@@ -561,6 +564,17 @@ void print_help() {
     std::cout << "  -w / --worker-port PORT   Stratum/worker port (alias: --stratum-port; default: 9327)\n";
     std::cout << "  --web-port PORT           Web dashboard / JSON-RPC API port (alias: --http-port; default: 8080)\n";
     std::cout << "  --http-host HOST          HTTP server bind address (default: 0.0.0.0)\n";
+    std::cout << "  --stratum-http[=true|false|auto]  Also answer the web API (GET/HEAD, read-only) on the\n";
+    std::cout << "                            stratum port, as python p2pool did on its worker port; trackers\n";
+    std::cout << "                            poll http://host:<worker port>/global_stats (default: false;\n";
+    std::cout << "                            auto = on when the web server binds a non-loopback address)\n";
+    std::cout << "  --stratum-http-budget N   HTTP requests in progress on the stratum port at once: at most N\n";
+    std::cout << "                            and at most max_stratum_connections - 1; others are answered 503\n";
+    std::cout << "                            (default 16; 0 = every HTTP request on the stratum port is\n";
+    std::cout << "                            answered 503)\n";
+    std::cout << "  --stratum-http-per-ip N   HTTP requests in progress on the stratum port at once from one\n";
+    std::cout << "                            address, one /64 for IPv6: at most N; others are answered 503\n";
+    std::cout << "                            (default 6; 0 = no limit below --stratum-http-budget)\n";
     std::cout << "  --external-ip ADDR        Public IP or domain for stratum URL display (default: auto-detect)\n\n";
 
     std::cout << "PARENT COIN DAEMON:\n";
@@ -603,7 +617,10 @@ void print_help() {
     std::cout << "  --stratum-target-time N   Target seconds per pseudoshare (default: 3)\n";
     std::cout << "  --no-vardiff              Disable automatic difficulty adjustment\n";
     std::cout << "  --max-coinbase-outputs N  Max coinbase outputs per block (default: 4000, matches p2pool)\n";
-    std::cout << "  --max-stratum-connections N  Max concurrent miners on this node (default: 100, 0 = unlimited)\n\n";
+    std::cout << "  --max-stratum-connections N  Max concurrent miners on this node (default: 100, 0 = unlimited)\n";
+    std::cout << "  --max-stratum-connections-per-ip N  Max concurrent miners from one IP address, one /64 for IPv6\n";
+    std::cout << "                            (default: 0 = unlimited). Rigs behind one NAT share an address:\n";
+    std::cout << "                            set N to at least the most rigs behind any one address.\n\n";
 
     std::cout << "EMBEDDED NODE OPTIONS:\n";
     std::cout << "  --embedded-ltc            Use embedded LTC SPV node (no daemon needed)\n";
@@ -635,6 +652,21 @@ void print_help() {
     std::cout << "                            Core 1.14.9's fields and hash_serialized) and exit\n";
     std::cout << "  --ltc-utxo-stats DIR      Print gettxoutsetinfo for the UTXO LevelDB at DIR (Litecoin\n";
     std::cout << "                            Core 0.21.4's fields and hash_serialized_2) and exit\n";
+    std::cout << "  --import-found-blocks FILE  Restore the pool's found-block history (Recent Blocks,\n";
+    std::cout << "                            luck, effort) from FILE: another node's /recent_blocks or\n";
+    std::cout << "                            /recent_merged_blocks JSON, or block hashes one per line.\n";
+    std::cout << "                            Repeatable or FILE,FILE; imported in order, e.g.\n";
+    std::cout << "                              curl http://NODE:WEBPORT/recent_blocks > blocks.json\n";
+    std::cout << "                              curl http://NODE:WEBPORT/recent_merged_blocks > merged.json\n";
+    std::cout << "                              --import-found-blocks blocks.json --import-found-blocks merged.json\n";
+    std::cout << "                            Each block is validated against this node's own header chain\n";
+    std::cout << "                            for its chain (LTC, DOGE) once it is synced; rows already held\n";
+    std::cout << "                            only gain missing fields. A row's effort measured by the\n";
+    std::cout << "                            source over more of its round than this node's own history\n";
+    std::cout << "                            covers is kept with it (effort_method \"imported\"); a\n";
+    std::cout << "                            second import of the same file fills it on rows a build\n";
+    std::cout << "                            without it imported. YAML import_found_blocks (a path\n";
+    std::cout << "                            or a list)\n";
     std::cout << "  --ltc-connect IP[:PORT]   Dial only this LTC peer (repeatable): no peer DB, DNS /\n";
     std::cout << "                            fixed / HTTP seeds or addr gossip (Core's -connect)\n";
     std::cout << "  --doge-connect IP[:PORT]  Dial only this DOGE peer (repeatable), as --ltc-connect\n";
@@ -959,6 +991,12 @@ int main(int argc, char* argv[]) {
     // other (no peer DB, DNS / fixed / HTTP seeds, addr gossip). HOST[:PORT].
     std::vector<std::string> ltc_connect;
     std::vector<std::string> doge_connect;
+    // --import-found-blocks FILE[,FILE...] (repeatable; YAML import_found_blocks:
+    // a path, a comma list or a list): a one-shot import of found-block
+    // history (core/found_block_import.hpp), the files in order, run once
+    // the header chains are wired. Holds CANONICAL paths only
+    // (core::found_block_import::open_import_file).
+    std::vector<std::string> import_found_blocks_paths;
     int doge_p2p_port = 0;                   // --doge-p2p-port PORT
     // Embedded LTC block relay (MWEB state at block announce):
     //   ltc_cmpct_v3          announce sendcmpct (true,3) then (false,2): MWEB peers
@@ -1020,17 +1058,15 @@ int main(int argc, char* argv[]) {
     // Redistribute mode for shares from unnamed/broken miners
     std::string redistribute_mode_str = "pplns";
 
-    // Stratum tuning (configurable via CLI or YAML)
-    core::StratumConfig stratum_config;  // defaults: min=0.0005, max=65536, target=3.0s, vardiff=true
-    stratum_config.coin_symbol = "LTC";  // runtime coin tag for coin-agnostic core log lines
-    // Idle keepalive-notify (cross-coin reuse of DASH's D9 mitigation): many
-    // ASIC/proxy clients drop a pool connection that receives no mining.notify
-    // within ~60 s (LTC/DOGE ~2.5 min block cadence gives long idle gaps at high
-    // fixed diff). 25 s is safely under any reasonable client watchdog and kept
-    // identical to the other coins for consistency. Re-notify the CURRENT job
-    // (non-clean, so no ASIC work reset and NO work-generation bump); this is
-    // transport/liveness only -- ZERO wire-byte and consensus change.
-    stratum_config.keepalive_notify_sec = 25;
+    // Stratum tuning (configurable via CLI or YAML). The compiled defaults --
+    // coin tag, idle keepalive-notify, and the zombie-session protections
+    // (TCP keepalive, authorize deadline, idle reaper, write backlog cap) --
+    // come from impl/ltc/stratum_defaults.hpp, which the KATs read too.
+    core::StratumConfig stratum_config = ltc::default_stratum_config();
+    // --stratum-http: the web API on the stratum port too (core/stratum_http.hpp)
+    core::StratumHttpMode stratum_http_mode = core::StratumHttpMode::Off;
+    // --stratum-http-budget / --stratum-http-per-ip (defaults 16 and 6)
+    core::StratumHttpLimits stratum_http_limits;
 
     // Operational tuning (configurable via CLI or YAML)
     std::string log_file;                        // empty = default "debug.log"
@@ -1170,8 +1206,58 @@ int main(int argc, char* argv[]) {
         return {};  // unknown chain — P2P broadcast disabled
     };
     
+    // --import-found-blocks FILE[,FILE...]: taken out of argv here, with a
+    // cursor of its own, before the main parse loop (which skips the values
+    // taken). Every value is refused or canonicalized now, before anything
+    // starts, through core::found_block_import::open_import_file: a missing
+    // value must not swallow the next option (--import-found-blocks
+    // --testnet would start a MAINNET node), a missing / non-regular /
+    // over-cap file must not surface only after the header sync, and a
+    // second file given without its own flag must not fall through to the
+    // positional RPC user. Only the canonical paths are kept.
+    std::vector<bool> import_found_blocks_value_at(static_cast<size_t>(argc > 0 ? argc : 0), false);
+    {
+        int cur = 1;
+        while (cur < argc) {
+            if (std::string(argv[cur]) != "--import-found-blocks") {
+                ++cur;
+                continue;
+            }
+            const std::string value = cur + 1 < argc ? argv[cur + 1] : "";
+            if (value.empty() || value[0] == '-') {
+                LOG_ERROR << "--import-found-blocks needs a FILE (or FILE,FILE), got "
+                          << (value.empty() ? std::string("nothing") : "'" + value + "'");
+                return 1;
+            }
+            import_found_blocks_value_at[static_cast<size_t>(cur + 1)] = true;
+            const auto paths = core::found_block_import::split_paths(value);
+            if (paths.empty()) {
+                LOG_ERROR << "--import-found-blocks '" << value << "': no file named";
+                return 1;
+            }
+            for (const auto& p : paths) {
+                const auto file = core::found_block_import::open_import_file(p);
+                if (!file.error.empty()) {
+                    LOG_ERROR << "--import-found-blocks " << p << ": " << file.error;
+                    return 1;
+                }
+                import_found_blocks_paths.push_back(file.path);
+            }
+            const int after = cur + 2;
+            if (after < argc && argv[after][0] != '-'
+                && core::found_block_import::open_import_file(argv[after]).error.empty()) {
+                LOG_ERROR << "--import-found-blocks takes one FILE (or FILE,FILE): give "
+                          << argv[after] << " its own --import-found-blocks";
+                return 1;
+            }
+            cur = after;
+        }
+    }
+
     // Parse command line arguments
     for (int i = 1; i < argc; ++i) {
+        if (import_found_blocks_value_at[static_cast<size_t>(i)])
+            continue;   // an --import-found-blocks value (the pass above)
         std::string arg = argv[i];
         
         if (arg == "--help" || arg == "-h") {
@@ -1364,6 +1450,11 @@ int main(int argc, char* argv[]) {
         else if (arg == "--doge-connect" && i + 1 < argc) {
             doge_connect.push_back(argv[++i]);
             cli_explicit.insert("doge_connect");
+        }
+        else if (arg == "--import-found-blocks") {
+            // Taken, checked and canonicalized by the pass before this loop
+            // (its value is skipped above).
+            cli_explicit.insert("import_found_blocks");
         }
         else if (arg == "--dump-doge-schedule-anchors" && i + 1 < argc) {
             // The anchors of a complete hash schedule (no node is started);
@@ -1696,6 +1787,31 @@ int main(int argc, char* argv[]) {
             stratum_config.max_stratum_connections = static_cast<size_t>(std::stoul(argv[++i]));
             cli_explicit.insert("max_stratum_connections");
         }
+        else if (arg == "--max-stratum-connections-per-ip" && i + 1 < argc) {
+            stratum_config.max_stratum_connections_per_ip = static_cast<size_t>(std::stoul(argv[++i]));
+            cli_explicit.insert("max_stratum_connections_per_ip");
+        }
+        else if (arg == "--stratum-http" || arg.rfind("--stratum-http=", 0) == 0) {
+            if (!core::parse_stratum_http_flag(arg, stratum_http_mode)) {
+                LOG_ERROR << "Bad value: " << arg << " (expected --stratum-http=true, false or auto)";
+                return 1;
+            }
+            cli_explicit.insert("stratum_http");
+        }
+        else if (arg == "--stratum-http-budget" && i + 1 < argc) {
+            if (!core::parse_stratum_http_count(argv[++i], stratum_http_limits.budget)) {
+                LOG_ERROR << "Bad value: --stratum-http-budget " << argv[i] << " (expected a count)";
+                return 1;
+            }
+            cli_explicit.insert("stratum_http_budget");
+        }
+        else if (arg == "--stratum-http-per-ip" && i + 1 < argc) {
+            if (!core::parse_stratum_http_count(argv[++i], stratum_http_limits.per_ip)) {
+                LOG_ERROR << "Bad value: --stratum-http-per-ip " << argv[i] << " (expected a count)";
+                return 1;
+            }
+            cli_explicit.insert("stratum_http_per_ip");
+        }
         // Operational tuning
         else if (arg == "--log-file" && i + 1 < argc) {
             log_file = argv[++i];
@@ -1894,6 +2010,23 @@ int main(int argc, char* argv[]) {
                 ltc_utxo_full = cfg["ltc_utxo_full"].as<bool>();
             if (!cli_explicit.count("ltc_utxo_full_dir") && cfg["ltc_utxo_full_dir"])
                 ltc_utxo_full_dir = cfg["ltc_utxo_full_dir"].as<std::string>();
+            if (!cli_explicit.count("import_found_blocks") && cfg["import_found_blocks"]) {
+                const auto node = cfg["import_found_blocks"];
+                std::vector<std::string> items;
+                if (node.IsSequence())
+                    for (const auto& e : node) items.push_back(e.as<std::string>());
+                else
+                    items.push_back(node.as<std::string>());
+                for (const auto& item : items)
+                    for (const auto& p : core::found_block_import::split_paths(item)) {
+                        const auto file = core::found_block_import::open_import_file(p);
+                        if (!file.error.empty()) {
+                            LOG_ERROR << "import_found_blocks " << p << ": " << file.error;
+                            return 1;
+                        }
+                        import_found_blocks_paths.push_back(file.path);   // canonical
+                    }
+            }
 
             // Embedded LTC block relay (see the declarations)
             if (!cli_explicit.count("ltc_cmpct_v3") && cfg["ltc_cmpct_v3"])
@@ -1963,6 +2096,16 @@ int main(int argc, char* argv[]) {
                 stratum_config.max_coinbase_outputs = cfg["max_coinbase_outputs"].as<size_t>();
             if (!cli_explicit.count("max_stratum_connections") && cfg["max_stratum_connections"])
                 stratum_config.max_stratum_connections = cfg["max_stratum_connections"].as<size_t>();
+            if (!cli_explicit.count("max_stratum_connections_per_ip") && cfg["max_stratum_connections_per_ip"])
+                stratum_config.max_stratum_connections_per_ip = cfg["max_stratum_connections_per_ip"].as<size_t>();
+            if (!cli_explicit.count("stratum_http") && cfg["stratum_http"])
+                core::apply_stratum_http_setting(cfg["stratum_http"].as<std::string>(), stratum_http_mode);
+            if (!cli_explicit.count("stratum_http_budget") && cfg["stratum_http_budget"])
+                core::apply_stratum_http_count_setting("stratum_http_budget", cfg["stratum_http_budget"].as<int64_t>(),
+                                                       stratum_http_limits.budget);
+            if (!cli_explicit.count("stratum_http_per_ip") && cfg["stratum_http_per_ip"])
+                core::apply_stratum_http_count_setting("stratum_http_per_ip", cfg["stratum_http_per_ip"].as<int64_t>(),
+                                                       stratum_http_limits.per_ip);
 
             // Operational tuning
             if (!cli_explicit.count("log_file") && cfg["log_file"])
@@ -2114,6 +2257,14 @@ int main(int argc, char* argv[]) {
         // Apply file-sourced (L1) values into the locals the node consumes.
         if (rc.file_set("web.port"))         http_port  = static_cast<int>(rc.get_u16("web.port").value_or(static_cast<uint16_t>(http_port)));
         if (rc.file_set("web.host"))         http_host  = rc.get_string("web.host").value_or(http_host);
+        if (rc.file_set("stratum.http") && !cli_explicit.count("stratum_http"))   // true / false / auto
+            core::apply_stratum_http_setting(rc.get_string("stratum.http").value_or(""), stratum_http_mode);
+        if (rc.file_set("stratum.http_budget") && !cli_explicit.count("stratum_http_budget"))
+            core::apply_stratum_http_count_setting("stratum.http_budget", rc.get_i64("stratum.http_budget"),
+                                                   stratum_http_limits.budget);
+        if (rc.file_set("stratum.http_per_ip") && !cli_explicit.count("stratum_http_per_ip"))
+            core::apply_stratum_http_count_setting("stratum.http_per_ip", rc.get_i64("stratum.http_per_ip"),
+                                                   stratum_http_limits.per_ip);
         if (rc.file_set("stratum.bind")) {
             std::string v = rc.get_string("stratum.bind").value_or("");
             auto colon = v.rfind(':'); std::string p = (colon == std::string::npos) ? v : v.substr(colon + 1);
@@ -2703,6 +2854,8 @@ int main(int argc, char* argv[]) {
                     address_explorer_prefix, block_explorer_prefix, tx_explorer_prefix);
             // Set stratum port BEFORE start() — start() launches the stratum listener.
             web_server.set_stratum_port(static_cast<uint16_t>(stratum_port));
+            web_server.set_stratum_http_mode(stratum_http_mode);
+            web_server.set_stratum_http_limits(stratum_http_limits);
             // Start HTTP server immediately so loading page is served during sync.
             // Stratum won't have valid work yet, but that's fine — miners retry.
             web_server.start();
@@ -3237,7 +3390,11 @@ int main(int argc, char* argv[]) {
                      << " target_time=" << stratum_config.target_time << "s"
                      << " vardiff=" << (stratum_config.vardiff_enabled ? "on" : "off")
                      << " max_cb_outputs=" << stratum_config.max_coinbase_outputs
-                     << " max_stratum_connections=" << stratum_config.max_stratum_connections;
+                     << " max_stratum_connections=" << stratum_config.max_stratum_connections
+                     << " per_ip=" << stratum_config.max_stratum_connections_per_ip
+                     << " keepalive=" << (stratum_config.tcp_keepalive_enabled ? "on" : "off")
+                     << " handshake_timeout=" << stratum_config.handshake_timeout_sec << "s"
+                     << " idle_timeout=" << stratum_config.session_idle_timeout_sec << "s";
             LOG_INFO << "Operational config: p2p_max_peers=" << p2p_max_peers
                      << " ban_duration=" << p2p_ban_duration << "s"
                      << " rss_limit=" << rss_limit_mb << "MB"
@@ -3271,34 +3428,12 @@ int main(int argc, char* argv[]) {
                     using MI = core::MiningInterface;
                     mi->set_found_block_persistence(
                         [fblk_store, fblk_leveldb](const MI::FoundBlock& blk) -> bool {
-                            c2pool::storage::FoundBlockRecord rec;
-                            rec.chain = blk.chain;
-                            rec.height = blk.height;
-                            rec.block_hash = blk.hash;
-                            rec.timestamp = blk.ts;
-                            rec.status = static_cast<uint8_t>(blk.status);
-                            rec.check_count = blk.check_count;
-                            rec.confirmations = blk.confirmations;
-                            rec.last_checked = static_cast<uint64_t>(std::time(nullptr));
-                            // #159: persist dashboard-enrichment fields so a
-                            // restored row keeps its full detail after a restart.
-                            rec.finder_address = blk.miner;
-                            rec.reward_satoshis = blk.subsidy;
-                            rec.network_difficulty = blk.network_difficulty;
-                            rec.share_difficulty = blk.share_difficulty;
-                            rec.pool_hashrate = blk.pool_hashrate;
-                            rec.share_hash = blk.share_hash;
-                            rec.authorship = static_cast<uint8_t>(blk.authorship);
-                            // #946: explorer fields (fblk v3).
-                            rec.coinbase_txid = blk.coinbase_txid;
-                            rec.tx_count = blk.tx_count;
-                            // #946: DOGE parent (fblk v4); set_found_block_parent
-                            // re-persists the row, so it survives a restart.
-                            rec.parent_hash = blk.parent_hash;
-                            rec.parent_height = blk.parent_height;
-                            // DOGE rows: network_difficulty is the aux chain's
-                            // own (fblk extension byte).
-                            rec.aux_difficulty_known = blk.aux_difficulty_known;
+                            // Every persisted field (#159 enrichment, #946
+                            // explorer + DOGE parent, the extension byte and
+                            // the imported-effort tail):
+                            // c2pool/storage/found_block_record_map.hpp.
+                            const auto rec = c2pool::storage::found_block_record_of(
+                                blk, static_cast<uint64_t>(std::time(nullptr)));
                             // A corrected height names the key it moved from.
                             return fblk_store->store(rec, blk.replaced_height);
                         },
@@ -3306,34 +3441,8 @@ int main(int argc, char* argv[]) {
                             auto records = fblk_store->load_all();
                             std::vector<MI::FoundBlock> result;
                             result.reserve(records.size());
-                            for (const auto& rec : records) {
-                                MI::FoundBlock blk;
-                                blk.height = rec.height;
-                                blk.hash = rec.block_hash;
-                                blk.ts = rec.timestamp;
-                                blk.status = static_cast<MI::BlockStatus>(rec.status);
-                                blk.check_count = rec.check_count;
-                                blk.chain = rec.chain;
-                                blk.confirmations = rec.confirmations;
-                                // #159: restore enrichment (v1 records => 0).
-                                blk.miner = rec.finder_address;
-                                blk.subsidy = rec.reward_satoshis;
-                                blk.network_difficulty = rec.network_difficulty;
-                                blk.share_difficulty = rec.share_difficulty;
-                                blk.pool_hashrate = rec.pool_hashrate;
-                                blk.share_hash = rec.share_hash;
-                                blk.authorship = static_cast<MI::BlockAuthorship>(rec.authorship);
-                                // #946: v1/v2 records leave these unknown (null).
-                                blk.coinbase_txid = rec.coinbase_txid;
-                                blk.tx_count = rec.tx_count;
-                                // #946: v1-v3 records leave the parent unknown (null).
-                                blk.parent_hash = rec.parent_hash;
-                                blk.parent_height = rec.parent_height;
-                                // false on a row written before the flag: its
-                                // stored difficulty is the parent's.
-                                blk.aux_difficulty_known = rec.aux_difficulty_known;
-                                result.push_back(std::move(blk));
-                            }
+                            for (const auto& rec : records)
+                                result.push_back(c2pool::storage::found_block_of<MI::FoundBlock>(rec));
                             return result;
                         }
                     );
@@ -7117,6 +7226,14 @@ int main(int argc, char* argv[]) {
                             // The aux chain's own difficulty, off the aux
                             // header's bits (display: the block's luck).
                             blk.difficulty = chain::target_to_difficulty(target);
+                            // The pool rate at find (display: the block's
+                            // pool_hashrate_at_find and single-sample luck):
+                            // the live estimator for a share relayed as it
+                            // is found, none for one the startup scan of the
+                            // share chain meets long after.
+                            blk.pool_hashrate = mi->gross_pool_hashrate_at(
+                                static_cast<double>(share_ts),
+                                static_cast<double>(std::time(nullptr)));
                             // Get real LTC block height from header chain
                             if (ltc_header_chain) {
                                 auto ltc_entry = ltc_header_chain->get_header(share_hash);
@@ -7136,6 +7253,8 @@ int main(int argc, char* argv[]) {
                                 rec.is_local = blk.is_local; rec.parent_height = blk.parent_height;
                                 rec.miner = blk.miner;
                                 rec.difficulty = blk.difficulty;
+                                // A held rate is kept (MergedBlockStore::store).
+                                rec.pool_hashrate = blk.pool_hashrate;
                                 ms->store(rec);
                             }
                         }
@@ -10954,6 +11073,12 @@ int main(int argc, char* argv[]) {
                     blk.miner = ctx.miner;
                     // The DOGE block's own difficulty (display: its luck).
                     blk.difficulty = chain::target_to_difficulty(doge_target);
+                    // The pool rate at find, when the share is this recent
+                    // (MiningInterface::gross_pool_hashrate_at).
+                    if (ctx.share_ts > 0)
+                        blk.pool_hashrate = mi_ptr_for_merge->gross_pool_hashrate_at(
+                            static_cast<double>(ctx.share_ts),
+                            static_cast<double>(std::time(nullptr)));
                     // Request full DOGE block from P2P to get exact coinbase_value.
                     // The block arrives async — we set coinbase_value=0 now and update
                     // when the DOGE block arrives via the full_block callback.
@@ -10979,6 +11104,7 @@ int main(int argc, char* argv[]) {
                         rec.is_local = blk.is_local; rec.parent_height = blk.parent_height;
                         rec.miner = blk.miner;
                         rec.difficulty = blk.difficulty;
+                        rec.pool_hashrate = blk.pool_hashrate;   // a held one is kept
                         ms->store(rec);
                     }
 
@@ -11104,6 +11230,36 @@ int main(int argc, char* argv[]) {
             // of staying "pending" on the dashboard forever.
             web_server.get_mining_interface()->reverify_pending_found_blocks();
 
+            // --import-found-blocks: the pool's found-block history from another
+            // node (core/found_block_import.hpp). Every block is validated
+            // against the embedded header chains wired above, once they are
+            // synced; rows the ledger holds only gain missing fields.
+            if (!import_found_blocks_paths.empty()) {
+                namespace fbi = core::found_block_import;
+                fbi::Source src;
+                src.primary_chain = ltc::dashboard::chain_label(settings->m_testnet);
+                src.primary = fbi::header_chain_lookup(embedded_chain.get());
+                if (doge_chain)
+                    src.aux["DOGE"] = fbi::header_chain_lookup(doge_chain.get());
+                if (explorer_enabled && embedded_chain && ltc_utxo_db)
+                    src.pays_pool = ltc::found_block::raw_block_pool_check(
+                        embedded_chain.get(), ltc_utxo_db.get());
+                if (!embedded_chain)
+                    LOG_ERROR << "[Pool] --import-found-blocks validates every block against"
+                                 " the embedded LTC header chain, which this node does not run"
+                                 " (--no-embedded-ltc): nothing can be imported";
+                std::vector<fbi::File> files;
+                for (const auto& path : import_found_blocks_paths) {
+                    fbi::File f{path, fbi::read_file(path)};
+                    LOG_INFO << "[Pool] found-block import from " << path << ": "
+                             << f.parsed.rows.size() << " rows ("
+                             << (f.parsed.format.empty() ? "unreadable" : f.parsed.format) << ")";
+                    files.push_back(std::move(f));
+                }
+                web_server.get_mining_interface()->start_found_block_import(
+                    std::move(files), std::move(src));
+            }
+
             // Load persisted merged blocks into mm_manager BEFORE block scan.
             {
                 auto store_ptr = web_server.get_mining_interface()->get_merged_block_store();
@@ -11126,6 +11282,7 @@ int main(int argc, char* argv[]) {
                         blk.parent_height = rec.parent_height;
                         blk.miner = rec.miner;
                         blk.difficulty = rec.difficulty;   // 0 on an older record
+                        blk.pool_hashrate = rec.pool_hashrate;   // 0: not known
                         mm->add_discovered_block(blk);  // dedup handles duplicates
                         ++loaded;
                     }
@@ -11179,8 +11336,10 @@ int main(int argc, char* argv[]) {
                         LOG_INFO << "[BLOCK-SCAN] Scanning " << scan_depth << " shares from "
                                  << heads.size() << " head(s) (latest block ts=" << latest_block_ts
                                  << ", existing=" << existing.size() << ")";
+                        // Through the node: the hooks read under this guard
+                        // (no second shared lock on this thread).
                         for (const auto& [head_hash, _] : heads)
-                            guard->scan_chain_for_blocks(head_hash, scan_depth);
+                            p2p_node->scan_chain_for_blocks(guard, head_hash, scan_depth);
                     }
                     } // guard
                 }
@@ -11551,6 +11710,8 @@ int main(int argc, char* argv[]) {
             // Configure for solo mining mode
             solo_server.set_solo_mode(true);
             solo_server.set_stratum_port(static_cast<uint16_t>(stratum_port));  // Set the correct Stratum port
+            solo_server.set_stratum_http_mode(stratum_http_mode);   // no web server here: auto = off
+            solo_server.set_stratum_http_limits(stratum_http_limits);
             solo_server.get_mining_interface()->set_stratum_config(stratum_config);
             if (!solo_address.empty()) {
                 solo_server.set_solo_address(solo_address);

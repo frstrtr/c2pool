@@ -3219,6 +3219,21 @@ void DASHWorkSource::set_producer_job_fn(ProducerJobFn fn)
     producer_job_fn_ = std::move(fn);
 }
 
+std::optional<coin::IslockConflict>
+DASHWorkSource::served_template_islock_conflict(
+    const uint256& locked_txid,
+    const std::vector<std::pair<uint256, uint32_t>>& inputs) const
+{
+    std::shared_ptr<const coin::DashWorkData> snap;
+    {
+        std::lock_guard<std::mutex> lk(template_mutex_);
+        snap = template_cache_;
+    }
+    if (!snap) return std::nullopt;
+    return coin::body_conflicts_with_lock(snap->m_txs, snap->m_tx_hashes,
+                                          locked_txid, inputs);
+}
+
 void DASHWorkSource::invalidate_template_cache(const char* reason)
 {
     // Stale-payee fix (defect 3): a CoindRPC reconnect churn means the cached

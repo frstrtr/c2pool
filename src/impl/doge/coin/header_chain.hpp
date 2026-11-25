@@ -495,6 +495,10 @@ private:
         if (header.m_previous_block.IsNull()) {
             if (bhash != m_params.genesis_hash)
                 return false; // wrong genesis
+            // The genesis header is accepted only while the store has no tip
+            // (the check is on the tip, not on the entries).
+            if (!m_tip.IsNull())
+                return false;
             
             IndexEntry entry;
             entry.header = header;

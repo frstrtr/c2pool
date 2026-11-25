@@ -228,4 +228,91 @@ TEST(DashBlockConfirmLane, UnknownHashReportsSentinel)
               mi.run_block_verification_now(blk_hash(0x09).GetHex()));
 }
 
+
+// ── 3. Height unknown (row recorded at height 0) ───────────────────────────
+// Production 2026-10-25: block 000000000000001c9e20… was orphaned per every
+// other node's ledger, but the node that found it recorded height 0, its own
+// header chain never held the losing header, and the row sat "pending" for a
+// month (resolve_status needs a height). resolve_unknown_height judges it from
+// the header chain's time span instead.
+
+// A best chain whose headers exist from `root` to `tip`, one every 150 s.
+struct TimedChain {
+    uint32_t root, tip;
+    int64_t  root_time;
+    std::optional<int64_t> time_at(uint32_t h) const {
+        if (h < root || h > tip) return std::nullopt;
+        return root_time + static_cast<int64_t>(h - root) * 150;
+    }
+};
+
+constexpr int64_t kMargin = dash::coin::block_confirm::kUnknownHeightSpanMarginSec;
+
+int unknown_verdict(const TimedChain& c, int64_t found_ts)
+{
+    return dash::coin::block_confirm::resolve_unknown_height(
+        [&](uint32_t h) { return c.time_at(h); }, c.tip, found_ts);
+}
+
+TEST(DashBlockConfirmLane, UnknownHeightOrphanedWhenChainSpansBothSides)
+{
+    // root 2548212 (the primary's real 26545-header store), found ~ mid-chain
+    const TimedChain c{2548212, 2574756, 1790000000};
+    const int64_t found = c.root_time + 13104LL * 150;          // h ≈ 2561316
+    EXPECT_EQ(-1, unknown_verdict(c, found));
+}
+
+TEST(DashBlockConfirmLane, UnknownHeightPendingUntilTipIsMarginPast)
+{
+    const TimedChain c{2548212, 2574756, 1790000000};
+    const int64_t tip_time = *c.time_at(c.tip);
+    EXPECT_EQ(0, unknown_verdict(c, tip_time - kMargin + 1))   // tip 1 s short
+        << "a fresh find must not be called orphaned before the chain is a margin past it";
+    EXPECT_EQ(-1, unknown_verdict(c, tip_time - kMargin));      // exactly the margin
+}
+
+TEST(DashBlockConfirmLane, UnknownHeightPendingWhenChainRootedLater)
+{
+    // A cold-started node: headers only from an anchor AFTER the find.
+    const TimedChain c{2570000, 2574756, 1795000000};
+    EXPECT_EQ(0, unknown_verdict(c, c.root_time - 1))
+        << "a chain that does not reach back over the find cannot judge it";
+    EXPECT_EQ(0, unknown_verdict(c, c.root_time + kMargin - 1));  // root 1 s too young
+    EXPECT_EQ(-1, unknown_verdict(c, c.root_time + kMargin));     // exactly the margin
+}
+
+TEST(DashBlockConfirmLane, UnknownHeightPendingWithoutTipOrTime)
+{
+    const TimedChain empty{10, 5, 0};                               // nothing indexed
+    EXPECT_EQ(0, unknown_verdict(empty, 1790000000));
+    const TimedChain c{2548212, 2574756, 1790000000};
+    EXPECT_EQ(0, unknown_verdict(c, 0)) << "an unknown found time is never a verdict";
+}
+
+TEST(DashBlockConfirmLane, FoundBlockAtHeightZeroFlipsToOrphaned)
+{
+    // The production shape end to end: a row recorded at height 0, a verifier
+    // wired like main_dash (header chain does not hold the hash → span verdict).
+    core::MiningInterface mi(/*testnet=*/false, nullptr, Blockchain::DASH);
+    const uint256 ours = blk_hash(0x07);
+    const TimedChain c{2548212, 2574756, 1790000000};
+    const int64_t found = c.root_time + 13104LL * 150;
+    mi.record_found_block(/*height=*/0, ours, static_cast<uint32_t>(found), "DASH",
+                          "Xminer", ours.GetHex(), 1.0, 0.0, 3.0, kSubsidy);
+    ASSERT_EQ(mi.get_found_blocks()[0].status,
+              core::MiningInterface::BlockStatus::pending);
+    mi.set_block_verify_fn([&](const std::string& hash_hex) -> int {
+        int64_t ts = 0;
+        for (const auto& b : mi.get_found_blocks())
+            if (b.hash == hash_hex) ts = static_cast<int64_t>(b.ts);
+        return dash::coin::block_confirm::resolve_unknown_height(
+            [&](uint32_t h) { return c.time_at(h); }, c.tip, ts);
+    });
+    EXPECT_LT(mi.run_block_verification_now(ours.GetHex()), 0);
+    EXPECT_EQ(mi.get_found_blocks()[0].status,
+              core::MiningInterface::BlockStatus::orphaned)
+        << "a height-0 row whose block the spanning chain does not hold must "
+           "flip to orphaned, not stay pending forever";
+}
+
 }  // namespace

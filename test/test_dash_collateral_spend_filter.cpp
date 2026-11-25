@@ -465,6 +465,77 @@ TEST(DashBodyTopology, EmitGateRefusesABodyTxWhoseMempoolParentIsNotEarlier) {
         << why.cause << " " << why.value;
 }
 
+// N2 belt. A template built before an islock arrived still carries the tx the
+// lock conflicts with; Dash Core rejects a block with it unless the block is
+// already ChainLocked (v24.0.2 validation.cpp:2811-2829, conflict-tx-lock).
+// The emit gate refuses such a body when the lock is VERIFIED, and only then:
+// a relay-lane (unverified) lock must not be able to refuse templates.
+TEST(DashBodyTopology, EmitGateRefusesABodyTxThatConflictsWithAVerifiedIslock) {
+    const uint256 prev_hash = raw256(0xAB);
+    auto seed = mn_set_with_collateral(raw256(0xC0), 0);
+    std::vector<CSimplifiedMNListEntry> entries;
+    for (uint8_t b : {0x01, 0x02}) {
+        CSimplifiedMNListEntry e;
+        e.nVersion = CSimplifiedMNListEntry::VER_BASIC_BLS;
+        e.proRegTxHash = raw256(b);
+        e.confirmedHash = raw256(0x77);
+        e.isValid = true;
+        entries.push_back(e);
+    }
+    CSimplifiedMNList sml(std::move(entries));
+
+    UTXOViewCache utxo(nullptr);
+    NodeCoinState st;
+    st.set_require_sml(true);
+    st.sml() = sml;
+    st.set_have_sml(true);
+    st.set_sml_current_hash(prev_hash);
+    st.mnstates().load(seed.snapshot(), H - 1);
+    st.mempool().set_utxo(&utxo);
+    st.set_tip(H - 1, prev_hash, 0x1b104be3u, 1'700'000'000u,
+               DASH_PUBKEY_VER, DASH_P2SH_VER);
+    const uint256 fp = mint_hash(0x62);
+    utxo.add_coin(Outpoint(fp, 0), Coin(1'000'000, {}, 1, false));
+    const auto a = make_spend(fp, 0, 990'000, 13);
+    ASSERT_TRUE(st.mempool().add_tx(a));
+
+    auto body = [&](std::initializer_list<const MutableTransaction*> txs) {
+        DashWorkData w;
+        auto cb = build_embedded_cbtx(H - 1, sml, st.qmgr(),
+                                      0, std::array<uint8_t, 96>{}, 0, nullptr);
+        w.m_coinbase_payload = encode_cbtx(cb);
+        for (const auto* t : txs) w.m_txs.emplace_back(*t);
+        return w;
+    };
+    DeclineReport why;
+    const std::vector<std::pair<uint256, uint32_t>> lock_fp{{fp, 0u}};
+
+    // Baseline: the body built before any lock is clean.
+    ASSERT_TRUE(st.embedded_template_emit_ok(body({&a}), &why))
+        << why.cause << " " << why.value;
+
+    // A relay-lane (unverified) lock on fp:0 for another txid: no refusal.
+    st.mempool().add_islock(raw256(0x5A), lock_fp);
+    EXPECT_TRUE(st.embedded_template_emit_ok(body({&a}), &why))
+        << "an unverified lock must not refuse templates: " << why.cause;
+
+    // The same lock, VERIFIED: the served body can no longer be a valid block.
+    st.mempool().add_verified_islock(raw256(0x5A), lock_fp);
+    EXPECT_FALSE(st.embedded_template_emit_ok(body({&a}), &why));
+    EXPECT_EQ(why.cause, "emit-islock-conflict");
+    EXPECT_NE(why.value.find(dash::coin::dash_txid(a).GetHex().substr(0, 12)), std::string::npos)
+        << why.value;
+
+    // A body without the tx is fine.
+    EXPECT_TRUE(st.embedded_template_emit_ok(body({}), &why))
+        << why.cause << " " << why.value;
+
+    // A verified lock on `a` itself is not a conflict.
+    st.mempool().add_verified_islock(dash::coin::dash_txid(a), lock_fp);
+    EXPECT_TRUE(st.embedded_template_emit_ok(body({&a}), &why))
+        << why.cause << " " << why.value;
+}
+
 // ════════════════════════════════════════════════════════════════════════
 // An MNHF signal with an output. Dash Core's CheckTransaction lets a type-7
 // tx carry inputs and outputs (consensus/tx_check.cpp:18-21), though its

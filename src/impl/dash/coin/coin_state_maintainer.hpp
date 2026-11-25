@@ -953,7 +953,10 @@ public:
         // R1-guarded) forward full-resync over held state.
         if (diff.baseBlockHash.IsNull()) {
             m_state.sml().mnList.clear();
-            m_state.qmgr().clear();
+            // Keeps the retained (recently rotated-out) quorums for isdlock
+            // pass 2: any ZERO-base snapshot (after a reorg wipe or a forward
+            // full resync over held state) must not empty them.
+            m_state.qmgr().clear_for_reorg();
         }
 
         // 1) SML (merkleRootMNList). apply_diff erases deletedMNs, upserts
@@ -1231,24 +1234,54 @@ public:
     /// our templates — the same threat model as the ChainLock coinbase fields
     /// (on_new_chainlock above). When no verifier is installed, or
     /// verification FAILS, we adopt NOTHING: the map stays exactly as it was
-    /// and selection is unchanged (the pre-existing behaviour). A refusal
-    /// costs only parity with dashd's conflict handling — islock exclusion is
-    /// an optimization, not consensus for us; an erroneous acceptance costs
-    /// template fees on demand.
+    /// and selection is unchanged (the pre-existing behaviour). An erroneous
+    /// acceptance costs template fees on demand.
+    ///
+    /// Islock exclusion is NOT only an optimization: Dash Core rejects a block
+    /// carrying a tx that conflicts with a known islock unless that block is
+    /// already ChainLocked (v24.0.2 validation.cpp:2811-2829,
+    /// conflict-tx-lock), and a freshly found block never is. A VERIFIED
+    /// adoption therefore also goes into the mempool's verified map (the emit
+    /// gate refuses a body conflicting with it) and is handed to the
+    /// on_verified_islock sink, which main_dash points at a forced clean work
+    /// refresh when the SERVED template spends one of the locked outpoints
+    /// (N2: a template built before the lock arrived). Only this verified
+    /// lane may drive those two actions.
     void on_new_isdlock(const std::vector<std::pair<uint256, uint32_t>>& inputs,
                         const uint256& txid, const uint256& cycle_hash,
                         const std::array<uint8_t, 96>& sig) {
         if (!m_islock_verify) return;                     // no verifier => fail closed
         if (!m_islock_verify(inputs, txid, cycle_hash, sig)) {
+            // The relay lane (on_islock) has already applied this lock,
+            // unverified, a moment ago in the same isdlock handler. Undo that:
+            // a refused lock keeps neither the hold short-circuit nor its
+            // outpoint exclusion (Mempool::revoke_unverified_islock). The
+            // feed-liveness tick stays.
+            const auto rv = m_state.mempool().revoke_unverified_islock(txid, inputs);
             LOG_WARNING << "[ISLOCK] rejected unverified isdlock txid="
                         << txid.GetHex().substr(0, 16) << "... cycle="
-                        << cycle_hash.GetHex().substr(0, 16) << "...";
+                        << cycle_hash.GetHex().substr(0, 16) << "... -- relay-lane"
+                        << " effects revoked (hold_restored=" << rv.hold_restored
+                        << " g4_cleared=" << rv.g4_cleared
+                        << " g4_restored=" << rv.g4_restored << ")";
             return;
         }
         LOG_INFO << "[ISLOCK] adopted VERIFIED isdlock txid="
                  << txid.GetHex().substr(0, 16) << "... inputs="
                  << inputs.size();
-        on_islock(txid, inputs);
+        m_state.mempool().add_verified_islock(txid, inputs);
+        if (m_on_verified_islock) m_on_verified_islock(txid, inputs);
+    }
+
+    /// N2 sink: called after every VERIFIED isdlock adoption with the locked
+    /// txid and outpoints. main_dash checks the served template against them
+    /// and forces a clean work refresh on a conflict. Unset (KAT posture) is a
+    /// no-op.
+    using VerifiedIslockFn = std::function<void(
+        const uint256& locked_txid,
+        const std::vector<std::pair<uint256, uint32_t>>& inputs)>;
+    void set_on_verified_islock(VerifiedIslockFn fn) {
+        m_on_verified_islock = std::move(fn);
     }
 
     /// Verifier seam for DSTX adoption (W5-B CoinJoin broadcast tx):
@@ -1326,7 +1359,7 @@ public:
                      << " block(s) no longer on the active chain"
                         " (external-collateral proof)";
         m_state.sml().mnList.clear();
-        m_state.qmgr().clear();
+        m_state.qmgr().clear_for_reorg();   // keeps the isdlock pass-2 retained set
         m_have_mn_sml = false;
         m_state.set_have_sml(false);
         // Drop the SML's current-at marker so (a) the freshness gate fails until
@@ -1466,6 +1499,10 @@ public:
     /// behaviour is unchanged (empty map, hold self-disarmed).
     void on_islock(const uint256& locked_txid,
                    const std::vector<std::pair<uint256, uint32_t>>& inputs) {
+        // Dash Core's TriviallyValid refusals: a lock with no inputs or a null
+        // txid is never applied (it could never be verified, so nothing would
+        // ever revoke it).
+        if (inputs.empty() || locked_txid.IsNull()) return;
         m_state.mempool().add_islock(locked_txid, inputs);
     }
 
@@ -1539,11 +1576,13 @@ public:
     void on_new_tip(uint32_t prev_height, const uint256& prev_hash,
                     uint32_t bits_for_next, uint32_t mtp_at_tip,
                     uint8_t address_version, uint8_t address_p2sh_version,
-                    uint32_t curtime = 0, uint32_t version = 0) {
+                    uint32_t curtime = 0, uint32_t version = 0,
+                    bool mtp_window_complete = true) {
         m_hdr_prev_height          = prev_height;
         m_hdr_prev_hash            = prev_hash;
         m_hdr_bits_for_next        = bits_for_next;
         m_hdr_mtp_at_tip           = mtp_at_tip;
+        m_hdr_mtp_window_complete  = mtp_window_complete;
         m_hdr_address_version      = address_version;
         m_hdr_address_p2sh_version = address_p2sh_version;
         m_hdr_curtime              = curtime;
@@ -3200,6 +3239,7 @@ private:
         m_prev_hash            = m_hdr_prev_hash;
         m_bits_for_next        = m_hdr_bits_for_next;
         m_mtp_at_tip           = m_hdr_mtp_at_tip;
+        m_mtp_window_complete  = m_hdr_mtp_window_complete;
         m_address_version      = m_hdr_address_version;
         m_address_p2sh_version = m_hdr_address_p2sh_version;
         m_curtime              = m_hdr_curtime;
@@ -3413,7 +3453,7 @@ private:
         if (m_have_tip && m_have_mn)
             m_state.set_tip(m_prev_height, m_prev_hash, m_bits_for_next,
                             m_mtp_at_tip, m_address_version, m_address_p2sh_version,
-                            m_curtime, m_version);
+                            m_curtime, m_version, m_mtp_window_complete);
         // DASHBOARD ONLY: publish the header-tip work bits for the daemonless
         // network-difficulty graph feed. Runs on the coin-p2p io thread; the
         // web/think thread reads it via published_bits_for_next() (atomic). Does
@@ -3505,6 +3545,7 @@ private:
         m_on_new_quorum_commitments;
     ChainLockVerifyFn     m_chainlock_verify; // unset => live ChainLocks never adopted (fail closed)
     IslockVerifyFn        m_islock_verify;    // unset => isdlocks never adopted (fail closed, G4 stays dormant)
+    VerifiedIslockFn      m_on_verified_islock;  // N2: verified adoption -> served-template conflict check
     DstxVerifyFn          m_dstx_verify;      // unset => DSTX-es never admitted (fail closed, W5-B stays dormant)
     // E2: independent DIP-0027 credit-pool accrual, advanced per ingested block
     // (on_block_connected) and re-anchored per accepted mnlistdiff. Verified
@@ -3559,6 +3600,7 @@ private:
     uint256  m_prev_hash;
     uint32_t m_bits_for_next{0};
     uint32_t m_mtp_at_tip{0};
+    bool     m_mtp_window_complete{true};
     uint8_t  m_address_version{0};
     uint8_t  m_address_p2sh_version{0};
     uint32_t m_curtime{0};
@@ -3578,6 +3620,7 @@ private:
     uint256  m_hdr_prev_hash;
     uint32_t m_hdr_bits_for_next{0};
     uint32_t m_hdr_mtp_at_tip{0};
+    bool     m_hdr_mtp_window_complete{true};
     uint8_t  m_hdr_address_version{0};
     uint8_t  m_hdr_address_p2sh_version{0};
     uint32_t m_hdr_curtime{0};

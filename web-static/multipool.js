@@ -26,6 +26,19 @@
     // cross-origin pools (requires CORS headers, already present in web.py).
     window.multipoolApiBase = '';
 
+    // ── Pinned API base (?api=/api/<id>) ─────────────────────────────────
+    // A page opened with ?api=/api/<id> (dual.html frames each dashboard this
+    // way) talks to that one same-origin route only: no pool tabs, no stored
+    // pool switching. Anything that is not a plain /api/<id> path is ignored.
+    window._multipoolPinned = false;
+    try {
+        var pinned = new URLSearchParams(window.location.search).get('api');
+        if (pinned && /^\/api\/[a-z0-9_-]{1,32}$/.test(pinned)) {
+            window.multipoolApiBase = pinned;
+            window._multipoolPinned = true;
+        }
+    } catch (e) { /* no URLSearchParams: stay on the default */ }
+
     // ── d3.json override ─────────────────────────────────────────────────
     // Transparently routes relative API calls (../foo) and absolute path
     // calls (/foo) through the active pool's base URL when cross-origin
@@ -99,6 +112,7 @@
 
         if (window._multipoolProxyMode) {
             // In proxy mode, always use the proxy API route
+            if (!POOL_ID_RE.test(String(poolId))) return;
             window.multipoolApiBase = '/api/' + poolId;
         } else {
             // In direct mode, check if this pool is the current page's origin
@@ -232,6 +246,13 @@
 
     // ── Auto-detect: try proxy first, then direct ────────────────────────
     function autoDetectCurrentPool() {
+        if (window._multipoolPinned) {
+            // One pool, fixed by the page URL: hide the tab strip and keep the
+            // header symbol filled from that pool's currency_info.
+            var tabs = document.getElementById('pool-tabs');
+            if (tabs) tabs.style.display = 'none';
+            return;
+        }
         var xhr = new XMLHttpRequest();
         xhr.open('GET', '/api/pools', true);
         xhr.timeout = 3000;
@@ -252,7 +273,15 @@
         xhr.send();
     }
 
+    // A proxy pool id becomes part of a same-origin route (/api/<id>) and of
+    // element ids, so only plain ids are accepted; any other entry is skipped.
+    var POOL_ID_RE = /^[a-z0-9_-]{1,32}$/;
+
     function initFromProxy(proxyPools) {
+        proxyPools = proxyPools.filter(function(pool) {
+            return pool && typeof pool.id === 'string' && POOL_ID_RE.test(pool.id);
+        });
+        if (!proxyPools.length) { initFromDirect(); return; }
         window._multipoolProxyMode = true;
 
         // Register all pools from proxy with their backend URLs (for display)
@@ -271,7 +300,12 @@
             saveConfig(config);
         }
 
-        // Set API base to the active pool's proxy route
+        // Set API base to the active pool's proxy route (a stored id that is
+        // not a plain id falls back to the first listed pool).
+        if (!POOL_ID_RE.test(String(config.activePool))) {
+            config.activePool = proxyPools[0].id;
+            saveConfig(config);
+        }
         window.multipoolApiBase = '/api/' + config.activePool;
 
         renderTabs();

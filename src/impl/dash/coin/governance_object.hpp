@@ -50,6 +50,7 @@
 #include <cstdint>
 #include <cctype>
 #include <cstring>
+#include <limits>
 #include <optional>
 #include <span>
 #include <string>
@@ -111,9 +112,16 @@ struct GovernanceTrigger {
     int32_t                        event_block_height{0};
     std::vector<SuperblockPayment> payments;
 
+    /// Sum of the scheduled amounts, bounded (every amount is > 0 and within
+    /// MoneyRange by parse). Display and logging only; the budget check is
+    /// resolve_superblock_payments().
     int64_t total_amount() const {
         int64_t t = 0;
-        for (const auto& p : payments) t += p.amount;
+        for (const auto& p : payments) {
+            if (p.amount > std::numeric_limits<int64_t>::max() - t)
+                return std::numeric_limits<int64_t>::max();
+            t += p.amount;
+        }
         return t;
     }
 };

@@ -131,6 +131,7 @@ bind = "0.0.0.0:9327"       # Stratum (miner) listener; default port 9327. c2poo
 #   vardiff -- vardiff (default on; --no-vardiff disables) (CLI: --no-vardiff)
 #   max_coinbase_outputs -- max coinbase outputs (CLI: --max-coinbase-outputs)
 #   max_connections -- max stratum connections (CLI: --max-stratum-connections)
+#   max_connections_per_ip -- max stratum connections per source IP, one /64 for IPv6 (0=unlimited; rigs behind one NAT share an address) (CLI: --max-stratum-connections-per-ip)
 # [ltc.web]
 #   external_ip -- miner-facing host for stratum URL (CLI: --external-ip)
 #   dashboard_dir -- dashboard static asset dir (CLI: --dashboard-dir)

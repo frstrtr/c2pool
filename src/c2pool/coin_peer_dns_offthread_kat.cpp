@@ -16,11 +16,13 @@
 //
 // Every coin's peer manager copy is checked (merged LTC/DOGE/NMC, BTC, BCH,
 // DGB, DASH, BIP110), one mode per ctest entry:
-//   start      start() runs inside an io handler; a 100 ms timer must keep its
-//              cadence (no gap > 1 s) and the seeds' peers must be added once
-//              the round completes, without the hung seed's.
+//   start      start() runs inside an io handler; no seed lookup may run inside
+//              an io handler, a 100 ms timer must keep its cadence (no gap of
+//              kDnsStallMs or more while a seed lookup is in flight) and the
+//              seeds' peers must be added once the round completes, without
+//              the hung seed's.
 //   emergency  the emergency re-arm (60 s floor) fires the round from its timer
-//              handler; same cadence and peer checks.
+//              handler; the same lookup, cadence and peer checks.
 //   preloop    start() before the event loop runs waits for the round, so the
 //              peers are there when it returns, but in parallel: about one
 //              seed's delay, not the sum, and at most the round timeout.
@@ -30,6 +32,15 @@
 //              runs again and the manager is stopped or destroyed. A stopped
 //              manager must have no peers; a delivery to a destroyed one is a
 //              heap-use-after-free (run it under ASan to see that leg fail).
+//              The stop()/destroy handler must not hold the io thread waiting
+//              for the round, and no seed lookup may run inside a handler.
+//
+// The cadence check tells a DNS stall from host noise by when the gap falls,
+// not by its size: a gap that overlaps a seed lookup in flight is held to
+// kDnsStallMs, any other gap only to kIdleStallMs. A stall of the event loop
+// on DNS, whether a lookup inside a handler or a handler waiting for one,
+// always overlaps a lookup in flight; a scheduler stall on a loaded CI host
+// mostly falls in the long idle stretches (emergency waits out a 60 s floor).
 // Linux only (ELF symbol preemption + dlsym(RTLD_NEXT)).
 
 #include <boost/asio.hpp>
@@ -48,6 +59,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -72,6 +84,16 @@ constexpr int kStuckMs = 12000;   // a seed that hangs past the round timeout
 // ParallelSeedResolver::kDefaultSeedTimeout, spelled out so this file also
 // builds on master (where the KAT must fail).
 constexpr int kRoundTimeoutMs = 10000;
+// Cadence limits (see the header): a gap that overlaps a seed lookup in
+// flight, and any other gap. The idle limit only catches a wedged loop; a
+// 1677 ms gap, at an unknown point of the run, failed the old single limit
+// on a loaded VM905 CI runner (2026-11-21).
+constexpr int kDnsStallMs = 1000;
+constexpr int kIdleStallMs = kRoundTimeoutMs;
+// stop()/destroy of a manager whose round is in flight must not wait for the
+// round's lookups (cancel() wakes and joins the coordinator at once).
+// The handler also saves each manager's peer DB (a few ms in all).
+constexpr int kStopHoldMs = kDnsStallMs;
 
 struct FakeSeed
 {
@@ -106,6 +128,18 @@ struct FakeAnswer
 std::mutex* g_answers_mutex = new std::mutex;
 std::set<addrinfo*>* g_answers = new std::set<addrinfo*>;
 
+// The test's io_context. Set in main() before any manager exists, so the
+// resolver threads only ever read it.
+boost::asio::io_context* g_ioc = nullptr;
+// Fake lookups made inside one of its handlers: each one is the field bug's
+// mechanism, a getaddrinfo() blocking the event loop.
+std::atomic<int> g_fake_lookups_on_io{0};
+// Fake lookups started and returned so far. Both only grow, so a gap
+// overlapped a lookup in flight iff more had started by its end than had
+// returned by its start (the cadence check).
+std::atomic<unsigned> g_fake_started{0};
+std::atomic<unsigned> g_fake_finished{0};
+
 } // namespace
 
 extern "C" int getaddrinfo(const char* node, const char* service,
@@ -117,6 +151,10 @@ extern "C" int getaddrinfo(const char* node, const char* service,
         static Fn real = reinterpret_cast<Fn>(dlsym(RTLD_NEXT, "getaddrinfo"));
         return real ? real(node, service, hints, res) : EAI_FAIL;
     }
+    if (g_ioc && g_ioc->get_executor().running_in_this_thread())
+        ++g_fake_lookups_on_io;
+    ++g_fake_started;
+    struct Finished { ~Finished() { ++g_fake_finished; } } finished;   // every return path
     std::this_thread::sleep_for(milliseconds(fake->delay_ms));
     if (!fake->ip) return EAI_NONAME;
 
@@ -221,25 +259,36 @@ void destroy(std::vector<Subject>& v)
 }
 
 /// A 100 ms timer on the io_context; the worst gap between two fires is how
-/// long the event loop was unresponsive.
+/// long the event loop was unresponsive. Each gap is filed as a DNS gap when
+/// a fake seed lookup was in flight at any point of it, else as an idle gap.
 class Cadence
 {
 public:
+    /// The worst gap of one kind, and when it began (ms since begin()).
+    struct Worst
+    {
+        bool seen = false;
+        milliseconds gap{0};
+        milliseconds at{0};
+    };
+
     explicit Cadence(boost::asio::io_context& ioc) : m_timer(ioc) {}
 
     void begin()
     {
-        m_last = Clock::now();
+        m_begin = m_last = Clock::now();
+        mark();
         arm();
     }
     /// Stop, counting the time since the last fire too: a stall that ends
     /// the run before the timer fires again is still a stall.
     void end()
     {
-        m_worst = std::max(m_worst, std::chrono::duration_cast<milliseconds>(Clock::now() - m_last));
+        note(Clock::now());
         m_timer.cancel();
     }
-    long long worst_ms() const { return m_worst.count(); }
+    const Worst& dns() const { return m_dns; }
+    const Worst& idle() const { return m_idle; }
 
 private:
     void arm()
@@ -248,16 +297,57 @@ private:
         m_timer.async_wait([this](const boost::system::error_code& ec) {
             if (ec) return;
             const auto now = Clock::now();
-            m_worst = std::max(m_worst, std::chrono::duration_cast<milliseconds>(now - m_last));
+            note(now);
             m_last = now;
+            mark();
             arm();
         });
     }
 
+    /// The lookups returned by the start of the next gap.
+    void mark() { m_finished_at_last = g_fake_finished.load(); }
+
+    /// A lookup overlapped the gap iff more lookups had started by its end
+    /// than had returned by its start (both counters only grow).
+    void note(Clock::time_point now)
+    {
+        const bool dns = g_fake_started.load() > m_finished_at_last;
+        const auto gap = std::chrono::duration_cast<milliseconds>(now - m_last);
+        Worst& w = dns ? m_dns : m_idle;
+        if (!w.seen || gap > w.gap) {
+            w.seen = true;
+            w.gap = gap;
+            w.at = std::chrono::duration_cast<milliseconds>(m_last - m_begin);
+        }
+    }
+
     boost::asio::steady_timer m_timer;
+    Clock::time_point m_begin;
     Clock::time_point m_last;
-    milliseconds m_worst{0};
+    unsigned m_finished_at_last = 0;
+    Worst m_dns;
+    Worst m_idle;
 };
+
+std::string describe(const Cadence::Worst& w)
+{
+    if (!w.seen) return "none";
+    return std::to_string(w.gap.count()) + " ms, began at +" + std::to_string(w.at.count()) + " ms";
+}
+
+/// The cadence report and checks shared by the start and emergency modes.
+void check_cadence(const Cadence& c, const char* mode, long long peers_ms)
+{
+    std::printf("[%s] peers after %lld ms; worst io gap with a lookup in flight: %s; idle: %s;"
+                " %d lookups inside an io handler\n", mode, peers_ms, describe(c.dns()).c_str(),
+                describe(c.idle()).c_str(), g_fake_lookups_on_io.load());
+    CHECK(g_fake_lookups_on_io.load() == 0, "[%s] %d seed lookups ran inside an io handler",
+          mode, g_fake_lookups_on_io.load());
+    CHECK(c.dns().gap.count() < kDnsStallMs, "[%s] io_context stalled with a seed lookup in"
+          " flight (DNS on the io thread): %s", mode, describe(c.dns()).c_str());
+    CHECK(c.idle().gap.count() < kIdleStallMs, "[%s] io_context stalled: %s", mode,
+          describe(c.idle()).c_str());
+}
 
 long long since_ms(Clock::time_point t)
 {
@@ -312,9 +402,7 @@ int mode_start(boost::asio::io_context& ioc)
               std::max(t0 + milliseconds(kStuckMs + 1500), Clock::now() + milliseconds(1000)));
     cadence.end();
 
-    std::printf("[start] peers after %lld ms, worst io gap %lld ms\n", peers_ms, cadence.worst_ms());
-    CHECK(cadence.worst_ms() < 1000, "[start] io_context stalled %lld ms (DNS on the io thread)",
-          cadence.worst_ms());
+    check_cadence(cadence, "start", peers_ms);
     CHECK(peers_ms <= kRoundTimeoutMs + 2000, "[start] peers took %lld ms (round timeout %d ms)",
           peers_ms, kRoundTimeoutMs);
     check_peers(subjects, "start");
@@ -339,9 +427,7 @@ int mode_emergency(boost::asio::io_context& ioc)
     run_until(ioc, [] { return false; }, Clock::now() + milliseconds(kStuckMs - kRoundTimeoutMs + 1500));
     cadence.end();
 
-    std::printf("[emergency] peers after %lld ms, worst io gap %lld ms\n", peers_ms, cadence.worst_ms());
-    CHECK(cadence.worst_ms() < 1000, "[emergency] io_context stalled %lld ms (DNS in the re-arm"
-          " timer handler)", cadence.worst_ms());
+    check_cadence(cadence, "emergency", peers_ms);
     CHECK(peers_ms <= 60000 + kRoundTimeoutMs + 3000, "[emergency] peers took %lld ms", peers_ms);
     check_peers(subjects, "emergency");
     destroy(subjects);
@@ -402,11 +488,23 @@ int mode_stop(boost::asio::io_context& ioc)
         }
     boost::asio::steady_timer at500(ioc);
     at500.expires_after(milliseconds(500));
+    long long held_ms = -1;
     at500.async_wait([&](const boost::system::error_code&) {
+        const auto t = Clock::now();
         for (auto& s : stopped) s.stop();
         destroy(destroyed);
+        held_ms = since_ms(t);
     });
     run_until(ioc, [] { return false; }, Clock::now() + milliseconds(kSlowMs + 1500));
+    if (held_ms < 0) {
+        // The managers' queued handlers may outlive them now: run nothing more.
+        CHECK(held_ms >= 0, "[stop] the stop()/destroy handler never ran (the loop was held"
+              " past %d ms)", kSlowMs + 1500);
+        return 0;
+    }
+    std::printf("[stop] stop()/destroy 500 ms into a round held the io thread %lld ms\n", held_ms);
+    CHECK(held_ms < kStopHoldMs, "[stop] stop()/destroy held the io thread %lld ms (cancel()"
+          " waited for the round's lookups)", held_ms);
     for (auto& s : stopped)
         CHECK(s.peer_count() == 0, "[stop/%s] peer_count=%zu: the round was delivered after stop()",
               s.name.c_str(), s.peer_count());
@@ -441,6 +539,8 @@ int mode_stop(boost::asio::io_context& ioc)
           " deliveries never ran (the test ran nothing)", control.front().peer_count());
     destroy(stale_stopped);
     destroy(control);
+    CHECK(g_fake_lookups_on_io.load() == 0, "[stop] %d seed lookups ran inside an io handler",
+          g_fake_lookups_on_io.load());
     std::printf("[stop] no round delivered after stop() or destruction\n");
     return 0;
 }
@@ -455,6 +555,7 @@ int main(int argc, char** argv)
     std::filesystem::remove_all(g_scratch);
 
     boost::asio::io_context ioc;
+    g_ioc = &ioc;   // before any manager or resolver thread exists
     if (mode == "start")          mode_start(ioc);
     else if (mode == "emergency") mode_emergency(ioc);
     else if (mode == "preloop")   mode_preloop(ioc);

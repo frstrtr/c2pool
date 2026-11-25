@@ -11,6 +11,7 @@
 #include <core/uint256.hpp>
 #include <core/log.hpp>
 #include <core/pack.hpp>
+#include <core/pool_luck.hpp>
 
 namespace c2pool {
 namespace storage {
@@ -57,9 +58,38 @@ struct FoundBlockRecord {
     // PARENT's difficulty there (#1738) and reads false: its difficulty is
     // not known. Meaningless on a parent-chain row.
     bool                    aux_difficulty_known{false};
+    // The row came from an import of another node's history
+    // (MiningInterface::import_found_blocks, --import-found-blocks), not from
+    // this node's own observation. Same extension byte, no version bump: a
+    // build that predates the bit reads the row and ignores it (it writes the
+    // row back without the bit, which reads as "recorded" here).
+    bool                    imported{false};
+    // Another node's measured effort of the round that ends in this block
+    // (--import-found-blocks; MiningInterface::FoundBlock::imported_effort):
+    // the source row's effort, its history_coverage and the block it timed
+    // the round from. 0 / "" = none. A TAIL after the extension byte, present
+    // only when bit kExtImportedEffort says so -- again no version bump:
+    // every earlier build stops reading at (or before) the extension byte, so
+    // it keeps the row and ignores the tail; it writes the row back without
+    // the tail and the bit, which reads as "no imported effort" here.
+    double                  imported_effort{0.0};
+    double                  imported_coverage{0.0};
+    std::string             imported_prev_hash;
 
     // Bits of the extension byte that follows the v4 tail.
     static constexpr uint8_t kExtAuxDifficultyKnown = 0x01;
+    static constexpr uint8_t kExtImported           = 0x02;
+    static constexpr uint8_t kExtImportedEffort     = 0x04;   // the tail follows
+
+    /// An imported effort a reader may use: within its absolute bounds with a
+    /// coverage in (0, 1] (core::luck::imported_effort_valid), and the full
+    /// hash of the block it was timed from (a cut or corrupt length byte reads
+    /// as none, never as a short hash that matches no round).
+    bool has_imported_effort() const
+    {
+        return core::luck::imported_effort_valid(imported_effort, imported_coverage)
+            && imported_prev_hash.size() == 64;
+    }
 
     // Serialize to bytes for LevelDB storage
     std::vector<uint8_t> serialize() const
@@ -136,8 +166,21 @@ struct FoundBlockRecord {
         ps << has_parent_height;
         ps << static_cast<uint64_t>(parent_height.value_or(0));
         // --- v4 extension byte ---
-        uint8_t ext = aux_difficulty_known ? kExtAuxDifficultyKnown : 0;
+        const bool effort_tail = has_imported_effort();
+        uint8_t ext = (aux_difficulty_known ? kExtAuxDifficultyKnown : 0)
+                    | (imported ? kExtImported : 0)
+                    | (effort_tail ? kExtImportedEffort : 0);
         ps << ext;
+        // --- imported-effort tail (only behind its bit: a row without an
+        // imported effort is byte for byte what the earlier writer wrote) ---
+        if (effort_tail) {
+            put_double(imported_effort);
+            put_double(imported_coverage);
+            uint8_t ip_len = static_cast<uint8_t>(std::min(imported_prev_hash.size(), size_t(255)));
+            ps << ip_len;
+            ps.write(std::span<const std::byte>(
+                reinterpret_cast<const std::byte*>(imported_prev_hash.data()), ip_len));
+        }
 
         auto span = ps.get_span();
         return {reinterpret_cast<const uint8_t*>(span.data()),
@@ -242,8 +285,34 @@ struct FoundBlockRecord {
             uint64_t ph = read_u64();
             if (has_parent_height && whole) rec.parent_height = ph;
             // --- v4 extension byte (absent on rows written before it) ---
-            if (whole && pos < data.size())
-                rec.aux_difficulty_known = (read_u8() & kExtAuxDifficultyKnown) != 0;
+            if (whole && pos < data.size()) {
+                const uint8_t ext = read_u8();
+                rec.aux_difficulty_known = (ext & kExtAuxDifficultyKnown) != 0;
+                rec.imported = (ext & kExtImported) != 0;
+                // --- the imported-effort tail, behind its bit. A cut or
+                // malformed tail is no imported effort, never leftover bytes.
+                if (ext & kExtImportedEffort) {
+                    auto get_double = [&]() -> double {
+                        uint64_t bits = read_u64();
+                        double d;
+                        std::memcpy(&d, &bits, sizeof(d));
+                        return d;
+                    };
+                    const double effort = get_double();
+                    const double coverage = get_double();
+                    const uint8_t ip_len = read_u8();
+                    std::string prev = read_str(ip_len);
+                    FoundBlockRecord probe;
+                    probe.imported_effort = effort;
+                    probe.imported_coverage = coverage;
+                    probe.imported_prev_hash = std::move(prev);
+                    if (!overrun && probe.has_imported_effort()) {
+                        rec.imported_effort = probe.imported_effort;
+                        rec.imported_coverage = probe.imported_coverage;
+                        rec.imported_prev_hash = std::move(probe.imported_prev_hash);
+                    }
+                }
+            }
         }
 
         return rec;
@@ -435,6 +504,11 @@ struct MergedBlockRecord {
     // The aux chain's own network difficulty at find, from the aux block's
     // bits. 0 = not known (a record written before it existed).
     double                  difficulty{0.0};
+    // The GROSS parent-chain pool rate at find (DiscoveredMergedBlock::
+    // pool_hashrate). 0 = not known. Follows the difficulty, written only
+    // when known: a record without it is byte for byte the earlier one, and
+    // an earlier build stops after the difficulty, keeping the record.
+    double                  pool_hashrate{0.0};
 
     std::vector<uint8_t> serialize() const
     {
@@ -487,6 +561,12 @@ struct MergedBlockRecord {
         uint64_t difficulty_bits;
         std::memcpy(&difficulty_bits, &difficulty, sizeof(difficulty_bits));
         ps << difficulty_bits;
+        // --- the rate at find, only when known ---
+        if (pool_hashrate > 0.0 && std::isfinite(pool_hashrate)) {
+            uint64_t rate_bits;
+            std::memcpy(&rate_bits, &pool_hashrate, sizeof(rate_bits));
+            ps << rate_bits;
+        }
 
         auto span = ps.get_span();
         return {reinterpret_cast<const uint8_t*>(span.data()),
@@ -549,6 +629,13 @@ struct MergedBlockRecord {
                 double d;
                 std::memcpy(&d, &bits, sizeof(d));
                 if (d > 0.0 && std::isfinite(d)) rec.difficulty = d;
+                // --- the rate at find (absent when not known) ---
+                if (pos + 8 <= data.size()) {
+                    uint64_t rbits = read_u64();
+                    double r;
+                    std::memcpy(&r, &rbits, sizeof(r));
+                    if (r > 0.0 && std::isfinite(r)) rec.pool_hashrate = r;
+                }
             }
         }
         return rec;
@@ -561,9 +648,25 @@ class MergedBlockStore {
 public:
     explicit MergedBlockStore(core::LevelDBStore& store) : m_store(store) {}
 
+    /// Store a merged block record. A rate at find already stored for the
+    /// block is never replaced by an unknown one: the same block learned
+    /// again long after its find (the startup scan of the share chain)
+    /// carries none, and the record it overwrites holds the reading taken
+    /// when the block was found.
     bool store(const MergedBlockRecord& rec)
     {
         auto key = make_key(rec.chain_id, rec.height, rec.block_hash);
+        if (!(rec.pool_hashrate > 0.0)) {
+            std::vector<uint8_t> old;
+            if (m_store.get(key, old)) {
+                const auto held = MergedBlockRecord::deserialize(old);
+                if (held.block_hash == rec.block_hash && held.pool_hashrate > 0.0) {
+                    MergedBlockRecord keep = rec;
+                    keep.pool_hashrate = held.pool_hashrate;
+                    return m_store.put(key, keep.serialize());
+                }
+            }
+        }
         return m_store.put(key, rec.serialize());
     }
 

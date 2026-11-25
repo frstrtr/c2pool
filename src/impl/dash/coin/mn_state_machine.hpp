@@ -411,6 +411,12 @@ public:
     /// MnCheckpointLane::rearm() calls this, on exactly that boundary.
     void reset_sml_recovery_budget() { m_sml_recovered_total = 0; }
 
+    /// Carry the SPENT half of the per-bridge budget across a restart: a
+    /// resumed bridge is the SAME bridge, so it continues with what the
+    /// previous process already spent (the persisted record's count), never
+    /// with a fresh budget.
+    void restore_sml_recovery_spent(size_t spent) { m_sml_recovered_total = spent; }
+
     /// How deep pass 0's ranked candidate list goes. The recovery walk can
     /// never look past this depth, which bounds both the work and the blast
     /// radius: a genuine desync cannot be "walked off" by marching down an
@@ -545,6 +551,24 @@ public:
     void mark_ban_state_measured(uint32_t height)
     {
         m_ban_state_measured_at = height;
+    }
+
+    /// The unmeasured-revive ordering ledger, for the bridge cursor record.
+    const std::map<uint256, uint32_t>& unmeasured_revive_at() const
+    {
+        return m_unmeasured_revive_at;
+    }
+
+    /// Re-adopt the measurement ledgers a persisted record carried for the
+    /// SAME entries just load()ed from it (load() retires both because a new
+    /// set invalidates them; a resumed set is not a new set, so its own
+    /// ledgers come back with it).
+    void restore_measurement_ledgers(uint32_t ban_state_measured_at,
+                                     const std::vector<std::pair<uint256, uint32_t>>& revives)
+    {
+        m_ban_state_measured_at = ban_state_measured_at;
+        m_unmeasured_revive_at.clear();
+        for (const auto& [h, at] : revives) m_unmeasured_revive_at[h] = at;
     }
 
     /// The proTxHashes in `block` whose revive outcome this machine cannot
@@ -2647,9 +2671,11 @@ private:
     // dashd wrote nPoSeRevivedHeight = that height; we could not decide the
     // gate, so nPoSeRevivedHeight stayed 0 and the projection drifted ~one
     // queue length ahead. repair_unmeasured_revive_ordering() consumes this
-    // under height-exact confirmation. Transient (never persisted): a resume
-    // re-measures via the fold ladder, and a stale ledger must not license a
-    // revive-height write. Cleared by load().
+    // under height-exact confirmation. A stale ledger must not license a
+    // revive-height write, so it is persisted with the bridge cursor ONLY for
+    // records of this machine's own set (format v5) and re-adopted only with
+    // that same set; records built from another set carry none, and load()
+    // retires it, so a ledger never describes a set it was not written for.
     std::map<uint256, uint32_t> m_unmeasured_revive_at;
 
     /// Walk every ProUpServTx in a block, in tx order, handing the caller the

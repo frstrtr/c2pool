@@ -497,10 +497,14 @@ inline constexpr double kImplausibleRateShare = 0.01;
 ///   share_difficulty  the winning share's difficulty; 0 = not known
 ///   reference_rate    the history's rate at or near the block's time
 ///                     (RateHistory::yardstick_rate); 0 = no history near it
-/// With neither yardstick the rate stands as recorded.
+/// With neither yardstick the rate stands as recorded -- if it is at least
+/// kMinPoolRate: below one hash a second there is no pool, and a value like
+/// 1e-300 would put a luck of 1e300 % on the page.
+inline constexpr double kMinPoolRate = 1.0;
+
 inline bool rate_at_find_plausible(double rate, double share_difficulty, double reference_rate)
 {
-    if (!(rate > 0.0) || !std::isfinite(rate))
+    if (!(rate >= kMinPoolRate) || !std::isfinite(rate))
         return false;
     if (share_difficulty > 0.0
         && rate * kShareWorkBoundSeconds < share_difficulty * kHashesPerDifficulty)
@@ -519,6 +523,7 @@ enum class EffortMethod : uint8_t {
     first_block,    ///< no earlier main-chain block: effort 1.0 by definition
     integrated,     ///< integral of the rate / difficulty history over the round
     single_sample,  ///< the one rate / difficulty sample taken at find time
+    imported,       ///< another node's integral over the same round (see below)
 };
 
 inline const char* effort_method_name(EffortMethod m)
@@ -527,6 +532,7 @@ inline const char* effort_method_name(EffortMethod m)
     case EffortMethod::first_block:   return "first_block";
     case EffortMethod::integrated:    return "integrated";
     case EffortMethod::single_sample: return "single_sample";
+    case EffortMethod::imported:      return "imported";
     default:                          return "";
     }
 }
@@ -541,6 +547,14 @@ struct RoundInput {
     bool     main_chain{true};  ///< false: orphaned / stale
     double   difficulty{0.0};   ///< the block's own network difficulty; 0 = unknown
     double   rate_at_find{0.0}; ///< gross pool rate sampled at record time; 0 = unknown
+    /// Another node's measurement of the round that ends in this block
+    /// (--import-found-blocks): its integrated effort, the share of the round
+    /// its rate history covered, and the row it timed the round from, as an
+    /// index into the same rows (-1: that block is not held here, so the
+    /// round here is not the round it measured). See imported_effort_wins.
+    double   imported_effort{0.0};
+    double   imported_coverage{0.0};
+    int      imported_prev{-1};
 };
 
 struct RoundResult {
@@ -608,9 +622,157 @@ inline RoundResult effort_over(const RateHistory& hist, const RoundOptions& opt,
         r.missing = difficulty > 0.0 ? MissingInput::rate : MissingInput::difficulty;
         return r;
     }
+    // An effort so small that its luck is not a number (a denormal rate, a
+    // degenerate history) is no measurement: never a luck of inf -- served as
+    // null under a method that claims a value.
+    if (!std::isnormal(r.effort) || !std::isfinite(100.0 / r.effort)) {
+        RoundResult none;
+        none.time_to_find = t;
+        none.missing = MissingInput::rate;
+        return none;
+    }
     r.luck = 100.0 / r.effort;
     r.expected_time = t / r.effort;
     return r;
+}
+
+// ---------------------------------------------------------------------------
+// An effort measured by another node
+// ---------------------------------------------------------------------------
+//
+// The pool rate is the SHARE CHAIN's rate: every node of the pool samples the
+// same one. A round integrated by a node whose history covers it is a
+// measurement of the pool's round, valid on every node. A node that joined
+// later (or lost its history) covers that round in part or not at all, and
+// can take the other node's figure (--import-found-blocks) -- only where it
+// is the better measurement of the SAME round:
+//   * the same two blocks bound it (RoundInput::imported_prev is the row this
+//     node times the round from);
+//   * it covers more of the round than this node's own integral does. A tie
+//     keeps this node's own: its own measurement is never replaced by one no
+//     better. A single sample, or no effort at all, covers nothing.
+//   * the first block keeps its 1.0: by the operator's ruling it is one block
+//     found for one expected, on every node.
+//   * it is a figure at all: an effort in [kImportedEffortMin,
+//     kImportedEffortMax] and a coverage in (0, 1] (imported_effort_valid);
+//   * the other node measured at least kImportedCoverageFloor of the round --
+//     the dashboard's own line under which a figure is "mostly
+//     extrapolation" (C2P_MIN_TAG_COVERAGE). Below it the figure is an
+//     extrapolation too, and a period would count its block against almost
+//     nothing expected (effort * coverage);
+//   * where this node measured part of the round itself, the figure agrees
+//     with that: the mean pool rate it implies is within kImportedRateBand of
+//     the mean rate this node measured over the part it covers
+//     (imported_effort_agrees). A file cannot overrule what the node saw.
+// Only an integrated figure is taken: another node's single sample is its
+// rate at find times the round, which this node computes itself from the
+// same rate (pool_hashrate_at_find).
+//
+// KNOWN LIMIT: a period window that cuts an imported round counts it linear
+// in time (period_luck), as a single sample. Which part of the round the
+// other node's history covered is not known here; the "all" period is exact,
+// the 1d / 7d / 30d windows may over- or under-count the one straddling
+// round by up to its uncovered share.
+
+/// Two coverages closer than this are a tie (the same history, summed over
+/// differently clipped segments, differs in the last bits).
+inline constexpr double kCoverageTie = 1e-6;
+/// An imported effort is a number of blocks expected over one round: a
+/// millionth of a block, or a million blocks, is no pool's round.
+inline constexpr double kImportedEffortMin = 1e-6;
+inline constexpr double kImportedEffortMax = 1e6;
+/// The least share of the round the other node must have measured.
+inline constexpr double kImportedCoverageFloor = 0.5;
+/// How far the mean rate an imported effort implies may be from the mean
+/// rate this node measured over the same round: a factor of 3 either way. A
+/// pool's mean rate over one round does not move 3x between two parts of it
+/// as a rule (DOGE 6454700: 1.41 between the source's whole round and the
+/// 5.2 % the outside operator's node saw).
+inline constexpr double kImportedRateBand = 3.0;
+
+/// Is (effort, coverage) a figure at all? Normal finite numbers, the effort
+/// within [kImportedEffortMin, kImportedEffortMax], the coverage in (0, 1].
+inline bool imported_effort_valid(double effort, double coverage)
+{
+    return std::isnormal(effort) && effort >= kImportedEffortMin && effort <= kImportedEffortMax
+        && std::isnormal(coverage) && coverage > 0.0 && coverage <= 1.0;
+}
+
+/// Does `effort` agree with what this node measured of the round itself? Both
+/// run against the round's own difficulty over the same time, so the ratio of
+/// the efforts is the ratio of the mean rates. A round this node did not
+/// integrate (a single sample, nothing) has nothing to agree with.
+inline bool imported_effort_agrees(const RoundResult& local, double effort)
+{
+    if (local.method != EffortMethod::integrated || !(local.effort > 0.0))
+        return true;
+    const double ratio = effort / local.effort;
+    return ratio >= 1.0 / kImportedRateBand && ratio <= kImportedRateBand;
+}
+
+/// Does another node's effort of a round, with `coverage` of it measured,
+/// beat `local`, this node's own result for the same round?
+inline bool imported_effort_wins(const RoundResult& local, double effort, double coverage)
+{
+    if (!imported_effort_valid(effort, coverage) || coverage < kImportedCoverageFloor)
+        return false;
+    if (!imported_effort_agrees(local, effort))
+        return false;
+    switch (local.method) {
+    case EffortMethod::none:
+    case EffortMethod::single_sample: return true;
+    case EffortMethod::integrated:    return coverage > local.coverage + kCoverageTie;
+    default:                          return false;   // first_block; imported already
+    }
+}
+
+/// `r` (this node's round, its time_to_find kept) with another node's effort
+/// in place. What a period counts of it is that node's covered integral
+/// (effort * coverage, which is exactly its covered integral) and its block:
+/// a figure is taken only where that node says it was watching when the
+/// block was found.
+inline void use_imported_effort(RoundResult& r, double effort, double coverage)
+{
+    r.method = EffortMethod::imported;
+    r.missing = MissingInput::nothing;
+    r.effort = effort;
+    r.luck = 100.0 / effort;
+    r.expected_time = r.time_to_find > 0.0 ? r.time_to_find / effort : 0.0;
+    r.coverage = coverage;
+    r.covered_effort = effort * coverage;
+    r.end_covered = true;
+    // What the other node integrated is not known here: no rate, difficulty
+    // or sample count of this node's stands behind the figure.
+    r.rate_used = 0.0;
+    r.difficulty_used = 0.0;
+    r.samples = 0;
+}
+
+/// Is another node's `effort` of a round of `round_seconds` ending in a block
+/// of `difficulty` plausibly the POOL's? The rate it implies -- the mean pool
+/// rate over the round, effort * D * 2^32 / round -- is held to the bounds a
+/// rate recorded at find is held to (rate_at_find_plausible: the share
+/// difficulty from below, 1 % of the history's yardstick), and to
+/// `max_rate` (the whole network's rate, 0 = no bound) from above, and the
+/// effort itself to [kImportedEffortMin, kImportedEffortMax]. A forged figure
+/// can only change a display number. These bounds, the coverage floor and
+/// the agreement with this node's own measurement (imported_effort_wins) keep
+/// it near what this pool can have done; with no yardstick at all (no
+/// history, no share difficulty, no rates in the file) only the absolute
+/// bounds stand. Without a round or a difficulty it cannot be judged: the
+/// caller counts that apart (it is no refusal).
+inline bool imported_effort_plausible(double effort, double round_seconds, double difficulty,
+                                      double share_difficulty, double reference_rate,
+                                      double max_rate)
+{
+    if (!std::isnormal(effort) || effort < kImportedEffortMin || effort > kImportedEffortMax)
+        return false;
+    if (!(round_seconds > 0.0) || !(difficulty > 0.0) || !std::isfinite(difficulty))
+        return false;
+    const double rate = effort * difficulty * kHashesPerDifficulty / round_seconds;
+    if (!rate_at_find_plausible(rate, share_difficulty, reference_rate))
+        return false;
+    return !(max_rate > 0.0) || rate <= max_rate;
 }
 
 /// Time order of the rows of one chain: by time, then height, then position.
@@ -655,6 +817,11 @@ inline std::vector<RoundResult> compute_rounds(const std::vector<RoundInput>& ro
             r = effort_over(hist, opt, rows[last_main].ts, row.ts, row.difficulty,
                             row.rate_at_find);
             r.prev = last_main;
+            // Another node's measurement of this same round, where it covers
+            // more of it than this node's own.
+            if (row.imported_prev == last_main
+                && imported_effort_wins(r, row.imported_effort, row.imported_coverage))
+                use_imported_effort(r, row.imported_effort, row.imported_coverage);
         }
         if (row.main_chain)
             last_main = i;
@@ -665,12 +832,14 @@ inline std::vector<RoundResult> compute_rounds(const std::vector<RoundInput>& ro
 /// What a round adds to a period's blocks_expected when all of it lies in
 /// the period (period_luck): one for a first block, the integral over the
 /// time the history covers for an integrated round (NOT scaled up to the
-/// whole round), the single-sample effort for a round with no history.
+/// whole round), the single-sample effort for a round with no history. An
+/// imported round adds the other node's covered integral.
 inline double period_effort(const RoundResult& r)
 {
     switch (r.method) {
     case EffortMethod::first_block:   return 1.0;
-    case EffortMethod::integrated:    return r.covered_effort;
+    case EffortMethod::integrated:
+    case EffortMethod::imported:      return r.covered_effort;
     case EffortMethod::single_sample: return r.effort;
     default:                          return 0.0;
     }
@@ -678,7 +847,8 @@ inline double period_effort(const RoundResult& r)
 
 /// Does the row's block count in a period's k (period_luck)? A main-chain
 /// block with an effort; for an integrated round, only if the history was
-/// watching when the block was found.
+/// watching when the block was found (an imported figure is taken only
+/// where the other node's was).
 inline bool counts_in_period(const RoundInput& row, const RoundResult& r)
 {
     if (!row.main_chain)
@@ -686,7 +856,8 @@ inline bool counts_in_period(const RoundInput& row, const RoundResult& r)
     switch (r.method) {
     case EffortMethod::first_block:
     case EffortMethod::single_sample: return true;
-    case EffortMethod::integrated:    return r.end_covered;
+    case EffortMethod::integrated:
+    case EffortMethod::imported:      return r.end_covered;
     default:                          return false;
     }
 }

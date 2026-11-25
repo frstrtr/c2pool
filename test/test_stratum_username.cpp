@@ -10,6 +10,7 @@
  *   4. Preservation: LTC/DOGE "ADDR/CHAIN_ID:ADDR" merged tokens unchanged
  *   5. Worker dot-strip skipped when the last "/" token is a valid diff;
  *      a ".worker" before the "/<diff>" is still stripped (no B1 lockout)
+ *   6. "d=N" start difficulty in the authorize password (wire units)
  */
 
 #include <gtest/gtest.h>
@@ -271,4 +272,42 @@ TEST(StratumUsername, WorkerBeforeSlashDiffIsStripped)
     EXPECT_EQ(c.slash.merged_addresses.at(98), DOGE_ADDR);
     ASSERT_TRUE(c.slash.share_diff.has_value());
     EXPECT_DOUBLE_EQ(*c.slash.share_diff, 1024.0);
+}
+
+// --- 6. "d=N" start difficulty in the mining.authorize password ------------
+// Wire units; the whole password or one ","/";"-separated key=value token;
+// the last "d=" token decides; a bad value sets nothing and is flagged.
+TEST(StratumPasswordDiff, AcceptedForms)
+{
+    struct Case { const char* pw; double want; };
+    for (const Case& c : {Case{"d=4096", 4096.0}, Case{"x,d=4096", 4096.0}, Case{"d=4096;x", 4096.0},
+                          Case{"c=LTC, d = 0.5 ;x", 0.5}, Case{"D=1e3", 1000.0},
+                          Case{"d=5,d=7", 7.0}, Case{"x;d=16;", 16.0}}) {
+        SCOPED_TRACE(c.pw);
+        const auto pd = parse_password_start_diff(c.pw);
+        ASSERT_TRUE(pd.diff.has_value());
+        EXPECT_DOUBLE_EQ(*pd.diff, c.want);
+        EXPECT_FALSE(pd.bad);
+    }
+}
+
+TEST(StratumPasswordDiff, NoTokenIsNotAnError)
+{
+    for (const char* pw : {"", "x", "password", "dd=5", "sd=5", "d", "xd=4"}) {
+        SCOPED_TRACE(pw);
+        const auto pd = parse_password_start_diff(pw);
+        EXPECT_FALSE(pd.diff.has_value());
+        EXPECT_FALSE(pd.bad);
+    }
+}
+
+TEST(StratumPasswordDiff, GarbageIsIgnoredAndFlagged)
+{
+    for (const char* pw : {"d=abc", "d=-5", "d=0", "d=", "d=inf", "d=nan", "d=1e999", "d=0x10",
+                           "x,d=4096x", "d=5,d=bad"}) {
+        SCOPED_TRACE(pw);
+        const auto pd = parse_password_start_diff(pw);
+        EXPECT_FALSE(pd.diff.has_value());
+        EXPECT_TRUE(pd.bad);
+    }
 }

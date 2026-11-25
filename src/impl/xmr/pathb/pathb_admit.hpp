@@ -151,6 +151,12 @@ private:
     std::optional<Entry> last_;
 };
 
+// The coinbase rows' node-internal alarms: rows 10, 26 and 27.
+inline std::uint64_t coinbase_internal_count(const AlarmSink& s) {
+    return s.count_of(RowId::R10, Missing::NodeInternal) + s.count_of(RowId::R26, Missing::NodeInternal)
+           + s.count_of(RowId::R27, Missing::NodeInternal);
+}
+
 struct AdmitResult {
     AdmitVerdict verdict = AdmitVerdict::Defer;
     RowId row = RowId::None;

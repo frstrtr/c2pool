@@ -63,6 +63,7 @@
 #include "shared_collateral.hpp"  // Dash Core v24 shared-collateral template script
 #include "vendor/mnhftx.hpp"      // MNHF signal (type 7): its zero fee needs no UTXO view
 #include "vendor/bls_verify.hpp"  // opkey_to_basic: one point, one byte string (provider conflicts)
+#include "islock_conflict.hpp"    // N2: verified-islock conflicts in an already-built body
 
 #include <core/uint256.hpp>
 #include <core/pack.hpp>
@@ -327,8 +328,92 @@ public:
         std::lock_guard<std::mutex> lock(m_mutex);
         return m_recent_chain_spend_blocks.size();
     }
+    /// How many chain-coin proofs have been asked for (any answer). A
+    /// diagnostic counter (and a KAT probe that a fold really consulted the
+    /// chain-coin view); the folded-root memo keys on the recorded ANSWERS
+    /// instead (ChainCoinRecorder below).
+    uint64_t chain_coin_proofs() const
+    {
+        return m_chain_coin_proofs.load(std::memory_order_relaxed);
+    }
+
+    /// One prove_chain_coin answer: the outpoint asked, the proof, and the
+    /// coin (Unspent only; a default coin otherwise).
+    struct ChainCoinAnswer {
+        ::core::coin::Outpoint op;
+        CoinProof              proof{CoinProof::Unknown};
+        ::core::coin::Coin     coin;
+    };
+
+    /// Records every prove_chain_coin answer given ON THIS THREAD while the
+    /// recorder is alive (nested recorders restore the outer one).
+    ///
+    /// The P-2 folded-root memo (node_coin_state.hpp) needs it. Some provider
+    /// txs make the fold ask the chain-coin view (a ProRegTx reusing an
+    /// existing coin as its collateral; a ProUpRegTx, whose Dash Core check
+    /// reads its masternode's collateral): the recent-spend ring, the UTXO view
+    /// and the replay fold. Those move without a new tip or a list write, so
+    /// the memo key alone cannot tell a stale root from a good one. Instead of
+    /// tracking every way those three can change, the memo stores the answers
+    /// the fold got and, on a hit, asks the same outpoints again
+    /// (chain_coin_answers_unchanged): the fold is a function of the list
+    /// state (keyed), the body (keyed) and these answers, so identical answers
+    /// mean an identical root. Thread-local: selection on another thread asks
+    /// the same view without landing in this record.
+    class ChainCoinRecorder {
+    public:
+        explicit ChainCoinRecorder(std::vector<ChainCoinAnswer>& out)
+            : m_prev(recorder_slot())
+        {
+            recorder_slot() = &out;
+        }
+        ~ChainCoinRecorder() { recorder_slot() = m_prev; }
+        ChainCoinRecorder(const ChainCoinRecorder&) = delete;
+        ChainCoinRecorder& operator=(const ChainCoinRecorder&) = delete;
+
+    private:
+        std::vector<ChainCoinAnswer>* m_prev;
+    };
+
+    /// Ask each recorded outpoint again; true iff every answer (proof, and for
+    /// Unspent the whole coin) is the same as recorded. Not counted in
+    /// chain_coin_proofs() and never recorded.
+    bool chain_coin_answers_unchanged(const std::vector<ChainCoinAnswer>& answers) const
+    {
+        for (const auto& a : answers) {
+            ::core::coin::Coin c;
+            const CoinProof p = prove_chain_coin_uncounted(a.op, c);
+            if (p != a.proof) return false;
+            if (p == CoinProof::Unspent
+                && !(c.value == a.coin.value
+                     && c.scriptPubKey.m_data == a.coin.scriptPubKey.m_data
+                     && c.height == a.coin.height
+                     && c.coinbase == a.coin.coinbase
+                     && c.pegout == a.coin.pegout))
+                return false;
+        }
+        return true;
+    }
+
     CoinProof prove_chain_coin(const ::core::coin::Outpoint& op,
                                ::core::coin::Coin& out) const
+    {
+        m_chain_coin_proofs.fetch_add(1, std::memory_order_relaxed);
+        const CoinProof p = prove_chain_coin_uncounted(op, out);
+        if (auto* rec = recorder_slot())
+            rec->push_back(ChainCoinAnswer{op, p, p == CoinProof::Unspent ? out : ::core::coin::Coin{}});
+        return p;
+    }
+
+private:
+    static std::vector<ChainCoinAnswer>*& recorder_slot()
+    {
+        static thread_local std::vector<ChainCoinAnswer>* slot = nullptr;
+        return slot;
+    }
+
+    CoinProof prove_chain_coin_uncounted(const ::core::coin::Outpoint& op,
+                                         ::core::coin::Coin& out) const
     {
         {
             std::lock_guard<std::mutex> lock(m_mutex);
@@ -350,6 +435,7 @@ public:
         return CoinProof::Unknown;
     }
 
+public:
     /// blockmintxfee-equivalent knob (dashd -blockmintxfee / BlockAssembler
     /// Options::blockMinFeeRate, miner.cpp:100). Sets the min ancestor-package
     /// feerate in duffs/kB used by the blockMinFeeRate early-return in
@@ -1653,8 +1739,11 @@ public:
         // add_islock erases them from the (already-pruned) set as it pops.
         for (const auto& mtx : block.m_txs) {
             m_islock_txids.erase(dash_txid(mtx));
+            m_verified_islock_txids.erase(dash_txid(mtx));
             for (const auto& vin : mtx.vin) {
                 m_islock_outpoints.erase(
+                    std::make_pair(vin.prevout.hash, vin.prevout.index));
+                m_verified_islock_outpoints.erase(
                     std::make_pair(vin.prevout.hash, vin.prevout.index));
             }
         }
@@ -1998,15 +2087,21 @@ public:
     ///      candidate vin against this map (belt for txs admitted between
     ///      islock arrival and eviction, and for re-added conflicts).
     ///
-    /// RESIDUAL RACE (documented, not closable node-side): an islock that
-    /// FORMS (or reaches us) after a template was emitted can invalidate a
-    /// share won on that template — the islock-formation window. dashd's
-    /// validator itself waives conflict-tx-lock once the block is
-    /// chainlocked (validation.cpp:2612 has_chainlock override), so the
-    /// exposure is one islock-vs-block race per conflicting spend, the same
-    /// race dashd's own miner runs. There is no pre-emit oracle for "an
-    /// islock will form for the OTHER spend"; tracking known locks is the
-    /// full extent of what any miner can do.
+    /// RESIDUAL RACE (not closable node-side): an islock that FORMS after a
+    /// template was emitted invalidates a block won on that template before
+    /// we can know — the islock-formation window, the same race dashd's own
+    /// miner runs. dashd's validator waives conflict-tx-lock only for a block
+    /// that is ALREADY ChainLocked (v24.0.2 validation.cpp:2811-2829), which
+    /// a freshly found block never is, so a block in this window is lost.
+    /// There is no pre-emit oracle for "an islock will form for the OTHER
+    /// spend".
+    ///
+    /// CLOSABLE PART (N2): an islock that has REACHED us and been verified
+    /// while a template carrying the conflicting tx is still being served.
+    /// Eviction (1) and the selection guard (2) only shape the NEXT template;
+    /// add_verified_islock records the verified outpoints, the emit gate
+    /// refuses a body that conflicts with one, and main_dash forces a clean
+    /// work refresh when the served template does.
     ///
     /// FEED: dashd-peer relay (the sole-ingestion-path invariant covers
     /// islocks too — they arrive from the same relay peers as the txs), via
@@ -2021,6 +2116,19 @@ public:
                     const std::vector<std::pair<uint256, uint32_t>>& inputs)
     {
         std::lock_guard<std::mutex> lock(m_mutex);
+        add_islock_locked(locked_txid, inputs, /*verified=*/false);
+    }
+
+    /// add_islock's body. An UNVERIFIED (relay-lane) lock never overrides an
+    /// outpoint a VERIFIED lock owns: it neither rewrites that entry nor
+    /// evicts the pool entry spending it. Otherwise the G4 selection guard
+    /// (which then reads the rewritten entry) and the emit gate's belt (which
+    /// reads the verified map) would disagree, and every freshly built
+    /// template would be refused.
+    void add_islock_locked(const uint256& locked_txid,
+                           const std::vector<std::pair<uint256, uint32_t>>& inputs,
+                           bool verified)
+    {
         // Locked-TXID index — dashd's IsLocked(txid) equivalent for the IS
         // mining-safety hold: a tx WITH a known islock is safe to mine
         // immediately (TestPackageTransactions skips the 10-min hold for it).
@@ -2035,6 +2143,11 @@ public:
         // Feed-liveness tick for the hold's ISLOCK_FEED_FRESH_SECS gate.
         m_last_islock_seen = std::time(nullptr);
         for (const auto& in : inputs) {
+            if (!verified) {
+                const auto v = m_verified_islock_outpoints.find(in);
+                if (v != m_verified_islock_outpoints.end() && v->second != locked_txid)
+                    continue;   // a verified lock owns this outpoint
+            }
             // Bound the tracking map (relay is untrusted input): evict the
             // oldest registration once over cap. 100k outpoints ≈ a few MB.
             while (m_islock_order.size() >= MAX_ISLOCK_OUTPOINTS
@@ -2064,6 +2177,134 @@ public:
         return m_islock_outpoints.size();
     }
 
+    // ── N2: VERIFIED islock outpoints ────────────────────────────────────
+    /// Adopt a BLS-VERIFIED islock (CoinStateMaintainer::on_new_isdlock, after
+    /// the verifier passed). Does everything add_islock does — the unverified
+    /// relay lane has normally run for the same lock already, so that part is
+    /// idempotent — and also records the outpoints in the VERIFIED map.
+    ///
+    /// add_islock evicts the conflicting pool entry and the G4 selection guard
+    /// keeps it out of NEW templates, but a template built and served before
+    /// the lock arrived still carries it, and a block won on that job is
+    /// rejected (Dash Core v24.0.2 validation.cpp:2811-2829, conflict-tx-lock;
+    /// the waiver there applies only to a block that is already ChainLocked).
+    /// The verified map is what may act on that: the emit gate's belt
+    /// (verified_islock_conflict_in) and the forced work refresh main_dash
+    /// fires when the served template spends a just-verified lock's outpoint.
+    /// The unverified map must not drive either: a forged lock would otherwise
+    /// refuse templates or force clean_jobs notifies on demand.
+    void add_verified_islock(const uint256& locked_txid,
+                             const std::vector<std::pair<uint256, uint32_t>>& inputs)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        add_islock_locked(locked_txid, inputs, /*verified=*/true);
+        for (const auto& in : inputs) {
+            // Same bounded-FIFO posture as the unverified map.
+            while (m_verified_islock_order.size() >= MAX_ISLOCK_OUTPOINTS
+                   && !m_verified_islock_order.empty()) {
+                m_verified_islock_outpoints.erase(m_verified_islock_order.front());
+                m_verified_islock_order.pop_front();
+            }
+            auto [it, inserted] = m_verified_islock_outpoints.insert_or_assign(in, locked_txid);
+            if (inserted) m_verified_islock_order.push_back(in);
+        }
+        while (m_verified_islock_txid_order.size() >= MAX_ISLOCK_OUTPOINTS
+               && !m_verified_islock_txid_order.empty()) {
+            m_verified_islock_txids.erase(m_verified_islock_txid_order.front());
+            m_verified_islock_txid_order.pop_front();
+        }
+        if (m_verified_islock_txids.insert(locked_txid).second)
+            m_verified_islock_txid_order.push_back(locked_txid);
+    }
+
+    /// What revoke_unverified_islock undid.
+    struct IslockRevoke {
+        bool   hold_restored{false};       // txid left m_islock_txids (the hold applies again)
+        size_t g4_cleared{0};              // outpoint entries this lock wrote, removed
+        size_t g4_restored{0};             // entries it had overwritten, back to the verified lock
+    };
+
+    /// Lane 2 REFUSED this lock (BLS verification failed): undo what the
+    /// unverified relay lane (on_islock -> add_islock) did with it. Dash Core
+    /// only ever acts on locks it verified (its IsLocked short-circuit of
+    /// IsTxSafeForMining, miner.cpp:430-436), so a refused lock must not keep
+    /// a tx out of the 600 s mining-safety hold or keep its outpoints excluded.
+    /// Both lanes run synchronously in one isdlock handler (p2p_client.hpp:
+    /// new_islock, then new_isdlock), so the revoke lands before any template
+    /// can be built in between.
+    ///
+    ///   * txid: removed from m_islock_txids unless a VERIFIED lock holds the
+    ///     same txid (a forged copy naming a verified txid changes nothing);
+    ///   * each input: an entry this lock wrote (still mapped to its txid) is
+    ///     removed, or set back to the VERIFIED lock's txid when the forged
+    ///     lock had overwritten a verified entry (otherwise G4 would stop
+    ///     excluding a tx the emit belt still refuses);
+    ///   * the feed-liveness tick (m_last_islock_seen) is left alone: a
+    ///     revocation must not make the feed look dark and disarm the hold.
+    ///
+    /// Not undone: a pool entry add_islock already EVICTED stays evicted (it is
+    /// re-relayed or mined elsewhere; the cost is fees, never a block).
+    IslockRevoke revoke_unverified_islock(const uint256& locked_txid,
+                                          const std::vector<std::pair<uint256, uint32_t>>& inputs)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        IslockRevoke r;
+        if (!m_verified_islock_txids.count(locked_txid) && m_islock_txids.erase(locked_txid))
+            r.hold_restored = true;   // stale order-deque entries are harmless (FIFO erase)
+        for (const auto& in : inputs) {
+            auto it = m_islock_outpoints.find(in);
+            const auto v = m_verified_islock_outpoints.find(in);
+            if (v != m_verified_islock_outpoints.end()) {
+                if (it == m_islock_outpoints.end()) {
+                    m_islock_outpoints.emplace(in, v->second);
+                    m_islock_order.push_back(in);
+                    ++r.g4_restored;
+                } else if (it->second != v->second) {
+                    it->second = v->second;
+                    ++r.g4_restored;
+                }
+                continue;
+            }
+            if (it != m_islock_outpoints.end() && it->second == locked_txid) {
+                m_islock_outpoints.erase(it);
+                ++r.g4_cleared;
+            }
+        }
+        return r;
+    }
+
+    /// Hold short-circuit probe (dashd IsLocked(txid) equivalent) for KATs
+    /// and diagnostics.
+    bool islock_txid_known(const uint256& txid) const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_islock_txids.count(txid) > 0;
+    }
+
+    /// First tx of an already-built body that spends an outpoint a VERIFIED
+    /// islock assigns to a different txid (nullopt = none). `txids` parallel
+    /// to `txs` when available (DashWorkData m_txs / m_tx_hashes).
+    template <typename TxT>
+    std::optional<IslockConflict>
+    verified_islock_conflict_in(const std::vector<TxT>& txs,
+                                const std::vector<uint256>& txids) const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_verified_islock_outpoints.empty()) return std::nullopt;
+        return first_islock_conflict(txs, txids,
+            [this](const std::pair<uint256, uint32_t>& op) -> std::optional<uint256> {
+                auto it = m_verified_islock_outpoints.find(op);
+                if (it == m_verified_islock_outpoints.end()) return std::nullopt;
+                return it->second;
+            });
+    }
+
+    size_t verified_islock_outpoint_count() const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_verified_islock_outpoints.size();
+    }
+
     void evict_expired()
     {
         time_t cutoff = std::time(nullptr) - m_expiry_sec;
@@ -2090,6 +2331,10 @@ public:
         m_feerate_index.clear();
         m_islock_outpoints.clear();
         m_islock_order.clear();
+        m_verified_islock_outpoints.clear();
+        m_verified_islock_order.clear();
+        m_verified_islock_txids.clear();
+        m_verified_islock_txid_order.clear();
         m_islock_txids.clear();
         m_islock_txid_order.clear();
         m_last_islock_seen = 0;
@@ -2905,6 +3150,7 @@ public:
                 //     construction.
                 if (is_hold_active && !e->tx.vin.empty()
                     && !m_islock_txids.count(e->txid)
+                    && !m_verified_islock_txids.count(e->txid)
                     && now_ts - e->time_added < WAIT_FOR_ISLOCK_TIMEOUT_SECS) {
                     ok = false;
                     break;
@@ -2927,9 +3173,16 @@ public:
 
                     // G4: islock conflict — the outpoint is locked to a
                     // different txid; packing this tx is conflict-tx-lock.
-                    auto lk = m_islock_outpoints.find(opkey);
-                    if (lk != m_islock_outpoints.end()
-                        && lk->second != e->txid) {
+                    //     A VERIFIED entry outranks the relay-lane one
+                    //     (the emit gate's belt reads the verified map).
+                    const uint256* locked_to = nullptr;
+                    if (auto vk = m_verified_islock_outpoints.find(opkey);
+                        vk != m_verified_islock_outpoints.end())
+                        locked_to = &vk->second;
+                    else if (auto lk = m_islock_outpoints.find(opkey);
+                             lk != m_islock_outpoints.end())
+                        locked_to = &lk->second;
+                    if (locked_to != nullptr && *locked_to != e->txid) {
                         ok = false;
                         break;
                     }
@@ -3156,6 +3409,9 @@ private:
     std::map<uint256, MempoolEntry>                    m_pool;
     std::multimap<time_t, uint256>                     m_time_index;
     std::map<std::pair<uint256, uint32_t>, uint256>    m_spent_outputs;
+    // prove_chain_coin calls (chain_coin_proofs()); a relaxed counter, read by
+    // the emit gate around one fold on the same thread.
+    mutable std::atomic<uint64_t>                      m_chain_coin_proofs{0};
     // Step 2: feerate-sorted index. greater<double> means begin() =
     // highest feerate, so iteration is best-first.
     std::set<FeeKey>                                   m_feerate_index;
@@ -3163,6 +3419,14 @@ private:
     // insertion order for bounded eviction.
     std::map<std::pair<uint256, uint32_t>, uint256>    m_islock_outpoints;
     std::deque<std::pair<uint256, uint32_t>>           m_islock_order;
+    // N2: the subset adopted through the BLS-VERIFIED lane only
+    // (add_verified_islock). Drives the emit belt and the forced refresh.
+    std::map<std::pair<uint256, uint32_t>, uint256>    m_verified_islock_outpoints;
+    std::deque<std::pair<uint256, uint32_t>>           m_verified_islock_order;
+    // Txids holding a VERIFIED lock: revoke_unverified_islock never strips
+    // their hold short-circuit.
+    std::set<uint256>                                  m_verified_islock_txids;
+    std::deque<uint256>                                m_verified_islock_txid_order;
     // IS mining-safety hold: txids holding a known islock (dashd
     // IsLocked(txid)) — such a tx bypasses the 10-minute hold. Same bounded-
     // FIFO posture as the outpoint map (relay is untrusted input).

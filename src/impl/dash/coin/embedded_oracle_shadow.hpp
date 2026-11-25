@@ -294,7 +294,10 @@ inline std::vector<FieldResult> compare_templates(
     // ── EQUALITY (cross-node) ───────────────────────────────────────────────
     eq("height",   Regime::Equality, true, std::to_string(emb.m_height), std::to_string(dashd.m_height));
     eq("bits",     Regime::Equality, true, std::to_string(emb.m_bits),   std::to_string(dashd.m_bits));
-    eq("mintime",  Regime::Equality, true, std::to_string(emb.m_mintime),std::to_string(dashd.m_mintime));
+    // mintime 0 on the embedded side is a withheld floor (the tip's MTP window
+    // is incomplete), not a wrong value: shown, not counted.
+    eq("mintime",  Regime::Equality, emb.m_mintime != 0,
+       std::to_string(emb.m_mintime), std::to_string(dashd.m_mintime));
     eq("payee_identities", Regime::Equality, true,
        payee_identity_str(emb.m_packed_payments), payee_identity_str(dashd.m_packed_payments));
     // Incident h=2516595: the FULL MN payout SET (owner + operator + ratio),

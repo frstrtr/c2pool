@@ -994,12 +994,11 @@ TEST(DashV36Network, NoNetKeepsPublicAndCustomIdPaths) {
     }
 }
 
-TEST(DashV36Network, SeedListIsTheApprovedPublicNodes) {
+TEST(DashV36Network, SeedListIsEmptyUntilPublicSeedsExist) {
     IdentityGuard g;
-    // The operator-approved seeds, pinned: a change to the list must update
-    // this line in the same PR.
-    const std::vector<std::string> expected{"158.220.92.171:8998", "109.123.238.32:8998"};
-    EXPECT_EQ(dash::v36_network_seed_hosts(), expected);
+    // No public v36 seed nodes yet, pinned: a seed set comes with a public v36
+    // deployment and must update this KAT in the same change.
+    EXPECT_TRUE(dash::v36_network_seed_hosts().empty());
     for (const auto& hp : dash::v36_network_seed_hosts()) {
         const auto colon = hp.rfind(':');
         ASSERT_NE(colon, std::string::npos) << hp;

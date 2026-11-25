@@ -858,6 +858,8 @@ public:
         if (!m_position_verified)
             return "header-tip-to-reach-anchor@h="
                    + std::to_string(m_anchor_height);
+        if (!m_restore_settled && m_pending_restore && m_r7_defers > 0)
+            return "restore-hold@h=" + std::to_string(m_pending_restore->cursor_height);
         if (m_requested_through >= m_next)
             return "block-bodies@h=" + std::to_string(m_next) + ".."
                    + std::to_string(m_requested_through);
@@ -905,6 +907,15 @@ public:
     /// the attempt has run — including on success — because "resumed" and
     /// "refused, and here is which rule" are the same question to an operator.
     const std::string& restore_verdict() const { return m_restore_verdict; }
+    /// R7 deferrals of the persisted cursor while our header tip was below it:
+    /// all of them, and the ones that brought no new tip height (the counted
+    /// ones; restore_defer_bound() of them end the wait COLD).
+    uint32_t r7_defers() const { return m_r7_defers; }
+    /// The state machine's measurement ledgers (status / KATs).
+    uint32_t ban_state_measured_at() const { return m_machine.ban_state_measured_at(); }
+    size_t   unmeasured_revives() const { return m_machine.unmeasured_revive_at().size(); }
+    uint32_t r7_stalled() const { return m_r7_stalled; }
+    static constexpr uint32_t restore_defer_bound() { return kMaxRestoreDefers; }
 
     /// TRUE while a RESTORED set is still unfalsified.
     ///
@@ -1208,6 +1219,9 @@ public:
                 m_pending_is_live = true;
                 m_restore_settled = false;
                 m_restore_defers  = 0;
+                m_r7_defers       = 0;
+                m_r7_stalled      = 0;
+                m_r7_tip_high     = 0;
             }
             m_status = "RE-ARMED after a payee APPLY GAP (gap re-arm "
                        + std::to_string(m_gap_rearms) + ", not counted against"
@@ -1612,6 +1626,9 @@ private:
         m_pending_is_live = false;
         m_restore_settled = false;
         m_restore_defers  = 0;
+        m_r7_defers       = 0;
+        m_r7_stalled      = 0;
+        m_r7_tip_high     = 0;
     }
 
 public:
@@ -2500,6 +2517,9 @@ private:
         m_pending_is_live = false;
         m_restore_settled = m_cursor_store == nullptr;
         m_restore_defers  = 0;
+        m_r7_defers       = 0;
+        m_r7_stalled      = 0;
+        m_r7_tip_high     = 0;
         m_restore_verdict.clear();
         if (!m_cursor_store) return;
         std::string why;
@@ -2689,15 +2709,44 @@ private:
         }
 
         // R7 — is this record even about the replay we are here to do?
+        //
+        // A header tip BELOW the cursor is DEFERRED, not refused, while the
+        // header chain is still climbing: a fresh header store fast-starts at
+        // the anchor and re-syncs to the live tip in seconds, and refusing at
+        // the first pump turned that into a full re-fold from the anchor.
+        // Only a pump that brings NO new tip height counts toward
+        // kMaxRestoreDefers (the same bound R4 uses, on its own counter);
+        // every other pump raises the tip by at least one, and the tip cannot
+        // pass the cursor without leaving this branch, so the whole wait is
+        // bounded by (cursor - first deferred tip) + kMaxRestoreDefers pumps.
+        // Nothing is accepted here: once the tip reaches the cursor, R4 below
+        // still decides whether our chain holds exactly the folded block.
         const uint32_t tip = m_tip_height ? m_tip_height() : 0;
         if (rec.cursor_height > tip) {
-            restore_cold(
-                "R7 cursor-above-tip",
-                "the record's cursor h=" + std::to_string(rec.cursor_height)
-                    + " is ABOVE our own header tip h=" + std::to_string(tip)
-                    + " — we cannot verify at a height we do not have, and a"
-                      " chain that lost ground is not a chain to resume onto");
-            return true;
+            const bool rising = m_r7_defers == 0 || tip > m_r7_tip_high;
+            if (tip > m_r7_tip_high) m_r7_tip_high = tip;
+            if (!rising && ++m_r7_stalled > kMaxRestoreDefers) {
+                restore_cold(
+                    "R7 cursor-above-tip",
+                    "the record's cursor h=" + std::to_string(rec.cursor_height)
+                        + " stayed ABOVE our own header tip h="
+                        + std::to_string(tip) + " across "
+                        + std::to_string(kMaxRestoreDefers)
+                        + " pumps that brought no new header height — we"
+                          " cannot verify at a height we do not have, and a"
+                          " chain that stopped short is not a chain to resume"
+                          " onto");
+                return true;
+            }
+            ++m_r7_defers;
+            if (m_r7_defers == 1 || m_r7_defers % 10 == 0 || !rising)
+                LOG_INFO << "[MN-CKPT] persisted cursor h=" << rec.cursor_height
+                         << " is above our header tip h=" << tip
+                         << " (deferral " << m_r7_defers << ", stalled "
+                         << m_r7_stalled << "/" << kMaxRestoreDefers
+                         << ") — waiting for the header chain to reach it,"
+                            " then R4 decides";
+            return false;   // defer this pump
         }
 
         // R4 — the reorg / fork guard. Deferred, not refused, while the header
@@ -2765,7 +2814,14 @@ private:
         // run, i.e. a node could buy extra overrides by restarting. Carrying
         // them makes restart-equivalence the default.
         m_machine.load(rec.entries, rec.cursor_height);
-        m_machine.reset_sml_recovery_budget();
+        // The demotion-walk cap reads the MACHINE's spent count, so that is
+        // the one that must carry (the lane's m_sml_recovered below is the
+        // same per-bridge count, kept for status).
+        m_machine.restore_sml_recovery_spent(rec.sml_recovered);
+        // load() retired the measurement ledgers; the record carries the ones
+        // that describe exactly these entries (format v5).
+        m_machine.restore_measurement_ledgers(rec.ban_state_measured_at,
+                                              rec.unmeasured_revive_at);
         m_next              = rec.cursor_height + 1;
         m_applied           = 0;   // blocks applied BY THIS PROCESS
         m_restored_applied  = rec.applied;
@@ -2982,13 +3038,24 @@ private:
         rec.revive_probes      = static_cast<uint32_t>(m_revive_probes);
         rec.revive_unmeasured  = static_cast<uint32_t>(m_revive_unmeasured);
         rec.revive_declined    = static_cast<uint32_t>(m_revive_declined);
-        rec.sml_recovered      = static_cast<uint32_t>(m_sml_recovered);
+        // The count the demotion-walk cap reads, current at the moment the
+        // record is written (the lane's own total is added only after the
+        // block's persist).
+        rec.sml_recovered      = static_cast<uint32_t>(m_machine.sml_recovered_total());
         rec.pose_removed       = static_cast<uint32_t>(m_pose_removed);
         rec.pose_reinstated    = static_cast<uint32_t>(m_pose_reinstated);
         rec.tx_revived         = static_cast<uint32_t>(m_tx_revived);
         rec.revive_dropped     = static_cast<uint32_t>(m_revive_dropped);
         rec.registered         = static_cast<uint32_t>(m_registered);
         rec.spent              = static_cast<uint32_t>(m_spent);
+        // The measurement ledgers describe THIS machine's own set. A record
+        // built from another set (the live-follow and re-arm records pass the
+        // maintainer's entries) carries none, exactly as a v4 record did.
+        if (!entries) {
+            rec.ban_state_measured_at = m_machine.ban_state_measured_at();
+            rec.unmeasured_revive_at.assign(m_machine.unmeasured_revive_at().begin(),
+                                            m_machine.unmeasured_revive_at().end());
+        }
         if (entries) {
             rec.entries = *entries;
         } else {
@@ -4674,6 +4741,9 @@ public:
         m_persist_arith_warned = false;
         m_resume_hold_logged   = 0;
         m_restore_defers       = 0;
+        m_r7_defers            = 0;
+        m_r7_stalled           = 0;
+        m_r7_tip_high          = 0;
         // ── THE ADJUDICATION ITSELF, not merely its result. ───────────────
         //
         // m_restore_settled is the LATCH that says "this process no longer
@@ -4926,6 +4996,11 @@ public:
     std::optional<MnBridgeCursor> m_pending_restore;
     bool     m_restore_settled{true};    // true when no adjudication is owed
     uint32_t m_restore_defers{0};
+    /// R7 deferrals (header tip below the cursor): all of them, the ones that
+    /// brought no new tip height, and the highest tip seen while deferring.
+    uint32_t m_r7_defers{0};
+    uint32_t m_r7_stalled{0};
+    uint32_t m_r7_tip_high{0};
     std::string m_restore_verdict;
     uint32_t m_restored_at{0};           // height a restore resumed from
     /// Blocks / folds a PREVIOUS process contributed. Kept separate from

@@ -757,13 +757,14 @@ inline void apply_sharechain_identity(SharechainConfig::NamedNetwork named,
 // (SharechainConfig::V36_P2P_PORT);
 // IP literals, so dialing needs no DNS. An explicit --addnode/--connect
 // replaces the whole list.
+//
+// No public v36 seed nodes yet: the list is empty, and a node started with
+// --net dash-v36 and no --addnode/--connect says so at startup. A seed set
+// comes with a public v36 deployment, as its own change.
 // ---------------------------------------------------------------------------
 inline std::vector<std::string> v36_network_seed_hosts()
 {
-    return {
-        "158.220.92.171:8998",   // dash.voidbind.com
-        "109.123.238.32:8998",   // Singapore
-    };
+    return {};
 }
 
 // ---------------------------------------------------------------------------

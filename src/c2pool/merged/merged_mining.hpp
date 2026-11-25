@@ -359,6 +359,12 @@ struct DiscoveredMergedBlock
     // The aux chain's own network difficulty at find, read off the aux
     // block's bits (0 = not known). Display only (the block's luck).
     double      difficulty{0.0};
+    // The GROSS parent-chain pool rate when the block was found (the
+    // sharechain estimator, MiningInterface::gross_pool_hashrate_at); 0 = not
+    // known: a record from before it was kept, or a block learned long after
+    // its find. Display only: served as pool_hashrate_at_find, the
+    // single-sample fallback of the block's luck.
+    double      pool_hashrate{0.0};
 };
 
 // ─── Integrated Merged Mining Manager ────────────────────────────────────────

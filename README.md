@@ -16,6 +16,13 @@ Original forum thread: <https://bitcointalk.org/index.php?topic=18313>
 
 ## Latest releases
 
+- **[v0.2.12.12.2](https://github.com/frstrtr/c2pool/releases/tag/v0.2.12.12.2)** — LTC + DOGE: the embedded header chains accept the genesis header only into a header store that has no tip yet; check the LTC and DOGE header stores once after upgrading (steps in the release notes). Dashboard: Discovered Merged Blocks links the parent hash to the parent-chain explorer only when its parent height is known. Recommended for every LTC/DOGE node.
+- **[v0.2.12.12.1](https://github.com/frstrtr/c2pool/releases/tag/v0.2.12.12.1)** — DASH: a header-chain robustness fix. Recommended for every Dash node.
+- **[v0.2.12.12](https://github.com/frstrtr/c2pool/releases/tag/v0.2.12.12)** — DASH: InstantSend locks are checked against recently rotated quorums, and templates follow InstantSend locks; lower CPU with provider transactions in the template; share-chain block solutions are relayed at the network's difficulty only; a won block is not held back when the local Dash Core does not answer.
+- **[v0.2.12.11](https://github.com/frstrtr/c2pool/releases/tag/v0.2.12.11)** — DASH: lower CPU and no io-loop stalls when serving masternode special transactions; a found block recorded without a height no longer stays "pending"; chainz links on the dashboard.
+- **[v0.2.12.10](https://github.com/frstrtr/c2pool/releases/tag/v0.2.12.10)** — Stratum (all coins): no difficulty runaway after a restart, and the `d=N` / `+N` miner password options. LTC: dead stratum connections no longer fill the miner cap; `--import-found-blocks` restores the found-block history from another node. DASH: `--listen HOST:PORT` binds HOST; shorter tracker lock holds.
+- **[v0.2.12.9](https://github.com/frstrtr/c2pool/releases/tag/v0.2.12.9)** — All coins: dashboard luck is based on effort, and pool luck over a period is blocks found ÷ blocks expected with a 95% interval. LTC: Best Share shows your own miners' best hash. DASH: a new node keeps working through the Dash Core v24 activation; `--connect` is connect-only; `c2pool-dash` now requires dashbls.
+- **[v0.2.12.8](https://github.com/frstrtr/c2pool/releases/tag/v0.2.12.8)** — All coins: a fresh node no longer aborts while it looks up DNS seeds; source-archive builds show their real version; `--version` on LTC and BTC. Dashboard: an interactive PPLNS view.
 - **[v0.2.12.7](https://github.com/frstrtr/c2pool/releases/tag/v0.2.12.7)** — LTC: `--fee` pays the node owner the configured fee (v0.2.12–v0.2.12.6 paid about 1/12 of it), and a smaller miner's shares count at their full weight next to a bigger miner. DASH: on a node with several miners, each submission is judged by its own job's share target (a smaller miner could keep as little as 1/30 of its shares). LTC dashboard: one found block shows as the same row on every node, and merged blocks appear only under Merged Mining Blocks. Linux packages run without `start.sh`.
 - **[v0.2.12.6](https://github.com/frstrtr/c2pool/releases/tag/v0.2.12.6)** — LTC + DASH: a share that solves a block wins its head race against an equal-work sibling, as in p2pool. Dashboard fixes.
 - **[v0.2.12.5](https://github.com/frstrtr/c2pool/releases/tag/v0.2.12.5)** — DASH: superblock trigger votes are re-synced right before the superblock, for the Dash Core 24.0.1 voting change. Upgrade before superblock 2,575,480.
@@ -37,10 +44,10 @@ c2pool-dash builds valid Dash mainnet blocks from embedded coin-state. The
 deterministic masternode list, LLMQ quorums, ChainLocks and the DIP-4 coinbase
 are reconstructed inside c2pool. No Dash Core node is required on the serve path.
 Dash Core 24 (hard fork) is supported from v0.2.11.1: the v24 rules are built
-into the node, so a daemon-less pool has no dashd to upgrade. The activation
-signal was not mined by block 2,572,415, so the earliest v24 activation is now
-block 2,584,512 (around 2026-12-06). c2pool is compatible with Dash Core 24.0.2
-peers.
+into the node, so a daemon-less pool has no dashd to upgrade. v24 signalling
+started at block 2,576,448 (2026-11-22): the earliest lock-in is block 2,580,480
+and the earliest activation block 2,584,512 (around 2026-12-07). c2pool is
+compatible with Dash Core 24.0.2 peers.
 Blocks built this way have been accepted on Dash mainnet, including the pool
 development-fee split. A bare `c2pool-dash --run` is daemonless: with no
 `--coin-rpc` given, every embedded serving lever defaults ON
@@ -50,11 +57,11 @@ when NO dashd arm is given"; resolver in
 `dash.voidbind.com` runs this posture with no dashd on the host. A node started
 with `--coin-rpc H:P` keeps dashd as the reward-safe fallback arm — the
 operator's private deployment still runs dashd-attached — so both postures are
-supported by the same binary. The remaining work is the daemonless-finalize item
-below (retiring the `--coin-rpc` fallback entirely). See
+supported by the same binary. The remaining work is retiring the `--coin-rpc`
+fallback entirely. See
 [Per-binary launch reference](#per-binary-launch-reference) for the flags.
 
-**DASH v36 network (code merged 2026-10-03, seed nodes not yet deployed).**
+**DASH v36 network (code merged 2026-10-03, no public seed nodes yet).**
 `c2pool-dash --net dash-v36` joins a separate DASH sharechain that uses the V36
 share format. It has its own identity (network id `ac2785363c0180b8`, protocol
 3601), so it never mixes with the v16 `p2pool-dash` sharechain, and its own P2P
@@ -65,36 +72,39 @@ adds:
 - cheap pre-checks before X11, plus size and count caps on incoming shares
   (PR #1850);
 - a graded misbehaviour score and ban for sharechain peers (PR #1858);
-- built-in seeds on port 8998, so a node started with `--net dash-v36` and no
-  `--addnode` finds the network by itself (PR #1859).
-The two public seed nodes are being deployed; until they listen on 8998, the
-v36 network has no public peers.
+- built-in seed support on port 8998 (PR #1859).
+The public v36 network has no deployed seed nodes yet; until it does, start
+with `--addnode` to a known v36 peer.
 
 ## Governance
 
-Daemonless-Dash finalization has a funding proposal in Dash on-chain governance:
-c2pool-daemonless-delivered, 252 DASH, paid once at superblock 2575480 (around
-2026-11-20). The voting cutoff is around 2026-11-17.
+Daemonless-Dash finalization has not been funded by Dash on-chain governance yet.
 
-- DashCentral: https://www.dashcentral.org/p/c2pool-daemonless-delivered
-- Governance object: c7b462b7c8d81df10ce34ebd4436afd715f288c25a7c949835f889015248b247
-- Collateral: 639a53cfa9f19f16414a9dd679ebfdc930633e18eedd8cd5f06ff4a90925b705, mined
-  in block 2565421 by this pool through runtime transaction injection (below)
-- Vote from a masternode:
+- **c2pool-daemonless-dash** (current, submitted 2026-11-23): 50 DASH at each of six
+  superblocks, December 2026 to May 2027 (window 2026-11-22 to 2027-06-03), to
+  XdgF55wEHBRWwbuBniNYH4GvvaoYMgL84u. Each superblock is decided separately.
+  DashCentral: https://www.dashcentral.org/p/c2pool-daemonless-dash;
+  governance object fef748433af0d10120a4033f1e8edf2146b95d19d97fa63d47a71f556349342d;
+  collateral 41b080a7d6ae9ee1c37a7d31ccc3d99a984b663c630f0afcc3a9079b22da415e (zero fee,
+  242 inputs), mined in block 2577188 by this pool through runtime transaction
+  injection (below). Check the tally on any Dash Core node with
+  `dash-cli gobject get fef748433af0d10120a4033f1e8edf2146b95d19d97fa63d47a71f556349342d`.
+- **c2pool-daemonless-delivered** (252 DASH, one payment at superblock 2575480,
+  2026-11-20): at the voting cutoff it had 190 net yes votes (206 yes, 16 no),
+  short of the threshold of 10 percent of the masternode voting weight. It could not
+  have been paid there in any case: of that superblock's 6828.26 DASH budget,
+  6710.00 DASH went to 19 approved payments, leaving 118.26 DASH. Superblock
+  2575480 did not pay it, and its window ends before the next superblock.
+  DashCentral: https://www.dashcentral.org/p/c2pool-daemonless-delivered;
+  governance object c7b462b7c8d81df10ce34ebd4436afd715f288c25a7c949835f889015248b247;
+  collateral 639a53cfa9f19f16414a9dd679ebfdc930633e18eedd8cd5f06ff4a90925b705, mined in
+  block 2565421 by this pool through runtime transaction injection (below).
+- **c2pool-daemonless-finalize**
+  (fa758340f1bd2391d17bb43667f76c5d9070d737b68e018e42ed75b09c6ba631, 2 x 125.5 DASH)
+  reached the threshold only after the last superblock inside its window (2558864)
+  had passed. Its window ended on 2026-11-04, so it was never paid.
 
-  ```
-  dash-cli gobject vote-many c7b462b7c8d81df10ce34ebd4436afd715f288c25a7c949835f889015248b247 funding yes
-  ```
-
-Funding requires net yes votes equal to 10 percent of enabled masternodes by the
-superblock.
-
-The earlier proposal, c2pool-daemonless-finalize
-(fa758340f1bd2391d17bb43667f76c5d9070d737b68e018e42ed75b09c6ba631, 2 x 125.5 DASH),
-reached the threshold only after the last superblock inside its window (2558864)
-had passed. Its window ends on 2026-11-04, before superblock 2575480, so it will
-never be paid. The new amount is its 251 DASH plus the 1 DASH collateral it burned.
-Votes do not carry over to the new hash.
+Votes do not carry over to a new proposal hash.
 
 ## Runtime transaction injection and the offline signer
 
@@ -119,18 +129,20 @@ not relay. The node never holds keys; transactions are signed on an offline mach
   finds a block. A coinbase input must be mature in the block being built.
 - **Examples on mainnet.** Block 2565253 carries a zero-fee consolidation of 189 outputs
   (539aa4b7aeceeb17c302cd51f402f3371f527ef73178466b5e3c2f80b9b40a28). Block 2565421
-  carries the collateral of the proposal above.
+  carries the collateral of c2pool-daemonless-delivered. Block 2577188 carries the
+  collateral of c2pool-daemonless-dash: zero fee, 242 inputs, spending every output
+  of the payment address that was mature when it was built, 1-duff outputs included.
 
 Tools in this repository, under `ui/c2wallet-qt/` (see its README):
 
 - **c2wallet-qt-signer**, the air-gapped signer. It is built with no network code, and
   a link guard checks this. It builds and signs zero-fee consolidations and governance
-  collaterals (PageDashInject) and exports the signed hex. A Sign / Verify Message page
-  at Dash Core parity is in review (#2127).
+  collaterals (PageDashInject) and exports the signed hex. It also has a Sign / Verify
+  Message page at Dash Core parity (#2127).
 - **The inject scheduler** in the key-free companion. It queues signed transactions and
   submits them when their inputs mature, at a height or time, or after a parent
-  transaction is ChainLocked. The core is merged (#2120). The headless daemon
-  `c2wallet-qt-schedd` is in review (#2123).
+  transaction is ChainLocked. The core (#2120) and the headless daemon
+  `c2wallet-qt-schedd` (#2123) are merged.
 
 ## Daemonless BIP-110
 
@@ -178,7 +190,7 @@ c2pool builds one binary per **parent chain** (`c2pool-<coin>`). Several parents
 | **DigiByte** (DGB) | Scrypt¹ | DOGE (embedded, `-DAUX_DOGE`) | Live, daemonless (`c2pool-dgb --run --coin-p2p-discover`; dgb.voidbind.com) — mainnet only, no testnet mode |
 | **Bitcoin Cash** (BCH) | SHA256d | — | Live, daemonless (`c2pool-bch --pool`; bch.voidbind.com) |
 | **BIP-110** (Knots BLAKE2b fork) | BLAKE2b² (SHA256d until height 961640) | — | **Experimental** (new fork; daemonless embedded; live on bip110.voidbind.com) — `c2pool-bip110 --run` |
-| **Monero** (XMR) | RandomX | none | **Experimental**, stagenet only (v37 lane; daemonless, several nodes, one owed ledger; `c2pool-v37-xmr`); mainnet fenced, see [docs/xmr-lane](docs/xmr-lane/README.md) |
+| **Monero** (XMR) | RandomX | none | **Experimental** (v37 lane, Path B payouts; `c2pool-v37-xmr`, can run daemonless; not built by the release workflow): regtest, stagenet and testnet run a pool; mainnet runs only `--follow-only` and needs `--i-understand-mainnet` even for that; see [docs/xmr-lane](docs/xmr-lane/README.md) |
 
 "Live" means a public voidbind node runs that per-coin binary with no coin
 daemon on the serve path. It is not a production-maturity claim: only the LTC
@@ -217,60 +229,63 @@ and does not yet exist, so the work can be judged on what it actually is.
   which does **not** touch the v37 consensus digest. Merged: the lane foundation
   (scaffold + vendored RandomX + X0 — PR #1500), buildable KAT-tested primitives
   (RandomX CI-gated — PR #1502), the monerod adapter + descriptor-finalize + receipt
-  envelope (PR #1503), and stratum + FCMP-fenced coinbase-settlement + carrier wire
-  (PR #1507). Goldens, real-RandomX verify, and the end-to-end KAT are **merged**
-  (PR #1512); a **single-node stagenet daemon is live** (monerod-bound, PRs
-  #1520 / #1529). Multi-node settlement commits one owed ledger (`owed_digest`)
-  with an on-chain credit cut (PRs #1697 / #1704); the earlier section-13
-  state-root draft (PR #1551) was closed in its favour. Every node recomputes the
-  lane coinbase and books a block that does not match as debit-only (PR #1884);
-  every consensus parameter is part of the pool identity (PR #1894); and old
-  balances drain from a capped slice of each block (PR #1895).
-  Since 2026-09-27 the lane also has: an installable node package with a
-  run-a-node guide (PR #1817, [docs/xmr-lane/RUN-A-NODE.md](docs/xmr-lane/RUN-A-NODE.md));
-  raindrops (sub-threshold work credited like shares) on by default (PR #1818); a built-in mainnet
-  bootstrap list, peer discovery and a persistent peer book (PRs #1819 / #1820);
-  repair below the vault horizon that survives restarts (PR #1824); a verify worker
-  pool for raindrops (PR #1839); a refusal of node-local settings that would split
-  the owed ledger on mainnet (PR #1872); and the node's fees disclosed in every
-  stratum login reply (PR #1880). The payout rules, fees and known limits are
-  written up in [docs/xmr-lane/payout-fairness.md](docs/xmr-lane/payout-fairness.md)
-  (PR #1879), and a public comparison with other decentralized pools is in
-  [docs/xmr-lane/comparison.md](docs/xmr-lane/comparison.md) (PR #1901).
-- **Rule upgrades without stopping the pool, voted by miners' work (designed, not
-  implemented).** Rule epochs are appended to the lane's history and activate by a
-  vote weighted by miners' finalized work. Each miner's work votes; by default the
-  vote is delegated to the node operator, and any miner can override it with one
-  word in a stock xmrig password. Old nodes hold instead of forking, and a fixed
-  constitution means earned balances cannot be reduced, delayed or redirected by
-  any vote. Today a rule change on the XMR lane is still a new pool genesis. The
-  design note is in PR #1908 (draft). The first slice, which fixes the pool identity
-  from a derived genesis and adds the epoch and vote sections to the wire and the
-  store, is in PR #1911 (draft). It is meant to be the last flag day before the
-  Monero mainnet genesis.
+  envelope (PR #1503), and stratum + carrier wire (PR #1507). Goldens,
+  real-RandomX verify, and the end-to-end KAT are **merged** (PR #1512).
+  Since the Path B flag day (PR #2010) the lane has one payout model, Path B: Work
+  Receipt Settlement (WRS), also called pay per receipt (PPR). There is no owed
+  ledger, no carried balance and no payout queue; each pool block's coinbase pays
+  that block's full reward to the Work Receipts in its window. The node is
+  `c2pool-v37-xmr` (`src/c2pool/v37/xmr/`, PRs #1992 / #2010), and several nodes
+  can run one pool together. The lane also has a node package with a run-a-node
+  guide (PR #1817, [docs/xmr-lane/RUN-A-NODE.md](docs/xmr-lane/RUN-A-NODE.md)),
+  peer discovery and a persistent peer book (PR #1820), and the node's fees
+  disclosed in every stratum login reply (PR #1880). The earlier owed-ledger
+  model and its rules (PRs #1697 / #1704, #1872, #1884, #1894, #1895) are retired
+  on this lane. Its payout rules and a public comparison with other decentralized
+  pools are in [docs/xmr-lane/payout-fairness.md](docs/xmr-lane/payout-fairness.md)
+  (PR #1879) and [docs/xmr-lane/comparison.md](docs/xmr-lane/comparison.md) (PR
+  #1901), both written for the earlier owed-ledger model.
+- **Rule upgrades (XMR lane).** Rule upgrades are voted by miners' work (PR
+  #1962, wired at PR #2010): a node operator can set `--vote no`; a miner can set
+  `vote=<n>` as the password in a stock xmrig. Every build today compiles only
+  the first epoch. The pool identity does not change with the rules.
 - **Reference prototypes** under `proto/` (TLA⁺, MRR refimpl + goldens, the M4 sync
   feasibility harness, testbeds) and the v37 design-track spec/headers under
   `src/sharechain/v37/`. These are for study and reproduction, not deployment.
+- **Machine-checked proofs for the XMR lane's payout split (Path B), in
+  progress.** The payout arithmetic is being written as a Lean 4 model, with
+  theorems to be proved that every paying block's outputs sum to exactly the
+  block reward, that a larger contribution never lowers that payee's output
+  within the window, and that the order in which work arrives does not change
+  the outputs, plus theorems about the arithmetic's integer widths and division
+  by zero. The statements are fixed and locked with the maintainer's signature,
+  so the proofs cannot weaken them, and each proof will be re-checked by several
+  independent proof kernels in an isolated gate. A differential fuzzer will run
+  the model against the production C++. This will prove the *model*; the C++ is
+  tied to it by fuzzing, not by proof. The Lean project will live under
+  `proto/lean/`, next to the TLA⁺ specs.
 - The production multi-coin pool code (v36 line) that c2pool actually runs.
 
 ### What does NOT yet exist — the honest gaps
 - **Not wired into a production node.** Outside the XMR lane, the v37 engine is a
   **reference/prototype behind CI** and nothing settles on a live network. The
-  XMR lane settles on Monero stagenet in the author's multi-node test runs; it is
+  XMR lane's node can run a pool on Monero regtest, stagenet and testnet; it is
   not in production anywhere.
-- **No public v37 network.** The XMR lane runs on Monero stagenet in test runs;
-  the other lanes exercise **simnet / loopback only**.
+- **No public v37 network.** The XMR lane's pool mode is for Monero's test
+  networks only; the other lanes exercise **simnet / loopback only**.
 - **No performance benchmark.** The only performance artifact is a Python
   *feasibility* harness (M4). There is **no benchmark of the real engine**;
   throughput, latency, and scaling claims are **unproven** until one exists.
-- **XMR lane is stagenet only.** Its RandomX verify runs CI-gated in light mode;
-  the XMR PayoutDescriptor kind-bytes (0x10 / 0x11) are activated add-only (PR
-  #1518). Three daemonless nodes have run together on stagenet in day-long
-  capstone tests (PRs #1697 / #1704 / #1857); no multi-node run has yet met the
-  full capstone bar. Attempt 9 started on 2026-10-03 at 09:36 UTC (24 hours).
-  Mainnet stays double-fenced. Funding for the mainnet milestone is requested in
-  Monero CCS proposal !699 (25 XMR), which is on the agenda of the Monero community
-  workgroup meeting of 2026-10-03.
+- **XMR lane has no mainnet pool mode.** Its RandomX verify runs CI-gated in
+  light mode; the XMR PayoutDescriptor kind-bytes (0x10 / 0x11) are activated
+  add-only (PR #1518). On mainnet the node runs only `--follow-only`, and needs
+  `--i-understand-mainnet` even for that. Mainnet pool mode is disabled in code.
+  Open items before mainnet are tracked privately; mainnet pool mode stays off
+  until they close and an independent review and a multi-node stagenet soak
+  pass.
+- **Monero CCS:** the funding proposal (MR !699) was withdrawn by its author on
+  2026-10-04 while the payout model is replaced by Work Receipts (Path B). No
+  funding application is open.
 - **No token, no production deployments.** There is no v37 token, and nothing v37 is
   deployed in production.
 - **Formal ≠ empirical.** Model-checking bounds behavior over small configurations;
@@ -295,15 +310,13 @@ and does not yet exist, so the work can be judged on what it actually is.
   clean script becomes the default at the v37 boundary.
 
 ### v36 ratchet complete — the last generation shared with Python p2pool
-- **The LTC line has ratcheted to V36.** As of August 2026 the live Litecoin
-  sharechain signals **100% V36** across the sampling window, and c2pool nodes
-  produce and validate **V36 PPLNS** shares on the shared LTC+DOGE chain alongside
-  the remaining Python `p2pool` v36 nodes. V36 is now the operating generation, not
-  a transition target.
+- **The LTC line ratcheted to V36.** Since 2026-11-13 00:00:00 UTC
+  the LTC share chain runs share version 3601 (the V36 share format under share
+  type 3601). Only c2pool v0.2.12.1 and later are on it; Python `p2pool` nodes are
+  not.
 - **V36 is the end of the line for the Python implementation.** The Python `p2pool`
-  is maintained only for the V36 sharechain it already interoperates with; no
-  further Python protocol development is planned. V36 is the **final share format
-  shared between the Python codebase and c2pool (C++).**
+  is no longer maintained. V36 is the **final share format shared between the
+  Python codebase and c2pool (C++).**
 - **v37 is C++ only.** The next generation — **Work Receipts** and the **MRR
   Roundabout** settlement/lanes core — is being built exclusively in c2pool. There
   is no Python v37, and the v37 sharechain does not interoperate with Python
@@ -314,7 +327,7 @@ and does not yet exist, so the work can be judged on what it actually is.
 - The v37 research line is merged to `master` (PR #809, "V37 dev"), and the v37
   engine consumer tree (`src/c2pool/v37/`, W1 to W6) and the isolated XMR Family-B lane
   (`src/impl/xmr/`) now build behind CI on both build legs. The checks required
-  before a merge to `master` are `attribution-gate`, the DASH gates G1 and G3a,
+  before a merge to `master` are `attribution-gate`, `canon-check`, the DASH gates G1 and G3a,
   the BCH gates G3a and G3b, `PR path filter`, `PR platform coverage status` and
   `Test allowlist drift-guard`. The coin matrix (DASH / LTC / BCH / DGB / DOGE),
   the Linux x86_64 and ASan/UBSan legs and the other CI lanes are not required
@@ -337,6 +350,8 @@ c2pool is an independent C++ implementation of the P2Pool sharechain concept ori
 
 Development is supported by Anthropic's [Claude for Open Source](https://claude.com/contact-sales/claude-for-oss) program (2026). The design, the consensus rules, and responsibility for every byte shipped remain with the maintainers.
 
+> **Two Dash blocks in a row from the daemonless pool, again** (2026-11-23 02:37:02 and 02:37:35 UTC) — [#2576844](https://blockchair.com/dash/block/2576844) and [#2576845](https://blockchair.com/dash/block/2576845), 33 seconds apart. Both were built from embedded coin-state with no Dash Core node on the serve path, and both are confirmed.
+>
 > **Two Dash blocks in a row from the daemonless pool** (2026-11-15 03:40:39 and 03:42:26 UTC) — [#2572489](https://blockchair.com/dash/block/2572489) and [#2572490](https://blockchair.com/dash/block/2572490), 107 seconds apart. Both were built from embedded coin-state with no Dash Core node on the serve path, and both are confirmed.
 >
 > **First LTC + DOGE twin block found by c2pool in production** (2026-11-12 15:46:10 UTC) LTC [#3211872](https://blockchair.com/litecoin/block/3211872) + DOGE [#6454700](https://blockchair.com/dogecoin/block/6454700) — one proof of work, 6.256 LTC + 10,001 DOGE, found by a public V36 pool node (about 210 GH/s) eleven hours after it moved from Python p2pool to c2pool v0.2.12.2.
@@ -353,9 +368,9 @@ Development is supported by Anthropic's [Claude for Open Source](https://claude.
 >
 > **Sharechain Transparency Explorer** (2026-04-07) — defragmenter-style sharechain visualization with interactive PPLNS treemaps, animated hover effects, per-miner LTC+DOGE payout breakdown, V36 upgrade pressure for V35 miners
 > 
-> **Recent Bitcoin Block Mined by P2pool** (2026-06-27 05:34:44 UTC) BTC [#955609](https://blockchair.com/bitcoin/block/955609)
+> **Bitcoin block mined by P2Pool** (2026-06-27 05:34:44 UTC) BTC [#955609](https://blockchair.com/bitcoin/block/955609)
 > 
-> **Recent Bitcoin Block Mined by P2pool** (2025-03-07 06:08:22 UTC) BTC [#886688](https://blockchair.com/bitcoin/block/886688)
+> **Bitcoin block mined by P2Pool** (2025-03-07 06:08:22 UTC) BTC [#886688](https://blockchair.com/bitcoin/block/886688)
 >
 > **First DASH block, c2pool** (2026-07-20 01:15:15 UTC) DASH [#2507753](https://blockchair.com/dash/block/2507753) — a solo X11 block. The DIP4 coinbase pays the masternode the network requires at that height, and dashd accepted it. The payee is checked against the template before the block is broadcast; work built on a stale template is discarded, not mined.
 >
@@ -368,8 +383,7 @@ Development is supported by Anthropic's [Claude for Open Source](https://claude.
 | OS | Version | Compiler | Boost | Arch | Status |
 |----|---------|----------|-------|------|--------|
 | Ubuntu | 24.04.4 LTS | GCC 13.3 | 1.90 (Conan) | x86_64 | Working |
-| macOS | 26.3.1 (Tahoe) | Apple Clang 21.0 | 1.90 (Homebrew) | x86_64 Intel | Working |
-| macOS | 26.3.1 (Tahoe) | Apple Clang 21.0 | 1.90 (Homebrew) | arm64 (M-series) | Working |
+| macOS | 26.6 (Tahoe) | Apple Clang 21.0 | 1.90 (Conan) | arm64; x86_64 cross-compiled, run under Rosetta 2 | Working |
 | Windows | 11 (26100) | MSVC 2022 | 1.90 (Conan) | x86_64 | Working |
 
 ---
@@ -380,8 +394,8 @@ Pre-built binaries are available on the [Releases page](https://github.com/frstr
 
 | Platform | Package | Notes |
 |----------|---------|-------|
-| Linux x86_64 | `.tar.gz` | Extract and run `./start.sh` |
-| macOS (universal) | `.dmg` or `.zip` | One universal binary for Apple Silicon and Intel Macs; no Homebrew needed |
+| Linux x86_64 | `.tar.gz` | Extract and run `./c2pool-<coin>` (or `./start.sh`) |
+| macOS (universal) | `.dmg` or `.zip` | One universal binary for Apple Silicon and Intel Macs; requires macOS 26.0 or later; no Homebrew needed |
 | Windows x86_64 | `.zip` or `setup.exe` | Installer bundles VC++ Runtime + firewall rules |
 
 macOS packages are built on an Apple Silicon build host. The arm64 slice is a
@@ -395,7 +409,7 @@ x86_64 slice. Details: [docs/ci-macos.md](docs/ci-macos.md).
 Each release includes a `SHA256SUMS` file, and recent releases also include a
 detached signature `SHA256SUMS.asc` (from v0.2.7; added to v0.2.8 on 2026-10-03).
 Check the signature with the maintainer key published at
-<https://github.com/frstrtr.gpg> (key `50AB1379285EFE76`):
+<https://github.com/frstrtr.gpg> (key fingerprint `99556F8DE6AD66057A1A10EC50AB1379285EFE76`):
 
 ```bash
 curl -s https://github.com/frstrtr.gpg | gpg --import
@@ -406,7 +420,7 @@ Then verify the files:
 
 ```bash
 # Linux / macOS
-sha256sum -c SHA256SUMS
+sha256sum -c --ignore-missing SHA256SUMS
 
 # Windows (PowerShell)
 Get-FileHash c2pool-*-setup.exe -Algorithm SHA256
@@ -417,7 +431,7 @@ Get-FileHash c2pool-*-setup.exe -Algorithm SHA256
 
 All release binaries are built from the tagged git commit. To verify a binary matches the source:
 
-1. Check the git tag: `git log v0.2.0 --oneline -1`
+1. Check the git tag: `git log <tag> --oneline -1` (for example `v0.2.12.12.2`)
 2. Build from that tag following the platform-specific guide
 3. Compare the SHA256 of your binary with the release `SHA256SUMS`
 
@@ -437,7 +451,7 @@ export PATH="$PATH:$HOME/.local/bin"   # so `conan` is on PATH (add to ~/.bashrc
 conan profile detect --force
 
 git clone https://github.com/frstrtr/c2pool.git
-cd c2pool && git checkout v0.2.12.7   # or the newest tag on the Releases page; omit to build master
+cd c2pool && git checkout v0.2.12.12.2   # or the newest tag on the Releases page; omit to build master
 mkdir build && cd build
 conan install .. --build=missing --output-folder=. --settings=build_type=Release
 cmake .. -DCMAKE_TOOLCHAIN_FILE=conan_toolchain.cmake -DCMAKE_BUILD_TYPE=Release
@@ -553,7 +567,7 @@ c2pool has four operating modes. The default is a full P2P pool — no flags req
 | **Custodial** | `--custodial` | no | 100% to `--address` | Hosted pool, off-chain accounting |
 | **Sharechain** | `--sharechain` | yes | *(no mining)* | P2P relay node only |
 
-> **`--solo` and `--custodial` are disabled in this release:** c2pool-ltc
+> **`--solo` and `--custodial` are disabled (since v0.2.11.1):** c2pool-ltc
 > refuses to start in them. Their coinbase has no room for the miners'
 > extranonce, so every block they found was invalid while the shares were
 > accepted. Use the integrated (default) mode.
@@ -694,7 +708,7 @@ digest `a2fbc0b51258f8cf479a3035887c6927ae6e3c425f1b3eabdd16f212b6c9a6fc`.
 ./c2pool --address YOUR_LTC_ADDRESS --fee 1
 
 # Solo pool for own miners (no sharechain, proportional payouts)
-# (disabled in this release: c2pool-ltc refuses to start, see above)
+# (disabled since v0.2.11.1: c2pool-ltc refuses to start, see above)
 ./c2pool --solo
 
 # Custodial pool (all coinbase to operator, stratum for accounting)
@@ -752,6 +766,48 @@ node operator's fee destination and fallback when no miners are connected.
 In **custodial** mode, miner stratum usernames are used for accounting only
 and never appear in coinbase outputs. The backoffice polls `/stratum_stats`
 for per-worker hashrate, accepted shares, and connection time.
+
+### Stratum difficulty (`+N`, `d=N`, `mining.suggest_difficulty`)
+
+Every connection has its own pseudoshare difficulty (vardiff). It starts at
+the vardiff floor and moves toward one pseudoshare every target time (3 s;
+10 s on `c2pool-dash`). A miner can set it in three ways. They use two
+different units:
+
+- **Internal units**: the node's difficulty, as python p2pool reads
+  `ADDRESS+N`. Logins carried over from p2pool keep their meaning.
+- **Wire units**: the number the miner sees in `mining.set_difficulty`.
+  On scrypt coins (`c2pool-ltc`, `c2pool-dgb`) wire = 65536 × internal,
+  p2pool's `DUMB_SCRYPT_DIFF`. On `c2pool-btc` (SHA256d) and `c2pool-dash`
+  (X11) the two are the same.
+
+| Where | Units | Example | Effect |
+|-------|-------|---------|--------|
+| Username suffix `+N` | internal | `ADDRESS+1`, `ADDRESS.rig+1` | Fixed difficulty N for the connection; vardiff is off. `c2pool-dash` rounds N down to a power of two, as its vardiff does. |
+| Password `d=N` | wire | `d=65536`, `x,d=65536`, `d=65536;x` | Start difficulty N; vardiff continues from it. |
+| `mining.suggest_difficulty` | wire | `[65536]` | Sets the difficulty when it arrives; vardiff continues from it. |
+
+On a scrypt coin, `ADDRESS+1` and `d=65536` both send the miner
+`mining.set_difficulty` 65536. The difference is that `+1` stays fixed,
+while `d=65536` is where vardiff starts. On BTC or DASH, `ADDRESS+4096` and
+`d=4096` both send 4096.
+
+- `+N` wins. With it, `d=N` and `mining.suggest_difficulty` are ignored.
+- Without `+N`, `d=N` and `mining.suggest_difficulty` each set the
+  difficulty when they arrive, and the later one wins. `d=N` is read once
+  per connection, at the first successful `mining.authorize`. In the
+  password it can be the whole value or one `key=value` token separated by
+  `,` or `;`.
+- A value that is not a positive finite number is ignored, and the node logs
+  it once per connection.
+
+Each value, whether a miner set it or vardiff computed it, stays within the
+vardiff floor and ceiling (`--stratum-min-diff` / `--stratum-max-diff` on
+`c2pool-ltc`). It also never goes above the pool-share difficulty of the job,
+as in p2pool. So a hash that would make a sharechain share is always worth
+submitting, and a miner never withholds one. The node sends
+`mining.set_difficulty` before any job whose difficulty differs from the
+last one it sent.
 
 ---
 
@@ -937,8 +993,9 @@ upgraded-hash-power gate (the V35 → V36 switch keeps it). What 3601 changes:
   c2pool before v0.2.12) is disconnected and refused, without a ban: it cannot
   load a 3601 share and its own V36 shares are invalid from then on. Such a
   node logs "version unsupported" for the 3601 shares it is sent before the
-  disconnect and is left on a sharechain of its own: **upgrade every node to
-  c2pool v0.2.12.1 before the flag day**. p2pool is not supported from then on.
+  disconnect and is left on a sharechain of its own. A node older than c2pool
+  v0.2.12.1 is no longer on the LTC share chain: **upgrade it to the latest
+  release**. p2pool is not supported.
   Our log says "peer ... is too old for share version 3601 ...: peer too old,
   upgrade to c2pool v0.2.12".
 
@@ -951,7 +1008,7 @@ mainnet node always uses the compiled one.
 With one merged chain configured (DOGE alone, the default) every login is
 resolved as before (except an address that is not an address at all, now
 ignored as p2pool does). With two or more (e.g. DOGE + PEP), where the server
-before this release gave an address to one chain by guessing, it is now
+before v0.2.12 gave an address to one chain by guessing, it is now
 ignored with a warning and the chains get the LTC address's key (as in case 1):
 
 - a second address of a version two configured chains share: a P2SH `9.../A...`
@@ -979,8 +1036,44 @@ the DGB pool. See [c2pool-dgb](#c2pool-dgb--digibyte-scrypt) below.
 | Port | Purpose |
 |------|---------|
 | 9326 | P2Pool sharechain (peer-to-peer) |
-| 9327 | Stratum mining |
+| 9327 | Stratum mining (with `--stratum-http` on, also the read-only REST API; see below) |
 | 8080 | Web dashboard + REST API |
+
+**The REST API on the stratum port.** python p2pool served its web API on
+the worker port, and p2pool-aware trackers (miningpoolstats and others) poll
+`http://host:9327/global_stats`. When `--stratum-http` is on, c2pool answers
+such a request on the stratum port too: the stratum server looks at the first
+line of a connection, and an
+HTTP request line hands the connection to the web server's own request
+handler. Same routes and JSON as the web port, but strictly read-only: GET and
+HEAD only (other methods get 405), every local-only, token-gated or
+state-changing route (`/control/*`, `/web/log`, `/logs/export`,
+`/api/config*`, `/api/admin/*`, ...) answers 403 there whatever the client's
+address or `?token=`, the event stream answers 405, and the connection closes
+after one response. Stratum lines are served exactly as before. An HTTP
+connection is not a miner session, but it counts toward
+`--max-stratum-connections` and the per-IP cap while open. At the stratum
+handshake deadline the stratum side shuts the connection down and nothing more
+is read or written; the slot is released when the HTTP side closes it. The
+response write is closed at write start + the web idle timeout (30 s by
+default; 30 s when that timeout is 0) if that comes first. At most
+`--stratum-http-budget` (default 16, and at most
+`--max-stratum-connections` minus 1) HTTP requests are in progress on the
+stratum port at once, at most `--stratum-http-per-ip` (default 6) from one
+address (one /64 for IPv6); the others are answered 503 and close at once.
+`--stratum-http-budget 0` answers every HTTP request on the stratum port with
+503; `--stratum-http-per-ip 0` sets no limit below the budget.
+`--stratum-http=true|false|auto` (settings key `stratum.http`, same values;
+also on/off/yes/no/1/0), default `false`; `auto`: on when the web server binds `::`,
+binds `0.0.0.0` and the stratum listener an IPv4 address, or binds the stratum
+listener's own non-loopback address; off when it binds `127.0.0.1` / `::1`
+behind a reverse proxy, binds one LAN or VPN address while the stratum port
+binds wider, binds `0.0.0.0` while the stratum port binds IPv6, or is disabled.
+`auto` cannot see a firewall, a cloud security group or a container that
+publishes only the stratum port: if the web port is closed that way, do not
+use `auto`; keep `--stratum-http=false` (the default). The startup log says which:
+`stratum HTTP: ON (web bound to 0.0.0.0)` or
+`stratum HTTP: OFF (web bound to 10.8.0.1, stratum to 0.0.0.0)`.
 
 Per-coin binaries use their own defaults. For DASH: sharechain 8999 on the v16
 network and **8998** on the v36 network (`--net dash-v36`); a private
@@ -1078,6 +1171,9 @@ legacy YAML key set.
 | `-w` / `--worker-port` | `stratum_port` | 9327 | Stratum mining port |
 | `--web-port` | `web_port` | 8080 | HTTP API / dashboard port |
 | `--http-host` | `http_host` | 0.0.0.0 | HTTP bind address |
+| `--stratum-http[=true\|false\|auto]` | `stratum_http` | false | Also answer the read-only REST API on the stratum port (python p2pool parity); auto = on when the HTTP bind address is not loopback (the LTC stratum port binds the same address) |
+| `--stratum-http-budget N` | `stratum_http_budget` | 16 | HTTP requests in progress on the stratum port at once, at most N and at most max_stratum_connections - 1; others are answered 503 (0 = every HTTP request on the stratum port is answered 503) |
+| `--stratum-http-per-ip N` | `stratum_http_per_ip` | 6 | HTTP requests in progress on the stratum port at once from one address, one /64 for IPv6: at most N; others are answered 503 (0 = no limit below `--stratum-http-budget`) |
 | `--coind-address` | `ltc_rpc_host` | 127.0.0.1 | Coin daemon RPC host |
 | `--coind-rpc-port` | `ltc_rpc_port` | auto | Coin daemon RPC port |
 | `--rpcuser` | `ltc_rpc_user` | -- | RPC username |
@@ -1088,6 +1184,8 @@ legacy YAML key set.
 | `--stratum-target-time` | `target_time` | 3.0 | Seconds between pseudoshares |
 | `--no-vardiff` | `vardiff_enabled` | true | Disable auto-difficulty |
 | `--max-coinbase-outputs` | `max_coinbase_outputs` | 4000 | Max coinbase outputs |
+| `--max-stratum-connections` | `max_stratum_connections` | 100 | Max concurrent miners on this node (0 = unlimited) |
+| `--max-stratum-connections-per-ip` | `max_stratum_connections_per_ip` | 0 | Max concurrent miners from one IP address (0 = unlimited). An IPv6 address counts by its /64, since one host can be handed a whole /64. Rigs behind one NAT share an address, so set it to at least the most rigs behind any one address. |
 | `--network-id` | `network_id` | 0 | Private chain identifier (hex) |
 | `--v3601-activation-time` | `sharechain.v3601_activation_time` | compiled | Share version 3601 flag day, unix time — testnet or a private `--network-id` chain only (see [Share version 3601](#share-version-3601-flag-day)) |
 | `--log-level` | `log_level` | trace | trace/debug/info/warning/error |
@@ -1096,7 +1194,7 @@ legacy YAML key set.
 | `--log-max-mb` | `log_max_total_mb` | 1000 | Total size cap across all rotated log files (MB) |
 | `--p2p-max-peers` | `p2p_max_peers` | 30 | Max total P2P peers |
 | `--ban-duration` | `ban_duration` | 300 | P2P ban duration (seconds) |
-| `--rss-limit-mb` | `rss_limit_mb` | 4000 | RSS memory abort limit (MB) |
+| `--rss-limit-mb` | `rss_limit_mb` | 5000 | RSS memory abort limit (MB) |
 | `--cors-origin` | `cors_origin` | -- | CORS Allow-Origin header |
 | `--payout-window` | `payout_window_seconds` | 86400 | PPLNS window (seconds) |
 | `--storage-save-interval` | `storage_save_interval` | 300 | Sharechain save interval |
@@ -1112,6 +1210,7 @@ legacy YAML key set.
 | `--coinbase-text` | `coinbase_text` | see below | Custom coinbase scriptSig text |
 | `--message-blob-hex` | -- | -- | V36 authority message blob |
 | `--doge-testnet4alpha` | `doge_testnet4alpha` | false | Use DOGE testnet4alpha |
+| `--import-found-blocks FILE` (repeatable, or `A,B`) | `import_found_blocks` (path or list) | -- | Restore the pool's found-block history from another node's `/recent_blocks` and `/recent_merged_blocks` (see [Restore found-block history](#restore-found-block-history)) |
 
 ---
 
@@ -1211,6 +1310,8 @@ Only the daemonless trust anchor applies to a daemonless node — see
 | `--listen [HOST:]PORT` | `0.0.0.0:8999` | Sharechain (pool P2P) bind. |
 | `--addnode H:P` (repeatable) | — | Persistent outbound sharechain peers. |
 | `--connect H:P` (repeatable) | — | Connect-only sharechain peers. |
+| `--net dash-v36` | off (v16 sharechain) | Join the DASH v36 network: share v36 only, P2P port 8998. Mainnet only; cannot be combined with `--network-id`, `--prefix` or `--testnet`. |
+| `--network-id HEX` [`--prefix HEX`] | the public p2pool-dash identity | Private sharechain identifier (hex, 1–8 bytes) and prefix. A custom id never dials public seeds and keeps its state in its own `<data-dir>` subdirectory; `--prefix` requires `--network-id`. |
 | `--no-p2p-relay` | off | Suppress the embedded won-block P2P relay (isolates the RPC submit arm). |
 | `--coin-p2p-connect H:P` (repeatable) | — | Pin explicit DASH coin-network peers (port 9999). |
 | `--coin-p2p-discover` | off | Seed-based (dnsseed.dash.org + fixed), scored, group-diverse coin-peer discovery — the network-standalone arm. Pinned peers are kept alongside. |
@@ -1263,6 +1364,11 @@ dashd-attached default OFF)
 | `--replay-fold-prestate FILE`, `--replay-fold-quorums`, `--replay-fold-qsnapshot FILE`, `--replay-fold-worklists FILE` | Anchor-seeded DML fold driven by the bulk lane, with derived quorum member sets. |
 | `--replay-mnlist-seed-height H --replay-mnlist-seed-source getmnlistdiff --replay-mnlist-seed-file FILE` | Optional V20 `getmnlistdiff` seed instead of deriving from DIP3 (implies `--replay-bulk`). |
 | `--replay-mined-commitment-index` | Mined-commitment store fed from replay. |
+| `--embedded-utxo-snapshot FILE` (alias `--utxo-snapshot`), `--embedded-utxo-snapshot-pin PINFILE` | Full UTXO set: import a pinned `dumptxoutset` into `<net>/utxo_full_leveldb` at start, then connect strictly from its base. |
+| `--embedded-utxo-full=false` | Open the accrual view instead of the full UTXO set. |
+| `--utxo-import FILE[,PART...]` [`--embedded-utxo-snapshot-pin PINFILE`] | Import into `<data-dir>/<net>/utxo_full_leveldb` and exit; the next start opens it. |
+| `--embedded-credit-pool-seed` | Seed the credit-pool follower from the v20 height over coin P2P. |
+| `--dash-v24-activation-height N` | Emergency pin of the Dash Core v24 activation height (a window boundary). It decides only where the versionbits/EHF tracker cannot, and the node fails closed where they disagree. |
 
 **Web, money, misc**
 
@@ -1271,6 +1377,9 @@ dashd-attached default OFF)
 | `--stratum [HOST:]PORT` | off | Miner-facing Stratum listener. |
 | `--web-port PORT` (alias `--http-port`) | 8080 | Dashboard + JSON API; `0` disables. If it collides with the Stratum port it moves to stratum+1. |
 | `--web-host ADDR` | `0.0.0.0` | Dashboard bind interface. |
+| `--stratum-http[=true\|false\|auto]` | false | Also answer the read-only JSON API on the Stratum port (python p2pool parity); auto = on when `--web-host` is `::`, is `0.0.0.0` with an IPv4 Stratum bind, or is the same non-loopback address as the Stratum bind. |
+| `--stratum-http-budget N` | 16 | HTTP requests in progress on the Stratum port at once, at most N and at most max_stratum_connections - 1; others are answered 503 (0 = every HTTP request on the Stratum port is answered 503). |
+| `--stratum-http-per-ip N` | 6 | HTTP requests in progress on the Stratum port at once from one address, one /64 for IPv6: at most N; others are answered 503 (0 = no limit below `--stratum-http-budget`). |
 | `--dashboard-dir PATH` | `web-static` | Static dashboard root. |
 | `--external-ip ADDR` (aliases `--stratum-advertise`, `--public-host`) | auto-detect | Miner-facing host shown in the dashboard Stratum URL (NAT). |
 | `--explorer` / `--no-explorer` | on | Loopback-only `/api/explorer` surface + raw-block retention. |
@@ -1280,6 +1389,11 @@ dashd-attached default OFF)
 | `--redistribute pplns\|fee\|boost\|donate` | `pplns` | Unnamed-share redistribution. |
 | `--coinbase-text TEXT` | `/P2Pool-DASH/c2pool/` | Coinbase scriptSig text, max 64 bytes (see [Coinbase structure](#coinbase-structure)). |
 | `--message-blob-hex HEX` (alias `--transition-message`) | — | Encrypted authority message blob. |
+| `--deferred-mint` / `--no-deferred-mint` | off | A share solved while the tracker is busy is minted at the next free lock instead of being declined. |
+| `--mempool-entry-probe` | off | Wire the direct-local `GET /mempool_entry?txid=` probe. |
+| `--allow-stub-bls` | off | Run a `bls=stub` build in a configuration that relies on BLS. Testing only, never in production (see the BLS section above). |
+
+Alert relay: see `c2pool-dash --help`.
 
 ### c2pool-btc — Bitcoin (SHA256d)
 
@@ -1318,7 +1432,8 @@ usage and exits 1.
 | `--merged SYMBOL:CHAIN_ID:HOST:PORT:USER:PASS[:P2P_PORT]` (repeatable) | — | Embedded merged-mined aux chain (NMC under BTC). |
 | `-f` / `--fee PCT` | 0 | Node-owner fee as a committed payout-identity substitution (not a separate output). Requires `--node-owner-address`. |
 | `--node-owner-address ADDR` | — | Fee destination (P2PKH/P2SH/P2WPKH). Undecodable → fee disabled. |
-| `--give-author PCT` (alias `--dev-donation`) | compiled-in `donation_u16 = 50` (the usage text labels it 0.5%) | Donation **amount** only; `0` allowed (dust-marker output still emitted). The donation script is never changed. |
+| `--give-author PCT` (alias `--dev-donation`) | 0.1 (`core::kAuthorFeeDefaultPct`) | Donation **amount** only; `0` allowed (dust-marker output still emitted). The donation script is never changed. |
+| `--import-found-blocks FILE` (repeatable, or `A,B`) | — | Restore the pool's found-block history from another node's `/recent_blocks` or a list of block hashes, each validated against the embedded BTC header chain; needs `--http` (see [Restore found-block history](#restore-found-block-history)). The ledger is kept across restarts in `<data-dir>/bitcoin/found_blocks_db` (`bitcoin_testnet`, `bitcoin_testnet4`, `bitcoin_regtest` on the test networks). |
 
 ### c2pool-dgb — DigiByte (Scrypt)
 
@@ -1429,6 +1544,101 @@ cd /opt/c2pool-bip110 && ./c2pool-bip110 --run --coin-p2p-discover \
 | `--node-owner-address ADDR` (alias `--donation`) | — | Node-owner fee destination and subsidy fallback when a miner's username has no resolvable address. |
 | `--give-author PCT` (alias `--dev-donation`) | 0.1 (catalog `money.give_author_pct`) | Author donation percent. |
 | `-f` / `--fee PCT` | 0 | Node-owner fee percent. |
+
+---
+
+## Restore found-block history
+
+A node's found-block ledger only holds the blocks the node saw itself, so a
+node that joined the pool late (or lost its `found_blocks_db`) shows a short
+Recent Blocks list, and its luck and effort start from there. The pool's
+history is on every other node. To bring it in (`c2pool-ltc`):
+
+```bash
+# 1. Take the history from any node of the pool (its dashboard / web URL):
+#    the LTC blocks, and the merged (DOGE) blocks.
+curl -s https://ltc.voidbind.com/recent_blocks -o blocks.json
+curl -s https://ltc.voidbind.com/recent_merged_blocks -o merged.json
+
+# 2. Start your node once with both files, imported in this order:
+./c2pool-ltc <your usual options> \
+    --import-found-blocks blocks.json --import-found-blocks merged.json
+```
+
+`--import-found-blocks` may be given more than once or as a comma list
+(`--import-found-blocks blocks.json,merged.json`); in the legacy YAML,
+`import_found_blocks: [blocks.json, merged.json]` or a single path. Any node of
+the pool will do: `http://<node>:<web-port>/recent_blocks` (8080 by default).
+Each file is checked when the options are read, at its canonical path (a
+symlink is followed to its target, which must be a regular file): a missing
+or unreadable file, a directory, a device or FIFO, a value that is another
+option (`--import-found-blocks --testnet`), a second file without its own
+flag, or a file above 64 MiB or 100,000 entries stops the node at once with
+an error (exit 1).
+
+The import runs at startup, after the embedded header chains are synced (it
+waits for the sync and says so in the log). Each file gets a summary line, then
+the run a total, counted per chain:
+
+```
+found-block import merged.json: 9 rows: imported 8 (DOGE 8), ..., rejected 1 (DOGE: below_header_chain=1); ...
+found-block import DONE (2 files): 15 rows: imported 12 (DOGE 8, LTC 4), ..., rejected 3 (DOGE: below_header_chain=1; LTC: not_on_chain=2); ...
+```
+
+It is safe to run again: a block the ledger already holds only gains the
+fields it lacks, nothing the node recorded itself is replaced. There is no HTTP
+write endpoint for this, on purpose.
+
+What gets in:
+
+- **Only blocks of their chain.** Each row's hash must be on the best chain of
+  the node's own header chain for that chain: LTC rows against the embedded LTC
+  header chain, merged (DOGE) rows from `/recent_merged_blocks` against the
+  embedded DOGE header chain. Height, time and difficulty are then taken from
+  that header (a wrong height in the file is repaired). A hash the chain does
+  not hold (`not_on_chain`), a side-branch block (`not_main_chain`), another
+  chain's row (`other_chain`), a duplicate and a malformed entry are refused
+  and counted against the chain they name. Blocks below a header chain's
+  starting checkpoint cannot be checked and are skipped as
+  `below_header_chain` of that chain: LTC below `--header-checkpoint` (by
+  default 3,088,000), DOGE below `--doge-header-checkpoint` (by default
+  6,160,000). Merged rows on a node without the embedded DOGE header chain are
+  `merged_unvalidated`.
+- **Pool blocks on the source's word.** Where the node still has the block's
+  body (the lite explorer's recent blocks) its coinbase must pay the p2pool
+  donation script (`not_pool_block` otherwise). For older blocks it cannot be
+  checked, and the row says where it came from: `"provenance": "imported"` on
+  `/recent_blocks` (and `found_locally: false`, `luck_method: "relayed"`).
+- **Luck and effort** count the imported rows like any other (`src/core/pool_luck.hpp`):
+  integrated over the node's own rate history where it covers a round,
+  otherwise a single sample at the pool rate the source recorded at find
+  (`pool_hashrate_at_find`). A rate that is not plausibly the pool's is not
+  stored, and that round reads `hashrate_unavailable` instead of an absurd
+  luck: below the share chain's floor for the winning share's difficulty,
+  below 1 % of the node's own rate history near the block (or of the median
+  of the file's rates where that history does not reach), or above the whole
+  network's rate.
+
+A plain list of block hashes (one per line, `#` comments allowed, or a JSON
+array of strings) works too; those rows carry no pool rate, so their rounds
+have no luck unless the node's own history covers them.
+
+`c2pool-btc` takes the same flag (no YAML key): each row is checked against
+the embedded BTC header chain under the `BTC` label, and there is no merged
+chain to import and no coinbase check. The ledger lives in the dashboard, so
+the node needs `--http`. For example, the pool's two BTC blocks as a hash list:
+
+```bash
+cat > btc-blocks.txt <<'LIST'
+# 886688 (2025-03-07), 955609 (2026-06-27)
+00000000000000000001822dc3db70b75d281687f8baa10d1818d0703f49fec0
+00000000000000000000c9f3c1b80c0f3fd57d18a8fc223cbec004f92b716fb7
+LIST
+./c2pool-btc <your usual options> --import-found-blocks btc-blocks.txt
+```
+
+The rows are then kept in `<data-dir>/bitcoin/found_blocks_db` like the
+node's own finds, so the flag is needed once.
 
 ---
 
@@ -1561,7 +1771,7 @@ See [util/README.md](util/README.md) for full documentation.
 
 The `--network-id` overrides the IDENTIFIER hashed into every share's
 verification hash. Nodes without the correct ID cannot forge valid shares.
-See [above](#configuration-reference) for details.
+See [above](#configuration-reference-ltc-binary) for details.
 
 ---
 
@@ -1589,10 +1799,11 @@ cd build && ctest --output-on-failure -j$(nproc)
 
 | Area | Status |
 |---|---|
-| V36 share format (LTC parent chain) | Released (v0.2.0); prod cutover gated on crossing soak |
+| V36 share format (LTC parent chain) | Production. Share version 3601 (V36 format) on mainnet since 2026-11-13 00:00:00 UTC (v0.2.12.1) |
 | V36 share format (DGB Scrypt parent chain) | Running — `c2pool-dgb` daemonless public node (dgb.voidbind.com), joined to the live DGB sharechain via `--sharechain-addnode` |
-| Daemonless per-coin nodes (BTC, BCH, DASH) | Running — public voidbind nodes with no coin daemon on the serve path |
-| Merged mining (DOGE, PEP, BELLS, LKY, JKC, SHIC) | Working |
+| Daemonless per-coin nodes (BTC, BCH) | Running — public voidbind nodes with no coin daemon on the serve path |
+| DASH (`c2pool-dash`) | Production on mainnet, daemonless by default (embedded coin state; `--coin-rpc` optional fallback) |
+| Merged mining | DOGE in production (embedded); PEP, LKY, SHIC through external daemons, not production-tested; BELLS, JKC (segwit) not supported yet |
 | Embedded LTC SPV node | Working |
 | Embedded DOGE SPV node | Working |
 | Embedded BIP-110 daemonless pool (BLAKE2b fork) | Experimental (live on bip110.voidbind.com; fork-follow + Stratum mining + reward-safe mempool-serving on `master` #1439) |
@@ -1601,14 +1812,14 @@ cd build && ctest --output-on-failure -j$(nproc)
 | VARDIFF | Working |
 | Payout / PPLNS | Working |
 | Authority message blobs (V36) | Working |
-| Solo / Custodial modes | Disabled in v0.2.11.1 and v0.2.12 (`c2pool-ltc` refuses to start: their blocks were invalid); fix pending |
-| Test suite | 1,875 test cases across 194 suites |
+| Solo / Custodial modes | Disabled since v0.2.11.1, still in v0.2.12.12.2 (`c2pool-ltc` refuses to start: their blocks were invalid); not yet fixed |
+| Test suite | About 6,500 test cases across about 970 suites |
 
 > **Need a pool running today?** Use the
 > [latest c2pool release](https://github.com/frstrtr/c2pool/releases/latest).
 > The Python [p2pool-merged-v36](https://github.com/frstrtr/p2pool-merged-v36)
-> is no longer maintained and falls off the LTC share chain at the share
-> version 3601 flag day.
+> is no longer maintained and has not been on the LTC share chain since the
+> share version 3601 flag day (2026-11-13 00:00:00 UTC).
 
 ---
 
@@ -1622,10 +1833,9 @@ cd build && ctest --output-on-failure -j$(nproc)
 ## V37 development
 
 - **V37 Purple Paper** (Work Receipts design): https://frstrtr.github.io/c2pool/purple-paper.html
-  Erratum E-1: section 9 says the coinbase pays owed amounts "largest first". The
-  code and the ratified rule pay **oldest first** (by when a balance became
-  eligible, ties broken by a salted hash no participant can choose). The corrected
-  text is in PR #1884 (repository copy) and PR #1881 (site).
+  Erratum E-1: section 9 said the coinbase pays owed amounts "largest first"; the
+  rule is **oldest first**. Corrected on the site (PR #1881) and in the repository
+  copy (PR #1884).
 - Dev chat (Telegram): https://t.me/c2pooldev
 - V37 dev-branch primitives (diff): https://github.com/frstrtr/c2pool/compare/master...v37-dev
 
@@ -1644,5 +1854,3 @@ cd build && ctest --output-on-failure -j$(nproc)
 - [Windows](doc/build-windows.md)
 
 See [deploy/DEPLOY.md](deploy/DEPLOY.md) for HiveOS/MinerStat/RaveOS setup.
-
-<!-- safe-cosmetic auto-merge dry-run 2026-06-06 -->

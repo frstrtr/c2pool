@@ -2182,6 +2182,97 @@ void smoke() {
     });
 }
 
+// ---------------------------------------------------------------------------
+// The coinbase-internal count: rows 10, 26 and 27 with NodeInternal; row 12 not
+// ---------------------------------------------------------------------------
+void coinbase_internal() {
+    run_part("coinbase-internal count", [] {
+        KatNet net;
+        KatNode n(net, kJ0);
+        const std::vector<pb::Hash32> chain = pipeline_chain(n, 60);
+        if (chain.empty()) return;  // the harness printed its FAIL line
+        const pb::Hash32 L = chain.back();  // position 60
+        const pb::Hash32 T = chain[58];     // position 59
+        const std::uint64_t hL = n.node(L).h;
+        const std::uint64_t hc = h_pos(61);
+        check(n.alarm.count() == 0 && pb::coinbase_internal_count(n.alarm) == 0, "coinbase-internal: 0 on the pipeline chain");
+        // window(tip, 16) with W + 1 in the cache: the coinbase row's node-internal outcome
+        const auto bad_window = [&](const pb::Hash32& tip) {
+            n.windows = pb::WindowCache{};
+            (void)n.windows.get(tip, 16, [&] {
+                pb::TipWindow w = pb::evaluate_window_at(n.store, tip, n.prev_of(tip), n.mon, 16, net.author_id);
+                pb::Window bad = *w.window;
+                bad.W += pb::Work(1);
+                w.window = std::make_shared<const pb::Window>(bad);
+                return w;
+            });
+        };
+        // row 10: the own body of a carrier on L
+        {
+            const pb::CarrierBodyV3 c = carrier_on(n, L, hc, {}, 1, 6000);
+            bad_window(L);
+            const std::uint64_t rx0 = n.rx_calls;
+            const pb::AdmitResult a = admit(n, c);
+            n.windows = pb::WindowCache{};
+            check(is(a, AdmitVerdict::Defer, RowId::R10) && a.missing == Missing::NodeInternal && a.alarm && a.strike == 0
+                          && n.rx_calls == rx0 && n.alarm.count_of(RowId::R10, Missing::NodeInternal) == 1
+                          && pb::coinbase_internal_count(n.alarm) == 1,
+                  "coinbase-internal: row 10 node-internal (the own body) -> 1 (" + desc(a) + ")");
+        }
+        // row 26: a pending receipt on L
+        {
+            const pb::ReceiptBodyV3 r = body_on(n, L, hL + 1, 18, 6010);
+            bad_window(L);
+            const pb::AdmitResult a = pb::admit_receipt(n.env(), bytes_of(r), pb::Role::Pending);
+            n.windows = pb::WindowCache{};
+            check(is(a, AdmitVerdict::Defer, RowId::R26) && a.missing == Missing::NodeInternal && a.alarm && a.strike == 0
+                          && n.alarm.count_of(RowId::R26, Missing::NodeInternal) == 1
+                          && pb::coinbase_internal_count(n.alarm) == 2,
+                  "coinbase-internal: row 26 node-internal (a pending receipt) -> 2 (" + desc(a) + ")");
+        }
+        // row 26: a carried body on T in a carrier on L
+        {
+            const pb::ReceiptBodyV3 r = body_on(n, T, n.node(T).h + 1, 19, 6020);
+            const pb::CarrierBodyV3 c = carrier_on(n, L, hc, {r}, 1, 6021);
+            bad_window(T);
+            const pb::AdmitResult a = admit(n, c);
+            n.windows = pb::WindowCache{};
+            check(is(a, AdmitVerdict::Defer, RowId::R26) && a.missing == Missing::NodeInternal && a.alarm && a.body == 1
+                          && n.alarm.count_of(RowId::R26, Missing::NodeInternal) == 2
+                          && pb::coinbase_internal_count(n.alarm) == 3,
+                  "coinbase-internal: row 26 node-internal (a carried body) -> 3 (" + desc(a) + ")");
+        }
+        // control: the row-12 events (RandomX false: BAN; the seed missing: DEFER) do not count
+        {
+            const std::uint64_t ci = pb::coinbase_internal_count(n.alarm);
+            const pb::CarrierBodyV3 c = carrier_on(n, L, hc, {}, 1, 6030);
+            n.bad_pow.insert(pb::receipt_id(c.own));
+            const pb::AdmitResult a = admit(n, c);
+            n.bad_pow.clear();
+            n.no_seed.insert(c.own.blob.prev_id);
+            const pb::AdmitResult b = admit(n, c);
+            n.no_seed.clear();
+            check(is(a, AdmitVerdict::Ban, RowId::R12) && is(b, AdmitVerdict::Defer, RowId::R12) && b.missing == Missing::Seed
+                          && pb::coinbase_internal_count(n.alarm) == ci,
+                  "coinbase-internal: the row-12 events (RandomX BAN, seed DEFER) do not count");
+        }
+        // the rows of the count on a sink: 10, 26, 27 with NodeInternal; row 12 and a claim alarm not
+        {
+            pb::AlarmSink s;
+            s.raise(RowId::R12, pb::Basis::Computed, pb::Hash32{}, Missing::NodeInternal);
+            check(s.count_of(RowId::R12, Missing::NodeInternal) == 1 && pb::coinbase_internal_count(s) == 0,
+                  "coinbase-internal: a row-12 node-internal alarm -> 0");
+            s.raise(RowId::R10, pb::Basis::Computed, pb::Hash32{}, Missing::NodeInternal);
+            s.raise(RowId::R26, pb::Basis::Computed, pb::Hash32{}, Missing::NodeInternal);
+            s.raise(RowId::R27, pb::Basis::Computed, pb::Hash32{}, Missing::NodeInternal);
+            s.raise(RowId::R10, pb::Basis::ClaimSpan, pb::Hash32{}, Missing::ClaimAlarm);
+            s.raise(RowId::R29, pb::Basis::Computed, pb::Hash32{}, Missing::NodeInternal);
+            check(s.count() == 6 && pb::coinbase_internal_count(s) == 3,
+                  "coinbase-internal: rows 10, 26, 27 node-internal -> 3; row 12, row 29, a claim alarm -> 0");
+        }
+    });
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -2200,5 +2291,6 @@ int main(int argc, char** argv) {
     run("p49", p49);
     run("rows_more", rows_more);
     run("deep_walk", deep_walk);
+    run("coinbase_internal", coinbase_internal);
     return finish("v37_xmr_pathb_admit_kat");
 }
