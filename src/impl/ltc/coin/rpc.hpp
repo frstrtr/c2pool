@@ -105,6 +105,9 @@ public:
 	nlohmann::json getblockheader(uint256 header, bool verbose = true);
 	// verbosity: 0 for hex-encoded data, 1 for a json object, and 2 for json object with transaction data
 	nlohmann::json getblock(uint256 blockhash, int verbosity = 1);
+	// The best chain: its height, and the block at a height (found-block verdicts in RPC mode).
+	nlohmann::json getblockcount();
+	nlohmann::json getblockhash(uint32_t height);
 	
 };
 

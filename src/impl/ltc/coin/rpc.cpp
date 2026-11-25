@@ -520,6 +520,16 @@ nlohmann::json NodeRPC::getblock(uint256 blockhash, int verbosity)
 	return CallAPIMethod("getblock", {blockhash, verbosity});
 }
 
+nlohmann::json NodeRPC::getblockcount()
+{
+	return CallAPIMethod("getblockcount");
+}
+
+nlohmann::json NodeRPC::getblockhash(uint32_t height)
+{
+	return CallAPIMethod("getblockhash", {height});
+}
+
 } // namespace coin
 
 
