@@ -192,9 +192,13 @@ print(f"L2PAY pre_switch={side['pre'][1]}/{side['pre'][0]} post_switch={side['po
 PY
 LACC=$(grep -c "submit_block_hex accepted" "$P/nodeA.log" "$P/nodeB.log" | awk -F: '{s+=$2}END{print s}')
 DACC=$(cat "$P"/node?.log | grep -c "\[MM:DOGE\] submitblock ACCEPTED")
-REJ=$(cat "$P"/node?.log | grep -ci "submit_block_hex.*reject\|submitblock REJECT")
+# LTC NodeRPC::submit_block_hex logs a daemon reject as "submit_block_hex result: <reason>"
+# (no "reject" word); submit_block logs "Block submittal result:"; the DOGE aux path logs
+# "] submitblock REJECTED by daemon:" or, on an RPC exception, "] submitblock failed:".
+REJ_RE="submit_block_hex result:|Block submittal result:|submit_block_hex.*reject|\] submitblock (REJECT|failed:)"
+REJ=$(cat "$P"/node?.log | grep -Eci "$REJ_RE")
 S1=$(grep L1SUM "$P/extract.txt")
-if [ "$LACC" -ge 1 ] && [ "$DACC" -ge 1 ] && [ "$REJ" -eq 0 ] && echo "$S1" | grep -q "populated=[1-9]" && echo "$S1" | grep -q "doge_auxpow=[1-9]" && echo "$S1" | grep -q "doge_populated=[1-9]"; then
+if [ "$LACC" -ge 1 ] && [ "$DACC" -ge 1 ] && [ "$REJ" -eq 0 ] && echo "$S1" | grep -Eq "(^| )populated=[1-9]" && echo "$S1" | grep -q "doge_auxpow=[1-9]" && echo "$S1" | grep -q "doge_populated=[1-9]"; then
   res "L1 PASS $S1 ltc_acc=$LACC doge_acc=$DACC rejects=$REJ"; else res "L1 FAIL $S1 ltc_acc=$LACC doge_acc=$DACC rejects=$REJ"; fi
 
 # ---------------------------------------------------------------- L2 verdict
