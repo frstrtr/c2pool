@@ -997,6 +997,7 @@ TEST(BtcCoinPeerPool, OnlyATipMovingBatchRanksAPeerForFailover)
     auto live = handshaked_peers(hx);
     FakePeer* a = live[0];
     FakePeer* b = live[1];
+    const std::string a_key = a->key;   // a is gone after the failover
     hx.advance(12);
     b->send_headers(make_chain(hx.root, 5, 71));   // moves the tip 100 -> 105
     hx.pool->tick();
@@ -1008,7 +1009,7 @@ TEST(BtcCoinPeerPool, OnlyATipMovingBatchRanksAPeerForFailover)
     hx.advance(kNoProgressFailoverSec - 12);
     hx.pool->tick();   // no progress since B's batch: a failover
     EXPECT_EQ(hx.reported_disconnected.size(), 1u);
-    EXPECT_EQ(hx.reported_disconnected.count(a->key), 1u);
+    EXPECT_EQ(hx.reported_disconnected.count(a_key), 1u);
 }
 
 // ── Transactions: fetched once, next announcer on a miss ───────────────────
