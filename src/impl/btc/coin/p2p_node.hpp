@@ -360,6 +360,9 @@ public:
     /// Peer metadata accessors
     uint32_t peer_version() const { return m_peer_version; }
     const std::string& peer_subver() const { return m_peer_subver; }
+    /// The address this connection dials (display: the dashboard's peer row).
+    std::string peer_address() const { return m_target_addr.to_string(); }
+    const NetService& peer_service() const { return m_target_addr; }
     uint32_t peer_start_height() const { return m_peer_start_height; }
     int64_t peer_uptime_sec() const {
         return std::chrono::duration_cast<std::chrono::seconds>(
