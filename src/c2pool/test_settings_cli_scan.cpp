@@ -172,6 +172,25 @@ int main() {
         CHECK(rc.get_string("stratum.http_budget").value_or("") == "7", name + " TLS flags consume one value each");
     }
 
+    // (9) The four TLS limit rows: each consumes its value on every binary
+    //     with a settings file.
+    for (const auto& [bin, coin, name] : std::vector<std::tuple<Bin, CoinBit, std::string>>{
+             {Bin::BIN_LTC, C_LTC, "ltc"}, {Bin::BIN_DASH, C_DASH, "dash"}, {Bin::BIN_BTC, C_BTC, "btc"},
+             {Bin::BIN_DGB, C_DGB, "dgb"}, {Bin::BIN_BCH, C_BCH, "bch"}}) {
+        std::vector<std::string> s = {"prog", "--stratum-tls-rate-per-ip", "2.5", "--stratum-tls-burst-per-ip", "40",
+                                      "--stratum-tls-handshakes", "64", "--stratum-tls-handshakes-per-ip", "16",
+                                      "--stratum-http-budget", "7"};
+        std::vector<char*> p; for (auto& x : s) p.push_back(const_cast<char*>(x.c_str()));
+        CliTracker tr; ResolvedConfig rc; rc.seed_compiled_defaults(coin);
+        scan_cli((int)p.size(), p.data(), bin, tr, rc);
+        CHECK(rc.get_string("stratum.tls_rate_per_ip").value_or("") == "2.5", name + " --stratum-tls-rate-per-ip");
+        CHECK(rc.get_string("stratum.tls_burst_per_ip").value_or("") == "40", name + " --stratum-tls-burst-per-ip");
+        CHECK(rc.get_string("stratum.tls_handshakes").value_or("") == "64", name + " --stratum-tls-handshakes");
+        CHECK(rc.get_string("stratum.tls_handshakes_per_ip").value_or("") == "16", name + " --stratum-tls-handshakes-per-ip");
+        CHECK(rc.source_of("stratum.tls_handshakes") == Source::Cli, name + " TLS limits source=cli");
+        CHECK(rc.get_string("stratum.http_budget").value_or("") == "7", name + " TLS limits consume one value each");
+    }
+
     if (g_fail == 0) std::cout << "\ntest_settings_cli_scan: ALL PASS\n";
     else std::cout << "\ntest_settings_cli_scan: " << g_fail << " FAILURE(S)\n";
     return g_fail == 0 ? 0 : 1;

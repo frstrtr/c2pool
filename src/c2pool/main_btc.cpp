@@ -170,6 +170,12 @@ static void print_usage()
         "                  --stratum-tls; re-read with the key when either file\n"
         "                  changes, and on SIGHUP.\n"
         "  --stratum-tls-key FILE  PEM private key for --stratum-tls (no passphrase).\n"
+        "  --stratum-tls-rate-per-ip R / --stratum-tls-burst-per-ip N  TLS accepts\n"
+        "                  a second from one address (IPv6: one /64) and how many\n"
+        "                  back to back (default 5 and 20; 0 = no limit).\n"
+        "  --stratum-tls-handshakes N / --stratum-tls-handshakes-per-ip N  TLS\n"
+        "                  handshakes in progress at once, in total and from one\n"
+        "                  address (default 32 and 8; 0 = no limit).\n"
         "  --sharechain-port P  bind the sharechain (pool P2P) listener on\n"
         "                  port P instead of the default 9333, so a SECOND\n"
         "                  isolated c2pool-btc instance can run on one host\n"
@@ -513,6 +519,15 @@ int main(int argc, char* argv[])
             core::stratum_tls_setting().cert = argv[++i];
         else if (arg == "--stratum-tls-key" && i + 1 < argc)
             core::stratum_tls_setting().key = argv[++i];
+        else if ((arg == "--stratum-tls-rate-per-ip" || arg == "--stratum-tls-burst-per-ip"
+                  || arg == "--stratum-tls-handshakes" || arg == "--stratum-tls-handshakes-per-ip")
+                 && i + 1 < argc) {
+            std::string err;
+            if (!core::parse_stratum_tls_limit_flag(arg, argv[++i], core::stratum_tls_setting(), err)) {
+                std::cerr << "c2pool-btc: " << err << "\n";
+                return 1;
+            }
+        }
         else
         {
             std::cerr << "unknown arg: " << arg << "\n";
@@ -567,12 +582,8 @@ int main(int argc, char* argv[])
         if (rc.file_set("stratum.http_per_ip"))   // --stratum-http-per-ip
             core::apply_stratum_http_count_setting("stratum.http_per_ip", rc.get_i64("stratum.http_per_ip"),
                                                    core::stratum_http_limits_setting().per_ip);
-        if (rc.file_set("stratum.tls_bind"))   // --stratum-tls
-            core::stratum_tls_setting().bind = rc.get_string("stratum.tls_bind").value_or("");
-        if (rc.file_set("stratum.tls_cert"))   // --stratum-tls-cert
-            core::stratum_tls_setting().cert = rc.get_string("stratum.tls_cert").value_or("");
-        if (rc.file_set("stratum.tls_key"))    // --stratum-tls-key
-            core::stratum_tls_setting().key = rc.get_string("stratum.tls_key").value_or("");
+        // --stratum-tls, -cert, -key and the four TLS limits (stratum.tls_*).
+        core::apply_stratum_tls_file_settings(rc, core::stratum_tls_setting());
         if (rc.file_set("stratum.bind"))      split_hostport(rc.get_string("stratum.bind").value_or(""), stratum_addr, stratum_port);
         if (rc.file_set("sharechain.listen")) { std::string hh; split_hostport(rc.get_string("sharechain.listen").value_or(""), hh, sharechain_port); }
         if (rc.file_set("daemon_rpc.endpoint")) split_hostport(rc.get_string("daemon_rpc.endpoint").value_or(""), bitcoind_host, bitcoind_port);

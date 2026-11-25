@@ -638,6 +638,8 @@ void print_banner(const char* argv0)
         << "           [--stratum-http[=true|false|auto]]\n"
         << "           [--stratum-http-budget N] [--stratum-http-per-ip N]\n"
         << "           [--stratum-tls [HOST:]PORT --stratum-tls-cert FILE --stratum-tls-key FILE]\n"
+        << "           [--stratum-tls-rate-per-ip R] [--stratum-tls-burst-per-ip N]\n"
+        << "           [--stratum-tls-handshakes N] [--stratum-tls-handshakes-per-ip N]\n"
         << "           [--external-ip ADDR]\n"
         << "           [--header-dgw-log-only]  (log, do not refuse, a header off its DGW bits)\n"
         << "           [--embedded-utxo[=false]] [--embedded-mainnet[=false]] [--embedded-null-arm[=false]]\n"
@@ -843,6 +845,11 @@ void print_banner(const char* argv0)
         << "        certificates. Needs --stratum-tls-cert FILE (PEM chain, leaf\n"
         << "        first) and --stratum-tls-key FILE (PEM, no passphrase); both are\n"
         << "        re-read when either changes and on SIGHUP (default: off).\n"
+        << "        --stratum-tls-rate-per-ip R / --stratum-tls-burst-per-ip N: TLS\n"
+        << "        accepts a second from one address (IPv6: one /64) and how many\n"
+        << "        back to back (default 5 and 20); --stratum-tls-handshakes N /\n"
+        << "        --stratum-tls-handshakes-per-ip N: TLS handshakes in progress at\n"
+        << "        once, in total and from one address (default 32 and 8); 0 = no limit.\n"
         << "        --embedded-oracle-shadow runs the OBSERVE-only per-block dashd\n"
         << "        cross-check: dashd getblocktemplate{mode:proposal} is the VERDICT,\n"
         << "        regime-aware field-compare is the DIAGNOSIS; a persisted graduation\n"
@@ -13606,6 +13613,17 @@ int main(int argc, char** argv)
             core::stratum_tls_setting().cert = argv[++i];
         else if (std::strcmp(argv[i], "--stratum-tls-key") == 0 && i + 1 < argc)
             core::stratum_tls_setting().key = argv[++i];
+        else if ((std::strcmp(argv[i], "--stratum-tls-rate-per-ip") == 0
+                  || std::strcmp(argv[i], "--stratum-tls-burst-per-ip") == 0
+                  || std::strcmp(argv[i], "--stratum-tls-handshakes") == 0
+                  || std::strcmp(argv[i], "--stratum-tls-handshakes-per-ip") == 0) && i + 1 < argc) {
+            const char* flag = argv[i];
+            std::string err;
+            if (!core::parse_stratum_tls_limit_flag(flag, argv[++i], core::stratum_tls_setting(), err)) {
+                std::cout << "c2pool-dash: " << err << "\n";
+                return 2;
+            }
+        }
         // Miner-facing host override for the dashboard Stratum URL. Both production
         // nodes NAT out through one gateway, so the auto-detected outbound IP
         // is NOT the address miners reach; the operator advertises the real
@@ -13710,12 +13728,8 @@ int main(int argc, char** argv)
         if (rc.file_set("stratum.http_per_ip"))   // --stratum-http-per-ip
             core::apply_stratum_http_count_setting("stratum.http_per_ip", rc.get_i64("stratum.http_per_ip"),
                                                    core::stratum_http_limits_setting().per_ip);
-        if (rc.file_set("stratum.tls_bind"))   // --stratum-tls
-            core::stratum_tls_setting().bind = rc.get_string("stratum.tls_bind").value_or("");
-        if (rc.file_set("stratum.tls_cert"))   // --stratum-tls-cert
-            core::stratum_tls_setting().cert = rc.get_string("stratum.tls_cert").value_or("");
-        if (rc.file_set("stratum.tls_key"))    // --stratum-tls-key
-            core::stratum_tls_setting().key = rc.get_string("stratum.tls_key").value_or("");
+        // --stratum-tls, -cert, -key and the four TLS limits (stratum.tls_*).
+        core::apply_stratum_tls_file_settings(rc, core::stratum_tls_setting());
         if (rc.file_set("stratum.bind"))    parse_listen(rc.get_string("stratum.bind").value_or(""), stratum_host, stratum_port);
         if (rc.file_set("web.external_ip")) external_ip = rc.get_string("web.external_ip").value_or(external_ip);
         if (rc.file_set("web.dashboard_dir")) dashboard_dir = rc.get_string("web.dashboard_dir").value_or(dashboard_dir);

@@ -1100,13 +1100,23 @@ changes.
   counted and logged at most once a minute.
 - A TLS handshake costs CPU on the thread that also runs the sharechain and
   the templates, so new TLS connections are limited before it: 200 a second
-  from all addresses (400 at once after a quiet spell), 5 a second from one
-  address or IPv6 /64 (20 at once), and at most 32 handshakes in progress (8
-  from one address). A connection over a limit is closed at the accept,
-  counted, and logged rate-limited like the other refusals; the plain stratum
-  port is not limited. Prefer an ECDSA P-256 certificate (certbot
-  `--key-type ecdsa`): its handshake costs the server several times less
-  than RSA-2048.
+  from all addresses (400 back to back after a quiet spell), 5 a second from
+  one address or IPv6 /64 (20 back to back; `--stratum-tls-rate-per-ip R`,
+  `--stratum-tls-burst-per-ip N`), and at most 32 handshakes in progress, 8
+  from one address (`--stratum-tls-handshakes N`,
+  `--stratum-tls-handshakes-per-ip N`; settings keys `stratum.tls_rate_per_ip`,
+  `stratum.tls_burst_per_ip`, `stratum.tls_handshakes`,
+  `stratum.tls_handshakes_per_ip`; 0 = no limit). Raise the per-address values
+  for a farm behind one NAT or a local proxy. At the handshake limit a new
+  connection evicts the oldest handshake that has been in progress for 1.5 s
+  or more (counted as a failed handshake); with none that old, the new one is
+  closed. A connection over a limit is closed at the accept, counted, and
+  logged rate-limited like the other refusals (counted per address, one /64
+  for IPv6); a refusal by the handshake limit spends no rate token. The plain
+  stratum port is not limited. A connection that has sent no byte 3 s after
+  the accept is closed, whatever the 10 s handshake bound. Prefer an ECDSA
+  P-256 certificate (certbot `--key-type ecdsa`): its handshake costs the
+  server several times less than RSA-2048.
 - Renewals: the certificate and key are read again when either file's
   modification time or size changes (checked at each new connection), and on
   `SIGHUP` (`kill -HUP <pid>`, e.g. from a certbot deploy hook). New
@@ -1123,11 +1133,13 @@ changes.
   The startup log names the listener and the certificate: `stratum TLS:
   listening on 0.0.0.0:3334 (stratum+ssl://, TLS 1.2+; subject
   /CN=pool.example.org, valid until ...)`, with a warning when the
-  certificate is expired or not yet valid, or the key file is readable by its
-  group or others. If the TLS port cannot be bound, that is logged as an error
+  certificate is expired or not yet valid, or the key file is readable by
+  others or writable by anyone but its owner (group read, as in Debian's
+  `root:ssl-cert` 0640, is fine). If the TLS port cannot be bound, that is logged as an error
   and the node runs on without it, as for the plain stratum port. Given to a
   mode that opens no stratum listener (DASH, DGB or BIP110 without `--run`, BCH
-  without `--pool`), the flags are warned about and have no effect.
+  without `--pool`, LTC with `--sharechain`), the flags are warned about and
+  have no effect.
 
 Per-coin binaries use their own defaults. For DASH: sharechain 8999 on the v16
 network and **8998** on the v36 network (`--net dash-v36`); a private
@@ -1231,6 +1243,8 @@ legacy YAML key set.
 | `--stratum-tls [HOST:]PORT` | `stratum_tls` | off | Second stratum listener speaking TLS (`stratum+ssl://`); PORT alone binds `--http-host`; same sessions and limits as the stratum port (see [Ports](#ports)) |
 | `--stratum-tls-cert FILE` | `stratum_tls_cert` | -- | PEM certificate chain (leaf first) for `--stratum-tls`; re-read with the key when either file changes and on SIGHUP |
 | `--stratum-tls-key FILE` | `stratum_tls_key` | -- | PEM private key for `--stratum-tls` (no passphrase) |
+| `--stratum-tls-rate-per-ip R` / `--stratum-tls-burst-per-ip N` | `stratum_tls_rate_per_ip` / `stratum_tls_burst_per_ip` | 5 / 20 | TLS accepts a second from one address (IPv6 /64), and how many back to back (0 = no limit) |
+| `--stratum-tls-handshakes N` / `--stratum-tls-handshakes-per-ip N` | `stratum_tls_handshakes` / `stratum_tls_handshakes_per_ip` | 32 / 8 | TLS handshakes in progress at once, in total and from one address (0 = no limit) |
 | `--coind-address` | `ltc_rpc_host` | 127.0.0.1 | Coin daemon RPC host |
 | `--coind-rpc-port` | `ltc_rpc_port` | auto | Coin daemon RPC port |
 | `--rpcuser` | `ltc_rpc_user` | -- | RPC username |
@@ -1440,6 +1454,8 @@ dashd-attached default OFF)
 | `--stratum-tls [HOST:]PORT` | off | Second Stratum listener speaking TLS (`stratum+ssl://`); PORT alone binds the `--stratum` host; same sessions and limits as the Stratum port (see [Ports](#ports)). Needs the two flags below. |
 | `--stratum-tls-cert FILE` | — | PEM certificate chain (leaf first); re-read with the key when either file changes and on SIGHUP. |
 | `--stratum-tls-key FILE` | — | PEM private key (no passphrase). |
+| `--stratum-tls-rate-per-ip R`, `--stratum-tls-burst-per-ip N` | 5, 20 | TLS accepts a second from one address (IPv6 /64), and how many back to back (0 = no limit). |
+| `--stratum-tls-handshakes N`, `--stratum-tls-handshakes-per-ip N` | 32, 8 | TLS handshakes in progress at once, in total and from one address (0 = no limit). |
 | `--dashboard-dir PATH` | `web-static` | Static dashboard root. |
 | `--external-ip ADDR` (aliases `--stratum-advertise`, `--public-host`) | auto-detect | Miner-facing host shown in the dashboard Stratum URL (NAT). |
 | `--explorer` / `--no-explorer` | on | Loopback-only `/api/explorer` surface + raw-block retention. |

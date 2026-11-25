@@ -581,6 +581,11 @@ void print_help() {
     std::cout << "  --stratum-tls-cert FILE   PEM certificate chain (leaf first) for --stratum-tls; with the key,\n";
     std::cout << "                            re-read when either file changes and on SIGHUP (renewals)\n";
     std::cout << "  --stratum-tls-key FILE    PEM private key for --stratum-tls (not passphrase-protected)\n";
+    std::cout << "  --stratum-tls-rate-per-ip R / --stratum-tls-burst-per-ip N  TLS accepts a second from one\n";
+    std::cout << "                            address (IPv6: one /64) and how many back to back (default 5 and 20;\n";
+    std::cout << "                            0 = no limit)\n";
+    std::cout << "  --stratum-tls-handshakes N / --stratum-tls-handshakes-per-ip N  TLS handshakes in progress\n";
+    std::cout << "                            at once, in total and from one address (default 32 and 8; 0 = no limit)\n";
     std::cout << "  --external-ip ADDR        Public IP or domain for stratum URL display (default: auto-detect)\n\n";
 
     std::cout << "PARENT COIN DAEMON:\n";
@@ -1827,6 +1832,18 @@ int main(int argc, char* argv[]) {
             core::stratum_tls_setting().key = argv[++i];
             cli_explicit.insert("stratum_tls_key");
         }
+        else if ((arg == "--stratum-tls-rate-per-ip" || arg == "--stratum-tls-burst-per-ip"
+                  || arg == "--stratum-tls-handshakes" || arg == "--stratum-tls-handshakes-per-ip")
+                 && i + 1 < argc) {
+            std::string err;
+            if (!core::parse_stratum_tls_limit_flag(arg, argv[++i], core::stratum_tls_setting(), err)) {
+                LOG_ERROR << err;
+                return 1;
+            }
+            std::string key = arg.substr(2);   // "stratum_tls_handshakes", the YAML key
+            std::replace(key.begin(), key.end(), '-', '_');
+            cli_explicit.insert(key);
+        }
         // Operational tuning
         else if (arg == "--log-file" && i + 1 < argc) {
             log_file = argv[++i];
@@ -2127,6 +2144,17 @@ int main(int argc, char* argv[]) {
                 core::stratum_tls_setting().cert = cfg["stratum_tls_cert"].as<std::string>();
             if (!cli_explicit.count("stratum_tls_key") && cfg["stratum_tls_key"])
                 core::stratum_tls_setting().key = cfg["stratum_tls_key"].as<std::string>();
+            for (const char* k : {"stratum_tls_rate_per_ip", "stratum_tls_burst_per_ip",
+                                  "stratum_tls_handshakes", "stratum_tls_handshakes_per_ip"}) {
+                if (cli_explicit.count(k) || !cfg[k])
+                    continue;
+                std::string flag = std::string("--") + k;
+                std::replace(flag.begin(), flag.end(), '_', '-');
+                std::string err;
+                if (!core::parse_stratum_tls_limit_flag(flag, cfg[k].as<std::string>(),
+                                                        core::stratum_tls_setting(), err))
+                    LOG_WARNING << "config: " << k << " ignored: " << err;
+            }
 
             // Operational tuning
             if (!cli_explicit.count("log_file") && cfg["log_file"])
@@ -2286,12 +2314,8 @@ int main(int argc, char* argv[]) {
         if (rc.file_set("stratum.http_per_ip") && !cli_explicit.count("stratum_http_per_ip"))
             core::apply_stratum_http_count_setting("stratum.http_per_ip", rc.get_i64("stratum.http_per_ip"),
                                                    stratum_http_limits.per_ip);
-        if (rc.file_set("stratum.tls_bind") && !cli_explicit.count("stratum_tls"))      // --stratum-tls
-            core::stratum_tls_setting().bind = rc.get_string("stratum.tls_bind").value_or("");
-        if (rc.file_set("stratum.tls_cert") && !cli_explicit.count("stratum_tls_cert")) // --stratum-tls-cert
-            core::stratum_tls_setting().cert = rc.get_string("stratum.tls_cert").value_or("");
-        if (rc.file_set("stratum.tls_key") && !cli_explicit.count("stratum_tls_key"))   // --stratum-tls-key
-            core::stratum_tls_setting().key = rc.get_string("stratum.tls_key").value_or("");
+        // --stratum-tls, -cert, -key and the four TLS limits (stratum.tls_*).
+        core::apply_stratum_tls_file_settings(rc, core::stratum_tls_setting());
         if (rc.file_set("stratum.bind")) {
             std::string v = rc.get_string("stratum.bind").value_or("");
             auto colon = v.rfind(':'); std::string p = (colon == std::string::npos) ? v : v.substr(colon + 1);
@@ -2315,6 +2339,8 @@ int main(int argc, char* argv[]) {
         std::cerr << "c2pool: " << *why << std::endl;
         return 1;
     }
+    if (sharechain_mode && core::stratum_tls_setting().any_set())
+        LOG_WARNING << "--stratum-tls has no effect with --sharechain (no stratum listener)";
 
     // WAIT mode: block genesis share creation until peers deliver the
     // sharechain.  GENESIS/AUTO start unlocked.  Set to true after

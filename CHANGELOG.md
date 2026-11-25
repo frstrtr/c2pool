@@ -27,9 +27,14 @@
   load is logged and the last good one stays in use.
 - New TLS connections are limited before the handshake: 200/s from all
   addresses (burst 400), 5/s from one address or IPv6 /64 (burst 20), at most
-  32 handshakes in progress (8 per address). Over a limit: closed at the
-  accept, counted, logged rate-limited. The plain port is not limited. An
-  ECDSA P-256 certificate is recommended.
+  32 handshakes in progress (8 per address); the per-address rate and burst
+  and both handshake limits are settings (`--stratum-tls-rate-per-ip`,
+  `--stratum-tls-burst-per-ip`, `--stratum-tls-handshakes`,
+  `--stratum-tls-handshakes-per-ip`; keys `stratum.tls_*`). Over a limit:
+  closed at the accept, counted, logged rate-limited per address (IPv6 /64).
+  At the handshake limit the oldest handshake in progress 1.5 s or more is
+  evicted for the new connection. No byte 3 s after the accept: closed. The
+  plain port is not limited. An ECDSA P-256 certificate is recommended.
 - HTTP on the stratum port (`--stratum-http`) stays on the plain port.
 - `--version` names `tls=on` or `tls=off` on every binary.
 - An incomplete set of flags, a host that is not an IP address, or a

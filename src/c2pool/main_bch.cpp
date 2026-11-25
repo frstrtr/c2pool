@@ -134,6 +134,12 @@ void print_banner(const char* argv0)
         << "                            --stratum-tls; re-read with the key when either\n"
         << "                            file changes, and on SIGHUP\n"
         << "  --stratum-tls-key FILE    PEM private key for --stratum-tls (no passphrase)\n"
+        << "  --stratum-tls-rate-per-ip R / --stratum-tls-burst-per-ip N  TLS accepts a\n"
+        << "                            second from one address (IPv6: one /64) and how\n"
+        << "                            many back to back (default 5 and 20; 0 = no limit)\n"
+        << "  --stratum-tls-handshakes N / --stratum-tls-handshakes-per-ip N  TLS\n"
+        << "                            handshakes in progress at once, in total and from\n"
+        << "                            one address (default 32 and 8; 0 = no limit)\n"
         << "  --sharechain-addnode H:P  pin explicit sharechain (pool P2P) peer(s);\n"
         << "                            REPEATABLE. Given => only these are dialed.\n"
         << "  --anchor N                cold-start ABLA floor anchor height\n"
@@ -942,6 +948,17 @@ int main(int argc, char** argv)
             core::stratum_tls_setting().cert = argv[++i];
         else if (std::strcmp(argv[i], "--stratum-tls-key") == 0 && i + 1 < argc)
             core::stratum_tls_setting().key = argv[++i];
+        else if ((std::strcmp(argv[i], "--stratum-tls-rate-per-ip") == 0
+                  || std::strcmp(argv[i], "--stratum-tls-burst-per-ip") == 0
+                  || std::strcmp(argv[i], "--stratum-tls-handshakes") == 0
+                  || std::strcmp(argv[i], "--stratum-tls-handshakes-per-ip") == 0) && i + 1 < argc) {
+            const char* flag = argv[i];
+            std::string err;
+            if (!core::parse_stratum_tls_limit_flag(flag, argv[++i], core::stratum_tls_setting(), err)) {
+                std::cerr << "c2pool-bch: " << err << "\n";
+                return 1;
+            }
+        }
         else if (std::strcmp(argv[i], "--leg-c-capture") == 0) want_leg_c = true;
         else if (std::strcmp(argv[i], "--leg-c-capture-p2p") == 0) want_leg_c_p2p = true;
         else if (std::strcmp(argv[i], "--p2p-port") == 0 && i + 1 < argc)
@@ -1034,12 +1051,8 @@ int main(int argc, char** argv)
         if (rc.file_set("stratum.http_per_ip"))   // --stratum-http-per-ip
             core::apply_stratum_http_count_setting("stratum.http_per_ip", rc.get_i64("stratum.http_per_ip"),
                                                    core::stratum_http_limits_setting().per_ip);
-        if (rc.file_set("stratum.tls_bind"))   // --stratum-tls
-            core::stratum_tls_setting().bind = rc.get_string("stratum.tls_bind").value_or("");
-        if (rc.file_set("stratum.tls_cert"))   // --stratum-tls-cert
-            core::stratum_tls_setting().cert = rc.get_string("stratum.tls_cert").value_or("");
-        if (rc.file_set("stratum.tls_key"))    // --stratum-tls-key
-            core::stratum_tls_setting().key = rc.get_string("stratum.tls_key").value_or("");
+        // --stratum-tls, -cert, -key and the four TLS limits (stratum.tls_*).
+        core::apply_stratum_tls_file_settings(rc, core::stratum_tls_setting());
         if (rc.file_set("daemon_rpc.auth_file")) rpc_conf = rc.get_string("daemon_rpc.auth_file").value_or(rpc_conf);
         // Coin-network peer (--peer alias) + --coin-p2p-discover from the settings
         // file (L1). coin_p2p.connect is HOST[:PORT]; an omitted port keeps the

@@ -141,6 +141,12 @@ void print_banner(const char* argv0)
         "                       --stratum-tls; re-read with the key when either\n"
         "                       file changes, and on SIGHUP\n"
         "  --stratum-tls-key FILE  PEM private key for --stratum-tls (no passphrase)\n"
+        "  --stratum-tls-rate-per-ip R / --stratum-tls-burst-per-ip N  TLS accepts a\n"
+        "                       second from one address (IPv6: one /64) and how many\n"
+        "                       back to back (default 5 and 20; 0 = no limit)\n"
+        "  --stratum-tls-handshakes N / --stratum-tls-handshakes-per-ip N  TLS\n"
+        "                       handshakes in progress at once, in total and from one\n"
+        "                       address (default 32 and 8; 0 = no limit)\n"
         "  --node-owner-address ADDR  subsidy fallback / donation payout when a\n"
         "                       miner has no resolvable payout address (base58/bech32)\n"
         "  --bip110-sharechain  ARM the M3 v36 sharechain MINT (DEFAULT OFF): start\n"
@@ -2835,6 +2841,15 @@ int main(int argc, char** argv)
         }
         else if (arg == "--stratum-tls-key" && i + 1 < argc) {
             core::stratum_tls_setting().key = argv[++i];
+        }
+        else if ((arg == "--stratum-tls-rate-per-ip" || arg == "--stratum-tls-burst-per-ip"
+                  || arg == "--stratum-tls-handshakes" || arg == "--stratum-tls-handshakes-per-ip")
+                 && i + 1 < argc) {
+            std::string err;
+            if (!core::parse_stratum_tls_limit_flag(arg, argv[++i], core::stratum_tls_setting(), err)) {
+                std::fprintf(stderr, "c2pool-bip110: %s\n", err.c_str());
+                return 1;
+            }
         }
         else if ((arg == "--node-owner-address" || arg == "--donation") && i + 1 < argc) {
             donation_address = argv[++i];
