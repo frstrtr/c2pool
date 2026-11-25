@@ -2911,7 +2911,9 @@ int main(int argc, char** argv)
     // a disjoint literal, so the known-flag behaviour is unchanged.
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--version") == 0) {
-            std::cout << "c2pool-dgb " << C2POOL_VERSION << "\n";
+            // tls=: the TLS stratum listener is built in (on) or not.
+            std::cout << "c2pool-dgb " << C2POOL_VERSION
+                      << " tls=" << (core::stratum_tls_supported() ? "on" : "off") << "\n";
             return 0;
         }
         else if (std::strcmp(argv[i], "--help") == 0)     want_help = true;
@@ -3165,6 +3167,8 @@ int main(int argc, char** argv)
         std::cerr << "c2pool-dgb: " << *why << "\n";
         return 1;
     }
+    if (!want_run && core::stratum_tls_setting().any_set())
+        std::cerr << "c2pool-dgb: warning: --stratum-tls has no effect without --run (no stratum listener)\n";
 
     // --run: stand up the run-loop (io_context + sharechain peer + stratum).
     if (want_run)

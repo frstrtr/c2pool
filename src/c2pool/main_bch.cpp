@@ -861,7 +861,9 @@ int main(int argc, char** argv)
     // strcmp is a disjoint literal, so the known-flag behaviour is unchanged.
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--version") == 0) {
-            std::cout << "c2pool-bch " << C2POOL_VERSION << "\n";
+            // tls=: the TLS stratum listener is built in (on) or not.
+            std::cout << "c2pool-bch " << C2POOL_VERSION
+                      << " tls=" << (core::stratum_tls_supported() ? "on" : "off") << "\n";
             return 0;
         }
         else if (std::strcmp(argv[i], "--help") == 0)     want_help = true;
@@ -1072,6 +1074,8 @@ int main(int argc, char** argv)
         std::cerr << "c2pool-bch: " << *why << "\n";
         return 1;
     }
+    if (!want_pool && core::stratum_tls_setting().any_set())
+        std::cerr << "c2pool-bch: warning: --stratum-tls has no effect without --pool (no stratum listener)\n";
 
     // FAIL-CLOSED coin-peer gate (BCH FIX-2): a run mode that dials the coin
     // network must have an explicit --peer OR --coin-p2p-discover. Placed AFTER

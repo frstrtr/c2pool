@@ -534,7 +534,7 @@ void print_help() {
     std::cout << "COMMAND LINE OPTIONS:\n";
     std::cout << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
     std::cout << "  --help, -h                Show this help message and exit\n";
-    std::cout << "  --version                 Print \"c2pool-ltc <version> embedded=<coins>\" and exit\n";
+    std::cout << "  --version                 Print \"c2pool-ltc <version> tls=on|off embedded=<coins>\" and exit\n";
     std::cout << "  --data-dir PATH           Root all per-instance state here (default: ~/.c2pool)\n";
     std::cout << "                            (isolates co-located instances)\n";
     std::cout << "  --testnet                 Use testnet instead of mainnet\n";
@@ -863,10 +863,12 @@ int main(int argc, char* argv[]) {
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--version") {
+            // tls= (the TLS stratum listener is built in) before embedded=.
+            const char* tls = core::stratum_tls_supported() ? "on" : "off";
 #ifdef C2POOL_VERSION
-            std::cout << "c2pool-ltc " << C2POOL_VERSION << " embedded=ltc,doge,nmc\n";
+            std::cout << "c2pool-ltc " << C2POOL_VERSION << " tls=" << tls << " embedded=ltc,doge,nmc\n";
 #else
-            std::cout << "c2pool-ltc dev embedded=ltc,doge,nmc\n";
+            std::cout << "c2pool-ltc dev tls=" << tls << " embedded=ltc,doge,nmc\n";
 #endif
             return 0;
         }

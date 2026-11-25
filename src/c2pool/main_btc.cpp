@@ -296,10 +296,12 @@ int main(int argc, char* argv[])
         }
         else if (arg == "--version")
         {
+            // tls=: the TLS stratum listener is built in (on) or not.
 #ifdef C2POOL_VERSION
-            std::cout << "c2pool-btc " << C2POOL_VERSION << "\n";
+            std::cout << "c2pool-btc " << C2POOL_VERSION
+                      << " tls=" << (core::stratum_tls_supported() ? "on" : "off") << "\n";
 #else
-            std::cout << "c2pool-btc dev\n";
+            std::cout << "c2pool-btc dev tls=" << (core::stratum_tls_supported() ? "on" : "off") << "\n";
 #endif
             return 0;
         }

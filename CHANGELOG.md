@@ -25,7 +25,13 @@
   or size changes (checked at each new connection) and on SIGHUP. New
   connections use the new pair, open ones keep theirs; a pair that does not
   load is logged and the last good one stays in use.
+- New TLS connections are limited before the handshake: 200/s from all
+  addresses (burst 400), 5/s from one address or IPv6 /64 (burst 20), at most
+  32 handshakes in progress (8 per address). Over a limit: closed at the
+  accept, counted, logged rate-limited. The plain port is not limited. An
+  ECDSA P-256 certificate is recommended.
 - HTTP on the stratum port (`--stratum-http`) stays on the plain port.
+- `--version` names `tls=on` or `tls=off` on every binary.
 - An incomplete set of flags, a host that is not an IP address, or a
   certificate or key that does not load is refused at start.
 - Build: CMake option `C2POOL_STRATUM_TLS` (OpenSSL >= 1.1.1 via

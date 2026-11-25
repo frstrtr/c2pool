@@ -1098,6 +1098,15 @@ changes.
   certificates. A handshake not done 10 s after the accept, or one that fails
   (a plaintext client on the TLS port), closes the connection; failures are
   counted and logged at most once a minute.
+- A TLS handshake costs CPU on the thread that also runs the sharechain and
+  the templates, so new TLS connections are limited before it: 200 a second
+  from all addresses (400 at once after a quiet spell), 5 a second from one
+  address or IPv6 /64 (20 at once), and at most 32 handshakes in progress (8
+  from one address). A connection over a limit is closed at the accept,
+  counted, and logged rate-limited like the other refusals; the plain stratum
+  port is not limited. Prefer an ECDSA P-256 certificate (certbot
+  `--key-type ecdsa`): its handshake costs the server several times less
+  than RSA-2048.
 - Renewals: the certificate and key are read again when either file's
   modification time or size changes (checked at each new connection), and on
   `SIGHUP` (`kill -HUP <pid>`, e.g. from a certbot deploy hook). New
@@ -1110,9 +1119,15 @@ changes.
 - A bad set (one flag without the others, a host that is not an IP address, a
   certificate or key that does not load) is refused at start. A build without
   OpenSSL (CMake `-DC2POOL_STRATUM_TLS=OFF`; the default on macOS and Windows
-  for now) refuses the three flags. The startup log names the listener and the
-  certificate: `stratum TLS: listening on 0.0.0.0:3334 (stratum+ssl://, TLS
-  1.2+; subject /CN=pool.example.org, valid until ...)`.
+  for now) refuses the three flags; `--version` says `tls=on` or `tls=off`.
+  The startup log names the listener and the certificate: `stratum TLS:
+  listening on 0.0.0.0:3334 (stratum+ssl://, TLS 1.2+; subject
+  /CN=pool.example.org, valid until ...)`, with a warning when the
+  certificate is expired or not yet valid, or the key file is readable by its
+  group or others. If the TLS port cannot be bound, that is logged as an error
+  and the node runs on without it, as for the plain stratum port. Given to a
+  mode that opens no stratum listener (DASH, DGB or BIP110 without `--run`, BCH
+  without `--pool`), the flags are warned about and have no effect.
 
 Per-coin binaries use their own defaults. For DASH: sharechain 8999 on the v16
 network and **8998** on the v36 network (`--net dash-v36`); a private

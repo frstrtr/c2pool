@@ -2762,7 +2762,10 @@ int main(int argc, char** argv)
 
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
-        if (arg == "--version") { std::printf("c2pool-bip110 %s\n", C2POOL_VERSION); return 0; }
+        if (arg == "--version") {   // tls=: the TLS stratum listener is built in (on) or not
+            std::printf("c2pool-bip110 %s tls=%s\n", C2POOL_VERSION, core::stratum_tls_supported() ? "on" : "off");
+            return 0;
+        }
         if (arg == "--help" || arg == "-h") { print_banner(argv[0]); return 0; }
         else if (arg == "--selftest") { selftest = true; run = false; }
         else if (arg == "--run") { run = true; selftest = false; }
@@ -2870,6 +2873,8 @@ int main(int argc, char** argv)
         std::fprintf(stderr, "c2pool-bip110: %s\n", why->c_str());
         return 1;
     }
+    if (!run && core::stratum_tls_setting().any_set())
+        std::fprintf(stderr, "c2pool-bip110: warning: --stratum-tls has no effect without --run (no stratum listener)\n");
 
     if (run) {
         if (!coin_p2p_discover && explicit_peers.empty()) {

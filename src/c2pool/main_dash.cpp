@@ -13116,7 +13116,9 @@ int main(int argc, char** argv)
             // (BLS-dark) binary is otherwise indistinguishable here, and this is
             // the surface operators and scripts read. bls= is the last token so
             // an inventory can match it with `--version | grep -oE 'bls=[a-z]+'`.
+            // tls= before it: the TLS stratum listener is built in (on) or not.
             std::cout << "c2pool-dash " << C2POOL_VERSION
+                      << " tls=" << (core::stratum_tls_supported() ? "on" : "off")
                       << " bls=" << dash::coin::vendor::bls_backend_name() << "\n";
             return 0;
         }
@@ -13766,6 +13768,8 @@ int main(int argc, char** argv)
         std::cout << "c2pool-dash: " << *why << "\n";
         return 2;
     }
+    if (!want_run && core::stratum_tls_setting().any_set())
+        std::cout << "c2pool-dash: warning: --stratum-tls has no effect without --run (no stratum listener)\n";
 
     // ── FULL-HISTORY REPLAY W3: --replay-utxo-* standalone utility ──────────
     // Runs and EXITS: opens the fold store, names its resume cursor, and with
