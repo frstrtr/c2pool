@@ -14,6 +14,7 @@
 #include <cstring>
 #include <iostream>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -149,6 +150,26 @@ int main() {
         CHECK(rc.get_string("stratum.http").value_or("") == want, "ltc " + arg + " -> stratum.http=" + want);
         CHECK(rc.source_of("stratum.http") == Source::Cli, "ltc " + arg + " source=cli");
         CHECK(rc.get_string("web.port").value_or("") == "7", "ltc " + arg + " consumes no value token");
+    }
+
+    // (8) The TLS stratum listener's three VALUE rows (--stratum-tls,
+    //     --stratum-tls-cert, --stratum-tls-key) on every binary that has a
+    //     settings file: each consumes its value and lands in its key.
+    for (const auto& [bin, coin, name] : std::vector<std::tuple<Bin, CoinBit, std::string>>{
+             {Bin::BIN_LTC, C_LTC, "ltc"}, {Bin::BIN_DASH, C_DASH, "dash"}, {Bin::BIN_BTC, C_BTC, "btc"},
+             {Bin::BIN_DGB, C_DGB, "dgb"}, {Bin::BIN_BCH, C_BCH, "bch"}}) {
+        std::vector<std::string> s = {"prog", "--stratum-tls", "0.0.0.0:3334", "--stratum-tls-cert",
+                                      "/etc/c2pool/fullchain.pem", "--stratum-tls-key",
+                                      "/etc/c2pool/privkey.pem", "--stratum-http-budget", "7"};
+        std::vector<char*> p; for (auto& x : s) p.push_back(const_cast<char*>(x.c_str()));
+        CliTracker tr; ResolvedConfig rc; rc.seed_compiled_defaults(coin);
+        scan_cli((int)p.size(), p.data(), bin, tr, rc);
+        CHECK(rc.get_string("stratum.tls_bind").value_or("") == "0.0.0.0:3334", name + " --stratum-tls -> stratum.tls_bind");
+        CHECK(rc.get_string("stratum.tls_cert").value_or("") == "/etc/c2pool/fullchain.pem", name + " --stratum-tls-cert -> stratum.tls_cert");
+        CHECK(rc.get_string("stratum.tls_key").value_or("") == "/etc/c2pool/privkey.pem", name + " --stratum-tls-key -> stratum.tls_key");
+        CHECK(rc.source_of("stratum.tls_bind") == Source::Cli && rc.source_of("stratum.tls_key") == Source::Cli,
+              name + " TLS keys source=cli");
+        CHECK(rc.get_string("stratum.http_budget").value_or("") == "7", name + " TLS flags consume one value each");
     }
 
     if (g_fail == 0) std::cout << "\ntest_settings_cli_scan: ALL PASS\n";

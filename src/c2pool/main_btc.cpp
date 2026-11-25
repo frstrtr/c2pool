@@ -161,6 +161,15 @@ static void print_usage()
         "                  at once from one address, one /64 for IPv6: at most N;\n"
         "                  others are answered 503 (default 6; 0 = no limit below\n"
         "                  --stratum-http-budget).\n"
+        "  --stratum-tls [HOST:]PORT  a second stratum listener that speaks TLS\n"
+        "                  (stratum+ssl://), so miners can verify the pool's\n"
+        "                  certificate; PORT alone binds the --stratum host. Same\n"
+        "                  sessions, limits and miner list as the plain port; TLS\n"
+        "                  1.2+, no client certificates (default: off).\n"
+        "  --stratum-tls-cert FILE  PEM certificate chain (leaf first) for\n"
+        "                  --stratum-tls; re-read with the key when either file\n"
+        "                  changes, and on SIGHUP.\n"
+        "  --stratum-tls-key FILE  PEM private key for --stratum-tls (no passphrase).\n"
         "  --sharechain-port P  bind the sharechain (pool P2P) listener on\n"
         "                  port P instead of the default 9333, so a SECOND\n"
         "                  isolated c2pool-btc instance can run on one host\n"
@@ -493,6 +502,15 @@ int main(int argc, char* argv[])
                 return 1;
             }
         }
+        // --stratum-tls [HOST:]PORT / --stratum-tls-cert FILE / --stratum-tls-key
+        // FILE: the TLS stratum listener (core/stratum_tls.hpp); checked once
+        // every flag and setting is read (check_stratum_tls_settings).
+        else if (arg == "--stratum-tls" && i + 1 < argc)
+            core::stratum_tls_setting().bind = argv[++i];
+        else if (arg == "--stratum-tls-cert" && i + 1 < argc)
+            core::stratum_tls_setting().cert = argv[++i];
+        else if (arg == "--stratum-tls-key" && i + 1 < argc)
+            core::stratum_tls_setting().key = argv[++i];
         else
         {
             std::cerr << "unknown arg: " << arg << "\n";
@@ -547,6 +565,12 @@ int main(int argc, char* argv[])
         if (rc.file_set("stratum.http_per_ip"))   // --stratum-http-per-ip
             core::apply_stratum_http_count_setting("stratum.http_per_ip", rc.get_i64("stratum.http_per_ip"),
                                                    core::stratum_http_limits_setting().per_ip);
+        if (rc.file_set("stratum.tls_bind"))   // --stratum-tls
+            core::stratum_tls_setting().bind = rc.get_string("stratum.tls_bind").value_or("");
+        if (rc.file_set("stratum.tls_cert"))   // --stratum-tls-cert
+            core::stratum_tls_setting().cert = rc.get_string("stratum.tls_cert").value_or("");
+        if (rc.file_set("stratum.tls_key"))    // --stratum-tls-key
+            core::stratum_tls_setting().key = rc.get_string("stratum.tls_key").value_or("");
         if (rc.file_set("stratum.bind"))      split_hostport(rc.get_string("stratum.bind").value_or(""), stratum_addr, stratum_port);
         if (rc.file_set("sharechain.listen")) { std::string hh; split_hostport(rc.get_string("sharechain.listen").value_or(""), hh, sharechain_port); }
         if (rc.file_set("daemon_rpc.endpoint")) split_hostport(rc.get_string("daemon_rpc.endpoint").value_or(""), bitcoind_host, bitcoind_port);
@@ -558,6 +582,14 @@ int main(int argc, char* argv[])
         if (rc.file_set("money.node_owner_fee_pct")) node_owner_fee = rc.get_double("money.node_owner_fee_pct").value_or(node_owner_fee);
         if (rc.file_set("money.node_owner_address")) node_owner_address = rc.get_string("money.node_owner_address").value_or(node_owner_address);
         if (rc.file_set("money.give_author_pct")) { dev_donation = rc.get_double("money.give_author_pct").value_or(dev_donation); give_author_set = true; }
+    }
+
+    // --stratum-tls / --stratum-tls-cert / --stratum-tls-key (command line or
+    // settings file): a complete set this build supports, whose certificate
+    // and key load; else refused here, before anything starts.
+    if (auto why = core::check_stratum_tls_settings(core::stratum_tls_setting())) {
+        std::cerr << "c2pool-btc: " << *why << "\n";
+        return 1;
     }
 
     // The external-bitcoind endpoint is only mandatory when NOT running the
@@ -3494,6 +3526,8 @@ int main(int argc, char* argv[])
         core::configure_stratum_http(*stratum_server_for_shutdown, web_server.get(),
                                      core::stratum_http_mode_setting(),
                                      core::stratum_http_limits_setting());
+    // The TLS stratum listener (--stratum-tls), when set.
+    core::configure_stratum_tls(stratum_server_for_shutdown.get(), core::stratum_tls_setting());
 
     // Periodic think/clean tick (every 5s, safety net) — mirrors the LTC/dash
     // tick (main_ltc.cpp think_timer). Without it, think() fired only on share

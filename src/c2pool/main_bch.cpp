@@ -51,6 +51,7 @@
 #include <core/settings_cli.hpp>          // M0b control-plane wiring
 #include <core/config_endpoint.hpp>       // M1 control-plane READ-ONLY endpoints
 #include <core/stratum_http.hpp>           // --stratum-http (the web API on the stratum port)
+#include <core/stratum_tls.hpp>            // --stratum-tls (the TLS stratum listener)
 #include <impl/bch/catalog_defaults.hpp>  // M0b L0 compiled defaults
 
 #include <cstdlib>
@@ -123,6 +124,16 @@ void print_banner(const char* argv0)
         << "                            once from one address, one /64 for IPv6: at\n"
         << "                            most N; others are answered 503 (default 6; 0 =\n"
         << "                            no limit below --stratum-http-budget)\n"
+        << "  --stratum-tls [HOST:]PORT a second stratum listener that speaks TLS\n"
+        << "                            (stratum+ssl://), so miners can verify the\n"
+        << "                            pool's certificate; PORT alone binds the\n"
+        << "                            --stratum host. Same sessions, limits and miner\n"
+        << "                            list as the plain port; TLS 1.2+, no client\n"
+        << "                            certificates (default: off)\n"
+        << "  --stratum-tls-cert FILE   PEM certificate chain (leaf first) for\n"
+        << "                            --stratum-tls; re-read with the key when either\n"
+        << "                            file changes, and on SIGHUP\n"
+        << "  --stratum-tls-key FILE    PEM private key for --stratum-tls (no passphrase)\n"
         << "  --sharechain-addnode H:P  pin explicit sharechain (pool P2P) peer(s);\n"
         << "                            REPEATABLE. Given => only these are dialed.\n"
         << "  --anchor N                cold-start ABLA floor anchor height\n"
@@ -920,6 +931,15 @@ int main(int argc, char** argv)
                 return 1;
             }
         }
+        // --stratum-tls [HOST:]PORT / --stratum-tls-cert FILE / --stratum-tls-key
+        // FILE: the TLS stratum listener (core/stratum_tls.hpp); checked once
+        // every flag and setting is read (check_stratum_tls_settings).
+        else if (std::strcmp(argv[i], "--stratum-tls") == 0 && i + 1 < argc)
+            core::stratum_tls_setting().bind = argv[++i];
+        else if (std::strcmp(argv[i], "--stratum-tls-cert") == 0 && i + 1 < argc)
+            core::stratum_tls_setting().cert = argv[++i];
+        else if (std::strcmp(argv[i], "--stratum-tls-key") == 0 && i + 1 < argc)
+            core::stratum_tls_setting().key = argv[++i];
         else if (std::strcmp(argv[i], "--leg-c-capture") == 0) want_leg_c = true;
         else if (std::strcmp(argv[i], "--leg-c-capture-p2p") == 0) want_leg_c_p2p = true;
         else if (std::strcmp(argv[i], "--p2p-port") == 0 && i + 1 < argc)
@@ -1012,6 +1032,12 @@ int main(int argc, char** argv)
         if (rc.file_set("stratum.http_per_ip"))   // --stratum-http-per-ip
             core::apply_stratum_http_count_setting("stratum.http_per_ip", rc.get_i64("stratum.http_per_ip"),
                                                    core::stratum_http_limits_setting().per_ip);
+        if (rc.file_set("stratum.tls_bind"))   // --stratum-tls
+            core::stratum_tls_setting().bind = rc.get_string("stratum.tls_bind").value_or("");
+        if (rc.file_set("stratum.tls_cert"))   // --stratum-tls-cert
+            core::stratum_tls_setting().cert = rc.get_string("stratum.tls_cert").value_or("");
+        if (rc.file_set("stratum.tls_key"))    // --stratum-tls-key
+            core::stratum_tls_setting().key = rc.get_string("stratum.tls_key").value_or("");
         if (rc.file_set("daemon_rpc.auth_file")) rpc_conf = rc.get_string("daemon_rpc.auth_file").value_or(rpc_conf);
         // Coin-network peer (--peer alias) + --coin-p2p-discover from the settings
         // file (L1). coin_p2p.connect is HOST[:PORT]; an omitted port keeps the
@@ -1038,6 +1064,14 @@ int main(int argc, char** argv)
     print_banner(argv[0]);
     if (want_help)
         return 0;
+
+    // --stratum-tls / --stratum-tls-cert / --stratum-tls-key (command line or
+    // settings file): a complete set this build supports, whose certificate
+    // and key load; else refused here, before anything starts.
+    if (auto why = core::check_stratum_tls_settings(core::stratum_tls_setting())) {
+        std::cerr << "c2pool-bch: " << *why << "\n";
+        return 1;
+    }
 
     // FAIL-CLOSED coin-peer gate (BCH FIX-2): a run mode that dials the coin
     // network must have an explicit --peer OR --coin-p2p-discover. Placed AFTER

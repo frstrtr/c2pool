@@ -166,6 +166,7 @@ void print_banner(const char* argv0, const core::CoinParams& p)
         << "       [--embedded-serve-mempool-txs[=true|false]]\n"
         << "       [--stratum-http[=true|false|auto]]\n"
         << "       [--stratum-http-budget N] [--stratum-http-per-ip N]\n"
+        << "       [--stratum-tls [HOST:]PORT --stratum-tls-cert FILE --stratum-tls-key FILE]\n"
         << "       [--data-dir PATH] [--dev-relax-algo-softforks]\n"
         << "       [--coin-p2p-discover]\n\n"
         << "  --data-dir PATH  root all per-instance state here (default ~/.c2pool);\n"
@@ -187,6 +188,13 @@ void print_banner(const char* argv0, const core::CoinParams& p)
         << "        stratum port at once from one address, one /64 for IPv6, at\n"
         << "        most N; others are answered 503 (default 6; 0 = no limit below\n"
         << "        --stratum-http-budget).\n"
+        << "        --stratum-tls [HOST:]PORT opens a second stratum listener that\n"
+        << "        speaks TLS (stratum+ssl://), so miners can verify the pool's\n"
+        << "        certificate; PORT alone binds the --stratum host. Same sessions,\n"
+        << "        limits and miner list as the plain port; TLS 1.2+, no client\n"
+        << "        certificates. Needs --stratum-tls-cert FILE (PEM chain, leaf\n"
+        << "        first) and --stratum-tls-key FILE (PEM, no passphrase); both are\n"
+        << "        re-read when either changes and on SIGHUP (default: off).\n"
         << "        Embedded P2P won-block relay + external digibyted\n"
         << "        RPC fallback land in the next slices.\n"
         << "        --regtest-force-won-share (regtest-ONLY; requires\n"
@@ -2751,6 +2759,8 @@ int run_node(const core::CoinParams& params, bool testnet,
         core::configure_stratum_http(*stratum_server, web_server.get(),
                                      core::stratum_http_mode_setting(),
                                      core::stratum_http_limits_setting());
+    // The TLS stratum listener (--stratum-tls), when set.
+    core::configure_stratum_tls(stratum_server.get(), core::stratum_tls_setting());
 
     // Periodic think/clean tick (every 5s, safety net) — mirrors the LTC/dash
     // tick. Without it, think() fired only on share arrival: no stale-head
@@ -3051,6 +3061,15 @@ int main(int argc, char** argv)
                 return 1;
             }
         }
+        // --stratum-tls [HOST:]PORT / --stratum-tls-cert FILE / --stratum-tls-key
+        // FILE: the TLS stratum listener (core/stratum_tls.hpp); checked once
+        // every flag and setting is read (check_stratum_tls_settings).
+        else if (std::strcmp(argv[i], "--stratum-tls") == 0 && i + 1 < argc)
+            core::stratum_tls_setting().bind = argv[++i];
+        else if (std::strcmp(argv[i], "--stratum-tls-cert") == 0 && i + 1 < argc)
+            core::stratum_tls_setting().cert = argv[++i];
+        else if (std::strcmp(argv[i], "--stratum-tls-key") == 0 && i + 1 < argc)
+            core::stratum_tls_setting().key = argv[++i];
         else {
             std::cerr << "unknown argument: " << argv[i] << "\n";
             return 1;
@@ -3099,6 +3118,12 @@ int main(int argc, char** argv)
         if (rc.file_set("stratum.http_per_ip"))   // --stratum-http-per-ip
             core::apply_stratum_http_count_setting("stratum.http_per_ip", rc.get_i64("stratum.http_per_ip"),
                                                    core::stratum_http_limits_setting().per_ip);
+        if (rc.file_set("stratum.tls_bind"))   // --stratum-tls
+            core::stratum_tls_setting().bind = rc.get_string("stratum.tls_bind").value_or("");
+        if (rc.file_set("stratum.tls_cert"))   // --stratum-tls-cert
+            core::stratum_tls_setting().cert = rc.get_string("stratum.tls_cert").value_or("");
+        if (rc.file_set("stratum.tls_key"))    // --stratum-tls-key
+            core::stratum_tls_setting().key = rc.get_string("stratum.tls_key").value_or("");
         if (rc.file_set("sharechain.listen")) {
             std::string v = rc.get_string("sharechain.listen").value_or("");
             auto colon = v.rfind(':'); std::string p = (colon == std::string::npos) ? v : v.substr(colon + 1);
@@ -3132,6 +3157,14 @@ int main(int argc, char** argv)
 
     if (want_help)
         return 0;
+
+    // --stratum-tls / --stratum-tls-cert / --stratum-tls-key (command line or
+    // settings file): a complete set this build supports, whose certificate
+    // and key load; else refused here, before anything starts.
+    if (auto why = core::check_stratum_tls_settings(core::stratum_tls_setting())) {
+        std::cerr << "c2pool-dgb: " << *why << "\n";
+        return 1;
+    }
 
     // --run: stand up the run-loop (io_context + sharechain peer + stratum).
     if (want_run)

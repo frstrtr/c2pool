@@ -637,6 +637,7 @@ void print_banner(const char* argv0)
         << "           [--web-port PORT] [--web-host ADDR] [--dashboard-dir PATH]\n"
         << "           [--stratum-http[=true|false|auto]]\n"
         << "           [--stratum-http-budget N] [--stratum-http-per-ip N]\n"
+        << "           [--stratum-tls [HOST:]PORT --stratum-tls-cert FILE --stratum-tls-key FILE]\n"
         << "           [--external-ip ADDR]\n"
         << "           [--header-dgw-log-only]  (log, do not refuse, a header off its DGW bits)\n"
         << "           [--embedded-utxo[=false]] [--embedded-mainnet[=false]] [--embedded-null-arm[=false]]\n"
@@ -835,6 +836,13 @@ void print_banner(const char* argv0)
         << "        stratum port at once from one address, one /64 for IPv6, at\n"
         << "        most N; others are answered 503 (default 6; 0 = no limit below\n"
         << "        --stratum-http-budget).\n"
+        << "        --stratum-tls [HOST:]PORT opens a second stratum listener that\n"
+        << "        speaks TLS (stratum+ssl://), so miners can verify the pool's\n"
+        << "        certificate; PORT alone binds the --stratum host. Same sessions,\n"
+        << "        limits and miner list as the plain port; TLS 1.2+, no client\n"
+        << "        certificates. Needs --stratum-tls-cert FILE (PEM chain, leaf\n"
+        << "        first) and --stratum-tls-key FILE (PEM, no passphrase); both are\n"
+        << "        re-read when either changes and on SIGHUP (default: off).\n"
         << "        --embedded-oracle-shadow runs the OBSERVE-only per-block dashd\n"
         << "        cross-check: dashd getblocktemplate{mode:proposal} is the VERDICT,\n"
         << "        regime-aware field-compare is the DIAGNOSIS; a persisted graduation\n"
@@ -5538,6 +5546,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         core::configure_stratum_http(*stratum_server, web_server.get(),
                                      core::stratum_http_mode_setting(),
                                      core::stratum_http_limits_setting());
+    // The TLS stratum listener (--stratum-tls), when set.
+    core::configure_stratum_tls(stratum_server.get(), core::stratum_tls_setting());
 
     // ── Think loop: initial election + 15 s keep-fresh tick ───────────────
     // Share arrivals trigger run_think() themselves (add_verified_shares);
@@ -13585,6 +13595,15 @@ int main(int argc, char** argv)
                 return 2;
             }
         }
+        // --stratum-tls [HOST:]PORT / --stratum-tls-cert FILE / --stratum-tls-key
+        // FILE: the TLS stratum listener (core/stratum_tls.hpp); checked once
+        // every flag and setting is read (check_stratum_tls_settings).
+        else if (std::strcmp(argv[i], "--stratum-tls") == 0 && i + 1 < argc)
+            core::stratum_tls_setting().bind = argv[++i];
+        else if (std::strcmp(argv[i], "--stratum-tls-cert") == 0 && i + 1 < argc)
+            core::stratum_tls_setting().cert = argv[++i];
+        else if (std::strcmp(argv[i], "--stratum-tls-key") == 0 && i + 1 < argc)
+            core::stratum_tls_setting().key = argv[++i];
         // Miner-facing host override for the dashboard Stratum URL. Both production
         // nodes NAT out through one gateway, so the auto-detected outbound IP
         // is NOT the address miners reach; the operator advertises the real
@@ -13689,6 +13708,12 @@ int main(int argc, char** argv)
         if (rc.file_set("stratum.http_per_ip"))   // --stratum-http-per-ip
             core::apply_stratum_http_count_setting("stratum.http_per_ip", rc.get_i64("stratum.http_per_ip"),
                                                    core::stratum_http_limits_setting().per_ip);
+        if (rc.file_set("stratum.tls_bind"))   // --stratum-tls
+            core::stratum_tls_setting().bind = rc.get_string("stratum.tls_bind").value_or("");
+        if (rc.file_set("stratum.tls_cert"))   // --stratum-tls-cert
+            core::stratum_tls_setting().cert = rc.get_string("stratum.tls_cert").value_or("");
+        if (rc.file_set("stratum.tls_key"))    // --stratum-tls-key
+            core::stratum_tls_setting().key = rc.get_string("stratum.tls_key").value_or("");
         if (rc.file_set("stratum.bind"))    parse_listen(rc.get_string("stratum.bind").value_or(""), stratum_host, stratum_port);
         if (rc.file_set("web.external_ip")) external_ip = rc.get_string("web.external_ip").value_or(external_ip);
         if (rc.file_set("web.dashboard_dir")) dashboard_dir = rc.get_string("web.dashboard_dir").value_or(dashboard_dir);
@@ -13732,6 +13757,14 @@ int main(int argc, char** argv)
                             << " -- NOT arming; config-apply stays fail-closed";
             }
         }
+    }
+
+    // --stratum-tls / --stratum-tls-cert / --stratum-tls-key (command line or
+    // settings file): a complete set this build supports, whose certificate
+    // and key load; else refused here, before anything starts.
+    if (auto why = core::check_stratum_tls_settings(core::stratum_tls_setting())) {
+        std::cout << "c2pool-dash: " << *why << "\n";
+        return 2;
     }
 
     // ── FULL-HISTORY REPLAY W3: --replay-utxo-* standalone utility ──────────

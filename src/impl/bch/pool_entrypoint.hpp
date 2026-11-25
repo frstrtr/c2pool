@@ -1049,6 +1049,8 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
         core::configure_stratum_http(*stratum_server, web_server.get(),
                                      core::stratum_http_mode_setting(),
                                      core::stratum_http_limits_setting());
+    // The TLS stratum listener (--stratum-tls), when set.
+    core::configure_stratum_tls(stratum_server.get(), core::stratum_tls_setting());
 
     // Periodic think/clean tick (every 5s, safety net) — mirrors the LTC/dash
     // tick. Without it, think() fired only on share arrival: no stale-head
