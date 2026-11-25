@@ -22,16 +22,25 @@ set -u
 E=$1 PH=$2 DH=$3 DCONF=${4:-}
 P16=${PH:0:16} D16=${DH:0:16}
 LOGS=("$E"/node?.log)
-MARK=$(cat "$E/l3.mark" 2>/dev/null || echo "")   # HH:MM:SS of the orphan step
 
 p_orph=$(cat "${LOGS[@]}" | grep -c "Block ${P16}\.\.\. ORPHANED (confirmations=-")
 d_orph=$(cat "${LOGS[@]}" | grep -A3 "BLOCK ORPHANED — DOGE" | grep -c "Block hash: *${DH}")
-# submits of D stamped after the orphan step (log lines start "[HH:MM:SS.")
-if [ -n "$MARK" ]; then
-  resub=$(cat "${LOGS[@]}" | grep "Merged block submitted.*snapshot hash=${D16}" \
+# submits of D written after the orphan step. l3.lines holds the nodeA/nodeB log line
+# counts at that step, so only later lines are read: no clock, timezone or midnight
+# dependence. Evidence from older harness runs has only l3.mark (UTC HH:MM:SS, while
+# node logs stamp local time); it is compared as before and tagged clock=legacy-utc.
+RESUB_RE="Merged block submitted.*snapshot hash=${D16}"
+if [ -s "$E/l3.lines" ]; then
+  read -r LA LB < "$E/l3.lines"
+  resub=$( { tail -n +"$((LA+1))" "$E/nodeA.log"; tail -n +"$((LB+1))" "$E/nodeB.log"; } | grep -c "$RESUB_RE")
+  clock=lines
+elif [ -s "$E/l3.mark" ]; then
+  MARK=$(cat "$E/l3.mark")
+  resub=$(cat "${LOGS[@]}" | grep "$RESUB_RE" \
           | awk -v m="$MARK" '{t=substr($1,2,8); if (t>=m) n++} END{print n+0}')
+  clock=legacy-utc
 else
-  resub=NA
+  resub=NA; clock=none
 fi
 rows=$(python3 - "$E" "$PH" <<'PY'
 import json,sys
@@ -49,5 +58,5 @@ ok=1
 [ "$resub" = "0" ] || ok=0
 [ "${DCONF:-0}" -lt 0 ] 2>/dev/null || ok=0
 echo "$rows" | grep -q "confirmed" && ok=0
-S="L3SCORE P_ORPH=$p_orph D_ORPH=$d_orph resub_after_orphan=$resub doge_conf_D=${DCONF:-NA} $rows"
+S="L3SCORE P_ORPH=$p_orph D_ORPH=$d_orph resub_after_orphan=$resub resub_clock=$clock doge_conf_D=${DCONF:-NA} $rows"
 if [ $ok = 1 ]; then echo "L3 PASS $S"; else echo "L3 FAIL $S"; fi

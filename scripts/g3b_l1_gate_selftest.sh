@@ -10,6 +10,7 @@ chk(){ if [ "$1" = "$2" ]; then echo "ok   $3"; else echo "FAIL $3 (got $1 want 
 n(){ printf '%s\n' "$1" | grep -Eci "$REJ_RE"; }
 chk "$(n '2026-11-24 [error] submit_block_hex result: "high-hash"')" 1 "LTC daemon reject counted"
 chk "$(n 'Block submittal result: 0("bad-txnmrklroot") Expected: 1')" 1 "LTC submit_block reject counted"
+chk "$(n '[warning] submitblock: coin daemon rejected the block (or already had it)')" 1 "stratum submit reject counted"
 chk "$(n '[MM:DOGE] submitblock REJECTED by daemon: bad-cb-amount')" 1 "DOGE reject counted"
 chk "$(n '[MM:DOGE] submitblock failed: connection refused')" 1 "DOGE exception counted"
 chk "$(n 'submit_block_hex accepted')" 0 "LTC accept not counted"

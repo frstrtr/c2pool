@@ -193,9 +193,10 @@ PY
 LACC=$(grep -c "submit_block_hex accepted" "$P/nodeA.log" "$P/nodeB.log" | awk -F: '{s+=$2}END{print s}')
 DACC=$(cat "$P"/node?.log | grep -c "\[MM:DOGE\] submitblock ACCEPTED")
 # LTC NodeRPC::submit_block_hex logs a daemon reject as "submit_block_hex result: <reason>"
-# (no "reject" word); submit_block logs "Block submittal result:"; the DOGE aux path logs
-# "] submitblock REJECTED by daemon:" or, on an RPC exception, "] submitblock failed:".
-REJ_RE="submit_block_hex result:|Block submittal result:|submit_block_hex.*reject|\] submitblock (REJECT|failed:)"
+# (no "reject" word); submit_block logs "Block submittal result:"; the stratum submit path
+# (core web_server.cpp) logs "submitblock: coin daemon rejected the block"; the DOGE aux path
+# logs "] submitblock REJECTED by daemon:" or, on an RPC exception, "] submitblock failed:".
+REJ_RE="submit_block_hex result:|Block submittal result:|submitblock: coin daemon rejected|submit_block_hex.*reject|\] submitblock (REJECT|failed:)"
 REJ=$(cat "$P"/node?.log | grep -Eci "$REJ_RE")
 S1=$(grep L1SUM "$P/extract.txt")
 if [ "$LACC" -ge 1 ] && [ "$DACC" -ge 1 ] && [ "$REJ" -eq 0 ] && echo "$S1" | grep -Eq "(^| )populated=[1-9]" && echo "$S1" | grep -q "doge_auxpow=[1-9]" && echo "$S1" | grep -q "doge_populated=[1-9]"; then
@@ -205,16 +206,26 @@ if [ "$LACC" -ge 1 ] && [ "$DACC" -ge 1 ] && [ "$REJ" -eq 0 ] && echo "$S1" | gr
 if [[ $LEGS == *2* ]]; then
   CA=$(grep -c "\-> CONFIRMED" "$P/nodeA.log"); CB=$(grep -c "\-> CONFIRMED" "$P/nodeB.log")
   REV=$(cat "$P"/node?.log | grep -c "ACTIVATED -> VOTING\|CONFIRMED but network is")
-  V35=$(grep -c "using=v35" "$P/nodeA.log"); V36A=$(grep -c "using=v36" "$P/nodeA.log"); V36B=$(grep -c "using=v36" "$P/nodeB.log")
+  V35A=$(grep -c "using=v35" "$P/nodeA.log"); V35B=$(grep -c "using=v35" "$P/nodeB.log")
+  V36A=$(grep -c "using=v36" "$P/nodeA.log"); V36B=$(grep -c "using=v36" "$P/nodeB.log")
   BADA=$(grep -cE "$STRICT" "$P/nodeA.log"); BADB=$(grep -cE "$STRICT" "$P/nodeB.log")
   XNB=$(cat "$P"/node?.log | grep -c "Cross-check mismatch (non-blocking)")
   PAY=$(grep L2PAY "$P/extract.txt")
-  sleep 15
-  BA=$(grep -o "best_hash=[0-9a-f]*" "$P/nodeA.log" | tail -1); BB=$(grep -o "best_hash=[0-9a-f]*" "$P/nodeB.log" | tail -1)
+  # no-fork check: both nodes must report the same best share. The miners are still
+  # running, so a sample can catch one node a share ahead; sample up to 12 times, 5s
+  # apart, and accept the first sample where the two tips are equal and non-zero.
+  TIPEQ=0; BA=""; BB=""
+  for i in $(seq 1 12); do
+    BA=$(curl -s --max-time 5 http://127.0.0.1:28090/web/best_share_hash | tr -dc '0-9a-f')
+    BB=$(curl -s --max-time 5 http://127.0.0.1:28091/web/best_share_hash | tr -dc '0-9a-f')
+    echo "tip sample $i A=$BA B=$BB" >> "$P/tips.txt"
+    if [ -n "$BA" ] && [ "$BA" = "$BB" ] && [ -n "${BA//0/}" ]; then TIPEQ=1; break; fi
+    sleep 5
+  done
   for n in A B; do grep -E "\[AutoRatchet\] (VOTING|ACTIVATED|CONFIRMED) ->|\[AutoRatchet\] ACTIVATED:" "$P/node$n.log" > "$P/ratchet$n.txt"; done
-  L2="confirmed A=$CA B=$CB reverts=$REV hook v35=$V35 v36 A=$V36A B=$V36B verify_fail A=$BADA B=$BADB xcheck_nonblocking=$XNB $PAY tipA=$BA tipB=$BB cross_ltc_h=${CROSS_LTC_H:-none}"
-  if [ "$CA" -ge 1 ] && [ "$CB" -ge 1 ] && [ "$REV" -eq 0 ] && [ "$V35" -ge 1 ] && [ "$V36A" -ge 1 ] && [ "$V36B" -ge 1 ] \
-     && [ "$BADA" -eq 0 ] && [ "$BADB" -eq 0 ] && echo "$PAY" | grep -qE "pre_switch=[1-9][0-9]*/[0-9]+ post_switch=[1-9][0-9]*/[0-9]+"; then
+  L2="confirmed A=$CA B=$CB reverts=$REV hook v35 A=$V35A B=$V35B v36 A=$V36A B=$V36B verify_fail A=$BADA B=$BADB xcheck_nonblocking=$XNB $PAY tipA=${BA:0:16} tipB=${BB:0:16} tip_equal=$TIPEQ cross_ltc_h=${CROSS_LTC_H:-none}"
+  if [ "$CA" -ge 1 ] && [ "$CB" -ge 1 ] && [ "$REV" -eq 0 ] && [ "$V35A" -ge 1 ] && [ "$V35B" -ge 1 ] && [ "$V36A" -ge 1 ] && [ "$V36B" -ge 1 ] \
+     && [ "$TIPEQ" -eq 1 ] && [ "$BADA" -eq 0 ] && [ "$BADB" -eq 0 ] && echo "$PAY" | grep -qE "pre_switch=[1-9][0-9]*/[0-9]+ post_switch=[1-9][0-9]*/[0-9]+"; then
     res "L2 PASS $L2"; else res "L2 FAIL $L2"; fi
 fi
 
@@ -242,7 +253,9 @@ PY
     curl -s http://127.0.0.1:28090/recent_blocks > "$P/recent_blocks.before.json"
     # orphan the parent: invalidate P and build a longer competing branch without c2pool
     PHH=$(LC getblockheader "$PH" | J "d['height']"); TIP=$(LC getblockcount)
-    date -u +%H:%M:%S > "$P/l3.mark"   # resubmits of D are counted from here
+    # resubmits of D are counted from here: record each node log's line count, so the
+    # scorer reads only lines written after this point (no clock or midnight dependence)
+    echo "$(wc -l < "$P/nodeA.log") $(wc -l < "$P/nodeB.log")" > "$P/l3.lines"
     LC invalidateblock "$PH"; LC generatetoaddress $((TIP-PHH+8)) "$GEN" >/dev/null
     # orphan D on the aux chain too (aux block whose parent was lost must not stand)
     DC invalidateblock "$DH"; DC generatetoaddress 10 "$(DC getnewaddress)" >/dev/null
