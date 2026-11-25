@@ -22,9 +22,12 @@
 #                       A and B end on the same best share (no fork).
 #   L3 parent lost    : orphan an LTC parent P that carried the aux commit of an
 #                       accepted DOGE block D (invalidateblock P + a longer non-c2pool
-#                       branch), then orphan D on dogecoind. PASS = c2pool never
-#                       re-submits D, D appears once in /recent_blocks (no double
-#                       credit), and P and D rows leave "confirmed".
+#                       branch), then orphan D on dogecoind. Scored by
+#                       g3b_l3_score.sh from the node logs: PASS = the node logs P
+#                       ORPHANED and the DOGE orphan banner for D, never re-submits
+#                       D after the orphan step, dogecoind has D at confirmations<0,
+#                       and no /recent_blocks row says P is "confirmed" (RPC mode
+#                       never writes a row verdict, so rows stay "pending").
 #
 # Regtest difficulty is trivial (every hash is a share AND a block) and c2pool
 # clamps stratum difficulty DOWN to the pool-share difficulty (so
@@ -47,6 +50,7 @@ if [ "$CROSS_TIMEOUT_S" -lt "$CROSS_TIMEOUT_FLOOR_S" ] && [ "${G3B_ALLOW_SHORT_T
   CROSS_TIMEOUT_REQ=$CROSS_TIMEOUT_S; CROSS_TIMEOUT_S=$CROSS_TIMEOUT_FLOOR_S
 fi
 MINER="$(cd "$(dirname "$0")" && pwd)/g3b_paced_scrypt_miner.py"
+L3SCORE="$(cd "$(dirname "$0")" && pwd)/g3b_l3_score.sh"
 mkdir -p "$P"; exec >>"$P/driver.log" 2>&1
 log(){ printf "[%s] %s\n" "$(date -u +%FT%TZ)" "$*"; }
 res(){ echo "$*" >> "$P/VERDICT"; log "RESULT $*"; }
@@ -228,33 +232,19 @@ PY
   if [ -z "${PH:-}" ]; then res "L3 FAIL no (LTC parent, DOGE aux) pair found"; else
     log "L3 pair P=$PH D=$DH doge_h=$DHH"
     kill $MINERS 2>/dev/null; MINERS=""; sleep 10
-    SUBD0=$(cat "$P"/node?.log | grep -c "$DH")
     curl -s http://127.0.0.1:28090/recent_blocks > "$P/recent_blocks.before.json"
     # orphan the parent: invalidate P and build a longer competing branch without c2pool
     PHH=$(LC getblockheader "$PH" | J "d['height']"); TIP=$(LC getblockcount)
+    date -u +%H:%M:%S > "$P/l3.mark"   # resubmits of D are counted from here
     LC invalidateblock "$PH"; LC generatetoaddress $((TIP-PHH+8)) "$GEN" >/dev/null
     # orphan D on the aux chain too (aux block whose parent was lost must not stand)
     DC invalidateblock "$DH"; DC generatetoaddress 10 "$(DC getnewaddress)" >/dev/null
     log "L3 orphaned P (ltc h=$PHH, tip now $(LC getblockcount)) and D (doge h=$DHH, tip now $(DC getblockcount))"
     sleep 180   # FoundBlock verifiers run at +30s/+120s
     curl -s http://127.0.0.1:28090/recent_blocks > "$P/recent_blocks.after.json"
-    SUBD1=$(cat "$P"/node?.log | grep -c "$DH")
-    python3 - "$P" "$PH" "$DH" > "$P/l3.txt" <<'PY'
-import json,sys
-P,PH,DH=sys.argv[1:]
-try: rows=json.load(open(f"{P}/recent_blocks.after.json"))
-except Exception as e: print(f"L3ROWS unreadable {e}"); sys.exit()
-rows=rows if isinstance(rows,list) else rows.get("blocks",rows.get("recent_blocks",[]))
-def find(h): return [r for r in rows if h in json.dumps(r)]
-p,d=find(PH),find(DH)
-st=lambda rs:[(r.get("status") or r.get("verdict") or r.get("confirmed") or r.get("state")) for r in rs]
-print(f"L3ROWS parent_rows={len(p)} parent_status={st(p)} aux_rows={len(d)} aux_status={st(d)}")
-PY
-    L3=$(cat "$P/l3.txt"); DCHAIN=$(DC getblock "$DH" 2>/dev/null | J "d['confirmations']")
-    log "L3 $L3 doge_conf_of_D=$DCHAIN log_mentions_D before=$SUBD0 after=$SUBD1"
-    if echo "$L3" | grep -q "aux_rows=1 " && [ "$SUBD1" -eq "$SUBD0" ] && [ "${DCHAIN:-0}" -lt 0 ] \
-       && ! echo "$L3" | grep -qiE "status=\[[^]]*confirmed"; then
-      res "L3 PASS $L3 doge_conf_D=$DCHAIN resubmits=0"; else res "L3 FAIL-or-REVIEW $L3 doge_conf_D=$DCHAIN log_D $SUBD0->$SUBD1"; fi
+    DCHAIN=$(DC getblock "$DH" 2>/dev/null | J "d['confirmations']")
+    L3=$("$L3SCORE" "$P" "$PH" "$DH" "$DCHAIN" | tee "$P/l3.txt")
+    log "$L3"; res "$L3"
   fi
 fi
 log "VERDICT $(tr '\n' ' ' < "$P/VERDICT")"
