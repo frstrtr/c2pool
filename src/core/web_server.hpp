@@ -400,6 +400,7 @@ public:
     nlohmann::json rest_miner_stats(const std::string& address);  // /miner_stats/<addr> — detailed per-miner stats
     nlohmann::json rest_best_share();               // /best_share — node-wide best share (BitAxe style)
     nlohmann::json rest_miner_payouts(const std::string& address); // /miner_payouts/<addr> — payout history per miner
+    nlohmann::json rest_merged_miner_payouts(const std::string& address); // /merged_miner_payouts/<addr> — merged (aux) blocks per miner
     nlohmann::json rest_version_signaling(const nlohmann::json* cached_sc = nullptr); // /version_signaling — V36 version tracking
     nlohmann::json rest_v36_status();                // /v36_status — V36 diagnostic
     nlohmann::json rest_patron_sendmany(const std::string& total); // /patron_sendmany/<total> — sendmany text
@@ -1678,6 +1679,12 @@ public:
     /// shares) decodes back to that address; a bare 20-byte pubkey hash
     /// (v36) cannot be rendered without its script type and reads "".
     static std::string found_block_miner_display(const std::string& stored);
+    /// A row's miner is this address's payee: the same address, another
+    /// spelling of the same script, or a pre-fix raw 20-byte pubkey hash
+    /// (uint160::GetHex, byte-reversed) that is the hash of the address's
+    /// P2PKH, P2WPKH or P2SH script. An empty address matches every row.
+    static bool found_block_miner_pays(const std::string& stored,
+                                       const std::string& address);
     /// Block-explorer prefix for a merged (aux) chain label ("" = none known,
     /// emitted as null). The parent prefix (block_explorer_prefix) must never
     /// link an aux hash: blockchair/litecoin answers "not found" for a DOGE id.

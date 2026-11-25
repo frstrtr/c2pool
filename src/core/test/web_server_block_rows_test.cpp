@@ -271,6 +271,82 @@ TEST(FoundBlockRows, MinerPayoutsMatchThePayeeNotTheSpelling)
     EXPECT_EQ(mi.rest_miner_payouts(kMiner)["blocks_found"].get<int>(), 0);
 }
 
+// /merged_miner_payouts/<addr> (the miner page's merged panel) lists the aux
+// blocks this miner's shares found, in the aux coin; the parent page keeps
+// the parent blocks only.
+TEST(FoundBlockRows, MergedMinerPayoutsListTheMinersAuxBlocks)
+{
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::LITECOIN);
+    record_the_find(mi);
+    const auto st = mi.rest_merged_miner_payouts(kMiner);
+    ASSERT_EQ(st["blocks_found"].get<int>(), 1) << st.dump(1);
+    ASSERT_EQ(st["blocks"].size(), 1u);
+    EXPECT_EQ(st["symbol"].get<std::string>(), "DOGE");
+    const auto& b = st["blocks"][0];
+    EXPECT_EQ(b["block_hash"].get<std::string>(), kDogeBlock);
+    EXPECT_EQ(b["symbol"].get<std::string>(), "DOGE");
+    EXPECT_EQ(b["block_height"].get<uint64_t>(), kDogeHeight);
+    EXPECT_NEAR(b["block_reward"].get<double>(), 10001.17205332, 1e-6);
+    EXPECT_EQ(b["explorer_url"].get<std::string>(),
+              "https://blockchair.com/dogecoin/block/" + kDogeBlock);
+    EXPECT_NEAR(st["total_estimated_rewards"].get<double>(), 10001.17205332, 1e-6);
+
+    EXPECT_EQ(mi.rest_merged_miner_payouts("LLd7gHqnEkaYahJ3s4gGuR7Qqps9pqQtYi")
+                  ["blocks_found"].get<int>(), 0);
+    EXPECT_EQ(mi.rest_miner_payouts(kMiner)["blocks_found"].get<int>(), 1);
+}
+
+// A row a pre-fix binary recorded from a v36 share holds the share's pubkey
+// hash as uint160::GetHex (the 20 script bytes reversed). It still counts for
+// the address paying that hash, P2PKH or P2WPKH; the bytes in script order
+// name nobody.
+TEST(FoundBlockRows, MinerPayoutsCountPreFixPubkeyHashRows)
+{
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::LITECOIN);
+    std::vector<unsigned char> h(20);
+    for (size_t i = 0; i < h.size(); ++i) h[i] = static_cast<unsigned char>(0x10 + 7 * i);
+    std::vector<unsigned char> p2pkh{0x76, 0xa9, 0x14};
+    p2pkh.insert(p2pkh.end(), h.begin(), h.end());
+    p2pkh.push_back(0x88);
+    p2pkh.push_back(0xac);
+    std::vector<unsigned char> p2wpkh{0x00, 0x14};
+    p2wpkh.insert(p2wpkh.end(), h.begin(), h.end());
+    const std::string legacy = core::script_to_address(p2pkh, "", 0x30, 0x32);   // L...
+    const std::string bech   = core::script_to_address(p2wpkh, "ltc", 0x30, 0x32);
+    ASSERT_EQ(legacy[0], 'L');
+
+    static const char* kHex = "0123456789abcdef";
+    std::string reversed, forward;
+    for (size_t i = 0; i < 20; ++i) {
+        const unsigned char r = h[19 - i], f = h[i];
+        reversed += kHex[r >> 4]; reversed += kHex[r & 0x0f];
+        forward  += kHex[f >> 4]; forward  += kHex[f & 0x0f];
+    }
+    ASSERT_EQ(MiningInterface::found_block_miner_display(reversed), "");
+
+    const std::string b1 = "7777777777777777777777777777777777777777777777777777777777770011";
+    const std::string b2 = "7777777777777777777777777777777777777777777777777777777777770012";
+    mi.record_found_block(3204796, uint256S(b1), 1793436566, "LTC", reversed, b1,
+                          0.0, 0.0, 0.0, 625000000,
+                          MiningInterface::BlockAuthorship::sharechain_peer);
+    mi.record_found_block(3204797, uint256S(b2), 1793436666, "LTC", forward, b2,
+                          0.0, 0.0, 0.0, 625000000,
+                          MiningInterface::BlockAuthorship::sharechain_peer);
+
+    const auto st = mi.rest_miner_payouts(legacy);
+    EXPECT_EQ(st["blocks_found"].get<int>(), 1) << st.dump(1);
+    ASSERT_EQ(st["blocks"].size(), 1u);
+    EXPECT_EQ(st["blocks"][0]["block_hash"].get<std::string>(), b1);
+    EXPECT_EQ(mi.rest_miner_payouts(bech)["blocks_found"].get<int>(), 1) << bech;
+    EXPECT_EQ(mi.rest_miner_payouts(kMiner)["blocks_found"].get<int>(), 0);
+
+    EXPECT_TRUE(MiningInterface::found_block_miner_pays(reversed, legacy));
+    EXPECT_FALSE(MiningInterface::found_block_miner_pays(forward, legacy));
+    EXPECT_FALSE(MiningInterface::found_block_miner_pays(reversed, kMiner));
+}
+
 // Requirement 3: rows persisted by the old binaries restore without harm and
 // render the facts they can, null where they cannot.
 TEST(FoundBlockRows, PreFixRowsRenderHonestly)
