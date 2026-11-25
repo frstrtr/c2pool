@@ -1071,6 +1071,7 @@ public:
     // refresh_work() path can push the current distribution here so
     // /current_payouts reflects the live sharechain.
     void set_cached_pplns_outputs(std::vector<std::pair<std::string, uint64_t>> v) {
+        note_pplns_payees(v);
         std::lock_guard<std::mutex> lock(m_work_mutex);
         m_cached_pplns_outputs = std::move(v);
     }
@@ -1685,6 +1686,17 @@ public:
     /// P2PKH, P2WPKH or P2SH script. An empty address matches every row.
     static bool found_block_miner_pays(const std::string& stored,
                                        const std::string& address);
+    /// The miner a found-block row is shown and counted under: the stored
+    /// miner when it renders; for a pre-fix raw pubkey-hash row, the payee
+    /// address this node has seen in a PPLNS distribution whose script pays
+    /// that hash; otherwise (no miner known) the parent coinbase's donation
+    /// address. "" on a coin with no address form for it.
+    /// *unknown (optional) is set when no miner is known and the donation
+    /// address stands in for it (API: "miner_unknown": true).
+    std::string found_block_row_miner(const std::string& stored, bool* unknown = nullptr) const;
+    /// Remember the payee addresses of a PPLNS distribution (bounded) so a
+    /// pre-fix pubkey-hash row can be shown under its address.
+    void note_pplns_payees(const std::vector<std::pair<std::string, uint64_t>>& outputs);
     /// Block-explorer prefix for a merged (aux) chain label ("" = none known,
     /// emitted as null). The parent prefix (block_explorer_prefix) must never
     /// link an aux hash: blockchair/litecoin answers "not found" for a DOGE id.
@@ -2239,6 +2251,10 @@ private:
     std::string             m_cached_coinb1;
     std::string             m_cached_coinb2;
     mutable std::mutex      m_work_mutex;
+    // Payee addresses seen in PPLNS distributions (note_pplns_payees). Leaf
+    // lock: nothing else is taken while it is held.
+    mutable std::mutex      m_pplns_payees_mutex;
+    std::set<std::string>   m_pplns_payees;
 
     // Recent-won-block dedup state (#886) — see already_submitted_block().
     mutable std::mutex      m_recent_submit_mutex;
