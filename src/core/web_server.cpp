@@ -1842,6 +1842,7 @@ MiningInterface::build_job_coinbase(
         const std::string bits_str = tmpl.value("bits", std::string());
         if (ws.needs_pplns_recompute && ws.pplns_best_share == prev_share_hash && !recomputed_split.empty()
             && !self.cached_pplns_matches(prev_share_hash, value, bits_str, ws.donation_script)) {
+            self.note_pplns_payees(recomputed_split);
             self.m_cached_pplns_outputs = std::move(recomputed_split);
             self.m_cached_pplns_best_share = ws.pplns_best_share;
             self.m_cached_raw_scripts = ws.raw_scripts;
@@ -3754,6 +3755,9 @@ nlohmann::json MiningInterface::found_block_row_locked(const FoundBlock& b) cons
         || b.effort_method == core::luck::EffortMethod::single_sample
         || imported_effort)
         history_coverage = b.history_coverage;
+    // Evaluated before the initializer: "miner" sets it, "miner_unknown" reads it.
+    bool miner_unknown = false;
+    const std::string row_miner_shown = found_block_row_miner(b.miner, &miner_unknown);
     return {
         {"ts", b.ts},
         {"hash", b.hash},
@@ -3766,7 +3770,8 @@ nlohmann::json MiningInterface::found_block_row_locked(const FoundBlock& b) cons
         {"confirmations", b.confirmations},
         // Rendered on read so a pre-fix peer row's raw hex never reaches the
         // UI as if it were an address (found_block_miner_display).
-        {"miner", found_block_miner_display(b.miner)},
+        {"miner", row_miner_shown},
+        {"miner_unknown", miner_unknown},
         // #946: no share behind the find (e.g. an aux solve that missed the
         // share target) is null, never "". A pre-fix finder row naming the
         // winner's PARENT share is null too (found_block_share_hash).
@@ -8112,6 +8117,61 @@ std::vector<unsigned char> p2pk_as_p2pkh(const std::vector<unsigned char>& s)
     p2pkh.push_back(0xac);
     return p2pkh;
 }
+} // namespace
+
+void MiningInterface::note_pplns_payees(
+    const std::vector<std::pair<std::string, uint64_t>>& outputs)
+{
+    std::vector<std::string> addrs;
+    for (const auto& [script_hex, amount] : outputs) {
+        (void)amount;
+        const auto addr = primary_script_to_address(ParseHex(script_hex));
+        if (!addr.empty()) addrs.push_back(addr);
+    }
+    std::lock_guard<std::mutex> lock(m_pplns_payees_mutex);
+    for (auto& a : addrs) {
+        if (m_pplns_payees.size() >= 4096) break;
+        m_pplns_payees.insert(std::move(a));
+    }
+}
+
+std::string MiningInterface::found_block_row_miner(const std::string& stored, bool* unknown) const
+{
+    if (unknown) *unknown = false;
+    const std::string shown = found_block_miner_display(stored);
+    if (!shown.empty()) return shown;
+    if (stored.size() == 40) {
+        std::lock_guard<std::mutex> lock(m_pplns_payees_mutex);
+        for (const auto& addr : m_pplns_payees)
+            if (found_block_miner_pays(stored, addr)) return addr;
+    }
+    // No miner known: the parent coinbase's donation address, on a coin with
+    // an address form for it (as /web/currency_info's donation_address).
+    if (unknown) *unknown = true;
+    std::string label = m_coin_label;
+    for (auto& c : label) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    if (label == "BCH" || label == "NMC" || label == "BIP110")
+        return {};
+    switch (m_blockchain) {
+    case Blockchain::LITECOIN:
+    case Blockchain::BITCOIN:
+    case Blockchain::DOGECOIN:
+    case Blockchain::DASH:
+        break;
+    default:
+        return {};
+    }
+    const auto donation = m_donation_script;
+    if (donation.empty()) return {};
+    auto addr = primary_script_to_address(donation);
+    if (addr.empty()) {
+        const auto p2pkh = p2pk_as_p2pkh(donation);
+        if (!p2pkh.empty()) addr = primary_script_to_address(p2pkh);
+    }
+    return addr;
+}
+
+namespace {
 
 // A merged chain's address of a script on the node's network, from the
 // chain's own versions in c2pool::merged::aux_chain_params_table (the table
@@ -9815,7 +9875,10 @@ nlohmann::json MiningInterface::rest_miner_payouts(const std::string& address)
             // this miner found, added its aux reward to the parent-coin totals
             // and linked its aux hash through the parent explorer.
             if (!is_primary_found_block(b)) continue;
-            if (found_block_miner_pays(b.miner, address)) {
+            // The miner the row is shown under (an unknown one: the donation
+            // address), or a pre-fix pubkey-hash row's own payee.
+            if (found_block_miner_pays(found_block_row_miner(b.miner), address)
+                || found_block_miner_pays(b.miner, address)) {
                 ++blocks_found;
                 double payout_estimate = b.subsidy > 0 ? static_cast<double>(b.subsidy) / 1e8 : 0;
                 if (b.status == BlockStatus::confirmed)
@@ -9913,7 +9976,8 @@ nlohmann::json MiningInterface::rest_merged_miner_payouts(const std::string& add
     std::vector<const Row*> mine;
     std::map<std::string, int> per_symbol;
     for (const auto& r : rows) {
-        if (!found_block_miner_pays(r.miner, address)) continue;
+        if (!found_block_miner_pays(found_block_row_miner(r.miner), address)
+            && !found_block_miner_pays(r.miner, address)) continue;
         mine.push_back(&r);
         ++per_symbol[r.symbol];
     }
@@ -11545,7 +11609,10 @@ nlohmann::json MiningInterface::rest_recent_merged_blocks()
         j["pow_hash"]    = blk.block_hash;
         j["parent_hash"] = parent;
         j["height"]      = blk.height;
+        bool miner_unknown = false;
+        miner = found_block_row_miner(miner, &miner_unknown);
         j["miner"]       = miner.empty() ? nlohmann::json(nullptr) : nlohmann::json(miner);
+        j["miner_unknown"] = miner_unknown;
         j["verified"]    = (blk.accepted || (own && own->status == BlockStatus::confirmed))
                                ? nlohmann::json(true) : nlohmann::json(nullptr);
         j["explorer_url"] = explorer_of(blk.symbol, blk.block_hash);
@@ -11567,7 +11634,10 @@ nlohmann::json MiningInterface::rest_recent_merged_blocks()
         j["parent_hash"] = b.parent_hash.empty() ? nlohmann::json(nullptr)
                                                  : nlohmann::json(b.parent_hash);
         j["height"]      = b.height;
-        j["miner"]       = b.miner.empty() ? nlohmann::json(nullptr) : nlohmann::json(b.miner);
+        bool miner_unknown = false;
+        const std::string row_miner = found_block_row_miner(b.miner, &miner_unknown);
+        j["miner"]       = row_miner.empty() ? nlohmann::json(nullptr) : nlohmann::json(row_miner);
+        j["miner_unknown"] = miner_unknown;
         j["verified"]    = b.status == BlockStatus::confirmed ? nlohmann::json(true)
                          : b.status == BlockStatus::orphaned  ? nlohmann::json(false)
                                                               : nlohmann::json(nullptr);
@@ -11613,7 +11683,10 @@ nlohmann::json MiningInterface::rest_discovered_merged_blocks()
         j["aux_hash"]         = blk.block_hash;
         j["aux_symbol"]       = blk.symbol;
         j["aux_reward"]       = blk.coinbase_value > 0 ? nlohmann::json(blk.coinbase_value / 1e8) : nlohmann::json(nullptr);
-        j["miner"]            = blk.miner.empty() ? nlohmann::json(nullptr) : nlohmann::json(blk.miner);
+        bool miner_unknown = false;
+        const std::string row_miner = found_block_row_miner(blk.miner, &miner_unknown);
+        j["miner"]            = row_miner.empty() ? nlohmann::json(nullptr) : nlohmann::json(row_miner);
+        j["miner_unknown"]    = miner_unknown;
         j["peer_addr"]        = blk.is_local ? "local" : "peer";
         j["status"]           = blk.accepted ? "confirmed" : "orphaned";
         arr.push_back(std::move(j));

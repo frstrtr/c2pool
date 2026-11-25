@@ -31,6 +31,8 @@
 
 #include <core/uint256.hpp>
 #include <core/web_server.hpp>
+#include <core/donation.hpp>
+#include <core/address_utils.hpp>
 
 using core::MiningInterface;
 
@@ -345,6 +347,63 @@ TEST(FoundBlockRows, MinerPayoutsCountPreFixPubkeyHashRows)
     EXPECT_TRUE(MiningInterface::found_block_miner_pays(reversed, legacy));
     EXPECT_FALSE(MiningInterface::found_block_miner_pays(forward, legacy));
     EXPECT_FALSE(MiningInterface::found_block_miner_pays(reversed, kMiner));
+}
+
+// A row with no known miner is shown and counted under the parent coinbase's
+// donation address; a pre-fix pubkey-hash row under the payee a PPLNS
+// distribution named for that hash.
+TEST(FoundBlockRows, UnknownMinerRowsShowTheDonationAddress)
+{
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::LITECOIN);
+    const std::vector<unsigned char> donation(core::donation::COMBINED_DONATION_SCRIPT.begin(),
+                                              core::donation::COMBINED_DONATION_SCRIPT.end());
+    mi.set_donation_script(donation);
+    const std::string donation_addr = core::script_to_address(donation, true, false);
+    ASSERT_FALSE(donation_addr.empty());
+
+    // The payee behind a pre-fix row: P2PKH of h, stored as h reversed.
+    std::vector<unsigned char> h(20);
+    for (size_t i = 0; i < h.size(); ++i) h[i] = static_cast<unsigned char>(0x21 + 3 * i);
+    std::vector<unsigned char> p2pkh{0x76, 0xa9, 0x14};
+    p2pkh.insert(p2pkh.end(), h.begin(), h.end());
+    p2pkh.push_back(0x88);
+    p2pkh.push_back(0xac);
+    const std::string payee = core::script_to_address(p2pkh, true, false);
+    static const char* kHex = "0123456789abcdef";
+    std::string reversed, script_hex;
+    for (size_t i = 0; i < 20; ++i) {
+        const unsigned char r = h[19 - i];
+        reversed += kHex[r >> 4]; reversed += kHex[r & 0x0f];
+    }
+    for (unsigned char c : p2pkh) { script_hex += kHex[c >> 4]; script_hex += kHex[c & 0x0f]; }
+
+    const std::string b1 = "7777777777777777777777777777777777777777777777777777777777770021";
+    const std::string b2 = "7777777777777777777777777777777777777777777777777777777777770022";
+    mi.record_found_block(3160570, uint256S(b1), 1786832375, "LTC", "", b1,
+                          0.0, 0.0, 0.0, 625000000,
+                          MiningInterface::BlockAuthorship::sharechain_peer);
+    mi.record_found_block(3204796, uint256S(b2), 1793436566, "LTC", reversed, b2,
+                          0.0, 0.0, 0.0, 625000000,
+                          MiningInterface::BlockAuthorship::sharechain_peer);
+
+    // Before any PPLNS distribution names the payee, both rows are unknown.
+    auto recent = mi.rest_recent_blocks();
+    EXPECT_EQ(find_row(recent, "hash", b1)["miner"].get<std::string>(), donation_addr);
+    EXPECT_EQ(find_row(recent, "hash", b2)["miner"].get<std::string>(), donation_addr);
+
+    mi.set_cached_pplns_outputs({{script_hex, 100000000}});
+    recent = mi.rest_recent_blocks();
+    EXPECT_EQ(find_row(recent, "hash", b1)["miner"].get<std::string>(), donation_addr);
+    EXPECT_EQ(find_row(recent, "hash", b2)["miner"].get<std::string>(), payee);
+    // Marked as a stand-in, not a donation payout.
+    EXPECT_TRUE(find_row(recent, "hash", b1)["miner_unknown"].get<bool>());
+    EXPECT_FALSE(find_row(recent, "hash", b2)["miner_unknown"].get<bool>());
+
+    const auto don = mi.rest_miner_payouts(donation_addr);
+    EXPECT_EQ(don["blocks_found"].get<int>(), 1) << don.dump(1);
+    EXPECT_EQ(mi.rest_miner_payouts(payee)["blocks_found"].get<int>(), 1);
+    EXPECT_EQ(mi.rest_miner_payouts(kMiner)["blocks_found"].get<int>(), 0);
 }
 
 // Requirement 3: rows persisted by the old binaries restore without harm and
