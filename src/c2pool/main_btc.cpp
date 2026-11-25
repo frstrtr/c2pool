@@ -2930,9 +2930,14 @@ int main(int argc, char* argv[])
         // is DELIBERATELY pure — unlike the set_pplns_fn seam it does NOT call
         // ws->set_donation_script(), which is a stratum work-refresh side effect
         // and must not fire from a display timer.
+        // The last distribution served: returned while the tracker is busy
+        // (read_tracker() is a try-lock), so a page load during share
+        // processing shows the payouts instead of {}.
+        struct LastPayouts { std::mutex m; nlohmann::json j = nlohmann::json::object(); };
+        auto last_payouts = std::make_shared<LastPayouts>();
         auto current_pplns =
             [p2p_node_raw, auto_ratchet, &header_chain, ws = work_source.get(),
-             halving = chain_params.subsidy_halving_interval, testnet]()
+             halving = chain_params.subsidy_halving_interval, testnet, last_payouts]()
             -> nlohmann::json {
                 if (!p2p_node_raw) return nlohmann::json::object();
                 // best_share_hash() takes its OWN try-shared-lock; read it BEFORE
@@ -2949,12 +2954,20 @@ int main(int argc, char* argv[])
                 if (!bb) if (auto t = header_chain.tip()) bb = t->header.m_bits;
                 if (!bb) return nlohmann::json::object();
                 auto guard = p2p_node_raw->read_tracker();
-                if (!guard) return nlohmann::json::object();
+                if (!guard) {
+                    std::lock_guard<std::mutex> l(last_payouts->m);
+                    return last_payouts->j;
+                }
                 auto [ver, dv] = auto_ratchet->get_share_version(*guard, best);
                 (void)dv;
-                return btc::dashboard::pplns_payouts_current(
+                auto out = btc::dashboard::pplns_payouts_current(
                     *guard, best, static_cast<int>(ver), bb,
                     btc::coin::get_block_subsidy(tip + 1, halving), testnet);
+                if (out.is_object() && !out.empty()) {
+                    std::lock_guard<std::mutex> l(last_payouts->m);
+                    last_payouts->j = out;
+                }
+                return out;
             };
         mi->set_current_payouts_fn(current_pplns);
 
