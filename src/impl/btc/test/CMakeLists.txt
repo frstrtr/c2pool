@@ -23,6 +23,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         genesis_check_test.cpp
         gentx_coinbase_test.cpp
         gentx_unpack_test.cpp
+        header_source_step_test.cpp
         idle_progress_gate_test.cpp
         known_txs_retention_test.cpp
         legacy_addrme_self_probe_test.cpp

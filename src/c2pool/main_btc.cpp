@@ -33,6 +33,7 @@
 // non-broadcaster shape suitable for B2-net smoke testing.
 
 #include <impl/btc/coin/header_chain.hpp>
+#include <impl/btc/coin/header_source_step.hpp>
 #include <core/found_block_lookups.hpp>           // header-bits difficulty by block hash
 #include <impl/btc/coin/template_builder.hpp> // btc::coin::get_block_subsidy — zero-rig block-value projection (dashboard cards)
 #include <impl/btc/coin/tip_reconcile_gate.hpp> // B5b: TipReconcileGate SSOT (10s re-poll cadence + fire predicate) shared with tip_reconcile_test.cpp
@@ -1318,8 +1319,15 @@ int main(int argc, char* argv[])
             // failover draws the NEXT best-scored peer instead of re-picking a
             // dead one; cleared to re-sweep once the banked set is exhausted.
             auto standalone_tried = std::make_shared<std::set<std::string>>();
+            // The candidate dialed last, and whether it ever completed the
+            // handshake: on failover it is reported to the peer manager as a
+            // failed dial or a disconnect, so dead candidates age out of the
+            // working set and DNS-seeded peers can take their places.
+            auto standalone_current    = std::make_shared<std::string>();
+            auto standalone_handshaked = std::make_shared<bool>(false);
             auto dial_standalone_peer =
-                [&coin_node, &coin_peer_mgr, standalone_tried]() -> bool {
+                [&coin_node, &coin_peer_mgr, standalone_tried, standalone_current,
+                 standalone_handshaked]() -> bool {
                     auto cands = coin_peer_mgr->get_peers_to_connect(*standalone_tried);
                     if (cands.empty()) {
                         standalone_tried->clear();
@@ -1331,6 +1339,8 @@ int main(int argc, char* argv[])
                     }
                     const auto& ep = cands.front();
                     standalone_tried->insert(ep.to_string());
+                    *standalone_current    = ep.to_string();
+                    *standalone_handshaked = false;
                     LOG_INFO << "[BTC] standalone header source: dialing coin peer "
                              << ep.to_string() << " (no external bitcoind)";
                     coin_node.start_p2p(ep.to_net_service());
@@ -1365,11 +1375,12 @@ int main(int argc, char* argv[])
             //       peers. Weak self-ref avoids a shared_ptr cycle (mirrors the
             //       B5 warn timer below).
             constexpr int kDriverTickSec         = 12;
-            constexpr int kNoProgressFailoverSec = 40;
             auto hdr_last_height    = std::make_shared<uint32_t>(header_chain.height());
             auto hdr_last_progress  = std::make_shared<std::chrono::steady_clock::time_point>(
                 std::chrono::steady_clock::now());
             auto hdr_was_handshaked = std::make_shared<bool>(false);
+            auto hdr_last_getheaders = std::make_shared<std::chrono::steady_clock::time_point>(
+                std::chrono::steady_clock::now());
             auto standalone_dial_timer =
                 std::make_shared<boost::asio::steady_timer>(ioc);
             auto schedule_standalone_dial = std::make_shared<std::function<void()>>();
@@ -1379,15 +1390,16 @@ int main(int argc, char* argv[])
             std::weak_ptr<std::function<void()>> weak_dial = schedule_standalone_dial;
             *schedule_standalone_dial =
                 [standalone_dial_timer, weak_dial, &coin_node, &header_chain,
-                 &chain_params, dial_standalone_peer, hdr_caught_up,
+                 &chain_params, &coin_peer_mgr, dial_standalone_peer, hdr_caught_up,
                  hdr_last_height, hdr_last_progress, hdr_was_handshaked,
-                 kDriverTickSec, kNoProgressFailoverSec]() {
+                 hdr_last_getheaders, standalone_current, standalone_handshaked,
+                 kDriverTickSec]() {
                     standalone_dial_timer->expires_after(std::chrono::seconds(kDriverTickSec));
                     standalone_dial_timer->async_wait(
                         [standalone_dial_timer, weak_dial, &coin_node, &header_chain,
-                         &chain_params, dial_standalone_peer, hdr_caught_up,
+                         &chain_params, &coin_peer_mgr, dial_standalone_peer, hdr_caught_up,
                          hdr_last_height, hdr_last_progress, hdr_was_handshaked,
-                         kNoProgressFailoverSec]
+                         hdr_last_getheaders, standalone_current, standalone_handshaked]
                         (const boost::system::error_code& ec) {
                             if (ec) return;
                             constexpr uint32_t GETHEADERS_VERSION = 70016;
@@ -1401,34 +1413,51 @@ int main(int argc, char* argv[])
                                 *hdr_last_progress = now;
                             }
 
+                            // A full block locator (tip, then exponentially back to
+                            // genesis): a peer that does not hold our tip (a block
+                            // that lost a race) answers from the fork point, not
+                            // from genesis.
                             auto send_locator_getheaders = [&]() {
-                                uint256 locator;
-                                if (auto tip = header_chain.tip(); tip)
-                                    locator = tip->block_hash;
-                                else
-                                    locator = chain_params.genesis_hash;
+                                auto locator = header_chain.get_locator();
+                                if (locator.empty())
+                                    locator.push_back(chain_params.genesis_hash);
                                 LOG_INFO << "[BTC] standalone header-sync getheaders locator="
-                                         << locator.GetHex().substr(0, 16)
+                                         << locator.front().GetHex().substr(0, 16)
+                                         << " (" << locator.size() << " hashes)"
                                          << " chain_height=" << h;
                                 coin_node.send_getheaders(
-                                    GETHEADERS_VERSION, {locator}, uint256::ZERO);
+                                    GETHEADERS_VERSION, locator, uint256::ZERO);
+                                *hdr_last_getheaders = now;
                             };
 
-                            if (handshaked && !caught_up) {
-                                if (!*hdr_was_handshaked)      // fresh (re)connect
-                                    send_locator_getheaders();
-                                else if (!advanced)            // stalled / at genesis
-                                    send_locator_getheaders();
+                            const bool fresh = handshaked && !*hdr_was_handshaked;
+                            if (fresh && !standalone_current->empty()) {
+                                coin_peer_mgr->notify_connected(*standalone_current);
+                                *standalone_handshaked = true;
                             }
+                            const auto secs = [&](std::chrono::steady_clock::time_point t) {
+                                return static_cast<int64_t>(
+                                    std::chrono::duration_cast<std::chrono::seconds>(now - t).count());
+                            };
+                            const auto step = btc::coin::header_source_step(
+                                caught_up, handshaked, fresh, advanced,
+                                secs(*hdr_last_progress), secs(*hdr_last_getheaders));
+                            if (step.getheaders)
+                                send_locator_getheaders();
                             *hdr_was_handshaked = handshaked;
 
-                            if (!caught_up &&
-                                now - *hdr_last_progress >=
-                                    std::chrono::seconds(kNoProgressFailoverSec)) {
+                            if (step.failover) {
                                 LOG_INFO << "[BTC] standalone header source: no header "
-                                            "progress for " << kNoProgressFailoverSec
+                                            "progress for " << secs(*hdr_last_progress)
                                          << "s (chain_height=" << h << ", handshaked="
-                                         << handshaked << ") — failing over to next candidate";
+                                         << handshaked << ", caught_up=" << caught_up
+                                         << ") — failing over to next candidate";
+                                if (!standalone_current->empty()) {
+                                    if (*standalone_handshaked)
+                                        coin_peer_mgr->notify_disconnected(*standalone_current);
+                                    else
+                                        coin_peer_mgr->notify_dial_failed(*standalone_current);
+                                }
                                 dial_standalone_peer();
                                 *hdr_last_progress  = now;    // grace window for the new peer
                                 *hdr_was_handshaked = false;  // force getheaders on its handshake
@@ -1461,18 +1490,17 @@ int main(int argc, char* argv[])
                 LOG_WARNING << "[BTC] initial getheaders: handshake not complete (peer slow?)";
                 // Fire anyway — at worst the peer ignores and we retry later.
             }
-            // Locator: if HeaderChain has any tip, use its hash; else genesis.
-            // For a fresh DB the chain is empty so locator = [genesis].
-            uint256 locator;
-            if (auto tip = header_chain.tip(); tip)
-                locator = tip->block_hash;
-            else
-                locator = chain_params.genesis_hash;
+            // Locator: the header chain's block locator (tip, then back to
+            // genesis); a fresh DB has none, so locator = [genesis].
+            auto locator = header_chain.get_locator();
+            if (locator.empty())
+                locator.push_back(chain_params.genesis_hash);
             LOG_INFO << "[BTC] Sending initial getheaders, locator="
-                     << locator.GetHex().substr(0, 16)
-                     << " (chain_height=" << header_chain.height() << ")";
+                     << locator.front().GetHex().substr(0, 16)
+                     << " (" << locator.size() << " hashes, chain_height="
+                     << header_chain.height() << ")";
             coin_node.send_getheaders(
-                BTC_PROTOCOL_VERSION, {locator}, uint256::ZERO);
+                BTC_PROTOCOL_VERSION, locator, uint256::ZERO);
         });
 
     // B5: stale-submit warning timer. Every 30s, scan pending_submits for
@@ -1548,16 +1576,15 @@ int main(int argc, char* argv[])
                         have_pending, coin_node.has_p2p(),
                         coin_node.is_handshake_complete())
                     == btc::coin::TipReconcileGate::Action::Poll) {
-                    uint256 locator;
-                    if (auto tip = header_chain.tip(); tip)
-                        locator = tip->block_hash;
-                    else
-                        locator = chain_params.genesis_hash;
+                    auto locator = header_chain.get_locator();
+                    if (locator.empty())
+                        locator.push_back(chain_params.genesis_hash);
                     LOG_INFO << "[BTC-SUBMIT] tip-reconcile getheaders locator="
-                             << locator.GetHex().substr(0, 16)
+                             << locator.front().GetHex().substr(0, 16)
+                             << " (" << locator.size() << " hashes)"
                              << " chain_height=" << header_chain.height();
                     coin_node.send_getheaders(
-                        BTC_PROTOCOL_VERSION, {locator}, uint256::ZERO);
+                        BTC_PROTOCOL_VERSION, locator, uint256::ZERO);
                 }
                 if (auto self = weak_reconcile.lock()) (*self)();
             });
