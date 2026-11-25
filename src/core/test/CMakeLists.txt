@@ -272,6 +272,13 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
     # GET/HEAD, local-only routes, the caps and the session accounting, the
     # handshake deadline, the 503 without a web server. Same folding.
     # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
+    # stratum_tls_test.cpp: the TLS stratum listener (core/stratum_tls.hpp):
+    # the --stratum-tls flags and their refusal without TLS, a real loopback
+    # handshake with a self-signed certificate made in the test, stratum
+    # replies over TLS equal to plain, a plaintext client on the TLS port, the
+    # shared per-IP cap, and certificate reload (file change, reload_tls(),
+    # SIGHUP). The OpenSSL cases compile only with C2POOL_STRATUM_TLS. Same
+    # fold-into-core_test reasoning as every TU here.
     add_executable(core_test
         addr_store_save_test.cpp
         address_coin_validation_test.cpp
@@ -319,6 +326,7 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
         stratum_port_http_test.cpp
         stratum_port_http_wire_test.cpp
         stratum_refusal_log_test.cpp
+        stratum_tls_test.cpp
         template_refresh_on_tx_test.cpp
         template_txs_check_test.cpp
         tx_advertiser_test.cpp

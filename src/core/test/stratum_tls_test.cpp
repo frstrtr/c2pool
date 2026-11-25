@@ -1,0 +1,875 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+//
+// The TLS stratum listener (core/stratum_tls.hpp, StratumServer::start_tls):
+//
+//   * --stratum-tls [HOST:]PORT parse, and the check of the three flags
+//     (complete set, an IP host, a certificate and key that load), which
+//     refuses every flag in a build without TLS;
+//   * a real TLS handshake over loopback with a throwaway self-signed
+//     certificate made here with the OpenSSL API, verified by the client;
+//     mining.subscribe / mining.authorize over TLS get the replies a plain
+//     connection gets from the same server, and the worker registry lists the
+//     TLS session under its real remote address;
+//   * TLS 1.2 and 1.3 clients connect, a client capped below TLS 1.2 does not;
+//   * a plaintext client on the TLS port is closed cleanly and counted, a
+//     client that never starts the handshake is closed at the handshake
+//     timeout, and the listener keeps serving both ports after either;
+//   * an HTTP request line over TLS is an invalid stratum line (HTTP on the
+//     stratum port is the plain listener's only);
+//   * the per-IP cap counts plain and TLS sessions together;
+//   * certificate reload: a changed file is read at the next accept, new
+//     connections get the new certificate while a connection opened before
+//     keeps working; a pair that does not load leaves the last good one in
+//     use; reload_tls() and SIGHUP re-read the files; a passphrase-protected
+//     key is refused without a prompt.
+
+#include <gtest/gtest.h>
+
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <csignal>
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <future>
+#include <memory>
+#include <optional>
+#include <random>
+#include <string>
+#include <thread>
+#include <cstring>
+#include <utility>
+#include <vector>
+
+#include <nlohmann/json.hpp>
+
+#include <core/stratum_server.hpp>
+#include <core/stratum_tls.hpp>
+#include <core/web_server.hpp>
+
+#include "stratum_port_http_test_util.hpp"
+
+#ifdef C2POOL_STRATUM_TLS
+#include <boost/asio/ssl.hpp>
+#include <openssl/evp.h>
+#include <openssl/pem.h>
+#include <openssl/ssl.h>
+#include <openssl/x509.h>
+#include <openssl/x509v3.h>
+#endif
+
+using namespace stratum_http_test;
+using json = nlohmann::json;
+namespace fs = std::filesystem;
+
+namespace {
+
+bool wait_until(const std::function<bool()>& done, std::chrono::milliseconds timeout = 5000ms)
+{
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (done()) return true;
+        std::this_thread::sleep_for(10ms);
+    }
+    return done();
+}
+
+// A fresh directory under the temp dir, removed with the object.
+struct TempDir {
+    fs::path path;
+    TempDir()
+    {
+        std::random_device rd;
+        path = fs::temp_directory_path() / ("c2pool-tls-test-" + std::to_string(rd()) + std::to_string(rd()));
+        fs::create_directories(path);
+    }
+    ~TempDir()
+    {
+        std::error_code ec;
+        fs::remove_all(path, ec);
+    }
+};
+
+}  // namespace
+
+// ── The flags ───────────────────────────────────────────────────────────────
+
+TEST(StratumTlsFlags, BindParse)
+{
+    std::string host = "unchanged";
+    uint16_t port = 1;
+    ASSERT_TRUE(core::parse_stratum_tls_bind("3334", host, port));
+    EXPECT_EQ(host, "");
+    EXPECT_EQ(port, 3334);
+    ASSERT_TRUE(core::parse_stratum_tls_bind("0.0.0.0:3335", host, port));
+    EXPECT_EQ(host, "0.0.0.0");
+    EXPECT_EQ(port, 3335);
+    ASSERT_TRUE(core::parse_stratum_tls_bind("[::]:3336", host, port));
+    EXPECT_EQ(host, "::");
+    EXPECT_EQ(port, 3336);
+    ASSERT_TRUE(core::parse_stratum_tls_bind("[2001:db8::1]:65535", host, port));
+    EXPECT_EQ(host, "2001:db8::1");
+    EXPECT_EQ(port, 65535);
+
+    for (const char* bad : {"", "0", "65536", "99999999", "abc", "3334x", ":3334", "host:", "[::1]",
+                            "[::1]3334", "[]:3334", "1.2.3.4:-1", "1.2.3.4: 80"}) {
+        host = "unchanged";
+        port = 7;
+        EXPECT_FALSE(core::parse_stratum_tls_bind(bad, host, port)) << bad;
+        EXPECT_EQ(host, "unchanged") << bad;
+        EXPECT_EQ(port, 7) << bad;
+    }
+}
+
+TEST(StratumTlsFlags, NothingSetIsFine)
+{
+    EXPECT_FALSE(core::check_stratum_tls_settings({}, true));
+    EXPECT_FALSE(core::check_stratum_tls_settings({}, false));
+    EXPECT_FALSE(core::check_stratum_tls_settings({}));
+}
+
+TEST(StratumTlsFlags, EveryFlagIsRefusedWithoutTlsSupport)
+{
+    for (const core::StratumTlsSettings& s :
+         {core::StratumTlsSettings{"3334", "", ""}, core::StratumTlsSettings{"", "c.pem", ""},
+          core::StratumTlsSettings{"", "", "k.pem"}, core::StratumTlsSettings{"3334", "c.pem", "k.pem"}}) {
+        const auto why = core::check_stratum_tls_settings(s, /*supported=*/false);
+        ASSERT_TRUE(why) << s.bind << "|" << s.cert << "|" << s.key;
+        EXPECT_NE(why->find("this build has no TLS support"), std::string::npos) << *why;
+    }
+    if (!core::stratum_tls_supported()) {
+        // This build: the real check refuses, and so does the listener.
+        const auto why = core::check_stratum_tls_settings({"3334", "c.pem", "k.pem"});
+        ASSERT_TRUE(why);
+        EXPECT_NE(why->find("C2POOL_STRATUM_TLS=OFF"), std::string::npos) << *why;
+        std::string err;
+        EXPECT_FALSE(core::load_stratum_tls_context("c.pem", "k.pem", err));
+        EXPECT_NE(err.find("no TLS support"), std::string::npos) << err;
+    }
+}
+
+TEST(StratumTlsFlags, IncompleteOrMalformedSetsAreRefused)
+{
+    auto refused = [](core::StratumTlsSettings s, const std::string& needle) {
+        const auto why = core::check_stratum_tls_settings(s, /*supported=*/true);
+        if (!why) return ::testing::AssertionFailure() << "accepted: " << s.bind;
+        if (why->find(needle) == std::string::npos)
+            return ::testing::AssertionFailure() << "'" << *why << "' lacks '" << needle << "'";
+        return ::testing::AssertionSuccess();
+    };
+    EXPECT_TRUE(refused({"3334", "", ""}, "needs --stratum-tls-cert FILE"));
+    EXPECT_TRUE(refused({"3334", "c.pem", ""}, "needs --stratum-tls-cert FILE"));
+    EXPECT_TRUE(refused({"3334", "", "k.pem"}, "needs --stratum-tls-cert FILE"));
+    EXPECT_TRUE(refused({"", "c.pem", "k.pem"}, "without --stratum-tls [HOST:]PORT"));
+    EXPECT_TRUE(refused({"", "c.pem", ""}, "without --stratum-tls [HOST:]PORT"));
+    EXPECT_TRUE(refused({"0", "c.pem", "k.pem"}, "is not [HOST:]PORT"));
+    EXPECT_TRUE(refused({"70000", "c.pem", "k.pem"}, "is not [HOST:]PORT"));
+    EXPECT_TRUE(refused({"pool.example:3334", "c.pem", "k.pem"}, "HOST must be an IP address"));
+}
+
+#ifdef C2POOL_STRATUM_TLS
+
+namespace {
+
+namespace ssl = boost::asio::ssl;
+
+// A throwaway EC P-256 key and a self-signed certificate for CN=`cn`
+// (SAN DNS:localhost, IP:127.0.0.1), written as PEM.
+struct TestCert {
+    std::string cert;
+    std::string key;
+};
+
+bool write_self_signed(const fs::path& cert_path, const fs::path& key_path, const std::string& cn,
+                       long serial, const char* passphrase = nullptr)
+{
+    EVP_PKEY* pkey = nullptr;
+    EVP_PKEY_CTX* kctx = EVP_PKEY_CTX_new_id(EVP_PKEY_EC, nullptr);
+    bool ok = kctx && EVP_PKEY_keygen_init(kctx) == 1
+           && EVP_PKEY_CTX_set_ec_paramgen_curve_nid(kctx, NID_X9_62_prime256v1) == 1
+           && EVP_PKEY_keygen(kctx, &pkey) == 1;
+    EVP_PKEY_CTX_free(kctx);
+    X509* x = ok ? X509_new() : nullptr;
+    if (x) {
+        X509_set_version(x, 2);
+        ASN1_INTEGER_set(X509_get_serialNumber(x), serial);
+        X509_gmtime_adj(X509_getm_notBefore(x), -3600);
+        X509_gmtime_adj(X509_getm_notAfter(x), 86400);
+        X509_set_pubkey(x, pkey);
+        X509_NAME* name = X509_get_subject_name(x);
+        X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
+                                   reinterpret_cast<const unsigned char*>(cn.c_str()), -1, -1, 0);
+        X509_set_issuer_name(x, name);
+        X509V3_CTX v3;
+        X509V3_set_ctx_nodb(&v3);
+        X509V3_set_ctx(&v3, x, x, nullptr, nullptr, 0);
+        for (const auto& [nid, value] : {std::pair<int, const char*>{NID_basic_constraints, "critical,CA:TRUE"},
+                                         {NID_subject_alt_name, "DNS:localhost,IP:127.0.0.1"}}) {
+            X509_EXTENSION* ext = X509V3_EXT_nconf_nid(nullptr, &v3, nid, value);
+            ok = ok && ext && X509_add_ext(x, ext, -1) == 1;
+            X509_EXTENSION_free(ext);
+        }
+        ok = ok && X509_sign(x, pkey, EVP_sha256()) > 0;
+    }
+    if (ok) {
+        BIO* cb = BIO_new_file(cert_path.string().c_str(), "wb");
+        ok = cb && PEM_write_bio_X509(cb, x) == 1;
+        BIO_free(cb);
+        BIO* kb = BIO_new_file(key_path.string().c_str(), "wb");
+        ok = ok && kb
+          && (passphrase
+                  ? PEM_write_bio_PrivateKey(kb, pkey, EVP_aes_128_cbc(),
+                                             reinterpret_cast<const unsigned char*>(passphrase),
+                                             static_cast<int>(std::strlen(passphrase)), nullptr, nullptr)
+                  : PEM_write_bio_PrivateKey(kb, pkey, nullptr, nullptr, 0, nullptr, nullptr))
+                 == 1;
+        BIO_free(kb);
+    }
+    X509_free(x);
+    EVP_PKEY_free(pkey);
+    return ok;
+}
+
+TestCert make_cert(const fs::path& dir, const std::string& cn, long serial)
+{
+    TestCert c{(dir / (cn + ".crt")).string(), (dir / (cn + ".key")).string()};
+    EXPECT_TRUE(write_self_signed(c.cert, c.key, cn, serial)) << cn;
+    return c;
+}
+
+// Replace `to` by `from`'s bytes in one rename, with a modification time
+// `bump` past the old one (a renewal as certbot or an operator does it).
+void replace_file(const std::string& from, const std::string& to, std::chrono::seconds bump = 2s)
+{
+    const auto before = fs::last_write_time(to);
+    const std::string tmp = to + ".new";
+    fs::copy_file(from, tmp, fs::copy_options::overwrite_existing);
+    fs::last_write_time(tmp, before + bump);
+    fs::rename(tmp, to);
+}
+
+// A blocking TLS client with timeouts (the TLS twin of RawClient).
+class TlsClient {
+public:
+    // `trust`: verify the server against this PEM (and the name "localhost");
+    // empty: no verification. max_version / min_version: OpenSSL protocol
+    // bounds (0: the library's defaults).
+    explicit TlsClient(const std::string& trust = {}, int max_version = 0, int min_version = 0)
+        : ctx_(ssl::context::tls_client), stream_(io_, ctx_)
+    {
+        // On the connection itself: the SSL object already exists.
+        if (min_version) SSL_set_min_proto_version(stream_.native_handle(), min_version);
+        if (max_version) SSL_set_max_proto_version(stream_.native_handle(), max_version);
+        if (!trust.empty()) {
+            ctx_.load_verify_file(trust);
+            stream_.set_verify_mode(ssl::verify_peer);
+            stream_.set_verify_callback(ssl::host_name_verification("localhost"));
+        } else {
+            stream_.set_verify_mode(ssl::verify_none);
+        }
+        SSL_set_tlsext_host_name(stream_.native_handle(), "localhost");
+    }
+
+    // TCP connect, then the TLS handshake within `timeout`.
+    bool connect(uint16_t port, std::chrono::milliseconds timeout = 3000ms)
+    {
+        boost::system::error_code ec;
+        stream_.next_layer().connect(tcp::endpoint(net::ip::make_address("127.0.0.1"), port), ec);
+        if (ec) { error_ = ec.message(); return false; }
+        bool done = false;
+        stream_.async_handshake(ssl::stream_base::client, [&](const boost::system::error_code& e) {
+            done = true;
+            if (e) error_ = e.message();
+            handshake_ok_ = !e;
+        });
+        run(done, timeout);
+        return handshake_ok_;
+    }
+
+    void send(const std::string& bytes)
+    {
+        bool done = false;
+        net::async_write(stream_, net::buffer(bytes),
+                         [&](const boost::system::error_code&, std::size_t) { done = true; });
+        run(done, 3000ms);
+    }
+
+    std::optional<std::string> read_line(std::chrono::milliseconds timeout = 3000ms)
+    {
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (received_.find('\n') == std::string::npos && !closed_
+               && std::chrono::steady_clock::now() < deadline) {
+            bool done = false;
+            stream_.async_read_some(net::buffer(buf_), [&](const boost::system::error_code& e, std::size_t n) {
+                done = true;
+                if (n) received_.append(buf_.data(), n);
+                if (e) closed_ = true;
+            });
+            run(done, std::chrono::duration_cast<std::chrono::milliseconds>(
+                          deadline - std::chrono::steady_clock::now()));
+        }
+        const auto nl = received_.find('\n');
+        if (nl == std::string::npos) return std::nullopt;
+        std::string line = received_.substr(0, nl);
+        received_.erase(0, nl + 1);
+        return line;
+    }
+
+    // The reply to request `id` (notifications before it are skipped).
+    std::optional<json> reply(int id, std::chrono::milliseconds timeout = 3000ms)
+    {
+        for (int i = 0; i < 20; ++i) {
+            auto line = read_line(timeout);
+            if (!line) return std::nullopt;
+            auto j = json::parse(*line, nullptr, false);
+            if (j.is_object() && j.value("id", json()) == id) return j;
+        }
+        return std::nullopt;
+    }
+
+    // The subject CN of the certificate the server presented.
+    std::string peer_cn()
+    {
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+        X509* x = SSL_get1_peer_certificate(stream_.native_handle());
+#else
+        X509* x = SSL_get_peer_certificate(stream_.native_handle());
+#endif
+        if (!x) return {};
+        char cn[256] = {};
+        X509_NAME_get_text_by_NID(X509_get_subject_name(x), NID_commonName, cn, sizeof(cn));
+        X509_free(x);
+        return cn;
+    }
+
+    std::string version() { return SSL_get_version(stream_.native_handle()); }
+    uint16_t local_port() { return stream_.next_layer().local_endpoint().port(); }
+    const std::string& error() const { return error_; }
+
+private:
+    void run(bool& done, std::chrono::milliseconds timeout)
+    {
+        io_.restart();
+        io_.run_for(timeout);
+        if (!done) {
+            boost::system::error_code ec;
+            stream_.next_layer().cancel(ec);
+            io_.restart();
+            io_.run();
+        }
+    }
+
+    net::io_context io_;
+    ssl::context ctx_;
+    ssl::stream<tcp::socket> stream_;
+    std::array<char, 4096> buf_{};
+    std::string received_;
+    std::string error_;
+    bool handshake_ok_ = false;
+    bool closed_ = false;
+};
+
+// The reply to request `id` on a plain connection.
+std::optional<json> plain_reply(RawClient& c, int id)
+{
+    for (int i = 0; i < 20; ++i) {
+        auto line = c.read_line();
+        if (!line) return std::nullopt;
+        auto j = json::parse(*line, nullptr, false);
+        if (j.is_object() && j.value("id", json()) == id) return j;
+    }
+    return std::nullopt;
+}
+
+const std::string kSubscribe = R"({"id":1,"method":"mining.subscribe","params":["tls-test/1.0"]})" "\n";
+const std::string kAuthorize =
+    R"({"id":2,"method":"mining.authorize","params":["LTCtestaddress0123456789abcdef.rig1","x"]})" "\n";
+
+// A StratumServer (plain listener) with a TLS listener, both on 127.0.0.1,
+// on an io_context run on its own thread.
+class TlsNode {
+public:
+    net::io_context ioc;
+    std::shared_ptr<core::MiningInterface> work = std::make_shared<core::MiningInterface>(false);
+    std::unique_ptr<core::StratumServer> stratum;
+    uint16_t port = 0;
+    uint16_t tls_port = 0;
+
+    bool start(const TestCert& cert, const core::stratum::StratumConfig& cfg = {},
+               std::chrono::milliseconds handshake_timeout = core::kStratumTlsHandshakeTimeout)
+    {
+        work->set_stratum_config(cfg);
+        for (int attempt = 0; attempt < 20 && !stratum; ++attempt) {
+            auto s = std::make_unique<core::StratumServer>(ioc, "127.0.0.1", free_port(), work);
+            if (s->start()) stratum = std::move(s);
+        }
+        if (!stratum) return false;
+        port = stratum->get_port();
+        core::StratumServer::TlsOptions o;
+        o.bind_address = "127.0.0.1";
+        o.port = 0;   // a free port
+        o.cert_file = cert.cert;
+        o.key_file = cert.key;
+        o.handshake_timeout = handshake_timeout;
+        std::string err;
+        if (!stratum->start_tls(o, &err)) {
+            ADD_FAILURE() << "start_tls: " << err;
+            return false;
+        }
+        tls_port = stratum->get_tls_port();
+        guard_.emplace(net::make_work_guard(ioc));
+        th_ = std::thread([this] { ioc.run(); });
+        return tls_port != 0;
+    }
+
+    template <typename F>
+    auto on_io(F&& fn) -> decltype(fn())
+    {
+        std::promise<decltype(fn())> prom;
+        auto fut = prom.get_future();
+        net::post(ioc, [&] { prom.set_value(fn()); });
+        return fut.get();
+    }
+
+    // Sessions still connected (notify_all prunes the closed ones first).
+    size_t live_sessions()
+    {
+        return on_io([&] {
+            stratum->notify_all(false);
+            return stratum->get_session_count();
+        });
+    }
+
+    ~TlsNode()
+    {
+        if (stratum && th_.joinable()) {
+            std::promise<void> done;
+            net::post(ioc, [&] { stratum->stop(); done.set_value(); });
+            done.get_future().wait();
+        }
+        guard_.reset();
+        ioc.stop();
+        if (th_.joinable()) th_.join();
+        stratum.reset();
+    }
+
+private:
+    std::optional<net::executor_work_guard<net::io_context::executor_type>> guard_;
+    std::thread th_;
+};
+
+}  // namespace
+
+TEST(StratumTlsFlags, CertificateAndKeyMustLoad)
+{
+    TempDir dir;
+    const auto a = make_cert(dir.path, "pool-a", 1);
+    const auto b = make_cert(dir.path, "pool-b", 2);
+    EXPECT_FALSE(core::check_stratum_tls_settings({"3334", a.cert, a.key}));
+    EXPECT_FALSE(core::check_stratum_tls_settings({"127.0.0.1:3334", a.cert, a.key}));
+    EXPECT_FALSE(core::check_stratum_tls_settings({"[::1]:3334", a.cert, a.key}));
+
+    auto refused = [](core::StratumTlsSettings s, const std::string& needle) {
+        const auto why = core::check_stratum_tls_settings(s);
+        if (!why) return ::testing::AssertionFailure() << "accepted";
+        if (why->find(needle) == std::string::npos)
+            return ::testing::AssertionFailure() << "'" << *why << "' lacks '" << needle << "'";
+        return ::testing::AssertionSuccess();
+    };
+    EXPECT_TRUE(refused({"3334", (dir.path / "missing.crt").string(), a.key}, "cannot read"));
+    EXPECT_TRUE(refused({"3334", a.cert, (dir.path / "missing.key").string()}, "cannot read"));
+    EXPECT_TRUE(refused({"3334", a.cert, b.key}, "does not match"));
+    EXPECT_TRUE(refused({"3334", a.key, a.key}, "cannot load the certificate chain"));
+    EXPECT_TRUE(refused({"3334", a.cert, a.cert}, "cannot load the private key"));
+}
+
+TEST(StratumTlsFlags, PassphraseProtectedKeyIsRefusedWithoutAPrompt)
+{
+    TempDir dir;
+    const std::string cert = (dir.path / "enc.crt").string();
+    const std::string key = (dir.path / "enc.key").string();
+    ASSERT_TRUE(write_self_signed(cert, key, "pool-enc", 9, "secret"));
+    // A prompt would read the terminal and block; the load returns at once.
+    auto fut = std::async(std::launch::async, [&] { return core::check_stratum_tls_settings({"3334", cert, key}); });
+    ASSERT_EQ(fut.wait_for(10s), std::future_status::ready);
+    const auto why = fut.get();
+    ASSERT_TRUE(why);
+    EXPECT_NE(why->find("cannot load the private key"), std::string::npos) << *why;
+}
+
+TEST(StratumTlsListener, StartRefusals)
+{
+    TempDir dir;
+    const auto a = make_cert(dir.path, "pool-a", 1);
+    net::io_context ioc;
+    auto work = std::make_shared<core::MiningInterface>(false);
+    core::StratumServer s(ioc, "127.0.0.1", free_port(), work);
+    core::StratumServer::TlsOptions o;
+    o.bind_address = "127.0.0.1";
+    o.cert_file = a.cert;
+    o.key_file = a.key;
+    std::string err;
+    EXPECT_FALSE(s.start_tls(o, &err));   // the plain listener is not running
+    EXPECT_NE(err.find("not running"), std::string::npos) << err;
+    ASSERT_TRUE(s.start());
+    o.port = s.get_port();
+    EXPECT_FALSE(s.start_tls(o, &err));   // the plain listener's own address
+    EXPECT_NE(err.find("plain stratum listener"), std::string::npos) << err;
+    o.port = 0;
+    o.key_file = a.cert;
+    EXPECT_FALSE(s.start_tls(o, &err));
+    EXPECT_NE(err.find("cannot load the private key"), std::string::npos) << err;
+    EXPECT_FALSE(s.is_tls_running());
+    EXPECT_EQ(s.get_tls_port(), 0);
+    o.key_file = a.key;
+    ASSERT_TRUE(s.start_tls(o, &err)) << err;
+    EXPECT_TRUE(s.is_tls_running());
+    EXPECT_NE(s.get_tls_port(), 0);
+    EXPECT_NE(s.get_tls_certificate_summary().find("CN=pool-a"), std::string::npos)
+        << s.get_tls_certificate_summary();
+    EXPECT_FALSE(s.start_tls(o, &err));   // once
+    EXPECT_NE(err.find("already open"), std::string::npos) << err;
+    s.stop();
+    EXPECT_FALSE(s.is_tls_running());
+}
+
+TEST(StratumTlsListener, ConfigureFromTheFlags)
+{
+    TempDir dir;
+    const auto a = make_cert(dir.path, "pool-a", 1);
+    net::io_context ioc;
+    auto work = std::make_shared<core::MiningInterface>(false);
+    core::StratumServer s(ioc, "127.0.0.1", free_port(), work);
+    ASSERT_TRUE(s.start());
+    EXPECT_FALSE(core::configure_stratum_tls(&s, {}));   // not set: nothing
+    EXPECT_FALSE(s.is_tls_running());
+    EXPECT_FALSE(core::configure_stratum_tls(nullptr, {"3334", a.cert, a.key}));   // no stratum listener
+    const uint16_t p = free_port();
+    // PORT alone: the stratum listener's host.
+    ASSERT_TRUE(core::configure_stratum_tls(&s, {std::to_string(p), a.cert, a.key}));
+    EXPECT_EQ(s.get_tls_bind_address(), "127.0.0.1");
+    EXPECT_EQ(s.get_tls_port(), p);
+    s.stop();
+}
+
+TEST(StratumTlsSession, SubscribeAndAuthorizeOverTlsAnswerAsPlain)
+{
+    TempDir dir;
+    const auto a = make_cert(dir.path, "localhost", 1);
+    TlsNode node;
+    ASSERT_TRUE(node.start(a));
+
+    RawClient plain;
+    ASSERT_TRUE(plain.connect("127.0.0.1", node.port));
+    plain.send(kSubscribe);
+    const auto p_sub = plain_reply(plain, 1);
+    plain.send(kAuthorize);
+    const auto p_auth = plain_reply(plain, 2);
+    ASSERT_TRUE(p_sub && p_auth);
+
+    // The client verifies the chain and the name against the certificate.
+    TlsClient tls(a.cert);
+    ASSERT_TRUE(tls.connect(node.tls_port)) << tls.error();
+    EXPECT_EQ(tls.peer_cn(), "localhost");
+    tls.send(kSubscribe);
+    const auto t_sub = tls.reply(1);
+    tls.send(kAuthorize);
+    const auto t_auth = tls.reply(2);
+    ASSERT_TRUE(t_sub && t_auth);
+
+    // mining.subscribe: the same shape; only the per-session ids differ.
+    ASSERT_TRUE((*p_sub)["error"].is_null());
+    ASSERT_TRUE((*t_sub)["error"].is_null());
+    ASSERT_TRUE((*p_sub)["result"].is_array() && (*t_sub)["result"].is_array());
+    ASSERT_EQ((*p_sub)["result"].size(), (*t_sub)["result"].size());
+    ASSERT_EQ((*t_sub)["result"].size(), 3u);
+    EXPECT_EQ((*p_sub)["result"][2], (*t_sub)["result"][2]);   // extranonce2_size
+    EXPECT_EQ((*p_sub)["result"][1].get<std::string>().size(),
+              (*t_sub)["result"][1].get<std::string>().size());   // extranonce1
+    EXPECT_NE((*p_sub)["result"][1], (*t_sub)["result"][1]);
+    auto methods = [](const json& r) {
+        std::vector<std::string> m;
+        for (const auto& s : r["result"][0]) m.push_back(s[0].get<std::string>());
+        return m;
+    };
+    EXPECT_EQ(methods(*p_sub), methods(*t_sub));
+    // mining.authorize: byte-identical.
+    EXPECT_EQ(p_auth->dump(), t_auth->dump());
+    EXPECT_EQ((*t_auth)["result"], true) << t_auth->dump();
+
+    // The registry lists the TLS session under its real remote address.
+    const std::string tls_ep = "127.0.0.1:" + std::to_string(tls.local_port());
+    const std::string plain_ep = "127.0.0.1:" + std::to_string(plain.socket().local_endpoint().port());
+    ASSERT_TRUE(wait_until([&] { return node.work->get_stratum_workers().size() == 2; }));
+    std::optional<core::MiningInterface::WorkerInfo> tls_row, plain_row;
+    for (const auto& [id, w] : node.work->get_stratum_workers()) {
+        if (w.remote_endpoint == tls_ep) tls_row = w;
+        if (w.remote_endpoint == plain_ep) plain_row = w;
+    }
+    ASSERT_TRUE(tls_row) << tls_ep;
+    ASSERT_TRUE(plain_row) << plain_ep;
+    EXPECT_EQ(tls_row->username, plain_row->username);
+    EXPECT_EQ(tls_row->worker_name, plain_row->worker_name);
+    EXPECT_EQ(tls_row->payout_warning, plain_row->payout_warning);
+    EXPECT_EQ(tls_row->difficulty, plain_row->difficulty);
+    EXPECT_EQ(node.stratum->get_session_count(), 2u);
+    EXPECT_EQ(node.stratum->get_tls_handshakes(), 1u);
+    EXPECT_EQ(node.stratum->get_tls_handshake_failures(), 0u);
+
+    // An unknown method and a malformed line: the same errors as plain.
+    for (const std::string& line : {std::string(R"({"id":5,"method":"mining.nope","params":[]})"),
+                                    std::string(R"({"id":6,"method":"mining.submit","params":[]})")}) {
+        plain.send(line + "\n");
+        tls.send(line + "\n");
+        const int id = json::parse(line)["id"];
+        const auto p = plain_reply(plain, id);
+        const auto t = tls.reply(id);
+        ASSERT_TRUE(p && t) << line;
+        EXPECT_EQ(p->dump(), t->dump()) << line;
+    }
+}
+
+TEST(StratumTlsSession, Tls12And13ClientsConnectOlderOnesDoNot)
+{
+    TempDir dir;
+    const auto a = make_cert(dir.path, "localhost", 1);
+    TlsNode node;
+    ASSERT_TRUE(node.start(a));
+    {
+        TlsClient c(a.cert, TLS1_2_VERSION);
+        ASSERT_TRUE(c.connect(node.tls_port)) << c.error();
+        EXPECT_EQ(c.version(), "TLSv1.2");
+        c.send(kSubscribe);
+        EXPECT_TRUE(c.reply(1));
+    }
+    {
+        TlsClient c(a.cert, 0, TLS1_3_VERSION);
+        ASSERT_TRUE(c.connect(node.tls_port)) << c.error();
+        EXPECT_EQ(c.version(), "TLSv1.3");
+        c.send(kSubscribe);
+        EXPECT_TRUE(c.reply(1));
+    }
+    {
+        // A client that offers at most TLS 1.1 gets no session.
+        TlsClient c({}, TLS1_1_VERSION);
+        EXPECT_FALSE(c.connect(node.tls_port));
+    }
+    EXPECT_TRUE(wait_until([&] { return node.stratum->get_tls_handshake_failures() == 1; }));
+    EXPECT_EQ(node.stratum->get_tls_handshakes(), 2u);
+}
+
+TEST(StratumTlsSession, PlaintextClientOnTheTlsPortIsClosed)
+{
+    TempDir dir;
+    const auto a = make_cert(dir.path, "localhost", 1);
+    TlsNode node;
+    ASSERT_TRUE(node.start(a));
+
+    RawClient c;
+    ASSERT_TRUE(c.connect("127.0.0.1", node.tls_port));
+    c.send(kSubscribe);
+    const std::string got = c.read_all(3000ms);
+    EXPECT_TRUE(c.closed());
+    EXPECT_EQ(got.find("\"result\""), std::string::npos) << got;   // at most a TLS alert
+    ASSERT_TRUE(wait_until([&] { return node.stratum->get_tls_handshake_failures() == 1; }));
+    EXPECT_EQ(node.stratum->get_tls_handshakes(), 0u);
+    EXPECT_TRUE(node.work->get_stratum_workers().empty());
+    EXPECT_EQ(node.live_sessions(), 0u);
+
+    // Both listeners keep serving.
+    TlsClient t(a.cert);
+    ASSERT_TRUE(t.connect(node.tls_port)) << t.error();
+    t.send(kSubscribe);
+    EXPECT_TRUE(t.reply(1));
+    RawClient p;
+    ASSERT_TRUE(p.connect("127.0.0.1", node.port));
+    p.send(kSubscribe);
+    EXPECT_TRUE(plain_reply(p, 1));
+}
+
+TEST(StratumTlsSession, SilentClientIsClosedAtTheHandshakeTimeout)
+{
+    TempDir dir;
+    const auto a = make_cert(dir.path, "localhost", 1);
+    TlsNode node;
+    ASSERT_TRUE(node.start(a, {}, 300ms));
+    EXPECT_EQ(node.stratum->tls_handshake_timeout(), 300ms);
+
+    RawClient c;
+    ASSERT_TRUE(c.connect("127.0.0.1", node.tls_port));
+    const auto t0 = std::chrono::steady_clock::now();
+    const std::string got = c.read_all(5000ms);   // sends nothing
+    const auto took = std::chrono::steady_clock::now() - t0;
+    EXPECT_TRUE(c.closed());
+    EXPECT_TRUE(got.empty()) << got.size();
+    EXPECT_LT(took, 3000ms);
+    ASSERT_TRUE(wait_until([&] { return node.stratum->get_tls_handshake_failures() == 1; }));
+    EXPECT_EQ(node.live_sessions(), 0u);
+
+    TlsClient t(a.cert);
+    ASSERT_TRUE(t.connect(node.tls_port)) << t.error();
+    t.send(kSubscribe);
+    EXPECT_TRUE(t.reply(1));
+}
+
+TEST(StratumTlsSession, HttpOnTheStratumPortIsPlainOnly)
+{
+    TempDir dir;
+    const auto a = make_cert(dir.path, "localhost", 1);
+    TlsNode node;
+    ASSERT_TRUE(node.start(a));
+    std::atomic<int> handed{0};
+    node.stratum->set_http(true, [&](core::StratumHttpRequest&) { ++handed; return false; });
+
+    TlsClient t(a.cert);
+    ASSERT_TRUE(t.connect(node.tls_port)) << t.error();
+    t.send(request("GET", "/global_stats"));
+    const auto line = t.read_line();
+    ASSERT_TRUE(line);
+    const auto j = json::parse(*line, nullptr, false);
+    ASSERT_TRUE(j.is_object()) << *line;
+    EXPECT_EQ(j["error"][1], "Invalid JSON") << *line;
+    EXPECT_EQ(handed.load(), 0);
+
+    // The plain port still hands HTTP over (its handler declined: a 503).
+    const auto r = exchange("127.0.0.1", node.port, request("GET", "/global_stats"));
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.status, 503u);
+    EXPECT_EQ(handed.load(), 1);
+}
+
+TEST(StratumTlsSession, PerIpCapCountsPlainAndTlsTogether)
+{
+    TempDir dir;
+    const auto a = make_cert(dir.path, "localhost", 1);
+    core::stratum::StratumConfig cfg;
+    cfg.max_stratum_connections_per_ip = 1;
+    TlsNode node;
+    ASSERT_TRUE(node.start(a, cfg));
+    {
+        RawClient p;
+        ASSERT_TRUE(p.connect("127.0.0.1", node.port));
+        p.send(kSubscribe);
+        ASSERT_TRUE(plain_reply(p, 1));
+        TlsClient t(a.cert);
+        EXPECT_FALSE(t.connect(node.tls_port));   // refused at the accept
+        EXPECT_TRUE(wait_until([&] { return node.stratum->get_refused_per_ip() == 1; }));
+    }
+    EXPECT_TRUE(wait_until([&] { return node.live_sessions() == 0; }));
+    {
+        TlsClient t(a.cert);
+        ASSERT_TRUE(t.connect(node.tls_port)) << t.error();
+        t.send(kSubscribe);
+        ASSERT_TRUE(t.reply(1));
+        RawClient p;
+        ASSERT_TRUE(p.connect("127.0.0.1", node.port));
+        p.send(kSubscribe);
+        EXPECT_FALSE(plain_reply(p, 1));   // closed at the accept
+        EXPECT_TRUE(wait_until([&] { return node.stratum->get_refused_per_ip() == 2; }));
+    }
+}
+
+TEST(StratumTlsReload, NewConnectionsGetTheRenewedCertificate)
+{
+    TempDir dir;
+    const auto a = make_cert(dir.path, "pool-a", 1);
+    const auto b = make_cert(dir.path, "pool-b", 2);
+    const auto c = make_cert(dir.path, "pool-c", 3);
+    // The files the listener reads (a renewal replaces them in place).
+    const TestCert live{(dir.path / "live.crt").string(), (dir.path / "live.key").string()};
+    fs::copy_file(a.cert, live.cert);
+    fs::copy_file(a.key, live.key);
+
+    TlsNode node;
+    ASSERT_TRUE(node.start(live));
+    TlsClient first;
+    ASSERT_TRUE(first.connect(node.tls_port)) << first.error();
+    EXPECT_EQ(first.peer_cn(), "pool-a");
+    first.send(kSubscribe);
+    ASSERT_TRUE(first.reply(1));
+
+    // Renewed: the next accept reads the new pair.
+    replace_file(b.key, live.key);
+    replace_file(b.cert, live.cert);
+    TlsClient second;
+    ASSERT_TRUE(second.connect(node.tls_port)) << second.error();
+    EXPECT_EQ(second.peer_cn(), "pool-b");
+    EXPECT_EQ(node.stratum->get_tls_reloads(), 1u);
+    EXPECT_NE(node.stratum->get_tls_certificate_summary().find("CN=pool-b"), std::string::npos);
+
+    // The connection opened before keeps working, on its certificate.
+    first.send(kAuthorize);
+    const auto auth = first.reply(2);
+    ASSERT_TRUE(auth);
+    EXPECT_EQ((*auth)["result"], true);
+    EXPECT_EQ(first.peer_cn(), "pool-a");
+
+    // Half-renewed (the certificate changed, the key not yet): it does not
+    // load; the last good pair stays in use and is not retried until a file
+    // changes again.
+    replace_file(c.cert, live.cert);
+    TlsClient third;
+    ASSERT_TRUE(third.connect(node.tls_port)) << third.error();
+    EXPECT_EQ(third.peer_cn(), "pool-b");
+    EXPECT_EQ(node.stratum->get_tls_reload_failures(), 1u);
+    TlsClient third_again;
+    ASSERT_TRUE(third_again.connect(node.tls_port)) << third_again.error();
+    EXPECT_EQ(node.stratum->get_tls_reload_failures(), 1u);
+    // ... and the key follows: loaded.
+    replace_file(c.key, live.key);
+    TlsClient fourth;
+    ASSERT_TRUE(fourth.connect(node.tls_port)) << fourth.error();
+    EXPECT_EQ(fourth.peer_cn(), "pool-c");
+    EXPECT_EQ(node.stratum->get_tls_reloads(), 2u);
+}
+
+TEST(StratumTlsReload, ReloadNowAndSighup)
+{
+    TempDir dir;
+    const auto a = make_cert(dir.path, "pool-a", 1);
+    const auto b = make_cert(dir.path, "pool-b", 2);
+    const TestCert live{(dir.path / "live.crt").string(), (dir.path / "live.key").string()};
+    fs::copy_file(a.cert, live.cert);
+    fs::copy_file(a.key, live.key);
+    TlsNode node;
+    ASSERT_TRUE(node.start(live));
+
+    // reload_tls(): a re-read now, whatever the files' stamps.
+    std::string err;
+    ASSERT_TRUE(node.stratum->reload_tls(&err)) << err;
+    EXPECT_EQ(node.stratum->get_tls_reloads(), 1u);
+    fs::copy_file(b.cert, live.cert, fs::copy_options::overwrite_existing);
+    fs::copy_file(b.key, live.key, fs::copy_options::overwrite_existing);
+    ASSERT_TRUE(node.stratum->reload_tls(&err)) << err;
+    EXPECT_EQ(node.stratum->get_tls_reloads(), 2u);
+    TlsClient c1;
+    ASSERT_TRUE(c1.connect(node.tls_port)) << c1.error();
+    EXPECT_EQ(c1.peer_cn(), "pool-b");
+    EXPECT_EQ(node.stratum->get_tls_reloads(), 2u);   // the accept saw nothing new
+
+    // A re-read of a pair that does not load keeps the last good one.
+    std::ofstream(live.key, std::ios::binary | std::ios::trunc) << "not a key\n";
+    EXPECT_FALSE(node.stratum->reload_tls(&err));
+    EXPECT_NE(err.find("cannot load the private key"), std::string::npos) << err;
+    EXPECT_EQ(node.stratum->get_tls_reload_failures(), 1u);
+    TlsClient c2;
+    ASSERT_TRUE(c2.connect(node.tls_port)) << c2.error();
+    EXPECT_EQ(c2.peer_cn(), "pool-b");
+
+#ifndef _WIN32
+    // SIGHUP: the same re-read, on the io thread; armed again after each.
+    fs::copy_file(a.cert, live.cert, fs::copy_options::overwrite_existing);
+    fs::copy_file(a.key, live.key, fs::copy_options::overwrite_existing);
+    const uint64_t before = node.stratum->get_tls_reloads();
+    ASSERT_EQ(std::raise(SIGHUP), 0);
+    ASSERT_TRUE(wait_until([&] { return node.stratum->get_tls_reloads() == before + 1; }));
+    TlsClient c3;
+    ASSERT_TRUE(c3.connect(node.tls_port)) << c3.error();
+    EXPECT_EQ(c3.peer_cn(), "pool-a");
+    ASSERT_EQ(std::raise(SIGHUP), 0);
+    EXPECT_TRUE(wait_until([&] { return node.stratum->get_tls_reloads() == before + 2; }));
+#endif
+}
+
+#endif  // C2POOL_STRATUM_TLS

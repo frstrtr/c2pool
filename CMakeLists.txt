@@ -75,6 +75,53 @@ else()
     message(STATUS "dashd ZMQ hashblock tip-notify: DISABLED (C2POOL_WITH_ZMQ=OFF)")
 endif()
 
+# Optional TLS stratum listener (--stratum-tls, stratum+ssl://;
+# src/core/stratum_tls.hpp), linked against OpenSSL >= 1.1.1 found with
+# find_package(OpenSSL) (system libssl-dev; OPENSSL_ROOT_DIR elsewhere).
+# C2POOL_STRATUM_TLS_STATIC_OPENSSL (default ON) links the static libssl.a /
+# libcrypto.a, so no binary gains a shared-library dependency (the Linux
+# packages and the static c2pool-v37-xmr daemon keep their library set).
+# AUTO-DETECT: a configure that does not set C2POOL_STRATUM_TLS turns it ON on
+# Linux when that OpenSSL is found, and leaves it OFF on macOS and Windows,
+# whose release packages provide no OpenSSL yet. ON with OpenSSL missing is a
+# configure error. OFF: no OpenSSL dependency; the binaries refuse the
+# --stratum-tls flags with a message saying this build has no TLS.
+option(C2POOL_STRATUM_TLS_STATIC_OPENSSL "Link OpenSSL statically for the TLS stratum listener" ON)
+macro(c2pool_find_stratum_openssl)
+    if(C2POOL_STRATUM_TLS_STATIC_OPENSSL)
+        set(OPENSSL_USE_STATIC_LIBS TRUE)
+    endif()
+    find_package(OpenSSL 1.1.1 QUIET)
+endmacro()
+if(NOT DEFINED CACHE{C2POOL_STRATUM_TLS})
+    set(_c2p_stratum_tls_default OFF)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        c2pool_find_stratum_openssl()
+        if(OPENSSL_FOUND)
+            set(_c2p_stratum_tls_default ON)
+        endif()
+    endif()
+    set(C2POOL_STRATUM_TLS ${_c2p_stratum_tls_default} CACHE BOOL
+        "Build the TLS stratum listener (--stratum-tls); needs OpenSSL >= 1.1.1")
+endif()
+option(C2POOL_STRATUM_TLS "Build the TLS stratum listener (--stratum-tls); needs OpenSSL >= 1.1.1" OFF)
+set(C2POOL_STRATUM_TLS_AVAILABLE OFF)
+if(C2POOL_STRATUM_TLS)
+    c2pool_find_stratum_openssl()
+    if(NOT OPENSSL_FOUND OR NOT TARGET OpenSSL::SSL OR NOT TARGET OpenSSL::Crypto)
+        message(FATAL_ERROR
+            "C2POOL_STRATUM_TLS=ON but OpenSSL >= 1.1.1 was not found"
+            " (static libraries: C2POOL_STRATUM_TLS_STATIC_OPENSSL=${C2POOL_STRATUM_TLS_STATIC_OPENSSL})."
+            " Install it (libssl-dev on Debian/Ubuntu) or point OPENSSL_ROOT_DIR at it,"
+            " set -DC2POOL_STRATUM_TLS_STATIC_OPENSSL=OFF to link the shared libraries,"
+            " or configure with -DC2POOL_STRATUM_TLS=OFF (the binaries then refuse --stratum-tls).")
+    endif()
+    set(C2POOL_STRATUM_TLS_AVAILABLE ON)
+    message(STATUS "stratum TLS listener: ENABLED (OpenSSL ${OPENSSL_VERSION}: ${OPENSSL_SSL_LIBRARY} ${OPENSSL_CRYPTO_LIBRARY})")
+else()
+    message(STATUS "stratum TLS listener: DISABLED (C2POOL_STRATUM_TLS=OFF; --stratum-tls is refused)")
+endif()
+
 # Threading (needed by LevelDB on some platforms)
 find_package(Threads REQUIRED)
 
