@@ -166,9 +166,53 @@ TEST(StratumTlsFlags, IncompleteOrMalformedSetsAreRefused)
     EXPECT_TRUE(refused({"3334", "", "k.pem"}, "needs --stratum-tls-cert FILE"));
     EXPECT_TRUE(refused({"", "c.pem", "k.pem"}, "without --stratum-tls [HOST:]PORT"));
     EXPECT_TRUE(refused({"", "c.pem", ""}, "without --stratum-tls [HOST:]PORT"));
+    core::StratumTlsSettings limits_only;
+    limits_only.limits_set = true;
+    EXPECT_TRUE(refused(limits_only, "without --stratum-tls [HOST:]PORT"));
     EXPECT_TRUE(refused({"0", "c.pem", "k.pem"}, "is not [HOST:]PORT"));
     EXPECT_TRUE(refused({"70000", "c.pem", "k.pem"}, "is not [HOST:]PORT"));
     EXPECT_TRUE(refused({"pool.example:3334", "c.pem", "k.pem"}, "HOST must be an IP address"));
+}
+
+TEST(StratumTlsFlags, LimitFlags)
+{
+    core::StratumTlsSettings s;
+    EXPECT_EQ(s.rate_per_ip, 5.0);
+    EXPECT_EQ(s.burst_per_ip, 20u);
+    EXPECT_EQ(s.max_handshakes, 32u);
+    EXPECT_EQ(s.max_handshakes_per_ip, 8u);
+    EXPECT_FALSE(s.limits_set);
+    EXPECT_FALSE(s.any_set());
+    std::string err;
+    ASSERT_TRUE(core::parse_stratum_tls_limit_flag("--stratum-tls-rate-per-ip", "2.5", s, err)) << err;
+    EXPECT_EQ(s.rate_per_ip, 2.5);
+    EXPECT_TRUE(s.limits_set);
+    EXPECT_TRUE(s.any_set());
+    ASSERT_TRUE(core::parse_stratum_tls_limit_flag("--stratum-tls-rate-per-ip", "0", s, err));
+    EXPECT_EQ(s.rate_per_ip, 0.0);
+    ASSERT_TRUE(core::parse_stratum_tls_limit_flag("--stratum-tls-burst-per-ip", "64", s, err));
+    EXPECT_EQ(s.burst_per_ip, 64u);
+    ASSERT_TRUE(core::parse_stratum_tls_limit_flag("--stratum-tls-handshakes", "100", s, err));
+    EXPECT_EQ(s.max_handshakes, 100u);
+    ASSERT_TRUE(core::parse_stratum_tls_limit_flag("--stratum-tls-handshakes-per-ip", "0", s, err));
+    EXPECT_EQ(s.max_handshakes_per_ip, 0u);
+    const auto before = s;
+    for (const auto& [flag, value] : std::vector<std::pair<std::string, std::string>>{
+             {"--stratum-tls-rate-per-ip", "-1"}, {"--stratum-tls-rate-per-ip", "abc"},
+             {"--stratum-tls-rate-per-ip", "1e3"}, {"--stratum-tls-rate-per-ip", "inf"},
+             {"--stratum-tls-rate-per-ip", "1.2.3"}, {"--stratum-tls-rate-per-ip", ""},
+             {"--stratum-tls-rate-per-ip", "."}, {"--stratum-tls-burst-per-ip", "1.5"},
+             {"--stratum-tls-burst-per-ip", "-3"}, {"--stratum-tls-handshakes", "x"},
+             {"--stratum-tls-handshakes-per-ip", ""}, {"--stratum-tls-handshakes", "99999999"},
+             {"--stratum-tls-nope", "1"}}) {
+        err.clear();
+        EXPECT_FALSE(core::parse_stratum_tls_limit_flag(flag, value, s, err)) << flag << " " << value;
+        EXPECT_FALSE(err.empty()) << flag << " " << value;
+    }
+    EXPECT_EQ(s.rate_per_ip, before.rate_per_ip);
+    EXPECT_EQ(s.burst_per_ip, before.burst_per_ip);
+    EXPECT_EQ(s.max_handshakes, before.max_handshakes);
+    EXPECT_EQ(s.max_handshakes_per_ip, before.max_handshakes_per_ip);
 }
 
 // ── Limits before the handshake (header-only, every build) ──────────────────
@@ -176,6 +220,8 @@ TEST(StratumTlsFlags, IncompleteOrMalformedSetsAreRefused)
 TEST(StratumTlsDefaults, NamedValues)
 {
     EXPECT_EQ(core::kStratumTlsHandshakeTimeout, std::chrono::milliseconds(10000));
+    EXPECT_EQ(core::kStratumTlsFirstByteTimeout, std::chrono::milliseconds(3000));
+    EXPECT_EQ(core::kStratumTlsHandshakeEvictAfter, std::chrono::milliseconds(1500));
     EXPECT_EQ(core::kStratumTlsAcceptRate, 200.0);
     EXPECT_EQ(core::kStratumTlsAcceptBurst, 400.0);
     EXPECT_EQ(core::kStratumTlsAcceptRatePerIp, 5.0);
@@ -184,6 +230,8 @@ TEST(StratumTlsDefaults, NamedValues)
     EXPECT_EQ(core::kStratumTlsMaxHandshakesPerIp, 8u);
     const core::StratumServer::TlsOptions o;
     EXPECT_EQ(o.handshake_timeout, std::chrono::milliseconds(10000));
+    EXPECT_EQ(o.first_byte_timeout, std::chrono::milliseconds(3000));
+    EXPECT_EQ(o.evict_after, std::chrono::milliseconds(1500));
     EXPECT_EQ(o.accept_rate, core::kStratumTlsAcceptRate);
     EXPECT_EQ(o.accept_burst, core::kStratumTlsAcceptBurst);
     EXPECT_EQ(o.accept_rate_per_ip, core::kStratumTlsAcceptRatePerIp);
@@ -258,14 +306,86 @@ TEST(StratumTlsLimits, AcceptLimiterGlobalAndPerAddress)
         EXPECT_EQ(lim.admit(b, t0 + std::chrono::milliseconds(100)), L::Verdict::Admit);
     }
     {
-        // Keys whose bucket is full again are pruned once the map is large.
-        L lim(0.0, 0.0, 1.0, 1.0, t0);
+        // Keys whose bucket is full again are pruned once the map is large;
+        // a key still drained survives (its refusal state is kept).
+        L lim(0.0, 0.0, 0.1, 1.0, t0);   // one token per 10 s
         for (unsigned i = 0; i < 2000; ++i)
             ASSERT_EQ(lim.admit(boost::asio::ip::make_address_v4(0x0a000000u + i), t0), L::Verdict::Admit);
         EXPECT_EQ(lim.keys(), 2000u);
-        EXPECT_EQ(lim.admit(boost::asio::ip::make_address("198.51.100.1"), t0 + std::chrono::seconds(5)),
-                  L::Verdict::Admit);
+        const auto t1 = t0 + std::chrono::seconds(20);   // all 2000 full again
+        const auto drained = boost::asio::ip::make_address("198.51.100.1");
+        EXPECT_EQ(lim.admit(drained, t1), L::Verdict::Admit);   // prunes, then drains this one
         EXPECT_EQ(lim.keys(), 1u);
+        for (unsigned i = 0; i < 1100; ++i)
+            ASSERT_EQ(lim.admit(boost::asio::ip::make_address_v4(0x0b000000u + i), t1), L::Verdict::Admit);
+        EXPECT_EQ(lim.keys(), 1101u);
+        const auto t2 = t1 + std::chrono::seconds(2);   // a prune runs, nothing is full
+        EXPECT_EQ(lim.admit(boost::asio::ip::make_address("198.51.100.2"), t2), L::Verdict::Admit);
+        EXPECT_EQ(lim.keys(), 1102u);
+        EXPECT_EQ(lim.admit(drained, t2), L::Verdict::RatePerIp);   // still drained: kept
+    }
+    {
+        // check() spends nothing; take() spends what check() admitted.
+        L lim(10.0, 2.0, 1.0, 1.0, t0);
+        EXPECT_EQ(lim.check(a, t0), L::Verdict::Admit);
+        EXPECT_EQ(lim.check(a, t0), L::Verdict::Admit);
+        lim.take(a);
+        EXPECT_EQ(lim.check(a, t0), L::Verdict::RatePerIp);
+        EXPECT_EQ(lim.check(b, t0), L::Verdict::Admit);
+        lim.take(b);
+        EXPECT_EQ(lim.check(b, t0), L::Verdict::Rate);   // the global two are spent
+    }
+}
+
+TEST(StratumTlsLimits, HandshakeGateEvictsTheOldest)
+{
+    using clock = core::StratumTlsHandshakeGate::clock;
+    const auto t0 = clock::now();
+    const auto a = boost::asio::ip::make_address("192.0.2.1");
+    const auto b = boost::asio::ip::make_address("192.0.2.2");
+    const auto c = boost::asio::ip::make_address("192.0.2.3");
+    const auto after = std::chrono::milliseconds(1500);
+    {
+        core::StratumTlsHandshakeGate gate;
+        int closed1 = 0, closed2 = 0;
+        auto s1 = gate.try_acquire(a, 2, 0, t0, after);
+        auto s2 = gate.try_acquire(b, 2, 0, t0 + std::chrono::milliseconds(100), after);
+        ASSERT_TRUE(s1 && s2);
+        s1->on_evict([&] { ++closed1; });
+        s2->on_evict([&] { ++closed2; });
+        // At the limit, both younger than 1.5 s: refused.
+        EXPECT_FALSE(gate.try_acquire(c, 2, 0, t0 + std::chrono::milliseconds(1000), after));
+        // s1 old enough: evicted for the newcomer, at once.
+        auto s3 = gate.try_acquire(c, 2, 0, t0 + std::chrono::milliseconds(1550), after);
+        ASSERT_TRUE(s3);
+        EXPECT_EQ(closed1, 1);
+        EXPECT_EQ(closed2, 0);
+        EXPECT_EQ(gate.evictions(), 1u);
+        EXPECT_EQ(gate.in_progress(), 2u);
+        EXPECT_EQ(gate.in_progress_from(a), 0u);
+        s1.reset();   // the evicted session goes later: counts unchanged
+        EXPECT_EQ(gate.in_progress(), 2u);
+        // s2 next (s3 has no on_evict: never evicted).
+        auto s4 = gate.try_acquire(a, 2, 0, t0 + std::chrono::seconds(5), after);
+        ASSERT_TRUE(s4);
+        EXPECT_EQ(closed2, 1);
+        EXPECT_FALSE(gate.try_acquire(b, 2, 0, t0 + std::chrono::seconds(9), after));   // s3, s4: no on_evict
+    }
+    {
+        // A key at its own limit evicts its own oldest, not another key's.
+        core::StratumTlsHandshakeGate gate;
+        int closed_a = 0, closed_b = 0;
+        auto sb = gate.try_acquire(b, 10, 1, t0, after);
+        auto sa = gate.try_acquire(a, 10, 1, t0 + std::chrono::milliseconds(10), after);
+        ASSERT_TRUE(sa && sb);
+        sb->on_evict([&] { ++closed_b; });
+        sa->on_evict([&] { ++closed_a; });
+        auto sa2 = gate.try_acquire(a, 10, 1, t0 + std::chrono::seconds(2), after);
+        ASSERT_TRUE(sa2);
+        EXPECT_EQ(closed_a, 1);
+        EXPECT_EQ(closed_b, 0);
+        EXPECT_EQ(gate.in_progress_from(a), 1u);
+        EXPECT_EQ(gate.in_progress_from(b), 1u);
     }
 }
 
@@ -483,10 +603,10 @@ public:
     std::string version() { return SSL_get_version(stream_.native_handle()); }
     SSL* native() { return stream_.native_handle(); }
 
-    // A TLS 1.2 renegotiation from this side: true when it completed.
-    bool renegotiate(std::chrono::milliseconds timeout = 3000ms)
+    // Run the client handshake again (after SSL_renegotiate): true when it
+    // completed.
+    bool handshake_again(std::chrono::milliseconds timeout = 3000ms)
     {
-        if (SSL_renegotiate(stream_.native_handle()) != 1) { error_ = "SSL_renegotiate refused locally"; return false; }
         bool done = false, ok = false;
         stream_.async_handshake(ssl::stream_base::client, [&](const boost::system::error_code& e) {
             done = true;
@@ -701,9 +821,20 @@ TEST(StratumTlsListener, ConfigureFromTheFlags)
     EXPECT_FALSE(core::configure_stratum_tls(nullptr, {"3334", a.cert, a.key}));   // no stratum listener
     const uint16_t p = free_port();
     // PORT alone: the stratum listener's host.
-    ASSERT_TRUE(core::configure_stratum_tls(&s, {std::to_string(p), a.cert, a.key}));
+    core::StratumTlsSettings set{std::to_string(p), a.cert, a.key};
+    set.rate_per_ip = 7.5;
+    set.burst_per_ip = 30;
+    set.max_handshakes = 64;
+    set.max_handshakes_per_ip = 0;
+    ASSERT_TRUE(core::configure_stratum_tls(&s, set));
     EXPECT_EQ(s.get_tls_bind_address(), "127.0.0.1");
     EXPECT_EQ(s.get_tls_port(), p);
+    const auto o = s.get_tls_options();
+    EXPECT_EQ(o.accept_rate_per_ip, 7.5);
+    EXPECT_EQ(o.accept_burst_per_ip, 30.0);
+    EXPECT_EQ(o.max_handshakes, 64u);
+    EXPECT_EQ(o.max_handshakes_per_ip, 0u);
+    EXPECT_EQ(o.accept_rate, core::kStratumTlsAcceptRate);   // not a flag
     s.stop();
 }
 
@@ -1098,15 +1229,25 @@ TEST(StratumTlsContextSettings, KeyReadableByOthersIsNamed)
 #else
     TempDir dir;
     const auto a = make_cert(dir.path, "pool-a", 1);
-    fs::permissions(a.key, fs::perms::owner_read | fs::perms::owner_write, fs::perm_options::replace);
-    EXPECT_FALSE(core::stratum_tls_key_permissions_problem(a.key));
-    fs::permissions(a.key, fs::perms::owner_read | fs::perms::owner_write | fs::perms::group_read,
-                    fs::perm_options::replace);
-    auto p = core::stratum_tls_key_permissions_problem(a.key);
+    using P = fs::perms;
+    auto problem = [&](P perms) {
+        fs::permissions(a.key, perms, fs::perm_options::replace);
+        return core::stratum_tls_key_permissions_problem(a.key);
+    };
+    EXPECT_FALSE(problem(P::owner_read | P::owner_write));                    // 600
+    EXPECT_FALSE(problem(P::owner_read));                                     // 400
+    EXPECT_FALSE(problem(P::owner_read | P::owner_write | P::group_read));    // 640 (root:ssl-cert)
+    auto p = problem(P::owner_read | P::owner_write | P::others_read);        // 604
     ASSERT_TRUE(p);
-    EXPECT_NE(p->find("mode 640"), std::string::npos) << *p;
-    fs::permissions(a.key, fs::perms::owner_read | fs::perms::others_read, fs::perm_options::replace);
-    EXPECT_TRUE(core::stratum_tls_key_permissions_problem(a.key));
+    EXPECT_NE(p->find("readable by others (mode 604); chmod o-r"), std::string::npos) << *p;
+    p = problem(P::owner_read | P::owner_write | P::group_read | P::group_write);   // 660
+    ASSERT_TRUE(p);
+    EXPECT_NE(p->find("writable by its group (mode 660); chmod g-w"), std::string::npos) << *p;
+    p = problem(P::owner_read | P::owner_write | P::others_read | P::others_write);  // 606
+    ASSERT_TRUE(p);
+    EXPECT_NE(p->find("readable by others and writable by others (mode 606); chmod o-r,o-w"),
+              std::string::npos) << *p;
+    fs::permissions(a.key, P::owner_read | P::owner_write, fs::perm_options::replace);
 #endif
 }
 
@@ -1131,7 +1272,8 @@ TEST(StratumTlsSession, RenegotiationIsRefused)
     c.send(kSubscribe);
     ASSERT_TRUE(c.reply(1));
     c.read_line(1000ms);   // the set_difficulty after it: nothing else is in flight
-    EXPECT_FALSE(c.renegotiate()) << "a client-initiated renegotiation completed";
+    ASSERT_EQ(SSL_renegotiate(c.native()), 1);   // scheduled on this side
+    EXPECT_FALSE(c.handshake_again()) << "a client-initiated renegotiation completed";
 }
 
 TEST(StratumTlsSession, NoSessionResumption)
@@ -1331,6 +1473,8 @@ TEST(StratumTlsRate, HandshakesInProgressAreBounded)
     ASSERT_TRUE(node.start(a, {}, core::kStratumTlsHandshakeTimeout, [](auto& o) {
         o.max_handshakes = 2;
         o.max_handshakes_per_ip = 0;
+        o.evict_after = std::chrono::seconds(60);   // nothing evicted here
+        o.first_byte_timeout = std::chrono::seconds(10);
     }));
     auto silent1 = std::make_unique<RawClient>();
     RawClient silent2;
@@ -1365,6 +1509,8 @@ TEST(StratumTlsRate, HandshakesInProgressFromOneAddressAreBounded)
     ASSERT_TRUE(node.start(a, {}, core::kStratumTlsHandshakeTimeout, [](auto& o) {
         o.max_handshakes = 10;
         o.max_handshakes_per_ip = 1;
+        o.evict_after = std::chrono::seconds(60);
+        o.first_byte_timeout = std::chrono::seconds(10);
     }));
     RawClient silent;
     ASSERT_TRUE(silent.connect("127.0.0.1", node.tls_port));
@@ -1399,6 +1545,135 @@ TEST(StratumTlsReload, SighupIsRestartableAndThePreviousDispositionComesBack)
         node.on_io([&] { node.stratum->stop(); return 0; });
         ASSERT_EQ(::sigaction(SIGHUP, nullptr, &now), 0);
         EXPECT_EQ(now.sa_handler, SIG_IGN);           // nohup's SIG_IGN is back
+    }
+    ASSERT_EQ(::sigaction(SIGHUP, &before, nullptr), 0);
+#endif
+}
+
+TEST(StratumTlsRate, SilentHoldersAreEvictedForARealClient)
+{
+    TempDir dir;
+    const auto a = make_cert(dir.path, "localhost", 1);
+    TlsNode node;
+    ASSERT_TRUE(node.start(a, {}, core::kStratumTlsHandshakeTimeout, [](auto& o) {
+        o.max_handshakes = 2;
+        o.max_handshakes_per_ip = 0;
+        o.evict_after = std::chrono::milliseconds(200);
+        o.first_byte_timeout = std::chrono::seconds(10);   // only the eviction frees them
+    }));
+    RawClient silent1, silent2;
+    ASSERT_TRUE(silent1.connect("127.0.0.1", node.tls_port));
+    ASSERT_TRUE(wait_until([&] { return node.stratum->get_tls_handshakes_in_progress() == 1; }));
+    ASSERT_TRUE(silent2.connect("127.0.0.1", node.tls_port));
+    ASSERT_TRUE(wait_until([&] { return node.stratum->get_tls_handshakes_in_progress() == 2; }));
+    std::this_thread::sleep_for(400ms);
+    TlsClient c(a.cert);
+    ASSERT_TRUE(c.connect(node.tls_port)) << c.error();
+    c.send(kSubscribe);
+    EXPECT_TRUE(c.reply(1));
+    EXPECT_EQ(node.stratum->get_tls_handshake_evictions(), 1u);
+    EXPECT_EQ(node.stratum->get_tls_refused_handshakes(), 0u);
+    silent1.read_all(2000ms);
+    EXPECT_TRUE(silent1.closed());   // the oldest was the one evicted
+    EXPECT_TRUE(silent2.silent_for(200ms));
+    EXPECT_TRUE(wait_until([&] { return node.stratum->get_tls_handshake_failures() == 1; }));
+}
+
+TEST(StratumTlsSession, NoClientHelloWithinTheFirstByteTimeout)
+{
+    TempDir dir;
+    const auto a = make_cert(dir.path, "localhost", 1);
+    TlsNode node;
+    ASSERT_TRUE(node.start(a, {}, std::chrono::milliseconds(1000), [](auto& o) {
+        o.first_byte_timeout = std::chrono::milliseconds(300);
+    }));
+    EXPECT_EQ(node.stratum->tls_first_byte_timeout(), std::chrono::milliseconds(300));
+    {
+        RawClient c;   // sends nothing
+        ASSERT_TRUE(c.connect("127.0.0.1", node.tls_port));
+        const auto t0 = std::chrono::steady_clock::now();
+        c.read_all(5000ms);
+        const auto took = std::chrono::steady_clock::now() - t0;
+        EXPECT_TRUE(c.closed());
+        EXPECT_GE(took, 200ms);
+        EXPECT_LT(took, 900ms);   // the first-byte bound, not the 1000 ms one
+    }
+    {
+        RawClient c;   // one byte of a record header, then nothing
+        ASSERT_TRUE(c.connect("127.0.0.1", node.tls_port));
+        const auto t0 = std::chrono::steady_clock::now();
+        c.send(std::string(1, '\x16'));
+        c.read_all(5000ms);
+        const auto took = std::chrono::steady_clock::now() - t0;
+        EXPECT_TRUE(c.closed());
+        EXPECT_GE(took, 800ms);   // the whole-handshake bound
+        EXPECT_LT(took, 3000ms);
+    }
+    EXPECT_TRUE(wait_until([&] { return node.stratum->get_tls_handshake_failures() == 2; }));
+    TlsClient t(a.cert);   // a real client is unaffected
+    ASSERT_TRUE(t.connect(node.tls_port)) << t.error();
+}
+
+TEST(StratumTlsRate, AHandshakeBoundRefusalSpendsNoToken)
+{
+    TempDir dir;
+    const auto a = make_cert(dir.path, "localhost", 1);
+    TlsNode node;
+    ASSERT_TRUE(node.start(a, {}, core::kStratumTlsHandshakeTimeout, [](auto& o) {
+        o.accept_rate = 0;
+        o.accept_rate_per_ip = 0.05;   // one token per 20 s: none come back here
+        o.accept_burst_per_ip = 3;
+        o.max_handshakes_per_ip = 1;
+        o.evict_after = std::chrono::seconds(60);
+        o.first_byte_timeout = std::chrono::seconds(10);
+    }));
+    auto silent = std::make_unique<RawClient>();   // token 1, holds the slot
+    ASSERT_TRUE(silent->connect("127.0.0.1", node.tls_port));
+    ASSERT_TRUE(wait_until([&] { return node.stratum->get_tls_handshakes_in_progress() == 1; }));
+    {
+        RawClient refused;   // the slot is taken: closed, no token spent
+        ASSERT_TRUE(refused.connect("127.0.0.1", node.tls_port));
+        refused.read_all(2000ms);
+        EXPECT_TRUE(refused.closed());
+        EXPECT_EQ(node.stratum->get_tls_refused_handshakes(), 1u);
+    }
+    silent.reset();
+    ASSERT_TRUE(wait_until([&] { return node.stratum->get_tls_handshakes_in_progress() == 0; }));
+    TlsClient c1(a.cert);   // token 2
+    ASSERT_TRUE(c1.connect(node.tls_port)) << c1.error();
+    TlsClient c2(a.cert);   // token 3 (gone if the refusal had spent one)
+    ASSERT_TRUE(c2.connect(node.tls_port)) << c2.error();
+    TlsClient c3(a.cert);
+    EXPECT_FALSE(c3.connect(node.tls_port));
+    EXPECT_TRUE(wait_until([&] { return node.stratum->get_tls_refused_rate_per_ip() == 1; }));
+}
+
+TEST(StratumTlsReload, TwoListenersRestoreTheDispositionWhenTheLastCloses)
+{
+#ifdef _WIN32
+    GTEST_SKIP() << "no SIGHUP";
+#else
+    struct sigaction ignore {};
+    ignore.sa_handler = SIG_IGN;
+    sigemptyset(&ignore.sa_mask);
+    struct sigaction before {};
+    ASSERT_EQ(::sigaction(SIGHUP, &ignore, &before), 0);
+    {
+        TempDir dir;
+        const auto a = make_cert(dir.path, "localhost", 1);
+        TlsNode one, two;
+        ASSERT_TRUE(one.start(a));
+        ASSERT_TRUE(two.start(a));
+        struct sigaction now {};
+        one.on_io([&] { one.stratum->stop(); return 0; });
+        ASSERT_EQ(::sigaction(SIGHUP, nullptr, &now), 0);
+        EXPECT_NE(now.sa_handler, SIG_IGN);   // two still holds it
+        const uint64_t reloads = two.stratum->get_tls_reloads();
+        ASSERT_EQ(std::raise(SIGHUP), 0);
+        EXPECT_TRUE(wait_until([&] { return two.stratum->get_tls_reloads() == reloads + 1; }));
+        two.on_io([&] { two.stratum->stop(); return 0; });
+        ASSERT_EQ(::sigaction(SIGHUP, nullptr, &now), 0);
+        EXPECT_EQ(now.sa_handler, SIG_IGN);   // the last one closed: back
     }
     ASSERT_EQ(::sigaction(SIGHUP, &before, nullptr), 0);
 #endif

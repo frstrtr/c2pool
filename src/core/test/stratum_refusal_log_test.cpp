@@ -71,3 +71,27 @@ TEST(StratumRefusalLog, ZeroWindowLogsEveryRefusal)
         EXPECT_TRUE(lim.record(at(i * 0.01), "203.0.113.7", kCap));
     EXPECT_EQ(lim.pending(), 0u);
 }
+
+TEST(RefusalLogLimiter, PendingPeersAreCappedTheRestCountedAsOther)
+{
+    using clock = core::RefusalLogLimiter::clock;
+    core::RefusalLogLimiter lim(std::chrono::seconds(10));
+    const auto t0 = clock::now();
+    ASSERT_TRUE(lim.record(t0, "first", "d"));   // logged in full
+    const std::size_t n = core::RefusalLogLimiter::kMaxPendingPeers + 500;
+    for (std::size_t i = 0; i < n; ++i)
+        EXPECT_FALSE(lim.record(t0, "2001:db8:" + std::to_string(i) + "::", "d"));
+    lim.record(t0, "2001:db8:0::", "d");   // a known peer is still told apart
+    EXPECT_EQ(lim.pending(), n + 1);
+    EXPECT_EQ(lim.pending_peers(), core::RefusalLogLimiter::kMaxPendingPeers);
+    const auto summary = lim.flush(t0 + std::chrono::seconds(10));
+    ASSERT_TRUE(summary);
+    EXPECT_NE(summary->find("top peer 2001:db8:0:: x2"), std::string::npos) << *summary;
+    EXPECT_NE(summary->find(", 500 from other peers"), std::string::npos) << *summary;
+    EXPECT_EQ(lim.pending_peers(), 0u);
+    // The next window starts clean.
+    EXPECT_FALSE(lim.record(t0 + std::chrono::seconds(11), "x", "d"));
+    const auto next = lim.flush(t0 + std::chrono::seconds(21));
+    ASSERT_TRUE(next);
+    EXPECT_EQ(next->find("other peers"), std::string::npos) << *next;
+}

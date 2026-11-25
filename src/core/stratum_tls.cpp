@@ -12,11 +12,17 @@
 #include <filesystem>
 #include <system_error>
 
+#include <algorithm>
+#include <charconv>
+#include <cstdlib>
+#include <utility>
+
 #include <boost/asio/append.hpp>
 #include <boost/asio/ip/address.hpp>
 #include <boost/asio/post.hpp>
 
 #include <core/log.hpp>
+#include <core/settings_file.hpp>
 
 #ifdef C2POOL_STRATUM_TLS
 #include <boost/asio/ssl.hpp>
@@ -274,20 +280,95 @@ std::optional<std::string> stratum_tls_key_permissions_problem(const std::string
     (void)key;
     return std::nullopt;
 #else
+    // Group read is fine (Debian's root:ssl-cert 0640 layout); others reading
+    // it, or anyone but the owner writing it, is not.
     namespace fs = std::filesystem;
     std::error_code ec;
     const auto perms = fs::status(key, ec).permissions();
     if (ec || perms == fs::perms::unknown)
         return std::nullopt;
-    const auto open = perms & (fs::perms::group_read | fs::perms::group_write | fs::perms::others_read
-                               | fs::perms::others_write);
-    if (open == fs::perms::none)
+    const bool other_read = (perms & fs::perms::others_read) != fs::perms::none;
+    const bool group_write = (perms & fs::perms::group_write) != fs::perms::none;
+    const bool other_write = (perms & fs::perms::others_write) != fs::perms::none;
+    if (!other_read && !group_write && !other_write)
         return std::nullopt;
+    std::string what, fix;
+    if (other_read) { what = "readable by others"; fix = "o-r"; }
+    if (group_write || other_write) {
+        what += what.empty() ? "" : " and ";
+        what += group_write && other_write ? "writable by its group and others"
+              : group_write ? "writable by its group" : "writable by others";
+        fix += fix.empty() ? "" : ",";
+        fix += group_write && other_write ? "go-w" : group_write ? "g-w" : "o-w";
+    }
     char mode[8];
     std::snprintf(mode, sizeof(mode), "%03o", static_cast<unsigned>(perms) & 0777u);
-    return "the private key " + key + " is readable or writable by its group or by others (mode "
-         + mode + "); chmod 600 it";
+    return "the private key " + key + " is " + what + " (mode " + mode + "); chmod " + fix + " " + key;
 #endif
+}
+
+bool parse_stratum_tls_limit_flag(std::string_view flag, std::string_view value, StratumTlsSettings& s,
+                                  std::string& error)
+{
+    const std::string f(flag);
+    if (f == "--stratum-tls-rate-per-ip") {
+        // A plain decimal: digits and at most one point (no sign, exponent,
+        // inf or nan).
+        const bool ok_chars = !value.empty() && value.find_first_not_of("0123456789.") == std::string_view::npos
+                              && std::count(value.begin(), value.end(), '.') <= 1 && value != ".";
+        if (ok_chars) {
+            const std::string v(value);
+            char* end = nullptr;
+            const double r = std::strtod(v.c_str(), &end);
+            if (end == v.c_str() + v.size() && r >= 0 && r <= 1e6) {
+                s.rate_per_ip = r;
+                s.limits_set = true;
+                return true;
+            }
+        }
+        error = "bad value: " + f + " " + std::string(value) + " (expected accepts a second, a number >= 0; 0 = no limit)";
+        return false;
+    }
+    std::size_t* out = f == "--stratum-tls-burst-per-ip"         ? &s.burst_per_ip
+                     : f == "--stratum-tls-handshakes"          ? &s.max_handshakes
+                     : f == "--stratum-tls-handshakes-per-ip"   ? &s.max_handshakes_per_ip
+                                                                : nullptr;
+    if (!out) {
+        error = "not a TLS stratum limit flag: " + f;
+        return false;
+    }
+    std::size_t n = 0;
+    const auto r = std::from_chars(value.data(), value.data() + value.size(), n);
+    if (value.empty() || r.ec != std::errc{} || r.ptr != value.data() + value.size() || n > 1000000) {
+        error = "bad value: " + f + " " + std::string(value) + " (expected a count; 0 = no limit)";
+        return false;
+    }
+    *out = n;
+    s.limits_set = true;
+    return true;
+}
+
+void apply_stratum_tls_file_settings(const c2pool::settings::ResolvedConfig& rc, StratumTlsSettings& s)
+{
+    if (rc.file_set("stratum.tls_bind"))
+        s.bind = rc.get_string("stratum.tls_bind").value_or("");
+    if (rc.file_set("stratum.tls_cert"))
+        s.cert = rc.get_string("stratum.tls_cert").value_or("");
+    if (rc.file_set("stratum.tls_key"))
+        s.key = rc.get_string("stratum.tls_key").value_or("");
+    // The limits: the same values as on the command line; a bad one is
+    // refused with a warning and leaves the setting as it was.
+    for (const auto& [canon, flag] : {std::pair<const char*, const char*>{"stratum.tls_rate_per_ip", "--stratum-tls-rate-per-ip"},
+                                      {"stratum.tls_burst_per_ip", "--stratum-tls-burst-per-ip"},
+                                      {"stratum.tls_handshakes", "--stratum-tls-handshakes"},
+                                      {"stratum.tls_handshakes_per_ip", "--stratum-tls-handshakes-per-ip"}}) {
+        if (!rc.file_set(canon))
+            continue;
+        std::string error;
+        const std::string v = rc.get_string(canon).value_or("");
+        if (!parse_stratum_tls_limit_flag(flag, v, s, error))
+            LOG_WARNING << "settings: " << canon << " = '" << v << "' ignored: " << error;
+    }
 }
 
 std::optional<std::string> check_stratum_tls_settings(const StratumTlsSettings& s, bool supported)
@@ -299,7 +380,8 @@ std::optional<std::string> check_stratum_tls_settings(const StratumTlsSettings& 
                            "this build has no TLS support (built without OpenSSL: CMake option "
                            "C2POOL_STRATUM_TLS=OFF)");
     if (s.bind.empty())
-        return std::string("--stratum-tls-cert / --stratum-tls-key given without --stratum-tls [HOST:]PORT");
+        return std::string("--stratum-tls-cert / --stratum-tls-key / --stratum-tls-* limits given without "
+                           "--stratum-tls [HOST:]PORT");
     std::string host;
     uint16_t port = 0;
     if (!parse_stratum_tls_bind(s.bind, host, port))

@@ -39,6 +39,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <iterator>
 #include <map>
 #include <memory>
@@ -55,14 +56,51 @@
 
 namespace core {
 
+/// A TLS connection whose handshake has not completed this long after the
+/// accept is closed (StratumServer::TlsOptions::handshake_timeout).
+inline constexpr std::chrono::milliseconds kStratumTlsHandshakeTimeout{10000};
+/// ... and one that has sent nothing (no ClientHello byte) this long after
+/// the accept (TlsOptions::first_byte_timeout).
+inline constexpr std::chrono::milliseconds kStratumTlsFirstByteTimeout{3000};
+/// With the handshakes in progress at their limit, a new connection evicts
+/// the oldest one that has been in progress at least this long (it is closed
+/// and counted as a failed handshake); none that old: the new one is closed
+/// (TlsOptions::evict_after).
+inline constexpr std::chrono::milliseconds kStratumTlsHandshakeEvictAfter{1500};
+
+/// New TLS connections a second, from all addresses (token bucket rate), and
+/// the bucket size: at most kStratumTlsAcceptBurst back to back after a quiet
+/// spell. 0 = no limit.
+inline constexpr double kStratumTlsAcceptRate = 200.0;
+inline constexpr double kStratumTlsAcceptBurst = 400.0;
+/// The same from one address (IPv4 address, IPv6 /64: per_ip_cap_key):
+/// --stratum-tls-rate-per-ip / --stratum-tls-burst-per-ip. Up to the burst
+/// may arrive back to back (a farm behind one NAT reconnecting); at most
+/// kStratumTlsMaxHandshakesPerIp of them handshake at the same moment, the
+/// others are closed and retry.
+inline constexpr double kStratumTlsAcceptRatePerIp = 5.0;
+inline constexpr double kStratumTlsAcceptBurstPerIp = 20.0;
+/// TLS handshakes in progress at once, in total and from one address
+/// (--stratum-tls-handshakes / --stratum-tls-handshakes-per-ip). Separate
+/// from max_stratum_connections. 0 = no limit.
+inline constexpr std::size_t kStratumTlsMaxHandshakes = 32;
+inline constexpr std::size_t kStratumTlsMaxHandshakesPerIp = 8;
+
 /// The flags as given (command line or settings file). bind empty = off.
 struct StratumTlsSettings {
     std::string bind;   // --stratum-tls [HOST:]PORT
     std::string cert;   // --stratum-tls-cert FILE
     std::string key;    // --stratum-tls-key FILE
+    // --stratum-tls-rate-per-ip / --stratum-tls-burst-per-ip /
+    // --stratum-tls-handshakes / --stratum-tls-handshakes-per-ip.
+    double rate_per_ip = kStratumTlsAcceptRatePerIp;
+    std::size_t burst_per_ip = static_cast<std::size_t>(kStratumTlsAcceptBurstPerIp);
+    std::size_t max_handshakes = kStratumTlsMaxHandshakes;
+    std::size_t max_handshakes_per_ip = kStratumTlsMaxHandshakesPerIp;
+    bool limits_set = false;   // one of those four was given
 
     bool enabled() const { return !bind.empty(); }
-    bool any_set() const { return !bind.empty() || !cert.empty() || !key.empty(); }
+    bool any_set() const { return !bind.empty() || !cert.empty() || !key.empty() || limits_set; }
 };
 
 /// The process's TLS stratum flags: the parse writes them, the wiring
@@ -73,24 +111,24 @@ inline StratumTlsSettings& stratum_tls_setting()
     return s;
 }
 
-/// A TLS connection whose handshake has not completed this long after the
-/// accept is closed (StratumServer::TlsOptions::handshake_timeout).
-inline constexpr std::chrono::milliseconds kStratumTlsHandshakeTimeout{10000};
+/// One of the four limit flags (--stratum-tls-rate-per-ip R: a decimal
+/// number >= 0; --stratum-tls-burst-per-ip, --stratum-tls-handshakes,
+/// --stratum-tls-handshakes-per-ip N: a count) with its value. true: `s`
+/// holds it (and limits_set); false: `error` says why (s unchanged), also for
+/// a flag that is none of the four.
+bool parse_stratum_tls_limit_flag(std::string_view flag, std::string_view value, StratumTlsSettings& s,
+                                  std::string& error);
 
-/// New TLS connections a second, from all addresses (token bucket rate), and
-/// the bucket size: at most kStratumTlsAcceptBurst at once after a quiet
-/// spell. 0 = no limit.
-inline constexpr double kStratumTlsAcceptRate = 200.0;
-inline constexpr double kStratumTlsAcceptBurst = 400.0;
-/// The same from one address (IPv4 address, IPv6 /64: per_ip_cap_key). The
-/// burst lets a farm behind one NAT reconnect 20 rigs at once.
-inline constexpr double kStratumTlsAcceptRatePerIp = 5.0;
-inline constexpr double kStratumTlsAcceptBurstPerIp = 20.0;
-/// TLS handshakes in progress at once, in total and from one address (an
-/// accept over either is closed). Separate from max_stratum_connections.
-/// 0 = no limit.
-inline constexpr std::size_t kStratumTlsMaxHandshakes = 32;
-inline constexpr std::size_t kStratumTlsMaxHandshakesPerIp = 8;
+}  // namespace core
+namespace c2pool::settings { class ResolvedConfig; }
+namespace core {
+
+/// The settings-file keys stratum.tls_bind / tls_cert / tls_key and the four
+/// limits (stratum.tls_rate_per_ip, tls_burst_per_ip, tls_handshakes,
+/// tls_handshakes_per_ip): the ones set by the file (the command line wins:
+/// its keys are never file-set) go into `s`; a bad limit is warned about
+/// and ignored.
+void apply_stratum_tls_file_settings(const c2pool::settings::ResolvedConfig& rc, StratumTlsSettings& s);
 
 /// A token bucket: `rate` tokens a second, at most `burst` held (it starts
 /// full). rate <= 0: every take() succeeds. Not thread-safe.
@@ -143,7 +181,9 @@ public:
                             clock::time_point now = clock::now())
         : global_(rate, burst, now), per_ip_rate_(per_ip_rate), per_ip_burst_(per_ip_burst) {}
 
-    Verdict admit(const address& key, clock::time_point now)
+    /// Would an accept from `key` get a token from both buckets now? Spends
+    /// nothing (take() does).
+    Verdict check(const address& key, clock::time_point now)
     {
         if (!global_.ready(now))
             return Verdict::Rate;
@@ -154,9 +194,22 @@ public:
         }
         if (!it->second.ready(now))
             return Verdict::RatePerIp;
-        global_.take();
-        it->second.take();
         return Verdict::Admit;
+    }
+    /// Spend the tokens of an accept check() admitted.
+    void take(const address& key)
+    {
+        global_.take();
+        if (auto it = per_key_.find(key); it != per_key_.end())
+            it->second.take();
+    }
+    /// check() and, when it admits, take().
+    Verdict admit(const address& key, clock::time_point now)
+    {
+        const Verdict v = check(key, now);
+        if (v == Verdict::Admit)
+            take(key);
+        return v;
     }
     std::size_t keys() const { return per_key_.size(); }
 
@@ -180,38 +233,110 @@ private:
 
 /// Handshakes in progress on the TLS listener, in total and per key. A slot
 /// is held from the accept until the session's handshake ends (or the
-/// session goes); the counts live in shared state, so a slot may outlive the
-/// gate. Thread-safe.
+/// session goes). At a limit, the oldest handshake in progress at least
+/// `evict_after` (from the same key when that key's limit is the one hit) is
+/// evicted: its slot is freed at once and its on_evict function closes it;
+/// none that old, the newcomer gets no slot. The counts live in shared
+/// state, so a slot may outlive the gate. Thread-safe; on_evict functions run
+/// on the calling thread, outside the lock.
 class StratumTlsHandshakeGate {
+    struct Entry {
+        boost::asio::ip::address key;
+        std::chrono::steady_clock::time_point since;
+        std::function<void()> evict;
+    };
+    struct State {
+        std::mutex mutex;
+        std::map<uint64_t, Entry> entries;   // acquisition order: oldest first
+        std::map<boost::asio::ip::address, std::size_t> per_key;
+        uint64_t next_id = 0;
+        uint64_t evictions = 0;
+        void erase_locked(std::map<uint64_t, Entry>::iterator it)
+        {
+            auto k = per_key.find(it->second.key);
+            if (k != per_key.end() && --k->second == 0)
+                per_key.erase(k);
+            entries.erase(it);
+        }
+    };
+
 public:
+    using clock = std::chrono::steady_clock;
     using address = boost::asio::ip::address;
+
+    class Slot {
+    public:
+        ~Slot()
+        {
+            std::lock_guard<std::mutex> lk(st_->mutex);
+            if (auto it = st_->entries.find(id_); it != st_->entries.end())
+                st_->erase_locked(it);
+        }
+        Slot(const Slot&) = delete;
+        Slot& operator=(const Slot&) = delete;
+        /// How the gate closes this handshake when it evicts it (until set,
+        /// it is not evicted).
+        void on_evict(std::function<void()> fn)
+        {
+            std::lock_guard<std::mutex> lk(st_->mutex);
+            if (auto it = st_->entries.find(id_); it != st_->entries.end())
+                it->second.evict = std::move(fn);
+        }
+
+    private:
+        friend class StratumTlsHandshakeGate;
+        Slot(std::shared_ptr<State> st, uint64_t id) : st_(std::move(st)), id_(id) {}
+        std::shared_ptr<State> st_;
+        uint64_t id_;
+    };
+
     StratumTlsHandshakeGate() : state_(std::make_shared<State>()) {}
 
-    /// A slot for one handshake from `key`, or nullptr when `max_total` are
-    /// in progress or `max_per_key` from `key` (0: no limit). Released when
-    /// its last copy goes.
-    std::shared_ptr<void> try_acquire(const address& key, std::size_t max_total, std::size_t max_per_key)
+    /// A slot for one handshake from `key` (0 limits: none), evicting one as
+    /// above when at a limit; nullptr when no slot can be had.
+    std::shared_ptr<Slot> try_acquire(const address& key, std::size_t max_total, std::size_t max_per_key,
+                                      clock::time_point now = clock::now(),
+                                      clock::duration evict_after = kStratumTlsHandshakeEvictAfter)
     {
-        std::lock_guard<std::mutex> lk(state_->mutex);
-        if (max_total > 0 && state_->total >= max_total)
-            return nullptr;
-        auto& n = state_->per_key[key];   // a new key starts at 0 and is admitted
-        if (max_per_key > 0 && n >= max_per_key)
-            return nullptr;
-        ++n;
-        ++state_->total;
-        return std::shared_ptr<void>(static_cast<void*>(state_.get()), [st = state_, key](void*) {
-            std::lock_guard<std::mutex> lk(st->mutex);
-            --st->total;
-            auto it = st->per_key.find(key);
-            if (it != st->per_key.end() && --it->second == 0)
-                st->per_key.erase(it);
-        });
+        std::function<void()> evict;
+        std::shared_ptr<Slot> slot;
+        {
+            std::lock_guard<std::mutex> lk(state_->mutex);
+            const auto k = state_->per_key.find(key);
+            const std::size_t from_key = k == state_->per_key.end() ? 0 : k->second;
+            const bool key_full = max_per_key > 0 && from_key >= max_per_key;
+            const bool total_full = max_total > 0 && state_->entries.size() >= max_total;
+            if (key_full || total_full) {
+                auto victim = state_->entries.end();
+                for (auto it = state_->entries.begin(); it != state_->entries.end(); ++it) {
+                    if (key_full && it->second.key != key)
+                        continue;
+                    if (now - it->second.since < evict_after)
+                        break;   // oldest first: the rest are younger
+                    if (it->second.evict) {
+                        victim = it;
+                        break;
+                    }
+                }
+                if (victim == state_->entries.end())
+                    return nullptr;
+                evict = std::move(victim->second.evict);
+                state_->erase_locked(victim);
+                ++state_->evictions;
+            }
+            const uint64_t id = state_->next_id++;
+            state_->entries.emplace(id, Entry{key, now, {}});
+            ++state_->per_key[key];
+            slot.reset(new Slot(state_, id));
+        }
+        if (evict)
+            evict();
+        return slot;
     }
     std::size_t in_progress() const
     {
         std::lock_guard<std::mutex> lk(state_->mutex);
-        return state_->total;
+        return state_->entries.size();
     }
     std::size_t in_progress_from(const address& key) const
     {
@@ -219,13 +344,14 @@ public:
         auto it = state_->per_key.find(key);
         return it == state_->per_key.end() ? 0 : it->second;
     }
+    /// Handshakes evicted since the gate was made.
+    uint64_t evictions() const
+    {
+        std::lock_guard<std::mutex> lk(state_->mutex);
+        return state_->evictions;
+    }
 
 private:
-    struct State {
-        std::mutex mutex;
-        std::size_t total = 0;
-        std::map<address, std::size_t> per_key;
-    };
     std::shared_ptr<State> state_;
 };
 
