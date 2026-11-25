@@ -29,16 +29,30 @@ d_orph=$(cat "${LOGS[@]}" | grep -A3 "BLOCK ORPHANED — DOGE" | grep -c "Block 
 # counts at that step, so only later lines are read: no clock, timezone or midnight
 # dependence. Evidence from older harness runs has only l3.mark (UTC HH:MM:SS, while
 # node logs stamp local time); it is compared as before and tagged clock=legacy-utc.
+# Both node logs must exist and l3.lines must hold exactly two integers. Anything else
+# gives resub=NA, which is never a PASS: a missing log or a one-field l3.lines would
+# otherwise drop a node silently and read as "0 resubmits".
 RESUB_RE="Merged block submitted.*snapshot hash=${D16}"
-if [ -s "$E/l3.lines" ]; then
-  read -r LA LB < "$E/l3.lines"
-  resub=$( { tail -n +"$((LA+1))" "$E/nodeA.log"; tail -n +"$((LB+1))" "$E/nodeB.log"; } | grep -c "$RESUB_RE")
-  clock=lines
+if [ ! -f "$E/nodeA.log" ] || [ ! -f "$E/nodeB.log" ]; then
+  resub=NA; clock=missing-log
+elif [ -s "$E/l3.lines" ]; then
+  LA="" LB="" LX=""
+  read -r LA LB LX < "$E/l3.lines"
+  if [[ $LA =~ ^[0-9]+$ ]] && [[ $LB =~ ^[0-9]+$ ]] && [ -z "$LX" ]; then
+    resub=$( { tail -n +"$((LA+1))" "$E/nodeA.log"; tail -n +"$((LB+1))" "$E/nodeB.log"; } | grep -c "$RESUB_RE")
+    clock=lines
+  else
+    resub=NA; clock=bad-l3.lines
+  fi
 elif [ -s "$E/l3.mark" ]; then
   MARK=$(cat "$E/l3.mark")
-  resub=$(cat "${LOGS[@]}" | grep "$RESUB_RE" \
-          | awk -v m="$MARK" '{t=substr($1,2,8); if (t>=m) n++} END{print n+0}')
-  clock=legacy-utc
+  if [[ $MARK =~ ^[0-9]{2}:[0-9]{2}:[0-9]{2}$ ]]; then
+    resub=$(cat "$E/nodeA.log" "$E/nodeB.log" | grep "$RESUB_RE" \
+            | awk -v m="$MARK" '{t=substr($1,2,8); if (t>=m) n++} END{print n+0}')
+    clock=legacy-utc
+  else
+    resub=NA; clock=bad-l3.mark
+  fi
 else
   resub=NA; clock=none
 fi

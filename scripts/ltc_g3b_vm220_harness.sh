@@ -8,7 +8,9 @@
 #
 # Legs (all against real litecoind/dogecoind -regtest, real cpuminer scrypt):
 #   L1 genuine blocks : c2pool-submitted populated LTC blocks + populated DOGE auxpow blocks
-#                       accepted, PPLNS coinbase pays both miners, 0 rejects.
+#                       accepted; >=1 LTC block carries the aux commit and >=1 LTC PPLNS
+#                       coinbase pays both miners (pre-switch blocks can pay only M1 until
+#                       B's shares are in the window); 0 rejects (REJ_RE below).
 #   L2 v35->v36 cross : two peered c2pool nodes (A --genesis, B -n A) start in
 #                       AutoRatchet VOTING minting v35 (desired=36). Regtest pool
 #                       params = testnet (CHAIN_LENGTH 400, share_period 4s), so
@@ -147,6 +149,8 @@ log "UP nodeA=$NA nodeB=$NB minerA=$MA minerB=$MB"
 
 state(){ grep -o "\[AutoRatchet\] [A-Z]* -> [A-Z]*" "$P/node$1.log" | tail -1; }
 win(){ grep -o "window=[0-9]*/[0-9]*" "$P/node$1.log" | tail -1; }
+tipnorm(){ tr -d '"[:space:]'; }
+hex64(){ [[ $1 =~ ^[0-9a-f]{64}$ ]] && [[ $1 =~ [1-9a-f] ]]; }   # 64 lower-hex, not all zero
 STRICT='expected_gentx=|\[verify_share\] hash mismatch|pow_hash recompute: hash mismatch|run_think: banning peer|Cross-check FAILED'
 
 # ---------------------------------------------------------------- L2 crossing (runs while L1 blocks accrue)
@@ -192,15 +196,31 @@ print(f"L2PAY pre_switch={side['pre'][1]}/{side['pre'][0]} post_switch={side['po
 PY
 LACC=$(grep -c "submit_block_hex accepted" "$P/nodeA.log" "$P/nodeB.log" | awk -F: '{s+=$2}END{print s}')
 DACC=$(cat "$P"/node?.log | grep -c "\[MM:DOGE\] submitblock ACCEPTED")
-# LTC NodeRPC::submit_block_hex logs a daemon reject as "submit_block_hex result: <reason>"
-# (no "reject" word); submit_block logs "Block submittal result:"; the stratum submit path
-# (core web_server.cpp) logs "submitblock: coin daemon rejected the block"; the DOGE aux path
-# logs "] submitblock REJECTED by daemon:" or, on an RPC exception, "] submitblock failed:".
-REJ_RE="submit_block_hex result:|Block submittal result:|submitblock: coin daemon rejected|submit_block_hex.*reject|\] submitblock (REJECT|failed:)"
-REJ=$(cat "$P"/node?.log | grep -Eci "$REJ_RE")
+# Reject lines, verbatim from the source (core log prefix "[HH:MM:SS.ffffff][sev] "):
+#   LTC  ltc/coin/rpc.cpp   "submit_block_hex result: <json>", "Block submittal result: ..."
+#   core web_server.cpp     "submitblock: coin daemon rejected the block"; "[error] submitblock
+#                           failed: <what>" (stratum RPC transport; core only, DOGE never logs it)
+#   DOGE merged_mining.cpp  "[MM:DOGE] submitblock REJECTED by daemon:" (BIP22 reject string),
+#                           "submitblock refused:" (JSON-RPC error, e.g. -22 Block decode failed),
+#                           "submitblock: no answer (" (timeout, unparsable, non -22 RPC error),
+#                           "Merged block refused:" (commit check), "Merged block REFUSED:"
+#                           (oversize), "Merged block assembly failed:", "submit threw".
+# On purpose, "submitblock: no answer" COUNTS. Against a loopback regtest daemon it means the
+# submit channel failed or the daemon answered with a verify error, so the submit path proved
+# nothing (the same verdict kind as "submit threw"). "submitblock INCONCLUSIVE" does NOT count:
+# the daemon validated and stored the block, it is just not on its best chain. That is the
+# two-node race for one DOGE height (each node submits its own merged block), and the LTC side
+# treats "inconclusive" as accepted too (core::coin::submitblock_result_accepted). It is
+# reported as doge_inconclusive so the stale rate stays visible.
+REJ_RE="submit_block_hex result:|Block submittal result:|submitblock: coin daemon rejected|\] submitblock failed:|\[MM:[A-Z0-9]+\] (submitblock (REJECTED by daemon|refused):|submitblock: no answer \(|Merged block (refused|REFUSED):|Merged block assembly failed:|submit threw)|submitblock via RPC: REJECTED"
+REJ=$(cat "$P"/node?.log | grep -Ec "$REJ_RE")
+DINC=$(cat "$P"/node?.log | grep -c "\[MM:DOGE\] submitblock INCONCLUSIVE")
 S1=$(grep L1SUM "$P/extract.txt")
-if [ "$LACC" -ge 1 ] && [ "$DACC" -ge 1 ] && [ "$REJ" -eq 0 ] && echo "$S1" | grep -Eq "(^| )populated=[1-9]" && echo "$S1" | grep -q "doge_auxpow=[1-9]" && echo "$S1" | grep -q "doge_populated=[1-9]"; then
-  res "L1 PASS $S1 ltc_acc=$LACC doge_acc=$DACC rejects=$REJ"; else res "L1 FAIL $S1 ltc_acc=$LACC doge_acc=$DACC rejects=$REJ"; fi
+# Every L1SUM counter that L1 PASS claims must be >=1. populated= is anchored, so
+# doge_populated= cannot satisfy it.
+l1sum_ok(){ local k; for k in populated auxcommit pays_both doge_auxpow doge_populated; do echo "$1" | grep -Eq "(^| )$k=[1-9]" || return 1; done; }
+if [ "$LACC" -ge 1 ] && [ "$DACC" -ge 1 ] && [ "$REJ" -eq 0 ] && l1sum_ok "$S1"; then
+  res "L1 PASS $S1 ltc_acc=$LACC doge_acc=$DACC rejects=$REJ doge_inconclusive=$DINC"; else res "L1 FAIL $S1 ltc_acc=$LACC doge_acc=$DACC rejects=$REJ doge_inconclusive=$DINC"; fi
 
 # ---------------------------------------------------------------- L2 verdict
 if [[ $LEGS == *2* ]]; then
@@ -214,12 +234,15 @@ if [[ $LEGS == *2* ]]; then
   # no-fork check: both nodes must report the same best share. The miners are still
   # running, so a sample can catch one node a share ahead; sample up to 12 times, 5s
   # apart, and accept the first sample where the two tips are equal and non-zero.
+  # /web/best_share_hash answers a JSON string "<64 hex>". Strip only the quotes and
+  # whitespace, then require exactly 64 lower-hex on BOTH sides: an error body such as
+  # {"error":"Internal error"} must never reduce to a comparable "hash".
   TIPEQ=0; BA=""; BB=""
   for i in $(seq 1 12); do
-    BA=$(curl -s --max-time 5 http://127.0.0.1:28090/web/best_share_hash | tr -dc '0-9a-f')
-    BB=$(curl -s --max-time 5 http://127.0.0.1:28091/web/best_share_hash | tr -dc '0-9a-f')
+    BA=$(curl -s --max-time 5 http://127.0.0.1:28090/web/best_share_hash | tipnorm)
+    BB=$(curl -s --max-time 5 http://127.0.0.1:28091/web/best_share_hash | tipnorm)
     echo "tip sample $i A=$BA B=$BB" >> "$P/tips.txt"
-    if [ -n "$BA" ] && [ "$BA" = "$BB" ] && [ -n "${BA//0/}" ]; then TIPEQ=1; break; fi
+    if hex64 "$BA" && hex64 "$BB" && [ "$BA" = "$BB" ]; then TIPEQ=1; break; fi
     sleep 5
   done
   for n in A B; do grep -E "\[AutoRatchet\] (VOTING|ACTIVATED|CONFIRMED) ->|\[AutoRatchet\] ACTIVATED:" "$P/node$n.log" > "$P/ratchet$n.txt"; done
