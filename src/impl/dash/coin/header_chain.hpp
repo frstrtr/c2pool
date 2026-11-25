@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <functional>
 #include <iomanip>
 #include <map>
@@ -91,7 +92,7 @@ inline DashChainParams make_dash_chain_params_mainnet() {
     p.block_hash_func = p.pow_func;
 
     // Fast-start checkpoint: PINNED TO COINCIDE WITH THE MN-SET BRIDGE
-    // ANCHOR (dash_mn_checkpoint_mainnet.inc, height 2549400). Cold start
+    // ANCHOR (dash_mn_checkpoint_mainnet.inc, height 2563800). Cold start
     // seeds the header tip AT the anchor, skipping ~2.5M headers of
     // validation from genesis.
     //
@@ -113,10 +114,10 @@ inline DashChainParams make_dash_chain_params_mainnet() {
     // verify). The coincidence is machine-enforced by that KAT, so the two
     // pins can never silently drift apart again.
     p.fast_start_checkpoint = DashChainParams::Checkpoint{};
-    p.fast_start_checkpoint->height = 2549400;
+    p.fast_start_checkpoint->height = 2563800;
     p.fast_start_checkpoint->hash.SetHex(
-        "00000000000000134ce084ad3dac4b93069fc40f32cb8d24a446754112b5010f");
-    // The FULL header of the anchor block (mainnet 2549400), so the cold seed
+        "0000000000000016a129aa626ea761e08a389af18b4a64a2f8556596edd08e22");
+    // The FULL header of the anchor block (mainnet 2563800), so the cold seed
     // populates entry.header — not just entry.hash. Without it the seeded
     // IndexEntry carries a default (all-zero) hashMerkleRoot, and the DIP-4
     // historical-snapshot authentication in the MN-set bridge fails closed at
@@ -132,12 +133,12 @@ inline DashChainParams make_dash_chain_params_mainnet() {
     p.fast_start_checkpoint->has_header = true;
     p.fast_start_checkpoint->hdr_version = 536870912u;   // 0x20000000
     p.fast_start_checkpoint->hdr_prev_block.SetHex(
-        "000000000000000a5e49a9455f31b8b878ea3a31101a10da83dcdefb3795f9e9");
+        "000000000000001152bacae0c99708a0d092fb289b7aef9d605845ef5fbf8cb7");
     p.fast_start_checkpoint->hdr_merkle_root.SetHex(
-        "935359e1a2d29fca27dc6ac1d6eea422f24301616bda26e087ac67f81b42790c");
-    p.fast_start_checkpoint->hdr_time  = 1791075943u;
-    p.fast_start_checkpoint->hdr_bits  = 0x191f4884u;
-    p.fast_start_checkpoint->hdr_nonce = 3249420384u;
+        "ca996896c66729694de8ec1bf488011b7105e50ada2b965ab982e7023bc76197");
+    p.fast_start_checkpoint->hdr_time  = 1793344433u;
+    p.fast_start_checkpoint->hdr_bits  = 0x191f7d6cu;
+    p.fast_start_checkpoint->hdr_nonce = 1038440354u;
     return p;
 }
 
@@ -178,6 +179,17 @@ inline bool check_pow(const uint256& pow_hash, uint32_t bits, const uint256& pow
     if (negative || target.IsNull() || overflow || target > pow_limit)
         return false;
     return pow_hash <= target;
+}
+
+/// Dash Core GetNetworkHashPS arithmetic (rpc/mining.cpp): the chain work
+/// between the window's base and tip divided by the span between the earliest
+/// and latest block time in the window. 0 when the work does not grow or the
+/// span is not positive (dashd returns 0 for minTime == maxTime).
+inline double network_hashps_from(const uint256& tip_work, const uint256& base_work,
+                                  int64_t min_time, int64_t max_time)
+{
+    if (tip_work <= base_work || max_time <= min_time) return 0.0;
+    return (tip_work - base_work).getdouble() / static_cast<double>(max_time - min_time);
 }
 
 inline uint256 get_block_proof(uint32_t bits) {
@@ -250,6 +262,27 @@ inline uint32_t dark_gravity_wave(
     return bn_new.GetCompact();
 }
 
+/// Dash Core pow.cpp DarkGravityWave, the fPowAllowMinDifficultyBlocks rules
+/// (testnet): the next block's bits depend on ITS OWN time. More than two hours
+/// after its parent it may be mined at powLimit; more than 4 x nPowTargetSpacing
+/// (10 minutes) after, at ten times the parent's target (capped at powLimit);
+/// otherwise the DGW bits. Mainnet has no such rule (allow_min_difficulty is
+/// false), so this returns dgw_bits there.
+inline uint32_t dgw_bits_for_block_time(uint32_t dgw_bits, uint32_t prev_bits, int64_t prev_time,
+                                        int64_t block_time, const DashChainParams& params)
+{
+    if (!params.allow_min_difficulty) return dgw_bits;
+    const uint256 pow_limit = params.pow_limit;
+    if (block_time > prev_time + 2 * 60 * 60) return pow_limit.GetCompact();
+    if (block_time > prev_time + params.target_spacing * 4) {
+        uint256 bn = target_from_bits(prev_bits);
+        bn *= 10u;
+        if (bn > pow_limit) return pow_limit.GetCompact();
+        return bn.GetCompact();
+    }
+    return dgw_bits;
+}
+
 // ─── HeaderChain ────────────────────────────────────────────────────────────
 
 class HeaderChain {
@@ -274,6 +307,7 @@ public:
                 return false;
             }
             load_from_db();
+            reselect_anchored_tip();
         }
         // Prefer fast-start checkpoint over genesis when chain is empty.
         // Matches c2pool-ltc init order: an anchor block jumps us past
@@ -387,6 +421,30 @@ public:
         return m_best_work;
     }
 
+    /// Dash Core getnetworkhashps(lookup): the chain work of the last `lookup`
+    /// blocks divided by the span between the earliest and latest timestamp in
+    /// that window (rpc/mining.cpp GetNetworkHashPS). The tip difficulty alone
+    /// is a poor estimate on Dash: DarkGravityWave follows rented hashrate, so
+    /// difficulty swings ~2x within hours. 0 when fewer than `lookup` headers
+    /// sit above the fast-start anchor (the caller falls back), or the span is
+    /// not positive.
+    double network_hashps(uint32_t lookup = 576) const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_tip.IsNull() || lookup == 0 || m_tip_height <= lookup) return 0.0;
+        const auto tip = get_header_by_height_internal(m_tip_height);
+        const auto base = get_header_by_height_internal(m_tip_height - lookup);
+        if (!tip || !base || tip->chain_work <= base->chain_work) return 0.0;
+        int64_t min_time = tip->header.m_timestamp, max_time = min_time;
+        for (uint32_t h = m_tip_height - lookup; h < m_tip_height; ++h) {   // base included, as dashd
+            const auto e = get_header_by_height_internal(h);
+            if (!e) return 0.0;   // a hole in the window: no estimate
+            const int64_t t = e->header.m_timestamp;
+            if (t < min_time) min_time = t;
+            if (t > max_time) max_time = t;
+        }
+        return network_hashps_from(tip->chain_work, base->chain_work, min_time, max_time);
+    }
+
     // Phase C-TEMPLATE step 9: bits the next block must satisfy.
     // Wraps DarkGravityWave3 over the current tip + 24-block window.
     // Returns 0 when we don't yet have enough headers to retarget
@@ -398,6 +456,56 @@ public:
             return this->get_header_by_height_internal(h);
         };
         return dark_gravity_wave(get_ancestor, m_tip_height, m_params);
+    }
+
+    /// The bits the next block must carry when its time is `block_time`, on
+    /// top of the tip `prev_hash` (Dash Core GetNextWorkRequired(pindexLast,
+    /// pblock)). Only testnet's min-difficulty rules make the time matter.
+    /// 0 when the tip is not `prev_hash` or there are too few headers.
+    uint32_t next_work_required_at(const uint256& prev_hash, int64_t block_time) const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_tip.IsNull() || m_tip != prev_hash || m_tip_height < DGW_PAST_BLOCKS) return 0;
+        auto get_ancestor = [this](uint32_t h) -> std::optional<IndexEntry> {
+            return this->get_header_by_height_internal(h);
+        };
+        const uint32_t dgw = dark_gravity_wave(get_ancestor, m_tip_height, m_params);
+        const auto tip = get_header_by_height_internal(m_tip_height);
+        if (!tip) return 0;
+        return dgw_bits_for_block_time(dgw, tip->header.m_bits, tip->header.m_timestamp,
+                                       block_time, m_params);
+    }
+
+    /// The bits a block on top of `prev_hash` must carry at `block_time`
+    /// (Dash Core GetNextWorkRequired(pindexPrev, pblock)) for any `prev_hash`
+    /// on our best chain, not only the tip. nullopt when `prev_hash` is
+    /// unknown, off the best chain, below height DGW_PAST_BLOCKS (Core
+    /// answers powLimit there), or any of the DGW_PAST_BLOCKS headers ending
+    /// at it is missing (below a fast-start anchor) or is the synthetic
+    /// anchor itself (bits 0, time 0: dark_gravity_wave would average a zero
+    /// target into the window). None of those is a network target to check
+    /// against. `max_depth`: nullopt also when `prev_hash` is more than this
+    /// many blocks below our tip, so a caller can refuse an old parent whose
+    /// historic bits are easier than today's.
+    std::optional<uint32_t> expected_bits_after(const uint256& prev_hash, int64_t block_time,
+                                                uint32_t max_depth = UINT32_MAX) const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        auto it = m_headers.find(prev_hash);
+        if (it == m_headers.end()) return std::nullopt;
+        const uint32_t h = it->second.height;
+        auto at = m_height_index.find(h);
+        if (at == m_height_index.end() || at->second != prev_hash) return std::nullopt;
+        if (h > m_tip_height || m_tip_height - h > max_depth) return std::nullopt;
+        if (h < static_cast<uint32_t>(DGW_PAST_BLOCKS)) return std::nullopt;
+        for (uint32_t n = 0; n < static_cast<uint32_t>(DGW_PAST_BLOCKS); ++n) {
+            const auto e = get_header_by_height_internal(h - n);
+            if (!e || e->header.m_bits == 0) return std::nullopt;
+        }
+        auto get_ancestor = [this](uint32_t hh) -> std::optional<IndexEntry> {
+            return this->get_header_by_height_internal(hh);
+        };
+        const uint32_t dgw = dark_gravity_wave(get_ancestor, h, m_params);
+        return dgw_bits_for_block_time(dgw, it->second.header.m_bits, it->second.header.m_timestamp,
+                                       block_time, m_params);
     }
 
     size_t size() const {
@@ -428,6 +536,34 @@ public:
         }
         std::sort(times.begin(), times.end());
         return times[times.size() / 2];
+    }
+
+    /// Median-time-past of the block `hash` (Dash Core GetMedianTimePast: the
+    /// median of its own and its 10 ancestors' timestamps). A block built on
+    /// `hash` is valid only with a time above it ("time-too-old" otherwise).
+    /// nullopt when `hash` is unknown, off our best chain, more than
+    /// `max_depth` blocks below our tip, below height 10, or any of the 11
+    /// headers is missing (below a fast-start anchor) or synthetic (time 0).
+    std::optional<uint32_t> median_time_past_at(const uint256& hash,
+                                                uint32_t max_depth = UINT32_MAX) const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        auto it = m_headers.find(hash);
+        if (it == m_headers.end()) return std::nullopt;
+        const uint32_t h = it->second.height;
+        auto at = m_height_index.find(h);
+        if (at == m_height_index.end() || at->second != hash) return std::nullopt;
+        if (h > m_tip_height || m_tip_height - h > max_depth) return std::nullopt;
+        static constexpr uint32_t MEDIAN_SPAN = 11;
+        if (h + 1 < MEDIAN_SPAN) return std::nullopt;
+        std::vector<uint32_t> times;
+        times.reserve(MEDIAN_SPAN);
+        for (uint32_t n = 0; n < MEDIAN_SPAN; ++n) {
+            const auto e = get_header_by_height_internal(h - n);
+            if (!e || e->header.m_timestamp == 0) return std::nullopt;
+            times.push_back(e->header.m_timestamp);
+        }
+        std::sort(times.begin(), times.end());
+        return times[MEDIAN_SPAN / 2];
     }
 
     bool has_header(const uint256& hash) const {
@@ -693,6 +829,9 @@ public:
         if (m_tip.IsNull()) return false;
         auto it = m_headers.find(m_tip);
         if (it == m_headers.end()) return false;
+        // A tip that does not run through the fast-start anchor is never a
+        // synced tip, however fresh its timestamp.
+        if (!descends_from_anchor_locked(it->second)) return false;
         auto now = static_cast<uint32_t>(std::time(nullptr));
         return (now - it->second.header.m_timestamp) < 86400; // 24 hours
     }
@@ -710,6 +849,12 @@ public:
     /// advertised, which is "unknown", NOT "we are current".
     uint32_t peer_tip_height() const
     { return m_peer_tip_height.load(std::memory_order_relaxed); }
+
+    /// Refuse (default) or log-and-accept a header whose bits are not the DGW
+    /// bits of its own window. The mismatch is logged either way; testnet
+    /// always accepts (its min-difficulty rules are not modelled).
+    void set_refuse_dgw_mismatch(bool refuse) { m_refuse_dgw_mismatch = refuse; }
+    bool refuse_dgw_mismatch() const { return m_refuse_dgw_mismatch; }
 
     /// Backfill progress line throttle: at most one line per `headers` of
     /// forward progress OR per `ms` of wall clock, whichever comes first.
@@ -750,6 +895,102 @@ public:
     void set_on_tip_changed(TipChangedCallback cb) { m_on_tip_changed = std::move(cb); }
 
 private:
+    /// A persisted store whose tip does not run through the fast-start anchor
+    /// (written before the anchor rule) re-selects its tip at load: the
+    /// highest-work stored header that does descend from the anchor (at
+    /// least the anchor itself). Without this, headers the store already holds
+    /// are refused as duplicates and the tip could never move again.
+    void reselect_anchored_tip()
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (!m_params.fast_start_checkpoint.has_value() || m_tip.IsNull()) return;
+        const auto& cp = m_params.fast_start_checkpoint.value();
+        auto anchor_it = m_headers.find(cp.hash);
+        if (anchor_it == m_headers.end()) {
+            // A store written before this anchor existed (its tip below the
+            // anchor, or on no chain through it). Start from the anchor exactly
+            // as an empty store does: init() seeds it and selects it as the tip
+            // right after this returns. The old entries stay stored for lookups.
+            LOG_WARNING << "[EMB-DASH] stored tip h=" << m_tip_height << " "
+                        << m_tip.GetHex().substr(0, 16)
+                        << " is not on a chain through the fast-start anchor h="
+                        << cp.height << " (not held); starting from the anchor";
+            m_tip.SetNull();
+            m_tip_height = 0;
+            m_best_work = uint256::ZERO;
+            m_height_index.clear();
+            return;
+        }
+        auto tip_it = m_headers.find(m_tip);
+        if (tip_it != m_headers.end() && descends_from_anchor_locked(tip_it->second)) return;
+
+        // Descent by height order: an entry descends iff it is the anchor or
+        // its parent descends. One pass over the entries at or above it.
+        std::vector<const IndexEntry*> above;
+        for (const auto& [h, e] : m_headers)
+            if (e.height >= cp.height) above.push_back(&e);
+        std::sort(above.begin(), above.end(),
+                  [](const IndexEntry* a, const IndexEntry* b) { return a->height < b->height; });
+        std::set<uint256> desc;
+        const IndexEntry* best = &anchor_it->second;
+        for (const IndexEntry* e : above) {
+            const bool d = (e->hash == cp.hash) || desc.count(e->prev_hash) != 0;
+            if (!d) continue;
+            desc.insert(e->hash);
+            if (e->chain_work > best->chain_work
+                || (e->chain_work == best->chain_work && e->height > best->height))
+                best = e;
+        }
+        LOG_WARNING << "[EMB-DASH] stored tip h=" << m_tip_height << " "
+                    << m_tip.GetHex().substr(0, 16)
+                    << " does not run through the fast-start anchor; tip re-selected"
+                       " at h=" << best->height << " " << best->hash.GetHex().substr(0, 16);
+        m_tip = best->hash;
+        m_tip_height = best->height;
+        m_best_work = best->chain_work;
+        rebuild_height_index(m_tip);
+        m_dirty_headers.insert(m_tip);   // flush_dirty() writes the tip only with a dirty entry
+        persist_tip();
+    }
+
+    /// Does `e` lie on a chain through the fast-start anchor? Always true for
+    /// a store without one (it syncs from genesis). Caller holds m_mutex.
+    ///
+    /// The walk stops at the first ancestor that is on the current best chain
+    /// at its height, provided that chain itself runs through the anchor: the
+    /// tip only moves to descendants (this rule), so that is the usual case
+    /// and a linear extension costs one lookup. A side branch costs its depth.
+    ///
+    /// INVARIANT the shortcut relies on: at heights between the anchor and the
+    /// tip, m_height_index holds the best chain (rebuild_height_index on every
+    /// non-linear tip change). Anything that moves the tip without rebuilding
+    /// the index (e.g. set_dynamic_checkpoint, not used by Dash) breaks it.
+    bool descends_from_anchor_locked(const IndexEntry& e) const
+    {
+        if (!m_params.fast_start_checkpoint.has_value()) return true;
+        const auto& cp = m_params.fast_start_checkpoint.value();
+        if (e.height < cp.height) return false;
+        if (e.height == cp.height) return e.hash == cp.hash;
+        auto anchor_at = m_height_index.find(cp.height);
+        const bool best_runs_through_anchor =
+            m_tip_height >= cp.height && anchor_at != m_height_index.end()
+            && anchor_at->second == cp.hash;
+        uint256  h  = e.prev_hash;
+        uint32_t ht = e.height - 1;
+        while (true) {
+            if (ht < cp.height) return false;
+            if (ht == cp.height) return h == cp.hash;
+            if (best_runs_through_anchor && ht <= m_tip_height) {
+                auto at = m_height_index.find(ht);
+                if (at != m_height_index.end() && at->second == h) return true;
+            }
+            auto it = m_headers.find(h);
+            if (it == m_headers.end()) return false;
+            h = it->second.prev_hash;
+            --ht;
+        }
+    }
+
     bool add_header_internal(const BlockHeaderType& header) {
         // Dash: block identity = X11(header)
         uint256 bhash = x11_hash(header);
@@ -760,6 +1001,11 @@ private:
         // Genesis
         if (header.m_previous_block.IsNull()) {
             if (bhash != m_params.genesis_hash) return false;
+            // Only an EMPTY store starts from the genesis header: the branch
+            // below sets the tip, its height and the best work. A store that
+            // already has a tip (a fast-start anchor, or any chain) keeps it.
+            // Pre-anchor history is the backfill walk's.
+            if (!m_tip.IsNull()) return false;
             IndexEntry entry;
             entry.header = header;
             entry.hash = bhash;
@@ -818,6 +1064,22 @@ private:
         bool equal_at_tip = entry.chain_work == m_best_work
                          && new_height == m_tip_height
                          && bhash != m_tip;
+        // A store that started from the fast-start anchor keeps a best chain
+        // that runs through the anchor. A header that does not descend from
+        // it is stored (lookups keep working) but never competes for the tip,
+        // whatever its work: below the anchor the store holds no cumulative
+        // work to compare against.
+        if ((dominated || equal_at_tip) && !descends_from_anchor_locked(entry)) {
+            const uint64_t n_nd = ++m_not_descending_logs;
+            if (n_nd <= 5 || n_nd % 1000 == 0)
+                LOG_INFO << "[EMB-DASH] header h=" << new_height << " "
+                         << bhash.GetHex().substr(0, 16)
+                         << " does not descend from the fast-start anchor; it"
+                            " does not compete for the tip (#"
+                         << n_nd << ")";
+            dominated = false;
+            equal_at_tip = false;
+        }
         if (dominated || equal_at_tip) {
             uint32_t old_height = m_tip_height;
             uint256  old_tip = m_tip;
@@ -870,21 +1132,74 @@ private:
     static constexpr uint32_t TESTNET_DGW_HEIGHT = 4002;
 
     bool validate_difficulty(const BlockHeaderType& header, uint32_t new_height) {
+        // The first DGW window above the fast-start anchor reaches below it,
+        // where the store holds no headers, so full DGW cannot be computed
+        // there. Bound it instead by the DGW clamp: a DGW target is at most 3x
+        // the average target of its window. This bound assumes the window's
+        // pre-anchor blocks are not easier than the easiest known target (the
+        // pinned anchor and this header's own ancestors above it); it must be
+        // re-checked at every re-pin of the anchor. (Testnet's min-difficulty
+        // blocks are exempt, as below.)
+        if (m_params.fast_start_checkpoint.has_value()) {
+            const auto& cp = m_params.fast_start_checkpoint.value();
+            if (new_height > cp.height && new_height <= cp.height + DGW_PAST_BLOCKS) {
+                const bool min_diff_block = m_params.allow_min_difficulty
+                    && header.m_bits == m_params.pow_limit.GetCompact();
+                if (cp.has_header && !min_diff_block) {
+                    uint256 easiest = target_from_bits(cp.hdr_bits);
+                    auto it = m_headers.find(header.m_previous_block);
+                    while (it != m_headers.end() && it->second.height > cp.height) {
+                        const uint256 t = target_from_bits(it->second.header.m_bits);
+                        if (t > easiest) easiest = t;
+                        it = m_headers.find(it->second.prev_hash);
+                    }
+                    uint256 bound = easiest;
+                    bound *= 3u;
+                    if (bound > m_params.pow_limit) bound = m_params.pow_limit;
+                    if (target_from_bits(header.m_bits) > bound) {
+                        const uint64_t n_na = ++m_near_anchor_logs;
+                        if (n_na <= 5 || n_na % 1000 == 0)
+                            LOG_WARNING << "[EMB-DASH] header h=" << new_height
+                                        << " bits=0x" << std::hex << header.m_bits
+                                        << std::dec << " is easier than 3x the"
+                                           " anchor window allows (#"
+                                        << n_na << ")";
+                        return false;
+                    }
+                }
+                return true;
+            }
+        }
         uint32_t dgw_height = m_params.allow_min_difficulty ? TESTNET_DGW_HEIGHT : MAINNET_DGW_HEIGHT;
         if (new_height <= dgw_height + DGW_PAST_BLOCKS + 2) return true;
-        if (m_params.fast_start_checkpoint.has_value()) {
-            uint32_t cp_h = m_params.fast_start_checkpoint->height;
-            if (new_height > cp_h && new_height < cp_h + DGW_PAST_BLOCKS + 10)
-                return true;
-        }
-        if (m_headers.size() < static_cast<size_t>(DGW_PAST_BLOCKS + 10))
+        // A store without a fast-start anchor that is still tiny cannot hold a
+        // window. An anchored store can: above anchor+24 the window is anchor+1
+        // or later, all held, so DGW applies from anchor+25 on.
+        if (!m_params.fast_start_checkpoint.has_value()
+            && m_headers.size() < static_cast<size_t>(DGW_PAST_BLOCKS + 10))
             return true;
 
         auto prev_it = m_headers.find(header.m_previous_block);
         if (prev_it == m_headers.end()) return false;
 
-        auto get_ancestor = [this](uint32_t h) -> std::optional<IndexEntry> {
-            return this->get_header_by_height_internal(h);
+        // DGW over THIS header's own ancestors (prev links), not the best
+        // chain's height index: a header on a side branch is judged by the
+        // window it actually extends.
+        std::vector<IndexEntry> window;
+        window.reserve(static_cast<size_t>(DGW_PAST_BLOCKS) + 1);
+        for (auto it = prev_it;
+             it != m_headers.end() && window.size() <= static_cast<size_t>(DGW_PAST_BLOCKS);
+             it = m_headers.find(it->second.prev_hash)) {
+            window.push_back(it->second);
+            if (it->second.prev_hash.IsNull()) break;
+        }
+        const uint32_t top = prev_it->second.height;
+        // A window that is not fully held (only near genesis, or on a store
+        // still missing history) cannot be judged here.
+        if (window.size() < static_cast<size_t>(DGW_PAST_BLOCKS)) return true;
+        auto get_ancestor = [&window, top](uint32_t h) -> std::optional<IndexEntry> {
+            if (h > top || top - h >= window.size()) return std::nullopt;
+            return window[top - h];
         };
 
         uint32_t expected_bits = dark_gravity_wave(
@@ -904,8 +1219,11 @@ private:
                             << " at height=" << new_height
                             << " actual=0x" << std::hex << header.m_bits
                             << " expected=0x" << expected_bits << std::dec;
-            // Accept despite mismatch — PoW (X11) is still validated
-            return true;
+            // Mainnet refuses a header whose bits are not the DGW bits of its
+            // own window. Testnet has min-difficulty rules this port does not
+            // model, so there a mismatch is logged and accepted as before;
+            // set_refuse_dgw_mismatch(false) does the same on mainnet.
+            return m_params.allow_min_difficulty || !m_refuse_dgw_mismatch;
         }
 
         return true;
@@ -1036,6 +1354,9 @@ private:
     uint256  m_best_work;
 
     std::atomic<uint32_t> m_peer_tip_height{0};
+    bool m_refuse_dgw_mismatch{true};   // see set_refuse_dgw_mismatch()
+    uint64_t m_not_descending_logs{0};  // log throttles, per instance
+    uint64_t m_near_anchor_logs{0};
     std::unique_ptr<core::LevelDBStore> m_db;
     std::set<uint256> m_dirty_headers;
 

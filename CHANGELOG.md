@@ -2,6 +2,177 @@
 
 ## [Unreleased]
 
+### With --stratum-http on, the REST API answers on the stratum port too
+- python p2pool served its web API on the worker port, and p2pool-aware
+  trackers (miningpoolstats and others) poll `http://host:<worker port>/global_stats`.
+  c2pool's stratum port answered such a request with a stratum "Invalid JSON"
+  error and logged `Error processing Stratum message: ... parse_error`.
+- When `--stratum-http` is on, the stratum port hands a connection whose
+  first line is an HTTP request line (empty lines before it are skipped) to
+  the web server's own
+  request handler, on the web server's HTTP thread: same routes, JSON and
+  headers as the web port. It is strictly read-only there: GET and HEAD
+  (other methods 405), every local-only, token-gated or state-changing route
+  answers 403 whatever the address or `?token=`, the event stream
+  (`/sharechain/stream`) answers 405, and the connection closes after one
+  response. A stratum line, or
+  anything else, takes the stratum path exactly as before, also when it
+  arrives in pieces.
+- An HTTP connection is not a miner session (not in the session count, the
+  miner list or the notify fan-out), but while it is open it counts toward
+  `max_stratum_connections` and the per-IP cap, and the stratum handshake
+  deadline, counted from the accept, ends it: nothing is read or written at or
+  after it, and at it the stratum side shuts the connection down; the slot is
+  released when the HTTP side closes the connection. The response write is
+  also closed at write start + the web idle timeout (30 s by default; 30 s when
+  that timeout is 0), whichever comes first. A 503 written by the stratum
+  side is closed at the handshake deadline or 30 s after it starts.
+- A bounded number of stratum-port HTTP requests is in progress at once, in
+  total and per address; others are answered 503
+  (`{"error":"busy, try again later"}`) and close at once:
+  `--stratum-http-budget N` (settings key `stratum.http_budget`, LTC YAML
+  `stratum_http_budget`; default 16) in total, at most
+  `max_stratum_connections` - 1 (0 = every HTTP request on the stratum port is
+  answered 503), and `--stratum-http-per-ip N` (`stratum.http_per_ip`,
+  `stratum_http_per_ip`; default 6) from one address, one /64 for IPv6
+  (0 = no limit below the budget). The startup line names the values in
+  force.
+  At most one info line per minute,
+  `HTTP request on stratum port from <ip>: GET /global_stats -> 200`; the
+  requests in between are counted and summarised with the first request
+  after the minute. Failed requests (malformed, cut off) get the same
+  treatment as one warning line per minute instead of one each.
+- `--stratum-http=true|false|auto` on every coin (settings key
+  `stratum.http`, the same values, also on/off/yes/no/1/0; anything else is
+  refused with a warning and leaves the setting as it was), default `false`;
+  `auto`: on when the web server binds `::`, binds `0.0.0.0` and the stratum
+  listener an IPv4 address, or binds the stratum listener's own non-loopback
+  address; off when it binds loopback only (a reverse proxy in front decides
+  what is public), binds one LAN or VPN address while the stratum port binds
+  wider, binds `0.0.0.0` while the stratum port binds IPv6, or is disabled. `auto`
+  cannot see a firewall, a cloud security group or a container that
+  publishes only the stratum port: on a node whose web port is closed that
+  way, do not use `auto`; keep `--stratum-http=false` (the default). Forced on without a web server, an HTTP
+  request gets a 503. The startup log names the result, e.g.
+  `stratum HTTP: ON (web bound to 0.0.0.0)` or
+  `stratum HTTP: OFF (web bound to 10.8.0.1, stratum to 0.0.0.0)`.
+- HEAD now works on the web port as well (it answered 405), except on the
+  routes that change state on GET (`/control/*`, `/api/admin/*`) and
+  `/sharechain/stream`, which answer HEAD with 405.
+
+### Linux packages: the binary starts without start.sh
+- `c2pool-<coin>` in the Linux tarball now loads its bundled libraries from
+  the package's `lib/` by itself (RUNPATH `$ORIGIN/lib`, and `$ORIGIN` on
+  `lib/libdash_scriptcheck.so`). Through v0.2.12.6 only `start.sh`, which sets
+  `LD_LIBRARY_PATH`, found them: run directly (a systemd unit, your own
+  script) the binary failed with `error while loading shared libraries:
+  libsecp256k1.so.6` unless the host had a library of that name, and then
+  used the host's copy, not the bundled one; `c2pool-dash` always failed
+  (`libdash_scriptcheck.so`). On those versions, set
+  `LD_LIBRARY_PATH=<package dir>/lib` (systemd: `Environment=`). `start.sh`
+  is unchanged.
+
+### Node fee draw honours fractional fees; addr gossip at 80%
+- `core::random::random_float` was an integer draw: `random_float(0, 100)`
+  returned only 0..100 and `random_float(0, 1)` only 0 or 1. It is now a
+  continuous draw on [min, max) (p2pool `random.uniform`).
+- The node-fee draw (`-f` / `money.node_owner_fee_pct`, LTC stratum and the
+  HTTP JSON-RPC submit path) took the fee with probability ceil(fee)/101:
+  0.5% took about 0.99%, 1% about 0.99%, 1.5% about 1.98%, 100% about 99%.
+  It now takes exactly the configured rate. Operators with a node fee see
+  it taken at that rate from this release on. DASH and BTC stratum use
+  their own fee rolls and are unchanged.
+- Share-chain addr / addrme relay (`random_float(0, 1) < 0.8`, every coin)
+  fired 50% of the time; it now fires 80%, as in p2pool. No share or block
+  construction or validation uses these draws.
+
+### LTC: share version 3601 (flag day) — upgrade every node to c2pool v0.2.12
+- From a flag day set in the release (`ltc::PoolConfig::V3601_ACTIVATION_TIME`;
+  not scheduled in this build) every share is a share version 3601 share: the
+  V36 share format under share type 3601. Not voted through the AutoRatchet:
+  a share's version follows from its own timestamp (3601 at or after the flag
+  day, an earlier version before it, nothing but 3601 after a 3601 share), and
+  the switch does not go through the 60% upgraded-hash-power gate (the
+  V35 → V36 switch keeps it). `--v3601-activation-time` moves it on testnet or
+  a private `--network-id` chain only.
+- Merged payouts of 3601 shares come from the share alone: its own merged
+  address, else its own parent key (P2PKH / P2WPKH as P2PKH, P2SH as P2SH).
+  No 3601 share feeds or uses the first-seen address of another share ("Tier 1.5"),
+  which depended on the order a node received shares and let a share naming
+  another miner's parent script take that miner's address-less shares.
+  **V36 shares keep the old rule exactly** (Tier 1.5, P2SH as P2SH): the
+  shares in the window at the flag day keep their payouts, nothing moves at
+  the switch.
+- 3601 shares carrying several merged chains must commit to the AuxPoW tree
+  over exactly the blocks they carry (enforced; still only counted for V36
+  shares). c2pool's own commitments always comply.
+- c2pool advertises protocol 3601. From the flag day a peer below it (p2pool,
+  c2pool before v0.2.12) is disconnected and refused, without a ban, and is
+  never sent a 3601 share; it is left on a sharechain of its own. p2pool is no
+  longer supported from then on.
+- Stratum: a P2SH login without an explicit merged address keeps the merged
+  P2SH derived from its key (as before) and is warned: if it is a
+  segwit-wrapped wallet address (P2SH-P2WPKH/P2WSH, e.g. `M...`), give the
+  DOGE address explicitly (`LTC_ADDRESS,DOGE_ADDRESS`); on DOGE (no segwit)
+  such an output becomes spendable by anyone once the redeem script is
+  public. A P2SH `--node-owner-address` is warned the same way. P2WSH / P2TR
+  logins are flagged "P2WSH/P2TR address → redistributed"; a swapped pair
+  whose first address is not valid (`DOGE-with-bad-checksum,LTCADDR`) pays the
+  LTC address.
+- A share re-wrapped under the other type number (36 <-> 3601; the share hash
+  does not commit to it) is dropped by the share handlers before the tracker
+  and its sender disconnected (never banned); the relay cache only holds the
+  bytes of the share the tracker adopted; LevelDB loads apply the same check.
+- `--no-embedded-doge` disables embedded DOGE networking entirely (no P2P, no
+  DNS seeds), also when a `--merged DOGE:...` spec carries a P2P port.
+- `--no-embedded-ltc`: the initial getblocktemplate fetch and the 2 s poll are
+  armed when the coin daemon is attached. They never were (the web server
+  starts before the coin node): such a pool got a template only on a
+  sharechain event (a peer's share or bestblock, a merged-chain work change),
+  and an isolated one never did ("Waiting for block template"). A block the
+  daemon's own P2P link announces now refreshes the template at once.
+- Redistribution reads the sharechain only under its read lock (a crash race
+  with the compute thread, seen under TSAN).
+- No work is built on a burn output any more. When the sharechain was busy
+  (the PPLNS split at the best share could not be read) the template refresh
+  paid the whole subsidy to the zero key and cached that as the split of the
+  best share; every stratum job at that share then paid it. Now a split is
+  only reused for the best share, coinbase value, bits and donation it was
+  computed for (a new block or a fee change at the same best share paid the
+  old amounts: blocks rejected bad-cb-amount, or underpaid), nothing is
+  cached otherwise, and the zero-key fallback is gone. An empty sharechain
+  pays the donation (p2pool's genesis rule).
+- A redistributed share (no usable login address) and a node fee draw pay
+  the recipient's own script type: a P2SH recipient was paid
+  P2PKH(<script hash>), which nobody can spend. With no recipient the share
+  goes to the combined donation, never the zero key.
+- `--solo` and `--custodial` refuse to start: their coinbase has no
+  extranonce slot, so every block they found was invalid (bad-txnmrklroot)
+  while the miners' shares were accepted.
+- A stratum job is no longer built while the sharechain is busy: the PPLNS at
+  the job's prev share or the ref_hash could not be read, and the job used
+  the cached PPLNS of another best share or a null ref_hash, so its shares
+  could not match their own generation transaction ("Cross-check FAILED").
+  The job is held: the miner keeps its last job, one retry is pending per
+  session (every 500 ms), and after 20 s the session stops retrying (logged)
+  until the next notify. Never the global coinbase.
+- Shares this node makes are written to LevelDB like received ones (they
+  never were: after a restart the chain had holes until peers sent them back).
+
+### DASH: compiled masternode anchor re-pinned to h=2563800
+- The compiled masternode anchor and the header fast-start move from h=2549400
+  to h=2563800 (blockhash 0000000000000016a129aa626ea761e0…, 3005 registered, 2249
+  valid). The old anchor reaches the 20000-block bridge limit at tip 2569400, past
+  which a cold start on default flags fails closed. The set is self-derived by
+  the replay fold (every block root-checked against its committed cbTx root) and
+  matches Dash Core 24.0.0 `protx list registered true 2563800` on every column.
+- The height stays at or below the pinned UTXO snapshot (2564044), the v24
+  versionbits walk-back (2564341) and the EHF scan anchor (2568000).
+- A running node keeps its header chain, its PoSe oracle snapshot and its full
+  UTXO set. Its persisted masternode bridge cursor descends from the old anchor
+  and is refused once at the first restart (rule R2): the bridge replays from
+  the new anchor to the tip and persists a cursor of the new lineage.
+
 ### DOGE: the embedded UTXO set is built from genesis (templates no longer underfill)
 - The embedded DOGE UTXO set was a partial view born from the last 1,440 blocks:
   a tx spending any older coin (e.g. the 499-input consolidations the network

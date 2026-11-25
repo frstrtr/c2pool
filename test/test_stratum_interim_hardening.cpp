@@ -51,6 +51,19 @@
 //      windowed DOA rate the miner page shows leaves them out; a genuinely
 //      expired job of this connection still counts. The window rolls off.
 //
+//   8. ZOMBIE SESSIONS ON LTC — the LTC node's StratumConfig
+//      (ltc::default_stratum_config, what main_ltc.cpp starts from) turns on
+//      the BTC/DASH protections; under it a connection that never authorizes
+//      is dropped at the deadline, an unauthorized session silent past the
+//      idle timeout is reaped while a quiet authorized rig stays, and at the
+//      miner cap such a zombie is closed at once so a new miner is admitted.
+//      The deadlines are cut to test size where they are on and left off
+//      where they are off. Plus the per-source-IP cap
+//      (max_stratum_connections_per_ip, default 0 = unlimited), and the
+//      rate limit on the refusal WARN lines (refusal_log_interval_sec), the
+//      TCP liveness options on an accepted socket (TCP_USER_TIMEOUT), and the
+//      per-IP key (an IPv6 address counts by its /64).
+//
 // WIRE SAFETY / BYTE-PARITY: everything here is admission/eviction/memory
 // only — no notify param, coinbase (coinb1‖en1‖en2‖coinb2), or share byte
 // changes. The notify/coinbase/share BYTE-PARITY KAT is NOT this file: for
@@ -73,16 +86,25 @@
 #include <core/stratum_work_source.hpp>
 #include <core/uint256.hpp>
 #include <core/web_server.hpp>   // MiningInterface: worker registry + /miner_stats
+#include <impl/ltc/stratum_defaults.hpp>   // the LTC node's StratumConfig (main_ltc.cpp)
 
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <future>
+#include <iostream>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
+
+#ifdef __linux__
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/socket.h>
+#endif
 
 namespace asio = boost::asio;
 using tcp = asio::ip::tcp;
@@ -102,11 +124,33 @@ public:
     // MWEB fields put into every WorkSnapshot (defaults: a non-MWEB coin).
     std::string snap_mweb;
     bool        snap_mweb_active{false};
+    // Share bits frozen into every WorkSnapshot (the job's pool-share
+    // difficulty; 0 = none) and the difficulty every submission hashes to.
+    std::atomic<uint32_t> snap_share_bits{0};
+    std::atomic<double>   hash_diff{1.0e12};
+    // mining_submit calls (pool shares and blocks).
+    std::atomic<int>      submit_calls{0};
     // The JobSnapshot the last mining_submit received (io thread only).
     std::optional<core::stratum::JobSnapshot> last_job;
     // Optional worker registry the session bookkeeping is forwarded to, so a
     // test can read /miner_stats exactly as the web API serves it.
     core::MiningInterface* registry{nullptr};
+    // While set, every connection coinbase is held (CoinbaseResult::held: the
+    // sharechain busy); every build_connection_coinbase call is counted.
+    std::atomic<bool> hold{false};
+    mutable std::atomic<int> build_calls{0};
+    // While set, there is no work template (a node still syncing headers);
+    // every get_current_work_template call is counted.
+    std::atomic<bool> no_template{false};
+    mutable std::atomic<int> template_calls{0};
+    // While set, every connection coinbase comes with the header fields frozen
+    // with it (WorkSnapshot::has_header), as a require_job_snapshot coin's do.
+    std::atomic<bool> snap_header{false};
+    // While set, the work template carries no difficulty bits (a broken work
+    // source: the session holds the work, it never fabricates bits).
+    std::atomic<bool> no_bits{false};
+    // While set, build_connection_coinbase throws (a failing work source).
+    std::atomic<bool> throw_on_build{false};
 
     FakeWorkSource()
     {
@@ -143,7 +187,18 @@ public:
         if (registry) registry->update_stratum_worker(sid, hr, dead, diff, acc, rej, stale);
     }
 
-    nlohmann::json get_current_work_template() const override { return tmpl_; }
+    nlohmann::json get_current_work_template() const override
+    {
+        ++template_calls;
+        if (no_template.load())
+            return nlohmann::json();
+        if (no_bits.load()) {
+            auto t = tmpl_;
+            t.erase("bits");
+            return t;
+        }
+        return tmpl_;
+    }
     std::vector<std::string> get_stratum_merkle_branches() const override { return {}; }
     std::pair<std::string, std::string> get_coinbase_parts() const override { return {"", ""}; }
 
@@ -152,7 +207,14 @@ public:
         const std::vector<unsigned char>&,
         const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>&) const override
     {
+        ++build_calls;
+        if (throw_on_build.load())
+            throw std::runtime_error("test work source: coinbase build failed");
         core::stratum::CoinbaseResult r;
+        if (hold.load()) {
+            r.held = true;
+            return r;
+        }
         r.coinb1 = "01000000010000000000000000000000000000000000000000000000000000"
                    "000000000000ffffffff";
         r.coinb2 = "0000000000f2052a010000001976a914000000000000000000000000000000"
@@ -160,6 +222,14 @@ public:
         r.snapshot.tx_data = tx_data_;
         r.snapshot.mweb = snap_mweb;
         r.snapshot.mweb_active = snap_mweb_active;
+        r.snapshot.frozen_ref.bits = snap_share_bits.load();
+        if (snap_header.load()) {
+            r.snapshot.has_header = true;
+            r.snapshot.gbt_prevhash = tmpl_["previousblockhash"].get<std::string>();
+            r.snapshot.header_version = tmpl_["version"].get<uint32_t>();
+            r.snapshot.block_nbits_hex = tmpl_["bits"].get<std::string>();
+            r.snapshot.curtime = static_cast<uint32_t>(tmpl_["curtime"].get<uint64_t>());
+        }
         return r;
     }
 
@@ -170,6 +240,7 @@ public:
                                  const std::map<uint32_t, std::vector<unsigned char>>&,
                                  const core::stratum::JobSnapshot* job) override
     {
+        ++submit_calls;
         if (job) last_job = *job;
         json r;
         r["result"] = true;
@@ -186,8 +257,11 @@ public:
                                     uint32_t, const std::string&, const std::string&,
                                     const std::vector<std::string>&) const override
     {
-        return 1.0e12;  // always above vardiff → submission accepted
+        return hash_diff.load();  // default 1e12: always above vardiff → accepted
     }
+
+    // Block bits of the template (call before the server starts).
+    void set_block_bits(const std::string& bits) { tmpl_["bits"] = bits; }
 
 private:
     nlohmann::json tmpl_;
@@ -272,6 +346,21 @@ public:
         return !ec;
     }
 
+    // Connect from a given loopback source address (127.0.0.2 is another
+    // client address on Linux). false when the address cannot be bound.
+    bool connect_from(uint16_t port, const char* source)
+    {
+        boost::system::error_code ec;
+        sock_.open(tcp::v4(), ec);
+        if (!ec) sock_.bind(tcp::endpoint(asio::ip::make_address(source), 0), ec);
+        if (!ec) sock_.connect(tcp::endpoint(asio::ip::make_address("127.0.0.1"), port), ec);
+        if (ec) {
+            boost::system::error_code ignore;
+            sock_.close(ignore);
+        }
+        return !ec;
+    }
+
     void send_json(const json& j)
     {
         auto line = std::make_shared<std::string>(j.dump() + "\n");
@@ -337,8 +426,12 @@ public:
     }
     bool authorize(const std::string& user, int id = 2)
     {
+        return authorize_with(user, "x", id);
+    }
+    bool authorize_with(const std::string& user, const std::string& password, int id = 2)
+    {
         send_json({{"id", id}, {"method", "mining.authorize"},
-                   {"params", json::array({user, "x"})}});
+                   {"params", json::array({user, password})}});
         auto resp = wait_response(id);
         return resp && (*resp)["result"].is_boolean() && (*resp)["result"].get<bool>();
     }
@@ -388,18 +481,68 @@ public:
         return wait_response(id);
     }
 
+    // Pipeline n submits against one job in a single write (a rig's burst),
+    // then read until all n replies arrive. Returns the number accepted, -1
+    // on timeout.
+    int submit_burst(const std::string& user, const std::string& job_id, int n, int first_id,
+                     std::chrono::milliseconds timeout = 20000ms)
+    {
+        std::string bytes;
+        for (int i = 0; i < n; ++i)
+            bytes += json({{"id", first_id + i}, {"method", "mining.submit"},
+                           {"params", json::array({user, job_id, "00000000", last_ntime, "12345678"})}})
+                         .dump() + "\n";
+        send_raw(bytes);
+        int replies = 0, accepted = 0;
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (replies < n && std::chrono::steady_clock::now() < deadline) {
+            auto line = read_line(500ms);
+            if (!line) {
+                if (was_closed_by_peer()) return -1;
+                continue;
+            }
+            json j = json::parse(*line, nullptr, false);
+            if (j.is_discarded()) continue;
+            record_notify(j);
+            if (j.contains("id") && j["id"].is_number_integer()) {
+                const int id = j["id"].get<int>();
+                if (id >= first_id && id < first_id + n) {
+                    ++replies;
+                    if (j["result"].is_boolean() && j["result"].get<bool>()) ++accepted;
+                }
+            }
+        }
+        return replies == n ? accepted : -1;
+    }
+
+    // Read whatever arrives within `quiet` (notifies, set_difficulty).
+    void drain(std::chrono::milliseconds quiet = 300ms)
+    {
+        while (auto line = read_line(quiet)) {
+            json j = json::parse(*line, nullptr, false);
+            if (!j.is_discarded()) record_notify(j);
+        }
+    }
+
     std::vector<std::string> jobs;         // job ids, in notify order
     std::vector<bool> clean_flags;         // clean_jobs (params[8]) per notify, in order
     std::string last_ntime = "65a812c0";   // overwritten by record_notify
+    std::vector<double> set_diffs;         // mining.set_difficulty values (wire), in order
+    std::vector<double> diff_at_notify;    // the last set_difficulty before each notify (-1: none)
 
 private:
     void record_notify(const json& j)
     {
+        if (j.contains("method") && j["method"] == "mining.set_difficulty"
+            && j.contains("params") && j["params"].is_array() && !j["params"].empty()
+            && j["params"][0].is_number())
+            set_diffs.push_back(j["params"][0].get<double>());
         if (j.contains("method") && j["method"] == "mining.notify"
             && j.contains("params") && j["params"].is_array()
             && j["params"].size() >= 9) {
             jobs.push_back(j["params"][0].get<std::string>());
             clean_flags.push_back(j["params"][8].get<bool>());
+            diff_at_notify.push_back(set_diffs.empty() ? -1.0 : set_diffs.back());
             last_ntime = j["params"][7].get<std::string>();
         }
     }
@@ -622,6 +765,420 @@ TEST(StratumInterimHardening, KeepaliveOffLeavesIdleSessionUnfed)
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// Held jobs (CoinbaseResult::held: the sharechain was busy, no coinbase its
+// shares could verify). No job goes out while held, never the global coinbase;
+// one pending retry per session (every 500 ms) whatever the notify rate; a
+// clean notify held meanwhile makes the retry clean; the hold is bounded by
+// StratumConfig::job_hold_limit_sec, after which the session waits for the
+// next notify.
+// ════════════════════════════════════════════════════════════════════════════
+TEST(StratumJobHold, OnePendingRetryPerSessionAndTheCleanFlagCarried)
+{
+    ServerHarness h;
+    ASSERT_TRUE(h.start());
+
+    Client c;
+    ASSERT_TRUE(c.connect(h.port));
+    ASSERT_TRUE(c.subscribe());
+    ASSERT_TRUE(c.authorize("interimtestworker1"));
+    ASSERT_TRUE(c.collect_notifies(1, 5000ms));
+    const size_t base = c.jobs.size();
+
+    h.ws->hold = true;
+    const int calls0 = h.ws->build_calls.load();
+    // a non-clean notify held first, then nine clean ones while its retry is
+    // pending
+    h.on_io([&] { h.server->notify_all(false); return 0; });
+    h.on_io([&] { for (int i = 0; i < 9; ++i) h.server->notify_all(true); return 0; });
+    std::this_thread::sleep_for(1200ms);
+    const int held_calls = h.ws->build_calls.load() - calls0;
+    // ten notifies and the retries at 0.5 s and 1.0 s (one pending at a time);
+    // a timer per held notify would make it 10 + 20
+    EXPECT_GE(held_calls, 11);
+    EXPECT_LE(held_calls, 13);
+    EXPECT_FALSE(c.collect_notifies(base + 1, 300ms)) << "no job while it is held";
+
+    h.ws->hold = false;
+    ASSERT_TRUE(c.collect_notifies(base + 1, 2000ms)) << "the pending retry sends the job";
+    EXPECT_EQ(c.jobs.size(), base + 1) << "one job, not one per held notify";
+    EXPECT_TRUE(c.clean_flags.back()) << "a clean notify was held: the retry is clean";
+}
+
+TEST(StratumJobHold, TheHoldIsBoundedThenWaitsForTheNextNotify)
+{
+    ServerHarness h;
+    h.ws->cfg.job_hold_limit_sec = 1;
+    ASSERT_TRUE(h.start());
+
+    Client c;
+    ASSERT_TRUE(c.connect(h.port));
+    ASSERT_TRUE(c.subscribe());
+    ASSERT_TRUE(c.authorize("interimtestworker1"));
+    ASSERT_TRUE(c.collect_notifies(1, 5000ms));
+    const size_t base = c.jobs.size();
+
+    h.ws->hold = true;
+    const int calls0 = h.ws->build_calls.load();
+    h.on_io([&] { h.server->notify_all(true); return 0; });
+    std::this_thread::sleep_for(2000ms);
+    const int bounded = h.ws->build_calls.load() - calls0;
+    // the notify and its retries until 1 s since the hold began
+    EXPECT_GE(bounded, 2);
+    EXPECT_LE(bounded, 4);
+    std::this_thread::sleep_for(1500ms);
+    EXPECT_EQ(h.ws->build_calls.load() - calls0, bounded) << "no retry past the limit";
+    EXPECT_FALSE(c.collect_notifies(base + 1, 300ms)) << "the miner keeps its last job";
+
+    // the next notify starts a new hold, and the job goes out once it can be
+    // built
+    h.on_io([&] { h.server->notify_all(true); return 0; });
+    std::this_thread::sleep_for(700ms);
+    EXPECT_GE(h.ws->build_calls.load() - calls0, bounded + 2);
+    h.ws->hold = false;
+    ASSERT_TRUE(c.collect_notifies(base + 1, 2000ms));
+}
+
+// A clean notify held, then the hold ends with a job another (non-clean)
+// notify builds before the held retry fires: that job is the clean one, and
+// the retry sends nothing (the hold is over).
+TEST(StratumJobHold, HeldCleanGoesOutWithTheJobAnotherNotifyBuilds)
+{
+    ServerHarness h;
+    ASSERT_TRUE(h.start());
+
+    Client c;
+    ASSERT_TRUE(c.connect(h.port));
+    ASSERT_TRUE(c.subscribe());
+    ASSERT_TRUE(c.authorize("interimtestworker1"));
+    ASSERT_TRUE(c.collect_notifies(1, 5000ms));
+    c.drain(200ms);
+    const size_t base = c.jobs.size();
+
+    h.ws->hold = true;
+    h.on_io([&] { h.server->notify_all(true); return 0; });   // held, retry in 500 ms
+    h.ws->hold = false;
+    h.on_io([&] { h.server->notify_all(false); return 0; });  // builds first
+    ASSERT_TRUE(c.collect_notifies(base + 1, 1000ms));
+    EXPECT_TRUE(c.clean_flags[base]) << "a clean notify was held: the first job sent is clean";
+    c.drain(800ms);
+    EXPECT_EQ(c.jobs.size(), base + 1) << "the hold ended with that job: no retry";
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Work not ready yet (no template, a template without difficulty bits, or a
+// require_job_snapshot job without its atomic snapshot): no job goes out and
+// the session retries every 1 s. A clean notify requested while the work was
+// not ready makes the job that finally goes out clean (mining.notify param 9,
+// clean_jobs), so the miner flushes its stale jobs; one pending retry per
+// session whatever the notify rate; a non-clean wait still retries non-clean.
+// ════════════════════════════════════════════════════════════════════════════
+TEST(StratumTemplateWait, CleanNotifyCarriedThroughTheRetry)
+{
+    ServerHarness h;
+    ASSERT_TRUE(h.start());
+
+    Client c;
+    ASSERT_TRUE(c.connect(h.port));
+    ASSERT_TRUE(c.subscribe());
+    ASSERT_TRUE(c.authorize("interimtestworker1"));
+    ASSERT_TRUE(c.collect_notifies(1, 5000ms));
+    c.drain(200ms);
+    const size_t base = c.jobs.size();
+
+    h.ws->no_template = true;
+    h.on_io([&] { h.server->notify_all(true); return 0; });
+    EXPECT_FALSE(c.collect_notifies(base + 1, 300ms)) << "no job without a template";
+    h.ws->no_template = false;
+    ASSERT_TRUE(c.collect_notifies(base + 1, 2000ms)) << "the pending retry sends the job";
+    EXPECT_TRUE(c.clean_flags[base])
+        << "a clean notify was requested while the template was not ready: the retry is clean";
+}
+
+TEST(StratumTemplateWait, OnePendingRetryPerSessionWhateverTheNotifyRate)
+{
+    ServerHarness h;
+    ASSERT_TRUE(h.start());
+
+    Client c;
+    ASSERT_TRUE(c.connect(h.port));
+    ASSERT_TRUE(c.subscribe());
+    ASSERT_TRUE(c.authorize("interimtestworker1"));
+    ASSERT_TRUE(c.collect_notifies(1, 5000ms));
+    c.drain(200ms);
+    const size_t base = c.jobs.size();
+
+    h.ws->no_template = true;
+    const int calls0 = h.ws->template_calls.load();
+    // a non-clean notify first, then nine clean ones while its retry is pending
+    h.on_io([&] { h.server->notify_all(false); return 0; });
+    h.on_io([&] { for (int i = 0; i < 9; ++i) h.server->notify_all(true); return 0; });
+    std::this_thread::sleep_for(1500ms);
+    const int waiting_calls = h.ws->template_calls.load() - calls0;
+    // ten notifies and the retry at 1 s; a timer per notify would make it 10 + 10
+    EXPECT_GE(waiting_calls, 11);
+    EXPECT_LE(waiting_calls, 12);
+    EXPECT_FALSE(c.collect_notifies(base + 1, 200ms)) << "no job without a template";
+
+    h.ws->no_template = false;
+    ASSERT_TRUE(c.collect_notifies(base + 1, 2000ms)) << "the pending retry sends the job";
+    c.drain(1500ms);
+    EXPECT_EQ(c.jobs.size(), base + 1) << "one job, not one per notify made during the wait";
+    EXPECT_TRUE(c.clean_flags.back()) << "a clean notify was made during the wait: the retry is clean";
+}
+
+TEST(StratumTemplateWait, NonCleanWaitRetriesNonClean)
+{
+    ServerHarness h;
+    ASSERT_TRUE(h.start());
+
+    Client c;
+    ASSERT_TRUE(c.connect(h.port));
+    ASSERT_TRUE(c.subscribe());
+    ASSERT_TRUE(c.authorize("interimtestworker1"));
+    ASSERT_TRUE(c.collect_notifies(1, 5000ms));
+    c.drain(200ms);
+    const size_t base = c.jobs.size();
+
+    h.ws->no_template = true;
+    h.on_io([&] { h.server->notify_all(false); return 0; });
+    EXPECT_FALSE(c.collect_notifies(base + 1, 300ms)) << "no job without a template";
+    h.ws->no_template = false;
+    ASSERT_TRUE(c.collect_notifies(base + 1, 2000ms)) << "the pending retry sends the job";
+    EXPECT_FALSE(c.clean_flags[base]) << "no clean notify was made: the retry is not clean";
+}
+
+// A clean notify requested during the wait, then the template is back and a
+// non-clean notify sends the first job before the retry fires: that job is
+// the clean one.
+TEST(StratumTemplateWait, OwedCleanGoesOutWithTheFirstJobSent)
+{
+    ServerHarness h;
+    ASSERT_TRUE(h.start());
+
+    Client c;
+    ASSERT_TRUE(c.connect(h.port));
+    ASSERT_TRUE(c.subscribe());
+    ASSERT_TRUE(c.authorize("interimtestworker1"));
+    ASSERT_TRUE(c.collect_notifies(1, 5000ms));
+    c.drain(200ms);
+    const size_t base = c.jobs.size();
+
+    h.ws->no_template = true;
+    h.on_io([&] { h.server->notify_all(true); return 0; });
+    std::this_thread::sleep_for(200ms);
+    h.ws->no_template = false;
+    h.on_io([&] { h.server->notify_all(false); return 0; });
+    ASSERT_TRUE(c.collect_notifies(base + 1, 1000ms));
+    EXPECT_TRUE(c.clean_flags[base])
+        << "a clean notify was requested during the wait: the first job sent is clean";
+}
+
+// The same wait on a require_job_snapshot coin whose job is suppressed for
+// want of an atomic header+coinbase snapshot.
+TEST(StratumTemplateWait, SuppressedJobRetryCarriesTheCleanFlag)
+{
+    ServerHarness h;
+    h.ws->cfg.require_job_snapshot = true;
+    h.ws->snap_header = true;
+    ASSERT_TRUE(h.start());
+
+    Client c;
+    ASSERT_TRUE(c.connect(h.port));
+    ASSERT_TRUE(c.subscribe());
+    ASSERT_TRUE(c.authorize("interimtestworker1"));
+    ASSERT_TRUE(c.collect_notifies(1, 5000ms));
+    c.drain(200ms);
+    const size_t base = c.jobs.size();
+
+    h.ws->snap_header = false;
+    const int calls0 = h.ws->build_calls.load();
+    h.on_io([&] { for (int i = 0; i < 3; ++i) h.server->notify_all(true); return 0; });
+    EXPECT_FALSE(c.collect_notifies(base + 1, 300ms)) << "no job without its snapshot";
+    EXPECT_EQ(h.ws->build_calls.load() - calls0, 3) << "the three notifies, no retry yet";
+    h.ws->snap_header = true;
+    ASSERT_TRUE(c.collect_notifies(base + 1, 2000ms)) << "the pending retry sends the job";
+    c.drain(1500ms);
+    EXPECT_EQ(c.jobs.size(), base + 1) << "one job, not one per suppressed notify";
+    EXPECT_TRUE(c.clean_flags[base])
+        << "a clean notify was suppressed: the retry is clean";
+}
+
+// Connect, subscribe, authorize, and read the jobs that follow.
+static bool connect_and_authorize(ServerHarness& h, Client& c)
+{
+    if (!c.connect(h.port) || !c.subscribe() || !c.authorize("interimtestworker1"))
+        return false;
+    if (!c.collect_notifies(1, 5000ms))
+        return false;
+    c.drain(200ms);
+    return true;
+}
+
+// The missing-bits arm of the wait: a template without difficulty bits is
+// held like no template, and a clean request made meanwhile is carried.
+TEST(StratumTemplateWait, MissingBitsWaitCarriesTheCleanFlag)
+{
+    ServerHarness h;
+    ASSERT_TRUE(h.start());
+    Client c;
+    ASSERT_TRUE(connect_and_authorize(h, c));
+    const size_t base = c.jobs.size();
+
+    h.ws->no_bits = true;
+    h.on_io([&] { for (int i = 0; i < 4; ++i) h.server->notify_all(true); return 0; });
+    EXPECT_FALSE(c.collect_notifies(base + 1, 300ms)) << "no job from a template without bits";
+    h.ws->no_bits = false;
+    ASSERT_TRUE(c.collect_notifies(base + 1, 2000ms)) << "the pending retry sends the job";
+    EXPECT_TRUE(c.clean_flags[base]) << "a clean notify was made during the wait: the retry is clean";
+    c.drain(1500ms);
+    EXPECT_EQ(c.jobs.size(), base + 1) << "one job, not one per notify made during the wait";
+}
+
+// Another notify sent the job the wait owed: the pending retry finds the wait
+// over and nothing owed, and sends nothing.
+TEST(StratumTemplateWait, NoRetryAfterTheOwedJobWentOut)
+{
+    ServerHarness h;
+    ASSERT_TRUE(h.start());
+    Client c;
+    ASSERT_TRUE(connect_and_authorize(h, c));
+    const size_t base = c.jobs.size();
+
+    h.ws->no_template = true;
+    h.on_io([&] { h.server->notify_all(true); return 0; });
+    std::this_thread::sleep_for(200ms);
+    h.ws->no_template = false;
+    const int calls0 = h.ws->template_calls.load();
+    h.on_io([&] { h.server->notify_all(false); return 0; });
+    ASSERT_TRUE(c.collect_notifies(base + 1, 1000ms));
+    EXPECT_TRUE(c.clean_flags[base]) << "the first job sent carries the owed clean request";
+    c.drain(1500ms);   // the pending retry fires at ~1 s
+    EXPECT_EQ(c.jobs.size(), base + 1) << "the wait ended with that job: the retry sends nothing";
+    EXPECT_EQ(h.ws->template_calls.load() - calls0, 1) << "the retry does not even fetch";
+}
+
+// The work goes away again while the first wait's retry is still pending: that
+// retry serves the new wait (on time, with its clean request); no second timer.
+TEST(StratumTemplateWait, ANewWaitIsServedByThePendingRetry)
+{
+    ServerHarness h;
+    ASSERT_TRUE(h.start());
+    Client c;
+    ASSERT_TRUE(connect_and_authorize(h, c));
+    const size_t base = c.jobs.size();
+
+    const auto t0 = std::chrono::steady_clock::now();
+    h.ws->no_template = true;
+    h.on_io([&] { h.server->notify_all(false); return 0; });  // retry at ~1 s
+    std::this_thread::sleep_for(200ms);
+    h.ws->no_template = false;
+    h.on_io([&] { h.server->notify_all(false); return 0; });  // the wait ends with this job
+    ASSERT_TRUE(c.collect_notifies(base + 1, 1000ms));
+    EXPECT_FALSE(c.clean_flags[base]);
+    h.ws->no_template = true;
+    h.on_io([&] { h.server->notify_all(true); return 0; });   // a new wait, clean owed
+    std::this_thread::sleep_for(300ms);
+    h.ws->no_template = false;
+    ASSERT_TRUE(c.collect_notifies(base + 2, 2000ms)) << "the pending retry serves the new wait";
+    EXPECT_TRUE(c.clean_flags[base + 1]) << "with the clean request made during it";
+    EXPECT_LT(std::chrono::steady_clock::now() - t0, 1600ms) << "at ~1 s, by the first timer";
+    c.drain(1500ms);
+    EXPECT_EQ(c.jobs.size(), base + 2);
+}
+
+// A clean request owed by the wait, then the template is back but the job is
+// held until the hold limit ends the retries: the clean request is still owed
+// to the next job sent.
+TEST(StratumTemplateWait, CleanOwedByTheWaitSurvivesTheHoldLimit)
+{
+    ServerHarness h;
+    h.ws->cfg.job_hold_limit_sec = 1;
+    ASSERT_TRUE(h.start());
+    Client c;
+    ASSERT_TRUE(connect_and_authorize(h, c));
+    const size_t base = c.jobs.size();
+
+    h.ws->no_template = true;
+    h.on_io([&] { h.server->notify_all(true); return 0; });   // retry at ~1 s, clean owed
+    h.ws->no_template = false;
+    h.ws->hold = true;                                          // that retry is held; limit ~2 s
+    std::this_thread::sleep_for(3000ms);
+    EXPECT_FALSE(c.collect_notifies(base + 1, 200ms)) << "no job while it is held";
+    h.ws->hold = false;
+    h.on_io([&] { h.server->notify_all(false); return 0; });
+    ASSERT_TRUE(c.collect_notifies(base + 1, 1000ms));
+    EXPECT_TRUE(c.clean_flags[base])
+        << "the clean request owed by the wait outlives the hold limit";
+}
+
+// A retry whose send_notify_work throws (a failing work source): the exception
+// stays inside the session (the server keeps serving) and the clean request
+// the retry carried is still owed to the next job sent.
+TEST(StratumTemplateWait, RetryThatThrowsKeepsTheCleanOwed)
+{
+    ServerHarness h;
+    ASSERT_TRUE(h.start());
+    Client c;
+    ASSERT_TRUE(connect_and_authorize(h, c));
+    const size_t base = c.jobs.size();
+
+    h.ws->no_template = true;
+    h.on_io([&] { h.server->notify_all(true); return 0; });   // retry at ~1 s, clean owed
+    h.ws->throw_on_build = true;
+    h.ws->no_template = false;
+    std::this_thread::sleep_for(1300ms);                        // the retry threw
+    EXPECT_FALSE(c.collect_notifies(base + 1, 200ms));
+    h.ws->throw_on_build = false;
+    h.on_io([&] { h.server->notify_all(false); return 0; });
+    ASSERT_TRUE(c.collect_notifies(base + 1, 1000ms)) << "the server still serves";
+    EXPECT_TRUE(c.clean_flags[base]) << "the clean request the failed retry carried is still owed";
+}
+
+// A clean notify held past job_hold_limit_sec: the session stops retrying,
+// and the next job sent (here from a non-clean notify) is the clean one.
+TEST(StratumJobHold, CleanOwedPastTheHoldLimitGoesOutWithTheNextJob)
+{
+    ServerHarness h;
+    h.ws->cfg.job_hold_limit_sec = 1;
+    ASSERT_TRUE(h.start());
+    Client c;
+    ASSERT_TRUE(connect_and_authorize(h, c));
+    const size_t base = c.jobs.size();
+
+    h.ws->hold = true;
+    h.on_io([&] { h.server->notify_all(true); return 0; });   // held, clean owed
+    std::this_thread::sleep_for(2000ms);                        // past the 1 s limit
+    EXPECT_FALSE(c.collect_notifies(base + 1, 200ms)) << "the miner keeps its last job";
+    h.ws->hold = false;
+    h.on_io([&] { h.server->notify_all(false); return 0; });
+    ASSERT_TRUE(c.collect_notifies(base + 1, 1000ms));
+    EXPECT_TRUE(c.clean_flags[base])
+        << "the held clean request outlives the hold limit: the next job sent is clean";
+}
+
+// The held retry's send_notify_work throws: the server keeps serving and the
+// clean request the retry carried is still owed to the next job sent.
+TEST(StratumJobHold, RetryThatThrowsKeepsTheCleanOwed)
+{
+    ServerHarness h;
+    ASSERT_TRUE(h.start());
+    Client c;
+    ASSERT_TRUE(connect_and_authorize(h, c));
+    const size_t base = c.jobs.size();
+
+    h.ws->hold = true;
+    h.on_io([&] { h.server->notify_all(true); return 0; });   // held, retry at ~0.5 s
+    h.ws->throw_on_build = true;
+    std::this_thread::sleep_for(800ms);                         // the retry threw
+    h.ws->hold = false;
+    h.ws->throw_on_build = false;
+    EXPECT_FALSE(c.collect_notifies(base + 1, 200ms)) << "no retry after the failed one";
+    h.on_io([&] { h.server->notify_all(false); return 0; });
+    ASSERT_TRUE(c.collect_notifies(base + 1, 1000ms)) << "the server still serves";
+    EXPECT_TRUE(c.clean_flags[base]) << "the clean request the failed retry carried is still owed";
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // KAT 5 — Stratum line cap (StratumSession::kMaxStratumLineBytes = 16384).
 // Before the cap the session's streambuf had no max_size: a peer that never
 // sent '\n' grew it until the process ran out of memory. p2pool's stratum
@@ -742,6 +1299,363 @@ TEST(StratumInterimHardening, JobSnapshotCarriesMwebFields)
         ASSERT_TRUE(seen.has_value()) << "mining_submit never saw the job";
         EXPECT_EQ(seen->mweb_active, cs.active) << "mweb_active lost in the job freeze";
         EXPECT_EQ(seen->mweb, cs.mweb);
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// KAT 6b — Vardiff runaway + pool-share bound (core: LTC, BTC and DASH serve
+// miners through this one server). Field (LTC, 2026-11): a restarted node's 15
+// ASIC rigs all came up at max_difficulty 65536; four stayed. Each started at
+// the 0.0005 floor and sent a burst of floor shares before applying the first
+// raise; the issued-difficulty grace accepted them, and every accepted share
+// was timed as if found at the CURRENT difficulty: 10x per 12 shares, 0.0005 ->
+// 65536 in ~109 floor shares. At 65536 a 15 GH/s rig finds a pseudoshare every
+// ~5 h, and it withholds every pool share under 65536 (~99% of its PPLNS
+// weight; the pool-share difficulty was ~660). Covered here on the wire:
+//   - a floor burst on the old job no longer ramps the session;
+//   - no job is issued, and no set_difficulty sent, above the job's pool-share
+//     difficulty (p2pool: target = max(target, share target)), and a share at
+//     exactly the pool-share difficulty reaches share creation;
+//   - a rig ramped high comes back within one share period (the next job) and
+//     steps down after one share at the bound;
+//   - "d=N" in the password (start, wire units), "+N" on the login (fixed,
+//     internal units as in python p2pool), their bound and their precedence
+//     over mining.suggest_difficulty.
+// Each coin case runs the same code: LTC (wire = 65536 x internal, ratio
+// vardiff), BTC (wire = internal, ratio vardiff), DASH (wire = internal,
+// hashrate vardiff, 10 s target).
+// ════════════════════════════════════════════════════════════════════════════
+namespace {
+
+constexpr uint32_t kPoolBitsDiff1 = 0x1d00ffff;   // pool-share difficulty 1.0 (the diff-1 target)
+constexpr double   kPoolDiff1 = 1.0;
+constexpr const char* kHardBlockBits = "1a00ffff"; // block difficulty 2^24: a pool share is not a block
+
+struct CoinCase { const char* name; double mult; bool hashrate_vardiff; double target; };
+const CoinCase kLtcCase{"LTC", 65536.0, false, 3.0};
+const CoinCase kBtcCase{"BTC", 1.0, false, 3.0};
+const CoinCase kDashCase{"DASH", 1.0, true, 10.0};
+
+void apply_case(ServerHarness& h, const CoinCase& cc)
+{
+    h.ws->cfg.set_difficulty_multiplier = cc.mult;
+    h.ws->cfg.use_hashrate_vardiff = cc.hashrate_vardiff;
+    h.ws->cfg.target_time = cc.target;
+    h.ws->set_block_bits(kHardBlockBits);
+}
+
+// subscribe (its set_difficulty + job), then authorize and its job.
+bool login(Client& c, const std::string& user, const std::string& password = "x")
+{
+    if (!c.subscribe() || !c.collect_notifies(1, 5000ms))
+        return false;
+    const size_t n = c.jobs.size();
+    return c.authorize_with(user, password) && c.collect_notifies(n + 1, 5000ms);
+}
+
+// A rig that applies every raise at once: bursts of 13 on the newest job until
+// the advertised difficulty reaches `wire_goal` or `rounds` run out.
+void ramp(Client& c, const std::string& user, double wire_goal, int rounds, int& id)
+{
+    for (int r = 0; r < rounds && !(c.set_diffs.back() >= wire_goal); ++r) {
+        ASSERT_EQ(c.submit_burst(user, c.jobs.back(), 13, id), 13);
+        id += 13;
+    }
+}
+
+bool accepted(const std::optional<json>& resp)
+{
+    return resp && (*resp)["result"].is_boolean() && (*resp)["result"].get<bool>();
+}
+
+}  // namespace
+
+// KAT 1 (+5): 120 accepted submits of the start job (issued at 0.0005) in one
+// burst. Master: LTC/BTC end at 65536.
+TEST(StratumVardiff, FloorBurstOnOldJobDoesNotRunAway)
+{
+    for (const CoinCase& cc : {kLtcCase, kBtcCase, kDashCase}) {
+        SCOPED_TRACE(cc.name);
+        ServerHarness h;
+        apply_case(h, cc);
+        h.ws->hash_diff = 0.001;   // a floor share
+        ASSERT_TRUE(h.start());
+
+        Client c;
+        ASSERT_TRUE(c.connect(h.port));
+        const std::string user = "vardiffburstworker";
+        ASSERT_TRUE(login(c, user));
+        ASSERT_DOUBLE_EQ(c.diff_at_notify.back(), 0.0005 * cc.mult) << "start job at the floor";
+
+        const auto t0 = std::chrono::steady_clock::now();
+        ASSERT_EQ(c.submit_burst(user, c.jobs.back(), 120, 1000), 120);
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - t0).count();
+        c.drain(200ms);
+        const double internal = c.set_diffs.back() / cc.mult;
+        printf("[%s] 120-share floor burst answered in %lld ms; difficulty now %g (internal)\n",
+               cc.name, static_cast<long long>(ms), internal);
+        if (cc.hashrate_vardiff)
+            EXPECT_LE(internal, 0.0625) << "hashrate vardiff: bounded by the credited work";
+        else
+            EXPECT_LE(internal, 0.005 * (1.0 + 1e-9)) << "floor burst ran the vardiff away";
+    }
+}
+
+// KAT 2 (+5): a rig fast enough for any difficulty is never issued one above
+// its job's pool-share difficulty, and a share at exactly that difficulty is
+// accepted and goes to share creation. Master: ramps to 65536, the share is
+// rejected "Low difficulty share".
+TEST(StratumVardiff, NeverIssuedAbovePoolShareDifficulty)
+{
+    for (const CoinCase& cc : {kLtcCase, kBtcCase, kDashCase}) {
+        SCOPED_TRACE(cc.name);
+        ServerHarness h;
+        apply_case(h, cc);
+        h.ws->snap_share_bits = kPoolBitsDiff1;
+        h.ws->hash_diff = 1.0e6;
+        ASSERT_TRUE(h.start());
+
+        Client c;
+        ASSERT_TRUE(c.connect(h.port));
+        const std::string user = "vardiffboundworker";
+        ASSERT_TRUE(login(c, user));
+        const double pool_wire = kPoolDiff1 * cc.mult;
+        int id = 1000;
+        ramp(c, user, 65536.0 * cc.mult, 40, id);
+        c.drain(200ms);
+
+        for (double d : c.set_diffs)
+            EXPECT_LE(d, pool_wire) << "set_difficulty above the pool-share difficulty";
+        for (double d : c.diff_at_notify)
+            EXPECT_LE(d, pool_wire) << "a job issued above the pool-share difficulty";
+        EXPECT_DOUBLE_EQ(c.set_diffs.back(), pool_wire) << "a fast rig sits at the bound";
+
+        const int before = h.ws->submit_calls.load();
+        h.ws->hash_diff = kPoolDiff1;
+        EXPECT_TRUE(accepted(c.submit(user, c.jobs.back(), id++)))
+            << "a share at the pool-share difficulty was rejected";
+        EXPECT_EQ(h.ws->submit_calls.load(), before + 1) << "the pool share never reached share creation";
+    }
+}
+
+// KAT 3: a rig ramped to 65536 while no pool-share bits were known. The next
+// job (one sharechain share later) carries them: set_difficulty at the bound
+// goes out ahead of it, the rig's next share at the bound is a pool share,
+// and that one share brings the vardiff down. Test-sized target time (50 ms),
+// so "past 10 x 2 x target" is 1 s.
+TEST(StratumVardiff, MisRampedRigComesBackWithinOneShare)
+{
+    for (const CoinCase& cc : {kLtcCase, kBtcCase}) {
+        SCOPED_TRACE(cc.name);
+        ServerHarness h;
+        apply_case(h, cc);
+        h.ws->cfg.target_time = 0.05;
+        h.ws->hash_diff = 1.0e6;
+        ASSERT_TRUE(h.start());
+
+        Client c;
+        ASSERT_TRUE(c.connect(h.port));
+        const std::string user = "vardiffmisrampworker";
+        ASSERT_TRUE(login(c, user));
+        int id = 1000;
+        ramp(c, user, 65536.0 * cc.mult, 60, id);
+        ASSERT_DOUBLE_EQ(c.set_diffs.back(), 65536.0 * cc.mult) << "precondition: ramped to max";
+
+        h.ws->snap_share_bits = kPoolBitsDiff1;
+        const size_t jobs_before = c.jobs.size();
+        h.on_io([&] { h.server->notify_all(false); return 0; });
+        ASSERT_TRUE(c.collect_notifies(jobs_before + 1, 5000ms));
+        EXPECT_DOUBLE_EQ(c.diff_at_notify.back(), kPoolDiff1 * cc.mult)
+            << "the next job must be issued (and announced) at the pool-share difficulty";
+
+        std::this_thread::sleep_for(1200ms);   // the rig's share interval at the bound
+        const int before = h.ws->submit_calls.load();
+        h.ws->hash_diff = kPoolDiff1;
+        EXPECT_TRUE(accepted(c.submit(user, c.jobs.back(), id++)));
+        EXPECT_EQ(h.ws->submit_calls.load(), before + 1) << "the share at the bound is a pool share";
+        c.drain(200ms);
+        EXPECT_LT(c.set_diffs.back(), kPoolDiff1 * cc.mult)
+            << "one share at the bound must bring the vardiff down";
+    }
+}
+
+// "d=4096" in the password: the session's start difficulty in WIRE units, sent
+// with set_difficulty at authorize, ahead of the first job; the floor job's
+// burst does not move it (ratio vardiff) or only lowers it (hashrate vardiff).
+TEST(StratumVardiff, PasswordStartDifficultySentAtOnce)
+{
+    for (const CoinCase& cc : {kLtcCase, kBtcCase, kDashCase}) {
+        SCOPED_TRACE(cc.name);
+        ServerHarness h;
+        apply_case(h, cc);
+        h.ws->hash_diff = 0.001;
+        ASSERT_TRUE(h.start());
+
+        Client c;
+        ASSERT_TRUE(c.connect(h.port));
+        const std::string user = "vardiffpasswordworker";
+        ASSERT_TRUE(c.subscribe());
+        ASSERT_TRUE(c.collect_notifies(1, 5000ms));
+        const std::string floor_job = c.jobs.back();
+        const size_t sd = c.set_diffs.size(), nj = c.jobs.size();
+        ASSERT_TRUE(c.authorize_with(user, "x,d=4096"));
+        ASSERT_TRUE(c.collect_notifies(nj + 1, 5000ms));
+        ASSERT_GT(c.set_diffs.size(), sd) << "no set_difficulty after authorize";
+        EXPECT_DOUBLE_EQ(c.set_diffs[sd], 4096.0) << "d=4096 is wire units";
+        EXPECT_DOUBLE_EQ(c.diff_at_notify.back(), 4096.0);
+
+        ASSERT_EQ(c.submit_burst(user, floor_job, 120, 1000), 120);
+        c.drain(200ms);
+        if (cc.hashrate_vardiff)
+            EXPECT_LE(c.set_diffs.back(), 4096.0);
+        else
+            EXPECT_DOUBLE_EQ(c.set_diffs.back(), 4096.0) << "the floor burst moved the start difficulty";
+    }
+    // The other separator and order.
+    ServerHarness h;
+    ASSERT_TRUE(h.start());
+    Client c;
+    ASSERT_TRUE(c.connect(h.port));
+    ASSERT_TRUE(login(c, "vardiffpasswordworker2", "d=8192;x"));
+    EXPECT_DOUBLE_EQ(c.diff_at_notify.back(), 8192.0);
+}
+
+// "d=" above the pool-share difficulty is issued at it.
+TEST(StratumVardiff, PasswordStartDifficultyBoundedByPoolShare)
+{
+    for (const CoinCase& cc : {kLtcCase, kBtcCase, kDashCase}) {
+        SCOPED_TRACE(cc.name);
+        ServerHarness h;
+        apply_case(h, cc);
+        h.ws->snap_share_bits = kPoolBitsDiff1;
+        ASSERT_TRUE(h.start());
+        Client c;
+        ASSERT_TRUE(c.connect(h.port));
+        ASSERT_TRUE(login(c, "vardiffpwboundworker", "d=100000000"));
+        EXPECT_DOUBLE_EQ(c.diff_at_notify.back(), kPoolDiff1 * cc.mult);
+        for (double d : c.set_diffs)
+            EXPECT_LE(d, kPoolDiff1 * cc.mult);
+    }
+}
+
+// Garbage, zero, negative, non-finite and empty "d=" values are ignored: the
+// login succeeds and the difficulty stays where it was.
+TEST(StratumVardiff, PasswordGarbageIgnored)
+{
+    for (const char* pw : {"d=abc", "d=-5", "d=0", "d=", "d=inf", "d=nan", "x,d=1e999", "d=0x10"}) {
+        SCOPED_TRACE(pw);
+        ServerHarness h;
+        ASSERT_TRUE(h.start());
+        Client c;
+        ASSERT_TRUE(c.connect(h.port));
+        ASSERT_TRUE(login(c, "vardiffgarbageworker", pw)) << "a bad d= must not fail the login";
+        c.drain(200ms);
+        for (double d : c.set_diffs)
+            EXPECT_DOUBLE_EQ(d, 0.0005 * 65536.0);
+    }
+}
+
+// "ADDR+N": a fixed difficulty in INTERNAL units, as python p2pool reads it
+// (difficulty_to_target(float(N))), so the miner is sent N x the wire
+// multiplier: "+1" is 65536 on LTC, "+4" is 4 on BTC and DASH. Sent at
+// authorize, bounded by the pool-share difficulty, not moved by vardiff.
+TEST(StratumVardiff, PlusSuffixIsFixedSentAndBounded)
+{
+    for (const CoinCase& cc : {kLtcCase, kBtcCase, kDashCase}) {
+        SCOPED_TRACE(cc.name);
+        ServerHarness h;
+        apply_case(h, cc);
+        h.ws->hash_diff = 1.0e6;
+        ASSERT_TRUE(h.start());
+        Client c;
+        ASSERT_TRUE(c.connect(h.port));
+        const std::string user = "vardiffplusworker";
+        const bool scrypt = cc.mult > 1.0;
+        const double wire = scrypt ? 1.0 * cc.mult : 4.0;   // "+1" on LTC, "+4" on BTC/DASH
+        ASSERT_TRUE(c.subscribe());
+        ASSERT_TRUE(c.collect_notifies(1, 5000ms));
+        const size_t sd = c.set_diffs.size(), nj = c.jobs.size();
+        ASSERT_TRUE(c.authorize(user + (scrypt ? "+1" : "+4")));
+        ASSERT_TRUE(c.collect_notifies(nj + 1, 5000ms));
+        ASSERT_GT(c.set_diffs.size(), sd) << "+N never sent";
+        EXPECT_DOUBLE_EQ(c.set_diffs[sd], wire) << "+N is internal units: wire = N x multiplier";
+        EXPECT_DOUBLE_EQ(c.diff_at_notify.back(), wire);
+        int id = 1000;
+        for (int r = 0; r < 4; ++r, id += 13)
+            ASSERT_EQ(c.submit_burst(user, c.jobs.back(), 13, id), 13);
+        c.drain(200ms);
+        EXPECT_DOUBLE_EQ(c.set_diffs.back(), wire) << "vardiff moved a fixed +N";
+    }
+    {
+        ServerHarness h;
+        h.ws->snap_share_bits = kPoolBitsDiff1;
+        ASSERT_TRUE(h.start());
+        Client c;
+        ASSERT_TRUE(c.connect(h.port));
+        ASSERT_TRUE(login(c, "vardiffplusworker+1000000"));
+        EXPECT_DOUBLE_EQ(c.diff_at_notify.back(), kPoolDiff1 * 65536.0) << "+N above the pool-share difficulty";
+        for (double d : c.set_diffs)
+            EXPECT_LE(d, kPoolDiff1 * 65536.0);
+    }
+}
+
+// The two units side by side: "+N" internal, "d=N" wire. On scrypt "+1" and
+// "d=65536" send the same difficulty; on BTC "+4096" and "d=4096" do.
+TEST(StratumVardiff, PlusSuffixInternalPasswordWire)
+{
+    for (const CoinCase& cc : {kLtcCase, kBtcCase}) {
+        SCOPED_TRACE(cc.name);
+        const bool scrypt = cc.mult > 1.0;
+        const double wire = scrypt ? 65536.0 : 4096.0;
+        {
+            ServerHarness h;
+            apply_case(h, cc);
+            ASSERT_TRUE(h.start());
+            Client c;
+            ASSERT_TRUE(c.connect(h.port));
+            ASSERT_TRUE(login(c, std::string("vardiffunitsworker") + (scrypt ? "+1" : "+4096")));
+            EXPECT_DOUBLE_EQ(c.diff_at_notify.back(), wire);
+        }
+        {
+            ServerHarness h;
+            apply_case(h, cc);
+            ASSERT_TRUE(h.start());
+            Client c;
+            ASSERT_TRUE(c.connect(h.port));
+            ASSERT_TRUE(login(c, "vardiffunitsworker", scrypt ? "d=65536" : "d=4096"));
+            EXPECT_DOUBLE_EQ(c.diff_at_notify.back(), wire);
+        }
+    }
+}
+
+// Precedence: "+N" is fixed (d=N and mining.suggest_difficulty ignored);
+// without it, d=N starts the session and a later suggest_difficulty wins.
+TEST(StratumVardiff, PlusSuffixOverPasswordOverNothing)
+{
+    auto suggest = [](Client& c, double wire, int id) {
+        c.send_json({{"id", id}, {"method", "mining.suggest_difficulty"}, {"params", json::array({wire})}});
+        return c.wait_response(id).has_value();
+    };
+    {
+        ServerHarness h;
+        ASSERT_TRUE(h.start());
+        Client c;
+        ASSERT_TRUE(c.connect(h.port));
+        ASSERT_TRUE(login(c, "vardiffprecworker+1", "d=8192"));   // LTC: +1 internal = 65536 wire
+        EXPECT_DOUBLE_EQ(c.diff_at_notify.back(), 65536.0) << "+N must win over d=N";
+        ASSERT_TRUE(suggest(c, 16384.0, 50));
+        EXPECT_DOUBLE_EQ(c.set_diffs.back(), 65536.0) << "+N must win over suggest_difficulty";
+    }
+    {
+        ServerHarness h;
+        ASSERT_TRUE(h.start());
+        Client c;
+        ASSERT_TRUE(c.connect(h.port));
+        ASSERT_TRUE(login(c, "vardiffprecworker", "d=8192"));
+        EXPECT_DOUBLE_EQ(c.diff_at_notify.back(), 8192.0);
+        ASSERT_TRUE(suggest(c, 16384.0, 50));
+        EXPECT_DOUBLE_EQ(c.set_diffs.back(), 16384.0) << "a later suggest_difficulty is honoured";
     }
 }
 
@@ -922,4 +1836,319 @@ TEST(StratumInterimHardening, DrainHooksRefuseAndDropExactly)
     Client c4;
     ASSERT_TRUE(c4.connect(h.port));
     EXPECT_TRUE(c4.subscribe()) << "accepting=true must restore the accept path";
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Zombie sessions on LTC (+ merged DOGE). Field: an LTC node held 100/100
+// stratum slots and refused every real miner (refused_total=264674) because
+// LTC left every StratumConfig zombie protection off: a half-open NAT-dead
+// socket or a connection that never authorizes kept its slot forever.
+// ════════════════════════════════════════════════════════════════════════════
+namespace {
+
+// The LTC node's compiled StratumConfig with each deadline that is ON cut to a
+// test-sized value; a deadline that is OFF stays off. So these KATs see the
+// node LTC actually runs: where LTC leaves a protection off, they see it off.
+core::stratum::StratumConfig ltc_config_short(uint32_t handshake_s, uint32_t idle_s,
+                                              uint32_t keepalive_notify_s)
+{
+    auto c = ltc::default_stratum_config();
+    if (c.handshake_timeout_sec) c.handshake_timeout_sec = handshake_s;
+    if (c.session_idle_timeout_sec) c.session_idle_timeout_sec = idle_s;
+    if (c.keepalive_notify_sec) c.keepalive_notify_sec = keepalive_notify_s;
+    return c;
+}
+
+double seconds_since(std::chrono::steady_clock::time_point t0)
+{
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+}
+
+// The session behind c is still open and served: read what is already
+// buffered (a closed socket shows here, after its buffered lines), then one
+// more notify must arrive after a notify_all.
+bool still_served(ServerHarness& h, Client& c)
+{
+    for (int i = 0; i < 200 && c.read_line(300ms); ++i) {}
+    if (c.was_closed_by_peer()) return false;
+    const size_t had = c.jobs.size();
+    h.notify_storm(1);
+    return c.collect_notifies(had + 1, 5000ms) && !c.was_closed_by_peer();
+}
+
+}  // namespace
+
+// The config main_ltc.cpp starts from (before CLI/YAML) has the BTC/DASH
+// protections on, with the BTC/DASH values; the per-IP cap stays opt-in.
+TEST(LtcStratumZombie, DefaultsTurnTheProtectionsOn)
+{
+    const auto c = ltc::default_stratum_config();
+    EXPECT_EQ(c.coin_symbol, "LTC");
+    EXPECT_TRUE(c.tcp_keepalive_enabled);
+    EXPECT_EQ(c.tcp_keepalive_idle_sec, 60u);
+    EXPECT_EQ(c.tcp_keepalive_interval_sec, 10u);
+    EXPECT_EQ(c.tcp_keepalive_count, 3u);
+    EXPECT_EQ(c.handshake_timeout_sec, 30u);
+    EXPECT_EQ(c.session_idle_timeout_sec, 1800u);
+    EXPECT_EQ(c.max_write_queue_depth, 256u);
+    EXPECT_EQ(c.keepalive_notify_sec, 25u);
+    EXPECT_EQ(c.max_stratum_connections, 100u);
+    EXPECT_EQ(c.max_stratum_connections_per_ip, 0u);
+}
+
+// A connection that never authorizes -- a bare TCP probe, or one that
+// subscribes and stops -- is closed at the authorize deadline. A miner that
+// authorizes is kept past it.
+TEST(LtcStratumZombie, NeverAuthorizingConnectionIsDroppedAtTheDeadline)
+{
+    ServerHarness h;
+    h.ws->cfg = ltc_config_short(/*handshake*/ 1, /*idle*/ 1800, /*keepalive notify*/ 25);
+    ASSERT_TRUE(h.start());
+
+    Client miner;
+    ASSERT_TRUE(miner.connect(h.port));
+    ASSERT_TRUE(miner.subscribe());
+    ASSERT_TRUE(miner.authorize("ltcminer1"));
+
+    const auto t0 = std::chrono::steady_clock::now();
+    Client probe;                       // connects, sends nothing
+    ASSERT_TRUE(probe.connect(h.port));
+    Client subscriber;                  // subscribes, never authorizes
+    ASSERT_TRUE(subscriber.connect(h.port));
+    ASSERT_TRUE(subscriber.subscribe());
+
+    EXPECT_TRUE(probe.wait_closed(6000ms)) << "a bare probe must not keep its slot";
+    EXPECT_TRUE(subscriber.wait_closed(6000ms)) << "a never-authorizing session must not keep its slot";
+    EXPECT_GE(seconds_since(t0), 0.9) << "closed at the deadline, not on accept";
+
+    // The authorized miner is past the deadline too and still served.
+    EXPECT_TRUE(still_served(h, miner)) << "authorize must disarm the deadline";
+}
+
+// The idle reaper counts INBOUND lines only. An unauthorized session that
+// sends nothing is reaped although the node keeps sending it keepalive
+// notifies; an unauthorized session that keeps talking is kept; an authorized
+// rig that sends nothing (a low hashrate on a high fixed difficulty) is kept,
+// because TCP keepalive -- on for LTC -- vouches for its socket.
+TEST(LtcStratumZombie, IdleReaperReapsInboundSilenceButKeepsAQuietRig)
+{
+    ServerHarness h;
+    // No authorize deadline here, so only the reaper can close a session. The
+    // reaper sweeps every max(15 s, min(60 s, timeout / 2)): first sweep at 15 s.
+    h.ws->cfg = ltc_config_short(/*handshake*/ 0, /*idle*/ 2, /*keepalive notify*/ 1);
+    ASSERT_TRUE(h.start());
+
+    Client rig;          // authorized, then silent
+    ASSERT_TRUE(rig.connect(h.port));
+    ASSERT_TRUE(rig.subscribe());
+    ASSERT_TRUE(rig.authorize("ltcminer1"));
+    Client zombie;       // subscribed, then silent (receives keepalive notifies)
+    ASSERT_TRUE(zombie.connect(h.port));
+    ASSERT_TRUE(zombie.subscribe());
+    Client talker;       // subscribed, never authorizes, keeps sending lines
+    ASSERT_TRUE(talker.connect(h.port));
+    ASSERT_TRUE(talker.subscribe());
+
+    const auto t0 = std::chrono::steady_clock::now();
+    bool zombie_closed = false;
+    int zombie_notifies = 0;
+    int ping = 100;
+    while (!zombie_closed && seconds_since(t0) < 22.0) {
+        talker.send_json({{"id", ping++}, {"method", "mining.extranonce.subscribe"},
+                          {"params", json::array()}});
+        const auto line = zombie.read_line(400ms);
+        if (line && line->find("mining.notify") != std::string::npos)
+            ++zombie_notifies;
+        zombie_closed = zombie.was_closed_by_peer();
+    }
+    EXPECT_TRUE(zombie_closed) << "an unauthorized session silent past the idle timeout must be reaped";
+    EXPECT_GE(zombie_notifies, 3) << "the zombie was sent keepalive notifies meanwhile";
+
+    // The quiet rig and the talker were swept over too and are still served.
+    EXPECT_TRUE(still_served(h, rig)) << "a quiet authorized rig must not be reaped";
+    EXPECT_TRUE(still_served(h, talker)) << "inbound lines must keep a session";
+}
+
+// At the miner cap a zombie (here: unauthorized and silent past the idle
+// timeout, before the 15 s reaper sweep and the 30 s authorize deadline) is
+// closed the moment a new connection arrives, and the new miner is admitted.
+// A live quiet rig is not touched, and a fresh session is not a zombie.
+TEST(LtcStratumZombie, AtTheCapAZombieMakesRoomForANewMiner)
+{
+    ServerHarness h;
+    h.ws->cfg = ltc_config_short(/*handshake*/ 30, /*idle*/ 2, /*keepalive notify*/ 25);
+    h.ws->cfg.max_stratum_connections = 2;
+    ASSERT_TRUE(h.start());
+
+    Client rig;
+    ASSERT_TRUE(rig.connect(h.port));
+    ASSERT_TRUE(rig.subscribe());
+    ASSERT_TRUE(rig.authorize("ltcminer1"));
+    Client zombie;
+    ASSERT_TRUE(zombie.connect(h.port));
+    ASSERT_TRUE(zombie.subscribe());
+
+    // Not idle yet: the cap holds.
+    Client early;
+    ASSERT_TRUE(early.connect(h.port));
+    EXPECT_FALSE(early.subscribe());
+    EXPECT_TRUE(early.was_closed_by_peer()) << "a session inside its idle window is not a zombie";
+    EXPECT_EQ(h.on_io([&] { return h.server->get_refused_connections(); }), 1u);
+
+    std::this_thread::sleep_for(2600ms);   // the zombie is now idle past 2 s
+
+    Client miner;
+    ASSERT_TRUE(miner.connect(h.port));
+    EXPECT_TRUE(miner.subscribe()) << "at the cap a zombie must make room for a new miner";
+    EXPECT_TRUE(miner.authorize("ltcminer2"));
+    EXPECT_TRUE(zombie.wait_closed(3000ms)) << "the zombie was the one closed";
+    EXPECT_EQ(h.on_io([&] { return h.server->get_refused_connections(); }), 1u);
+
+    EXPECT_TRUE(still_served(h, rig)) << "a quiet authorized rig is not a zombie";
+
+    // Both slots now hold live miners: the next connection is refused.
+    Client late;
+    ASSERT_TRUE(late.connect(h.port));
+    EXPECT_FALSE(late.subscribe());
+    EXPECT_TRUE(late.was_closed_by_peer());
+    EXPECT_EQ(h.on_io([&] { return h.server->get_refused_connections(); }), 2u);
+}
+
+// max_stratum_connections_per_ip: 0 (the default) leaves one address
+// unlimited; N refuses that address's (N+1)th live session, counted apart
+// from the node cap, while another address is still admitted and a freed
+// slot admits the address again.
+TEST(StratumPerIpCap, OneAddressCannotTakeEverySlot)
+{
+    ServerHarness h;
+    ASSERT_TRUE(h.start());
+
+    std::vector<std::unique_ptr<Client>> same;
+    for (int i = 0; i < 3; ++i) {
+        auto c = std::make_unique<Client>();
+        ASSERT_TRUE(c->connect(h.port));
+        ASSERT_TRUE(c->subscribe()) << "default per-IP cap 0 = unlimited (connection " << i << ")";
+        same.push_back(std::move(c));
+    }
+
+    // The server reads the config on the io thread at each accept.
+    h.on_io([&] { h.ws->cfg.max_stratum_connections_per_ip = 3; return 0; });
+    Client fourth;
+    ASSERT_TRUE(fourth.connect(h.port));
+    EXPECT_FALSE(fourth.subscribe());
+    EXPECT_TRUE(fourth.was_closed_by_peer()) << "a 4th session from one address must be refused";
+    EXPECT_EQ(h.on_io([&] { return h.server->get_refused_per_ip(); }), 1u);
+    EXPECT_EQ(h.on_io([&] { return h.server->get_refused_connections(); }), 0u)
+        << "per-IP refusals are not node-cap refusals";
+
+    Client other;
+    if (other.connect_from(h.port, "127.0.0.2")) {
+        EXPECT_TRUE(other.subscribe()) << "another address is still admitted";
+    } else {
+        std::cout << "[ SKIPPED part ] 127.0.0.2 not bindable here: other-address admission not checked\n";
+    }
+
+    same.front().reset();                 // free one of this address's slots
+    std::this_thread::sleep_for(300ms);   // let the server see the close
+    Client again;
+    ASSERT_TRUE(again.connect(h.port));
+    EXPECT_TRUE(again.subscribe()) << "a freed slot admits the address again";
+    EXPECT_EQ(h.on_io([&] { return h.server->get_refused_per_ip(); }), 1u);
+}
+
+// Refusal WARN lines are rate-limited (StratumConfig::refusal_log_interval_sec,
+// core/stratum_refusal_log.hpp): a reconnect storm against a full node gets
+// its first refusal logged at once and the rest in one summary line when the
+// window ends, while the refusal counter still counts every one.
+TEST(StratumRefusalLog, CapStormCountsEveryRefusalButLogsTwoLines)
+{
+    ServerHarness h;
+    h.ws->cfg.max_stratum_connections = 1;
+    h.ws->cfg.refusal_log_interval_sec = 3;
+    ASSERT_TRUE(h.start());
+
+    Client miner;
+    ASSERT_TRUE(miner.connect(h.port));
+    ASSERT_TRUE(miner.subscribe());
+
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < 20; ++i) {
+        Client c;
+        ASSERT_TRUE(c.connect(h.port));
+        ASSERT_TRUE(c.wait_closed(3000ms)) << "connection " << i << " must be refused";
+    }
+    const double storm_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    EXPECT_EQ(h.on_io([&] { return h.server->get_refused_connections(); }), 20u)
+        << "every refusal is counted";
+    if (storm_s < 2.5) {   // the storm fit in one window (it takes milliseconds)
+        EXPECT_EQ(h.on_io([&] { return h.server->get_refusal_lines_logged(); }), 1u)
+            << "only the first refusal is logged at once";
+    }
+
+    // The summary of the other 19 is written when the window ends, with no
+    // further refusal to trigger it.
+    uint64_t lines = 0;
+    for (int i = 0; i < 60 && lines < 2; ++i) {
+        std::this_thread::sleep_for(100ms);
+        lines = h.on_io([&] { return h.server->get_refusal_lines_logged(); });
+    }
+    std::this_thread::sleep_for(500ms);
+    lines = h.on_io([&] { return h.server->get_refusal_lines_logged(); });
+    if (storm_s < 2.5)
+        EXPECT_EQ(lines, 2u) << "one summary line for the rest of the window";
+    EXPECT_LE(lines, 3u) << "20 refusals must not write 20 lines";
+    EXPECT_EQ(h.on_io([&] { return h.server->get_refused_connections(); }), 20u);
+}
+
+// TCP liveness on an accepted stratum socket (core::apply_stratum_tcp_liveness,
+// which StratumSession::start() runs). Linux sends no keepalive probe while
+// sent data is unacknowledged, and an authorized rig is fed a notify every
+// keepalive_notify_sec, so behind a dead NAT only TCP_USER_TIMEOUT ends such
+// a session in minutes rather than after tcp_retries2 (~15 min). The default
+// applies to every coin that turns keepalive on (BTC and DASH leave it as is).
+TEST(StratumTcpLiveness, KeepaliveSocketGetsProbeTimingAndUserTimeout)
+{
+    EXPECT_EQ(core::stratum::StratumConfig{}.tcp_user_timeout_sec, 120u);
+    EXPECT_EQ(ltc::default_stratum_config().tcp_user_timeout_sec, 120u);
+#ifndef __linux__
+    GTEST_SKIP() << "per-probe tuning and TCP_USER_TIMEOUT are Linux socket options";
+#else
+    asio::io_context io;
+    tcp::acceptor acc(io, tcp::endpoint(asio::ip::make_address("127.0.0.1"), 0));
+    tcp::socket client(io);
+    tcp::socket server(io);
+    client.connect(acc.local_endpoint());
+    acc.accept(server);
+    const auto get = [&](int level, int opt) {
+        int v = -1;
+        socklen_t len = sizeof v;
+        if (::getsockopt(server.native_handle(), level, opt, &v, &len) != 0) return -2;
+        return v;
+    };
+
+    core::apply_stratum_tcp_liveness(server, core::stratum::StratumConfig{});   // keepalive off (DGB, BCH)
+    EXPECT_EQ(get(SOL_SOCKET, SO_KEEPALIVE), 0) << "keepalive off: the socket is left alone";
+    EXPECT_EQ(get(IPPROTO_TCP, TCP_USER_TIMEOUT), 0);
+
+    core::apply_stratum_tcp_liveness(server, ltc::default_stratum_config());
+    EXPECT_NE(get(SOL_SOCKET, SO_KEEPALIVE), 0);
+    EXPECT_EQ(get(IPPROTO_TCP, TCP_KEEPIDLE), 60);
+    EXPECT_EQ(get(IPPROTO_TCP, TCP_KEEPINTVL), 10);
+    EXPECT_EQ(get(IPPROTO_TCP, TCP_KEEPCNT), 3);
+    EXPECT_EQ(get(IPPROTO_TCP, TCP_USER_TIMEOUT), 120000)
+        << "unacknowledged data (the keepalive notifies) must not keep a dead peer for tcp_retries2";
+#endif
+}
+
+// The per-IP cap counts an IPv6 address by its /64 (one host is handed a whole
+// /64 and could rotate through it), an IPv4-mapped address as its IPv4
+// address, and an IPv4 address as itself.
+TEST(StratumPerIpCap, Ipv6CountsByItsSlash64)
+{
+    const auto key = [](const char* a) { return core::per_ip_cap_key(asio::ip::make_address(a)); };
+    EXPECT_EQ(key("2001:db8:1:2::10"), key("2001:db8:1:2:aaaa:bbbb:cccc:dddd"));
+    EXPECT_NE(key("2001:db8:1:2::10"), key("2001:db8:1:3::10"));
+    EXPECT_EQ(key("::ffff:203.0.113.7"), key("203.0.113.7"));
+    EXPECT_NE(key("203.0.113.7"), key("203.0.113.8"));
+    EXPECT_EQ(key("203.0.113.7"), asio::ip::make_address("203.0.113.7"));
 }

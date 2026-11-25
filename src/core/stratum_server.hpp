@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
+#include "merged_chain_addr.hpp"
+#include "stratum_http.hpp"
+#include "stratum_refusal_log.hpp"
 
 #include <memory>
 #include <string>
@@ -181,6 +184,12 @@ private:
         // of p2pool-dash work.py:477 grace (p2pool judges each share by its own
         // job's target). 0.0 = unset ⇒ gate falls back to the live vardiff.
         double issued_difficulty{0.0};
+        // The payout and merged scripts this job's ref_hash committed to: the
+        // share made from it carries these, whatever the session's login is
+        // by the time the miner submits.
+        bool has_payout{false};
+        std::vector<unsigned char> payout_script;
+        std::map<uint32_t, std::vector<unsigned char>> merged_scripts;
     };
     std::unordered_map<std::string, JobEntry> active_jobs_;
     // Insertion-order companion to active_jobs_ (interim hardening fix #1).
@@ -231,6 +240,14 @@ private:
     // to connected_at_.
     std::chrono::steady_clock::time_point last_notify_at_;
     std::string session_id_;
+    // The first inbound line has been read: only that one is checked for an
+    // HTTP request line (try_http_handoff). Empty lines before it are skipped
+    // while HTTP is on (RFC 9112 2.2), at most 4.
+    bool first_line_seen_ = false;
+    int blank_lines_skipped_ = 0;
+    // Remote address, read once at construction (the socket is connected
+    // then; remote_endpoint() fails after close). Keys the per-IP cap.
+    boost::asio::ip::address peer_address_;
 
     // Reject-reason diagnostics throttle: emit the low-diff (P5) and
     // malformed-params (P1) reject lines at most once per REJECT_LOG_INTERVAL
@@ -241,6 +258,28 @@ private:
 
     // Merged mining: per-chain payout addresses set by the miner.
     std::map<uint32_t, std::string> merged_addresses_;
+    // The ones sent with mining.set_merged_addresses: the only entries that
+    // outlive a re-authorize (the login's own are resolved again from it).
+    std::map<uint32_t, std::string> set_merged_addresses_;
+    // The last successful login's primary and the merged addresses it gave
+    // itself (not set_merged_addresses, not auto-derived): kept by a
+    // re-authorize with the same primary.
+    std::string login_primary_;
+    std::map<uint32_t, std::string> login_given_;
+    // The login has no payout address a share can carry (empty, invalid,
+    // another coin's) and the work source redistributes it: the jobs carry
+    // parent_script_ (p2pool's case 4) or an empty payout.
+    bool payout_unusable_{false};
+    std::vector<unsigned char> parent_script_;
+    std::string payout_warning_;   // shown with the worker ("address invalid → redistributed")
+    // The scriptPubKey a merged entry pays on its chain
+    // (core::merged_addr::merged_payout_script).
+    std::vector<unsigned char> merged_script_for(uint32_t chain_id, const std::string& addr) const;
+    bool testnet_network() const;
+    // The merged-chain identification table (built once per session).
+    const std::vector<core::merged_addr::ChainAddrInfo>& merged_table() const;
+    mutable std::vector<core::merged_addr::ChainAddrInfo> merged_table_;
+    mutable bool merged_table_built_{false};
 
     // BIP 310 version-rolling (ASICBoost) state
     static constexpr uint32_t POOL_VERSION_MASK = 0x1fffe000;
@@ -258,6 +297,17 @@ private:
     // value > 0. Parsed here only; consumers wire it per coin.
     std::optional<double> share_difficulty_override_;
 
+    // Difficulty last sent with mining.set_difficulty (internal units; 0 =
+    // none yet). send_notify_work() sends set_difficulty ahead of any job
+    // whose issued difficulty differs from it, so the miner hashes every job
+    // at the difficulty the job is judged and credited at.
+    double advertised_difficulty_ = 0.0;
+    // "d=N" in the mining.authorize password: the session's start difficulty,
+    // taken from the first successful authorize only; a bad value is logged
+    // once per session.
+    bool password_diff_applied_ = false;
+    bool password_diff_logged_ = false;
+
     // Periodic work-push timer — member (not shared_ptr) so RAII guarantees
     // the timer outlives all its callbacks.  Matches p2pool Twisted semantics
     // where the transport/protocol object owns its timers.
@@ -273,6 +323,31 @@ private:
     // sec): armed at start(), disarmed once authorize completes. A session that
     // never authorizes (half-open / probe) is dropped when it fires.
     boost::asio::steady_timer handshake_timer_;
+
+    // A held job (CoinbaseResult::held): one pending retry per session, for
+    // at most StratumConfig::job_hold_limit_sec since the hold began; past it
+    // the session stops retrying (the miner keeps its last valid job) until
+    // the next notify. hold_retry_clean_: a notify held meanwhile asked for
+    // clean jobs, so the next job sent does (the retry's, or one built first
+    // by another notify), also after the limit ended the retries.
+    bool hold_retry_pending_ = false;
+    bool hold_retry_clean_ = false;
+    std::chrono::steady_clock::time_point hold_since_{};
+    uint64_t hold_retries_ = 0;
+
+    // Work not ready (no template, a template without difficulty bits, or a
+    // job suppressed for want of an atomic snapshot / a real prevhash): one
+    // pending 1 s retry per session, however many notifies arrive meanwhile
+    // (template_retry_pending_ is set while its timer is armed and cleared
+    // only by its handler). template_waiting_: a wait is active (set by each
+    // not-ready exit, cleared once the work is ready); a retry that finds the
+    // wait over and nothing owed sends nothing. template_retry_clean_: a
+    // clean request is owed (made during the wait, or carried by a call that
+    // ended without a job), so the next job sent carries clean_jobs=true —
+    // the retry's, or one sent first by any other notify.
+    bool template_retry_pending_ = false;
+    bool template_waiting_ = false;
+    bool template_retry_clean_ = false;
 
 public:
     explicit StratumSession(tcp::socket socket, std::shared_ptr<IWorkSource> mining_interface,
@@ -292,6 +367,23 @@ public:
         return std::chrono::duration<double>(
                    std::chrono::steady_clock::now() - last_notify_at_).count();
     }
+    // Seconds since the TCP connection was accepted (handshake deadline).
+    double seconds_since_connect() const {
+        return std::chrono::duration<double>(
+                   std::chrono::steady_clock::now() - connected_at_).count();
+    }
+    const boost::asio::ip::address& peer_address() const { return peer_address_; }
+    // The idle reaper's rule (StratumConfig::session_idle_timeout_sec): no
+    // INBOUND line for more than timeout s (notifies sent to the miner do not
+    // count). With OS TCP keepalive on, an authorized session is never idle-
+    // reaped: keepalive is the liveness authority, and a rig on a high fixed
+    // difficulty can legitimately stay quiet past the window. 0 = off.
+    bool idle_reapable(uint32_t timeout, bool keepalive_on) const;
+    // Why this session may be closed now under cfg's hygiene knobs: past the
+    // handshake deadline without an authorize, or idle_reapable. nullptr =
+    // keep it. The miner cap uses it to free a slot at the moment a new
+    // connection would be refused (between reaper sweeps and timer firings).
+    const char* reclaim_reason(const core::stratum::StratumConfig& cfg) const;
     // Reap a stale/zombie session: cancel timers + close the socket. The pending
     // async_read then fails and runs the normal disconnect path. Idempotent.
     void drop_stale(const char* reason);
@@ -308,6 +400,29 @@ private:
     std::string generate_subscription_id();
     void read_message();
     void process_message(std::size_t bytes_read);
+    // HTTP on the stratum port (core/stratum_http.hpp): when the first line
+    // (bytes_read bytes at the front of buffer_) is an HTTP request line and
+    // the server has it on, leave the miner sessions, take an HTTP slot under
+    // the caps, and hand the socket plus everything buffered to the server's
+    // HTTP handler within the hand-off budget; answer 503 over the budget or
+    // the per-address share (busy), or when there is no handler or it
+    // declines (not served). true: the connection is no longer this
+    // session's -- stop reading.
+    bool try_http_handoff(std::size_t bytes_read);
+    // The first line so far is an empty line (CRLF / LF) and HTTP is on:
+    // consume it and keep looking for the request line. true: skipped.
+    bool skip_leading_blank_line(std::size_t bytes_read);
+    // The stratum side's 503 for an HTTP connection (`kind` picks the body),
+    // written on req->socket's io_context, then the close; the write is
+    // closed at min(req->deadline, write start +
+    // kStratumHttpUnavailableWriteTimeout). `req` (and its slot) is released
+    // when both the write and its deadline have completed.
+    static void answer_http_unavailable(std::shared_ptr<StratumHttpRequest> req,
+                                        const std::string& method, const std::string& target,
+                                        StratumHttpUnavailable kind);
+    // Test access (core_test).
+    friend struct StratumSessionTestAccess;
+
 
     nlohmann::json handle_subscribe(const nlohmann::json& params, const nlohmann::json& request_id);
     nlohmann::json handle_authorize(const nlohmann::json& params, const nlohmann::json& request_id);
@@ -335,6 +450,9 @@ public:
     // async handlers reference half-destroyed state when the io_context dies.
     void shutdown() { cancel_timers(); }
 private:
+    // The work is not ready: remember a clean request and arm the session's
+    // single 1 s retry unless one is already pending.
+    void retry_notify_when_work_ready(bool force_clean);
     void start_periodic_work_push();
     void schedule_work_push_timer();
     void cancel_timers();
@@ -344,8 +462,22 @@ private:
     void arm_handshake_timer();
 
     std::string generate_extranonce1();
-    void parse_address_separators(std::string& username, std::string& merged_addr_raw);
+    void parse_address_separators(std::string& username, std::string& merged_addr_raw,
+                                  std::set<uint32_t>* slash_chains = nullptr);
 };
+
+/// OS TCP liveness for one accepted stratum socket under cfg; a no-op unless
+/// cfg.tcp_keepalive_enabled. SO_KEEPALIVE everywhere; on Linux also the probe
+/// timing (TCP_KEEPIDLE/INTVL/CNT) and TCP_USER_TIMEOUT
+/// (StratumConfig::tcp_user_timeout_sec). Best-effort: an option the OS
+/// refuses is logged and skipped.
+void apply_stratum_tcp_liveness(tcp::socket& socket, const core::stratum::StratumConfig& cfg);
+
+/// What the per-IP cap (StratumConfig::max_stratum_connections_per_ip) counts
+/// by: the IPv4 address (an IPv4-mapped IPv6 address counts as its IPv4
+/// address), or the /64 of an IPv6 address -- one host is handed a whole /64
+/// and could otherwise rotate through it.
+boost::asio::ip::address per_ip_cap_key(const boost::asio::ip::address& a);
 
 /// Stratum Server — accepts TCP connections and spawns StratumSession per miner.
 class StratumServer
@@ -364,6 +496,9 @@ class StratumServer
     // STRICT per-node miner cap (interim hardening fix #5): connections refused
     // because sessions_.size() >= StratumConfig::max_stratum_connections.
     std::atomic<uint64_t> refused_connections_{0};
+    // Connections refused by StratumConfig::max_stratum_connections_per_ip
+    // (one remote address already holds that many live sessions).
+    std::atomic<uint64_t> refused_per_ip_{0};
 
     // Drain-mode admission gate (#866 action 2). Default true = the legacy
     // accept path, unchanged. false refuses every new connection regardless of
@@ -374,6 +509,21 @@ class StratumServer
     // Sessions dropped because an inbound line exceeded
     // StratumSession::kMaxStratumLineBytes without a '\n'.
     std::atomic<uint64_t> oversized_line_drops_{0};
+
+    // HTTP on the stratum port (core/stratum_http.hpp). Off until set_http().
+    // http_state_ counts the live HTTP connections (total and per cap key;
+    // the connection caps count them) and rate-limits their log lines; it is
+    // shared with each connection's slot.
+    struct HttpState;
+    std::shared_ptr<HttpState> http_state_;
+    mutable std::mutex http_mutex_;
+    bool http_on_ = false;
+    StratumHttpHandler http_handler_;
+    StratumHttpLimits http_limits_;
+    // HTTP requests answered 503 because the hand-off budget, or the
+    // per-address share, was in use.
+    std::atomic<uint64_t> refused_http_budget_{0};
+    std::atomic<uint64_t> refused_http_share_{0};
 
     // p2pool RateMonitor pair (work.py:223-226):
     //   local_rate_monitor: per-user hashrate (for get_local_rates)
@@ -394,6 +544,22 @@ class StratumServer
     // Disarmed (never scheduled) when the timeout is 0 -> legacy no-op.
     boost::asio::steady_timer idle_reap_timer_;
     void start_idle_reaper();
+
+    // Rate-limited refusal WARN lines (StratumConfig::refusal_log_interval_sec):
+    // one limiter per cap; the timer emits a pending summary when its window
+    // ends even if no further refusal arrives. io-thread state.
+    RefusalLogLimiter cap_refusal_log_;
+    RefusalLogLimiter per_ip_refusal_log_;
+    RefusalLogLimiter http_budget_refusal_log_;
+    RefusalLogLimiter http_share_refusal_log_;
+    boost::asio::steady_timer refusal_log_timer_;
+    std::optional<RefusalLogLimiter::clock::time_point> refusal_log_timer_due_;   // armed for
+    std::atomic<uint64_t> refusal_lines_logged_{0};
+    void log_refusal(RefusalLogLimiter& lim, const std::string& peer_ip,
+                     const std::string& peer, const std::string& detail,
+                     const char* total_name, uint64_t total);
+    void flush_refusal_logs();
+    void arm_refusal_log_timer();
 
 public:
     StratumServer(net::io_context& ioc, const std::string& address, uint16_t port, std::shared_ptr<IWorkSource> mining_interface);
@@ -443,11 +609,82 @@ public:
 
     /// Connections refused by the strict per-node miner cap (fix #5).
     uint64_t get_refused_connections() const { return refused_connections_.load(); }
+    /// Connections refused by the per-source-IP cap.
+    uint64_t get_refused_per_ip() const { return refused_per_ip_.load(); }
+    /// Refusal WARN lines written (full + summary), both caps: rate-limited,
+    /// unlike the refusal counters.
+    uint64_t get_refusal_lines_logged() const { return refusal_lines_logged_.load(); }
     /// Sessions dropped for an over-length line (no '\n' within the cap).
     uint64_t get_oversized_line_drops() const { return oversized_line_drops_.load(); }
     void record_oversized_line_drop() { oversized_line_drops_.fetch_add(1); }
     /// Live session count (dead sessions pruned lazily — see notify_all()).
+    /// Miner sessions only: an HTTP request on the stratum port leaves the
+    /// sessions once its first line is read (get_http_connection_count).
     size_t get_session_count() const;
+
+    /// HTTP on the stratum port (core/stratum_http.hpp). on=false (the
+    /// default) keeps the legacy behaviour: an HTTP request line is just an
+    /// invalid stratum line. on=true with a handler hands HTTP connections to
+    /// it, within the hand-off budget of `limits` (stratum_http_budget); over
+    /// it, and with no handler (or one that declines), they are answered 503.
+    /// Any thread; applies to connections whose first line arrives after.
+    void set_http(bool on, StratumHttpHandler handler, StratumHttpLimits limits = {});
+    bool http_on() const;
+    struct HttpConfig {
+        bool on = false;
+        StratumHttpHandler handler;
+        StratumHttpLimits limits;
+    };
+    /// The switch, handler and limits as of now (sessions read them on the io
+    /// thread).
+    HttpConfig http_config() const;
+    /// max_stratum_connections as of now (0: no cap).
+    std::size_t connection_cap() const;
+    /// Live HTTP connections taken from this port (they count toward
+    /// max_stratum_connections and the per-IP cap, never as sessions).
+    size_t get_http_connection_count() const;
+    /// HTTP connections handed over (or answered 503) since start.
+    uint64_t get_http_requests() const;
+    /// HTTP log lines written (rate-limited: full + summary).
+    uint64_t get_http_log_lines() const;
+    /// Failed-request warning lines written (rate-limited: full + summary).
+    uint64_t get_http_error_log_lines() const;
+    /// One HTTP connection's place under the caps; a hand-off slot also holds
+    /// one unit of the hand-off budget, in total and for its per_ip_cap_key.
+    /// Released when its last owner drops it.
+    struct HttpSlot;
+    /// A slot for one HTTP connection from `peer` under the caps; released
+    /// when the returned pointer's last copy goes.
+    std::shared_ptr<void> acquire_http_slot(const boost::asio::ip::address& peer);
+    enum class HttpRefusal { None, Budget, Share };
+    struct HttpHandoff {
+        std::shared_ptr<void> slot;              // null when refused
+        HttpRefusal refusal = HttpRefusal::None;
+    };
+    /// One step under one lock: a hand-off slot for `peer` when fewer than
+    /// stratum_http_budget(cap, ...).handoffs hand-offs are in progress and
+    /// fewer than .per_key from per_ip_cap_key(peer); else the refusal kind
+    /// and no slot. A granted slot counts one request.
+    HttpHandoff try_acquire_http_handoff(const boost::asio::ip::address& peer, std::size_t cap,
+                                         const StratumHttpLimits& limits);
+    /// Count and log (rate-limited) one HTTP request answered 503 for
+    /// `refusal`. Call on the io thread.
+    void record_http_refusal(HttpRefusal refusal, const std::string& peer_ip, std::size_t cap,
+                             const StratumHttpLimits& limits);
+    /// HTTP requests answered 503 for the hand-off budget / the per-address
+    /// share since start.
+    uint64_t get_http_refused_budget() const { return refused_http_budget_.load(); }
+    uint64_t get_http_refused_share() const { return refused_http_share_.load(); }
+    /// Hand-offs in progress; the most at once since start; keys with one or
+    /// more in progress.
+    size_t get_http_handoffs() const;
+    size_t get_http_handoffs_peak() const;
+    size_t get_http_handoff_keys() const;
+    /// The per-request log callback for an HTTP connection from `peer_ip`.
+    std::function<void(const std::string&, const std::string&, unsigned)>
+    http_response_logger(const std::string& peer_ip) const;
+    /// The failed-request log callback for an HTTP connection from `peer_ip`.
+    std::function<void(const std::string&)> http_error_logger(const std::string& peer_ip) const;
 
     /// Drain-mode hooks (#866 action 2). Default-inert: while accepting is true
     /// (the default) nothing changes. set_accepting(false) closes each new

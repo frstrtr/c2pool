@@ -191,6 +191,67 @@ inline bool is_hex256(const std::string& s)
     return true;
 }
 
+/// Hex string -> bytes; empty on any non-hex character or odd length.
+inline std::vector<unsigned char> hex_bytes(const std::string& h)
+{
+    std::vector<unsigned char> out;
+    if (h.size() % 2) return {};
+    auto nib = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    for (size_t i = 0; i < h.size(); i += 2) {
+        const int a = nib(h[i]), b = nib(h[i + 1]);
+        if (a < 0 || b < 0) return {};
+        out.push_back(static_cast<unsigned char>((a << 4) | b));
+    }
+    return out;
+}
+
+/// Dash Core v24 state JSON (CDeterministicMNState::ToJson): a version-3
+/// state reports `payouts` [{address, script, reward}] or, for a shared
+/// masternode, `shares` [{amount, refundScript, rewardScript, ownerAddress,
+/// ...}] with `earlyPeriodBlocks` / `earlyPenalty`, instead of
+/// `payoutAddress`. The scripts are given as hex, so no address decoding is
+/// needed for them; a share's owner key is the hash of its P2PKH owner
+/// address. `rewardScript` is the EFFECTIVE reward script (the refund script
+/// when none is set); it is stored as such, which pays identically. Returns
+/// false on anything missing or malformed (the caller aborts the seed).
+inline bool read_v24_payouts(const nlohmann::json& s, MNState& mn,
+                             uint8_t address_version, uint8_t address_p2sh_version)
+{
+    if (s.contains("shares") && s["shares"].is_array() && !s["shares"].empty()) {
+        for (const auto& j : s["shares"]) {
+            if (!j.is_object() || !j.contains("amount") || !j["amount"].is_number_integer()) return false;
+            vendor::CCollateralShare sh;
+            sh.amount = j["amount"].get<int64_t>();
+            sh.scriptRefund.m_data = hex_bytes(j.value("refundScript", ""));
+            sh.scriptReward.m_data = hex_bytes(j.value("rewardScript", ""));
+            const auto owner = payout_address_to_script(j.value("ownerAddress", ""), address_version,
+                                                        address_p2sh_version);
+            if (sh.scriptRefund.m_data.empty() || sh.scriptReward.m_data.empty() || owner.size() != 25)
+                return false;
+            std::copy(owner.begin() + 3, owner.begin() + 23, sh.keyIDOwner.data());
+            mn.v24.shares.push_back(std::move(sh));
+        }
+        mn.v24.nEarlyPeriodBlocks = s.value("earlyPeriodBlocks", 0u);
+        mn.v24.nEarlyPenalty = s.value("earlyPenalty", int64_t{0});
+        return true;
+    }
+    if (!s.contains("payouts") || !s["payouts"].is_array() || s["payouts"].empty()) return false;
+    for (const auto& j : s["payouts"]) {
+        if (!j.is_object() || !j.contains("reward") || !j["reward"].is_number_integer()) return false;
+        vendor::MasternodePayoutShare po;
+        po.scriptPayout.m_data = hex_bytes(j.value("script", ""));
+        po.reward = j["reward"].get<uint16_t>();
+        if (po.scriptPayout.m_data.empty()) return false;
+        mn.v24.payouts.push_back(std::move(po));
+    }
+    return true;
+}
+
 } // namespace detail
 
 /// Convert a dashd `protx list valid true` (detailed) JSON array into the
@@ -306,10 +367,23 @@ inline std::vector<std::pair<uint256, MNState>> parse_protx_list_seed(
         mn.isValid = (mn.nPoSeBanHeight == 0);
         if (!mn.isValid) ++st.pose_banned;
 
+        // Dash Core v24: a version-3 state carries a payout list or a share
+        // table instead of payoutAddress.
+        if (mn.nVersion >= vendor::ProTxVersion::EXT_ADDR) {
+            if (!detail::read_v24_payouts(s, mn, address_version, address_p2sh_version)) {
+                ++st.payout_decode_failed;
+                LOG_WARNING << "[MN-SEED] version-" << mn.nVersion << " state of proTx "
+                            << proTxHash.GetHex().substr(0, 16)
+                            << " has no decodable payouts/shares -- seed aborted (fail-closed)";
+                if (stats) *stats = st;
+                return {};
+            }
+        }
         // THE payee keystone: payoutAddress -> scriptPayout, byte-exact.
+        if (mn.nVersion < vendor::ProTxVersion::EXT_ADDR)
         mn.scriptPayout.m_data = detail::payout_address_to_script(
             s.value("payoutAddress", ""), address_version, address_p2sh_version);
-        if (mn.scriptPayout.m_data.empty()) {
+        if (mn.nVersion < vendor::ProTxVersion::EXT_ADDR && mn.scriptPayout.m_data.empty()) {
             ++st.payout_decode_failed;
             LOG_WARNING << "[MN-SEED] undecodable payoutAddress '"
                         << s.value("payoutAddress", "") << "' for proTx "

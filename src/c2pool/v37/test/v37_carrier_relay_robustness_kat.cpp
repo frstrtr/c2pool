@@ -85,6 +85,7 @@ static int g_checks = 0;
     } while (0)
 
 static const ChainId CHAIN = 1;
+static const ChainId NO_LANE = CHAIN + 1;   // no lane is ever added for it
 
 static LaneParams small_params() {
     LaneParams p;
@@ -192,7 +193,26 @@ struct Node {
         return (s && s->identities) ? s->identities->size() : 0;
     }
     std::uint64_t pushes() const { return ingest->pushes_forwarded(); }
+    // Engine settle point: records apply and publish in FIFO order, so when this
+    // tracked record resolves every record submitted before it is visible
+    // through snapshot(). A rewind on a chain with no lane changes nothing.
+    void settle_engine() {
+        (void)engine.submit_tracked(LaneRecord::rewind(NO_LANE, 0)).get();
+    }
 };
+
+// Link settle point: a control frame written after everything `from` has sent
+// `to`. `to` binds no control handler, so its reader only counts the frame, and
+// it handles frames in arrival order: once the count moves, every earlier
+// frame's handler has returned. Then `to`'s engine publishes what they submitted.
+static bool settle_link(Node& from, Node& to) {
+    const std::uint64_t before = to.net->ctrl_frames_ignored();
+    if (from.net->broadcast(std::vector<std::uint8_t>{0xff}) != 1) return false;
+    if (!wait_until([&] { return to.net->ctrl_frames_ignored() == before + 1; }))
+        return false;
+    to.settle_engine();
+    return true;
+}
 
 // A re-offer configuration with the rate limits opened up, so a sweep is
 // deterministic in a test. The BOUNDS under test (entries / bytes / attempts /
@@ -261,7 +281,8 @@ static void test_rr1_reoffer_after_reconnect() {
     // Sweep again and again: no double count anywhere.
     const ::v37::bytes32 d_after = B2.lane_digest();
     for (int i = 0; i < 3; ++i) (void)A.relay->reoffer_tick();
-    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    CHECK(settle_link(A, B2));
+    A.settle_engine();
     CHECK(B2.raw_total() == w);
     CHECK(B2.next_pos() == 1);
     CHECK(B2.pushes() == 1);
@@ -318,7 +339,8 @@ static void test_rr2_reoffer_is_reject_dedup() {
         CHECK(again.admission.pushes.empty());                     // ★ zero pushes
         CHECK(!again.relayed);                                     // no amplification
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    // Each handle_inbound above returned on this thread; settle the engine.
+    B.settle_engine();
 
     // Byte-identical consensus state.
     CHECK(B.raw_total() == raw_before);
@@ -360,7 +382,7 @@ static void test_rr3_bounds_hold_the_horizon() {
         CHECK(A.relay->reoffer_pending() == 0);
         CHECK(A.relay->reoffer_stats().expired_age == 1);
         CHECK(A.relay->reoffer_stats().frames_reoffered == 0);
-        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        CHECK(settle_link(A, B));
         CHECK(B.raw_total() == 0);                           // B never saw it
         CHECK(B.next_pos() == 0);
     }
@@ -424,7 +446,7 @@ static void test_rr3_bounds_hold_the_horizon() {
 
         // Two deliveries of one carrier, still ONE credit on B.
         CHECK(wait_until([&] { return B.next_pos() == 1; }));
-        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        CHECK(settle_link(A, B));
         CHECK(B.next_pos() == 1);
         CHECK(B.raw_total() == s.work());
         CHECK(B.pushes() == 1);
@@ -614,7 +636,7 @@ static void test_rr6_send_worker_tick_and_probe() {
         CHECK(got);
         CHECK(q.stats().reoffered >= 1);
         q.stop();
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        CHECK(settle_link(A, B));
         CHECK(B.next_pos() == 1);                     // still exactly one credit
         CHECK(B.raw_total() == s.work());
         CHECK(B.pushes() == 1);
@@ -643,7 +665,7 @@ static void test_rr6_send_worker_tick_and_probe() {
         CHECK(A.relay->reoffer_tick() == 0);
         CHECK(A.relay->reoffer_pending() == 0);
         CHECK(A.relay->reoffer_stats().expired_window == 1);
-        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        CHECK(settle_link(A, B));
         CHECK(B.next_pos() == 0);                      // nothing offered, nothing credited
     }
 }

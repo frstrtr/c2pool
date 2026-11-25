@@ -10,7 +10,7 @@
 /// lane's note_persist doctrine: persisted == delivered + folded):
 ///
 ///   key 'R'              — the CRangesSet equivalent:
-///                          [1B schema_ver=1][varint n_ranges]
+///                          [1B schema_ver=2][varint n_ranges]
 ///                          [n × (8B u64 start LE, 8B u64 end_exclusive LE)]
 ///                          ranges sorted, disjoint, non-adjacent — the
 ///                          canonical compact form of every mined unlock index
@@ -18,10 +18,12 @@
 ///   key 'w' + [4B height]— per-block window rows (key height BIG-endian so a
 ///                          prefix scan walks ascending heights):
 ///                          [8B int64 gross_unlocked LE][4B u32 n_type9 LE]
+///                          [8B int64 balance LE] (schema 2: the cbTx
+///                          creditPoolBalance after the block)
 ///                          for each of the last (window+1)=577 heights;
 ///                          rows below cursor−577 pruned in the same batch.
 ///   key 'C'              — cursor / attestation:
-///                          [1B schema_ver=1][4B height LE][32B block_hash]
+///                          [1B schema_ver=2][4B height LE][32B block_hash]
 ///                          [8B int64 computed_balance LE][1B proven_complete]
 ///                          [1B era (0=pre-v22, 1=v22, 2=v24)]
 ///                          computed_balance MUST equal the cbTx
@@ -71,12 +73,16 @@ struct CpIdxSeedProvenance {
 struct CpIdxWindowRowRec {
     int64_t  gross_unlocked{0};
     uint32_t n_type9{0};
+    int64_t  balance{0};   ///< schema 2: the cbTx creditPoolBalance after the block (Dash Core v24 limit)
 };
 
 class CreditPoolIdxDb
 {
 public:
-    static constexpr uint8_t kSchemaVer = 1;
+    /// 2: window rows carry the block's pool balance (Dash Core v24
+    /// UnlockLimitV24 reads the balance at the window start). A schema-1
+    /// namespace fails to load, so it is wiped and re-seeded from the floor.
+    static constexpr uint8_t kSchemaVer = 2;
 
     explicit CreditPoolIdxDb(const std::string& db_path,
                              const ::core::LevelDBOptions& opts = {})
@@ -125,7 +131,7 @@ public:
         const bool scan_ok = m_store.for_each_prefix(
             std::string(1, 'w'),
             [&](const std::string& key, const std::vector<uint8_t>& value) {
-                if (key.size() != 5 || value.size() != 12) { rows_ok = false; return false; }
+                if (key.size() != 5 || value.size() != 20) { rows_ok = false; return false; }
                 const uint32_t h = (uint32_t(uint8_t(key[1])) << 24)
                                  | (uint32_t(uint8_t(key[2])) << 16)
                                  | (uint32_t(uint8_t(key[3])) <<  8)
@@ -136,6 +142,9 @@ public:
                 row.gross_unlocked = static_cast<int64_t>(u);
                 row.n_type9 = uint32_t(value[8]) | (uint32_t(value[9]) << 8)
                             | (uint32_t(value[10]) << 16) | (uint32_t(value[11]) << 24);
+                uint64_t b = 0;
+                for (int i = 0; i < 8; ++i) b |= uint64_t(value[12 + i]) << (8 * i);
+                row.balance = static_cast<int64_t>(b);
                 window_rows[h] = row;
                 return true;
             });
@@ -294,6 +303,7 @@ public:
         std::vector<uint8_t> out;
         put_u64(out, static_cast<uint64_t>(r.gross_unlocked));
         put_u32(out, r.n_type9);
+        put_u64(out, static_cast<uint64_t>(r.balance));
         return out;
     }
 

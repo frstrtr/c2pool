@@ -525,6 +525,14 @@ inline ShadowOutcome shadow_evaluate(WorkSource source,
             ecb.merkleRootQuorums.GetHex(), dcb.merkleRootQuorums.GetHex());
         add("cbtx_version", /*commitment=*/false,
             std::to_string(ecb.nVersion), std::to_string(dcb.nVersion));
+        // Dash Core v24 CbTx version 4: the unlock root is TX-SET-DEPENDENT
+        // (the body's v2 asset unlocks), so it is never a commitment-trio
+        // member here; a difference between equal bodies shows in the
+        // block-level merkle root instead.
+        if (ecb.nVersion >= vendor::CCbTx::VERSION_MERKLE_ROOT_ASSETUNLOCKS
+            && dcb.nVersion >= vendor::CCbTx::VERSION_MERKLE_ROOT_ASSETUNLOCKS)
+            add("merkleRootAssetUnlocks", /*commitment=*/false,
+                ecb.merkleRootAssetUnlocks.GetHex(), dcb.merkleRootAssetUnlocks.GetHex());
         add("cbtx_height",  /*commitment=*/false,
             std::to_string(ecb.nHeight),  std::to_string(dcb.nHeight));
     } else {

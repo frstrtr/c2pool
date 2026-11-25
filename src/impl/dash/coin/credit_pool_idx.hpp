@@ -24,7 +24,7 @@
 ///     duplicated").
 ///   * per-block gross-unlocked rows for the sliding CreditPoolPeriodBlocks
 ///     (=576) latelyUnlocked window (:180-189).
-///   * the era ladder — pre-v22 / WITHDRAWALS(2000 DASH) / V24(4000 DASH),
+///   * the era ladder — pre-v22 / WITHDRAWALS(2000 DASH) / V24 (UnlockLimitV24),
 ///     :192-203, constants creditpool.h:124-127 — gated on the buried
 ///     chainparams deployment heights ported below.
 ///
@@ -63,6 +63,8 @@
 
 #include <impl/dash/coin/credit_pool.hpp>
 #include <impl/dash/coin/credit_pool_idx_db.hpp>
+#include <impl/dash/coin/dash_deployments.hpp>    // DashNetwork
+#include <impl/dash/coin/deployment_status.hpp>   // v24_state (Dash Core v24)
 #include <impl/dash/coin/asset_unlock_admission.hpp>
 #include <impl/dash/coin/asset_unlock_verify.hpp>
 #include <impl/dash/coin/asset_lock_fold.hpp>     // money_in_range
@@ -179,20 +181,44 @@ public:
 inline constexpr int64_t kCpLimitAmountLow  = 100  * COIN_SAT;
 inline constexpr int64_t kCpLimitAmountHigh = 1000 * COIN_SAT;
 inline constexpr int64_t kCpLimitAmountV22  = 2000 * COIN_SAT;
-inline constexpr int64_t kCpLimitAmountV24  = 4000 * COIN_SAT;
 
-/// "Not activated" sentinel for a deployment with no buried height yet
-/// (DEPLOYMENT_V24 is versionbits NEVER_ACTIVE on mainnet/testnet at this
-/// dashd pin — chainparams.cpp:213/:412). Fail-safe direction: treating an
-/// actually-active era as inactive only makes OUR limit stricter (a smaller
-/// template), never an invalid block.
+/// Dash Core v24.0.0 CCreditPoolManager (evo/creditpool.h): the v24 limit is a
+/// net rule on the pool balance.
+inline constexpr int64_t kCpMaxUnlockDropPercentV24 = 20;
+inline constexpr int64_t kCpMinUnlockDropV24        = 2000 * COIN_SAT;
+
+/// CCreditPoolManager::UnlockLimitV24: the total the v24 rule admits in the
+/// block after one whose pool balance is `balance`, given the balance
+/// `balance_window_start` CreditPoolPeriodBlocks earlier (0 when that block
+/// has no credit pool). Integer arithmetic exactly as Core.
+constexpr int64_t cp_unlock_limit_v24(int64_t balance, int64_t balance_window_start)
+{
+    const int64_t pct = balance_window_start * kCpMaxUnlockDropPercentV24 / 100;
+    const int64_t allowed_drop = pct > kCpMinUnlockDropV24 ? pct : kCpMinUnlockDropV24;
+    const int64_t room = allowed_drop - (balance_window_start - balance);
+    const int64_t floored = room > 0 ? room : 0;
+    return floored < balance ? floored : balance;
+}
+
+/// CAssetUnlockPayload::CURRENT_VERSION in Dash Core v24: version 2 (the
+/// stable-txid unlock) is valid once DEPLOYMENT_V24 is active.
+inline constexpr uint8_t kAssetUnlockMaxVersionV24 = 2;
+
+/// "No explicit height" for DEPLOYMENT_V24: the era then comes from the
+/// deployment status (deployment_status.hpp v24_state for the schedule's
+/// network). There is NO safe default: the v24 rule is net (UnlockLimitV24
+/// subtracts the drop already taken in the window), so it can be STRICTER
+/// than the v22 cap of 2000 DASH. Treating an active era as v22 could admit
+/// an unlock Dash Core v24 rejects (failed-creditpool-unlock-too-much), so an
+/// UNKNOWN v24 state refuses every unlock.
 inline constexpr uint32_t kCpIdxNeverActive = 0xFFFFFFFFu;
 
 struct CpIdxDeploySchedule {
     uint32_t v20_floor_height;     // trustless seed floor (set empty below it)
     uint32_t withdrawals_height;   // DEPLOYMENT_WITHDRAWALS buried height (v22)
-    uint32_t v24_height;           // DEPLOYMENT_V24 (kCpIdxNeverActive = not yet)
+    uint32_t v24_height;           // DEPLOYMENT_V24 explicit height (kCpIdxNeverActive: ask the status)
     uint32_t window_blocks{576};   // Params().CreditPoolPeriodBlocks()
+    DashNetwork network{DashNetwork::MAINNET};   // whose v24 status to ask
 };
 
 /// Mainnet: V20 buried @1,987,776 (block 000000000000001bf41cff06b76780
@@ -204,20 +230,35 @@ inline constexpr CpIdxDeploySchedule kCpIdxScheduleMainnet{
 /// Testnet: V20 @905,100 (subsidy.hpp:55); WITHDRAWALS @1,148,500
 /// (chainparams.cpp:395); V24 not activated.
 inline constexpr CpIdxDeploySchedule kCpIdxScheduleTestnet{
-    905'100u, 1'148'500u, kCpIdxNeverActive, 576u};
+    905'100u, 1'148'500u, kCpIdxNeverActive, 576u, DashNetwork::TESTNET};
 
 enum class CpIdxEra : uint8_t { PreV22 = 0, V22 = 1, V24 = 2 };
 
-inline CpIdxEra cp_idx_era_at(const CpIdxDeploySchedule& s, uint32_t height)
+/// Whether DEPLOYMENT_V24 is active for the block at `height`
+/// (DeploymentActiveAt), nullopt when that is not known.
+inline std::optional<bool> cp_idx_v24_active_at(const CpIdxDeploySchedule& s, uint32_t height)
 {
-    if (height >= s.v24_height)         return CpIdxEra::V24;
+    if (s.v24_height != kCpIdxNeverActive) return height >= s.v24_height;
+    const V24State st = v24_state(s.network, height);
+    if (st == V24State::UNKNOWN) return std::nullopt;
+    return st == V24State::ACTIVE;
+}
+
+/// The era of the credit pool of the block at `height` (Dash Core
+/// ConstructCreditPool: DeploymentActiveAt(block_index, ...)), nullopt when
+/// the v24 state of that block is not known.
+inline std::optional<CpIdxEra> cp_idx_era_at(const CpIdxDeploySchedule& s, uint32_t height)
+{
+    const auto v24 = cp_idx_v24_active_at(s, height);
+    if (!v24) return std::nullopt;
+    if (*v24)                           return CpIdxEra::V24;
     if (height >= s.withdrawals_height) return CpIdxEra::V22;
     return CpIdxEra::PreV22;
 }
 
 /// dashd ConstructCreditPool's era-laddered withdrawal limit
-/// (evo/creditpool.cpp:192-212), verbatim arithmetic:
-///   V24 active:          max(0, min(pool, 4000 − lately))
+/// (evo/creditpool.cpp, Dash Core v24.0.0), verbatim arithmetic:
+///   V24 active:          UnlockLimitV24(pool, pool 576 blocks earlier)
 ///   WITHDRAWALS active:  min(pool, 2000)
 ///   pre-v22:             "max(100, min(.10 · pool, 1000)) inside window":
 ///                        if pool + lately > 100:
@@ -226,12 +267,13 @@ inline CpIdxEra cp_idx_era_at(const CpIdxDeploySchedule& s, uint32_t height)
 /// A NEGATIVE result mirrors the dashd throw ("Negative limit for
 /// CreditPool") — returned as nullopt so the caller fails closed.
 inline std::optional<int64_t>
-cp_idx_current_limit(int64_t pool_balance, int64_t lately_unlocked, CpIdxEra era)
+cp_idx_current_limit(int64_t pool_balance, int64_t lately_unlocked, CpIdxEra era,
+                     int64_t balance_window_start = 0)
 {
     int64_t limit = pool_balance;
     switch (era) {
     case CpIdxEra::V24:
-        limit = std::max<int64_t>(0, std::min(limit, kCpLimitAmountV24 - lately_unlocked));
+        limit = cp_unlock_limit_v24(pool_balance, balance_window_start);
         break;
     case CpIdxEra::V22:
         limit = std::min(limit, kCpLimitAmountV22);
@@ -253,7 +295,9 @@ cp_idx_current_limit(int64_t pool_balance, int64_t lately_unlocked, CpIdxEra era
 class CreditPoolIdxFollower
 {
 public:
-    struct WindowRow { int64_t gross_unlocked{0}; uint32_t n_type9{0}; };
+    /// `balance`: the cbTx creditPoolBalance after that block (the v24 rule
+    /// reads the balance at the window start).
+    struct WindowRow { int64_t gross_unlocked{0}; uint32_t n_type9{0}; int64_t balance{0}; };
 
     /// Platform-share accrual per height (the reward term the scalar balance
     /// needs — credit_pool.hpp apply_block's reward_accrual). Injectable for
@@ -280,8 +324,10 @@ public:
              int64_t seed_wallclock = 0)
     {
         wipe_memory();
+        m_full_history = true;
         m_height = m_sched.v20_floor_height;
         m_hash   = floor_hash;
+        m_floor_balance = floor_balance;
         m_scalar.seed(floor_balance, m_height);
         m_armed = true;
         m_proven_complete = false;
@@ -298,6 +344,39 @@ public:
                  << " hash=" << floor_hash.GetHex().substr(0, 16)
                  << " balance=" << floor_balance << " (empty set, lately=0)";
     }
+
+    /// ARM a WINDOW seed at `height`, a recent block whose committed CbTx
+    /// creditPoolBalance is `balance`. From there the balance, latelyUnlocked
+    /// and the window-start balance (Dash Core v24 UnlockLimitV24) are exact
+    /// once CreditPoolPeriodBlocks + 1 blocks have been applied. The unlock
+    /// INDEX set is not: a duplicate-index check (CheckAssetUnlockTx
+    /// bad-assetunlock-duplicated-index) needs every unlock since v20, so a
+    /// window-seeded follower never permits admission (accrual_permitted).
+    /// Memory only: never attach a store to a window seed.
+    void arm_window(uint32_t height, const uint256& hash, int64_t balance)
+    {
+        wipe_memory();
+        m_full_history = false;
+        m_window_floor = height;
+        m_height = height;
+        m_hash = hash;
+        m_floor_balance = balance;
+        m_scalar.seed(balance, height);
+        m_armed = true;
+        m_proven_complete = false;
+        m_fail_cause.clear();
+        LOG_INFO << "[CP-IDX] armed a WINDOW seed at h=" << height << " "
+                 << hash.GetHex().substr(0, 16) << " balance=" << balance
+                 << " (balance history and limit only; unlock admission needs the full"
+                    " seed from the v20 floor)";
+    }
+
+    /// Forget everything (in memory; a store is left to the next arm()).
+    void reset() { wipe_memory(); }
+
+    /// True when the follower was seeded from the v20 floor (the index set is
+    /// complete); false for a window seed.
+    bool full_history() const { return m_full_history; }
 
     /// Resume from the persisted namespace. Returns true when a complete,
     /// well-formed state was restored (cursor NOT yet bridged to the live
@@ -348,8 +427,20 @@ public:
                 m_db->wipe();
                 return false;
             }
-            m_window[h] = WindowRow{it->second.gross_unlocked, it->second.n_type9};
+            m_window[h] = WindowRow{it->second.gross_unlocked, it->second.n_type9,
+                                    it->second.balance};
             lately += it->second.gross_unlocked;
+        }
+        // The row at the window start itself (cursor − window) is not part of
+        // latelyUnlocked, but Dash Core v24's UnlockLimitV24 reads its balance
+        // (distant_block_index). Keep it when the store has it; without it
+        // the v24 limit fails closed until the window slides one block.
+        if (cursor.height > m_sched.window_blocks) {
+            const uint32_t h0 = cursor.height - m_sched.window_blocks;
+            auto it = rows.find(h0);
+            if (h0 > m_sched.v20_floor_height && it != rows.end())
+                m_window[h0] = WindowRow{it->second.gross_unlocked, it->second.n_type9,
+                                         it->second.balance};
         }
         m_lately_unlocked = lately;
         m_height = cursor.height;
@@ -443,7 +534,7 @@ public:
         int64_t out_gross = 0;
         if (height > m_sched.window_blocks) {
             const uint32_t out_h = height - m_sched.window_blocks;
-            if (out_h > m_sched.v20_floor_height) {
+            if (out_h > floor_height()) {
                 auto it = m_window.find(out_h);
                 if (it == m_window.end()) {
                     return fail_closed(height, "window row missing at h="
@@ -452,7 +543,7 @@ public:
                 out_gross = it->second.gross_unlocked;
             }
         }
-        m_window[height] = WindowRow{gross, n_type9};
+        m_window[height] = WindowRow{gross, n_type9, cbtx.creditPoolBalance};
         m_lately_unlocked += gross - out_gross;
 
         // Scalar recompute — EXACTLY credit_pool.hpp:67-130 (reused member).
@@ -476,7 +567,7 @@ public:
             it = m_window.erase(it);
         if (m_db != nullptr) {
             m_db->write_apply(m_indexes.export_ranges(), height,
-                              CpIdxWindowRowRec{gross, n_type9},
+                              CpIdxWindowRowRec{gross, n_type9, cbtx.creditPoolBalance},
                               make_cursor(), prune_below);
         }
         return true;
@@ -511,6 +602,7 @@ public:
         if (!flag_on) return false;                                    // (a)
         if (!vendor::bls_backend_available()) return false;            // (b)
         if (!m_armed || !m_proven_complete) return false;              // (c,d,e latch)
+        if (!m_full_history) return false;   // window seed: the index set is incomplete
         if (m_height != template_height - 1) return false;             // (c) fresh
         if (m_hash != template_prev_hash) return false;                // (c) exact parent
         return true;
@@ -547,12 +639,35 @@ public:
         // should stay same and depends only on the previous block",
         // creditpool.h:66-71) — i.e. of the cursor, which conjunct (c) just
         // pinned to the template's parent.
-        const CpIdxEra era = cp_idx_era_at(m_sched, m_height);
+        const auto era_opt = cp_idx_era_at(m_sched, m_height);
+        if (!era_opt) {
+            LOG_WARNING << "[CP-IDX] Dash Core v24 state unknown for the pool at h=" << m_height
+                        << " — the unlock limit is undecidable, exclude-all";
+            return false;
+        }
+        const CpIdxEra era = *era_opt;
+        const auto window_start = balance_at_window_start();
+        if (era == CpIdxEra::V24 && !window_start) {
+            LOG_WARNING << "[CP-IDX] v24 limit needs the balance at h="
+                        << (m_height - m_sched.window_blocks)
+                        << ", which the window does not hold — fail closed, exclude-all";
+            return false;
+        }
         const auto limit = cp_idx_current_limit(m_scalar.balance(),
-                                                m_lately_unlocked, era);
+                                                m_lately_unlocked, era,
+                                                window_start.value_or(0));
         if (!limit) {
             LOG_WARNING << "[CP-IDX] negative era limit at h=" << m_height
                         << " — fail closed, exclude-all";
+            return false;
+        }
+
+        // bad-assetunlocktx-version-2: a version-2 payload needs
+        // DEPLOYMENT_V24 active for the block being built.
+        const auto v24_for_block = cp_idx_v24_active_at(m_sched, template_height);
+        if (!v24_for_block) {
+            LOG_WARNING << "[CP-IDX] Dash Core v24 state unknown for template h=" << template_height
+                        << " — unlock versions undecidable, exclude-all";
             return false;
         }
 
@@ -567,8 +682,11 @@ public:
             if (tx.vout.size() > unlockverify::kMaximumWithdrawals) continue;
             vendor::CAssetUnlockPayload pl;
             if (!vendor::parse_assetunlock_payload(tx.extra_payload, pl)) continue;
+            // bad-assetunlocktx-version / -version-2 (Dash Core v24).
             if (pl.nVersion == 0 ||
-                pl.nVersion > vendor::CAssetUnlockPayload::CURRENT_VERSION) continue;
+                pl.nVersion > (*v24_for_block ? kAssetUnlockMaxVersionV24
+                                             : vendor::CAssetUnlockPayload::CURRENT_VERSION))
+                continue;
 
             int64_t to_unlock = static_cast<int64_t>(pl.fee);
             bool money_ok = pl.fee > 0;                       // bad-txns-assetunlock-fee-outofrange
@@ -628,8 +746,95 @@ public:
     const std::string& fail_cause() const { return m_fail_cause; }
     const CpIdxDeploySchedule& schedule() const { return m_sched; }
 
+    /// The withdrawal limit the pool at the cursor gives the NEXT block
+    /// (Dash Core ConstructCreditPool currentLimit), nullopt when the era or
+    /// the window-start balance is not known or the limit would be negative.
+    std::optional<int64_t> current_limit() const
+    {
+        if (!m_armed) return std::nullopt;
+        const auto era = cp_idx_era_at(m_sched, m_height);
+        if (!era) return std::nullopt;
+        const auto start = balance_at_window_start();
+        if (*era == CpIdxEra::V24 && !start) return std::nullopt;
+        return cp_idx_current_limit(m_scalar.balance(), m_lately_unlocked, *era, start.value_or(0));
+    }
+
+    /// The in-memory ledger after a block, for a shallow reorg rewind
+    /// (credit_pool_lane.hpp keeps the last few).
+    struct State
+    {
+        CRangesSet                    indexes;
+        std::map<uint32_t, WindowRow> window;
+        int64_t                       lately_unlocked{0};
+        CreditPool                    scalar;
+        uint32_t                      height{0};
+        uint256                       hash;
+        bool                          proven_complete{false};
+    };
+    State snapshot() const
+    {
+        return State{m_indexes, m_window, m_lately_unlocked, m_scalar, m_height, m_hash,
+                     m_proven_complete};
+    }
+    /// Rewind to a state this follower produced on the active chain (the
+    /// lane checks the lineage) and persist it: the full ranges, the cursor
+    /// and the cursor's own window row are rewritten; rows above the cursor
+    /// are never loaded (restore reads up to the cursor) and are overwritten
+    /// as the new branch applies.
+    void restore_snapshot(const State& s)
+    {
+        if (!m_armed) return;
+        m_indexes = s.indexes;
+        m_window = s.window;
+        m_lately_unlocked = s.lately_unlocked;
+        m_scalar = s.scalar;
+        m_height = s.height;
+        m_hash = s.hash;
+        m_proven_complete = s.proven_complete;
+        if (m_db != nullptr) {
+            auto it = m_window.find(m_height);
+            CpIdxWindowRowRec row;
+            if (it != m_window.end())
+                row = CpIdxWindowRowRec{it->second.gross_unlocked, it->second.n_type9, it->second.balance};
+            const uint32_t prune_below = m_height > m_sched.window_blocks
+                                       ? m_height - m_sched.window_blocks : 0;
+            m_db->write_apply(m_indexes.export_ranges(), m_height, row, make_cursor(), prune_below);
+        }
+        LOG_WARNING << "[CP-IDX] rewound to h=" << m_height << " " << m_hash.GetHex().substr(0, 16)
+                    << " (reorg) balance=" << m_scalar.balance();
+    }
+
+    /// An explicit DEPLOYMENT_V24 height (tests, or a known activation).
+    /// kCpIdxNeverActive (the default) asks the deployment status for the
+    /// schedule's network instead, and an UNKNOWN state refuses all unlocks.
+    void set_v24_height(uint32_t h) { m_sched.v24_height = h; }
+
+    /// The pool balance after the block CreditPoolPeriodBlocks before the
+    /// cursor (Dash Core distant_block_index), 0 when that block has no credit
+    /// pool (below the v20 floor); nullopt when the window does not hold it.
+    std::optional<int64_t> balance_at_window_start() const
+    {
+        if (m_height < m_sched.window_blocks) return int64_t{0};
+        const uint32_t h = m_height - m_sched.window_blocks;
+        if (h < floor_height()) {
+            // Below the v20 floor there is no credit pool (Core: 0). Below a
+            // window seed's floor the balance is simply not known.
+            if (!m_full_history) return std::nullopt;
+            return int64_t{0};
+        }
+        if (h == floor_height() && m_floor_balance) return *m_floor_balance;
+        auto it = m_window.find(h);
+        if (it == m_window.end()) return std::nullopt;
+        return it->second.balance;
+    }
+
 private:
     CpIdxDeploySchedule m_sched;
+    std::optional<int64_t> m_floor_balance;   // the floor block's balance (set by arm / arm_window)
+    bool                m_full_history{true};  // seeded from the v20 floor
+    uint32_t            m_window_floor{0};     // arm_window's floor height
+
+    uint32_t floor_height() const { return m_full_history ? m_sched.v20_floor_height : m_window_floor; }
     RewardFn            m_reward_fn;
     CreditPoolIdxDb*    m_db{nullptr};      // borrowed, optional
 
@@ -650,7 +855,12 @@ private:
         c.block_hash       = m_hash;
         c.computed_balance = m_scalar.balance();
         c.proven_complete  = m_proven_complete;
-        c.era              = static_cast<uint8_t>(cp_idx_era_at(m_sched, m_height));
+        // Informational (the limit is recomputed at admission): an unknown
+        // v24 state records the pre-v24 ladder value.
+        const auto era = cp_idx_era_at(m_sched, m_height);
+        c.era              = static_cast<uint8_t>(era ? *era
+                                 : (m_height >= m_sched.withdrawals_height ? CpIdxEra::V22
+                                                                          : CpIdxEra::PreV22));
         return c;
     }
 

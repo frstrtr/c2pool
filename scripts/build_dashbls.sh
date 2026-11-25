@@ -11,7 +11,10 @@
 #     cmake -DC2POOL_DASH_BLS=ON -DDASHBLS_ROOT=<PREFIX> ...
 #
 # Requires: autoconf/automake/libtool, a C++17 compiler, and libgmp-dev (relic
-# ARITH=gmp backend). See the autotools note below for why not CMake.
+# ARITH=gmp backend). See the autotools note below for why not CMake. The same
+# script serves Linux, macOS (Homebrew autotools + gmp) and Windows, where
+# scripts/build_dashbls_win64.sh runs it under MSYS2 MINGW64, the toolchain
+# class dashd's own Windows release uses.
 #
 # SOURCE = dash's OWN vendored src/dashbls subtree at the v23.1.7 release tag,
 # NOT the standalone dashpay/bls-signatures repo. The standalone 1.3.6 tag
@@ -28,7 +31,7 @@ DASH_REPO="${DASH_REPO:-https://github.com/dashpay/dash.git}"
 DASH_REF="${DASH_REF:-v23.1.7}"
 PREFIX="${1:-${DASHBLS_ROOT:-/opt/dashbls}}"
 BUILD_DIR="${BUILD_DIR:-/tmp/dashbls-build}"
-JOBS="${JOBS:-$(nproc 2>/dev/null || echo 4)}"
+JOBS="${JOBS:-$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)}"
 
 echo "[build_dashbls] dash=$DASH_REPO ref=$DASH_REF (src/dashbls subtree) prefix=$PREFIX"
 
@@ -62,10 +65,17 @@ echo "[build_dashbls] building dash $DASH_REF src/dashbls (dashd-byte-identical)
 # listed above). The resulting libdashbls.a is SELF-CONTAINED (bls + relic +
 # mimalloc objects in one archive), so no separate librelic_s.a is installed —
 # the c2pool CMake find treats the relic library as optional accordingly.
+# DASHBLS_CONFIGURE_ARGS: extra configure arguments, word-split on purpose.
+# The macOS x86_64 slice is cross-built on Apple Silicon with
+# "--build=aarch64-apple-darwin --host=x86_64-apple-darwin --with-backend=easy"
+# (the arm64 slice: --host=aarch64-apple-darwin --with-backend=gmp) plus
+# CC/CXX/CPPFLAGS/LDFLAGS from the environment (see
+# .github/actions/provision-dashbls). Unset = the native build, as before.
 (
     cd "$DASHBLS_SRC"
     sh autogen.sh
-    ./configure --prefix="$PREFIX" --disable-shared
+    # shellcheck disable=SC2086
+    ./configure --prefix="$PREFIX" --disable-shared ${DASHBLS_CONFIGURE_ARGS:-}
     make -j "$JOBS"
     make install
 )

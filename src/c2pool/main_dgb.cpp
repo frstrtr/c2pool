@@ -164,6 +164,8 @@ void print_banner(const char* argv0, const core::CoinParams& p)
         << "       [--give-author PCT] [-f|--fee PCT]\n"
         << "       [--sharechain-port P] [--sharechain-addnode HOST:PORT ...]\n"
         << "       [--embedded-serve-mempool-txs[=true|false]]\n"
+        << "       [--stratum-http[=true|false|auto]]\n"
+        << "       [--stratum-http-budget N] [--stratum-http-per-ip N]\n"
         << "       [--data-dir PATH] [--dev-relax-algo-softforks]\n"
         << "       [--coin-p2p-discover]\n\n"
         << "  --data-dir PATH  root all per-instance state here (default ~/.c2pool);\n"
@@ -172,7 +174,20 @@ void print_banner(const char* argv0, const core::CoinParams& p)
         << "        (--run: io_context + sharechain peer + Stratum standup).\n"
         << "        --stratum [HOST:]PORT binds a miner-facing TCP listener\n"
         << "        (e.g. --stratum 5022 or --stratum 127.0.0.1:5022); omit to\n"
-        << "        disable. Embedded P2P won-block relay + external digibyted\n"
+        << "        disable. --stratum-http[=true|false|auto] also answers the\n"
+        << "        web API (GET/HEAD, read-only) on the stratum port, as python\n"
+        << "        p2pool did on its worker port; default false; auto = on when\n"
+        << "        --http binds ::, binds 0.0.0.0 and --stratum is IPv4, or binds\n"
+        << "        the --stratum address (not loopback).\n"
+        << "        --stratum-http-budget N: HTTP requests in progress on the\n"
+        << "        stratum port at once, at most N and at most\n"
+        << "        max_stratum_connections - 1; others are answered 503 (default\n"
+        << "        16; 0 = every HTTP request on the stratum port is answered 503).\n"
+        << "        --stratum-http-per-ip N: HTTP requests in progress on the\n"
+        << "        stratum port at once from one address, one /64 for IPv6, at\n"
+        << "        most N; others are answered 503 (default 6; 0 = no limit below\n"
+        << "        --stratum-http-budget).\n"
+        << "        Embedded P2P won-block relay + external digibyted\n"
         << "        RPC fallback land in the next slices.\n"
         << "        --regtest-force-won-share (regtest-ONLY; requires\n"
         << "        --regtest AND --coin-daemon) drives ONE forced won\n"
@@ -2598,7 +2613,12 @@ int run_node(const core::CoinParams& params, bool testnet,
                     height, block_hash, static_cast<uint64_t>(std::time(nullptr)),
                     /*chain=*/"DGB", /*miner=*/"", /*share_hash=*/block_hash.GetHex(),
                     mi->get_network_difficulty(), /*share_difficulty=*/0.0,
-                    mi->get_local_hashrate(), /*subsidy=*/0);
+                    // Pool hashrate 0 -> record_found_block reads the
+                    // sharechain pool estimator. This site passed
+                    // get_local_hashrate(): this node's OWN stratum rate in a
+                    // field named pool_hashrate_at_find, so a block's luck
+                    // was measured against one node's miners, not the pool.
+                    /*pool_hashrate=*/0.0, /*subsidy=*/0);
                 // Arm the post-broadcast confirm/orphan poller. Telemetry only.
                 mi->schedule_block_verification(block_hash.GetHex());
                 std::cout << "[DGB] recorded found block hash="
@@ -2614,6 +2634,50 @@ int run_node(const core::CoinParams& params, bool testnet,
         // only ever return pending today and would be inert-until-fed -- it lands
         // with the header-ingest slice, not as dead code now. The LIVE verdict
         // source is the external digibyted getblockheader RPC (rpc.cpp).
+        // The block's OWN difficulty and time, by hash: a recorded block's
+        // network difficulty is its header's nBits (the record above passes
+        // the live reading, which record_found_block replaces as soon as the
+        // header can be had). The embedded header chain keeps no by-hash
+        // index and is not fed yet (M3), so, like the verdict below, the
+        // source is digibyted getblockheader; without an RPC the lookups
+        // answer 0 and the live reading stands. Display only.
+        {
+            auto header_field = [rp = rpc.get()](const std::string& hash_hex,
+                                                 const char* field) -> nlohmann::json {
+                if (!rp) return nullptr;
+                uint256 h; h.SetHex(hash_hex);
+                try {
+                    auto j = rp->getblockheader(h, /*verbose=*/true);
+                    if (j.is_object() && j.contains(field)) return j[field];
+                } catch (...) { /* unknown to the daemon / transport error */ }
+                return nullptr;
+            };
+            mi->set_block_field_lookups(
+                [header_field](const std::string& hash_hex) -> double {
+                    // "bits": the compact target as 8 hex digits.
+                    auto bits = header_field(hash_hex, "bits");
+                    if (!bits.is_string()) return 0.0;
+                    try {
+                        const uint32_t nbits = static_cast<uint32_t>(
+                            std::stoul(bits.get<std::string>(), nullptr, 16));
+                        if (nbits == 0) return 0.0;
+                        return chain::target_to_difficulty(chain::bits_to_target(nbits));
+                    } catch (...) { return 0.0; }
+                },
+                [header_field](const std::string& hash_hex) -> uint32_t {
+                    auto t = header_field(hash_hex, "time");
+                    return t.is_number_unsigned() ? t.get<uint32_t>() : 0;
+                });
+            // The found-block record above stores header_chain's next height,
+            // which is its base (0) until the header ingest lands: the row
+            // takes its real height from digibyted once the block confirms.
+            mi->set_block_height_lookup(
+                [header_field](const std::string& hash_hex) -> uint64_t {
+                    auto h = header_field(hash_hex, "height");
+                    return h.is_number_unsigned() ? h.get<uint64_t>() : 0;
+                });
+        }
+
         mi->set_block_verify_fn(
             [rp = rpc.get()](const std::string& hash_hex) -> int {
                 if (!rp) return 0;   // no digibyted RPC -> cannot ask the chain -> pending
@@ -2682,6 +2746,11 @@ int run_node(const core::CoinParams& params, bool testnet,
     } else {
         std::cout << "[DGB] dashboard disabled (no --http flag)" << std::endl;
     }
+    // HTTP on the stratum port (--stratum-http; auto follows the --http bind).
+    if (stratum_server)
+        core::configure_stratum_http(*stratum_server, web_server.get(),
+                                     core::stratum_http_mode_setting(),
+                                     core::stratum_http_limits_setting());
 
     // Periodic think/clean tick (every 5s, safety net) — mirrors the LTC/dash
     // tick. Without it, think() fired only on share arrival: no stale-head
@@ -2960,6 +3029,28 @@ int main(int argc, char** argv)
             serve_mempool_txs = true;
         else if (std::strcmp(argv[i], "--embedded-serve-mempool-txs=false") == 0)
             serve_mempool_txs_off = true;
+        // --stratum-http[=true|false|auto]: the web API on the stratum port too
+        // (core/stratum_http.hpp).
+        else if (std::strcmp(argv[i], "--stratum-http") == 0
+                 || std::strncmp(argv[i], "--stratum-http=", 15) == 0) {
+            if (!core::parse_stratum_http_flag(argv[i], core::stratum_http_mode_setting())) {
+                std::cerr << "bad value: " << argv[i] << " (expected --stratum-http=true, false or auto)\n";
+                return 1;
+            }
+        }
+        // --stratum-http-budget N / --stratum-http-per-ip N (core/stratum_http.hpp).
+        else if (std::strcmp(argv[i], "--stratum-http-budget") == 0 && i + 1 < argc) {
+            if (!core::parse_stratum_http_count(argv[++i], core::stratum_http_limits_setting().budget)) {
+                std::cerr << "bad value: --stratum-http-budget " << argv[i] << " (expected a count)\n";
+                return 1;
+            }
+        }
+        else if (std::strcmp(argv[i], "--stratum-http-per-ip") == 0 && i + 1 < argc) {
+            if (!core::parse_stratum_http_count(argv[++i], core::stratum_http_limits_setting().per_ip)) {
+                std::cerr << "bad value: --stratum-http-per-ip " << argv[i] << " (expected a count)\n";
+                return 1;
+            }
+        }
         else {
             std::cerr << "unknown argument: " << argv[i] << "\n";
             return 1;
@@ -2999,6 +3090,15 @@ int main(int argc, char** argv)
             c2pool::catalog::C_DGB, path);
         // Apply file-sourced (L1) values into the locals the node consumes.
         if (rc.file_set("web.port"))                 http_port = static_cast<uint16_t>(rc.get_u16("web.port").value_or(http_port));
+        if (rc.file_set("stratum.http"))   // --stratum-http: true / false / auto
+            core::apply_stratum_http_setting(rc.get_string("stratum.http").value_or(""),
+                                             core::stratum_http_mode_setting());
+        if (rc.file_set("stratum.http_budget"))   // --stratum-http-budget
+            core::apply_stratum_http_count_setting("stratum.http_budget", rc.get_i64("stratum.http_budget"),
+                                                   core::stratum_http_limits_setting().budget);
+        if (rc.file_set("stratum.http_per_ip"))   // --stratum-http-per-ip
+            core::apply_stratum_http_count_setting("stratum.http_per_ip", rc.get_i64("stratum.http_per_ip"),
+                                                   core::stratum_http_limits_setting().per_ip);
         if (rc.file_set("sharechain.listen")) {
             std::string v = rc.get_string("sharechain.listen").value_or("");
             auto colon = v.rfind(':'); std::string p = (colon == std::string::npos) ? v : v.substr(colon + 1);

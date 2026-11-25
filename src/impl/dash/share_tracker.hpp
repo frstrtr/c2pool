@@ -76,37 +76,151 @@ struct TailScore
     }
 };
 
+// p2pool think() Phase 4 (p2pool-merged-v36 data.py:2933-2947) sorts the
+// heads ascending as tuples ((score...), h) and takes the last. h is the
+// share hash as an integer, so on a full tie of the score the numerically
+// larger hash wins. `hash` is that trailing element: uint256 operator< is
+// CompareTo (arithmetic), the same order as p2pool's ints.
 struct HeadScore
 {
-    // p2pool: (work - min(punish,1)*ata(target), -reason, -time_seen)
+    // p2pool: ((work - min(punish,1)*ata(target), -punish, -time_seen), h)
     // Sorted ascending, .back() = best. Standard < comparison.
-    uint288 adjusted_work;  // work - punishment_deduction
-    int32_t neg_reason{};   // -reason (higher = less punished = better)
+    uint288 adjusted_work;  // work - min(punish,1)*ata(target)
+    int32_t neg_reason{};   // -punish (a block solution is -(-1) = +1: better)
     int64_t neg_time_seen{}; // -time_seen (higher = seen earlier = better)
+    uint256 hash;           // p2pool's trailing h: larger wins a full tie
 
     friend bool operator<(const HeadScore& a, const HeadScore& b)
     {
         if (a.adjusted_work < b.adjusted_work) return true;
         if (b.adjusted_work < a.adjusted_work) return false;
-        return std::tie(a.neg_reason, a.neg_time_seen) < std::tie(b.neg_reason, b.neg_time_seen);
+        if (std::tie(a.neg_reason, a.neg_time_seen) != std::tie(b.neg_reason, b.neg_time_seen))
+            return std::tie(a.neg_reason, a.neg_time_seen) < std::tie(b.neg_reason, b.neg_time_seen);
+        return a.hash < b.hash;
     }
 };
 
 struct TraditionalScore
 {
-    // p2pool: (work, -time_seen, -reason)
+    // p2pool: ((work, -time_seen, -punish), h)
     // No is_local. Sorted ascending, .back() = best.
     uint288 work;
     int64_t neg_time_seen{};
     int32_t neg_reason{};
+    uint256 hash;           // p2pool's trailing h
 
     friend bool operator<(const TraditionalScore& a, const TraditionalScore& b)
     {
         if (a.work < b.work) return true;
         if (b.work < a.work) return false;
-        return std::tie(a.neg_time_seen, a.neg_reason) < std::tie(b.neg_time_seen, b.neg_reason);
+        if (std::tie(a.neg_time_seen, a.neg_reason) != std::tie(b.neg_time_seen, b.neg_reason))
+            return std::tie(a.neg_time_seen, a.neg_reason) < std::tie(b.neg_time_seen, b.neg_reason);
+        return a.hash < b.hash;
     }
 };
+
+/// p2pool Share.should_punish_reason as head scoring sees it
+/// (p2pool-merged-v36 data.py:1690-1696). A block solution (the share's PoW
+/// hash at or below its header's block target: is_block_solution) is -1,
+/// checked FIRST, before naughty. A naughty share is 1 and a descendant of
+/// one its naughty depth (> 1). Anything else is 0. Phase 5 walks back only
+/// while the punish is > 0, so a block-solution head is never walked back.
+inline int32_t head_punish_reason(bool is_block_solution, int32_t naughty)
+{
+    if (is_block_solution) return -1;
+    if (naughty > 0) return naughty;
+    return 0;
+}
+
+/// The block-solution credit (head_punish_reason's -1) is granted only for a
+/// share whose header bits ARE the network target for its parent block:
+/// expected_bits is that target as our coin header chain computes it
+/// (HeaderChain::expected_bits_after), nullopt when the parent is unknown,
+/// off our best chain, or the retarget window is incomplete. p2pool takes the
+/// share's own header bits on trust (data.py:1691), so a share claiming an
+/// easy block target would win every same-parent race and tie a one-share-
+/// longer branch; here it gets no credit and scores as a plain share.
+/// The deepest parent (blocks below our header-chain tip) a block-solution
+/// credit is checked for. A real block share's parent is our tip, or tip - 1
+/// once the block itself arrived. A share naming an older parent would be
+/// checked against that parent's historic bits, which are easier whenever
+/// the difficulty rose since: no credit beyond this depth.
+inline constexpr uint32_t BLOCK_CREDIT_MAX_PARENT_DEPTH = 6;
+
+inline bool block_solution_credit(bool is_block_solution, uint32_t header_bits,
+                                  std::optional<uint32_t> expected_bits)
+{
+    return is_block_solution && expected_bits.has_value() && *expected_bits == header_bits;
+}
+
+/// Whether a block-solving share may fire the found-block hook, which
+/// reconstructs the block and relays it to the coin network. A block is valid
+/// on the network only when its header bits are the target the network
+/// requires after its parent, so with the header-chain oracle bound
+/// (m_expected_block_bits) the hook fires only on an exact match:
+///  - Mismatch: the network would reject the block; nothing is relayed.
+///  - UnknownParent: the oracle has no answer (parent unknown, off our best
+///    chain, deeper than BLOCK_CREDIT_MAX_PARENT_DEPTH, or the retarget window
+///    is incomplete); nothing is relayed, the finder relays its own block.
+///  - NoOracle: no oracle bound (tests, tools, a node without a coin-P2P link
+///    and so without the P2P relay arm): the share's own bits are taken, as
+///    p2pool does (node.py:289).
+enum class FoundBlockBits { Match, Mismatch, UnknownParent, NoOracle };
+
+inline FoundBlockBits found_block_bits(uint32_t header_bits, bool have_oracle,
+                                       std::optional<uint32_t> expected_bits)
+{
+    if (!have_oracle) return FoundBlockBits::NoOracle;
+    if (!expected_bits.has_value()) return FoundBlockBits::UnknownParent;
+    return *expected_bits == header_bits ? FoundBlockBits::Match : FoundBlockBits::Mismatch;
+}
+
+inline bool found_block_may_fire(FoundBlockBits v)
+{
+    return v == FoundBlockBits::Match || v == FoundBlockBits::NoOracle;
+}
+
+/// Whether a block-solving share's header time lets the found-block hook fire.
+/// The coin network accepts a block only with a time above its parent's
+/// median-time-past ("time-too-old" otherwise); `floor` is that MTP + 1 from
+/// the header-chain oracle (m_block_time_floor), nullopt when unknown. Only a
+/// KNOWN floor refuses: below it => no fire; an unknown floor or no oracle =>
+/// fire (the bits check, which runs first, already needs the parent on our
+/// header chain). This gates only the hook (relay and record), never the share.
+enum class FoundBlockTime { AtOrAboveFloor, BelowFloor, UnknownFloor, NoOracle };
+
+inline FoundBlockTime found_block_time(uint32_t header_time, bool have_oracle,
+                                       std::optional<uint32_t> floor)
+{
+    if (!have_oracle) return FoundBlockTime::NoOracle;
+    if (!floor.has_value()) return FoundBlockTime::UnknownFloor;
+    return header_time >= *floor ? FoundBlockTime::AtOrAboveFloor : FoundBlockTime::BelowFloor;
+}
+
+inline bool found_block_time_may_fire(FoundBlockTime v)
+{
+    return v != FoundBlockTime::BelowFloor;
+}
+
+/// p2pool Phase 4 head key. work is the verified work up to the head's 5th
+/// parent; attempts is ata(target) of the head itself (its index `work`).
+/// work - min(punish,1)*attempts: a punished head (punish > 0) is one share
+/// behind, a block solution (punish -1) one share ahead.
+inline HeadScore make_head_score(const uint288& work, const uint288& attempts,
+                                 int32_t punish, int64_t time_seen, const uint256& hash)
+{
+    uint288 adjusted = work;
+    if (punish > 0) adjusted = adjusted - attempts;
+    else if (punish < 0) adjusted = adjusted + attempts;
+    return {adjusted, -punish, -time_seen, hash};
+}
+
+/// p2pool Phase 4 traditional key: ((work, -time_seen, -punish), h).
+inline TraditionalScore make_traditional_score(const uint288& work, int32_t punish,
+                                               int64_t time_seen, const uint256& hash)
+{
+    return {work, -time_seen, -punish, hash};
+}
 
 template <typename ScoreT>
 struct DecoratedData
@@ -386,6 +500,10 @@ private:
     // with no limit.  Counter is cleared on successful verification or
     // when the share is removed from the chain (on_removed signal).
     std::unordered_map<uint256, int, ShareHasher> m_verify_fail_count;
+    // Block-solving shares fire_block_found_checked refused (log throttle).
+    uint64_t m_found_block_refusals = 0;   // same writer context as m_verify_fail_count
+    // Block-solving shares relayed with an unknown parent MTP (log throttle).
+    uint64_t m_found_block_unchecked_time = 0;
 
     static int64_t now_seconds()
     {
@@ -403,6 +521,17 @@ public:
     std::function<void(const uint256&)> m_on_share_verified;
     // Callback fired when a verified share meets the block target (found block)
     std::function<void(const uint256&)> m_on_block_found;
+    // Head scoring's block-solution credit: the bits a block on top of
+    // `prev_block` at `block_time` must carry, from the coin header chain
+    // (HeaderChain::expected_bits_after); nullopt when unknown. Unset (tests,
+    // tools, a node with no header chain) => no block-solution credit at all.
+    std::function<std::optional<uint32_t>(const uint256& prev_block, int64_t block_time)>
+        m_expected_block_bits;
+    // The earliest header time a block built on `prev_block` may carry: the
+    // coin network's median-time-past of `prev_block` + 1, from the coin header
+    // chain (HeaderChain::median_time_past_at); nullopt when unknown. Gates
+    // only the found-block hook (fire_block_found_checked), never the share.
+    std::function<std::optional<uint32_t>(const uint256& prev_block)> m_block_time_floor;
     // Callback fired when a verified share meets a merged chain target (DOGE block)
     // Args: share_hash, pow_hash (for target comparison by caller)
     std::function<void(const uint256&, const uint256&)> m_on_merged_block_check;
@@ -413,6 +542,87 @@ public:
     /// to a concrete share instead of an empty string. Display hook only.
     std::function<void(double difficulty, const std::string& miner,
                        const uint256& share_hash)> m_on_share_difficulty;
+
+    // Fire m_on_block_found for a block-solving share only when its header
+    // bits are the ones the coin network requires after its parent block
+    // (found_block_bits) and its header time is not at or below the parent's
+    // known median-time-past (found_block_time). The share itself is never
+    // affected. Returns whether the hook fired. A refusal is logged,
+    // never silent; the log is throttled (the first 3, then every 10th) since
+    // each refused share is one verified share.
+    //
+    // Trade-off of UnknownParent: the hook carries every arm (coin-P2P relay,
+    // the dashd submitblock backup when one is configured, the dashboard row),
+    // so a share whose parent the oracle cannot answer gets none of them on
+    // this node: a parent more than BLOCK_CREDIT_MAX_PARENT_DEPTH below our
+    // header-chain tip (history), off our best chain (a race), or a header
+    // chain that is not ready. The block's finder broadcasts it from its own
+    // stratum path, which this check does not touch.
+    bool fire_block_found_checked(const uint256& share_hash, const uint256& prev_block,
+                                  uint32_t header_bits, uint32_t header_time)
+    {
+        if (!m_on_block_found) return false;
+        std::optional<uint32_t> expected;
+        if (m_expected_block_bits)
+            expected = m_expected_block_bits(prev_block, static_cast<int64_t>(header_time));
+        const auto verdict = found_block_bits(header_bits,
+                                              static_cast<bool>(m_expected_block_bits), expected);
+        if (found_block_may_fire(verdict)) {
+            // The header time must be above the parent's median-time-past.
+            std::optional<uint32_t> floor;
+            if (m_block_time_floor)
+                floor = m_block_time_floor(prev_block);
+            const auto tv = found_block_time(header_time,
+                                             static_cast<bool>(m_block_time_floor), floor);
+            if (found_block_time_may_fire(tv)) {
+                if (tv == FoundBlockTime::UnknownFloor) {
+                    // Fires, but say so (throttled like the refusals).
+                    const uint64_t u = ++m_found_block_unchecked_time;
+                    if (u <= 3 || u % 10 == 0)
+                        LOG_INFO << "[BLOCK-FOUND] share " << share_hash.GetHex().substr(0, 16)
+                                 << ": the median-time-past of block "
+                                 << prev_block.GetHex().substr(0, 16)
+                                 << " is unknown here; relayed without the time check"
+                                 << " (#" << u << ")";
+                }
+                m_on_block_found(share_hash);
+                return true;
+            }
+            // Only a known floor refuses (BelowFloor; *floor is engaged).
+            const uint64_t n = ++m_found_block_refusals;
+            if (n > 3 && n % 10 != 0)
+                return false;
+            LOG_ERROR << "[BLOCK-FOUND] share " << share_hash.GetHex().substr(0, 16)
+                      << " meets its header target, but its header time " << header_time
+                      << " is below the network's minimum " << *floor << " after block "
+                      << prev_block.GetHex().substr(0, 16)
+                      << " (median-time-past + 1) -- the block is invalid on the network;"
+                         " NOT relayed, NOT recorded (the share stays) (refusal #" << n << ")";
+            return false;
+        }
+        const uint64_t n = ++m_found_block_refusals;
+        if (n > 3 && n % 10 != 0)
+            return false;
+        if (verdict == FoundBlockBits::Mismatch) {
+            LOG_ERROR << "[BLOCK-FOUND] share " << share_hash.GetHex().substr(0, 16)
+                      << " meets its header target, but its header bits 0x" << std::hex
+                      << header_bits << " are not the network's 0x" << *expected << std::dec
+                      << " after block " << prev_block.GetHex().substr(0, 16)
+                      << " -- the block is invalid on the network; NOT relayed, NOT recorded"
+                      << " (refusal #" << n << ")";
+        } else {
+            LOG_WARNING << "[BLOCK-FOUND] share " << share_hash.GetHex().substr(0, 16)
+                        << " meets its header target, but the expected bits after block "
+                        << prev_block.GetHex().substr(0, 16)
+                        << " are unknown here (not within the last "
+                        << BLOCK_CREDIT_MAX_PARENT_DEPTH
+                        << " blocks of our best header chain, or the header chain is not"
+                           " ready), so its bits 0x" << std::hex << header_bits << std::dec
+                        << " cannot be checked -- NOT relayed or recorded by this node"
+                        << " (refusal #" << n << ")";
+        }
+        return false;
+    }
 
     // Scan the verified best chain for block solutions after startup.
     // Uses cached pow_hash from index (stored during original attempt_verify).
@@ -436,7 +646,10 @@ public:
                 uint256 block_target = chain::bits_to_target(s->m_min_header.m_bits);
                 if (!block_target.IsNull() && pow <= block_target) {
                     idx->is_block_solution = true;
-                    if (m_on_block_found) { m_on_block_found(pos); ++found_ltc; }
+                    if (fire_block_found_checked(pos, s->m_min_header.m_previous_block,
+                                                 s->m_min_header.m_bits,
+                                                 s->m_min_header.m_timestamp))
+                        ++found_ltc;
                 }
                 // Check merged targets (V36 shares carry exact data in m_merged_coinbase_info)
                 if (m_on_merged_block_check)
@@ -615,13 +828,26 @@ public:
         if (m_on_share_verified)
             m_on_share_verified(share_hash);
 
-        // Block detection: if share_init_verify flagged this share as a block solution,
-        // fire the callback. Matches p2pool's tracker.verified.added watcher (node.py:289).
-        if (m_on_block_found && g_last_init_is_block) {
+        // Block detection: share_init_verify flagged this share as a block
+        // solution (its PoW hash meets its header's block target). The index
+        // flag feeds head scoring (head_punish_reason) whether or not a
+        // found-block hook is bound; the hook fires as p2pool's
+        // tracker.verified.added watcher does (node.py:289), and only for
+        // header bits the network accepts (fire_block_found_checked).
+        if (g_last_init_is_block) {
             g_last_init_is_block = false;
             auto* idx = chain.get_index(share_hash);
             if (idx) idx->is_block_solution = true;
-            m_on_block_found(share_hash);
+            if (m_on_block_found) {
+                uint256 prev_block;
+                uint32_t bits = 0, ts = 0;
+                share_var.invoke([&](auto* obj) {
+                    prev_block = obj->m_min_header.m_previous_block;
+                    bits = obj->m_min_header.m_bits;
+                    ts = obj->m_min_header.m_timestamp;
+                });
+                fire_block_found_checked(share_hash, prev_block, bits, ts);
+            }
         }
 
         // Report share difficulty for best-share dashboard tracking.
@@ -747,6 +973,27 @@ public:
         return {static_cast<int32_t>(SharechainConfig::chain_length()), score_res};
     }
 
+    /// Is `possible_child` equal to `item` or a descendant of it? The same
+    /// answer as chain.is_child_of(item, possible_child) on a consistent share
+    /// forest (one parent per share, no cycles, lines shorter than get_last's
+    /// 100,000-step guard; a DASH chain is pruned to 2*CHAIN_LENGTH+10): walk
+    /// from `possible_child` along the parent links; reaching `item` (also when
+    /// `item` is the segment's missing parent, as is_child_of counts it) is
+    /// true, running off the chain is false. Costs the distance walked instead
+    /// of is_child_of's four full-chain walks (KAT:
+    /// test_dash_supersede_hint_equivalence, every pair of a forest).
+    bool descends_from(const uint256& item, const uint256& possible_child)
+    {
+        uint256 cur = possible_child;
+        const size_t guard = chain.size() + 1;   // a consistent forest never needs more
+        for (size_t steps = 0; steps <= guard; ++steps) {
+            if (cur == item) return true;
+            if (cur.IsNull() || !chain.contains(cur)) return false;
+            cur = chain.get_index(cur)->tail;
+        }
+        return false;
+    }
+
     // -- Restart-reorg supersede detector (see SupersedeHint) --
     // Returns an ACTIVE hint iff a genuine competing fork exists whose RECEIVED
     // cumulative work is STRICTLY greater than the incumbent best's VERIFIED
@@ -774,18 +1021,35 @@ public:
         uint256 best_ch;
         uint288 best_ch_work;
         bool found = false;
+        // Cheapest filters first, the descendant check LAST. It used to be
+        // chain.is_child_of, which walks the chain four times per head
+        // (get_height/get_last of both ends, O(chain) each) and was most of
+        // this function's cost on a full tracker; descends_from gives the same
+        // answer walking only from the head back. Every filter is
+        // a `continue` whose only side effect is value-transparent memoisation
+        // (the TrackerView height/work memo), so their order does not change the
+        // candidate set; the argmax runs over the candidates in the same head
+        // order with the same strict `>`, so the hint is identical. The work
+        // pre-check cannot change the result either: the hint only goes active
+        // for a candidate with STRICTLY more work than the incumbent, and every
+        // such candidate is kept (KAT: test_dash_supersede_hint_equivalence).
         for (auto& [head, tail] : chain.get_heads())
         {
             if (head == incumbent_best) continue;
             if (!chain.contains(head)) continue;
-            // Extension of our own best chain (not a fork) — the ordinary
-            // budgeted Phase-2 verifies it; never treat it as a challenger.
-            try { if (chain.is_child_of(incumbent_best, head)) continue; }
-            catch (...) { /* concurrent trim — treat as fork candidate */ }
-            // Already a full-length verified chain — Phase-3 scoring handles it.
-            if (verified.get_acc_height(head) >= CL) continue;
             uint288 w;
             try { w = chain.get_work(head); } catch (...) { continue; }
+            // Cannot out-work the incumbent: can never be the active target.
+            if (!(incumbent_work < w)) continue;
+            // Already a full-length verified chain — Phase-3 scoring handles it.
+            if (verified.get_acc_height(head) >= CL) continue;
+            // Extension of our own best chain (not a fork) — the ordinary
+            // budgeted Phase-2 verifies it; never treat it as a challenger.
+            // descends_from == chain.is_child_of on a share forest, but walks
+            // only from `head` back to the incumbent (1-2 steps for the usual
+            // just-received extension) instead of four full-chain walks.
+            try { if (descends_from(incumbent_best, head)) continue; }
+            catch (...) { /* defensive: treat as fork candidate (as before) */ }
             if (!found || w > best_ch_work) { best_ch_work = w; best_ch = head; found = true; }
         }
 
@@ -1449,6 +1713,26 @@ public:
             }
         }
 
+        // The block-solution credit of a share, checked against the network
+        // target once per think() cycle (Phase 4 heads, Phase 5 walk-back).
+        std::map<uint256, bool> block_credit_cache;
+        auto block_credit_of = [&](const uint256& h, const auto* idx) -> bool {
+            if (!idx || !idx->is_block_solution || !m_expected_block_bits) return false;
+            auto it = block_credit_cache.find(h);
+            if (it != block_credit_cache.end()) return it->second;
+            uint256 prev_block;
+            uint32_t bits = 0, ts = 0;
+            chain.get_share(h).invoke([&](auto* obj) {
+                prev_block = obj->m_min_header.m_previous_block;
+                bits = obj->m_min_header.m_bits;
+                ts = obj->m_min_header.m_timestamp;
+            });
+            const bool ok = block_solution_credit(true, bits,
+                m_expected_block_bits(prev_block, static_cast<int64_t>(ts)));
+            block_credit_cache.emplace(h, ok);
+            return ok;
+        };
+
         // Phase 4: Score heads within the best tail — pick the best head
         std::vector<DecoratedData<HeadScore>> decorated_heads;
         std::vector<DecoratedData<TraditionalScore>> traditional_sort;
@@ -1475,30 +1759,22 @@ public:
                     if (!head_idx) continue;
                     int64_t ts = head_idx->time_seen;
 
-                    // Punish heads: naughty (invalid block) only.
-                    // F10/(b): the non-canonical 95%-version-obsolescence punish
-                    // is dropped — canonical Phase-4 head-scoring punishes only
-                    // naughty heads. The version gate is the check() 60% weighted
-                    // switch rule (share_check), not head-scoring.
-                    int32_t reason = 0;
-                    {
-                        auto* idx = chain.get_index(hh);
-                        if (idx && idx->naughty > 0)
-                            reason = idx->naughty;
-                    }
+                    // p2pool should_punish_reason (head_punish_reason): a
+                    // block solution is -1, ahead of a naughty head (> 0), but
+                    // only with header bits bound to the network target
+                    // (block_credit_of). F10/(b): the non-canonical
+                    // 95%-version-obsolescence punish is dropped — the version
+                    // gate is the check() 60% weighted switch rule
+                    // (share_check), not head-scoring.
+                    const int32_t reason =
+                        head_punish_reason(block_credit_of(hh, head_idx), head_idx->naughty);
 
-                    // p2pool: sort key = (work - min(punish,1)*ata(target), -reason, -time_seen)
+                    // p2pool: sort key = ((work - min(punish,1)*ata(target), -punish, -time_seen), h)
                     // peer_addr is None is COMMENTED OUT in p2pool — no is_local dimension.
-                    // Punishment deducted from work: a punished share is mathematically behind.
-                    uint288 adjusted_work = work_score;
-                    if (reason > 0) {
-                        // Deduct one share's worth of attempts (min(reason,1) * ata(target))
-                        auto* share_idx = chain.get_index(hh);
-                        if (share_idx)
-                            adjusted_work = adjusted_work - share_idx->work;
-                    }
-                    decorated_heads.push_back({{adjusted_work, -reason, -ts}, hh});
-                    traditional_sort.push_back({{work_score, -ts, -reason}, hh});
+                    decorated_heads.push_back(
+                        {make_head_score(work_score, head_idx->work, reason, ts, hh), hh});
+                    traditional_sort.push_back(
+                        {make_traditional_score(work_score, reason, ts, hh), hh});
                 } catch (const std::exception&) {
                     // Chain concurrently modified — skip this head, retry next cycle
                 }
@@ -1521,10 +1797,15 @@ public:
         {
             // Check if best share should be punished
             auto* best_idx = chain.get_index(best);
-            if (best_idx && best_idx->naughty > 0)
+            auto punish_of = [&](const uint256& h) -> int32_t {
+                auto* idx = chain.get_index(h);
+                if (!idx) return 0;
+                return head_punish_reason(block_credit_of(h, idx), idx->naughty);
+            };
+            if (punish_of(best) > 0)
             {
-                // Walk back through punished shares
-                while (best_idx && best_idx->naughty > 0)
+                // Walk back through punished shares (p2pool: while punish > 0)
+                while (punish_of(best) > 0)
                 {
                     uint256 prev;
                     chain.get_share(best).invoke([&](auto* obj) {
@@ -1534,8 +1815,10 @@ public:
                     best = prev;
                     best_idx = chain.get_index(best);
 
-                    // p2pool: if not punish, find best descendent
-                    if (best_idx && best_idx->naughty == 0)
+                    // p2pool: if not punish, find best descendent. Exactly 0:
+                    // a block-solution parent (-1) ends the walk-back without
+                    // descending (the loop condition is punish > 0).
+                    if (best_idx && punish_of(best) == 0)
                     {
                         // Find deepest non-naughty child via reverse map
                         std::function<std::pair<int,uint256>(const uint256&, int)> best_desc;
@@ -1561,7 +1844,7 @@ public:
                     }
                 }
             }
-            punish_val = (best_idx && best_idx->naughty > 0) ? best_idx->naughty : 0;
+            punish_val = punish_of(best);
         }
 
         // Phase 6: Compute cutoffs for desired shares filtering

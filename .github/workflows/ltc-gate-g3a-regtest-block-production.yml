@@ -56,6 +56,11 @@ jobs:
             echo "CONAN_HOME=$HOME/.conan2-ci/$RUNNER_NAME" >> "$GITHUB_ENV"
           fi
 
+      # ccache for the gate script's cmake configure (self-hosted only; a
+      # runner without ccache builds as before).
+      - name: ccache launcher (when installed)
+        uses: ./.github/actions/ccache-launcher
+
       - name: Check gate entrypoint presence
         id: presence
         run: |
@@ -113,6 +118,12 @@ jobs:
           LTC_RPC_PASS: ${{ secrets.LTC_RPC_PASS }}
           DOGE_RPC_PASS: ${{ secrets.DOGE_RPC_PASS }}
         run: bash tests/gates/ltc_g3a_regtest_block_production.sh
+
+      - name: ccache hits and misses for this job
+        if: always()
+        uses: ./.github/actions/ccache-launcher
+        with:
+          report: 'true'
 
       - name: Prune runner workspace
         if: always()

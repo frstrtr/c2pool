@@ -344,3 +344,37 @@ TEST(LevelDBStoreSnapshot, ASnapshotOfAnEarlierOpenIsRefused)
     EXPECT_TRUE(scan(nullptr));
     EXPECT_EQ(seen, "three");
 }
+
+// The store owns the block cache and the bloom filter policy its DB uses
+// (leveldb::Options only points at them; LevelDB frees neither): they exist
+// while the DB is open, close() releases them after the DB, and a reopen makes
+// new ones and keeps the data.
+TEST(LevelDBStoreLock, TheStoreOwnsItsCacheAndFilterAndReleasesThemOnClose)
+{
+    TempDir t;
+    core::LevelDBOptions o;
+    ASSERT_GT(o.block_cache_size, 0u);
+    ASSERT_GT(o.bloom_filter_bits, 0);
+    core::LevelDBStore db(t.dir.string(), o);
+    for (int round = 0; round < 3; ++round) {
+        ASSERT_TRUE(db.open()) << "round " << round;
+        EXPECT_NE(db.block_cache(), nullptr);
+        EXPECT_NE(db.filter_policy(), nullptr);
+        if (round == 0) ASSERT_TRUE(db.put("k", bytes("kept")));
+        std::vector<uint8_t> v;
+        ASSERT_TRUE(db.get("k", v)) << "round " << round;
+        EXPECT_EQ(v, bytes("kept"));
+        db.close();
+        EXPECT_EQ(db.block_cache(), nullptr);
+        EXPECT_EQ(db.filter_policy(), nullptr);
+    }
+
+    // Options that ask for neither hold neither.
+    core::LevelDBOptions none;
+    none.block_cache_size = 0;
+    none.bloom_filter_bits = 0;
+    core::LevelDBStore bare(t.dir.string(), none);
+    ASSERT_TRUE(bare.open());
+    EXPECT_EQ(bare.block_cache(), nullptr);
+    EXPECT_EQ(bare.filter_policy(), nullptr);
+}

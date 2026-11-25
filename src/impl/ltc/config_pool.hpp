@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
+#include <optional>
+
 #include <core/config.hpp>
 #include <core/fileconfig.hpp>
 #include <core/netaddress.hpp>
@@ -36,7 +38,10 @@ public:
     static constexpr uint32_t SPREAD                    = 3;       // blocks (PPLNS window)
     static constexpr uint32_t TARGET_LOOKBEHIND         = 200;
     static constexpr uint32_t MINIMUM_PROTOCOL_VERSION  = 3301;  // accept v35 (3502) and v36 (3600) peers
-    static constexpr uint32_t ADVERTISED_PROTOCOL_VERSION = 3600; // our capability (V36 shares)
+    static constexpr uint32_t ADVERTISED_PROTOCOL_VERSION = 3601; // our capability (V36 and 3601 shares)
+    // The protocol of a node that handles 3601 shares: peers below it are
+    // disconnected once the flag day has passed (they cannot load a 3601 share).
+    static constexpr uint32_t V3601_PROTOCOL_VERSION    = 3601;
     static constexpr uint32_t SEGWIT_ACTIVATION_VERSION = 17;
     static constexpr uint32_t BLOCK_MAX_SIZE            = 1000000;
     static constexpr uint32_t BLOCK_MAX_WEIGHT          = 4000000;
@@ -61,6 +66,25 @@ public:
 
     // Runtime testnet flag — set once at startup
     static inline bool is_testnet = false;
+
+    // Share version 3601 flag day (share.hpp FLAG_DAY_SHARE_VERSION), unix
+    // time: a share whose timestamp is at or after it is a 3601 share and one
+    // before it is not (share_check.hpp flag_day_problem). Not ratchet-voted:
+    // every node switches at the same share timestamp. 0xFFFFFFFF = not
+    // scheduled. Mainnet: 2026-11-13 00:00:00 UTC (v0.2.12.1; v0.2.12 had
+    // 2026-11-11 12:00:00 UTC, moved to give every node time to upgrade). The
+    // override is for tests and, on testnet or a private --network-id chain
+    // only, --v3601-activation-time: on mainnet every node must use the
+    // compiled time.
+    static constexpr uint32_t V3601_ACTIVATION_TIME          = 1794528000u;
+    static constexpr uint32_t TESTNET_V3601_ACTIVATION_TIME  = 0xFFFFFFFFu;
+    static inline std::optional<uint32_t> v3601_activation_time_override;
+    static uint32_t v3601_activation_time()
+    {
+        if (v3601_activation_time_override)
+            return *v3601_activation_time_override;
+        return is_testnet ? TESTNET_V3601_ACTIVATION_TIME : V3601_ACTIVATION_TIME;
+    }
 
     // Accessors that return correct value for current network
     static uint32_t share_period()      { return is_testnet ? TESTNET_SHARE_PERIOD : SHARE_PERIOD; }
@@ -212,20 +236,38 @@ public:
         "bip65", "csv", "segwit", "taproot", "mweb"
     };
 
-    // Default bootstrap peers for the LTC p2pool mainnet
+    // Default bootstrap peers for the LTC p2pool mainnet: nodes of the V36
+    // share chain only. The older list also held hosts of other networks (an
+    // old V35 p2pool at 20.113.157.65 and a separate chain at 20.127.82.115 /
+    // 20.106.76.227); a fresh node that reached them first could follow their
+    // chain instead of the V36 one. The other old entries no longer answer.
     static inline const std::vector<std::string> DEFAULT_BOOTSTRAP_HOSTS = {
-        "ml.toom.im",
+        "ltc.voidbind.com",
+        "109.123.238.32",
+        "p2p-spb.xyz",
         "usa.p2p-spb.xyz",
-        "102.160.209.121",
-        "5.188.104.245",
-        "20.127.82.115",
+        "83.221.211.116",
         "31.25.241.224",
-        "20.113.157.65",
-        "20.106.76.227",
-        "15.218.180.55",
-        "173.79.139.224",
-        "174.60.78.162",
     };
+
+    // Hosts that serve another share chain. They are dropped from a persisted
+    // bootstrap list (<data-dir>/ltc/pool.yaml, written by earlier versions
+    // with the old defaults) when it is loaded.
+    static inline const std::set<std::string> FOREIGN_CHAIN_HOSTS = {
+        "20.113.157.65",
+        "20.127.82.115",
+        "20.106.76.227",
+    };
+
+    // True when HOST or HOST:PORT names a FOREIGN_CHAIN_HOSTS entry.
+    static bool is_foreign_chain_host(const std::string& addr)
+    {
+        std::string host = addr;
+        const auto colon = host.rfind(':');
+        if (colon != std::string::npos && host.find(':') == colon)
+            host = host.substr(0, colon);
+        return FOREIGN_CHAIN_HOSTS.count(host) != 0;
+    }
 
     // -----------------------------------------------------------------------
     // Runtime config loaded from pool.yaml

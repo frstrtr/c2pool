@@ -93,8 +93,8 @@ struct SegwitDataDefault
 
 struct TxHashRefs
 {
-    uint64_t m_share_count;
-    uint64_t m_tx_count;
+    uint64_t m_share_count{0};
+    uint64_t m_tx_count{0};
 
     TxHashRefs() = default;
     TxHashRefs(uint64_t share, uint64_t tx) : m_share_count(share), m_tx_count(tx) {}
@@ -119,7 +119,7 @@ struct HashLinkType
 {
     FixedStrType<32> m_state;      //pack.FixedStrType(32)
     // FixedStrType<0> m_extra_data; //pack.FixedStrType(0) # bit of a hack, but since the donation script is at the end, const_ending is long enough to always make this empty
-    uint64_t m_length;        //pack.VarIntType()
+    uint64_t m_length{0};     //pack.VarIntType()
 
     C2POOL_SERIALIZE_METHODS(HashLinkType) { READWRITE(obj.m_state, /*obj.m_extra_data,*/ VarInt(obj.m_length)); }
 };
@@ -129,7 +129,7 @@ struct V36HashLinkType
 {
     FixedStrType<32> m_state;
     BaseScript m_extra_data;     // VarStr in V36
-    uint64_t m_length;
+    uint64_t m_length{0};
 
     C2POOL_SERIALIZE_METHODS(V36HashLinkType) { READWRITE(obj.m_state, obj.m_extra_data, VarInt(obj.m_length)); }
 };
@@ -137,7 +137,7 @@ struct V36HashLinkType
 // V36 merged mining: per-chain address entry
 struct MergedAddressEntry
 {
-    uint32_t m_chain_id;
+    uint32_t m_chain_id{0};
     BaseScript m_script;
 
     C2POOL_SERIALIZE_METHODS(MergedAddressEntry) { READWRITE(obj.m_chain_id, obj.m_script); }
@@ -146,9 +146,9 @@ struct MergedAddressEntry
 // V36 merged mining: per-chain coinbase verification entry
 struct MergedCoinbaseEntry
 {
-    uint32_t m_chain_id;
-    uint64_t m_coinbase_value;
-    uint32_t m_block_height;
+    uint32_t m_chain_id{0};
+    uint64_t m_coinbase_value{0};
+    uint32_t m_block_height{0};
     FixedStrType<80> m_block_header;
     MerkleLink m_coinbase_merkle_link;
     BaseScript m_coinbase_script;  // V36: actual scriptSig (allows custom tags + THE state_root)

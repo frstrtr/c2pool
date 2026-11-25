@@ -998,6 +998,8 @@ void Bip110WorkSource::update_stratum_worker(const std::string& id, double hr, d
     std::lock_guard<std::mutex> lk(workers_mutex_);
     auto it = workers_.find(id);
     if (it == workers_.end()) return;
+    if (acc > it->second.accepted)
+        it->second.last_accepted_at = std::chrono::steady_clock::now();
     it->second.hashrate = hr; it->second.dead_hashrate = dead; it->second.difficulty = diff;
     it->second.accepted = acc; it->second.rejected = rej; it->second.stale = stale;
 }

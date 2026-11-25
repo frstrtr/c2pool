@@ -21,6 +21,12 @@ is byte-identical to the RPC (mn_seed.hpp) seed. No network access.
                  dropped). `protx list valid` would delete it, which makes
                  "banned" and "does not exist" the same observation and leaves
                  a later ProUpServTx revive with nothing to revive.
+  6. compare  -- LEGACY<->BASIC operator-key encoding on two real mainnet
+                 pairs; a self-derived and a dashd-derived checkpoint of one set
+                 carry different FILE digests but one CONTENT digest; `compare`
+                 answers MATCH for both and MISMATCH (exit 1) for another
+                 blockhash, one lastPaidHeight, one operator key, or a
+                 masternode missing from dashd's set.
 
 Run from the repo root:  python3 tools/dash/test_gen_mn_checkpoint.py
 """
@@ -216,6 +222,96 @@ def main():
           len(banned_rows) == 1 and banned_rows[0][12] not in ("-", ""))
 
     for p in (out, jsrc, sj, so, ro):
+        os.unlink(p)
+
+    print("[6] content digest + compare: one set, one content digest, either key encoding")
+    # Real mainnet pairs (h=2563800): one G1 point as Dash Core prints it for a
+    # version-1 entry (LEGACY) and as a self-derived anchor stores it (BASIC).
+    l0 = "086f5c0d57ac779daae188eb2e177f49ab2dfe26114889fa0a7af5dcfca25cffad47f2b4e1cee0d90736aac589a46283"
+    b0 = "886f5c0d57ac779daae188eb2e177f49ab2dfe26114889fa0a7af5dcfca25cffad47f2b4e1cee0d90736aac589a46283"
+    l1 = "9710294871d99ad4d6ed0c7bf4a43a43054413e4ab0bd5873291352895ffc5fb6a5ce877f274c1b878a4068dcaeae66d"
+    b1 = "b710294871d99ad4d6ed0c7bf4a43a43054413e4ab0bd5873291352895ffc5fb6a5ce877f274c1b878a4068dcaeae66d"
+    check("legacy -> basic, sign clear (0x00 -> 0x80)", g.opkey_legacy_to_basic(l0) == b0)
+    check("legacy -> basic, sign set (0x80 -> 0xa0)", g.opkey_legacy_to_basic(l1) == b1)
+    check("null key -> '-'", g.opkey_legacy_to_basic("00" * 48) == "-")
+    try:
+        g.opkey_legacy_to_basic("40" + l0[2:])
+        noncanon_refused = False
+    except ValueError:
+        noncanon_refused = True
+    check("a 'legacy' key with byte-0 bits 6-5 set is refused", noncanon_refused)
+
+    def entry(pro, coll, ver, opkey, last_paid=200):
+        return {"type": "Regular", "proTxHash": pro * 32, "collateralHash": coll * 32,
+                "collateralIndex": 0, "operatorReward": 0,
+                "state": {"version": ver, "registeredHeight": 100, "lastPaidHeight": last_paid,
+                          "PoSeRevivedHeight": -1, "PoSeBanHeight": -1, "revocationReason": 0,
+                          "payoutAddress": "yVXDAM73Tg6A44Bm3qduXsMCYxzuqBCT48",
+                          "pubKeyOperator": opkey}}
+
+    # As dashd prints the set: v1 key LEGACY, v2 key BASIC, a revoked key as zeros.
+    dashd_set = [entry("71", "81", 1, l1), entry("72", "82", 2, b0), entry("73", "83", 2, "00" * 48)]
+    bh = "ef" * 32
+
+    def write_json(obj):
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as jf:
+            json.dump(obj, jf)
+            return jf.name
+
+    pj = write_json(dashd_set)
+    with tempfile.NamedTemporaryFile("w", suffix=".inc", delete=False) as tf:
+        dp = tf.name
+    g.main(["pin", "--network", "testnet", "--protx-json", pj, "--height", "777",
+            "--blockhash", bh, "--generated", "2026-01-01T00:00:00Z", "--output", dp, "--quiet"])
+    dcp = g.parse_checkpoint(g.unwrap_inc(Path(dp).read_text()), expected_network="testnet")
+
+    # The same set as c2pool's own dumpers write it: every key BASIC, null as `-`.
+    sd_rows = []
+    for f in dcp["_entries"]:
+        f = list(f)
+        f[16] = {l1: b1, "00" * 48: "-"}.get(f[16], f[16])
+        sd_rows.append("mn " + " ".join(f))
+    sd_header = [g.MAGIC, "network testnet", "height 777", "blockhash " + bh,
+                 "source self-derived from chain via c2pool --replay-bulk at H=777",
+                 "generated 2026-01-02T00:00:00Z", "count %d" % len(sd_rows)]
+    sd_digest = g.mn_checkpoint_digest("\n".join(sd_header + sd_rows) + "\n")
+    with tempfile.NamedTemporaryFile("w", suffix=".inc", delete=False) as tf:
+        sp = tf.name
+    g.write_inc(sp, sd_header, sd_digest, sd_rows)
+    scp = g.parse_checkpoint(g.unwrap_inc(Path(sp).read_text()), expected_network="testnet")
+
+    def cdigest(cp):
+        return g.content_digest(cp["network"], cp["height"], cp["blockhash"],
+                                g.normalized_rows(cp["_entries"], g.keys_are_basic(cp)))
+
+    check("the two producers' FILE digests differ (provenance lines, key encoding)",
+          dcp["digest"] != scp["digest"])
+    check("their CONTENT digests are equal", cdigest(dcp) == cdigest(scp))
+
+    def compare_rc(argv):
+        try:
+            g.main(argv)
+            return 0
+        except SystemExit as ex:
+            return ex.code
+
+    check("compare: self-derived file vs dashd's set -> MATCH (exit 0)",
+          compare_rc(["compare", sp, "--protx-json", pj, "--blockhash", bh]) == 0)
+    check("compare: dashd-derived file vs dashd's set -> MATCH (exit 0)",
+          compare_rc(["compare", dp, "--protx-json", pj, "--blockhash", bh]) == 0)
+    check("compare: another blockhash -> MISMATCH (exit 1)",
+          compare_rc(["compare", sp, "--protx-json", pj, "--blockhash", "ee" * 32]) == 1)
+    pj_paid = write_json([entry("71", "81", 1, l1, last_paid=201)] + dashd_set[1:])
+    check("compare: one lastPaidHeight differs -> MISMATCH (exit 1)",
+          compare_rc(["compare", sp, "--protx-json", pj_paid, "--blockhash", bh]) == 1)
+    pj_key = write_json([entry("71", "81", 1, l0)] + dashd_set[1:])
+    check("compare: one operator key differs -> MISMATCH (exit 1)",
+          compare_rc(["compare", sp, "--protx-json", pj_key, "--blockhash", bh]) == 1)
+    pj_less = write_json(dashd_set[:2])
+    check("compare: a masternode missing from dashd's set -> MISMATCH (exit 1)",
+          compare_rc(["compare", sp, "--protx-json", pj_less, "--blockhash", bh]) == 1)
+
+    for p in (pj, dp, sp, pj_paid, pj_key, pj_less):
         os.unlink(p)
 
     print()

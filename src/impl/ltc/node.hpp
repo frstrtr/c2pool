@@ -12,6 +12,7 @@
 #include "desired_request_pacer.hpp"   // futility backoff for the desired-request drain
 #include "ingest_budget.hpp"            // inbound-share admission bounds + ancestor-walk depth bound
 #include "misbehavior.hpp"              // #1601 per-peer invalid-PoW misbehavior scoring
+#include "own_share_reject_marks.hpp"    // re-broadcast hold-off for our own shares a peer aborted on
 #include <pool/share_download.hpp>     // shared downloader helpers (build_stops)
 
 #include <core/coin_params.hpp>
@@ -30,6 +31,9 @@
 #include <chrono>
 #include <cstdint>
 #include <deque>
+#include <map>
+#include <optional>
+#include <string>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -130,6 +134,89 @@ struct ShareReplyData
     bool empty() const { return size() == 0; }
 };
 
+// ── Share version 3601 flag day: peers (share.hpp FLAG_DAY_SHARE_VERSION) ──
+// A peer below PoolConfig::V3601_PROTOCOL_VERSION cannot load a 3601 share
+// (old c2pool logs "version unsupported" for each; p2pool drops the
+// connection), and from the flag day on its own shares are V36 shares we
+// reject. Before the flag day it is a normal peer; from it, it is
+// disconnected and refused (a clean close, never a ban), and a 3601 share is
+// never sent to it.
+inline bool peer_takes_3601(const std::optional<uint32_t>& protocol)
+{
+    return protocol.has_value() && *protocol >= PoolConfig::V3601_PROTOCOL_VERSION;
+}
+
+inline bool v3601_flag_day_passed(uint32_t now_unix)
+{
+    return now_unix >= PoolConfig::v3601_activation_time();
+}
+
+inline std::string pre_3601_peer_line(const std::string& addr, const std::optional<uint32_t>& protocol,
+                                      const std::string& subversion)
+{
+    return "peer " + addr + " (protocol " + (protocol ? std::to_string(*protocol) : std::string("?"))
+           + (subversion.empty() ? std::string() : ", " + subversion) + ") is too old for share version 3601"
+           + " (switched at " + std::to_string(PoolConfig::v3601_activation_time())
+           + "): peer too old, upgrade to c2pool v0.2.12; disconnecting";
+}
+
+// The "too old for share version 3601" WARNING: once an hour per peer IP. An
+// old peer redials from a new ephemeral port each time, so a limit per
+// ip:port would let the line repeat on every redial; the rest go to the
+// debug log. Bounded: expired entries are dropped past 4096.
+class Pre3601WarnLimiter
+{
+public:
+    using clock = std::chrono::steady_clock;
+    bool should_warn(const std::string& ip, clock::time_point now)
+    {
+        auto& until = m_until[ip];
+        if (until > now)
+            return false;
+        until = now + std::chrono::hours(1);
+        if (m_until.size() > 4096)
+            for (auto it = m_until.begin(); it != m_until.end();)
+                it = it->second <= now ? m_until.erase(it) : std::next(it);
+        return true;
+    }
+    std::size_t size() const { return m_until.size(); }
+
+private:
+    std::map<std::string, clock::time_point> m_until;
+};
+
+// A share received from a peer (or read back from LevelDB) whose type number
+// does not fit its own timestamp (share_check.hpp flag_day_problem, without
+// the parent): a type below 3601 at or after the flag day, or a 3601 share
+// before it. "" when it fits. Neither the share hash nor its coinbase
+// commits to the type number, so such a share may be an honest share
+// re-wrapped under the other number: it must never reach the tracker, whose
+// dedup by hash would keep the bad copy (it fails the share check and then
+// takes the honest children with it), nor the relay cache. The share
+// handlers drop it and disconnect the sender: a peer below 3601 past the
+// flag day is too old (drop_pre_3601_peer); one sending 3601 shares before
+// it is broken or hostile. Never a ban.
+inline std::string received_share_flag_day_problem(ShareType& share)
+{
+    std::string why;
+    share.invoke([&](auto* obj) {
+        why = flag_day_problem(std::remove_pointer_t<decltype(obj)>::version, obj->m_timestamp, std::nullopt);
+    });
+    return why;
+}
+
+// A share of a version below 3601 whose timestamp is at or after the flag
+// day (the sender is a node too old for share version 3601).
+inline bool pre_3601_share_past_flag_day(ShareType& share)
+{
+    bool r = false;
+    share.invoke([&](auto* obj) {
+        r = std::remove_pointer_t<decltype(obj)>::version < FLAG_DAY_SHARE_VERSION
+            && obj->m_timestamp >= PoolConfig::v3601_activation_time();
+    });
+    return r;
+}
+
 class NodeImpl : public pool::SharechainNode<ltc::Config, ltc::ShareChain, ltc::Peer>
 {
 
@@ -198,6 +285,9 @@ protected:
     boost::asio::thread_pool m_think_pool{1};
     std::atomic<bool> m_think_running{false};
     std::atomic<bool> m_clean_running{false};
+    // A run_think() skipped because a cycle held m_think_running: the cycle's
+    // epilogue posts one run_think() for it (think_gate.hpp).
+    std::atomic<bool> m_rethink_pending{false};
     mutable std::shared_mutex m_tracker_mutex;
 
     // ── think()/clean watchdog (mirrors btc/node) ────────────────────────
@@ -433,6 +523,30 @@ protected:
     // Used by TrackerReadGuard to skip shared_lock when the caller is
     // already on the compute thread (which holds exclusive lock).
     std::atomic<std::thread::id> m_compute_thread_id{};
+    // The node whose m_tracker_mutex THIS thread holds, outside the compute
+    // thread, while it runs tracker code that fires the tracker hooks:
+    // notify_local_share's inline attempt_verify (exclusive; the io thread, or
+    // the HTTP thread for a JSON-RPC submit) and the startup block scan
+    // (shared, scan_chain_for_blocks(held, ...)). Per thread, so any number of
+    // shared holders mark independently. Set after the lock is taken, cleared
+    // before it is released (TrackerLockHolderMark). Constant-initialized
+    // inline thread_local: no TLS wrapper (see web_server.hpp
+    // t_direct_local_request).
+    inline static thread_local const NodeImpl* t_tracker_lock_holder = nullptr;
+    // Marks the calling thread as holding `node`'s tracker lock for its scope
+    // (nests: the previous mark is restored). The caller must already hold
+    // m_tracker_mutex, in either mode, for longer than the mark.
+    class TrackerLockHolderMark {
+        const NodeImpl* prev_;
+    public:
+        explicit TrackerLockHolderMark(const NodeImpl* node) : prev_(t_tracker_lock_holder)
+        {
+            t_tracker_lock_holder = node;
+        }
+        ~TrackerLockHolderMark() { t_tracker_lock_holder = prev_; }
+        TrackerLockHolderMark(const TrackerLockHolderMark&) = delete;
+        TrackerLockHolderMark& operator=(const TrackerLockHolderMark&) = delete;
+    };
 
     // Pending share batches queued while think() holds the mutex.
     // Drained on the IO thread after think() releases the lock.
@@ -586,6 +700,10 @@ public:
 
     // ICommunicator (override BaseNode to track outbound lifecycle):
     void error(const message_error_type& err, const NetService& service, const std::source_location where = std::source_location::current()) override;
+    // Socket read errors arrive here as an error_code. Records whether it was a
+    // peer abort (classified on the code, not its possibly localized text), then
+    // takes the base route, which renders the code and lands in error() above.
+    void error(const boost::system::error_code& ec, const NetService& service, const std::source_location where = std::source_location::current()) override;
     void close_connection(const NetService& service) override;
 
     // BaseNode:
@@ -623,6 +741,30 @@ public:
     // past threshold. Drop decayed scorer entries each think cycle.
     void note_invalid_pow_share(NetService addr);
     void prune_pow_misbehavior();
+
+    // Share version 3601 flag day (see peer_takes_3601 above). io-thread only.
+    // Closes the connection (no ban, and the shares sent to it in the last
+    // seconds are not taken as rejected) and keeps the dialer off the address
+    // (ip:port) for an hour; the WARNING is once an hour per IP
+    // (Pre3601WarnLimiter).
+    void drop_pre_3601_peer(const NetService& addr, const std::string& line);
+    // The share handlers: drop a received share whose type number does not
+    // fit its timestamp (received_share_flag_day_problem). Returns true when
+    // it was dropped (destroyed); `drop_peer` then names why the sender is
+    // to be disconnected, once the batch is handled (drop_misfit_sender).
+    bool drop_misfit_share(ShareType& share, std::string& drop_peer);
+    void drop_misfit_sender(const peer_ptr& peer, const std::string& why);
+    // LevelDB: the row of a share, and a locally created share stored like a
+    // received one (caller holds the tracker lock).
+    static c2pool::storage::SharechainStorage::ShareBatchEntry share_db_entry(ShareType& share,
+                                                                               const chain::RawShare* raw);
+    bool persist_local_share(const uint256& hash);
+    // From the flag day on: drop every connected peer below 3601 (every 5 s,
+    // m_flag_day_timer).
+    void disconnect_pre_3601_peers();
+    bool peer_takes_3601_at(const NetService& addr) const;
+    std::map<NetService, std::chrono::steady_clock::time_point> m_pre_3601_until;   // dial suppression
+    Pre3601WarnLimiter m_pre_3601_warn;                                              // the log line, per IP
     void processing_shares_phase2(HandleSharesData& data, NetService addr);
     /// Direct tracker access — compute-thread-only (already holds exclusive lock)
     /// or startup code (before compute thread exists).
@@ -632,7 +774,8 @@ public:
 
     /// RAII guard for IO-thread tracker reads.
     /// - IO thread: acquires shared_lock(try_to_lock). Returns falsy if busy.
-    /// - Compute thread: skips locking (exclusive already held). Always truthy.
+    /// - Compute thread, or a thread marked as holding the lock
+    ///   (holds_tracker_lock): skips locking (already held). Always truthy.
     /// Guard lifetime = lock lifetime. No way to hold a dangling reference.
     class TrackerReadGuard {
         std::shared_lock<std::shared_mutex> lock_;
@@ -664,12 +807,39 @@ public:
         return std::this_thread::get_id() == m_compute_thread_id.load(std::memory_order_relaxed);
     }
 
+    /// True if the calling thread already holds m_tracker_mutex: the compute
+    /// thread (exclusive), or a thread marked by TrackerLockHolderMark
+    /// (notify_local_share's inline verify, exclusive; the startup block scan,
+    /// shared). A std::shared_mutex must not be shared-locked by a thread that
+    /// owns it in either mode (undefined behaviour; under an exclusive hold
+    /// glibc refuses the try-lock), so readers on such a thread read directly.
+    bool holds_tracker_lock() const {
+        return is_compute_thread() || t_tracker_lock_holder == this;
+    }
+
     /// Preferred tracker accessor for IO-thread callbacks.
     /// Returns a guard that:
     ///   - On IO thread: acquires shared_lock(try_to_lock). Check `if (!guard)` before use.
-    ///   - On compute thread: skips locking (exclusive lock already held). Always valid.
+    ///   - On compute thread, or on a thread marked as holding the lock
+    ///     (notify_local_share's exclusive verify, the startup block scan: the
+    ///     tracker hooks they fire): skips locking (already held). Always valid.
     TrackerReadGuard read_tracker() {
-        return TrackerReadGuard(m_tracker_mutex, m_tracker, is_compute_thread());
+        return TrackerReadGuard(m_tracker_mutex, m_tracker, holds_tracker_lock());
+    }
+
+    /// ShareTracker::scan_chain_for_blocks for a caller that holds the tracker
+    /// lock through `held` (read_tracker(): the startup block scan). The hooks
+    /// it fires (m_on_block_found, m_on_merged_block_check) read through
+    /// read_tracker() on this thread, which took a SECOND shared lock of the
+    /// mutex this thread already held: undefined behaviour (glibc's
+    /// reader-preferring rwlock happens to grant it). They read under `held`,
+    /// in the same order. A failed guard scans nothing.
+    void scan_chain_for_blocks(const TrackerReadGuard& held, const uint256& tip, int max_shares)
+    {
+        if (!held)
+            return;
+        TrackerLockHolderMark mark(this);
+        m_tracker.scan_chain_for_blocks(tip, max_shares);
     }
 
     /// Acquire shared (reader) lock on the tracker mutex — BLOCKING.
@@ -695,7 +865,59 @@ public:
         catch (const std::invalid_argument&) { /* request already timed out */ }
     }
 
-    std::vector<ltc::ShareType> handle_get_share(std::vector<uint256> hashes, uint64_t parents, std::vector<uint256> stops, NetService peer_addr);
+    /// The shares a SHAREREQ asks for (owned clones; the caller destroy()s
+    /// them). Never blocks: when think() holds the tracker lock the answer is
+    /// empty, and `*busy` (when given) is set so the caller can try again.
+    std::vector<ltc::ShareType> handle_get_share(std::vector<uint256> hashes, uint64_t parents, std::vector<uint256> stops, NetService peer_addr, bool* busy = nullptr);
+
+    /// A SHAREREQ that found the tracker busy (handle_get_share `*busy`): it
+    /// waits, retried every SHAREREQ_RETRY_INTERVAL on a timer — the io thread
+    /// never blocks — for up to m_sharereq_busy_budget, and only then is
+    /// answered empty, as every busy request was before. False when it cannot
+    /// wait (no io_context, or SHAREREQ_DEFERRED_MAX already waiting): the
+    /// caller answers now. A node whose think() holds the lock most of each
+    /// minute otherwise answers nearly every request empty, and the peers that
+    /// need its shares never get them.
+    bool defer_sharereq(const peer_ptr& peer, const uint256& id, std::vector<uint256> hashes,
+                        uint64_t parents, std::vector<uint256> stops);
+    /// The sharereply for `id` to a waited request (good, or too_long when it
+    /// would not fit); destroy()s `shares`.
+    void write_sharereply(const peer_ptr& peer, const uint256& id, std::vector<ltc::ShareType>& shares);
+
+    struct DeferredShareReq {
+        std::weak_ptr<peer_t> peer;
+        NetService addr;
+        uint256 id;
+        std::vector<uint256> hashes;
+        uint64_t parents{0};
+        std::vector<uint256> stops;
+        std::chrono::steady_clock::time_point deadline;
+    };
+    static constexpr std::chrono::milliseconds SHAREREQ_RETRY_INTERVAL{100};
+    // At most this many requests wait at once, and this many per peer; past
+    // either a busy request is answered empty at once, as before (a flood
+    // holds no unbounded state, and one peer cannot take the whole list).
+    static constexpr std::size_t SHAREREQ_DEFERRED_MAX = 256;
+    static constexpr std::size_t SHAREREQ_DEFERRED_PER_PEER = 8;
+    // One timer pass answers at most this many waiting requests from the
+    // tracker (each can pack up to 1000 shares); the rest go in the next pass,
+    // SHAREREQ_CONTINUE_INTERVAL later, so the io thread is never held long.
+    static constexpr std::size_t SHAREREQ_SERVED_PER_PASS = 16;
+    static constexpr std::chrono::milliseconds SHAREREQ_CONTINUE_INTERVAL{10};
+    std::chrono::milliseconds m_sharereq_busy_budget{2000};
+    std::deque<DeferredShareReq> m_deferred_sharereqs;   // IO thread only
+    std::unique_ptr<boost::asio::steady_timer> m_sharereq_retry_timer;
+    bool m_sharereq_retry_armed{false};
+    struct SharereqDeferStats {
+        uint64_t deferred{0};          // requests that found the tracker busy and waited
+        uint64_t served_after_wait{0}; // ... and were answered from the tracker
+        uint64_t empty_after_wait{0};  // ... and were still busy at the deadline: empty
+        uint64_t peer_gone{0};         // ... whose peer disconnected meanwhile
+        uint64_t not_deferred{0};      // busy with the wait list (or the peer's share) full: empty at once
+        size_t last_reply_shares{0};   // shares in the last reply sent after a wait
+    } m_sharereq_defer_stats;          // IO thread only
+    void arm_sharereq_retry(std::chrono::milliseconds after = SHAREREQ_RETRY_INTERVAL);
+    void retry_deferred_sharereqs();
 
     /// Broadcast a new best-block notification to all connected P2P peers.
     void broadcast_bestblock(const coin::BlockHeaderType& header) {
@@ -1084,7 +1306,23 @@ protected:
     std::function<std::vector<std::string>()> m_local_miner_scripts_fn;
     std::string m_node_payout_script_hex;
     std::set<uint256> m_shared_share_hashes;  // de-dup set for broadcast_share
-    std::set<uint256> m_rejected_share_hashes; // shares rejected by peers — never re-broadcast
+    // Our OWN shares a peer aborted on right after we pushed them: held off
+    // RE-broadcast for a TTL. Never consulted when serving shares — see
+    // own_share_reject_marks.hpp for why the old never-expiring, serve-filtering
+    // m_rejected_share_hashes was removed.
+    ltc::OwnShareRejectMarks<uint256, NetService> m_own_share_rejects;
+    // Clock for m_own_share_rejects. A test subclass overrides it to step time.
+    virtual std::chrono::steady_clock::time_point reject_mark_now() const
+    {
+        return std::chrono::steady_clock::now();
+    }
+    // error() path: attribute a peer-initiated drop to our latest push, if any.
+    // `ec_peer_abort` is the error_code classification when the drop came in as
+    // one; the text of `reason` is the fallback.
+    void note_disconnect_for_reject_marks(const NetService& service, const std::string& reason,
+                                          bool ec_peer_abort);
+    // Set by error(error_code) for the nested error(string) call, consumed there.
+    bool m_drop_ec_is_peer_abort = false;
     // broadcast_share tracker try-lock outcome counters (see the accessors above).
     std::atomic<uint64_t> m_broadcast_deferred{0};
     std::atomic<uint64_t> m_broadcast_acquired{0};
@@ -1161,6 +1399,28 @@ protected:
     ltc::FetchFailureMemory<uint256, NetService> m_fetch_failures;  // guarded by m_fetch_failover_mtx
     std::vector<NetService> m_peer_keys_snapshot;                   // guarded by m_fetch_failover_mtx
 
+    // Which peer download_shares asks next for a parent: untried peers first
+    // (30 min memory), the next untried one at once after an empty reply, the
+    // pacer only once every connected peer has failed the hash. The 90 s
+    // m_fetch_failures above stays the abandoned() input. See
+    // share_fetch_failover.hpp FetchPeerRotation. IO-THREAD CONFINED.
+    ltc::FetchPeerRotation<uint256, NetService> m_fetch_rotation;
+
+    // Whether a handshake may wake the backed-off parents (a host not seen
+    // within 10 min, at most once per 30 s). IO-THREAD CONFINED.
+    ltc::PeerWakeGate<std::string> m_peer_wake_gate;
+
+    // A peer finished its handshake: it is untried for every parent, and —
+    // when it is a new source (m_peer_wake_gate) — every backed-off parent may
+    // be asked again now (it gets asked first). IO thread.
+    void note_fetch_peer_connected(const NetService& addr)
+    {
+        const double now = static_cast<double>(std::time(nullptr));
+        m_fetch_rotation.forget_peer(addr);
+        if (m_peer_wake_gate.admit(addr.address(), now))
+            m_desired_pacer.make_all_eligible(now);
+    }
+
     // Refresh the peer-key snapshot from the live IO-owned m_peers map. MUST be
     // called on the IO thread. Takes m_fetch_failover_mtx.
     void refresh_peer_keys_snapshot()
@@ -1189,14 +1449,6 @@ protected:
     // so we track which req_ids belong to which peer for cancel-on-disconnect.
     std::map<uint256, NetService> m_pending_share_reqs;  // req_id → peer addr
 
-    // Track recently-broadcast share hashes + timestamp so we can detect
-    // rapid disconnections (peer rejected our share → PoW invalid loop).
-    struct BroadcastRecord {
-        std::vector<uint256> hashes;
-        std::chrono::steady_clock::time_point when;
-    };
-    std::map<NetService, BroadcastRecord> m_last_broadcast_to; // per-peer
-
     // Connection maintenance
     static constexpr size_t DEFAULT_TARGET_OUTBOUND_PEERS = 8;
     size_t m_max_peers = 30;
@@ -1205,6 +1457,7 @@ protected:
     // Periodic have_tx/losing_tx delta sweep (core/tx_advertiser.hpp). Cadence
     // mirrors the canonical known-tx removal loop, node.py:298 t.start(10).
     std::unique_ptr<core::Timer> m_tx_advert_timer;
+    std::unique_ptr<core::Timer> m_flag_day_timer;   // disconnect_pre_3601_peers
     std::unique_ptr<core::Timer> m_readvert_timer; // one-shot ROOT-2 re-advert
     std::set<NetService> m_pending_outbound;   // addresses currently being dialed
     std::set<NetService> m_outbound_addrs;     // successfully connected outbound peers

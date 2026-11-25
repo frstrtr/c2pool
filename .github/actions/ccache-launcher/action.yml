@@ -1,0 +1,59 @@
+name: ccache launcher (when installed)
+description: >
+  Makes the job's CMake configure use ccache as the C/C++ compiler launcher,
+  only when ccache is on PATH. It exports CMAKE_C_COMPILER_LAUNCHER and
+  CMAKE_CXX_COMPILER_LAUNCHER to the rest of the job via GITHUB_ENV; CMake
+  (3.17+) takes them as the default for the cache variables of the same name
+  on the FIRST configure of a build dir, so this step must run before the
+  configure, and the build dir must be fresh (every caller wipes it).
+  ccache keeps using the runner's own cache dir and size cap (VM905 runners:
+  ~/.cache/ccache; heavy runners: CCACHE_DIR from the runner .env).
+
+  A runner without ccache gets a warning and builds exactly as before, with
+  no launcher: the job never fails over a missing cache. No-op on
+  github-hosted runners, whose cache would not survive the job anyway.
+
+  report: 'true' prints this job's own hit/miss counters (from a per-job
+  stats log under RUNNER_TEMP), not the shared cache's lifetime totals. Call
+  it once more near the end of the job, before "Prune runner workspace".
+
+inputs:
+  report:
+    description: "'true' = print this job's ccache hit/miss counters instead of enabling the launcher."
+    required: false
+    default: 'false'
+
+runs:
+  using: composite
+  steps:
+    - name: Enable ccache launcher if installed
+      if: inputs.report != 'true' && runner.environment != 'github-hosted'
+      shell: bash
+      run: |
+        set -uo pipefail
+        if ! command -v ccache >/dev/null 2>&1; then
+          echo "::warning title=ccache missing::ccache not on PATH on runner ${RUNNER_NAME:-?}; building without a compiler launcher (slower, still correct)"
+          exit 0
+        fi
+        log="$RUNNER_TEMP/ccache-stats.log"
+        : > "$log"
+        {
+          echo "CMAKE_C_COMPILER_LAUNCHER=ccache"
+          echo "CMAKE_CXX_COMPILER_LAUNCHER=ccache"
+          echo "CCACHE_STATSLOG=$log"
+        } >> "$GITHUB_ENV"
+        echo "ccache launcher on: $(ccache --version | head -1), cache_dir=$(ccache -k cache_dir 2>/dev/null || echo '?'), max_size=$(ccache -k max_size 2>/dev/null || echo '?')"
+
+    - name: ccache hits and misses for this job
+      # !cancelled(): report after a failed build too (no implicit success()).
+      if: ${{ !cancelled() && inputs.report == 'true' && runner.environment != 'github-hosted' }}
+      shell: bash
+      run: |
+        set -uo pipefail
+        if [ -z "${CCACHE_STATSLOG:-}" ]; then
+          echo "ccache launcher was not enabled in this job"
+        elif [ ! -s "$CCACHE_STATSLOG" ]; then
+          echo "ccache: no compiler calls went through the launcher in this job"
+        else
+          ccache --show-log-stats -v || true
+        fi

@@ -178,14 +178,25 @@ TEST(DashSimplifiedMNS, CalcHashPreimageBitExact) {
 }
 
 TEST(DashSimplifiedMNS, CalcHashOmitsVersion) {
-    // Two entries identical in every HASHED field but with different
-    // nVersion (both >= VER_BASIC_BLS so the conditional branches match)
-    // must hash identically, proving nVersion is excluded from the preimage.
-    auto a = make_entry(CSimplifiedMNListEntry::VER_BASIC_BLS,
-                        CSimplifiedMNListEntry::TYPE_REGULAR);
-    auto b = a;
-    b.nVersion = CSimplifiedMNListEntry::VER_EXT_ADDR;   // 3, still regular
-    EXPECT_EQ(a.CalcHash(), b.CalcHash());
+    // The SER_GETHASH preimage is the network encoding minus its leading
+    // 2-byte nVersion, for every entry version. (This used to compare a v2
+    // entry with a "v3" copy of it; since Dash Core v24 a v3 entry carries an
+    // ExtNetInfo instead of the 18-byte service, so no two versions >= 2
+    // share a layout any more and the property is pinned per version.)
+    for (uint16_t ver : {CSimplifiedMNListEntry::VER_LEGACY_BLS,
+                         CSimplifiedMNListEntry::VER_BASIC_BLS,
+                         CSimplifiedMNListEntry::VER_EXT_ADDR}) {
+        auto e = make_entry(ver, CSimplifiedMNListEntry::TYPE_REGULAR);
+        auto ps = ::pack(e);
+        auto sp = ps.get_span();
+        ASSERT_GT(sp.size(), 2u);
+        uint256 expected;
+        CHash256()
+            .Write(std::span<const unsigned char>(
+                reinterpret_cast<const unsigned char*>(sp.data()) + 2, sp.size() - 2))
+            .Finalize(std::span<unsigned char>(expected.data(), 32));
+        EXPECT_EQ(e.CalcHash(), expected) << "nVersion=" << ver;
+    }
 }
 
 // ─── KAT 3: sort uses memcmp order, NOT integer order (Bug A guard) ─────────

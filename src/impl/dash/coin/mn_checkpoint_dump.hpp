@@ -84,6 +84,14 @@ namespace coin {
 
 namespace mn_dump_detail {
 
+/// A row with nothing to pay: no scriptPayout below v3, no payouts and no
+/// shares at v3 (Dash Core v24).
+inline bool payee_less(uint16_t nVersion, const OPScript& script_payout, const MnStateV24Ext& ext)
+{
+    if (v24::state_has_ext(nVersion)) return ext.payouts.empty() && ext.shares.empty();
+    return script_payout.m_data.empty();
+}
+
 inline std::string hex_lower(const unsigned char* p, size_t n)
 {
     static const char* kHex = "0123456789abcdef";
@@ -190,9 +198,13 @@ inline constexpr const char* kSelfDerivedIncHeader =
 
 /// One `mn` .inc line for a registered masternode, in the authoritative
 /// 17-field order (mn_checkpoint.hpp:66-83). REUSED by the dumper and the KAT.
+/// `v2`: the format-/2 line (Dash Core v24): an 18th column with the
+/// MnStateV24Ext hex (`-` below v3), and `-` for a v3 row's scriptPayout.
 inline std::string emit_mn_record_line(const uint256& protx,
-                                       const replay::ReplayMNState& st)
+                                       const replay::ReplayMNState& st,
+                                       bool v2 = false)
 {
+    const bool v3_row = v24::state_has_ext(st.nVersion);
     using namespace mn_dump_detail;
     std::ostringstream o;
     o << "mn "
@@ -208,8 +220,10 @@ inline std::string emit_mn_record_line(const uint256& protx,
       << clamp_height(st.nConsecutivePayments) << ' '          // 10 consecutivePayments
       << st.nRevocationReason << ' '                           // 11 revocationReason
       << st.nOperatorReward << ' '                             // 12 operatorReward (bps)
-      // 13 scriptPayout — REQUIRED, verbatim ProRegTx bytes (chain-authentic).
-      << hex_lower(st.scriptPayout.m_data.data(), st.scriptPayout.m_data.size()) << ' ';
+      // 13 scriptPayout — REQUIRED, verbatim ProRegTx bytes (chain-authentic);
+      //    `-` for a v3 row (/2), whose payouts are column 18.
+      << (v3_row ? std::string("-")
+                 : hex_lower(st.scriptPayout.m_data.data(), st.scriptPayout.m_data.size())) << ' ';
     // 14 scriptOperatorPayout — `-` when unset.
     if (st.scriptOperatorPayout.m_data.empty())
         o << "- ";
@@ -231,6 +245,17 @@ inline std::string emit_mn_record_line(const uint256& protx,
         o << "-";
     else
         o << hex_lower(st.pubKeyOperator.data(), st.pubKeyOperator.size());
+    if (v2) {
+        // 18 v24 state (Dash Core v24, format /2) — `-` below version 3.
+        if (!v3_row) {
+            o << " -";
+        } else {
+            ::PackStream ps;
+            ps << st.v24;
+            auto sp = ps.get_span();
+            o << ' ' << hex_lower(reinterpret_cast<const unsigned char*>(sp.data()), sp.size());
+        }
+    }
     return o.str();
 }
 
@@ -252,7 +277,7 @@ struct MnCheckpointDump {
 inline MnCheckpointDump finish_mn_checkpoint_dump(
     std::vector<std::pair<std::string, std::string>> rows,
     uint32_t height, const uint256& blockhash, const std::string& network,
-    const std::string& source, const std::string& generated)
+    const std::string& source, const std::string& generated, bool v2 = false)
 {
     using namespace mn_dump_detail;
     MnCheckpointDump r;
@@ -270,7 +295,7 @@ inline MnCheckpointDump finish_mn_checkpoint_dump(
 
     // 7-line header, exact order/formatting of gen_mn_checkpoint.py.
     std::vector<std::string> header = {
-        std::string(kMnCheckpointMagic),
+        std::string(v2 ? kMnCheckpointMagicV2 : kMnCheckpointMagic),
         "network " + network,
         "height " + std::to_string(height),
         "blockhash " + blockhash.GetHex(),
@@ -337,6 +362,7 @@ inline replay::ReplayMNState mnstate_to_replay_line(const MNState& mn)
     st.keyIDVoting          = mn.keyIDVoting;
     st.scriptPayout         = mn.scriptPayout;
     st.scriptOperatorPayout = mn.scriptOperatorPayout;
+    st.v24                  = mn.v24;
     return st;
 }
 
@@ -368,18 +394,21 @@ inline MnCheckpointDump emit_mn_checkpoint_dump(const replay::DmlFoldEngine& eng
     // runtime parser would (mn_checkpoint.hpp:470-480).
     std::vector<std::pair<std::string, std::string>> rows;  // (protx display hex, line)
     rows.reserve(engine.size());
+    bool v2 = false;   // format /2 iff the set holds a Dash Core v24 (v3) state
+    for (const auto& [protx, st] : engine.entries())
+        if (v24::state_has_ext(st.nVersion)) v2 = true;
     for (const auto& [protx, st] : engine.entries()) {
-        if (st.scriptPayout.m_data.empty()) {
+        if (mn_dump_detail::payee_less(st.nVersion, st.scriptPayout, st.v24)) {
             r.error = "registered MN " + protx.GetHex().substr(0, 16)
                     + " carries an empty scriptPayout — a payee-less MN would"
                       " project a wrong payee (fail-closed)";
             return r;
         }
-        rows.emplace_back(protx.GetHex(), emit_mn_record_line(protx, st));
+        rows.emplace_back(protx.GetHex(), emit_mn_record_line(protx, st, v2));
     }
     return finish_mn_checkpoint_dump(std::move(rows), engine.height(),
                                      engine.block_hash(), engine.network(),
-                                     source, generated);
+                                     source, generated, v2);
 }
 
 /// MN-CKPT BRIDGE overload. Serialize the bridge's OWN reconstructed set —
@@ -410,15 +439,22 @@ inline MnCheckpointDump emit_mn_checkpoint_dump(
     // runtime parser would (mn_checkpoint.hpp:470-480).
     std::vector<std::pair<std::string, std::string>> rows;  // (protx display hex, line)
     rows.reserve(entries.size());
+    bool v2 = false;   // format /2 iff the set holds a Dash Core v24 (v3) state
+    for (const auto& [protx, mn] : entries)
+        if (v24::state_has_ext(mn.nVersion)) v2 = true;
     for (const auto& [protx, mn] : entries) {
-        if (mn.scriptPayout.m_data.empty()) {
+        if (mn_dump_detail::payee_less(mn.nVersion, mn.scriptPayout, mn.v24)) {
             r.error = "registered MN " + protx.GetHex().substr(0, 16)
                     + " carries an empty scriptPayout — a payee-less MN would"
                       " project a wrong payee (fail-closed)";
             return r;
         }
         rows.emplace_back(protx.GetHex(),
-                          emit_mn_record_line(protx, mnstate_to_replay_line(mn)));
+                          emit_mn_record_line(protx, mnstate_to_replay_line(mn), v2));
+    }
+    if (v2) {
+        return finish_mn_checkpoint_dump(std::move(rows), height, blockhash,
+                                         network, source, generated, true);
     }
     return finish_mn_checkpoint_dump(std::move(rows), height, blockhash,
                                      network, source, generated);

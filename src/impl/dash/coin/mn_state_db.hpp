@@ -38,6 +38,7 @@
 /// CDeterministicMNState wire layout.
 
 #include <impl/dash/coin/vendor/providertx.hpp>
+#include <impl/dash/coin/v24_state.hpp>
 
 #include <core/leveldb_store.hpp>
 #include <core/uint256.hpp>
@@ -87,6 +88,10 @@ struct MNState
     uint160                                        platformNodeID;
     uint16_t                                       platformP2PPort{0};
     uint16_t                                       platformHTTPPort{0};
+
+    // Dash Core v24 (nVersion >= 3): payout list, share table, early-exit
+    // terms and the ExtNetInfo that replaces `netInfo`. Empty below v3.
+    MnStateV24Ext                                  v24;
 
     // ── Payout-split provenance (incident h=2516595 bad-cb-payee) ──────
     // dashd's coinbase pays the MN share as a SET: owner scriptPayout plus,
@@ -155,15 +160,34 @@ struct MNState
     /// projected?") must test THIS script, never scriptPayout alone and never
     /// "any script of this masternode". Mainnet, 2026-10-28: four anchor rows
     /// carry bps=10000 with the operator script equal to the owner script.
+    /// Dash Core v24: a v3 state pays its payout list (the first entry is the
+    /// guaranteed one) and a shared state its shares (v24::guaranteed_payout_script).
     const std::vector<unsigned char>& first_payout_script() const
     {
-        return (nOperatorReward == 10000
-                && !scriptOperatorPayout.m_data.empty())
-            ? scriptOperatorPayout.m_data
-            : scriptPayout.m_data;
+        return v24::guaranteed_payout_script(*this);
     }
 
-    C2POOL_SERIALIZE_METHODS(MNState)
+    // Row codec (format 3). The pre-v24 fields keep their exact format-2
+    // layout; a state with nVersion >= 3 appends its MnStateV24Ext. A v1/v2
+    // state therefore encodes exactly as in format 2.
+    template <typename Stream>
+    void Serialize(Stream& s) const
+    {
+        Base::Write(s, *this);
+        if (v24::state_has_ext(nVersion)) s << v24;
+    }
+    template <typename Stream>
+    void Unserialize(Stream& s)
+    {
+        Base::Read(s, *this);
+        if (v24::state_has_ext(nVersion)) s >> v24;
+    }
+    /// Pre-v24 (format 3) reading: the pre-v24 fields only.
+    template <typename Stream>
+    void unserialize_pre_v24(Stream& s) { Base::Read(s, *this); }
+
+    struct Base {
+    FORMAT_METHODS(MNState)
     {
         READWRITE(obj.nVersion,
                   obj.nType,
@@ -187,6 +211,7 @@ struct MNState
                   obj.platformHTTPPort,
                   obj.payoutSplitProvenance);
     }
+    };
 
     bool operator==(const MNState& r) const
     {
@@ -208,7 +233,8 @@ struct MNState
             && platformNodeID == r.platformNodeID
             && platformP2PPort == r.platformP2PPort
             && platformHTTPPort == r.platformHTTPPort
-            && payoutSplitProvenance == r.payoutSplitProvenance;
+            && payoutSplitProvenance == r.payoutSplitProvenance
+            && v24 == r.v24;
     }
 };
 
@@ -230,12 +256,34 @@ public:
     // mixes dashd-seeded LEGACY bytes with projection-written basic ones,
     // which no byte rule can tell apart; it is cleared and reseeded through
     // the canonicalizing seed paths (a one-time cold start).
-    static constexpr uint32_t kFormatVersion = 3;
+    //
+    // v4 (Dash Core v24) appends the v24 state block to rows whose nVersion
+    // is 3 or more; v1/v2 rows are byte-identical to v3. A v3 store is
+    // therefore read in place: its rows are decoded with the v3 layout, and
+    // only if one of them already claims nVersion >= 3 (a v24 state an older
+    // binary stored without its payout list) is the store cleared and
+    // reseeded, because that state cannot be completed. A v2 store is
+    // cleared (above).
+    static constexpr uint32_t kFormatVersion = 4;
+    static constexpr uint32_t kFormatVersionPreV24 = 3;
 
     bool open()
     {
         if (!m_store.open()) return false;
-        const uint32_t stored = load_format_version();
+        uint32_t stored = load_format_version();
+        if (stored == kFormatVersionPreV24) {
+            if (pre_v24_store_has_v24_rows()) {
+                LOG_INFO << "[MNS-DB] format v3 store holds a v24 (nVersion>=3) state"
+                            " without its payout list: clearing; the"
+                            " checkpoint/seed reseed rebuilds it";
+                if (!clear()) return false;
+            } else {
+                LOG_INFO << "[MNS-DB] format v3 -> v4: rows read in place"
+                            " (identical encoding below nVersion 3)";
+            }
+            store_format_version();
+            stored = kFormatVersion;
+        }
         if (stored != kFormatVersion) {
             const bool had_rows =
                 !m_store.list_keys(std::string(1, 'M'), /*limit=*/1).empty();
@@ -243,8 +291,9 @@ public:
                 LOG_INFO << "[MNS-DB] format v" << stored << " -> v"
                          << kFormatVersion
                          << " migration: clearing store (v2: payout-split "
-                            "provenance; v3: canonical operator keys); the "
-                            "checkpoint/seed reseed rebuilds it";
+                            "provenance; v3: canonical operator keys; v4: Dash "
+                            "Core v24 states); the checkpoint/seed reseed "
+                            "rebuilds it";
                 if (!clear()) return false;
             }
             store_format_version();
@@ -379,6 +428,23 @@ private:
     static std::string make_state_key() { return std::string(1, 'B'); }
 
     static std::string make_format_key() { return std::string(1, 'F'); }
+
+    bool pre_v24_store_has_v24_rows()
+    {
+        for (const auto& key : m_store.list_keys(std::string(1, 'M'), /*limit=*/100000)) {
+            std::vector<uint8_t> data;
+            if (key.size() != 33 || !m_store.get(key, data)) continue;
+            try {
+                MNState st;
+                ::PackStream ps(data);
+                st.unserialize_pre_v24(ps);
+                if (v24::state_has_ext(st.nVersion)) return true;
+            } catch (const std::exception&) {
+                // load_all reports undecodable rows as before
+            }
+        }
+        return false;
+    }
 
     // 0 = no format key (a v1 store, or a fresh directory).
     uint32_t load_format_version()

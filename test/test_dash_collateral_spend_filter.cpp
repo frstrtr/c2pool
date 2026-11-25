@@ -31,6 +31,9 @@
 #include <impl/dash/coin/mn_state_db.hpp>
 #include <impl/dash/coin/mempool.hpp>
 #include <impl/dash/coin/node_coin_state.hpp>
+#include <impl/dash/coin/vendor/mnhftx.hpp>
+#include <impl/dash/coin/mnhf_check.hpp>
+#include <impl/dash/coin/quorum_manager.hpp>
 #include <impl/dash/coin/subsidy.hpp>
 #include <impl/dash/coin/transaction.hpp>
 #include <impl/dash/coin/utxo_adapter.hpp>
@@ -44,6 +47,8 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <set>
+#include <utility>
 #include <vector>
 
 using dash::coin::DashWorkData;
@@ -256,4 +261,823 @@ TEST(DashCollateralSpendFilter, PredicateMatchesExactOutpointOnly) {
     in2.sequence = 0xffffffffu;
     multi.vin.push_back(in2);
     EXPECT_TRUE(tx_spends_mn_collateral(mnstates, multi));
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// The exclusion takes the spend's in-body descendants with it. Selection is
+// topological (mempool.hpp G1), so a child of the spend and that child's own
+// child are packed after it; left behind, each spends an output the block
+// does not create and a won block is rejected
+// bad-txns-inputs-missingorspent. The exclusion runs in both postures: the
+// bare builder and the default daemonless one (SML present,
+// --embedded-include-mn-special-txs on).
+// ════════════════════════════════════════════════════════════════════════
+
+TEST(DashCollateralSpendFilter, ExcludedSpendTakesItsChildAndGrandchildOut) {
+    UTXOViewCache utxo(nullptr);
+    Mempool mp;
+    mp.set_utxo(&utxo);
+    const uint256 p0 = mint_hash(0x50);
+    utxo.add_coin(Outpoint(p0, 0), Coin(100'000, {}, 1, false));
+    const auto innocent = make_spend(p0, 0, 90'000, /*salt=*/1);                  // fee 10'000
+    const uint256 collat = raw256(0xC0);
+    utxo.add_coin(Outpoint(collat, 0), Coin(100'000'000'000LL, {}, 1, false));
+    const auto spend = make_spend(collat, 0, 99'999'950'000LL, /*salt=*/2);       // fee 50'000
+    const auto child = make_spend(dash::coin::dash_txid(spend), 0,
+                                  99'999'940'000LL, /*salt=*/3);                  // fee 10'000
+    const auto grandchild = make_spend(dash::coin::dash_txid(child), 0,
+                                       99'999'930'000LL, /*salt=*/4);             // fee 10'000
+    ASSERT_TRUE(mp.add_tx(innocent));
+    ASSERT_TRUE(mp.add_tx(spend));
+    ASSERT_TRUE(mp.add_tx(child));
+    ASSERT_TRUE(mp.add_tx(grandchild));
+
+    std::vector<CSimplifiedMNListEntry> entries;
+    for (uint8_t b : {0x01, 0x02}) {
+        CSimplifiedMNListEntry e;
+        e.nVersion = CSimplifiedMNListEntry::VER_BASIC_BLS;
+        e.proRegTxHash = raw256(b);
+        e.confirmedHash = raw256(0x77);
+        e.isValid = true;
+        entries.push_back(e);
+    }
+    const CSimplifiedMNList sml(std::move(entries));
+    dash::coin::QuorumManager qmgr;
+    auto build = [&](const MnStateMachine& mnstates, bool daemonless) {
+        if (!daemonless)
+            return build_embedded_workdata(H - 1, raw256(0xAB), mnstates, mp, 0x1b104be3u,
+                                           1'700'000'000u, DASH_PUBKEY_VER, DASH_P2SH_VER);
+        return build_embedded_workdata(
+            H - 1, raw256(0xAB), mnstates, mp, 0x1b104be3u, 1'700'000'000u,
+            DASH_PUBKEY_VER, DASH_P2SH_VER, 1'700'000'100u, 0x20000000u, nullptr,
+            &sml, &qmgr, 0, dash::coin::k_zero_cl_sig, 0, nullptr, nullptr,
+            dash::coin::DASH_MN_RR_HEIGHT_MAINNET, nullptr,
+            dash::coin::DASH_MN_MIN_CONFIRMATIONS_MAINNET, /*suppress=*/false,
+            "utxo-immature-serving", nullptr, false, nullptr,
+            /*include_mn_special_txs=*/true, nullptr, nullptr, nullptr,
+            /*v24_active=*/false, nullptr, nullptr);
+    };
+    auto rides = [](const DashWorkData& w, const MutableTransaction& tx) {
+        for (const auto& h : w.m_tx_hashes)
+            if (h == dash::coin::dash_txid(tx)) return true;
+        return false;
+    };
+    const int64_t reward = compute_dash_block_reward_post_v20(H);
+
+    // Not vacuous: when the outpoint backs no masternode the whole chain rides.
+    const auto no_mn = mn_set_with_collateral(raw256(0xC1), 0);
+    for (bool daemonless : {false, true}) {
+        const auto w = build(no_mn, daemonless);
+        EXPECT_TRUE(rides(w, spend) && rides(w, child) && rides(w, grandchild))
+            << "daemonless=" << daemonless << ": the selector packs the chain";
+        EXPECT_EQ(w.m_coinbase_value, static_cast<uint64_t>(reward + 80'000));
+    }
+
+    const auto mnstates = mn_set_with_collateral(collat, 0);
+    for (bool daemonless : {false, true}) {
+        const auto w = build(mnstates, daemonless);
+        EXPECT_TRUE(rides(w, innocent)) << "daemonless=" << daemonless;
+        EXPECT_FALSE(rides(w, spend)) << "daemonless=" << daemonless;
+        EXPECT_FALSE(rides(w, child))
+            << "daemonless=" << daemonless << ": child of the excluded spend left in the body";
+        EXPECT_FALSE(rides(w, grandchild))
+            << "daemonless=" << daemonless << ": grandchild of the excluded spend left in the body";
+        EXPECT_EQ(w.m_coinbase_value, static_cast<uint64_t>(reward + 10'000))
+            << "daemonless=" << daemonless << ": the dropped fees must leave the coinbase";
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// TOPOLOGY, defence in depth: a body tx that spends an output of a mempool tx
+// the body does not carry before it. The builder drops it (and, by the same
+// rule, its descendants) with their fees; the pre-emit gate refuses a final
+// body that still carries one. Neither the tx-serve referee nor any other
+// gate checked input topology, which is how an orphaned child of an excluded
+// collateral spend could reach a miner.
+// ════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+// P (chain-funded), its child C, C's child G, and an independent U, all in
+// the mempool; fees 10'000 each.
+struct Chain {
+    UTXOViewCache utxo{nullptr};
+    Mempool mp;
+    MutableTransaction p, c, g, u;
+    Chain()
+    {
+        mp.set_utxo(&utxo);
+        const uint256 fp = mint_hash(0x61), fu = mint_hash(0x62);
+        utxo.add_coin(Outpoint(fp, 0), Coin(1'000'000, {}, 1, false));
+        utxo.add_coin(Outpoint(fu, 0), Coin(1'000'000, {}, 1, false));
+        p = make_spend(fp, 0, 990'000, 11);
+        c = make_spend(dash::coin::dash_txid(p), 0, 980'000, 12);
+        g = make_spend(dash::coin::dash_txid(c), 0, 970'000, 13);
+        u = make_spend(fu, 0, 990'000, 14);
+        for (const auto* t : {&p, &c, &g, &u}) EXPECT_TRUE(mp.add_tx(*t));
+    }
+};
+
+std::vector<Mempool::SelectedTx> selection(std::initializer_list<const MutableTransaction*> txs)
+{
+    std::vector<Mempool::SelectedTx> out;
+    for (const auto* t : txs) out.push_back(Mempool::SelectedTx{*t, 10'000, 200});
+    return out;
+}
+
+} // namespace
+
+TEST(DashBodyTopology, BuilderPassDropsATxWhoseMempoolParentIsNotServed) {
+    Chain ch;
+    using dash::coin::drop_txs_spending_unserved_mempool_parents;
+
+    // P left out: C and, through C, G go with their fees; U stays.
+    auto sel = selection({&ch.u, &ch.c, &ch.g});
+    uint64_t fees = 30'000;
+    EXPECT_EQ(drop_txs_spending_unserved_mempool_parents(sel, fees, ch.mp, H), 2u);
+    ASSERT_EQ(sel.size(), 1u);
+    EXPECT_EQ(dash::coin::dash_txid(sel[0].tx), dash::coin::dash_txid(ch.u));
+    EXPECT_EQ(fees, 10'000u);
+
+    // The whole chain, parents first: nothing to drop.
+    auto full = selection({&ch.p, &ch.c, &ch.g, &ch.u});
+    fees = 40'000;
+    EXPECT_EQ(drop_txs_spending_unserved_mempool_parents(full, fees, ch.mp, H), 0u);
+    EXPECT_EQ(full.size(), 4u);
+    EXPECT_EQ(fees, 40'000u);
+
+    // A child placed before its parent is dropped, its own child with it.
+    auto reversed = selection({&ch.c, &ch.p, &ch.g});
+    fees = 30'000;
+    EXPECT_EQ(drop_txs_spending_unserved_mempool_parents(reversed, fees, ch.mp, H), 2u);
+    ASSERT_EQ(reversed.size(), 1u);
+    EXPECT_EQ(dash::coin::dash_txid(reversed[0].tx), dash::coin::dash_txid(ch.p));
+    EXPECT_EQ(fees, 10'000u);
+}
+
+TEST(DashBodyTopology, EmitGateRefusesABodyTxWhoseMempoolParentIsNotEarlier) {
+    const uint256 prev_hash = raw256(0xAB);
+    auto seed = mn_set_with_collateral(raw256(0xC0), 0);
+    std::vector<CSimplifiedMNListEntry> entries;
+    for (uint8_t b : {0x01, 0x02}) {
+        CSimplifiedMNListEntry e;
+        e.nVersion = CSimplifiedMNListEntry::VER_BASIC_BLS;
+        e.proRegTxHash = raw256(b);
+        e.confirmedHash = raw256(0x77);
+        e.isValid = true;
+        entries.push_back(e);
+    }
+    CSimplifiedMNList sml(std::move(entries));
+
+    UTXOViewCache utxo(nullptr);
+    NodeCoinState st;
+    st.set_require_sml(true);
+    st.sml() = sml;
+    st.set_have_sml(true);
+    st.set_sml_current_hash(prev_hash);
+    st.mnstates().load(seed.snapshot(), H - 1);
+    st.mempool().set_utxo(&utxo);
+    st.set_tip(H - 1, prev_hash, 0x1b104be3u, 1'700'000'000u,
+               DASH_PUBKEY_VER, DASH_P2SH_VER);
+    const uint256 fp = mint_hash(0x61);
+    utxo.add_coin(Outpoint(fp, 0), Coin(1'000'000, {}, 1, false));
+    const auto p = make_spend(fp, 0, 990'000, 11);
+    const auto c = make_spend(dash::coin::dash_txid(p), 0, 980'000, 12);
+    ASSERT_TRUE(st.mempool().add_tx(p));
+    ASSERT_TRUE(st.mempool().add_tx(c));
+
+    auto body = [&](std::initializer_list<const MutableTransaction*> txs) {
+        DashWorkData w;
+        auto cb = build_embedded_cbtx(H - 1, sml, st.qmgr(),
+                                      0, std::array<uint8_t, 96>{}, 0, nullptr);
+        w.m_coinbase_payload = encode_cbtx(cb);
+        for (const auto* t : txs) w.m_txs.emplace_back(*t);
+        return w;
+    };
+    DeclineReport why;
+
+    EXPECT_FALSE(st.embedded_template_emit_ok(body({&c}), &why));
+    EXPECT_EQ(why.cause, "emit-tx-spends-unserved-mempool-parent");
+    EXPECT_FALSE(st.embedded_template_emit_ok(body({&c, &p}), &why));
+    EXPECT_EQ(why.cause, "emit-tx-spends-unserved-mempool-parent") << "parent after child";
+
+    EXPECT_TRUE(st.embedded_template_emit_ok(body({&p, &c}), &why))
+        << why.cause << " " << why.value;
+}
+
+// N2 belt. A template built before an islock arrived still carries the tx the
+// lock conflicts with; Dash Core rejects a block with it unless the block is
+// already ChainLocked (v24.0.2 validation.cpp:2811-2829, conflict-tx-lock).
+// The emit gate refuses such a body when the lock is VERIFIED, and only then:
+// a relay-lane (unverified) lock must not be able to refuse templates.
+TEST(DashBodyTopology, EmitGateRefusesABodyTxThatConflictsWithAVerifiedIslock) {
+    const uint256 prev_hash = raw256(0xAB);
+    auto seed = mn_set_with_collateral(raw256(0xC0), 0);
+    std::vector<CSimplifiedMNListEntry> entries;
+    for (uint8_t b : {0x01, 0x02}) {
+        CSimplifiedMNListEntry e;
+        e.nVersion = CSimplifiedMNListEntry::VER_BASIC_BLS;
+        e.proRegTxHash = raw256(b);
+        e.confirmedHash = raw256(0x77);
+        e.isValid = true;
+        entries.push_back(e);
+    }
+    CSimplifiedMNList sml(std::move(entries));
+
+    UTXOViewCache utxo(nullptr);
+    NodeCoinState st;
+    st.set_require_sml(true);
+    st.sml() = sml;
+    st.set_have_sml(true);
+    st.set_sml_current_hash(prev_hash);
+    st.mnstates().load(seed.snapshot(), H - 1);
+    st.mempool().set_utxo(&utxo);
+    st.set_tip(H - 1, prev_hash, 0x1b104be3u, 1'700'000'000u,
+               DASH_PUBKEY_VER, DASH_P2SH_VER);
+    const uint256 fp = mint_hash(0x62);
+    utxo.add_coin(Outpoint(fp, 0), Coin(1'000'000, {}, 1, false));
+    const auto a = make_spend(fp, 0, 990'000, 13);
+    ASSERT_TRUE(st.mempool().add_tx(a));
+
+    auto body = [&](std::initializer_list<const MutableTransaction*> txs) {
+        DashWorkData w;
+        auto cb = build_embedded_cbtx(H - 1, sml, st.qmgr(),
+                                      0, std::array<uint8_t, 96>{}, 0, nullptr);
+        w.m_coinbase_payload = encode_cbtx(cb);
+        for (const auto* t : txs) w.m_txs.emplace_back(*t);
+        return w;
+    };
+    DeclineReport why;
+    const std::vector<std::pair<uint256, uint32_t>> lock_fp{{fp, 0u}};
+
+    // Baseline: the body built before any lock is clean.
+    ASSERT_TRUE(st.embedded_template_emit_ok(body({&a}), &why))
+        << why.cause << " " << why.value;
+
+    // A relay-lane (unverified) lock on fp:0 for another txid: no refusal.
+    st.mempool().add_islock(raw256(0x5A), lock_fp);
+    EXPECT_TRUE(st.embedded_template_emit_ok(body({&a}), &why))
+        << "an unverified lock must not refuse templates: " << why.cause;
+
+    // The same lock, VERIFIED: the served body can no longer be a valid block.
+    st.mempool().add_verified_islock(raw256(0x5A), lock_fp);
+    EXPECT_FALSE(st.embedded_template_emit_ok(body({&a}), &why));
+    EXPECT_EQ(why.cause, "emit-islock-conflict");
+    EXPECT_NE(why.value.find(dash::coin::dash_txid(a).GetHex().substr(0, 12)), std::string::npos)
+        << why.value;
+
+    // A body without the tx is fine.
+    EXPECT_TRUE(st.embedded_template_emit_ok(body({}), &why))
+        << why.cause << " " << why.value;
+
+    // A verified lock on `a` itself is not a conflict.
+    st.mempool().add_verified_islock(dash::coin::dash_txid(a), lock_fp);
+    EXPECT_TRUE(st.embedded_template_emit_ok(body({&a}), &why))
+        << why.cause << " " << why.value;
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// An MNHF signal with an output. Dash Core's CheckTransaction lets a type-7
+// tx carry inputs and outputs (consensus/tx_check.cpp:18-21), though its
+// signer never adds any (MNHFTxPayload::PrepareTx, evo/mnhftx.cpp:37-45). A
+// relayed signal B with a bad signature and one output, plus C spending B:0:
+// both used to be selected (B lifted by the +0.1 DASH MNHF priority delta),
+// the builder's MNHF screen then dropped B after every other check and kept
+// C. That is an invalid block whose coinbase claims C's fee, or, with a
+// pre-emit topology check, a template refused on every rebuild.
+// ════════════════════════════════════════════════════════════════════════
+
+TEST(DashBodyTopology, MnhfSignalWithAnOutputNeverOrphansItsChild) {
+    UTXOViewCache utxo(nullptr);
+    Mempool mp;
+    mp.set_utxo(&utxo);
+    const uint256 f = mint_hash(0x70);
+    utxo.add_coin(Outpoint(f, 0), Coin(1'000'000, {}, 1, false));
+
+    MutableTransaction b;
+    b.version = 3; b.type = dash::coin::vendor::MNHFTxPayload::SPECIALTX_TYPE; b.locktime = 0;
+    dash::coin::vendor::MNHFTxPayload pl;
+    pl.nVersion = 1;
+    pl.signal.versionBit = 13;
+    pl.signal.quorumHash = raw256(0x99);   // no such quorum: CheckMNHFTx refuses it
+    {
+        ::PackStream s;
+        s << pl;
+        auto sp = s.get_span();
+        const auto* d = reinterpret_cast<const unsigned char*>(sp.data());
+        b.extra_payload.assign(d, d + sp.size());
+    }
+    TxOut bo; bo.value = 0; bo.scriptPubKey.m_data = {0x51};
+    b.vout.push_back(bo);
+    const uint256 bid = dash::coin::dash_txid(b);
+
+    MutableTransaction c;
+    c.version = 1; c.type = 0; c.locktime = 77;
+    TxIn i0; i0.prevout.hash = bid; i0.prevout.index = 0; i0.sequence = 0xffffffffu;
+    TxIn i1; i1.prevout.hash = f;   i1.prevout.index = 0; i1.sequence = 0xffffffffu;
+    c.vin.push_back(i0); c.vin.push_back(i1);
+    TxOut co; co.value = 990'000; c.vout.push_back(co);                 // fee 10'000
+    const uint256 cid = dash::coin::dash_txid(c);
+    ASSERT_TRUE(mp.add_tx(b));
+    ASSERT_TRUE(mp.add_tx(c));
+
+    std::vector<CSimplifiedMNListEntry> entries;
+    for (uint8_t x : {0x01, 0x02}) {
+        CSimplifiedMNListEntry e;
+        e.nVersion = CSimplifiedMNListEntry::VER_BASIC_BLS;
+        e.proRegTxHash = raw256(x);
+        e.confirmedHash = raw256(0x77);
+        e.isValid = true;
+        entries.push_back(e);
+    }
+    const CSimplifiedMNList sml(std::move(entries));
+    dash::coin::QuorumManager qmgr;
+    const auto mn = mn_set_with_collateral(raw256(0xC1), 0);
+    dash::coin::MnhfCheckEnv env;   // wired, as in production; this signal fails it
+    const auto w = build_embedded_workdata(
+        H - 1, raw256(0xAB), mn, mp, 0x1b104be3u, 1'700'000'000u,
+        DASH_PUBKEY_VER, DASH_P2SH_VER, 1'700'000'100u, 0x20000000u, nullptr,
+        &sml, &qmgr, 0, dash::coin::k_zero_cl_sig, 0, nullptr, nullptr,
+        dash::coin::DASH_MN_RR_HEIGHT_MAINNET, nullptr,
+        dash::coin::DASH_MN_MIN_CONFIRMATIONS_MAINNET, /*suppress=*/false,
+        "utxo-immature-serving", nullptr, false, nullptr,
+        /*include_mn_special_txs=*/true, nullptr, nullptr, nullptr,
+        /*v24_active=*/false, nullptr, &env);
+    auto rides = [&](const uint256& id) {
+        for (const auto& h : w.m_tx_hashes) if (h == id) return true;
+        return false;
+    };
+    EXPECT_FALSE(rides(bid)) << "the refused signal rides";
+    EXPECT_FALSE(rides(cid)) << "the child of the refused signal was left in the body";
+    // Every body input that names a mempool tx names one earlier in the body.
+    ASSERT_EQ(w.m_tx_hashes.size(), w.m_txs.size());
+    std::set<uint256> earlier;
+    for (size_t i = 0; i < w.m_txs.size(); ++i) {
+        for (const auto& in : w.m_txs[i].vin)
+            EXPECT_TRUE(earlier.count(in.prevout.hash) || !mp.contains(in.prevout.hash))
+                << "body tx " << w.m_tx_hashes[i].GetHex().substr(0, 16)
+                << " spends an output of mempool tx " << in.prevout.hash.GetHex().substr(0, 16)
+                << " that the body does not carry before it";
+        earlier.insert(w.m_tx_hashes[i]);
+    }
+    EXPECT_EQ(w.m_coinbase_value, static_cast<uint64_t>(compute_dash_block_reward_post_v20(H)))
+        << "the coinbase claims the fee of a tx the block cannot carry";
+}
+
+// The txs placed before the mempool range (type-6 commitments, the pins that
+// ride, type-9 unlocks) count as served: a selected child of one of them,
+// should that parent also sit in the mempool, stays.
+TEST(DashBodyTopology, BuilderPassCountsTheTxsPlacedBeforeTheRangeAsServed) {
+    Chain ch;
+    using dash::coin::drop_txs_spending_unserved_mempool_parents;
+    auto sel = selection({&ch.c, &ch.g});
+    uint64_t fees = 20'000;
+    const std::set<uint256> placed_before{dash::coin::dash_txid(ch.p)};
+    EXPECT_EQ(drop_txs_spending_unserved_mempool_parents(sel, fees, ch.mp, H, placed_before), 0u);
+    EXPECT_EQ(sel.size(), 2u);
+    EXPECT_EQ(fees, 20'000u);
+    EXPECT_EQ(drop_txs_spending_unserved_mempool_parents(sel, fees, ch.mp, H), 2u)
+        << "without it the parent is unserved";
+    EXPECT_TRUE(sel.empty());
+    EXPECT_EQ(fees, 0u);
+}
+
+// Builder to gate on the production branch, where m_tx_hashes lines up with
+// the body. A CPFP pair (a parent below the block min fee rate on its own,
+// paid for by its child) rides parent first and passes the gate; the same
+// template with the parent cut out, ids kept aligned, is refused.
+TEST(DashBodyTopology, BuilderCpfpTemplatePassesTheGateAndFailsItWithoutTheParent) {
+    const uint256 prev_hash = raw256(0xAB);
+    auto seed = mn_set_with_collateral(raw256(0xC0), 0);
+    std::vector<CSimplifiedMNListEntry> entries;
+    for (uint8_t b : {0x01, 0x02}) {
+        CSimplifiedMNListEntry e;
+        e.nVersion = CSimplifiedMNListEntry::VER_BASIC_BLS;
+        e.proRegTxHash = raw256(b);
+        e.confirmedHash = raw256(0x77);
+        e.isValid = true;
+        entries.push_back(e);
+    }
+    UTXOViewCache utxo(nullptr);
+    NodeCoinState st;
+    st.set_require_sml(true);
+    st.sml() = CSimplifiedMNList(std::move(entries));
+    st.set_have_sml(true);
+    st.set_sml_current_hash(prev_hash);
+    st.mnstates().load(seed.snapshot(), H - 1);
+    st.mempool().set_utxo(&utxo);
+    st.set_tip(H - 1, prev_hash, 0x1b104be3u, 1'700'000'000u,
+               DASH_PUBKEY_VER, DASH_P2SH_VER, 1'700'000'100u, 0x20000000u);
+    const uint256 fp = mint_hash(0x63);
+    utxo.add_coin(Outpoint(fp, 0), Coin(1'000'000, {}, 1, false));
+    const auto p = make_spend(fp, 0, 999'990, 21);                                // fee 10
+    const auto c = make_spend(dash::coin::dash_txid(p), 0, 949'990, 22);          // fee 50'000
+    ASSERT_TRUE(st.mempool().add_tx(p));
+    ASSERT_TRUE(st.mempool().add_tx(c));
+
+    const auto w = build_embedded_workdata(
+        H - 1, prev_hash, std::as_const(st).mnstates(), st.mempool(), 0x1b104be3u,
+        1'700'000'000u, DASH_PUBKEY_VER, DASH_P2SH_VER, 1'700'000'100u, 0x20000000u, nullptr,
+        &std::as_const(st).sml(), &std::as_const(st).qmgr(), 0, dash::coin::k_zero_cl_sig, 0,
+        nullptr, nullptr, dash::coin::DASH_MN_RR_HEIGHT_MAINNET, nullptr,
+        dash::coin::DASH_MN_MIN_CONFIRMATIONS_MAINNET);
+    ASSERT_EQ(w.m_tx_hashes.size(), w.m_txs.size());
+    auto index_of = [&](const DashWorkData& t, const MutableTransaction& tx) {
+        for (size_t i = 0; i < t.m_tx_hashes.size(); ++i)
+            if (t.m_tx_hashes[i] == dash::coin::dash_txid(tx)) return static_cast<long>(i);
+        return -1L;
+    };
+    const long ip = index_of(w, p), ic = index_of(w, c);
+    ASSERT_GE(ip, 0) << "the CPFP parent rides with its child";
+    ASSERT_GE(ic, 0);
+    EXPECT_LT(ip, ic) << "parent before child";
+    EXPECT_EQ(w.m_coinbase_value,
+              static_cast<uint64_t>(compute_dash_block_reward_post_v20(H) + 50'010));
+    DeclineReport why;
+    EXPECT_TRUE(st.embedded_template_emit_ok(w, &why))
+        << why.cause << " " << why.value << " / " << why.threshold;
+
+    auto cut = w;
+    auto erase_at = [](auto& v, long i) { v.erase(v.begin() + i); };
+    erase_at(cut.m_txs, ip);
+    erase_at(cut.m_tx_hashes, ip);
+    if (cut.m_tx_fees.size() == w.m_txs.size()) erase_at(cut.m_tx_fees, ip);
+    if (cut.m_tx_data_hex.size() == w.m_txs.size()) erase_at(cut.m_tx_data_hex, ip);
+    ASSERT_EQ(cut.m_tx_hashes.size(), cut.m_txs.size());
+    EXPECT_FALSE(st.embedded_template_emit_ok(cut, &why));
+    EXPECT_EQ(why.cause, "emit-tx-spends-unserved-mempool-parent");
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// GBT-xcheck LABEL: an MN-root difference explained EXACTLY by the
+// collateral spends the builder excludes (dashd takes a type-0 spend of an
+// MN's collateral, the embedded template excludes it, the roots legitimately
+// differ). Classification only — serving is unchanged
+// (stratum/work_source.cpp still swaps to dashd on ANY root diff).
+// ════════════════════════════════════════════════════════════════════════
+
+#include <impl/dash/coin/gbt_xcheck_collateral.hpp>
+
+namespace {
+
+using dash::coin::MnRootXcheck;
+using dash::coin::MnRootXcheckInput;
+using dash::coin::classify_mnroot_xcheck;
+
+CSimplifiedMNList two_entry_sml(bool with_victim) {
+    std::vector<CSimplifiedMNListEntry> entries;
+    for (uint8_t b : {0x01, 0x02}) {
+        if (b == 0x02 && !with_victim) continue;
+        CSimplifiedMNListEntry e;
+        e.nVersion = CSimplifiedMNListEntry::VER_BASIC_BLS;
+        e.proRegTxHash = raw256(b);
+        e.confirmedHash = raw256(0x77);
+        e.isValid = true;
+        entries.push_back(e);
+    }
+    return CSimplifiedMNList(std::move(entries));
+}
+
+DashWorkData build_daemonless(const MnStateMachine& mnstates, Mempool& mp,
+                              const CSimplifiedMNList& sml,
+                              dash::coin::QuorumManager& qmgr,
+                              bool want_xcheck_aid = false) {
+    return build_embedded_workdata(
+        H - 1, raw256(0xAB), mnstates, mp, 0x1b104be3u, 1'700'000'000u,
+        DASH_PUBKEY_VER, DASH_P2SH_VER, 1'700'000'100u, 0x20000000u, nullptr,
+        &sml, &qmgr, 0, dash::coin::k_zero_cl_sig, 0, nullptr, nullptr,
+        dash::coin::DASH_MN_RR_HEIGHT_MAINNET, nullptr,
+        dash::coin::DASH_MN_MIN_CONFIRMATIONS_MAINNET, /*suppress=*/false,
+        "utxo-immature-serving", nullptr, false, nullptr,
+        /*include_mn_special_txs=*/true, nullptr, nullptr, nullptr,
+        /*v24_active=*/false, nullptr, nullptr, want_xcheck_aid);
+}
+
+uint256 committed_mnroot(const DashWorkData& w) {
+    dash::coin::vendor::CCbTx cb;
+    EXPECT_TRUE(dash::coin::vendor::parse_cbtx(w.m_coinbase_payload, cb));
+    return cb.merkleRootMNList;
+}
+
+} // namespace
+
+// RED on master (the builder records no alternative root): the builder's own
+// fold, with the excluded spend chain appended, removes the victim MN — and
+// ONLY that — so the alternative root is the root of the list without it,
+// while the committed root still carries it.
+TEST(DashXcheckCollateral, BuilderRecordsTheRootDashdCommitsWithTheExcludedSpend) {
+    UTXOViewCache utxo(nullptr);
+    Mempool mp;
+    mp.set_utxo(&utxo);
+    const uint256 p0 = mint_hash(0x50);
+    utxo.add_coin(Outpoint(p0, 0), Coin(100'000, {}, 1, false));
+    const auto innocent = make_spend(p0, 0, 90'000, /*salt=*/1);
+    const uint256 collat = raw256(0xC0);
+    utxo.add_coin(Outpoint(collat, 0), Coin(100'000'000'000LL, {}, 1, false));
+    const auto spend = make_spend(collat, 0, 99'999'950'000LL, /*salt=*/2);
+    const auto child = make_spend(dash::coin::dash_txid(spend), 0, 99'999'940'000LL, /*salt=*/3);
+    ASSERT_TRUE(mp.add_tx(innocent));
+    ASSERT_TRUE(mp.add_tx(spend));
+    ASSERT_TRUE(mp.add_tx(child));
+
+    const auto sml = two_entry_sml(/*with_victim=*/true);
+    dash::coin::QuorumManager qmgr;
+    const auto mnstates = mn_set_with_collateral(collat, 0);
+    const auto w = build_daemonless(mnstates, mp, sml, qmgr);
+
+    // Served body unchanged by this PR: only the innocent tx rides.
+    ASSERT_EQ(w.m_tx_hashes.size(), 1u);
+    EXPECT_EQ(w.m_tx_hashes[0], dash::coin::dash_txid(innocent));
+    // Committed root = the list WITH the victim (nothing removed it).
+    EXPECT_EQ(committed_mnroot(w), two_entry_sml(true).CalcMerkleRoot());
+    // Alternative root = the list WITHOUT the victim, by the builder's fold.
+    ASSERT_FALSE(w.m_xcheck_collateral_alt_mnroot.IsNull())
+        << "builder recorded no alternative root for its excluded collateral spend";
+    EXPECT_EQ(w.m_xcheck_collateral_alt_mnroot, two_entry_sml(false).CalcMerkleRoot());
+    EXPECT_NE(w.m_xcheck_collateral_alt_mnroot, committed_mnroot(w));
+    // The excluded set, in selection order: the spend and its child.
+    ASSERT_EQ(w.m_xcheck_collateral_excluded_txids.size(), 2u);
+    EXPECT_EQ(w.m_xcheck_collateral_excluded_txids[0], dash::coin::dash_txid(spend));
+    EXPECT_EQ(w.m_xcheck_collateral_excluded_txids[1], dash::coin::dash_txid(child));
+}
+
+// Guard: nothing excluded => nothing recorded (no alternative root to match).
+TEST(DashXcheckCollateral, NoExcludedSpendRecordsNoAlternativeRoot) {
+    UTXOViewCache utxo(nullptr);
+    Mempool mp;
+    mp.set_utxo(&utxo);
+    const uint256 p0 = mint_hash(0x50);
+    utxo.add_coin(Outpoint(p0, 0), Coin(100'000, {}, 1, false));
+    ASSERT_TRUE(mp.add_tx(make_spend(p0, 0, 90'000, /*salt=*/1)));
+    const auto sml = two_entry_sml(true);
+    dash::coin::QuorumManager qmgr;
+    const auto w = build_daemonless(mn_set_with_collateral(raw256(0xC1), 0), mp, sml, qmgr);
+    EXPECT_TRUE(w.m_xcheck_collateral_alt_mnroot.IsNull());
+    EXPECT_TRUE(w.m_xcheck_collateral_excluded_txids.empty());
+}
+
+// ── The pure classifier (gbt_xcheck_collateral.hpp) ─────────────────────
+namespace {
+struct XcheckCase {
+    uint256 emb = raw256(0x11), dashd = raw256(0x22), alt = raw256(0x22);
+    bool quorums_equal = true;
+    std::vector<uint256> excluded{raw256(0x90)};
+    std::vector<uint256> ours{raw256(0x80)};
+    std::vector<uint256> theirs{raw256(0x80), raw256(0x90)};
+    MnRootXcheck run() const {
+        return classify_mnroot_xcheck(MnRootXcheckInput{
+            emb, dashd, quorums_equal, alt, &excluded, &ours, &theirs});
+    }
+};
+} // namespace
+
+// RED on master (the classifier does not exist; every MN-root diff was a
+// hard mismatch): an excluded spend dashd took is explained.
+TEST(DashXcheckCollateral, ExactCollateralExplanationIsLabelledExplained) {
+    EXPECT_EQ(XcheckCase{}.run(), MnRootXcheck::CollateralExplained);
+}
+
+TEST(DashXcheckCollateral, QuorumRootDifferenceIsNeverExplained) {
+    XcheckCase c;
+    c.quorums_equal = false;
+    EXPECT_EQ(c.run(), MnRootXcheck::Mismatch);
+}
+
+TEST(DashXcheckCollateral, NoAlternativeRootIsAMismatch) {
+    XcheckCase c;
+    c.alt = uint256();
+    EXPECT_EQ(c.run(), MnRootXcheck::Mismatch);
+}
+
+TEST(DashXcheckCollateral, AlternativeRootNotEqualToDashdIsAMismatch) {
+    XcheckCase c;
+    c.alt = raw256(0x33);   // the removal does not account for dashd's root
+    EXPECT_EQ(c.run(), MnRootXcheck::Mismatch);
+}
+
+TEST(DashXcheckCollateral, ExcludedSpendDashdDidNotTakeIsAMismatch) {
+    XcheckCase c;
+    c.theirs = {raw256(0x80)};
+    EXPECT_EQ(c.run(), MnRootXcheck::Mismatch);
+}
+
+// DIRECTOR's case: the spend is present in BOTH sets, yet the roots differ —
+// the spend cannot explain that difference.
+TEST(DashXcheckCollateral, SpendPresentInBothSetsYetRootsDifferIsAMismatch) {
+    XcheckCase c;
+    c.ours.push_back(raw256(0x90));
+    EXPECT_EQ(c.run(), MnRootXcheck::Mismatch);
+}
+
+TEST(DashXcheckCollateral, NothingExcludedIsAMismatch) {
+    XcheckCase c;
+    c.excluded.clear();
+    EXPECT_EQ(c.run(), MnRootXcheck::Mismatch);
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// GBT-xcheck step 0b: an MN-root difference explained EXACTLY by collateral
+// spends only dashd's template carries — txs our candidate set never had
+// (testnet h=1592649: the spend never reached the builder's filter).
+// Separate label (gbt-xcheck-modulo-dashd-only-collateral); classification
+// only — serving is unchanged.
+// ════════════════════════════════════════════════════════════════════════
+
+#include <impl/dash/coin/gbt_xcheck_dashd_only_collateral.hpp>
+
+namespace {
+
+using dash::coin::DashdOnlyCollateral;
+using dash::coin::XcheckCollateralAid;
+using dash::coin::apply_appended_collateral_spends;
+using dash::coin::classify_dashd_only_collateral;
+using DashTx = dash::coin::Transaction;
+
+// Our side of the h=1592649 shape: our pool holds only an innocent tx (the
+// collateral spend never reached us), the builder keeps its fold.
+struct DashdOnlyShape {
+    UTXOViewCache utxo{nullptr};
+    Mempool mp;
+    uint256 collat = raw256(0xC0);
+    MutableTransaction innocent, spend;
+    CSimplifiedMNList sml = two_entry_sml(/*with_victim=*/true);
+    dash::coin::QuorumManager qmgr;
+    MnStateMachine mnstates = mn_set_with_collateral(raw256(0xC0), 0);
+    DashWorkData w;
+
+    DashdOnlyShape() {
+        mp.set_utxo(&utxo);
+        const uint256 p0 = mint_hash(0x50);
+        utxo.add_coin(Outpoint(p0, 0), Coin(100'000, {}, 1, false));
+        innocent = make_spend(p0, 0, 90'000, /*salt=*/1);
+        spend = make_spend(collat, 0, 99'999'950'000LL, /*salt=*/2);   // NOT pooled
+        EXPECT_TRUE(mp.add_tx(innocent));
+        w = build_daemonless(mnstates, mp, sml, qmgr, /*want_xcheck_aid=*/true);
+    }
+    // dashd's body: the innocent tx plus the spend we never had.
+    std::vector<DashTx> dashd_txs() const { return {DashTx(innocent), DashTx(spend)}; }
+    std::vector<uint256> dashd_ids() const {
+        return {dash::coin::dash_txid(innocent), dash::coin::dash_txid(spend)};
+    }
+    dash::coin::DashdOnlyCollateralVerdict run(const std::vector<DashTx>& txs,
+                                               const std::vector<uint256>& ids,
+                                               const uint256& dashd_root,
+                                               bool quorums_equal = true,
+                                               const XcheckCollateralAid* aid_override = nullptr,
+                                               bool use_override = false) const {
+        return classify_dashd_only_collateral(
+            use_override ? aid_override : w.m_xcheck_collateral_aid.get(),
+            committed_mnroot(w), dashd_root, quorums_equal, w.m_tx_hashes,
+            w.m_xcheck_collateral_excluded_txids, ids, txs);
+    }
+};
+
+} // namespace
+
+// RED on master (no aid, no replay): the fold's exported collateral index,
+// replayed for the excluded spend chain, gives EXACTLY the root of #2244's
+// full re-fold — the two paths agree, so the dashd-only label uses the same
+// collateral loop the committed fold runs.
+TEST(DashXcheckDashdOnlyCollateral, AidReplayEqualsTheFullRefoldOfTheExcludedSpend) {
+    UTXOViewCache utxo(nullptr);
+    Mempool mp;
+    mp.set_utxo(&utxo);
+    const uint256 p0 = mint_hash(0x50);
+    utxo.add_coin(Outpoint(p0, 0), Coin(100'000, {}, 1, false));
+    const auto innocent = make_spend(p0, 0, 90'000, /*salt=*/1);
+    const uint256 collat = raw256(0xC0);
+    utxo.add_coin(Outpoint(collat, 0), Coin(100'000'000'000LL, {}, 1, false));
+    const auto spend = make_spend(collat, 0, 99'999'950'000LL, /*salt=*/2);
+    const auto child = make_spend(dash::coin::dash_txid(spend), 0, 99'999'940'000LL, /*salt=*/3);
+    ASSERT_TRUE(mp.add_tx(innocent));
+    ASSERT_TRUE(mp.add_tx(spend));
+    ASSERT_TRUE(mp.add_tx(child));
+    const auto sml = two_entry_sml(true);
+    dash::coin::QuorumManager qmgr;
+    const auto mnstates = mn_set_with_collateral(collat, 0);
+    const auto w = build_daemonless(mnstates, mp, sml, qmgr, /*want_xcheck_aid=*/true);
+
+    ASSERT_TRUE(w.m_xcheck_collateral_aid) << "builder kept no fold for the xcheck";
+    const auto& aid = *w.m_xcheck_collateral_aid;
+    EXPECT_EQ(aid.folded.CalcMerkleRoot(), committed_mnroot(w));
+    EXPECT_EQ(aid.owners.size(), 2u);   // both listed MNs, each by its own collateral
+    ASSERT_FALSE(w.m_xcheck_collateral_alt_mnroot.IsNull());
+    unsigned removed = 0;
+    const auto replay = apply_appended_collateral_spends(
+        aid.folded, aid.owners, std::vector<MutableTransaction>{spend, child}, &removed);
+    EXPECT_EQ(removed, 1u);
+    EXPECT_EQ(replay.CalcMerkleRoot(), w.m_xcheck_collateral_alt_mnroot);
+    EXPECT_EQ(replay.CalcMerkleRoot(), two_entry_sml(false).CalcMerkleRoot());
+}
+
+// Guard: a node that does not ask keeps nothing, and asking never changes the
+// template (body and CbTx byte-equal).
+TEST(DashXcheckDashdOnlyCollateral, AidIsOptInAndNeverChangesTheTemplate) {
+    UTXOViewCache utxo(nullptr);
+    Mempool mp;
+    mp.set_utxo(&utxo);
+    const uint256 p0 = mint_hash(0x50);
+    utxo.add_coin(Outpoint(p0, 0), Coin(100'000, {}, 1, false));
+    ASSERT_TRUE(mp.add_tx(make_spend(p0, 0, 90'000, /*salt=*/1)));
+    const auto sml = two_entry_sml(true);
+    dash::coin::QuorumManager qmgr;
+    const auto mnstates = mn_set_with_collateral(raw256(0xC1), 0);
+    const auto off = build_daemonless(mnstates, mp, sml, qmgr);
+    const auto on  = build_daemonless(mnstates, mp, sml, qmgr, /*want_xcheck_aid=*/true);
+    EXPECT_FALSE(off.m_xcheck_collateral_aid);
+    EXPECT_TRUE(on.m_xcheck_collateral_aid);
+    EXPECT_EQ(off.m_coinbase_payload, on.m_coinbase_payload);
+    EXPECT_EQ(off.m_tx_hashes, on.m_tx_hashes);
+    EXPECT_EQ(off.m_coinbase_value, on.m_coinbase_value);
+}
+
+// RED on master: the h=1592649 shape. The spend is only in dashd's body; its
+// collateral loop removes the victim, giving dashd's root exactly.
+TEST(DashXcheckDashdOnlyCollateral, SpendOnlyDashdCarriesIsExplained) {
+    DashdOnlyShape c;
+    ASSERT_EQ(c.w.m_tx_hashes.size(), 1u);
+    ASSERT_TRUE(c.w.m_xcheck_collateral_excluded_txids.empty());   // never reached the filter
+    const auto v = c.run(c.dashd_txs(), c.dashd_ids(), two_entry_sml(false).CalcMerkleRoot());
+    EXPECT_EQ(v.verdict, DashdOnlyCollateral::Explained) << v.why;
+    EXPECT_EQ(v.dashd_only, 1u);
+    EXPECT_EQ(v.spends, 1u);
+    EXPECT_EQ(v.removed, 1u);
+    EXPECT_EQ(v.alt_mnroot, two_entry_sml(false).CalcMerkleRoot());
+}
+
+TEST(DashXcheckDashdOnlyCollateral, QuorumRootDifferenceIsNeverExplained) {
+    DashdOnlyShape c;
+    const auto v = c.run(c.dashd_txs(), c.dashd_ids(), two_entry_sml(false).CalcMerkleRoot(),
+                         /*quorums_equal=*/false);
+    EXPECT_EQ(v.verdict, DashdOnlyCollateral::Mismatch);
+}
+
+TEST(DashXcheckDashdOnlyCollateral, NoAidIsAMismatch) {
+    DashdOnlyShape c;
+    const auto v = c.run(c.dashd_txs(), c.dashd_ids(), two_entry_sml(false).CalcMerkleRoot(),
+                         true, nullptr, /*use_override=*/true);
+    EXPECT_EQ(v.verdict, DashdOnlyCollateral::Mismatch);
+}
+
+// An aid that is not the list the template committed explains nothing.
+TEST(DashXcheckDashdOnlyCollateral, AidNotTheCommittedListIsAMismatch) {
+    DashdOnlyShape c;
+    XcheckCollateralAid other = *c.w.m_xcheck_collateral_aid;
+    other.folded = two_entry_sml(false);
+    const auto v = c.run(c.dashd_txs(), c.dashd_ids(), two_entry_sml(false).CalcMerkleRoot(),
+                         true, &other, /*use_override=*/true);
+    EXPECT_EQ(v.verdict, DashdOnlyCollateral::Mismatch);
+}
+
+TEST(DashXcheckDashdOnlyCollateral, ReplayNotEqualToDashdRootIsAMismatch) {
+    DashdOnlyShape c;
+    const auto v = c.run(c.dashd_txs(), c.dashd_ids(), raw256(0x33));
+    EXPECT_EQ(v.verdict, DashdOnlyCollateral::Mismatch);
+}
+
+// DIRECTOR's case: the spend is in BOTH sets, yet the roots differ — it is
+// not dashd-only and explains nothing.
+TEST(DashXcheckDashdOnlyCollateral, SpendPresentInBothSetsYetRootsDifferIsAMismatch) {
+    DashdOnlyShape c;
+    auto ours = c.w.m_tx_hashes;
+    ours.push_back(dash::coin::dash_txid(c.spend));
+    const auto v = classify_dashd_only_collateral(
+        c.w.m_xcheck_collateral_aid.get(), committed_mnroot(c.w),
+        two_entry_sml(false).CalcMerkleRoot(), true, ours,
+        c.w.m_xcheck_collateral_excluded_txids, c.dashd_ids(), c.dashd_txs());
+    EXPECT_EQ(v.verdict, DashdOnlyCollateral::Mismatch);
+}
+
+// A provider tx only dashd carries changes leaves a collateral loop cannot
+// account for: never explained, even next to a matching spend.
+TEST(DashXcheckDashdOnlyCollateral, DashdOnlyProviderTxIsAMismatch) {
+    DashdOnlyShape c;
+    MutableTransaction pro;
+    pro.version = 3; pro.type = dash::coin::tx_type::PROVIDER_UPDATE_SERVICE; pro.locktime = 7;
+    auto txs = c.dashd_txs();
+    auto ids = c.dashd_ids();
+    txs.emplace_back(pro);
+    ids.push_back(dash::coin::dash_txid(pro));
+    const auto v = c.run(txs, ids, two_entry_sml(false).CalcMerkleRoot());
+    EXPECT_EQ(v.verdict, DashdOnlyCollateral::Mismatch);
+}
+
+// Spends our builder excluded are the #2244 class, not this one.
+TEST(DashXcheckDashdOnlyCollateral, SpendsAllBuilderExcludedAreNotThisLabel) {
+    DashdOnlyShape c;
+    const std::vector<uint256> excluded{dash::coin::dash_txid(c.spend)};
+    const auto v = classify_dashd_only_collateral(
+        c.w.m_xcheck_collateral_aid.get(), committed_mnroot(c.w),
+        two_entry_sml(false).CalcMerkleRoot(), true, c.w.m_tx_hashes, excluded,
+        c.dashd_ids(), c.dashd_txs());
+    EXPECT_EQ(v.verdict, DashdOnlyCollateral::Mismatch);
+}
+
+TEST(DashXcheckDashdOnlyCollateral, DashdOnlyTxSpendingNoCollateralIsAMismatch) {
+    DashdOnlyShape c;
+    const auto unrelated = make_spend(mint_hash(0x61), 0, 1'000, /*salt=*/9);
+    const std::vector<DashTx> txs{DashTx(c.innocent), DashTx(unrelated)};
+    const std::vector<uint256> ids{dash::coin::dash_txid(c.innocent), dash::coin::dash_txid(unrelated)};
+    const auto v = c.run(txs, ids, two_entry_sml(false).CalcMerkleRoot());
+    EXPECT_EQ(v.verdict, DashdOnlyCollateral::Mismatch);
 }

@@ -236,8 +236,27 @@ TEST(DashV36Flip, IsolatedNodeMintsV36ThatSelfAndPeerAccept)
     // ── node A: its own tracker takes both minted shares ──
     {
         LiveNode a(p, sub + "_a");
-        EXPECT_FALSE(a.node->add_local_share(m1->to_share_type()).IsNull());
-        EXPECT_FALSE(a.node->add_local_share(m2->to_share_type()).IsNull());
+        // add_local_share runs think() for the share it just added, and an
+        // ordinary mint takes the tracker lock with try_to_lock: while a think
+        // holds it, the mint is DECLINED by design ("[MINT] tracker busy ...
+        // retry on next solve"). Two mints issued back to back therefore race
+        // the first one's think; under ASan that think is slow enough to win
+        // (CI 2026-11-16, run 43875912103: m2 declined, the chain never got
+        // it). Mint each share on a settled node, as a miner's next solve
+        // would arrive, and retry a decline the way the next solve does.
+        const auto mint_settled = [&](const auto& minted) {
+            for (int attempt = 0; attempt < 20; ++attempt) {
+                if (!a.settled([](dash::ShareTracker&) {}))
+                    return false;
+                auto st = minted->to_share_type();
+                if (!a.node->add_local_share(st).IsNull())
+                    return true;
+                st.destroy();   // a declined mint is not owned by the tracker
+            }
+            return false;
+        };
+        EXPECT_TRUE(mint_settled(m1)) << "the node declined the genesis mint 20 times";
+        EXPECT_TRUE(mint_settled(m2)) << "the node declined the child mint 20 times";
         ASSERT_TRUE(a.pump_until([&](dash::ShareTracker& t) {
             return t.chain.contains(g.share.m_hash) && t.chain.contains(c.share.m_hash);
         }));

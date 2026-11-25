@@ -79,4 +79,59 @@ inline int resolve_status(
     return static_cast<int>(confs);
 }
 
+// Margin, in header-timestamp seconds, that the header chain must extend on
+// BOTH sides of a found block's recorded time before its absence counts as an
+// orphan verdict (resolve_unknown_height). 2 h: covers Dash Core's +2 h
+// future-time allowance on header timestamps, and ~46 blocks of depth behind
+// the found time — far past anything a ChainLocked chain reorganises.
+inline constexpr int64_t kUnknownHeightSpanMarginSec = 2 * 60 * 60;
+
+/// Verdict for a found block whose HEIGHT IS UNKNOWN (a row recorded before the
+/// work source read the job's height: height 0) and whose hash the header
+/// chain does NOT hold, not even on a side branch. resolve_status() cannot run
+/// without a height, and such a row used to stay "pending" forever (production
+/// 2026-10-25: 000000000000001c9e20…, orphaned per every other node's ledger,
+/// pending on the node that found it for a month).
+///
+///   time_at_height(h): header timestamp of the best-chain header at height h,
+///                      or nullopt if the chain does not index h (below its
+///                      root, or above its tip).
+///   tip_height:        current best-chain tip height.
+///   found_ts:          the row's recorded found time (unix seconds).
+///
+/// Returns -1 (orphaned) only when the header chain demonstrably spans the
+/// found time with `margin` on both sides — its root header is at least
+/// `margin` older and its tip header at least `margin` newer — so a block that
+/// was on the best chain anywhere in that window would be in the index. The
+/// caller has already established that the hash is not in the index.
+/// Otherwise 0 (pending): the chain is rooted later (cold start from an
+/// anchor), has not advanced far enough yet, or cannot be read.
+/// Never returns >0: a held block always has a height and goes through
+/// resolve_status().
+inline int resolve_unknown_height(
+    const std::function<std::optional<int64_t>(uint32_t)>& time_at_height,
+    uint32_t tip_height,
+    int64_t found_ts,
+    int64_t margin = kUnknownHeightSpanMarginSec)
+{
+    if (found_ts <= 0 || margin < 0) return 0;
+    const auto tip_time = time_at_height(tip_height);
+    if (!tip_time.has_value() || *tip_time < found_ts + margin)
+        return 0;                       // chain not yet far enough past the find
+
+    // Lowest indexed height: headers are contiguous from the root to the tip,
+    // so "indexed" is monotone in height — binary search for the first one.
+    uint32_t lo = 0, hi = tip_height;   // invariant: hi is indexed
+    while (lo < hi) {
+        const uint32_t mid = lo + (hi - lo) / 2;
+        if (time_at_height(mid).has_value()) hi = mid;
+        else lo = mid + 1;
+    }
+    const auto root_time = time_at_height(lo);
+    if (!root_time.has_value() || *root_time > found_ts - margin)
+        return 0;                       // chain rooted too late to judge
+
+    return -1;                          // spanned on both sides, not held → orphaned
+}
+
 }  // namespace dash::coin::block_confirm

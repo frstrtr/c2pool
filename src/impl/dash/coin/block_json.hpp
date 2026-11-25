@@ -20,6 +20,7 @@
 /// Read-only display serving: nothing here builds a template, prices a fee, or
 /// touches consensus/gentx/reward/coinbase/share validity.
 
+#include <impl/dash/coin/dash_txid.hpp>
 #include "block.hpp"
 #include "transaction.hpp"
 
@@ -164,12 +165,11 @@ inline nlohmann::json parse_the_commitment(const std::vector<unsigned char>& scr
     return the;
 }
 
-/// txid = sha256d(canonical non-witness tx bytes) — identical to dash_txid()
-/// (utxo_adapter.hpp); recomputed inline here so this header stays free of the
-/// UTXO machinery.
+/// txid = dash_txid() (dash_txid.hpp: SHA256d of the serialization, with the
+/// Dash Core v24 stable-txid rule for version-2 asset unlocks). That header is
+/// free of the UTXO machinery.
 inline uint256 dash_explorer_txid(const MutableTransaction& mtx) {
-    auto packed = ::pack(mtx);
-    return ::Hash(packed.get_span());
+    return ::dash::coin::dash_txid(mtx);
 }
 
 } // namespace detail

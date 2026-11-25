@@ -68,7 +68,7 @@ inline core::CoinParams make_coin_params(bool testnet)
     p.target_lookbehind        = 200;
     p.spread                   = 3;
     p.minimum_protocol_version = 3301;  // accept v35 (3502) peers for v35->v36 AutoRatchet crossing
-    p.advertised_protocol_version = 3600;  // advertise V36 capability; >= .82 latched min (3503) so crossing peers accept us
+    p.advertised_protocol_version = 3601;  // V36 + 3601 shares (PoolConfig::V3601_PROTOCOL_VERSION); >= .82 latched min (3503) so crossing peers accept us
     p.block_max_size           = 1000000;
     p.block_max_weight         = 4000000;
 
@@ -88,17 +88,12 @@ inline core::CoinParams make_coin_params(bool testnet)
 
     // Bootstrap
     p.bootstrap_addrs = {
-        "ml.toom.im",
+        "ltc.voidbind.com",
+        "109.123.238.32",
+        "p2p-spb.xyz",
         "usa.p2p-spb.xyz",
-        "102.160.209.121",
-        "5.188.104.245",
-        "20.127.82.115",
+        "83.221.211.116",
         "31.25.241.224",
-        "20.113.157.65",
-        "20.106.76.227",
-        "15.218.180.55",
-        "173.79.139.224",
-        "174.60.78.162",
     };
 
     // Donation scripts (consensus-critical, must match p2pool data.py)

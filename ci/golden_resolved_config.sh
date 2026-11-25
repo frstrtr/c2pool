@@ -12,6 +12,7 @@
 #
 # It also runs the negative gates in the same instrument:
 #   * unknown-flag rejection (exit 1) on every binary,
+#   * --version (exit 0, `c2pool-<coin> <version>[ key=value...]`) on every binary,
 #   * the money-gate end-to-end (an unacked money key in a settings file =>
 #     exit 78, no dump markers), on dash + btc + dgb.
 #
@@ -121,6 +122,22 @@ for coin in dash ltc btc dgb bch; do
   else echo "FAIL $coin unknown-flag exit=$rc (want 1)"; fails=$((fails+1)); fi
 done
 
+echo "== --version (expect exit 0, 'c2pool-<coin> <version>[ key=value...]') =="
+# The version line is the last stdout line; dash prints its [init] lines before
+# it, the other binaries print that line only.
+for coin in dash ltc btc dgb bch; do
+  bin="$BINDIR/c2pool-$coin"; [ -x "$bin" ] || continue
+  out="$("$bin" --version 2>/dev/null)"; rc=$?
+  last="$(printf '%s\n' "$out" | tail -n 1)"
+  nlines="$(printf '%s\n' "$out" | wc -l | tr -d ' ')"
+  if [ "$rc" -eq 0 ] && printf '%s\n' "$last" | grep -qE "^c2pool-$coin [^ ]+( [a-z]+=[^ ]+)*\$" \
+     && { [ "$coin" = dash ] || [ "$nlines" -eq 1 ]; }; then
+    echo "ok   $coin --version: $last"
+  else
+    echo "FAIL $coin --version exit=$rc lines=$nlines last='$last'"; fails=$((fails+1))
+  fi
+done
+
 echo "== money-gate end-to-end (unacked money key => exit 78, no dump) =="
 money_e2e() {  # coin section
   local coin="$1" section="$2"
@@ -138,6 +155,64 @@ money_e2e() {  # coin section
 money_e2e dash dash.money
 money_e2e btc  btc.money
 money_e2e dgb  dgb.money
+
+# c2pool-ltc --import-found-blocks FILE: a bad value is refused while the flags
+# are parsed (exit 1, no dump), never swallowed. `--import-found-blocks
+# --testnet` dropped network.testnet=true (a mainnet node), and a second file
+# given without its own flag became the positional RPC user.
+echo "== ltc --import-found-blocks values (bad value => exit 1, no dump) =="
+if [ -x "$BINDIR/c2pool-ltc" ]; then
+  fbi_dd="$(mktemp -d)"
+  printf '[]' > "$fbi_dd/a.json"; printf '[]' > "$fbi_dd/b.json"
+  fbi_case() {  # want_rc label args...
+    local want="$1" label="$2"; shift 2
+    local out; out="$("$BINDIR/c2pool-ltc" --data-dir "$fbi_dd" "$@" --dump-resolved-config 2>/dev/null)"
+    local rc=$?
+    local dumped=0; printf '%s' "$out" | grep -q "$BEGIN" && dumped=1
+    local ok=0   # a refusal prints no dump; an accepted value dumps
+    if [ "$want" -eq 0 ]; then [ "$dumped" -eq 1 ] && ok=1; else [ "$dumped" -eq 0 ] && ok=1; fi
+    if [ "$rc" -eq "$want" ] && [ "$ok" -eq 1 ]; then
+      echo "ok   ltc $label (exit $rc)"
+    else
+      echo "FAIL ltc $label exit=$rc (want $want) dumped=$dumped"; fails=$((fails+1))
+    fi
+  }
+  fbi_case 1 "value is an option (--testnet)" --import-found-blocks --testnet
+  fbi_case 1 "missing file" --import-found-blocks "$fbi_dd/none.json"
+  fbi_case 1 "a directory" --import-found-blocks "$fbi_dd"
+  fbi_case 1 "second file without its own flag" --import-found-blocks "$fbi_dd/a.json" "$fbi_dd/b.json"
+  fbi_case 0 "two files, flag twice" --import-found-blocks "$fbi_dd/a.json" --import-found-blocks "$fbi_dd/b.json"
+  fbi_case 0 "two files, comma list" --import-found-blocks "$fbi_dd/a.json,$fbi_dd/b.json"
+  rm -rf "$fbi_dd"
+fi
+
+# c2pool-btc --import-found-blocks FILE: the same refusals, while the flags are
+# parsed (src/impl/btc/found_block_ledger.hpp take_import_flags).
+echo "== btc --import-found-blocks values (bad value => exit 1, no dump) =="
+if [ -x "$BINDIR/c2pool-btc" ]; then
+  fbb_dd="$(mktemp -d)"
+  printf '[]' > "$fbb_dd/a.json"; printf '[]' > "$fbb_dd/b.json"
+  fbb_case() {  # want_rc label args...
+    local want="$1" label="$2"; shift 2
+    local out; out="$("$BINDIR/c2pool-btc" --data-dir "$fbb_dd" "$@" --dump-resolved-config 2>/dev/null)"
+    local rc=$?
+    local dumped=0; printf '%s' "$out" | grep -q "$BEGIN" && dumped=1
+    local ok=0   # a refusal prints no dump; an accepted value dumps
+    if [ "$want" -eq 0 ]; then [ "$dumped" -eq 1 ] && ok=1; else [ "$dumped" -eq 0 ] && ok=1; fi
+    if [ "$rc" -eq "$want" ] && [ "$ok" -eq 1 ]; then
+      echo "ok   btc $label (exit $rc)"
+    else
+      echo "FAIL btc $label exit=$rc (want $want) dumped=$dumped"; fails=$((fails+1))
+    fi
+  }
+  fbb_case 1 "value is an option (--testnet)" --import-found-blocks --testnet
+  fbb_case 1 "missing file" --import-found-blocks "$fbb_dd/none.json"
+  fbb_case 1 "a directory" --import-found-blocks "$fbb_dd"
+  fbb_case 1 "second file without its own flag" --import-found-blocks "$fbb_dd/a.json" "$fbb_dd/b.json"
+  fbb_case 0 "two files, flag twice" --import-found-blocks "$fbb_dd/a.json" --import-found-blocks "$fbb_dd/b.json"
+  fbb_case 0 "two files, comma list" --import-found-blocks "$fbb_dd/a.json,$fbb_dd/b.json"
+  rm -rf "$fbb_dd"
+fi
 
 if [ "$fails" -eq 0 ]; then echo; echo "golden_resolved_config: ALL PASS"; exit 0; fi
 echo; echo "golden_resolved_config: $fails FAILURE(S)"; exit 1

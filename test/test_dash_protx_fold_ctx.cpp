@@ -473,8 +473,14 @@ TEST(DashSupersetSpecialTx, ExternalCollateralSpentByARecentBlockIsRefused)
     auto reg = proreg(1);
     auto regtx = special(1, reg, 0x01);
     const auto verifier = accept_all();
+    // S6: without a ProTxCheckEnv the serving context checks nothing, so no
+    // provider tx rides. This KAT is about the fold's own collateral proof, so
+    // it stands in an env whose Core check accepts everything.
+    EXPECT_EQ(fold(w, {regtx}, dash::coin::make_template_fold_context(w.sm, mp, &verifier)).applied, 0u);
+    dash::coin::ProTxCheckEnv env;
+    env.check_override = [](const MutableTransaction&) { return std::optional<std::string>{}; };
     auto fold_now = [&] {
-        return fold(w, {regtx}, dash::coin::make_template_fold_context(w.sm, mp, &verifier));
+        return fold(w, {regtx}, dash::coin::make_template_fold_context(w.sm, mp, &verifier, &env));
     };
     EXPECT_EQ(fold_now().applied, 1u) << "nothing proves the collateral spent yet";
 
@@ -518,6 +524,25 @@ TEST(DashSupersetSpecialTx, ExtAddrPayloadIsRefusedByName)
     ASSERT_EQ(f.refused_reasons.size(), 2u);
     for (const auto& why : f.refused_reasons)
         EXPECT_NE(why.find("ExtAddr"), std::string::npos) << why;
+    EXPECT_EQ(f.sml.CalcMerkleRoot(), w.base.CalcMerkleRoot());
+}
+
+// Dash Core v24: a v2 update of a masternode whose SML leaf is version 3
+// (ExtAddr) goes through SetStateVersion (target version, netInfo
+// conversion), which this fold does not port: refused by name, never applied
+// with the v2 leaf layout.
+TEST(DashSupersetSpecialTx, UpdateOfAnExtAddrLeafIsRefusedByName)
+{
+    auto mn = make_mn(1);
+    mn.leaf.nVersion = CSimplifiedMNListEntry::VER_EXT_ADDR;
+    mn.leaf.extNetInfo.set(v::NetInfoPurpose::CORE_P2P,
+                           {v::NetInfoEntry{v::NetService::ipv4(1, 2, 3, 4, 9999)}});
+    World w({mn});
+    const auto ctx = MnFoldContext::from(w.sm, {}, accept_all());
+    const auto f = fold(w, {special(2, proupserv(w.mns[0], 2), 0x02)}, ctx);
+    ASSERT_EQ(f.refused, 1u);
+    ASSERT_EQ(f.refused_reasons.size(), 1u);
+    EXPECT_NE(f.refused_reasons.front().find("ExtAddr"), std::string::npos) << f.refused_reasons.front();
     EXPECT_EQ(f.sml.CalcMerkleRoot(), w.base.CalcMerkleRoot());
 }
 

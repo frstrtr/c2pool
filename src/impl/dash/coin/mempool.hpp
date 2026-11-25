@@ -60,6 +60,10 @@
 #include "sigops.hpp"             // G2: bad-blk-sigops accounting during selection
 #include "vendor/assetlock.hpp"   // DIP-0027 CAssetUnlockPayload (type-9 fee source)
 #include "asset_lock_fold.hpp"    // check_asset_lock_tx: type-8 selection gate
+#include "shared_collateral.hpp"  // Dash Core v24 shared-collateral template script
+#include "vendor/mnhftx.hpp"      // MNHF signal (type 7): its zero fee needs no UTXO view
+#include "vendor/bls_verify.hpp"  // opkey_to_basic: one point, one byte string (provider conflicts)
+#include "islock_conflict.hpp"    // N2: verified-islock conflicts in an already-built body
 
 #include <core/uint256.hpp>
 #include <core/pack.hpp>
@@ -324,8 +328,92 @@ public:
         std::lock_guard<std::mutex> lock(m_mutex);
         return m_recent_chain_spend_blocks.size();
     }
+    /// How many chain-coin proofs have been asked for (any answer). A
+    /// diagnostic counter (and a KAT probe that a fold really consulted the
+    /// chain-coin view); the folded-root memo keys on the recorded ANSWERS
+    /// instead (ChainCoinRecorder below).
+    uint64_t chain_coin_proofs() const
+    {
+        return m_chain_coin_proofs.load(std::memory_order_relaxed);
+    }
+
+    /// One prove_chain_coin answer: the outpoint asked, the proof, and the
+    /// coin (Unspent only; a default coin otherwise).
+    struct ChainCoinAnswer {
+        ::core::coin::Outpoint op;
+        CoinProof              proof{CoinProof::Unknown};
+        ::core::coin::Coin     coin;
+    };
+
+    /// Records every prove_chain_coin answer given ON THIS THREAD while the
+    /// recorder is alive (nested recorders restore the outer one).
+    ///
+    /// The P-2 folded-root memo (node_coin_state.hpp) needs it. Some provider
+    /// txs make the fold ask the chain-coin view (a ProRegTx reusing an
+    /// existing coin as its collateral; a ProUpRegTx, whose Dash Core check
+    /// reads its masternode's collateral): the recent-spend ring, the UTXO view
+    /// and the replay fold. Those move without a new tip or a list write, so
+    /// the memo key alone cannot tell a stale root from a good one. Instead of
+    /// tracking every way those three can change, the memo stores the answers
+    /// the fold got and, on a hit, asks the same outpoints again
+    /// (chain_coin_answers_unchanged): the fold is a function of the list
+    /// state (keyed), the body (keyed) and these answers, so identical answers
+    /// mean an identical root. Thread-local: selection on another thread asks
+    /// the same view without landing in this record.
+    class ChainCoinRecorder {
+    public:
+        explicit ChainCoinRecorder(std::vector<ChainCoinAnswer>& out)
+            : m_prev(recorder_slot())
+        {
+            recorder_slot() = &out;
+        }
+        ~ChainCoinRecorder() { recorder_slot() = m_prev; }
+        ChainCoinRecorder(const ChainCoinRecorder&) = delete;
+        ChainCoinRecorder& operator=(const ChainCoinRecorder&) = delete;
+
+    private:
+        std::vector<ChainCoinAnswer>* m_prev;
+    };
+
+    /// Ask each recorded outpoint again; true iff every answer (proof, and for
+    /// Unspent the whole coin) is the same as recorded. Not counted in
+    /// chain_coin_proofs() and never recorded.
+    bool chain_coin_answers_unchanged(const std::vector<ChainCoinAnswer>& answers) const
+    {
+        for (const auto& a : answers) {
+            ::core::coin::Coin c;
+            const CoinProof p = prove_chain_coin_uncounted(a.op, c);
+            if (p != a.proof) return false;
+            if (p == CoinProof::Unspent
+                && !(c.value == a.coin.value
+                     && c.scriptPubKey.m_data == a.coin.scriptPubKey.m_data
+                     && c.height == a.coin.height
+                     && c.coinbase == a.coin.coinbase
+                     && c.pegout == a.coin.pegout))
+                return false;
+        }
+        return true;
+    }
+
     CoinProof prove_chain_coin(const ::core::coin::Outpoint& op,
                                ::core::coin::Coin& out) const
+    {
+        m_chain_coin_proofs.fetch_add(1, std::memory_order_relaxed);
+        const CoinProof p = prove_chain_coin_uncounted(op, out);
+        if (auto* rec = recorder_slot())
+            rec->push_back(ChainCoinAnswer{op, p, p == CoinProof::Unspent ? out : ::core::coin::Coin{}});
+        return p;
+    }
+
+private:
+    static std::vector<ChainCoinAnswer>*& recorder_slot()
+    {
+        static thread_local std::vector<ChainCoinAnswer>* slot = nullptr;
+        return slot;
+    }
+
+    CoinProof prove_chain_coin_uncounted(const ::core::coin::Outpoint& op,
+                                         ::core::coin::Coin& out) const
     {
         {
             std::lock_guard<std::mutex> lock(m_mutex);
@@ -347,6 +435,7 @@ public:
         return CoinProof::Unknown;
     }
 
+public:
     /// blockmintxfee-equivalent knob (dashd -blockmintxfee / BlockAssembler
     /// Options::blockMinFeeRate, miner.cpp:100). Sets the min ancestor-package
     /// feerate in duffs/kB used by the blockMinFeeRate early-return in
@@ -364,6 +453,22 @@ public:
         return m_block_min_tx_fee;
     }
 
+    /// Dash Core v24 MIN_STANDARD_TX_SIZE (policy/policy.h, 65 bytes): a tx
+    /// whose serialization is shorter is "tx-size-small" (CVE-2017-12842
+    /// shape) and never accepted, relayed or mined by Core. 0 (default, unit
+    /// tests) disables the rule; c2pool-dash arms 65. Applied at admission and
+    /// again at selection (an entry that predates the knob never rides).
+    void set_min_standard_tx_size(uint32_t bytes)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_min_standard_tx_size = bytes;
+    }
+    uint32_t min_standard_tx_size() const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_min_standard_tx_size;
+    }
+
     /// Arm/disarm the IS/CL mining-safety hold. The caller (main_dash, off the
     /// coin-P2P SporkState on its io thread) pushes the spork2+spork3
     /// conjunction here — dashd's own gate: TestPackageTransactions skips the
@@ -379,6 +484,44 @@ public:
     bool instantsend_mining_hold() const
     {
         return m_is_hold_armed.load(std::memory_order_relaxed);
+    }
+
+    /// Dash Core v24: DEPLOYMENT_V24 is active for the block after our tip, so
+    /// admission applies Core v24's ContextualCheckTransaction type list and
+    /// accepts the shared-masternode provider types 10-12 (Core's mempool
+    /// accepts them from activation and rejects them as bad-txns-type before).
+    /// The node sets it on every tip change (NodeCoinState::set_tip). Default
+    /// off: the v23.1.9 list (0..9), unchanged.
+    void set_v24_admission(bool active)
+    {
+        m_v24_admission.store(active, std::memory_order_relaxed);
+    }
+    bool v24_admission() const
+    {
+        return m_v24_admission.load(std::memory_order_relaxed);
+    }
+
+    /// A masternode at the chain tip, as the provider-tx admission rules
+    /// read it (Dash Core m_dmnman.GetListAtChainTip().GetMN). `Unknown`: the
+    /// node's list is not at the tip, so the list-dependent rules are skipped
+    /// rather than guessed (the template fold still refuses a forbidden
+    /// in-block pair); `Absent`: the list is at the tip and lacks it.
+    enum class TipMn : uint8_t { Unknown, Absent, Listed };
+    struct TipOperatorKey {
+        TipMn state{TipMn::Unknown};
+        std::array<uint8_t, vendor::BLS_PUBKEY_SIZE> key{};   ///< canonical basic bytes (Listed)
+    };
+    /// Wired by the node from its masternode list. It decides Dash Core's
+    /// "masternode is not in the list" and "only one operator key change in
+    /// the mempool" rules for ProUpRegTx, ProUpRevTx, ProUpShareTx and
+    /// ProUpSharedRegTx at admission (txmempool.cpp existsProviderTxConflict,
+    /// hasKeyChangeInMempool) and the same-key exemption of
+    /// existsProviderTxCrossSchemeConflict. Unset: as Unknown.
+    using TipOperatorKeyFn = std::function<TipOperatorKey(const uint256& protx)>;
+    void set_tip_operator_key_fn(TipOperatorKeyFn fn)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_tip_opkey = std::move(fn);
     }
 
     /// ── PINNED-LOCAL-TX include gate (donation-dust consolidation lane) ────
@@ -1070,6 +1213,245 @@ public:
     }
 
 private:
+    /// CheckSharedCollateralTemplateOutputs for one tx: every output paying
+    /// the template is the collateral output of this tx's own shared
+    /// registration (internal collateral, at exactly that index).
+    static bool is_shared_registration_collateral_only(const MutableTransaction& tx)
+    {
+        if (!tx_has_extra_payload(tx.version, tx.type) || tx.type != vendor::CProRegTx::SPECIALTX_TYPE) return false;
+        vendor::CProRegTx p;
+        if (!vendor::decode_special_payload(tx.extra_payload, p) || !p.IsShared()
+            || !p.collateralOutpoint.hash.IsNull())
+            return false;
+        for (uint32_t i = 0; i < tx.vout.size(); ++i)
+            if (is_shared_collateral_script(tx.vout[i].scriptPubKey.m_data) && i != p.collateralOutpoint.index)
+                return false;
+        return true;
+    }
+
+    // ── Dash Core provider-tx references (txmempool.cpp mapProTxRefs and the
+    // per-type unique-property maps), derived from a pool tx's payload. ──
+    struct ProviderRef {
+        uint256  txid;
+        uint16_t type{0};
+        uint256  mn;                               ///< the masternode it names (a ProRegTx: itself)
+        std::optional<std::array<uint8_t, vendor::BLS_PUBKEY_SIZE>> opkey_basic;   ///< types 1, 3, 12
+        bool     opkey_wire_legacy{false};         ///< the payload encodes it in the legacy scheme
+        uint160  voting;                           ///< type 12
+        std::optional<uint160> reward_key;         ///< type 11: the P2PKH/P2PK key its reward pays
+    };
+
+    /// ExtractDestination(script) == PKHash(key): the key a P2PKH or P2PK
+    /// script pays, else nullopt.
+    static std::optional<uint160> paid_key_of(const std::vector<unsigned char>& s)
+    {
+        uint160 id;
+        if (s.size() == 25 && s[0] == 0x76 && s[1] == 0xa9 && s[2] == 0x14 && s[23] == 0x88 && s[24] == 0xac) {
+            std::copy(s.begin() + 3, s.begin() + 23, id.data());
+            return id;
+        }
+        const bool p2pk33 = s.size() == 35 && s[0] == 33 && (s[1] == 0x02 || s[1] == 0x03) && s[34] == 0xac;
+        const bool p2pk65 = s.size() == 67 && s[0] == 65 && s[1] == 0x04 && s[66] == 0xac;
+        if (p2pk33 || p2pk65) {
+            CHash160()
+                .Write(std::span<const unsigned char>(s.data() + 1, s.size() - 2))
+                .Finalize(std::span<unsigned char>(id.data(), 20));
+            return id;
+        }
+        return std::nullopt;
+    }
+
+    static std::optional<ProviderRef> provider_ref_of(const MutableTransaction& tx, const uint256& txid)
+    {
+        if (!tx_has_extra_payload(tx.version, tx.type)) return std::nullopt;
+        ProviderRef r;
+        r.txid = txid;
+        r.type = tx.type;
+        switch (tx.type) {
+        case vendor::CProRegTx::SPECIALTX_TYPE: {
+            vendor::CProRegTx p;
+            if (!vendor::parse_protx_payload(tx.extra_payload, p)) return std::nullopt;
+            r.mn = txid;
+            r.opkey_wire_legacy = p.nVersion < vendor::ProTxVersion::BASIC_BLS;
+            r.opkey_basic = vendor::opkey_to_basic(p.pubKeyOperator, r.opkey_wire_legacy);
+            return r;
+        }
+        case vendor::CProUpServTx::SPECIALTX_TYPE: {
+            vendor::CProUpServTx p;
+            if (!vendor::parse_protx_payload(tx.extra_payload, p)) return std::nullopt;
+            r.mn = p.proTxHash;
+            return r;
+        }
+        case vendor::CProUpRegTx::SPECIALTX_TYPE: {
+            vendor::CProUpRegTx p;
+            if (!vendor::parse_protx_payload(tx.extra_payload, p)) return std::nullopt;
+            r.mn = p.proTxHash;
+            r.opkey_wire_legacy = p.nVersion < vendor::ProTxVersion::BASIC_BLS;
+            r.opkey_basic = vendor::opkey_to_basic(p.pubKeyOperator, r.opkey_wire_legacy);
+            return r;
+        }
+        case vendor::CProUpRevTx::SPECIALTX_TYPE: {
+            vendor::CProUpRevTx p;
+            if (!vendor::parse_protx_payload(tx.extra_payload, p)) return std::nullopt;
+            r.mn = p.proTxHash;
+            return r;
+        }
+        case vendor::CProDisTx::SPECIALTX_TYPE: {
+            vendor::CProDisTx p;
+            if (!vendor::parse_protx_payload(tx.extra_payload, p)) return std::nullopt;
+            r.mn = p.proTxHash;
+            return r;
+        }
+        case vendor::CProUpShareTx::SPECIALTX_TYPE: {
+            vendor::CProUpShareTx p;
+            if (!vendor::parse_protx_payload(tx.extra_payload, p)) return std::nullopt;
+            r.mn = p.proTxHash;
+            r.reward_key = paid_key_of(p.scriptReward.m_data);
+            return r;
+        }
+        case vendor::CProUpSharedRegTx::SPECIALTX_TYPE: {
+            vendor::CProUpSharedRegTx p;
+            if (!vendor::parse_protx_payload(tx.extra_payload, p)) return std::nullopt;
+            r.mn = p.proTxHash;
+            r.opkey_wire_legacy = false;   // always the basic scheme
+            r.opkey_basic = vendor::opkey_to_basic(p.pubKeyOperator, false);
+            r.voting = p.keyIDVoting;
+            return r;
+        }
+        default:
+            return std::nullopt;
+        }
+    }
+
+    TipOperatorKey tip_mn_locked(const uint256& protx) const
+    {
+        return m_tip_opkey ? m_tip_opkey(protx) : TipOperatorKey{};
+    }
+
+    /// CTxMemPoolEntry::isKeyChangeProTx (txmempool.cpp addUncheckedProTx): a
+    /// ProUpRegTx / ProUpSharedRegTx with a key other than the tip's, a
+    /// ProUpRevTx of a masternode holding a key. Core fixes it at admission;
+    /// this reads the tip now (a pending update whose key the chain has since
+    /// changed was evicted by rule 4 of remove_protx_conflicts_for_block).
+    bool is_key_change_locked(const ProviderRef& r) const
+    {
+        if (r.type != vendor::CProUpRegTx::SPECIALTX_TYPE && r.type != vendor::CProUpRevTx::SPECIALTX_TYPE
+            && r.type != vendor::CProUpSharedRegTx::SPECIALTX_TYPE)
+            return false;
+        const TipOperatorKey tip = tip_mn_locked(r.mn);
+        if (tip.state != TipMn::Listed) return false;
+        if (r.type == vendor::CProUpRevTx::SPECIALTX_TYPE)
+            return std::any_of(tip.key.begin(), tip.key.end(), [](uint8_t b) { return b != 0; });
+        return r.opkey_basic && *r.opkey_basic != tip.key;
+    }
+
+    /// Dash Core v24 admission conflicts (validation.cpp PreChecks ->
+    /// existsProviderTxConflict, then existsProviderTxCrossSchemeConflict;
+    /// "protx-dup") for the masternode-share types and every pair they form
+    /// with the older provider types:
+    ///   * ProUpRegTx, ProUpRevTx, ProUpShareTx, ProUpSharedRegTx(X): X is
+    ///     not in the list at the tip; a key change while another key change
+    ///     of X is pending (not ProUpShareTx: it never changes the key);
+    ///   * ProUpSharedRegTx(X): a pending ProUpShareTx(X) whose reward pays
+    ///     the new voting key;
+    ///   * ProUpShareTx(X): a pending ProUpSharedRegTx(X) whose voting key the
+    ///     new reward pays;
+    ///   * ProRegTx / ProUpRegTx / ProUpSharedRegTx where one side of the pair
+    ///     is a ProUpSharedRegTx: both claim the same operator key under the
+    ///     same encoding, or under the other encoding of the same point unless
+    ///     the pending one is the same masternode's own registrar update or
+    ///     the incoming update keeps the key the masternode holds.
+    ///   * ProUpServTx: an unconfirmed ancestor changes an operator key, or
+    ///     is an MNHF signal, an asset lock or an asset unlock
+    ///     (IsUnorderableServiceUpdate).
+    /// With the list not at the tip (TipMn::Unknown) the list-dependent rules
+    /// are skipped; the template fold still refuses a forbidden pair inside
+    /// one block. The ProRegTx/ProUpRegTx pairs among themselves stay with
+    /// the template fold, as before v24.
+    std::optional<std::string> provider_admission_conflict_locked(const MutableTransaction& tx,
+                                                                  const uint256& txid) const
+    {
+        const uint16_t t = tx.type;
+        constexpr uint16_t kReg = vendor::CProRegTx::SPECIALTX_TYPE;
+        constexpr uint16_t kUpReg = vendor::CProUpRegTx::SPECIALTX_TYPE;
+        constexpr uint16_t kUpRev = vendor::CProUpRevTx::SPECIALTX_TYPE;
+        constexpr uint16_t kUpShare = vendor::CProUpShareTx::SPECIALTX_TYPE;
+        constexpr uint16_t kUpSharedReg = vendor::CProUpSharedRegTx::SPECIALTX_TYPE;
+        constexpr uint16_t kUpServ = vendor::CProUpServTx::SPECIALTX_TYPE;
+        if (t == kUpServ && tx_has_extra_payload(tx.version, tx.type)) {
+            // IsUnorderableServiceUpdate: block assembly puts a service update
+            // in front of a key change of its masternode together with its
+            // unconfirmed ancestors (service_update_order.hpp), which it cannot
+            // do past a key change, an MNHF signal, an asset lock or unlock.
+            std::vector<uint256> stack;
+            std::set<uint256> seen;
+            for (const auto& in : tx.vin) stack.push_back(in.prevout.hash);
+            while (!stack.empty()) {
+                const uint256 h = stack.back();
+                stack.pop_back();
+                if (!seen.insert(h).second) continue;
+                const auto it = m_pool.find(h);
+                if (it == m_pool.end()) continue;
+                const auto& a = it->second.tx;
+                if (tx_has_extra_payload(a.version, a.type)) {
+                    if (a.type == vendor::MNHFTxPayload::SPECIALTX_TYPE || a.type == 8 || a.type == 9)
+                        return "unorderable service update (an unconfirmed ancestor " + h.GetHex().substr(0, 16)
+                             + " is of type " + std::to_string(a.type) + ")";
+                    if (const auto r = provider_ref_of(a, h); r && is_key_change_locked(*r))
+                        return "unorderable service update (an unconfirmed ancestor " + h.GetHex().substr(0, 16)
+                             + " changes an operator key)";
+                }
+                for (const auto& in : a.vin) stack.push_back(in.prevout.hash);
+            }
+            return std::nullopt;
+        }
+        if (t != kReg && t != kUpReg && t != kUpRev && t != kUpShare && t != kUpSharedReg)
+            return std::nullopt;
+        const auto me = provider_ref_of(tx, txid);
+        if (!me) return std::nullopt;   // an unparseable payload: the Core checks refuse it later
+        std::vector<ProviderRef> refs;
+        for (const auto& [id, e] : m_pool) {
+            const uint16_t et = e.tx.type;
+            if ((et < 1 || et > 4) && !tx_type_is_v24_provider(et)) continue;
+            if (auto r = provider_ref_of(e.tx, id)) refs.push_back(std::move(*r));
+        }
+        auto short_id = [](const uint256& h) { return h.GetHex().substr(0, 16); };
+
+        const TipOperatorKey tip = t == kReg ? TipOperatorKey{} : tip_mn_locked(me->mn);
+        if (t != kReg) {
+            if (tip.state == TipMn::Absent) return std::string("masternode not in the list");
+            if (tip.state == TipMn::Listed && is_key_change_locked(*me))
+                for (const auto& r : refs)
+                    if (r.mn == me->mn && is_key_change_locked(r))
+                        return "another operator key change of masternode " + short_id(me->mn) + " is pending ("
+                             + short_id(r.txid) + ")";
+        }
+        if (t == kUpSharedReg)
+            for (const auto& r : refs)
+                if (r.type == kUpShare && r.mn == me->mn && r.reward_key && *r.reward_key == me->voting)
+                    return "a pending share reward update pays the new voting key (" + short_id(r.txid) + ")";
+        if (t == kUpShare && me->reward_key)
+            for (const auto& r : refs)
+                if (r.type == kUpSharedReg && r.mn == me->mn && r.voting == *me->reward_key)
+                    return "a pending shared registrar update makes the new reward the voting key ("
+                         + short_id(r.txid) + ")";
+
+        if (me->opkey_basic && (t == kReg || t == kUpReg || t == kUpSharedReg)) {
+            const bool keeps_tip_key = t != kReg && tip.state == TipMn::Listed && *me->opkey_basic == tip.key;
+            for (const auto& r : refs) {
+                if (r.type != kReg && r.type != kUpReg && r.type != kUpSharedReg) continue;
+                if (t != kUpSharedReg && r.type != kUpSharedReg) continue;   // see above
+                if (!r.opkey_basic || *r.opkey_basic != *me->opkey_basic) continue;
+                if (r.opkey_wire_legacy == me->opkey_wire_legacy)
+                    return "operator key claimed by pending " + short_id(r.txid);
+                const bool own_registrar = t != kReg && r.type != kReg && r.mn == me->mn;
+                if (!own_registrar && !keeps_tip_key)
+                    return "operator key claimed under the other scheme by pending " + short_id(r.txid);
+            }
+        }
+        return std::nullopt;
+    }
+
     bool add_tx_locked(const MutableTransaction& tx,
                        ::core::coin::UTXOViewCache* utxo,
                        bool is_dstx,
@@ -1084,7 +1466,9 @@ private:
         // relays one (IsStandardTx rejects nVersion < 1), so only a dialled
         // non-dashd peer can push it.
         if (contextual_check) {
-            if (auto why = contextual_tx_check(tx, /*is_coinbase=*/false)) {
+            const bool v24 = m_v24_admission.load(std::memory_order_relaxed);
+            if (auto why = v24 ? contextual_tx_check_v24(tx, /*is_coinbase=*/false)
+                               : contextual_tx_check(tx, /*is_coinbase=*/false)) {
                 LOG_INFO << "[MEMPOOL] reject " << *why << " txid="
                          << dash_txid(tx).GetHex().substr(0, 16)
                          << " version16=" << wire_version_i16(tx.version)
@@ -1106,8 +1490,23 @@ private:
                 return false;
             }
         }
+        if (m_min_standard_tx_size != 0
+            && ::pack(tx).get_span().size() < m_min_standard_tx_size) {
+            LOG_INFO << "[MEMPOOL] reject tx-size-small txid="
+                     << dash_txid(tx).GetHex().substr(0, 16)
+                     << " (below Dash Core's MIN_STANDARD_TX_SIZE "
+                     << m_min_standard_tx_size << ")";
+            return false;
+        }
         uint256 txid = dash_txid(tx);
         if (m_pool.count(txid)) return false;
+        // Dash Core's provider-tx admission conflicts for the v24 types
+        // (existsProviderTxConflict / existsProviderTxCrossSchemeConflict):
+        // the pool keeps a pairwise-safe set, as Core's does.
+        if (auto why = provider_admission_conflict_locked(tx, txid)) {
+            LOG_INFO << "[MEMPOOL] reject protx-dup txid=" << txid.GetHex().substr(0, 16) << " (" << *why << ")";
+            return false;
+        }
 
         // #125 — REJECT ALREADY-CONFIRMED TRANSACTIONS AT ADMISSION.
         //
@@ -1340,8 +1739,11 @@ public:
         // add_islock erases them from the (already-pruned) set as it pops.
         for (const auto& mtx : block.m_txs) {
             m_islock_txids.erase(dash_txid(mtx));
+            m_verified_islock_txids.erase(dash_txid(mtx));
             for (const auto& vin : mtx.vin) {
                 m_islock_outpoints.erase(
+                    std::make_pair(vin.prevout.hash, vin.prevout.index));
+                m_verified_islock_outpoints.erase(
                     std::make_pair(vin.prevout.hash, vin.prevout.index));
             }
         }
@@ -1401,16 +1803,26 @@ public:
     ///      it.
     ///   4. ProUpRegTx(X): removeProTxKeyChangedConflicts(X, hash(newKey))
     ///      evicts every pool entry naming X whose validForProTxKey differs.
-    ///      dashd sets validForProTxKey only for ProUpRegTx / ProUpRevTx (the
-    ///      MN's key at admission, txmempool.cpp:686,694); a ProUpServTx keeps
-    ///      the null default (txmempool.h:178), so it is evicted by EVERY mined
-    ///      ProUpRegTx(X). A pending ProUpRegTx / ProUpRevTx(X) stays when the
+    ///      Dash Core v24.0.0 sets validForProTxKey to the MN's tip key at
+    ///      admission for ProUpServTx, ProUpRegTx and ProUpRevTx alike
+    ///      (txmempool.cpp addUncheckedProTx; v23 left a ProUpServTx's null, so
+    ///      every mined ProUpRegTx(X) evicted it). A pending type 2-4 tx naming X stays when the
     ///      key does not change: the pre-block key's bytes under its holder's
     ///      scheme equal the new key's wire bytes (SerializeHash compares bytes,
     ///      so a legacy key re-sent in the basic encoding IS a change here).
     ///      Unknown MN or no `pre_block_operator_key` ⇒ evicted. Also evicts
     ///      pool ProRegTx/ProUpRegTx with the same pubKeyOperator.
     ///   5. ProUpRevTx(X): evicts every pool type 2-4 naming X.
+    ///   Dash Core v24 (shared masternodes):
+    ///   1/2 also evict the pending types 10-12 naming the masternode
+    ///      (removeProTxReferences), and a shared registration's share owner
+    ///      keys conflict like an owner key;
+    ///   6. ProUpSharedRegTx(X): the operator-key conflicts of rule 4, the
+    ///      key-changed conflicts of rule 4 (types 2-4 only: the shared types
+    ///      are authorized by share owner keys), and every pending
+    ///      ProUpShareTx(X) whose reward pays the new voting key;
+    ///   7. ProUpShareTx(X): every pending ProUpSharedRegTx(X) whose voting key
+    ///      the new reward pays.
     /// It also records the block's spent outpoints for prove_chain_coin (S2),
     /// under `at` (height + hash) so a reorg can forget them again
     /// (forget_chain_spends_off_chain); a block recorded without a position
@@ -1442,18 +1854,21 @@ public:
         struct PoolProTx {
             uint256  txid;
             uint16_t type{0};
-            uint256  names_mn;                  // types 2-4: the proTxHash
+            uint256  names_mn;                  // types 2-4, 10-12: the proTxHash
             TxPrevOut collateral;               // type 1: resolved collateral
             uint160  owner;                     // type 1
-            std::array<uint8_t, vendor::BLS_PUBKEY_SIZE> opkey{};   // types 1,3
+            std::vector<uint160> share_owners;  // type 1 (shared registration)
+            std::array<uint8_t, vendor::BLS_PUBKEY_SIZE> opkey{};   // types 1,3,12 (wire bytes)
             bool     has_opkey{false};
             uint160  platform;                  // types 1,2 (Evo only)
             std::optional<Service> service;     // types 1,2
+            uint160  voting;                    // type 12
+            std::optional<uint160> reward_key;  // type 11 (P2PKH/P2PK reward)
         };
         std::vector<PoolProTx> pro;
         for (const auto& [txid, e] : m_pool) {
             const auto& tx = e.tx;
-            if (tx.type < 1 || tx.type > 4) continue;
+            if ((tx.type < 1 || tx.type > 4) && !tx_type_is_v24_provider(tx.type)) continue;
             if (!tx_has_extra_payload(tx.version, tx.type)) continue;
             PoolProTx p;
             p.txid = txid;
@@ -1465,6 +1880,7 @@ public:
                     p.collateral = pl.collateralOutpoint;
                     if (pl.collateralOutpoint.hash.IsNull()) p.collateral.hash = txid;
                     p.owner = pl.keyIDOwner;
+                    for (const auto& sh : pl.shares) p.share_owners.push_back(sh.keyIDOwner);
                     p.opkey = pl.pubKeyOperator; p.has_opkey = true;
                     if (pl.nType == vendor::MnType::EVO) p.platform = pl.platformNodeID;
                     p.service = service_of(pl.netInfo);
@@ -1482,10 +1898,27 @@ public:
                     p.names_mn = pl.proTxHash;
                     p.opkey = pl.pubKeyOperator; p.has_opkey = true;
                 }
-            } else {
+            } else if (tx.type == vendor::CProUpRevTx::SPECIALTX_TYPE) {
                 vendor::CProUpRevTx pl;
                 if ((ok = vendor::parse_protx_payload(tx.extra_payload, pl)))
                     p.names_mn = pl.proTxHash;
+            } else if (tx.type == vendor::CProDisTx::SPECIALTX_TYPE) {
+                vendor::CProDisTx pl;
+                if ((ok = vendor::parse_protx_payload(tx.extra_payload, pl)))
+                    p.names_mn = pl.proTxHash;
+            } else if (tx.type == vendor::CProUpShareTx::SPECIALTX_TYPE) {
+                vendor::CProUpShareTx pl;
+                if ((ok = vendor::parse_protx_payload(tx.extra_payload, pl))) {
+                    p.names_mn = pl.proTxHash;
+                    p.reward_key = paid_key_of(pl.scriptReward.m_data);
+                }
+            } else {
+                vendor::CProUpSharedRegTx pl;
+                if ((ok = vendor::parse_protx_payload(tx.extra_payload, pl))) {
+                    p.names_mn = pl.proTxHash;
+                    p.opkey = pl.pubKeyOperator; p.has_opkey = true;
+                    p.voting = pl.keyIDVoting;
+                }
             }
             if (ok) pro.push_back(std::move(p));
         }
@@ -1496,15 +1929,24 @@ public:
             if (p.txid == mined) return;        // dashd: conflictHash != tx_hash
             evict.emplace(p.txid, why);
         };
+        // removeProTxReferences: every pending tx naming the masternode,
+        // the v24 shared-masternode types included (`with_shared`); the
+        // key-changed eviction (removeProTxKeyChangedConflicts) skips those:
+        // share owner keys, not the operator key, authorize them.
         auto evict_updates_of = [&](const uint256& mn, const uint256& mined,
-                                    const char* why) {
-            for (const auto& p : pro)
-                if (p.type >= 2 && p.type <= 4 && p.names_mn == mn) mark(p, mined, why);
+                                    const char* why, bool with_shared = true) {
+            for (const auto& p : pro) {
+                const bool v24_shared_type = tx_type_is_v24_provider(p.type);
+                if (((p.type >= 2 && p.type <= 4) || (with_shared && v24_shared_type)) && p.names_mn == mn)
+                    mark(p, mined, why);
+            }
         };
         auto evict_id_conflicts = [&](const uint160& id, const uint256& mined) {
             if (id.IsNull()) return;
             for (const auto& p : pro) {
                 if (p.type == 1 && p.owner == id)
+                    mark(p, mined, "dup-owner-or-platform-id");
+                if (p.type == 1 && std::find(p.share_owners.begin(), p.share_owners.end(), id) != p.share_owners.end())
                     mark(p, mined, "dup-owner-or-platform-id");
                 if ((p.type == 1 || p.type == 2) && !p.platform.IsNull() && p.platform == id)
                     mark(p, mined, "dup-owner-or-platform-id");
@@ -1520,7 +1962,8 @@ public:
         auto evict_opkey_conflicts = [&](const std::array<uint8_t, vendor::BLS_PUBKEY_SIZE>& k,
                                          const uint256& mined) {
             for (const auto& p : pro)
-                if ((p.type == 1 || p.type == 3) && p.has_opkey && p.opkey == k)
+                if ((p.type == 1 || p.type == 3 || p.type == vendor::CProUpSharedRegTx::SPECIALTX_TYPE)
+                    && p.has_opkey && p.opkey == k)
                     mark(p, mined, "dup-operator-key");
         };
 
@@ -1548,6 +1991,7 @@ public:
                 if (coll.hash.IsNull()) coll.hash = mined;
                 evict_service_conflicts(service_of(pl.netInfo), mined);
                 evict_id_conflicts(pl.keyIDOwner, mined);
+                for (const auto& sh : pl.shares) evict_id_conflicts(sh.keyIDOwner, mined);
                 evict_opkey_conflicts(pl.pubKeyOperator, mined);
                 if (pl.nType == vendor::MnType::EVO)
                     evict_id_conflicts(pl.platformNodeID, mined);
@@ -1575,18 +2019,49 @@ public:
                 const bool key_changes = !held || *held != pl.pubKeyOperator;
                 for (const auto& p : pro) {
                     if (p.names_mn != pl.proTxHash) continue;
-                    if (p.type == vendor::CProUpServTx::SPECIALTX_TYPE)
-                        mark(p, mined, "operator-key-update");   // validForProTxKey null
-                    else if ((p.type == vendor::CProUpRegTx::SPECIALTX_TYPE
-                              || p.type == vendor::CProUpRevTx::SPECIALTX_TYPE)
-                             && key_changes)
+                    if ((p.type == vendor::CProUpServTx::SPECIALTX_TYPE
+                         || p.type == vendor::CProUpRegTx::SPECIALTX_TYPE
+                         || p.type == vendor::CProUpRevTx::SPECIALTX_TYPE)
+                        && key_changes)
                         mark(p, mined, "operator-key-changed");
                 }
             } else if (tx.type == vendor::CProUpRevTx::SPECIALTX_TYPE) {
-                // Rule 5 — removeProTxKeyChangedConflicts(null key).
+                // Rule 5 — removeProTxKeyChangedConflicts(null key); the v24
+                // shared-masternode types are not keyed on the operator.
                 vendor::CProUpRevTx pl;
                 if (!vendor::parse_protx_payload(tx.extra_payload, pl)) continue;
-                evict_updates_of(pl.proTxHash, mined, "operator-revoked");
+                evict_updates_of(pl.proTxHash, mined, "operator-revoked", /*with_shared=*/false);
+            } else if (tx.type == vendor::CProUpSharedRegTx::SPECIALTX_TYPE) {
+                // Rule 6 (Dash Core v24) — removeProTxPubKeyConflicts,
+                // removeProTxKeyChangedConflicts and
+                // removeProTxVotingPayeeConflicts(X, voting, UPDATE_SHARE).
+                vendor::CProUpSharedRegTx pl;
+                if (!vendor::parse_protx_payload(tx.extra_payload, pl)) continue;
+                evict_opkey_conflicts(pl.pubKeyOperator, mined);
+                std::optional<std::array<uint8_t, vendor::BLS_PUBKEY_SIZE>> held;
+                if (pre_block_operator_key) held = pre_block_operator_key(pl.proTxHash);
+                const bool key_changes = !held || *held != pl.pubKeyOperator;
+                for (const auto& p : pro) {
+                    if (p.names_mn != pl.proTxHash) continue;
+                    if ((p.type == vendor::CProUpServTx::SPECIALTX_TYPE
+                         || p.type == vendor::CProUpRegTx::SPECIALTX_TYPE
+                         || p.type == vendor::CProUpRevTx::SPECIALTX_TYPE)
+                        && key_changes)
+                        mark(p, mined, "operator-key-changed");
+                    else if (p.type == vendor::CProUpShareTx::SPECIALTX_TYPE && p.reward_key
+                             && *p.reward_key == pl.keyIDVoting)
+                        mark(p, mined, "share-reward-pays-the-new-voting-key");
+                }
+            } else if (tx.type == vendor::CProUpShareTx::SPECIALTX_TYPE) {
+                // Rule 7 (Dash Core v24) — removeProTxVotingPayeeConflicts(X,
+                // reward key, UPDATE_SHARED_REGISTRAR).
+                vendor::CProUpShareTx pl;
+                if (!vendor::parse_protx_payload(tx.extra_payload, pl)) continue;
+                if (const auto k = paid_key_of(pl.scriptReward.m_data))
+                    for (const auto& p : pro)
+                        if (p.type == vendor::CProUpSharedRegTx::SPECIALTX_TYPE && p.names_mn == pl.proTxHash
+                            && p.voting == *k)
+                            mark(p, mined, "voting-key-is-a-share-reward");
             }
         }
 
@@ -1612,15 +2087,21 @@ public:
     ///      candidate vin against this map (belt for txs admitted between
     ///      islock arrival and eviction, and for re-added conflicts).
     ///
-    /// RESIDUAL RACE (documented, not closable node-side): an islock that
-    /// FORMS (or reaches us) after a template was emitted can invalidate a
-    /// share won on that template — the islock-formation window. dashd's
-    /// validator itself waives conflict-tx-lock once the block is
-    /// chainlocked (validation.cpp:2612 has_chainlock override), so the
-    /// exposure is one islock-vs-block race per conflicting spend, the same
-    /// race dashd's own miner runs. There is no pre-emit oracle for "an
-    /// islock will form for the OTHER spend"; tracking known locks is the
-    /// full extent of what any miner can do.
+    /// RESIDUAL RACE (not closable node-side): an islock that FORMS after a
+    /// template was emitted invalidates a block won on that template before
+    /// we can know — the islock-formation window, the same race dashd's own
+    /// miner runs. dashd's validator waives conflict-tx-lock only for a block
+    /// that is ALREADY ChainLocked (v24.0.2 validation.cpp:2811-2829), which
+    /// a freshly found block never is, so a block in this window is lost.
+    /// There is no pre-emit oracle for "an islock will form for the OTHER
+    /// spend".
+    ///
+    /// CLOSABLE PART (N2): an islock that has REACHED us and been verified
+    /// while a template carrying the conflicting tx is still being served.
+    /// Eviction (1) and the selection guard (2) only shape the NEXT template;
+    /// add_verified_islock records the verified outpoints, the emit gate
+    /// refuses a body that conflicts with one, and main_dash forces a clean
+    /// work refresh when the served template does.
     ///
     /// FEED: dashd-peer relay (the sole-ingestion-path invariant covers
     /// islocks too — they arrive from the same relay peers as the txs), via
@@ -1635,6 +2116,19 @@ public:
                     const std::vector<std::pair<uint256, uint32_t>>& inputs)
     {
         std::lock_guard<std::mutex> lock(m_mutex);
+        add_islock_locked(locked_txid, inputs, /*verified=*/false);
+    }
+
+    /// add_islock's body. An UNVERIFIED (relay-lane) lock never overrides an
+    /// outpoint a VERIFIED lock owns: it neither rewrites that entry nor
+    /// evicts the pool entry spending it. Otherwise the G4 selection guard
+    /// (which then reads the rewritten entry) and the emit gate's belt (which
+    /// reads the verified map) would disagree, and every freshly built
+    /// template would be refused.
+    void add_islock_locked(const uint256& locked_txid,
+                           const std::vector<std::pair<uint256, uint32_t>>& inputs,
+                           bool verified)
+    {
         // Locked-TXID index — dashd's IsLocked(txid) equivalent for the IS
         // mining-safety hold: a tx WITH a known islock is safe to mine
         // immediately (TestPackageTransactions skips the 10-min hold for it).
@@ -1649,6 +2143,11 @@ public:
         // Feed-liveness tick for the hold's ISLOCK_FEED_FRESH_SECS gate.
         m_last_islock_seen = std::time(nullptr);
         for (const auto& in : inputs) {
+            if (!verified) {
+                const auto v = m_verified_islock_outpoints.find(in);
+                if (v != m_verified_islock_outpoints.end() && v->second != locked_txid)
+                    continue;   // a verified lock owns this outpoint
+            }
             // Bound the tracking map (relay is untrusted input): evict the
             // oldest registration once over cap. 100k outpoints ≈ a few MB.
             while (m_islock_order.size() >= MAX_ISLOCK_OUTPOINTS
@@ -1678,6 +2177,134 @@ public:
         return m_islock_outpoints.size();
     }
 
+    // ── N2: VERIFIED islock outpoints ────────────────────────────────────
+    /// Adopt a BLS-VERIFIED islock (CoinStateMaintainer::on_new_isdlock, after
+    /// the verifier passed). Does everything add_islock does — the unverified
+    /// relay lane has normally run for the same lock already, so that part is
+    /// idempotent — and also records the outpoints in the VERIFIED map.
+    ///
+    /// add_islock evicts the conflicting pool entry and the G4 selection guard
+    /// keeps it out of NEW templates, but a template built and served before
+    /// the lock arrived still carries it, and a block won on that job is
+    /// rejected (Dash Core v24.0.2 validation.cpp:2811-2829, conflict-tx-lock;
+    /// the waiver there applies only to a block that is already ChainLocked).
+    /// The verified map is what may act on that: the emit gate's belt
+    /// (verified_islock_conflict_in) and the forced work refresh main_dash
+    /// fires when the served template spends a just-verified lock's outpoint.
+    /// The unverified map must not drive either: a forged lock would otherwise
+    /// refuse templates or force clean_jobs notifies on demand.
+    void add_verified_islock(const uint256& locked_txid,
+                             const std::vector<std::pair<uint256, uint32_t>>& inputs)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        add_islock_locked(locked_txid, inputs, /*verified=*/true);
+        for (const auto& in : inputs) {
+            // Same bounded-FIFO posture as the unverified map.
+            while (m_verified_islock_order.size() >= MAX_ISLOCK_OUTPOINTS
+                   && !m_verified_islock_order.empty()) {
+                m_verified_islock_outpoints.erase(m_verified_islock_order.front());
+                m_verified_islock_order.pop_front();
+            }
+            auto [it, inserted] = m_verified_islock_outpoints.insert_or_assign(in, locked_txid);
+            if (inserted) m_verified_islock_order.push_back(in);
+        }
+        while (m_verified_islock_txid_order.size() >= MAX_ISLOCK_OUTPOINTS
+               && !m_verified_islock_txid_order.empty()) {
+            m_verified_islock_txids.erase(m_verified_islock_txid_order.front());
+            m_verified_islock_txid_order.pop_front();
+        }
+        if (m_verified_islock_txids.insert(locked_txid).second)
+            m_verified_islock_txid_order.push_back(locked_txid);
+    }
+
+    /// What revoke_unverified_islock undid.
+    struct IslockRevoke {
+        bool   hold_restored{false};       // txid left m_islock_txids (the hold applies again)
+        size_t g4_cleared{0};              // outpoint entries this lock wrote, removed
+        size_t g4_restored{0};             // entries it had overwritten, back to the verified lock
+    };
+
+    /// Lane 2 REFUSED this lock (BLS verification failed): undo what the
+    /// unverified relay lane (on_islock -> add_islock) did with it. Dash Core
+    /// only ever acts on locks it verified (its IsLocked short-circuit of
+    /// IsTxSafeForMining, miner.cpp:430-436), so a refused lock must not keep
+    /// a tx out of the 600 s mining-safety hold or keep its outpoints excluded.
+    /// Both lanes run synchronously in one isdlock handler (p2p_client.hpp:
+    /// new_islock, then new_isdlock), so the revoke lands before any template
+    /// can be built in between.
+    ///
+    ///   * txid: removed from m_islock_txids unless a VERIFIED lock holds the
+    ///     same txid (a forged copy naming a verified txid changes nothing);
+    ///   * each input: an entry this lock wrote (still mapped to its txid) is
+    ///     removed, or set back to the VERIFIED lock's txid when the forged
+    ///     lock had overwritten a verified entry (otherwise G4 would stop
+    ///     excluding a tx the emit belt still refuses);
+    ///   * the feed-liveness tick (m_last_islock_seen) is left alone: a
+    ///     revocation must not make the feed look dark and disarm the hold.
+    ///
+    /// Not undone: a pool entry add_islock already EVICTED stays evicted (it is
+    /// re-relayed or mined elsewhere; the cost is fees, never a block).
+    IslockRevoke revoke_unverified_islock(const uint256& locked_txid,
+                                          const std::vector<std::pair<uint256, uint32_t>>& inputs)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        IslockRevoke r;
+        if (!m_verified_islock_txids.count(locked_txid) && m_islock_txids.erase(locked_txid))
+            r.hold_restored = true;   // stale order-deque entries are harmless (FIFO erase)
+        for (const auto& in : inputs) {
+            auto it = m_islock_outpoints.find(in);
+            const auto v = m_verified_islock_outpoints.find(in);
+            if (v != m_verified_islock_outpoints.end()) {
+                if (it == m_islock_outpoints.end()) {
+                    m_islock_outpoints.emplace(in, v->second);
+                    m_islock_order.push_back(in);
+                    ++r.g4_restored;
+                } else if (it->second != v->second) {
+                    it->second = v->second;
+                    ++r.g4_restored;
+                }
+                continue;
+            }
+            if (it != m_islock_outpoints.end() && it->second == locked_txid) {
+                m_islock_outpoints.erase(it);
+                ++r.g4_cleared;
+            }
+        }
+        return r;
+    }
+
+    /// Hold short-circuit probe (dashd IsLocked(txid) equivalent) for KATs
+    /// and diagnostics.
+    bool islock_txid_known(const uint256& txid) const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_islock_txids.count(txid) > 0;
+    }
+
+    /// First tx of an already-built body that spends an outpoint a VERIFIED
+    /// islock assigns to a different txid (nullopt = none). `txids` parallel
+    /// to `txs` when available (DashWorkData m_txs / m_tx_hashes).
+    template <typename TxT>
+    std::optional<IslockConflict>
+    verified_islock_conflict_in(const std::vector<TxT>& txs,
+                                const std::vector<uint256>& txids) const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_verified_islock_outpoints.empty()) return std::nullopt;
+        return first_islock_conflict(txs, txids,
+            [this](const std::pair<uint256, uint32_t>& op) -> std::optional<uint256> {
+                auto it = m_verified_islock_outpoints.find(op);
+                if (it == m_verified_islock_outpoints.end()) return std::nullopt;
+                return it->second;
+            });
+    }
+
+    size_t verified_islock_outpoint_count() const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_verified_islock_outpoints.size();
+    }
+
     void evict_expired()
     {
         time_t cutoff = std::time(nullptr) - m_expiry_sec;
@@ -1704,6 +2331,10 @@ public:
         m_feerate_index.clear();
         m_islock_outpoints.clear();
         m_islock_order.clear();
+        m_verified_islock_outpoints.clear();
+        m_verified_islock_order.clear();
+        m_verified_islock_txids.clear();
+        m_verified_islock_txid_order.clear();
         m_islock_txids.clear();
         m_islock_txid_order.clear();
         m_last_islock_seen = 0;
@@ -1750,6 +2381,97 @@ public:
         return m_pool.count(txid) > 0;
     }
 
+    /// Read-only diagnosis of one pool entry: is it a template candidate, and
+    /// if not, which input could no coin source price. Feeds GET
+    /// /mempool_entry (fee-parity shadow tooling: the comparator asks it for
+    /// every tx dashd mined and we did not). Mutates nothing, not even the
+    /// fee cache. The input walk mirrors compute_fee_locked's general path,
+    /// source for source: our UTXO view, an in-pool parent, the live fold
+    /// (fold_resolve), the fee-coin lookup.
+    struct Probe {
+        bool     in_pool{false};
+        time_t   time_added{0};
+        bool     fee_known{false};
+        bool     fee_fold_proven{false};  ///< what the template selector gates on
+        bool     in_feerate_index{false};
+        uint64_t fee{0};
+        uint64_t fee_delta{0};
+        uint32_t base_size{0};
+        int32_t  tx_type{0};
+        uint32_t n_vin{0};
+        uint32_t n_vin_unresolved{0};     ///< inputs no source can price now
+        // Coin sources wired on this node.
+        bool     utxo_view{false};
+        bool     fold_live{false};        ///< fold_resolve can answer (wired and at tip)
+        bool     fee_coin_lookup{false};
+        // The first input no source could price (n_vin_unresolved > 0).
+        uint32_t first_unresolved_vin{0};
+        uint256  first_unresolved_hash;
+        uint32_t first_unresolved_index{0};
+        bool     first_unresolved_parent_in_pool{false};  ///< parent held, index past its vouts
+        bool     first_unresolved_coin_spent{false};      ///< fee-coin lookup knows it, spent
+    };
+    Probe probe(const uint256& txid) const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        Probe p;
+        auto* utxo = m_utxo.load();
+        p.utxo_view       = utxo != nullptr;
+        p.fold_live       = fold_active();
+        p.fee_coin_lookup = static_cast<bool>(m_fee_coin_lookup);
+        auto it = m_pool.find(txid);
+        if (it == m_pool.end()) return p;
+        const MempoolEntry& e = it->second;
+        p.in_pool          = true;
+        p.time_added       = e.time_added;
+        p.fee_known        = e.fee_known;
+        p.fee_fold_proven  = e.fee_fold_proven;
+        p.fee              = e.fee;
+        p.fee_delta        = e.fee_delta;
+        p.base_size        = e.base_size;
+        p.tx_type          = static_cast<int32_t>(e.tx.type);
+        p.n_vin            = static_cast<uint32_t>(e.tx.vin.size());
+        p.in_feerate_index = e.fee_known
+            && m_feerate_index.count(FeeKey{e.modified_fee(), e.base_size, txid}) > 0;
+        for (uint32_t i = 0; i < e.tx.vin.size(); ++i) {
+            const auto& vin = e.tx.vin[i];
+            ::core::coin::Outpoint op(vin.prevout.hash, vin.prevout.index);
+            ::core::coin::Coin coin;
+            if (utxo && utxo->get_coin(op, coin)) continue;
+            auto pit = m_pool.find(vin.prevout.hash);
+            const bool parent_held = pit != m_pool.end();
+            if (parent_held && vin.prevout.index < pit->second.tx.vout.size()) continue;
+            if (fold_resolve(op, coin)) continue;
+            bool spent = false;
+            if (m_fee_coin_lookup) {
+                ::core::coin::Coin fc;
+                if (m_fee_coin_lookup(op, fc)) {
+                    if (!fc.is_spent()) continue;
+                    spent = true;
+                }
+            }
+            if (p.n_vin_unresolved++ == 0) {
+                p.first_unresolved_vin            = i;
+                p.first_unresolved_hash           = vin.prevout.hash;
+                p.first_unresolved_index          = vin.prevout.index;
+                p.first_unresolved_parent_in_pool = parent_held;
+                p.first_unresolved_coin_spent     = spent;
+            }
+        }
+        return p;
+    }
+
+    /// The txids of `txids` the pool holds, read under one lock (one
+    /// consistent view for a whole template body).
+    std::set<uint256> contained(const std::set<uint256>& txids) const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        std::set<uint256> out;
+        for (const auto& id : txids)
+            if (m_pool.count(id) > 0) out.insert(id);
+        return out;
+    }
+
     size_t size() const
     {
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -1770,6 +2492,19 @@ public:
             if (e.fee_known) sum += e.fee;
         }
         return sum;
+    }
+
+    /// The type-9 asset unlocks in the pool, in txid order. Selection never
+    /// takes them; the credit-pool follower's admission does
+    /// (credit_pool_lane.hpp), so this is its candidate list.
+    std::vector<MutableTransaction> asset_unlock_candidates() const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        std::vector<MutableTransaction> out;
+        for (const auto& kv : m_pool)
+            if (kv.second.tx.type == vendor::CAssetUnlockPayload::SPECIALTX_TYPE)
+                out.push_back(kv.second.tx);
+        return out;
     }
 
     std::optional<MempoolEntry> get_entry(const uint256& txid) const
@@ -1891,6 +2626,27 @@ public:
         return out;
     }
 
+    /// BIP 152 short-id walk (Dash Core PartiallyDownloadedBlock::InitData:
+    /// LOCK(pool->cs), then every pool->vTxHashes entry). Calls `fn` once per
+    /// pooled tx, under the pool lock, with the tx by reference: nothing is
+    /// copied here. The key is the INSTANCE hash Dash Core v24 keys vTxHashes
+    /// by (txmempool.cpp GetInstanceHash): the pool key (dash_txid) for every
+    /// tx except a version-2 asset unlock, whose stable txid zeroes the quorum
+    /// signing info and so differs from the instance hash. `fn` returns false
+    /// to stop the walk. It must not call back into this Mempool.
+    template <typename Fn>
+    void for_each_tx_by_instance_hash(Fn&& fn) const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        for (const auto& [txid, e] : m_pool) {
+            if (is_asset_unlock_with_stable_txid(e.tx)) {
+                if (!fn(dash_instance_hash(e.tx), e.tx)) return;
+            } else if (!fn(txid, e.tx)) {
+                return;
+            }
+        }
+    }
+
     /// Phase C-TEMPLATE prerequisite — fee-aware tx selection.
     /// Returns transactions in TOPOLOGICALLY-VALID feerate order (see G1
     /// below) up to `max_bytes` of base-size budget. Transactions with
@@ -1973,10 +2729,24 @@ public:
     // meanings byte-for-byte for every existing caller — `true` masks all
     // special out, `false`/default admits all — so only the embedded builder,
     // which now passes an explicit partial mask, changes behaviour.
+    //
+    // Dash Core v24 (the embedded builder sets these from its own inputs):
+    //   * types 10-12 (ProDisTx/ProUpShareTx/ProUpSharedRegTx) — admitted when
+    //     allow_v24_provider (DEPLOYMENT_V24 active for the block and the v24
+    //     fold armed: the template folds them, sml_special_fold.hpp); a
+    //     ProDisTx may then spend its shared masternode's template-script
+    //     collateral, the only spend Core allows of that coin;
+    //   * type 7 (MNHF signal) — admitted when allow_mnhf (the builder runs
+    //     Dash Core's CheckMNHFTx and the duplicate rule, mnhf_check.hpp);
+    //   * v24_rules — the block's ContextualCheckTransaction type list is Core
+    //     v24's (0..12) instead of v23.1.9's (0..9).
     struct SpecialTxSelectMask {
         bool allow_all_special;   // legacy exclude_special == false
         bool allow_mn_types;      // types 1-4
         bool allow_locks;         // type 8
+        bool allow_v24_provider;  // types 10-12 (only with v24_rules)
+        bool allow_mnhf;          // type 7
+        bool v24_rules;           // DEPLOYMENT_V24 active for the block
         // A single user-provided constructor (default exclude_special=false =>
         // legacy admit-all). No in-class member initializers: those would be
         // odr-used by the `= {}` default argument on get_sorted_txs_with_fees
@@ -1986,13 +2756,18 @@ public:
         constexpr SpecialTxSelectMask(bool exclude_special = false)
             : allow_all_special(!exclude_special),
               allow_mn_types(false),
-              allow_locks(false) {}
+              allow_locks(false),
+              allow_v24_provider(false),
+              allow_mnhf(false),
+              v24_rules(false) {}
         constexpr bool admits(uint16_t tx_type) const {
             if (tx_type == 0) return true;              // ordinary tx
             if (allow_all_special) return true;         // legacy general path
             if (tx_type >= 1 && tx_type <= 4) return allow_mn_types;
+            if (tx_type == 7) return allow_mnhf;
             if (tx_type == 8) return allow_locks;
-            return false;                               // 5/6/7/9 never here
+            if (tx_type_is_v24_provider(tx_type)) return allow_v24_provider && v24_rules;
+            return false;                               // 5/6/9 never here
         }
     };
 
@@ -2285,8 +3060,17 @@ public:
                 // PER-TYPE special-tx admission (see SpecialTxSelectMask):
                 // the legacy exclude_special=true collapses to admits()==false
                 // for every type!=0; the partial embedded mask admits types
-                // 1-4 and/or 8 only, and 5/6/7/9 are never selected.
+                // 1-4, 7, 8 and (v24) 10-12, and 5/6/9 are never selected.
                 if (!special_mask.admits(e->tx.type)) { ok = false; break; }
+                // An MNHF signal rides only in the shape Dash Core's signer
+                // builds: no inputs and no outputs (MNHFTxPayload::PrepareTx,
+                // evo/mnhftx.cpp:37-45). CheckTransaction lets a type-7 tx
+                // carry both (consensus/tx_check.cpp:18-21), but a signal with
+                // an output can have an in-mempool child while the builder
+                // refuses signals one by one (mnhf_check.hpp). Dropping the
+                // member drops its package, so such a child never rides.
+                if (e->tx.type == vendor::MNHFTxPayload::SPECIALTX_TYPE
+                    && (!e->tx.vin.empty() || !e->tx.vout.empty())) { ok = false; break; }
                 // A type-8 lock rides only when it is a valid block member:
                 // the CheckAssetLockTx port of asset_lock_fold.hpp (version 1,
                 // P2PKH credit outputs, one `6a 00` marker equal to the
@@ -2298,11 +3082,44 @@ public:
                 // package, and any descendant fails the parent check.
                 if (e->tx.type == vendor::CAssetLockPayload::SPECIALTX_TYPE
                     && !check_asset_lock_tx(e->tx)) { ok = false; break; }
+                // Dash Core v24 IsStandardSpecialTx: a lock with more than 100
+                // inputs, larger than 20480 bytes or of payload version 2 is
+                // nonstandard; Core never mines one from its mempool, and
+                // Platform cannot fund from it (good citizen).
+                if (e->tx.type == vendor::CAssetLockPayload::SPECIALTX_TYPE
+                    && asset_lock_standard_refusal(e->tx)) { ok = false; break; }
+                // MIN_STANDARD_TX_SIZE, for entries that predate the knob.
+                if (m_min_standard_tx_size != 0 && e->base_size < m_min_standard_tx_size) {
+                    ok = false;
+                    break;
+                }
+                // Dash Core v24 shared-collateral template (04445348437551):
+                // a tx paying it never rides (shared_collateral.hpp), except
+                // a shared registration whose collateral output it is, under
+                // v24 with the provider fold armed
+                // (CheckSharedCollateralTemplateOutputs). A tx spending it is
+                // caught where the stale-input guard resolves each input's
+                // coin below.
+                {
+                    bool pays_template = false;
+                    for (const auto& out : e->tx.vout)
+                        if (is_shared_collateral_script(out.scriptPubKey.m_data)) { pays_template = true; break; }
+                    if (pays_template
+                        && !(special_mask.v24_rules && special_mask.allow_mn_types
+                             && is_shared_registration_collateral_only(e->tx))) {
+                        ok = false;
+                        break;
+                    }
+                }
                 // Belt for the admission gate (add_tx_locked): a pool entry
                 // that predates it (or any future seam that bypasses it) must
                 // never ride — dashd rejects the block (bad-txns-version /
                 // bad-txns-type, ContextualCheckTransaction post-DIP3).
-                if (contextual_tx_check(e->tx, /*is_coinbase=*/false)) { ok = false; break; }
+                if (special_mask.v24_rules ? contextual_tx_check_v24(e->tx, /*is_coinbase=*/false).has_value()
+                                           : contextual_tx_check(e->tx, /*is_coinbase=*/false).has_value()) {
+                    ok = false;
+                    break;
+                }
 
                 // ── dashd TestPackageTransactions (node/miner.cpp:374-391),
                 // member-level; either failure drops the WHOLE package and —
@@ -2333,6 +3150,7 @@ public:
                 //     construction.
                 if (is_hold_active && !e->tx.vin.empty()
                     && !m_islock_txids.count(e->txid)
+                    && !m_verified_islock_txids.count(e->txid)
                     && now_ts - e->time_added < WAIT_FOR_ISLOCK_TIMEOUT_SECS) {
                     ok = false;
                     break;
@@ -2355,9 +3173,16 @@ public:
 
                     // G4: islock conflict — the outpoint is locked to a
                     // different txid; packing this tx is conflict-tx-lock.
-                    auto lk = m_islock_outpoints.find(opkey);
-                    if (lk != m_islock_outpoints.end()
-                        && lk->second != e->txid) {
+                    //     A VERIFIED entry outranks the relay-lane one
+                    //     (the emit gate's belt reads the verified map).
+                    const uint256* locked_to = nullptr;
+                    if (auto vk = m_verified_islock_outpoints.find(opkey);
+                        vk != m_verified_islock_outpoints.end())
+                        locked_to = &vk->second;
+                    else if (auto lk = m_islock_outpoints.find(opkey);
+                             lk != m_islock_outpoints.end())
+                        locked_to = &lk->second;
+                    if (locked_to != nullptr && *locked_to != e->txid) {
                         ok = false;
                         break;
                     }
@@ -2391,6 +3216,9 @@ public:
                         }
                         const auto& pscript = parent->second.tx
                             .vout[vin.prevout.index].scriptPubKey.m_data;
+                        // Shared-collateral template spend (unreachable: a
+                        // parent paying it never rides), kept for symmetry.
+                        if (is_shared_collateral_script(pscript)) { ok = false; break; }
                         if (is_p2sh_script(pscript)) {
                             tx_sigops += count_p2sh_sigops(
                                 vin.scriptSig.m_data);
@@ -2433,6 +3261,17 @@ public:
                         if (!have) {
                             // Stale input: not a selected parent, and neither the
                             // forward UTXO view nor (when armed) either fold has it.
+                            ok = false;
+                            break;
+                        }
+                        // Dash Core v24: only a ProDisTx may spend a coin locked
+                        // to the shared-collateral template; one rides only
+                        // with the v24 fold armed (the builder's fold then
+                        // checks it, CheckProDisTx, and removes the masternode).
+                        if (is_shared_collateral_script(coin.scriptPubKey.m_data)
+                            && !(special_mask.allow_v24_provider && special_mask.v24_rules
+                                 && tx_is_special_version(e->tx.version)
+                                 && e->tx.type == tx_type::PROVIDER_DISSOLVE)) {
                             ok = false;
                             break;
                         }
@@ -2570,6 +3409,9 @@ private:
     std::map<uint256, MempoolEntry>                    m_pool;
     std::multimap<time_t, uint256>                     m_time_index;
     std::map<std::pair<uint256, uint32_t>, uint256>    m_spent_outputs;
+    // prove_chain_coin calls (chain_coin_proofs()); a relaxed counter, read by
+    // the emit gate around one fold on the same thread.
+    mutable std::atomic<uint64_t>                      m_chain_coin_proofs{0};
     // Step 2: feerate-sorted index. greater<double> means begin() =
     // highest feerate, so iteration is best-first.
     std::set<FeeKey>                                   m_feerate_index;
@@ -2577,6 +3419,14 @@ private:
     // insertion order for bounded eviction.
     std::map<std::pair<uint256, uint32_t>, uint256>    m_islock_outpoints;
     std::deque<std::pair<uint256, uint32_t>>           m_islock_order;
+    // N2: the subset adopted through the BLS-VERIFIED lane only
+    // (add_verified_islock). Drives the emit belt and the forced refresh.
+    std::map<std::pair<uint256, uint32_t>, uint256>    m_verified_islock_outpoints;
+    std::deque<std::pair<uint256, uint32_t>>           m_verified_islock_order;
+    // Txids holding a VERIFIED lock: revoke_unverified_islock never strips
+    // their hold short-circuit.
+    std::set<uint256>                                  m_verified_islock_txids;
+    std::deque<uint256>                                m_verified_islock_txid_order;
     // IS mining-safety hold: txids holding a known islock (dashd
     // IsLocked(txid)) — such a tx bypasses the 10-minute hold. Same bounded-
     // FIFO posture as the outpoint map (relay is untrusted input).
@@ -2612,6 +3462,8 @@ private:
     // Hold arm-bit (spork2+spork3, pushed from the io thread via
     // set_instantsend_mining_hold; read on the serve executor). DEFAULT OFF.
     std::atomic<bool>                                  m_is_hold_armed{false};
+    std::atomic<bool>                                  m_v24_admission{false};   // set_v24_admission
+    TipOperatorKeyFn                                   m_tip_opkey;              // set_tip_operator_key_fn
     size_t                                             m_total_bytes{0};
     size_t                                             m_max_bytes;
     time_t                                             m_expiry_sec;
@@ -2620,6 +3472,7 @@ private:
     // DEFAULT_BLOCK_MIN_TX_FEE. Read under m_mutex (selector holds it); written
     // via set_block_min_tx_fee (also under the lock).
     int64_t                                            m_block_min_tx_fee{DEFAULT_BLOCK_MIN_TX_FEE};
+    uint32_t                                           m_min_standard_tx_size{0};   // 0 = off; c2pool-dash: 65
     std::atomic<::core::coin::UTXOViewCache*>          m_utxo{nullptr};
     // Second-source coin lookup for the PINNED-TX gate only (see
     // set_external_coin_lookup). Set once at wiring time, before any template
@@ -3167,6 +4020,18 @@ private:
             return false;
         }
 
+        // MNHF signal (type 7): Dash Core's CheckTransaction lets it carry no
+        // inputs and no outputs, and such a signal pays exactly zero (Core
+        // skips its relay-fee check, validation.cpp:1066-1068). Exact without
+        // a UTXO view; its +0.1 DASH priority delta (above) is modified fee
+        // only. A type 7 with inputs or outputs takes the general path.
+        if (entry.tx.type == vendor::MNHFTxPayload::SPECIALTX_TYPE
+            && entry.tx.vin.empty() && entry.tx.vout.empty()) {
+            entry.fee = 0;
+            entry.fee_known = true;
+            entry.fee_fold_proven = true;
+            return true;
+        }
         if (!utxo) {
             entry.fee_known = false;
             entry.fee_fold_proven = false;

@@ -50,6 +50,7 @@
 #include <core/filesystem.hpp>   // core::filesystem::set_data_dir (--data-dir, #722)
 #include <core/settings_cli.hpp>          // M0b control-plane wiring
 #include <core/config_endpoint.hpp>       // M1 control-plane READ-ONLY endpoints
+#include <core/stratum_http.hpp>           // --stratum-http (the web API on the stratum port)
 #include <impl/bch/catalog_defaults.hpp>  // M0b L0 compiled defaults
 
 #include <cstdlib>
@@ -107,6 +108,21 @@ void print_banner(const char* argv0)
         << "Pool / sharechain:\n"
         << "  --stratum [HOST:]PORT     bind the stratum miner endpoint (else disabled)\n"
         << "  --http [HOST:]PORT        bind the dashboard/HTTP endpoint (else disabled)\n"
+        << "  --stratum-http[=true|false|auto]  also answer the web API (GET/HEAD,\n"
+        << "                            read-only) on the stratum port, as python p2pool\n"
+        << "                            did on its worker port; default false; auto =\n"
+        << "                            on when --http binds ::, binds 0.0.0.0 and\n"
+        << "                            --stratum is IPv4, or binds the --stratum\n"
+        << "                            address (not loopback)\n"
+        << "  --stratum-http-budget N   HTTP requests in progress on the stratum port at\n"
+        << "                            once: at most N and at most\n"
+        << "                            max_stratum_connections - 1; others are answered\n"
+        << "                            503 (default 16; 0 = every HTTP request on the\n"
+        << "                            stratum port is answered 503)\n"
+        << "  --stratum-http-per-ip N   HTTP requests in progress on the stratum port at\n"
+        << "                            once from one address, one /64 for IPv6: at\n"
+        << "                            most N; others are answered 503 (default 6; 0 =\n"
+        << "                            no limit below --stratum-http-budget)\n"
         << "  --sharechain-addnode H:P  pin explicit sharechain (pool P2P) peer(s);\n"
         << "                            REPEATABLE. Given => only these are dialed.\n"
         << "  --anchor N                cold-start ABLA floor anchor height\n"
@@ -882,6 +898,28 @@ int main(int argc, char** argv)
                 http_port = static_cast<uint16_t>(std::stoul(hp));
             }
         }
+        // --stratum-http[=true|false|auto]: the web API on the stratum port too
+        // (core/stratum_http.hpp).
+        else if (std::strcmp(argv[i], "--stratum-http") == 0
+                 || std::strncmp(argv[i], "--stratum-http=", 15) == 0) {
+            if (!core::parse_stratum_http_flag(argv[i], core::stratum_http_mode_setting())) {
+                std::cerr << "bad value: " << argv[i] << " (expected --stratum-http=true, false or auto)\n";
+                return 1;
+            }
+        }
+        // --stratum-http-budget N / --stratum-http-per-ip N (core/stratum_http.hpp).
+        else if (std::strcmp(argv[i], "--stratum-http-budget") == 0 && i + 1 < argc) {
+            if (!core::parse_stratum_http_count(argv[++i], core::stratum_http_limits_setting().budget)) {
+                std::cerr << "bad value: --stratum-http-budget " << argv[i] << " (expected a count)\n";
+                return 1;
+            }
+        }
+        else if (std::strcmp(argv[i], "--stratum-http-per-ip") == 0 && i + 1 < argc) {
+            if (!core::parse_stratum_http_count(argv[++i], core::stratum_http_limits_setting().per_ip)) {
+                std::cerr << "bad value: --stratum-http-per-ip " << argv[i] << " (expected a count)\n";
+                return 1;
+            }
+        }
         else if (std::strcmp(argv[i], "--leg-c-capture") == 0) want_leg_c = true;
         else if (std::strcmp(argv[i], "--leg-c-capture-p2p") == 0) want_leg_c_p2p = true;
         else if (std::strcmp(argv[i], "--p2p-port") == 0 && i + 1 < argc)
@@ -965,6 +1003,15 @@ int main(int argc, char** argv)
             c2pool::catalog::C_BCH, path);
         // Apply file-sourced (L1) values into the locals the node consumes.
         if (rc.file_set("web.port"))        http_port  = static_cast<uint16_t>(rc.get_u16("web.port").value_or(http_port));
+        if (rc.file_set("stratum.http"))   // --stratum-http: true / false / auto
+            core::apply_stratum_http_setting(rc.get_string("stratum.http").value_or(""),
+                                             core::stratum_http_mode_setting());
+        if (rc.file_set("stratum.http_budget"))   // --stratum-http-budget
+            core::apply_stratum_http_count_setting("stratum.http_budget", rc.get_i64("stratum.http_budget"),
+                                                   core::stratum_http_limits_setting().budget);
+        if (rc.file_set("stratum.http_per_ip"))   // --stratum-http-per-ip
+            core::apply_stratum_http_count_setting("stratum.http_per_ip", rc.get_i64("stratum.http_per_ip"),
+                                                   core::stratum_http_limits_setting().per_ip);
         if (rc.file_set("daemon_rpc.auth_file")) rpc_conf = rc.get_string("daemon_rpc.auth_file").value_or(rpc_conf);
         // Coin-network peer (--peer alias) + --coin-p2p-discover from the settings
         // file (L1). coin_p2p.connect is HOST[:PORT]; an omitted port keeps the

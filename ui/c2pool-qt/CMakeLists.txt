@@ -92,6 +92,8 @@ qt_add_resources(c2pool-qt "explorer_bundle"
         "${C2POOL_EXPLORER_DIR}/dist/sharechain-explorer.js"
         "${C2POOL_EXPLORER_DIR}/pplns-embed.html"
         "${C2POOL_EXPLORER_DIR}/dist/pplns-view.js"
+        # Scene engine + PPLNS treemap view, for the embed swap.
+        "${C2POOL_EXPLORER_DIR}/dist/scene.js"
 )
 
 # The panel reads the node's parameter catalog (src/core/param_catalog.*) and the

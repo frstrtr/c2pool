@@ -37,6 +37,11 @@ struct TipAdvance
     uint8_t  address_p2sh_version{0};
     uint32_t curtime{0};
     uint32_t version{0};
+    // mtp_at_tip is over the full 11-header window of the tip. When false
+    // (e.g. right after a cold start) the template's mintime is 0: no submit
+    // floor from an MTP over fewer headers, which can be later than the
+    // network's. mtp_at_tip keeps its other uses (lock-time cutoff, MNHF).
+    bool     mtp_window_complete{true};
 };
 
 /// Header/think path payload: a block was connected to the active chain. The
@@ -230,10 +235,19 @@ struct Node
     // subscribes: for a trigger it parses the payment schedule into the
     // GovernanceStore. Distinct from the SML axis (mnlistdiff) — this is the
     // governance-object axis feeding daemonless superblock payee sourcing.
+    // C3: the signer (collateral outpoint), its BLS vchSig and the signed
+    // digest (govobject_signature_hash — CGovernanceObject::GetSignatureHash)
+    // ride along so the maintainer can verify a TRIGGER's masternode
+    // signature before storing it (dashcore IsValidLocally parity).
     struct GovObjectRecord {
         uint256              object_hash;
         int32_t              object_type{0};
         std::vector<uint8_t> vch_data;      // plaintext JSON bytes (trigger schedule)
+        uint256              mn_outpoint_hash;
+        uint32_t             mn_outpoint_index{0};
+        std::vector<uint8_t> vch_sig;
+        uint256              sig_hash;      // govobject_signature_hash
+        std::string          peer_key;      // session that delivered it
     };
     Event<GovObjectRecord> new_govobject;
 
@@ -257,6 +271,8 @@ struct Node
         int64_t              time{0};
         std::vector<uint8_t> vch_sig;            // BLS operator-key sig (verify seam)
         uint256              vote_hash;          // govvote_signature_hash (signed digest)
+        uint256              vote_id;            // govvote_identity_hash (== inv hash)
+        std::string          peer_key;           // session that delivered it
     };
     Event<GovVoteRecord> new_govvote;
 

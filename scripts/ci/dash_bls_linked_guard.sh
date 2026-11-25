@@ -14,7 +14,10 @@
 # applied to the ARTEFACT rather than to the build flags, so a future refactor
 # that reintroduces a soft fallback still cannot ship a dark binary quietly.
 #
-#   usage: scripts/ci/dash_bls_linked_guard.sh <path-to-c2pool-dash>
+#   usage: scripts/ci/dash_bls_linked_guard.sh [--rodata-only] <path-to-c2pool-dash>
+#
+# (Windows: the backend is c2pool_dashbls.dll, not part of the .exe; see
+# dash_bls_linked_guard.ps1.)
 #
 # Two independent markers, BOTH required:
 #
@@ -25,11 +28,20 @@
 #   2. symbols: the dashbls C++ API entry points bls_verify.cpp calls. Only
 #      checked when the binary still has a symbol table (pre-strip); skipped
 #      with a note, never silently, on a stripped binary.
+#
+# --rodata-only skips leg 2 explicitly. Use it for a stripped Mach-O: `strip`
+# there keeps the global __mh_execute_header, so nm is never empty and the
+# automatic skip below cannot tell "stripped" from "stub". Leg 1 is unchanged.
 set -euo pipefail
 
+RODATA_ONLY=0
+if [ "${1:-}" = "--rodata-only" ]; then
+    RODATA_ONLY=1
+    shift
+fi
 BIN="${1:-}"
 if [ -z "$BIN" ] || [ ! -f "$BIN" ]; then
-    echo "dash_bls_linked_guard: usage: $0 <path-to-c2pool-dash>" >&2
+    echo "dash_bls_linked_guard: usage: $0 [--rodata-only] <path-to-c2pool-dash>" >&2
     exit 2
 fi
 
@@ -60,8 +72,14 @@ fi
 
 # Symbol leg. `nm` reports "no symbols" on a stripped binary; that is a SKIP,
 # never a pass and never a failure — the rodata leg above still covers it.
-syms="$(nm -C --defined-only "$BIN" 2>/dev/null || true)"
-if [ -z "$syms" ]; then
+if [ "$RODATA_ONLY" -eq 1 ]; then
+    syms=""
+else
+    syms="$(nm -C --defined-only "$BIN" 2>/dev/null || true)"
+fi
+if [ "$RODATA_ONLY" -eq 1 ]; then
+    echo "  skip symbol check (--rodata-only: packaged binary; the rodata leg above still applies)"
+elif [ -z "$syms" ]; then
     echo "  skip symbol check (binary is stripped — rodata leg above still applies)"
 else
     for want in 'bls::G1Element::FromBytes' 'bls::G2Element::FromBytes'; do

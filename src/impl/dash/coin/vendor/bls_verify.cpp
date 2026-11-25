@@ -10,11 +10,15 @@
 // launcher, which never defines C2POOL_DASH_BLS).
 
 #include <impl/dash/coin/vendor/bls_verify.hpp>
+#include <impl/dash/coin/vendor/bls_canonical.hpp>
 
 #include <core/pack.hpp>       // PackStream, WriteCompactSize
 #include <core/hash.hpp>       // CHash256
 
+#include <algorithm>
 #include <cstring>
+#include <optional>
+#include <vector>
 #include <span>
 
 #ifdef C2POOL_DASH_BLS
@@ -368,6 +372,20 @@ make_commitment_bls_verifier(MemberKeysProvider provider)
         if (!members) return false;   // member set uncertain → fail closed
         return verify_final_commitment(c, *members);
     };
+}
+
+// ── Dash Core's BLS encoding rules for provider payloads (bls_canonical.hpp) ──
+
+// The rules are header-only (bls_canonical.hpp); exported here so the
+// default BlsEncodingChecks has a linkable address.
+std::optional<bool> bls_pubkey_core_valid(const std::array<uint8_t, 48>& key, bool legacy)
+{
+    return bls_pubkey_core_valid_inline(key, legacy);
+}
+
+std::optional<bool> bls_sig_core_decodes(const std::array<uint8_t, 96>& sig, bool legacy)
+{
+    return bls_sig_core_decodes_inline(sig, legacy);
 }
 
 } // namespace vendor

@@ -612,12 +612,19 @@ TEST(DashMnCheckpoint, NetworkMismatchRefuses)
 
 TEST(DashMnCheckpoint, BadMagicRefuses)
 {
+    // /2 is the Dash Core v24 format now; an unknown future format still
+    // refuses by name.
     std::string p = mutate(kRealCheckpoint1519543,
                            "c2pool-dash-mn-checkpoint/1",
-                           "c2pool-dash-mn-checkpoint/2");
+                           "c2pool-dash-mn-checkpoint/3");
     auto cp = parse_mn_checkpoint(p, "testnet");
     EXPECT_FALSE(cp.ok);
     EXPECT_NE(cp.error.find("bad magic"), std::string::npos) << cp.error;
+    // A /1 file relabelled /2 has the wrong column count for /2 and refuses.
+    std::string p2 = mutate(kRealCheckpoint1519543,
+                            "c2pool-dash-mn-checkpoint/1",
+                            "c2pool-dash-mn-checkpoint/2");
+    EXPECT_FALSE(parse_mn_checkpoint(p2, "testnet").ok);
 }
 
 TEST(DashMnCheckpoint, UnknownKeyRefusesRatherThanIgnoring)
@@ -5660,6 +5667,18 @@ std::map<uint256, MNState> as_map(
     return std::map<uint256, MNState>(v.begin(), v.end());
 }
 
+/// Byte-exact MNState comparison through the record's own encoder. Unlike
+/// MNState::operator== it covers EVERY persisted field (collateralOutpoint,
+/// netInfo and the v24 block included), so a resume that drifts in a field
+/// operator== does not look at still fails here.
+std::vector<unsigned char> mnstate_bytes(const MNState& st)
+{
+    auto stream = ::pack(st);
+    auto sp = stream.get_span();
+    const auto* b = reinterpret_cast<const unsigned char*>(sp.data());
+    return std::vector<unsigned char>(b, b + sp.size());
+}
+
 } // namespace
 
 // ── 1. THE CLAIM: a restart RESUMES ────────────────────────────────────────
@@ -5738,6 +5757,10 @@ TEST(DashMnBridgeCursor, ResumedBridgePublishesExactlyWhatAContinuousOneDoes)
             << "resumed state differs for " << hash.GetHex().substr(0, 16)
             << " — nLastPaidHeight " << got.at(hash).nLastPaidHeight
             << " vs " << st.nLastPaidHeight;
+        EXPECT_EQ(mnstate_bytes(got.at(hash)), mnstate_bytes(st))
+            << "resumed state differs byte-for-byte for "
+            << hash.GetHex().substr(0, 16)
+            << " (a field outside MNState::operator==)";
     }
 
     // ...and so must the LIFETIME accounting. This is the half that catches a
@@ -5818,6 +5841,216 @@ TEST(DashMnBridgeCursor, ReorgPastThePersistedCursorIsRefusedAndReplayedCold)
     ASSERT_TRUE(r.h.published) << r.h.lane.status();
     EXPECT_EQ(r.h.published_as_of, 1519546u);
     EXPECT_EQ(r.h.lane.replay_applied(), 3u);
+}
+
+// ── 4b. R7: a header tip BELOW the cursor defers; it does not refuse ───────
+//
+// A fresh header store fast-starts AT the anchor and re-syncs to the live tip
+// within seconds. The cursor must survive that window: a refusal at the first
+// pump turned a seconds-long header catch-up into a full re-fold from the
+// anchor. Only pumps that bring no new tip height count toward the bound.
+
+TEST(DashMnBridgeCursor, R7CursorAboveACatchingUpTipResumesWarm)
+{
+    TempCursorStore cs("r7warm");
+    { CursorRun a(&cs.store, 1519545); a.run(); ASSERT_TRUE(a.h.published); }
+    ASSERT_TRUE(cs.exists());
+
+    // A fresh header store: the tip is back at the anchor.
+    CursorRun r(&cs.store, kAnchorHeight);
+    r.run();
+    EXPECT_FALSE(r.h.lane.cursor_restored());
+    EXPECT_TRUE(r.h.lane.restore_verdict().empty())
+        << "a deferral is not a verdict: " << r.h.lane.restore_verdict();
+    EXPECT_EQ(r.h.lane.r7_defers(), 1u);
+    EXPECT_EQ(r.h.lane.r7_stalled(), 0u);
+    EXPECT_TRUE(cs.exists()) << "a deferred record must not be erased";
+    EXPECT_TRUE(r.h.requested.empty())
+        << "nothing may be replayed while the cursor is being held";
+    EXPECT_NE(r.h.lane.waiting_for().find("restore-hold@h=1519545"), std::string::npos)
+        << "the hold must be named, not read as an idle lane: " << r.h.lane.waiting_for();
+
+    // The headers come back past the cursor.
+    r.h.tip = 1519546;
+    r.h.lane.pump();
+
+    ASSERT_TRUE(r.h.lane.cursor_restored())
+        << "verdict: " << r.h.lane.restore_verdict();
+    EXPECT_EQ(r.h.lane.restored_at(), 1519545u);
+    ASSERT_TRUE(r.h.published) << r.h.lane.status();
+    EXPECT_EQ(r.h.published_as_of, 1519546u);
+    for (uint32_t asked : r.h.requested)
+        EXPECT_GT(asked, 1519545u)
+            << "h=" << asked << " was folded by the previous process; a warm"
+               " resume never asks for it again";
+    EXPECT_EQ(r.h.lane.replay_applied(), 1u);
+    EXPECT_EQ(r.h.lane.applied_lifetime(), 3u);
+}
+
+TEST(DashMnBridgeCursor, R7TipThatNeverReachesTheCursorGoesColdAfterTheBound)
+{
+    TempCursorStore cs("r7bound");
+    { CursorRun a(&cs.store, 1519545); a.run(); ASSERT_TRUE(a.h.published); }
+
+    CursorRun r(&cs.store, kAnchorHeight);
+    r.run();   // deferral 1: the first look is never a stall
+    const uint32_t bound = MnCheckpointLane::restore_defer_bound();
+    for (uint32_t i = 1; i <= bound; ++i) {
+        r.h.lane.pump();
+        ASSERT_EQ(r.h.lane.r7_stalled(), i);
+        ASSERT_FALSE(r.h.lane.cursor_restored());
+        ASSERT_TRUE(r.h.lane.restore_verdict().empty())
+            << "still inside the bound at stalled pump " << i << ": "
+            << r.h.lane.restore_verdict();
+        ASSERT_TRUE(cs.exists());
+    }
+    // One stalled pump past the bound: COLD, exactly as before this change.
+    r.h.lane.pump();
+    EXPECT_FALSE(r.h.lane.cursor_restored());
+    EXPECT_NE(r.h.lane.restore_verdict().find("R7 cursor-above-tip"),
+              std::string::npos)
+        << r.h.lane.restore_verdict();
+    EXPECT_FALSE(cs.exists()) << "a refused record is erased";
+    EXPECT_EQ(r.h.lane.cursor_height(), kAnchorHeight)
+        << "the cold replay starts at the anchor";
+
+    // ...and the cold lane still does its job: with the tip at the anchor it
+    // publishes the anchor set at once (nothing to replay), as before.
+    ASSERT_TRUE(r.h.published) << r.h.lane.status();
+    EXPECT_EQ(r.h.published_as_of, kAnchorHeight);
+    EXPECT_EQ(r.h.lane.replay_applied(), 0u);
+}
+
+TEST(DashMnBridgeCursor, R7OnlyPumpsWithoutANewTipHeightCountTowardTheBound)
+{
+    TempCursorStore cs("r7rise");
+    { CursorRun a(&cs.store, 1519545); a.run(); ASSERT_TRUE(a.h.published); }
+
+    CursorRun r(&cs.store, kAnchorHeight);
+    r.run();
+    const uint32_t bound = MnCheckpointLane::restore_defer_bound();
+    for (uint32_t i = 1; i < bound; ++i) r.h.lane.pump();
+    ASSERT_EQ(r.h.lane.r7_stalled(), bound - 1);
+
+    // The tip climbs one height (still below the cursor): not a stall.
+    r.h.tip = kAnchorHeight + 1;
+    r.h.lane.pump();
+    EXPECT_EQ(r.h.lane.r7_stalled(), bound - 1);
+    EXPECT_TRUE(r.h.lane.restore_verdict().empty()) << r.h.lane.restore_verdict();
+
+    // A reorg-like dip back below the high-water mark is a stall, not progress.
+    r.h.tip = kAnchorHeight;
+    r.h.lane.pump();
+    EXPECT_EQ(r.h.lane.r7_stalled(), bound);
+    EXPECT_TRUE(r.h.lane.restore_verdict().empty()) << r.h.lane.restore_verdict();
+    r.h.lane.pump();
+    EXPECT_NE(r.h.lane.restore_verdict().find("R7"), std::string::npos)
+        << r.h.lane.restore_verdict();
+}
+
+TEST(DashMnBridgeCursor, R7TipThatCatchesUpOnADifferentChainIsRefusedByR4)
+{
+    TempCursorStore cs("r7fork");
+    { CursorRun a(&cs.store, 1519545); a.run(); ASSERT_TRUE(a.h.published); }
+
+    CursorRun r(&cs.store, kAnchorHeight);
+    r.h.auto_deliver = false;
+    r.run();
+    ASSERT_EQ(r.h.lane.r7_defers(), 1u);
+
+    // The tip reaches the cursor height, but on a chain that holds a
+    // different block there.
+    r.h.headers[1519545] = uint256S(
+        "00000000000000000000000000000000000000000000000000000000feedface");
+    r.h.tip = 1519546;
+    r.h.lane.pump();
+
+    EXPECT_FALSE(r.h.lane.cursor_restored());
+    EXPECT_NE(r.h.lane.restore_verdict().find("R4"), std::string::npos)
+        << r.h.lane.restore_verdict();
+    EXPECT_FALSE(cs.exists());
+    EXPECT_EQ(r.h.lane.cursor_height(), kAnchorHeight);
+
+    r.h.auto_deliver = true;
+    for (uint32_t ht = 1519544; ht <= 1519546; ++ht)
+        r.h.lane.on_block_connected(r.h.blocks.at(ht), ht);
+    ASSERT_TRUE(r.h.published) << r.h.lane.status();
+    EXPECT_EQ(r.h.published_as_of, 1519546u);
+    EXPECT_EQ(r.h.lane.replay_applied(), 3u);
+}
+
+TEST(DashMnBridgeCursor, R7ACursorAtOrBelowTheTipNeverDefers)
+{
+    TempCursorStore cs("r7none");
+    { CursorRun a(&cs.store, 1519545); a.run(); ASSERT_TRUE(a.h.published); }
+
+    CursorRun r(&cs.store, 1519546);
+    r.run();
+    ASSERT_TRUE(r.h.lane.cursor_restored()) << r.h.lane.restore_verdict();
+    EXPECT_EQ(r.h.lane.r7_defers(), 0u);
+    EXPECT_EQ(r.h.lane.r7_stalled(), 0u);
+    EXPECT_EQ(r.h.lane.restored_at(), 1519545u);
+}
+
+// ── 4c. A resumed bridge continues with the demotion-walk budget the previous
+// process already spent; a restart must never hand it a fresh one.
+TEST(DashMnBridgeCursor, ResumeCarriesTheSpentDemotionWalkBudget)
+{
+    TempCursorStore cs("smlspent");
+    { CursorRun a(&cs.store, 1519545); a.run(); ASSERT_TRUE(a.h.published); }
+
+    std::string why;
+    auto rec = cs.store.load(why);
+    ASSERT_TRUE(rec.has_value()) << why;
+    rec->sml_recovered = 3;   // three demotions already spent by that bridge
+    ASSERT_TRUE(cs.store.store(*rec));
+
+    CursorRun r(&cs.store, 1519546);
+    r.run();
+    ASSERT_TRUE(r.h.lane.cursor_restored()) << r.h.lane.restore_verdict();
+    EXPECT_EQ(r.h.lane.sml_recovered(), 3u);
+    EXPECT_EQ(r.h.lane.sml_recovery_spent(), 3u)
+        << "the cap reads the machine's spent count: a resume that zeroes it"
+           " lets every restart buy a fresh budget";
+}
+
+// ── 4d. The machine's measurement ledgers travel with the set (format v5):
+// the record round-trips them, and a resumed machine holds exactly what the
+// previous process held, which load() alone would have cleared.
+TEST(DashMnBridgeCursor, ResumeCarriesTheMeasurementLedgers)
+{
+    TempCursorStore cs("ledgers");
+    { CursorRun a(&cs.store, 1519545); a.run(); ASSERT_TRUE(a.h.published); }
+
+    std::string why;
+    auto rec = cs.store.load(why);
+    ASSERT_TRUE(rec.has_value()) << why;
+    rec->ban_state_measured_at = 1519545;
+    rec->unmeasured_revive_at = {
+        {uint256S(kQ1), 1519544u},
+        {uint256S(kQ2), 1519545u},
+    };
+    ASSERT_TRUE(cs.store.store(*rec));
+
+    // The codec round-trips both.
+    std::string why2;
+    auto back = cs.store.load(why2);
+    ASSERT_TRUE(back.has_value()) << why2;
+    EXPECT_EQ(back->ban_state_measured_at, 1519545u);
+    ASSERT_EQ(back->unmeasured_revive_at.size(), 2u);
+    EXPECT_EQ(back->unmeasured_revive_at[0].second, 1519544u);
+    EXPECT_EQ(back->unmeasured_revive_at[1].second, 1519545u);
+
+    // A resume re-adopts them.
+    CursorRun r(&cs.store, 1519545);
+    r.run();
+    ASSERT_TRUE(r.h.lane.cursor_restored()) << r.h.lane.restore_verdict();
+    EXPECT_EQ(r.h.lane.ban_state_measured_at(), 1519545u)
+        << "load() retires the measurement; a resume of the SAME set must"
+           " bring it back";
+    EXPECT_EQ(r.h.lane.unmeasured_revives(), 2u)
+        << "the unmeasured-revive ledger is what lets the ordering repair act"
+           " after a restart";
 }
 
 // ── 5. R5: the anti-gap arithmetic ─────────────────────────────────────────
@@ -5982,6 +6215,22 @@ TEST(DashMnBridgeCursor, AFormatV2RecordWithMixedOperatorKeysIsRefusedAndReplaye
     const auto after = cs.raw();
     ASSERT_GT(after.size(), 28u);
     EXPECT_EQ(after[24], static_cast<uint8_t>(MnBridgeCursorStore::kFormatVersion));
+}
+
+// ── 6d. A v3 record is REFUSED (Dash Core v24): MNState rows with nVersion
+//     >= 3 now carry the v24 state block, which a v3 record never wrote.
+TEST(DashMnBridgeCursor, AFormatV3RecordFromBeforeTheV24StateIsRefused)
+{
+    EXPECT_GE(MnBridgeCursorStore::kFormatVersion, 4u);
+    TempCursorStore cs("fmtv3");
+    { CursorRun a(&cs.store, 1519545); a.run(); ASSERT_TRUE(a.h.published); }
+    auto b = cs.raw();
+    ASSERT_GT(b.size(), 28u);
+    b[24] = 3; b[25] = 0; b[26] = 0; b[27] = 0;
+    cs.write_raw(b);
+    std::string why;
+    EXPECT_FALSE(cs.store.load(why).has_value()) << why;
+    EXPECT_NE(why.find("format v3"), std::string::npos) << why;
 }
 
 // ── 7. A fail-closed bridge must not be resumable ──────────────────────────
@@ -6880,7 +7129,7 @@ TEST(DashMnCheckpointBudgets, AClampedBudgetIsAnnouncedOncePerBridgeNotOncePerPu
     using Lane = MnCheckpointLane;
     BridgeHarness h;
     h.auto_deliver = false;
-    const uint32_t kWide = 40000;      // 8+400 / 8+160 / 4+40 -- all three clamp
+    const uint32_t kWide = 80000;      // 8+800 / 8+320 / 4+80 -- all three clamp
     fill_headers(h, kAnchorHeight, kAnchorHeight + kWide + 2000);
     h.tip = kAnchorHeight + 1;
 
@@ -6913,6 +7162,35 @@ TEST(DashMnCheckpointBudgets, AClampedBudgetIsAnnouncedOncePerBridgeNotOncePerPu
     // A re-arm is a NEW bridge: the announcement is owed again.
     h.lane.arm(good_checkpoint());
     EXPECT_EQ(h.lane.budget_ceiling_warnings(), 0u);
+}
+
+// The other half of the stated bound: at the DEFAULT bridge bound no ceiling
+// is reached. A bridge that is allowed to start must get its full window-sized
+// budgets; if the default limit outgrows the ceilings, the clamp turns into an
+// everyday event and the "UNMEASURED" counts it leaves behind stop meaning
+// anything. Raising kDefaultMaxBridgeBlocks without its ceilings fails here.
+TEST(DashMnCheckpointBudgets, AtTheDefaultBridgeBoundNoCeilingIsReached)
+{
+    using Lane = MnCheckpointLane;
+    BridgeHarness h;
+    h.auto_deliver = false;
+    const uint32_t kMax = Lane::kDefaultMaxBridgeBlocks;
+    fill_headers(h, kAnchorHeight, kAnchorHeight + kMax + 10);
+    h.tip = kAnchorHeight + 1;
+
+    h.lane.arm(good_checkpoint());          // the stock bound: no set_max_bridge_blocks
+    h.lane.pump();
+    h.tip = kAnchorHeight + kMax;           // the widest window the default allows
+    h.lane.pump();
+
+    EXPECT_EQ(h.lane.budget_ceiling_warnings(), 0u)
+        << "a window-sized budget is clamped at the default bridge bound";
+    EXPECT_EQ(h.lane.revive_probe_cap(), Lane::kReviveProbeBase + kMax / Lane::kReviveProbePerBlocks);
+    EXPECT_EQ(h.lane.ondemand_cap(),     Lane::kOnDemandFoldBase + kMax / Lane::kOnDemandFoldPerBlocks);
+    EXPECT_EQ(h.lane.sml_recovery_cap(), static_cast<size_t>(4 + kMax / 1000));
+    EXPECT_LT(h.lane.revive_probe_cap(), Lane::kReviveProbeCapMax);
+    EXPECT_LT(h.lane.ondemand_cap(),     Lane::kOnDemandFoldCapMax);
+    EXPECT_LT(h.lane.sml_recovery_cap(), Lane::kSmlRecoveryCapMax);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -7167,4 +7445,52 @@ TEST(DashMnCheckpointGapReseed, Persist_EveryFoldAtTip)
     EXPECT_GE(r3.h.lane.persist_writes(), 3u)
         << "three folds within kPersistAtTipSlack of the tip: three records,"
            " not one per 250";
+}
+
+// ── 4e. A live-follow record is built from the maintainer's set, so it
+// carries none of the bridge machine's measurement ledgers; a resume from it
+// holds exactly what a continuous run's maintainer holds (none).
+TEST(DashMnBridgeCursor, LiveFollowRecordCarriesNoBridgeLedgers)
+{
+    TempCursorStore cs("liveledgers");
+    { CursorRun a(&cs.store, 1519544); a.run(); ASSERT_TRUE(a.h.published); }
+
+    // Give the bridge machine ledgers through a resume one block below the
+    // tip (a resume AT the tip holds until something new is fetched).
+    std::string why;
+    auto rec = cs.store.load(why);
+    ASSERT_TRUE(rec.has_value()) << why;
+    ASSERT_EQ(rec->cursor_height, 1519544u);
+    rec->ban_state_measured_at = 1519544;
+    rec->unmeasured_revive_at = { {uint256S(kQ1), 1519543u}, {uint256S(kQ2), 1519544u} };
+    ASSERT_TRUE(cs.store.store(*rec));
+
+    {
+        CursorRun r(&cs.store, 1519545);
+        r.run();
+        ASSERT_TRUE(r.h.lane.cursor_restored()) << r.h.lane.restore_verdict();
+        ASSERT_TRUE(r.h.published) << r.h.lane.status();
+        ASSERT_NE(r.h.lane.ban_state_measured_at(), 0u)
+            << "the bridge machine must hold a measurement for this KAT to mean anything";
+
+        // The maintainer folds the next block; that is the record now on disk.
+        const auto at46 = fold_forward(r.h.published_set, 1519545, r.h.blocks, 1519546);
+        r.h.lane.note_live_fold(std::map<uint256, MNState>(at46.begin(), at46.end()),
+                                1519546, synth_block_hash(1519546));
+        auto live = cs.store.load(why);
+        ASSERT_TRUE(live.has_value()) << why;
+        EXPECT_EQ(live->cursor_height, 1519546u);
+        EXPECT_EQ(live->ban_state_measured_at, 0u)
+            << "the bridge's measurement does not describe the maintainer's set";
+        EXPECT_TRUE(live->unmeasured_revive_at.empty())
+            << "the bridge's revive ledger does not describe the maintainer's set";
+    }
+
+    // A restart resumes from the live record and holds no ledgers.
+    CursorRun r2(&cs.store, 1519546);
+    r2.run();
+    ASSERT_TRUE(r2.h.lane.cursor_restored()) << r2.h.lane.restore_verdict();
+    EXPECT_EQ(r2.h.lane.restored_at(), 1519546u);
+    EXPECT_EQ(r2.h.lane.ban_state_measured_at(), 0u);
+    EXPECT_EQ(r2.h.lane.unmeasured_revives(), 0u);
 }

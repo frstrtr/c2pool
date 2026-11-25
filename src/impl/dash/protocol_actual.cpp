@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #include "node.hpp"
 #include "share.hpp"
+#include <impl/dash/coin/dash_txid.hpp>
 
 #include <core/uint256.hpp>
 #include <core/random.hpp>
@@ -293,8 +294,8 @@ void Actual::HANDLER(remember_tx)
     // Phase 2: txs — peer sends full transactions (compute hash, store)
     for (auto& tx : msg->m_txs)
     {
-        auto packed = pack(coin::TX_WITH_WITNESS(tx));
-        auto tx_hash = Hash(packed.get_span());
+        // The block txid (stable for a Dash Core v24 version-2 asset unlock).
+        auto tx_hash = coin::dash_txid(tx);
 
         if (peer->m_remembered_txs.contains(tx_hash))
         {

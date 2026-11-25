@@ -42,6 +42,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <string>
 #include <thread>
@@ -372,4 +373,200 @@ TEST(DashDashboardFoundBlock, MinerIsTheSharesCommittedPayoutNotACoinbaseOutput)
     EXPECT_EQ(row.miner, "XghFtkZ8W3vhEHejUBbD3n387hemVJ6Pt4")
         << "the row's miner must be the share's committed payout address";
     EXPECT_EQ(row.subsidy, 177109977u);
+}
+
+// ── The found-block hook and the network's bits ────────────────────────────
+// A block is valid on the coin network only when its header bits are the
+// target the network requires after its parent. With the header-chain oracle
+// bound (m_expected_block_bits, as main_dash binds it whenever a coin-P2P link
+// exists), the tracker fires the found-block hook, which records the row and
+// relays the block, only for those bits (dash::found_block_bits).
+
+namespace {
+
+const uint256& parent_block()
+{
+    static const uint256 h = hash_from_byte(0x5a);
+    return h;
+}
+
+struct OracleProbe
+{
+    int calls = 0;
+    uint256 prev;
+    int64_t time = 0;
+};
+
+void set_parent(Harness& h)
+{
+    h.node.tracker().chain.get_share(h.share_hash).invoke([](auto* s) {
+        s->m_min_header.m_previous_block = parent_block();
+    });
+}
+
+void bind_oracle(Harness& h, OracleProbe& probe, std::optional<uint32_t> answer)
+{
+    h.node.tracker().m_expected_block_bits =
+        [&probe, answer](const uint256& prev, int64_t time) -> std::optional<uint32_t> {
+            ++probe.calls;
+            probe.prev = prev;
+            probe.time = time;
+            return answer;
+        };
+}
+
+} // namespace
+
+TEST(DashDashboardFoundBlock, BlockAtTheNetworksBitsIsRecorded)
+{
+    Harness h;
+    set_parent(h);
+    h.bind(/*testnet=*/false);
+    OracleProbe probe;
+    bind_oracle(h, probe, BLOCK_BITS);
+
+    h.fire_under_exclusive_lock();
+
+    EXPECT_EQ(h.rows.size(), 1u) << "header bits equal the network's: the hook fires";
+    EXPECT_EQ(probe.calls, 1);
+    EXPECT_EQ(probe.prev, parent_block()) << "the oracle is asked about the share's parent block";
+    EXPECT_EQ(probe.time, static_cast<int64_t>(HEADER_TIME)) << "...at the share's header time";
+}
+
+TEST(DashDashboardFoundBlock, BlockAtOtherThanTheNetworksBitsIsNotRecorded)
+{
+    Harness h;
+    set_parent(h);
+    h.bind(/*testnet=*/false);
+    OracleProbe probe;
+    bind_oracle(h, probe, 0x1b0404cbu);   // the network wants a harder target
+
+    h.fire_under_exclusive_lock();
+
+    EXPECT_EQ(probe.calls, 1);
+    EXPECT_TRUE(h.rows.empty())
+        << "a block the network rejects must be neither recorded nor relayed";
+    EXPECT_TRUE(h.node.tracker().chain.get_index(h.share_hash)->is_block_solution)
+        << "the share index keeps its block flag; head scoring checks bits on its own";
+}
+
+TEST(DashDashboardFoundBlock, BlockOnAParentTheOracleCannotAnswerIsNotRecorded)
+{
+    Harness h;
+    set_parent(h);
+    h.bind(/*testnet=*/false);
+    OracleProbe probe;
+    bind_oracle(h, probe, std::nullopt);
+
+    h.fire_under_exclusive_lock();
+
+    EXPECT_EQ(probe.calls, 1);
+    EXPECT_TRUE(h.rows.empty())
+        << "with nothing to check the bits against, this node does not relay; "
+           "the finder relays its own block";
+}
+
+TEST(DashDashboardFoundBlock, FoundBlockBitsVerdicts)
+{
+    using dash::FoundBlockBits;
+    EXPECT_EQ(dash::found_block_bits(BLOCK_BITS, true, BLOCK_BITS), FoundBlockBits::Match);
+    EXPECT_EQ(dash::found_block_bits(BLOCK_BITS, true, 0x1b0404cbu), FoundBlockBits::Mismatch);
+    EXPECT_EQ(dash::found_block_bits(BLOCK_BITS, true, std::nullopt), FoundBlockBits::UnknownParent);
+    EXPECT_EQ(dash::found_block_bits(BLOCK_BITS, false, std::nullopt), FoundBlockBits::NoOracle);
+    EXPECT_TRUE(dash::found_block_may_fire(FoundBlockBits::Match));
+    EXPECT_TRUE(dash::found_block_may_fire(FoundBlockBits::NoOracle));
+    EXPECT_FALSE(dash::found_block_may_fire(FoundBlockBits::Mismatch));
+    EXPECT_FALSE(dash::found_block_may_fire(FoundBlockBits::UnknownParent));
+}
+
+// ── The found-block hook and the network's time floor ──────────────────────
+// With the bits right, the hook still fires only for a header time above the
+// parent's median-time-past (m_block_time_floor answers MTP + 1). The share
+// keeps its block flag either way.
+
+namespace {
+
+struct FloorProbe
+{
+    int calls = 0;
+    uint256 prev;
+};
+
+void bind_time_floor(Harness& h, FloorProbe& probe, std::optional<uint32_t> floor)
+{
+    h.node.tracker().m_block_time_floor =
+        [&probe, floor](const uint256& prev) -> std::optional<uint32_t> {
+            ++probe.calls;
+            probe.prev = prev;
+            return floor;
+        };
+}
+
+} // namespace
+
+TEST(DashDashboardFoundBlock, BlockAtTheNetworksTimeFloorIsRecorded)
+{
+    Harness h;
+    set_parent(h);
+    h.bind(/*testnet=*/false);
+    OracleProbe bits;
+    bind_oracle(h, bits, BLOCK_BITS);
+    FloorProbe floor;
+    bind_time_floor(h, floor, HEADER_TIME);   // header time == MTP + 1: valid
+
+    h.fire_under_exclusive_lock();
+
+    EXPECT_EQ(h.rows.size(), 1u);
+    EXPECT_EQ(floor.calls, 1);
+    EXPECT_EQ(floor.prev, parent_block()) << "the floor is asked for the share's parent block";
+}
+
+TEST(DashDashboardFoundBlock, BlockBelowTheNetworksTimeFloorIsNotRecorded)
+{
+    Harness h;
+    set_parent(h);
+    h.bind(/*testnet=*/false);
+    OracleProbe bits;
+    bind_oracle(h, bits, BLOCK_BITS);
+    FloorProbe floor;
+    bind_time_floor(h, floor, HEADER_TIME + 1);   // header time <= MTP: time-too-old
+
+    h.fire_under_exclusive_lock();
+
+    EXPECT_EQ(floor.calls, 1);
+    EXPECT_TRUE(h.rows.empty()) << "a time-too-old block must be neither recorded nor relayed";
+    EXPECT_TRUE(h.node.tracker().chain.get_index(h.share_hash)->is_block_solution)
+        << "the share keeps its block flag";
+}
+
+// Only a KNOWN floor refuses: with the bits right, an unknown floor fires.
+TEST(DashDashboardFoundBlock, BlockWithAnUnknownTimeFloorIsRecorded)
+{
+    Harness h;
+    set_parent(h);
+    h.bind(/*testnet=*/false);
+    OracleProbe bits;
+    bind_oracle(h, bits, BLOCK_BITS);
+    FloorProbe floor;
+    bind_time_floor(h, floor, std::nullopt);
+
+    h.fire_under_exclusive_lock();
+
+    EXPECT_EQ(floor.calls, 1);
+    EXPECT_EQ(h.rows.size(), 1u) << "an unknown floor does not refuse";
+}
+
+TEST(DashDashboardFoundBlock, FoundBlockTimeVerdicts)
+{
+    using dash::FoundBlockTime;
+    EXPECT_EQ(dash::found_block_time(HEADER_TIME, true, HEADER_TIME), FoundBlockTime::AtOrAboveFloor);
+    EXPECT_EQ(dash::found_block_time(HEADER_TIME + 1, true, HEADER_TIME), FoundBlockTime::AtOrAboveFloor);
+    EXPECT_EQ(dash::found_block_time(HEADER_TIME - 1, true, HEADER_TIME), FoundBlockTime::BelowFloor);
+    EXPECT_EQ(dash::found_block_time(HEADER_TIME, true, std::nullopt), FoundBlockTime::UnknownFloor);
+    EXPECT_EQ(dash::found_block_time(HEADER_TIME, false, std::nullopt), FoundBlockTime::NoOracle);
+    EXPECT_TRUE(dash::found_block_time_may_fire(FoundBlockTime::AtOrAboveFloor));
+    EXPECT_TRUE(dash::found_block_time_may_fire(FoundBlockTime::NoOracle));
+    EXPECT_TRUE(dash::found_block_time_may_fire(FoundBlockTime::UnknownFloor))
+        << "only a known floor refuses";
+    EXPECT_FALSE(dash::found_block_time_may_fire(FoundBlockTime::BelowFloor));
 }

@@ -23,7 +23,12 @@ sharechain-explorer/
 ├── tests/unit/                    Node-native tests (node --test)
 ├── dist/                          built bundles (committed at phase 1)
 │   ├── shared-core.js             40 KB budget (currently ~25 KB)
-│   └── sharechain-explorer.js     120 KB budget (currently ~42 KB)
+│   ├── sharechain-explorer.js     120 KB budget (currently ~59 KB)
+│   ├── pplns-view.js              60 KB budget (currently ~32 KB)
+│   └── layout.js                  4 KB budget; classic-script IIFE
+│                                  (global C2PLayout) carrying the one
+│                                  squarify for dashboard.html and
+│                                  share.html
 ├── schemas/                       JSON-Schemas per M1 D6
 ├── demo/                          synthetic-data demo
 │   ├── demo.html                  deterministic RNG, no server
@@ -47,7 +52,8 @@ npm run build:dev    # esbuild → dist/*.js with inline sourcemaps
 npm test             # Node --test (no jest, no vitest)
 npm run manifest     # regenerate resources-manifest.json
 npm run size         # bundle-size gate
-npm run verify       # typecheck + build + test + manifest + size
+npm run stamp        # rewrite ?v=<content hash> on every page/loader script load
+npm run verify       # typecheck + build + stamp check + test + manifest + size
 ```
 
 ## Three surfaces for visual verification

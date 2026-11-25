@@ -48,6 +48,12 @@ namespace coin {
 namespace replay {
 
 inline constexpr const char* kPrestateMagic = "c2pool-dash-replay-prestate/1";
+// Format /2 (Dash Core v24): a 27th field carries a version-3 state's
+// MnStateV24Ext (payout list, share table, early-exit terms, ExtNetInfo) as
+// hex, `-` for v1/v2; a v3 row's scriptPayout field is `-` and its netInfo
+// fields are zero. /1 is unchanged (and is what the test twin parser reads);
+// a /1 row claiming version 3 is refused.
+inline constexpr const char* kPrestateMagicV2 = "c2pool-dash-replay-prestate/2";
 
 struct Prestate
 {
@@ -168,7 +174,8 @@ inline Prestate parse_prestate_text(const std::string& text)
     if (!std::getline(is, line)) return fail("prestate is empty");
     while (!line.empty() && (line.back() == '\r' || line.back() == '\n'))
         line.pop_back();
-    if (line != kPrestateMagic)
+    const bool format2 = line == kPrestateMagicV2;
+    if (line != kPrestateMagic && !format2)
         return fail("bad prestate format tag '" + line + "' (want '"
                     + kPrestateMagic + "')");
 
@@ -226,10 +233,10 @@ inline Prestate parse_prestate_text(const std::string& text)
             || !have_count)
             return fail("'mn' record on line " + std::to_string(lineno)
                         + " before the header block was complete");
-        if (f.size() != 26)
+        if (f.size() != (format2 ? 27u : 26u))
             return fail("mn record on line " + std::to_string(lineno)
                         + " has " + std::to_string(f.size())
-                        + " fields, want 26");
+                        + " fields, want " + std::string(format2 ? "27" : "26"));
 
         const std::string at = " on line " + std::to_string(lineno);
         uint256 protx;
@@ -288,9 +295,28 @@ inline Prestate parse_prestate_text(const std::string& text)
         if (!u16(12, "platformHTTPPort", st.platformHTTPPort)) return ps;
         if (!u16(13, "nOperatorReward", st.nOperatorReward))   return ps;
 
+        const bool v3_row = v24::state_has_ext(st.nVersion);
+        if (v3_row) {
+            // Dash Core v24: payouts / shares / ExtNetInfo in field 27.
+            std::vector<uint8_t> blob;
+            if (!format2) return fail("version-3 state needs prestate /2" + at);
+            if (f[14] != "-" || f[26] == "-" || !d::hex_to_bytes(f[26], blob))
+                return fail("version-3 row needs scriptPayout '-' and a v24 field" + at);
+            try {
+                ::PackStream bs(blob);
+                bs >> st.v24;
+                if (!bs.empty()) throw std::ios_base::failure("trailing bytes");
+            } catch (const std::exception& ex) {
+                return fail(std::string("bad v24 field: ") + ex.what() + at);
+            }
+            if (st.v24.payouts.empty() && st.v24.shares.empty())
+                return fail("version-3 row with neither payouts nor shares" + at);
+        } else if (format2 && f[26] != "-") {
+            return fail("v24 field on a pre-v3 row" + at);
+        }
         // The payee keystone: an MN with no payout script still occupies a
         // DIP-3 queue slot, so a blank one would project a wrong payee.
-        {
+        if (!v3_row) {
             std::vector<uint8_t> sp;
             if (f[14] == "-" || !d::hex_to_bytes(f[14], sp) || sp.empty())
                 return fail("missing/undecodable scriptPayout" + at);

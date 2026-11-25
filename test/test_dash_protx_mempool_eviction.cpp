@@ -301,11 +301,11 @@ TEST(DashMempool, UnrelatedProTxSurvivesBlock)
 }
 
 // S3 — rule 4 is dashd's removeProTxKeyChangedConflicts(X, hash(newKey)):
-// a pending ProUpServTx carries the NULL validForProTxKey (txmempool.cpp sets
-// it only for ProUpRegTx / ProUpRevTx, :686/:694; txmempool.h:178) and is
-// evicted by any mined ProUpRegTx(X); a pending ProUpRegTx / ProUpRevTx(X)
-// survives a mined ProUpRegTx that leaves the key's bytes unchanged, and is
-// evicted when they change.
+// Dash Core v24.0.0 keys a pending ProUpServTx, ProUpRegTx and ProUpRevTx(X)
+// alike on the masternode's key at admission (txmempool.cpp
+// addUncheckedProTx; v23 left a ProUpServTx's null, so any mined ProUpRegTx
+// evicted it): each survives a mined ProUpRegTx that leaves the key's bytes
+// unchanged, and is evicted when they change.
 TEST(DashMempool, BlockProUpRegTxKeepsUpdatesValidForAnUnchangedOperatorKey)
 {
     const std::array<uint8_t, 48> key = seq<48>(0xE5);
@@ -327,7 +327,7 @@ TEST(DashMempool, BlockProUpRegTxKeepsUpdatesValidForAnUnchangedOperatorKey)
         return std::array<bool, 3>{pooled(mp, serv), pooled(mp, reg), pooled(mp, rev)};
     };
     const auto same = run(key);
-    EXPECT_FALSE(same[0]) << "a pending ProUpServTx is evicted by any mined ProUpRegTx (dashd)";
+    EXPECT_TRUE(same[0]) << "the operator key did not change: the pending ProUpServTx stays (Dash Core v24)";
     EXPECT_TRUE(same[1]) << "the operator key did not change: the pending ProUpRegTx stays";
     EXPECT_TRUE(same[2]) << "the operator key did not change: the pending ProUpRevTx stays";
     const auto changed = run(seq<48>(0x70));

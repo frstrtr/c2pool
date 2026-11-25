@@ -28,6 +28,26 @@ if (BUILD_TESTING AND GTest_FOUND)
     # existing allowlisted target (a standalone add_executable would be absent
     # from build.yml's --target list and silently Not-Run — the #769 trap).
     #
+    # serve_marked_shares_test.cpp + own_share_reject_marks_test.cpp: getshares
+    # replies are complete and contiguous even for shares pushed to a peer that
+    # dropped right after (dba0be63d skipped them forever); the narrowed
+    # own-share re-broadcast hold-off (peer abort only, 10 min TTL). REAL
+    # NodeImpl + real loopback peer. Same folding rule: into the existing
+    # allowlisted target.
+    #
+    # restart_reload_window_test.cpp: the 2026-11-13 restart stall — a restart
+    # reloads the whole persisted window (the store's height index keeps every
+    # share of a height; the loader reads the share records). REAL store and
+    # NodeImpl. Same folding rule: into the existing allowlisted target.
+    #
+    # parent_fetch_rotation_test.cpp: same incident — a parent is asked of every
+    # connected peer, at once, before the pacer backs it off. REAL NodeImpl +
+    # loopback peers, and the pure FetchPeerRotation. Same folding rule.
+    #
+    # sharereq_busy_wait_test.cpp: same incident — a SHAREREQ waits briefly for
+    # a busy tracker instead of being answered empty. REAL NodeImpl + loopback
+    # peer. Same folding rule.
+    #
     # pool_rate_head_select_test.cpp: the coin-generic dashboard pool-rate
     # HEAD-SELECTION + get_average_stale_prop SSOT (sharechain/
     # pool_rate_head_select.hpp, issue #1482) — verified best when live, else the
@@ -198,6 +218,17 @@ if (BUILD_TESTING AND GTest_FOUND)
     # tip is not a confirmation, a best-chain block confirms once 6 deep.
     # Same folding rule.
     #
+    # dashboard_found_block_test.cpp: one LTC find -> the same /recent_blocks
+    # row on the finder (ltc::dashboard::row_from_submit, fed by the stratum
+    # submit that minted the share) and on every peer (row_from_share, off the
+    # gossiped share): BIP34 block height (never the share absheight), the
+    # payout address (never raw pubkey-hash hex), the share's own hash (never
+    # the winner's parent). Field share of LTC 3211872. Same folding rule.
+    #
+    # found_block_wiring_test.cpp: source-structural guard that main_ltc.cpp's
+    # two LTC record sites use those builders and label the finder this_node.
+    # Same folding rule.
+    #
     # merged_found_record_test.cpp: a merged find on a stale job is recorded
     # as the block the share committed to (its hash and height from the
     # frozen snapshot), not the current work. Same folding rule.
@@ -206,6 +237,23 @@ if (BUILD_TESTING AND GTest_FOUND)
     # aux daemons' CAuxPow::getExpectedIndex (#2060): two chains {98, 1} at
     # {0, 1}, colliding ids grow the tree, every proof carries the index and
     # size the daemon checks. Same folding rule.
+    #
+    # merged_multi_aux_test.cpp: two or more aux chains: a find recovers its
+    # chain's committed block and chain merkle branch from the leaves the
+    # committed root was built from (stale jobs included), the proofs pass
+    # CAuxPow::check, a root or chain that is not known fails closed, and the
+    # one-chain (DOGE) bytes are pinned to the pre-fix path. Same folding rule.
+    #
+    # merged_aux_hardening_test.cpp: several aux chains under one parent: each
+    # chain's createauxblock address is of its own chain and network; a hung,
+    # failing or slow aux daemon drops out of that round's commitment (the
+    # smallest tree over the chains left, as a V36 peer checks it) while the
+    # others keep committing, with no lock held over the network; AuxChainRPC
+    # deadlines, reconnect and backoff against a socket; the daemon's
+    # submitblock answer is kept and a non-DOGE find follows its chain; each
+    # chain's own block size limit; one slow or throwing submit neither delays
+    # nor aborts the others; the chain merkle tree height is capped. Same
+    # folding rule.
     #
     # merged_rebuild_payouts_test.cpp: the merged work is always buildable: a
     # rebuild without payouts never commits to the parent's hash (keeps the
@@ -339,11 +387,67 @@ if (BUILD_TESTING AND GTest_FOUND)
     # to the pre-fix bytes; every tracker copy takes the cache lock. Same
     # folding rule.
     #
+    # share_v3601_flag_day_test.cpp: share version 3601, the flag day: the
+    # version follows from the share's timestamp (not the ratchet), the
+    # boundary skips the 60% switch gate (V35 -> V36 keeps it), straddling
+    # and reorgs across the day, a 3601 share reloads as one and an old node
+    # cannot load it, peers below protocol 3601, and the AuxPoW commitment
+    # rule enforced for 3601 shares only. Same folding rule.
+    #
+    # share_v3601_rewrap_test.cpp: a share re-wrapped under the other type
+    # number (36 <-> 3601; the hash does not commit to it) is dropped by the
+    # share handlers before the tracker, in both directions; a duplicate copy
+    # never replaces the relay bytes of the held share; LevelDB loads use the
+    # same check. Real NodeImpl phase 2. Same folding rule.
+    #
     # best_share_hash_lock_test.cpp: NodeImpl::best_share_hash() reads the
     # tracker under the reader discipline (direct on the compute thread, a
     # shared try-lock elsewhere, the published verified best while busy, the
     # caller's guard when it holds one), driven on a REAL ltc::NodeImpl against
     # a compute thread moving the best share. Same folding rule.
+    #
+    # redistribute_script_type_test.cpp: a redistribution recipient taken from
+    # an address share keeps the (hash, type) the share carries; a P2WSH / P2TR
+    # / bare script is not a recipient (never its first bytes as P2PKH). Same
+    # folding rule.
+    #
+    # solo_payouts_test.cpp: --solo pays each miner to its login's own script
+    # (P2SH, P2WPKH, P2WSH, P2TR; never P2PKH of a script hash, never the zero
+    # key) and the outputs add up to the subsidy. Same folding rule.
+    #
+    # head_score_block_solution_test.cpp: think() head selection as in
+    # p2pool-merged-v36 (data.py:1690-1696, 2933-2967): a head whose share
+    # solved an LTC block is punish -1, one share of work ahead of an
+    # equal-work sibling and level with a branch one share longer; a full tie
+    # goes to the larger hash; Phase 5 walks back only while punish > 0; a
+    # merged-only (DOGE) solution earns nothing. REAL ShareTracker::think().
+    # Same folding rule.
+    #
+    # node_fee_job_target_test.cpp: --fee pays the operator the fee. A node-fee
+    # job (decide_job_payout gave its payout to the operator) has its miner's
+    # share bits (the login's rate key -> job_desired_share_target ->
+    # the REAL ShareTracker::compute_share_target band clip), and over many
+    # seeded jobs the operator's expected PPLNS weight equals the jobs the fee
+    # drew (was ~0.64 of them; field 0.08% of the block for --fee 1). Same
+    # folding rule.
+    #
+    # local_share_block_hook_test.cpp: a locally minted share that solves a
+    # block reaches the found-block and merged-block hooks with the share
+    # readable. notify_local_share verifies under its own EXCLUSIVE lock and
+    # the hooks read through read_tracker(): a shared try-lock by the owning
+    # thread (undefined; glibc refuses it) made them bail. The startup block
+    # scan fires the same hooks under its own shared guard and now reads
+    # through it too. REAL NodeImpl, REAL minted and verified share. Same
+    # folding rule.
+    #
+    # think_best_change_notify_test.cpp + think_gate_test.cpp: every
+    # best-share change reaches m_on_best_share_changed once — one made by
+    # clean_tracker Step 1 (compared away by Step 4) included, re-advertised
+    # to the peers as after a think — and a
+    # run_think() skipped while a cycle holds the slot is served by one think
+    # from the cycle's epilogue (the #854 pending re-think, ported from DASH).
+    # REAL NodeImpl with its compute thread and a test io_context, plus the
+    # slot protocol under thread contention. Same folding rule.
     # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
     add_executable(share_test
         auto_ratchet_blocked_by_test.cpp
@@ -360,6 +464,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         cmpct_v3_mweb_state_test.cpp
         compact_block_merkle_test.cpp
         compact_block_mweb_relay_test.cpp
+        dashboard_found_block_test.cpp
         desired_request_pacer_test.cpp
         desired_version_tally_test.cpp
         doge_auxpow_witness_test.cpp
@@ -381,7 +486,9 @@ if (BUILD_TESTING AND GTest_FOUND)
         f11_donation_invariance_test.cpp
         found_block_peer_txid_test.cpp
         found_block_verify_test.cpp
+        found_block_wiring_test.cpp
         head_retention_test.cpp
+        head_score_block_solution_test.cpp
         header_pow_always_test.cpp
         hogaddr_spend_guard_test.cpp
         ingest_bounds_test.cpp
@@ -389,6 +496,8 @@ if (BUILD_TESTING AND GTest_FOUND)
         ingest_ownership_test.cpp
         invalid_pow_score_test.cpp
         legacy_addrme_self_probe_test.cpp
+        listen_port_guard_test.cpp
+        local_share_block_hook_test.cpp
         ltc_fd_plan_test.cpp
         ltc_full_view_prices_old_inputs_test.cpp
         ltc_gentx_golden_kat_test.cpp
@@ -398,7 +507,9 @@ if (BUILD_TESTING AND GTest_FOUND)
         mempool_bip68_test.cpp
         mempool_final_tx_test.cpp
         mempool_mweb_admission_test.cpp
+        merged_aux_hardening_test.cpp
         merged_found_record_test.cpp
+        merged_multi_aux_test.cpp
         merged_rebuild_payouts_test.cpp
         merged_refresh_request_test.cpp
         merged_weights_threads_test.cpp
@@ -408,20 +519,33 @@ if (BUILD_TESTING AND GTest_FOUND)
         mweb_next_header_test.cpp
         mweb_state_hash_binding_test.cpp
         mweb_tx_wire_test.cpp
+        node_fee_job_target_test.cpp
+        own_share_reject_marks_test.cpp
+        parent_fetch_rotation_test.cpp
         peer_block_pow_carry_test.cpp
         per_peer_ingest_test.cpp
         pool_rate_head_select_test.cpp
+        redistribute_script_type_test.cpp
+        restart_reload_window_test.cpp
         restart_reorg_supersede_test.cpp
         self_connection_ban_test.cpp
+        serve_marked_shares_test.cpp
+        bootstrap_hosts_test.cpp
         share_fetch_failover_test.cpp
         share_message_unpack_bounds_test.cpp
         share_remove_owns_data_test.cpp
         share_test.cpp
+        share_v3601_flag_day_test.cpp
+        share_v3601_rewrap_test.cpp
+        sharereq_busy_wait_test.cpp
+        solo_payouts_test.cpp
         template_gap_gate_test.cpp
         template_hogex_survives_truncation_test.cpp
         template_mweb_ext_merge_test.cpp
         template_sigop_budget_test.cpp
         template_topology_spend_test.cpp
+        think_best_change_notify_test.cpp
+        think_gate_test.cpp
         utxo_order_test.cpp
         utxo_view_stats_test.cpp
         version_switch_floor_test.cpp

@@ -764,6 +764,8 @@ export function buildAnimationPlan(input: AnimationInput): AnimationPlan {
 
 export interface AnimationController {
   isRunning(): boolean;
+  /** True while a plan waits behind the running one (tick() starts it). */
+  hasQueued(): boolean;
   start(plan: AnimationPlan, nowMs: number): void;
   tick(nowMs: number): FrameSpec | null;
   queueNext(plan: AnimationPlan): void;
@@ -787,6 +789,9 @@ export function createAnimationController(): AnimationController {
   return {
     isRunning(): boolean {
       return state.plan !== null;
+    },
+    hasQueued(): boolean {
+      return state.queued !== null;
     },
     start(plan, nowMs) {
       applyStart(plan, nowMs);

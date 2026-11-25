@@ -727,7 +727,7 @@ TEST(DashPoseOracleFeeder, PersistsV4AndResumesOnlyWhenTheBlockIsOnOurHeaderChai
         ASSERT_TRUE(ch.feeder->seeded());
         EXPECT_EQ(ch.feeder->stats().seed_source, "snapshot");
         EXPECT_EQ(ch.eng.height(), 101u);
-        EXPECT_EQ(ch.eng.loaded_snapshot_version(), 4u);
+        EXPECT_EQ(ch.eng.loaded_snapshot_version(), 5u);   // v5 since Dash Core v24 (identical below v3)
         EXPECT_EQ(ch.eng.find(ch.a)->nPoSePenalty, 66);
         EXPECT_EQ(ch.eng.find(ch.a)->nPoSePenaltyHi, 100);
         EXPECT_EQ(ch.eng.find(ch.b)->nPoSePenaltyHi, 199);

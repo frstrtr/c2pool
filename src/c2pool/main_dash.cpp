@@ -65,6 +65,7 @@
 #include <impl/dash/coin/rpc_conf.hpp>     // dash.conf creds resolution (rpcpassword off argv)
 #include <impl/dash/coin/node_interface.hpp>
 #include <impl/dash/coin/p2p_client.hpp>   // dash::coin::p2p::CoinClient — OPT-IN coin-network dial (E1, --coin-p2p-connect)
+#include <impl/dash/coin/compact_mempool_provider.hpp> // dash::coin::CompactMempoolBinding — #968a cmpctblock short ids vs the embedded mempool
 #include <impl/dash/coin/coin_peer_manager.hpp> // dash::coin::DashCoinPeerManager — DASH-ISOLATED scored/diverse peer discovery (--coin-p2p-discover; network-standalone gate)
 #include <impl/dash/coin/chain_seeds.hpp>  // dash::coin::dash_dns_seeds / dash_fixed_seeds — DASH mainnet/testnet seed bootstrap
 #include <impl/dash/coin/won_block_dispatch.hpp> // dash::coin::broadcast_won_block — S8 dual-path won-block dispatcher (embedded P2P primary + submitblock RPC backup)
@@ -92,6 +93,7 @@
 #include <impl/dash/coin/utxo_snapshot_import.hpp>  // S2: the full UTXO set from a pinned dumptxoutset snapshot
 #include <impl/dash/coin/utxo_status.hpp>            // S2: /local_stats utxo + [EMBED-STATUS] utxo=
 #include <impl/dash/coin/utxo_scan.hpp>              // N1: GET /api/utxo/scan (full-set script scan)
+#include <impl/dash/coin/mempool_probe_json.hpp>     // GET /mempool_entry (fee-parity shadow probe)
 #include <impl/dash/coin/inject_validate.hpp>        // N3: POST /api/tx-inject/validate reply
 #include <impl/dash/coin/header_chain.hpp>       // dash::coin::HeaderChain — SPV header/tip authority (E2a)
 #include <impl/dash/coin/block_confirm.hpp>      // dash::coin::block_confirm — post-broadcast confirm/orphan verdict
@@ -107,6 +109,11 @@
 #include <impl/dash/coin/payee_fold_feeder.hpp>  // ordered connect for the payee + UTXO lanes
 #include <impl/dash/coin/mempool_ingest.hpp>     // wire_mempool_ingest (leg 1)
 #include <impl/dash/coin/tip_ingest.hpp>         // wire_tip_ingest (leg 2)
+#include <impl/dash/coin/deployment_status.hpp>  // Dash Core v24 deployment tracking (EHF + versionbits)
+#include <impl/dash/coin/v24_activation_wire.hpp>  // the v24 activation height cross-check into the folds
+#include <impl/dash/coin/mnhf_node_env.hpp>      // Dash Core CheckMNHFTx inputs from the node
+#include <impl/dash/coin/credit_pool_lane.hpp>   // Dash Core v24 credit-pool follower (UnlockLimitV24, unlock admission)
+#include <impl/dash/coin/protx_ecdsa.hpp>        // CHashSigner::VerifyHash for the provider-tx checks
 #include <impl/dash/coin/embedded_oracle_shadow.hpp> // dash::coin::EmbeddedOracleShadow — per-block dashd cross-check (OBSERVE-only)
 #include <impl/dash/coin/embedded_shadow_compare.hpp> // dash::coin::EmbeddedShadowCompare — serve-vs-dashd template diff (OBSERVE-only, NOT a gate)
 #include <impl/dash/coin/mempool_validity_gate.hpp>   // dash::coin::MempoolValidityGate — THE --embedded-serve-mempool-txs arming condition
@@ -156,6 +163,7 @@
 #include <impl/dash/coin/v36_work_policy.hpp>    // dash::coin::resolve_v36_work_policy (DASH v36 network: work source)
 #include <impl/dash/stratum/tip_refresh.hpp>   // dash::stratum::fire_share_tip_refresh — bump + notify_all + dashboard refresh
 #include <impl/dash/local_mint_ledger.hpp>     // dash::mint::LocalMintLedger — display-only local orphan/sibling gauge
+#include <impl/dash/deferred_mint_dash.hpp>    // dash::mint::DeferredSolve / mint_solve_once — deferred-mint queue binding
 #include <impl/dash/share_messages.hpp>        // dash::validate_message_data — operator message-blob validation (EMIT side, mirrors main_ltc.cpp)
 #include <c2pool/storage/found_block_store.hpp>  // FoundBlockStore/Record + LevelDBStore + MergedBlockStore (persistence, main_ltc parity)
 #include <c2pool/storage/the_checkpoint.hpp>   // TheCheckpointStore — #159 (G9) DASH parity wiring (inert until merged mining)
@@ -183,6 +191,7 @@
 #include <utility>      // std::as_const (qc-plan lambda: read-only qmgr access)
 #include <cstring>
 #include <fstream>
+#include <sstream>
 #include <iostream>
 #include <map>
 #include <set>          // PoSe oracle consultation log (one line per tip x MN)
@@ -197,6 +206,23 @@
 
 namespace {
 
+// --dash-v24-activation-height N: emergency pin of the Dash Core v24
+// activation height (operator decision O7). Validated against the network in
+// run_node; see coin/deployment_status.hpp for how it combines with the
+// computed state.
+std::optional<uint32_t> g_v24_activation_pin;
+// --header-dgw-log-only: the coin header chain logs a header whose bits are
+// not the DGW bits of its own window and ACCEPTS it, instead of refusing it
+// (the mainnet default). An escape hatch, not a mode to run in.
+bool g_header_dgw_log_only = false;
+// --embedded-credit-pool-seed: seed the credit-pool follower from the v20
+// floor (every block since v20 over coin P2P, mainnet ~580k blocks, kept in
+// <net>/credit_pool_idx). The only seed that admits asset unlocks: Dash Core
+// refuses a duplicate unlock index against every unlock since v20. Off (the
+// default): a window seed (~584 blocks) tracks the balance history and the
+// Dash Core v24 limit, and every unlock stays excluded.
+bool g_credit_pool_seed = false;
+
 // -- Sharechain (pool-to-pool) peering CONTRACT (launcher-peering-cli slice) --
 // The DASH dual-pool G2 ratchet (LIVE rows C1-C4) needs main_dash to accept the
 // peering argv the way main_btc does (--sharechain-port + bootstrap). This slice
@@ -210,7 +236,8 @@ struct PeeringConfig {
     uint16_t    listen_port = 0;           // 0 => sharechain SSOT default (8999/18999; 8998 under --net dash-v36)
     bool        listen_set  = false;
     std::vector<NetService> addnodes;      // --addnode HOST:PORT (persistent outbound)
-    std::vector<NetService> connects;      // --connect HOST:PORT (connect-only; no listen/discovery)
+    std::vector<NetService> connects;      // --connect HOST:PORT: outbound dials ONLY the configured peers
+                                           // (no addr-gossip dialing); no inbound listener unless --listen
 };
 
 // Parse "HOST:PORT" (PORT mandatory; IPv4/hostname single-colon form).
@@ -286,6 +313,19 @@ struct UtxoSnapshotCli {
     std::string import_file;          // --utxo-import FILE: import into the full-set dir and exit
 };
 UtxoSnapshotCli g_utxo_snapshot;
+
+// --mempool-entry-probe: wire GET /mempool_entry (fee-parity shadow tooling).
+// DEFAULT OFF: an unwired node answers 404, so a production node exposes
+// nothing new. Even on, the route answers only a direct local request.
+// File scope like g_utxo_snapshot: written once while parsing argv.
+bool g_mempool_entry_probe = false;
+
+// --deferred-mint / --no-deferred-mint: the deferred-mint queue
+// (core/deferred_mint.hpp). ON, a solve the busy tracker declines is queued and
+// minted at the next point the lock is free instead of being lost. OFF (the
+// default until a soak and a canary have measured it) is the old single
+// try-and-decline, exactly.
+bool g_deferred_mint = dash::mint::kDeferredMintDefault;
 
 // --embedded-mn-bridge-no-cursor (#91): DISABLE the bridge's resumable replay
 // cursor, so every process start replays the whole window from the pinned
@@ -563,7 +603,8 @@ void report_peering(const PeeringConfig& peer, bool testnet)
     const uint16_t bind = peer.listen_port ? peer.listen_port : ssot;
     if (!peer.connects.empty() && !peer.listen_set) {
         std::cout << "[run] sharechain peering: --connect mode ("
-                  << peer.connects.size() << " peer[s]); listen + discovery suppressed\n";
+                  << peer.connects.size() << " peer[s]); outbound dials ONLY the configured"
+                     " peers (no addr-gossip dialing); inbound listener suppressed\n";
     } else {
         std::cout << "[run] sharechain peering: listen " << peer.listen_host << ":" << bind
                   << (peer.listen_set ? " (--listen)\n" : " (sharechain SSOT default)\n");
@@ -594,9 +635,16 @@ void print_banner(const char* argv0)
         << "           [--network-id HEX [--prefix HEX]]  (private sharechain identity)\n"
         << "           [--stratum [HOST:]PORT] [--coin-p2p-connect HOST:PORT]... [--coin-p2p-discover]\n"
         << "           [--web-port PORT] [--web-host ADDR] [--dashboard-dir PATH]\n"
+        << "           [--stratum-http[=true|false|auto]]\n"
+        << "           [--stratum-http-budget N] [--stratum-http-per-ip N]\n"
         << "           [--external-ip ADDR]\n"
+        << "           [--header-dgw-log-only]  (log, do not refuse, a header off its DGW bits)\n"
         << "           [--embedded-utxo[=false]] [--embedded-mainnet[=false]] [--embedded-null-arm[=false]]\n"
         << "           [--embedded-superblock[=false]] [--embedded-include-mn-special-txs[=false]]\n"
+        << "           [--embedded-superblock-unfunded-mainnet]  (TEST/SOAK ONLY — MUST NEVER be set on a\n"
+        << "              production MAINNET node: serves a superblock height with a normal coinbase when\n"
+        << "              the node believes no trigger is funded; a wrong belief loses the block. Default\n"
+        << "              OFF = refuse, master's behaviour; testnet serves the unfunded verdict without it)\n"
         << "           [--embedded-accrue-asset-locks[=false]] [--embedded-mn-bridge-max N]\n"
         << "           [--embedded-asn-diversity]\n"
         << "           [--embedded-mn-bridge-no-cursor]\n"
@@ -608,12 +656,21 @@ void print_banner(const char* argv0)
         << "              running node that is not using that set; the next start opens it)\n"
         << "             (full UTXO set: import a pinned dumptxoutset into <net>/utxo_full_leveldb\n"
         << "              at start, then connect strictly from its base; alias --utxo-snapshot)\n"
+        << "           [--deferred-mint | --no-deferred-mint]\n"
+        << "             (queue a solve the busy tracker cannot take and mint it at the next\n"
+        << "              free lock instead of declining it; default off: --no-deferred-mint\n"
+        << "              is the old single try-and-decline)\n"
+        << "           [--mempool-entry-probe]\n"
+        << "             (wire the direct-local GET /mempool_entry?txid= probe for the fee-parity\n"
+        << "              shadow; default off)\n"
         << "           [--embedded-tx-serve-own-set[=false]]\n"
         << "             (ALL embedded serving levers default ON when NO dashd arm is given —\n"
         << "              bare `--run` = daemonless, serves the FULL mempool + special txs (DIP\n"
         << "              types 1-4) + funded superblocks, reward-safe; =false opts each out)\n"
         << "           [--embedded-fresh-datum-race] [--embedded-fresh-datum-race-k N]\n"
         << "           [--embedded-getmnlistd-tracker]\n"
+        << "           [--embedded-compact-blocks[=false]]  (BIP 152 compact-block receive for new\n"
+        << "              tip bodies, default ON; =false fetches every body whole)\n"
         << "           [--embedded-fold-live PATH] [--embedded-fold-live-expect HASH]\n"
         << "           [--embedded-fold-checkscripts[=false]]\n"
         << "           [--embedded-tx-inject] [--embedded-tx-inject-hex FILE]\n"
@@ -637,6 +694,9 @@ void print_banner(const char* argv0)
         << "           [--embedded-accrue-asset-locks] [--embedded-accrue-asset-unlocks]\n"
         << "           [--embedded-ingest-isdlock] [--embedded-ingest-dstx]\n"
         << "           [--embedded-proactive-rotate]\n"
+        << "           [--dash-v24-activation-height N]  (emergency pin of the Dash Core v24\n"
+        << "             activation height; a window boundary; decides only where the\n"
+        << "             EHF/versionbits tracker cannot, and fails closed where it disagrees)\n"
         << "           [--embedded-utxo-fold-fees DBPATH --embedded-utxo-fold-expect HEX]\n"
         << "           [--pin-local-tx-hex FILE]  (zero-fee self-mined tx, e.g. donation consolidation)\n"
         << "           [--pin-splice-xcheck-arm]  (let pins ride an xcheck-SWAPPED dashd template; default OFF)\n"
@@ -762,6 +822,19 @@ void print_banner(const char* argv0)
         << "        --web-port PORT (alias --http-port, default 8080) serves the FULL\n"
         << "        c2pool web dashboard + JSON API on --web-host (default 0.0.0.0)\n"
         << "        from --dashboard-dir (default web-static); --web-port 0 disables.\n"
+        << "        --stratum-http[=true|false|auto] also answers that API (GET/HEAD,\n"
+        << "        read-only) on the stratum port, as python p2pool did on its\n"
+        << "        worker port (trackers poll host:<stratum>/global_stats); default\n"
+        << "        false; auto = on when --web-host is ::, is 0.0.0.0 and --stratum\n"
+        << "        is IPv4, or is the --stratum address (not loopback).\n"
+        << "        --stratum-http-budget N: HTTP requests in progress on the\n"
+        << "        stratum port at once, at most N and at most\n"
+        << "        max_stratum_connections - 1; others are answered 503 (default\n"
+        << "        16; 0 = every HTTP request on the stratum port is answered 503).\n"
+        << "        --stratum-http-per-ip N: HTTP requests in progress on the\n"
+        << "        stratum port at once from one address, one /64 for IPv6, at\n"
+        << "        most N; others are answered 503 (default 6; 0 = no limit below\n"
+        << "        --stratum-http-budget).\n"
         << "        --embedded-oracle-shadow runs the OBSERVE-only per-block dashd\n"
         << "        cross-check: dashd getblocktemplate{mode:proposal} is the VERDICT,\n"
         << "        regime-aware field-compare is the DIAGNOSIS; a persisted graduation\n"
@@ -1317,7 +1390,15 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
              // re-folds and rejects on root drift, so an included special tx
              // always commits a folded MN root. Default false = today's
              // exclude-all (coinbase-only body for special txs).
-             bool embedded_include_mn_special_txs = false)
+             bool embedded_include_mn_special_txs = false,
+             // --embedded-superblock-unfunded-mainnet: explicit MAINNET opt-in
+             // for serving a PROVEN-unfunded superblock height (NotTriggered,
+             // normal coinbase). TEST/SOAK ONLY — it must never be set on a
+             // production mainnet node. Default OFF: on mainnet every
+             // superblock height without a funded trigger refuses (master's
+             // behaviour). Testnet serves NotTriggered without it. Never
+             // implied by any other flag.
+             bool embedded_superblock_unfunded_mainnet = false)
 {
     namespace io = boost::asio;
 
@@ -1428,6 +1509,20 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // so persisted shares and their is_verified flags can never cross
     // identities. No flag: "dash" / "dash_testnet", byte-identical to master.
     const std::string net_subdir = dash::SharechainConfig::data_subdir(testnet);
+    // Dash Core v24: the emergency activation pin must be a window boundary of
+    // this network (activation happens only at the first block of a period).
+    if (g_v24_activation_pin) {
+        const auto v24_net = testnet ? dash::coin::DashNetwork::TESTNET
+                                     : dash::coin::DashNetwork::MAINNET;
+        const std::string why =
+            dash::coin::validate_v24_activation_pin(v24_net, *g_v24_activation_pin);
+        if (!why.empty()) {
+            std::cerr << "--dash-v24-activation-height " << *g_v24_activation_pin
+                      << " " << why << "\n";
+            return 1;
+        }
+        dash::coin::set_dash_v24_activation_pin(v24_net, g_v24_activation_pin);
+    }
     if (dash::SharechainConfig::has_custom_network_id()) {
         if (dash::SharechainConfig::is_named_v36_network())
             std::cout << "[run] DASH v36 network (--net " << dash::SharechainConfig::V36_NETWORK_NAME
@@ -1561,7 +1656,19 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // a share-load crash (the throw lands right after the "Loaded N
         // persisted shares" lines). Fail CLEANLY with the actual reason.
         try {
-            p2p_node.core::Server::listen(bind_port);
+            if (core::is_wildcard_listen_host(peer.listen_host)) {
+                // Every interface (the default 0.0.0.0, or ::): unchanged.
+                p2p_node.core::Server::listen(bind_port);
+            } else if (!p2p_node.core::Server::listen_on(peer.listen_host, bind_port)) {
+                // --listen HOST:PORT used to ignore HOST and bind every
+                // interface while this log line named HOST. Bind exactly HOST,
+                // or stop: never listen somewhere the operator did not ask for.
+                std::cerr << "[run] FATAL: cannot bind sharechain P2P listener to "
+                          << peer.listen_host << ":" << bind_port
+                          << " (HOST must be a numeric address of this host, and the "
+                             "port free)\n";
+                return 1;
+            }
         } catch (const std::exception& e) {
             std::cerr << "[run] FATAL: cannot bind sharechain P2P port "
                       << bind_port << ": " << e.what()
@@ -1596,6 +1703,13 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // think()'s desired-set dispatch rides run_think). This is what lets an
     // EMPTY node JOIN an established p2pool-dash chain instead of only
     // serving inbound peers.
+    // --connect: outbound dials go only to the explicitly configured peers
+    // (--connect plus any --addnode), never to addresses learned from gossip.
+    if (!peer.connects.empty()) {
+        std::vector<NetService> configured(peer.connects);
+        configured.insert(configured.end(), peer.addnodes.begin(), peer.addnodes.end());
+        p2p_node.set_connect_only(configured);
+    }
     p2p_node.start_outbound_connections();
     if (!config.pool()->m_bootstrap_addrs.empty())
         std::cout << "[run] outbound dialing started ("
@@ -1610,6 +1724,77 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // this frame. Nothing consensus-visible reads this — see
     // local_mint_ledger.hpp.
     auto mint_ledger = std::make_shared<dash::mint::LocalMintLedger>();
+
+    // ── Deferred mint (core/deferred_mint.hpp) ────────────────────────────
+    // A solve the busy tracker declines is queued and minted at the next point
+    // the lock is free: both IO-phase epilogues (think slot still held, so the
+    // batch gets one think) and the 2 s advert tick. The stratum thread never
+    // waits. Opt-in (--deferred-mint); off is the old decline, exactly.
+    // Two extra display-only ledgers settle the shares minted FROM THE QUEUE,
+    // split by whether the solve's prev was the tip when it arrived (only those
+    // can land on the best chain; the others are siblings that lose the tie).
+    auto deferred_ledger_tip    = std::make_shared<dash::mint::LocalMintLedger>();
+    auto deferred_ledger_behind = std::make_shared<dash::mint::LocalMintLedger>();
+    // io thread only (the minter's owner): which prev a solve of ours already
+    // claims, for the tip/behind split (dash::mint::PrevClaimTracker).
+    auto prev_claims = std::make_shared<dash::mint::PrevClaimTracker>();
+    using DashDeferredMinter = core::DeferredMinter<dash::mint::DeferredSolve>;
+    auto deferred_minter = std::make_shared<DashDeferredMinter>(
+        g_deferred_mint,
+        [node = &p2p_node, mint_params, mint_ledger, deferred_ledger_tip,
+         deferred_ledger_behind, prev_claims](const dash::mint::DeferredSolve& s,
+                                              const core::MintAttempt& a) {
+            const auto out = dash::mint::mint_solve_once(*node, mint_params, s, a);
+            if (out.result == core::MintResult::Minted) {
+                // Display-only: remember what we minted so the best-share-
+                // changed leg can tell later whether it stayed on the best
+                // chain (local_mint_ledger.hpp). Never gates the mint.
+                mint_ledger->record_mint(out.hash);
+                if (a.from_queue) {
+                    (s.prev_was_tip ? deferred_ledger_tip : deferred_ledger_behind)
+                        ->record_mint(out.hash);
+                    prev_claims->queued_minted(s.in.prev_share_hash);
+                }
+            }
+            return out;
+        },
+        [node = &p2p_node]() { node->run_think(); },
+        // Every solve the queue finally loses. A block-winning one is a
+        // forfeit, loud and counted like the bounded-wait expiry (a duplicate
+        // is not: the chain already holds that share). queue_full is logged by
+        // the mint seam (the solve was never queued) and shutdown by the
+        // shutdown block; neither held a claim.
+        [node = &p2p_node, prev_claims](const dash::mint::DeferredSolve& s,
+                                        core::MintDropReason why) {
+            using R = core::MintDropReason;
+            if (why != R::queue_full && why != R::shutdown)
+                prev_claims->queued_dropped(s.in.prev_share_hash);
+            if (s.in.won_block && why != R::duplicate) {
+                node->record_block_share_forfeit(s.in.pow_hash, core::to_string(why));
+            } else if (why != R::queue_full && why != R::shutdown) {
+                LOG_INFO << "[MINT-DEFER] queued solve dropped (" << core::to_string(why)
+                         << ") prev=" << s.in.prev_share_hash.GetHex().substr(0, 16)
+                         << (s.in.won_block ? " (block-winning share, already in the chain)" : "");
+            }
+        });
+    // Owner = this thread: run_node's own thread is the one that runs ioc.run()
+    // (the stratum seam, both IO epilogues and the advert tick all run there).
+    deferred_minter->bind_owner_thread();
+    p2p_node.set_deferred_mint_drain(
+        [w = std::weak_ptr<DashDeferredMinter>(deferred_minter)]() {
+            auto m = w.lock();
+            if (!m) return;
+            const auto st = m->drain_point();
+            if (st.minted > 0 || st.dropped > 0)
+                LOG_INFO << "[MINT-DEFER] drained: minted=" << st.minted
+                         << " dropped=" << st.dropped << " left=" << m->depth()
+                         << (st.stopped_busy ? " (tracker busy again)" : "")
+                         << (st.stopped_budget ? " (time budget)" : "");
+        });
+    std::cout << "[run] deferred mint "
+              << (g_deferred_mint ? "ON (--deferred-mint: busy-tracker solves are queued)"
+                                  : "OFF (busy-tracker solves are declined; --deferred-mint enables)")
+              << "\n";
 
     // ── Hashing on another node (failback): ONE sharechain read ───────────
     // Per payout address, the newest share minted on ANOTHER node (received
@@ -2110,7 +2295,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             // tally + work-weighted sampling mirror what apply_min_protocol_ratchet
             // keys on (version_negotiation::get_desired_version_weights), so the
             // dashboard shows the SAME numbers the ratchet decides on.
-            mi->set_sharechain_stats_fn([node_ptr, mint_ledger]() -> nlohmann::json {
+            mi->set_sharechain_stats_fn([node_ptr, mint_ledger, deferred_minter,
+                                         deferred_ledger_tip, deferred_ledger_behind]() -> nlohmann::json {
                 // Last-good cache (mirrors main_ltc.cpp's stats_fn): think() holds the
                 // tracker lock frequently during normal operation, and returning a
                 // 4-field snapshot then would make the transition gauge (which reads
@@ -2145,6 +2331,12 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     out["local_gone_shares"]     = lm.gone;
                     out["local_orphan_rate"]     = lm.orphan_rate;
                 }
+                // Deferred mint (core/deferred_mint.hpp): queue counters and
+                // the on-best-chain outcome of the shares minted from it, per
+                // cause. Lock-free (own mutexes), so the busy-cache path below
+                // refreshes it too. Served raw at /sharechain/stats.
+                out["mint_defer"] = dash::mint::mint_defer_json(
+                    deferred_minter->snapshot(), *deferred_ledger_tip, *deferred_ledger_behind);
 
                 // Protocol-floor gauge inputs (v16→v36 crossing). The live accept-floor
                 // is the ratchet output (1700 pre-crossing → 3600 once ≥95% v36-weighted);
@@ -2182,6 +2374,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                         cached["local_pending_shares"]  = out["local_pending_shares"];
                         cached["local_gone_shares"]     = out["local_gone_shares"];
                         cached["local_orphan_rate"]     = out["local_orphan_rate"];
+                        cached["mint_defer"]            = out["mint_defer"];
                         return cached;
                     }
                     out["chain_height"] = snap.chain_count;
@@ -2968,6 +3161,14 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // => the coin client keeps its stall-only rotation (byte-identical to
         // master); the setter only flips a member bool.
         coin_p2p->set_proactive_rotate_enabled(embedded_proactive_rotate);
+        // #968a: the operator's --coin-p2p-connect targets (the pinned local
+        // dashd among them) are never disconnected by Misbehaving(); neither
+        // is any loopback / private-LAN peer (p2p_client.hpp is_protected_peer).
+        {
+            std::set<std::string> protected_keys;
+            for (const auto& t : coin_p2p_targets) protected_keys.insert(t.to_string());
+            coin_p2p->set_protected_peer_keys(std::move(protected_keys));
+        }
 
         if (coin_p2p_discover_eff) {
             // ── Network-standalone arm: seed-discovered, SCORED, group-diverse
@@ -3174,6 +3375,28 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     std::unique_ptr<dash::coin::replay::ReplayUtxoFold> fold_fee_fold;
     std::unique_ptr<dash::coin::FoldFeeSource>          fold_fee_source;
     dash::coin::NodeCoinState node_coin_state;
+    // Dash Core v24 (DEPLOYMENT_V24): every block folds as its CbTx version
+    // states (v24_activation.hpp); a v24 statement below the earliest
+    // possible activation is a block dashd rejects. The tracking's activation
+    // height arrives through V24ActivationWire (below) as a cross-check.
+    {
+        const auto fold_net =
+            dash::SharechainConfig::is_testnet ? dash::coin::DashNetwork::TESTNET : dash::coin::DashNetwork::MAINNET;
+        node_coin_state.mnstates().set_v24_earliest(dash::coin::v24_earliest_unmeasured_activation(fold_net));
+        node_coin_state.mnstates().set_v20_height(dash::coin::dash_deployment_params(fold_net).v20_height);
+    }
+    if (dash::SharechainConfig::is_testnet) {
+        // The projection's chain heights from the same testnet gates the
+        // replay engines use (FoldGates::testnet()): DIP3 activation for its
+        // ContextualCheckTransaction pre-scan (the mainnet default 1,028,160
+        // left testnet blocks 7,000..1,028,159 unchecked). Its payee selection
+        // assumes MN_RR active (no Evo 4-in-a-row bonus), true on testnet from
+        // 1,066,900.
+        const auto tg = dash::coin::replay::FoldGates::testnet();
+        node_coin_state.mnstates().set_dip0003_height(static_cast<uint32_t>(tg.dip0003_height));
+        node_coin_state.mnstates().set_v24_height(static_cast<uint32_t>(tg.v24_height));
+        node_coin_state.mnstates().set_netinfo_rules(tg.netinfo_rules);
+    }
     if (!fold_live_db.empty()) {
         fold_live = std::make_shared<dash::coin::replay::ReplayUtxoFold>();
         if (!fold_live->open(fold_live_db)) {
@@ -3392,6 +3615,20 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             [source = utxo_scan_source](const std::string& query, const std::atomic<bool>& cancel) {
                 return source->handle(query, cancel);
             });
+        // GET /mempool_entry?txid=HEX (--mempool-entry-probe, direct-local,
+        // read-only): one entry's template candidacy for the fee-parity shadow
+        // comparator. Runs on the producer thread (thread_safe_wrap), so
+        // node_coin_state is alive. Off by default: unwired answers 404.
+        if (g_mempool_entry_probe) {
+            web_server->get_mining_interface()->set_mempool_entry_fn(
+                [&node_coin_state](std::string txid_hex) -> nlohmann::json {
+                    uint256 txid;
+                    txid.SetHex(txid_hex);
+                    return dash::coin::mempool_probe_json(
+                        txid, node_coin_state.mempool().probe(txid));
+                });
+            std::cout << "[run] --mempool-entry-probe: GET /mempool_entry wired (direct-local only)\n";
+        }
     }
     // ── IS/CL MINING-SAFETY HOLD arming (dashd TestPackageTransactions) ─────
     // dashd's miner refuses any not-yet-islocked tx with vins younger than 10
@@ -3408,18 +3645,34 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // the pre-hold include-immediately behaviour instead of holding every
     // young tx for 10 minutes. No coin-P2P arm => no isdlock feed => the
     // arm-bit below is never set and the hold stays OFF.
+    //
+    // Dash Core v24 (#7278) removed SPORK_3 and treats it as always on, and a
+    // v24 network no longer relays it, so the arm-bit follows SPORK_2 alone
+    // (IsInstantSendEnabled). A stale "SPORK_3 off" can no longer disarm it.
     if (coin_p2p) {
         auto arm_is_hold = [&cp = *coin_p2p, &ncs = node_coin_state]() {
             const int64_t now = static_cast<int64_t>(std::time(nullptr));
             const auto& ss = cp.spork_state();
             ncs.mempool().set_instantsend_mining_hold(
-                ss.is_active(dash::coin::SPORK_2_INSTANTSEND_ENABLED, now)
-                && ss.is_active(dash::coin::SPORK_3_INSTANTSEND_BLOCK_FILTERING,
-                                now));
+                ss.is_active(dash::coin::SPORK_2_INSTANTSEND_ENABLED, now));
         };
         arm_is_hold();   // seed posture now (mainnet seed: both active)
         coin_p2p->set_spork_change_callback(arm_is_hold);
     }
+    // #968a slice 3b: BIP 152 cmpctblock short ids are matched against THIS
+    // node's embedded Mempool (compact_mempool_provider.hpp), so a compact
+    // block whose txs we already hold completes without a getblocktxn round
+    // trip. A wrong tx that matches by short id is caught by the receiver's
+    // merkle bind, and the full block is fetched. Declared AFTER
+    // node_coin_state, so it is destroyed BEFORE it: the destructor takes the
+    // provider out of coin_p2p while the Mempool is still alive. coin_p2p is
+    // declared earlier and can outlive this scope (set_lifetime pins it per
+    // async op), so without this it would keep a provider pointing into a
+    // freed Mempool. No coin-P2P arm => nothing is bound.
+    dash::coin::CompactMempoolBinding<dash::coin::p2p::CoinClient<dash::Config>>
+        cmpct_mempool_binding;
+    if (coin_p2p)
+        cmpct_mempool_binding.bind(coin_p2p, node_coin_state.mempool());
     // #107 PHASE 2 (--embedded-accrue-asset-locks): DEFAULT OFF. When ON the
     // embedded CbTx creditPoolBalance accrues the pending type-8 asset-lock term
     // dashd commits, so the gbt-xcheck-modulo-special-explained swap stops
@@ -3434,6 +3687,9 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // builder drops any special tx the SML fold cannot apply exactly and the
     // emit gate re-folds and rejects on root drift.
     node_coin_state.set_include_mn_special_txs(embedded_include_mn_special_txs);
+    // Dash Core v24 MIN_STANDARD_TX_SIZE (65 bytes, CVE-2017-12842 shape):
+    // never admitted, never mined. Policy; Core refuses these too.
+    node_coin_state.mempool().set_min_standard_tx_size(65);
     // B.9 (Dash Core v23.1.8 delta): the types 1-4 fold verifies the BLS
     // operator signature of every ProUpServTx / ProUpRevTx against the
     // pre-block operator key (dashd CheckProUpServTx / CheckProUpRevTx ->
@@ -3443,7 +3699,18 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     node_coin_state.set_protx_operator_sig_verifier(
         dash::coin::memoize_operator_sig_fn(
             &dash::coin::vendor::verify_protx_operator_sig));
-    std::cout << "[run] embedded special-tx superset (DIP types 1-4): "
+    // Dash Core's full CheckPro*Tx before a provider tx rides a template
+    // (protx_check.hpp): payload rules, network fields, collateral, inputsHash
+    // and the collateral / owner ECDSA signatures. Without it the builder and
+    // the emit gate fold no provider tx at all (VERIFY-S2 P-2).
+    {
+        dash::coin::ProTxCheckEnv env;
+        env.net = testnet ? dash::coin::DashNetwork::TESTNET : dash::coin::DashNetwork::MAINNET;
+        env.ecdsa = &dash::coin::protx_ecdsa_verify_hash;
+        node_coin_state.set_protx_check_env(std::move(env));
+    }
+    std::cout << "[run] embedded special-tx superset (provider types 1-4; from Dash Core v24 "
+                 "activation also 10-12; MNHF signals type 7): "
               << (embedded_include_mn_special_txs
                       ? "ON (--embedded-include-mn-special-txs: SML-folded "
                         "special txs admitted; root re-folded + drift-rejected "
@@ -3459,20 +3726,20 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                         "txs in the served body -- #125/tx-serving)"
                       : "OFF (default: creditPool = seed + platform reward only)")
               << "\n";
-    // #143 Variant B (--embedded-accrue-asset-unlocks): DEFAULT OFF. The
-    // template-side seam (build_embedded_workdata admitted_asset_unlocks)
-    // stays nullptr unless the CreditPool INDEX follower reports
-    // accrual_permitted() — which additionally requires a completed, proven
-    // gap-free seed from the v20 floor (a follow-up soak arms that lane).
-    // Until then the flag documents intent and the posture below names the
-    // state; the served template is exclude-all either way.
+    // #143 Variant B (--embedded-accrue-asset-unlocks): the template-side
+    // seam (build_embedded_workdata admitted_asset_unlocks) stays nullptr
+    // unless the credit-pool follower lane (credit_pool_lane.hpp, wired with
+    // the Dash Core v24 block below) reports accrual_permitted(): a complete
+    // FULL seed from the v20 floor (--embedded-credit-pool-seed), real BLS,
+    // fresh at the template's parent. The default WINDOW seed never admits.
     std::cout << "[run] embedded #143 asset-UNLOCK (type-9) accrual: "
               << (embedded_accrue_asset_unlocks
                       ? "ARMED (--embedded-accrue-asset-unlocks: admission "
-                        "still gated on the CreditPool INDEX follower's "
-                        "fail-closed predicate — proven-complete seed + real "
-                        "BLS + fresh-at-parent; NO follower lane is seeded in "
-                        "this build, so templates remain exclude-all)"
+                        "gated on the credit-pool follower's fail-closed "
+                        "predicate -- a complete FULL seed from the v20 floor "
+                        "(--embedded-credit-pool-seed) + real BLS + "
+                        "fresh-at-parent; otherwise templates exclude every "
+                        "unlock)"
                       : "OFF (default: templates exclude ALL type-9 — "
                         "today's proven-valid behavior)")
               << "\n";
@@ -3650,6 +3917,19 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     auto payee_feeder_sub = coin_state.block_connected.subscribe(
         [&payee_feeder](const dash::interfaces::BlockConnected& bc) {
             payee_feeder.on_block_connected(bc);
+        });
+    // Dash Core v24: the EHF signal tracker is the FIRST sink of the ordered
+    // stream, ahead of the UTXO lane and the maintainer. The maintainer's sink
+    // promotes the serve tip and builds the next template synchronously, and
+    // that template asks for the v24 state of the block after this body, so
+    // the tracker must have read the body by then (VERIFY-H0-S0-S1 M3). The
+    // ordered stream also gives the tracker bound bodies in height order (no
+    // arrival-order holes for the rescan to refetch). The sink is installed
+    // where the tracker is built, further down.
+    std::function<void(const dash::interfaces::BlockConnected&)> ehf_ordered_sink;
+    auto ehf_ordered_sub = payee_feeder.ordered.subscribe(
+        [&ehf_ordered_sink](const dash::interfaces::BlockConnected& bc) {
+            if (ehf_ordered_sink) ehf_ordered_sink(bc);
         });
     // S2: the full UTXO set (DESIGN 4.3). <net>/utxo_full_leveldb is opened
     // instead of the accrual view when it holds a set that passes the S2-2
@@ -4093,9 +4373,36 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     }
 
     dash::stratum::DASHWorkSource::SubmitBlockFn stratum_submit_fn =
-        [p2p_relay, rpc_submit](const std::vector<unsigned char>& block_bytes,
+        [p2p_relay, rpc_submit, &node_coin_state](
+                                const std::vector<unsigned char>& block_bytes,
                                 uint32_t height,
                                 bool height_race) -> bool {
+            // N2: a won block carrying a tx that conflicts with a VERIFIED
+            // islock is conflict-tx-lock on every non-IBD Dash Core node
+            // (v24.0.2 validation.cpp:2811-2829) unless it is already
+            // ChainLocked, which a fresh block never is. Checked AFTER dispatch
+            // (never delay a won block) and only while the verified lane holds
+            // locks; it names the loss instead of leaving an unexplained orphan.
+            auto name_islock_conflict = [&]() {
+                if (node_coin_state.mempool().verified_islock_outpoint_count() == 0) return;
+                try {
+                    dash::coin::BlockType blk;
+                    ::PackStream s(block_bytes);
+                    s >> blk;
+                    if (const auto c = node_coin_state.mempool().verified_islock_conflict_in(
+                            blk.m_txs, std::vector<uint256>{}))
+                        LOG_ERROR << "[ISLOCK-CONFLICT] won block height=" << height
+                                  << " carries tx " << c->txid.GetHex().substr(0, 16)
+                                  << " spending " << c->outpoint.first.GetHex().substr(0, 16)
+                                  << ":" << c->outpoint.second
+                                  << ", locked by a VERIFIED islock to "
+                                  << c->locked_txid.GetHex().substr(0, 16)
+                                  << " -- Dash Core will reject it (conflict-tx-lock)";
+                } catch (...) {
+                    LOG_WARNING << "[ISLOCK-CONFLICT] won-block islock check skipped:"
+                                   " block decode failed";
+                }
+            };
             const std::string block_hex = HexStr(block_bytes);
             std::cout << "[DASH-STRATUM-BLOCK] won block height=" << height
                       << " bytes=" << block_bytes.size()
@@ -4126,12 +4433,14 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                                  "(no embedded P2P peer AND no dashd RPC creds) -- "
                                  "won block NOT broadcast\n";
                 }
+                name_islock_conflict();
                 return false;
             }
             std::cout << "[DASH-STRATUM-BLOCK] relayed: p2p="
                       << (bcast.p2p_sent ? "sent" : "off")
                       << " rpc=" << (bcast.rpc_ok ? "ok" : "off")
                       << " landed_first=" << bcast.landed_first << "\n";
+            name_islock_conflict();
             return true;
         };
 
@@ -4328,6 +4637,10 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // consulted, i.e. during an actual embedded outage.
     const bool xcheck_wanted = (testnet || embedded_mainnet);
     work_source->set_gbt_xcheck(xcheck_wanted && static_cast<bool>(rpc));
+    // The xcheck's label aid (a collateral spend only dashd's template
+    // carries) needs the committed fold kept in the template: exactly where
+    // the xcheck runs, nowhere else (a daemonless node keeps nothing).
+    node_coin_state.set_xcheck_collateral_aid(xcheck_wanted && static_cast<bool>(rpc));
     // --embedded-tx-serve-own-set: serve own valid tx set on a divergent
     // mempool selection instead of the dashd-parity swap (DEFAULT OFF).
     work_source->set_tx_serve_own_set(embedded_tx_serve_own_set);
@@ -4828,7 +5141,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // commitment, deterministic producer rebuild (X11 identity gate +
         // pow<=target ban-safety gate inside), tracker insert + broadcast.
         work_source->set_mint_share_fn(
-            [node_ptr, mint_params, mint_registry, mint_ledger](
+            [node_ptr, mint_registry, deferred_minter, prev_claims](
                 const dash::stratum::DASHWorkSource::MintShareInputs& in) -> uint256
             {
                 if (in.ref_hash.IsNull()) {
@@ -4836,6 +5149,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                                    "no sharechain credit (fail-closed)";
                     return uint256();
                 }
+                // The frozen job is COPIED here, at arrival: a queued solve never
+                // depends on the registry still holding its job (FIFO cap 512).
                 auto frozen = mint_registry->get(in.ref_hash);
                 if (!frozen) {
                     LOG_WARNING << "[MINT] no frozen job for ref="
@@ -4844,78 +5159,46 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     return uint256();
                 }
 
-                // #889: a WON BLOCK is unrepeatable — there is no next solve to
-                // mint instead, and an unminted block-winning share is a block
-                // no p2pool peer can ever see (they detect pool blocks by
-                // watching the sharechain for a share meeting the block target,
-                // p2pool/node.py:145-147). So the block arm takes a BOUNDED WAIT
-                // for the tracker; the ordinary share arm keeps today's single
-                // try-and-decline, which is the right trade when the next solve
-                // mints. THE BLOCK IS ALREADY SUBMITTED at this point — the
-                // won-block arm in work_source.cpp dispatches it before invoking
-                // this seam — so no wait here can delay or endanger it.
+                // #889: a WON BLOCK is unrepeatable, so mint_solve_once gives it
+                // a BOUNDED WAIT for the tracker (the block itself was submitted
+                // before this seam; no wait here can delay it). An ordinary
+                // solve keeps the single try; with the deferred-mint queue ON a
+                // busy tracker QUEUES it instead of losing it, and a won-block
+                // share whose bounded wait expired goes to the FRONT.
                 //
                 // #878/#881: this lambda holds ZERO locks on entry (stratum
                 // asio handler -> process_message -> handle_submit ->
-                // mining_submit -> mint seam; verified lock-free end to end),
-                // which is what makes a bounded wait viable instead of a
-                // deadlock. The guard below is scoped and RELEASED before
-                // add_local_share takes the exclusive lock — never nested.
-                const auto urgency = in.won_block
-                    ? dash::tracker_acquire::Urgency::BlockWinning
-                    : dash::tracker_acquire::Urgency::Opportunistic;
-
-                std::optional<dash::stratum::MintedShare> built;
-                {
-                    auto guard = node_ptr->read_tracker(urgency);
-                    if (!guard) {
-                        if (in.won_block) {
-                            LOG_ERROR << "[MINT-BLOCK] FORFEIT — tracker still "
-                                         "busy after "
-                                      << dash::tracker_acquire::
-                                             BLOCK_SHARE_LOCK_BUDGET.count()
-                                      << "ms; cannot even REBUILD the "
-                                         "block-winning share. The block was "
-                                         "already submitted, but no p2pool peer "
-                                         "will see it.";
-                        } else {
-                            LOG_WARNING << "[MINT] tracker busy — solve declined "
-                                           "(retry on next share)";
-                        }
-                        return uint256();
-                    }
-                    // The share type this chain mints: v16 DashShare (public)
-                    // or v36 DashV36Share (private/isolated v36 sharechain).
-                    built = dash::mint::mint_from_inputs_any(
-                        guard->chain, mint_params, in, *frozen);
+                // mining_submit -> mint seam; verified lock-free end to end).
+                // mint_solve_once scopes and RELEASES its read guard before
+                // add_local_share_ex takes the exclusive lock — never nested.
+                // Runs on the io thread, the minter's owner (prev_claims and
+                // depth() are io-thread state). The soak metric's cause split
+                // is only computed with the queue on: the default skips the
+                // extra snapshot read and the claim bookkeeping.
+                const bool on = deferred_minter->enabled();
+                const bool prev_was_tip = on
+                    && prev_claims->classify_tip(in.prev_share_hash, node_ptr->snapshot_best_share());
+                dash::mint::DeferredSolve solve{in, std::move(*frozen), prev_was_tip};
+                const auto r = deferred_minter->on_solve(std::move(solve), in.won_block);
+                if (on && (r.outcome.result == core::MintResult::Minted || r.queued))
+                    prev_claims->claim(in.prev_share_hash,
+                                       r.outcome.result == core::MintResult::Minted);
+                if (r.outcome.result == core::MintResult::Minted)
+                    return r.outcome.hash;
+                if (r.queued) {
+                    LOG_INFO << "[MINT-DEFER] "
+                             << (r.behind_queue ? "solve queued behind earlier queued solve(s)"
+                                                : "tracker busy — solve queued")
+                             << " (depth=" << deferred_minter->depth() << ")"
+                             << (in.won_block ? " BLOCK-WINNING share at the front" : "");
+                } else if (r.outcome.result == core::MintResult::Busy && deferred_minter->enabled()
+                           && !in.won_block) {
+                    // Queue full. (With the kill switch the mint body already
+                    // logged the old "declined" line.)
+                    LOG_WARNING << "[MINT] tracker busy — solve declined (retry on next share)"
+                                   " [deferred-mint queue full]";
                 }
-                if (!built) {
-                    LOG_WARNING << "[MINT] producer rebuild declined the solve "
-                                   "(identity/target gate) — NOT minted";
-                    return uint256();
-                }
-
-                dash::ShareType share = built->to_share_type();
-                // #889: same urgency for the tracker WRITE. add_local_share
-                // still returns ZERO if the bounded wait expires — the decline
-                // is preserved, it is just no longer silent (LOG_ERROR + a
-                // forfeit counter) and no longer triggered by a merely
-                // momentary think().
-                const uint256 minted =
-                    node_ptr->add_local_share(share, in.won_block);
-                if (minted.IsNull()) {
-                    // Not inserted (busy/duplicate) — reclaim the allocation.
-                    share.invoke([](auto* obj) { delete obj; });
-                    return uint256();
-                }
-                LOG_INFO << "[MINT] share " << minted.GetHex().substr(0, 16)
-                         << " minted onto the sharechain (prev="
-                         << in.prev_share_hash.GetHex().substr(0, 16) << ")";
-                // Display-only: remember what we minted so the best-share-changed
-                // leg below can tell us later whether it stayed on the best chain
-                // (see local_mint_ledger.hpp). Never gates the mint.
-                mint_ledger->record_mint(minted);
-                return minted;
+                return uint256();
             });
 
         // PPLNS fallback-coinbase weights (non-producer path): oracle-window
@@ -4968,7 +5251,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             core::WebServer* web = web_server.get();   // may be null (dashboard off)
             p2p_node.set_on_best_share_changed(
                 [ws = work_source.get(), web, &stratum_server, node_ptr,
-                 mint_ledger]() {
+                 mint_ledger, deferred_ledger_tip, deferred_ledger_behind]() {
                     dash::stratum::fire_share_tip_refresh(
                         ws, stratum_server.get(), web);
 
@@ -4976,17 +5259,21 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     // the new best chain. Runs AFTER the notify (miners first)
                     // and on a try-lock read guard, so a busy tracker simply
                     // defers the verdict to the next tip change.
-                    if (mint_ledger->pending_count() > 0) {
+                    if (mint_ledger->pending_count() > 0
+                        || deferred_ledger_tip->pending_count() > 0
+                        || deferred_ledger_behind->pending_count() > 0) {
                         auto guard = node_ptr->read_tracker();
                         if (guard) {
                             const uint256 best = node_ptr->snapshot_best_share();
                             auto& chain = guard->chain;
-                            mint_ledger->settle(
-                                [&chain, &best](const uint256& h) {
-                                    return dash::mint::classify_local_mint(
-                                        chain, best, h,
-                                        dash::mint::LocalMintLedger::kSettleDepth);
-                                });
+                            const auto classify = [&chain, &best](const uint256& h) {
+                                return dash::mint::classify_local_mint(
+                                    chain, best, h,
+                                    dash::mint::LocalMintLedger::kSettleDepth);
+                            };
+                            mint_ledger->settle(classify);
+                            deferred_ledger_tip->settle(classify);
+                            deferred_ledger_behind->settle(classify);
                         }
                     }
                 });
@@ -5246,6 +5533,11 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     } else {
         std::cout << "[run] stratum disabled (no --stratum flag)\n";
     }
+    // HTTP on the stratum port (--stratum-http; auto follows --web-host).
+    if (stratum_server)
+        core::configure_stratum_http(*stratum_server, web_server.get(),
+                                     core::stratum_http_mode_setting(),
+                                     core::stratum_http_limits_setting());
 
     // ── Think loop: initial election + 15 s keep-fresh tick ───────────────
     // Share arrivals trigger run_think() themselves (add_verified_shares);
@@ -5403,6 +5695,12 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // subscriptions -> lane -> maintainer -> header_chain.
     std::unique_ptr<dash::coin::MnCheckpointLane> mn_ckpt_lane;
     std::vector<std::shared_ptr<EventDisposable>> coin_feed_subs;
+    // #968a: the header chain the cmpctblock gate reads. Declared AFTER
+    // header_chain, so it is destroyed BEFORE it: the destructor takes the
+    // view out of coin_p2p (which can outlive this scope, see
+    // cmpct_mempool_binding above) while the chain is still alive.
+    dash::coin::CompactChainViewBinding<dash::coin::p2p::CoinClient<dash::Config>>
+        cmpct_chain_binding;
     // ── W2 replay bulk-fetch locals (--replay-bulk; replay_bulk_fetch.hpp) ──
     // Declared AFTER header_chain (they read it) so they unwind FIRST at
     // return; the timer is last so its callbacks stop before the lane dies.
@@ -5490,6 +5788,60 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // stays null, and the lambda's guard stays false, when the flag is off or
     // the arm is refused.
     std::shared_ptr<dash::coin::MinedCommitmentIndex>          mined_commitment_index;
+    // Dash Core v24 deployment tracking (EHF signal tracker + versionbits).
+    // Function scope: the service tick, the body filter and the tip callback
+    // reach them. The registry entry is removed before the header chain the
+    // status reads is destroyed (members below are destroyed first).
+    std::shared_ptr<dash::coin::EhfSignalTracker>     ehf_tracker;
+    std::shared_ptr<dash::coin::DashDeploymentStatus> v24_status;
+    // The v24 activation height from the tracking into the payee projection
+    // and the replay folds (v24_activation.hpp), persisted (<net>/v24_activation.v1).
+    std::shared_ptr<dash::coin::V24ActivationWire>    v24_wire;
+    std::unique_ptr<dash::coin::EhfRescanLane>        ehf_rescan;
+    std::string                                       ehf_path;
+    // Credit-pool follower (#143 / Dash Core v24 UnlockLimitV24): the store
+    // outlives the lane that writes it (declared first, destroyed last).
+    std::unique_ptr<dash::coin::CreditPoolIdxDb>      cp_db;
+    std::unique_ptr<dash::coin::CreditPoolLane>       cp_lane;
+    // Teardown: the status stops reading the header chain (shutdown) and
+    // leaves the registry before the header chain is destroyed. The node's
+    // v24 state function (node_coin_state outlives header_chain) then answers
+    // UNKNOWN instead of reading freed headers.
+    // The MNHF check environment's chain lookup reads the header chain too;
+    // it answers "unknown" (the signal is left out) once this flag drops.
+    struct V24StatusUninstall {
+        dash::coin::DashNetwork net;
+        std::shared_ptr<dash::coin::DashDeploymentStatus> status;
+        std::shared_ptr<std::atomic<bool>> chain_alive;
+        ~V24StatusUninstall()
+        {
+            if (chain_alive) chain_alive->store(false);
+            if (status) status->shutdown();
+            dash::coin::install_dash_deployment_status(net, nullptr);
+        }
+    } v24_status_uninstall{testnet ? dash::coin::DashNetwork::TESTNET
+                                   : dash::coin::DashNetwork::MAINNET, nullptr, nullptr};
+    // Head scoring's block-solution credit reads the header chain through this
+    // oracle (the tracker's m_expected_block_bits). Declared after
+    // header_chain, so it is destroyed first: it detaches under the oracle's
+    // mutex, after which a think() cycle gets nullopt (no credit) instead of
+    // reading freed headers; a call in flight finishes before the detach.
+    struct BlockBitsOracle {
+        std::mutex m;
+        const dash::coin::HeaderChain* hc{nullptr};
+    };
+    struct BlockBitsOracleDetach {
+        std::shared_ptr<BlockBitsOracle> oracle = std::make_shared<BlockBitsOracle>();
+        ~BlockBitsOracleDetach()
+        {
+            std::lock_guard<std::mutex> lk(oracle->m);
+            oracle->hc = nullptr;
+        }
+    } block_bits_oracle;
+    if (!coin_p2p)
+        LOG_WARNING << "[HEAD-SCORE] block-solution credit OFF: no coin header chain on this node"
+                       " (no coin-P2P feed), so a block-solving share scores as a plain share here"
+                       " while nodes with a header chain prefer it";
     if (coin_p2p) {
         const auto dash_params = testnet
             ? dash::coin::make_dash_chain_params_testnet()
@@ -5497,7 +5849,61 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         const auto hdr_db = (core::filesystem::config_path()
             / net_subdir / "dash_headers").string();
         header_chain = std::make_unique<dash::coin::HeaderChain>(dash_params, hdr_db);
+        header_chain->set_refuse_dgw_mismatch(!g_header_dgw_log_only);
+        if (g_header_dgw_log_only)
+            LOG_WARNING << "[EMB-DASH] --header-dgw-log-only: a header whose bits"
+                           " are not the DGW bits of its window is logged and"
+                           " ACCEPTED";
         header_chain->init();
+
+        // Head scoring credits a block-solution share only when its header
+        // bits are the network target for its parent block, as this header
+        // chain computes it (DGW over a complete window on our best chain).
+        {
+            std::lock_guard<std::mutex> lk(block_bits_oracle.oracle->m);
+            block_bits_oracle.oracle->hc = header_chain.get();
+        }
+        p2p_node.tracker().m_expected_block_bits =
+            [oracle = block_bits_oracle.oracle](const uint256& prev_block, int64_t block_time)
+                -> std::optional<uint32_t> {
+                std::lock_guard<std::mutex> lk(oracle->m);
+                if (!oracle->hc) return std::nullopt;
+                return oracle->hc->expected_bits_after(prev_block, block_time,
+                                                       dash::BLOCK_CREDIT_MAX_PARENT_DEPTH);
+            };
+        // A share-chain block solution is relayed and recorded only with a
+        // header time above its parent's median-time-past (the stratum arm's
+        // job-mintime floor, applied to the tracker arm). Same oracle object,
+        // same depth bound; the share itself is never affected.
+        p2p_node.tracker().m_block_time_floor =
+            [oracle = block_bits_oracle.oracle](const uint256& prev_block)
+                -> std::optional<uint32_t> {
+                std::lock_guard<std::mutex> lk(oracle->m);
+                if (!oracle->hc) return std::nullopt;
+                const auto mtp = oracle->hc->median_time_past_at(
+                    prev_block, dash::BLOCK_CREDIT_MAX_PARENT_DEPTH);
+                if (!mtp) return std::nullopt;
+                return *mtp + 1;
+            };
+        LOG_INFO << "[HEAD-SCORE] block-solution credit ARMED: a block-solving share's header"
+                    " bits are checked against this node's header chain; its block is"
+                    " relayed only with those bits and a time above the parent's MTP";
+
+        // Dashboard network hashrate from chain work over the last 576 headers
+        // (Dash Core getnetworkhashps(576)) instead of the tip difficulty, which
+        // DarkGravityWave swings ~2x within hours (11-16: tip formula 5.6 PH/s,
+        // getnetworkhashps 3.25 PH/s). Same oracle as the block-bits credit: it
+        // detaches before header_chain is destroyed, so a late web request gets
+        // 0 (the web server falls back to its formula) instead of freed headers.
+        if (web_server) {
+            web_server->get_mining_interface()->set_network_hashrate_fn(
+                [oracle = block_bits_oracle.oracle]() -> double {
+                    std::lock_guard<std::mutex> lk(oracle->m);
+                    return oracle->hc ? oracle->hc->network_hashps(576) : 0.0;
+                });
+            LOG_INFO << "[WEB] network hashrate = chain work over the last 576 headers"
+                        " (getnetworkhashps-equivalent)";
+        }
 
         // CROSS-LANE ASYMMETRY CLOSED: HeaderChain::is_synced() was DEFINED
         // AND NEVER CALLED on the DASH path (bch 13 callers, ltc 12, nmc 12,
@@ -5880,7 +6286,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             web_server->get_mining_interface()->set_coin_sync_status_fn(
                 [hc = header_chain.get(), cp = coin_p2p.get(),
                  lanes = dml_lanes, &utxo_lane, &utxo_full_refusal,
-                 &utxo_import_seconds]() -> nlohmann::json {
+                 &utxo_import_seconds, &v24_status, &ehf_tracker, &cp_lane,
+                 &node_coin_state]() -> nlohmann::json {
                     nlohmann::json s = nlohmann::json::object();
                     const uint32_t hh = hc ? hc->height() : 0;
                     uint32_t th = cp ? cp->best_peer_height() : 0;
@@ -5941,6 +6348,48 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     // S2: the UTXO set (full / accrual), passed through as-is.
                     s["utxo"] = dash::coin::utxo_status_json(utxo_lane, utxo_full_refusal,
                                                              utxo_import_seconds);
+                    // Dash Core v24 deployment: the state of the next block, how
+                    // it is decided, EHF coverage, and the cross-check latch
+                    // (a non-"none" latch means the chain refuted our state).
+                    if (v24_status && hc) {
+                        const uint32_t next = hc->height() + 1;
+                        const auto r = v24_status->resolve(next, dash::coin::DashDeployment::V24);
+                        const auto l = v24_status->latch();
+                        s["v24"] = {
+                            {"next_height", next},
+                            {"state", dash::coin::v24_state_name(r.active)},
+                            {"basis", r.basis},
+                            {"ehf_scanned_to", ehf_tracker ? ehf_tracker->verified_coverage() : -1},
+                            {"cross_check_latch", l == dash::coin::V24Latch::NONE    ? "none"
+                                                  : l == dash::coin::V24Latch::EXACT ? "exact-refuted"
+                                                                                     : "bound-refuted"},
+                            {"pin_refuted", v24_status->pin_refuted()},
+                            {"contradictions", v24_status->contradictions()},
+                            // Heights the embedded arm declined because the
+                            // scheduled payee is paid through a v24 payout
+                            // list (cause mn-payee-v24-payout-list; S4).
+                            {"payee_payout_list_declines", node_coin_state.v24_payout_list_declines()},
+                            {"payee_payout_list_last_height", node_coin_state.v24_payout_list_last_height()},
+                        };
+                    }
+                    // Credit-pool follower: the balance history and the limit
+                    // the next block's unlocks are held to.
+                    if (cp_lane) {
+                        const auto c = cp_lane->status();
+                        nlohmann::json j = {
+                            {"seed", c.mode == dash::coin::CreditPoolLane::SeedMode::FULL ? "full" : "window"},
+                            {"full_history", c.full_history},
+                            {"armed", c.armed}, {"proven_complete", c.proven_complete},
+                            {"floor", c.floor}, {"height", c.height},
+                            {"balance", c.balance}, {"lately_unlocked", c.lately_unlocked},
+                            {"applied", c.applied}, {"rejected_bodies", c.rejected_bodies},
+                            {"rewinds", c.rewinds}, {"failures", c.failures},
+                            {"fail_cause", c.fail_cause}, {"in_flight", c.in_flight},
+                        };
+                        if (c.limit) j["limit_next_block"] = *c.limit;
+                        if (c.window_start_balance) j["window_start_balance"] = *c.window_start_balance;
+                        s["credit_pool"] = j;
+                    }
                     return s;
                 });
         }
@@ -6372,12 +6821,34 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                         return dash::coin::superblock_budget(
                             h, static_cast<int>(budget_cycle));
                     });
-                node_coin_state.set_superblock_provider(
-                    [maint = maintainer.get()](uint32_t next_height)
-                        -> std::optional<std::vector<dash::coin::SuperblockPayment>> {
-                        return maint->superblock_schedule(next_height);
+                // Tri-state verdict (Triggered / NotTriggered / Unknown + the
+                // gate that refused): a PROVEN-unfunded superblock height
+                // serves a normal coinbase; anything unprovable refuses with
+                // a distinct reason in the decline value.
+                node_coin_state.set_superblock_resolver(
+                    [maint = maintainer.get()](uint32_t next_height) {
+                        return maint->superblock_resolution(next_height);
                     });
                 node_coin_state.set_require_superblock_provider(embedded_superblock);
+                // C4: chainparams nSuperblockMaturityWindow (Dash Core v24
+                // chainparams.cpp: mainnet 1662, testnet 8) — the per-trigger
+                // vote re-sync fires at tip H - window, H - late lead and
+                // H - 2 (after the deferred 24.0.1 NO votes; never H - 1).
+                maintainer->set_superblock_maturity_window(
+                    testnet ? dash::coin::DASH_SUPERBLOCK_MATURITY_WINDOW_TESTNET
+                            : dash::coin::DASH_SUPERBLOCK_MATURITY_WINDOW_MAINNET);
+                // MAINNET GATE: NotTriggered is served on testnet; on mainnet
+                // only with the explicit opt-in flag (default OFF => Unknown
+                // "not-triggered-disabled" => refuse, master's behaviour).
+                maintainer->set_not_triggered_enabled(testnet || embedded_superblock_unfunded_mainnet);
+                if (!testnet && embedded_superblock_unfunded_mainnet)
+                    LOG_WARNING << "[E-SUPERBLOCK] --embedded-superblock-unfunded-mainnet SET "
+                                   "(TEST/SOAK ONLY — never on a production mainnet node): "
+                                   "this MAINNET node will serve a superblock height with a "
+                                   "NORMAL coinbase when it PROVES no trigger is funded (R5 "
+                                   "answered coverage from >= "
+                                << dash::coin::DASH_GOVSYNC_MIN_PEERS_DEFAULT
+                                << " peers + strict absence). A wrong proof loses the block.";
                 // R5 GOVSYNC-COMPLETENESS GATE (production wiring). Model:
                 // dashcore CMasternodeSync governance-phase completion — the
                 // view is COMPLETE only when the governance set was requested
@@ -6421,13 +6892,61 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 {
                     auto* ncs = &node_coin_state;
 
+                    // Tri-state signer resolution shared by the vote and the
+                    // C3 trigger-object verifier. "Current" = the DMN view has
+                    // folded the serve tip, so a collateral outpoint it cannot
+                    // resolve is one dashd's TIP list cannot resolve either
+                    // (=> Invalid, dashd parity); on a lagging view, or with
+                    // no BLS backend, nothing is concluded (=> CannotVerify:
+                    // held aside, and the superblock verdict it could affect
+                    // stays Unknown).
+                    using SigCheck = dash::coin::CoinStateMaintainer::GovSigCheck;
+                    auto check_operator_sig =
+                        [ncs](const uint256& op_hash, uint32_t op_index,
+                              const uint256& digest,
+                              const std::vector<uint8_t>& sig) -> SigCheck {
+                        // A BLS signature is 96 bytes; anything else (e.g. the
+                        // 65-byte ECDSA voting-key signature a PROPOSAL funding
+                        // vote carries) can never verify under an operator key
+                        // — dashd's SetBytes rejects it outright.
+                        if (sig.size() != 96) return SigCheck::Invalid;
+                        if (!dash::coin::vendor::bls_backend_available())
+                            return SigCheck::CannotVerify;
+                        const auto& mns = std::as_const(*ncs).mnstates();
+                        const bool current = ncs->prev_height() != 0 &&
+                            mns.last_applied_height() >= ncs->prev_height();
+                        // UNFILTERED (no PoSe-ban check) — dashcore
+                        // CGovernanceVote::IsValid / IsValidLocally resolve
+                        // via GetMNByCollateral, so a banned MN's signature
+                        // still verifies in dashd and must here too.
+                        bitcoin_family::coin::TxPrevOut op;
+                        op.hash  = op_hash;
+                        op.index = op_index;
+                        const dash::coin::MNState* mn =
+                            dash::coin::gov_mn_by_collateral(mns, op);
+                        if (!mn) return current ? SigCheck::Invalid
+                                                : SigCheck::CannotVerify;
+                        // The projection store holds every operator key
+                        // as canonical BASIC bytes (P-3): decode them as
+                        // basic, with no scheme fallback -- read as
+                        // legacy they can decode to -P and accept a
+                        // signature dashd rejects.
+                        if (dash::coin::vendor::verify_govvote_operator_sig(
+                                mn->pubKeyOperator, /*key_legacy_scheme=*/false,
+                                digest, sig, /*pubkey_scheme_fallback=*/false))
+                            return SigCheck::Valid;
+                        // A stale view may hold a pre-ProUpRegTx operator key.
+                        return current ? SigCheck::Invalid : SigCheck::CannotVerify;
+                    };
+
                     // Vote-signature verifier — dashcore CGovernanceVote::
                     // CheckSignature over the MN's OPERATOR key (TRIGGER funding
                     // votes; the ECDSA voting-key path is PROPOSAL-only and NOT
                     // used here). Plus the IsValid time bound (nTime <= now+1h).
-                    maintainer->set_vote_verifier(
-                        [ncs](const dash::coin::CoinStateMaintainer::GovVoteContext& v)
-                            -> bool {
+                    maintainer->set_vote_check(
+                        [check_operator_sig](
+                            const dash::coin::CoinStateMaintainer::GovVoteContext& v)
+                            -> SigCheck {
                             // dashcore IsValid: reject a vote timestamped more
                             // than an hour into the future (clock-skew bound).
                             // KNOWN NIT (documented, not fixed): dashcore uses
@@ -6438,29 +6957,26 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                             // skew of the +1h edge; NTP-disciplined hosts make
                             // it negligible. Revisit if soak shows drift.
                             if (v.time > static_cast<int64_t>(std::time(nullptr)) + 60 * 60)
-                                return false;
-                            // Resolve collateral outpoint -> DMN -> operator
-                            // key. UNFILTERED (no PoSe-ban check) — dashcore
-                            // CGovernanceVote::IsValid resolves via
-                            // GetMNByCollateral, so a banned MN's vote still
-                            // verifies in dashd and must here too (dropping a
-                            // banned MN's NO inflates our yes−no vs dashd).
-                            bitcoin_family::coin::TxPrevOut op;
-                            op.hash  = v.mn_outpoint_hash;
-                            op.index = v.mn_outpoint_index;
-                            const dash::coin::MNState* mn =
-                                dash::coin::gov_mn_by_collateral(
-                                    ncs->mnstates(), op);
-                            if (!mn) return false;           // MN not in DMN list
-                            // The projection store holds every operator key
-                            // as canonical BASIC bytes (P-3): decode them as
-                            // basic, with no scheme fallback -- read as
-                            // legacy they can decode to -P and accept a vote
-                            // signed with -sk that dashd rejects.
-                            return dash::coin::vendor::verify_govvote_operator_sig(
-                                mn->pubKeyOperator, /*key_legacy_scheme=*/false,
-                                v.vote_hash, v.vch_sig,
-                                /*pubkey_scheme_fallback=*/false);
+                                return SigCheck::Invalid;
+                            return check_operator_sig(v.mn_outpoint_hash,
+                                                      v.mn_outpoint_index,
+                                                      v.vote_hash, v.vch_sig);
+                        });
+
+                    // C3 — TRIGGER-object signature (dashcore IsValidLocally,
+                    // Dash Core v24 governance/object.cpp:746-761): the MN named
+                    // by the object's collateral outpoint must be in the tip
+                    // list and the object must verify under its OPERATOR key
+                    // over CGovernanceObject::GetSignatureHash (object.cpp
+                    // 551-575; govobject_signature_hash). Unverified triggers
+                    // are never stored.
+                    maintainer->set_object_verifier(
+                        [check_operator_sig](
+                            const dash::coin::CoinStateMaintainer::GovObjectContext& o)
+                            -> SigCheck {
+                            return check_operator_sig(o.mn_outpoint_hash,
+                                                      o.mn_outpoint_index,
+                                                      o.sig_hash, o.vch_sig);
                         });
 
                     // Vote-weight + membership-at-tally — dashcore
@@ -6473,9 +6989,30 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     // SAME live DMN view.
                     maintainer->gov_store().set_vote_weight_fn(
                         [ncs](const std::string& key) -> int {
+                            // Const view: a read must not bump the D2 root-memo
+                            // epoch (the tally now also runs inside the
+                            // template build via the tri-state resolver).
                             return dash::coin::gov_vote_weight_for_key(
-                                ncs->mnstates(), key);
+                                std::as_const(*ncs).mnstates(), key);
                         });
+
+                    // MED-4 RemoveInvalidVotes parity: a stored vote counts
+                    // only while the voter's CURRENT operator key is the one it
+                    // verified under (a ProUpRegTx key change or removal from
+                    // the list drops it in dashd, governance.cpp:1180-1226).
+                    maintainer->gov_store().set_signer_fp_fn(
+                        [ncs](const std::string& key) -> std::optional<uint256> {
+                            return dash::coin::gov_operator_fp_for_key(
+                                std::as_const(*ncs).mnstates(), key);
+                        });
+
+                    // LOW-6: "the DMN view has folded the serve tip" — held
+                    // startup-window trigger records are re-fetched once true.
+                    maintainer->set_gov_view_current_fn([ncs]() {
+                        const auto& mns = std::as_const(*ncs).mnstates();
+                        return ncs->prev_height() != 0 &&
+                               mns.last_applied_height() >= ncs->prev_height();
+                    });
                 }
 
                 // Reconciled log (R5 completeness gate + R3 vote-verify both wired).
@@ -6491,10 +7028,12 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                              << (dash::coin::vendor::bls_backend_available()
                                      ? "BLS backend ON"
                                      : "BLS backend ABSENT => votes never verify")
-                             << "). Serve stays CLOSED until the completeness "
-                                "predicate proves complete (single peer / empty store "
-                                "=> FALSE) and a funded soak clears -- R3 vote-verify "
-                                "landing here cannot by itself open it.";
+                             << "). Tri-state verdict: Triggered pays the exact "
+                                "trigger, NotTriggered (normal coinbase) only when PROVEN "
+                                "(R5 complete + no stored/held/orphan-voted trigger at H "
+                                "+ C3 trigger signatures verified), anything else refuses "
+                                "with a named reason. A single peer can never prove "
+                                "completeness (R5 floor is not lowered).";
             }
         }
 
@@ -7433,6 +7972,68 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 });
         }
 
+        // N2: a BLS-VERIFIED islock whose outpoint the SERVED template spends
+        // under another txid. Dash Core rejects a block carrying that tx unless
+        // the block is already ChainLocked (v24.0.2 validation.cpp:2811-2829,
+        // conflict-tx-lock), so the job miners hold can no longer win a block.
+        // Mempool eviction and the G4 selection guard only shape the NEXT
+        // template; drop the cached one and push clean work now (clean_jobs:
+        // the old work cannot produce a valid block, so rigs should discard
+        // what they have queued). Verified lane only — a forged lock on the
+        // unverified relay lane must not be able to force clean notifies — and
+        // coalesced to one refresh per second with one trailing refresh.
+        {
+            std::weak_ptr<dash::stratum::DASHWorkSource> ws_islock = work_source;
+            auto coalescer = std::make_shared<dash::coin::IslockRefreshCoalescer>(
+                std::chrono::seconds(1));
+            auto trailing = std::make_shared<io::steady_timer>(ioc);
+            auto fire = [ws_islock, &stratum_server]() {
+                if (auto ws = ws_islock.lock())
+                    ws->invalidate_template_cache("verified islock conflicts with the served template");
+                if (stratum_server) stratum_server->notify_all();
+            };
+            maintainer->set_on_verified_islock(
+                [ws_islock, coalescer, trailing, fire](
+                    const uint256& locked_txid,
+                    const std::vector<std::pair<uint256, uint32_t>>& inputs) {
+                    auto ws = ws_islock.lock();
+                    if (!ws) return;
+                    const auto c = ws->served_template_islock_conflict(locked_txid, inputs);
+                    if (!c) return;
+                    const auto d = coalescer->on_trigger(std::chrono::steady_clock::now());
+                    LOG_WARNING << "[ISLOCK-CONFLICT] served template carries tx "
+                                << c->txid.GetHex().substr(0, 16)
+                                << " spending " << c->outpoint.first.GetHex().substr(0, 16)
+                                << ":" << c->outpoint.second
+                                << ", now locked by a VERIFIED islock to "
+                                << locked_txid.GetHex().substr(0, 16)
+                                << " (a block on this job would be conflict-tx-lock) -- "
+                                << (d.act == dash::coin::IslockRefreshCoalescer::Act::FireNow
+                                        ? "forcing a clean work refresh"
+                                        : d.act == dash::coin::IslockRefreshCoalescer::Act::ScheduleTrailing
+                                              ? "clean work refresh scheduled (coalesced)"
+                                              : "clean work refresh already scheduled");
+                    switch (d.act) {
+                    case dash::coin::IslockRefreshCoalescer::Act::FireNow:
+                        fire();
+                        break;
+                    case dash::coin::IslockRefreshCoalescer::Act::ScheduleTrailing:
+                        trailing->expires_after(d.delay);
+                        trailing->async_wait(
+                            [coalescer, fire](const boost::system::error_code& ec) {
+                                // Clear the pending flag either way: a cancelled
+                                // wait must not leave the coalescer stuck.
+                                coalescer->on_trailing_fired(std::chrono::steady_clock::now());
+                                if (ec) return;   // cancelled (shutdown)
+                                fire();
+                            });
+                        break;
+                    case dash::coin::IslockRefreshCoalescer::Act::AlreadyPending:
+                        break;
+                    }
+                });
+        }
+
         // review PR #780 H-1 heal: on a malformed quorum tail the maintainer
         // wipes the base-relative SML/quorum state and asks for a FULL re-sync.
         // Reset the sml_base request tracker to ZERO and re-request a full
@@ -7548,28 +8149,46 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 auto tip = hc->tip();
                 if (!tip || cyc->height > tip->height) return false;
 
-                // Collect the active ROTATED type-5 quorums, each with the
+                // Collect the ROTATED type-5 quorums of a set, each with the
                 // height of its base block (rotated invariant: baseHeight ==
                 // cycleHeight + quorumIndex; islock_verify.hpp filters on it).
-                std::vector<dash::coin::islock::RotatedQuorumCandidate> cands;
-                for (const auto& e : st->qmgr().active_entries()) {
-                    if (e.key.llmqType != p->type) continue;
-                    auto hdr = hc->get_header(e.key.quorumHash);
-                    if (!hdr) continue;          // base header not held => skip
-                    dash::coin::islock::RotatedQuorumCandidate c;
-                    c.quorum_hash       = e.key.quorumHash;
-                    c.base_height       = hdr->height;
-                    c.quorum_index      = static_cast<uint16_t>(
-                        e.commitment.quorumIndex < 0 ? 0xffff
-                                                     : e.commitment.quorumIndex);
-                    c.quorum_public_key = e.commitment.quorumPublicKey;
-                    cands.push_back(c);
+                auto collect = [&](const auto& entries) {
+                    std::vector<dash::coin::islock::RotatedQuorumCandidate> cands;
+                    for (const auto& e : entries) {
+                        if (e.key.llmqType != p->type) continue;
+                        auto hdr = hc->get_header(e.key.quorumHash);
+                        if (!hdr) continue;      // base header not held => skip
+                        dash::coin::islock::RotatedQuorumCandidate c;
+                        c.quorum_hash       = e.key.quorumHash;
+                        c.base_height       = hdr->height;
+                        c.quorum_index      = static_cast<uint16_t>(
+                            e.commitment.quorumIndex < 0 ? 0xffff
+                                                         : e.commitment.quorumIndex);
+                        c.quorum_public_key = e.commitment.quorumPublicKey;
+                        cands.push_back(c);
+                    }
+                    return cands;
+                };
+                // The active rotated quorums, then (only if that fails) the
+                // recently retired ones: a lock names its signing quorum's own
+                // cycle, and for a few blocks after a rotation the network
+                // still signs with the previous cycle, which Dash Core accepts
+                // (net_instantsend.cpp:136-145) but our active set has dropped.
+                const auto pass = dash::coin::islock::verify_islock_two_pass(
+                    *p, collect(st->qmgr().active_entries()),
+                    [&] { return collect(st->qmgr().retired_entries()); }, tip->height,
+                    cyc->height, inputs, txid,
+                    [&sig](const auto& pubkey, const uint256& sign_hash) {
+                        return dash::coin::vendor::verify_chainlock_sig(pubkey, sign_hash, sig);
+                    });
+                if (pass == dash::coin::islock::IslockVerifyPass::Previous) {
+                    static std::atomic<uint64_t> previous_cycle_passes{0};
+                    const uint64_t n = ++previous_cycle_passes;
+                    if (n == 1 || n % 100 == 0)
+                        LOG_INFO << "[ISLOCK] verified against a RETAINED (recently"
+                                    " rotated-out) quorum: " << n << " so far";
                 }
-                auto target = dash::coin::islock::build_islock_sign_target(
-                    *p, cands, cyc->height, inputs, txid);
-                if (!target) return false;       // no quorum selectable => fail closed
-                return dash::coin::vendor::verify_chainlock_sig(
-                    target->quorum.quorum_public_key, target->sign_hash, sig);
+                return pass != dash::coin::islock::IslockVerifyPass::None;
             });
 
         // W5-B DSTX verifier: BLS-verify the mixing masternode's OPERATOR
@@ -7662,6 +8281,12 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // Node::block_connected, driving leg 3 + the E2b UTXO lane.
         coin_feed_subs.push_back(
             dash::coin::wire_full_block_ingest(coin_state, *header_chain));
+        // #968a: BIP 152 compact blocks need the header chain (the cmpctblock
+        // gate: parent known, PoW, header connected before the body) and the
+        // mempool (short ids, bound above). With both wired, a new tip body is
+        // requested as MSG_CMPCT_BLOCK and up to three peers that served us
+        // tips are asked to push cmpctblock (p2p_client.hpp).
+        cmpct_chain_binding.bind(coin_p2p, *header_chain);
 
         // ── PR-C1 (embedded-fold-live) LIVE tip-tracking wiring ──────────────
         // Armed only when --embedded-fold-live opened + VERIFIED a store above.
@@ -8011,8 +8636,304 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // populated() flips), and (b) #739 idle-notify: bump work-generation +
         // notify sessions on a real tip change so idle miners are not wedged on
         // stale work between job-push timer firings (event-driven notify).
+        // ── Dash Core v24 deployment tracking ─────────────────────────────
+        // The EHF tracker reads every connected body for MNHF (type 7)
+        // signals and persists them (<net>/ehf_signals.v1); a cold start
+        // rescans bodies from the fixed anchor over the coin P2P network
+        // (operator decision O7). The status answers v24_state(height) for
+        // every v24 switch and the block version the template signals with.
+        {
+            const auto v24_net = testnet ? dash::coin::DashNetwork::TESTNET
+                                         : dash::coin::DashNetwork::MAINNET;
+            dash::coin::VbChainFn chain_fn =
+                [hc = header_chain.get()](uint32_t h) -> std::optional<dash::coin::VbBlockInfo> {
+                    auto e = hc->get_header_by_height(h);
+                    if (!e) return std::nullopt;
+                    dash::coin::VbBlockInfo b;
+                    b.nVersion = static_cast<int32_t>(e->header.m_version);
+                    b.nTime    = e->header.m_timestamp;
+                    b.hash     = e->hash;
+                    return b;
+                };
+            ehf_tracker = std::make_shared<dash::coin::EhfSignalTracker>(v24_net, chain_fn);
+            ehf_path = (core::filesystem::config_path() / net_subdir / "ehf_signals.v1").string();
+            const bool ehf_loaded = ehf_tracker->load(ehf_path);
+            v24_status = std::make_shared<dash::coin::DashDeploymentStatus>(
+                v24_net, chain_fn,
+                [hc = header_chain.get()]() -> std::optional<uint32_t> {
+                    if (!hc->tip()) return std::nullopt;
+                    return hc->height();
+                },
+                ehf_tracker);
+            v24_status->set_v24_activation_override(g_v24_activation_pin);
+            // The cross-check latch survives a restart (<net>/v24_latch.v1).
+            const std::string latch_path =
+                (core::filesystem::config_path() / net_subdir / "v24_latch.v1").string();
+            {
+                std::ifstream lf(latch_path);
+                std::stringstream ss;
+                if (lf) ss << lf.rdbuf();
+                if (lf && v24_status->deserialize_latch(ss.str())
+                    && v24_status->latch() != dash::coin::V24Latch::NONE) {
+                    LOG_WARNING << "[DASH-V24] cross-check latch RESTORED from " << latch_path
+                                << ": " << ss.str();
+                    // A latch set by a CbTx version Core rejects clears now
+                    // if that block left our best chain while we were down
+                    // (reorged out, orphaned), and the record with it; one set
+                    // by a valid block waits for a cross-check that agrees.
+                    v24_status->revalidate_latch();
+                    if (v24_status->latch() == dash::coin::V24Latch::NONE) {
+                        const std::string tmp = latch_path + ".tmp";
+                        {
+                            std::ofstream out(tmp, std::ios::trunc);
+                            out << v24_status->serialize_latch();
+                        }
+                        if (std::rename(tmp.c_str(), latch_path.c_str()) != 0)
+                            LOG_WARNING << "[DASH-V24] could not persist " << latch_path;
+                    }
+                }
+            }
+            dash::coin::install_dash_deployment_status(v24_net, v24_status);
+            // The embedded template is decided for the block it builds; an
+            // UNKNOWN state refuses it (cause v24-state-unknown).
+            node_coin_state.set_v24_state_fn(
+                [st = v24_status](uint32_t h) { return st->v24_state(h); });
+            node_coin_state.set_v24_network(v24_net);
+            // The activation height from this tracking, on every network
+            // (testnet's buried 1,578,000 at once; mainnet once the block that
+            // decided LOCKED_IN is settled, most of a window before
+            // activation), into the payee projection here and into each
+            // replay fold where it is built, as the cross-check of each
+            // block's own CbTx statement (v24_activation.hpp). Re-checked on
+            // every ordered block and withdrawn when the tracking disagrees
+            // or its cross-check latch fires (v24_activation_wire.hpp).
+            {
+                dash::coin::V24TrackingView view;
+                view.activation_height = [st = v24_status]() {
+                    return st->activation_height(dash::coin::DashDeployment::V24);
+                };
+                view.state = [st = v24_status](uint32_t h) { return st->v24_state(h); };
+                view.refuted = [st = v24_status]() { return st->latch() != dash::coin::V24Latch::NONE; };
+                view.tip = [hc = header_chain.get()]() -> std::optional<uint32_t> {
+                    if (!hc || hc->height() == 0) return std::nullopt;
+                    return hc->height();
+                };
+                v24_wire = std::make_shared<dash::coin::V24ActivationWire>(
+                    v24_net, std::move(view),
+                    (core::filesystem::config_path() / net_subdir / "v24_activation.v1").string());
+            }
+            v24_wire->add_sink([&node_coin_state](uint32_t h) { node_coin_state.mnstates().set_v24_height(h); });
+            // The tracking first; the persisted height only where it does not
+            // know yet, re-checked by the next refresh like any pushed height.
+            v24_wire->refresh();
+            v24_wire->load();
+            v24_wire->refresh();
+            // Dash Core's CheckMNHFTx for the type-7 signals our templates
+            // carry (mnhf_check.hpp; selected under
+            // --embedded-include-mn-special-txs): the quorum block on our
+            // chain, the quorum key from the active set, the BLS recovered
+            // signature, and the staged signals from the EHF tracker (exact
+            // only where it covers the parent; elsewhere the signal stays out).
+            {
+                auto alive = std::make_shared<std::atomic<bool>>(true);
+                v24_status_uninstall.chain_alive = alive;
+                auto me = dash::coin::make_node_mnhf_check_env(
+                    v24_net, header_chain.get(), std::shared_ptr<const dash::coin::EhfSignalTracker>(ehf_tracker),
+                    std::shared_ptr<const std::atomic<bool>>(alive),
+                    [&node_coin_state](uint8_t type, const uint256& q) -> std::optional<std::array<uint8_t, 48>> {
+                        const auto c = std::as_const(node_coin_state).qmgr().find(type, q);
+                        if (!c) return std::nullopt;
+                        return c->quorumPublicKey;
+                    });
+                node_coin_state.set_mnhf_check_env(std::move(me));
+            }
+            // Testnet min-difficulty rules (Dash Core DarkGravityWave with
+            // fPowAllowMinDifficultyBlocks): bits follow the template's time.
+            if (testnet)
+                node_coin_state.set_bits_at_time_fn(
+                    [hc = header_chain.get()](const uint256& prev, uint32_t t) -> std::optional<uint32_t> {
+                        const uint32_t b = hc->next_work_required_at(prev, t);
+                        if (b == 0) return std::nullopt;
+                        return b;
+                    });
+            const auto scanned = ehf_tracker->scanned_to();
+            std::cout << "[run] Dash Core v24 deployment tracking: EHF anchor h="
+                      << ehf_tracker->anchor() << ", bodies scanned to "
+                      << (scanned ? std::to_string(*scanned) : std::string("none"))
+                      << (ehf_loaded ? " (loaded " + ehf_path + ")" : std::string(" (fresh)"))
+                      << ", signals " << ehf_tracker->signals().size()
+                      << ", activation pin "
+                      << (g_v24_activation_pin ? std::to_string(*g_v24_activation_pin)
+                                               : std::string("none"))
+                      << "\n";
+            v24_status_uninstall.status = v24_status;
+            // Live feed: bound bodies from the ordered stream (subscribed as
+            // its first sink, above). Each one also states the switch: Dash
+            // Core v24 requires CbTx version 4 exactly when v24 is active, so
+            // the status cross-checks every block of our chain and latches
+            // fail closed on a contradiction (design §3.1 item 8; the version
+            // word is read directly, no CbTx codec needed).
+            ehf_ordered_sink =
+                [t = ehf_tracker, st = v24_status, path = ehf_path, &cp_lane, latch_path,
+                 latch_seen = std::make_shared<uint64_t>(v24_status->latch_version()),
+                 wire = v24_wire](
+                    const dash::interfaces::BlockConnected& bc) {
+                    auto packed = ::pack(static_cast<const dash::coin::BlockHeaderType&>(bc.block));
+                    const uint256 h = dash::crypto::hash_x11(packed.get_span());
+                    // The credit-pool follower takes the same bound, ordered
+                    // body (it ignores heights it cannot apply contiguously).
+                    if (cp_lane) cp_lane->on_ordered_block(bc.height, h, bc.block);
+                    const size_t before = t->signals().size();
+                    t->connect_block(bc.block, bc.height, h);
+                    if (!bc.block.m_txs.empty() && bc.block.m_txs[0].type == 5
+                        && bc.block.m_txs[0].extra_payload.size() >= 2) {
+                        const auto& pl = bc.block.m_txs[0].extra_payload;
+                        const uint16_t cbv = static_cast<uint16_t>(pl[0] | (pl[1] << 8));
+                        st->cross_check_cbtx_version(bc.height, h, cbv);
+                        // Persist a latch change (set, escalate, clear).
+                        const uint64_t lv = st->latch_version();
+                        if (lv != *latch_seen) {
+                            const std::string tmp = latch_path + ".tmp";
+                            {
+                                std::ofstream lf(tmp, std::ios::trunc);
+                                lf << st->serialize_latch();
+                            }
+                            if (std::rename(tmp.c_str(), latch_path.c_str()) == 0) *latch_seen = lv;
+                            else LOG_WARNING << "[DASH-V24] could not persist " << latch_path;
+                        }
+                    }
+                    if (t->signals().size() != before)
+                        LOG_INFO << "[DASH-V24] MNHF signal mined at h=" << bc.height
+                                 << " " << h.GetHex().substr(0, 16)
+                                 << " (EHF stage: " << t->signals().size() << " signal(s))";
+                    if (t->dirty() && !t->save(path))
+                        LOG_WARNING << "[DASH-V24] could not persist " << path;
+                    // The activation height, once known, reaches the folds
+                    // before the maintainer folds this block (this is the
+                    // ordered stream's first sink).
+                    if (wire) wire->refresh();
+                };
+            // Cold-start rescan: fetch [next needed, live floor - 1]. The live
+            // floor is the payee cursor + 1 (the tip-follow path fetches from
+            // there); unseeded, the header tip - 6.
+            ehf_rescan = std::make_unique<dash::coin::EhfRescanLane>(
+                ehf_tracker, chain_fn,
+                [m = maintainer.get(), hc = header_chain.get()]() -> std::optional<uint32_t> {
+                    const uint32_t cursor = m ? m->payee_fold_cursor() : 0;
+                    if (cursor > 0) return cursor + 1;
+                    if (!hc->tip() || hc->height() < 6) return std::nullopt;
+                    return hc->height() - 6;
+                },
+                [cp = coin_p2p.get(), rr = std::make_shared<size_t>(0)](
+                    const std::vector<uint256>& hashes) {
+                    auto keys = cp->eligible_bulk_peer_keys();
+                    if (keys.empty()) {
+                        const std::string pk = cp->primary_peer_key();
+                        if (pk.empty()) return false;
+                        keys.push_back(pk);
+                    }
+                    return cp->request_blocks_from(keys[(*rr)++ % keys.size()], hashes);
+                });
+            // Credit-pool follower (#143 / Dash Core v24). Armed with the
+            // type-9 accrual lever; it seeds only with
+            // --embedded-credit-pool-seed (the whole chain since v20).
+            if (embedded_accrue_asset_unlocks) {
+                const auto sched = testnet ? dash::coin::kCpIdxScheduleTestnet
+                                           : dash::coin::kCpIdxScheduleMainnet;
+                dash::coin::CreditPoolLane::Seams cs;
+                cs.hash_at = [hc = header_chain.get()](uint32_t h) -> std::optional<uint256> {
+                    auto e = hc->get_header_by_height(h);
+                    if (!e) return std::nullopt;
+                    return e->hash;
+                };
+                cs.tip = [hc = header_chain.get()]() -> std::optional<uint32_t> {
+                    if (!hc->tip()) return std::nullopt;
+                    return hc->height();
+                };
+                cs.live_floor = [m = maintainer.get(), hc = header_chain.get()]() -> std::optional<uint32_t> {
+                    const uint32_t cursor = m ? m->payee_fold_cursor() : 0;
+                    if (cursor > 0) return cursor + 1;
+                    if (!hc->tip() || hc->height() < 6) return std::nullopt;
+                    return hc->height() - 6;
+                };
+                cs.request = [cp = coin_p2p.get(), rr = std::make_shared<size_t>(0)](
+                    const std::vector<uint256>& hashes) {
+                    auto keys = cp->eligible_bulk_peer_keys();
+                    if (keys.empty()) {
+                        const std::string pk = cp->primary_peer_key();
+                        if (pk.empty()) return false;
+                        keys.push_back(pk);
+                    }
+                    return cp->request_blocks_from(keys[(*rr)++ % keys.size()], hashes);
+                };
+                using CpMode = dash::coin::CreditPoolLane::SeedMode;
+                cp_lane = std::make_unique<dash::coin::CreditPoolLane>(
+                    sched, testnet ? dash::coin::DASH_MN_RR_HEIGHT_TESTNET
+                                   : dash::coin::DASH_MN_RR_HEIGHT_MAINNET,
+                    std::move(cs), g_credit_pool_seed ? CpMode::FULL : CpMode::WINDOW);
+                if (g_credit_pool_seed) {
+                    cp_db = std::make_unique<dash::coin::CreditPoolIdxDb>(
+                        (core::filesystem::config_path() / net_subdir / "credit_pool_idx").string());
+                    if (!cp_db->open()) {
+                        LOG_WARNING << "[CP-LANE] could not open the credit-pool store; the"
+                                       " follower runs in memory only";
+                        cp_db.reset();
+                    }
+                }
+                cp_lane->start(cp_db.get());
+                const auto cps = cp_lane->status();
+                std::cout << "[run] credit-pool follower (Dash Core v24 UnlockLimitV24, unlock"
+                             " admission): floor h=" << cps.floor
+                          << (cps.armed ? ", resumed at h=" + std::to_string(cps.height)
+                                        : std::string(", arms at the floor"))
+                          << (g_credit_pool_seed
+                                  ? ", FULL seed from the v20 floor (admits unlocks once complete)"
+                                  : ", WINDOW seed (~584 blocks: balance history and limit; every"
+                                    " unlock stays excluded -- --embedded-credit-pool-seed admits them)")
+                          << "\n";
+                // Template admission: platform-quorum candidates from the
+                // active quorum set, base heights from the header chain.
+                node_coin_state.set_asset_unlock_admit_fn(
+                    [ln = cp_lane.get(), hc = header_chain.get(), testnet](
+                        uint32_t height, const uint256& prev_hash,
+                        const std::vector<dash::coin::MutableTransaction>& cands,
+                        const dash::coin::QuorumManager& qmgr)
+                        -> std::shared_ptr<const dash::coin::AssetUnlockAdmission> {
+                        const auto* p = dash::coin::unlockverify::platform_llmq_params(
+                            testnet ? dash::coin::LlmqNetwork::Testnet
+                                    : dash::coin::LlmqNetwork::Mainnet);
+                        if (p == nullptr) return nullptr;
+                        std::vector<dash::coin::chainlock::QuorumCandidate> quorums;
+                        for (const auto& e : qmgr.active_entries()) {
+                            if (e.key.llmqType != p->type) continue;
+                            auto hdr = hc->get_header(e.key.quorumHash);
+                            if (!hdr) continue;
+                            dash::coin::chainlock::QuorumCandidate c;
+                            c.quorum_hash       = e.key.quorumHash;
+                            c.base_height       = hdr->height;
+                            c.quorum_public_key = e.commitment.quorumPublicKey;
+                            quorums.push_back(c);
+                        }
+                        auto adm = ln->admit(true, height, prev_hash, cands, quorums, *p);
+                        if (!adm) return nullptr;
+                        return std::make_shared<const dash::coin::AssetUnlockAdmission>(std::move(*adm));
+                    });
+            }
+            coin_p2p->set_block_body_filter(
+                [lane = ehf_rescan.get(), cpl = cp_lane.get()](
+                    const uint256& h, const dash::coin::BlockType& blk) {
+                    // Each lane claims only the bodies it asked for; both may.
+                    const bool a = lane->on_body(h, blk);
+                    const bool b = cpl && cpl->on_body(h, blk);
+                    return a || b;
+                });
+        }
+
         header_chain->set_on_tip_changed(
             [&coin_state, &stratum_server, hc = header_chain.get(),
+             // Dash Core v24: block version (ComputeBlockVersion) of the next
+             // block -- bit 13 / 14 while a deployment is STARTED or LOCKED_IN.
+             v24s = v24_status,
              addr_ver, p2sh_ver, ws = work_source.get(),
              cp = coin_p2p.get(), sml_base, m = maintainer.get(),
              mnl = mn_ckpt_lane.get(), qcms = qc_ms_prefetch_handle,
@@ -8058,6 +8979,9 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 if (qcms) qcms->prefetch_cycle(new_height);
                 auto ta = dash::coin::tip_advance_from_chain(
                     *hc, addr_ver, p2sh_ver);
+                // Signalling only where the deployment state is known exactly;
+                // 0x20000000 otherwise (the template default, unchanged).
+                if (ta && v24s) ta->version = v24s->block_version(ta->prev_height + 1);
                 if (ta) {
                     coin_state.new_tip.happened(*ta);
                     LOG_INFO << "[EMB-DASH] tip advanced h=" << new_height
@@ -8314,6 +9238,36 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             [maint = maintainer.get()](const std::string& pk) {
                 maint->note_govsync_requested(pk);
             });
+
+        // E-SUPERBLOCK C4: the maintainer re-requests each held trigger's
+        // votes at tip H - maturity window, H - late lead and H - 2
+        // (per-object govsync with a non-empty filter — never the nProp=0
+        // full sync) and fetches the parent object of any orphan FUNDING YES
+        // vote. The client enforces
+        // the once-per-(peer, object) window dashd v24 tracks as a fulfilled
+        // request (repeat => Misbehaving(20)): nFulfilledRequestExpireTime is
+        // 3600 s on mainnet and 300 s on testnet (chainparams.cpp), + margin.
+        coin_p2p->set_govsync_votes_resync_secs(testnet ? 360 : 3660);
+        // R5 coverage = ANSWERED peers only (ssc(GOVOBJ) + every announced
+        // object received), never "requested".
+        coin_p2p->set_on_govsync_coverage(
+            [maint = maintainer.get()](const std::string& pk, bool covered) {
+                if (covered) maint->note_govsync_answered(pk);
+                else         maint->note_govsync_unanswered(pk);
+            });
+        if (embedded_govsync || embedded_superblock) {
+            // Leg B fresh nProp=0 re-prime inside the maturity window (the
+            // client keeps it to at most once per hour per peer).
+            maintainer->set_on_gov_reprime(
+                [cp = coin_p2p.get(), maint = maintainer.get()]() {
+                    for (const auto& pk : cp->send_govsync_prime())
+                        maint->note_govsync_requested(pk);
+                });
+            maintainer->set_on_trigger_vote_resync(
+                [cp = coin_p2p.get()](const uint256& h) { cp->send_govsync(h); });
+            maintainer->set_on_gov_object_fetch(
+                [cp = coin_p2p.get()](const uint256& h) { cp->send_govobject_fetch(h); });
+        }
 
         // Kick the initial sync once the version/verack handshake completes:
         // getheaders off our current locator + a mempool prime.
@@ -9087,8 +10041,20 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     // through unchanged (reward-safe: a wrong seed can never mint).
                     dash::coin::replay::FoldConfig fcfg;
                     fcfg.enabled = true;
+                    if (dash::SharechainConfig::is_testnet)   // testnet heights incl. Dash Core v24 (1,578,000)
+                        fcfg.gates = rp::FoldGates::testnet();
+                    else
+                        fcfg.gates.v24_earliest =
+                            dash::coin::v24_earliest_unmeasured_activation(dash::coin::DashNetwork::MAINNET);
+                    fcfg.gates.v20_height = dash::coin::dash_deployment_params(
+                        dash::SharechainConfig::is_testnet ? dash::coin::DashNetwork::TESTNET
+                                                           : dash::coin::DashNetwork::MAINNET).v20_height;
                     mn_bridge_fold_engine =
                         std::make_unique<rp::DmlFoldEngine>(fcfg);
+                    if (v24_wire)
+                        v24_wire->add_sink([&mn_bridge_fold_engine](uint32_t h) {
+                            if (mn_bridge_fold_engine) mn_bridge_fold_engine->set_v24_height(h);
+                        });
                     mn_diff_writer = std::make_unique<rp::MnDiffWriter>(
                         *mn_diff_store, *mn_bridge_fold_engine);
 
@@ -9263,6 +10229,9 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                                     st.keyIDVoting      = e.keyIDVoting;
                                     st.netInfo.ip       = e.netAddress;
                                     st.netInfo.port_be  = e.netPort;
+                                    // Dash Core v24: a v3 leaf carries ExtNetInfo
+                                    // (also root-committing).
+                                    st.v24.extNetInfo   = e.extNetInfo;
                                     st.platformHTTPPort = e.platformHTTPPort;
                                     st.platformNodeID   = e.platformNodeID;
                                     if (!e.confirmedHash.IsNull())
@@ -9286,6 +10255,12 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                                         st.scriptPayout         = mn.scriptPayout;
                                         st.scriptOperatorPayout = mn.scriptOperatorPayout;
                                         st.platformP2PPort      = mn.platformP2PPort;
+                                        // Dash Core v24 payout list / share table /
+                                        // early-exit terms (checkpoint /2).
+                                        st.v24.payouts            = mn.v24.payouts;
+                                        st.v24.shares             = mn.v24.shares;
+                                        st.v24.nEarlyPeriodBlocks = mn.v24.nEarlyPeriodBlocks;
+                                        st.v24.nEarlyPenalty      = mn.v24.nEarlyPenalty;
                                         ++with_facets;
                                     } else {
                                         ++without_facets;
@@ -9612,8 +10587,20 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 }
                 dash::coin::replay::FoldConfig fcfg;
                 fcfg.enabled = true;   // W1 feature flag, explicit opt-in
+                if (dash::SharechainConfig::is_testnet)   // testnet heights incl. Dash Core v24 (1,578,000)
+                    fcfg.gates = dash::coin::replay::FoldGates::testnet();
+                else
+                    fcfg.gates.v24_earliest =
+                        dash::coin::v24_earliest_unmeasured_activation(dash::coin::DashNetwork::MAINNET);
+                fcfg.gates.v20_height = dash::coin::dash_deployment_params(
+                    dash::SharechainConfig::is_testnet ? dash::coin::DashNetwork::TESTNET
+                                                       : dash::coin::DashNetwork::MAINNET).v20_height;
                 replay_fold_engine =
                     std::make_unique<rp::DmlFoldEngine>(fcfg);
+                if (v24_wire)
+                    v24_wire->add_sink([&replay_fold_engine](uint32_t h) {
+                        if (replay_fold_engine) replay_fold_engine->set_v24_height(h);
+                    });
                 const std::string serr =
                     rp::seed_engine_from_prestate(*replay_fold_engine, ps);
                 if (!serr.empty()) {
@@ -10326,9 +11313,14 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     return ln->on_headers(key, b);
                 });
             coin_p2p->set_block_body_filter(
-                [ln = replay_lane.get()](const uint256& h,
-                                         const dash::coin::BlockType& blk) {
-                    return ln->on_block_body(h, blk);
+                [ln = replay_lane.get(), ehf = ehf_rescan.get(), cpl = cp_lane.get()](
+                    const uint256& h, const dash::coin::BlockType& blk) {
+                    // The EHF rescan and the credit-pool seed only claim
+                    // bodies they asked for.
+                    if (ln->on_block_body(h, blk)) return true;
+                    const bool a = ehf && ehf->on_body(h, blk);
+                    const bool b = cpl && cpl->on_body(h, blk);
+                    return a || b;
                 });
             coin_p2p->set_on_block_notfound(
                 [ln = replay_lane.get()](const uint256& h) {
@@ -10914,10 +11906,12 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 // a row pending forever. Fall through to the header chain.
                 uint32_t found_height = 0;
                 bool have_height = false;
+                int64_t found_ts = 0;
                 for (const auto& b : mi->get_found_blocks()) {
                     if (b.hash == hash_hex) {
                         found_height = static_cast<uint32_t>(b.height);
                         have_height = found_height != 0;
+                        found_ts = static_cast<int64_t>(b.ts);
                         break;
                     }
                 }
@@ -10940,8 +11934,19 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                         return dash::coin::block_confirm::resolve_status(
                             winner_at, hc->height(), h, found_height);
                     }
-                    // header chain present but height unknown → still pending
-                    return 0;
+                    // Height unknown AND the header chain does not hold the
+                    // hash (not even on a side branch). If the chain spans the
+                    // found time with a margin on both sides, a block that had
+                    // been on the best chain in that window would be indexed:
+                    // orphaned. Otherwise pending (chain rooted later / not
+                    // far enough yet). Used to stay pending forever.
+                    return dash::coin::block_confirm::resolve_unknown_height(
+                        [hc](uint32_t hh) -> std::optional<int64_t> {
+                            if (auto e = hc->get_header_by_height(hh))
+                                return static_cast<int64_t>(e->header.m_timestamp);
+                            return std::nullopt;
+                        },
+                        hc->height(), found_ts);
                 }
 
                 // Fallback arm (no embedded chain): dashd getblockheader.
@@ -10997,13 +12002,16 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             // the work source read the job's own height) takes its height from
             // the header chain when the chain holds that header; the re-verify
             // pass below then resolves it at that height.
-            cache_mi->backfill_found_block_heights(
-                [hc](const std::string& block_hash_hex) -> uint64_t {
-                    uint256 h;
-                    h.SetHex(block_hash_hex);
-                    auto e = hc->get_header(h);
-                    return e ? static_cast<uint64_t>(e->height) : 0;
-                });
+            auto height_lookup = [hc](const std::string& block_hash_hex) -> uint64_t {
+                uint256 h;
+                h.SetHex(block_hash_hex);
+                auto e = hc->get_header(h);
+                return e ? static_cast<uint64_t>(e->height) : 0;
+            };
+            cache_mi->backfill_found_block_heights(height_lookup);
+            // Kept for a row recorded at height 0 after this backfill: it
+            // learns its height when its block confirms.
+            cache_mi->set_block_height_lookup(height_lookup);
             // Retain the same lookups so the record + confirm paths can fill a
             // missing network_difficulty for blocks won AFTER this backfill runs
             // (sharechain-replay / relay wins recorded seconds into boot), whose
@@ -11077,7 +12085,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         *diag_tick = [diag_timer, diag_tick, ticks, diag_mi, embed_shape,
                       embed_since, embed_last, &node_coin_state, &maintainer,
                       dml_lanes, &utxo_lane,
-                      &header_chain, &mn_ckpt_lane,
+                      &header_chain, &mn_ckpt_lane, &coin_p2p,
                       ws_ri = work_source.get(), &stratum_server](
                          const boost::system::error_code& ec) {
             if (ec) return;   // cancelled at shutdown
@@ -11209,8 +12217,46 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                         << (maintainer
                                 ? (maintainer->gov_sync_complete() ? 1 : 0)
                                 : 0)
+                        // Governance stream volume (R5 quiescence inputs) and
+                        // the C2/C3 held-aside state: objects/votes received,
+                        // triggers rejected for a bad masternode signature,
+                        // records blocking a verdict (unparsed / pending /
+                        // store-full / orphan-YES parents), signatures not yet
+                        // checkable, orphan votes buffered.
+                        << " gov_objects="
+                        << (maintainer ? maintainer->gov_sync_status().object_count() : 0)
+                        << " gov_votes="
+                        << (maintainer ? maintainer->gov_sync_status().vote_count() : 0)
+                        << " gov_trig_rejected="
+                        << (maintainer ? maintainer->gov_triggers_rejected() : 0)
+                        << " gov_outstanding="
+                        << (maintainer ? maintainer->gov_store().outstanding_count() : 0)
+                        << " gov_pending="
+                        << (maintainer ? maintainer->gov_pending_objects() : 0)
+                        << " gov_unverif_votes="
+                        << (maintainer ? maintainer->gov_unverifiable_votes() : 0)
+                        << " gov_orphan_votes="
+                        << (maintainer ? maintainer->gov_orphan_votes() : 0)
+                        << " gov_latch="
+                        << (maintainer ? (maintainer->gov_desync_latched() ? 1 : 0) : 0)
                         << " trigger=" << (changed ? "shape-change" : "heartbeat")
                         << " suppressed=" << *embed_since;
+                    // Governance ingest companion line (same cadence): what
+                    // the peers announced and what we pulled, plus the
+                    // superblock verdict reason for the next height when it is
+                    // a superblock height (grep-provable on the soak).
+                    if (coin_p2p)
+                        LOG_INFO << coin_p2p->gov_ingest_status()
+                                 << " vote_resync_skipped="
+                                 << coin_p2p->govsync_votes_skipped()
+                                 << " not_triggered_served_h="
+                                 << (maintainer
+                                         ? maintainer->gov_not_triggered_served_height()
+                                         : 0u)
+                                 << " latch_reason="
+                                 << (maintainer && maintainer->gov_desync_latched()
+                                         ? maintainer->gov_desync_reason()
+                                         : std::string("none"));
                     *embed_shape = shape.str();
                     *embed_last  = now;
                     *embed_since = 0;
@@ -11255,13 +12301,26 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     auto mn_service_tick =
         std::make_shared<std::function<void(const boost::system::error_code&)>>();
     *mn_service_tick =
-        [&mn_service_timer, mn_service_tick, &mn_ckpt_lane, &payee_feeder](
+        [&mn_service_timer, mn_service_tick, &mn_ckpt_lane, &payee_feeder,
+         &ehf_rescan, &ehf_tracker, &ehf_path, &cp_lane](
             const boost::system::error_code& ec) {
             if (ec) return;   // cancelled at shutdown
             if (mn_ckpt_lane) mn_ckpt_lane->service_tick();
             // Ordered connect: first asks after the inv grace, re-asks every
             // 10 s, until the payee cursor reaches the header tip.
             payee_feeder.tick();
+            // Dash Core v24: EHF cold-start rescan from the anchor (fetch
+            // only below the live floor), and persist what it found.
+            if (ehf_rescan) {
+                const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+                ehf_rescan->tick(now_ms);
+                // Credit-pool follower: arm, seed below the live floor, and
+                // mark complete at the header tip.
+                if (cp_lane) cp_lane->tick(now_ms);
+            }
+            if (ehf_tracker && ehf_tracker->dirty() && !ehf_tracker->save(ehf_path))
+                LOG_WARNING << "[DASH-V24] could not persist " << ehf_path;
             mn_service_timer.expires_after(std::chrono::seconds(3));
             mn_service_timer.async_wait(*mn_service_tick);
         };
@@ -11530,6 +12589,14 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // run() has returned but web_server/mining-interface teardown is below.
     if (web_server) web_server->get_mining_interface()->save_stat_log();
 
+    // Deferred mint: run() has returned (ioc stopped), so nothing is minted
+    // from the queue any more — a share stored now could never be broadcast.
+    // Count and log what is left; drop the node's drain hook.
+    p2p_node.set_deferred_mint_drain(nullptr);
+    if (const size_t left = deferred_minter->shutdown())
+        LOG_WARNING << "[MINT-DEFER] shutdown: " << left
+                    << " queued solve(s) not minted (counted as 'shutdown')";
+
     // Stop the ZMQ hashblock subscriber (joins its thread) BEFORE the stratum
     // acceptor + work source it refreshes are torn down. Its callback only posts
     // onto the now-stopped ioc, so no refresh can run past here.
@@ -11723,6 +12790,17 @@ int run_mine_block(bool testnet, const std::string& rpc_endpoint,
 
 int main(int argc, char** argv)
 {
+    // One BLS mode per binary (vendor/bls_mode_guard.hpp): a translation unit
+    // compiled without C2POOL_DASH_BLS beside one compiled with it would leave
+    // the linker free to keep a fail-closed stub of the provider-tx checks.
+    if (dash::coin::vendor::bls_mode_mixed()) {
+        std::cerr << "[init] FATAL: this c2pool-dash binary mixes BLS-backend and BLS-stub translation units"
+                     " (C2POOL_DASH_BLS differs between them); rebuild it from one configuration\n";
+        return 1;
+    }
+    std::cout << "[init] BLS backend: "
+              << ((dash::coin::vendor::bls_modes() & dash::coin::vendor::kBlsModeBackend) ? "dashbls" : "none (stub)")
+              << "\n";
     // Interim hardening fix #4: raise RLIMIT_NOFILE to 65536 at startup
     // (one fd per stratum/miner session + RPC + sharechain P2P; distro-default
     // 1024 starves the accept loop). Report the effective soft limit.
@@ -11836,6 +12914,7 @@ int main(int argc, char** argv)
     bool embedded_superblock = false;
     bool embedded_superblock_off = false;      // --embedded-superblock=false
     bool allow_stub_bls = false;               // --allow-stub-bls (#1671): run a bls=stub build knowingly in a BLS-relying config
+    bool embedded_superblock_unfunded_mainnet = false; // --embedded-superblock-unfunded-mainnet: explicit mainnet NotTriggered opt-in (default OFF)
     bool embedded_govsync = false;             // --embedded-govsync: OBSERVE-ONLY arm of the governance sourcing lane (inv 17/18 pull + store populate); default OFF; does NOT arm serving (that is --embedded-superblock)
     std::string stratum_host = "0.0.0.0";      // --stratum [HOST:]PORT bind interface (default all)
     uint16_t    stratum_port = 0;              // 0 disables the Stratum accept-loop; --stratum sets it
@@ -12105,6 +13184,8 @@ int main(int argc, char** argv)
             allow_stub_bls = true;                  // #1671: run bls=stub knowingly (see the refuse-to-start gate before run_node)
         else if (std::strcmp(argv[i], "--embedded-govsync") == 0)
             embedded_govsync = true;
+        else if (std::strcmp(argv[i], "--embedded-superblock-unfunded-mainnet") == 0)
+            embedded_superblock_unfunded_mainnet = true;
         else if (std::strcmp(argv[i], "--embedded-utxo") == 0)
             embedded_utxo = true;
         else if (std::strcmp(argv[i], "--embedded-utxo=false") == 0)
@@ -12118,6 +13199,12 @@ int main(int argc, char** argv)
             g_utxo_snapshot.full_off = true;        // S2: rollback to the accrual view
         else if (std::strcmp(argv[i], "--utxo-import") == 0 && i + 1 < argc)
             g_utxo_snapshot.import_file = argv[++i];  // S2: offline import, exits
+        else if (std::strcmp(argv[i], "--mempool-entry-probe") == 0)
+            g_mempool_entry_probe = true;
+        else if (std::strcmp(argv[i], "--deferred-mint") == 0)
+            g_deferred_mint = true;
+        else if (std::strcmp(argv[i], "--no-deferred-mint") == 0)
+            g_deferred_mint = false;
         else if (std::strcmp(argv[i], "--explorer") == 0)
             explorer_enabled = true;
         else if (std::strcmp(argv[i], "--no-explorer") == 0)
@@ -12140,6 +13227,8 @@ int main(int argc, char** argv)
             embedded_accrue_asset_unlocks = true; // #143 Variant B (type-9)
         else if (std::strcmp(argv[i], "--embedded-accrue-asset-unlocks=false") == 0)
             embedded_accrue_asset_unlocks_off = true; // good-citizen opt-out
+        else if (std::strcmp(argv[i], "--header-dgw-log-only") == 0)
+            g_header_dgw_log_only = true;   // log a DGW mismatch and accept the header
         else if (std::strcmp(argv[i], "--embedded-include-mn-special-txs") == 0)
             embedded_include_mn_special_txs = true;   // special-tx superset (DIP types 1-4)
         else if (std::strcmp(argv[i], "--embedded-include-mn-special-txs=false") == 0)
@@ -12184,6 +13273,14 @@ int main(int argc, char** argv)
             dash::coin::set_embedded_getmnlistd_tracker_enabled(true);
         else if (std::strcmp(argv[i], "--embedded-getmnlistd-tracker=false") == 0)
             dash::coin::set_embedded_getmnlistd_tracker_enabled(false);
+        // #968a --embedded-compact-blocks[=false] (default ON): ask for a new
+        // tip body as getdata(MSG_CMPCT_BLOCK) and rebuild it from the mempool.
+        // =false is the canary kill switch: every body is fetched whole, any
+        // cmpctblock is dropped. Process-wide flag (compact_negotiation.hpp).
+        else if (std::strcmp(argv[i], "--embedded-compact-blocks") == 0)
+            dash::coin::set_embedded_compact_blocks_enabled(true);
+        else if (std::strcmp(argv[i], "--embedded-compact-blocks=false") == 0)
+            dash::coin::set_embedded_compact_blocks_enabled(false);
         else if (std::strcmp(argv[i], "--embedded-asn-diversity") == 0)
             embedded_asn_diversity = true;   // PR-4: require racing set to span >=2 ASNs
         else if (std::strcmp(argv[i], "--embedded-asn-diversity=false") == 0)
@@ -12217,6 +13314,18 @@ int main(int argc, char** argv)
         else if (std::strcmp(argv[i],
                              "--embedded-creditpool-publish-at-serve-tip") == 0)
             embedded_creditpool_publish_at_serve_tip = true;
+        else if (std::strcmp(argv[i], "--dash-v24-activation-height") == 0 && i + 1 < argc) {
+            // Validated against the network in run_node (window boundary).
+            char* end = nullptr;
+            const unsigned long long v = std::strtoull(argv[++i], &end, 10);
+            if (!end || *end != '\0' || v == 0 || v > 0xffffffffull) {
+                std::cerr << "--dash-v24-activation-height: not a height: " << argv[i] << "\n";
+                return 1;
+            }
+            g_v24_activation_pin = static_cast<uint32_t>(v);
+        }
+        else if (std::strcmp(argv[i], "--embedded-credit-pool-seed") == 0)
+            g_credit_pool_seed = true;   // credit-pool follower seed from the v20 floor
         else if (std::strcmp(argv[i], "--embedded-tx-inject") == 0)
             embedded_tx_inject = true;   // #157: opt-in miner/user tx-injection (default OFF)
         else if (std::strcmp(argv[i], "--embedded-tx-inject-hex") == 0 && i + 1 < argc)
@@ -12453,6 +13562,29 @@ int main(int argc, char** argv)
         }
         else if (std::strcmp(argv[i], "--web-host") == 0 && i + 1 < argc)
             web_host = argv[++i];
+        // --stratum-http[=true|false|auto]: the web API on the stratum port too
+        // (core/stratum_http.hpp).
+        else if (std::strcmp(argv[i], "--stratum-http") == 0
+                 || std::strncmp(argv[i], "--stratum-http=", 15) == 0) {
+            if (!core::parse_stratum_http_flag(argv[i], core::stratum_http_mode_setting())) {
+                std::cout << "c2pool-dash: bad value: " << argv[i]
+                          << " (expected --stratum-http=true, false or auto)\n";
+                return 2;
+            }
+        }
+        // --stratum-http-budget N / --stratum-http-per-ip N (core/stratum_http.hpp).
+        else if (std::strcmp(argv[i], "--stratum-http-budget") == 0 && i + 1 < argc) {
+            if (!core::parse_stratum_http_count(argv[++i], core::stratum_http_limits_setting().budget)) {
+                std::cout << "c2pool-dash: bad value: --stratum-http-budget " << argv[i] << " (expected a count)\n";
+                return 2;
+            }
+        }
+        else if (std::strcmp(argv[i], "--stratum-http-per-ip") == 0 && i + 1 < argc) {
+            if (!core::parse_stratum_http_count(argv[++i], core::stratum_http_limits_setting().per_ip)) {
+                std::cout << "c2pool-dash: bad value: --stratum-http-per-ip " << argv[i] << " (expected a count)\n";
+                return 2;
+            }
+        }
         // Miner-facing host override for the dashboard Stratum URL. Both production
         // nodes NAT out through one gateway, so the auto-detected outbound IP
         // is NOT the address miners reach; the operator advertises the real
@@ -12548,6 +13680,15 @@ int main(int argc, char** argv)
         // file-set keys (present && source==File) are applied; CLI-set keys never
         // become File-sourced (the loader skips tracker keys), so the CLI wins.
         if (rc.file_set("web.port"))        web_port    = static_cast<uint16_t>(rc.get_u16("web.port").value_or(web_port));
+        if (rc.file_set("stratum.http"))   // --stratum-http: true / false / auto
+            core::apply_stratum_http_setting(rc.get_string("stratum.http").value_or(""),
+                                             core::stratum_http_mode_setting());
+        if (rc.file_set("stratum.http_budget"))   // --stratum-http-budget
+            core::apply_stratum_http_count_setting("stratum.http_budget", rc.get_i64("stratum.http_budget"),
+                                                   core::stratum_http_limits_setting().budget);
+        if (rc.file_set("stratum.http_per_ip"))   // --stratum-http-per-ip
+            core::apply_stratum_http_count_setting("stratum.http_per_ip", rc.get_i64("stratum.http_per_ip"),
+                                                   core::stratum_http_limits_setting().per_ip);
         if (rc.file_set("stratum.bind"))    parse_listen(rc.get_string("stratum.bind").value_or(""), stratum_host, stratum_port);
         if (rc.file_set("web.external_ip")) external_ip = rc.get_string("web.external_ip").value_or(external_ip);
         if (rc.file_set("web.dashboard_dir")) dashboard_dir = rc.get_string("web.dashboard_dir").value_or(dashboard_dir);
@@ -12991,7 +14132,8 @@ int main(int argc, char** argv)
                         embedded_utxo_fold_fees_db,    // W5-A fold fee source
                         embedded_utxo_fold_expect,     // W5-A anchor restatement
                         explorer_enabled,             // /api/explorer surface (default ON)
-                        embedded_include_mn_special_txs); // special-tx superset (DIP types 1-4)
+                        embedded_include_mn_special_txs, // special-tx superset (DIP types 1-4)
+                        embedded_superblock_unfunded_mainnet); // explicit mainnet NotTriggered opt-in
     }
     return run_selftest();
 }

@@ -50,6 +50,7 @@
 #include <cstdint>
 #include <cctype>
 #include <cstring>
+#include <limits>
 #include <optional>
 #include <span>
 #include <string>
@@ -111,9 +112,16 @@ struct GovernanceTrigger {
     int32_t                        event_block_height{0};
     std::vector<SuperblockPayment> payments;
 
+    /// Sum of the scheduled amounts, bounded (every amount is > 0 and within
+    /// MoneyRange by parse). Display and logging only; the budget check is
+    /// resolve_superblock_payments().
     int64_t total_amount() const {
         int64_t t = 0;
-        for (const auto& p : payments) t += p.amount;
+        for (const auto& p : payments) {
+            if (p.amount > std::numeric_limits<int64_t>::max() - t)
+                return std::numeric_limits<int64_t>::max();
+            t += p.amount;
+        }
         return t;
     }
 };
@@ -355,6 +363,47 @@ inline uint256 govobject_hash(const uint256& hash_parent,
     put_u8(pre, 0x00);            // legacy dummy uint8_t{}
     put_u32le(pre, 0xffffffffu);  // legacy dummy 0xffffffff
     put_bytes(pre, vch_sig);
+    return ::Hash(std::span<const unsigned char>(pre.data(), pre.size()));
+}
+
+/// dashcore CGovernanceObject::GetSignatureHash() (governance/object.cpp:551-
+/// 554) == SerializeHash(*this) with SER_GETHASH, i.e. Governance::Object's
+/// SERIALIZE_METHODS (governance/common.h:73-87) WITHOUT vchSig:
+///   hashParent      (32 raw bytes)
+///   revision        (int32 LE)
+///   time            (int64 LE)
+///   collateralHash  (32 raw bytes)
+///   vchData         (compactsize(len) + RAW bytes — NOT the hex string the
+///                    identity hash uses)
+///   type            (int32 LE — enum class GovernanceObject : int, serialized
+///                    through is_serializable_enum as its underlying int)
+///   masternodeOutpoint (COutPoint: hash 32 raw + n uint32 LE, no dummies)
+/// Double-SHA256. This is the digest the creating masternode signs with its
+/// OPERATOR BLS key (basic scheme) for a TRIGGER object — the digest
+/// CGovernanceObject::CheckSignature (object.cpp:566-575) verifies when
+/// IsValidLocally admits a trigger (object.cpp:746-761). It differs from
+/// govobject_hash (identity) in three ways: it includes collateralHash and
+/// type, vchData is raw (not hex), and there are no legacy dummy bytes.
+inline uint256 govobject_signature_hash(const uint256& hash_parent,
+                                        int32_t revision,
+                                        int64_t time,
+                                        const uint256& collateral_hash,
+                                        const std::vector<uint8_t>& vch_data,
+                                        int32_t object_type,
+                                        const uint256& mn_outpoint_hash,
+                                        uint32_t mn_outpoint_index)
+{
+    using namespace govhash_detail;
+    std::vector<unsigned char> pre;
+    pre.reserve(32 + 4 + 8 + 32 + 9 + vch_data.size() + 4 + 32 + 4);
+    put_uint256(pre, hash_parent);
+    put_i32le(pre, revision);
+    put_i64le(pre, time);
+    put_uint256(pre, collateral_hash);
+    put_bytes(pre, vch_data);
+    put_i32le(pre, object_type);
+    put_uint256(pre, mn_outpoint_hash);
+    put_u32le(pre, mn_outpoint_index);
     return ::Hash(std::span<const unsigned char>(pre.data(), pre.size()));
 }
 

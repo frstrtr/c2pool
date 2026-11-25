@@ -107,10 +107,13 @@ namespace coin {
 
 // Bump on ANY change to the field-comparison / graduation semantics so a new
 // comparator does NOT inherit an old comparator's clean streak (§6 cond. 4).
-inline constexpr uint32_t kOracleComparatorVersion = 1;
+// 2: Dash Core v24 -- CbTx version 4 is a known version, not a drift
+//    sentinel (kMaxKnownCbTxVersion below), so the graduation semantics changed.
+inline constexpr uint32_t kOracleComparatorVersion = 2;
 // Highest CbTx payload version this comparator models. A connected/observed
 // CbTx with a higher nVersion is a chain-drift sentinel (§6 cond. 5).
-inline constexpr uint16_t kMaxKnownCbTxVersion = vendor::CCbTx::VERSION_CLSIG_AND_BALANCE;
+// Dash Core v24 CbTx version 4 is modelled (vendor/cbtx.hpp).
+inline constexpr uint16_t kMaxKnownCbTxVersion = vendor::CCbTx::VERSION_MERKLE_ROOT_ASSETUNLOCKS;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Height-class taxonomy. A single height can belong to MULTIPLE classes;
@@ -291,7 +294,10 @@ inline std::vector<FieldResult> compare_templates(
     // ── EQUALITY (cross-node) ───────────────────────────────────────────────
     eq("height",   Regime::Equality, true, std::to_string(emb.m_height), std::to_string(dashd.m_height));
     eq("bits",     Regime::Equality, true, std::to_string(emb.m_bits),   std::to_string(dashd.m_bits));
-    eq("mintime",  Regime::Equality, true, std::to_string(emb.m_mintime),std::to_string(dashd.m_mintime));
+    // mintime 0 on the embedded side is a withheld floor (the tip's MTP window
+    // is incomplete), not a wrong value: shown, not counted.
+    eq("mintime",  Regime::Equality, emb.m_mintime != 0,
+       std::to_string(emb.m_mintime), std::to_string(dashd.m_mintime));
     eq("payee_identities", Regime::Equality, true,
        payee_identity_str(emb.m_packed_payments), payee_identity_str(dashd.m_packed_payments));
     // Incident h=2516595: the FULL MN payout SET (owner + operator + ratio),
@@ -591,13 +597,14 @@ public:
         , periodicity_(NetPeriodicity::for_net(cfg_.testnet))
     {
         load_graduation_state();
-        // A fallback/dev/no-git commit string (empty, "dev", or the CMake
-        // "0.1.0-alpha" default) can be shared across DIFFERENT binaries, so it
+        // A fallback/dev/no-git commit string (empty, "dev", the CMake
+        // "unknown" default, or the older "0.1.0-alpha" one) can be shared across DIFFERENT binaries, so it
         // must NEVER inherit a prior streak (review nit c). `--dirty` in the git
         // describe (CMakeLists) covers tag-exact dirty rebuilds; this covers the
         // no-git fallbacks.
         const bool fallback_commit = cfg_.c2pool_commit.empty()
-            || cfg_.c2pool_commit == "dev" || cfg_.c2pool_commit == "0.1.0-alpha";
+            || cfg_.c2pool_commit == "dev" || cfg_.c2pool_commit == "unknown"
+            || cfg_.c2pool_commit == "0.1.0-alpha";
         // Streak-invalidation on identity change (§6 cond. 4).
         if (fallback_commit
             || ledger_.key_comparator != kOracleComparatorVersion

@@ -47,6 +47,8 @@
 #include <impl/dash/coin/special_tx_pool_delta.hpp> // #107: explain the pool delta
 #include <impl/dash/coin/tx_serve_referee.hpp>  // tx-serve internal-consistency referee (own-set vs dashd-parity)
 #include <impl/dash/coin/gbt_quorum_staleness.hpp>   // GBT-xcheck quorumroot-dashd-stale classifier
+#include <impl/dash/coin/gbt_xcheck_collateral.hpp>  // GBT-xcheck modulo-collateral label
+#include <impl/dash/coin/gbt_xcheck_dashd_only_collateral.hpp>  // GBT-xcheck modulo-dashd-only-collateral label
 #include <impl/dash/coin/serve_staleness.hpp> // serve-staleness sentinel (steady_now_ms + the incident catalogue)
 
 #include <core/address_utils.hpp>             // core::address_to_script (mint payout from username)
@@ -137,6 +139,10 @@ DASHWorkSource::DASHWorkSource(const coin::NodeCoinState& coin_state,
     // (WorkSnapshot::has_header) and suppresses the job otherwise. This also
     // makes the core's legacy stub-coinbase fallback unreachable for DASH.
     config_.require_job_snapshot = true;
+    // Dash Core v24 deploys v24 on version bit 13 and evo_shares on bit 14;
+    // a rolled version must not clear or set them (BIP320's 0x1fffe000 would
+    // let it). Bits 15..28 stay rollable.
+    config_.version_rolling_pool_mask = 0x1fff8000u;
     // Vardiff target share rate: adopt p2pool-dash's FIELD-TUNED default of 10s
     // per pseudoshare (p2pool-dash/p2pool/main.py:1153 default=10., dest='share_rate'),
     // not the 3s jtoomim/BTC default (stratum_types.hpp:40). DASH's variable X11
@@ -1274,6 +1280,58 @@ void DASHWorkSource::resource_template_now(CoinStateArm arm) const
                                     " (swapping would serve a bad-cbtx-"
                                     "quorummerkleroot template)";
                     } else {
+                    // MN-root difference explained EXACTLY by the collateral
+                    // spends the embedded builder excludes by design
+                    // (gbt_xcheck_collateral.hpp)? LABEL ONLY: the swap to
+                    // dashd's template below happens either way.
+                    const bool collateral_explained = !quorums_differ
+                        && coin::classify_mnroot_xcheck(coin::MnRootXcheckInput{
+                               emb_cb.merkleRootMNList, dref_cb.merkleRootMNList,
+                               /*quorum_roots_equal=*/true,
+                               sel.work.m_xcheck_collateral_alt_mnroot,
+                               &sel.work.m_xcheck_collateral_excluded_txids,
+                               &sel.work.m_tx_hashes, &dref.m_tx_hashes})
+                           == coin::MnRootXcheck::CollateralExplained;
+                    // Else: explained EXACTLY by collateral spends only dashd's
+                    // template carries, txs we never had
+                    // (gbt_xcheck_dashd_only_collateral.hpp)? A separate label:
+                    // a freshness/relay matter, not a design exclusion. LABEL
+                    // ONLY: the swap below happens either way.
+                    coin::DashdOnlyCollateralVerdict dashd_only;
+                    if (!quorums_differ && !collateral_explained)
+                        dashd_only = coin::classify_dashd_only_collateral(
+                            sel.work.m_xcheck_collateral_aid.get(),
+                            emb_cb.merkleRootMNList, dref_cb.merkleRootMNList,
+                            /*quorum_roots_equal=*/true,
+                            sel.work.m_tx_hashes,
+                            sel.work.m_xcheck_collateral_excluded_txids,
+                            dref.m_tx_hashes, dref.m_txs);
+                    const bool dashd_only_explained =
+                        dashd_only.verdict == coin::DashdOnlyCollateral::Explained;
+                    if (collateral_explained) {
+                        LOG_INFO << "[DASH-STRATUM-GBT] GBT-xcheck MATCH-MODULO-COLLATERAL at h="
+                                 << sel.work.m_height << " embedded mnlist="
+                                 << emb_cb.merkleRootMNList.GetHex().substr(0, 16)
+                                 << " dashd mnlist="
+                                 << dref_cb.merkleRootMNList.GetHex().substr(0, 16)
+                                 << " == embedded body + "
+                                 << sel.work.m_xcheck_collateral_excluded_txids.size()
+                                 << " excluded MN-collateral spend(s) dashd includes"
+                                    " (same fold, byte-equal root) — serving dashd"
+                                    " template; classification only";
+                    } else if (dashd_only_explained) {
+                        LOG_INFO << "[DASH-STRATUM-GBT] GBT-xcheck MATCH-MODULO-DASHD-ONLY-COLLATERAL at h="
+                                 << sel.work.m_height << " embedded mnlist="
+                                 << emb_cb.merkleRootMNList.GetHex().substr(0, 16)
+                                 << " dashd mnlist="
+                                 << dref_cb.merkleRootMNList.GetHex().substr(0, 16)
+                                 << " == embedded fold + " << dashd_only.spends
+                                 << " collateral spend(s) only dashd's template carries"
+                                 << " (" << dashd_only.removed << " MN removed, "
+                                 << dashd_only.dashd_only << " dashd-only tx(s);"
+                                    " fold collateral loop, byte-equal root) — serving"
+                                    " dashd template; classification only";
+                    } else {
                     LOG_WARNING << "[DASH-STRATUM-GBT] GBT-xcheck "
                                 << (quorums_differ ? "merkleRootQuorums"
                                                    : "merkleRootMNList")
@@ -1286,14 +1344,31 @@ void DASHWorkSource::resource_template_now(CoinStateArm arm) const
                                 << emb_cb.merkleRootMNList.GetHex().substr(0, 16)
                                 << " dashd mnlist="
                                 << dref_cb.merkleRootMNList.GetHex().substr(0, 16)
+                                << " collateral-aid alt="
+                                << (sel.work.m_xcheck_collateral_alt_mnroot.IsNull()
+                                        ? std::string("none")
+                                        : sel.work.m_xcheck_collateral_alt_mnroot.GetHex().substr(0, 16))
+                                << " excluded="
+                                << sel.work.m_xcheck_collateral_excluded_txids.size()
+                                << " dashd-only-aid="
+                                << (quorums_differ ? "n/a" : dashd_only.why)
+                                << " alt2="
+                                << (dashd_only.alt_mnroot.IsNull()
+                                        ? std::string("none")
+                                        : dashd_only.alt_mnroot.GetHex().substr(0, 16))
                                 << " — serving dashd template (reward-safety backstop:"
                                    " a wrong quorum/MN root is the bad-cbtx-"
                                    "quorummerkleroot reject vector)";
+                    }
                     coin::DeclineReport xcheck;
                     xcheck.viable    = false;
                     xcheck.cause     = quorums_differ
                                            ? "gbt-xcheck-quorumroot-mismatch"
-                                           : "gbt-xcheck-mnroot-mismatch";
+                                           : (collateral_explained
+                                                  ? "gbt-xcheck-modulo-collateral-explained"
+                                                  : (dashd_only_explained
+                                                         ? "gbt-xcheck-modulo-dashd-only-collateral"
+                                                         : "gbt-xcheck-mnroot-mismatch"));
                     xcheck.value     = (quorums_differ ? emb_cb.merkleRootQuorums
                                                        : emb_cb.merkleRootMNList).GetHex();
                     xcheck.threshold = (quorums_differ ? dref_cb.merkleRootQuorums
@@ -2437,9 +2512,21 @@ core::stratum::CoinbaseResult DASHWorkSource::build_connection_coinbase(
                         out.coinb1 = HexStr(b1);
                         out.coinb2 = HexStr(b2);
                         freeze_snapshot(out, pj->ref_hash);
-                        // Publish the share_info-committed target so the
-                        // mining_submit share gate matches the minted share's
-                        // own m_bits (the ban-safety alignment).
+                        // The share target THIS job's shares carry
+                        // (share_info.bits/max_bits). The stratum session
+                        // judges a submit by its own job's frozen bits
+                        // (core::stratum::pool_share_bits), not by the node-
+                        // global bits of the last job built for ANY
+                        // connection: Cap 1 sizes each miner's target by its
+                        // own rate (up to 30x apart), so judged by a bigger
+                        // miner's job a smaller miner's shares were dropped
+                        // as pseudoshares.
+                        out.snapshot.frozen_ref.bits     = pj->share_bits;
+                        out.snapshot.frozen_ref.max_bits = pj->share_max_bits;
+                        // Also publish it as the node's live target: the
+                        // dashboard reads it, and a job built without frozen
+                        // bits (the non-producer path) is gated by it. The
+                        // frozen value above is what gates THIS job.
                         // set_share_target only stores atomics; const_cast is
                         // safe here (build_connection_coinbase is const by
                         // interface contract, the target publish is a relaxed
@@ -3130,6 +3217,21 @@ void DASHWorkSource::set_producer_job_fn(ProducerJobFn fn)
 {
     std::lock_guard<std::mutex> lk(producer_job_mutex_);
     producer_job_fn_ = std::move(fn);
+}
+
+std::optional<coin::IslockConflict>
+DASHWorkSource::served_template_islock_conflict(
+    const uint256& locked_txid,
+    const std::vector<std::pair<uint256, uint32_t>>& inputs) const
+{
+    std::shared_ptr<const coin::DashWorkData> snap;
+    {
+        std::lock_guard<std::mutex> lk(template_mutex_);
+        snap = template_cache_;
+    }
+    if (!snap) return std::nullopt;
+    return coin::body_conflicts_with_lock(snap->m_txs, snap->m_tx_hashes,
+                                          locked_txid, inputs);
 }
 
 void DASHWorkSource::invalidate_template_cache(const char* reason)

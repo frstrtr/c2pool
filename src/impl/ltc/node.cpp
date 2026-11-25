@@ -4,6 +4,8 @@
 #include <thread>
 
 #include "share_tx_refs.hpp"
+#include "persisted_reload.hpp"
+#include "think_gate.hpp"
 
 #include <core/reloaded_block_flag.hpp>   // core::restore_block_flag (a reloaded share keeps its block flag)
 #include <core/common.hpp>
@@ -19,6 +21,8 @@
 #include <iomanip>
 #include <random>
 #include <unordered_map>
+#include <utility>
+#include <ctime>
 #ifndef _WIN32
 #include <execinfo.h>  // backtrace() for think() watchdog stack dump (glibc-only)
 #endif
@@ -126,6 +130,28 @@ static uint64_t make_random_nonce()
     return rng();
 }
 
+// A share WE minted: it never arrived from a peer. Same test as the local-fork
+// log in processing_shares and auto_ratchet.hpp. Shares reloaded from LevelDB
+// carry peer_addr "database" and so do not count.
+static bool share_locally_minted(ShareType& share)
+{
+    bool local = false;
+    share.invoke([&](auto* obj) {
+        local = (obj->peer_addr == NetService{"0.0.0.0", 0} || obj->peer_addr == NetService{});
+    });
+    return local;
+}
+
+// The subset of `sent` that is in `own`, in `sent` order.
+static std::vector<uint256> own_subset(const std::vector<uint256>& sent, const std::set<uint256>& own)
+{
+    std::vector<uint256> out;
+    for (const auto& h : sent)
+        if (own.count(h))
+            out.push_back(h);
+    return out;
+}
+
 void NodeImpl::send_ping(peer_ptr peer)
 {
         auto rmsg = ltc::message_ping::make_raw();
@@ -155,28 +181,60 @@ void NodeImpl::connected(std::shared_ptr<core::Socket> socket)
     send_version(peer);
 }
 
+void NodeImpl::note_disconnect_for_reject_marks(const NetService& service, const std::string& reason,
+                                                bool ec_peer_abort)
+{
+    using Marks = decltype(m_own_share_rejects);
+    const bool peer_abort = ec_peer_abort || ltc::disconnect_is_peer_abort(reason);
+    const auto out = m_own_share_rejects.on_disconnect(
+        service, peer_abort ? Marks::DropKind::PeerAbort : Marks::DropKind::Other, reject_mark_now());
+    if (out.verdict == Marks::Verdict::Marked && !out.newly_marked.empty()) {
+        // Our own share(s), and the peer ABORTED (RST) right after the push:
+        // the canonical bad-share drop. Rare by construction, still capped.
+        static uint64_t mark_log = 0;
+        const bool loud = mark_log < 20 || mark_log % 100 == 0;
+        ++mark_log;
+        const std::string line = "[Pool] Peer " + service.to_string()
+            + " aborted the connection (" + reason + ") "
+            + std::to_string(out.since_push.count()) + "ms after we pushed "
+            + std::to_string(out.newly_marked.size()) + " of our own share(s), first "
+            + out.newly_marked.front().GetHex().substr(0, 16)
+            + ": holding them off re-broadcast for "
+            + std::to_string(std::chrono::duration_cast<std::chrono::seconds>(Marks::MARK_TTL).count())
+            + "s (still served to any peer that asks)";
+        if (loud)
+            LOG_WARNING << line;
+        else
+            LOG_DEBUG_POOL << line;
+    } else if (out.verdict == Marks::Verdict::NotARejection) {
+        // A timeout / EOF / other drop shortly after a push of our own shares.
+        // Not a rejection (dba0be63d treated it as one; see
+        // own_share_reject_marks.hpp). Debug-level, sampled.
+        static uint64_t skip_log = 0;
+        if (skip_log++ % 50 == 0)
+            LOG_DEBUG_POOL << "[Pool] Peer " << service.to_string() << " dropped ("
+                           << reason << ") " << out.since_push.count()
+                           << "ms after a push of " << out.own_in_push
+                           << " own share(s): not a rejection, nothing held off";
+    }
+}
+
+void NodeImpl::error(const boost::system::error_code& ec, const NetService& service, const std::source_location where)
+{
+    // Classify on the code: WSAECONNRESET's text is localized on Windows.
+    // base_t renders the code (parse_net_error) and calls error(string) below,
+    // synchronously on this thread, which consumes the flag.
+    m_drop_ec_is_peer_abort = ltc::disconnect_is_peer_abort(ec);
+    base_t::error(ec, service, where);
+    m_drop_ec_is_peer_abort = false;
+}
+
 void NodeImpl::error(const message_error_type& err, const NetService& service, const std::source_location where)
 {
-    // If peer disconnected within 10s of us sending shares, those shares
-    // were likely rejected (e.g. PoW-invalid).  Mark them so we don't
-    // keep re-broadcasting the same bad share on every reconnection.
-    {
-        auto it = m_last_broadcast_to.find(service);
-        if (it != m_last_broadcast_to.end()) {
-            auto elapsed = std::chrono::steady_clock::now() - it->second.when;
-            if (elapsed < std::chrono::seconds(10)) {
-                for (const auto& h : it->second.hashes) {
-                    if (m_rejected_share_hashes.insert(h).second) {
-                        LOG_WARNING << "[Pool] Marking share " << h.GetHex().substr(0, 16)
-                                    << " as rejected (peer " << service.to_string()
-                                    << " disconnected " << std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count()
-                                    << "ms after broadcast)";
-                    }
-                }
-            }
-            m_last_broadcast_to.erase(it);
-        }
-    }
+    // A peer-initiated drop right after we pushed OUR OWN shares may be the
+    // canonical bad-share abort. Only that case holds those shares off
+    // RE-broadcast, for a TTL. Nothing here ever affects serving them.
+    note_disconnect_for_reject_marks(service, err, std::exchange(m_drop_ec_is_peer_abort, false));
 
     // Drop stale nonce->peer entries for this endpoint before base cleanup.
     // Without this, reconnects can be rejected as false duplicates because
@@ -216,19 +274,11 @@ void NodeImpl::error(const message_error_type& err, const NetService& service, c
 
 void NodeImpl::close_connection(const NetService& service)
 {
-    // Same rejection tracking as error() — close_connection is another
-    // path for peer disconnection.
-    {
-        auto it = m_last_broadcast_to.find(service);
-        if (it != m_last_broadcast_to.end()) {
-            auto elapsed = std::chrono::steady_clock::now() - it->second.when;
-            if (elapsed < std::chrono::seconds(10)) {
-                for (const auto& h : it->second.hashes)
-                    m_rejected_share_hashes.insert(h);
-            }
-            m_last_broadcast_to.erase(it);
-        }
-    }
+    // Every caller of close_connection is a close WE decided on (ban,
+    // duplicate/self swap, misfit or pre-3601 sender, remembered-tx cap, admin
+    // drop). The peer rejected nothing, so nothing we pushed it is marked.
+    // (dba0be63d marked here too.)
+    m_own_share_rejects.forget_peer(service);
 
     m_pending_outbound.erase(service);
     m_outbound_addrs.erase(service);
@@ -330,6 +380,15 @@ std::optional<pool::PeerConnectionType> NodeImpl::handle_version(std::unique_ptr
                         << ", disconnecting";
             throw std::runtime_error("peer protocol too old");
         }
+        // From the share version 3601 flag day on, a peer that cannot load a
+        // 3601 share is refused the same clean way (no ban).
+        if (!peer_takes_3601(msg->m_version)
+            && v3601_flag_day_passed(static_cast<uint32_t>(std::time(nullptr))))
+        {
+            drop_pre_3601_peer(peer->addr(), pre_3601_peer_line(msg->m_addr_from.m_endpoint.to_string(),
+                                                                msg->m_version, msg->m_subversion));
+            throw std::runtime_error("peer protocol too old");
+        }
 
         // Duplicate-nonce policy: REPLACE-OLD (accept-then-drop busy-loop fix).
         // A peer redialing with the same (per-process) nonce is signalling its
@@ -357,6 +416,8 @@ std::optional<pool::PeerConnectionType> NodeImpl::handle_version(std::unique_ptr
         m_peers[peer->m_nonce] = peer;
         m_peer_count.store(m_peers.size(), std::memory_order_relaxed);
         publish_peer_info_snapshot();   // IO thread: refresh the display snapshot
+        // A new peer has been asked for none of the parents we are missing.
+        note_fetch_peer_connected(peer->addr());
 
         // Request peers from the newly established connection
         {
@@ -381,10 +442,16 @@ std::optional<pool::PeerConnectionType> NodeImpl::handle_version(std::unique_ptr
             }
         }
 
-        // Advertise ourselves to the peer (matching Python p2pool sendAdvertisement)
+        // Advertise ourselves to the peer. Canonical p2pool-merged-v36
+        // p2p.py:127 sendAdvertisement: `if self.node.serverfactory.listen_port
+        // is not None`. A node whose
+        // listen() bind failed (main_ltc.cpp:3892 logs and carries on) has a
+        // closed acceptor, and the bare core::Server::listen_port() throws
+        // bad_descriptor out of this handler, dropping every peer (#925).
+        // No listener means nothing to advertise: skip the addrme.
+        if (auto our_listen_port = core::Server::listen_port_or_none())
         {
-            auto port = core::Server::listen_port();
-            auto addrme_msg = ltc::message_addrme::make_raw(port);
+            auto addrme_msg = ltc::message_addrme::make_raw(*our_listen_port);
             peer->write(std::move(addrme_msg));
         }
 
@@ -738,6 +805,77 @@ void NodeImpl::note_invalid_pow_share(NetService addr)
 // on the io thread each think cycle, alongside the other periodic prunes, and
 // MUST use the same steady_clock timebase as note_invalid_pow_share() so the
 // decay math is consistent (std::time() would be a different epoch).
+bool NodeImpl::peer_takes_3601_at(const NetService& addr) const
+{
+    for (const auto& [nonce, peer] : m_peers)
+        if (peer && peer->addr() == addr)
+            return peer_takes_3601(peer->m_other_version);
+    return false;
+}
+
+void NodeImpl::drop_pre_3601_peer(const NetService& addr, const std::string& line)
+{
+    const auto now = std::chrono::steady_clock::now();
+    if (m_pre_3601_warn.should_warn(addr.address(), now))
+        LOG_WARNING << "[Pool] " << line;   // once an hour per IP
+    else
+        LOG_DEBUG_POOL << "[Pool] " << line;
+    m_pre_3601_until[addr] = now + std::chrono::hours(1);   // the dialer skips this ip:port
+    // A deliberate close: what we sent it is not "rejected by the peer".
+    m_own_share_rejects.forget_peer(addr);
+    if (m_pre_3601_until.size() > 4096)
+        for (auto it = m_pre_3601_until.begin(); it != m_pre_3601_until.end(); )
+            it = it->second <= now ? m_pre_3601_until.erase(it) : std::next(it);
+}
+
+bool NodeImpl::drop_misfit_share(ShareType& share, std::string& drop_peer)
+{
+    const auto why = received_share_flag_day_problem(share);
+    if (why.empty())
+        return false;
+    if (drop_peer.empty())
+        drop_peer = why;
+    share.destroy();
+    return true;
+}
+
+void NodeImpl::drop_misfit_sender(const peer_ptr& peer, const std::string& why)
+{
+    if (!peer || why.empty())
+        return;
+    if (!peer_takes_3601(peer->m_other_version) || why.find("peer too old") != std::string::npos) {
+        drop_pre_3601_peer(peer->addr(), pre_3601_peer_line(peer->addr().to_string(), peer->m_other_version,
+                                                            peer->m_other_subversion));
+    } else {
+        // A 3601-capable peer sending a share under the wrong type number:
+        // broken or hostile. Disconnected (rate-limited line), not banned.
+        const auto now = std::chrono::steady_clock::now();
+        const std::string line = "peer " + peer->addr().to_string() + " sent a share whose type number does not fit "
+                                 "its timestamp (" + why + "): dropped, disconnecting";
+        if (m_pre_3601_warn.should_warn("misfit:" + peer->addr().address(), now))
+            LOG_WARNING << "[Pool] " << line;
+        else
+            LOG_DEBUG_POOL << "[Pool] " << line;
+        m_own_share_rejects.forget_peer(peer->addr());
+    }
+    close_connection(peer->addr());
+}
+
+void NodeImpl::disconnect_pre_3601_peers()
+{
+    if (!v3601_flag_day_passed(static_cast<uint32_t>(std::time(nullptr))))
+        return;
+    std::vector<std::pair<NetService, std::string>> old;
+    for (const auto& [nonce, peer] : m_peers)
+        if (peer && !peer_takes_3601(peer->m_other_version))
+            old.emplace_back(peer->addr(), pre_3601_peer_line(peer->addr().to_string(), peer->m_other_version,
+                                                              peer->m_other_subversion));
+    for (const auto& [addr, line] : old) {
+        drop_pre_3601_peer(addr, line);
+        close_connection(addr);
+    }
+}
+
 void NodeImpl::prune_pow_misbehavior()
 {
     const double now_s = std::chrono::duration<double>(
@@ -843,6 +981,60 @@ bool NodeImpl::processing_shares(HandleSharesData& data_ref, NetService addr)
     return true;
 }
 
+// The LevelDB row of a share: its type number (8 bytes LE) and its bytes (the
+// received ones when `raw` holds them under the same type number, else packed).
+c2pool::storage::SharechainStorage::ShareBatchEntry NodeImpl::share_db_entry(ShareType& share,
+                                                                             const chain::RawShare* raw)
+{
+    std::vector<uint8_t> bytes;
+    if (raw && raw->type == static_cast<uint64_t>(share.version()) && !raw->contents.m_data.empty())
+    {
+        bytes.assign(raw->contents.m_data.begin(), raw->contents.m_data.end());
+    }
+    else
+    {
+        PackStream ps = pack(share);
+        auto span = ps.get_span();
+        bytes.assign(reinterpret_cast<const uint8_t*>(span.data()),
+                     reinterpret_cast<const uint8_t*>(span.data()) + span.size());
+    }
+    uint64_t ver = share.version();
+    std::vector<uint8_t> versioned;
+    versioned.resize(8 + bytes.size());
+    std::memcpy(versioned.data(), &ver, 8);
+    std::memcpy(versioned.data() + 8, bytes.data(), bytes.size());
+
+    c2pool::storage::SharechainStorage::ShareBatchEntry entry;
+    share.ACTION({
+        uint256 target = chain::bits_to_target(obj->m_bits);
+        uint256 abswork_256;
+        std::copy(obj->m_abswork.begin(), obj->m_abswork.end(), abswork_256.begin());
+        entry.hash = obj->m_hash;
+        entry.serialized_data = std::move(versioned);
+        entry.prev_hash = obj->m_prev_hash;
+        entry.height = obj->m_absheight;
+        entry.timestamp = obj->m_timestamp;
+        entry.work = abswork_256;
+        entry.target = target;
+    });
+    return entry;
+}
+
+// A share this node made (create_local_share) into LevelDB, as a received
+// one is in processing_shares_phase2: without it a restart reloads the
+// network's shares but not ours, and the chain has holes (many heads, "chain
+// too short") until peers send our own shares back. Caller holds the
+// tracker lock.
+bool NodeImpl::persist_local_share(const uint256& hash)
+{
+    if (!m_storage || !m_storage->is_available() || !m_chain || !m_chain->contains(hash))
+        return false;
+    auto& share = m_chain->get_share(hash);
+    std::vector<c2pool::storage::SharechainStorage::ShareBatchEntry> one;
+    one.push_back(share_db_entry(share, nullptr));
+    return m_storage->store_shares_batch(one);
+}
+
 void NodeImpl::processing_shares_phase2(HandleSharesData& data, NetService addr)
 {
     // Phase 2 (io_context thread): topological sort + chain insertion + LevelDB store.
@@ -892,17 +1084,22 @@ void NodeImpl::processing_shares_phase2(HandleSharesData& data, NetService addr)
     // lock. ASIO single-thread still guarantees no overlapping IO handler.
 
     // Step 1: collect verified shares (skip any that failed verification, hash still null)
+    // and keep each one's original raw bytes, by share OBJECT: the relay cache
+    // gets them only for the object the tracker adopts (step 3), never for a
+    // duplicate by hash (a copy under another type number would otherwise
+    // replace the bytes relayed for the share the tracker holds).
     std::vector<ShareType> valid_shares;
     valid_shares.reserve(data.m_items.size());
+    std::unordered_map<const void*, chain::RawShare> raw_by_object;
     for (size_t idx = 0; idx < data.m_items.size(); ++idx)
     {
         auto& share = data.m_items[idx];
         if (share.hash().IsNull())
             continue; // verification failed in phase 1
 
-        // Cache original raw bytes for relay (keyed by computed hash)
-        if (idx < data.m_raw_items.size() && !data.m_raw_items[idx].contents.m_data.empty())
-            m_raw_share_cache[share.hash()] = std::move(data.m_raw_items[idx]);
+        if (idx < data.m_raw_items.size() && !data.m_raw_items[idx].contents.m_data.empty()
+            && data.m_raw_items[idx].type == static_cast<uint64_t>(share.version()))
+            raw_by_object.emplace(ltc::share_ptr_id(share), std::move(data.m_raw_items[idx]));
         valid_shares.push_back(share);
     }
 
@@ -993,6 +1190,9 @@ void NodeImpl::processing_shares_phase2(HandleSharesData& data, NetService addr)
                 auto slot = batch_slot.find(adopted_id);
                 if (slot != batch_slot.end())
                     ltc::share_release(data.m_items[slot->second]);
+                // The relay bytes of the adopted object (keyed by its hash).
+                if (auto raw = raw_by_object.find(adopted_id); raw != raw_by_object.end())
+                    m_raw_share_cache[share.hash()] = std::move(raw->second);
             }
         }
 
@@ -1030,42 +1230,8 @@ void NodeImpl::processing_shares_phase2(HandleSharesData& data, NetService addr)
         // Collect for batch LevelDB persist (committed atomically after loop)
         if (m_storage && m_storage->is_available())
         {
-            std::vector<uint8_t> bytes;
             auto raw_it = m_raw_share_cache.find(share.hash());
-            if (raw_it != m_raw_share_cache.end() &&
-                raw_it->second.type == share.version() &&
-                !raw_it->second.contents.m_data.empty())
-            {
-                bytes.assign(raw_it->second.contents.m_data.begin(),
-                             raw_it->second.contents.m_data.end());
-            }
-            else
-            {
-                PackStream ps = pack(share);
-                auto span = ps.get_span();
-                bytes.assign(reinterpret_cast<const uint8_t*>(span.data()),
-                             reinterpret_cast<const uint8_t*>(span.data()) + span.size());
-            }
-            uint64_t ver = share.version();
-            std::vector<uint8_t> versioned;
-            versioned.resize(8 + bytes.size());
-            std::memcpy(versioned.data(), &ver, 8);
-            std::memcpy(versioned.data() + 8, bytes.data(), bytes.size());
-
-            share.ACTION({
-                uint256 target = chain::bits_to_target(obj->m_bits);
-                uint256 abswork_256;
-                std::copy(obj->m_abswork.begin(), obj->m_abswork.end(), abswork_256.begin());
-                c2pool::storage::SharechainStorage::ShareBatchEntry entry;
-                entry.hash = obj->m_hash;
-                entry.serialized_data = std::move(versioned);
-                entry.prev_hash = obj->m_prev_hash;
-                entry.height = obj->m_absheight;
-                entry.timestamp = obj->m_timestamp;
-                entry.work = abswork_256;
-                entry.target = target;
-                db_batch.push_back(std::move(entry));
-            });
+            db_batch.push_back(share_db_entry(share, raw_it != m_raw_share_cache.end() ? &raw_it->second : nullptr));
         }
     }
 
@@ -1096,8 +1262,20 @@ void NodeImpl::processing_shares_phase2(HandleSharesData& data, NetService addr)
     }
 }
 
-std::vector<ltc::ShareType> NodeImpl::handle_get_share(std::vector<uint256> hashes, uint64_t parents, std::vector<uint256> stops, NetService peer_addr)
+std::vector<ltc::ShareType> NodeImpl::handle_get_share(std::vector<uint256> hashes, uint64_t parents, std::vector<uint256> stops, NetService peer_addr, bool* busy)
 {
+    // An empty hash list would divide by zero in the parents cap below (UB;
+    // SIGFPE on x86). Answer it empty, as BTC and DASH do (dash/node.cpp
+    // handle_get_share). Rate-limited: the peer controls how often this fires.
+    if (hashes.empty())
+    {
+        static uint64_t empty_log = 0;
+        if (empty_log++ % 50 == 0)
+            LOG_WARNING << "[handle_get_share] EMPTY hashes from " << peer_addr.to_string()
+                        << " (malformed sharereq) — answering empty";
+        return {};
+    }
+
     // try_to_lock per the architectural rule (node.hpp:67) — IO thread MUST
     // never block on m_tracker_mutex.  A blocking shared_lock here was the
     // root cause of the periodic event-loop freeze + SIGABRT cycle on
@@ -1113,6 +1291,10 @@ std::vector<ltc::ShareType> NodeImpl::handle_get_share(std::vector<uint256> hash
     std::shared_lock<std::shared_mutex> lock(m_tracker_mutex, std::try_to_lock);
     if (!lock.owns_lock())
     {
+        if (busy) {   // the caller lets the request wait (defer_sharereq)
+            *busy = true;
+            return {};
+        }
         static int defer_log = 0;
         if (defer_log++ % 50 == 0)
             LOG_INFO << "[handle_get_share] tracker busy — returning empty to "
@@ -1122,6 +1304,8 @@ std::vector<ltc::ShareType> NodeImpl::handle_get_share(std::vector<uint256> hash
     }
 
     parents = std::min(parents, (uint64_t)1000/hashes.size());
+    // No 3601 share to a peer that cannot load one.
+    const bool takes_3601 = peer_takes_3601_at(peer_addr);
 	std::vector<ltc::ShareType> shares;
 	for (const auto& handle_hash : hashes)
 	{
@@ -1140,7 +1324,11 @@ std::vector<ltc::ShareType> NodeImpl::handle_get_share(std::vector<uint256> hash
         {
 			if (std::find(stops.begin(), stops.end(), hash) != stops.end())
 				break;
-			if (m_rejected_share_hashes.count(hash))
+			// Serve every share we hold, contiguously, as canonical
+			// handle_get_shares does (p2pool-merged-v36 p2pool/node.py:141-152).
+			// The own-share reject marks never filter a reply: a hole here
+			// makes every syncing peer fail over (own_share_reject_marks.hpp).
+			if (!takes_3601 && data.share.version() >= FLAG_DAY_SHARE_VERSION)
 				continue;
 			shares.push_back(data.share);
 		}
@@ -1158,6 +1346,136 @@ std::vector<ltc::ShareType> NodeImpl::handle_get_share(std::vector<uint256> hash
 	// independent memory it destroy()s. Same borrow-vs-own rule as #1131/#1163.
 	for (auto& s : shares) s = s.clone();
 	return shares;
+}
+
+void NodeImpl::write_sharereply(const peer_ptr& peer, const uint256& id, std::vector<ltc::ShareType>& shares)
+{
+    {
+        static int dbg_rep = 0;
+        if (dbg_rep < 20)
+        {
+            ++dbg_rep;
+            LOG_WARNING << "SHAREREPLY (after wait) #" << dbg_rep << " returning " << shares.size() << " shares to "
+                        << peer->addr().to_string();
+        }
+    }
+    std::vector<chain::RawShare> rshares;
+    try
+    {
+        for (auto& share : shares)
+            rshares.emplace_back(share.version(), pack(share));
+        peer->write(ltc::message_sharereply::make_raw(id, ltc::ShareReplyResult::good, rshares));
+    }
+    catch (const std::invalid_argument& e)
+    {
+        // Serialization overflow: the packed shares exceeded the P2P message
+        // size limit (32 MB). Reply with too_long so the peer requests a
+        // smaller batch. This is the correct behavior per Python p2pool.
+        LOG_WARNING << "Share reply too large, sending too_long: " << e.what();
+        peer->write(ltc::message_sharereply::make_raw(id, ltc::ShareReplyResult::too_long, {}));
+    }
+    // #1130: free the OWNED copies handle_get_share cloned. Each variant owns
+    // independent heap from clone(), so this never touches the pointers the
+    // sharechain still owns.
+    for (auto& share : shares)
+        share.destroy();
+    shares.clear();
+}
+
+bool NodeImpl::defer_sharereq(const peer_ptr& peer, const uint256& id, std::vector<uint256> hashes,
+                              uint64_t parents, std::vector<uint256> stops)
+{
+    const NetService addr = peer->addr();
+    const auto of_peer = static_cast<std::size_t>(std::count_if(
+        m_deferred_sharereqs.begin(), m_deferred_sharereqs.end(),
+        [&](const DeferredShareReq& d) { return d.addr == addr; }));
+    if (m_context && m_deferred_sharereqs.size() < SHAREREQ_DEFERRED_MAX
+        && of_peer < SHAREREQ_DEFERRED_PER_PEER)
+    {
+        ++m_sharereq_defer_stats.deferred;
+        m_deferred_sharereqs.push_back(DeferredShareReq{
+            peer, addr, id, std::move(hashes), parents, std::move(stops),
+            std::chrono::steady_clock::now() + m_sharereq_busy_budget});
+        arm_sharereq_retry();
+        return true;
+    }
+    ++m_sharereq_defer_stats.not_deferred;
+    static int busy_log = 0;
+    if (busy_log++ % 50 == 0)
+        LOG_INFO << "[handle_get_share] tracker busy — returning empty to "
+                 << peer->addr().to_string() << " (" << m_deferred_sharereqs.size()
+                 << " requests already waiting)";
+    return false;
+}
+
+void NodeImpl::arm_sharereq_retry(std::chrono::milliseconds after)
+{
+    if (m_sharereq_retry_armed || !m_context)
+        return;
+    if (!m_sharereq_retry_timer)
+        m_sharereq_retry_timer = std::make_unique<boost::asio::steady_timer>(*m_context);
+    m_sharereq_retry_armed = true;
+    m_sharereq_retry_timer->expires_after(after);
+    m_sharereq_retry_timer->async_wait([this](const boost::system::error_code& ec) {
+        if (ec)   // cancelled: the timer (and its node) is going away
+            return;
+        m_sharereq_retry_armed = false;
+        retry_deferred_sharereqs();
+    });
+}
+
+void NodeImpl::retry_deferred_sharereqs()
+{
+    // IO thread. Every waiting request gets one more non-blocking try; one past
+    // its deadline is answered with what that try got (empty while still busy).
+    // At most SHAREREQ_SERVED_PER_PASS are answered from the tracker per pass;
+    // the rest keep their place for the next pass.
+    auto waiting = std::move(m_deferred_sharereqs);
+    m_deferred_sharereqs.clear();
+    const auto now = std::chrono::steady_clock::now();
+    std::size_t served = 0;
+    for (auto& req : waiting)
+    {
+        if (served >= SHAREREQ_SERVED_PER_PASS)
+        {
+            m_deferred_sharereqs.push_back(std::move(req));
+            continue;
+        }
+        auto peer = req.peer.lock();
+        const bool connected = peer && std::any_of(m_peers.begin(), m_peers.end(),
+            [&](const auto& kv) { return kv.second == peer; });
+        if (!connected)
+        {
+            ++m_sharereq_defer_stats.peer_gone;
+            continue;
+        }
+        bool busy = false;
+        auto shares = handle_get_share(req.hashes, req.parents, req.stops, peer->addr(), &busy);
+        if (busy && now < req.deadline)
+        {
+            m_deferred_sharereqs.push_back(std::move(req));
+            continue;
+        }
+        if (busy)
+        {
+            ++m_sharereq_defer_stats.empty_after_wait;
+            static int expired_log = 0;
+            if (expired_log++ % 50 == 0)
+                LOG_INFO << "[handle_get_share] tracker still busy after "
+                         << m_sharereq_busy_budget.count() << " ms — returning empty to "
+                         << peer->addr().to_string();
+        }
+        else
+        {
+            ++m_sharereq_defer_stats.served_after_wait;
+            ++served;
+        }
+        m_sharereq_defer_stats.last_reply_shares = shares.size();
+        write_sharereply(peer, req.id, shares);
+    }
+    if (!m_deferred_sharereqs.empty())
+        arm_sharereq_retry(served >= SHAREREQ_SERVED_PER_PASS ? SHAREREQ_CONTINUE_INTERVAL
+                                                              : SHAREREQ_RETRY_INTERVAL);
 }
 
 std::vector<uint256> NodeImpl::send_shares(peer_ptr peer, const std::vector<uint256>& share_hashes)
@@ -1181,18 +1499,21 @@ std::vector<uint256> NodeImpl::send_shares(peer_ptr peer, const std::vector<uint
         return {};
     }
 
-    // Collect shares that exist in our chain (skip rejected)
+    // Collect shares that exist in our chain (no 3601 share to a peer that
+    // cannot load one). The own-share reject marks are NOT consulted here: the
+    // broadcast / re-advertise walks that build share_hashes apply them, and
+    // this function must send whatever its caller asked for.
+    const bool takes_3601 = peer_takes_3601(peer->m_other_version);
     std::vector<ShareType> shares;
     for (const auto& hash : share_hashes)
     {
         if (!m_chain->contains(hash))
             continue;
-        if (m_rejected_share_hashes.count(hash))
-            continue;
         // Retrieve the share via get_chain(hash, 1) — first element is the share itself
         for (auto [h, data] : m_chain->get_chain(hash, 1))
         {
-            shares.push_back(data.share);
+            if (takes_3601 || data.share.version() < FLAG_DAY_SHARE_VERSION)
+                shares.push_back(data.share);
             break;
         }
     }
@@ -1331,7 +1652,7 @@ std::vector<uint256> NodeImpl::send_shares(peer_ptr peer, const std::vector<uint
     for (size_t i = 0; i < shares.size(); ++i)
     {
         auto it = m_raw_share_cache.find(shares[i].hash());
-        if (it != m_raw_share_cache.end())
+        if (it != m_raw_share_cache.end() && it->second.type == static_cast<uint64_t>(shares[i].version()))
         {
             rshares.push_back(it->second);
         }
@@ -1460,7 +1781,9 @@ void NodeImpl::broadcast_share(const uint256& share_hash)
     // breaks on the marked hash, no retry path exists, and m_shared_share_hashes
     // is only ever cleared wholesale on overflow. A chain TIP lost that way is
     // silent PPLNS-credit loss. Mark only what reached >= 1 peer, below.
+    const auto mark_now = reject_mark_now();
     std::vector<uint256> to_send;
+    std::set<uint256> own;   // the locally minted subset of to_send
     int32_t height = m_chain->get_height(share_hash);
     int32_t walk = std::min(height, 5);
 
@@ -1468,8 +1791,10 @@ void NodeImpl::broadcast_share(const uint256& share_hash)
     {
         if (m_shared_share_hashes.count(hash))
             break;
-        if (m_rejected_share_hashes.count(hash))
-            continue; // skip shares previously rejected by peers
+        if (m_own_share_rejects.suppressed(hash, mark_now))
+            continue; // our own share a peer aborted on, within its TTL
+        if (share_locally_minted(data.share))
+            own.insert(hash);
         to_send.push_back(hash);
     }
 
@@ -1480,19 +1805,16 @@ void NodeImpl::broadcast_share(const uint256& share_hash)
     // runs. This counter is the one that stayed at zero in production.
     m_broadcast_reached_send.fetch_add(1, std::memory_order_relaxed);
 
-    auto now = std::chrono::steady_clock::now();
     std::vector<uint256> actually_sent;
     for (auto& [nonce, peer] : m_peers) {
         auto sent = send_shares(peer, to_send);
         actually_sent.insert(actually_sent.end(), sent.begin(), sent.end());
-        // Record what THIS peer was actually sent, not the pre-gate batch.
-        // error()/close_connection() turn this record into permanent entries in
-        // m_rejected_share_hashes when the peer drops within 10s — and that set
-        // is never cleared and also stops us serving those shares to syncing
-        // peers. Recording to_send would brand shares the gate withheld, or a
-        // whole batch send_shares abandoned, as "peer-rejected" despite never
-        // having been a byte on the wire.
-        m_last_broadcast_to[peer->addr()] = {sent, now};
+        // Record only OUR OWN shares that THIS peer was actually sent, not the
+        // pre-gate batch: a share the gate withheld, or a batch send_shares
+        // abandoned, was never a byte on the wire, and a share we received is
+        // never ours to hold off. error() can turn this record into a TTL'd
+        // re-broadcast hold-off if the peer aborts within the window.
+        m_own_share_rejects.note_push(peer->addr(), own_subset(sent, own), mark_now);
     }
     // Mark ONLY the shares a peer actually accepted for write; anything skipped
     // for every peer (or with no peers connected) stays unmarked and is retried
@@ -1513,10 +1835,22 @@ void NodeImpl::notify_local_share(const uint256& share_hash)
     // chain nodes -> SIGSEGV (kr1z1s LTC/DGB). try_to_lock keeps the IO thread
     // non-blocking; if think()/clean holds the lock we skip the inline verify —
     // the share is already in-chain and run_think() below will score it next cycle.
+    //
+    // attempt_verify fires the tracker hooks synchronously, under this lock:
+    // m_on_block_found and m_on_merged_block_check (main_ltc) read the share
+    // through read_tracker(). This thread owns the mutex exclusively, and a
+    // shared try-lock by its owner is undefined behaviour (glibc refuses it),
+    // so the hooks bailed: a block our own share solved got no found-block
+    // row from this path, a DOGE one no merged row. The mark makes
+    // read_tracker() on this thread read under the lock already held, as on
+    // the compute thread, where the same hooks fire for every verified share.
     {
         std::unique_lock lock(m_tracker_mutex, std::try_to_lock);
-        if (lock.owns_lock() && m_tracker.chain.contains(share_hash))
-            m_tracker.attempt_verify(share_hash);
+        if (lock.owns_lock()) {
+            TrackerLockHolderMark holder(this);   // ends before the unlock
+            if (m_tracker.chain.contains(share_hash))
+                m_tracker.attempt_verify(share_hash);
+        }
     }
 
     // Trigger async think() — will pick up the local share through scoring.
@@ -1526,8 +1860,9 @@ void NodeImpl::notify_local_share(const uint256& share_hash)
 uint256 NodeImpl::best_share_hash()
 {
     // Reader discipline (m_tracker_mutex, node.hpp): never block, never read
-    // the tracker unlocked. The compute thread already holds the lock.
-    if (is_compute_thread())
+    // the tracker unlocked. The compute thread already holds the lock, and so
+    // does a thread inside notify_local_share's exclusive verify.
+    if (holds_tracker_lock())
         return best_share_hash_and_publish();
     std::shared_lock<std::shared_mutex> lock(m_tracker_mutex, std::try_to_lock);
     if (!lock.owns_lock())
@@ -1658,7 +1993,7 @@ uint256 NodeImpl::advertised_best_share()
     // nothing to advertise yet; the re-advert timer and the next best-share
     // change push the head once the lock is free.
     std::shared_lock<std::shared_mutex> lock(m_tracker_mutex, std::defer_lock);
-    if (!is_compute_thread() && !lock.try_lock())
+    if (!holds_tracker_lock() && !lock.try_lock())
         return uint256::ZERO;
     if (m_chain && m_chain->size() > 0) {
         uint256 best;
@@ -1703,24 +2038,27 @@ void NodeImpl::readvertise_best_share()
     if (!m_chain->contains(head))
         return;
 
+    const auto mark_now = reject_mark_now();
     std::vector<uint256> to_send;
+    std::set<uint256> own;   // the locally minted subset of to_send
     int32_t height = m_chain->get_height(head);
     int32_t walk = std::min(height, 5);
     for (auto [hash, data] : m_chain->get_chain(head, walk)) {
-        if (m_rejected_share_hashes.count(hash))
-            continue; // never re-broadcast peer-rejected shares
+        if (m_own_share_rejects.suppressed(hash, mark_now))
+            continue; // our own share a peer aborted on, within its TTL
+        if (share_locally_minted(data.share))
+            own.insert(hash);
         to_send.push_back(hash);
     }
     if (to_send.empty())
         return;
 
-    auto now = std::chrono::steady_clock::now();
     for (auto& [nonce, peer] : m_peers) {
         auto sent = send_shares(peer, to_send);
-        // Per-peer sent set, not the pre-gate batch — see broadcast_share for
-        // why recording to_send here can brand a never-sent share as
-        // permanently peer-rejected.
-        m_last_broadcast_to[peer->addr()] = {sent, now};
+        // Own shares actually sent to THIS peer only; see broadcast_share.
+        // Other miners' head shares are re-pushed here on every best change,
+        // which is how dba0be63d came to brand them.
+        m_own_share_rejects.note_push(peer->addr(), own_subset(sent, own), mark_now);
     }
     LOG_INFO << "[readvertise] re-pushed " << to_send.size()
              << " head share(s) to " << m_peers.size() << " peer(s) (ROOT-2)";
@@ -1765,21 +2103,22 @@ void NodeImpl::download_shares(peer_ptr advertiser, const uint256& target_hash,
     std::optional<NetService> advertiser_key;
     if (advertiser) advertiser_key = advertiser->addr();
 
-    // #25(C): pick a peer that has NOT recently failed this exact hash, preferring
-    // the advertiser. nullopt => every peer has failed it within the TTL: back off
-    // this cycle (the failures age out and a different desired parent is tried).
+    // Pick a peer that has not failed this exact hash (30 min memory), the
+    // advertiser first while it has not; once every connected peer has failed
+    // it, the one that failed it longest ago (FetchPeerRotation). The pacer, not
+    // this choice, decides WHEN a hash every peer failed is asked again.
     const double fnow = static_cast<double>(std::time(nullptr));
     std::optional<NetService> chosen_key;
     {
         std::lock_guard<std::mutex> g(m_fetch_failover_mtx);
         m_fetch_failures.prune(fnow);
         m_peer_keys_snapshot = peer_keys;  // keep fresh for clean_tracker's parent_abandoned
-        chosen_key = m_fetch_failures.choose(
-            target_hash, advertiser_key, peer_keys, fnow,
-            [](std::size_t n) -> std::size_t {
-                return static_cast<std::size_t>(core::random::random_uint256().GetLow64() % n);
-            });
     }
+    chosen_key = m_fetch_rotation.choose(
+        target_hash, advertiser_key, peer_keys, fnow,
+        [](std::size_t n) -> std::size_t {
+            return static_cast<std::size_t>(core::random::random_uint256().GetLow64() % n);
+        });
     if (!chosen_key.has_value()) {
         m_downloading_shares.erase(target_hash);
         return;
@@ -1865,31 +2204,71 @@ void NodeImpl::download_shares(peer_ptr advertiser, const uint256& target_hash,
 
     request_shares(req_id, peer, hashes, parents, stops,
         [this, weak_peer, target_hash, peer_addr_for_log, req_id, chosen_key_val,
-         walk_depth](ltc::ShareReplyData reply)
+         advertiser_key, walk_depth](ltc::ShareReplyData reply)
         {
             m_downloading_shares.erase(target_hash);
             m_pending_share_reqs.erase(req_id);
 
             if (reply.empty())
             {
-                // Empty reply = timeout or this peer had no matching shares.
-                // #25(C): remember the (hash, peer) failure so we fail over to a
-                // DIFFERENT peer next cycle, and only abandon the head once the
-                // whole peer set has failed it (see FetchFailureMemory::abandoned).
+                // Empty reply = timeout, disconnect, or this peer had no
+                // matching shares. #25(C): remember the (hash, peer) failure; the
+                // head is abandoned only once the whole peer set has failed it
+                // within 90 s (FetchFailureMemory::abandoned, unchanged).
+                const double now = static_cast<double>(std::time(nullptr));
                 {
                     std::lock_guard<std::mutex> g(m_fetch_failover_mtx);
-                    m_fetch_failures.record(target_hash, chosen_key_val,
-                                            static_cast<double>(std::time(nullptr)));
+                    m_fetch_failures.record(target_hash, chosen_key_val, now);
                 }
-                // Futility backoff (io thread): damp THIS hash for a growing
-                // interval so a desired set nobody can serve stops being
-                // re-requested at full rate every think() cycle.
-                m_desired_pacer.record_empty(
-                    target_hash, static_cast<double>(std::time(nullptr)));
+                std::vector<NetService> connected;
+                connected.reserve(m_peers.size());
+                for (const auto& [nonce, p] : m_peers)
+                    if (p) connected.push_back(p->addr());
+                if (m_fetch_rotation.record_failure(target_hash, chosen_key_val, connected, now))
+                {
+                    // Already being fetched by another request, or already
+                    // held (it arrived another way): nothing to ask for.
+                    if (m_downloading_shares.count(target_hash))
+                        return;
+                    {
+                        std::shared_lock<std::shared_mutex> lock(m_tracker_mutex, std::try_to_lock);
+                        if (lock.owns_lock() && m_chain && m_chain->contains(target_hash))
+                        {
+                            m_fetch_rotation.clear_hash(target_hash);
+                            m_desired_pacer.record_success(target_hash);
+                            return;
+                        }
+                    }
+                    // A connected peer has not been asked for it yet: ask it
+                    // now, no backoff. The peer that holds the share is often
+                    // not the one that advertised it.
+                    LOG_INFO << "[Pool] Share request empty for "
+                             << target_hash.ToString().substr(0,16)
+                             << " from " << peer_addr_for_log.to_string()
+                             << " (asking an untried peer next)";
+                    if (m_pending_desired.size() < DESIRED_QUEUE_MAX)
+                    {
+                        m_pending_desired.push_front(DesiredRequest{
+                            advertiser_key.value_or(NetService{}), target_hash, walk_depth});
+                        // Not from inside this callback: it also runs from
+                        // error()/close_connection() cancelling a dropped
+                        // peer's requests.
+                        if (m_context)
+                            schedule_desired_drain();
+                        else
+                            drain_pending_desired();
+                    }
+                    return;
+                }
+                // Every connected peer has failed it. Futility backoff (io
+                // thread): damp THIS hash for a growing interval so a desired
+                // set nobody can serve stops being re-requested at full rate
+                // every think() cycle.
+                m_desired_pacer.record_empty(target_hash, now);
                 LOG_INFO << "[Pool] Share request empty for "
                          << target_hash.ToString().substr(0,16)
                          << " from " << peer_addr_for_log.to_string()
-                         << " (failing over to another peer)";
+                         << " (every connected peer has failed it; backing off)";
                 return;
             }
 
@@ -1898,6 +2277,7 @@ void NodeImpl::download_shares(peer_ptr advertiser, const uint256& target_hash,
                 std::lock_guard<std::mutex> g(m_fetch_failover_mtx);
                 m_fetch_failures.clear_hash(target_hash);
             }
+            m_fetch_rotation.clear_hash(target_hash);
             m_desired_pacer.record_success(target_hash);
 
             auto& owned = *reply.m_owned;
@@ -1996,8 +2376,9 @@ void NodeImpl::drain_pending_desired()
     while (!m_pending_desired.empty() && processed < DESIRED_REQUEST_BUDGET) {
         auto entry = m_pending_desired.front();
         m_pending_desired.pop_front();
-        // Futility backoff. A hash whose last reply was empty is skipped until
-        // its backoff expires; unknown and healthy hashes are always eligible.
+        // Futility backoff. A hash every connected peer has answered empty is
+        // skipped until its backoff expires; unknown and healthy hashes, and
+        // hashes some connected peer has not failed yet, are always eligible.
         // A skip does NOT consume budget -- it is a map lookup, and the point of
         // the pass is to reach the hashes that can still be served.
         if (!m_desired_pacer.eligible(entry.hash, now))
@@ -2038,36 +2419,44 @@ void NodeImpl::load_persisted_shares()
     if (!m_storage || !m_storage->is_available())
         return;
 
-    // load_sharechain iterates the height index and loads each share.
-    // Limit to keep_per_head shares to avoid loading unbounded history
-    // into memory (LevelDB is never pruned, so it accumulates forever).
-    LOG_INFO << "[Pool] Scanning LevelDB height index for persisted shares...";
+    // Every stored share's own index record (absheight, verified), not the
+    // height index: that one lost a height's main-chain share whenever a fork
+    // share of the height was pruned, and a graceful stop skips its rebuild,
+    // so a restart reloaded a fraction of the window in fragments and could
+    // not reconnect its tip (persisted_reload.hpp). Reload every share in the
+    // 2*CHAIN_LENGTH+10 absheights ending at the highest verified share, and
+    // everything above it, in absheight order (parents before children).
+    LOG_INFO << "[Pool] Scanning LevelDB share index for persisted shares...";
     auto t0 = std::chrono::steady_clock::now();
-    auto all_hashes = m_storage->get_shares_by_height_range(0, UINT64_MAX);
+    std::vector<core::SharechainLevelDBStore::IndexEntry> entries;
+    if (!m_storage->scan_share_index(entries))
+    {
+        LOG_ERROR << "[Pool] LevelDB share index scan failed — starting without persisted shares";
+        return;
+    }
     auto scan_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - t0).count();
-    {
-        std::set<uint256> unique(all_hashes.begin(), all_hashes.end());
-        LOG_INFO << "[Pool] Height index scan: " << all_hashes.size() << " entries ("
-                 << unique.size() << " unique) in " << scan_ms << "ms";
-    }
-    if (all_hashes.empty())
+    if (entries.empty())
     {
         LOG_INFO << "No persisted shares found in LevelDB";
         return;
     }
 
-    const size_t keep_per_head = m_tracker.m_params->chain_length * 2 + 10;
-    const size_t total_in_db = all_hashes.size();
-
-    // Only load the most recent shares (highest height = end of vector)
-    size_t skip = 0;
-    if (total_in_db > keep_per_head)
-    {
-        skip = total_in_db - keep_per_head;
-        LOG_INFO << "[Pool] LevelDB has " << total_in_db << " shares, loading only newest "
-                 << keep_per_head << " (skipping " << skip << " old shares)";
-    }
+    const uint64_t keep_per_head = m_tracker.m_params->chain_length * 2 + 10;
+    const size_t total_in_db = entries.size();
+    const ltc::ReloadWindow window = ltc::reload_window(entries, keep_per_head);
+    const size_t first = static_cast<size_t>(
+        std::lower_bound(entries.begin(), entries.end(), window.low,
+                         [](const core::SharechainLevelDBStore::IndexEntry& e, uint64_t h) {
+                             return e.height < h;
+                         })
+        - entries.begin());
+    const size_t skip = first;   // entries below the window
+    LOG_INFO << "[Pool] Share index scan: " << total_in_db << " shares, absheight "
+             << entries.front().height << ".." << entries.back().height << " in " << scan_ms
+             << "ms; reloading absheight >= " << window.low << " (anchor " << window.anchor
+             << (window.anchored_on_verified ? ", highest verified" : ", highest stored; none verified")
+             << ", window " << keep_per_head << "), " << skip << " older";
 
     const size_t to_load = total_in_db - skip;
     LOG_INFO << "[Pool] Loading shares from LevelDB: " << to_load << " shares to process...";
@@ -2075,7 +2464,7 @@ void NodeImpl::load_persisted_shares()
     std::vector<uint256> verified_hashes; // shares to pre-populate into verified
     for (size_t i = skip; i < total_in_db; ++i)
     {
-        const auto& hash = all_hashes[i];
+        const auto& hash = entries[i].hash;
         std::vector<uint8_t> data;
         core::ShareMetadata meta;
         if (!m_storage->load_share(hash, data, meta)) {
@@ -2097,6 +2486,16 @@ void NodeImpl::load_persisted_shares()
             PackStream ps(share_bytes);
 
             auto share = ltc::load_share(static_cast<int64_t>(ver), ps, NetService{"database", 0});
+            // A stored share whose type number does not fit its timestamp
+            // (the flag day): never into the tracker.
+            if (const auto why = received_share_flag_day_problem(share); !why.empty()) {
+                ++skipped_load;
+                static int misfit_log = 0;
+                if (misfit_log++ < 5)
+                    LOG_WARNING << "[Pool] LevelDB share " << hash.GetHex().substr(0, 16) << " not loaded: " << why;
+                share.destroy();
+                continue;
+            }
             // m_hash is not part of the serialized format — it's computed
             // during share_check validation.  Restore it from the LevelDB key.
             share.ACTION({ obj->m_hash = hash; });
@@ -2176,20 +2575,39 @@ void NodeImpl::load_persisted_shares()
         LOG_INFO << "[Pool] Pre-populated " << pre_verified << " verified shares from LevelDB";
 
     LOG_INFO << "[Pool] Loaded " << loaded << " shares from LevelDB storage"
-             << " (DB total: " << total_in_db << ", limit: " << keep_per_head
+             << " (DB total: " << total_in_db << ", window: " << keep_per_head
+             << " absheights from " << window.low
              << ", skipped: load=" << skipped_load << " small=" << skipped_small
-             << " dup=" << skipped_contains << ")";
+             << " dup=" << skipped_contains << ") in "
+             << std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - t0).count()
+             << "ms";
 
-    // Prune old shares from LevelDB that we skipped
-    if (skip > 0)
+    // Prune the shares below the window (they are never reloaded, so nothing
+    // else would ever remove them) — only below a VERIFIED anchor: an
+    // unverified absheight is a peer's claim and never decides a deletion.
+    if (skip > 0 && window.prune_below)
     {
+        constexpr size_t PRUNE_CHUNK = 2000;   // one WriteBatch per chunk
         size_t pruned = 0;
+        std::vector<uint256> chunk;
+        chunk.reserve(PRUNE_CHUNK);
         for (size_t i = 0; i < skip; ++i)
         {
-            if (m_storage->remove_share(all_hashes[i]))
-                ++pruned;
+            chunk.push_back(entries[i].hash);
+            if (chunk.size() == PRUNE_CHUNK || i + 1 == skip)
+            {
+                if (m_storage->remove_shares_batch(chunk))
+                    pruned += chunk.size();
+                chunk.clear();
+            }
         }
         LOG_INFO << "[Pool] Pruned " << pruned << " old shares from LevelDB";
+    }
+    else if (skip > 0)
+    {
+        LOG_INFO << "[Pool] Kept " << skip << " shares below the reload window in LevelDB:"
+                 << " no verified share anchors the window";
     }
 }
 
@@ -2258,6 +2676,10 @@ void NodeImpl::start_outbound_connections()
         m_tx_advert_timer = std::make_unique<core::Timer>(m_context, true);
         m_tx_advert_timer->start(core::TX_ADVERT_INTERVAL_SECONDS,
                                  [this]() { advertise_known_txs(); });
+        // Share version 3601 flag day: no peer below 3601 stays past it (a
+        // timer of its own: on a quiet chain no think cycle runs).
+        m_flag_day_timer = std::make_unique<core::Timer>(m_context, true);
+        m_flag_day_timer->start(5, [this]() { disconnect_pre_3601_peers(); });
     }
 
     if (m_target_outbound_peers == 0)
@@ -2281,6 +2703,11 @@ void NodeImpl::start_outbound_connections()
                 break;
             // Skip if already connected, already dialing, or banned
             if (m_connections.contains(ap.addr) || m_pending_outbound.contains(ap.addr) || is_banned(ap.addr))
+                continue;
+            // A peer refused as too old for share version 3601: not redialed
+            // for an hour (it is not banned).
+            if (auto old = m_pre_3601_until.find(ap.addr);
+                old != m_pre_3601_until.end() && old->second > std::chrono::steady_clock::now())
                 continue;
 
             LOG_INFO << "[Pool] Dialing outbound peer " << ap.addr.to_string();
@@ -2494,10 +2921,16 @@ void NodeImpl::run_think()
 {
     // Skip if a think() is already running on the compute thread.
     // The atomic flag serializes: only one think() in flight at a time.
-    if (m_think_running.exchange(true)) {
+    // A skipped request is remembered (m_rethink_pending) and the cycle that
+    // holds the slot posts one run_think() from its epilogue: the slot is
+    // still held after the compute thread released the tracker lock, so a
+    // share minted or received in that window (notify_local_share,
+    // processing_shares_phase2) was in the chain but never elected.
+    if (!ltc::think::acquire_think_slot(m_think_running, m_rethink_pending)) {
         static int skip_log = 0;
         if (skip_log++ % 20 == 0)
-            LOG_INFO << "[ASYNC-THINK] skipped — compute thread busy (skip_count=" << skip_log << ")";
+            LOG_INFO << "[ASYNC-THINK] skipped — compute thread busy, re-think queued (skip_count="
+                     << skip_log << ")";
         return;
     }
 
@@ -2655,6 +3088,15 @@ void NodeImpl::run_think()
       // The mutex is NOT held — IO thread can acquire it for drain_pending.
       boost::asio::post(*m_context, [this, result = std::move(result),
                                       best_changed, needs_continue]() {
+        // Release the think slot once, on whichever path gets there first: a
+        // second release could clear the slot of a cycle started since.
+        bool slot_released = false;
+        auto release_slot = [this, &slot_released]() -> bool {
+            if (slot_released)
+                return false;
+            slot_released = true;
+            return ltc::think::release_think_slot(m_think_running, m_rethink_pending);
+        };
         try {
             // think() returned normally — disarm the watchdog for this cycle.
             disarm_think_watchdog();
@@ -2675,6 +3117,7 @@ void NodeImpl::run_think()
                 else ++it;
             }
 
+
             // Clear stale download set (p2pool node.py:108-141)
             m_downloading_shares.clear();
 
@@ -2688,9 +3131,12 @@ void NodeImpl::run_think()
                 std::lock_guard<std::mutex> g(m_fetch_failover_mtx);
                 m_fetch_failures.prune(static_cast<double>(std::time(nullptr)));
             }
+            m_fetch_rotation.prune(static_cast<double>(std::time(nullptr)));
             // #1601: drop invalid-PoW scorer entries that have decayed to ~0, so
             // the misbehavior map stays bounded even under identity cycling.
             prune_pow_misbehavior();
+            // Expire own-share re-broadcast hold-offs and stale push records.
+            m_own_share_rejects.prune(reject_mark_now());
             // #1716 part B: apply the hourly canonical banscore forgiveness.
             run_forgiveness(std::chrono::steady_clock::now());
             // Keep the peer-key snapshot fresh for clean_tracker's parent_abandoned.
@@ -2762,20 +3208,27 @@ void NodeImpl::run_think()
 
             // Clear flag AFTER drain — prevents new think() from starting
             // while deferred shares are still being added to the tracker.
-            m_think_running.store(false);
-            LOG_INFO << "[ASYNC-THINK] cycle complete — IO thread free";
+            // The release reports whether a run_think() was skipped while
+            // this cycle held the slot (a share minted or drained above):
+            // serve it, once, or its election waits for some later trigger.
+            const bool rethink_owed = release_slot();
+            LOG_INFO << "[ASYNC-THINK] cycle complete — IO thread free"
+                     << (rethink_owed ? " (re-think queued)" : "");
 
             // If verification budget was exhausted, schedule continuation.
             // The IO thread processes network I/O between verification batches.
-            if (needs_continue) {
+            // One post serves both.
+            if (needs_continue || rethink_owed) {
                 boost::asio::post(*m_context, [this]() { run_think(); });
             }
         } catch (const std::exception& e) {
             LOG_ERROR << "run_think() IO phase failed: " << e.what();
-            m_think_running.store(false);
+            if (release_slot())
+                boost::asio::post(*m_context, [this]() { run_think(); });
         } catch (...) {
             LOG_ERROR << "run_think() IO phase failed: unknown error";
-            m_think_running.store(false);
+            if (release_slot())
+                boost::asio::post(*m_context, [this]() { run_think(); });
         }
       });
     });
@@ -2975,7 +3428,10 @@ void NodeImpl::clean_tracker()
         return;
 
     // Skip if think() is already in flight — the 5s timer will retry.
-    if (m_think_running.load()) {
+    // Taking the slot is one compare-exchange (it blocks think() re-entry
+    // during clean): a run_think() from another thread (the HTTP submit path)
+    // cannot take it between a check and a store.
+    if (!ltc::think::acquire_clean_slot(m_think_running)) {
         m_clean_running.store(false);
         return;
     }
@@ -2983,7 +3439,6 @@ void NodeImpl::clean_tracker()
     // Post the entire clean_tracker body to the compute thread.
     // This guarantees chain modifications happen under exclusive lock,
     // never concurrent with think() or IO-thread reads.
-    m_think_running.store(true);  // block think() re-entry during clean
 
     // clean_tracker runs think()+the removal walk under the same exclusive
     // lock — arm the watchdog here too (disarmed in this path's IO-phase).
@@ -2994,12 +3449,19 @@ void NodeImpl::clean_tracker()
 
       bool clean_best_changed = false;
       bool bootstrap = false;
+      // The tip when this cycle took the lock, and after the last step that
+      // set it. Step 1 and Step 4 both run think() and set the best share;
+      // the change the miners must hear about is entry -> exit, wherever in
+      // the cycle it happened (a Step-1 move used to be compared away).
+      uint256 best_at_entry;
+      uint256 best_at_exit;
       // v36-0.24 #25(B): the missing parents think() still wants (its `desired`
       // set), captured from Step-1's think() result and consulted by Step-2's head
       // GC so a head we are ACTIVELY downloading toward is not purged mid-catch-up.
       std::set<uint256> desired_parents;
       try {
         std::unique_lock lock(m_tracker_mutex);  // exclusive
+        best_at_entry = best_at_exit = m_best_share_hash;
 
         // Step 1: Run think() inline (already holds the lock)
         {
@@ -3037,6 +3499,7 @@ void NodeImpl::clean_tracker()
 
             if (!result.best.IsNull()) {
                 m_best_share_hash = result.best;
+                best_at_exit = m_best_share_hash;
                 // Same critical section as the decision: the merged payouts
                 // for this best share are available before the prune below
                 // (which can hold the lock for a long time).
@@ -3271,8 +3734,8 @@ void NodeImpl::clean_tracker()
                                       m_supersede_hint);
         m_last_top5_heads = std::move(result.top5_heads);
         if (!result.best.IsNull()) {
-            clean_best_changed = (m_best_share_hash != result.best);
             m_best_share_hash = result.best;
+            best_at_exit = m_best_share_hash;
         }
         publish_snapshot();
         flush_verified_to_leveldb();
@@ -3351,21 +3814,42 @@ void NodeImpl::clean_tracker()
       } catch (...) {
         LOG_ERROR << "[CLEAN] failed on compute thread: unknown error";
       }
+      // Entry against exit: a best share Step 1 moved and Step 4 kept is a
+      // change (it was compared Step 4 against Step 1 and never notified),
+      // and one a later step threw past still is. Notified once, below.
+      clean_best_changed = ltc::think::clean_cycle_best_changed(best_at_entry, best_at_exit);
       // Lock released — post work refresh + drain to IO thread.
       // Work refresh (1-5s) runs WITHOUT any lock so shared_lock readers
       // (handle_get_share, send_shares) are never blocked.
       boost::asio::post(*m_context, [this, clean_best_changed]() {
-        disarm_think_watchdog();
-        // Enforce the cache_max_* limits. This is the ONLY call site: the code
-        // that used to do it (prune_shares) was never called at all.
-        evict_caches_io_phase();
-        if (clean_best_changed && m_on_best_share_changed) {
-            LOG_INFO << "[CLEAN] IO-phase: work refresh (best changed)";
-            m_on_best_share_changed();
+        // A throw here used to leave m_think_running and m_clean_running set
+        // for good (no think, no clean, until a watchdog that this very
+        // handler disarmed): the flags are released after the try.
+        try {
+            disarm_think_watchdog();
+            // Enforce the cache_max_* limits. This is the ONLY call site: the code
+            // that used to do it (prune_shares) was never called at all.
+            evict_caches_io_phase();
+            if (clean_best_changed && m_on_best_share_changed) {
+                LOG_INFO << "[CLEAN] IO-phase: work refresh (best changed)";
+                m_on_best_share_changed();
+            }
+            // Peers learn the new best share the way they do after a think
+            // (run_think's IO phase): re-push the head walk.
+            if (clean_best_changed && !m_peers.empty())
+                readvertise_best_share();
+            drain_pending_adds();
+        } catch (const std::exception& e) {
+            LOG_ERROR << "[CLEAN] IO phase failed: " << e.what();
+        } catch (...) {
+            LOG_ERROR << "[CLEAN] IO phase failed: unknown error";
         }
-        drain_pending_adds();
-        m_think_running.store(false);
+        // The clean cycle holds the think slot too: a run_think() skipped
+        // during it (a mint, a peer batch) is served now.
+        const bool rethink_owed = ltc::think::release_think_slot(m_think_running, m_rethink_pending);
         m_clean_running.store(false);
+        if (rethink_owed)
+            boost::asio::post(*m_context, [this]() { run_think(); });
       });
     }); // end of m_think_pool lambda
 }

@@ -68,7 +68,9 @@ public:
         return it == m_state.end() || now >= it->second.next_eligible;
     }
 
-    // An empty reply came back for `hash`: double its backoff (clamped to cap).
+    // `hash` came back empty and no connected peer is left that has not failed
+    // it (node.cpp asks the untried ones first, at once — FetchPeerRotation):
+    // double its backoff (clamped to cap).
     void record_empty(const HashT& hash, double now)
     {
         auto& s = m_state[hash];
@@ -86,6 +88,16 @@ public:
     void record_success(const HashT& hash)
     {
         m_state.erase(hash);
+    }
+
+    // A peer connected: it has been asked for none of the backed-off hashes, so
+    // every one of them may be asked again now. The exponent is kept — if the
+    // new peer fails a hash too, its next backoff continues from where it was.
+    void make_all_eligible(double now)
+    {
+        for (auto& [hash, s] : m_state)
+            if (s.next_eligible > now)
+                s.next_eligible = now;
     }
 
     // Drop entries that have been eligible again for longer than kForgetAfter.

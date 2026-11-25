@@ -27,8 +27,12 @@
 #include <core/uint256.hpp>
 #include <core/web_server.hpp>   // MiningInterface: the found-block rows this store persists
 
+#include "found_block_records_2e6db7b5f.hpp"   // the earlier build's own record serializers
+
 #include <algorithm>
 #include <atomic>
+#include <cstdint>
+#include <limits>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -54,6 +58,11 @@ struct Bytes {
     Bytes& str(const std::string& s) { u8(uint8_t(s.size())); v.insert(v.end(), s.begin(), s.end()); return *this; }
     Bytes& dbl(double d) { uint64_t b; std::memcpy(&b, &d, 8); return u64(b); }
 };
+
+// The bytes each serializer writes after its last versioned tail: the fblk
+// extension byte (aux_difficulty_known) and the mblk aux difficulty (a u64).
+constexpr size_t kFblkExt = 1;
+constexpr size_t kMblkExt = 8;
 
 // Two 64-char hashes sharing their first 16 chars (the part the key keeps).
 const std::string kHashA = std::string(16, '5') + std::string(48, 'a');
@@ -201,9 +210,9 @@ TEST(FoundBlockStoreKat, TruncatedTailLeavesTxCountUnknown)
     FoundBlockRecord f = FoundBlockRecord::deserialize(fblk_v2_record().v);
     f.tx_count = 7;
     auto fb = f.serialize();
-    // Cuts the v3 tail: drops the empty v4 parent tail (len + flag + u64) and
-    // the last 2 bytes of the tx_count u32.
-    fb.resize(fb.size() - (1 + 1 + 8) - 2);
+    // Cuts the v3 tail: drops the extension byte, the empty v4 parent tail
+    // (len + flag + u64) and the last 2 bytes of the tx_count u32.
+    fb.resize(fb.size() - kFblkExt - (1 + 1 + 8) - 2);
     auto back = FoundBlockRecord::deserialize(fb);
     EXPECT_EQ(back.block_hash, kHashA);
     EXPECT_FALSE(back.tx_count.has_value());
@@ -213,7 +222,7 @@ TEST(FoundBlockStoreKat, TruncatedTailLeavesTxCountUnknown)
     MergedBlockRecord m = MergedBlockRecord::deserialize(mblk_v1_record(98, 1, kHashA).v);
     m.tx_count = 7;
     auto mb = m.serialize();
-    mb.resize(mb.size() - 2);
+    mb.resize(mb.size() - kMblkExt - 2);   // the difficulty, then 2 of tx_count
     EXPECT_FALSE(MergedBlockRecord::deserialize(mb).tx_count.has_value());
 }
 
@@ -226,7 +235,7 @@ TEST(FoundBlockStoreKat, CutTxCountDoesNotLeakIntoTheParentTail)
     for (auto [tx_count, kept] : {std::pair<uint32_t, size_t>{1, 2}, {1, 3}, {258, 3}}) {
         f.tx_count = tx_count;
         auto fb = f.serialize();
-        fb.resize(fb.size() - (1 + 1 + 8) - (4 - kept));
+        fb.resize(fb.size() - kFblkExt - (1 + 1 + 8) - (4 - kept));
         auto back = FoundBlockRecord::deserialize(fb);
         EXPECT_EQ(back.block_hash, kHashA) << tx_count << "/" << kept;
         EXPECT_FALSE(back.tx_count.has_value()) << tx_count << "/" << kept;
@@ -318,8 +327,133 @@ TEST(FoundBlockStoreKat, FblkV4CarriesTheMergedParent)
     // A cut parent_height stays unknown, never 0.
     rec.parent_height = 2900001;
     auto cut = rec.serialize();
-    cut.resize(cut.size() - 3);
+    cut.resize(cut.size() - kFblkExt - 3);
     EXPECT_FALSE(FoundBlockRecord::deserialize(cut).parent_height.has_value());
+}
+
+// The byte after the v4 tail says a merged row's network_difficulty is the
+// AUX chain's own (a row written before it holds the parent's). It is an
+// extension WITHOUT a version bump: a build that predates it refuses any
+// version above 4 and would lose the row, but stops reading after the v4 tail
+// and so never sees the byte.
+TEST(FoundBlockStoreKat, FblkExtensionByteCarriesTheAuxDifficultyFlag)
+{
+    FoundBlockRecord rec = FoundBlockRecord::deserialize(fblk_v2_record().v);
+    rec.chain = "DOGE";
+    rec.parent_hash = hash_n(0x17c);
+    rec.network_difficulty = 33000000.0;
+
+    // Written before the flag existed: no byte, not known.
+    auto old_row = rec.serialize();
+    ASSERT_EQ(old_row[0], 4) << "no version bump";
+    old_row.resize(old_row.size() - kFblkExt);
+    auto back = FoundBlockRecord::deserialize(old_row);
+    EXPECT_EQ(back.block_hash, kHashA);
+    EXPECT_EQ(back.parent_hash, hash_n(0x17c));
+    EXPECT_FALSE(back.aux_difficulty_known);
+
+    // Default false round-trips false; set, it round-trips true.
+    EXPECT_FALSE(FoundBlockRecord::deserialize(rec.serialize()).aux_difficulty_known);
+    rec.aux_difficulty_known = true;
+    const auto with_flag = rec.serialize();
+    back = FoundBlockRecord::deserialize(with_flag);
+    EXPECT_TRUE(back.aux_difficulty_known);
+    EXPECT_DOUBLE_EQ(back.network_difficulty, 33000000.0);
+    EXPECT_EQ(back.parent_hash, hash_n(0x17c));
+
+    // The row is the pre-extension row plus one byte: an earlier build reads
+    // the same bytes up to the v4 tail and gets every field it knows.
+    ASSERT_EQ(with_flag.size(), old_row.size() + kFblkExt);
+    EXPECT_TRUE(std::equal(old_row.begin(), old_row.end(), with_flag.begin()));
+
+    // A cut v4 tail never turns leftover bytes into the flag.
+    auto cut = with_flag;
+    cut.resize(cut.size() - kFblkExt - 3);
+    EXPECT_FALSE(FoundBlockRecord::deserialize(cut).aux_difficulty_known);
+}
+
+// The source node's measured effort of an imported row's round rides a tail
+// AFTER the extension byte, behind its bit 0x04 -- no version bump. A row
+// without one is byte for byte what the earlier writer wrote; with one it is
+// that row plus the tail. Every earlier build stops reading at (or before)
+// the extension byte, so it loads such a row with every field it knows; when
+// it writes the row back it drops the tail and the bit, which reads here as
+// "no imported effort".
+TEST(FoundBlockStoreKat, ImportedEffortRidesATailBehindItsExtensionBit)
+{
+    FoundBlockRecord rec = FoundBlockRecord::deserialize(fblk_v2_record().v);
+    rec.chain = "DOGE";
+    rec.parent_hash = hash_n(0x17c);
+    rec.parent_height = 3211872;
+    rec.aux_difficulty_known = true;
+    rec.imported = true;
+    const auto without = rec.serialize();
+    ASSERT_EQ(without[0], 4) << "no version bump";
+    EXPECT_EQ(without.back(),
+              FoundBlockRecord::kExtAuxDifficultyKnown | FoundBlockRecord::kExtImported);
+    auto back = FoundBlockRecord::deserialize(without);
+    EXPECT_FALSE(back.has_imported_effort());
+    EXPECT_DOUBLE_EQ(back.imported_effort, 0.0);
+
+    // DOGE 6454700 as ltc.voidbind.com measured it.
+    rec.imported_effort = 1.3911304960028799;
+    rec.imported_coverage = 1.0;
+    rec.imported_prev_hash = hash_n(0xb9ed3c3d);
+    const auto with = rec.serialize();
+    ASSERT_EQ(with[0], 4);
+    ASSERT_EQ(with.size(), without.size() + 8 + 8 + 1 + 64);
+    EXPECT_TRUE(std::equal(without.begin(), without.end() - 1, with.begin()))
+        << "the earlier row up to its extension byte";
+    EXPECT_EQ(with[without.size() - 1],
+              FoundBlockRecord::kExtAuxDifficultyKnown | FoundBlockRecord::kExtImported
+                  | FoundBlockRecord::kExtImportedEffort);
+    back = FoundBlockRecord::deserialize(with);
+    EXPECT_DOUBLE_EQ(back.imported_effort, 1.3911304960028799);
+    EXPECT_DOUBLE_EQ(back.imported_coverage, 1.0);
+    EXPECT_EQ(back.imported_prev_hash, hash_n(0xb9ed3c3d));
+    EXPECT_TRUE(back.aux_difficulty_known);
+    EXPECT_TRUE(back.imported);
+    EXPECT_EQ(back.parent_hash, hash_n(0x17c));
+    ASSERT_TRUE(back.parent_height.has_value());
+    EXPECT_EQ(*back.parent_height, 3211872u);
+    EXPECT_EQ(back.serialize(), with) << "round-trips byte for byte";
+
+    // What an earlier build writes back: its fields, its bits, no tail.
+    auto rewritten = std::vector<uint8_t>(with.begin(), with.begin() + without.size());
+    rewritten.back() &= static_cast<uint8_t>(~FoundBlockRecord::kExtImportedEffort);
+    EXPECT_EQ(rewritten, without);
+    EXPECT_FALSE(FoundBlockRecord::deserialize(rewritten).has_imported_effort());
+
+    // A cut tail is no imported effort -- never leftover bytes -- and the
+    // rest of the row stands.
+    for (size_t cut : {size_t(1), size_t(30), size_t(64), size_t(66), size_t(80)}) {
+        auto c = with;
+        c.resize(with.size() - cut);
+        const auto r = FoundBlockRecord::deserialize(c);
+        EXPECT_EQ(r.block_hash, kHashA) << cut;
+        EXPECT_FALSE(r.has_imported_effort()) << cut;
+        EXPECT_DOUBLE_EQ(r.imported_effort, 0.0) << cut;
+        EXPECT_TRUE(r.imported) << cut;
+        EXPECT_TRUE(r.aux_difficulty_known) << cut;
+    }
+    // A figure out of range is neither written nor read.
+    for (double coverage : {0.0, 1.5, std::nan("")}) {
+        FoundBlockRecord bad = rec;
+        bad.imported_coverage = coverage;
+        EXPECT_EQ(bad.serialize(), without) << coverage;
+    }
+    {
+        auto forged = with;
+        double big = 7.0;   // coverage 7 in the tail
+        std::memcpy(&forged[without.size() + 8], &big, sizeof(big));
+        EXPECT_FALSE(FoundBlockRecord::deserialize(forged).has_imported_effort());
+    }
+    // Rows from before the extension byte, and from before the tail, load
+    // with no imported effort.
+    auto pre_ext = without;
+    pre_ext.pop_back();
+    EXPECT_FALSE(FoundBlockRecord::deserialize(pre_ext).has_imported_effort());
+    EXPECT_FALSE(FoundBlockRecord::deserialize(fblk_v2_record().v).has_imported_effort());
 }
 
 TEST(FoundBlockStoreKat, UnknownVersionsAreRejected)
@@ -416,6 +550,120 @@ TEST(MergedBlockStoreKat, MblkV2IsAPureAppendAndRoundTrips)
     EXPECT_EQ(*back.tx_count, 0u);
     EXPECT_EQ(back.miner, "Dminer");
     EXPECT_EQ(back.parent_height, 2900000u);
+}
+
+// The aux chain's own difficulty rides after the v2 tail, again without a
+// version bump (an earlier build stops after its tail and keeps the record).
+TEST(MergedBlockStoreKat, MblkExtensionCarriesTheAuxDifficulty)
+{
+    auto rec = MergedBlockRecord::deserialize(mblk_v1_record(98, 5400000, kHashA).v);
+    EXPECT_DOUBLE_EQ(rec.difficulty, 0.0) << "a v1 record has none";
+    rec.share_hash = hash_n(0x5a);
+    rec.tx_count = 7;
+
+    // Written before the difficulty existed: nothing after the v2 tail.
+    auto old_row = rec.serialize();
+    ASSERT_EQ(old_row[0], 2) << "no version bump";
+    old_row.resize(old_row.size() - kMblkExt);
+    auto back = MergedBlockRecord::deserialize(old_row);
+    EXPECT_EQ(back.block_hash, kHashA);
+    EXPECT_DOUBLE_EQ(back.difficulty, 0.0);
+    ASSERT_TRUE(back.tx_count.has_value());
+    EXPECT_EQ(*back.tx_count, 7u);
+
+    rec.difficulty = 33412345.678;
+    const auto with_difficulty = rec.serialize();
+    back = MergedBlockRecord::deserialize(with_difficulty);
+    EXPECT_DOUBLE_EQ(back.difficulty, 33412345.678);
+    EXPECT_EQ(back.share_hash, hash_n(0x5a));
+    ASSERT_EQ(with_difficulty.size(), old_row.size() + kMblkExt);
+    EXPECT_TRUE(std::equal(old_row.begin(), old_row.end(), with_difficulty.begin()));
+
+    // A cut difficulty is not known, never a number made of leftover bytes.
+    auto cut = with_difficulty;
+    cut.resize(cut.size() - 3);
+    EXPECT_DOUBLE_EQ(MergedBlockRecord::deserialize(cut).difficulty, 0.0);
+}
+
+// The pool rate at find follows the difficulty, written only when known: a
+// record without it is byte for byte the earlier one, and an earlier build
+// (which stops after the difficulty) keeps a record with it.
+TEST(MergedBlockStoreKat, RateAtFindFollowsTheDifficultyWhenKnown)
+{
+    auto rec = MergedBlockRecord::deserialize(mblk_v1_record(98, 6463962, kHashA).v);
+    EXPECT_DOUBLE_EQ(rec.pool_hashrate, 0.0) << "a v1 record has none";
+    rec.difficulty = 42136316.98663563;
+    const auto without = rec.serialize();
+    EXPECT_DOUBLE_EQ(MergedBlockRecord::deserialize(without).pool_hashrate, 0.0);
+
+    rec.pool_hashrate = 1.48e11;
+    const auto with = rec.serialize();
+    ASSERT_EQ(with[0], 2) << "no version bump";
+    ASSERT_EQ(with.size(), without.size() + 8);
+    EXPECT_TRUE(std::equal(without.begin(), without.end(), with.begin()));
+    auto back = MergedBlockRecord::deserialize(with);
+    EXPECT_DOUBLE_EQ(back.pool_hashrate, 1.48e11);
+    EXPECT_DOUBLE_EQ(back.difficulty, 42136316.98663563);
+    EXPECT_EQ(back.miner, "Dminer");
+    EXPECT_EQ(back.serialize(), with);
+
+    // A cut rate is not known; the difficulty before it stands.
+    auto cut = with;
+    cut.resize(cut.size() - 3);
+    back = MergedBlockRecord::deserialize(cut);
+    EXPECT_DOUBLE_EQ(back.pool_hashrate, 0.0);
+    EXPECT_DOUBLE_EQ(back.difficulty, 42136316.98663563);
+    // A record from before the difficulty has neither.
+    auto pre = without;
+    pre.resize(pre.size() - kMblkExt);
+    back = MergedBlockRecord::deserialize(pre);
+    EXPECT_EQ(back.block_hash, kHashA);
+    EXPECT_DOUBLE_EQ(back.difficulty, 0.0);
+    EXPECT_DOUBLE_EQ(back.pool_hashrate, 0.0);
+}
+
+// The same block stored again without a rate -- learned again long after its
+// find, by the startup scan of the share chain -- keeps the rate read when it
+// was found; everything else the new record says is taken.
+TEST(MergedBlockStoreKat, StoreKeepsAHeldRateAtFind)
+{
+    TempDb t("mblk_rate_keep");
+    ASSERT_TRUE(t.db.open());
+    MergedBlockStore store(t.db);
+    MergedBlockRecord r;
+    r.chain_id = 98; r.symbol = "DOGE"; r.height = 6463962; r.block_hash = kHashA;
+    r.timestamp = 1795083273; r.difficulty = 42136316.98663563; r.pool_hashrate = 1.48e11;
+    ASSERT_TRUE(store.store(r));
+
+    MergedBlockRecord again = r;
+    again.pool_hashrate = 0.0;
+    again.coinbase_value = 1000000000000ULL;
+    ASSERT_TRUE(store.store(again));
+    auto all = store.load_all();
+    ASSERT_EQ(all.size(), 1u);
+    EXPECT_DOUBLE_EQ(all[0].pool_hashrate, 1.48e11);
+    EXPECT_EQ(all[0].coinbase_value, 1000000000000ULL);
+
+    // A known rate is stored as given; the updaters keep it.
+    again.pool_hashrate = 1.5e11;
+    ASSERT_TRUE(store.store(again));
+    ASSERT_TRUE(store.update_coinbase(kHashA, 98, 777));
+    ASSERT_TRUE(store.update_body(kHashA, 98, hash_n(0xcb), 3));
+    all = store.load_all();
+    ASSERT_EQ(all.size(), 1u);
+    EXPECT_DOUBLE_EQ(all[0].pool_hashrate, 1.5e11);
+    EXPECT_EQ(all[0].coinbase_value, 777u);
+
+    // Another block under the same 16-char key prefix is not "held".
+    MergedBlockRecord other = r;
+    other.block_hash = kHashB;
+    other.pool_hashrate = 0.0;
+    ASSERT_TRUE(store.store(other));
+    std::vector<uint8_t> raw;
+    ASSERT_TRUE(t.db.get(mblk_key(98, 6463962, kHashB), raw));
+    const auto o = MergedBlockRecord::deserialize(raw);
+    EXPECT_EQ(o.block_hash, kHashB);
+    EXPECT_DOUBLE_EQ(o.pool_hashrate, 0.0);
 }
 
 TEST(MergedBlockStoreKat, UpdateCoinbaseReachesTheNewestPast1000)
@@ -543,7 +791,7 @@ void wire_store(MI& mi, FoundBlockStore& store)
             rec.share_difficulty = b.share_difficulty;
             rec.pool_hashrate = b.pool_hashrate; rec.share_hash = b.share_hash;
             rec.authorship = static_cast<uint8_t>(b.authorship);
-            return store.store(rec);
+            return store.store(rec, b.replaced_height);
         },
         [&store]() {
             std::vector<MI::FoundBlock> out;
@@ -717,4 +965,235 @@ TEST(FoundBlockStoreKat, StartupBackfillGivesAHeightZeroRowItsHeight)
 
     arm_competitor_verdict(mi);
     EXPECT_EQ(mi.run_block_verification_now(kStaleHash), -1);
+}
+
+// A height the header chain CORRECTS (the LTC peer path stored the share
+// absheight, 27707625 for block 3211872, 2026-11-12) moves the row to its
+// real key: the absheight key must not survive to be loaded again. Wired as
+// main_ltc.cpp wires the store (FoundBlock::replaced_height names the old
+// key; store() stays O(1), no key scan).
+TEST(FoundBlockStoreKat, CorrectedHeightLeavesOneKey)
+{
+    const std::string kLtc = "84024db9063696eabf560504fa15737d6ab15a560441e5bab7fd51bd03571223";
+    const std::string kOther = "84024db9063696ea" + std::string(48, '0');   // same key suffix
+    constexpr uint64_t kAbs = 27707625, kReal = 3211872;
+    TempDb t("fblk_height_correct");
+    ASSERT_TRUE(t.db.open());
+    FoundBlockStore store(t.db);
+    auto ltc_row = [](uint64_t height, const std::string& hash) {
+        FoundBlockRecord rec;
+        rec.chain = "LTC"; rec.height = height; rec.block_hash = hash;
+        rec.timestamp = 1794498365; rec.status = 0;
+        rec.finder_address = "085cdff070d752d9e137e82396e387ec1641fd75";
+        rec.share_hash = hash; rec.authorship = 1;
+        return rec;
+    };
+    ASSERT_TRUE(store.store(ltc_row(kAbs, kLtc)));
+    // A different block whose key shares the 16-hex suffix is not touched.
+    ASSERT_TRUE(store.store(ltc_row(3000000, kOther)));
+
+    {
+        MI mi(/*testnet=*/false, nullptr, c2pool::address::Blockchain::LITECOIN);
+        wire_store(mi, store);
+        mi.load_persisted_found_blocks();
+        mi.correct_found_block_heights([&](const std::string& h) -> uint64_t {
+            return h == kLtc ? kReal : 0;
+        }, /*tip_height=*/kReal + 100);
+        EXPECT_FALSE(has_key(t.db, fblk_key("LTC", kAbs, kLtc)))
+            << "the absheight key would be loaded again on the next start";
+        EXPECT_TRUE(has_key(t.db, fblk_key("LTC", kReal, kLtc)));
+        EXPECT_TRUE(has_key(t.db, fblk_key("LTC", 3000000, kOther)));
+    }
+    MI mi(/*testnet=*/false, nullptr, c2pool::address::Blockchain::LITECOIN);
+    wire_store(mi, store);
+    mi.load_persisted_found_blocks();
+    const auto rows = mi.get_found_blocks();
+    ASSERT_EQ(rows.size(), 2u);
+    ASSERT_NE(row_of(rows, kLtc), nullptr);
+    EXPECT_EQ(row_of(rows, kLtc)->height, kReal);
+    // The row now renders the miner it can: a bare pubkey hash is not an address.
+    for (const auto& b : mi.rest_recent_blocks())
+        if (b["hash"].get<std::string>() == kLtc)
+            EXPECT_EQ(b["miner"].get<std::string>(), "");
+}
+
+// The record path's correction (the block's own BIP34 height arriving for a
+// row stored at the share absheight) re-keys the stored row the same way.
+TEST(FoundBlockStoreKat, RecordPathCorrectionLeavesOneKey)
+{
+    const std::string kLtc = "84024db9063696eabf560504fa15737d6ab15a560441e5bab7fd51bd03571223";
+    constexpr uint64_t kAbs = 27707625, kReal = 3211872;
+    TempDb t("fblk_height_record_correct");
+    ASSERT_TRUE(t.db.open());
+    FoundBlockStore store(t.db);
+    MI mi(/*testnet=*/false, nullptr, c2pool::address::Blockchain::LITECOIN);
+    wire_store(mi, store);
+    uint256 h; h.SetHex(kLtc);
+    mi.record_found_block(kAbs, h, 1794498365, "LTC", "085cdff070d752d9e137e82396e387ec1641fd75",
+                          kLtc, 0.0, 0.0, 0.0, 0, MI::BlockAuthorship::sharechain_peer);
+    ASSERT_TRUE(has_key(t.db, fblk_key("LTC", kAbs, kLtc)));
+    mi.record_found_block(kReal, h, 1794498365, "LTC", "LVypi56LPcT9jR3e5Y5AdoVc5EGdrVk26F",
+                          kLtc, 0.0, 0.0, 0.0, 0, MI::BlockAuthorship::sharechain_peer,
+                          /*height_from_block=*/true);
+    EXPECT_FALSE(has_key(t.db, fblk_key("LTC", kAbs, kLtc)));
+    EXPECT_TRUE(has_key(t.db, fblk_key("LTC", kReal, kLtc)));
+    const auto loaded = store.load_all();
+    ASSERT_EQ(loaded.size(), 1u);
+    EXPECT_EQ(loaded[0].height, kReal);
+    EXPECT_EQ(loaded[0].finder_address, "LVypi56LPcT9jR3e5Y5AdoVc5EGdrVk26F");
+}
+
+// ── Against the earlier build's OWN serializers ──────────────────────────────
+// found_block_records_2e6db7b5f.hpp is origin/master 2e6db7b5f's record code,
+// byte for byte (identical to v0.2.12.10's), in its own namespace. Both ways:
+//   * the earlier build reads a new row with every field it knows, and what
+//     it writes back is byte for byte the new writer's row without the tail
+//     (fblk) / the rate (mblk) -- which the new reader takes as "none";
+//   * the new reader reads the earlier build's rows and writes them back
+//     unchanged;
+//   * no cut of a new row, no value of the tail's hash-length byte and no
+//     trailing bytes make either reader read past the end or take a figure
+//     from anything but a whole tail.
+namespace {
+
+FoundBlockRecord full_fblk_with_effort()
+{
+    FoundBlockRecord r;
+    r.chain = "DOGE"; r.height = 6454700; r.block_hash = hash_n(0x700); r.timestamp = 1794498365;
+    r.status = 1; r.check_count = 3; r.last_checked = 1794500000; r.confirmations = 120;
+    r.finder_address = "LVypi56LPcT9jR3e5Y5AdoVc5EGdrVk26F"; r.reward_satoshis = 1000000000000ULL;
+    r.network_difficulty = 37146875.79962987; r.share_difficulty = 514.33; r.pool_hashrate = 1.45e11;
+    r.share_hash = hash_n(0x701); r.authorship = 1; r.coinbase_txid = hash_n(0x702); r.tx_count = 17;
+    r.parent_hash = hash_n(0x703); r.parent_height = 3211872; r.aux_difficulty_known = true;
+    r.imported = true;
+    r.imported_effort = 1.3911304960028799; r.imported_coverage = 1.0;
+    r.imported_prev_hash = hash_n(0x704);
+    return r;
+}
+
+template <class A, class B>
+void expect_same_fblk_fields(const A& a, const B& b, const char* what)
+{
+    EXPECT_EQ(a.chain, b.chain) << what;
+    EXPECT_EQ(a.height, b.height) << what;
+    EXPECT_EQ(a.block_hash, b.block_hash) << what;
+    EXPECT_EQ(a.timestamp, b.timestamp) << what;
+    EXPECT_EQ(a.status, b.status) << what;
+    EXPECT_EQ(a.check_count, b.check_count) << what;
+    EXPECT_EQ(a.last_checked, b.last_checked) << what;
+    EXPECT_EQ(a.confirmations, b.confirmations) << what;
+    EXPECT_EQ(a.finder_address, b.finder_address) << what;
+    EXPECT_EQ(a.reward_satoshis, b.reward_satoshis) << what;
+    EXPECT_DOUBLE_EQ(a.network_difficulty, b.network_difficulty) << what;
+    EXPECT_DOUBLE_EQ(a.share_difficulty, b.share_difficulty) << what;
+    EXPECT_DOUBLE_EQ(a.pool_hashrate, b.pool_hashrate) << what;
+    EXPECT_EQ(a.share_hash, b.share_hash) << what;
+    EXPECT_EQ(a.authorship, b.authorship) << what;
+    EXPECT_EQ(a.coinbase_txid, b.coinbase_txid) << what;
+    EXPECT_EQ(a.tx_count.has_value(), b.tx_count.has_value()) << what;
+    EXPECT_EQ(a.tx_count.value_or(0), b.tx_count.value_or(0)) << what;
+    EXPECT_EQ(a.parent_hash, b.parent_hash) << what;
+    EXPECT_EQ(a.parent_height.has_value(), b.parent_height.has_value()) << what;
+    EXPECT_EQ(a.parent_height.value_or(0), b.parent_height.value_or(0)) << what;
+    EXPECT_EQ(a.aux_difficulty_known, b.aux_difficulty_known) << what;
+    EXPECT_EQ(a.imported, b.imported) << what;
+}
+
+} // namespace
+
+TEST(FoundBlockStoreKat, FblkRowsInteroperateWithThe2e6db7b5fSerializer)
+{
+    namespace O = c2pool::storage_2e6db7b5f;
+    const FoundBlockRecord rec = full_fblk_with_effort();
+    const auto with = rec.serialize();
+    FoundBlockRecord rec0 = rec;
+    rec0.imported_effort = 0.0; rec0.imported_coverage = 0.0; rec0.imported_prev_hash.clear();
+    const auto without = rec0.serialize();
+    ASSERT_EQ(with.size(), without.size() + 8 + 8 + 1 + 64);
+
+    // The earlier build reads the new row: every field it knows.
+    const O::FoundBlockRecord o = O::FoundBlockRecord::deserialize(with);
+    expect_same_fblk_fields(o, rec, "earlier reader on new bytes");
+    // What it writes back is the row without the tail ...
+    EXPECT_EQ(o.serialize(), without);
+    // ... which the new reader takes as "no imported effort", every other
+    // field intact, and writes back unchanged.
+    const FoundBlockRecord n = FoundBlockRecord::deserialize(o.serialize());
+    expect_same_fblk_fields(n, rec, "new reader on the earlier build's bytes");
+    EXPECT_FALSE(n.has_imported_effort());
+    EXPECT_EQ(n.serialize(), without);
+
+    // Every cut of the new row: neither reader reads past the end; the new
+    // one takes a figure only from the whole tail.
+    for (size_t len = 0; len <= with.size(); ++len) {
+        const std::vector<uint8_t> cut(with.begin(), with.begin() + static_cast<std::ptrdiff_t>(len));
+        const auto nr = FoundBlockRecord::deserialize(cut);
+        (void)O::FoundBlockRecord::deserialize(cut);
+        EXPECT_EQ(nr.has_imported_effort(), len == with.size()) << len;
+    }
+    // Every value of the tail's hash-length byte: only the whole 64-char
+    // hash is a round's start (a short one would match no round, and only
+    // keep a valid figure out).
+    const size_t ip_len_at = without.size() + 16;
+    for (int v = 0; v < 256; ++v) {
+        auto c = with;
+        c[ip_len_at] = static_cast<uint8_t>(v);
+        const auto nr = FoundBlockRecord::deserialize(c);
+        EXPECT_EQ(nr.has_imported_effort(), v == 64) << v;
+        EXPECT_EQ(nr.block_hash, rec.block_hash) << v;
+        const FoundBlockRecord kept = FoundBlockRecord::deserialize(nr.serialize());
+        EXPECT_EQ(kept.has_imported_effort(), v == 64) << v;
+    }
+    // Trailing bytes after a whole tail are ignored by both.
+    auto longer = with;
+    longer.insert(longer.end(), {1, 2, 3, 4, 5});
+    EXPECT_TRUE(FoundBlockRecord::deserialize(longer).has_imported_effort());
+    expect_same_fblk_fields(O::FoundBlockRecord::deserialize(longer), rec,
+                            "earlier reader, trailing bytes");
+}
+
+TEST(MergedBlockStoreKat, MblkRecordsInteroperateWithThe2e6db7b5fSerializer)
+{
+    namespace O = c2pool::storage_2e6db7b5f;
+    MergedBlockRecord m;
+    m.chain_id = 98; m.symbol = "DOGE"; m.height = 6463962; m.block_hash = hash_n(0x800);
+    m.parent_hash = hash_n(0x801); m.timestamp = 1795083273; m.accepted = true;
+    m.coinbase_value = 1000000000000ULL; m.is_local = false; m.parent_height = 3215000;
+    m.miner = "LVypi56LPcT9jR3e5Y5AdoVc5EGdrVk26F"; m.share_hash = hash_n(0x802);
+    m.coinbase_txid = hash_n(0x803); m.tx_count = 9; m.difficulty = 42136316.98663563;
+    m.pool_hashrate = 1.48e11;
+    const auto with = m.serialize();
+    MergedBlockRecord m0 = m;
+    m0.pool_hashrate = 0.0;
+    const auto without = m0.serialize();
+    ASSERT_EQ(with.size(), without.size() + 8);
+
+    const O::MergedBlockRecord o = O::MergedBlockRecord::deserialize(with);
+    EXPECT_EQ(o.block_hash, m.block_hash);
+    EXPECT_EQ(o.miner, m.miner);
+    EXPECT_EQ(o.share_hash, m.share_hash);
+    EXPECT_EQ(o.coinbase_value, m.coinbase_value);
+    EXPECT_EQ(o.tx_count.value_or(0), m.tx_count.value_or(0));
+    EXPECT_DOUBLE_EQ(o.difficulty, m.difficulty);
+    EXPECT_EQ(o.serialize(), without) << "the earlier writer drops only the rate";
+    const auto n = MergedBlockRecord::deserialize(o.serialize());
+    EXPECT_DOUBLE_EQ(n.pool_hashrate, 0.0);
+    EXPECT_DOUBLE_EQ(n.difficulty, m.difficulty);
+    EXPECT_EQ(n.serialize(), without);
+
+    for (size_t len = 0; len <= with.size(); ++len) {
+        const std::vector<uint8_t> cut(with.begin(), with.begin() + static_cast<std::ptrdiff_t>(len));
+        const auto nr = MergedBlockRecord::deserialize(cut);
+        (void)O::MergedBlockRecord::deserialize(cut);
+        EXPECT_EQ(nr.pool_hashrate > 0.0, len == with.size()) << len;
+    }
+    // A rate with no known difficulty: it follows a zero difficulty, which
+    // the earlier reader reads as "not known", as before.
+    MergedBlockRecord nd = m;
+    nd.difficulty = 0.0;
+    const auto nd_bytes = nd.serialize();
+    const auto nd_back = MergedBlockRecord::deserialize(nd_bytes);
+    EXPECT_DOUBLE_EQ(nd_back.difficulty, 0.0);
+    EXPECT_DOUBLE_EQ(nd_back.pool_hashrate, 1.48e11);
+    EXPECT_DOUBLE_EQ(O::MergedBlockRecord::deserialize(nd_bytes).difficulty, 0.0);
 }

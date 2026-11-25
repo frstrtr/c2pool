@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #include <gtest/gtest.h>
 
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <string>
 
 #include <nlohmann/json.hpp>
@@ -126,4 +129,115 @@ TEST(CurrentMergedPayoutsCompute, KeepsDustDonationMarker) {
     EXPECT_DOUBLE_EQ(merged["XdgF55wEHBRWwbuBniNYH4GvvaoYMgL84u"]["amount"].get<double>(), 1e-08);
     EXPECT_TRUE(merged.contains("XmR5w1yQ8oExampleDashAddr0000000000"));
     EXPECT_FALSE(merged.contains("XpQ7z2aB9nExampleDashAddr1111111111"));
+}
+
+// ---------------------------------------------------------------------------
+// "Predicted Payout History" (miner page) is the stat log's current_payouts
+// series ("cps"). The sampler (update_stat_log) read only the coinbase-builder
+// PPLNS cache, which the coins wiring set_current_payouts_fn (DASH, BTC,
+// BIP-110) never fill, so their series stayed {} on every tick while
+// /current_payouts showed live balances. The sampler now takes the same direct
+// source when the cache gives nothing.
+// ---------------------------------------------------------------------------
+namespace {
+
+struct PayoutHistDir {
+    std::filesystem::path dir;
+    explicit PayoutHistDir(const char* name) {
+        dir = std::filesystem::temp_directory_path() / name;
+        std::filesystem::remove_all(dir);
+        std::filesystem::create_directories(dir);
+    }
+    ~PayoutHistDir() { std::filesystem::remove_all(dir); }
+    std::string path(const char* leaf) const { return (dir / leaf).string(); }
+};
+
+nlohmann::json read_payout_hist_log(const std::string& path) {
+    std::ifstream f(path);
+    EXPECT_TRUE(static_cast<bool>(f)) << "stat-log file must exist: " << path;
+    std::string content((std::istreambuf_iterator<char>(f)),
+                        std::istreambuf_iterator<char>());
+    auto arr = nlohmann::json::parse(content);
+    EXPECT_TRUE(arr.is_array());
+    return arr;
+}
+
+} // namespace
+
+// FAILS WITHOUT THE FIX: "cps" is {} although the direct source has payouts.
+TEST(CurrentPayoutsHistory, SamplerRecordsTheDirectSource) {
+    PayoutHistDir tmp("core_payout_history_direct_kat");
+    core::MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                             c2pool::address::Blockchain::DASH);
+    mi.set_stat_log_path(tmp.path("graph_db"));
+
+    const nlohmann::json feed = {
+        {"XmR5w1yQ8oExampleDashAddr0000000000", 0.37003781},
+        {"XdgF55wEHBRWwbuBniNYH4GvvaoYMgL84u", 0.04097709},
+    };
+    mi.set_current_payouts_fn([feed]() { return feed; });
+
+    mi.update_stat_log();
+    mi.save_stat_log();
+
+    auto arr = read_payout_hist_log(tmp.path("graph_db"));
+    ASSERT_EQ(arr.size(), static_cast<std::size_t>(1));
+    ASSERT_TRUE(arr[0].contains("cps"));
+    EXPECT_EQ(arr[0]["cps"], feed)
+        << "the payout-history sample must carry the same split /current_payouts serves";
+
+    // What the miner page's chart fetches.
+    auto series = mi.rest_web_graph_data("current_payouts", "last_hour");
+    bool seen = false;
+    for (const auto& p : series)
+        if (p.is_array() && p.size() > 1 && p[1].is_object()
+            && p[1].contains("XmR5w1yQ8oExampleDashAddr0000000000"))
+            seen = true;
+    EXPECT_TRUE(seen) << "/web/graph_data/current_payouts must show the miner's predicted payout";
+}
+
+// The cache path (LTC) is unchanged: when the coinbase-builder cache has the
+// split, the direct source is not sampled too (no doubled or mixed series).
+TEST(CurrentPayoutsHistory, CachePathIsNotMixedWithTheDirectSource) {
+    PayoutHistDir tmp("core_payout_history_cache_kat");
+    core::MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                             c2pool::address::Blockchain::LITECOIN);
+    mi.set_stat_log_path(tmp.path("graph_db"));
+
+    // One P2PKH output of 1.5 coins in the cache.
+    mi.set_cached_pplns_outputs({{"76a914" + std::string(40, '1') + "88ac", 150000000ULL}});
+    int direct_calls = 0;
+    mi.set_current_payouts_fn([&direct_calls]() {
+        ++direct_calls;
+        return nlohmann::json{{"LdirectSourceMustNotAppear000000000", 9.0}};
+    });
+
+    mi.update_stat_log();
+    mi.save_stat_log();
+
+    auto arr = read_payout_hist_log(tmp.path("graph_db"));
+    ASSERT_EQ(arr.size(), static_cast<std::size_t>(1));
+    ASSERT_TRUE(arr[0].contains("cps"));
+    const auto& cps = arr[0]["cps"];
+    ASSERT_EQ(cps.size(), static_cast<std::size_t>(1)) << cps.dump();
+    EXPECT_FALSE(cps.contains("LdirectSourceMustNotAppear000000000"));
+    EXPECT_DOUBLE_EQ(cps.begin().value().get<double>(), 1.5);
+    EXPECT_EQ(direct_calls, 0) << "with the cache populated the direct source is not consulted";
+}
+
+// No source at all: the sample stays honestly empty (no fabricated payouts).
+TEST(CurrentPayoutsHistory, NoSourceRecordsNothing) {
+    PayoutHistDir tmp("core_payout_history_none_kat");
+    core::MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                             c2pool::address::Blockchain::DASH);
+    mi.set_stat_log_path(tmp.path("graph_db"));
+    mi.set_current_payouts_fn([]() { return nlohmann::json::object(); });
+
+    mi.update_stat_log();
+    mi.save_stat_log();
+
+    auto arr = read_payout_hist_log(tmp.path("graph_db"));
+    ASSERT_EQ(arr.size(), static_cast<std::size_t>(1));
+    ASSERT_TRUE(arr[0].contains("cps"));
+    EXPECT_TRUE(arr[0]["cps"].empty());
 }

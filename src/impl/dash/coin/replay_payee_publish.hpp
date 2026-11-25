@@ -140,6 +140,9 @@ inline MNState to_payee_state(const ReplayMNState& st)
     mn.keyIDVoting        = st.keyIDVoting;
     mn.nOperatorReward    = st.nOperatorReward;
     mn.scriptPayout       = st.scriptPayout;
+    // Dash Core v24: the payout list, share table and early-exit terms the
+    // payee builder pays from (empty below v3).
+    mn.v24                = st.v24;
 
     // ProUpServTx facets.
     mn.netInfo              = st.netInfo;
@@ -297,9 +300,11 @@ inline ReplayPayeeGuard evaluate_payee_guard(const DmlFoldEngine&     engine,
         return g;
     }
     for (const auto& e : engine.entries()) {
-        if (e.second.scriptPayout.m_data.empty()) {
+        // A v3 / shared state (Dash Core v24) has no scriptPayout; it is paid
+        // at its payout list or share split (first_payout_script).
+        if (e.second.first_payout_script().empty()) {
             g.blocker = "G8 folded entry " + e.first.GetHex().substr(0, 16)
-                      + " carries an EMPTY scriptPayout";
+                      + " carries an EMPTY scriptPayout (and no v24 payout list or share)";
             return g;
         }
     }

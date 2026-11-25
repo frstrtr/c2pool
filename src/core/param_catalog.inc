@@ -14,6 +14,8 @@
 
 C2P_PARAM("meta.version", Meta, BOOL, COMPILE_TIME_READONLY, C_ALL, LIT, "false", NONE, "print version and exit")
   C2P_ALIAS("meta.version", BIN_DASH, "--version", FLAG)
+  C2P_ALIAS("meta.version", BIN_LTC, "--version", FLAG)
+  C2P_ALIAS("meta.version", BIN_BTC, "--version", FLAG)
   C2P_ALIAS("meta.version", BIN_DGB, "--version", FLAG)
   C2P_ALIAS("meta.version", BIN_BCH, "--version", FLAG)
   C2P_ALIAS("meta.version", BIN_BIP110, "--version", FLAG)
@@ -190,6 +192,10 @@ C2P_PARAM("sharechain.no_p2p_relay", Sharechain, BOOL, RESTART, C_DASH|C_DGB, LI
   C2P_ALIAS("sharechain.no_p2p_relay", BIN_DASH, "--no-p2p-relay", FLAG)
   C2P_ALIAS("sharechain.no_p2p_relay", BIN_DGB, "--no-p2p-relay", FLAG)
 
+C2P_PARAM("sharechain.deferred_mint", Sharechain, TRISTATE_BOOL, RESTART, C_DASH, NONE, "", NONE, "queue a solve a busy tracker declines and mint it when the lock frees (default off; --deferred-mint enables)")
+  C2P_ALIAS("sharechain.deferred_mint", BIN_DASH, "--deferred-mint", FLAG)
+  C2P_ALIAS("sharechain.deferred_mint", BIN_DASH, "--no-deferred-mint", FLAG_NO_PREFIX)
+
 C2P_PARAM("sharechain.max_conns", Sharechain, INT64, RESTART, C_LTC, LIT, "0", NONE, "max connections")
   C2P_ALIAS("sharechain.max_conns", BIN_LTC, "--max-conns", VALUE)
 
@@ -210,6 +216,8 @@ C2P_PARAM("sharechain.network_id", Sharechain, HEX, MONEY_RESTART, C_LTC|C_BTC|C
   C2P_ALIAS("sharechain.network_id", BIN_LTC, "--chain-id", VALUE)
   C2P_ALIAS("sharechain.network_id", BIN_BTC, "--network-id", VALUE)
   C2P_ALIAS("sharechain.network_id", BIN_DASH, "--network-id", VALUE)
+C2P_PARAM("sharechain.v3601_activation_time", Sharechain, INT64, MONEY_RESTART, C_LTC, LIT, "", NONE, "share version 3601 flag day, unix time (testnet / private --network-id chain only)")
+  C2P_ALIAS("sharechain.v3601_activation_time", BIN_LTC, "--v3601-activation-time", VALUE)
 
 C2P_PARAM("sharechain.prefix", Sharechain, HEX, MONEY_RESTART, C_LTC|C_BTC|C_DASH, LIT, "", HEX_EVEN, "private sharechain prefix")
   C2P_ALIAS("sharechain.prefix", BIN_LTC, "--prefix", VALUE)
@@ -333,6 +341,33 @@ C2P_PARAM("stratum.max_coinbase_outputs", Stratum, INT64, LIVE, C_LTC, LIT, "0",
 C2P_PARAM("stratum.max_connections", Stratum, INT64, LIVE, C_LTC, LIT, "0", NONE, "max stratum connections")
   C2P_ALIAS("stratum.max_connections", BIN_LTC, "--max-stratum-connections", VALUE)
 
+C2P_PARAM("stratum.max_connections_per_ip", Stratum, INT64, LIVE, C_LTC, LIT, "0", NONE, "max stratum connections per source IP, one /64 for IPv6 (0=unlimited; rigs behind one NAT share an address)")
+  C2P_ALIAS("stratum.max_connections_per_ip", BIN_LTC, "--max-stratum-connections-per-ip", VALUE)
+
+C2P_PARAM("stratum.http", Stratum, ENUM_STR, RESTART, C_ALL, LIT, "false", ENUM_MEMBER, "also answer the web API (GET/HEAD, read-only) on the stratum port, as python p2pool did on its worker port: true, false or auto (also on/off/yes/no/1/0; default false; auto: on when the web server binds ::, binds 0.0.0.0 and the stratum listener an IPv4 address, or binds the stratum listener's own non-loopback address)")
+  C2P_ALIAS("stratum.http", BIN_DASH, "--stratum-http", FLAG_OPT_EQFALSE)
+  C2P_ALIAS("stratum.http", BIN_LTC, "--stratum-http", FLAG_OPT_EQFALSE)
+  C2P_ALIAS("stratum.http", BIN_BTC, "--stratum-http", FLAG_OPT_EQFALSE)
+  C2P_ALIAS("stratum.http", BIN_DGB, "--stratum-http", FLAG_OPT_EQFALSE)
+  C2P_ALIAS("stratum.http", BIN_BCH, "--stratum-http", FLAG_OPT_EQFALSE)
+  C2P_ALIAS("stratum.http", BIN_BIP110, "--stratum-http", FLAG_OPT_EQFALSE)
+
+C2P_PARAM("stratum.http_budget", Stratum, INT64, RESTART, C_ALL, LIT, "16", NONE, "HTTP requests in progress on the stratum port at once: at most N and at most max_stratum_connections - 1; others are answered 503 (0 = every HTTP request on the stratum port is answered 503)")
+  C2P_ALIAS("stratum.http_budget", BIN_DASH, "--stratum-http-budget", VALUE)
+  C2P_ALIAS("stratum.http_budget", BIN_LTC, "--stratum-http-budget", VALUE)
+  C2P_ALIAS("stratum.http_budget", BIN_BTC, "--stratum-http-budget", VALUE)
+  C2P_ALIAS("stratum.http_budget", BIN_DGB, "--stratum-http-budget", VALUE)
+  C2P_ALIAS("stratum.http_budget", BIN_BCH, "--stratum-http-budget", VALUE)
+  C2P_ALIAS("stratum.http_budget", BIN_BIP110, "--stratum-http-budget", VALUE)
+
+C2P_PARAM("stratum.http_per_ip", Stratum, INT64, RESTART, C_ALL, LIT, "6", NONE, "HTTP requests in progress on the stratum port at once from one address, one /64 for IPv6: at most N; others are answered 503 (0 = no limit below stratum.http_budget)")
+  C2P_ALIAS("stratum.http_per_ip", BIN_DASH, "--stratum-http-per-ip", VALUE)
+  C2P_ALIAS("stratum.http_per_ip", BIN_LTC, "--stratum-http-per-ip", VALUE)
+  C2P_ALIAS("stratum.http_per_ip", BIN_BTC, "--stratum-http-per-ip", VALUE)
+  C2P_ALIAS("stratum.http_per_ip", BIN_DGB, "--stratum-http-per-ip", VALUE)
+  C2P_ALIAS("stratum.http_per_ip", BIN_BCH, "--stratum-http-per-ip", VALUE)
+  C2P_ALIAS("stratum.http_per_ip", BIN_BIP110, "--stratum-http-per-ip", VALUE)
+
 C2P_PARAM("web.port", WebOps, UINT16, RESTART, C_ALL, FROM_POOL_CONFIG, "", PORT_RANGE, "dashboard/web bind port (0=off)")
   C2P_ALIAS("web.port", BIN_DASH, "--web-port", VALUE)
   C2P_ALIAS("web.port", BIN_DASH, "--http-port", VALUE)
@@ -354,6 +389,9 @@ C2P_PARAM("web.external_ip", WebOps, STRING, LIVE, C_DASH|C_LTC, LIT, "", NONE, 
 C2P_PARAM("web.dashboard_dir", WebOps, PATH, RESTART, C_DASH|C_LTC, LIT, "web-static", NONE, "dashboard static asset dir")
   C2P_ALIAS("web.dashboard_dir", BIN_DASH, "--dashboard-dir", VALUE)
   C2P_ALIAS("web.dashboard_dir", BIN_LTC, "--dashboard-dir", VALUE)
+
+C2P_PARAM("web.mempool_entry_probe", WebOps, BOOL, RESTART, C_DASH, LIT, "false", NONE, "direct-local GET /mempool_entry probe (fee-parity shadow tooling)")
+  C2P_ALIAS("web.mempool_entry_probe", BIN_DASH, "--mempool-entry-probe", FLAG)
 
 C2P_PARAM("web.explorer", WebOps, TRISTATE_BOOL, RESTART, C_DASH|C_BIP110, NONE, "", NONE, "loopback-only /api/explorer surface (default on)")
   C2P_ALIAS("web.explorer", BIN_DASH, "--explorer", FLAG)
@@ -470,6 +508,9 @@ C2P_PARAM("merged.spec", Merged, MERGED_SPEC, RESTART, C_BTC|C_LTC|C_NMC|C_DGB|C
   C2P_ALIAS("merged.spec", BIN_BTC, "--merged", VALUE)
   C2P_ALIAS("merged.spec", BIN_DGB, "--merged", VALUE)
 
+C2P_PARAM("merged.payout_addresses", Merged, STRING, MONEY_RESTART, C_LTC, LIT, "", NONE, "per-chain SYMBOL:ADDRESS for createauxblock (repeatable)")
+  C2P_ALIAS("merged.payout_addresses", BIN_LTC, "--merged-payout-address", VALUE)
+
 C2P_PARAM("merged.coind_address", Merged, STRING, RESTART, C_LTC|C_DOGE, LIT, "", NONE, "merged coind address")
   C2P_ALIAS("merged.coind_address", BIN_LTC, "--merged-coind-address", VALUE)
 
@@ -537,6 +578,17 @@ C2P_PARAM("utility.utxo_stats", Meta, PATH, COMPILE_TIME_READONLY, C_LTC|C_DOGE,
 C2P_PARAM("utility.ltc_utxo_stats", Meta, PATH, COMPILE_TIME_READONLY, C_LTC, LIT, "", NONE, "print gettxoutsetinfo (Litecoin Core 0.21.4 GetUTXOStats, hash_serialized_2) for the UTXO LevelDB at DIR, then exit")
   C2P_ALIAS("utility.ltc_utxo_stats", BIN_LTC, "--ltc-utxo-stats", VALUE)
 
+// One-shot on a RUNNING node (not print-and-exit): import found-block history
+// (core/found_block_import.hpp) from another node's /recent_blocks JSON or a
+// list of block hashes, each block validated against the node's own header
+// chain (LTC and DOGE on c2pool-ltc, BTC on c2pool-btc). CLI and, on
+// c2pool-ltc, the legacy YAML key import_found_blocks only; compile-time
+// readonly so a settings file is refused rather than silently ignored, and
+// nothing is mirrored into the resolved config.
+C2P_PARAM("utility.import_found_blocks", Meta, PATH, COMPILE_TIME_READONLY, C_LTC|C_BTC, LIT, "", NONE, "import found-block history from FILE (repeatable or FILE,FILE: another node's /recent_blocks and /recent_merged_blocks JSON, or block hashes one per line), each block validated against its own chain's header chain")
+  C2P_ALIAS("utility.import_found_blocks", BIN_LTC, "--import-found-blocks", VALUE)
+  C2P_ALIAS("utility.import_found_blocks", BIN_BTC, "--import-found-blocks", VALUE)
+
 C2P_PARAM("embedded.ltc_cmpct_v3", Embedded, TRISTATE_BOOL, RESTART, C_LTC, NONE, "", NONE, "ask LTC MWEB peers for v3 compact blocks (default on)")
   C2P_ALIAS("embedded.ltc_cmpct_v3", BIN_LTC, "--ltc-cmpct-v3", FLAG)
   C2P_ALIAS("embedded.ltc_cmpct_v3", BIN_LTC, "--no-ltc-cmpct-v3", FLAG_NO_PREFIX)
@@ -586,6 +638,9 @@ C2P_PARAM("embedded.superblock", Embedded, BOOL, RESTART, C_DASH, LIT, "false", 
 C2P_PARAM("embedded.govsync", Embedded, BOOL, RESTART, C_DASH, LIT, "false", NONE, "observe-only governance store")
   C2P_ALIAS("embedded.govsync", BIN_DASH, "--embedded-govsync", FLAG)
 
+C2P_PARAM("embedded.superblock_unfunded_mainnet", Embedded, BOOL, RESTART, C_DASH, LIT, "false", NONE, "TEST/SOAK ONLY - never set on a production mainnet node: serve a superblock height the node believes unfunded with a normal coinbase (default off = refuse; testnet always on)")
+  C2P_ALIAS("embedded.superblock_unfunded_mainnet", BIN_DASH, "--embedded-superblock-unfunded-mainnet", FLAG)
+
 C2P_PARAM("embedded.serve_mempool_txs", Embedded, TRISTATE_BOOL, RESTART, C_DASH|C_BIP110|C_DGB, NONE, "", NONE, "fee-carrying templates (daemonless default ON; DGB: advisory GBT only -- the mined stratum job stays coinbase-only until the S2 job-commit lands)")
   C2P_ALIAS("embedded.serve_mempool_txs", BIN_DASH, "--embedded-serve-mempool-txs", FLAG_OPT_EQFALSE)
   C2P_ALIAS("embedded.serve_mempool_txs", BIN_DGB, "--embedded-serve-mempool-txs", FLAG_OPT_EQFALSE)
@@ -610,6 +665,12 @@ C2P_PARAM("embedded.accrue_asset_locks", Embedded, BOOL, RESTART, C_DASH, LIT, "
 C2P_PARAM("embedded.accrue_asset_unlocks", Embedded, BOOL, RESTART, C_DASH, LIT, "false", NONE, "type-9 asset-unlock fold")
   C2P_ALIAS("embedded.accrue_asset_unlocks", BIN_DASH, "--embedded-accrue-asset-unlocks", FLAG)
 
+C2P_PARAM("embedded.credit_pool_seed", Embedded, BOOL, RESTART, C_DASH, LIT, "false", NONE, "seed the credit-pool follower from the v20 floor (needed to admit asset unlocks)")
+  C2P_ALIAS("embedded.credit_pool_seed", BIN_DASH, "--embedded-credit-pool-seed", FLAG)
+
+C2P_PARAM("embedded.header_dgw_log_only", Embedded, BOOL, MONEY_RESTART, C_DASH, LIT, "false", NONE, "coin header chain logs and accepts a header off its DGW bits instead of refusing it (CLI only)")
+  C2P_ALIAS("embedded.header_dgw_log_only", BIN_DASH, "--header-dgw-log-only", FLAG)
+
 C2P_PARAM("embedded.null_arm", Embedded, TRISTATE_BOOL, MONEY_RESTART, C_DASH, NONE, "", NONE, "optimistic null commitment (money/consensus)")
   C2P_ALIAS("embedded.null_arm", BIN_DASH, "--embedded-null-arm", FLAG_OPT_EQFALSE)
 
@@ -624,6 +685,9 @@ C2P_PARAM("embedded.fresh_datum_race_k", Embedded, INT64, LIVE, C_DASH, LIT, "2"
 
 C2P_PARAM("embedded.getmnlistd_tracker", Embedded, TRISTATE_BOOL, LIVE, C_DASH, NONE, "", NONE, "10s slot re-ask tracker (default ON)")
   C2P_ALIAS("embedded.getmnlistd_tracker", BIN_DASH, "--embedded-getmnlistd-tracker", FLAG_OPT_EQFALSE)
+
+C2P_PARAM("embedded.compact_blocks", Embedded, TRISTATE_BOOL, RESTART, C_DASH, NONE, "", NONE, "BIP 152 compact-block receive for new tip bodies (default ON; =false fetches every body whole)")
+  C2P_ALIAS("embedded.compact_blocks", BIN_DASH, "--embedded-compact-blocks", FLAG_OPT_EQFALSE)
 
 C2P_PARAM("embedded.asn_diversity", Embedded, TRISTATE_BOOL, LIVE, C_DASH, NONE, "", NONE, "require >=2 ASNs in racing set")
   C2P_ALIAS("embedded.asn_diversity", BIN_DASH, "--embedded-asn-diversity", FLAG_OPT_EQFALSE)
@@ -824,6 +888,9 @@ C2P_PARAM("utility.max_nonce", Meta, INT64, RESTART, C_DASH, LIT, "4294967295", 
 
 C2P_PARAM("bls.allow_stub", Gate, BOOL, RESTART, C_DASH, LIT, "false", NONE, "knowingly run a bls=stub (BLS-dark) build in a BLS-relying config")
   C2P_ALIAS("bls.allow_stub", BIN_DASH, "--allow-stub-bls", FLAG)
+
+C2P_PARAM("dash.v24_activation_height", Embedded, INT64, RESTART, C_DASH, NONE, "", NONE, "pin the Dash Core v24 activation height once locked in (unset: follow the EHF signals)")
+  C2P_ALIAS("dash.v24_activation_height", BIN_DASH, "--dash-v24-activation-height", VALUE)
 
 #undef C2P_PARAM
 #undef C2P_ALIAS

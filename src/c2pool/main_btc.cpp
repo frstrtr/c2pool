@@ -33,6 +33,8 @@
 // non-broadcaster shape suitable for B2-net smoke testing.
 
 #include <impl/btc/coin/header_chain.hpp>
+#include <impl/btc/coin/header_source_step.hpp>
+#include <core/found_block_lookups.hpp>           // header-bits difficulty by block hash
 #include <impl/btc/coin/template_builder.hpp> // btc::coin::get_block_subsidy — zero-rig block-value projection (dashboard cards)
 #include <impl/btc/coin/tip_reconcile_gate.hpp> // B5b: TipReconcileGate SSOT (10s re-poll cadence + fire predicate) shared with tip_reconcile_test.cpp
 #include <impl/btc/coin/mempool.hpp>
@@ -56,6 +58,7 @@
 #include <impl/btc/coin/reconstruct_won_block.hpp> // make_reconstruct_closure — faithful won-block body (#839)
 #include <impl/btc/coin/won_block_dispatch.hpp>    // make_on_block_found — dual-path won-block dispatch (#744)
 #include <impl/btc/coin/block_confirm.hpp>       // #995/#1155 found-block confirm/orphan resolver
+#include <impl/btc/found_block_ledger.hpp>       // found_blocks_db persistence + --import-found-blocks
 #include <impl/btc/coin/merged_spec.hpp>          // parse --merged SPEC -> AuxChainConfig (NMC PE host-wire slice 3)
 #include <impl/btc/coin/merged_backend.hpp>       // build aux backends + merged_addr payout seam (NMC PE host-wire slice 4)
 // PA/PB: embedded NMC SPV aux backend (daemonless --merged NMC) — mirrors the
@@ -115,6 +118,7 @@ static void print_usage()
         "Usage: c2pool-btc [--testnet | --testnet4 | --regtest] --bitcoind HOST:PORT\n"
         "                  [--p2pool HOST:PORT]\n"
         "\n"
+        "  --version       print \"c2pool-btc <version>\" and exit\n"
         "  --testnet       BTC testnet3 chain (genesis 000000000933ea01...)\n"
         "  --testnet4      BTC testnet4 chain (genesis 00000000da84f2ba...)\n"
         "  --regtest       BTC regtest chain (genesis 0f9188f13cb7b2c7...)\n"
@@ -143,6 +147,20 @@ static void print_usage()
         "                  e.g. --stratum 9332           (binds 0.0.0.0:9332)\n"
         "                       --stratum 127.0.0.1:9332 (loopback only)\n"
         "                  Omit to disable stratum listener.\n"
+        "  --stratum-http[=true|false|auto]  also answer the web API (GET/HEAD,\n"
+        "                  read-only) on the stratum port, as python p2pool did on\n"
+        "                  its worker port (trackers poll host:<stratum>/global_stats).\n"
+        "                  default false; auto = on when --http binds ::, binds\n"
+        "                  0.0.0.0 and --stratum is IPv4, or binds the --stratum\n"
+        "                  address (not loopback).\n"
+        "  --stratum-http-budget N  HTTP requests in progress on the stratum port\n"
+        "                  at once: at most N and at most max_stratum_connections - 1;\n"
+        "                  others are answered 503 (default 16; 0 = every HTTP\n"
+        "                  request on the stratum port is answered 503).\n"
+        "  --stratum-http-per-ip N  HTTP requests in progress on the stratum port\n"
+        "                  at once from one address, one /64 for IPv6: at most N;\n"
+        "                  others are answered 503 (default 6; 0 = no limit below\n"
+        "                  --stratum-http-budget).\n"
         "  --sharechain-port P  bind the sharechain (pool P2P) listener on\n"
         "                  port P instead of the default 9333, so a SECOND\n"
         "                  isolated c2pool-btc instance can run on one host\n"
@@ -175,7 +193,19 @@ static void print_usage()
         "  --give-author PCT  dev-donation percent (alias --dev-donation). Default\n"
         "                  is the built-in 0.1%; 0 allowed (donation output still\n"
         "                  emits per p2pool dust-marker semantics, amount 0). Changes\n"
-        "                  the donation AMOUNT only — the donation script is unchanged.\n";
+        "                  the donation AMOUNT only — the donation script is unchanged.\n"
+        "  --import-found-blocks FILE  Restore the pool's found-block history\n"
+        "                  (Recent Blocks, luck, effort) from FILE: another node's\n"
+        "                  /recent_blocks JSON, or block hashes one per line.\n"
+        "                  Repeatable or FILE,FILE; imported in order, e.g.\n"
+        "                    curl http://NODE:WEBPORT/recent_blocks > blocks.json\n"
+        "                    --import-found-blocks blocks.json\n"
+        "                  Each block is validated against this node's own embedded\n"
+        "                  BTC header chain once it is synced; rows already held only\n"
+        "                  gain missing fields. Needs --http (the ledger is the\n"
+        "                  dashboard's). The ledger is kept across restarts in\n"
+        "                  <data-dir>/bitcoin/found_blocks_db (bitcoin_testnet,\n"
+        "                  bitcoin_testnet4, bitcoin_regtest on the test networks).\n";
 }
 
 /// BTC wire-protocol magic bytes per network (pchMessageStart).
@@ -230,12 +260,38 @@ int main(int argc, char* argv[])
     bool        want_dump_config  = false; // --dump-resolved-config (M0b)
     bool        want_ack_money    = false; // --ack-money-settings (M0b)
 
+    // --import-found-blocks FILE[,FILE...]: taken out of argv here, before
+    // the parse loop below (which skips the values taken). Every value is
+    // refused or canonicalized now, before anything starts
+    // (core::found_block_import::open_import_file): a value must not swallow
+    // the next option (--import-found-blocks --testnet would start a MAINNET
+    // node), and a missing / non-regular / over-cap file must not surface
+    // only after the header sync.
+    const btc::found_block_ledger::ImportFlags import_found_blocks =
+        btc::found_block_ledger::take_import_flags(argc, argv);
+    if (!import_found_blocks.error.empty())
+    {
+        std::cerr << "error: " << import_found_blocks.error << "\n";
+        return 1;
+    }
+
     for (int i = 1; i < argc; ++i)
     {
+        if (import_found_blocks.is_value(i))
+            continue;   // an --import-found-blocks value (the pass above)
         std::string arg = argv[i];
         if (arg == "-h" || arg == "--help")
         {
             print_usage();
+            return 0;
+        }
+        else if (arg == "--version")
+        {
+#ifdef C2POOL_VERSION
+            std::cout << "c2pool-btc " << C2POOL_VERSION << "\n";
+#else
+            std::cout << "c2pool-btc dev\n";
+#endif
             return 0;
         }
         else if (arg == "--settings" && i + 1 < argc)
@@ -276,6 +332,11 @@ int main(int argc, char* argv[])
         else if (arg == "--coin-p2p-discover")
         {
             coin_p2p_discover = true;
+        }
+        else if (arg == "--import-found-blocks")
+        {
+            // Taken, checked and canonicalized by the pass before this loop
+            // (its value is skipped above).
         }
         else if (arg == "--bitcoind" && i + 1 < argc)
         {
@@ -408,6 +469,30 @@ int main(int argc, char* argv[])
             dev_donation    = std::strtod(argv[++i], nullptr);
             give_author_set = true;
         }
+        else if (arg == "--stratum-http" || arg.rfind("--stratum-http=", 0) == 0)
+        {
+            // --stratum-http[=true|false|auto]: the web API on the stratum port
+            // too (core/stratum_http.hpp).
+            if (!core::parse_stratum_http_flag(arg, core::stratum_http_mode_setting())) {
+                std::cerr << "bad value: " << arg << " (expected --stratum-http=true, false or auto)\n";
+                return 1;
+            }
+        }
+        // --stratum-http-budget N / --stratum-http-per-ip N (core/stratum_http.hpp).
+        else if (arg == "--stratum-http-budget" && i + 1 < argc)
+        {
+            if (!core::parse_stratum_http_count(argv[++i], core::stratum_http_limits_setting().budget)) {
+                std::cerr << "bad value: --stratum-http-budget " << argv[i] << " (expected a count)\n";
+                return 1;
+            }
+        }
+        else if (arg == "--stratum-http-per-ip" && i + 1 < argc)
+        {
+            if (!core::parse_stratum_http_count(argv[++i], core::stratum_http_limits_setting().per_ip)) {
+                std::cerr << "bad value: --stratum-http-per-ip " << argv[i] << " (expected a count)\n";
+                return 1;
+            }
+        }
         else
         {
             std::cerr << "unknown arg: " << arg << "\n";
@@ -453,6 +538,15 @@ int main(int argc, char* argv[])
             else { h = v.substr(0, c); p = static_cast<uint16_t>(std::stoi(v.substr(c + 1))); }
         };
         if (rc.file_set("web.port"))          http_port = static_cast<uint16_t>(rc.get_u16("web.port").value_or(http_port));
+        if (rc.file_set("stratum.http"))   // --stratum-http: true / false / auto
+            core::apply_stratum_http_setting(rc.get_string("stratum.http").value_or(""),
+                                             core::stratum_http_mode_setting());
+        if (rc.file_set("stratum.http_budget"))   // --stratum-http-budget
+            core::apply_stratum_http_count_setting("stratum.http_budget", rc.get_i64("stratum.http_budget"),
+                                                   core::stratum_http_limits_setting().budget);
+        if (rc.file_set("stratum.http_per_ip"))   // --stratum-http-per-ip
+            core::apply_stratum_http_count_setting("stratum.http_per_ip", rc.get_i64("stratum.http_per_ip"),
+                                                   core::stratum_http_limits_setting().per_ip);
         if (rc.file_set("stratum.bind"))      split_hostport(rc.get_string("stratum.bind").value_or(""), stratum_addr, stratum_port);
         if (rc.file_set("sharechain.listen")) { std::string hh; split_hostport(rc.get_string("sharechain.listen").value_or(""), hh, sharechain_port); }
         if (rc.file_set("daemon_rpc.endpoint")) split_hostport(rc.get_string("daemon_rpc.endpoint").value_or(""), bitcoind_host, bitcoind_port);
@@ -1225,8 +1319,15 @@ int main(int argc, char* argv[])
             // failover draws the NEXT best-scored peer instead of re-picking a
             // dead one; cleared to re-sweep once the banked set is exhausted.
             auto standalone_tried = std::make_shared<std::set<std::string>>();
+            // The candidate dialed last, and whether it ever completed the
+            // handshake: on failover it is reported to the peer manager as a
+            // failed dial or a disconnect, so dead candidates age out of the
+            // working set and DNS-seeded peers can take their places.
+            auto standalone_current    = std::make_shared<std::string>();
+            auto standalone_handshaked = std::make_shared<bool>(false);
             auto dial_standalone_peer =
-                [&coin_node, &coin_peer_mgr, standalone_tried]() -> bool {
+                [&coin_node, &coin_peer_mgr, standalone_tried, standalone_current,
+                 standalone_handshaked]() -> bool {
                     auto cands = coin_peer_mgr->get_peers_to_connect(*standalone_tried);
                     if (cands.empty()) {
                         standalone_tried->clear();
@@ -1238,6 +1339,8 @@ int main(int argc, char* argv[])
                     }
                     const auto& ep = cands.front();
                     standalone_tried->insert(ep.to_string());
+                    *standalone_current    = ep.to_string();
+                    *standalone_handshaked = false;
                     LOG_INFO << "[BTC] standalone header source: dialing coin peer "
                              << ep.to_string() << " (no external bitcoind)";
                     coin_node.start_p2p(ep.to_net_service());
@@ -1272,11 +1375,12 @@ int main(int argc, char* argv[])
             //       peers. Weak self-ref avoids a shared_ptr cycle (mirrors the
             //       B5 warn timer below).
             constexpr int kDriverTickSec         = 12;
-            constexpr int kNoProgressFailoverSec = 40;
             auto hdr_last_height    = std::make_shared<uint32_t>(header_chain.height());
             auto hdr_last_progress  = std::make_shared<std::chrono::steady_clock::time_point>(
                 std::chrono::steady_clock::now());
             auto hdr_was_handshaked = std::make_shared<bool>(false);
+            auto hdr_last_getheaders = std::make_shared<std::chrono::steady_clock::time_point>(
+                std::chrono::steady_clock::now());
             auto standalone_dial_timer =
                 std::make_shared<boost::asio::steady_timer>(ioc);
             auto schedule_standalone_dial = std::make_shared<std::function<void()>>();
@@ -1286,15 +1390,16 @@ int main(int argc, char* argv[])
             std::weak_ptr<std::function<void()>> weak_dial = schedule_standalone_dial;
             *schedule_standalone_dial =
                 [standalone_dial_timer, weak_dial, &coin_node, &header_chain,
-                 &chain_params, dial_standalone_peer, hdr_caught_up,
+                 &chain_params, &coin_peer_mgr, dial_standalone_peer, hdr_caught_up,
                  hdr_last_height, hdr_last_progress, hdr_was_handshaked,
-                 kDriverTickSec, kNoProgressFailoverSec]() {
+                 hdr_last_getheaders, standalone_current, standalone_handshaked,
+                 kDriverTickSec]() {
                     standalone_dial_timer->expires_after(std::chrono::seconds(kDriverTickSec));
                     standalone_dial_timer->async_wait(
                         [standalone_dial_timer, weak_dial, &coin_node, &header_chain,
-                         &chain_params, dial_standalone_peer, hdr_caught_up,
+                         &chain_params, &coin_peer_mgr, dial_standalone_peer, hdr_caught_up,
                          hdr_last_height, hdr_last_progress, hdr_was_handshaked,
-                         kNoProgressFailoverSec]
+                         hdr_last_getheaders, standalone_current, standalone_handshaked]
                         (const boost::system::error_code& ec) {
                             if (ec) return;
                             constexpr uint32_t GETHEADERS_VERSION = 70016;
@@ -1308,34 +1413,51 @@ int main(int argc, char* argv[])
                                 *hdr_last_progress = now;
                             }
 
+                            // A full block locator (tip, then exponentially back to
+                            // genesis): a peer that does not hold our tip (a block
+                            // that lost a race) answers from the fork point, not
+                            // from genesis.
                             auto send_locator_getheaders = [&]() {
-                                uint256 locator;
-                                if (auto tip = header_chain.tip(); tip)
-                                    locator = tip->block_hash;
-                                else
-                                    locator = chain_params.genesis_hash;
+                                auto locator = header_chain.get_locator();
+                                if (locator.empty())
+                                    locator.push_back(chain_params.genesis_hash);
                                 LOG_INFO << "[BTC] standalone header-sync getheaders locator="
-                                         << locator.GetHex().substr(0, 16)
+                                         << locator.front().GetHex().substr(0, 16)
+                                         << " (" << locator.size() << " hashes)"
                                          << " chain_height=" << h;
                                 coin_node.send_getheaders(
-                                    GETHEADERS_VERSION, {locator}, uint256::ZERO);
+                                    GETHEADERS_VERSION, locator, uint256::ZERO);
+                                *hdr_last_getheaders = now;
                             };
 
-                            if (handshaked && !caught_up) {
-                                if (!*hdr_was_handshaked)      // fresh (re)connect
-                                    send_locator_getheaders();
-                                else if (!advanced)            // stalled / at genesis
-                                    send_locator_getheaders();
+                            const bool fresh = handshaked && !*hdr_was_handshaked;
+                            if (fresh && !standalone_current->empty()) {
+                                coin_peer_mgr->notify_connected(*standalone_current);
+                                *standalone_handshaked = true;
                             }
+                            const auto secs = [&](std::chrono::steady_clock::time_point t) {
+                                return static_cast<int64_t>(
+                                    std::chrono::duration_cast<std::chrono::seconds>(now - t).count());
+                            };
+                            const auto step = btc::coin::header_source_step(
+                                caught_up, handshaked, fresh, advanced,
+                                secs(*hdr_last_progress), secs(*hdr_last_getheaders));
+                            if (step.getheaders)
+                                send_locator_getheaders();
                             *hdr_was_handshaked = handshaked;
 
-                            if (!caught_up &&
-                                now - *hdr_last_progress >=
-                                    std::chrono::seconds(kNoProgressFailoverSec)) {
+                            if (step.failover) {
                                 LOG_INFO << "[BTC] standalone header source: no header "
-                                            "progress for " << kNoProgressFailoverSec
+                                            "progress for " << secs(*hdr_last_progress)
                                          << "s (chain_height=" << h << ", handshaked="
-                                         << handshaked << ") — failing over to next candidate";
+                                         << handshaked << ", caught_up=" << caught_up
+                                         << ") — failing over to next candidate";
+                                if (!standalone_current->empty()) {
+                                    if (*standalone_handshaked)
+                                        coin_peer_mgr->notify_disconnected(*standalone_current);
+                                    else
+                                        coin_peer_mgr->notify_dial_failed(*standalone_current);
+                                }
                                 dial_standalone_peer();
                                 *hdr_last_progress  = now;    // grace window for the new peer
                                 *hdr_was_handshaked = false;  // force getheaders on its handshake
@@ -1368,18 +1490,17 @@ int main(int argc, char* argv[])
                 LOG_WARNING << "[BTC] initial getheaders: handshake not complete (peer slow?)";
                 // Fire anyway — at worst the peer ignores and we retry later.
             }
-            // Locator: if HeaderChain has any tip, use its hash; else genesis.
-            // For a fresh DB the chain is empty so locator = [genesis].
-            uint256 locator;
-            if (auto tip = header_chain.tip(); tip)
-                locator = tip->block_hash;
-            else
-                locator = chain_params.genesis_hash;
+            // Locator: the header chain's block locator (tip, then back to
+            // genesis); a fresh DB has none, so locator = [genesis].
+            auto locator = header_chain.get_locator();
+            if (locator.empty())
+                locator.push_back(chain_params.genesis_hash);
             LOG_INFO << "[BTC] Sending initial getheaders, locator="
-                     << locator.GetHex().substr(0, 16)
-                     << " (chain_height=" << header_chain.height() << ")";
+                     << locator.front().GetHex().substr(0, 16)
+                     << " (" << locator.size() << " hashes, chain_height="
+                     << header_chain.height() << ")";
             coin_node.send_getheaders(
-                BTC_PROTOCOL_VERSION, {locator}, uint256::ZERO);
+                BTC_PROTOCOL_VERSION, locator, uint256::ZERO);
         });
 
     // B5: stale-submit warning timer. Every 30s, scan pending_submits for
@@ -1455,16 +1576,15 @@ int main(int argc, char* argv[])
                         have_pending, coin_node.has_p2p(),
                         coin_node.is_handshake_complete())
                     == btc::coin::TipReconcileGate::Action::Poll) {
-                    uint256 locator;
-                    if (auto tip = header_chain.tip(); tip)
-                        locator = tip->block_hash;
-                    else
-                        locator = chain_params.genesis_hash;
+                    auto locator = header_chain.get_locator();
+                    if (locator.empty())
+                        locator.push_back(chain_params.genesis_hash);
                     LOG_INFO << "[BTC-SUBMIT] tip-reconcile getheaders locator="
-                             << locator.GetHex().substr(0, 16)
+                             << locator.front().GetHex().substr(0, 16)
+                             << " (" << locator.size() << " hashes)"
                              << " chain_height=" << header_chain.height();
                     coin_node.send_getheaders(
-                        BTC_PROTOCOL_VERSION, {locator}, uint256::ZERO);
+                        BTC_PROTOCOL_VERSION, locator, uint256::ZERO);
                 }
                 if (auto self = weak_reconcile.lock()) (*self)();
             });
@@ -3170,14 +3290,35 @@ int main(int argc, char* argv[])
                 uint64_t height = static_cast<uint64_t>(header_chain.height()) + 1;
                 mi->record_found_block(
                     height, block_hash, static_cast<uint64_t>(std::time(nullptr)),
-                    /*chain=*/"BTC", /*miner=*/"", /*share_hash=*/block_hash.GetHex(),
+                    /*chain=*/btc::found_block_ledger::kChainLabel,
+                    /*miner=*/"", /*share_hash=*/block_hash.GetHex(),
                     mi->get_network_difficulty(), /*share_difficulty=*/0.0,
-                    mi->get_local_hashrate(), /*subsidy=*/0);
+                    // Pool hashrate 0 -> record_found_block reads the
+                    // sharechain pool estimator. This site passed
+                    // get_local_hashrate(): this node's OWN stratum rate in a
+                    // field named pool_hashrate_at_find, so a block's luck
+                    // was measured against one node's miners, not the pool.
+                    /*pool_hashrate=*/0.0, /*subsidy=*/0);
                 mi->schedule_block_verification(block_hash.GetHex());
                 LOG_INFO << "[BTC] recorded found block hash="
                          << block_hash.GetHex().substr(0, 16)
                          << " -- confirm/orphan poller armed";
             };
+
+        // The block's OWN difficulty and time, by hash, off the embedded
+        // header chain: a recorded block's network difficulty is its header's
+        // nBits (the record above passes the live template's reading, which
+        // record_found_block replaces as soon as the header is held, at
+        // record time or at the confirm verdict). Merged NMC blocks likewise,
+        // off the embedded NMC header chain. Display only.
+        {
+            auto lookups = core::header_chain_block_lookups(&header_chain);
+            mi->set_block_field_lookups(lookups.first, lookups.second);
+            mi->set_block_height_lookup(core::header_chain_height_lookup(&header_chain));
+            if (nmc_chain)
+                mi->add_chain_block_difficulty_lookup(
+                    "NMC", core::header_chain_block_lookups(nmc_chain.get()).first);
+        }
 
         // VERDICT. Resolve a recorded found block against the chain: >0 accepted
         // (best-chain depth), <0 orphaned (off the active chain), 0 pending (not
@@ -3260,6 +3401,33 @@ int main(int argc, char* argv[])
             LOG_INFO << "[BTC-POOL] graph_db stats persistence -> " << graph_db_path;
         }
 
+        // Found-block ledger persistence (LTC "Layer +2" parity): the
+        // /recent_blocks rows were held in memory only and lost on every
+        // restart. A LevelDB beside this network's embedded_headers
+        // (<data>/bitcoin/found_blocks_db; bitcoin_testnet, bitcoin_testnet4,
+        // bitcoin_regtest), never LTC's <data>/<net>/found_blocks_db.
+        // Restored after the stat log (the network-difficulty seed reads it)
+        // and after the verify fn above, so a row still pending at the last
+        // shutdown gets its confirm/orphan checks again. Display only.
+        {
+            const std::string fblk_db_path =
+                btc::found_block_ledger::db_path(net_dir).string();
+            if (btc::found_block_ledger::enable_persistence(*mi, fblk_db_path))
+                LOG_INFO << "[BTC-POOL] found-block persistence enabled at " << fblk_db_path
+                         << " (" << mi->get_found_blocks().size() << " rows restored)";
+            else
+                LOG_WARNING << "[BTC-POOL] found-block LevelDB at " << fblk_db_path
+                            << " could not be opened -- the ledger is kept in memory only";
+            mi->reverify_pending_found_blocks();
+        }
+
+        // --import-found-blocks: the pool's found-block history from another
+        // node (core/found_block_import.hpp). Every block is validated against
+        // the embedded BTC header chain, once it is synced; rows the ledger
+        // holds only gain missing fields. Display only.
+        if (!import_found_blocks.paths.empty())
+            btc::found_block_ledger::start_import(*mi, import_found_blocks.paths, &header_chain);
+
         if (web_server->start()) {
             // LTC-parity site 3/3: periodic save_stat_log every 100s (matches p2pool
             // graph_db + main_ltc.cpp:7429). Self-rescheduling steady_timer on the SAME
@@ -3290,7 +3458,15 @@ int main(int argc, char* argv[])
         } // if (mi != nullptr)
     } else {
         LOG_INFO << "[BTC-POOL] dashboard disabled (no --http bind given).";
+        if (!import_found_blocks.paths.empty())
+            LOG_WARNING << "[BTC-POOL] --import-found-blocks: the found-block ledger is the"
+                           " dashboard's and --http is not given; nothing is imported";
     }
+    // HTTP on the stratum port (--stratum-http; auto follows the --http bind).
+    if (stratum_server_for_shutdown)
+        core::configure_stratum_http(*stratum_server_for_shutdown, web_server.get(),
+                                     core::stratum_http_mode_setting(),
+                                     core::stratum_http_limits_setting());
 
     // Periodic think/clean tick (every 5s, safety net) — mirrors the LTC/dash
     // tick (main_ltc.cpp think_timer). Without it, think() fired only on share

@@ -1,0 +1,128 @@
+name: Provision dashbls (Windows x64)
+description: >
+  Windows counterpart of provision-dashbls: make the dashbls (BLS12-381)
+  backend available to the MSVC DASH build, so -DC2POOL_DASH_BLS=ON links the
+  REAL verifier instead of failing to configure.
+
+  dashd's Windows release builds its src/dashbls subtree with autotools and
+  mingw-w64 GCC against a static GMP. MSVC cannot link that C++ library, so
+  scripts/build_dashbls_win64.sh builds it the same way in MSYS2 MINGW64
+  (scripts/build_dashbls.sh unchanged: same pinned tag, ARITH=GMP,
+  MULTI=PTHREAD) and links it into one self-contained c2pool_dashbls.dll that
+  exports only the C ABI in src/impl/dash/coin/vendor/dashbls_abi. CMake turns
+  the DLL's export list into an MSVC import library; the facade headers next to
+  that ABI give c2pool's code the dashbls class names.
+
+  The build happens ONCE per runner per (pinned tag, ABI sources) key; a prefix
+  whose key matches is reused and MSYS2 is not even set up. Exports
+  DASHBLS_ROOT to $GITHUB_ENV and FAILS the job when the DLL, its export list,
+  or a GMP build stamp is missing.
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve prefix, pinned tag and ABI fingerprint
+      id: resolve
+      shell: powershell -ExecutionPolicy Bypass -Command ". '{0}'"
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $prefix = Join-Path $env:USERPROFILE '.c2pool-deps\dashbls-win64'
+        # Single source of truth for the pin: scripts/build_dashbls.sh.
+        $m = Select-String -Path 'scripts/build_dashbls.sh' -Pattern '^DASH_REF="\$\{DASH_REF:-(.*)\}"' | Select-Object -First 1
+        if (-not $m) { Write-Host "::error::could not parse DASH_REF from scripts/build_dashbls.sh"; exit 1 }
+        $pin = $m.Matches[0].Groups[1].Value.Trim()
+        # The DLL embeds the ABI shim, so its sources are part of the cache key.
+        # Line endings are normalised first: this checkout is CRLF.
+        $files = @(
+          'scripts/build_dashbls.sh',
+          'scripts/build_dashbls_win64.sh',
+          'src/impl/dash/coin/vendor/dashbls_abi/c2pool_dashbls_abi.h',
+          'src/impl/dash/coin/vendor/dashbls_abi/c2pool_dashbls_abi.cpp',
+          'src/impl/dash/coin/vendor/dashbls_abi/c2pool_dashbls_selftest.c'
+        )
+        $ms = New-Object System.IO.MemoryStream
+        foreach ($f in $files) {
+          $text = [IO.File]::ReadAllText((Resolve-Path $f).Path) -replace "`r`n", "`n"
+          $bytes = [Text.Encoding]::UTF8.GetBytes($text)
+          $ms.Write($bytes, 0, $bytes.Length)
+        }
+        $sha = [Security.Cryptography.SHA256]::Create()
+        $fp = -join ($sha.ComputeHash($ms.ToArray()) | ForEach-Object { $_.ToString('x2') })
+        $key = "$pin abi-$($fp.Substring(0, 16))"
+        $marker = Join-Path $prefix '.c2pool-key'
+        $warm = (Test-Path (Join-Path $prefix 'bin\c2pool_dashbls.dll')) -and
+                (Test-Path (Join-Path $prefix 'lib\c2pool_dashbls.def')) -and
+                (Test-Path $marker) -and
+                ((Get-Content $marker -Raw).Trim() -eq $key)
+        Write-Host "dashbls-win64 prefix=$prefix key=$key warm=$warm"
+        [IO.File]::AppendAllText($env:GITHUB_ENV, "DASHBLS_WIN_PREFIX=$prefix`nDASHBLS_WIN_KEY=$key`n")
+        [IO.File]::AppendAllText($env:GITHUB_OUTPUT, "cold=$(if ($warm) { 'false' } else { 'true' })`n")
+
+    - name: Set up MSYS2 MINGW64 (cold prefix only)
+      if: steps.resolve.outputs.cold == 'true'
+      uses: msys2/setup-msys2@v2
+      with:
+        msystem: MINGW64
+        update: false
+        cache: false
+        path-type: minimal
+        install: >-
+          git
+          autotools
+          mingw-w64-x86_64-gcc
+          mingw-w64-x86_64-gmp
+
+    - name: Build dashbls + c2pool_dashbls.dll (cold prefix only)
+      if: steps.resolve.outputs.cold == 'true'
+      shell: msys2 {0}
+      run: |
+        set -euo pipefail
+        prefix="$(cygpath -u "$DASHBLS_WIN_PREFIX")"
+        # Belt-and-braces before an rm -rf: only ever the per-user deps dir.
+        case "$prefix" in
+          */.c2pool-deps/dashbls-win64) ;;
+          *) echo "::error::refusing to remove unexpected prefix $prefix"; exit 1 ;;
+        esac
+        rm -rf "$prefix"
+        work="$(cygpath -u "$RUNNER_TEMP")/dashbls-win64"
+        rm -rf "$work"
+        mkdir -p "$work/scripts"
+        # The runner checks out with core.autocrlf=true; bash needs LF scripts.
+        for f in build_dashbls.sh build_dashbls_win64.sh; do
+          tr -d '\r' < "scripts/$f" > "$work/scripts/$f"
+        done
+        C2POOL_SRC="$(cygpath -u "$GITHUB_WORKSPACE")" \
+        BUILD_DIR="$work/build" \
+        JOBS="$(nproc)" \
+          bash "$work/scripts/build_dashbls_win64.sh" "$prefix"
+        rm -rf "$work"
+
+    - name: Assert c2pool_dashbls.dll is present and export DASHBLS_ROOT
+      shell: powershell -ExecutionPolicy Bypass -Command ". '{0}'"
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $prefix = $env:DASHBLS_WIN_PREFIX
+        $dll = Join-Path $prefix 'bin\c2pool_dashbls.dll'
+        $def = Join-Path $prefix 'lib\c2pool_dashbls.def'
+        $fail = $false
+        foreach ($f in @($dll, $def)) {
+          if (Test-Path $f) { Write-Host "  ok   $f" } else { Write-Host "  MISS $f"; $fail = $true }
+        }
+        if ($fail) { Write-Host "::error::dashbls-win64 provisioning did not produce a usable prefix at $prefix"; exit 1 }
+        $marker = Join-Path $prefix '.c2pool-key'
+        if ("${{ steps.resolve.outputs.cold }}" -eq 'true') {
+          [IO.File]::WriteAllText($marker, "$env:DASHBLS_WIN_KEY`n")
+        }
+        # Load the DLL and ask it what it is: proves it loads on this host and
+        # was built from the pinned tag with the GMP backend.
+        $src = 'using System; using System.Runtime.InteropServices; public static class C2DblsProvisionProbe { [DllImport(@"' + $dll + '", CallingConvention = CallingConvention.Cdecl)] public static extern IntPtr c2dbls_build_info(); }'
+        Add-Type -TypeDefinition $src
+        $info = [Runtime.InteropServices.Marshal]::PtrToStringAnsi([C2DblsProvisionProbe]::c2dbls_build_info())
+        Write-Host "  c2pool_dashbls.dll: $info"
+        $pin = ($env:DASHBLS_WIN_KEY -split ' ')[0]
+        if ($info -notlike "dashbls $pin ARITH=GMP *") {
+          Write-Host "::error::c2pool_dashbls.dll reports '$info', expected dashbls $pin with ARITH=GMP"
+          exit 1
+        }
+        # Forward slashes: the value lands in a cmake -D on the command line.
+        [IO.File]::AppendAllText($env:GITHUB_ENV, "DASHBLS_ROOT=$($prefix -replace '\\', '/')`n")

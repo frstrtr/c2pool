@@ -22,8 +22,9 @@
 //        ser_action.ForRead() { ... }     → formatter-type-discriminated
 //                                            post-read hook in FORMAT_METHODS.
 //      Wire format is byte-for-byte identical to dashcore.
-//   3. CheckBlock() call removed from FillBlock (c2pool-dash validates
-//      blocks at higher layers).
+//   3. CheckBlock() / IsBlockMutated call removed from FillBlock; the caller
+//      (compact_block_receive.hpp) binds the body to the header merkle root
+//      and treats a mismatch as READ_STATUS_FAILED (full-block fallback).
 
 #pragma once
 
@@ -144,22 +145,22 @@ protected:
     size_t prefilled_count = 0, mempool_count = 0, extra_count = 0;
 
     // Shim: dashcore threads a `CTxMemPool*`; c2pool-dash passes a
-    // snapshot provider (see shim.hpp). Null callback = no mempool
-    // (pre-Phase-M); reassembly falls straight through to getblocktxn.
+    // provider that walks the pool under its lock (see shim.hpp). Null
+    // callback = no mempool; reassembly falls straight through to getblocktxn.
     MempoolShortIdProvider mempool_provider;
-    // Upper bound on transactions a block may contain. Dashcore reads
-    // MaxBlockSize() from ChainParams at call-time; c2pool-dash injects
-    // it at construction so blockencodings.cpp stays free of
-    // chain-params deps.
-    size_t max_block_tx_count;
+    // The block size limit in BYTES (Dash Core MaxBlockSize(), 2 MB since
+    // DIP0001). InitData divides it by MIN_TRANSACTION_SIZE for the tx-count
+    // bound, exactly as Dash Core does. Injected at construction so
+    // blockencodings.cpp stays free of chain-params deps.
+    size_t max_block_size;
 
 public:
     CBlockHeader header;
 
     explicit PartiallyDownloadedBlock(MempoolShortIdProvider provider,
-                                      size_t max_block_tx_count_in)
+                                      size_t max_block_size_in)
         : mempool_provider(std::move(provider))
-        , max_block_tx_count(max_block_tx_count_in) {}
+        , max_block_size(max_block_size_in) {}
 
     // extra_txn is a list of extra transactions to look at, in <hash, reference> form
     ReadStatus InitData(const CBlockHeaderAndShortTxIDs& cmpctblock,

@@ -169,6 +169,67 @@ TEST(DashNodeCoinState, PopulatedRoutesEmbeddedByteEqualToDirectBuild) {
     expect_workdata_eq(sel.work, reference);
 }
 
+// The template's mintime (the submit floor, MTP + 1) is withheld (0) when the
+// tip's MTP is not over a full 11-header window (set_tip's last argument):
+// an MTP over fewer headers can be later than the network's. The flag
+// touches only the mintime (height, coinbase value and transactions match).
+TEST(DashNodeCoinState, IncompleteMtpWindowServesNoMintime) {
+    const uint256 prev_hash = raw256(0xAB);
+    const uint32_t bits = 0x1b104be3u;
+    const uint32_t mtp  = 1'700'000'000u;
+    auto never = [&]() -> DashWorkData {
+        ADD_FAILURE() << "a populated bundle must not reach the dashd fallback";
+        return DashWorkData{};
+    };
+
+    NodeCoinState full;
+    seed_single_mn(full, p2pkh_script(0x30));
+    full.set_tip(H - 1, prev_hash, bits, mtp, DASH_PUBKEY_VER, DASH_P2SH_VER,
+                 1'700'000'123u, 0x20000000u, /*mtp_window_complete=*/true);
+    const WorkSelection a = full.select_work(never);
+    ASSERT_EQ(a.source, WorkSource::Embedded);
+    EXPECT_EQ(a.work.m_mintime, mtp + 1) << "a full window: the floor is MTP + 1";
+
+    NodeCoinState partial;
+    seed_single_mn(partial, p2pkh_script(0x30));
+    partial.set_tip(H - 1, prev_hash, bits, mtp, DASH_PUBKEY_VER, DASH_P2SH_VER,
+                    1'700'000'123u, 0x20000000u, /*mtp_window_complete=*/false);
+    const WorkSelection b = partial.select_work(never);
+    ASSERT_EQ(b.source, WorkSource::Embedded);
+    EXPECT_EQ(b.work.m_mintime, 0u) << "an incomplete window: no floor";
+    EXPECT_EQ(b.work.m_height, a.work.m_height);
+    EXPECT_EQ(b.work.m_coinbase_value, a.work.m_coinbase_value);
+    EXPECT_EQ(b.work.m_txs.size(), a.work.m_txs.size()) << "only the floor changes";
+}
+
+// The same through the maintainer's production hops: on_new_tip carries the
+// flag to promote_serve_tip -> republish -> set_tip.
+TEST(DashNodeCoinState, MaintainerCarriesTheMtpWindowFlagToTheTemplate) {
+    const uint32_t mtp = 1'700'000'000u;
+    auto never = [&]() -> DashWorkData {
+        ADD_FAILURE() << "a populated bundle must not reach the dashd fallback";
+        return DashWorkData{};
+    };
+    MNState pm; pm.isValid = true; pm.nRegisteredHeight = 2'300'000;
+    pm.nLastPaidHeight = 0; pm.scriptPayout.m_data = p2pkh_script(0x30);
+    pm.payoutSplitProvenance = MNState::SPLIT_KNOWN;
+
+    for (const bool complete : {true, false}) {
+        NodeCoinState st;
+        CoinStateMaintainer maint(st);
+        maint.on_mn_list_update(
+            std::vector<std::pair<uint256, MNState>>{{raw256(0x01), pm}}, 0);
+        maint.on_new_tip(H - 1, raw256(0xAB), 0x1b104be3u, mtp,
+                         DASH_PUBKEY_VER, DASH_P2SH_VER, 1'700'000'123u, 0x20000000u,
+                         /*mtp_window_complete=*/complete);
+        ASSERT_TRUE(st.populated());
+        const WorkSelection sel = st.select_work(never);
+        ASSERT_EQ(sel.source, WorkSource::Embedded);
+        EXPECT_EQ(sel.work.m_mintime, complete ? mtp + 1 : 0u)
+            << (complete ? "a full window: MTP + 1" : "an incomplete window: no floor");
+    }
+}
+
 // ════════════════════════════════════════════════════════════════════════
 // COLD arm (retained fallback): unpopulated / invalidated -> DashdFallback.
 // ════════════════════════════════════════════════════════════════════════
@@ -436,6 +497,49 @@ TEST(DashNodeCoinState, UnresolvablePayeeFailsClosedToDashd) {
     ASSERT_TRUE(st.mnstates().find_expected_payee().has_value());
     EXPECT_TRUE(st.make_embedded_work_inputs().viable())
         << "#996 guard must NOT refuse when the due payee resolves";
+}
+
+// Dash Core v24 (testnet shadow h=1586594): the scheduled payee is an
+// ExtAddr masternode paid through its payout list, so its scriptPayout is
+// empty. The builder would pay an empty script (bad-cb-payee): the embedded
+// arm must refuse the height until the v24 payee builder can pay the list.
+TEST(DashNodeCoinState, PayeeWithoutABuildableScriptFailsClosed) {
+    NodeCoinState st;
+    MNState ext;
+    ext.isValid = true;
+    ext.nRegisteredHeight = 2'300'000;
+    ext.payoutSplitProvenance = MNState::SPLIT_KNOWN;
+    // scriptPayout left empty, as the seed leaves it for a v3 payout list.
+    st.mnstates().load(std::vector<std::pair<uint256, MNState>>{{raw256(0x01), ext}});
+    st.set_tip(H - 1, raw256(0xAB), 0x1b104be3u, 1'700'000'000u,
+               DASH_PUBKEY_VER, DASH_P2SH_VER);
+    ASSERT_TRUE(st.populated());
+    ASSERT_TRUE(st.mnstates().find_expected_payee().has_value());
+    const auto e = st.make_embedded_work_inputs();
+    EXPECT_FALSE(e.viable());
+    EXPECT_EQ(e.decline.cause, "mn-payee-v24-payout-list");
+    EXPECT_EQ(e.decline.value, "protx=" + raw256(0x01).GetHex().substr(0, 12));
+    // Counted once per height, however many templates rebuild it.
+    st.make_embedded_work_inputs();
+    EXPECT_EQ(st.v24_payout_list_declines(), 1u);
+    EXPECT_EQ(st.v24_payout_list_last_height(), H);
+    // With the v24 payee builder a v3 masternode is paid through its payout
+    // list: the same empty scriptPayout with a v3 list serves.
+    {
+        MNState v3 = ext;
+        v3.nVersion = dash::coin::vendor::ProTxVersion::EXT_ADDR;
+        dash::coin::vendor::MasternodePayoutShare po;
+        po.scriptPayout.m_data = p2pkh_script(0x31);
+        po.reward = 10000;
+        v3.v24.payouts.push_back(po);
+        st.mnstates().load(std::vector<std::pair<uint256, MNState>>{{raw256(0x01), v3}});
+        const auto e3 = st.make_embedded_work_inputs();
+        EXPECT_NE(e3.decline.cause, "mn-payee-v24-payout-list") << e3.decline.cause;
+    }
+    // Control: the same masternode with a payout script serves.
+    seed_single_mn(st, p2pkh_script(0x30));
+    EXPECT_TRUE(st.make_embedded_work_inputs().viable());
+    EXPECT_EQ(st.v24_payout_list_declines(), 1u);
 }
 
 // #996 rescope: an EMPTY payee queue must NOT trip the guard (default ON).
@@ -2266,6 +2370,50 @@ TEST(DashQcPoseGate, ProvenBanRootIsMemoizedAcrossEmitEvaluations) {
     EXPECT_TRUE(st.embedded_template_emit_ok(sel2.work, &why)) << why.one_line();
 }
 
+// The same proven-ban height with the SUPERSET arm on (P-2,
+// --embedded-include-mn-special-txs): the expected root is the FOLDED root
+// (projection -> bans -> provider fold over the body). Its memo is keyed on
+// (epoch, tip, ban list, body txids). Pinned here: warm evaluations do no
+// root work (RED on pre-memo master: N calls == N roots), and the BAN LIST
+// key moves the memo by itself (the oracle calls do not bump the epoch).
+TEST(DashQcPoseGate, P2FoldedRootMemoIsWarmAndMovesWithTheBanList) {
+    using dash::coin::vendor::sml_calc_merkle_root_count;
+    NodeCoinState st;
+    seed_real_qc_serving(st, make_real_qc(/*punish_listed_member=*/true));
+    st.set_include_mn_special_txs(true);
+    wire_oracle(st, 50, 50);
+
+    WorkSelection sel = st.select_work([] { return DashWorkData{}; });
+    ASSERT_EQ(sel.source, WorkSource::Embedded) << sel.decline.one_line();
+    DeclineReport why;
+    ASSERT_TRUE(st.embedded_template_emit_ok(sel.work, &why)) << why.one_line();
+
+    const uint64_t roots0 = sml_calc_merkle_root_count();
+    const uint64_t folds0 = st.fold_root_computes_dbg();
+    constexpr int N = 100;
+    for (int i = 0; i < N; ++i)
+        ASSERT_TRUE(st.embedded_template_emit_ok(sel.work, nullptr));
+    EXPECT_EQ(sml_calc_merkle_root_count() - roots0, 0u)
+        << N << " warm P-2 evaluations at a banning height re-derived the"
+                " folded root (pre-memo: " << N << ")";
+    EXPECT_EQ(st.fold_root_computes_dbg() - folds0, 0u);
+
+    // The oracle stops proving the ban (same epoch): the ban-list key moves,
+    // the folded root is re-derived without the ban, and the banned-root
+    // template is refused instead of served off the memo.
+    wire_oracle(st, 0, 0);
+    EXPECT_FALSE(st.embedded_template_emit_ok(sel.work, &why));
+    EXPECT_EQ(why.cause, "emit-mnlist-root-drift") << why.one_line();
+    EXPECT_EQ(st.fold_root_computes_dbg() - folds0, 1u);
+
+    // The ban is proven again: one re-derivation for the new key, then warm.
+    wire_oracle(st, 50, 50);
+    ASSERT_TRUE(st.embedded_template_emit_ok(sel.work, &why)) << why.one_line();
+    EXPECT_EQ(st.fold_root_computes_dbg() - folds0, 2u);
+    ASSERT_TRUE(st.embedded_template_emit_ok(sel.work, nullptr));
+    EXPECT_EQ(st.fold_root_computes_dbg() - folds0, 2u);
+}
+
 // KAT 10 — fail closed with no oracle (the PR-A production posture): the
 // refusal names stage=penalty-unknown, and an oracle that is not at THIS tip
 // names oracle-not-at-tip — both at viability and at emit.
@@ -2491,4 +2639,183 @@ TEST(DashNodeCoinState, TxInjectStatusPublishMirrorsArmFlag) {
 
     st.set_tx_inject_enabled(false);        // disarm mirrors too
     EXPECT_FALSE(core::obs::inject_status().enabled.load());
+}
+
+// ── Dash Core v24: the deployment-state seam (slice S0) ─────────────────────
+// The embedded template is decided for the block it builds: v24_active is
+// the state of prev+1, and an UNKNOWN state refuses the embedded arm with a
+// named cause (the dashd fallback serves). Unset, the seam is INACTIVE and
+// the template is byte-identical to before.
+TEST(DashNodeCoinState, V24StateSeamDecidesForTheBlockBeingBuilt) {
+    using dash::coin::V24State;
+    UTXOViewCache utxo(nullptr);
+    NodeCoinState st;
+    seed_single_mn(st, p2pkh_script(0x30));
+    st.mempool().set_utxo(&utxo);
+    const uint32_t bits = 0x1b104be3u, mtp = 1'700'000'000u;
+    st.set_tip(H - 2, raw256(0xA1), bits, mtp, DASH_PUBKEY_VER, DASH_P2SH_VER, mtp + 60, 0x20000000u);
+    ASSERT_TRUE(st.populated());
+    {
+        auto e = st.make_embedded_work_inputs();
+        EXPECT_TRUE(e.viable());
+        EXPECT_FALSE(e.v24_active) << "unset seam = pre-v24";
+    }
+    st.set_v24_state_fn([](uint32_t h) { return h >= H ? V24State::ACTIVE : V24State::INACTIVE; });
+    {
+        auto e = st.make_embedded_work_inputs();   // builds H-1
+        EXPECT_TRUE(e.viable());
+        EXPECT_FALSE(e.v24_active);
+    }
+    st.set_tip(H - 1, raw256(0xA2), bits, mtp, DASH_PUBKEY_VER, DASH_P2SH_VER, mtp + 60, 0x20002000u);
+    {
+        auto e = st.make_embedded_work_inputs();   // builds H
+        EXPECT_TRUE(e.viable());
+        EXPECT_TRUE(e.v24_active);
+        EXPECT_EQ(e.version, 0x20002000u) << "the tip advance's block version rides through";
+    }
+    st.set_v24_state_fn([](uint32_t) { return V24State::UNKNOWN; });
+    {
+        auto e = st.make_embedded_work_inputs();
+        EXPECT_FALSE(e.viable());
+        EXPECT_EQ(e.decline.cause, "v24-state-unknown");
+        EXPECT_EQ(e.decline.value, "h=" + std::to_string(H));
+        bool fallback_called = false;
+        auto sel = st.select_work([&]() { fallback_called = true; return DashWorkData{}; });
+        EXPECT_EQ(sel.source, WorkSource::DashdFallback);
+        EXPECT_TRUE(fallback_called);
+        EXPECT_EQ(sel.decline.cause, "v24-state-unknown");
+    }
+}
+
+// VERIFY-H0-S0-S1 N2: an unwired seam does not mean "pre-v24". It falls back
+// to the process-wide answer for the network: mainnet without an installed
+// status is INACTIVE only below the earliest possible activation (2,580,480)
+// and UNKNOWN from it on, so the arm fails closed instead of building a
+// pre-v24 block on a chain that may be v24.
+TEST(DashNodeCoinState, V24UnsetSeamFallsBackToTheNetworkAnswer) {
+    UTXOViewCache utxo(nullptr);
+    NodeCoinState st;
+    seed_single_mn(st, p2pkh_script(0x30));
+    st.mempool().set_utxo(&utxo);
+    const uint32_t bits = 0x1b104be3u, mtp = 1'700'000'000u;
+    st.set_tip(2'580'478, raw256(0xB1), bits, mtp, DASH_PUBKEY_VER, DASH_P2SH_VER, mtp + 60, 0x20000000u);
+    ASSERT_TRUE(st.populated());
+    {
+        auto e = st.make_embedded_work_inputs();   // builds 2,580,479
+        EXPECT_TRUE(e.viable());
+        EXPECT_FALSE(e.v24_active);
+    }
+    st.set_tip(2'580'479, raw256(0xB2), bits, mtp, DASH_PUBKEY_VER, DASH_P2SH_VER, mtp + 60, 0x20000000u);
+    {
+        auto e = st.make_embedded_work_inputs();   // builds 2,580,480
+        EXPECT_FALSE(e.viable());
+        EXPECT_EQ(e.decline.cause, "v24-state-unknown");
+    }
+    // Testnet: the buried height (1,578,000) decides.
+    st.set_v24_network(dash::coin::DashNetwork::TESTNET);
+    {
+        auto e = st.make_embedded_work_inputs();
+        EXPECT_TRUE(e.viable());
+        EXPECT_TRUE(e.v24_active);
+    }
+}
+
+// ── E-SUPERBLOCK: the pre-emit gate re-asserts the superblock VERDICT ────────
+// A template built while the superblock height was PROVEN unfunded carries no
+// treasury outputs; if the verdict moves before emit (a trigger crossed the
+// threshold, a schedule changed) the built treasury slice no longer matches
+// what dashd will demand (IsBlockValueValid / IsBlockPayeeValid, Dash Core v24
+// masternode/payments.cpp:313-388) and the template must be discarded.
+TEST(DashServeGateNamesRefusal, SuperblockVerdictDriftFailsPreEmit) {
+    using namespace dash::coin;
+    NodeCoinState st;
+    seed_healthy_armed(st);
+    SuperblockResolution verdict;
+    verdict.verdict = SuperblockVerdict::NotTriggered;
+    verdict.reason  = "not-triggered";
+    st.set_is_superblock_fn([](uint32_t next_h) { return next_h == H; });
+    st.set_superblock_resolver([&verdict](uint32_t) { return verdict; });
+    st.set_require_superblock_provider(true);
+    st.set_superblock_sync_complete_fn([]() { return true; });
+
+    // Proven unfunded: served, normal coinbase, and the template clears the
+    // gate's superblock checks. (The shared harness seeds a NULL bestCL
+    // signature — set_best_cl(H-1, {}) — so this baseline is stopped LATER in
+    // the gate by emit-bestcl-null-committed; the superblock checks run before
+    // it, so the drift assertions below are unaffected.)
+    WorkSelection sel = st.select_work([] { return DashWorkData{}; });
+    ASSERT_EQ(sel.source, WorkSource::Embedded) << st.describe_decline().value;
+    EXPECT_EQ(sel.work.m_tx_serve_stamp.superblock_total, 0u);
+    {
+        DeclineReport base;
+        const bool ok = st.embedded_template_emit_ok(sel.work, &base);
+        EXPECT_TRUE(ok || base.cause == "emit-bestcl-null-committed")
+            << "baseline must pass every superblock check; cause=" << base.cause;
+        EXPECT_EQ(base.cause.rfind("emit-superblock", 0), std::string::npos) << base.cause;
+    }
+
+    // The network's trigger gets funded before emit: discard, named.
+    verdict.verdict = SuperblockVerdict::Triggered;
+    verdict.reason  = "triggered";
+    SuperblockPayment sp;
+    sp.script = p2pkh_script(0x77);
+    sp.amount = 500'000'000;
+    verdict.payments = {sp};
+    DeclineReport why;
+    EXPECT_FALSE(st.embedded_template_emit_ok(sel.work, &why));
+    EXPECT_EQ(why.cause, "emit-superblock-drift");
+
+    // Unknown at emit time: discard with the verdict's own reason.
+    verdict = SuperblockResolution::unknown("trigger-ambiguous");
+    EXPECT_FALSE(st.embedded_template_emit_ok(sel.work, &why));
+    EXPECT_EQ(why.cause, "emit-superblock-refused");
+    EXPECT_EQ(why.value, "trigger-ambiguous");
+    // ...and viability names it the same way.
+    EXPECT_EQ(st.describe_decline().cause, "superblock-refused");
+    EXPECT_EQ(st.describe_decline().value, "trigger-ambiguous");
+}
+
+// LOW-7: the pre-emit gate compares the ORDERED superblock payee list, not
+// only the total — a same-total schedule in another order (or to another
+// payee) is a different block to dashd's CSuperblock::IsValid.
+TEST(DashServeGateNamesRefusal, SuperblockPayeeOrderDriftFailsPreEmit) {
+    using namespace dash::coin;
+    NodeCoinState st;
+    seed_healthy_armed(st);
+    SuperblockPayment a, b;
+    a.script = p2pkh_script(0x71); a.amount = 300'000'000;
+    b.script = p2pkh_script(0x72); b.amount = 200'000'000;
+    SuperblockResolution verdict;
+    verdict.verdict  = SuperblockVerdict::Triggered;
+    verdict.reason   = "triggered";
+    verdict.payments = {a, b};
+    st.set_is_superblock_fn([](uint32_t next_h) { return next_h == H; });
+    st.set_superblock_resolver([&verdict](uint32_t) { return verdict; });
+    st.set_require_superblock_provider(true);
+    st.set_superblock_sync_complete_fn([]() { return true; });
+
+    WorkSelection sel = st.select_work([] { return DashWorkData{}; });
+    ASSERT_EQ(sel.source, WorkSource::Embedded) << st.describe_decline().value;
+    EXPECT_EQ(sel.work.m_tx_serve_stamp.superblock_total, 500'000'000u);
+    {
+        DeclineReport base;
+        st.embedded_template_emit_ok(sel.work, &base);
+        EXPECT_EQ(base.cause.rfind("emit-superblock", 0), std::string::npos) << base.cause;
+    }
+    // Same total, swapped order => drift.
+    verdict.payments = {b, a};
+    DeclineReport why;
+    EXPECT_FALSE(st.embedded_template_emit_ok(sel.work, &why));
+    EXPECT_EQ(why.cause, "emit-superblock-drift");
+    // Same total and order but another payee => drift.
+    SuperblockPayment c = a;
+    c.script = p2pkh_script(0x73);
+    verdict.payments = {c, b};
+    EXPECT_FALSE(st.embedded_template_emit_ok(sel.work, &why));
+    EXPECT_EQ(why.cause, "emit-superblock-drift");
+    // The schedule it was built from passes the superblock checks again.
+    verdict.payments = {a, b};
+    DeclineReport again;
+    st.embedded_template_emit_ok(sel.work, &again);
+    EXPECT_EQ(again.cause.rfind("emit-superblock", 0), std::string::npos) << again.cause;
 }

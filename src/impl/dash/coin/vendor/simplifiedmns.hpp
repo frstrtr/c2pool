@@ -2,7 +2,8 @@
 #pragma once
 
 // Vendored from dashcore/src/evo/simplifiedmns.{h,cpp} @ develop cfad414
-// (Dash Core v23.1-dev).
+// (Dash Core v23.1-dev); the netInfo of version-3 entries follows Dash Core
+// v24.0.0 (ExtNetInfo, vendor/netinfo.hpp).
 //
 // Adaptations from upstream:
 //
@@ -19,13 +20,20 @@
 //      we'd then need to multiplex on a serialization-mode tag like
 //      dashcore's CHashWriter. Not relevant pre-Phase L.
 //
-//   2. NetInfoInterface / NetInfoSerWrapper is replaced by an inline
-//      18-byte legacy CService (16-byte raw IPv6 + 2-byte BE port).
-//      MnNetInfo (DIP-0028 ExtAddr multi-addr) is NOT supported yet —
-//      ExtAddr is gated behind `DEPLOYMENT_V24` (EHF) which has not
-//      activated on Dash mainnet. We log+drop entries with
-//      nVersion >= ExtAddr (==3) so the absence is visible. Re-vendor
-//      with NetInfo support once DEPLOYMENT_V24 activates.
+//   2. NetInfoInterface / NetInfoSerWrapper is replaced by two members,
+//      selected by the entry's nVersion exactly as Core's
+//      NetInfoSerWrapper(netInfo, nVersion >= ProTxVersion::ExtAddr):
+//        - nVersion 1/2: the inline 18-byte legacy CService (netAddress,
+//          16 raw IPv6 bytes + netPort, 2 bytes big-endian), unchanged;
+//        - nVersion 3 (Dash Core v24, DEPLOYMENT_V24): extNetInfo, an
+//          ExtNetInfo (vendor/netinfo.hpp), on the wire AND in the
+//          SER_GETHASH leaf preimage; an EvoNode entry then carries no
+//          platformHTTPPort.
+//      Reading an entry whose nVersion is 0 or above 3 throws: such an
+//      entry has no layout this code knows, so the mnlistdiff carrying it
+//      fails to parse (fail closed) instead of being read with a guessed
+//      layout. Writing is not restricted (in-memory entries never carry
+//      such a version).
 //
 //   3. CBLSLazyPublicKey is replaced by a 48-byte std::array (pass-
 //      through-correct wire bytes; legacy/basic BLS scheme-flag is
@@ -61,6 +69,7 @@
 // compute_merkle_root helper below keeps this header self-contained.
 
 #include <impl/dash/coin/vendor/shim.hpp>
+#include <impl/dash/coin/vendor/netinfo.hpp>
 
 #include <core/uint256.hpp>
 #include <core/pack.hpp>
@@ -122,8 +131,9 @@ struct CSimplifiedMNListEntry
     uint16_t                              nVersion{VER_BASIC_BLS};
     uint256                               proRegTxHash;
     uint256                               confirmedHash;
-    std::array<uint8_t, NETADDR_SIZE>     netAddress{};   // raw IPv6 (v4 = ::ffff:...)
-    uint16_t                              netPort{0};      // BE on the wire (CService)
+    std::array<uint8_t, NETADDR_SIZE>     netAddress{};   // nVersion 1/2: raw IPv6 (v4 = ::ffff:...)
+    uint16_t                              netPort{0};      // nVersion 1/2: BE on the wire (CService)
+    ExtNetInfo                            extNetInfo;      // nVersion 3 (Dash Core v24)
     std::array<uint8_t, BLS_PUBKEY_SIZE>  pubKeyOperator{};
     uint160                               keyIDVoting;
     bool                                  isValid{false};
@@ -143,15 +153,21 @@ struct CSimplifiedMNListEntry
     // SERIALIZE_METHODS/READWRITE macro (which is not mapped in our pack
     // layer and would leave the type non-serializable). Field order and
     // the per-entry nVersion-conditional gating are preserved verbatim.
+    bool has_ext_netinfo() const { return nVersion >= VER_EXT_ADDR; }
+
     template <typename Stream>
     void Serialize(Stream& s) const
     {
         s << nVersion
           << proRegTxHash
-          << confirmedHash
-          << Using<RawBytesFormat<NETADDR_SIZE>>(netAddress)
-          << Using<BigEndianFormat<2>>(netPort)
-          << Using<RawBytesFormat<BLS_PUBKEY_SIZE>>(pubKeyOperator)
+          << confirmedHash;
+        if (has_ext_netinfo()) {
+            s << extNetInfo;
+        } else {
+            s << Using<RawBytesFormat<NETADDR_SIZE>>(netAddress)
+              << Using<BigEndianFormat<2>>(netPort);
+        }
+        s << Using<RawBytesFormat<BLS_PUBKEY_SIZE>>(pubKeyOperator)
           << keyIDVoting
           << isValid;
         if (nVersion >= VER_BASIC_BLS) {
@@ -168,12 +184,18 @@ struct CSimplifiedMNListEntry
     template <typename Stream>
     void Unserialize(Stream& s)
     {
-        s >> nVersion
-          >> proRegTxHash
-          >> confirmedHash
-          >> Using<RawBytesFormat<NETADDR_SIZE>>(netAddress)
-          >> Using<BigEndianFormat<2>>(netPort)
-          >> Using<RawBytesFormat<BLS_PUBKEY_SIZE>>(pubKeyOperator)
+        s >> nVersion;
+        if (nVersion == 0 || nVersion > VER_EXT_ADDR)
+            throw std::ios_base::failure("SML entry nVersion has no known layout");
+        s >> proRegTxHash
+          >> confirmedHash;
+        if (has_ext_netinfo()) {
+            s >> extNetInfo;
+        } else {
+            s >> Using<RawBytesFormat<NETADDR_SIZE>>(netAddress)
+              >> Using<BigEndianFormat<2>>(netPort);
+        }
+        s >> Using<RawBytesFormat<BLS_PUBKEY_SIZE>>(pubKeyOperator)
           >> keyIDVoting
           >> isValid;
         if (nVersion >= VER_BASIC_BLS) {
@@ -196,13 +218,17 @@ struct CSimplifiedMNListEntry
         ::PackStream s;
         s << proRegTxHash;
         s << confirmedHash;
-        s.write(std::as_bytes(std::span{netAddress}));
-        // CService port: 2 bytes big-endian
-        uint8_t port_be[2] = {
-            static_cast<uint8_t>((netPort >> 8) & 0xff),
-            static_cast<uint8_t>(netPort & 0xff)
-        };
-        s.write(std::as_bytes(std::span{port_be}));
+        if (has_ext_netinfo()) {
+            s << extNetInfo;   // Core: NetInfoSerWrapper(netInfo, nVersion >= ExtAddr)
+        } else {
+            s.write(std::as_bytes(std::span{netAddress}));
+            // CService port: 2 bytes big-endian
+            uint8_t port_be[2] = {
+                static_cast<uint8_t>((netPort >> 8) & 0xff),
+                static_cast<uint8_t>(netPort & 0xff)
+            };
+            s.write(std::as_bytes(std::span{port_be}));
+        }
         s.write(std::as_bytes(std::span{pubKeyOperator}));
         s << keyIDVoting;
         s << isValid;
@@ -233,6 +259,7 @@ struct CSimplifiedMNListEntry
             && confirmedHash == r.confirmedHash
             && netAddress == r.netAddress
             && netPort == r.netPort
+            && extNetInfo == r.extNetInfo
             && pubKeyOperator == r.pubKeyOperator
             && keyIDVoting == r.keyIDVoting
             && isValid == r.isValid
@@ -247,7 +274,7 @@ struct CSimplifiedMNListEntry
         os << "v" << nVersion
            << " t" << nType
            << " proreg=" << proRegTxHash.GetHex().substr(0, 12)
-           << " port=" << netPort
+           << " port=" << (has_ext_netinfo() ? extNetInfo.GetPrimary().port : netPort)
            << (isValid ? " VALID" : " INVALID");
         return os.str();
     }

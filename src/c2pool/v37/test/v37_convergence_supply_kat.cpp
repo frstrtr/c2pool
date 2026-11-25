@@ -102,6 +102,7 @@ static int g_checks = 0;
     } while (0)
 
 static const ChainId CHAIN = 1;
+static const ChainId NO_LANE = CHAIN + 1;   // no lane is ever added for it
 
 static LaneParams small_params() {
     LaneParams p;
@@ -211,6 +212,8 @@ struct Node {
     std::vector<bytes32> unservable_ids;
     std::optional<CtrlOrder> last_order;
     std::vector<SupplyFailure> failures;
+    // Control frames whose handlers (serve + fetch) have fully run.
+    std::atomic<std::uint64_t> ctrl_done{0};
 
     explicit Node(u64 tip, bool with_control = true) {
         engine.start();
@@ -268,6 +271,7 @@ struct Node {
                                     const std::vector<std::uint8_t>& f) {
                 serve->on_control(p, f);
                 fetch->on_control(p, f);
+                ctrl_done.fetch_add(1);
             });
         }
         net->set_on_peer_event([this](CarrierPeerNode::PeerId p, bool up) {
@@ -283,6 +287,12 @@ struct Node {
         return s ? s->digest : ::v37::bytes32{};
     }
     std::uint64_t pushes() const { return ingest->pushes_forwarded(); }
+    // Engine settle point: records apply and publish in FIFO order, so when this
+    // tracked record resolves every record submitted before it is visible
+    // through snapshot(). A rewind on a chain with no lane changes nothing.
+    void settle_engine() {
+        (void)engine.submit_tracked(LaneRecord::rewind(NO_LANE, 0)).get();
+    }
 
     std::size_t n_frames() { std::lock_guard<std::mutex> lk(last_mtx); return last_frames.size(); }
     std::size_t n_all_frames() { std::lock_guard<std::mutex> lk(last_mtx); return all_frames.size(); }
@@ -438,6 +448,11 @@ static void test_cs2_roundtrip() {
     // ★ NO APPLY. Stage 1 supplies bytes; it does not admit them. B's lane is
     // exactly where it was — this suite never calls handle_inbound on a fetched
     // frame, never folds, and never touches the ledger.
+    // Settle point: the fetch has completed and B's engine has published.
+    CHECK(wait_until([&] {
+        return B.fetch->stats().fetches_completed == 1 && !B.fetch->busy(pa);
+    }));
+    B.settle_engine();
     CHECK(B.next_pos() == 0);
     CHECK(B.raw_total() == 0);
     CHECK(B.pushes() == 0);
@@ -531,6 +546,8 @@ static void test_cs3_lying_peer_fail_closed() {
     CHECK(B.fetch->stats().frames_verified == 0);
     CHECK(B.n_frames() == 0);
     // And nothing was admitted anywhere: this layer does not apply.
+    // The failure callback is the handler's last step; settle B's engine.
+    B.settle_engine();
     CHECK(B.next_pos() == 0);
 
     done.store(true);
@@ -903,7 +920,7 @@ static void test_cs7_old_peer_keeps_socket() {
     CHECK(send_framed(CarrierWire::encode(c)));
     CHECK(wait_until([&] { return carrier_frames.load() == 1; }));
     CHECK(!socket_broke.load());
-    CHECK(old_node.next_pos() == 1);
+    CHECK(wait_until([&] { return old_node.next_pos() == 1; }));
 
     stop.store(true);
     ::shutdown(fd, SHUT_RDWR);
@@ -1017,8 +1034,15 @@ static void test_cs8_zero_consensus_movement() {
         CHECK(ids.size() == 3);
         CHECK(B.fetch->request_frames(pl.front(), CHAIN, ids));
         CHECK(wait_until([&] { return B.n_frames() == 3; }));
+        // Completion: A's two request handlers and B's fetch have fully run.
+        CHECK(wait_until([&] { return A.ctrl_done.load() == 2; }));
+        CHECK(wait_until([&] {
+            return B.fetch->stats().fetches_completed == 1 &&
+                   !B.fetch->busy(pl.front());
+        }));
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    A.settle_engine();
+    B.settle_engine();
 
     // ★ Byte-identical on BOTH sides. Supplying is not applying: B holds three
     // verified carrier frames and has appended NOTHING.
@@ -1184,6 +1208,7 @@ static void test_cs9_reply_ceiling_and_continuation() {
             CHECK(A.relay->vault().stats().frames_truncated >= 1);
         }
         // Supplying is still not applying.
+        B.settle_engine();
         CHECK(B.next_pos() == 0);
         CHECK(B.raw_total() == 0);
         CHECK(B.pushes() == 0);

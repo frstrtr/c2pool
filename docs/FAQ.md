@@ -108,13 +108,22 @@ no extra configuration.
 | Primary address type | Merged payout auto-derived? |
 |----------------------|-----------------------------|
 | P2PKH  (`L...`, legacy)      | ✅ yes |
-| P2SH   (`M...` / `3...`)     | ✅ yes |
+| P2SH   (`M...` / `3...`)     | ✅ yes, as P2SH — ⚠️ supply your DOGE address if segwit-wrapped |
 | P2WPKH (`ltc1q...`, segwit)  | ✅ yes |
-| P2WSH  (`ltc1q...`, 32-byte) | ❌ no — supply merged addresses explicitly |
-| P2TR   (`ltc1p...`, taproot) | ❌ no — supply merged addresses explicitly |
+| P2WSH  (`ltc1q...`, 32-byte) | ❌ not usable — use a P2PKH or P2WPKH address |
+| P2TR   (`ltc1p...`, taproot) | ❌ not usable — use a P2PKH or P2WPKH address |
 
-The 32-byte witness programs (P2WSH/P2TR) can't be reduced to a 20-byte
-`hash160`, so for those you must name each chain's address yourself.
+A P2SH address is paid on the merged chains as the P2SH of the same hash.
+That is right for a legacy P2SH (a multisig) but not for a segwit-wrapped
+wallet address (P2SH-P2WPKH/P2WSH, e.g. `M...`): on DOGE (no segwit) such an
+output becomes spendable by anyone once the redeem script is public. A P2SH
+login without an explicit merged address is therefore warned ("P2SH address:
+if segwit-wrapped, give a DOGE address" in the workers list): give your DOGE
+address explicitly, `LTC_ADDRESS,DOGE_ADDRESS`. The 32-byte
+witness programs (P2WSH/P2TR) can't be carried by a V36 share (a 20-byte
+payout hash): its LTC payout is redistributed like an invalid address's
+("P2WSH/P2TR address → redistributed"); merged addresses you name are still
+paid.
 
 **To override or set addresses per chain explicitly**, use any of:
 
@@ -132,6 +141,18 @@ the primary, **reverse-derives** the LTC payout from the same key.
 Worker names (`.worker1` or `_worker1`) are stripped from each address before
 use.
 
+With several merged chains configured, a second address two of them could
+take (DOGE's `D...` is also a Bellscoin P2SH; P2SH `A...`/`9...` is shared by
+DOGE, PEP and SHIC) or that none of them identifies is ignored, with a warning
+in the node's log, and those chains pay your LTC address's key: name its chain
+with the slash form (`LTCADDR/98:DOGEADDR`) to be paid there. An address with a
+bad checksum is ignored the same way.
+
+An empty username, an invalid address or another coin's address is not
+refused: its shares are redistributed by the node's `--redistribute` mode (on
+LTC and on every merged chain), as p2pool does; the dashboard's workers list
+marks such logins "address invalid → redistributed".
+
 ### Which mode pays whom?
 
 | Mode | CLI flag | Who gets paid |
@@ -143,6 +164,10 @@ use.
 In integrated and solo modes the miner's address appears **directly in the
 coinbase** — the pool never holds the funds. Only `--custodial` routes
 everything to the operator for off-chain accounting.
+
+`--solo` and `--custodial` are disabled in this release: c2pool-ltc refuses
+to start in them (their blocks were invalid: the coinbase had no room for
+the miners' extranonce). Use the integrated (default) mode.
 
 ---
 

@@ -23,6 +23,7 @@
 #include <core/uint256.hpp>
 #include <memory>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdint>
@@ -55,6 +56,18 @@ struct StratumConfig {
     // max_stratum_connections (YAML) / --max-stratum-connections (CLI).
     // Admission control only — zero wire-byte change for admitted sessions.
     size_t max_stratum_connections = 100;
+    // Per-source-IP share of that cap: at most this many live sessions from
+    // one remote address, so one host cannot take every slot. A refused
+    // connection is closed cleanly and counted apart from the node cap
+    // (StratumServer::get_refused_per_ip). 0 = unlimited (the default, so
+    // every coin is unchanged; a farm behind one NAT address shares it).
+    size_t max_stratum_connections_per_ip = 0;
+    // The refusal WARN lines of either cap: the first one after a quiet
+    // window is logged at once, then at most one summary line per window per
+    // cap (core/stratum_refusal_log.hpp). The refusal counters still count
+    // every refusal. 0 = a line per refusal (the old behaviour). Log-volume
+    // only.
+    uint32_t refusal_log_interval_sec = 10;
     // Runtime coin tag for coin-agnostic core log lines (e.g. the "waiting
     // for block template" warning). Set by each coin's work source / main so
     // a DASH binary never logs "[LTC]" (issue #732 secondary defect). Empty
@@ -91,6 +104,14 @@ struct StratumConfig {
     // Default false: every other coin negotiates version-rolling as before.
     bool disable_version_rolling{false};
 
+    // ── Pool side of the BIP310 version-rolling mask ──────────────────────────
+    // The negotiated mask is this AND the miner's. The BIP320 default
+    // 0x1fffe000 (bits 13..28) suits coins whose versionbits deployments sit
+    // below bit 13. Dash Core v24 deploys on bits 13 (v24) and 14 (evo_shares),
+    // so the DASH lane narrows it to keep those two under the template's
+    // control. Default: every other coin byte-identical.
+    uint32_t version_rolling_pool_mask{0x1fffe000};
+
     // ── Live-session hygiene (production ZOMBIE-SESSION LEAK fix) ──────────
     // A NAT-dropped miner's TCP connection is frequently never FIN/RST'd, so
     // StratumSession::is_connected() (socket_.is_open()) stays true FOREVER and
@@ -98,9 +119,11 @@ struct StratumConfig {
     // immortal subscribed session that keeps drawing full per-notify job builds
     // (observed: 66 sockets for ~23 rigs). At the default cap these zombies also
     // lock real rigs out (admission control). These knobs bound that leak. ALL
-    // default OFF/neutral so LTC/BTC/DGB behaviour is BYTE-UNCHANGED; DASH opts
-    // in (impl/dash/stratum/work_source.cpp ctor). Transport/liveness only --
-    // zero wire-byte change and consensus-neutral.
+    // default OFF/neutral; DASH, BTC and LTC opt in (impl/dash/stratum/
+    // work_source.cpp, impl/btc/stratum/work_source.cpp,
+    // impl/ltc/stratum_defaults.hpp). At the miner cap the same deadlines also
+    // free a slot on the spot (StratumSession::reclaim_reason). Transport/
+    // liveness only -- zero wire-byte change and consensus-neutral.
     //
     // (a) OS TCP keepalive: the kernel probes an idle peer and errors the
     //     pending async_read on a dead NAT path, which runs the normal
@@ -109,6 +132,17 @@ struct StratumConfig {
     uint32_t tcp_keepalive_idle_sec     = 60;   // begin probing after 60 s idle
     uint32_t tcp_keepalive_interval_sec = 10;   // 10 s between probes
     uint32_t tcp_keepalive_count        = 3;    // drop after 3 failed probes
+    //     Linux sends no keepalive probe while sent data is unacknowledged, and
+    //     the idle keepalive-notify (e) keeps data in flight to an authorized
+    //     rig: behind a dead NAT such a session would otherwise only fail on
+    //     retransmission exhaustion (tcp_retries2, ~15 min), and the reaper
+    //     skips it meanwhile. TCP_USER_TIMEOUT aborts the connection once
+    //     sent data stays unacknowledged this long; while set, it also
+    //     decides when failed keepalive probes end an idle connection
+    //     (instead of tcp_keepalive_count). A dead peer then goes in ~2 min
+    //     whether it was idle or being fed notifies. Linux only, set with
+    //     keepalive; 0 = leave the kernel default.
+    uint32_t tcp_user_timeout_sec       = 120;
     // (b) Handshake deadline: drop a session that has not completed
     //     mining.authorize within N s (a live rig authorizes in << 1 s). 0=off.
     uint32_t handshake_timeout_sec      = 0;
@@ -134,6 +168,13 @@ struct StratumConfig {
     //     work-generation-gated).
     uint32_t keepalive_notify_sec       = 0;
 
+    // A held job (CoinbaseResult::held: the sharechain was busy, no coinbase
+    // its shares could verify) is retried every 500 ms, one pending retry per
+    // session, for at most this many seconds since the hold began; past it the
+    // session stops retrying (the miner keeps its last job) until the next
+    // notify. Never the global coinbase.
+    uint32_t job_hold_limit_sec         = 20;
+
     // ── Payout-address acceptance for the running coin (issue #961) ──────────
     // The Base58Check version bytes and bech32 HRPs (BARE, no trailing '1') this
     // coin accepts as its OWN payout addresses on the ACTIVE network. Populated
@@ -150,7 +191,56 @@ struct StratumConfig {
     std::vector<uint8_t>     payout_p2pkh_versions;
     std::vector<uint8_t>     payout_p2sh_versions;
     std::vector<std::string> payout_bech32_hrps;   // BARE HRPs, no trailing '1'
+    // The parent coin's P2PKH/P2SH versions on EVERY network: never claimed
+    // by a merged chain when a login address is identified
+    // (core/merged_chain_addr.hpp).
+    std::vector<uint8_t>     merged_parent_versions;
+    // Merged chains are configured (--merged / embedded DOGE): logins wait
+    // until the merged-mining manager is attached (IWorkSource::merged_ready).
+    bool merged_chains_expected{false};
+    // A login without a payout address a share can carry (empty, invalid,
+    // another coin's) is accepted and its shares redistributed by the work
+    // source (decide_job_payout), as p2pool does. Off: such logins are
+    // refused (#961) — for work sources that do not redistribute.
+    bool redistribute_unusable_logins{false};
 };
+
+/// The 20-byte key of a payout: the hash160 (P2PKH, P2SH) or witness program
+/// (P2WPKH) its script pays. The per-address hashrate map
+/// (StratumServer::get_local_addr_rates, p2pool get_local_addr_rates) is keyed
+/// by it.
+using PayoutKey = std::array<uint8_t, 20>;
+
+/// The key a P2PKH / P2SH / P2WPKH payout script pays; all zero for any
+/// other script.
+inline PayoutKey payout_script_key(const std::vector<unsigned char>& script)
+{
+    PayoutKey key{};
+    if (script.size() == 25 && script[0] == 0x76)
+        std::copy(script.begin() + 3, script.begin() + 23, key.begin());
+    else if (script.size() == 23 && script[0] == 0xa9)
+        std::copy(script.begin() + 2, script.begin() + 22, key.begin());
+    else if (script.size() == 22 && script[0] == 0x00)
+        std::copy(script.begin() + 2, script.begin() + 22, key.begin());
+    return key;
+}
+
+/// The share bits a submission is judged by when deciding whether it makes a
+/// share (StratumSession::handle_submit's pool-share gate): its job's own,
+/// frozen when the job was built, the bits the share it makes carries (p2pool
+/// got_response: pow_hash <= share_info['bits'].target, of that job).
+/// `live_bits` (the work source's get_share_bits(): the bits of the last job
+/// built for ANY connection) only for a job built without frozen bits. Judged
+/// by the live bits, a job's share was dropped whenever the last job built
+/// was a harder one (another miner's, or any job after a node-fee job sized
+/// by the operator's key), and a harder job's submission went to share
+/// creation, which refused its PoW, whenever the last job built was easier.
+/// The work source's mining_submit gets the same bits (JobSnapshot::share_bits;
+/// BTC/BCH classify the submission against them).
+inline uint32_t pool_share_bits(uint32_t job_frozen_bits, uint32_t live_bits)
+{
+    return job_frozen_bits != 0 ? job_frozen_bits : live_bits;
+}
 
 /// Frozen share-construction fields returned by ref_hash_fn. These
 /// capture the share-tracker state at the moment a job was assembled
@@ -204,6 +294,10 @@ struct JobSnapshot {
     std::string block_nbits;      // original GBT block bits (for block target check)
     RefHashResult frozen_ref;     // frozen share fields from template time
     int stale_info{0};            // 0=none, 253=orphan (stale block template)
+    // The payout the job committed to (IWorkSource::decide_job_payout); the
+    // merged scripts it committed to are the map passed with the snapshot.
+    bool has_payout{false};
+    std::vector<unsigned char> payout_script;
 };
 
 /// Atomic snapshot of work-related fields under the work source's mutex.
@@ -246,6 +340,11 @@ struct CoinbaseResult {
     std::string coinb1;
     std::string coinb2;
     WorkSnapshot snapshot;
+    // No coinbase now: the work source could not build one its shares can
+    // verify (the sharechain was busy). The session holds the job (the
+    // miner keeps its last one) and retries; it never falls back to the
+    // global coinbase.
+    bool held{false};
 };
 
 /// Rolling record of one stratum connection's submit outcomes, for the
@@ -374,6 +473,9 @@ struct WorkerInfo {
     // session that records them (set at authorize). Null when the entry did
     // not come from a core stratum session.
     std::shared_ptr<SubmitOutcomeWindow> submit_window;
+    // Set when the login's payout is not its own address
+    // (e.g. "address invalid → redistributed").
+    std::string payout_warning;
 };
 
 }  // namespace core::stratum

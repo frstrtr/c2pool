@@ -41,11 +41,11 @@ doge_header_checkpoint: "6160000:51efd04daebddba43ae403662098524d99abf3edad3bddc
 
 # ─── Sharechain Seed Nodes ─────────────────────────────────────────────────
 # P2P peers to bootstrap the sharechain from. Added alongside hardcoded
-# bootstrap hosts (ml.toom.im, usa.p2p-spb.xyz, etc.). CLI: -n HOST:PORT
+# bootstrap hosts (ltc.voidbind.com, usa.p2p-spb.xyz, etc.). CLI: -n HOST:PORT
 # These are p2pool sharechain protocol peers (port 9326), NOT coin daemons.
 seed_nodes:
   - "voidbind.com:9326"
-  - "ml.toom.im:9326"
+  - "ltc.voidbind.com:9326"
   - "usa.p2p-spb.xyz:9326"
 # Add your own trusted nodes:
 # - "your-node.example.com:9326"
@@ -72,6 +72,11 @@ donation_percentage: 0.1       # Developer donation % (default: 0.1%)
 # node_owner_address: ""       # Node owner payout address (LTC)
 # node_owner_merged_address: "" # Explicit merged chain (DOGE) payout address for node fee
 #                               # If not set, auto-converts from LTC address (same hash160)
+# merged_payout_addresses:       # Address each aux daemon's createauxblock gets (the merged
+#   PEP: "P..."                  # coinbase itself pays PPLNS). Required for every aux chain
+#                               # with an RPC daemon except DOGE; an address of another chain
+#                               # or network disables that chain at startup.
+#                               # CLI: --merged-payout-address SYMBOL:ADDRESS
 # redistribute: pplns           # Redistribution mode: pplns, fee, boost, donate
 
 # ─── Stratum per-connection vardiff tuning ───────────────────────────────────
@@ -80,6 +85,10 @@ max_difficulty: 65536.0        # Ceiling for per-connection difficulty (large fa
 target_time: 10.0              # Target seconds between pseudoshares
 vardiff_enabled: true          # Auto-adjust per-connection difficulty
 max_coinbase_outputs: 4000     # Max coinbase outputs (p2pool: 4000)
+# max_stratum_connections: 100       # Max concurrent miners on this node (0 = unlimited)
+# max_stratum_connections_per_ip: 0  # Max concurrent miners from one IP address, one /64 for IPv6
+#                                    # (0 = unlimited). Rigs behind one NAT share an address: set it
+#                                    # to at least the most rigs behind any one address.
 
 # ─── P2P Sharechain ─────────────────────────────────────────────────────────
 p2p_max_peers: 30              # Max total P2P peers (inbound + outbound)
