@@ -93,10 +93,13 @@ macro(c2pool_find_stratum_openssl)
     endif()
     find_package(OpenSSL 1.1.1 QUIET)
 endmacro()
-# A static libcrypto can name extra archives in its pkg-config Libs.private
-# as -l:<file> (Ubuntu 26.04, OpenSSL 3.5: -l:libjitterentropy.a, from
-# libjitterentropy3-dev). A missing one only fails at link time, so look for
-# each here and list the missing files in <out_var> (empty: none missing).
+# A static libcrypto names extra libraries in its pkg-config Libs.private
+# (Ubuntu 26.04, OpenSSL 3.5: -l:libjitterentropy.a -lz -lzstd -ldl, from
+# libjitterentropy3-dev, zlib1g-dev and libzstd-dev). A missing one only fails
+# at link time, so look for each here and list the missing ones in <out_var>
+# (empty: none missing). -l:<file> needs that exact file; -l<name> needs a
+# lib<name>.a or lib<name>.so the linker can find. libcrypto/libssl themselves
+# and the C runtime libraries are not probed.
 function(c2pool_stratum_openssl_missing_static_deps out_var)
     set(_missing "")
     find_package(PkgConfig QUIET)
@@ -106,13 +109,22 @@ function(c2pool_stratum_openssl_missing_static_deps out_var)
             OUTPUT_VARIABLE _libs OUTPUT_STRIP_TRAILING_WHITESPACE
             ERROR_QUIET RESULT_VARIABLE _rc)
         if(_rc EQUAL 0)
-            string(REGEX MATCHALL "-l:[^ ]+" _colon_libs "${_libs}")
-            foreach(_lib IN LISTS _colon_libs)
-                string(SUBSTRING "${_lib}" 3 -1 _file)
+            separate_arguments(_flags UNIX_COMMAND "${_libs}")
+            foreach(_flag IN LISTS _flags)
+                if(_flag MATCHES "^-l:(.+)$")
+                    set(_name "${CMAKE_MATCH_1}")
+                elseif(_flag MATCHES "^-l(.+)$")
+                    set(_name "${CMAKE_MATCH_1}")
+                    if(_name MATCHES "^(crypto|ssl|dl|pthread|m|rt|c)$")
+                        continue()
+                    endif()
+                else()
+                    continue()
+                endif()
                 unset(_c2p_static_dep CACHE)
-                find_library(_c2p_static_dep NAMES "${_file}")
+                find_library(_c2p_static_dep NAMES "${_name}")
                 if(NOT _c2p_static_dep)
-                    list(APPEND _missing "${_file}")
+                    list(APPEND _missing "${_name}")
                 endif()
                 unset(_c2p_static_dep CACHE)
             endforeach()
@@ -132,7 +144,7 @@ if(NOT DEFINED CACHE{C2POOL_STRATUM_TLS})
             if(_c2p_static_missing)
                 message(STATUS "stratum TLS listener: auto-detect leaves it OFF: the static OpenSSL"
                     " also needs ${_c2p_static_missing}, which was not found"
-                    " (Ubuntu: libjitterentropy3-dev for libjitterentropy.a)")
+                    " (Ubuntu: libjitterentropy3-dev for libjitterentropy.a, libzstd-dev for zstd, zlib1g-dev for z)")
             else()
                 set(_c2p_stratum_tls_default ON)
             endif()
@@ -158,8 +170,8 @@ if(C2POOL_STRATUM_TLS)
         if(_c2p_static_missing)
             message(FATAL_ERROR
                 "C2POOL_STRATUM_TLS=ON with a static OpenSSL, but its libcrypto also needs"
-                " ${_c2p_static_missing}, which was not found (Ubuntu: libjitterentropy3-dev"
-                " provides libjitterentropy.a). Install it,"
+                " ${_c2p_static_missing}, which was not found (Ubuntu: libjitterentropy3-dev,"
+                " libzstd-dev or zlib1g-dev provide them). Install them,"
                 " set -DC2POOL_STRATUM_TLS_STATIC_OPENSSL=OFF to link the shared libraries,"
                 " or configure with -DC2POOL_STRATUM_TLS=OFF.")
         endif()
