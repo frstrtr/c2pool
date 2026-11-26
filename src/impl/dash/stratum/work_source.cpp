@@ -1727,17 +1727,33 @@ void DASHWorkSource::resource_template_now(CoinStateArm arm) const
         }
     }
 
-    // One tx-hex vector for every job this template will serve, encoded here,
-    // from this template's own bodies, once per store, outside the template
-    // lock. `work` is a local no other thread can see; after the store below it
-    // is the immutable cached snapshot, so the vector can never drift from the
-    // bodies it was encoded from. A later store (rebuild, tip change, after an
-    // invalidate) encodes its own: nothing is carried from one template to the
-    // next.
-    if (work.m_bits != 0 && !work.m_previous_block.IsNull())
-        work.m_tx_hex_shared = coin::TemplateTxHex::encode(
-            work.m_tx_data_hex,
-            template_store_seq_.fetch_add(1, std::memory_order_relaxed) + 1);
+    // One tx-hex vector for every job this template will serve, set here,
+    // once per store, outside the template lock. `work` is a local no other
+    // thread can see; after the store below it is the immutable cached
+    // snapshot, so the vector can never drift from its bodies.
+    //
+    // A rebuild on the same tip whose ordered tx-hash list equals the cached
+    // template's (and whose bodies a txid may not pin are byte-equal) takes the
+    // cached template's vector: it already holds exactly these bodies, in this
+    // order (coin::template_tx_hex_reusable). Anything else encodes a fresh
+    // one from this template's own bodies: another list, the same txs in
+    // another order, a tip change, and any store after an invalidate, a set-gap
+    // or a failed serve-time re-check (each drops the cache, so there is no
+    // previous template to compare with). The candidate is read under the
+    // lock; a store racing in between can only change WHICH equal-bodied
+    // vector is taken.
+    if (work.m_bits != 0 && !work.m_previous_block.IsNull()) {
+        std::shared_ptr<const coin::DashWorkData> prev;
+        {
+            std::lock_guard<std::mutex> lk(template_mutex_);
+            prev = template_cache_;
+        }
+        const uint64_t seq = template_store_seq_.fetch_add(1, std::memory_order_relaxed) + 1;
+        work.m_tx_hex_shared =
+            (prev && coin::template_tx_hex_reusable(*prev, work))
+                ? coin::TemplateTxHex::reuse(prev->m_tx_hex_shared, seq)
+                : coin::TemplateTxHex::encode(work.m_tx_data_hex, seq);
+    }
 
     const auto now = std::chrono::steady_clock::now();
     std::lock_guard<std::mutex> lk(template_mutex_);
@@ -2549,7 +2565,8 @@ core::stratum::CoinbaseResult DASHWorkSource::build_connection_coinbase(
         }
         // The template's own tx-hex vector, shared by every job over it (one
         // pointer copy). It sits inside the same immutable `wd` the branches
-        // above came from, so the two cannot belong to different templates.
+        // above came from, so the two cannot belong to different templates
+        // (a reused vector holds exactly this wd's bodies, in this order).
         out.snapshot.tx_data = coin::job_tx_hex(*wd);
     };
 

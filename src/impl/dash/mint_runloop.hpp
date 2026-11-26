@@ -350,9 +350,10 @@ inline std::optional<ProducerJobBuild> build_producer_job(
     // desired_tx_hashes) -- the finder assembles the won block from them
     // (coin/reconstruct_won_block.hpp). Null on v16 and on coinbase-only jobs.
     //
-    // A stored template carries its own encoded vector (m_tx_hex_shared): the
-    // frozen job takes that very pointer, the one its stratum job froze, so the
-    // two cannot hold different bodies. The memo serves only a template that
+    // A stored template carries its own vector (m_tx_hex_shared: encoded for
+    // it, or reused from the previous stored template with the same bodies):
+    // the frozen job takes that very pointer, the one its stratum job froze, so
+    // the two cannot hold different bodies. The memo serves only a template that
     // never went through the store (it carries no vector); its hash-list match
     // is sound because callers ask for the template they are serving now.
     if (v36 && !wd.m_tx_hashes.empty())

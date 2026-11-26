@@ -18,15 +18,19 @@
 //     extranonce1 and its own start difficulty; every mining.notify and
 //     mining.set_difficulty on the wire). They pass on the pre-P5 code and must
 //     keep passing.
-//   * The P5 contract (pointer identity per template, a fresh vector after
-//     every rebuild, invalidate and tip change, no vector on a copy, the live
-//     hex gauge, the serve timing line): added with the change itself.
+//   * The P5 contract (pointer identity per template; a rebuild on the same
+//     tip with an equal ORDERED tx-hash list reuses the previous template's
+//     vector, while another list, a reordered list, a re-signed asset unlock
+//     under the same txid, a tip change and an invalidate each get a fresh
+//     one; no vector on a copy; the live hex gauge; the serve timing line):
+//     added with the change itself.
 //
 // Templates come from the stubbed dashd fallback, so each re-source stores a
 // new DashWorkData instance exactly as production does.
 
 #include <impl/dash/stratum/work_source.hpp>
 #include <impl/dash/coinbase_builder.hpp>   // sha256d
+#include <impl/dash/coin/dash_txid.hpp>     // dash_txid, dash_instance_hash (v24 stable txid)
 #include <impl/dash/coin/vendor/bls_mode_guard.hpp>
 
 #include <core/stratum_server.hpp>
@@ -40,6 +44,7 @@
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <future>
@@ -726,6 +731,54 @@ core::stratum::CoinbaseResult serve_once(const DASHWorkSource& ws, unsigned char
     return serve_session(ws, uint256::ZERO, "00000001", p2pkh(fill)).cbr;
 }
 
+// A template over explicit (body hex, txid) pairs, for bodies whose txid is not
+// the fixture's sha256d of the body (a v24 stable-txid asset unlock).
+DashWorkData make_template_txs(const char* prev_hex, uint32_t height, uint64_t coinbase_value,
+                               const std::vector<std::pair<std::string, uint256>>& txs)
+{
+    DashWorkData w = make_template(prev_hex, height, coinbase_value, {});
+    for (const auto& [hex, txid] : txs) {
+        w.m_tx_data_hex.push_back(hex);
+        w.m_tx_hashes.push_back(txid);
+        w.m_tx_fees.push_back(1000u + hex.size() / 2);
+    }
+    return w;
+}
+
+// A version-2 asset unlock (special tx type 9, payload version 2): Dash Core
+// v24 gives it a stable txid that leaves requestedHeight, quorumHash and
+// quorumSig out, so every re-signed instance (another `sig_tag` here) has the
+// same txid and other bytes.
+dash::coin::MutableTransaction unlock_v2(unsigned char sig_tag)
+{
+    dash::coin::MutableTransaction tx;
+    tx.version = 3;
+    tx.type    = dash::coin::tx_type::ASSET_UNLOCK;
+    tx.extra_payload.assign(dash::coin::kAssetUnlockPayloadSize, 0x11);
+    tx.extra_payload[0] = dash::coin::kAssetUnlockStableTxidVersion;
+    std::fill(tx.extra_payload.end() - 96, tx.extra_payload.end(), sig_tag);
+    dash::coin::TxOut o;
+    o.value = 123456;
+    tx.vout.push_back(o);
+    return tx;
+}
+
+std::string tx_hex(const dash::coin::MutableTransaction& tx)
+{
+    auto packed = ::pack(tx);
+    auto sp = packed.get_span();
+    return HexStr(std::span<const unsigned char>(
+        reinterpret_cast<const unsigned char*>(sp.data()), sp.size()));
+}
+
+std::vector<const std::string*> flagged_bodies(const DashWorkData& w)
+{
+    std::vector<const std::string*> v;
+    for (const auto& h : w.m_tx_data_hex)
+        if (dash::coin::txid_may_omit_body_bytes(h)) v.push_back(&h);
+    return v;
+}
+
 }  // namespace
 
 // Every session served on one template gets that template's own vector: one
@@ -750,24 +803,142 @@ TEST(DashP5SharedTxHex, EverySessionOnOneTemplateSharesItsVector)
     }
 }
 
-// A rebuild with the SAME tx set is a new template: a new vector, never the
-// old one. Jobs already issued keep the old vector and its bodies.
-TEST(DashP5SharedTxHex, RebuildWithTheSameTxSetYieldsAFreshVector)
+// THE REUSE RULE (coin::template_tx_hex_reusable). A rebuild on the same tip
+// whose tx-hash list equals the cached template's as an ORDERED list (tmpl_B
+// is tmpl_A rebuilt) takes the cached template's vector: that vector holds the
+// tx bodies and nothing else, and these are the same bodies in the same order.
+// It is still a new template with its own seq, and the gauge counts the one
+// vector once.
+TEST(DashP5SharedTxHex, RebuildWithAnEqualOrderedTxListReusesTheVector)
 {
+    int64_t a_chars = 0;
+    for (const auto& h : tmpl_A().m_tx_data_hex) a_chars += static_cast<int64_t>(h.size());
+    const int64_t base = dash::coin::live_template_hex_chars();
     Source src;
     src.set(tmpl_A());
     DASHWorkSource ws(src.coin_state, src.fallback(), Source::submit());
     const auto a = serve_once(ws);
     ASSERT_TRUE(a.snapshot.tx_data);
+    const auto a_tmpl = ws.peek_template();
     src.set(tmpl_B());
     ws.bump_work_generation();
-    const auto b = serve_once(ws);
+    const auto b = serve_once(ws, 0x33);
     ASSERT_TRUE(b.snapshot.tx_data);
-    EXPECT_NE(a.snapshot.tx_data.get(), b.snapshot.tx_data.get())
-        << "the rebuilt template reused the previous template's vector";
+    const auto b_tmpl = ws.peek_template();
+    ASSERT_TRUE(a_tmpl && b_tmpl);
+    ASSERT_NE(a_tmpl, b_tmpl) << "the rebuild did not store a new template";
+    ASSERT_EQ(b_tmpl->m_tx_hashes, a_tmpl->m_tx_hashes);
+    EXPECT_EQ(b.snapshot.tx_data.get(), a.snapshot.tx_data.get())
+        << "an equal ordered tx list must reuse the previous template's vector";
     EXPECT_EQ(b.snapshot.tx_data.get(), own_vector(ws));
-    EXPECT_EQ(*a.snapshot.tx_data, tmpl_A().m_tx_data_hex);
+    EXPECT_NE(b_tmpl->m_tx_hex_shared.seq(), a_tmpl->m_tx_hex_shared.seq())
+        << "a reused vector still names its own template";
+    EXPECT_EQ(b_tmpl->m_tx_hex_shared.body_bytes(), a_tmpl->m_tx_hex_shared.body_bytes());
     EXPECT_EQ(*b.snapshot.tx_data, tmpl_B().m_tx_data_hex);
+    EXPECT_EQ(b.snapshot.merkle_branches, branches_for_bodies(*b.snapshot.tx_data));
+    EXPECT_EQ(dash::coin::live_template_hex_chars(), base + a_chars)
+        << "one vector for both templates, counted once";
+}
+
+// The same txs in another order are another block body: a fresh vector, in the
+// new order, and the issued job keeps the old order. No body here is one whose
+// txid may leave bytes out, so the ORDERED hash comparison alone tells the two
+// lists apart (a set comparison would call them equal).
+TEST(DashP5SharedTxHex, RebuildWithAReorderedTxListYieldsAFreshVector)
+{
+    auto reordered = tmpl_A();
+    std::reverse(reordered.m_tx_data_hex.begin(), reordered.m_tx_data_hex.end());
+    std::reverse(reordered.m_tx_hashes.begin(), reordered.m_tx_hashes.end());
+    std::reverse(reordered.m_tx_fees.begin(), reordered.m_tx_fees.end());
+    const auto a_hashes = tmpl_A().m_tx_hashes;
+    ASSERT_EQ(std::set<uint256>(reordered.m_tx_hashes.begin(), reordered.m_tx_hashes.end()),
+              std::set<uint256>(a_hashes.begin(), a_hashes.end()));
+    ASSERT_NE(reordered.m_tx_hashes, a_hashes);
+    ASSERT_TRUE(flagged_bodies(tmpl_A()).empty());
+
+    Source src;
+    src.set(tmpl_A());
+    DASHWorkSource ws(src.coin_state, src.fallback(), Source::submit());
+    const auto a = serve_once(ws);
+    src.set(reordered);
+    ws.bump_work_generation();
+    const auto r = serve_once(ws);
+    ASSERT_TRUE(a.snapshot.tx_data && r.snapshot.tx_data);
+    EXPECT_NE(a.snapshot.tx_data.get(), r.snapshot.tx_data.get())
+        << "a reordered tx list reused the previous template's vector";
+    EXPECT_EQ(r.snapshot.tx_data.get(), own_vector(ws));
+    EXPECT_EQ(*r.snapshot.tx_data, reordered.m_tx_data_hex);
+    EXPECT_EQ(*a.snapshot.tx_data, tmpl_A().m_tx_data_hex) << "the issued job keeps its order";
+    EXPECT_EQ(r.snapshot.merkle_branches, branches_for_bodies(*r.snapshot.tx_data));
+}
+
+// Same tip, same count, same body sizes, one tx replaced: another list, a
+// fresh vector holding the new bodies.
+TEST(DashP5SharedTxHex, RebuildWithOneTxReplacedYieldsAFreshVector)
+{
+    const auto replaced =
+        make_template(kPrev1, 2583001u, 164990000ULL, {{0x41, 64}, {0x52, 300}, {0x43, 5}});
+    ASSERT_EQ(replaced.m_tx_hashes.size(), tmpl_C().m_tx_hashes.size());
+    ASSERT_NE(replaced.m_tx_hashes[1], tmpl_C().m_tx_hashes[1]);
+    ASSERT_TRUE(flagged_bodies(replaced).empty() && flagged_bodies(tmpl_C()).empty());
+
+    Source src;
+    src.set(tmpl_C());
+    DASHWorkSource ws(src.coin_state, src.fallback(), Source::submit());
+    const auto c = serve_once(ws);
+    src.set(replaced);
+    ws.bump_work_generation();
+    const auto n = serve_once(ws);
+    ASSERT_TRUE(c.snapshot.tx_data && n.snapshot.tx_data);
+    EXPECT_NE(c.snapshot.tx_data.get(), n.snapshot.tx_data.get())
+        << "a list with one tx replaced reused the previous template's vector";
+    EXPECT_EQ(n.snapshot.tx_data.get(), own_vector(ws));
+    EXPECT_EQ(*n.snapshot.tx_data, replaced.m_tx_data_hex);
+    EXPECT_EQ(n.snapshot.merkle_branches, branches_for_bodies(*n.snapshot.tx_data));
+}
+
+// Dash Core v24: a re-signed asset unlock keeps its stable txid and changes its
+// bytes (requestedHeight, quorumHash, quorumSig), and the coinbase's
+// merkleRootAssetUnlocks commits those bytes. So an equal hash list does not
+// pin such a body, and the store compares its bytes: the same instance again
+// still reuses; a re-signed instance under the same txid gets a fresh vector
+// with its own bytes.
+TEST(DashP5SharedTxHex, ReSignedAssetUnlockUnderTheSameTxidYieldsAFreshVector)
+{
+    const auto inst1 = unlock_v2(0xaa);
+    const auto inst2 = unlock_v2(0xbb);   // the same withdrawal, re-signed
+    ASSERT_TRUE(dash::coin::is_asset_unlock_with_stable_txid(inst1));
+    ASSERT_EQ(dash::coin::dash_txid(inst1), dash::coin::dash_txid(inst2));
+    ASSERT_NE(dash::coin::dash_instance_hash(inst1), dash::coin::dash_instance_hash(inst2));
+    const std::string plain = body_hex(0x61, 90);
+    auto with = [&](const dash::coin::MutableTransaction& u) {
+        return make_template_txs(kPrev1, 2583001u, 165000000ULL,
+                                 {{plain, body_txid(plain)}, {tx_hex(u), dash::coin::dash_txid(u)}});
+    };
+    const auto t1 = with(inst1);
+    const auto t2 = with(inst2);
+    ASSERT_EQ(t1.m_tx_hashes, t2.m_tx_hashes) << "the hash lists are equal";
+    ASSERT_NE(t1.m_tx_data_hex, t2.m_tx_data_hex) << "the bodies are not";
+    ASSERT_EQ(flagged_bodies(t1).size(), 1u) << "the unlock, and only it, is byte-compared";
+    ASSERT_EQ(flagged_bodies(t1).front(), &t1.m_tx_data_hex[1]);
+
+    Source src;
+    src.set(t1);
+    DASHWorkSource ws(src.coin_state, src.fallback(), Source::submit());
+    const auto first = serve_once(ws);
+    ws.bump_work_generation();   // the same instance again: equal bytes
+    const auto again = serve_once(ws);
+    src.set(t2);
+    ws.bump_work_generation();   // re-signed: the same txid, other bytes
+    const auto resigned = serve_once(ws);
+    ASSERT_TRUE(first.snapshot.tx_data && again.snapshot.tx_data && resigned.snapshot.tx_data);
+    EXPECT_EQ(again.snapshot.tx_data.get(), first.snapshot.tx_data.get())
+        << "equal bytes under an equal list must still reuse";
+    EXPECT_NE(resigned.snapshot.tx_data.get(), first.snapshot.tx_data.get())
+        << "a re-signed unlock under the same txid reused the old instance's bytes";
+    EXPECT_EQ(resigned.snapshot.tx_data.get(), own_vector(ws));
+    EXPECT_EQ(*resigned.snapshot.tx_data, t2.m_tx_data_hex);
+    EXPECT_EQ(*first.snapshot.tx_data, t1.m_tx_data_hex);
 }
 
 // A rebuild with another tx set: a new vector holding the new bodies.
@@ -788,6 +959,7 @@ TEST(DashP5SharedTxHex, RebuildWithAnotherTxSetYieldsAFreshVector)
 }
 
 // invalidate_template_cache, then the same content again: still a new vector.
+// The reuse candidate is the CACHED template, and the invalidate dropped it.
 TEST(DashP5SharedTxHex, InvalidateYieldsAFreshVector)
 {
     Source src;
@@ -804,8 +976,14 @@ TEST(DashP5SharedTxHex, InvalidateYieldsAFreshVector)
     EXPECT_EQ(*after.snapshot.tx_data, tmpl_C().m_tx_data_hex);
 }
 
-// A new tip (the store's own tip-moved bump) with the same bodies on it: a new
-// vector, frozen with the new tip's header.
+// A new tip (the store's own tip-moved bump) with the same bodies on it, in the
+// same order: a new vector, frozen with the new tip's header. A TIP CHANGE
+// NEVER REUSES, by decision (coin::template_tx_hex_reusable): the vector holds
+// the tx bodies only, so the tip does not change its content, but the one Dash
+// txid that does not cover all of its body's bytes (the v24 stable txid of a
+// re-signed asset unlock) changes those bytes at a height boundary. The byte
+// check covers that; the tip rule is a second, independent barrier, and costs
+// nothing measurable (an equal non-empty list across a new block is rare).
 TEST(DashP5SharedTxHex, TipChangeYieldsAFreshVector)
 {
     Source src;
@@ -957,8 +1135,9 @@ TEST(DashP5SharedTxHex, ExecutorStoresWhileServingKeepBodiesWithBranches)
 }
 
 // Over a real stratum server: four sessions, six notifies each, four
-// templates. Every job holds its template's one vector: four vectors in all,
-// not one per job.
+// templates. Every job holds its template's one vector, and B (A rebuilt: an
+// equal ordered tx list on the same tip) holds A's: three vectors in all, not
+// one per job. A's vector carries A's three notifies and B's one per session.
 TEST(DashP5SharedTxHex, SessionsOnRealStratumShareOneVectorPerTemplate)
 {
     Stratum st;
@@ -971,13 +1150,16 @@ TEST(DashP5SharedTxHex, SessionsOnRealStratumShareOneVectorPerTemplate)
         ++jobs_per_vector[b.tx_data.get()];
         sessions_per_vector[b.tx_data.get()].insert(b.script);
     }
-    EXPECT_EQ(jobs_per_vector.size(), 4u) << "one vector per template (A, B, C, D)";
+    EXPECT_EQ(jobs_per_vector.size(), 3u) << "one vector for A and B (reused), one each for C, D";
     size_t jobs = 0;
+    std::multiset<size_t> counts;
     for (const auto& [v, n] : jobs_per_vector) {
         jobs += n;
+        counts.insert(n);
         EXPECT_GE(sessions_per_vector[v].size(), 4u) << "every session shares the vector";
     }
     EXPECT_EQ(jobs, 4u * 6u);
+    EXPECT_EQ(counts, (std::multiset<size_t>{4u, 4u, 16u})) << "A+B: 4 sessions x 4 notifies; C, D: 4 each";
 }
 
 // One timing line per template, written when the next template's first serve
