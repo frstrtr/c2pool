@@ -19,8 +19,9 @@
 // The driver API it uses: set_lifetime / lifetime_armed, set_on_headers_message,
 // set_fetch_filter, connect, chain_label, is_handshake_complete, peer_subver,
 // peer_start_height, send_getheaders, submit_block_raw, request_full_block and
-// request_tx(txid); the sink's new_headers / new_block / new_tx / full_block
-// events.
+// request_tx(txid) (and request_tx(std::vector<uint256>) if it has one: one
+// getdata for request_txs); the sink's new_headers / new_block / new_tx /
+// full_block events.
 
 #include "basic_coin_peer_pool.hpp"
 
@@ -109,6 +110,16 @@ public:
 
     void request_block(const uint256& hash) override { m_node->request_full_block(hash); }
     void request_tx(const uint256& txid) override { m_node->request_tx(txid); }
+
+    /// One getdata for all of them where the driver takes a list
+    /// (request_tx(std::vector<uint256>)); else one request_tx each.
+    void request_txs(const std::vector<uint256>& txids) override
+    {
+        if constexpr (requires(Driver& d, const std::vector<uint256>& v) { d.request_tx(v); })
+            m_node->request_tx(txids);
+        else
+            PoolPeer::request_txs(txids);
+    }
 
 private:
     std::shared_ptr<Driver> m_node;

@@ -75,7 +75,13 @@
 //     same bytes (SHA256d of the whole block) once per kCoinPoolRelayDedupSec;
 //   - the dashboard rows: one per pooled peer with a completed handshake;
 //   - on request, getdata for transactions from one pooled peer (the next one
-//     each call; request_txs), and the keys of every slot (slot_keys).
+//     each call; request_txs, one message), the keys of every slot
+//     (slot_keys), and the bodies of given blocks whose headers the chain
+//     holds, outside pool_body_wanted (fetch_bodies: a caller's catch-up,
+//     tracked, retried and delivered in chain order like any other body);
+//   - a body that does not match its header, from a peer not seen sending a
+//     bad one for that block, is reported with the number of such peers
+//     (on_bad_body, optional).
 //
 // IO-thread only, except rows() and live_count() (any thread).
 
@@ -335,6 +341,13 @@ public:
     /// getdata for a block body / a transaction.
     virtual void        request_block(const uint256& hash) = 0;
     virtual void        request_tx(const uint256& txid) = 0;
+    /// getdata for several transactions (one message where the connection
+    /// can; by default one request_tx each).
+    virtual void        request_txs(const std::vector<uint256>& txids)
+    {
+        for (const auto& h : txids)
+            request_tx(h);
+    }
 };
 
 /// What the pool needs from its surroundings.
@@ -369,6 +382,9 @@ struct BasicCoinPeerPoolHost {
     std::function<void()>                    on_empty_headers;
     /// A block body matches its header (optional; unset = every body does).
     std::function<bool(const BlockType&)>    body_valid;
+    /// A body that failed body_valid, from a peer that had not sent a bad
+    /// one for this block, with the number of peers that have (optional).
+    std::function<void(const BlockType&, size_t bad_peers)> on_bad_body;
     /// The best height of the full_block consumer (the UTXO set); nullopt
     /// while it holds no block (optional; unset = bodies go on as they come).
     std::function<std::optional<uint32_t>()> body_best_height;
@@ -546,9 +562,59 @@ public:
         if (live.empty())
             return 0;
         Slot* s = live[m_req_rr++ % live.size()];
-        for (const auto& h : txids)
-            s->peer->request_tx(h);
+        s->peer->request_txs(txids);
         return 1;
+    }
+
+    /// getdata for the bodies of `hashes`, blocks whose headers the chain
+    /// holds, whatever their height (pool_body_wanted does not apply): a
+    /// caller's catch-up, such as a UTXO view behind the header tip. Each is
+    /// asked of a connected peer (round robin; not one that sent a body not
+    /// matching its header), then tracked, retried, checked and delivered in
+    /// chain order like an announced body. One pending or held is left to
+    /// its own retries; one already received (and passed on) is asked again
+    /// (its full_block pass does not run twice). Returns the number asked.
+    size_t fetch_bodies(const std::vector<uint256>& hashes)
+    {
+        const auto t = now();
+        size_t asked = 0;
+        for (const auto& hash : hashes) {
+            if (!has_header(hash) || m_held.count(hash))
+                continue;
+            auto it = m_bodies.find(hash);
+            if (it != m_bodies.end() && !it->second.received)
+                continue;   // pending: its retries run
+            if (it == m_bodies.end() && !make_room_for_body(false))
+                continue;
+            auto live = live_slots();
+            Slot* s = nullptr;
+            for (size_t i = 0; i < live.size() && !s; ++i) {
+                Slot* c = live[(m_body_rr + i) % live.size()];
+                if (it == m_bodies.end() || !it->second.bad.count(c->id))
+                    s = c;
+            }
+            ++m_body_rr;
+            if (!s)
+                continue;
+            if (it == m_bodies.end()) {
+                track_body(hash, *s, t);
+            } else {
+                Body& b = it->second;
+                b.received = false;
+                b.awaiting_room = false;
+                b.first = t;
+                b.at = t;
+                b.sent = t;
+                b.asked = s->id;
+                b.asked_key = s->key;
+                b.asked_hs = s->handshaked_at;
+                b.asks = 1;
+                b.same_asks = 0;
+            }
+            s->peer->request_block(hash);
+            ++asked;
+        }
+        return asked;
     }
 
 private:
@@ -1100,6 +1166,8 @@ private:
                 LOG_WARNING << m_tag << " coin peer " << key << " sent block "
                             << hash.GetHex().substr(0, 16)
                             << " whose body does not match its header: dropped";
+            if (first_bad && m_host.on_bad_body)
+                m_host.on_bad_body(block, b.bad.size());
             if (b.bad.size() >= 2 && !b.loud
                 && (m_last_bad_log == Clock::time_point{}
                     || secs(t - m_last_bad_log) >= kCoinPoolBadBodyLogSec)) {
