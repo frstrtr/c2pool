@@ -4,12 +4,14 @@
 from dashd RPC captures.
 
 The fold engine (src/impl/dash/coin/replay_fold_engine.hpp) is KAT'd against
-REAL mainnet chain bytes: a full-state pre-list at an anchor height, raw block
-bodies folded over it, and the committed cbTx merkleRootMNList of every folded
-block as the answer key. This tool converts the RPC captures into the .inc
-string-literal fixtures the test TU (test/test_dash_replay_fold.cpp) embeds.
+REAL chain bytes (mainnet; testnet for Dash Core v24): a full-state pre-list
+at an anchor height, raw block bodies folded over it, and the committed cbTx
+merkleRootMNList of every folded block as the answer key. This tool converts
+the RPC captures into the .inc string-literal fixtures the test TU
+(test/test_dash_replay_fold.cpp) embeds.
 
-Capture recipe (dashd v23, any synced mainnet node):
+Capture recipe (dashd v23 or v24, any synced node; a testnet capture takes
+--network testnet on both commands below):
 
     dash-cli protx list registered true <H>      > list_<H>.json
     dash-cli protx diff 1 <H>                    > diff_<H>.json
@@ -42,6 +44,26 @@ Field conventions in the prestate fixture (format `c2pool-dash-replay-prestate/1
     total_registered_count = count. NEITHER affects the SML root or any W1
     fold output; the exact chain values are only derivable by the Phase-2
     genesis replay (design doc §4.5), which will supersede this assignment.
+
+Format `c2pool-dash-replay-prestate/2` (Dash Core v24; the format
+src/impl/dash/coin/replay_prestate.hpp reads) is emitted only when the list
+holds a version-3 state; a list without one is still written as /1, byte for
+byte as before. /2 appends a 27th field to every `mn` line:
+
+  * `-` for a v1/v2 state;
+  * for a v3 state, the hex of its MnStateV24Ext as the state codec writes
+    it (v24_state.hpp): ExtNetInfo | payout list | share table |
+    u32 nEarlyPeriodBlocks | i64 nEarlyPenalty. The row's scriptPayout field
+    is `-`, and its legacy netInfo (ip/port) and scalar platform ports are 0:
+    a v3 state carries its addresses in the ExtNetInfo only.
+
+  The ExtNetInfo is rebuilt from the RPC `addresses` object (purposes in
+  ascending order, one NetInfoEntry per printed endpoint: IPv4, IPv6 or a
+  domain); it is under the v3 SML leaf, so the root self-check below proves
+  the reconstruction. The RPC prints a share's reward script as
+  RewardScript() (the refund script when none is set), so a reward script
+  equal to the refund script is written as "not set" (empty): every reader
+  goes through RewardScript(), which gives the same script either way.
 
 The pre-list root parity (fixture entries -> DIP-4 root == `mnroot` ==
 committed cbTx root at <H>) is asserted BOTH here at generation time and
@@ -119,8 +141,12 @@ def entry_sml_hash(rec):
     b = b""
     b += bytes.fromhex(rec["proTxHash_wire"])
     b += bytes.fromhex(rec["confirmedHash_wire"])
-    b += bytes.fromhex(rec["ip_hex"])
-    b += struct.pack(">H", rec["port"])
+    if rec["nVersion"] >= 3:
+        # v3 leaf: the ExtNetInfo replaces the legacy 18-byte CService.
+        b += rec["extNetInfo"]
+    else:
+        b += bytes.fromhex(rec["ip_hex"])
+        b += struct.pack(">H", rec["port"])
     b += bytes.fromhex(rec["pubKeyOperator"])
     b += bytes.fromhex(rec["keyIDVoting"])
     b += b"\x01" if rec["isValid"] else b"\x00"
@@ -203,6 +229,130 @@ def _platform_p2p_port(state):
     return int(eps[0].rsplit(":", 1)[1])
 
 
+# ── Dash Core v24 state codec (v24_state.hpp MnStateV24Ext, vendor/netinfo.hpp,
+# vendor/providertx.hpp): Bitcoin-style CompactSize-prefixed vectors and
+# scripts, little-endian integers, big-endian ports.
+
+# NetInfoPurpose (netinfo.h): the ascending order ExtNetInfo serializes in.
+NETINFO_PURPOSES = {"core_p2p": 0, "platform_p2p": 1, "platform_https": 2}
+NETINFO_ENTRY_SERVICE = 0x01
+NETINFO_ENTRY_DOMAIN = 0x02
+BIP155_IPV4 = 1
+BIP155_IPV6 = 2
+EXT_NETINFO_VERSION = 1
+
+
+def compact_size(n):
+    if n < 0xfd:
+        return struct.pack("<B", n)
+    if n <= 0xffff:
+        return b"\xfd" + struct.pack("<H", n)
+    if n <= 0xffffffff:
+        return b"\xfe" + struct.pack("<I", n)
+    return b"\xff" + struct.pack("<Q", n)
+
+
+def ser_script(b):
+    return compact_size(len(b)) + b
+
+
+def netinfo_entry_bytes(endpoint, protx):
+    """One `addresses` endpoint string -> NetInfoEntry wire bytes: a service
+    (ADDRv2 CService: BIP155 net id, CompactSize length, address, BE port)
+    or a domain (CompactSize length, name, BE port)."""
+    if endpoint.startswith("["):
+        host, sep, port = endpoint[1:].partition("]:")
+        if not sep:
+            die("proTx %s: malformed endpoint %r" % (protx, endpoint))
+        addr = ipaddress.IPv6Address(host)
+        # Core prints IPv4 as a.b.c.d and keeps the internal/TORv2 ranges out
+        # of valid entries; CJDNS (fc00::/8) prints exactly like IPv6, so its
+        # BIP155 network cannot be told from the JSON.
+        if (addr.ipv4_mapped is not None or addr.packed[0] == 0xfc
+                or addr.packed[:6] in (bytes.fromhex("fd87d87eeb43"),
+                                       bytes.fromhex("fd6b88c08724"))):
+            die("proTx %s: endpoint %r is not a plain IPv6 address; its "
+                "ADDRv2 network is ambiguous in the RPC output" % (protx, endpoint))
+        svc = (struct.pack("<B", BIP155_IPV6) + compact_size(16) + addr.packed)
+        return (struct.pack("<B", NETINFO_ENTRY_SERVICE) + svc
+                + struct.pack(">H", int(port)))
+    host, _, port = endpoint.rpartition(":")
+    if not host:
+        die("proTx %s: malformed endpoint %r" % (protx, endpoint))
+    try:
+        addr = ipaddress.IPv4Address(host)
+        svc = struct.pack("<B", BIP155_IPV4) + compact_size(4) + addr.packed
+        return (struct.pack("<B", NETINFO_ENTRY_SERVICE) + svc
+                + struct.pack(">H", int(port)))
+    except ipaddress.AddressValueError:
+        pass
+    if host.endswith(".onion") or host.endswith(".i2p") or ":" in host:
+        die("proTx %s: endpoint %r (Tor/I2P/unbracketed) is not supported by "
+            "this encoder" % (protx, endpoint))
+    name = host.encode("ascii")
+    return (struct.pack("<B", NETINFO_ENTRY_DOMAIN) + compact_size(len(name))
+            + name + struct.pack(">H", int(port)))
+
+
+def ext_netinfo_bytes(addresses, protx):
+    """The RPC `addresses` object of a version-3 state -> ExtNetInfo wire
+    bytes: u8 version | CompactSize n | {u8 purpose | entries}* in ascending
+    purpose order (ExtNetInfo::ToJson prints every purpose it holds)."""
+    items = []
+    for key, endpoints in (addresses or {}).items():
+        if key not in NETINFO_PURPOSES:
+            die("proTx %s: unknown netInfo purpose %r" % (protx, key))
+        items.append((NETINFO_PURPOSES[key], endpoints))
+    items.sort()
+    out = struct.pack("<B", EXT_NETINFO_VERSION) + compact_size(len(items))
+    for purpose, endpoints in items:
+        out += struct.pack("<B", purpose) + compact_size(len(endpoints))
+        for ep in endpoints:
+            out += netinfo_entry_bytes(ep, protx)
+    return out
+
+
+def _script_matches_address(script, address, pubkey_ver, p2sh_ver, protx, what):
+    if address_to_script(address, pubkey_ver, p2sh_ver) != script:
+        die("proTx %s: %s script %s does not encode address %s"
+            % (protx, what, script.hex(), address))
+
+
+def v24_ext_bytes(state, protx, pubkey_ver, p2sh_ver, extnet):
+    """MnStateV24Ext (v24_state.hpp) of a version-3 state, as its codec
+    writes it: ExtNetInfo | payouts | shares | nEarlyPeriodBlocks u32 |
+    nEarlyPenalty i64."""
+    payouts = state.get("payouts") or []
+    shares = state.get("shares") or []
+    out = extnet
+    out += compact_size(len(payouts))
+    for p in payouts:
+        script = bytes.fromhex(p["script"])
+        _script_matches_address(script, p["address"], pubkey_ver, p2sh_ver,
+                                protx, "payout")
+        reward = int(p["reward"])
+        if not 0 < reward <= 10000:
+            die("proTx %s: payout reward %r bps is out of range" % (protx, reward))
+        out += ser_script(script) + struct.pack("<H", reward)
+    out += compact_size(len(shares))
+    for sh in shares:
+        refund = bytes.fromhex(sh["refundScript"])
+        reward = bytes.fromhex(sh["rewardScript"])
+        _script_matches_address(refund, sh["refundAddress"], pubkey_ver, p2sh_ver,
+                                protx, "share refund")
+        _script_matches_address(reward, sh["rewardAddress"], pubkey_ver, p2sh_ver,
+                                protx, "share reward")
+        # The RPC prints RewardScript(): an unset reward script reads as the
+        # refund script (module doc).
+        stored_reward = b"" if reward == refund else reward
+        out += struct.pack("<q", int(sh["amount"]))
+        out += ser_script(refund) + ser_script(stored_reward)
+        out += bytes.fromhex(address_to_keyid_hex(sh["ownerAddress"]))
+    out += struct.pack("<I", int(state.get("earlyPeriodBlocks", 0)))
+    out += struct.pack("<q", int(state.get("earlyPenalty", 0)))
+    return out
+
+
 def cmd_prestate(args):
     with open(args.list) as f:
         plist = json.load(f)
@@ -236,16 +386,41 @@ def cmd_prestate(args):
         if d.get("nType", 0) != ntype:
             die("proTx %s: list type %d != diff nType %r"
                 % (protx, ntype, d.get("nType", 0)))
-        ip, port = service_to_ip_port(_legacy_service(s))
+        v3 = nversion >= 3
+        shared = "shares" in s
         pubkey = (s.get("pubKeyOperator") or "").lower()
         if not is_hex_n(pubkey, 96):
             die("proTx %s: bad pubKeyOperator" % protx)
         if pubkey != (d.get("pubKeyOperator") or "").lower():
             die("proTx %s: list/diff pubKeyOperator disagree" % protx)
         voting = address_to_keyid_hex(s["votingAddress"])
-        owner = address_to_keyid_hex(s["ownerAddress"])
+        # A shared masternode has no owner key (its share owners sign).
+        if "ownerAddress" in s:
+            owner = address_to_keyid_hex(s["ownerAddress"])
+        elif shared:
+            owner = "00" * 20
+        else:
+            die("proTx %s: state has no ownerAddress" % protx)
         pubkey_ver, p2sh_ver = ADDRESS_VERSIONS[args.network]
-        payout = address_to_script(s["payoutAddress"], pubkey_ver, p2sh_ver).hex()
+        extnet = b""
+        v24_hex = "-"
+        if v3:
+            # The SML entry's addresses are the leaf's ExtNetInfo; the full
+            # state prints the same object.
+            if (d.get("addresses") or {}) != (s.get("addresses") or {}):
+                die("proTx %s: list/diff addresses disagree for a v3 state" % protx)
+            extnet = ext_netinfo_bytes(d.get("addresses"), protx)
+            if not s.get("payouts") and not s.get("shares"):
+                die("proTx %s: v3 state with neither payouts nor shares" % protx)
+            v24_hex = v24_ext_bytes(s, protx, pubkey_ver, p2sh_ver, extnet).hex()
+            ip, port = b"\x00" * 16, 0
+            payout = "-"
+        else:
+            if shared or "payouts" in s:
+                die("proTx %s: a version-%d state with a payout list or share "
+                    "table cannot be written to the prestate" % (protx, nversion))
+            ip, port = service_to_ip_port(_legacy_service(s))
+            payout = address_to_script(s["payoutAddress"], pubkey_ver, p2sh_ver).hex()
         op_addr = s.get("operatorPayoutAddress", "")
         script_op = (address_to_script(op_addr, pubkey_ver, p2sh_ver).hex()
                      if op_addr else "-")
@@ -255,6 +430,8 @@ def cmd_prestate(args):
             "confirmedHash_wire": rev_hex(d["confirmedHash"]),
             "ip_hex": ip.hex(),
             "port": port,
+            "extNetInfo": extnet,
+            "v24": v24_hex,
             "pubKeyOperator": pubkey,
             "keyIDVoting": voting,
             "keyIDOwner": owner,
@@ -264,9 +441,12 @@ def cmd_prestate(args):
             "platformNodeID_wire": rev_hex(node_id) if node_id else "",
             # v23 protx JSON has no scalar platformP2PPort; it lives in the
             # addresses.platform_p2p endpoint. Not under the SML root — only
-            # carried so ProUpServTx folds have a faithful baseline.
-            "platformP2PPort": _platform_p2p_port(s),
-            "platformHTTPPort": _platform_http_port(d, s),
+            # carried so ProUpServTx folds have a faithful baseline. A v3
+            # state has no scalar ports (SetStateVersion zeroes them; a v3
+            # ProRegTx carries none): its Platform endpoints are ExtNetInfo
+            # entries.
+            "platformP2PPort": 0 if v3 else _platform_p2p_port(s),
+            "platformHTTPPort": 0 if v3 else _platform_http_port(d, s),
             "operatorRewardBps": operator_reward_bp(e.get("operatorReward")),
             "scriptPayout": payout,
             "scriptOperatorPayout": script_op,
@@ -302,8 +482,10 @@ def cmd_prestate(args):
     for internal_id, i in enumerate(order):
         records[i]["internalId"] = internal_id
 
+    # /1 unless a version-3 state needs the v24 field (module doc).
+    format2 = any(r["nVersion"] >= 3 for r in records)
     lines = [
-        "c2pool-dash-replay-prestate/1",
+        "c2pool-dash-replay-prestate/2" if format2 else "c2pool-dash-replay-prestate/1",
         "network %s" % args.network,
         "height %d" % height,
         "blockhash %s" % blockhash.lower(),
@@ -311,7 +493,7 @@ def cmd_prestate(args):
         "count %d" % len(records),
     ]
     for r in sorted(records, key=lambda r: r["proTxHash_wire"]):
-        lines.append(" ".join(str(x) for x in [
+        fields = [
             "mn",
             r["proTxHash_wire"],
             r["confirmedHash_wire"] if int(r["confirmedHash_wire"], 16) else "-",
@@ -338,7 +520,10 @@ def cmd_prestate(args):
             r["collateralHash_wire"],
             r["collateralIndex"],
             r["internalId"],
-        ]))
+        ]
+        if format2:
+            fields.append(r["v24"])
+        lines.append(" ".join(str(x) for x in fields))
     if args.text:   # the plain prestate file test_dash_replay_run.cpp reads
         with open(args.out, "w") as f:
             f.write("\n".join(lines) + "\n")
@@ -362,8 +547,8 @@ def cmd_block(args):
     width = 512
     lines = [block_hex[i:i + width] for i in range(0, len(block_hex), width)]
     write_inc(args.out, args.symbol, lines, [
-        "Raw mainnet block body (dash-cli getblock <hash> 0), %d bytes."
-        % (len(block_hex) // 2),
+        "Raw %s block body (dash-cli getblock <hash> 0), %d bytes."
+        % (args.network, len(block_hex) // 2),
     ])
     print("wrote %s (%d bytes)" % (args.out, len(block_hex) // 2))
 
@@ -525,6 +710,8 @@ def main():
     p.add_argument("--hex", required=True)
     p.add_argument("--symbol", required=True)
     p.add_argument("--out", required=True)
+    p.add_argument("--network", choices=sorted(ADDRESS_VERSIONS), default="mainnet",
+                   help="only names the chain in the fixture preamble")
     p.set_defaults(fn=cmd_block)
 
     p = sub.add_parser("seamwork")
