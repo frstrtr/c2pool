@@ -467,6 +467,81 @@ public:
     void error(const message_error_type& err, const NetService& service, const std::source_location where = std::source_location::current()) override;
     void close_connection(const NetService& service) override;
 
+    // ── Socket-less dial failure (ported from the DASH node, #1835) ─────
+    // core::Factory::Client reports a dial that never produced a socket
+    // (ECONNREFUSED / ETIMEDOUT / resolve error) here, not through error() or
+    // close_connection(), which both need a socket. Without this override the
+    // address stayed in m_pending_outbound for the life of the process and
+    // try_connect_peers() skipped it on every later pass: a peer that was down
+    // at the first dial was never dialed again. The Factory calls this only
+    // through a live shared_ptr to the node (enable_shared_from_this or
+    // set_lifetime), so standup_pool_run creates the node with make_shared.
+    //
+    // IO thread, same discipline as error(). m_outbound_addrs is cleared only
+    // when no connection to the address is live. A pinned peer
+    // (--sharechain-addnode) gets its next redial scheduled with back-off.
+    // INLINE for the same vtable reason as the DASH node.
+    void connect_failed(const NetService& addr) override
+    {
+        const bool was_pending = m_pending_outbound.erase(addr) > 0;
+        const bool was_outbound =
+            !m_connections.contains(addr) && m_outbound_addrs.erase(addr) > 0;
+        if (was_outbound)
+            publish_peer_info_snapshot();
+        if (is_pinned(addr))
+            schedule_pin_redial(addr, std::chrono::steady_clock::now());
+        if (was_pending)
+            log_failed_dial(addr, std::chrono::steady_clock::now());
+    }
+
+    // ── Pinned sharechain peers (--sharechain-addnode) ──────────────────
+    // python p2pool's --p2pool-node: one ReconnectingClientFactory per address
+    // (p2p.py SingleClientFactory), outside the random outgoing set and not
+    // subject to bans. It redials after every failed dial and every drop, the
+    // delay starting at 1 s and growing by e (2.718...) up to 3600 s, and goes
+    // back to 1 s once a connection completes its version handshake.
+    static constexpr double PIN_INITIAL_DELAY_S = 1.0;
+    static constexpr double PIN_DELAY_FACTOR = 2.7182818284590451;
+    static constexpr double PIN_MAX_DELAY_S = 3600.0;
+    static constexpr std::chrono::seconds FAILED_DIAL_LOG_INTERVAL{600};
+
+    void add_pinned_peer(const NetService& addr)
+    {
+        m_pinned_peers.try_emplace(addr);
+    }
+    bool is_pinned(const NetService& addr) const { return m_pinned_peers.contains(addr); }
+
+    /// Seconds until the pin's next redial is due (0 when due now), or -1 for
+    /// an address that is not pinned. For tests and the peer view.
+    double pin_seconds_until_redial(const NetService& addr, std::chrono::steady_clock::time_point now) const
+    {
+        auto it = m_pinned_peers.find(addr);
+        if (it == m_pinned_peers.end())
+            return -1.0;
+        if (it->second.next_dial <= now)
+            return 0.0;
+        return std::chrono::duration<double>(it->second.next_dial - now).count();
+    }
+
+    /// One pass over the pins: dial every pin that is neither connected nor
+    /// already being dialed and whose back-off has run out. Returns how many
+    /// dials were started. Driven by a 1 s timer from start_outbound_connections().
+    size_t maintain_pinned_peers(std::chrono::steady_clock::time_point now)
+    {
+        size_t dialed = 0;
+        for (auto& [addr, pin] : m_pinned_peers)
+        {
+            if (pin_connected(addr) || m_pending_outbound.contains(addr))
+                continue;
+            if (pin.next_dial > now)
+                continue;
+            LOG_INFO << "[Pool] Dialing pinned sharechain peer " << addr.to_string();
+            begin_outbound_dial(addr);
+            ++dialed;
+        }
+        return dialed;
+    }
+
     // BaseNode:
     void send_ping(peer_ptr peer) override;
     std::optional<pool::PeerConnectionType> handle_version(std::unique_ptr<RawMessage> rmsg, peer_ptr peer) override;
@@ -649,6 +724,13 @@ public:
 
     /// Graceful shutdown: flush pending verified/removal buffers to LevelDB.
     void shutdown();
+
+    /// Teardown before the entrypoint destroys what the node calls into (the
+    /// embedded daemon): stop and join the think/verify pools, then clear the
+    /// won-block and best-share callbacks, then flush (shutdown()). After this
+    /// no node code calls an entrypoint object. Call once ioc.run() returned.
+    void stop_for_teardown();
+    bool torn_down() const { return m_torn_down; }
 
     /// Start dialing outbound peers from AddrStore / bootstrap list.
     /// Maintains target outbound peer count active outbound connections.
@@ -851,6 +933,7 @@ protected:
     std::string m_software_version = "/c2pool:0.1/";  // overridden by set_software_version()
     std::function<void(const uint256&)> m_on_bestblock;
     std::function<void()> m_on_best_share_changed;
+    bool m_torn_down = false;   // stop_for_teardown() ran (IO/owner thread only)
     std::function<double()> m_local_hashrate_fn;
     std::function<LocalRateStats()> m_local_rate_stats_fn;
     std::function<std::vector<std::pair<std::string, uint64_t>>()> m_current_pplns_fn;
@@ -892,6 +975,109 @@ protected:
     std::unique_ptr<core::Timer> m_readvert_timer; // one-shot ROOT-2 re-advert
     std::set<NetService> m_pending_outbound;   // addresses currently being dialed
     std::set<NetService> m_outbound_addrs;     // successfully connected outbound peers
+
+    // Pinned sharechain peers (--sharechain-addnode) and their redial state:
+    // twisted ReconnectingClientFactory's delay (seconds) and when the next
+    // dial is due. A default next_dial (the epoch) means "due now".
+    struct PinState
+    {
+        double delay_s = PIN_INITIAL_DELAY_S;
+        std::chrono::steady_clock::time_point next_dial{};
+    };
+    std::map<NetService, PinState> m_pinned_peers;
+    std::unique_ptr<core::Timer> m_pin_timer;
+
+    // Failed-dial INFO lines, at most one per address per FAILED_DIAL_LOG_INTERVAL.
+    struct FailedDialLog
+    {
+        std::chrono::steady_clock::time_point last{};
+        uint64_t suppressed = 0;
+        bool logged = false;
+    };
+    std::map<NetService, FailedDialLog> m_failed_dial_log;
+
+    // Starts an outbound dial and marks the address pending until connected(),
+    // error() or connect_failed() resolves it. Virtual so the dialer KAT can
+    // observe the dials of a rig-free node.
+    virtual void begin_outbound_dial(const NetService& addr)
+    {
+        m_pending_outbound.insert(addr);
+        core::Client::connect(addr);
+    }
+
+    // Live connections made by dialing a pin: the endpoint the dial landed on
+    // (a HOST:PORT pin may land on any of its addresses) -> the pin. Filled in
+    // connected() from the socket's dial target, cleared on the drop.
+    std::map<NetService, NetService> m_pin_live;
+
+    // The pin a live connection belongs to: the pin its dial was made for, or
+    // the address itself when that is a pin.
+    std::optional<NetService> pin_for(const NetService& live) const
+    {
+        if (auto it = m_pin_live.find(live); it != m_pin_live.end())
+            return it->second;
+        if (m_pinned_peers.contains(live))
+            return live;
+        return std::nullopt;
+    }
+
+public:
+    /// A live connection made for this pin (under whatever address it landed on).
+    bool pin_connected(const NetService& pin) const
+    {
+        if (m_connections.contains(pin))
+            return true;
+        for (const auto& [live, p] : m_pin_live)
+            if (p == pin && m_connections.contains(live))
+                return true;
+        return false;
+    }
+
+protected:
+
+    // twisted ReconnectingClientFactory.retry(), without the jitter: after a
+    // failed dial or a drop, delay = min(delay * e, 3600) and redial then.
+    void schedule_pin_redial(const NetService& pin, std::chrono::steady_clock::time_point now)
+    {
+        auto it = m_pinned_peers.find(pin);
+        if (it == m_pinned_peers.end())
+            return;
+        it->second.delay_s = std::min(it->second.delay_s * PIN_DELAY_FACTOR, PIN_MAX_DELAY_S);
+        it->second.next_dial = now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                         std::chrono::duration<double>(it->second.delay_s));
+    }
+
+    // resetDelay(), called from proto_connected (version handshake done).
+    void note_pin_handshake(const NetService& live)
+    {
+        if (auto pin = pin_for(live))
+            m_pinned_peers[*pin].delay_s = PIN_INITIAL_DELAY_S;
+    }
+
+    void log_failed_dial(const NetService& addr, std::chrono::steady_clock::time_point now)
+    {
+        if (m_failed_dial_log.size() > 1024)
+            m_failed_dial_log.clear();
+        auto& e = m_failed_dial_log[addr];
+        if (e.logged && now - e.last < FAILED_DIAL_LOG_INTERVAL)
+        {
+            ++e.suppressed;
+            return;
+        }
+        std::string more;
+        if (e.suppressed)
+            more = " (" + std::to_string(e.suppressed) + " more failures since the last report)";
+        std::string next = "; will retry on the next maintenance pass";
+        if (is_pinned(addr))
+        {
+            const double s = pin_seconds_until_redial(addr, now);
+            next = "; pinned peer, redial in " + std::to_string(static_cast<long long>(s + 0.5)) + "s";
+        }
+        LOG_INFO << "[Pool] Outbound dial to " << addr.to_string() << " failed" << more << next;
+        e.logged = true;
+        e.last = now;
+        e.suppressed = 0;
+    }
 
     // Peer banning: maps address → ban expiry time
 

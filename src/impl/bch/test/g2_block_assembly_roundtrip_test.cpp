@@ -538,6 +538,9 @@ void test_won_block_undecodable_username_refuses_share()
 
 // #1437 topology KAT, defined in template_topology_spend_test.cpp (same target).
 int run_template_topology_spend_checks();
+// v35 login refusal KAT (work_source_authorize_refusal_test.cpp, same target).
+// Runs last: it registers the CashAddr decoder for the whole process.
+int run_work_source_authorize_refusal_checks();
 
 int main()
 {
@@ -553,6 +556,9 @@ int main()
 
     // #1437: mempool tx-selection topology + intra-template double-spend guard.
     failures += run_template_topology_spend_checks();
+
+    // v35 shares carry only a legacy address: refuse logins that have none.
+    failures += run_work_source_authorize_refusal_checks();
 
     if (failures) {
         std::cerr << failures << " CHECK(s) failed\n";

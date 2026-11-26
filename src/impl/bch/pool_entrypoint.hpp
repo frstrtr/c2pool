@@ -153,7 +153,28 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
     daemon.run();
 
     // 3: the pool node (sharechain, LevelDB, P2P, Stratum).
-    Node node(&ioc, &config);  // concrete NodeBridge<NodeImpl,Legacy,Actual> -- NodeImpl alone is abstract (ICommunicator::handle lives in NodeBridge)
+    // concrete NodeBridge<NodeImpl,Legacy,Actual> -- NodeImpl alone is abstract
+    // (ICommunicator::handle lives in NodeBridge). Owned through make_shared so
+    // core::Factory sees it as managed (enable_shared_from_this): every
+    // accept/dial completion re-locks a weak handle, so a failed sharechain
+    // dial reaches connect_failed() (dropped for a node with no handle) and is
+    // no longer left pending forever. Deliberately NOT set_lifetime(): that
+    // pins the node in every pending async op, so it would outlive this
+    // function and be destroyed in ~io_context, after `daemon` -- the
+    // won-block sink's target. This way it is destroyed at the end of this
+    // scope, before `daemon`, as the stack object was; stop_for_teardown()
+    // below quiets it first. `node` is a reference alias, so every use below
+    // is unchanged.
+    auto node_holder = std::make_shared<Node>(&ioc, &config);
+    Node& node = *node_holder;
+    if (static_cast<core::INetwork&>(node).weak_from_this().expired())
+        throw std::runtime_error("bch::standup_pool_run: sharechain node is not shared_ptr-managed");
+    // Also on an exception out of the run-loop: the guard is destroyed just
+    // before the node and after everything declared later (idempotent).
+    struct NodeTeardown {
+        NodeImpl& n;
+        ~NodeTeardown() { n.stop_for_teardown(); }
+    } node_teardown{node};
 
     // 4: bind the in-operation won-block fire path to the dual-path broadcaster.
     wire_won_block_sink(node, daemon);
@@ -178,11 +199,18 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
     // store seeded from m_bootstrap_addrs (run_pool). node inherits
     // core::Server via BaseNode : core::Factory<core::Server, core::Client>
     // (src/pool/node.hpp), so node.core::Server::listen(...) resolves exactly as
-    // in main_dgb.cpp:678 / main_btc.cpp:1638. When explicit --sharechain-addnode
-    // peers were pinned, raise the outbound target to at least that count so all
-    // pins are dialed (default m_target_outbound_peers = 8 otherwise).
+    // in main_dgb.cpp:678 / main_btc.cpp:1638.
+    // --sharechain-addnode peers are PINNED (python --p2pool-node): dialed on
+    // their own, kept connected and redialed with back-off, on top of the
+    // normal outbound target, which is no longer lowered to the pin count.
     if (explicit_sharechain_peers)
-        node.set_target_outbound_peers(std::max<size_t>(1, explicit_sharechain_peers));
+    {
+        for (const auto& addr : config.pool()->m_bootstrap_addrs)
+            node.add_pinned_peer(addr);
+        node.set_target_outbound_peers(std::max<size_t>(8, explicit_sharechain_peers));
+        LOG_INFO << "[BCH-POOL] " << config.pool()->m_bootstrap_addrs.size()
+                 << " pinned sharechain peer(s) (--sharechain-addnode)";
+    }
     node.core::Server::listen(PoolConfig::P2P_PORT);
     LOG_INFO << "[BCH-POOL] sharechain listening :" << PoolConfig::P2P_PORT
              << " proto adv=" << PoolConfig::ADVERTISED_PROTOCOL_VERSION
@@ -345,6 +373,11 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
                 std::memcpy(p.pubkey_hash.begin(), payout_script.data() + 2, 20);
                 p.pubkey_type = 1;
             }
+            // v34/v35 preimage field: the address string, the SAME function
+            // create_local_share_v35 writes into m_address (python
+            // script2_to_address form). Empty when the script has none; the
+            // create side then refuses to mint, so no share carries it.
+            p.address = bch::v35_share_address_for_script(payout_script);
 
             auto block_bits_fallback = [&] {
                 p.bits = block_bits;  p.max_bits = block_bits;
@@ -533,6 +566,30 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
                     best_share_hash, block_target, subsidy, donation_script);
             return node.tracker().get_expected_payouts(
                 best_share_hash, block_target, subsidy, donation_script);
+        });
+
+    // Pre-v36 author outputs (v34/v35 shares): the exact payout list, donation
+    // last, that generate_share_transaction rebuilds for our share. Python keys
+    // it by the address string the share carries, so it comes from the same
+    // compute_v35_gentx_outputs the verifier uses, keyed by the address
+    // create_local_share_v35 will write (v35_share_address_for_script).
+    work_source->set_v35_outputs_fn(
+        [&node](const uint256& prev_share_hash,
+                const uint256& block_target,
+                uint64_t subsidy,
+                const std::vector<unsigned char>& payout_script)
+            -> std::vector<std::pair<std::vector<unsigned char>, uint64_t>>
+        {
+            const std::string addr = bch::v35_share_address_for_script(payout_script);
+            if (addr.empty())
+                throw std::invalid_argument("payout script has no v35 address form");
+            std::shared_lock<std::shared_mutex> lk(node.tracker_mutex());
+            auto v35 = bch::compute_v35_gentx_outputs(
+                node.tracker(), prev_share_hash, block_target, subsidy,
+                std::vector<unsigned char>(addr.begin(), addr.end()));
+            auto outs = std::move(v35.payouts);
+            outs.emplace_back(PoolConfig::get_donation_script(int64_t(35)), v35.donation_amount);
+            return outs;
         });
 
     work_source->set_create_share_fn(
@@ -1080,6 +1137,12 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
     // Drive the shared io_context: pool node + embedded daemon + stratum run together.
     ioc.run();
 
+    // Teardown order. Locals die in reverse: stratum/web, the node, then
+    // `daemon`. Quiet the node first: join its think/verify pools (a think()
+    // may be inside a won block, calling the sink into `daemon`) and clear its
+    // callbacks, so no node code runs against a destroyed object.
+    node.stop_for_teardown();
+
     // LTC-parity site 3/3 (the TRUE third, missing until now): save the stat log
     // on clean shutdown. load-on-start (site 1) + periodic-100s (site 2) only
     // persist at tick boundaries, so without this every clean restart drops
@@ -1095,6 +1158,7 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
         if (auto* mi = web_server->get_mining_interface())
             mi->save_stat_log();
     }
+
 }
 
 } // namespace bch

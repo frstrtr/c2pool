@@ -7,6 +7,7 @@
 #include <vector>
 #include <string>
 #include <memory>
+#include <optional>
 #include <source_location>
 
 #include <boost/asio.hpp>
@@ -74,6 +75,12 @@ class Socket : public std::enable_shared_from_this<Socket>
 
     NetService m_addr;
     NetService m_addr_local;
+
+    // Outbound sockets only: the NetService the node asked core::Client to
+    // dial, exactly as given (a HOST:PORT name stays a name). m_addr is the
+    // endpoint the dial landed on, which for a name may be any of its
+    // addresses. Set by the Factory before connected(); unset for inbound.
+    std::optional<NetService> m_dial_target;
 
     // ── Outbound write queue (issue #863) ──────────────────────────────────
     //
@@ -169,6 +176,9 @@ public:
     {
         return m_addr;
     }
+
+    const std::optional<NetService>& dial_target() const { return m_dial_target; }
+    void set_dial_target(const NetService& target) { m_dial_target = target; }
 
     bool status() const
     {
