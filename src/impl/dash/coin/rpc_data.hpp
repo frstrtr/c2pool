@@ -6,6 +6,7 @@
 
 #include "transaction.hpp"
 
+#include <atomic>
 #include <string>
 #include <vector>
 #include <cstdint>
@@ -110,6 +111,83 @@ struct PinOutcome {
     int64_t     value{0};
 };
 
+// ── ONE SHARED TX-HEX VECTOR PER STORED TEMPLATE ─────────────────────────
+// Hex characters held by every live TemplateTxHex vector, process-wide: up
+// when the work source's template store encodes one, down when the last job
+// referencing it is dropped. Relaxed atomic: a gauge, not a synchronization
+// point.
+inline std::atomic<int64_t>& live_template_hex_chars_counter() noexcept
+{
+    static std::atomic<int64_t> n{0};
+    return n;
+}
+inline int64_t live_template_hex_chars() noexcept
+{
+    return live_template_hex_chars_counter().load(std::memory_order_relaxed);
+}
+
+// The tx-hex vector every stratum job (and every v36 frozen mint job) built
+// over ONE stored template carries. Before, each job copied the template's
+// m_tx_data_hex into a vector of its own: once per session per notify on the
+// io thread, and one copy per retained job.
+//
+// Encoded once by DASHWorkSource's template store, just before the template
+// becomes the immutable cached snapshot (shared_ptr<const DashWorkData>), from
+// that template's own m_tx_data_hex. It lives inside the template it was
+// encoded from, so a job can never pair one template's merkle branches with
+// another template's bodies, on any thread.
+//
+// A COPY STARTS EMPTY. Copying a DashWorkData makes another template instance,
+// which may then be mutated (a pin splice, a test that drops a body); it must
+// never inherit a vector encoded from the original. Readers holding a template
+// without one fall back to a fresh copy (job_tx_hex below), which is exactly
+// what every job carried before. Moves keep the vector (the store moves the
+// template into its cached snapshot).
+class TemplateTxHex {
+public:
+    TemplateTxHex() = default;
+    TemplateTxHex(const TemplateTxHex&) noexcept {}
+    TemplateTxHex& operator=(const TemplateTxHex& other) noexcept
+    {
+        if (this != &other) *this = TemplateTxHex{};
+        return *this;
+    }
+    TemplateTxHex(TemplateTxHex&&) noexcept = default;
+    TemplateTxHex& operator=(TemplateTxHex&&) noexcept = default;
+
+    /// Encode `bodies` once. `seq` names the stored template instance (the
+    /// store's own counter; > 0). The copy is the only O(bytes) step.
+    static TemplateTxHex encode(const std::vector<std::string>& bodies, uint64_t seq)
+    {
+        int64_t chars = 0;
+        for (const auto& h : bodies) chars += static_cast<int64_t>(h.size());
+        std::unique_ptr<std::vector<std::string>> v(new std::vector<std::string>(bodies));
+        live_template_hex_chars_counter().fetch_add(chars, std::memory_order_relaxed);
+        TemplateTxHex t;
+        // On a throw here the deleter runs and takes the count back down.
+        t.m_hex = std::shared_ptr<const std::vector<std::string>>(
+            v.release(), [chars](const std::vector<std::string>* p) {
+                live_template_hex_chars_counter().fetch_sub(chars, std::memory_order_relaxed);
+                delete p;
+            });
+        t.m_body_bytes = static_cast<uint64_t>(chars) / 2;
+        t.m_seq        = seq;
+        return t;
+    }
+
+    explicit operator bool() const noexcept { return static_cast<bool>(m_hex); }
+    const std::shared_ptr<const std::vector<std::string>>& hex() const noexcept { return m_hex; }
+    /// Serialized bytes of the bodies (hex characters / 2).
+    uint64_t body_bytes() const noexcept { return m_body_bytes; }
+    /// The store sequence of the template it was encoded for (0: none).
+    uint64_t seq() const noexcept { return m_hex ? m_seq : 0; }
+
+private:
+    std::shared_ptr<const std::vector<std::string>> m_hex;
+    uint64_t m_body_bytes{0};
+    uint64_t m_seq{0};
+};
+
 struct DashWorkData {
     // Raw getblocktemplate JSON response (kept for fallback access to fields
     // we haven't promoted to members yet).
@@ -132,6 +210,11 @@ struct DashWorkData {
     // Raw "data" hex for each transaction — kept so we can assemble a full
     // block to submit via submitblock when a miner wins.
     std::vector<std::string> m_tx_data_hex;
+    // m_tx_data_hex encoded ONCE for every job built over this template (see
+    // TemplateTxHex). Set only by the work source's template store, on the
+    // instance it then caches; empty on every other DashWorkData and on any
+    // copy. Read it through job_tx_hex().
+    TemplateTxHex m_tx_hex_shared;
 
     // Dash-specific ------------------------------------------------------------
     // Normalized list of masternode + superblock + platform payments, in the
@@ -302,6 +385,16 @@ struct DashWorkData {
     // rejected as bad-blk-length if it wins. Always accompanied by a WARNING.
     bool m_pin_block_budget_unenforced{false};
 };
+
+// The tx-hex vector a job built over `wd` carries: the template's own shared
+// vector when the store encoded one, else a fresh copy of its bodies (the only
+// form before the shared vector existed, kept for templates that never went
+// through the store and for copies).
+inline std::shared_ptr<const std::vector<std::string>> job_tx_hex(const DashWorkData& wd)
+{
+    if (wd.m_tx_hex_shared) return wd.m_tx_hex_shared.hex();
+    return std::make_shared<const std::vector<std::string>>(wd.m_tx_data_hex);
+}
 
 } // namespace coin
 } // namespace dash

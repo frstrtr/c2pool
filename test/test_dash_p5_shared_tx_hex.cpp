@@ -47,7 +47,9 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <regex>
 #include <set>
+#include <span>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -695,4 +697,327 @@ TEST(DashP5SharedTxHex, WireServesMatchThePreP5GoldenPerSession)
                              << " bodies at h=" << b.height << ")";
     }
     expect_golden("kGoldenWire", digests, kGoldenWire);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// The P5 contract: one vector per stored template, never carried to another.
+// ═════════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+// The branches a job over `bodies` must carry (the fixture's txid is the
+// sha256d of its body, so the bodies alone determine them).
+std::vector<std::string> branches_for_bodies(const std::vector<std::string>& bodies)
+{
+    if (bodies.empty()) return {};
+    std::vector<uint256> leaves{uint256::ZERO};
+    for (const auto& h : bodies) leaves.push_back(body_txid(h));
+    return dash::coinbase::merkle_branches_hex(dash::coinbase::merkle_branches_raw(leaves));
+}
+
+const std::vector<std::string>* own_vector(const DASHWorkSource& ws)
+{
+    auto t = ws.peek_template();
+    return t && t->m_tx_hex_shared ? t->m_tx_hex_shared.hex().get() : nullptr;
+}
+
+core::stratum::CoinbaseResult serve_once(const DASHWorkSource& ws, unsigned char fill = 0x11)
+{
+    return serve_session(ws, uint256::ZERO, "00000001", p2pkh(fill)).cbr;
+}
+
+}  // namespace
+
+// Every session served on one template gets that template's own vector: one
+// pointer, not a copy each, and its content is the template's bodies.
+TEST(DashP5SharedTxHex, EverySessionOnOneTemplateSharesItsVector)
+{
+    Source src;
+    DASHWorkSource ws(src.coin_state, src.fallback(), Source::submit());
+    std::map<size_t, std::set<const std::vector<std::string>*>> per_step;
+    std::map<size_t, const std::vector<std::string>*> own;
+    walk_templates(src, ws, [&](size_t t, size_t, const Serve& s) {
+        ASSERT_TRUE(s.cbr.snapshot.tx_data);
+        per_step[t].insert(s.cbr.snapshot.tx_data.get());
+        own[t] = own_vector(ws);
+    });
+    ASSERT_EQ(per_step.size(), 4u);
+    for (const auto& [t, ptrs] : per_step) {
+        EXPECT_EQ(ptrs.size(), 1u) << "template " << t << ": " << ptrs.size()
+                                   << " vectors for 6 serves";
+        ASSERT_NE(own[t], nullptr) << "template " << t << " was stored without a vector";
+        EXPECT_EQ(*ptrs.begin(), own[t]) << "template " << t << ": not the template's own vector";
+    }
+}
+
+// A rebuild with the SAME tx set is a new template: a new vector, never the
+// old one. Jobs already issued keep the old vector and its bodies.
+TEST(DashP5SharedTxHex, RebuildWithTheSameTxSetYieldsAFreshVector)
+{
+    Source src;
+    src.set(tmpl_A());
+    DASHWorkSource ws(src.coin_state, src.fallback(), Source::submit());
+    const auto a = serve_once(ws);
+    ASSERT_TRUE(a.snapshot.tx_data);
+    src.set(tmpl_B());
+    ws.bump_work_generation();
+    const auto b = serve_once(ws);
+    ASSERT_TRUE(b.snapshot.tx_data);
+    EXPECT_NE(a.snapshot.tx_data.get(), b.snapshot.tx_data.get())
+        << "the rebuilt template reused the previous template's vector";
+    EXPECT_EQ(b.snapshot.tx_data.get(), own_vector(ws));
+    EXPECT_EQ(*a.snapshot.tx_data, tmpl_A().m_tx_data_hex);
+    EXPECT_EQ(*b.snapshot.tx_data, tmpl_B().m_tx_data_hex);
+}
+
+// A rebuild with another tx set: a new vector holding the new bodies.
+TEST(DashP5SharedTxHex, RebuildWithAnotherTxSetYieldsAFreshVector)
+{
+    Source src;
+    src.set(tmpl_A());
+    DASHWorkSource ws(src.coin_state, src.fallback(), Source::submit());
+    const auto a = serve_once(ws);
+    src.set(tmpl_C());
+    ws.bump_work_generation();
+    const auto c = serve_once(ws);
+    ASSERT_TRUE(a.snapshot.tx_data && c.snapshot.tx_data);
+    EXPECT_NE(a.snapshot.tx_data.get(), c.snapshot.tx_data.get());
+    EXPECT_EQ(c.snapshot.tx_data.get(), own_vector(ws));
+    EXPECT_EQ(*c.snapshot.tx_data, tmpl_C().m_tx_data_hex);
+    EXPECT_EQ(c.snapshot.merkle_branches, branches_for_bodies(*c.snapshot.tx_data));
+}
+
+// invalidate_template_cache, then the same content again: still a new vector.
+TEST(DashP5SharedTxHex, InvalidateYieldsAFreshVector)
+{
+    Source src;
+    src.set(tmpl_C());
+    DASHWorkSource ws(src.coin_state, src.fallback(), Source::submit());
+    const auto before = serve_once(ws);
+    ws.invalidate_template_cache("kat: P5 invalidate");
+    EXPECT_EQ(ws.peek_template(), nullptr);
+    const auto after = serve_once(ws);
+    ASSERT_TRUE(before.snapshot.tx_data && after.snapshot.tx_data);
+    EXPECT_NE(before.snapshot.tx_data.get(), after.snapshot.tx_data.get())
+        << "a template stored after an invalidate reused the dropped template's vector";
+    EXPECT_EQ(after.snapshot.tx_data.get(), own_vector(ws));
+    EXPECT_EQ(*after.snapshot.tx_data, tmpl_C().m_tx_data_hex);
+}
+
+// A new tip (the store's own tip-moved bump) with the same bodies on it: a new
+// vector, frozen with the new tip's header.
+TEST(DashP5SharedTxHex, TipChangeYieldsAFreshVector)
+{
+    Source src;
+    src.set(tmpl_A());
+    DASHWorkSource ws(src.coin_state, src.fallback(), Source::submit());
+    const auto a = serve_once(ws);
+    auto next_tip = tmpl_A();
+    next_tip.m_previous_block.SetHex(kPrev2);
+    next_tip.m_height += 1;
+    src.set(next_tip);
+    ws.bump_work_generation();
+    const uint64_t gen_before = ws.get_work_generation();
+    const auto n = serve_once(ws);
+    EXPECT_EQ(ws.get_work_generation(), gen_before + 1) << "the store's own tip-moved bump";
+    ASSERT_TRUE(a.snapshot.tx_data && n.snapshot.tx_data);
+    EXPECT_NE(a.snapshot.tx_data.get(), n.snapshot.tx_data.get());
+    EXPECT_EQ(n.snapshot.tx_data.get(), own_vector(ws));
+    EXPECT_EQ(n.snapshot.gbt_prevhash, std::string(kPrev2));
+    EXPECT_EQ(*n.snapshot.tx_data, next_tip.m_tx_data_hex);
+}
+
+// A copy of a stored template is another instance: it carries no vector, so a
+// mutated copy can never hand out the original's bodies. A move keeps it.
+TEST(DashP5SharedTxHex, CopiedTemplateCarriesNoVector)
+{
+    Source src;
+    src.set(tmpl_A());
+    DASHWorkSource ws(src.coin_state, src.fallback(), Source::submit());
+    (void)serve_once(ws);
+    const auto stored = ws.peek_template();
+    ASSERT_TRUE(stored && stored->m_tx_hex_shared);
+    const auto* own = stored->m_tx_hex_shared.hex().get();
+
+    DashWorkData copy = *stored;
+    EXPECT_FALSE(copy.m_tx_hex_shared) << "a copy-constructed template kept the vector";
+    EXPECT_EQ(copy.m_tx_hex_shared.seq(), 0u);
+    DashWorkData assigned = tmpl_C();
+    assigned = *stored;
+    EXPECT_FALSE(assigned.m_tx_hex_shared) << "a copy-assigned template kept the vector";
+
+    // The copy's job bodies are its own bodies, by value.
+    const auto copy_hex = dash::coin::job_tx_hex(copy);
+    ASSERT_TRUE(copy_hex);
+    EXPECT_NE(copy_hex.get(), own);
+    EXPECT_EQ(*copy_hex, stored->m_tx_data_hex);
+    copy.m_tx_data_hex.pop_back();
+    copy.m_tx_hashes.pop_back();
+    EXPECT_EQ(*dash::coin::job_tx_hex(copy), copy.m_tx_data_hex)
+        << "a mutated copy must serve its own bodies";
+    EXPECT_EQ(dash::coin::job_tx_hex(*stored).get(), own);
+
+    // A move is the same instance moving house (the store moves into its cache).
+    DashWorkData moved_from = tmpl_A();
+    moved_from.m_tx_hex_shared = dash::coin::TemplateTxHex::encode(moved_from.m_tx_data_hex, 7);
+    const auto* encoded = moved_from.m_tx_hex_shared.hex().get();
+    DashWorkData moved = std::move(moved_from);
+    ASSERT_TRUE(moved.m_tx_hex_shared);
+    EXPECT_EQ(moved.m_tx_hex_shared.hex().get(), encoded);
+    EXPECT_EQ(moved.m_tx_hex_shared.seq(), 7u);
+}
+
+// The live-hex gauge counts a vector from its store to its last job.
+TEST(DashP5SharedTxHex, LiveHexGaugeReturnsToBaselineWhenTheLastJobDrops)
+{
+    int64_t a_chars = 0;
+    for (const auto& h : tmpl_A().m_tx_data_hex) a_chars += static_cast<int64_t>(h.size());
+    const int64_t base = dash::coin::live_template_hex_chars();
+    std::optional<core::stratum::CoinbaseResult> job;
+    {
+        Source src;
+        src.set(tmpl_A());
+        DASHWorkSource ws(src.coin_state, src.fallback(), Source::submit());
+        job = serve_once(ws);
+        (void)serve_once(ws, 0x33);   // another session: no second vector
+        EXPECT_EQ(dash::coin::live_template_hex_chars(), base + a_chars);
+        ws.invalidate_template_cache("kat: P5 gauge");
+        EXPECT_EQ(dash::coin::live_template_hex_chars(), base + a_chars)
+            << "the issued job still holds the dropped template's vector";
+    }
+    EXPECT_EQ(dash::coin::live_template_hex_chars(), base + a_chars);
+    job.reset();
+    EXPECT_EQ(dash::coin::live_template_hex_chars(), base)
+        << "the vector outlived its last job";
+}
+
+// N9: a store lands between the serve's cached_work() and its freeze (the
+// producer job runs in between; here it stores the next template itself). The
+// job's bodies still come from the template its branches came from.
+TEST(DashP5SharedTxHex, StoreBetweenCachedWorkAndFreezeKeepsBodiesWithBranches)
+{
+    Source src;
+    src.set(tmpl_A());
+    DASHWorkSource ws(src.coin_state, src.fallback(), Source::submit());
+    (void)serve_once(ws);
+    bool stored_mid_serve = false;
+    ws.set_producer_job_fn([&](const uint256& prev, const std::vector<unsigned char>& script,
+                               const DashWorkData& wd) {
+        if (!stored_mid_serve) {
+            stored_mid_serve = true;
+            src.set(tmpl_C());
+            ws.bump_work_generation();
+            (void)ws.get_current_work_template();   // re-sources and stores C now
+        }
+        return stub_producer_job(prev, script, wd);
+    });
+    const auto cbr = ws.build_connection_coinbase(uint256::ZERO, "00000001", p2pkh(0x11), {});
+    ASSERT_TRUE(stored_mid_serve);
+    ASSERT_EQ(ws.peek_template()->m_tx_data_hex, tmpl_C().m_tx_data_hex)
+        << "the mid-serve store did not land";
+    ASSERT_TRUE(cbr.snapshot.tx_data);
+    EXPECT_EQ(cbr.snapshot.height, tmpl_A().m_height);
+    EXPECT_EQ(*cbr.snapshot.tx_data, tmpl_A().m_tx_data_hex)
+        << "the job froze the bodies of a template it was not built over";
+    EXPECT_EQ(cbr.snapshot.merkle_branches, branches_for_bodies(*cbr.snapshot.tx_data));
+}
+
+// The executor model: stores run on a pool thread while the serving thread
+// serves. Every job's branches and bodies belong to one template.
+TEST(DashP5SharedTxHex, ExecutorStoresWhileServingKeepBodiesWithBranches)
+{
+    Source src;
+    src.set(tmpl_A());
+    DASHWorkSource ws(src.coin_state, src.fallback(), Source::submit());
+    asio::thread_pool pool(1);
+    ws.set_refresh_executor([&pool](std::function<void()> job) { asio::post(pool, std::move(job)); });
+
+    std::set<uint64_t> seqs;
+    size_t served = 0;
+    for (int i = 0; i < 600; ++i) {
+        src.set(i % 2 ? tmpl_C() : tmpl_A());
+        ws.bump_work_generation();
+        const auto cbr = serve_once(ws, static_cast<unsigned char>(0x11 + (i % 4)));
+        if (auto t = ws.peek_template()) seqs.insert(t->m_tx_hex_shared.seq());
+        if (i % 50 == 0) std::this_thread::sleep_for(1ms);   // let the pool store
+        if (!cbr.snapshot.has_header) continue;               // nothing stored yet
+        ++served;
+        ASSERT_TRUE(cbr.snapshot.tx_data);
+        const bool is_a = *cbr.snapshot.tx_data == tmpl_A().m_tx_data_hex;
+        const bool is_c = *cbr.snapshot.tx_data == tmpl_C().m_tx_data_hex;
+        ASSERT_TRUE(is_a || is_c) << "serve " << i << " froze bodies of no template";
+        ASSERT_EQ(cbr.snapshot.merkle_branches, branches_for_bodies(*cbr.snapshot.tx_data))
+            << "serve " << i << ": branches of one template, bodies of another";
+        ASSERT_EQ(cbr.snapshot.subsidy,
+                  is_a ? tmpl_A().m_coinbase_value : tmpl_C().m_coinbase_value);
+    }
+    pool.join();
+    EXPECT_GT(served, 500u);
+    EXPECT_GE(seqs.size(), 3u) << "the pool must have stored while serving";
+}
+
+// Over a real stratum server: four sessions, six notifies each, four
+// templates. Every job holds its template's one vector: four vectors in all,
+// not one per job.
+TEST(DashP5SharedTxHex, SessionsOnRealStratumShareOneVectorPerTemplate)
+{
+    Stratum st;
+    auto run = run_wire_walk(st);
+    ASSERT_TRUE(run.ok) << "the stratum walk did not complete";
+    std::map<const std::vector<std::string>*, size_t> jobs_per_vector;
+    std::map<const std::vector<std::string>*, std::set<std::vector<unsigned char>>> sessions_per_vector;
+    for (const auto& b : st.ws->built()) {
+        ASSERT_TRUE(b.tx_data);
+        ++jobs_per_vector[b.tx_data.get()];
+        sessions_per_vector[b.tx_data.get()].insert(b.script);
+    }
+    EXPECT_EQ(jobs_per_vector.size(), 4u) << "one vector per template (A, B, C, D)";
+    size_t jobs = 0;
+    for (const auto& [v, n] : jobs_per_vector) {
+        jobs += n;
+        EXPECT_GE(sessions_per_vector[v].size(), 4u) << "every session shares the vector";
+    }
+    EXPECT_EQ(jobs, 4u * 6u);
+}
+
+// One timing line per template, written when the next template's first serve
+// is recorded, with the template's own counts and sizes.
+TEST(DashP5SharedTxHex, ServeTimingWritesOneLinePerTemplate)
+{
+    Source src;
+    src.set(tmpl_A());
+    DASHWorkSource ws(src.coin_state, src.fallback(), Source::submit());
+    for (unsigned char f : {0x11, 0x33, 0x44, 0x55, 0x66}) (void)serve_once(ws, f);
+    // A coinbase build with no template fetch before it: a serve, not a span.
+    (void)ws.build_connection_coinbase(uint256::ZERO, "00000001", p2pkh(0x77), {});
+    EXPECT_EQ(ws.serve_timing_lines(), 0u) << "the open template's line is not written yet";
+    const uint64_t a_seq = ws.peek_template()->m_tx_hex_shared.seq();
+
+    src.set(tmpl_C());
+    ws.bump_work_generation();
+    (void)serve_once(ws);
+    ASSERT_EQ(ws.serve_timing_lines(), 1u);
+    const auto s = ws.last_serve_timing();
+    ASSERT_TRUE(s.has_value());
+    EXPECT_EQ(s->seq, a_seq);
+    EXPECT_EQ(s->height, tmpl_A().m_height);
+    EXPECT_EQ(s->txs, 6u);
+    EXPECT_EQ(s->body_bytes, 1u + 37u + 120u + 251u + 999u + 2u);
+    EXPECT_EQ(s->serves, 6u);
+    EXPECT_EQ(s->spans, 5u);
+    EXPECT_LE(s->serve_us_p50, s->serve_us_p99);
+    EXPECT_LE(s->serve_us_p99, s->serve_us_max);
+    EXPECT_LE(s->coinbase_us_p50, s->coinbase_us_max);
+
+    const std::string line = DASHWorkSource::format_serve_timing_line(*s);
+    EXPECT_TRUE(std::regex_match(line, std::regex(
+        R"(\[DASH-SERVE-TIMING\] serve timing per template: seq=\d+ h=\d+ txs=\d+ bytes=\d+ )"
+        R"(serves=\d+ spans=\d+ serve_us p50=\d+ p99=\d+ max=\d+ )"
+        R"(coinbase_us p50=\d+ p99=\d+ max=\d+ live_hex_chars=-?\d+)")))
+        << line;
+    EXPECT_NE(line.find(" txs=6 bytes=1410 serves=6 spans=5 "), std::string::npos) << line;
+
+    // Serving C further writes nothing until the next template.
+    (void)serve_once(ws, 0x33);
+    EXPECT_EQ(ws.serve_timing_lines(), 1u);
 }
