@@ -2,10 +2,10 @@
 #pragma once
 // bip110::coin::SideBodies -- block bodies the own-UTXO view could not connect
 // when they arrived: a competing block at the view's height, one of a branch
-// the header chain does not follow yet, one above a gap. main_bip110.cpp keeps
-// the last few and, after each connect and after the tip-changed handler rolls
-// the view back to a fork, connects those that are now the active chain's next
-// block. Without it a reorg onto a branch whose blocks were already received
+// the header chain does not follow yet, one above a gap. The view's follower
+// (utxo_follow.hpp) keeps the last few and connects those that are now the
+// active chain's next block: after each body, on every tip change and on each
+// catch-up step. Without it a reorg onto a branch whose blocks were already received
 // would stop the view at the fork: the coin peer pool asks for a body once and
 // does not ask again for one it received (it only holds a child for its
 // parent), and the connect takes only the active chain's contiguous next block.
@@ -63,6 +63,7 @@ public:
     }
 
     size_t size() const { return m_bodies.size(); }
+    void clear() { m_bodies.clear(); }
     bool holds(const uint256& id) const
     {
         for (const auto& kept : m_bodies)

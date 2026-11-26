@@ -36,7 +36,7 @@
 #include <impl/bip110/coin/block_confirm.hpp>      // found-block confirm/orphan resolver (B2 telemetry)
 #include <impl/bip110/coin/parent_tx_resolver.hpp> // M3 tier-3 input pricing
 #include <impl/bip110/coin/utxo_reorg.hpp>         // GAP4 reorg-blindness fix
-#include <impl/bip110/coin/utxo_side_bodies.hpp>   // bodies kept for a later connect (after a rollback)
+#include <impl/bip110/coin/utxo_follow.hpp>        // UtxoFollower: the UTXO view on the active chain (keep, catch up, re-anchor)
 #include <impl/bip110/stratum/work_source.hpp>
 
 // ── M3 sharechain MINT lane (behind --bip110-sharechain; default OFF) ────────
@@ -261,6 +261,11 @@ int run_embedded(bool coin_p2p_discover,
 
     bip110::coin::Node<MiniConfig> coin_node(&ioc, &config);
 
+    // The NODE_BLAKE2B peer manager (--coin-p2p-discover; built below). Declared
+    // before the fan-out broadcaster and the coin peer pool, whose hooks hold a
+    // raw pointer to it, so both are destroyed first.
+    std::unique_ptr<bip110::coin::BtcCoinPeerManager> coin_peer_mgr;
+
     // ── M3 PR-C2 addrman-backed FOUND-BLOCK fan-out (behind --bip110-sharechain;
     // DEFAULT OFF) ───────────────────────────────────────────────────────────
     // Declared at run_embedded scope so they outlive work_source / the stratum
@@ -380,11 +385,18 @@ int run_embedded(bool coin_p2p_discover,
     // rolls the view back to the fork (and permanently on an unrecoverable
     // rollback), so templates are NEVER built from a diverged ledger — the
     // work source falls back to coinbase-only (never a wrong fee).
+    // The serve gate also requires the view to be AT the header tip
+    // (UtxoFollower::fresh, kServeMaxLag 0): until the tip block's body is
+    // connected the mempool still holds the transactions it confirmed, and a
+    // view left behind (bodies not received, the view not yet anchored) prices
+    // nothing it should. The follower is built with the UTXO connect below.
     std::atomic<bool> utxo_consistent{true};
+    std::shared_ptr<bip110::coin::UtxoFollower> utxo_follower;
     work_source->set_mempool(&mempool, serve_mempool_txs,
-        [&header_chain, &utxo_consistent]() {
+        [&header_chain, &utxo_consistent, &utxo_follower]() {
             return utxo_consistent.load(std::memory_order_relaxed)
-                && header_chain.height() >= header_chain.params().blake2b_height;
+                && header_chain.height() >= header_chain.params().blake2b_height
+                && utxo_follower && utxo_follower->fresh();
         });
     LOG_INFO << "[EMB-BIP110] mempool tx-serving "
              << (serve_mempool_txs ? "ENABLED" : "DISABLED (coinbase-only)")
@@ -979,49 +991,38 @@ int run_embedded(bool coin_p2p_discover,
     // so witness data arrives intact. Registration order matters: UTXO connect
     // FIRST (so the post-tip mempool passes see the applied block), mirroring
     // main_btc.cpp. This deepens the T2 pricing view one block at a time.
-    // The block is found in the header chain by its BIP-110 identity
-    // (bip110::coin::block_hash: BLAKE2b at/after the v2 fork), the key the
-    // chain is indexed by -- SHA256d(header) never matches past the fork.
+    // bip110::coin::UtxoFollower (utxo_follow.hpp) keeps the view on the active
+    // chain: a block is connected only as the active chain's block right after
+    // the view's best (the first one anchors an empty view), found in the header
+    // chain by its BIP-110 identity (bip110::coin::block_hash: BLAKE2b at/after
+    // the v2 fork -- SHA256d(header) never matches past the fork); a body that
+    // cannot connect yet is kept and offered again after every body, on every
+    // tip change and on each catch-up step; the catch-up step (the pool driver)
+    // fetches the active chain's next blocks while the view is behind the tip,
+    // and re-anchors a view too far behind or off the active chain.
     // Coin peer pool: the pool runs this UTXO connect itself, in chain order
     // (on_body_in_order), after its body check, and sets utxo_connect_by_pool;
     // the full_block subscriber below then leaves the connect to the pool.
     auto utxo_connect_by_pool = std::make_shared<bool>(false);
-    // Connect one body if it is the ACTIVE chain's block right after the view's
-    // best (any block while the view holds none). True iff it was connected.
-    auto utxo_try_connect =
-        [&header_chain, &utxo_cache, &utxo_db, &mempool, bip110_txid, BIP110_KEEP_DEPTH]
-        (const bip110::coin::BlockType& block) -> bool
-        {
+    {
+        bip110::coin::UtxoFollowHost fh;
+        fh.view = [&utxo_cache]() { return utxo_cache.get_best(); };
+        fh.tip_height = [&header_chain]() { return header_chain.height(); };
+        fh.active_at = [&header_chain](uint32_t h) -> std::optional<uint256> {
+            auto e = header_chain.get_header_by_height(h);
+            if (!e) return std::nullopt;
+            return e->block_hash;
+        };
+        fh.height_of = [&header_chain](const uint256& id) -> std::optional<uint32_t> {
+            auto e = header_chain.get_header(id);
+            if (!e) return std::nullopt;
+            return e->height;
+        };
+        // The connect itself (the follower checked utxo_connect_gate).
+        fh.connect = [&utxo_cache, &utxo_db, &mempool, bip110_txid, BIP110_KEEP_DEPTH]
+                     (const bip110::coin::BlockType& block, uint32_t height) -> bool {
             const uint256 block_hash =
                 bip110::coin::block_hash(static_cast<const bip110::coin::BlockHeaderType&>(block));
-            auto entry = header_chain.get_header(block_hash);
-            if (!entry) return false;               // header sync lagging — drop
-            uint32_t height = entry->height;
-            if (height <= utxo_cache.get_best_height()) return false;   // monotonic
-            // GAP4 continuity gate: only connect a block that extends the current
-            // view tip. A non-contiguous block means a reorg is pending — the
-            // tip-changed handler rolls the view back to the fork first, then the
-            // new branch re-connects contiguously from fork+1. Skip (named) here.
-            {
-                uint256 view_best = utxo_cache.get_best_block();
-                if (!view_best.IsNull() && block.m_previous_block != view_best) {
-                    LOG_WARNING << "[EMB-BIP110] utxo-connect skipped: non-contiguous "
-                                   "(reorg pending) h=" << height
-                                << " prev=" << block.m_previous_block.GetHex().substr(0, 16)
-                                << " view_best=" << view_best.GetHex().substr(0, 16);
-                    return false;
-                }
-            }
-            // Only the active chain's block: a competing block that extends the
-            // view is not connected while the header chain follows another one.
-            {
-                auto active = header_chain.get_header_by_height(height);
-                if (!active || active->block_hash != block_hash) {
-                    LOG_INFO << "[EMB-BIP110] utxo-connect skipped: not on the active chain h="
-                             << height << " hash=" << block_hash.GetHex().substr(0, 16);
-                    return false;
-                }
-            }
             try {
                 auto undo = utxo_cache.connect_block(block, height, bip110_txid, block_hash);
                 utxo_db.put_block_undo(height, undo);
@@ -1041,26 +1042,67 @@ int run_embedded(bool coin_p2p_discover,
                 return false;
             }
         };
-    // Bodies the connect could not apply when they came (a competing block, one
-    // of a branch not followed yet, one above a gap; bip110::coin::SideBodies):
-    // connected once they are the active chain's next block, after a connect
-    // and after the tip-changed handler rolls the view back to a fork.
-    auto side_bodies = std::make_shared<bip110::coin::SideBodies>(/*max=*/8);
-    auto utxo_connect_side = [side_bodies, utxo_try_connect]() {
-        side_bodies->connect_ready(utxo_try_connect);
-    };
-    auto utxo_connect_block =
-        [&header_chain, utxo_try_connect, utxo_connect_side, side_bodies]
-        (const bip110::coin::BlockType& block)
-        {
-            if (utxo_try_connect(block)) {
-                utxo_connect_side();   // a kept body may extend it now
-                return;
-            }
-            if (header_chain.has_header(
-                    bip110::coin::block_hash(static_cast<const bip110::coin::BlockHeaderType&>(block))))
-                side_bodies->keep(block);
+        // Kept bodies connected (their full_block pass ran when they came): the
+        // UTXO-based mempool passes on the connected view.
+        fh.after_kept = [&mempool, &utxo_cache]() {
+            mempool.revalidate_inputs(&utxo_cache);
+            mempool.recompute_unknown_fees(&utxo_cache);
         };
+        // ── GAP4 UTXO-view reorg handling ────────────────────────────────────
+        // The view is on an abandoned branch: flag it inconsistent (serve
+        // coinbase-only), roll the view back to the common ancestor via undo data
+        // (removing rolled-back coins, restoring the coins they spent;
+        // fail-closed on missing/legacy/too-deep undo or a record of another
+        // block), requarantine + re-price the mempool against the reconciled
+        // view, then clear the flag. A rolled-back coin can NEVER be
+        // priced/included afterwards (GAP2's inclusion rule is the 2nd wall). On
+        // failure the flag stays set until the follower re-anchors the view.
+        fh.rollback = [&utxo_cache, &utxo_db, &header_chain, &mempool, &utxo_consistent,
+                       BIP110_KEEP_DEPTH]() -> bool {
+            const uint32_t old_h = utxo_cache.get_best_height();
+            utxo_consistent.store(false, std::memory_order_relaxed);
+            const auto tip = header_chain.tip();
+            auto res = bip110::coin::reorg_disconnect_to_fork(
+                utxo_cache, utxo_db, header_chain, tip ? tip->block_hash : uint256(),
+                BIP110_KEEP_DEPTH);
+            if (res != bip110::coin::ReorgResult::OK) {
+                LOG_ERROR << "[EMB-BIP110] UTXO reorg FAILED ("
+                          << bip110::coin::reorg_result_name(res) << ") view_h=" << old_h
+                          << " tip_h=" << header_chain.height() << " — serving coinbase-only"
+                             " until the view is re-anchored (fail closed, never a wrong ledger)";
+                return false;
+            }
+            mempool.requarantine_all();
+            mempool.set_tip_height(utxo_cache.get_best_height());
+            mempool.recompute_unknown_fees(&utxo_cache);
+            mempool.revalidate_inputs(&utxo_cache);
+            utxo_consistent.store(true, std::memory_order_relaxed);
+            LOG_INFO << "[EMB-BIP110] UTXO reorg reconciled to fork h="
+                     << utxo_cache.get_best_height() << " (from h=" << old_h << ", tip h="
+                     << header_chain.height() << ")";
+            return true;
+        };
+        // Wipe the view (UTXOViewCache::reanchor: coins, undo records and the
+        // retained explorer bodies); the next connected block anchors it, as the
+        // first anchor. Every mempool price came from the old view.
+        fh.reanchor = [&utxo_cache, &mempool, &utxo_consistent]() -> bool {
+            if (!utxo_cache.reanchor())
+                return false;
+            mempool.requarantine_all();
+            mempool.recompute_unknown_fees(&utxo_cache);
+            utxo_consistent.store(true, std::memory_order_relaxed);
+            return true;
+        };
+        // The bodies come through the coin peer pool (built below).
+        fh.fetch = [&coin_pool](const std::vector<uint256>& ids) {
+            if (coin_pool)
+                coin_pool->fetch_bodies(ids);
+        };
+        utxo_follower = std::make_shared<bip110::coin::UtxoFollower>(std::move(fh));
+    }
+    auto utxo_connect_block = [utxo_follower](const bip110::coin::BlockType& block) {
+        utxo_follower->on_body(block);
+    };
     coin_node.full_block.subscribe(
         [&header_chain, &utxo_db, explorer_enabled, EXPLORER_DEPTH,
          utxo_connect_block, utxo_connect_by_pool]
@@ -1092,47 +1134,18 @@ int run_embedded(bool coin_p2p_discover,
             utxo_connect_block(block);
         });
 
-    // ── GAP4 UTXO-view reorg handling ───────────────────────────────────────
-    // On a fork-chain reorg the header chain fires on_tip_changed. If the view's
-    // best is already on the new chain this is a plain extension (no-op — the
-    // connect handler applies the new blocks). Otherwise the view is on an
-    // abandoned branch: flag it inconsistent (serve coinbase-only), roll the view
-    // back to the common ancestor via undo data (removing rolled-back coins,
-    // restoring the coins they spent; fail-closed on missing/legacy/too-deep
-    // undo or a record of another block), requarantine + re-price the mempool
-    // against the reconciled view, then clear the flag. A rolled-back coin can
-    // NEVER be priced/included afterwards (GAP2's inclusion rule is the 2nd wall).
+    // On a fork-chain reorg the header chain fires on_tip_changed: the follower
+    // offers its kept bodies first (a branch that just became active may extend
+    // the view: a plain extension rolls nothing back), then, if the view's best
+    // left the active chain, rolls the view back to the fork (fh.rollback) and
+    // offers them again.
     header_chain.set_on_tip_changed(
-        [&utxo_cache, &utxo_db, &header_chain, &mempool, &utxo_consistent, BIP110_KEEP_DEPTH,
-         utxo_connect_side]
-        (const uint256& /*old_tip*/, uint32_t old_h, const uint256& new_tip, uint32_t new_h)
+        [utxo_follower](const uint256& /*old_tip*/, uint32_t old_h, const uint256& /*new_tip*/,
+                        uint32_t new_h)
         {
-            uint256  view_best = utxo_cache.get_best_block();
-            uint32_t view_h    = utxo_cache.get_best_height();
-            if (view_best.IsNull()) return;    // nothing connected yet
-            auto active_at = header_chain.get_header_by_height(view_h);
-            if (active_at && active_at->block_hash == view_best)
-                return;                        // view already on the new chain — plain extension
-
-            utxo_consistent.store(false, std::memory_order_relaxed);
-            auto res = bip110::coin::reorg_disconnect_to_fork(
-                utxo_cache, utxo_db, header_chain, new_tip, BIP110_KEEP_DEPTH);
-            if (res != bip110::coin::ReorgResult::OK) {
-                LOG_ERROR << "[EMB-BIP110] UTXO reorg FAILED ("
-                          << bip110::coin::reorg_result_name(res) << ") old_h=" << old_h
-                          << " new_h=" << new_h << " — serving coinbase-only until view "
-                             "rebuild (fail closed, never a wrong ledger)";
-                return;   // leave utxo_consistent=false (until restart / rebuild)
-            }
-            // The new branch's blocks already received connect from fork+1.
-            utxo_connect_side();
-            mempool.requarantine_all();
-            mempool.set_tip_height(utxo_cache.get_best_height());
-            mempool.recompute_unknown_fees(&utxo_cache);
-            mempool.revalidate_inputs(&utxo_cache);
-            utxo_consistent.store(true, std::memory_order_relaxed);
-            LOG_INFO << "[EMB-BIP110] UTXO reorg reconciled to fork h="
-                     << utxo_cache.get_best_height() << " (new tip h=" << new_h << ")";
+            if (utxo_follower->on_tip_changed() == bip110::coin::UtxoFollower::TipChange::RollbackFailed)
+                LOG_WARNING << "[EMB-BIP110] UTXO view left on the old branch (old_h=" << old_h
+                            << " new_h=" << new_h << "): re-anchored by the next catch-up step";
         });
 
     // ── M3 mempool tx ingest ──────────────────────────────────────────────
@@ -1198,8 +1211,7 @@ int run_embedded(bool coin_p2p_discover,
             }
         });
 
-    // Peer discovery + explicit peers -> a shared candidate dialer with failover.
-    std::unique_ptr<bip110::coin::BtcCoinPeerManager> coin_peer_mgr;
+    // Peer discovery (the scored NODE_BLAKE2B peer manager; declared above).
     const std::string pm_dir = std::string(getenv("HOME") ? getenv("HOME") : ".")
                              + "/.c2pool/bip110/peers";
     if (coin_p2p_discover) {
@@ -1328,6 +1340,32 @@ int run_embedded(bool coin_p2p_discover,
     auto explicit_list = std::make_shared<std::vector<NetService>>(explicit_peers);
     std::shared_ptr<std::function<void()>> keepalive;   // the pool driver
     if (!explicit_peers.empty() || coin_peer_mgr) {
+        // An explicit peer given by host name is resolved (async, the asio
+        // resolver the dial path uses); its addresses take its place among the
+        // explicit peers (the pool dials addresses only).
+        for (const auto& ns : explicit_peers) {
+            if (!bip110::coin::is_peer_hostname(ns))
+                continue;
+            LOG_WARNING << "[EMB-BIP110] explicit fork peer " << ns.to_string()
+                        << " is a host name: resolving it (the coin peer pool dials addresses)";
+            auto resolver = std::make_shared<boost::asio::ip::tcp::resolver>(ioc);
+            resolver->async_resolve(
+                ns.address(), std::to_string(ns.port()),
+                [resolver, explicit_list, ns](const boost::system::error_code& ec,
+                                              boost::asio::ip::tcp::resolver::results_type results) {
+                    if (ec) {
+                        LOG_WARNING << "[EMB-BIP110] explicit fork peer " << ns.to_string()
+                                    << " not resolved (" << ec.message() << "): not dialed";
+                        return;
+                    }
+                    std::vector<NetService> addrs;
+                    for (const auto& r : results)
+                        addrs.emplace_back(r.endpoint().address().to_string(), r.endpoint().port());
+                    const size_t n = bip110::coin::add_resolved_peers(*explicit_list, ns, addrs);
+                    LOG_INFO << "[EMB-BIP110] explicit fork peer " << ns.to_string()
+                             << " resolved: " << n << " address(es) added";
+                });
+        }
         auto* mgr = coin_peer_mgr.get();
         std::weak_ptr<bip110::coin::p2p::InboundListener<MiniConfig>> weak_il = inbound_listener;
         bip110::coin::CoinPeerPoolHost ph;
@@ -1409,7 +1447,7 @@ int run_embedded(bool coin_p2p_discover,
         // A pooled block body goes on only if it was asked for, its header is in
         // the chain and it matches that header and the BIP-110 block rules; the
         // RDTS weight cap by the parent's median time past (header chain).
-        ph.body_valid = [&header_chain](const bip110::coin::BlockType& b) {
+        auto rdts_cap_for = [&header_chain](const bip110::coin::BlockType& b) {
             const auto mtp = bip110::coin::parent_median_time_past(
                 b.m_previous_block,
                 [&header_chain](const uint256& h) -> std::optional<bip110::coin::BlockHeaderType> {
@@ -1417,8 +1455,29 @@ int run_embedded(bool coin_p2p_discover,
                     if (!e) return std::nullopt;
                     return e->header;
                 });
-            return bip110::coin::block_body_matches_header(
-                b, bip110::coin::rdts_weight_cap_applies(b, mtp));
+            return bip110::coin::rdts_weight_cap_applies(b, mtp);
+        };
+        ph.body_valid = [rdts_cap_for](const bip110::coin::BlockType& b) {
+            return bip110::coin::block_body_matches_header(b, rdts_cap_for(b));
+        };
+        // Bodies from two or more peers that pass every c2pool-btc check and
+        // fail only a BIP-110 rule (the committed transaction count, the RDTS
+        // weight cap): an ERROR naming the rule (BodyRuleAlarm: once per block,
+        // at most every 10 min), so a rule of ours the fork network does not
+        // share shows at once.
+        auto rule_alarm = std::make_shared<bip110::coin::BodyRuleAlarm>();
+        ph.on_bad_body = [rdts_cap_for, rule_alarm](const bip110::coin::BlockType& b, size_t peers) {
+            if (peers < 2)
+                return;
+            const auto rule = bip110::coin::block_body_rule(b, rdts_cap_for(b));
+            const uint256 id = bip110::coin::block_hash(
+                static_cast<const bip110::coin::BlockHeaderType&>(b));
+            if (rule_alarm->should_log(id, rule, peers, std::chrono::steady_clock::now()))
+                LOG_ERROR << "[EMB-BIP110] block " << id.GetHex().substr(0, 16) << ": bodies from "
+                          << peers << " fork peers pass every Bitcoin check and fail only the"
+                             " BIP-110 " << bip110::coin::body_rule_name(rule) << " rule -- if"
+                             " the fork network accepts this block, that rule does not match"
+                             " the network's";
         };
         ph.body_best_height = [&utxo_cache]() -> std::optional<uint32_t> {
             if (utxo_cache.get_best_block().IsNull()) return std::nullopt;
@@ -1457,19 +1516,25 @@ int run_embedded(bool coin_p2p_discover,
         // Every kCoinPoolPollSec the pool's poll(): block-body retries and the
         // chain-order hold; every kCoinPoolTickSec its full tick: slot upkeep +
         // refill, and the header-source step over the whole pool
-        // (header_source_step: progress = the header tip, from any peer). Weak
-        // self-ref avoids a shared_ptr cycle; `keepalive` holds it.
+        // (header_source_step: progress = the header tip, from any peer). Then,
+        // once header sync is caught up, the UTXO view's catch-up step
+        // (UtxoFollower::catch_up: the next bodies while the view is behind the
+        // tip, a re-anchor when it is too far behind or off the active chain).
+        // Weak self-ref avoids a shared_ptr cycle; `keepalive` holds it.
         auto pool_timer = std::make_shared<io::steady_timer>(ioc);
         auto schedule_pool = std::make_shared<std::function<void()>>();
         std::weak_ptr<std::function<void()>> weak_pool = schedule_pool;
         auto* pool_ptr = coin_pool.get();
-        *schedule_pool = [pool_timer, weak_pool, pool_ptr]() {
+        *schedule_pool = [pool_timer, weak_pool, pool_ptr, utxo_follower, hdr_caught_up]() {
             pool_timer->expires_after(
                 std::chrono::seconds(static_cast<int>(bip110::coin::kCoinPoolPollSec)));
-            pool_timer->async_wait([weak_pool, pool_ptr](const boost::system::error_code& ec) {
+            pool_timer->async_wait([weak_pool, pool_ptr, utxo_follower, hdr_caught_up]
+                                   (const boost::system::error_code& ec) {
                 if (ec) return;
                 try {
                     pool_ptr->poll();
+                    if (*hdr_caught_up)
+                        utxo_follower->catch_up();
                 } catch (const std::exception& e) {
                     LOG_WARNING << "[EMB-BIP110] coin peer pool tick error: " << e.what();
                 }
@@ -1571,8 +1636,11 @@ int run_embedded(bool coin_p2p_discover,
                 for (const auto& k : coin_pool->slot_keys())
                     pooled.insert(k);
             std::vector<NetService> targets;
-            // Explicit fork peers first (the operator's pinned NODE_BLAKE2B set).
-            for (const auto& ep : *explicit_list) targets.push_back(ep);
+            // Explicit fork peers first (the operator's pinned NODE_BLAKE2B set);
+            // with the pool, a host-name entry by its resolved addresses only.
+            for (const auto& ep : *explicit_list)
+                if (!coin_pool || !bip110::coin::is_peer_hostname(ep))
+                    targets.push_back(ep);
             // Then the addrman tried set (NODE_BLAKE2B-filtered, scored).
             if (coin_peer_mgr)
                 for (const auto& ep : coin_peer_mgr->get_tried_peers(/*max_count=*/16))

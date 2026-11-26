@@ -22,6 +22,9 @@
 //   [E] when the cap applies: a v2 block whose parent's median time past is
 //       before RDTS_EXPIRY_TIME, or unknown; not at or after it; never a v1
 //       block. parent_median_time_past is Core's median of 11.
+//   [F] block_body_rule names the rule a body breaks (the c2pool-btc checks
+//       first); BodyRuleAlarm logs a block whose bodies from 2+ peers fail
+//       only a BIP-110 rule, once per block and at most every 10 minutes.
 //
 // Pure decode / hash test: no node, no network.
 
@@ -36,6 +39,7 @@
 #include <core/pack.hpp>
 #include <core/uint256.hpp>
 
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <map>
@@ -339,6 +343,44 @@ int run_block_body_check_kat()
         uint256 unknown;
         unknown.SetHex("00000000000000000000000000000000000000000000000000000000000000ff");
         CHECK(!parent_median_time_past(unknown, lookup), "[E] an unknown parent: no median time");
+    }
+
+    // ── [F] the rule a body breaks; the alarm ─────────────────────────────────
+    {
+        BlockType ok = make_v2_block(970005, {make_spend(0)});
+        CHECK(block_body_rule(ok, true) == BodyRule::Ok, "[F] a matching body: ok");
+        BlockType root = ok;
+        root.m_merkle_root.SetHex("00000000000000000000000000000000000000000000000000000000000000ee");
+        root.m_txcount = 9;
+        CHECK(block_body_rule(root, true) == BodyRule::Header,
+              "[F] a wrong merkle root (and count): the c2pool-btc check is named first");
+        BlockType count = ok;
+        count.m_txcount = 3;
+        CHECK(block_body_rule(count, true) == BodyRule::TxCount, "[F] the committed count");
+        BlockType heavy = make_v2_block(970005, {make_spend(0, 100000), make_spend(1, 100000)});
+        CHECK(block_body_rule(heavy, true) == BodyRule::Weight
+                  && block_body_rule(heavy, false) == BodyRule::Ok,
+              "[F] the RDTS weight cap (and none once it no longer applies)");
+        CHECK(std::string(body_rule_name(BodyRule::TxCount)) == "committed transaction count"
+                  && std::string(body_rule_name(BodyRule::Weight)) == "RDTS weight cap",
+              "[F] the rules are named");
+
+        BodyRuleAlarm alarm;
+        const auto t0 = BodyRuleAlarm::Clock::time_point{} + std::chrono::hours(10);
+        uint256 b1, b2, b3;
+        b1.SetHex("00000000000000000000000000000000000000000000000000000000000000b1");
+        b2.SetHex("00000000000000000000000000000000000000000000000000000000000000b2");
+        b3.SetHex("00000000000000000000000000000000000000000000000000000000000000b3");
+        CHECK(!alarm.should_log(b1, BodyRule::TxCount, 1, t0), "[F] one peer: no alarm");
+        CHECK(!alarm.should_log(b1, BodyRule::Header, 3, t0),
+              "[F] a c2pool-btc check failing: no alarm (the pool's own error covers it)");
+        CHECK(alarm.should_log(b1, BodyRule::TxCount, 2, t0), "[F] two peers, only the count: alarm");
+        CHECK(!alarm.should_log(b1, BodyRule::TxCount, 3, t0 + std::chrono::hours(1)),
+              "[F] the same block again: no second alarm");
+        CHECK(!alarm.should_log(b2, BodyRule::Weight, 2, t0 + std::chrono::seconds(599)),
+              "[F] another block within 10 minutes: no alarm");
+        CHECK(alarm.should_log(b3, BodyRule::Weight, 2, t0 + std::chrono::seconds(600)),
+              "[F] after 10 minutes: alarm, the weight rule");
     }
 
     std::printf("%s\n", g_fail == 0 ? "bip110_block_body_check_kat PASS" : "bip110_block_body_check_kat FAIL");

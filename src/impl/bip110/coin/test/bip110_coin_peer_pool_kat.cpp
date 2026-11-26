@@ -30,12 +30,29 @@
 //   [H] a won block goes to every connected peer; the same bytes once per
 //       kCoinPoolRelayDedupSec, different bytes for the same header both.
 //   [I] request_txs (the mempool's parent fetches) asks one connected peer,
-//       the next one each call; slot_keys lists dialing and connected slots.
+//       the next one each call, all of them in one request (one getdata);
+//       slot_keys lists dialing and connected slots.
 //   [J] a transaction is fetched once by txid and passed on once.
-//   [K] a reorg onto a branch whose block was received while it competed:
-//       with main_bip110's connect gate (contiguous, active chain only) the
-//       kept body (SideBodies) connects after the rollback and the branch's
-//       next block follows; without it the view stays at the fork.
+//   [K] the UTXO view's follower (UtxoFollower) over the real pool: a reorg
+//       onto a branch whose block was received while it competed (the kept
+//       body connects after the rollback, then the branch's next block).
+//   [L] the view at the fork point when the other branch wins without a
+//       rollback: the kept body connects on the tip change (before the
+//       plain-extension return), or after the child's body fails to connect.
+//   [M] a 20-block gap: the catch-up step fetches the active chain's next 4
+//       blocks (fetch_bodies) until the view is at the tip; the serve gate is
+//       closed while the view is behind.
+//   [N] a gap past kReanchorGap: the view is re-anchored and the tip's body
+//       fetched; it anchors the view at the tip.
+//   [O] an empty view anchors at the tip's body (catch-up); a view whose best
+//       left the active chain without a tip change (a restart) is rolled
+//       back, or re-anchored if the rollback fails.
+//   [P] fetch_bodies: a block below the fetch window is fetched; a pending or
+//       held one is left alone; a received one is asked again and connects
+//       without a second full_block pass; never asked of a peer that sent a
+//       bad body.
+//   [Q] on_bad_body: once per peer and block, with the number of such peers.
+//   [R] utxo_connect_gate and utxo_view_fresh.
 //
 // No node, no network.
 
@@ -45,7 +62,7 @@
 #include <impl/bip110/coin/mempool.hpp>
 #include <impl/bip110/coin/template_builder.hpp>
 #include <impl/bip110/coin/transaction.hpp>
-#include <impl/bip110/coin/utxo_side_bodies.hpp>
+#include <impl/bip110/coin/utxo_follow.hpp>
 
 #include <core/hash.hpp>
 #include <core/netaddress.hpp>
@@ -186,8 +203,12 @@ struct Harness {
     std::vector<uint256> late_connects;
     int forwarded_txs = 0;
     int announced = 0;
-    // Replaces the UTXO-connect model of on_body_in_order (optional).
+    // Replaces the UTXO-connect model of on_body_in_order (optional), and
+    // the body consumer's best height.
     std::function<void(const BlockType&)> connect_override;
+    std::function<std::optional<uint32_t>()> best_override;
+    // on_bad_body reports: (block identity, bad peers).
+    std::vector<std::pair<uint256, size_t>> bad_reports;
     std::unique_ptr<CoinPeerPool> pool;
 
     explicit Harness(size_t n_candidates = 20);
@@ -247,6 +268,12 @@ struct FakePeer : PoolPeer {
     }
     void request_block(const uint256& h) override { requested.push_back(h); }
     void request_tx(const uint256& h) override { requested_txs.push_back(h); }
+    std::vector<std::vector<uint256>> tx_batches;
+    void request_txs(const std::vector<uint256>& txids) override
+    {
+        tx_batches.push_back(txids);
+        PoolPeer::request_txs(txids);
+    }
 
     void send_headers(const std::vector<BlockHeaderType>& hdrs)
     {
@@ -300,7 +327,12 @@ Harness::Harness(size_t n_candidates)
     // The production check: the c2pool-btc rules plus the BIP-110 rules.
     h.body_valid = [this](const BlockType& b) { return block_body_matches_header(b, rdts_cap); };
     h.body_best_height = [this]() -> std::optional<uint32_t> {
+        if (best_override)
+            return best_override();
         return track_utxo ? utxo_best : std::nullopt;
+    };
+    h.on_bad_body = [this](const BlockType& b, size_t peers) {
+        bad_reports.emplace_back(block_hash(b), peers);
     };
     h.on_headers = [this](const std::vector<BlockHeaderType>& hdrs) {
         forwarded.push_back(hdrs);
@@ -354,6 +386,117 @@ size_t asks_for(Harness& hx, const uint256& h)
         n += p->asked_for(h);
     return n;
 }
+
+/// A UTXO view for UtxoFollower over a Harness: the active chain, the view's
+/// best, its connect / rollback / re-anchor, and the pool's fetch_bodies.
+struct ViewModel {
+    Harness& hx;
+    std::map<uint32_t, uint256> active;          // the active chain
+    std::map<uint256, uint256> parent;           // id -> parent
+    std::map<uint256, BlockType> bodies;         // id -> body, for delivery
+    uint256 best;                                // the view (null: empty)
+    uint32_t best_h = 0;
+    std::vector<uint256> connected;
+    int rollbacks = 0, reanchors = 0, kept_passes = 0;
+    bool rollback_ok = true;
+    std::unique_ptr<UtxoFollower> f;
+
+    explicit ViewModel(Harness& h) : hx(h)
+    {
+        active[hx.height] = hx.root;
+        best = hx.root;
+        best_h = hx.height;
+        UtxoFollowHost fh;
+        fh.view = [this]() { return std::make_pair(best, best_h); };
+        fh.tip_height = [this]() { return hx.height; };
+        fh.active_at = [this](uint32_t at) -> std::optional<uint256> {
+            auto it = active.find(at);
+            if (it == active.end()) return std::nullopt;
+            return it->second;
+        };
+        fh.height_of = [this](const uint256& id) -> std::optional<uint32_t> {
+            auto it = hx.chain.find(id);
+            if (it == hx.chain.end()) return std::nullopt;
+            return it->second;
+        };
+        fh.connect = [this](const BlockType& b, uint32_t at) {
+            best = block_hash(b);
+            best_h = at;
+            connected.push_back(best);
+            return true;
+        };
+        fh.after_kept = [this]() { ++kept_passes; };
+        fh.rollback = [this]() {
+            ++rollbacks;
+            if (!rollback_ok)
+                return false;
+            while (!best.IsNull()) {
+                auto it = active.find(best_h);
+                if (it != active.end() && it->second == best)
+                    break;
+                best = parent[best];
+                --best_h;
+            }
+            return true;
+        };
+        fh.reanchor = [this]() {
+            ++reanchors;
+            best.SetNull();
+            best_h = 0;
+            return true;
+        };
+        fh.fetch = [this](const std::vector<uint256>& ids) { hx.pool->fetch_bodies(ids); };
+        fh.now = [this]() { return hx.t; };
+        f = std::make_unique<UtxoFollower>(std::move(fh));
+        hx.connect_override = [this](const BlockType& b) { f->on_body(b); };
+        hx.best_override = [this]() -> std::optional<uint32_t> {
+            if (best.IsNull()) return std::nullopt;
+            return best_h;
+        };
+    }
+
+    /// A header into the chain; `tip`: it is the header tip (and its branch
+    /// the active chain from its height down to `fork_h`).
+    void header(const BlockType& b, bool tip)
+    {
+        hx.add(b);
+        const uint256 id = block_hash(b);
+        parent[id] = b.m_previous_block;
+        bodies[id] = b;
+        if (!tip)
+            return;
+        hx.tip_hash = id;
+        hx.height = hx.chain[id];
+        uint256 at = id;
+        for (uint32_t h = hx.height; active.count(h) == 0 || active[h] != at; --h) {
+            active[h] = at;
+            at = parent[at];
+            if (at.IsNull() || !hx.chain.count(at))
+                break;
+        }
+        for (auto it = active.upper_bound(hx.height); it != active.end();)
+            it = active.erase(it);
+    }
+
+    /// Deliver every body the pool asked of a connected peer and that was not
+    /// delivered yet; returns the number delivered.
+    size_t deliver_requested(std::set<std::pair<std::string, size_t>>& done)
+    {
+        size_t n = 0;
+        for (auto& [key, p] : hx.peers) {
+            for (size_t i = 0; i < p->requested.size(); ++i) {
+                if (!done.insert({key, i}).second)
+                    continue;
+                auto it = bodies.find(p->requested[i]);
+                if (it == bodies.end())
+                    continue;
+                p->hooks.full_block(it->second);
+                ++n;
+            }
+        }
+        return n;
+    }
+};
 
 } // namespace
 
@@ -425,6 +568,25 @@ int run_coin_peer_pool_kat()
         CHECK(none.empty(), "[C] no explicit peers and no manager: no candidates");
         const auto only_explicit = pool_candidates(explicit_peers, {}, {}, nullptr);
         CHECK(only_explicit.size() == 2, "[C] explicit peers alone (no discovery)");
+        // A host-name entry: resolved addresses take its place.
+        CHECK(is_peer_hostname(NetService("seed.example.org", 8333))
+                  && !is_peer_hostname(NetService("203.0.113.7", 8333))
+                  && !is_peer_hostname(NetService("2001:db8::1", 8333))
+                  && !is_peer_hostname(NetService("0.0.0.0", 8333)),
+              "[C] a host name is told from an IP literal");
+        std::vector<NetService> list = {NetService("203.0.113.7", 8333),
+                                        NetService("seed.example.org", 8333),
+                                        NetService("198.51.100.2", 9333)};
+        const size_t added = add_resolved_peers(
+            list, NetService("seed.example.org", 8333),
+            {NetService("192.0.2.20", 8333), NetService("203.0.113.7", 8333), NetService("192.0.2.21", 8333)});
+        std::vector<std::string> order;
+        for (const auto& ep : pool_candidates(list, {}, {}, nullptr))
+            order.push_back(ep.to_string());
+        CHECK(added == 2
+                  && (order == std::vector<std::string>{"203.0.113.7:8333", "192.0.2.20:8333",
+                                                        "192.0.2.21:8333", "198.51.100.2:9333"}),
+              "[C] its addresses keep its place among the explicit peers, each once");
     }
 
     // ── [D] headers from any peer ─────────────────────────────────────────────
@@ -619,6 +781,12 @@ int run_coin_peer_pool_kat()
                     asked.insert(k);
         }
         CHECK(asked.size() == 3, "[I] three calls asked the three connected peers in turn");
+        bool one_batch = true;
+        for (auto& [k, p] : hx.peers)
+            if (p->hs)
+                one_batch = one_batch && p->tx_batches.size() == 1
+                            && (p->tx_batches[0] == std::vector<uint256>{a, b});
+        CHECK(one_batch, "[I] each call is one request for both transactions");
         const auto keys = hx.pool->slot_keys();
         CHECK(keys.size() == 8, "[I] slot_keys lists dialing and connected slots");
         bool all = true;
@@ -643,72 +811,295 @@ int run_coin_peer_pool_kat()
     }
 
     // ── [K] a reorg onto a branch received while it competed ──────────────────
-    for (const bool keep_side : {true, false}) {
+    {
         Harness hx;
-        hx.track_utxo = true;
-        hx.utxo_best = 970000;
-        uint256 view_best = hx.root;
-        std::map<uint32_t, uint256> active = {{970000, hx.root}};
-        SideBodies side(8);
-        // main_bip110's utxo_try_connect gate: above the best, contiguous, the
-        // active chain's block.
-        auto try_connect = [&](const BlockType& b) -> bool {
-            const uint256 id = block_hash(b);
-            auto it = hx.chain.find(id);
-            if (it == hx.chain.end() || it->second <= *hx.utxo_best)
-                return false;
-            if (b.m_previous_block != view_best)
-                return false;
-            if (active[it->second] != id)
-                return false;
-            view_best = id;
-            hx.utxo_best = it->second;
-            return true;
-        };
-        hx.connect_override = [&](const BlockType& b) {
-            if (try_connect(b))
-                side.connect_ready(try_connect);
-            else if (keep_side)
-                side.keep(b);
-        };
+        ViewModel vm(hx);
         hx.pool->tick();
         handshake(hx, 2);
         auto live = handshaked_peers(hx);
         const BlockType a1 = make_block(hx.root, 970001, 61, {make_spend(11)});
-        hx.add(a1);
-        active[970001] = block_hash(a1);
+        vm.header(a1, true);
+        vm.f->on_tip_changed();
         live[0]->hooks.fetch(block_hash(a1), true);
         live[0]->hooks.full_block(a1);
-        const bool a1_in = view_best == block_hash(a1);
+        const bool a1_in = vm.best == block_hash(a1);
         // A competing block at the same height: fetched (its mempool pass),
-        // not connected.
+        // kept, not connected.
         const BlockType b1 = make_block(hx.root, 970001, 62, {make_spend(12)});
-        hx.add(b1);
+        vm.header(b1, false);
         const bool b1_fetched = live[1]->hooks.fetch(block_hash(b1), true);
         live[1]->hooks.full_block(b1);
-        const bool b1_kept = side.holds(block_hash(b1));
-        // b2 on b1: the header chain follows b; the tip-changed handler rolls
-        // the view back to the fork and connects the kept bodies.
+        CHECK(a1_in && b1_fetched && vm.f->keeps(block_hash(b1)) && vm.best == block_hash(a1),
+              "[K] the competing block's body is fetched and kept, not connected");
+        // b2 on b1: the chain follows b; the tip change rolls the view back to
+        // the fork and connects the kept body; b2's body follows.
         const BlockType b2 = make_block(block_hash(b1), 970002, 63, {make_spend(13)});
-        hx.add(b2);
-        active[970001] = block_hash(b1);
-        active[970002] = block_hash(b2);
-        view_best = hx.root;
-        hx.utxo_best = 970000;
-        side.connect_ready(try_connect);
+        vm.header(b2, true);
+        CHECK(vm.f->on_tip_changed() == UtxoFollower::TipChange::RolledBack && vm.rollbacks == 1
+                  && vm.best == block_hash(b1),
+              "[K] the tip change rolls the view back and the kept body connects");
         live[0]->hooks.fetch(block_hash(b2), true);
         live[0]->hooks.full_block(b2);
+        CHECK(vm.best == block_hash(b2) && vm.best_h == 970002 && vm.f->fresh(),
+              "[K] the branch's next block follows; the view is at the tip");
+    }
+
+    // ── [L] the view at the fork point; the other branch wins, no rollback ───
+    for (const bool tip_change_first : {true, false}) {
+        Harness hx;
+        ViewModel vm(hx);   // the view at P (the root)
+        hx.pool->tick();
+        handshake(hx, 2);
+        auto live = handshaked_peers(hx);
+        const BlockType a = make_block(hx.root, 970001, 71, {make_spend(21)});
+        const BlockType b = make_block(hx.root, 970001, 72, {make_spend(22)});
+        vm.header(a, true);
+        vm.f->on_tip_changed();
+        CHECK(live[0]->hooks.fetch(block_hash(a), true), "[L] a's body is fetched");
+        vm.header(b, true);   // the equal-work switch: b is the tip
+        vm.f->on_tip_changed();
+        live[0]->hooks.full_block(a);
+        CHECK(vm.best == hx.root && vm.f->keeps(block_hash(a)),
+              "[L] a's body is kept (b is the active block), the view stays at P");
+        // a2 on a: a's branch wins; the view's best P is still on the active
+        // chain (no rollback).
+        const BlockType a2 = make_block(block_hash(a), 970002, 73, {make_spend(23)});
+        vm.header(a2, true);
+        if (tip_change_first) {
+            CHECK(vm.f->on_tip_changed() == UtxoFollower::TipChange::None && vm.rollbacks == 0
+                      && vm.best == block_hash(a),
+                  "[L] the tip change connects the kept a before the plain-extension return");
+        }
+        live[1]->hooks.fetch(block_hash(a2), true);
+        live[1]->hooks.full_block(a2);
         hx.advance(btc::coin::kCoinPoolBodyHoldSec);
         hx.pool->poll();
-        if (keep_side) {
-            CHECK(a1_in && b1_fetched && b1_kept,
-                  "[K] the competing block's body was fetched and kept, not connected");
-            CHECK(view_best == block_hash(b2) && hx.utxo_best == std::optional<uint32_t>(970002),
-                  "[K] after the rollback the kept body connects and the branch's next follows");
-        } else {
-            CHECK(view_best == hx.root,
-                  "[K] without the kept body the view stays at the fork (why it is kept)");
+        CHECK(vm.best == block_hash(a2) && vm.best_h == 970002,
+              tip_change_first ? "[L] then a2's body connects"
+                               : "[L] without the tip change: a2's body connects a, then a2");
+    }
+
+    // ── [M] a 20-block gap: the catch-up step ────────────────────────────────
+    {
+        Harness hx;
+        ViewModel vm(hx);
+        hx.pool->tick();
+        handshake(hx, 3);
+        uint256 prev = hx.root;
+        std::vector<BlockType> chain20;
+        for (uint32_t i = 1; i <= 20; ++i) {
+            chain20.push_back(make_block(prev, 970000 + i, 800 + i, {make_spend(100 + i)}));
+            prev = block_hash(chain20.back());
         }
+        for (const auto& blk : chain20)
+            vm.header(blk, true);
+        CHECK(!vm.f->fresh(), "[M] 20 blocks behind: the serve gate's view term is closed");
+        // The tip's body comes by announcement first (the gap is too large for
+        // the pool's hold): kept.
+        auto live = handshaked_peers(hx);
+        CHECK(live[0]->hooks.fetch(block_hash(chain20.back()), true), "[M] the tip's body is fetched");
+        live[0]->hooks.full_block(chain20.back());
+        CHECK(vm.f->keeps(block_hash(chain20.back())), "[M] ... and kept");
+        std::set<std::pair<std::string, size_t>> done;
+        bool bounded = true, ordered = true;
+        int steps = 0;
+        for (; steps < 20 && vm.best != block_hash(chain20.back()); ++steps) {
+            const auto step = vm.f->catch_up();
+            bounded = bounded && step.fetched.size() <= UtxoFollower::kInFlight;
+            if (step.step != UtxoFollower::Step::Fetch)
+                ordered = false;
+            vm.deliver_requested(done);
+            hx.advance(3);
+            hx.pool->poll();
+        }
+        CHECK(bounded && ordered, "[M] each step fetches at most 4 bodies of the active chain");
+        CHECK(vm.best == block_hash(chain20.back()) && vm.best_h == 970020,
+              "[M] the view reaches the tip (the kept tip body connects last)");
+        bool in_order = vm.connected.size() == 20;
+        for (size_t i = 0; in_order && i < 20; ++i)
+            in_order = vm.connected[i] == block_hash(chain20[i]);
+        CHECK(in_order, "[M] the 20 blocks connect in chain order");
+        CHECK(vm.f->fresh(), "[M] at the tip: the serve gate's view term is open");
+    }
+
+    // ── [N] a gap past kReanchorGap: re-anchor ────────────────────────────────
+    {
+        Harness hx;
+        ViewModel vm(hx);
+        hx.pool->tick();
+        handshake(hx, 2);
+        uint256 prev = hx.root;
+        BlockType last;
+        for (uint32_t i = 1; i <= UtxoFollower::kReanchorGap + 12; ++i) {
+            last = make_block(prev, 970000 + i, 5000 + i);
+            prev = block_hash(last);
+            vm.header(last, true);
+        }
+        const auto step = vm.f->catch_up();
+        CHECK(step.step == UtxoFollower::Step::Reanchor && vm.reanchors == 1 && vm.best.IsNull()
+                  && step.fetched == std::vector<uint256>{block_hash(last)},
+              "[N] 300 behind: the view is re-anchored and the tip's body fetched");
+        std::set<std::pair<std::string, size_t>> done;
+        vm.deliver_requested(done);
+        CHECK(vm.best == block_hash(last) && vm.f->fresh(),
+              "[N] the tip's body anchors the view at the tip");
+    }
+
+    // ── [O] the first anchor; a view off the active chain at catch-up ─────────
+    {
+        Harness hx;
+        ViewModel vm(hx);
+        vm.best.SetNull();   // an empty view (the live case after the fork)
+        vm.best_h = 0;
+        hx.pool->tick();
+        handshake(hx, 2);
+        const BlockType t1 = make_block(hx.root, 970001, 91, {make_spend(31)});
+        vm.header(t1, true);
+        CHECK(!vm.f->fresh(), "[O] an empty view: the serve gate's view term is closed");
+        const auto step = vm.f->catch_up();
+        CHECK(step.step == UtxoFollower::Step::Anchor
+                  && step.fetched == std::vector<uint256>{block_hash(t1)},
+              "[O] an empty view: the tip's body is fetched");
+        std::set<std::pair<std::string, size_t>> done;
+        vm.deliver_requested(done);
+        CHECK(vm.best == block_hash(t1) && vm.f->fresh(), "[O] ... and anchors the view");
+        // The chain moves to another branch while the view is not told (a
+        // restart): the catch-up step rolls back.
+        const BlockType u1 = make_block(hx.root, 970001, 92, {make_spend(32)});
+        const BlockType u2 = make_block(block_hash(u1), 970002, 93, {make_spend(33)});
+        vm.header(u1, false);
+        vm.header(u2, true);
+        const auto back = vm.f->catch_up();
+        CHECK(back.step == UtxoFollower::Step::Rollback && vm.rollbacks == 1 && vm.best == hx.root,
+              "[O] the view's best off the active chain: rolled back to the fork");
+        // A view off the chain whose rollback fails: re-anchored.
+        Harness hy;
+        ViewModel vy(hy);
+        vy.rollback_ok = false;
+        const BlockType x1 = make_block(hy.root, 970001, 94);
+        const BlockType y1 = make_block(hy.root, 970001, 95);
+        vy.header(x1, true);
+        vy.best = block_hash(x1);
+        vy.best_h = 970001;
+        vy.header(y1, true);
+        const auto ra = vy.f->catch_up();
+        CHECK(ra.step == UtxoFollower::Step::Reanchor && vy.rollbacks == 1 && vy.reanchors == 1,
+              "[O] a failed rollback: the view is re-anchored");
+    }
+
+    // ── [P] fetch_bodies ──────────────────────────────────────────────────────
+    {
+        Harness hx;
+        hx.pool->tick();
+        handshake(hx, 3);
+        auto live = handshaked_peers(hx);
+        uint256 prev = hx.root;
+        std::vector<BlockType> c;
+        for (uint32_t i = 1; i <= 12; ++i) {
+            c.push_back(make_block(prev, 970000 + i, 600 + i, {make_spend(200 + i)}));
+            prev = block_hash(c.back());
+            hx.add(c.back());
+        }
+        const uint256 old_id = block_hash(c[0]);   // 12 below the tip: no announcement fetch
+        CHECK(!live[0]->hooks.fetch(old_id, true), "[P] an announced block 12 below the tip is not fetched");
+        CHECK(hx.pool->fetch_bodies({old_id}) == 1 && asks_for(hx, old_id) == 1,
+              "[P] fetch_bodies asks for it");
+        CHECK(hx.pool->fetch_bodies({old_id}) == 0, "[P] a pending one is left to its retries");
+        uint256 unknown;
+        unknown.SetHex("00000000000000000000000000000000000000000000000000000000000beef1");
+        CHECK(hx.pool->fetch_bodies({unknown}) == 0, "[P] a block whose header is not held is not asked");
+        FakePeer* asked = nullptr;
+        for (auto* p : live)
+            if (p->asked_for(old_id))
+                asked = p;
+        asked->hooks.full_block(c[0]);
+        CHECK(hx.connected_blocks == std::vector<uint256>{old_id}
+                  && hx.forwarded_blocks == std::vector<uint256>{old_id},
+              "[P] it is delivered (connect, full_block)");
+        CHECK(hx.pool->fetch_bodies({old_id}) == 1, "[P] a received one is asked again");
+        for (auto* p : live)
+            if (!p->requested.empty() && p->requested.back() == old_id)
+                p->hooks.full_block(c[0]);
+        CHECK(hx.connected_blocks.size() == 2 && hx.forwarded_blocks.size() == 1,
+              "[P] ... and connects again without a second full_block pass");
+        // A tip body three peers sent bad: on_bad_body per peer ([Q] below).
+        const BlockType skew = make_block(prev, 970013, 699, {make_spend(299)}, uint16_t{9});
+        hx.add(skew);
+        const uint256 sid = block_hash(skew);
+        CHECK(live[0]->hooks.fetch(sid, true), "[P] the skewed tip body is fetched");
+        live[0]->hooks.full_block(skew);
+        FakePeer* reasked = live[1]->asked_for(sid) ? live[1] : live[2];
+        reasked->hooks.full_block(skew);
+        FakePeer* third = reasked == live[1] ? live[2] : live[1];
+        third->hooks.full_block(skew);
+        // A received body is never asked again of a peer that sent a bad one.
+        {
+            Harness h2;
+            h2.pool->tick();
+            handshake(h2, 2);
+            auto l2 = handshaked_peers(h2);
+            const BlockType v = make_block(h2.root, 970001, 690, {make_spend(290)});
+            h2.add(v);
+            const uint256 vid = block_hash(v);
+            CHECK(l2[0]->hooks.fetch(vid, true), "[P] a body is fetched");
+            BlockType junk = v;
+            junk.m_txs[1].vout[0].value += 1;   // the merkle root no longer matches
+            l2[0]->hooks.full_block(junk);
+            l2[1]->hooks.full_block(v);
+            // Twice, so the round robin starts at each peer once.
+            const size_t a0 = l2[0]->asked_for(vid), a1 = l2[1]->asked_for(vid);
+            bool asked_ok = true;
+            for (int round = 0; round < 2; ++round) {
+                asked_ok = asked_ok && h2.pool->fetch_bodies({vid}) == 1;
+                l2[1]->hooks.full_block(v);   // received again
+            }
+            CHECK(asked_ok && l2[0]->asked_for(vid) == a0 && l2[1]->asked_for(vid) == a1 + 2,
+                  "[P] asked again of the peer that sent the good body, never the bad one");
+        }
+
+        // ── [Q] on_bad_body ───────────────────────────────────────────────────
+        size_t reports = 0;
+        std::vector<size_t> counts;
+        for (const auto& [id, n] : hx.bad_reports)
+            if (id == sid) {
+                ++reports;
+                counts.push_back(n);
+            }
+        CHECK((counts == std::vector<size_t>{1, 2, 3}),
+              "[Q] one report per peer that sent a bad body, with the count so far");
+        live[0]->hooks.full_block(skew);
+        size_t again = 0;
+        for (const auto& [id, n] : hx.bad_reports)
+            if (id == sid) ++again;
+        CHECK(reports == 3 && again == 3, "[Q] the same peer again: no second report");
+    }
+
+    // ── [R] the connect gate and the freshness term ───────────────────────────
+    {
+        uint256 v, other, id;
+        v.SetHex("00000000000000000000000000000000000000000000000000000000000000a1");
+        other.SetHex("00000000000000000000000000000000000000000000000000000000000000a2");
+        id.SetHex("00000000000000000000000000000000000000000000000000000000000000a3");
+        CHECK(utxo_connect_gate(uint256(), 0, id, other, 970005, id) == UtxoConnectGate::Connect,
+              "[R] an empty view: any active block anchors it");
+        CHECK(utxo_connect_gate(uint256(), 0, id, other, 970005, other) == UtxoConnectGate::NotActive,
+              "[R] an empty view: a block off the active chain does not");
+        CHECK(utxo_connect_gate(v, 100, id, v, 100, id) == UtxoConnectGate::Below,
+              "[R] at the view's best height: below");
+        CHECK(utxo_connect_gate(v, 100, id, other, 101, id) == UtxoConnectGate::NotContiguous,
+              "[R] a parent other than the view's best: non-contiguous");
+        CHECK(utxo_connect_gate(v, 100, id, v, 101, other) == UtxoConnectGate::NotActive,
+              "[R] the next block of a branch not followed: not active");
+        CHECK(utxo_connect_gate(v, 100, id, v, 101, id) == UtxoConnectGate::Connect,
+              "[R] the active chain's next block: connect");
+        auto at = [&](uint32_t h) -> std::optional<uint256> {
+            if (h == 100) return v;
+            return std::nullopt;
+        };
+        CHECK(utxo_view_fresh(v, 100, 100, at, 0) && !utxo_view_fresh(v, 100, 101, at, 0)
+                  && utxo_view_fresh(v, 100, 101, at, 1) && !utxo_view_fresh(uint256(), 0, 100, at, 0)
+                  && !utxo_view_fresh(other, 100, 100, at, 0),
+              "[R] fresh: on the active chain within max_lag of the tip; never empty");
     }
 
     std::printf("%s\n", g_fail == 0 ? "bip110_coin_peer_pool_kat PASS" : "bip110_coin_peer_pool_kat FAIL");

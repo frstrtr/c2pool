@@ -20,6 +20,8 @@
 //   [E] a pooled connection (make_pool_peer): its driver is shared_ptr-owned
 //       (tracked lifetime), labelled "CoinP2P <peer>", got the identity and the
 //       caller's setup before it dialed, and survives a pending dial dropped.
+//   [G] request_txs over a pooled connection to a loopback listener: one
+//       getdata (MSG_WITNESS_TX) for all the transactions.
 //   [F] main_bip110.cpp wires the pool: built from the explicit peers and the
 //       peer manager, each peer with the primary arm's crawl / self-advertise
 //       seams and the BIP 35 opt-in; bodies checked by the BIP-110 rules and
@@ -351,6 +353,71 @@ int run_coin_peer_pool_p2p_kat()
         CHECK(headers == 0, "[E] a dropped pending dial reports nothing");
     }
 
+    // ── [G] request_txs: one getdata ─────────────────────────────────────────
+    {
+        static_assert(requires(KatNode& d, const std::vector<uint256>& v) { d.request_tx(v); },
+                      "the bip110 driver takes a list: the pooled connection batches");
+        boost::asio::io_context ioc;
+        KatConfig cfg;
+        boost::asio::ip::tcp::acceptor acceptor(
+            ioc, boost::asio::ip::tcp::endpoint(boost::asio::ip::address_v4::loopback(), 0));
+        boost::asio::ip::tcp::socket server(ioc);
+        bool accepted = false;
+        acceptor.async_accept(server, [&](const boost::system::error_code& ec) { accepted = !ec; });
+        auto peer = make_pool_peer<KatConfig>(
+            &ioc, &cfg, NetService("127.0.0.1", acceptor.local_endpoint().port()), PoolPeerHooks{});
+        for (int i = 0; i < 50 && !accepted; ++i)
+            ioc.run_for(std::chrono::milliseconds(20));
+        ioc.run_for(std::chrono::milliseconds(50));
+        uint256 a, b;
+        a.SetHex("00000000000000000000000000000000000000000000000000000000000000c1");
+        b.SetHex("00000000000000000000000000000000000000000000000000000000000000c2");
+        peer->request_txs({a, b});
+        std::vector<unsigned char> buf;
+        for (int i = 0; i < 20; ++i) {
+            ioc.run_for(std::chrono::milliseconds(20));
+            boost::system::error_code ec;
+            const size_t avail = server.available(ec);
+            if (ec || avail == 0)
+                continue;
+            std::vector<unsigned char> chunk(avail);
+            const size_t n = server.read_some(boost::asio::buffer(chunk), ec);
+            if (ec)
+                break;
+            buf.insert(buf.end(), chunk.begin(), chunk.begin() + static_cast<long>(n));
+        }
+        size_t getdata = 0;
+        bool both = false;
+        for (size_t pos = 0; pos + 24 <= buf.size();) {
+            std::string cmd(reinterpret_cast<const char*>(&buf[pos + 4]), 12);
+            cmd = cmd.substr(0, cmd.find('\0'));
+            const uint32_t len = static_cast<uint32_t>(buf[pos + 16])
+                | (static_cast<uint32_t>(buf[pos + 17]) << 8)
+                | (static_cast<uint32_t>(buf[pos + 18]) << 16)
+                | (static_cast<uint32_t>(buf[pos + 19]) << 24);
+            if (pos + 24 + len > buf.size())
+                break;
+            const unsigned char* pl = &buf[pos + 24];
+            if (cmd == "getdata") {
+                ++getdata;
+                if (len == 1 + 2 * 36 && pl[0] == 2) {
+                    auto type_at = [&](size_t off) {
+                        return static_cast<uint32_t>(pl[off]) | (static_cast<uint32_t>(pl[off + 1]) << 8)
+                            | (static_cast<uint32_t>(pl[off + 2]) << 16)
+                            | (static_cast<uint32_t>(pl[off + 3]) << 24);
+                    };
+                    uint256 x, y;
+                    std::memcpy(x.data(), pl + 5, 32);
+                    std::memcpy(y.data(), pl + 41, 32);
+                    both = type_at(1) == 0x40000001u && type_at(37) == 0x40000001u && x == a && y == b;
+                }
+            }
+            pos += 24 + len;
+        }
+        CHECK(accepted, "[G] the pooled connection dialed the loopback listener");
+        CHECK(getdata == 1 && both, "[G] request_txs of two transactions is one getdata (MSG_WITNESS_TX)");
+    }
+
     // ── [F] main_bip110.cpp wires the pool ────────────────────────────────────
     {
         const std::string src = main_src_code();
@@ -371,27 +438,51 @@ int run_coin_peer_pool_p2p_kat()
               "[F] the stratum won block takes the primary relay (flag off)");
         CHECK(has(src, "coin_broadcaster_full->set_primary_submit(primary_relay);"),
               "[F] the fan-out keystone's ARM B is the primary relay (flag on)");
-        // The UTXO connect: by the BLAKE2b identity, the active chain's next
-        // block only; bodies it cannot apply yet are kept for a rollback; the
-        // pool's chain-order hook.
-        const auto try_fn = src.find("auto utxo_try_connect =");
-        CHECK(near_after(src, try_fn, "bip110::coin::block_hash(", 400),
-              "[F] the UTXO connect finds the header by the BIP-110 identity");
+        // The UTXO connect: the follower (UtxoFollower) over the view, the
+        // active chain and the pool's body fetch; by the BLAKE2b identity.
+        const auto follow = src.find("bip110::coin::UtxoFollowHost fh;");
+        CHECK(follow != std::string::npos
+                  && near_after(src, follow, "fh.view = [&utxo_cache]() { return utxo_cache.get_best(); };", 200)
+                  && near_after(src, follow, "header_chain.get_header_by_height(h);", 600),
+              "[F] the follower reads the view and the active chain");
+        const auto conn = src.find("fh.connect = [&utxo_cache, &utxo_db, &mempool, bip110_txid, BIP110_KEEP_DEPTH]");
+        CHECK(near_after(src, conn, "bip110::coin::block_hash(", 400)
+                  && near_after(src, conn, "utxo_cache.connect_block(block, height, bip110_txid, block_hash);", 900),
+              "[F] the UTXO connect keys the block by the BIP-110 identity");
         CHECK(!has(src, "Hash(packed_hdr.get_span())"), "[F] no SHA256d(header) lookup is left");
-        CHECK(near_after(src, try_fn, "block.m_previous_block != view_best", 1500)
-                  && near_after(src, try_fn, "header_chain.get_header_by_height(height);", 2500)
-                  && near_after(src, try_fn, "active->block_hash != block_hash", 2600),
-              "[F] only a contiguous block of the active chain is connected");
-        const auto connect_fn = src.find("auto utxo_connect_block =");
-        CHECK(near_after(src, connect_fn, "if (utxo_try_connect(block)) {", 200)
-                  && near_after(src, connect_fn, "side_bodies->keep(block);", 600),
-              "[F] a body not connected now is kept (bounded)");
-        const auto rollback = src.find("bip110::coin::reorg_disconnect_to_fork(");
-        const auto side = src.find("utxo_connect_side();", rollback);
-        const auto requarantine = src.find("mempool.requarantine_all();", rollback);
-        CHECK(rollback != std::string::npos && side != std::string::npos
-                  && requarantine != std::string::npos && side < requarantine,
-              "[F] after a rollback the kept bodies of the new branch connect");
+        const auto rb = src.find("fh.rollback = [");
+        CHECK(near_after(src, rb, "utxo_consistent.store(false, std::memory_order_relaxed);", 400)
+                  && near_after(src, rb, "bip110::coin::reorg_disconnect_to_fork(", 700)
+                  && near_after(src, rb, "mempool.requarantine_all();", 2200),
+              "[F] the rollback: inconsistent while it runs, the mempool re-priced after");
+        const auto ra = src.find("fh.reanchor = [&utxo_cache, &mempool, &utxo_consistent]() -> bool {");
+        CHECK(near_after(src, ra, "if (!utxo_cache.reanchor())", 200),
+              "[F] the re-anchor wipes the view (UTXOViewCache::reanchor)");
+        CHECK(has(src, "coin_pool->fetch_bodies(ids);"), "[F] the follower's bodies come through the pool");
+        const auto connect_fn = src.find("auto utxo_connect_block = [utxo_follower](const bip110::coin::BlockType& block) {");
+        CHECK(near_after(src, connect_fn, "utxo_follower->on_body(block);", 200),
+              "[F] a body goes to the follower (connect, else keep)");
+        const auto tipc = src.find("header_chain.set_on_tip_changed(");
+        CHECK(near_after(src, tipc, "utxo_follower->on_tip_changed()", 400),
+              "[F] every tip change goes to the follower (kept bodies first, then a rollback)");
+        const auto cu = src.find("pool_ptr->poll();");
+        CHECK(near_after(src, cu, "if (*hdr_caught_up)", 100)
+                  && near_after(src, cu, "utxo_follower->catch_up();", 200),
+              "[F] the pool driver runs the catch-up step once header sync is caught up");
+        const auto gate = src.find("work_source->set_mempool(&mempool, serve_mempool_txs,");
+        CHECK(near_after(src, gate, "&& utxo_follower && utxo_follower->fresh();", 500),
+              "[F] the serve gate requires the view at the tip");
+        CHECK(has(src, "rule_alarm->should_log(id, rule, peers, std::chrono::steady_clock::now())")
+                  && has(src, "bip110::coin::block_body_rule(b, rdts_cap_for(b));"),
+              "[F] a BIP-110-only body failure from 2+ peers is an ERROR naming the rule");
+        CHECK(has(src, "bip110::coin::is_peer_hostname(ns)") && has(src, "resolver->async_resolve(")
+                  && has(src, "bip110::coin::add_resolved_peers(*explicit_list, ns, addrs);"),
+              "[F] a host-name --peer is resolved for the pool");
+        const auto mgr_decl = src.find("std::unique_ptr<bip110::coin::BtcCoinPeerManager> coin_peer_mgr;");
+        const auto fan_decl = src.find("std::unique_ptr<bip110::coin::Bip110Broadcaster<MiniConfig>>     coin_broadcaster;");
+        CHECK(mgr_decl != std::string::npos && fan_decl != std::string::npos && decl != std::string::npos
+                  && mgr_decl < fan_decl && mgr_decl < decl,
+              "[F] the peer manager outlives the fan-out and the pool (declared first)");
         const auto sub = src.find("utxo_connect_block, utxo_connect_by_pool]", connect_fn);
         CHECK(sub != std::string::npos && near_after(src, sub, "if (*utxo_connect_by_pool) return;", 2000)
                   && near_after(src, sub, "utxo_connect_block(block);", 2100),
@@ -437,10 +528,11 @@ int run_coin_peer_pool_p2p_kat()
         CHECK(near_after(src, tip, "return tip ? tip->block_hash : uint256();", 200),
               "[F] the header tip is the chain's tip block");
         // Bodies: the BIP-110 check with the RDTS cap by the parent's median time.
-        const auto valid = src.find("ph.body_valid = [&header_chain](const bip110::coin::BlockType& b)");
-        CHECK(near_after(src, valid, "bip110::coin::parent_median_time_past(", 200)
-                  && near_after(src, valid, "bip110::coin::block_body_matches_header(", 700)
-                  && near_after(src, valid, "bip110::coin::rdts_weight_cap_applies(b, mtp)", 800),
+        const auto cap = src.find("auto rdts_cap_for = [&header_chain](const bip110::coin::BlockType& b) {");
+        const auto valid = src.find("ph.body_valid = [rdts_cap_for](const bip110::coin::BlockType& b) {");
+        CHECK(near_after(src, cap, "bip110::coin::parent_median_time_past(", 200)
+                  && near_after(src, cap, "return bip110::coin::rdts_weight_cap_applies(b, mtp);", 700)
+                  && near_after(src, valid, "return bip110::coin::block_body_matches_header(b, rdts_cap_for(b));", 200),
               "[F] bodies pass the BIP-110 body check, RDTS cap by the parent's median time past");
         const auto best = src.find("ph.body_best_height = [&utxo_cache]");
         CHECK(near_after(src, best, "utxo_cache.get_best_block().IsNull()", 200),

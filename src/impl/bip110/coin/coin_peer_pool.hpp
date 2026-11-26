@@ -31,6 +31,7 @@
 #include <core/pack.hpp>
 #include <core/uint256.hpp>
 
+#include <algorithm>
 #include <functional>
 #include <set>
 #include <string>
@@ -77,6 +78,34 @@ using CoinPeerPool     = btc::coin::BasicCoinPeerPool<Bip110PoolCoin>;
 inline uint256 pool_header_hash(const BlockHeaderType& header)
 {
     return Bip110PoolCoin::header_hash(header);
+}
+
+/// An explicit peer given by host name, not by an IP address: the pool dials
+/// addresses only (pool_candidates), so main resolves it first
+/// (add_resolved_peers).
+inline bool is_peer_hostname(const NetService& ns)
+{
+    return !ns.address().empty() && classify_address(ns.address()) == AddrClass::invalid;
+}
+
+/// Put `resolved` (the addresses of the host-name entry `host`) right after
+/// that entry in `list`, so they keep its place among the explicit peers; one
+/// already in the list is not added again. Returns the number added.
+inline size_t add_resolved_peers(std::vector<NetService>& list, const NetService& host,
+                                 const std::vector<NetService>& resolved)
+{
+    auto at = std::find(list.begin(), list.end(), host);
+    if (at == list.end())
+        return 0;
+    size_t added = 0;
+    auto pos = std::next(at);
+    for (const auto& r : resolved) {
+        if (std::find(list.begin(), list.end(), r) != list.end())
+            continue;
+        pos = std::next(list.insert(pos, r));
+        ++added;
+    }
+    return added;
 }
 
 /// The pool's dial candidates (CoinPeerPoolHost::candidates): the explicit fork
