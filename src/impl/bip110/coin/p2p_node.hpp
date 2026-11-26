@@ -215,6 +215,21 @@ private:
     // Raw block parser: if set, re-parses DOGE AuxPoW full blocks from raw P2P bytes.
     using RawBlockParser = std::function<BlockType(const uint8_t*, size_t)>;
     RawBlockParser m_raw_block_parser;
+    // Fetch filter for announced items: consulted before the getdata for an
+    // announced block (inv, BIP 130 headers announcement) or transaction
+    // (inv); false skips that item. Unset: every announced item is fetched.
+    using FetchFilter = std::function<bool(const uint256& hash, bool is_block)>;
+    FetchFilter m_fetch_filter;
+    // Called with the entry count of every headers message, an empty one
+    // included (new_headers fires only for a non-empty one). Unset: nothing.
+    using HeadersMessageCallback = std::function<void(size_t count)>;
+    HeadersMessageCallback m_on_headers_message;
+    // A block's hash as the getdata / getblocktxn / served-block paths and the
+    // fetch filter use it. Unset: SHA256d of the serialized header. The coin
+    // peer pool sets the BIP-110 block identity (bip110::coin::block_hash,
+    // BLAKE2b for a v2 header), the hash fork peers key blocks by.
+    using HeaderHashFn = std::function<uint256(const BlockHeaderType&)>;
+    HeaderHashFn m_header_hash;
 
 public:
     NodeP2P(io::io_context* context, bip110::interfaces::Node* coin, config_t* config,
@@ -458,6 +473,26 @@ public:
     /// Set custom raw block parser (for DOGE AuxPoW full blocks).
     void set_raw_block_parser(RawBlockParser p) { m_raw_block_parser = std::move(p); }
 
+    /// Set the fetch filter for announced blocks and transactions (unset by
+    /// default: every announced item is fetched).
+    void set_fetch_filter(FetchFilter f) { m_fetch_filter = std::move(f); }
+
+    /// Set the callback for every headers message's entry count (unset by
+    /// default).
+    void set_on_headers_message(HeadersMessageCallback cb) { m_on_headers_message = std::move(cb); }
+
+    /// Set the block hash function (unset by default: SHA256d of the header).
+    void set_header_hash_fn(HeaderHashFn fn) { m_header_hash = std::move(fn); }
+
+    /// A block's hash as this driver requests, serves and filters blocks by.
+    uint256 header_hash(const BlockHeaderType& header) const
+    {
+        if (m_header_hash)
+            return m_header_hash(header);
+        auto packed = pack(header);
+        return Hash(packed.get_span());
+    }
+
     /// Send getaddr to request peer addresses.
     void send_getaddr()
     {
@@ -534,6 +569,9 @@ public:
         m_peer->write(msg);
     }
 
+    /// One transaction by its txid (getdata MSG_WITNESS_TX, as above).
+    void request_tx(const uint256& txid) { request_tx(std::vector<uint256>{txid}); }
+
     /// Request a block via plain MSG_BLOCK (0x02) getdata.
     /// Works for any block regardless of MWEB support.
     void request_block(const uint256& block_hash)
@@ -603,8 +641,7 @@ public:
                 auto rmsg = message_cmpctblock::make_raw(cb);
                 m_peer->write(rmsg);
 
-                auto packed_hdr = pack(static_cast<BlockHeaderType&>(block));
-                auto blockhash = Hash(packed_hdr.get_span());
+                auto blockhash = header_hash(static_cast<BlockHeaderType&>(block));
 
                 // Cache the full block so we can serve getblocktxn requests.
                 m_sent_cmpct_block = std::move(block);
@@ -661,8 +698,7 @@ public:
             PackStream hp(block_bytes);
             BlockHeaderType hdr;
             hp >> hdr;
-            auto packed_hdr = pack(hdr);
-            m_served_block_hash = Hash(packed_hdr.get_span());
+            m_served_block_hash = header_hash(hdr);
         } catch (const std::exception& e) {
             LOG_WARNING << "[" << m_chain_label
                         << "] cache_served_block: header hash failed: " << e.what();
@@ -680,6 +716,11 @@ public:
     //[x][x][x] void handle_message_headers(std::shared_ptr<coind::messages::message_headers> msg, CoindProtocol* protocol); //
 
 private:
+    bool wants_fetch(const uint256& hash, bool is_block) const
+    {
+        return !m_fetch_filter || m_fetch_filter(hash, is_block);
+    }
+
     void ensure_timeout_timer()
     {
         if (!m_timeout_timer)
@@ -949,7 +990,8 @@ private:
             // Request via MSG_WITNESS_TX (0x40000001) since getdata doesn't accept MSG_WTX.
             // Reference: Bitcoin Core protocol.h line 447, net_processing.cpp line 3036
             if (inv.m_type == inventory_type::wtx) {
-                vinv.push_back(inventory_type(inventory_type::witness_tx, inv.m_hash));
+                if (wants_fetch(inv.m_hash, false))
+                    vinv.push_back(inventory_type(inventory_type::witness_tx, inv.m_hash));
                 continue;
             }
 
@@ -960,15 +1002,17 @@ private:
                 // transactions arrive with their witness data intact.
                 // Without this, P2WPKH/P2WSH spends arrive stripped and
                 // fail CheckQueue when included in blocks.
-                vinv.push_back(inventory_type(inventory_type::witness_tx, inv.m_hash));
+                if (wants_fetch(inv.m_hash, false))
+                    vinv.push_back(inventory_type(inventory_type::witness_tx, inv.m_hash));
                 break;
             case inventory_type::block:
                 m_coin->new_block.happened(inv.m_hash);
                 // BTC advertises NODE_WITNESS — getdata for blocks must use
                 // MSG_WITNESS_BLOCK (0x40000002) per BIP 144, otherwise the
                 // peer drops witness data on the wire.
-                vinv.push_back(inventory_type(
-                    inventory_type::witness_block, inv.m_hash));
+                if (wants_fetch(inv.m_hash, true))
+                    vinv.push_back(inventory_type(
+                        inventory_type::witness_block, inv.m_hash));
                 break;
             case inventory_type::filtered_block:
             case inventory_type::cmpct_block:
@@ -1013,8 +1057,7 @@ private:
         }
 
         auto header = static_cast<BlockHeaderType>(block);
-        auto packed_header = pack(header);
-        auto blockhash = Hash(packed_header.get_span());
+        auto blockhash = header_hash(header);
         // ReplyMatcher may throw if nobody registered a pending request for
         // this block (e.g., unsolicited block or getdata-triggered response).
         // Catch to ensure full_block event always fires.
@@ -1051,14 +1094,16 @@ private:
             for (auto block : msg->m_headers)
             {
                 auto header = (BlockHeaderType)block;
-                auto packed_header = pack(header);
-                auto blockhash = Hash(packed_header.get_span());
+                auto blockhash = header_hash(header);
                 try {
                     m_peer->get_header(blockhash, header);
                 } catch (const std::invalid_argument&) {}
                 vheaders.push_back(header);
             }
         }
+
+        if (m_on_headers_message)
+            m_on_headers_message(vheaders.size());
 
         if (!vheaders.empty()) {
             m_coin->new_headers.happened(vheaders);
@@ -1069,8 +1114,9 @@ private:
             // LTC's MSG_MWEB_BLOCK (0x60000002) would be rejected by bitcoind.
             if (vheaders.size() <= 3 && m_peer) {
                 for (auto& hdr : vheaders) {
-                    auto packed = pack(hdr);
-                    auto bhash = Hash(packed.get_span());
+                    auto bhash = header_hash(hdr);
+                    if (!wants_fetch(bhash, true))
+                        continue;
                     auto getdata_msg = message_getdata::make_raw(
                         {inventory_type(inventory_type::witness_block, bhash)});
                     m_peer->write(getdata_msg);
@@ -1194,8 +1240,7 @@ private:
     ADD_P2P_HANDLER(cmpctblock)
     {
         auto& cb = msg->m_compact_block;
-        auto packed_hdr = pack(cb.header);
-        auto blockhash = Hash(packed_hdr.get_span());
+        auto blockhash = header_hash(cb.header);
 
         LOG_INFO << "[" << m_chain_label << "] Received compact block "
                  << blockhash.GetHex()
@@ -1352,8 +1397,7 @@ private:
         }
 
         // Build and deliver the full block
-        auto packed_hdr = pack(cb.header);
-        auto blockhash = Hash(packed_hdr.get_span());
+        auto blockhash = header_hash(cb.header);
 
         BlockType block;
         static_cast<BlockHeaderType&>(block) = cb.header;

@@ -265,6 +265,15 @@ public:
 
     size_t slot_count() const { return m_slots.size(); }
     bool has_slot(const std::string& key) const { return m_slots.count(key) != 0; }
+    /// The key of every slot, dialing or live (main: the coin peer pool dials
+    /// a different fork peer than any fan-out slot).
+    std::vector<std::string> slot_keys() const
+    {
+        std::vector<std::string> keys;
+        keys.reserve(m_slots.size());
+        for (const auto& [key, slot] : m_slots) keys.push_back(key);
+        return keys;
+    }
     bool is_backed_off(const std::string& key) const
     {
         auto bo = m_backoff.find(key);

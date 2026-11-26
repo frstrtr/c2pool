@@ -24,6 +24,10 @@
 ///       - operator split: MN 1dae04ea…b7a0 carries nOperatorReward=800bps
 ///         + a set scriptOperatorPayout through the whole sequence (the
 ///         h=2516595 bad-cb-payee field class, derived from history).
+///     And REAL TESTNET bytes under Dash Core v24 (prestate format /2): the
+///     h=1596476 pre-list with 44 version-3 states, the h=1596477 ProDisTx
+///     dissolution of a shared masternode, and the h=1596480 share-split
+///     payment of another (end of file).
 ///
 ///  2. SYNTHETIC VECTORS with independently hand-built expected SML entry
 ///     sets (never the engine's own output): registration/internalId,
@@ -38,6 +42,7 @@
 
 #include <impl/dash/coin/replay_fold_engine.hpp>
 #include <impl/dash/coin/replay_fold_consumer.hpp>   // S1: a refused block does not latch the lane
+#include <impl/dash/coin/replay_prestate.hpp>        // the runtime twin of parse_prestate_into
 #include <impl/dash/coin/vendor/cbtx.hpp>
 #include <impl/dash/coin/vendor/llmq_commitment.hpp>
 #include <impl/dash/coin/vendor/providertx.hpp>
@@ -72,6 +77,12 @@
 #include "data/dash_replay_block_2516759.inc"
 #include "data/dash_replay_block_2516760.inc"
 #include "data/dash_replay_quorum_2516412.inc"
+// Dash Core v24 on testnet (DEPLOYMENT_V24 active since 1,578,000).
+#include "data/dash_replay_prestate_testnet_1596476.inc"
+#include "data/dash_replay_block_testnet_1596477.inc"
+#include "data/dash_replay_block_testnet_1596478.inc"
+#include "data/dash_replay_block_testnet_1596479.inc"
+#include "data/dash_replay_block_testnet_1596480.inc"
 
 using dash::coin::BlockType;
 using dash::coin::MutableTransaction;
@@ -185,6 +196,9 @@ static std::vector<std::string> split_ws(const std::string& line)
     return out;
 }
 
+// Formats /1 (26 fields) and /2 (Dash Core v24: a 27th field carrying a
+// version-3 state's MnStateV24Ext as hex, `-` on a v1/v2 row) — the same
+// contract as the runtime loader (replay_prestate.hpp parse_prestate_text).
 static void parse_prestate_into(const char* text, PrestateFixture& fx,
                                 bool canonicalize_opkeys = true)
 {
@@ -192,7 +206,8 @@ static void parse_prestate_into(const char* text, PrestateFixture& fx,
     std::string line;
     size_t declared = 0;
     EXPECT_TRUE(std::getline(is, line));
-    EXPECT_EQ(line, "c2pool-dash-replay-prestate/1");
+    const bool format2 = line == "c2pool-dash-replay-prestate/2";
+    ASSERT_TRUE(format2 || line == "c2pool-dash-replay-prestate/1") << line;
     while (std::getline(is, line)) {
         if (line.empty()) continue;
         auto f = split_ws(line);
@@ -203,7 +218,7 @@ static void parse_prestate_into(const char* text, PrestateFixture& fx,
         if (f[0] == "mnroot")    { fx.mnroot_display = f[1]; continue; }
         if (f[0] == "count")     { declared = std::stoul(f[1]); continue; }
         ASSERT_EQ(f[0], "mn") << "unknown fixture line: " << line;
-        ASSERT_EQ(f.size(), 26u) << line;
+        ASSERT_EQ(f.size(), format2 ? 27u : 26u) << line;
         uint256 protx = u256_wire(f[1]);
         ReplayMNState st;
         st.confirmedHash = (f[2] == "-") ? uint256{} : u256_wire(f[2]);
@@ -260,6 +275,20 @@ static void parse_prestate_into(const char* text, PrestateFixture& fx,
         st.collateralOutpoint.hash  = u256_wire(f[23]);
         st.collateralOutpoint.index = static_cast<uint32_t>(std::stoul(f[24]));
         st.internalId               = std::stoull(f[25]);
+        if (dash::coin::v24::state_has_ext(st.nVersion)) {
+            // A v3 state: payout list / share table / early-exit terms /
+            // ExtNetInfo in field 27, no single payout script, no legacy
+            // service.
+            ASSERT_TRUE(format2) << "version-3 state in a /1 fixture: " << line;
+            ASSERT_EQ(f[14], "-") << line;
+            std::vector<uint8_t> blob;
+            ASSERT_TRUE(f[26] != "-" && hex_to_bytes(f[26], blob)) << line;
+            ::PackStream bs(blob);
+            bs >> st.v24;
+            ASSERT_TRUE(bs.empty()) << "trailing bytes after the v24 field: " << line;
+        } else if (format2) {
+            ASSERT_EQ(f[26], "-") << "v24 field on a pre-v3 row: " << line;
+        }
         fx.entries.emplace_back(protx, std::move(st));
     }
     EXPECT_EQ(fx.entries.size(), declared);
@@ -328,6 +357,8 @@ static DmlFoldEngine seed_from_fixture(const PrestateFixture& fx)
 {
     FoldConfig cfg;
     cfg.enabled = true; // W1 feature flag — explicit opt-in, tests only
+    // The chain's own heights (DIP3, V19, MN_RR, V24, confirmations).
+    if (fx.network == "testnet") cfg.gates = FoldGates::testnet();
     DmlFoldEngine eng(cfg);
     auto entries = fx.entries;
     uint256 anchor_hash;
@@ -3453,4 +3484,193 @@ TEST(DashReplayFoldV24, RejectCodesFailClosed)
         dis.vchSigs.resize(1);
         expect_fail(synth_cfg(), {}, make_special_tx(10, dis, 1), "bad-txns-type");
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// REAL TESTNET KATs: Dash Core v24 provider transactions on chain bytes
+// ═══════════════════════════════════════════════════════════════════════════
+// A full-state pre-list at testnet h=1596476 (dashd v24 `protx list` +
+// `protx diff`, format /2: 44 of 409 states are version 3, 6 of them shared
+// masternodes) and the real blocks 1596477..1596480 folded over it, the
+// engine's per-block self-checks as the assertion:
+//   - h=1596477 carries ProDisTx d90acb5d…b7b8 (type 10), signed by all three
+//     shares, spending the shared collateral ec205192…8bec:2. The committed
+//     root fddf052b…84ab only matches when that masternode leaves the list in
+//     the collateral-spend pass (Core v24 FinishListForBlock).
+//   - h=1596478/1596479: no list change, the root carries forward.
+//   - h=1596480 pays the shared masternode f842cce8…eb1e: the coinbase must
+//     carry its owner reward split pro rata over its two shares (890 + 110
+//     DASH), exact amounts (the payee self-check's v24 multiset form).
+// The v3 leaves hash their ExtNetInfo, so the pre-list parity alone proves
+// the v24 SML leaf over 44 real version-3 states.
+namespace testnet_v24_kat {
+
+const char* kRoot1596476 = "40c9082bedbc7c6183a088ee8d981c88a61651aca50785aa7647df7c8b71187c";
+const char* kRoot1596477 = "fddf052bb6ae0967e001d97c11e249a96fa4b319a36fef5768a319300d1584ab";
+const char* kDissolvedMN = "ec2051922135e29cd27f32f0d4789641c74826046dca5a11dacaa1cc55708bec";
+const char* kProDisTxid  = "d90acb5d2ae53da77d1ca4256f9fa6b1874e5f1adefd8ae5cdc9cf69d271b7b8";
+const char* kSharedPayee = "f842cce8ab3040d16ba3708312ed3450b6c8de78a2c7eb5e2e6274384273eb1e";
+// A version-3 EvoNode: ExtNetInfo with all three purposes.
+const char* kV3Evo       = "763ca29ff79683e7572451311c9ca4a83cd0df930a7db19416efe5dd825c0b80";
+
+std::vector<unsigned char> script_hex(const char* hex)
+{
+    std::vector<uint8_t> b;
+    EXPECT_TRUE(hex_to_bytes(hex, b)) << hex;
+    return {b.begin(), b.end()};
+}
+
+DmlFoldEngine seeded()
+{
+    auto fx = parse_prestate(kDashReplayPrestateTestnet1596476);
+    EXPECT_EQ(fx.network, "testnet");
+    EXPECT_EQ(fx.height, 1596476u);
+    EXPECT_EQ(fx.mnroot_display, kRoot1596476);
+    return seed_from_fixture(fx);   // asserts pre-list root parity
+}
+
+} // namespace testnet_v24_kat
+
+TEST(DashReplayFoldReal, TestnetV24PrestateRootParity1596476)
+{
+    using namespace testnet_v24_kat;
+    auto fx = parse_prestate(kDashReplayPrestateTestnet1596476);
+    ASSERT_EQ(fx.entries.size(), 409u);
+    size_t v3 = 0, shared = 0;
+    for (const auto& [p, st] : fx.entries) {
+        if (st.nVersion >= ProTxVersion::EXT_ADDR) ++v3;
+        if (st.v24.IsShared()) ++shared;
+    }
+    EXPECT_EQ(v3, 44u);
+    EXPECT_EQ(shared, 6u);
+    auto eng = seed_from_fixture(fx);
+    EXPECT_EQ(eng.compute_sml_root().GetHex(), kRoot1596476);
+
+    // The runtime loader reads the same text to the same states.
+    const auto ps = dash::coin::replay::parse_prestate_text(kDashReplayPrestateTestnet1596476);
+    ASSERT_TRUE(ps.ok) << ps.error;
+    ASSERT_EQ(ps.entries.size(), fx.entries.size());
+    for (size_t i = 0; i < fx.entries.size(); ++i) {
+        EXPECT_EQ(ps.entries[i].first, fx.entries[i].first);
+        EXPECT_TRUE(ps.entries[i].second == fx.entries[i].second) << fx.entries[i].first.GetHex();
+    }
+
+    // The v24 fields, against the values dashd printed for them.
+    const ReplayMNState* dis = eng.find(from_display(kDissolvedMN));
+    ASSERT_NE(dis, nullptr);
+    EXPECT_EQ(dis->nVersion, ProTxVersion::EXT_ADDR);
+    EXPECT_TRUE(dis->keyIDOwner.IsNull());
+    EXPECT_TRUE(dis->scriptPayout.m_data.empty());
+    EXPECT_EQ(dis->nOperatorReward, 1000);
+    EXPECT_FALSE(dis->scriptOperatorPayout.m_data.empty());
+    EXPECT_EQ(dis->collateralOutpoint.hash, from_display(kDissolvedMN));
+    EXPECT_EQ(dis->collateralOutpoint.index, 2u);
+    ASSERT_EQ(dis->v24.shares.size(), 3u);
+    EXPECT_EQ(dis->v24.shares[0].amount, 29000000000);
+    EXPECT_EQ(dis->v24.shares[1].amount, 35000000000);
+    EXPECT_EQ(dis->v24.shares[2].amount, 36000000000);
+    EXPECT_EQ(dis->v24.shares[0].scriptRefund.m_data,
+              script_hex("76a9145e0be533e9cd10575f921f611eb0bcbe494058c388ac"));
+    EXPECT_EQ(dis->v24.shares[0].RewardScript().m_data,
+              script_hex("76a914a15196105f81b34071a87d2286864343bc5c6d5e88ac"));
+    EXPECT_EQ(dis->v24.nEarlyPeriodBlocks, 52560u);
+    EXPECT_EQ(dis->v24.nEarlyPenalty, 200000000);
+    EXPECT_EQ(dis->v24.extNetInfo.to_string(), "core_p2p=78.187.175.70:19999");
+
+    const ReplayMNState* sp = eng.find(from_display(kSharedPayee));
+    ASSERT_NE(sp, nullptr);
+    ASSERT_EQ(sp->v24.shares.size(), 2u);
+    EXPECT_EQ(sp->v24.shares[0].amount, 89000000000);
+    EXPECT_EQ(sp->v24.shares[1].amount, 11000000000);
+    // dashd prints the reward script as RewardScript(); one equal to the
+    // refund script is "not set" in the fixture.
+    EXPECT_TRUE(sp->v24.shares[0].scriptReward.m_data.empty());
+    EXPECT_EQ(sp->v24.shares[0].RewardScript().m_data,
+              script_hex("76a9144ba27378bbf5842caac11bc76d134a7388ba583b88ac"));
+
+    const ReplayMNState* evo = eng.find(from_display(kV3Evo));
+    ASSERT_NE(evo, nullptr);
+    EXPECT_EQ(evo->nType, MnType::EVO);
+    EXPECT_EQ(evo->nVersion, ProTxVersion::EXT_ADDR);
+    EXPECT_EQ(evo->v24.extNetInfo.to_string(),
+              "core_p2p=162.35.243.85:19997;platform_p2p=162.35.243.85:36656;"
+              "platform_https=162.35.243.85:1443");
+    EXPECT_TRUE(evo->netInfo == LegacyNetService{});
+    EXPECT_EQ(evo->platformHTTPPort, 0);
+    ASSERT_EQ(evo->v24.payouts.size(), 1u);
+    EXPECT_EQ(evo->v24.payouts[0].reward, 10000);
+    EXPECT_EQ(evo->v24.payouts[0].scriptPayout.m_data,
+              script_hex("76a91418d05f474a776383ac3aebbfb978ae29da144ed088ac"));
+}
+
+TEST(DashReplayFoldReal, TestnetV24ProDisTx1596477FoldsToCommittedRoot)
+{
+    using namespace testnet_v24_kat;
+    auto eng = seeded();
+    const uint256 dissolved = from_display(kDissolvedMN);
+    const ReplayMNState* pre = eng.find(dissolved);
+    ASSERT_NE(pre, nullptr);
+    ASSERT_TRUE(pre->v24.IsShared());
+    const auto collateral = pre->collateralOutpoint;
+    const size_t n_shares = pre->v24.shares.size();
+    const size_t n_pre = eng.size();
+
+    // The block's one provider tx: a ProDisTx of that masternode, signed by
+    // every share, spending its collateral.
+    const auto blk = parse_block(kDashReplayBlockTestnet1596477);
+    size_t n_dis = 0;
+    for (const auto& tx : blk.m_txs) {
+        if (tx.type != dash::coin::vendor::CProDisTx::SPECIALTX_TYPE) continue;
+        ++n_dis;
+        EXPECT_EQ(v24_fold_kat::txid(tx).GetHex(), kProDisTxid);
+        dash::coin::vendor::CProDisTx dp;
+        ASSERT_TRUE(dash::coin::vendor::parse_protx_payload(
+            std::vector<uint8_t>(tx.extra_payload.begin(), tx.extra_payload.end()), dp));
+        EXPECT_EQ(dp.proTxHash, dissolved);
+        EXPECT_EQ(dp.vchSigs.size(), n_shares);
+        ASSERT_EQ(tx.vin.size(), 1u);
+        EXPECT_EQ(tx.vin[0].prevout.hash, collateral.hash);
+        EXPECT_EQ(tx.vin[0].prevout.index, collateral.index);
+    }
+    ASSERT_EQ(n_dis, 1u);
+
+    const auto r = eng.fold_block(blk, 1596477);
+    ASSERT_TRUE(r.ok) << r.error;
+    EXPECT_EQ(r.committed_root.GetHex(), kRoot1596477);
+    EXPECT_EQ(r.computed_root.GetHex(), kRoot1596477);
+    EXPECT_EQ(r.collateral_spent, 1u);
+    EXPECT_EQ(r.registered, 0u);
+    EXPECT_EQ(eng.find(dissolved), nullptr);
+    EXPECT_EQ(eng.size(), n_pre - 1);
+    EXPECT_TRUE(r.payee_paid_verified);
+}
+
+TEST(DashReplayFoldReal, TestnetV24SharedPayee1596480FoldsWithExactShareSplit)
+{
+    using namespace testnet_v24_kat;
+    auto eng = seeded();
+    const char* seq[] = {kDashReplayBlockTestnet1596477, kDashReplayBlockTestnet1596478,
+                         kDashReplayBlockTestnet1596479, kDashReplayBlockTestnet1596480};
+    uint32_t h = 1596477;
+    FoldResult last;
+    for (const char* bh : seq) {
+        const auto blk = parse_block(bh);
+        last = eng.fold_block(blk, h);
+        ASSERT_TRUE(last.ok) << "h=" << h << ": " << last.error;
+        EXPECT_EQ(last.computed_root.GetHex(), kRoot1596477) << "h=" << h;
+        EXPECT_TRUE(last.payee_paid_verified) << "h=" << h;
+        ++h;
+    }
+    // h=1596480: the projected payee is the shared masternode and the
+    // coinbase carries its exact share split (dashd: 99340806 + 12278078
+    // duffs to the two share reward scripts).
+    ASSERT_TRUE(last.payee.has_value());
+    EXPECT_EQ(last.payee->GetHex(), kSharedPayee);
+    EXPECT_TRUE(last.payee_amounts_verified);
+    const auto blk = parse_block(kDashReplayBlockTestnet1596480);
+    std::multiset<std::pair<int64_t, std::vector<unsigned char>>> paid;
+    for (const auto& o : blk.m_txs[0].vout) paid.emplace(o.value, o.scriptPubKey.m_data);
+    EXPECT_EQ(paid.count({99340806, script_hex("76a9144ba27378bbf5842caac11bc76d134a7388ba583b88ac")}), 1u);
+    EXPECT_EQ(paid.count({12278078, script_hex("76a914667ea67141dc92d0364313606f5eb609a7f2084188ac")}), 1u);
+    EXPECT_EQ(eng.height(), 1596480u);
 }
