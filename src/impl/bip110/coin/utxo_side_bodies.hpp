@@ -18,6 +18,7 @@
 
 #include <cstddef>
 #include <deque>
+#include <iterator>
 #include <utility>
 
 namespace bip110::coin {
@@ -64,6 +65,14 @@ public:
 
     size_t size() const { return m_bodies.size(); }
     void clear() { m_bodies.clear(); }
+
+    /// Keep only the bodies for which `keep` (bool(const BlockType&)) holds.
+    template <typename Keep>
+    void retain(const Keep& keep)
+    {
+        for (auto it = m_bodies.begin(); it != m_bodies.end();)
+            it = keep(it->second) ? std::next(it) : m_bodies.erase(it);
+    }
     bool holds(const uint256& id) const
     {
         for (const auto& kept : m_bodies)

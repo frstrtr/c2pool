@@ -61,6 +61,10 @@
 //       the first connect after a re-anchor), and no other connect does.
 //   [U] a view behind whose next body never comes: re-anchored at the tip
 //       after kStuckReanchorSec, not before.
+//   [W] the stuck re-anchor with a kept body at or above the anchor floor:
+//       the emptied view anchors on it at once (no fetch of the tip's body),
+//       kept bodies below the floor are dropped; ticks during header sync
+//       restart the stuck clock, so the first catch-up after it fetches.
 //   [V] an empty view anchors only at or above tip - kInFlight; an older
 //       active body (a late catch-up body) neither anchors nor is kept; an
 //       active block at or below the view's height is not kept, a competing
@@ -1150,7 +1154,9 @@ int run_coin_peer_pool_kat()
         const BlockType a3 = make_block(block_hash(a2), 970003, 85, {make_spend(45)});
         vm.header(a2, true);
         vm.header(a3, true);
-        vm.f->on_tip_changed();
+        CHECK(vm.f->on_tip_changed() == UtxoFollower::TipChange::RollbackFailed && vm.rollbacks == 1
+                  && vm.reanchors == 1,
+              "[S] a tip change while suspended: no rollback attempt, the re-anchor not yet due");
         vm.f->on_body(a2);
         CHECK(vm.best == block_hash(a1) && vm.connected.size() == 1 && vm.f->kept() == 0,
               "[S] suspended: the flipped-back chain's next body does not connect");
@@ -1222,6 +1228,49 @@ int run_coin_peer_pool_kat()
         CHECK(late.step == UtxoFollower::Step::Reanchor && vm.reanchors == 1
                   && late.fetched == std::vector<uint256>{block_hash(n1)},
               "[U] after it: re-anchored at the tip, the tip's body fetched");
+    }
+
+    // ── [W] the stuck re-anchor anchors on a kept body; the stuck clock ──────
+    {
+        Harness hx;
+        ViewModel vm(hx);   // the view at the root (970000)
+        hx.pool->tick();
+        handshake(hx, 2);
+        uint256 prev = hx.root;
+        std::vector<BlockType> c;
+        for (uint32_t i = 1; i <= 8; ++i) {
+            c.push_back(make_block(prev, 970000 + i, 160 + i, {make_spend(80 + i)}));
+            prev = block_hash(c.back());
+            vm.header(c.back(), true);
+        }
+        // c1's body never comes; c3 (below the floor 970004) and c6 are kept.
+        vm.f->on_body(c[2]);
+        vm.f->on_body(c[5]);
+        CHECK(vm.f->keeps(block_hash(c[2])) && vm.f->keeps(block_hash(c[5])),
+              "[W] c3 and c6 are kept (non-contiguous)");
+        vm.f->catch_up();
+        hx.advance(UtxoFollower::kStuckReanchorSec);
+        const auto r = vm.f->catch_up();
+        CHECK(r.step == UtxoFollower::Step::Reanchor && vm.reanchors == 1 && r.fetched.empty()
+                  && vm.best == block_hash(c[5]) && vm.best_h == 970006,
+              "[W] stuck: re-anchored on the kept c6 at once, the tip's body not fetched");
+        CHECK(!vm.f->keeps(block_hash(c[2])), "[W] the kept c3, below the floor, is dropped");
+
+        // Ticks during header sync restart the stuck clock.
+        Harness hy;
+        ViewModel vy(hy);
+        hy.pool->tick();
+        handshake(hy, 2);
+        const BlockType n1 = make_block(hy.root, 970001, 171, {make_spend(91)});
+        vy.header(n1, true);
+        vy.f->catch_up();   // the stuck clock starts
+        for (int i = 0; i < 40; ++i) {
+            hy.advance(60);
+            vy.f->on_tick(/*header_sync_caught_up=*/false);
+        }
+        const auto after = vy.f->on_tick(true);
+        CHECK(after.step == UtxoFollower::Step::Fetch && vy.reanchors == 0,
+              "[W] 40 min of header sync later: the first catch-up fetches, no stuck re-anchor");
     }
 
     // ── [V] the anchor floor; what is kept ────────────────────────────────────

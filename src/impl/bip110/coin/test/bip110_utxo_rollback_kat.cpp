@@ -19,6 +19,12 @@
 //       same failure leaves A3 and A2 undone in the cache, and A4's flush
 //       writes them: A1's coinbase (spent by A2) comes back unspent, A2's and
 //       A3's coinbases are gone -- a wrong ledger under a best that names A4.
+//   [D] utxo_connect_and_flush with a flush that fails (injected): A2's
+//       connect is dropped (the view stays at A1, A1's coinbase unspent, no
+//       change pending); A2 connected again once the flush works records an
+//       undo with A1's coinbase, which a rollback of A2 restores.
+//   [E] the witness: the same connect without the drop applies A2 twice and
+//       its undo record loses A1's coinbase; the rollback cannot restore it.
 //
 // Pure store test: no node, no network.
 
@@ -208,6 +214,32 @@ struct Setup {
     }
 };
 
+/// UTXOViewCache with a flush that can be made to fail (reads, connects and
+/// the rest go to the real cache).
+struct FlakyCache {
+    core::coin::UTXOViewCache& real;
+    bool fail_flush{false};
+
+    template <typename B, typename F>
+    core::coin::BlockUndo connect_block(const B& b, uint32_t h, F f, const uint256& id)
+    {
+        return real.connect_block(b, h, f, id);
+    }
+    bool flush(const uint256& id, uint32_t h) { return fail_flush ? false : real.flush(id, h); }
+    void discard_pending() { real.discard_pending(); }
+    void prune_undo(uint32_t h, uint32_t keep) { real.prune_undo(h, keep); }
+};
+
+/// The connect as main had it before: the flush's result ignored.
+template <typename Cache>
+void connect_ignoring_flush(Cache& cache, core::coin::UTXOViewDB& db, const BlockType& b, uint32_t height)
+{
+    const uint256 id = block_hash(b);
+    auto undo = cache.connect_block(b, height, txid_of, id);
+    db.put_block_undo(height, undo);
+    (void)cache.flush(id, height);
+}
+
 } // namespace
 
 int run_utxo_rollback_kat()
@@ -258,6 +290,47 @@ int run_utxo_rollback_kat()
         CHECK(has_coin(reopened, s.c1, 0) && !has_coin(reopened, s.cb2, 0) && !has_coin(reopened, s.cb3, 0)
                   && reopened.get_best().first == block_hash(s.a4),
               "[C] A4's flush writes them: A1's coinbase back unspent, A2's and A3's gone (why the drop)");
+    }
+
+    // ── [D] a failing flush drops the connect ──────────────────────────────────
+    for (const bool drop : {true, false}) {
+        Setup s(base + (drop ? "_flush_drop" : "_flush_plain"));
+        CHECK(s.db.open(), drop ? "[D] the DB opens" : "[E] the DB opens");
+        CHECK(connect(s.cache, s.db, s.a1 = block(uint256(), 100, 1, {}), 100, true),
+              drop ? "[D] A1 connects" : "[E] A1 connects");
+        s.c1 = txid_of(s.a1.m_txs[0]);
+        s.a2 = block(block_hash(s.a1), 101, 2, {spend(s.c1, 0, 100000)});
+        s.o2 = txid_of(s.a2.m_txs[1]);
+        FlakyCache flaky{s.cache, true};
+        if (drop) {
+            CHECK(!utxo_connect_and_flush(flaky, s.db, s.a2, 101, txid_of, block_hash(s.a2), 288),
+                  "[D] the flush fails: the connect reports failure");
+            CHECK(s.cache.cache_size() == 0 && has_coin(s.cache, s.c1, 0) && !has_coin(s.cache, s.o2, 0)
+                      && s.cache.get_best().first == block_hash(s.a1),
+                  "[D] A2's changes are dropped: the view is at A1, A1's coinbase unspent");
+            flaky.fail_flush = false;
+            CHECK(utxo_connect_and_flush(flaky, s.db, s.a2, 101, txid_of, block_hash(s.a2), 288),
+                  "[D] A2 connects once the flush works");
+        } else {
+            connect_ignoring_flush(flaky, s.db, s.a2, 101);
+            flaky.fail_flush = false;
+            connect_ignoring_flush(flaky, s.db, s.a2, 101);   // catch-up asks for it again
+        }
+        core::coin::BlockUndo undo;
+        const bool has_undo = s.db.get_block_undo(101, undo);
+        size_t known = 0;
+        for (const auto& tu : undo.tx_undos)
+            for (const auto& c : tu.spent_coins)
+                if (!c.is_spent())
+                    ++known;
+        const bool rolled = has_undo && s.cache.disconnect_from_undo(undo);
+        s.cache.flush(block_hash(s.a1), 100);
+        if (drop)
+            CHECK(known == 1 && rolled && has_coin(s.cache, s.c1, 0) && !has_coin(s.cache, s.o2, 0),
+                  "[D] A2's undo holds A1's coinbase; rolling A2 back restores it");
+        else
+            CHECK(known == 0 && !has_coin(s.cache, s.c1, 0),
+                  "[E] without the drop A2's undo lost A1's coinbase: the rollback cannot restore it");
     }
 
     std::printf("%s\n", g_fail == 0 ? "bip110_utxo_rollback_kat PASS" : "bip110_utxo_rollback_kat FAIL");

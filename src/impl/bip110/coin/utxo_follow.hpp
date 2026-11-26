@@ -23,7 +23,11 @@
 //     (the host's rollback leaves the view as the backing DB had it, nothing
 //     half-undone), the view is SUSPENDED -- no connect until it is re-anchored
 //     -- and re-anchored at once; a failed re-anchor is retried every
-//     kReanchorRetrySec (on_tick), whatever the header sync.
+//     kReanchorRetrySec (on_tick and tip changes, with no rollback attempt),
+//     whatever the header sync.
+//   - A re-anchor keeps the kept bodies at or above the anchor floor; an
+//     active one anchors the emptied view at once, else the tip's body is
+//     fetched.
 //   - Catch-up step (the pool driver, every kCoinPoolPollSec, once header sync
 //     is caught up):
 //       * an empty view: the tip's body is fetched, to anchor the view;
@@ -34,10 +38,11 @@
 //         more than kReanchorGap bodies (up to ~800 kB each under the RDTS cap)
 //         and a rollback can never reach below the undo horizon
 //         (BIP110_KEEP_DEPTH == kReanchorGap) anyway;
-//       * behind, and its best has not moved for kStuckReanchorSec (the next
-//         block's body did not come): an ERROR and a re-anchor at the tip,
-//         rather than the serve gate shut until the gap passes kReanchorGap
-//         (~48 h);
+//       * behind, and its best has not moved for kStuckReanchorSec of
+//         catch-up rounds (the next block's body did not come; the clock
+//         restarts whenever a tick skips the catch-up): an ERROR and a
+//         re-anchor at the tip, rather than the serve gate shut until the gap
+//         passes kReanchorGap (~48 h);
 //       * else the active chain's next kInFlight blocks after the view's best
 //         that are not kept are fetched (the pool holds a body that arrives
 //         before its parent, at most kCoinPoolMaxBodyGap of them; kInFlight
@@ -196,6 +201,14 @@ public:
     /// bodies again; a failed rollback suspends and re-anchors the view now.
     TipChange on_tip_changed()
     {
+        if (m_suspended) {
+            // No rollback of a suspended view: only the re-anchor (retried at
+            // most every kReanchorRetrySec, so a burst of tip changes wipes the
+            // view at most once per kReanchorRetrySec).
+            CatchUp ignored;
+            reanchor(tip(), "suspended after a failed rollback", ignored, /*error=*/true);
+            return m_suspended ? TipChange::RollbackFailed : TipChange::None;
+        }
         connect_kept();
         const auto [best, height] = view();
         if (best.IsNull() || on_active(best, height))
@@ -206,6 +219,9 @@ public:
         }
         m_suspended = true;
         CatchUp ignored;
+        // The wipe runs here, on the IO thread inside the header chain's tip
+        // callback; it is bounded by the view's size (the coins since its
+        // anchor, at most kReanchorGap undo records and retained bodies).
         reanchor(tip(), "a rollback to the fork failed", ignored, /*error=*/true);
         return TipChange::RollbackFailed;
     }
@@ -215,12 +231,22 @@ public:
     CatchUp on_tick(bool header_sync_caught_up)
     {
         if (m_suspended) {
+            // Also during header sync: a suspended view gets no connect, so it
+            // is wiped (at most every kReanchorRetrySec) and stays empty until
+            // header sync is caught up and the tip's body anchors it.
+            reset_stuck();
             CatchUp out;
             out.step = reanchor(tip(), "suspended after a failed rollback", out, true)
                 ? Step::Reanchor : Step::ReanchorFailed;
             return out;
         }
-        return header_sync_caught_up ? catch_up() : CatchUp{};
+        if (!header_sync_caught_up) {
+            // The stuck clock counts catch-up rounds only: the first one after
+            // header sync gets its fetch before any stuck re-anchor.
+            reset_stuck();
+            return CatchUp{};
+        }
+        return catch_up();
     }
 
     /// One catch-up step.
@@ -347,6 +373,11 @@ private:
         return false;
     }
 
+    static uint32_t anchor_floor(uint32_t tip_h)
+    {
+        return tip_h > kInFlight ? tip_h - static_cast<uint32_t>(kInFlight) : 0;
+    }
+
     void reset_stuck()
     {
         m_stuck_best.SetNull();
@@ -366,9 +397,8 @@ private:
         const auto at = active_at(*height);
         r.active = at && *at == id;
         const auto [best, best_height] = view();
-        const uint32_t t_h = tip();
-        const uint32_t floor = t_h > kInFlight ? t_h - static_cast<uint32_t>(kInFlight) : 0;
-        r.gate = utxo_connect_gate(best, best_height, id, block.m_previous_block, *height, at, floor);
+        r.gate = utxo_connect_gate(best, best_height, id, block.m_previous_block, *height, at,
+                                   anchor_floor(tip()));
         if (r.gate != UtxoConnectGate::Connect) {
             if (log_skip && r.gate != UtxoConnectGate::Below)
                 LOG_INFO << "[EMB-BIP110] utxo-connect deferred (" << utxo_connect_gate_name(r.gate)
@@ -436,10 +466,18 @@ private:
         }
         m_suspended = false;
         m_last_reanchor_fail = Clock::time_point{};
-        m_kept.clear();
+        // Kept bodies at or above the anchor floor stay: an active one anchors
+        // the emptied view at once (no wait for the tip's body); the rest go.
+        const uint32_t floor = anchor_floor(tip_h);
+        m_kept.retain([this, floor](const BlockType& b) {
+            const auto h = m_host.height_of ? m_host.height_of(block_hash(b)) : std::nullopt;
+            return h && *h >= floor;
+        });
         m_asked.clear();
         reset_stuck();
-        fetch_heights(tip_h, tip_h, out);
+        connect_kept();
+        if (view().first.IsNull())
+            fetch_heights(tip_h, tip_h, out);
         return true;
     }
 

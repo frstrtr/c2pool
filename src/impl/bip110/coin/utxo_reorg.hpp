@@ -29,9 +29,11 @@
 #include <core/coin/utxo.hpp>
 #include <core/coin/utxo_view_cache.hpp>
 #include <core/coin/utxo_view_db.hpp>
+#include <core/log.hpp>
 #include <core/uint256.hpp>
 
 #include <cstdint>
+#include <exception>
 
 namespace bip110 {
 namespace coin {
@@ -110,6 +112,38 @@ inline ReorgResult reorg_disconnect_or_discard(core::coin::UTXOViewCache& cache,
     if (r != ReorgResult::OK)
         cache.discard_pending();
     return r;
+}
+
+// Connect `block` at `height` to the view and persist it: its undo record,
+// then the flush, then the undo prune below keep_depth. If the flush (or the
+// connect) fails, the block's changes are dropped (discard_pending): the view
+// stays the DB's, at its old best, and false is returned, so the block is
+// connected again later from scratch -- not on top of its own unflushed
+// changes, which would apply it twice and write an undo record without the
+// coins it spent (a later rollback could not restore them). Cache / Db:
+// core::coin::UTXOViewCache / UTXOViewDB (templates: the KAT injects a
+// failing flush).
+template <typename Cache, typename Db, typename Block, typename TxidFn>
+inline bool utxo_connect_and_flush(Cache& cache, Db& db, const Block& block, uint32_t height,
+                                   TxidFn txid_fn, const uint256& block_hash, uint32_t keep_depth)
+{
+    try {
+        auto undo = cache.connect_block(block, height, txid_fn, block_hash);
+        db.put_block_undo(height, undo);
+        if (!cache.flush(block_hash, height)) {
+            cache.discard_pending();
+            LOG_ERROR << "[EMB-BIP110] UTXO flush failed h=" << height << " hash="
+                      << block_hash.GetHex().substr(0, 16)
+                      << ": the connect is dropped, the view stays at its best";
+            return false;
+        }
+        cache.prune_undo(height, keep_depth);
+    } catch (const std::exception& e) {
+        cache.discard_pending();
+        LOG_WARNING << "[EMB-BIP110] UTXO connect_block failed h=" << height << ": " << e.what();
+        return false;
+    }
+    return true;
 }
 
 } // namespace coin

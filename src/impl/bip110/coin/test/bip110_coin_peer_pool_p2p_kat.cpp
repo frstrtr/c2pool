@@ -447,8 +447,9 @@ int run_coin_peer_pool_p2p_kat()
               "[F] the follower reads the view and the active chain");
         const auto conn = src.find("fh.connect = [&utxo_cache, &utxo_db, &mempool, bip110_txid, BIP110_KEEP_DEPTH]");
         CHECK(near_after(src, conn, "bip110::coin::block_hash(", 400)
-                  && near_after(src, conn, "utxo_cache.connect_block(block, height, bip110_txid, block_hash);", 900),
-              "[F] the UTXO connect keys the block by the BIP-110 identity");
+                  && near_after(src, conn, "bip110::coin::utxo_connect_and_flush(utxo_cache, utxo_db, block, height, bip110_txid,", 700),
+              "[F] the UTXO connect keys the block by the BIP-110 identity; a failed flush drops it");
+        CHECK(!has(src, "utxo_cache.connect_block("), "[F] no connect that ignores its flush is left");
         CHECK(!has(src, "Hash(packed_hdr.get_span())"), "[F] no SHA256d(header) lookup is left");
         const auto rb = src.find("fh.rollback = [");
         CHECK(near_after(src, rb, "utxo_consistent.store(false, std::memory_order_relaxed);", 400)

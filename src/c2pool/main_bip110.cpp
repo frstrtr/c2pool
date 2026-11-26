@@ -1018,29 +1018,24 @@ int run_embedded(bool coin_p2p_discover,
             if (!e) return std::nullopt;
             return e->height;
         };
-        // The connect itself (the follower checked utxo_connect_gate).
+        // The connect itself (the follower checked utxo_connect_gate):
+        // utxo_connect_and_flush drops the block's changes if the flush or the
+        // connect fails (the view stays at its best; connected again later).
         fh.connect = [&utxo_cache, &utxo_db, &mempool, bip110_txid, BIP110_KEEP_DEPTH]
                      (const bip110::coin::BlockType& block, uint32_t height) -> bool {
             const uint256 block_hash =
                 bip110::coin::block_hash(static_cast<const bip110::coin::BlockHeaderType&>(block));
-            try {
-                auto undo = utxo_cache.connect_block(block, height, bip110_txid, block_hash);
-                utxo_db.put_block_undo(height, undo);
-                utxo_cache.flush(block_hash, height);
-                utxo_cache.prune_undo(height, BIP110_KEEP_DEPTH);
-                // (Explorer raw-block retention hoisted OUT of this connect gate to
-                // the top of the full_block subscriber — DASH/LTC parity — so it
-                // persists every received body regardless of connect contiguity.)
-                mempool.set_tip_height(height);
-                LOG_INFO << "[EMB-BIP110] UTXO connect: h=" << height
-                         << " txs=" << block.m_txs.size()
-                         << " best_height=" << utxo_cache.get_best_height();
-                return true;
-            } catch (const std::exception& e) {
-                LOG_WARNING << "[EMB-BIP110] UTXO connect_block failed h=" << height
-                            << ": " << e.what();
+            if (!bip110::coin::utxo_connect_and_flush(utxo_cache, utxo_db, block, height, bip110_txid,
+                                                      block_hash, BIP110_KEEP_DEPTH))
                 return false;
-            }
+            // (Explorer raw-block retention hoisted OUT of this connect gate to
+            // the top of the full_block subscriber — DASH/LTC parity — so it
+            // persists every received body regardless of connect contiguity.)
+            mempool.set_tip_height(height);
+            LOG_INFO << "[EMB-BIP110] UTXO connect: h=" << height
+                     << " txs=" << block.m_txs.size()
+                     << " best_height=" << utxo_cache.get_best_height();
+            return true;
         };
         // Kept bodies connected (their full_block pass ran when they came): the
         // UTXO-based mempool passes on the connected view.
