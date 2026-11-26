@@ -545,6 +545,14 @@ public:
         SSL_set_tlsext_host_name(stream_.native_handle(), "localhost");
     }
 
+    // Let this client really offer TLS 1.0 / 1.1: OpenSSL 3 forbids them
+    // below security level 0, so a refusal then comes from the server.
+    void allow_legacy_protocols()
+    {
+        SSL_set_security_level(stream_.native_handle(), 0);
+        SSL_set_cipher_list(stream_.native_handle(), "DEFAULT:@SECLEVEL=0");
+    }
+
     // TCP connect, then the TLS handshake within `timeout`.
     bool connect(uint16_t port, std::chrono::milliseconds timeout = 3000ms)
     {
@@ -961,6 +969,34 @@ TEST(StratumTlsSession, Tls12And13ClientsConnectOlderOnesDoNot)
     EXPECT_EQ(node.stratum->get_tls_handshakes(), 2u);
 }
 
+// One protocol version at a time, from a client able to offer TLS 1.0 and 1.1:
+// the server refuses 1.0 and 1.1 and accepts 1.2 and 1.3. (The context's
+// option and minimum-version bits are pinned in ServerContextDefaults.)
+TEST(StratumTlsSession, EachProtocolVersionAloneBelowTls12IsRefused)
+{
+    TempDir dir;
+    const auto a = make_cert(dir.path, "localhost", 1);
+    TlsNode node;
+    ASSERT_TRUE(node.start(a));
+    const std::pair<int, bool> cases[] = {
+        {TLS1_VERSION, false}, {TLS1_1_VERSION, false},
+        {TLS1_2_VERSION, true}, {TLS1_3_VERSION, true}};
+    for (const auto& [version, accepted] : cases) {
+        TlsClient c({}, version, version);
+        c.allow_legacy_protocols();
+        EXPECT_EQ(c.connect(node.tls_port), accepted)
+            << "protocol 0x" << std::hex << version << ": " << c.error();
+        if (accepted) {
+            // A reply proves the server finished its side of the handshake
+            // (a TLS 1.3 client finishes first).
+            c.send(kSubscribe);
+            EXPECT_TRUE(c.reply(1));
+        }
+    }
+    EXPECT_TRUE(wait_until([&] { return node.stratum->get_tls_handshake_failures() == 2; }));
+    EXPECT_TRUE(wait_until([&] { return node.stratum->get_tls_handshakes() == 2; }));
+}
+
 TEST(StratumTlsSession, PlaintextClientOnTheTlsPortIsClosed)
 {
     TempDir dir;
@@ -1185,6 +1221,10 @@ TEST(StratumTlsContextSettings, ServerContextDefaults)
     ASSERT_NE(h, nullptr);
     EXPECT_EQ(SSL_CTX_get_min_proto_version(h), TLS1_2_VERSION);
     const auto opts = SSL_CTX_get_options(h);
+    // The asio options on the context (both bounds are kept).
+    EXPECT_TRUE(opts & SSL_OP_NO_SSLv3);
+    EXPECT_TRUE(opts & SSL_OP_NO_TLSv1);
+    EXPECT_TRUE(opts & SSL_OP_NO_TLSv1_1);
     EXPECT_TRUE(opts & SSL_OP_NO_COMPRESSION);
     EXPECT_TRUE(opts & SSL_OP_CIPHER_SERVER_PREFERENCE);
     EXPECT_TRUE(opts & SSL_OP_NO_TICKET);

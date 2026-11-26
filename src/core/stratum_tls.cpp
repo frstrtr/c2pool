@@ -42,7 +42,17 @@ namespace net = boost::asio;
 
 class StratumTlsContext {
 public:
-    StratumTlsContext() : ssl(net::ssl::context::tls_server) {}
+    // Protocols below TLS 1.2 are switched off here as asio options and again
+    // by SSL_CTX_set_min_proto_version(TLS1_2_VERSION) in the loader.
+    StratumTlsContext() : ssl(net::ssl::context::tls_server)
+    {
+        ssl.set_options(net::ssl::context::default_workarounds
+                        | net::ssl::context::no_sslv2
+                        | net::ssl::context::no_sslv3
+                        | net::ssl::context::no_tlsv1
+                        | net::ssl::context::no_tlsv1_1
+                        | net::ssl::context::single_dh_use);
+    }
     net::ssl::context ssl;
     std::string description;
     std::optional<std::string> validity_problem;   // "expired" / "not yet valid"
