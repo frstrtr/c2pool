@@ -24,6 +24,7 @@
 
 #include "basic_coin_peer_pool.hpp"
 
+#include <core/inetwork.hpp>
 #include <core/netaddress.hpp>
 
 #include <cassert>
