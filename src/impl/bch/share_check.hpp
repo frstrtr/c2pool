@@ -2421,7 +2421,14 @@ uint256 create_local_share_v35(
     // such form cannot be carried by a v35 share: refuse to mint.
     {
         const std::string addr_str = v35_share_address_for_script(payout_script);
-        if (addr_str.empty() || v35_address_to_script(addr_str, pool_v35_net()) != payout_script) {
+        bool round_trips = false;
+        try {
+            round_trips = !addr_str.empty()
+                       && v35_address_to_script(addr_str, pool_v35_net()) == payout_script;
+        } catch (const V35AddressError&) {
+            round_trips = false;   // refuse to mint, never throw out of the author path
+        }
+        if (!round_trips) {
             LOG_WARNING << "[create_local_share_v35] REFUSING to mint: payout script has no "
                            "v35 address form (python would reject the share)";
             return uint256();
