@@ -478,6 +478,9 @@ private:
 					core::record_dial_family(addr.address(), core::dial_family_of(ep.address()));
 
 				LOG_TRACE << "[" << m_label << "] Handshake with " << ep.address() << ":" << ep.port();
+				// Tell the node which of its dials this is: for a HOST:PORT
+				// name the socket's own address is whichever endpoint won.
+				socket->set_dial_target(addr);
 				socket->init();
 
 				node_ptr->connected(socket);

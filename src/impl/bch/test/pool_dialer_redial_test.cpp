@@ -14,10 +14,19 @@
 //   BannedPinIsStillDialed              FAILS before the fix
 //   FailedDialLogIsRateLimited          FAILS before the fix
 //   UnmanagedNodeNeverHearsTheFailure   passes both: why standup_pool_run now
-//                                       owns the node through a shared_ptr
-//   ArmedNodeRedialsAfterRefusedDial    FAILS before the fix: a real io_context,
+//                                       owns the node through make_shared
+//   SharedNodeRedialsAfterRefusedDial   FAILS before the fix: a real io_context,
 //                                       a real refused TCP dial through
-//                                       core::Factory, the pin redialed ~2.7 s later
+//                                       core::Factory, the pin redialed by its
+//                                       timer (condition waits, no fixed sleep)
+//   HostnamePinLandsOnAnotherAddress    FAILS before the fix: a localhost:PORT pin
+//                                       that connects on ::1 (not the first IPv4
+//                                       the resolver memo keeps), drops, and must
+//                                       still be redialed
+//   TeardownJoinsComputeAndDetaches     FAILS before the fix: a won-block call in
+//                                       flight finishes before teardown returns,
+//                                       none can follow it
+//   StandupTearsDownBeforeTheDaemon     FAILS before the fix (source order)
 //
 // HARNESS: plain int main()/CHECK; runs from the already-allowlisted
 // bch_embedded_block_broadcast_test executable (run_pool_dialer_redial_checks()).
@@ -30,15 +39,28 @@
 
 #include <boost/asio.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <exception>
 #include <filesystem>
+#include <fstream>
+#include <functional>
+#include <future>
 #include <iostream>
 #include <memory>
+#include <sstream>
 #include <string>
+#include <thread>
 #include <unistd.h>
 #include <vector>
+
+#ifndef BCH_POOL_ENTRYPOINT_SRC
+#error "BCH_POOL_ENTRYPOINT_SRC must point at src/impl/bch/pool_entrypoint.hpp"
+#endif
+#ifndef BCH_MAIN_BCH_SRC
+#error "BCH_MAIN_BCH_SRC must point at src/c2pool/main_bch.cpp"
+#endif
 
 namespace {
 
@@ -98,6 +120,12 @@ public:
     }
     const auto& fail_log(const NetService& a) { return this->m_failed_dial_log[a]; }
     void log_fail(const NetService& a, clock_t_::time_point t) { this->log_failed_dial(a, t); }
+    void post_compute(std::function<void()> fn) { boost::asio::post(this->m_think_pool, std::move(fn)); }
+    void fire_broadcaster()
+    {
+        if (this->m_block_broadcaster)
+            this->m_block_broadcaster({}, std::string());
+    }
 
 protected:
     void begin_outbound_dial(const NetService& addr) override
@@ -237,6 +265,23 @@ uint16_t closed_loopback_port()
     return port;
 }
 
+// Run the io_context in short slices until pred() holds or the deadline passes.
+// Waits on the condition, not on a fixed time, so a slow host only takes longer.
+bool run_until(boost::asio::io_context& ioc, const std::function<bool()>& pred,
+               std::chrono::milliseconds deadline)
+{
+    const auto end = clock_t_::now() + deadline;
+    while (clock_t_::now() < end)
+    {
+        if (pred())
+            return true;
+        if (ioc.stopped())
+            ioc.restart();
+        ioc.run_for(std::chrono::milliseconds(20));
+    }
+    return pred();
+}
+
 void UnmanagedNodeNeverHearsTheFailure()
 {
     PrivateDataDir dir;
@@ -244,37 +289,181 @@ void UnmanagedNodeNeverHearsTheFailure()
     boost::asio::io_context ioc;
     const NetService pin{std::string("127.0.0.1"), closed_loopback_port()};
     {
-        LiveNode node(&ioc, &config);        // stack object, no lifetime handle
+        LiveNode node(&ioc, &config);        // stack object: no shared_ptr handle
         node.add_pinned_peer(pin);
         node.maintain_pinned_peers(clock_t_::now());
         ioc.run_for(std::chrono::milliseconds(1500));
         CHECK(node.dials == 1, "dials " << node.dials);
         CHECK(node.pending(pin), "the Factory drops connect_failed for an unmanaged node, so the "
-                                 "dial stays pending: this is the leak the shared_ptr owner closes");
+                                 "dial stays pending: this is the leak make_shared ownership closes");
     }
     ioc.restart();
     ioc.poll();
 }
 
-void ArmedNodeRedialsAfterRefusedDial()
+void SharedNodeRedialsAfterRefusedDial()
 {
     PrivateDataDir dir;
-    bch::Config config("bch");               // outlives ioc (pending handlers pin the node)
+    bch::Config config("bch");
     boost::asio::io_context ioc;
     const NetService pin{std::string("127.0.0.1"), closed_loopback_port()};
+    // As standup_pool_run: make_shared, no set_lifetime (nothing pins the node).
     auto node = std::make_shared<LiveNode>(&ioc, &config);
-    node->set_lifetime(node);
-    REQUIRE(node->lifetime_armed(), "lifetime armed");
+    REQUIRE(!static_cast<core::INetwork&>(*node).weak_from_this().expired(), "shared_ptr-managed");
     node->set_target_outbound_peers(8);
     node->add_pinned_peer(pin);
-    node->start_outbound_connections();      // pins first, then the (empty) addr-store dialer
+    node->start_outbound_connections();      // pins at once, then the 1 s pin timer
 
-    ioc.run_for(std::chrono::milliseconds(4500));
-    CHECK(node->dials == 2, "initial dial + one redial after ~e s within 4.5 s, got " << node->dials);
-    CHECK(!node->pending(pin), "the refused dial reached connect_failed");
-    const double left = node->pin_seconds_until_redial(pin, clock_t_::now());
-    CHECK(left > 2.0 && left <= E * E + 0.2, "second retry delay e^2, " << left << " s left");
+    CHECK(run_until(ioc, [&] { return node->dials >= 1 && !node->pending(pin); },
+                    std::chrono::seconds(15)),
+          "the refused first dial must reach connect_failed, dials " << node->dials);
+    const double first = node->pin_seconds_until_redial(pin, clock_t_::now());
+    CHECK(first > 0.0 && first <= E + 0.2, "first retry delay e, " << first << " s left");
+
+    CHECK(run_until(ioc, [&] { return node->dials >= 2 && !node->pending(pin); },
+                    std::chrono::seconds(30)),
+          "the pin timer must redial and that dial fail too, dials " << node->dials);
+    const double second = node->pin_seconds_until_redial(pin, clock_t_::now());
+    CHECK(second > E && second <= E * E + 0.2, "second retry delay e^2, " << second << " s left");
+    node->stop_for_teardown();
     node.reset();
+}
+
+void HostnamePinLandsOnAnotherAddress()
+{
+    using boost::asio::ip::tcp;
+    // Needs "localhost" -> both 127.0.0.1 and ::1, and a bindable ::1.
+    {
+        boost::asio::io_context io;
+        tcp::resolver r(io);
+        boost::system::error_code ec;
+        auto res = r.resolve("localhost", "0", ec);
+        bool v4 = false, v6 = false;
+        for (const auto& e : res)
+        {
+            v4 = v4 || e.endpoint().address().is_v4();
+            v6 = v6 || e.endpoint().address().is_v6();
+        }
+        if (ec || !v4 || !v6)
+        {
+            std::cout << "  note: skipped, localhost does not resolve to both IPv4 and IPv6 here\n";
+            return;
+        }
+    }
+    PrivateDataDir dir;
+    bch::Config config("bch");
+    boost::asio::io_context ioc;
+    tcp::acceptor acc(ioc);
+    {
+        boost::system::error_code ec;
+        acc.open(tcp::v6(), ec);
+        if (!ec) acc.set_option(boost::asio::ip::v6_only(true), ec);
+        if (!ec) acc.bind({boost::asio::ip::make_address("::1"), 0}, ec);
+        if (!ec) acc.listen(8, ec);
+        if (ec)
+        {
+            std::cout << "  note: skipped, cannot listen on [::1]: " << ec.message() << "\n";
+            return;
+        }
+    }
+    // Listening on ::1 only: whatever order the resolver gives, the dial lands
+    // on ::1, never on the 127.0.0.1 core::lookup_resolved_host remembers.
+    const NetService pin{std::string("localhost"), acc.local_endpoint().port()};
+    auto node = std::make_shared<LiveNode>(&ioc, &config);
+    node->add_pinned_peer(pin);
+
+    std::shared_ptr<tcp::socket> server;
+    acc.async_accept([&](const boost::system::error_code& ec, tcp::socket sock) {
+        if (!ec) server = std::make_shared<tcp::socket>(std::move(sock));
+    });
+    REQUIRE(node->maintain_pinned_peers(clock_t_::now()) == 1, "pin dialed");
+    REQUIRE(run_until(ioc, [&] { return server && node->pin_connected(pin); }, std::chrono::seconds(15)),
+            "the pin must connect on [::1]");
+    CHECK(!node->pending(pin), "the name-keyed pending mark is cleared by the dial target");
+
+    server->close();                         // the peer drops us
+    CHECK(run_until(ioc, [&] { return !node->pin_connected(pin); }, std::chrono::seconds(15)),
+          "the drop must be seen");
+    CHECK(node->pin_seconds_until_redial(pin, clock_t_::now()) > 0.0,
+          "the drop of a connection made for the pin schedules its redial");
+    CHECK(node->maintain_pinned_peers(clock_t_::now() + std::chrono::hours(2)) == 1,
+          "and the pin is dialed again (not stuck as pending or as connected)");
+    run_until(ioc, [&] { return !node->pending(pin); }, std::chrono::seconds(5));
+    node->stop_for_teardown();
+    node.reset();
+    acc.close();
+    ioc.restart();
+    ioc.poll();
+}
+
+void TeardownJoinsComputeAndDetaches()
+{
+    PrivateDataDir dir;
+    Probe node;
+    std::atomic<int> calls{0}, after{0};
+    std::atomic<bool> torn{false};
+    node.set_block_broadcaster([&](const std::vector<unsigned char>&, const std::string&) {
+        ++calls;
+        if (torn) ++after;
+    });
+    // A think() inside a won block when SIGTERM stops the run-loop.
+    std::promise<void> started, release;
+    auto released = release.get_future().share();
+    node.post_compute([&node, &started, released] {
+        started.set_value();
+        released.wait();
+        node.fire_broadcaster();
+    });
+    started.get_future().wait();
+    std::thread releaser([&release] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        release.set_value();
+    });
+    node.stop_for_teardown();                // waits for the running task
+    torn = true;
+    releaser.join();
+    CHECK(calls == 1, "the in-flight won-block call completes before teardown returns, calls " << calls);
+    node.post_compute([&node] { node.fire_broadcaster(); });   // after teardown: never runs
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    CHECK(after == 0, "no won-block call after teardown, got " << after);
+    CHECK(!node.has_block_broadcaster(), "the won-block sink is cleared");
+    CHECK(!node.tracker().m_on_block_found, "the tracker's block-found hook is cleared");
+    CHECK(node.torn_down(), "torn down");
+    node.stop_for_teardown();                // idempotent
+}
+
+std::string slurp(const char* path)
+{
+    std::ifstream f(path);
+    std::stringstream ss;
+    ss << f.rdbuf();
+    return ss.str();
+}
+
+void StandupTearsDownBeforeTheDaemon()
+{
+    const std::string ep = slurp(BCH_POOL_ENTRYPOINT_SRC);
+    REQUIRE(!ep.empty(), "read " << BCH_POOL_ENTRYPOINT_SRC);
+    const auto daemon_decl = ep.find("coin::EmbeddedDaemon<Config> daemon(");
+    const auto node_decl = ep.find("std::make_shared<Node>(&ioc, &config)");
+    const auto guard = ep.find("node_teardown{node}");
+    const auto run = ep.find("ioc.run();");
+    const auto stop = ep.find("node.stop_for_teardown();");
+    REQUIRE(daemon_decl != std::string::npos && node_decl != std::string::npos, "declarations found");
+    CHECK(daemon_decl < node_decl, "the daemon is declared before the node, so it outlives it");
+    CHECK(guard != std::string::npos && guard > node_decl, "a teardown guard follows the node (exception path)");
+    CHECK(run != std::string::npos && stop != std::string::npos && stop > run,
+          "stop_for_teardown() runs right after ioc.run() returns");
+    CHECK(ep.find("node_holder->set_lifetime") == std::string::npos,
+          "set_lifetime would pin the node past the daemon (destroyed in ~io_context)");
+
+    const std::string mb = slurp(BCH_MAIN_BCH_SRC);
+    const auto run_pool = mb.find("int run_pool(");
+    REQUIRE(run_pool != std::string::npos, "run_pool found");
+    const auto cfg = mb.find("bch::Config config(\"bch\");", run_pool);
+    const auto io = mb.find("boost::asio::io_context ioc;", run_pool);
+    CHECK(cfg != std::string::npos && io != std::string::npos && cfg < io,
+          "run_pool declares config before ioc, so config outlives the io_context");
 }
 
 void run_case(const char* name, void (*fn)())
@@ -302,6 +491,9 @@ int run_pool_dialer_redial_checks()
     run_case("BannedPinIsStillDialed", BannedPinIsStillDialed);
     run_case("FailedDialLogIsRateLimited", FailedDialLogIsRateLimited);
     run_case("UnmanagedNodeNeverHearsTheFailure", UnmanagedNodeNeverHearsTheFailure);
-    run_case("ArmedNodeRedialsAfterRefusedDial", ArmedNodeRedialsAfterRefusedDial);
+    run_case("SharedNodeRedialsAfterRefusedDial", SharedNodeRedialsAfterRefusedDial);
+    run_case("HostnamePinLandsOnAnotherAddress", HostnamePinLandsOnAnotherAddress);
+    run_case("TeardownJoinsComputeAndDetaches", TeardownJoinsComputeAndDetaches);
+    run_case("StandupTearsDownBeforeTheDaemon", StandupTearsDownBeforeTheDaemon);
     return g_failures;
 }

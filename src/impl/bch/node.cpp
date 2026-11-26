@@ -132,15 +132,18 @@ void NodeImpl::send_ping(peer_ptr peer)
 void NodeImpl::connected(std::shared_ptr<core::Socket> socket)
 {
     auto addr = socket->get_addr();
-    bool is_outbound = m_pending_outbound.erase(addr) > 0;
-    // A pin given as HOST:PORT was dialed (and marked pending) under its name.
-    const auto pin = pin_for(addr);
-    if (pin && *pin != addr)
-        is_outbound = m_pending_outbound.erase(*pin) > 0 || is_outbound;
+    // An outbound dial was marked pending under the NetService it was made
+    // for, which for a HOST:PORT pin is the name, not the endpoint it landed
+    // on: clear it by the dial target the Factory hands over.
+    const NetService dialed = socket->dial_target().value_or(addr);
+    bool is_outbound = m_pending_outbound.erase(dialed) > 0;
+    if (dialed != addr)
+        is_outbound = m_pending_outbound.erase(addr) > 0 || is_outbound;
+    const bool pinned = is_outbound && is_pinned(dialed);
 
     // Reject banned peers. A pinned peer we dialed is exempt, as python's
     // --p2pool-node connection (SingleClientFactory) never consults the bans.
-    if (is_banned(addr) && !(is_outbound && pin))
+    if (is_banned(addr) && !pinned)
     {
         LOG_INFO << "[Pool] Rejecting connection from banned peer " << addr.to_string();
         socket->close();
@@ -152,6 +155,8 @@ void NodeImpl::connected(std::shared_ptr<core::Socket> socket)
 
     if (is_outbound)
         m_outbound_addrs.insert(addr);
+    if (pinned)
+        m_pin_live[addr] = dialed;
 
     auto peer = m_connections[addr];
     send_version(peer);
@@ -198,6 +203,7 @@ void NodeImpl::error(const message_error_type& err, const NetService& service, c
     // A pinned peer dropped: redial it with back-off (python --p2pool-node).
     if (auto pin = pin_for(service))
         schedule_pin_redial(*pin, std::chrono::steady_clock::now());
+    m_pin_live.erase(service);
 
     // p2pool p2p.py:595: self.get_shares.respond_all(reason)
     // Cancel pending share requests for this peer — invokes callbacks with
@@ -238,6 +244,7 @@ void NodeImpl::close_connection(const NetService& service)
     m_outbound_addrs.erase(service);
     if (auto pin = pin_for(service))
         schedule_pin_redial(*pin, std::chrono::steady_clock::now());
+    m_pin_live.erase(service);
 
     // Drop stale nonce->peer entries for this endpoint (parity with error()).
     // close_connection is a peer-removal path too — without this a graceful
@@ -1501,6 +1508,31 @@ void NodeImpl::flush_verified_to_leveldb()
     }
     m_storage->mark_shares_verified_with_pow(hash_pow_pairs);
     m_verified_flush_buf.clear();
+}
+
+void NodeImpl::stop_for_teardown()
+{
+    if (m_torn_down)
+        return;
+    m_torn_down = true;
+
+    // Compute side first: stop() lets a running think()/verify task finish and
+    // drops the queued ones, join() waits for it. Only then is nothing left
+    // that can call the callbacks below, so clearing them is race-free.
+    m_think_pool.stop();
+    m_verify_pool.stop();
+    m_think_pool.join();
+    m_verify_pool.join();
+
+    // Callbacks into objects the entrypoint owns (the embedded daemon behind
+    // the won-block sink, the stratum work refresh). The node must not reach
+    // them once the entrypoint starts destroying them.
+    m_block_broadcaster = nullptr;
+    m_tracker.m_on_block_found = nullptr;
+    m_on_best_share_changed = nullptr;
+    m_on_bestblock = nullptr;
+
+    shutdown();   // flush the LevelDB buffers while the node is quiet
 }
 
 void NodeImpl::shutdown()

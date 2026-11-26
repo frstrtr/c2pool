@@ -473,8 +473,9 @@ public:
     // close_connection(), which both need a socket. Without this override the
     // address stayed in m_pending_outbound for the life of the process and
     // try_connect_peers() skipped it on every later pass: a peer that was down
-    // at the first dial was never dialed again. The Factory only calls this
-    // through a lifetime handle (set_lifetime), so standup_pool_run arms one.
+    // at the first dial was never dialed again. The Factory calls this only
+    // through a live shared_ptr to the node (enable_shared_from_this or
+    // set_lifetime), so standup_pool_run creates the node with make_shared.
     //
     // IO thread, same discipline as error(). m_outbound_addrs is cleared only
     // when no connection to the address is live. A pinned peer
@@ -724,6 +725,13 @@ public:
     /// Graceful shutdown: flush pending verified/removal buffers to LevelDB.
     void shutdown();
 
+    /// Teardown before the entrypoint destroys what the node calls into (the
+    /// embedded daemon): stop and join the think/verify pools, then clear the
+    /// won-block and best-share callbacks, then flush (shutdown()). After this
+    /// no node code calls an entrypoint object. Call once ioc.run() returned.
+    void stop_for_teardown();
+    bool torn_down() const { return m_torn_down; }
+
     /// Start dialing outbound peers from AddrStore / bootstrap list.
     /// Maintains target outbound peer count active outbound connections.
     void start_outbound_connections();
@@ -925,6 +933,7 @@ protected:
     std::string m_software_version = "/c2pool:0.1/";  // overridden by set_software_version()
     std::function<void(const uint256&)> m_on_bestblock;
     std::function<void()> m_on_best_share_changed;
+    bool m_torn_down = false;   // stop_for_teardown() ran (IO/owner thread only)
     std::function<double()> m_local_hashrate_fn;
     std::function<LocalRateStats()> m_local_rate_stats_fn;
     std::function<std::vector<std::pair<std::string, uint64_t>>()> m_current_pplns_fn;
@@ -996,33 +1005,35 @@ protected:
         core::Client::connect(addr);
     }
 
-    // The pin a live connection belongs to: the address itself, or a pinned
-    // HOST:PORT whose name resolved to this IP (core::lookup_resolved_host).
+    // Live connections made by dialing a pin: the endpoint the dial landed on
+    // (a HOST:PORT pin may land on any of its addresses) -> the pin. Filled in
+    // connected() from the socket's dial target, cleared on the drop.
+    std::map<NetService, NetService> m_pin_live;
+
+    // The pin a live connection belongs to: the pin its dial was made for, or
+    // the address itself when that is a pin.
     std::optional<NetService> pin_for(const NetService& live) const
     {
+        if (auto it = m_pin_live.find(live); it != m_pin_live.end())
+            return it->second;
         if (m_pinned_peers.contains(live))
             return live;
-        for (const auto& [pin, state] : m_pinned_peers)
-        {
-            (void)state;
-            if (pin.port() != live.port())
-                continue;
-            auto ip = core::lookup_resolved_host(pin.address());
-            if (ip && *ip == live.address())
-                return pin;
-        }
         return std::nullopt;
     }
 
-    // A live connection to the pin, under its own address or, for a HOST:PORT
-    // pin, under the IP its name resolved to.
+public:
+    /// A live connection made for this pin (under whatever address it landed on).
     bool pin_connected(const NetService& pin) const
     {
         if (m_connections.contains(pin))
             return true;
-        auto ip = core::lookup_resolved_host(pin.address());
-        return ip && m_connections.contains(NetService(*ip, pin.port()));
+        for (const auto& [live, p] : m_pin_live)
+            if (p == pin && m_connections.contains(live))
+                return true;
+        return false;
     }
+
+protected:
 
     // twisted ReconnectingClientFactory.retry(), without the jitter: after a
     // failed dial or a drop, delay = min(delay * e, 3600) and redial then.

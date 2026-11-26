@@ -32,9 +32,17 @@
 //             dropped, then left-padded to 20 bytes; an odd hex length raises.
 //             type 0 -> 76 a9 <len> h 88 ac, type 1 -> a9 <len> h 87, any other
 //             type raises NotImplementedError.
+//
+// padding_bugfix: p2pool's load_share sets net.PARENT.padding_bugfix =
+// (share type >= 35), a process-wide flag. jtoomim's p2poolBCH therefore runs
+// v34 shares with it False ('{:x}', no padding to 20 bytes, so a hash with a
+// leading zero byte becomes a shorter push). kr1z1sBCH, the public chain, has
+// only v35 shares. This rule is the v35 (True) one for every share; the v34
+// difference is unreachable on the live chain.
 
 #include <btclibs/crypto/sha256.h>
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>

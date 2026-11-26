@@ -160,6 +160,10 @@ public:
     std::string                         get_current_gbt_prevhash() const override;
     uint64_t                            get_work_generation() const override;
     bool                                has_merged_chain(uint32_t chain_id) const override;
+    /// v34/v35 shares carry a legacy Base58 address (python script2_to_address
+    /// form). While the chain mints them (author version < 36), refuse a login
+    /// whose payout script has none (e.g. a 32-byte P2SH CashAddr).
+    std::string                         authorize_refusal(const std::string& username) const override;
 
     /// #961 cross-lane (B4): publish BCH's OWN payout-address acceptance (legacy
     /// base58; CashAddr is a registered native decoder consulted by decide_payout_

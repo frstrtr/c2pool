@@ -154,17 +154,27 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
 
     // 3: the pool node (sharechain, LevelDB, P2P, Stratum).
     // concrete NodeBridge<NodeImpl,Legacy,Actual> -- NodeImpl alone is abstract
-    // (ICommunicator::handle lives in NodeBridge). shared_ptr-owned +
-    // set_lifetime, as the DASH node: core::Server(accept) and core::Client(dial)
-    // then pin it with a strong ref per async op, and the Factory delivers
-    // connect_failed() (it drops that signal for a node with no lifetime
-    // handle), so a failed sharechain dial is no longer left pending forever.
-    // `node` is a reference alias, so every use below is unchanged.
+    // (ICommunicator::handle lives in NodeBridge). Owned through make_shared so
+    // core::Factory sees it as managed (enable_shared_from_this): every
+    // accept/dial completion re-locks a weak handle, so a failed sharechain
+    // dial reaches connect_failed() (dropped for a node with no handle) and is
+    // no longer left pending forever. Deliberately NOT set_lifetime(): that
+    // pins the node in every pending async op, so it would outlive this
+    // function and be destroyed in ~io_context, after `daemon` -- the
+    // won-block sink's target. This way it is destroyed at the end of this
+    // scope, before `daemon`, as the stack object was; stop_for_teardown()
+    // below quiets it first. `node` is a reference alias, so every use below
+    // is unchanged.
     auto node_holder = std::make_shared<Node>(&ioc, &config);
     Node& node = *node_holder;
-    node_holder->set_lifetime(node_holder);
-    if (!node_holder->lifetime_armed())
-        throw std::runtime_error("bch::standup_pool_run: sharechain node dial/accept lifetime failed to arm");
+    if (static_cast<core::INetwork&>(node).weak_from_this().expired())
+        throw std::runtime_error("bch::standup_pool_run: sharechain node is not shared_ptr-managed");
+    // Also on an exception out of the run-loop: the guard is destroyed just
+    // before the node and after everything declared later (idempotent).
+    struct NodeTeardown {
+        NodeImpl& n;
+        ~NodeTeardown() { n.stop_for_teardown(); }
+    } node_teardown{node};
 
     // 4: bind the in-operation won-block fire path to the dual-path broadcaster.
     wire_won_block_sink(node, daemon);
@@ -1125,6 +1135,12 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
     // Drive the shared io_context: pool node + embedded daemon + stratum run together.
     ioc.run();
 
+    // Teardown order. Locals die in reverse: stratum/web, the node, then
+    // `daemon`. Quiet the node first: join its think/verify pools (a think()
+    // may be inside a won block, calling the sink into `daemon`) and clear its
+    // callbacks, so no node code runs against a destroyed object.
+    node.stop_for_teardown();
+
     // LTC-parity site 3/3 (the TRUE third, missing until now): save the stat log
     // on clean shutdown. load-on-start (site 1) + periodic-100s (site 2) only
     // persist at tick boundaries, so without this every clean restart drops
@@ -1140,6 +1156,7 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
         if (auto* mi = web_server->get_mining_interface())
             mi->save_stat_log();
     }
+
 }
 
 } // namespace bch

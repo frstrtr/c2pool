@@ -35,6 +35,7 @@
 #include <impl/bch/coin/template_builder.hpp>  // build_template + rpc::WorkData
 #include <impl/bch/config_pool.hpp>            // PoolConfig::max_target (G2 cold-start floor)
 #include <impl/bch/config_coin.hpp>            // bch::address_acceptance (#961 registry-sourced payout check)
+#include <impl/bch/v35_address.hpp>            // v35_script_to_address (v35 share address form)
 
 #include <core/log.hpp>
 #include <btclibs/util/strencodings.h>         // HexStr
@@ -400,6 +401,31 @@ void BCHWorkSource::set_node_owner_fee(double pct, std::vector<unsigned char> sc
 // The fee is NOT a coinbase output — it is a payout-identity substitution into
 // the share's existing committed pubkey_hash, so verify reproduces the coinbase
 // byte-for-byte.
+std::string BCHWorkSource::authorize_refusal(const std::string& username) const
+{
+    std::function<int64_t()> author_version_fn;
+    {
+        std::lock_guard<std::mutex> lk(callback_mutex_);
+        author_version_fn = author_version_fn_;
+    }
+    const int64_t author_version = author_version_fn ? author_version_fn() : 35;
+    if (author_version >= 36)
+        return {};
+    // The same decode mining_submit applies: own legacy Base58, else CashAddr.
+    std::vector<unsigned char> script;
+    const auto match = core::classify_address_for_coin(
+        username, bch::address_acceptance(is_testnet_, is_regtest_), script);
+    if (match == core::AddressCoinMatch::Invalid)
+        script = core::address_to_script(username);
+    if (script.empty())
+        return {};   // undecodable / foreign: the existing door and submit checks handle it
+    if (!bch::v35_script_to_address(script, bch::V35_MAINNET).empty())
+        return {};
+    return "this chain mints v35 shares, which carry only a P2PKH or 20-byte P2SH "
+           "address; this payout address has neither form (use a P2PKH or 20-byte "
+           "P2SH address)";
+}
+
 std::vector<unsigned char> BCHWorkSource::effective_payout_script(
     const std::vector<unsigned char>& miner_script,
     const uint256& prev_share_hash,

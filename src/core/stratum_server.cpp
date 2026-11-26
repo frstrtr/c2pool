@@ -1388,6 +1388,19 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
             }
         }
 
+        if (!username_.empty()) {
+            const std::string why = mining_interface_->authorize_refusal(username_);
+            if (!why.empty()) {
+                LOG_WARNING << "[Stratum] REJECTED mining.authorize: " << username_ << ": " << why;
+                authorized_ = false;
+                nlohmann::json response;
+                response["id"] = request_id;
+                response["result"] = false;
+                response["error"] = nlohmann::json::array({24, "Unauthorized: " + why, nullptr});
+                return response;
+            }
+        }
+
         LOG_INFO << "[Stratum] Mining authorization successful for: " << username_;
         login_primary_ = username_;
         login_given_ = std::move(given_now);
