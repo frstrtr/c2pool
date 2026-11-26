@@ -8,6 +8,7 @@
 #include "share.hpp"
 #include "share_messages.hpp"
 #include "share_types.hpp"
+#include "v35_address.hpp"         // python address_to_script2 for v34/v35 share addresses
 #include "version_switch_gate.hpp"
 #include <core/version_gate.hpp>   // SSOT: core::version_gate::is_v36_active
 
@@ -290,42 +291,19 @@ inline std::vector<unsigned char> compute_gentx_before_refhash(int64_t share_ver
 }
 
 // ============================================================================
-// pubkey_hash_to_address()
+// v34/v35 share addresses (python share_data.address)
 //
-// Convert (pubkey_hash, pubkey_type) to a Litecoin address string.
-// Used for V35 share_data.address field (VarStr).
-// pubkey_type: 0=P2PKH, 1=P2WPKH, 2=P2SH (same as V36 encoding)
+// The network is the pool's own (PoolConfig::is_testnet, which also selects the
+// IDENTIFIER and PREFIX). The rule itself is in v35_address.hpp.
 // ============================================================================
-inline std::string pubkey_hash_to_address(const uint160& pubkey_hash, uint8_t pubkey_type)
+inline const V35Net& pool_v35_net() { return v35_net(PoolConfig::is_testnet); }
+
+// The address string our own v34/v35 share carries for `payout_script`: the
+// form python's script2_to_address writes (legacy Base58, BCH version bytes).
+// Empty when the script has no such form; a v35 share must not be minted then.
+inline std::string v35_share_address_for_script(const std::vector<unsigned char>& payout_script)
 {
-    bool testnet = PoolConfig::is_testnet;
-    if (pubkey_type == 0) {
-        // P2PKH: Base58Check with version byte
-        uint8_t ver = testnet ? 0x6f : 0x30;
-        std::vector<unsigned char> payload(21);
-        payload[0] = ver;
-        std::memcpy(payload.data() + 1, pubkey_hash.data(), 20);
-        return EncodeBase58Check({payload.data(), payload.size()});
-    } else if (pubkey_type == 1) {
-        // P2WPKH: Bech32 segwit v0 — BTC mainnet "bc", testnet "tb"
-        std::string hrp = testnet ? "tb" : "bc";
-        std::vector<uint8_t> prog(20);
-        std::memcpy(prog.data(), pubkey_hash.data(), 20);
-        return bech32::encode_segwit(hrp, 0, prog);
-    } else if (pubkey_type == 2) {
-        // P2SH: Base58Check with version byte
-        uint8_t ver = testnet ? 0xc4 : 0x32;
-        std::vector<unsigned char> payload(21);
-        payload[0] = ver;
-        std::memcpy(payload.data() + 1, pubkey_hash.data(), 20);
-        return EncodeBase58Check({payload.data(), payload.size()});
-    }
-    // Fallback: P2PKH
-    uint8_t ver = testnet ? 0x6f : 0x30;
-    std::vector<unsigned char> payload(21);
-    payload[0] = ver;
-    std::memcpy(payload.data() + 1, pubkey_hash.data(), 20);
-    return EncodeBase58Check({payload.data(), payload.size()});
+    return v35_script_to_address(payout_script, pool_v35_net());
 }
 
 // ============================================================================
@@ -506,6 +484,12 @@ uint256 share_init_verify(const ShareT& share, bool check_pow = true)
 
     if (share.m_merkle_link.m_branch.size() > 16)
         throw std::invalid_argument("merkle branch too long");
+
+    // v34/v35: python Share.__init__ computes new_script = address_to_script2(
+    // share_data['address']) and raises on an address it cannot convert, so the
+    // share never exists. Same here: V35AddressError rejects the share.
+    if constexpr (requires { share.m_address; })
+        (void)get_share_script(&share);
 
     constexpr int64_t ver = ShareT::version;
 
@@ -741,8 +725,8 @@ uint256 share_init_verify(const ShareT& share, bool check_pow = true)
     if (!share.m_hash.IsNull() && share_hash != share.m_hash) {
         static int preimage_diag = 0;
         if (preimage_diag++ < 10) {
-            LOG_WARNING << "[verify-preimage] recomputed=" << share_hash.GetHex().substr(0, 16)
-                        << " stored=" << share.m_hash.GetHex().substr(0, 16);
+            LOG_WARNING << "[verify-preimage] recomputed=" << share_hash.GetHex()
+                        << " stored=" << share.m_hash.GetHex();
             LOG_WARNING << "[verify-preimage] gentx_hash=" << gentx_hash.GetHex()
                         << " merkle_root=" << merkle_root.GetHex();
             LOG_WARNING << "[verify-preimage] hdr ver=" << share.m_min_header.m_version
@@ -932,6 +916,11 @@ inline std::vector<unsigned char> resolve_merged_payout_script(
 
 // ============================================================================
 // Helper: extract full scriptPubKey from a share variant
+//
+// V34/V35 shares carry an address string; it is converted with the python rule
+// (v35_address_to_script). An address python refuses throws V35AddressError:
+// such a share is invalid (share_init_verify rejects it before it reaches the
+// tracker), and its string bytes are never used as a script.
 // ============================================================================
 inline std::vector<unsigned char> get_share_script(const auto* obj)
 {
@@ -939,17 +928,187 @@ inline std::vector<unsigned char> get_share_script(const auto* obj)
         return pubkey_hash_to_script(obj->m_pubkey_hash, obj->m_pubkey_type);
     else if constexpr (requires { obj->m_address; })
     {
-        // V34/V35: m_address contains a human-readable address string.
-        // Convert to scriptPubKey for PPLNS weight computation.
-        std::string addr_str(obj->m_address.m_data.begin(), obj->m_address.m_data.end());
-        auto script = core::address_to_script(addr_str);
-        if (!script.empty())
-            return script;
-        // Fallback: return raw bytes (shouldn't happen with valid addresses)
-        return obj->m_address.m_data;
+        const auto& a = obj->m_address.m_data;
+        return v35_address_to_script(
+            std::string_view(reinterpret_cast<const char*>(a.data()), a.size()), pool_v35_net());
     }
     else
         return pubkey_hash_to_script(obj->m_pubkey_hash, 0);
+}
+
+// ============================================================================
+// v35_pplns_key()
+//
+// The key of a share in the pre-v36 (flat) PPLNS window: python's
+// `share.address`, which WeightsSkipList.get_delta keys the weights by and
+// generate_transaction keys the amounts, the finder entry and the tie-sort by.
+//   v34/v35: share_data['address'], the string exactly as carried;
+//   pre-v34: pubkey_hash_to_address(pubkey_hash, ADDRESS_VERSION, -1);
+//   v36 (p2pool-merged-v36): pubkey_hash_to_address(pubkey_hash, *ver/witver of
+//            pubkey_type*): P2SH -> P2SH version, P2WPKH -> CashAddr type 0,
+//            anything else -> P2PKH version.
+// Two strings for one script are two keys, as in python. The key becomes a
+// script only when the coinbase outputs are written (v35_address_to_script).
+// ============================================================================
+inline std::vector<unsigned char> v35_pplns_key(const auto* obj)
+{
+    if constexpr (requires { obj->m_address; })
+        return obj->m_address.m_data;
+    else
+    {
+        const auto& net = pool_v35_net();
+        const auto h = obj->m_pubkey_hash.GetChars();
+        std::string addr;
+        if constexpr (requires { obj->m_pubkey_type; })
+        {
+            if (obj->m_pubkey_type == 2)
+                addr = v35_legacy_address(net.p2sh_version, h.data());
+            else if (obj->m_pubkey_type == 1)
+                addr = v35_cashaddr_encode(net.hrp, 0, std::vector<uint8_t>(h.begin(), h.end()));
+            else
+                addr = v35_legacy_address(net.p2pkh_version, h.data());
+        }
+        else
+            addr = v35_legacy_address(net.p2pkh_version, h.data());
+        return std::vector<unsigned char>(addr.begin(), addr.end());
+    }
+}
+
+// ============================================================================
+// v35_gentx_outputs()
+//
+// The pre-v36 payout outputs of python generate_transaction() (kr1z1sBCH
+// c198121 / p2poolBCH 6603b79 p2pool/data.py), from weights keyed by address:
+//
+//   amounts = {a: subsidy*(199*w)//(200*total_weight)}      # every key, zeros kept
+//   amounts[this_address] += subsidy//200                   # finder
+//   amounts[donation_address] = amounts.get(donation_address, 0)
+//                               + subsidy - sum(amounts)    # rest to donation
+//   sum(amounts) != subsidy or any < 0  -> ValueError
+//   dests = sorted(amounts, key=(a == donation_address, amounts[a], a))[-4000:]
+//   payouts = [(amounts[a], address_to_script2(a)) for a in dests
+//              if amounts[a] and a != donation_address]
+//   + (amounts[donation_address], DONATION_SCRIPT)          # always, last
+//
+// Ties sort by the address bytes (python 2 str order == vector<unsigned char>
+// order). An address that equals donation_address is paid inside the donation
+// output. The donation output itself is not included in `payouts`.
+// ============================================================================
+struct V35GentxOutputs
+{
+    std::vector<std::pair<std::vector<unsigned char>, uint64_t>> payouts;  // (script, amount), coinbase order
+    std::vector<std::vector<unsigned char>> payout_keys;                   // address of each payout (diagnostics)
+    uint64_t donation_amount{0};
+};
+
+inline V35GentxOutputs v35_gentx_outputs(
+    const std::map<std::vector<unsigned char>, uint288>& weights,
+    const uint288& total_weight,
+    uint64_t subsidy,
+    const std::vector<unsigned char>& finder_key,
+    const V35Net& net)
+{
+    std::map<std::vector<unsigned char>, uint64_t> amounts;
+    if (!weights.empty())
+    {
+        if (total_weight.IsNull())
+            throw std::invalid_argument("v35 PPLNS: zero total weight");
+        const uint288 den = total_weight * 200;
+        for (const auto& [key, w] : weights)
+            amounts[key] = (uint288(subsidy) * (w * 199) / den).GetLow64();
+    }
+    amounts[finder_key] += subsidy / 200;
+
+    const std::vector<unsigned char> donation_key(net.donation_address.begin(), net.donation_address.end());
+    uint64_t others = 0;
+    for (const auto& [key, a] : amounts)
+        if (key != donation_key)
+            others += a;
+    if (others > subsidy)
+        throw std::invalid_argument("v35 PPLNS: payouts exceed the subsidy");
+    amounts[donation_key] = subsidy - others;
+
+    std::vector<std::pair<std::vector<unsigned char>, uint64_t>> dests;
+    dests.reserve(amounts.size());
+    for (const auto& [key, a] : amounts)
+        if (key != donation_key)
+            dests.emplace_back(key, a);
+    std::sort(dests.begin(), dests.end(), [](const auto& x, const auto& y) {
+        if (x.second != y.second) return x.second < y.second;
+        return x.first < y.first;
+    });
+    // [-4000:] over the donation-inclusive list; donation sorts last.
+    constexpr size_t MAX_DESTS = 4000;
+    if (dests.size() > MAX_DESTS - 1)
+        dests.erase(dests.begin(), dests.end() - static_cast<std::ptrdiff_t>(MAX_DESTS - 1));
+
+    V35GentxOutputs out;
+    out.donation_amount = amounts[donation_key];
+    for (const auto& [key, a] : dests)
+    {
+        if (a == 0)
+            continue;
+        out.payouts.emplace_back(
+            v35_address_to_script(
+                std::string_view(reinterpret_cast<const char*>(key.data()), key.size()), net),
+            a);
+        out.payout_keys.push_back(key);
+    }
+    return out;
+}
+
+// ============================================================================
+// compute_v35_gentx_outputs()
+//
+// The pre-v36 window of a share whose parent is `prev_hash`, as python
+// generate_transaction walks it, then v35_gentx_outputs(). Used by the verifier
+// (generate_share_transaction), the stratum author and create_local_share_v35,
+// so all three build the same outputs.
+//   assert height >= REAL_CHAIN_LENGTH or last is None   (else throws)
+//   get_cumulative_weights(grandparent, max(0, min(height, REAL_CHAIN_LENGTH) - 1),
+//                          65535 * SPREAD * target_to_average_attempts(block_target))
+// ============================================================================
+template <typename TrackerT>
+V35GentxOutputs compute_v35_gentx_outputs(
+    TrackerT& tracker,
+    const uint256& prev_hash,
+    const uint256& block_target,
+    uint64_t subsidy,
+    const std::vector<unsigned char>& finder_key,
+    uint288* total_weight_out = nullptr,
+    uint288* total_donation_weight_out = nullptr,
+    size_t* n_keys_out = nullptr)
+{
+    std::map<std::vector<unsigned char>, uint288> weights;
+    uint288 total_weight;
+    uint288 total_donation_weight;
+    if (!prev_hash.IsNull() && tracker.chain.contains(prev_hash))
+    {
+        const auto chain_len = static_cast<int32_t>(PoolConfig::real_chain_length());
+        const auto height = tracker.chain.get_height(prev_hash);
+        const auto last = tracker.chain.get_last(prev_hash);
+        if (!(height >= chain_len || last.IsNull()))
+            throw std::invalid_argument(
+                "share chain not long enough for PPLNS verification (height="
+                + std::to_string(height) + " need=" + std::to_string(chain_len) + ")");
+
+        uint256 pplns_start;
+        tracker.chain.get(prev_hash).share.invoke([&](auto* s) { pplns_start = s->m_prev_hash; });
+        const auto walk_count = static_cast<int32_t>(std::max(0, std::min(chain_len, height) - 1));
+        const auto max_weight = chain::target_to_average_attempts(block_target)
+                                * PoolConfig::SPREAD * 65535;
+        if (!pplns_start.IsNull() && tracker.chain.contains(pplns_start) && walk_count > 0)
+        {
+            auto result = tracker.get_cumulative_weights(pplns_start, walk_count, max_weight);
+            weights = std::move(result.weights);
+            total_weight = result.total_weight;
+            total_donation_weight = result.total_donation_weight;
+        }
+    }
+    if (total_weight_out) *total_weight_out = total_weight;
+    if (total_donation_weight_out) *total_donation_weight_out = total_donation_weight;
+    if (n_keys_out) *n_keys_out = weights.size();
+    return v35_gentx_outputs(weights, total_weight, subsidy, finder_key, pool_v35_net());
 }
 
 // ============================================================================
@@ -997,40 +1156,55 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool 
         }
     }
 
-    // --- 1. Compute PPLNS weights with full scriptPubKey keys ---
+    // --- 1+2+3. PPLNS weights -> amounts -> ordered payout outputs ---
     // Walk from share's prev_hash (parent) backward through the chain.
     // This matches the Python: weights are computed relative to the share's parent.
 
     auto prev_hash = share.m_prev_hash;
-    std::map<std::vector<unsigned char>, uint288> weights;
+    std::map<std::vector<unsigned char>, uint288> weights;   // v36 path (script keys)
     uint288 total_weight;
     uint288 total_donation_weight;
+    size_t n_weight_keys = 0;
+    std::vector<std::pair<std::vector<unsigned char>, uint64_t>> payout_outputs;
+    std::vector<std::vector<unsigned char>> payout_keys;     // pre-v36: address of each payout
+    uint64_t donation_amount = 0;
+    auto gst_t1 = std::chrono::steady_clock::now();
+    auto gst_t2 = gst_t1;
 
-    if (!prev_hash.IsNull() && tracker.chain.contains(prev_hash))
+    if (!use_v36_pplns)
     {
-        // p2pool data.py:762-764 — refuse to compute PPLNS with insufficient depth.
-        // Without this guard, attempt_verify() (which allows CHAIN_LENGTH+1) can
-        // trigger a PPLNS walk that terminates early, producing wrong coinbase
-        // amounts and causing persistent GENTX-MISMATCH during bootstrap.
-        auto chain_len = static_cast<int32_t>(PoolConfig::real_chain_length());
+        // Pre-v36 (v34/v35) PPLNS, python generate_transaction exactly: the
+        // window from the GRANDPARENT, weights / amounts / finder / tie-sort all
+        // keyed by the address string, scripts only for the written outputs.
+        // block_target from block header bits (python: self.header['bits'].target).
+        auto v35 = compute_v35_gentx_outputs(
+            tracker, prev_hash, chain::bits_to_target(share.m_min_header.m_bits),
+            subsidy, v35_pplns_key(&share),
+            &total_weight, &total_donation_weight, &n_weight_keys);
+        payout_outputs = std::move(v35.payouts);
+        payout_keys = std::move(v35.payout_keys);
+        donation_amount = v35.donation_amount;
+        gst_t1 = gst_t2 = std::chrono::steady_clock::now();
+    }
+    else
+    {
+        if (!prev_hash.IsNull() && tracker.chain.contains(prev_hash))
         {
-            auto pplns_height = tracker.chain.get_height(prev_hash);
-            auto pplns_last = tracker.chain.get_last(prev_hash);
-            if (!(pplns_height >= chain_len || pplns_last.IsNull()))
-                throw std::invalid_argument(
-                    "share chain not long enough for PPLNS verification (height="
-                    + std::to_string(pplns_height) + " need="
-                    + std::to_string(chain_len) + ")");
-        }
+            // p2pool data.py:762-764 — refuse to compute PPLNS with insufficient depth.
+            // Without this guard, attempt_verify() (which allows CHAIN_LENGTH+1) can
+            // trigger a PPLNS walk that terminates early, producing wrong coinbase
+            // amounts and causing persistent GENTX-MISMATCH during bootstrap.
+            auto chain_len = static_cast<int32_t>(PoolConfig::real_chain_length());
+            {
+                auto pplns_height = tracker.chain.get_height(prev_hash);
+                auto pplns_last = tracker.chain.get_last(prev_hash);
+                if (!(pplns_height >= chain_len || pplns_last.IsNull()))
+                    throw std::invalid_argument(
+                        "share chain not long enough for PPLNS verification (height="
+                        + std::to_string(pplns_height) + " need="
+                        + std::to_string(chain_len) + ")");
+            }
 
-        // block_target from block header bits (matches Python: self.header['bits'].target)
-        auto block_target = chain::bits_to_target(share.m_min_header.m_bits);
-        auto max_weight = chain::target_to_average_attempts(block_target)
-                          * PoolConfig::SPREAD * 65535;
-
-        // PPLNS formula selected by runtime v36_active (AutoRatchet state),
-        // not compile-time share version. Ref: p2pool data.py:879, work.py:759.
-        if (use_v36_pplns) {
             // V36 PPLNS: exponential depth-decay, walk from parent
             uint288 unlimited_weight;
             unlimited_weight.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
@@ -1038,109 +1212,65 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool 
             weights = std::move(result.weights);
             total_weight = result.total_weight;
             total_donation_weight = result.total_donation_weight;
-        } else {
-            // Pre-V36 PPLNS: flat cumulative weights (no decay)
-            // CRITICAL: Walk from GRANDPARENT for HEIGHT-1 shares.
-            // p2pool data.py:884-885:
-            //   _pplns_start = previous_share.share_data['previous_share_hash']
-            //   _pplns_max_shares = max(0, min(height, REAL_CHAIN_LENGTH) - 1)
-            uint256 pplns_start;
-            tracker.chain.get(prev_hash).share.invoke([&](auto* s) {
-                pplns_start = s->m_prev_hash;  // grandparent
-            });
-            auto available = tracker.chain.get_height(prev_hash);
-            auto walk_count = static_cast<int32_t>(
-                std::max(0, std::min(chain_len, available) - 1));
-
-            if (!pplns_start.IsNull() && tracker.chain.contains(pplns_start) && walk_count > 0) {
-                auto result = tracker.get_cumulative_weights(pplns_start, walk_count, max_weight);
-                weights = std::move(result.weights);
-                total_weight = result.total_weight;
-                total_donation_weight = result.total_donation_weight;
-            }
         }
-    }
 
-    // --- 2. Convert weights to exact integer payout amounts ---
-    // Python formula:
-    //   Pre-V36: amounts[script] = subsidy * (199 * weight) / (200 * total_weight)
-    //            amounts[finder] += subsidy // 200
-    //   V36:     amounts[script] = subsidy * weight / total_weight
-    //   donation = subsidy - sum(amounts)
+        // --- 2. Convert weights to exact integer payout amounts ---
+        // V36: amounts[script] = subsidy * weight / total_weight
+        //      donation = subsidy - sum(amounts), no finder fee
 
-    auto gst_t1 = std::chrono::steady_clock::now(); // after PPLNS walk
-    std::map<std::vector<unsigned char>, uint64_t> amounts;
+        gst_t1 = std::chrono::steady_clock::now(); // after PPLNS walk
+        std::map<std::vector<unsigned char>, uint64_t> amounts;
 
-    // Periodic dump of PPLNS weights for cross-impl comparison
-    {
-        static auto last_amt_dump = std::chrono::steady_clock::now() - std::chrono::seconds(60);
-        auto now_d = std::chrono::steady_clock::now();
-        if (now_d - last_amt_dump > std::chrono::seconds(30) && weights.size() >= 2) {
-            last_amt_dump = now_d;
-            LOG_DEBUG_DIAG << "[PPLNS-AMT] subsidy=" << subsidy
-                     << " total_weight=" << total_weight.GetLow64()
-                     << " don_weight=" << total_donation_weight.GetLow64()
-                     << " addrs=" << weights.size()
-                     << " prev=" << prev_hash.GetHex().substr(0, 16);
-            for (auto& [s, w] : weights) {
-                uint64_t a = (total_weight.IsNull()) ? 0 :
-                    (uint288(subsidy) * w / total_weight).GetLow64();
-                LOG_DEBUG_DIAG << "[PPLNS-AMT]   weight=" << w.GetLow64()
-                         << " amount=" << a;
-            }
-        }
-    }
-
-    if (!total_weight.IsNull())
-    {
-        for (auto& [script, weight] : weights)
+        // Periodic dump of PPLNS weights for cross-impl comparison
         {
-            uint64_t amount;
-            if (use_v36_pplns)
+            static auto last_amt_dump = std::chrono::steady_clock::now() - std::chrono::seconds(60);
+            auto now_d = std::chrono::steady_clock::now();
+            if (now_d - last_amt_dump > std::chrono::seconds(30) && weights.size() >= 2) {
+                last_amt_dump = now_d;
+                LOG_DEBUG_DIAG << "[PPLNS-AMT] subsidy=" << subsidy
+                         << " total_weight=" << total_weight.GetLow64()
+                         << " don_weight=" << total_donation_weight.GetLow64()
+                         << " addrs=" << weights.size()
+                         << " prev=" << prev_hash.GetHex().substr(0, 16);
+                for (auto& [s, w] : weights) {
+                    uint64_t a = (total_weight.IsNull()) ? 0 :
+                        (uint288(subsidy) * w / total_weight).GetLow64();
+                    LOG_DEBUG_DIAG << "[PPLNS-AMT]   weight=" << w.GetLow64()
+                             << " amount=" << a;
+                }
+            }
+        }
+
+        if (!total_weight.IsNull())
+        {
+            for (auto& [script, weight] : weights)
             {
-                // V36: amounts[script] = subsidy * weight / total_weight
                 uint288 num = uint288(subsidy) * weight;
-                amount = (num / total_weight).GetLow64();
+                uint64_t amount = (num / total_weight).GetLow64();
+                if (amount > 0)
+                    amounts[script] = amount;
             }
-            else
-            {
-                // Pre-V36: amounts[script] = subsidy * (199 * weight) / (200 * total_weight)
-                uint288 num = uint288(subsidy) * (weight * 199);
-                uint288 den = total_weight * 200;
-                amount = (num / den).GetLow64();
+        }
+
+        // Donation output = subsidy minus sum of all payout amounts
+        uint64_t sum_amounts = 0;
+        for (auto& [s, a] : amounts)
+            sum_amounts += a;
+        donation_amount = (subsidy > sum_amounts) ? (subsidy - sum_amounts) : 0;
+
+        // Dump amounts for cross-impl debugging
+        if (dump_diag) {
+            LOG_DEBUG_DIAG << "[GST-AMOUNTS] subsidy=" << subsidy << " addrs=" << amounts.size()
+                     << " sum=" << sum_amounts << " donation=" << donation_amount
+                     << " prev=" << prev_hash.GetHex().substr(0,16);
+            for (auto& [s, a] : amounts) {
+                static const char* HX = "0123456789abcdef";
+                std::string sh; for (size_t i = 0; i < std::min(s.size(), size_t(10)); ++i) { sh += HX[s[i]>>4]; sh += HX[s[i]&0xf]; }
+                LOG_DEBUG_DIAG << "[GST-AMOUNTS]   " << sh << "... = " << a;
             }
-            if (amount > 0)
-                amounts[script] = amount;
         }
-    }
 
-    // Pre-V36: add 0.5% finder fee to share creator
-    if (!use_v36_pplns)
-    {
-        auto finder_script = get_share_script(&share);
-        amounts[finder_script] += subsidy / 200;
-    }
-
-    // Donation output = subsidy minus sum of all payout amounts
-    uint64_t sum_amounts = 0;
-    for (auto& [s, a] : amounts)
-        sum_amounts += a;
-    uint64_t donation_amount = (subsidy > sum_amounts) ? (subsidy - sum_amounts) : 0;
-
-    // Dump amounts for cross-impl debugging
-    if (dump_diag) {
-        LOG_DEBUG_DIAG << "[GST-AMOUNTS] subsidy=" << subsidy << " addrs=" << amounts.size()
-                 << " sum=" << sum_amounts << " donation=" << donation_amount
-                 << " prev=" << prev_hash.GetHex().substr(0,16);
-        for (auto& [s, a] : amounts) {
-            static const char* HX = "0123456789abcdef";
-            std::string sh; for (size_t i = 0; i < std::min(s.size(), size_t(10)); ++i) { sh += HX[s[i]>>4]; sh += HX[s[i]&0xf]; }
-            LOG_DEBUG_DIAG << "[GST-AMOUNTS]   " << sh << "... = " << a;
-        }
-    }
-
-    // V36 consensus: donation output must carry >= 1 satoshi (a60f7f7f)
-    if (use_v36_pplns) {
+        // V36 consensus: donation output must carry >= 1 satoshi (a60f7f7f)
         if (donation_amount < 1 && subsidy > 0 && !amounts.empty()) {
             // Deduct 1 sat from the largest miner payout
             // Deterministic tiebreak: (amount, script) — largest script wins when equal
@@ -1155,32 +1285,32 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool 
                 donation_amount = subsidy - sum_amounts;
             }
         }
+
+        // --- 3. Build sorted output list ---
+        gst_t2 = std::chrono::steady_clock::now(); // after amounts
+        // Python: sorted(dests, key=lambda a: (amounts[a], a))[-4000:]
+        // = ascending by (amount, script), keep last 4000 (highest amounts)
+        payout_outputs.assign(amounts.begin(), amounts.end());
+        std::sort(payout_outputs.begin(), payout_outputs.end(),
+            [](const auto& a, const auto& b) {
+                if (a.second != b.second) return a.second < b.second; // asc by amount
+                return a.first < b.first; // asc by script for tie-breaking
+            });
+
+        // Keep last MAX_OUTPUTS (highest amounts), matching Python's [-4000:].
+        // Oracle (p2pool data.py) applies [-4000:] over the donation-INCLUSIVE dest
+        // list; we append the donation output separately below, so reserve one slot
+        // for it and clamp miners to MAX_OUTPUTS-1. This keeps total payout vouts
+        // <= 4000, byte-matching oracle. Residual edge: if the donation amount
+        // ranked below 4000 miner amounts the oracle would trim it instead -- not
+        // reachable in a BCH PPLNS window (leftover + 0.5% finder fee dominate), but
+        // documented here rather than relied on silently. (broadcaster-gate clamp)
+        constexpr size_t MAX_OUTPUTS = 4000;
+        constexpr size_t MAX_MINER_OUTPUTS = MAX_OUTPUTS - 1; // reserve donation slot
+        if (payout_outputs.size() > MAX_MINER_OUTPUTS)
+            payout_outputs.erase(payout_outputs.begin(), payout_outputs.end() - MAX_MINER_OUTPUTS);
+        n_weight_keys = weights.size();
     }
-
-    // --- 3. Build sorted output list ---
-    auto gst_t2 = std::chrono::steady_clock::now(); // after amounts
-    // Python: sorted(dests, key=lambda a: (amounts[a], a))[-4000:]
-    // = ascending by (amount, script), keep last 4000 (highest amounts)
-    std::vector<std::pair<std::vector<unsigned char>, uint64_t>> payout_outputs(
-        amounts.begin(), amounts.end());
-    std::sort(payout_outputs.begin(), payout_outputs.end(),
-        [](const auto& a, const auto& b) {
-            if (a.second != b.second) return a.second < b.second; // asc by amount
-            return a.first < b.first; // asc by script for tie-breaking
-        });
-
-    // Keep last MAX_OUTPUTS (highest amounts), matching Python's [-4000:].
-    // Oracle (p2pool data.py) applies [-4000:] over the donation-INCLUSIVE dest
-    // list; we append the donation output separately below, so reserve one slot
-    // for it and clamp miners to MAX_OUTPUTS-1. This keeps total payout vouts
-    // <= 4000, byte-matching oracle. Residual edge: if the donation amount
-    // ranked below 4000 miner amounts the oracle would trim it instead -- not
-    // reachable in a BCH PPLNS window (leftover + 0.5% finder fee dominate), but
-    // documented here rather than relied on silently. (broadcaster-gate clamp)
-    constexpr size_t MAX_OUTPUTS = 4000;
-    constexpr size_t MAX_MINER_OUTPUTS = MAX_OUTPUTS - 1; // reserve donation slot
-    if (payout_outputs.size() > MAX_MINER_OUTPUTS)
-        payout_outputs.erase(payout_outputs.begin(), payout_outputs.end() - MAX_MINER_OUTPUTS);
 
     // --- 4. Serialise the coinbase transaction ---
     // Non-witness serialization (for txid computation):
@@ -1495,7 +1625,7 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool 
             auto* cp = reinterpret_cast<const unsigned char*>(tx.data());
             LOG_INFO << "[COINBASE-HEX] len=" << tx.size()
                      << " txid=" << txid.GetHex()
-                     << " share=" << share.m_hash.GetHex().substr(0, 16)
+                     << " share=" << share.m_hash.GetHex()
                      << " hex=" << to_hex_fn(cp, tx.size());
         }
     }
@@ -1520,8 +1650,16 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool 
                     << " total_don_weight=" << total_donation_weight.GetHex();
         for (size_t i = 0; i < payout_outputs.size(); ++i) {
             auto& [s, a] = payout_outputs[i];
+            std::string key;
+            if (i < payout_keys.size())
+                key = " address=" + std::string(payout_keys[i].begin(), payout_keys[i].end());
             LOG_WARNING << "[GENTX-DIAG]  payout[" << i << "] amount=" << a
-                        << " script=" << to_hex(s.data(), s.size());
+                        << " script=" << to_hex(s.data(), s.size()) << key;
+        }
+        {
+            auto ds = PoolConfig::get_donation_script(ver);
+            LOG_WARNING << "[GENTX-DIAG]  donation amount=" << donation_amount
+                        << " script=" << to_hex(ds.data(), ds.size());
         }
         // First 5 + last 5 shares in PPLNS walk (for cross-impl comparison)
         if (!share.m_prev_hash.IsNull() && tracker.chain.contains(share.m_prev_hash)) {
@@ -1530,7 +1668,7 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool 
             LOG_WARNING << "[GENTX-DIAG] PPLNS walk_count=" << cl
                         << " total_weight=" << total_weight.GetHex()
                         << " total_don_weight=" << total_donation_weight.GetHex()
-                        << " n_addrs=" << weights.size();
+                        << " n_addrs=" << n_weight_keys;
             // First 5 shares
             auto wv = tracker.chain.get_chain(share.m_prev_hash, std::min(cl, int32_t(5)));
             int si = 0;
@@ -1539,7 +1677,7 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool 
                 d.share.invoke([&, hash_copy](auto* obj) {
                     auto att = chain::target_to_average_attempts(chain::bits_to_target(obj->m_bits));
                     auto sc = get_share_script(obj);
-                    LOG_WARNING << "[GENTX-DIAG]  walk[" << si << "] hash=" << hash_copy.ToString().substr(0,16)
+                    LOG_WARNING << "[GENTX-DIAG]  walk[" << si << "] hash=" << hash_copy.ToString()
                                 << " bits=0x" << std::hex << obj->m_bits
                                 << " max_bits=0x" << obj->m_max_bits << std::dec
                                 << " att=" << att.GetHex()
@@ -1558,7 +1696,7 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool 
                         d.share.invoke([&, hash_copy](auto* obj) {
                             auto att = chain::target_to_average_attempts(chain::bits_to_target(obj->m_bits));
                             auto sc = get_share_script(obj);
-                            LOG_WARNING << "[GENTX-DIAG]  walk_tail[" << si2 << "/" << cl << "] hash=" << hash_copy.ToString().substr(0,16)
+                            LOG_WARNING << "[GENTX-DIAG]  walk_tail[" << si2 << "/" << cl << "] hash=" << hash_copy.ToString()
                                         << " bits=0x" << std::hex << obj->m_bits
                                         << " max_bits=0x" << obj->m_max_bits << std::dec
                                         << " att=" << att.GetHex()
@@ -1850,14 +1988,18 @@ bool share_check(const ShareT& share,
         uint256 expected_gentx = generate_share_transaction(share, tracker, false, v36_active);
         if (expected_gentx != gentx_hash)
         {
+            std::string finder;
+            if constexpr (requires { share.m_address; })
+                finder = " address=" + std::string(share.m_address.m_data.begin(), share.m_address.m_data.end());
             LOG_WARNING << "GENTX-MISMATCH detail:"
-                        << " share=" << share_hash.ToString().substr(0,16)
+                        << " share=" << share_hash.ToString()
                         << " ver=" << share.version
                         << " subsidy=" << share.m_subsidy
                         << " donation=" << share.m_donation
-                        << " prev=" << share.m_prev_hash.ToString().substr(0,16);
-            LOG_WARNING << "  expected_gentx=" << expected_gentx.ToString().substr(0,32)
-                        << " actual_gentx=" << gentx_hash.ToString().substr(0,32);
+                        << " prev=" << share.m_prev_hash.ToString()
+                        << finder;
+            LOG_WARNING << "  expected_gentx=" << expected_gentx.ToString()
+                        << " actual_gentx=" << gentx_hash.ToString();
 
             auto chain_len = std::min(
                 tracker.chain.get_height(share.m_prev_hash),
@@ -1869,7 +2011,7 @@ bool share_check(const ShareT& share,
             int32_t v35_walk = std::max(0, chain_len - 1);
             LOG_WARNING << "  PPLNS chain_len=" << chain_len
                         << " v35_walk=" << v35_walk
-                        << " grandparent=" << (gp_hash.IsNull() ? "null" : gp_hash.GetHex().substr(0,16))
+                        << " grandparent=" << (gp_hash.IsNull() ? "null" : gp_hash.GetHex())
                         << " prev_height=" << tracker.chain.get_height(share.m_prev_hash)
                         << " real_chain_length=" << PoolConfig::real_chain_length();
 
@@ -2031,8 +2173,8 @@ uint256 verify_share(const ShareT& share, TrackerT& tracker)
         static int hash_mismatch_log = 0;
         if (hash_mismatch_log++ < 10)
             LOG_WARNING << "[verify_share] hash mismatch: recomputed="
-                        << hash.GetHex().substr(0, 16)
-                        << " stored=" << share.m_hash.GetHex().substr(0, 16);
+                        << hash.GetHex()
+                        << " stored=" << share.m_hash.GetHex();
     }
 
     // Re-derive gentx_hash for the check phase
@@ -2273,36 +2415,18 @@ uint256 create_local_share_v35(
     if (override_bits)     share.m_bits     = override_bits;
     share.m_nonce      = 0;
 
-    // V35: address as string (VarStr), convert from payout_script
+    // V35: the address string python writes for this script (legacy Base58,
+    // BCH version bytes). It is the share's PPLNS key and the ref-hash preimage
+    // field, so ref_hash_fn derives it with the same function. A script with no
+    // such form cannot be carried by a v35 share: refuse to mint.
     {
-        uint160 pubkey_hash;
-        uint8_t pubkey_type = 0;
-        if (payout_script.size() == 25 && payout_script[0] == 0x76) {
-            std::memcpy(pubkey_hash.data(), payout_script.data() + 3, 20);
-            pubkey_type = 0;
-        } else if (payout_script.size() == 23 && payout_script[0] == 0xa9) {
-            std::memcpy(pubkey_hash.data(), payout_script.data() + 2, 20);
-            pubkey_type = 2;
-        } else if (payout_script.size() == 22 && payout_script[0] == 0x00) {
-            std::memcpy(pubkey_hash.data(), payout_script.data() + 2, 20);
-            pubkey_type = 1;
-        } else if (payout_script.size() >= 20) {
-            std::memcpy(pubkey_hash.data(), payout_script.data(), 20);
+        const std::string addr_str = v35_share_address_for_script(payout_script);
+        if (addr_str.empty() || v35_address_to_script(addr_str, pool_v35_net()) != payout_script) {
+            LOG_WARNING << "[create_local_share_v35] REFUSING to mint: payout script has no "
+                           "v35 address form (python would reject the share)";
+            return uint256();
         }
-        std::string addr_str = pubkey_hash_to_address(pubkey_hash, pubkey_type);
         share.m_address.m_data.assign(addr_str.begin(), addr_str.end());
-        {
-            auto roundtrip = core::address_to_script(addr_str);
-            static const char* H = "0123456789abcdef";
-            std::string ps_hex, rt_hex;
-            for (auto b : payout_script) { ps_hex += H[b>>4]; ps_hex += H[b&0xf]; }
-            for (auto b : roundtrip) { rt_hex += H[b>>4]; rt_hex += H[b&0xf]; }
-            LOG_INFO << "[V35-ADDR] type=" << (int)pubkey_type
-                     << " addr=" << addr_str
-                     << " payout_script=" << ps_hex
-                     << " roundtrip=" << rt_hex
-                     << " match=" << (payout_script == roundtrip ? "YES" : "NO");
-        }
     }
 
     // Chain position: absheight and abswork
@@ -2396,14 +2520,18 @@ uint256 create_local_share_v35(
     ref_stream << share.m_donation;
     { uint8_t si = static_cast<uint8_t>(share.m_stale_info); ref_stream << si; }
     ::Serialize(ref_stream, VarInt(share.m_desired_version));
-    // segwit_data
-    if (share.m_segwit_data.has_value()) {
-        ref_stream << share.m_segwit_data.value();
-    } else {
-        std::vector<uint256> empty_branch;
-        ref_stream << empty_branch;
-        uint256 zero_root;
-        ref_stream << zero_root;
+    // segwit_data: only where the share type carries it (is_segwit_activated,
+    // as share_init_verify serialises it). BCH never activated segwit, so the
+    // v35 ref_type has no segwit_data field at all.
+    if constexpr (bch::is_segwit_activated(35)) {
+        if (share.m_segwit_data.has_value()) {
+            ref_stream << share.m_segwit_data.value();
+        } else {
+            std::vector<uint256> empty_branch;
+            ref_stream << empty_branch;
+            uint256 zero_root;
+            ref_stream << zero_root;
+        }
     }
     // V35: NO merged_addresses
     ref_stream << share.m_far_share_hash;
@@ -2435,62 +2563,14 @@ uint256 create_local_share_v35(
     if (!actual_coinbase_bytes.empty()) {
         coinbase_bytes_for_hashlink = actual_coinbase_bytes;
     } else {
-        // Fallback: reconstruct coinbase from V35 PPLNS walk
-        // V35: flat weights, grandparent start, height-1 window, 199/200 formula, finder fee
-        // Reference: p2pool data.py lines 878-965
-        std::map<std::vector<unsigned char>, uint288> weights;
-        uint288 total_weight;
-
-        if (!prev_share.IsNull() && tracker.chain.contains(prev_share))
-        {
-            // V35: start from grandparent (prev_share.prev_hash)
-            uint256 pplns_start;
-            tracker.chain.get(prev_share).share.invoke([&](auto* s) {
-                pplns_start = s->m_prev_hash;
-            });
-
-            if (!pplns_start.IsNull()) {
-                auto height = tracker.chain.get_height(prev_share);
-                int32_t max_shares = std::max(0, std::min(height,
-                    static_cast<int32_t>(PoolConfig::real_chain_length())) - 1);
-                auto block_target = chain::bits_to_target(share.m_min_header.m_bits);
-                auto desired_weight = chain::target_to_average_attempts(block_target)
-                                      * uint288(PoolConfig::SPREAD) * uint288(65535);
-                // Flat weight accumulation (not decayed)
-                auto result = tracker.get_cumulative_weights(pplns_start, max_shares, desired_weight);
-                weights = std::move(result.weights);
-                total_weight = result.total_weight;
-            }
-        }
-
-        std::map<std::vector<unsigned char>, uint64_t> amounts;
-        if (!total_weight.IsNull()) {
-            for (auto& [script, weight] : weights) {
-                // V35: 99.5% to PPLNS — subsidy * 199 * weight / (200 * total_weight)
-                uint64_t amount = (uint288(subsidy) * uint288(199) * weight
-                                   / (uint288(200) * total_weight)).GetLow64();
-                if (amount > 0) amounts[script] = amount;
-            }
-        }
-        // V35: add 0.5% finder fee to the share creator's payout script
-        amounts[payout_script] = (amounts.count(payout_script) ? amounts[payout_script] : 0)
-                                 + subsidy / 200;
-        uint64_t sum_amounts = 0;
-        for (auto& [s, a] : amounts) sum_amounts += a;
-        // V35: no minimum donation enforcement (unlike v36)
-        uint64_t donation_amount = (subsidy > sum_amounts) ? (subsidy - sum_amounts) : 0;
-
-        std::vector<std::pair<std::vector<unsigned char>, uint64_t>> payout_outputs(
-            amounts.begin(), amounts.end());
-        std::sort(payout_outputs.begin(), payout_outputs.end(),
-            [](const auto& a, const auto& b) {
-                if (a.second != b.second) return a.second < b.second;
-                return a.first < b.first;
-            });
-        // Reserve one slot for the separately-appended donation output so total
-        // payout vouts stay <= 4000, matching oracle donation-inclusive [-4000:].
-        if (payout_outputs.size() > 3999)
-            payout_outputs.erase(payout_outputs.begin(), payout_outputs.end() - 3999);
+        // Fallback: reconstruct the coinbase the verifier rebuilds (python
+        // generate_transaction, pre-v36): the same compute_v35_gentx_outputs
+        // generate_share_transaction uses, keyed by this share's address.
+        auto v35 = compute_v35_gentx_outputs(
+            tracker, prev_share, chain::bits_to_target(share.m_min_header.m_bits),
+            subsidy, share.m_address.m_data);
+        const auto& payout_outputs = v35.payouts;
+        const uint64_t donation_amount = v35.donation_amount;
 
         PackStream gentx;
         { uint32_t v = 1; gentx.write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&v), 4)); }

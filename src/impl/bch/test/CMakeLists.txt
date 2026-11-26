@@ -287,6 +287,19 @@ if(BUILD_TESTING)
     # handle_version, which this target already compiles (node.cpp). Invoked
     # from main() via run_self_connection_ban_checks(); no new executable.
     target_sources(bch_embedded_block_broadcast_test PRIVATE self_connection_ban_test.cpp)
+    # v35 CashAddr gentx fix KATs ride the same EXISTING allowlisted target (no
+    # new executable, no build.yml change):
+    #   v35_address_kat_test.cpp  address -> script vectors from the python rule,
+    #                             run with no CashAddr decoder registered; the
+    #                             address our own v35 shares carry
+    #   v35_gentx_kat_test.cpp    the real public share 0000...24caa7c3 with its
+    #                             4,319-share window (gentx == public gentx.raw),
+    #                             one script under three strings, own-share verify
+    target_sources(bch_embedded_block_broadcast_test PRIVATE
+        v35_address_kat_test.cpp
+        v35_gentx_kat_test.cpp)
+    target_compile_definitions(bch_embedded_block_broadcast_test PRIVATE
+        BCH_V35_KAT_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/v35_real_share")
 
     # #1437 topology KAT (child-without-parent + intra-template double-spend)
     # rides this EXISTING allowlisted target (bch tree is plain main()/CHECK,

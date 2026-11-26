@@ -164,7 +164,7 @@ void NodeImpl::error(const message_error_type& err, const NetService& service, c
             if (elapsed < std::chrono::seconds(10)) {
                 for (const auto& h : it->second.hashes) {
                     if (m_rejected_share_hashes.insert(h).second) {
-                        LOG_WARNING << "[Pool] Marking share " << h.GetHex().substr(0, 16)
+                        LOG_WARNING << "[Pool] Marking share " << h.GetHex()
                                     << " as rejected (peer " << service.to_string()
                                     << " disconnected " << std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count()
                                     << "ms after broadcast)";
@@ -554,14 +554,15 @@ void NodeImpl::processing_shares_phase2(HandleSharesData& data, NetService addr)
         share.invoke([](auto* obj) {
             auto target = chain::bits_to_target(obj->m_bits);
             double diff = chain::target_to_difficulty(target);
-            // Extract miner identity (pubkey_hash for v17/v33/v36, address script for v34/v35)
+            // Miner identity: pubkey_hash for v17/v33/v36, the address string for v34/v35
             std::string miner_hex;
             if constexpr (requires { obj->m_pubkey_hash; })
-                miner_hex = obj->m_pubkey_hash.GetHex().substr(0, 16);
+                miner_hex = obj->m_pubkey_hash.GetHex();
             else if constexpr (requires { obj->m_address; })
-                miner_hex = "script";
+                for (unsigned char c : obj->m_address.m_data)
+                    miner_hex.push_back((c >= 0x20 && c < 0x7f) ? static_cast<char>(c) : '?');
             LOG_INFO << "Received share: diff=" << std::scientific << std::setprecision(2) << diff
-                     << " hash=" << obj->m_hash.GetHex().substr(0, 16)
+                     << " hash=" << obj->m_hash.GetHex()
                      << " miner=" << miner_hex;
         });
 
@@ -1343,7 +1344,7 @@ void NodeImpl::load_persisted_shares()
 
     const size_t to_load = total_in_db - skip;
     LOG_INFO << "[Pool] Loading shares from LevelDB: " << to_load << " shares to process...";
-    int loaded = 0, skipped_contains = 0, skipped_load = 0, skipped_small = 0;
+    int loaded = 0, skipped_contains = 0, skipped_load = 0, skipped_small = 0, skipped_address = 0;
     std::vector<uint256> verified_hashes; // shares to pre-populate into verified
     for (size_t i = skip; i < total_in_db; ++i)
     {
@@ -1372,6 +1373,20 @@ void NodeImpl::load_persisted_shares()
             // m_hash is not part of the serialized format — it's computed
             // during share_check validation.  Restore it from the LevelDB key.
             share.ACTION({ obj->m_hash = hash; });
+            // v34/v35: python cannot load a share whose address it cannot turn
+            // into a script (Share.__init__ raises), so neither do we. This drops
+            // e.g. shares an older build minted with a Litecoin-format address.
+            bool bad_address = false;
+            share.ACTION({
+                if constexpr (requires { obj->m_address; }) {
+                    try { (void)get_share_script(obj); }
+                    catch (const V35AddressError&) { bad_address = true; }
+                }
+            });
+            if (bad_address) {
+                ++skipped_address;
+                continue;
+            }
             if (!m_chain->contains(share.hash()))
             {
                 m_tracker.add(share);
@@ -1444,7 +1459,7 @@ void NodeImpl::load_persisted_shares()
     LOG_INFO << "[Pool] Loaded " << loaded << " shares from LevelDB storage"
              << " (DB total: " << total_in_db << ", limit: " << keep_per_head
              << ", skipped: load=" << skipped_load << " small=" << skipped_small
-             << " dup=" << skipped_contains << ")";
+             << " dup=" << skipped_contains << " bad_address=" << skipped_address << ")";
 
     // Prune old shares from LevelDB that we skipped
     if (skip > 0)

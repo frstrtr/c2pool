@@ -345,6 +345,11 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
                 std::memcpy(p.pubkey_hash.begin(), payout_script.data() + 2, 20);
                 p.pubkey_type = 1;
             }
+            // v34/v35 preimage field: the address string, the SAME function
+            // create_local_share_v35 writes into m_address (python
+            // script2_to_address form). Empty when the script has none; the
+            // create side then refuses to mint, so no share carries it.
+            p.address = bch::v35_share_address_for_script(payout_script);
 
             auto block_bits_fallback = [&] {
                 p.bits = block_bits;  p.max_bits = block_bits;
@@ -533,6 +538,30 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
                     best_share_hash, block_target, subsidy, donation_script);
             return node.tracker().get_expected_payouts(
                 best_share_hash, block_target, subsidy, donation_script);
+        });
+
+    // Pre-v36 author outputs (v34/v35 shares): the exact payout list, donation
+    // last, that generate_share_transaction rebuilds for our share. Python keys
+    // it by the address string the share carries, so it comes from the same
+    // compute_v35_gentx_outputs the verifier uses, keyed by the address
+    // create_local_share_v35 will write (v35_share_address_for_script).
+    work_source->set_v35_outputs_fn(
+        [&node](const uint256& prev_share_hash,
+                const uint256& block_target,
+                uint64_t subsidy,
+                const std::vector<unsigned char>& payout_script)
+            -> std::vector<std::pair<std::vector<unsigned char>, uint64_t>>
+        {
+            const std::string addr = bch::v35_share_address_for_script(payout_script);
+            if (addr.empty())
+                throw std::invalid_argument("payout script has no v35 address form");
+            std::shared_lock<std::shared_mutex> lk(node.tracker_mutex());
+            auto v35 = bch::compute_v35_gentx_outputs(
+                node.tracker(), prev_share_hash, block_target, subsidy,
+                std::vector<unsigned char>(addr.begin(), addr.end()));
+            auto outs = std::move(v35.payouts);
+            outs.emplace_back(PoolConfig::get_donation_script(int64_t(35)), v35.donation_amount);
+            return outs;
         });
 
     work_source->set_create_share_fn(

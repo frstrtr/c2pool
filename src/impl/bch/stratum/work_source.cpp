@@ -344,6 +344,12 @@ void BCHWorkSource::set_pplns_fn(PplnsFn fn)
     pplns_fn_ = std::move(fn);
 }
 
+void BCHWorkSource::set_v35_outputs_fn(V35OutputsFn fn)
+{
+    std::lock_guard<std::mutex> lk(callback_mutex_);
+    v35_outputs_fn_ = std::move(fn);
+}
+
 void BCHWorkSource::set_author_version_fn(std::function<int64_t()> fn)
 {
     std::lock_guard<std::mutex> lk(callback_mutex_);
@@ -454,13 +460,13 @@ core::stratum::CoinbaseResult BCHWorkSource::build_connection_coinbase(
         block_bits = parse_be_hex_u32(it->get<std::string>());
     const uint32_t curtime = static_cast<uint32_t>(std::time(nullptr));
 
-    PplnsFn pplns_fn; RefHashFn ref_hash_fn;
+    PplnsFn pplns_fn; RefHashFn ref_hash_fn; V35OutputsFn v35_outputs_fn;
     std::vector<unsigned char> donation_script;
     std::function<int64_t()> author_version_fn;
     {
         std::lock_guard<std::mutex> lk(callback_mutex_);
         pplns_fn = pplns_fn_; ref_hash_fn = ref_hash_fn_; donation_script = donation_script_;
-        author_version_fn = author_version_fn_;
+        author_version_fn = author_version_fn_; v35_outputs_fn = v35_outputs_fn_;
     }
     // Author version gates the pre-v36 finder-fee shape (applied below, needs
     // this connection\x27s payout_script). Unset => 35 (safe: fresh chains author
@@ -477,11 +483,38 @@ core::stratum::CoinbaseResult BCHWorkSource::build_connection_coinbase(
         scriptsig.insert(scriptsig.end(), POOL_TAG.begin(), POOL_TAG.end());
     }
 
+    // Node-owner fee (p2pool -f/--fee): resolve the payout IDENTITY that receives
+    // this share's finder value (and, via the committed share, its future PPLNS
+    // weight). effective_payout_script substitutes the node owner's script for
+    // ~fee% of jobs, deterministically on (prev_share_hash, extranonce1,
+    // payout_script) so the SAME decision is reproduced at submit time and by
+    // verify. Default (fee 0 / no owner) => eff == payout_script, byte-identical.
+    // It feeds the v35 outputs / finder fee, the degraded fallback, AND the
+    // ref_hash below so the OP_RETURN commits to the substituted identity.
+    const std::vector<unsigned char> eff_payout_script =
+        effective_payout_script(payout_script, prev_share_hash, extranonce1_hex);
+
+    uint256 block_target;
+    if (block_bits != 0) block_target.SetCompact(block_bits);
+
+    // Pre-v36 authors: the exact outputs the verifier rebuilds (python rule,
+    // keyed by address string, donation last). Falls through to the generic
+    // path below only when the producer is unset or throws.
+    std::vector<std::pair<std::vector<unsigned char>, uint64_t>> outputs;
+    bool have_outputs = false;
+    if (author_version < 36 && v35_outputs_fn) {
+        try {
+            outputs = v35_outputs_fn(prev_share_hash, block_target, coinbasevalue, eff_payout_script);
+            have_outputs = true;
+        } catch (const std::exception& e) {
+            LOG_WARNING << "[BCH-STRATUM] v35_outputs_fn threw: " << e.what()
+                        << " -- falling back to the generic PPLNS coinbase";
+        }
+    }
+
     // PPLNS payouts.
     std::map<std::vector<unsigned char>, double> payouts;
-    if (pplns_fn) {
-        uint256 block_target;
-        if (block_bits != 0) block_target.SetCompact(block_bits);
+    if (!have_outputs && pplns_fn) {
         try { payouts = pplns_fn(prev_share_hash, block_target, coinbasevalue, donation_script); }
         catch (const std::exception& e) {
             LOG_WARNING << "[BCH-STRATUM] pplns_fn threw: " << e.what()
@@ -503,22 +536,11 @@ core::stratum::CoinbaseResult BCHWorkSource::build_connection_coinbase(
             payouts[donation_script] += static_cast<double>(dropped_value);
     }
 
-    // Node-owner fee (p2pool -f/--fee): resolve the payout IDENTITY that receives
-    // this share's finder value (and, via the committed share, its future PPLNS
-    // weight). effective_payout_script substitutes the node owner's script for
-    // ~fee% of jobs, deterministically on (prev_share_hash, extranonce1,
-    // payout_script) so the SAME decision is reproduced at submit time and by
-    // verify. Default (fee 0 / no owner) => eff == payout_script, byte-identical.
-    // It feeds the v35 finder fee, the degraded fallback, AND the ref_hash below
-    // so the OP_RETURN commits to the substituted identity.
-    const std::vector<unsigned char> eff_payout_script =
-        effective_payout_script(payout_script, prev_share_hash, extranonce1_hex);
-
     // Pre-v36 finder fee: sub-36 authors owe generate_share_transaction\x27s v35
     // credit of subsidy/200 to the (creator==finder==) miner\x27s own payout_script,
     // deducted from the donation residual. Header-only apply_v35_finder_fee keeps
     // this byte-identical to the KAT-pinned math; sv>=36 skips it entirely.
-    if (author_version < 36)
+    if (!have_outputs && author_version < 36)
         apply_v35_finder_fee(payouts, eff_payout_script, donation_script, coinbasevalue);
 
     // V36 removes the finder fee -- pure PPLNS accounting. The oracle
@@ -530,7 +552,7 @@ core::stratum::CoinbaseResult BCHWorkSource::build_connection_coinbase(
     // the legacy work source's not-v36 path, not in this v36-only builder.
 
     // Degraded fallback: full subsidy -> miner/owner.
-    if (payouts.empty() && !eff_payout_script.empty())
+    if (!have_outputs && payouts.empty() && !eff_payout_script.empty())
         payouts[eff_payout_script] = static_cast<double>(coinbasevalue);
 
     // === Oracle-conforming output assembly (p2pool-merged-v36 data.py gentx) ===
@@ -544,7 +566,8 @@ core::stratum::CoinbaseResult BCHWorkSource::build_connection_coinbase(
     // pure, header-only assemble_v36_coinbase_outputs() so the byte-shape is
     // pinned by coinbase_author_kat_test against the p2pool-merged-v36 oracle
     // (data.py generate_transaction) rather than asserted against this builder.
-    auto outputs = assemble_v36_coinbase_outputs(std::move(payouts), donation_script, coinbasevalue);
+    if (!have_outputs)
+        outputs = assemble_v36_coinbase_outputs(std::move(payouts), donation_script, coinbasevalue);
 
     // ref_hash + frozen chain-walk values.
     core::stratum::RefHashResult rh_result;
