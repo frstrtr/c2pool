@@ -354,8 +354,13 @@ inline std::optional<ProducerJobBuild> build_producer_job(
     // it, or reused from the previous stored template with the same bodies):
     // the frozen job takes that very pointer, the one its stratum job froze, so
     // the two cannot hold different bodies. The memo serves only a template that
-    // never went through the store (it carries no vector); its hash-list match
-    // is sound because callers ask for the template they are serving now.
+    // never went through the store (it carries no vector). Its match (the txid
+    // list and the body count) is NOT byte-exact under Dash Core v24: a
+    // version-2 asset unlock (type 9) keeps its txid when re-signed while its
+    // bytes change. That is not reachable today, because template selection
+    // never admits types 5/6/9 (Mempool::SpecialTxSelectMask::admits). Before
+    // type 9 may enter templates, the memo must byte-check such bodies the way
+    // coin::template_tx_hex_reusable does, or be retired.
     if (v36 && !wd.m_tx_hashes.empty())
         out.frozen.tx_data_hex = wd.m_tx_hex_shared
                                      ? wd.m_tx_hex_shared.hex()
