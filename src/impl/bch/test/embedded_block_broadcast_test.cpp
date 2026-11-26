@@ -73,6 +73,10 @@ int run_legacy_addrme_self_probe_checks();
 // fold-in: its own TU, run from this already-allowlisted executable.
 int run_self_connection_ban_checks();
 
+// Stratum latency refresh KATs (stratum_worker_rtt_test.cpp). Same fold-in:
+// its own TU, run from this already-allowlisted executable.
+int run_stratum_worker_rtt_checks();
+
 int main() {
     boost::asio::io_context ioc;
     TestConfig config;
@@ -178,6 +182,9 @@ int main() {
 
     // #1716 part B: ban the host behind a self-connection, as canonical does.
     failures += run_self_connection_ban_checks();
+
+    // Stratum latency refresh: a submit-time RTT replaces the authorize one.
+    failures += run_stratum_worker_rtt_checks();
 
     if (failures == 0) {
         std::cout << "embedded_block_broadcast_test: ALL PASS\n";
