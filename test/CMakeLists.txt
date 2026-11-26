@@ -1406,6 +1406,10 @@ if (BUILD_TESTING AND GTest_FOUND)
         test_dash_share_gate_frozen_bits.cpp
         test_dash_serve_staleness_unit.cpp
         test_dash_gbt_quorum_staleness.cpp
+        # test_dash_p5_shared_tx_hex.cpp: P5, one shared tx-hex vector per
+        # cached template -- golden serve byte-identity (work-source API and a
+        # real StratumServer on loopback) plus the sharing contract.
+        test_dash_p5_shared_tx_hex.cpp
         ${CMAKE_SOURCE_DIR}/src/impl/dash/coin/zmq_tip_notify.cpp)
     target_link_libraries(test_dash_stratum_work_source PRIVATE
         GTest::gtest_main GTest::gtest
