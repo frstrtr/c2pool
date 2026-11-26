@@ -93,12 +93,49 @@ macro(c2pool_find_stratum_openssl)
     endif()
     find_package(OpenSSL 1.1.1 QUIET)
 endmacro()
+# A static libcrypto can name extra archives in its pkg-config Libs.private
+# as -l:<file> (Ubuntu 26.04, OpenSSL 3.5: -l:libjitterentropy.a, from
+# libjitterentropy3-dev). A missing one only fails at link time, so look for
+# each here and list the missing files in <out_var> (empty: none missing).
+function(c2pool_stratum_openssl_missing_static_deps out_var)
+    set(_missing "")
+    find_package(PkgConfig QUIET)
+    if(PKG_CONFIG_FOUND)
+        execute_process(
+            COMMAND ${PKG_CONFIG_EXECUTABLE} --static --libs-only-l libcrypto
+            OUTPUT_VARIABLE _libs OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET RESULT_VARIABLE _rc)
+        if(_rc EQUAL 0)
+            string(REGEX MATCHALL "-l:[^ ]+" _colon_libs "${_libs}")
+            foreach(_lib IN LISTS _colon_libs)
+                string(SUBSTRING "${_lib}" 3 -1 _file)
+                unset(_c2p_static_dep CACHE)
+                find_library(_c2p_static_dep NAMES "${_file}")
+                if(NOT _c2p_static_dep)
+                    list(APPEND _missing "${_file}")
+                endif()
+                unset(_c2p_static_dep CACHE)
+            endforeach()
+        endif()
+    endif()
+    set(${out_var} "${_missing}" PARENT_SCOPE)
+endfunction()
 if(NOT DEFINED CACHE{C2POOL_STRATUM_TLS})
     set(_c2p_stratum_tls_default OFF)
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         c2pool_find_stratum_openssl()
         if(OPENSSL_FOUND)
-            set(_c2p_stratum_tls_default ON)
+            set(_c2p_static_missing "")
+            if(C2POOL_STRATUM_TLS_STATIC_OPENSSL)
+                c2pool_stratum_openssl_missing_static_deps(_c2p_static_missing)
+            endif()
+            if(_c2p_static_missing)
+                message(STATUS "stratum TLS listener: auto-detect leaves it OFF: the static OpenSSL"
+                    " also needs ${_c2p_static_missing}, which was not found"
+                    " (Ubuntu: libjitterentropy3-dev for libjitterentropy.a)")
+            else()
+                set(_c2p_stratum_tls_default ON)
+            endif()
         endif()
     endif()
     set(C2POOL_STRATUM_TLS ${_c2p_stratum_tls_default} CACHE BOOL
@@ -115,6 +152,17 @@ if(C2POOL_STRATUM_TLS)
             " Install it (libssl-dev on Debian/Ubuntu) or point OPENSSL_ROOT_DIR at it,"
             " set -DC2POOL_STRATUM_TLS_STATIC_OPENSSL=OFF to link the shared libraries,"
             " or configure with -DC2POOL_STRATUM_TLS=OFF (the binaries then refuse --stratum-tls).")
+    endif()
+    if(C2POOL_STRATUM_TLS_STATIC_OPENSSL)
+        c2pool_stratum_openssl_missing_static_deps(_c2p_static_missing)
+        if(_c2p_static_missing)
+            message(FATAL_ERROR
+                "C2POOL_STRATUM_TLS=ON with a static OpenSSL, but its libcrypto also needs"
+                " ${_c2p_static_missing}, which was not found (Ubuntu: libjitterentropy3-dev"
+                " provides libjitterentropy.a). Install it,"
+                " set -DC2POOL_STRATUM_TLS_STATIC_OPENSSL=OFF to link the shared libraries,"
+                " or configure with -DC2POOL_STRATUM_TLS=OFF.")
+        endif()
     endif()
     set(C2POOL_STRATUM_TLS_AVAILABLE ON)
     message(STATUS "stratum TLS listener: ENABLED (OpenSSL ${OPENSSL_VERSION}: ${OPENSSL_SSL_LIBRARY} ${OPENSSL_CRYPTO_LIBRARY})")
