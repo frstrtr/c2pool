@@ -452,9 +452,14 @@ int run_coin_peer_pool_p2p_kat()
         CHECK(!has(src, "Hash(packed_hdr.get_span())"), "[F] no SHA256d(header) lookup is left");
         const auto rb = src.find("fh.rollback = [");
         CHECK(near_after(src, rb, "utxo_consistent.store(false, std::memory_order_relaxed);", 400)
-                  && near_after(src, rb, "bip110::coin::reorg_disconnect_to_fork(", 700)
-                  && near_after(src, rb, "mempool.requarantine_all();", 2200),
-              "[F] the rollback: inconsistent while it runs, the mempool re-priced after");
+                  && near_after(src, rb, "bip110::coin::reorg_disconnect_or_discard(", 700)
+                  && near_after(src, rb, "mempool.requarantine_all();", 2400),
+              "[F] the rollback: inconsistent while it runs, a failure dropped, the mempool re-priced after");
+        CHECK(!has(src, "bip110::coin::reorg_disconnect_to_fork("),
+              "[F] no rollback that can leave the view half-undone");
+        const auto fr = src.find("fh.on_fresh = [fresh_ws]() {");
+        CHECK(near_after(src, fr, "ws->bump_work_generation();", 200),
+              "[F] a connect that brings the view to the tip bumps the work generation");
         const auto ra = src.find("fh.reanchor = [&utxo_cache, &mempool, &utxo_consistent]() -> bool {");
         CHECK(near_after(src, ra, "if (!utxo_cache.reanchor())", 200),
               "[F] the re-anchor wipes the view (UTXOViewCache::reanchor)");
@@ -466,9 +471,8 @@ int run_coin_peer_pool_p2p_kat()
         CHECK(near_after(src, tipc, "utxo_follower->on_tip_changed()", 400),
               "[F] every tip change goes to the follower (kept bodies first, then a rollback)");
         const auto cu = src.find("pool_ptr->poll();");
-        CHECK(near_after(src, cu, "if (*hdr_caught_up)", 100)
-                  && near_after(src, cu, "utxo_follower->catch_up();", 200),
-              "[F] the pool driver runs the catch-up step once header sync is caught up");
+        CHECK(near_after(src, cu, "utxo_follower->on_tick(*hdr_caught_up);", 100),
+              "[F] the pool driver ticks the follower (catch-up once header sync is caught up)");
         const auto gate = src.find("work_source->set_mempool(&mempool, serve_mempool_txs,");
         CHECK(near_after(src, gate, "&& utxo_follower && utxo_follower->fresh();", 500),
               "[F] the serve gate requires the view at the tip");
@@ -476,8 +480,10 @@ int run_coin_peer_pool_p2p_kat()
                   && has(src, "bip110::coin::block_body_rule(b, rdts_cap_for(b));"),
               "[F] a BIP-110-only body failure from 2+ peers is an ERROR naming the rule");
         CHECK(has(src, "bip110::coin::is_peer_hostname(ns)") && has(src, "resolver->async_resolve(")
-                  && has(src, "bip110::coin::add_resolved_peers(*explicit_list, ns, addrs);"),
-              "[F] a host-name --peer is resolved for the pool");
+                  && has(src, "bip110::coin::add_resolved_peers(*explicit_list, ns, addrs);")
+                  && has(src, "bip110::coin::peer_resolve_backoff_sec(failures);")
+                  && has(src, "(*again)(ns, failures + 1);"),
+              "[F] a host-name --peer is resolved for the pool, again after a failure");
         const auto mgr_decl = src.find("std::unique_ptr<bip110::coin::BtcCoinPeerManager> coin_peer_mgr;");
         const auto fan_decl = src.find("std::unique_ptr<bip110::coin::Bip110Broadcaster<MiniConfig>>     coin_broadcaster;");
         CHECK(mgr_decl != std::string::npos && fan_decl != std::string::npos && decl != std::string::npos

@@ -251,7 +251,9 @@ add_test(NAME bip110_coin_reachability_kat COMMAND bip110_coin_reachability_kat)
 # check with the BIP-110 block rules), bip110_coin_peer_pool_kat.cpp (the pool
 # over BIP-110 types and BLAKE2b identities) and bip110_coin_peer_pool_p2p_kat.cpp
 # (the pooled connection over the bip110 NodeP2P, and a source check of the
-# main_bip110.cpp wiring, read from BIP110_MAIN_SRC). The v2 block identity is
+# main_bip110.cpp wiring, read from BIP110_MAIN_SRC), and
+# bip110_utxo_rollback_kat.cpp (a rollback of the UTXO view that fails half-way,
+# over a real UTXOViewDB). The v2 block identity is
 # BLAKE2b, so the lane-local primitive is compiled in (as for the retention KAT).
 add_executable(bip110_explorer_getblock_kat
     test/bip110_explorer_getblock_kat.cpp
@@ -259,6 +261,7 @@ add_executable(bip110_explorer_getblock_kat
     test/bip110_block_body_check_kat.cpp
     test/bip110_coin_peer_pool_kat.cpp
     test/bip110_coin_peer_pool_p2p_kat.cpp
+    test/bip110_utxo_rollback_kat.cpp
     ${CMAKE_SOURCE_DIR}/src/impl/bip110/crypto/blake2b.c
 )
 target_compile_definitions(bip110_explorer_getblock_kat PRIVATE __C2POOL_COIN_BIP110__=1

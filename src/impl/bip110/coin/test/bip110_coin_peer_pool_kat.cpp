@@ -53,6 +53,18 @@
 //       bad body.
 //   [Q] on_bad_body: once per peer and block, with the number of such peers.
 //   [R] utxo_connect_gate and utxo_view_fresh.
+//   [S] a rollback that fails: the view is suspended (no connect, even when
+//       the chain flips back) and re-anchored at once; a failed re-anchor is
+//       retried after kReanchorRetrySec by the tick, whatever the header sync.
+//   [T] the work bump: a connect that brings the view to the tip calls
+//       on_fresh once (the tip's body; a held body released by its parent;
+//       the first connect after a re-anchor), and no other connect does.
+//   [U] a view behind whose next body never comes: re-anchored at the tip
+//       after kStuckReanchorSec, not before.
+//   [V] an empty view anchors only at or above tip - kInFlight; an older
+//       active body (a late catch-up body) neither anchors nor is kept; an
+//       active block at or below the view's height is not kept, a competing
+//       one is.
 //
 // No node, no network.
 
@@ -397,8 +409,8 @@ struct ViewModel {
     uint256 best;                                // the view (null: empty)
     uint32_t best_h = 0;
     std::vector<uint256> connected;
-    int rollbacks = 0, reanchors = 0, kept_passes = 0;
-    bool rollback_ok = true;
+    int rollbacks = 0, reanchors = 0, kept_passes = 0, fresh_bumps = 0;
+    bool rollback_ok = true, reanchor_ok = true;
     std::unique_ptr<UtxoFollower> f;
 
     explicit ViewModel(Harness& h) : hx(h)
@@ -426,6 +438,7 @@ struct ViewModel {
             return true;
         };
         fh.after_kept = [this]() { ++kept_passes; };
+        fh.on_fresh = [this]() { ++fresh_bumps; };
         fh.rollback = [this]() {
             ++rollbacks;
             if (!rollback_ok)
@@ -441,6 +454,8 @@ struct ViewModel {
         };
         fh.reanchor = [this]() {
             ++reanchors;
+            if (!reanchor_ok)
+                return false;
             best.SetNull();
             best_h = 0;
             return true;
@@ -587,6 +602,10 @@ int run_coin_peer_pool_kat()
                   && (order == std::vector<std::string>{"203.0.113.7:8333", "192.0.2.20:8333",
                                                         "192.0.2.21:8333", "198.51.100.2:9333"}),
               "[C] its addresses keep its place among the explicit peers, each once");
+        CHECK(peer_resolve_backoff_sec(0) == 30 && peer_resolve_backoff_sec(1) == 60
+                  && peer_resolve_backoff_sec(5) == 960 && peer_resolve_backoff_sec(6) == 1800
+                  && peer_resolve_backoff_sec(40) == 1800,
+              "[C] a failed resolve is tried again after 30 s, doubling, at most 30 min");
     }
 
     // ── [D] headers from any peer ─────────────────────────────────────────────
@@ -1092,6 +1111,9 @@ int run_coin_peer_pool_kat()
               "[R] the next block of a branch not followed: not active");
         CHECK(utxo_connect_gate(v, 100, id, v, 101, id) == UtxoConnectGate::Connect,
               "[R] the active chain's next block: connect");
+        CHECK(utxo_connect_gate(uint256(), 0, id, other, 970005, id, 970006) == UtxoConnectGate::StaleAnchor
+                  && utxo_connect_gate(uint256(), 0, id, other, 970006, id, 970006) == UtxoConnectGate::Connect,
+              "[R] an empty view: below the anchor floor a block does not anchor, at it it does");
         auto at = [&](uint32_t h) -> std::optional<uint256> {
             if (h == 100) return v;
             return std::nullopt;
@@ -1100,6 +1122,131 @@ int run_coin_peer_pool_kat()
                   && utxo_view_fresh(v, 100, 101, at, 1) && !utxo_view_fresh(uint256(), 0, 100, at, 0)
                   && !utxo_view_fresh(other, 100, 100, at, 0),
               "[R] fresh: on the active chain within max_lag of the tip; never empty");
+    }
+
+    // ── [S] a rollback that fails ─────────────────────────────────────────────
+    {
+        Harness hx;
+        ViewModel vm(hx);
+        hx.pool->tick();
+        handshake(hx, 2);
+        auto live = handshaked_peers(hx);
+        const BlockType a1 = make_block(hx.root, 970001, 81, {make_spend(41)});
+        vm.header(a1, true);
+        vm.f->on_tip_changed();
+        vm.f->on_body(a1);
+        vm.rollback_ok = false;
+        vm.reanchor_ok = false;
+        const BlockType b1 = make_block(hx.root, 970001, 82, {make_spend(42)});
+        const BlockType b2 = make_block(block_hash(b1), 970002, 83, {make_spend(43)});
+        vm.header(b1, false);
+        vm.header(b2, true);
+        CHECK(vm.f->on_tip_changed() == UtxoFollower::TipChange::RollbackFailed && vm.rollbacks == 1
+                  && vm.reanchors == 1 && vm.f->suspended(),
+              "[S] the rollback fails: a re-anchor at once (it fails too: suspended)");
+        // The chain flips back to a before the re-anchor; a2 comes.
+        const BlockType a2 = make_block(block_hash(a1), 970002, 84, {make_spend(44)});
+        hx.advance(1);
+        const BlockType a3 = make_block(block_hash(a2), 970003, 85, {make_spend(45)});
+        vm.header(a2, true);
+        vm.header(a3, true);
+        vm.f->on_tip_changed();
+        vm.f->on_body(a2);
+        CHECK(vm.best == block_hash(a1) && vm.connected.size() == 1 && vm.f->kept() == 0,
+              "[S] suspended: the flipped-back chain's next body does not connect");
+        vm.reanchor_ok = true;
+        CHECK(vm.f->on_tick(false).step == UtxoFollower::Step::ReanchorFailed && vm.reanchors == 1,
+              "[S] the re-anchor is retried only after kReanchorRetrySec");
+        hx.advance(UtxoFollower::kReanchorRetrySec);
+        const auto r = vm.f->on_tick(false);
+        CHECK(r.step == UtxoFollower::Step::Reanchor && vm.reanchors == 2 && !vm.f->suspended()
+                  && vm.best.IsNull() && r.fetched == std::vector<uint256>{block_hash(a3)},
+              "[S] then re-anchored by the tick (header sync not caught up), the tip's body fetched");
+        const int bumps = vm.fresh_bumps;
+        vm.f->on_body(a3);
+        CHECK(vm.best == block_hash(a3) && vm.fresh_bumps == bumps + 1,
+              "[S] the tip's body anchors the view; one work bump (the first connect after it)");
+    }
+
+    // ── [T] the work bump when the view reaches the tip ──────────────────────
+    {
+        Harness hx;
+        ViewModel vm(hx);   // at the root, the tip: fresh
+        hx.pool->tick();
+        handshake(hx, 2);
+        auto live = handshaked_peers(hx);
+        CHECK(vm.f->fresh() && vm.fresh_bumps == 0, "[T] at the tip: fresh, no bump yet");
+        const BlockType n1 = make_block(hx.root, 970001, 121, {make_spend(51)});
+        vm.header(n1, true);
+        vm.f->on_tip_changed();
+        CHECK(!vm.f->fresh(), "[T] the header at tip+1: not fresh");
+        live[0]->hooks.fetch(block_hash(n1), true);
+        live[0]->hooks.full_block(n1);
+        CHECK(vm.best == block_hash(n1) && vm.fresh_bumps == 1,
+              "[T] its body connects: exactly one bump");
+        // Two headers; the tip's body comes before its parent's.
+        const BlockType n2 = make_block(block_hash(n1), 970002, 122, {make_spend(52)});
+        const BlockType n3 = make_block(block_hash(n2), 970003, 123, {make_spend(53)});
+        vm.header(n2, true);
+        vm.header(n3, true);
+        vm.f->on_tip_changed();
+        live[1]->hooks.fetch(block_hash(n3), true);
+        live[1]->hooks.full_block(n3);
+        CHECK(vm.fresh_bumps == 1, "[T] the tip's body held for its parent: no bump");
+        FakePeer* asked = live[0]->asked_for(block_hash(n2)) ? live[0] : live[1];
+        asked->hooks.full_block(n2);
+        CHECK(vm.best == block_hash(n3) && vm.fresh_bumps == 2,
+              "[T] the parent connects (not at the tip: no bump), then the tip: one bump");
+    }
+
+    // ── [U] the next body never comes ─────────────────────────────────────────
+    {
+        Harness hx;
+        ViewModel vm(hx);
+        hx.pool->tick();
+        handshake(hx, 2);
+        const BlockType n1 = make_block(hx.root, 970001, 131, {make_spend(61)});
+        vm.header(n1, true);
+        const auto first = vm.f->catch_up();
+        CHECK(first.step == UtxoFollower::Step::Fetch
+                  && first.fetched == std::vector<uint256>{block_hash(n1)},
+              "[U] behind by one: its body is fetched");
+        bool early = false;
+        for (int64_t t = 0; t + 60 < UtxoFollower::kStuckReanchorSec; t += 60) {
+            hx.advance(60);
+            early = early || vm.f->catch_up().step == UtxoFollower::Step::Reanchor;
+        }
+        CHECK(!early && vm.reanchors == 0, "[U] no re-anchor before kStuckReanchorSec");
+        hx.advance(60);
+        const auto late = vm.f->catch_up();
+        CHECK(late.step == UtxoFollower::Step::Reanchor && vm.reanchors == 1
+                  && late.fetched == std::vector<uint256>{block_hash(n1)},
+              "[U] after it: re-anchored at the tip, the tip's body fetched");
+    }
+
+    // ── [V] the anchor floor; what is kept ────────────────────────────────────
+    {
+        Harness hx;
+        ViewModel vm(hx);
+        vm.best.SetNull();
+        vm.best_h = 0;
+        uint256 prev = hx.root;
+        std::vector<BlockType> c;
+        for (uint32_t i = 1; i <= 10; ++i) {
+            c.push_back(make_block(prev, 970000 + i, 140 + i, {make_spend(70 + i)}));
+            prev = block_hash(c.back());
+            vm.header(c.back(), true);
+        }
+        CHECK(!vm.f->on_body(c[4]) && vm.best.IsNull() && vm.f->kept() == 0,
+              "[V] an active body below tip - kInFlight neither anchors nor is kept");
+        CHECK(vm.f->on_body(c[5]) && vm.best == block_hash(c[5]),
+              "[V] one at tip - kInFlight anchors the view");
+        CHECK(!vm.f->on_body(c[4]) && vm.f->kept() == 0,
+              "[V] an active block below the view's height is not kept");
+        const BlockType sib = make_block(block_hash(c[4]), 970006, 199, {make_spend(99)});
+        vm.header(sib, false);
+        CHECK(!vm.f->on_body(sib) && vm.f->keeps(block_hash(sib)),
+              "[V] a competing block at the view's height is kept");
     }
 
     std::printf("%s\n", g_fail == 0 ? "bip110_coin_peer_pool_kat PASS" : "bip110_coin_peer_pool_kat FAIL");

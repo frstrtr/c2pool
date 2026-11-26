@@ -32,6 +32,7 @@
 #include <core/uint256.hpp>
 
 #include <algorithm>
+#include <cstdint>
 #include <functional>
 #include <set>
 #include <string>
@@ -86,6 +87,16 @@ inline uint256 pool_header_hash(const BlockHeaderType& header)
 inline bool is_peer_hostname(const NetService& ns)
 {
     return !ns.address().empty() && classify_address(ns.address()) == AddrClass::invalid;
+}
+
+/// Seconds before a failed resolve of a host-name explicit peer is tried
+/// again, after `failures` failures so far: 30 s, doubling, at most 30 min.
+inline int64_t peer_resolve_backoff_sec(int failures)
+{
+    int64_t s = 30;
+    for (int i = 0; i < failures && s < 1800; ++i)
+        s *= 2;
+    return std::min<int64_t>(s, 1800);
 }
 
 /// Put `resolved` (the addresses of the host-name entry `host`) right after

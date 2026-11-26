@@ -130,6 +130,8 @@ int run_cmpct_shortid_kat();
 int run_block_body_check_kat();
 int run_coin_peer_pool_kat();
 int run_coin_peer_pool_p2p_kat();
+// A UTXO-view rollback that fails half-way (bip110_utxo_rollback_kat.cpp).
+int run_utxo_rollback_kat();
 
 int main()
 {
@@ -257,6 +259,7 @@ int main()
     g_fail += run_block_body_check_kat();
     g_fail += run_coin_peer_pool_kat();
     g_fail += run_coin_peer_pool_p2p_kat();
+    g_fail += run_utxo_rollback_kat();
 
     if (g_fail == 0) std::printf("\nALL PASS: bip110 explorer retention + full-then-partial getblock"
                                  " + cmpct short ids + coin peer pool\n");

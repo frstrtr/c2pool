@@ -1048,6 +1048,14 @@ int run_embedded(bool coin_p2p_discover,
             mempool.revalidate_inputs(&utxo_cache);
             mempool.recompute_unknown_fees(&utxo_cache);
         };
+        // A connect made the view fresh (the serve gate opens): bump the work
+        // generation, so stratum pushes populated work; the tip header's own
+        // bump came while the gate was still shut (coinbase-only work).
+        std::weak_ptr<bip110::stratum::Bip110WorkSource> fresh_ws = work_source;
+        fh.on_fresh = [fresh_ws]() {
+            if (auto ws = fresh_ws.lock())
+                ws->bump_work_generation();
+        };
         // ── GAP4 UTXO-view reorg handling ────────────────────────────────────
         // The view is on an abandoned branch: flag it inconsistent (serve
         // coinbase-only), roll the view back to the common ancestor via undo data
@@ -1056,20 +1064,24 @@ int run_embedded(bool coin_p2p_discover,
         // block), requarantine + re-price the mempool against the reconciled
         // view, then clear the flag. A rolled-back coin can NEVER be
         // priced/included afterwards (GAP2's inclusion rule is the 2nd wall). On
-        // failure the flag stays set until the follower re-anchors the view.
+        // failure the disconnects already made are dropped
+        // (reorg_disconnect_or_discard): the view is the DB's again, at its old
+        // best, never half-undone; the flag stays set and the follower
+        // suspends the view (no connect) and re-anchors it at once.
         fh.rollback = [&utxo_cache, &utxo_db, &header_chain, &mempool, &utxo_consistent,
                        BIP110_KEEP_DEPTH]() -> bool {
             const uint32_t old_h = utxo_cache.get_best_height();
             utxo_consistent.store(false, std::memory_order_relaxed);
             const auto tip = header_chain.tip();
-            auto res = bip110::coin::reorg_disconnect_to_fork(
+            auto res = bip110::coin::reorg_disconnect_or_discard(
                 utxo_cache, utxo_db, header_chain, tip ? tip->block_hash : uint256(),
                 BIP110_KEEP_DEPTH);
             if (res != bip110::coin::ReorgResult::OK) {
                 LOG_ERROR << "[EMB-BIP110] UTXO reorg FAILED ("
                           << bip110::coin::reorg_result_name(res) << ") view_h=" << old_h
-                          << " tip_h=" << header_chain.height() << " — serving coinbase-only"
-                             " until the view is re-anchored (fail closed, never a wrong ledger)";
+                          << " tip_h=" << header_chain.height() << " — partial rollback dropped;"
+                             " serving coinbase-only until the view is re-anchored (fail closed,"
+                             " never a wrong ledger)";
                 return false;
             }
             mempool.requarantine_all();
@@ -1082,15 +1094,21 @@ int run_embedded(bool coin_p2p_discover,
                      << header_chain.height() << ")";
             return true;
         };
-        // Wipe the view (UTXOViewCache::reanchor: coins, undo records and the
-        // retained explorer bodies); the next connected block anchors it, as the
-        // first anchor. Every mempool price came from the old view.
+        // Wipe the view; the next connected block anchors it, as the first
+        // anchor. Every mempool price came from the old view. The wipe
+        // (UTXOViewCache::reanchor -> UTXOViewDB::reset) also drops the
+        // explorer's retained block bodies (the 'F' records in the same DB):
+        // getblock serves header partials for older heights until new bodies
+        // refill the EXPLORER_DEPTH window.
         fh.reanchor = [&utxo_cache, &mempool, &utxo_consistent]() -> bool {
             if (!utxo_cache.reanchor())
                 return false;
             mempool.requarantine_all();
             mempool.recompute_unknown_fees(&utxo_cache);
             utxo_consistent.store(true, std::memory_order_relaxed);
+            LOG_WARNING << "[EMB-BIP110] UTXO view wiped for a re-anchor: its coins, undo"
+                           " records and the explorer's retained block bodies (these refill"
+                           " from new blocks)";
             return true;
         };
         // The bodies come through the coin peer pool (built below).
@@ -1138,14 +1156,17 @@ int run_embedded(bool coin_p2p_discover,
     // offers its kept bodies first (a branch that just became active may extend
     // the view: a plain extension rolls nothing back), then, if the view's best
     // left the active chain, rolls the view back to the fork (fh.rollback) and
-    // offers them again.
+    // offers them again; if the rollback fails it suspends the view and
+    // re-anchors it before returning (no connect in between).
     header_chain.set_on_tip_changed(
         [utxo_follower](const uint256& /*old_tip*/, uint32_t old_h, const uint256& /*new_tip*/,
                         uint32_t new_h)
         {
             if (utxo_follower->on_tip_changed() == bip110::coin::UtxoFollower::TipChange::RollbackFailed)
-                LOG_WARNING << "[EMB-BIP110] UTXO view left on the old branch (old_h=" << old_h
-                            << " new_h=" << new_h << "): re-anchored by the next catch-up step";
+                LOG_WARNING << "[EMB-BIP110] UTXO view could not follow the reorg (old_h=" << old_h
+                            << " new_h=" << new_h << "): "
+                            << (utxo_follower->suspended() ? "suspended, re-anchor retried"
+                                                           : "re-anchored");
         });
 
     // ── M3 mempool tx ingest ──────────────────────────────────────────────
@@ -1339,23 +1360,34 @@ int run_embedded(bool coin_p2p_discover,
     // weight cap (block_body_check.hpp).
     auto explicit_list = std::make_shared<std::vector<NetService>>(explicit_peers);
     std::shared_ptr<std::function<void()>> keepalive;   // the pool driver
+    std::shared_ptr<std::function<void(NetService, int)>> resolve_keepalive;   // host-name --peer
     if (!explicit_peers.empty() || coin_peer_mgr) {
         // An explicit peer given by host name is resolved (async, the asio
         // resolver the dial path uses); its addresses take its place among the
-        // explicit peers (the pool dials addresses only).
-        for (const auto& ns : explicit_peers) {
-            if (!bip110::coin::is_peer_hostname(ns))
-                continue;
-            LOG_WARNING << "[EMB-BIP110] explicit fork peer " << ns.to_string()
-                        << " is a host name: resolving it (the coin peer pool dials addresses)";
+        // explicit peers (the pool dials addresses only), so the next free slot
+        // goes to them first (pool_candidates puts the explicit peers first). A
+        // failed resolve is tried again after peer_resolve_backoff_sec (30 s,
+        // doubling, at most 30 min).
+        auto resolve_peer = std::make_shared<std::function<void(NetService, int)>>();
+        std::weak_ptr<std::function<void(NetService, int)>> weak_resolve = resolve_peer;
+        *resolve_peer = [&ioc, explicit_list, weak_resolve](NetService ns, int failures) {
             auto resolver = std::make_shared<boost::asio::ip::tcp::resolver>(ioc);
             resolver->async_resolve(
                 ns.address(), std::to_string(ns.port()),
-                [resolver, explicit_list, ns](const boost::system::error_code& ec,
-                                              boost::asio::ip::tcp::resolver::results_type results) {
+                [&ioc, resolver, explicit_list, weak_resolve, ns, failures](
+                    const boost::system::error_code& ec,
+                    boost::asio::ip::tcp::resolver::results_type results) {
                     if (ec) {
+                        const int64_t wait = bip110::coin::peer_resolve_backoff_sec(failures);
                         LOG_WARNING << "[EMB-BIP110] explicit fork peer " << ns.to_string()
-                                    << " not resolved (" << ec.message() << "): not dialed";
+                                    << " not resolved (" << ec.message() << "): tried again in "
+                                    << wait << "s";
+                        auto timer = std::make_shared<io::steady_timer>(ioc, std::chrono::seconds(wait));
+                        timer->async_wait([timer, weak_resolve, ns, failures](const boost::system::error_code& e) {
+                            if (e) return;
+                            if (auto again = weak_resolve.lock())
+                                (*again)(ns, failures + 1);
+                        });
                         return;
                     }
                     std::vector<NetService> addrs;
@@ -1365,6 +1397,14 @@ int run_embedded(bool coin_p2p_discover,
                     LOG_INFO << "[EMB-BIP110] explicit fork peer " << ns.to_string()
                              << " resolved: " << n << " address(es) added";
                 });
+        };
+        resolve_keepalive = resolve_peer;
+        for (const auto& ns : explicit_peers) {
+            if (!bip110::coin::is_peer_hostname(ns))
+                continue;
+            LOG_WARNING << "[EMB-BIP110] explicit fork peer " << ns.to_string()
+                        << " is a host name: resolving it (the coin peer pool dials addresses)";
+            (*resolve_peer)(ns, 0);
         }
         auto* mgr = coin_peer_mgr.get();
         std::weak_ptr<bip110::coin::p2p::InboundListener<MiniConfig>> weak_il = inbound_listener;
@@ -1533,8 +1573,7 @@ int run_embedded(bool coin_p2p_discover,
                 if (ec) return;
                 try {
                     pool_ptr->poll();
-                    if (*hdr_caught_up)
-                        utxo_follower->catch_up();
+                    utxo_follower->on_tick(*hdr_caught_up);
                 } catch (const std::exception& e) {
                     LOG_WARNING << "[EMB-BIP110] coin peer pool tick error: " << e.what();
                 }
@@ -2937,7 +2976,7 @@ int run_embedded(bool coin_p2p_discover,
 
     LOG_INFO << "[EMB-BIP110] entering io loop";
     ioc.run();
-    (void)keepalive; (void)tip_ka;
+    (void)keepalive; (void)tip_ka; (void)resolve_keepalive;
     return 0;
 }
 

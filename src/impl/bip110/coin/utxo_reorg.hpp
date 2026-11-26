@@ -92,5 +92,25 @@ inline ReorgResult reorg_disconnect_to_fork(core::coin::UTXOViewCache& cache,
     return ReorgResult::OK;
 }
 
+// reorg_disconnect_to_fork, and on any failure the disconnects it already
+// made are dropped (UTXOViewCache::discard_pending: they were only in the
+// cache, a rollback flushes once at the end): the view is the backing DB's
+// again, unchanged at its old best, never partly rolled back. Without the
+// drop, the next connect's flush would write the half-undone blocks (their
+// spent coins back, their new coins gone) under a best that still names the
+// old tip.
+template <typename HeaderChainT>
+inline ReorgResult reorg_disconnect_or_discard(core::coin::UTXOViewCache& cache,
+                                               core::coin::UTXOViewDB& db,
+                                               const HeaderChainT& chain,
+                                               const uint256& new_tip,
+                                               uint32_t keep_depth)
+{
+    const ReorgResult r = reorg_disconnect_to_fork(cache, db, chain, new_tip, keep_depth);
+    if (r != ReorgResult::OK)
+        cache.discard_pending();
+    return r;
+}
+
 } // namespace coin
 } // namespace bip110
