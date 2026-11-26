@@ -247,11 +247,22 @@ add_test(NAME bip110_coin_reachability_kat COMMAND bip110_coin_reachability_kat)
 # BTC vector in src/impl/btc/test/btc_regtest_cmpct_fixtures.hpp; bip110 is the
 # BTC twin before the fork). It rides this executable, which is already in both
 # build.yml target lists, instead of adding a target.
+# So do the coin peer pool KATs: bip110_block_body_check_kat.cpp (the body
+# check with the BIP-110 block rules), bip110_coin_peer_pool_kat.cpp (the pool
+# over BIP-110 types and BLAKE2b identities) and bip110_coin_peer_pool_p2p_kat.cpp
+# (the pooled connection over the bip110 NodeP2P, and a source check of the
+# main_bip110.cpp wiring, read from BIP110_MAIN_SRC). The v2 block identity is
+# BLAKE2b, so the lane-local primitive is compiled in (as for the retention KAT).
 add_executable(bip110_explorer_getblock_kat
     test/bip110_explorer_getblock_kat.cpp
     test/bip110_cmpct_shortid_kat.cpp
+    test/bip110_block_body_check_kat.cpp
+    test/bip110_coin_peer_pool_kat.cpp
+    test/bip110_coin_peer_pool_p2p_kat.cpp
+    ${CMAKE_SOURCE_DIR}/src/impl/bip110/crypto/blake2b.c
 )
-target_compile_definitions(bip110_explorer_getblock_kat PRIVATE __C2POOL_COIN_BIP110__=1)
+target_compile_definitions(bip110_explorer_getblock_kat PRIVATE __C2POOL_COIN_BIP110__=1
+    BIP110_MAIN_SRC="${CMAKE_SOURCE_DIR}/src/c2pool/main_bip110.cpp")
 target_link_libraries(bip110_explorer_getblock_kat
     bip110_coin
     c2pool_payout
