@@ -131,46 +131,55 @@ namespace core {
 void apply_stratum_tls_file_settings(const c2pool::settings::ResolvedConfig& rc, StratumTlsSettings& s);
 
 /// A token bucket: `rate` tokens a second, at most `burst` held (it starts
-/// full). rate <= 0: every take() succeeds. Not thread-safe.
+/// full; a burst between 0 and 1 holds 1). rate <= 0 or burst <= 0: no limit,
+/// every take() succeeds (the "0 = no limit" of both flags). Not thread-safe.
 class StratumTlsTokenBucket {
 public:
     using clock = std::chrono::steady_clock;
     StratumTlsTokenBucket(double rate, double burst, clock::time_point now)
-        : rate_(rate), burst_(std::max(burst, 1.0)), tokens_(std::max(burst, 1.0)), last_(now) {}
+        : unlimited_(rate <= 0 || burst <= 0), rate_(rate), burst_(std::max(burst, 1.0)),
+          tokens_(std::max(burst, 1.0)), last_(now) {}
     /// A token is there now.
     bool ready(clock::time_point now)
     {
         refill(now);
-        return rate_ <= 0 || tokens_ >= 1.0;
+        return unlimited_ || tokens_ >= 1.0;
     }
     /// Spend one token (call after ready()).
     void take()
     {
-        if (rate_ > 0) tokens_ -= 1.0;
+        if (!unlimited_) tokens_ -= 1.0;
     }
     /// Refilled to the brim: nothing to remember about this bucket.
     bool full(clock::time_point now)
     {
         refill(now);
-        return rate_ <= 0 || tokens_ >= burst_;
+        return unlimited_ || tokens_ >= burst_;
     }
+    bool unlimited() const { return unlimited_; }
 
 private:
     void refill(clock::time_point now)
     {
-        if (rate_ <= 0 || now <= last_) return;
+        if (unlimited_ || now <= last_) return;
         tokens_ = std::min(burst_, tokens_ + rate_ * std::chrono::duration<double>(now - last_).count());
         last_ = now;
     }
+    bool unlimited_;
     double rate_, burst_, tokens_;
     clock::time_point last_;
 };
 
 /// The accept rate limit of the TLS listener: one bucket for all addresses
 /// and one per key (per_ip_cap_key of the remote address). An accept takes a
-/// token from both or from neither. A refused accept never adds a key, so the
-/// per-key map grows at most at the global rate; keys whose bucket is full
-/// again are pruned. Not thread-safe (the stratum io thread).
+/// token from both or from neither. Only an accept that passes the global
+/// bucket adds a key, so keys are added at most at the global accept rate.
+/// A key is dropped once its bucket is full again, by a prune that runs at
+/// most once a second and only past 1024 keys: a key a handshake-bound
+/// refusal added (nothing spent) is full at once, a drained one
+/// burst/rate seconds after its last accept (4 s at the defaults). The map
+/// so holds about max(1024, global rate x (1 s + per-key burst/rate)) keys.
+/// Not thread-safe (the stratum io thread).
 class StratumTlsAcceptLimiter {
 public:
     using clock = std::chrono::steady_clock;
@@ -293,21 +302,26 @@ public:
     StratumTlsHandshakeGate() : state_(std::make_shared<State>()) {}
 
     /// A slot for one handshake from `key` (0 limits: none), evicting one as
-    /// above when at a limit; nullptr when no slot can be had.
+    /// above when at a limit; nullptr when no slot can be had. evict_after
+    /// duration::max(): never evict (the newcomer would not be admitted).
     std::shared_ptr<Slot> try_acquire(const address& key, std::size_t max_total, std::size_t max_per_key,
                                       clock::time_point now = clock::now(),
                                       clock::duration evict_after = kStratumTlsHandshakeEvictAfter)
     {
         std::function<void()> evict;
-        std::shared_ptr<Slot> slot;
+        std::shared_ptr<Slot> slot;   // destroyed after the lock below on every exit
         {
             std::lock_guard<std::mutex> lk(state_->mutex);
+            // The slot first: if any allocation below throws, it erases what
+            // was inserted for it (or nothing), and no victim was touched.
+            const uint64_t id = state_->next_id;
+            slot.reset(new Slot(state_, id));
             const auto k = state_->per_key.find(key);
             const std::size_t from_key = k == state_->per_key.end() ? 0 : k->second;
             const bool key_full = max_per_key > 0 && from_key >= max_per_key;
             const bool total_full = max_total > 0 && state_->entries.size() >= max_total;
+            auto victim = state_->entries.end();
             if (key_full || total_full) {
-                auto victim = state_->entries.end();
                 for (auto it = state_->entries.begin(); it != state_->entries.end(); ++it) {
                     if (key_full && it->second.key != key)
                         continue;
@@ -320,14 +334,15 @@ public:
                 }
                 if (victim == state_->entries.end())
                     return nullptr;
+            }
+            state_->entries.emplace(id, Entry{key, now, {}});
+            ++state_->per_key[key];
+            ++state_->next_id;
+            if (victim != state_->entries.end()) {
                 evict = std::move(victim->second.evict);
                 state_->erase_locked(victim);
                 ++state_->evictions;
             }
-            const uint64_t id = state_->next_id++;
-            state_->entries.emplace(id, Entry{key, now, {}});
-            ++state_->per_key[key];
-            slot.reset(new Slot(state_, id));
         }
         if (evict)
             evict();

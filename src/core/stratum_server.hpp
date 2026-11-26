@@ -333,6 +333,7 @@ private:
     bool tls_handshake_done_ = false;
     bool tls_handshake_timed_out_ = false;
     bool tls_handshake_evicted_ = false;    // closed by the gate for a newcomer
+    uint64_t tls_timer_generation_ = 0;     // bumped by each arm and at the end
     bool tls_waiting_first_byte_ = false;   // no ClientHello byte yet
     std::chrono::steady_clock::time_point tls_handshake_deadline_{};
     // The TLS listener's in-flight handshake slot (StratumTlsHandshakeGate):
@@ -821,6 +822,9 @@ private:
     void handle_accept(boost::system::error_code ec, tcp::socket socket);
     // The admission path both listeners share (drain gate, node cap, per-IP
     // cap); `tls` non-null makes the session a TLS one.
+    // admit() would take a connection from `peer` now (drain gate, node cap,
+    // per-IP cap; read only).
+    bool would_admit(const boost::asio::ip::address& peer) const;
     void admit(boost::system::error_code ec, tcp::socket socket,
                std::shared_ptr<StratumTlsContext> tls,
                std::shared_ptr<StratumTlsHandshakeGate::Slot> tls_slot = nullptr);

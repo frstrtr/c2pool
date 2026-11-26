@@ -517,8 +517,12 @@ void StratumServer::handle_tls_accept(boost::system::error_code ec, tcp::socket 
             d << "TLS accept rate from one address, IPv6 /64, " << o.accept_rate_per_ip
               << "/s (burst " << o.accept_burst_per_ip << ") reached";
             detail = d.str();
-        } else if (!(slot = tls_->handshake_gate.try_acquire(key, o.max_handshakes, o.max_handshakes_per_ip, now,
-                                                              o.evict_after))) {
+        } else if (!(slot = tls_->handshake_gate.try_acquire(
+                         key, o.max_handshakes, o.max_handshakes_per_ip, now,
+                         // Evict for the newcomer only when admit() would take it.
+                         would_admit(ep_ec ? boost::asio::ip::address{} : ep.address())
+                             ? std::chrono::duration_cast<StratumTlsHandshakeGate::clock::duration>(o.evict_after)
+                             : StratumTlsHandshakeGate::clock::duration::max()))) {
             tls_->refused_handshakes.fetch_add(1);
             detail = std::to_string(tls_->handshake_gate.in_progress()) + " TLS handshakes in progress, "
                    + std::to_string(tls_->handshake_gate.in_progress_from(key))
@@ -868,6 +872,33 @@ void StratumServer::handle_accept(boost::system::error_code ec, tcp::socket sock
     if (running_) {
         accept_connections();
     }
+}
+
+bool StratumServer::would_admit(const boost::asio::ip::address& peer) const
+{
+    // admit()'s refusals, read only: the drain gate, the node cap and the
+    // per-IP cap over the connected sessions (admit() would also close the
+    // ones the hygiene knobs condemn; not counted here, so this errs toward
+    // "no").
+    if (!accepting_.load())
+        return false;
+    const core::stratum::StratumConfig* cfg =
+        mining_interface_ ? &mining_interface_->get_stratum_config() : nullptr;
+    const size_t cap = cfg ? cfg->max_stratum_connections : 0;
+    const size_t ip_cap = cfg ? cfg->max_stratum_connections_per_ip : 0;
+    if (cap == 0 && ip_cap == 0)
+        return true;
+    const bool per_ip = ip_cap > 0 && !peer.is_unspecified();
+    const auto ip_key = per_ip ? per_ip_cap_key(peer) : boost::asio::ip::address{};
+    std::lock_guard<std::mutex> lock(sessions_mutex_);
+    size_t live = http_state_->total();
+    size_t from_ip = per_ip ? http_state_->from(ip_key) : 0;
+    for (const auto& s : sessions_) {
+        if (!s->is_connected()) continue;
+        ++live;
+        if (per_ip && per_ip_cap_key(s->peer_address()) == ip_key) ++from_ip;
+    }
+    return !(cap > 0 && live >= cap) && !(per_ip && from_ip >= ip_cap);
 }
 
 void StratumServer::admit(boost::system::error_code ec, tcp::socket socket,
@@ -1376,13 +1407,17 @@ void StratumSession::start_tls_handshake()
 
 void StratumSession::arm_tls_handshake_timer(std::chrono::steady_clock::time_point at)
 {
-    // expires_at() aborts a wait already armed (its handler sees ec).
+    // expires_at() aborts a wait already armed (its handler sees ec), except
+    // one whose expiry is already queued with success: the generation tells
+    // that stale run apart (a ClientHello read at the first-byte boundary).
+    const uint64_t generation = ++tls_timer_generation_;
     tls_handshake_timer_.expires_at(at);
     std::weak_ptr<StratumSession> weak = shared_from_this();
-    tls_handshake_timer_.async_wait([weak](const boost::system::error_code& ec) {
+    tls_handshake_timer_.async_wait([weak, generation](const boost::system::error_code& ec) {
         if (ec) return;   // re-armed, the handshake ended, or the session closed
         auto self = weak.lock();
-        if (!self || self->tls_handshake_done_ || !self->is_connected()) return;
+        if (!self || generation != self->tls_timer_generation_) return;   // re-armed since
+        if (self->tls_handshake_done_ || !self->is_connected()) return;
         // Closing the socket ends the pending wait or handshake, whose
         // handler counts and logs it (rate-limited).
         self->tls_handshake_timed_out_ = true;
@@ -1411,6 +1446,7 @@ void StratumSession::hold_tls_handshake_slot(std::shared_ptr<StratumTlsHandshake
 void StratumSession::finish_tls_handshake(const boost::system::error_code& ec)
 {
     tls_handshake_slot_.reset();   // the handshake is over, whatever the outcome
+    ++tls_timer_generation_;       // any expiry still queued is stale
     tls_handshake_timer_.cancel();
     // Closed under the handshake by stop(), a reaper or a cap (neither by the
     // timeouts nor by an eviction): no failure, and server_ may be stopping.
