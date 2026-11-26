@@ -98,12 +98,12 @@ uint256 u256(const std::string& display_hex)
 // A synthetic, unique share hash for window row i.
 uint256 row_hash(uint32_t i)
 {
+    // uint256::begin() yields the eight 32-bit limbs (little-endian), not
+    // bytes: limb 0 carries i, the top limb carries the 0x5a35 tag.
     uint256 h;
     h.SetNull();
-    for (int b = 0; b < 4; ++b)
-        h.begin()[b] = static_cast<unsigned char>((i >> (8 * b)) & 0xff);
-    h.begin()[31] = 0x5a;
-    h.begin()[30] = 0x35;
+    h.begin()[0] = i;
+    h.begin()[7] = 0x5a350000u;
     return h;
 }
 
