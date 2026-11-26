@@ -133,9 +133,14 @@ void NodeImpl::connected(std::shared_ptr<core::Socket> socket)
 {
     auto addr = socket->get_addr();
     bool is_outbound = m_pending_outbound.erase(addr) > 0;
+    // A pin given as HOST:PORT was dialed (and marked pending) under its name.
+    const auto pin = pin_for(addr);
+    if (pin && *pin != addr)
+        is_outbound = m_pending_outbound.erase(*pin) > 0 || is_outbound;
 
-    // Reject banned peers
-    if (is_banned(addr))
+    // Reject banned peers. A pinned peer we dialed is exempt, as python's
+    // --p2pool-node connection (SingleClientFactory) never consults the bans.
+    if (is_banned(addr) && !(is_outbound && pin))
     {
         LOG_INFO << "[Pool] Rejecting connection from banned peer " << addr.to_string();
         socket->close();
@@ -190,6 +195,9 @@ void NodeImpl::error(const message_error_type& err, const NetService& service, c
     m_pending_outbound.erase(service);
     m_outbound_addrs.erase(service);
     publish_peer_info_snapshot();   // IO thread: refresh after peer removal
+    // A pinned peer dropped: redial it with back-off (python --p2pool-node).
+    if (auto pin = pin_for(service))
+        schedule_pin_redial(*pin, std::chrono::steady_clock::now());
 
     // p2pool p2p.py:595: self.get_shares.respond_all(reason)
     // Cancel pending share requests for this peer — invokes callbacks with
@@ -228,6 +236,8 @@ void NodeImpl::close_connection(const NetService& service)
 
     m_pending_outbound.erase(service);
     m_outbound_addrs.erase(service);
+    if (auto pin = pin_for(service))
+        schedule_pin_redial(*pin, std::chrono::steady_clock::now());
 
     // Drop stale nonce->peer entries for this endpoint (parity with error()).
     // close_connection is a peer-removal path too — without this a graceful
@@ -349,6 +359,9 @@ std::optional<pool::PeerConnectionType> NodeImpl::handle_version(std::unique_ptr
         peer->m_nonce = msg->m_nonce;
         m_peers[peer->m_nonce] = peer;
         publish_peer_info_snapshot();   // IO thread: refresh the display snapshot
+        // Handshake done: a pinned peer's redial delay goes back to 1 s
+        // (ReconnectingClientFactory.resetDelay from proto_connected).
+        note_pin_handshake(peer->addr());
 
         // Request peers from the newly established connection
         {
@@ -1515,6 +1528,16 @@ void NodeImpl::start_outbound_connections()
                                  [this]() { advertise_known_txs(); });
     }
 
+    // Pinned peers (--sharechain-addnode): dialed at once, kept connected and
+    // redialed with back-off from a 1 s check, independent of the outbound
+    // target below (python --p2pool-node, a SingleClientFactory per address).
+    if (!m_pinned_peers.empty() && m_context)
+    {
+        maintain_pinned_peers(std::chrono::steady_clock::now());
+        m_pin_timer = std::make_unique<core::Timer>(m_context, true);
+        m_pin_timer->start(1, [this]() { maintain_pinned_peers(std::chrono::steady_clock::now()); });
+    }
+
     if (m_target_outbound_peers == 0)
     {
         LOG_INFO << "Outbound peer dialing disabled (target=0)";
@@ -1539,8 +1562,7 @@ void NodeImpl::start_outbound_connections()
                 continue;
 
             LOG_INFO << "[Pool] Dialing outbound peer " << ap.addr.to_string();
-            m_pending_outbound.insert(ap.addr);
-            core::Client::connect(ap.addr);
+            begin_outbound_dial(ap.addr);
             --needed;
         }
     };

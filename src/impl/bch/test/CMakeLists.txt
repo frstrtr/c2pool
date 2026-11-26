@@ -300,6 +300,13 @@ if(BUILD_TESTING)
         v35_gentx_kat_test.cpp)
     target_compile_definitions(bch_embedded_block_broadcast_test PRIVATE
         BCH_V35_KAT_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/v35_real_share")
+    # Sharechain dialer KAT (pool_dialer_redial_test.cpp): connect_failed() and
+    # pinned --sharechain-addnode redial with back-off, rig-free and over a real
+    # refused dial. It builds a real bch::Config, hence the two config TUs.
+    target_sources(bch_embedded_block_broadcast_test PRIVATE
+        pool_dialer_redial_test.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/bch/config_coin.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/bch/config_pool.cpp)
 
     # #1437 topology KAT (child-without-parent + intra-template double-spend)
     # rides this EXISTING allowlisted target (bch tree is plain main()/CHECK,

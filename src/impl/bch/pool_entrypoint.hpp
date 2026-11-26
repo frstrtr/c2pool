@@ -153,7 +153,18 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
     daemon.run();
 
     // 3: the pool node (sharechain, LevelDB, P2P, Stratum).
-    Node node(&ioc, &config);  // concrete NodeBridge<NodeImpl,Legacy,Actual> -- NodeImpl alone is abstract (ICommunicator::handle lives in NodeBridge)
+    // concrete NodeBridge<NodeImpl,Legacy,Actual> -- NodeImpl alone is abstract
+    // (ICommunicator::handle lives in NodeBridge). shared_ptr-owned +
+    // set_lifetime, as the DASH node: core::Server(accept) and core::Client(dial)
+    // then pin it with a strong ref per async op, and the Factory delivers
+    // connect_failed() (it drops that signal for a node with no lifetime
+    // handle), so a failed sharechain dial is no longer left pending forever.
+    // `node` is a reference alias, so every use below is unchanged.
+    auto node_holder = std::make_shared<Node>(&ioc, &config);
+    Node& node = *node_holder;
+    node_holder->set_lifetime(node_holder);
+    if (!node_holder->lifetime_armed())
+        throw std::runtime_error("bch::standup_pool_run: sharechain node dial/accept lifetime failed to arm");
 
     // 4: bind the in-operation won-block fire path to the dual-path broadcaster.
     wire_won_block_sink(node, daemon);
@@ -178,11 +189,18 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
     // store seeded from m_bootstrap_addrs (run_pool). node inherits
     // core::Server via BaseNode : core::Factory<core::Server, core::Client>
     // (src/pool/node.hpp), so node.core::Server::listen(...) resolves exactly as
-    // in main_dgb.cpp:678 / main_btc.cpp:1638. When explicit --sharechain-addnode
-    // peers were pinned, raise the outbound target to at least that count so all
-    // pins are dialed (default m_target_outbound_peers = 8 otherwise).
+    // in main_dgb.cpp:678 / main_btc.cpp:1638.
+    // --sharechain-addnode peers are PINNED (python --p2pool-node): dialed on
+    // their own, kept connected and redialed with back-off, on top of the
+    // normal outbound target, which is no longer lowered to the pin count.
     if (explicit_sharechain_peers)
-        node.set_target_outbound_peers(std::max<size_t>(1, explicit_sharechain_peers));
+    {
+        for (const auto& addr : config.pool()->m_bootstrap_addrs)
+            node.add_pinned_peer(addr);
+        node.set_target_outbound_peers(std::max<size_t>(8, explicit_sharechain_peers));
+        LOG_INFO << "[BCH-POOL] " << config.pool()->m_bootstrap_addrs.size()
+                 << " pinned sharechain peer(s) (--sharechain-addnode)";
+    }
     node.core::Server::listen(PoolConfig::P2P_PORT);
     LOG_INFO << "[BCH-POOL] sharechain listening :" << PoolConfig::P2P_PORT
              << " proto adv=" << PoolConfig::ADVERTISED_PROTOCOL_VERSION

@@ -73,10 +73,11 @@ int run_legacy_addrme_self_probe_checks();
 // fold-in: its own TU, run from this already-allowlisted executable.
 int run_self_connection_ban_checks();
 
-// v35 CashAddr gentx fix KATs (v35_address_kat_test.cpp, v35_gentx_kat_test.cpp).
-// Same fold-in.
+// v35 CashAddr gentx fix KATs (v35_address_kat_test.cpp, v35_gentx_kat_test.cpp)
+// and the sharechain dialer KAT (pool_dialer_redial_test.cpp). Same fold-in.
 int run_v35_address_kat_checks();
 int run_v35_gentx_kat_checks();
+int run_pool_dialer_redial_checks();
 
 int main() {
     boost::asio::io_context ioc;
@@ -187,6 +188,9 @@ int main() {
     // v35 share address rule (no decoder registered), real-share gentx, own shares.
     failures += run_v35_address_kat_checks();
     failures += run_v35_gentx_kat_checks();
+
+    // Sharechain dialer: connect_failed + pinned addnode redial.
+    failures += run_pool_dialer_redial_checks();
 
     if (failures == 0) {
         std::cout << "embedded_block_broadcast_test: ALL PASS\n";
