@@ -125,7 +125,7 @@ jobs:
           flock "$lockfd"
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            g++ cmake make libleveldb-dev libsecp256k1-dev
+            g++ cmake make libleveldb-dev libsecp256k1-dev libssl-dev
 
       - uses: actions/setup-python@v6
         if: steps.presence.outputs.exists == '1'
@@ -192,9 +192,14 @@ jobs:
             dgb)  EXTRA="-DAUX_DOGE=ON" ;;
             dash) EXTRA="-DC2POOL_DASH_BLS=ON -DDASHBLS_ROOT=$DASHBLS_ROOT" ;;
           esac
+          # -DC2POOL_STRATUM_TLS=ON: the TLS stratum listener (--stratum-tls) is
+          # a HARD requirement of the Linux package -- cmake FATAL_ERRORs when
+          # OpenSSL (libssl-dev, static libs) is missing -- so this cell cannot
+          # quietly package a tls=off binary. Static OpenSSL: no new .so to bundle.
           cmake -S . -B build_${{ matrix.coin }} \
             -DCMAKE_TOOLCHAIN_FILE=build_${{ matrix.coin }}/conan_toolchain.cmake \
             -DCMAKE_BUILD_TYPE=Release \
+            -DC2POOL_STRATUM_TLS=ON \
             $EXTRA
 
       # Boost header-integrity + version gate: a torn/mixed Boost tree or an
