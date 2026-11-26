@@ -527,9 +527,9 @@ public:
             ++cnt;
             if (cnt <= 3 || cnt % 10 == 0)
                 LOG_WARNING << "attempt_verify FAILED (" << cnt
-                            << ") for " << share_hash.ToString().substr(0,16)
+                            << ") for " << share_hash.ToString()
                             << " acc_height=" << acc_height
-                            << " last=" << (last.IsNull() ? "null" : last.ToString().substr(0,16))
+                            << " last=" << (last.IsNull() ? "null" : last.ToString())
                             << " error: " << e.what();
             return false;
         }
@@ -1541,16 +1541,26 @@ public:
         std::map<std::vector<unsigned char>, double> result;
         uint64_t sum = 0;
 
+        // The weights are keyed by address (python share.address). Each
+        // address gets its own floor-rounded amount, as python pays it; two
+        // addresses for one script are summed here because this map is keyed
+        // by script (what that script receives). An address equal to python's
+        // donation_address is paid inside the donation output.
+        const auto& net = pool_v35_net();
+        const std::vector<unsigned char> donation_key(net.donation_address.begin(),
+                                                      net.donation_address.end());
         if (!total_weight.IsNull())
         {
-            for (const auto& [script, weight] : weights)
+            for (const auto& [key, weight] : weights)
             {
                 // V35: 99.5% to PPLNS — subsidy * 199 * weight / (200 * total_weight)
                 // Reference: data.py line 924
                 uint64_t amount = (uint288(subsidy) * uint288(199) * weight / (uint288(200) * total_weight)).GetLow64();
-                if (amount > 0)
+                if (amount > 0 && key != donation_key)
                 {
-                    result[script] = static_cast<double>(amount);
+                    auto script = v35_address_to_script(
+                        std::string_view(reinterpret_cast<const char*>(key.data()), key.size()), net);
+                    result[script] += static_cast<double>(amount);
                     sum += amount;
                 }
             }
@@ -1641,8 +1651,9 @@ private:
                     auto att = chain::target_to_average_attempts(target);
                     delta.total_weight = att * 65535;
                     delta.total_donation_weight = att * static_cast<uint32_t>(obj->m_donation);
-                    auto addr_bytes = get_share_script(obj);
-                    delta.weights[addr_bytes] = att * static_cast<uint32_t>(65535 - obj->m_donation);
+                    // Pre-v36 (flat) PPLNS is keyed by python's share.address,
+                    // not by script: two strings for one script stay two keys.
+                    delta.weights[v35_pplns_key(obj)] = att * static_cast<uint32_t>(65535 - obj->m_donation);
                 });
                 return delta;
             },

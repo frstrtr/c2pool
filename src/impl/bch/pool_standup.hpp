@@ -36,7 +36,9 @@ namespace bch
 
 // Bind the pool node won-block sink to the embedded daemon dual-path broadcaster.
 // Capture by reference: both objects are owned by the binary entrypoint and
-// outlive the pool run-loop, so the lambda never dangles. Call once at startup.
+// outlive the pool run-loop. The node is destroyed before the daemon, and
+// NodeImpl::stop_for_teardown() clears this sink (after joining the think
+// pool that calls it) before either goes. Call once at startup.
 inline void wire_won_block_sink(NodeImpl& node, coin::EmbeddedDaemon<Config>& daemon)
 {
     node.set_block_broadcaster(

@@ -132,10 +132,18 @@ void NodeImpl::send_ping(peer_ptr peer)
 void NodeImpl::connected(std::shared_ptr<core::Socket> socket)
 {
     auto addr = socket->get_addr();
-    bool is_outbound = m_pending_outbound.erase(addr) > 0;
+    // An outbound dial was marked pending under the NetService it was made
+    // for, which for a HOST:PORT pin is the name, not the endpoint it landed
+    // on: clear it by the dial target the Factory hands over.
+    const NetService dialed = socket->dial_target().value_or(addr);
+    bool is_outbound = m_pending_outbound.erase(dialed) > 0;
+    if (dialed != addr)
+        is_outbound = m_pending_outbound.erase(addr) > 0 || is_outbound;
+    const bool pinned = is_outbound && is_pinned(dialed);
 
-    // Reject banned peers
-    if (is_banned(addr))
+    // Reject banned peers. A pinned peer we dialed is exempt, as python's
+    // --p2pool-node connection (SingleClientFactory) never consults the bans.
+    if (is_banned(addr) && !pinned)
     {
         LOG_INFO << "[Pool] Rejecting connection from banned peer " << addr.to_string();
         socket->close();
@@ -147,6 +155,8 @@ void NodeImpl::connected(std::shared_ptr<core::Socket> socket)
 
     if (is_outbound)
         m_outbound_addrs.insert(addr);
+    if (pinned)
+        m_pin_live[addr] = dialed;
 
     auto peer = m_connections[addr];
     send_version(peer);
@@ -164,7 +174,7 @@ void NodeImpl::error(const message_error_type& err, const NetService& service, c
             if (elapsed < std::chrono::seconds(10)) {
                 for (const auto& h : it->second.hashes) {
                     if (m_rejected_share_hashes.insert(h).second) {
-                        LOG_WARNING << "[Pool] Marking share " << h.GetHex().substr(0, 16)
+                        LOG_WARNING << "[Pool] Marking share " << h.GetHex()
                                     << " as rejected (peer " << service.to_string()
                                     << " disconnected " << std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count()
                                     << "ms after broadcast)";
@@ -190,6 +200,10 @@ void NodeImpl::error(const message_error_type& err, const NetService& service, c
     m_pending_outbound.erase(service);
     m_outbound_addrs.erase(service);
     publish_peer_info_snapshot();   // IO thread: refresh after peer removal
+    // A pinned peer dropped: redial it with back-off (python --p2pool-node).
+    if (auto pin = pin_for(service))
+        schedule_pin_redial(*pin, std::chrono::steady_clock::now());
+    m_pin_live.erase(service);
 
     // p2pool p2p.py:595: self.get_shares.respond_all(reason)
     // Cancel pending share requests for this peer — invokes callbacks with
@@ -228,6 +242,9 @@ void NodeImpl::close_connection(const NetService& service)
 
     m_pending_outbound.erase(service);
     m_outbound_addrs.erase(service);
+    if (auto pin = pin_for(service))
+        schedule_pin_redial(*pin, std::chrono::steady_clock::now());
+    m_pin_live.erase(service);
 
     // Drop stale nonce->peer entries for this endpoint (parity with error()).
     // close_connection is a peer-removal path too — without this a graceful
@@ -349,6 +366,9 @@ std::optional<pool::PeerConnectionType> NodeImpl::handle_version(std::unique_ptr
         peer->m_nonce = msg->m_nonce;
         m_peers[peer->m_nonce] = peer;
         publish_peer_info_snapshot();   // IO thread: refresh the display snapshot
+        // Handshake done: a pinned peer's redial delay goes back to 1 s
+        // (ReconnectingClientFactory.resetDelay from proto_connected).
+        note_pin_handshake(peer->addr());
 
         // Request peers from the newly established connection
         {
@@ -554,14 +574,15 @@ void NodeImpl::processing_shares_phase2(HandleSharesData& data, NetService addr)
         share.invoke([](auto* obj) {
             auto target = chain::bits_to_target(obj->m_bits);
             double diff = chain::target_to_difficulty(target);
-            // Extract miner identity (pubkey_hash for v17/v33/v36, address script for v34/v35)
+            // Miner identity: pubkey_hash for v17/v33/v36, the address string for v34/v35
             std::string miner_hex;
             if constexpr (requires { obj->m_pubkey_hash; })
-                miner_hex = obj->m_pubkey_hash.GetHex().substr(0, 16);
+                miner_hex = obj->m_pubkey_hash.GetHex();
             else if constexpr (requires { obj->m_address; })
-                miner_hex = "script";
+                for (unsigned char c : obj->m_address.m_data)
+                    miner_hex.push_back((c >= 0x20 && c < 0x7f) ? static_cast<char>(c) : '?');
             LOG_INFO << "Received share: diff=" << std::scientific << std::setprecision(2) << diff
-                     << " hash=" << obj->m_hash.GetHex().substr(0, 16)
+                     << " hash=" << obj->m_hash.GetHex()
                      << " miner=" << miner_hex;
         });
 
@@ -1343,7 +1364,7 @@ void NodeImpl::load_persisted_shares()
 
     const size_t to_load = total_in_db - skip;
     LOG_INFO << "[Pool] Loading shares from LevelDB: " << to_load << " shares to process...";
-    int loaded = 0, skipped_contains = 0, skipped_load = 0, skipped_small = 0;
+    int loaded = 0, skipped_contains = 0, skipped_load = 0, skipped_small = 0, skipped_address = 0;
     std::vector<uint256> verified_hashes; // shares to pre-populate into verified
     for (size_t i = skip; i < total_in_db; ++i)
     {
@@ -1372,6 +1393,20 @@ void NodeImpl::load_persisted_shares()
             // m_hash is not part of the serialized format — it's computed
             // during share_check validation.  Restore it from the LevelDB key.
             share.ACTION({ obj->m_hash = hash; });
+            // v34/v35: python cannot load a share whose address it cannot turn
+            // into a script (Share.__init__ raises), so neither do we. This drops
+            // e.g. shares an older build minted with a Litecoin-format address.
+            bool bad_address = false;
+            share.ACTION({
+                if constexpr (requires { obj->m_address; }) {
+                    try { (void)get_share_script(obj); }
+                    catch (const V35AddressError&) { bad_address = true; }
+                }
+            });
+            if (bad_address) {
+                ++skipped_address;
+                continue;
+            }
             if (!m_chain->contains(share.hash()))
             {
                 m_tracker.add(share);
@@ -1444,7 +1479,7 @@ void NodeImpl::load_persisted_shares()
     LOG_INFO << "[Pool] Loaded " << loaded << " shares from LevelDB storage"
              << " (DB total: " << total_in_db << ", limit: " << keep_per_head
              << ", skipped: load=" << skipped_load << " small=" << skipped_small
-             << " dup=" << skipped_contains << ")";
+             << " dup=" << skipped_contains << " bad_address=" << skipped_address << ")";
 
     // Prune old shares from LevelDB that we skipped
     if (skip > 0)
@@ -1475,6 +1510,31 @@ void NodeImpl::flush_verified_to_leveldb()
     m_verified_flush_buf.clear();
 }
 
+void NodeImpl::stop_for_teardown()
+{
+    if (m_torn_down)
+        return;
+    m_torn_down = true;
+
+    // Compute side first: stop() lets a running think()/verify task finish and
+    // drops the queued ones, join() waits for it. Only then is nothing left
+    // that can call the callbacks below, so clearing them is race-free.
+    m_think_pool.stop();
+    m_verify_pool.stop();
+    m_think_pool.join();
+    m_verify_pool.join();
+
+    // Callbacks into objects the entrypoint owns (the embedded daemon behind
+    // the won-block sink, the stratum work refresh). The node must not reach
+    // them once the entrypoint starts destroying them.
+    m_block_broadcaster = nullptr;
+    m_tracker.m_on_block_found = nullptr;
+    m_on_best_share_changed = nullptr;
+    m_on_bestblock = nullptr;
+
+    shutdown();   // flush the LevelDB buffers while the node is quiet
+}
+
 void NodeImpl::shutdown()
 {
     LOG_INFO << "[Pool] NodeImpl shutdown: flushing pending LevelDB buffers...";
@@ -1498,6 +1558,16 @@ void NodeImpl::start_outbound_connections()
         m_tx_advert_timer = std::make_unique<core::Timer>(m_context, true);
         m_tx_advert_timer->start(core::TX_ADVERT_INTERVAL_SECONDS,
                                  [this]() { advertise_known_txs(); });
+    }
+
+    // Pinned peers (--sharechain-addnode): dialed at once, kept connected and
+    // redialed with back-off from a 1 s check, independent of the outbound
+    // target below (python --p2pool-node, a SingleClientFactory per address).
+    if (!m_pinned_peers.empty() && m_context)
+    {
+        maintain_pinned_peers(std::chrono::steady_clock::now());
+        m_pin_timer = std::make_unique<core::Timer>(m_context, true);
+        m_pin_timer->start(1, [this]() { maintain_pinned_peers(std::chrono::steady_clock::now()); });
     }
 
     if (m_target_outbound_peers == 0)
@@ -1524,8 +1594,7 @@ void NodeImpl::start_outbound_connections()
                 continue;
 
             LOG_INFO << "[Pool] Dialing outbound peer " << ap.addr.to_string();
-            m_pending_outbound.insert(ap.addr);
-            core::Client::connect(ap.addr);
+            begin_outbound_dial(ap.addr);
             --needed;
         }
     };

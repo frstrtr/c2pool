@@ -99,6 +99,19 @@ public:
         uint64_t subsidy,
         const std::vector<unsigned char>& donation_script)>;
 
+    /// Pre-v36 (v34/v35) author outputs: the PPLNS payouts in coinbase order
+    /// followed by the donation output, i.e. exactly the (script, amount)
+    /// list the verifier (generate_share_transaction) rebuilds for a share
+    /// whose parent is prev_share_hash and whose address is the v35 address
+    /// of payout_script. Python keys these by address string, so they cannot
+    /// be derived from the script-keyed PplnsFn map. Throws when no such list
+    /// exists (e.g. the script has no v35 address form).
+    using V35OutputsFn = std::function<std::vector<std::pair<std::vector<unsigned char>, uint64_t>>(
+        const uint256& prev_share_hash,
+        const uint256& block_target,
+        uint64_t subsidy,
+        const std::vector<unsigned char>& payout_script)>;
+
     /// Computes the ref_hash AND walks the share tracker for all
     /// chain-derived values needed to populate snap.frozen_ref. Mirrors
     /// the BTC/LTC RefHashFn contract: returns the full
@@ -147,6 +160,10 @@ public:
     std::string                         get_current_gbt_prevhash() const override;
     uint64_t                            get_work_generation() const override;
     bool                                has_merged_chain(uint32_t chain_id) const override;
+    /// v34/v35 shares carry a legacy Base58 address (python script2_to_address
+    /// form). While the chain mints them (author version < 36), refuse a login
+    /// whose payout script has none (e.g. a 32-byte P2SH CashAddr).
+    std::string                         authorize_refusal(const std::string& username) const override;
 
     /// #961 cross-lane (B4): publish BCH's OWN payout-address acceptance (legacy
     /// base58; CashAddr is a registered native decoder consulted by decide_payout_
@@ -231,6 +248,11 @@ public:
     /// (degraded mode — no c2pool sharechain participation but valid BCH
     /// blocks still produced).
     void set_pplns_fn(PplnsFn fn);
+
+    /// Wire the pre-v36 author-output producer. When set, sub-36 authors build
+    /// their coinbase outputs from it (no PplnsFn, finder-fee or assemble step),
+    /// so our own v34/v35 shares match the verifier byte for byte.
+    void set_v35_outputs_fn(V35OutputsFn fn);
 
     /// Wire the ref_hash producer. Called once at startup. May be left
     /// unset; in that case the coinbase OP_RETURN is omitted (degraded
@@ -328,6 +350,7 @@ private:
     // PPLNS + ref_hash + share-create callbacks (from ShareTracker via main_bch.cpp)
     mutable std::mutex          callback_mutex_;
     PplnsFn                     pplns_fn_;
+    V35OutputsFn                v35_outputs_fn_;
     RefHashFn                   ref_hash_fn_;
     CreateShareFn               create_share_fn_;
     std::vector<unsigned char>  donation_script_;

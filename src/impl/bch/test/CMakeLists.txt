@@ -287,14 +287,41 @@ if(BUILD_TESTING)
     # handle_version, which this target already compiles (node.cpp). Invoked
     # from main() via run_self_connection_ban_checks(); no new executable.
     target_sources(bch_embedded_block_broadcast_test PRIVATE self_connection_ban_test.cpp)
+    # v35 CashAddr gentx fix KATs ride the same EXISTING allowlisted target (no
+    # new executable, no build.yml change):
+    #   v35_address_kat_test.cpp  address -> script vectors from the python rule,
+    #                             run with no CashAddr decoder registered; the
+    #                             address our own v35 shares carry
+    #   v35_gentx_kat_test.cpp    the real public share 0000...24caa7c3 with its
+    #                             4,319-share window (gentx == public gentx.raw),
+    #                             one script under three strings, own-share verify
+    target_sources(bch_embedded_block_broadcast_test PRIVATE
+        v35_address_kat_test.cpp
+        v35_gentx_kat_test.cpp)
+    target_compile_definitions(bch_embedded_block_broadcast_test PRIVATE
+        BCH_V35_KAT_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/v35_real_share")
+    # Sharechain dialer KAT (pool_dialer_redial_test.cpp): connect_failed() and
+    # pinned --sharechain-addnode redial with back-off, rig-free and over a real
+    # refused dial. It builds a real bch::Config, hence the two config TUs.
+    target_sources(bch_embedded_block_broadcast_test PRIVATE
+        pool_dialer_redial_test.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/bch/config_coin.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/bch/config_pool.cpp)
+    # Its teardown source-order guard reads the entrypoint and main_bch.cpp.
+    target_compile_definitions(bch_embedded_block_broadcast_test PRIVATE
+        BCH_POOL_ENTRYPOINT_SRC="${CMAKE_SOURCE_DIR}/src/impl/bch/pool_entrypoint.hpp"
+        BCH_MAIN_BCH_SRC="${CMAKE_SOURCE_DIR}/src/c2pool/main_bch.cpp")
 
     # #1437 topology KAT (child-without-parent + intra-template double-spend)
     # rides this EXISTING allowlisted target (bch tree is plain main()/CHECK,
     # no GTest); run_template_topology_spend_checks() is invoked from the
     # roundtrip test's main (no new executable / no #143 NOT_BUILT trap).
+    # work_source_authorize_refusal_test.cpp (v35 login refusal) rides the same
+    # target; it needs the BCHWorkSource this target already links.
     add_executable(bch_g2_block_assembly_roundtrip_test
         g2_block_assembly_roundtrip_test.cpp
         template_topology_spend_test.cpp
+        work_source_authorize_refusal_test.cpp
         ${CMAKE_SOURCE_DIR}/src/impl/bch/coin/transaction.cpp)
     target_include_directories(bch_g2_block_assembly_roundtrip_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(bch_g2_block_assembly_roundtrip_test PRIVATE

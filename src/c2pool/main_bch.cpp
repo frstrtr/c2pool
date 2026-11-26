@@ -123,8 +123,9 @@ void print_banner(const char* argv0)
         << "                            once from one address, one /64 for IPv6: at\n"
         << "                            most N; others are answered 503 (default 6; 0 =\n"
         << "                            no limit below --stratum-http-budget)\n"
-        << "  --sharechain-addnode H:P  pin explicit sharechain (pool P2P) peer(s);\n"
-        << "                            REPEATABLE. Given => only these are dialed.\n"
+        << "  --sharechain-addnode H:P  pin a sharechain (pool P2P) peer: kept connected,\n"
+        << "                            redialed with back-off (python --p2pool-node);\n"
+        << "                            REPEATABLE. Given => no public seed list.\n"
         << "  --anchor N                cold-start ABLA floor anchor height\n"
         << "  --rpc-conf PATH           external BCHN-RPC fallback creds (host:port+auth)\n"
         << "  --data-dir PATH           root all per-instance state here (default\n"
@@ -692,11 +693,13 @@ int run_pool(const std::string& peer_host, uint16_t peer_port, bool testnet,
              const std::string& node_owner_address,
              bool coin_p2p_discover)
 {
-    boost::asio::io_context ioc;
-
     bch::PoolConfig::is_testnet = testnet;
 
+    // config before ioc: locals die in reverse order, so the io_context (and
+    // any handler it still holds) goes first and config outlives everything
+    // that was given a pointer to it.
     bch::Config config("bch");
+    boost::asio::io_context ioc;
     // Skip Config::init() (no on-disk pool.yaml/coin.yaml); set only the fields
     // the run-loop touches, from BCH chainparams.
     config.coin()->m_testnet = testnet || testnet4 || regtest;
