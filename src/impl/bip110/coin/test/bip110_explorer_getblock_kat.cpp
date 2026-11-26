@@ -124,6 +124,14 @@ static IndexEntry make_entry(const BlockType& b, const uint256& hash, uint32_t h
 
 // BIP 152 short ids against bitcoind (bip110_cmpct_shortid_kat.cpp, #2055).
 int run_cmpct_shortid_kat();
+// The coin peer pool: its block-body check (bip110_block_body_check_kat.cpp),
+// the pool over BIP-110 types (bip110_coin_peer_pool_kat.cpp) and the pooled
+// connection + main_bip110.cpp wiring (bip110_coin_peer_pool_p2p_kat.cpp).
+int run_block_body_check_kat();
+int run_coin_peer_pool_kat();
+int run_coin_peer_pool_p2p_kat();
+// A UTXO-view rollback that fails half-way (bip110_utxo_rollback_kat.cpp).
+int run_utxo_rollback_kat();
 
 int main()
 {
@@ -248,8 +256,13 @@ int main()
     }
 
     g_fail += run_cmpct_shortid_kat();
+    g_fail += run_block_body_check_kat();
+    g_fail += run_coin_peer_pool_kat();
+    g_fail += run_coin_peer_pool_p2p_kat();
+    g_fail += run_utxo_rollback_kat();
 
-    if (g_fail == 0) std::printf("\nALL PASS: bip110 explorer retention + full-then-partial getblock\n");
+    if (g_fail == 0) std::printf("\nALL PASS: bip110 explorer retention + full-then-partial getblock"
+                                 " + cmpct short ids + coin peer pool\n");
     else             std::printf("\n%d CHECK(s) FAILED\n", g_fail);
     return g_fail == 0 ? 0 : 1;
 }
