@@ -119,6 +119,15 @@ private:
     // Raw block parser: if set, re-parses DOGE AuxPoW full blocks from raw P2P bytes.
     using RawBlockParser = std::function<BlockType(const uint8_t*, size_t)>;
     RawBlockParser m_raw_block_parser;
+    // Fetch filter for announced items: consulted before the getdata for an
+    // announced block (inv, BIP 130 headers announcement) or transaction
+    // (inv); false skips that item. Unset: every announced item is fetched.
+    using FetchFilter = std::function<bool(const uint256& hash, bool is_block)>;
+    FetchFilter m_fetch_filter;
+    // Called with the entry count of every headers message, an empty one
+    // included (new_headers fires only for a non-empty one). Unset: nothing.
+    using HeadersMessageCallback = std::function<void(size_t count)>;
+    HeadersMessageCallback m_on_headers_message;
 
 public:
     NodeP2P(io::io_context* context, btc::interfaces::Node* coin, config_t* config,
@@ -307,6 +316,14 @@ public:
     /// Set custom raw block parser (for DOGE AuxPoW full blocks).
     void set_raw_block_parser(RawBlockParser p) { m_raw_block_parser = std::move(p); }
 
+    /// Set the fetch filter for announced blocks and transactions (unset by
+    /// default: every announced item is fetched).
+    void set_fetch_filter(FetchFilter f) { m_fetch_filter = std::move(f); }
+
+    /// Set the callback for every headers message's entry count (unset by
+    /// default).
+    void set_on_headers_message(HeadersMessageCallback cb) { m_on_headers_message = std::move(cb); }
+
     /// Send getaddr to request peer addresses.
     void send_getaddr()
     {
@@ -334,6 +351,19 @@ public:
         if (m_peer) {
             auto msg = message_getdata::make_raw(
                 {inventory_type(inventory_type::witness_block, block_hash)});
+            m_peer->write(msg);
+        }
+    }
+
+    /// Request a transaction via getdata (MSG_WITNESS_TX, BIP 144) by its
+    /// txid. Correct while wtxidrelay (BIP 339) is not negotiated (this driver
+    /// never sends it): peers then announce, and look up, transactions by
+    /// txid. With wtxidrelay a wtxid would need MSG_WTX instead.
+    void request_tx(const uint256& txid)
+    {
+        if (m_peer) {
+            auto msg = message_getdata::make_raw(
+                {inventory_type(inventory_type::witness_tx, txid)});
             m_peer->write(msg);
         }
     }
@@ -472,6 +502,11 @@ public:
     //[x][x][x] void handle_message_headers(std::shared_ptr<coind::messages::message_headers> msg, CoindProtocol* protocol); //
 
 private:
+    bool wants_fetch(const uint256& hash, bool is_block) const
+    {
+        return !m_fetch_filter || m_fetch_filter(hash, is_block);
+    }
+
     void ensure_timeout_timer()
     {
         if (!m_timeout_timer)
@@ -664,11 +699,17 @@ private:
         for (auto& inv : msg->m_invs)
         {
             auto btype = inv.base_type();
-            // BIP 339: MSG_WTX (type 5) uses wtxid instead of txid.
-            // Request via MSG_WITNESS_TX (0x40000001) since getdata doesn't accept MSG_WTX.
-            // Reference: Bitcoin Core protocol.h line 447, net_processing.cpp line 3036
+            // BIP 339: an MSG_WTX (type 5) inv carries a wtxid, and the
+            // matching getdata is MSG_WTX with that wtxid (Bitcoin Core
+            // accepts MSG_WTX in getdata). A peer sends MSG_WTX invs only
+            // after both sides sent wtxidrelay before verack; this driver
+            // never sends wtxidrelay, so peers announce by txid (MSG_TX) and
+            // this branch is not reached. The MSG_WITNESS_TX request below
+            // would look the hash up as a txid: correct only for that
+            // txid-announced case.
             if (inv.m_type == inventory_type::wtx) {
-                vinv.push_back(inventory_type(inventory_type::witness_tx, inv.m_hash));
+                if (wants_fetch(inv.m_hash, false))
+                    vinv.push_back(inventory_type(inventory_type::witness_tx, inv.m_hash));
                 continue;
             }
 
@@ -679,15 +720,17 @@ private:
                 // transactions arrive with their witness data intact.
                 // Without this, P2WPKH/P2WSH spends arrive stripped and
                 // fail CheckQueue when included in blocks.
-                vinv.push_back(inventory_type(inventory_type::witness_tx, inv.m_hash));
+                if (wants_fetch(inv.m_hash, false))
+                    vinv.push_back(inventory_type(inventory_type::witness_tx, inv.m_hash));
                 break;
             case inventory_type::block:
                 m_coin->new_block.happened(inv.m_hash);
                 // BTC advertises NODE_WITNESS — getdata for blocks must use
                 // MSG_WITNESS_BLOCK (0x40000002) per BIP 144, otherwise the
                 // peer drops witness data on the wire.
-                vinv.push_back(inventory_type(
-                    inventory_type::witness_block, inv.m_hash));
+                if (wants_fetch(inv.m_hash, true))
+                    vinv.push_back(inventory_type(
+                        inventory_type::witness_block, inv.m_hash));
                 break;
             case inventory_type::filtered_block:
             case inventory_type::cmpct_block:
@@ -779,6 +822,9 @@ private:
             }
         }
 
+        if (m_on_headers_message)
+            m_on_headers_message(vheaders.size());
+
         if (!vheaders.empty()) {
             m_coin->new_headers.happened(vheaders);
 
@@ -790,6 +836,8 @@ private:
                 for (auto& hdr : vheaders) {
                     auto packed = pack(hdr);
                     auto bhash = Hash(packed.get_span());
+                    if (!wants_fetch(bhash, true))
+                        continue;
                     auto getdata_msg = message_getdata::make_raw(
                         {inventory_type(inventory_type::witness_block, bhash)});
                     m_peer->write(getdata_msg);

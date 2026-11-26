@@ -6,12 +6,15 @@ if (BUILD_TESTING AND GTest_FOUND)
         auto_ratchet_sim_test.cpp
         bip34_height_push_test.cpp
         block_assembly_test.cpp
+        block_body_check_test.cpp
         block_broadcast_connect_test.cpp
         block_broadcast_guard_test.cpp
         broadcast_gate_test.cpp
         broadcast_lock_discipline_test.cpp
         cmpct_bitcoind_vector_test.cpp
         coin_peer_manager_test.cpp
+        coin_peer_pool_p2p_test.cpp
+        coin_peer_pool_test.cpp
         dashboard_pplns_current_test.cpp
         f10b_version_punish_removal_test.cpp
         f11_donation_invariance_test.cpp
