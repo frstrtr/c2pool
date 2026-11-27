@@ -57,6 +57,7 @@
 #include <shared_mutex>
 #include <span>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace {
@@ -973,4 +974,47 @@ TEST(DgbMintRoundTrip, V35MintDeclinesWhenItsRefIsNotTheCoinbases)
     (void)rig.ws->mining_submit(miner_login(), "job", "cafef00d", "0000002f", "6a1b2c3d", "00c0ffee", "rid", {}, &j);
     EXPECT_TRUE(rig.minted.IsNull()) << "a share with another ref than its coinbase's was minted";
     EXPECT_EQ(rig.chain.tracker.chain.size(), before) << "and added to the chain";
+}
+
+// The best moves between job and submit (a peer share lands on the job's
+// prev share, review 7a4373856): the old job's submit still mints the job's
+// own coinbase on the job's prev, and the share verifies (its generation
+// transaction is the coinbase the miner hashed).
+TEST(DgbMintRoundTrip, ASubmitAfterTheBestMovedMintsTheJobsCoinbase)
+{
+    for (int64_t ver : {int64_t(35), int64_t(36)}) {
+        SCOPED_TRACE(ver);
+        RtRig rig;
+        rig.mint_version = ver;
+        const Bytes payout = stratum_payout(miner_login());
+        const uint256 prev = rig.chain.tip;
+        auto cbr = rig.ws->build_connection_coinbase(prev, "cafef00d", payout, {});
+        ASSERT_FALSE(cbr.coinb1.empty());
+        auto j = rig.job(cbr, 0x2100ffffu, &payout);
+
+        // A peer share on the job's prev: the tracker's best moves past it.
+        const uint256 peer(std::vector<unsigned char>(32, 0x7e));
+        rig.chain.tracker.chain.get(prev).share.invoke([&](auto* tip_share) {
+            using T = std::remove_pointer_t<decltype(tip_share)>;
+            auto* s = new T(*tip_share);
+            s->m_hash = peer;
+            s->m_prev_hash = prev;
+            s->m_absheight = tip_share->m_absheight + 1;
+            s->m_timestamp = tip_share->m_timestamp + 15;
+            s->m_min_header.m_timestamp = s->m_timestamp;
+            dgb::ShareType st;
+            st = s;
+            rig.chain.tracker.add(st);
+        });
+        ASSERT_TRUE(rig.chain.tracker.chain.contains(peer));
+        rig.chain.tip = peer;
+        rig.chain.tip_ts += 15;
+
+        const auto m = submit_and_read(rig, j, miner_login(), {}, ver);
+        ASSERT_TRUE(m.ok) << "the old job's share was not minted";
+        EXPECT_TRUE(m.gentx_ok) << "the minted share is not the coinbase the miner hashed";
+        rig.chain.tracker.chain.get(rig.minted).share.invoke([&](auto* s) {
+            EXPECT_EQ(s->m_prev_hash, prev) << "the share moved to the new best";
+        });
+    }
 }
