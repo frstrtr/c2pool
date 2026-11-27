@@ -1273,6 +1273,47 @@ bool SharechainLevelDBStore::mark_shares_verified(const std::vector<uint256>& ha
     }
 }
 
+bool SharechainLevelDBStore::mark_shares_unverified(const std::vector<uint256>& hashes)
+{
+    if (!m_store || !m_store->is_open())
+        return false;
+    try {
+        auto batch = m_store->create_batch();
+        int updated = 0;
+        for (const auto& hash : hashes) {
+            ShareMetadata metadata;
+            std::vector<uint8_t> dummy;
+            if (!load_share(hash, dummy, metadata))
+                continue;
+            if (!metadata.is_verified)
+                continue;
+            PackStream ms;
+            ms << metadata.prev_hash;
+            ms << metadata.height;
+            ms << metadata.timestamp;
+            ms << metadata.work;
+            ms << metadata.target;
+            ms << static_cast<uint8_t>(metadata.is_orphan ? 1 : 0);
+            ms << static_cast<uint8_t>(0); // is_verified = false
+            ms << metadata.pow_hash;
+            auto span = ms.get_span();
+            std::vector<uint8_t> md(
+                reinterpret_cast<const uint8_t*>(span.data()),
+                reinterpret_cast<const uint8_t*>(span.data()) + span.size());
+            batch.put(make_index_key(hash), md);
+            ++updated;
+        }
+        if (updated > 0 && !batch.commit()) {
+            LOG_ERROR << "mark_shares_unverified: batch commit failed";
+            return false;
+        }
+        return true;
+    } catch (const std::exception& e) {
+        LOG_ERROR << "mark_shares_unverified failed: " << e.what();
+        return false;
+    }
+}
+
 bool SharechainLevelDBStore::mark_shares_verified_with_pow(
     const std::vector<std::pair<uint256, uint256>>& hash_pow_pairs)
 {
