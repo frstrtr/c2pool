@@ -119,11 +119,14 @@ TEST(DgbWonBlockSerialize, SegwitActiveWithCommitmentEmitsBip144)
     EXPECT_EQ(out.bytes.size(), 80u + 1u + cb.size() + 36u);
     EXPECT_EQ(out.bytes[85], 0x00);   // marker
     EXPECT_EQ(out.bytes[86], 0x01);   // flag
-    // witness stack: 1 item of 32 zero bytes, immediately before the locktime.
+    // witness stack: 1 item, the reserved value '[P2Pool]'*4 (the value the
+    // commitment is built with), immediately before the locktime.
     const size_t wit = out.bytes.size() - 4 - 34;
     EXPECT_EQ(out.bytes[wit], 0x01);
     EXPECT_EQ(out.bytes[wit + 1], 0x20);
-    for (size_t i = 0; i < 32; ++i) EXPECT_EQ(out.bytes[wit + 2 + i], 0x00);
+    const char* reserved = "[P2Pool][P2Pool][P2Pool][P2Pool]";
+    for (size_t i = 0; i < 32; ++i)
+        EXPECT_EQ(out.bytes[wit + 2 + i], static_cast<uint8_t>(reserved[i])) << i;
 }
 
 TEST(DgbWonBlockSerialize, SegwitInactiveNeverEmitsWitnessEvenWithCommitment)

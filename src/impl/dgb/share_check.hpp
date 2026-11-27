@@ -29,6 +29,7 @@
 #include <btclibs/base58.h>
 #include <btclibs/bech32.h>
 #include <core/address_utils.hpp>
+#include <impl/dgb/coin/p2pool_witness_nonce.hpp>   // P2POOL_WITNESS_NONCE
 #include <impl/dgb/v35_address.hpp>   // v35_address_to_script: the python network's V34/V35 address rule
 
 #include <algorithm>
@@ -53,14 +54,8 @@ inline bool version_switch_underweight(const uint288& new_ver_weight,
     return new_ver_weight < (total_weight * uint32_t(60)) / uint288(100);
 }
 
-// P2Pool witness nonce: '[P2Pool]' repeated 4 times = 32 bytes
+// P2Pool witness nonce ('[P2Pool]'*4): coin/p2pool_witness_nonce.hpp.
 // Used for witness commitment: SHA256d(wtxid_merkle_root || P2POOL_WITNESS_NONCE)
-static const unsigned char P2POOL_WITNESS_NONCE[32] = {
-    0x5b, 0x50, 0x32, 0x50, 0x6f, 0x6f, 0x6c, 0x5d,
-    0x5b, 0x50, 0x32, 0x50, 0x6f, 0x6f, 0x6c, 0x5d,
-    0x5b, 0x50, 0x32, 0x50, 0x6f, 0x6f, 0x6c, 0x5d,
-    0x5b, 0x50, 0x32, 0x50, 0x6f, 0x6f, 0x6c, 0x5d,
-};
 
 // Compute P2Pool witness commitment hash from raw wtxid merkle root.
 // Returns SHA256d(root || '[P2Pool]'*4)
