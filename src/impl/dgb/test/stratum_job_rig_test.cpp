@@ -703,9 +703,12 @@ TEST(DgbStratumJobs, ANamedDogeAddressIsCaseFourNotSplit)
     EXPECT_EQ(p, owner);
 }
 
-// The same through a real core::StratumServer with DOGE configured: the three
-// login forms that name a DOGE address and no DGB one each get a case-4 job
-// (the DGB parent is the DOGE P2SH script, the node's donation), not split.
+// The same through a real core::StratumServer with DOGE configured: each
+// login form that names a DOGE address and no DGB one is either refused at
+// authorize (the core does not read an empty primary in that form: safe,
+// nothing is paid elsewhere) or gets a case-4 job (the DGB parent is the DOGE
+// P2SH script, the node's donation); never a split job. At least one form
+// reaches case 4.
 TEST(DgbStratumJobs, NamedDogeLoginFormsAreCaseFourThroughTheServer)
 {
     const Bytes owner{0x76, 0xa9, 0x14, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e,
@@ -715,8 +718,9 @@ TEST(DgbStratumJobs, NamedDogeLoginFormsAreCaseFourThroughTheServer)
     const std::string doge = core::script_to_address(doge_p2sh_script, "", 30, 22);   // DOGE mainnet P2SH
     ASSERT_FALSE(doge.empty());
     struct Form { const char* name; std::string login; bool set_merged; };
+    int case4 = 0;
     for (const Form& f : {Form{"comma", "," + doge, false}, Form{"slash", "/98:" + doge, false},
-                          Form{"set_merged_addresses", "", true}}) {
+                          Form{"pipe", "|" + doge, false}, Form{"set_merged_addresses", "", true}}) {
         SCOPED_TRACE(f.name);
         JobRig rig;
         boost::asio::io_context mioc;
@@ -738,19 +742,34 @@ TEST(DgbStratumJobs, NamedDogeLoginFormsAreCaseFourThroughTheServer)
             c.send({{"id", 5}, {"method", "mining.set_merged_addresses"}, {"params", {{{"98", doge}}}}});
             c.pump(2000, 5);
         }
+        size_t before = 0;
+        {
+            std::lock_guard<std::mutex> l(rig.mu);
+            before = rig.payouts.size();   // the job sent after subscribe (no login yet)
+        }
         c.send({{"id", 2}, {"method", "mining.authorize"}, {"params", {f.login, "x"}}});
         auto auth = c.pump(2000, 2);
         ASSERT_TRUE(auth.has_value());
-        ASSERT_TRUE((*auth)["result"].is_boolean() && (*auth)["result"].get<bool>()) << auth->dump();
+        const bool accepted = (*auth)["result"].is_boolean() && (*auth)["result"].get<bool>();
+        if (!accepted) {
+            std::lock_guard<std::mutex> l(rig.mu);
+            for (size_t i = before; i < rig.payouts.size(); ++i)
+                EXPECT_FALSE(rig.donations[i].has_value()) << "a refused login got a split job";
+            continue;
+        }
         for (int i = 0; i < 40; ++i) {
             c.pump(100);
             std::lock_guard<std::mutex> l(rig.mu);
-            if (!rig.payouts.empty() && rig.payouts.back() == doge_p2sh_script)
+            if (rig.payouts.size() > before)
                 break;
         }
         std::lock_guard<std::mutex> l(rig.mu);
-        ASSERT_FALSE(rig.payouts.empty()) << "no job";
-        EXPECT_EQ(rig.payouts.back(), doge_p2sh_script) << "the login's job is not case 4";
-        EXPECT_FALSE(rig.donations.back().has_value()) << "the login's job was split";
+        ASSERT_GT(rig.payouts.size(), before) << "no job for the accepted login";
+        for (size_t i = before; i < rig.payouts.size(); ++i) {
+            EXPECT_EQ(rig.payouts[i], doge_p2sh_script) << "the login's job is not case 4";
+            EXPECT_FALSE(rig.donations[i].has_value()) << "the login's job was split";
+        }
+        ++case4;
     }
+    EXPECT_GE(case4, 1) << "no login form reached case 4";
 }
