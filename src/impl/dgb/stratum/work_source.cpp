@@ -490,16 +490,28 @@ core::stratum::CoinbaseResult DGBWorkSource::build_connection_coinbase(
     // The PPLNS inputs (weight map walked from the ShareTracker, ref_hash,
     // subsidy, donation script) are produced by the seam bound in main_dgb.cpp
     // -- the tracker walk lives there, not in the work source. While the seam is
-    // UNBOUND (or returns nullopt) this is byte-identical to the pre-wire stub:
-    // an empty result, so the session pushes no work (safe, non-functional).
+    // UNBOUND (or returns nullopt) the result is HELD (no coinbase, no job).
     PplnsInputsFn fn;
     {
         std::lock_guard<std::mutex> lk(pplns_inputs_mutex_);
         fn = pplns_inputs_fn_;  // copy under lock; a concurrent set_*_fn() cannot
                                 // tear it out mid-call.
     }
+    // No coinbase its shares could carry (unbound producer, or the producer
+    // declined below): HELD, never an empty result. An empty result made the
+    // core stratum server fall back to the global coinbase (empty on DGB) and
+    // then to its hard-coded stub (stratum_server.cpp send_notify_work: no
+    // BIP34 height, 50 coins to hash160 0x00..00), so a miner hashed a coinbase
+    // no share or block could ever be credited for. Held, the session sends no
+    // job (the miner keeps its last real one) and retries, bounded by
+    // StratumConfig::job_hold_limit_sec (CoinbaseResult::held).
+    auto held = []() {
+        core::stratum::CoinbaseResult r;
+        r.held = true;
+        return r;
+    };
     if (!fn)
-        return {};  // unbound: pre-wire behavior (empty job).
+        return held();  // unbound producer: no job.
 
     // Node-owner fee (p2pool -f/--fee): resolve the payout IDENTITY that receives
     // this share's finder value (and, via the committed share, its future PPLNS
@@ -513,7 +525,7 @@ core::stratum::CoinbaseResult DGBWorkSource::build_connection_coinbase(
     std::optional<dgb::coin::ConnCoinbasePplnsInputs> inputs =
         fn(prev_share_hash, extranonce1_hex, eff_payout_script, merged_addrs);
     if (!inputs)
-        return {};  // producer declined (e.g. tip not yet known) -> safe empty job.
+        return held();  // producer declined (no or unknown prev share, tracker busy): no job.
 
     // ── DGB-as-DOGE-parent merged-mining commitment snapshot ──────────────────
     // Runtime-armed (no -DAUX_DOGE compile fence): when a --merged DOGE spec has

@@ -343,7 +343,11 @@ if (BUILD_TESTING AND GTest_FOUND)
     # non-empty commitment in the DGB coinbase, PPLNS + merged-address outputs,
     # the single-P2PKH fallback address, has_merged_chain() login paths, and
     # no binding / byte-identical coinbase without --merged). Same folding rule.
-    add_executable(dgb_work_source_test work_source_test.cpp aux_doge_payout_provider_test.cpp)
+    # stratum_best_share_test.cpp / stratum_job_rig_test.cpp: the stratum jobs
+    # build on the node's best share (locked cell, one best-change hook) and a
+    # miner is never served the stub coinbase (real core::StratumServer rig).
+    add_executable(dgb_work_source_test work_source_test.cpp aux_doge_payout_provider_test.cpp
+                   stratum_best_share_test.cpp stratum_job_rig_test.cpp)
     target_link_libraries(dgb_work_source_test PRIVATE
         GTest::gtest_main GTest::gtest
         core dgb dgb_stratum

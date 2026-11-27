@@ -171,27 +171,27 @@ c2pool::merged::MergedMiningManager::PayoutProvider make_doge_payout_provider(No
 /// main_dgb's --merged DOGE wiring (the BTC parent lane's, main_btc.cpp
 /// set_payout_provider / set_on_work_changed / mark_pplns_dirty), on the DGB
 /// node and work source. A null manager (no --merged) binds NOTHING: no
-/// provider, no best-share callback, no work-change hook, so a standalone DGB
-/// node's coinbase and job pushes stay byte-identical. Returns whether it
-/// bound.
+/// provider, no work-change hook, so a standalone DGB node's coinbase stays
+/// byte-identical. Returns whether it bound.
 ///   - provider: the PPLNS split at the best share (above);
 ///   - on_work_changed: a fresh aux tip or commitment re-pushes stratum jobs,
 ///     so miners never mine a stale DOGE commitment;
-///   - best share changed (NodeImpl IO phase, no tracker lock held): marks
-///     the payouts dirty; the next poll or coinbase build rebuilds the DOGE
-///     block for the new best share (MergedMiningManager::is_pplns_dirty);
 ///   - one initial mark so the first job build populates the commitment.
+/// The best-share change marks the payouts dirty through the node's ONE
+/// best-change hook (best_share_cell.hpp wire_best_share, also_on_best), not
+/// here: on_best_share_changed is a single slot.
 template <typename NodeT, typename WorkSourceT>
 bool wire_doge_merged_payouts(c2pool::merged::MergedMiningManager* mm, NodeT& node, WorkSourceT* ws)
 {
     if (!mm)
         return false;
-    mm->set_payout_provider(make_doge_payout_provider(&node));
+    // The work-change hook first: the merged-mining poll thread is already
+    // running, so the hook must be in place before a provider can make it fire.
     mm->set_on_work_changed([ws]() {
         if (ws)
             ws->bump_work_generation();
     });
-    node.set_on_best_share_changed([mm]() { mm->mark_pplns_dirty(); });
+    mm->set_payout_provider(make_doge_payout_provider(&node));
     mm->mark_pplns_dirty();
     return true;
 }

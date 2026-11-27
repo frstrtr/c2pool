@@ -64,6 +64,7 @@
 #include <impl/dgb/coin/header_ingest.hpp>
 #include <impl/dgb/coin/mempool_ingest.hpp>
 #include <impl/dgb/stratum/work_source.hpp>
+#include <impl/dgb/best_share_cell.hpp>         // stratum best share: locked cell + the one best-change hook
 #include <impl/dgb/coin/work_ref_hash.hpp>      // make_work_ref_hash_params (ref preimage SSOT)
 #include <impl/dgb/coin/coinbase_scriptsig.hpp>   // build_coinbase_scriptsig (BIP34 height + /c2pool-dgb/ tag, #902)
 #include <impl/dgb/run_loop_mint.hpp>              // parse_min_header_80 + mint_local_share_at_frozen_version (#884/#294)
@@ -1523,6 +1524,8 @@ int run_node(const core::CoinParams& params, bool testnet,
     // uses the "dgbrt" bech32 HRP). Pass it through so a legitimate --regtest
     // payout address is accepted rather than rejected as Foreign.
     work_source->set_regtest(regtest);
+    // The best share stratum jobs build on (wire_best_share below).
+    auto stratum_best_share = std::make_shared<dgb::BestShareCell>();
     // #961 cross-lane (B4): publish DGB's REGISTRY-SOURCED own-coin payout-address
     // acceptance into the StratumConfig the core StratumServer reads, so the SAME
     // decide_payout_address() door-reject (mining.authorize) + no-empty-payout
@@ -1584,6 +1587,23 @@ int run_node(const core::CoinParams& params, bool testnet,
         std::cout << "[DGB-MM] DOGE payout provider + work-change hook wired ("
                   << mm_manager->chain_count() << " aux chain(s))" << std::endl;
 #endif // AUX_DOGE
+
+    // ── Stratum best share (best_share_cell.hpp) ─────────────────────────────
+    // Without this every job froze a NULL prev share: the producer declined it
+    // and no local share could ever be credited. The jobs read a lock-protected
+    // cell refreshed under the tracker guard by the node's ONE best-change hook
+    // (NodeImpl::best_share_hash reads the tracker unlocked); the same hook
+    // marks the DOGE payouts dirty under --merged and bumps the work
+    // generation so miners get jobs on the new best share.
+    {
+        std::function<void()> also_on_best;
+#ifdef AUX_DOGE
+        if (auto* mm = mm_manager.get())
+            also_on_best = [mm]() { mm->mark_pplns_dirty(); };
+#endif // AUX_DOGE
+        dgb::wire_best_share(p2p_node, stratum_best_share, work_source.get(), ioc,
+                             std::move(also_on_best));
+    }
 
     // -- External-daemon GBT tip fallback bind (the fallback V36 mandates PERSIST)
     // While the embedded HeaderChain is unfed (tip_hash()==nullopt -- the live

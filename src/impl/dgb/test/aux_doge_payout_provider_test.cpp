@@ -22,6 +22,7 @@
 #include <impl/dgb/coin/aux_doge_payout_provider.hpp>
 
 #include <impl/dgb/address_encoding.hpp>       // dgb::address_acceptance
+#include <impl/dgb/best_share_cell.hpp>        // wire_best_share (the one best-change hook)
 #include <impl/dgb/coin/connection_coinbase.hpp>
 #include <impl/dgb/coin/header_chain.hpp>
 #include <impl/dgb/coin/mempool.hpp>
@@ -408,8 +409,14 @@ TEST(DgbDogeMergedPayout, WiredProviderGivesNonEmptyCommitmentInDgbCoinbase)
     ws->set_merged_mining_manager(&mm);
 
     ASSERT_TRUE(dgb::coin::wire_doge_merged_payouts(&mm, node, ws.get()));
-    ASSERT_TRUE(static_cast<bool>(node.on_best)) << "best-share change hook bound";
+    EXPECT_FALSE(static_cast<bool>(node.on_best)) << "the DOGE wiring leaves the single best-change slot alone";
     EXPECT_TRUE(mm.is_pplns_dirty()) << "initial dirty mark";
+    // main_dgb's one best-change hook, with the DOGE dirty mark (as main_dgb binds it).
+    boost::asio::io_context hook_ioc;
+    auto cell = std::make_shared<dgb::BestShareCell>();
+    dgb::wire_best_share(node, cell, ws.get(), hook_ioc, [&mm]() { mm.mark_pplns_dirty(); });
+    ASSERT_TRUE(static_cast<bool>(node.on_best)) << "best-share change hook bound";
+    EXPECT_EQ(cell->get(), sc.best);
 
     mm.refresh_aux_work();
     const auto snap = mm.get_cached_header_infos_and_commitment();
@@ -438,10 +445,12 @@ TEST(DgbDogeMergedPayout, WiredProviderGivesNonEmptyCommitmentInDgbCoinbase)
     EXPECT_NE(cb.find("2c" + hex(Bytes(commitment.begin(), commitment.end()))), std::string::npos);
     EXPECT_NE(cb, ssot_coinbase_hex());
 
-    // A best-share change marks the payouts dirty again.
+    // A best-share change marks the payouts dirty again (and bumps the work).
     ASSERT_FALSE(mm.is_pplns_dirty());
+    const auto gen = ws->get_work_generation();
     node.on_best();
     EXPECT_TRUE(mm.is_pplns_dirty());
+    EXPECT_GT(ws->get_work_generation(), gen);
 }
 
 TEST(DgbDogeMergedPayout, WithoutProviderTheCommitmentStaysEmpty)
