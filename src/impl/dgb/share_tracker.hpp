@@ -2833,7 +2833,8 @@ public:
                                 const std::vector<unsigned char>& operator_ltc_script = {},
                                 const std::vector<unsigned char>& operator_merged_script = {},
                                 const std::function<std::vector<unsigned char>(const std::vector<unsigned char>&)>&
-                                    resolve = {})
+                                    resolve = {},
+                                const std::function<bool(const std::vector<unsigned char>&)>& donation_sink = {})
     {
         auto chain_len = std::min(chain.get_height(best_share_hash),
                                   static_cast<int32_t>(PoolConfig::real_chain_length()));
@@ -2904,8 +2905,21 @@ public:
         uint64_t remainder = (total_distributed <= miners_reward) ? (miners_reward - total_distributed) : 0;
         uint64_t final_donation = donation_amount + remainder;
 
+        // `donation_sink` (optional, node-local): an entry the caller routes at
+        // least partly to the donation afterwards (the DOGE P2SH split sends
+        // a - floor(a/2) >= 1 of an amount a >= 1 there). With such an entry the
+        // >= 1 sat donation is guaranteed after the caller's step, so the
+        // deduction below is skipped and the split sees the whole amount.
+        bool sink_pays_donation = false;
+        if (donation_sink)
+            for (const auto& [scr, amt] : result)
+                if (amt >= 1 && donation_sink(scr)) {
+                    sink_pays_donation = true;
+                    break;
+                }
+
         // V36 CONSENSUS RULE: Donation must be >= 1 satoshi
-        if (final_donation < 1 && static_cast<int64_t>(subsidy) > 0 && !result.empty()) {
+        if (final_donation < 1 && static_cast<int64_t>(subsidy) > 0 && !result.empty() && !sink_pays_donation) {
             // Deduct from largest miner (deterministic tiebreak by script)
             auto largest = std::max_element(result.begin(), result.end(),
                 [](const auto& a, const auto& b) {

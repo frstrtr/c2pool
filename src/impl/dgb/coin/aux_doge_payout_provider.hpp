@@ -106,8 +106,9 @@ inline std::string doge_fallback_payout_address(bool testnet, bool regtest = fal
 ///   - all of it to the donation when no owner script is set, or when the
 ///     owner part rounds to 0 (a == 1): never a 0-value output.
 /// Both parts merge into existing outputs for the same scripts. The >= 1 sat
-/// donation rule still holds, because the donation only grows. The sum is
-/// unchanged. An explicit DOGE address always wins; P2PKH, P2WPKH and every
+/// donation rule holds after the split: the core rule is skipped when a P2SH
+/// amount >= 1 is to be split (its donation part is >= 1), and applies as
+/// before otherwise. The sum is unchanged. An explicit DOGE address always wins; P2PKH, P2WPKH and every
 /// other key are paid as before.
 struct DogeP2shSplit {
     std::vector<unsigned char> owner_script;   // empty: the whole amount to the donation
@@ -195,9 +196,20 @@ DogePayouts doge_merged_payouts(TrackerT& tracker, const uint256& best, uint32_t
             }
             return resolve_merged_payout_script(key);
         };
+    // The split routes a - floor(a/2) >= 1 of every placeholder amount a >= 1 to
+    // the donation, so the core's >= 1 sat donation rule (which would take
+    // that sat from the largest entry, possibly a placeholder, and make the
+    // split 49/51) is left to the split: exactly 50/50, the odd sat to the
+    // donation, and the donation still >= 1.
+    std::function<bool(const std::vector<unsigned char>&)> donation_sink;
+    if (p2sh_split)
+        donation_sink = [](const std::vector<unsigned char>& s) {
+            const auto& tag = detail::p2sh_split_tag();
+            return s.size() > tag.size() && std::equal(tag.begin(), tag.end(), s.begin());
+        };
     try {
         payouts_map = tracker.get_merged_expected_payouts(best, block_target, coinbase_value, chain_id,
-                                                          donation_script, {}, {}, resolve);
+                                                          donation_script, {}, {}, resolve, donation_sink);
     } catch (const std::exception& e) {
         LOG_WARNING << "[DGB-MM] get_merged_expected_payouts threw: " << e.what();
         miss = "payouts_threw";

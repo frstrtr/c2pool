@@ -34,6 +34,7 @@
 #include <cstdint>
 #include <map>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace {
@@ -115,8 +116,11 @@ TEST(DgbDogeP2shSplit, P2shKeyIsSplitOwnerDonationOthersUnchanged)
     const auto got = as_map(dgb::coin::doge_merged_payouts(sc.tracker, sc.tip, kDoge, value, miss, &rule));
 
     EXPECT_EQ(got.count(p2sh(h(0x51))), 0u) << "the P2SH key is not paid as a DOGE P2SH";
-    EXPECT_EQ(got.at(kOwner), a / 2);
-    EXPECT_EQ(got.at(donation()), base.at(donation()) + (a - a / 2)) << "odd satoshi to the donation";
+    // The split sees the whole amount: the core's >= 1 sat rule (which took
+    // 1 sat from the P2SH entry in `base`) is left to the split.
+    EXPECT_EQ(a + 1, 1'000'000'000ULL);
+    EXPECT_EQ(got.at(kOwner), (a + 1) / 2);
+    EXPECT_EQ(got.at(donation()), (a + 1) - (a + 1) / 2) << "odd satoshi to the donation";
     // Unchanged: P2PKH, P2WPKH (as P2PKH), and the explicit DOGE address of a P2SH key.
     EXPECT_EQ(got.at(p2pkh(h(0xa1))), base.at(p2pkh(h(0xa1))));
     EXPECT_EQ(got.at(p2pkh(h(0xc3))), base.at(p2pkh(h(0xc3))));
@@ -124,11 +128,9 @@ TEST(DgbDogeP2shSplit, P2shKeyIsSplitOwnerDonationOthersUnchanged)
     EXPECT_EQ(got.count(p2sh(h(0xe5))), 0u);
     EXPECT_EQ(sum(got), value);
     EXPECT_EQ(sum(base), value);
-    // The known numbers (four equal shares; the >= 1 sat donation is taken
-    // from the largest entry, the P2SH key).
-    EXPECT_EQ(a, 999'999'999ULL);
-    EXPECT_EQ(got.at(kOwner), 499'999'999ULL);
-    EXPECT_EQ(got.at(donation()), 500'000'001ULL);
+    // The known numbers (four equal shares, no donation weight): exactly 50/50.
+    EXPECT_EQ(got.at(kOwner), 500'000'000ULL);
+    EXPECT_EQ(got.at(donation()), 500'000'000ULL);
 }
 
 TEST(DgbDogeP2shSplit, NoOwnerScriptSendsAllToTheDonation)
@@ -221,11 +223,59 @@ TEST(DgbDogeP2shSplit, ProviderAppliesTheRule)
     const uint64_t value = 4'000'000'000ULL;
     auto with_owner = as_map(dgb::coin::make_doge_payout_provider(
         &node, std::make_shared<const dgb::coin::DogeP2shSplit>(dgb::coin::DogeP2shSplit{kOwner}))(kDoge, value));
-    EXPECT_EQ(with_owner.at(kOwner), 499'999'999ULL);
+    EXPECT_EQ(with_owner.at(kOwner), 500'000'000ULL);
     EXPECT_EQ(with_owner.count(p2sh(h(0x51))), 0u);
     auto by_default = as_map(dgb::coin::make_doge_payout_provider(&node)(kDoge, value));
     EXPECT_EQ(by_default.count(kOwner), 0u);
     EXPECT_EQ(by_default.count(p2sh(h(0x51))), 0u);
-    EXPECT_EQ(by_default.at(donation()), 999'999'999ULL + 1ULL);
+    EXPECT_EQ(by_default.at(donation()), 1'000'000'000ULL);
     EXPECT_EQ(sum(by_default), value);
+}
+
+// A window of P2SH keys only, no donation weight: the split is exactly 50/50
+// (the core's >= 1 sat rule would have taken 1 sat first: 49/51), and the
+// donation is still >= 1. Without the split rule the core rule is unchanged.
+TEST(DgbDogeP2shSplit, OnlyP2shKeysNoDonationIsExactlyFiftyFifty)
+{
+    dgb::ShareTracker tracker;
+    uint256 tip;
+    for (int i = 0; i < 3; ++i) {
+        auto* s = new dgb::MergedMiningShare();
+        s->m_hash = uint256(std::vector<unsigned char>(32, static_cast<unsigned char>(0x60 + i)));
+        if (i == 0) s->m_prev_hash.SetNull(); else s->m_prev_hash = tip;
+        s->m_pubkey_hash = uint160(base_uint<160>(h(0x51)));
+        s->m_pubkey_type = 2;   // P2SH
+        s->m_donation = 0;
+        s->m_desired_version = 36;
+        s->m_bits = 0x1e0fffff;
+        s->m_max_bits = 0x1e0fffff;
+        s->m_min_header.m_bits = 0x1b0404cb;
+        tip = s->m_hash;
+        dgb::ShareType st;
+        st = s;
+        tracker.add(st);
+    }
+    const dgb::coin::DogeP2shSplit with_owner{kOwner};
+    const dgb::coin::DogeP2shSplit no_owner{};
+    std::string miss;
+    for (const auto& [value, owner, don] : std::vector<std::tuple<uint64_t, uint64_t, uint64_t>>{
+             {100, 50, 50}, {101, 50, 51}, {1, 0, 1}, {1'000'000'000'000ULL, 500'000'000'000ULL, 500'000'000'000ULL}}) {
+        SCOPED_TRACE(value);
+        const auto got = as_map(dgb::coin::doge_merged_payouts(tracker, tip, kDoge, value, miss, &with_owner));
+        EXPECT_EQ(got.count(p2sh(h(0x51))), 0u);
+        EXPECT_EQ(owner == 0 ? 0u : got.at(kOwner), owner) << "not floor(a/2) to the owner";
+        if (owner == 0)
+            EXPECT_EQ(got.count(kOwner), 0u) << "a 0-value owner output";
+        EXPECT_EQ(got.at(donation()), don);
+        EXPECT_GE(got.at(donation()), 1u);
+        EXPECT_EQ(sum(got), value);
+        const auto all = as_map(dgb::coin::doge_merged_payouts(tracker, tip, kDoge, value, miss, &no_owner));
+        EXPECT_EQ(all.at(donation()), value) << "no owner: all to the donation";
+        EXPECT_EQ(all.size(), 1u);
+    }
+    // Without the split rule the core's >= 1 sat rule applies as before.
+    const auto base = tracker.get_merged_expected_payouts(tip, chain::bits_to_target(0x1b0404cb), 100, kDoge,
+                                                          donation(), {}, {});
+    EXPECT_EQ(base.at(p2sh(h(0x51))), 99u);
+    EXPECT_EQ(base.at(donation()), 1u);
 }
