@@ -46,6 +46,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <bit>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -229,6 +230,10 @@ public:
         // After fee selection, the block body must be in canonical order:
         // ascending txid, coinbase excluded (it is prepended downstream). This
         // is consensus-critical on BCH -- a non-CTOR body is rejected.
+        // uint256 operator< compares 32-bit limbs most significant first, which
+        // equals BCHN's order (last byte first) only on a little-endian host.
+        static_assert(std::endian::native == std::endian::little,
+                      "CTOR txid order via uint256 operator< needs a little-endian host");
         std::sort(selected_txs.begin(), selected_txs.end(),
                   [](const Mempool::SelectedTx& a, const Mempool::SelectedTx& b) {
                       return compute_txid(a.tx) < compute_txid(b.tx);

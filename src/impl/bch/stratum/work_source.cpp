@@ -29,6 +29,7 @@
 #include <impl/bch/stratum/coinbase_outputs.hpp>  // assemble_v36_coinbase_outputs
 #include <impl/bch/stratum/coinbase_slot_guard.hpp> // coinb1_ends_in_commitment_slot
 
+#include <impl/bch/coin/block_assembly.hpp>    // verify_assembled_block (won-block self-check)
 #include <impl/bch/coin/header_chain.hpp>
 #include <impl/bch/coin/mempool.hpp>
 #include <impl/bch/coin/merkle.hpp>            // merkle_hash_pair (CTOR SHA256d)
@@ -294,6 +295,12 @@ nlohmann::json BCHWorkSource::get_current_work_template() const
 
 std::vector<std::string> BCHWorkSource::get_stratum_merkle_branches() const
 {
+    return get_stratum_merkle_branches(cached_template());
+}
+
+std::vector<std::string> BCHWorkSource::get_stratum_merkle_branches(
+    const std::shared_ptr<const bch::coin::rpc::WorkData>& wd) const
+{
     // Coinbase-left merkle siblings for mining.notify. The miner rebuilds
     // the root via SHA256d(coinbase_txid || branch[0]), then folds in each
     // subsequent branch. BCH uses CTOR (Nov 2018) for the block tx ORDER,
@@ -301,26 +308,19 @@ std::vector<std::string> BCHWorkSource::get_stratum_merkle_branches() const
     // BTC with NO witness commitment -- so the branch algorithm is identical;
     // build_template has already emitted m_hashes in canonical (CTOR) order.
     //
+    // wd->m_hashes is the body txid list [tx1..txN] with NO coinbase slot;
+    // bch::coin::stratum_merkle_siblings prepends the coinbase leaf 0.
+    //
     // Wire encoding: hex of the LE-internal 32 bytes (NOT GetHex() display
     // order) -- the miner hex2bin-s this straight into SHA256d, so the bytes
     // must match the leaves the pool hashed.
-    auto wd = cached_template();
     if (!wd || wd->m_hashes.empty()) return {};
 
-    std::vector<uint256> level = wd->m_hashes;  // [0] = coinbase placeholder
+    const std::vector<uint256> siblings = bch::coin::stratum_merkle_siblings(wd->m_hashes);
     std::vector<std::string> branches;
-    while (level.size() > 1) {
-        branches.push_back(HexStr(std::span<const unsigned char>(level[1].data(), 32)));
-        std::vector<uint256> next;
-        next.reserve((level.size() + 2) / 2);
-        next.push_back(uint256::ZERO);  // placeholder for (coinbase, level[1]) combo
-        for (size_t i = 2; i < level.size(); i += 2) {
-            const uint256& l = level[i];
-            const uint256& r = (i + 1 < level.size()) ? level[i + 1] : level[i];
-            next.push_back(bch::coin::merkle_hash_pair(l, r));
-        }
-        level = std::move(next);
-    }
+    branches.reserve(siblings.size());
+    for (const auto& sib : siblings)
+        branches.push_back(HexStr(std::span<const unsigned char>(sib.data(), 32)));
     return branches;
 }
 
@@ -719,7 +719,9 @@ core::stratum::CoinbaseResult BCHWorkSource::build_connection_coinbase(
     snap.frozen_ref.ref_hash         = ref_hash;
     snap.frozen_ref.last_txout_nonce = ref_nonce;
 
-    auto branches = get_stratum_merkle_branches();
+    // Branches from the SAME template snapshot as tx_data below and the
+    // coinbase value above (no second cached_template() read).
+    auto branches = get_stratum_merkle_branches(wd);
     for (const auto& h : branches) {
         uint256 b; auto bb = ParseHex(h);
         if (bb.size() == 32) std::memcpy(b.begin(), bb.data(), 32);
@@ -941,6 +943,29 @@ nlohmann::json BCHWorkSource::mining_submit(
         } else {
             LOG_ERROR << "[BCH-STRATUM-BLOCK] no submit_block_fn wired -- WON BLOCK height="
                       << height << " not broadcast -- lost subsidy!";
+        }
+
+        // Body-vs-header merkle self-check, strictly after the dispatch above:
+        // re-deserialize the block and recompute the root over
+        // [coinbase, tx1..txN]; it must equal the root folded from the job's
+        // branches into the header. Logged only. Runs on this thread, so it
+        // is skipped above kSelfCheckMaxBytes (~27 us/KB: <= ~0.1 s).
+        static constexpr size_t kSelfCheckMaxBytes = 4'000'000;
+        if (block_bytes.size() > kSelfCheckMaxBytes) {
+            LOG_INFO << "[BCH-STRATUM-BLOCK] merkle self-check skipped ("
+                     << block_bytes.size() << " bytes > " << kSelfCheckMaxBytes << ")";
+        } else {
+            const bch::coin::BlockSelfCheck chk = bch::coin::verify_assembled_block(
+                std::span<const unsigned char>(block_bytes.data(), block_bytes.size()));
+            if (chk.ok) {
+                LOG_INFO << "[BCH-STRATUM-BLOCK] merkle self-check OK ("
+                         << chk.tx_count << " txs)";
+            } else {
+                LOG_ERROR << "[BCH-STRATUM-BLOCK] merkle self-check FAILED: " << chk.reason
+                          << " header_root=" << chk.header_merkle_root.GetHex()
+                          << " body_root=" << chk.computed_merkle_root.GetHex()
+                          << " txs=" << chk.tx_count;
+            }
         }
 
         // Found-block telemetry sink (#995 BCH arm): record the won block to the

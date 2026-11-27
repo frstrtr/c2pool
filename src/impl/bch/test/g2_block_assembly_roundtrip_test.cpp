@@ -538,6 +538,10 @@ void test_won_block_undecodable_username_refuses_share()
 
 // #1437 topology KAT, defined in template_topology_spend_test.cpp (same target).
 int run_template_topology_spend_checks();
+// Stratum merkle branch fold KAT (stratum_merkle_branch_test.cpp, same target).
+int run_stratum_merkle_branch_checks();
+// CTOR order + fold vs a real mainnet block (ctor_real_block_kat_test.cpp).
+int run_ctor_real_block_checks();
 // v35 login refusal KAT (work_source_authorize_refusal_test.cpp, same target).
 // Runs last: it registers the CashAddr decoder for the whole process.
 int run_work_source_authorize_refusal_checks();
@@ -556,6 +560,10 @@ int main()
 
     // #1437: mempool tx-selection topology + intra-template double-spend guard.
     failures += run_template_topology_spend_checks();
+
+    // Stratum branches: fold(coinbase_txid, branches) == block merkle root.
+    failures += run_stratum_merkle_branch_checks();
+    failures += run_ctor_real_block_checks();
 
     // v35 shares carry only a legacy address: refuse logins that have none.
     failures += run_work_source_authorize_refusal_checks();

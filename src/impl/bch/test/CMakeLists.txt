@@ -328,8 +328,14 @@ if(BUILD_TESTING)
     # roundtrip test's main (no new executable / no #143 NOT_BUILT trap).
     # work_source_authorize_refusal_test.cpp (v35 login refusal) rides the same
     # target; it needs the BCHWorkSource this target already links.
+    # stratum_merkle_branch_test.cpp (stratum branch fold == block merkle root,
+    # N = 0..9 and 33, through BCHWorkSource and a won block) rides it too, as
+    # does ctor_real_block_kat_test.cpp (TemplateBuilder CTOR order and the
+    # fold vs real mainnet block 957699).
     add_executable(bch_g2_block_assembly_roundtrip_test
         g2_block_assembly_roundtrip_test.cpp
+        ctor_real_block_kat_test.cpp
+        stratum_merkle_branch_test.cpp
         template_topology_spend_test.cpp
         work_source_authorize_refusal_test.cpp
         ${CMAKE_SOURCE_DIR}/src/impl/bch/coin/transaction.cpp)
