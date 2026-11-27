@@ -27,6 +27,10 @@ import random
 import sys
 import tempfile
 
+# Share donations (review 7a4373856 R1): --give-author's 66, none, split
+# jobs (32768), the extremes.
+DONATIONS = [0, 66, 32768, 65535, 32768, 7]
+
 ADDRESSES = [
     'DB68diZto76gixVajwyoMjcEXsSdyEhnS9',                                   # base58 P2PKH
     'SdasP9NHJS5wW5AwADre1ozLhHkeUU6Qqx',                                   # base58 P2SH
@@ -79,7 +83,7 @@ def main():
             nonce=rnd.getrandbits(32),
             address=address,
             subsidy=72000 * 10**8,
-            donation=0,
+            donation=DONATIONS[i % len(DONATIONS)],
             stale_info=None,
             desired_version=35,
         )

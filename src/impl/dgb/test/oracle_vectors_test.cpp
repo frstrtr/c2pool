@@ -91,6 +91,17 @@ Bytes payout_of(int i)
 // push it back up.
 uint32_t gap_before(int i) { return i == 60 ? 400u : i == 118 ? 5000u : 1u + static_cast<uint32_t>(i % 9); }
 
+// The share donation of job i: a split job (32768) every third, donation 0
+// every fifth, else none (--give-author's 66).
+std::optional<uint16_t> donation_of(int i)
+{
+    if (i % 3 == 0)
+        return uint16_t(32768);
+    if (i % 5 == 0)
+        return uint16_t(0);
+    return std::nullopt;
+}
+
 // The block bits of share i's template: mostly the real-range 0x1b0404cb,
 // some easy ones so the PPLNS cap 65535*SPREAD*attempts(block) binds inside
 // the window (python's partial-last-share branch).
@@ -137,7 +148,8 @@ struct OracleRig {
             req.block_value = block.value;
             req.local_hash_rate = block.local_hash_rate;
             req.now = now;
-            req.donation = 66;
+            // main_dgb's choice: a split job's own donation, else --give-author's.
+            req.donation = block.share_donation ? *block.share_donation : 66;
             req.aux_mm_scriptsig = aux;
             return dgb::build_conn_job_inputs(tracker, params, req, []() {
                 return std::pair<int64_t, uint64_t>{35, 35};
@@ -147,7 +159,7 @@ struct OracleRig {
             auto hdr = dgb::parse_min_header_80(in.header_bytes);
             if (!hdr)
                 return uint256();
-            minted = dgb::mint_local_share_at_frozen_version(in, *hdr, tracker, params, 66);
+            minted = dgb::mint_local_share_at_frozen_version(in, *hdr, tracker, params, in.donation ? *in.donation : 66);
             return minted;
         });
     }
@@ -214,10 +226,16 @@ struct OracleRig {
         ws->set_gbt_tip_fn([this]() -> std::optional<dgb::stratum::DGBWorkSource::GbtTip> {
             return dgb::stratum::DGBWorkSource::GbtTip{std::string(56, '0') + "0badf00d", tip_bits, kHeight};
         });
-        auto cbr = ws->build_connection_coinbase(order.back(), "cafef00d", payout_of(i), {});
+        // Review 7a4373856 R1: split jobs (donation 32768) and donation-0 jobs
+        // among the --give-author (66) ones, through the job's share donation
+        // as the stratum server carries it.
+        const std::optional<uint16_t> dn = donation_of(i);
+        auto cbr = ws->build_connection_coinbase_for(core::stratum::PayoutKey{}, order.back(), "cafef00d",
+                                                     payout_of(i), {}, dn);
         if (cbr.held || cbr.coinb1.empty())
             return false;
         core::stratum::JobSnapshot j;
+        j.share_donation = dn;
         j.has_payout = true;
         j.payout_script = payout_of(i);
         j.coinb1 = cbr.coinb1;
@@ -409,9 +427,18 @@ TEST(DgbOracleReverse, PythonMintedSharesVerifyHere)
             } catch (const std::exception& e) {
                 why = e.what();
             }
+            // The refusal is the one python gives (review 7a4373856 NIT 9).
+            const std::string name = n["name"].get<std::string>();
+            const char* want = name.find("address") != std::string::npos ? "address"
+                               : name.find("segwit") != std::string::npos ? "segwit_data"
+                                                                          : "share_info invalid";
             if (why.empty()) {
-                ADD_FAILURE() << "negative '" << n["name"].get<std::string>() << "' before share " << i
+                ADD_FAILURE() << "negative '" << name << "' before share " << i
                               << " passed this node's checks (python: " << n["python_refusal"] << ")";
+                ++fails;
+            } else if (why.find(want) == std::string::npos) {
+                ADD_FAILURE() << "negative '" << name << "' before share " << i << " refused for another reason: "
+                              << why << " (want '" << want << "')";
                 ++fails;
             } else {
                 ++refused;
