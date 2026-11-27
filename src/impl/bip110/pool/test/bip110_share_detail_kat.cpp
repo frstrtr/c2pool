@@ -249,6 +249,7 @@ int main()
     expect_true("[2] far_parent present + 64-hex string", is_hex64(d.value("far_parent", nlohmann::json())));
     expect_true("[2] type_name == \"V36\"", d.value("type_name", std::string{}) == "V36");
     expect_true("[2] children is an array", d.contains("children") && d["children"].is_array());
+    expect_true("[2] the tip has no children", d["children"].empty());
     expect_true("[2] local is an object", d.contains("local") && d["local"].is_object());
     expect_true("[2] local carries verified/time_first_seen/peer",
                 d["local"].contains("verified") && d["local"].contains("time_first_seen")
@@ -311,6 +312,9 @@ int main()
         expect_true("[7] genesis type_name == \"V36\"", g.value("type_name", std::string{}) == "V36");
         expect_true("[7] genesis has share_data/block/children (rich shape holds)",
                     g.contains("share_data") && g.contains("block") && g.contains("children"));
+        expect_true("[7] genesis children == [tip] (the chain's reverse index)",
+                    g["children"].is_array() && g["children"].size() == 1
+                        && g["children"][0] == tip.GetHex());
         // Parent is the null share (not in the window) -> pplns omitted honestly.
         expect_true("[7] genesis omits pplns honestly (null anchor)", !g.contains("pplns"));
     }

@@ -16,6 +16,10 @@ Original forum thread: <https://bitcointalk.org/index.php?topic=18313>
 
 ## Latest releases
 
+- **[v0.2.12.16](https://github.com/frstrtr/c2pool/releases/tag/v0.2.12.16)** — BTC + BIP110: header requests carry a full block locator, and header sync recovers when the peer stops relaying blocks (BTC: without `--bitcoind`). Dashboard: the BTC coin-peer card shows the connected peer and the other public candidates; a found block with no known miner (LTC, DOGE, BTC, Dash) shows under the donation address; a multi-pool deployment can list its stratum endpoints by region.
+- **[v0.2.12.15](https://github.com/frstrtr/c2pool/releases/tag/v0.2.12.15)** — LTC/DOGE miner page: the merged-mining panel lists the miner's merged blocks, and LTC blocks recorded before v0.2.12.7 count for their miner. BTC: found blocks are kept across restarts, and `--import-found-blocks` as on LTC. DASH: previous-cycle InstantSend locks keep verifying through a reorg.
+- **[v0.2.12.14](https://github.com/frstrtr/c2pool/releases/tag/v0.2.12.14)** — All coins: the read-only web API can also answer on the stratum port (`--stratum-http`, off by default), and the web port answers `HEAD`. Dashboard: local hashrate counts only sessions that are currently submitting. DASH: the superblock payment total is checked against the budget at every step.
+- **[v0.2.12.13](https://github.com/frstrtr/c2pool/releases/tag/v0.2.12.13)** — DASH: the masternode list resumes after a header-store reset (the first start on this version is a cold start); the mainnet header chain follows the built-in anchor; share-chain block solutions below the network's minimum time are not relayed. LTC/DOGE: imported found blocks take the source node's measured effort.
 - **[v0.2.12.12.2](https://github.com/frstrtr/c2pool/releases/tag/v0.2.12.12.2)** — LTC + DOGE: the embedded header chains accept the genesis header only into a header store that has no tip yet; check the LTC and DOGE header stores once after upgrading (steps in the release notes). Dashboard: Discovered Merged Blocks links the parent hash to the parent-chain explorer only when its parent height is known. Recommended for every LTC/DOGE node.
 - **[v0.2.12.12.1](https://github.com/frstrtr/c2pool/releases/tag/v0.2.12.12.1)** — DASH: a header-chain robustness fix. Recommended for every Dash node.
 - **[v0.2.12.12](https://github.com/frstrtr/c2pool/releases/tag/v0.2.12.12)** — DASH: InstantSend locks are checked against recently rotated quorums, and templates follow InstantSend locks; lower CPU with provider transactions in the template; share-chain block solutions are relayed at the network's difficulty only; a won block is not held back when the local Dash Core does not answer.
@@ -301,13 +305,18 @@ and does not yet exist, so the work can be judged on what it actually is.
   hysteresis and chain self-heal, to close the whole *class* rather than the known
   modes — is **in progress on the design track and not yet landed. We do not claim
   the class is fully closed.**
-- **Donation script (legacy key, disclosed):** the v36 donation output currently
-  uses a P2SH script that **inherits a legacy p2pool donation key** from the
-  upstream codebase. This is **not an endorsement by, or involvement of, any third
-  party** — it is inherited code. It is scheduled for replacement with a
-  **c2pool-only script in v37**. v36 blocks already produced with the inherited
-  script are immutable consensus history and cannot be retroactively changed; the
-  clean script becomes the default at the v37 boundary.
+- **Donation script (legacy key, disclosed):** the v36 donation output of the
+  parent share's coinbase (LTC, BTC, DGB, BCH) currently uses a P2SH script that
+  **inherits a legacy p2pool donation key** from the upstream codebase. This is
+  **not an endorsement by, or involvement of, any third party** — it is inherited
+  code. It is scheduled for replacement with a **c2pool-only script in v37**. v36
+  blocks already produced with the inherited script are immutable consensus
+  history and cannot be retroactively changed; the clean script becomes the
+  default at the v37 boundary. The merged-chain coinbases c2pool builds itself
+  (DOGE, NMC and the other aux chains) no longer pay it: their donation output
+  pays a single c2pool key (P2PKH, see
+  [Who is paid on a merged chain](#who-is-paid-on-a-merged-chain-c2pool-ltc-sharechain-mode)),
+  the key c2pool-dash donates to.
 
 ### v36 ratchet complete — the last generation shared with Python p2pool
 - **The LTC line ratcheted to V36.** Since 2026-11-13 00:00:00 UTC
@@ -929,18 +938,41 @@ built and committed in the job's coinbase, as in p2pool.
      `LTCADDR/98:DOGEADDR/63:PEPADDR`.
 4. **Empty login, or an LTC address that is invalid or another coin's** — the
    login is accepted and its shares are redistributed by `--redistribute`
-   (`pplns|fee|boost|donate`, see [Configuration reference](#configuration-reference-ltc-binary)),
-   as p2pool does: the LTC payout goes to the recipient the mode picks, and
+   (`split|pplns|fee|boost|donate`, see [Configuration reference](#configuration-reference-ltc-binary)).
+   The default, `split`, pays every such share 50% to the node owner and 50%
+   to the donation: the share pays the node owner (`--node-owner-address`, else
+   `--address`) with donation 32768/65535 instead of `--give-author`'s, so
+   PPLNS gives the owner and the donation half of its weight each, on LTC and
+   on every merged chain the share names no address for (the owner's merged
+   address there: `--node-owner-merged-address` for DOGE, else the owner's key
+   converted; a P2SH owner key is not converted, that chain's half goes to the
+   donation). Without a usable owner address the node keeps the old `pplns`
+   behaviour, or the other terms of a hybrid spec (logged once at startup). The job sent right after
+   `mining.subscribe`, built before the login, is such work too: a share found
+   on it and submitted after the authorize pays the owner and the donation the
+   same way. With the other modes, as p2pool does: the LTC payout goes to the
+   recipient the mode picks, and
    every merged chain the share names no address for gets that recipient's key
    (the node owner's merged addresses when it is the owner) — written into the
-   share, so every node derives the same payout. With a valid DOGE address as
-   the second address of an invalid LTC address, the LTC payout uses that DOGE
-   address's key instead (p2pool's "case 4"). The log warns per miner and the
-   dashboard's workers list shows "address invalid → redistributed".
-   A P2WSH/P2TR LTC address cannot be carried by a V36 share (a 20-byte payout
-   hash): its LTC payout is redistributed the same way, with the same warning
-   in the log and "P2WSH/P2TR address → redistributed" in the workers list; the
-   LTC payout is never taken from a merged chain's address for it. A swapped
+   share, so every node derives the same payout. Attributable work is never
+   halved (p2pool's "case 4", extended): a login whose LTC address is invalid,
+   empty or another coin's, or one a V36 share cannot carry (P2WSH/P2TR: a
+   32-byte witness program, while a share carries a 20-byte payout hash), and
+   that names a merged address has its LTC payout paid to that address's key,
+   with the node's normal donation; the merged addresses are paid as given.
+   The address must be one the login named (comma or slash form, a
+   re-authorize of the same LTC address, `mining.set_merged_addresses` after
+   the authorize, or before the first authorize of a new connection), of a
+   configured merged chain on this network, in a legacy form: P2PKH (paid as
+   P2PKH) or P2SH (paid as P2SH); a bech32 merged address does not count.
+   DOGE's is used if named, else the lowest configured chain id's. The
+   workers list shows "address invalid → parent paid to the DOGE address's
+   key" or "P2WSH/P2TR address → parent paid to the DOGE address's key"
+   ("the chain_id=N address's key" for another chain). An address set while
+   another login was accepted on the connection never counts. A login naming
+   no usable address is redistributed as above, with a warning in the log
+   ("address invalid → redistributed", "P2WSH/P2TR address → redistributed"
+   in the workers list). A swapped
    pair whose first address is not valid (`DOGE-with-bad-checksum,LTCADDR`)
    pays the valid LTC address, as before.
 
@@ -968,8 +1000,26 @@ share's version:
   naming another miner's parent script could take that miner's address-less
   shares).
 
+The merged coinbase c2pool builds (every chain in multiaddress mode: DOGE
+under LTC, and under DGB once its payout provider lands; NMC under BTC; the
+other LTC aux chains) ends with its
+donation output, which takes the donation and the PPLNS rounding remainder
+(at least 1 satoshi). It pays one P2PKH key on every chain: script
+`76a914 20cb5c22b1e4d5947e5c112c7696b51ad9af3c61 88ac`, on DOGE
+`D88Vn6Dyct7DKfVCfR3syHkjyNx9gEyyiv` (testnet
+`nXBZW6xtYrZwCe4PhEhLDhM3DFLSd1pa1R`), the key c2pool-dash donates to. It is
+not the parent share's combined P2SH donation, which the LTC/BTC/DGB coinbase
+keeps. A merged payout to that combined P2SH (a share redistributed by
+`--redistribute donate`, a P2WSH/P2TR `--node-owner-address` without a merged
+address) is added to the donation output, never paid as a miner output. A
+`createauxblock`-mode chain's coinbase is its daemon's and has no donation
+output.
+
 c2pool nodes do not re-derive each other's merged coinbases, so the rule
-decides no share's validity. A P2SH `--node-owner-address` without
+decides no share's validity, and neither does the merged donation. Python
+p2pool V36 nodes do re-derive the DOGE coinbase, with the combined P2SH as its
+donation: on LTC testnet, whose shares stay V36 (no flag day), a Python V36
+node rejects the c2pool shares that carry a DOGE block. A P2SH `--node-owner-address` without
 `--node-owner-merged-address` is paid as the same P2SH on the merged chains,
 with the same segwit-wrapped warning at startup. `--solo` / `--custodial` merged payouts do not use per-miner
 merged addresses, and `c2pool-btc` (NMC) and `c2pool-dgb` (DOGE) do not carry
@@ -1075,6 +1125,72 @@ use `auto`; keep `--stratum-http=false` (the default). The startup log says whic
 `stratum HTTP: ON (web bound to 0.0.0.0)` or
 `stratum HTTP: OFF (web bound to 10.8.0.1, stratum to 0.0.0.0)`.
 
+**TLS stratum (`stratum+ssl://`).** On a plain stratum connection a miner
+cannot tell who sends it work: anything on the path (a hijacked route or DNS
+name, a middlebox) can pose as the pool and take the hashrate. Firmware that
+speaks `stratum+ssl://` (Braiins OS and others) verifies the pool's
+certificate instead. `--stratum-tls [HOST:]PORT` opens a second stratum
+listener that speaks TLS; `PORT` alone binds the plain stratum listener's
+address (`--stratum` host; on LTC `--http-host`). It needs
+`--stratum-tls-cert FILE` (PEM, the full chain, leaf first, e.g. Let's
+Encrypt's `fullchain.pem`) and `--stratum-tls-key FILE` (PEM, not
+passphrase-protected, e.g. `privkey.pem`); settings keys `stratum.tls_bind`,
+`stratum.tls_cert`, `stratum.tls_key` (LTC YAML `stratum_tls`,
+`stratum_tls_cert`, `stratum_tls_key`). Without `--stratum-tls` nothing
+changes.
+- After the TLS handshake a connection is an ordinary stratum session of the
+  same server: the same JSON-RPC, vardiff and job handling, the same
+  `--max-stratum-connections` and per-IP caps (counted together with the
+  plain port, keyed on the real remote address), refusal log, drain mode,
+  miner list and dashboard rows.
+- TLS 1.2 and 1.3 only (TLS 1.2: ECDHE with AES-GCM or ChaCha20-Poly1305), no
+  compression, no renegotiation, no session resumption, no client
+  certificates. A handshake not done 10 s after the accept, or one that fails
+  (a plaintext client on the TLS port), closes the connection; failures are
+  counted and logged at most once a minute.
+- A TLS handshake costs CPU on the thread that also runs the sharechain and
+  the templates, so new TLS connections are limited before it: 200 a second
+  from all addresses (400 back to back after a quiet spell), 5 a second from
+  one address or IPv6 /64 (20 back to back; `--stratum-tls-rate-per-ip R`,
+  `--stratum-tls-burst-per-ip N`), and at most 32 handshakes in progress, 8
+  from one address (`--stratum-tls-handshakes N`,
+  `--stratum-tls-handshakes-per-ip N`; settings keys `stratum.tls_rate_per_ip`,
+  `stratum.tls_burst_per_ip`, `stratum.tls_handshakes`,
+  `stratum.tls_handshakes_per_ip`; 0 = no limit). Raise the per-address values
+  for a farm behind one NAT or a local proxy. At the handshake limit a new
+  connection evicts the oldest handshake that has been in progress for 1.5 s
+  or more (counted as a failed handshake); with none that old, the new one is
+  closed. A connection over a limit is closed at the accept, counted, and
+  logged rate-limited like the other refusals (counted per address, one /64
+  for IPv6); a refusal by the handshake limit spends no rate token. The plain
+  stratum port is not limited. A connection that has sent no byte 3 s after
+  the accept is closed, whatever the 10 s handshake bound. Prefer an ECDSA
+  P-256 certificate (certbot `--key-type ecdsa`): its handshake costs the
+  server several times less than RSA-2048.
+- Renewals: the certificate and key are read again when either file's
+  modification time or size changes (checked at each new connection), and on
+  `SIGHUP` (`kill -HUP <pid>`, e.g. from a certbot deploy hook). New
+  connections get the new pair; open ones keep theirs. A pair that does not
+  load (for instance the certificate renewed but not yet the key) is logged
+  and the last good pair stays in use. The key file must be readable by the
+  user c2pool runs as.
+- HTTP on the stratum port (`--stratum-http`) is answered on the plain port
+  only.
+- A bad set (one flag without the others, a host that is not an IP address, a
+  certificate or key that does not load) is refused at start. A build without
+  OpenSSL (CMake `-DC2POOL_STRATUM_TLS=OFF`; the default on macOS and Windows
+  for now) refuses the three flags; `--version` says `tls=on` or `tls=off`.
+  The startup log names the listener and the certificate: `stratum TLS:
+  listening on 0.0.0.0:3334 (stratum+ssl://, TLS 1.2+; subject
+  /CN=pool.example.org, valid until ...)`, with a warning when the
+  certificate is expired or not yet valid, or the key file is readable by
+  others or writable by anyone but its owner (group read, as in Debian's
+  `root:ssl-cert` 0640, is fine). If the TLS port cannot be bound, that is logged as an error
+  and the node runs on without it, as for the plain stratum port. Given to a
+  mode that opens no stratum listener (DASH, DGB or BIP110 without `--run`, BCH
+  without `--pool`, LTC with `--sharechain`), the flags are warned about and
+  have no effect.
+
 Per-coin binaries use their own defaults. For DASH: sharechain 8999 on the v16
 network and **8998** on the v36 network (`--net dash-v36`); a private
 `--network-id` chain keeps 8999 (18999 on testnet).
@@ -1099,6 +1215,7 @@ is `src/core/param_catalog.inc`. Commented example files for c2pool-ltc, -dash,
 | `--dump-resolved-config` | ltc, dash, btc, dgb, bch | Print the fully resolved config with the source of every key (compiled / file / CLI) between `=== RESOLVED CONFIG BEGIN ===` / `END` markers, then exit 0 **without starting the node**. Works with no coin endpoint configured. |
 | `--ack-money-settings` | ltc, dash, btc, dgb, bch | Compute and print the money-ack hash for the resolved settings file, then exit. Requires a settings file (`--settings PATH` or the data-dir default); exit 78 otherwise. |
 | `--data-dir PATH` | ltc, dash, btc, dgb, bch | Root all per-instance state (sharechain LevelDB, addr store, logs, …) under `PATH` (default `~/.c2pool`). Handled before the settings probe, so the default `c2pool.toml` is looked up under the final data dir. Requires a non-empty, non-flag argument (exit 1 otherwise). |
+| `--analytics-id ID` | ltc, dash, btc, dgb, bch, bip110 | Off by default. Google Analytics (GA4) page views, only after the visitor accepts the consent bar, with addresses and query strings stripped; the operator is responsible for the privacy notice. Settings key `web.analytics_id` (`[<coin>.web] analytics_id`, not on bip110, which reads no settings file); the CLI wins. See [Google Analytics tag](#google-analytics-tag). |
 
 **Money gate.** A settings file can never silently arm a money-class key
 (`MONEY_*` rows in the catalog: fees, donation, payout addresses, network
@@ -1108,6 +1225,52 @@ before anything starts (`src/core/settings_file.hpp`). Run
 `--ack-money-settings` to obtain the hash for the file as it stands, put it in
 `[gate].money_ack_hash`, and the file is accepted; any later edit to a money key
 invalidates the hash.
+
+#### Google Analytics tag
+
+**Off by default.** Nothing is added to any page unless the operator sets
+`--analytics-id G-XXXXXXXXXX` (or `web.analytics_id` in the settings file). Then
+the node puts a Google Analytics (GA4) tag and a consent bar into the HTML pages
+it serves (`src/core/analytics_tag.hpp`, one helper for every page).
+
+- **What is collected: GA4 page views only, and only after consent.** Before a
+  visitor accepts there is no contact with Google at all: the page carries no
+  external script, and Google's script (`gtag.js`) is not loaded, so not even the
+  visitor's IP address or browser reaches Google, and no cookie is set. On Decline,
+  or with no answer, it is never loaded. On Accept (or on a later visit after an
+  Accept) the page creates the one `gtag.js` script element, with no referrer,
+  then sets every Consent Mode type (`analytics_storage`, `ad_storage`,
+  `ad_user_data`, `ad_personalization`) to `denied`, grants `analytics_storage`,
+  and makes the config call (`send_page_view: false`) and the one `page_view`.
+- **Addresses and query strings are stripped.** The page view carries an
+  explicit `page_location`, `page_path`, `page_referrer` and `page_title`, never
+  the raw URL: the query string and fragment are dropped, and any path segment
+  that holds 20 or more letters and digits in a row (an address), or follows a
+  per-miner route, becomes `:addr` (`/miner_payouts/<address>` →
+  `/miner_payouts/:addr`, `/miner.html?address=<address>` → `/miner.html`). The
+  page's referrer policy is `no-referrer`, so no request carries the raw URL.
+- **Consent bar.** A small bar at the bottom reads "This site uses Google
+  Analytics cookies to count visits." with **Accept** and **Decline**. Accept
+  grants `analytics_storage` only (no `ad_*` type is ever granted); Decline loads
+  and sends nothing. The choice is kept in the browser's `localStorage`
+  (`c2pool_ga_consent`) and the bar is not shown again. A page without `</body>`
+  gets no bar, so it never loads or sends anything.
+- **Never on** `/control/*`, `/api/*` (admin, config, tx-inject), `/web/log`,
+  `/logs/*`, a request that carries a token, or a non-HTML response. A page
+  without `</head>`, or one that already loads `gtag.js`, is left unchanged.
+- **Only a measurement ID.** The value must be `G-` followed by 4–20 upper-case
+  letters or digits (the legacy `UA-<digits>-<digits>` form is also accepted).
+  A bad command-line value refuses the start (non-zero exit); a bad settings-file
+  value (also the LTC YAML `analytics_id`) is logged as a warning and ignored.
+- **Pages.** The dashboard's static `.html` / `.htm` files (also on the Stratum
+  port with `--stratum-http`) and the generated pages of
+  [`explorer/explorer.py`](#api-endpoints), which takes the same
+  `--analytics-id ID` flag: pass it there too, since the explorer is a separate
+  process.
+- **The operator who enables it is responsible for their own privacy notice**
+  (and for the GA4 property's settings). Turn off Enhanced measurement in the
+  GA4 web stream: otherwise GA adds its own events after consent, and an
+  outbound-click event carries the link URL, which can hold an address.
 
 `c2pool-bip110` does not take `--settings` / `--data-dir` / `--dump-resolved-config`
 (no `BIN_BIP110` alias for those rows in `param_catalog.inc`); its money
@@ -1157,7 +1320,7 @@ legacy YAML key set.
 | `--give-author` | `donation_percentage` | 0.1 | Developer fee % (p2pool default: 0.5%) |
 | `-f` / `--fee` | `node_owner_fee` | 0 | Node owner fee %: with that probability a job (decided when it is built, as p2pool does) is the owner's, on LTC and on every merged chain |
 | `--node-owner-address` | `node_owner_address` | -- | Node owner payout address |
-| `--redistribute` | `redistribute` | pplns | Mode: pplns/fee/boost/donate — where the shares of an empty, invalid or other-coin login go, on the parent and every merged chain (accepted, not refused; see [Who is paid on a merged chain](#who-is-paid-on-a-merged-chain-c2pool-ltc-sharechain-mode)) |
+| `--redistribute` | `redistribute` | split | Mode: split/pplns/fee/boost/donate — where the shares of an empty, invalid or other-coin login (and of the job built before the login) go, on the parent and every merged chain (accepted, not refused; see [Who is paid on a merged chain](#who-is-paid-on-a-merged-chain-c2pool-ltc-sharechain-mode)). `split`: 50% node owner / 50% donation (each such share pays the owner with donation 32768/65535); pplns without a node-owner address |
 | `--merged SYMBOL:CHAIN_ID:HOST:PORT:USER:PASS[:P2P_PORT]` | `merged` | DOGE:98 (embedded) | Merged-mined aux chain (repeatable) |
 | `--merged-payout-address SYMBOL:ADDRESS` | `merged_payout_addresses` | DOGE built-in | That chain's address for `createauxblock` (required for every RPC chain but DOGE; DGB and chains without address parameters are exempt); the node owner's address on that chain for its node-fee shares (chains other than DOGE) (repeatable) |
 | `--node-owner-merged-address` | `node_owner_merged_address` | -- | Node owner's DOGE address (alias `--merged-operator-address`, as in p2pool): the DOGE address written into the owner's own shares (node-fee shares, redistributed shares landing on the owner's key). Unset or not a DOGE address of the network: the owner's LTC key, converted (P2PKH/P2WPKH only; a P2SH `--node-owner-address` is not converted and the donation script is written, with a warning). It is not a payout-time redirect: peers derive the same payouts from the shares |
@@ -1174,6 +1337,11 @@ legacy YAML key set.
 | `--stratum-http[=true\|false\|auto]` | `stratum_http` | false | Also answer the read-only REST API on the stratum port (python p2pool parity); auto = on when the HTTP bind address is not loopback (the LTC stratum port binds the same address) |
 | `--stratum-http-budget N` | `stratum_http_budget` | 16 | HTTP requests in progress on the stratum port at once, at most N and at most max_stratum_connections - 1; others are answered 503 (0 = every HTTP request on the stratum port is answered 503) |
 | `--stratum-http-per-ip N` | `stratum_http_per_ip` | 6 | HTTP requests in progress on the stratum port at once from one address, one /64 for IPv6: at most N; others are answered 503 (0 = no limit below `--stratum-http-budget`) |
+| `--stratum-tls [HOST:]PORT` | `stratum_tls` | off | Second stratum listener speaking TLS (`stratum+ssl://`); PORT alone binds `--http-host`; same sessions and limits as the stratum port (see [Ports](#ports)) |
+| `--stratum-tls-cert FILE` | `stratum_tls_cert` | -- | PEM certificate chain (leaf first) for `--stratum-tls`; re-read with the key when either file changes and on SIGHUP |
+| `--stratum-tls-key FILE` | `stratum_tls_key` | -- | PEM private key for `--stratum-tls` (no passphrase) |
+| `--stratum-tls-rate-per-ip R` / `--stratum-tls-burst-per-ip N` | `stratum_tls_rate_per_ip` / `stratum_tls_burst_per_ip` | 5 / 20 | TLS accepts a second from one address (IPv6 /64), and how many back to back (0 = no limit) |
+| `--stratum-tls-handshakes N` / `--stratum-tls-handshakes-per-ip N` | `stratum_tls_handshakes` / `stratum_tls_handshakes_per_ip` | 32 / 8 | TLS handshakes in progress at once, in total and from one address (0 = no limit) |
 | `--coind-address` | `ltc_rpc_host` | 127.0.0.1 | Coin daemon RPC host |
 | `--coind-rpc-port` | `ltc_rpc_port` | auto | Coin daemon RPC port |
 | `--rpcuser` | `ltc_rpc_user` | -- | RPC username |
@@ -1199,7 +1367,7 @@ legacy YAML key set.
 | `--payout-window` | `payout_window_seconds` | 86400 | PPLNS window (seconds) |
 | `--storage-save-interval` | `storage_save_interval` | 300 | Sharechain save interval |
 | `--dashboard-dir` | `dashboard_dir` | web-static | Static dashboard directory |
-| `--analytics-id` | `analytics_id` | -- | Google Analytics measurement ID (e.g. `G-XXXXXXXXXX`); injected into dashboard HTML `</head>` |
+| `--analytics-id` | `analytics_id` | -- (off) | Google Analytics measurement ID (`G-XXXXXXXXXX`): GA4 page views after the visitor accepts the consent bar, addresses and query strings stripped (see [Google Analytics tag](#google-analytics-tag)); TOML `web.analytics_id` |
 | -- | `address_explorer_prefix` | Blockchair | Custom address explorer URL prefix |
 | -- | `block_explorer_prefix` | Blockchair | Custom block explorer URL prefix |
 | -- | `tx_explorer_prefix` | Blockchair | Custom tx explorer URL prefix |
@@ -1380,13 +1548,19 @@ dashd-attached default OFF)
 | `--stratum-http[=true\|false\|auto]` | false | Also answer the read-only JSON API on the Stratum port (python p2pool parity); auto = on when `--web-host` is `::`, is `0.0.0.0` with an IPv4 Stratum bind, or is the same non-loopback address as the Stratum bind. |
 | `--stratum-http-budget N` | 16 | HTTP requests in progress on the Stratum port at once, at most N and at most max_stratum_connections - 1; others are answered 503 (0 = every HTTP request on the Stratum port is answered 503). |
 | `--stratum-http-per-ip N` | 6 | HTTP requests in progress on the Stratum port at once from one address, one /64 for IPv6: at most N; others are answered 503 (0 = no limit below `--stratum-http-budget`). |
+| `--stratum-tls [HOST:]PORT` | off | Second Stratum listener speaking TLS (`stratum+ssl://`); PORT alone binds the `--stratum` host; same sessions and limits as the Stratum port (see [Ports](#ports)). Needs the two flags below. |
+| `--stratum-tls-cert FILE` | — | PEM certificate chain (leaf first); re-read with the key when either file changes and on SIGHUP. |
+| `--stratum-tls-key FILE` | — | PEM private key (no passphrase). |
+| `--stratum-tls-rate-per-ip R`, `--stratum-tls-burst-per-ip N` | 5, 20 | TLS accepts a second from one address (IPv6 /64), and how many back to back (0 = no limit). |
+| `--stratum-tls-handshakes N`, `--stratum-tls-handshakes-per-ip N` | 32, 8 | TLS handshakes in progress at once, in total and from one address (0 = no limit). |
 | `--dashboard-dir PATH` | `web-static` | Static dashboard root. |
+| `--analytics-id ID` | off | GA4 page views after the visitor accepts the consent bar, addresses and query strings stripped ([Google Analytics tag](#google-analytics-tag)); settings key `web.analytics_id`. |
 | `--external-ip ADDR` (aliases `--stratum-advertise`, `--public-host`) | auto-detect | Miner-facing host shown in the dashboard Stratum URL (NAT). |
 | `--explorer` / `--no-explorer` | on | Loopback-only `/api/explorer` surface + raw-block retention. |
 | `--give-author PCT` (alias `--dev-donation`) | 0.1 | Author donation percent. |
 | `-f` / `--fee PCT` | 0 | Node-owner fee percent. |
 | `--node-owner-address ADDR` | — | Fee destination. |
-| `--redistribute pplns\|fee\|boost\|donate` | `pplns` | Unnamed-share redistribution. |
+| `--redistribute split\|pplns\|fee\|boost\|donate` | `split` | Where the shares of a login with no usable (P2PKH) payout address go. `split`: 50% node owner / 50% donation (the share pays `--node-owner-address` with donation 32768/65535); pplns without a usable `--node-owner-address`. |
 | `--coinbase-text TEXT` | `/P2Pool-DASH/c2pool/` | Coinbase scriptSig text, max 64 bytes (see [Coinbase structure](#coinbase-structure)). |
 | `--message-blob-hex HEX` (alias `--transition-message`) | — | Encrypted authority message blob. |
 | `--deferred-mint` / `--no-deferred-mint` | off | A share solved while the tracker is busy is minted at the next free lock instead of being declined. |
@@ -1427,6 +1601,7 @@ usage and exits 1.
 | `--network-id HEX` (≤8 bytes), `--prefix HEX` | public BTC | Private sharechain identifier / prefix — two independent constants. Setting `--network-id` alone also suppresses the public seed list. |
 | `--stratum [HOST:]PORT` | off | Stratum listener. |
 | `--http [HOST:]PORT` | off | Operator dashboard (`web-static` relative to the working directory; parser only — not in the `--help` text). |
+| `--analytics-id ID` | off | GA4 page views of the `--http` pages after the visitor accepts the consent bar, addresses and query strings stripped ([Google Analytics tag](#google-analytics-tag)); settings key `web.analytics_id`. |
 | `--coin-rpc HOST:PORT` | — | `submitblock` RPC backup endpoint (no secret on argv). |
 | `--coin-rpc-auth PATH` | `~/.bitcoin/bitcoin.conf` | `rpcuser`/`rpcpassword` file for the backup. Omit both to run daemonless. |
 | `--merged SYMBOL:CHAIN_ID:HOST:PORT:USER:PASS[:P2P_PORT]` (repeatable) | — | Embedded merged-mined aux chain (NMC under BTC). |
@@ -1458,6 +1633,7 @@ destination.
 | `--run` | | Stand up the run-loop (io_context + sharechain peer + Stratum). Without it (or with `--selftest`) the binary runs the self-test and exits. |
 | `--stratum [HOST:]PORT` | off | Stratum listener. |
 | `--http [HOST:]PORT` | off | Dashboard + stats persistence (`web-static` relative to the working directory). |
+| `--analytics-id ID` | off | GA4 page views of the `--http` pages after the visitor accepts the consent bar, addresses and query strings stripped ([Google Analytics tag](#google-analytics-tag)); settings key `web.analytics_id`. |
 | `--sharechain-port P` | 5024 | Sharechain listener port. |
 | `--sharechain-addnode HOST:PORT` (repeatable) | public defaults | Pin sharechain peers; suppresses the default bootstrap list. `92.53.224.27:5024` is the live public DGB sharechain seed named in the source. |
 | `--coin-p2p-discover` | off | DGB-isolated scored, diverse coin-peer discovery — daemonless. |
@@ -1467,7 +1643,7 @@ destination.
 | `--regtest`, `--regtest-force-won-share` | off | Regtest marker; forced won share is refused unless `--regtest` **and** `--coin-daemon` are both given. |
 | `--no-p2p-relay` | off | Suppress the embedded won-block relay (isolates the RPC arm). |
 | `--dev-relax-algo-softforks` | off | Dev-only: relax the algo-softfork readiness gate for an isolated tuned testnet; ignored on mainnet. |
-| `--redistribute SPEC` | `pplns` | `pplns\|fee\|boost\|donate` or hybrid `boost:70,donate:20`. |
+| `--redistribute SPEC` | `pplns` | `pplns\|fee\|boost\|donate` or hybrid `boost:70,donate:20`. `split` is not available on DGB yet: a spec naming it is warned about and binds no policy. |
 | `--node-owner-address ADDR` | — | Operator payout identity for the `fee` arm and for `-f`/`--fee`. |
 | `-f` / `--fee PCT` | 0 | Node-owner fee percent; needs `--node-owner-address`. |
 | `--give-author PCT` (alias `--dev-donation`) | 0.1 | Author donation percent. |
@@ -1502,6 +1678,7 @@ loop. Unknown argument → `unknown argument: …`, exit 1. The pool mode is
 | `--anchor N` | 0 | Cold-start ABLA floor anchor height. |
 | `--stratum [HOST:]PORT` | off | Stratum listener. |
 | `--http [HOST:]PORT` | off | Dashboard. |
+| `--analytics-id ID` | off | GA4 page views of the `--http` pages after the visitor accepts the consent bar, addresses and query strings stripped ([Google Analytics tag](#google-analytics-tag)); settings key `web.analytics_id`. |
 | `--rpc-conf PATH` | — | BCHN `bitcoin.conf` for the external-RPC fallback (`rpcuser`/`rpcpassword`; endpoint is `127.0.0.1:<rpcport>`). |
 | `--coin-p2p-discover` | off | Daemonless coin-peer discovery (CoinAddrMan); no `--peer` needed. |
 | `--sharechain-addnode HOST:PORT` (repeatable) | public defaults | Pin sharechain peers (`92.53.224.27:9349` is the live public BCH sharechain seed named in the source). |
@@ -1536,6 +1713,7 @@ cd /opt/c2pool-bip110 && ./c2pool-bip110 --run --coin-p2p-discover \
 | `--coin-externalip IP` | peer-echo auto | Operator-pinned reachable IP for self-advertisement (bare IP; port 8333 substituted). |
 | `--fork-checkpoint` | off | Seed the Knots 961640 checkpoint for a fast proof. |
 | `--http [HOST:]PORT` | off | Shared coin-generic dashboard (`/`, `/node_info`, `/api/node_topology`, `/broadcaster_status`). |
+| `--analytics-id ID` | off | GA4 page views of the `--http` pages after the visitor accepts the consent bar, addresses and query strings stripped ([Google Analytics tag](#google-analytics-tag)); command line only (no settings file). |
 | `--stratum [HOST:]PORT` / `--no-stratum` | `0.0.0.0:9336` on | Stratum listener; `--no-stratum` disables. |
 | `--serve-mempool-txs` / `--no-serve-mempool-txs` | on | Include real network txs in served templates (M3 good-citizen); the `--no-` form is the coinbase-only escape hatch. |
 | `--bip110-sharechain` | off | Arm the M3 sharechain mint on `:9337` and dial the federation sharechain. First outbound is irreversible (params-freeze checkpoint). Absent → M2 header-follower only. |
@@ -1684,6 +1862,12 @@ explorer_url: "http://localhost:9090"
 # Run the explorer UI against c2pool's API
 python3 explorer/explorer.py --ltc-c2pool http://127.0.0.1:8080/api/explorer --web-port 9090
 ```
+
+`--analytics-id G-XXXXXXXXXX` (off by default; a bad value exits 2) puts the same
+Google Analytics tag and consent bar as the node's into every page the explorer
+generates: GA4 page views only, after consent, with addresses and query strings
+stripped. It is a separate process, so give it the flag as well as the node
+(see [Google Analytics tag](#google-analytics-tag)).
 
 The explorer shows block details, decoded coinbase scripts, THE commitment proofs for c2pool-found blocks, and links to Blockchair for transactions/addresses outside the stored range.
 

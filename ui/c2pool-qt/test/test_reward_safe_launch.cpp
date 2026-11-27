@@ -122,7 +122,7 @@ PerCoinParams bchDefault()
     p.payoutAddress = "bitcoincash:qexample";
     p.fee = 1.0;
     p.giveAuthorSet = true; p.giveAuthor = 0.5;
-    p.redistribute = "fee";
+    p.redistribute = "fee"; p.redistributeSet = true;
     p.messageBlob = "deadbeef";
     return p;
 }
@@ -141,7 +141,7 @@ PerCoinParams dgbDefault()
     p.sharechainPort = 5024;
     p.addnodes = {"5.6.7.8:5024"};
     p.payoutAddress = "DExampleDgbAddress";
-    p.redistribute = "boost:70,donate:30";
+    p.redistribute = "boost:70,donate:30"; p.redistributeSet = true;
     return p;
 }
 
@@ -393,6 +393,56 @@ int main()
         check(!contains(argv0, "--embedded-tx-inject")
                   && !contains(argv0, "--control-plane-token-file"),
               "DASH default argv carries neither tx-inject arming flag");
+    }
+
+    // --redistribute (split is the LTC/DASH default): only a mode the operator
+    //     set in the form is passed on. A value loaded from a settings store
+    //     written before (every save stored the combo's "pplns") carries no
+    //     user-set marker: omitted, the binary's default applies; on DGB the
+    //     flag is never passed unless set; split itself is never passed.
+    {
+        for (PerCoinParams p : {dashDefault(), dgbDefault()}) {
+            p.redistribute = "pplns";
+            p.redistributeSet = false;
+            check(!contains(build_percoin_argv(p), "--redistribute"),
+                  "a legacy saved pplns (no user-set marker) is not passed on");
+            p.redistributeSet = true;
+            const auto argv = build_percoin_argv(p);
+            check(contains(argv, "--redistribute") && contains(argv, "pplns"),
+                  "a pplns the operator set is passed on");
+            p.redistribute = "split";
+            check(!contains(build_percoin_argv(p), "--redistribute"), "split (the default) is not passed");
+        }
+        PerCoinParams g = dgbDefault();
+        g.redistributeSet = false;
+        check(!contains(build_percoin_argv(g), "--redistribute"),
+              "DGB: --redistribute only when the operator set it");
+
+        // Restoring a saved form: without the marker (an older store) a
+        // pplns was the old default and is not restored; a fee / boost /
+        // donate was a choice and is kept; with the marker, as saved.
+        using c2pool_qt::restore_redistribute_choice;
+        const std::vector<std::string> offered = {"split", "pplns", "fee", "boost", "donate"};
+        const auto r1 = restore_redistribute_choice(std::nullopt, "pplns", offered);
+        check(!r1.first && r1.second == "split", "an older store's pplns is not restored (split shown)");
+        for (const char* m : {"fee", "boost", "donate"}) {
+            const auto r = restore_redistribute_choice(std::nullopt, m, offered);
+            check(r.first && r.second == m, "an older store's fee/boost/donate is kept as the operator's choice");
+        }
+        const auto r2 = restore_redistribute_choice(std::nullopt, "split", offered);
+        check(!r2.first && r2.second == "split", "an older store's split: the default");
+        const auto r3 = restore_redistribute_choice(std::nullopt, "boost:70,donate:30", offered);
+        check(!r3.first && r3.second == "split", "a value the form does not offer is not restored");
+        const auto r4 = restore_redistribute_choice(true, "pplns", offered);
+        check(r4.first && r4.second == "pplns", "a marked pplns (the operator's choice) is restored");
+        const auto r5 = restore_redistribute_choice(false, "fee", offered);
+        check(!r5.first && r5.second == "split", "marked unset: the default");
+        // and what a restored choice passes on
+        PerCoinParams l = dashDefault();
+        l.redistribute = restore_redistribute_choice(std::nullopt, "fee", offered).second;
+        l.redistributeSet = restore_redistribute_choice(std::nullopt, "fee", offered).first;
+        const auto la = build_percoin_argv(l);
+        check(contains(la, "--redistribute") && contains(la, "fee"), "an older store's fee is passed on, as before");
     }
 
     std::printf(failures == 0 ? "ALL PASS\n" : "FAILURES: %d\n", failures);

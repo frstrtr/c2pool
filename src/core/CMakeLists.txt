@@ -36,6 +36,7 @@ set(source
     http_session.cpp
     ip_mask.hpp ip_mask.cpp
     stratum_server.hpp stratum_server.cpp
+    stratum_tls.hpp stratum_tls.cpp
     stratum_types.hpp
     stratum_work_source.hpp
     address_utils.hpp address_utils.cpp
@@ -81,6 +82,15 @@ target_link_libraries(core PUBLIC Boost::headers Boost::exception Boost::log Boo
 
 # Add LevelDB include directories
 target_include_directories(core PUBLIC ${LEVELDB_INCLUDE_DIRS})
+
+# The TLS stratum listener (top-level option C2POOL_STRATUM_TLS). Only
+# stratum_tls.cpp includes OpenSSL; the headers have one layout with or without
+# it. PUBLIC: every target linking core links OpenSSL, and core_test sees the
+# define for the TLS KATs.
+if(C2POOL_STRATUM_TLS_AVAILABLE)
+    target_compile_definitions(core PUBLIC C2POOL_STRATUM_TLS=1)
+    target_link_libraries(core PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+endif()
 
 # UTXO snapshots (DASH full UTXO set, PR S1): MuHash3072 + ChaCha20 and the
 # compressor / Coin codec ported from Dash Core v23.1.7 (crypto/VENDOR.md),

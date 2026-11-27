@@ -654,7 +654,10 @@ public:
     // ─── Shared helpers (used by both build_multiaddress_block and rebuild_cached_blocks) ───
 
     // Build canonical merged coinbase TX hex from PPLNS payouts.
-    // Matches p2pool's build_canonical_merged_coinbase output ordering.
+    // Matches p2pool's build_canonical_merged_coinbase output ordering. The
+    // donation output (last) pays merged_donation_script(); payout entries
+    // with that script or the old combined P2SH are folded into it
+    // (merged_donation.hpp).
     static std::string build_pplns_coinbase_hex(
         int height,
         const std::vector<std::pair<std::vector<unsigned char>, uint64_t>>& payouts,

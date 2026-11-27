@@ -271,7 +271,21 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
     # the hand-off to HttpSession on the web server's HTTP thread, read-only
     # GET/HEAD, local-only routes, the caps and the session accounting, the
     # handshake deadline, the 503 without a web server. Same folding.
+    # analytics_tag_test.cpp: the Google Analytics tag in served HTML
+    # (core/analytics_tag.hpp): once before </head> with consent default
+    # denied, the consent bar once before </body>, nothing for an empty or bad
+    # ID; a real WebServer tags its static .html pages only; every coin
+    # binary's --analytics-id reaches its web server (source wiring); the
+    # explorer.py generated pages carry the same bytes (python3, if present).
+    # Same fold-into-core_test reasoning as every TU here.
     # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
+    # stratum_tls_test.cpp: the TLS stratum listener (core/stratum_tls.hpp):
+    # the --stratum-tls flags and their refusal without TLS, a real loopback
+    # handshake with a self-signed certificate made in the test, stratum
+    # replies over TLS equal to plain, a plaintext client on the TLS port, the
+    # shared per-IP cap, and certificate reload (file change, reload_tls(),
+    # SIGHUP). The OpenSSL cases compile only with C2POOL_STRATUM_TLS. Same
+    # fold-into-core_test reasoning as every TU here.
     add_executable(core_test
         accepted_payout_script_test.cpp
         stratum_submit_frozen_ref_test.cpp
@@ -280,6 +294,7 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
         stratum_start_difficulty_test.cpp
         addr_store_save_test.cpp
         address_coin_validation_test.cpp
+        analytics_tag_test.cpp
         author_fee_test.cpp
         block_body_summary_test.cpp
         block_broadcast_test.cpp
@@ -289,6 +304,7 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
         coin_compressor_test.cpp
         coin_registry_symbol_test.cpp
         core_merkle_branches_test.cpp
+        dashboard_hook_wiring_test.cpp
         dual_family_dial_test.cpp
         events_test.cpp
         factory_connect_failed_uaf_test.cpp
@@ -325,6 +341,7 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
         stratum_port_http_test.cpp
         stratum_port_http_wire_test.cpp
         stratum_refusal_log_test.cpp
+        stratum_tls_test.cpp
         template_refresh_on_tx_test.cpp
         template_txs_check_test.cpp
         tx_advertiser_test.cpp
@@ -358,6 +375,7 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
         web_server_redistribute_type_test.cpp
         web_server_relay_block_test.cpp
         web_server_rpc_refresh_test.cpp
+        web_server_share_lookup_test.cpp
         web_server_submitblock_test.cpp
         web_server_utxo_scan_test.cpp
         web_server_worker_liveness_test.cpp

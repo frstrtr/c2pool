@@ -189,6 +189,55 @@ public:
                                double hashrate, double dead_hashrate, double difficulty,
                                uint64_t accepted, uint64_t rejected, uint64_t stale) override;
 
+    /// Best Share card feed. The stratum session calls record_best_pseudoshare
+    /// for every accepted pseudoshare with its achieved difficulty and the
+    /// submit fields; the sink set here (the dashboard's MiningInterface,
+    /// wired by bch::standup_pool_run) receives them. No sink: a no-op, as before. Display
+    /// only: never affects acceptance, target or payout.
+    using BestPseudoshareFn = std::function<void(
+        double share_difficulty, const std::string& miner,
+        const std::string& coinb1, const std::string& coinb2,
+        const std::string& extranonce1, const std::string& extranonce2,
+        const std::string& ntime, const std::string& nonce,
+        uint32_t version, const std::string& prevhash_hex,
+        const std::string& nbits_hex,
+        const std::vector<std::string>& merkle_branches)>;
+    void set_best_pseudoshare_fn(BestPseudoshareFn fn)
+    {
+        std::lock_guard<std::mutex> lk(best_pseudoshare_mutex_);
+        best_pseudoshare_fn_ = std::move(fn);
+    }
+    void record_best_pseudoshare(
+        double share_difficulty, const std::string& miner,
+        const std::string& coinb1, const std::string& coinb2,
+        const std::string& extranonce1, const std::string& extranonce2,
+        const std::string& ntime, const std::string& nonce,
+        uint32_t version, const std::string& prevhash_hex,
+        const std::string& nbits_hex,
+        const std::vector<std::string>& merkle_branches) override
+    {
+        BestPseudoshareFn fn;
+        {
+            std::lock_guard<std::mutex> lk(best_pseudoshare_mutex_);
+            fn = best_pseudoshare_fn_;
+        }
+        if (!fn) return;
+        try {
+            fn(share_difficulty, miner, coinb1, coinb2, extranonce1, extranonce2,
+               ntime, nonce, version, prevhash_hex, nbits_hex, merkle_branches);
+        } catch (...) {
+            // a display feed must not reach the submit path
+        }
+    }
+
+    /// A copy of the per-connection worker registry, for the dashboard
+    /// (MiningInterface::set_stratum_workers_fn / set_stratum_hashrate_fn).
+    std::map<std::string, core::stratum::WorkerInfo> snapshot_stratum_workers() const
+    {
+        std::lock_guard<std::mutex> lk(workers_mutex_);
+        return workers_;
+    }
+
     // ── IWorkSource: work generation ─────────────────────────────────────
     nlohmann::json                       get_current_work_template() const override;
     std::vector<std::string>             get_stratum_merkle_branches() const override;
@@ -346,6 +395,10 @@ private:
     // Best-share callback (from ShareTracker)
     mutable std::mutex          best_share_mutex_;
     std::function<uint256()>    best_share_hash_fn_;
+
+    // Best Share card sink (set_best_pseudoshare_fn)
+    mutable std::mutex          best_pseudoshare_mutex_;
+    BestPseudoshareFn           best_pseudoshare_fn_;
 
     // PPLNS + ref_hash + share-create callbacks (from ShareTracker via main_bch.cpp)
     mutable std::mutex          callback_mutex_;

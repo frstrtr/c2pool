@@ -60,6 +60,7 @@
 #include <core/netaddress.hpp>
 #include <core/stratum_server.hpp>
 #include <core/web_server.hpp>              // shared coin-generic dashboard + /node_info
+#include <core/analytics_tag.hpp>           // --analytics-id
 #include <core/filesystem.hpp>             // config_path() for graph_db stats persistence
 #include <core/log.hpp>
 #include <core/param_catalog.hpp>           // M0b catalog: C_BIP110 / BIN_BIP110
@@ -77,6 +78,7 @@
 #include <functional>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <span>
 #include <string>
@@ -119,6 +121,11 @@ void print_banner(const char* argv0)
         "  --fork-checkpoint    seed the Knots 961640 checkpoint for a fast proof\n"
         "  --http [HOST:]PORT   serve the shared coin-generic dashboard (HTML at\n"
         "                       \"/\", JSON /node_info for health probes)\n"
+        "  --analytics-id ID    Google Analytics (GA4) measurement ID, G-XXXXXXXXXX;\n"
+        "                       off by default. Every HTML page --http serves then shows\n"
+        "                       a consent bar; only after a visitor accepts are GA4\n"
+        "                       page views sent, with addresses and query strings\n"
+        "                       stripped. You are responsible for your own privacy notice.\n"
         "  --stratum-http[=true|false|auto]  also answer the web API (GET/HEAD,\n"
         "                       read-only) on the stratum port, as python p2pool did\n"
         "                       on its worker port; default false; auto = on when\n"
@@ -132,6 +139,21 @@ void print_banner(const char* argv0)
         "                       once from one address, one /64 for IPv6: at most N;\n"
         "                       others are answered 503 (default 6; 0 = no limit\n"
         "                       below --stratum-http-budget)\n"
+        "  --stratum-tls [HOST:]PORT  a second stratum listener that speaks TLS\n"
+        "                       (stratum+ssl://), so miners can verify the pool's\n"
+        "                       certificate; PORT alone binds the --stratum host.\n"
+        "                       Same sessions, limits and miner list as the plain\n"
+        "                       port; TLS 1.2+, no client certificates (default off)\n"
+        "  --stratum-tls-cert FILE  PEM certificate chain (leaf first) for\n"
+        "                       --stratum-tls; re-read with the key when either\n"
+        "                       file changes, and on SIGHUP\n"
+        "  --stratum-tls-key FILE  PEM private key for --stratum-tls (no passphrase)\n"
+        "  --stratum-tls-rate-per-ip R / --stratum-tls-burst-per-ip N  TLS accepts a\n"
+        "                       second from one address (IPv6: one /64) and how many\n"
+        "                       back to back (default 5 and 20; 0 = no limit)\n"
+        "  --stratum-tls-handshakes N / --stratum-tls-handshakes-per-ip N  TLS\n"
+        "                       handshakes in progress at once, in total and from one\n"
+        "                       address (default 32 and 8; 0 = no limit)\n"
         "  --node-owner-address ADDR  subsidy fallback / donation payout when a\n"
         "                       miner has no resolvable payout address (base58/bech32)\n"
         "  --bip110-sharechain  ARM the M3 v36 sharechain MINT (DEFAULT OFF): start\n"
@@ -2026,6 +2048,7 @@ int run_embedded(bool coin_p2p_discover,
         // btc/dgb): "/" -> web-static/dashboard.html. The deploy pairs a
         // web-static copied from THIS commit next to the binary/CWD.
         web_server->set_dashboard_dir("web-static");
+        web_server->set_analytics_id(core::analytics_id_setting());   // --analytics-id (default off)
         // Node fee card — configured node-owner fee percent.
         mi->set_pool_fee_percent(node_owner_fee_pct);
 
@@ -2420,12 +2443,28 @@ int run_embedded(bool coin_p2p_discover,
             // Nested-lock hazard: snapshot the LOCK-FREE best BEFORE read_tracker(),
             // and call current_pplns() (which takes + releases its OWN guard)
             // BEFORE taking this fn's guard — DASH ordering (main_dash.cpp:1886-1888).
+            // The last window served: returned while the tracker is busy, so a
+            // refresh that meets a locked tracker does not blank the explorer
+            // until the next refresh.
+            struct LastWindow { std::mutex m; nlohmann::json j = nlohmann::json::object(); };
+            auto last_window = std::make_shared<LastWindow>();
             mi->set_sharechain_window_fn(
-                [scn, mi, current_pplns, ws = work_source.get()]() -> nlohmann::json {
+                [scn, mi, current_pplns, ws = work_source.get(), last_window]() -> nlohmann::json {
                     const uint256 best = scn->get_tracker_snapshot().best_share;  // lock-free
                     auto cur = current_pplns();          // takes + releases its own guard
+                    // Found-block share hashes for the explorer's block marks
+                    // (the ledger's own mutex, taken before the tracker guard).
+                    std::vector<std::string> found;
+                    if (mi)
+                        for (const auto& fb : mi->get_found_blocks()) {
+                            const std::string sh = mi->found_block_share_hash(fb);
+                            if (!sh.empty()) found.push_back(sh);
+                        }
                     auto guard = scn->read_tracker();
-                    if (!guard) return nlohmann::json::object();  // tracker busy -> honest empty
+                    if (!guard) {   // tracker busy -> the last window served
+                        std::lock_guard<std::mutex> l(last_window->m);
+                        return last_window->j;
+                    }
                     std::string fee_hash160 = mi ? mi->get_node_fee_hash160() : std::string{};
                     const bool testnet = bip110::pool::PoolConfig::is_testnet;
                     // "This node" self-identity for the explorer's blue highlight
@@ -2468,7 +2507,7 @@ int run_embedded(bool coin_p2p_discover,
                         *guard, best,
                         bip110::pool::PoolConfig::chain_length(),
                         my_address, fee_hash160,
-                        testnet);
+                        testnet, found);
                     if (!my_addrs.empty())
                         w["my_addresses"] = std::move(my_addrs);
                     // Fold the projected split in as the explorer's per-share
@@ -2478,6 +2517,8 @@ int run_embedded(bool coin_p2p_discover,
                     // is the overlay source. Read-only.
                     if (cur.is_object() && !cur.empty())
                         w["pplns_current"] = std::move(cur);
+                    std::lock_guard<std::mutex> l(last_window->m);
+                    last_window->j = w;
                     return w;
                 });
             // bip110 has no share-tip refresh event (MI stratum off, no
@@ -2843,6 +2884,8 @@ int run_embedded(bool coin_p2p_discover,
         core::configure_stratum_http(*stratum_server, web_server.get(),
                                      core::stratum_http_mode_setting(),
                                      core::stratum_http_limits_setting());
+    // The TLS stratum listener (--stratum-tls), when set.
+    core::configure_stratum_tls(stratum_server.get(), core::stratum_tls_setting());
 
     // Periodic tip log — the live-proof capture line.
     auto tip_timer = std::make_shared<io::steady_timer>(ioc);
@@ -3033,7 +3076,10 @@ int main(int argc, char** argv)
 
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
-        if (arg == "--version") { std::printf("c2pool-bip110 %s\n", C2POOL_VERSION); return 0; }
+        if (arg == "--version") {   // tls=: the TLS stratum listener is built in (on) or not
+            std::printf("c2pool-bip110 %s tls=%s\n", C2POOL_VERSION, core::stratum_tls_supported() ? "on" : "off");
+            return 0;
+        }
         if (arg == "--help" || arg == "-h") { print_banner(argv[0]); return 0; }
         else if (arg == "--selftest") { selftest = true; run = false; }
         else if (arg == "--run") { run = true; selftest = false; }
@@ -3071,6 +3117,13 @@ int main(int argc, char** argv)
             }
         }
         else if (arg == "--no-stratum") { stratum_port = 0; }
+        else if (arg == "--analytics-id" && i + 1 < argc) {
+            if (!core::parse_analytics_id(argv[++i], core::analytics_id_setting())) {
+                std::fprintf(stderr, "bad value: --analytics-id %s (expected a Google Analytics "
+                                     "measurement ID, G-XXXXXXXXXX)\n", argv[i]);
+                return 1;
+            }
+        }
         else if (arg == "--stratum-http" || arg.rfind("--stratum-http=", 0) == 0) {
             // the web API on the stratum port too (core/stratum_http.hpp)
             if (!core::parse_stratum_http_flag(arg, core::stratum_http_mode_setting())) {
@@ -3089,6 +3142,27 @@ int main(int argc, char** argv)
         else if (arg == "--stratum-http-per-ip" && i + 1 < argc) {
             if (!core::parse_stratum_http_count(argv[++i], core::stratum_http_limits_setting().per_ip)) {
                 std::fprintf(stderr, "bad value: --stratum-http-per-ip %s (expected a count)\n", argv[i]);
+                return 1;
+            }
+        }
+        // --stratum-tls [HOST:]PORT / --stratum-tls-cert FILE / --stratum-tls-key
+        // FILE: the TLS stratum listener (core/stratum_tls.hpp); checked once
+        // every flag is read (check_stratum_tls_settings).
+        else if (arg == "--stratum-tls" && i + 1 < argc) {
+            core::stratum_tls_setting().bind = argv[++i];
+        }
+        else if (arg == "--stratum-tls-cert" && i + 1 < argc) {
+            core::stratum_tls_setting().cert = argv[++i];
+        }
+        else if (arg == "--stratum-tls-key" && i + 1 < argc) {
+            core::stratum_tls_setting().key = argv[++i];
+        }
+        else if ((arg == "--stratum-tls-rate-per-ip" || arg == "--stratum-tls-burst-per-ip"
+                  || arg == "--stratum-tls-handshakes" || arg == "--stratum-tls-handshakes-per-ip")
+                 && i + 1 < argc) {
+            std::string err;
+            if (!core::parse_stratum_tls_limit_flag(arg, argv[++i], core::stratum_tls_setting(), err)) {
+                std::fprintf(stderr, "c2pool-bip110: %s\n", err.c_str());
                 return 1;
             }
         }
@@ -3122,6 +3196,15 @@ int main(int argc, char** argv)
                 static_cast<uint16_t>(std::stoi(ep.substr(colon + 1))));
         }
     }
+
+    // --stratum-tls / --stratum-tls-cert / --stratum-tls-key: a complete set
+    // this build supports, whose certificate and key load; else refused here.
+    if (auto why = core::check_stratum_tls_settings(core::stratum_tls_setting())) {
+        std::fprintf(stderr, "c2pool-bip110: %s\n", why->c_str());
+        return 1;
+    }
+    if (!run && core::stratum_tls_setting().any_set())
+        std::fprintf(stderr, "c2pool-bip110: warning: --stratum-tls has no effect without --run (no stratum listener)\n");
 
     if (run) {
         if (!coin_p2p_discover && explicit_peers.empty()) {

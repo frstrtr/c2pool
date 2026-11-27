@@ -58,6 +58,7 @@
 [ltc.web]
 port = 8080                 # dashboard + JSON API TCP port; default 8080
 host = "0.0.0.0"            # dashboard bind address; default 0.0.0.0 (all interfaces); "127.0.0.1" = this host only
+# analytics_id = "G-XXXXXXXXXX"   # Google Analytics: GA4 page views only after the visitor accepts the consent bar, addresses and query strings stripped; you need your own privacy notice. Default "" (off). CLI --analytics-id wins
 
 [ltc.stratum]
 bind = "0.0.0.0:9327"       # Stratum (miner) listener; default port 9327. c2pool-ltc uses only the PORT part of this value
@@ -136,7 +137,6 @@ bind = "0.0.0.0:9327"       # Stratum (miner) listener; default port 9327. c2poo
 #   external_ip -- miner-facing host for stratum URL (CLI: --external-ip)
 #   dashboard_dir -- dashboard static asset dir (CLI: --dashboard-dir)
 #   cors_origin -- CORS origin (CLI: --cors-origin)
-#   analytics_id -- analytics id (CLI: --analytics-id)
 # [ltc.global]
 #   rss_limit_mb -- RSS limit MB (abort over) (CLI: --rss-limit-mb)
 #   storage_save_interval -- storage save interval seconds (CLI: --storage-save-interval)
@@ -150,7 +150,7 @@ bind = "0.0.0.0:9327"       # Stratum (miner) listener; default port 9327. c2poo
 #   node_owner_script [money] -- node-owner output script (CLI: --node-owner-script)
 #   merged_operator_address [money] -- merged (doge) fee address (CLI: --node-owner-merged-address / --merged-operator-address)
 #   auto_detect_wallet [money] -- auto-detect wallet (default on) (CLI: --auto-detect-wallet / --no-auto-detect-wallet)
-#   redistribute [money] -- unnamed-share redistribution (CLI: --redistribute)
+#   redistribute [money] -- unattributable-share redistribution (split: 50% node owner / 50% donation) (CLI: --redistribute)
 #   coinbase_text [money] -- coinbase attribution text (CLI: --coinbase-text)
 # [ltc.merged]
 #   spec -- merged-mining spec SYMBOL:CHAIN:HOST:PORT:USER:PASS (CLI: --merged)

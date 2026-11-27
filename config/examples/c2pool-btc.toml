@@ -72,6 +72,7 @@ bind = "0.0.0.0:9334"       # Stratum (miner) listener [HOST:]PORT; default off 
 
 [btc.web]
 port = 8083                 # dashboard TCP port, bound on 0.0.0.0; default 0 (off). For a loopback-only bind use the CLI: --http 127.0.0.1:8083
+# analytics_id = "G-XXXXXXXXXX"   # Google Analytics: GA4 page views only after the visitor accepts the consent bar, addresses and query strings stripped; you need your own privacy notice. Default "" (off). CLI --analytics-id wins
 
 [btc.daemon_rpc]
 # Leave these commented out for the daemonless posture.

@@ -20,6 +20,8 @@
 
 #include <gtest/gtest.h>
 
+#include <optional>
+
 #include <memory>
 #include <string>
 #include <vector>
@@ -130,7 +132,8 @@ struct Rig {
                                   uint64_t, uint32_t, uint32_t,
                                   bool, const std::string&, const uint256&,
                                   const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>&,
-                                  const std::vector<uint256>&) {
+                                  const std::vector<uint256>&,
+                                  const std::optional<uint16_t>&) {
             share_infos = mi.get_last_merged_header_infos();
             MiningInterface::RefHashResult r;
             r.ref_hash.SetHex(std::string(64, '5'));

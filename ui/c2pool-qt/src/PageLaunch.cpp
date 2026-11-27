@@ -370,14 +370,21 @@ void PageLaunch::setupUi()
                 [this](int) { onBuildPreview(); });
 
         redistributeCombo_ = new QComboBox;
-        redistributeCombo_->addItems({"pplns", "fee", "boost", "donate"});
+        redistributeCombo_->addItems({"split", "pplns", "fee", "boost", "donate"});
         redistributeCombo_->setToolTip(
             "--redistribute MODE\n"
-            "  pplns  - distribute anonymised shares by PPLNS weight (default)\n"
+            "  split  - 50% node owner / 50% donation (default; pplns without a node owner address)\n"
+            "  pplns  - distribute anonymised shares by PPLNS weight\n"
             "  fee    - 100% of anonymous shares → node operator\n"
             "  boost  - give to active miners with zero PPLNS weight\n"
             "  donate - 100% to donation address");
         form->addRow("Redistribute mode:", redistributeCombo_);
+        // A choice the operator makes (not a programmatic load) is the one
+        // passed on (redistributeUserSet_).
+        connect(redistributeCombo_, &QComboBox::activated, this, [this](int) {
+            redistributeUserSet_ = true;
+            onBuildPreview();
+        });
 
         vbox->addWidget(g);
     }
@@ -814,9 +821,9 @@ QString PageLaunch::buildLegacyCommand() const
     if (!nodeOwnerScript.isEmpty())
         parts << "--node-owner-script" << nodeOwnerScript;
 
-    // Redistribute (only if non-default)
+    // Redistribute: only a mode the operator chose, and not the default
     const QString redistribute = redistributeCombo_->currentText();
-    if (redistribute != "pplns")
+    if (redistributeUserSet_ && redistribute != "split")
         parts << "--redistribute" << redistribute;
 
     // Merged mining
@@ -959,6 +966,7 @@ c2pool_qt::PerCoinParams PageLaunch::marshalPerCoinParams() const
         giveAuthorZeroAckCheck_ && giveAuthorZeroAckCheck_->isChecked();
     pp.giveAuthorSet = pp.giveAuthor > 0.0 || pp.giveAuthorExplicitZeroAck;
     pp.redistribute  = redistributeCombo_->currentText().toStdString();
+    pp.redistributeSet = redistributeUserSet_;
     pp.messageBlob   = messageBlobEdit_->text().trimmed().toStdString();
 
     // ── DGB/BCH deeper run-loop controls (emitted only where the catalog has
@@ -1397,6 +1405,7 @@ void PageLaunch::saveSettings() const
     s.setValue("nodeOwnerAddr", nodeOwnerAddrEdit_->text());
     s.setValue("giveAuthor",    giveAuthorSpinBox_->value());
     s.setValue("redistribute",  redistributeCombo_->currentText());
+    s.setValue("redistributeUserSet", redistributeUserSet_);
     s.setValue("maxConns",      maxConnsSpinBox_->value());
     s.setValue("coindP2pPort",  coindP2pPortSpin_->value());
     s.setValue("coindP2pAddr",  coindP2pAddrEdit_->text());
@@ -1467,7 +1476,20 @@ void PageLaunch::loadSettings()
     nodeOwnerAddrEdit_->setText(s.value("nodeOwnerAddr").toString());
     giveAuthorSpinBox_->setValue(s.value("giveAuthor", 0.0).toDouble());
     {
-        const int idx = redistributeCombo_->findText(s.value("redistribute", "pplns").toString());
+        // c2pool_qt::restore_redistribute_choice: with the user-set marker,
+        // the saved choice; without it (a store written before split became
+        // the default), a saved fee / boost / donate is kept as the
+        // operator's choice and a saved pplns (the old default) is not.
+        std::optional<bool> marker;
+        if (s.contains("redistributeUserSet"))
+            marker = s.value("redistributeUserSet").toBool();
+        std::vector<std::string> offered;
+        for (int i = 0; i < redistributeCombo_->count(); ++i)
+            offered.push_back(redistributeCombo_->itemText(i).toStdString());
+        const auto [user_set, mode] = c2pool_qt::restore_redistribute_choice(
+            marker, s.value("redistribute", "").toString().toStdString(), offered);
+        redistributeUserSet_ = user_set;
+        const int idx = redistributeCombo_->findText(QString::fromStdString(mode));
         redistributeCombo_->setCurrentIndex(idx >= 0 ? idx : 0);
     }
     maxConnsSpinBox_->setValue(s.value("maxConns", 0).toInt());

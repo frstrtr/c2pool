@@ -167,6 +167,7 @@
 #include <impl/dash/share_messages.hpp>        // dash::validate_message_data — operator message-blob validation (EMIT side, mirrors main_ltc.cpp)
 #include <c2pool/storage/found_block_store.hpp>  // FoundBlockStore/Record + LevelDBStore + MergedBlockStore (persistence, main_ltc parity)
 #include <c2pool/storage/the_checkpoint.hpp>   // TheCheckpointStore — #159 (G9) DASH parity wiring (inert until merged mining)
+#include <core/analytics_tag.hpp>              // --analytics-id / web.analytics_id
 #include <core/web_server.hpp>                 // core::WebServer — the EXISTING c2pool dashboard (same wiring main_ltc.cpp uses)
 #include <impl/dash/enhanced_node.hpp>         // dash::EnhancedDashNode — core::IMiningNode the WebServer ctor takes
 #include <impl/dash/share_messages.hpp>        // dash::unpack_share_messages — signed transitional-blob DISPLAY+VERIFY feed
@@ -646,8 +647,12 @@ void print_banner(const char* argv0)
         << "           [--network-id HEX [--prefix HEX]]  (private sharechain identity)\n"
         << "           [--stratum [HOST:]PORT] [--coin-p2p-connect HOST:PORT]... [--coin-p2p-discover]\n"
         << "           [--web-port PORT] [--web-host ADDR] [--dashboard-dir PATH]\n"
+        << "           [--analytics-id ID]\n"
         << "           [--stratum-http[=true|false|auto]]\n"
         << "           [--stratum-http-budget N] [--stratum-http-per-ip N]\n"
+        << "           [--stratum-tls [HOST:]PORT --stratum-tls-cert FILE --stratum-tls-key FILE]\n"
+        << "           [--stratum-tls-rate-per-ip R] [--stratum-tls-burst-per-ip N]\n"
+        << "           [--stratum-tls-handshakes N] [--stratum-tls-handshakes-per-ip N]\n"
         << "           [--external-ip ADDR]\n"
         << "           [--header-dgw-log-only]  (log, do not refuse, a header off its DGW bits)\n"
         << "           [--embedded-utxo[=false]] [--embedded-mainnet[=false]] [--embedded-null-arm[=false]]\n"
@@ -728,7 +733,9 @@ void print_banner(const char* argv0)
         << "           [--embedded-no-dashd-mn-seed [--embedded-fold-only-proof]]\n"
         << "           [--oracle-graduation-blocks N] [--oracle-class-coverage K]\n"
         << "           [--give-author PCT] [-f|--fee PCT] [--node-owner-address ADDR]\n"
-        << "           [--redistribute pplns|fee|boost|donate]\n"
+        << "           [--redistribute split|pplns|fee|boost|donate]  (default split: work with no\n"
+        << "              usable payout address pays 50% node owner / 50% donation; pplns without\n"
+        << "              a --node-owner-address)\n"
         << "           [--coin-zmq-hashblock tcp://HOST:PORT]\n"
         << "           [--message-blob-hex HEX] [--coinbase-text TEXT]\n"
         << "       " << argv0 << " --mine-block [--coin-rpc H:P] [--coin-rpc-auth PATH]\n"
@@ -836,6 +843,10 @@ void print_banner(const char* argv0)
         << "        --web-port PORT (alias --http-port, default 8080) serves the FULL\n"
         << "        c2pool web dashboard + JSON API on --web-host (default 0.0.0.0)\n"
         << "        from --dashboard-dir (default web-static); --web-port 0 disables.\n"
+        << "        --analytics-id ID (Google Analytics GA4, G-XXXXXXXXXX), off by default:\n"
+        << "        every HTML page it serves shows a consent bar; only after a visitor\n"
+        << "        accepts are GA4 page views sent, with addresses and query strings\n"
+        << "        stripped. You are responsible for your own privacy notice.\n"
         << "        --stratum-http[=true|false|auto] also answers that API (GET/HEAD,\n"
         << "        read-only) on the stratum port, as python p2pool did on its\n"
         << "        worker port (trackers poll host:<stratum>/global_stats); default\n"
@@ -849,6 +860,18 @@ void print_banner(const char* argv0)
         << "        stratum port at once from one address, one /64 for IPv6, at\n"
         << "        most N; others are answered 503 (default 6; 0 = no limit below\n"
         << "        --stratum-http-budget).\n"
+        << "        --stratum-tls [HOST:]PORT opens a second stratum listener that\n"
+        << "        speaks TLS (stratum+ssl://), so miners can verify the pool's\n"
+        << "        certificate; PORT alone binds the --stratum host. Same sessions,\n"
+        << "        limits and miner list as the plain port; TLS 1.2+, no client\n"
+        << "        certificates. Needs --stratum-tls-cert FILE (PEM chain, leaf\n"
+        << "        first) and --stratum-tls-key FILE (PEM, no passphrase); both are\n"
+        << "        re-read when either changes and on SIGHUP (default: off).\n"
+        << "        --stratum-tls-rate-per-ip R / --stratum-tls-burst-per-ip N: TLS\n"
+        << "        accepts a second from one address (IPv6: one /64) and how many\n"
+        << "        back to back (default 5 and 20); --stratum-tls-handshakes N /\n"
+        << "        --stratum-tls-handshakes-per-ip N: TLS handshakes in progress at\n"
+        << "        once, in total and from one address (default 32 and 8); 0 = no limit.\n"
         << "        --embedded-oracle-shadow runs the OBSERVE-only per-block dashd\n"
         << "        cross-check: dashd getblocktemplate{mode:proposal} is the VERDICT,\n"
         << "        regime-aware field-compare is the DIAGNOSIS; a persisted graduation\n"
@@ -1110,7 +1133,7 @@ int run_selftest()
 //   dev_donation        --give-author (donation_percentage), default 0.1%
 //   node_owner_fee      -f/--fee (node_owner_fee), default 0
 //   node_owner_address  --node-owner-address (fee destination, P2PKH)
-//   redistribute_mode   --redistribute (pplns/fee/boost/donate)
+//   redistribute_mode   --redistribute (split/pplns/fee/boost/donate), default split
 int run_node(bool testnet, const std::string& rpc_endpoint,
              const std::string& rpc_conf_path, const std::string& submit_hex,
              const PeeringConfig& peer,
@@ -2254,6 +2277,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         });
 
         web_server->set_dashboard_dir(dashboard_dir);
+        web_server->set_analytics_id(core::analytics_id_setting());   // --analytics-id (default off)
         // Explicitly DISABLE the WebServer's own stratum acceptor. Its ctor
         // defaults stratum_port_ to (web_port + 10) (web_server.cpp:8330/8344/
         // 8358) and start() binds it unconditionally when non-zero
@@ -4861,11 +4885,25 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         if (fee_policy.node_owner_fee_pct > 0.0 && fee_policy.node_owner_script.empty())
             std::cout << "[run] --fee " << node_owner_fee << " set but no usable "
                          "--node-owner-address -- node-owner fee DISABLED\n";
+        // --redistribute split (the default): shares of work with no usable
+        // payout address pay the node owner with donation 32768/65535 (half
+        // the weight each). No usable owner address: the owner half cannot
+        // be paid, this node runs pplns (said once, here).
+        const bool split_without_owner =
+            fee_policy.redistribute == dash::mint::MintFeePolicy::Redistribute::SPLIT
+            && fee_policy.node_owner_script.empty();
+        if (split_without_owner) {
+            fee_policy.redistribute = dash::mint::MintFeePolicy::Redistribute::PPLNS;
+            std::cout << "[run] --redistribute split: no usable --node-owner-address (a P2PKH DASH "
+                         "address) -- the owner half cannot be paid; unattributable work falls back "
+                         "to pplns (spread over the PPLNS window) on this node\n";
+        }
         std::cout << "[run] fee policy: give-author=" << dev_donation
                   << "% (donation_u16=" << fee_policy.donation_u16
                   << ") node-owner-fee=" << node_owner_fee
                   << "% (owner=" << (fee_policy.node_owner_script.empty() ? "unset" : node_owner_address)
-                  << ") redistribute=" << redistribute_mode << "\n";
+                  << ") redistribute=" << redistribute_mode
+                  << (split_without_owner ? " (no owner: pplns)" : "") << "\n";
 
         // Best-share election: prev_share_hash for new jobs = the live tip
         // think() elected (verified-work-first; ZERO with peers-but-no-
@@ -5457,15 +5495,12 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                                     // exact regardless: superblock payouts come
                                     // from the 20% carve-out already deducted
                                     // from every block's subsidy. Cycle is
-                                    // network-specific (mainnet 16616, tn 24).
+                                    // network-specific (mainnet 16616, tn 24,
+                                    // regtest 10: dash_superblock_cycle).
                                     info.superblock =
                                         dash::coin::is_superblock_height(
                                             height,
-                                            testnet
-                                                ? dash::coin::
-                                                      DASH_SUPERBLOCK_CYCLE_TESTNET
-                                                : dash::coin::
-                                                      DASH_SUPERBLOCK_CYCLE_MAINNET);
+                                            dash::coin::dash_superblock_cycle(testnet, g_regtest));
                                     info.coinbase_value_sat =
                                         static_cast<uint64_t>(reward);
                                     info.payment_amount_sat =
@@ -5560,6 +5595,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         core::configure_stratum_http(*stratum_server, web_server.get(),
                                      core::stratum_http_mode_setting(),
                                      core::stratum_http_limits_setting());
+    // The TLS stratum listener (--stratum-tls), when set.
+    core::configure_stratum_tls(stratum_server.get(), core::stratum_tls_setting());
 
     // ── Think loop: initial election + 15 s keep-fresh tick ───────────────
     // Share arrivals trigger run_think() themselves (add_verified_shares);
@@ -6771,11 +6808,10 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // governance/treasury outputs, which the embedded template does not
         // compute. Refuse the embedded arm on those heights and let the reward-
         // safe dashd fallback serve the correct superblock template. Cycle is
-        // network-specific (mainnet 16616, testnet 24).
+        // network-specific (mainnet 16616, testnet 24, regtest 10), from the
+        // same definition the work source's store brake reads.
         {
-            const int sb_cycle = testnet
-                ? dash::coin::DASH_SUPERBLOCK_CYCLE_TESTNET
-                : dash::coin::DASH_SUPERBLOCK_CYCLE_MAINNET;
+            const int sb_cycle = dash::coin::dash_superblock_cycle(testnet, g_regtest);
             node_coin_state.set_is_superblock_fn(
                 [sb_cycle](uint32_t next_height) {
                     return dash::coin::is_superblock_height(next_height, sb_cycle);
@@ -13085,7 +13121,7 @@ int main(int argc, char** argv)
     std::string web_host      = "0.0.0.0";     // --web-host bind interface
     uint16_t    web_port      = 8080;          // --web-port / --http-port (0 disables)
     std::string dashboard_dir = "web-static";  // --dashboard-dir static asset root
-    std::string redistribute_mode = "pplns";   // --redistribute pplns|fee|boost|donate
+    std::string redistribute_mode = dash::mint::MintFeePolicy::kDefaultRedistribute;   // --redistribute split|pplns|fee|boost|donate
     std::string coin_zmq_hashblock;             // --coin-zmq-hashblock ENDPOINT (opt-in dashd ZMQ hashblock instant tip-notify, e.g. tcp://127.0.0.1:28332)
     // Operator-supplied miner-facing host for the dashboard Stratum URL.
     // Empty => auto-detect the outbound public IP (current behaviour).
@@ -13128,7 +13164,9 @@ int main(int argc, char** argv)
             // (BLS-dark) binary is otherwise indistinguishable here, and this is
             // the surface operators and scripts read. bls= is the last token so
             // an inventory can match it with `--version | grep -oE 'bls=[a-z]+'`.
+            // tls= before it: the TLS stratum listener is built in (on) or not.
             std::cout << "c2pool-dash " << C2POOL_VERSION
+                      << " tls=" << (core::stratum_tls_supported() ? "on" : "off")
                       << " bls=" << dash::coin::vendor::bls_backend_name() << "\n";
             return 0;
         }
@@ -13617,6 +13655,26 @@ int main(int argc, char** argv)
                 return 2;
             }
         }
+        // --stratum-tls [HOST:]PORT / --stratum-tls-cert FILE / --stratum-tls-key
+        // FILE: the TLS stratum listener (core/stratum_tls.hpp); checked once
+        // every flag and setting is read (check_stratum_tls_settings).
+        else if (std::strcmp(argv[i], "--stratum-tls") == 0 && i + 1 < argc)
+            core::stratum_tls_setting().bind = argv[++i];
+        else if (std::strcmp(argv[i], "--stratum-tls-cert") == 0 && i + 1 < argc)
+            core::stratum_tls_setting().cert = argv[++i];
+        else if (std::strcmp(argv[i], "--stratum-tls-key") == 0 && i + 1 < argc)
+            core::stratum_tls_setting().key = argv[++i];
+        else if ((std::strcmp(argv[i], "--stratum-tls-rate-per-ip") == 0
+                  || std::strcmp(argv[i], "--stratum-tls-burst-per-ip") == 0
+                  || std::strcmp(argv[i], "--stratum-tls-handshakes") == 0
+                  || std::strcmp(argv[i], "--stratum-tls-handshakes-per-ip") == 0) && i + 1 < argc) {
+            const char* flag = argv[i];
+            std::string err;
+            if (!core::parse_stratum_tls_limit_flag(flag, argv[++i], core::stratum_tls_setting(), err)) {
+                std::cout << "c2pool-dash: " << err << "\n";
+                return 2;
+            }
+        }
         // Miner-facing host override for the dashboard Stratum URL. Both production
         // nodes NAT out through one gateway, so the auto-detected outbound IP
         // is NOT the address miners reach; the operator advertises the real
@@ -13627,6 +13685,13 @@ int main(int argc, char** argv)
             external_ip = argv[++i];
         else if (std::strcmp(argv[i], "--dashboard-dir") == 0 && i + 1 < argc)
             dashboard_dir = argv[++i];
+        else if (std::strcmp(argv[i], "--analytics-id") == 0 && i + 1 < argc) {
+            if (!core::parse_analytics_id(argv[++i], core::analytics_id_setting())) {
+                std::cout << "c2pool-dash: bad value: --analytics-id " << argv[i]
+                          << " (expected a Google Analytics measurement ID, G-XXXXXXXXXX)\n";
+                return 2;
+            }
+        }
         else if (std::strcmp(argv[i], "--stratum") == 0 && i + 1 < argc) {
             // --stratum [HOST:]PORT -- bind a Stratum TCP listener for miners.
             // Bare PORT keeps the default 0.0.0.0 bind host (parse_listen SSOT).
@@ -13721,9 +13786,14 @@ int main(int argc, char** argv)
         if (rc.file_set("stratum.http_per_ip"))   // --stratum-http-per-ip
             core::apply_stratum_http_count_setting("stratum.http_per_ip", rc.get_i64("stratum.http_per_ip"),
                                                    core::stratum_http_limits_setting().per_ip);
+        // --stratum-tls, -cert, -key and the four TLS limits (stratum.tls_*).
+        core::apply_stratum_tls_file_settings(rc, core::stratum_tls_setting());
         if (rc.file_set("stratum.bind"))    parse_listen(rc.get_string("stratum.bind").value_or(""), stratum_host, stratum_port);
         if (rc.file_set("web.external_ip")) external_ip = rc.get_string("web.external_ip").value_or(external_ip);
         if (rc.file_set("web.dashboard_dir")) dashboard_dir = rc.get_string("web.dashboard_dir").value_or(dashboard_dir);
+        if (rc.file_set("web.analytics_id"))   // --analytics-id: a bad value is warned about and ignored
+            core::apply_analytics_id_setting("web.analytics_id", rc.get_string("web.analytics_id").value_or(""),
+                                             core::analytics_id_setting());
         if (rc.file_set("daemon_rpc.endpoint")) rpc_endpoint = rc.get_string("daemon_rpc.endpoint").value_or(rpc_endpoint);
         if (rc.file_set("daemon_rpc.auth_file")) rpc_conf_path = rc.get_string("daemon_rpc.auth_file").value_or(rpc_conf_path);
         if (rc.file_set("money.redistribute"))       redistribute_mode  = rc.get_string("money.redistribute").value_or(redistribute_mode);
@@ -13765,6 +13835,16 @@ int main(int argc, char** argv)
             }
         }
     }
+
+    // --stratum-tls / --stratum-tls-cert / --stratum-tls-key (command line or
+    // settings file): a complete set this build supports, whose certificate
+    // and key load; else refused here, before anything starts.
+    if (auto why = core::check_stratum_tls_settings(core::stratum_tls_setting())) {
+        std::cout << "c2pool-dash: " << *why << "\n";
+        return 2;
+    }
+    if (!want_run && core::stratum_tls_setting().any_set())
+        std::cout << "c2pool-dash: warning: --stratum-tls has no effect without --run (no stratum listener)\n";
 
     // ── FULL-HISTORY REPLAY W3: --replay-utxo-* standalone utility ──────────
     // Runs and EXITS: opens the fold store, names its resume cursor, and with

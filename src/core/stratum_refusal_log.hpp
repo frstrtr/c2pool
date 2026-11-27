@@ -12,6 +12,7 @@
 
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <map>
 #include <optional>
@@ -41,7 +42,12 @@ public:
             return true;
         }
         ++pending_;
-        ++pending_peers_[peer_ip];
+        // At most kMaxPendingPeers distinct peers are told apart; the rest
+        // (a flood from many addresses) are counted together as "other".
+        if (pending_peers_.size() < kMaxPendingPeers || pending_peers_.count(peer_ip))
+            ++pending_peers_[peer_ip];
+        else
+            ++pending_other_;
         pending_detail_ = detail;
         return false;
     }
@@ -57,10 +63,14 @@ public:
         const long secs = std::lround(std::chrono::duration<double>(now - *last_line_).count());
         std::string s = std::to_string(pending_) + " more in the last " + std::to_string(secs)
                       + " s (" + pending_detail_ + ", top peer " + top.first + " x"
-                      + std::to_string(top.second) + ")";
+                      + std::to_string(top.second)
+                      + (pending_other_ ? ", " + std::to_string(pending_other_) + " from other peers"
+                                        : std::string{})
+                      + ")";
         last_line_ = now;
         pending_ = 0;
         pending_peers_.clear();
+        pending_other_ = 0;
         pending_detail_.clear();
         return s;
     }
@@ -73,6 +83,10 @@ public:
     }
 
     uint64_t pending() const { return pending_; }
+    /// Distinct peers told apart in the pending summary (at most
+    /// kMaxPendingPeers).
+    std::size_t pending_peers() const { return pending_peers_.size(); }
+    static constexpr std::size_t kMaxPendingPeers = 1024;
 
 private:
     // The peer with the most pending refusals (the lowest address on a tie).
@@ -88,6 +102,7 @@ private:
     std::optional<clock::time_point> last_line_;   // the last line logged (full or summary)
     uint64_t pending_ = 0;
     std::map<std::string, uint64_t> pending_peers_;
+    uint64_t pending_other_ = 0;   // past kMaxPendingPeers distinct peers
     std::string pending_detail_;
 };
 

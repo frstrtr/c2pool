@@ -19,6 +19,7 @@
 #include <string>
 #include <vector>
 
+#include <core/author_fee.hpp>
 #include <core/uint256.hpp>
 #include <core/web_server.hpp>
 
@@ -155,4 +156,251 @@ TEST(RedistributeType, WithoutTheFeeDrawTheMinersOwnTypeIsKept)
     ASSERT_TRUE(r.created.has_value());
     ASSERT_EQ(r.created->size(), 23u);
     EXPECT_EQ((*r.created)[0], 0xa9) << "a P2SH miner is paid as P2SH";
+}
+
+// --redistribute split (the default): work the node cannot attribute to a
+// payout address pays the node owner and the donation half and half. The job
+// (decide_job_payout) pays the owner's own script type with share donation
+// core::kSplitShareDonation (32768 of 65535); the share made from it carries
+// exactly that payout and donation (ShareCreationParams), whatever the login
+// is by the time the miner submits.
+namespace {
+// The donation script on a merged chain (a P2SH owner's merged half).
+const std::vector<unsigned char> kMergedDonation = {0xa9, 0x14, 0x8c, 0x62, 0x72, 0x87};
+struct SplitRig : Rig {
+    std::optional<std::optional<uint16_t>> donation;   // the created share's donation (outer: created)
+    SplitRig()
+    {
+        mi.set_create_share_fn([this](const MiningInterface::ShareCreationParams& p) {
+            created = p.payout_script;
+            donation = p.share_donation;
+            return uint256();
+        });
+    }
+    void submit(const std::string& user)
+    {
+        donation.reset();
+        Rig::submit(user);
+    }
+};
+} // namespace
+
+TEST(RedistributeSplit, AnUnusableLoginMintsTheOwnerWithTheSplitDonation)
+{
+    EXPECT_EQ(core::kSplitShareDonation, 32768);
+    for (const auto& owner : {p2pkh(0x0a), p2sh(0x0b), p2wpkh(0x0c)}) {
+        SplitRig r;
+        // the old --redistribute pick lands elsewhere: split takes its place
+        r.mi.set_redistribute_fn([] { return std::pair<std::string, uint8_t>{hex20(0x07), 0}; });
+        ASSERT_TRUE(r.mi.set_split_owner(owner, {}, kMergedDonation));
+        EXPECT_TRUE(r.mi.has_split_owner());
+        // no usable address: decided at submit (a job without a payout)
+        r.submit("not-an-address");
+        ASSERT_TRUE(r.created.has_value());
+        EXPECT_EQ(*r.created, owner) << "the owner, in its own script type";
+        ASSERT_TRUE(r.donation.has_value() && r.donation->has_value());
+        EXPECT_EQ(**r.donation, 32768);
+        // a usable login: its own payout, the node's donation
+        r.submit("mvFaiHPVU5dYAnKcw4knKpZyzoW8UoaheA");
+        ASSERT_TRUE(r.created.has_value());
+        EXPECT_NE(*r.created, owner);
+        ASSERT_TRUE(r.donation.has_value());
+        EXPECT_FALSE(r.donation->has_value());
+    }
+}
+
+// The job decision: a payout a share cannot carry (empty login, P2WSH) pays
+// the owner with the split donation; a usable payout is unchanged with the
+// node's donation; the node fee draw comes first (a fee job is the
+// operator's, with the node's donation).
+TEST(RedistributeSplit, TheJobDecisionReturnsTheSplitDonation)
+{
+    MiningInterface mi{true};
+    const auto owner = p2pkh(0x0a);
+    ASSERT_TRUE(mi.set_split_owner(owner, {}, kMergedDonation));
+    std::vector<std::pair<uint32_t, std::vector<unsigned char>>> merged;
+    std::vector<unsigned char> payout;
+    auto d = mi.decide_job_payout(payout, merged);
+    ASSERT_TRUE(d.has_value());
+    EXPECT_EQ(*d, 32768);
+    EXPECT_EQ(payout, owner);
+    std::vector<unsigned char> p2wsh{0x00, 0x20};
+    p2wsh.insert(p2wsh.end(), 32, 0x43);
+    payout = p2wsh;
+    d = mi.decide_job_payout(payout, merged);
+    ASSERT_TRUE(d.has_value());
+    EXPECT_EQ(*d, 32768);
+    EXPECT_EQ(payout, owner) << "a P2WSH primary (a share carries a 20-byte hash): the owner";
+    payout = p2pkh(0x21);
+    EXPECT_FALSE(mi.decide_job_payout(payout, merged).has_value());
+    EXPECT_EQ(payout, p2pkh(0x21));
+    mi.set_node_fee(100.0, p2sh(0x0e));
+    payout.clear();
+    EXPECT_FALSE(mi.decide_job_payout(payout, merged).has_value());
+    EXPECT_EQ(payout, p2sh(0x0e)) << "the fee draw takes the job first";
+}
+
+// The reconnect race: the job sent right after mining.subscribe is built
+// before mining.authorize, with no payout. Its job id stays active after the
+// authorize, so a share found on it can be submitted (and is accepted) under
+// the now-authorized login. It is minted with the payout and donation that
+// job committed to: the owner and the split donation, never an empty script
+// (no share) and never the login's address (its ref_hash committed to the
+// owner). The session side (the job keeps its decision through the
+// authorize) is pinned in share_test (MergedAuxStratumSession,
+// AJobBuiltBeforeTheLoginKeepsItsSplitThroughTheAuthorize).
+TEST(RedistributeSplit, TheJobBuiltBeforeTheLoginMintsTheOwnerWithTheSplitDonation)
+{
+    SplitRig r;
+    const auto owner = p2pkh(0x0a);
+    ASSERT_TRUE(r.mi.set_split_owner(owner, {}, kMergedDonation));
+    // what send_notify_work did for that job: the decision on an empty payout
+    std::vector<unsigned char> payout;
+    std::vector<std::pair<uint32_t, std::vector<unsigned char>>> merged;
+    const auto d = r.mi.decide_job_payout(payout, merged);
+    r.job.has_payout = true;
+    r.job.payout_script = payout;
+    r.job.share_donation = d;
+    // submitted after the authorize, under a usable login
+    r.submit("mvFaiHPVU5dYAnKcw4knKpZyzoW8UoaheA");
+    ASSERT_TRUE(r.created.has_value()) << "the miner's work is credited: a share is minted";
+    EXPECT_EQ(*r.created, owner);
+    ASSERT_TRUE(r.donation.has_value() && r.donation->has_value());
+    EXPECT_EQ(**r.donation, 32768);
+}
+
+// No usable node-owner address: the owner half cannot be paid; the node
+// keeps the old pplns behaviour (the --redistribute pick, the node's
+// donation). An empty, P2WSH or zero-key owner is refused.
+TEST(RedistributeSplit, WithoutAnOwnerTheOldRedistributionStays)
+{
+    std::vector<unsigned char> p2wsh{0x00, 0x20};
+    p2wsh.insert(p2wsh.end(), 32, 0x43);
+    for (const auto& bad : {std::vector<unsigned char>{}, p2wsh, p2pkh(0x00)}) {
+        SplitRig r;
+        r.mi.set_redistribute_fn([] { return std::pair<std::string, uint8_t>{hex20(0x07), 0}; });
+        EXPECT_FALSE(r.mi.set_split_owner(bad, {}, kMergedDonation));
+        EXPECT_FALSE(r.mi.has_split_owner());
+        std::vector<unsigned char> payout;
+        std::vector<std::pair<uint32_t, std::vector<unsigned char>>> merged;
+        EXPECT_FALSE(r.mi.decide_job_payout(payout, merged).has_value());
+        EXPECT_EQ(payout, p2pkh(0x07)) << "the pplns pick, as before";
+        r.submit("not-an-address");
+        ASSERT_TRUE(r.created.has_value());
+        EXPECT_EQ(*r.created, p2pkh(0x07));
+        ASSERT_TRUE(r.donation.has_value());
+        EXPECT_FALSE(r.donation->has_value()) << "the node's donation";
+    }
+    // set, then cleared by an unusable owner: off again
+    SplitRig r;
+    ASSERT_TRUE(r.mi.set_split_owner(p2pkh(0x0a), {}, kMergedDonation));
+    EXPECT_FALSE(r.mi.set_split_owner({}, {}, kMergedDonation));
+    EXPECT_FALSE(r.mi.has_split_owner());
+}
+
+// The old modes are unchanged: without a split owner, the fee and the
+// --redistribute pick decide as before and carry the node's donation.
+TEST(RedistributeSplit, TheOldModesCarryTheNodesDonation)
+{
+    SplitRig r;
+    r.mi.set_address_fallback_fn([](const std::string&) { return std::pair<std::string, uint8_t>{hex20(0x0f), 2}; });
+    r.submit("not-an-address");
+    ASSERT_TRUE(r.created.has_value());
+    EXPECT_EQ(*r.created, p2sh(0x0f));
+    ASSERT_TRUE(r.donation.has_value());
+    EXPECT_FALSE(r.donation->has_value());
+    r.mi.set_node_fee(100.0, p2pkh(0x0d));
+    r.submit("mvFaiHPVU5dYAnKcw4knKpZyzoW8UoaheA");
+    ASSERT_TRUE(r.created.has_value());
+    EXPECT_EQ(*r.created, p2pkh(0x0d));
+    ASSERT_TRUE(r.donation.has_value());
+    EXPECT_FALSE(r.donation->has_value());
+}
+
+// The share donation of a job, in one place for the job's ref_hash and the
+// share minted from it: the job's own (a split job), else --give-author's,
+// round(65535 * pct / 100). A split job keeps exactly 32768 whatever
+// --give-author says (above 50% too).
+TEST(RedistributeSplit, TheJobDonationHelperPinsBothSides)
+{
+    EXPECT_EQ(core::job_share_donation(std::nullopt, 0.1), 66);
+    EXPECT_EQ(core::job_share_donation(std::nullopt, 2.5), 1638);
+    EXPECT_EQ(core::job_share_donation(std::nullopt, 0.0), 0);
+    EXPECT_EQ(core::job_share_donation(std::nullopt, 100.0), 65535);
+    EXPECT_EQ(core::job_share_donation(core::kSplitShareDonation, 0.1), 32768);
+    EXPECT_EQ(core::job_share_donation(core::kSplitShareDonation, 60.0), 32768);
+    EXPECT_EQ(core::job_share_donation(uint16_t(77), 0.1), 77);
+    EXPECT_DOUBLE_EQ(core::job_share_donation_pct(std::nullopt, 0.1), 0.1);
+    EXPECT_DOUBLE_EQ(core::job_share_donation_pct(core::kSplitShareDonation, 0.1), 32768 * 100.0 / 65535.0);
+}
+
+// A P2SH owner: its key is not converted to a merged chain (a same-hash P2SH
+// on a chain without segwit), so the split needs the merged donation script
+// for those chains; without one the owner is refused.
+TEST(RedistributeSplit, AP2shOwnerNeedsTheMergedDonationScript)
+{
+    MiningInterface mi{true};
+    EXPECT_FALSE(mi.set_split_owner(p2sh(0x0b), {}, {}));
+    EXPECT_FALSE(mi.has_split_owner());
+    EXPECT_TRUE(mi.set_split_owner(p2sh(0x0b), {}, kMergedDonation));
+    EXPECT_TRUE(mi.has_split_owner());
+    EXPECT_TRUE(mi.set_split_owner(p2pkh(0x0a), {}, {})) << "a P2PKH owner's key is converted";
+    EXPECT_TRUE(mi.set_split_owner(p2wpkh(0x0c), {}, {})) << "a P2WPKH owner's key is converted (P2PKH)";
+}
+
+// p2pool's case 4 for a P2WSH / P2TR login with a DOGE address is decided at
+// the login (core::merged_addr::resolve_merged_login: the stratum session
+// hands the DOGE address's key as the job's payout). That payout is one a
+// share carries: the job keeps it with the node's donation, never the split
+// (owner and dev get nothing from this case). The merged entries stay. A
+// P2WSH / P2TR payout itself (no DOGE address) is the split's; the parent
+// payout is never taken from a merged chain's script here.
+TEST(RedistributeSplit, TheDogeKeyPayoutOfAnUncarriedLoginIsNotSplit)
+{
+    MiningInterface mi{true};
+    ASSERT_TRUE(mi.set_split_owner(p2pkh(0x0a), {}, kMergedDonation));
+    for (const auto& doge : {p2pkh(0x21), p2sh(0x22)}) {
+        std::vector<unsigned char> payout = doge;
+        std::vector<std::pair<uint32_t, std::vector<unsigned char>>> merged = {{98, doge}};
+        EXPECT_FALSE(mi.decide_job_payout(payout, merged).has_value()) << "the node's donation, not 32768";
+        EXPECT_EQ(payout, doge);
+        EXPECT_EQ(merged, (std::vector<std::pair<uint32_t, std::vector<unsigned char>>>{{98, doge}}));
+    }
+    std::vector<unsigned char> p2wsh{0x00, 0x20}, p2tr{0x51, 0x20};
+    p2wsh.insert(p2wsh.end(), 32, 0x43);
+    p2tr.insert(p2tr.end(), 32, 0x44);
+    for (const auto& uncarried : {p2wsh, p2tr}) {
+        std::vector<unsigned char> payout = uncarried;
+        std::vector<std::pair<uint32_t, std::vector<unsigned char>>> merged;
+        const auto d = mi.decide_job_payout(payout, merged);
+        ASSERT_TRUE(d.has_value());
+        EXPECT_EQ(*d, 32768);
+        EXPECT_EQ(payout, p2pkh(0x0a));
+    }
+}
+
+// The worker's payout label follows a payout changed after its authorize
+// (case 4 from a later mining.set_merged_addresses): an existing session's
+// label is updated, its other fields kept; a session that is not registered
+// is not created.
+TEST(RedistributeSplit, TheWorkerPayoutLabelIsUpdatedInPlace)
+{
+    MiningInterface mi{true};
+    MiningInterface::WorkerInfo wi;
+    wi.username = "garbage";
+    wi.worker_name = "rig";
+    wi.payout_warning = "address invalid → redistributed";
+    wi.difficulty = 42.0;
+    mi.register_stratum_worker("s1", wi);
+    mi.update_stratum_worker_payout_warning("s1", "address invalid → parent paid to the DOGE address's key");
+    auto workers = mi.get_stratum_workers();
+    ASSERT_EQ(workers.count("s1"), 1u);
+    EXPECT_EQ(workers.at("s1").payout_warning, "address invalid → parent paid to the DOGE address's key");
+    EXPECT_EQ(workers.at("s1").username, "garbage");
+    EXPECT_EQ(workers.at("s1").worker_name, "rig");
+    EXPECT_DOUBLE_EQ(workers.at("s1").difficulty, 42.0);
+    mi.update_stratum_worker_payout_warning("s2", "x");
+    workers = mi.get_stratum_workers();
+    EXPECT_EQ(workers.count("s2"), 0u) << "a missing session is not created";
+    EXPECT_EQ(workers.size(), 1u);
 }

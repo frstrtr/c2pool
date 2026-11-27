@@ -14,6 +14,7 @@
 #include <cstring>
 #include <iostream>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -149,6 +150,87 @@ int main() {
         CHECK(rc.get_string("stratum.http").value_or("") == want, "ltc " + arg + " -> stratum.http=" + want);
         CHECK(rc.source_of("stratum.http") == Source::Cli, "ltc " + arg + " source=cli");
         CHECK(rc.get_string("web.port").value_or("") == "7", "ltc " + arg + " consumes no value token");
+    }
+
+    // (8) The TLS stratum listener's three VALUE rows (--stratum-tls,
+    //     --stratum-tls-cert, --stratum-tls-key) on every binary that has a
+    //     settings file: each consumes its value and lands in its key.
+    for (const auto& [bin, coin, name] : std::vector<std::tuple<Bin, CoinBit, std::string>>{
+             {Bin::BIN_LTC, C_LTC, "ltc"}, {Bin::BIN_DASH, C_DASH, "dash"}, {Bin::BIN_BTC, C_BTC, "btc"},
+             {Bin::BIN_DGB, C_DGB, "dgb"}, {Bin::BIN_BCH, C_BCH, "bch"}}) {
+        std::vector<std::string> s = {"prog", "--stratum-tls", "0.0.0.0:3334", "--stratum-tls-cert",
+                                      "/etc/c2pool/fullchain.pem", "--stratum-tls-key",
+                                      "/etc/c2pool/privkey.pem", "--stratum-http-budget", "7"};
+        std::vector<char*> p; for (auto& x : s) p.push_back(const_cast<char*>(x.c_str()));
+        CliTracker tr; ResolvedConfig rc; rc.seed_compiled_defaults(coin);
+        scan_cli((int)p.size(), p.data(), bin, tr, rc);
+        CHECK(rc.get_string("stratum.tls_bind").value_or("") == "0.0.0.0:3334", name + " --stratum-tls -> stratum.tls_bind");
+        CHECK(rc.get_string("stratum.tls_cert").value_or("") == "/etc/c2pool/fullchain.pem", name + " --stratum-tls-cert -> stratum.tls_cert");
+        CHECK(rc.get_string("stratum.tls_key").value_or("") == "/etc/c2pool/privkey.pem", name + " --stratum-tls-key -> stratum.tls_key");
+        CHECK(rc.source_of("stratum.tls_bind") == Source::Cli && rc.source_of("stratum.tls_key") == Source::Cli,
+              name + " TLS keys source=cli");
+        CHECK(rc.get_string("stratum.http_budget").value_or("") == "7", name + " TLS flags consume one value each");
+    }
+
+    // (9) The four TLS limit rows: each consumes its value on every binary
+    //     with a settings file.
+    for (const auto& [bin, coin, name] : std::vector<std::tuple<Bin, CoinBit, std::string>>{
+             {Bin::BIN_LTC, C_LTC, "ltc"}, {Bin::BIN_DASH, C_DASH, "dash"}, {Bin::BIN_BTC, C_BTC, "btc"},
+             {Bin::BIN_DGB, C_DGB, "dgb"}, {Bin::BIN_BCH, C_BCH, "bch"}}) {
+        std::vector<std::string> s = {"prog", "--stratum-tls-rate-per-ip", "2.5", "--stratum-tls-burst-per-ip", "40",
+                                      "--stratum-tls-handshakes", "64", "--stratum-tls-handshakes-per-ip", "16",
+                                      "--stratum-http-budget", "7"};
+        std::vector<char*> p; for (auto& x : s) p.push_back(const_cast<char*>(x.c_str()));
+        CliTracker tr; ResolvedConfig rc; rc.seed_compiled_defaults(coin);
+        scan_cli((int)p.size(), p.data(), bin, tr, rc);
+        CHECK(rc.get_string("stratum.tls_rate_per_ip").value_or("") == "2.5", name + " --stratum-tls-rate-per-ip");
+        CHECK(rc.get_string("stratum.tls_burst_per_ip").value_or("") == "40", name + " --stratum-tls-burst-per-ip");
+        CHECK(rc.get_string("stratum.tls_handshakes").value_or("") == "64", name + " --stratum-tls-handshakes");
+        CHECK(rc.get_string("stratum.tls_handshakes_per_ip").value_or("") == "16", name + " --stratum-tls-handshakes-per-ip");
+        CHECK(rc.source_of("stratum.tls_handshakes") == Source::Cli, name + " TLS limits source=cli");
+        CHECK(rc.get_string("stratum.http_budget").value_or("") == "7", name + " TLS limits consume one value each");
+    }
+
+    // (10) --analytics-id ID on every binary with a settings file: the value is
+    //     captured into web.analytics_id with Source::Cli (so a settings-file
+    //     web.analytics_id never overrides it), and it is off (empty) when absent.
+    for (Bin b : bins) {
+        const std::string name = bin_name(b);
+        {
+            std::vector<std::string> s = {"prog", "--analytics-id", "G-TEST1234"};
+            std::vector<char*> p; for (auto& x : s) p.push_back(const_cast<char*>(x.c_str()));
+            CliTracker tr; ResolvedConfig rc; rc.seed_compiled_defaults(coin_of_bin(b));
+            scan_cli((int)p.size(), p.data(), b, tr, rc);
+            CHECK(tr.has("web.analytics_id"), name + " --analytics-id marks web.analytics_id");
+            CHECK(rc.get_string("web.analytics_id").value_or("") == "G-TEST1234",
+                  name + " --analytics-id G-TEST1234 -> web.analytics_id=G-TEST1234");
+            CHECK(rc.source_of("web.analytics_id") == Source::Cli, name + " --analytics-id source=cli");
+        }
+        {
+            std::vector<std::string> s = {"prog"};
+            std::vector<char*> p; for (auto& x : s) p.push_back(const_cast<char*>(x.c_str()));
+            CliTracker tr; ResolvedConfig rc; rc.seed_compiled_defaults(coin_of_bin(b));
+            scan_cli((int)p.size(), p.data(), b, tr, rc);
+            const ParamRow* row = find_by_canon("web.analytics_id");
+            CHECK(!tr.has("web.analytics_id") && !rc.has("web.analytics_id")
+                      && row && row->default_literal.empty(),
+                  name + " no --analytics-id -> web.analytics_id unset, compiled default off (empty)");
+        }
+    }
+
+    // (9) --redistribute's default is split (unattributable work pays the node
+    //     owner and the donation half and half) on DASH and LTC;
+    //     --redistribute pplns still selects the old mode.
+    {
+        const ParamRow* row = find_by_canon("money.redistribute");
+        CHECK(row != nullptr && row->default_literal == "split", "money.redistribute default is split");
+        CHECK(row != nullptr && row->applies_to(C_DASH) && row->applies_to(C_LTC),
+              "money.redistribute applies to DASH and LTC");
+        std::vector<std::string> s = {"prog", "--redistribute", "pplns"};
+        std::vector<char*> p; for (auto& x : s) p.push_back(const_cast<char*>(x.c_str()));
+        CliTracker tr; ResolvedConfig rc; rc.seed_compiled_defaults(C_LTC);
+        scan_cli((int)p.size(), p.data(), Bin::BIN_LTC, tr, rc);
+        CHECK(rc.get_string("money.redistribute").value_or("") == "pplns", "ltc --redistribute pplns -> pplns");
     }
 
     if (g_fail == 0) std::cout << "\ntest_settings_cli_scan: ALL PASS\n";

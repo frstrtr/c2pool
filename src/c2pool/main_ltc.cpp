@@ -49,6 +49,7 @@
 #include <core/log.hpp>
 #include <core/uint256.hpp>
 #include <core/web_server.hpp>
+#include <core/analytics_tag.hpp>         // --analytics-id / web.analytics_id
 #include <core/hash.hpp>
 #include <core/address_utils.hpp>
 #include <core/config.hpp>
@@ -285,6 +286,7 @@ static void segfault_handler(int sig) {
 #include <c2pool/merged/aux_chain_params.hpp>
 #include <c2pool/merged/aux_found_verdict.hpp>
 #include <c2pool/merged/payout_source.hpp>
+#include <c2pool/merged/merged_donation.hpp>
 #include <c2pool/merged/coin_broadcaster.hpp>
 #include <impl/ltc/coin/mweb_fetch_retry.hpp>
 #include <impl/ltc/coin/mweb_ext_poller.hpp>
@@ -326,6 +328,7 @@ static void segfault_handler(int sig) {
 #include <impl/ltc/pool_monitor.hpp>
 #include <impl/ltc/whale_departure.hpp>
 #include <impl/ltc/redistribute.hpp>
+#include <core/author_fee.hpp>   // kSplitShareDonation (--redistribute split)
 
 // Coin daemon RPC
 #include <impl/ltc/coin/rpc.hpp>
@@ -534,7 +537,7 @@ void print_help() {
     std::cout << "COMMAND LINE OPTIONS:\n";
     std::cout << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
     std::cout << "  --help, -h                Show this help message and exit\n";
-    std::cout << "  --version                 Print \"c2pool-ltc <version> embedded=<coins>\" and exit\n";
+    std::cout << "  --version                 Print \"c2pool-ltc <version> tls=on|off embedded=<coins>\" and exit\n";
     std::cout << "  --data-dir PATH           Root all per-instance state here (default: ~/.c2pool)\n";
     std::cout << "                            (isolates co-located instances)\n";
     std::cout << "  --testnet                 Use testnet instead of mainnet\n";
@@ -556,7 +559,9 @@ void print_help() {
     std::cout << "  --give-author PERCENT     Developer donation (alias: --dev-donation; default: 0.1%)\n";
     std::cout << "  -f / --fee PERCENT        Node owner fee (alias: --node-owner-fee; default: 0%)\n";
     std::cout << "  --node-owner-address ADDR Node owner payout address\n";
-    std::cout << "  --redistribute MODE       Redistribution mode: pplns, fee, boost, donate\n\n";
+    std::cout << "  --redistribute MODE       Where work with no usable payout address goes: split (default:\n";
+    std::cout << "                            50% node owner / 50% donation; pplns without an owner address),\n";
+    std::cout << "                            pplns, fee, boost, donate\n\n";
     
     std::cout << "PORT CONFIGURATION:\n";
     std::cout << "  --p2pool-port PORT        P2P sharechain port (alias: --p2p-port; default: 9326)\n";
@@ -574,6 +579,18 @@ void print_help() {
     std::cout << "  --stratum-http-per-ip N   HTTP requests in progress on the stratum port at once from one\n";
     std::cout << "                            address, one /64 for IPv6: at most N; others are answered 503\n";
     std::cout << "                            (default 6; 0 = no limit below --stratum-http-budget)\n";
+    std::cout << "  --stratum-tls [HOST:]PORT A second stratum listener speaking TLS (stratum+ssl://), so miners\n";
+    std::cout << "                            can verify the pool's certificate; PORT alone binds --http-host.\n";
+    std::cout << "                            Same sessions, limits and miner list as the plain port; TLS 1.2+,\n";
+    std::cout << "                            no client certificates (default: off; needs the two flags below)\n";
+    std::cout << "  --stratum-tls-cert FILE   PEM certificate chain (leaf first) for --stratum-tls; with the key,\n";
+    std::cout << "                            re-read when either file changes and on SIGHUP (renewals)\n";
+    std::cout << "  --stratum-tls-key FILE    PEM private key for --stratum-tls (not passphrase-protected)\n";
+    std::cout << "  --stratum-tls-rate-per-ip R / --stratum-tls-burst-per-ip N  TLS accepts a second from one\n";
+    std::cout << "                            address (IPv6: one /64) and how many back to back (default 5 and 20;\n";
+    std::cout << "                            0 = no limit)\n";
+    std::cout << "  --stratum-tls-handshakes N / --stratum-tls-handshakes-per-ip N  TLS handshakes in progress\n";
+    std::cout << "                            at once, in total and from one address (default 32 and 8; 0 = no limit)\n";
     std::cout << "  --external-ip ADDR        Public IP or domain for stratum URL display (default: auto-detect)\n\n";
 
     std::cout << "PARENT COIN DAEMON:\n";
@@ -719,7 +736,10 @@ void print_help() {
     std::cout << "  --payout-window N         PPLNS payout window in seconds (default: 86400)\n";
     std::cout << "  --storage-save-interval N Periodic sharechain save interval in seconds (default: 300)\n";
     std::cout << "  --dashboard-dir PATH      Dashboard static files directory (default: web-static)\n";
-    std::cout << "  --analytics-id ID         Google Analytics measurement ID (e.g. G-XXXXXXXXXX)\n\n";
+    std::cout << "  --analytics-id ID         Google Analytics (GA4) measurement ID, G-XXXXXXXXXX; off by default.\n";
+    std::cout << "                            Every HTML page then shows a consent bar; only after a visitor\n";
+    std::cout << "                            accepts are GA4 page views sent, with addresses and query\n";
+    std::cout << "                            strings stripped. You are responsible for your own privacy notice.\n\n";
 
     std::cout << "BLOCKCHAIN SUPPORT:\n";
     std::cout << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
@@ -856,10 +876,12 @@ int main(int argc, char* argv[]) {
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--version") {
+            // tls= (the TLS stratum listener is built in) before embedded=.
+            const char* tls = core::stratum_tls_supported() ? "on" : "off";
 #ifdef C2POOL_VERSION
-            std::cout << "c2pool-ltc " << C2POOL_VERSION << " embedded=ltc,doge,nmc\n";
+            std::cout << "c2pool-ltc " << C2POOL_VERSION << " tls=" << tls << " embedded=ltc,doge,nmc\n";
 #else
-            std::cout << "c2pool-ltc dev embedded=ltc,doge,nmc\n";
+            std::cout << "c2pool-ltc dev tls=" << tls << " embedded=ltc,doge,nmc\n";
 #endif
             return 0;
         }
@@ -1053,7 +1075,7 @@ int main(int argc, char* argv[]) {
     bool max_outgoing_conns_set = false;
 
     // Redistribute mode for shares from unnamed/broken miners
-    std::string redistribute_mode_str = "pplns";
+    std::string redistribute_mode_str = ltc::kDefaultRedistributeMode;   // --redistribute (split)
 
     // Stratum tuning (configurable via CLI or YAML). The compiled defaults --
     // coin tag, idle keepalive-notify, and the zombie-session protections
@@ -1803,6 +1825,33 @@ int main(int argc, char* argv[]) {
             }
             cli_explicit.insert("stratum_http_per_ip");
         }
+        // --stratum-tls [HOST:]PORT / --stratum-tls-cert FILE / --stratum-tls-key
+        // FILE: the TLS stratum listener (core/stratum_tls.hpp); checked once
+        // every flag and setting is read (check_stratum_tls_settings).
+        else if (arg == "--stratum-tls" && i + 1 < argc) {
+            core::stratum_tls_setting().bind = argv[++i];
+            cli_explicit.insert("stratum_tls");
+        }
+        else if (arg == "--stratum-tls-cert" && i + 1 < argc) {
+            core::stratum_tls_setting().cert = argv[++i];
+            cli_explicit.insert("stratum_tls_cert");
+        }
+        else if (arg == "--stratum-tls-key" && i + 1 < argc) {
+            core::stratum_tls_setting().key = argv[++i];
+            cli_explicit.insert("stratum_tls_key");
+        }
+        else if ((arg == "--stratum-tls-rate-per-ip" || arg == "--stratum-tls-burst-per-ip"
+                  || arg == "--stratum-tls-handshakes" || arg == "--stratum-tls-handshakes-per-ip")
+                 && i + 1 < argc) {
+            std::string err;
+            if (!core::parse_stratum_tls_limit_flag(arg, argv[++i], core::stratum_tls_setting(), err)) {
+                LOG_ERROR << err;
+                return 1;
+            }
+            std::string key = arg.substr(2);   // "stratum_tls_handshakes", the YAML key
+            std::replace(key.begin(), key.end(), '-', '_');
+            cli_explicit.insert(key);
+        }
         // Operational tuning
         else if (arg == "--log-file" && i + 1 < argc) {
             log_file = argv[++i];
@@ -1849,7 +1898,11 @@ int main(int argc, char* argv[]) {
             cli_explicit.insert("dashboard_dir");
         }
         else if (arg == "--analytics-id" && i + 1 < argc) {
-            analytics_id = argv[++i];
+            if (!core::parse_analytics_id(argv[++i], analytics_id)) {
+                LOG_ERROR << "Bad value: --analytics-id " << argv[i]
+                          << " (expected a Google Analytics measurement ID, G-XXXXXXXXXX)";
+                return 1;
+            }
             cli_explicit.insert("analytics_id");
         }
         // Seed node: -n HOST:PORT (p2pool compat)
@@ -2097,6 +2150,23 @@ int main(int argc, char* argv[]) {
             if (!cli_explicit.count("stratum_http_per_ip") && cfg["stratum_http_per_ip"])
                 core::apply_stratum_http_count_setting("stratum_http_per_ip", cfg["stratum_http_per_ip"].as<int64_t>(),
                                                        stratum_http_limits.per_ip);
+            if (!cli_explicit.count("stratum_tls") && cfg["stratum_tls"])
+                core::stratum_tls_setting().bind = cfg["stratum_tls"].as<std::string>();
+            if (!cli_explicit.count("stratum_tls_cert") && cfg["stratum_tls_cert"])
+                core::stratum_tls_setting().cert = cfg["stratum_tls_cert"].as<std::string>();
+            if (!cli_explicit.count("stratum_tls_key") && cfg["stratum_tls_key"])
+                core::stratum_tls_setting().key = cfg["stratum_tls_key"].as<std::string>();
+            for (const char* k : {"stratum_tls_rate_per_ip", "stratum_tls_burst_per_ip",
+                                  "stratum_tls_handshakes", "stratum_tls_handshakes_per_ip"}) {
+                if (cli_explicit.count(k) || !cfg[k])
+                    continue;
+                std::string flag = std::string("--") + k;
+                std::replace(flag.begin(), flag.end(), '_', '-');
+                std::string err;
+                if (!core::parse_stratum_tls_limit_flag(flag, cfg[k].as<std::string>(),
+                                                        core::stratum_tls_setting(), err))
+                    LOG_WARNING << "config: " << k << " ignored: " << err;
+            }
 
             // Operational tuning
             if (!cli_explicit.count("log_file") && cfg["log_file"])
@@ -2122,7 +2192,8 @@ int main(int argc, char* argv[]) {
             if (!cli_explicit.count("dashboard_dir") && cfg["dashboard_dir"])
                 dashboard_dir = cfg["dashboard_dir"].as<std::string>();
             if (!cli_explicit.count("analytics_id") && cfg["analytics_id"])
-                analytics_id = cfg["analytics_id"].as<std::string>();
+                core::apply_analytics_id_setting("analytics_id", cfg["analytics_id"].as<std::string>(),
+                                                 analytics_id);
             if (cfg["explorer"])
                 explorer_enabled = cfg["explorer"].as<bool>();
             if (cfg["explorer_url"])
@@ -2248,6 +2319,9 @@ int main(int argc, char* argv[]) {
         // Apply file-sourced (L1) values into the locals the node consumes.
         if (rc.file_set("web.port"))         http_port  = static_cast<int>(rc.get_u16("web.port").value_or(static_cast<uint16_t>(http_port)));
         if (rc.file_set("web.host"))         http_host  = rc.get_string("web.host").value_or(http_host);
+        if (rc.file_set("web.analytics_id"))   // --analytics-id: a bad value is warned about and ignored
+            core::apply_analytics_id_setting("web.analytics_id", rc.get_string("web.analytics_id").value_or(""),
+                                             analytics_id);
         if (rc.file_set("stratum.http") && !cli_explicit.count("stratum_http"))   // true / false / auto
             core::apply_stratum_http_setting(rc.get_string("stratum.http").value_or(""), stratum_http_mode);
         if (rc.file_set("stratum.http_budget") && !cli_explicit.count("stratum_http_budget"))
@@ -2256,6 +2330,8 @@ int main(int argc, char* argv[]) {
         if (rc.file_set("stratum.http_per_ip") && !cli_explicit.count("stratum_http_per_ip"))
             core::apply_stratum_http_count_setting("stratum.http_per_ip", rc.get_i64("stratum.http_per_ip"),
                                                    stratum_http_limits.per_ip);
+        // --stratum-tls, -cert, -key and the four TLS limits (stratum.tls_*).
+        core::apply_stratum_tls_file_settings(rc, core::stratum_tls_setting());
         if (rc.file_set("stratum.bind")) {
             std::string v = rc.get_string("stratum.bind").value_or("");
             auto colon = v.rfind(':'); std::string p = (colon == std::string::npos) ? v : v.substr(colon + 1);
@@ -2270,6 +2346,17 @@ int main(int argc, char* argv[]) {
                 v3601_activation_time = static_cast<uint64_t>(*v);
         }
     }
+
+    // --stratum-tls / --stratum-tls-cert / --stratum-tls-key (command line,
+    // YAML, settings file): a complete set this build supports, whose
+    // certificate and key load; else refused here, before anything starts.
+    if (auto why = core::check_stratum_tls_settings(core::stratum_tls_setting())) {
+        LOG_ERROR << *why;
+        std::cerr << "c2pool: " << *why << std::endl;
+        return 1;
+    }
+    if (sharechain_mode && core::stratum_tls_setting().any_set())
+        LOG_WARNING << "--stratum-tls has no effect with --sharechain (no stratum listener)";
 
     // WAIT mode: block genesis share creation until peers deliver the
     // sharechain.  GENESIS/AUTO start unlocked.  Set to true after
@@ -2770,12 +2857,17 @@ int main(int argc, char* argv[]) {
             // (--redistribute), as p2pool does, not refused.
             stratum_config.redistribute_unusable_logins = true;
             // The merged addresses of the operator's own shares (node-fee
-            // shares, redistributed shares landing on the operator's key):
-            // p2pool's --merged-operator-address cascade, per merged chain.
-            if (node_owner_fee > 0.0 && !node_owner_address.empty() && !merged_chain_specs.empty()) {
+            // shares, redistributed shares landing on the operator's key,
+            // split shares): p2pool's --merged-operator-address cascade, per
+            // merged chain.
+            // `donation`: the merged donation the cascade pays when the owner's
+            // key is not converted (the node fee: the combined P2SH, which the
+            // aux coinbase folds into its donation; split: the aux coinbase's
+            // donation key, c2pool::merged::merged_donation_script()).
+            const auto owner_merged_scripts = [&](const std::string& owner_address, const std::string& payout_what,
+                                                  const std::string& shares_what, bool p2sh_key_pays_donation,
+                                                  const std::vector<unsigned char>& donation) {
                 std::map<uint32_t, std::vector<unsigned char>> op_scripts;
-                const std::vector<unsigned char> donation(ltc::PoolConfig::COMBINED_DONATION_SCRIPT.begin(),
-                                                          ltc::PoolConfig::COMBINED_DONATION_SCRIPT.end());
                 for (const auto& spec : merged_chain_specs) {
                     const auto c1 = spec.find(':');
                     if (c1 == std::string::npos)
@@ -2788,16 +2880,65 @@ int main(int argc, char* argv[]) {
                     const auto o = c2pool::merged::resolve_operator_merged_script(
                         sym, settings->m_testnet ? c2pool::merged::AuxNetwork::testnet
                                                  : c2pool::merged::AuxNetwork::mainnet,
-                        node_owner_address, node_owner_merged_address,
-                        ov != merged_payout_addresses.end() ? ov->second : std::string(), donation);
+                        owner_address, node_owner_merged_address,
+                        ov != merged_payout_addresses.end() ? ov->second : std::string(), donation,
+                        p2sh_key_pays_donation);
                     if (!o.warning.empty())
-                        LOG_WARNING << "[MM:" << sym << "] " << o.warning << ": the node fee's " << sym
+                        LOG_WARNING << "[MM:" << sym << "] " << o.warning << ": the " << payout_what << "'s " << sym
                                     << " payout uses " << o.source;
-                    LOG_INFO << "[MM:" << sym << "] node-fee shares pay " << sym << " to the operator ("
+                    LOG_INFO << "[MM:" << sym << "] " << shares_what << " shares pay " << sym << " to the operator ("
                              << o.source << ")";
                     op_scripts[cid] = o.script;
                 }
-                web_server.get_mining_interface()->set_operator_merged_scripts(std::move(op_scripts));
+                return op_scripts;
+            };
+            if (node_owner_fee > 0.0 && !node_owner_address.empty() && !merged_chain_specs.empty())
+                web_server.get_mining_interface()->set_operator_merged_scripts(
+                    owner_merged_scripts(node_owner_address, "node fee", "node-fee", false,
+                                         std::vector<unsigned char>(ltc::PoolConfig::COMBINED_DONATION_SCRIPT.begin(),
+                                                                    ltc::PoolConfig::COMBINED_DONATION_SCRIPT.end())));
+            // --redistribute split (the default): work the node cannot
+            // attribute to a payout address (no usable login address, a payout
+            // a share cannot carry with no DOGE address given, the job built
+            // before the login) pays the node owner and the donation half and
+            // half: the share pays the owner with donation
+            // core::kSplitShareDonation (32768 of 65535), on LTC and on every
+            // merged chain (a P2SH owner without its merged address: that
+            // chain's half to the donation). The owner is the node fee's:
+            // --node-owner-address, else --address. None usable on LTC: the
+            // owner half cannot be paid, and this node runs the spec's other
+            // terms, or pplns (logged once, here).
+            {
+                // The split shares' merged donation: the aux coinbase's
+                // donation key (merged_donation.hpp).
+                const std::vector<unsigned char>& merged_donation = c2pool::merged::merged_donation_script();
+                const auto split = ltc::setup_split_owner(
+                    *web_server.get_mining_interface(), redistribute_mode_str, node_owner_address, payout_address,
+                    ltc::address_acceptance(settings->m_testnet),
+                    [&](const std::string& owner) {
+                        return merged_chain_specs.empty()
+                                   ? std::map<uint32_t, std::vector<unsigned char>>{}
+                                   : owner_merged_scripts(owner, "split owner", "split", true, merged_donation);
+                    },
+                    merged_donation);
+                if (split.selected && split.hybrid)
+                    LOG_WARNING << "--redistribute " << redistribute_mode_str << ": split is not a hybrid weight"
+                                << " (it pays every such share half and half, not some of them): "
+                                << (split.owner_set ? "using split" : "without an owner, the other terms run");
+                if (split.owner_set)
+                    LOG_INFO << "Redistribute split: unattributable work pays the node owner " << split.owner
+                             << " and the donation half and half (share donation " << core::kSplitShareDonation
+                             << "/65535 instead of --give-author's), LTC and merged chains";
+                else if (split.selected)
+                    LOG_WARNING << "--redistribute split: "
+                                << (split.owner.empty()
+                                        ? std::string("no node-owner address (--node-owner-address or --address)")
+                                        : "the node-owner address " + split.owner
+                                              + " is not an LTC P2PKH/P2SH/P2WPKH address of this network")
+                                << ": the owner half cannot be paid; unattributable work falls back to "
+                                << ltc::format_hybrid_weights(ltc::split_fallback_weights(
+                                       ltc::parse_redistribute_spec(redistribute_mode_str)))
+                                << " on this node";
             }
             web_server.get_mining_interface()->set_stratum_config(stratum_config);
             if (fd_limit_known)
@@ -2847,6 +2988,7 @@ int main(int argc, char* argv[]) {
             web_server.set_stratum_port(static_cast<uint16_t>(stratum_port));
             web_server.set_stratum_http_mode(stratum_http_mode);
             web_server.set_stratum_http_limits(stratum_http_limits);
+            web_server.set_stratum_tls(core::stratum_tls_setting());   // --stratum-tls
             // Start HTTP server immediately so loading page is served during sync.
             // Stratum won't have valid work yet, but that's fine — miners retry.
             web_server.start();
@@ -7397,7 +7539,8 @@ int main(int argc, char* argv[]) {
                     bool segwit_active, const std::string& witness_commitment_hex,
                     const uint256& witness_root,
                     const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs,
-                    const std::vector<uint256>& merkle_branches)
+                    const std::vector<uint256>& merkle_branches,
+                    const std::optional<uint16_t>& share_donation)
                     -> core::MiningInterface::RefHashResult
                 {
                     auto guard = p2p_node->read_tracker();
@@ -7440,7 +7583,9 @@ int main(int argc, char* argv[]) {
                     params.subsidy = subsidy;
                     // donation = round(65535 * percentage / 100)
                     // Matches p2pool: math.perfect_round(65535*self.donation_percentage/100)
-                    params.donation = static_cast<uint16_t>(std::round(65535.0 * dev_donation / 100.0));
+                    // A split job (decide_job_payout, --redistribute split)
+                    // carries its own: the share's donation, not added to it.
+                    params.donation = core::job_share_donation(share_donation, dev_donation);
                     params.desired_version = desired_ver;
 
                     // Per-miner desired_target (p2pool-merged-v36 work.py get_work
@@ -7466,7 +7611,7 @@ int main(int argc, char* argv[]) {
                     target_in.local_hash_rate = local_hash_rate;
                     target_in.share_period = ltc::PoolConfig::share_period();
                     target_in.subsidy = subsidy;
-                    target_in.donation_percent = dev_donation;
+                    target_in.donation_percent = core::job_share_donation_pct(share_donation, dev_donation);
                     target_in.dust_threshold = ltc::PoolConfig::dust_threshold();
                     target_in.spread = ltc::PoolConfig::SPREAD;
                     target_in.block_bits = bits;
@@ -7825,7 +7970,9 @@ int main(int argc, char* argv[]) {
                         prev_share,
                         p.merkle_branches,
                         p.payout_script,
-                        static_cast<uint16_t>(std::round(65535.0 * dev_donation / 100.0)),  // donation from --give-author
+                        // The job's donation (a split job), else --give-author's:
+                        // the one its ref_hash committed to.
+                        core::job_share_donation(p.share_donation, dev_donation),
                         merged_addrs,
                         stale,
                         p.segwit_active,
@@ -10005,12 +10152,14 @@ int main(int argc, char* argv[]) {
                 // Solo: proportional split by stratum hashrates.
                 auto owner_script_mm = core::address_to_script(payout_address);
                 mm_manager->set_payout_provider(
-                    [&web_server, mi, custodial_mode, owner_script_mm,
+                    [&web_server, custodial_mode, owner_script_mm,
                      dev_donation, node_owner_fee, &payout_address](
                         uint32_t chain_id, uint64_t coinbase_value)
                     -> std::vector<std::pair<std::vector<unsigned char>, uint64_t>>
                 {
-                    auto& donation_script = mi->get_donation_script();
+                    // The aux coinbase's donation (merged_donation.hpp), not
+                    // the parent coinbase's (MiningInterface's donation script).
+                    const auto& donation_script = c2pool::merged::merged_donation_script();
 
                     // Donation (dev_donation% or 1 satoshi marker)
                     uint64_t donation_amount = (dev_donation > 0)
@@ -10081,15 +10230,14 @@ int main(int argc, char* argv[]) {
                 // share the jobs build on: V36 peers re-derive the payouts
                 // from the share's prev share.
                 auto merged_payout_source = mm_manager->payout_source();
-                auto combined_donation = std::vector<unsigned char>(
-                    ltc::PoolConfig::COMBINED_DONATION_SCRIPT.begin(),
-                    ltc::PoolConfig::COMBINED_DONATION_SCRIPT.end());
+                const std::vector<unsigned char> merged_donation = c2pool::merged::merged_donation_script();
                 // The weights of `best` for a merged chain, as a payout
-                // source entry. Merged chains always use
-                // COMBINED_DONATION_SCRIPT (P2SH) regardless of share version
-                // (p2pool data.py line 303); the parent chain uses the
+                // source entry. The merged chains' donation and PPLNS
+                // remainder go to the aux coinbase's donation script, the
+                // single P2PKH key, whatever the share version
+                // (merged_donation.hpp); the parent chain uses the
                 // version-dependent donation.
-                auto merged_weights = [combined_donation](
+                auto merged_weights = [merged_donation](
                     ltc::ShareTracker& tracker, const uint256& best, uint32_t chain_id)
                     -> c2pool::merged::MergedPayoutSource::Weights
                 {
@@ -10101,9 +10249,9 @@ int main(int argc, char* argv[]) {
                     auto w = std::make_shared<const ltc::MergedPayoutWeights>(
                         tracker.get_merged_payout_weights(best, chain_id));
                     out.chain_len = w->chain_len;
-                    out.derive = [w, combined_donation](uint64_t coinbase_value) {
+                    out.derive = [w, merged_donation](uint64_t coinbase_value) {
                         return ltc::ShareTracker::merged_payout_outputs(*w, coinbase_value,
-                                                                         combined_donation);
+                                                                         merged_donation);
                     };
                     out.origins = [w]() { return ltc::ShareTracker::merged_payout_origins(*w); };
                     return out;
@@ -10336,10 +10484,15 @@ int main(int argc, char* argv[]) {
             auto pool_monitor = std::make_unique<ltc::PoolMonitor>();
 
             // Redistribute mode for invalid/empty miner addresses (V2: hybrid support)
-            auto hybrid_weights = ltc::parse_redistribute_spec(redistribute_mode_str);
+            // split: decided by the MiningInterface (set_split_owner above);
+            // the Redistributor runs the spec's other terms (pplns for split
+            // alone), used only when no owner could be set.
+            auto hybrid_weights = ltc::split_fallback_weights(ltc::parse_redistribute_spec(redistribute_mode_str));
             auto redistributor = std::make_unique<ltc::Redistributor>();
             redistributor->set_hybrid_weights(hybrid_weights);
-            LOG_INFO << "Redistribute mode: " << ltc::format_hybrid_weights(hybrid_weights);
+            LOG_INFO << "Redistribute mode: "
+                     << (web_server.get_mining_interface()->has_split_owner()
+                             ? std::string("split") : ltc::format_hybrid_weights(hybrid_weights));
 
             // Set operator identity for "fee" and "boost" modes.
             // get_node_fee_hash160() extracts the hash160 from the fee scriptPubKey
@@ -11703,6 +11856,7 @@ int main(int argc, char* argv[]) {
             solo_server.set_stratum_port(static_cast<uint16_t>(stratum_port));  // Set the correct Stratum port
             solo_server.set_stratum_http_mode(stratum_http_mode);   // no web server here: auto = off
             solo_server.set_stratum_http_limits(stratum_http_limits);
+            solo_server.set_stratum_tls(core::stratum_tls_setting());   // --stratum-tls
             solo_server.get_mining_interface()->set_stratum_config(stratum_config);
             if (!solo_address.empty()) {
                 solo_server.set_solo_address(solo_address);

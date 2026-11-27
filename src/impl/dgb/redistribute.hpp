@@ -117,6 +117,35 @@ inline std::vector<HybridWeight> parse_redistribute_spec(const std::string& spec
     return result;
 }
 
+// A spec naming "split" (alone or as a hybrid term). The LTC and DASH
+// default, --redistribute split (half the share's weight to the node owner,
+// half to the donation), is not available on DGB yet: it needs the payout and
+// the donation decided when the job is built, and DGB decides the
+// redistributed payout at submit time. Such a spec binds no policy (as
+// without --redistribute) and is warned about; it is never read as pplns
+// (parse_single_mode's fallback for an unknown mode).
+inline bool spec_names_split(const std::string& spec)
+{
+    std::istringstream ss(spec);
+    std::string token;
+    while (std::getline(ss, token, ',')) {
+        std::string mode = token.substr(0, token.find(':'));
+        const auto first = mode.find_first_not_of(" \t");
+        const auto last = mode.find_last_not_of(" \t");
+        mode = first == std::string::npos ? std::string() : mode.substr(first, last - first + 1);
+        if (mode == "split")
+            return true;
+    }
+    return false;
+}
+
+// Whether --redistribute SPEC binds a Redistributor: a spec is given, and it
+// does not name split (spec_names_split).
+inline bool binds_redistributor(const std::string& spec)
+{
+    return !spec.empty() && !spec_names_split(spec);
+}
+
 // Backward-compatible: returns the primary mode (first/only entry)
 inline RedistributeMode parse_redistribute_mode(const std::string& spec)
 {

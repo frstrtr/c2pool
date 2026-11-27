@@ -64,6 +64,8 @@
 #include "config_pool.hpp"      // bch::PoolConfig::get_donation_script
 #include "coin/template_builder.hpp" // bch::coin::get_block_subsidy (display Current Payouts subsidy)
 #include "dashboard_pplns.hpp"  // bch::dashboard::pplns_payouts_current — pool-wide Current Payouts read-model (#1508, read-only)
+#include "dashboard_sharechain.hpp" // bch::dashboard window / delta / tip / share detail / stats (read-only)
+#include "dashboard_start.hpp"      // bch::start_dashboard (a failed bind keeps the server)
 #include "config_coin.hpp"      // bch::address_acceptance (#961 cross-lane payout publish)
 #include "coin/cashaddr.hpp"    // bch::coin::cashaddr::register_cashaddr_decoder (#961 CashAddr payout)
 #include "share_check.hpp"      // bch::create_local_share (transitive via node.hpp)
@@ -78,12 +80,16 @@
 #include <core/log.hpp>
 #include <core/stratum_server.hpp>
 #include <core/web_server.hpp>       // H-STATS.944: operator dashboard + graph_db persist
+#include <core/analytics_tag.hpp>    // --analytics-id (core::analytics_id_setting)
 #include <core/config_endpoint.hpp>  // M1 control-plane READ-ONLY endpoints
 #include <core/filesystem.hpp>      // config_path() for the graph_db location
 #include <core/found_block_lookups.hpp> // header-bits difficulty by block hash
+#include <core/hash.hpp>               // Hash (SHA256d) for the Best Share card hash
 #include <functional>
 #include <ctime>       // std::time (found-block record timestamp)
 #include <limits>       // std::numeric_limits (RPC-fallback sentinel)
+#include <map>
+#include <mutex>
 #include <optional>     // std::optional (winner_at oracle)
 
 #include <btclibs/util/strencodings.h>   // HexStr
@@ -857,6 +863,7 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
         // src/impl/bch only (PER-COIN ISOLATION); zero src/core edits.
         mi->set_dashboard_always_ready(true);
         web_server->set_dashboard_dir("web-static");
+        web_server->set_analytics_id(core::analytics_id_setting());   // --analytics-id (default off)
 
         // D-BCH dashboard feeds (integrator 2026-08-03): wire the live BCH
         // data sources into the MiningInterface the H-STATS.944 seam already
@@ -890,16 +897,128 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
         mi->set_peer_info_fn([&node]() { return node.get_peer_info_json(); });
         //   pool hashrate -- lock-free tracker snapshot published by think().
         mi->set_pool_hashrate_fn([&node]() { return node.get_tracker_snapshot().pool_hashrate; });
-        //   sharechain stats -- chain/verified/head counts + hashrate.
-        mi->set_sharechain_stats_fn([&node]() {
-            auto s = node.get_tracker_snapshot();
-            return nlohmann::json{
-                {"chain_count", s.chain_count},
-                {"verified_count", s.verified_count},
-                {"head_count", s.head_count},
-                {"pool_hashrate", s.pool_hashrate},
-            };
+        //   best share -- the verified best head the stratum jobs build on
+        //   (/web/best_share_hash, /web/sync_status has_best_share). Read
+        //   under the tracker read guard; the last answer while it is busy.
+        struct LastHash { std::mutex m; uint256 h; };
+        auto last_best = std::make_shared<LastHash>();
+        mi->set_best_share_hash_fn([&node, last_best]() -> uint256 {
+            auto guard = node.read_tracker();
+            std::lock_guard<std::mutex> l(last_best->m);
+            if (guard) last_best->h = node.best_share_hash();
+            return last_best->h;
         });
+        //   sharechain stats -- the LTC-family key set every stats consumer
+        //   reads (/global_stats current_height + unique miners,
+        //   /version_signaling, /v36_status, /web/sync_status chain_size,
+        //   /miner_stats, /best_share), walked under the read guard
+        //   (bch::dashboard::chain_stats); the last full result while the
+        //   tracker is busy. Also feeds the network difficulty off the
+        //   embedded header tip (/global_stats network difficulty and hash
+        //   rate, the difficulty graph), as a stratum template would.
+        struct LastDoc { std::mutex m; nlohmann::json j = nlohmann::json::object(); };
+        auto last_stats = std::make_shared<LastDoc>();
+        mi->set_sharechain_stats_fn([&node, &daemon, mi, last_stats]() -> nlohmann::json {
+            if (auto tip = daemon.chain().tip())
+                mi->update_network_difficulty(
+                    chain::target_to_difficulty(chain::bits_to_target(tip->header.m_bits)),
+                    "bch-header-tip");
+            const auto snap = node.get_tracker_snapshot();
+            nlohmann::json out;
+            std::optional<int> live_ver;
+            {
+                auto guard = node.read_tracker();
+                if (guard) {
+                    out = bch::dashboard::chain_stats(*guard);
+                    const uint256 best = node.best_share_hash();
+                    if (!best.IsNull() && guard->chain.contains(best)) {
+                        guard->chain.get_share(best).invoke([&](auto* sh) {
+                            using ST = std::remove_pointer_t<decltype(sh)>;
+                            live_ver = static_cast<int>(ST::version);
+                        });
+                    }
+                }
+            }
+            std::lock_guard<std::mutex> l(last_stats->m);
+            if (out.is_null()) {
+                out = last_stats->j;
+            } else {
+                if (live_ver) {
+                    out["live_share_version"] = *live_ver;
+                    mi->set_cached_share_version(*live_ver);
+                } else if (last_stats->j.contains("live_share_version")) {
+                    out["live_share_version"] = last_stats->j["live_share_version"];
+                }
+                last_stats->j = out;
+            }
+            out["chain_count"]    = snap.chain_count;
+            out["verified_count"] = snap.verified_count;
+            out["head_count"]     = snap.head_count;
+            out["pool_hashrate"]  = snap.pool_hashrate;
+            return out;
+        });
+        // A sharechain walk: refreshed when the tip moves, not every pump tick.
+        mi->mark_last_cache_tip_driven();
+
+        //   block value -- MINERS BLOCK VALUE / NODE FEE cards and
+        //   attempts-to-block. This MI has no IMiningNode, so refresh_work()
+        //   never fills a template; project the next block off the embedded
+        //   header tip and the BCH subsidy (main_btc.cpp's projection). BCH has
+        //   no protocol outputs: the whole subsidy is the miners'. Fees are
+        //   not in a projection (block_value_basis "projected").
+        mi->set_coin_work_fn([&daemon]() -> core::MiningInterface::CoinWorkInfo {
+            core::MiningInterface::CoinWorkInfo info;
+            auto tip = daemon.chain().tip();
+            const uint32_t height = daemon.chain().height();
+            if (!tip || height == 0) return info;
+            info.valid              = true;
+            info.projected          = true;
+            info.height             = height + 1;
+            info.coinbase_value_sat = bch::coin::get_block_subsidy(height + 1);
+            info.network_difficulty =
+                chain::target_to_difficulty(chain::bits_to_target(tip->header.m_bits));
+            info.template_age_sec   = -1;
+            return info;
+        });
+
+        //   stratum workers -- the BCHWorkSource session registry
+        //   (/stratum_stats, /local_stats miners, the worker graphs). The
+        //   sessions register on the work source, not on this MI.
+        mi->set_stratum_workers_fn([ws = work_source.get()]() {
+            return ws ? ws->snapshot_stratum_workers()
+                      : std::map<std::string, core::stratum::WorkerInfo>{};
+        });
+        mi->set_stratum_hashrate_fn([ws = work_source.get()]() -> double {
+            if (!ws) return 0.0;
+            double total = 0.0;
+            for (const auto& [id, w] : ws->snapshot_stratum_workers()) { (void)id; total += w.hashrate; }
+            return total;
+        });
+        // Best Share card: every accepted pseudoshare's achieved difficulty
+        // (the stratum session reports it to the work source, which had no
+        // sink, so the card stayed empty with rigs hashing). The card's hash
+        // is the share's SHA256d header hash, rebuilt from the submit fields
+        // when the share can set a record.
+        work_source->set_best_pseudoshare_fn(
+            [mi](double diff, const std::string& miner,
+                 const std::string& coinb1, const std::string& coinb2,
+                 const std::string& en1, const std::string& en2,
+                 const std::string& ntime, const std::string& nonce,
+                 uint32_t version, const std::string& prevhash_hex,
+                 const std::string& nbits_hex, const std::vector<std::string>& branches) {
+                // Almost every pseudoshare is below every leg: rebuild the
+                // hash only for one that can set a record.
+                if (!mi->beats_best_difficulty(diff, /*update_merged=*/false))
+                    return;
+                std::string pow_hex;
+                const uint256 merkle_root = core::MiningInterface::reconstruct_merkle_root(
+                    coinb1 + en1 + en2 + coinb2, branches);
+                const auto header = core::MiningInterface::build_header_bytes(
+                    version, prevhash_hex, merkle_root, ntime, nbits_hex, nonce);
+                if (header.size() == 80)
+                    pow_hex = Hash(std::span<const unsigned char>(header.data(), header.size())).GetHex();
+                mi->update_best_difficulty(diff, miner, pow_hex, /*update_merged=*/false);
+            });
 
         // ── Pool-wide "Current Payouts" (#1508 read-model wiring, #939 seam) ─
         // Lights /current_payouts + /current_merged_payouts (the main dashboard
@@ -921,7 +1040,7 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
         // blocks and never takes a long-held lock on the payout map. Read-only:
         // touches no mutable/verified state, sends no wire bytes, builds no
         // coinbase. Display-only — zero consensus/reward/wire change.
-        mi->set_current_payouts_fn([&node, &daemon, is_testnet]() -> nlohmann::json {
+        auto current_pplns = [&node, &daemon, is_testnet]() -> nlohmann::json {
             // Difficulty-epoch bits + subsidy from the embedded BCH header tip
             // (its OWN mutex, not the tracker's — read BEFORE the tracker guard).
             // A cold/absent header follower yields bits==0 -> honest-empty {}.
@@ -956,6 +1075,109 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
 
             return bch::dashboard::pplns_payouts_current(
                 *guard, best, ver, block_bits, subsidy, is_testnet);
+        };
+        mi->set_current_payouts_fn(current_pplns);
+
+        // ── Sharechain explorer + share page ──────────────────────────────────
+        // /sharechain/window (the explorer grid), /sharechain/tip (its update
+        // poll), /sharechain/delta (its live updates) and /web/share/<hash>
+        // (share.html), from bch::dashboard (dashboard_sharechain.hpp) in the
+        // field shape the LTC/BTC nodes serve. Each feeder copies what it needs
+        // under ONE node.read_tracker() guard (busy -> the last document
+        // served, or the not-found error for a share lookup) and builds the
+        // JSON after releasing it. current_pplns() and get_found_blocks() take
+        // their own locks, so they run before the guard, never inside it.
+        auto found_share_hashes = [mi]() {
+            std::vector<std::string> out;
+            for (const auto& fb : mi->get_found_blocks()) {
+                const std::string sh = mi->found_block_share_hash(fb);
+                if (!sh.empty()) out.push_back(sh);
+            }
+            return out;
+        };
+        auto last_window = std::make_shared<LastDoc>();
+        mi->set_sharechain_window_fn(
+            [&node, mi, current_pplns, found_share_hashes, last_window, is_testnet]()
+            -> nlohmann::json {
+            auto cur = current_pplns();
+            const auto found = found_share_hashes();
+            core::sharechain_views::ChainSnapshot snap;
+            {
+                auto guard = node.read_tracker();
+                if (!guard) {
+                    std::lock_guard<std::mutex> l(last_window->m);
+                    return last_window->j;
+                }
+                snap = bch::dashboard::window_snapshot(*guard);
+            }
+            std::string my_address;
+            if (!mi->get_payout_address().empty()) {
+                auto script = core::address_to_script(mi->get_payout_address());
+                if (!script.empty())
+                    my_address = core::sharechain_views::script_address(script, is_testnet);
+            }
+            nlohmann::json result = core::sharechain_views::window_json(
+                snap, PoolConfig::chain_length(), my_address, mi->get_node_fee_hash160(),
+                found, is_testnet);
+            // The pool-wide split as the treemap's source for every share
+            // (pplns_current) and keyed by the tip's short hash (pplns), as BTC.
+            if (cur.is_object() && !cur.empty()) {
+                if (!snap.best.IsNull())
+                    result["pplns"] = {{ snap.best.GetHex().substr(0, 16), cur }};
+                result["pplns_current"] = std::move(cur);
+            }
+            std::lock_guard<std::mutex> l(last_window->m);
+            last_window->j = result;
+            return result;
+        });
+        // Two window walks (the split and the rows): refreshed when the tip
+        // moves, not every pump tick. The explorer's live updates come from
+        // /sharechain/tip and /sharechain/delta.
+        mi->mark_last_cache_tip_driven();
+        // The tip-driven caches (stats, window) refresh when the best share
+        // changes; the pump's 30 s fallback covers a quiet chain. The node
+        // calls this on its IO thread with no tracker lock held, and clears it
+        // in stop_for_teardown() before the web server goes.
+        node.set_on_best_share_changed([mi]() { mi->refresh_tip_sensitive_caches(); });
+
+        struct LastTip { std::mutex m; std::optional<core::SharechainTip> t; };
+        auto last_tip = std::make_shared<LastTip>();
+        mi->set_sharechain_tip_fn([&node, last_tip]() -> std::optional<core::SharechainTip> {
+            auto guard = node.read_tracker();
+            std::lock_guard<std::mutex> l(last_tip->m);
+            if (guard)
+                last_tip->t = core::sharechain_views::tip_of(*guard);
+            return last_tip->t;
+        });
+
+        mi->set_sharechain_delta_fn(
+            [&node, mi, found_share_hashes, is_testnet](const std::string& since) -> nlohmann::json {
+            const auto found = found_share_hashes();
+            core::sharechain_views::ChainSnapshot snap;
+            {
+                auto guard = node.read_tracker();
+                if (!guard) return nlohmann::json::object();
+                snap = bch::dashboard::delta_snapshot(*guard, since);
+            }
+            return core::sharechain_views::delta_json(snap, mi->get_node_fee_hash160(), found,
+                                                      is_testnet);
+        });
+
+        mi->set_share_lookup_fn([&node, mi, is_testnet](const std::string& hash_hex)
+                                    -> nlohmann::json {
+            const auto found = mi->get_found_blocks();
+            nlohmann::json detail;
+            {
+                auto guard = node.read_tracker();
+                if (!guard) return nlohmann::json{{"error", "tracker busy"}};
+                detail = bch::dashboard::share_detail(*guard, hash_hex, is_testnet);
+            }
+            if (detail.contains("error")) return detail;
+            core::sharechain_views::add_found_block_fields(detail, found,
+                [mi](const core::MiningInterface::FoundBlock& fb) {
+                    return mi->is_primary_found_block(fb);
+                });
+            return detail;
         });
 
         // ââ Found-block verifier: confirm/orphan a won block vs the chain ââ
@@ -1075,7 +1297,9 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
             LOG_INFO << "[BCH-POOL] graph_db stats persistence -> " << graph_db_path;
         }
 
-        if (web_server->start()) {
+        // A failed bind keeps the server (dashboard_start.hpp): the hooks
+        // installed above hold `mi` for the whole run.
+        if (start_dashboard(web_server, http_addr, http_port)) {
             // LTC-parity site 3/3: periodic save_stat_log every 100s (matches
             // p2pool graph_db + main_ltc.cpp:7429). Self-rescheduling steady_timer
             // on the SAME ioc the run-loop drives; captured by shared_ptr so it
@@ -1092,10 +1316,6 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
             stats_timer->async_wait(*save_fn);
             LOG_INFO << "[BCH-POOL] dashboard live on http://" << http_addr << ":"
                      << http_port << " (graph_db persist every 100s).";
-        } else {
-            LOG_ERROR << "[BCH-POOL] WebServer FAILED to bind " << http_addr << ":"
-                      << http_port << " -- dashboard disabled, run-loop continues.";
-            web_server.reset();
         }
         } // if (mi != nullptr)
     } else {
@@ -1106,6 +1326,8 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
         core::configure_stratum_http(*stratum_server, web_server.get(),
                                      core::stratum_http_mode_setting(),
                                      core::stratum_http_limits_setting());
+    // The TLS stratum listener (--stratum-tls), when set.
+    core::configure_stratum_tls(stratum_server.get(), core::stratum_tls_setting());
 
     // Periodic think/clean tick (every 5s, safety net) — mirrors the LTC/dash
     // tick. Without it, think() fired only on share arrival: no stale-head

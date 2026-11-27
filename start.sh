@@ -129,11 +129,14 @@ if [ "$USE_CONFIG" = 1 ]; then
     [ -n "$SP" ] && STRATUM_PORT="$SP"
 fi
 # A web/stratum port given in EXTRA_ARGS wins (the parsers keep the last value).
+# --analytics-id ID is also given to the explorer, so its pages carry the tag.
 prev=""
+ANALYTICS_ID=""
 for a in "$@"; do
     case "$prev" in
         --web-port|--http-port|--http) WEB_PORT="${a##*:}" ;;
         --stratum|-w|--worker-port|--stratum-port) STRATUM_PORT="${a##*:}" ;;
+        --analytics-id) ANALYTICS_ID="$a" ;;
     esac
     prev="$a"
 done
@@ -157,6 +160,9 @@ case "$COIN" in
         EXPLORER_NOTE="not available for $BIN_NAME (no explorer API)"
         ;;
 esac
+if [ ${#EXPLORER_ARGS[@]} -gt 0 ] && [ -n "$ANALYTICS_ID" ]; then
+    EXPLORER_ARGS=("${EXPLORER_ARGS[@]}" --analytics-id "$ANALYTICS_ID")
+fi
 if [ ${#EXPLORER_ARGS[@]} -gt 0 ] && ! command -v python3 >/dev/null 2>&1; then
     EXPLORER_ARGS=()
     EXPLORER_NOTE="not started: python3 not found (install python3)"

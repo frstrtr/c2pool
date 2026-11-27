@@ -30,6 +30,7 @@
 #include <map>
 #include <mutex>
 #include <cctype>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -336,6 +337,10 @@ struct JobSnapshot {
     // merged scripts it committed to are the map passed with the snapshot.
     bool has_payout{false};
     std::vector<unsigned char> payout_script;
+    // The donation the job's shares carry when decide_job_payout set one (a
+    // split job: work the node cannot attribute, core::kSplitShareDonation);
+    // none: the node's own (--give-author). The job's ref_hash committed to it.
+    std::optional<uint16_t> share_donation;
 };
 
 /// Atomic snapshot of work-related fields under the work source's mutex.

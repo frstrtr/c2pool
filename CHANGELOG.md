@@ -2,6 +2,81 @@
 
 ## [Unreleased]
 
+### Unattributable work now pays 50% node owner / 50% donation (was spread over PPLNS)
+- `--redistribute split`, the new default (LTC with its merged chains, and
+  DASH): a share of work the node cannot attribute to a payout address (an
+  empty, invalid, other-coin or P2WSH/P2TR login naming no merged address;
+  the job sent right after `mining.subscribe`, built before the
+  login, whose shares can arrive after the authorize) pays the node owner
+  (`--node-owner-address`; on LTC else `--address`) with donation 32768/65535
+  instead of `--give-author`'s.
+  PPLNS splits each share's weight by its own donation field, so the owner and
+  the donation get half of it each, on LTC and on every merged chain (the
+  owner's merged address: `--node-owner-merged-address` for DOGE, else the
+  owner's key converted; a P2SH owner key is not converted, that chain's half
+  goes to the donation; an address the login names for a chain stays). Every
+  such share, deterministically; no consensus change.
+- Attributable work is never halved (p2pool's case 4, extended): a login
+  whose LTC address is invalid, empty, another coin's, or P2WSH/P2TR, and that
+  names a merged address (comma or slash form, a re-authorize of the same LTC
+  address, `mining.set_merged_addresses` after the authorize or before the
+  first authorize of a new connection) of a configured chain on this network
+  in P2PKH or P2SH form is paid on LTC to that address's key (DOGE's, else the
+  lowest configured chain's), with the node's donation, its merged addresses
+  as given. An address set while another login was accepted never counts.
+  Split applies only to a login naming no usable address.
+- Qt launcher: a saved pplns is no longer applied; re-select it if you want
+  it. A saved fee, boost or donate is kept; split is not passed on.
+- Without a usable node-owner address the owner half cannot be paid: the node
+  keeps the old `pplns` behaviour (a hybrid spec: its other terms), said once
+  at startup. `pplns`, `fee`, `boost` and `donate` are unchanged and still
+  selectable.
+- DGB is unchanged (`--redistribute` stays opt-in); a DGB spec naming `split`
+  is warned about and binds no policy.
+
+### --stratum-tls: a stratum listener that speaks TLS (stratum+ssl://)
+- On plain Stratum V1 a miner cannot verify who sends it work: anything on the
+  path can pose as the pool and take the hashrate. `--stratum-tls [HOST:]PORT`
+  (every coin; settings key `stratum.tls_bind`, LTC YAML `stratum_tls`) opens
+  a second stratum listener that speaks TLS, for firmware that connects with
+  `stratum+ssl://` and verifies the pool's certificate. `PORT` alone binds the
+  plain stratum listener's address. It needs `--stratum-tls-cert FILE` (PEM,
+  the full chain; `stratum.tls_cert`, `stratum_tls_cert`) and
+  `--stratum-tls-key FILE` (PEM, no passphrase; `stratum.tls_key`,
+  `stratum_tls_key`). Default: off; without the flags nothing changes.
+- A TLS connection is an ordinary session of the same stratum server after the
+  handshake: the same JSON-RPC, vardiff and limits, the caps counted together
+  with the plain port and keyed on the real remote address, the same refusal
+  log, drain mode, miner list and dashboard rows.
+- TLS 1.2 and 1.3 only (TLS 1.2 suites: ECDHE with AES-GCM or
+  ChaCha20-Poly1305), no compression, no renegotiation, no session
+  resumption, no client certificates. A handshake not done 10 s after the
+  accept, or one that fails, closes the connection; failures are counted and
+  logged at most once a minute.
+- The certificate and key are read again when either file's modification time
+  or size changes (checked at each new connection) and on SIGHUP. New
+  connections use the new pair, open ones keep theirs; a pair that does not
+  load is logged and the last good one stays in use.
+- New TLS connections are limited before the handshake: 200/s from all
+  addresses (burst 400), 5/s from one address or IPv6 /64 (burst 20), at most
+  32 handshakes in progress (8 per address); the per-address rate and burst
+  and both handshake limits are settings (`--stratum-tls-rate-per-ip`,
+  `--stratum-tls-burst-per-ip`, `--stratum-tls-handshakes`,
+  `--stratum-tls-handshakes-per-ip`; keys `stratum.tls_*`). Over a limit:
+  closed at the accept, counted, logged rate-limited per address (IPv6 /64).
+  At the handshake limit the oldest handshake in progress 1.5 s or more is
+  evicted for the new connection. No byte 3 s after the accept: closed. The
+  plain port is not limited. An ECDSA P-256 certificate is recommended.
+- HTTP on the stratum port (`--stratum-http`) stays on the plain port.
+- `--version` names `tls=on` or `tls=off` on every binary.
+- An incomplete set of flags, a host that is not an IP address, or a
+  certificate or key that does not load is refused at start.
+- Build: CMake option `C2POOL_STRATUM_TLS` (OpenSSL >= 1.1.1 via
+  `find_package(OpenSSL)`). Not set: ON on Linux when OpenSSL is found, OFF on
+  macOS and Windows. `C2POOL_STRATUM_TLS_STATIC_OPENSSL` (default ON) links
+  the static libraries, so no binary gains a shared-library dependency. A
+  build without TLS refuses the three flags.
+
 ### With --stratum-http on, the REST API answers on the stratum port too
 - python p2pool served its web API on the worker port, and p2pool-aware
   trackers (miningpoolstats and others) poll `http://host:<worker port>/global_stats`.

@@ -41,6 +41,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 #include <boost/asio.hpp>
@@ -51,6 +52,7 @@
 #include <btclibs/crypto/sha256.h>
 #include <btclibs/bech32.h>
 #include <btclibs/util/strencodings.h>
+#include <core/author_fee.hpp>
 #include <core/hash.hpp>
 #include <core/pack.hpp>
 #include <core/uint256.hpp>
@@ -59,6 +61,7 @@
 #include <core/merged_chain_addr.hpp>
 #include <core/stratum_server.hpp>
 #include <core/web_server.hpp>
+#include <impl/ltc/address_encoding.hpp>
 #include <impl/ltc/redistribute.hpp>
 #include <impl/ltc/share_check.hpp>
 #include <shared_mutex>
@@ -2158,10 +2161,12 @@ TEST(MergedAuxStratumLogin, TestnetSwappedLoginDoesNotCrossPay)
 }
 
 // An empty, invalid or other-coin primary is not usable: no merged address is
-// derived from it (p2pool never converts such a key), its shares are
-// redistributed by the work source; with a valid DOGE address of the node's
-// network as the comma second address, the parent payout is that address's
-// key (p2pool's case 4).
+// derived from it (p2pool never converts such a key). With a valid merged
+// address the login named (comma or slash form), the parent payout is that
+// address's key (p2pool's case 4, extended 2026-11-27: DOGE's, else the
+// lowest configured chain's; core::merged_addr::case4_parent over the
+// addresses the login named, which for an unusable primary are all of
+// r.addresses); with none its shares are redistributed by the work source.
 TEST(MergedAuxStratumLogin, UnusablePrimaryIsRedistributedOrCase4)
 {
     using namespace core::merged_addr;
@@ -2176,22 +2181,30 @@ TEST(MergedAuxStratumLogin, UnusablePrimaryIsRedistributedOrCase4)
         const auto r = login(u, "", {}, {98});
         EXPECT_FALSE(r.usable_primary) << "'" << u << "'";
         EXPECT_TRUE(r.addresses.empty()) << "'" << u << "'";
-        EXPECT_TRUE(r.parent_script.empty());
+        EXPECT_TRUE(case4_parent(r.addresses, table, [](uint32_t id) { return id == 98; }).script.empty());
     }
+    const auto c4 = [&](const LoginResolution& r, std::set<uint32_t> conf) {
+        return case4_parent(r.addresses, table, [conf](uint32_t id) { return conf.count(id) > 0; });
+    };
     // case 4: invalid primary, valid DOGE second (P2PKH and P2SH)
     auto r = login("notanaddress", b58(30, 0x21), {}, {98});
     EXPECT_FALSE(r.usable_primary);
-    EXPECT_EQ(r.parent_script, core::address_to_script(b58(30, 0x21)));
+    EXPECT_EQ(c4(r, {98}).script, core::address_to_script(b58(30, 0x21)));
+    EXPECT_EQ(c4(r, {98}).chain_id, 98u);
     EXPECT_EQ(r.addresses.at(98), b58(30, 0x21));
     r = login(b58(0, 0x61), b58(22, 0x22), {}, {98});
-    ASSERT_EQ(r.parent_script.size(), 23u) << "a DOGE P2SH gives an LTC P2SH";
-    // not case 4: a DOGE address of another network, the slash form, a PEP address
-    EXPECT_TRUE(login("notanaddress", b58(113, 0x21), {}, {98}).parent_script.empty());
-    EXPECT_TRUE(login("notanaddress", "", {{98, b58(30, 0x21)}}, {98}).parent_script.empty());
+    ASSERT_EQ(c4(r, {98}).script.size(), 23u) << "a DOGE P2SH gives an LTC P2SH";
+    // case 4 in the slash form too (garbage/98:D...)
+    r = login("notanaddress", "", {{98, b58(30, 0x21)}}, {98});
+    EXPECT_EQ(c4(r, {98}).script, core::address_to_script(b58(30, 0x21)));
+    // a PEP address alone: case 4 on the PEP key
     r = login("notanaddress", b58(56, 0x31), {}, {98, 63});
-    EXPECT_TRUE(r.parent_script.empty());
     EXPECT_EQ(r.addresses.at(63), b58(56, 0x31));
     EXPECT_FALSE(r.addresses.count(98)) << "no DOGE address derived from an unusable primary";
+    EXPECT_EQ(c4(r, {98, 63}).script, core::address_to_script(b58(56, 0x31)));
+    EXPECT_EQ(c4(r, {98, 63}).chain_id, 63u);
+    // not case 4: a DOGE address of another network
+    EXPECT_TRUE(c4(login("notanaddress", b58(113, 0x21), {}, {98}), {98}).script.empty());
     // a first address that is not an address before a valid LTC address: the
     // LTC address is the primary (as the pre-change server paid it)
     r = login(b58(30, 0x25).substr(1), b58(48, 0x01), {}, {98});
@@ -2214,12 +2227,18 @@ struct RecordingWorkSource : core::stratum::IWorkSource {
     core::stratum::StratumConfig cfg;
     std::set<uint32_t> chains;
     std::atomic<bool> ready{true};
+    std::atomic<bool> refuse{false};   // authorize_refusal: refuse every login
+    std::string authorize_refusal(const std::string&) const override
+    {
+        return refuse.load() ? std::string("refused by the test") : std::string();
+    }
     mutable std::mutex mu;
     mutable std::vector<std::map<uint32_t, std::vector<unsigned char>>> builds;
     mutable std::vector<std::vector<unsigned char>> payouts;
     std::vector<std::map<uint32_t, std::vector<unsigned char>>> submits;
     std::vector<std::vector<unsigned char>> submit_payouts;
     std::vector<uint32_t> submit_share_bits;   // the share bits each submit was handed
+    std::vector<std::optional<uint16_t>> submit_donations;   // the share donation each submit was handed
     // Node-fee and share-target knobs (set before a connection): every job
     // the operator's (decide_job_payout), the live share bits
     // (get_share_bits: the last job built), the jobs' frozen share bits, the
@@ -2231,11 +2250,22 @@ struct RecordingWorkSource : core::stratum::IWorkSource {
     std::string block_bits{"207fffff"};
     mutable std::vector<core::stratum::PayoutKey> login_keys;   // build_connection_coinbase_for
     bool merged_ready() const override { return ready.load(); }
-    void decide_job_payout(std::vector<unsigned char>& payout,
-                           std::vector<std::pair<uint32_t, std::vector<unsigned char>>>&) const override
+    // split_owner: a job with no payout a share can carry pays it, with the
+    // split donation (MiningInterface::decide_job_payout under --redistribute
+    // split).
+    std::vector<unsigned char> split_owner;
+    std::optional<uint16_t> decide_job_payout(std::vector<unsigned char>& payout,
+                                              std::vector<std::pair<uint32_t, std::vector<unsigned char>>>&) const override
     {
         if (!fee_script.empty())
             payout = fee_script;
+        const bool carried = (payout.size() == 25 && payout[0] == 0x76) || (payout.size() == 23 && payout[0] == 0xa9)
+                             || (payout.size() == 22 && payout[0] == 0x00 && payout[1] == 0x14);
+        if (!carried && !split_owner.empty()) {
+            payout = split_owner;
+            return core::kSplitShareDonation;
+        }
+        return std::nullopt;
     }
 
     const core::stratum::StratumConfig& get_stratum_config() const override { return cfg; }
@@ -2266,14 +2296,23 @@ struct RecordingWorkSource : core::stratum::IWorkSource {
         r.snapshot.frozen_ref.bits = frozen_bits;
         return r;
     }
+    mutable std::vector<std::optional<uint16_t>> build_donations;   // build_connection_coinbase_for
+    std::vector<std::string> warning_updates;   // update_stratum_worker_payout_warning
+    void update_stratum_worker_payout_warning(const std::string&, const std::string& w) override
+    {
+        std::lock_guard<std::mutex> l(mu);
+        warning_updates.push_back(w);
+    }
     core::stratum::CoinbaseResult build_connection_coinbase_for(
         const core::stratum::PayoutKey& login_key, const uint256& prev, const std::string& en1,
         const std::vector<unsigned char>& payout,
-        const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged) const override
+        const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged,
+        const std::optional<uint16_t>& share_donation) const override
     {
         {
             std::lock_guard<std::mutex> l(mu);
             login_keys.push_back(login_key);
+            build_donations.push_back(share_donation);
         }
         return build_connection_coinbase(prev, en1, payout, merged);
     }
@@ -2286,6 +2325,7 @@ struct RecordingWorkSource : core::stratum::IWorkSource {
         submits.push_back(merged);
         submit_payouts.push_back(job && job->has_payout ? job->payout_script : std::vector<unsigned char>{0xff});
         submit_share_bits.push_back(job ? job->share_bits : 0);
+        submit_donations.push_back(job ? job->share_donation : std::nullopt);
         return {{"result", true}};
     }
     uint32_t get_share_bits() const override { return live_bits; }
@@ -2816,6 +2856,683 @@ TEST(MergedAuxNodeFee, RedistributedJobCarriesTheRecipientsMergedAddresses)
     mi.decide_job_payout(payout, merged);
     EXPECT_EQ(payout, core::address_to_script(b58(48, 0x01)));
     EXPECT_TRUE(merged.empty());
+}
+
+// --redistribute split (the default): a payout a share cannot carry (an
+// empty login, a P2WSH primary with no DOGE address, the job sent before the
+// login) pays the node owner with the split donation
+// (core::kSplitShareDonation, 32768 of 65535). On every merged chain the job
+// names no address for, the owner's script there: its merged address
+// (--node-owner-merged-address, set_split_owner's map), else its key
+// converted (P2PKH; a P2SH key is not converted: the merged donation),
+// written into the share (Tier 1), so the DOGE side of the share pays the
+// owner and the donation too. An address the login named stays (that chain's
+// work is attributable). The old --redistribute pick is not consulted. A
+// P2WSH primary with a DOGE address is case 4 at the login: the DOGE key,
+// which the job keeps, no split.
+TEST(RedistributeSplit, TheJobPaysTheOwnerOnTheParentAndEveryMergedChain)
+{
+    using Merged = std::vector<std::pair<uint32_t, std::vector<unsigned char>>>;
+    Rig rig({{"DOGE", 98}, {"PEP", 63}});
+    core::MiningInterface mi(false, nullptr);
+    mi.set_merged_mining_manager(&rig.mm);
+    mi.set_redistribute_fn([] { return std::pair<std::string, uint8_t>{h160_of(b58(48, 0x07)), 0}; });
+    const auto owner = core::address_to_script(b58(48, 0x0a));       // a P2PKH owner
+    const auto owner_doge = core::address_to_script(b58(30, 0x0c));  // its DOGE address
+    const auto owner_floor = core::hash160_to_merged_script(h160_of(b58(48, 0x0a)), "p2pkh");
+    const std::vector<unsigned char> don(ltc::PoolConfig::COMBINED_DONATION_SCRIPT.begin(),
+                                         ltc::PoolConfig::COMBINED_DONATION_SCRIPT.end());
+    ASSERT_TRUE(mi.set_split_owner(owner, {{98, owner_doge}}, don));
+    // an empty login / the job built before the login
+    std::vector<unsigned char> payout;
+    Merged merged;
+    auto d = mi.decide_job_payout(payout, merged);
+    ASSERT_TRUE(d.has_value());
+    EXPECT_EQ(*d, 32768);
+    EXPECT_EQ(payout, owner);
+    EXPECT_EQ(merged, (Merged{{63, owner_floor}, {98, owner_doge}}));
+    // a P2WSH primary with a DOGE address is case 4, decided at the login:
+    // the job's payout is the DOGE address's key, kept with the node's
+    // donation (AnUncarriedPrimaryWithADogeAddressPaysTheDogeKey); the
+    // parent payout is never taken from a merged chain's script here
+    const auto miner_doge = core::address_to_script(b58(30, 0x21));
+    payout = miner_doge;
+    merged = {{98, miner_doge}};
+    d = mi.decide_job_payout(payout, merged);
+    EXPECT_FALSE(d.has_value());
+    EXPECT_EQ(payout, miner_doge);
+    EXPECT_EQ(merged, (Merged{{98, miner_doge}}));
+    // a P2WSH primary with no address on any chain: the split
+    const auto p2wsh = core::address_to_script(bech32::encode_segwit("ltc", 0, std::vector<unsigned char>(32, 0x43)));
+    ASSERT_EQ(p2wsh.size(), 34u);
+    payout = p2wsh;
+    merged.clear();
+    d = mi.decide_job_payout(payout, merged);
+    ASSERT_TRUE(d.has_value());
+    EXPECT_EQ(*d, 32768);
+    EXPECT_EQ(payout, owner);
+    EXPECT_EQ(merged, (Merged{{63, owner_floor}, {98, owner_doge}}));
+    // a usable payout: nothing changes, the node's donation
+    payout = core::address_to_script(b58(48, 0x01));
+    merged.clear();
+    EXPECT_FALSE(mi.decide_job_payout(payout, merged).has_value());
+    EXPECT_EQ(payout, core::address_to_script(b58(48, 0x01)));
+    EXPECT_TRUE(merged.empty());
+    // a P2SH owner without a merged address: P2SH on LTC; its key is not
+    // converted to the merged chains (never a same-hash P2SH there): their
+    // half goes to the merged donation script
+    const auto owner_p2sh = core::address_to_script(b58(50, 0x0b));
+    ASSERT_TRUE(mi.set_split_owner(owner_p2sh, {}, don));
+    payout.clear();
+    merged.clear();
+    d = mi.decide_job_payout(payout, merged);
+    ASSERT_TRUE(d.has_value());
+    EXPECT_EQ(payout, owner_p2sh);
+    EXPECT_EQ(merged, (Merged{{63, don}, {98, don}}));
+    for (const auto& [id, script] : merged)
+        EXPECT_NE(script, core::hash160_to_merged_script(h160_of(b58(50, 0x0b)), "p2sh")) << id;
+    // ... with its DOGE address set (--node-owner-merged-address): DOGE pays it
+    ASSERT_TRUE(mi.set_split_owner(owner_p2sh, {{98, owner_doge}}, don));
+    payout.clear();
+    merged.clear();
+    mi.decide_job_payout(payout, merged);
+    EXPECT_EQ(merged, (Merged{{63, don}, {98, owner_doge}}));
+    // a P2WPKH owner: P2WPKH on LTC, its key as P2PKH on the merged chains
+    const auto owner_wpkh = core::address_to_script(bech32::encode_segwit("ltc", 0, std::vector<unsigned char>(20, 0x2d)));
+    ASSERT_EQ(owner_wpkh.size(), 22u);
+    ASSERT_TRUE(mi.set_split_owner(owner_wpkh, {}, don));
+    payout.clear();
+    merged.clear();
+    d = mi.decide_job_payout(payout, merged);
+    ASSERT_TRUE(d.has_value());
+    EXPECT_EQ(payout, owner_wpkh);
+    std::string h;
+    for (int i = 0; i < 20; ++i) h += "2d";
+    const auto wpkh_floor = core::hash160_to_merged_script(h, "p2pkh");
+    EXPECT_EQ(merged, (Merged{{63, wpkh_floor}, {98, wpkh_floor}}));
+}
+
+// --redistribute split at startup (main_ltc.cpp runs exactly this): a spec
+// without split never sets an owner, whatever owner address the node has (a
+// pplns / fee / boost / donate node does not split); with split the owner is
+// --node-owner-address, else --address, an LTC address whose script a share
+// carries; a foreign-coin or P2WSH owner sets nothing (the fallback runs).
+TEST(RedistributeSplit, TheStartupSetupSplitsOnlyASplitSpecAndPicksTheOwner)
+{
+    const auto acc = ltc::address_acceptance(false);
+    const std::vector<unsigned char> don(ltc::PoolConfig::COMBINED_DONATION_SCRIPT.begin(),
+                                         ltc::PoolConfig::COMBINED_DONATION_SCRIPT.end());
+    const std::string node_owner = b58(48, 0x0a), address = b58(48, 0x0b);
+    int merged_calls = 0;
+    std::string merged_for;
+    const auto merged = [&](const std::string& owner) {
+        ++merged_calls;
+        merged_for = owner;
+        return std::map<uint32_t, std::vector<unsigned char>>{{98, core::address_to_script(b58(30, 0x0c))}};
+    };
+    for (const char* spec : {"pplns", "fee", "boost", "donate", "boost:70,donate:30"}) {
+        core::MiningInterface mi(false, nullptr);
+        const auto r = ltc::setup_split_owner(mi, spec, node_owner, address, acc, merged, don);
+        EXPECT_FALSE(r.selected) << spec;
+        EXPECT_FALSE(r.owner_set) << spec;
+        EXPECT_FALSE(mi.has_split_owner()) << spec << ": a node not configured for split never splits";
+    }
+    EXPECT_EQ(merged_calls, 0);
+    // split: --node-owner-address first
+    {
+        core::MiningInterface mi(false, nullptr);
+        const auto r = ltc::setup_split_owner(mi, "split", node_owner, address, acc, merged, don);
+        EXPECT_TRUE(r.selected);
+        EXPECT_FALSE(r.hybrid);
+        EXPECT_EQ(r.owner, node_owner) << "--node-owner-address before --address";
+        EXPECT_TRUE(r.owner_set);
+        EXPECT_TRUE(mi.has_split_owner());
+        EXPECT_EQ(merged_for, node_owner);
+        std::vector<unsigned char> payout;
+        std::vector<std::pair<uint32_t, std::vector<unsigned char>>> m;
+        ASSERT_TRUE(mi.decide_job_payout(payout, m).has_value());
+        EXPECT_EQ(payout, core::address_to_script(node_owner));
+    }
+    // ... else --address
+    {
+        core::MiningInterface mi(false, nullptr);
+        const auto r = ltc::setup_split_owner(mi, "split", "", address, acc, merged, don);
+        EXPECT_EQ(r.owner, address);
+        EXPECT_TRUE(r.owner_set);
+        std::vector<unsigned char> payout;
+        std::vector<std::pair<uint32_t, std::vector<unsigned char>>> m;
+        ASSERT_TRUE(mi.decide_job_payout(payout, m).has_value());
+        EXPECT_EQ(payout, core::address_to_script(address));
+    }
+    EXPECT_EQ(ltc::split_owner_address(node_owner, address), node_owner);
+    EXPECT_EQ(ltc::split_owner_address("", address), address);
+    // a hybrid naming split: selected, flagged
+    {
+        core::MiningInterface mi(false, nullptr);
+        const auto r = ltc::setup_split_owner(mi, "boost:70,split:30", node_owner, address, acc, merged, don);
+        EXPECT_TRUE(r.selected);
+        EXPECT_TRUE(r.hybrid);
+        EXPECT_TRUE(r.owner_set);
+    }
+    // no owner, a DOGE (foreign) owner, a P2WSH owner: nothing set
+    for (const std::string& bad : {std::string(), b58(30, 0x0c),
+                                   bech32::encode_segwit("ltc", 0, std::vector<unsigned char>(32, 0x43))}) {
+        core::MiningInterface mi(false, nullptr);
+        merged_calls = 0;
+        const auto r = ltc::setup_split_owner(mi, "split", bad, "", acc, merged, don);
+        EXPECT_TRUE(r.selected);
+        EXPECT_FALSE(r.owner_set) << bad;
+        EXPECT_FALSE(mi.has_split_owner()) << bad;
+        EXPECT_EQ(merged_calls, 0) << bad;
+    }
+}
+
+// The split owner's merged scripts (main_ltc's cascade with
+// p2sh_key_pays_donation): a P2SH owner key is not converted, the split
+// shares' merged half goes to the donation; the owner's merged address (P1)
+// is paid when set; a P2PKH key is converted. The node fee's cascade
+// (without the flag) is unchanged: P2SH stays P2SH.
+TEST(RedistributeSplit, AP2shOwnersMergedHalfGoesToTheDonation)
+{
+    using c2pool::merged::AuxNetwork;
+    using c2pool::merged::resolve_operator_merged_script;
+    const std::vector<unsigned char> don = {0xa9, 0x14, 1, 2, 3};
+    const std::string p2sh = b58(50, 0x0b), p2pkh = b58(48, 0x0a), doge = b58(30, 0x0c);
+    auto r = resolve_operator_merged_script("DOGE", AuxNetwork::mainnet, p2sh, "", "", don, true);
+    EXPECT_EQ(r.script, don);
+    EXPECT_EQ(r.source, "donation script");
+    EXPECT_NE(r.warning.find("--node-owner-merged-address"), std::string::npos) << r.warning;
+    r = resolve_operator_merged_script("PEP", AuxNetwork::mainnet, p2sh, "", "", don, true);
+    EXPECT_EQ(r.script, don);
+    r = resolve_operator_merged_script("DOGE", AuxNetwork::mainnet, p2sh, doge, "", don, true);
+    EXPECT_EQ(r.script, core::address_to_script(doge)) << "P1: the owner's DOGE address";
+    r = resolve_operator_merged_script("DOGE", AuxNetwork::mainnet, p2pkh, "", "", don, true);
+    EXPECT_EQ(r.script, core::hash160_to_merged_script(h160_of(p2pkh), "p2pkh"));
+    r = resolve_operator_merged_script("DOGE", AuxNetwork::mainnet, p2sh, "", "", don);
+    EXPECT_EQ(r.script, core::hash160_to_merged_script(h160_of(p2sh), "p2sh")) << "the node fee's: unchanged";
+}
+
+// The reconnect race at the stratum session: the job sent right after
+// mining.subscribe is built before mining.authorize, with no payout, so the
+// work source gives it the split (here: the owner and the split donation).
+// Its job id stays active after the authorize: a share found on it and
+// submitted under the now-authorized login is accepted and carries the
+// payout and donation that job committed to (its ref_hash), never an empty
+// script, and the jobs after the authorize carry the login's payout and the
+// node's donation. (The MiningInterface side, the decision and the minted
+// share, is pinned in core_test: RedistributeSplit.TheJobBuiltBeforeTheLogin
+// MintsTheOwnerWithTheSplitDonation.)
+TEST(MergedAuxStratumSession, AJobBuiltBeforeTheLoginKeepsItsSplitThroughTheAuthorize)
+{
+    using namespace std::chrono_literals;
+    const std::string ltc = b58(48, 0x01);
+    const auto owner = core::address_to_script(b58(48, 0x0a));
+    SessionRig rig({98}, /*redistribute=*/true);
+    rig.ws->split_owner = owner;
+    LineClient c(rig.port);
+    ASSERT_GE(c.fd, 0);
+    rig.step(c, 1, "mining.subscribe", nlohmann::json::array());
+    ASSERT_FALSE(c.last_job.empty()) << "a job is sent right after subscribe";
+    const std::string before_login = c.last_job;
+    {
+        std::lock_guard<std::mutex> l(rig.ws->mu);
+        ASSERT_FALSE(rig.ws->build_donations.empty());
+        EXPECT_EQ(rig.ws->payouts.back(), owner) << "built with no login: the split";
+        ASSERT_TRUE(rig.ws->build_donations.back().has_value());
+        EXPECT_EQ(*rig.ws->build_donations.back(), 32768) << "the build commits to the split donation";
+    }
+    ASSERT_TRUE(rig.step(c, 2, "mining.authorize", {ltc, "x"}));
+    ASSERT_NE(c.last_job, before_login) << "the authorize sends a new job";
+    const std::string after_login = c.last_job;
+    {
+        std::lock_guard<std::mutex> l(rig.ws->mu);
+        EXPECT_EQ(rig.ws->payouts.back(), core::address_to_script(ltc));
+        EXPECT_FALSE(rig.ws->build_donations.back().has_value());
+    }
+    const auto nsub = [&rig] {
+        std::lock_guard<std::mutex> l(rig.ws->mu);
+        return rig.ws->submits.size();
+    };
+    c.send({{"id", 3}, {"method", "mining.submit"}, {"params", {"w", before_login, "00000000", "6ae2a090", "00000000"}}});
+    const auto r3 = c.wait_id(3);
+    ASSERT_TRUE(r3.has_value());
+    for (int i = 0; i < 100 && nsub() < 1; ++i) std::this_thread::sleep_for(5ms);
+    c.send({{"id", 4}, {"method", "mining.submit"}, {"params", {"w", after_login, "00000000", "6ae2a090", "00000001"}}});
+    c.wait_id(4);
+    for (int i = 0; i < 100 && nsub() < 2; ++i) std::this_thread::sleep_for(5ms);
+    std::lock_guard<std::mutex> l(rig.ws->mu);
+    ASSERT_EQ(rig.ws->submits.size(), 2u) << "the share on the job built before the login is not refused";
+    EXPECT_EQ(rig.ws->submit_payouts[0], owner) << "the payout that job committed to, not the login's";
+    ASSERT_TRUE(rig.ws->submit_donations[0].has_value());
+    EXPECT_EQ(*rig.ws->submit_donations[0], 32768);
+    EXPECT_EQ(rig.ws->submit_payouts[1], core::address_to_script(ltc));
+    EXPECT_FALSE(rig.ws->submit_donations[1].has_value());
+}
+
+// p2pool's case 4 extended (2026-11-27: attributable work is never halved):
+// a login whose own address pays no share -- invalid / empty / another
+// coin's, or one a share cannot carry (P2WSH / P2TR: a 32-byte witness
+// program) -- with a merged address it named (comma or slash form,
+// mining.set_merged_addresses after its authorize) has its parent payout
+// paid to that address's own hash160 in its legacy form (P2PKH stays P2PKH,
+// P2SH stays P2SH): DOGE's if named, else the lowest configured chain's;
+// the named entries are kept. Nothing usable named: no parent script (the
+// work source redistributes it).
+TEST(MergedAuxStratumLogin, AnUncarriedPrimaryWithAMergedAddressPaysItsKey)
+{
+    using namespace core::merged_addr;
+    const auto table = merged_chain_table(false, kLtcAllNetworks);
+    const auto doge_and_pep = [](uint32_t id) { return id == 98 || id == 63; };
+    const std::string p2wsh = bech32::encode_segwit("ltc", 0, std::vector<unsigned char>(32, 0x43));
+    const std::string p2tr = bech32::encode_segwit("ltc", 1, std::vector<unsigned char>(32, 0x44));
+    EXPECT_FALSE(share_carries(core::address_to_script(p2wsh)));
+    EXPECT_FALSE(share_carries(core::address_to_script(p2tr)));
+    EXPECT_TRUE(share_carries(core::address_to_script(b58(48, 0x01))));
+    EXPECT_TRUE(share_carries(core::address_to_script(b58(50, 0x02))));
+    EXPECT_TRUE(share_carries(core::address_to_script(bech32::encode_segwit("ltc", 0, std::vector<unsigned char>(20, 0x42)))));
+    // the resolution keeps the address the login gave for such a primary
+    for (const auto& primary : {p2wsh, p2tr}) {
+        const auto r = resolve_merged_login(primary, b58(30, 0x21), {}, table, doge_and_pep, ltc_versions(false), kLtcHrps);
+        EXPECT_TRUE(r.usable_primary);
+        EXPECT_EQ(r.addresses.at(98), b58(30, 0x21)) << "the DOGE entry is unchanged";
+        EXPECT_FALSE(r.addresses.count(63)) << "nothing is derived from a 32-byte witness program";
+    }
+    // DOGE first (P2PKH, P2SH), its own form
+    for (const std::string& doge : {b58(30, 0x21), b58(22, 0x23)}) {
+        const auto c = case4_parent({{98, doge}, {63, b58(56, 0x31)}}, table, doge_and_pep);
+        EXPECT_EQ(c.script, core::address_to_script(doge));
+        EXPECT_EQ(c.chain_id, 98u);
+        EXPECT_EQ(c.address, doge);
+    }
+    // PEP only: the PEP key
+    auto c = case4_parent({{63, b58(56, 0x31)}}, table, doge_and_pep);
+    EXPECT_EQ(c.script, core::address_to_script(b58(56, 0x31)));
+    EXPECT_EQ(c.chain_id, 63u);
+    // a chain that is not configured does not count
+    EXPECT_TRUE(case4_parent({{63, b58(56, 0x31)}}, table, [](uint32_t id) { return id == 98; }).script.empty());
+    // nothing named: none
+    EXPECT_TRUE(case4_parent({}, table, doge_and_pep).script.empty());
+}
+
+// The same at the stratum session: a P2WSH / P2TR login with a DOGE address
+// is built with the DOGE key as its parent payout and the node's donation
+// (no split donation), its DOGE entry as given; the same login without a DOGE
+// address is the split's.
+TEST(MergedAuxStratumSession, AnUncarriedPrimaryWithADogeAddressIsPaidOnBothChains)
+{
+    const auto owner = core::address_to_script(b58(48, 0x0a));
+    const std::string p2wsh = bech32::encode_segwit("ltc", 0, std::vector<unsigned char>(32, 0x43));
+    const std::string p2tr = bech32::encode_segwit("ltc", 1, std::vector<unsigned char>(32, 0x44));
+    const std::string doge = b58(30, 0x21);
+    const auto doge_script = core::address_to_script(doge);
+    for (const auto& primary : {p2wsh, p2tr}) {
+        for (const std::string& user : {primary + "," + doge, primary + "/98:" + doge}) {
+            SessionRig rig({98}, /*redistribute=*/true);
+            rig.ws->split_owner = owner;
+            LineClient c(rig.port);
+            ASSERT_GE(c.fd, 0);
+            rig.step(c, 1, "mining.subscribe", nlohmann::json::array());
+            ASSERT_TRUE(rig.step(c, 2, "mining.authorize", {user, "x"})) << user;
+            std::lock_guard<std::mutex> l(rig.ws->mu);
+            EXPECT_EQ(rig.ws->payouts.back(), doge_script) << user << ": the parent paid to the DOGE key";
+            ASSERT_FALSE(rig.ws->build_donations.empty());
+            EXPECT_FALSE(rig.ws->build_donations.back().has_value()) << user << ": the node's donation, not 32768";
+            ASSERT_TRUE(rig.ws->builds.back().count(98));
+            EXPECT_EQ(rig.ws->builds.back().at(98), doge_script) << user << ": the DOGE entry as given";
+        }
+        SessionRig rig({98}, /*redistribute=*/true);
+        rig.ws->split_owner = owner;
+        LineClient c(rig.port);
+        ASSERT_GE(c.fd, 0);
+        rig.step(c, 1, "mining.subscribe", nlohmann::json::array());
+        ASSERT_TRUE(rig.step(c, 2, "mining.authorize", {primary, "x"}));
+        std::lock_guard<std::mutex> l(rig.ws->mu);
+        EXPECT_EQ(rig.ws->payouts.back(), owner) << primary << " alone: the split";
+        ASSERT_TRUE(rig.ws->build_donations.back().has_value());
+        EXPECT_EQ(*rig.ws->build_donations.back(), 32768);
+    }
+}
+
+// Case 4 at the session, in every form the login can name its address in,
+// and never from another login's: (1) authorize(P2WSH) then
+// mining.set_merged_addresses{98:DOGE}: the next job (sent at once) is case
+// 4, the parent on the DOGE key with the node's donation; (2) an invalid
+// primary in the slash form (garbage/98:DOGE): case 4; (3) a P2WSH primary
+// naming only a PEP address: case 4 on the PEP key; (4) worker A's
+// mining.set_merged_addresses, then a re-authorize as worker B (P2WSH):
+// B's parent is not paid to A's key (the split), whatever A's address still
+// pays on DOGE.
+TEST(MergedAuxStratumSession, Case4ComesOnlyFromAnAddressTheLoginNamed)
+{
+    using namespace std::chrono_literals;
+    const auto owner = core::address_to_script(b58(48, 0x0a));
+    const std::string p2wsh = bech32::encode_segwit("ltc", 0, std::vector<unsigned char>(32, 0x43));
+    const std::string doge = b58(30, 0x21), pep = b58(56, 0x31);
+    const auto doge_script = core::address_to_script(doge);
+    // (1) authorize, then set_merged_addresses
+    {
+        SessionRig rig({98}, /*redistribute=*/true);
+        rig.ws->split_owner = owner;
+        LineClient c(rig.port);
+        ASSERT_GE(c.fd, 0);
+        rig.step(c, 1, "mining.subscribe", nlohmann::json::array());
+        ASSERT_TRUE(rig.step(c, 2, "mining.authorize", {p2wsh, "x"}));
+        {
+            std::lock_guard<std::mutex> l(rig.ws->mu);
+            EXPECT_EQ(rig.ws->payouts.back(), owner) << "no merged address yet: the split";
+        }
+        const size_t n = rig.ws->count();
+        rig.step(c, 3, "mining.set_merged_addresses", {{{"98", doge}}});
+        ASSERT_GT(rig.ws->count(), n) << "the payout changed: new work at once";
+        std::lock_guard<std::mutex> l(rig.ws->mu);
+        EXPECT_EQ(rig.ws->payouts.back(), doge_script) << "case 4 after the authorize";
+        EXPECT_FALSE(rig.ws->build_donations.back().has_value()) << "the node's donation, not 32768";
+        EXPECT_EQ(rig.ws->builds.back().at(98), doge_script);
+    }
+    // (2) an invalid primary, slash form
+    {
+        SessionRig rig({98}, /*redistribute=*/true);
+        rig.ws->split_owner = owner;
+        LineClient c(rig.port);
+        ASSERT_GE(c.fd, 0);
+        rig.step(c, 1, "mining.subscribe", nlohmann::json::array());
+        ASSERT_TRUE(rig.step(c, 2, "mining.authorize", {b58(48, 0x06).substr(1) + "/98:" + doge, "x"}));
+        std::lock_guard<std::mutex> l(rig.ws->mu);
+        EXPECT_EQ(rig.ws->payouts.back(), doge_script) << "garbage/98:DOGE: case 4";
+        EXPECT_FALSE(rig.ws->build_donations.back().has_value());
+        EXPECT_EQ(rig.ws->builds.back().at(98), doge_script);
+    }
+    // (3) a P2WSH primary naming only PEP
+    {
+        SessionRig rig({98, 63}, /*redistribute=*/true);
+        rig.ws->split_owner = owner;
+        LineClient c(rig.port);
+        ASSERT_GE(c.fd, 0);
+        rig.step(c, 1, "mining.subscribe", nlohmann::json::array());
+        ASSERT_TRUE(rig.step(c, 2, "mining.authorize", {p2wsh + "/63:" + pep, "x"}));
+        std::lock_guard<std::mutex> l(rig.ws->mu);
+        EXPECT_EQ(rig.ws->payouts.back(), core::address_to_script(pep)) << "case 4 on the PEP key";
+        EXPECT_FALSE(rig.ws->build_donations.back().has_value());
+        EXPECT_EQ(rig.ws->builds.back().at(63), core::address_to_script(pep));
+    }
+    // (4) worker A's set_merged_addresses, then worker B (P2WSH)
+    {
+        SessionRig rig({98}, /*redistribute=*/true);
+        rig.ws->split_owner = owner;
+        LineClient c(rig.port);
+        ASSERT_GE(c.fd, 0);
+        rig.step(c, 1, "mining.subscribe", nlohmann::json::array());
+        ASSERT_TRUE(rig.step(c, 2, "mining.authorize", {b58(48, 0x01), "x"}));
+        c.send({{"id", 3}, {"method", "mining.set_merged_addresses"}, {"params", {{{"98", doge}}}}});
+        c.wait_id(3);
+        ASSERT_TRUE(rig.step(c, 4, "mining.authorize", {p2wsh + ".workerB", "x"}));
+        std::lock_guard<std::mutex> l(rig.ws->mu);
+        EXPECT_NE(rig.ws->payouts.back(), doge_script) << "B is never paid to A's key";
+        EXPECT_EQ(rig.ws->payouts.back(), owner) << "B named no address: the split";
+        ASSERT_TRUE(rig.ws->build_donations.back().has_value());
+        EXPECT_EQ(*rig.ws->build_donations.back(), 32768);
+    }
+}
+
+// Case 4 and the order of mining.set_merged_addresses: (1) on a fresh
+// connection an address set before the first authorize is the login's own;
+// after an authorize only one set after the latest authorize counts (an
+// earlier one, given while another login was accepted, never pays a later
+// login's parent); (2) a re-authorize of the same primary keeps the
+// addresses that login gave, a set_merged_addresses while it was accepted
+// included; (3) a merged address in a non-legacy form (a BELLS bech32) is
+// not a parent key: the split; (4) a set that does not change the payout
+// pushes no new work and leaves the worker's label, one that does updates it.
+TEST(MergedAuxStratumSession, Case4FollowsTheLoginsOwnSetMergedAddresses)
+{
+    using namespace std::chrono_literals;
+    const auto owner = core::address_to_script(b58(48, 0x0a));
+    const std::string garbage = b58(48, 0x06).substr(1);
+    const std::string p2wsh = bech32::encode_segwit("ltc", 0, std::vector<unsigned char>(32, 0x43));
+    const std::string d1 = b58(30, 0x21), d2 = b58(30, 0x22), pep = b58(56, 0x31);
+    const auto rig_for = [&](std::set<uint32_t> chains) {
+        auto rig = std::make_unique<SessionRig>(std::move(chains), /*redistribute=*/true);
+        rig->ws->split_owner = owner;
+        return rig;
+    };
+    const auto last_payout = [](SessionRig& rig) {
+        std::lock_guard<std::mutex> l(rig.ws->mu);
+        return rig.ws->payouts.back();
+    };
+    const auto last_donation = [](SessionRig& rig) {
+        std::lock_guard<std::mutex> l(rig.ws->mu);
+        return rig.ws->build_donations.back();
+    };
+    // (1a) a fresh connection: set before the first authorize counts
+    {
+        auto rig = rig_for({98});
+        LineClient c(rig->port);
+        ASSERT_GE(c.fd, 0);
+        rig->step(c, 1, "mining.subscribe", nlohmann::json::array());
+        c.send({{"id", 2}, {"method", "mining.set_merged_addresses"}, {"params", {{{"98", d1}}}}});
+        c.wait_id(2);
+        ASSERT_TRUE(rig->step(c, 3, "mining.authorize", {garbage, "x"}));
+        EXPECT_EQ(last_payout(*rig), core::address_to_script(d1)) << "the login's own, sent before its authorize";
+        EXPECT_FALSE(last_donation(*rig).has_value());
+    }
+    // (1b) after an authorize: a set before the re-authorize does not count
+    {
+        auto rig = rig_for({98});
+        LineClient c(rig->port);
+        ASSERT_GE(c.fd, 0);
+        rig->step(c, 1, "mining.subscribe", nlohmann::json::array());
+        ASSERT_TRUE(rig->step(c, 2, "mining.authorize", {b58(48, 0x01), "x"}));
+        ASSERT_TRUE(rig->step(c, 3, "mining.authorize", {garbage, "x"}));
+        c.send({{"id", 4}, {"method", "mining.set_merged_addresses"}, {"params", {{{"98", d1}}}}});
+        c.wait_id(4);
+        // set while `garbage` is accepted: its own (case 4); a new login does not inherit it
+        ASSERT_TRUE(rig->step(c, 5, "mining.authorize", {p2wsh, "x"}));
+        EXPECT_EQ(last_payout(*rig), owner) << "set before this authorize, for another login: the split";
+        ASSERT_TRUE(last_donation(*rig).has_value());
+        EXPECT_EQ(*last_donation(*rig), 32768);
+    }
+    // (2) a re-authorize of the same (unusable) primary keeps its addresses
+    {
+        auto rig = rig_for({98});
+        LineClient c(rig->port);
+        ASSERT_GE(c.fd, 0);
+        rig->step(c, 1, "mining.subscribe", nlohmann::json::array());
+        ASSERT_TRUE(rig->step(c, 2, "mining.authorize", {garbage + "," + d1, "x"}));
+        EXPECT_EQ(last_payout(*rig), core::address_to_script(d1));
+        ASSERT_TRUE(rig->step(c, 3, "mining.authorize", {garbage, "x"}));
+        EXPECT_EQ(last_payout(*rig), core::address_to_script(d1)) << "the same primary: its DOGE address carried";
+        rig->step(c, 4, "mining.set_merged_addresses", {{{"98", d2}}});
+        EXPECT_EQ(last_payout(*rig), core::address_to_script(d2));
+        ASSERT_TRUE(rig->step(c, 5, "mining.authorize", {garbage, "x"}));
+        EXPECT_EQ(last_payout(*rig), core::address_to_script(d2))
+            << "the address set while it was accepted, carried by the same primary";
+        EXPECT_FALSE(last_donation(*rig).has_value());
+    }
+    // (3) a BELLS bech32 (not a legacy form): not a parent key
+    {
+        auto rig = rig_for({16});
+        LineClient c(rig->port);
+        ASSERT_GE(c.fd, 0);
+        rig->step(c, 1, "mining.subscribe", nlohmann::json::array());
+        const std::string bells = bech32::encode_segwit("bel", 0, std::vector<unsigned char>(20, 0x51));
+        ASSERT_TRUE(rig->step(c, 2, "mining.authorize", {garbage + "/16:" + bells, "x"}));
+        EXPECT_EQ(last_payout(*rig), owner) << "a bech32 merged address is no parent key: the split";
+        ASSERT_TRUE(last_donation(*rig).has_value());
+        EXPECT_EQ(*last_donation(*rig), 32768);
+    }
+    // (4) push only on change; the worker label follows the payout
+    {
+        auto rig = rig_for({98, 63});
+        LineClient c(rig->port);
+        ASSERT_GE(c.fd, 0);
+        rig->step(c, 1, "mining.subscribe", nlohmann::json::array());
+        ASSERT_TRUE(rig->step(c, 2, "mining.authorize", {p2wsh, "x"}));
+        EXPECT_EQ(last_payout(*rig), owner);
+        rig->step(c, 3, "mining.set_merged_addresses", {{{"98", d1}}});
+        EXPECT_EQ(last_payout(*rig), core::address_to_script(d1));
+        {
+            std::lock_guard<std::mutex> l(rig->ws->mu);
+            ASSERT_EQ(rig->ws->warning_updates.size(), 1u);
+            EXPECT_EQ(rig->ws->warning_updates.back(), "P2WSH/P2TR address → parent paid to the DOGE address's key");
+        }
+        const size_t n = rig->ws->count();
+        for (int id = 4; id <= 5; ++id) {
+            // the same DOGE address again; a PEP address while DOGE is named
+            c.send({{"id", id}, {"method", "mining.set_merged_addresses"},
+                    {"params", {id == 4 ? nlohmann::json{{"98", d1}} : nlohmann::json{{"63", pep}}}}});
+            c.wait_id(id);
+        }
+        std::this_thread::sleep_for(200ms);
+        EXPECT_EQ(rig->ws->count(), n) << "the payout did not change: no new work";
+        {
+            std::lock_guard<std::mutex> l(rig->ws->mu);
+            EXPECT_EQ(rig->ws->warning_updates.size(), 1u) << "nor a label update";
+        }
+        rig->step(c, 6, "mining.set_merged_addresses", {{{"98", d2}}});
+        EXPECT_GT(rig->ws->count(), n);
+        EXPECT_EQ(last_payout(*rig), core::address_to_script(d2));
+    }
+}
+
+// A mining.set_merged_addresses before the first authorize is the first
+// login's own (for the chains it names no address for itself) and stays its
+// own through a re-authorize of the same primary: (1c) set{98:X}, auth G,
+// re-auth G (also as another worker): the parent is X's key each time, DOGE
+// pays X; (1d) set{98:X}, auth "G,D1": the login's own D1 wins, parent D1's
+// key and DOGE D1.
+TEST(MergedAuxStratumSession, APreAuthorizeSetStaysTheSamePrimarysOwn)
+{
+    const auto owner = core::address_to_script(b58(48, 0x0a));
+    const std::string garbage = b58(48, 0x06).substr(1);
+    const std::string x = b58(30, 0x21), d1 = b58(30, 0x22);
+    const auto last = [](SessionRig& rig) {
+        std::lock_guard<std::mutex> l(rig.ws->mu);
+        return std::make_tuple(rig.ws->payouts.back(), rig.ws->build_donations.back(), rig.ws->builds.back());
+    };
+    {
+        SessionRig rig({98}, /*redistribute=*/true);
+        rig.ws->split_owner = owner;
+        LineClient c(rig.port);
+        ASSERT_GE(c.fd, 0);
+        rig.step(c, 1, "mining.subscribe", nlohmann::json::array());
+        c.send({{"id", 2}, {"method", "mining.set_merged_addresses"}, {"params", {{{"98", x}}}}});
+        c.wait_id(2);
+        int id = 3;
+        for (const std::string& user : {garbage, garbage, garbage + ".w2"}) {
+            ASSERT_TRUE(rig.step(c, id++, "mining.authorize", {user, "x"})) << user;
+            const auto [payout, donation, merged] = last(rig);
+            EXPECT_EQ(payout, core::address_to_script(x)) << user << ": the parent on X's key";
+            EXPECT_FALSE(donation.has_value()) << user;
+            ASSERT_TRUE(merged.count(98));
+            EXPECT_EQ(merged.at(98), core::address_to_script(x)) << user;
+        }
+    }
+    {
+        SessionRig rig({98}, /*redistribute=*/true);
+        rig.ws->split_owner = owner;
+        LineClient c(rig.port);
+        ASSERT_GE(c.fd, 0);
+        rig.step(c, 1, "mining.subscribe", nlohmann::json::array());
+        c.send({{"id", 2}, {"method", "mining.set_merged_addresses"}, {"params", {{{"98", x}}}}});
+        c.wait_id(2);
+        ASSERT_TRUE(rig.step(c, 3, "mining.authorize", {garbage + "," + d1, "x"}));
+        const auto [payout, donation, merged] = last(rig);
+        EXPECT_EQ(payout, core::address_to_script(d1)) << "the login's own address wins";
+        EXPECT_FALSE(donation.has_value());
+        EXPECT_EQ(merged.at(98), core::address_to_script(d1)) << "and DOGE pays it, consistently";
+    }
+}
+
+// A refused authorize (merged chains not ready; the work source's
+// authorize_refusal) accepts no login: the connection has still never
+// authorized (a later set_merged_addresses is the next login's own) and the
+// refused login's addresses are not committed (a later login of the same
+// primary does not carry them). A set_merged_addresses while no login is
+// accepted supersedes the previous login's address for the chain.
+TEST(MergedAuxStratumSession, ARefusedAuthorizeAcceptsAndCommitsNothing)
+{
+    const auto owner = core::address_to_script(b58(48, 0x0a));
+    const std::string garbage = b58(48, 0x06).substr(1);
+    const std::string x = b58(30, 0x21), d1 = b58(30, 0x22), d2 = b58(30, 0x23);
+    const auto last_payout = [](SessionRig& rig) {
+        std::lock_guard<std::mutex> l(rig.ws->mu);
+        return rig.ws->payouts.back();
+    };
+    // merged chains not ready: refused; a set after it is still pre-authorize
+    {
+        SessionRig rig({98}, /*redistribute=*/true);
+        rig.ws->split_owner = owner;
+        LineClient c(rig.port);
+        ASSERT_GE(c.fd, 0);
+        rig.step(c, 1, "mining.subscribe", nlohmann::json::array());
+        rig.ws->ready = false;
+        c.send({{"id", 2}, {"method", "mining.authorize"}, {"params", {garbage, "x"}}});
+        const auto r = c.wait_id(2);
+        ASSERT_TRUE(r.has_value());
+        EXPECT_FALSE((*r)["result"].get<bool>());
+        c.send({{"id", 3}, {"method", "mining.set_merged_addresses"}, {"params", {{{"98", x}}}}});
+        c.wait_id(3);
+        rig.ws->ready = true;
+        ASSERT_TRUE(rig.step(c, 4, "mining.authorize", {garbage, "x"}));
+        EXPECT_EQ(last_payout(rig), core::address_to_script(x))
+            << "the refused authorize did not make the connection an authorized one";
+    }
+    // authorize_refusal on a fresh connection: still never authorized
+    {
+        SessionRig rig({98}, /*redistribute=*/true);
+        rig.ws->split_owner = owner;
+        LineClient c(rig.port);
+        ASSERT_GE(c.fd, 0);
+        rig.step(c, 1, "mining.subscribe", nlohmann::json::array());
+        rig.ws->refuse = true;
+        c.send({{"id", 2}, {"method", "mining.authorize"}, {"params", {garbage, "x"}}});
+        const auto r = c.wait_id(2);
+        ASSERT_TRUE(r.has_value());
+        EXPECT_FALSE((*r)["result"].get<bool>());
+        c.send({{"id", 3}, {"method", "mining.set_merged_addresses"}, {"params", {{{"98", x}}}}});
+        c.wait_id(3);
+        rig.ws->refuse = false;
+        ASSERT_TRUE(rig.step(c, 4, "mining.authorize", {garbage, "x"}));
+        EXPECT_EQ(last_payout(rig), core::address_to_script(x))
+            << "a login refused by the work source did not make the connection an authorized one";
+    }
+    // authorize_refusal: the refused login's address is not committed
+    {
+        SessionRig rig({98}, /*redistribute=*/true);
+        rig.ws->split_owner = owner;
+        LineClient c(rig.port);
+        ASSERT_GE(c.fd, 0);
+        rig.step(c, 1, "mining.subscribe", nlohmann::json::array());
+        ASSERT_TRUE(rig.step(c, 2, "mining.authorize", {garbage, "x"}));
+        rig.ws->refuse = true;
+        c.send({{"id", 3}, {"method", "mining.authorize"}, {"params", {garbage + "," + d1, "x"}}});
+        const auto r = c.wait_id(3);
+        ASSERT_TRUE(r.has_value());
+        EXPECT_FALSE((*r)["result"].get<bool>());
+        rig.ws->refuse = false;
+        ASSERT_TRUE(rig.step(c, 4, "mining.authorize", {garbage, "x"}));
+        EXPECT_EQ(last_payout(rig), owner) << "the refused login's D1 was not committed: the split";
+    }
+    // a set while no login is accepted supersedes the previous login's address
+    {
+        SessionRig rig({98}, /*redistribute=*/true);
+        rig.ws->split_owner = owner;
+        LineClient c(rig.port);
+        ASSERT_GE(c.fd, 0);
+        rig.step(c, 1, "mining.subscribe", nlohmann::json::array());
+        ASSERT_TRUE(rig.step(c, 2, "mining.authorize", {garbage + "," + d1, "x"}));
+        EXPECT_EQ(last_payout(rig), core::address_to_script(d1));
+        rig.ws->ready = false;
+        c.send({{"id", 3}, {"method", "mining.authorize"}, {"params", {garbage, "x"}}});
+        c.wait_id(3);
+        c.send({{"id", 4}, {"method", "mining.set_merged_addresses"}, {"params", {{{"98", d2}}}}});
+        c.wait_id(4);
+        rig.ws->ready = true;
+        ASSERT_TRUE(rig.step(c, 5, "mining.authorize", {garbage, "x"}));
+        std::lock_guard<std::mutex> l(rig.ws->mu);
+        EXPECT_EQ(rig.ws->builds.back().at(98), core::address_to_script(d2)) << "the address set now pays DOGE";
+        EXPECT_NE(rig.ws->payouts.back(), core::address_to_script(d1)) << "the superseded D1 is not the parent key";
+    }
 }
 
 // A P2SH primary: its merged chains are paid to the same P2SH script (as

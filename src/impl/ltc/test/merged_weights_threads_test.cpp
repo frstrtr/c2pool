@@ -59,6 +59,7 @@
 
 #include <btclibs/util/strencodings.h>
 #include <c2pool/merged/merged_mining.hpp>
+#include <c2pool/merged/merged_donation.hpp>
 #include <c2pool/merged/payout_source.hpp>
 #include <core/uint256.hpp>
 #include <impl/ltc/share.hpp>
@@ -423,7 +424,10 @@ uint256 build_identity_chain(ltc::ShareTracker& t)
 // The values the code computed for the identity fixture before the
 // concurrency fix (origin/master 59b781cdf, single-threaded, cold caches; the
 // fix only adds locking: same tracker state, same bytes). SHA256d of the
-// serializations above; the merged payout hash as is.
+// serializations above; the merged payout hash as is. The merged coinbase's
+// donation output pays the single P2PKH key since (merged_donation.hpp): its
+// golden is that of the coinbase with that one output's script put back to
+// the combined P2SH (old_donation_coinbase), every other byte as before.
 constexpr const char* kGoldenMergedWeights  = "4d8780506af83ff1c96497c9b88bba155d8558378abb2af50f3d4f97dc44fedd";
 constexpr const char* kGoldenMergedPayouts  = "a7ffc1a32947214379fa824087514157eb95833c3aeef5784565c1cb26848b41";
 constexpr const char* kGoldenMergedCoinbase = "91a414acc373601061b4428c7bfbebf99ae5892bd10ffea9cebfd2c63a90da30";
@@ -433,11 +437,26 @@ constexpr const char* kGoldenMergedHash     = "e7e341bd0a19f02e3d9bf374e8831faed
 constexpr const char* kGoldenDecayed        = "b443412ec48549fe1762a0c2d390d8a3dd41bce206656a6d8bf85a73d3159145";
 constexpr const char* kGoldenCapped         = "c8f0744b6d299b8191fbed4c7995c1862bb4153fe48369b6e7e3bd0bbde44f90";
 
+/// A merged coinbase whose last output (before the locktime) pays the single
+/// P2PKH donation, with that output's script replaced by the combined P2SH the
+/// aux coinbase paid before; "" if the last output is not that donation.
+std::string old_donation_coinbase(const std::string& cb)
+{
+    const std::string now = "19" + hex_of(c2pool::merged::merged_donation_script());
+    const std::string old = "17" + hex_of(combined_donation());
+    if (cb.size() < now.size() + 8 || cb.compare(cb.size() - 8 - now.size(), now.size(), now) != 0)
+        return {};
+    return cb.substr(0, cb.size() - 8 - now.size()) + old + cb.substr(cb.size() - 8);
+}
+
 void expect_golden(const Snapshot& s, const std::string& when)
 {
     EXPECT_EQ(digest(s.merged_weights), kGoldenMergedWeights) << when << ": merged payout weights";
     EXPECT_EQ(digest(s.merged_payouts), kGoldenMergedPayouts) << when << ": merged payouts";
-    EXPECT_EQ(digest(s.merged_coinbase), kGoldenMergedCoinbase) << when << ": merged coinbase bytes";
+    EXPECT_FALSE(old_donation_coinbase(s.merged_coinbase).empty())
+        << when << ": the merged coinbase's last output pays the single P2PKH donation";
+    EXPECT_EQ(digest(old_donation_coinbase(s.merged_coinbase)), kGoldenMergedCoinbase)
+        << when << ": merged coinbase bytes (donation script aside)";
     EXPECT_EQ(digest(s.nmc_weights), kGoldenNmcWeights) << when << ": NMC weights";
     EXPECT_EQ(digest(s.v36_weights), kGoldenV36Weights) << when << ": v36 merged weights";
     EXPECT_EQ(s.merged_hash, kGoldenMergedHash) << when << ": merged payout hash";

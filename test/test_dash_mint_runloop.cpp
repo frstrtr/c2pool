@@ -729,6 +729,178 @@ TEST(DashMintRunloop, DonationFieldDecaysPplnsWeight)
     EXPECT_EQ(w.total_weight, att * 65535u);
 }
 
+// (11b) --redistribute split (the default): work with no usable payout
+//       address (broken credentials, or the job sent right after subscribe,
+//       built before the login: an empty payout) is minted under the node
+//       owner with donation core::kSplitShareDonation (32768 of 65535): PPLNS
+//       gives the owner and the donation half of the share's weight each. The
+//       minted share carries the identity and donation its job froze, even
+//       when the share is submitted under the miner's (now authorized) login.
+//       No usable owner: the pplns arm. The other modes are unchanged.
+TEST(DashMintRunloop, SplitMintsTheOwnerWithHalfTheWeightToTheDonation)
+{
+    using dash::mint::MintFeePolicy;
+    using dash::mint::resolve_mint_identity;
+
+    // split is the default; the other spellings parse as before.
+    EXPECT_EQ(MintFeePolicy{}.redistribute, MintFeePolicy::Redistribute::SPLIT);
+    EXPECT_STREQ(MintFeePolicy::kDefaultRedistribute, "split");
+    EXPECT_EQ(MintFeePolicy::parse_redistribute(MintFeePolicy::kDefaultRedistribute),
+              MintFeePolicy::Redistribute::SPLIT);
+    EXPECT_EQ(MintFeePolicy::parse_redistribute("pplns"), MintFeePolicy::Redistribute::PPLNS);
+    EXPECT_EQ(MintFeePolicy::parse_redistribute("fee"), MintFeePolicy::Redistribute::FEE);
+    EXPECT_EQ(MintFeePolicy::parse_redistribute("boost"), MintFeePolicy::Redistribute::BOOST);
+    EXPECT_EQ(MintFeePolicy::parse_redistribute("donate"), MintFeePolicy::Redistribute::DONATE);
+    EXPECT_EQ(MintFeePolicy::parse_redistribute("garbage"), MintFeePolicy::Redistribute::PPLNS);
+
+    const auto params = easy_params();
+    dash::ShareTracker tracker;
+    tracker.m_coin_params = params;
+    const uint160 owner_pkh = h160_uniform(0x99);
+    const uint160 miner_pkh = h160_uniform(0x22);
+    const auto owner_script = dash::pubkey_hash_to_script2(owner_pkh);
+    const auto miner_script = dash::pubkey_hash_to_script2(miner_pkh);
+
+    MintFeePolicy p;                     // redistribute: split (default)
+    p.donation_u16 = 66;                 // --give-author 0.1%
+    p.node_owner_script = owner_script;  // --node-owner-address
+
+    // the job built before the login (empty payout) and a broken login
+    for (const auto& unusable : {std::vector<unsigned char>{}, std::vector<unsigned char>{0x00, 0x14}}) {
+        auto id = resolve_mint_identity(p, unusable, 5000);
+        ASSERT_TRUE(id.has_value());
+        EXPECT_TRUE(id->substituted);
+        EXPECT_EQ(id->payout_script, owner_script);
+        EXPECT_EQ(id->donation_u16, 32768) << "the split donation, not added to --give-author's";
+        EXPECT_EQ(id->donation_u16, core::kSplitShareDonation);
+    }
+    // a usable login keeps its own share and the node's donation
+    auto keep = resolve_mint_identity(p, miner_script, 0);
+    ASSERT_TRUE(keep.has_value());
+    EXPECT_FALSE(keep->substituted);
+    EXPECT_EQ(keep->payout_script, miner_script);
+    EXPECT_EQ(keep->donation_u16, 66);
+
+    // mint the split job; it is submitted under the miner's login
+    auto id = resolve_mint_identity(p, {}, 5000);
+    ASSERT_TRUE(id.has_value());
+    auto wd = make_workdata();
+    auto solved = solve_job(tracker, params, uint256(), owner_pkh, wd, 51, id->donation_u16);
+    ASSERT_TRUE(solved.solved);
+    solved.in.payout_script = miner_script;
+    auto built = mint_from_inputs(tracker.chain, params, solved.in, solved.frozen);
+    ASSERT_TRUE(built.has_value()) << "the work is credited, not refused";
+    EXPECT_EQ(built->share.m_pubkey_hash, owner_pkh);
+    EXPECT_EQ(built->share.m_donation, 32768);
+
+    // PPLNS: half of the share's weight to the owner, half to the donation
+    dash::ShareType st;
+    st = new dash::DashShare(built->share);
+    tracker.add(st);
+    const uint288 att = chain::target_to_average_attempts(chain::bits_to_target(built->share.m_bits));
+    uint288 big;
+    big.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    auto w = dash::producer::get_cumulative_weights(tracker.chain, built->share.m_hash, 1, big);
+    ASSERT_EQ(w.weights.count(owner_script), 1u);
+    EXPECT_EQ(w.weights[owner_script], att * 32767u);
+    EXPECT_EQ(w.donation_weight, att * 32768u);
+    EXPECT_EQ(w.total_weight, att * 65535u);
+
+    // no usable owner: the owner half cannot be paid -> the pplns arm
+    MintFeePolicy no_owner = p;
+    no_owner.node_owner_script.clear();
+    EXPECT_FALSE(resolve_mint_identity(no_owner, {}, 0).has_value()) << "pplns on an empty window declines";
+    dash::mint::RedistributeInputs ri;
+    ri.candidates = {{miner_script, 10}};
+    ri.pplns_roll = 3;
+    auto pick = resolve_mint_identity(no_owner, {}, 0, ri);
+    ASSERT_TRUE(pick.has_value());
+    EXPECT_EQ(pick->payout_script, miner_script);
+    EXPECT_EQ(pick->donation_u16, 66) << "pplns: the node's donation, as before";
+}
+
+// (11c) A split job keeps the donation it froze through the registry's churn:
+//       (a) the policy changes after the job was built (pplns, donate): the
+//           share minted from the held job still carries the owner and 32768;
+//       (b) the job cache's re-put (P2' age refresh) keeps it: the lookup past
+//           the first put's age still returns 32768;
+//       (c) aged out: the mint is a miss with cause=age, never a share under a
+//           fresh identity (a job rebuilt under the new policy cannot mint the
+//           solved header).
+TEST(DashMintRunloop, SplitJobKeepsItsFrozenDonationThroughRegistryChurn)
+{
+    using dash::mint::MintFeePolicy;
+    using dash::mint::resolve_mint_identity;
+    const auto params = easy_params();
+    dash::ShareTracker tracker;
+    tracker.m_coin_params = params;
+    const uint160 owner_pkh = h160_uniform(0x99);
+    const auto owner_script = dash::pubkey_hash_to_script2(owner_pkh);
+    const auto miner_script = dash::pubkey_hash_to_script2(h160_uniform(0x22));
+
+    MintFeePolicy p;                     // split (default)
+    p.donation_u16 = 66;
+    p.node_owner_script = owner_script;
+    auto id = resolve_mint_identity(p, {}, 5000);   // the job built before the login
+    ASSERT_TRUE(id.has_value());
+    ASSERT_EQ(id->donation_u16, 32768);
+    auto wd = make_workdata();
+    auto solved = solve_job(tracker, params, uint256(), owner_pkh, wd, 71, id->donation_u16);
+    ASSERT_TRUE(solved.solved);
+    ASSERT_EQ(solved.frozen.donation, 32768);
+    solved.in.payout_script = miner_script;   // submitted under the miner's login
+
+    auto t = std::chrono::steady_clock::time_point{} + std::chrono::hours(1);
+    FrozenJobRegistry registry(dash::mint::FrozenRegistryConfig{}, [&t] { return t; });
+    const uint256 coin_tip = wd.m_previous_block;
+    registry.put(solved.in.ref_hash, solved.frozen, coin_tip, uint256());
+
+    // (a) the policy moves on: new jobs change, the held one does not
+    for (const auto mode : {MintFeePolicy::Redistribute::PPLNS, MintFeePolicy::Redistribute::DONATE}) {
+        p.redistribute = mode;
+        const auto fresh = resolve_mint_identity(p, {}, 5000);
+        if (fresh)
+            EXPECT_NE(fresh->donation_u16, 32768) << "a new job under the new policy";
+        auto job = dash::mint::frozen_job_for_mint(registry, solved.in.ref_hash);
+        ASSERT_TRUE(job.has_value());
+        EXPECT_EQ(job->donation, 32768);
+        auto built = mint_from_inputs(tracker.chain, params, solved.in, *job);
+        ASSERT_TRUE(built.has_value());
+        EXPECT_EQ(built->share.m_pubkey_hash, owner_pkh);
+        EXPECT_EQ(built->share.m_donation, 32768);
+    }
+
+    // (b) a re-put (the job cache serving the same job) refreshes the age
+    t += std::chrono::seconds(300);
+    registry.put(solved.in.ref_hash, solved.frozen, coin_tip, uint256());
+    t += std::chrono::seconds(300);   // 600 s after the first put, 300 s after the re-put
+    dash::stratum::FrozenMintJob other;
+    registry.put(h256_tag(0x71), other, coin_tip, uint256());   // runs the eviction
+    {
+        const auto look = registry.lookup_for_mint(solved.in.ref_hash);
+        ASSERT_TRUE(look.job.has_value()) << "the re-put kept the split job";
+        EXPECT_EQ(look.job->donation, 32768);
+        EXPECT_EQ(look.job->payout_script_override, owner_script);
+    }
+
+    // (c) aged out: a miss named age, and no share under another identity
+    t += std::chrono::seconds(421);
+    registry.put(h256_tag(0x72), other, coin_tip, uint256());
+    std::string line;
+    EXPECT_FALSE(dash::mint::frozen_job_for_mint(registry, solved.in.ref_hash, &line).has_value());
+    EXPECT_NE(line.find(" cause=age"), std::string::npos) << line;
+    const auto miss = registry.lookup_for_mint(solved.in.ref_hash);
+    EXPECT_FALSE(miss.job.has_value());
+    EXPECT_TRUE(miss.evicted);
+    EXPECT_EQ(miss.cause, dash::mint::FrozenEvictCause::age);
+    p.redistribute = MintFeePolicy::Redistribute::DONATE;
+    const auto donate = resolve_mint_identity(p, {}, 5000);
+    ASSERT_TRUE(donate.has_value());
+    auto rebuilt = solve_job(tracker, params, uint256(), owner_pkh, wd, 71, donate->donation_u16);
+    EXPECT_FALSE(mint_from_inputs(tracker.chain, params, solved.in, rebuilt.frozen).has_value())
+        << "a job rebuilt under another identity cannot mint the solved share";
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 // (8) 1.67% pool-share cap END-TO-END through build_producer_job.
 //

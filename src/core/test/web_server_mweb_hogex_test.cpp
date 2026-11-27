@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #include <gtest/gtest.h>
 
+#include <optional>
+
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
@@ -290,7 +292,8 @@ void stub_ref_hash(MiningInterface& mi)
                           uint64_t, uint32_t, uint32_t,
                           bool, const std::string&, const uint256&,
                           const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>&,
-                          const std::vector<uint256>&) {
+                          const std::vector<uint256>&,
+                          const std::optional<uint16_t>&) {
         MiningInterface::RefHashResult r;
         r.ref_hash.SetHex(rep("5", 64));
         r.bits = 0x207fffff;
