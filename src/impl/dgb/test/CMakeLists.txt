@@ -351,7 +351,7 @@ if (BUILD_TESTING AND GTest_FOUND)
                    mint_round_trip_test.cpp doge_p2sh_split_test.cpp
                    main_dgb_wiring_test.cpp dormant_chain_revive_test.cpp mint_retry_test.cpp
                    v35_address_test.cpp pplns_v35_order_test.cpp v35_hold_test.cpp
-                   v35_share_info_test.cpp)
+                   v35_share_info_test.cpp oracle_vectors_test.cpp)
     target_link_libraries(dgb_work_source_test PRIVATE
         GTest::gtest_main GTest::gtest
         core dgb dgb_stratum
