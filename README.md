@@ -1508,7 +1508,7 @@ dashd-attached default OFF)
 | `--embedded-ingest-isdlock[=false]` | `MSG_ISDLOCK` feed (InstantSend conflict locks, BLS-gated). |
 | `--embedded-ingest-dstx[=false]` | CoinJoin DSTX lane. |
 | `--embedded-include-mn-special-txs[=false]` | DIP special-tx superset (types 1–4). |
-| `--embedded-include-v24-provider-txs[=false]` | Dash Core v24 provider types 10–12 (ProDisTx, ProUpShareTx, ProUpSharedRegTx) with the superset, from v24 activation. Default ON in both postures; `=false` keeps them out, types 1–4 unaffected. |
+| `--embedded-include-v24-provider-txs[=false]` | Dash Core v24 provider types 10–12 (ProDisTx, ProUpShareTx, ProUpSharedRegTx) and v24 shared registrations (type-1 ProRegTx in the shared format) with the superset, from v24 activation. Default ON in both postures; `=false` keeps them out, other types 1–4 unaffected. |
 | `--embedded-accrue-asset-locks[=false]` / `--embedded-accrue-asset-unlocks[=false]` | Type-8 / type-9 asset-lock/unlock fold. |
 | `--embedded-utxo-immature-serve-empty` | Serve coinbase-only until the UTXO view is mature. |
 | `--embedded-creditpool-publish-at-serve-tip` | Publish the derived credit pool at the serve tip (money path, default OFF). |

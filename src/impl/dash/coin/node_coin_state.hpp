@@ -471,9 +471,11 @@ public:
 
     /// --embedded-include-v24-provider-txs (default ON): with the superset
     /// above armed and Dash Core v24 active, OFF keeps the shared-masternode
-    /// types 10-12 (ProDisTx, ProUpShareTx, ProUpSharedRegTx) out of the
-    /// served body while types 1-4 still ride; the emit gate then refuses any
-    /// body that carries one. ON is today's behaviour.
+    /// types 10-12 (ProDisTx, ProUpShareTx, ProUpSharedRegTx) and v24 shared
+    /// registrations (type-1 ProRegTx in the shared format,
+    /// is_v24_shared_registration) out of the served body while every other
+    /// type 1-4 tx still rides; the emit gate then refuses any body that
+    /// carries one. ON is today's behaviour.
     void set_include_v24_provider_txs(bool v) { m_include_v24_provider_txs = v; bump_root_memo_epoch(); }
     bool include_v24_provider_txs() const { return m_include_v24_provider_txs; }
 
@@ -1946,17 +1948,22 @@ public:
         // by design. With the special-tx fold armed it is allowed through here
         // and the fold below checks it and removes the masternode (refusing the
         // template on any doubt). Under the v24 provider opt-out no type 10-12
-        // tx may ride at all, and a ProDisTx is a collateral spend like any
-        // other.
+        // tx and no v24 shared registration may ride at all, and a ProDisTx is
+        // a collateral spend like any other.
         const bool v24_fold = m_include_mn_special_txs && m_include_v24_provider_txs
                               && v24_state_for(next_h) == V24State::ACTIVE;
         for (const auto& tx : w.m_txs) {
             uint256 protx;
-            if (!m_include_v24_provider_txs && tx_is_special_version(tx.version)
-                && tx_type_is_v24_provider(tx.type))
-                return reject("emit-v24-provider-tx-opted-out",
-                              "type=" + std::to_string(tx.type),
-                              "no-type-10-12-in-template");
+            if (!m_include_v24_provider_txs && tx_is_special_version(tx.version)) {
+                if (tx_type_is_v24_provider(tx.type))
+                    return reject("emit-v24-provider-tx-opted-out",
+                                  "type=" + std::to_string(tx.type),
+                                  "no-v24-provider-tx-in-template");
+                if (is_v24_shared_registration(tx))
+                    return reject("emit-v24-provider-tx-opted-out",
+                                  "type=1-shared-registration",
+                                  "no-v24-provider-tx-in-template");
+            }
             if (v24_fold && tx_is_special_version(tx.version) && tx.type == tx_type::PROVIDER_DISSOLVE)
                 continue;
             if (tx_spends_mn_collateral(m_mnstates, tx, &protx))
@@ -2464,7 +2471,8 @@ public:
         // SUPERSET: include provider special txs (types 1-4) + fold them into
         // the committed merkleRootMNList. Default OFF (canary flag).
         e.include_mn_special_txs = m_include_mn_special_txs;
-        // v24 provider types 10-12 (default ON; OFF keeps them out).
+        // v24 provider types 10-12 and v24 shared registrations (default ON;
+        // OFF keeps them out).
         e.include_v24_provider_txs = m_include_v24_provider_txs;
         // GBT-xcheck label aid (never served; false => nothing kept).
         e.want_xcheck_aid = m_xcheck_collateral_aid;
@@ -3147,7 +3155,8 @@ private:
     bool m_include_mn_special_txs{false};
     // --embedded-include-v24-provider-txs (set_include_v24_provider_txs).
     // Default ON. Consumed by make_embedded_work_inputs (builder) and
-    // embedded_template_emit_ok (refuses a type 10-12 tx while OFF).
+    // embedded_template_emit_ok (refuses a type 10-12 tx or a v24 shared
+    // registration while OFF).
     bool m_include_v24_provider_txs{true};
     // GBT-xcheck label aid requested (set_xcheck_collateral_aid). Default OFF.
     bool m_xcheck_collateral_aid{false};

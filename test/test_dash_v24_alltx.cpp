@@ -16,7 +16,8 @@
 //   * types 1-4 under v24: the template fold now runs the v24 transitions
 //     (a revocation keeps a basic state's version);
 //   * the operator opt-out --embedded-include-v24-provider-txs=false: types
-//     10-12 stay out of the template, types 1-4 still ride.
+//     10-12 and v24 shared registrations stay out of the template, every
+//     other type 1-4 tx still rides.
 //
 // This TU rides test_dash_govvote_bls (the BLS-backend target).
 
@@ -3047,8 +3048,9 @@ TEST(DashV24AllTx, P2FoldMemoServesAChainCoinFoldOnlyWhileItsAnswersHold)
 
 // ── The v24 provider opt-out (--embedded-include-v24-provider-txs=false) ─────
 // The superset lever admits types 1-4 and, from v24 activation, the shared
-// types 10-12. The opt-out keeps 10-12 out and nothing else: types 1-4 still
-// ride, the fees of the txs left out leave the coinbase with them, and the
+// types 10-12. The opt-out keeps 10-12 (and, below, v24 shared registrations)
+// out and nothing else: types 1-4 still ride, the fees of the txs left out
+// leave the coinbase with them, and the
 // committed root is the block-connect root of the body served. ON (the
 // default) is the template every caller built before the flag existed.
 
@@ -3275,49 +3277,207 @@ TEST(DashV24AllTx, V24ProviderOptOutChangesNothingBeforeActivation)
     }
 }
 
-TEST(DashV24AllTx, V24ProviderOptOutKeepsAType1SharedRegistration)
+// The opt-out also holds a type-1 ProRegTx in the v24 shared-registration
+// format (mempool.hpp is_v24_shared_registration: a version-3 payload with a
+// share table, CProRegTx::IsShared). Every other type-1 payload rides as before.
+
+namespace {
+const RealProReg& tn_shared_registration()
 {
-    // A shared registration is a type-1 ProRegTx: the opt-out names types
-    // 10-12 only, so it still rides (BuilderCarriesARealSharedRegistrationOnlyAtV24).
-    V24World w;
-    const RealProReg* r = nullptr;
     for (const auto& f : kTnProRegV3)
-        if (std::string(f.txid) == "8699ef5afd141f7b02f170db4f4875468ace2f6c84c6889f3e0280633ba65f40") r = &f;
-    ASSERT_NE(r, nullptr);
-    const auto tx = tx_from_hex(r->hex);
-    ::core::coin::UTXOViewCache utxo(nullptr);
-    utxo.add_coin(::core::coin::Outpoint(u256("be2d2879d9c61c0be23d2e2a776258ecd34a0c305e08686d9be4c37386af0c0e"), 1),
-                  ::core::coin::Coin(59'949'999'775, script_of(unhex("76a9147e043aa93e5160be7d0a9051af26727304fbbbc988ac")),
-                                     1'583'288, false));
-    utxo.add_coin(::core::coin::Outpoint(u256("87b3ecbef212122cab1b6417d14a3e3dea52856e50e0de5f55ee0c6c865768a5"), 1),
-                  ::core::coin::Coin(100'000'000, script_of(unhex("76a91461c8a7a076a563357c2668c73a0f0f64882e607388ac")),
-                                     1'583'287, false));
-    utxo.add_coin(::core::coin::Outpoint(u256("be2d2879d9c61c0be23d2e2a776258ecd34a0c305e08686d9be4c37386af0c0e"), 0),
-                  ::core::coin::Coin(40'050'000'000, script_of(unhex("76a914837502f9d1483f4a19b153da729c4e2e49691d3488ac")),
-                                     1'583'288, false));
+        if (std::string(f.txid) == kTnSharedPro) return f;
+    ADD_FAILURE() << "fixture: the shared registration is not in kTnProRegV3";
+    return kTnProRegV3[0];
+}
+/// The real testnet shared registration of BuilderCarriesARealSharedRegistrationOnlyAtV24
+/// and a child spending its first output (P2PKH change), both pooled when
+/// `pooled`; their funding coins are in the view either way.
+struct SharedRegPool {
+    V24World w;
+    const RealProReg& r = tn_shared_registration();
+    MutableTransaction reg = tx_from_hex(r.hex);
+    MutableTransaction child;
+    ::core::coin::UTXOViewCache utxo{nullptr};
     dash::coin::Mempool mp;
-    mp.set_utxo(&utxo);
-    ASSERT_TRUE(mp.add_tx(tx));
-    const auto sml = w.base_sml();
+    v::CSimplifiedMNList sml;
     dash::coin::QuorumManager qmgr;
     dash::coin::ProTxCheckEnv env;
-    env.net = dash::coin::DashNetwork::TESTNET;
-    env.ecdsa = &dash::coin::protx_ecdsa_verify_hash;
-    const dash::coin::MnFoldContext::OperatorSigFn sigfn = &v::verify_protx_operator_sig;
-    auto build = [&](bool include_v24) {
+    dash::coin::MnFoldContext::OperatorSigFn sigfn = &v::verify_protx_operator_sig;
+
+    explicit SharedRegPool(bool pooled = true)
+    {
+        // Its funding coins, from testnet blocks 1,583,287-1,583,288.
+        utxo.add_coin(::core::coin::Outpoint(u256("be2d2879d9c61c0be23d2e2a776258ecd34a0c305e08686d9be4c37386af0c0e"), 1),
+                      ::core::coin::Coin(59'949'999'775,
+                                         script_of(unhex("76a9147e043aa93e5160be7d0a9051af26727304fbbbc988ac")),
+                                         1'583'288, false));
+        utxo.add_coin(::core::coin::Outpoint(u256("87b3ecbef212122cab1b6417d14a3e3dea52856e50e0de5f55ee0c6c865768a5"), 1),
+                      ::core::coin::Coin(100'000'000,
+                                         script_of(unhex("76a91461c8a7a076a563357c2668c73a0f0f64882e607388ac")),
+                                         1'583'287, false));
+        utxo.add_coin(::core::coin::Outpoint(u256("be2d2879d9c61c0be23d2e2a776258ecd34a0c305e08686d9be4c37386af0c0e"), 0),
+                      ::core::coin::Coin(40'050'000'000,
+                                         script_of(unhex("76a914837502f9d1483f4a19b153da729c4e2e49691d3488ac")),
+                                         1'583'288, false));
+        mp.set_utxo(&utxo);
+        child = tx_with_inputs(0, {{txid(reg), 0}});
+        child.vout.push_back(txout(reg.vout[0].value - 10'000, p2pkh(ec_key(0x5e).id)));
+        if (pooled) {
+            EXPECT_TRUE(mp.add_tx(reg));
+            EXPECT_TRUE(mp.add_tx(child));
+        }
+        sml = w.base_sml();
+        env.net = dash::coin::DashNetwork::TESTNET;
+        env.ecdsa = &dash::coin::protx_ecdsa_verify_hash;
+    }
+    dash::coin::DashWorkData build(bool v24, std::optional<bool> include_v24) const
+    {
+        if (!include_v24)
+            return dash::coin::build_embedded_workdata(
+                r.height - 1, h256(0xAB), w.sm, mp, 0x1b104be3u, 1'790'987'000u, 140, 19, 1'790'987'100u,
+                0x20000000u, nullptr, &sml, &qmgr, 0, dash::coin::k_zero_cl_sig, 0, nullptr, nullptr,
+                dash::coin::DASH_MN_RR_HEIGHT_MAINNET, nullptr, dash::coin::DASH_MN_MIN_CONFIRMATIONS_MAINNET,
+                /*suppress=*/false, "utxo-immature-serving", nullptr, false, nullptr,
+                /*include_mn_special_txs=*/true, nullptr, nullptr, &sigfn, v24, &env, nullptr);
         return dash::coin::build_embedded_workdata(
-            r->height - 1, h256(0xAB), w.sm, mp, 0x1b104be3u, 1'790'987'000u, 140, 19, 1'790'987'100u, 0x20000000u,
+            r.height - 1, h256(0xAB), w.sm, mp, 0x1b104be3u, 1'790'987'000u, 140, 19, 1'790'987'100u,
+            0x20000000u, nullptr, &sml, &qmgr, 0, dash::coin::k_zero_cl_sig, 0, nullptr, nullptr,
+            dash::coin::DASH_MN_RR_HEIGHT_MAINNET, nullptr, dash::coin::DASH_MN_MIN_CONFIRMATIONS_MAINNET,
+            /*suppress=*/false, "utxo-immature-serving", nullptr, false, nullptr,
+            /*include_mn_special_txs=*/true, nullptr, nullptr, &sigfn, v24, &env, nullptr,
+            /*want_xcheck_aid=*/false, /*include_v24_provider_txs=*/*include_v24);
+    }
+};
+/// The real mainnet legacy-format (version 2) ProRegTx of
+/// RealMainnetCollateralReuseProRegTxRidesOurTemplate, with its list and coins.
+struct LegacyRegPool {
+    static constexpr uint32_t kH = 2'569'332;
+    MutableTransaction reg = tx_from_hex(kMainProReg);
+    MnStateMachine sm;
+    v::CSimplifiedMNList sml;
+    ::core::coin::UTXOViewCache utxo{nullptr};
+    dash::coin::Mempool mp;
+    dash::coin::QuorumManager qmgr;
+    dash::coin::ProTxCheckEnv env;
+    dash::coin::MnFoldContext::OperatorSigFn sigfn = &v::verify_protx_operator_sig;
+
+    LegacyRegPool()
+    {
+        const uint256 old_pro = u256("6544976109c4e181344fa61595c68424e0e336292882f68129f84f1a54893305");
+        const uint256 coll_hash = u256("eaf3185b4391dfc8f260f90747f042da09b04d383528e2c373faceeae02e8b7a");
+        MNState old;
+        old.nVersion = v::ProTxVersion::BASIC_BLS;
+        old.nType = v::MnType::REGULAR;
+        old.collateralOutpoint.hash = coll_hash;
+        old.collateralOutpoint.index = 1;
+        old.keyIDOwner = u160_from_p2pkh("76a91488b281127b8911ed78356a3ce1322490d20d155188ac");
+        old.keyIDVoting = old.keyIDOwner;
+        old.pubKeyOperator = arr_hex<48>(
+            "826b5d2455e2eae4810888658eb68e2c53b7706ae7dba242b00b1071f0e8ed7558b647cd6a0fd324f2a4b36df803a01a");
+        old.netInfo = ipv4(43, 224, 35, 163, 9999);
+        old.scriptPayout = script_of(unhex("76a914084229eacbab19b23f72607bf22c594e4b9fabce88ac"));
+        old.nRegisteredHeight = 2'568'790;
+        old.isValid = false;
+        old.nPoSeBanHeight = 2'569'290;
+        old.payoutSplitProvenance = MNState::SPLIT_KNOWN;
+        V24World w;
+        MNState other = w.regular;
+        other.nRegisteredHeight = 2'500'000;
+        other.payoutSplitProvenance = MNState::SPLIT_KNOWN;
+        sm.load({{old_pro, old}, {w.R, other}}, kH - 1);
+        std::vector<v::CSimplifiedMNListEntry> leaves = {to_replay(old_pro, old, h256(0x62)).to_sml_entry(old_pro),
+                                                         to_replay(w.R, other, h256(0x61)).to_sml_entry(w.R)};
+        sml = v::CSimplifiedMNList(std::move(leaves));
+        sml.sort();
+        utxo.add_coin(::core::coin::Outpoint(u256("401350de0d7da5cbe0c76ce5f2d404017a14f75fed9e3e1a712d67387437a98e"), 2),
+                      ::core::coin::Coin(77'071'322,
+                                         script_of(unhex("76a91488b281127b8911ed78356a3ce1322490d20d155188ac")),
+                                         2'560'957, false));
+        utxo.add_coin(::core::coin::Outpoint(coll_hash, 1),
+                      ::core::coin::Coin(kColl, script_of(unhex("76a914332e2bab0ef016af7102f42db2866cf44f21033488ac")),
+                                         1'302'450, false));
+        mp.set_utxo(&utxo);
+        EXPECT_TRUE(mp.add_tx(reg));
+        env.net = dash::coin::DashNetwork::MAINNET;
+        env.ecdsa = &dash::coin::protx_ecdsa_verify_hash;
+    }
+    dash::coin::DashWorkData build(bool v24, std::optional<bool> include_v24) const
+    {
+        if (!include_v24)
+            return dash::coin::build_embedded_workdata(
+                kH - 1, h256(0xAB), sm, mp, 0x191ca6f1u, 1'794'215'316u, 76, 16, 1'794'215'564u, 0x20000000u,
+                nullptr, &sml, &qmgr, 0, dash::coin::k_zero_cl_sig, 0, nullptr, nullptr,
+                dash::coin::DASH_MN_RR_HEIGHT_MAINNET, nullptr, dash::coin::DASH_MN_MIN_CONFIRMATIONS_MAINNET,
+                /*suppress=*/false, "utxo-immature-serving", nullptr, false, nullptr,
+                /*include_mn_special_txs=*/true, nullptr, nullptr, &sigfn, v24, &env, nullptr);
+        return dash::coin::build_embedded_workdata(
+            kH - 1, h256(0xAB), sm, mp, 0x191ca6f1u, 1'794'215'316u, 76, 16, 1'794'215'564u, 0x20000000u,
             nullptr, &sml, &qmgr, 0, dash::coin::k_zero_cl_sig, 0, nullptr, nullptr,
             dash::coin::DASH_MN_RR_HEIGHT_MAINNET, nullptr, dash::coin::DASH_MN_MIN_CONFIRMATIONS_MAINNET,
             /*suppress=*/false, "utxo-immature-serving", nullptr, false, nullptr,
-            /*include_mn_special_txs=*/true, nullptr, nullptr, &sigfn, /*v24_active=*/true, &env, nullptr,
-            /*want_xcheck_aid=*/false, include_v24);
-    };
-    const auto on = build(true);
-    ASSERT_TRUE(opt_rides(on, tx)) << "fixture: the shared registration rides ON";
-    const auto off = build(false);
-    EXPECT_TRUE(opt_rides(off, tx)) << "a type-1 tx is not opted out";
-    EXPECT_TRUE(SameTemplate(on, off)) << "no type 10-12 in the pool: nothing changes";
+            /*include_mn_special_txs=*/true, nullptr, nullptr, &sigfn, v24, &env, nullptr,
+            /*want_xcheck_aid=*/false, /*include_v24_provider_txs=*/*include_v24);
+    }
+};
+}  // namespace
+
+TEST(DashV24AllTx, V24ProviderOptOutHoldsASharedRegistrationAndKeepsALegacyProRegTx)
+{
+    {   // The v24 shared registration is held, with its package.
+        SharedRegPool p;
+        ASSERT_TRUE(dash::coin::is_v24_shared_registration(p.reg)) << "the format marker";
+        const auto on = p.build(/*v24=*/true, true);
+        ASSERT_TRUE(opt_rides(on, p.reg)) << "fixture: the shared registration rides ON";
+        ASSERT_TRUE(opt_rides(on, p.child)) << "fixture: its child rides ON";
+        const auto off = p.build(/*v24=*/true, false);
+        EXPECT_FALSE(opt_rides(off, p.reg)) << "the shared registration rode";
+        EXPECT_FALSE(opt_rides(off, p.child)) << "its child rode without it";
+        EXPECT_TRUE(off.m_xcheck_collateral_excluded_txids.empty());
+        // Simply not selected: the template of a pool that never held it.
+        const SharedRegPool empty(/*pooled=*/false);
+        EXPECT_TRUE(SameTemplate(off, empty.build(/*v24=*/true, false)));
+        EXPECT_TRUE(SameTemplate(off, empty.build(/*v24=*/true, true)));
+        v::CCbTx cb_on, cb_off;
+        ASSERT_TRUE(v::parse_cbtx(on.m_coinbase_payload, cb_on));
+        ASSERT_TRUE(v::parse_cbtx(off.m_coinbase_payload, cb_off));
+        EXPECT_NE(cb_off.merkleRootMNList, cb_on.merkleRootMNList) << "the new masternode is not committed";
+        // Before v24 the opt-out changes nothing.
+        EXPECT_TRUE(SameTemplate(p.build(/*v24=*/false, false), p.build(/*v24=*/false, true)));
+    }
+    {   // A legacy-format (version 2) ProRegTx still rides under v24.
+        LegacyRegPool p;
+        ASSERT_FALSE(dash::coin::is_v24_shared_registration(p.reg)) << "the format marker";
+        const auto on = p.build(/*v24=*/true, true);
+        ASSERT_TRUE(opt_rides(on, p.reg)) << "fixture: the legacy ProRegTx rides ON";
+        const auto off = p.build(/*v24=*/true, false);
+        EXPECT_TRUE(opt_rides(off, p.reg)) << "the legacy ProRegTx was held";
+        EXPECT_TRUE(SameTemplate(on, off));
+    }
+}
+
+TEST(DashV24AllTx, V24ProviderOptInKeepsASharedRegistrationAsBefore)
+{
+    {   // ON (the default): the assertions of BuilderCarriesARealSharedRegistrationOnlyAtV24.
+        SharedRegPool p;
+        const auto dflt = p.build(/*v24=*/true, std::nullopt);
+        EXPECT_TRUE(SameTemplate(dflt, p.build(/*v24=*/true, true))) << "the default is ON";
+        EXPECT_TRUE(opt_rides(dflt, p.reg));
+        EXPECT_TRUE(opt_rides(dflt, p.child));
+        v::CCbTx cb;
+        ASSERT_TRUE(v::parse_cbtx(dflt.m_coinbase_payload, cb));
+        EXPECT_NE(cb.merkleRootMNList, p.sml.CalcMerkleRoot()) << "the new masternode is in the committed root";
+        std::vector<MutableTransaction> body;
+        for (const auto& t : dflt.m_txs) body.emplace_back(t);
+        const auto c = p.w.connect(body, cb.merkleRootMNList);
+        EXPECT_TRUE(c.ok) << c.error;
+        EXPECT_FALSE(opt_rides(p.build(/*v24=*/false, std::nullopt), p.reg)) << "before v24 it never rides";
+    }
+    {   // The legacy ProRegTx, before and after v24.
+        LegacyRegPool p;
+        EXPECT_TRUE(SameTemplate(p.build(/*v24=*/true, std::nullopt), p.build(/*v24=*/true, true)));
+        EXPECT_TRUE(SameTemplate(p.build(/*v24=*/false, std::nullopt), p.build(/*v24=*/false, true)));
+        EXPECT_TRUE(opt_rides(p.build(/*v24=*/true, std::nullopt), p.reg));
+    }
 }
 
 TEST(DashV24AllTx, V24ProviderOptOutEmitGateRefusesTypes10To12)
@@ -3381,6 +3541,27 @@ TEST(DashV24AllTx, V24ProviderOptOutEmitGateRefusesTypes10To12)
         EXPECT_FALSE(st.embedded_template_emit_ok(one, &why));
         EXPECT_EQ(why.cause, "emit-v24-provider-tx-opted-out");
         EXPECT_EQ(why.value, "type=" + std::to_string(t.type));
+    }
+    // So is a v24 shared registration; a legacy-format ProRegTx is not
+    // refused by the opt-out (whatever else the gate makes of it here).
+    {
+        const auto reg = tx_from_hex(tn_shared_registration().hex);
+        auto one = wd;
+        one.m_txs.clear();
+        one.m_txs.emplace_back(reg);
+        one.m_tx_hashes = {txid(reg)};
+        one.m_tx_fees = {0};
+        EXPECT_FALSE(st.embedded_template_emit_ok(one, &why));
+        EXPECT_EQ(why.cause, "emit-v24-provider-tx-opted-out");
+        EXPECT_EQ(why.value, "type=1-shared-registration");
+        const auto legacy = tx_from_hex(kMainProReg);
+        auto two = wd;
+        two.m_txs.clear();
+        two.m_txs.emplace_back(legacy);
+        two.m_tx_hashes = {txid(legacy)};
+        two.m_tx_fees = {0};
+        (void)st.embedded_template_emit_ok(two, &why);
+        EXPECT_NE(why.cause, "emit-v24-provider-tx-opted-out");
     }
     // The same node, opted back in, serves the dissolution again.
     st.set_include_v24_provider_txs(true);

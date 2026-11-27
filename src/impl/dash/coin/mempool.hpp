@@ -91,6 +91,21 @@
 namespace dash {
 namespace coin {
 
+/// The Dash Core v24 shared-registration format: a type-1 ProRegTx whose
+/// payload carries a share table (CProRegTx::IsShared(), vendor/providertx.hpp;
+/// the codec reads that table only for ProTx version 3, ProTxVersion::EXT_ADDR).
+/// The v24 provider opt-out (--embedded-include-v24-provider-txs=false) holds
+/// these together with types 10-12. Every other type-1 payload, and one that
+/// does not decode, is not this format.
+template <typename Tx>
+inline bool is_v24_shared_registration(const Tx& tx)
+{
+    if (!tx_has_extra_payload(tx.version, tx.type) || tx.type != vendor::CProRegTx::SPECIALTX_TYPE) return false;
+    vendor::CProRegTx p;
+    return vendor::decode_special_payload(tx.extra_payload, p)
+        && p.nVersion >= vendor::ProTxVersion::EXT_ADDR && p.IsShared();
+}
+
 struct MempoolEntry {
     MutableTransaction tx;
     uint256  txid;
@@ -2737,6 +2752,10 @@ public:
     //     the template folds them, sml_special_fold.hpp); a
     //     ProDisTx may then spend its shared masternode's template-script
     //     collateral, the only spend Core allows of that coin;
+    //   * hold_v24_shared_registration — a type-1 ProRegTx in the v24
+    //     shared-registration format (is_v24_shared_registration) is never
+    //     selected; set only by the --embedded-include-v24-provider-txs=false
+    //     opt-out under v24, so every other mask leaves it as before;
     //   * type 7 (MNHF signal) — admitted when allow_mnhf (the builder runs
     //     Dash Core's CheckMNHFTx and the duplicate rule, mnhf_check.hpp);
     //   * v24_rules — the block's ContextualCheckTransaction type list is Core
@@ -2746,6 +2765,7 @@ public:
         bool allow_mn_types;      // types 1-4
         bool allow_locks;         // type 8
         bool allow_v24_provider;  // types 10-12 (only with v24_rules)
+        bool hold_v24_shared_registration;  // type-1 shared registrations held
         bool allow_mnhf;          // type 7
         bool v24_rules;           // DEPLOYMENT_V24 active for the block
         // A single user-provided constructor (default exclude_special=false =>
@@ -2759,6 +2779,7 @@ public:
               allow_mn_types(false),
               allow_locks(false),
               allow_v24_provider(false),
+              hold_v24_shared_registration(false),
               allow_mnhf(false),
               v24_rules(false) {}
         constexpr bool admits(uint16_t tx_type) const {
@@ -3063,6 +3084,13 @@ public:
                 // for every type!=0; the partial embedded mask admits types
                 // 1-4, 7, 8 and (v24) 10-12, and 5/6/9 are never selected.
                 if (!special_mask.admits(e->tx.type)) { ok = false; break; }
+                // The v24 provider opt-out also holds a type-1 ProRegTx in the
+                // v24 shared-registration format (is_v24_shared_registration).
+                // Dropping the member drops its package, so a child spending
+                // one of its outputs never rides either.
+                if (special_mask.hold_v24_shared_registration
+                    && e->tx.type == vendor::CProRegTx::SPECIALTX_TYPE
+                    && is_v24_shared_registration(e->tx)) { ok = false; break; }
                 // An MNHF signal rides only in the shape Dash Core's signer
                 // builds: no inputs and no outputs (MNHFTxPayload::PrepareTx,
                 // evo/mnhftx.cpp:37-45). CheckTransaction lets a type-7 tx
@@ -3097,7 +3125,7 @@ public:
                 // Dash Core v24 shared-collateral template (04445348437551):
                 // a tx paying it never rides (shared_collateral.hpp), except
                 // a shared registration whose collateral output it is, under
-                // v24 with the provider fold armed
+                // v24 with the provider fold armed and no v24 provider opt-out
                 // (CheckSharedCollateralTemplateOutputs). A tx spending it is
                 // caught where the stale-input guard resolves each input's
                 // coin below.
@@ -3107,6 +3135,7 @@ public:
                         if (is_shared_collateral_script(out.scriptPubKey.m_data)) { pays_template = true; break; }
                     if (pays_template
                         && !(special_mask.v24_rules && special_mask.allow_mn_types
+                             && !special_mask.hold_v24_shared_registration
                              && is_shared_registration_collateral_only(e->tx))) {
                         ok = false;
                         break;

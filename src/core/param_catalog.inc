@@ -741,7 +741,7 @@ C2P_PARAM("embedded.null_arm", Embedded, TRISTATE_BOOL, MONEY_RESTART, C_DASH, N
 C2P_PARAM("embedded.include_mn_special_txs", Embedded, TRISTATE_BOOL, RESTART, C_DASH, NONE, "", NONE, "DIP special-tx superset types 1-4 (daemonless default ON)")
   C2P_ALIAS("embedded.include_mn_special_txs", BIN_DASH, "--embedded-include-mn-special-txs", FLAG_OPT_EQFALSE)
 
-C2P_PARAM("embedded.include_v24_provider_txs", Embedded, TRISTATE_BOOL, RESTART, C_DASH, NONE, "", NONE, "Dash v24 provider types 10-12 with the special-tx superset (default ON; =false keeps them out, types 1-4 unaffected)")
+C2P_PARAM("embedded.include_v24_provider_txs", Embedded, TRISTATE_BOOL, RESTART, C_DASH, NONE, "", NONE, "Dash v24 provider types 10-12 and v24 shared registrations with the special-tx superset (default ON; =false keeps them out, other types 1-4 unaffected)")
   C2P_ALIAS("embedded.include_v24_provider_txs", BIN_DASH, "--embedded-include-v24-provider-txs", FLAG_OPT_EQFALSE)
 
 C2P_PARAM("embedded.fresh_datum_race", Embedded, TRISTATE_BOOL, LIVE, C_DASH, NONE, "", NONE, "race freshest getmnlistd (default ON)")

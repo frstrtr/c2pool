@@ -191,7 +191,8 @@ struct EmbeddedWorkInputs {
 
     // --embedded-include-v24-provider-txs (default true): with the superset
     // above armed and v24 active, false keeps the shared-masternode types
-    // 10-12 out of selection; types 1-4 still ride. Set by
+    // 10-12 and v24 shared registrations out of selection; every other type
+    // 1-4 tx still rides. Set by
     // NodeCoinState::make_embedded_work_inputs from set_include_v24_provider_txs.
     bool                             include_v24_provider_txs{true};
 
