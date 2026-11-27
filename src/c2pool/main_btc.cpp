@@ -2900,9 +2900,12 @@ int main(int argc, char* argv[])
                 info.payments_total_sat = 0;
                 info.burn_sat           = 0;
                 // Coin network difficulty from the last observed BTC block
-                // target (same source as the sharechain-stats netdiff feed).
-                if (ws) {
-                    uint32_t bb = ws->last_block_bits();
+                // target (same source as the sharechain-stats netdiff feed);
+                // on a relay with no rigs no work was ever built, so the
+                // header follower's tip bits (as current_pplns uses).
+                {
+                    uint32_t bb = ws ? ws->last_block_bits() : 0;
+                    if (!bb) if (auto t = header_chain.tip()) bb = t->header.m_bits;
                     if (bb) info.network_difficulty =
                         chain::target_to_difficulty(chain::bits_to_target(bb));
                 }
@@ -3141,7 +3144,7 @@ int main(int argc, char* argv[])
         // <10), letting live_share_version fall back to the bogus header 36.
         // Direct tracker walk under the read guard (BTC has no StatsSkipList);
         // tip-driven cadence keeps the O(chain_length) walk off the hot path.
-        mi->set_sharechain_stats_fn([p2p_node_raw, auto_ratchet,
+        mi->set_sharechain_stats_fn([p2p_node_raw, auto_ratchet, &header_chain,
                                      ws = work_source.get(), mi]() -> nlohmann::json {
             static std::mutex   s_cache_mutex;
             static nlohmann::json s_last_good;
@@ -3220,11 +3223,17 @@ int main(int argc, char* argv[])
             if (mi) mi->set_cached_share_version(live_ver);
 
             // Coin network difficulty from the last observed BTC block target
-            // (fills /local_stats net_difficulty + the netdiff graph series).
-            if (mi && ws) {
-                uint32_t bb = ws->last_block_bits();
+            // (fills /local_stats net_difficulty + the netdiff graph series);
+            // the header follower's tip bits when no work was ever built.
+            if (mi) {
+                uint32_t bb = ws ? ws->last_block_bits() : 0;
+                const char* source = "btc-template";
+                if (!bb) {
+                    if (auto t = header_chain.tip()) bb = t->header.m_bits;
+                    source = "btc-header-tip";
+                }
                 if (bb) mi->update_network_difficulty(
-                    chain::target_to_difficulty(chain::bits_to_target(bb)), "btc-template");
+                    chain::target_to_difficulty(chain::bits_to_target(bb)), source);
             }
 
             nlohmann::json result;
