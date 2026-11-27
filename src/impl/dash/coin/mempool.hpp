@@ -91,19 +91,29 @@
 namespace dash {
 namespace coin {
 
-/// The Dash Core v24 shared-registration format: a type-1 ProRegTx whose
-/// payload carries a share table (CProRegTx::IsShared(), vendor/providertx.hpp;
-/// the codec reads that table only for ProTx version 3, ProTxVersion::EXT_ADDR).
-/// The v24 provider opt-out (--embedded-include-v24-provider-txs=false) holds
-/// these together with types 10-12. Every other type-1 payload, and one that
-/// does not decode, is not this format.
+/// A ProTx payload format that is only valid once Dash Core v24 is active: a
+/// type 1-4 tx (ProRegTx, ProUpServTx, ProUpRegTx, ProUpRevTx) whose payload
+/// parses with ProTx version >= ProTxVersion::EXT_ADDR (3). Dash Core refuses
+/// version 3 before v24 (specialtxman.cpp: nVersion > ProTxVersion::GetMax
+/// is bad-protx-version, and GetMax is ExtAddr only with v24 active;
+/// protx_check.hpp max_version). Shared registrations are version 3. The v24
+/// provider opt-out (--embedded-include-v24-provider-txs=false) holds these
+/// together with types 10-12. A version 1/2 payload, and one that does not
+/// parse, is not a match.
 template <typename Tx>
-inline bool is_v24_shared_registration(const Tx& tx)
+inline bool is_v24_format_protx(const Tx& tx)
 {
-    if (!tx_has_extra_payload(tx.version, tx.type) || tx.type != vendor::CProRegTx::SPECIALTX_TYPE) return false;
-    vendor::CProRegTx p;
-    return vendor::decode_special_payload(tx.extra_payload, p)
-        && p.nVersion >= vendor::ProTxVersion::EXT_ADDR && p.IsShared();
+    if (!tx_has_extra_payload(tx.version, tx.type)) return false;
+    const auto v3 = [&tx](auto p) {
+        return vendor::parse_protx_payload(tx.extra_payload, p) && p.nVersion >= vendor::ProTxVersion::EXT_ADDR;
+    };
+    switch (tx.type) {
+    case vendor::CProRegTx::SPECIALTX_TYPE:    return v3(vendor::CProRegTx{});
+    case vendor::CProUpServTx::SPECIALTX_TYPE: return v3(vendor::CProUpServTx{});
+    case vendor::CProUpRegTx::SPECIALTX_TYPE:  return v3(vendor::CProUpRegTx{});
+    case vendor::CProUpRevTx::SPECIALTX_TYPE:  return v3(vendor::CProUpRevTx{});
+    default:                                   return false;
+    }
 }
 
 struct MempoolEntry {
@@ -2752,10 +2762,11 @@ public:
     //     the template folds them, sml_special_fold.hpp); a
     //     ProDisTx may then spend its shared masternode's template-script
     //     collateral, the only spend Core allows of that coin;
-    //   * hold_v24_shared_registration — a type-1 ProRegTx in the v24
-    //     shared-registration format (is_v24_shared_registration) is never
-    //     selected; set only by the --embedded-include-v24-provider-txs=false
-    //     opt-out under v24, so every other mask leaves it as before;
+    //   * hold_v24_format_protx — a type 1-4 tx with a version-3 (ExtAddr)
+    //     ProTx payload (is_v24_format_protx, shared registrations included)
+    //     is never selected; set only by the
+    //     --embedded-include-v24-provider-txs=false opt-out under v24, so
+    //     every other mask leaves it as before;
     //   * type 7 (MNHF signal) — admitted when allow_mnhf (the builder runs
     //     Dash Core's CheckMNHFTx and the duplicate rule, mnhf_check.hpp);
     //   * v24_rules — the block's ContextualCheckTransaction type list is Core
@@ -2765,7 +2776,7 @@ public:
         bool allow_mn_types;      // types 1-4
         bool allow_locks;         // type 8
         bool allow_v24_provider;  // types 10-12 (only with v24_rules)
-        bool hold_v24_shared_registration;  // type-1 shared registrations held
+        bool hold_v24_format_protx;  // version-3 ProTx payloads of types 1-4 held
         bool allow_mnhf;          // type 7
         bool v24_rules;           // DEPLOYMENT_V24 active for the block
         // A single user-provided constructor (default exclude_special=false =>
@@ -2779,7 +2790,7 @@ public:
               allow_mn_types(false),
               allow_locks(false),
               allow_v24_provider(false),
-              hold_v24_shared_registration(false),
+              hold_v24_format_protx(false),
               allow_mnhf(false),
               v24_rules(false) {}
         constexpr bool admits(uint16_t tx_type) const {
@@ -3084,13 +3095,13 @@ public:
                 // for every type!=0; the partial embedded mask admits types
                 // 1-4, 7, 8 and (v24) 10-12, and 5/6/9 are never selected.
                 if (!special_mask.admits(e->tx.type)) { ok = false; break; }
-                // The v24 provider opt-out also holds a type-1 ProRegTx in the
-                // v24 shared-registration format (is_v24_shared_registration).
-                // Dropping the member drops its package, so a child spending
-                // one of its outputs never rides either.
-                if (special_mask.hold_v24_shared_registration
-                    && e->tx.type == vendor::CProRegTx::SPECIALTX_TYPE
-                    && is_v24_shared_registration(e->tx)) { ok = false; break; }
+                // The v24 provider opt-out also holds every type 1-4 tx with a
+                // version-3 (ExtAddr) ProTx payload, shared registrations
+                // included (is_v24_format_protx). Dropping the member drops its
+                // package, so a child spending one of its outputs never rides
+                // either.
+                if (special_mask.hold_v24_format_protx
+                    && is_v24_format_protx(e->tx)) { ok = false; break; }
                 // An MNHF signal rides only in the shape Dash Core's signer
                 // builds: no inputs and no outputs (MNHFTxPayload::PrepareTx,
                 // evo/mnhftx.cpp:37-45). CheckTransaction lets a type-7 tx
@@ -3135,7 +3146,7 @@ public:
                         if (is_shared_collateral_script(out.scriptPubKey.m_data)) { pays_template = true; break; }
                     if (pays_template
                         && !(special_mask.v24_rules && special_mask.allow_mn_types
-                             && !special_mask.hold_v24_shared_registration
+                             && !special_mask.hold_v24_format_protx
                              && is_shared_registration_collateral_only(e->tx))) {
                         ok = false;
                         break;

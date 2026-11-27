@@ -16,8 +16,8 @@
 //   * types 1-4 under v24: the template fold now runs the v24 transitions
 //     (a revocation keeps a basic state's version);
 //   * the operator opt-out --embedded-include-v24-provider-txs=false: types
-//     10-12 and v24 shared registrations stay out of the template, every
-//     other type 1-4 tx still rides.
+//     10-12 and version-3 (ExtAddr) ProTx payloads of types 1-4 (shared
+//     registrations included) stay out of the template, v1/v2 ProTx ride.
 //
 // This TU rides test_dash_govvote_bls (the BLS-backend target).
 
@@ -3048,7 +3048,7 @@ TEST(DashV24AllTx, P2FoldMemoServesAChainCoinFoldOnlyWhileItsAnswersHold)
 
 // ── The v24 provider opt-out (--embedded-include-v24-provider-txs=false) ─────
 // The superset lever admits types 1-4 and, from v24 activation, the shared
-// types 10-12. The opt-out keeps 10-12 (and, below, v24 shared registrations)
+// types 10-12. The opt-out keeps 10-12 (and, below, version-3 ProTx payloads)
 // out and nothing else: types 1-4 still ride, the fees of the txs left out
 // leave the coinbase with them, and the
 // committed root is the block-connect root of the body served. ON (the
@@ -3277,9 +3277,10 @@ TEST(DashV24AllTx, V24ProviderOptOutChangesNothingBeforeActivation)
     }
 }
 
-// The opt-out also holds a type-1 ProRegTx in the v24 shared-registration
-// format (mempool.hpp is_v24_shared_registration: a version-3 payload with a
-// share table, CProRegTx::IsShared). Every other type-1 payload rides as before.
+// The opt-out also holds every ProTx payload format only valid under v24: a
+// type 1-4 tx whose payload parses with version >= EXT_ADDR (3)
+// (mempool.hpp is_v24_format_protx). Shared registrations are version 3.
+// Version 1/2 payloads ride as before.
 
 namespace {
 const RealProReg& tn_shared_registration()
@@ -3425,7 +3426,7 @@ TEST(DashV24AllTx, V24ProviderOptOutHoldsASharedRegistrationAndKeepsALegacyProRe
 {
     {   // The v24 shared registration is held, with its package.
         SharedRegPool p;
-        ASSERT_TRUE(dash::coin::is_v24_shared_registration(p.reg)) << "the format marker";
+        ASSERT_TRUE(dash::coin::is_v24_format_protx(p.reg)) << "the format marker (version 3)";
         const auto on = p.build(/*v24=*/true, true);
         ASSERT_TRUE(opt_rides(on, p.reg)) << "fixture: the shared registration rides ON";
         ASSERT_TRUE(opt_rides(on, p.child)) << "fixture: its child rides ON";
@@ -3446,7 +3447,7 @@ TEST(DashV24AllTx, V24ProviderOptOutHoldsASharedRegistrationAndKeepsALegacyProRe
     }
     {   // A legacy-format (version 2) ProRegTx still rides under v24.
         LegacyRegPool p;
-        ASSERT_FALSE(dash::coin::is_v24_shared_registration(p.reg)) << "the format marker";
+        ASSERT_FALSE(dash::coin::is_v24_format_protx(p.reg)) << "the format marker (version 2)";
         const auto on = p.build(/*v24=*/true, true);
         ASSERT_TRUE(opt_rides(on, p.reg)) << "fixture: the legacy ProRegTx rides ON";
         const auto off = p.build(/*v24=*/true, false);
@@ -3477,6 +3478,200 @@ TEST(DashV24AllTx, V24ProviderOptInKeepsASharedRegistrationAsBefore)
         EXPECT_TRUE(SameTemplate(p.build(/*v24=*/true, std::nullopt), p.build(/*v24=*/true, true)));
         EXPECT_TRUE(SameTemplate(p.build(/*v24=*/false, std::nullopt), p.build(/*v24=*/false, true)));
         EXPECT_TRUE(opt_rides(p.build(/*v24=*/true, std::nullopt), p.reg));
+    }
+}
+
+namespace {
+/// Version-3 (ExtAddr) ProUpServTx of R (synthetic): an ExtNetInfo service,
+/// signed by R's operator.
+MutableTransaction servtx_r_v3(const V24World& w)
+{
+    MutableTransaction tx = tx_with_inputs(2, {{h256(0x8f), 0}});
+    v::CProUpServTx p;
+    p.nVersion = v::ProTxVersion::EXT_ADDR;
+    p.nType = v::MnType::REGULAR;
+    p.proTxHash = w.R;
+    p.extNetInfo = core4(5, 6, 7, 9, 9999);
+    p.inputsHash = dash::coin::protx_check_detail::inputs_hash(tx);
+    p.sig = {};
+    const auto h = v::protx_operator_sign_hash(pack_payload(p));
+    p.sig = bls::BasicSchemeMPL().Sign(w.rop.sk, bls::Bytes(h->data(), 32)).SerializeToArray(false);
+    tx.extra_payload = pack_payload(p);
+    return tx;
+}
+/// Version-3 ProUpRegTx of R (synthetic): a two-entry payout list, R's
+/// operator key kept, signed by R's owner (as in
+/// ProUpRegTxV3PayoutListFoldsAndMatchesBlockConnect).
+MutableTransaction upreg_r_v3(const V24World& w)
+{
+    MutableTransaction tx = tx_with_inputs(3, {{h256(0x84), 0}});
+    v::CProUpRegTx p;
+    p.nVersion = v::ProTxVersion::EXT_ADDR;
+    p.proTxHash = w.R;
+    p.pubKeyOperator = w.rop.pub;
+    p.keyIDVoting = w.rvoting.id;
+    for (const auto& [id, reward] :
+         std::vector<std::pair<uint160, uint16_t>>{{ec_key(0x5a).id, 6000}, {ec_key(0x5b).id, 4000}}) {
+        v::MasternodePayoutShare s;
+        s.scriptPayout = script_of(p2pkh(id));
+        s.reward = reward;
+        p.payouts.push_back(s);
+    }
+    p.inputsHash = dash::coin::protx_check_detail::inputs_hash(tx);
+    tx.extra_payload = pack_payload(p);
+    const auto h = dash::coin::protx_check_detail::hash_without_trailing_vchsig(tx.extra_payload, 0);
+    p.vchSig = sign_compact(w.rowner, *h);
+    tx.extra_payload = pack_payload(p);
+    return tx;
+}
+/// Version-3 ProUpRevTx of R (synthetic; the v2 layout), signed by R's operator.
+MutableTransaction rev_r_v3(const V24World& w)
+{
+    MutableTransaction tx = tx_with_inputs(4, {{h256(0x86), 1}});
+    v::CProUpRevTx p;
+    p.nVersion = v::ProTxVersion::EXT_ADDR;
+    p.proTxHash = w.R;
+    p.nReason = v::CProUpRevTx::REASON_TERMINATION_OF_SERVICE;
+    p.inputsHash = dash::coin::protx_check_detail::inputs_hash(tx);
+    p.sig = {};
+    const auto h = v::protx_operator_sign_hash(pack_payload(p));
+    p.sig = bls::BasicSchemeMPL().Sign(w.rop.sk, bls::Bytes(h->data(), 32)).SerializeToArray(false);
+    tx.extra_payload = pack_payload(p);
+    return tx;
+}
+/// A real testnet version-3 ProRegTx that is not a shared registration.
+const RealProReg& tn_v3_registration_unshared()
+{
+    for (const auto& f : kTnProRegV3) {
+        v::CProRegTx p;
+        if (v::parse_protx_payload(tx_from_hex(f.hex).extra_payload, p) && !p.IsShared()) return f;
+    }
+    ADD_FAILURE() << "fixture: no unshared registration in kTnProRegV3";
+    return kTnProRegV3[0];
+}
+/// `tx` alone in a pool, every input funded (its outputs plus a 10,000-duff
+/// fee on the first input), selected with the mask the builder sets under v24
+/// with the superset armed: opted out (`include_v24` false) or not.
+bool selected_alone(const MutableTransaction& tx, bool include_v24)
+{
+    ::core::coin::UTXOViewCache utxo(nullptr);
+    int64_t out = 0;
+    for (const auto& o : tx.vout) out += o.value;
+    for (size_t i = 0; i < tx.vin.size(); ++i)
+        utxo.add_coin(::core::coin::Outpoint(tx.vin[i].prevout.hash, tx.vin[i].prevout.index),
+                      ::core::coin::Coin(i == 0 ? out + 10'000 : 0, script_of(p2pkh(ec_key(0x6a).id)), 1, false));
+    dash::coin::Mempool mp;
+    mp.set_utxo(&utxo);
+    mp.set_v24_admission(true);
+    EXPECT_TRUE(mp.add_tx(tx)) << "type " << tx.type;
+    dash::coin::Mempool::SpecialTxSelectMask m;
+    m.allow_all_special = false;
+    m.allow_mn_types = true;
+    m.v24_rules = true;
+    m.allow_v24_provider = include_v24;
+    m.hold_v24_format_protx = !include_v24;
+    const auto picked = mp.get_sorted_txs_with_fees(1'000'000, m);
+    for (const auto& s : picked.first)
+        if (txid(s.tx) == txid(tx)) return true;
+    return false;
+}
+/// R's synthetic version-3 type 2, 3 or 4 tx in V24World's pool (pooled or
+/// not), with the coins its checks read.
+struct V3RPool {
+    V24World w;
+    MutableTransaction tx;
+    ::core::coin::UTXOViewCache utxo{nullptr};
+    dash::coin::Mempool mp;
+    v::CSimplifiedMNList sml;
+    dash::coin::QuorumManager qmgr;
+    dash::coin::ProTxCheckEnv env;
+    dash::coin::MnFoldContext::OperatorSigFn sigfn = &v::verify_protx_operator_sig;
+
+    explicit V3RPool(int type, bool pooled = true)
+    {
+        tx = type == 2 ? servtx_r_v3(w) : type == 3 ? upreg_r_v3(w) : rev_r_v3(w);
+        utxo.add_coin(::core::coin::Outpoint(tx.vin[0].prevout.hash, tx.vin[0].prevout.index),
+                      ::core::coin::Coin(1'000'000, script_of(p2pkh(ec_key(0x6b).id)), 1, false));
+        // R's collateral (CheckProUpRegTx reads its coin).
+        utxo.add_coin(::core::coin::Outpoint(w.regular.collateralOutpoint.hash, w.regular.collateralOutpoint.index),
+                      ::core::coin::Coin(kColl, script_of(p2pkh(w.rcollat.id)), 1, false));
+        mp.set_utxo(&utxo);
+        mp.set_v24_admission(true);
+        if (pooled) EXPECT_TRUE(mp.add_tx(tx));
+        sml = w.base_sml();
+        env.net = dash::coin::DashNetwork::MAINNET;
+        env.ecdsa = &dash::coin::protx_ecdsa_verify_hash;
+    }
+    dash::coin::DashWorkData build(bool v24, std::optional<bool> include_v24) const
+    {
+        if (!include_v24)
+            return dash::coin::build_embedded_workdata(
+                V24World::H - 1, h256(0xAB), w.sm, mp, 0x1b104be3u, 1'800'000'000u, 76, 16, 1'800'000'100u,
+                0x20000000u, nullptr, &sml, &qmgr, 0, dash::coin::k_zero_cl_sig, 0, nullptr, nullptr,
+                dash::coin::DASH_MN_RR_HEIGHT_MAINNET, nullptr, dash::coin::DASH_MN_MIN_CONFIRMATIONS_MAINNET,
+                /*suppress=*/false, "utxo-immature-serving", nullptr, false, nullptr,
+                /*include_mn_special_txs=*/true, nullptr, nullptr, &sigfn, v24, &env, nullptr);
+        return dash::coin::build_embedded_workdata(
+            V24World::H - 1, h256(0xAB), w.sm, mp, 0x1b104be3u, 1'800'000'000u, 76, 16, 1'800'000'100u,
+            0x20000000u, nullptr, &sml, &qmgr, 0, dash::coin::k_zero_cl_sig, 0, nullptr, nullptr,
+            dash::coin::DASH_MN_RR_HEIGHT_MAINNET, nullptr, dash::coin::DASH_MN_MIN_CONFIRMATIONS_MAINNET,
+            /*suppress=*/false, "utxo-immature-serving", nullptr, false, nullptr,
+            /*include_mn_special_txs=*/true, nullptr, nullptr, &sigfn, v24, &env, nullptr,
+            /*want_xcheck_aid=*/false, /*include_v24_provider_txs=*/*include_v24);
+    }
+};
+}  // namespace
+
+TEST(DashV24AllTx, V24ProviderOptOutHoldsEveryV3ProTxInSelection)
+{
+    // Each tx alone in its own pool. Version 3 (real testnet bytes where we
+    // have them, synthetic otherwise) is selected ON and held OFF; version
+    // 1/2 is selected either way.
+    V24World w;
+    struct Case {
+        const char* what;
+        MutableTransaction tx;
+        bool v3;
+    };
+    const std::vector<Case> cases = {
+        {"type 1 v3, real testnet, not shared", tx_from_hex(tn_v3_registration_unshared().hex), true},
+        {"type 1 v3, real testnet shared registration", tx_from_hex(tn_shared_registration().hex), true},
+        {"type 2 v3, real testnet (Regular a356adb8)", tx_from_hex(kTnServA356), true},
+        {"type 2 v3, real testnet (EvoNode 763ca29f)", tx_from_hex(kTnServEvo), true},
+        {"type 2 v3, synthetic", servtx_r_v3(w), true},
+        {"type 3 v3, synthetic", upreg_r_v3(w), true},
+        {"type 4 v3, real testnet (EvoNode 044d20aa)", tx_from_hex(kTnRevV3), true},
+        {"type 4 v3, synthetic", rev_r_v3(w), true},
+        {"type 1 v2, real mainnet", tx_from_hex(kMainProReg), false},
+        {"type 2 v2, synthetic", servtx_r(w), false},
+        {"type 3 v2, synthetic", w.upreg_r(w.rop2.pub), false},
+        {"type 4 v2, synthetic", w.rev_r(), false},
+    };
+    for (const auto& c : cases) {
+        SCOPED_TRACE(c.what);
+        EXPECT_EQ(dash::coin::is_v24_format_protx(c.tx), c.v3) << "the format marker";
+        ASSERT_TRUE(selected_alone(c.tx, /*include_v24=*/true)) << "fixture: selected ON";
+        EXPECT_EQ(selected_alone(c.tx, /*include_v24=*/false), !c.v3)
+            << (c.v3 ? "a version-3 payload rode OFF" : "a version 1/2 payload was held OFF");
+    }
+}
+
+TEST(DashV24AllTx, V24ProviderOptOutHoldsV3ProTxTypes2To4InTheTemplate)
+{
+    for (const int type : {2, 3, 4}) {
+        SCOPED_TRACE("type " + std::to_string(type) + " v3 (synthetic)");
+        V3RPool p(type);
+        ASSERT_TRUE(dash::coin::is_v24_format_protx(p.tx));
+        const auto on = p.build(/*v24=*/true, true);
+        ASSERT_TRUE(opt_rides(on, p.tx)) << "fixture: rides ON";
+        EXPECT_TRUE(SameTemplate(p.build(/*v24=*/true, std::nullopt), on)) << "the default is ON";
+        const auto off = p.build(/*v24=*/true, false);
+        EXPECT_FALSE(opt_rides(off, p.tx)) << "the version-3 payload rode OFF";
+        const V3RPool empty(type, /*pooled=*/false);
+        EXPECT_TRUE(SameTemplate(off, empty.build(/*v24=*/true, false))) << "as if it was never pooled";
+        // Before v24 a version-3 payload never rides, and OFF = ON.
+        EXPECT_FALSE(opt_rides(p.build(/*v24=*/false, true), p.tx));
+        EXPECT_TRUE(SameTemplate(p.build(/*v24=*/false, false), p.build(/*v24=*/false, true)));
     }
 }
 
@@ -3542,25 +3737,28 @@ TEST(DashV24AllTx, V24ProviderOptOutEmitGateRefusesTypes10To12)
         EXPECT_EQ(why.cause, "emit-v24-provider-tx-opted-out");
         EXPECT_EQ(why.value, "type=" + std::to_string(t.type));
     }
-    // So is a v24 shared registration; a legacy-format ProRegTx is not
-    // refused by the opt-out (whatever else the gate makes of it here).
-    {
-        const auto reg = tx_from_hex(tn_shared_registration().hex);
-        auto one = wd;
-        one.m_txs.clear();
-        one.m_txs.emplace_back(reg);
-        one.m_tx_hashes = {txid(reg)};
-        one.m_tx_fees = {0};
-        EXPECT_FALSE(st.embedded_template_emit_ok(one, &why));
+    // So is every version-3 ProTx of types 1-4 (shared registration
+    // included); a version 1/2 one is not refused by the opt-out (whatever
+    // else the gate makes of it here).
+    auto only = [&](const MutableTransaction& t) {
+        auto body = wd;
+        body.m_txs.clear();
+        body.m_txs.emplace_back(t);
+        body.m_tx_hashes = {txid(t)};
+        body.m_tx_fees = {0};
+        return body;
+    };
+    for (const auto& t : {tx_from_hex(tn_v3_registration_unshared().hex), tx_from_hex(tn_shared_registration().hex),
+                          tx_from_hex(kTnServA356), servtx_r_v3(w), upreg_r_v3(w), tx_from_hex(kTnRevV3),
+                          rev_r_v3(w)}) {
+        SCOPED_TRACE("v3 type " + std::to_string(t.type));
+        EXPECT_FALSE(st.embedded_template_emit_ok(only(t), &why));
         EXPECT_EQ(why.cause, "emit-v24-provider-tx-opted-out");
-        EXPECT_EQ(why.value, "type=1-shared-registration");
-        const auto legacy = tx_from_hex(kMainProReg);
-        auto two = wd;
-        two.m_txs.clear();
-        two.m_txs.emplace_back(legacy);
-        two.m_tx_hashes = {txid(legacy)};
-        two.m_tx_fees = {0};
-        (void)st.embedded_template_emit_ok(two, &why);
+        EXPECT_EQ(why.value, "type=" + std::to_string(t.type) + "-v3-protx");
+    }
+    for (const auto& t : {tx_from_hex(kMainProReg), servtx_r(w), w.upreg_r(w.rop2.pub), w.rev_r()}) {
+        SCOPED_TRACE("v1/v2 type " + std::to_string(t.type));
+        (void)st.embedded_template_emit_ok(only(t), &why);
         EXPECT_NE(why.cause, "emit-v24-provider-tx-opted-out");
     }
     // The same node, opted back in, serves the dissolution again.

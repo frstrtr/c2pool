@@ -759,8 +759,8 @@ inline DashWorkData build_embedded_workdata(
     // positional caller is byte-unchanged (the folded copy is never built).
     // Dash Core v24: with v24_active the same lever admits the shared-
     // masternode types 10-12 (the fold then runs the v24 transitions for every
-    // provider type; include_v24_provider_txs=false keeps 10-12 and v24
-    // shared registrations out), and, with mnhf_check_env, type-7 MNHF signals.
+    // provider type; include_v24_provider_txs=false keeps 10-12 and version-3
+    // ProTx payloads out), and, with mnhf_check_env, type-7 MNHF signals.
     // The type-8 (asset-lock) selection leg rides accrue_pending_asset_locks;
     // types 5/6/9 are never selected (type-6 is builder-generated, type-9 is
     // admission-path-only via admitted_asset_unlocks).
@@ -802,10 +802,10 @@ inline DashWorkData build_embedded_workdata(
     bool want_xcheck_aid = false,
     // --embedded-include-v24-provider-txs (default true). With the special-tx
     // superset armed and v24 active, false keeps the shared-masternode types
-    // 10-12 (ProDisTx, ProUpShareTx, ProUpSharedRegTx) and type-1 ProRegTx in
-    // the v24 shared-registration format (mempool.hpp
-    // is_v24_shared_registration) out of selection, while every other type
-    // 1-4 tx and type 7 still ride. A ProDisTx then never reaches the body,
+    // 10-12 (ProDisTx, ProUpShareTx, ProUpSharedRegTx) and every version-3
+    // (ExtAddr) ProTx payload of types 1-4, shared registrations included
+    // (mempool.hpp is_v24_format_protx), out of selection, while version 1/2
+    // ProTx and type 7 still ride. A ProDisTx then never reaches the body,
     // so its collateral-spend exemption below never applies. true (default)
     // => byte-identical to the template before this parameter existed.
     bool include_v24_provider_txs = true)
@@ -918,17 +918,17 @@ inline DashWorkData build_embedded_workdata(
     // the selection applies Core v24's type list. MNHF signals (type 7) ride
     // the lever when their checks are wired (mnhf_check.hpp); they change no
     // CbTx root. include_v24_provider_txs=false (operator opt-out) masks types
-    // 10-12 and v24 shared registrations alone: every other type 1-4 tx and
-    // type 7 are unaffected.
+    // 10-12 and version-3 (ExtAddr) ProTx payloads of types 1-4 alone: version
+    // 1/2 ProTx and type 7 are unaffected.
     Mempool::SpecialTxSelectMask special_mask;
     special_mask.allow_all_special = false;                 // never the general path here
     special_mask.allow_mn_types    = include_mn_special_txs && (sml != nullptr);
     special_mask.allow_locks       = accrue_pending_asset_locks;
     special_mask.allow_v24_provider = special_mask.allow_mn_types && v24_active
                                       && include_v24_provider_txs;
-    // The opt-out also holds type-1 shared registrations (v24 format only;
-    // every other type-1 payload rides as before). Set only under v24.
-    special_mask.hold_v24_shared_registration = v24_active && !include_v24_provider_txs;
+    // The opt-out also holds every ProTx payload format only valid under v24:
+    // version 3 of types 1-4, shared registrations included. Set only under v24.
+    special_mask.hold_v24_format_protx = v24_active && !include_v24_provider_txs;
     special_mask.allow_mnhf        = include_mn_special_txs && mnhf_check_env != nullptr;
     special_mask.v24_rules         = v24_active;
     // suppress_mempool_txs: coinbase-only body, total_fees == 0 exactly. The
