@@ -299,6 +299,7 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
         coin_compressor_test.cpp
         coin_registry_symbol_test.cpp
         core_merkle_branches_test.cpp
+        dashboard_hook_wiring_test.cpp
         dual_family_dial_test.cpp
         events_test.cpp
         factory_connect_failed_uaf_test.cpp
@@ -368,6 +369,7 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
         web_server_redistribute_type_test.cpp
         web_server_relay_block_test.cpp
         web_server_rpc_refresh_test.cpp
+        web_server_share_lookup_test.cpp
         web_server_submitblock_test.cpp
         web_server_utxo_scan_test.cpp
         web_server_worker_liveness_test.cpp

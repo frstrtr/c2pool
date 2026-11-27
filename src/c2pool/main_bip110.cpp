@@ -78,6 +78,7 @@
 #include <functional>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <span>
 #include <string>
@@ -2442,12 +2443,28 @@ int run_embedded(bool coin_p2p_discover,
             // Nested-lock hazard: snapshot the LOCK-FREE best BEFORE read_tracker(),
             // and call current_pplns() (which takes + releases its OWN guard)
             // BEFORE taking this fn's guard — DASH ordering (main_dash.cpp:1886-1888).
+            // The last window served: returned while the tracker is busy, so a
+            // refresh that meets a locked tracker does not blank the explorer
+            // until the next refresh.
+            struct LastWindow { std::mutex m; nlohmann::json j = nlohmann::json::object(); };
+            auto last_window = std::make_shared<LastWindow>();
             mi->set_sharechain_window_fn(
-                [scn, mi, current_pplns, ws = work_source.get()]() -> nlohmann::json {
+                [scn, mi, current_pplns, ws = work_source.get(), last_window]() -> nlohmann::json {
                     const uint256 best = scn->get_tracker_snapshot().best_share;  // lock-free
                     auto cur = current_pplns();          // takes + releases its own guard
+                    // Found-block share hashes for the explorer's block marks
+                    // (the ledger's own mutex, taken before the tracker guard).
+                    std::vector<std::string> found;
+                    if (mi)
+                        for (const auto& fb : mi->get_found_blocks()) {
+                            const std::string sh = mi->found_block_share_hash(fb);
+                            if (!sh.empty()) found.push_back(sh);
+                        }
                     auto guard = scn->read_tracker();
-                    if (!guard) return nlohmann::json::object();  // tracker busy -> honest empty
+                    if (!guard) {   // tracker busy -> the last window served
+                        std::lock_guard<std::mutex> l(last_window->m);
+                        return last_window->j;
+                    }
                     std::string fee_hash160 = mi ? mi->get_node_fee_hash160() : std::string{};
                     const bool testnet = bip110::pool::PoolConfig::is_testnet;
                     // "This node" self-identity for the explorer's blue highlight
@@ -2490,7 +2507,7 @@ int run_embedded(bool coin_p2p_discover,
                         *guard, best,
                         bip110::pool::PoolConfig::chain_length(),
                         my_address, fee_hash160,
-                        testnet);
+                        testnet, found);
                     if (!my_addrs.empty())
                         w["my_addresses"] = std::move(my_addrs);
                     // Fold the projected split in as the explorer's per-share
@@ -2500,6 +2517,8 @@ int run_embedded(bool coin_p2p_discover,
                     // is the overlay source. Read-only.
                     if (cur.is_object() && !cur.empty())
                         w["pplns_current"] = std::move(cur);
+                    std::lock_guard<std::mutex> l(last_window->m);
+                    last_window->j = w;
                     return w;
                 });
             // bip110 has no share-tip refresh event (MI stratum off, no

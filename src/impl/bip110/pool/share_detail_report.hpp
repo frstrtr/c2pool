@@ -105,9 +105,14 @@ inline nlohmann::json build_share_detail(
         result["parent"]     = obj->m_prev_hash.GetHex();
         result["far_parent"] = obj->m_far_share_hash.GetHex();
         result["type_name"]  = "V" + std::to_string(ShareT::version);
-        // No reverse (parent -> children) index on the shared ShareChain, so
-        // children stay empty rather than being faked — same as DASH :404-407.
-        result["children"]   = nlohmann::json::array();
+        // Children: the shares whose parent is this one, from the chain's
+        // reverse index (p2pool tracker.reverse; main_ltc.cpp does the same).
+        nlohmann::json children = nlohmann::json::array();
+        const auto& rev = chain.get_reverse();
+        if (auto it = rev.find(hash); it != rev.end())
+            for (const auto& child : it->second)
+                children.push_back(child.GetHex());
+        result["children"] = std::move(children);
 
         nlohmann::json local_j;
         local_j["verified"]                 = verified.contains(hash);

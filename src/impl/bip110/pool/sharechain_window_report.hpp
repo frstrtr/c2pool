@@ -36,6 +36,8 @@
 #include <core/uint256.hpp>
 
 #include <btclibs/util/strencodings.h>       // HexStr (script-hex fallback for s.m / my_address)
+#include <core/sharechain_dashboard_views.hpp> // coinbase_text, script_hash160, short_hashes
+#include <core/view_block_hashes.hpp>         // core::found_block_hashes_in
 
 #include <nlohmann/json.hpp>
 
@@ -52,13 +54,18 @@ namespace bip110::pool
 // is the LOCK-FREE published snapshot best — read by the caller BEFORE taking
 // the tracker read guard (nested shared-lock hazard). `window_size` is the
 // PPLNS window length; `my_address` / `fee_hash160` are display markers.
+// `found_share_hashes`: the full share hashes of the found-block ledger, for
+// the explorer's block marks (blocks / block_hashes). Rows carry s (stale_info),
+// cb (coinbase text) and fee (pays the node fee address) as the other coins'
+// windows do, and the window its heads (fork marks).
 //
 // Empty when the chain has no best share — rendered honestly, NEVER faked.
 inline nlohmann::json sharechain_window_report(
     ShareTracker& tracker, const uint256& best_share,
     std::uint32_t window_size,
     const std::string& my_address, const std::string& fee_hash160,
-    bool testnet)
+    bool testnet,
+    const std::vector<std::string>& found_share_hashes = {})
 {
     nlohmann::json result = nlohmann::json::object();
     auto& chain    = tracker.chain;
@@ -91,6 +98,10 @@ inline nlohmann::json sharechain_window_report(
                         s["b"]  = obj->m_bits;
                         s["a"]  = obj->m_absheight;
                         s["dv"] = obj->m_desired_version;
+                        s["s"]  = static_cast<int>(obj->m_stale_info);
+                        const std::string cb =
+                            core::sharechain_views::coinbase_text(obj->m_coinbase.m_data);
+                        if (!cb.empty()) s["cb"] = cb;
                         // (b) native share version — BTC omits this; the V36?
                         // column tallies s.V.
                         s["V"]  = static_cast<int>(obj->version);
@@ -102,6 +113,9 @@ inline nlohmann::json sharechain_window_report(
                         if (addr.empty())
                             addr = HexStr(script);
                         s["m"] = addr;
+                        if (!fee_hash160.empty()
+                            && core::sharechain_views::script_hash160(script) == fee_hash160)
+                            s["fee"] = 1;
                     });
                     shares_arr.push_back(std::move(s));
                 }
@@ -111,6 +125,14 @@ inline nlohmann::json sharechain_window_report(
         }
     }
     int total_n = static_cast<int>(shares_arr.size());
+    std::vector<uint256> heads;
+    for (const auto& [head_hash, tail_hash] : chain.get_heads()) {
+        (void)tail_hash;
+        heads.push_back(head_hash);
+    }
+    result["heads"]        = core::sharechain_views::short_hashes(heads);
+    result["blocks"]       = core::sharechain_views::short_hashes(found_share_hashes);
+    result["block_hashes"] = core::found_block_hashes_in(shares_arr, found_share_hashes);
     result["shares"] = std::move(shares_arr);
     result["total"]  = total_n;
     return result;
