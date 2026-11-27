@@ -25,6 +25,7 @@
 #include <core/target_utils.hpp>
 #include <core/uint256.hpp>
 
+#include <c2pool/merged/merged_donation.hpp>
 #include <gtest/gtest.h>
 
 #include <memory>
@@ -50,7 +51,9 @@ Bytes wpkh(const Bytes& k) { Bytes s{0x00, 0x14}; s.insert(s.end(), k.begin(), k
 const Bytes kOwner = p2pkh(h(0x0e));
 const Bytes kExplicitX = p2pkh(h(0x5c));
 
-const Bytes& donation() { static const Bytes d = dgb::PoolConfig::get_donation_script(36); return d; }
+// The aux donation (#2346): the single P2PKH key, as the manager's builder pays.
+const Bytes& donation() { return c2pool::merged::merged_donation_script(); }
+const Bytes& combined_p2sh() { static const Bytes d = dgb::PoolConfig::get_donation_script(36); return d; }
 
 // Four V36 shares of equal work, donation 0:
 //   S: P2SH key 0x51, no merged address        -> split
@@ -272,6 +275,7 @@ TEST(DgbDogeP2shSplit, OnlyP2shKeysNoDonationIsExactlyFiftyFifty)
         const auto all = as_map(dgb::coin::doge_merged_payouts(tracker, tip, kDoge, value, miss, &no_owner));
         EXPECT_EQ(all.at(donation()), value) << "no owner: all to the donation";
         EXPECT_EQ(all.size(), 1u);
+        EXPECT_EQ(got.count(combined_p2sh()), 0u) << "the donation is still the combined P2SH";
     }
     // Without the split rule the core's >= 1 sat rule applies as before.
     const auto base = tracker.get_merged_expected_payouts(tip, chain::bits_to_target(0x1b0404cb), 100, kDoge,

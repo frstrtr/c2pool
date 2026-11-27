@@ -13,8 +13,8 @@
 // tracker: the PPLNS split of the DOGE coinbase value at the best share,
 // from dgb::ShareTracker::get_merged_expected_payouts (the share chain's
 // merged weights: a share's explicit merged address for the chain, else its
-// parent script, with the V36 combined donation getting the donation weight
-// and the rounding remainder).
+// parent script, with the aux donation, merged_donation_script(), getting
+// the donation weight and the rounding remainder).
 //
 // FALLBACK ADDRESS. AuxChainConfig::aux_payout_address is what
 // createauxblock gets (the createauxblock / non-multiaddress path, and the
@@ -33,6 +33,7 @@
 #include <impl/dgb/share_check.hpp>          // resolve_merged_payout_script, is_merged_key
 
 #include <c2pool/merged/aux_chain_params.hpp> // find_aux_chain_params (DOGE version bytes)
+#include <c2pool/merged/merged_donation.hpp>  // merged_donation_script (the aux coinbase donation)
 #include <c2pool/merged/merged_mining.hpp>    // MergedMiningManager::PayoutProvider, note_payout_*
 
 #include <core/address_utils.hpp>             // core::script_to_address
@@ -59,21 +60,12 @@ using DogePayouts = std::vector<std::pair<std::vector<unsigned char>, uint64_t>>
 /// The DOGE AuxPoW chain id (dogecoin chainparams; the --merged DOGE:98 spec).
 inline constexpr uint32_t DOGE_AUX_CHAIN_ID = 98;
 
-/// hash160 of the single donation P2PKH c2pool-dash pays its donation output
-/// to (dash share_check.hpp DONATION_SCRIPT = 76a914 <this> 88ac).
-inline constexpr std::array<uint8_t, 20> DONATION_P2PKH_HASH160 = {
-    0x20, 0xcb, 0x5c, 0x22, 0xb1, 0xe4, 0xd5, 0x94, 0x7e, 0x5c,
-    0x11, 0x2c, 0x76, 0x96, 0xb5, 0x1a, 0xd9, 0xaf, 0x3c, 0x61,
-};
-
-/// OP_DUP OP_HASH160 <DONATION_P2PKH_HASH160> OP_EQUALVERIFY OP_CHECKSIG.
+/// The single donation P2PKH every aux coinbase pays its donation output to
+/// (c2pool::merged::merged_donation_script(), core::donation::
+/// SINGLE_P2PKH_DONATION_SCRIPT; the c2pool-dash donation key).
 inline std::vector<unsigned char> doge_fallback_payout_script()
 {
-    std::vector<unsigned char> s{0x76, 0xa9, 0x14};
-    s.insert(s.end(), DONATION_P2PKH_HASH160.begin(), DONATION_P2PKH_HASH160.end());
-    s.push_back(0x88);
-    s.push_back(0xac);
-    return s;
+    return c2pool::merged::merged_donation_script();
 }
 
 /// The DOGE address of doge_fallback_payout_script() on the node's network
@@ -178,10 +170,11 @@ DogePayouts doge_merged_payouts(TrackerT& tracker, const uint256& best, uint32_t
     tracker.chain.get(best).share.invoke([&](auto* s) {
         block_target = chain::bits_to_target(s->m_min_header.m_bits);
     });
-    // Merged chains commit the V36 combined donation (P2SH) whatever the
-    // parent share version (p2pool data.py:303; the manager's coinbase
-    // builder puts that script last).
-    const auto donation_script = dgb::PoolConfig::get_donation_script(36);
+    // The aux coinbase's donation is the single P2PKH key on every lane
+    // (#2346): the manager's builder pays merged_donation_script() last and
+    // folds the old combined P2SH into it; the split's donation weight and
+    // remainder land on the same script.
+    const auto& donation_script = c2pool::merged::merged_donation_script();
     std::map<std::vector<unsigned char>, uint64_t> payouts_map;
     // The split rule's resolver: a P2SH parent key (not a Tier-1 merged
     // address) gets a placeholder of its own, so its amount is never merged

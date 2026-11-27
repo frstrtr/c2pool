@@ -43,6 +43,7 @@
 #include <core/uint256.hpp>
 
 #include <boost/asio/io_context.hpp>
+#include <c2pool/merged/merged_donation.hpp>
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
 
@@ -246,6 +247,9 @@ uint64_t sum(const Payouts& p)
     return s;
 }
 
+// The aux coinbase donation the provider splits to (#2346).
+const Bytes& aux_donation() { return c2pool::merged::merged_donation_script(); }
+
 const Bytes& combined_donation()
 {
     static const Bytes d = dgb::PoolConfig::get_donation_script(36);
@@ -262,6 +266,7 @@ TEST(DgbDogeMergedPayout, FallbackScriptIsTheDashDonationP2pkhNotTheP2sh)
                      0x11, 0x2c, 0x76, 0x96, 0xb5, 0x1a, 0xd9, 0xaf, 0x3c, 0x61};
     const Bytes script = dgb::coin::doge_fallback_payout_script();
     EXPECT_EQ(hex(script), "76a914" + hex(h) + "88ac");
+    EXPECT_EQ(script, c2pool::merged::merged_donation_script()) << "a byte copy of its own";
     EXPECT_EQ(script, p2pkh(h));
     EXPECT_NE(script, combined_donation());
     EXPECT_NE(script, Bytes(core::donation::COMBINED_DONATION_SCRIPT.begin(),
@@ -273,8 +278,8 @@ TEST(DgbDogeMergedPayout, FallbackScriptIsTheDashDonationP2pkhNotTheP2sh)
 
 TEST(DgbDogeMergedPayout, FallbackAddressIsDogeP2pkhRecomputedFromHash160)
 {
-    const Bytes script = p2pkh(Bytes(dgb::coin::DONATION_P2PKH_HASH160.begin(),
-                                     dgb::coin::DONATION_P2PKH_HASH160.end()));
+    const Bytes script = p2pkh(Bytes(core::donation::SINGLE_P2PKH_DONATION_SCRIPT.begin() + 3,
+                                     core::donation::SINGLE_P2PKH_DONATION_SCRIPT.begin() + 23));
     // Recomputed from the bytes with DOGE's P2PKH versions (30 main, 113 test).
     const std::string main_addr = core::script_to_address(script, "", 30, 22);
     const std::string test_addr = core::script_to_address(script, "", 113, 196);
@@ -314,7 +319,7 @@ TEST(DgbDogeMergedPayout, ProviderFollowsMergedExpectedPayouts)
 
     // Oracle: the tracker's merged split at the same best share.
     uint256 block_target = chain::bits_to_target(0x1e0ffff0);
-    auto m = sc.tracker.get_merged_expected_payouts(sc.best, block_target, value, kDoge, combined_donation(),
+    auto m = sc.tracker.get_merged_expected_payouts(sc.best, block_target, value, kDoge, aux_donation(),
                                                     {}, {});
     Payouts oracle;   // map order: sorted by script
     for (auto& [s, v] : m)
@@ -335,7 +340,8 @@ TEST(DgbDogeMergedPayout, ProviderFollowsMergedExpectedPayouts)
     EXPECT_EQ(by[kDogeX], 1'999'999'999ULL);
     EXPECT_EQ(by[p2pkh(kHashB)], 1'000'000'000ULL);
     EXPECT_EQ(by[p2pkh(kHashC)], 1'000'000'000ULL);
-    EXPECT_EQ(by[combined_donation()], 1ULL);
+    EXPECT_EQ(by[aux_donation()], 1ULL);
+    EXPECT_EQ(by.count(combined_donation()), 0u) << "the DOGE donation is still the combined P2SH";
     // A's parent key is not paid on DOGE: its explicit merged address is.
     EXPECT_EQ(by.count(p2pkh(kHashA)), 0u);
 }
@@ -793,7 +799,7 @@ TEST(DgbDogeMergedPayout, ProviderSplitsAtTheGivenBestNotTheTip)
     auto oracle_at = [&](const uint256& b) {
         Payouts o;
         for (auto& [scr, v] : sc.tracker.get_merged_expected_payouts(b, chain::bits_to_target(0x1e0ffff0), value,
-                                                                     kDoge, combined_donation(), {}, {}))
+                                                                     kDoge, aux_donation(), {}, {}))
             if (v >= 1)
                 o.emplace_back(scr, v);
         return o;
