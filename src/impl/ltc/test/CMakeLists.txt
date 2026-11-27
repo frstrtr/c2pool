@@ -462,6 +462,10 @@ if (BUILD_TESTING AND GTest_FOUND)
     # from the cycle's epilogue (the #854 pending re-think, ported from DASH).
     # REAL NodeImpl with its compute thread and a test io_context, plus the
     # slot protocol under thread contention. Same folding rule.
+    #
+    # ltc_stratum_merkle_fold_test.cpp: core compute_merkle_branches over the
+    # embedded template's m_hashes folds back to the txid merkle root
+    # [coinbase, tx1..txN], N = 0..9 and 33. Same folding rule.
     # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
     add_executable(share_test
         auto_ratchet_blocked_by_test.cpp
@@ -515,6 +519,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         ltc_fd_plan_test.cpp
         ltc_full_view_prices_old_inputs_test.cpp
         ltc_gentx_golden_kat_test.cpp
+        ltc_stratum_merkle_fold_test.cpp
         ltc_template_time_test.cpp
         ltc_utxo_full_rerun_test.cpp
         ltc_utxo_lane_rerun_test.cpp
