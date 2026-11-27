@@ -212,10 +212,19 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
                  << " pinned sharechain peer(s) (--sharechain-addnode)";
     }
     node.core::Server::listen(PoolConfig::P2P_PORT);
-    LOG_INFO << "[BCH-POOL] sharechain listening :" << PoolConfig::P2P_PORT
-             << " proto adv=" << PoolConfig::ADVERTISED_PROTOCOL_VERSION
-             << " min=" << PoolConfig::MINIMUM_PROTOCOL_VERSION
-             << " prefix=" << PoolConfig::prefix_hex();
+    // listen() logs a failed bind and returns; it does not throw. Report what
+    // actually happened, so a failed bind is not followed by a "listening" line.
+    if (const auto bound = node.core::Server::listen_port_or_none())
+        LOG_INFO << "[BCH-POOL] sharechain listening :" << *bound
+                 << " proto adv=" << PoolConfig::ADVERTISED_PROTOCOL_VERSION
+                 << " min=" << PoolConfig::MINIMUM_PROTOCOL_VERSION
+                 << " prefix=" << PoolConfig::prefix_hex();
+    else
+        LOG_WARNING << "[BCH-POOL] sharechain NOT listening (bind :"
+                    << PoolConfig::P2P_PORT << " failed), outbound only, no addrme"
+                    << " proto adv=" << PoolConfig::ADVERTISED_PROTOCOL_VERSION
+                    << " min=" << PoolConfig::MINIMUM_PROTOCOL_VERSION
+                    << " prefix=" << PoolConfig::prefix_hex();
     node.start_outbound_connections();
     LOG_INFO << "[BCH-POOL] outbound sharechain dialing started ("
              << config.pool()->m_bootstrap_addrs.size() << " bootstrap addr(s))";
