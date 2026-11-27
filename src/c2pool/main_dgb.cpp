@@ -70,6 +70,7 @@
 #include <impl/dgb/run_loop_mint.hpp>              // parse_min_header_80 + mint_local_share_at_frozen_version (#884/#294)
 #include <impl/dgb/auto_ratchet_wire.hpp>          // dgb_select_mint_versions + DGB_BASE/TARGET_VERSION (#884)
 #include <impl/dgb/conn_pplns_producer.hpp>        // make_conn_pplns_inputs (ref-hash bind SSOT)
+#include <impl/dgb/conn_job_producer.hpp>          // build_conn_job_inputs (the job producer SSOT)
 #include <impl/dgb/coin/pplns_weight_walk.hpp>   // compute_pplns_weight_walk (PPLNS step-1 SSOT)
 #include <core/target_utils.hpp>                 // chain::bits_to_target / target_to_average_attempts
 #include <core/version_gate.hpp>                 // core::version_gate::is_v36_active
@@ -1714,164 +1715,30 @@ int run_node(const core::CoinParams& params, bool testnet,
                 const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs)
                 -> std::optional<dgb::coin::ConnCoinbasePplnsInputs>
             {
-                // Non-blocking tracker read. Contended -> decline (empty job).
+                // Non-blocking tracker read. Contended -> decline (the job is held).
                 auto guard = p2p_node.read_tracker();
                 if (!guard)
                     return std::nullopt;
 
-                // No tip / parent not in chain -> safe coinbase-only empty job
-                // (pre-wire behavior; nothing to PPLNS-split yet).
-                if (prev_share_hash.IsNull() || !pplns_tracker.chain.contains(prev_share_hash))
-                    return std::nullopt;
-
-                // Prospective block bits: at emission there is no found block, so
-                // the prospective NEXT share reuses the tip share's block target
-                // -- the same value create_local_share() reads from the found
-                // block header (share.m_min_header.m_bits) and the walk feeds into
-                // the pre-V36 max_weight cap. Read under the held tracker lock.
-                uint32_t block_bits = 0;
-                uint32_t prev_ts    = 0;
-                uint128  prev_abswork;
-                uint32_t prev_absheight = 0;
-                pplns_tracker.chain.get(prev_share_hash).share.invoke([&](auto* prev) {
-                    block_bits      = prev->m_min_header.m_bits;
-                    prev_ts         = prev->m_timestamp;
-                    prev_abswork    = prev->m_abswork;
-                    prev_absheight  = prev->m_absheight;
-                });
-                if (block_bits == 0)
-                    return std::nullopt;  // tip share carries no usable target.
-
-                // #884: ask the AutoRatchet ONCE for this template's {mint,
-                // vote} pair; everything version-dependent below uses it.
-                int64_t  mint_version = 0;
-                uint64_t vote_version = 0;
-                {
-                    std::lock_guard<std::mutex> rl(*dgb_ratchet_mutex);
-                    const auto [mv, vv] = dgb::dgb_select_mint_versions(
-                        *dgb_ratchet, pplns_tracker, prev_share_hash);
-                    mint_version = mv;
-                    vote_version = static_cast<uint64_t>(vv);
-                }
-                const bool use_v36_pplns =
-                    core::version_gate::is_v36_active(mint_version);
-
-                // PAYOUT half -- PPLNS weight walk SSOT (the verifier's step 1).
-                dgb::CumulativeWeights walk;
-                try {
-                    walk = dgb::coin::compute_pplns_weight_walk(
-                        pplns_tracker, prev_share_hash, block_bits, params, use_v36_pplns);
-                } catch (const std::invalid_argument&) {
-                    // Insufficient-depth guard (the SAME boundary the verifier
-                    // refuses): decline rather than emit a wrong split.
-                    return std::nullopt;
-                }
-                if (walk.weights.empty())
-                    return std::nullopt;  // no payout recipients yet -> empty job.
-
-                // -- FROZEN template-time fields (mirror create_local_share) --
-                // timestamp: clip to >= prev.timestamp + 1.
-                uint32_t timestamp = static_cast<uint32_t>(std::time(nullptr));
-                if (timestamp <= prev_ts)
-                    timestamp = prev_ts + 1;
-
-                // share target AFTER timestamp clip (== create_local_share order).
-                const auto desired_target = chain::bits_to_target(block_bits);
-                const auto st = pplns_tracker.compute_share_target(
-                    prev_share_hash, timestamp, desired_target);
-                const uint32_t max_bits = st.max_bits;
-                const uint32_t bits     = st.bits;
-
-                // absheight / abswork / far_share_hash from the parent.
-                const uint32_t absheight = prev_absheight + 1;
-                const auto cur_attempts = chain::target_to_average_attempts(
-                    chain::bits_to_target(bits));
-                const uint128 abswork = prev_abswork + uint128(cur_attempts.GetLow64());
-
-                uint256 far_share_hash;
-                {
-                    auto [prev_height, last] =
-                        pplns_tracker.chain.get_height_and_last(prev_share_hash);
-                    if (last.IsNull() && prev_height < 99)
-                        far_share_hash = uint256();  // chain complete & < 99 deep
-                    else
-                        far_share_hash =
-                            pplns_tracker.chain.get_nth_parent_key(prev_share_hash, 99);
-                }
-
-                // merged_payout_hash (V36) over the same block target.
-                const uint256 merged_payout_hash =
-                    pplns_tracker.compute_merged_payout_hash(prev_share_hash, desired_target);
-
-                // Merged-mining addresses forwarded from the session.
-                std::vector<dgb::MergedAddressEntry> merged_addresses;
-                merged_addresses.reserve(merged_addrs.size());
-                for (const auto& entry : merged_addrs) {
-                    dgb::MergedAddressEntry e;
-                    e.m_chain_id = entry.first;
-                    e.m_script.m_data = entry.second;
-                    merged_addresses.push_back(std::move(e));
-                }
-
-                // subsidy for the prospective NEXT block (== create_local_share
-                // subsidy arg): subsidy_func(next_height). total_fees fold into
-                // the embedded coinbasevalue elsewhere; the PPLNS split here uses
-                // the block reward the verifier splits.
-                const uint64_t subsidy = params.subsidy_func
-                    ? params.subsidy_func(absheight)
-                    : 0;
-
-                // #902 -- production coinbase scriptSig: [BIP34 height push]
-                // [/c2pool-dgb/ tag]. Built from the coin block the next share
-                // sits on (header_chain.next_block_height()). Before this the
-                // scriptSig was EMPTY on the production path: no BIP34 height
-                // (=> bad-cb-height on any won block) and no pool tag. The SAME
-                // bytes feed BOTH the ref preimage (rin.coinbase_scriptSig, so
-                // the committed ref_hash matches) AND the emitted connection
-                // coinbase (ain.coinbase_script) -- a single SSOT so the two can
-                // never diverge and self-reject our own shares (#901 finding).
-                const std::vector<unsigned char> coinbase_scriptsig =
-                    dgb::coin::build_coinbase_scriptsig(header_chain.next_block_height());
-
-                // REF half -- assemble the ref preimage via the SSOT and hash it
-                // through the verifier primitive. V36/V35 split owned by
-                // compute_ref_hash_for_work().
-                dgb::coin::WorkRefHashInputs rin;
-                rin.share_version   = mint_version;   // #884: ratchet-selected
-                rin.desired_version = vote_version;
-                rin.prev_share      = prev_share_hash;
-                rin.coinbase_scriptSig = coinbase_scriptsig;  // #902: commit the BIP34+tag scriptSig
-                rin.share_nonce     = 0;            // share commitment nonce (not block)
-                rin.payout_script   = payout_script;
-                rin.subsidy         = subsidy;
-                rin.donation        = donation_u16;  // author default 0.1% (u16 66); --give-author overrides
-                rin.stale_info      = 0;
-                rin.has_segwit      = false;       // segwit populated by template-cache follow-on
-                rin.merged_addresses    = merged_addresses;
-                rin.merged_payout_hash  = merged_payout_hash;
-                rin.far_share_hash  = far_share_hash;
-                rin.max_bits        = max_bits;
-                rin.bits            = bits;
-                rin.timestamp       = timestamp;
-                rin.absheight       = absheight;
-                rin.abswork         = abswork;
-
-                // Assemble the final PPLNS inputs via the make_conn_pplns_inputs()
-                // SSOT (conn_pplns_producer.hpp): it computes ref_hash /
-                // last_txout_nonce from the SAME verifier primitive
-                // (compute_ref_hash_for_work) and forwards the walked weights into
-                // ConnCoinbasePplnsInputs -- ONE ref-hash and ONE payout
-                // implementation shared with the verifier, by construction.
-                dgb::ConnPplnsAssemblyInputs ain;
-                ain.weights         = std::move(walk.weights);
-                ain.total_weight    = walk.total_weight;
-                ain.subsidy         = subsidy;
-                ain.coinbase_script = coinbase_scriptsig;  // #902: same BIP34+tag scriptSig as the ref preimage
-                // #884: PPLNS formula / finder fee / donation script from the
-                // SAME ratchet-selected version (use_v36_pplns above agrees).
-                dgb::apply_conn_mint_version(ain, mint_version, payout_script);
-                ain.ref_params      = dgb::coin::make_work_ref_hash_params(rin, params);
-                return dgb::make_conn_pplns_inputs(ain, params);
+                // The producer SSOT (conn_job_producer.hpp, lifted from this
+                // lambda): PPLNS inputs + the frozen share fields at the prev
+                // share. #884: the AutoRatchet is asked ONCE, at the point the
+                // producer needs the {mint, vote} pair.
+                dgb::ConnJobRequest req;
+                req.prev_share_hash   = prev_share_hash;
+                req.payout_script     = payout_script;
+                req.merged_addrs      = merged_addrs;
+                req.next_block_height = header_chain.next_block_height();
+                req.now               = static_cast<uint32_t>(std::time(nullptr));
+                req.donation          = donation_u16;
+                return dgb::build_conn_job_inputs(
+                    pplns_tracker, params, req,
+                    [&]() -> std::pair<int64_t, uint64_t> {
+                        std::lock_guard<std::mutex> rl(*dgb_ratchet_mutex);
+                        const auto [mv, vv] = dgb::dgb_select_mint_versions(
+                            *dgb_ratchet, pplns_tracker, prev_share_hash);
+                        return {mv, static_cast<uint64_t>(vv)};
+                    });
             });
     }
 
@@ -1899,12 +1766,11 @@ int run_node(const core::CoinParams& params, bool testnet,
     // frozen_ref). It does NOT ask the ratchet again: if the ratchet moved
     // between template and submit, a fresh answer would rebuild a gentx that no
     // longer matches the coinbase the miner hashed. The mint is
-    // mint_local_share_at_frozen_version (run_loop_mint.hpp). Every other field
-    // mirrors the producer exactly: the same donation, no merged addrs
-    // (standalone DGB parent), segwit_active=false (the producer emits a
-    // non-segwit coinbase), so the reconstruction is byte-identical when the
-    // sharechain tip has not moved between template build and submit; if it has,
-    // create_local_share returns null (a correctly-declined stale share).
+    // mint_local_share_at_frozen_version (run_loop_mint.hpp): it records the
+    // coinbase the miner hashed (in.actual_coinbase) with the share fields the
+    // job's ref commits to (in.frozen_*, has_frozen), as the BTC lane does, so
+    // the share is exactly the submitted work. Same donation, segwit_active=false
+    // (the producer emits a non-segwit coinbase).
     {
         work_source->set_mint_share_fn(
             [&p2p_node, &params, donation_u16](

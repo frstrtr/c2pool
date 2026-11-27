@@ -143,6 +143,20 @@ struct ConnCoinbasePplnsInputs
     int64_t  share_version{36};
     uint64_t desired_version{36};
 
+    // The share fields the ref_hash commits to, exactly as the producer derived
+    // them (conn_job_producer.hpp). Not read by the coinbase build below; the
+    // work source freezes them onto the job (JobSnapshot::frozen_ref) and the
+    // mint stamps them (has_frozen), so the share it records is the one this
+    // coinbase's OP_RETURN ref commits to. frozen_bits is also the job's share
+    // target. Zero / null when no producer set them.
+    uint32_t frozen_absheight{0};
+    uint128  frozen_abswork;
+    uint256  frozen_far_share_hash;
+    uint32_t frozen_max_bits{0};
+    uint32_t frozen_bits{0};
+    uint32_t frozen_timestamp{0};
+    uint256  frozen_merged_payout_hash;
+
     // DGB-as-DOGE-parent merged-mining commitment (-DAUX_DOGE=ON path only).
     // The pre-built 44-byte AuxPoW MM tag (magic fabe6d6d || aux_merkle_root32 BE
     // || size4 LE || nonce4 LE) produced by dgb::coin::build_aux_mm_commitment

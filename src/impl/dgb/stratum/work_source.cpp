@@ -584,6 +584,16 @@ core::stratum::CoinbaseResult DGBWorkSource::build_connection_coinbase(
     // so the stratum server carries it on the job back to mining_submit's mint.
     out.snapshot.frozen_ref.share_version   = inputs->share_version;
     out.snapshot.frozen_ref.desired_version = inputs->desired_version;
+    // The share fields the ref commits to (the mint stamps them, has_frozen) and
+    // the job's share target: core stratum classifies with frozen_ref.bits
+    // (pool_share_bits), never a fallback diff-1.
+    out.snapshot.frozen_ref.absheight          = inputs->frozen_absheight;
+    out.snapshot.frozen_ref.abswork            = inputs->frozen_abswork;
+    out.snapshot.frozen_ref.far_share_hash     = inputs->frozen_far_share_hash;
+    out.snapshot.frozen_ref.max_bits           = inputs->frozen_max_bits;
+    out.snapshot.frozen_ref.bits               = inputs->frozen_bits;
+    out.snapshot.frozen_ref.timestamp          = inputs->frozen_timestamp;
+    out.snapshot.frozen_ref.merged_payout_hash = inputs->frozen_merged_payout_hash;
     return out;
 }
 
@@ -785,6 +795,19 @@ nlohmann::json DGBWorkSource::mining_submit(
         // #884: mint at the version pair frozen when this job's coinbase was built.
         in.share_version   = job->frozen_ref.share_version;
         in.desired_version = job->frozen_ref.desired_version;
+        // The coinbase the miner hashed and the share fields its OP_RETURN ref
+        // commits to: the mint records exactly this work (the BTC lane's
+        // has_frozen path). Without them the mint rebuilt the gentx with no
+        // extranonce and a submit-time timestamp, so the share never matched.
+        in.actual_coinbase.assign(coinbase.begin(), coinbase.end());
+        in.has_frozen                = !job->frozen_ref.ref_hash.IsNull();
+        in.frozen_absheight          = job->frozen_ref.absheight;
+        in.frozen_abswork            = job->frozen_ref.abswork;
+        in.frozen_far_share_hash     = job->frozen_ref.far_share_hash;
+        in.frozen_max_bits           = job->frozen_ref.max_bits;
+        in.frozen_bits               = job->frozen_ref.bits;
+        in.frozen_timestamp          = job->frozen_ref.timestamp;
+        in.frozen_merged_payout_hash = job->frozen_ref.merged_payout_hash;
 
         uint256 share_hash;
         try {

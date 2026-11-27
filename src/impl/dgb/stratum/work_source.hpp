@@ -105,6 +105,20 @@ public:
         /// the AutoRatchet, so the share matches the coinbase the miner hashed.
         int64_t                    share_version = 36;
         uint64_t                   desired_version = 36;
+        /// The coinbase the miner hashed (coinb1||en1||en2||coinb2): the share's
+        /// header and hash_link are built from it, so the share is the work the
+        /// miner did (the extranonce lives in its OP_RETURN nonce slot).
+        std::vector<unsigned char> actual_coinbase;
+        /// The share fields the job's ref_hash commits to (JobSnapshot::
+        /// frozen_ref, from the producer); stamped by the mint when has_frozen.
+        bool                       has_frozen = false;
+        uint32_t                   frozen_absheight = 0;
+        uint128                    frozen_abswork;
+        uint256                    frozen_far_share_hash;
+        uint32_t                   frozen_max_bits = 0;
+        uint32_t                   frozen_bits = 0;
+        uint32_t                   frozen_timestamp = 0;
+        uint256                    frozen_merged_payout_hash;
     };
 
     /// Callback invoked when `mining_submit` validates a submission whose

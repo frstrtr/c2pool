@@ -347,7 +347,8 @@ if (BUILD_TESTING AND GTest_FOUND)
     # build on the node's best share (locked cell, one best-change hook) and a
     # miner is never served the stub coinbase (real core::StratumServer rig).
     add_executable(dgb_work_source_test work_source_test.cpp aux_doge_payout_provider_test.cpp
-                   stratum_best_share_test.cpp stratum_job_rig_test.cpp)
+                   stratum_best_share_test.cpp stratum_job_rig_test.cpp
+                   mint_round_trip_test.cpp)
     target_link_libraries(dgb_work_source_test PRIVATE
         GTest::gtest_main GTest::gtest
         core dgb dgb_stratum
