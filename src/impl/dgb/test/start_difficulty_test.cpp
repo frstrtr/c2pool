@@ -116,3 +116,31 @@ TEST(DgbGbtFallback, AFailureIsCachedForTheTtl)
     EXPECT_EQ(ws.get_current_gbt_prevhash(), std::string(64, '1'));
     EXPECT_EQ(calls, 2);
 }
+
+// Review 2d3524094 R2: the failure is stamped when the call returns (a slow
+// failure is cached too), and the cache expires after the TTL.
+TEST(DgbGbtFallback, ASlowFailureIsCachedAndTheCacheExpires)
+{
+    c2pool::dgb::HeaderChain hc;
+    dgb::coin::Mempool mempool;
+    dgb::stratum::DGBWorkSource ws(hc, mempool, false, [](const std::vector<unsigned char>&, uint32_t) { return false; },
+                                   [](uint32_t h) -> uint64_t { return dgb::CoinParams::subsidy(h); });
+    int64_t clock = 1000;
+    ws.set_gbt_clock([&clock] { return clock; });
+    int calls = 0;
+    ws.set_gbt_tip_fn([&]() -> std::optional<dgb::stratum::DGBWorkSource::GbtTip> {
+        ++calls;
+        clock += 130;   // an unreachable host: the call blocks ~2 min
+        return std::nullopt;
+    });
+    EXPECT_TRUE(ws.get_current_gbt_prevhash().empty());
+    EXPECT_EQ(calls, 1);
+    EXPECT_TRUE(ws.get_current_gbt_prevhash().empty());
+    EXPECT_EQ(calls, 1) << "a slow failure was not cached";
+    clock += 4;
+    EXPECT_TRUE(ws.get_current_gbt_prevhash().empty());
+    EXPECT_EQ(calls, 1) << "within the TTL";
+    clock += 1;
+    EXPECT_TRUE(ws.get_current_gbt_prevhash().empty());
+    EXPECT_EQ(calls, 2) << "the failure cache never expires";
+}

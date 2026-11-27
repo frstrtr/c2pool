@@ -1487,7 +1487,13 @@ std::optional<DGBWorkSource::GbtTip> DGBWorkSource::resolve_gbt_tip_fallback() c
     // hold a lock across network IO). TTL-bound so per-heartbeat template/prevhash
     // polls do not each trigger a getblocktemplate round-trip.
     GbtTipFn fn;
-    const int64_t now = static_cast<int64_t>(std::time(nullptr));
+    std::function<int64_t()> clock;
+    {
+        std::lock_guard<std::mutex> lk(gbt_tip_mutex_);
+        clock = gbt_clock_;
+    }
+    auto now_sec = [&clock]() { return clock ? clock() : static_cast<int64_t>(std::time(nullptr)); };
+    const int64_t now = now_sec();
     {
         std::lock_guard<std::mutex> lk(gbt_tip_mutex_);
         if (gbt_tip_cache_ && (now - gbt_tip_cache_time_) < GBT_TIP_TTL_SECONDS)
@@ -1503,14 +1509,18 @@ std::optional<DGBWorkSource::GbtTip> DGBWorkSource::resolve_gbt_tip_fallback() c
         return std::nullopt;   // unbound (no digibyted creds armed) -> truthful absence
 
     std::optional<GbtTip> tip = fn();   // blocking getblocktemplate; nullopt on RPC failure
+    // Stamped when the call returns (review 2d3524094 R2): an RPC to an
+    // unreachable host can block ~2 min, longer than the TTL, and a stamp
+    // from before the call would have expired already.
+    const int64_t done = now_sec();
     {
         std::lock_guard<std::mutex> lk(gbt_tip_mutex_);
         if (tip) {
             gbt_tip_cache_      = tip;
-            gbt_tip_cache_time_ = now;
+            gbt_tip_cache_time_ = done;
             gbt_tip_fail_time_  = 0;
         } else {
-            gbt_tip_fail_time_  = now;
+            gbt_tip_fail_time_  = done;
         }
     }
     return tip;

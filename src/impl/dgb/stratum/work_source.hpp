@@ -328,6 +328,12 @@ public:
     };
     using GbtTipFn = std::function<std::optional<GbtTip>()>;
     void set_gbt_tip_fn(GbtTipFn fn);
+    /// The GBT cache's clock (seconds), a test seam; unset: std::time.
+    void set_gbt_clock(std::function<int64_t()> fn)
+    {
+        std::lock_guard<std::mutex> lk(gbt_tip_mutex_);
+        gbt_clock_ = std::move(fn);
+    }
 
     /// Work is served from the embedded header chain only once it has reached
     /// its tip: its median time past at most `sec` old (0, the default: not
@@ -550,6 +556,7 @@ private:
     mutable std::optional<GbtTip> gbt_tip_cache_;
     mutable int64_t               gbt_tip_cache_time_ = 0;
     mutable int64_t               gbt_tip_fail_time_ = 0;   // last failed GBT (negative cache)
+    std::function<int64_t()>      gbt_clock_;               // under gbt_tip_mutex_
     static constexpr int64_t      GBT_TIP_TTL_SECONDS = 5;
 
     // Resolve the external-daemon GBT tip fallback (previousblockhash + bits),
