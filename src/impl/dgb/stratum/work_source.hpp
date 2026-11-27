@@ -125,6 +125,9 @@ public:
         /// merged_addresses, in the producer's order), after the node-fee rule
         /// (effective_merged_addrs): the share carries exactly these.
         std::vector<std::pair<uint32_t, std::vector<unsigned char>>> merged_addrs;
+        /// The share's donation when its job set one (a split job,
+        /// JobSnapshot::share_donation); none: the node's own (--give-author).
+        std::optional<uint16_t>    donation;
     };
 
     /// Callback invoked when `mining_submit` validates a submission whose
@@ -158,9 +161,21 @@ public:
     uint64_t                            get_work_generation() const override;
     bool                                has_merged_chain(uint32_t chain_id) const override;
     // A DGB P2SH payout's auto-derived DOGE entry is dropped (its DOGE share
-    // takes the operator's P2SH split); see work_source.cpp.
-    void decide_job_payout(std::vector<unsigned char>& payout_script,
-                           std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged) const override;
+    // takes the operator's P2SH split); see work_source.cpp. --redistribute
+    // split (set_split_owner): a job with no payout script (an empty login,
+    // the job sent before the login) pays the node owner, and its shares
+    // carry core::kSplitShareDonation (returned): PPLNS gives the owner and
+    // the donation half of their weight each. Decided when the job is built,
+    // so the share minted from it carries the payout and donation its
+    // coinbase committed to.
+    std::optional<uint16_t> decide_job_payout(
+        std::vector<unsigned char>& payout_script,
+        std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged) const override;
+
+    /// --redistribute split: the node owner's DGB script (P2PKH / P2SH) the
+    /// jobs with no payout pay. Empty: off (an empty login is refused at
+    /// authorize, as before).
+    void set_split_owner(std::vector<unsigned char> script);
     // An empty login, or a DGB address a V35 share cannot carry (P2WSH,
     // P2TR): refused at authorize, with the reason.
     std::string                         authorize_refusal(const std::string& username) const override;
@@ -184,12 +199,15 @@ public:
         const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs) const override;
     // The same, for a connection's login key: the job's share target is
     // sized by that login's local hash rate (set_local_rate_fn).
+    // `share_donation`: decide_job_payout's for the job (a split job), the
+    // donation its ref_hash commits to; none: the node's own (--give-author).
     core::stratum::CoinbaseResult        build_connection_coinbase_for(
         const core::stratum::PayoutKey& login_key,
         const uint256& prev_share_hash,
         const std::string& extranonce1_hex,
         const std::vector<unsigned char>& payout_script,
-        const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs) const override;
+        const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs,
+        const std::optional<uint16_t>& share_donation = std::nullopt) const override;
 
     /// The local hash rate (attempts/s) of a login key, from the stratum
     /// server's per-address rates (main_dgb: get_local_addr_rates); unset or
@@ -296,6 +314,9 @@ public:
         uint32_t bits   = 0;
         uint64_t value  = 0;
         double   local_hash_rate = 0.0;
+        /// The job's share donation (a split job, decide_job_payout); none:
+        /// the node's own (--give-author). The ref_hash commits to it.
+        std::optional<uint16_t> share_donation;
     };
     using PplnsInputsFn = std::function<std::optional<dgb::coin::ConnCoinbasePplnsInputs>(
         const uint256& prev_share_hash,
@@ -504,6 +525,7 @@ private:
     // submitted username carries no valid payout address.
     mutable std::mutex          fallback_payout_mutex_;
     FallbackPayoutFn            fallback_payout_fn_;
+    std::vector<unsigned char>  split_owner_script_;   // --redistribute split (under fallback_payout_mutex_)
 
     // Node-owner fee (p2pool -f/--fee). Guarded by node_owner_fee_mutex_.
     // Default off (pct 0, empty script) => effective_payout_script returns the
@@ -537,7 +559,7 @@ private:
         const uint256& prev_share_hash, const std::string& extranonce1_hex,
         const std::vector<unsigned char>& payout_script,
         const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs,
-        double local_hash_rate) const;
+        double local_hash_rate, const std::optional<uint16_t>& share_donation) const;
 
     // Embedded DGB-as-DOGE-parent merged-mining manager (set_merged_mining_manager).
     // Non-owning; null unless a --merged DOGE spec armed the aux backend in

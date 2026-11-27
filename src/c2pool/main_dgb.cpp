@@ -1651,8 +1651,19 @@ int run_node(const core::CoinParams& params, bool testnet,
                   << " (" << owner_src << ")" << std::endl;
         if (node_owner_fee > 0.0 && !owner_doge.empty())
             work_source->set_owner_merged_scripts({{dgb::coin::DOGE_AUX_CHAIN_ID, owner_doge}});
+        // The P2SH-owner rule: a P2SH --node-owner-address's own DOGE amount
+        // (the owner half of split jobs) goes wholly to the owner DOGE script
+        // (an explicit --node-owner-merged-address), else to the donation.
+        std::vector<unsigned char> owner_parent;
+        if (!node_owner_address.empty()) {
+            std::vector<unsigned char> s;
+            if (core::classify_address_for_coin(node_owner_address, dgb::address_acceptance(testnet, regtest), s)
+                    == core::AddressCoinMatch::Own
+                && s.size() == 23 && s[0] == 0xa9 && s[22] == 0x87)
+                owner_parent = std::move(s);
+        }
         doge_p2sh_split = std::make_shared<const dgb::coin::DogeP2shSplit>(
-            dgb::coin::DogeP2shSplit{std::move(owner_doge)});
+            dgb::coin::DogeP2shSplit{std::move(owner_doge), std::move(owner_parent)});
     }
     // The provider reads the best share from the stratum best-share cell under
     // the tracker guard (wire_best_share below keeps the cell fresh).
@@ -1818,7 +1829,9 @@ int run_node(const core::CoinParams& params, bool testnet,
                 req.block_value       = block.value;
                 req.local_hash_rate   = block.local_hash_rate;
                 req.now               = static_cast<uint32_t>(std::time(nullptr));
-                req.donation          = donation_u16;
+                // --give-author's, or a split job's own (decide_job_payout):
+                // the ref_hash commits to it.
+                req.donation          = block.share_donation ? *block.share_donation : donation_u16;
                 req.aux_mm_scriptsig  = aux_mm_scriptsig;
                 return dgb::build_conn_job_inputs(
                     pplns_tracker, params, req,
@@ -1888,8 +1901,11 @@ int run_node(const core::CoinParams& params, bool testnet,
                         return std::nullopt;
                     uint256 share_hash;
                     try {
+                        // The job's donation (a split job), else --give-author's:
+                        // the one its coinbase's ref_hash committed to.
                         share_hash = dgb::mint_local_share_at_frozen_version(
-                            in, hdr, p2p_node.tracker(), params, /*donation=*/donation_u16);
+                            in, hdr, p2p_node.tracker(), params,
+                            /*donation=*/in.donation ? *in.donation : donation_u16);
                     } catch (const std::exception& e) {
                         LOG_WARNING << "[DGB-MINT] create_local_share threw: " << e.what();
                         return uint256();
@@ -1930,12 +1946,38 @@ int run_node(const core::CoinParams& params, bool testnet,
     // touches NOTHING on the sharechain (validation/codec/PPLNS unchanged) -- it
     // is node-local and consensus-safe. Absent --redistribute the fallback stays
     // unbound and the empty-credential path is byte-identical to prior builds.
-    // A spec naming split (the LTC/DASH default, not available on DGB yet)
-    // binds nothing either, and says so: never read as pplns.
-    if (dgb::spec_names_split(redistribute_spec))
-        std::cout << "[DGB] WARNING: --redistribute \"" << redistribute_spec
-                  << "\": split is not available on DGB yet -- no redistribute policy bound"
-                     " (as without --redistribute)" << std::endl;
+    // --redistribute split (the default, #2347): a job with no payout script
+    // (an empty login, the job sent before the login) pays the node owner
+    // with share donation core::kSplitShareDonation (32768/65535: the owner
+    // and the donation half and half), decided when the job is built
+    // (DGBWorkSource::decide_job_payout), so the minted share carries the
+    // payout and donation its coinbase committed to. The owner is
+    // --node-owner-address, an own-network DGB P2PKH/P2SH address; its DOGE
+    // half follows its DGB key (a P2SH owner: the explicit owner DOGE
+    // address, else the donation; aux_doge_payout_provider.hpp). None usable:
+    // the owner half cannot be paid; no policy is bound (an empty login is
+    // refused at authorize, as before), said once here.
+    if (dgb::spec_names_split(redistribute_spec)) {
+        std::vector<unsigned char> owner_script;
+        const bool own = !node_owner_address.empty()
+            && core::classify_address_for_coin(node_owner_address, dgb::address_acceptance(testnet, regtest),
+                                               owner_script) == core::AddressCoinMatch::Own;
+        const bool carried = (owner_script.size() == 25 && owner_script[0] == 0x76 && owner_script[1] == 0xa9)
+                             || (owner_script.size() == 23 && owner_script[0] == 0xa9 && owner_script[22] == 0x87);
+        if (own && carried) {
+            work_source->set_split_owner(owner_script);
+            std::cout << "[DGB] redistribute split: unattributable work pays the node owner \""
+                      << node_owner_address << "\" and the donation half and half (share donation "
+                      << core::kSplitShareDonation << "/65535 instead of --give-author's)" << std::endl;
+        } else {
+            std::cout << "[DGB] WARNING: --redistribute split: "
+                      << (node_owner_address.empty() ? std::string("no --node-owner-address")
+                                                     : "--node-owner-address \"" + node_owner_address
+                                                           + "\" is not an own-network DGB P2PKH/P2SH address")
+                      << " -- the owner half cannot be paid; no redistribute policy on this node"
+                         " (an empty login is refused at authorize)" << std::endl;
+        }
+    }
     if (dgb::binds_redistributor(redistribute_spec)) {
         auto redistributor = std::make_shared<dgb::Redistributor>();
         redistributor->set_hybrid_weights(dgb::parse_redistribute_spec(redistribute_spec));
@@ -2986,7 +3028,7 @@ int main(int argc, char** argv)
     uint256 coin_genesis;                   // --coin-genesis HASH (initial getheaders locator base)
     std::string rpc_endpoint;               // --coin-rpc HOST:PORT (external digibyted submit arm)
     std::string rpc_conf_path;              // --coin-rpc-auth PATH to digibyte.conf (creds source)
-    std::string redistribute_spec;         // --redistribute SPEC (node-local payout policy, #307)
+    std::string redistribute_spec = "split";   // --redistribute SPEC (node-local payout policy, #307; default split, #2347)
     std::string node_owner_address;        // --node-owner-address ADDR (operator payout identity for --redistribute fee, #307; also -f/--fee destination)
     std::string node_owner_merged_address; // --node-owner-merged-address / --merged-operator-address DOGEADDR (LTC spelling)
     bool v36_ratchet = false;              // --v36-ratchet: enable the V36 AutoRatchet (default: held at V35)

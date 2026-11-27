@@ -34,6 +34,7 @@
 #include <impl/dgb/coin/won_block_serialize.hpp>   // serialize_won_block SSOT (won-block framing)
 #include <impl/dgb/coin/header_sample_build.hpp>// compact_to_target (compact bits -> u256)
 
+#include <core/author_fee.hpp>                     // kSplitShareDonation (--redistribute split)
 #include <core/log.hpp>
 #include <core/hash.hpp>                        // Hash (sha256d) for coinbase txid + merkle pair
 #include <core/target_utils.hpp>            // chain::target_to_difficulty (vardiff/pool unit parity)
@@ -565,12 +566,29 @@ std::pair<std::string, std::string> DGBWorkSource::get_coinbase_parts() const
 // chain-98 entry that is the P2PKH of the P2SH payout's own hash. A DOGE
 // address the miner gave (any other key, or a P2SH of the same redeem script)
 // is kept.
-void DGBWorkSource::decide_job_payout(std::vector<unsigned char>& payout_script,
-                                      std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged) const
+std::optional<uint16_t> DGBWorkSource::decide_job_payout(
+    std::vector<unsigned char>& payout_script,
+    std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged) const
 {
+    // --redistribute split (the master default, #2347; dd049e9f1 on this mint):
+    // a job with no payout pays the node owner with half its weight to the
+    // donation. Its DOGE share follows the owner's DGB key (a P2SH owner: the
+    // P2SH-owner rule, aux_doge_payout_provider.hpp).
+    if (payout_script.empty()) {
+        std::vector<unsigned char> owner;
+        {
+            std::lock_guard<std::mutex> lk(fallback_payout_mutex_);
+            owner = split_owner_script_;
+        }
+        if (owner.empty())
+            return std::nullopt;
+        payout_script = std::move(owner);
+        merged.clear();
+        return core::kSplitShareDonation;
+    }
     if (!(payout_script.size() == 23 && payout_script[0] == 0xa9 && payout_script[1] == 0x14
           && payout_script[22] == 0x87))
-        return;
+        return std::nullopt;
     std::vector<unsigned char> derived{0x76, 0xa9, 0x14};
     derived.insert(derived.end(), payout_script.begin() + 2, payout_script.begin() + 22);
     derived.push_back(0x88);
@@ -578,6 +596,13 @@ void DGBWorkSource::decide_job_payout(std::vector<unsigned char>& payout_script,
     merged.erase(std::remove_if(merged.begin(), merged.end(),
                                 [&](const auto& e) { return e.first == kDogeChainId && e.second == derived; }),
                  merged.end());
+    return std::nullopt;
+}
+
+void DGBWorkSource::set_split_owner(std::vector<unsigned char> script)
+{
+    std::lock_guard<std::mutex> lk(fallback_payout_mutex_);
+    split_owner_script_ = std::move(script);
 }
 
 namespace {
@@ -604,9 +629,18 @@ std::string DGBWorkSource::authorize_refusal(const std::string& username) const
     // login is read.
     if (std::string hold = work_hold(); !hold.empty())
         return hold;
-    if (username.empty())
+    if (username.empty()) {
+        // --redistribute split armed: an empty login's work pays the node
+        // owner and the donation half and half (decide_job_payout), as
+        // p2pool pays its node address for one.
+        {
+            std::lock_guard<std::mutex> lk(fallback_payout_mutex_);
+            if (!split_owner_script_.empty())
+                return {};
+        }
         return "a DGB payout address is required (DGB_ADDRESS, or DGB_ADDRESS,DOGE_ADDRESS to name the "
                "DOGE payout)";
+    }
     // An UPPERCASE bech32 login: the python network keys V35 weights by the
     // address string as typed, so the same key typed in both cases would be
     // two outputs there and one here. The lowercase form is the same address.
@@ -705,7 +739,8 @@ core::stratum::CoinbaseResult DGBWorkSource::build_connection_coinbase(
     const std::vector<unsigned char>& payout_script,
     const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs) const
 {
-    return build_coinbase(prev_share_hash, extranonce1_hex, payout_script, merged_addrs, /*local_hash_rate=*/0.0);
+    return build_coinbase(prev_share_hash, extranonce1_hex, payout_script, merged_addrs, /*local_hash_rate=*/0.0,
+                          std::nullopt);
 }
 
 core::stratum::CoinbaseResult DGBWorkSource::build_connection_coinbase_for(
@@ -713,7 +748,8 @@ core::stratum::CoinbaseResult DGBWorkSource::build_connection_coinbase_for(
     const uint256& prev_share_hash,
     const std::string& extranonce1_hex,
     const std::vector<unsigned char>& payout_script,
-    const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs) const
+    const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs,
+    const std::optional<uint16_t>& share_donation) const
 {
     LocalRateFn fn;
     {
@@ -721,7 +757,7 @@ core::stratum::CoinbaseResult DGBWorkSource::build_connection_coinbase_for(
         fn = local_rate_fn_;
     }
     const double rate = fn ? fn(login_key) : 0.0;
-    return build_coinbase(prev_share_hash, extranonce1_hex, payout_script, merged_addrs, rate);
+    return build_coinbase(prev_share_hash, extranonce1_hex, payout_script, merged_addrs, rate, share_donation);
 }
 
 void DGBWorkSource::set_local_rate_fn(LocalRateFn fn)
@@ -766,7 +802,7 @@ core::stratum::CoinbaseResult DGBWorkSource::build_coinbase(
     const std::string& extranonce1_hex,
     const std::vector<unsigned char>& payout_script,
     const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs,
-    double local_hash_rate) const
+    double local_hash_rate, const std::optional<uint16_t>& share_donation) const
 {
     // Phase B live-wire: delegate to the PPLNS->coinbase SSOT
     // (build_connection_coinbase_from_pplns), which itself routes through the
@@ -906,6 +942,7 @@ core::stratum::CoinbaseResult DGBWorkSource::build_coinbase(
         return held();
     block.value = coinbase_value(block.height, /*total_fees=*/0, /*gbt_coinbasevalue=*/std::nullopt);
     block.local_hash_rate = local_hash_rate;
+    block.share_donation = share_donation;
 
     // The producer and the PPLNS->coinbase build may throw (review dd1248abd
     // #6: a V35 key the split cannot turn into a script). The core session
@@ -1181,6 +1218,9 @@ nlohmann::json DGBWorkSource::mining_submit(
             }
         }
         in.segwit_active   = job->segwit_active;
+        // A split job's donation (the core kept decide_job_payout's with the
+        // job): the share carries the donation its ref_hash committed to.
+        in.donation        = job->share_donation;
         // #884: mint at the version pair frozen when this job's coinbase was built.
         in.share_version   = job->frozen_ref.share_version;
         in.desired_version = job->frozen_ref.desired_version;

@@ -104,6 +104,12 @@ inline std::string doge_fallback_payout_address(bool testnet, bool regtest = fal
 /// other key are paid as before.
 struct DogeP2shSplit {
     std::vector<unsigned char> owner_script;   // empty: the whole amount to the donation
+    /// The P2SH-owner rule (--redistribute split): the node owner's own DGB
+    /// P2SH script, which the split jobs pay. Its DOGE amount (the owner's
+    /// half of unattributable work) goes WHOLLY to an explicit owner DOGE
+    /// address (owner_script), else wholly to the donation: never halved
+    /// again as a miner's P2SH login is.
+    std::vector<unsigned char> owner_parent_script;
 };
 
 namespace detail {
@@ -132,7 +138,10 @@ inline void apply_doge_p2sh_split(std::map<std::vector<unsigned char>, uint64_t>
     for (auto it = payouts.begin(); it != payouts.end();) {
         if (it->first.size() > tag.size() && std::equal(tag.begin(), tag.end(), it->first.begin())) {
             const uint64_t a = it->second;
-            const uint64_t owner = rule.owner_script.empty() ? 0 : a / 2;
+            const bool own_key = !rule.owner_parent_script.empty()
+                && std::equal(it->first.begin() + tag.size(), it->first.end(),
+                              rule.owner_parent_script.begin(), rule.owner_parent_script.end());
+            const uint64_t owner = rule.owner_script.empty() ? 0 : own_key ? a : a / 2;
             if (owner > 0)
                 to_owner[rule.owner_script] += owner;
             to_donation += a - owner;

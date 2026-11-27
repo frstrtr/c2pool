@@ -283,3 +283,33 @@ TEST(DgbDogeP2shSplit, OnlyP2shKeysNoDonationIsExactlyFiftyFifty)
     EXPECT_EQ(base.at(p2sh(h(0x51))), 99u);
     EXPECT_EQ(base.at(donation()), 1u);
 }
+
+// The P2SH-owner rule (--redistribute split): the node owner's own P2SH key
+// (the split jobs' payout) goes WHOLLY to an explicit owner DOGE address, else
+// wholly to the donation; a miner's P2SH key is still halved.
+TEST(DgbDogeP2shSplit, TheOwnersOwnP2shKeyIsNotHalvedAgain)
+{
+    auto tagged = [](const Bytes& k) {
+        Bytes t{0xff, 'p', '2', 's', 'h', '-', 's', 'p', 'l', 'i', 't'};
+        t.insert(t.end(), k.begin(), k.end());
+        return t;
+    };
+    const Bytes owner_p2sh = p2sh(h(0x0f));
+    const Bytes miner_p2sh = p2sh(h(0x51));
+    {
+        const dgb::coin::DogeP2shSplit rule{kOwner, owner_p2sh};
+        std::map<Bytes, uint64_t> m{{tagged(owner_p2sh), 1001}, {tagged(miner_p2sh), 101}};
+        dgb::coin::apply_doge_p2sh_split(m, rule, donation());
+        EXPECT_EQ(m.at(kOwner), 1001u + 50u) << "the owner's own key halved, or the miner's not";
+        EXPECT_EQ(m.at(donation()), 51u);
+        EXPECT_EQ(sum(m), 1102u);
+    }
+    {
+        // No explicit owner DOGE address: the owner's half goes to the donation.
+        const dgb::coin::DogeP2shSplit rule{Bytes{}, owner_p2sh};
+        std::map<Bytes, uint64_t> m{{tagged(owner_p2sh), 1001}, {tagged(miner_p2sh), 101}};
+        dgb::coin::apply_doge_p2sh_split(m, rule, donation());
+        EXPECT_EQ(m.size(), 1u);
+        EXPECT_EQ(m.at(donation()), 1102u);
+    }
+}

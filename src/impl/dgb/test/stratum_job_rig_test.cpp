@@ -34,6 +34,7 @@
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/post.hpp>
+#include <core/author_fee.hpp>
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
 
@@ -167,6 +168,7 @@ struct JobRig {
     std::mutex mu;
     uint256 known_share;          // the only share the producer knows (none yet)
     std::vector<Bytes> payouts;   // the payout script of every job the producer built
+    std::vector<std::optional<uint16_t>> donations;   // and its share donation (JobBlock)
     std::string tip_prev = "ce2fd8d332d667c009e6e031fec6cba0e4d12c963d2c84f824d6c1ae676e7de9";
 
     JobRig()
@@ -182,12 +184,14 @@ struct JobRig {
         });
         // main_dgb's producer shape: decline a null or unknown prev share.
         ws->set_pplns_inputs_fn([this](const uint256& prev, const std::string&, const Bytes& payout,
-                                       const std::vector<std::pair<uint32_t, Bytes>>&, const Bytes&, const dgb::stratum::DGBWorkSource::JobBlock&)
+                                       const std::vector<std::pair<uint32_t, Bytes>>&, const Bytes&,
+                                       const dgb::stratum::DGBWorkSource::JobBlock& block)
                                     -> std::optional<dgb::coin::ConnCoinbasePplnsInputs> {
             std::lock_guard<std::mutex> l(mu);
             if (prev.IsNull() || prev != known_share)
                 return std::nullopt;
             payouts.push_back(payout);
+            donations.push_back(block.share_donation);
             return rig_inputs();
         });
         port = rig_free_port();
@@ -570,4 +574,96 @@ TEST(DgbStratumJobs, EmptyAndUncarriableLoginsAreRefusedAtAuthorize)
         c.pump(1000);
         EXPECT_TRUE(c.notifies.empty()) << "a refused login was served a job";
     }
+}
+
+// The DGB --redistribute split (#2347 on this mint, dd049e9f1): with the node
+// owner armed, an empty login is accepted, its job pays the owner with share
+// donation 32768 (decide_job_payout), the producer commits the ref to it, and
+// the share minted from it carries that payout and donation. Through a real
+// core::StratumServer over the real DGBWorkSource.
+TEST(DgbStratumJobs, ASplitJobPaysTheOwnerWithHalfToTheDonation)
+{
+    JobRig rig;
+    const uint256 best(std::vector<unsigned char>(32, 0x5b));
+    {
+        std::lock_guard<std::mutex> l(rig.mu);
+        rig.known_share = best;
+    }
+    rig.ws->set_best_share_hash_fn([best]() { return best; });
+    const Bytes owner{0x76, 0xa9, 0x14, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e,
+                      0x0e, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e, 0x88, 0xac};
+    EXPECT_FALSE(rig.ws->authorize_refusal("").empty()) << "an empty login accepted with no split armed";
+    rig.ws->set_split_owner(owner);
+    EXPECT_TRUE(rig.ws->authorize_refusal("").empty()) << "split armed: an empty login is redistributed";
+    {
+        // decide_job_payout itself: only an empty payout is split.
+        Bytes p;
+        std::vector<std::pair<uint32_t, Bytes>> m{{98, Bytes{0x01}}};
+        EXPECT_EQ(rig.ws->decide_job_payout(p, m), std::optional<uint16_t>(core::kSplitShareDonation));
+        EXPECT_EQ(p, owner);
+        EXPECT_TRUE(m.empty());
+        Bytes miner = owner;
+        miner[5] = 0x44;
+        Bytes q = miner;
+        std::vector<std::pair<uint32_t, Bytes>> none;
+        EXPECT_FALSE(rig.ws->decide_job_payout(q, none).has_value());
+        EXPECT_EQ(q, miner);
+    }
+    std::mutex mint_mu;
+    std::vector<dgb::stratum::DGBWorkSource::MintShareInputs> mints;
+    rig.ws->set_mint_share_fn([&](const dgb::stratum::DGBWorkSource::MintShareInputs& in) -> uint256 {
+        std::lock_guard<std::mutex> l(mint_mu);
+        mints.push_back(in);
+        return uint256(std::vector<unsigned char>(32, 0x77));
+    });
+
+    RigClient c(rig.port);
+    ASSERT_GE(c.fd, 0);
+    c.send({{"id", 1}, {"method", "mining.subscribe"}, {"params", nlohmann::json::array()}});
+    auto sub = c.pump(2000, 1);
+    ASSERT_TRUE(sub.has_value());
+    const std::string en1 = (*sub)["result"][1].get<std::string>();
+    const int en2_size = (*sub)["result"][2].get<int>();
+    c.send({{"id", 2}, {"method", "mining.authorize"}, {"params", {"", "x"}}});
+    auto auth = c.pump(2000, 2);
+    ASSERT_TRUE(auth.has_value());
+    ASSERT_TRUE((*auth)["result"].is_boolean() && (*auth)["result"].get<bool>()) << auth->dump();
+    for (int i = 0; i < 30 && c.notifies.empty(); ++i)
+        c.pump(100);
+    ASSERT_FALSE(c.notifies.empty()) << "no job for the split login";
+    {
+        std::lock_guard<std::mutex> l(rig.mu);
+        ASSERT_FALSE(rig.payouts.empty());
+        EXPECT_EQ(rig.payouts.back(), owner) << "the split job does not pay the node owner";
+        EXPECT_EQ(rig.donations.back(), std::optional<uint16_t>(core::kSplitShareDonation))
+            << "the producer did not commit the ref to the split donation";
+    }
+    const auto n = c.notifies.back();
+    const std::string job_id = n[0].get<std::string>();
+    const std::string coinb1 = n[2].get<std::string>(), coinb2 = n[3].get<std::string>();
+    std::vector<std::string> branches;
+    for (const auto& b : n[4])
+        branches.push_back(b.get<std::string>());
+    const uint32_t version = static_cast<uint32_t>(std::stoul(n[5].get<std::string>(), nullptr, 16));
+    const std::string nbits = n[6].get<std::string>(), ntime = n[7].get<std::string>();
+    const std::string en2(static_cast<size_t>(en2_size) * 2, '0');
+    const double need = chain::target_to_difficulty(chain::bits_to_target(rig_inputs().frozen_bits));
+    std::string nonce;
+    for (uint32_t k = 0; k < 20000 && nonce.empty(); ++k) {
+        char buf[9];
+        std::snprintf(buf, sizeof buf, "%08x", k);
+        if (rig.ws->compute_share_difficulty(coinb1, coinb2, en1, en2, ntime, buf, version, rig.tip_prev, nbits,
+                                             branches) >= need)
+            nonce = buf;
+    }
+    ASSERT_FALSE(nonce.empty());
+    c.send({{"id", 3}, {"method", "mining.submit"}, {"params", {"", job_id, en2, ntime, nonce}}});
+    auto resp = c.pump(3000, 3);
+    ASSERT_TRUE(resp.has_value());
+    EXPECT_TRUE((*resp)["result"].is_boolean() && (*resp)["result"].get<bool>()) << resp->dump();
+    std::lock_guard<std::mutex> l(mint_mu);
+    ASSERT_EQ(mints.size(), 1u);
+    EXPECT_EQ(mints.back().payout_script, owner) << "the share does not carry the job's owner payout";
+    EXPECT_EQ(mints.back().donation, std::optional<uint16_t>(core::kSplitShareDonation))
+        << "the share does not carry the donation its ref committed to";
 }

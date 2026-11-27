@@ -73,3 +73,23 @@ TEST(DgbMainWiring, LiveSeamsAreBound)
     // Nothing else binds the single-slot best-change hook.
     EXPECT_EQ(at("set_on_best_share_changed("), std::string::npos);
 }
+
+// The DGB --redistribute split (#2347 re-applied on this mint): the default
+// spec, the owner armed, and the job's donation through the producer and mint.
+TEST(DgbMainWiring, TheRedistributeSplitIsWired)
+{
+    std::ifstream f(DGB_MAIN_SRC);
+    ASSERT_TRUE(f.good()) << DGB_MAIN_SRC;
+    std::stringstream ss;
+    ss << f.rdbuf();
+    const std::string s = ss.str();
+    for (const char* line : {
+             "std::string redistribute_spec = \"split\";",
+             "if (dgb::spec_names_split(redistribute_spec)) {",
+             "work_source->set_split_owner(owner_script);",
+             "req.donation          = block.share_donation ? *block.share_donation : donation_u16;",
+             "/*donation=*/in.donation ? *in.donation : donation_u16);",
+             "dgb::coin::DogeP2shSplit{std::move(owner_doge), std::move(owner_parent)});"})
+        EXPECT_NE(s.find(line), std::string::npos) << line;
+    EXPECT_EQ(s.find("split is not available on DGB yet"), std::string::npos);
+}

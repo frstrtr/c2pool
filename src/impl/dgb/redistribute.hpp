@@ -117,12 +117,11 @@ inline std::vector<HybridWeight> parse_redistribute_spec(const std::string& spec
     return result;
 }
 
-// A spec naming "split" (alone or as a hybrid term). The LTC and DASH
-// default, --redistribute split (half the share's weight to the node owner,
-// half to the donation), is not available on DGB yet: it needs the payout and
-// the donation decided when the job is built, and DGB decides the
-// redistributed payout at submit time. Such a spec binds no policy (as
-// without --redistribute) and is warned about; it is never read as pplns
+// A spec naming "split" (alone or as a hybrid term): --redistribute split,
+// the default on DGB as on LTC and DASH (half the share's weight to the node
+// owner, half to the donation). It is decided when the job is built
+// (DGBWorkSource::decide_job_payout, armed by main_dgb with the node owner's
+// script), not by a Redistributor; it is never read as pplns
 // (parse_single_mode's fallback for an unknown mode).
 inline bool spec_names_split(const std::string& spec)
 {
