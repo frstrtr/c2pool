@@ -16,6 +16,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         coin_peer_pool_p2p_test.cpp
         coin_peer_pool_test.cpp
         dashboard_pplns_current_test.cpp
+        dashboard_sharechain_test.cpp
         f10b_version_punish_removal_test.cpp
         f11_donation_invariance_test.cpp
         finder_fee_integer_exact_test.cpp
