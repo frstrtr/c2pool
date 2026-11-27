@@ -15,6 +15,7 @@
 #include <gtest/gtest.h>
 
 #include <c2pool/merged/merged_mining.hpp>
+#include <c2pool/merged/merged_donation.hpp>
 #include <core/hash.hpp>
 #include <core/target_utils.hpp>
 #include <btclibs/uint256.h>
@@ -125,6 +126,10 @@ static const std::vector<unsigned char> COMBINED_DONATION = {
     0x52, 0x6d, 0xd8, 0x6a, 0xcf, 0xf6, 0x0c, 0x71, 0x36, 0xbe,
     0x8e, 0x85, 0x87
 };
+// The aux coinbase's donation (the single P2PKH key): what the merged payout
+// providers split the PPLNS remainder to and build_multiaddress_block pays
+// last (c2pool/merged/merged_donation.hpp).
+static const std::vector<unsigned char>& MERGED_DONATION = c2pool::merged::merged_donation_script();
 
 // ============================================================================
 // Deterministic hash generation
@@ -594,7 +599,7 @@ TEST_F(PPLNSStressTest, MultiaddressBlock_ParentChain30Miners)
 
     uint64_t reward = 12'5000'0000ULL;
     auto payouts_map = compute_expected_payouts(
-        r.weights, r.total_weight, r.total_donation_weight, reward, COMBINED_DONATION);
+        r.weights, r.total_weight, r.total_donation_weight, reward, MERGED_DONATION);
 
     std::vector<std::pair<std::vector<unsigned char>, uint64_t>> payouts;
     for (auto& [script, amount] : payouts_map)
@@ -621,7 +626,7 @@ TEST_F(PPLNSStressTest, MultiaddressBlock_ParentChain30Miners)
 
     // Last output is donation
     auto& last = outputs.back();
-    EXPECT_EQ(std::vector<uint8_t>(COMBINED_DONATION.begin(), COMBINED_DONATION.end()),
+    EXPECT_EQ(std::vector<uint8_t>(MERGED_DONATION.begin(), MERGED_DONATION.end()),
               last.first);
     EXPECT_GE(last.second, 1u);
 }
@@ -634,7 +639,7 @@ TEST_F(PPLNSStressTest, MultiaddressBlock_MergedChain50Miners)
 
     uint64_t reward = 10000'0000'0000ULL;  // DOGE
     auto payouts_map = compute_expected_payouts(
-        r.weights, r.total_weight, r.total_donation_weight, reward, COMBINED_DONATION);
+        r.weights, r.total_weight, r.total_donation_weight, reward, MERGED_DONATION);
 
     std::vector<std::pair<std::vector<unsigned char>, uint64_t>> payouts;
     for (auto& [script, amount] : payouts_map)
@@ -821,7 +826,11 @@ TEST_F(PPLNSStressTest, EndToEnd_PayoutHashToBlock_ParentAndMerged)
         r.weights, r.total_weight, r.total_donation_weight, true);
     ASSERT_FALSE(payout_hash.IsNull());
 
-    // --- Parent chain (LTC) ---
+    // --- Parent chain (LTC) split, built by the AUX builder ---
+    // Not the LTC parent gentx (generate_share_transaction, which keeps the
+    // combined P2SH donation; LTC_T5_GentxGolden pins it): a synthetic
+    // coinbase build_multiaddress_block makes of the LTC split, to compare
+    // the output counts of the two splits.
     uint64_t ltc_reward = 12'5000'0000ULL;
     auto ltc_payouts_map = compute_expected_payouts(
         r.weights, r.total_weight, r.total_donation_weight, ltc_reward, COMBINED_DONATION);
@@ -844,7 +853,7 @@ TEST_F(PPLNSStressTest, EndToEnd_PayoutHashToBlock_ParentAndMerged)
     // --- Merged chain (DOGE) ---
     uint64_t doge_reward = 10000'0000'0000ULL;
     auto doge_payouts_map = compute_expected_payouts(
-        r.weights, r.total_weight, r.total_donation_weight, doge_reward, COMBINED_DONATION);
+        r.weights, r.total_weight, r.total_donation_weight, doge_reward, MERGED_DONATION);
 
     std::vector<std::pair<std::vector<unsigned char>, uint64_t>> doge_payouts;
     for (auto& [s, a] : doge_payouts_map)
@@ -870,13 +879,16 @@ TEST_F(PPLNSStressTest, EndToEnd_PayoutHashToBlock_ParentAndMerged)
     EXPECT_EQ(payout_hash, payout_hash2)
         << "Payout hash must be stable across reward computations";
 
-    // Donation present in both
-    auto donation_vec = std::vector<uint8_t>(COMBINED_DONATION.begin(), COMBINED_DONATION.end());
+    // Donation present in both. Both blocks come from the aux builder, which
+    // pays its donation to MERGED_DONATION; the LTC split's combined P2SH
+    // entry is folded into it (the synthetic aux-builder coinbase, not the
+    // LTC parent gentx).
+    auto donation_vec = std::vector<uint8_t>(MERGED_DONATION.begin(), MERGED_DONATION.end());
     bool ltc_has_donation = false, doge_has_donation = false;
     for (const auto& [s, v] : ltc_outputs)
         if (s == donation_vec) { ltc_has_donation = true; EXPECT_GE(v, 1u); }
     for (const auto& [s, v] : doge_outputs)
         if (s == donation_vec) { doge_has_donation = true; EXPECT_GE(v, 1u); }
-    EXPECT_TRUE(ltc_has_donation) << "LTC block must have donation output";
+    EXPECT_TRUE(ltc_has_donation) << "aux-builder block over the LTC split must have the donation output";
     EXPECT_TRUE(doge_has_donation) << "DOGE block must have donation output";
 }

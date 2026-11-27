@@ -12,6 +12,7 @@
 #include <gtest/gtest.h>
 
 #include <c2pool/merged/merged_mining.hpp>
+#include <c2pool/merged/merged_donation.hpp>
 #include <core/hash.hpp>
 #include <core/target_utils.hpp>
 #include <btclibs/uint256.h>
@@ -133,13 +134,25 @@ static std::vector<unsigned char> make_p2wsh_script(const std::vector<unsigned c
     return s;
 }
 
-// Combined donation script (V36+, matches PoolConfig)
+// Combined donation script (V36+, matches PoolConfig): the parent share
+// donation, and the aux coinbase's donation before it paid the single key. An
+// aux payout entry with it is folded into the aux donation output.
 static const std::vector<unsigned char> COMBINED_DONATION = {
     0xa9, 0x14,
     0x8c, 0x62, 0x72, 0x62, 0x1d, 0x89, 0xe8, 0xfa,
     0x52, 0x6d, 0xd8, 0x6a, 0xcf, 0xf6, 0x0c, 0x71,
     0x36, 0xbe, 0x8e, 0x85,
     0x87
+};
+// The aux coinbase's donation (the single P2PKH key 20cb5c22..3c61), the
+// script the merged payout providers give the PPLNS remainder
+// (c2pool/merged/merged_donation.hpp).
+static const std::vector<unsigned char> MERGED_DONATION = {
+    0x76, 0xa9, 0x14,
+    0x20, 0xcb, 0x5c, 0x22, 0xb1, 0xe4, 0xd5, 0x94,
+    0x7e, 0x5c, 0x11, 0x2c, 0x76, 0x96, 0xb5, 0x1a,
+    0xd9, 0xaf, 0x3c, 0x61,
+    0x88, 0xac
 };
 
 // ============================================================================
@@ -255,7 +268,7 @@ public:
             [](const auto& a, const auto& b) { return a.first < b.first; });
 
         // Add donation last
-        payouts.emplace_back(COMBINED_DONATION, donation);
+        payouts.emplace_back(MERGED_DONATION, donation);
         return payouts;
     }
 
@@ -499,12 +512,56 @@ TEST_F(MultiaddressCoinbaseTest, DonationIsAlwaysLastOutput)
         pos += script_len;
     }
 
-    // Last output should be COMBINED_DONATION
+    // Last output should be the aux donation: the single P2PKH key, the
+    // accessor's bytes
     ASSERT_FALSE(output_scripts.empty());
     auto& last_script = output_scripts.back();
-    std::vector<uint8_t> expected_donation(COMBINED_DONATION.begin(), COMBINED_DONATION.end());
+    std::vector<uint8_t> expected_donation(MERGED_DONATION.begin(), MERGED_DONATION.end());
     EXPECT_EQ(last_script, expected_donation)
-        << "Last output must be the combined donation script";
+        << "Last output must be the single P2PKH donation script";
+    EXPECT_EQ(MERGED_DONATION, c2pool::merged::merged_donation_script());
+    for (const auto& s : output_scripts)
+        EXPECT_NE(s, std::vector<uint8_t>(COMBINED_DONATION.begin(), COMBINED_DONATION.end()));
+}
+
+// A payout entry with the old combined P2SH (a share redistributed in
+// "donate" mode, a miner paying the old donation address) is folded into the
+// donation output with the one the providers pay: never a miner output.
+TEST_F(MultiaddressCoinbaseTest, OldCombinedDonationIsFoldedIntoTheDonation)
+{
+    auto tmpl = make_template(100);
+    auto miner = make_p2pkh_script(hash160_from_index(0));
+    std::vector<std::pair<std::vector<unsigned char>, uint64_t>> payouts = {
+        {miner, 40'0000'0000ULL}, {COMBINED_DONATION, 7'0000'0000ULL}, {MERGED_DONATION, 3'0000'0000ULL}};
+    std::sort(payouts.begin(), payouts.end());
+
+    auto raw = from_hex(MergedMiningManager::build_multiaddress_block(tmpl, payouts, "", uint256{}));
+    ASSERT_FALSE(raw.empty());
+    size_t pos = 80;
+    read_varint(raw, pos);  // tx count
+    pos += 4;               // tx version
+    uint64_t vin_count = read_varint(raw, pos);
+    for (uint64_t i = 0; i < vin_count; ++i) {
+        pos += 32 + 4;
+        uint64_t sig_len = read_varint(raw, pos);
+        pos += sig_len + 4;
+    }
+    std::vector<std::pair<std::vector<uint8_t>, uint64_t>> outs;
+    uint64_t vout_count = read_varint(raw, pos);
+    for (uint64_t i = 0; i < vout_count; ++i) {
+        uint64_t value = read_le64(&raw[pos]);
+        pos += 8;
+        uint64_t slen = read_varint(raw, pos);
+        outs.emplace_back(std::vector<uint8_t>(raw.begin() + pos, raw.begin() + pos + slen), value);
+        pos += slen;
+    }
+    // miner + OP_RETURN + donation
+    ASSERT_EQ(outs.size(), 3u);
+    EXPECT_EQ(outs[0].first, miner);
+    EXPECT_EQ(outs[0].second, 40'0000'0000ULL);
+    EXPECT_EQ(outs[1].first[0], 0x6a);
+    EXPECT_EQ(outs[2].first, MERGED_DONATION);
+    EXPECT_EQ(outs[2].second, 10'0000'0000ULL);
 }
 
 TEST_F(MultiaddressCoinbaseTest, OpReturnPresent)

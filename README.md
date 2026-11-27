@@ -305,13 +305,18 @@ and does not yet exist, so the work can be judged on what it actually is.
   hysteresis and chain self-heal, to close the whole *class* rather than the known
   modes — is **in progress on the design track and not yet landed. We do not claim
   the class is fully closed.**
-- **Donation script (legacy key, disclosed):** the v36 donation output currently
-  uses a P2SH script that **inherits a legacy p2pool donation key** from the
-  upstream codebase. This is **not an endorsement by, or involvement of, any third
-  party** — it is inherited code. It is scheduled for replacement with a
-  **c2pool-only script in v37**. v36 blocks already produced with the inherited
-  script are immutable consensus history and cannot be retroactively changed; the
-  clean script becomes the default at the v37 boundary.
+- **Donation script (legacy key, disclosed):** the v36 donation output of the
+  parent share's coinbase (LTC, BTC, DGB, BCH) currently uses a P2SH script that
+  **inherits a legacy p2pool donation key** from the upstream codebase. This is
+  **not an endorsement by, or involvement of, any third party** — it is inherited
+  code. It is scheduled for replacement with a **c2pool-only script in v37**. v36
+  blocks already produced with the inherited script are immutable consensus
+  history and cannot be retroactively changed; the clean script becomes the
+  default at the v37 boundary. The merged-chain coinbases c2pool builds itself
+  (DOGE, NMC and the other aux chains) no longer pay it: their donation output
+  pays a single c2pool key (P2PKH, see
+  [Who is paid on a merged chain](#who-is-paid-on-a-merged-chain-c2pool-ltc-sharechain-mode)),
+  the key c2pool-dash donates to.
 
 ### v36 ratchet complete — the last generation shared with Python p2pool
 - **The LTC line ratcheted to V36.** Since 2026-11-13 00:00:00 UTC
@@ -972,8 +977,26 @@ share's version:
   naming another miner's parent script could take that miner's address-less
   shares).
 
+The merged coinbase c2pool builds (every chain in multiaddress mode: DOGE
+under LTC, and under DGB once its payout provider lands; NMC under BTC; the
+other LTC aux chains) ends with its
+donation output, which takes the donation and the PPLNS rounding remainder
+(at least 1 satoshi). It pays one P2PKH key on every chain: script
+`76a914 20cb5c22b1e4d5947e5c112c7696b51ad9af3c61 88ac`, on DOGE
+`D88Vn6Dyct7DKfVCfR3syHkjyNx9gEyyiv` (testnet
+`nXBZW6xtYrZwCe4PhEhLDhM3DFLSd1pa1R`), the key c2pool-dash donates to. It is
+not the parent share's combined P2SH donation, which the LTC/BTC/DGB coinbase
+keeps. A merged payout to that combined P2SH (a share redistributed by
+`--redistribute donate`, a P2WSH/P2TR `--node-owner-address` without a merged
+address) is added to the donation output, never paid as a miner output. A
+`createauxblock`-mode chain's coinbase is its daemon's and has no donation
+output.
+
 c2pool nodes do not re-derive each other's merged coinbases, so the rule
-decides no share's validity. A P2SH `--node-owner-address` without
+decides no share's validity, and neither does the merged donation. Python
+p2pool V36 nodes do re-derive the DOGE coinbase, with the combined P2SH as its
+donation: on LTC testnet, whose shares stay V36 (no flag day), a Python V36
+node rejects the c2pool shares that carry a DOGE block. A P2SH `--node-owner-address` without
 `--node-owner-merged-address` is paid as the same P2SH on the merged chains,
 with the same segwit-wrapped warning at startup. `--solo` / `--custodial` merged payouts do not use per-miner
 merged addresses, and `c2pool-btc` (NMC) and `c2pool-dgb` (DOGE) do not carry

@@ -34,7 +34,8 @@
 #include <crypto/ripemd160.h>   // CRIPEMD160 for Hash160
 #include <c2pool/merged/merged_mining.hpp>  // Integrated merged mining
 #include <c2pool/merged/aux_chain_params.hpp>  // merged-chain address versions (/web/currency_info)
-#include <core/donation.hpp>                    // COMBINED_DONATION_SCRIPT (merged donation address)
+#include <core/donation.hpp>                    // COMBINED_DONATION_SCRIPT (parent donation address)
+#include <c2pool/merged/merged_donation.hpp>   // merged_donation_script (aux coinbase donation)
 #include <impl/ltc/config_pool.hpp>          // PoolConfig::is_testnet for donation addr
 
 #include <iomanip>
@@ -8555,16 +8556,15 @@ nlohmann::json MiningInterface::rest_web_currency_info()
 
         // merged_donation_addresses: every merged chain whose block c2pool
         // builds itself (multiaddress; build_pplns_coinbase_hex always pays
-        // the V36 combined donation P2SH) and that is not disabled. A
-        // createauxblock-mode chain's coinbase is the daemon's, with no
-        // donation output: not listed.
+        // merged_donation_script(), the single P2PKH key) and that is not
+        // disabled. A createauxblock-mode chain's coinbase is the daemon's,
+        // with no donation output: not listed.
         nlohmann::json donation_merged = nlohmann::json::object();
-        const std::vector<unsigned char> combined_donation(core::donation::COMBINED_DONATION_SCRIPT.begin(),
-                                                           core::donation::COMBINED_DONATION_SCRIPT.end());
+        const auto& merged_donation = c2pool::merged::merged_donation_script();
         for (const auto& ci : chain_infos) {
             if (!ci.multiaddress || !ci.config_error.empty())
                 continue;
-            const auto addr = merged_chain_script_to_address(combined_donation, ci.symbol, m_testnet);
+            const auto addr = merged_chain_script_to_address(merged_donation, ci.symbol, m_testnet);
             if (!addr.empty())
                 donation_merged[upper_symbol(ci.symbol)] = addr;
         }
@@ -10821,17 +10821,36 @@ nlohmann::json MiningInterface::compute_current_merged_payouts()
             uint8_t merged_p2pkh_ver = ci.address_version ? ci.address_version : 0x1e;
             uint8_t merged_p2sh_ver  = ci.p2sh_version    ? ci.p2sh_version    : 0x16;
 
-            for (auto& [script, amount] : merged_payouts) {
-                // Donation: P2PK (ends with OP_CHECKSIG), P2SH matching donation script,
-                // or script matching the known donation_script from MiningInterface
-                bool is_donation = (script.size() > 33 && script.back() == 0xac); // P2PK
+            // The aux coinbase pays every entry with its donation script or
+            // the old combined P2SH (a "donate"-mode share) as ONE output, to
+            // merged_donation_script(): shown as that one entry, its amount
+            // the sum, so each chain has a single donation row equal to the
+            // coinbase's donation output.
+            std::vector<std::pair<std::vector<unsigned char>, uint64_t>> merged_outputs;
+            merged_outputs.reserve(merged_payouts.size());
+            uint64_t aux_donation = 0;
+            bool has_aux_donation = false;
+            for (const auto& [script, amount] : merged_payouts) {
+                if (c2pool::merged::is_merged_donation_output(script)) {
+                    aux_donation += amount;
+                    has_aux_donation = true;
+                } else {
+                    merged_outputs.emplace_back(script, amount);
+                }
+            }
+            if (has_aux_donation)
+                merged_outputs.emplace_back(c2pool::merged::merged_donation_script(), aux_donation);
+
+            for (auto& [script, amount] : merged_outputs) {
+                // Donation: the aux coinbase's donation (merged_donation_script,
+                // the single P2PKH key) or the combined P2SH folded into it
+                // (is_merged_donation_output), P2PK (ends with OP_CHECKSIG), or
+                // the parent donation_script from MiningInterface
+                bool is_donation = c2pool::merged::is_merged_donation_output(script);
+                if (!is_donation && script.size() > 33 && script.back() == 0xac)
+                    is_donation = true; // P2PK
                 if (!is_donation && !m_donation_script.empty() && script == m_donation_script)
                     is_donation = true; // matches configured donation script
-                if (!is_donation && script.size() == 23 && script[0] == 0xa9) {
-                    // Check if P2SH matches combined donation hash (8c6272621d89e8fa...)
-                    if (script[2] == 0x8c && script[3] == 0x62 && script[4] == 0x72)
-                        is_donation = true;
-                }
                 std::string source = is_donation ? "donation" : "auto-convert";
 
                 // Convert merged script to proper DOGE address
@@ -10894,12 +10913,13 @@ nlohmann::json MiningInterface::compute_current_merged_payouts()
                 // and COMBINED_DONATION_SCRIPT (P2SH → MLhSm on mainnet) have different
                 // hash160 values, so hash160 matching won't find the parent.
                 if (!attached && is_donation) {
-                    // Use known DOGE donation address (precomputed, same as p2pool)
+                    // Without an address of its own (a P2PK script): the
+                    // address of the aux coinbase's donation output on this
+                    // chain, from the script bytes and the chain's versions.
                     std::string doge_donation_addr = merged_addr;
                     if (doge_donation_addr.empty() || doge_donation_addr == "donation")
-                        doge_donation_addr = ltc::PoolConfig::is_testnet
-                            ? "2N63WXLw22FXFdLBNqWZLsDX7WQJTPXus7f"   // COMBINED_DONATION_DOGE_TESTNET
-                            : "A5EZCT4tUrtoKuvJaWbtVQADzdUKdtsqpr";  // COMBINED_DONATION_DOGE_MAINNET
+                        doge_donation_addr = script_to_address(c2pool::merged::merged_donation_script(), "",
+                                                               merged_p2pkh_ver, merged_p2sh_ver);
 
                     // Find LTC donation address: try known prefixes
                     std::string ltc_donation_key;

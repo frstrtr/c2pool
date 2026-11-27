@@ -286,6 +286,7 @@ static void segfault_handler(int sig) {
 #include <c2pool/merged/aux_chain_params.hpp>
 #include <c2pool/merged/aux_found_verdict.hpp>
 #include <c2pool/merged/payout_source.hpp>
+#include <c2pool/merged/merged_donation.hpp>
 #include <c2pool/merged/coin_broadcaster.hpp>
 #include <impl/ltc/coin/mweb_fetch_retry.hpp>
 #include <impl/ltc/coin/mweb_ext_poller.hpp>
@@ -10017,12 +10018,14 @@ int main(int argc, char* argv[]) {
                 // Solo: proportional split by stratum hashrates.
                 auto owner_script_mm = core::address_to_script(payout_address);
                 mm_manager->set_payout_provider(
-                    [&web_server, mi, custodial_mode, owner_script_mm,
+                    [&web_server, custodial_mode, owner_script_mm,
                      dev_donation, node_owner_fee, &payout_address](
                         uint32_t chain_id, uint64_t coinbase_value)
                     -> std::vector<std::pair<std::vector<unsigned char>, uint64_t>>
                 {
-                    auto& donation_script = mi->get_donation_script();
+                    // The aux coinbase's donation (merged_donation.hpp), not
+                    // the parent coinbase's (MiningInterface's donation script).
+                    const auto& donation_script = c2pool::merged::merged_donation_script();
 
                     // Donation (dev_donation% or 1 satoshi marker)
                     uint64_t donation_amount = (dev_donation > 0)
@@ -10093,15 +10096,14 @@ int main(int argc, char* argv[]) {
                 // share the jobs build on: V36 peers re-derive the payouts
                 // from the share's prev share.
                 auto merged_payout_source = mm_manager->payout_source();
-                auto combined_donation = std::vector<unsigned char>(
-                    ltc::PoolConfig::COMBINED_DONATION_SCRIPT.begin(),
-                    ltc::PoolConfig::COMBINED_DONATION_SCRIPT.end());
+                const std::vector<unsigned char> merged_donation = c2pool::merged::merged_donation_script();
                 // The weights of `best` for a merged chain, as a payout
-                // source entry. Merged chains always use
-                // COMBINED_DONATION_SCRIPT (P2SH) regardless of share version
-                // (p2pool data.py line 303); the parent chain uses the
+                // source entry. The merged chains' donation and PPLNS
+                // remainder go to the aux coinbase's donation script, the
+                // single P2PKH key, whatever the share version
+                // (merged_donation.hpp); the parent chain uses the
                 // version-dependent donation.
-                auto merged_weights = [combined_donation](
+                auto merged_weights = [merged_donation](
                     ltc::ShareTracker& tracker, const uint256& best, uint32_t chain_id)
                     -> c2pool::merged::MergedPayoutSource::Weights
                 {
@@ -10113,9 +10115,9 @@ int main(int argc, char* argv[]) {
                     auto w = std::make_shared<const ltc::MergedPayoutWeights>(
                         tracker.get_merged_payout_weights(best, chain_id));
                     out.chain_len = w->chain_len;
-                    out.derive = [w, combined_donation](uint64_t coinbase_value) {
+                    out.derive = [w, merged_donation](uint64_t coinbase_value) {
                         return ltc::ShareTracker::merged_payout_outputs(*w, coinbase_value,
-                                                                         combined_donation);
+                                                                         merged_donation);
                     };
                     out.origins = [w]() { return ltc::ShareTracker::merged_payout_origins(*w); };
                     return out;
