@@ -72,6 +72,7 @@
 #include <impl/nmc/coin/headers_wire.hpp>         // parse_nmc_headers_message (AuxPoW intact)
 #include <impl/ltc/config_coin.hpp>               // ltc::config::P2PData/RPCData — BroadcasterConfig adapter dep (coin_broadcaster.hpp; main_ltc pulls it via config.hpp)
 #include <c2pool/merged/coin_broadcaster.hpp>     // CoinBroadcaster (NMC coin-P2P header-feed)
+#include <c2pool/merged/merged_donation.hpp>      // merged_donation_script (aux coinbase donation)
 
 #include <core/author_fee.hpp>                   // SSOT author-fee default + donation_percent_to_u16
 #include <core/coin/utxo.hpp>
@@ -2296,9 +2297,11 @@ int main(int argc, char* argv[])
             tracker.chain.get(best).share.invoke([&](auto* s) {
                 block_target = chain::bits_to_target(s->m_min_header.m_bits);
             });
-            // Merged chains commit the V36 (P2SH) donation script regardless
-            // of parent share version (p2pool data.py:303).
-            auto donation_script = btc::PoolConfig::get_donation_script(36);
+            // The aux coinbase's donation and PPLNS remainder: the single
+            // P2PKH key whatever the parent share version
+            // (merged_donation.hpp); the BTC coinbase keeps its own
+            // version-dependent donation.
+            const auto& donation_script = c2pool::merged::merged_donation_script();
             std::map<std::vector<unsigned char>, uint64_t> payouts_map;
             try {
                 payouts_map = tracker.get_merged_expected_payouts(

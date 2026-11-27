@@ -32,6 +32,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         legacy_addrme_self_probe_test.cpp
         merged_backend_test.cpp
         merged_commitment_test.cpp
+        merged_donation_kat_test.cpp
         merged_spec_test.cpp
         reconstruct_merkle_backstop_test.cpp
         reconstruct_test.cpp

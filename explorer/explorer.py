@@ -733,6 +733,10 @@ def decode_dip4_cbtx(payload_hex):
 # Known cross-coin p2pool/c2pool donation script fingerprints (see
 # src/core/donation.hpp — byte-identical across btc/bch/dgb/ltc/dash).
 COMBINED_DONATION_H160 = "8c6272621d89e8fa526dd86acff60c7136be8e85"      # v36 P2SH
+# The single-key P2PKH (core::donation::SINGLE_P2PKH_DONATION_SCRIPT): the
+# donation output of every aux-chain coinbase c2pool builds, and the DASH
+# share donation.
+SINGLE_DONATION_SCRIPT_HEX = "76a91420cb5c22b1e4d5947e5c112c7696b51ad9af3c6188ac"
 OLD_DONATION_PUBKEY = "04ffd03de44a6e11b9917f3a29f9443283d9871c9d743ef30d5eddcd37094b64d1b3d8090496b53256786bf5c82932ec23c3b74d9f05a6f95a8b5529352656664b"
 
 
@@ -836,6 +840,10 @@ def decode_outputs(vout_list, addr):
             if COMBINED_DONATION_H160 in out["hex"]:
                 out["is_donation"] = True
                 out["donation_type"] = "p2pool_combined"
+        # Detect the single-key P2PKH donation (aux-chain coinbases, DASH)
+        if out["hex"] == SINGLE_DONATION_SCRIPT_HEX:
+            out["is_donation"] = True
+            out["donation_type"] = "c2pool_single"
         # Detect legacy P2PK donation (pre-v36, shared across coins)
         if OLD_DONATION_PUBKEY in out["hex"]:
             out["is_donation"] = True

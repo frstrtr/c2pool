@@ -45,10 +45,13 @@ const f = new Function(section('c2pPayoutRole')
   + '\nreturn { c2pPayoutRole, c2pMergedIsDonation, c2pPayoutVersionHtml, c2pPayoutRoleLabel, c2pPayoutRowSymbol };')() as Fns;
 
 const DON_LTC = 'MLhSmVQxMusLE3pjGFvp4unFckgjeD8LUA';
-const DON_DOGE = 'A5EZCT4tUrtoKuvJaWbtVQADzdUKdtsqpr';
+// The DOGE donation output: the aux coinbase's single P2PKH key
+// (merged_donation_script, c2pool/merged/merged_donation.hpp).
+const DON_DOGE = 'D88Vn6Dyct7DKfVCfR3syHkjyNx9gEyyiv';
 
 // /current_merged_payouts as served 2026-11-16 (sg-ltc and the outside LTC
-// node 92.53.224.27 agree), trimmed to two miners and the donation row.
+// node 92.53.224.27 agree), trimmed to two miners and the donation row, with
+// the donation row's DOGE address the one the aux coinbase pays now.
 const LTC_MERGED: Record<string, Row> = {
   LVypi56LPcT9jR3e5Y5AdoVc5EGdrVk26F: { amount: 6.18633968, merged: [{ address: 'DFtxz7j9cN7P1cY5dz5RuYbSk9df7dyjuS', amount: 9915.74776462, parent: 'LVypi56LPcT9jR3e5Y5AdoVc5EGdrVk26F', source: 'explicit', symbol: 'DOGE' }] },
   LLd7gHqnEkaYahJ3s4gGuR7Qqps9pqQtYi: { amount: 0.04739658, merged: [{ address: 'DMjcAEDQ6Qg96ZaVR5dy4oidvrfoPB5kzC', amount: 58.42132557, parent: 'LLd7gHqnEkaYahJ3s4gGuR7Qqps9pqQtYi', source: 'explicit', symbol: 'DOGE' }] },

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #include "merged_mining.hpp"
 #include "aux_chain_params.hpp"
+#include "merged_donation.hpp"
 #include <core/coin/mweb_shape.hpp>
 #include <core/coin/sigop_cost.hpp>
 #include <impl/nmc/coin/aux_expected_index.hpp>  // CAuxPow::getExpectedIndex; leveldb-free
@@ -2827,6 +2828,9 @@ void MergedMiningManager::set_block_relay_fn(BlockRelayFn fn)
 // valid ordering. The sharechain commits to merged work via the AuxPoW merkle
 // proof, not by re-deriving these outputs across peers. Donation split + dust
 // tiebreak below are deterministic purely for stable local block assembly.
+// The donation output, always last, pays merged_donation_script() (the single
+// P2PKH key, merged_donation.hpp); every payout entry with that script or the
+// combined P2SH the aux coinbase paid before is folded into it.
 /*static*/ std::string MergedMiningManager::build_pplns_coinbase_hex(
     int height,
     const std::vector<std::pair<std::vector<unsigned char>, uint64_t>>& payouts,
@@ -2834,11 +2838,7 @@ void MergedMiningManager::set_block_relay_fn(BlockRelayFn fn)
 {
     if (payouts.empty()) return {};
 
-    static const std::vector<unsigned char> COMBINED_DONATION = {
-        0xa9, 0x14, 0x8c, 0x62, 0x72, 0x62, 0x1d, 0x89, 0xe8, 0xfa,
-        0x52, 0x6d, 0xd8, 0x6a, 0xcf, 0xf6, 0x0c, 0x71, 0x36, 0xbe,
-        0x8e, 0x85, 0x87
-    };
+    const std::vector<unsigned char>& donation_script = merged_donation_script();
 
     std::ostringstream cb;
     cb << "01000000" << "01"
@@ -2868,7 +2868,7 @@ void MergedMiningManager::set_block_relay_fn(BlockRelayFn fn)
     std::vector<std::pair<std::vector<unsigned char>, uint64_t>> miner_outs;
     uint64_t donation_amount = 0;
     for (const auto& [script, amount] : payouts) {
-        if (script == COMBINED_DONATION) donation_amount += amount;
+        if (is_merged_donation_output(script)) donation_amount += amount;
         else if (amount > 0) miner_outs.emplace_back(script, amount);
     }
     if (donation_amount < 1 && !miner_outs.empty()) {
@@ -2896,8 +2896,8 @@ void MergedMiningManager::set_block_relay_fn(BlockRelayFn fn)
     { uint8_t z[8] = {}; cb << to_hex(z, 8)
         << varint_hex(op_return_script.size()) << to_hex(op_return_script.data(), op_return_script.size()); }
     { uint8_t vbuf[8]; for (int i = 0; i < 8; ++i) vbuf[i] = (donation_amount >> (8*i)) & 0xFF;
-      cb << to_hex(vbuf, 8) << varint_hex(COMBINED_DONATION.size())
-         << to_hex(COMBINED_DONATION.data(), COMBINED_DONATION.size()); }
+      cb << to_hex(vbuf, 8) << varint_hex(donation_script.size())
+         << to_hex(donation_script.data(), donation_script.size()); }
     cb << "00000000";
     return cb.str();
 }
