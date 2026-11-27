@@ -405,7 +405,7 @@ Pre-built binaries are available on the [Releases page](https://github.com/frstr
 
 | Platform | Package | Notes |
 |----------|---------|-------|
-| Linux x86_64 | `.tar.gz` | Extract and run `./c2pool-<coin>` (or `./start.sh`) |
+| Linux x86_64 | `.tar.gz` | Extract and run `./c2pool-<coin>` (or `./start.sh`); requires glibc 2.38 and libstdc++ from GCC 13 or later (Ubuntu 24.04+, Debian 13+). The packages do not start on older distributions (Ubuntu 22.04, Debian 11/12); build from source there (see doc/build-unix.md; tested on Ubuntu 24.04). |
 | macOS (universal) | `.dmg` or `.zip` | One universal binary for Apple Silicon and Intel Macs; requires macOS 26.0 or later; no Homebrew needed |
 | Windows x86_64 | `.zip` or `setup.exe` | Installer bundles VC++ Runtime + firewall rules |
 
