@@ -2362,32 +2362,13 @@ uint256 create_local_share_v35(
             }
         }
 
-        std::map<std::vector<unsigned char>, uint64_t> amounts;
-        if (!total_weight.IsNull()) {
-            for (auto& [script, weight] : weights) {
-                // V35: 99.5% to PPLNS — subsidy * 199 * weight / (200 * total_weight)
-                uint64_t amount = (uint288(subsidy) * uint288(199) * weight
-                                   / (uint288(200) * total_weight)).GetLow64();
-                if (amount > 0) amounts[script] = amount;
-            }
-        }
-        // V35: add 0.5% finder fee to the share creator's payout script
-        amounts[payout_script] = (amounts.count(payout_script) ? amounts[payout_script] : 0)
-                                 + subsidy / 200;
-        uint64_t sum_amounts = 0;
-        for (auto& [s, a] : amounts) sum_amounts += a;
-        // V35: no minimum donation enforcement (unlike v36)
-        uint64_t donation_amount = (subsidy > sum_amounts) ? (subsidy - sum_amounts) : 0;
-
-        std::vector<std::pair<std::vector<unsigned char>, uint64_t>> payout_outputs(
-            amounts.begin(), amounts.end());
-        std::sort(payout_outputs.begin(), payout_outputs.end(),
-            [](const auto& a, const auto& b) {
-                if (a.second != b.second) return a.second < b.second;
-                return a.first < b.first;
-            });
-        if (payout_outputs.size() > 4000)
-            payout_outputs.erase(payout_outputs.begin(), payout_outputs.end() - 4000);
+        // V35 amounts (99.5% by weight + the 0.5% finder fee, no >=1-sat
+        // donation rule) and the python output order: the payout split SSOT
+        // the producer and the verifier use (pplns_payout_split.hpp).
+        const auto split = dgb::coin::compute_pplns_payout_split(weights, total_weight, subsidy,
+                                                                 /*use_v36_pplns=*/false, payout_script);
+        const uint64_t donation_amount = split.donation_amount;
+        const auto& payout_outputs = split.payout_outputs;
 
         PackStream gentx;
         { uint32_t v = 1; gentx.write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&v), 4)); }
