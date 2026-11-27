@@ -83,6 +83,7 @@
 #include <core/config_endpoint.hpp>  // M1 control-plane READ-ONLY endpoints
 #include <core/filesystem.hpp>      // config_path() for the graph_db location
 #include <core/found_block_lookups.hpp> // header-bits difficulty by block hash
+#include <core/hash.hpp>               // Hash (SHA256d) for the Best Share card hash
 #include <functional>
 #include <ctime>       // std::time (found-block record timestamp)
 #include <limits>       // std::numeric_limits (RPC-fallback sentinel)
@@ -992,6 +993,26 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
             for (const auto& [id, w] : ws->snapshot_stratum_workers()) { (void)id; total += w.hashrate; }
             return total;
         });
+        // Best Share card: every accepted pseudoshare's achieved difficulty
+        // (the stratum session reports it to the work source, which had no
+        // sink, so the card stayed empty with rigs hashing). The card's hash
+        // is the share's SHA256d header hash, rebuilt from the submit fields.
+        work_source->set_best_pseudoshare_fn(
+            [mi](double diff, const std::string& miner,
+                 const std::string& coinb1, const std::string& coinb2,
+                 const std::string& en1, const std::string& en2,
+                 const std::string& ntime, const std::string& nonce,
+                 uint32_t version, const std::string& prevhash_hex,
+                 const std::string& nbits_hex, const std::vector<std::string>& branches) {
+                std::string pow_hex;
+                const uint256 merkle_root = core::MiningInterface::reconstruct_merkle_root(
+                    coinb1 + en1 + en2 + coinb2, branches);
+                const auto header = core::MiningInterface::build_header_bytes(
+                    version, prevhash_hex, merkle_root, ntime, nbits_hex, nonce);
+                if (header.size() == 80)
+                    pow_hex = Hash(std::span<const unsigned char>(header.data(), header.size())).GetHex();
+                mi->update_best_difficulty(diff, miner, pow_hex, /*update_merged=*/false);
+            });
 
         // ── Pool-wide "Current Payouts" (#1508 read-model wiring, #939 seam) ─
         // Lights /current_payouts + /current_merged_payouts (the main dashboard
