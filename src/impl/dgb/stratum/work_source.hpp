@@ -363,23 +363,24 @@ public:
         gbt_clock_ = std::move(fn);
     }
 
-    /// Work is served from the embedded header chain only once it has reached
-    /// its tip: its median time past at most `sec` old (0, the default: not
-    /// checked). A latch: once reached, never behind again. Until then the
-    /// GBT fallback's template is served when bound, else no work. During
-    /// header sync the embedded template would be for an old height and
-    /// prevhash.
+    /// Work is served from the embedded header chain only while its tip is
+    /// recent: its median time past at most `sec` old (0, the default: not
+    /// checked). Otherwise (header sync, or a tip that stopped moving) the
+    /// GBT fallback's template is served when bound, else no work: the
+    /// embedded template would be for an old height and prevhash.
     void set_tip_recent_sec(uint32_t sec) { tip_recent_sec_.store(sec); }
+    /// The tip-age clock (seconds), a test seam; unset: std::time.
+    void set_tip_clock(std::function<int64_t()> fn)
+    {
+        std::lock_guard<std::mutex> lk(tip_clock_mutex_);
+        tip_clock_ = std::move(fn);
+    }
 
     /// True when work comes from the embedded header chain: it has a tip and
-    /// has reached it (set_tip_recent_sec, latched); false: digibyted's GBT
+    /// that tip is recent (set_tip_recent_sec); false: digibyted's GBT
     /// template, or none. The one source choice of the template, the prevhash
     /// getter and the work gate.
     bool embedded_chain_serves() const;
-    /// The header chain's tip switched deep (main_dgb: a cut of more than a
-    /// few headers): the tip latch is let go, so the embedded chain serves
-    /// again only once it is at its tip.
-    void reset_tip_latch() { tip_latched_.store(false); }
 
     /// Whether a template can be served now: the embedded chain serves, or
     /// digibyted's GBT answers with a height (through the GBT cache, so at
@@ -562,7 +563,9 @@ private:
     mutable std::mutex          summary_mutex_;
     mutable std::optional<TemplateSummary> summary_;   // under summary_mutex_
     mutable std::atomic<int>    tip_state_{-1};   // last logged: 1 at tip, 0 behind/held, 2 behind/GBT
-    mutable std::atomic<bool>   tip_latched_{false};   // reached its tip once: never behind again
+    mutable std::mutex          tip_clock_mutex_;
+    std::function<int64_t()>    tip_clock_;      // under tip_clock_mutex_
+    int64_t tip_age() const;   // seconds since the chain's median time past
     mutable std::mutex          local_rate_mutex_;
     LocalRateFn                 local_rate_fn_;
     std::function<double()>     node_rate_fn_;   // under local_rate_mutex_

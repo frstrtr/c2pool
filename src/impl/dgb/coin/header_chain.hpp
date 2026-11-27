@@ -192,6 +192,72 @@ inline u256 digishield_next_target(const RetargetWindow& rw,
     return bn_new;
 }
 
+// ── Header work (DigiByte Core GetBlockProof) ───────────────────────────────
+namespace work_detail {
+inline u256 bit_not(const u256& a)
+{
+    u256 r;
+    for (int i = 0; i < 4; ++i)
+        r.limb[i] = ~a.limb[i];
+    return r;
+}
+// a - b modulo 2^256.
+inline u256 sub(const u256& a, const u256& b)
+{
+    u256 r;
+    uint64_t borrow = 0;
+    for (int i = 0; i < 4; ++i) {
+        const uint64_t x = a.limb[i], y = b.limb[i];
+        r.limb[i] = x - y - borrow;
+        borrow = (x < y || (x == y && borrow)) ? 1 : 0;
+    }
+    return r;
+}
+// floor(n / d), d != 0: bitwise long division, the remainder carried at 257
+// bits (a remainder shifted past 2^256 is above d, so d is taken off).
+inline u256 div(const u256& n, const u256& d)
+{
+    u256 q, r;
+    for (int bit = 255; bit >= 0; --bit) {
+        const bool carry = (r.limb[3] >> 63) != 0;
+        for (int i = 3; i > 0; --i)
+            r.limb[i] = (r.limb[i] << 1) | (r.limb[i - 1] >> 63);
+        r.limb[0] = (r.limb[0] << 1) | ((n.limb[bit / 64] >> (bit % 64)) & 1u);
+        if (carry || !(r < d)) {
+            r = sub(r, d);
+            q.limb[bit / 64] |= uint64_t(1) << (bit % 64);
+        }
+    }
+    return q;
+}
+} // namespace work_detail
+
+/// The work of a header of `target`: floor(2^256 / (target + 1)), as
+/// DigiByte Core's GetBlockProof computes it ((~target / (target + 1)) + 1).
+/// 0 for a zero target (never credited).
+inline u256 header_work(const u256& target)
+{
+    if (target.is_zero())
+        return u256{};
+    u256 plus_one = target;
+    plus_one += u256(1);
+    if (plus_one.is_zero())   // target == 2^256 - 1
+        return u256(1);
+    u256 w = work_detail::div(work_detail::bit_not(target), plus_one);
+    w += u256(1);
+    return w;
+}
+
+/// a + b, saturating at 2^256 - 1.
+inline u256 saturating_add(const u256& a, const u256& b)
+{
+    u256 r = a;
+    r += b;
+    if (r < a)
+        return work_detail::bit_not(u256{});
+    return r;
+}
+
 // Work-neutral header chain with a Scrypt-only DigiShield retarget body.
 // Append order is oldest..newest; the retarget walk reads nearest-first.
 class HeaderChain {
@@ -291,7 +357,7 @@ public:
             if (h.n_time <= median_time_past())
                 return IngestResult::REJECTED;
 
-            push_header(h);
+            push_header(h, header_work(h.target));
             m_cumulative_work += work_from_target(h.target);  // credited
             trim_to_window();
             return IngestResult::VALIDATED_SCRYPT;
@@ -301,7 +367,7 @@ public:
         default:
             // Extends the header chain; work-neutral (NO m_cumulative_work
             // change) and excluded from the retarget window by construction.
-            push_header(h);
+            push_header(h, u256{});
             trim_to_window();
             return IngestResult::ACCEPTED_CONTINUITY;
         }
@@ -431,8 +497,33 @@ public:
     void restore_tail(const std::vector<HeaderSample>& tail)
     {
         for (const auto& h : tail)
-            push_header(h);
+            push_header(h, header_credit(h));
         trim_to_window();
+    }
+
+    // The Scrypt work `h` is credited with when it is appended: its
+    // header_work when it is a Scrypt header whose target is non-zero, at
+    // most pow_limit (when set) and met by its scrypt hash; else 0 (a
+    // non-Scrypt header carries no work here). The context-free half of
+    // validate_and_append: the MTP check can still refuse it.
+    u256 header_credit(const HeaderSample& h) const
+    {
+        if (dgb_header_disposition(h.n_version) != HeaderDisposition::VALIDATE_SCRYPT || h.target.is_zero())
+            return u256{};
+        if (!m_ds_params.pow_limit.is_zero() && h.target > m_ds_params.pow_limit)
+            return u256{};
+        if (h.pow_hash > h.target)
+            return u256{};
+        return header_work(h.target);
+    }
+
+    // The Scrypt work credited to the headers after position `index` (the
+    // branch a fork from m_chain[index] would replace).
+    u256 work_after(std::size_t index) const
+    {
+        if (index + 1 >= m_chain_work.size())
+            return u256{};
+        return work_detail::sub(m_chain_work.back(), m_chain_work[index]);
     }
 
     // A getheaders block locator (DigiByte Core CChain::GetLocator shape):
@@ -615,11 +706,17 @@ private:
     // sequence - m_front_seq. Every push / pop keeps it in step.
     std::unordered_multimap<uint64_t, uint64_t> m_index;
     uint64_t                  m_front_seq = 0;    // sequence number of m_chain.front()
+    // The Scrypt work credited through each retained header (a running sum
+    // from the chain's start, saturating; in step with m_chain): the work of
+    // a range is a difference.
+    std::deque<u256>          m_chain_work;
 
-    void push_header(const HeaderSample& h)
+    void push_header(const HeaderSample& h, const u256& credit)
     {
         const uint64_t seq = m_front_seq + m_chain.size();
+        const u256 before = m_chain_work.empty() ? m_work_floor : m_chain_work.back();
         m_chain.push_back(h);
+        m_chain_work.push_back(saturating_add(before, credit));
         if (!h.block_hash.is_zero())
             m_index.emplace(h.block_hash.limb[0], seq);
     }
@@ -638,14 +735,29 @@ private:
     {
         unindex(m_chain.front(), m_front_seq);
         m_chain.pop_front();
+        m_work_floor = m_chain_work.front();
+        m_chain_work.pop_front();
         ++m_front_seq;
     }
     void pop_back_header()
     {
         unindex(m_chain.back(), m_front_seq + m_chain.size() - 1);
         m_chain.pop_back();
+        m_chain_work.pop_back();
     }
+    u256                      m_work_floor{};   // the running sum below m_chain_work.front()
     uint64_t                  m_cumulative_work = 0;
 };
+
+/// The live header chain's parameters (main_dgb): DigiByte's Scrypt
+/// powLimit, ~uint256(0) >> 20 (compact 0x1e0fffff) on mainnet and testnet,
+/// 0x207fffff on regtest. No retarget window (the served bits come from the
+/// MultiShield V4 walk).
+inline DigiShieldParams dgb_live_header_params(bool regtest)
+{
+    DigiShieldParams p;
+    p.pow_limit = regtest ? ::dgb::coin::compact_to_target(0x207fffffu) : ::dgb::coin::multishield_pow_limit();
+    return p;
+}
 
 } // namespace c2pool::dgb

@@ -233,24 +233,34 @@ std::function<uint256()> DGBWorkSource::get_best_share_hash_fn() const
     return best_share_hash_fn_;  // empty function until set_best_share_hash_fn() called
 }
 
+int64_t DGBWorkSource::tip_age() const
+{
+    int64_t now = static_cast<int64_t>(std::time(nullptr));
+    {
+        std::lock_guard<std::mutex> lk(tip_clock_mutex_);
+        if (tip_clock_)
+            now = tip_clock_();
+    }
+    return now - chain_.median_time_past();
+}
+
 bool DGBWorkSource::embedded_chain_serves() const
 {
     // The one template-source choice (reviews 906a0e5e3 #4, dd1248abd #5,
     // 7793bfb6c #2), read by the template, the prevhash getter and the work
-    // gate: the embedded header chain once it has a tip and has reached it.
-    // While it syncs, its template is for an old height and prevhash. A latch,
-    // as a node's initial block download: once at its tip it stays so (a
-    // quiet network never holds work again; a lost digibyted is the work
-    // gate's, stratum_work_gate.hpp).
+    // gate: the embedded header chain while it has a tip whose median time
+    // is at most tip_recent_sec old. While it syncs, or once its tip is that
+    // stale (no header for an hour on a 15 s chain), its template is for an
+    // old height and prevhash: digibyted's template when bound, else no work
+    // (review c6c1c0cff R1/R3: no latch).
     if (!chain_.tip_hash())
         return false;
     const uint32_t recent = tip_recent_sec_.load();
-    if (recent == 0 || tip_latched_.load())
+    if (recent == 0)
         return true;
-    const int64_t age = static_cast<int64_t>(std::time(nullptr)) - chain_.median_time_past();
+    const int64_t age = tip_age();
     if (age > static_cast<int64_t>(recent))
         return false;
-    tip_latched_.store(true);
     if (tip_state_.exchange(1) != 1)
         LOG_INFO << "[DGB-STRATUM] header chain at its tip (median time " << age << " s old): serving work from it";
     return true;
@@ -510,8 +520,7 @@ nlohmann::json DGBWorkSource::get_current_work_template() const
             from_gbt = true;
         } else if (tip || embedded_behind) {
             if (embedded_behind && tip_state_.exchange(0) != 0)
-                LOG_WARNING << "[DGB-STRATUM] header chain behind its tip (median time "
-                            << (static_cast<int64_t>(std::time(nullptr)) - chain_.median_time_past())
+                LOG_WARNING << "[DGB-STRATUM] header chain behind its tip (median time " << tip_age()
                             << " s old > " << tip_recent_sec_.load() << " s) and no digibyted template:"
                                " work held until it syncs";
             return nlohmann::json::object();

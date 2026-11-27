@@ -862,13 +862,25 @@ TEST(DgbWorkSource, WorkTemplateServesRealV4BitsAndPrevhash)
     ws->set_gbt_tip_fn(nullptr);
     ws->set_tip_recent_sec(0);
     EXPECT_TRUE(ws->get_current_work_template().contains("bits"));
-    // A latch: once the chain has reached its tip, it is never behind again.
-    ws->set_tip_recent_sec(UINT32_MAX);
-    ASSERT_EQ(ws->get_current_work_template()["previousblockhash"].get<std::string>(), expected_prev);
+    // Review c6c1c0cff R1/R3: no latch. The chain serves while its median
+    // time is at most the bound old, and stops once it is older (no header
+    // for an hour): digibyted's template when bound, else no work.
+    int64_t now = fx.chain.median_time_past() + 60;
+    ws->set_tip_clock([&now]() { return now; });
     ws->set_tip_recent_sec(3600);
-    const auto latched = ws->get_current_work_template();
-    ASSERT_TRUE(latched.contains("bits")) << "the tip latch let go";
-    EXPECT_EQ(latched["previousblockhash"].get<std::string>(), expected_prev);
+    const auto fresh = ws->get_current_work_template();
+    ASSERT_TRUE(fresh.contains("bits")) << "a recent tip serves no work";
+    EXPECT_EQ(fresh["previousblockhash"].get<std::string>(), expected_prev);
+    now += 3600;
+    EXPECT_FALSE(ws->embedded_chain_serves()) << "a stale tip still serves";
+    EXPECT_FALSE(ws->get_current_work_template().contains("bits")) << "work served from a stale tip";
+    ws->set_gbt_tip_fn([]() -> std::optional<dgb::stratum::DGBWorkSource::GbtTip> {
+        return dgb::stratum::DGBWorkSource::GbtTip{std::string(56, '0') + "0badf00d", "1a00ffff", 24200000};
+    });
+    EXPECT_EQ(ws->get_current_work_template()["previousblockhash"].get<std::string>(),
+              std::string(56, '0') + "0badf00d") << "a stale tip: digibyted's template";
+    ws->set_gbt_tip_fn(nullptr);
+    ws->set_tip_clock(nullptr);
 }
 
 // Review dd1248abd #5 / #8: main_dgb arms the tip check on mainnet only.

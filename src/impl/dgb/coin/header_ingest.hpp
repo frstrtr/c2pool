@@ -18,9 +18,12 @@
 // daemon-port scrypt boundary) and handed to HeaderChain::validate_and_append.
 //
 // LINKAGE (ingest_linked): a header is appended only onto its parent; known
-// headers are skipped; a fork branch from a retained header at most
-// kMaxReorgDepth below the tip switches the tip only once it is longer, with
-// the chain restored on a rejection; a zero or unretained parent is dropped.
+// headers are skipped; a fork branch from any retained header switches the
+// tip only once it carries strictly more Scrypt work than the branch it
+// replaces (HeaderChain::header_credit: 2^256/(target+1) for a Scrypt header
+// that meets its target within pow_limit, 0 for any other), with the chain
+// restored on a rejection; a zero or unretained parent is dropped; an empty
+// chain takes only the header on genesis.
 //
 // CONSENSUS DISCIPLINE: beyond the linkage this connector adds NO policy. Disposition
 // (VALIDATED_SCRYPT / ACCEPTED_CONTINUITY / REJECTED), the Scrypt-only PoW gate
@@ -58,38 +61,45 @@ namespace c2pool::dgb
 enum class LinkResult {
     APPENDED,      // onto the tip (or the first header of an empty chain)
     KNOWN,         // already in the retained window: skipped
-    BUFFERED,      // a fork header kept aside: its branch is not longer yet
-    REORGED,       // its branch became longer: the tip switched to it
-    UNCONNECTED,   // its parent is not retained, too deep, or zero: dropped
+    BUFFERED,      // a fork header kept aside: its branch has no more Scrypt work yet
+    REORGED,       // its branch has more Scrypt work: the tip switched to it
+    UNCONNECTED,   // its parent is not retained, or zero, or not genesis on an empty chain: dropped
     REJECTED,      // validate_and_append refused it (the chain is unchanged)
 };
 
-// A fork branch below the tip is kept here until it is longer than the
-// branch above its fork point (first seen keeps the tip).
-inline constexpr std::size_t kMaxReorgDepth = 32;
+// A fork branch below the tip is kept here until it carries more Scrypt work
+// than the branch above its fork point (equal work: the first seen keeps the
+// tip). At most kMaxForkHeaders headers (the retained window).
+inline constexpr std::size_t kMaxForkHeaders = HeaderChain::HEADER_WINDOW_CAP;
 struct ForkBuffer {
     u256 parent = 0;
     std::vector<HeaderSample> headers;
+    u256 work = 0;   // the Scrypt work the headers are credited with
 };
 
 // One header, linked: appended only onto its parent. Rules:
+//   - an empty chain with a known `genesis` takes only the header on it,
+//     at height 1;
 //   - the tip's child is appended (validate_and_append);
 //   - a zero parent on a non-empty chain is refused (UNCONNECTED);
-//   - a header onto a retained header at most kMaxReorgDepth below the tip
-//     starts or extends a fork branch, kept aside until that branch is
-//     strictly longer than the branch above the fork point; then the tip
-//     switches to it, every header validated in the fork's own context, and
-//     on any rejection the chain is restored exactly;
+//   - a header onto any retained header starts or extends a fork branch,
+//     kept aside until that branch carries strictly more Scrypt work
+//     (HeaderChain::header_credit) than the branch above its fork point;
+//     then the tip switches to it, every header validated in the fork's own
+//     context, and on any rejection the chain is restored exactly;
 //   - anything else is dropped.
-// The first header of an empty chain onto `genesis` sits at height 1.
 // `cut_depth`, when given, receives the depth of a switch.
 inline LinkResult ingest_linked(HeaderChain& chain, ForkBuffer& fork, const HeaderSample& s,
                                 const u256& genesis = 0, std::size_t* cut_depth = nullptr)
 {
     const auto tip = chain.tip_hash();
     if (!tip) {
-        if (chain.size() == 0 && !genesis.is_zero() && s.prev_hash == genesis && chain.base_height() == 0)
-            chain.set_base_height(1);
+        if (chain.size() == 0 && !genesis.is_zero()) {
+            if (!(s.prev_hash == genesis))
+                return LinkResult::UNCONNECTED;
+            if (chain.base_height() == 0)
+                chain.set_base_height(1);
+        }
         return chain.validate_and_append(s) == IngestResult::REJECTED ? LinkResult::REJECTED : LinkResult::APPENDED;
     }
     if (s.prev_hash.is_zero())
@@ -98,23 +108,28 @@ inline LinkResult ingest_linked(HeaderChain& chain, ForkBuffer& fork, const Head
         return chain.validate_and_append(s) == IngestResult::REJECTED ? LinkResult::REJECTED : LinkResult::APPENDED;
     if (chain.find_index(s.block_hash))
         return LinkResult::KNOWN;
+    const u256 credit = chain.header_credit(s);
     if (!fork.headers.empty() && s.prev_hash == fork.headers.back().block_hash) {
-        fork.headers.push_back(s);
-    } else if (const auto p = chain.find_index(s.prev_hash)) {
-        if (chain.size() - 1 - *p > kMaxReorgDepth)
+        if (fork.headers.size() >= kMaxForkHeaders) {
+            fork = ForkBuffer{};
             return LinkResult::UNCONNECTED;
+        }
+        fork.headers.push_back(s);
+        fork.work = saturating_add(fork.work, credit);
+    } else if (chain.find_index(s.prev_hash)) {
         fork.parent = s.prev_hash;
         fork.headers.assign(1, s);
+        fork.work = credit;
     } else {
         return LinkResult::UNCONNECTED;
     }
     const auto p = chain.find_index(fork.parent);
-    if (!p || chain.size() - 1 - *p > kMaxReorgDepth) {
-        fork.headers.clear();
+    if (!p) {   // the fork point left the retained window
+        fork = ForkBuffer{};
         return LinkResult::UNCONNECTED;
     }
     const std::size_t above = chain.size() - 1 - *p;
-    if (fork.headers.size() <= above)
+    if (!(fork.work > chain.work_after(*p)))
         return LinkResult::BUFFERED;
     // Switch: the fork onto its parent, validated there; restored on reject.
     // The parent is tracked by height (an append may evict the window front).
@@ -125,11 +140,11 @@ inline LinkResult ingest_linked(HeaderChain& chain, ForkBuffer& fork, const Head
         if (chain.validate_and_append(h) == IngestResult::REJECTED) {
             chain.truncate_after(static_cast<std::size_t>(parent_height - chain.base_height()));
             chain.restore_tail(tail);
-            fork.headers.clear();
+            fork = ForkBuffer{};
             return LinkResult::REJECTED;
         }
     }
-    fork.headers.clear();
+    fork = ForkBuffer{};
     if (cut_depth)
         *cut_depth = above;
     return LinkResult::REORGED;
@@ -212,7 +227,7 @@ wire_header_ingest(::dgb::interfaces::Node& node, HeaderChain& chain, HeaderInge
                 }
             }
             if (reorged) {
-                LOG_WARNING << "[DGB-HEADERS] the tip switched to a longer branch (cut " << deepest
+                LOG_WARNING << "[DGB-HEADERS] the tip switched to a branch with more Scrypt work (cut " << deepest
                             << " header(s) deep)";
                 if (opts.on_reorg)
                     opts.on_reorg(deepest);
