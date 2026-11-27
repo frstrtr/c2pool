@@ -55,8 +55,8 @@ TEST(DgbWorkGate, ReasonsAsThePythonNetwork)
     in.check_contact = false;
     in.coin_contact_age_sec = 100000;
     EXPECT_EQ(dgb::work_gate_reason(in), "");
-    // Python's order: peers, contact, then the best share (review 2d3524094
-    // NIT 2: each pair combined).
+    // Python's order: peers, contact, then the best share (each pair
+    // combined).
     in.require_peers = true;
     in.check_contact = true;
     in.best_share_null = true;
@@ -114,7 +114,7 @@ TEST(DgbWorkGate, HeldWorkSourceServesNoTemplateAndRefusesAuthorize)
     EXPECT_EQ(ws.authorize_refusal(login), "");
 }
 
-// Review 7793bfb6c #6: the tick itself, through fakes.
+// The tick itself, through fakes.
 namespace {
 struct FakeWs {
     std::string hold;
@@ -186,7 +186,7 @@ TEST(DgbWorkGate, TheTickHoldsReleasesAndClosesSessionsOnce)
     EXPECT_EQ(dgb::work_gate_tick(st, ob, 1104, ws, srv), "");
 }
 
-// Review 2d3524094 R1: contact is a servable template within 60 s (python's
+// Contact is a servable template within 60 s (python's
 // last successful work fetch), and while the embedded chain serves with a
 // dialled coin peer, that peer handshaken.
 TEST(DgbWorkGate, ContactIsAServableTemplate)
@@ -206,8 +206,8 @@ TEST(DgbWorkGate, ContactIsAServableTemplate)
         EXPECT_EQ(dgb::work_gate_tick(st, ob, 1062, ws, srv), "");
     }
     {
-        // A firewalled coin peer and no RPC: the chain never gets a tip,
-        // nothing is servable: held after 60 s (the ce7b789af behaviour).
+        // A firewalled coin node and no RPC: the chain never gets a tip,
+        // nothing is servable: held after 60 s.
         dgb::WorkGateState st;
         st.last_contact = 1000;
         auto ob = healthy();

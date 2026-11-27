@@ -19,7 +19,7 @@
 // v36_active): C1-C4 pin it for a V36 share. The python V35 network
 // (frstrtr/p2pool-dgb-scrypt data.py generate_transaction:162-170) has NO
 // decay: pre_target2 = clip(pre_target, prev.max_target*9//10, *11//10)
-// whatever the gap. V35_* pin that (review 713dc77a0 R4: c2pool applied the
+// whatever the gap. V35_* pin that (c2pool applied the
 // V36 decay to V35 shares, so a python peer rejected the first V35 share after
 // any gap over 300 s, the first share on a revived tip included). MAX_TARGET
 // from networks/digibyte.py = 2**256//2**20 - 1 (2^236 - 1); SHARE_PERIOD=15

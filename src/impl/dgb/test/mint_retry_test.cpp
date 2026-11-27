@@ -2,7 +2,7 @@
 // ---------------------------------------------------------------------------
 // The DGB mint retries while the tracker is busy (rides dgb_work_source_test).
 //
-// Review 713dc77a0 #11: main_dgb's mint seam took the tracker lock with
+// main_dgb's mint seam took the tracker lock with
 // try_to_lock and dropped the share when it was busy ("deferred" meant lost).
 // dgb::mint_with_retry runs the attempt now, and while it reports busy retries
 // it on the IO context, bounded; a declined share is not retried.

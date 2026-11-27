@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
-// Pins for the mutants review dd1248abd #8 found no KAT killed (rides
-// dgb_work_source_test). The tip check, the store epoch and its failure
+// Pins for mutants no other KAT kills (rides dgb_work_source_test). The tip check, the store epoch and its failure
 // branches are pinned in work_source_test / store_rules_epoch_test.
 // ---------------------------------------------------------------------------
 
@@ -52,7 +51,7 @@ std::string hex(const Bytes& b) { return HexStr(Span<const unsigned char>(b.data
 // 266-276, 334-337), never a P2PKH of its own. A split that erased the
 // donation key before adding the finder fee would pay it as a separate output.
 // Expected values: data.py's rules re-stated in python3 (weights 1:1:1 of 4).
-TEST(DgbReviewMutantPins, FinderIsTheDonationAddress)
+TEST(DgbMutantPins, FinderIsTheDonationAddress)
 {
     const char* kLower = "dgb1q24242424242424242424242424242424swqgq4";
     const char* kD = "DB68diZto76gixVajwyoMjcEXsSdyEhnS9";
@@ -74,7 +73,7 @@ TEST(DgbReviewMutantPins, FinderIsTheDonationAddress)
 // branch with that root is a present segwit_data python accepts. The share
 // carries an undecodable address, so share_init_verify stops at the address
 // check right after the segwit_data one (a bare share must not run further).
-TEST(DgbReviewMutantPins, SegwitDataWithABranchIsNotTheNoneValue)
+TEST(DgbMutantPins, SegwitDataWithABranchIsNotTheNoneValue)
 {
     const auto params = dgb::make_coin_params(/*testnet=*/false);
     auto refusal = [&](bool with_branch) -> std::string {
@@ -102,7 +101,7 @@ TEST(DgbReviewMutantPins, SegwitDataWithABranchIsNotTheNoneValue)
 // Source pins: the share_info height is the accumulated one (attempt_verify's
 // source), and the won-block relay requires the share hash outside the
 // regtest forced-won seam.
-TEST(DgbReviewMutantPins, OneHeightSourceAndTheRelayGate)
+TEST(DgbMutantPins, OneHeightSourceAndTheRelayGate)
 {
     const std::string check = slurp(src_root() / "impl" / "dgb" / "share_check.hpp");
     ASSERT_FALSE(check.empty());

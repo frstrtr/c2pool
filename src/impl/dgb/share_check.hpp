@@ -541,7 +541,7 @@ uint256 share_init_verify(const ShareT& share, const core::CoinParams& params, b
         throw std::invalid_argument("bad coinbase size");
 
     // While DGB is held at V35 (no --v36-ratchet), a V36 share is refused:
-    // the python V35 network cannot load one (review 906a0e5e3 #9).
+    // the python V35 network cannot load one.
     if constexpr (core::version_gate::is_v36_active(ShareT::version))
         if (!v36_shares_accepted())
             throw std::invalid_argument("V36 share while DGB shares are held at V35");
@@ -560,9 +560,9 @@ uint256 share_init_verify(const ShareT& share, const core::CoinParams& params, b
 
     // V34/V35: the python network turns the share's address into its payout
     // script or rejects the share (p2pool-dgb-scrypt Share.__init__:
-    // address_to_script2); this node rejects exactly those (review 713dc77a0
-    // #7: before, an undecodable or foreign address fell back to raw bytes, a
-    // dgb1p bech32m address was accepted, an uppercase one misread).
+    // address_to_script2); this node rejects exactly those (before, an
+    // undecodable or foreign address fell back to raw bytes, a dgb1p bech32m
+    // address was accepted, an uppercase one misread).
     if constexpr (requires { share.m_address; })
     {
         const std::string addr(share.m_address.m_data.begin(), share.m_address.m_data.end());
@@ -1667,7 +1667,7 @@ void check_v35_share_info(const ShareT& share, TrackerT& tracker, const core::Co
     if (share.m_prev_hash.IsNull() || !tracker.chain.contains(share.m_prev_hash))
         return;
     // One height source with attempt_verify (the accumulated height, which
-    // survives pruning; review 906a0e5e3 #6): python decides once the chain is
+    // survives pruning): python decides once the chain is
     // rooted or REAL_CHAIN_LENGTH long, and so does attempt_verify before it
     // gets here; a walk height cut short by a pruned tail no longer skips the
     // check.
@@ -2373,8 +2373,8 @@ uint256 create_local_share_v35(
 
     // The mined coinbase commits (its OP_RETURN) to the ref the job froze.
     // The share made here must carry exactly that ref: when the ref computed
-    // from the share's own fields differs, the share is DECLINED (review
-    // 906a0e5e3 #7). Taking the coinbase's ref instead made a share whose
+    // from the share's own fields differs, the share is DECLINED. Taking the
+    // coinbase's ref instead made a share whose
     // fields python regenerates to another ref ("share PoW invalid", a
     // PeerMisbehavingError there).
     if (!actual_coinbase_bytes.empty() && actual_coinbase_bytes.size() > 44) {

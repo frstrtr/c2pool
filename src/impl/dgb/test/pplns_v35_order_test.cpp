@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
 // The output order of a V35 generation transaction (rides dgb_work_source_test).
-// Review 713dc77a0 #6.
 //
 // The python V35 network sorts the dests by (is_donation, amount, ADDRESS
 // STRING) and keeps the last 4000, the donation among them (p2pool-dgb-scrypt

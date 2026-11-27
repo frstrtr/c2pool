@@ -248,6 +248,20 @@ inline u256 header_work(const u256& target)
     return w;
 }
 
+/// Whether a compact nBits is one DigiByte Core's SetCompact marks negative
+/// (the sign bit with a non-zero mantissa) or overflowing (a mantissa that
+/// does not fit 256 bits at its exponent): CheckProofOfWork refuses both.
+inline bool compact_negative_or_overflow(uint32_t bits)
+{
+    const uint32_t size = bits >> 24;
+    const uint32_t word = bits & 0x007fffffu;
+    if (word == 0)
+        return false;
+    if (bits & 0x00800000u)
+        return true;
+    return size > 34 || (word > 0xff && size > 33) || (word > 0xffff && size > 32);
+}
+
 /// a + b, saturating at 2^256 - 1.
 inline u256 saturating_add(const u256& a, const u256& b)
 {
@@ -291,7 +305,7 @@ public:
             // PoW validate path. A zero target is not a validatable Scrypt
             // header (the structural guard here is that a malformed target
             // never credits work).
-            if (h.target.is_zero())
+            if (h.target.is_zero() || compact_negative_or_overflow(h.n_bits))
                 return IngestResult::REJECTED;
 
             // Minimum-difficulty ceiling (DigiByte Core CheckProofOfWork
@@ -502,13 +516,15 @@ public:
     }
 
     // The Scrypt work `h` is credited with when it is appended: its
-    // header_work when it is a Scrypt header whose target is non-zero, at
-    // most pow_limit (when set) and met by its scrypt hash; else 0 (a
-    // non-Scrypt header carries no work here). The context-free half of
+    // header_work when it is a Scrypt header whose nBits is neither negative
+    // nor overflowing and whose target is non-zero, at most pow_limit (when
+    // set) and met by its scrypt hash; else 0 (a non-Scrypt header carries
+    // no work here). The context-free half of
     // validate_and_append: the MTP check can still refuse it.
     u256 header_credit(const HeaderSample& h) const
     {
-        if (dgb_header_disposition(h.n_version) != HeaderDisposition::VALIDATE_SCRYPT || h.target.is_zero())
+        if (dgb_header_disposition(h.n_version) != HeaderDisposition::VALIDATE_SCRYPT || h.target.is_zero()
+            || compact_negative_or_overflow(h.n_bits))
             return u256{};
         if (!m_ds_params.pow_limit.is_zero() && h.target > m_ds_params.pow_limit)
             return u256{};
@@ -529,7 +545,7 @@ public:
     // A getheaders block locator (DigiByte Core CChain::GetLocator shape):
     // the tip, the 10 headers below it one by one, then steps doubling back
     // to the oldest retained header. Only headers with a populated id. Empty
-    // for an empty chain. A peer finds the fork point from it, so a tip it
+    // for an empty chain. The coin node finds the fork point from it, so a tip it
     // does not have (a stale block) no longer makes it answer from genesis.
     std::vector<u256> locator() const
     {

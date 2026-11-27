@@ -132,7 +132,7 @@ static std::vector<std::string> lane_addresses(const core::CoinAddressAcceptance
     return out;
 }
 
-// Review 713dc77a0 #12: BTC, BIP110 and DASH DO publish their acceptance, so
+// BTC, BIP110 and DASH DO publish their acceptance, so
 // accepted_payout_script runs on them; every mainnet/testnet address form
 // still gives exactly address_to_script's bytes.
 TEST(AcceptedPayoutScript, PublishedLaneAcceptanceIsByteIdentical)

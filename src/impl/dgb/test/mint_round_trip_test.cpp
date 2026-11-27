@@ -315,7 +315,7 @@ TEST(DgbMintRoundTrip, MintedShareIsTheHeaderTheMinerHashed)
 
 // The pre-fix mint (no mined coinbase, no frozen fields: has_frozen=false) on
 // the same submit: the share it records is not the header the miner hashed.
-// Review 713dc77a0 R2 + #9: the job's coinbase claims the subsidy of the BLOCK
+// The job's coinbase claims the subsidy of the BLOCK
 // it is for (the template's height), and the PPLNS walk takes that block's
 // bits (the share's own header bits, which the verifier and p2pool
 // generate_transaction read). Before, the value was subsidy(share absheight)
@@ -727,7 +727,7 @@ TEST(DgbMintRoundTrip, FirstShareOnANinetyDayOldTip)
     }
 }
 
-// Review 713dc77a0 #5: V35 is segwit-activated on the python network
+// V35 is segwit-activated on the python network
 // (SEGWIT_ACTIVATION_VERSION 35). Every V35 share carries segwit_data and its
 // generation transaction starts with the P2Pool witness commitment; a DGB job
 // carries no transactions, so segwit_data is {[], 0, root 0} and the
@@ -886,7 +886,7 @@ TEST(DgbMintRoundTrip, ShareTargetIsThePoolTargetCappedPerAddress)
     EXPECT_EQ(huge.snapshot.frozen_ref.bits, floor30.bits);
 }
 
-// Review 906a0e5e3 REQUIRED 1: the won-block ARM A (m_on_block_found ->
+// The won-block ARM A (m_on_block_found ->
 // reconstruct_closure -> assemble_won_block) rebuilds the block from the share.
 // A V35 coinbase carries the P2Pool witness commitment, so the rebuilt block
 // must carry the '[P2Pool]'*4 coinbase witness (Core's CheckWitnessMalleation)
@@ -950,7 +950,7 @@ TEST(DgbMintRoundTrip, ArmAWonV35BlockPassesTheWitnessCheckAndKeepsItsHash)
     EXPECT_FALSE(peer_closure(peer_hash).has_value()) << "a block with unknown transactions was relayed";
 }
 
-// Review 906a0e5e3 #7: the V35 mint declines a share whose own fields hash to
+// The V35 mint declines a share whose own fields hash to
 // another ref than the one the mined coinbase committed to (before, it took
 // the coinbase's ref and broadcast a share python regenerates differently).
 TEST(DgbMintRoundTrip, V35MintDeclinesWhenItsRefIsNotTheCoinbases)
@@ -976,8 +976,8 @@ TEST(DgbMintRoundTrip, V35MintDeclinesWhenItsRefIsNotTheCoinbases)
     EXPECT_EQ(rig.chain.tracker.chain.size(), before) << "and added to the chain";
 }
 
-// The best moves between job and submit (a peer share lands on the job's
-// prev share, review 7a4373856): the old job's submit still mints the job's
+// The best moves between job and submit (a share from another node lands on
+// the job's prev share): the old job's submit still mints the job's
 // own coinbase on the job's prev, and the share verifies (its generation
 // transaction is the coinbase the miner hashed).
 TEST(DgbMintRoundTrip, ASubmitAfterTheBestMovedMintsTheJobsCoinbase)

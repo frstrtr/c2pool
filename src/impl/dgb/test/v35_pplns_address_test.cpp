@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
 // V35 PPLNS keyed by ADDRESS STRING, as the python DGB network (rides
-// dgb_work_source_test). Review 906a0e5e3 REQUIRED 2.
+// dgb_work_source_test).
 //
 // Python (p2pool-dgb-scrypt data.py) keys a share's weight by share.address,
 // sums amounts per string, merges the donation's own P2PKH address into the

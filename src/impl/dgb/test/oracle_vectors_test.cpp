@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
 // Cross-implementation vectors for the python DGB oracle (rides
-// dgb_work_source_test). Review 713dc77a0, C2POOL's gate before any canary.
+// dgb_work_source_test).
 //
 // Mints a genesis-rooted chain of V35 shares the way a c2pool-dgb node does:
 // the first two shares by create_local_share_v35 (the job producer builds on a
@@ -227,7 +227,7 @@ struct OracleRig {
         ws->set_gbt_tip_fn([this]() -> std::optional<dgb::stratum::DGBWorkSource::GbtTip> {
             return dgb::stratum::DGBWorkSource::GbtTip{std::string(56, '0') + "0badf00d", tip_bits, kHeight};
         });
-        // Review 7a4373856 R1: split jobs (donation 32768) and donation-0 jobs
+        // Split jobs (donation 32768) and donation-0 jobs
         // among the --give-author (66) ones, through the job's share donation
         // as the stratum server carries it.
         const std::optional<uint16_t> dn = donation_of(i);
@@ -357,7 +357,7 @@ TEST(DgbOracleVectors, MintedChainPassesOwnChecksAndIsDumped)
         });
     }
 
-    // Coverage (review 906a0e5e3 #8): the retarget and its +-10% clip move
+    // Coverage: the retarget and its +-10% clip move
     // max_bits inside the chain, and more than one block-bits value is used.
     {
         std::set<uint32_t> max_bits, header_bits;
@@ -379,7 +379,7 @@ TEST(DgbOracleVectors, MintedChainPassesOwnChecksAndIsDumped)
     }
 }
 
-// The python -> c2pool direction (review 906a0e5e3 #8): shares minted by the
+// The python -> c2pool direction: shares minted by the
 // python oracle itself (scripts/dgb_oracle_harness/mint_vectors.py: its own
 // generate_transaction / get_share on a genesis-rooted tracker, every payout
 // case python accepts) must verify here with python's hash; the mutated ones
@@ -428,7 +428,7 @@ TEST(DgbOracleReverse, PythonMintedSharesVerifyHere)
             } catch (const std::exception& e) {
                 why = e.what();
             }
-            // The refusal is the one python gives (review 7a4373856 NIT 9).
+            // The refusal is the one python gives.
             const std::string name = n["name"].get<std::string>();
             const char* want = name.find("address") != std::string::npos ? "address"
                                : name.find("segwit") != std::string::npos ? "segwit_data"

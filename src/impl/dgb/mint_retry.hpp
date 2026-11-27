@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 // ---------------------------------------------------------------------------
-// The DGB mint retries while the sharechain is busy (review 713dc77a0 #11).
+// The DGB mint retries while the sharechain is busy.
 //
 // main_dgb's mint seam takes the tracker's exclusive lock without blocking the
 // Stratum IO thread (try_to_lock). Before, a busy tracker (the compute thread

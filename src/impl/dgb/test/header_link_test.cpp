@@ -3,7 +3,7 @@
 // The embedded DGB header ingest links on the parent (rides
 // dgb_work_source_test). dgb.voidbind (2026-11-27) sat 161k blocks behind:
 // every header was appended in arrival order whatever its parent, and the
-// getheaders locator was the tip alone, so with a tip the peer did not have it
+// getheaders locator was the tip alone, so with a tip the coin node did not have it
 // answered from genesis, every header failed the MTP gate, and the walk-
 // forward re-downloaded the chain in 20000-header batches. Pinned:
 //   - a header is appended only onto the tip; a known one is skipped; an
@@ -32,6 +32,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -161,7 +162,7 @@ TEST(DgbHeaderLink, AppendsOnlyOntoItsParent)
     HeaderChain chain;
     c2pool::dgb::ForkBuffer fork;
     const auto a = build(chain, fork, 5);
-    // Block 1 (the header on genesis) sits at height 1 (review 7a4373856 R2).
+    // Block 1 (the header on genesis) sits at height 1.
     ASSERT_EQ(chain.tip_height(), std::optional<uint32_t>(5u));
     EXPECT_EQ(chain.next_block_height(), 6u);
     EXPECT_EQ(c2pool::dgb::wire_hash(*chain.tip_hash()), id_of(a[4]));
@@ -174,7 +175,7 @@ TEST(DgbHeaderLink, AppendsOnlyOntoItsParent)
     EXPECT_EQ(ingest_linked(chain, fork, make_header_sample(header_on(stranger, 1790000500))), LinkResult::UNCONNECTED);
     EXPECT_EQ(ingest_linked(chain, fork, make_header_sample(header_on(dgb_genesis(), 1790000600, 99))),
               LinkResult::UNCONNECTED);
-    // A zero parent on a non-empty chain (review F2c): refused.
+    // A zero parent on a non-empty chain: refused.
     EXPECT_EQ(ingest_linked(chain, fork, make_header_sample(header_on(uint256(), 1790000700))), LinkResult::UNCONNECTED);
     EXPECT_EQ(chain.tip_height(), std::optional<uint32_t>(5u));
 }
@@ -253,7 +254,7 @@ TEST(DgbHeaderLink, TheTipFollowsTheMostScryptWork)
     }
 }
 
-// Review 7a4373856 F1: a rejected switch never changes the chain, and the
+// A rejected switch never changes the chain, and the
 // honest next header still lands on the tip.
 TEST(DgbHeaderLink, ARejectedForkLeavesTheChainUnchanged)
 {
@@ -289,7 +290,7 @@ TEST(DgbHeaderLink, ARejectedForkLeavesTheChainUnchanged)
     }
 }
 
-// Review c6c1c0cff G1: on the live chain (DigiByte's Scrypt pow_limit),
+// On the live chain (DigiByte's Scrypt pow_limit),
 // branches that carry no more Scrypt work never move the tip, at any depth
 // or length; the chain keeps following its own branch.
 TEST(DgbHeaderLink, BranchesWithoutMoreScryptWorkNeverMoveTheTip)
@@ -366,14 +367,14 @@ TEST(DgbHeaderLink, BranchesWithoutMoreScryptWorkNeverMoveTheTip)
         other.SetHex("c0ffe");
         node.new_headers.happened(std::vector<BlockHeaderType>{header_on(other, 1790000000, 1)});
         EXPECT_EQ(chain.size(), 0u) << "a first header off genesis";
-        EXPECT_EQ(requests, 1) << "the peer is asked again from genesis";
+        EXPECT_EQ(requests, 1) << "the coin node is asked again from genesis";
         node.new_headers.happened(run_on(dgb_genesis(), 50, 1790000000));
         EXPECT_EQ(chain.tip_height(), std::optional<uint32_t>(50u));
         EXPECT_EQ(chain.base_height(), 1u);
     }
 }
 
-// Review c6c1c0cff G1(2)/R1: a branch with more Scrypt work is followed from
+// A branch with more Scrypt work is followed from
 // any retained depth (an honest reorg deeper than the old bound of 32).
 TEST(DgbHeaderLink, ADeepBranchWithMoreScryptWorkIsFollowed)
 {
@@ -398,7 +399,7 @@ TEST(DgbHeaderLink, ADeepBranchWithMoreScryptWorkIsFollowed)
     EXPECT_EQ(m.chain.tip_height(), std::optional<uint32_t>(111u));
 }
 
-// Review c6c1c0cff G1: non-Scrypt headers on the tip carry no work, so the
+// Non-Scrypt headers on the tip carry no work, so the
 // next Scrypt header on the branch below them takes the tip back, at any
 // depth (here 50, then 33).
 TEST(DgbHeaderLink, TheTipReturnsToTheBranchWithScryptWork)
@@ -424,6 +425,67 @@ TEST(DgbHeaderLink, TheTipReturnsToTheBranchWithScryptWork)
     EXPECT_EQ(*m.chain.tip_hash(), s3.block_hash);
 }
 
+// A compact nBits DigiByte Core's SetCompact marks negative (the sign bit
+// with a non-zero mantissa) or overflowing is refused, and carries no work.
+TEST(DgbHeaderLink, ANegativeOrOverflowingCompactIsRefused)
+{
+    using c2pool::dgb::compact_negative_or_overflow;
+    for (uint32_t bits : {0x20ffffffu, 0x04923456u, 0x23000001u, 0x22000100u, 0x21010000u})
+        EXPECT_TRUE(compact_negative_or_overflow(bits)) << std::hex << bits;
+    for (uint32_t bits : {0x207fffffu, 0x1b0404cbu, 0x1e0fffffu, 0x04800000u, 0x22000001u, 0x2100ffffu})
+        EXPECT_FALSE(compact_negative_or_overflow(bits)) << std::hex << bits;
+    // On the regtest chain (pow_limit 0x207fffff): 0x20ffffff reads as
+    // 0x207fffff with the sign bit dropped; refused all the same.
+    const c2pool::dgb::u256 g = u_of(dgb_genesis());
+    HeaderChain chain(c2pool::dgb::dgb_live_header_params(/*regtest=*/true), 0);
+    const auto negative = sample(1, g, 1790000000, true, 0x20ffffff);
+    EXPECT_EQ(negative.target, c2pool::dgb::compact_to_target(0x207fffff));
+    EXPECT_TRUE(chain.header_credit(negative).is_zero());
+    EXPECT_EQ(chain.validate_and_append(negative), c2pool::dgb::IngestResult::REJECTED);
+    EXPECT_EQ(chain.size(), 0u);
+    const auto positive = sample(2, g, 1790000000, true, 0x207fffff);
+    EXPECT_FALSE(chain.header_credit(positive).is_zero());
+    EXPECT_EQ(chain.validate_and_append(positive), c2pool::dgb::IngestResult::VALIDATED_SCRYPT);
+}
+
+// While a fork branch is kept aside, the getheaders locator leads with its
+// last header (as Core's best header), so the answer continues that branch.
+TEST(DgbHeaderLink, TheLocatorLeadsWithTheBufferedBranch)
+{
+    Mixed m;
+    build_mixed(m, 10);
+    const auto b = branch(m.a[3].block_hash, 3, 1790000100, 1000, [](int) { return false; });
+    for (const auto& h : b)
+        EXPECT_EQ(ingest_linked(m.chain, m.fork, h), LinkResult::BUFFERED);
+    const auto loc = c2pool::dgb::getheaders_locator(m.chain, dgb_genesis(), &m.fork);
+    ASSERT_GE(loc.size(), 3u);
+    EXPECT_EQ(loc[0], c2pool::dgb::wire_hash(b.back().block_hash));
+    EXPECT_EQ(loc[1], c2pool::dgb::wire_hash(m.a[9].block_hash));
+    EXPECT_EQ(loc.back(), dgb_genesis());
+    c2pool::dgb::ForkBuffer none;
+    EXPECT_EQ(c2pool::dgb::getheaders_locator(m.chain, dgb_genesis(), &none)[0],
+              c2pool::dgb::wire_hash(m.a[9].block_hash));
+    // The live ingest shares its fork buffer with the locator (main_dgb).
+    HeaderChain chain;
+    dgb::interfaces::Node node;
+    c2pool::dgb::HeaderIngestOptions opts;
+    opts.genesis = u_of(dgb_genesis());
+    auto shared = std::make_shared<c2pool::dgb::ForkBuffer>();
+    opts.fork = shared;
+    std::vector<uint256> asked;
+    opts.request_headers = [&chain, &asked, shared] {
+        asked = c2pool::dgb::getheaders_locator(chain, dgb_genesis(), shared.get());
+    };
+    auto sub = c2pool::dgb::wire_header_ingest(node, chain, opts);
+    const auto a = run_on(dgb_genesis(), 6, 1790000000);
+    node.new_headers.happened(a);
+    const auto f = run_on(id_of(a[2]), 3, 1790000100, /*salt=*/9);
+    node.new_headers.happened(f);
+    ASSERT_FALSE(asked.empty()) << "a buffered branch asked for no headers";
+    EXPECT_EQ(asked[0], id_of(f.back()));
+    EXPECT_EQ(asked[1], id_of(a[5]));
+}
+
 TEST(DgbHeaderLink, TheLiveIngestLinksTheBatch)
 {
     HeaderChain chain;
@@ -445,7 +507,7 @@ TEST(DgbHeaderLink, TheLiveIngestLinksTheBatch)
     ASSERT_EQ(chain.tip_height(), std::optional<uint32_t>(6u)) << "known headers appended again";
     EXPECT_EQ(requests, 0);
     // A batch from genesis that does not connect: nothing appended, and the
-    // peer is asked again with the chain's locator.
+    // coin node is asked again with the chain's locator.
     node.new_headers.happened(run_on(dgb_genesis(), 4, 1780000000, /*salt=*/3));
     EXPECT_EQ(chain.tip_height(), std::optional<uint32_t>(6u));
     EXPECT_EQ(c2pool::dgb::wire_hash(*chain.tip_hash()), id_of(a[5]));
@@ -486,10 +548,10 @@ TEST(DgbHeaderLink, MainDgbSendsTheFullLocatorAndUnknownCommandsAreQuiet)
     const std::string main = ss.str();
     EXPECT_NE(main.find("const std::vector<uint256> locator = c2pool::dgb::getheaders_locator("), std::string::npos);
     EXPECT_EQ(main.find("(tip->limb[i] >> (8 * j))"), std::string::npos) << "a tip-only locator";
-    // Review 7a4373856: the ingest knows genesis and asks for headers; the
+    // The ingest knows genesis and asks for headers; the
     // walk-forward and inv use the chain's locator; --coin-daemon keeps a
-    // driver; the HTTP thread reads the published tip. Review c6c1c0cff: the
-    // live chain has DigiByte's Scrypt pow_limit; regtest without
+    // driver; the HTTP thread reads the published tip. The live chain has
+    // DigiByte's Scrypt pow_limit; regtest without
     // --coin-genesis numbers the first header 1.
     for (const char* line : {
              "auto header_ingest_sub  = c2pool::dgb::wire_header_ingest(coin_iface, header_chain, header_opts);",
@@ -497,13 +559,18 @@ TEST(DgbHeaderLink, MainDgbSendsTheFullLocatorAndUnknownCommandsAreQuiet)
              "stop_coin_header_driver = dgb::start_periodic(ioc, std::chrono::milliseconds(12000),",
              "const uint32_t hh = header_tip_pub->load();",
              "c2pool::dgb::HeaderChain header_chain(c2pool::dgb::dgb_live_header_params(regtest), 0);",
-             "if (regtest && coin_genesis.IsNull()) {\n        header_chain.set_base_height(1);"})
+             "if (regtest && coin_genesis.IsNull()) {\n        header_chain.set_base_height(1);",
+             "header_opts.fork = header_fork;"})
         EXPECT_NE(main.find(line), std::string::npos) << line;
+    size_t fork_locators = 0;
+    for (size_t at = 0; (at = main.find("header_fork.get()", at)) != std::string::npos; ++at)
+        ++fork_locators;
+    EXPECT_EQ(fork_locators, 6u) << "every getheaders locator leads with a buffered branch";
     EXPECT_EQ(main.find("reset_tip_latch"), std::string::npos) << "the tip latch is gone (a stale tip stops serving)";
     size_t n = 0;
     for (size_t at = 0; (at = main.find("coin_p2p->set_locator_fn(", at)) != std::string::npos; ++at)
         ++n;
-    EXPECT_EQ(n, 2u) << "both coin-peer modes walk forward from the chain's locator";
+    EXPECT_EQ(n, 2u) << "both coin-node modes walk forward from the chain's locator";
 
     const auto p2p = std::filesystem::path(DGB_MAIN_SRC).parent_path().parent_path() / "impl" / "dgb" / "coin"
                      / "p2p_node.hpp";

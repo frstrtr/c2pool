@@ -156,7 +156,7 @@ TEST(DgbV35Hold, MainDgbUsesThePolicy)
     EXPECT_NE(src.find("\"--v36-ratchet\""), std::string::npos);
 }
 
-// Review 906a0e5e3 #9: while held at V35, a V36 share (which the python V35
+// While held at V35, a V36 share (which the python V35
 // network cannot load) is refused at share_init_verify; with the opt-in it is
 // judged as before. main_dgb sets the flag before any share is loaded.
 TEST(DgbV35Hold, V36SharesAreRefusedWhileHeld)

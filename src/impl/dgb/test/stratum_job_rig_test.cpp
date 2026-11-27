@@ -326,7 +326,7 @@ TEST(DgbStratumJobs, JobPushWatchDecisions)
     EXPECT_EQ(w.tick("bb", 7), A::none);
 }
 
-// Review 713dc77a0 NIT 16: the watch runs main_dgb's best-share refresh at
+// The watch runs main_dgb's best-share refresh at
 // every tick; a best it finds (a bumped generation) is pushed by that tick.
 TEST(DgbStratumJobs, JobPushWatchRunsItsBeforeTickHook)
 {
@@ -395,7 +395,7 @@ TEST(DgbStratumJobs, NewTipPushesCleanJobsWithoutAMinerEvent)
     stopped.get_future().wait();
 }
 
-// Review 713dc77a0 R1: the stratum server did not carry the job's frozen ref
+// The stratum server did not carry the job's frozen ref
 // (ref_hash, last_txout_nonce) to mining_submit, so the DGB work source saw
 // every real job as "not built here" and refused every share. Through a real
 // core::StratumServer over the real DGBWorkSource: subscribe, authorize, the
@@ -483,7 +483,7 @@ TEST(DgbStratumJobs, RealSubmitReachesTheMintWithTheJobsFrozenRef)
     EXPECT_FALSE(m.actual_coinbase.empty());
 }
 
-// Review 713dc77a0 #10 and #13: an empty login (DGB does not redistribute it)
+// An empty login (DGB does not redistribute it)
 // and a dgb1 P2WSH or P2TR login (a V35 share cannot carry it: it was paid to
 // a P2PKH of the program's first 20 bytes) are refused at authorize, with the
 // reason; D..., S..., dgb1q (20-byte) and a DOGE primary are not. Through a
@@ -670,7 +670,7 @@ TEST(DgbStratumJobs, ASplitJobPaysTheOwnerWithHalfToTheDonation)
         << "the share does not carry the donation its ref committed to";
 }
 
-// Review 7a4373856 F3: a login with no DGB payout that names a DOGE address
+// A login with no DGB payout that names a DOGE address
 // (",DOGEADDR", "/98:DOGEADDR", or an empty login then
 // mining.set_merged_addresses: all reach the job as an empty payout plus a
 // chain-98 entry) is case 4, never split: its DGB parent is paid to that
@@ -704,7 +704,7 @@ TEST(DgbStratumJobs, ANamedDogeAddressIsCaseFourNotSplit)
 }
 
 // The same through a real core::StratumServer with DOGE configured, per login
-// form that names a DOGE address and no DGB one (review c6c1c0cff NIT 3):
+// form that names a DOGE address and no DGB one:
 // the comma, pipe, semicolon and space forms are refused at authorize (the
 // core reads no empty primary in them: nothing is paid); "/98:DOGEADDR" and
 // mining.set_merged_addresses get case-4 jobs (the DGB parent is the DOGE

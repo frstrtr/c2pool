@@ -262,7 +262,7 @@ public:
         {
             // A command outside our handler set (the handler map's own
             // refusal, "MessageHandler not contain <cmd>"): newer DigiByte
-            // Core peers push their oracle traffic (oracleprice, oraclehb,
+            // Core nodes push their oracle traffic (oracleprice, oraclehb,
             // getoracles, oramusnonce, ...) unsolicited. Ignored, as Core
             // ignores an unknown command; counted, and logged once per
             // command (it was an ERROR line per message: ~400 per 10 minutes
@@ -287,7 +287,7 @@ public:
     /// chain's, getheaders_locator); unset: the batch's last header alone.
     void set_locator_fn(std::function<std::vector<uint256>()> fn) { m_locator_fn = std::move(fn); }
     /// Called on an inv(block): main_dgb asks for headers with the chain's
-    /// locator, so a peer announcing by inv still extends the header chain.
+    /// locator, so a coin node announcing by inv still extends the header chain.
     void set_on_block_inv(std::function<void()> fn) { m_on_block_inv = std::move(fn); }
 
     /// Unknown commands ignored so far, per command name.
@@ -778,7 +778,7 @@ private:
                 auto tip_hash = Hash(packed_tip.get_span());
                 // The header chain's locator when bound: after a batch that
                 // connected its tip IS the batch's last header; after one that
-                // did not, the peer is asked from the fork point.
+                // did not, the coin node is asked from the fork point.
                 std::vector<uint256> loc = m_locator_fn ? m_locator_fn() : std::vector<uint256>{};
                 if (loc.empty())
                     loc.push_back(tip_hash);

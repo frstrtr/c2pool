@@ -2,7 +2,7 @@
 #pragma once
 
 #include "config_pool.hpp"
-#include "store_rules_epoch.hpp"   // reverify_store_if_rules_changed (reviews 906a0e5e3 #5, dd1248abd R1-R2)
+#include "store_rules_epoch.hpp"   // reverify_store_if_rules_changed
 #include "config_coin.hpp"
 
 #include <core/config.hpp>

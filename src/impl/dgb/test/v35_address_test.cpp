@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
 // The V34/V35 share address, exactly as the python DGB network reads it
-// (rides dgb_work_source_test). Review 713dc77a0 #7.
+// (rides dgb_work_source_test).
 //
 // Goldens are NOT computed by the code under test: the bech32 cases were
 // produced by the oracle's own util/segwit_addr.py (frstrtr/p2pool-dgb-scrypt
@@ -57,7 +57,7 @@ const Vec kVecs[] = {
     {"wrong_hrp", "ltc1qyy3zxfp9ycnjs2f29vkz6t30xqcnyve5qnawxn", ""},
     {"garbage", "not-an-address", ""},
     // Whitespace around a base58 address: python's base58_decode fails and
-    // bech32_decode rejects characters < 33 (review 906a0e5e3 3a).
+    // bech32_decode rejects characters < 33.
     {"leading_space", " DB69qk9X8T9A3vZ8odhDxAFedZB9qoKaLG", ""},
     {"trailing_newline", "DB69qk9X8T9A3vZ8odhDxAFedZB9qoKaLG\n", ""},
     {"trailing_space", "DB69qk9X8T9A3vZ8odhDxAFedZB9qoKaLG ", ""},
@@ -114,7 +114,7 @@ TEST(DgbV35Address, ShareWithAnUnpayableAddressIsRejected)
         dgb::PaddingBugfixShare share;
         static_assert(dgb::PaddingBugfixShare::version == 35);
         share.m_coinbase.m_data = {0x03, 0x01, 0x02, 0x03};
-        share.m_segwit_data = dgb::SegwitData{};   // a V35 share carries it (9227fdc9f)
+        share.m_segwit_data = dgb::SegwitData{};   // a V35 share carries it
         const std::string a = v.addr;
         share.m_address.m_data.assign(a.begin(), a.end());
         try {
@@ -126,7 +126,7 @@ TEST(DgbV35Address, ShareWithAnUnpayableAddressIsRejected)
     }
 }
 
-// Review 906a0e5e3 3b: the V35 segwit_data none-value {[], root 2**256-1} is
+// The V35 segwit_data none-value {[], root 2**256-1} is
 // python's None (Share.__init__ then fails); this node reads it back as
 // present, so share_init_verify rejects that exact value.
 TEST(DgbV35Address, SegwitDataNoneValueIsRejected)

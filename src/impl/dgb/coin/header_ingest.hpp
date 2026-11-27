@@ -69,8 +69,9 @@ enum class LinkResult {
 
 // A fork branch below the tip is kept here until it carries more Scrypt work
 // than the branch above its fork point (equal work: the first seen keeps the
-// tip). At most kMaxForkHeaders headers (the retained window).
-inline constexpr std::size_t kMaxForkHeaders = HeaderChain::HEADER_WINDOW_CAP;
+// tip). At most kMaxForkHeaders headers: one less than the retained window,
+// so a switch never evicts its own fork point.
+inline constexpr std::size_t kMaxForkHeaders = HeaderChain::HEADER_WINDOW_CAP - 1;
 struct ForkBuffer {
     u256 parent = 0;
     std::vector<HeaderSample> headers;
@@ -138,8 +139,11 @@ inline LinkResult ingest_linked(HeaderChain& chain, ForkBuffer& fork, const Head
     chain.truncate_after(*p);
     for (const auto& h : fork.headers) {
         if (chain.validate_and_append(h) == IngestResult::REJECTED) {
-            chain.truncate_after(static_cast<std::size_t>(parent_height - chain.base_height()));
-            chain.restore_tail(tail);
+            // The fork point is still retained (kMaxForkHeaders); guarded all the same.
+            if (parent_height >= chain.base_height()) {
+                chain.truncate_after(static_cast<std::size_t>(parent_height - chain.base_height()));
+                chain.restore_tail(tail);
+            }
             fork = ForkBuffer{};
             return LinkResult::REJECTED;
         }
@@ -162,10 +166,15 @@ inline uint256 wire_hash(const u256& v)
 
 // The getheaders locator for `chain` (HeaderChain::locator: the tip, 10 below
 // it, then doubling steps), ending with `genesis` when given; [genesis] for
-// an empty chain.
-inline std::vector<uint256> getheaders_locator(const HeaderChain& chain, const uint256& genesis)
+// an empty chain. While a fork branch is kept aside (`fork`), its last header
+// comes first, as Core's best header: the answer continues that branch, so a
+// branch longer than one answer (2000 headers) is followed.
+inline std::vector<uint256> getheaders_locator(const HeaderChain& chain, const uint256& genesis,
+                                               const ForkBuffer* fork = nullptr)
 {
     std::vector<uint256> out;
+    if (fork && !fork->headers.empty())
+        out.push_back(wire_hash(fork->headers.back().block_hash));
     for (const auto& h : chain.locator())
         out.push_back(wire_hash(h));
     if (!genesis.IsNull() && (out.empty() || out.back() != genesis))
@@ -175,11 +184,13 @@ inline std::vector<uint256> getheaders_locator(const HeaderChain& chain, const u
 
 // The live ingest's options (main_dgb): the genesis the first header sits
 // on, a getheaders request with the chain's locator (an unconnected or a
-// buffered fork header: the peer is asked from the fork point, as Core does),
-// the tip height published after each batch (for other threads), and the
-// depth of a tip switch.
+// buffered fork header: the coin node is asked from the fork point, as Core
+// does), the tip height published after each batch (for other threads), the
+// depth of a tip switch, and the fork buffer (shared with the locator; one
+// is made when none is given).
 struct HeaderIngestOptions {
     u256 genesis = 0;
+    std::shared_ptr<ForkBuffer> fork;
     std::function<void()> request_headers;
     std::function<void(uint32_t)> on_tip;
     std::function<void(std::size_t)> on_reorg;
@@ -191,7 +202,7 @@ struct HeaderIngestOptions {
 inline std::shared_ptr<EventDisposable>
 wire_header_ingest(::dgb::interfaces::Node& node, HeaderChain& chain, HeaderIngestOptions opts = {})
 {
-    auto fork = std::make_shared<ForkBuffer>();
+    auto fork = opts.fork ? opts.fork : std::make_shared<ForkBuffer>();
     return node.new_headers.subscribe(
         [&chain, fork, opts](const std::vector<::dgb::coin::BlockHeaderType>& headers)
         {

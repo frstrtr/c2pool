@@ -232,7 +232,7 @@ TEST(DgbStratumBestShare, UnbuildableCoinbaseIsHeldNotEmpty)
     EXPECT_TRUE(r.coinb1.empty());
 }
 
-// Review dd1248abd #6: a throw while the job coinbase is built (a V35 key the
+// A throw while the job coinbase is built (a V35 key the
 // PPLNS split cannot turn into a script) is no job, never an exception out of
 // the core session's io handler.
 TEST(DgbStratumBestShare, AThrowingCoinbaseBuildIsHeld)

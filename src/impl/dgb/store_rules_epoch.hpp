@@ -2,7 +2,7 @@
 #pragma once
 // ---------------------------------------------------------------------------
 // The DGB sharechain store is verified again once when the share rules it was
-// written under change (reviews 906a0e5e3 #5, dd1248abd REQUIRED 1-2).
+// written under change.
 //
 // The store keeps each share's "verified" flag, and a restart reloads it
 // without verifying again (p2pool known_verified). After the V35 rule changes

@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
 // The DGB sharechain store is verified again once on a share-rules change
-// (rides dgb_work_source_test). Reviews 906a0e5e3 #5, dd1248abd REQUIRED 1-2
-// and #7/#8: the shares are KEPT and their verified flags cleared; the marker
+// (rides dgb_work_source_test): the shares are KEPT and their verified flags cleared; the marker
 // is written only after a re-scan confirms no flag is left; on a failure no
 // stored flag is trusted and the clear runs again on the next start.
 // ---------------------------------------------------------------------------
@@ -181,6 +180,6 @@ TEST(DgbStoreRulesEpoch, TheNodeRunsItBeforeTheLoadAndHonoursIt)
     EXPECT_LT(call, hpp.find("load_persisted_shares();", call));
     EXPECT_EQ(hpp.find("wipe_store_if_rules_changed"), std::string::npos);
     EXPECT_NE(cpp.find("if (meta.is_verified && m_trust_stored_verified) {"), std::string::npos);
-    // Review dd1248abd #7: stored V36 shares are not loaded while held.
+    // Stored V36 shares are not loaded while held.
     EXPECT_NE(cpp.find("if (ver >= 36 && !dgb::v36_shares_accepted()) {"), std::string::npos);
 }

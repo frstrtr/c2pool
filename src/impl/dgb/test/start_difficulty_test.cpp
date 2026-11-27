@@ -92,7 +92,7 @@ TEST(DgbStartDifficulty, MainDgbBindsTheNodeRate)
     EXPECT_LT(unbind, s.find("    stratum_server.reset();", unbind));
 }
 
-// Review 7793bfb6c NIT: a failed getblocktemplate is cached as long as a
+// A failed getblocktemplate is cached as long as a
 // good one, so the sessions' 1 s template retries do not each run the
 // blocking RPC while digibyted fails; rebinding the seam drops it.
 TEST(DgbGbtFallback, AFailureIsCachedForTheTtl)
@@ -117,7 +117,7 @@ TEST(DgbGbtFallback, AFailureIsCachedForTheTtl)
     EXPECT_EQ(calls, 2);
 }
 
-// Review 2d3524094 R2: the failure is stamped when the call returns (a slow
+// The failure is stamped when the call returns (a slow
 // failure is cached too), and the cache expires after the TTL.
 TEST(DgbGbtFallback, ASlowFailureIsCachedAndTheCacheExpires)
 {

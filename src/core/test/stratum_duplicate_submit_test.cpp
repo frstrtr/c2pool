@@ -289,7 +289,7 @@ TEST(StratumDuplicateSubmit, HexCaseIsTheSameHeader)
     EXPECT_FALSE(ok(r.replies[1])) << "upper-case hex of the same nonce passed as a new header";
 }
 
-// Review dd1248abd REQUIRED 3: only a submission that passed the vardiff
+// Only a submission that passed the vardiff
 // gate is remembered; a low-difficulty repeat is low-difficulty again.
 TEST(StratumDuplicateSubmit, ALowDifficultySubmitIsNotRemembered)
 {
@@ -318,7 +318,7 @@ TEST(StratumDuplicateSubmit, TheSetIsCappedPerJob)
     EXPECT_EQ(r.dispatched, 4u);
 }
 
-// Review 7793bfb6c REQUIRED: with the flag on, a header has one spelling. The
+// With the flag on, a header has one spelling. The
 // coin parsers read "1", "0x00000001", "00000001zz" and 300 leading zeros as
 // nonce 1, so any spelling but exactly 8 hex digits (extranonce2 exactly 2x
 // its size, version_bits at most 8) is refused [20] before the PoW, not

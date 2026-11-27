@@ -836,7 +836,7 @@ TEST(DgbDogeMergedPayout, BusyTrackerReMarksThePayoutsDirty)
     EXPECT_EQ(mm.get_cached_header_infos_and_commitment().second.size(), 44u);
 }
 
-// Review 713dc77a0 R3: core gives DOGE the primary's hash160 when the login
+// Core gives DOGE the primary's hash160 when the login
 // names no DOGE address, and types a DGB "S..." (version 63) as P2PKH, so an
 // S... login's DOGE script was P2PKH(redeem-script hash): unspendable, and as
 // the share's merged address it also hid the operator's P2SH split. The DGB
@@ -894,7 +894,7 @@ TEST(DgbDogeMergedPayout, P2shLoginGetsNoAutoDerivedDogeAndTakesTheSplit)
     // (DgbDogeP2shSplit.P2shKeyIsSplitOwnerDonationOthersUnchanged).
 }
 
-// Review 713dc77a0 NIT 15: while the tracker is busy the DOGE provider declines
+// While the tracker is busy the DOGE provider declines
 // and re-marks the payouts dirty, and every session's job build retried the
 // rebuild inline. The inline rebuild runs at most once a second; the manager's
 // poll rebuilds a dirty cache too.

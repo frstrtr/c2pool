@@ -840,12 +840,12 @@ TEST(DgbWorkSource, WorkTemplateServesRealV4BitsAndPrevhash)
     EXPECT_EQ(tmpl["previousblockhash"].get<std::string>(), expected_prev);
     EXPECT_EQ(ws->get_current_gbt_prevhash(), expected_prev);
 
-    // Review 906a0e5e3 #4: with the tip-recency check main_dgb arms (an hour),
+    // With the tip-recency check main_dgb arms (an hour),
     // a header chain whose median time is older (this 2026-09 fixture) serves
     // no work; unchecked (0) it serves the template above.
     ws->set_tip_recent_sec(3600);
     EXPECT_FALSE(ws->get_current_work_template().contains("bits")) << "work served from a chain behind its tip";
-    // Review dd1248abd #5: behind its tip, digibyted's template when the GBT
+    // Behind its tip, digibyted's template when the GBT
     // fallback is bound (its prevhash, bits and height).
     ws->set_gbt_tip_fn([]() -> std::optional<dgb::stratum::DGBWorkSource::GbtTip> {
         return dgb::stratum::DGBWorkSource::GbtTip{std::string(56, '0') + "0badf00d", "1a00ffff", 24200000};
@@ -855,14 +855,14 @@ TEST(DgbWorkSource, WorkTemplateServesRealV4BitsAndPrevhash)
     EXPECT_EQ(gbt["bits"].get<std::string>(), "1a00ffff");
     EXPECT_EQ(gbt["previousblockhash"].get<std::string>(), std::string(56, '0') + "0badf00d");
     EXPECT_EQ(gbt["height"].get<uint32_t>(), 24200000u);
-    // Review 7793bfb6c #2: the prevhash getter (the job push watches it)
+    // The prevhash getter (the job push watches it)
     // follows the same source.
     EXPECT_EQ(ws->get_current_gbt_prevhash(), std::string(56, '0') + "0badf00d");
     EXPECT_FALSE(ws->embedded_chain_serves());
     ws->set_gbt_tip_fn(nullptr);
     ws->set_tip_recent_sec(0);
     EXPECT_TRUE(ws->get_current_work_template().contains("bits"));
-    // Review c6c1c0cff R1/R3: no latch. The chain serves while its median
+    // No latch. The chain serves while its median
     // time is at most the bound old, and stops once it is older (no header
     // for an hour): digibyted's template when bound, else no work.
     int64_t now = fx.chain.median_time_past() + 60;
@@ -883,7 +883,7 @@ TEST(DgbWorkSource, WorkTemplateServesRealV4BitsAndPrevhash)
     ws->set_tip_clock(nullptr);
 }
 
-// Review dd1248abd #5 / #8: main_dgb arms the tip check on mainnet only.
+// main_dgb arms the tip check on mainnet only.
 TEST(DgbWorkSource, MainDgbArmsTheTipCheckOnMainnetOnly)
 {
     std::ifstream f(DGB_MAIN_SRC);
@@ -958,8 +958,8 @@ TEST(DgbWorkSource, GbtTipFallbackPopulatesPrevhashAndBitsWhenChainEmpty)
     ASSERT_TRUE(tmpl.contains("bits"));
     EXPECT_EQ(tmpl["bits"].get<std::string>(), kBits);
 
-    // The height is the daemon's (the empty header chain has none; review
-    // 906a0e5e3 #4), and so is the subsidy the template claims.
+    // The height is the daemon's (the empty header chain has none), and so
+    // is the subsidy the template claims.
     ASSERT_TRUE(tmpl.contains("height"));
     EXPECT_EQ(tmpl["height"].get<uint32_t>(), 123u);
 

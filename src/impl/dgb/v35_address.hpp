@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 // ---------------------------------------------------------------------------
-// The V34/V35 share address, exactly as the python DGB network reads it
-// (review 713dc77a0 #7, #6).
+// The V34/V35 share address, exactly as the python DGB network reads it.
 //
 // A V34/V35 share carries its payout as an address string. The python oracle
 // (frstrtr/p2pool-dgb-scrypt, bitcoin/data.py address_to_script2) turns it into
@@ -261,7 +260,7 @@ inline std::string v35_script_to_address(const std::vector<unsigned char>& s, co
 }
 
 // ---------------------------------------------------------------------------
-// V34/V35 PPLNS keys (review 906a0e5e3 REQUIRED 2). The python V35 network
+// V34/V35 PPLNS keys. The python V35 network
 // keys a share's weight by its ADDRESS STRING (data.py WeightsSkipList:
 // share.address), sums amounts per string, merges the donation's own P2PKH
 // address (donation_script_to_address) into the donation, sorts the dests by

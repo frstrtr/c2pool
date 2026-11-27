@@ -167,7 +167,7 @@ inline PplnsPayoutSplit compute_pplns_payout_split(
     //   addr))[-4000:]. So equal amounts sort by the address string ("D..." <
     //   "S..." < "dgb1..."), not by the script (where a P2WPKH 0x00... sorted
     //   first), and the donation takes one of the 4000 places: at most 3999
-    //   payouts (review 713dc77a0 #6). The string of a script is its canonical
+    //   payouts. The string of a script is its canonical
     //   address (v35_script_to_address: base58, lowercase bech32), which is the
     //   string a share minted here carries; a script without one keeps the
     //   script order after the addressed ones.

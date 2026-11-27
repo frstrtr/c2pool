@@ -246,13 +246,12 @@ int64_t DGBWorkSource::tip_age() const
 
 bool DGBWorkSource::embedded_chain_serves() const
 {
-    // The one template-source choice (reviews 906a0e5e3 #4, dd1248abd #5,
-    // 7793bfb6c #2), read by the template, the prevhash getter and the work
-    // gate: the embedded header chain while it has a tip whose median time
+    // The one template-source choice, read by the template, the prevhash
+    // getter and the work gate: the embedded header chain while it has a tip whose median time
     // is at most tip_recent_sec old. While it syncs, or once its tip is that
     // stale (no header for an hour on a 15 s chain), its template is for an
     // old height and prevhash: digibyted's template when bound, else no work
-    // (review c6c1c0cff R1/R3: no latch).
+    // (no latch).
     if (!chain_.tip_hash())
         return false;
     const uint32_t recent = tip_recent_sec_.load();
@@ -564,7 +563,7 @@ std::pair<std::string, std::string> DGBWorkSource::get_coinbase_parts() const
     return { {}, {} };
 }
 
-// Review 713dc77a0 R3. core resolve_merged_login gives every configured merged
+// core resolve_merged_login gives every configured merged
 // chain the primary's hash160 when the miner names no address for it. A DGB
 // P2SH primary ("S...", version 63) is not in core address_to_hash160's P2SH
 // list, so it is typed P2PKH and its DOGE script becomes P2PKH(redeem-script
@@ -641,7 +640,7 @@ bool payout_carried(const std::vector<unsigned char>& s)
 }
 } // namespace
 
-// Review 713dc77a0 #10 and #13. An empty login has no payout a share can carry
+// An empty login has no payout a share can carry
 // and DGB does not redistribute one (the DGB split comes with the
 // --redistribute split re-apply), and a V35 DGB share carries only a P2PKH,
 // P2SH or 20-byte P2WPKH address: a dgb1 P2WSH/P2TR login was paid to a P2PKH
@@ -893,7 +892,7 @@ core::stratum::CoinbaseResult DGBWorkSource::build_coinbase(
     // the coinbase is byte-identical to standalone DGB.
     std::vector<unsigned char> aux_mm_scriptsig;
     if (mm_manager_ && mm_manager_->has_chains()) {
-        // Rebuilt inline at most once a second (review 713dc77a0 NIT 15):
+        // Rebuilt inline at most once a second:
         // while the tracker is busy the provider declines and re-marks the
         // payouts dirty, and every session's job build retried the rebuild;
         // the manager's own poll rebuilds a dirty cache too.
@@ -930,7 +929,7 @@ core::stratum::CoinbaseResult DGBWorkSource::build_coinbase(
         std::lock_guard<std::mutex> lk(fallback_payout_mutex_);
         owner_payout = !split_owner_script_.empty() && payout_script == split_owner_script_;
     }
-    // A V35 share carries no merged address (review c6c1c0cff R4): a P2SH
+    // A V35 share carries no merged address: a P2SH
     // login's DOGE share is split so under V35 even when it names a DOGE
     // address; told once the job's share version is known (below).
     const bool p2sh_doge_rule = mm_manager_ && !owner_payout && payout_script.size() == 23
@@ -973,8 +972,8 @@ core::stratum::CoinbaseResult DGBWorkSource::build_coinbase(
     block.local_hash_rate = local_hash_rate;
     block.share_donation = share_donation;
 
-    // The producer and the PPLNS->coinbase build may throw (review dd1248abd
-    // #6: a V35 key the split cannot turn into a script). The core session
+    // The producer and the PPLNS->coinbase build may throw (a V35 key the
+    // split cannot turn into a script). The core session
     // has no try around its job build, so an escaping throw would leave the
     // io handler: no job instead, logged at most once a minute.
     std::optional<dgb::coin::ConnCoinbasePplnsInputs> inputs;
@@ -1583,7 +1582,7 @@ std::optional<DGBWorkSource::GbtTip> DGBWorkSource::resolve_gbt_tip_fallback() c
         std::lock_guard<std::mutex> lk(gbt_tip_mutex_);
         if (gbt_tip_cache_ && (now - gbt_tip_cache_time_) < GBT_TIP_TTL_SECONDS)
             return gbt_tip_cache_;
-        // A failure is cached as long (review 7793bfb6c NIT): while digibyted
+        // A failure is cached as long: while digibyted
         // fails, each session's 1 s template retry would otherwise run its own
         // blocking getblocktemplate on the IO thread.
         if (gbt_tip_fail_time_ != 0 && (now - gbt_tip_fail_time_) < GBT_TIP_TTL_SECONDS)
@@ -1594,7 +1593,7 @@ std::optional<DGBWorkSource::GbtTip> DGBWorkSource::resolve_gbt_tip_fallback() c
         return std::nullopt;   // unbound (no digibyted creds armed) -> truthful absence
 
     std::optional<GbtTip> tip = fn();   // blocking getblocktemplate; nullopt on RPC failure
-    // Stamped when the call returns (review 2d3524094 R2): an RPC to an
+    // Stamped when the call returns: an RPC to an
     // unreachable host can block ~2 min, longer than the TTL, and a stamp
     // from before the call would have expired already.
     const int64_t done = now_sec();

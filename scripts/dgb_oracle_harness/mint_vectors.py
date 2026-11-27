@@ -27,7 +27,7 @@ import random
 import sys
 import tempfile
 
-# Share donations (review 7a4373856 R1): --give-author's 66, none, split
+# Share donations: --give-author's 66, none, split
 # jobs (32768), the extremes.
 DONATIONS = [0, 66, 32768, 65535, 32768, 7]
 
