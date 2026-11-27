@@ -1017,3 +1017,21 @@ TEST(DgbWorkSource, ConnectionCoinbaseProducerNulloptYieldsEmptyJob)
 }
 
 }  // namespace
+// VARDIFF item (a): DGB sessions use the LTC / BTC / DASH hygiene profile
+// (TCP keepalive, a handshake timeout, the idle reaper backstop, a bounded
+// write queue); before, all off on DGB.
+TEST(DgbWorkSource, SessionHygieneProfile)
+{
+    Fixture fx;
+    auto ws = fx.make();
+    const auto& c = ws->get_stratum_config();
+    EXPECT_TRUE(c.tcp_keepalive_enabled);
+    EXPECT_EQ(c.tcp_keepalive_idle_sec, 60u);
+    EXPECT_EQ(c.tcp_keepalive_interval_sec, 10u);
+    EXPECT_EQ(c.tcp_keepalive_count, 3u);
+    EXPECT_EQ(c.handshake_timeout_sec, 30u);
+    EXPECT_EQ(c.session_idle_timeout_sec, 1800u);
+    EXPECT_EQ(c.max_write_queue_depth, 256u);
+    EXPECT_EQ(c.keepalive_notify_sec, 25u);
+    EXPECT_TRUE(c.reject_duplicate_submits);
+}

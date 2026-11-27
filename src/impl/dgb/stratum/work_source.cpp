@@ -178,6 +178,17 @@ DGBWorkSource::DGBWorkSource(c2pool::dgb::HeaderChain&     chain,
     // A repeated submit of the same header on a job is refused with error 22
     // (p2pool / kr1z1s work.py received_header_hashes).
     config_.reject_duplicate_submits = true;
+    // Session hygiene, the LTC / BTC / DASH profile (ltc/stratum_defaults.hpp):
+    // a NAT-dropped rig's half-open socket and a client that connects and
+    // never authorizes would each hold a slot forever, until the node refuses
+    // every real miner at max_stratum_connections. Transport/liveness only.
+    config_.tcp_keepalive_enabled      = true;   // kernel probes dead NAT paths
+    config_.tcp_keepalive_idle_sec     = 60;
+    config_.tcp_keepalive_interval_sec = 10;
+    config_.tcp_keepalive_count        = 3;
+    config_.handshake_timeout_sec      = 30;     // drop a connection that never authorizes
+    config_.session_idle_timeout_sec   = 1800;   // backstop; never reaps an authorized session with keepalive on
+    config_.max_write_queue_depth      = 256;    // drop a peer that stopped reading
     LOG_INFO << "[DGB-STRATUM] DGBWorkSource constructed"
              << " (testnet=" << is_testnet_
              << " min_diff=" << config_.min_difficulty
