@@ -44,6 +44,7 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <future>
 #include <memory>
@@ -485,6 +486,19 @@ TEST(DgbStratumJobs, EmptyAndUncarriableLoginsAreRefusedAtAuthorize)
 
     JobRig probe;
     EXPECT_NE(probe.ws->authorize_refusal("").find("DGB payout address"), std::string::npos);
+    {
+        // An UPPERCASE bech32 login is refused (python keys V35 weights by the
+        // string as typed); its lowercase form is accepted.
+        Bytes k20(20, 0x66);
+        Bytes w{0x00, 0x14};
+        w.insert(w.end(), k20.begin(), k20.end());
+        const std::string lower = core::script_to_address(w, "dgb", 30, 63);
+        std::string upper = lower;
+        for (auto& ch : upper)
+            ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+        EXPECT_NE(probe.ws->authorize_refusal(upper).find(lower), std::string::npos) << upper;
+        EXPECT_TRUE(probe.ws->authorize_refusal(lower).empty()) << lower;
+    }
     EXPECT_FALSE(probe.ws->authorize_refusal(p2wsh).empty()) << p2wsh;
     if (!p2tr.empty())
         EXPECT_FALSE(probe.ws->authorize_refusal(p2tr).empty()) << p2tr;

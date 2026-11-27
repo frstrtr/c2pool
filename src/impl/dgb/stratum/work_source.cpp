@@ -43,6 +43,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <chrono>
@@ -480,6 +481,16 @@ std::string DGBWorkSource::authorize_refusal(const std::string& username) const
     if (username.empty())
         return "a DGB payout address is required (DGB_ADDRESS, or DGB_ADDRESS,DOGE_ADDRESS to name the "
                "DOGE payout)";
+    // An UPPERCASE bech32 login: the python network keys V35 weights by the
+    // address string as typed, so the same key typed in both cases would be
+    // two outputs there and one here. The lowercase form is the same address.
+    for (const char* hrp : {"DGB1", "DGBT1", "DGBRT1"})
+        if (username.rfind(hrp, 0) == 0) {
+            std::string lower = username;
+            for (auto& c : lower)
+                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            return "use the lowercase form of this bech32 address (" + lower + ")";
+        }
     std::vector<unsigned char> script;
     if (core::classify_address_for_coin(username, dgb::address_acceptance(is_testnet_, is_regtest_), script)
         != core::AddressCoinMatch::Own)
