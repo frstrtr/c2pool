@@ -45,6 +45,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <future>
@@ -1195,11 +1196,109 @@ TEST(DashP5SharedTxHex, ServeTimingWritesOneLinePerTemplate)
     EXPECT_TRUE(std::regex_match(line, std::regex(
         R"(\[DASH-SERVE-TIMING\] serve timing per template: seq=\d+ h=\d+ txs=\d+ bytes=\d+ )"
         R"(serves=\d+ spans=\d+ serve_us p50=\d+ p99=\d+ max=\d+ )"
-        R"(coinbase_us p50=\d+ p99=\d+ max=\d+ live_hex_chars=-?\d+)")))
+        R"(coinbase_us p50=\d+ p99=\d+ max=\d+ live_hex_chars=-?\d+ )"
+        R"(store_brake=(on|off) brake_skips=\d+)")))
         << line;
     EXPECT_NE(line.find(" txs=6 bytes=1410 serves=6 spans=5 "), std::string::npos) << line;
 
     // Serving C further writes nothing until the next template.
     (void)serve_once(ws, 0x33);
     EXPECT_EQ(ws.serve_timing_lines(), 1u);
+}
+
+// ── P2': the frozen-job registry's safety brake at the template store ───────
+//
+// While the registry is over its byte cap with no evictable entry left
+// (FrozenJobRegistry::brake_on, wired through set_store_brake_fn), a same-tip
+// refresh that changes only the tx set is not stored: the cached template
+// keeps being served, re-stamped fresh so the sessions do not re-source on
+// every request. A tip change, a same-set refresh, any store after an
+// invalidate, and every refresh once the brake is off still store. The serve
+// timing line carries the brake and its skip count.
+TEST(DashWorkSourceStoreBrake, SkipsSameTipTxRefreshKeepsTipStore)
+{
+    Source src;
+    src.set(tmpl_A());
+    int calls = 0;
+    auto fb = src.fallback();
+    DASHWorkSource ws(src.coin_state, [&calls, fb] { ++calls; return fb(); }, Source::submit());
+    std::atomic<bool> brake{false};
+    ws.set_store_brake_fn([&brake] { return brake.load(); });
+
+    (void)serve_once(ws);
+    const auto a = ws.peek_template();
+    ASSERT_TRUE(a);
+
+    // ON: a same-tip refresh with another tx set is not stored.
+    brake = true;
+    src.set(tmpl_C());
+    ws.bump_work_generation();
+    const int before = calls;
+    const auto c = serve_once(ws);
+    EXPECT_EQ(calls, before + 1) << "the refresh ran";
+    EXPECT_EQ(ws.peek_template(), a) << "the cached template is kept";
+    EXPECT_EQ(ws.store_brake_skips(), 1u);
+    ASSERT_TRUE(c.snapshot.tx_data);
+    EXPECT_EQ(*c.snapshot.tx_data, tmpl_A().m_tx_data_hex) << "the sessions keep A's bodies";
+    (void)serve_once(ws, 0x33);
+    (void)serve_once(ws, 0x44);
+    EXPECT_EQ(calls, before + 1) << "re-stamped fresh: no re-source per request";
+
+    // ON: a tip change stores.
+    src.set(tmpl_D());
+    ws.bump_work_generation();
+    (void)serve_once(ws);
+    const auto d = ws.peek_template();
+    ASSERT_TRUE(d);
+    EXPECT_NE(d->m_previous_block, a->m_previous_block);
+    EXPECT_EQ(ws.store_brake_skips(), 1u);
+    {
+        const auto s = ws.last_serve_timing();   // A's line, written at D's first serve
+        ASSERT_TRUE(s.has_value());
+        EXPECT_EQ(s->seq, a->m_tx_hex_shared.seq());
+        EXPECT_TRUE(s->store_brake);
+        EXPECT_EQ(s->store_brake_skips, 1u);
+        const std::string line = DASHWorkSource::format_serve_timing_line(*s);
+        EXPECT_NE(line.find(" store_brake=on brake_skips=1"), std::string::npos) << line;
+    }
+
+    // ON: a same-tip refresh that adds txs to D is not stored.
+    const DashWorkData e1 = make_template(kPrev2, 2583002u, 164500000ULL, {{0x51, 40}, {0x52, 90}});
+    src.set(e1);
+    ws.bump_work_generation();
+    (void)serve_once(ws);
+    EXPECT_EQ(ws.peek_template(), d);
+    EXPECT_EQ(ws.store_brake_skips(), 2u);
+
+    // ON: after an invalidate there is no cached template to keep: it stores.
+    ws.invalidate_template_cache("kat: P2' store brake");
+    (void)serve_once(ws);
+    const auto e1_stored = ws.peek_template();
+    ASSERT_TRUE(e1_stored);
+    EXPECT_EQ(e1_stored->m_tx_hashes, e1.m_tx_hashes);
+    EXPECT_EQ(ws.store_brake_skips(), 2u);
+
+    // ON: the same tx set again is not a tx change: it stores (reusing the vector).
+    ws.bump_work_generation();
+    (void)serve_once(ws);
+    const auto e1_again = ws.peek_template();
+    ASSERT_TRUE(e1_again);
+    EXPECT_NE(e1_again, e1_stored);
+    EXPECT_EQ(e1_again->m_tx_hex_shared.hex().get(), e1_stored->m_tx_hex_shared.hex().get());
+    EXPECT_EQ(ws.store_brake_skips(), 2u);
+
+    // OFF: a same-tip tx change stores.
+    brake = false;
+    const DashWorkData e2 = make_template(kPrev2, 2583002u, 164600000ULL, {{0x61, 70}});
+    src.set(e2);
+    ws.bump_work_generation();
+    (void)serve_once(ws);
+    ASSERT_TRUE(ws.peek_template());
+    EXPECT_EQ(ws.peek_template()->m_tx_hashes, e2.m_tx_hashes);
+    EXPECT_EQ(ws.store_brake_skips(), 2u);
+
+    // The skip rule itself.
+    EXPECT_TRUE(DASHWorkSource::store_brake_may_skip(tmpl_A(), tmpl_C()));
+    EXPECT_FALSE(DASHWorkSource::store_brake_may_skip(tmpl_A(), tmpl_B())) << "same set";
+    EXPECT_FALSE(DASHWorkSource::store_brake_may_skip(tmpl_C(), tmpl_D())) << "tip change";
 }

@@ -578,6 +578,27 @@ public:
     /// and share-target submissions cannot mint (loud fail-closed decline).
     void set_producer_job_fn(ProducerJobFn fn);
 
+    /// The frozen-job registry's SAFETY BRAKE (dash::mint::FrozenJobRegistry::
+    /// brake_on): true while the registry is over its byte cap with no
+    /// evictable entry left. While it holds, the template store keeps the
+    /// cached template instead of storing a same-tip refresh that changes only
+    /// the tx set (store_brake_may_skip), and re-stamps it fresh; a tip change,
+    /// any other change and any store after an invalidate still store. Called
+    /// from whichever thread stores (io inline or the rpc_pool executor), so it
+    /// must be thread-safe. Unbound: never engaged.
+    using StoreBrakeFn = std::function<bool()>;
+    void set_store_brake_fn(StoreBrakeFn fn);
+    /// Template refreshes the brake kept out of the store, since construction.
+    uint64_t store_brake_skips() const {
+        return store_brake_skips_.load(std::memory_order_relaxed);
+    }
+    /// The brake's skip rule: `next` is a refresh of `cached` on the same coin
+    /// tip (previous block, height and bits) with another tx set. Everything
+    /// else a same-tip template carries (the coinbase value, the payment
+    /// amounts, the CbTx payload) follows from that tx set.
+    static bool store_brake_may_skip(const coin::DashWorkData& cached,
+                                     const coin::DashWorkData& next);
+
     /// Drop the cached template snapshot + bump work_generation. Wired to the
     /// NodeRPC reconnect hook in main_dash.cpp (stale-payee fix, defect 3):
     /// a "CoindRPC reconnecting" churn means any cached template — and the
@@ -636,6 +657,8 @@ public:
         uint32_t serve_us_p50{0}, serve_us_p99{0}, serve_us_max{0};
         uint32_t coinbase_us_p50{0}, coinbase_us_p99{0}, coinbase_us_max{0};
         int64_t  live_hex_chars{0};   ///< coin::live_template_hex_chars() at the write
+        bool     store_brake{false};     ///< the frozen-job registry's safety brake at the write
+        uint64_t store_brake_skips{0};   ///< store_brake_skips() at the write
     };
     static std::string format_serve_timing_line(const ServeTimingSummary& s);
     /// The last summary written, and how many were written (tests).
@@ -1048,6 +1071,12 @@ private:
     // Producer-job builder (slice 3/3 run-loop mint). Empty until wired.
     mutable std::mutex          producer_job_mutex_;
     ProducerJobFn               producer_job_fn_;
+
+    // Frozen-job registry safety brake (set_store_brake_fn). Empty until wired.
+    mutable std::mutex          store_brake_mutex_;
+    StoreBrakeFn                store_brake_fn_;
+    mutable std::atomic<uint64_t> store_brake_skips_{0};
+    bool store_brake_engaged() const;
 
     // Template cache (stage 4c): the last DashWorkData sourced through the
     // embedded/fallback selector, keyed on work_generation_ + a staleness TTL

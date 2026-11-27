@@ -1744,9 +1744,46 @@ void DASHWorkSource::resource_template_now(CoinStateArm arm) const
     // vector is taken.
     if (work.m_bits != 0 && !work.m_previous_block.IsNull()) {
         std::shared_ptr<const coin::DashWorkData> prev;
+        bool prev_is_embedded = false;
         {
             std::lock_guard<std::mutex> lk(template_mutex_);
             prev = template_cache_;
+            prev_is_embedded = template_cache_is_embedded_;
+        }
+        // SAFETY BRAKE (frozen-job registry over its byte cap with no
+        // evictable entry left): a same-tip refresh from the same arm that
+        // changes only the tx set is not stored. The cached template keeps
+        // being served and is re-stamped fresh, with the same generation
+        // discipline as a store, so the sessions do not re-source on every
+        // request. A tip change, an arm change and any store after an
+        // invalidate (the cache was dropped, so there is no `prev`: an islock
+        // conflict, a reconnect, a failed serve-time re-check) still store.
+        if (prev && prev_is_embedded == work_is_embedded
+            && store_brake_may_skip(*prev, work) && store_brake_engaged()) {
+            bool skipped = false;
+            uint64_t skips = 0;
+            {
+                std::lock_guard<std::mutex> lk(template_mutex_);
+                if (template_cache_ == prev) {
+                    const uint64_t gen_now = work_generation_.load(std::memory_order_relaxed);
+                    template_cache_gen_ = (gen_now == gen_at_source) ? gen_now : gen_at_source;
+                    template_cache_at_  = std::chrono::steady_clock::now();
+                    template_last_fail_at_ = {};
+                    skips   = store_brake_skips_.fetch_add(1, std::memory_order_relaxed) + 1;
+                    skipped = true;
+                }
+            }
+            if (skipped) {
+                if (skips == 1 || skips % 20 == 0)
+                    LOG_WARNING << "[DASH-STRATUM] SAFETY BRAKE: same-tip template refresh"
+                                   " that changes only the tx set NOT stored (h="
+                                << work.m_height << " txs kept=" << prev->m_tx_hashes.size()
+                                << " offered=" << work.m_tx_hashes.size()
+                                << " brake_skips=" << skips
+                                << ") -- the frozen-job registry is over its byte cap;"
+                                   " the cached template keeps being served";
+                return;
+            }
         }
         const uint64_t seq = template_store_seq_.fetch_add(1, std::memory_order_relaxed) + 1;
         work.m_tx_hex_shared =
@@ -3302,6 +3339,31 @@ void DASHWorkSource::set_producer_job_fn(ProducerJobFn fn)
     producer_job_fn_ = std::move(fn);
 }
 
+void DASHWorkSource::set_store_brake_fn(StoreBrakeFn fn)
+{
+    std::lock_guard<std::mutex> lk(store_brake_mutex_);
+    store_brake_fn_ = std::move(fn);
+}
+
+bool DASHWorkSource::store_brake_engaged() const
+{
+    StoreBrakeFn fn;
+    {
+        std::lock_guard<std::mutex> lk(store_brake_mutex_);
+        fn = store_brake_fn_;
+    }
+    return fn && fn();
+}
+
+bool DASHWorkSource::store_brake_may_skip(const coin::DashWorkData& cached,
+                                          const coin::DashWorkData& next)
+{
+    return cached.m_previous_block == next.m_previous_block
+        && cached.m_height == next.m_height
+        && cached.m_bits == next.m_bits
+        && cached.m_tx_hashes != next.m_tx_hashes;
+}
+
 // ── Serve timing (ServeTimingSummary) ───────────────────────────────────────
 
 std::string DASHWorkSource::format_serve_timing_line(const ServeTimingSummary& s)
@@ -3315,7 +3377,9 @@ std::string DASHWorkSource::format_serve_timing_line(const ServeTimingSummary& s
       << " max=" << s.serve_us_max
       << " coinbase_us p50=" << s.coinbase_us_p50 << " p99=" << s.coinbase_us_p99
       << " max=" << s.coinbase_us_max
-      << " live_hex_chars=" << s.live_hex_chars;
+      << " live_hex_chars=" << s.live_hex_chars
+      << " store_brake=" << (s.store_brake ? "on" : "off")
+      << " brake_skips=" << s.store_brake_skips;
     return o.str();
 }
 
@@ -3339,6 +3403,8 @@ void DASHWorkSource::note_serve_timing(const coin::DashWorkData& wd, int64_t ser
                 s.coinbase_us_p50 = percentile_us(acc.coinbase_us, 50);
                 s.coinbase_us_p99 = percentile_us(acc.coinbase_us, 99);
                 s.live_hex_chars  = coin::live_template_hex_chars();
+                s.store_brake       = store_brake_engaged();
+                s.store_brake_skips = store_brake_skips_.load(std::memory_order_relaxed);
                 last_serve_timing_ = s;
                 ++serve_timing_lines_;
                 done = s;

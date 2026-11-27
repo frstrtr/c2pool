@@ -640,11 +640,16 @@ if (BUILD_TESTING AND GTest_FOUND)
     # round-trip through the version-36 ShareVariants dispatch, merged-fields-
     # inert convention, and v16 backward-compat. Same allowlisted target (proven
     # pattern), no build.yml change (avoids the #769 new-target/allowlist trap).
+    # test_dash_frozen_registry_cap.cpp (P2'): the frozen-job registry's byte
+    # cap, age eviction, count backstop and tier order on an injected clock,
+    # the cap rule read from the cgroup, and the producer job cache's age
+    # sweep. Same allowlisted target (proven pattern), no build.yml change.
     add_executable(test_dash_share_hash_link
         test_dash_share_hash_link.cpp
         test_dash_share_producer.cpp
         test_dash_share_producer_bind.cpp
         test_dash_mint_runloop.cpp
+        test_dash_frozen_registry_cap.cpp
         test_dash_share_download.cpp
         test_dash_v36_share.cpp
         test_dash_known_txs_retention.cpp)
