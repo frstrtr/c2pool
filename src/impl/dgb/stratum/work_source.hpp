@@ -197,6 +197,13 @@ public:
     using LocalRateFn = std::function<double(const core::stratum::PayoutKey&)>;
     void set_local_rate_fn(LocalRateFn fn);
 
+    /// A new session's start difficulty (dgb_start_difficulty, as the python
+    /// DGB network): node rate / 10 per second, else 3000x the dust target of
+    /// the current template. The node rate is set_node_rate_fn's (main_dgb:
+    /// the stratum server's total pseudoshare rate); unset: 0.
+    double start_difficulty(const core::stratum::PayoutKey& login_key) const override;
+    void set_node_rate_fn(std::function<double()> fn);
+
     // ── IWorkSource: share submission ────────────────────────────────────
     nlohmann::json mining_submit(
         const std::string& username, const std::string& job_id,
@@ -476,6 +483,7 @@ private:
     PplnsInputsFn               pplns_inputs_fn_;
     mutable std::mutex          local_rate_mutex_;
     LocalRateFn                 local_rate_fn_;
+    std::function<double()>     node_rate_fn_;   // under local_rate_mutex_
     core::stratum::CoinbaseResult build_coinbase(
         const uint256& prev_share_hash, const std::string& extranonce1_hex,
         const std::vector<unsigned char>& payout_script,

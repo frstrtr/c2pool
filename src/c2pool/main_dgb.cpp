@@ -1971,6 +1971,9 @@ int run_node(const core::CoinParams& params, bool testnet,
                     const auto it = rates.find(key);
                     return it == rates.end() ? 0.0 : it->second;
                 });
+            // A new session's start difficulty from the node's pseudoshare
+            // rate (dgb_start_difficulty: rate / 10 per second).
+            work_source->set_node_rate_fn([srv = stratum_server.get()]() { return srv->get_total_hashrate(); });
         } else {
             std::cout << "[DGB] stratum FAILED to bind " << stratum_addr << ":"
                       << stratum_port << " — stratum disabled" << std::endl;
@@ -2804,6 +2807,7 @@ int run_node(const core::CoinParams& params, bool testnet,
     if (found_block_report) *found_block_report = nullptr;  // #995: unbind before mi dies
     if (stop_job_push) stop_job_push();   // before the server it pushes to goes
     if (work_source) work_source->set_local_rate_fn(nullptr);   // it reads the server's rates
+    if (work_source) work_source->set_node_rate_fn(nullptr);
     stratum_server.reset();
     web_server.reset();
 

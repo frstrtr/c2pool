@@ -15,6 +15,7 @@
 // accept-by-continuity / V37 and never reach this work source.
 
 #include <impl/dgb/stratum/work_source.hpp>
+#include <impl/dgb/stratum_start_difficulty.hpp>   // dgb_start_difficulty (VARDIFF item 2)
 
 #include <impl/dgb/coin/header_chain.hpp>
 #include <impl/dgb/coin/mempool.hpp>
@@ -56,6 +57,7 @@ namespace dgb::stratum {
 
 namespace {
 constexpr uint32_t kDogeChainId = 98;   // the DOGE AuxPoW chain id (--merged DOGE:98)
+constexpr uint64_t kDustThreshold = 100000;   // DUST_THRESHOLD 0.001 DGB (params.hpp p.dust_threshold)
 } // namespace
 
 namespace {
@@ -601,6 +603,37 @@ void DGBWorkSource::set_local_rate_fn(LocalRateFn fn)
 {
     std::lock_guard<std::mutex> lk(local_rate_mutex_);
     local_rate_fn_ = std::move(fn);
+}
+
+void DGBWorkSource::set_node_rate_fn(std::function<double()> fn)
+{
+    std::lock_guard<std::mutex> lk(local_rate_mutex_);
+    node_rate_fn_ = std::move(fn);
+}
+
+double DGBWorkSource::start_difficulty(const core::stratum::PayoutKey&) const
+{
+    std::function<double()> fn;
+    {
+        std::lock_guard<std::mutex> lk(local_rate_mutex_);
+        fn = node_rate_fn_;
+    }
+    const double node_rate = fn ? fn() : 0.0;
+    uint32_t bits = 0;
+    uint64_t value = 0;
+    if (!(node_rate > 0.0)) {
+        // No node rate yet: the current template's block.
+        try {
+            const nlohmann::json tmpl = get_current_work_template();
+            if (tmpl.is_object() && tmpl.contains("bits") && tmpl.contains("height")) {
+                bits = static_cast<uint32_t>(std::stoul(tmpl["bits"].get<std::string>(), nullptr, 16));
+                value = coinbase_value(tmpl["height"].get<uint32_t>(), 0, std::nullopt);
+            }
+        } catch (const std::exception&) {
+            return 0.0;
+        }
+    }
+    return dgb::dgb_start_difficulty(node_rate, bits, value, dgb::PoolConfig::SPREAD, kDustThreshold);
 }
 
 core::stratum::CoinbaseResult DGBWorkSource::build_coinbase(
