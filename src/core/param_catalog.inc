@@ -486,9 +486,11 @@ C2P_PARAM("money.payout_address", Money, STRING, MONEY_RESTART, C_LTC, LIT, "", 
 C2P_PARAM("money.node_owner_script", Money, HEX, MONEY_RESTART, C_LTC, LIT, "", HEX_EVEN, "node-owner output script")
   C2P_ALIAS("money.node_owner_script", BIN_LTC, "--node-owner-script", VALUE)
 
-C2P_PARAM("money.merged_operator_address", Money, STRING, MONEY_RESTART, C_LTC|C_DOGE, LIT, "", ADDR_COIN, "merged (doge) fee address")
+C2P_PARAM("money.merged_operator_address", Money, STRING, MONEY_RESTART, C_LTC|C_DOGE|C_DGB, LIT, "", ADDR_COIN, "merged (doge) fee address")
   C2P_ALIAS("money.merged_operator_address", BIN_LTC, "--node-owner-merged-address", VALUE)
   C2P_ALIAS("money.merged_operator_address", BIN_LTC, "--merged-operator-address", VALUE)
+  C2P_ALIAS("money.merged_operator_address", BIN_DGB, "--node-owner-merged-address", VALUE)
+  C2P_ALIAS("money.merged_operator_address", BIN_DGB, "--merged-operator-address", VALUE)
 
 C2P_PARAM("money.payout_pubkey_hash", Money, HEX, MONEY_RESTART, C_DASH, LIT, "", HEX_EVEN, "P2PKH for mine-block")
   C2P_ALIAS("money.payout_pubkey_hash", BIN_DASH, "--payout-pubkey-hash", VALUE)
