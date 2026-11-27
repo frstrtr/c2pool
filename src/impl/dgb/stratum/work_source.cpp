@@ -320,8 +320,30 @@ void DGBWorkSource::update_stratum_worker(const std::string& session_id,
 // IWorkSource: work generation — Stage 4c will fill these in.
 // ─────────────────────────────────────────────────────────────────────────────
 
+void DGBWorkSource::set_work_hold(const std::string& reason)
+{
+    std::lock_guard<std::mutex> lk(work_hold_mutex_);
+    if (reason == work_hold_)
+        return;
+    if (!reason.empty())
+        LOG_WARNING << "[DGB-STRATUM] work held, miners refused: " << reason;
+    else
+        LOG_INFO << "[DGB-STRATUM] work hold over (" << work_hold_ << "): serving work";
+    work_hold_ = reason;
+}
+
+std::string DGBWorkSource::work_hold() const
+{
+    std::lock_guard<std::mutex> lk(work_hold_mutex_);
+    return work_hold_;
+}
+
 nlohmann::json DGBWorkSource::get_current_work_template() const
 {
+    // The work gate (no sharechain peers, lost contact with digibyted): no
+    // template, so the stratum layer sends no job.
+    if (!work_hold().empty())
+        return nlohmann::json::object();
     // Stage 4c (coinbasevalue wire): the full GBT-shaped template
     // (previousblockhash, bits, version, curtime, mintime, transactions[])
     // is assembled by the embedded dgb::coin::TemplateBuilder in a following
@@ -516,6 +538,10 @@ bool payout_carried(const std::vector<unsigned char>& s)
 // foreign or undecodable one) are left to the core door.
 std::string DGBWorkSource::authorize_refusal(const std::string& username) const
 {
+    // The work gate first, as python's preprocess_request runs before the
+    // login is read.
+    if (std::string hold = work_hold(); !hold.empty())
+        return hold;
     if (username.empty())
         return "a DGB payout address is required (DGB_ADDRESS, or DGB_ADDRESS,DOGE_ADDRESS to name the "
                "DOGE payout)";

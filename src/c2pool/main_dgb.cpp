@@ -66,6 +66,7 @@
 #include <impl/dgb/stratum/work_source.hpp>
 #include <impl/dgb/best_share_cell.hpp>         // stratum best share: locked cell + the one best-change hook
 #include <impl/dgb/stratum_job_push.hpp>        // clean jobs on a new tip / best share (1 s watch)
+#include <impl/dgb/stratum_work_gate.hpp>        // no work without sharechain peers / digibyted contact
 #include <impl/dgb/coin/work_ref_hash.hpp>      // make_work_ref_hash_params (ref preimage SSOT)
 #include <impl/dgb/coin/coinbase_scriptsig.hpp>   // build_coinbase_scriptsig (BIP34 height + /c2pool-dgb/ tag, #902)
 #include <impl/dgb/run_loop_mint.hpp>              // parse_min_header_80 + mint_local_share_at_frozen_version (#884/#294)
@@ -2013,6 +2014,42 @@ int run_node(const core::CoinParams& params, bool testnet,
             });
     }
 
+    // The stratum work gate (stratum_work_gate.hpp; python work.py
+    // preprocess_request): no work while the node has no sharechain peers
+    // (mainnet: PERSIST) or has lost contact with digibyted for more than
+    // 60 s; once a hold has lasted 15 s the live sessions are closed once, so
+    // rigs fail over. The share download and verification go on.
+    std::function<void()> stop_work_gate;
+    if (stratum_server) {
+        auto* srv = stratum_server.get();
+        const bool require_peers = !testnet && !regtest;
+        const auto steady_sec = []() {
+            return static_cast<int64_t>(std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
+        };
+        auto last_contact = std::make_shared<int64_t>(steady_sec());
+        auto watch = std::make_shared<dgb::WorkGateWatch>();
+        stop_work_gate = dgb::start_periodic(ioc, dgb::kWorkGateTick,
+            [&p2p_node, &coin_p2p, srv, ws = work_source.get(), require_peers, steady_sec,
+             last_contact, watch]() {
+                const int64_t now = steady_sec();
+                if (coin_p2p && coin_p2p->is_handshake_complete())
+                    *last_contact = now;
+                dgb::WorkGateInputs in;
+                in.require_peers = require_peers;
+                in.sharechain_peers = p2p_node.get_peer_info_json().size();
+                in.coin_daemon = static_cast<bool>(coin_p2p);
+                in.coin_contact_age_sec = now - *last_contact;
+                const std::string reason = dgb::work_gate_reason(in);
+                ws->set_work_hold(reason);
+                if (watch->tick(reason, now) == dgb::WorkGateWatch::Action::drop_sessions) {
+                    const size_t n = srv->drop_sessions(srv->get_session_count());
+                    if (n)
+                        LOG_WARNING << "[DGB-STRATUM] closed " << n << " miner session(s): " << reason;
+                }
+            });
+    }
+
     // ── #82 REGTEST-GATED forced-won-share LIVE seam (decision (a), 2026-06-21) ──
     //
     // Synthesize ONE won share, insert it into the LIVE dgb::ShareTracker chain,
@@ -2817,6 +2854,7 @@ int run_node(const core::CoinParams& params, bool testnet,
     // declared first, so it would otherwise outlive them).
     if (found_block_report) *found_block_report = nullptr;  // #995: unbind before mi dies
     if (stop_job_push) stop_job_push();   // before the server it pushes to goes
+    if (stop_work_gate) stop_work_gate(); // it closes the server's sessions
     if (work_source) work_source->set_local_rate_fn(nullptr);   // it reads the server's rates
     if (work_source) work_source->set_node_rate_fn(nullptr);
     stratum_server.reset();

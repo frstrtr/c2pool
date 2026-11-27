@@ -334,6 +334,12 @@ public:
     /// header sync the template would be for an old height and prevhash.
     void set_tip_recent_sec(uint32_t sec) { tip_recent_sec_.store(sec); }
 
+    /// The stratum work gate (stratum_work_gate.hpp): a non-empty reason holds
+    /// all work (no template, so no job) and refuses mining.authorize with it;
+    /// empty serves work. Logged once per change.
+    void set_work_hold(const std::string& reason);
+    std::string work_hold() const;
+
     /// Dispatch one share-difficulty submission to the bound mint callback.
     /// The stage-4d mining_submit classify branch calls this on the
     /// "pow_hash <= share target" outcome. Returns the minted share hash, or a
@@ -488,6 +494,8 @@ private:
     mutable std::mutex          pplns_inputs_mutex_;
     PplnsInputsFn               pplns_inputs_fn_;
     std::atomic<uint32_t>       tip_recent_sec_{0};
+    mutable std::mutex          work_hold_mutex_;
+    std::string                 work_hold_;      // under work_hold_mutex_
     mutable std::atomic<int>    tip_state_{-1};   // last logged: 1 at tip, 0 behind
     mutable std::mutex          local_rate_mutex_;
     LocalRateFn                 local_rate_fn_;
