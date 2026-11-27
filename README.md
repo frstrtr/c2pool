@@ -974,7 +974,8 @@ share's version:
   shares).
 
 The merged coinbase c2pool builds (every chain in multiaddress mode: DOGE
-under LTC or DGB, NMC under BTC, the other LTC aux chains) ends with its
+under LTC, and under DGB once its payout provider lands; NMC under BTC; the
+other LTC aux chains) ends with its
 donation output, which takes the donation and the PPLNS rounding remainder
 (at least 1 satoshi). It pays one P2PKH key on every chain: script
 `76a914 20cb5c22b1e4d5947e5c112c7696b51ad9af3c61 88ac`, on DOGE

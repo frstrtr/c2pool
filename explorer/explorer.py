@@ -1094,6 +1094,10 @@ class ExplorerEngine:
         tag = cb.get("pool_tag", "")
         outs = block.get("_outputs_decoded", [])
         has_combined = any(o.get("donation_type") == "p2pool_combined" for o in outs)
+        # The single-key P2PKH donation: an aux-chain coinbase c2pool built
+        # (whatever its scriptSig tag), or a p2pool-dash DASH block. A pool
+        # block, but no V36 marker: the tag rules above are left as they are.
+        has_single = any(o.get("donation_type") == "c2pool_single" for o in outs)
         has_ref = any(o.get("type") == "p2pool_ref" for o in outs)
 
         if "c2pool" in tag.lower():
@@ -1117,6 +1121,8 @@ class ExplorerEngine:
             # Tag says p2pool but no combined/ref output → legacy V35.
             if "v36" not in tag.lower():
                 cb["pool_tag"] = "P2Pool v35"
+        if has_single:
+            cb["is_pool_block"] = True
 
         # Merged-mining parent (e.g. DOGE child → LTC parent) coinbase decode.
         parent_id = prof.get("merged_parent")

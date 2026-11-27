@@ -10820,7 +10820,27 @@ nlohmann::json MiningInterface::compute_current_merged_payouts()
             uint8_t merged_p2pkh_ver = ci.address_version ? ci.address_version : 0x1e;
             uint8_t merged_p2sh_ver  = ci.p2sh_version    ? ci.p2sh_version    : 0x16;
 
-            for (auto& [script, amount] : merged_payouts) {
+            // The aux coinbase pays every entry with its donation script or
+            // the old combined P2SH (a "donate"-mode share) as ONE output, to
+            // merged_donation_script(): shown as that one entry, its amount
+            // the sum, so each chain has a single donation row equal to the
+            // coinbase's donation output.
+            std::vector<std::pair<std::vector<unsigned char>, uint64_t>> merged_outputs;
+            merged_outputs.reserve(merged_payouts.size());
+            uint64_t aux_donation = 0;
+            bool has_aux_donation = false;
+            for (const auto& [script, amount] : merged_payouts) {
+                if (c2pool::merged::is_merged_donation_output(script)) {
+                    aux_donation += amount;
+                    has_aux_donation = true;
+                } else {
+                    merged_outputs.emplace_back(script, amount);
+                }
+            }
+            if (has_aux_donation)
+                merged_outputs.emplace_back(c2pool::merged::merged_donation_script(), aux_donation);
+
+            for (auto& [script, amount] : merged_outputs) {
                 // Donation: the aux coinbase's donation (merged_donation_script,
                 // the single P2PKH key) or the combined P2SH folded into it
                 // (is_merged_donation_output), P2PK (ends with OP_CHECKSIG), or

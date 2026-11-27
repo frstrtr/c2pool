@@ -59,8 +59,9 @@ inline constexpr std::array<uint8_t, 23> COMBINED_DONATION_SCRIPT = {
 // OP_CHECKSIG over hash160 20cb5c22b1e4d5947e5c112c7696b51ad9af3c61. Two users:
 //   - DASH: the share donation output (p2pool-dash data.py DONATION_SCRIPT,
 //     XdgF55wEHBRWwbuBniNYH4GvvaoYMgL84u); impl/dash/share_check.hpp.
-//   - every aux-chain coinbase c2pool builds (DOGE under LTC or DGB, NMC
-//     under BTC, the other LTC aux chains): its always-last donation output
+//   - every aux-chain coinbase c2pool builds (DOGE under LTC, and under DGB
+//     once its payout provider lands; NMC under BTC; the other LTC aux
+//     chains): its always-last donation output
 //     and the PPLNS remainder, through c2pool::merged::merged_donation_script()
 //     (c2pool/merged/merged_donation.hpp). The same bytes on every chain: on
 //     DOGE D88Vn6Dyct7DKfVCfR3syHkjyNx9gEyyiv (mainnet) and
