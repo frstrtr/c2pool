@@ -165,6 +165,8 @@ TEST(RedistributeType, WithoutTheFeeDrawTheMinersOwnTypeIsKept)
 // exactly that payout and donation (ShareCreationParams), whatever the login
 // is by the time the miner submits.
 namespace {
+// The donation script on a merged chain (a P2SH owner's merged half).
+const std::vector<unsigned char> kMergedDonation = {0xa9, 0x14, 0x8c, 0x62, 0x72, 0x87};
 struct SplitRig : Rig {
     std::optional<std::optional<uint16_t>> donation;   // the created share's donation (outer: created)
     SplitRig()
@@ -190,7 +192,7 @@ TEST(RedistributeSplit, AnUnusableLoginMintsTheOwnerWithTheSplitDonation)
         SplitRig r;
         // the old --redistribute pick lands elsewhere: split takes its place
         r.mi.set_redistribute_fn([] { return std::pair<std::string, uint8_t>{hex20(0x07), 0}; });
-        ASSERT_TRUE(r.mi.set_split_owner(owner, {}));
+        ASSERT_TRUE(r.mi.set_split_owner(owner, {}, kMergedDonation));
         EXPECT_TRUE(r.mi.has_split_owner());
         // no usable address: decided at submit (a job without a payout)
         r.submit("not-an-address");
@@ -215,7 +217,7 @@ TEST(RedistributeSplit, TheJobDecisionReturnsTheSplitDonation)
 {
     MiningInterface mi{true};
     const auto owner = p2pkh(0x0a);
-    ASSERT_TRUE(mi.set_split_owner(owner, {}));
+    ASSERT_TRUE(mi.set_split_owner(owner, {}, kMergedDonation));
     std::vector<std::pair<uint32_t, std::vector<unsigned char>>> merged;
     std::vector<unsigned char> payout;
     auto d = mi.decide_job_payout(payout, merged);
@@ -251,7 +253,7 @@ TEST(RedistributeSplit, TheJobBuiltBeforeTheLoginMintsTheOwnerWithTheSplitDonati
 {
     SplitRig r;
     const auto owner = p2pkh(0x0a);
-    ASSERT_TRUE(r.mi.set_split_owner(owner, {}));
+    ASSERT_TRUE(r.mi.set_split_owner(owner, {}, kMergedDonation));
     // what send_notify_work did for that job: the decision on an empty payout
     std::vector<unsigned char> payout;
     std::vector<std::pair<uint32_t, std::vector<unsigned char>>> merged;
@@ -277,7 +279,7 @@ TEST(RedistributeSplit, WithoutAnOwnerTheOldRedistributionStays)
     for (const auto& bad : {std::vector<unsigned char>{}, p2wsh, p2pkh(0x00)}) {
         SplitRig r;
         r.mi.set_redistribute_fn([] { return std::pair<std::string, uint8_t>{hex20(0x07), 0}; });
-        EXPECT_FALSE(r.mi.set_split_owner(bad, {}));
+        EXPECT_FALSE(r.mi.set_split_owner(bad, {}, kMergedDonation));
         EXPECT_FALSE(r.mi.has_split_owner());
         std::vector<unsigned char> payout;
         std::vector<std::pair<uint32_t, std::vector<unsigned char>>> merged;
@@ -291,8 +293,8 @@ TEST(RedistributeSplit, WithoutAnOwnerTheOldRedistributionStays)
     }
     // set, then cleared by an unusable owner: off again
     SplitRig r;
-    ASSERT_TRUE(r.mi.set_split_owner(p2pkh(0x0a), {}));
-    EXPECT_FALSE(r.mi.set_split_owner({}, {}));
+    ASSERT_TRUE(r.mi.set_split_owner(p2pkh(0x0a), {}, kMergedDonation));
+    EXPECT_FALSE(r.mi.set_split_owner({}, {}, kMergedDonation));
     EXPECT_FALSE(r.mi.has_split_owner());
 }
 
@@ -313,4 +315,66 @@ TEST(RedistributeSplit, TheOldModesCarryTheNodesDonation)
     EXPECT_EQ(*r.created, p2pkh(0x0d));
     ASSERT_TRUE(r.donation.has_value());
     EXPECT_FALSE(r.donation->has_value());
+}
+
+// The share donation of a job, in one place for the job's ref_hash and the
+// share minted from it: the job's own (a split job), else --give-author's,
+// round(65535 * pct / 100). A split job keeps exactly 32768 whatever
+// --give-author says (above 50% too).
+TEST(RedistributeSplit, TheJobDonationHelperPinsBothSides)
+{
+    EXPECT_EQ(core::job_share_donation(std::nullopt, 0.1), 66);
+    EXPECT_EQ(core::job_share_donation(std::nullopt, 2.5), 1638);
+    EXPECT_EQ(core::job_share_donation(std::nullopt, 0.0), 0);
+    EXPECT_EQ(core::job_share_donation(std::nullopt, 100.0), 65535);
+    EXPECT_EQ(core::job_share_donation(core::kSplitShareDonation, 0.1), 32768);
+    EXPECT_EQ(core::job_share_donation(core::kSplitShareDonation, 60.0), 32768);
+    EXPECT_EQ(core::job_share_donation(uint16_t(77), 0.1), 77);
+    EXPECT_DOUBLE_EQ(core::job_share_donation_pct(std::nullopt, 0.1), 0.1);
+    EXPECT_DOUBLE_EQ(core::job_share_donation_pct(core::kSplitShareDonation, 0.1), 32768 * 100.0 / 65535.0);
+}
+
+// A P2SH owner: its key is not converted to a merged chain (a same-hash P2SH
+// on a chain without segwit), so the split needs the merged donation script
+// for those chains; without one the owner is refused.
+TEST(RedistributeSplit, AP2shOwnerNeedsTheMergedDonationScript)
+{
+    MiningInterface mi{true};
+    EXPECT_FALSE(mi.set_split_owner(p2sh(0x0b), {}, {}));
+    EXPECT_FALSE(mi.has_split_owner());
+    EXPECT_TRUE(mi.set_split_owner(p2sh(0x0b), {}, kMergedDonation));
+    EXPECT_TRUE(mi.has_split_owner());
+    EXPECT_TRUE(mi.set_split_owner(p2pkh(0x0a), {}, {})) << "a P2PKH owner's key is converted";
+    EXPECT_TRUE(mi.set_split_owner(p2wpkh(0x0c), {}, {})) << "a P2WPKH owner's key is converted (P2PKH)";
+}
+
+// p2pool's case 4 for a P2WSH / P2TR login with a DOGE address is decided at
+// the login (core::merged_addr::resolve_merged_login: the stratum session
+// hands the DOGE address's key as the job's payout). That payout is one a
+// share carries: the job keeps it with the node's donation, never the split
+// (owner and dev get nothing from this case). The merged entries stay. A
+// P2WSH / P2TR payout itself (no DOGE address) is the split's; the parent
+// payout is never taken from a merged chain's script here.
+TEST(RedistributeSplit, TheDogeKeyPayoutOfAnUncarriedLoginIsNotSplit)
+{
+    MiningInterface mi{true};
+    ASSERT_TRUE(mi.set_split_owner(p2pkh(0x0a), {}, kMergedDonation));
+    for (const auto& doge : {p2pkh(0x21), p2sh(0x22)}) {
+        std::vector<unsigned char> payout = doge;
+        std::vector<std::pair<uint32_t, std::vector<unsigned char>>> merged = {{98, doge}};
+        EXPECT_FALSE(mi.decide_job_payout(payout, merged).has_value()) << "the node's donation, not 32768";
+        EXPECT_EQ(payout, doge);
+        EXPECT_EQ(merged, (std::vector<std::pair<uint32_t, std::vector<unsigned char>>>{{98, doge}}));
+    }
+    std::vector<unsigned char> p2wsh{0x00, 0x20}, p2tr{0x51, 0x20};
+    p2wsh.insert(p2wsh.end(), 32, 0x43);
+    p2tr.insert(p2tr.end(), 32, 0x44);
+    for (const auto& uncarried : {p2wsh, p2tr}) {
+        std::vector<unsigned char> payout = uncarried;
+        std::vector<std::pair<uint32_t, std::vector<unsigned char>>> merged;
+        const auto d = mi.decide_job_payout(payout, merged);
+        ASSERT_TRUE(d.has_value());
+        EXPECT_EQ(*d, 32768);
+        EXPECT_EQ(payout, p2pkh(0x0a));
+    }
 }

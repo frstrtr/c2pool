@@ -243,6 +243,10 @@ inline uint16_t merged_p2p_port(const std::string& symbol, bool embedded_doge, u
 ///      is warned about: if segwit-wrapped, it is anyone-can-spend on a chain
 ///      without segwit once its redeem script is public);
 ///   P3 else (a P2WSH/P2TR operator address) the pool donation script.
+/// `p2sh_key_pays_donation` (the --redistribute split shares): a P2SH
+/// operator key is not converted at P2 (a same-hash P2SH on a chain without
+/// segwit is anyone-can-spend once a segwit-wrapped redeem script is public):
+/// those shares' merged half goes to the donation script, with a warning.
 struct OperatorMergedScript {
     std::vector<unsigned char> script;
     std::string source;
@@ -253,7 +257,8 @@ inline OperatorMergedScript resolve_operator_merged_script(const std::string& sy
                                                            const std::string& node_owner_address,
                                                            const std::string& node_owner_merged_address,
                                                            const std::string& merged_payout_address,
-                                                           const std::vector<unsigned char>& donation_script)
+                                                           const std::vector<unsigned char>& donation_script,
+                                                           bool p2sh_key_pays_donation = false)
 {
     OperatorMergedScript r;
     std::string up = symbol;
@@ -279,6 +284,17 @@ inline OperatorMergedScript resolve_operator_merged_script(const std::string& sy
     }
     std::string atype;
     const auto h160 = core::address_to_hash160(node_owner_address, atype);
+    if (h160.size() == 40 && atype == "p2sh" && p2sh_key_pays_donation) {
+        r.script = donation_script;
+        r.source = "donation script";
+        if (r.warning.empty())
+            r.warning = "the --node-owner-address is P2SH, not converted for the split shares: their " + up
+                        + " half goes to the donation; set "
+                        + (up == "DOGE" ? std::string("--node-owner-merged-address")
+                                        : "--merged-payout-address " + up + ":<address>")
+                        + " to be paid there";
+        return r;
+    }
     if (h160.size() == 40 && (atype == "p2pkh" || atype == "p2wpkh" || atype == "p2sh")) {
         r.script = core::hash160_to_merged_script(h160, atype);
         r.source = "--node-owner-address key";

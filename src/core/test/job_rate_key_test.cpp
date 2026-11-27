@@ -101,6 +101,7 @@ struct Rig {
     MiningInterface mi{/*testnet=*/true};
     std::vector<unsigned char> seen_payout;
     PayoutKey seen_rate_key{};
+    std::optional<uint16_t> seen_donation;   // the donation the ref_hash commits to
     Rig()
     {
         mi.set_coin_node(&ltc);
@@ -113,9 +114,10 @@ struct Rig {
                                   uint64_t, uint32_t, uint32_t, bool, const std::string&, const uint256&,
                                   const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>&,
                                   const std::vector<uint256>&,
-                                  const std::optional<uint16_t>&) {
+                                  const std::optional<uint16_t>& donation) {
             seen_payout = payout;
             seen_rate_key = rate_key;
+            seen_donation = donation;
             MiningInterface::RefHashResult r;
             r.ref_hash.SetHex(std::string(64, '5'));
             r.bits = 0x207fffff;
@@ -129,10 +131,10 @@ struct Rig {
     {
         auto payout = login_script;
         std::vector<std::pair<uint32_t, std::vector<unsigned char>>> merged;
-        mi.decide_job_payout(payout, merged);
+        const auto donation = mi.decide_job_payout(payout, merged);
         uint256 prev;
         prev.SetHex("01");
-        const auto cbr = mi.build_connection_coinbase_for(login, prev, "aabbccdd", payout, merged);
+        const auto cbr = mi.build_connection_coinbase_for(login, prev, "aabbccdd", payout, merged, donation);
         EXPECT_FALSE(cbr.held);
         EXPECT_FALSE(cbr.coinb1.empty());
         return payout;
@@ -209,4 +211,21 @@ TEST(PoolShareGate, TheJobsOwnBitsNotTheLastJobBuilt)
     EXPECT_EQ(core::stratum::pool_share_bits(easy, hard), easy);
     EXPECT_EQ(core::stratum::pool_share_bits(hard, easy), hard);
     EXPECT_EQ(core::stratum::pool_share_bits(0, hard), hard) << "a job without frozen bits: the live ones";
+}
+
+// --redistribute split: the job's donation reaches the ref_hash the coinbase
+// commits to (decide_job_payout -> build_connection_coinbase_for ->
+// ref_hash_fn), so the share minted from the job carries it; a plain job
+// commits to the node's (none here).
+TEST(NodeFeeShareTarget, ASplitJobCommitsItsRefHashToTheSplitDonation)
+{
+    Rig r;
+    const std::vector<unsigned char> don = {0xa9, 0x14, 0x8c, 0x62, 0x72, 0x87};
+    ASSERT_TRUE(r.mi.set_split_owner(p2pkh(0x0e), {}, don));
+    EXPECT_EQ(r.job(PayoutKey{}, {}), p2pkh(0x0e)) << "an empty login: the owner";
+    ASSERT_TRUE(r.seen_donation.has_value()) << "the split donation reached ref_hash_fn";
+    EXPECT_EQ(*r.seen_donation, 32768);
+    EXPECT_EQ(r.seen_payout, p2pkh(0x0e));
+    EXPECT_EQ(r.job(key_of(0x0a), p2pkh(0x0a)), p2pkh(0x0a));
+    EXPECT_FALSE(r.seen_donation.has_value()) << "a miner's job: the node's donation";
 }

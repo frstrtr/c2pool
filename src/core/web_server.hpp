@@ -934,10 +934,14 @@ public:
     // (P2PKH / P2SH / P2WPKH) with core::kSplitShareDonation as its shares'
     // donation, and, for every merged chain the job names no address for,
     // the owner's script there (`merged_scripts` by chain id, else the
-    // owner's key converted). It replaces set_redistribute_fn for those
-    // jobs. An empty or unusable `script` turns it off (returns false).
+    // owner's key converted: P2PKH and P2WPKH as P2PKH; a P2SH owner's key
+    // is not converted, that chain's half goes to `merged_donation_script`).
+    // It replaces set_redistribute_fn for those jobs. An empty or unusable
+    // `script`, or a P2SH one without a merged donation script, turns it off
+    // (returns false).
     bool set_split_owner(const std::vector<unsigned char>& script,
-                         std::map<uint32_t, std::vector<unsigned char>> merged_scripts);
+                         std::map<uint32_t, std::vector<unsigned char>> merged_scripts,
+                         std::vector<unsigned char> merged_donation_script);
     bool has_split_owner() const {
         std::lock_guard<std::mutex> l(m_redistribute_mu);
         return !m_split_owner_script.empty();
@@ -2569,6 +2573,7 @@ private:
     // --redistribute split: the node owner's parent script and merged scripts.
     std::vector<unsigned char> m_split_owner_script;
     std::map<uint32_t, std::vector<unsigned char>> m_split_owner_merged_scripts;
+    std::vector<unsigned char> m_split_owner_merged_floor;   // a merged chain without a script above
     mutable std::mutex m_redistribute_mu;   // m_redistribute_fn, m_address_fallback_fn, m_split_owner_*
     std::vector<unsigned char> m_donation_script;   // protocol donation scriptPubKey
     std::function<double()> m_stratum_hashrate_fn;  // callback to get stratum total hashrate

@@ -506,19 +506,29 @@ std::vector<unsigned char> hash160_hex_script(const std::string& h160, uint8_t t
 // Deciding this at job time is what makes the share's pubkey, donation and
 // merged addresses those its coinbase's ref_hash committed to.
 bool MiningInterface::set_split_owner(const std::vector<unsigned char>& script,
-                                      std::map<uint32_t, std::vector<unsigned char>> merged_scripts)
+                                      std::map<uint32_t, std::vector<unsigned char>> merged_scripts,
+                                      std::vector<unsigned char> merged_donation_script)
 {
     uint8_t type = 0;
     const std::string h160 = script_hash160_hex(script, type);
-    const bool usable = h160.size() == 40 && h160 != std::string(40, '0');
+    // A merged chain the job names no address for: the owner's key converted
+    // (P2PKH and P2WPKH as P2PKH); a P2SH key is not converted (a same-hash
+    // P2SH on a chain without segwit is anyone-can-spend once a
+    // segwit-wrapped redeem script is public): the donation.
+    std::vector<unsigned char> floor;
+    if (h160.size() == 40)
+        floor = type == 2 ? std::move(merged_donation_script) : core::hash160_to_merged_script(h160, "p2pkh");
+    const bool usable = h160.size() == 40 && h160 != std::string(40, '0') && !floor.empty();
     std::lock_guard<std::mutex> l(m_redistribute_mu);
     if (!usable) {
         m_split_owner_script.clear();
         m_split_owner_merged_scripts.clear();
+        m_split_owner_merged_floor.clear();
         return false;
     }
     m_split_owner_script = script;
     m_split_owner_merged_scripts = std::move(merged_scripts);
+    m_split_owner_merged_floor = std::move(floor);
     return true;
 }
 
@@ -549,24 +559,27 @@ std::optional<uint16_t> MiningInterface::decide_job_payout(
         address_fallback_fn_t fallback;
         std::vector<unsigned char> split_owner;
         std::map<uint32_t, std::vector<unsigned char>> split_merged;
+        std::vector<unsigned char> split_floor;
         {
             std::lock_guard<std::mutex> l(m_redistribute_mu);
             redistribute = m_redistribute_fn;
             fallback = m_address_fallback_fn;
             split_owner = m_split_owner_script;
             split_merged = m_split_owner_merged_scripts;
+            split_floor = m_split_owner_merged_floor;
         }
         // --redistribute split: the node owner, half of the share's weight
         // to the donation. The merged chains the job names an address for
         // keep it; every other configured chain gets the owner's script
-        // there (its merged address, else its key converted: P2SH stays
-        // P2SH, else P2PKH), written into the share (Tier 1).
+        // there (its merged address, else its key converted, P2PKH; a P2SH
+        // key is not converted: the donation; set_split_owner), written into
+        // the share (Tier 1).
         uint8_t owner_type = 0;
         const std::string owner_h160 = script_hash160_hex(split_owner, owner_type);
         if (owner_h160.size() == 40) {
             payout_script = split_owner;
             if (m_mm_manager) {
-                const auto floor = core::hash160_to_merged_script(owner_h160, owner_type == 2 ? "p2sh" : "p2pkh");
+                const auto& floor = split_floor;
                 for (const auto& ci : m_mm_manager->get_chain_infos()) {
                     const bool has = std::any_of(merged.begin(), merged.end(),
                                                  [&](const auto& e) { return e.first == ci.chain_id; });

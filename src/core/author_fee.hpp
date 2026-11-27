@@ -9,7 +9,9 @@
 #ifndef C2POOL_CORE_AUTHOR_FEE_HPP
 #define C2POOL_CORE_AUTHOR_FEE_HPP
 
+#include <cmath>
 #include <cstdint>
+#include <optional>
 
 namespace core {
 
@@ -35,6 +37,24 @@ inline uint16_t donation_percent_to_u16(double pct)
 // number: 32768 to the donation, 32767 to the owner). It replaces the node's
 // --give-author donation on such a share, it is not added to it.
 constexpr uint16_t kSplitShareDonation = 32768;
+
+// The donation of a share minted from a job: the job's own when its payout
+// decision set one (a split job, kSplitShareDonation), else --give-author's,
+// round(65535 * pct / 100) as the LTC lane computes it. The job's ref_hash
+// and the share minted from the job both take it from here: they must agree
+// (the ref_hash commits to the share's donation).
+inline uint16_t job_share_donation(const std::optional<uint16_t>& job_donation, double give_author_pct)
+{
+    return job_donation ? *job_donation
+                        : static_cast<uint16_t>(std::round(65535.0 * give_author_pct / 100.0));
+}
+
+// job_share_donation as a percent: what the job's share target (the dust cap
+// on the miner's expected payout) is sized with.
+inline double job_share_donation_pct(const std::optional<uint16_t>& job_donation, double give_author_pct)
+{
+    return job_donation ? *job_donation * 100.0 / 65535.0 : give_author_pct;
+}
 
 } // namespace core
 

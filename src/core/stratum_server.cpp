@@ -1371,17 +1371,31 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
             }
             if (!payout_unusable_ && acfg.redistribute_unusable_logins && !username_.empty()) {
                 // A parent address a share cannot carry (P2WSH / P2TR: a V36
-                // share has a 20-byte payout hash): the work source
-                // redistributes its parent payout (decide_job_payout).
+                // share has a 20-byte payout hash). With a DOGE address given
+                // for it, p2pool's case 4: the parent payout is that DOGE
+                // address's key (parent_script, resolve_merged_login), with
+                // the node's donation, and the DOGE address is paid as given:
+                // the miner is paid on both chains. Without one the work
+                // source redistributes the payout (decide_job_payout).
                 const auto spk = address_to_script(username_);
                 const bool carried = (spk.size() == 25 && spk[0] == 0x76) || (spk.size() == 23 && spk[0] == 0xa9)
                                      || (spk.size() == 22 && spk[0] == 0x00 && spk[1] == 0x14);
-                if (!carried) {
+                if (!carried && !parent_script.empty()) {
+                    payout_unusable_ = true;
+                    parent_script_ = parent_script;
+                    payout_warning_ = "P2WSH/P2TR address → parent paid to the DOGE address's key";
+                    LOG_WARNING << "[Stratum] " << username_ << (worker_name_.empty() ? "" : "." + worker_name_)
+                                << ": a P2WSH/P2TR address cannot be carried by a V36 share (20-byte payout "
+                                   "hash): its LTC payout is paid to the key of the DOGE address given with it "
+                                   "(p2pool case 4); its DOGE payout is that address";
+                } else if (!carried) {
                     payout_warning_ = "P2WSH/P2TR address → redistributed";
                     LOG_WARNING << "[Stratum] " << username_ << (worker_name_.empty() ? "" : "." + worker_name_)
                                 << ": a P2WSH/P2TR address cannot be carried by a V36 share (20-byte payout "
-                                   "hash): its LTC payout is redistributed (--redistribute); use a P2PKH or "
-                                   "P2WPKH address";
+                                   "hash) and no DOGE address is given with it: its payout is redistributed "
+                                   "by --redistribute (the default, split: half to the node owner, half to the "
+                                   "donation), merged chains included; use a P2PKH or P2WPKH address, or give "
+                                   "a DOGE address (LTC_ADDRESS,DOGE_ADDRESS) to be paid on both chains";
                 } else if (p2sh_derived) {
                     payout_warning_ = "P2SH address: if segwit-wrapped, give a DOGE address";
                 }

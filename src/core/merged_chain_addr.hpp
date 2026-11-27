@@ -41,6 +41,9 @@
 namespace core {
 namespace merged_addr {
 
+// DOGE's merged-mining chain id (p2pool's case 4 names DOGE).
+inline constexpr uint32_t kDogeChainId = 98;
+
 struct ChainAddrInfo {
     uint32_t chain_id;
     std::vector<std::string> hrps;       // identification (mainnet and testnet)
@@ -126,7 +129,10 @@ struct LoginResolution {
     bool usable_primary{false};
     // Case 4 (p2pool work.py): an unusable primary with a valid DOGE address
     // as the second one: the parent payout is that address's hash160 (P2SH
-    // stays P2SH).
+    // stays P2SH). Also a parent address a share cannot carry (P2WSH / P2TR:
+    // a 32-byte witness program) with a DOGE address given for it (the comma
+    // or slash form, mining.set_merged_addresses): the miner is paid on both
+    // chains, with the node's donation.
     std::vector<unsigned char> parent_script;
     // A P2SH primary's key was auto-derived for some configured chain (paid
     // as P2SH; unsafe if segwit-wrapped): shown with the worker.
@@ -306,6 +312,26 @@ inline LoginResolution resolve_merged_login(std::string primary, const std::stri
                                      "address (P2SH-P2WPKH/P2WSH, e.g. M...), give your DOGE address "
                                      "explicitly (LTC_ADDRESS,DOGE_ADDRESS); on DOGE (no segwit) such an "
                                      "output becomes spendable by anyone once the redeem script is public");
+            }
+        }
+        // Case 4 for a parent address a share cannot carry (P2WSH / P2TR:
+        // a share's payout is a 20-byte hash) with a DOGE address given for
+        // it (no address is auto-derived from such a primary, so any DOGE
+        // entry is the miner's own): the parent payout is the DOGE address's
+        // key, P2PKH or P2SH, as for an unusable primary.
+        const auto spk = core::address_to_script(primary);
+        const bool carried = (spk.size() == 25 && spk[0] == 0x76) || (spk.size() == 23 && spk[0] == 0xa9)
+                             || (spk.size() == 22 && spk[0] == 0x00 && spk[1] == 0x14);
+        const auto* doge = find_chain(table, kDogeChainId);
+        const auto it = r.addresses.find(kDogeChainId);
+        if (!carried && is_parent(primary) && doge && configured(kDogeChainId) && it != r.addresses.end()) {
+            std::vector<unsigned char> script;
+            if (core::classify_address_for_coin(it->second, doge->p2pkh, doge->p2sh, doge->own_hrps, script)
+                    == core::AddressCoinMatch::Own
+                && (script.size() == 25 || script.size() == 23)) {
+                r.parent_script = script;   // P2PKH or P2SH of the DOGE address's hash160
+                r.notes.push_back("Case 4: primary " + primary + " cannot be carried by a share (a 32-byte witness"
+                                  " program); the parent payout uses the DOGE address " + it->second + "'s key");
             }
         }
     } else if (!primary.empty()) {

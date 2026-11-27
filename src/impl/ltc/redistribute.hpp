@@ -29,6 +29,7 @@
 #include "share_tracker.hpp"
 #include "share_check.hpp"
 
+#include <core/address_utils.hpp>
 #include <core/log.hpp>
 #include <core/target_utils.hpp>
 
@@ -135,12 +136,28 @@ inline bool spec_selects_split(const std::vector<HybridWeight>& weights)
                        [](const HybridWeight& w) { return w.mode == RedistributeMode::SPLIT; });
 }
 
-// The Redistributor's weights under split: the old pplns behaviour, used only
-// for a node without an owner address (core::MiningInterface::set_split_owner
-// failed), whose owner half cannot be paid.
-inline std::vector<HybridWeight> split_fallback_weights()
+// The Redistributor's weights for a spec: its terms other than split. A node
+// with an owner set runs split for every unattributable job
+// (core::MiningInterface::set_split_owner) and never asks the Redistributor;
+// on a node without one (the owner half cannot be paid) these are what runs:
+// a hybrid keeps its other terms and their weights, split alone is the old
+// pplns. A spec without split is returned unchanged.
+inline std::vector<HybridWeight> split_fallback_weights(const std::vector<HybridWeight>& weights)
 {
-    return {{RedistributeMode::PPLNS, 100}};
+    std::vector<HybridWeight> out;
+    for (const auto& w : weights)
+        if (w.mode != RedistributeMode::SPLIT)
+            out.push_back(w);
+    if (out.empty())
+        out.push_back({RedistributeMode::PPLNS, 100});
+    return out;
+}
+
+// The node owner --redistribute split pays: --node-owner-address, else
+// --address (the node fee's owner).
+inline std::string split_owner_address(const std::string& node_owner_address, const std::string& payout_address)
+{
+    return !node_owner_address.empty() ? node_owner_address : payout_address;
 }
 
 // Backward-compatible: returns the primary mode (first/only entry)
@@ -232,6 +249,47 @@ inline bool script_pubkey_of(const std::vector<unsigned char>& script, uint160& 
         return true;
     }
     return false;
+}
+
+// --redistribute split at startup: whether the spec selects it, the owner
+// address it pays and whether the mining interface took that owner (split
+// then runs; otherwise the Redistributor's split_fallback_weights do).
+struct SplitOwnerSetup
+{
+    bool selected{false};    // the spec names split
+    bool hybrid{false};      // ... among other terms (split runs alone)
+    std::string owner;       // the owner address tried
+    bool owner_set{false};   // the mining interface took it
+};
+
+// The owner is split_owner_address(); it must be an address of the parent
+// coin (`acceptance`) whose script a share carries (P2PKH, P2SH, P2WPKH).
+// `merged_scripts(owner)` gives the owner's script per merged chain id;
+// `merged_donation_script` is the donation on a merged chain (a P2SH owner's
+// merged half goes there, set_split_owner). A spec without split sets
+// nothing.
+template <class MiningInterfaceT, class MergedScriptsFn>
+SplitOwnerSetup setup_split_owner(MiningInterfaceT& mi, const std::string& spec,
+                                  const std::string& node_owner_address, const std::string& payout_address,
+                                  const core::CoinAddressAcceptance& acceptance, MergedScriptsFn&& merged_scripts,
+                                  const std::vector<unsigned char>& merged_donation_script)
+{
+    SplitOwnerSetup r;
+    const auto weights = parse_redistribute_spec(spec);
+    r.selected = spec_selects_split(weights);
+    if (!r.selected)
+        return r;
+    r.hybrid = weights.size() > 1;
+    r.owner = split_owner_address(node_owner_address, payout_address);
+    std::vector<unsigned char> script;
+    uint160 hash;
+    uint8_t type = 0;
+    if (r.owner.empty()
+        || core::classify_address_for_coin(r.owner, acceptance, script) != core::AddressCoinMatch::Own
+        || !script_pubkey_of(script, hash, type))
+        return r;
+    r.owner_set = mi.set_split_owner(script, merged_scripts(r.owner), merged_donation_script);
+    return r;
 }
 
 class Redistributor
@@ -368,8 +426,8 @@ private:
         case RedistributeMode::BOOST:
             return pick_boost(tracker, best);
 
-        // SPLIT is decided by the MiningInterface (set_split_owner); here,
-        // with no owner, it is the pplns fallback (split_fallback_weights).
+        // SPLIT is decided by the MiningInterface (set_split_owner); the
+        // Redistributor runs split_fallback_weights, which hold no SPLIT.
         case RedistributeMode::SPLIT:
         case RedistributeMode::PPLNS:
         default:
