@@ -29,6 +29,7 @@
 #include <btclibs/base58.h>
 #include <btclibs/bech32.h>
 #include <core/address_utils.hpp>
+#include <impl/dgb/v35_address.hpp>   // v35_address_to_script: the python network's V34/V35 address rule
 
 #include <algorithm>
 #include <array>
@@ -524,6 +525,18 @@ uint256 share_init_verify(const ShareT& share, const core::CoinParams& params, b
     if (share.m_coinbase.size() < 2 || share.m_coinbase.size() > 100)
         throw std::invalid_argument("bad coinbase size");
 
+    // V34/V35: the python network turns the share's address into its payout
+    // script or rejects the share (p2pool-dgb-scrypt Share.__init__:
+    // address_to_script2); this node rejects exactly those (review 713dc77a0
+    // #7: before, an undecodable or foreign address fell back to raw bytes, a
+    // dgb1p bech32m address was accepted, an uppercase one misread).
+    if constexpr (requires { share.m_address; })
+    {
+        const std::string addr(share.m_address.m_data.begin(), share.m_address.m_data.end());
+        if (!v35_address_to_script(addr, v35_address_net(PoolConfig::is_testnet)))
+            throw std::invalid_argument("share address is not payable on this network");
+    }
+
     if (share.m_merkle_link.m_branch.size() > 16)
         throw std::invalid_argument("merkle branch too long");
 
@@ -949,6 +962,12 @@ inline std::vector<unsigned char> get_share_script(const auto* obj)
         // or "dgb", so it read an "S..." as a P2PKH and a "dgb1..." as nothing,
         // and every such share's generation transaction came out wrong.
         std::string addr_str(obj->m_address.m_data.begin(), obj->m_address.m_data.end());
+        // The python network's own rule, exactly (v35_address.hpp): D/S
+        // base58 with DGB's versions, BIP173 bech32 read with padding_bugfix.
+        // A share whose address it rejects is rejected at share_init_verify;
+        // the fallbacks below only ever see such unverified shares.
+        if (auto oracle = v35_address_to_script(addr_str, v35_address_net(PoolConfig::is_testnet)))
+            return *oracle;
         {
             core::CoinAddressAcceptance net = address_acceptance(PoolConfig::is_testnet, false);
             if (PoolConfig::is_testnet)   // regtest: testnet base58 bytes, its own HRP
