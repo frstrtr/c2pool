@@ -252,11 +252,12 @@ TEST(AnalyticsTag, PageWithoutBodyGetsHeadOnlyConsentDenied)
     ASSERT_TRUE(core::inject_analytics_tag(html, kId));
     EXPECT_EQ(count(html, core::analytics_head_snippet(kId, false)), 1u);
     EXPECT_EQ(html.find(std::string(core::kAnalyticsConsentMarker)), std::string::npos);
-    // No stored-choice restore without the bar: consent stays denied.
+    // No stored-choice restore without the bar: the start function (the only
+    // place that loads gtag.js or grants anything) is never called.
     EXPECT_EQ(html.find("localStorage"), std::string::npos);
-    EXPECT_EQ(html.find("'granted'"), std::string::npos);
-    EXPECT_NE(html.find("gtag('consent','default'"), std::string::npos);
-    EXPECT_EQ(html.find("c2poolGaStart();"), std::string::npos);   // nothing is ever sent
+    EXPECT_EQ(html.find("c2poolGaStart();"), std::string::npos);
+    EXPECT_EQ(html.find("<script async"), std::string::npos);
+    EXPECT_EQ(html.find("src=\"https://www.googletagmanager.com"), std::string::npos);
 }
 
 TEST(AnalyticsTag, UpperCaseTagsAndExistingGtag)
@@ -282,25 +283,39 @@ TEST(AnalyticsTag, ConsentDefaultDeniedBeforeConfig)
         const auto def = s.find(
             "gtag('consent','default',{analytics_storage:'denied',ad_storage:'denied',"
             "ad_user_data:'denied',ad_personalization:'denied'});");
-        const auto loader = s.find("<script async src=\"https://www.googletagmanager.com/gtag/js?id=" + kId
-                                   + "\" referrerpolicy=\"no-referrer\">");
+        // No external script tag: gtag.js is only created by the start function.
+        EXPECT_EQ(s.find("<script async"), std::string::npos);
+        EXPECT_EQ(s.find("<script src"), std::string::npos);
+        EXPECT_EQ(s.find("src=\""), std::string::npos);
+        EXPECT_EQ(count(s, "<script>"), 1u);
+        const auto start = s.find("function c2poolGaStart(){");
+        const auto loader = s.find("var g=document.createElement('script');\ng.async=true;\n"
+                                   "g.setAttribute('referrerpolicy','no-referrer');\n"
+                                   "g.src='https://www.googletagmanager.com/gtag/js?id=" + kId + "';\n"
+                                   "(document.head||document.documentElement).appendChild(g);");
+        const auto upd = s.find("gtag('consent','update',{analytics_storage:'granted'});");
         const auto config = s.find("gtag('config','" + kId + "',{send_page_view:false,");
+        ASSERT_NE(start, std::string::npos);
         ASSERT_NE(def, std::string::npos);
         ASSERT_NE(loader, std::string::npos);
+        ASSERT_NE(upd, std::string::npos);
         ASSERT_NE(config, std::string::npos);
-        EXPECT_LT(def, loader);
-        EXPECT_LT(loader, config);
+        // All of it inside the start function: the script, then default, grant, config.
+        EXPECT_LT(start, loader);
+        EXPECT_LT(loader, def);
+        EXPECT_LT(def, upd);
+        EXPECT_LT(upd, config);
+        EXPECT_EQ(count(s, "createElement('script')"), 1u);
+        EXPECT_EQ(count(s, "googletagmanager.com"), 1u);
+        EXPECT_EQ(count(s, "gtag('consent','default'"), 1u);
         EXPECT_EQ(count(s, "gtag('config'"), 1u);
         EXPECT_EQ(count(s, "gtag('event'"), 1u);
-        // The config call and the page_view live only in the start function,
-        // which runs once consent is granted.
-        const auto start = s.find("function c2poolGaStart(){");
-        ASSERT_NE(start, std::string::npos);
-        EXPECT_LT(start, config);
+        // Before the start function only the stubs and the sanitizer.
+        EXPECT_EQ(s.substr(0, start).find("gtag("), s.substr(0, start).find("gtag(){"));
         if (restore) {
             const std::string restore_call =
                 "try{if(window.localStorage.getItem('c2pool_ga_consent')==='granted')"
-                "{gtag('consent','update',{analytics_storage:'granted'});c2poolGaStart();}}catch(e){}";
+                "{c2poolGaStart();}}catch(e){}";
             EXPECT_EQ(count(s, restore_call), 1u);
             EXPECT_EQ(count(s, "c2poolGaStart();"), 1u);   // the restore is the only call in <head>
         } else {
@@ -698,9 +713,10 @@ TEST(AnalyticsTag, SnippetSendsOnlySanitizedPageViewsAfterConsent)
               std::string::npos);
     // No request from the page carries its URL as a referrer.
     EXPECT_NE(all.find("<meta name=\"referrer\" content=\"no-referrer\">"), std::string::npos);
-    EXPECT_NE(all.find("referrerpolicy=\"no-referrer\""), std::string::npos);
+    EXPECT_NE(all.find("g.setAttribute('referrerpolicy','no-referrer');"), std::string::npos);
     // Accept starts it; nothing else does.
-    EXPECT_NE(all.find("if(typeof c2poolGaStart==='function'){c2poolGaStart();}"), std::string::npos);
+    EXPECT_NE(all.find("if(c==='granted'&&typeof c2poolGaStart==='function'){c2poolGaStart();}"),
+              std::string::npos);
     EXPECT_EQ(count(all, "c2poolGaStart();"), 2u);   // the restore and Accept
 }
 
@@ -717,7 +733,10 @@ bool have_node()
 
 // Runs every inline <script> of a page in one node vm context with a fake
 // location / document / localStorage and the consent bar, optionally clicks
-// a button, and prints the dataLayer (one JSON line per phase).
+// a button, and prints, one JSON line per phase: the dataLayer, every script
+// element the page created (and whether it was inserted), every network call
+// it tried (fetch / XMLHttpRequest / sendBeacon / Image), and how many
+// external <script src> tags the HTML itself has.
 const char* kNodeHarness = R"JS(
 const fs = require('fs'), vm = require('vm');
 const html = fs.readFileSync(process.argv[2], 'utf8');
@@ -726,30 +745,45 @@ const scripts = [];
 const re = /<script>([\s\S]*?)<\/script>/g;
 let m;
 while ((m = re.exec(html)) !== null) scripts.push(m[1]);
-function el(attrs) { return { style: {}, attrs: attrs || {}, getAttribute(k) { return this.attrs[k]; }, parentNode: null }; }
+const external = (html.match(/<script[^>]*\ssrc\s*=/gi) || []).length;
+const created = [], inserted = [], net = [];
+function el(tag, attrs) {
+  return { tagName: String(tag || 'div').toUpperCase(), style: {}, attrs: attrs || {},
+           getAttribute(k) { return this.attrs[k]; }, setAttribute(k, v) { this.attrs[k] = String(v); },
+           parentNode: null };
+}
 const body = { removeChild(c) { c.parentNode = null; }, insertBefore(n) { n.parentNode = body; } };
-const accept = el({ 'data-c2pool-ga': 'granted' }), decline = el({ 'data-c2pool-ga': 'denied' });
-const bar = el(); bar.parentNode = body; bar.offsetHeight = 40;
+const head = { appendChild(n) { inserted.push(n); n.parentNode = head; return n; } };
+const accept = el('button', { 'data-c2pool-ga': 'granted' }), decline = el('button', { 'data-c2pool-ga': 'denied' });
+const bar = el('div'); bar.parentNode = body; bar.offsetHeight = 40;
 bar.getElementsByTagName = () => [accept, decline];
 const store = {};
 if (sc.stored) store.c2pool_ga_consent = sc.stored;
 const ctx = {
   location: { origin: 'https://pool.example', pathname: sc.pathname, search: sc.search, hash: '#frag',
               href: 'https://pool.example' + sc.pathname + sc.search + '#frag' },
-  document: { referrer: sc.referrer, title: sc.title,
+  document: { referrer: sc.referrer, title: sc.title, head: head, documentElement: head,
               getElementById: (id) => (id === 'c2pool-ga-consent' ? bar : null),
-              createElement: () => el() },
+              createElement: (t) => { const e = el(t); if (e.tagName === 'SCRIPT') created.push(e); return e; } },
   localStorage: { getItem: (k) => (k in store ? store[k] : null), setItem: (k, v) => { store[k] = String(v); } },
+  fetch: () => { net.push('fetch'); return new Promise(() => {}); },
+  XMLHttpRequest: function () { net.push('xhr'); this.open = () => {}; this.send = () => {}; },
+  navigator: { sendBeacon: () => { net.push('beacon'); return true; } },
+  Image: function () { net.push('image'); },
   URL, Date, String,
 };
 ctx.window = ctx;
 vm.createContext(ctx);
 for (const s of scripts) vm.runInContext(s, ctx);
 const dump = (phase) => console.log(JSON.stringify({ phase, dataLayer: (ctx.dataLayer || []).map((a) => Array.from(a)),
-  bar: bar.style.display || '', barRemoved: bar.parentNode === null, stored: store.c2pool_ga_consent || null }));
+  bar: bar.style.display || '', barRemoved: bar.parentNode === null, stored: store.c2pool_ga_consent || null,
+  scripts: created.map((e) => ({ src: e.src || e.attrs.src || '', async: e.async === true,
+                                 referrerpolicy: e.attrs.referrerpolicy || null, inserted: inserted.includes(e) })),
+  inserted: inserted.length, net, external }));
 dump('load');
 if (sc.click === 'accept') { accept.onclick(); dump('click'); }
 if (sc.click === 'decline') { decline.onclick(); dump('click'); }
+if (sc.again) { ctx.c2poolGaStart(); ctx.c2poolGaStart(); dump('again'); }
 if (sc.paths) console.log(JSON.stringify({ phase: 'paths', out: sc.paths.map((p) => ctx.c2poolGaPath(p)) }));
 )JS";
 
@@ -761,6 +795,30 @@ std::vector<nlohmann::json> commands(const nlohmann::json& phase, const std::str
         if (c.is_array() && !c.empty() && c[0] == name)
             out.push_back(c);
     return out;
+}
+
+// No contact with Google in this phase: no script element, nothing inserted,
+// no network call, and the HTML has no external script tag.
+void expect_no_contact(const nlohmann::json& phase, const std::string& what)
+{
+    EXPECT_TRUE(phase["scripts"].empty()) << what << ": " << phase.dump();
+    EXPECT_EQ(phase["inserted"], 0) << what;
+    EXPECT_TRUE(phase["net"].empty()) << what;
+    EXPECT_EQ(phase["external"], 0) << what;
+    EXPECT_TRUE(phase["dataLayer"].empty()) << what << ": " << phase.dump();
+}
+
+// Exactly one gtag.js script element, inserted, async, no referrer.
+void expect_one_gtag_script(const nlohmann::json& phase, const std::string& id, const std::string& what)
+{
+    ASSERT_EQ(phase["scripts"].size(), 1u) << what << ": " << phase.dump();
+    EXPECT_EQ(phase["scripts"][0]["src"], "https://www.googletagmanager.com/gtag/js?id=" + id) << what;
+    EXPECT_EQ(phase["scripts"][0]["async"], true) << what;
+    EXPECT_EQ(phase["scripts"][0]["referrerpolicy"], "no-referrer") << what;
+    EXPECT_EQ(phase["scripts"][0]["inserted"], true) << what;
+    EXPECT_EQ(phase["inserted"], 1) << what;
+    EXPECT_TRUE(phase["net"].empty()) << what;   // the page itself makes no request
+    EXPECT_EQ(phase["external"], 0) << what;
 }
 
 }  // namespace
@@ -821,6 +879,7 @@ TEST(AnalyticsTag, SnippetUnderNodeSendsNoAddressAndNothingBeforeConsent)
         EXPECT_EQ(events[0][1], "page_view");
         EXPECT_EQ(events[0][2]["page_location"], "https://pool.example/miner_payouts/:addr");
         EXPECT_EQ(ph[0]["barRemoved"], true);
+        expect_one_gtag_script(ph[0], kId, "stored granted, at load");
         // Default denied comes first, the config only after the grant.
         const auto& dl = ph[0]["dataLayer"];
         std::size_t i_default = 99, i_update = 99, i_config = 99;
@@ -832,15 +891,23 @@ TEST(AnalyticsTag, SnippetUnderNodeSendsNoAddressAndNothingBeforeConsent)
         EXPECT_LT(i_default, i_update);
         EXPECT_LT(i_update, i_config);
     }
-    // A first visit: nothing is sent until Accept; Accept sends one clean page view.
+    // A first visit: no contact at all until Accept; Accept loads gtag.js once
+    // and sends one clean page view; starting again changes nothing.
     {
         const auto ph = run_page({{"pathname", "/miner.html"}, {"search", "?address=" + kAddr},
-                                  {"referrer", ""}, {"title", "Miner Stats - c2pool"}, {"click", "accept"}});
-        ASSERT_EQ(ph.size(), 2u);
+                                  {"referrer", ""}, {"title", "Miner Stats - c2pool"}, {"click", "accept"},
+                                  {"again", true}});
+        ASSERT_EQ(ph.size(), 3u);
         EXPECT_EQ(ph[0]["bar"], "flex");
-        EXPECT_TRUE(commands(ph[0], "config").empty());
-        EXPECT_TRUE(commands(ph[0], "event").empty());
-        EXPECT_EQ(commands(ph[0], "consent").size(), 1u);
+        expect_no_contact(ph[0], "first visit, before Accept");
+        expect_one_gtag_script(ph[1], kId, "after Accept");
+        expect_one_gtag_script(ph[2], kId, "after starting twice more");
+        EXPECT_EQ(commands(ph[2], "config").size(), 1u);
+        EXPECT_EQ(commands(ph[2], "event").size(), 1u);
+        const auto consent = commands(ph[1], "consent");
+        ASSERT_EQ(consent.size(), 2u);
+        EXPECT_EQ(consent[0][1], "default");
+        EXPECT_EQ(consent[1][1], "update");
         const auto config = commands(ph[1], "config");
         ASSERT_EQ(config.size(), 1u);
         EXPECT_EQ(config[0][2]["page_location"], "https://pool.example/miner.html");
@@ -849,19 +916,15 @@ TEST(AnalyticsTag, SnippetUnderNodeSendsNoAddressAndNothingBeforeConsent)
         EXPECT_EQ(ph[1]["stored"], "granted");
         EXPECT_EQ(ph[1]["barRemoved"], true);
     }
-    // Decline, or a stored decline: nothing is ever sent.
+    // Decline, or a stored decline: no contact with Google, ever.
     for (const nlohmann::json& sc : {nlohmann::json{{"pathname", "/miner.html"}, {"search", "?address=" + kAddr},
                                                     {"referrer", ""}, {"title", "t"}, {"click", "decline"}},
                                      nlohmann::json{{"pathname", "/miner.html"}, {"search", "?address=" + kAddr},
                                                     {"referrer", ""}, {"title", "t"}, {"stored", "denied"}}}) {
         const auto ph = run_page(sc);
         ASSERT_FALSE(ph.empty());
-        for (const auto& p : ph) {
-            EXPECT_TRUE(commands(p, "config").empty()) << sc.dump();
-            EXPECT_TRUE(commands(p, "event").empty()) << sc.dump();
-            for (const auto& c : commands(p, "consent"))
-                EXPECT_NE(c[1], "update") << sc.dump();
-        }
+        for (const auto& p : ph)
+            expect_no_contact(p, sc.dump());
         EXPECT_EQ(ph.back()["barRemoved"], true);
     }
     // The script's sanitizer and its C++ port agree.

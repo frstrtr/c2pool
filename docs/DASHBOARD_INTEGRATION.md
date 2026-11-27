@@ -226,9 +226,9 @@ tx_explorer_prefix:      "https://your-explorer.example.com/tx/"
 
 - **Analytics:** set `--analytics-id G-XXXXXXXXXX` (settings key
   `web.analytics_id`; LTC YAML `analytics_id`) on any coin binary; off by
-  default. Every HTML page then shows a small Accept / Decline bar, and only
-  after Accept are GA4 page views sent, with addresses and query strings
-  stripped. Pass the same flag to `explorer/explorer.py` for its pages. The
+  default. Every HTML page then shows a small Accept / Decline bar; nothing is
+  loaded from Google before Accept, and only after Accept are GA4 page views
+  sent, with addresses and query strings stripped. Pass the same flag to `explorer/explorer.py` for its pages. The
   operator who enables it is responsible for their own privacy notice. See the
   README section "Google Analytics tag".
 

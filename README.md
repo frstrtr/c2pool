@@ -1118,11 +1118,14 @@ the node puts a Google Analytics (GA4) tag and a consent bar into the HTML pages
 it serves (`src/core/analytics_tag.hpp`, one helper for every page).
 
 - **What is collected: GA4 page views only, and only after consent.** Before a
-  visitor accepts, nothing is sent to Google Analytics and no cookie is set:
-  every Consent Mode type (`analytics_storage`, `ad_storage`, `ad_user_data`,
-  `ad_personalization`) starts `denied`, and the config call
-  (`send_page_view: false`) and the one `page_view` run only after Accept. The
-  page still fetches `gtag.js`, with no referrer.
+  visitor accepts there is no contact with Google at all: the page carries no
+  external script, and Google's script (`gtag.js`) is not loaded, so not even the
+  visitor's IP address or browser reaches Google, and no cookie is set. On Decline,
+  or with no answer, it is never loaded. On Accept (or on a later visit after an
+  Accept) the page creates the one `gtag.js` script element, with no referrer,
+  then sets every Consent Mode type (`analytics_storage`, `ad_storage`,
+  `ad_user_data`, `ad_personalization`) to `denied`, grants `analytics_storage`,
+  and makes the config call (`send_page_view: false`) and the one `page_view`.
 - **Addresses and query strings are stripped.** The page view carries an
   explicit `page_location`, `page_path`, `page_referrer` and `page_title`, never
   the raw URL: the query string and fragment are dropped, and any path segment
@@ -1132,10 +1135,10 @@ it serves (`src/core/analytics_tag.hpp`, one helper for every page).
   page's referrer policy is `no-referrer`, so no request carries the raw URL.
 - **Consent bar.** A small bar at the bottom reads "This site uses Google
   Analytics cookies to count visits." with **Accept** and **Decline**. Accept
-  grants `analytics_storage` only (no `ad_*` type is ever granted); Decline sends
-  nothing. The choice is kept in the browser's `localStorage`
+  grants `analytics_storage` only (no `ad_*` type is ever granted); Decline loads
+  and sends nothing. The choice is kept in the browser's `localStorage`
   (`c2pool_ga_consent`) and the bar is not shown again. A page without `</body>`
-  gets no bar, so it never sends anything.
+  gets no bar, so it never loads or sends anything.
 - **Never on** `/control/*`, `/api/*` (admin, config, tx-inject), `/web/log`,
   `/logs/*`, a request that carries a token, or a non-HTML response. A page
   without `</head>`, or one that already loads `gtag.js`, is left unchanged.

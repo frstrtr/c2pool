@@ -13,10 +13,11 @@
 //   Decline keeps it denied. The choice is kept in localStorage under
 //   c2pool_ga_consent; a stored "granted" is restored on load, and a stored
 //   choice hides the bar.
-// - Page views only, after consent: the config call (send_page_view false)
-//   and the one page_view event run only once consent is granted. Before
-//   that nothing is sent to Google Analytics (gtag.js is fetched, with no
-//   referrer).
+// - No contact with Google before consent: the page carries no external
+//   script. Only once consent is granted (Accept, or a stored "granted" on
+//   load) does it create the one gtag.js script element (no referrer) and
+//   queue the consent default, the update, the config call (send_page_view
+//   false) and the one page_view. Decline, or no answer, never loads it.
 // - No address reaches Google: page_location / page_path / page_referrer /
 //   page_title are sent explicitly, built from location.pathname with the
 //   query string and fragment dropped and every address-like path segment
@@ -252,13 +253,15 @@ inline std::string& analytics_id_setting()
     return id;
 }
 
-/// The <head> part: the no-referrer policy, consent defaults (all denied),
-/// gtag.js, then the path sanitizer and the start function that, once
-/// consent is granted, makes the config call (send_page_view false) and
-/// sends the one page_view with the sanitized location, path, referrer and
-/// title. With `restore_choice` (the page also gets the consent bar) a
-/// stored "granted" starts it on load. `id` must be valid
-/// (inject_analytics_tag checks it).
+/// The <head> part: the no-referrer policy, the dataLayer / gtag stubs, the
+/// path sanitizer and the start function. Nothing here contacts Google: the
+/// start function, run only once consent is granted, creates the one gtag.js
+/// script element, then queues the consent default (all denied), the
+/// analytics_storage grant, the config call (send_page_view false) and the
+/// one page_view with the sanitized location, path, referrer and title.
+/// With `restore_choice` (the page also gets the consent bar) a stored
+/// "granted" starts it on load. `id` must be valid (inject_analytics_tag
+/// checks it).
 inline std::string analytics_head_snippet(const std::string& id, bool restore_choice)
 {
     std::string s;
@@ -266,20 +269,23 @@ inline std::string analytics_head_snippet(const std::string& id, bool restore_ch
     s += "\n<meta name=\"referrer\" content=\"no-referrer\">\n"
          "<script>\n"
          "window.dataLayer=window.dataLayer||[];\n"
-         "function gtag(){dataLayer.push(arguments);}\n"
-         "gtag('consent','default',{analytics_storage:'denied',ad_storage:'denied',"
-         "ad_user_data:'denied',ad_personalization:'denied'});\n"
-         "gtag('js',new Date());\n"
-         "</script>\n"
-         "<script async src=\"https://www.googletagmanager.com/gtag/js?id=";
-    s += id;
-    s += "\" referrerpolicy=\"no-referrer\"></script>\n"
-         "<script>\n";
+         "function gtag(){dataLayer.push(arguments);}\n";
     s += kAnalyticsPathJs;
     s += "\n"
          "function c2poolGaStart(){\n"
          "if(window.c2poolGaStarted){return;}\n"
          "window.c2poolGaStarted=true;\n"
+         "var g=document.createElement('script');\n"
+         "g.async=true;\n"
+         "g.setAttribute('referrerpolicy','no-referrer');\n"
+         "g.src='https://www.googletagmanager.com/gtag/js?id=";
+    s += id;
+    s += "';\n"
+         "(document.head||document.documentElement).appendChild(g);\n"
+         "gtag('consent','default',{analytics_storage:'denied',ad_storage:'denied',"
+         "ad_user_data:'denied',ad_personalization:'denied'});\n"
+         "gtag('consent','update',{analytics_storage:'granted'});\n"
+         "gtag('js',new Date());\n"
          "var p=c2poolGaPath(location.pathname),r='';\n"
          "try{if(document.referrer){var u=new URL(document.referrer);r=u.origin+c2poolGaPath(u.pathname);}}"
          "catch(e){r='(unknown)';}\n"
@@ -293,7 +299,7 @@ inline std::string analytics_head_snippet(const std::string& id, bool restore_ch
     if (restore_choice) {
         s += "try{if(window.localStorage.getItem('";
         s += kAnalyticsConsentKey;
-        s += "')==='granted'){gtag('consent','update',{analytics_storage:'granted'});c2poolGaStart();}}catch(e){}\n";
+        s += "')==='granted'){c2poolGaStart();}}catch(e){}\n";
     }
     s += "</script>\n";
     return s;
@@ -334,8 +340,7 @@ inline std::string analytics_consent_banner()
          "if(v==='granted'||v==='denied'){bar.parentNode.removeChild(bar);return;}\n"
          "function pick(c){\n"
          "try{window.localStorage.setItem(k,c);}catch(e){}\n"
-         "if(c==='granted'&&typeof gtag==='function'){gtag('consent','update',{analytics_storage:'granted'});"
-         "if(typeof c2poolGaStart==='function'){c2poolGaStart();}}\n"
+         "if(c==='granted'&&typeof c2poolGaStart==='function'){c2poolGaStart();}\n"
          "if(pad&&pad.parentNode){pad.parentNode.removeChild(pad);}\n"
          "if(bar.parentNode){bar.parentNode.removeChild(bar);}\n"
          "}\n"

@@ -77,8 +77,9 @@ URL_PREFIX = ""
 # string = off (the default): every generated page is byte-identical to before
 # this option existed. When set, every HTML page gets the same tag and consent
 # bar the c2pool node puts in its own pages (src/core/analytics_tag.hpp; the
-# node's core_test checks the two produce the same bytes): page views only,
-# after consent, with the query string dropped and addresses replaced.
+# node's core_test checks the two produce the same bytes): no contact with
+# Google before consent, then page views only, with the query string dropped
+# and addresses replaced.
 ANALYTICS_ID = ""
 
 _ANALYTICS_ID_RE = re.compile(r"G-[A-Z0-9]{4,20}|UA-[0-9]{4,10}-[0-9]{1,4}", re.ASCII)
@@ -102,25 +103,28 @@ _ANALYTICS_PATH_JS = (
 
 
 def analytics_head_snippet(analytics_id, restore_choice):
-    """The <head> part: the no-referrer policy, consent defaults (all
-    denied), gtag.js, then the path sanitizer and the start function that,
-    once consent is granted, makes the config call (send_page_view false) and
-    sends the one page_view with the query string dropped and address-like
-    path segments replaced by ":addr"."""
+    """The <head> part: the no-referrer policy, the dataLayer / gtag stubs,
+    the path sanitizer and the start function. Nothing here contacts Google:
+    the start function, run only once consent is granted, creates the one
+    gtag.js script element, then queues the consent default, the grant, the
+    config call (send_page_view false) and the one page_view, with the query
+    string dropped and address-like path segments replaced by ":addr"."""
     s = (_ANALYTICS_MARKER + "\n<meta name=\"referrer\" content=\"no-referrer\">\n"
          "<script>\n"
          "window.dataLayer=window.dataLayer||[];\n"
-         "function gtag(){dataLayer.push(arguments);}\n"
-         "gtag('consent','default',{analytics_storage:'denied',ad_storage:'denied',"
-         "ad_user_data:'denied',ad_personalization:'denied'});\n"
-         "gtag('js',new Date());\n"
-         "</script>\n"
-         "<script async src=\"https://www.googletagmanager.com/gtag/js?id=" + analytics_id +
-         "\" referrerpolicy=\"no-referrer\"></script>\n"
-         "<script>\n" + _ANALYTICS_PATH_JS + "\n"
+         "function gtag(){dataLayer.push(arguments);}\n" + _ANALYTICS_PATH_JS + "\n"
          "function c2poolGaStart(){\n"
          "if(window.c2poolGaStarted){return;}\n"
          "window.c2poolGaStarted=true;\n"
+         "var g=document.createElement('script');\n"
+         "g.async=true;\n"
+         "g.setAttribute('referrerpolicy','no-referrer');\n"
+         "g.src='https://www.googletagmanager.com/gtag/js?id=" + analytics_id + "';\n"
+         "(document.head||document.documentElement).appendChild(g);\n"
+         "gtag('consent','default',{analytics_storage:'denied',ad_storage:'denied',"
+         "ad_user_data:'denied',ad_personalization:'denied'});\n"
+         "gtag('consent','update',{analytics_storage:'granted'});\n"
+         "gtag('js',new Date());\n"
          "var p=c2poolGaPath(location.pathname),r='';\n"
          "try{if(document.referrer){var u=new URL(document.referrer);r=u.origin+c2poolGaPath(u.pathname);}}"
          "catch(e){r='(unknown)';}\n"
@@ -132,7 +136,7 @@ def analytics_head_snippet(analytics_id, restore_choice):
          "}\n")
     if restore_choice:
         s += ("try{if(window.localStorage.getItem('" + _ANALYTICS_CONSENT_KEY +
-              "')==='granted'){gtag('consent','update',{analytics_storage:'granted'});c2poolGaStart();}}catch(e){}\n")
+              "')==='granted'){c2poolGaStart();}}catch(e){}\n")
     s += "</script>\n"
     return s
 
@@ -167,8 +171,7 @@ def analytics_consent_banner():
             "if(v==='granted'||v==='denied'){bar.parentNode.removeChild(bar);return;}\n"
             "function pick(c){\n"
             "try{window.localStorage.setItem(k,c);}catch(e){}\n"
-            "if(c==='granted'&&typeof gtag==='function'){gtag('consent','update',{analytics_storage:'granted'});"
-            "if(typeof c2poolGaStart==='function'){c2poolGaStart();}}\n"
+            "if(c==='granted'&&typeof c2poolGaStart==='function'){c2poolGaStart();}\n"
             "if(pad&&pad.parentNode){pad.parentNode.removeChild(pad);}\n"
             "if(bar.parentNode){bar.parentNode.removeChild(bar);}\n"
             "}\n"
