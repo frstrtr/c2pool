@@ -255,6 +255,14 @@ bool DGBWorkSource::embedded_chain_serves() const
     return true;
 }
 
+bool DGBWorkSource::template_servable() const
+{
+    if (embedded_chain_serves())
+        return true;
+    const auto tip = resolve_gbt_tip_fallback();
+    return tip && tip->height != 0;
+}
+
 std::string DGBWorkSource::get_current_gbt_prevhash() const
 {
     // The tip block id as GBT-conventional big-endian display hex, drawn from

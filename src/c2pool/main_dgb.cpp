@@ -2020,9 +2020,9 @@ int run_node(const core::CoinParams& params, bool testnet,
 
     // The stratum work gate (stratum_work_gate.hpp; python work.py
     // preprocess_request / get_work): no work while the node has no
-    // sharechain peers or no best share (mainnet: PERSIST), or has lost
-    // contact with digibyted for more than 60 s while working from the
-    // embedded chain; once a hold has lasted 15 s the live sessions are closed
+    // sharechain peers or no best share (mainnet: PERSIST), or has had no
+    // servable template (lost contact with digibyted) for more than 60 s;
+    // once a hold has lasted 15 s the live sessions are closed
     // once, so rigs fail over. The share download and verification go on.
     std::function<void()> stop_work_gate;
     if (stratum_server) {
@@ -2037,12 +2037,19 @@ int run_node(const core::CoinParams& params, bool testnet,
         stop_work_gate = dgb::start_periodic(ioc, dgb::kWorkGateTick,
             [&p2p_node, &coin_p2p, srv, ws = work_source.get(), cell = stratum_best_share, require_peers,
              steady_sec, gate]() {
+                // The cell is refreshed here too (review 2d3524094 NIT 1): at
+                // startup it holds the raw head, which must not release work
+                // for a tick after the first peer connects.
+                const uint256 before = cell->get();
+                if (dgb::refresh_best_share_cell(p2p_node, *cell) && cell->get() != before)
+                    ws->bump_work_generation();
                 dgb::WorkGateObservation ob;
                 ob.require_peers = require_peers;
                 ob.sharechain_peers = p2p_node.get_peer_info_json().size();
                 ob.coin_dialled = static_cast<bool>(coin_p2p);
                 ob.coin_handshaken = coin_p2p && coin_p2p->is_handshake_complete();
                 ob.embedded_serves = ws->embedded_chain_serves();
+                ob.template_servable = ws->template_servable();
                 ob.best_share_null = cell->get().IsNull();
                 dgb::work_gate_tick(*gate, ob, steady_sec(), *ws, *srv);
             });

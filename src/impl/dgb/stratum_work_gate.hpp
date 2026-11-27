@@ -7,12 +7,18 @@
 // connection when get_work raises):
 //   - "p2pool is not connected to any peers": no sharechain peer on a PERSIST
 //     network (DGB mainnet; testnet and regtest are not PERSIST);
-//   - "lost contact with digibyted": while work comes from the embedded
-//     header chain, its coin peer has not been seen handshaken for more than
-//     60 s (python: last_update + 60, "lost contact with bitcoind"; while
-//     work comes from digibyted's GBT, a failed GBT already gives no work);
+//   - "lost contact with digibyted": no servable template for more than
+//     60 s (python: time.time() > last_update + 60, "lost contact with
+//     bitcoind", where last_update is the last successful work fetch).
+//     Contact is a servable template: the embedded chain at its tip (with
+//     its dialled coin peer handshaken, so a dead peer's stale tip does not
+//     count), or a getblocktemplate from digibyted. A firewalled coin peer
+//     with no RPC, a failing digibyted, or an embedded chain still syncing
+//     with no GBT all hold, so rigs fail over;
 //   - "p2pool is downloading shares": no best share on a PERSIST network
-//     (python get_work), e.g. during the revive, so rigs fail over.
+//     (python get_work), e.g. during the revive, so rigs fail over. If the
+//     revive spends its budget (64 requests) with nothing verified, this
+//     holds until a restart, as python would hold with best None.
 // Python authorizes and then closes the connection; this node refuses
 // mining.authorize with the reason (error 24), serves no template (no job),
 // and closes the live sessions once a hold has lasted 15 s (about python's
@@ -42,8 +48,8 @@ inline constexpr std::chrono::milliseconds kWorkGateTick{1000};
 struct WorkGateInputs {
     bool require_peers = false;        // net.PERSIST: DGB mainnet only
     size_t sharechain_peers = 0;
-    bool coin_daemon = false;          // work from the embedded chain, its coin peer dialled
-    int64_t coin_contact_age_sec = 0;  // since the coin peer was last seen handshaken
+    bool check_contact = false;        // digibyted contact is checked
+    int64_t coin_contact_age_sec = 0;  // since a template was last servable
     bool best_share_null = false;      // no best share yet
 };
 
@@ -53,7 +59,7 @@ inline std::string work_gate_reason(const WorkGateInputs& in)
 {
     if (in.require_peers && in.sharechain_peers == 0)
         return "p2pool is not connected to any peers";
-    if (in.coin_daemon && in.coin_contact_age_sec > kCoinContactLostSec)
+    if (in.check_contact && in.coin_contact_age_sec > kCoinContactLostSec)
         return "lost contact with digibyted";
     if (in.require_peers && in.best_share_null)
         return "p2pool is downloading shares";
@@ -93,6 +99,7 @@ struct WorkGateObservation {
     bool coin_dialled = false;      // --coin-daemon: a coin P2P peer exists
     bool coin_handshaken = false;   // ... and its handshake is complete now
     bool embedded_serves = false;   // work comes from the embedded chain
+    bool template_servable = false; // the embedded chain serves, or digibyted's GBT answers
     bool best_share_null = false;   // the stratum best-share cell is null
 };
 
@@ -101,18 +108,29 @@ struct WorkGateState {
     WorkGateWatch watch;
 };
 
+/// Contact with digibyted now: a servable template, and while the embedded
+/// chain serves with a dialled coin peer, that peer handshaken.
+inline bool digibyted_contact(const WorkGateObservation& ob)
+{
+    if (!ob.template_servable)
+        return false;
+    if (ob.embedded_serves && ob.coin_dialled)
+        return ob.coin_handshaken;
+    return true;
+}
+
 /// One gate tick: the reason, the work source's hold, and the live sessions
 /// closed once a hold has lasted kDropHeldSessionsAfterSec. Returns the reason.
 template <typename WorkSourceT, typename ServerT>
 std::string work_gate_tick(WorkGateState& st, const WorkGateObservation& ob, int64_t now_sec, WorkSourceT& ws,
                            ServerT& srv)
 {
-    if (ob.coin_handshaken)
+    if (digibyted_contact(ob))
         st.last_contact = now_sec;
     WorkGateInputs in;
     in.require_peers = ob.require_peers;
     in.sharechain_peers = ob.sharechain_peers;
-    in.coin_daemon = ob.coin_dialled && ob.embedded_serves;
+    in.check_contact = true;
     in.coin_contact_age_sec = now_sec - st.last_contact;
     in.best_share_null = ob.best_share_null;
     const std::string reason = work_gate_reason(in);

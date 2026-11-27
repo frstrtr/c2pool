@@ -343,6 +343,11 @@ public:
     /// getter and the work gate.
     bool embedded_chain_serves() const;
 
+    /// Whether a template can be served now: the embedded chain serves, or
+    /// digibyted's GBT answers with a height (through the GBT cache, so at
+    /// most one getblocktemplate per TTL). The work gate's digibyted contact.
+    bool template_servable() const;
+
     /// The stratum work gate (stratum_work_gate.hpp): a non-empty reason holds
     /// all work (no template, so no job) and refuses mining.authorize with it;
     /// empty serves work. Logged once per change.

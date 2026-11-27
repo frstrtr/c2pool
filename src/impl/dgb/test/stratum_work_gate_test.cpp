@@ -46,19 +46,28 @@ TEST(DgbWorkGate, ReasonsAsThePythonNetwork)
     in.sharechain_peers = 0;
     EXPECT_EQ(dgb::work_gate_reason(in), "");
     // digibyted: lost after more than 60 s (python: now > last_update + 60).
-    in.coin_daemon = true;
+    in.check_contact = true;
     in.coin_contact_age_sec = 60;
     EXPECT_EQ(dgb::work_gate_reason(in), "");
     in.coin_contact_age_sec = 61;
     EXPECT_EQ(dgb::work_gate_reason(in), kLost);
-    // No coin peer dialled: nothing to lose.
-    in.coin_daemon = false;
+    // Contact not checked: nothing to lose.
+    in.check_contact = false;
     in.coin_contact_age_sec = 100000;
     EXPECT_EQ(dgb::work_gate_reason(in), "");
-    // Python's order: peers first.
+    // Python's order: peers, contact, then the best share (review 2d3524094
+    // NIT 2: each pair combined).
     in.require_peers = true;
-    in.coin_daemon = true;
-    EXPECT_EQ(dgb::work_gate_reason(in), kNoPeers);
+    in.check_contact = true;
+    in.best_share_null = true;
+    EXPECT_EQ(dgb::work_gate_reason(in), kNoPeers) << "peers 0 + contact lost + best null";
+    in.coin_contact_age_sec = 0;
+    EXPECT_EQ(dgb::work_gate_reason(in), kNoPeers) << "peers 0 + best null";
+    in.sharechain_peers = 1;
+    in.coin_contact_age_sec = 61;
+    EXPECT_EQ(dgb::work_gate_reason(in), kLost) << "contact lost + best null";
+    in.coin_contact_age_sec = 0;
+    EXPECT_EQ(dgb::work_gate_reason(in), "p2pool is downloading shares");
 }
 
 TEST(DgbWorkGate, LiveSessionsAreClosedOncePerHoldAfter15s)
@@ -131,6 +140,7 @@ dgb::WorkGateObservation healthy()
     ob.coin_dialled = true;
     ob.coin_handshaken = true;
     ob.embedded_serves = true;
+    ob.template_servable = true;
     ob.best_share_null = false;
     return ob;
 }
@@ -176,29 +186,73 @@ TEST(DgbWorkGate, TheTickHoldsReleasesAndClosesSessionsOnce)
     EXPECT_EQ(dgb::work_gate_tick(st, ob, 1104, ws, srv), "");
 }
 
-TEST(DgbWorkGate, ContactCountsOnlyWhileWorkComesFromTheEmbeddedChain)
+// Review 2d3524094 R1: contact is a servable template within 60 s (python's
+// last successful work fetch), and while the embedded chain serves with a
+// dialled coin peer, that peer handshaken.
+TEST(DgbWorkGate, ContactIsAServableTemplate)
 {
-    dgb::WorkGateState st;
-    st.last_contact = 1000;
-    FakeWs ws;
     FakeSrv srv;
+    FakeWs ws;
+    {
+        // Embedded serving, coin peer lost: held after 60 s, restored on a handshake.
+        dgb::WorkGateState st;
+        st.last_contact = 1000;
+        auto ob = healthy();
+        dgb::work_gate_tick(st, ob, 1000, ws, srv);
+        ob.coin_handshaken = false;
+        EXPECT_EQ(dgb::work_gate_tick(st, ob, 1060, ws, srv), "") << "60 s is still contact";
+        EXPECT_EQ(dgb::work_gate_tick(st, ob, 1061, ws, srv), kLost);
+        ob.coin_handshaken = true;
+        EXPECT_EQ(dgb::work_gate_tick(st, ob, 1062, ws, srv), "");
+    }
+    {
+        // A firewalled coin peer and no RPC: the chain never gets a tip,
+        // nothing is servable: held after 60 s (the ce7b789af behaviour).
+        dgb::WorkGateState st;
+        st.last_contact = 1000;
+        auto ob = healthy();
+        ob.coin_handshaken = false;
+        ob.embedded_serves = false;
+        ob.template_servable = false;
+        EXPECT_EQ(dgb::work_gate_tick(st, ob, 1060, ws, srv), "");
+        EXPECT_EQ(dgb::work_gate_tick(st, ob, 1061, ws, srv), kLost);
+    }
+    {
+        // digibyted's GBT serves (P2P down): contact while GBT answers, lost
+        // 60 s after it stops.
+        dgb::WorkGateState st;
+        st.last_contact = 1000;
+        auto ob = healthy();
+        ob.coin_handshaken = false;
+        ob.embedded_serves = false;
+        ob.template_servable = true;
+        EXPECT_EQ(dgb::work_gate_tick(st, ob, 5000, ws, srv), "") << "GBT answering is contact";
+        ob.template_servable = false;
+        EXPECT_EQ(dgb::work_gate_tick(st, ob, 5060, ws, srv), "");
+        EXPECT_EQ(dgb::work_gate_tick(st, ob, 5061, ws, srv), kLost);
+    }
+    {
+        // No coin peer dialled (--coin-p2p-discover) and the embedded chain
+        // serves: contact; still syncing with no GBT: held after 60 s.
+        dgb::WorkGateState st;
+        st.last_contact = 1000;
+        auto ob = healthy();
+        ob.coin_dialled = false;
+        ob.coin_handshaken = false;
+        EXPECT_EQ(dgb::work_gate_tick(st, ob, 9000, ws, srv), "");
+        ob.embedded_serves = false;
+        ob.template_servable = false;
+        EXPECT_EQ(dgb::work_gate_tick(st, ob, 9061, ws, srv), kLost);
+    }
+    // The pure contact rule.
     auto ob = healthy();
-    dgb::work_gate_tick(st, ob, 1000, ws, srv);
+    EXPECT_TRUE(dgb::digibyted_contact(ob));
     ob.coin_handshaken = false;
-    EXPECT_EQ(dgb::work_gate_tick(st, ob, 1060, ws, srv), "") << "60 s is still contact";
-    EXPECT_EQ(dgb::work_gate_tick(st, ob, 1061, ws, srv), kLost);
-    // A handshake seen again restores contact.
-    ob.coin_handshaken = true;
-    EXPECT_EQ(dgb::work_gate_tick(st, ob, 1062, ws, srv), "");
-    // Work from digibyted's GBT (embedded chain behind or unfed): the coin
-    // P2P is not its contact; a failed GBT gives no work by itself.
-    ob.coin_handshaken = false;
-    ob.embedded_serves = false;
-    EXPECT_EQ(dgb::work_gate_tick(st, ob, 5000, ws, srv), "");
-    // No coin peer dialled at all (--coin-p2p-discover): no contact check.
-    ob.embedded_serves = true;
+    EXPECT_FALSE(dgb::digibyted_contact(ob));
     ob.coin_dialled = false;
-    EXPECT_EQ(dgb::work_gate_tick(st, ob, 9000, ws, srv), "");
+    EXPECT_TRUE(dgb::digibyted_contact(ob));
+    ob.template_servable = false;
+    EXPECT_FALSE(dgb::digibyted_contact(ob));
 }
 
 TEST(DgbWorkGate, StartPeriodicRepeatsAndStops)
@@ -229,6 +283,8 @@ TEST(DgbWorkGate, MainDgbRunsTheGate)
                              "ob.coin_dialled = static_cast<bool>(coin_p2p);",
                              "ob.coin_handshaken = coin_p2p && coin_p2p->is_handshake_complete();",
                              "ob.embedded_serves = ws->embedded_chain_serves();",
+                             "ob.template_servable = ws->template_servable();",
+                             "if (dgb::refresh_best_share_cell(p2p_node, *cell) && cell->get() != before)",
                              "ob.best_share_null = cell->get().IsNull();",
                              "dgb::work_gate_tick(*gate, ob, steady_sec(), *ws, *srv);"})
         EXPECT_NE(body.find(line), std::string::npos) << line;
