@@ -191,8 +191,8 @@ struct EmbeddedWorkInputs {
 
     // --embedded-include-v24-provider-txs (default true): with the superset
     // above armed and v24 active, false keeps the shared-masternode types
-    // 10-12 and v3 (ExtAddr) ProTx payloads out of selection; version 1/2
-    // ProTx still ride. Set by
+    // 10-12 and every type 1-4 tx but a parsed v1/v2 ProTx out of selection;
+    // v1/v2 ProTx still ride. Set by
     // NodeCoinState::make_embedded_work_inputs from set_include_v24_provider_txs.
     bool                             include_v24_provider_txs{true};
 

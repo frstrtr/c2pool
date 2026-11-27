@@ -3277,10 +3277,10 @@ TEST(DashV24AllTx, V24ProviderOptOutChangesNothingBeforeActivation)
     }
 }
 
-// The opt-out also holds every ProTx payload format only valid under v24: a
-// type 1-4 tx whose payload parses with version >= EXT_ADDR (3)
-// (mempool.hpp is_v24_format_protx). Shared registrations are version 3.
-// Version 1/2 payloads ride as before.
+// The opt-out also holds every type 1-4 tx unless its payload parses with
+// ProTx version 1 or 2 (mempool.hpp is_v24_opt_out_protx): version 3, only
+// valid under v24 (shared registrations are version 3), and, failing closed,
+// a payload that does not parse. Version 1/2 payloads ride as before.
 
 namespace {
 const RealProReg& tn_shared_registration()
@@ -3426,7 +3426,7 @@ TEST(DashV24AllTx, V24ProviderOptOutHoldsASharedRegistrationAndKeepsALegacyProRe
 {
     {   // The v24 shared registration is held, with its package.
         SharedRegPool p;
-        ASSERT_TRUE(dash::coin::is_v24_format_protx(p.reg)) << "the format marker (version 3)";
+        ASSERT_TRUE(dash::coin::is_v24_opt_out_protx(p.reg)) << "the format marker (version 3)";
         const auto on = p.build(/*v24=*/true, true);
         ASSERT_TRUE(opt_rides(on, p.reg)) << "fixture: the shared registration rides ON";
         ASSERT_TRUE(opt_rides(on, p.child)) << "fixture: its child rides ON";
@@ -3447,7 +3447,7 @@ TEST(DashV24AllTx, V24ProviderOptOutHoldsASharedRegistrationAndKeepsALegacyProRe
     }
     {   // A legacy-format (version 2) ProRegTx still rides under v24.
         LegacyRegPool p;
-        ASSERT_FALSE(dash::coin::is_v24_format_protx(p.reg)) << "the format marker (version 2)";
+        ASSERT_FALSE(dash::coin::is_v24_opt_out_protx(p.reg)) << "the format marker (version 2)";
         const auto on = p.build(/*v24=*/true, true);
         ASSERT_TRUE(opt_rides(on, p.reg)) << "fixture: the legacy ProRegTx rides ON";
         const auto off = p.build(/*v24=*/true, false);
@@ -3569,7 +3569,7 @@ bool selected_alone(const MutableTransaction& tx, bool include_v24)
     m.allow_mn_types = true;
     m.v24_rules = true;
     m.allow_v24_provider = include_v24;
-    m.hold_v24_format_protx = !include_v24;
+    m.hold_non_legacy_protx = !include_v24;
     const auto picked = mp.get_sorted_txs_with_fees(1'000'000, m);
     for (const auto& s : picked.first)
         if (txid(s.tx) == txid(tx)) return true;
@@ -3587,9 +3587,16 @@ struct V3RPool {
     dash::coin::ProTxCheckEnv env;
     dash::coin::MnFoldContext::OperatorSigFn sigfn = &v::verify_protx_operator_sig;
 
-    explicit V3RPool(int type, bool pooled = true)
+    /// With `payload`, the tx is a type `type` tx carrying exactly those
+    /// payload bytes instead (one funded input, no outputs).
+    explicit V3RPool(int type, bool pooled = true, std::optional<std::vector<uint8_t>> payload = std::nullopt)
     {
-        tx = type == 2 ? servtx_r_v3(w) : type == 3 ? upreg_r_v3(w) : rev_r_v3(w);
+        if (payload) {
+            tx = tx_with_inputs(static_cast<uint16_t>(type), {{h256(0x9a), 0}});
+            tx.extra_payload = *payload;
+        } else {
+            tx = type == 2 ? servtx_r_v3(w) : type == 3 ? upreg_r_v3(w) : rev_r_v3(w);
+        }
         utxo.add_coin(::core::coin::Outpoint(tx.vin[0].prevout.hash, tx.vin[0].prevout.index),
                       ::core::coin::Coin(1'000'000, script_of(p2pkh(ec_key(0x6b).id)), 1, false));
         // R's collateral (CheckProUpRegTx reads its coin).
@@ -3649,7 +3656,7 @@ TEST(DashV24AllTx, V24ProviderOptOutHoldsEveryV3ProTxInSelection)
     };
     for (const auto& c : cases) {
         SCOPED_TRACE(c.what);
-        EXPECT_EQ(dash::coin::is_v24_format_protx(c.tx), c.v3) << "the format marker";
+        EXPECT_EQ(dash::coin::is_v24_opt_out_protx(c.tx), c.v3) << "the format marker";
         ASSERT_TRUE(selected_alone(c.tx, /*include_v24=*/true)) << "fixture: selected ON";
         EXPECT_EQ(selected_alone(c.tx, /*include_v24=*/false), !c.v3)
             << (c.v3 ? "a version-3 payload rode OFF" : "a version 1/2 payload was held OFF");
@@ -3661,7 +3668,7 @@ TEST(DashV24AllTx, V24ProviderOptOutHoldsV3ProTxTypes2To4InTheTemplate)
     for (const int type : {2, 3, 4}) {
         SCOPED_TRACE("type " + std::to_string(type) + " v3 (synthetic)");
         V3RPool p(type);
-        ASSERT_TRUE(dash::coin::is_v24_format_protx(p.tx));
+        ASSERT_TRUE(dash::coin::is_v24_opt_out_protx(p.tx));
         const auto on = p.build(/*v24=*/true, true);
         ASSERT_TRUE(opt_rides(on, p.tx)) << "fixture: rides ON";
         EXPECT_TRUE(SameTemplate(p.build(/*v24=*/true, std::nullopt), on)) << "the default is ON";
@@ -3672,6 +3679,71 @@ TEST(DashV24AllTx, V24ProviderOptOutHoldsV3ProTxTypes2To4InTheTemplate)
         // Before v24 a version-3 payload never rides, and OFF = ON.
         EXPECT_FALSE(opt_rides(p.build(/*v24=*/false, true), p.tx));
         EXPECT_TRUE(SameTemplate(p.build(/*v24=*/false, false), p.build(/*v24=*/false, true)));
+    }
+}
+
+namespace {
+/// Type `type` payloads that do not parse, built from a valid version-2
+/// payload of that type: cut to half its length, with one trailing byte,
+/// relabelled version 4 (a version this code does not know), and four bytes
+/// of garbage.
+std::vector<std::pair<std::string, std::vector<uint8_t>>> unparsed_payloads(const V24World& w, int type)
+{
+    std::vector<uint8_t> v2;
+    switch (type) {
+    case 1: v2 = tx_from_hex(kMainProReg).extra_payload; break;
+    case 2: v2 = servtx_r(w).extra_payload; break;
+    case 3: v2 = w.upreg_r(w.rop2.pub).extra_payload; break;
+    default: v2 = w.rev_r().extra_payload; break;
+    }
+    std::vector<uint8_t> truncated(v2.begin(), v2.begin() + static_cast<std::ptrdiff_t>(v2.size() / 2));
+    std::vector<uint8_t> trailing = v2;
+    trailing.push_back(0x00);
+    std::vector<uint8_t> v4 = v2;
+    v4[0] = 0x04;
+    v4[1] = 0x00;
+    return {{"truncated", truncated},
+            {"trailing byte", trailing},
+            {"version 4", v4},
+            {"garbage", std::vector<uint8_t>{0xde, 0xad, 0xbe, 0xef}}};
+}
+}  // namespace
+
+TEST(DashV24AllTx, V24ProviderOptOutHoldsAnUnparsedProTxPayload)
+{
+    // Fail closed: under the opt-out a type 1-4 tx rides only when its payload
+    // parses with ProTx version 1 or 2. Mempool admission does not parse a
+    // provider payload (one that does not parse is left to the Dash Core
+    // checks), so these reach selection. The builder's fold then refuses them
+    // (bad-protx-payload) ON or OFF, so the hold is a selection-level
+    // safeguard on top of the fold.
+    V24World w;
+    for (const int type : {1, 2, 3, 4}) {
+        for (const auto& [what, payload] : unparsed_payloads(w, type)) {
+            SCOPED_TRACE("type " + std::to_string(type) + ", " + what);
+            auto tx = tx_with_inputs(static_cast<uint16_t>(type), {{h256(0x9b), 0}});
+            tx.extra_payload = payload;
+            ASSERT_FALSE(dash::coin::protx_payload_version(tx).has_value()) << "fixture: the payload must not parse";
+            EXPECT_FALSE(dash::coin::is_legacy_format_protx(tx));
+            EXPECT_TRUE(dash::coin::is_v24_opt_out_protx(tx));
+            // Selection, fed directly (admission takes it): selected ON as
+            // before, held OFF.
+            EXPECT_TRUE(selected_alone(tx, /*include_v24=*/true)) << "ON selects it, as before";
+            EXPECT_FALSE(selected_alone(tx, /*include_v24=*/false)) << "an unparsed payload was selected OFF";
+            // The builder: it never rides. ON is the template it was; OFF is
+            // the template of a pool that never held it.
+            V3RPool p(type, /*pooled=*/true, payload);
+            const auto on = p.build(/*v24=*/true, true);
+            EXPECT_FALSE(opt_rides(on, p.tx)) << "the fold refuses it ON";
+            EXPECT_TRUE(SameTemplate(p.build(/*v24=*/true, std::nullopt), on)) << "the default is ON";
+            const auto off = p.build(/*v24=*/true, false);
+            EXPECT_FALSE(opt_rides(off, p.tx));
+            const V3RPool empty(type, /*pooled=*/false, payload);
+            EXPECT_TRUE(SameTemplate(off, empty.build(/*v24=*/true, false))) << "as if it was never pooled";
+            EXPECT_TRUE(SameTemplate(on, empty.build(/*v24=*/true, true)));
+            EXPECT_TRUE(SameTemplate(p.build(/*v24=*/false, false), p.build(/*v24=*/false, true)))
+                << "before v24 OFF = ON";
+        }
     }
 }
 
@@ -3760,6 +3832,17 @@ TEST(DashV24AllTx, V24ProviderOptOutEmitGateRefusesTypes10To12)
         SCOPED_TRACE("v1/v2 type " + std::to_string(t.type));
         (void)st.embedded_template_emit_ok(only(t), &why);
         EXPECT_NE(why.cause, "emit-v24-provider-tx-opted-out");
+    }
+    // Fail closed: a type 1-4 payload that does not parse is refused too.
+    for (const int type : {1, 2, 3, 4}) {
+        for (const auto& [what, payload] : unparsed_payloads(w, type)) {
+            SCOPED_TRACE("unparsed type " + std::to_string(type) + ", " + what);
+            auto t = tx_with_inputs(static_cast<uint16_t>(type), {{h256(0x9c), 0}});
+            t.extra_payload = payload;
+            EXPECT_FALSE(st.embedded_template_emit_ok(only(t), &why));
+            EXPECT_EQ(why.cause, "emit-v24-provider-tx-opted-out");
+            EXPECT_EQ(why.value, "type=" + std::to_string(type) + "-unparsed-protx");
+        }
     }
     // The same node, opted back in, serves the dissolution again.
     st.set_include_v24_provider_txs(true);

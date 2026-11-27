@@ -802,10 +802,11 @@ inline DashWorkData build_embedded_workdata(
     bool want_xcheck_aid = false,
     // --embedded-include-v24-provider-txs (default true). With the special-tx
     // superset armed and v24 active, false keeps the shared-masternode types
-    // 10-12 (ProDisTx, ProUpShareTx, ProUpSharedRegTx) and every version-3
-    // (ExtAddr) ProTx payload of types 1-4, shared registrations included
-    // (mempool.hpp is_v24_format_protx), out of selection, while version 1/2
-    // ProTx and type 7 still ride. A ProDisTx then never reaches the body,
+    // 10-12 (ProDisTx, ProUpShareTx, ProUpSharedRegTx) and every type 1-4 tx
+    // that is not a parsed version 1/2 ProTx (version 3, shared registrations
+    // included, and any payload that does not parse; mempool.hpp
+    // is_v24_opt_out_protx) out of selection, while version 1/2 ProTx and
+    // type 7 still ride. A ProDisTx then never reaches the body,
     // so its collateral-spend exemption below never applies. true (default)
     // => byte-identical to the template before this parameter existed.
     bool include_v24_provider_txs = true)
@@ -918,17 +919,19 @@ inline DashWorkData build_embedded_workdata(
     // the selection applies Core v24's type list. MNHF signals (type 7) ride
     // the lever when their checks are wired (mnhf_check.hpp); they change no
     // CbTx root. include_v24_provider_txs=false (operator opt-out) masks types
-    // 10-12 and version-3 (ExtAddr) ProTx payloads of types 1-4 alone: version
-    // 1/2 ProTx and type 7 are unaffected.
+    // 10-12 and every type 1-4 tx that is not a parsed version 1/2 ProTx
+    // alone: version 1/2 ProTx and type 7 are unaffected.
     Mempool::SpecialTxSelectMask special_mask;
     special_mask.allow_all_special = false;                 // never the general path here
     special_mask.allow_mn_types    = include_mn_special_txs && (sml != nullptr);
     special_mask.allow_locks       = accrue_pending_asset_locks;
     special_mask.allow_v24_provider = special_mask.allow_mn_types && v24_active
                                       && include_v24_provider_txs;
-    // The opt-out also holds every ProTx payload format only valid under v24:
-    // version 3 of types 1-4, shared registrations included. Set only under v24.
-    special_mask.hold_v24_format_protx = v24_active && !include_v24_provider_txs;
+    // The opt-out also holds every type 1-4 tx unless its payload parses with
+    // ProTx version 1 or 2: version 3 (only valid under v24; shared
+    // registrations included) and, failing closed, a payload that does not
+    // parse. Set only under v24.
+    special_mask.hold_non_legacy_protx = v24_active && !include_v24_provider_txs;
     special_mask.allow_mnhf        = include_mn_special_txs && mnhf_check_env != nullptr;
     special_mask.v24_rules         = v24_active;
     // suppress_mempool_txs: coinbase-only body, total_fees == 0 exactly. The
