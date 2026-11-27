@@ -938,18 +938,41 @@ built and committed in the job's coinbase, as in p2pool.
      `LTCADDR/98:DOGEADDR/63:PEPADDR`.
 4. **Empty login, or an LTC address that is invalid or another coin's** — the
    login is accepted and its shares are redistributed by `--redistribute`
-   (`pplns|fee|boost|donate`, see [Configuration reference](#configuration-reference-ltc-binary)),
-   as p2pool does: the LTC payout goes to the recipient the mode picks, and
+   (`split|pplns|fee|boost|donate`, see [Configuration reference](#configuration-reference-ltc-binary)).
+   The default, `split`, pays every such share 50% to the node owner and 50%
+   to the donation: the share pays the node owner (`--node-owner-address`, else
+   `--address`) with donation 32768/65535 instead of `--give-author`'s, so
+   PPLNS gives the owner and the donation half of its weight each, on LTC and
+   on every merged chain the share names no address for (the owner's merged
+   address there: `--node-owner-merged-address` for DOGE, else the owner's key
+   converted; a P2SH owner key is not converted, that chain's half goes to the
+   donation). Without a usable owner address the node keeps the old `pplns`
+   behaviour, or the other terms of a hybrid spec (logged once at startup). The job sent right after
+   `mining.subscribe`, built before the login, is such work too: a share found
+   on it and submitted after the authorize pays the owner and the donation the
+   same way. With the other modes, as p2pool does: the LTC payout goes to the
+   recipient the mode picks, and
    every merged chain the share names no address for gets that recipient's key
    (the node owner's merged addresses when it is the owner) — written into the
-   share, so every node derives the same payout. With a valid DOGE address as
-   the second address of an invalid LTC address, the LTC payout uses that DOGE
-   address's key instead (p2pool's "case 4"). The log warns per miner and the
-   dashboard's workers list shows "address invalid → redistributed".
-   A P2WSH/P2TR LTC address cannot be carried by a V36 share (a 20-byte payout
-   hash): its LTC payout is redistributed the same way, with the same warning
-   in the log and "P2WSH/P2TR address → redistributed" in the workers list; the
-   LTC payout is never taken from a merged chain's address for it. A swapped
+   share, so every node derives the same payout. Attributable work is never
+   halved (p2pool's "case 4", extended): a login whose LTC address is invalid,
+   empty or another coin's, or one a V36 share cannot carry (P2WSH/P2TR: a
+   32-byte witness program, while a share carries a 20-byte payout hash), and
+   that names a merged address has its LTC payout paid to that address's key,
+   with the node's normal donation; the merged addresses are paid as given.
+   The address must be one the login named (comma or slash form, a
+   re-authorize of the same LTC address, `mining.set_merged_addresses` after
+   the authorize, or before the first authorize of a new connection), of a
+   configured merged chain on this network, in a legacy form: P2PKH (paid as
+   P2PKH) or P2SH (paid as P2SH); a bech32 merged address does not count.
+   DOGE's is used if named, else the lowest configured chain id's. The
+   workers list shows "address invalid → parent paid to the DOGE address's
+   key" or "P2WSH/P2TR address → parent paid to the DOGE address's key"
+   ("the chain_id=N address's key" for another chain). An address set while
+   another login was accepted on the connection never counts. A login naming
+   no usable address is redistributed as above, with a warning in the log
+   ("address invalid → redistributed", "P2WSH/P2TR address → redistributed"
+   in the workers list). A swapped
    pair whose first address is not valid (`DOGE-with-bad-checksum,LTCADDR`)
    pays the valid LTC address, as before.
 
@@ -1297,7 +1320,7 @@ legacy YAML key set.
 | `--give-author` | `donation_percentage` | 0.1 | Developer fee % (p2pool default: 0.5%) |
 | `-f` / `--fee` | `node_owner_fee` | 0 | Node owner fee %: with that probability a job (decided when it is built, as p2pool does) is the owner's, on LTC and on every merged chain |
 | `--node-owner-address` | `node_owner_address` | -- | Node owner payout address |
-| `--redistribute` | `redistribute` | pplns | Mode: pplns/fee/boost/donate — where the shares of an empty, invalid or other-coin login go, on the parent and every merged chain (accepted, not refused; see [Who is paid on a merged chain](#who-is-paid-on-a-merged-chain-c2pool-ltc-sharechain-mode)) |
+| `--redistribute` | `redistribute` | split | Mode: split/pplns/fee/boost/donate — where the shares of an empty, invalid or other-coin login (and of the job built before the login) go, on the parent and every merged chain (accepted, not refused; see [Who is paid on a merged chain](#who-is-paid-on-a-merged-chain-c2pool-ltc-sharechain-mode)). `split`: 50% node owner / 50% donation (each such share pays the owner with donation 32768/65535); pplns without a node-owner address |
 | `--merged SYMBOL:CHAIN_ID:HOST:PORT:USER:PASS[:P2P_PORT]` | `merged` | DOGE:98 (embedded) | Merged-mined aux chain (repeatable) |
 | `--merged-payout-address SYMBOL:ADDRESS` | `merged_payout_addresses` | DOGE built-in | That chain's address for `createauxblock` (required for every RPC chain but DOGE; DGB and chains without address parameters are exempt); the node owner's address on that chain for its node-fee shares (chains other than DOGE) (repeatable) |
 | `--node-owner-merged-address` | `node_owner_merged_address` | -- | Node owner's DOGE address (alias `--merged-operator-address`, as in p2pool): the DOGE address written into the owner's own shares (node-fee shares, redistributed shares landing on the owner's key). Unset or not a DOGE address of the network: the owner's LTC key, converted (P2PKH/P2WPKH only; a P2SH `--node-owner-address` is not converted and the donation script is written, with a warning). It is not a payout-time redirect: peers derive the same payouts from the shares |
@@ -1537,7 +1560,7 @@ dashd-attached default OFF)
 | `--give-author PCT` (alias `--dev-donation`) | 0.1 | Author donation percent. |
 | `-f` / `--fee PCT` | 0 | Node-owner fee percent. |
 | `--node-owner-address ADDR` | — | Fee destination. |
-| `--redistribute pplns\|fee\|boost\|donate` | `pplns` | Unnamed-share redistribution. |
+| `--redistribute split\|pplns\|fee\|boost\|donate` | `split` | Where the shares of a login with no usable (P2PKH) payout address go. `split`: 50% node owner / 50% donation (the share pays `--node-owner-address` with donation 32768/65535); pplns without a usable `--node-owner-address`. |
 | `--coinbase-text TEXT` | `/P2Pool-DASH/c2pool/` | Coinbase scriptSig text, max 64 bytes (see [Coinbase structure](#coinbase-structure)). |
 | `--message-blob-hex HEX` (alias `--transition-message`) | — | Encrypted authority message blob. |
 | `--deferred-mint` / `--no-deferred-mint` | off | A share solved while the tracker is busy is minted at the next free lock instead of being declined. |
@@ -1620,7 +1643,7 @@ destination.
 | `--regtest`, `--regtest-force-won-share` | off | Regtest marker; forced won share is refused unless `--regtest` **and** `--coin-daemon` are both given. |
 | `--no-p2p-relay` | off | Suppress the embedded won-block relay (isolates the RPC arm). |
 | `--dev-relax-algo-softforks` | off | Dev-only: relax the algo-softfork readiness gate for an isolated tuned testnet; ignored on mainnet. |
-| `--redistribute SPEC` | `pplns` | `pplns\|fee\|boost\|donate` or hybrid `boost:70,donate:20`. |
+| `--redistribute SPEC` | `pplns` | `pplns\|fee\|boost\|donate` or hybrid `boost:70,donate:20`. `split` is not available on DGB yet: a spec naming it is warned about and binds no policy. |
 | `--node-owner-address ADDR` | — | Operator payout identity for the `fee` arm and for `-f`/`--fee`. |
 | `-f` / `--fee PCT` | 0 | Node-owner fee percent; needs `--node-owner-address`. |
 | `--give-author PCT` (alias `--dev-donation`) | 0.1 | Author donation percent. |

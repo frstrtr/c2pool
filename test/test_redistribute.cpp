@@ -2,6 +2,9 @@
 #include <gtest/gtest.h>
 #include <impl/ltc/redistribute.hpp>
 #include <map>
+#include <string>
+#include <utility>
+#include <vector>
 
 using namespace ltc;
 
@@ -37,11 +40,89 @@ TEST(RedistributeV2, HybridParse_TwoModes)
     EXPECT_EQ(w[1].weight, 20);
 }
 
+// The default (an empty spec, main_ltc's --redistribute default) is split:
+// work the node cannot attribute pays the node owner and the donation half
+// and half (--redistribute split, 2026-11-27; was pplns).
 TEST(RedistributeV2, HybridParse_Empty)
 {
     auto w = parse_redistribute_spec("");
     ASSERT_EQ(w.size(), 1);
+    EXPECT_EQ(w[0].mode, RedistributeMode::SPLIT);
+}
+
+TEST(RedistributeSplit, TheDefaultModeIsSplit)
+{
+    EXPECT_STREQ(kDefaultRedistributeMode, "split");
+    auto w = parse_redistribute_spec(kDefaultRedistributeMode);
+    ASSERT_EQ(w.size(), 1u);
+    EXPECT_EQ(w[0].mode, RedistributeMode::SPLIT);
+    EXPECT_EQ(w[0].weight, 100u);
+    EXPECT_TRUE(spec_selects_split(w));
+    EXPECT_EQ(parse_single_mode("split"), RedistributeMode::SPLIT);
+    EXPECT_STREQ(redistribute_mode_str(RedistributeMode::SPLIT), "split");
+    EXPECT_EQ(format_hybrid_weights(w), "split");
+    // split in a hybrid spec selects split (it is not a weight)
+    EXPECT_TRUE(spec_selects_split(parse_redistribute_spec("boost:70,split:30")));
+}
+
+// The old modes parse and select as before, and select no split.
+TEST(RedistributeSplit, TheOldModesAreUnchanged)
+{
+    for (const auto& [spec, mode] : std::vector<std::pair<std::string, RedistributeMode>>{
+             {"pplns", RedistributeMode::PPLNS}, {"fee", RedistributeMode::FEE},
+             {"boost", RedistributeMode::BOOST}, {"donate", RedistributeMode::DONATE},
+             {"garbage", RedistributeMode::PPLNS}}) {
+        const auto w = parse_redistribute_spec(spec);
+        ASSERT_EQ(w.size(), 1u) << spec;
+        EXPECT_EQ(w[0].mode, mode) << spec;
+        EXPECT_FALSE(spec_selects_split(w)) << spec;
+    }
+    EXPECT_FALSE(spec_selects_split(parse_redistribute_spec("boost:70,donate:20,fee:10")));
+}
+
+// No node-owner address: split cannot pay the owner half; the Redistributor
+// runs the spec's other terms (main_ltc.cpp: split_fallback_weights of the
+// spec, whatever the owner): split alone is the old pplns, a hybrid keeps its
+// other terms and their weights, and a spec without split is unchanged.
+TEST(RedistributeSplit, TheNoOwnerFallbackIsPplns)
+{
+    const auto w = split_fallback_weights(parse_redistribute_spec("split"));
+    ASSERT_EQ(w.size(), 1u);
     EXPECT_EQ(w[0].mode, RedistributeMode::PPLNS);
+    EXPECT_EQ(w[0].weight, 100u);
+    EXPECT_FALSE(spec_selects_split(w));
+    EXPECT_EQ(format_hybrid_weights(split_fallback_weights(parse_redistribute_spec(""))), "pplns");
+    Redistributor r;
+    r.set_hybrid_weights(w);
+    EXPECT_EQ(r.mode(), RedistributeMode::PPLNS);
+}
+
+TEST(RedistributeSplit, AHybridWithoutAnOwnerKeepsItsOtherTerms)
+{
+    auto w = split_fallback_weights(parse_redistribute_spec("boost:70,split:30"));
+    ASSERT_EQ(w.size(), 1u);
+    EXPECT_EQ(w[0].mode, RedistributeMode::BOOST);
+    EXPECT_EQ(w[0].weight, 70u);
+    w = split_fallback_weights(parse_redistribute_spec("split:50,donate:30,fee:20"));
+    ASSERT_EQ(w.size(), 2u);
+    EXPECT_EQ(w[0].mode, RedistributeMode::DONATE);
+    EXPECT_EQ(w[0].weight, 30u);
+    EXPECT_EQ(w[1].mode, RedistributeMode::FEE);
+    EXPECT_EQ(w[1].weight, 20u);
+    EXPECT_EQ(format_hybrid_weights(w), "donate:30,fee:20");
+    w = split_fallback_weights(parse_redistribute_spec("split:40,split:60"));
+    ASSERT_EQ(w.size(), 1u);
+    EXPECT_EQ(w[0].mode, RedistributeMode::PPLNS) << "only split terms: pplns";
+    // a spec without split: unchanged (the old modes)
+    for (const char* spec : {"pplns", "fee", "boost", "donate", "boost:70,donate:20,fee:10"}) {
+        const auto in = parse_redistribute_spec(spec);
+        const auto out = split_fallback_weights(in);
+        ASSERT_EQ(out.size(), in.size()) << spec;
+        for (size_t i = 0; i < in.size(); ++i) {
+            EXPECT_EQ(out[i].mode, in[i].mode) << spec;
+            EXPECT_EQ(out[i].weight, in[i].weight) << spec;
+        }
+    }
 }
 
 TEST(RedistributeV2, HybridParse_BackwardCompat)

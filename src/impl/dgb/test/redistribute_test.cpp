@@ -362,4 +362,26 @@ TEST(DgbRedistribute, Issue1312ForeignOrWitnessAddressNeverArms)
     }
 }
 
+// --redistribute split is the LTC and DASH default, not available on DGB yet.
+// A DGB spec naming it (a settings file or the CLI saying "split", alone or
+// as a hybrid term) binds no Redistributor and is warned about (main_dgb.cpp):
+// never read as pplns, which parse_single_mode makes of an unknown mode.
+// Every other spec binds as before; no spec binds nothing, as before.
+TEST(DgbRedistribute, ASplitSpecBindsNoPolicyAndIsNeverReadAsPplns)
+{
+    for (const char* spec : {"split", "split:100", "boost:70,split:30", "split:50,donate:50", "boost:70, split:30",
+                             " split ", "boost:70,\tsplit:30"}) {
+        EXPECT_TRUE(dgb::spec_names_split(spec)) << spec;
+        EXPECT_FALSE(dgb::binds_redistributor(spec)) << spec;
+    }
+    for (const char* spec : {"pplns", "fee", "boost", "donate", "boost:70,donate:20,fee:10", "splitx", "xsplit"}) {
+        EXPECT_FALSE(dgb::spec_names_split(spec)) << spec;
+        EXPECT_TRUE(dgb::binds_redistributor(spec)) << spec;
+    }
+    EXPECT_FALSE(dgb::spec_names_split(""));
+    EXPECT_FALSE(dgb::binds_redistributor("")) << "no --redistribute: no policy, as before";
+    // What binding "split" would have done (the trap): an unknown mode is pplns.
+    EXPECT_EQ(dgb::parse_single_mode("split"), dgb::RedistributeMode::PPLNS);
+}
+
 } // namespace

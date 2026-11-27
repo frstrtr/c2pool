@@ -35,6 +35,8 @@
 
 #include <gtest/gtest.h>
 
+#include <optional>
+
 #include <algorithm>
 #include <map>
 #include <string>
@@ -173,7 +175,8 @@ struct Rig {
         mi.set_ref_hash_fn([this](const uint256&, const std::vector<unsigned char>&,
                                   const std::vector<unsigned char>&, const PayoutKey& rate_key,
                                   uint64_t, uint32_t, uint32_t, bool, const std::string&, const uint256&,
-                                  const Merged&, const std::vector<uint256>&) {
+                                  const Merged&, const std::vector<uint256>&,
+                                  const std::optional<uint16_t>&) {
             MiningInterface::RefHashResult r;
             r.ref_hash.SetHex(std::string(64, '5'));
             r.bits = node.share_bits(rate_key);

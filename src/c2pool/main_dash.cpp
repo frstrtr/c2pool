@@ -733,7 +733,9 @@ void print_banner(const char* argv0)
         << "           [--embedded-no-dashd-mn-seed [--embedded-fold-only-proof]]\n"
         << "           [--oracle-graduation-blocks N] [--oracle-class-coverage K]\n"
         << "           [--give-author PCT] [-f|--fee PCT] [--node-owner-address ADDR]\n"
-        << "           [--redistribute pplns|fee|boost|donate]\n"
+        << "           [--redistribute split|pplns|fee|boost|donate]  (default split: work with no\n"
+        << "              usable payout address pays 50% node owner / 50% donation; pplns without\n"
+        << "              a --node-owner-address)\n"
         << "           [--coin-zmq-hashblock tcp://HOST:PORT]\n"
         << "           [--message-blob-hex HEX] [--coinbase-text TEXT]\n"
         << "       " << argv0 << " --mine-block [--coin-rpc H:P] [--coin-rpc-auth PATH]\n"
@@ -1131,7 +1133,7 @@ int run_selftest()
 //   dev_donation        --give-author (donation_percentage), default 0.1%
 //   node_owner_fee      -f/--fee (node_owner_fee), default 0
 //   node_owner_address  --node-owner-address (fee destination, P2PKH)
-//   redistribute_mode   --redistribute (pplns/fee/boost/donate)
+//   redistribute_mode   --redistribute (split/pplns/fee/boost/donate), default split
 int run_node(bool testnet, const std::string& rpc_endpoint,
              const std::string& rpc_conf_path, const std::string& submit_hex,
              const PeeringConfig& peer,
@@ -4883,11 +4885,25 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         if (fee_policy.node_owner_fee_pct > 0.0 && fee_policy.node_owner_script.empty())
             std::cout << "[run] --fee " << node_owner_fee << " set but no usable "
                          "--node-owner-address -- node-owner fee DISABLED\n";
+        // --redistribute split (the default): shares of work with no usable
+        // payout address pay the node owner with donation 32768/65535 (half
+        // the weight each). No usable owner address: the owner half cannot
+        // be paid, this node runs pplns (said once, here).
+        const bool split_without_owner =
+            fee_policy.redistribute == dash::mint::MintFeePolicy::Redistribute::SPLIT
+            && fee_policy.node_owner_script.empty();
+        if (split_without_owner) {
+            fee_policy.redistribute = dash::mint::MintFeePolicy::Redistribute::PPLNS;
+            std::cout << "[run] --redistribute split: no usable --node-owner-address (a P2PKH DASH "
+                         "address) -- the owner half cannot be paid; unattributable work falls back "
+                         "to pplns (spread over the PPLNS window) on this node\n";
+        }
         std::cout << "[run] fee policy: give-author=" << dev_donation
                   << "% (donation_u16=" << fee_policy.donation_u16
                   << ") node-owner-fee=" << node_owner_fee
                   << "% (owner=" << (fee_policy.node_owner_script.empty() ? "unset" : node_owner_address)
-                  << ") redistribute=" << redistribute_mode << "\n";
+                  << ") redistribute=" << redistribute_mode
+                  << (split_without_owner ? " (no owner: pplns)" : "") << "\n";
 
         // Best-share election: prev_share_hash for new jobs = the live tip
         // think() elected (verified-work-first; ZERO with peers-but-no-
@@ -13105,7 +13121,7 @@ int main(int argc, char** argv)
     std::string web_host      = "0.0.0.0";     // --web-host bind interface
     uint16_t    web_port      = 8080;          // --web-port / --http-port (0 disables)
     std::string dashboard_dir = "web-static";  // --dashboard-dir static asset root
-    std::string redistribute_mode = "pplns";   // --redistribute pplns|fee|boost|donate
+    std::string redistribute_mode = dash::mint::MintFeePolicy::kDefaultRedistribute;   // --redistribute split|pplns|fee|boost|donate
     std::string coin_zmq_hashblock;             // --coin-zmq-hashblock ENDPOINT (opt-in dashd ZMQ hashblock instant tip-notify, e.g. tcp://127.0.0.1:28332)
     // Operator-supplied miner-facing host for the dashboard Stratum URL.
     // Empty => auto-detect the outbound public IP (current behaviour).

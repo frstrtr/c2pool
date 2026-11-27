@@ -1939,7 +1939,13 @@ int run_node(const core::CoinParams& params, bool testnet,
     // touches NOTHING on the sharechain (validation/codec/PPLNS unchanged) -- it
     // is node-local and consensus-safe. Absent --redistribute the fallback stays
     // unbound and the empty-credential path is byte-identical to prior builds.
-    if (!redistribute_spec.empty()) {
+    // A spec naming split (the LTC/DASH default, not available on DGB yet)
+    // binds nothing either, and says so: never read as pplns.
+    if (dgb::spec_names_split(redistribute_spec))
+        std::cout << "[DGB] WARNING: --redistribute \"" << redistribute_spec
+                  << "\": split is not available on DGB yet -- no redistribute policy bound"
+                     " (as without --redistribute)" << std::endl;
+    if (dgb::binds_redistributor(redistribute_spec)) {
         auto redistributor = std::make_shared<dgb::Redistributor>();
         redistributor->set_hybrid_weights(dgb::parse_redistribute_spec(redistribute_spec));
         // "donate" identity: P2SH hash160 == COMBINED_DONATION_SCRIPT[2..22]

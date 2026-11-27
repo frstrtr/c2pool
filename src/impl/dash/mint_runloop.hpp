@@ -443,20 +443,32 @@ inline std::vector<unsigned char> select_embed_blob(
 //                 (100% of the share's PPLNS weight decays to the donation
 //                 script — the DASH-conform expression of "100% to donation",
 //                 since a v16 share MUST carry some pubkey_hash);
+//       split  -> (default) mint under the node owner's identity with
+//                 donation=core::kSplitShareDonation (32768 of 65535): the
+//                 owner and the donation script each get half of the share's
+//                 PPLNS weight. Deterministic, every such share. Without a
+//                 usable owner address the owner half cannot be paid:
+//                 main_dash.cpp runs pplns instead (logged at startup), and
+//                 resolve_mint_identity takes the pplns arm;
 //       pplns/boost -> the LTC weighted-redistribution engine is NOT yet
 //                 ported to DASH; these decline the producer job (the
 //                 pre-existing fail-closed behavior, loudly logged).
 struct MintFeePolicy
 {
-    enum class Redistribute { PPLNS, FEE, BOOST, DONATE };
+    enum class Redistribute { PPLNS, FEE, BOOST, DONATE, SPLIT };
+
+    // The --redistribute default (main_dash.cpp, the param catalog's
+    // money.redistribute).
+    static constexpr const char* kDefaultRedistribute = "split";
 
     uint16_t donation_u16{66};                     // --give-author (default 0.1% -> 66)
     double   node_owner_fee_pct{0.0};              // --fee (0 = off)
     std::vector<unsigned char> node_owner_script;  // --node-owner-address (P2PKH), may be empty
-    Redistribute redistribute{Redistribute::PPLNS};
+    Redistribute redistribute{Redistribute::SPLIT};
 
     static Redistribute parse_redistribute(const std::string& s)
     {
+        if (s == "split")  return Redistribute::SPLIT;
         if (s == "fee")    return Redistribute::FEE;
         if (s == "boost")  return Redistribute::BOOST;
         if (s == "donate") return Redistribute::DONATE;
@@ -597,6 +609,13 @@ inline std::optional<ResolvedIdentity> resolve_mint_identity(
         if (owner_ok)
             return ResolvedIdentity{policy.node_owner_script, 65535, true};
         return std::nullopt;
+    case MintFeePolicy::Redistribute::SPLIT:
+        // Half the share's weight to the owner, half to the donation: the
+        // split donation replaces --give-author's, it is not added to it.
+        if (owner_ok)
+            return ResolvedIdentity{policy.node_owner_script, core::kSplitShareDonation, true};
+        // No usable owner: the owner half cannot be paid -> pplns.
+        [[fallthrough]];
     case MintFeePolicy::Redistribute::PPLNS:
     default: {
         // Weighted-random over the accrued PPLNS window (ltc pick_pplns). Empty

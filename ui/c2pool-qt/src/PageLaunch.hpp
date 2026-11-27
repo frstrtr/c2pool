@@ -153,7 +153,11 @@ private:
     QCheckBox*     giveAuthorZeroAckCheck_{nullptr}; ///< explicit 0% opt-in (reward-safety ack)
     QLineEdit*     nodeOwnerAddrEdit_;
     QLineEdit*     nodeOwnerScriptEdit_; ///< --node-owner-script (hex)
-    QComboBox*     redistributeCombo_;  ///< pplns / fee / boost / donate
+    QComboBox*     redistributeCombo_;  ///< split (default) / pplns / fee / boost / donate
+    /// The operator picked the redistribute mode in the form (saved as
+    /// "redistributeUserSet"). A mode saved before split became the default
+    /// has no such marker: it is not applied, the binary's default is.
+    bool           redistributeUserSet_ = false;
 
     // ── Merged Mining ───────────────────────────────────────────────────────
     /// Columns: Symbol | Chain ID | Host | Port | User | Password | P2P Port

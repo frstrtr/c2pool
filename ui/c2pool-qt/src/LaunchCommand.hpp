@@ -38,6 +38,7 @@
 
 #include "ParamCatalogView.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <optional>
 #include <string>
@@ -87,7 +88,11 @@ struct PerCoinParams {
     bool        giveAuthorSet = false;          ///< operator explicitly overrides the binary default
     double      giveAuthor = 0.0;               ///< money.give_author_pct value
     bool        giveAuthorExplicitZeroAck = false; ///< required to emit an explicit 0
-    std::string redistribute;                   ///< money.redistribute (omit when "pplns")
+    std::string redistribute;                   ///< money.redistribute value
+    /// The operator chose `redistribute` in the form (not a value loaded from a
+    /// settings store written before split became the default). Unset: omitted,
+    /// the binary's default applies (split on LTC/DASH; DGB: no policy).
+    bool        redistributeSet = false;
 
     std::string messageBlob;                    ///< global.message_blob_hex
 
@@ -259,8 +264,10 @@ inline std::vector<std::string> build_percoin_argv(const PerCoinParams& p)
     }
 
     {
+        // Only a mode the operator set, and not split (the LTC/DASH default;
+        // on DGB a spec naming split binds no policy, as without the flag).
         const std::string rd = trim(p.redistribute);
-        if (!rd.empty() && rd != "pplns")
+        if (p.redistributeSet && !rd.empty() && rd != "split")
             emit_value(a, bin, "money.redistribute", rd);
     }
 
@@ -316,6 +323,24 @@ inline std::string legacy_mode_flag(LegacyMode m)
     if (!canon) return std::string();
     auto s = catview::spelling_for(Bin::BIN_LTC, canon);
     return s ? s->first : std::string();
+}
+
+// The redistribute mode a saved launch form restores: {set by the operator,
+// mode to show}. A store written by this version has the user-set marker. An
+// older one saved the combo on every save: its "pplns" was the old default,
+// not a choice (unset: split, the new default, is shown and nothing is
+// passed on; re-select pplns to keep it), while any other mode it saved that
+// the form offers (fee, boost, donate) was the operator's choice and is kept.
+inline std::pair<bool, std::string> restore_redistribute_choice(const std::optional<bool>& user_set_marker,
+                                                                const std::string& saved,
+                                                                const std::vector<std::string>& offered)
+{
+    const bool is_offered = std::find(offered.begin(), offered.end(), saved) != offered.end();
+    if (user_set_marker)
+        return *user_set_marker && is_offered ? std::make_pair(true, saved) : std::make_pair(false, std::string("split"));
+    if (is_offered && saved != "pplns" && saved != "split")
+        return {true, saved};
+    return {false, "split"};
 }
 
 } // namespace c2pool_qt

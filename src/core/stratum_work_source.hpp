@@ -38,6 +38,7 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -89,10 +90,19 @@ public:
     // and merged addresses), decided when the job is built, as p2pool does in
     // get_work: the work source may give the job to the node operator (the
     // node fee) or redistribute a payout a share cannot carry (an empty
-    // login). The share made from the job carries exactly these. Default:
-    // unchanged.
-    virtual void decide_job_payout(std::vector<unsigned char>& /*payout_script*/,
-                                   std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& /*merged*/) const {}
+    // login). The share made from the job carries exactly these. Returns the
+    // donation the job's shares carry when the decision sets one (a split
+    // job, --redistribute split: the node owner's payout with half the
+    // share's weight to the donation); the caller passes it to
+    // build_connection_coinbase_for and keeps it with the job, so the share
+    // carries the donation its ref_hash committed to. None: the node's own.
+    // Default: unchanged, none.
+    virtual std::optional<uint16_t> decide_job_payout(
+        std::vector<unsigned char>& /*payout_script*/,
+        std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& /*merged*/) const
+    {
+        return std::nullopt;
+    }
 
     // A payout address the coin accepts but whose shares the node cannot
     // build (e.g. BCH v35 shares carry only a legacy P2PKH/P2SH address):
@@ -118,6 +128,11 @@ public:
     // need no override; MiningInterface stores it for dashboard display.
     virtual void update_stratum_worker_rtt(const std::string& /*session_id*/,
                                            double /*rtt_ms*/) {}
+
+    // Optional: the worker's payout label changed after its authorize (case
+    // 4 from a later mining.set_merged_addresses). Default no-op.
+    virtual void update_stratum_worker_payout_warning(const std::string& /*session_id*/,
+                                                      const std::string& /*warning*/) {}
 
     // ── Work generation ──────────────────────────────────────────────────
     // Called per-job-issue (when sending mining.notify). Implementors
@@ -164,13 +179,17 @@ public:
     /// job got the easiest share the band allows, 30x easier than its miner's
     /// at the hard edge: its shares weighed 1/30 of the work behind them and
     /// it ended at its first, quick share. Sized by the login, a fee job is
-    /// the job it replaced but for its payout. Default: the plain build.
+    /// the job it replaced but for its payout. `share_donation` is the one
+    /// decide_job_payout returned for the job (none: the node's own); a work
+    /// source whose decide_job_payout sets one commits its shares to it.
+    /// Default: the plain build (the default decide_job_payout sets none).
     virtual CoinbaseResult build_connection_coinbase_for(
         const PayoutKey& /*login_key*/,
         const uint256& prev_share_hash,
         const std::string& extranonce1_hex,
         const std::vector<unsigned char>& payout_script,
-        const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs) const
+        const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs,
+        const std::optional<uint16_t>& /*share_donation*/ = std::nullopt) const
     {
         return build_connection_coinbase(prev_share_hash, extranonce1_hex, payout_script, merged_addrs);
     }

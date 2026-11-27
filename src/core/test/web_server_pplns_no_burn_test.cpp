@@ -29,6 +29,8 @@
 
 #include <gtest/gtest.h>
 
+#include <optional>
+
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -142,7 +144,8 @@ struct Rig {
         mi.set_ref_hash_fn([](const uint256&, const std::vector<unsigned char>&, const std::vector<unsigned char>&,
                               const core::stratum::PayoutKey&, uint64_t, uint32_t, uint32_t, bool, const std::string&, const uint256&,
                               const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>&,
-                              const std::vector<uint256>&) {
+                              const std::vector<uint256>&,
+                              const std::optional<uint16_t>&) {
             MiningInterface::RefHashResult r;
             r.ref_hash.SetHex(std::string(64, '5'));
             r.bits = 0x207fffff;
@@ -378,7 +381,8 @@ TEST(PplnsNoBurn, ConcurrentJobsPayTheirOwnShareAtTheirOwnTemplateValue)
     mi.set_ref_hash_fn([&](const uint256&, const std::vector<unsigned char>&, const std::vector<unsigned char>&,
                            const core::stratum::PayoutKey&, uint64_t, uint32_t, uint32_t, bool, const std::string&, const uint256&,
                            const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>&,
-                           const std::vector<uint256>&) {
+                           const std::vector<uint256>&,
+                           const std::optional<uint16_t>&) {
         MiningInterface::RefHashResult r;
         if (busy.load())
             return r;   // the LTC hook: null while the tracker is busy

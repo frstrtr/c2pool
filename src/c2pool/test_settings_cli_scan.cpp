@@ -218,6 +218,21 @@ int main() {
         }
     }
 
+    // (9) --redistribute's default is split (unattributable work pays the node
+    //     owner and the donation half and half) on DASH and LTC;
+    //     --redistribute pplns still selects the old mode.
+    {
+        const ParamRow* row = find_by_canon("money.redistribute");
+        CHECK(row != nullptr && row->default_literal == "split", "money.redistribute default is split");
+        CHECK(row != nullptr && row->applies_to(C_DASH) && row->applies_to(C_LTC),
+              "money.redistribute applies to DASH and LTC");
+        std::vector<std::string> s = {"prog", "--redistribute", "pplns"};
+        std::vector<char*> p; for (auto& x : s) p.push_back(const_cast<char*>(x.c_str()));
+        CliTracker tr; ResolvedConfig rc; rc.seed_compiled_defaults(C_LTC);
+        scan_cli((int)p.size(), p.data(), Bin::BIN_LTC, tr, rc);
+        CHECK(rc.get_string("money.redistribute").value_or("") == "pplns", "ltc --redistribute pplns -> pplns");
+    }
+
     if (g_fail == 0) std::cout << "\ntest_settings_cli_scan: ALL PASS\n";
     else std::cout << "\ntest_settings_cli_scan: " << g_fail << " FAILURE(S)\n";
     return g_fail == 0 ? 0 : 1;

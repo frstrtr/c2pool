@@ -193,6 +193,9 @@ private:
         bool has_payout{false};
         std::vector<unsigned char> payout_script;
         std::map<uint32_t, std::vector<unsigned char>> merged_scripts;
+        // The donation its ref_hash committed to, when decide_job_payout set
+        // one (a split job); none: the node's own.
+        std::optional<uint16_t> share_donation;
     };
     std::unordered_map<std::string, JobEntry> active_jobs_;
     // Insertion-order companion to active_jobs_ (interim hardening fix #1).
@@ -270,10 +273,19 @@ private:
     std::string login_primary_;
     std::map<uint32_t, std::string> login_given_;
     // The login has no payout address a share can carry (empty, invalid,
-    // another coin's) and the work source redistributes it: the jobs carry
-    // parent_script_ (p2pool's case 4) or an empty payout.
+    // another coin's: unusable; P2WSH / P2TR: uncarried) and the work source
+    // redistributes it: the jobs carry parent_script_ (p2pool's case 4,
+    // update_case4_parent) or an empty payout.
     bool payout_unusable_{false};
+    bool payout_uncarried_{false};
     std::vector<unsigned char> parent_script_;
+    // mining.set_merged_addresses received before the first authorize of a
+    // connection: the first accepted login's own, for the chains it names no
+    // address for (folded into its login_given_, then cleared).
+    std::map<uint32_t, std::string> pre_auth_merged_;
+    bool ever_authorized_{false};   // a login was accepted on this connection
+    // Returns whether the payout changed (see stratum_server.cpp).
+    bool update_case4_parent(bool at_authorize);
     std::string payout_warning_;   // shown with the worker ("address invalid → redistributed")
     // The scriptPubKey a merged entry pays on its chain
     // (core::merged_addr::merged_payout_script).

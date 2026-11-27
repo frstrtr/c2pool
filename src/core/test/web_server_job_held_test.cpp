@@ -17,6 +17,8 @@
 
 #include <gtest/gtest.h>
 
+#include <optional>
+
 #include <map>
 #include <string>
 #include <vector>
@@ -69,7 +71,8 @@ struct Rig {
                                   uint64_t, uint32_t, uint32_t,
                                   bool, const std::string&, const uint256&,
                                   const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>&,
-                                  const std::vector<uint256>&) {
+                                  const std::vector<uint256>&,
+                                  const std::optional<uint16_t>&) {
             MiningInterface::RefHashResult r;
             if (ref_busy)
                 return r;   // the tracker try-lock failed: {}

@@ -2,6 +2,38 @@
 
 ## [Unreleased]
 
+### Unattributable work now pays 50% node owner / 50% donation (was spread over PPLNS)
+- `--redistribute split`, the new default (LTC with its merged chains, and
+  DASH): a share of work the node cannot attribute to a payout address (an
+  empty, invalid, other-coin or P2WSH/P2TR login naming no merged address;
+  the job sent right after `mining.subscribe`, built before the
+  login, whose shares can arrive after the authorize) pays the node owner
+  (`--node-owner-address`; on LTC else `--address`) with donation 32768/65535
+  instead of `--give-author`'s.
+  PPLNS splits each share's weight by its own donation field, so the owner and
+  the donation get half of it each, on LTC and on every merged chain (the
+  owner's merged address: `--node-owner-merged-address` for DOGE, else the
+  owner's key converted; a P2SH owner key is not converted, that chain's half
+  goes to the donation; an address the login names for a chain stays). Every
+  such share, deterministically; no consensus change.
+- Attributable work is never halved (p2pool's case 4, extended): a login
+  whose LTC address is invalid, empty, another coin's, or P2WSH/P2TR, and that
+  names a merged address (comma or slash form, a re-authorize of the same LTC
+  address, `mining.set_merged_addresses` after the authorize or before the
+  first authorize of a new connection) of a configured chain on this network
+  in P2PKH or P2SH form is paid on LTC to that address's key (DOGE's, else the
+  lowest configured chain's), with the node's donation, its merged addresses
+  as given. An address set while another login was accepted never counts.
+  Split applies only to a login naming no usable address.
+- Qt launcher: a saved pplns is no longer applied; re-select it if you want
+  it. A saved fee, boost or donate is kept; split is not passed on.
+- Without a usable node-owner address the owner half cannot be paid: the node
+  keeps the old `pplns` behaviour (a hybrid spec: its other terms), said once
+  at startup. `pplns`, `fee`, `boost` and `donate` are unchanged and still
+  selectable.
+- DGB is unchanged (`--redistribute` stays opt-in); a DGB spec naming `split`
+  is warned about and binds no policy.
+
 ### --stratum-tls: a stratum listener that speaks TLS (stratum+ssl://)
 - On plain Stratum V1 a miner cannot verify who sends it work: anything on the
   path can pose as the pool and take the hashrate. `--stratum-tls [HOST:]PORT`

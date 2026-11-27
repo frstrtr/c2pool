@@ -121,9 +121,16 @@ login without an explicit merged address is therefore warned ("P2SH address:
 if segwit-wrapped, give a DOGE address" in the workers list): give your DOGE
 address explicitly, `LTC_ADDRESS,DOGE_ADDRESS`. The 32-byte
 witness programs (P2WSH/P2TR) can't be carried by a V36 share (a 20-byte
-payout hash): its LTC payout is redistributed like an invalid address's
-("P2WSH/P2TR address → redistributed"); merged addresses you name are still
-paid.
+payout hash). Give a merged address with it (`LTC_ADDRESS,DOGE_ADDRESS`,
+`LTC_ADDRESS/98:DOGE_ADDRESS`, or `mining.set_merged_addresses` after the
+authorize, or before the first one on a new connection): the LTC payout is
+then paid to that address's key (DOGE's, else the lowest configured chain's;
+a P2PKH or P2SH address, not a bech32 one) and the merged chains to the
+addresses you gave, with the node's normal donation, so you are paid on both
+chains ("P2WSH/P2TR address → parent paid to the DOGE address's
+key"). Without a merged address its payout is redistributed like an invalid
+address's ("P2WSH/P2TR address → redistributed": by default 50% to the node
+owner, 50% to the donation).
 
 **To override or set addresses per chain explicitly**, use any of:
 
@@ -149,9 +156,16 @@ with the slash form (`LTCADDR/98:DOGEADDR`) to be paid there. An address with a
 bad checksum is ignored the same way.
 
 An empty username, an invalid address or another coin's address is not
-refused: its shares are redistributed by the node's `--redistribute` mode (on
-LTC and on every merged chain), as p2pool does; the dashboard's workers list
-marks such logins "address invalid → redistributed".
+refused. With a P2PKH/P2SH merged address in the login (or set with
+`mining.set_merged_addresses`), the
+LTC payout is that address's key, with the node's normal donation ("address
+invalid → parent paid to the DOGE address's key"); without one its shares are
+redistributed by the node's `--redistribute` mode (on LTC and on every merged
+chain); the dashboard's workers list marks such logins "address invalid →
+redistributed". The default mode, `split`, pays each such
+share 50% to the node owner and 50% to the donation (the share pays the node
+owner with donation 32768/65535); a node without a node-owner address uses
+`pplns` (spread over the PPLNS window, as p2pool does).
 
 ### Which mode pays whom?
 

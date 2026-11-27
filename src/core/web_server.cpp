@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #include <c2pool/merged/aux_commitment_rule.hpp>
 #include <core/host_port.hpp>
+#include <core/author_fee.hpp>  // kSplitShareDonation (--redistribute split)
 #include "web_server.hpp"
 #include "stratum_server.hpp"
 #include "analytics_tag.hpp"   // set_analytics_id: only a measurement ID is served
@@ -492,16 +493,50 @@ std::vector<unsigned char> hash160_hex_script(const std::string& h160, uint8_t t
 //     its payout is the operator's script and its merged addresses the
 //     operator's (p2pool replaces them on a fee draw);
 //   - a payout a V36 share cannot carry (an empty login, a P2WSH/P2TR
-//     primary): redistributed by --redistribute. Never from a merged chain's
-//     script (the old submit-time "Case 4" took the LTC payout from the DOGE
-//     entry);
+//     primary, the job built before the login): work the node cannot
+//     attribute. With --redistribute split (set_split_owner) the job pays
+//     the node owner with core::kSplitShareDonation as its shares' donation:
+//     PPLNS gives the owner and the donation half of each such share's
+//     weight each, on the parent and every merged chain (the returned
+//     donation; the job's ref_hash commits to it). Otherwise redistributed
+//     by --redistribute (pplns, fee, boost, donate). Never from a merged
+//     chain's script (the old submit-time "Case 4" took the LTC payout from
+//     the DOGE entry);
 //   - a share paying the operator's key with no merged address gets the
 //     operator's merged addresses (p2pool: the operator's merged payout on
 //     its own key).
-// Deciding this at job time is what makes the share's pubkey and merged
-// addresses those its coinbase's ref_hash committed to.
-void MiningInterface::decide_job_payout(std::vector<unsigned char>& payout_script,
-                                        std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged) const
+// Deciding this at job time is what makes the share's pubkey, donation and
+// merged addresses those its coinbase's ref_hash committed to.
+bool MiningInterface::set_split_owner(const std::vector<unsigned char>& script,
+                                      std::map<uint32_t, std::vector<unsigned char>> merged_scripts,
+                                      std::vector<unsigned char> merged_donation_script)
+{
+    uint8_t type = 0;
+    const std::string h160 = script_hash160_hex(script, type);
+    // A merged chain the job names no address for: the owner's key converted
+    // (P2PKH and P2WPKH as P2PKH); a P2SH key is not converted (a same-hash
+    // P2SH on a chain without segwit is anyone-can-spend once a
+    // segwit-wrapped redeem script is public): the donation.
+    std::vector<unsigned char> floor;
+    if (h160.size() == 40)
+        floor = type == 2 ? std::move(merged_donation_script) : core::hash160_to_merged_script(h160, "p2pkh");
+    const bool usable = h160.size() == 40 && h160 != std::string(40, '0') && !floor.empty();
+    std::lock_guard<std::mutex> l(m_redistribute_mu);
+    if (!usable) {
+        m_split_owner_script.clear();
+        m_split_owner_merged_scripts.clear();
+        m_split_owner_merged_floor.clear();
+        return false;
+    }
+    m_split_owner_script = script;
+    m_split_owner_merged_scripts = std::move(merged_scripts);
+    m_split_owner_merged_floor = std::move(floor);
+    return true;
+}
+
+std::optional<uint16_t> MiningInterface::decide_job_payout(
+    std::vector<unsigned char>& payout_script,
+    std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged) const
 {
     uint8_t op_type = 0;
     const std::string op_h160 = script_hash160_hex(m_node_fee_script, op_type);
@@ -514,20 +549,50 @@ void MiningInterface::decide_job_payout(std::vector<unsigned char>& payout_scrip
             payout_script = m_node_fee_script;
             if (!m_operator_merged_scripts.empty())
                 merged.assign(m_operator_merged_scripts.begin(), m_operator_merged_scripts.end());
-            return;
+            return std::nullopt;
         }
     }
     uint8_t type = 0;
     std::string h160 = script_hash160_hex(payout_script, type);
     bool redistributed = false;
     if (h160.empty()) {
-        // Case 3 (p2pool work.py): no payout a share can carry → redistribute.
+        // Case 3 (p2pool work.py): no payout a share can carry.
         std::function<std::pair<std::string, uint8_t>()> redistribute;
         address_fallback_fn_t fallback;
+        std::vector<unsigned char> split_owner;
+        std::map<uint32_t, std::vector<unsigned char>> split_merged;
+        std::vector<unsigned char> split_floor;
         {
             std::lock_guard<std::mutex> l(m_redistribute_mu);
             redistribute = m_redistribute_fn;
             fallback = m_address_fallback_fn;
+            split_owner = m_split_owner_script;
+            split_merged = m_split_owner_merged_scripts;
+            split_floor = m_split_owner_merged_floor;
+        }
+        // --redistribute split: the node owner, half of the share's weight
+        // to the donation. The merged chains the job names an address for
+        // keep it; every other configured chain gets the owner's script
+        // there (its merged address, else its key converted, P2PKH; a P2SH
+        // key is not converted: the donation; set_split_owner), written into
+        // the share (Tier 1).
+        uint8_t owner_type = 0;
+        const std::string owner_h160 = script_hash160_hex(split_owner, owner_type);
+        if (owner_h160.size() == 40) {
+            payout_script = split_owner;
+            if (m_mm_manager) {
+                const auto& floor = split_floor;
+                for (const auto& ci : m_mm_manager->get_chain_infos()) {
+                    const bool has = std::any_of(merged.begin(), merged.end(),
+                                                 [&](const auto& e) { return e.first == ci.chain_id; });
+                    if (has)
+                        continue;
+                    const auto it = split_merged.find(ci.chain_id);
+                    merged.emplace_back(ci.chain_id, it != split_merged.end() ? it->second : floor);
+                }
+                std::sort(merged.begin(), merged.end());
+            }
+            return core::kSplitShareDonation;
         }
         if (redistribute) {
             auto [h, t] = redistribute();
@@ -569,6 +634,7 @@ void MiningInterface::decide_job_payout(std::vector<unsigned char>& payout_scrip
         }
         std::sort(merged.begin(), merged.end());
     }
+    return std::nullopt;
 }
 
 bool MiningInterface::check_merged_mining(const std::string& header_hex,
@@ -1373,7 +1439,7 @@ MiningInterface::build_connection_coinbase(
     const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs) const
 {
     return build_job_coinbase(prev_share_hash, extranonce1_hex, payout_script, merged_addrs,
-                              core::stratum::payout_script_key(payout_script));
+                              core::stratum::payout_script_key(payout_script), std::nullopt);
 }
 
 MiningInterface::CoinbaseResult
@@ -1382,11 +1448,13 @@ MiningInterface::build_connection_coinbase_for(
     const uint256& prev_share_hash,
     const std::string& extranonce1_hex,
     const std::vector<unsigned char>& payout_script,
-    const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs) const
+    const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs,
+    const std::optional<uint16_t>& share_donation) const
 {
     // Sized by the login's key, the key its pseudoshares are recorded under
     // (zero for a keyless login): a fee or redistributed job is its miner's.
-    return build_job_coinbase(prev_share_hash, extranonce1_hex, payout_script, merged_addrs, login_key);
+    return build_job_coinbase(prev_share_hash, extranonce1_hex, payout_script, merged_addrs, login_key,
+                              share_donation);
 }
 
 MiningInterface::CoinbaseResult
@@ -1395,7 +1463,8 @@ MiningInterface::build_job_coinbase(
     const std::string& extranonce1_hex,
     const std::vector<unsigned char>& payout_script,
     const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs,
-    const core::stratum::PayoutKey& rate_key) const
+    const core::stratum::PayoutKey& rate_key,
+    const std::optional<uint16_t>& share_donation) const
 {
     // ── Lock hierarchy: m_work_mutex (1) > sessions_mutex_ (2) > MM::m_mutex (3) ──
     //
@@ -1768,7 +1837,7 @@ MiningInterface::build_job_coinbase(
         prev_share_hash,
         scriptsig_bytes, payout_script, rate_key, subsidy, bits, timestamp,
         ws.segwit_active, ws.witness_commitment, effective_witness_root,
-        merged_addrs, branches_u256);
+        merged_addrs, branches_u256, share_donation);
     LOG_TRACE << "[build_cb] ref_hash_fn returned, bits=" << std::hex << rhr.bits << std::dec;
     if (rhr.ref_hash.IsNull()) {
         // No ref_hash (the tracker is busy): every share of a coinbase
@@ -11948,6 +12017,14 @@ void MiningInterface::update_stratum_worker(const std::string& session_id,
     }
 }
 
+void MiningInterface::update_stratum_worker_payout_warning(const std::string& session_id, const std::string& warning)
+{
+    std::lock_guard<std::mutex> lock(m_stratum_workers_mutex);
+    auto it = m_stratum_workers.find(session_id);
+    if (it != m_stratum_workers.end())
+        it->second.payout_warning = warning;
+}
+
 void MiningInterface::update_stratum_worker_rtt(const std::string& session_id, double rtt_ms)
 {
     std::lock_guard<std::mutex> lock(m_stratum_workers_mutex);
@@ -13837,7 +13914,10 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
         std::string share_address;
         uint8_t share_addr_type = 0; // 0=P2PKH, 1=P2WPKH, 2=P2SH
         std::map<uint32_t, std::vector<unsigned char>> share_merged = merged_addresses;
+        // The share's donation: the job's (a split job), else the node's own.
+        std::optional<uint16_t> share_donation;
         if (job && job->has_payout) {
+            share_donation = job->share_donation;
             share_address = script_hash160_hex(job->payout_script, share_addr_type);
             if (share_address.size() != 40)
                 LOG_WARNING << "mining_submit: job payout of '" << primary_addr
@@ -13854,7 +13934,7 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
                 ? hash160_hex_script(share_address, share_addr_type) : std::vector<unsigned char>{};
             std::vector<std::pair<uint32_t, std::vector<unsigned char>>> merged(merged_addresses.begin(),
                                                                                 merged_addresses.end());
-            decide_job_payout(payout, merged);
+            share_donation = decide_job_payout(payout, merged);
             share_address = script_hash160_hex(payout, share_addr_type);
             share_merged = std::map<uint32_t, std::vector<unsigned char>>(merged.begin(), merged.end());
             if (share_address.size() != 40)
@@ -13936,6 +14016,7 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
             }
 
             params.merged_addresses = share_merged;
+            params.share_donation = share_donation;
             params.nonce = static_cast<uint32_t>(std::stoul(nonce, nullptr, 16));
             params.timestamp = static_cast<uint32_t>(std::stoul(ntime, nullptr, 16));
 
