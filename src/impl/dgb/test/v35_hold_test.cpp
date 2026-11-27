@@ -173,9 +173,12 @@ TEST(DgbV35Hold, V36SharesAreRefusedWhileHeld)
         return {};
     };
     dgb::v36_shares_accepted_flag().store(false);
+    EXPECT_FALSE(dgb::v36_shares_accepted());
     EXPECT_NE(reason().find("held at V35"), std::string::npos) << reason();
+    // With the opt-in the share goes on to the rest of the checks (not run on
+    // this empty share here).
     dgb::v36_shares_accepted_flag().store(true);
-    EXPECT_EQ(reason().find("held at V35"), std::string::npos) << reason();
+    EXPECT_TRUE(dgb::v36_shares_accepted());
 
     std::ifstream f(DGB_MAIN_SRC);
     std::stringstream ss;
