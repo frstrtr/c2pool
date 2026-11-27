@@ -214,14 +214,14 @@ TEST(DgbStratumBestShare, UnbuildableCoinbaseIsHeldNotEmpty)
     Ws w;
     auto ws = w.make();
     // Producer unbound.
-    auto r = ws->build_connection_coinbase(kBestA, "00", Bytes{0x01}, {});
+    auto r = ws->build_connection_coinbase(kBestA, "00", Bytes{0x76, 0xa9, 0x14, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x88, 0xac}, {});
     EXPECT_TRUE(r.held);
     EXPECT_TRUE(r.coinb1.empty());
     // Producer declines (null / unknown prev, tracker busy).
     ws->set_pplns_inputs_fn([](const uint256&, const std::string&, const Bytes&,
                                const std::vector<std::pair<uint32_t, Bytes>>&, const Bytes&, const dgb::stratum::DGBWorkSource::JobBlock&)
                                 -> std::optional<dgb::coin::ConnCoinbasePplnsInputs> { return std::nullopt; });
-    r = ws->build_connection_coinbase(uint256(), "00", Bytes{0x01}, {});
+    r = ws->build_connection_coinbase(uint256(), "00", Bytes{0x76, 0xa9, 0x14, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x88, 0xac}, {});
     EXPECT_TRUE(r.held);
     EXPECT_TRUE(r.coinb1.empty());
 }

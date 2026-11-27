@@ -457,6 +457,17 @@ void DGBWorkSource::decide_job_payout(std::vector<unsigned char>& payout_script,
                  merged.end());
 }
 
+namespace {
+// The payouts a DGB share carries: a P2PKH, P2SH or 20-byte P2WPKH script (a
+// V35 share's address, a V36 share's 20-byte payout hash).
+bool payout_carried(const std::vector<unsigned char>& s)
+{
+    return (s.size() == 25 && s[0] == 0x76 && s[1] == 0xa9 && s[2] == 0x14)
+           || (s.size() == 23 && s[0] == 0xa9 && s[1] == 0x14)
+           || (s.size() == 22 && s[0] == 0x00 && s[1] == 0x14);
+}
+} // namespace
+
 // Review 713dc77a0 #10 and #13. An empty login has no payout a share can carry
 // and DGB does not redistribute one (the DGB split comes with the
 // --redistribute split re-apply), and a V35 DGB share carries only a P2PKH,
@@ -473,10 +484,7 @@ std::string DGBWorkSource::authorize_refusal(const std::string& username) const
     if (core::classify_address_for_coin(username, dgb::address_acceptance(is_testnet_, is_regtest_), script)
         != core::AddressCoinMatch::Own)
         return {};
-    const bool carried = (script.size() == 25 && script[0] == 0x76 && script[1] == 0xa9 && script[2] == 0x14)
-                         || (script.size() == 23 && script[0] == 0xa9 && script[1] == 0x14)
-                         || (script.size() == 22 && script[0] == 0x00 && script[1] == 0x14);
-    if (carried)
+    if (payout_carried(script))
         return {};
     return "DGB shares carry only a P2PKH (D...), P2SH (S...) or P2WPKH (dgb1q..., 20-byte) address; "
            "a P2WSH or P2TR address cannot be paid (use one of those)";
@@ -596,11 +604,13 @@ core::stratum::CoinbaseResult DGBWorkSource::build_connection_coinbase(
     // verify. Default (fee 0 / no owner) => eff == payout_script, byte-identical.
     const std::vector<unsigned char> eff_payout_script =
         effective_payout_script(payout_script, prev_share_hash, extranonce1_hex);
-    // No payout a share can carry (an empty login, refused at authorize; this
-    // is the defence in depth): no job. A share minted from it would carry an
-    // empty payout that the submit path then redistributes, so its fields
-    // would differ from the ref the coinbase committed to.
-    if (eff_payout_script.empty())
+    // No payout a share can carry (an empty login, a P2WSH/P2TR one: both
+    // refused at authorize; this is the defence in depth, as the stratum
+    // session may still build for a refused login): no job. A share minted
+    // from an empty payout would carry one the submit path redistributes, so
+    // its fields would differ from the ref the coinbase committed to; a
+    // P2WSH/P2TR payout would be paid to a P2PKH of its program's first bytes.
+    if (!payout_carried(eff_payout_script))
         return held();
 
     // ── DGB-as-DOGE-parent merged-mining commitment ───────────────────────────

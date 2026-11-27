@@ -961,7 +961,7 @@ TEST(DgbWorkSource, ConnectionCoinbaseDelegatesToPplnsSsotByteIdentical)
         });
 
     auto wired = ws->build_connection_coinbase(
-        uint256(std::vector<unsigned char>(32, 0x11)), "cafef00d", Script{0x01}, {});
+        uint256(std::vector<unsigned char>(32, 0x11)), "cafef00d", Script{0x76, 0xa9, 0x14, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x88, 0xac}, {});
 
     // The SSOT called directly with the same inputs is the oracle.
     auto oracle = dgb::coin::build_connection_coinbase_from_pplns(inputs);
@@ -995,7 +995,7 @@ TEST(DgbWorkSource, ConnectionCoinbaseFreezesProducerVersionOnSnapshot)
                 return inputs;
             });
         auto wired = ws->build_connection_coinbase(
-            uint256(std::vector<unsigned char>(32, 0x11)), "cafef00d", Script{0x01}, {});
+            uint256(std::vector<unsigned char>(32, 0x11)), "cafef00d", Script{0x76, 0xa9, 0x14, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x88, 0xac}, {});
         EXPECT_EQ(wired.snapshot.frozen_ref.share_version, ver);
         EXPECT_EQ(wired.snapshot.frozen_ref.desired_version, 36u);
     }
