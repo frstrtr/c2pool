@@ -181,4 +181,6 @@ TEST(DgbStoreRulesEpoch, TheNodeRunsItBeforeTheLoadAndHonoursIt)
     EXPECT_LT(call, hpp.find("load_persisted_shares();", call));
     EXPECT_EQ(hpp.find("wipe_store_if_rules_changed"), std::string::npos);
     EXPECT_NE(cpp.find("if (meta.is_verified && m_trust_stored_verified) {"), std::string::npos);
+    // Review dd1248abd #7: stored V36 shares are not loaded while held.
+    EXPECT_NE(cpp.find("if (ver >= 36 && !dgb::v36_shares_accepted()) {"), std::string::npos);
 }
