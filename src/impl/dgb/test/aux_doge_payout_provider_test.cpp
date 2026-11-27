@@ -829,3 +829,61 @@ TEST(DgbDogeMergedPayout, BusyTrackerReMarksThePayoutsDirty)
     EXPECT_FALSE(mm.is_pplns_dirty());
     EXPECT_EQ(mm.get_cached_header_infos_and_commitment().second.size(), 44u);
 }
+
+// Review 713dc77a0 R3: core gives DOGE the primary's hash160 when the login
+// names no DOGE address, and types a DGB "S..." (version 63) as P2PKH, so an
+// S... login's DOGE script was P2PKH(redeem-script hash): unspendable, and as
+// the share's merged address it also hid the operator's P2SH split. The DGB
+// job drops exactly that entry; a DOGE address the miner gave is kept, and a
+// "D..." login's auto-derived DOGE key is kept.
+TEST(DgbDogeMergedPayout, P2shLoginGetsNoAutoDerivedDogeAndTakesTheSplit)
+{
+    WsFixture fx;
+    auto ws = fx.make();
+    boost::asio::io_context ioc;
+    MergedMiningManager mm(ioc);
+    add_doge(mm);
+    ws->set_merged_mining_manager(&mm);
+    Login on(*ws);
+    const auto own = dgb::address_acceptance(false, false);
+
+    // What core resolves for a bare S... login, and the job's scripts.
+    const auto r = on.resolve(kDgbS(), "");
+    ASSERT_EQ(r.addresses.count(kDoge), 1u) << "core no longer auto-derives DOGE (re-check this KAT)";
+    Bytes payout = core::accepted_payout_script(kDgbS(), own);
+    ASSERT_EQ(payout.size(), 23u);
+    std::vector<std::pair<uint32_t, Bytes>> merged{{kDoge, on.doge_script(r.addresses.at(kDoge))}};
+    Bytes unspendable{0x76, 0xa9, 0x14};
+    unspendable.insert(unspendable.end(), payout.begin() + 2, payout.begin() + 22);
+    unspendable.push_back(0x88);
+    unspendable.push_back(0xac);
+    ASSERT_EQ(merged[0].second, unspendable) << "the auto-derived DOGE script is the P2PKH of the redeem hash";
+    ws->decide_job_payout(payout, merged);
+    EXPECT_TRUE(merged.empty()) << "an S... login's DOGE was paid to P2PKH(redeem hash): burned";
+    EXPECT_EQ(payout.size(), 23u) << "the DGB payout is unchanged";
+
+    // A DOGE address the miner gave is kept (P2PKH, and P2SH of any script).
+    for (const auto& doge : {kDogeY(), kDogeZ()}) {
+        SCOPED_TRACE(doge);
+        const auto rg = on.resolve(kDgbS(), doge);
+        ASSERT_EQ(rg.addresses.at(kDoge), doge);
+        Bytes p = core::accepted_payout_script(kDgbS(), own);
+        std::vector<std::pair<uint32_t, Bytes>> m{{kDoge, on.doge_script(doge)}};
+        const auto before = m;
+        ws->decide_job_payout(p, m);
+        EXPECT_EQ(m, before);
+    }
+    // A P2PKH login's auto-derived DOGE key is spendable: kept.
+    {
+        const auto ra = on.resolve(kDgbA(), "");
+        ASSERT_EQ(ra.addresses.count(kDoge), 1u);
+        Bytes p = core::accepted_payout_script(kDgbA(), own);
+        std::vector<std::pair<uint32_t, Bytes>> m{{kDoge, on.doge_script(ra.addresses.at(kDoge))}};
+        const auto before = m;
+        ws->decide_job_payout(p, m);
+        EXPECT_EQ(m, before);
+    }
+    // The job's coinbase is built without a DOGE entry, so the S... share
+    // carries none and the provider applies the P2SH split to it
+    // (DgbDogeP2shSplit.P2shKeyIsSplitOwnerDonationOthersUnchanged).
+}

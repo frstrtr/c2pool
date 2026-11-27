@@ -440,3 +440,82 @@ TEST(DgbStratumJobs, RealSubmitReachesTheMintWithTheJobsFrozenRef)
     EXPECT_EQ(m.frozen_absheight, rig_inputs().frozen_absheight);
     EXPECT_FALSE(m.actual_coinbase.empty());
 }
+
+// Review 713dc77a0 #10 and #13: an empty login (DGB does not redistribute it)
+// and a dgb1 P2WSH or P2TR login (a V35 share cannot carry it: it was paid to
+// a P2PKH of the program's first 20 bytes) are refused at authorize, with the
+// reason; D..., S..., dgb1q (20-byte) and a DOGE primary are not. Through a
+// real core::StratumServer over the real DGBWorkSource: a refused login gets
+// no job. An empty payout never gets a job either (defence in depth).
+TEST(DgbStratumJobs, EmptyAndUncarriableLoginsAreRefusedAtAuthorize)
+{
+    Bytes prog32(32, 0x5a);
+    Bytes wsh{0x00, 0x20};
+    wsh.insert(wsh.end(), prog32.begin(), prog32.end());
+    const std::string p2wsh = core::script_to_address(wsh, "dgb", 30, 63);
+    ASSERT_EQ(p2wsh.rfind("dgb1q", 0), 0u) << p2wsh;
+    Bytes tr{0x51, 0x20};
+    tr.insert(tr.end(), prog32.begin(), prog32.end());
+    const std::string p2tr = core::script_to_address(tr, "dgb", 30, 63);
+
+    JobRig probe;
+    EXPECT_NE(probe.ws->authorize_refusal("").find("DGB payout address"), std::string::npos);
+    EXPECT_FALSE(probe.ws->authorize_refusal(p2wsh).empty()) << p2wsh;
+    if (!p2tr.empty())
+        EXPECT_FALSE(probe.ws->authorize_refusal(p2tr).empty()) << p2tr;
+    Bytes key(20, 0x66);
+    Bytes p2sh{0xa9, 0x14};
+    p2sh.insert(p2sh.end(), key.begin(), key.end());
+    p2sh.push_back(0x87);
+    Bytes wpkh{0x00, 0x14};
+    wpkh.insert(wpkh.end(), key.begin(), key.end());
+    Bytes doge_pkh{0x76, 0xa9, 0x14};
+    doge_pkh.insert(doge_pkh.end(), key.begin(), key.end());
+    doge_pkh.push_back(0x88);
+    doge_pkh.push_back(0xac);
+    for (const auto& ok : {dgb_address(), core::script_to_address(p2sh, "", 30, 63),
+                           core::script_to_address(wpkh, "dgb", 30, 63),
+                           core::script_to_address(doge_pkh, "", 30, 22) /* DOGE D... shares DGB's 30 */,
+                           core::script_to_address(p2sh, "", 30, 22) /* DOGE A... */})
+        EXPECT_TRUE(probe.ws->authorize_refusal(ok).empty()) << ok;
+
+    // The empty payout is held, never built (the producer is not even asked).
+    {
+        std::lock_guard<std::mutex> l(probe.mu);
+        probe.known_share = uint256(std::vector<unsigned char>(32, 0x5b));
+    }
+    size_t built = 0;
+    {
+        std::lock_guard<std::mutex> l(probe.mu);
+        built = probe.payouts.size();
+    }
+    auto held = probe.ws->build_connection_coinbase(uint256(std::vector<unsigned char>(32, 0x5b)), "00", Bytes{}, {});
+    EXPECT_TRUE(held.held);
+    {
+        std::lock_guard<std::mutex> l(probe.mu);
+        EXPECT_EQ(probe.payouts.size(), built) << "the producer was asked for an empty payout";
+    }
+
+    for (const std::string& login : {std::string(""), p2wsh}) {
+        SCOPED_TRACE(login);
+        JobRig rig;
+        const uint256 best(std::vector<unsigned char>(32, 0x5b));
+        {
+            std::lock_guard<std::mutex> l(rig.mu);
+            rig.known_share = best;
+        }
+        rig.ws->set_best_share_hash_fn([best]() { return best; });
+        RigClient c(rig.port);
+        ASSERT_GE(c.fd, 0);
+        c.send({{"id", 1}, {"method", "mining.subscribe"}, {"params", nlohmann::json::array()}});
+        ASSERT_TRUE(c.pump(2000, 1).has_value());
+        c.send({{"id", 2}, {"method", "mining.authorize"}, {"params", {login, "x"}}});
+        auto auth = c.pump(2000, 2);
+        ASSERT_TRUE(auth.has_value());
+        EXPECT_FALSE((*auth)["result"].is_boolean() && (*auth)["result"].get<bool>()) << auth->dump();
+        ASSERT_TRUE((*auth)["error"].is_array()) << auth->dump();
+        EXPECT_EQ((*auth)["error"][0].get<int>(), 24);
+        c.pump(1000);
+        EXPECT_TRUE(c.notifies.empty()) << "a refused login was served a job";
+    }
+}

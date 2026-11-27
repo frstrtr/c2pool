@@ -156,6 +156,13 @@ public:
     std::string                         get_current_gbt_prevhash() const override;
     uint64_t                            get_work_generation() const override;
     bool                                has_merged_chain(uint32_t chain_id) const override;
+    // A DGB P2SH payout's auto-derived DOGE entry is dropped (its DOGE share
+    // takes the operator's P2SH split); see work_source.cpp.
+    void decide_job_payout(std::vector<unsigned char>& payout_script,
+                           std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged) const override;
+    // An empty login, or a DGB address a V35 share cannot carry (P2WSH,
+    // P2TR): refused at authorize, with the reason.
+    std::string                         authorize_refusal(const std::string& username) const override;
 
     // ── IWorkSource: per-connection bookkeeping ──────────────────────────
     void register_stratum_worker(const std::string& session_id,

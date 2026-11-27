@@ -41,6 +41,7 @@
 #include <btclibs/util/strencodings.h>          // ParseHex, HexStr
 #include <btclibs/span.h>                       // Span (HexStr arg)
 
+#include <algorithm>
 #include <array>
 #include <cstdio>
 #include <cstring>
@@ -429,6 +430,57 @@ std::pair<std::string, std::string> DGBWorkSource::get_coinbase_parts() const
     return { {}, {} };
 }
 
+// Review 713dc77a0 R3. core resolve_merged_login gives every configured merged
+// chain the primary's hash160 when the miner names no address for it. A DGB
+// P2SH primary ("S...", version 63) is not in core address_to_hash160's P2SH
+// list, so it is typed P2PKH and its DOGE script becomes P2PKH(redeem-script
+// hash): an output no key can spend, and as the share's Tier-1 merged address
+// it also hid the P2SH rule below. On DGB a P2SH login without a DOGE address
+// of its own takes the operator's P2SH split instead (its DOGE share goes to
+// the node owner and the donation, doge_merged_payouts), so the job drops the
+// chain-98 entry that is the P2PKH of the P2SH payout's own hash. A DOGE
+// address the miner gave (any other key, or a P2SH of the same redeem script)
+// is kept.
+void DGBWorkSource::decide_job_payout(std::vector<unsigned char>& payout_script,
+                                      std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged) const
+{
+    if (!(payout_script.size() == 23 && payout_script[0] == 0xa9 && payout_script[1] == 0x14
+          && payout_script[22] == 0x87))
+        return;
+    std::vector<unsigned char> derived{0x76, 0xa9, 0x14};
+    derived.insert(derived.end(), payout_script.begin() + 2, payout_script.begin() + 22);
+    derived.push_back(0x88);
+    derived.push_back(0xac);
+    merged.erase(std::remove_if(merged.begin(), merged.end(),
+                                [&](const auto& e) { return e.first == kDogeChainId && e.second == derived; }),
+                 merged.end());
+}
+
+// Review 713dc77a0 #10 and #13. An empty login has no payout a share can carry
+// and DGB does not redistribute one (the DGB split comes with the
+// --redistribute split re-apply), and a V35 DGB share carries only a P2PKH,
+// P2SH or 20-byte P2WPKH address: a dgb1 P2WSH/P2TR login was paid to a P2PKH
+// of the first 20 bytes of its program (burned). Both are refused at
+// authorize, with the reason. Other logins (a DOGE address as the primary, a
+// foreign or undecodable one) are left to the core door.
+std::string DGBWorkSource::authorize_refusal(const std::string& username) const
+{
+    if (username.empty())
+        return "a DGB payout address is required (DGB_ADDRESS, or DGB_ADDRESS,DOGE_ADDRESS to name the "
+               "DOGE payout)";
+    std::vector<unsigned char> script;
+    if (core::classify_address_for_coin(username, dgb::address_acceptance(is_testnet_, is_regtest_), script)
+        != core::AddressCoinMatch::Own)
+        return {};
+    const bool carried = (script.size() == 25 && script[0] == 0x76 && script[1] == 0xa9 && script[2] == 0x14)
+                         || (script.size() == 23 && script[0] == 0xa9 && script[1] == 0x14)
+                         || (script.size() == 22 && script[0] == 0x00 && script[1] == 0x14);
+    if (carried)
+        return {};
+    return "DGB shares carry only a P2PKH (D...), P2SH (S...) or P2WPKH (dgb1q..., 20-byte) address; "
+           "a P2WSH or P2TR address cannot be paid (use one of those)";
+}
+
 void DGBWorkSource::set_node_owner_fee(double pct, std::vector<unsigned char> script)
 {
     std::lock_guard<std::mutex> lk(node_owner_fee_mutex_);
@@ -543,6 +595,12 @@ core::stratum::CoinbaseResult DGBWorkSource::build_connection_coinbase(
     // verify. Default (fee 0 / no owner) => eff == payout_script, byte-identical.
     const std::vector<unsigned char> eff_payout_script =
         effective_payout_script(payout_script, prev_share_hash, extranonce1_hex);
+    // No payout a share can carry (an empty login, refused at authorize; this
+    // is the defence in depth): no job. A share minted from it would carry an
+    // empty payout that the submit path then redistributes, so its fields
+    // would differ from the ref the coinbase committed to.
+    if (eff_payout_script.empty())
+        return held();
 
     // ── DGB-as-DOGE-parent merged-mining commitment ───────────────────────────
     // Runtime-armed (--merged DOGE): the cached 44-byte AuxPoW commitment, as
