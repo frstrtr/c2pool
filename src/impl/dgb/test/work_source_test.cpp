@@ -538,6 +538,60 @@ TEST(DgbWorkSource, MiningSubmitSameOutcomeWithAndWithoutGatePow)
     EXPECT_FALSE(fa.submit_called);
 }
 
+// The gate hashed other bytes than the submission's header (another
+// extranonce2, a rolled version bit): mining_submit hashes again (exactly one
+// scrypt) and the outcome and the won blocks are the ones without a gate pow.
+// Block target 0x207fffff: about half the submissions are won blocks.
+TEST(DgbWorkSource, MiningSubmitHashesAgainWhenTheGateHashedAnotherExtranonce2OrVersion)
+{
+    using dgb::stratum::DGBWorkSource;
+    struct Recorder {
+        c2pool::dgb::HeaderChain chain;
+        dgb::coin::Mempool       mempool;
+        std::vector<std::vector<unsigned char>> blocks;
+        std::unique_ptr<DGBWorkSource> make()
+        {
+            auto fn = [this](const std::vector<unsigned char>& block, uint32_t) -> bool {
+                blocks.push_back(block);
+                return true;
+            };
+            return std::make_unique<DGBWorkSource>(chain, mempool, /*is_testnet=*/false, fn, kSubsidyFunc);
+        }
+    };
+    struct Case {
+        const char* name;
+        std::string en2;
+        uint32_t version_xor;
+    };
+    for (const Case& c : {Case{"extranonce2", "00000001", 0u}, Case{"rolled version bit", kEN2, 0x00002000u}}) {
+        SCOPED_TRACE(c.name);
+        Recorder rb, rg;
+        auto base = rb.make();
+        auto got = rg.make();
+        int won = 0;
+        for (uint32_t n = 0; n < 16; ++n) {
+            char nonce[9];
+            std::snprintf(nonce, sizeof(nonce), "%08x", n);
+            auto jb = make_job(/*share_bits=*/0x2100ffffu, /*block_nbits=*/"207fffff");
+            const auto res_b = base->mining_submit("DGBaddr.w", "j", kEN1, kEN2, kNT, nonce, "rid", {}, &jb);
+
+            auto jg = make_job(0x2100ffffu, "207fffff");
+            got->compute_share_difficulty_pow(jg.coinb1, jg.coinb2, kEN1, c.en2, kNT, nonce,
+                                              jg.version ^ c.version_xor, jg.gbt_prevhash, jg.nbits,
+                                              jg.merkle_branches, jg.gate_pow);
+            ASSERT_TRUE(jg.gate_pow.valid);
+            const uint64_t c0 = DGBWorkSource::header_scrypt_count();
+            const auto res_g = got->mining_submit("DGBaddr.w", "j", kEN1, kEN2, kNT, nonce, "rid", {}, &jg);
+            EXPECT_EQ(DGBWorkSource::header_scrypt_count() - c0, 1u) << "nonce " << nonce;
+            EXPECT_EQ(res_g, res_b) << "nonce " << nonce;
+            won = static_cast<int>(rb.blocks.size());
+        }
+        EXPECT_GT(won, 0);
+        EXPECT_LT(won, 16);
+        EXPECT_EQ(rg.blocks, rb.blocks);
+    }
+}
+
 TEST(DgbWorkSource, ComputeShareDifficultyReturnsNotYetSentinel)
 {
     Fixture fx;
