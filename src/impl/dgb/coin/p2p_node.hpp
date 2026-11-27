@@ -258,14 +258,20 @@ public:
                       << rmsg->m_data.size() << " bytes): " << ec.what();
             // todo: error
             return;
-        } catch (const std::out_of_range&)
+        } catch (const std::out_of_range& ec)
         {
-            // A command outside our handler set: newer DigiByte Core peers
-            // push their oracle traffic (oracleprice, oraclehb, getoracles,
-            // oramusnonce, ...) unsolicited. Ignored, as Core ignores an
-            // unknown command; counted, and logged once per command (it was
-            // an ERROR line per message: ~400 per 10 minutes on mainnet).
-            note_unknown_command(rmsg->m_command, rmsg->m_data.size());
+            // A command outside our handler set (the handler map's own
+            // refusal, "MessageHandler not contain <cmd>"): newer DigiByte
+            // Core peers push their oracle traffic (oracleprice, oraclehb,
+            // getoracles, oramusnonce, ...) unsolicited. Ignored, as Core
+            // ignores an unknown command; counted, and logged once per
+            // command (it was an ERROR line per message: ~400 per 10 minutes
+            // on mainnet). An out_of_range from a known handler is an error.
+            if (std::string(ec.what()).rfind("MessageHandler not contain ", 0) == 0)
+                note_unknown_command(rmsg->m_command, rmsg->m_data.size());
+            else
+                LOG_ERROR << "NodeP2P handle(" << rmsg->m_command << ", " << rmsg->m_data.size()
+                          << " bytes): " << ec.what();
             return;
         }
 

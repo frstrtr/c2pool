@@ -2015,8 +2015,11 @@ int run_node(const core::CoinParams& params, bool testnet,
         const bool own = !node_owner_address.empty()
             && core::classify_address_for_coin(node_owner_address, dgb::address_acceptance(testnet, regtest),
                                                owner_script) == core::AddressCoinMatch::Own;
+        // P2PKH, P2SH or a 20-byte P2WPKH: the payouts a V35 share carries
+        // (review 7a4373856 R3: a bech32 owner arms the split too).
         const bool carried = (owner_script.size() == 25 && owner_script[0] == 0x76 && owner_script[1] == 0xa9)
-                             || (owner_script.size() == 23 && owner_script[0] == 0xa9 && owner_script[22] == 0x87);
+                             || (owner_script.size() == 23 && owner_script[0] == 0xa9 && owner_script[22] == 0x87)
+                             || (owner_script.size() == 22 && owner_script[0] == 0x00 && owner_script[1] == 0x14);
         if (own && carried) {
             work_source->set_split_owner(owner_script);
             std::cout << "[DGB] redistribute split: unattributable work pays the node owner \""
@@ -2026,7 +2029,7 @@ int run_node(const core::CoinParams& params, bool testnet,
             std::cout << "[DGB] WARNING: --redistribute split: "
                       << (node_owner_address.empty() ? std::string("no --node-owner-address")
                                                      : "--node-owner-address \"" + node_owner_address
-                                                           + "\" is not an own-network DGB P2PKH/P2SH address")
+                                                           + "\" is not an own-network DGB P2PKH/P2SH/P2WPKH address")
                       << " -- the owner half cannot be paid; no redistribute policy on this node"
                          " (an empty login is refused at authorize)" << std::endl;
         }

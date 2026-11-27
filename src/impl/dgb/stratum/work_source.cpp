@@ -913,8 +913,16 @@ core::stratum::CoinbaseResult DGBWorkSource::build_coinbase(
     // The operator's P2SH rule, told to the miner once per payout script: a
     // P2SH login with DOGE configured and no DOGE address of its own gets no
     // DOGE (its DOGE share is split node owner / donation).
-    if (mm_manager_ && payout_script.size() == 23 && payout_script[0] == 0xa9 && payout_script[1] == 0x14
-        && payout_script[22] == 0x87 && mm_manager_->has_chain(kDogeChainId)) {
+    // (Not for the node owner's own P2SH, the split jobs' payout: the
+    // P2SH-owner rule pays its DOGE wholly to the owner's DOGE address, else
+    // to the donation.)
+    bool owner_payout = false;
+    {
+        std::lock_guard<std::mutex> lk(fallback_payout_mutex_);
+        owner_payout = !split_owner_script_.empty() && payout_script == split_owner_script_;
+    }
+    if (mm_manager_ && !owner_payout && payout_script.size() == 23 && payout_script[0] == 0xa9
+        && payout_script[1] == 0x14 && payout_script[22] == 0x87 && mm_manager_->has_chain(kDogeChainId)) {
         bool has_doge = false;
         for (const auto& [cid, _] : eff_merged_addrs)
             has_doge = has_doge || cid == kDogeChainId;
