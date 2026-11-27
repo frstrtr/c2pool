@@ -2,9 +2,11 @@
 #pragma once
 
 #include "config_pool.hpp"
+#include "store_rules_epoch.hpp"   // wipe_store_if_rules_changed (review 906a0e5e3 #5)
 #include "config_coin.hpp"
 
 #include <core/config.hpp>
+#include <core/filesystem.hpp>
 #include <core/tx_advertiser.hpp>
 #include "params.hpp"
 #include "share.hpp"
@@ -230,6 +232,11 @@ public:
         // sharechain DB with c2pool-ltc on a shared host. Bucket-1 isolation primitive.
         std::string net_name = config->m_testnet ? "digibyte_testnet" : "digibyte";
         m_storage = std::make_unique<c2pool::storage::SharechainStorage>(net_name);
+        // A store written under older DGB share rules is emptied once first
+        // (store_rules_epoch.hpp): its verified flags would be reloaded as is.
+        if (m_storage && m_storage->is_available())
+            wipe_store_if_rules_changed(*m_storage, core::filesystem::config_path() / net_name
+                                                        / "dgb_share_rules_epoch");
         load_persisted_shares();
 
         // Wire up verified-hash persistence callback (p2pool known_verified pattern)
