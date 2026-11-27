@@ -80,7 +80,7 @@ port = 8084                 # dashboard TCP port, bound on 0.0.0.0; default 0 (o
 # give_author_pct = 0.1                        # [money] author donation, percent 0-100; default 0.1
 # node_owner_fee_pct = 1.0                     # [money] node-owner fee, percent 0-100; default 0 (off); needs node_owner_address
 # node_owner_address = "<your-DGB-address>"    # [money] operator payout identity for the fee and for redistribute = "fee"; default none
-# redistribute = "split"                       # [money] where shares of an empty or invalid login go: split (50% node owner / 50% donation; needs node_owner_address), pplns, fee, boost, donate, or a mix such as "boost:70,donate:20"; default split
+# redistribute = "pplns"                       # [money] where shares of an empty or invalid login go: pplns, fee, boost, donate, or a mix such as "boost:70,donate:20"; default pplns (split is not available on DGB yet: warned, no policy bound)
 
 [gate]
 # money_ack_hash = "<64-hex output of: c2pool-dgb --settings THIS_FILE --ack-money-settings>"   # needed only when a [money] key is uncommented

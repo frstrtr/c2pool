@@ -1478,7 +1478,7 @@ destination.
 | `--regtest`, `--regtest-force-won-share` | off | Regtest marker; forced won share is refused unless `--regtest` **and** `--coin-daemon` are both given. |
 | `--no-p2p-relay` | off | Suppress the embedded won-block relay (isolates the RPC arm). |
 | `--dev-relax-algo-softforks` | off | Dev-only: relax the algo-softfork readiness gate for an isolated tuned testnet; ignored on mainnet. |
-| `--redistribute SPEC` | `split` | `split\|pplns\|fee\|boost\|donate` or hybrid `boost:70,donate:20`. `split`: a job with no payout address pays `--node-owner-address` with donation 32768/65535 (50% owner / 50% donation); without a usable owner address no policy is bound (as before). |
+| `--redistribute SPEC` | `pplns` | `pplns\|fee\|boost\|donate` or hybrid `boost:70,donate:20`. `split` is not available on DGB yet: a spec naming it is warned about and binds no policy. |
 | `--node-owner-address ADDR` | — | Operator payout identity for the `fee` arm and for `-f`/`--fee`. |
 | `-f` / `--fee PCT` | 0 | Node-owner fee percent; needs `--node-owner-address`. |
 | `--give-author PCT` (alias `--dev-donation`) | 0.1 | Author donation percent. |
