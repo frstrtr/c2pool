@@ -493,11 +493,15 @@ struct Login {
     std::function<bool(uint32_t)> configured;
 
     // The inputs stratum_server.cpp passes resolve_merged_login, from the DGB
-    // work source's own StratumConfig (main_dgb's acceptance).
-    explicit Login(dgb::stratum::DGBWorkSource& ws)
+    // work source's own StratumConfig, set up as main_dgb does (acceptance +
+    // merged_parent_versions); `dgb_parent_versions=false` is the state
+    // before main_dgb published DGB's versions.
+    explicit Login(dgb::stratum::DGBWorkSource& ws, bool dgb_parent_versions = true)
     {
         const auto acc = dgb::address_acceptance(false, false);
         ws.set_payout_acceptance(acc.p2pkh_versions, acc.p2sh_versions, acc.bech32_hrps);
+        if (dgb_parent_versions)
+            ws.set_merged_parent_versions(dgb::merged_parent_versions());
         const auto& scfg = ws.get_stratum_config();
         table = core::merged_addr::merged_chain_table(false, scfg.merged_parent_versions);
         parent_versions = scfg.payout_p2pkh_versions;
@@ -523,6 +527,14 @@ struct Login {
 std::string kDgbA() { return core::script_to_address(p2pkh(kHashA), "", 30, 63); }
 std::string kDgbBech32C() { return core::script_to_address(p2wpkh(kHashC), "dgb", 30, 63); }
 std::string kDogeY() { return core::script_to_address(p2pkh(h160(0x77)), "", 30, 22); }
+std::string kDgbS()    // DGB P2SH "S..."
+{
+    Bytes s{0xa9, 0x14};
+    const Bytes h = h160(0x99);
+    s.insert(s.end(), h.begin(), h.end());
+    s.push_back(0x87);
+    return core::script_to_address(s, "", 30, 63);
+}
 std::string kDogeZ()   // DOGE P2SH "A..."
 {
     Bytes s{0xa9, 0x14};
@@ -624,4 +636,83 @@ TEST(DgbDogeMergedPayout, ExplicitSlashDogeAddressWinsOverDerived)
     EXPECT_EQ(r.addresses.at(kDoge), kDogeY());
     EXPECT_EQ(on.doge_script(r.addresses.at(kDoge)), p2pkh(h160(0x77)));
     EXPECT_NE(on.doge_script(r.addresses.at(kDoge)), p2pkh(kHashA)) << "not the derived key";
+}
+
+// ── merged_parent_versions: a DOGE login is identified by DOGE's own bytes ──
+
+TEST(DgbDogeMergedPayout, MergedParentVersionsAreDgbsOnEveryNetwork)
+{
+    // mainnet P2PKH 30 "D", P2SH 63 "S"; testnet (and regtest) 126 / 140.
+    EXPECT_EQ(dgb::merged_parent_versions(), (std::vector<uint8_t>{30, 63, 126, 140}));
+    WsFixture fx;
+    auto ws = fx.make();
+    EXPECT_TRUE(ws->get_stratum_config().merged_parent_versions.empty());
+    ws->set_merged_parent_versions(dgb::merged_parent_versions());
+    EXPECT_EQ(ws->get_stratum_config().merged_parent_versions, dgb::merged_parent_versions());
+}
+
+TEST(DgbDogeMergedPayout, DogeLoginIdentifiedWithDogeVersionBytes)
+{
+    WsFixture fx;
+    auto ws = fx.make();
+    boost::asio::io_context ioc;
+    MergedMiningManager mm(ioc);
+    add_doge(mm);
+    ws->set_merged_mining_manager(&mm);
+    Login on(*ws);
+
+    const auto* doge = core::merged_addr::find_chain(on.table, kDoge);
+    ASSERT_NE(doge, nullptr);
+    // DOGE is identified by its own bytes minus every DGB one: P2SH 22,
+    // testnet P2PKH 113 / P2SH 196 — never 30, DGB's P2PKH.
+    EXPECT_EQ(doge->versions, (std::vector<uint8_t>{22, 113, 196}));
+    for (auto v : dgb::merged_parent_versions())
+        EXPECT_EQ(std::count(doge->versions.begin(), doge->versions.end(), v), 0) << int(v);
+    // The scripts it pays still use DOGE's mainnet versions.
+    EXPECT_EQ(doge->p2pkh, (std::vector<uint8_t>{30}));
+    EXPECT_EQ(doge->p2sh, (std::vector<uint8_t>{22}));
+
+    EXPECT_TRUE(core::is_address_for_chain(kDogeZ(), doge->hrps, doge->versions));   // DOGE "A..."
+    EXPECT_FALSE(core::is_address_for_chain(kDgbA(), doge->hrps, doge->versions));   // DGB "D..."
+    EXPECT_FALSE(core::is_address_for_chain(kDgbS(), doge->hrps, doge->versions));   // DGB "S..."
+
+    // DGB,DOGE(A...): the DOGE address goes to DOGE, the primary stays.
+    auto r = on.resolve(kDgbA(), kDogeZ());
+    EXPECT_EQ(r.primary, kDgbA());
+    ASSERT_EQ(r.addresses.count(kDoge), 1u);
+    EXPECT_EQ(r.addresses.at(kDoge), kDogeZ());
+    EXPECT_EQ(on.doge_script(kDogeZ()).size(), 23u);
+
+    // DGB,DOGE(D...): a "D..." is DGB's as much as DOGE's; with one merged
+    // chain the second address still goes to DOGE (the single-chain rule),
+    // paying that key as a DOGE P2PKH.
+    r = on.resolve(kDgbA(), kDogeY());
+    EXPECT_EQ(r.primary, kDgbA());
+    ASSERT_EQ(r.addresses.count(kDoge), 1u);
+    EXPECT_EQ(r.addresses.at(kDoge), kDogeY());
+    EXPECT_EQ(on.doge_script(kDogeY()), p2pkh(h160(0x77)));
+}
+
+TEST(DgbDogeMergedPayout, DgbP2pkhPrimaryIsNeverTakenForDoge)
+{
+    // DGB "D...",DGB "S...": both DGB's. Without DGB's versions the "D..."
+    // primary counted as a DOGE address, the pair read as swapped and the
+    // DGB payout moved to the second address. With them it stays the first.
+    boost::asio::io_context ioc;
+    MergedMiningManager mm(ioc);
+    add_doge(mm);
+
+    WsFixture before_fx;
+    auto before_ws = before_fx.make();
+    before_ws->set_merged_mining_manager(&mm);
+    Login before(*before_ws, /*dgb_parent_versions=*/false);
+    EXPECT_EQ(before.resolve(kDgbA(), kDgbS()).primary, kDgbS()) << "the misread the rule removes";
+
+    WsFixture fx;
+    auto ws = fx.make();
+    ws->set_merged_mining_manager(&mm);
+    Login on(*ws);
+    const auto r = on.resolve(kDgbA(), kDgbS());
+    EXPECT_EQ(r.primary, kDgbA());
+    EXPECT_TRUE(r.usable_primary);
 }

@@ -1533,6 +1533,11 @@ int run_node(const core::CoinParams& params, bool testnet,
         const auto acc = dgb::address_acceptance(testnet, regtest);
         work_source->set_payout_acceptance(acc.p2pkh_versions, acc.p2sh_versions,
                                            acc.bech32_hrps);
+        // DGB's versions on every network (main_ltc's merged_parent_versions):
+        // a login address DGB could own is never identified as DOGE's (DGB's
+        // P2PKH 30 is also DOGE's). Only read by the merged-chain login
+        // resolution, so a node without --merged is unchanged.
+        work_source->set_merged_parent_versions(dgb::merged_parent_versions());
     }
 
     // Node-owner fee (p2pool -f/--fee): arm the deterministic payout-identity

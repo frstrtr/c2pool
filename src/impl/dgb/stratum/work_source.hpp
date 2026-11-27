@@ -312,6 +312,14 @@ public:
         config_.payout_bech32_hrps    = std::move(bech32_hrps);
     }
 
+    /// The parent coin's (DGB's) P2PKH/P2SH versions on every network, never
+    /// claimed by a merged chain when the core stratum server identifies a
+    /// login address (StratumConfig::merged_parent_versions; main_dgb binds
+    /// dgb::merged_parent_versions(), as main_ltc does for LTC).
+    void set_merged_parent_versions(std::vector<uint8_t> versions) {
+        config_.merged_parent_versions = std::move(versions);
+    }
+
     /// Node-owner fee (p2pool -f/--fee). Arms the deterministic per-(tip,
     /// connection) payout-identity substitution used by build_connection_coinbase
     /// and mining_submit. pct 0 or empty script => disabled (byte-identical to no
