@@ -45,6 +45,7 @@
 #include <array>
 #include <cstdio>
 #include <cstring>
+#include <chrono>
 #include <ctime>
 #include <span>
 #include <string>
@@ -617,8 +618,18 @@ core::stratum::CoinbaseResult DGBWorkSource::build_connection_coinbase(
     // the coinbase is byte-identical to standalone DGB.
     std::vector<unsigned char> aux_mm_scriptsig;
     if (mm_manager_ && mm_manager_->has_chains()) {
-        if (mm_manager_->is_pplns_dirty())
-            mm_manager_->rebuild_cached_blocks();
+        // Rebuilt inline at most once a second (review 713dc77a0 NIT 15):
+        // while the tracker is busy the provider declines and re-marks the
+        // payouts dirty, and every session's job build retried the rebuild;
+        // the manager's own poll rebuilds a dirty cache too.
+        if (mm_manager_->is_pplns_dirty()) {
+            const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            int64_t last = last_inline_rebuild_ns_.load(std::memory_order_relaxed);
+            if (now_ns - last >= 1000000000LL
+                && last_inline_rebuild_ns_.compare_exchange_strong(last, now_ns))
+                mm_manager_->rebuild_cached_blocks();
+        }
         auto mm_snap = mm_manager_->get_cached_header_infos_and_commitment();
         const std::vector<uint8_t>& mm_commitment = mm_snap.second;
         // Push opcode == length for a 1..75-byte push; the commitment is 44 B => 0x2c.

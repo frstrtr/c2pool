@@ -1502,7 +1502,9 @@ public:
                 desired_result.emplace_back(d.peer, d.hash);
                 LOG_INFO << "[REVIVE] requesting parent " << d.hash.GetHex().substr(0, 16)
                          << " of a dormant chain (head ts=" << d.max_timestamp << ", "
-                         << (timestamp_cutoff + 24 * 60 * 60 - d.max_timestamp) / 86400 << " d old); "
+                         << ((timestamp_cutoff + 24u * 60u * 60u > d.max_timestamp)
+                                 ? (timestamp_cutoff + 24u * 60u * 60u - d.max_timestamp) / 86400u : 0u)
+                         << " d old); "
                          << m_revive.requests_left << " revive requests left";
             } else {
                 static int filter_log = 0;

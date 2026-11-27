@@ -887,3 +887,30 @@ TEST(DgbDogeMergedPayout, P2shLoginGetsNoAutoDerivedDogeAndTakesTheSplit)
     // carries none and the provider applies the P2SH split to it
     // (DgbDogeP2shSplit.P2shKeyIsSplitOwnerDonationOthersUnchanged).
 }
+
+// Review 713dc77a0 NIT 15: while the tracker is busy the DOGE provider declines
+// and re-marks the payouts dirty, and every session's job build retried the
+// rebuild inline. The inline rebuild runs at most once a second; the manager's
+// poll rebuilds a dirty cache too.
+TEST(DgbDogeMergedPayout, BusyPayoutsAreRebuiltInlineAtMostOnceASecond)
+{
+    WsFixture fx;
+    auto ws = fx.make();
+    bind_inputs(*ws);
+    boost::asio::io_context ioc;
+    MergedMiningManager mm(ioc);
+    add_doge(mm);
+    ws->set_merged_mining_manager(&mm);
+    mm.refresh_aux_work();   // DOGE work in hand
+    int calls = 0;
+    mm.set_payout_provider([&](uint32_t, uint64_t) -> std::vector<std::pair<Bytes, uint64_t>> {
+        ++calls;
+        mm.mark_pplns_dirty();   // the tracker was busy: declined, dirty again
+        return {};
+    });
+    mm.mark_pplns_dirty();
+    for (int i = 0; i < 20; ++i)
+        (void)coinbase_hex(*ws);
+    EXPECT_EQ(calls, 1) << "every job build retried the busy rebuild (or none rebuilt)";
+    EXPECT_TRUE(mm.is_pplns_dirty());
+}

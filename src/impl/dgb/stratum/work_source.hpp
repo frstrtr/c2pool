@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
+#include <limits>
 
 // dgb::stratum::DGBWorkSource — concrete `core::stratum::IWorkSource`
 // implementation for c2pool-dgb (DigiByte Scrypt-only, V36).
@@ -447,6 +448,8 @@ private:
     std::vector<std::pair<uint32_t, std::vector<unsigned char>>> owner_merged_scripts_;
     // P2SH payout scripts already told about the DOGE split (bounded).
     mutable std::mutex                          p2sh_warned_mutex_;
+    // The last inline rebuild of a dirty DOGE payout cache (steady ns).
+    mutable std::atomic<int64_t>                last_inline_rebuild_ns_{std::numeric_limits<int64_t>::min() / 2};
     mutable std::set<std::vector<unsigned char>> p2sh_warned_;
 
     // Per-connection coinbase PPLNS-inputs producer (#327/#330 live-wire).

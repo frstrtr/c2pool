@@ -320,6 +320,31 @@ TEST(DgbStratumJobs, JobPushWatchDecisions)
     EXPECT_EQ(w.tick("bb", 7), A::none);
 }
 
+// Review 713dc77a0 NIT 16: the watch runs main_dgb's best-share refresh at
+// every tick; a best it finds (a bumped generation) is pushed by that tick.
+TEST(DgbStratumJobs, JobPushWatchRunsItsBeforeTickHook)
+{
+    struct Ws {
+        std::string prev = "aa";
+        uint64_t gen = 5;
+        std::string get_current_gbt_prevhash() const { return prev; }
+        uint64_t get_work_generation() const { return gen; }
+        void bump_work_generation() { ++gen; }
+    } ws;
+    boost::asio::io_context ioc;
+    int hooks = 0, pushes = 0;
+    auto stop = dgb::start_job_push_watch(
+        ioc, &ws, [&](bool clean) { pushes += clean ? 1 : 0; }, std::chrono::milliseconds(5),
+        [&]() {
+            if (++hooks == 3)
+                ws.bump_work_generation();   // the refresh found a new best
+        });
+    ioc.run_for(std::chrono::milliseconds(200));
+    stop();
+    EXPECT_GE(hooks, 3);
+    EXPECT_EQ(pushes, 1) << "the hook's new best was not pushed (or pushed twice)";
+}
+
 TEST(DgbStratumJobs, NewTipPushesCleanJobsWithoutAMinerEvent)
 {
     JobRig rig;

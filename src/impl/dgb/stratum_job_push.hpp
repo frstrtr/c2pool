@@ -69,10 +69,13 @@ inline constexpr std::chrono::milliseconds kJobPushTick{1000};
 /// is called (or the io context stops). WorkSourceT: get_current_gbt_prevhash,
 /// get_work_generation, bump_work_generation. `push(clean)` pushes the jobs
 /// (main_dgb: stratum_server->notify_all(true)).
+/// `before_tick` (optional) runs at the start of every tick (main_dgb: the
+/// best-share cell's periodic refresh).
 template <typename WorkSourceT>
 std::function<void()> start_job_push_watch(boost::asio::io_context& ioc, WorkSourceT* ws,
                                            std::function<void(bool clean)> push,
-                                           std::chrono::milliseconds tick = kJobPushTick)
+                                           std::chrono::milliseconds tick = kJobPushTick,
+                                           std::function<void()> before_tick = {})
 {
     struct State {
         JobPushWatch watch;
@@ -83,9 +86,11 @@ std::function<void()> start_job_push_watch(boost::asio::io_context& ioc, WorkSou
     auto st = std::make_shared<State>(ioc);
     auto loop = std::make_shared<std::function<void()>>();
     std::weak_ptr<std::function<void()>> weak = loop;
-    *loop = [st, ws, push, tick, weak]() {
+    *loop = [st, ws, push, tick, weak, before_tick]() {
         if (st->stopped)
             return;
+        if (before_tick)
+            before_tick();
         switch (st->watch.tick(ws->get_current_gbt_prevhash(), ws->get_work_generation())) {
         case JobPushWatch::Action::bump_and_push:
             ws->bump_work_generation();
