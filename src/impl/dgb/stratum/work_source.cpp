@@ -570,11 +570,27 @@ std::optional<uint16_t> DGBWorkSource::decide_job_payout(
     std::vector<unsigned char>& payout_script,
     std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged) const
 {
-    // --redistribute split (the master default, #2347; dd049e9f1 on this mint):
-    // a job with no payout pays the node owner with half its weight to the
-    // donation. Its DOGE share follows the owner's DGB key (a P2SH owner: the
-    // P2SH-owner rule, aux_doge_payout_provider.hpp).
     if (payout_script.empty()) {
+        // Case 4 (p2pool work.py; core::merged_addr::case4_parent): a login
+        // with no DGB payout that names a DOGE address in a legacy form pays
+        // its DGB parent to that address's own script (P2PKH stays P2PKH,
+        // P2SH stays P2SH), with the node's donation, the named entry kept.
+        // Split applies only when nothing usable is named (#2347).
+        for (const auto& [chain_id, script] : merged) {
+            if (chain_id != kDogeChainId)
+                continue;
+            const bool legacy = (script.size() == 25 && script[0] == 0x76 && script[1] == 0xa9 && script[2] == 0x14
+                                 && script[23] == 0x88 && script[24] == 0xac)
+                                || (script.size() == 23 && script[0] == 0xa9 && script[1] == 0x14 && script[22] == 0x87);
+            if (legacy) {
+                payout_script = script;
+                return std::nullopt;
+            }
+        }
+        // --redistribute split (the master default, #2347; dd049e9f1 on this
+        // mint): a job with no payout pays the node owner with half its
+        // weight to the donation. Its DOGE share follows the owner's DGB key
+        // (a P2SH owner: the P2SH-owner rule, aux_doge_payout_provider.hpp).
         std::vector<unsigned char> owner;
         {
             std::lock_guard<std::mutex> lk(fallback_payout_mutex_);

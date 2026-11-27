@@ -35,6 +35,7 @@
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/post.hpp>
 #include <core/author_fee.hpp>
+#include "doge_backend_fixture.hpp"
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
 
@@ -596,7 +597,8 @@ TEST(DgbStratumJobs, ASplitJobPaysTheOwnerWithHalfToTheDonation)
     rig.ws->set_split_owner(owner);
     EXPECT_TRUE(rig.ws->authorize_refusal("").empty()) << "split armed: an empty login is redistributed";
     {
-        // decide_job_payout itself: only an empty payout is split.
+        // decide_job_payout itself: only an empty payout naming nothing
+        // usable is split (an entry that is no legacy DOGE script).
         Bytes p;
         std::vector<std::pair<uint32_t, Bytes>> m{{98, Bytes{0x01}}};
         EXPECT_EQ(rig.ws->decide_job_payout(p, m), std::optional<uint16_t>(core::kSplitShareDonation));
@@ -666,4 +668,89 @@ TEST(DgbStratumJobs, ASplitJobPaysTheOwnerWithHalfToTheDonation)
     EXPECT_EQ(mints.back().payout_script, owner) << "the share does not carry the job's owner payout";
     EXPECT_EQ(mints.back().donation, std::optional<uint16_t>(core::kSplitShareDonation))
         << "the share does not carry the donation its ref committed to";
+}
+
+// Review 7a4373856 F3: a login with no DGB payout that names a DOGE address
+// (",DOGEADDR", "/98:DOGEADDR", or an empty login then
+// mining.set_merged_addresses: all reach the job as an empty payout plus a
+// chain-98 entry) is case 4, never split: its DGB parent is paid to that
+// address's own script (P2PKH stays P2PKH, P2SH stays P2SH) with the node's
+// donation, and the named entry is kept. Split only when nothing usable is
+// named (#2347).
+TEST(DgbStratumJobs, ANamedDogeAddressIsCaseFourNotSplit)
+{
+    JobRig rig;
+    const Bytes owner{0x76, 0xa9, 0x14, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e,
+                      0x0e, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e, 0x88, 0xac};
+    rig.ws->set_split_owner(owner);
+    const Bytes doge_p2pkh{0x76, 0xa9, 0x14, 0x3a, 0x3a, 0x3a, 0x3a, 0x3a, 0x3a, 0x3a, 0x3a, 0x3a, 0x3a,
+                           0x3a, 0x3a, 0x3a, 0x3a, 0x3a, 0x3a, 0x3a, 0x3a, 0x3a, 0x3a, 0x88, 0xac};
+    const Bytes doge_p2sh{0xa9, 0x14, 0x4b, 0x4b, 0x4b, 0x4b, 0x4b, 0x4b, 0x4b, 0x4b, 0x4b, 0x4b,
+                          0x4b, 0x4b, 0x4b, 0x4b, 0x4b, 0x4b, 0x4b, 0x4b, 0x4b, 0x4b, 0x87};
+    for (const Bytes& named : {doge_p2pkh, doge_p2sh}) {
+        SCOPED_TRACE(named.size());
+        Bytes p;
+        std::vector<std::pair<uint32_t, Bytes>> m{{98, named}};
+        EXPECT_FALSE(rig.ws->decide_job_payout(p, m).has_value()) << "a named DOGE address was split";
+        EXPECT_EQ(p, named) << "the DGB parent is not the named address's script";
+        ASSERT_EQ(m.size(), 1u) << "the named DOGE entry was dropped";
+        EXPECT_EQ(m[0].second, named);
+    }
+    // Another chain's entry is not DOGE's: nothing usable named, split.
+    Bytes p;
+    std::vector<std::pair<uint32_t, Bytes>> other{{7, doge_p2pkh}};
+    EXPECT_EQ(rig.ws->decide_job_payout(p, other), std::optional<uint16_t>(core::kSplitShareDonation));
+    EXPECT_EQ(p, owner);
+}
+
+// The same through a real core::StratumServer with DOGE configured: the three
+// login forms that name a DOGE address and no DGB one each get a case-4 job
+// (the DGB parent is the DOGE P2SH script, the node's donation), not split.
+TEST(DgbStratumJobs, NamedDogeLoginFormsAreCaseFourThroughTheServer)
+{
+    const Bytes owner{0x76, 0xa9, 0x14, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e,
+                      0x0e, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e, 0x88, 0xac};
+    const Bytes doge_p2sh_script{0xa9, 0x14, 0x4b, 0x4b, 0x4b, 0x4b, 0x4b, 0x4b, 0x4b, 0x4b, 0x4b, 0x4b,
+                                 0x4b, 0x4b, 0x4b, 0x4b, 0x4b, 0x4b, 0x4b, 0x4b, 0x4b, 0x4b, 0x87};
+    const std::string doge = core::script_to_address(doge_p2sh_script, "", 30, 22);   // DOGE mainnet P2SH
+    ASSERT_FALSE(doge.empty());
+    struct Form { const char* name; std::string login; bool set_merged; };
+    for (const Form& f : {Form{"comma", "," + doge, false}, Form{"slash", "/98:" + doge, false},
+                          Form{"set_merged_addresses", "", true}}) {
+        SCOPED_TRACE(f.name);
+        JobRig rig;
+        boost::asio::io_context mioc;
+        dgb_test::MergedMiningManager mm(mioc);
+        dgb_test::add_doge(mm);
+        rig.ws->set_merged_mining_manager(&mm);
+        rig.ws->set_split_owner(owner);
+        const uint256 best(std::vector<unsigned char>(32, 0x5b));
+        {
+            std::lock_guard<std::mutex> l(rig.mu);
+            rig.known_share = best;
+        }
+        rig.ws->set_best_share_hash_fn([best]() { return best; });
+        RigClient c(rig.port);
+        ASSERT_GE(c.fd, 0);
+        c.send({{"id", 1}, {"method", "mining.subscribe"}, {"params", nlohmann::json::array()}});
+        ASSERT_TRUE(c.pump(2000, 1).has_value());
+        if (f.set_merged) {
+            c.send({{"id", 5}, {"method", "mining.set_merged_addresses"}, {"params", {{{"98", doge}}}}});
+            c.pump(2000, 5);
+        }
+        c.send({{"id", 2}, {"method", "mining.authorize"}, {"params", {f.login, "x"}}});
+        auto auth = c.pump(2000, 2);
+        ASSERT_TRUE(auth.has_value());
+        ASSERT_TRUE((*auth)["result"].is_boolean() && (*auth)["result"].get<bool>()) << auth->dump();
+        for (int i = 0; i < 40; ++i) {
+            c.pump(100);
+            std::lock_guard<std::mutex> l(rig.mu);
+            if (!rig.payouts.empty() && rig.payouts.back() == doge_p2sh_script)
+                break;
+        }
+        std::lock_guard<std::mutex> l(rig.mu);
+        ASSERT_FALSE(rig.payouts.empty()) << "no job";
+        EXPECT_EQ(rig.payouts.back(), doge_p2sh_script) << "the login's job is not case 4";
+        EXPECT_FALSE(rig.donations.back().has_value()) << "the login's job was split";
+    }
 }
