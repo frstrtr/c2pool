@@ -93,3 +93,24 @@ TEST(DgbMainWiring, TheRedistributeSplitIsWired)
         EXPECT_NE(s.find(line), std::string::npos) << line;
     EXPECT_EQ(s.find("split is not available on DGB yet"), std::string::npos);
 }
+
+// The X1 audit (master 8e5b12995: main_dgb.cpp pool hashrate,
+// redistribute.hpp refresh_pplns_cache): no dashboard or redistribute
+// callback reads the tracker without the read guard.
+TEST(DgbMainWiring, TrackerReadsFromCallbacksAreGuarded)
+{
+    std::ifstream f(DGB_MAIN_SRC);
+    ASSERT_TRUE(f.good()) << DGB_MAIN_SRC;
+    std::stringstream ss;
+    ss << f.rdbuf();
+    const std::string s = ss.str();
+    EXPECT_EQ(s.find("auto& redist_tracker = p2p_node.tracker();"), std::string::npos);
+    const auto fb = s.find("work_source->set_fallback_payout_fn(");
+    ASSERT_NE(fb, std::string::npos);
+    const std::string body = s.substr(fb, s.find("});", fb) - fb);
+    EXPECT_NE(body.find("auto guard = p2p_node.read_tracker();"), std::string::npos);
+    EXPECT_NE(body.find("redistributor->pick(*guard, best)"), std::string::npos);
+    const auto hr = s.find("mi->set_pool_hashrate_fn(");
+    ASSERT_NE(hr, std::string::npos);
+    EXPECT_EQ(s.substr(hr, s.find("});", hr) - hr).find("p2p_node.tracker()"), std::string::npos);
+}

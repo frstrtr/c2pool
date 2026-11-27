@@ -2002,13 +2002,19 @@ int run_node(const core::CoinParams& params, bool testnet,
                       << "\" is not an own-network DGB P2PKH/P2SH address; fee arm "
                          "stays null (empty script, no burn)" << std::endl;
         }
-        auto& redist_tracker = p2p_node.tracker();
+        // The pick walks the PPLNS window (Redistributor::refresh_pplns_cache):
+        // under the tracker read guard, from the submit path (it was an
+        // unguarded read). Busy: no fallback payout this time (the empty
+        // payout's fail-safe: nothing is burned).
         work_source->set_fallback_payout_fn(
-            [redistributor, &redist_tracker, ws = work_source.get()]()
+            [redistributor, &p2p_node, ws = work_source.get()]()
                 -> std::vector<unsigned char> {
                 uint256 best;
                 if (auto bf = ws->get_best_share_hash_fn()) best = bf();
-                const dgb::RedistributeResult r = redistributor->pick(redist_tracker, best);
+                auto guard = p2p_node.read_tracker();
+                if (!guard)
+                    return {};
+                const dgb::RedistributeResult r = redistributor->pick(*guard, best);
                 if (r.pubkey_hash.IsNull())
                     return {};   // unconfigured identity -> fail-safe (no burn)
                 // Build the scriptPubKey from the RAW 20-byte hash (storage
