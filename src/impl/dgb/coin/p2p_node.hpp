@@ -18,6 +18,7 @@
 #include "compact_blocks.hpp"
 #include "mempool.hpp"
 
+#include <functional>
 #include <map>
 #include <memory>
 
@@ -95,6 +96,8 @@ private:
     // names; the rest counted under "other").
     std::map<std::string, uint64_t> m_unknown_commands;
     static constexpr std::size_t kMaxUnknownCommands = 64;
+    std::function<std::vector<uint256>()> m_locator_fn;
+    std::function<void()> m_on_block_inv;
     // Compact block reconstruction state: pending compact block awaiting blocktxn
     std::unique_ptr<CompactBlock> m_pending_cmpct;
     std::vector<uint32_t> m_pending_missing_indexes;
@@ -273,6 +276,13 @@ public:
     {
         return m_config->coin()->m_p2p.prefix;
     }
+
+    /// The getheaders locator the walk-forward sends (main_dgb: the header
+    /// chain's, getheaders_locator); unset: the batch's last header alone.
+    void set_locator_fn(std::function<std::vector<uint256>()> fn) { m_locator_fn = std::move(fn); }
+    /// Called on an inv(block): main_dgb asks for headers with the chain's
+    /// locator, so a peer announcing by inv still extends the header chain.
+    void set_on_block_inv(std::function<void()> fn) { m_on_block_inv = std::move(fn); }
 
     /// Unknown commands ignored so far, per command name.
     const std::map<std::string, uint64_t>& unknown_commands() const { return m_unknown_commands; }
@@ -635,6 +645,8 @@ private:
                 break;
             case inventory_type::block:
                 m_coin->new_block.happened(inv.m_hash);
+                if (m_on_block_inv)
+                    m_on_block_inv();
                 // BTC advertises NODE_WITNESS — getdata for blocks must use
                 // MSG_WITNESS_BLOCK (0x40000002) per BIP 144, otherwise the
                 // peer drops witness data on the wire.
@@ -758,8 +770,14 @@ private:
             else if (vheaders.size() > 3 && m_peer) {
                 auto packed_tip = pack(vheaders.back());
                 auto tip_hash = Hash(packed_tip.get_span());
+                // The header chain's locator when bound: after a batch that
+                // connected its tip IS the batch's last header; after one that
+                // did not, the peer is asked from the fork point.
+                std::vector<uint256> loc = m_locator_fn ? m_locator_fn() : std::vector<uint256>{};
+                if (loc.empty())
+                    loc.push_back(tip_hash);
                 auto getheaders_msg = message_getheaders::make_raw(
-                    1, {tip_hash}, uint256());
+                    1, loc, uint256());
                 m_peer->write(getheaders_msg);
                 LOG_INFO << "[" << m_chain_label << "] Walk-forward getheaders from "
                          << tip_hash.GetHex().substr(0, 16) << "..."

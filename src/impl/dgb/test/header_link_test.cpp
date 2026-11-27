@@ -74,58 +74,147 @@ std::vector<BlockHeaderType> run_on(const uint256& start, int n, uint32_t t0, ui
 
 } // namespace
 
+namespace {
+uint256 dgb_genesis()
+{
+    uint256 g;
+    g.SetHex("7497ea1b465eb39f1c8f507bc877078fe016d6fcb6dfad3a64c98dcc6e1e8496");
+    return g;
+}
+c2pool::dgb::u256 u_of(const uint256& h)
+{
+    uint256 c = h;
+    return c2pool::dgb::u256::from_le_bytes(reinterpret_cast<const unsigned char*>(c.begin()));
+}
+// A chain of `n` linked headers on genesis, through ingest_linked.
+std::vector<BlockHeaderType> build(HeaderChain& chain, c2pool::dgb::ForkBuffer& fork, int n)
+{
+    const auto a = run_on(dgb_genesis(), n, 1790000000);
+    for (const auto& h : a)
+        EXPECT_EQ(ingest_linked(chain, fork, make_header_sample(h), u_of(dgb_genesis())), LinkResult::APPENDED);
+    return a;
+}
+} // namespace
+
 TEST(DgbHeaderLink, AppendsOnlyOntoItsParent)
 {
-    uint256 genesis;
-    genesis.SetHex("7497ea1b465eb39f1c8f507bc877078fe016d6fcb6dfad3a64c98dcc6e1e8496");
-    HeaderChain chain;
-    chain.set_base_height(1);
-    const auto a = run_on(genesis, 5, 1790000000);
-    for (const auto& h : a)
-        EXPECT_EQ(ingest_linked(chain, make_header_sample(h)), LinkResult::APPENDED);
+    HeaderChain chain;   // production construction: no set_base_height
+    c2pool::dgb::ForkBuffer fork;
+    const auto a = build(chain, fork, 5);
+    // Block 1 (the header on genesis) sits at height 1 (review 7a4373856 R2).
     ASSERT_EQ(chain.tip_height(), std::optional<uint32_t>(5u));
+    EXPECT_EQ(chain.next_block_height(), 6u);
     EXPECT_EQ(c2pool::dgb::wire_hash(*chain.tip_hash()), id_of(a[4]));
-
     // A known header: skipped, nothing moves.
-    EXPECT_EQ(ingest_linked(chain, make_header_sample(a[2])), LinkResult::KNOWN);
+    EXPECT_EQ(ingest_linked(chain, fork, make_header_sample(a[2])), LinkResult::KNOWN);
     EXPECT_EQ(chain.tip_height(), std::optional<uint32_t>(5u));
-
-    // The peer's branch from a[2]: the chain is cut back to it and follows.
-    const auto b = run_on(id_of(a[2]), 3, 1790000100, /*salt=*/7);
-    EXPECT_EQ(ingest_linked(chain, make_header_sample(b[0])), LinkResult::REORGED);
-    EXPECT_EQ(chain.tip_height(), std::optional<uint32_t>(4u)) << "a[3], a[4] are not cut away";
-    EXPECT_EQ(ingest_linked(chain, make_header_sample(b[1])), LinkResult::APPENDED);
-    EXPECT_EQ(ingest_linked(chain, make_header_sample(b[2])), LinkResult::APPENDED);
-    EXPECT_EQ(chain.tip_height(), std::optional<uint32_t>(6u));
-    EXPECT_EQ(c2pool::dgb::wire_hash(*chain.tip_hash()), id_of(b[2]));
-
     // Unconnected (an answer from genesis, a random parent): dropped.
     uint256 stranger;
     stranger.SetHex("1234");
-    EXPECT_EQ(ingest_linked(chain, make_header_sample(header_on(stranger, 1790000500))), LinkResult::UNCONNECTED);
-    EXPECT_EQ(ingest_linked(chain, make_header_sample(header_on(genesis, 1790000600, 99))), LinkResult::UNCONNECTED);
+    EXPECT_EQ(ingest_linked(chain, fork, make_header_sample(header_on(stranger, 1790000500))), LinkResult::UNCONNECTED);
+    EXPECT_EQ(ingest_linked(chain, fork, make_header_sample(header_on(dgb_genesis(), 1790000600, 99))),
+              LinkResult::UNCONNECTED);
+    // A zero parent on a non-empty chain (review F2c): refused.
+    EXPECT_EQ(ingest_linked(chain, fork, make_header_sample(header_on(uint256(), 1790000700))), LinkResult::UNCONNECTED);
+    EXPECT_EQ(chain.tip_height(), std::optional<uint32_t>(5u));
+}
+
+// The tip switches only to a strictly longer branch above the fork point.
+TEST(DgbHeaderLink, ALongerBranchSwitchesTheTip)
+{
+    HeaderChain chain;
+    c2pool::dgb::ForkBuffer fork;
+    const auto a = build(chain, fork, 5);   // heights 1..5
+    const auto b = run_on(id_of(a[2]), 3, 1790000100, /*salt=*/7);   // on height 3
+    EXPECT_EQ(ingest_linked(chain, fork, make_header_sample(b[0])), LinkResult::BUFFERED);
+    EXPECT_EQ(ingest_linked(chain, fork, make_header_sample(b[1])), LinkResult::BUFFERED) << "as long, not longer";
+    EXPECT_EQ(chain.tip_height(), std::optional<uint32_t>(5u)) << "first seen keeps the tip";
+    std::size_t depth = 0;
+    EXPECT_EQ(ingest_linked(chain, fork, make_header_sample(b[2]), 0, &depth), LinkResult::REORGED);
+    EXPECT_EQ(depth, 2u);
     EXPECT_EQ(chain.tip_height(), std::optional<uint32_t>(6u));
+    EXPECT_EQ(c2pool::dgb::wire_hash(*chain.tip_hash()), id_of(b[2]));
+    EXPECT_FALSE(chain.find_index(u_of(id_of(a[3])))) << "the cut headers are still indexed";
+    EXPECT_TRUE(chain.find_index(u_of(id_of(b[0]))));
+}
+
+// Review 7a4373856 F1: a rejected fork header never changes the chain, and
+// the honest next header still lands on the tip.
+TEST(DgbHeaderLink, ARejectedForkLeavesTheChainUnchanged)
+{
+    HeaderChain chain;
+    c2pool::dgb::ForkBuffer fork;
+    const auto a = build(chain, fork, 6);
+    // A one-header fork on height 2 is never longer than the 4 above it.
+    BlockHeaderType bad = header_on(id_of(a[1]), 1790000200, 3);
+    bad.m_version = 0x20000100;   // unknown algo nibble: REJECT
+    EXPECT_NE(ingest_linked(chain, fork, make_header_sample(bad)), LinkResult::REORGED);
+    EXPECT_EQ(chain.tip_height(), std::optional<uint32_t>(6u));
+    // A fork that does become longer, with its last header invalid: restored.
+    std::vector<BlockHeaderType> f = run_on(id_of(a[4]), 2, 1790000300, /*salt=*/11);
+    f[1].m_version = 0x20000100;
+    EXPECT_EQ(ingest_linked(chain, fork, make_header_sample(f[0])), LinkResult::BUFFERED);
+    EXPECT_EQ(ingest_linked(chain, fork, make_header_sample(f[1])), LinkResult::REJECTED);
+    ASSERT_EQ(chain.tip_height(), std::optional<uint32_t>(6u)) << "a rejected switch cut the chain";
+    EXPECT_EQ(c2pool::dgb::wire_hash(*chain.tip_hash()), id_of(a[5]));
+    EXPECT_TRUE(chain.find_index(u_of(id_of(a[5])))) << "the restored tail is not indexed";
+    // The honest child of the tip: appended.
+    EXPECT_EQ(ingest_linked(chain, fork, make_header_sample(header_on(id_of(a[5]), 1790000400))), LinkResult::APPENDED);
+    EXPECT_EQ(chain.tip_height(), std::optional<uint32_t>(7u));
+}
+
+// The review's cut demonstrations are no-ops now: one header far below the
+// tip (beyond the depth bound), and a one-header fork that is not longer.
+TEST(DgbHeaderLink, OneHeaderNoLongerCutsTheChain)
+{
+    {
+        HeaderChain chain;
+        c2pool::dgb::ForkBuffer fork;
+        const auto a = build(chain, fork, 3000);
+        EXPECT_EQ(ingest_linked(chain, fork, make_header_sample(header_on(id_of(a[0]), 1790100000))),
+                  LinkResult::UNCONNECTED) << "a cut deeper than the bound";
+        EXPECT_EQ(chain.tip_height(), std::optional<uint32_t>(3000u));
+    }
+    {
+        HeaderChain chain;
+        c2pool::dgb::ForkBuffer fork;
+        const auto a = build(chain, fork, 30);
+        BlockHeaderType easy = header_on(id_of(a[1]), 1790100000, 5);
+        easy.m_version = 0x20000002;   // Scrypt, easy declared bits
+        easy.m_bits = 0x207fffff;
+        EXPECT_NE(ingest_linked(chain, fork, make_header_sample(easy)), LinkResult::REORGED);
+        EXPECT_EQ(chain.tip_height(), std::optional<uint32_t>(30u));
+        EXPECT_EQ(c2pool::dgb::wire_hash(*chain.tip_hash()), id_of(a[29]));
+    }
 }
 
 TEST(DgbHeaderLink, TheLiveIngestLinksTheBatch)
 {
-    uint256 genesis;
-    genesis.SetHex("7497ea1b465eb39f1c8f507bc877078fe016d6fcb6dfad3a64c98dcc6e1e8496");
     HeaderChain chain;
-    chain.set_base_height(1);
     dgb::interfaces::Node node;
-    auto sub = c2pool::dgb::wire_header_ingest(node, chain);
-    const auto a = run_on(genesis, 6, 1790000000);
+    int requests = 0;
+    uint32_t published = 0;
+    c2pool::dgb::HeaderIngestOptions opts;
+    opts.genesis = u_of(dgb_genesis());
+    opts.request_headers = [&] { ++requests; };
+    opts.on_tip = [&](uint32_t h) { published = h; };
+    auto sub = c2pool::dgb::wire_header_ingest(node, chain, opts);
+    const auto a = run_on(dgb_genesis(), 6, 1790000000);
     node.new_headers.happened(std::vector<BlockHeaderType>(a.begin(), a.begin() + 4));
-    ASSERT_EQ(chain.tip_height(), std::optional<uint32_t>(4u));
+    ASSERT_EQ(chain.tip_height(), std::optional<uint32_t>(4u)) << "block 1 is height 1 on the production chain";
+    EXPECT_EQ(published, 4u);
     // The same batch again plus the next two (a resend from an older locator):
     // the known ones are skipped, the new ones appended once.
     node.new_headers.happened(a);
     ASSERT_EQ(chain.tip_height(), std::optional<uint32_t>(6u)) << "known headers appended again";
-    // A batch from genesis (the wedge): nothing connects, nothing appended.
-    node.new_headers.happened(run_on(genesis, 4, 1780000000, /*salt=*/3));
+    EXPECT_EQ(requests, 0);
+    // A batch from genesis that does not connect: nothing appended, and the
+    // peer is asked again with the chain's locator.
+    node.new_headers.happened(run_on(dgb_genesis(), 4, 1780000000, /*salt=*/3));
     EXPECT_EQ(chain.tip_height(), std::optional<uint32_t>(6u));
     EXPECT_EQ(c2pool::dgb::wire_hash(*chain.tip_hash()), id_of(a[5]));
+    EXPECT_EQ(requests, 1);
+    EXPECT_EQ(published, 6u);
 }
 
 TEST(DgbHeaderLink, TheLocatorHasCoresShape)
@@ -133,10 +222,10 @@ TEST(DgbHeaderLink, TheLocatorHasCoresShape)
     uint256 genesis;
     genesis.SetHex("7497ea1b465eb39f1c8f507bc877078fe016d6fcb6dfad3a64c98dcc6e1e8496");
     HeaderChain chain;
-    chain.set_base_height(1);
+    c2pool::dgb::ForkBuffer fork;
     const auto a = run_on(genesis, 40, 1790000000);
     for (const auto& h : a)
-        ASSERT_EQ(ingest_linked(chain, make_header_sample(h)), LinkResult::APPENDED);
+        ASSERT_EQ(ingest_linked(chain, fork, make_header_sample(h), u_of(genesis)), LinkResult::APPENDED);
     const auto loc = c2pool::dgb::getheaders_locator(chain, genesis);
     // Core's GetLocator over heights 39..0: 39..29 one by one, then 28, 26,
     // 22, 14 (steps 1, 2, 4, 8) and the oldest, 0.
@@ -161,6 +250,21 @@ TEST(DgbHeaderLink, MainDgbSendsTheFullLocatorAndUnknownCommandsAreQuiet)
     const std::string main = ss.str();
     EXPECT_NE(main.find("const std::vector<uint256> locator = c2pool::dgb::getheaders_locator("), std::string::npos);
     EXPECT_EQ(main.find("(tip->limb[i] >> (8 * j))"), std::string::npos) << "a tip-only locator";
+    // Review 7a4373856: the ingest knows genesis and asks for headers; the
+    // walk-forward and inv use the chain's locator; --coin-daemon keeps a
+    // driver; the HTTP thread reads the published tip; a deep switch resets
+    // the tip latch.
+    for (const char* line : {
+             "auto header_ingest_sub  = c2pool::dgb::wire_header_ingest(coin_iface, header_chain, header_opts);",
+             "coin_p2p->set_on_block_inv(header_opts.request_headers);",
+             "stop_coin_header_driver = dgb::start_periodic(ioc, std::chrono::milliseconds(12000),",
+             "const uint32_t hh = header_tip_pub->load();",
+             "ws->reset_tip_latch();"})
+        EXPECT_NE(main.find(line), std::string::npos) << line;
+    size_t n = 0;
+    for (size_t at = 0; (at = main.find("coin_p2p->set_locator_fn(", at)) != std::string::npos; ++at)
+        ++n;
+    EXPECT_EQ(n, 2u) << "both coin-peer modes walk forward from the chain's locator";
 
     const auto p2p = std::filesystem::path(DGB_MAIN_SRC).parent_path().parent_path() / "impl" / "dgb" / "coin"
                      / "p2p_node.hpp";

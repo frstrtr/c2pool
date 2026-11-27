@@ -376,6 +376,10 @@ public:
     /// template, or none. The one source choice of the template, the prevhash
     /// getter and the work gate.
     bool embedded_chain_serves() const;
+    /// The header chain's tip switched deep (main_dgb: a cut of more than a
+    /// few headers): the tip latch is let go, so the embedded chain serves
+    /// again only once it is at its tip.
+    void reset_tip_latch() { tip_latched_.store(false); }
 
     /// Whether a template can be served now: the embedded chain serves, or
     /// digibyted's GBT answers with a height (through the GBT cache, so at

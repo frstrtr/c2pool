@@ -47,6 +47,7 @@
 #include <functional>
 #include <limits>
 #include <optional>
+#include <unordered_map>
 #include <vector>
 
 #include <impl/dgb/coin/dgb_arith256.hpp>
@@ -290,7 +291,7 @@ public:
             if (h.n_time <= median_time_past())
                 return IngestResult::REJECTED;
 
-            m_chain.push_back(h);
+            push_header(h);
             m_cumulative_work += work_from_target(h.target);  // credited
             trim_to_window();
             return IngestResult::VALIDATED_SCRYPT;
@@ -300,7 +301,7 @@ public:
         default:
             // Extends the header chain; work-neutral (NO m_cumulative_work
             // change) and excluded from the retarget window by construction.
-            m_chain.push_back(h);
+            push_header(h);
             trim_to_window();
             return IngestResult::ACCEPTED_CONTINUITY;
         }
@@ -392,13 +393,17 @@ public:
     // back -- a truthful absence, never a fabricated hash.
     // The position (0 == oldest retained) of the header with block id `hash`
     // in the retained window, searched from the tip back; none if not there.
+    // O(1) through the block-id index (every retained header with an id).
     std::optional<std::size_t> find_index(const u256& hash) const
     {
         if (hash.is_zero())
             return std::nullopt;
-        for (std::size_t i = m_chain.size(); i-- > 0;)
-            if (m_chain[i].block_hash == hash)
-                return i;
+        const auto range = m_index.equal_range(hash.limb[0]);
+        for (auto it = range.first; it != range.second; ++it) {
+            const uint64_t pos = it->second - m_front_seq;
+            if (pos < m_chain.size() && m_chain[pos].block_hash == hash)
+                return static_cast<std::size_t>(pos);
+        }
         return std::nullopt;
     }
 
@@ -406,11 +411,28 @@ public:
     // m_chain[index]): the header there becomes the tip. Heights stay
     // positional (tip_height() == base + index). cumulative_work is the
     // monotone proxy of credited work (see trim_to_window) and is not
-    // decremented.
+    // decremented (no production path reads it).
     void truncate_after(std::size_t index)
     {
         while (m_chain.size() > index + 1)
-            m_chain.pop_back();
+            pop_back_header();
+    }
+
+    // The headers after position `index`, oldest first (what truncate_after
+    // would drop), and their restore: appended back as they were, without
+    // validating again (they were validated in this same context).
+    std::vector<HeaderSample> tail_after(std::size_t index) const
+    {
+        std::vector<HeaderSample> out;
+        for (std::size_t i = index + 1; i < m_chain.size(); ++i)
+            out.push_back(m_chain[i]);
+        return out;
+    }
+    void restore_tail(const std::vector<HeaderSample>& tail)
+    {
+        for (const auto& h : tail)
+            push_header(h);
+        trim_to_window();
     }
 
     // A getheaders block locator (DigiByte Core CChain::GetLocator shape):
@@ -554,7 +576,7 @@ private:
     void trim_to_window()
     {
         while (m_chain.size() > HEADER_WINDOW_CAP) {
-            m_chain.pop_front();
+            pop_front_header();
             ++m_base_height;
         }
     }
@@ -589,6 +611,40 @@ private:
     // access here is positional / back() / size(), all O(1) on a deque, so the
     // container swap from std::vector is behaviour-preserving for consumers.
     std::deque<HeaderSample>  m_chain;          // oldest .. newest (<= CAP)
+    // Block id (low limb) -> the header's sequence number; position ==
+    // sequence - m_front_seq. Every push / pop keeps it in step.
+    std::unordered_multimap<uint64_t, uint64_t> m_index;
+    uint64_t                  m_front_seq = 0;    // sequence number of m_chain.front()
+
+    void push_header(const HeaderSample& h)
+    {
+        const uint64_t seq = m_front_seq + m_chain.size();
+        m_chain.push_back(h);
+        if (!h.block_hash.is_zero())
+            m_index.emplace(h.block_hash.limb[0], seq);
+    }
+    void unindex(const HeaderSample& h, uint64_t seq)
+    {
+        if (h.block_hash.is_zero())
+            return;
+        const auto range = m_index.equal_range(h.block_hash.limb[0]);
+        for (auto it = range.first; it != range.second; ++it)
+            if (it->second == seq) {
+                m_index.erase(it);
+                return;
+            }
+    }
+    void pop_front_header()
+    {
+        unindex(m_chain.front(), m_front_seq);
+        m_chain.pop_front();
+        ++m_front_seq;
+    }
+    void pop_back_header()
+    {
+        unindex(m_chain.back(), m_front_seq + m_chain.size() - 1);
+        m_chain.pop_back();
+    }
     uint64_t                  m_cumulative_work = 0;
 };
 

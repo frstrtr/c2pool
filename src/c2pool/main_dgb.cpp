@@ -1128,7 +1128,36 @@ int run_node(const core::CoinParams& params, bool testnet,
     // to next — header+mempool ingest together, the unblock order integrator
     // directed (2026-06-20).
     dgb::interfaces::Node coin_iface;
-    auto header_ingest_sub  = c2pool::dgb::wire_header_ingest(coin_iface, header_chain);
+    // The header ingest (header_ingest.hpp): linked on the parent, a fork
+    // switches the tip only once longer (depth bound kMaxReorgDepth), block 1
+    // on genesis sits at height 1. An unconnected or buffered fork header
+    // asks the coin peer for headers with the chain's locator (at most every
+    // 2 s); the tip height is published for the HTTP thread; a deep switch
+    // lets the work source's tip latch go (hook set once it exists).
+    const uint256 dgb_genesis = !coin_genesis.IsNull() ? coin_genesis
+        : uint256S(testnet ? "308ea0711d5763be2995670dd9ca9872753561285a84da1d58be58acaa822252"
+                           : "7497ea1b465eb39f1c8f507bc877078fe016d6fcb6dfad3a64c98dcc6e1e8496");
+    auto header_tip_pub = std::make_shared<std::atomic<uint32_t>>(0);
+    auto header_reorg_hook = std::make_shared<std::function<void(std::size_t)>>();
+    auto last_header_request = std::make_shared<std::chrono::steady_clock::time_point>();
+    c2pool::dgb::HeaderIngestOptions header_opts;
+    {
+        uint256 g = dgb_genesis;
+        header_opts.genesis = c2pool::dgb::u256::from_le_bytes(reinterpret_cast<const unsigned char*>(g.begin()));
+    }
+    header_opts.request_headers = [&coin_p2p, &header_chain, dgb_genesis, last_header_request]() {
+        const auto now = std::chrono::steady_clock::now();
+        if (!coin_p2p || !coin_p2p->is_handshake_complete() || now - *last_header_request < std::chrono::seconds(2))
+            return;
+        *last_header_request = now;
+        coin_p2p->send_getheaders(70019, c2pool::dgb::getheaders_locator(header_chain, dgb_genesis), uint256::ZERO);
+    };
+    header_opts.on_tip = [header_tip_pub](uint32_t h) { header_tip_pub->store(h); };
+    header_opts.on_reorg = [header_reorg_hook](std::size_t depth) {
+        if (*header_reorg_hook)
+            (*header_reorg_hook)(depth);
+    };
+    auto header_ingest_sub  = c2pool::dgb::wire_header_ingest(coin_iface, header_chain, header_opts);
     // Pass the fee-proof UTXO view (nullptr when the lane is disarmed) so a
     // relayed tx is fee-proved at ingest against the SAME view selection uses.
     auto mempool_ingest_sub = c2pool::dgb::wire_mempool_ingest(coin_iface, mempool, dgb_utxo_ptr);
@@ -1283,6 +1312,7 @@ int run_node(const core::CoinParams& params, bool testnet,
     // No behavior change when --coin-daemon is absent: coin_p2p stays null, the
     // consumer seam idles exactly as before this slice.
     io::steady_timer coin_getheaders_timer(ioc);
+    std::function<void()> stop_coin_header_driver;
     if (!coin_daemon.empty()) {
         if (coin_magic.empty())
             std::cout << "[DGB] WARNING: --coin-daemon set without --coin-magic "
@@ -1304,6 +1334,10 @@ int run_node(const core::CoinParams& params, bool testnet,
         coin_p2p->set_lifetime(coin_p2p);
         assert(coin_p2p->lifetime_armed() && "DGB coin-P2P dial lifetime failed to arm");
         coin_p2p->enable_mempool_request();  // also exercise the tx ingest seam
+        coin_p2p->set_locator_fn([&header_chain, dgb_genesis]() {
+            return c2pool::dgb::getheaders_locator(header_chain, dgb_genesis);
+        });
+        coin_p2p->set_on_block_inv(header_opts.request_headers);
         coin_p2p->connect(target);
         std::cout << "[DGB] embedded coin-daemon P2P producer dialing "
                   << target.to_string() << " magic=" << HexStr(coin_magic)
@@ -1314,7 +1348,7 @@ int run_node(const core::CoinParams& params, bool testnet,
         // chain into validate_and_append. 3s mirrors main_btc.cpp's driver.
         coin_getheaders_timer.expires_after(std::chrono::seconds(3));
         coin_getheaders_timer.async_wait(
-            [&coin_p2p, &header_chain, coin_genesis]
+            [&coin_p2p, &header_chain, dgb_genesis]
             (const boost::system::error_code& ec) {
                 if (ec) return;
                 if (!coin_p2p->is_handshake_complete()) {
@@ -1328,7 +1362,7 @@ int run_node(const core::CoinParams& params, bool testnet,
                 // forward continuation for long chains is a follow-up slice.
                 // The chain's locator (a restart with stored headers resumes
                 // from its tip), else [genesis].
-                const std::vector<uint256> locator = c2pool::dgb::getheaders_locator(header_chain, coin_genesis);
+                const std::vector<uint256> locator = c2pool::dgb::getheaders_locator(header_chain, dgb_genesis);
                 std::cout << "[DGB] coin-daemon handshake OK — sending initial "
                              "getheaders, locator="
                           << (locator.empty()
@@ -1337,6 +1371,20 @@ int run_node(const core::CoinParams& params, bool testnet,
                           << std::endl;
                 // 70019 == DigiByte Core PROTOCOL_VERSION (coin/p2p_node.hpp).
                 coin_p2p->send_getheaders(70019, locator, uint256::ZERO);
+            });
+        // Header sync stays alive after startup (review 7a4373856): every
+        // 12 s, a fresh handshake or no progress since the last tick sends
+        // getheaders with the chain's locator.
+        stop_coin_header_driver = dgb::start_periodic(ioc, std::chrono::milliseconds(12000),
+            [&coin_p2p, &header_chain, dgb_genesis, last_h = std::make_shared<uint32_t>(0),
+             was = std::make_shared<bool>(false)]() {
+                const bool hs = coin_p2p && coin_p2p->is_handshake_complete();
+                const uint32_t h = header_chain.tip_height().value_or(0);
+                if (hs && (!*was || h <= *last_h))
+                    coin_p2p->send_getheaders(70019, c2pool::dgb::getheaders_locator(header_chain, dgb_genesis),
+                                              uint256::ZERO);
+                *was = hs;
+                *last_h = h;
             });
     }
 
@@ -1398,6 +1446,10 @@ int run_node(const core::CoinParams& params, bool testnet,
             &ioc, &coin_iface, &config, "DGB-CoinP2P");
         coin_p2p->set_lifetime(coin_p2p);
         assert(coin_p2p->lifetime_armed() && "DGB coin-P2P dial lifetime failed to arm");
+        coin_p2p->set_locator_fn([&header_chain, dgb_genesis]() {
+            return c2pool::dgb::getheaders_locator(header_chain, dgb_genesis);
+        });
+        coin_p2p->set_on_block_inv(header_opts.request_headers);
 
         // Peers already dialed this run (exclusion set for failover); cleared to
         // re-sweep once the banked set is exhausted so a dead first pick — or a
@@ -1560,6 +1612,11 @@ int run_node(const core::CoinParams& params, bool testnet,
     auto work_source = std::make_shared<dgb::stratum::DGBWorkSource>(
         header_chain, mempool, testnet, std::move(stratum_submit_fn),
         params.subsidy_func);
+    // A deep header-tip switch lets the tip latch go (review 7a4373856).
+    *header_reorg_hook = [ws = work_source.get()](std::size_t depth) {
+        if (depth > 6)
+            ws->reset_tip_latch();
+    };
     // #961: the DGBWorkSource ctor takes only a testnet bool; --regtest is a
     // THIRD network (DigiByte CRegTestParams reuses the testnet base58 bytes and
     // uses the "dgbrt" bech32 HRP). Pass it through so a legitimate --regtest
@@ -2458,9 +2515,11 @@ int run_node(const core::CoinParams& params, bool testnet,
         // come from the single embedded coin P2P peer's version metadata
         // (empty until --coin-daemon arms it). Captures are main-scope
         // objects that outlive ioc.run(); all reads display-only.
-        mi->set_coin_sync_status_fn([&header_chain, &coin_p2p]() -> nlohmann::json {
+        mi->set_coin_sync_status_fn([header_tip_pub, &coin_p2p]() -> nlohmann::json {
             nlohmann::json s = nlohmann::json::object();
-            const uint32_t hh = header_chain.tip_height().value_or(0);
+            // The tip height the io thread publishes (the chain is not read
+            // from this thread).
+            const uint32_t hh = header_tip_pub->load();
             uint32_t th = 0;
             nlohmann::json peers = nlohmann::json::array();
             if (coin_p2p && coin_p2p->peer_version() > 0) {
@@ -3043,6 +3102,8 @@ int run_node(const core::CoinParams& params, bool testnet,
     if (found_block_report) *found_block_report = nullptr;  // #995: unbind before mi dies
     if (stop_job_push) stop_job_push();   // before the server it pushes to goes
     if (stop_work_gate) stop_work_gate(); // it closes the server's sessions
+    if (stop_coin_header_driver) stop_coin_header_driver();
+    *header_reorg_hook = nullptr;           // it reads the work source
     if (work_source) work_source->set_local_rate_fn(nullptr);   // it reads the server's rates
     if (work_source) work_source->set_node_rate_fn(nullptr);
     stratum_server.reset();
