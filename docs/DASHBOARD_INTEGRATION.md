@@ -224,8 +224,12 @@ block_explorer_prefix:   "https://your-explorer.example.com/block/"
 tx_explorer_prefix:      "https://your-explorer.example.com/tx/"
 ```
 
-- **Analytics:** set `--analytics-id G-XXXXXXXXXX` (YAML `analytics_id`) to
-  inject a measurement snippet into the dashboard `</head>`.
+- **Analytics:** set `--analytics-id G-XXXXXXXXXX` (settings key
+  `web.analytics_id`; LTC YAML `analytics_id`) on any coin binary to put the
+  Google Analytics tag into every HTML page the node serves, with Consent Mode
+  defaulting to denied and a small Accept / Decline bar; off by default. Pass the
+  same flag to `explorer/explorer.py` for its pages. See the README section
+  "Google Analytics tag".
 
 ---
 

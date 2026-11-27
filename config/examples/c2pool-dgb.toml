@@ -68,6 +68,7 @@ no_p2p_relay = false        # true = do not relay won blocks over the embedded c
 
 [dgb.web]
 port = 8084                 # dashboard TCP port, bound on 0.0.0.0; default 0 (off). For a loopback-only bind use the CLI: --http 127.0.0.1:8084
+# analytics_id = "G-XXXXXXXXXX"   # Google Analytics tag + consent bar (default denied) in every served HTML page; default "" (off). CLI --analytics-id wins
 
 [dgb.embedded]
 # serve_mempool_txs = true    # embedded fee-proof lane. Unset (default) = fee-proof lane ON, Stratum job commit OFF; true = also arm the job-commit lever (inert in this release); false = opt out of both
