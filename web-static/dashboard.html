@@ -6132,6 +6132,14 @@
             return tipShort || '';
         }
         // END c2pBlockMarks
+        // A share's stale_info as the sharechain stores it (p2pool's
+        // StaleInfo): 0 none, 253 orphan, 254 dead. 1 / 2 and the names are
+        // read too. Returns 'orphan', 'dead' or ''.
+        function c2pStaleKind(v) {
+            if (v === 253 || v === 1 || v === 'orphan') return 'orphan';
+            if (v === 254 || v === 2 || v === 'doa' || v === 'dead') return 'dead';
+            return '';
+        }
         // BEGIN c2pWindowBlocks (tested by sharechain-explorer/tests/unit/dashboard-window-blocks.test.ts)
         // "Blocks in Window": the blocks found since the oldest share in the
         // window. The window marks the blocks whose solving share is among its
@@ -7271,10 +7279,11 @@
             },
 
             getColor: function(share) {
+                var staleKind = c2pStaleKind(share.s);
                 // Dead shares - red
-                if (share.s === 2) return '#dc3545';
+                if (staleKind === 'dead') return '#dc3545';
                 // Orphan/stale - yellow
-                if (share.s === 1) return '#ffc107';
+                if (staleKind === 'orphan') return '#ffc107';
                 // Unverified - gray
                 if (!share.v) return '#555577';
 
@@ -7378,8 +7387,9 @@
                 var age = Math.floor(Date.now() / 1000 - share.t);
                 var difficulty = this.bitsToDifficulty(share.b);
 
-                var staleClass = share.s === 2 ? ' tt-dead' : share.s === 1 ? ' tt-stale' : '';
-                var staleText = share.s === 0 ? 'None' : share.s === 1 ? 'Orphan' : 'Dead';
+                var staleKind = c2pStaleKind(share.s);
+                var staleClass = staleKind === 'dead' ? ' tt-dead' : staleKind === 'orphan' ? ' tt-stale' : '';
+                var staleText = staleKind === 'orphan' ? 'Orphan' : staleKind === 'dead' ? 'Dead' : 'None';
                 var verText = share.v ? '<span style="color:#28a745">Verified</span>' : '<span style="color:#555577">Unverified</span>';
 
                 var minerAddr = share.m || '?';
@@ -7416,7 +7426,7 @@
                 if (tags.length > 0) {
                     html += '<div class="tt-row"><span class="tl">Tags</span><span class="tv">' + tags.join(' ') + '</span></div>';
                 }
-                if (share.s > 0) {
+                if (staleKind) {
                     html += '<div class="tt-row' + staleClass + '"><span class="tl">Stale</span><span class="tv">' + staleText + '</span></div>';
                 }
                 if (isLtcBlock || isDogeBlock) {
@@ -7703,8 +7713,9 @@
                 var vthr = (window.__shareVersionDescriptor && window.__shareVersionDescriptor.threshold) || 36;
                 shares.forEach(function(s) {
                     if (self.isMine(s.m)) mine++;
-                    if (s.s === 1) stale++;
-                    if (s.s === 2) dead++;
+                    var staleKind = c2pStaleKind(s.s);
+                    if (staleKind === 'orphan') stale++;
+                    if (staleKind === 'dead') dead++;
                     if (s.v) verified++;
                     if (s.fee) fee++;
                     if (s.V >= vthr) v36native++;

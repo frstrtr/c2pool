@@ -583,9 +583,10 @@
             html += kv('Donation', sd.donation != null ? (sd.donation * 100).toFixed(2) + '%' : '0.00%');
 
             var staleHtml = '-';
-            if (sd.stale_info === 'orphan' || sd.stale_info === 1) {
+            // stale_info as the sharechain stores it: 253 orphan, 254 dead.
+            if (sd.stale_info === 'orphan' || sd.stale_info === 1 || sd.stale_info === 253) {
                 staleHtml = '<span class="badge-stale">Orphan</span>';
-            } else if (sd.stale_info === 'dead' || sd.stale_info === 2) {
+            } else if (sd.stale_info === 'dead' || sd.stale_info === 'doa' || sd.stale_info === 2 || sd.stale_info === 254) {
                 staleHtml = '<span class="badge-stale" style="background:rgba(220,53,69,0.2);color:#dc3545">Dead</span>';
             } else {
                 staleHtml = '<span style="color:var(--success)">None</span>';
