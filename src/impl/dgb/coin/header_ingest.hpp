@@ -118,7 +118,7 @@ wire_header_ingest(::dgb::interfaces::Node& node, HeaderChain& chain)
                 // The cheap linkage first (sha256d, no scrypt): a known or an
                 // unconnected header is decided without building its sample.
                 auto packed = pack(h);
-                const uint256 id = Hash(packed.get_span());
+                uint256 id = Hash(packed.get_span());
                 const u256 block_hash = u256::from_le_bytes(reinterpret_cast<const unsigned char*>(id.begin()));
                 uint256 prev_id = h.m_previous_block;
                 const u256 prev = u256::from_le_bytes(reinterpret_cast<const unsigned char*>(prev_id.begin()));
