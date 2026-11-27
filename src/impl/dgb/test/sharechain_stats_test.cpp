@@ -6,8 +6,12 @@
 // so /global_stats current_height and the sync chain_size are not 0.
 // ---------------------------------------------------------------------------
 
+#include <impl/dgb/coin/header_chain.hpp>
+#include <impl/dgb/coin/mempool.hpp>
+#include <impl/dgb/config_coin.hpp>
 #include <impl/dgb/config_pool.hpp>
 #include <impl/dgb/share.hpp>
+#include <impl/dgb/stratum/work_source.hpp>
 #include <impl/dgb/share_tracker.hpp>
 #include <impl/dgb/sharechain_stats.hpp>
 
@@ -17,6 +21,7 @@
 #include <gtest/gtest.h>
 
 #include <fstream>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -123,5 +128,50 @@ TEST(DgbSharechainStats, MainDgbReadsUnderTheGuard)
     EXPECT_NE(body.find("auto guard = p2p_node.read_tracker();"), std::string::npos);
     EXPECT_NE(body.find("dgb::sharechain_stats_json(*guard, p2p_node.best_share_hash())"), std::string::npos);
     EXPECT_NE(body.find("p2p_node.get_tracker_snapshot()"), std::string::npos) << "no busy-path fallback";
+    EXPECT_EQ(body.find("p2p_node.tracker()"), std::string::npos) << "an unguarded tracker read";
+}
+
+// The dashboard's block value / network difficulty / height come from the
+// last template served; reading them builds nothing.
+TEST(DgbDashboardHooks, LastTemplateSummaryIsAPlainRead)
+{
+    c2pool::dgb::HeaderChain hc;
+    dgb::coin::Mempool mempool;
+    hc.set_base_height(20000000);
+    dgb::stratum::DGBWorkSource ws(hc, mempool, false, [](const std::vector<unsigned char>&, uint32_t) { return false; },
+                                   [](uint32_t h) -> uint64_t { return dgb::CoinParams::subsidy(h); });
+    int gbt_calls = 0;
+    ws.set_gbt_tip_fn([&gbt_calls]() -> std::optional<dgb::stratum::DGBWorkSource::GbtTip> {
+        ++gbt_calls;
+        return dgb::stratum::DGBWorkSource::GbtTip{std::string(64, '1'), "1a00ffff", 20000000};
+    });
+    EXPECT_FALSE(ws.last_template_summary().has_value());
+    EXPECT_EQ(gbt_calls, 0) << "the summary read reached digibyted";
+    const auto t = ws.get_current_work_template();
+    ASSERT_FALSE(t.empty());
+    const auto sum = ws.last_template_summary();
+    ASSERT_TRUE(sum.has_value());
+    EXPECT_EQ(sum->height, 20000000u);
+    EXPECT_EQ(sum->bits, 0x1a00ffffu);
+    EXPECT_EQ(sum->coinbase_value, t["coinbasevalue"].get<uint64_t>());
+    EXPECT_GT(sum->coinbase_value, 0u);
+}
+
+TEST(DgbDashboardHooks, MainDgbBindsBestShareCoinWorkAndAGuardedHashrate)
+{
+    std::ifstream f(DGB_MAIN_SRC);
+    ASSERT_TRUE(f.good()) << DGB_MAIN_SRC;
+    std::stringstream ss;
+    ss << f.rdbuf();
+    const std::string s = ss.str();
+    EXPECT_NE(s.find("mi->set_best_share_hash_fn([cell = stratum_best_share]() { return cell->get(); });"),
+              std::string::npos);
+    const auto cw = s.find("mi->set_coin_work_fn(");
+    ASSERT_NE(cw, std::string::npos);
+    EXPECT_NE(s.find("ws->last_template_summary()", cw), std::string::npos);
+    const auto hr = s.find("mi->set_pool_hashrate_fn(");
+    ASSERT_NE(hr, std::string::npos);
+    const std::string body = s.substr(hr, s.find("});", hr) - hr);
+    EXPECT_NE(body.find("auto guard = p2p_node.read_tracker();"), std::string::npos);
     EXPECT_EQ(body.find("p2p_node.tracker()"), std::string::npos) << "an unguarded tracker read";
 }

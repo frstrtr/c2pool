@@ -2630,18 +2630,44 @@ int run_node(const core::CoinParams& params, bool testnet,
         // (5) pool hashrate — attempts/s over the target-lookbehind window off
         //     the verified best share (SSOT: node.cpp L4 pool-hashrate line).
         //     Guards to 0 when the window cannot form (no best / height<=2).
+        //     Read under the tracker guard; while think() holds the tracker,
+        //     the last value (it was an unguarded read).
         mi->set_pool_hashrate_fn([&p2p_node, work_source]() -> double {
+            static std::atomic<double> s_last{0.0};
             auto best_fn = work_source->get_best_share_hash_fn();
             if (!best_fn) return 0.0;
             uint256 best = best_fn();
-            auto& tr = p2p_node.tracker();
-            if (best.IsNull() || !tr.chain.contains(best)) return 0.0;
-            int32_t height = static_cast<int32_t>(tr.chain.get_height(best));
-            if (height <= 2 || tr.m_params == nullptr) return 0.0;
-            int32_t dist = std::min<int32_t>(
-                height - 1, static_cast<int32_t>(tr.m_params->target_lookbehind));
-            auto aps = tr.get_pool_attempts_per_second(best, dist, /*use_min_work=*/false);
-            return static_cast<double>(aps.GetLow64());
+            auto guard = p2p_node.read_tracker();
+            if (!guard) return s_last.load();
+            auto& tr = *guard;
+            double rate = 0.0;
+            if (!best.IsNull() && tr.chain.contains(best) && tr.m_params != nullptr) {
+                const int32_t height = static_cast<int32_t>(tr.chain.get_height(best));
+                if (height > 2) {
+                    const int32_t dist = std::min<int32_t>(
+                        height - 1, static_cast<int32_t>(tr.m_params->target_lookbehind));
+                    rate = static_cast<double>(
+                        tr.get_pool_attempts_per_second(best, dist, /*use_min_work=*/false).GetLow64());
+                }
+            }
+            s_last.store(rate);
+            return rate;
+        });
+
+        // (5b) the best share (/web/best_share_hash, the sync status) from the
+        //      stratum best-share cell, and the block value / network
+        //      difficulty / height from the last template served (a plain
+        //      read: no template is built for the dashboard).
+        mi->set_best_share_hash_fn([cell = stratum_best_share]() { return cell->get(); });
+        mi->set_coin_work_fn([ws = work_source.get()]() -> core::MiningInterface::CoinWorkInfo {
+            core::MiningInterface::CoinWorkInfo info;
+            if (const auto t = ws->last_template_summary()) {
+                info.valid = true;
+                info.height = t->height;
+                info.coinbase_value_sat = t->coinbase_value;
+                info.network_difficulty = chain::target_to_difficulty(chain::bits_to_target(t->bits));
+            }
+            return info;
         });
 
         // (6) share-peers — the pool node sharechain P2P peer snapshot

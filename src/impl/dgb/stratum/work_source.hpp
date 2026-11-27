@@ -340,6 +340,16 @@ public:
     void set_work_hold(const std::string& reason);
     std::string work_hold() const;
 
+    /// The last template this source served (display only: the dashboard's
+    /// block value, network difficulty and height). A plain read: it never
+    /// builds a template or reaches digibyted.
+    struct TemplateSummary {
+        uint32_t height = 0;
+        uint32_t bits = 0;
+        uint64_t coinbase_value = 0;
+    };
+    std::optional<TemplateSummary> last_template_summary() const;
+
     /// Dispatch one share-difficulty submission to the bound mint callback.
     /// The stage-4d mining_submit classify branch calls this on the
     /// "pow_hash <= share target" outcome. Returns the minted share hash, or a
@@ -496,6 +506,8 @@ private:
     std::atomic<uint32_t>       tip_recent_sec_{0};
     mutable std::mutex          work_hold_mutex_;
     std::string                 work_hold_;      // under work_hold_mutex_
+    mutable std::mutex          summary_mutex_;
+    mutable std::optional<TemplateSummary> summary_;   // under summary_mutex_
     mutable std::atomic<int>    tip_state_{-1};   // last logged: 1 at tip, 0 behind
     mutable std::mutex          local_rate_mutex_;
     LocalRateFn                 local_rate_fn_;

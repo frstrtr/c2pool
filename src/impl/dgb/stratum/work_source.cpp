@@ -477,7 +477,27 @@ nlohmann::json DGBWorkSource::get_current_work_template() const
         in.coinbasevalue     = coinbase_value(tip->height, tx_sel.total_fees, std::nullopt);
     }
 
-    return dgb::coin::build_work_template(in);
+    nlohmann::json t = dgb::coin::build_work_template(in);
+    // The dashboard's summary of the template served (last_template_summary).
+    // Display only: never lets the work path fail.
+    try {
+        if (t.contains("bits") && t["bits"].is_string() && t.contains("height")) {
+            TemplateSummary sum;
+            sum.height = t["height"].get<uint32_t>();
+            sum.bits = static_cast<uint32_t>(std::stoul(t["bits"].get<std::string>(), nullptr, 16));
+            sum.coinbase_value = t.value("coinbasevalue", uint64_t(0));
+            std::lock_guard<std::mutex> lk(summary_mutex_);
+            summary_ = sum;
+        }
+    } catch (...) {
+    }
+    return t;
+}
+
+std::optional<DGBWorkSource::TemplateSummary> DGBWorkSource::last_template_summary() const
+{
+    std::lock_guard<std::mutex> lk(summary_mutex_);
+    return summary_;
 }
 
 std::vector<std::string> DGBWorkSource::get_stratum_merkle_branches() const
