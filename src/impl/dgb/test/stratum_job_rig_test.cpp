@@ -178,7 +178,7 @@ struct JobRig {
         ws->set_payout_acceptance(acc.p2pkh_versions, acc.p2sh_versions, acc.bech32_hrps);
         ws->set_gbt_tip_fn([this]() -> std::optional<dgb::stratum::DGBWorkSource::GbtTip> {
             std::lock_guard<std::mutex> l(mu);
-            return dgb::stratum::DGBWorkSource::GbtTip{tip_prev, "1b0404cb"};
+            return dgb::stratum::DGBWorkSource::GbtTip{tip_prev, "1b0404cb", 20000000};
         });
         // main_dgb's producer shape: decline a null or unknown prev share.
         ws->set_pplns_inputs_fn([this](const uint256& prev, const std::string&, const Bytes& payout,

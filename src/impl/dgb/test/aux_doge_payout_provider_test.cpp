@@ -191,7 +191,7 @@ struct WsFixture {
         auto ws = std::make_unique<dgb::stratum::DGBWorkSource>(chain, mempool, /*is_testnet=*/false, fn, kSubsidy);
         // A job needs a template (its block): the external-daemon tip fallback.
         ws->set_gbt_tip_fn([]() -> std::optional<dgb::stratum::DGBWorkSource::GbtTip> {
-            return dgb::stratum::DGBWorkSource::GbtTip{std::string(64, '1'), "1b0404cb"};
+            return dgb::stratum::DGBWorkSource::GbtTip{std::string(64, '1'), "1b0404cb", 20000000};
         });
         return ws;
     }

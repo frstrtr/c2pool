@@ -152,7 +152,7 @@ struct RtRig {
         hc.set_base_height(kRtBlockHeight);
         ws = std::make_unique<dgb::stratum::DGBWorkSource>(hc, mempool, false, submit, kRtSubsidy);
         ws->set_gbt_tip_fn([this]() -> std::optional<dgb::stratum::DGBWorkSource::GbtTip> {
-            return dgb::stratum::DGBWorkSource::GbtTip{std::string(56, '0') + "0badf00d", tip_bits};
+            return dgb::stratum::DGBWorkSource::GbtTip{std::string(56, '0') + "0badf00d", tip_bits, kRtBlockHeight};
         });
         ws->set_pplns_inputs_fn([this](const uint256& prev, const std::string&, const Bytes& payout,
                                        const std::vector<std::pair<uint32_t, Bytes>>& merged, const Bytes& aux, const dgb::stratum::DGBWorkSource::JobBlock& block)

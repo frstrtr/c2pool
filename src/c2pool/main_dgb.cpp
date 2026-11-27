@@ -1556,6 +1556,9 @@ int run_node(const core::CoinParams& params, bool testnet,
     // Network-derived; own-coin + a CONFIGURED merged chain (DOGE) stay accepted.
     {
         const auto acc = dgb::address_acceptance(testnet, regtest);
+        // Work only while the header chain is at its tip (median time at most
+        // an hour old; review 906a0e5e3 #4).
+        work_source->set_tip_recent_sec(3600);
         work_source->set_payout_acceptance(acc.p2pkh_versions, acc.p2sh_versions,
                                            acc.bech32_hrps);
         // DGB's versions on every network (main_ltc's merged_parent_versions):
@@ -1678,6 +1681,8 @@ int run_node(const core::CoinParams& params, bool testnet,
                     dgb::stratum::DGBWorkSource::GbtTip tip;
                     tip.previousblockhash = ph->get<std::string>();
                     tip.bits              = bt->get<std::string>();
+                    if (auto ht = tmpl.find("height"); ht != tmpl.end() && ht->is_number_unsigned())
+                        tip.height = ht->get<uint32_t>();
                     // GBT previousblockhash is 64-hex big-endian display -- the
                     // exact u256_be_display_hex convention the embedded path emits,
                     // so it flows verbatim (parity by the daemon's own GBT contract).

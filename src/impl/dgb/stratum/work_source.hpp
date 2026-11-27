@@ -324,9 +324,15 @@ public:
     struct GbtTip {
         std::string previousblockhash;  ///< GBT big-endian display hex (u256_be_display_hex convention)
         std::string bits;               ///< GBT nBits compact hex, daemon-authoritative
+        uint32_t    height = 0;         ///< GBT height (the next block's); 0 = unknown: no work
     };
     using GbtTipFn = std::function<std::optional<GbtTip>()>;
     void set_gbt_tip_fn(GbtTipFn fn);
+
+    /// Work is served only while the embedded header chain is at its tip: its
+    /// median time past at most `sec` old (0, the default: not checked). During
+    /// header sync the template would be for an old height and prevhash.
+    void set_tip_recent_sec(uint32_t sec) { tip_recent_sec_.store(sec); }
 
     /// Dispatch one share-difficulty submission to the bound mint callback.
     /// The stage-4d mining_submit classify branch calls this on the
@@ -481,6 +487,8 @@ private:
     // per-connection coinbase path returns an empty job (pre-wire behavior).
     mutable std::mutex          pplns_inputs_mutex_;
     PplnsInputsFn               pplns_inputs_fn_;
+    std::atomic<uint32_t>       tip_recent_sec_{0};
+    mutable std::atomic<int>    tip_state_{-1};   // last logged: 1 at tip, 0 behind
     mutable std::mutex          local_rate_mutex_;
     LocalRateFn                 local_rate_fn_;
     std::function<double()>     node_rate_fn_;   // under local_rate_mutex_

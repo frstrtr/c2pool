@@ -107,7 +107,7 @@ struct OracleRig {
         ws = std::make_unique<dgb::stratum::DGBWorkSource>(
             hc, mempool, false, submit, [](uint32_t h) -> uint64_t { return dgb::CoinParams::subsidy(h); });
         ws->set_gbt_tip_fn([]() -> std::optional<dgb::stratum::DGBWorkSource::GbtTip> {
-            return dgb::stratum::DGBWorkSource::GbtTip{std::string(56, '0') + "0badf00d", "1b0404cb"};
+            return dgb::stratum::DGBWorkSource::GbtTip{std::string(56, '0') + "0badf00d", "1b0404cb", kHeight};
         });
         // main_dgb's producer, held at V35 (DgbVersionPolicy without --v36-ratchet).
         ws->set_pplns_inputs_fn([this](const uint256& prev, const std::string&, const Bytes& payout,

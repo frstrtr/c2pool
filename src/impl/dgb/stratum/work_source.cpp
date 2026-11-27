@@ -424,13 +424,34 @@ nlohmann::json DGBWorkSource::get_current_work_template() const
         char bits_buf[9];
         std::snprintf(bits_buf, sizeof(bits_buf), "%08x", *nb);
         in.bits = std::string(bits_buf);
+        // Hold work until the header chain is at its tip (review 906a0e5e3
+        // #4): while it syncs, the template is for an old height and prevhash.
+        if (const uint32_t recent = tip_recent_sec_.load(); recent > 0) {
+            const int64_t age = static_cast<int64_t>(std::time(nullptr)) - chain_.median_time_past();
+            const int at_tip = age <= static_cast<int64_t>(recent) ? 1 : 0;
+            if (tip_state_.exchange(at_tip) != at_tip) {
+                if (at_tip)
+                    LOG_INFO << "[DGB-STRATUM] header chain at its tip (median time " << age
+                             << " s old): serving work";
+                else
+                    LOG_WARNING << "[DGB-STRATUM] header chain behind its tip (median time " << age
+                                << " s old > " << recent << " s): work held until it syncs";
+            }
+            if (!at_tip)
+                return nlohmann::json::object();
+        }
     } else if (auto tip = resolve_gbt_tip_fallback()) {
         // Embedded HeaderChain unfed -> external-daemon GBT fallback (persist per
-        // V36). Sources BOTH previousblockhash and the daemon-authoritative bits
-        // from ONE getblocktemplate snapshot (consistent height). Unbound / no
-        // creds / RPC failure -> both stay absent, byte-identical to before.
+        // V36). Sources previousblockhash, the daemon-authoritative bits AND the
+        // height from ONE getblocktemplate snapshot; the empty header chain has
+        // no height (next_block_height() would be its base, 0). No height: no
+        // work. Unbound / no creds / RPC failure -> all absent.
+        if (tip->height == 0)
+            return nlohmann::json::object();
         in.previousblockhash = tip->previousblockhash;
         in.bits              = tip->bits;
+        in.next_height       = tip->height;
+        in.coinbasevalue     = coinbase_value(tip->height, tx_sel.total_fees, std::nullopt);
     }
 
     return dgb::coin::build_work_template(in);

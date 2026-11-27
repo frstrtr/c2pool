@@ -68,7 +68,7 @@ TEST(DgbStartDifficulty, WorkSourceUsesTheNodeRateElseTheTemplate)
     core::stratum::PayoutKey key{};
     EXPECT_EQ(ws.start_difficulty(key), 0.0) << "no rate and no template: no seed";
     ws.set_gbt_tip_fn([]() -> std::optional<dgb::stratum::DGBWorkSource::GbtTip> {
-        return dgb::stratum::DGBWorkSource::GbtTip{std::string(64, '1'), "1a00ffff"};
+        return dgb::stratum::DGBWorkSource::GbtTip{std::string(64, '1'), "1a00ffff", 20000000};
     });
     const double from_template = ws.start_difficulty(key);
     EXPECT_TRUE(near(from_template, dgb::dgb_start_difficulty(0.0, 0x1a00ffff, dgb::CoinParams::subsidy(20000000),

@@ -837,6 +837,14 @@ TEST(DgbWorkSource, WorkTemplateServesRealV4BitsAndPrevhash)
     ASSERT_TRUE(tmpl.contains("previousblockhash"));
     EXPECT_EQ(tmpl["previousblockhash"].get<std::string>(), expected_prev);
     EXPECT_EQ(ws->get_current_gbt_prevhash(), expected_prev);
+
+    // Review 906a0e5e3 #4: with the tip-recency check main_dgb arms (an hour),
+    // a header chain whose median time is older (this 2026-09 fixture) serves
+    // no work; unchecked (0) it serves the template above.
+    ws->set_tip_recent_sec(3600);
+    EXPECT_FALSE(ws->get_current_work_template().contains("bits")) << "work served from a chain behind its tip";
+    ws->set_tip_recent_sec(0);
+    EXPECT_TRUE(ws->get_current_work_template().contains("bits"));
 }
 
 
@@ -889,7 +897,7 @@ TEST(DgbWorkSource, GbtTipFallbackPopulatesPrevhashAndBitsWhenChainEmpty)
     int calls = 0;
     ws->set_gbt_tip_fn([&]() -> std::optional<GbtTip> {
         ++calls;
-        return GbtTip{kPrev, kBits};
+        return GbtTip{kPrev, kBits, 123};
     });
 
     // mining.notify prevhash source (stratum_server get_current_gbt_prevhash).
@@ -903,8 +911,27 @@ TEST(DgbWorkSource, GbtTipFallbackPopulatesPrevhashAndBitsWhenChainEmpty)
     ASSERT_TRUE(tmpl.contains("bits"));
     EXPECT_EQ(tmpl["bits"].get<std::string>(), kBits);
 
+    // The height is the daemon's (the empty header chain has none; review
+    // 906a0e5e3 #4), and so is the subsidy the template claims.
+    ASSERT_TRUE(tmpl.contains("height"));
+    EXPECT_EQ(tmpl["height"].get<uint32_t>(), 123u);
+
     // TTL cache: the two accessors above must not each trigger a fresh RPC.
     EXPECT_LE(calls, 1);
+}
+
+// A daemon template without a height: no work (the empty header chain's
+// height is its base, 0: BIP34 0 and subsidy(0)).
+TEST(DgbWorkSource, GbtTipFallbackWithoutHeightServesNoWork)
+{
+    Fixture fx;
+    auto ws = fx.make();
+    ws->set_gbt_tip_fn([]() -> std::optional<GbtTip> {
+        return GbtTip{std::string(64, '1'), "1b0404cb", 0};
+    });
+    auto tmpl = ws->get_current_work_template();
+    EXPECT_FALSE(tmpl.contains("previousblockhash")) << tmpl.dump();
+    EXPECT_FALSE(tmpl.contains("height")) << tmpl.dump();
 }
 
 TEST(DgbWorkSource, GbtTipFallbackAbsentWhenSeamUnbound)
@@ -949,7 +976,7 @@ TEST(DgbWorkSource, ConnectionCoinbaseDelegatesToPplnsSsotByteIdentical)
     auto ws = fx.make();
     const auto inputs = sample_pplns_inputs();
     ws->set_gbt_tip_fn([]() -> std::optional<dgb::stratum::DGBWorkSource::GbtTip> {
-        return dgb::stratum::DGBWorkSource::GbtTip{std::string(64, '1'), "1b0404cb"};
+        return dgb::stratum::DGBWorkSource::GbtTip{std::string(64, '1'), "1b0404cb", 20000000};
     });
 
     // Bind a producer that hands back the fixed inputs regardless of args.
@@ -983,7 +1010,7 @@ TEST(DgbWorkSource, ConnectionCoinbaseFreezesProducerVersionOnSnapshot)
         Fixture fx;
         auto ws = fx.make();
         ws->set_gbt_tip_fn([]() -> std::optional<dgb::stratum::DGBWorkSource::GbtTip> {
-            return dgb::stratum::DGBWorkSource::GbtTip{std::string(64, '1'), "1b0404cb"};
+            return dgb::stratum::DGBWorkSource::GbtTip{std::string(64, '1'), "1b0404cb", 20000000};
         });
         auto inputs = sample_pplns_inputs();
         inputs.share_version   = ver;
