@@ -18,12 +18,15 @@
   such share, deterministically; no consensus change.
 - Attributable work is never halved (p2pool's case 4, extended): a login
   whose LTC address is invalid, empty, another coin's, or P2WSH/P2TR, and that
-  names a merged address (comma or slash form, or `mining.set_merged_addresses`
-  after its authorize, in either order) is paid on LTC to that address's key
-  (DOGE's, else the lowest configured chain's; P2PKH or P2SH as given), with
-  the node's donation, its merged addresses as given. Only an address the
-  login gave counts, never one left from another login on the connection.
+  names a merged address (comma or slash form, a re-authorize of the same LTC
+  address, `mining.set_merged_addresses` after the authorize or before the
+  first authorize of a new connection) of a configured chain on this network
+  in P2PKH or P2SH form is paid on LTC to that address's key (DOGE's, else the
+  lowest configured chain's), with the node's donation, its merged addresses
+  as given. An address set while another login was accepted never counts.
   Split applies only to a login naming no usable address.
+- Qt launcher: a saved pplns is no longer applied; re-select it if you want
+  it. A saved fee, boost or donate is kept; split is not passed on.
 - Without a usable node-owner address the owner half cannot be paid: the node
   keeps the old `pplns` behaviour (a hybrid spec: its other terms), said once
   at startup. `pplns`, `fee`, `boost` and `donate` are unchanged and still

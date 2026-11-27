@@ -948,17 +948,22 @@ built and committed in the job's coinbase, as in p2pool.
    share, so every node derives the same payout. Attributable work is never
    halved (p2pool's "case 4", extended): a login whose LTC address is invalid,
    empty or another coin's, or one a V36 share cannot carry (P2WSH/P2TR: a
-   20-byte payout hash), and that names a merged address (comma or slash form,
-   or `mining.set_merged_addresses` after its authorize, in either order) has
-   its LTC payout paid to that address's key, DOGE's if named, else the lowest
-   configured chain's, in its own form (P2PKH stays P2PKH, P2SH stays P2SH),
-   with the node's normal donation; the merged addresses are paid as given
-   ("address invalid → parent paid to the DOGE address's key", "P2WSH/P2TR
-   address → parent paid to the DOGE address's key"). Only a merged address
-   this login gave counts, never one left over from another login on the
-   connection. A login naming no usable address is redistributed as above,
-   with a warning in the log ("address invalid → redistributed", "P2WSH/P2TR
-   address → redistributed" in the workers list). A swapped
+   32-byte witness program, while a share carries a 20-byte payout hash), and
+   that names a merged address has its LTC payout paid to that address's key,
+   with the node's normal donation; the merged addresses are paid as given.
+   The address must be one the login named (comma or slash form, a
+   re-authorize of the same LTC address, `mining.set_merged_addresses` after
+   the authorize, or before the first authorize of a new connection), of a
+   configured merged chain on this network, in a legacy form: P2PKH (paid as
+   P2PKH) or P2SH (paid as P2SH); a bech32 merged address does not count.
+   DOGE's is used if named, else the lowest configured chain id's. The
+   workers list shows "address invalid → parent paid to the DOGE address's
+   key" or "P2WSH/P2TR address → parent paid to the DOGE address's key"
+   ("the chain_id=N address's key" for another chain). An address set while
+   another login was accepted on the connection never counts. A login naming
+   no usable address is redistributed as above, with a warning in the log
+   ("address invalid → redistributed", "P2WSH/P2TR address → redistributed"
+   in the workers list). A swapped
    pair whose first address is not valid (`DOGE-with-bad-checksum,LTCADDR`)
    pays the valid LTC address, as before.
 
