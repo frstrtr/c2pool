@@ -930,19 +930,15 @@ core::stratum::CoinbaseResult DGBWorkSource::build_coinbase(
         std::lock_guard<std::mutex> lk(fallback_payout_mutex_);
         owner_payout = !split_owner_script_.empty() && payout_script == split_owner_script_;
     }
-    if (mm_manager_ && !owner_payout && payout_script.size() == 23 && payout_script[0] == 0xa9
-        && payout_script[1] == 0x14 && payout_script[22] == 0x87 && mm_manager_->has_chain(kDogeChainId)) {
-        bool has_doge = false;
-        for (const auto& [cid, _] : eff_merged_addrs)
-            has_doge = has_doge || cid == kDogeChainId;
-        if (!has_doge) {
-            std::lock_guard<std::mutex> lk(p2sh_warned_mutex_);
-            if (p2sh_warned_.size() < 4096 && p2sh_warned_.insert(payout_script).second)
-                LOG_WARNING << "[DGB-MM] a P2SH login (" << HexStr(Span<const uint8_t>(payout_script.data(), payout_script.size()))
-                            << ") gives no DOGE address: its DOGE share is split between the node owner"
-                               " and the donation. Add ,DOGEADDR or /98:DOGEADDR to the login to receive DOGE.";
-        }
-    }
+    // A V35 share carries no merged address (review c6c1c0cff R4): a P2SH
+    // login's DOGE share is split so under V35 even when it names a DOGE
+    // address; told once the job's share version is known (below).
+    const bool p2sh_doge_rule = mm_manager_ && !owner_payout && payout_script.size() == 23
+                                && payout_script[0] == 0xa9 && payout_script[1] == 0x14 && payout_script[22] == 0x87
+                                && mm_manager_->has_chain(kDogeChainId);
+    bool names_doge = false;
+    for (const auto& [cid, _] : eff_merged_addrs)
+        names_doge = names_doge || cid == kDogeChainId;
 
     // The block this job is for, from ONE template: the producer builds the
     // coinbase for its height, bits and value, and the job carries that
@@ -995,6 +991,22 @@ core::stratum::CoinbaseResult DGBWorkSource::build_coinbase(
         if (now - last >= 60 && s_last_log.compare_exchange_strong(last, now))
             LOG_ERROR << "[DGB-STRATUM] job coinbase build failed (" << e.what() << "): no job";
         return held();
+    }
+
+    if (p2sh_doge_rule && (!names_doge || inputs->share_version < 36)) {
+        std::lock_guard<std::mutex> lk(p2sh_warned_mutex_);
+        if (p2sh_warned_.size() < 4096 && p2sh_warned_.insert(payout_script).second) {
+            const std::string hex = HexStr(Span<const uint8_t>(payout_script.data(), payout_script.size()));
+            if (!names_doge)
+                LOG_WARNING << "[DGB-MM] a P2SH login (" << hex
+                            << ") gives no DOGE address: its DOGE share is split between the node owner"
+                               " and the donation. Add ,DOGEADDR or /98:DOGEADDR to the login to receive DOGE.";
+            else
+                LOG_WARNING << "[DGB-MM] a P2SH login (" << hex
+                            << ") names a DOGE address, but V35 shares carry no DOGE address: its DOGE share"
+                               " is split between the node owner and the donation while shares are V35. A"
+                               " P2PKH login receives DOGE at the same key.";
+        }
     }
 
     core::stratum::CoinbaseResult out;
