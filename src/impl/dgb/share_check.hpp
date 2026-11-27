@@ -1597,6 +1597,67 @@ std::string verify_merged_coinbase_commitment(
 }
 
 // ============================================================================
+// check_v35_share_info()
+//
+// The python V35 network regenerates every share's share_info from the chain
+// and its own share_data, and rejects the share unless it is EQUAL
+// (p2pool-dgb-scrypt data.py check():520-553 -> generate_transaction):
+//   max_bits      = from the pool rate over TARGET_LOOKBEHIND, clamped to the
+//                   previous share's max target +-10% (no decay on V35);
+//   bits          = clip(the share's own target, (pre_target3//30,
+//                   pre_target3)): equal iff inside that range;
+//   timestamp     = max(its own, previous + 1);
+//   absheight     = previous + 1;
+//   abswork       = previous + target_to_average_attempts(bits);
+//   far_share_hash= None if the chain ends < 99 back, else the 99th parent.
+// This node verified only the generation transaction, so it accepted (and
+// built on) V35 shares python rejects. Python decides only once the chain
+// behind the share is rooted or at least REAL_CHAIN_LENGTH long
+// (get_height_and_last's assert); so does this check. Throws on a mismatch.
+// ============================================================================
+template <typename ShareT, typename TrackerT>
+void check_v35_share_info(const ShareT& share, TrackerT& tracker, const core::CoinParams& params)
+{
+    if (share.m_prev_hash.IsNull() || !tracker.chain.contains(share.m_prev_hash))
+        return;
+    auto [prev_height, last] = tracker.chain.get_height_and_last(share.m_prev_hash);
+    if (!(prev_height >= static_cast<int32_t>(params.real_chain_length) || last.IsNull()))
+        return;   // python has not decided either
+
+    uint32_t prev_ts = 0, prev_absheight = 0;
+    uint128 prev_abswork;
+    tracker.chain.get(share.m_prev_hash).share.invoke([&](auto* prev) {
+        prev_ts = prev->m_timestamp;
+        prev_absheight = prev->m_absheight;
+        prev_abswork = prev->m_abswork;
+    });
+
+    if (share.m_timestamp < prev_ts + 1)
+        throw std::invalid_argument("share_info invalid: timestamp not after the previous share's");
+    if (share.m_absheight != prev_absheight + 1)
+        throw std::invalid_argument("share_info invalid: absheight");
+    {
+        const auto att = chain::target_to_average_attempts(chain::bits_to_target(share.m_bits));
+        if (share.m_abswork != prev_abswork + uint128(att.GetLow64()))
+            throw std::invalid_argument("share_info invalid: abswork");
+    }
+    {
+        uint256 far;
+        if (!(last.IsNull() && prev_height < 99))
+            far = tracker.chain.get_nth_parent_key(share.m_prev_hash, 99);
+        if (share.m_far_share_hash != far)
+            throw std::invalid_argument("share_info invalid: far_share_hash");
+    }
+    const auto st = tracker.compute_share_target(share.m_prev_hash, share.m_timestamp,
+                                                 chain::bits_to_target(share.m_bits),
+                                                 static_cast<int64_t>(ShareT::version));
+    if (st.max_bits != share.m_max_bits)
+        throw std::invalid_argument("share_info invalid: max_bits");
+    if (st.bits != share.m_bits)
+        throw std::invalid_argument("share_info invalid: bits");
+}
+
+// ============================================================================
 // share_check()
 //
 // The check()-phase verification after init:
@@ -1704,6 +1765,9 @@ bool share_check(const ShareT& share,
     // the AutoRatchet transitions to ACTIVATED.
     constexpr int64_t share_ver = ShareT::version;
     bool v36_active = (core::version_gate::is_v36_active(share_ver));
+    // V34/V35: share_info must be exactly what the python network regenerates.
+    if constexpr (share_ver >= 34 && !core::version_gate::is_v36_active(share_ver))
+        check_v35_share_info(share, tracker, params);
     if (!share.m_prev_hash.IsNull() && tracker.chain.contains(share.m_prev_hash))
     {
         uint256 expected_gentx = generate_share_transaction(share, tracker, params, false, v36_active);
