@@ -71,23 +71,32 @@ TEST(DgbReviewMutantPins, FinderIsTheDonationAddress)
 }
 
 // Only the exact none-value {[], root 2**256-1} is python's None; a non-empty
-// branch with that root is a present segwit_data python accepts.
+// branch with that root is a present segwit_data python accepts. The share
+// carries an undecodable address, so share_init_verify stops at the address
+// check right after the segwit_data one (a bare share must not run further).
 TEST(DgbReviewMutantPins, SegwitDataWithABranchIsNotTheNoneValue)
 {
     const auto params = dgb::make_coin_params(/*testnet=*/false);
-    dgb::PaddingBugfixShare share;
-    share.m_coinbase.m_data = {0x03, 0x01, 0x02, 0x03};
-    const std::string a = "DB69qk9X8T9A3vZ8odhDxAFedZB9qoKaLG";
-    share.m_address.m_data.assign(a.begin(), a.end());
-    dgb::SegwitData sd = dgb::SegwitDataDefaultV35::get();
-    sd.m_txid_merkle_link.m_branch.push_back(uint256(std::vector<unsigned char>(32, 0x11)));
-    share.m_segwit_data = sd;
-    try {
-        dgb::share_init_verify(share, params, /*check_pow=*/false);
-    } catch (const std::exception& e) {
-        // Later checks may refuse this bare share; never as missing segwit_data.
-        EXPECT_EQ(std::string(e.what()).find("without segwit_data"), std::string::npos) << e.what();
-    }
+    auto refusal = [&](bool with_branch) -> std::string {
+        dgb::PaddingBugfixShare share;
+        share.m_coinbase.m_data = {0x03, 0x01, 0x02, 0x03};
+        const std::string a = "not-an-address";
+        share.m_address.m_data.assign(a.begin(), a.end());
+        dgb::SegwitData sd = dgb::SegwitDataDefaultV35::get();
+        if (with_branch)
+            sd.m_txid_merkle_link.m_branch.push_back(uint256(std::vector<unsigned char>(32, 0x11)));
+        share.m_segwit_data = sd;
+        try {
+            dgb::share_init_verify(share, params, /*check_pow=*/false);
+        } catch (const std::exception& e) {
+            return e.what();
+        }
+        return {};
+    };
+    EXPECT_NE(refusal(false).find("without segwit_data"), std::string::npos) << refusal(false);
+    const std::string with_branch = refusal(true);
+    EXPECT_EQ(with_branch.find("without segwit_data"), std::string::npos) << with_branch;
+    EXPECT_FALSE(with_branch.empty()) << "the undecodable address passed";
 }
 
 // Source pins: the share_info height is the accumulated one (attempt_verify's

@@ -36,6 +36,7 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <thread>
 #include <vector>
@@ -238,6 +239,11 @@ TEST(DgbStratumBestShare, AThrowingCoinbaseBuildIsHeld)
 {
     Ws w;
     auto ws = w.make();
+    // A template, so the build reaches the producer (the GBT fallback).
+    w.chain.set_base_height(20000000);
+    ws->set_gbt_tip_fn([]() -> std::optional<dgb::stratum::DGBWorkSource::GbtTip> {
+        return dgb::stratum::DGBWorkSource::GbtTip{std::string(64, '1'), "1a00ffff", 20000000};
+    });
     int calls = 0;
     ws->set_pplns_inputs_fn([&calls](const uint256&, const std::string&, const Bytes&,
                                      const std::vector<std::pair<uint32_t, Bytes>>&, const Bytes&,
