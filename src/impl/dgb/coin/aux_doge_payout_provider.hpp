@@ -46,6 +46,7 @@
 #include <exception>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <functional>
 #include <string>
 #include <utility>
@@ -313,8 +314,29 @@ c2pool::merged::MergedMiningManager::PayoutProvider make_doge_payout_provider(
         }
         std::string miss;
         auto result = doge_merged_payouts(*guard, best, chain_id, coinbase_value, miss, p2sh_split.get());
-        if (result.empty())
+        if (result.empty()) {
             MergedMiningManager::note_payout_miss(miss.empty() ? "empty" : miss);
+            return result;
+        }
+        // One line per new split (best share, DOGE value): what the DOGE
+        // coinbase pays, for the operator (and the canary) to compare with the
+        // share chain's PPLNS ([DOGE-PPLNS] weight lines).
+        uint64_t sum = 0, largest = 0;
+        for (const auto& [_, v] : result) {
+            sum += v;
+            largest = std::max(largest, v);
+        }
+        static std::mutex log_mu;
+        static uint256 last_best;
+        static uint64_t last_value = 0;
+        std::lock_guard<std::mutex> lk(log_mu);
+        if (best != last_best || coinbase_value != last_value) {
+            last_best = best;
+            last_value = coinbase_value;
+            LOG_INFO << "[DGB-MM] DOGE payouts chain_id=" << chain_id << " best=" << best.GetHex().substr(0, 16)
+                     << " value=" << coinbase_value << " outputs=" << result.size() << " sum=" << sum
+                     << " largest=" << largest << (sum == coinbase_value ? "" : " SUM-MISMATCH");
+        }
         return result;
     };
 }
