@@ -208,6 +208,10 @@ struct OracleRig {
     {
         now = tip_ts() + gap_before(i);
         tip_bits = block_bits_of(i);
+        // A new template: rebinding the tip seam drops the work source's TTL cache.
+        ws->set_gbt_tip_fn([this]() -> std::optional<dgb::stratum::DGBWorkSource::GbtTip> {
+            return dgb::stratum::DGBWorkSource::GbtTip{std::string(56, '0') + "0badf00d", tip_bits, kHeight};
+        });
         auto cbr = ws->build_connection_coinbase(order.back(), "cafef00d", payout_of(i), {});
         if (cbr.held || cbr.coinb1.empty())
             return false;
