@@ -136,7 +136,7 @@ struct OracleRig {
         });
     }
 
-    uint32_t tip_ts() const
+    uint32_t tip_ts()
     {
         uint32_t ts = 0;
         tracker.chain.get(order.back()).share.invoke([&](auto* s) { ts = s->m_timestamp; });
