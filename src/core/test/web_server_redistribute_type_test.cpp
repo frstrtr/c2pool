@@ -378,3 +378,29 @@ TEST(RedistributeSplit, TheDogeKeyPayoutOfAnUncarriedLoginIsNotSplit)
         EXPECT_EQ(payout, p2pkh(0x0a));
     }
 }
+
+// The worker's payout label follows a payout changed after its authorize
+// (case 4 from a later mining.set_merged_addresses): an existing session's
+// label is updated, its other fields kept; a session that is not registered
+// is not created.
+TEST(RedistributeSplit, TheWorkerPayoutLabelIsUpdatedInPlace)
+{
+    MiningInterface mi{true};
+    MiningInterface::WorkerInfo wi;
+    wi.username = "garbage";
+    wi.worker_name = "rig";
+    wi.payout_warning = "address invalid → redistributed";
+    wi.difficulty = 42.0;
+    mi.register_stratum_worker("s1", wi);
+    mi.update_stratum_worker_payout_warning("s1", "address invalid → parent paid to the DOGE address's key");
+    auto workers = mi.get_stratum_workers();
+    ASSERT_EQ(workers.count("s1"), 1u);
+    EXPECT_EQ(workers.at("s1").payout_warning, "address invalid → parent paid to the DOGE address's key");
+    EXPECT_EQ(workers.at("s1").username, "garbage");
+    EXPECT_EQ(workers.at("s1").worker_name, "rig");
+    EXPECT_DOUBLE_EQ(workers.at("s1").difficulty, 42.0);
+    mi.update_stratum_worker_payout_warning("s2", "x");
+    workers = mi.get_stratum_workers();
+    EXPECT_EQ(workers.count("s2"), 0u) << "a missing session is not created";
+    EXPECT_EQ(workers.size(), 1u);
+}

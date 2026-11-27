@@ -1263,11 +1263,6 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
         // another primary nothing of the previous login is carried over (its
         // auto-derived entries were that primary's hash160).
         merged_addresses_ = set_merged_addresses_;
-        // The set_merged_addresses a login counts as its own (case 4): those
-        // received after the latest authorize; on a connection that never
-        // authorized, also those sent before its first authorize.
-        if (ever_authorized_)
-            post_auth_merged_.clear();
         std::string merged_addr_raw;
         std::set<uint32_t> named_now;   // the slash form's chains
         parse_address_separators(username_, merged_addr_raw, &named_now);
@@ -1390,11 +1385,19 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
         }
 
         LOG_INFO << "[Stratum] Mining authorization successful for: " << username_;
+        // The set_merged_addresses sent before the first authorize of this
+        // connection are this login's own, for the chains it names no
+        // address for itself (its own address wins): committed with the
+        // login's (login_given_), so a re-authorize of the same primary
+        // keeps them, another login never does.
+        for (const auto& [id, addr] : pre_auth_merged_)
+            if (!given_now.count(id) && merged_addresses_.count(id) && merged_addresses_.at(id) == addr)
+                given_now[id] = addr;
+        pre_auth_merged_.clear();
         login_primary_ = username_;
         login_given_ = std::move(given_now);
         ever_authorized_ = true;
-        // Case 4 from the addresses this login gave itself (login_given_,
-        // post_auth_merged_).
+        // Case 4 from the addresses this login gave itself (login_given_).
         update_case4_parent(/*at_authorize=*/true);
 
         // ─── Login difficulty ───
@@ -1738,11 +1741,10 @@ std::vector<unsigned char> StratumSession::merged_script_for(uint32_t chain_id, 
 
 // p2pool's case 4 (extended): a login whose own address pays no share
 // (payout_unusable_) takes its parent payout from a merged address it named
-// itself -- the login's own (login_given_: comma or slash form, a swapped
-// pair, a re-authorize of the same primary, mining.set_merged_addresses
-// while it is accepted) or one set with mining.set_merged_addresses after
-// this authorize or before the first authorize of a fresh connection
-// (post_auth_merged_), never one carried over from another login -- of a
+// itself (login_given_: comma or slash form, a swapped pair, a re-authorize
+// of the same primary, mining.set_merged_addresses while it is accepted or
+// before the first authorize of a fresh connection), never one carried over
+// from another login -- of a
 // configured chain on this network, in its legacy form (P2PKH or P2SH:
 // core::merged_addr::case4_parent), with the node's donation. None: the
 // work source redistributes it. The worker label names the chain ("DOGE",
@@ -1754,11 +1756,8 @@ bool StratumSession::update_case4_parent(bool at_authorize)
     parent_script_.clear();
     if (!payout_unusable_)
         return parent_script_ != before;
-    std::map<uint32_t, std::string> named = login_given_;
-    for (const auto& [id, addr] : post_auth_merged_)
-        named[id] = addr;
     const auto c4 = core::merged_addr::case4_parent(
-        named, merged_table(), [this](uint32_t id) { return mining_interface_ && mining_interface_->has_merged_chain(id); });
+        login_given_, merged_table(), [this](uint32_t id) { return mining_interface_ && mining_interface_->has_merged_chain(id); });
     parent_script_ = c4.script;
     const bool changed = parent_script_ != before;
     const auto& acfg = mining_interface_->get_stratum_config();
@@ -1830,15 +1829,16 @@ nlohmann::json StratumSession::handle_set_merged_addresses(const nlohmann::json&
                 set_merged_addresses_[chain_id] = addr;
                 // Set by the accepted login: its own address for the chain,
                 // kept by a re-authorize of the same primary (login_given_),
-                // never by another login.
-                if (authorized_)
+                // never by another login. Before the first authorize of the
+                // connection: the next login's own (pre_auth_merged_, folded
+                // into its login_given_ when it is accepted).
+                if (authorized_) {
                     login_given_[chain_id] = addr;
-                else
+                } else {
                     login_given_.erase(chain_id);   // superseded by the address set now
-                // This login's own for case 4: after its authorize, or before
-                // the first authorize of a fresh connection.
-                if (authorized_ || !ever_authorized_)
-                    post_auth_merged_[chain_id] = addr;
+                    if (!ever_authorized_)
+                        pre_auth_merged_[chain_id] = addr;
+                }
             } catch (...) {
                 // skip malformed
             }

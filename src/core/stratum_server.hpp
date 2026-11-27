@@ -276,10 +276,10 @@ private:
     bool payout_unusable_{false};
     bool payout_uncarried_{false};
     std::vector<unsigned char> parent_script_;
-    // mining.set_merged_addresses received after the latest authorize, or
-    // before the first authorize of a connection that never authorized:
-    // with login_given_, the addresses this login named itself (case 4).
-    std::map<uint32_t, std::string> post_auth_merged_;
+    // mining.set_merged_addresses received before the first authorize of a
+    // connection: the first accepted login's own, for the chains it names no
+    // address for (folded into its login_given_, then cleared).
+    std::map<uint32_t, std::string> pre_auth_merged_;
     bool ever_authorized_{false};   // a login was accepted on this connection
     // Returns whether the payout changed (see stratum_server.cpp).
     bool update_case4_parent(bool at_authorize);

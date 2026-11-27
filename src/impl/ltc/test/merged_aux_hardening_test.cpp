@@ -41,6 +41,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 #include <boost/asio.hpp>
@@ -2226,6 +2227,11 @@ struct RecordingWorkSource : core::stratum::IWorkSource {
     core::stratum::StratumConfig cfg;
     std::set<uint32_t> chains;
     std::atomic<bool> ready{true};
+    std::atomic<bool> refuse{false};   // authorize_refusal: refuse every login
+    std::string authorize_refusal(const std::string&) const override
+    {
+        return refuse.load() ? std::string("refused by the test") : std::string();
+    }
     mutable std::mutex mu;
     mutable std::vector<std::map<uint32_t, std::vector<unsigned char>>> builds;
     mutable std::vector<std::vector<unsigned char>> payouts;
@@ -3385,6 +3391,147 @@ TEST(MergedAuxStratumSession, Case4FollowsTheLoginsOwnSetMergedAddresses)
         rig->step(c, 6, "mining.set_merged_addresses", {{{"98", d2}}});
         EXPECT_GT(rig->ws->count(), n);
         EXPECT_EQ(last_payout(*rig), core::address_to_script(d2));
+    }
+}
+
+// A mining.set_merged_addresses before the first authorize is the first
+// login's own (for the chains it names no address for itself) and stays its
+// own through a re-authorize of the same primary: (1c) set{98:X}, auth G,
+// re-auth G (also as another worker): the parent is X's key each time, DOGE
+// pays X; (1d) set{98:X}, auth "G,D1": the login's own D1 wins, parent D1's
+// key and DOGE D1.
+TEST(MergedAuxStratumSession, APreAuthorizeSetStaysTheSamePrimarysOwn)
+{
+    const auto owner = core::address_to_script(b58(48, 0x0a));
+    const std::string garbage = b58(48, 0x06).substr(1);
+    const std::string x = b58(30, 0x21), d1 = b58(30, 0x22);
+    const auto last = [](SessionRig& rig) {
+        std::lock_guard<std::mutex> l(rig.ws->mu);
+        return std::make_tuple(rig.ws->payouts.back(), rig.ws->build_donations.back(), rig.ws->builds.back());
+    };
+    {
+        SessionRig rig({98}, /*redistribute=*/true);
+        rig.ws->split_owner = owner;
+        LineClient c(rig.port);
+        ASSERT_GE(c.fd, 0);
+        rig.step(c, 1, "mining.subscribe", nlohmann::json::array());
+        c.send({{"id", 2}, {"method", "mining.set_merged_addresses"}, {"params", {{{"98", x}}}}});
+        c.wait_id(2);
+        int id = 3;
+        for (const std::string& user : {garbage, garbage, garbage + ".w2"}) {
+            ASSERT_TRUE(rig.step(c, id++, "mining.authorize", {user, "x"})) << user;
+            const auto [payout, donation, merged] = last(rig);
+            EXPECT_EQ(payout, core::address_to_script(x)) << user << ": the parent on X's key";
+            EXPECT_FALSE(donation.has_value()) << user;
+            ASSERT_TRUE(merged.count(98));
+            EXPECT_EQ(merged.at(98), core::address_to_script(x)) << user;
+        }
+    }
+    {
+        SessionRig rig({98}, /*redistribute=*/true);
+        rig.ws->split_owner = owner;
+        LineClient c(rig.port);
+        ASSERT_GE(c.fd, 0);
+        rig.step(c, 1, "mining.subscribe", nlohmann::json::array());
+        c.send({{"id", 2}, {"method", "mining.set_merged_addresses"}, {"params", {{{"98", x}}}}});
+        c.wait_id(2);
+        ASSERT_TRUE(rig.step(c, 3, "mining.authorize", {garbage + "," + d1, "x"}));
+        const auto [payout, donation, merged] = last(rig);
+        EXPECT_EQ(payout, core::address_to_script(d1)) << "the login's own address wins";
+        EXPECT_FALSE(donation.has_value());
+        EXPECT_EQ(merged.at(98), core::address_to_script(d1)) << "and DOGE pays it, consistently";
+    }
+}
+
+// A refused authorize (merged chains not ready; the work source's
+// authorize_refusal) accepts no login: the connection has still never
+// authorized (a later set_merged_addresses is the next login's own) and the
+// refused login's addresses are not committed (a later login of the same
+// primary does not carry them). A set_merged_addresses while no login is
+// accepted supersedes the previous login's address for the chain.
+TEST(MergedAuxStratumSession, ARefusedAuthorizeAcceptsAndCommitsNothing)
+{
+    const auto owner = core::address_to_script(b58(48, 0x0a));
+    const std::string garbage = b58(48, 0x06).substr(1);
+    const std::string x = b58(30, 0x21), d1 = b58(30, 0x22), d2 = b58(30, 0x23);
+    const auto last_payout = [](SessionRig& rig) {
+        std::lock_guard<std::mutex> l(rig.ws->mu);
+        return rig.ws->payouts.back();
+    };
+    // merged chains not ready: refused; a set after it is still pre-authorize
+    {
+        SessionRig rig({98}, /*redistribute=*/true);
+        rig.ws->split_owner = owner;
+        LineClient c(rig.port);
+        ASSERT_GE(c.fd, 0);
+        rig.step(c, 1, "mining.subscribe", nlohmann::json::array());
+        rig.ws->ready = false;
+        c.send({{"id", 2}, {"method", "mining.authorize"}, {"params", {garbage, "x"}}});
+        const auto r = c.wait_id(2);
+        ASSERT_TRUE(r.has_value());
+        EXPECT_FALSE((*r)["result"].get<bool>());
+        c.send({{"id", 3}, {"method", "mining.set_merged_addresses"}, {"params", {{{"98", x}}}}});
+        c.wait_id(3);
+        rig.ws->ready = true;
+        ASSERT_TRUE(rig.step(c, 4, "mining.authorize", {garbage, "x"}));
+        EXPECT_EQ(last_payout(rig), core::address_to_script(x))
+            << "the refused authorize did not make the connection an authorized one";
+    }
+    // authorize_refusal on a fresh connection: still never authorized
+    {
+        SessionRig rig({98}, /*redistribute=*/true);
+        rig.ws->split_owner = owner;
+        LineClient c(rig.port);
+        ASSERT_GE(c.fd, 0);
+        rig.step(c, 1, "mining.subscribe", nlohmann::json::array());
+        rig.ws->refuse = true;
+        c.send({{"id", 2}, {"method", "mining.authorize"}, {"params", {garbage, "x"}}});
+        const auto r = c.wait_id(2);
+        ASSERT_TRUE(r.has_value());
+        EXPECT_FALSE((*r)["result"].get<bool>());
+        c.send({{"id", 3}, {"method", "mining.set_merged_addresses"}, {"params", {{{"98", x}}}}});
+        c.wait_id(3);
+        rig.ws->refuse = false;
+        ASSERT_TRUE(rig.step(c, 4, "mining.authorize", {garbage, "x"}));
+        EXPECT_EQ(last_payout(rig), core::address_to_script(x))
+            << "a login refused by the work source did not make the connection an authorized one";
+    }
+    // authorize_refusal: the refused login's address is not committed
+    {
+        SessionRig rig({98}, /*redistribute=*/true);
+        rig.ws->split_owner = owner;
+        LineClient c(rig.port);
+        ASSERT_GE(c.fd, 0);
+        rig.step(c, 1, "mining.subscribe", nlohmann::json::array());
+        ASSERT_TRUE(rig.step(c, 2, "mining.authorize", {garbage, "x"}));
+        rig.ws->refuse = true;
+        c.send({{"id", 3}, {"method", "mining.authorize"}, {"params", {garbage + "," + d1, "x"}}});
+        const auto r = c.wait_id(3);
+        ASSERT_TRUE(r.has_value());
+        EXPECT_FALSE((*r)["result"].get<bool>());
+        rig.ws->refuse = false;
+        ASSERT_TRUE(rig.step(c, 4, "mining.authorize", {garbage, "x"}));
+        EXPECT_EQ(last_payout(rig), owner) << "the refused login's D1 was not committed: the split";
+    }
+    // a set while no login is accepted supersedes the previous login's address
+    {
+        SessionRig rig({98}, /*redistribute=*/true);
+        rig.ws->split_owner = owner;
+        LineClient c(rig.port);
+        ASSERT_GE(c.fd, 0);
+        rig.step(c, 1, "mining.subscribe", nlohmann::json::array());
+        ASSERT_TRUE(rig.step(c, 2, "mining.authorize", {garbage + "," + d1, "x"}));
+        EXPECT_EQ(last_payout(rig), core::address_to_script(d1));
+        rig.ws->ready = false;
+        c.send({{"id", 3}, {"method", "mining.authorize"}, {"params", {garbage, "x"}}});
+        c.wait_id(3);
+        c.send({{"id", 4}, {"method", "mining.set_merged_addresses"}, {"params", {{{"98", d2}}}}});
+        c.wait_id(4);
+        rig.ws->ready = true;
+        ASSERT_TRUE(rig.step(c, 5, "mining.authorize", {garbage, "x"}));
+        std::lock_guard<std::mutex> l(rig.ws->mu);
+        EXPECT_EQ(rig.ws->builds.back().at(98), core::address_to_script(d2)) << "the address set now pays DOGE";
+        EXPECT_NE(rig.ws->payouts.back(), core::address_to_script(d1)) << "the superseded D1 is not the parent key";
     }
 }
 
