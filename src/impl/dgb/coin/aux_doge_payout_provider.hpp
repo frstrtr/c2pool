@@ -76,14 +76,15 @@ inline std::vector<unsigned char> doge_fallback_payout_script()
 }
 
 /// The DOGE address of doge_fallback_payout_script() on the node's network
-/// (DOGE P2PKH 30 "D..." mainnet, 113 "n..." testnet, from
-/// aux_chain_params_table). "" only if c2pool had no DOGE address parameters.
-inline std::string doge_fallback_payout_address(bool testnet)
+/// (DOGE P2PKH 30 "D..." mainnet, 113 "n..." testnet, 111 "m..." regtest,
+/// from aux_chain_params_table). "" only if c2pool had no DOGE address
+/// parameters.
+inline std::string doge_fallback_payout_address(bool testnet, bool regtest = false)
 {
     const auto* p = c2pool::merged::find_aux_chain_params("DOGE");
     if (!p)
         return {};
-    const auto& v = testnet ? p->test : p->main;
+    const auto& v = regtest ? p->regtest : testnet ? p->test : p->main;
     if (v.p2pkh.empty() || v.p2sh.empty())
         return {};
     return core::script_to_address(doge_fallback_payout_script(), std::string(),
@@ -270,9 +271,18 @@ inline std::vector<unsigned char> doge_owner_script(const std::string& owner_dgb
 }
 
 /// The provider main_dgb registers with the merged-mining manager. NodeT is
-/// dgb::NodeImpl (best_share_hash(), read_tracker()); the tracker lock is
-/// only tried, never waited for: a busy tracker is a "tracker_busy" miss
-/// and the manager keeps the last block built on the same parent.
+/// dgb::NodeImpl (read_tracker()); the tracker lock is only tried, never
+/// waited for. The tracker guard is taken FIRST and the best share is read
+/// while it is held, from `best_fn` (main_dgb: the stratum best-share cell,
+/// refreshed on the IO thread under the guard; best_share_cell.hpp), else
+/// from node->best_share_hash(). NodeImpl::best_share_hash reads the tracker
+/// and the peer set unlocked, so it must not be called off the IO thread
+/// without the guard; this runs on the merged-mining RPC thread and the
+/// stratum IO thread.
+/// A busy tracker is a "tracker_busy" miss: the manager keeps the last block
+/// built on the same parent, and `on_busy` (main_dgb: mark the payouts dirty
+/// again) makes the next poll retry instead of keeping the old split until
+/// the next best-share change or DOGE tip.
 ///
 /// No payout basis is noted (as on the BTC parent lane): a DGB share carries
 /// no merged_coinbase_info, so no peer re-derives the DOGE payouts from its
@@ -280,22 +290,25 @@ inline std::vector<unsigned char> doge_owner_script(const std::string& owner_dgb
 /// share move drop the DOGE commitment instead of keeping the last block.
 template <typename NodeT>
 c2pool::merged::MergedMiningManager::PayoutProvider make_doge_payout_provider(
-    NodeT* node, std::shared_ptr<const DogeP2shSplit> p2sh_split = std::make_shared<const DogeP2shSplit>())
+    NodeT* node, std::shared_ptr<const DogeP2shSplit> p2sh_split = std::make_shared<const DogeP2shSplit>(),
+    std::function<uint256()> best_fn = {}, std::function<void()> on_busy = {})
 {
-    return [node, p2sh_split](uint32_t chain_id, uint64_t coinbase_value) -> DogePayouts {
+    return [node, p2sh_split, best_fn, on_busy](uint32_t chain_id, uint64_t coinbase_value) -> DogePayouts {
         using c2pool::merged::MergedMiningManager;
         if (!node) {
             MergedMiningManager::note_payout_miss("no_node");
             return {};
         }
-        const uint256 best = node->best_share_hash();
-        if (best.IsNull()) {
-            MergedMiningManager::note_payout_miss("no_best_share");
-            return {};
-        }
         auto guard = node->read_tracker();
         if (!guard) {
             MergedMiningManager::note_payout_miss("tracker_busy");
+            if (on_busy)
+                on_busy();
+            return {};
+        }
+        const uint256 best = best_fn ? best_fn() : node->best_share_hash();
+        if (best.IsNull()) {
+            MergedMiningManager::note_payout_miss("no_best_share");
             return {};
         }
         std::string miss;
@@ -320,7 +333,8 @@ c2pool::merged::MergedMiningManager::PayoutProvider make_doge_payout_provider(
 /// here: on_best_share_changed is a single slot.
 template <typename NodeT, typename WorkSourceT>
 bool wire_doge_merged_payouts(c2pool::merged::MergedMiningManager* mm, NodeT& node, WorkSourceT* ws,
-                              std::shared_ptr<const DogeP2shSplit> p2sh_split = nullptr)
+                              std::shared_ptr<const DogeP2shSplit> p2sh_split = nullptr,
+                              std::function<uint256()> best_fn = {})
 {
     if (!mm)
         return false;
@@ -331,7 +345,8 @@ bool wire_doge_merged_payouts(c2pool::merged::MergedMiningManager* mm, NodeT& no
             ws->bump_work_generation();
     });
     mm->set_payout_provider(make_doge_payout_provider(
-        &node, p2sh_split ? std::move(p2sh_split) : std::make_shared<const DogeP2shSplit>()));
+        &node, p2sh_split ? std::move(p2sh_split) : std::make_shared<const DogeP2shSplit>(),
+        std::move(best_fn), [mm]() { mm->mark_pplns_dirty(); }));
     mm->mark_pplns_dirty();
     return true;
 }

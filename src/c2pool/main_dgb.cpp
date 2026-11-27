@@ -563,12 +563,17 @@ int run_node(const core::CoinParams& params, bool testnet,
             // this network (aux_doge_payout_provider.hpp), never a placeholder.
             // Plus DOGE's own version bytes for the merged payout views.
             if (cfg.symbol == "DOGE") {
-                cfg.aux_payout_address = dgb::coin::doge_fallback_payout_address(testnet);
+                cfg.aux_payout_address = dgb::coin::doge_fallback_payout_address(testnet, regtest);
                 if (const auto* cp = c2pool::merged::find_aux_chain_params(cfg.symbol)) {
-                    const auto& v = testnet ? cp->test : cp->main;
+                    const auto& v = regtest ? cp->regtest : testnet ? cp->test : cp->main;
                     if (!v.p2pkh.empty()) cfg.address_version = v.p2pkh.front();
                     if (!v.p2sh.empty())  cfg.p2sh_version    = v.p2sh.front();
                 }
+                // An RPC daemon of another network refuses the address (-8/-5):
+                // check it against the daemon's chain, as main_ltc does.
+                cfg.check_payout_address = [sym = cfg.symbol, addr = cfg.aux_payout_address](const std::string& chain) {
+                    return c2pool::merged::check_aux_address_on_chain(sym, chain, addr);
+                };
                 std::cout << "[DGB-MM] DOGE fallback payout address "
                           << cfg.aux_payout_address << std::endl;
             }
@@ -1608,7 +1613,10 @@ int run_node(const core::CoinParams& params, bool testnet,
         doge_p2sh_split = std::make_shared<const dgb::coin::DogeP2shSplit>(
             dgb::coin::DogeP2shSplit{std::move(owner_doge)});
     }
-    if (dgb::coin::wire_doge_merged_payouts(mm_manager.get(), p2p_node, work_source.get(), doge_p2sh_split))
+    // The provider reads the best share from the stratum best-share cell under
+    // the tracker guard (wire_best_share below keeps the cell fresh).
+    if (dgb::coin::wire_doge_merged_payouts(mm_manager.get(), p2p_node, work_source.get(), doge_p2sh_split,
+                                            [cell = stratum_best_share]() { return cell->get(); }))
         std::cout << "[DGB-MM] DOGE payout provider + work-change hook wired ("
                   << mm_manager->chain_count() << " aux chain(s))" << std::endl;
 #endif // AUX_DOGE

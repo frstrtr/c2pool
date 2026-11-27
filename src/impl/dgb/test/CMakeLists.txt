@@ -348,13 +348,17 @@ if (BUILD_TESTING AND GTest_FOUND)
     # miner is never served the stub coinbase (real core::StratumServer rig).
     add_executable(dgb_work_source_test work_source_test.cpp aux_doge_payout_provider_test.cpp
                    stratum_best_share_test.cpp stratum_job_rig_test.cpp
-                   mint_round_trip_test.cpp doge_p2sh_split_test.cpp)
+                   mint_round_trip_test.cpp doge_p2sh_split_test.cpp
+                   main_dgb_wiring_test.cpp)
     target_link_libraries(dgb_work_source_test PRIVATE
         GTest::gtest_main GTest::gtest
         core dgb dgb_stratum
         c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
         dgb_coin pool sharechain
         nlohmann_json::nlohmann_json)
+    # main_dgb_wiring_test reads main_dgb.cpp (source guard of the live wiring).
+    target_compile_definitions(dgb_work_source_test PRIVATE
+        DGB_MAIN_SRC="${CMAKE_CURRENT_SOURCE_DIR}/../../../c2pool/main_dgb.cpp")
     gtest_add_tests(dgb_work_source_test "" AUTO)
 
     # dgb_template_builder_test: guards the build_work_template SSOT

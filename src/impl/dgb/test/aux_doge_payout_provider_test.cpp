@@ -442,7 +442,6 @@ TEST(DgbDogeMergedPayout, StandaloneBindsNothingAndCoinbaseUnchanged)
     WsFixture fx;
     auto ws = fx.make();
     bind_inputs(*ws);
-    const std::string before = coinbase_hex(*ws);
 
     EXPECT_FALSE(dgb::coin::wire_doge_merged_payouts(nullptr, node, ws.get()));
     EXPECT_FALSE(static_cast<bool>(node.on_best)) << "no best-share hook without --merged";
@@ -450,7 +449,6 @@ TEST(DgbDogeMergedPayout, StandaloneBindsNothingAndCoinbaseUnchanged)
     EXPECT_FALSE(ws->has_merged_chain(kDoge));
 
     const std::string after = coinbase_hex(*ws);
-    EXPECT_EQ(after, before);
     EXPECT_EQ(after, ssot_coinbase_hex());
     EXPECT_EQ(after.find("fabe6d6d"), std::string::npos);
 }
@@ -688,4 +686,141 @@ TEST(DgbDogeMergedPayout, DgbP2pkhPrimaryIsNeverTakenForDoge)
     const auto r = on.resolve(kDgbA(), kDgbS());
     EXPECT_EQ(r.primary, kDgbA());
     EXPECT_TRUE(r.usable_primary);
+}
+
+// ── R3: the provider takes the tracker guard first and reads the best share
+//    from the cell, never NodeImpl::best_share_hash off the IO thread ──────
+
+namespace {
+
+struct GuardNode {
+    dgb::ShareTracker& tracker;
+    uint256 best;
+    std::shared_mutex mtx;
+    bool held = false;
+    int best_calls = 0;
+    struct Guard {
+        std::shared_lock<std::shared_mutex> lk;
+        GuardNode* n;
+        Guard(std::shared_lock<std::shared_mutex> l, GuardNode* node) : lk(std::move(l)), n(node)
+        {
+            if (lk.owns_lock())
+                n->held = true;
+        }
+        Guard(Guard&& o) noexcept : lk(std::move(o.lk)), n(o.n) { o.n = nullptr; }
+        ~Guard()
+        {
+            if (n && lk.owns_lock())
+                n->held = false;
+        }
+        explicit operator bool() const { return lk.owns_lock(); }
+        dgb::ShareTracker& operator*() { return n->tracker; }
+    };
+    GuardNode(dgb::ShareTracker& t, const uint256& b) : tracker(t), best(b) {}
+    Guard read_tracker() { return Guard(std::shared_lock<std::shared_mutex>(mtx, std::try_to_lock), this); }
+    uint256 best_share_hash()
+    {
+        ++best_calls;
+        return best;
+    }
+};
+
+// Holds the tracker exclusively on another thread (the compute thread).
+struct HeldTracker {
+    std::promise<void> locked, release;
+    std::thread t;
+    explicit HeldTracker(std::shared_mutex& m)
+    {
+        auto rel = release.get_future().share();
+        t = std::thread([&m, this, rel] {
+            std::unique_lock<std::shared_mutex> lk(m);
+            locked.set_value();
+            rel.wait();
+        });
+        locked.get_future().wait();
+    }
+    void done()
+    {
+        release.set_value();
+        t.join();
+    }
+};
+
+} // namespace
+
+TEST(DgbDogeMergedPayout, ProviderTakesTheGuardFirstAndReadsBestFromTheCell)
+{
+    ShareChain sc;
+    GuardNode node(sc.tracker, sc.best);
+    int fn_calls = 0;
+    bool fn_under_guard = false;
+    int busy = 0;
+    auto provider = dgb::coin::make_doge_payout_provider(
+        &node, std::make_shared<const dgb::coin::DogeP2shSplit>(),
+        [&]() {
+            ++fn_calls;
+            fn_under_guard = node.held;
+            return sc.best;
+        },
+        [&]() { ++busy; });
+    EXPECT_FALSE(provider(kDoge, 1000).empty());
+    EXPECT_EQ(fn_calls, 1);
+    EXPECT_TRUE(fn_under_guard) << "the best share was read without the tracker guard";
+    EXPECT_EQ(node.best_calls, 0) << "NodeImpl::best_share_hash was called from the provider";
+
+    HeldTracker held(node.mtx);
+    EXPECT_TRUE(provider(kDoge, 1000).empty());
+    EXPECT_EQ(busy, 1) << "a busy tracker is not reported";
+    EXPECT_EQ(fn_calls, 1) << "the best share was read while the tracker was busy";
+    held.done();
+}
+
+TEST(DgbDogeMergedPayout, ProviderSplitsAtTheGivenBestNotTheTip)
+{
+    ShareChain sc;
+    const uint256 older(std::vector<unsigned char>(32, 0xd2));   // the tip's parent
+    ASSERT_TRUE(sc.tracker.chain.contains(older));
+    GuardNode node(sc.tracker, sc.best);
+    auto provider = dgb::coin::make_doge_payout_provider(
+        &node, std::make_shared<const dgb::coin::DogeP2shSplit>(), [older]() { return older; });
+    const uint64_t value = 3'000'000'000ULL;
+    const Payouts got = provider(kDoge, value);
+    auto oracle_at = [&](const uint256& b) {
+        Payouts o;
+        for (auto& [scr, v] : sc.tracker.get_merged_expected_payouts(b, chain::bits_to_target(0x1e0ffff0), value,
+                                                                     kDoge, combined_donation(), {}, {}))
+            if (v >= 1)
+                o.emplace_back(scr, v);
+        return o;
+    };
+    EXPECT_EQ(got, oracle_at(older));
+    EXPECT_NE(got, oracle_at(sc.best)) << "the provider split at the tip, not at the best share it was given";
+}
+
+TEST(DgbDogeMergedPayout, BusyTrackerReMarksThePayoutsDirty)
+{
+    ShareChain sc;
+    FakeNode node(sc.tracker, sc.best);
+    WsFixture fx;
+    auto ws = fx.make();
+    boost::asio::io_context ioc;
+    MergedMiningManager mm(ioc);
+    add_doge(mm);
+    ASSERT_TRUE(dgb::coin::wire_doge_merged_payouts(&mm, node, ws.get(), nullptr,
+                                                    [&sc]() { return sc.best; }));
+    std::promise<void> locked, release;
+    auto rel = release.get_future().share();
+    std::thread holder([&] {
+        std::unique_lock<std::shared_mutex> lk(node.mtx);
+        locked.set_value();
+        rel.wait();
+    });
+    locked.get_future().wait();
+    mm.refresh_aux_work();   // the rebuild's provider finds the tracker busy
+    EXPECT_TRUE(mm.is_pplns_dirty()) << "a busy tracker left the old split for the next poll";
+    release.set_value();
+    holder.join();
+    mm.refresh_aux_work();
+    EXPECT_FALSE(mm.is_pplns_dirty());
+    EXPECT_EQ(mm.get_cached_header_infos_and_commitment().second.size(), 44u);
 }
