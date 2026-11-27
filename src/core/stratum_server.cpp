@@ -1946,34 +1946,6 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
         }
     }
 
-    // ── Duplicate submit (StratumConfig::reject_duplicate_submits) ──
-    // The same (extranonce2, ntime, nonce, version) twice on one job is the
-    // same header: refused before the pseudoshare gate, so it is neither
-    // counted nor dispatched (p2pool work.py received_header_hashes).
-    if (mining_interface_->get_stratum_config().reject_duplicate_submits) {
-        auto lower = [](std::string v) {
-            for (auto& c : v)
-                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-            return v;
-        };
-        auto live = active_jobs_.find(job_id);
-        if (live != active_jobs_.end()) {
-            if (!live->second.submitted)
-                live->second.submitted = std::make_shared<std::unordered_set<std::string>>();
-            std::ostringstream key;
-            key << lower(extranonce2) << ':' << lower(ntime) << ':' << lower(nonce) << ':' << effective_version;
-            if (!live->second.submitted->insert(key.str()).second) {
-                ++rejected_shares_;
-                LOG_INFO << "[Stratum] duplicate submit from " << username_ << " (job=" << job_id << ")";
-                nlohmann::json response;
-                response["id"] = request_id;
-                response["result"] = false;
-                response["error"] = nlohmann::json::array({22, "Duplicate share", nullptr});
-                return response;
-            }
-        }
-    }
-
     // Use gbt_prevhash (BE display hex) — SetHex converts to LE internal,
     // matching build_block_from_stratum which the daemon accepts.
     // Per-coin PoW dispatch via IWorkSource virtual: LTC delegates to the
@@ -2104,6 +2076,40 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
         response["result"] = false;
         response["error"] = nlohmann::json::array({23, "Low difficulty share", nullptr});
         return response;
+    }
+
+    // ── Duplicate submit (StratumConfig::reject_duplicate_submits) ──
+    // The same (extranonce2, ntime, nonce, version) twice on one job is the
+    // same header. Only submissions that passed the gate above are
+    // remembered (p2pool work.py received_header_hashes, filled after
+    // pow <= pseudoshare target), at most duplicate_submit_keys_per_job per
+    // job; a repeat is neither counted nor dispatched.
+    if (const auto& scfg = mining_interface_->get_stratum_config(); scfg.reject_duplicate_submits) {
+        auto lower = [](std::string v) {
+            for (auto& c : v)
+                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            return v;
+        };
+        auto live = active_jobs_.find(job_id);
+        if (live != active_jobs_.end()) {
+            if (!live->second.submitted)
+                live->second.submitted = std::make_shared<std::unordered_set<std::string>>();
+            auto& seen = *live->second.submitted;
+            std::ostringstream key;
+            key << lower(extranonce2) << ':' << lower(ntime) << ':' << lower(nonce) << ':' << effective_version;
+            const std::string k = key.str();
+            if (seen.count(k)) {
+                ++rejected_shares_;
+                LOG_INFO << "[Stratum] duplicate submit from " << username_ << " (job=" << job_id << ")";
+                nlohmann::json response;
+                response["id"] = request_id;
+                response["result"] = false;
+                response["error"] = nlohmann::json::array({22, "Duplicate share", nullptr});
+                return response;
+            }
+            if (seen.size() < scfg.duplicate_submit_keys_per_job)
+                seen.insert(k);
+        }
     }
 
     // ── Pseudoshare accepted — record in RateMonitor ──

@@ -3,11 +3,14 @@
 // Duplicate mining.submit (rides core_test).
 //
 // StratumConfig::reject_duplicate_submits: the same (extranonce2, ntime,
-// nonce, version) twice on one job is refused with [22, "Duplicate share"]
-// before the pseudoshare gate, so it is neither counted (vardiff, rates, the
-// best-share feed) nor dispatched to the work source (p2pool work.py
-// received_header_hashes). Off (the default): today's behaviour, every repeat
-// accepted, counted and dispatched again.
+// nonce, version) twice on one job, among submissions that passed the
+// pseudoshare (vardiff) gate, is refused with [22, "Duplicate share"], so it
+// is neither counted (vardiff, rates, the best-share feed) nor dispatched to
+// the work source (p2pool work.py received_header_hashes, filled after
+// pow <= pseudoshare target). A low-difficulty submission is not remembered,
+// and at most duplicate_submit_keys_per_job are kept per job. Off (the
+// default): today's behaviour, every repeat accepted, counted and
+// dispatched again.
 // Through a real core::StratumServer on 127.0.0.1.
 // ---------------------------------------------------------------------------
 
@@ -95,10 +98,12 @@ struct DupSource : core::stratum::IWorkSource {
     uint32_t get_share_bits() const override { return 0x207fffff; }
     uint32_t get_share_max_bits() const override { return 0x207fffff; }
     double compute_share_difficulty(const std::string&, const std::string&, const std::string&, const std::string&,
-                                    const std::string&, const std::string&, uint32_t, const std::string&,
+                                    const std::string&, const std::string& nonce, uint32_t, const std::string&,
                                     const std::string&, const std::vector<std::string>&) const override
     {
-        return 1e15;   // every submission is a share
+        // Every submission is a share, except the nonce "0badd1ff": below
+        // any vardiff.
+        return nonce == "0badd1ff" ? 0.0 : 1e15;
     }
     void record_best_pseudoshare(double, const std::string&, const std::string&, const std::string&,
                                  const std::string&, const std::string&, const std::string&, const std::string&,
@@ -180,10 +185,11 @@ struct DupRun {
 };
 
 // Submits `nonces` in order on one job; the replies and what reached the source.
-DupRun run(bool reject_duplicates, const std::vector<std::string>& nonces)
+DupRun run(bool reject_duplicates, const std::vector<std::string>& nonces, size_t keys_per_job = 256)
 {
     auto ws = std::make_shared<DupSource>();
     ws->cfg.reject_duplicate_submits = reject_duplicates;
+    ws->cfg.duplicate_submit_keys_per_job = keys_per_job;
     boost::asio::io_context ioc;
     auto guard = boost::asio::make_work_guard(ioc);
     const uint16_t port = free_port_dup();
@@ -258,4 +264,33 @@ TEST(StratumDuplicateSubmit, HexCaseIsTheSameHeader)
     ASSERT_EQ(r.replies.size(), 2u);
     EXPECT_TRUE(ok(r.replies[0]));
     EXPECT_FALSE(ok(r.replies[1])) << "upper-case hex of the same nonce passed as a new header";
+}
+
+// Review dd1248abd REQUIRED 3: only a submission that passed the vardiff
+// gate is remembered; a low-difficulty repeat is low-difficulty again.
+TEST(StratumDuplicateSubmit, ALowDifficultySubmitIsNotRemembered)
+{
+    const auto r = run(true, {"0badd1ff", "0badd1ff", "00000001"});
+    ASSERT_EQ(r.replies.size(), 3u);
+    for (int i : {0, 1}) {
+        ASSERT_TRUE(r.replies[i].contains("error") && r.replies[i]["error"].is_array()) << r.replies[i].dump();
+        EXPECT_EQ(r.replies[i]["error"][0].get<int>(), 23) << "a low-difficulty submit was remembered";
+    }
+    EXPECT_TRUE(ok(r.replies[2]));
+    EXPECT_EQ(r.dispatched, 1u);
+}
+
+// At most duplicate_submit_keys_per_job are remembered per job: past it a new
+// submission is still checked against the remembered ones but not added.
+TEST(StratumDuplicateSubmit, TheSetIsCappedPerJob)
+{
+    const auto r = run(true, {"00000001", "00000002", "00000003", "00000003", "00000001", "00000002"}, 2);
+    ASSERT_EQ(r.replies.size(), 6u);
+    EXPECT_TRUE(ok(r.replies[0]));
+    EXPECT_TRUE(ok(r.replies[1]));
+    EXPECT_TRUE(ok(r.replies[2])) << "past the cap: accepted";
+    EXPECT_TRUE(ok(r.replies[3])) << "past the cap: not remembered, so not a duplicate";
+    EXPECT_FALSE(ok(r.replies[4])) << "a remembered one is still a duplicate";
+    EXPECT_FALSE(ok(r.replies[5]));
+    EXPECT_EQ(r.dispatched, 4u);
 }

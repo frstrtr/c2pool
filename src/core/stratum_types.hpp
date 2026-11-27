@@ -113,11 +113,16 @@ struct StratumConfig {
     uint32_t version_rolling_pool_mask{0x1fffe000};
 
     // A repeated mining.submit of the same (extranonce2, ntime, nonce,
-    // version) on a job is refused with [22, "Duplicate share"] before the
-    // pseudoshare gate: not counted, not dispatched (p2pool work.py
-    // received_header_hashes). Off (default): every lane byte-identical (a
-    // repeat is accepted and counted again).
+    // version) on a job, among the submissions that pass the pseudoshare
+    // (vardiff) gate, is refused with [22, "Duplicate share"]: not counted,
+    // not dispatched (p2pool work.py received_header_hashes, filled only
+    // after pow <= pseudoshare target). Off (default): every lane
+    // byte-identical (a repeat is accepted and counted again).
     bool reject_duplicate_submits{false};
+    // At most this many submissions are remembered per job (bounded memory
+    // on a public port); past it a job's new submissions are checked against
+    // the ones remembered but not added.
+    size_t duplicate_submit_keys_per_job{256};
 
     // ── Live-session hygiene (production ZOMBIE-SESSION LEAK fix) ──────────
     // A NAT-dropped miner's TCP connection is frequently never FIN/RST'd, so
