@@ -277,6 +277,7 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
         stratum_submit_frozen_ref_test.cpp
         stratum_empty_login_refusal_test.cpp
         stratum_duplicate_submit_test.cpp
+        stratum_start_difficulty_test.cpp
         addr_store_save_test.cpp
         address_coin_validation_test.cpp
         author_fee_test.cpp

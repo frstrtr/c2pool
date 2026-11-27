@@ -301,6 +301,7 @@ private:
 
     // Suggested difficulty from miner (mining.suggest_difficulty)
     double suggested_difficulty_ = 0.0;
+    bool   start_difficulty_applied_ = false;   // IWorkSource::start_difficulty, first authorize only
 
     // Per-miner SHARE difficulty from a colon-less "ADDR/<diff>" login token
     // (p2pool desired_share_target). Unset when absent or not a finite

@@ -102,6 +102,13 @@ public:
     // never minted. Default: none.
     virtual std::string authorize_refusal(const std::string& /*username*/) const { return {}; }
 
+    // The difficulty (INTERNAL units, as "+N" and the difficulty hint) a
+    // session starts at when its login names none: no "+N", no password
+    // "d=N", no mining.suggest_difficulty before the first authorize.
+    // Applied once, as the difficulty hint (bounded by [min, max] and the
+    // pool-share ceiling). 0 (default): the vardiff floor, as before.
+    virtual double start_difficulty(const PayoutKey& /*login_key*/) const { return 0.0; }
+
     // ── Per-connection bookkeeping ───────────────────────────────────────
     // Lifecycle: register on authorize, update each share, unregister on
     // disconnect. All keyed by stratum session_id.

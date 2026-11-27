@@ -1481,6 +1481,25 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
             }
         }
 
+        // Seeded start difficulty (IWorkSource::start_difficulty): a login
+        // that names no difficulty (no "+N", no password "d=N", no
+        // mining.suggest_difficulty) starts where the work source suggests,
+        // on the first authorize only. 0 (the default): unchanged.
+        if (mining_interface_ && !start_difficulty_applied_) {
+            start_difficulty_applied_ = true;
+            if (!fixed_diff && !password_diff_applied_ && !(suggested_difficulty_ > 0.0)) {
+                const double seed = mining_interface_->start_difficulty(pubkey_hash_);
+                if (seed > 0.0) {
+                    hashrate_tracker_.set_difficulty_hint(seed);
+                    LOG_INFO << "[Stratum] " << (username_.empty() ? std::string("(empty login)") : username_)
+                             << ": start difficulty " << seed << " (work source; issued "
+                             << hashrate_tracker_.get_current_difficulty() << ")";
+                    if (subscribed_ && hashrate_tracker_.get_current_difficulty() != advertised_difficulty_)
+                        send_set_difficulty(hashrate_tracker_.get_current_difficulty());
+                }
+            }
+        }
+
         // Resend work after a successful authorize. The job sent right after
         // subscribe was built before authorize ran, so it carried neither the
         // miner's primary payout address (username_ was empty -> empty
