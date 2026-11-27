@@ -1173,7 +1173,7 @@ nlohmann::json StratumSession::handle_subscribe(const nlohmann::json& params, co
             nlohmann::json::array({"mining.notify", subscription_id_})
         }),
         extranonce1_,
-        4  // extranonce2_size = 4 bytes
+        EXTRANONCE2_SIZE  // 4 bytes
     });
     response["error"] = nullptr;
     
@@ -1843,6 +1843,28 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
     std::string version_bits;
     if (params.size() >= 6 && params[5].is_string())
         version_bits = params[5].get<std::string>();
+
+    // With duplicate submits refused, one header must have one spelling: the
+    // coin parsers are lenient ("1", "0x1", "00000001zz" and 300 leading
+    // zeros are all nonce 1), so each spelling would be a new key, counted and
+    // dispatched again, and stored up to the line limit. Refused unless
+    // canonical, as python's stratum refuses any other format.
+    if (mining_interface_->get_stratum_config().reject_duplicate_submits
+        && !core::stratum::canonical_submit_fields(extranonce2, ntime, nonce, version_bits, EXTRANONCE2_SIZE)) {
+        ++rejected_shares_;
+        auto now_lg = std::chrono::steady_clock::now();
+        if (now_lg - last_badparams_log_ >= REJECT_LOG_INTERVAL) {
+            last_badparams_log_ = now_lg;
+            LOG_INFO << "[Stratum] REJECT non-canonical submit fields user=" << username_
+                     << " sizes en2=" << extranonce2.size() << " ntime=" << ntime.size()
+                     << " nonce=" << nonce.size() << " version_bits=" << version_bits.size();
+        }
+        nlohmann::json response;
+        response["id"] = request_id;
+        response["result"] = false;
+        response["error"] = nlohmann::json::array({20, "Invalid parameters", nullptr});
+        return response;
+    }
 
     // Stale detection: check if job_id is still active.
     auto job_it = active_jobs_.find(job_id);

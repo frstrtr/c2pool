@@ -265,6 +265,8 @@ private:
     std::chrono::steady_clock::time_point last_lowdiff_log_{};
     std::chrono::steady_clock::time_point last_badparams_log_{};
     static constexpr std::chrono::seconds REJECT_LOG_INTERVAL{5};
+    // The extranonce2 size mining.subscribe announces, in bytes.
+    static constexpr int EXTRANONCE2_SIZE = 4;
 
     // Merged mining: per-chain payout addresses set by the miner.
     std::map<uint32_t, std::string> merged_addresses_;

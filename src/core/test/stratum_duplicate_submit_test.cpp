@@ -2,6 +2,9 @@
 // ---------------------------------------------------------------------------
 // Duplicate mining.submit (rides core_test).
 //
+// With the flag on, the fields must also have their canonical spelling
+// (core::stratum::canonical_submit_fields), else [20, "Invalid parameters"].
+//
 // StratumConfig::reject_duplicate_submits: the same (extranonce2, ntime,
 // nonce, version) twice on one job, among submissions that passed the
 // pseudoshare (vardiff) gate, is refused with [22, "Duplicate share"], so it
@@ -184,8 +187,25 @@ struct DupRun {
     int best_calls = 0;
 };
 
+struct Submit {
+    std::string extranonce2 = "00000000";
+    std::string ntime = "6ae2a090";
+    std::string nonce;
+    std::string version_bits;   // empty: not sent
+};
+
+DupRun run_submits(bool reject_duplicates, const std::vector<Submit>& submits, size_t keys_per_job);
+
 // Submits `nonces` in order on one job; the replies and what reached the source.
 DupRun run(bool reject_duplicates, const std::vector<std::string>& nonces, size_t keys_per_job = 256)
+{
+    std::vector<Submit> v;
+    for (const auto& n : nonces)
+        v.push_back(Submit{"00000000", "6ae2a090", n, ""});
+    return run_submits(reject_duplicates, v, keys_per_job);
+}
+
+DupRun run_submits(bool reject_duplicates, const std::vector<Submit>& submits, size_t keys_per_job)
 {
     auto ws = std::make_shared<DupSource>();
     ws->cfg.reject_duplicate_submits = reject_duplicates;
@@ -208,8 +228,11 @@ DupRun run(bool reject_duplicates, const std::vector<std::string>& nonces, size_
             c.wait(-1, 100);
         EXPECT_FALSE(c.last_job.empty());
         int id = 10;
-        for (const auto& n : nonces) {
-            c.send({{"id", id}, {"method", "mining.submit"}, {"params", {"w", c.last_job, "00000000", "6ae2a090", n}}});
+        for (const auto& sub : submits) {
+            nlohmann::json p = {"w", c.last_job, sub.extranonce2, sub.ntime, sub.nonce};
+            if (!sub.version_bits.empty())
+                p.push_back(sub.version_bits);
+            c.send({{"id", id}, {"method", "mining.submit"}, {"params", p}});
             auto r = c.wait(id);
             out.replies.push_back(r ? *r : nlohmann::json());
             ++id;
@@ -293,4 +316,55 @@ TEST(StratumDuplicateSubmit, TheSetIsCappedPerJob)
     EXPECT_FALSE(ok(r.replies[4])) << "a remembered one is still a duplicate";
     EXPECT_FALSE(ok(r.replies[5]));
     EXPECT_EQ(r.dispatched, 4u);
+}
+
+// Review 7793bfb6c REQUIRED: with the flag on, a header has one spelling. The
+// coin parsers read "1", "0x00000001", "00000001zz" and 300 leading zeros as
+// nonce 1, so any spelling but exactly 8 hex digits (extranonce2 exactly 2x
+// its size, version_bits at most 8) is refused [20] before the PoW, not
+// counted, not dispatched, not remembered.
+TEST(StratumDuplicateSubmit, OnlyTheCanonicalSpellingIsTaken)
+{
+    std::vector<Submit> v;
+    v.push_back(Submit{"00000000", "6ae2a090", "00000001", ""});
+    for (const std::string n : {"1", "0x00000001", "00000001zz", " 0000001", "+0000001",
+                                std::string(300, '0') + "1", std::string(16000, '0')})
+        v.push_back(Submit{"00000000", "6ae2a090", n, ""});
+    v.push_back(Submit{"0000000", "6ae2a090", "00000002", ""});      // extranonce2 one digit short
+    v.push_back(Submit{"0000000000", "6ae2a090", "00000002", ""});   // and one byte long
+    v.push_back(Submit{"00000000", "6ae2a09", "00000002", ""});      // ntime short
+    v.push_back(Submit{"00000000", "6ae2a090", "00000002", "1fffe0000"});   // version_bits 9 digits
+    v.push_back(Submit{"00000000", "6ae2a090", "00000001", ""});      // the canonical one again
+    const auto r = run_submits(true, v, 256);
+    ASSERT_EQ(r.replies.size(), v.size());
+    EXPECT_TRUE(ok(r.replies[0])) << r.replies[0].dump();
+    for (size_t i = 1; i + 1 < v.size(); ++i) {
+        SCOPED_TRACE(i);
+        ASSERT_TRUE(r.replies[i].contains("error") && r.replies[i]["error"].is_array()) << r.replies[i].dump();
+        EXPECT_EQ(r.replies[i]["error"][0].get<int>(), 20);
+    }
+    ASSERT_TRUE(r.replies.back().contains("error") && r.replies.back()["error"].is_array());
+    EXPECT_EQ(r.replies.back()["error"][0].get<int>(), 22) << "the canonical repeat is the duplicate";
+    EXPECT_EQ(r.dispatched, 1u) << "a non-canonical spelling reached the work source";
+    EXPECT_EQ(r.best_calls, 1) << "a non-canonical spelling was counted";
+}
+
+// Off (every lane but DGB): no format check, today's parsing.
+TEST(StratumDuplicateSubmit, OffTakesAnySpellingAsToday)
+{
+    const auto r = run_submits(false, {Submit{"00000000", "6ae2a090", "1", ""}}, 256);
+    ASSERT_EQ(r.replies.size(), 1u);
+    EXPECT_TRUE(ok(r.replies[0])) << r.replies[0].dump();
+}
+
+TEST(StratumDuplicateSubmit, CanonicalFieldsHelper)
+{
+    using core::stratum::canonical_submit_fields;
+    EXPECT_TRUE(canonical_submit_fields("0a0B0c0D", "6AE2A090", "deadBEEF", "", 4));
+    EXPECT_TRUE(canonical_submit_fields("0a0b0c0d", "6ae2a090", "deadbeef", "1fffe000", 4));
+    EXPECT_TRUE(canonical_submit_fields("0a0b0c0d", "6ae2a090", "deadbeef", "2", 4));
+    EXPECT_FALSE(canonical_submit_fields("0a0b0c0d", "6ae2a090", "deadbeef", "x", 4));
+    EXPECT_FALSE(canonical_submit_fields("0a0b0c", "6ae2a090", "deadbeef", "", 4));
+    EXPECT_TRUE(canonical_submit_fields("0a0b0c", "6ae2a090", "deadbeef", "", 3));
+    EXPECT_FALSE(canonical_submit_fields("0a0b0c0d", "6ae2a090", "deadbee ", "", 4));
 }
