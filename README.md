@@ -945,17 +945,20 @@ built and committed in the job's coinbase, as in p2pool.
    recipient the mode picks, and
    every merged chain the share names no address for gets that recipient's key
    (the node owner's merged addresses when it is the owner) — written into the
-   share, so every node derives the same payout. With a valid DOGE address as
-   the second address of an invalid LTC address, the LTC payout uses that DOGE
-   address's key instead (p2pool's "case 4"). The log warns per miner and the
-   dashboard's workers list shows "address invalid → redistributed".
-   A P2WSH/P2TR LTC address cannot be carried by a V36 share (a 20-byte payout
-   hash). With a DOGE address given for it (comma or slash form), the LTC
-   payout uses that DOGE address's key and DOGE pays the DOGE address, with the
-   node's normal donation: the miner is paid on both chains ("P2WSH/P2TR
-   address → parent paid to the DOGE address's key"). Without one its payout is
-   redistributed the same way as above, with a warning in the log and
-   "P2WSH/P2TR address → redistributed" in the workers list. A swapped
+   share, so every node derives the same payout. Attributable work is never
+   halved (p2pool's "case 4", extended): a login whose LTC address is invalid,
+   empty or another coin's, or one a V36 share cannot carry (P2WSH/P2TR: a
+   20-byte payout hash), and that names a merged address (comma or slash form,
+   or `mining.set_merged_addresses` after its authorize, in either order) has
+   its LTC payout paid to that address's key, DOGE's if named, else the lowest
+   configured chain's, in its own form (P2PKH stays P2PKH, P2SH stays P2SH),
+   with the node's normal donation; the merged addresses are paid as given
+   ("address invalid → parent paid to the DOGE address's key", "P2WSH/P2TR
+   address → parent paid to the DOGE address's key"). Only a merged address
+   this login gave counts, never one left over from another login on the
+   connection. A login naming no usable address is redistributed as above,
+   with a warning in the log ("address invalid → redistributed", "P2WSH/P2TR
+   address → redistributed" in the workers list). A swapped
    pair whose first address is not valid (`DOGE-with-bad-checksum,LTCADDR`)
    pays the valid LTC address, as before.
 

@@ -5,8 +5,8 @@
 ### Unattributable work now pays 50% node owner / 50% donation (was spread over PPLNS)
 - `--redistribute split`, the new default (LTC with its merged chains, and
   DASH): a share of work the node cannot attribute to a payout address (an
-  empty, invalid or other-coin login; a P2WSH/P2TR LTC address with no DOGE
-  address; the job sent right after `mining.subscribe`, built before the
+  empty, invalid, other-coin or P2WSH/P2TR login naming no merged address;
+  the job sent right after `mining.subscribe`, built before the
   login, whose shares can arrive after the authorize) pays the node owner
   (`--node-owner-address`; on LTC else `--address`) with donation 32768/65535
   instead of `--give-author`'s.
@@ -16,9 +16,14 @@
   owner's key converted; a P2SH owner key is not converted, that chain's half
   goes to the donation; an address the login names for a chain stays). Every
   such share, deterministically; no consensus change.
-- A P2WSH/P2TR LTC address given with a DOGE address is paid on LTC to that
-  DOGE address's key (p2pool's case 4, extended), with the node's donation:
-  the miner is paid on both chains.
+- Attributable work is never halved (p2pool's case 4, extended): a login
+  whose LTC address is invalid, empty, another coin's, or P2WSH/P2TR, and that
+  names a merged address (comma or slash form, or `mining.set_merged_addresses`
+  after its authorize, in either order) is paid on LTC to that address's key
+  (DOGE's, else the lowest configured chain's; P2PKH or P2SH as given), with
+  the node's donation, its merged addresses as given. Only an address the
+  login gave counts, never one left from another login on the connection.
+  Split applies only to a login naming no usable address.
 - Without a usable node-owner address the owner half cannot be paid: the node
   keeps the old `pplns` behaviour (a hybrid spec: its other terms), said once
   at startup. `pplns`, `fee`, `boost` and `donate` are unchanged and still
