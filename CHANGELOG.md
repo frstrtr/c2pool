@@ -5,18 +5,24 @@
 ### Unattributable work now pays 50% node owner / 50% donation (was spread over PPLNS)
 - `--redistribute split`, the new default (LTC with its merged chains, and
   DASH): a share of work the node cannot attribute to a payout address (an
-  empty, invalid or other-coin login; a P2WSH/P2TR LTC address; the job sent
-  right after `mining.subscribe`, built before the login, whose shares can
-  arrive after the authorize) pays the node owner (`--node-owner-address`; on
-  LTC else `--address`) with donation 32768/65535 instead of `--give-author`'s.
+  empty, invalid or other-coin login; a P2WSH/P2TR LTC address with no DOGE
+  address; the job sent right after `mining.subscribe`, built before the
+  login, whose shares can arrive after the authorize) pays the node owner
+  (`--node-owner-address`; on LTC else `--address`) with donation 32768/65535
+  instead of `--give-author`'s.
   PPLNS splits each share's weight by its own donation field, so the owner and
   the donation get half of it each, on LTC and on every merged chain (the
   owner's merged address: `--node-owner-merged-address` for DOGE, else the
-  owner's key converted; an address the login names for a chain stays). Every
+  owner's key converted; a P2SH owner key is not converted, that chain's half
+  goes to the donation; an address the login names for a chain stays). Every
   such share, deterministically; no consensus change.
+- A P2WSH/P2TR LTC address given with a DOGE address is paid on LTC to that
+  DOGE address's key (p2pool's case 4, extended), with the node's donation:
+  the miner is paid on both chains.
 - Without a usable node-owner address the owner half cannot be paid: the node
-  keeps the old `pplns` behaviour, said once at startup. `pplns`, `fee`,
-  `boost` and `donate` are unchanged and still selectable.
+  keeps the old `pplns` behaviour (a hybrid spec: its other terms), said once
+  at startup. `pplns`, `fee`, `boost` and `donate` are unchanged and still
+  selectable.
 - DGB is unchanged (`--redistribute` stays opt-in); a DGB spec naming `split`
   is warned about and binds no policy.
 

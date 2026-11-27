@@ -936,8 +936,9 @@ built and committed in the job's coinbase, as in p2pool.
    PPLNS gives the owner and the donation half of its weight each, on LTC and
    on every merged chain the share names no address for (the owner's merged
    address there: `--node-owner-merged-address` for DOGE, else the owner's key
-   converted). Without a usable owner address the node keeps the old `pplns`
-   behaviour (logged once at startup). The job sent right after
+   converted; a P2SH owner key is not converted, that chain's half goes to the
+   donation). Without a usable owner address the node keeps the old `pplns`
+   behaviour, or the other terms of a hybrid spec (logged once at startup). The job sent right after
    `mining.subscribe`, built before the login, is such work too: a share found
    on it and submitted after the authorize pays the owner and the donation the
    same way. With the other modes, as p2pool does: the LTC payout goes to the
@@ -949,9 +950,12 @@ built and committed in the job's coinbase, as in p2pool.
    address's key instead (p2pool's "case 4"). The log warns per miner and the
    dashboard's workers list shows "address invalid → redistributed".
    A P2WSH/P2TR LTC address cannot be carried by a V36 share (a 20-byte payout
-   hash): its LTC payout is redistributed the same way, with the same warning
-   in the log and "P2WSH/P2TR address → redistributed" in the workers list; the
-   LTC payout is never taken from a merged chain's address for it. A swapped
+   hash). With a DOGE address given for it (comma or slash form), the LTC
+   payout uses that DOGE address's key and DOGE pays the DOGE address, with the
+   node's normal donation: the miner is paid on both chains ("P2WSH/P2TR
+   address → parent paid to the DOGE address's key"). Without one its payout is
+   redistributed the same way as above, with a warning in the log and
+   "P2WSH/P2TR address → redistributed" in the workers list. A swapped
    pair whose first address is not valid (`DOGE-with-bad-checksum,LTCADDR`)
    pays the valid LTC address, as before.
 

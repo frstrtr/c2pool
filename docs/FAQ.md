@@ -121,9 +121,13 @@ login without an explicit merged address is therefore warned ("P2SH address:
 if segwit-wrapped, give a DOGE address" in the workers list): give your DOGE
 address explicitly, `LTC_ADDRESS,DOGE_ADDRESS`. The 32-byte
 witness programs (P2WSH/P2TR) can't be carried by a V36 share (a 20-byte
-payout hash): its LTC payout is redistributed like an invalid address's
-("P2WSH/P2TR address → redistributed"); merged addresses you name are still
-paid.
+payout hash). Give your DOGE address with it (`LTC_ADDRESS,DOGE_ADDRESS`, or
+`LTC_ADDRESS/98:DOGE_ADDRESS`): the LTC payout is then paid to that DOGE
+address's key and DOGE to the DOGE address, with the node's normal donation,
+so you are paid on both chains ("P2WSH/P2TR address → parent paid to the DOGE
+address's key"). Without a DOGE address its payout is redistributed like an
+invalid address's ("P2WSH/P2TR address → redistributed": by default 50% to
+the node owner, 50% to the donation).
 
 **To override or set addresses per chain explicitly**, use any of:
 
