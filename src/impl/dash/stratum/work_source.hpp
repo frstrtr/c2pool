@@ -614,6 +614,34 @@ public:
         return serve_recheck_fail_count_.load(std::memory_order_relaxed);
     }
 
+    /// Serve timing, one summary per stored template. A "serve" is one
+    /// build_connection_coinbase over the template (one job). Its SPAN is the
+    /// DASH share of one session's serve on the serving thread: from that
+    /// session's get_current_work_template() to the end of its
+    /// build_connection_coinbase() (core::StratumSession::send_notify_work
+    /// calls template, branches, coinbase, in that order, with no yield), so
+    /// it covers the three cached_work() reads with their serve-time
+    /// re-checks, both merkle-branch computations, the producer job or the
+    /// payout split, and the frozen snapshot. Core's JSON and socket write are
+    /// not in it. The summary of a template is written (one INFO line,
+    /// format_serve_timing_line) when the first serve of the NEXT template is
+    /// recorded; it carries counts, sizes and durations only.
+    struct ServeTimingSummary {
+        uint64_t seq{0};          ///< store sequence of the template
+        uint32_t height{0};
+        uint64_t txs{0};
+        uint64_t body_bytes{0};
+        uint64_t serves{0};
+        uint64_t spans{0};        ///< serves with a measured span
+        uint32_t serve_us_p50{0}, serve_us_p99{0}, serve_us_max{0};
+        uint32_t coinbase_us_p50{0}, coinbase_us_p99{0}, coinbase_us_max{0};
+        int64_t  live_hex_chars{0};   ///< coin::live_template_hex_chars() at the write
+    };
+    static std::string format_serve_timing_line(const ServeTimingSummary& s);
+    /// The last summary written, and how many were written (tests).
+    std::optional<ServeTimingSummary> last_serve_timing() const;
+    uint64_t serve_timing_lines() const;
+
     /// Seconds since the cached template was sourced, -1 when none / unknown.
     /// Display only (the dashboard's block_value_age_sec): a template that is
     /// an hour old renders exactly like a live one without this, which is how
@@ -1047,6 +1075,25 @@ private:
     // event that changes the answer and must re-source immediately instead of
     // waiting out kRetryAfter (soak0804e resume-quantization fix).
     mutable uint64_t            template_last_fail_gen_{0};
+    // Store sequence: names each stored template instance (its TemplateTxHex
+    // seq). Any thread that stores (io inline, or the rpc_pool executor).
+    mutable std::atomic<uint64_t> template_store_seq_{0};
+
+    // Serve timing (ServeTimingSummary): the open template's samples. Serves
+    // record on the serving thread; the lock is held for a sample push, and
+    // once per template for its summary (the log line is written after it).
+    void note_serve_timing(const coin::DashWorkData& wd, int64_t serve_us,
+                           int64_t coinbase_us) const;
+    struct ServeTimingAcc {
+        ServeTimingSummary    head;          // seq/height/txs/bytes + counts
+        std::vector<uint32_t> serve_us;      // capped at kServeTimingSamples
+        std::vector<uint32_t> coinbase_us;
+    };
+    static constexpr size_t kServeTimingSamples = 4096;
+    mutable std::mutex                        serve_timing_mutex_;
+    mutable ServeTimingAcc                    serve_timing_;
+    mutable std::optional<ServeTimingSummary> last_serve_timing_;
+    mutable uint64_t                          serve_timing_lines_{0};
 
     // io-thread-decouple: background single-flight template refresh.
     // refresh_executor_ posts the blocking re-source onto the rpc_pool thread

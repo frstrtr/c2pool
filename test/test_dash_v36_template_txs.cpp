@@ -228,3 +228,38 @@ TEST(DashV36TemplateTxs, ProducerJobsOverOneTemplateShareOneBodyVector)
     EXPECT_TRUE(watch.expired())
         << "the memo holds weak references only: bodies die with the last frozen job";
 }
+
+// P5: a template the work source stored carries its own encoded tx-hex vector.
+// Every frozen job over it takes that very pointer, the one its stratum job
+// froze, so the won block and the job cannot hold different bodies. A template
+// that never went through the store (no vector) is still served by the memo.
+TEST(DashP5SharedTxHex, ProducerFrozenJobTakesTheTemplatesOwnVector)
+{
+    IdentityGuard guard;
+    const auto p = iso_prod_params();
+    ASSERT_EQ(p.current_share_version, 36u);
+    dash::ShareChain scratch;
+    auto stored = make_wd_with_txs(3);
+    stored.m_tx_hex_shared = dash::coin::TemplateTxHex::encode(stored.m_tx_data_hex, 1);
+    const auto* own = stored.m_tx_hex_shared.hex().get();
+
+    auto job = [&](const dash::coin::DashWorkData& w, uint8_t miner, uint32_t nonce) {
+        return dash::mint::build_producer_job(scratch, p, uint256(),
+                                              dash::pubkey_hash_to_script2(h160(miner)), w,
+                                              w.m_curtime, nonce, /*donation=*/0, "c2pool");
+    };
+    const auto a = job(stored, 0xa1, 21);
+    const auto b = job(stored, 0xb2, 22);
+    ASSERT_TRUE(a && b);
+    ASSERT_TRUE(a->frozen.tx_data_hex && b->frozen.tx_data_hex);
+    EXPECT_EQ(a->frozen.tx_data_hex.get(), own) << "the frozen job must take the template's own vector";
+    EXPECT_EQ(b->frozen.tx_data_hex.get(), own);
+    EXPECT_EQ(dash::coin::job_tx_hex(stored).get(), own) << "the stratum job freezes the same pointer";
+
+    const dash::coin::DashWorkData copy = stored;   // a copy carries no vector
+    ASSERT_FALSE(copy.m_tx_hex_shared);
+    const auto c = job(copy, 0xa1, 23);
+    ASSERT_TRUE(c && c->frozen.tx_data_hex);
+    EXPECT_NE(c->frozen.tx_data_hex.get(), own);
+    EXPECT_EQ(*c->frozen.tx_data_hex, stored.m_tx_data_hex);
+}

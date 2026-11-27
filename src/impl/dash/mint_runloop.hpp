@@ -134,7 +134,9 @@ inline uint256 desired_share_target(const core::CoinParams& params,
 // complete tx hash list (a txid is the hash of its body, so equal lists mean
 // equal bodies) and holds only weak_ptrs: it never extends a body vector's life
 // past the last frozen job that references it. Thread-safe (stratum sessions
-// build producer jobs concurrently).
+// build producer jobs concurrently). A template stored by the work source
+// brings its own encoded vector (DashWorkData::m_tx_hex_shared) and never
+// reaches the memo; see build_producer_job.
 class TemplateBodiesMemo
 {
 public:
@@ -347,8 +349,22 @@ inline std::optional<ProducerJobBuild> build_producer_job(
     // v36: the template's tx bodies (template order, parallel to
     // desired_tx_hashes) -- the finder assembles the won block from them
     // (coin/reconstruct_won_block.hpp). Null on v16 and on coinbase-only jobs.
+    //
+    // A stored template carries its own vector (m_tx_hex_shared: encoded for
+    // it, or reused from the previous stored template with the same bodies):
+    // the frozen job takes that very pointer, the one its stratum job froze, so
+    // the two cannot hold different bodies. The memo serves only a template that
+    // never went through the store (it carries no vector). Its match (the txid
+    // list and the body count) is NOT byte-exact under Dash Core v24: a
+    // version-2 asset unlock (type 9) keeps its txid when re-signed while its
+    // bytes change. That is not reachable today, because template selection
+    // never admits types 5/6/9 (Mempool::SpecialTxSelectMask::admits). Before
+    // type 9 may enter templates, the memo must byte-check such bodies the way
+    // coin::template_tx_hex_reusable does, or be retired.
     if (v36 && !wd.m_tx_hashes.empty())
-        out.frozen.tx_data_hex = TemplateBodiesMemo::instance().get(wd);
+        out.frozen.tx_data_hex = wd.m_tx_hex_shared
+                                     ? wd.m_tx_hex_shared.hex()
+                                     : TemplateBodiesMemo::instance().get(wd);
     return out;
 }
 

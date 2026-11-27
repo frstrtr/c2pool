@@ -57,6 +57,7 @@
 
 #include <btclibs/util/strencodings.h>        // ParseHex, HexStr
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -76,6 +77,32 @@ constexpr auto kStaleAfter = std::chrono::seconds(30);
 // Negative-cache window after a failed sourcing attempt (set-gap / dashd
 // down): sessions retry notify every 1 s -- don't turn that into an RPC storm.
 constexpr auto kRetryAfter = std::chrono::seconds(5);
+
+// Serve timing span (DASHWorkSource::ServeTimingSummary): when THIS thread's
+// current session serve started, i.e. its get_current_work_template() call.
+// A span longer than kServeSpanMax is not a serve (an aborted serve left the
+// start behind) and is not measured.
+struct ServeSpanStart {
+    const void* owner{nullptr};
+    std::chrono::steady_clock::time_point at{};
+};
+thread_local ServeSpanStart t_serve_span;
+constexpr auto kServeSpanMax = std::chrono::seconds(5);
+
+inline int64_t elapsed_us(std::chrono::steady_clock::time_point from,
+                          std::chrono::steady_clock::time_point to)
+{
+    return std::chrono::duration_cast<std::chrono::microseconds>(to - from).count();
+}
+
+// p-th percentile (nearest rank below) of an unsorted sample; 0 when empty.
+inline uint32_t percentile_us(std::vector<uint32_t> v, unsigned p)
+{
+    if (v.empty()) return 0;
+    const size_t k = (v.size() - 1) * p / 100;
+    std::nth_element(v.begin(), v.begin() + static_cast<std::ptrdiff_t>(k), v.end());
+    return v[k];
+}
 
 // Stratum sends ntime/nonce/nbits as big-endian hex; sscanf(%x) decodes them.
 inline uint32_t parse_be_hex_u32(const std::string& s)
@@ -1700,6 +1727,34 @@ void DASHWorkSource::resource_template_now(CoinStateArm arm) const
         }
     }
 
+    // One tx-hex vector for every job this template will serve, set here,
+    // once per store, outside the template lock. `work` is a local no other
+    // thread can see; after the store below it is the immutable cached
+    // snapshot, so the vector can never drift from its bodies.
+    //
+    // A rebuild on the same tip whose ordered tx-hash list equals the cached
+    // template's (and whose bodies a txid may not pin are byte-equal) takes the
+    // cached template's vector: it already holds exactly these bodies, in this
+    // order (coin::template_tx_hex_reusable). Anything else encodes a fresh
+    // one from this template's own bodies: another list, the same txs in
+    // another order, a tip change, and any store after an invalidate, a set-gap
+    // or a failed serve-time re-check (each drops the cache, so there is no
+    // previous template to compare with). The candidate is read under the
+    // lock; a store racing in between can only change WHICH equal-bodied
+    // vector is taken.
+    if (work.m_bits != 0 && !work.m_previous_block.IsNull()) {
+        std::shared_ptr<const coin::DashWorkData> prev;
+        {
+            std::lock_guard<std::mutex> lk(template_mutex_);
+            prev = template_cache_;
+        }
+        const uint64_t seq = template_store_seq_.fetch_add(1, std::memory_order_relaxed) + 1;
+        work.m_tx_hex_shared =
+            (prev && coin::template_tx_hex_reusable(*prev, work))
+                ? coin::TemplateTxHex::reuse(prev->m_tx_hex_shared, seq)
+                : coin::TemplateTxHex::encode(work.m_tx_data_hex, seq);
+    }
+
     const auto now = std::chrono::steady_clock::now();
     std::lock_guard<std::mutex> lk(template_mutex_);
     if (work.m_bits == 0 || work.m_previous_block.IsNull()) {
@@ -2374,6 +2429,10 @@ nlohmann::json DASHWorkSource::get_current_work_template() const
     // send_notify_work() consumes: previousblockhash (BE display hex),
     // version (int), bits (8-char BE hex string), curtime, height. Empty
     // object on a set-gap -- the session skips the push and retries.
+    //
+    // The first of a session serve's three calls: the serve timing span
+    // starts here (closed by build_connection_coinbase on this thread).
+    t_serve_span = {this, std::chrono::steady_clock::now()};
     auto wd = cached_work();
     if (!wd) return nlohmann::json::object();
 
@@ -2443,8 +2502,29 @@ core::stratum::CoinbaseResult DASHWorkSource::build_connection_coinbase(
     // pool's sharechain is EMPTY, so the single connecting miner carries the
     // whole worker_payout -- weights {payout_script: 1}, total 1 -- plus the
     // GBT-mandated masternode/superblock outputs and the donation tail.
+    const auto coinbase_t0 = std::chrono::steady_clock::now();
     auto wd = cached_work();
     if (!wd) return {};   // no template -> no job (session retries)
+
+    // Serve timing: recorded on every exit below, against THIS wd.
+    struct TimingScope {
+        const DASHWorkSource&                 ws_;
+        const coin::DashWorkData&             wd_;
+        std::chrono::steady_clock::time_point t0_;
+        ~TimingScope()
+        {
+            const auto end = std::chrono::steady_clock::now();
+            int64_t serve_us = -1;
+            if (t_serve_span.owner == &ws_ && end - t_serve_span.at < kServeSpanMax)
+                serve_us = elapsed_us(t_serve_span.at, end);
+            t_serve_span.owner = nullptr;
+            try {
+                ws_.note_serve_timing(wd_, serve_us, elapsed_us(t0_, end));
+            } catch (...) {
+                // Diagnostics only: never let a timing record end a serve.
+            }
+        }
+    } timing_scope{*this, *wd, coinbase_t0};
 
     // Serve-staleness sentinel: the per-connection coinbase path is the OTHER
     // way a height reaches a miner (get_current_work_template is the first).
@@ -2483,8 +2563,11 @@ core::stratum::CoinbaseResult DASHWorkSource::build_connection_coinbase(
             out.snapshot.frozen_ref.frozen_merkle_branches = raw;
             out.snapshot.merkle_branches = dash::coinbase::merkle_branches_hex(raw);
         }
-        out.snapshot.tx_data = std::make_shared<const std::vector<std::string>>(
-            wd->m_tx_data_hex);
+        // The template's own tx-hex vector, shared by every job over it (one
+        // pointer copy). It sits inside the same immutable `wd` the branches
+        // above came from, so the two cannot belong to different templates
+        // (a reused vector holds exactly this wd's bodies, in this order).
+        out.snapshot.tx_data = coin::job_tx_hex(*wd);
     };
 
     // ── Producer path (slice 3/3, run-loop mint) ─────────────────────────
@@ -3217,6 +3300,79 @@ void DASHWorkSource::set_producer_job_fn(ProducerJobFn fn)
 {
     std::lock_guard<std::mutex> lk(producer_job_mutex_);
     producer_job_fn_ = std::move(fn);
+}
+
+// ── Serve timing (ServeTimingSummary) ───────────────────────────────────────
+
+std::string DASHWorkSource::format_serve_timing_line(const ServeTimingSummary& s)
+{
+    // A timing line, by name, for grep. Counts, sizes and durations only.
+    std::ostringstream o;
+    o << "[DASH-SERVE-TIMING] serve timing per template: seq=" << s.seq
+      << " h=" << s.height << " txs=" << s.txs << " bytes=" << s.body_bytes
+      << " serves=" << s.serves << " spans=" << s.spans
+      << " serve_us p50=" << s.serve_us_p50 << " p99=" << s.serve_us_p99
+      << " max=" << s.serve_us_max
+      << " coinbase_us p50=" << s.coinbase_us_p50 << " p99=" << s.coinbase_us_p99
+      << " max=" << s.coinbase_us_max
+      << " live_hex_chars=" << s.live_hex_chars;
+    return o.str();
+}
+
+void DASHWorkSource::note_serve_timing(const coin::DashWorkData& wd, int64_t serve_us,
+                                       int64_t coinbase_us) const
+{
+    const uint64_t seq = wd.m_tx_hex_shared.seq();
+    if (seq == 0) return;   // not a stored template
+    auto clamp_us = [](int64_t us) {
+        return static_cast<uint32_t>(std::clamp<int64_t>(us, 0, UINT32_MAX));
+    };
+    std::optional<ServeTimingSummary> done;
+    {
+        std::lock_guard<std::mutex> lk(serve_timing_mutex_);
+        auto& acc = serve_timing_;
+        if (acc.head.seq != seq) {
+            if (acc.head.seq != 0 && acc.head.serves != 0) {
+                ServeTimingSummary s = acc.head;
+                s.serve_us_p50    = percentile_us(acc.serve_us, 50);
+                s.serve_us_p99    = percentile_us(acc.serve_us, 99);
+                s.coinbase_us_p50 = percentile_us(acc.coinbase_us, 50);
+                s.coinbase_us_p99 = percentile_us(acc.coinbase_us, 99);
+                s.live_hex_chars  = coin::live_template_hex_chars();
+                last_serve_timing_ = s;
+                ++serve_timing_lines_;
+                done = s;
+            }
+            acc = ServeTimingAcc{};
+            acc.head.seq        = seq;
+            acc.head.height     = wd.m_height;
+            acc.head.txs        = wd.m_tx_data_hex.size();
+            acc.head.body_bytes = wd.m_tx_hex_shared.body_bytes();
+        }
+        ++acc.head.serves;
+        const uint32_t cb = clamp_us(coinbase_us);
+        acc.head.coinbase_us_max = std::max(acc.head.coinbase_us_max, cb);
+        if (acc.coinbase_us.size() < kServeTimingSamples) acc.coinbase_us.push_back(cb);
+        if (serve_us >= 0) {
+            const uint32_t sv = clamp_us(serve_us);
+            ++acc.head.spans;
+            acc.head.serve_us_max = std::max(acc.head.serve_us_max, sv);
+            if (acc.serve_us.size() < kServeTimingSamples) acc.serve_us.push_back(sv);
+        }
+    }
+    if (done) LOG_INFO << format_serve_timing_line(*done);
+}
+
+std::optional<DASHWorkSource::ServeTimingSummary> DASHWorkSource::last_serve_timing() const
+{
+    std::lock_guard<std::mutex> lk(serve_timing_mutex_);
+    return last_serve_timing_;
+}
+
+uint64_t DASHWorkSource::serve_timing_lines() const
+{
+    std::lock_guard<std::mutex> lk(serve_timing_mutex_);
+    return serve_timing_lines_;
 }
 
 std::optional<coin::IslockConflict>
