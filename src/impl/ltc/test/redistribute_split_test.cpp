@@ -18,6 +18,8 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <fstream>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -33,6 +35,10 @@
 #include <impl/ltc/share.hpp>
 #include <impl/ltc/share_check.hpp>
 #include <impl/ltc/share_tracker.hpp>
+
+#ifndef C2POOL_IMPL_DIR
+#error "C2POOL_IMPL_DIR must be defined by CMake to the path of src/impl"
+#endif
 
 namespace {
 
@@ -363,4 +369,53 @@ TEST(RedistributeSplit, TheMintedShareRevealsTheDonationItsJobCommittedTo)
     ASSERT_FALSE(wrong.share.IsNull());
     EXPECT_EQ(wrong.donation, 66);
     EXPECT_FALSE(wrong.peers_rebuild) << "a share revealing another donation than its job's ref_hash";
+}
+
+// The main_ltc.cpp call sites that hand the job's donation on cannot be run
+// here (they are lambdas over the live node), so their text is pinned: the
+// ref_hash lambda takes the job's donation and commits the share to
+// core::job_share_donation(share_donation, dev_donation) (its share target
+// sized with the same), the create_share lambda mints with
+// core::job_share_donation(p.share_donation, dev_donation), no site builds
+// the --give-author formula by hand or passes std::nullopt for the job's
+// donation, and the startup passes --node-owner-address before --address
+// (ltc::setup_split_owner, whose precedence TheStartupSetupSplitsOnlyASplit
+// SpecAndPicksTheOwner pins) and runs the spec's fallback weights.
+TEST(RedistributeSplit, MainLtcHandsTheJobsDonationToTheRefHashAndTheShare)
+{
+    std::ifstream in(std::string(C2POOL_IMPL_DIR) + "/../c2pool/main_ltc.cpp");
+    ASSERT_TRUE(in.good());
+    std::stringstream ss;
+    ss << in.rdbuf();
+    std::string src;   // whitespace runs collapsed to one space
+    for (const char ch : ss.str()) {
+        const bool space = ch == ' ' || ch == '\n' || ch == '\t' || ch == '\r';
+        if (space) {
+            if (!src.empty() && src.back() != ' ')
+                src += ' ';
+        } else {
+            src += ch;
+        }
+    }
+    const auto count = [&src](const std::string& needle) {
+        size_t n = 0;
+        for (size_t at = src.find(needle); at != std::string::npos; at = src.find(needle, at + 1))
+            ++n;
+        return n;
+    };
+    EXPECT_EQ(count("const std::vector<uint256>& merkle_branches, const std::optional<uint16_t>& share_donation) "
+                    "-> core::MiningInterface::RefHashResult"), 1u)
+        << "the ref_hash lambda receives the job's donation";
+    EXPECT_EQ(count("params.donation = core::job_share_donation(share_donation, dev_donation);"), 1u);
+    EXPECT_EQ(count("target_in.donation_percent = core::job_share_donation_pct(share_donation, dev_donation);"), 1u);
+    EXPECT_EQ(count("core::job_share_donation(p.share_donation, dev_donation),"), 1u)
+        << "the create_share lambda mints with the job's donation";
+    EXPECT_EQ(count("job_share_donation(std::nullopt"), 0u);
+    EXPECT_EQ(count("job_share_donation_pct(std::nullopt"), 0u);
+    EXPECT_EQ(count("65535.0 * dev_donation"), 0u) << "the --give-author formula is core::job_share_donation's";
+    EXPECT_EQ(count("ltc::setup_split_owner( *web_server.get_mining_interface(), redistribute_mode_str, "
+                    "node_owner_address, payout_address,"), 1u)
+        << "--node-owner-address, then --address";
+    EXPECT_EQ(count("auto hybrid_weights = ltc::split_fallback_weights(ltc::parse_redistribute_spec("
+                    "redistribute_mode_str));"), 1u);
 }
