@@ -52,6 +52,10 @@
 namespace dgb::stratum {
 
 namespace {
+constexpr uint32_t kDogeChainId = 98;   // the DOGE AuxPoW chain id (--merged DOGE:98)
+} // namespace
+
+namespace {
 
 // previousblockhash big-endian display-hex rendering is the dgb::coin SSOT
 // (coin/hash_format.hpp), shared with the embedded work path
@@ -432,6 +436,24 @@ void DGBWorkSource::set_node_owner_fee(double pct, std::vector<unsigned char> sc
     node_owner_script_  = std::move(script);
 }
 
+void DGBWorkSource::set_owner_merged_scripts(
+    std::vector<std::pair<uint32_t, std::vector<unsigned char>>> scripts)
+{
+    std::lock_guard<std::mutex> lk(node_owner_fee_mutex_);
+    owner_merged_scripts_ = std::move(scripts);
+}
+
+std::vector<std::pair<uint32_t, std::vector<unsigned char>>> DGBWorkSource::effective_merged_addrs(
+    const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& miner_merged,
+    const std::vector<unsigned char>& miner_script,
+    const std::vector<unsigned char>& effective_script) const
+{
+    if (effective_script == miner_script)
+        return miner_merged;
+    std::lock_guard<std::mutex> lk(node_owner_fee_mutex_);
+    return owner_merged_scripts_;
+}
+
 // Deterministic per-(tip, connection) node-fee roll — ported verbatim from
 // BTCWorkSource::effective_payout_script. The DGB payout script is derived from
 // the miner's username at BOTH job build (build_connection_coinbase) and submit
@@ -549,8 +571,29 @@ core::stratum::CoinbaseResult DGBWorkSource::build_connection_coinbase(
         }
     }
 
+    // The merged addresses the share commits to (V36 merged_addresses, in its
+    // ref): the miner's, or the owner's on a node-fee job.
+    const auto eff_merged_addrs = effective_merged_addrs(merged_addrs, payout_script, eff_payout_script);
+
+    // The operator's P2SH rule, told to the miner once per payout script: a
+    // P2SH login with DOGE configured and no DOGE address of its own gets no
+    // DOGE (its DOGE share is split node owner / donation).
+    if (mm_manager_ && payout_script.size() == 23 && payout_script[0] == 0xa9 && payout_script[1] == 0x14
+        && payout_script[22] == 0x87 && mm_manager_->has_chain(kDogeChainId)) {
+        bool has_doge = false;
+        for (const auto& [cid, _] : eff_merged_addrs)
+            has_doge = has_doge || cid == kDogeChainId;
+        if (!has_doge) {
+            std::lock_guard<std::mutex> lk(p2sh_warned_mutex_);
+            if (p2sh_warned_.size() < 4096 && p2sh_warned_.insert(payout_script).second)
+                LOG_WARNING << "[DGB-MM] a P2SH login (" << HexStr(Span<const uint8_t>(payout_script.data(), payout_script.size()))
+                            << ") gives no DOGE address: its DOGE share is split between the node owner"
+                               " and the donation. Add ,DOGEADDR or /98:DOGEADDR to the login to receive DOGE.";
+        }
+    }
+
     std::optional<dgb::coin::ConnCoinbasePplnsInputs> inputs =
-        fn(prev_share_hash, extranonce1_hex, eff_payout_script, merged_addrs, aux_mm_scriptsig);
+        fn(prev_share_hash, extranonce1_hex, eff_payout_script, eff_merged_addrs, aux_mm_scriptsig);
     if (!inputs)
         return held();  // producer declined (no or unknown prev share, tracker busy): no job.
 
@@ -592,7 +635,7 @@ nlohmann::json DGBWorkSource::mining_submit(
     const std::string& extranonce1, const std::string& extranonce2,
     const std::string& ntime, const std::string& nonce,
     const std::string& /*request_id*/,
-    const std::map<uint32_t, std::vector<unsigned char>>& /*merged_addresses*/,
+    const std::map<uint32_t, std::vector<unsigned char>>& merged_addresses,
     const core::stratum::JobSnapshot* job)
 {
     // Stage 4d -- the hot path. Reconstruct the 80-byte block header from the
@@ -753,14 +796,24 @@ nlohmann::json DGBWorkSource::mining_submit(
         // → empty → the existing redistribute/empty fallback below; never a
         // wrong-coin payment.
         {
+            // The payout the job's coinbase was built for (the stratum server's
+            // decision, JobSnapshot::payout_script), so the share commits to
+            // the same script the producer did: also for a login whose primary
+            // is a configured merged chain's address (Case 5), which DGB's own
+            // classification below would reject. Jobs that carry no payout
+            // derive it from the username as before.
             std::vector<unsigned char> payout_script;
-            auto amatch = core::classify_address_for_coin(
-                username, dgb::address_acceptance(is_testnet_, is_regtest_),
-                payout_script);
-            if (amatch == core::AddressCoinMatch::Foreign)
-                LOG_WARNING << "[DGB-STRATUM] REJECTED foreign-coin payout address "
-                               "(user=" << username << ") — not a DGB address; "
-                               "refusing to misdirect funds";
+            if (job->has_payout) {
+                payout_script = job->payout_script;
+            } else {
+                auto amatch = core::classify_address_for_coin(
+                    username, dgb::address_acceptance(is_testnet_, is_regtest_),
+                    payout_script);
+                if (amatch == core::AddressCoinMatch::Foreign)
+                    LOG_WARNING << "[DGB-STRATUM] REJECTED foreign-coin payout address "
+                                   "(user=" << username << ") — not a DGB address; "
+                                   "refusing to misdirect funds";
+            }
             // Node-owner fee (p2pool -f/--fee): substitute the owner's payout
             // identity for ~fee% of shares, deterministically on (prev_share,
             // extranonce1, miner_script) so this matches build_connection_coinbase
@@ -771,6 +824,11 @@ nlohmann::json DGBWorkSource::mining_submit(
             // is untouched. Default (fee 0) => byte-identical to before.
             in.payout_script =
                 effective_payout_script(payout_script, job->prev_share_hash, extranonce1);
+            // The merged scripts the job committed to (the map is ordered by
+            // chain id, as the producer received them), after the node-fee rule.
+            const std::vector<std::pair<uint32_t, std::vector<unsigned char>>> job_merged(
+                merged_addresses.begin(), merged_addresses.end());
+            in.merged_addrs = effective_merged_addrs(job_merged, payout_script, in.payout_script);
         }
         // Redistribute V2 (#307): a miner with empty/broken stratum creds
         // yields no payout script. When the operator opted into a

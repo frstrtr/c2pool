@@ -140,6 +140,16 @@ inline uint256 mint_local_share_at_frozen_version(
     uint32_t f_absheight = 0, f_max_bits = 0, f_bits = 0, f_timestamp = 0;
     uint128 f_abswork;
     uint256 f_far, f_merged_payout_hash;
+    std::vector<MergedAddressEntry> merged_addrs;
+    if constexpr (requires { in.merged_addrs; }) {
+        merged_addrs.reserve(in.merged_addrs.size());
+        for (const auto& [chain_id, script] : in.merged_addrs) {
+            MergedAddressEntry e;
+            e.m_chain_id = chain_id;
+            e.m_script.m_data = script;
+            merged_addrs.push_back(std::move(e));
+        }
+    }
     if constexpr (requires { in.has_frozen; in.actual_coinbase; }) {
         actual_coinbase = in.actual_coinbase;
         has_frozen = in.has_frozen;
@@ -159,7 +169,7 @@ inline uint256 mint_local_share_at_frozen_version(
         in.subsidy, in.prev_share, in.merkle_branches,
         in.payout_script,
         donation,
-        std::vector<MergedAddressEntry>{},
+        merged_addrs,                        // the job's merged addresses (V36 shares carry them)
         StaleInfo::none,
         /*segwit_active=*/false,             // producer emits non-segwit coinbase
         std::string{},                       // witness_commitment_hex

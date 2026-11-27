@@ -49,6 +49,7 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <set>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -119,6 +120,10 @@ public:
         uint32_t                   frozen_bits = 0;
         uint32_t                   frozen_timestamp = 0;
         uint256                    frozen_merged_payout_hash;
+        /// The merged-chain scripts the job's coinbase committed to (V36
+        /// merged_addresses, in the producer's order), after the node-fee rule
+        /// (effective_merged_addrs): the share carries exactly these.
+        std::vector<std::pair<uint32_t, std::vector<unsigned char>>> merged_addrs;
     };
 
     /// Callback invoked when `mining_submit` validates a submission whose
@@ -345,6 +350,11 @@ public:
     /// fee). Ported from BTCWorkSource::set_node_owner_fee.
     void set_node_owner_fee(double pct, std::vector<unsigned char> script);
 
+    /// The node owner's merged-chain scripts (chain id -> script), written
+    /// into the owner's node-fee shares instead of the miner's merged
+    /// addresses. Empty (default): such shares carry no merged address.
+    void set_owner_merged_scripts(std::vector<std::pair<uint32_t, std::vector<unsigned char>>> scripts);
+
 private:
     /// Resolve the effective payout script for a job/share: the node owner's
     /// script with probability node_owner_fee_pct_%, else the miner's own
@@ -357,6 +367,17 @@ private:
         const std::vector<unsigned char>& miner_script,
         const uint256& prev_share_hash,
         const std::string& extranonce1_hex) const;
+
+    /// The merged addresses a job/share commits to: the miner's, unless the
+    /// node fee substituted the owner's payout (effective != miner script),
+    /// then the owner's merged scripts (set_owner_merged_scripts; none: no
+    /// merged address). A node-fee share therefore never ties the owner's
+    /// parent script to a miner's DOGE script (the tracker's per-miner merged
+    /// address table would then pay that miner for the owner's other shares).
+    std::vector<std::pair<uint32_t, std::vector<unsigned char>>> effective_merged_addrs(
+        const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& miner_merged,
+        const std::vector<unsigned char>& miner_script,
+        const std::vector<unsigned char>& effective_script) const;
 
     // External dependencies (non-owning references)
     c2pool::dgb::HeaderChain&   chain_;
@@ -405,6 +426,10 @@ private:
     mutable std::mutex          node_owner_fee_mutex_;
     double                      node_owner_fee_pct_{0.0};
     std::vector<unsigned char>  node_owner_script_;
+    std::vector<std::pair<uint32_t, std::vector<unsigned char>>> owner_merged_scripts_;
+    // P2SH payout scripts already told about the DOGE split (bounded).
+    mutable std::mutex                          p2sh_warned_mutex_;
+    mutable std::set<std::vector<unsigned char>> p2sh_warned_;
 
     // Per-connection coinbase PPLNS-inputs producer (#327/#330 live-wire).
     // Empty until set_pplns_inputs_fn() bound in main_dgb; while empty the

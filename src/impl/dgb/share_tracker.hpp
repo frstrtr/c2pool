@@ -2806,6 +2806,11 @@ public:
     // (c2pool_refactored.cpp); never invoked from share verification. Peers validate
     // the merged commitment via the AuxPoW merkle proof, NOT by re-deriving these
     // outputs, so output ordering is node-local (dogecoind accepts any valid order).
+    //
+    // `resolve` (optional, node-local): maps a weight key to the script its
+    // amount is paid to instead of resolve_merged_payout_script (an empty
+    // result still means unconvertible). Only the key -> script mapping
+    // changes; the arithmetic below is the same for every caller.
     std::map<std::vector<unsigned char>, uint64_t>
     get_merged_expected_payouts(const uint256& best_share_hash,
                                 const uint256& block_target,
@@ -2813,7 +2818,9 @@ public:
                                 uint32_t chain_id,
                                 const std::vector<unsigned char>& donation_script,
                                 const std::vector<unsigned char>& operator_ltc_script = {},
-                                const std::vector<unsigned char>& operator_merged_script = {})
+                                const std::vector<unsigned char>& operator_merged_script = {},
+                                const std::function<std::vector<unsigned char>(const std::vector<unsigned char>&)>&
+                                    resolve = {})
     {
         auto chain_len = std::min(chain.get_height(best_share_hash),
                                   static_cast<int32_t>(PoolConfig::real_chain_length()));
@@ -2855,6 +2862,8 @@ public:
             std::vector<unsigned char> script;
             if (!operator_ltc_script.empty() && !operator_merged_script.empty() && key == operator_ltc_script) {
                 script = operator_merged_script;
+            } else if (resolve) {
+                script = resolve(key);
             } else {
                 script = resolve_merged_payout_script(key);
             }

@@ -164,7 +164,7 @@ void print_banner(const char* argv0, const core::CoinParams& p)
         << " [--version] [--help] [--selftest] [--run] [--stratum [H:]P] [--http [H:]P]\n"
         << "       [--coin-daemon H:P] [--coin-magic HEX] [--regtest]\n"
         << "       [--regtest-force-won-share] [--no-p2p-relay]\n"
-        << "       [--redistribute SPEC] [--node-owner-address ADDR]\n"
+        << "       [--redistribute SPEC] [--node-owner-address ADDR] [--node-owner-merged-address DOGEADDR]\n"
         << "       [--give-author PCT] [-f|--fee PCT]\n"
         << "       [--sharechain-port P] [--sharechain-addnode HOST:PORT ...]\n"
         << "       [--embedded-serve-mempool-txs[=true|false]]\n"
@@ -284,7 +284,11 @@ int run_node(const core::CoinParams& params, bool testnet,
              // historical behavior of dialing --coin-daemon own :PORT; >0 makes this
              // the authoritative P2P dial port so --coin-daemon may carry the RPC
              // :PORT while the embedded coin-P2P still reaches the real parent P2P port.
-             int coind_p2p_port = -1)
+             int coind_p2p_port = -1,
+             // --node-owner-merged-address / --merged-operator-address (LTC's
+             // spelling): the node owner's DOGE address, for the owner half of
+             // the P2SH split and the owner's node-fee shares (doge_owner_script).
+             const std::string& node_owner_merged_address = "")
 {
     io::io_context ioc;
 
@@ -1584,7 +1588,27 @@ int run_node(const core::CoinParams& params, bool testnet,
     // wiring on the DGB node (aux_doge_payout_provider.hpp
     // wire_doge_merged_payouts). Null mm_manager (no --merged) => nothing bound
     // => standalone DGB byte-identical.
-    if (dgb::coin::wire_doge_merged_payouts(mm_manager.get(), p2p_node, work_source.get()))
+    //
+    // The operator's P2SH rule (aux_doge_payout_provider.hpp DogeP2shSplit): a
+    // P2SH parent key with no DOGE address of its own is paid half to the node
+    // owner's DOGE script, half to the donation. The owner's DOGE script:
+    // --node-owner-merged-address, else the --node-owner-address key when it
+    // is a DGB P2PKH/P2WPKH, else none (that half goes to the donation). The
+    // owner's node-fee shares carry it as their merged address.
+    std::shared_ptr<const dgb::coin::DogeP2shSplit> doge_p2sh_split;
+    if (mm_manager) {
+        std::string owner_src;
+        auto owner_doge = dgb::coin::doge_owner_script(node_owner_address, node_owner_merged_address,
+                                                       testnet, regtest, owner_src);
+        std::cout << "[DGB-MM] DOGE owner script for the P2SH split and node-fee shares: "
+                  << (owner_doge.empty() ? std::string("none, the donation") : HexStr(Span<const unsigned char>(owner_doge.data(), owner_doge.size())))
+                  << " (" << owner_src << ")" << std::endl;
+        if (node_owner_fee > 0.0 && !owner_doge.empty())
+            work_source->set_owner_merged_scripts({{dgb::coin::DOGE_AUX_CHAIN_ID, owner_doge}});
+        doge_p2sh_split = std::make_shared<const dgb::coin::DogeP2shSplit>(
+            dgb::coin::DogeP2shSplit{std::move(owner_doge)});
+    }
+    if (dgb::coin::wire_doge_merged_payouts(mm_manager.get(), p2p_node, work_source.get(), doge_p2sh_split))
         std::cout << "[DGB-MM] DOGE payout provider + work-change hook wired ("
                   << mm_manager->chain_count() << " aux chain(s))" << std::endl;
 #endif // AUX_DOGE
@@ -2765,6 +2789,7 @@ int main(int argc, char** argv)
     std::string rpc_conf_path;              // --coin-rpc-auth PATH to digibyte.conf (creds source)
     std::string redistribute_spec;         // --redistribute SPEC (node-local payout policy, #307)
     std::string node_owner_address;        // --node-owner-address ADDR (operator payout identity for --redistribute fee, #307; also -f/--fee destination)
+    std::string node_owner_merged_address; // --node-owner-merged-address / --merged-operator-address DOGEADDR (LTC spelling)
     // Author/dev donation + node-owner fee (ported from BTC/DASH). The built-in
     // author default is HARD-PINNED at 0.1% (core::kAuthorFeeDefaultPct → u16 66);
     // --give-author overrides the AMOUNT only. Node-owner fee defaults 0 (off).
@@ -2891,6 +2916,10 @@ int main(int argc, char** argv)
         }
         else if (std::strcmp(argv[i], "--node-owner-address") == 0 && i + 1 < argc) {
             node_owner_address = argv[++i];    // operator payout addr -> "fee" identity (#307 fee arm + -f/--fee destination)
+        }
+        else if ((std::strcmp(argv[i], "--node-owner-merged-address") == 0
+                  || std::strcmp(argv[i], "--merged-operator-address") == 0) && i + 1 < argc) {
+            node_owner_merged_address = argv[++i];   // the owner's DOGE address (P2SH split owner half, node-fee shares)
         }
         else if ((std::strcmp(argv[i], "--give-author") == 0
                   || std::strcmp(argv[i], "--dev-donation") == 0) && i + 1 < argc) {
@@ -3027,6 +3056,8 @@ int main(int argc, char** argv)
         if (rc.file_set("sharechain.no_p2p_relay") && rc.get_string("sharechain.no_p2p_relay").value_or("") == "true") no_p2p_relay = true;
         if (rc.file_set("money.redistribute"))       redistribute_spec  = rc.get_string("money.redistribute").value_or(redistribute_spec);
         if (rc.file_set("money.node_owner_address")) node_owner_address = rc.get_string("money.node_owner_address").value_or(node_owner_address);
+        if (rc.file_set("money.merged_operator_address"))
+            node_owner_merged_address = rc.get_string("money.merged_operator_address").value_or(node_owner_merged_address);
         if (rc.file_set("money.give_author_pct"))    dev_donation       = rc.get_double("money.give_author_pct").value_or(dev_donation);
         if (rc.file_set("money.node_owner_fee_pct")) node_owner_fee     = rc.get_double("money.node_owner_fee_pct").value_or(node_owner_fee);
         // embedded.serve_mempool_txs (S1 fee-proof lane): a [dgb] settings-file
@@ -3064,7 +3095,8 @@ int main(int argc, char** argv)
                         embedded_doge,
                         serve_mempool_txs, serve_mempool_txs_off,
                         sharechain_addnodes,
-                        coind_p2p_port);
+                        coind_p2p_port,
+                        node_owner_merged_address);
 
     // --selftest, or a bare invocation: drive the live score path so the
     // binary exercises real consensus code, then exit cleanly.

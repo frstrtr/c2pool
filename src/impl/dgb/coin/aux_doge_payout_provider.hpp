@@ -29,6 +29,8 @@
 // ---------------------------------------------------------------------------
 
 #include <impl/dgb/config_pool.hpp>          // dgb::PoolConfig::get_donation_script
+#include <impl/dgb/address_encoding.hpp>     // dgb::address_acceptance (owner's DGB address)
+#include <impl/dgb/share_check.hpp>          // resolve_merged_payout_script, is_merged_key
 
 #include <c2pool/merged/aux_chain_params.hpp> // find_aux_chain_params (DOGE version bytes)
 #include <c2pool/merged/merged_mining.hpp>    // MergedMiningManager::PayoutProvider, note_payout_*
@@ -43,6 +45,8 @@
 #include <cstdint>
 #include <exception>
 #include <map>
+#include <memory>
+#include <functional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -86,12 +90,76 @@ inline std::string doge_fallback_payout_address(bool testnet)
                                    v.p2pkh.front(), v.p2sh.front());
 }
 
+/// Operator rule, 2026-11-27 ("honest split + warning"). Node-local, on the
+/// DOGE payout path only; DGB consensus, share content and merged_payout_hash
+/// are unchanged.
+///
+/// Rule: a share whose DGB payout key is a P2SH (any "S...") and that names no
+/// DOGE address of its own (no Tier-1 merged address) is not paid as the same
+/// P2SH on DOGE. A DigiByte Core p2sh-segwit address is P2SH(0014<keyhash>),
+/// which becomes spendable by anyone on DOGE (no segwit) once a DGB spend
+/// reveals the redeem script. That key's DOGE amount `a` is paid as:
+///   - owner    = floor(a / 2) to the node owner's DOGE script;
+///   - donation = a - owner (the odd satoshi) to the donation script;
+///   - all of it to the donation when no owner script is set, or when the
+///     owner part rounds to 0 (a == 1): never a 0-value output.
+/// Both parts merge into existing outputs for the same scripts. The >= 1 sat
+/// donation rule still holds, because the donation only grows. The sum is
+/// unchanged. An explicit DOGE address always wins; P2PKH, P2WPKH and every
+/// other key are paid as before.
+struct DogeP2shSplit {
+    std::vector<unsigned char> owner_script;   // empty: the whole amount to the donation
+};
+
+namespace detail {
+// A P2SH weight key's internal placeholder while the split is computed (never
+// a script: the leading 0xff opcode is invalid, and the key follows).
+inline const std::vector<unsigned char>& p2sh_split_tag()
+{
+    static const std::vector<unsigned char> t{0xff, 'p', '2', 's', 'h', '-', 's', 'p', 'l', 'i', 't'};
+    return t;
+}
+inline bool is_p2sh_script(const std::vector<unsigned char>& s)
+{
+    return s.size() == 23 && s[0] == 0xa9 && s[1] == 0x14 && s[22] == 0x87;
+}
+} // namespace detail
+
+/// Applies the split to the payouts of get_merged_expected_payouts called with
+/// the split resolver (keys tagged by detail::p2sh_split_tag).
+inline void apply_doge_p2sh_split(std::map<std::vector<unsigned char>, uint64_t>& payouts,
+                                  const DogeP2shSplit& rule,
+                                  const std::vector<unsigned char>& donation_script)
+{
+    const auto& tag = detail::p2sh_split_tag();
+    uint64_t to_donation = 0;
+    std::map<std::vector<unsigned char>, uint64_t> to_owner;
+    for (auto it = payouts.begin(); it != payouts.end();) {
+        if (it->first.size() > tag.size() && std::equal(tag.begin(), tag.end(), it->first.begin())) {
+            const uint64_t a = it->second;
+            const uint64_t owner = rule.owner_script.empty() ? 0 : a / 2;
+            if (owner > 0)
+                to_owner[rule.owner_script] += owner;
+            to_donation += a - owner;
+            it = payouts.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    for (const auto& [script, amount] : to_owner)
+        payouts[script] += amount;
+    if (to_donation > 0)
+        payouts[donation_script] += to_donation;
+}
+
 /// The DOGE coinbase split at `best` for `chain_id`: the share chain's PPLNS
 /// merged payouts, sorted, zero-amount entries dropped. Empty (with `miss`
-/// set) when there is nothing to split at.
+/// set) when there is nothing to split at. With `p2sh_split`, the operator's
+/// P2SH rule above applies.
 template <typename TrackerT>
 DogePayouts doge_merged_payouts(TrackerT& tracker, const uint256& best, uint32_t chain_id,
-                                uint64_t coinbase_value, std::string& miss)
+                                uint64_t coinbase_value, std::string& miss,
+                                const DogeP2shSplit* p2sh_split = nullptr)
 {
     if (best.IsNull()) {
         miss = "no_best_share";
@@ -112,14 +180,29 @@ DogePayouts doge_merged_payouts(TrackerT& tracker, const uint256& best, uint32_t
     // builder puts that script last).
     const auto donation_script = dgb::PoolConfig::get_donation_script(36);
     std::map<std::vector<unsigned char>, uint64_t> payouts_map;
+    // The split rule's resolver: a P2SH parent key (not a Tier-1 merged
+    // address) gets a placeholder of its own, so its amount is never merged
+    // with an explicit DOGE address's before the split.
+    std::function<std::vector<unsigned char>(const std::vector<unsigned char>&)> resolve;
+    if (p2sh_split)
+        resolve = [](const std::vector<unsigned char>& key) -> std::vector<unsigned char> {
+            if (!is_merged_key(key) && detail::is_p2sh_script(key)) {
+                std::vector<unsigned char> t = detail::p2sh_split_tag();
+                t.insert(t.end(), key.begin(), key.end());
+                return t;
+            }
+            return resolve_merged_payout_script(key);
+        };
     try {
         payouts_map = tracker.get_merged_expected_payouts(best, block_target, coinbase_value, chain_id,
-                                                          donation_script, {}, {});
+                                                          donation_script, {}, {}, resolve);
     } catch (const std::exception& e) {
         LOG_WARNING << "[DGB-MM] get_merged_expected_payouts threw: " << e.what();
         miss = "payouts_threw";
         return {};
     }
+    if (p2sh_split)
+        apply_doge_p2sh_split(payouts_map, *p2sh_split, donation_script);
     // Map order: sorted by script, each script once (the sorted list the
     // provider contract asks for, without a re-sort).
     DogePayouts result;
@@ -132,6 +215,60 @@ DogePayouts doge_merged_payouts(TrackerT& tracker, const uint256& best, uint32_t
     return result;
 }
 
+/// The node owner's DOGE script, for the P2SH split's owner half (and the
+/// operator's own shares). The rule C2POOL gave the LTC lane:
+///   - an explicit DOGE address (--node-owner-merged-address /
+///     --merged-operator-address) when it is a DOGE address of this network;
+///   - else the owner's DGB key as a DOGE P2PKH, when --node-owner-address is
+///     a DGB P2PKH or P2WPKH (the same hash160);
+///   - else (P2SH owner, no owner, unusable address) empty: the donation.
+/// `source` names the choice for the log.
+inline std::vector<unsigned char> doge_owner_script(const std::string& owner_dgb_address,
+                                                    const std::string& owner_doge_address,
+                                                    bool testnet, bool regtest, std::string& source)
+{
+    if (!owner_doge_address.empty()) {
+        if (const auto* p = c2pool::merged::find_aux_chain_params("DOGE")) {
+            const auto v = c2pool::merged::aux_accepted_versions(
+                *p, testnet || regtest ? c2pool::merged::AuxNetwork::testnet : c2pool::merged::AuxNetwork::mainnet);
+            std::vector<unsigned char> script;
+            if (core::classify_address_for_coin(owner_doge_address, v.p2pkh, v.p2sh, v.hrps, script)
+                    == core::AddressCoinMatch::Own
+                && !script.empty()) {
+                source = "--node-owner-merged-address";
+                return script;
+            }
+        }
+        source = "donation (--node-owner-merged-address " + owner_doge_address
+                 + " is not a DOGE address of this network)";
+        return {};
+    }
+    std::vector<unsigned char> dgb_script;
+    if (!owner_dgb_address.empty()
+        && core::classify_address_for_coin(owner_dgb_address, dgb::address_acceptance(testnet, regtest), dgb_script)
+               == core::AddressCoinMatch::Own) {
+        const bool p2pkh = dgb_script.size() == 25 && dgb_script[0] == 0x76 && dgb_script[1] == 0xa9;
+        const bool p2wpkh = dgb_script.size() == 22 && dgb_script[0] == 0x00 && dgb_script[1] == 0x14;
+        if (p2pkh) {
+            source = "--node-owner-address key (P2PKH)";
+            return dgb_script;
+        }
+        if (p2wpkh) {
+            std::vector<unsigned char> s{0x76, 0xa9, 0x14};
+            s.insert(s.end(), dgb_script.begin() + 2, dgb_script.end());
+            s.push_back(0x88);
+            s.push_back(0xac);
+            source = "--node-owner-address key (P2WPKH as P2PKH)";
+            return s;
+        }
+        source = "donation (the --node-owner-address is not P2PKH/P2WPKH; set --node-owner-merged-address)";
+        return {};
+    }
+    source = owner_dgb_address.empty() ? "donation (no --node-owner-address)"
+                                       : "donation (--node-owner-address is not a DGB address)";
+    return {};
+}
+
 /// The provider main_dgb registers with the merged-mining manager. NodeT is
 /// dgb::NodeImpl (best_share_hash(), read_tracker()); the tracker lock is
 /// only tried, never waited for: a busy tracker is a "tracker_busy" miss
@@ -142,9 +279,10 @@ DogePayouts doge_merged_payouts(TrackerT& tracker, const uint256& best, uint32_t
 /// prev share, and a basis would make a busy-tracker rebuild after a best
 /// share move drop the DOGE commitment instead of keeping the last block.
 template <typename NodeT>
-c2pool::merged::MergedMiningManager::PayoutProvider make_doge_payout_provider(NodeT* node)
+c2pool::merged::MergedMiningManager::PayoutProvider make_doge_payout_provider(
+    NodeT* node, std::shared_ptr<const DogeP2shSplit> p2sh_split = std::make_shared<const DogeP2shSplit>())
 {
-    return [node](uint32_t chain_id, uint64_t coinbase_value) -> DogePayouts {
+    return [node, p2sh_split](uint32_t chain_id, uint64_t coinbase_value) -> DogePayouts {
         using c2pool::merged::MergedMiningManager;
         if (!node) {
             MergedMiningManager::note_payout_miss("no_node");
@@ -161,7 +299,7 @@ c2pool::merged::MergedMiningManager::PayoutProvider make_doge_payout_provider(No
             return {};
         }
         std::string miss;
-        auto result = doge_merged_payouts(*guard, best, chain_id, coinbase_value, miss);
+        auto result = doge_merged_payouts(*guard, best, chain_id, coinbase_value, miss, p2sh_split.get());
         if (result.empty())
             MergedMiningManager::note_payout_miss(miss.empty() ? "empty" : miss);
         return result;
@@ -181,7 +319,8 @@ c2pool::merged::MergedMiningManager::PayoutProvider make_doge_payout_provider(No
 /// best-change hook (best_share_cell.hpp wire_best_share, also_on_best), not
 /// here: on_best_share_changed is a single slot.
 template <typename NodeT, typename WorkSourceT>
-bool wire_doge_merged_payouts(c2pool::merged::MergedMiningManager* mm, NodeT& node, WorkSourceT* ws)
+bool wire_doge_merged_payouts(c2pool::merged::MergedMiningManager* mm, NodeT& node, WorkSourceT* ws,
+                              std::shared_ptr<const DogeP2shSplit> p2sh_split = nullptr)
 {
     if (!mm)
         return false;
@@ -191,7 +330,8 @@ bool wire_doge_merged_payouts(c2pool::merged::MergedMiningManager* mm, NodeT& no
         if (ws)
             ws->bump_work_generation();
     });
-    mm->set_payout_provider(make_doge_payout_provider(&node));
+    mm->set_payout_provider(make_doge_payout_provider(
+        &node, p2sh_split ? std::move(p2sh_split) : std::make_shared<const DogeP2shSplit>()));
     mm->mark_pplns_dirty();
     return true;
 }

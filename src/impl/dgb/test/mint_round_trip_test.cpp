@@ -129,6 +129,8 @@ struct RtRig {
     std::unique_ptr<dgb::stratum::DGBWorkSource> ws;
     int64_t mint_version = 36;
     std::optional<dgb::coin::ConnCoinbasePplnsInputs> last_inputs;
+    Bytes last_payout;                                   // what the producer was handed
+    std::vector<std::pair<uint32_t, Bytes>> last_merged;
     uint256 minted;
 
     RtRig()
@@ -146,6 +148,8 @@ struct RtRig {
             req.now = chain.tip_ts + 15;
             req.donation = 66;
             req.aux_mm_scriptsig = aux;
+            last_payout = payout;
+            last_merged = merged;
             last_inputs = dgb::build_conn_job_inputs(chain.tracker, params, req, [this]() {
                 return std::pair<int64_t, uint64_t>{mint_version, 36};
             });
@@ -161,10 +165,16 @@ struct RtRig {
         });
     }
 
-    // The job core::StratumServer would freeze from this coinbase result.
-    core::stratum::JobSnapshot job(const core::stratum::CoinbaseResult& cbr, uint32_t share_bits)
+    // The job core::StratumServer would freeze from this coinbase result
+    // (with `payout`: the payout the stratum server committed the job to).
+    core::stratum::JobSnapshot job(const core::stratum::CoinbaseResult& cbr, uint32_t share_bits,
+                                   const Bytes* payout = nullptr)
     {
         core::stratum::JobSnapshot j;
+        if (payout) {
+            j.has_payout = true;
+            j.payout_script = *payout;
+        }
         j.coinb1 = cbr.coinb1;
         j.coinb2 = cbr.coinb2;
         j.gbt_prevhash = std::string(56, '0') + "0badf00d";
@@ -485,4 +495,117 @@ TEST(DgbMintRoundTrip, CommitmentAppendedAfterTheRefIsNotCredited)
             matched = dgb::generate_share_transaction(*s, rig.chain.tracker, rig.params, false, true) == cb_txid;
         });
     EXPECT_FALSE(matched) << "the late splice matched the share's ref";
+}
+
+namespace {
+
+// Submits one share on `j` for `login`; returns the minted share's merged
+// addresses and payout script (the share must exist).
+struct Minted {
+    bool ok = false;
+    std::vector<std::pair<uint32_t, Bytes>> merged;
+    bool gentx_ok = false;
+};
+
+Minted submit_and_read(RtRig& rig, core::stratum::JobSnapshot& j, const std::string& login,
+                       const std::map<uint32_t, Bytes>& job_merged, int64_t ver)
+{
+    Minted m;
+    const std::string en1 = "cafef00d", en2 = "0000002a", ntime = "6a1b2c3d", nonce = "00c0ffee";
+    Bytes coinbase;
+    const Bytes header = miner_header(j, en1, en2, ntime, nonce, &coinbase);
+    auto r = rig.ws->mining_submit(login, "job", en1, en2, ntime, nonce, "rid", job_merged, &j);
+    if (!(r.is_boolean() && r.get<bool>()) || rig.minted.IsNull())
+        return m;
+    if (rig.minted != Hash(std::span<const unsigned char>(header.data(), header.size())))
+        return m;
+    m.ok = true;
+    const uint256 cb_txid = Hash(std::span<const unsigned char>(coinbase.data(), coinbase.size()));
+    rig.chain.tracker.chain.get(rig.minted).share.invoke([&](auto* s) {
+        if constexpr (requires { s->m_merged_addresses; })
+            for (const auto& e : s->m_merged_addresses)
+                m.merged.emplace_back(e.m_chain_id, e.m_script.m_data);
+        m.gentx_ok = dgb::generate_share_transaction(*s, rig.chain.tracker, rig.params, false,
+                                                     core::version_gate::is_v36_active(ver)) == cb_txid;
+    });
+    return m;
+}
+
+Bytes doge_x() { Bytes s{0x76, 0xa9, 0x14}; s.insert(s.end(), 20, 0x5c); s.push_back(0x88); s.push_back(0xac); return s; }
+
+} // namespace
+
+// An explicit DOGE address reaches the share: the job's merged scripts are the
+// ones the mint stamps (V36 merged_addresses), and the share still matches.
+TEST(DgbMintRoundTrip, ExplicitDogeAddressReachesTheShare)
+{
+    for (int64_t ver : {int64_t(35), int64_t(36)}) {
+        SCOPED_TRACE(ver);
+        RtRig rig;
+        rig.mint_version = ver;
+        const Bytes payout = stratum_payout(miner_login());
+        const std::vector<std::pair<uint32_t, Bytes>> merged{{98, doge_x()}};
+        auto cbr = rig.ws->build_connection_coinbase(rig.chain.tip, "cafef00d", payout, merged);
+        ASSERT_FALSE(cbr.coinb1.empty());
+        EXPECT_EQ(rig.last_merged, merged);
+        auto j = rig.job(cbr, 0x2100ffffu, &payout);
+        const auto m = submit_and_read(rig, j, miner_login(), {{98, doge_x()}}, ver);
+        ASSERT_TRUE(m.ok) << "the local share was not credited";
+        EXPECT_TRUE(m.gentx_ok) << "a peer would reject this share";
+        if (ver >= 36)
+            EXPECT_EQ(m.merged, merged) << "the explicit DOGE address did not reach the share";
+    }
+}
+
+// A node-fee job (the owner's payout substituted) carries the owner's merged
+// scripts, never the miner's: else the tracker would tie the owner's parent
+// script to the miner's DOGE script for every owner share.
+TEST(DgbMintRoundTrip, NodeFeeJobCarriesTheOwnersMergedScripts)
+{
+    Bytes owner{0x76, 0xa9, 0x14};
+    owner.insert(owner.end(), 20, 0x0e);
+    owner.push_back(0x88);
+    owner.push_back(0xac);
+    const Bytes owner_doge = owner;   // the owner's key as a DOGE P2PKH
+    for (bool with_owner_merged : {true, false}) {
+        SCOPED_TRACE(with_owner_merged);
+        RtRig rig;
+        rig.ws->set_node_owner_fee(100.0, owner);
+        if (with_owner_merged)
+            rig.ws->set_owner_merged_scripts({{98, owner_doge}});
+        const Bytes payout = stratum_payout(miner_login());
+        const std::vector<std::pair<uint32_t, Bytes>> miner_merged{{98, doge_x()}};
+        auto cbr = rig.ws->build_connection_coinbase(rig.chain.tip, "cafef00d", payout, miner_merged);
+        ASSERT_FALSE(cbr.coinb1.empty());
+        ASSERT_EQ(rig.last_payout, owner) << "not a node-fee job";
+        const std::vector<std::pair<uint32_t, Bytes>> want =
+            with_owner_merged ? std::vector<std::pair<uint32_t, Bytes>>{{98, owner_doge}}
+                              : std::vector<std::pair<uint32_t, Bytes>>{};
+        EXPECT_EQ(rig.last_merged, want);
+        auto j = rig.job(cbr, 0x2100ffffu, &payout);
+        const auto m = submit_and_read(rig, j, miner_login(), {{98, doge_x()}}, 36);
+        ASSERT_TRUE(m.ok);
+        EXPECT_TRUE(m.gentx_ok);
+        EXPECT_EQ(m.merged, want) << "the miner's DOGE address landed on the owner's share";
+    }
+}
+
+// A login whose primary is a configured merged chain's address (Case 5, a
+// DOGE "A..."): the job pays its key on DGB, and the mint now uses the job's
+// payout, so the share is credited (DGB's own classification rejected it).
+TEST(DgbMintRoundTrip, DogePrimaryLoginIsCreditedFromTheJobPayout)
+{
+    Bytes doge_p2sh{0xa9, 0x14};
+    doge_p2sh.insert(doge_p2sh.end(), 20, 0x2d);
+    doge_p2sh.push_back(0x87);
+    const std::string login = core::script_to_address(doge_p2sh, "", 30, 22);
+    const Bytes payout = core::address_to_script(login);   // what the stratum server builds for it
+    ASSERT_EQ(payout, doge_p2sh);
+    RtRig rig;
+    auto cbr = rig.ws->build_connection_coinbase(rig.chain.tip, "cafef00d", payout, {});
+    ASSERT_FALSE(cbr.coinb1.empty());
+    auto j = rig.job(cbr, 0x2100ffffu, &payout);
+    const auto m = submit_and_read(rig, j, login, {}, 36);
+    ASSERT_TRUE(m.ok) << "the DOGE-primary login was not credited";
+    EXPECT_TRUE(m.gentx_ok);
 }
