@@ -592,8 +592,39 @@ core::stratum::CoinbaseResult DGBWorkSource::build_connection_coinbase(
         }
     }
 
+    // The block this job is for, from ONE template: the producer builds the
+    // coinbase for its height, bits and value, and the job carries that
+    // template's header (snapshot.has_header), so the share's header bits, the
+    // PPLNS walk's block target and the coinbase value all belong to the block
+    // the miner hashes. Before, the producer took the block bits from the PREV
+    // share's header and the value from subsidy(share absheight): every
+    // coinbase claimed the subsidy of a block height ~20M lower (a won block
+    // was bad-cb-amount), and the walk's cap differed from the verifier's.
+    // A DGB job carries no transactions (no merkle branches, no tx_data), so
+    // its coinbase may claim the subsidy alone: fees of transactions the block
+    // does not include are never claimed.
+    const nlohmann::json tmpl = get_current_work_template();
+    JobBlock block;
+    std::string tmpl_prev, tmpl_bits;
+    try {
+        if (!tmpl.is_object() || !tmpl.contains("height") || !tmpl.contains("bits")
+            || !tmpl.contains("previousblockhash"))
+            return held();  // no template (window not filled / no tip): no job.
+        block.height = tmpl["height"].get<uint32_t>();
+        tmpl_bits    = tmpl["bits"].get<std::string>();
+        tmpl_prev    = tmpl["previousblockhash"].get<std::string>();
+        if (tmpl_bits.size() != 8 || tmpl_prev.size() != 64)
+            return held();
+        block.bits = static_cast<uint32_t>(std::stoul(tmpl_bits, nullptr, 16));
+    } catch (const std::exception&) {
+        return held();
+    }
+    if (block.bits == 0)
+        return held();
+    block.value = coinbase_value(block.height, /*total_fees=*/0, /*gbt_coinbasevalue=*/std::nullopt);
+
     std::optional<dgb::coin::ConnCoinbasePplnsInputs> inputs =
-        fn(prev_share_hash, extranonce1_hex, eff_payout_script, eff_merged_addrs, aux_mm_scriptsig);
+        fn(prev_share_hash, extranonce1_hex, eff_payout_script, eff_merged_addrs, aux_mm_scriptsig, block);
     if (!inputs)
         return held();  // producer declined (no or unknown prev share, tracker busy): no job.
 
@@ -623,6 +654,13 @@ core::stratum::CoinbaseResult DGBWorkSource::build_connection_coinbase(
     out.snapshot.frozen_ref.bits               = inputs->frozen_bits;
     out.snapshot.frozen_ref.timestamp          = inputs->frozen_timestamp;
     out.snapshot.frozen_ref.merged_payout_hash = inputs->frozen_merged_payout_hash;
+    // The job's header is the template the coinbase was built for.
+    out.snapshot.has_header      = true;
+    out.snapshot.gbt_prevhash    = tmpl_prev;
+    out.snapshot.header_version  = static_cast<uint32_t>(tmpl.value("version", 0x20000000));
+    out.snapshot.block_nbits_hex = tmpl_bits;
+    out.snapshot.curtime         = static_cast<uint32_t>(tmpl.value("curtime", 0));
+    out.snapshot.height          = block.height;
     return out;
 }
 

@@ -948,11 +948,14 @@ TEST(DgbWorkSource, ConnectionCoinbaseDelegatesToPplnsSsotByteIdentical)
     Fixture fx;
     auto ws = fx.make();
     const auto inputs = sample_pplns_inputs();
+    ws->set_gbt_tip_fn([]() -> std::optional<dgb::stratum::DGBWorkSource::GbtTip> {
+        return dgb::stratum::DGBWorkSource::GbtTip{std::string(64, '1'), "1b0404cb"};
+    });
 
     // Bind a producer that hands back the fixed inputs regardless of args.
     ws->set_pplns_inputs_fn(
         [&](const uint256&, const std::string&, const Script&,
-            const std::vector<std::pair<uint32_t, Script>>&, const Script&)
+            const std::vector<std::pair<uint32_t, Script>>&, const Script&, const dgb::stratum::DGBWorkSource::JobBlock&)
             -> std::optional<dgb::coin::ConnCoinbasePplnsInputs> {
             return inputs;
         });
@@ -979,12 +982,15 @@ TEST(DgbWorkSource, ConnectionCoinbaseFreezesProducerVersionOnSnapshot)
     for (int64_t ver : {int64_t(35), int64_t(36)}) {
         Fixture fx;
         auto ws = fx.make();
+        ws->set_gbt_tip_fn([]() -> std::optional<dgb::stratum::DGBWorkSource::GbtTip> {
+            return dgb::stratum::DGBWorkSource::GbtTip{std::string(64, '1'), "1b0404cb"};
+        });
         auto inputs = sample_pplns_inputs();
         inputs.share_version   = ver;
         inputs.desired_version = 36;
         ws->set_pplns_inputs_fn(
             [&](const uint256&, const std::string&, const Script&,
-                const std::vector<std::pair<uint32_t, Script>>&, const Script&)
+                const std::vector<std::pair<uint32_t, Script>>&, const Script&, const dgb::stratum::DGBWorkSource::JobBlock&)
                 -> std::optional<dgb::coin::ConnCoinbasePplnsInputs> {
                 return inputs;
             });
@@ -1001,7 +1007,7 @@ TEST(DgbWorkSource, ConnectionCoinbaseProducerNulloptYieldsEmptyJob)
     auto ws = fx.make();
     ws->set_pplns_inputs_fn(
         [&](const uint256&, const std::string&, const Script&,
-            const std::vector<std::pair<uint32_t, Script>>&, const Script&)
+            const std::vector<std::pair<uint32_t, Script>>&, const Script&, const dgb::stratum::DGBWorkSource::JobBlock&)
             -> std::optional<dgb::coin::ConnCoinbasePplnsInputs> {
             return std::nullopt;  // tip not yet known
         });

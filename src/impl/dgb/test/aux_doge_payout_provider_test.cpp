@@ -188,7 +188,12 @@ struct WsFixture {
     std::unique_ptr<dgb::stratum::DGBWorkSource> make()
     {
         auto fn = [](const std::vector<unsigned char>&, uint32_t) -> bool { return false; };
-        return std::make_unique<dgb::stratum::DGBWorkSource>(chain, mempool, /*is_testnet=*/false, fn, kSubsidy);
+        auto ws = std::make_unique<dgb::stratum::DGBWorkSource>(chain, mempool, /*is_testnet=*/false, fn, kSubsidy);
+        // A job needs a template (its block): the external-daemon tip fallback.
+        ws->set_gbt_tip_fn([]() -> std::optional<dgb::stratum::DGBWorkSource::GbtTip> {
+            return dgb::stratum::DGBWorkSource::GbtTip{std::string(64, '1'), "1b0404cb"};
+        });
+        return ws;
     }
 };
 
@@ -212,7 +217,7 @@ void bind_inputs(dgb::stratum::DGBWorkSource& ws)
     // As the producer does (conn_job_producer.hpp): the tagged commitment ends
     // the coinbase scriptSig.
     ws.set_pplns_inputs_fn([in](const uint256&, const std::string&, const Bytes&,
-                                const std::vector<std::pair<uint32_t, Bytes>>&, const Bytes& aux)
+                                const std::vector<std::pair<uint32_t, Bytes>>&, const Bytes& aux, const dgb::stratum::DGBWorkSource::JobBlock&)
                                -> std::optional<dgb::coin::ConnCoinbasePplnsInputs> {
         auto r = in;
         r.coinbase_script.insert(r.coinbase_script.end(), aux.begin(), aux.end());

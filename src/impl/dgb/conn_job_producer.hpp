@@ -42,7 +42,9 @@ struct ConnJobRequest {
     uint256 prev_share_hash;
     std::vector<unsigned char> payout_script;   // the job's (effective) payout script
     std::vector<std::pair<uint32_t, std::vector<unsigned char>>> merged_addrs;
-    uint32_t next_block_height = 0;             // header_chain.next_block_height()
+    uint32_t next_block_height = 0;             // the job template's height (BIP34)
+    uint32_t block_bits = 0;                    // the job template's bits (the share's header bits)
+    uint64_t block_value = 0;                   // the value the job's coinbase claims
     uint32_t now = 0;                           // wall clock (seconds)
     uint16_t donation = 0;                      // share donation (u16, --give-author)
     // The tagged DOGE merged-mining commitment ([0x2c][44 B], empty when merged
@@ -68,18 +70,21 @@ std::optional<coin::ConnCoinbasePplnsInputs> build_conn_job_inputs(
     // Prospective block bits: the tip share's block target (the value
     // create_local_share reads from the found block header) feeds the pre-V36
     // max_weight cap. Read under the held tracker lock.
-    uint32_t block_bits = 0;
+    // The block the job is for (the job template): its bits are the share's
+    // header bits, so the PPLNS walk's block target, as the verifier reads them
+    // from the share's own header (share_check) and p2pool generate_transaction
+    // takes block_target; never the previous share's header.
+    const uint32_t block_bits = req.block_bits;
+    if (block_bits == 0)
+        return std::nullopt;  // no template: no job.
     uint32_t prev_ts    = 0;
     uint128  prev_abswork;
     uint32_t prev_absheight = 0;
     tracker.chain.get(prev_share_hash).share.invoke([&](auto* prev) {
-        block_bits      = prev->m_min_header.m_bits;
         prev_ts         = prev->m_timestamp;
         prev_abswork    = prev->m_abswork;
         prev_absheight  = prev->m_absheight;
     });
-    if (block_bits == 0)
-        return std::nullopt;  // tip share carries no usable target.
 
     // #884: the {mint, vote} pair, asked ONCE for this template.
     const auto [mint_version, vote_version] = versions();
@@ -139,7 +144,9 @@ std::optional<coin::ConnCoinbasePplnsInputs> build_conn_job_inputs(
     }
 
     // subsidy for the prospective NEXT block (== create_local_share subsidy arg).
-    const uint64_t subsidy = params.subsidy_func ? params.subsidy_func(absheight) : 0;
+    // The block's value (the job template's: subsidy at the block height),
+    // never a subsidy of the share-chain height.
+    const uint64_t subsidy = req.block_value;
 
     // #902 -- coinbase scriptSig: [BIP34 height push][/c2pool-dgb/ tag], then
     // the DOGE merged-mining commitment when merged mining is on. The SAME bytes

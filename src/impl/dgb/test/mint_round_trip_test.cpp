@@ -69,6 +69,7 @@ core::CoinParams rt_params()
 }
 
 const core::SubsidyFunc kRtSubsidy = [](uint32_t h) -> uint64_t { return dgb::CoinParams::subsidy(h); };
+constexpr uint32_t kRtBlockHeight = 20000000;
 
 // A genesis-rooted V36 chain of `n` shares, one miner each in turn.
 struct RtChain {
@@ -97,7 +98,7 @@ struct RtChain {
             s->m_absheight = static_cast<uint32_t>(i + 1);
             abswork = abswork + uint128(chain::target_to_average_attempts(chain::bits_to_target(s->m_bits)).GetLow64());
             s->m_abswork = abswork;
-            s->m_subsidy = dgb::CoinParams::subsidy(static_cast<uint32_t>(i + 1));
+            s->m_subsidy = dgb::CoinParams::subsidy(kRtBlockHeight - 1);
             tip = s->m_hash;
             tip_ts = s->m_timestamp;
             dgb::ShareType st;
@@ -131,6 +132,8 @@ struct RtRig {
     std::unique_ptr<dgb::stratum::DGBWorkSource> ws;
     int64_t mint_version = 36;
     std::optional<dgb::coin::ConnCoinbasePplnsInputs> last_inputs;
+    dgb::stratum::DGBWorkSource::JobBlock last_block;   // what the producer was handed
+    std::string tip_bits = "1b0404cb";                   // the template's block bits
     Bytes last_payout;                                   // what the producer was handed
     std::vector<std::pair<uint32_t, Bytes>> last_merged;
     uint256 minted;
@@ -138,15 +141,24 @@ struct RtRig {
     explicit RtRig(uint32_t t0 = 1795600000u) : chain(12, t0)
     {
         auto submit = [](const std::vector<unsigned char>&, uint32_t) -> bool { return false; };
+        // The DGB block the jobs are for: height 20,000,000 (the coinbase's
+        // BIP34 height and its subsidy), header bits 0x1b0404cb.
+        hc.set_base_height(kRtBlockHeight);
         ws = std::make_unique<dgb::stratum::DGBWorkSource>(hc, mempool, false, submit, kRtSubsidy);
+        ws->set_gbt_tip_fn([this]() -> std::optional<dgb::stratum::DGBWorkSource::GbtTip> {
+            return dgb::stratum::DGBWorkSource::GbtTip{std::string(56, '0') + "0badf00d", tip_bits};
+        });
         ws->set_pplns_inputs_fn([this](const uint256& prev, const std::string&, const Bytes& payout,
-                                       const std::vector<std::pair<uint32_t, Bytes>>& merged, const Bytes& aux)
+                                       const std::vector<std::pair<uint32_t, Bytes>>& merged, const Bytes& aux, const dgb::stratum::DGBWorkSource::JobBlock& block)
                                     -> std::optional<dgb::coin::ConnCoinbasePplnsInputs> {
             dgb::ConnJobRequest req;
             req.prev_share_hash = prev;
             req.payout_script = payout;
             req.merged_addrs = merged;
-            req.next_block_height = 20000000;
+            req.next_block_height = block.height;   // main_dgb's producer
+            req.block_bits = block.bits;
+            req.block_value = block.value;
+            last_block = block;
             req.now = now ? now : chain.tip_ts + 15;
             req.donation = 66;
             req.aux_mm_scriptsig = aux;
@@ -179,9 +191,12 @@ struct RtRig {
         }
         j.coinb1 = cbr.coinb1;
         j.coinb2 = cbr.coinb2;
-        j.gbt_prevhash = std::string(56, '0') + "0badf00d";
-        j.nbits = "1b0404cb";           // the header's block bits
-        j.version = 0x20000202u;
+        // The header the job carries: the coinbase's own template
+        // (snapshot.has_header), as core::StratumServer takes it.
+        EXPECT_TRUE(cbr.snapshot.has_header);
+        j.gbt_prevhash = cbr.snapshot.gbt_prevhash;
+        j.nbits = cbr.snapshot.block_nbits_hex;   // the header's block bits
+        j.version = cbr.snapshot.header_version;
         j.share_bits = share_bits;
         j.block_nbits = "03000001";     // no digest is a block: ShareAccept, never WonBlock
         j.prev_share_hash = chain.tip;
@@ -290,6 +305,52 @@ TEST(DgbMintRoundTrip, MintedShareIsTheHeaderTheMinerHashed)
 
 // The pre-fix mint (no mined coinbase, no frozen fields: has_frozen=false) on
 // the same submit: the share it records is not the header the miner hashed.
+// Review 713dc77a0 R2 + #9: the job's coinbase claims the subsidy of the BLOCK
+// it is for (the template's height), and the PPLNS walk takes that block's
+// bits (the share's own header bits, which the verifier and p2pool
+// generate_transaction read). Before, the value was subsidy(share absheight)
+// (a share height ~20M below the block's: 72,000 DGB claimed on a block worth
+// far less, every won block bad-cb-amount) and the walk used the PREV share's
+// header bits. Easy template bits make the walk's cap (65535*SPREAD*
+// att(block)) bind inside this chain, so a walk at any other bits pays other
+// outputs and a peer's re-derived gentx differs.
+TEST(DgbMintRoundTrip, CoinbaseClaimsTheBlockSubsidyAndWalksTheJobsBlockBits)
+{
+    for (int64_t ver : {int64_t(35), int64_t(36)}) {
+        SCOPED_TRACE(ver);
+        RtRig rig;
+        rig.mint_version = ver;
+        rig.tip_bits = "207fffff";
+        auto cbr = rig.ws->build_connection_coinbase(rig.chain.tip, "cafef00d", stratum_payout(miner_login()), {});
+        ASSERT_FALSE(cbr.held);
+        ASSERT_TRUE(rig.last_inputs.has_value());
+        EXPECT_EQ(rig.last_block.height, kRtBlockHeight);
+        EXPECT_EQ(rig.last_block.bits, 0x207fffffu);
+        const uint64_t block_subsidy = dgb::CoinParams::subsidy(kRtBlockHeight);
+        EXPECT_EQ(cbr.snapshot.subsidy, block_subsidy);
+        EXPECT_EQ(rig.last_inputs->subsidy, block_subsidy);
+        EXPECT_NE(cbr.snapshot.subsidy, dgb::CoinParams::subsidy(rig.last_inputs->frozen_absheight))
+            << "the coinbase claims the subsidy of the share-chain height";
+        EXPECT_EQ(cbr.snapshot.block_nbits_hex, "207fffff");
+
+        auto j = rig.job(cbr, 0x2100ffffu);
+        const std::string en1 = "cafef00d", en2 = "0000002b", ntime = "6a1b2c3d", nonce = "00c0ffee";
+        Bytes coinbase;
+        const Bytes header = miner_header(j, en1, en2, ntime, nonce, &coinbase);
+        auto r = rig.ws->mining_submit(miner_login(), "job", en1, en2, ntime, nonce, "rid", {}, &j);
+        ASSERT_TRUE(r.is_boolean() && r.get<bool>()) << r.dump();
+        ASSERT_FALSE(rig.minted.IsNull()) << "the local share was not credited";
+        const uint256 cb_txid = Hash(std::span<const unsigned char>(coinbase.data(), coinbase.size()));
+        rig.chain.tracker.chain.get(rig.minted).share.invoke([&](auto* s) {
+            EXPECT_EQ(s->m_subsidy, block_subsidy);
+            EXPECT_EQ(s->m_min_header.m_bits, 0x207fffffu);
+            const uint256 expect_txid = dgb::generate_share_transaction(
+                *s, rig.chain.tracker, rig.params, false, core::version_gate::is_v36_active(ver));
+            EXPECT_EQ(expect_txid, cb_txid) << "the walk used other block bits than the share's header";
+        });
+    }
+}
+
 TEST(DgbMintRoundTrip, MintWithoutTheMinedCoinbaseAndFrozenFieldsDoesNotCredit)
 {
     RtRig rig;
@@ -467,7 +528,7 @@ TEST(DgbMintRoundTrip, CommitmentAppendedAfterTheRefIsNotCredited)
     tagged.insert(tagged.end(), commitment.begin(), commitment.end());
     // Producer without the commitment, then the old late splice.
     rig.ws->set_pplns_inputs_fn([&rig, tagged](const uint256& prev, const std::string&, const Bytes& payout,
-                                               const std::vector<std::pair<uint32_t, Bytes>>& merged, const Bytes&)
+                                               const std::vector<std::pair<uint32_t, Bytes>>& merged, const Bytes&, const dgb::stratum::DGBWorkSource::JobBlock& block)
                                     -> std::optional<dgb::coin::ConnCoinbasePplnsInputs> {
         dgb::ConnJobRequest req;
         req.prev_share_hash = prev;

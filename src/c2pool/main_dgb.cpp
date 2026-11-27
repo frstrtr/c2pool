@@ -1740,13 +1740,14 @@ int run_node(const core::CoinParams& params, bool testnet,
     {
         auto& pplns_tracker = p2p_node.tracker();
         work_source->set_pplns_inputs_fn(
-            [&pplns_tracker, &p2p_node, &params, &header_chain, donation_u16,
+            [&pplns_tracker, &p2p_node, &params, donation_u16,
              dgb_ratchet, dgb_ratchet_mutex](
                 const uint256& prev_share_hash,
                 const std::string& /*extranonce1_hex*/,
                 const std::vector<unsigned char>& payout_script,
                 const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs,
-                const std::vector<unsigned char>& aux_mm_scriptsig)
+                const std::vector<unsigned char>& aux_mm_scriptsig,
+                const dgb::stratum::DGBWorkSource::JobBlock& block)
                 -> std::optional<dgb::coin::ConnCoinbasePplnsInputs>
             {
                 // Non-blocking tracker read. Contended -> decline (the job is held).
@@ -1762,7 +1763,9 @@ int run_node(const core::CoinParams& params, bool testnet,
                 req.prev_share_hash   = prev_share_hash;
                 req.payout_script     = payout_script;
                 req.merged_addrs      = merged_addrs;
-                req.next_block_height = header_chain.next_block_height();
+                req.next_block_height = block.height;   // the job template's block
+                req.block_bits        = block.bits;
+                req.block_value       = block.value;
                 req.now               = static_cast<uint32_t>(std::time(nullptr));
                 req.donation          = donation_u16;
                 req.aux_mm_scriptsig  = aux_mm_scriptsig;

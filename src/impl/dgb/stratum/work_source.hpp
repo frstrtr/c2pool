@@ -255,12 +255,23 @@ public:
     /// ([0x2c][44 B]) the producer appends to the coinbase scriptSig BEFORE it
     /// builds the ref preimage and the coinbase; empty when merged mining is
     /// off or has no commitment yet.
+    /// `block`: the block the job is built for, read from ONE template (the
+    /// one whose header the job carries, CoinbaseResult::snapshot.has_header):
+    /// its height (the coinbase's BIP34 height), its bits (the share's header
+    /// bits, so the PPLNS walk's block target, p2pool generate_transaction's
+    /// block_target) and the value its coinbase may claim.
+    struct JobBlock {
+        uint32_t height = 0;
+        uint32_t bits   = 0;
+        uint64_t value  = 0;
+    };
     using PplnsInputsFn = std::function<std::optional<dgb::coin::ConnCoinbasePplnsInputs>(
         const uint256& prev_share_hash,
         const std::string& extranonce1_hex,
         const std::vector<unsigned char>& payout_script,
         const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs,
-        const std::vector<unsigned char>& aux_mm_scriptsig)>;
+        const std::vector<unsigned char>& aux_mm_scriptsig,
+        const JobBlock& block)>;
     void set_pplns_inputs_fn(PplnsInputsFn fn);
 
     /// External-daemon GBT tip fallback (the fallback V36 mandates PERSIST).
