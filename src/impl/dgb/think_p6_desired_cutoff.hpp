@@ -32,6 +32,7 @@
 // no value semantics changed.
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 
 namespace dgb {
@@ -57,6 +58,45 @@ inline uint32_t think_p6_timestamp_cutoff(bool best_valid, uint32_t best_ts,
 inline bool think_p6_passes_cutoff(uint32_t max_timestamp, uint32_t cutoff)
 {
     return max_timestamp >= cutoff;
+}
+
+// ── Dormant-chain revive (operator decision 2026-11-27) ─────────────────────
+// The one difference from p2pool's think() tail (data.py:2360-2374). While no
+// head has ever verified on this node (no valid best, verified chain empty), a
+// desired parent the cutoff would drop is still requested: at most
+// kRevivePerThink per think and kReviveMaxRequests in all (each request asks a
+// peer for up to 500 parents; think-P1 already stops asking once a head is in
+// the pruning zone, 2*CHAIN_LENGTH+10). Without it a node whose stored chain is
+// older than 24 h, with every head shallower than CHAIN_LENGTH, never fetches
+// the parents it needs, never verifies a head and never serves work. Once a
+// best share exists the revive ends for good and the cutoff applies exactly as
+// before. Only WHICH parents are requested changes; share validity and
+// verification are untouched.
+inline constexpr int kRevivePerThink = 1;
+inline constexpr int kReviveMaxRequests = 64;
+
+struct ReviveState {
+    int requests_left = kReviveMaxRequests;
+    bool done = false;
+};
+
+/// Once per think, before the filter: whether this think may revive. A valid
+/// best ends the revive for good.
+inline bool think_p6_revive_armed(ReviveState& st, bool best_valid, size_t verified_count)
+{
+    if (best_valid)
+        st.done = true;
+    return !st.done && verified_count == 0 && st.requests_left > 0;
+}
+
+/// Per desired entry the cutoff drops: whether the revive requests it anyway.
+inline bool think_p6_revive_take(ReviveState& st, bool armed, int& taken_this_think)
+{
+    if (!armed || taken_this_think >= kRevivePerThink || st.requests_left <= 0)
+        return false;
+    ++taken_this_think;
+    --st.requests_left;
+    return true;
 }
 
 } // namespace dgb

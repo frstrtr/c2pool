@@ -26,6 +26,7 @@ inline uint64_t mul128_shift(uint64_t a, uint64_t b, unsigned shift) {
 #include <impl/nmc/coin/aux_id.hpp>          // nmc::coin::NMC_AUXPOW_CHAIN_ID (v37 bucket-2)
 #include "share_check.hpp"
 #include "think_p1_walk_bounds.hpp"  // SSOT: think_p1_walk_count / think_p1_in_pruning_zone
+#include "think_p6_desired_cutoff.hpp"  // SSOT: dormant-chain revive (ReviveState, think_p6_revive_*)
 #include "coin/naughty_propagation.hpp"  // SSOT: propagate_naughty_from_parent (data.py:543-549)
 #include <impl/dgb/coin/desired_version_tally.hpp>  // SSOT: accumulate_version_weights / accumulate_version_counts (#429 follow-on)
 #include <impl/dgb/coin/share_weight_decay.hpp>  // SSOT: weight-decay constants/half_life/decay_per_share (#450 rewire)
@@ -1487,10 +1488,22 @@ public:
         // This prevents requesting shares from stale/pruned chain tails that
         // peers no longer have. Without this, we hammer peers with unanswerable
         // requests and they eventually drop us.
+        // Dormant-chain revive (think_p6_desired_cutoff.hpp): while no head has
+        // ever verified here, a parent the cutoff drops is still requested,
+        // bounded per think and in total; ends for good once a best exists.
+        const bool revive = think_p6_revive_armed(m_revive, !best.IsNull() && chain.contains(best),
+                                                  verified.size());
+        int revive_this_think = 0;
         std::vector<std::pair<NetService, uint256>> desired_result;
         for (auto& d : desired) {
             if (d.max_timestamp >= timestamp_cutoff) {
                 desired_result.emplace_back(d.peer, d.hash);
+            } else if (think_p6_revive_take(m_revive, revive, revive_this_think)) {
+                desired_result.emplace_back(d.peer, d.hash);
+                LOG_INFO << "[REVIVE] requesting parent " << d.hash.GetHex().substr(0, 16)
+                         << " of a dormant chain (head ts=" << d.max_timestamp << ", "
+                         << (timestamp_cutoff + 24 * 60 * 60 - d.max_timestamp) / 86400 << " d old); "
+                         << m_revive.requests_left << " revive requests left";
             } else {
                 static int filter_log = 0;
                 if (filter_log++ % 10 == 0)
@@ -2919,7 +2932,12 @@ public:
     // punish/score-down shares canonical accepts, breaking the #81 zero-
     // divergence gate. Head-scoring (Phase 4) now punishes only naughty heads.
 
+public:
+    /// Dormant-chain revive state (think() Phase 6, think_p6_desired_cutoff.hpp).
+    const ReviveState& revive_state() const { return m_revive; }
+
 private:
+    ReviveState m_revive;
     std::vector<stale_callback_t> m_stale_callbacks;
 
     // -- Skip list caches for O(log n) weight queries --

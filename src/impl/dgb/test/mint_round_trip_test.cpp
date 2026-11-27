@@ -49,6 +49,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <ctime>
 #include <memory>
 #include <optional>
 #include <shared_mutex>
@@ -123,7 +124,8 @@ Bytes stratum_payout(const std::string& login) { return core::address_to_script(
 
 struct RtRig {
     core::CoinParams params = rt_params();
-    RtChain chain{12, 1795600000u};
+    RtChain chain;
+    uint32_t now = 0;   // the producer's clock; 0: 15 s after the tip
     c2pool::dgb::HeaderChain hc;
     dgb::coin::Mempool mempool;
     std::unique_ptr<dgb::stratum::DGBWorkSource> ws;
@@ -133,7 +135,7 @@ struct RtRig {
     std::vector<std::pair<uint32_t, Bytes>> last_merged;
     uint256 minted;
 
-    RtRig()
+    explicit RtRig(uint32_t t0 = 1795600000u) : chain(12, t0)
     {
         auto submit = [](const std::vector<unsigned char>&, uint32_t) -> bool { return false; };
         ws = std::make_unique<dgb::stratum::DGBWorkSource>(hc, mempool, false, submit, kRtSubsidy);
@@ -145,7 +147,7 @@ struct RtRig {
             req.payout_script = payout;
             req.merged_addrs = merged;
             req.next_block_height = 20000000;
-            req.now = chain.tip_ts + 15;
+            req.now = now ? now : chain.tip_ts + 15;
             req.donation = 66;
             req.aux_mm_scriptsig = aux;
             last_payout = payout;
@@ -608,4 +610,45 @@ TEST(DgbMintRoundTrip, DogePrimaryLoginIsCreditedFromTheJobPayout)
     const auto m = submit_and_read(rig, j, login, {}, 36);
     ASSERT_TRUE(m.ok) << "the DOGE-primary login was not credited";
     EXPECT_TRUE(m.gentx_ok);
+}
+
+// Reviving a dormant chain: the first share minted on a ~90-day-old tip. The
+// producer's clock is today; the share's timestamp is "now" (after the old
+// tip, so no clip), absheight/abswork follow the tip, and the share target
+// moves at most 10% from the tip's max target (p2pool's retarget clamp) and
+// never above the network's maximum. The round trip still matches.
+TEST(DgbMintRoundTrip, FirstShareOnANinetyDayOldTip)
+{
+    const uint32_t today = static_cast<uint32_t>(std::time(nullptr));
+    for (int64_t ver : {int64_t(35), int64_t(36)}) {
+        SCOPED_TRACE(ver);
+        RtRig rig(today - 90u * 86400u);
+        rig.mint_version = ver;
+        rig.now = today;
+        const Bytes payout = stratum_payout(miner_login());
+        auto cbr = rig.ws->build_connection_coinbase(rig.chain.tip, "cafef00d", payout, {});
+        ASSERT_FALSE(cbr.coinb1.empty());
+        const auto& f = cbr.snapshot.frozen_ref;
+        EXPECT_EQ(f.timestamp, today);
+        uint32_t tip_absheight = 0, tip_max_bits = 0;
+        uint128 tip_abswork;
+        rig.chain.tracker.chain.get(rig.chain.tip).share.invoke([&](auto* s) {
+            tip_absheight = s->m_absheight;
+            tip_abswork = s->m_abswork;
+            tip_max_bits = s->m_max_bits;
+        });
+        EXPECT_EQ(f.absheight, tip_absheight + 1);
+        EXPECT_GT(f.abswork, tip_abswork);
+        const uint256 prev_max = chain::bits_to_target(tip_max_bits);
+        const uint256 new_max = chain::bits_to_target(f.max_bits);
+        EXPECT_LE(new_max, prev_max * 11 / 10) << "the share target jumped more than the clamp";
+        EXPECT_GE(new_max, prev_max * 9 / 10);
+        EXPECT_LE(new_max, rig.params.max_target) << "above the network's maximum share target";
+        EXPECT_LE(chain::bits_to_target(f.bits), new_max);
+
+        auto j = rig.job(cbr, 0x2100ffffu, &payout);
+        const auto m = submit_and_read(rig, j, miner_login(), {}, ver);
+        ASSERT_TRUE(m.ok) << "the first share on the old tip was not credited";
+        EXPECT_TRUE(m.gentx_ok) << "a peer would reject it";
+    }
 }
