@@ -14,6 +14,7 @@
 // for a V36 and for a 3601 share. A miner's share beside it keeps its own
 // donation. No consensus change: the donation is the share's own uint16 field.
 
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -372,50 +373,100 @@ TEST(RedistributeSplit, TheMintedShareRevealsTheDonationItsJobCommittedTo)
 }
 
 // The main_ltc.cpp call sites that hand the job's donation on cannot be run
-// here (they are lambdas over the live node), so their text is pinned: the
-// ref_hash lambda takes the job's donation and commits the share to
-// core::job_share_donation(share_donation, dev_donation) (its share target
-// sized with the same), the create_share lambda mints with
-// core::job_share_donation(p.share_donation, dev_donation), no site builds
-// the --give-author formula by hand or passes std::nullopt for the job's
-// donation, and the startup passes --node-owner-address before --address
-// (ltc::setup_split_owner, whose precedence TheStartupSetupSplitsOnlyASplit
-// SpecAndPicksTheOwner pins) and runs the spec's fallback weights.
+// here (they are lambdas over the live node), so their code is pinned, with
+// comments stripped and whitespace dropped (line breaks inside a call do not
+// matter): the ref_hash lambda takes the job's donation and commits the
+// share to core::job_share_donation(share_donation, dev_donation) (its share
+// target sized with the same), each set exactly once; the create_share
+// lambda mints with core::job_share_donation(p.share_donation, dev_donation);
+// no site builds the --give-author formula by hand or passes std::nullopt for
+// the job's donation; the startup passes --node-owner-address before
+// --address (ltc::setup_split_owner, whose precedence
+// TheStartupSetupSplitsOnlyASplitSpecAndPicksTheOwner pins) and runs the
+// spec's fallback weights.
+namespace {
+
+// The code of a C++ source with its comments removed (string and character
+// literals kept as they are) and every whitespace character dropped.
+std::string code_without_comments_or_spaces(const std::string& in)
+{
+    std::string out;
+    enum class St { code, line, block, str, chr } st = St::code;
+    for (size_t i = 0; i < in.size(); ++i) {
+        const char c = in[i];
+        const char n = i + 1 < in.size() ? in[i + 1] : '\0';
+        switch (st) {
+        case St::code:
+            if (c == '/' && n == '/') { st = St::line; ++i; }
+            else if (c == '/' && n == '*') { st = St::block; ++i; }
+            else {
+                // A ' between two alphanumerics is a digit separator
+                // (60'000'000), not a character literal.
+                const bool separator = c == '\'' && i > 0 && std::isalnum(static_cast<unsigned char>(in[i - 1]))
+                                       && std::isalnum(static_cast<unsigned char>(n));
+                if (c == '"') st = St::str;
+                else if (c == '\'' && !separator) st = St::chr;
+                if (!std::isspace(static_cast<unsigned char>(c)))
+                    out += c;
+            }
+            break;
+        case St::line:
+            if (c == '\n') st = St::code;
+            break;
+        case St::block:
+            if (c == '*' && n == '/') { st = St::code; ++i; }
+            break;
+        case St::str:
+        case St::chr:
+            out += c;
+            if (c == '\\' && i + 1 < in.size()) { out += in[++i]; break; }
+            if ((st == St::str && c == '"') || (st == St::chr && c == '\''))
+                st = St::code;
+            break;
+        }
+    }
+    return out;
+}
+
+size_t occurrences(const std::string& hay, const std::string& needle_with_spaces)
+{
+    std::string needle;
+    for (const char c : needle_with_spaces)
+        if (!std::isspace(static_cast<unsigned char>(c)))
+            needle += c;
+    size_t n = 0;
+    for (size_t at = hay.find(needle); at != std::string::npos; at = hay.find(needle, at + 1))
+        ++n;
+    return n;
+}
+
+} // namespace
+
 TEST(RedistributeSplit, MainLtcHandsTheJobsDonationToTheRefHashAndTheShare)
 {
+    // the stripper itself: comments go, literals stay, whitespace goes
+    EXPECT_EQ(code_without_comments_or_spaces("a = f(x, /* y */ z); // tail\nb(\"// kept\", 'c', 60'000);"),
+              "a=f(x,z);b(\"// kept\",'c',60'000);");
     std::ifstream in(std::string(C2POOL_IMPL_DIR) + "/../c2pool/main_ltc.cpp");
     ASSERT_TRUE(in.good());
     std::stringstream ss;
     ss << in.rdbuf();
-    std::string src;   // whitespace runs collapsed to one space
-    for (const char ch : ss.str()) {
-        const bool space = ch == ' ' || ch == '\n' || ch == '\t' || ch == '\r';
-        if (space) {
-            if (!src.empty() && src.back() != ' ')
-                src += ' ';
-        } else {
-            src += ch;
-        }
-    }
-    const auto count = [&src](const std::string& needle) {
-        size_t n = 0;
-        for (size_t at = src.find(needle); at != std::string::npos; at = src.find(needle, at + 1))
-            ++n;
-        return n;
-    };
-    EXPECT_EQ(count("const std::vector<uint256>& merkle_branches, const std::optional<uint16_t>& share_donation) "
-                    "-> core::MiningInterface::RefHashResult"), 1u)
+    const std::string src = code_without_comments_or_spaces(ss.str());
+    EXPECT_EQ(occurrences(src, "const std::vector<uint256>& merkle_branches, const std::optional<uint16_t>& share_donation) "
+                               "-> core::MiningInterface::RefHashResult"), 1u)
         << "the ref_hash lambda receives the job's donation";
-    EXPECT_EQ(count("params.donation = core::job_share_donation(share_donation, dev_donation);"), 1u);
-    EXPECT_EQ(count("target_in.donation_percent = core::job_share_donation_pct(share_donation, dev_donation);"), 1u);
-    EXPECT_EQ(count("core::job_share_donation(p.share_donation, dev_donation),"), 1u)
+    EXPECT_EQ(occurrences(src, "params.donation ="), 1u) << "the share's donation is set once";
+    EXPECT_EQ(occurrences(src, "params.donation = core::job_share_donation(share_donation, dev_donation);"), 1u);
+    EXPECT_EQ(occurrences(src, "target_in.donation_percent ="), 1u);
+    EXPECT_EQ(occurrences(src, "target_in.donation_percent = core::job_share_donation_pct(share_donation, dev_donation);"), 1u);
+    EXPECT_EQ(occurrences(src, "core::job_share_donation(p.share_donation, dev_donation),"), 1u)
         << "the create_share lambda mints with the job's donation";
-    EXPECT_EQ(count("job_share_donation(std::nullopt"), 0u);
-    EXPECT_EQ(count("job_share_donation_pct(std::nullopt"), 0u);
-    EXPECT_EQ(count("65535.0 * dev_donation"), 0u) << "the --give-author formula is core::job_share_donation's";
-    EXPECT_EQ(count("ltc::setup_split_owner( *web_server.get_mining_interface(), redistribute_mode_str, "
-                    "node_owner_address, payout_address,"), 1u)
+    EXPECT_EQ(occurrences(src, "job_share_donation(std::nullopt"), 0u);
+    EXPECT_EQ(occurrences(src, "job_share_donation_pct(std::nullopt"), 0u);
+    EXPECT_EQ(occurrences(src, "65535.0 * dev_donation"), 0u) << "the --give-author formula is core::job_share_donation's";
+    EXPECT_EQ(occurrences(src, "ltc::setup_split_owner(*web_server.get_mining_interface(), redistribute_mode_str, "
+                               "node_owner_address, payout_address,"), 1u)
         << "--node-owner-address, then --address";
-    EXPECT_EQ(count("auto hybrid_weights = ltc::split_fallback_weights(ltc::parse_redistribute_spec("
-                    "redistribute_mode_str));"), 1u);
+    EXPECT_EQ(occurrences(src, "auto hybrid_weights = ltc::split_fallback_weights(ltc::parse_redistribute_spec("
+                               "redistribute_mode_str));"), 1u);
 }
