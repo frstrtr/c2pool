@@ -135,7 +135,7 @@ struct RtRig {
     std::optional<dgb::coin::ConnCoinbasePplnsInputs> last_inputs;
     dgb::stratum::DGBWorkSource::JobBlock last_block;   // what the producer was handed
     std::string tip_bits = "1b0404cb";                   // the template's block bits
-    Bytes last_block;                                    // the last won block sent
+    Bytes won_block;                                     // the last won block sent
     Bytes last_payout;                                   // what the producer was handed
     std::vector<std::pair<uint32_t, Bytes>> last_merged;
     uint256 minted;
@@ -143,7 +143,7 @@ struct RtRig {
     explicit RtRig(uint32_t t0 = 1795600000u) : chain(12, t0)
     {
         auto submit = [this](const std::vector<unsigned char>& block, uint32_t) -> bool {
-            last_block = block;   // a won block's wire bytes
+            won_block = block;    // a won block's wire bytes
             return false;
         };
         // The DGB block the jobs are for: height 20,000,000 (the coinbase's
@@ -803,7 +803,7 @@ TEST(DgbMintRoundTrip, WonV35BlockPassesTheWitnessCommitmentCheck)
     j.block_nbits = "2100ffff";   // every hash is a block
     const std::string en1 = "cafef00d", en2 = "0000002d", ntime = "6a1b2c3d", nonce = "00c0ffee";
     (void)rig.ws->mining_submit(miner_login(), "job", en1, en2, ntime, nonce, "rid", {}, &j);
-    const Bytes& b = rig.last_block;
+    const Bytes& b = rig.won_block;
     ASSERT_GT(b.size(), 80u + 1u + 4u + 2u + 34u + 4u) << "no won block was sent";
     ASSERT_EQ(b[80], 0x01) << "a coinbase-only block";
     const size_t cb = 81;
