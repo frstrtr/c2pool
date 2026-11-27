@@ -647,7 +647,10 @@ inline std::optional<ResolvedIdentity> resolve_mint_identity(
 //     entries and payouts share it) + every entry's own bytes (its tx hash
 //     list, its payment list, scripts and payload, and a fixed overhead).
 //     The cap comes from the cgroup (frozen_registry_cap_from_cgroup).
-//   * COUNT. A backstop of 16,384 entries.
+//   * COUNT. A backstop of 16,384 entries. It is SOFT: it evicts in the same
+//     tier order and never takes an entry the rules keep, so a count above it
+//     is admitted, with a WARNING once per episode (over_backstop_puts counts
+//     the puts that left it over). The age still bounds every entry.
 //
 // EVICTION RUNS ONLY INSIDE put(). A session sweeps its own jobs only when it
 // inserts one, so with no work served nothing ages on either side; get() and
@@ -658,16 +661,22 @@ inline std::optional<ResolvedIdentity> resolve_mint_identity(
 //      T2, an entry on the current coin tip but an older best share;
 //      each only when its own (tip, best share) context was superseded (the
 //      first put on another context after its last put: the clean notify that
-//      moved the sessions off it) more than `grace` (30 s) ago.
+//      moved the sessions off it) more than `grace` (45 s) ago.
 // Entries on the current tip AND the current best share are never evicted
 // before their age, nor is a just-superseded entry inside the grace.
+// Each context keeps its own last-put list, and superseded contexts sit in a
+// list in supersession order, so an eviction pass visits only the contexts
+// past the grace (a prefix of that list), never the whole registry.
 //
 // SAFETY BRAKE. When the entries the rules keep exceed the cap on their own,
 // put() still admits (refusing would serve a ref whose solve then declines)
 // and raises brake_on(); the work source's template store then pauses
-// same-tip refreshes that change only the tx set (tip changes always store)
-// until registry bytes fall below 80% of the cap. One WARNING line on entry,
-// one INFO line on exit, a counter of episodes.
+// same-tip refreshes that change only the tx set (tip changes always store).
+// While the brake is on, the tiers trim to below 80% of the cap (not just to
+// the cap), so it is released as soon as the kept entries fit in 80% again;
+// trimming only to the cap would park the bytes just under it and keep the
+// brake on for as long as the load lasts. One WARNING line on entry, one INFO
+// line on exit, a counter of episodes.
 //
 // LOUD MISSES. Every eviction is remembered (ref, cause, time; ids only, never
 // the job) in a ring, so a submit whose job is gone names its cause:
@@ -681,20 +690,30 @@ inline std::optional<ResolvedIdentity> resolve_mint_identity(
 //     300   s  session job TTL (core StratumSession::JOB_TTL)
 //   +  37.5 s  session sweep lag: the TTL sweep runs only when the session
 //              inserts a job; DASH feeds every session at least every
-//              keepalive_notify_sec (25 s) and the half-interval guard
-//              bounds the gap at 1.5 x 25 s
+//              keepalive_notify_sec (DASHWorkSource::kKeepaliveNotifySec,
+//              25 s) and the half-interval guard bounds the gap at 1.5 x 25 s
 //   +  20   s  queued mint: a solve the busy tracker cannot take waits up to
-//              the deferred-mint TTL (core::DeferredMinter, 20 s); the mint
-//              owns a copy by then, but the won-block reconstruct reads the
-//              entry after the mint
+//              the deferred-mint TTL (core::DeferredMinter, 20 s). The mint
+//              copies the job at arrival and a won block carries that copy
+//              (WonBlockBodies), so this term is now conservative
 //   +  20   s  per-session hold (StratumConfig::job_hold_limit_sec), should
 //              DASH ever set `held`
 //   = 377.5 s; 420 s leaves 42.5 s of slack.
-inline constexpr double kFrozenJobLiveBoundSec = 300.0 + 1.5 * 25.0 + 20.0 + 20.0;
+//
+// The GRACE after a supersession: a session not yet served on the new
+// context keeps hashing, and submitting, the superseded job until its next
+// notify, at most the session lag (37.5 s) later; the stratum path accepts any
+// job still in the session's active_jobs_ and mints it (a DOA or sibling
+// share). 45 s = that lag + 7.5 s for results in flight.
+inline constexpr double kFrozenJobSessionLagSec =
+    1.5 * static_cast<double>(dash::stratum::DASHWorkSource::kKeepaliveNotifySec);
+inline constexpr double kFrozenJobLiveBoundSec = 300.0 + kFrozenJobSessionLagSec + 20.0 + 20.0;
 inline constexpr std::chrono::seconds kFrozenJobAge{420};
 static_assert(kFrozenJobLiveBoundSec < static_cast<double>(kFrozenJobAge.count()),
               "the frozen-job age must outlive every stratum job that can carry its ref");
-inline constexpr std::chrono::seconds kFrozenJobGrace{30};
+inline constexpr std::chrono::seconds kFrozenJobGrace{45};
+static_assert(static_cast<double>(kFrozenJobGrace.count()) >= kFrozenJobSessionLagSec + 5.0,
+              "the grace must cover the session lag plus results in flight");
 inline constexpr size_t kFrozenJobBackstop = 16384;
 
 inline constexpr uint64_t kMiB = 1024ull * 1024ull;
@@ -915,6 +934,7 @@ struct FrozenRegistryStats
     uint64_t backstop{0};
     uint64_t entries{0};
     uint64_t vectors{0};
+    uint64_t contexts{0};      ///< (tip, best share) contexts holding entries
     uint64_t hex_bytes{0};     ///< every vector once
     uint64_t entry_bytes{0};   ///< every entry's own bytes
     uint64_t bytes{0};         ///< hex_bytes + entry_bytes
@@ -927,7 +947,10 @@ struct FrozenRegistryStats
              mint_miss_backstop{0}, mint_miss_unknown{0};
     bool     brake_on{false};
     uint64_t brake_episodes{0};
-    uint64_t over_cap_puts{0};  ///< puts that left the registry over its cap
+    uint64_t over_cap_puts{0};       ///< puts that left the registry over its cap
+    uint64_t over_backstop_puts{0};  ///< puts that left the count over the backstop
+    uint64_t backstop_episodes{0};   ///< times the count went over the backstop
+    uint64_t scan_steps{0};          ///< contexts an eviction pass examined
 };
 
 /// A mint-time lookup. On a miss, `evicted` says whether the ref is one this
@@ -948,6 +971,13 @@ public:
     using TimePoint = std::chrono::steady_clock::time_point;
     using Clock     = std::function<TimePoint()>;
 
+    // At most this many evictions per put: a put after a long idle period
+    // (everything expired at once) or a trim to the brake level spreads the
+    // work over the next puts instead of holding the lock for all of it. A put
+    // that runs out of budget skips the later steps and the brake and backstop
+    // updates; the next put goes on where it stopped, so the order holds.
+    static constexpr size_t kEvictBudget = 1024;
+
     explicit FrozenJobRegistry(FrozenRegistryConfig cfg = {}, Clock clock = {})
         : m_cfg(cfg),
           m_now(clock ? std::move(clock) : Clock([] { return std::chrono::steady_clock::now(); }))
@@ -961,6 +991,7 @@ public:
     void put(const uint256& ref_hash, const dash::stratum::FrozenMintJob& job,
              const uint256& coin_tip = uint256(), const uint256& prev_share = uint256())
     {
+        std::vector<dash::stratum::FrozenMintJob> dead;    // evicted jobs, freed after the lock
         std::vector<std::pair<bool, std::string>> lines;   // (warning, text)
         {
             std::lock_guard<std::mutex> lk(m_mutex);
@@ -979,14 +1010,16 @@ public:
                     e.job = job;
                     account_locked(e);
                 }
-                if (e.tip != coin_tip || e.share != prev_share) {
-                    ctx_dec_locked(e.tip, e.share);
-                    e.tip   = coin_tip;
-                    e.share = prev_share;
-                    ctx_inc_locked(e.tip, e.share);
-                }
                 e.last_put = now;
                 m_lru.splice(m_lru.end(), m_lru, e.lru);
+                if (e.tip != coin_tip || e.share != prev_share) {
+                    ctx_remove_locked(e);
+                    e.tip   = coin_tip;
+                    e.share = prev_share;
+                    ctx_add_locked(e, ref_hash);
+                } else {
+                    ctx_touch_locked(e);
+                }
             } else {
                 ++m_stats.puts;
                 auto [ins, ok] = m_jobs.emplace(ref_hash, Entry{});
@@ -998,11 +1031,13 @@ public:
                 e.last_put = now;
                 e.lru      = m_lru.insert(m_lru.end(), ref_hash);
                 account_locked(e);
-                ctx_inc_locked(e.tip, e.share);
+                ctx_add_locked(e, ref_hash);
             }
-            evict_locked(now);
-            brake_locked(now, lines);
+            const bool complete = evict_locked(now);
+            brake_locked(now, lines, complete);
+            if (complete) backstop_locked(lines);
             periodic_locked(now, lines);
+            dead.swap(m_graveyard);
         }
         for (const auto& [warn, text] : lines) {
             if (warn) LOG_WARNING << text;
@@ -1010,8 +1045,7 @@ public:
         }
     }
 
-    /// The held job for `ref_hash`. Never evicts and counts nothing (the
-    /// won-block finder's read).
+    /// The held job for `ref_hash`. Never evicts and counts nothing.
     std::optional<dash::stratum::FrozenMintJob> get(const uint256& ref_hash) const
     {
         std::lock_guard<std::mutex> lk(m_mutex);
@@ -1090,7 +1124,7 @@ public:
     {
         std::ostringstream o;
         o << "[MINT-REG] 60s puts=" << s.puts << " reputs=" << s.reputs
-          << " entries=" << s.entries << " vectors=" << s.vectors
+          << " entries=" << s.entries << " vectors=" << s.vectors << " contexts=" << s.contexts
           << " hex_mib=" << format_mib(s.hex_bytes) << " entry_mib=" << format_mib(s.entry_bytes)
           << " bytes_mib=" << format_mib(s.bytes) << " peak_mib=" << format_mib(s.peak_bytes)
           << " cap_mib=" << format_mib(s.cap_bytes)
@@ -1100,13 +1134,28 @@ public:
           << " cap_oldshare=" << s.mint_miss_cap_oldshare << " backstop=" << s.mint_miss_backstop
           << " unknown=" << s.mint_miss_unknown << " mint_hits=" << s.mint_hits
           << " brake=" << (s.brake_on ? "on" : "off") << " brake_episodes=" << s.brake_episodes
-          << " over_cap_puts=" << s.over_cap_puts;
+          << " over_cap_puts=" << s.over_cap_puts
+          << " over_backstop_puts=" << s.over_backstop_puts
+          << " backstop_episodes=" << s.backstop_episodes;
+        return o.str();
+    }
+
+    /// The WARNING when the count goes over the soft backstop.
+    static std::string format_backstop_line(const FrozenRegistryStats& s)
+    {
+        std::ostringstream o;
+        o << "[MINT-REG] COUNT BACKSTOP exceeded with no evictable entry left: entries="
+          << s.entries << " backstop=" << s.backstop << " contexts=" << s.contexts
+          << " backstop_episodes=" << s.backstop_episodes
+          << " -- admitted: the backstop never evicts the current tip and best share, nor an"
+             " entry inside the grace; the age bound still applies";
         return o.str();
     }
 
 private:
-    enum class Tier { kept, old_tip, old_share };
+    using Pair = std::pair<uint256, uint256>;   // (coin tip, best share)
 
+    struct CtxNode { uint256 ref; TimePoint put; };   // an entry in its context's list
     struct Entry
     {
         dash::stratum::FrozenMintJob job;
@@ -1115,15 +1164,25 @@ private:
         TimePoint last_put{};
         uint64_t  entry_bytes{0};
         const void* vec{nullptr};
-        std::list<uint256>::iterator lru;
+        std::list<uint256>::iterator lru;       // in m_lru (every entry, last-put order)
+        std::list<CtxNode>::iterator ctx_lru;   // in its context's own list
     };
     struct VecInfo { uint64_t bytes{0}; uint64_t refs{0}; };
-    // A context (a coin tip + best share pair): how many entries sit on it,
-    // and when it was superseded (unset while it is the current one; set for
-    // every other context, because each one stopped being current at a put).
-    struct Ctx { uint64_t entries{0}; std::optional<TimePoint> superseded_at; };
+    // A context: its entries in last-put order (each with its last put, so an
+    // eviction pass needs no lookup), and when it was superseded (unset while
+    // it is the current one; set for every other context, because each one
+    // stopped being current at a put). A superseded context also sits in
+    // m_superseded, in supersession order, by pointer (map nodes do not move).
+    struct Ctx;
+    struct SupItem { Pair key; Ctx* ctx; };
+    struct Ctx
+    {
+        std::list<CtxNode>           lru;
+        std::optional<TimePoint>     superseded_at;
+        std::list<SupItem>::iterator sup;
+    };
+
     struct Evicted { uint256 ref; FrozenEvictCause cause; TimePoint at; TimePoint last_put; };
-    using Pair = std::pair<uint256, uint256>;
 
     static double seconds_between(TimePoint a, TimePoint b)
     {
@@ -1132,34 +1191,60 @@ private:
 
     uint64_t bytes_locked() const { return m_hex_bytes + m_entry_bytes; }
 
+    void supersede_locked(Ctx& c, const Pair& key, TimePoint now)
+    {
+        if (c.superseded_at) return;
+        c.superseded_at = now;
+        c.sup = m_superseded.insert(m_superseded.end(), SupItem{key, &c});
+    }
+
+    void revive_locked(Ctx& c)
+    {
+        if (!c.superseded_at) return;
+        m_superseded.erase(c.sup);
+        c.superseded_at.reset();
+    }
+
     // The context of this put becomes the current one. The previous current
     // context, when it differs, is superseded now (a clean notify moved the
     // sessions off it); the context put now is live again, which also covers a
-    // reorg back to a tip seen before. An entry's grace runs from ITS context's
-    // supersession, so an entry an earlier best-share change already
-    // superseded stays evictable when the tip then changes.
+    // reorg back to a tip seen before and two producers interleaving their
+    // puts. An entry's grace runs from ITS context's supersession, so an entry
+    // an earlier best-share change already superseded stays evictable when the
+    // tip then changes.
     void note_context_locked(const uint256& tip, const uint256& share, TimePoint now)
     {
         if (m_have_current && tip == m_cur_tip && share == m_cur_share) return;
         if (m_have_current)
-            if (auto p = m_ctx.find(Pair{m_cur_tip, m_cur_share});
-                p != m_ctx.end() && !p->second.superseded_at)
-                p->second.superseded_at = now;
-        if (auto p = m_ctx.find(Pair{tip, share}); p != m_ctx.end()) p->second.superseded_at.reset();
+            if (auto p = m_ctx.find(Pair{m_cur_tip, m_cur_share}); p != m_ctx.end())
+                supersede_locked(p->second, p->first, now);
+        if (auto p = m_ctx.find(Pair{tip, share}); p != m_ctx.end()) revive_locked(p->second);
         m_cur_tip      = tip;
         m_cur_share    = share;
         m_have_current = true;
     }
 
-    void ctx_inc_locked(const uint256& tip, const uint256& share)
+    void ctx_add_locked(Entry& e, const uint256& ref)
     {
-        ++m_ctx[Pair{tip, share}].entries;
+        Ctx& c = m_ctx[Pair{e.tip, e.share}];
+        e.ctx_lru = c.lru.insert(c.lru.end(), CtxNode{ref, e.last_put});
     }
 
-    void ctx_dec_locked(const uint256& tip, const uint256& share)
+    void ctx_touch_locked(Entry& e)
     {
-        if (auto p = m_ctx.find(Pair{tip, share}); p != m_ctx.end() && --p->second.entries == 0)
-            m_ctx.erase(p);
+        Ctx& c = m_ctx[Pair{e.tip, e.share}];
+        c.lru.splice(c.lru.end(), c.lru, e.ctx_lru);
+        e.ctx_lru->put = e.last_put;
+    }
+
+    void ctx_remove_locked(Entry& e)
+    {
+        auto p = m_ctx.find(Pair{e.tip, e.share});
+        if (p == m_ctx.end()) return;
+        p->second.lru.erase(e.ctx_lru);
+        if (!p->second.lru.empty()) return;
+        if (p->second.superseded_at) m_superseded.erase(p->second.sup);
+        m_ctx.erase(p);
     }
 
     void account_locked(Entry& e)
@@ -1187,24 +1272,15 @@ private:
         e.vec = nullptr;
     }
 
-    Tier tier_locked(const Entry& e, TimePoint now) const
-    {
-        if (e.tip == m_cur_tip && e.share == m_cur_share) return Tier::kept;
-        auto p = m_ctx.find(Pair{e.tip, e.share});
-        if (p == m_ctx.end() || !p->second.superseded_at ||
-            now - *p->second.superseded_at <= m_cfg.grace)
-            return Tier::kept;   // inside the grace
-        return e.tip != m_cur_tip ? Tier::old_tip : Tier::old_share;
-    }
-
     void erase_locked(std::map<uint256, Entry>::iterator it, FrozenEvictCause cause, TimePoint now)
     {
         Entry& e = it->second;
         unaccount_locked(e);
-        ctx_dec_locked(e.tip, e.share);
+        ctx_remove_locked(e);
         m_lru.erase(e.lru);
         m_ring.push_back(Evicted{it->first, cause, now, e.last_put});
         while (m_ring.size() > m_cfg.evicted_ring) m_ring.pop_front();
+        m_graveyard.push_back(std::move(e.job));   // freed by put() after the lock
         switch (cause) {
         case FrozenEvictCause::age:          ++m_stats.evict_age; break;
         case FrozenEvictCause::cap_oldtip:   ++m_stats.evict_cap_oldtip; break;
@@ -1214,46 +1290,90 @@ private:
         m_jobs.erase(it);
     }
 
-    // T1 oldest first, then T2 oldest first, while `over()` holds.
+    // T1 (contexts on an older coin tip) oldest last put first, then T2
+    // (older best share on the current tip), while `over()` holds and the
+    // budget lasts (false: it ran out, more is owed). Only the contexts
+    // superseded more than `grace` ago are candidates; they are the front of
+    // m_superseded, so ONE walk stops at the first one inside the grace and
+    // never visits the current context or the entries one by one. Across the
+    // candidate contexts of a tier a min-heap on each context's oldest entry
+    // keeps the global oldest-first order.
+    struct Cand { TimePoint front; Ctx* ctx; };
     template <typename Over>
-    void evict_tiers_locked(TimePoint now, bool backstop, Over over)
+    bool evict_tiers_locked(TimePoint now, bool backstop, Over over, size_t& budget)
     {
-        for (const Tier tier : {Tier::old_tip, Tier::old_share}) {
-            for (auto l = m_lru.begin(); l != m_lru.end() && over();) {
-                auto it = m_jobs.find(*l);
-                ++l;
-                if (tier_locked(it->second, now) != tier) continue;
-                erase_locked(it,
-                             backstop ? FrozenEvictCause::backstop
-                                      : (tier == Tier::old_tip ? FrozenEvictCause::cap_oldtip
-                                                               : FrozenEvictCause::cap_oldshare),
-                             now);
-            }
+        const auto later = [](const Cand& a, const Cand& b) { return a.front > b.front; };
+        std::vector<Cand> t1, t2;
+        for (const SupItem& si : m_superseded) {
+            ++m_stats.scan_steps;
+            if (now - *si.ctx->superseded_at <= m_cfg.grace) break;   // the rest are younger
+            if (si.key.first == m_cur_tip && si.key.second == m_cur_share) continue;
+            (si.key.first != m_cur_tip ? t1 : t2).push_back(Cand{si.ctx->lru.front().put, si.ctx});
         }
+        for (const bool old_tip : {true, false}) {
+            std::vector<Cand>& heap = old_tip ? t1 : t2;
+            std::make_heap(heap.begin(), heap.end(), later);
+            const FrozenEvictCause cause =
+                backstop ? FrozenEvictCause::backstop
+                         : (old_tip ? FrozenEvictCause::cap_oldtip : FrozenEvictCause::cap_oldshare);
+            while (!heap.empty() && over()) {
+                if (budget == 0) return false;
+                std::pop_heap(heap.begin(), heap.end(), later);
+                Ctx* c = heap.back().ctx;
+                heap.pop_back();
+                const bool last = c->lru.size() == 1;
+                erase_locked(m_jobs.find(c->lru.front().ref), cause, now);
+                --budget;
+                if (last) continue;   // the context went with its last entry
+                heap.push_back(Cand{c->lru.front().put, c});
+                std::push_heap(heap.begin(), heap.end(), later);
+            }
+            if (!over()) break;
+        }
+        return true;
     }
 
-    void evict_locked(TimePoint now)
+    // Over the byte cap: above the cap, or, while the brake is on, at or above
+    // 80% of it (so the brake can be released under a steady load).
+    bool over_cap_locked(bool braking) const
     {
-        // 1. Expired, oldest first: the list is in last-put order.
+        const uint64_t b = bytes_locked();
+        return braking ? b * 5 >= m_cfg.cap_bytes * 4 : b > m_cfg.cap_bytes;
+    }
+
+    // false: the eviction budget ran out with evictions still owed.
+    bool evict_locked(TimePoint now)
+    {
+        size_t budget = kEvictBudget;
+        // 1. Expired, oldest first: m_lru is in last-put order.
         while (!m_lru.empty()) {
             auto it = m_jobs.find(m_lru.front());
             if (now - it->second.last_put <= m_cfg.age) break;
+            if (budget == 0) return false;
             erase_locked(it, FrozenEvictCause::age, now);
+            --budget;
         }
-        // 2. Over the byte cap.
-        if (bytes_locked() > m_cfg.cap_bytes)
-            evict_tiers_locked(now, false, [this] { return bytes_locked() > m_cfg.cap_bytes; });
+        // 2. Over the byte cap (trimmed to below 80% while the brake is on).
+        const bool braking = m_brake.load(std::memory_order_relaxed);
+        if (over_cap_locked(braking) &&
+            !evict_tiers_locked(now, false, [this, braking] { return over_cap_locked(braking); }, budget))
+            return false;
         // 3. Over the count backstop.
-        if (m_jobs.size() > m_cfg.backstop)
-            evict_tiers_locked(now, true, [this] { return m_jobs.size() > m_cfg.backstop; });
+        if (m_jobs.size() > m_cfg.backstop &&
+            !evict_tiers_locked(now, true, [this] { return m_jobs.size() > m_cfg.backstop; }, budget))
+            return false;
+        return true;
     }
 
-    void brake_locked(TimePoint now, std::vector<std::pair<bool, std::string>>& lines)
+    // `complete`: this put's evictions all ran. When the budget cut them short,
+    // the bytes may still hold evictable entries, so the brake is not raised.
+    void brake_locked(TimePoint now, std::vector<std::pair<bool, std::string>>& lines, bool complete)
     {
         const uint64_t b = bytes_locked();
         m_peak_bytes = std::max(m_peak_bytes, b);
         const bool on = m_brake.load(std::memory_order_relaxed);
         if (b > m_cfg.cap_bytes) {
+            if (!complete) return;
             ++m_stats.over_cap_puts;
             if (on) return;
             m_brake.store(true, std::memory_order_relaxed);
@@ -1281,6 +1401,23 @@ private:
         }
     }
 
+    // The soft backstop: a WARNING once per episode of a count above it.
+    void backstop_locked(std::vector<std::pair<bool, std::string>>& lines)
+    {
+        if (m_jobs.size() > m_cfg.backstop) {
+            ++m_stats.over_backstop_puts;
+            if (m_over_backstop) return;
+            m_over_backstop = true;
+            ++m_stats.backstop_episodes;
+            lines.emplace_back(true, format_backstop_line(stats_locked()));
+        } else if (m_over_backstop) {
+            m_over_backstop = false;
+            lines.emplace_back(false, "[MINT-REG] count back within the backstop: entries=" +
+                                          std::to_string(m_jobs.size()) +
+                                          " backstop=" + std::to_string(m_cfg.backstop));
+        }
+    }
+
     // One stats line per 60 s of puts, when a counter moved since the last.
     void periodic_locked(TimePoint now, std::vector<std::pair<bool, std::string>>& lines)
     {
@@ -1305,6 +1442,7 @@ private:
         s.backstop    = m_cfg.backstop;
         s.entries     = m_jobs.size();
         s.vectors     = m_vectors.size();
+        s.contexts    = m_ctx.size();
         s.hex_bytes   = m_hex_bytes;
         s.entry_bytes = m_entry_bytes;
         s.bytes       = m_hex_bytes + m_entry_bytes;
@@ -1317,9 +1455,11 @@ private:
     const Clock                m_now;
     mutable std::mutex         m_mutex;
     std::map<uint256, Entry>   m_jobs;
-    std::list<uint256>         m_lru;      // last-put order, oldest first
+    std::list<uint256>         m_lru;         // every entry, last-put order, oldest first
     std::unordered_map<const void*, VecInfo> m_vectors;
-    std::map<Pair, Ctx>        m_ctx;      // (coin tip, best share) contexts
+    std::map<Pair, Ctx>        m_ctx;         // contexts holding entries
+    std::list<SupItem>         m_superseded;  // superseded contexts, oldest supersession first
+    std::vector<dash::stratum::FrozenMintJob> m_graveyard;   // evicted this put, freed outside the lock
     bool                       m_have_current{false};
     uint256                    m_cur_tip;
     uint256                    m_cur_share;
@@ -1327,13 +1467,80 @@ private:
     uint64_t                   m_hex_bytes{0};
     uint64_t                   m_entry_bytes{0};
     uint64_t                   m_peak_bytes{0};
-    FrozenRegistryStats        m_stats;    // counters only; sizes are filled by stats_locked
+    FrozenRegistryStats        m_stats;       // counters only; sizes are filled by stats_locked
     std::atomic<bool>          m_brake{false};
     TimePoint                  m_brake_since{};
+    bool                       m_over_backstop{false};
     bool                       m_have_line{false};
     TimePoint                  m_line_at{};
     std::tuple<uint64_t, uint64_t, uint64_t, uint64_t, uint64_t> m_line_key{};
 };
+
+// ── WonBlockBodies ──────────────────────────────────────────────────────────
+//
+// The tx bodies of a WON BLOCK's job, carried from the mint seam's copy to the
+// won-block rebuild. The mint copies the frozen job when the solve arrives;
+// the finder's rebuild (reconstruct_won_block, the p2p relay leg) runs later,
+// after the win has moved the tip, when the registry may already have
+// evicted the entry. The seam records the won job's tx hashes and its shared
+// hex vector here, and the rebuild reads them here first. At most kCapacity
+// wins are kept (each one template's vector, by pointer), oldest dropped.
+// Thread-safe: the seam runs on the io thread, the rebuild on the compute
+// thread.
+struct WonTemplateBodies
+{
+    std::vector<uint256> tx_hashes;
+    std::shared_ptr<const std::vector<std::string>> tx_data_hex;
+};
+
+class WonBlockBodies
+{
+public:
+    static constexpr size_t kCapacity = 4;
+
+    void record(const uint256& ref_hash, const dash::stratum::FrozenMintJob& job)
+    {
+        if (!job.tx_data_hex) return;   // v16 or coinbase-only: nothing to carry
+        std::lock_guard<std::mutex> lk(m_mu);
+        for (auto& e : m_entries)
+            if (e.first == ref_hash) {
+                e.second = WonTemplateBodies{job.desired_tx_hashes, job.tx_data_hex};
+                return;
+            }
+        m_entries.emplace_back(ref_hash, WonTemplateBodies{job.desired_tx_hashes, job.tx_data_hex});
+        while (m_entries.size() > kCapacity) m_entries.pop_front();
+    }
+
+    std::optional<WonTemplateBodies> find(const uint256& ref_hash) const
+    {
+        std::lock_guard<std::mutex> lk(m_mu);
+        for (const auto& e : m_entries)
+            if (e.first == ref_hash) return e.second;
+        return std::nullopt;
+    }
+
+    size_t size() const
+    {
+        std::lock_guard<std::mutex> lk(m_mu);
+        return m_entries.size();
+    }
+
+private:
+    mutable std::mutex m_mu;
+    std::deque<std::pair<uint256, WonTemplateBodies>> m_entries;
+};
+
+/// The finder's bodies for a won block's ref: the copy the mint carried, else
+/// the registry's entry (still held when the rebuild runs early).
+inline std::optional<WonTemplateBodies>
+won_block_bodies_for(const WonBlockBodies& won, const FrozenJobRegistry& registry,
+                     const uint256& ref_hash)
+{
+    if (auto w = won.find(ref_hash)) return w;
+    auto job = registry.get(ref_hash);
+    if (!job || !job->tx_data_hex) return std::nullopt;
+    return WonTemplateBodies{std::move(job->desired_tx_hashes), job->tx_data_hex};
+}
 
 // ── frozen_job_for_mint ─────────────────────────────────────────────────────
 //
@@ -1342,7 +1549,8 @@ private:
 // it must never be silent: the WARNING names the cause (an eviction by age,
 // by the cap from an old tip or an old share, by the count backstop, or
 // unknown: never registered here, or evicted before the remembered ring) and
-// carries that cause's counter.
+// carries that cause's counter. On a hit for a WON BLOCK (`won` set), the
+// job's bodies are recorded for the won-block rebuild (WonBlockBodies).
 inline std::string format_mint_miss_line(const uint256& ref_hash, const FrozenMintLookup& r)
 {
     std::ostringstream o;
@@ -1362,10 +1570,13 @@ inline std::string format_mint_miss_line(const uint256& ref_hash, const FrozenMi
 
 inline std::optional<dash::stratum::FrozenMintJob>
 frozen_job_for_mint(FrozenJobRegistry& registry, const uint256& ref_hash,
-                    std::string* miss_line = nullptr)
+                    std::string* miss_line = nullptr, WonBlockBodies* won = nullptr)
 {
     FrozenMintLookup r = registry.lookup_for_mint(ref_hash);
-    if (r.job) return std::move(r.job);
+    if (r.job) {
+        if (won) won->record(ref_hash, *r.job);
+        return std::move(r.job);
+    }
     const std::string line = format_mint_miss_line(ref_hash, r);
     LOG_WARNING << line;
     if (miss_line) *miss_line = line;

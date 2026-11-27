@@ -29,6 +29,7 @@
 // new DashWorkData instance exactly as production does.
 
 #include <impl/dash/stratum/work_source.hpp>
+#include <impl/dash/coin/subsidy.hpp>      // DASH_SUPERBLOCK_CYCLE_MAINNET (P2' store brake)
 #include <impl/dash/coinbase_builder.hpp>   // sha256d
 #include <impl/dash/coin/dash_txid.hpp>     // dash_txid, dash_instance_hash (v24 stable txid)
 #include <impl/dash/coin/vendor/bls_mode_guard.hpp>
@@ -1298,7 +1299,86 @@ TEST(DashWorkSourceStoreBrake, SkipsSameTipTxRefreshKeepsTipStore)
     EXPECT_EQ(ws.store_brake_skips(), 2u);
 
     // The skip rule itself.
-    EXPECT_TRUE(DASHWorkSource::store_brake_may_skip(tmpl_A(), tmpl_C()));
-    EXPECT_FALSE(DASHWorkSource::store_brake_may_skip(tmpl_A(), tmpl_B())) << "same set";
-    EXPECT_FALSE(DASHWorkSource::store_brake_may_skip(tmpl_C(), tmpl_D())) << "tip change";
+    const int cycle = dash::coin::DASH_SUPERBLOCK_CYCLE_MAINNET;
+    EXPECT_TRUE(DASHWorkSource::store_brake_may_skip(tmpl_A(), tmpl_C(), cycle));
+    EXPECT_FALSE(DASHWorkSource::store_brake_may_skip(tmpl_A(), tmpl_B(), cycle)) << "same set";
+    EXPECT_FALSE(DASHWorkSource::store_brake_may_skip(tmpl_C(), tmpl_D(), cycle)) << "tip change";
+}
+
+// With the brake on, a same-tip refresh is skipped only when nothing but the
+// tx set and its fee-driven amounts changed. A new payee, a new CbTx payload,
+// and ANY refresh at a superblock height (a governance trigger funded at this
+// tip changes the payments) are stored: a block over the kept template would
+// otherwise fail bad-cb-payee.
+TEST(DashWorkSourceStoreBrake, PaymentOrPayloadChangeAtSameTipStores)
+{
+    const int cycle = dash::coin::DASH_SUPERBLOCK_CYCLE_MAINNET;
+    const uint32_t sb_height = 156u * 16616u;   // 2,592,096: a mainnet superblock height
+    auto more_fees = [](DashWorkData w) {        // another tx set; the MN amount follows its fees
+        w = make_template(kPrev1, 2583001u, 165100000ULL, {{0x71, 30}, {0x72, 60}});
+        w.m_packed_payments[0].amount += 12345;
+        w.m_payment_amount = w.m_packed_payments[0].amount;
+        return w;
+    };
+    EXPECT_TRUE(DASHWorkSource::store_brake_may_skip(tmpl_A(), more_fees(tmpl_A()), cycle))
+        << "a fee-driven amount change alone is a tx-only refresh";
+    {
+        auto w = more_fees(tmpl_A());
+        auto s = p2pkh(0x23);
+        w.m_packed_payments[0].payee = "!" + HexStr(std::span<const unsigned char>(s.data(), s.size()));
+        EXPECT_FALSE(DASHWorkSource::store_brake_may_skip(tmpl_A(), w, cycle)) << "a new payee";
+    }
+    {
+        auto w = more_fees(tmpl_A());
+        w.m_coinbase_payload = {0x03, 0x00, 0x01};
+        EXPECT_FALSE(DASHWorkSource::store_brake_may_skip(tmpl_A(), w, cycle)) << "a new CbTx payload";
+    }
+    const char* const kPrevSb = "0000000000000011223344556677889900aabbccddeeff00112233445566778a";
+    const DashWorkData sb0 = make_template(kPrevSb, sb_height, 165000000ULL, {{0x31, 10}});
+    DashWorkData sb1 = make_template(kPrevSb, sb_height, 165000000ULL, {{0x32, 10}});
+    EXPECT_FALSE(DASHWorkSource::store_brake_may_skip(sb0, sb1, cycle))
+        << "a superblock height never skips, even with the same payees";
+    dash::coin::PackedPayment trigger;
+    trigger.payee  = "!76a914" + std::string(40, '9') + "88ac";
+    trigger.amount = 10000000ULL;              // inside the template's coinbase value
+    sb1.m_packed_payments.push_back(trigger);   // a trigger funded at this tip
+    sb1.m_payment_amount += trigger.amount;
+    EXPECT_FALSE(DASHWorkSource::store_brake_may_skip(sb0, sb1, cycle));
+
+    // Through the store, with the brake on.
+    Source src;
+    src.set(tmpl_A());
+    DASHWorkSource ws(src.coin_state, src.fallback(), Source::submit());
+    std::atomic<bool> brake{true};
+    ws.set_store_brake_fn([&brake] { return brake.load(); });
+    (void)serve_once(ws);
+    const auto a = ws.peek_template();
+    ASSERT_TRUE(a);
+    src.set(more_fees(tmpl_A()));
+    ws.bump_work_generation();
+    (void)serve_once(ws);
+    EXPECT_EQ(ws.peek_template(), a) << "fee-only refresh skipped";
+    EXPECT_EQ(ws.store_brake_skips(), 1u);
+    {
+        auto w = more_fees(tmpl_A());
+        w.m_coinbase_payload = {0x03, 0x00, 0x01};
+        src.set(w);
+        ws.bump_work_generation();
+        (void)serve_once(ws);
+        ASSERT_TRUE(ws.peek_template());
+        EXPECT_EQ(ws.peek_template()->m_coinbase_payload, w.m_coinbase_payload) << "payload change stored";
+        EXPECT_EQ(ws.store_brake_skips(), 1u);
+    }
+    src.set(sb0);
+    ws.bump_work_generation();
+    (void)serve_once(ws);
+    ASSERT_TRUE(ws.peek_template());
+    ASSERT_EQ(ws.peek_template()->m_height, sb_height);
+    src.set(sb1);
+    ws.bump_work_generation();
+    (void)serve_once(ws);
+    ASSERT_TRUE(ws.peek_template());
+    EXPECT_EQ(ws.peek_template()->m_packed_payments.size(), 2u)
+        << "the newly funded trigger reached the served template";
+    EXPECT_EQ(ws.store_brake_skips(), 1u);
 }

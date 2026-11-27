@@ -578,6 +578,11 @@ public:
     /// and share-target submissions cannot mint (loud fail-closed decline).
     void set_producer_job_fn(ProducerJobFn fn);
 
+    /// The idle keepalive-notify cadence (StratumConfig::keepalive_notify_sec)
+    /// this work source configures. Named so the frozen-job registry's age and
+    /// grace (dash::mint::kFrozenJobAge, kFrozenJobGrace) are derived from it.
+    static constexpr uint32_t kKeepaliveNotifySec = 25;
+
     /// The frozen-job registry's SAFETY BRAKE (dash::mint::FrozenJobRegistry::
     /// brake_on): true while the registry is over its byte cap with no
     /// evictable entry left. While it holds, the template store keeps the
@@ -593,11 +598,16 @@ public:
         return store_brake_skips_.load(std::memory_order_relaxed);
     }
     /// The brake's skip rule: `next` is a refresh of `cached` on the same coin
-    /// tip (previous block, height and bits) with another tx set. Everything
-    /// else a same-tip template carries (the coinbase value, the payment
-    /// amounts, the CbTx payload) follows from that tx set.
+    /// tip (previous block, height and bits) with another tx set, NOT at a
+    /// superblock height (governance payments are not tip state), with the
+    /// same payees in the same order and a byte-equal CbTx payload. Only the
+    /// amounts may differ (the masternode amount follows the fee total of the
+    /// tx set). `superblock_cycle` is dashcore's nSuperblockCycle.
     static bool store_brake_may_skip(const coin::DashWorkData& cached,
-                                     const coin::DashWorkData& next);
+                                     const coin::DashWorkData& next,
+                                     int superblock_cycle);
+    /// nSuperblockCycle of this work source's network.
+    int superblock_cycle() const;
 
     /// Drop the cached template snapshot + bump work_generation. Wired to the
     /// NodeRPC reconnect hook in main_dash.cpp (stale-payee fix, defect 3):

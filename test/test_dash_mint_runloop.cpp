@@ -481,8 +481,8 @@ TEST(DashMintRunloop, DeclinesSolveBelowCommittedTarget)
 }
 
 // (7) Frozen-job registry: fail-closed on unknown refs, bounded by its count
-//     backstop. Each job here is served on a new best share 40 s after the
-//     previous one (past the 30 s grace), so the older ones are old-share
+//     backstop. Each job here is served on a new best share 50 s after the
+//     previous one (past the 45 s grace), so the older ones are old-share
 //     entries the backstop may take, oldest first; the newest is current.
 TEST(DashMintRunloop, FrozenJobRegistryFailClosedAndBounded)
 {
@@ -495,7 +495,7 @@ TEST(DashMintRunloop, FrozenJobRegistryFailClosedAndBounded)
     EXPECT_EQ(registry.stats().mint_miss_unknown, 1u);
 
     for (uint8_t i = 1; i <= 6; ++i) {
-        t += std::chrono::seconds(40);
+        t += std::chrono::seconds(50);
         dash::stratum::FrozenMintJob job;
         job.share_nonce = i;
         registry.put(h256_tag(i), job, h256_tag(0xf0), h256_tag(static_cast<uint8_t>(0xa0 + i)));

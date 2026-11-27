@@ -15,7 +15,9 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
+#include <iostream>
 #include <map>
 #include <memory>
 #include <optional>
@@ -91,8 +93,9 @@ uint64_t one_entry_bytes(const FrozenMintJob& j)
 }  // namespace
 
 // A sustained stream of full-size templates, far over the cap: 1 and 8 payouts
-// per template, a new best share every 5 templates, a new tip every 25, 7 s
-// apart. After EVERY put the registry is at or under its cap, its bytes equal
+// per template, a new best share every 5 templates, a new tip every 25, 8 s
+// apart (so the current context plus the ones inside the 45 s grace hold at
+// most 11 templates, about 57 MiB, under the 64 MiB cap). After EVERY put the registry is at or under its cap, its bytes equal
 // an independent count (each live vector once, every live entry's own bytes),
 // the brake never engages, and every job on the current tip and best share is
 // still held (so the newest job of every payout hits).
@@ -110,7 +113,7 @@ TEST(DashFrozenJobRegistryCap, FloodFullTemplatesStaysUnderCap)
         unsigned char t = 1, sh = 1;
         uint64_t n = 0;
         for (int step = 0; step < 180; ++step) {
-            clk.advance(7s);
+            clk.advance(8s);
             if (step > 0 && step % 25 == 0) { ++t; ++sh; current_ctx.clear(); }
             else if (step > 0 && step % 5 == 0) { ++sh; current_ctx.clear(); }
             HexVec v = hex_vec(4970, 800);   // 3,976,000 hex chars
@@ -149,9 +152,9 @@ TEST(DashFrozenJobRegistryCap, FloodFullTemplatesStaysUnderCap)
 }
 
 // Every put on ONE tip and ONE best share: nothing unexpired is evicted, the
-// registry admits past its cap and raises the brake. Superseded entries leave
-// after the grace, which brings the bytes back under the cap but not below 80%
-// of it, so the brake holds; once the age clears them it is released.
+// registry admits past its cap and raises the brake. Once the best share moves
+// and the grace has passed, the superseded entries are trimmed to below 80% of
+// the cap (the brake's trim level, not just the cap) and the brake is released.
 TEST(DashFrozenJobRegistryCap, FloodOneTipAdmitsAndFlagsBackpressure)
 {
     FakeClock clk;
@@ -178,21 +181,23 @@ TEST(DashFrozenJobRegistryCap, FloodOneTipAdmitsAndFlagsBackpressure)
     EXPECT_EQ(reg.size(), 31u);
     EXPECT_TRUE(reg.brake_on());
 
-    // Past the grace: old-share entries go until the cap holds; still >= 80%.
-    clk.advance(31s);
+    // Still inside the grace: nothing goes, the brake holds.
+    clk.advance(dash::mint::kFrozenJobGrace - 1s);
     reg.put(key(101), job_with(hex_vec(256, 4096), 256), tip(1), share(2));
-    EXPECT_LE(reg.bytes(), cap);
-    EXPECT_GE(reg.bytes() * 5, cap * 4);
-    EXPECT_TRUE(reg.brake_on()) << "released above 80% of the cap";
+    EXPECT_EQ(reg.size(), 32u);
+    EXPECT_TRUE(reg.brake_on());
+
+    // Past the grace: old-share entries go, oldest first, to below 80%.
+    clk.advance(2s);
+    reg.put(key(102), job_with(hex_vec(256, 4096), 256), tip(1), share(2));
+    EXPECT_LT(reg.bytes() * 5, cap * 4);
+    EXPECT_FALSE(reg.brake_on()) << "the brake must be released once the kept entries fit";
     EXPECT_TRUE(reg.contains(key(100)));
     EXPECT_TRUE(reg.contains(key(101)));
+    EXPECT_TRUE(reg.contains(key(102)));
+    EXPECT_FALSE(reg.contains(key(1))) << "oldest first";
+    EXPECT_TRUE(reg.contains(key(30))) << "only down to the trim level";
     EXPECT_GT(reg.stats().evict_cap_oldshare, 0u);
-
-    // The age clears everything but the new put: below 80%, released.
-    clk.advance(421s);
-    reg.put(key(102), job_with(nullptr, 0), tip(1), share(2));
-    EXPECT_LT(reg.bytes() * 5, cap * 4);
-    EXPECT_FALSE(reg.brake_on());
     EXPECT_EQ(reg.stats().brake_episodes, 1u);
 }
 
@@ -260,7 +265,9 @@ TEST(DashFrozenJobRegistryCap, EvictionOrderOldTipThenOldShare)
     FakeClock clk;
     const FrozenMintJob probe = job_with(hex_vec(64, 1024), 64);
     const uint64_t one = one_entry_bytes(probe);
-    FrozenJobRegistry reg(cfg_cap(3 * one + one / 2), clk.fn());
+    // 5 entries raise the brake; its trim level (80% of 4.4) then keeps 3.
+    const uint64_t cap = one * 22 / 5;
+    FrozenJobRegistry reg(cfg_cap(cap), clk.fn());
 
     auto put = [&](uint64_t i, unsigned char t, unsigned char s) {
         reg.put(key(i), job_with(hex_vec(64, 1024), 64), tip(t), share(s));
@@ -271,7 +278,8 @@ TEST(DashFrozenJobRegistryCap, EvictionOrderOldTipThenOldShare)
     clk.advance(1s);
     put(5, 2, 2);                         // tip B, share S2: current
     EXPECT_EQ(reg.size(), 5u) << "inside the grace nothing is evictable";
-    clk.advance(38s);
+    EXPECT_TRUE(reg.brake_on());
+    clk.advance(dash::mint::kFrozenJobGrace + 1s);
     put(6, 2, 2);
 
     EXPECT_FALSE(reg.contains(key(3)));
@@ -280,7 +288,7 @@ TEST(DashFrozenJobRegistryCap, EvictionOrderOldTipThenOldShare)
     EXPECT_TRUE(reg.contains(key(2))) << "an old-share entry went before an old-tip one";
     EXPECT_TRUE(reg.contains(key(5)));
     EXPECT_TRUE(reg.contains(key(6)));
-    EXPECT_LE(reg.bytes(), 3 * one + one / 2);
+    EXPECT_LE(reg.bytes(), cap);
     const auto s = reg.stats();
     EXPECT_EQ(s.evict_cap_oldtip, 2u);
     EXPECT_EQ(s.evict_cap_oldshare, 1u);
@@ -288,8 +296,8 @@ TEST(DashFrozenJobRegistryCap, EvictionOrderOldTipThenOldShare)
     EXPECT_EQ(reg.lookup_for_mint(key(1)).cause, FrozenEvictCause::cap_oldshare);
 }
 
-// An entry superseded less than 30 s ago survives cap pressure, by old share
-// and by old tip; just past the grace it goes.
+// An entry superseded less than the grace (45 s) ago survives cap pressure, by
+// old share and by old tip; just past the grace it goes.
 TEST(DashFrozenJobRegistryCap, GraceKeepsJustSupersededEntries)
 {
     for (const bool by_tip : {false, true}) {
@@ -305,12 +313,12 @@ TEST(DashFrozenJobRegistryCap, GraceKeepsJustSupersededEntries)
         put(2, 1, 1);
         clk.advance(1s);
         put(3, by_tip ? 2 : 1, 2);        // supersedes (1, 1) now
-        clk.advance(29s);
-        put(4, by_tip ? 2 : 1, 2);        // 29 s after: over the cap, nothing evictable
+        clk.advance(dash::mint::kFrozenJobGrace - 1s);
+        put(4, by_tip ? 2 : 1, 2);        // 44 s after: over the cap, nothing evictable
         EXPECT_TRUE(reg.contains(key(1)));
         EXPECT_TRUE(reg.contains(key(2)));
         EXPECT_TRUE(reg.brake_on());
-        clk.advance(1001ms);              // 30.001 s after
+        clk.advance(1001ms);              // 45.001 s after
         put(5, by_tip ? 2 : 1, 2);
         EXPECT_FALSE(reg.contains(key(1)));
         EXPECT_FALSE(reg.contains(key(2)));
@@ -482,7 +490,7 @@ TEST(DashFrozenJobRegistryCap, CapFromCgroupMemoryMax)
         const auto line = dash::mint::format_frozen_registry_config_line(c, FrozenRegistryConfig{});
         EXPECT_NE(line.find("[MINT-REG] config cap_mib=256.0 cap_bytes=268435456 source=no-limit"
                             " cgroup=- memory_max=none"), std::string::npos) << line;
-        EXPECT_NE(line.find(" age_s=420 grace_s=30 backstop=16384 "), std::string::npos) << line;
+        EXPECT_NE(line.find(" age_s=420 grace_s=45 backstop=16384 "), std::string::npos) << line;
     }
 }
 
@@ -496,14 +504,14 @@ TEST(DashFrozenJobRegistryCap, BackstopUsesTierOrder)
         reg.put(key(i), job_with(nullptr, 0), tip(t), share(s));
     };
     put(1, 9, 9);                          // expires before the backstop runs
-    clk.advance(400s);
+    clk.advance(380s);
     put(2, 2, 1); put(3, 2, 1);            // tip B, share S1: old share (T2)
     clk.advance(1s);
     put(4, 1, 0); put(5, 1, 0);            // tip A: old tip (T1), newer than T2
     clk.advance(1s);
     put(6, 2, 2);                          // current
     EXPECT_EQ(reg.size(), 6u) << "inside the grace the backstop admits";
-    clk.advance(38s);
+    clk.advance(dash::mint::kFrozenJobGrace + 1s);
     put(7, 2, 2);
 
     EXPECT_FALSE(reg.contains(key(1)));
@@ -557,4 +565,245 @@ TEST(DashProducerJobCache, SweepsByAgeAtAnySize)
     EXPECT_EQ(cache.size(), 1u) << "older than 60 s is swept at size 2";
     (void)cache.find({share(3), {}}, wd, t0 + 62s);
     EXPECT_EQ(cache.size(), 0u);
+}
+
+// ── Second pass: brake release, interleaving, reorg back, late session,
+//    bounded eviction pass, soft backstop ───────────────────────────────────
+
+// Under a sustained load the brake is released once the kept entries fit:
+// while it is on, the tiers trim to below 80% of the cap, not just to the cap
+// (bytes parked just under the cap would keep it on for the whole load and
+// freeze every block's tx set).
+TEST(DashFrozenJobRegistryCap, BrakeReleasesUnderSustainedLoad)
+{
+    FakeClock clk;
+    const uint64_t cap = 16 * kMiB;
+    FrozenJobRegistry reg(cfg_cap(cap), clk.fn());
+    uint64_t n = 0;
+    for (int i = 0; i < 20; ++i) {   // one context over the cap: the brake engages
+        clk.advance(5s);
+        reg.put(key(++n), job_with(hex_vec(256, 4096), 256), tip(1), share(1));
+    }
+    ASSERT_TRUE(reg.brake_on());
+    // Sustained load: a new 1 MiB job every 5 s, a new best share every 10 s.
+    int released_at = -1;
+    for (int i = 0; i < 60; ++i) {
+        clk.advance(5s);
+        reg.put(key(++n), job_with(hex_vec(256, 4096), 256), tip(1),
+                share(static_cast<unsigned char>(2 + i / 2)));
+        if (released_at < 0 && !reg.brake_on()) released_at = i;
+        if (released_at >= 0) {
+            EXPECT_FALSE(reg.brake_on()) << "re-engaged at put " << i;
+            EXPECT_LE(reg.bytes(), cap) << "put " << i;
+        }
+    }
+    ASSERT_GE(released_at, 0) << "the brake stayed on for the whole load";
+    EXPECT_LE(released_at, 10) << "released one put after the grace";
+    EXPECT_EQ(reg.stats().brake_episodes, 1u);
+}
+
+// Two producers interleave their puts on two contexts (a tip change racing
+// the sessions): each put makes its context current and supersedes the other
+// for a few seconds only, so neither producer's jobs are taken while both
+// keep putting. Once one stops, its jobs go after the grace.
+TEST(DashFrozenJobRegistryCap, InterleavedProducersKeepBothContextsLive)
+{
+    FakeClock clk;
+    const uint64_t one = one_entry_bytes(job_with(hex_vec(64, 1024), 64));
+    FrozenJobRegistry reg(cfg_cap(4 * one), clk.fn());
+    std::vector<uint256> a, b;
+    uint64_t n = 0;
+    for (int i = 0; i < 24; ++i) {   // 120 s, 5 s apart, alternating
+        clk.advance(5s);
+        const bool is_a = (i % 2) == 0;
+        const uint256 r = key(++n);
+        reg.put(r, job_with(hex_vec(64, 1024), 64), is_a ? tip(2) : tip(1),
+                is_a ? share(2) : share(1));
+        (is_a ? a : b).push_back(r);
+        for (const auto& x : a) ASSERT_TRUE(reg.contains(x)) << "producer A lost a job at put " << i;
+        for (const auto& x : b) ASSERT_TRUE(reg.contains(x)) << "producer B lost a job at put " << i;
+    }
+    EXPECT_EQ(reg.stats().evict_cap_oldtip + reg.stats().evict_cap_oldshare, 0u);
+    // B stops; A goes on. Past the grace (45 s after A's first lone put) B's
+    // jobs go, A's stay.
+    for (int i = 0; i < 12; ++i) {
+        clk.advance(5s);
+        const uint256 r = key(++n);
+        reg.put(r, job_with(hex_vec(64, 1024), 64), tip(2), share(2));
+        a.push_back(r);
+    }
+    for (const auto& x : b) EXPECT_FALSE(reg.contains(x));
+    for (const auto& x : a) EXPECT_TRUE(reg.contains(x));
+    EXPECT_EQ(reg.stats().evict_cap_oldtip, b.size());
+}
+
+// A reorg back to an earlier tip: the tip seen before becomes current again
+// with its old context, so its jobs are kept; the orphaned tip's jobs go
+// after the grace.
+TEST(DashFrozenJobRegistryCap, ReorgBackToEarlierTipRevivesIt)
+{
+    FakeClock clk;
+    const uint64_t one = one_entry_bytes(job_with(hex_vec(64, 1024), 64));
+    FrozenJobRegistry reg(cfg_cap(3 * one), clk.fn());
+    auto put = [&](uint64_t i, unsigned char t, unsigned char s) {
+        reg.put(key(i), job_with(hex_vec(64, 1024), 64), tip(t), share(s));
+    };
+    put(1, 1, 1);             // tip A
+    clk.advance(5s);
+    put(2, 1, 1);
+    clk.advance(5s);
+    put(3, 2, 2);             // tip B
+    clk.advance(5s);
+    put(4, 2, 2);
+    clk.advance(5s);
+    put(5, 1, 1);             // B orphaned: back on tip A, same context
+    clk.advance(dash::mint::kFrozenJobGrace + 1s);
+    put(6, 1, 1);
+    EXPECT_TRUE(reg.contains(key(1))) << "the revived tip's old job was taken";
+    EXPECT_TRUE(reg.contains(key(2)));
+    EXPECT_TRUE(reg.contains(key(5)));
+    EXPECT_TRUE(reg.contains(key(6)));
+    EXPECT_FALSE(reg.contains(key(3))) << "the orphaned tip's job is kept";
+    EXPECT_FALSE(reg.contains(key(4)));
+    EXPECT_EQ(reg.lookup_for_mint(key(3)).cause, FrozenEvictCause::cap_oldtip);
+}
+
+// A late session: the best share moves, one session is served on it at once,
+// another only at its next notify, up to the session lag (37.5 s) later, and
+// meanwhile still submits on its old job. Under cap pressure that job is
+// still held 44 s after the supersession (the grace covers the lag), so the
+// submit mints.
+TEST(DashFrozenJobRegistryCap, LateSessionInsideTheGraceStillMints)
+{
+    FakeClock clk;
+    const uint64_t one = one_entry_bytes(job_with(hex_vec(64, 1024), 64));
+    FrozenJobRegistry reg(cfg_cap(3 * one), clk.fn());
+    const uint256 late = key(1);
+    reg.put(late, job_with(hex_vec(64, 1024), 64, 77), tip(1), share(1));
+    reg.put(key(2), job_with(hex_vec(64, 1024), 64), tip(1), share(1));
+    clk.advance(10s);
+    uint64_t n = 100;
+    reg.put(key(++n), job_with(hex_vec(64, 1024), 64), tip(1), share(2));   // supersedes share 1
+    for (int i = 0; i < 7; ++i) {                                            // others, under pressure
+        clk.advance(5s);
+        reg.put(key(++n), job_with(hex_vec(64, 1024), 64), tip(1), share(2));
+    }
+    clk.advance(4s);   // 39 s after the supersession: the late session's result arrives
+    const auto hit = reg.lookup_for_mint(late);
+    ASSERT_TRUE(hit.job.has_value()) << "a job a late session still submits on was taken";
+    EXPECT_EQ(hit.job->share_nonce, 77u);
+    clk.advance(5s);   // 44 s: one more put, still inside the grace
+    reg.put(key(++n), job_with(hex_vec(64, 1024), 64), tip(1), share(2));
+    EXPECT_TRUE(reg.contains(late));
+    clk.advance(dash::mint::kFrozenJobGrace - 44s + 1s);
+    reg.put(key(++n), job_with(hex_vec(64, 1024), 64), tip(1), share(2));
+    EXPECT_FALSE(reg.contains(late)) << "past the grace it goes";
+}
+
+// The eviction pass visits only the contexts past the grace, never the
+// entries one by one: at 16,384 entries in the current context (the brake on,
+// nothing evictable) a put examines no context; with the entries spread over
+// 1,024 superseded contexts it examines at most the candidate contexts. The
+// put hold times are printed ([P2-HOLD]) for the record.
+TEST(DashFrozenJobRegistryCap, EvictionPassVisitsOnlyContextsPastTheGrace)
+{
+    using wall = std::chrono::steady_clock;
+    auto us = [](wall::duration d) {
+        return static_cast<int64_t>(std::chrono::duration_cast<std::chrono::microseconds>(d).count());
+    };
+    const FrozenMintJob small = job_with(nullptr, 8);
+    {   // (a) 16,384 entries, all current: over the cap and at the backstop.
+        FakeClock clk;
+        FrozenJobRegistry reg(cfg_cap(1 * kMiB), clk.fn());
+        for (uint64_t i = 1; i <= 16384; ++i) reg.put(key(i), small, tip(1), share(1));
+        ASSERT_TRUE(reg.brake_on());
+        const uint64_t steps0 = reg.stats().scan_steps;
+        int64_t worst = 0, total = 0;
+        for (uint64_t i = 0; i < 200; ++i) {
+            clk.advance(1ms);
+            const auto t0 = wall::now();
+            reg.put(key(100000 + i), small, tip(1), share(1));
+            const int64_t d = us(wall::now() - t0);
+            worst = std::max(worst, d);
+            total += d;
+        }
+        EXPECT_EQ(reg.stats().scan_steps, steps0) << "a put scanned with nothing evictable";
+        std::cout << "[P2-HOLD] 16384+ current entries, brake on: put max_us=" << worst
+                  << " avg_us=" << total / 200 << "\n";
+    }
+    {   // (b) 16,384 entries over 1,024 superseded contexts, then puts that evict.
+        FakeClock clk;
+        const uint64_t one = one_entry_bytes(job_with(hex_vec(1, 64), 8));
+        FrozenJobRegistry reg(cfg_cap(16000 * one), clk.fn());
+        uint64_t n = 0;
+        for (unsigned c = 0; c < 1024; ++c) {
+            clk.advance(100ms);
+            for (int j = 0; j < 16; ++j)
+                reg.put(key(++n), job_with(hex_vec(1, 64), 8), tip(1), key(c, 0x77));
+        }
+        clk.advance(dash::mint::kFrozenJobGrace + 1s);
+        int64_t worst = 0, total = 0;
+        uint64_t worst_steps = 0;
+        for (int i = 0; i < 200; ++i) {
+            clk.advance(1ms);
+            const uint64_t s0 = reg.stats().scan_steps;
+            const auto t0 = wall::now();
+            reg.put(key(++n), job_with(hex_vec(1, 64), 8), tip(1), key(5000, 0x77));
+            const int64_t d = us(wall::now() - t0);
+            worst = std::max(worst, d);
+            total += d;
+            worst_steps = std::max(worst_steps, reg.stats().scan_steps - s0);
+        }
+        EXPECT_LE(reg.bytes(), 16000 * one);
+        EXPECT_GT(reg.stats().evict_cap_oldshare, 0u);
+        EXPECT_LE(worst_steps, 1024u + 1u) << "a put examined more than the candidate contexts";
+        std::cout << "[P2-HOLD] 16384 entries over 1024 superseded contexts, evicting: put max_us="
+                  << worst << " avg_us=" << total / 200 << " max_contexts_examined="
+                  << worst_steps << "\n";
+        {
+            const auto t0 = wall::now();
+            (void)reg.lookup_for_mint(key(999999999));   // a miss walks the full eviction ring
+            std::cout << "[P2-HOLD] mint lookup miss over a full eviction ring (4096): us="
+                      << us(wall::now() - t0) << "\n";
+        }
+        // (c) everything expired at once (a put after an idle period): each put
+        // evicts at most kEvictBudget, the next puts go on.
+        clk.advance(dash::mint::kFrozenJobAge + 1s);
+        const size_t before = reg.size();
+        const uint64_t aged0 = reg.stats().evict_age;
+        const auto t0 = wall::now();
+        reg.put(key(++n), small, tip(1), key(5000, 0x77));
+        std::cout << "[P2-HOLD] first put after " << before << " entries expired: us="
+                  << us(wall::now() - t0) << " (evicts at most "
+                  << FrozenJobRegistry::kEvictBudget << ")\n";
+        EXPECT_EQ(reg.size(), before + 1 - FrozenJobRegistry::kEvictBudget);
+        for (int i = 0; i < 20; ++i) reg.put(key(++n), small, tip(1), key(5000, 0x77));
+        EXPECT_EQ(reg.size(), 21u);
+        EXPECT_EQ(reg.stats().evict_age - aged0, before);
+    }
+}
+
+// The count backstop is soft: above it the registry admits, counts the puts
+// and warns once per episode.
+TEST(DashFrozenJobRegistryCap, SoftBackstopWarnsOncePerEpisode)
+{
+    FakeClock clk;
+    FrozenJobRegistry reg(cfg_cap(dash::mint::kFrozenRegistryCapMax, /*backstop=*/4), clk.fn());
+    for (uint64_t i = 1; i <= 6; ++i) reg.put(key(i), job_with(nullptr, 0), tip(1), share(1));
+    auto s = reg.stats();
+    EXPECT_EQ(s.entries, 6u) << "the backstop never takes the current context";
+    EXPECT_EQ(s.over_backstop_puts, 2u);
+    EXPECT_EQ(s.backstop_episodes, 1u);
+    const std::string line = FrozenJobRegistry::format_backstop_line(s);
+    EXPECT_NE(line.find("[MINT-REG] COUNT BACKSTOP exceeded with no evictable entry left: entries=6"
+                        " backstop=4"), std::string::npos) << line;
+    clk.advance(dash::mint::kFrozenJobAge + 1s);
+    reg.put(key(7), job_with(nullptr, 0), tip(1), share(1));   // back within
+    for (uint64_t i = 8; i <= 11; ++i) reg.put(key(i), job_with(nullptr, 0), tip(1), share(1));
+    s = reg.stats();
+    EXPECT_EQ(s.entries, 5u);
+    EXPECT_EQ(s.backstop_episodes, 2u);
+    EXPECT_EQ(s.over_backstop_puts, 1u + 2u);
+    EXPECT_NE(FrozenJobRegistry::format_stats_line(s).find(" over_backstop_puts=3 backstop_episodes=2"),
+              std::string::npos);
 }

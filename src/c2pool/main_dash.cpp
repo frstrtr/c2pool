@@ -4325,18 +4325,24 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         LOG_INFO << dash::mint::format_frozen_registry_config_line(cap, cfg);
         return std::make_shared<dash::mint::FrozenJobRegistry>(cfg);
     }();
+    // A won block's bodies, carried from the mint seam's copy of its job: the
+    // rebuild below runs after the win has moved the tip, when the registry
+    // may already have evicted the entry (dash::mint::WonBlockBodies).
+    auto won_bodies = std::make_shared<dash::mint::WonBlockBodies>();
     {
         auto& won_tracker = p2p_node.tracker();
         const core::CoinParams won_params = mint_params;
         core::MiningInterface* won_mi =
             web_server ? web_server->get_mining_interface() : nullptr;
 
-        // v36 finder bodies: the template this node froze for the share's ref.
+        // v36 finder bodies: the template this node froze for the share's ref,
+        // from the mint's carried copy first, else the registry.
         dash::coin::FinderBodiesLookup won_finder =
-            [mint_registry](const uint256& ref) -> std::optional<dash::coin::FinderTemplateBodies> {
-                auto job = mint_registry->get(ref);
-                if (!job || !job->tx_data_hex) return std::nullopt;
-                return dash::coin::FinderTemplateBodies{job->desired_tx_hashes, job->tx_data_hex};
+            [mint_registry, won_bodies](const uint256& ref)
+                -> std::optional<dash::coin::FinderTemplateBodies> {
+                auto b = dash::mint::won_block_bodies_for(*won_bodies, *mint_registry, ref);
+                if (!b) return std::nullopt;
+                return dash::coin::FinderTemplateBodies{std::move(b->tx_hashes), b->tx_data_hex};
             };
         dash::coin::WonBlockReconstructor won_reconstruct =
             [&won_tracker, won_params, won_finder](const uint256& sh)
@@ -5148,7 +5154,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // commitment, deterministic producer rebuild (X11 identity gate +
         // pow<=target ban-safety gate inside), tracker insert + broadcast.
         work_source->set_mint_share_fn(
-            [node_ptr, mint_registry, deferred_minter, prev_claims](
+            [node_ptr, mint_registry, won_bodies, deferred_minter, prev_claims](
                 const dash::stratum::DASHWorkSource::MintShareInputs& in) -> uint256
             {
                 if (in.ref_hash.IsNull()) {
@@ -5159,8 +5165,11 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 // The frozen job is COPIED here, at arrival: a queued solve never
                 // depends on the registry still holding its job. A miss is LOUD:
                 // the WARNING names the cause (age, cap_oldtip, cap_oldshare,
-                // backstop, unknown) with its counter (frozen_job_for_mint).
-                auto frozen = dash::mint::frozen_job_for_mint(*mint_registry, in.ref_hash);
+                // backstop, unknown) with its counter (frozen_job_for_mint). A won
+                // block's bodies are recorded for its rebuild (WonBlockBodies).
+                auto frozen = dash::mint::frozen_job_for_mint(
+                    *mint_registry, in.ref_hash, nullptr,
+                    in.won_block ? won_bodies.get() : nullptr);
                 if (!frozen)
                     return uint256();
 

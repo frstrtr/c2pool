@@ -41,6 +41,7 @@
 #include <impl/dash/coin/serve_gate_ledger_json.hpp>  // serve_gate_ledger_{to_json,save,load} — cumulative cross-restart accounting
 #include <impl/dash/coinbase_builder.hpp>     // compute_dash_payouts, build, split_coinb, merkle helpers
 #include <impl/dash/coin/block_producer.hpp>  // compute_merkle_root, append_compact_size, target_from_nbits
+#include <impl/dash/coin/subsidy.hpp>         // is_superblock_height (the store brake's skip rule)
 #include <impl/dash/crypto/hash_x11.hpp>      // dash::crypto::hash_x11 (X11 PoW SSOT)
 #include <impl/dash/params.hpp>               // dash::make_coin_params
 #include <impl/dash/coin/vendor/cbtx.hpp>     // vendor::parse_cbtx (GBT-xcheck creditPool)
@@ -213,7 +214,7 @@ DASHWorkSource::DASHWorkSource(const coin::NodeCoinState& coin_state,
     // ~90 s. Re-notify the CURRENT job (non-clean, so no ASIC work reset) every
     // 25 s -- comfortably under the 60 s watchdog -- so any node is a stable
     // backup regardless of slot/path/RPC-timeout settings.
-    config_.keepalive_notify_sec     = 25;
+    config_.keepalive_notify_sec     = kKeepaliveNotifySec;   // 25 s
     LOG_INFO << "[DASH-STRATUM] DASHWorkSource constructed"
              << " (min_diff=" << config_.min_difficulty
              << " max_diff=" << config_.max_difficulty
@@ -1752,14 +1753,15 @@ void DASHWorkSource::resource_template_now(CoinStateArm arm) const
         }
         // SAFETY BRAKE (frozen-job registry over its byte cap with no
         // evictable entry left): a same-tip refresh from the same arm that
-        // changes only the tx set is not stored. The cached template keeps
+        // changes only the tx set (the same payees and CbTx payload, not at a
+        // superblock height: store_brake_may_skip) is not stored. The cached template keeps
         // being served and is re-stamped fresh, with the same generation
         // discipline as a store, so the sessions do not re-source on every
         // request. A tip change, an arm change and any store after an
         // invalidate (the cache was dropped, so there is no `prev`: an islock
         // conflict, a reconnect, a failed serve-time re-check) still store.
         if (prev && prev_is_embedded == work_is_embedded
-            && store_brake_may_skip(*prev, work) && store_brake_engaged()) {
+            && store_brake_may_skip(*prev, work, superblock_cycle()) && store_brake_engaged()) {
             bool skipped = false;
             uint64_t skips = 0;
             {
@@ -3356,12 +3358,37 @@ bool DASHWorkSource::store_brake_engaged() const
 }
 
 bool DASHWorkSource::store_brake_may_skip(const coin::DashWorkData& cached,
-                                          const coin::DashWorkData& next)
+                                          const coin::DashWorkData& next,
+                                          int superblock_cycle)
 {
-    return cached.m_previous_block == next.m_previous_block
-        && cached.m_height == next.m_height
-        && cached.m_bits == next.m_bits
-        && cached.m_tx_hashes != next.m_tx_hashes;
+    // The same coin tip, and another tx set.
+    if (cached.m_previous_block != next.m_previous_block || cached.m_height != next.m_height
+        || cached.m_bits != next.m_bits)
+        return false;
+    if (cached.m_tx_hashes == next.m_tx_hashes)
+        return false;
+    // A superblock height pays governance triggers, which are not tip state: a
+    // trigger funded at this tip changes the payments, and a block over the
+    // kept template would fail bad-cb-payee. Never skip there.
+    if (coin::is_superblock_height(next.m_height, superblock_cycle))
+        return false;
+    // Anywhere else the payee list (in order) and the CbTx payload must be
+    // byte-equal. The amounts may differ: the masternode amount is a share of
+    // subsidy + fees, so it moves with the tx set the kept template keeps
+    // consistently (requiring equal amounts would never skip at all).
+    if (cached.m_packed_payments.size() != next.m_packed_payments.size())
+        return false;
+    for (size_t i = 0; i < next.m_packed_payments.size(); ++i)
+        if (cached.m_packed_payments[i].payee != next.m_packed_payments[i].payee)
+            return false;
+    return cached.m_coinbase_payload == next.m_coinbase_payload;
+}
+
+int DASHWorkSource::superblock_cycle() const
+{
+    // dashcore nSuperblockCycle: mainnet 16616, testnet 24, regtest 10.
+    if (is_regtest_) return 10;
+    return is_testnet_ ? coin::DASH_SUPERBLOCK_CYCLE_TESTNET : coin::DASH_SUPERBLOCK_CYCLE_MAINNET;
 }
 
 // ── Serve timing (ServeTimingSummary) ───────────────────────────────────────
