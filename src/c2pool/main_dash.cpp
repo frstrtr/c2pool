@@ -327,6 +327,17 @@ bool g_mempool_entry_probe = false;
 // try-and-decline, exactly.
 bool g_deferred_mint = dash::mint::kDeferredMintDefault;
 
+// --frozen-job-cap-mb N: override the frozen-job registry's byte cap (MiB, at
+// least 1). Unset (0) = the cgroup rule, min(256 MiB, memory.max / 8) with a
+// floor of 64 MiB (dash::mint::frozen_registry_cap_from_cgroup). For shadow
+// runs that exercise the eviction tiers and the safety brake on real traffic.
+uint64_t g_frozen_job_cap_mb = 0;
+
+// --regtest: DASH rides the testnet identity for it (testnet = true), and this
+// remembers that it is regtest, for what differs: the work source's superblock
+// cycle (10, not testnet's 24), which the store brake's skip rule reads.
+bool g_regtest = false;
+
 // --embedded-mn-bridge-no-cursor (#91): DISABLE the bridge's resumable replay
 // cursor, so every process start replays the whole window from the pinned
 // anchor — exactly the behaviour before #91 existed.
@@ -660,6 +671,9 @@ void print_banner(const char* argv0)
         << "             (queue a solve the busy tracker cannot take and mint it at the next\n"
         << "              free lock instead of declining it; default off: --no-deferred-mint\n"
         << "              is the old single try-and-decline)\n"
+        << "           [--frozen-job-cap-mb N]\n"
+        << "             (frozen-job registry byte cap in MiB; default min(256, cgroup\n"
+        << "              memory.max / 8), at least 64; for shadow runs)\n"
         << "           [--mempool-entry-probe]\n"
         << "             (wire the direct-local GET /mempool_entry?txid= probe for the fee-parity\n"
         << "              shadow; default off)\n"
@@ -4302,19 +4316,38 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // node refuses a tx-committing v36 won block (the finder's stratum arm
     // already submitted it). The registry is created here so the reconstructor
     // and the mint wiring below share the one instance.
-    auto mint_registry = std::make_shared<dash::mint::FrozenJobRegistry>();
+    //
+    // Bounded by age (420 s after the last put), bytes (the cgroup rule, or
+    // --frozen-job-cap-mb) and count (16,384); see FrozenJobRegistry.
+    auto mint_registry = [] {
+        dash::mint::FrozenRegistryCapChoice cap = dash::mint::frozen_registry_cap_from_cgroup();
+        if (g_frozen_job_cap_mb != 0) {
+            cap.cap_bytes = g_frozen_job_cap_mb * dash::mint::kMiB;
+            cap.source    = "flag";
+        }
+        dash::mint::FrozenRegistryConfig cfg;
+        cfg.cap_bytes = cap.cap_bytes;
+        LOG_INFO << dash::mint::format_frozen_registry_config_line(cap, cfg);
+        return std::make_shared<dash::mint::FrozenJobRegistry>(cfg);
+    }();
+    // A won block's bodies, carried from the mint seam's copy of its job: the
+    // rebuild below runs after the win has moved the tip, when the registry
+    // may already have evicted the entry (dash::mint::WonBlockBodies).
+    auto won_bodies = std::make_shared<dash::mint::WonBlockBodies>();
     {
         auto& won_tracker = p2p_node.tracker();
         const core::CoinParams won_params = mint_params;
         core::MiningInterface* won_mi =
             web_server ? web_server->get_mining_interface() : nullptr;
 
-        // v36 finder bodies: the template this node froze for the share's ref.
+        // v36 finder bodies: the template this node froze for the share's ref,
+        // from the mint's carried copy first, else the registry.
         dash::coin::FinderBodiesLookup won_finder =
-            [mint_registry](const uint256& ref) -> std::optional<dash::coin::FinderTemplateBodies> {
-                auto job = mint_registry->get(ref);
-                if (!job || !job->tx_data_hex) return std::nullopt;
-                return dash::coin::FinderTemplateBodies{job->desired_tx_hashes, job->tx_data_hex};
+            [mint_registry, won_bodies](const uint256& ref)
+                -> std::optional<dash::coin::FinderTemplateBodies> {
+                auto b = dash::mint::won_block_bodies_for(*won_bodies, *mint_registry, ref);
+                if (!b) return std::nullopt;
+                return dash::coin::FinderTemplateBodies{std::move(b->tx_hashes), b->tx_data_hex};
             };
         dash::coin::WonBlockReconstructor won_reconstruct =
             [&won_tracker, won_params, won_finder](const uint256& sh)
@@ -4562,6 +4595,9 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     auto work_source = std::make_shared<dash::stratum::DASHWorkSource>(
         node_coin_state, std::move(dashd_fallback), std::move(stratum_submit_fn),
         core::stratum::StratumConfig{}, testnet);
+    // --regtest rides the testnet flag; the work source still needs to know
+    // (its superblock cycle is regtest's 10, read by the store brake).
+    work_source->set_regtest(g_regtest);
     // Gate-lift (v0.2.4): allow the daemonless embedded arm on mainnet when the
     // operator opts in via --embedded-mainnet. The CbTx is proven byte-identical
     // to real dashd (both merkle roots reproduced from the mnlistdiff wire); the
@@ -4906,18 +4942,12 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // Per-(prev, payout, template) CACHE: sessions re-notify every ~1 s;
         // a fresh random share_nonce per notify would make every job's bytes
         // unique — defeating the session's shared-payload reuse AND churning
-        // the frozen-job registry past its eviction window. Rebuilding is
-        // deterministic given the same inputs, so within a 30 s TTL (the
-        // template staleness window) the SAME job is served.
-        struct ProducerJobCacheEntry {
-            dash::mint::ProducerJobBuild build;
-            uint256 coin_tip;
-            uint32_t height{0};
-            std::chrono::steady_clock::time_point at;
-        };
-        using ProducerJobKey = std::pair<uint256, std::vector<unsigned char>>;
-        auto job_cache = std::make_shared<
-            std::map<ProducerJobKey, ProducerJobCacheEntry>>();
+        // the frozen-job registry. Rebuilding is deterministic given the same
+        // inputs, so within a 30 s TTL (the template staleness window) the
+        // SAME job is served (dash::mint::ProducerJobCache: the hit rule, and
+        // a 60 s age sweep on every call).
+        using ProducerJobKey = dash::mint::ProducerJobCache::Key;
+        auto job_cache = std::make_shared<dash::mint::ProducerJobCache>();
 
         work_source->set_producer_job_fn(
             // stratum_server is captured BY REFERENCE (the sibling lambdas'
@@ -4954,34 +4984,19 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 // cached coinbase to the exact tx set (and therefore the exact
                 // fee total) it was computed for; payment_amount equality is the
                 // cheap belt for any same-height payment-array drift.
-                if (auto it = job_cache->find(key); it != job_cache->end()) {
-                    auto& e = it->second;
-                    if (e.coin_tip == wd.m_previous_block && e.height == wd.m_height
-                        && e.build.frozen.payment_amount == wd.m_payment_amount
-                        && e.build.frozen.desired_tx_hashes == wd.m_tx_hashes
-                        && now - e.at < std::chrono::seconds(30)) {
-                        mint_registry->put(e.build.job.ref_hash, e.build.frozen);
-                        return e.build.job;
-                    }
-                    if (e.coin_tip == wd.m_previous_block && e.height == wd.m_height
-                        && now - e.at < std::chrono::seconds(30)) {
-                        static int drift_log = 0;
-                        if (drift_log++ % 20 == 0)
-                            LOG_INFO << "[MINT] producer job cache invalidated: "
-                                        "template tx-set/fee drift at same tip "
-                                        "(h=" << wd.m_height << ") -- rebuilding "
-                                        "gentx over the current template";
-                    }
-                    job_cache->erase(it);
+                const auto hit = job_cache->find(key, wd, now);
+                if (hit.outcome == dash::mint::ProducerJobCache::Outcome::hit) {
+                    mint_registry->put(hit.build->job.ref_hash, hit.build->frozen,
+                                       wd.m_previous_block, prev_share_hash);
+                    return hit.build->job;
                 }
-                // Lazy TTL sweep keeps the cache bounded across miner churn.
-                if (job_cache->size() > 128) {
-                    for (auto it = job_cache->begin(); it != job_cache->end();) {
-                        if (now - it->second.at > std::chrono::seconds(60))
-                            it = job_cache->erase(it);
-                        else
-                            ++it;
-                    }
+                if (hit.outcome == dash::mint::ProducerJobCache::Outcome::drift) {
+                    static int drift_log = 0;
+                    if (drift_log++ % 20 == 0)
+                        LOG_INFO << "[MINT] producer job cache invalidated: "
+                                    "template tx-set/fee drift at same tip "
+                                    "(h=" << wd.m_height << ") -- rebuilding "
+                                    "gentx over the current template";
                 }
 
                 auto guard = node_ptr->read_tracker();
@@ -5126,22 +5141,28 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     }
                 }
 
-                mint_registry->put(built->job.ref_hash, built->frozen);
+                mint_registry->put(built->job.ref_hash, built->frozen,
+                                   wd.m_previous_block, prev_share_hash);
                 // Template txs -> m_known_txs so share relay can serve
                 // remember_tx for the share's new_transaction_hashes.
                 node_ptr->register_template_txs(wd.m_txs, wd.m_tx_hashes);
 
-                auto job = built->job;
-                (*job_cache)[key] = ProducerJobCacheEntry{
-                    std::move(*built), wd.m_previous_block, wd.m_height, now};
-                return job;
+                auto shared = std::make_shared<const dash::mint::ProducerJobBuild>(
+                    std::move(*built));
+                job_cache->store(key, shared, wd.m_previous_block, wd.m_height, now);
+                return shared->job;
             });
+
+        // The registry's SAFETY BRAKE reaches the template store: while it is
+        // over its byte cap with no evictable entry left, same-tip refreshes
+        // that change only the tx set are not stored (tip changes still are).
+        work_source->set_store_brake_fn([mint_registry] { return mint_registry->brake_on(); });
 
         // The mint itself: registry lookup by the coinbase's OP_RETURN
         // commitment, deterministic producer rebuild (X11 identity gate +
         // pow<=target ban-safety gate inside), tracker insert + broadcast.
         work_source->set_mint_share_fn(
-            [node_ptr, mint_registry, deferred_minter, prev_claims](
+            [node_ptr, mint_registry, won_bodies, deferred_minter, prev_claims](
                 const dash::stratum::DASHWorkSource::MintShareInputs& in) -> uint256
             {
                 if (in.ref_hash.IsNull()) {
@@ -5150,14 +5171,15 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     return uint256();
                 }
                 // The frozen job is COPIED here, at arrival: a queued solve never
-                // depends on the registry still holding its job (FIFO cap 512).
-                auto frozen = mint_registry->get(in.ref_hash);
-                if (!frozen) {
-                    LOG_WARNING << "[MINT] no frozen job for ref="
-                                << in.ref_hash.GetHex().substr(0, 16)
-                                << " (evicted/foreign) — declined";
+                // depends on the registry still holding its job. A miss is LOUD:
+                // the WARNING names the cause (age, cap_oldtip, cap_oldshare,
+                // backstop, unknown) with its counter (frozen_job_for_mint). A won
+                // block's bodies are recorded for its rebuild (WonBlockBodies).
+                auto frozen = dash::mint::frozen_job_for_mint(
+                    *mint_registry, in.ref_hash, nullptr,
+                    in.won_block ? won_bodies.get() : nullptr);
+                if (!frozen)
                     return uint256();
-                }
 
                 // #889: a WON BLOCK is unrepeatable, so mint_solve_once gives it
                 // a BOUNDED WAIT for the tracker (the block itself was submitted
@@ -13127,8 +13149,8 @@ int main(int argc, char** argv)
             payout_pkh_hex = argv[++i];
         else if (std::strcmp(argv[i], "--max-nonce") == 0 && i + 1 < argc)
             max_nonce = std::strtoull(argv[++i], nullptr, 0);
-        else if (std::strcmp(argv[i], "--testnet") == 0 ||
-                 std::strcmp(argv[i], "--regtest") == 0)  testnet = true;
+        else if (std::strcmp(argv[i], "--testnet") == 0)  testnet = true;
+        else if (std::strcmp(argv[i], "--regtest") == 0) { testnet = true; g_regtest = true; }
         else if ((std::strcmp(argv[i], "--coin-rpc") == 0 ||
                   std::strcmp(argv[i], "--coin-daemon") == 0) && i + 1 < argc)
             rpc_endpoint = argv[++i];
@@ -13205,6 +13227,16 @@ int main(int argc, char** argv)
             g_deferred_mint = true;
         else if (std::strcmp(argv[i], "--no-deferred-mint") == 0)
             g_deferred_mint = false;
+        else if (std::strcmp(argv[i], "--frozen-job-cap-mb") == 0 && i + 1 < argc) {
+            char* end = nullptr;
+            const unsigned long long mb = std::strtoull(argv[++i], &end, 10);
+            if (end == argv[i] || *end != '\0' || mb == 0 || mb > 1024ull * 1024ull) {
+                std::cerr << "--frozen-job-cap-mb: expected a number of MiB in [1, 1048576], got '"
+                          << argv[i] << "'\n";
+                return 1;
+            }
+            g_frozen_job_cap_mb = mb;
+        }
         else if (std::strcmp(argv[i], "--explorer") == 0)
             explorer_enabled = true;
         else if (std::strcmp(argv[i], "--no-explorer") == 0)

@@ -29,6 +29,7 @@
 // new DashWorkData instance exactly as production does.
 
 #include <impl/dash/stratum/work_source.hpp>
+#include <impl/dash/coin/subsidy.hpp>      // DASH_SUPERBLOCK_CYCLE_MAINNET (P2' store brake)
 #include <impl/dash/coinbase_builder.hpp>   // sha256d
 #include <impl/dash/coin/dash_txid.hpp>     // dash_txid, dash_instance_hash (v24 stable txid)
 #include <impl/dash/coin/vendor/bls_mode_guard.hpp>
@@ -45,6 +46,10 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <iterator>
+#include <fstream>
+#include <cctype>
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <future>
@@ -1195,11 +1200,241 @@ TEST(DashP5SharedTxHex, ServeTimingWritesOneLinePerTemplate)
     EXPECT_TRUE(std::regex_match(line, std::regex(
         R"(\[DASH-SERVE-TIMING\] serve timing per template: seq=\d+ h=\d+ txs=\d+ bytes=\d+ )"
         R"(serves=\d+ spans=\d+ serve_us p50=\d+ p99=\d+ max=\d+ )"
-        R"(coinbase_us p50=\d+ p99=\d+ max=\d+ live_hex_chars=-?\d+)")))
+        R"(coinbase_us p50=\d+ p99=\d+ max=\d+ live_hex_chars=-?\d+ )"
+        R"(store_brake=(on|off) brake_skips=\d+)")))
         << line;
     EXPECT_NE(line.find(" txs=6 bytes=1410 serves=6 spans=5 "), std::string::npos) << line;
 
     // Serving C further writes nothing until the next template.
     (void)serve_once(ws, 0x33);
     EXPECT_EQ(ws.serve_timing_lines(), 1u);
+}
+
+// ── P2': the frozen-job registry's safety brake at the template store ───────
+//
+// While the registry is over its byte cap with no evictable entry left
+// (FrozenJobRegistry::brake_on, wired through set_store_brake_fn), a same-tip
+// refresh that changes only the tx set is not stored: the cached template
+// keeps being served, re-stamped fresh so the sessions do not re-source on
+// every request. A tip change, a same-set refresh, any store after an
+// invalidate, and every refresh once the brake is off still store. The serve
+// timing line carries the brake and its skip count.
+TEST(DashWorkSourceStoreBrake, SkipsSameTipTxRefreshKeepsTipStore)
+{
+    Source src;
+    src.set(tmpl_A());
+    int calls = 0;
+    auto fb = src.fallback();
+    DASHWorkSource ws(src.coin_state, [&calls, fb] { ++calls; return fb(); }, Source::submit());
+    std::atomic<bool> brake{false};
+    ws.set_store_brake_fn([&brake] { return brake.load(); });
+
+    (void)serve_once(ws);
+    const auto a = ws.peek_template();
+    ASSERT_TRUE(a);
+
+    // ON: a same-tip refresh with another tx set is not stored.
+    brake = true;
+    src.set(tmpl_C());
+    ws.bump_work_generation();
+    const int before = calls;
+    const auto c = serve_once(ws);
+    EXPECT_EQ(calls, before + 1) << "the refresh ran";
+    EXPECT_EQ(ws.peek_template(), a) << "the cached template is kept";
+    EXPECT_EQ(ws.store_brake_skips(), 1u);
+    ASSERT_TRUE(c.snapshot.tx_data);
+    EXPECT_EQ(*c.snapshot.tx_data, tmpl_A().m_tx_data_hex) << "the sessions keep A's bodies";
+    (void)serve_once(ws, 0x33);
+    (void)serve_once(ws, 0x44);
+    EXPECT_EQ(calls, before + 1) << "re-stamped fresh: no re-source per request";
+
+    // ON: a tip change stores.
+    src.set(tmpl_D());
+    ws.bump_work_generation();
+    (void)serve_once(ws);
+    const auto d = ws.peek_template();
+    ASSERT_TRUE(d);
+    EXPECT_NE(d->m_previous_block, a->m_previous_block);
+    EXPECT_EQ(ws.store_brake_skips(), 1u);
+    {
+        const auto s = ws.last_serve_timing();   // A's line, written at D's first serve
+        ASSERT_TRUE(s.has_value());
+        EXPECT_EQ(s->seq, a->m_tx_hex_shared.seq());
+        EXPECT_TRUE(s->store_brake);
+        EXPECT_EQ(s->store_brake_skips, 1u);
+        const std::string line = DASHWorkSource::format_serve_timing_line(*s);
+        EXPECT_NE(line.find(" store_brake=on brake_skips=1"), std::string::npos) << line;
+    }
+
+    // ON: a same-tip refresh that adds txs to D is not stored.
+    const DashWorkData e1 = make_template(kPrev2, 2583002u, 164500000ULL, {{0x51, 40}, {0x52, 90}});
+    src.set(e1);
+    ws.bump_work_generation();
+    (void)serve_once(ws);
+    EXPECT_EQ(ws.peek_template(), d);
+    EXPECT_EQ(ws.store_brake_skips(), 2u);
+
+    // ON: after an invalidate there is no cached template to keep: it stores.
+    ws.invalidate_template_cache("kat: P2' store brake");
+    (void)serve_once(ws);
+    const auto e1_stored = ws.peek_template();
+    ASSERT_TRUE(e1_stored);
+    EXPECT_EQ(e1_stored->m_tx_hashes, e1.m_tx_hashes);
+    EXPECT_EQ(ws.store_brake_skips(), 2u);
+
+    // ON: the same tx set again is not a tx change: it stores (reusing the vector).
+    ws.bump_work_generation();
+    (void)serve_once(ws);
+    const auto e1_again = ws.peek_template();
+    ASSERT_TRUE(e1_again);
+    EXPECT_NE(e1_again, e1_stored);
+    EXPECT_EQ(e1_again->m_tx_hex_shared.hex().get(), e1_stored->m_tx_hex_shared.hex().get());
+    EXPECT_EQ(ws.store_brake_skips(), 2u);
+
+    // OFF: a same-tip tx change stores.
+    brake = false;
+    const DashWorkData e2 = make_template(kPrev2, 2583002u, 164600000ULL, {{0x61, 70}});
+    src.set(e2);
+    ws.bump_work_generation();
+    (void)serve_once(ws);
+    ASSERT_TRUE(ws.peek_template());
+    EXPECT_EQ(ws.peek_template()->m_tx_hashes, e2.m_tx_hashes);
+    EXPECT_EQ(ws.store_brake_skips(), 2u);
+
+    // The skip rule itself.
+    const int cycle = dash::coin::DASH_SUPERBLOCK_CYCLE_MAINNET;
+    EXPECT_TRUE(DASHWorkSource::store_brake_may_skip(tmpl_A(), tmpl_C(), cycle));
+    EXPECT_FALSE(DASHWorkSource::store_brake_may_skip(tmpl_A(), tmpl_B(), cycle)) << "same set";
+    EXPECT_FALSE(DASHWorkSource::store_brake_may_skip(tmpl_C(), tmpl_D(), cycle)) << "tip change";
+}
+
+// With the brake on, a same-tip refresh is skipped only when nothing but the
+// tx set and its fee-driven amounts changed. A new payee, a new CbTx payload,
+// and ANY refresh at a superblock height (a governance trigger funded at this
+// tip changes the payments) are stored: a block over the kept template would
+// otherwise fail bad-cb-payee.
+TEST(DashWorkSourceStoreBrake, PaymentOrPayloadChangeAtSameTipStores)
+{
+    const int cycle = dash::coin::DASH_SUPERBLOCK_CYCLE_MAINNET;
+    const uint32_t sb_height = 156u * 16616u;   // 2,592,096: a mainnet superblock height
+    auto more_fees = [](DashWorkData w) {        // another tx set; the MN amount follows its fees
+        w = make_template(kPrev1, 2583001u, 165100000ULL, {{0x71, 30}, {0x72, 60}});
+        w.m_packed_payments[0].amount += 12345;
+        w.m_payment_amount = w.m_packed_payments[0].amount;
+        return w;
+    };
+    EXPECT_TRUE(DASHWorkSource::store_brake_may_skip(tmpl_A(), more_fees(tmpl_A()), cycle))
+        << "a fee-driven amount change alone is a tx-only refresh";
+    {
+        auto w = more_fees(tmpl_A());
+        auto s = p2pkh(0x23);
+        w.m_packed_payments[0].payee = "!" + HexStr(std::span<const unsigned char>(s.data(), s.size()));
+        EXPECT_FALSE(DASHWorkSource::store_brake_may_skip(tmpl_A(), w, cycle)) << "a new payee";
+    }
+    {
+        auto w = more_fees(tmpl_A());
+        w.m_coinbase_payload = {0x03, 0x00, 0x01};
+        EXPECT_FALSE(DASHWorkSource::store_brake_may_skip(tmpl_A(), w, cycle)) << "a new CbTx payload";
+    }
+    const char* const kPrevSb = "0000000000000011223344556677889900aabbccddeeff00112233445566778a";
+    const DashWorkData sb0 = make_template(kPrevSb, sb_height, 165000000ULL, {{0x31, 10}});
+    DashWorkData sb1 = make_template(kPrevSb, sb_height, 165000000ULL, {{0x32, 10}});
+    EXPECT_FALSE(DASHWorkSource::store_brake_may_skip(sb0, sb1, cycle))
+        << "a superblock height never skips, even with the same payees";
+    dash::coin::PackedPayment trigger;
+    trigger.payee  = "!76a914" + std::string(40, '9') + "88ac";
+    trigger.amount = 10000000ULL;              // inside the template's coinbase value
+    sb1.m_packed_payments.push_back(trigger);   // a trigger funded at this tip
+    sb1.m_payment_amount += trigger.amount;
+    EXPECT_FALSE(DASHWorkSource::store_brake_may_skip(sb0, sb1, cycle));
+
+    // Through the store, with the brake on.
+    Source src;
+    src.set(tmpl_A());
+    DASHWorkSource ws(src.coin_state, src.fallback(), Source::submit());
+    std::atomic<bool> brake{true};
+    ws.set_store_brake_fn([&brake] { return brake.load(); });
+    (void)serve_once(ws);
+    const auto a = ws.peek_template();
+    ASSERT_TRUE(a);
+    src.set(more_fees(tmpl_A()));
+    ws.bump_work_generation();
+    (void)serve_once(ws);
+    EXPECT_EQ(ws.peek_template(), a) << "fee-only refresh skipped";
+    EXPECT_EQ(ws.store_brake_skips(), 1u);
+    {
+        auto w = more_fees(tmpl_A());
+        w.m_coinbase_payload = {0x03, 0x00, 0x01};
+        src.set(w);
+        ws.bump_work_generation();
+        (void)serve_once(ws);
+        ASSERT_TRUE(ws.peek_template());
+        EXPECT_EQ(ws.peek_template()->m_coinbase_payload, w.m_coinbase_payload) << "payload change stored";
+        EXPECT_EQ(ws.store_brake_skips(), 1u);
+    }
+    src.set(sb0);
+    ws.bump_work_generation();
+    (void)serve_once(ws);
+    ASSERT_TRUE(ws.peek_template());
+    ASSERT_EQ(ws.peek_template()->m_height, sb_height);
+    src.set(sb1);
+    ws.bump_work_generation();
+    (void)serve_once(ws);
+    ASSERT_TRUE(ws.peek_template());
+    EXPECT_EQ(ws.peek_template()->m_packed_payments.size(), 2u)
+        << "the newly funded trigger reached the served template";
+    EXPECT_EQ(ws.store_brake_skips(), 1u);
+}
+
+// --regtest rides the testnet flag on DASH, but its superblock cycle is 10,
+// not testnet's 24. The run wires it (main_dash: --regtest -> g_regtest ->
+// DASHWorkSource::set_regtest), so at a regtest superblock height the store
+// brake never skips a same-tip refresh; one height later it does.
+TEST(DashWorkSourceStoreBrake, RegtestSuperblockHeightNeverSkips)
+{
+    const uint32_t h = 151u * 10u;   // 1,510: a regtest superblock height, not a testnet (24) one
+    ASSERT_NE(h % 24u, 0u);
+    auto at = [](uint32_t height, unsigned char tag) {
+        return make_template(kPrev1, height, 165000000ULL, {{tag, 40}});
+    };
+    auto run = [&](uint32_t height, bool regtest) {
+        Source src;
+        src.set(at(height, 0x31));
+        DASHWorkSource ws(src.coin_state, src.fallback(), Source::submit(),
+                          core::stratum::StratumConfig{}, /*is_testnet=*/true);
+        ws.set_regtest(regtest);
+        std::atomic<bool> brake{true};
+        ws.set_store_brake_fn([&brake] { return brake.load(); });
+        (void)serve_once(ws);
+        src.set(at(height, 0x32));   // same tip and payees, another tx set
+        ws.bump_work_generation();
+        (void)serve_once(ws);
+        return std::make_pair(ws.superblock_cycle(), ws.store_brake_skips());
+    };
+    {
+        const auto [cycle, skips] = run(h, /*regtest=*/true);
+        EXPECT_EQ(cycle, dash::coin::DASH_SUPERBLOCK_CYCLE_REGTEST);
+        EXPECT_EQ(skips, 0u) << "a regtest superblock height was skipped";
+    }
+    {
+        const auto [cycle, skips] = run(h + 1, /*regtest=*/true);
+        EXPECT_EQ(cycle, 10);
+        EXPECT_EQ(skips, 1u) << "one height later the brake skips";
+    }
+    {
+        const auto [cycle, skips] = run(h, /*regtest=*/false);
+        EXPECT_EQ(cycle, dash::coin::DASH_SUPERBLOCK_CYCLE_TESTNET);
+        EXPECT_EQ(skips, 1u) << "without the regtest flag the testnet cycle applies";
+    }
+
+    // The run wires it: --regtest sets the flag, and the work source gets it.
+    std::ifstream in(DASH_MAIN_SRC);
+    ASSERT_TRUE(in.good()) << "cannot open " << DASH_MAIN_SRC;
+    std::string src((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    src.erase(std::remove_if(src.begin(), src.end(), [](unsigned char c) { return std::isspace(c); }),
+              src.end());
+    EXPECT_NE(src.find(R"("--regtest")==0){testnet=true;g_regtest=true;})"), std::string::npos)
+        << "--regtest does not set g_regtest";
+    EXPECT_NE(src.find("work_source->set_regtest(g_regtest);"), std::string::npos)
+        << "the DASH work source is not told about --regtest";
 }

@@ -19,6 +19,8 @@
 //   F3. Bodies that do not match the committed link -- a swapped body, a
 //       missing body, a reordered hash list, a foreign template -- are refused
 //       with a named cause (v36_finder_block_bodies) and nothing is framed.
+//   F4. A won block rebuilds from the bodies the mint carried after the
+//       frozen-job registry evicted its job (dash::mint::WonBlockBodies).
 //
 // Folded into test_dash_node (the same harness and link set as
 // test_dash_v36_flip.cpp).
@@ -33,6 +35,7 @@
 #include <impl/dash/coin/reconstruct_won_block.hpp>
 #include <impl/dash/mint_runloop.hpp>
 
+#include <chrono>
 #include <memory>
 #include <optional>
 #include <string>
@@ -272,4 +275,57 @@ TEST(DashV36FinderBlock, FinderRejectsBodiesThatDoNotMatchTheLink)
         refused({good.tx_hashes, std::make_shared<const std::vector<std::string>>(hex)},
                 "tx 2");
     }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// F4. P2': a won block rebuilds after the registry evicted its job
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// The mint seam copies the frozen job when the won solve arrives and records
+// its bodies (WonBlockBodies); the rebuild runs later, after the win has moved
+// the tip, and by then the bounded registry may have evicted the entry. The
+// rebuild reads the carried copy first, so it still frames the full block.
+TEST(DashV36FinderBlock, WonBlockRebuildsAfterItsEntryWasEvicted)
+{
+    IdentityGuard guard;
+    FinderRig rig(make_wd_with_txs(3));
+    ASSERT_TRUE(rig.ok());
+    const auto& child = rig.child();
+    const uint256 ref = rig.j2.build.job.ref_hash;
+
+    auto t = std::chrono::steady_clock::time_point{} + std::chrono::hours(1);
+    dash::mint::FrozenJobRegistry registry(dash::mint::FrozenRegistryConfig{}, [&t] { return t; });
+    dash::mint::WonBlockBodies won;
+    registry.put(ref, rig.j2.build.frozen, rig.wd.m_previous_block, uint256());
+
+    // The won solve arrives: the seam reads the job and carries its bodies.
+    auto job = dash::mint::frozen_job_for_mint(registry, ref, nullptr, &won);
+    ASSERT_TRUE(job.has_value());
+    EXPECT_EQ(won.size(), 1u);
+
+    // The tip moves on and the registry ages the entry out.
+    t += dash::mint::kFrozenJobAge + std::chrono::seconds(1);
+    registry.put(uint256(std::vector<unsigned char>(32, 0x42)), dash::stratum::FrozenMintJob{},
+                 uint256(std::vector<unsigned char>(32, 0x43)), uint256());
+    ASSERT_FALSE(registry.contains(ref));
+
+    auto lookup = [&](const dash::mint::WonBlockBodies& carried) -> FinderBodiesLookup {
+        return [&registry, &carried](const uint256& r) -> std::optional<FinderTemplateBodies> {
+            auto b = dash::mint::won_block_bodies_for(carried, registry, r);
+            if (!b) return std::nullopt;
+            return FinderTemplateBodies{std::move(b->tx_hashes), b->tx_data_hex};
+        };
+    };
+    const auto rebuilt = dash::coin::reconstruct_won_block(
+        child.m_hash, child, rig.t, rig.p, /*known_txs=*/{}, lookup(won));
+    ASSERT_TRUE(rebuilt.has_value()) << "the won block was not rebuilt after its entry was evicted";
+    const auto direct = dash::coin::reconstruct_won_block(
+        child.m_hash, child, rig.t, rig.p, {}, rig.finder(rig.frozen_bodies()));
+    ASSERT_TRUE(direct.has_value());
+    EXPECT_EQ(rebuilt->bytes, direct->bytes) << "the carried bodies frame the same block";
+
+    // Without the carried copy the evicted registry cannot rebuild it.
+    const dash::mint::WonBlockBodies none;
+    EXPECT_FALSE(dash::coin::reconstruct_won_block(child.m_hash, child, rig.t, rig.p, {},
+                                                   lookup(none)).has_value());
 }

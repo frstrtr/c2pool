@@ -196,6 +196,9 @@ C2P_PARAM("sharechain.deferred_mint", Sharechain, TRISTATE_BOOL, RESTART, C_DASH
   C2P_ALIAS("sharechain.deferred_mint", BIN_DASH, "--deferred-mint", FLAG)
   C2P_ALIAS("sharechain.deferred_mint", BIN_DASH, "--no-deferred-mint", FLAG_NO_PREFIX)
 
+C2P_PARAM("sharechain.frozen_job_cap_mb", Sharechain, INT64, RESTART, C_DASH, NONE, "", NONE, "frozen-job registry byte cap in MiB (default auto: min(256 MiB, memory.max/8), floor 64 MiB; range 1 MiB - 1 TiB, i.e. 1..1048576)")
+  C2P_ALIAS("sharechain.frozen_job_cap_mb", BIN_DASH, "--frozen-job-cap-mb", VALUE)
+
 C2P_PARAM("sharechain.max_conns", Sharechain, INT64, RESTART, C_LTC, LIT, "0", NONE, "max connections")
   C2P_ALIAS("sharechain.max_conns", BIN_LTC, "--max-conns", VALUE)
 
