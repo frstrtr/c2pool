@@ -374,21 +374,24 @@ TEST(RedistributeSplit, TheMintedShareRevealsTheDonationItsJobCommittedTo)
 
 // The main_ltc.cpp call sites that hand the job's donation on cannot be run
 // here (they are lambdas over the live node), so their code is pinned, with
-// comments stripped and whitespace dropped (line breaks inside a call do not
-// matter): the ref_hash lambda takes the job's donation and commits the
-// share to core::job_share_donation(share_donation, dev_donation) (its share
-// target sized with the same), each set exactly once; the create_share
+// comments and #if 0 blocks removed and whitespace dropped (line breaks
+// inside a call do not matter): the ref_hash lambda takes the job's donation
+// and commits the share to core::job_share_donation(share_donation,
+// dev_donation) (its share target sized with the same), each assigned
+// exactly once and by no other operator (+=, -=, ...); the create_share
 // lambda mints with core::job_share_donation(p.share_donation, dev_donation);
 // no site builds the --give-author formula by hand or passes std::nullopt for
 // the job's donation; the startup passes --node-owner-address before
 // --address (ltc::setup_split_owner, whose precedence
-// TheStartupSetupSplitsOnlyASplitSpecAndPicksTheOwner pins) and runs the
-// spec's fallback weights.
+// TheStartupSetupSplitsOnlyASplitSpecAndPicksTheOwner pins), gives a P2SH
+// owner's merged half the aux coinbase's donation key
+// (c2pool::merged::merged_donation_script()), and runs the spec's fallback
+// weights.
 namespace {
 
-// The code of a C++ source with its comments removed (string and character
-// literals kept as they are) and every whitespace character dropped.
-std::string code_without_comments_or_spaces(const std::string& in)
+// The source with its comments removed (string and character literals kept,
+// digit separators handled), line breaks kept.
+std::string strip_comments(const std::string& in)
 {
     std::string out;
     enum class St { code, line, block, str, chr } st = St::code;
@@ -406,14 +409,14 @@ std::string code_without_comments_or_spaces(const std::string& in)
                                        && std::isalnum(static_cast<unsigned char>(n));
                 if (c == '"') st = St::str;
                 else if (c == '\'' && !separator) st = St::chr;
-                if (!std::isspace(static_cast<unsigned char>(c)))
-                    out += c;
+                out += c;
             }
             break;
         case St::line:
-            if (c == '\n') st = St::code;
+            if (c == '\n') { st = St::code; out += c; }
             break;
         case St::block:
+            if (c == '\n') out += c;
             if (c == '*' && n == '/') { st = St::code; ++i; }
             break;
         case St::str:
@@ -428,15 +431,76 @@ std::string code_without_comments_or_spaces(const std::string& in)
     return out;
 }
 
+// The lines outside #if 0 ... #endif (nested conditionals counted).
+std::string drop_if0_blocks(const std::string& in)
+{
+    std::istringstream ss(in);
+    std::string line, out;
+    int skip = 0;   // depth inside an #if 0
+    while (std::getline(ss, line)) {
+        std::string t;
+        for (const char c : line)
+            if (!std::isspace(static_cast<unsigned char>(c)))
+                t += c;
+        const bool opens = t.rfind("#if", 0) == 0;   // #if, #ifdef, #ifndef
+        if (skip > 0) {
+            if (opens) ++skip;
+            else if (t.rfind("#endif", 0) == 0) --skip;
+            else if (skip == 1 && (t.rfind("#else", 0) == 0 || t.rfind("#elif", 0) == 0)) skip = 0;
+            continue;
+        }
+        if (t == "#if0") { skip = 1; continue; }
+        out += line;
+        out += '\n';
+    }
+    return out;
+}
+
+std::string without_spaces(const std::string& in)
+{
+    std::string out;
+    for (const char c : in)
+        if (!std::isspace(static_cast<unsigned char>(c)))
+            out += c;
+    return out;
+}
+
+// What is matched: no comments, no #if 0 code, no whitespace.
+std::string code_without_comments_or_spaces(const std::string& in)
+{
+    return without_spaces(drop_if0_blocks(strip_comments(in)));
+}
+
 size_t occurrences(const std::string& hay, const std::string& needle_with_spaces)
 {
-    std::string needle;
-    for (const char c : needle_with_spaces)
-        if (!std::isspace(static_cast<unsigned char>(c)))
-            needle += c;
+    const std::string needle = without_spaces(needle_with_spaces);
     size_t n = 0;
     for (size_t at = hay.find(needle); at != std::string::npos; at = hay.find(needle, at + 1))
         ++n;
+    return n;
+}
+
+// Assignments to `lhs` by any assignment operator (=, +=, -=, *=, /=, %=,
+// &=, |=, ^=, <<=, >>=), not a comparison (==).
+size_t assignments(const std::string& hay, const std::string& lhs)
+{
+    size_t n = 0;
+    for (size_t at = hay.find(lhs); at != std::string::npos; at = hay.find(lhs, at + 1)) {
+        const size_t k = at + lhs.size();
+        if (k > 0 && at > 0) {
+            const char before = hay[at - 1];
+            if (std::isalnum(static_cast<unsigned char>(before)) || before == '_' || before == '.')
+                continue;   // part of a longer name
+        }
+        const std::string rest = hay.substr(k, 3);
+        if (rest.rfind("==", 0) == 0)
+            continue;
+        for (const char* op : {"<<=", ">>=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "="})
+            if (rest.rfind(op, 0) == 0) {
+                ++n;
+                break;
+            }
+    }
     return n;
 }
 
@@ -444,9 +508,13 @@ size_t occurrences(const std::string& hay, const std::string& needle_with_spaces
 
 TEST(RedistributeSplit, MainLtcHandsTheJobsDonationToTheRefHashAndTheShare)
 {
-    // the stripper itself: comments go, literals stay, whitespace goes
+    // the helpers: comments and #if 0 code go, literals stay, whitespace goes
     EXPECT_EQ(code_without_comments_or_spaces("a = f(x, /* y */ z); // tail\nb(\"// kept\", 'c', 60'000);"),
-              "a=f(x,z);b(\"// kept\",'c',60'000);");
+              "a=f(x,z);b(\"//kept\",'c',60'000);");
+    EXPECT_EQ(code_without_comments_or_spaces("a;\n#if 0\nb;\n#ifdef X\nc;\n#endif\nd;\n#else\ne;\n#endif\nf;\n"),
+              "a;e;#endiff;");
+    EXPECT_EQ(assignments("params.donation=1;params.donation+=2;x.params.donation=3;if(params.donation==4)",
+                          "params.donation"), 2u);
     std::ifstream in(std::string(C2POOL_IMPL_DIR) + "/../c2pool/main_ltc.cpp");
     ASSERT_TRUE(in.good());
     std::stringstream ss;
@@ -455,9 +523,9 @@ TEST(RedistributeSplit, MainLtcHandsTheJobsDonationToTheRefHashAndTheShare)
     EXPECT_EQ(occurrences(src, "const std::vector<uint256>& merkle_branches, const std::optional<uint16_t>& share_donation) "
                                "-> core::MiningInterface::RefHashResult"), 1u)
         << "the ref_hash lambda receives the job's donation";
-    EXPECT_EQ(occurrences(src, "params.donation ="), 1u) << "the share's donation is set once";
+    EXPECT_EQ(assignments(src, "params.donation"), 1u) << "the share's donation is set once, by =";
     EXPECT_EQ(occurrences(src, "params.donation = core::job_share_donation(share_donation, dev_donation);"), 1u);
-    EXPECT_EQ(occurrences(src, "target_in.donation_percent ="), 1u);
+    EXPECT_EQ(assignments(src, "target_in.donation_percent"), 1u);
     EXPECT_EQ(occurrences(src, "target_in.donation_percent = core::job_share_donation_pct(share_donation, dev_donation);"), 1u);
     EXPECT_EQ(occurrences(src, "core::job_share_donation(p.share_donation, dev_donation),"), 1u)
         << "the create_share lambda mints with the job's donation";
@@ -467,6 +535,11 @@ TEST(RedistributeSplit, MainLtcHandsTheJobsDonationToTheRefHashAndTheShare)
     EXPECT_EQ(occurrences(src, "ltc::setup_split_owner(*web_server.get_mining_interface(), redistribute_mode_str, "
                                "node_owner_address, payout_address,"), 1u)
         << "--node-owner-address, then --address";
+    // a P2SH split owner's merged half: the aux coinbase's donation key
+    EXPECT_EQ(occurrences(src, "const std::vector<unsigned char>& merged_donation = "
+                               "c2pool::merged::merged_donation_script();"), 1u);
+    EXPECT_EQ(occurrences(src, "owner_merged_scripts(owner, \"split owner\", \"split\", true, merged_donation);"), 1u);
+    EXPECT_EQ(occurrences(src, "}, merged_donation);"), 1u) << "setup_split_owner's merged donation script";
     EXPECT_EQ(occurrences(src, "auto hybrid_weights = ltc::split_fallback_weights(ltc::parse_redistribute_spec("
                                "redistribute_mode_str));"), 1u);
 }
