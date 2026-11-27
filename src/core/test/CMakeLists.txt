@@ -273,6 +273,7 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
     # handshake deadline, the 503 without a web server. Same folding.
     # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
     add_executable(core_test
+        accepted_payout_script_test.cpp
         addr_store_save_test.cpp
         address_coin_validation_test.cpp
         author_fee_test.cpp

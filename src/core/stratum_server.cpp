@@ -2530,8 +2530,10 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
                     template_retry_clean_ = template_retry_clean_ || force_clean;
                     return;
                 }
-                // Accepted (own-coin OR configured-merged): byte-identical build.
-                payout_script = address_to_script(username_);
+                // Accepted (own-coin OR configured-merged). An own-coin address
+                // pays its own script type (accepted_payout_script); anything
+                // else is byte-identical to address_to_script.
+                payout_script = core::accepted_payout_script(username_, own);
             }
         }
 
