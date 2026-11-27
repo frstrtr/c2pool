@@ -661,15 +661,12 @@ nlohmann::json DGBWorkSource::mining_submit(
     }
 
     // Every coinbase this work source builds carries the producer's frozen ref
-    // (build_connection_coinbase sets frozen_ref.ref_hash). A job without one
-    // was not built here (e.g. the stratum server's own fallback coinbase): no
-    // share and no block mined on it can be credited, so it is refused before
-    // anything is reconstructed, classified or dispatched.
-    if (job->frozen_ref.ref_hash.IsNull()) {
-        LOG_WARNING << "[DGB-STRATUM] submit reject (job carries no frozen ref): user=" << username
-                    << " job=" << job_id;
-        return reject(21, "Job not found");
-    }
+    // (build_connection_coinbase sets frozen_ref.ref_hash; the stratum server
+    // carries it with the job to this snapshot). A job without one was not
+    // built here: no share minted from it can be credited, so its share path
+    // is refused below. A won block is NEVER refused: it is dispatched first,
+    // whatever the job, and only its share is skipped.
+    const bool built_here = !job->frozen_ref.ref_hash.IsNull();
 
     // 1. coinbase = coinb1 || extranonce1 || extranonce2 || coinb2
     auto coinb1_bytes = ParseHex(job->coinb1);
@@ -1007,9 +1004,12 @@ nlohmann::json DGBWorkSource::mining_submit(
 
         // #887: the won block is a SHARE too. The dispatch above has already
         // happened, so nothing here can delay, gate or endanger the block
-        // submit -- the mint is strictly downstream of it. Pre-wiring on DGB
-        // until #884 binds set_mint_share_fn in main_dgb.cpp.
-        mint_solved_share(/*won_block=*/true);
+        // submit -- the mint is strictly downstream of it.
+        if (built_here)
+            mint_solved_share(/*won_block=*/true);
+        else
+            LOG_WARNING << "[DGB-STRATUM] won block dispatched; its job carries no frozen ref, so no share"
+                           " is minted: user=" << username << " job=" << job_id;
 
         bump_accepted();
         return nlohmann::json(true);
@@ -1018,6 +1018,11 @@ nlohmann::json DGBWorkSource::mining_submit(
     case dgb::coin::SubmitClass::ShareAccept: {
         // share_target >= pow_hash > block_target -> meets sharechain difficulty
         // but not the full block.
+        if (!built_here) {
+            LOG_WARNING << "[DGB-STRATUM] submit reject (job carries no frozen ref): user=" << username
+                        << " job=" << job_id;
+            return reject(21, "Job not found");
+        }
         mint_solved_share(/*won_block=*/false);
 
         bump_accepted();

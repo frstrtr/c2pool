@@ -26,6 +26,7 @@
 
 #include <core/address_utils.hpp>
 #include <core/pow.hpp>
+#include <core/target_utils.hpp>
 #include <core/stratum_server.hpp>
 #include <core/uint256.hpp>
 
@@ -145,6 +146,11 @@ dgb::coin::ConnCoinbasePplnsInputs rig_inputs()
     in.donation_script = dgb::PoolConfig::get_donation_script(36);
     in.ref_hash = uint256(std::vector<unsigned char>(32, 0xab));
     in.last_txout_nonce = 0;
+    // The frozen share fields the job carries (bits: every hash is a share).
+    in.frozen_absheight = 1234;
+    in.frozen_bits = 0x2100ffff;
+    in.frozen_max_bits = 0x2100ffff;
+    in.frozen_timestamp = 1793210001;
     return in;
 }
 
@@ -356,4 +362,81 @@ TEST(DgbStratumJobs, NewTipPushesCleanJobsWithoutAMinerEvent)
     std::promise<void> stopped;
     boost::asio::post(rig.ioc, [&] { stop(); stopped.set_value(); });
     stopped.get_future().wait();
+}
+
+// Review 713dc77a0 R1: the stratum server did not carry the job's frozen ref
+// (ref_hash, last_txout_nonce) to mining_submit, so the DGB work source saw
+// every real job as "not built here" and refused every share. Through a real
+// core::StratumServer over the real DGBWorkSource: subscribe, authorize, the
+// producer's job, a nonce ground locally to the session's fixed difficulty,
+// mining.submit; the share reaches the mint with the job's frozen fields.
+TEST(DgbStratumJobs, RealSubmitReachesTheMintWithTheJobsFrozenRef)
+{
+    JobRig rig;
+    const uint256 best(std::vector<unsigned char>(32, 0x5b));
+    {
+        std::lock_guard<std::mutex> l(rig.mu);
+        rig.known_share = best;
+    }
+    rig.ws->set_best_share_hash_fn([best]() { return best; });
+    std::mutex mint_mu;
+    std::vector<dgb::stratum::DGBWorkSource::MintShareInputs> mints;
+    rig.ws->set_mint_share_fn([&](const dgb::stratum::DGBWorkSource::MintShareInputs& in) -> uint256 {
+        std::lock_guard<std::mutex> l(mint_mu);
+        mints.push_back(in);
+        return uint256(std::vector<unsigned char>(32, 0x77));
+    });
+
+    RigClient c(rig.port);
+    ASSERT_GE(c.fd, 0);
+    c.send({{"id", 1}, {"method", "mining.subscribe"}, {"params", nlohmann::json::array()}});
+    auto sub = c.pump(2000, 1);
+    ASSERT_TRUE(sub.has_value());
+    const std::string en1 = (*sub)["result"][1].get<std::string>();
+    const int en2_size = (*sub)["result"][2].get<int>();
+    c.send({{"id", 2}, {"method", "mining.authorize"}, {"params", {dgb_address(), "x"}}});
+    auto auth = c.pump(2000, 2);
+    ASSERT_TRUE(auth.has_value());
+    ASSERT_TRUE((*auth)["result"].is_boolean() && (*auth)["result"].get<bool>()) << auth->dump();
+    for (int i = 0; i < 30 && c.notifies.empty(); ++i)
+        c.pump(100);
+    ASSERT_FALSE(c.notifies.empty()) << "no job";
+    const auto n = c.notifies.back();
+    const std::string job_id = n[0].get<std::string>();
+    const std::string coinb1 = n[2].get<std::string>(), coinb2 = n[3].get<std::string>();
+    std::vector<std::string> branches;
+    for (const auto& b : n[4])
+        branches.push_back(b.get<std::string>());
+    const uint32_t version = static_cast<uint32_t>(std::stoul(n[5].get<std::string>(), nullptr, 16));
+    const std::string nbits = n[6].get<std::string>(), ntime = n[7].get<std::string>();
+    const std::string en2(static_cast<size_t>(en2_size) * 2, '0');
+
+    // The session difficulty is bounded by the job's pool-share difficulty
+    // (its frozen share bits, every hash a share): grind to that.
+    const double need = chain::target_to_difficulty(chain::bits_to_target(rig_inputs().frozen_bits));
+    std::string nonce;
+    for (uint32_t k = 0; k < 20000 && nonce.empty(); ++k) {
+        char buf[9];
+        std::snprintf(buf, sizeof buf, "%08x", k);
+        if (rig.ws->compute_share_difficulty(coinb1, coinb2, en1, en2, ntime, buf, version, rig.tip_prev, nbits,
+                                             branches) >= need)
+            nonce = buf;
+    }
+    ASSERT_FALSE(nonce.empty()) << "no nonce met the session difficulty " << need;
+
+    c.send({{"id", 3}, {"method", "mining.submit"},
+            {"params", {dgb_address(), job_id, en2, ntime, nonce}}});
+    auto resp = c.pump(3000, 3);
+    ASSERT_TRUE(resp.has_value()) << "no reply to mining.submit";
+    EXPECT_TRUE((*resp)["result"].is_boolean() && (*resp)["result"].get<bool>()) << resp->dump();
+
+    std::lock_guard<std::mutex> l(mint_mu);
+    ASSERT_EQ(mints.size(), 1u) << "the share never reached the mint (every real submit refused)";
+    const auto& m = mints.back();
+    EXPECT_TRUE(m.has_frozen) << "the job's frozen ref did not reach mining_submit";
+    EXPECT_EQ(m.prev_share, best);
+    EXPECT_EQ(m.frozen_bits, rig_inputs().frozen_bits);
+    EXPECT_EQ(m.frozen_timestamp, rig_inputs().frozen_timestamp);
+    EXPECT_EQ(m.frozen_absheight, rig_inputs().frozen_absheight);
+    EXPECT_FALSE(m.actual_coinbase.empty());
 }

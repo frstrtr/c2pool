@@ -285,10 +285,29 @@ TEST(DgbWorkSource, MiningSubmitWonBlockDispatchesBroadcaster)
 }
 
 // A job without the producer's frozen ref (a coinbase this work source did not
-// build, e.g. the stratum server's fallback) is refused before classification:
-// even a digest that clears every target reaches neither the block broadcaster
-// nor the mint.
-TEST(DgbWorkSource, MiningSubmitRefusesAJobWithoutFrozenRef)
+// build): its SHARE path is refused (no mint), but a won block is always
+// dispatched first and only its share is skipped.
+TEST(DgbWorkSource, MiningSubmitRefusesTheShareOfAJobWithoutFrozenRef)
+{
+    Fixture fx;
+    auto ws = fx.make();
+    bool minted = false;
+    ws->set_mint_share_fn([&](const dgb::stratum::DGBWorkSource::MintShareInputs&) -> uint256 {
+        minted = true;
+        return uint256(std::vector<unsigned char>(32, 0x01));
+    });
+    auto job = make_job(/*share_bits=*/0x2100ffffu, /*block_nbits=*/"03000001");
+    job.frozen_ref.ref_hash.SetNull();
+    auto result = ws->mining_submit("DGBaddr.worker1", "job-noref", kEN1, kEN2, kNT, kNON, "rid",
+                                    /*merged_addresses=*/{}, &job);
+    ASSERT_TRUE(result.is_array()) << result.dump();
+    ASSERT_GE(result.size(), 2u);
+    EXPECT_FALSE(result[0].get<bool>());
+    EXPECT_EQ(result[1][0].get<int>(), 21);
+    EXPECT_FALSE(minted) << "no share may be minted from a job not built here";
+}
+
+TEST(DgbWorkSource, MiningSubmitAlwaysDispatchesAWonBlockEvenWithoutFrozenRef)
 {
     Fixture fx;
     auto ws = fx.make();
@@ -299,14 +318,11 @@ TEST(DgbWorkSource, MiningSubmitRefusesAJobWithoutFrozenRef)
     });
     auto job = make_job(/*share_bits=*/0x2100ffffu, /*block_nbits=*/"2100ffff");
     job.frozen_ref.ref_hash.SetNull();
-    auto result = ws->mining_submit("DGBaddr.worker1", "job-noref", kEN1, kEN2, kNT, kNON, "rid",
+    auto result = ws->mining_submit("DGBaddr.worker1", "job-noref-won", kEN1, kEN2, kNT, kNON, "rid",
                                     /*merged_addresses=*/{}, &job);
-    ASSERT_TRUE(result.is_array()) << result.dump();
-    ASSERT_GE(result.size(), 2u);
-    EXPECT_FALSE(result[0].get<bool>());
-    EXPECT_EQ(result[1][0].get<int>(), 21);
-    EXPECT_FALSE(fx.submit_called) << "no block may be dispatched from a job not built here";
-    EXPECT_FALSE(minted) << "no share may be minted from a job not built here";
+    EXPECT_TRUE(fx.submit_called) << "a won block was held back by the frozen-ref guard";
+    EXPECT_FALSE(minted) << "no share is minted from a job not built here";
+    EXPECT_TRUE(result.is_boolean() && result.get<bool>()) << result.dump();
 }
 
 TEST(DgbWorkSource, MiningSubmitShareAcceptDispatchesMint)

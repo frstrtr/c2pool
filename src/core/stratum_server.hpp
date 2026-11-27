@@ -170,6 +170,11 @@ private:
         uint32_t frozen_timestamp{0};
         uint256  frozen_merged_payout_hash;
         uint256  frozen_witness_root;                  // wtxid_merkle_root at template time
+        // The ref the job's coinbase committed to (its OP_RETURN) and that
+        // coinbase's last_txout_nonce, for work sources that check or rebuild
+        // the share at submit (DGB). Carried as built; no lane rewrites them.
+        uint256  frozen_ref_hash;
+        uint64_t frozen_last_txout_nonce{0};
         bool     has_frozen{false};
         int64_t  share_version{36};    // AutoRatchet-determined share version at template time
         uint64_t desired_version{36};  // Version vote

@@ -2016,6 +2016,8 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
     snapshot.frozen_ref.merged_payout_hash = job.frozen_merged_payout_hash;
     snapshot.frozen_ref.frozen_merkle_branches = job.payload->frozen_merkle_branches;
     snapshot.frozen_ref.frozen_witness_root = job.frozen_witness_root;
+    snapshot.frozen_ref.ref_hash = job.frozen_ref_hash;
+    snapshot.frozen_ref.last_txout_nonce = job.frozen_last_txout_nonce;
     snapshot.frozen_ref.frozen_merged_coinbase_info = job.payload->frozen_merged_coinbase_info;
     snapshot.frozen_ref.share_version = job.share_version;
     snapshot.frozen_ref.desired_version = job.desired_version;
@@ -2825,6 +2827,8 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
         // frozen_merkle_branches + frozen_merged_coinbase_info live in the
         // shared payload (je.payload) — see fix #2 above.
         je.frozen_witness_root = cbr.snapshot.frozen_ref.frozen_witness_root;
+        je.frozen_ref_hash = cbr.snapshot.frozen_ref.ref_hash;
+        je.frozen_last_txout_nonce = cbr.snapshot.frozen_ref.last_txout_nonce;
         je.share_version = cbr.snapshot.frozen_ref.share_version;
         je.desired_version = cbr.snapshot.frozen_ref.desired_version;
         je.has_frozen = true;
