@@ -29,6 +29,8 @@
 #include <impl/bch/share_tracker.hpp>
 #include <impl/bch/dashboard_pplns.hpp>
 
+int run_dashboard_sharechain_checks();   // dashboard_sharechain_test.cpp
+
 namespace {
 
 int failures = 0;
@@ -170,6 +172,10 @@ int main()
             tracker, tip, 36, /*block_bits=*/0, kSubsidy, false);
         CHECK(c.is_object() && c.empty());
     }
+
+    // The sharechain explorer / share page / stats views
+    // (dashboard_sharechain_test.cpp, built into this executable).
+    failures += run_dashboard_sharechain_checks();
 
     if (failures == 0)
         std::cout << "bch_dashboard_pplns_current_test: ALL PASS\n";

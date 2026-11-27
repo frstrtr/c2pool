@@ -189,6 +189,14 @@ public:
                                double hashrate, double dead_hashrate, double difficulty,
                                uint64_t accepted, uint64_t rejected, uint64_t stale) override;
 
+    /// A copy of the per-connection worker registry, for the dashboard
+    /// (MiningInterface::set_stratum_workers_fn / set_stratum_hashrate_fn).
+    std::map<std::string, core::stratum::WorkerInfo> snapshot_stratum_workers() const
+    {
+        std::lock_guard<std::mutex> lk(workers_mutex_);
+        return workers_;
+    }
+
     // ── IWorkSource: work generation ─────────────────────────────────────
     nlohmann::json                       get_current_work_template() const override;
     std::vector<std::string>             get_stratum_merkle_branches() const override;

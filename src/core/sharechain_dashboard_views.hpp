@@ -8,6 +8,8 @@
 //   /sharechain/delta   delta_json(snapshot(..., since)) its live updates
 //   /sharechain/tip     tip_of(tracker)                  the update poll
 //   /web/share/<hash>   share_detail(...)                share.html
+//   sharechain stats    chain_stats(...)                 /global_stats,
+//                       /version_signaling, /v36_status, /web/sync_status, ...
 //
 // For the coins whose shares carry the p2pool share fields (m_prev_hash,
 // m_far_share_hash, m_min_header, m_coinbase, m_bits, m_max_bits, m_absheight,
@@ -34,6 +36,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <string>
 #include <tuple>
@@ -431,6 +434,94 @@ void add_found_block_fields(nlohmann::json& detail, const FoundBlocks& found, Is
             return;
         }
     }
+}
+
+// The sharechain stats the MiningInterface endpoints read
+// (set_sharechain_stats_fn): over the window from the tallest head, the share
+// counts by version, desired version and miner, orphan / dead counts, the
+// work-weighted desired versions of the sampling window (the last tenth), the
+// average share difficulty, and the head / tail sets. The caller adds
+// live_share_version. Same keys and walk as main_btc.cpp's stats feeder.
+template <typename Tracker>
+nlohmann::json chain_stats(Tracker& tracker, uint32_t chain_length)
+{
+    auto& chain    = tracker.chain;
+    auto& verified = tracker.verified;
+    auto [best, best_height] = tallest_head(chain);
+    (void)best_height;
+
+    const int chain_len  = static_cast<int>(chain_length);
+    const int chain_ht   = best.IsNull() ? 0 : static_cast<int>(chain.get_height(best));
+    const int walk       = std::min(chain_ht, chain_len);
+    const int skip_cnt   = std::min(chain_ht, chain_len * 9 / 10);
+    const int sample_cnt = std::min(chain_ht - skip_cnt, chain_len / 10);
+
+    std::map<std::string, int>    version_counts, desired_counts, miner_counts;
+    std::map<std::string, double> sampling_weights;
+    double difficulty_sum = 0.0;
+    int total = 0, orphan = 0, dead = 0;
+    if (!best.IsNull() && walk > 0) {
+        try {
+            int i = 0;
+            for (auto [hash, data] : chain.get_chain(best, static_cast<uint64_t>(walk))) {
+                (void)hash;
+                data.share.invoke([&](auto* s) {
+                    using T = std::remove_pointer_t<decltype(s)>;
+                    ++total;
+                    version_counts[std::to_string(static_cast<int>(T::version))]++;
+                    desired_counts[std::to_string(static_cast<int>(s->m_desired_version))]++;
+                    const int si = static_cast<int>(s->m_stale_info);
+                    if (si == 253) ++orphan; else if (si == 254) ++dead;
+                    const auto target = chain::bits_to_target(s->m_bits);
+                    difficulty_sum += chain::target_to_difficulty(target);
+                    std::string miner;
+                    if constexpr (requires { s->m_address; })
+                        miner = HexStr(s->m_address.m_data);
+                    else if constexpr (requires { s->m_pubkey_hash; })
+                        miner = s->m_pubkey_hash.GetHex();
+                    if (!miner.empty()) miner_counts[miner]++;
+                    if (i >= skip_cnt && i < skip_cnt + sample_cnt) {
+                        const auto att = chain::target_to_average_attempts(target);
+                        sampling_weights[std::to_string(static_cast<int>(s->m_desired_version))] +=
+                            static_cast<double>(att.GetLow64());
+                    }
+                });
+                ++i;
+            }
+        } catch (const std::exception&) {
+            // a broken link: the counts read so far
+        }
+    }
+
+    nlohmann::json result = nlohmann::json::object();
+    result["chain_height"]   = chain_ht;
+    result["chain_length"]   = chain_len;
+    result["chain_tip_hash"] = best.IsNull() ? "" : best.GetHex();
+    result["total_shares"]   = total;
+    result["orphan_shares"]  = orphan;
+    result["dead_shares"]    = dead;
+    result["fork_count"]     = static_cast<int>(chain.get_heads().size());
+    result["verified_count"] = static_cast<int>(verified.size());
+    result["shares_by_version"]         = version_counts;
+    result["shares_by_desired_version"] = desired_counts;
+    result["shares_by_miner"]           = miner_counts;
+    result["sampling_desired_version"]  = sampling_weights;
+    result["sampling_total"]            = sample_cnt;
+    result["average_difficulty"]        = total > 0 ? difficulty_sum / total : 1.0;
+
+    nlohmann::json heads = nlohmann::json::array();
+    for (const auto& [h, t] : chain.get_heads()) { (void)t; heads.push_back(h.GetHex()); }
+    result["heads"] = std::move(heads);
+    nlohmann::json vheads = nlohmann::json::array();
+    for (const auto& [h, t] : verified.get_heads()) { (void)t; vheads.push_back(h.GetHex()); }
+    result["verified_heads"] = std::move(vheads);
+    nlohmann::json tails = nlohmann::json::array();
+    for (const auto& [t, hs] : chain.get_tails()) { (void)hs; tails.push_back(t.GetHex()); }
+    result["tails"] = std::move(tails);
+    nlohmann::json vtails = nlohmann::json::array();
+    for (const auto& [t, hs] : verified.get_tails()) { (void)hs; vtails.push_back(t.GetHex()); }
+    result["verified_tails"] = std::move(vtails);
+    return result;
 }
 
 } // namespace core::sharechain_views

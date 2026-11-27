@@ -49,6 +49,10 @@ if(BUILD_TESTING)
             btclibs)
         add_test(NAME bch_${t} COMMAND bch_${t})
     endforeach()
+    # The sharechain explorer / share page / stats views (bch::dashboard,
+    # dashboard_sharechain.hpp): checks run from the pplns test's main, so the
+    # target CI already builds and runs covers them.
+    target_sources(bch_dashboard_pplns_current_test PRIVATE dashboard_sharechain_test.cpp)
 
     # #1131 source-structural KAT (BCH-lane mirror of dash/btc/ltc): the think-P1
     # bad-share removal must borrow from `verified` (owns_data=false) so only the
