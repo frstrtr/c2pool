@@ -534,7 +534,9 @@ TEST(DgbMintRoundTrip, CommitmentAppendedAfterTheRefIsNotCredited)
         req.prev_share_hash = prev;
         req.payout_script = payout;
         req.merged_addrs = merged;
-        req.next_block_height = 20000000;
+        req.next_block_height = block.height;   // the job template's block
+        req.block_bits = block.bits;
+        req.block_value = block.value;
         req.now = rig.chain.tip_ts + 15;
         req.donation = 66;
         auto in = dgb::build_conn_job_inputs(rig.chain.tracker, rig.params, req, []() {
