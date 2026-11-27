@@ -359,6 +359,8 @@ c2pool is an independent C++ implementation of the P2Pool sharechain concept ori
 
 Development is supported by Anthropic's [Claude for Open Source](https://claude.com/contact-sales/claude-for-oss) program (2026). The design, the consensus rules, and responsibility for every byte shipped remain with the maintainers.
 
+> **Two Dash blocks in a row from the daemonless pool, a third time** (2026-11-27 11:42:07 and 11:43:12 UTC) — [#2579253](https://blockchair.com/dash/block/2579253) and [#2579254](https://blockchair.com/dash/block/2579254), 65 seconds apart. Both were built from embedded coin-state with no Dash Core node on the serve path, and both are confirmed.
+>
 > **Two Dash blocks in a row from the daemonless pool, again** (2026-11-23 02:37:02 and 02:37:35 UTC) — [#2576844](https://blockchair.com/dash/block/2576844) and [#2576845](https://blockchair.com/dash/block/2576845), 33 seconds apart. Both were built from embedded coin-state with no Dash Core node on the serve path, and both are confirmed.
 >
 > **Two Dash blocks in a row from the daemonless pool** (2026-11-15 03:40:39 and 03:42:26 UTC) — [#2572489](https://blockchair.com/dash/block/2572489) and [#2572490](https://blockchair.com/dash/block/2572490), 107 seconds apart. Both were built from embedded coin-state with no Dash Core node on the serve path, and both are confirmed.
