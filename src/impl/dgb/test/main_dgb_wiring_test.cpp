@@ -87,8 +87,8 @@ TEST(DgbMainWiring, TheRedistributeSplitIsWired)
              "std::string redistribute_spec = \"split\";",
              "if (dgb::spec_names_split(redistribute_spec)) {",
              "work_source->set_split_owner(owner_script);",
-             "req.donation          = block.share_donation ? *block.share_donation : donation_u16;",
-             "/*donation=*/in.donation ? *in.donation : donation_u16);",
+             "req.donation          = core::job_share_donation(block.share_donation, give_author_pct);",
+             "/*donation=*/core::job_share_donation(in.donation, give_author_pct));",
              "dgb::coin::DogeP2shSplit{std::move(owner_doge), std::move(owner_parent)});"})
         EXPECT_NE(s.find(line), std::string::npos) << line;
     EXPECT_EQ(s.find("split is not available on DGB yet"), std::string::npos);

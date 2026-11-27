@@ -325,12 +325,14 @@ int run_node(const core::CoinParams& params, bool testnet,
     dgb::v36_shares_accepted_flag().store(v36_ratchet);
     io::io_context ioc;
 
-    // Author/dev donation u16 (p2pool committed donation field). Built-in default
-    // 0.1% -> u16 66 via the SSOT conversion, shared with DASH/LTC/BTC/BIP110.
-    // BOTH share-identity sites below (ref preimage + create_local_share mint)
-    // consume this SAME value so the committed ref_hash matches the created share
-    // (a mismatch = 100% self-decline). --give-author overrides the AMOUNT only.
-    const uint16_t donation_u16 = core::donation_percent_to_u16(dev_donation);
+    // Author/dev donation (p2pool committed donation field). Built-in default
+    // 0.1% -> u16 66. BOTH share-identity sites below (ref preimage +
+    // create_local_share mint) take the share's donation from
+    // core::job_share_donation(job donation, give_author_pct): the job's own
+    // for a split job, else --give-author's, so the committed ref_hash matches
+    // the created share (a mismatch = 100% self-decline). Clamped to [0, 100] %
+    // as donation_percent_to_u16 does. --give-author overrides the AMOUNT only.
+    const double give_author_pct = std::clamp(dev_donation, 0.0, 100.0);
 
     // Per-coin config root: ~/.c2pool/<net>/ (sharechain LevelDB + addrs.json
     // open underneath). Bucket-1 isolation primitive: DGB never shares LTC's
@@ -1855,7 +1857,7 @@ int run_node(const core::CoinParams& params, bool testnet,
     {
         auto& pplns_tracker = p2p_node.tracker();
         work_source->set_pplns_inputs_fn(
-            [&pplns_tracker, &p2p_node, &params, donation_u16, dgb_versions](
+            [&pplns_tracker, &p2p_node, &params, give_author_pct, dgb_versions](
                 const uint256& prev_share_hash,
                 const std::string& /*extranonce1_hex*/,
                 const std::vector<unsigned char>& payout_script,
@@ -1884,7 +1886,7 @@ int run_node(const core::CoinParams& params, bool testnet,
                 req.now               = static_cast<uint32_t>(std::time(nullptr));
                 // --give-author's, or a split job's own (decide_job_payout):
                 // the ref_hash commits to it.
-                req.donation          = block.share_donation ? *block.share_donation : donation_u16;
+                req.donation          = core::job_share_donation(block.share_donation, give_author_pct);
                 req.aux_mm_scriptsig  = aux_mm_scriptsig;
                 return dgb::build_conn_job_inputs(
                     pplns_tracker, params, req,
@@ -1926,7 +1928,7 @@ int run_node(const core::CoinParams& params, bool testnet,
     // (the producer emits a non-segwit coinbase).
     {
         work_source->set_mint_share_fn(
-            [&p2p_node, &params, donation_u16, &ioc](
+            [&p2p_node, &params, give_author_pct, &ioc](
                 const dgb::stratum::DGBWorkSource::MintShareInputs& in) -> uint256
             {
                 // in.coinbase_bytes is the coinbase scriptSig (BIP34 height +
@@ -1947,7 +1949,7 @@ int run_node(const core::CoinParams& params, bool testnet,
                 // frozen fields, so a later mint makes the same share. The lock
                 // is released BEFORE broadcast_share / notify_local_share,
                 // which take their own locks / post to io.
-                auto attempt = [&p2p_node, &params, donation_u16, in,
+                auto attempt = [&p2p_node, &params, give_author_pct, in,
                                 hdr = *min_header]() -> std::optional<uint256> {
                     std::unique_lock<std::shared_mutex> lk(p2p_node.tracker_mutex(), std::try_to_lock);
                     if (!lk.owns_lock())
@@ -1958,7 +1960,7 @@ int run_node(const core::CoinParams& params, bool testnet,
                         // the one its coinbase's ref_hash committed to.
                         share_hash = dgb::mint_local_share_at_frozen_version(
                             in, hdr, p2p_node.tracker(), params,
-                            /*donation=*/in.donation ? *in.donation : donation_u16);
+                            /*donation=*/core::job_share_donation(in.donation, give_author_pct));
                     } catch (const std::exception& e) {
                         LOG_WARNING << "[DGB-MINT] create_local_share threw: " << e.what();
                         return uint256();

@@ -37,6 +37,7 @@
 #include <impl/dgb/stratum/work_source.hpp>
 
 #include <btclibs/util/strencodings.h>
+#include <core/author_fee.hpp>
 #include <core/hash.hpp>
 #include <core/pack.hpp>
 #include <core/uint256.hpp>
@@ -149,7 +150,7 @@ struct OracleRig {
             req.local_hash_rate = block.local_hash_rate;
             req.now = now;
             // main_dgb's choice: a split job's own donation, else --give-author's.
-            req.donation = block.share_donation ? *block.share_donation : 66;
+            req.donation = core::job_share_donation(block.share_donation, 0.1);   // 0.1 % = 66
             req.aux_mm_scriptsig = aux;
             return dgb::build_conn_job_inputs(tracker, params, req, []() {
                 return std::pair<int64_t, uint64_t>{35, 35};
@@ -159,7 +160,7 @@ struct OracleRig {
             auto hdr = dgb::parse_min_header_80(in.header_bytes);
             if (!hdr)
                 return uint256();
-            minted = dgb::mint_local_share_at_frozen_version(in, *hdr, tracker, params, in.donation ? *in.donation : 66);
+            minted = dgb::mint_local_share_at_frozen_version(in, *hdr, tracker, params, core::job_share_donation(in.donation, 0.1));
             return minted;
         });
     }
