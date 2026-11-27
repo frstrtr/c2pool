@@ -12,9 +12,15 @@
 // classification for its own addresses when the coin published its
 // acceptance, and address_to_script otherwise.
 // Pinned: every LTC address form gives byte-for-byte the same script as
-// before; a coin with no acceptance (BTC/BCH/DASH/BIP110) takes exactly
-// address_to_script; DGB P2SH and bech32 get their own script type; a
-// configured merged chain's address keeps address_to_script.
+// before; so does every mainnet/testnet address form of the other lanes that
+// publish their acceptance (BTC main_btc.cpp, BIP110 main_bip110.cpp, DASH
+// main_dash.cpp: their sets restated below from impl/*/address_encoding.hpp
+// and impl/bip110/params.hpp); the one change outside DGB is BTC/BIP110
+// --regtest "bcrt1", which address_to_script does not know (an empty job
+// script before, the real witness script now: regtest only); an empty
+// acceptance takes exactly address_to_script; DGB P2SH and bech32 get their
+// own script type; a configured merged chain's address keeps
+// address_to_script.
 // ---------------------------------------------------------------------------
 
 #include <core/address_utils.hpp>
@@ -95,9 +101,84 @@ TEST(AcceptedPayoutScript, LtcAddressesAreByteIdentical)
     }
 }
 
-TEST(AcceptedPayoutScript, NoPublishedAcceptanceTakesAddressToScript)
+// The acceptance BTC, BIP110 and DASH publish (main_btc.cpp:1892,
+// main_bip110.cpp:415, main_dash.cpp:4649), restated from
+// btc::address_acceptance, bip110::address_acceptance (params.hpp
+// MAINNET/TESTNET/REGTEST_ADDR) and dash::address_acceptance.
+static core::CoinAddressAcceptance acceptance(std::vector<uint8_t> p2pkh_v, std::vector<uint8_t> p2sh_v,
+                                       std::vector<std::string> hrps)
 {
-    // BTC/BCH/DASH/BIP110 publish no acceptance: exactly address_to_script,
+    core::CoinAddressAcceptance a;
+    a.p2pkh_versions = std::move(p2pkh_v);
+    a.p2sh_versions = std::move(p2sh_v);
+    a.bech32_hrps = std::move(hrps);
+    return a;
+}
+
+static std::vector<std::string> lane_addresses(const core::CoinAddressAcceptance& acc)
+{
+    std::vector<std::string> out;
+    out.push_back(core::script_to_address(p2pkh(h(0x11)), "", acc.p2pkh_versions[0], acc.p2sh_versions[0]));
+    out.push_back(core::script_to_address(p2sh(h(0x22)), "", acc.p2pkh_versions[0], acc.p2sh_versions[0]));
+    if (!acc.bech32_hrps.empty()) {
+        const std::string hrp = acc.bech32_hrps.front();
+        out.push_back(core::script_to_address(witness(0, h(0x33)), hrp, acc.p2pkh_versions[0], acc.p2sh_versions[0]));
+        out.push_back(core::script_to_address(witness(0, h(0x44, 32)), hrp, acc.p2pkh_versions[0],
+                                              acc.p2sh_versions[0]));
+        const auto p2tr = bech32::encode_segwit(hrp, 1, std::vector<uint8_t>(32, 0x55));
+        if (!p2tr.empty())
+            out.push_back(p2tr);
+    }
+    return out;
+}
+
+// Review 713dc77a0 #12: BTC, BIP110 and DASH DO publish their acceptance, so
+// accepted_payout_script runs on them; every mainnet/testnet address form
+// still gives exactly address_to_script's bytes.
+TEST(AcceptedPayoutScript, PublishedLaneAcceptanceIsByteIdentical)
+{
+    struct Lane { const char* name; core::CoinAddressAcceptance acc; };
+    const std::vector<Lane> lanes = {
+        {"btc-main", acceptance({0x00}, {0x05}, {"bc"})},
+        {"btc-testnet", acceptance({0x6f}, {0xc4}, {"tb"})},
+        {"bip110-main", acceptance({0x00}, {0x05}, {"bc"})},
+        {"bip110-testnet", acceptance({0x6f}, {0xc4}, {"tb"})},
+        {"dash-main", acceptance({76}, {16}, {})},
+        {"dash-testnet", acceptance({140}, {19}, {})},
+    };
+    for (const auto& lane : lanes) {
+        SCOPED_TRACE(lane.name);
+        const auto addrs = lane_addresses(lane.acc);
+        ASSERT_GE(addrs.size(), 2u);
+        for (const auto& a : addrs) {
+            ASSERT_FALSE(a.empty());
+            Bytes own;
+            ASSERT_EQ(core::classify_address_for_coin(a, lane.acc, own), core::AddressCoinMatch::Own) << a;
+            EXPECT_EQ(core::accepted_payout_script(a, lane.acc), core::address_to_script(a)) << a;
+            EXPECT_FALSE(core::address_to_script(a).empty()) << a;
+        }
+    }
+}
+
+// The one change outside DGB: BTC/BIP110 --regtest "bcrt1". address_to_script
+// does not know the regtest HRP (the job script was empty); accepted now pays
+// the address's own witness script. Regtest only; base58 regtest addresses
+// (testnet bytes) are unchanged.
+TEST(AcceptedPayoutScript, RegtestBech32GetsItsScript)
+{
+    const auto regtest = acceptance({0x6f}, {0xc4}, {"bcrt"});
+    const std::string wpkh = core::script_to_address(witness(0, h(0x33)), "bcrt", 0x6f, 0xc4);
+    ASSERT_EQ(wpkh.rfind("bcrt1", 0), 0u);
+    EXPECT_TRUE(core::address_to_script(wpkh).empty()) << "the old job script (none)";
+    EXPECT_EQ(core::accepted_payout_script(wpkh, regtest), witness(0, h(0x33)));
+    for (const auto& a : {core::script_to_address(p2pkh(h(0x11)), "", 0x6f, 0xc4),
+                          core::script_to_address(p2sh(h(0x22)), "", 0x6f, 0xc4)})
+        EXPECT_EQ(core::accepted_payout_script(a, regtest), core::address_to_script(a)) << a;
+}
+
+TEST(AcceptedPayoutScript, EmptyAcceptanceTakesAddressToScript)
+{
+    // A work source that publishes no acceptance: exactly address_to_script,
     // for any address (including ones address_to_script mis-types).
     const core::CoinAddressAcceptance none;
     const std::vector<std::string> addrs = {
