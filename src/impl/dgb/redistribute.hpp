@@ -47,22 +47,14 @@ namespace dgb
 
 enum class RedistributeMode
 {
-    PPLNS,   // distribute by PPLNS weight proportionally
+    PPLNS,   // distribute by PPLNS weight proportionally (default)
     FEE,     // 100% to node operator
     BOOST,   // give to active miners with zero/low PPLNS shares
-    DONATE,  // 100% to donation script
-    SPLIT    // node owner / donation half and half (default): decided at job
-             // time by DGBWorkSource::decide_job_payout (set_split_owner),
-             // not by this Redistributor
+    DONATE   // 100% to donation script
 };
-
-// The --redistribute default (main_dgb.cpp, the param catalog's
-// money.redistribute).
-inline constexpr const char* kDefaultRedistributeMode = "split";
 
 inline RedistributeMode parse_single_mode(const std::string& s)
 {
-    if (s == "split")  return RedistributeMode::SPLIT;
     if (s == "fee")    return RedistributeMode::FEE;
     if (s == "boost")  return RedistributeMode::BOOST;
     if (s == "donate") return RedistributeMode::DONATE;
@@ -73,7 +65,6 @@ inline const char* redistribute_mode_str(RedistributeMode m)
 {
     switch (m)
     {
-    case RedistributeMode::SPLIT:  return "split";
     case RedistributeMode::FEE:    return "fee";
     case RedistributeMode::BOOST:  return "boost";
     case RedistributeMode::DONATE: return "donate";
@@ -124,14 +115,6 @@ inline std::vector<HybridWeight> parse_redistribute_spec(const std::string& spec
         result.push_back({parse_single_mode(spec), 100});
 
     return result;
-}
-
-// split selected: alone, or anywhere in a hybrid spec (split pays every such
-// share half and half; it is not a weight among the other modes).
-inline bool spec_selects_split(const std::vector<HybridWeight>& weights)
-{
-    return std::any_of(weights.begin(), weights.end(),
-                       [](const HybridWeight& w) { return w.mode == RedistributeMode::SPLIT; });
 }
 
 // Backward-compatible: returns the primary mode (first/only entry)

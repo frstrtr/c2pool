@@ -105,10 +105,6 @@ public:
         /// the AutoRatchet, so the share matches the coinbase the miner hashed.
         int64_t                    share_version = 36;
         uint64_t                   desired_version = 36;
-        /// The share's donation when its job set one (a split job,
-        /// decide_job_payout: core::kSplitShareDonation); none: the node's
-        /// own (--give-author). The job's ref_hash committed to it.
-        std::optional<uint16_t>    donation;
     };
 
     /// Callback invoked when `mining_submit` validates a submission whose
@@ -159,25 +155,6 @@ public:
         const std::string& extranonce1_hex,
         const std::vector<unsigned char>& payout_script,
         const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs) const override;
-    /// The job of a stratum connection: as build_connection_coinbase, its
-    /// shares committed to `share_donation` (decide_job_payout's; none: the
-    /// node's own).
-    core::stratum::CoinbaseResult        build_connection_coinbase_for(
-        const core::stratum::PayoutKey& login_key,
-        const uint256& prev_share_hash,
-        const std::string& extranonce1_hex,
-        const std::vector<unsigned char>& payout_script,
-        const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs,
-        const std::optional<uint16_t>& share_donation = std::nullopt) const override;
-    /// --redistribute split (set_split_owner): a job with no payout script
-    /// (an empty or broken login, the job sent before the login) pays the
-    /// node owner, and its shares carry core::kSplitShareDonation: PPLNS
-    /// gives the owner and the donation half of their weight each. Decided
-    /// when the job is built, so the share minted from it carries the payout
-    /// and the donation its coinbase committed to. Otherwise unchanged.
-    std::optional<uint16_t> decide_job_payout(
-        std::vector<unsigned char>& payout_script,
-        std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged) const override;
 
     // ── IWorkSource: share submission ────────────────────────────────────
     nlohmann::json mining_submit(
@@ -242,11 +219,6 @@ public:
     using FallbackPayoutFn = std::function<std::vector<unsigned char>()>;
     void set_fallback_payout_fn(FallbackPayoutFn fn);
 
-    /// --redistribute split: the node owner's DGB script (P2PKH / P2SH) the
-    /// jobs with no payout pay (decide_job_payout). Empty: off (the jobs
-    /// keep the empty payout and the fallback above, if bound, at submit).
-    void set_split_owner(std::vector<unsigned char> script);
-
     /// Producer seam for the per-connection coinbase (Phase B live-wire).
     /// Given the share-chain tip a miner builds ON TOP OF, plus this session's
     /// extranonce1 and resolved payout/merged scripts, returns the fully
@@ -260,14 +232,11 @@ public:
     /// emitted coinbase is byte-identical to the verifier's
     /// generate_share_transaction() BY CONSTRUCTION: both delegate to the single
     /// compute_pplns_payout_split() SSOT via build_connection_coinbase_from_pplns.
-    /// `share_donation`: the job's (a split job), the donation its ref_hash
-    /// commits to; none: the node's own (--give-author).
     using PplnsInputsFn = std::function<std::optional<dgb::coin::ConnCoinbasePplnsInputs>(
         const uint256& prev_share_hash,
         const std::string& extranonce1_hex,
         const std::vector<unsigned char>& payout_script,
-        const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs,
-        const std::optional<uint16_t>& share_donation)>;
+        const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs)>;
     void set_pplns_inputs_fn(PplnsInputsFn fn);
 
     /// External-daemon GBT tip fallback (the fallback V36 mandates PERSIST).
@@ -402,7 +371,6 @@ private:
     // submitted username carries no valid payout address.
     mutable std::mutex          fallback_payout_mutex_;
     FallbackPayoutFn            fallback_payout_fn_;
-    std::vector<unsigned char>  split_owner_script_;   // --redistribute split (under fallback_payout_mutex_)
 
     // Node-owner fee (p2pool -f/--fee). Guarded by node_owner_fee_mutex_.
     // Default off (pct 0, empty script) => effective_payout_script returns the

@@ -25,7 +25,6 @@
 
 #include <core/pow.hpp>                 // core::SubsidyFunc
 
-#include <core/author_fee.hpp>          // kSplitShareDonation
 #include <core/stratum_work_source.hpp>
 
 #include <gtest/gtest.h>
@@ -908,7 +907,7 @@ TEST(DgbWorkSource, ConnectionCoinbaseDelegatesToPplnsSsotByteIdentical)
     // Bind a producer that hands back the fixed inputs regardless of args.
     ws->set_pplns_inputs_fn(
         [&](const uint256&, const std::string&, const Script&,
-            const std::vector<std::pair<uint32_t, Script>>&, const std::optional<uint16_t>&)
+            const std::vector<std::pair<uint32_t, Script>>&)
             -> std::optional<dgb::coin::ConnCoinbasePplnsInputs> {
             return inputs;
         });
@@ -940,7 +939,7 @@ TEST(DgbWorkSource, ConnectionCoinbaseFreezesProducerVersionOnSnapshot)
         inputs.desired_version = 36;
         ws->set_pplns_inputs_fn(
             [&](const uint256&, const std::string&, const Script&,
-                const std::vector<std::pair<uint32_t, Script>>&, const std::optional<uint16_t>&)
+                const std::vector<std::pair<uint32_t, Script>>&)
                 -> std::optional<dgb::coin::ConnCoinbasePplnsInputs> {
                 return inputs;
             });
@@ -957,99 +956,13 @@ TEST(DgbWorkSource, ConnectionCoinbaseProducerNulloptYieldsEmptyJob)
     auto ws = fx.make();
     ws->set_pplns_inputs_fn(
         [&](const uint256&, const std::string&, const Script&,
-            const std::vector<std::pair<uint32_t, Script>>&, const std::optional<uint16_t>&)
+            const std::vector<std::pair<uint32_t, Script>>&)
             -> std::optional<dgb::coin::ConnCoinbasePplnsInputs> {
             return std::nullopt;  // tip not yet known
         });
     auto r = ws->build_connection_coinbase(uint256::ZERO, "00", Script{}, {});
     EXPECT_TRUE(r.coinb1.empty());
     EXPECT_TRUE(r.coinb2.empty());
-}
-
-// --redistribute split (the default): a job with no payout script (an empty
-// or broken login, the job sent after subscribe, before the login) pays the
-// node owner and its shares carry core::kSplitShareDonation (32768 of 65535:
-// PPLNS gives the owner and the donation half of their weight each). Decided
-// when the job is built (decide_job_payout): the producer commits the ref_hash
-// to that donation, and the mint carries the job's payout and donation
-// whatever the login is by the time the miner submits. Off: unchanged.
-TEST(DgbWorkSource, SplitJobPaysTheOwnerAndTheMintCarriesItsDonation)
-{
-    Fixture fx;
-    auto ws = fx.make();
-    Script owner = {0x76, 0xa9, 0x14};
-    owner.insert(owner.end(), 20, 0x5a);
-    owner.push_back(0x88);
-    owner.push_back(0xac);
-    Script miner = {0x76, 0xa9, 0x14};
-    miner.insert(miner.end(), 20, 0x11);
-    miner.push_back(0x88);
-    miner.push_back(0xac);
-    std::vector<std::pair<uint32_t, Script>> merged;
-
-    // No owner set: an empty payout stays empty, no donation of its own.
-    Script payout;
-    EXPECT_FALSE(ws->decide_job_payout(payout, merged).has_value());
-    EXPECT_TRUE(payout.empty());
-
-    ws->set_split_owner(owner);
-    const auto don = ws->decide_job_payout(payout, merged);
-    ASSERT_TRUE(don.has_value());
-    EXPECT_EQ(*don, 32768);
-    EXPECT_EQ(*don, core::kSplitShareDonation);
-    EXPECT_EQ(payout, owner);
-    // A usable payout: unchanged, the node's own donation.
-    Script mine = miner;
-    EXPECT_FALSE(ws->decide_job_payout(mine, merged).has_value());
-    EXPECT_EQ(mine, miner);
-
-    // The build hands the job's payout and donation to the producer (the
-    // ref_hash commits to them).
-    Script seen_payout;
-    std::optional<uint16_t> seen_donation;
-    const auto inputs = sample_pplns_inputs();
-    ws->set_pplns_inputs_fn(
-        [&](const uint256&, const std::string&, const Script& p,
-            const std::vector<std::pair<uint32_t, Script>>&, const std::optional<uint16_t>& d)
-            -> std::optional<dgb::coin::ConnCoinbasePplnsInputs> {
-            seen_payout = p;
-            seen_donation = d;
-            return inputs;
-        });
-    const auto built = ws->build_connection_coinbase_for(
-        {}, uint256(std::vector<unsigned char>(32, 0x11)), "cafef00d", payout, {}, don);
-    EXPECT_FALSE(built.coinb1.empty());
-    EXPECT_EQ(seen_payout, owner);
-    ASSERT_TRUE(seen_donation.has_value());
-    EXPECT_EQ(*seen_donation, 32768);
-    // build_connection_coinbase (no job decision): the node's own donation.
-    ws->build_connection_coinbase(uint256(std::vector<unsigned char>(32, 0x11)), "cafef00d", miner, {});
-    EXPECT_FALSE(seen_donation.has_value());
-
-    // The mint: the split job's payout and donation, under whatever login
-    // submits it (here one that yields no payout script of its own).
-    dgb::stratum::DGBWorkSource::MintShareInputs seen;
-    ws->set_mint_share_fn(
-        [&](const dgb::stratum::DGBWorkSource::MintShareInputs& got) -> uint256 {
-            seen = got;
-            return uint256();
-        });
-    auto job = make_job(/*share_bits=*/0x2100ffffu, /*block_nbits=*/"03000001");
-    job.has_payout = true;
-    job.payout_script = owner;
-    job.share_donation = core::kSplitShareDonation;
-    ws->mining_submit("DGBaddr.worker1", "job-split", kEN1, kEN2, kNT, kNON, "rid",
-                      /*merged_addresses=*/{}, &job);
-    EXPECT_EQ(seen.payout_script, owner);
-    ASSERT_TRUE(seen.donation.has_value());
-    EXPECT_EQ(*seen.donation, 32768);
-    // A job without a donation of its own: the mint gets none (the node's).
-    job.share_donation.reset();
-    seen = {};
-    ws->mining_submit("DGBaddr.worker1", "job-plain", kEN1, kEN2, kNT, kNON, "rid",
-                      /*merged_addresses=*/{}, &job);
-    EXPECT_FALSE(seen.donation.has_value());
-    EXPECT_NE(seen.payout_script, owner) << "a plain job's payout comes from the login, as before";
 }
 
 }  // namespace
