@@ -22,6 +22,7 @@
 #include <impl/dgb/config_coin.hpp>
 #include <impl/dgb/config_pool.hpp>
 #include <impl/dgb/stratum/work_source.hpp>
+#include <impl/dgb/stratum_job_push.hpp>
 
 #include <core/address_utils.hpp>
 #include <core/pow.hpp>
@@ -159,6 +160,7 @@ struct JobRig {
     std::mutex mu;
     uint256 known_share;          // the only share the producer knows (none yet)
     std::vector<Bytes> payouts;   // the payout script of every job the producer built
+    std::string tip_prev = "ce2fd8d332d667c009e6e031fec6cba0e4d12c963d2c84f824d6c1ae676e7de9";
 
     JobRig()
     {
@@ -167,9 +169,9 @@ struct JobRig {
                                                            kRigSubsidy);
         const auto acc = dgb::address_acceptance(false, false);
         ws->set_payout_acceptance(acc.p2pkh_versions, acc.p2sh_versions, acc.bech32_hrps);
-        ws->set_gbt_tip_fn([]() -> std::optional<dgb::stratum::DGBWorkSource::GbtTip> {
-            return dgb::stratum::DGBWorkSource::GbtTip{
-                "ce2fd8d332d667c009e6e031fec6cba0e4d12c963d2c84f824d6c1ae676e7de9", "1b0404cb"};
+        ws->set_gbt_tip_fn([this]() -> std::optional<dgb::stratum::DGBWorkSource::GbtTip> {
+            std::lock_guard<std::mutex> l(mu);
+            return dgb::stratum::DGBWorkSource::GbtTip{tip_prev, "1b0404cb"};
         });
         // main_dgb's producer shape: decline a null or unknown prev share.
         ws->set_pplns_inputs_fn([this](const uint256& prev, const std::string&, const Bytes& payout,
@@ -294,4 +296,64 @@ TEST(DgbStratumJobs, P2shAndBech32LoginsReachTheProducerAsTheirOwnScript)
         ASSERT_FALSE(rig.payouts.empty());
         EXPECT_EQ(rig.payouts.back(), want);
     }
+}
+
+// ── Clean jobs on a new DGB tip / a new best share (stratum_job_push.hpp) ──
+
+TEST(DgbStratumJobs, JobPushWatchDecisions)
+{
+    dgb::JobPushWatch w;
+    using A = dgb::JobPushWatch::Action;
+    EXPECT_EQ(w.tick("aa", 5), A::none) << "first tick primes";
+    EXPECT_EQ(w.tick("aa", 5), A::none);
+    EXPECT_EQ(w.tick("aa", 6), A::push) << "a bumped generation (best share / DOGE) pushes";
+    EXPECT_EQ(w.tick("aa", 6), A::none);
+    EXPECT_EQ(w.tick("bb", 6), A::bump_and_push) << "a new tip bumps and pushes";
+    EXPECT_EQ(w.tick("bb", 7), A::none) << "the watch's own bump is not pushed twice";
+    EXPECT_EQ(w.tick("", 7), A::none) << "no prevhash (no template yet) is not a tip change";
+    EXPECT_EQ(w.tick("bb", 7), A::none);
+}
+
+TEST(DgbStratumJobs, NewTipPushesCleanJobsWithoutAMinerEvent)
+{
+    JobRig rig;
+    const uint256 best(std::vector<unsigned char>(32, 0x5b));
+    {
+        std::lock_guard<std::mutex> l(rig.mu);
+        rig.known_share = best;
+    }
+    rig.ws->set_best_share_hash_fn([best]() { return best; });
+    auto* srv = rig.srv.get();
+    auto stop = dgb::start_job_push_watch(rig.ioc, rig.ws.get(), [srv](bool clean) { srv->notify_all(clean); },
+                                          std::chrono::milliseconds(100));
+    RigClient c(rig.port);
+    ASSERT_GE(c.fd, 0);
+    c.send({{"id", 1}, {"method", "mining.subscribe"}, {"params", nlohmann::json::array()}});
+    ASSERT_TRUE(c.pump(2000, 1).has_value());
+    c.send({{"id", 2}, {"method", "mining.authorize"}, {"params", {dgb_address(), "x"}}});
+    ASSERT_TRUE(c.pump(2000, 2).has_value());
+    for (int i = 0; i < 30 && c.notifies.empty(); ++i)
+        c.pump(100);
+    ASSERT_FALSE(c.notifies.empty()) << "no first job";
+    c.pump(500);
+    const size_t before = c.notifies.size();
+
+    // A new DGB tip: a clean job arrives well inside the 25 s keepalive.
+    {
+        std::lock_guard<std::mutex> l(rig.mu);
+        rig.tip_prev = "0ad1" + std::string(60, '7');
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < 80 && c.notifies.size() == before; ++i)
+        c.pump(100);
+    const auto waited = std::chrono::steady_clock::now() - t0;
+    ASSERT_GT(c.notifies.size(), before) << "no job after the new tip";
+    EXPECT_LT(waited, std::chrono::seconds(8));
+    const auto& n = c.notifies.back();
+    ASSERT_GE(n.size(), 9u);
+    EXPECT_TRUE(n[8].get<bool>()) << "the job on the new tip is not clean";
+    // Stop the watch on the io thread (its timer lives there).
+    std::promise<void> stopped;
+    boost::asio::post(rig.ioc, [&] { stop(); stopped.set_value(); });
+    stopped.get_future().wait();
 }

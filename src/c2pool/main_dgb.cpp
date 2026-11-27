@@ -65,6 +65,7 @@
 #include <impl/dgb/coin/mempool_ingest.hpp>
 #include <impl/dgb/stratum/work_source.hpp>
 #include <impl/dgb/best_share_cell.hpp>         // stratum best share: locked cell + the one best-change hook
+#include <impl/dgb/stratum_job_push.hpp>        // clean jobs on a new tip / best share (1 s watch)
 #include <impl/dgb/coin/work_ref_hash.hpp>      // make_work_ref_hash_params (ref preimage SSOT)
 #include <impl/dgb/coin/coinbase_scriptsig.hpp>   // build_coinbase_scriptsig (BIP34 height + /c2pool-dgb/ tag, #902)
 #include <impl/dgb/run_loop_mint.hpp>              // parse_min_header_80 + mint_local_share_at_frozen_version (#884/#294)
@@ -1944,6 +1945,16 @@ int run_node(const core::CoinParams& params, bool testnet,
         std::cout << "[DGB] stratum disabled (no --stratum flag)" << std::endl;
     }
 
+    // Clean jobs on a new DGB tip, a new best share or a fresh DOGE commitment,
+    // within a second (stratum_job_push.hpp); before, only the 25 s keepalive
+    // refreshed a miner's job, non-clean.
+    std::function<void()> stop_job_push;
+    if (stratum_server) {
+        auto* srv = stratum_server.get();
+        stop_job_push = dgb::start_job_push_watch(ioc, work_source.get(),
+                                                  [srv](bool clean) { srv->notify_all(clean); });
+    }
+
     // ── #82 REGTEST-GATED forced-won-share LIVE seam (decision (a), 2026-06-21) ──
     //
     // Synthesize ONE won share, insert it into the LIVE dgb::ShareTracker chain,
@@ -2747,6 +2758,7 @@ int run_node(const core::CoinParams& params, bool testnet,
     // alive — explicit reset keeps destruction order safe (stratum_server was
     // declared first, so it would otherwise outlive them).
     if (found_block_report) *found_block_report = nullptr;  // #995: unbind before mi dies
+    if (stop_job_push) stop_job_push();   // before the server it pushes to goes
     stratum_server.reset();
     web_server.reset();
 

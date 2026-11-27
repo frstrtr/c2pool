@@ -55,6 +55,13 @@ TEST(DgbMainWiring, LiveSeamsAreBound)
         << "the provider does not read the best share from the cell";
     EXPECT_NE(s.find("mm->mark_pplns_dirty()", best - 400), std::string::npos)
         << "the best-change hook does not mark the DOGE payouts dirty";
+    // Clean jobs on a new tip / best share, stopped before the server goes.
+    const auto push = at("dgb::start_job_push_watch(ioc, work_source.get(),");
+    ASSERT_NE(push, std::string::npos) << "no job push on a new DGB tip";
+    EXPECT_NE(s.find("srv->notify_all(clean)", push), std::string::npos);
+    const auto stop = at("if (stop_job_push) stop_job_push();");
+    ASSERT_NE(stop, std::string::npos);
+    EXPECT_LT(stop, s.find("    stratum_server.reset();", stop)) << "the push watch outlives the server";
     // Nothing else binds the single-slot best-change hook.
     EXPECT_EQ(at("set_on_best_share_changed("), std::string::npos);
 }
