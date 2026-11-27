@@ -126,7 +126,11 @@ TEST(DgbSharechainStats, MainDgbReadsUnderTheGuard)
     ASSERT_NE(end, std::string::npos);
     const std::string body = s.substr(fn, end - fn);
     EXPECT_NE(body.find("auto guard = p2p_node.read_tracker();"), std::string::npos);
-    EXPECT_NE(body.find("dgb::sharechain_stats_json(*guard, p2p_node.best_share_hash())"), std::string::npos);
+    EXPECT_NE(body.find("dgb::sharechain_stats_json(*guard, best);"), std::string::npos);
+    EXPECT_NE(body.find("const uint256 best = cell->get();"), std::string::npos)
+        << "the best share is not the stratum cell's";
+    EXPECT_EQ(body.find("best_share_hash()"), std::string::npos) << "IO-thread state read on the HTTP thread";
+    EXPECT_EQ(body.find("out[\"chain_height\"] = snap.chain_count"), std::string::npos) << "a count as a height";
     EXPECT_NE(body.find("p2p_node.get_tracker_snapshot()"), std::string::npos) << "no busy-path fallback";
     EXPECT_EQ(body.find("p2p_node.tracker()"), std::string::npos) << "an unguarded tracker read";
 }

@@ -2408,24 +2408,26 @@ int run_node(const core::CoinParams& params, bool testnet,
         // (4) scrypt pool stats (sharechain_stats.hpp, LTC's field shape),
         //     read under the tracker guard. While think() holds the tracker:
         //     the last full result with the snapshot's live counts (LTC's
-        //     s_last_good), or the snapshot alone before the first one.
-        mi->set_sharechain_stats_fn([&p2p_node]() {
+        //     s_last_good), or the snapshot's counts alone before the first
+        //     one (no chain_height: the snapshot has a count, not a height).
+        //     The best share is the stratum cell's: best_share_hash() reads
+        //     IO-thread state, and this runs on the HTTP thread.
+        mi->set_sharechain_stats_fn([&p2p_node, cell = stratum_best_share]() {
             static std::mutex s_mutex;
             static nlohmann::json s_last_good;
+            const uint256 best = cell->get();
             auto guard = p2p_node.read_tracker();
             if (!guard) {
                 const auto snap = p2p_node.get_tracker_snapshot();
                 std::lock_guard<std::mutex> lk(s_mutex);
                 nlohmann::json out = s_last_good.is_null() ? nlohmann::json::object() : s_last_good;
-                if (s_last_good.is_null()) {
-                    out["chain_height"] = snap.chain_count;
+                if (s_last_good.is_null())
                     out["total_shares"] = snap.chain_count;
-                }
                 out["verified_count"] = snap.verified_count;
                 out["fork_count"] = snap.fork_count;
                 return out;
             }
-            nlohmann::json r = dgb::sharechain_stats_json(*guard, p2p_node.best_share_hash());
+            nlohmann::json r = dgb::sharechain_stats_json(*guard, best);
             std::lock_guard<std::mutex> lk(s_mutex);
             s_last_good = r;
             return r;
