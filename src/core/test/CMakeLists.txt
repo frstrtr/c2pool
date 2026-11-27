@@ -360,6 +360,7 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
         web_server_redistribute_type_test.cpp
         web_server_relay_block_test.cpp
         web_server_rpc_refresh_test.cpp
+        web_server_share_lookup_test.cpp
         web_server_submitblock_test.cpp
         web_server_utxo_scan_test.cpp
         web_server_worker_liveness_test.cpp

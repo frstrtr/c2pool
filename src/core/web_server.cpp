@@ -12221,13 +12221,18 @@ nlohmann::json MiningInterface::rest_web_my_share_hashes50()
 nlohmann::json MiningInterface::rest_web_share(const std::string& hash)
 {
     // Use dedicated share lookup if wired
+    bool busy = false;
     if (m_share_lookup_fn) {
         auto result = m_share_lookup_fn(hash);
         if (!result.is_null() && !result.contains("error"))
             return result;
+        // The tracker was locked for an update: say so, so share.html asks
+        // again instead of showing a held share as not found.
+        busy = result.is_object() && result["error"].is_string()
+               && result["error"].get<std::string>() == "tracker busy";
     }
     nlohmann::json result = nlohmann::json::object();
-    result["error"] = "share not found";
+    result["error"] = busy ? "tracker busy" : "share not found";
     result["hash"] = hash;
     return result;
 }

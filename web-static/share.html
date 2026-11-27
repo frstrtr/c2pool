@@ -517,6 +517,10 @@
             // DASH block); the twin and merged-child banners are the LTC+DOGE
             // node's (is_doge_block is set only there).
             var primarySym = String(symbol || 'LTC').toUpperCase();
+            // The solved block's height and confirmations: block_height /
+            // block_confirmations, ltc_block_* on the LTC node.
+            var blockHeight = share.block_height || share.ltc_block_height;
+            var blockConfs = share.block_confirmations || share.ltc_block_confirmations;
             var childSym = mergedSym || 'DOGE';
             var isPrimaryBlock = share.is_block_solution;
             var isDogeBlock = share.is_doge_block;
@@ -536,8 +540,8 @@
                 html += '<div class="block-banner legendary">';
                 html += '<div class="banner-title" style="color:#ff8000">TWIN BLOCK — LEGENDARY</div>';
                 html += '<div class="banner-detail" style="color:#ffd700">' + esc(primarySym) + ' Block: ' + primaryBlockLink(share_hash, 20);
-                if (share.ltc_block_height) html += ' (height ' + share.ltc_block_height + ')';
-                if (share.ltc_block_confirmations) html += ' — ' + share.ltc_block_confirmations + ' confirmations';
+                if (blockHeight) html += ' (height ' + blockHeight + ')';
+                if (blockConfs) html += ' — ' + blockConfs + ' confirmations';
                 html += '</div>';
                 html += '<div class="banner-detail" style="color:#00e5ff">' + esc(childSym) + ' Block: <a href="' + dogeExplorer + (db.block_hash || '') + '" target="_blank">' + (db.block_hash || '').substr(0, 20) + '…</a>';
                 if (db.height) html += ' (height ' + db.height + ')';
@@ -548,8 +552,8 @@
                 html += '<div class="block-banner ltc-block">';
                 html += '<div class="banner-title" style="color:#ffd700">' + esc(primarySym) + ' BLOCK SOLUTION</div>';
                 html += '<div class="banner-detail" style="color:#ffd700">Block: ' + primaryBlockLink(share_hash, 24);
-                if (share.ltc_block_height) html += ' (height ' + share.ltc_block_height + ')';
-                if (share.ltc_block_confirmations) html += ' — ' + share.ltc_block_confirmations + ' confirmations';
+                if (blockHeight) html += ' (height ' + blockHeight + ')';
+                if (blockConfs) html += ' — ' + blockConfs + ' confirmations';
                 html += '</div>';
                 var val = share.block && share.block.gentx ? share.block.gentx.value : null;
                 if (val) html += '<div class="banner-detail" style="color:var(--text)">Block reward: ' + val.toFixed(8) + ' ' + symbol + '</div>';
@@ -1013,6 +1017,12 @@
             document.getElementById('share-root').innerHTML = '<div class="loading-msg">Loading share ' + share_hash.substr(-16) + '...</div>';
 
             d3.json('../web/share/' + share_hash, function(share) {
+                if (share && share.error === 'tracker busy') {
+                    // The node was mid-update: the next poll asks again.
+                    current_hash = null;
+                    document.getElementById('share-root').innerHTML = '<div class="loading-msg">Loading share ' + esc(share_hash.substr(-16)) + '... (node busy, retrying)</div>';
+                    return;
+                }
                 renderShare(share, currency_info);
             });
         }
