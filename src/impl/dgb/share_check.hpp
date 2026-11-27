@@ -5,6 +5,7 @@
 // Ported from legacy sharechains/data.cpp + sharechains/share.cpp
 
 #include "config_pool.hpp"
+#include "address_encoding.hpp"   // dgb::address_acceptance (v34/v35 address decode, network versions)
 #include "share.hpp"
 #include "share_messages.hpp"
 #include "share_types.hpp"
@@ -941,8 +942,21 @@ inline std::vector<unsigned char> get_share_script(const auto* obj)
     else if constexpr (requires { obj->m_address; })
     {
         // V34/V35: m_address contains a human-readable address string.
-        // Convert to scriptPubKey for PPLNS weight computation.
+        // Convert to scriptPubKey for PPLNS weight computation, with the DGB
+        // network's own version bytes / HRPs first, as the oracle does
+        // (p2pool bitcoin/data.py address_to_script2(address, net.PARENT)):
+        // the chain-agnostic address_to_script does not know DGB's P2SH (0x3f)
+        // or "dgb", so it read an "S..." as a P2PKH and a "dgb1..." as nothing,
+        // and every such share's generation transaction came out wrong.
         std::string addr_str(obj->m_address.m_data.begin(), obj->m_address.m_data.end());
+        {
+            core::CoinAddressAcceptance net = address_acceptance(PoolConfig::is_testnet, false);
+            if (PoolConfig::is_testnet)   // regtest: testnet base58 bytes, its own HRP
+                net.bech32_hrps.push_back(addr::BECH32_REGTEST);
+            std::vector<unsigned char> own;
+            if (core::classify_address_for_coin(addr_str, net, own) == core::AddressCoinMatch::Own)
+                return own;
+        }
         auto script = core::address_to_script(addr_str);
         if (!script.empty())
             return script;

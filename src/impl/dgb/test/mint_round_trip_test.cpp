@@ -295,3 +295,69 @@ TEST(DgbMintRoundTrip, MintWithoutTheMinedCoinbaseAndFrozenFieldsDoesNotCredit)
     const uint256 header_hash = Hash(std::span<const unsigned char>(header.data(), header.size()));
     EXPECT_NE(rig.minted, header_hash) << "the old mint path matched the miner's header";
 }
+
+// A DGB P2SH "S..." and a "dgb1..." miner are credited: the job payout script
+// (core accepted_payout_script, as the stratum server builds it) is the one
+// the mint derives from the username, so the round trip matches.
+TEST(DgbMintRoundTrip, P2shAndBech32MinersAreCredited)
+{
+    Bytes key(20, 0x66);
+    Bytes p2sh{0xa9, 0x14};
+    p2sh.insert(p2sh.end(), key.begin(), key.end());
+    p2sh.push_back(0x87);
+    Bytes wpkh{0x00, 0x14};
+    wpkh.insert(wpkh.end(), key.begin(), key.end());
+    const auto acc = dgb::address_acceptance(false, false);
+    for (const auto& script : {p2sh, wpkh}) {
+        const std::string login = core::script_to_address(script, script.size() == 23 ? "" : "dgb", 30, 63);
+        SCOPED_TRACE(login);
+        ASSERT_EQ(core::accepted_payout_script(login, acc), script);
+        for (int64_t ver : {int64_t(35), int64_t(36)}) {
+            SCOPED_TRACE(ver);
+            RtRig rig;
+            rig.mint_version = ver;
+            auto cbr = rig.ws->build_connection_coinbase(rig.chain.tip, "cafef00d",
+                                                         core::accepted_payout_script(login, acc), {});
+            ASSERT_FALSE(cbr.coinb1.empty());
+            auto j = rig.job(cbr, 0x2100ffffu);
+            const std::string en1 = "cafef00d", en2 = "0000002a", ntime = "6a1b2c3d", nonce = "00c0ffee";
+            Bytes coinbase;
+            const Bytes header = miner_header(j, en1, en2, ntime, nonce, &coinbase);
+            auto r = rig.ws->mining_submit(login, "job", en1, en2, ntime, nonce, "rid", {}, &j);
+            ASSERT_TRUE(r.is_boolean() && r.get<bool>()) << r.dump();
+            ASSERT_FALSE(rig.minted.IsNull());
+            EXPECT_EQ(rig.minted, Hash(std::span<const unsigned char>(header.data(), header.size())));
+            const uint256 cb_txid = Hash(std::span<const unsigned char>(coinbase.data(), coinbase.size()));
+            rig.chain.tracker.chain.get(rig.minted).share.invoke([&](auto* s) {
+                EXPECT_EQ(dgb::generate_share_transaction(*s, rig.chain.tracker, rig.params, false,
+                                                          core::version_gate::is_v36_active(ver)),
+                          cb_txid) << "a peer would reject this share (gentx mismatch)";
+            });
+        }
+    }
+}
+
+// A v34/v35 share carries its payout as an address string; the verifier reads
+// it back with the DGB network's versions, as the oracle does
+// (address_to_script2(address, net.PARENT)): "S..." is the P2SH, "dgb1..." the
+// witness program, "D..." the P2PKH.
+TEST(DgbMintRoundTrip, V35ShareAddressDecodesWithTheDgbNetworkVersions)
+{
+    Bytes key(20, 0x66);
+    Bytes p2pkh{0x76, 0xa9, 0x14};
+    p2pkh.insert(p2pkh.end(), key.begin(), key.end());
+    p2pkh.push_back(0x88);
+    p2pkh.push_back(0xac);
+    Bytes p2sh{0xa9, 0x14};
+    p2sh.insert(p2sh.end(), key.begin(), key.end());
+    p2sh.push_back(0x87);
+    Bytes wpkh{0x00, 0x14};
+    wpkh.insert(wpkh.end(), key.begin(), key.end());
+    for (const auto& script : {p2pkh, p2sh, wpkh}) {
+        const std::string addr = core::script_to_address(script, script.size() == 22 ? "dgb" : "", 30, 63);
+        SCOPED_TRACE(addr);
+        dgb::PaddingBugfixShare s;
+        s.m_address.m_data.assign(addr.begin(), addr.end());
+        EXPECT_EQ(dgb::get_share_script(&s), script);
+    }
+}

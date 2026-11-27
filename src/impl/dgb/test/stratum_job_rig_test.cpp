@@ -158,6 +158,7 @@ struct JobRig {
     uint16_t port = 0;
     std::mutex mu;
     uint256 known_share;          // the only share the producer knows (none yet)
+    std::vector<Bytes> payouts;   // the payout script of every job the producer built
 
     JobRig()
     {
@@ -171,12 +172,13 @@ struct JobRig {
                 "ce2fd8d332d667c009e6e031fec6cba0e4d12c963d2c84f824d6c1ae676e7de9", "1b0404cb"};
         });
         // main_dgb's producer shape: decline a null or unknown prev share.
-        ws->set_pplns_inputs_fn([this](const uint256& prev, const std::string&, const Bytes&,
+        ws->set_pplns_inputs_fn([this](const uint256& prev, const std::string&, const Bytes& payout,
                                        const std::vector<std::pair<uint32_t, Bytes>>&)
                                     -> std::optional<dgb::coin::ConnCoinbasePplnsInputs> {
             std::lock_guard<std::mutex> l(mu);
             if (prev.IsNull() || prev != known_share)
                 return std::nullopt;
+            payouts.push_back(payout);
             return rig_inputs();
         });
         port = rig_free_port();
@@ -248,4 +250,48 @@ TEST(DgbStratumJobs, NoJobEverCarriesTheStubCoinbase)
     EXPECT_EQ(n[2].get<std::string>(), oracle.coinb1);
     EXPECT_EQ(n[3].get<std::string>(), oracle.coinb2);
     EXPECT_NE(n[2].get<std::string>(), kStubCoinb1);
+}
+
+// The job payout script of a DGB P2SH "S..." and a "dgb1..." login is the
+// login's own script type (core accepted_payout_script), the same one the DGB
+// mint derives from the username: before, "S..." reached the producer as a
+// P2PKH of the redeem-script hash and "dgb1..." as an empty script, so the
+// job's ref and the share's never matched.
+TEST(DgbStratumJobs, P2shAndBech32LoginsReachTheProducerAsTheirOwnScript)
+{
+    Bytes key(20, 0x66);
+    Bytes p2sh{0xa9, 0x14};
+    p2sh.insert(p2sh.end(), key.begin(), key.end());
+    p2sh.push_back(0x87);
+    Bytes wpkh{0x00, 0x14};
+    wpkh.insert(wpkh.end(), key.begin(), key.end());
+    const std::string s_login = core::script_to_address(p2sh, "", 30, 63);
+    const std::string bech_login = core::script_to_address(wpkh, "dgb", 30, 63);
+    ASSERT_EQ(s_login.front(), 'S');
+    ASSERT_EQ(bech_login.rfind("dgb1", 0), 0u);
+
+    for (const auto& [login, want] : std::vector<std::pair<std::string, Bytes>>{{s_login, p2sh}, {bech_login, wpkh}}) {
+        SCOPED_TRACE(login);
+        JobRig rig;
+        const uint256 best(std::vector<unsigned char>(32, 0x5b));
+        {
+            std::lock_guard<std::mutex> l(rig.mu);
+            rig.known_share = best;
+        }
+        rig.ws->set_best_share_hash_fn([best]() { return best; });
+        RigClient c(rig.port);
+        ASSERT_GE(c.fd, 0);
+        c.send({{"id", 1}, {"method", "mining.subscribe"}, {"params", nlohmann::json::array()}});
+        ASSERT_TRUE(c.pump(2000, 1).has_value());
+        c.send({{"id", 2}, {"method", "mining.authorize"}, {"params", {login, "x"}}});
+        auto auth = c.pump(2000, 2);
+        ASSERT_TRUE(auth.has_value());
+        EXPECT_TRUE((*auth)["result"].is_boolean() && (*auth)["result"].get<bool>()) << auth->dump();
+        for (int i = 0; i < 30 && c.notifies.empty(); ++i)
+            c.pump(100);
+        ASSERT_FALSE(c.notifies.empty()) << "no job";
+        std::lock_guard<std::mutex> l(rig.mu);
+        ASSERT_FALSE(rig.payouts.empty());
+        EXPECT_EQ(rig.payouts.back(), want);
+    }
 }
