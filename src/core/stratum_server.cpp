@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
+#include <cctype>
 #include <algorithm>
 #include "stratum_server.hpp"
 #include "web_server.hpp"       // MiningInterface
@@ -1923,6 +1924,34 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
             effective_version = job.version ^ miner_version_bits;
         } catch (...) {
             LOG_WARNING << "[Stratum] Invalid version_bits hex from " << username_ << ": " << version_bits;
+        }
+    }
+
+    // ── Duplicate submit (StratumConfig::reject_duplicate_submits) ──
+    // The same (extranonce2, ntime, nonce, version) twice on one job is the
+    // same header: refused before the pseudoshare gate, so it is neither
+    // counted nor dispatched (p2pool work.py received_header_hashes).
+    if (mining_interface_->get_stratum_config().reject_duplicate_submits) {
+        auto lower = [](std::string v) {
+            for (auto& c : v)
+                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            return v;
+        };
+        auto live = active_jobs_.find(job_id);
+        if (live != active_jobs_.end()) {
+            if (!live->second.submitted)
+                live->second.submitted = std::make_shared<std::unordered_set<std::string>>();
+            std::ostringstream key;
+            key << lower(extranonce2) << ':' << lower(ntime) << ':' << lower(nonce) << ':' << effective_version;
+            if (!live->second.submitted->insert(key.str()).second) {
+                ++rejected_shares_;
+                LOG_INFO << "[Stratum] duplicate submit from " << username_ << " (job=" << job_id << ")";
+                nlohmann::json response;
+                response["id"] = request_id;
+                response["result"] = false;
+                response["error"] = nlohmann::json::array({22, "Duplicate share", nullptr});
+                return response;
+            }
         }
     }
 

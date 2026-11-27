@@ -173,6 +173,9 @@ DGBWorkSource::DGBWorkSource(c2pool::dgb::HeaderChain&     chain,
     // reasonable client watchdog -- so idle DGB sessions stay stable backups.
     // Transport/liveness only; ZERO wire-byte and consensus change.
     config_.keepalive_notify_sec = 25;
+    // A repeated submit of the same header on a job is refused with error 22
+    // (p2pool / kr1z1s work.py received_header_hashes).
+    config_.reject_duplicate_submits = true;
     LOG_INFO << "[DGB-STRATUM] DGBWorkSource constructed"
              << " (testnet=" << is_testnet_
              << " min_diff=" << config_.min_difficulty

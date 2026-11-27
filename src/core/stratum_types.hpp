@@ -112,6 +112,13 @@ struct StratumConfig {
     // control. Default: every other coin byte-identical.
     uint32_t version_rolling_pool_mask{0x1fffe000};
 
+    // A repeated mining.submit of the same (extranonce2, ntime, nonce,
+    // version) on a job is refused with [22, "Duplicate share"] before the
+    // pseudoshare gate: not counted, not dispatched (p2pool work.py
+    // received_header_hashes). Off (default): every lane byte-identical (a
+    // repeat is accepted and counted again).
+    bool reject_duplicate_submits{false};
+
     // ── Live-session hygiene (production ZOMBIE-SESSION LEAK fix) ──────────
     // A NAT-dropped miner's TCP connection is frequently never FIN/RST'd, so
     // StratumSession::is_connected() (socket_.is_open()) stays true FOREVER and

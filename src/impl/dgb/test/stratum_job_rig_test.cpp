@@ -456,8 +456,19 @@ TEST(DgbStratumJobs, RealSubmitReachesTheMintWithTheJobsFrozenRef)
     ASSERT_TRUE(resp.has_value()) << "no reply to mining.submit";
     EXPECT_TRUE((*resp)["result"].is_boolean() && (*resp)["result"].get<bool>()) << resp->dump();
 
+    // VARDIFF item 3: DGB refuses a repeat of the same header (error 22),
+    // which is neither counted nor minted again.
+    EXPECT_TRUE(rig.ws->get_stratum_config().reject_duplicate_submits);
+    c.send({{"id", 4}, {"method", "mining.submit"},
+            {"params", {dgb_address(), job_id, en2, ntime, nonce}}});
+    auto dup = c.pump(3000, 4);
+    ASSERT_TRUE(dup.has_value()) << "no reply to the repeated mining.submit";
+    EXPECT_FALSE((*dup)["result"].is_boolean() && (*dup)["result"].get<bool>()) << dup->dump();
+    ASSERT_TRUE((*dup)["error"].is_array()) << dup->dump();
+    EXPECT_EQ((*dup)["error"][0].get<int>(), 22);
+
     std::lock_guard<std::mutex> l(mint_mu);
-    ASSERT_EQ(mints.size(), 1u) << "the share never reached the mint (every real submit refused)";
+    ASSERT_EQ(mints.size(), 1u) << "the share never reached the mint (every real submit refused), or was minted twice";
     const auto& m = mints.back();
     EXPECT_TRUE(m.has_frozen) << "the job's frozen ref did not reach mining_submit";
     EXPECT_EQ(m.prev_share, best);

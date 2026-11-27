@@ -11,6 +11,7 @@
 #include <map>
 #include <optional>
 #include <unordered_map>
+#include <unordered_set>
 #include <iomanip>
 #include <sstream>
 #include <ctime>
@@ -195,6 +196,10 @@ private:
         bool has_payout{false};
         std::vector<unsigned char> payout_script;
         std::map<uint32_t, std::vector<unsigned char>> merged_scripts;
+        // The (extranonce2, ntime, nonce, version) submissions seen on this
+        // job (StratumConfig::reject_duplicate_submits); shared so the per-
+        // submit job copy stays cheap. Lives as long as the job.
+        std::shared_ptr<std::unordered_set<std::string>> submitted;
     };
     std::unordered_map<std::string, JobEntry> active_jobs_;
     // Insertion-order companion to active_jobs_ (interim hardening fix #1).

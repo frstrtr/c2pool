@@ -1,0 +1,261 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// ---------------------------------------------------------------------------
+// Duplicate mining.submit (rides core_test).
+//
+// StratumConfig::reject_duplicate_submits: the same (extranonce2, ntime,
+// nonce, version) twice on one job is refused with [22, "Duplicate share"]
+// before the pseudoshare gate, so it is neither counted (vardiff, rates, the
+// best-share feed) nor dispatched to the work source (p2pool work.py
+// received_header_hashes). Off (the default): today's behaviour, every repeat
+// accepted, counted and dispatched again.
+// Through a real core::StratumServer on 127.0.0.1.
+// ---------------------------------------------------------------------------
+
+#include <core/stratum_server.hpp>
+#include <core/stratum_work_source.hpp>
+#include <core/uint256.hpp>
+
+#include <boost/asio/executor_work_guard.hpp>
+#include <boost/asio/io_context.hpp>
+#include <boost/asio/ip/tcp.hpp>
+#include <boost/asio/post.hpp>
+#include <gtest/gtest.h>
+#include <nlohmann/json.hpp>
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <unistd.h>
+
+#include <chrono>
+#include <future>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <string>
+#include <thread>
+#include <vector>
+
+namespace {
+
+const uint256 kRef(std::vector<unsigned char>(32, 0xab));
+constexpr uint64_t kNonce = 0x0102030405060708ULL;
+
+struct DupSource : core::stratum::IWorkSource {
+    core::stratum::StratumConfig cfg;
+    mutable std::mutex mu;
+    std::vector<core::stratum::JobSnapshot> submits;
+    int best_calls = 0;   // record_best_pseudoshare: once per accepted pseudoshare
+
+    const core::stratum::StratumConfig& get_stratum_config() const override { return cfg; }
+    std::function<uint256()> get_best_share_hash_fn() const override
+    {
+        return [] { return uint256(std::vector<unsigned char>(32, 0x5b)); };
+    }
+    std::string get_current_gbt_prevhash() const override { return std::string(64, '1'); }
+    uint64_t get_work_generation() const override { return 1; }
+    bool has_merged_chain(uint32_t) const override { return false; }
+    void register_stratum_worker(const std::string&, const core::stratum::WorkerInfo&) override {}
+    void unregister_stratum_worker(const std::string&) override {}
+    void update_stratum_worker(const std::string&, double, double, double, uint64_t, uint64_t, uint64_t) override {}
+    nlohmann::json get_current_work_template() const override
+    {
+        return {{"bits", "207fffff"}, {"previousblockhash", std::string(64, '1')}, {"version", 0x20000000},
+                {"curtime", 1793210000}, {"height", 100}};
+    }
+    std::vector<std::string> get_stratum_merkle_branches() const override { return {}; }
+    std::pair<std::string, std::string> get_coinbase_parts() const override { return {"01000000", "00000000"}; }
+    core::stratum::CoinbaseResult build_connection_coinbase(
+        const uint256&, const std::string&, const std::vector<unsigned char>&,
+        const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>&) const override
+    {
+        core::stratum::CoinbaseResult r;
+        r.coinb1 = "01000000";
+        r.coinb2 = "00000000";
+        r.snapshot.subsidy = 777;
+        r.snapshot.frozen_ref.ref_hash = kRef;
+        r.snapshot.frozen_ref.last_txout_nonce = kNonce;
+        r.snapshot.frozen_ref.absheight = 4242;
+        r.snapshot.frozen_ref.bits = 0x207fffff;
+        r.snapshot.frozen_ref.max_bits = 0x207fffff;
+        r.snapshot.frozen_ref.timestamp = 1793210001;
+        return r;
+    }
+    nlohmann::json mining_submit(const std::string&, const std::string&, const std::string&, const std::string&,
+                                 const std::string&, const std::string&, const std::string&,
+                                 const std::map<uint32_t, std::vector<unsigned char>>&,
+                                 const core::stratum::JobSnapshot* job) override
+    {
+        std::lock_guard<std::mutex> l(mu);
+        if (job)
+            submits.push_back(*job);
+        return nlohmann::json(true);
+    }
+    uint32_t get_share_bits() const override { return 0x207fffff; }
+    uint32_t get_share_max_bits() const override { return 0x207fffff; }
+    double compute_share_difficulty(const std::string&, const std::string&, const std::string&, const std::string&,
+                                    const std::string&, const std::string&, uint32_t, const std::string&,
+                                    const std::string&, const std::vector<std::string>&) const override
+    {
+        return 1e15;   // every submission is a share
+    }
+    void record_best_pseudoshare(double, const std::string&, const std::string&, const std::string&,
+                                 const std::string&, const std::string&, const std::string&, const std::string&,
+                                 uint32_t, const std::string&, const std::string&,
+                                 const std::vector<std::string>&) override
+    {
+        std::lock_guard<std::mutex> l(mu);
+        ++best_calls;
+    }
+};
+
+uint16_t free_port_dup()
+{
+    boost::asio::io_context io;
+    boost::asio::ip::tcp::acceptor a(io, {boost::asio::ip::make_address("127.0.0.1"), 0});
+    return a.local_endpoint().port();
+}
+
+struct DupClient {
+    int fd = -1;
+    std::string buf;
+    std::string last_job;
+    explicit DupClient(uint16_t port)
+    {
+        fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        sockaddr_in a{};
+        a.sin_family = AF_INET;
+        a.sin_port = htons(port);
+        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        if (::connect(fd, reinterpret_cast<sockaddr*>(&a), sizeof a) != 0) {
+            ::close(fd);
+            fd = -1;
+        }
+        struct timeval tv{0, 50000};
+        if (fd >= 0)
+            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    }
+    ~DupClient()
+    {
+        if (fd >= 0)
+            ::close(fd);
+    }
+    void send(const nlohmann::json& j)
+    {
+        const std::string line = j.dump() + "\n";
+        (void)::send(fd, line.data(), line.size(), MSG_NOSIGNAL);
+    }
+    std::optional<nlohmann::json> wait(int id, int ms = 3000)
+    {
+        const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
+        while (std::chrono::steady_clock::now() < until) {
+            size_t nl;
+            while ((nl = buf.find('\n')) != std::string::npos) {
+                const std::string line = buf.substr(0, nl);
+                buf.erase(0, nl + 1);
+                nlohmann::json j;
+                try { j = nlohmann::json::parse(line); } catch (...) { continue; }
+                if (j.contains("method") && j["method"] == "mining.notify" && j["params"].is_array())
+                    last_job = j["params"][0].get<std::string>();
+                if (id >= 0 && j.contains("id") && j["id"].is_number() && j["id"].get<int>() == id)
+                    return j;
+            }
+            char tmp[16384];
+            const ssize_t n = ::recv(fd, tmp, sizeof tmp, 0);
+            if (n > 0)
+                buf.append(tmp, static_cast<size_t>(n));
+            if (n == 0)
+                break;
+        }
+        return std::nullopt;
+    }
+};
+
+
+struct DupRun {
+    std::vector<nlohmann::json> replies;
+    size_t dispatched = 0;
+    int best_calls = 0;
+};
+
+// Submits `nonces` in order on one job; the replies and what reached the source.
+DupRun run(bool reject_duplicates, const std::vector<std::string>& nonces)
+{
+    auto ws = std::make_shared<DupSource>();
+    ws->cfg.reject_duplicate_submits = reject_duplicates;
+    boost::asio::io_context ioc;
+    auto guard = boost::asio::make_work_guard(ioc);
+    const uint16_t port = free_port_dup();
+    auto srv = std::make_unique<core::StratumServer>(ioc, "127.0.0.1", port, ws);
+    EXPECT_TRUE(srv->start());
+    std::thread io([&] { ioc.run(); });
+    DupRun out;
+    {
+        DupClient c(port);
+        EXPECT_GE(c.fd, 0);
+        c.send({{"id", 1}, {"method", "mining.subscribe"}, {"params", nlohmann::json::array()}});
+        EXPECT_TRUE(c.wait(1).has_value());
+        c.send({{"id", 2}, {"method", "mining.authorize"}, {"params", {"1BoatSLRHtKNngkdXEeobR76b53LETtpyT", "x"}}});
+        EXPECT_TRUE(c.wait(2).has_value());
+        for (int i = 0; i < 40 && c.last_job.empty(); ++i)
+            c.wait(-1, 100);
+        EXPECT_FALSE(c.last_job.empty());
+        int id = 10;
+        for (const auto& n : nonces) {
+            c.send({{"id", id}, {"method", "mining.submit"}, {"params", {"w", c.last_job, "00000000", "6ae2a090", n}}});
+            auto r = c.wait(id);
+            out.replies.push_back(r ? *r : nlohmann::json());
+            ++id;
+        }
+    }
+    {
+        std::lock_guard<std::mutex> l(ws->mu);
+        out.dispatched = ws->submits.size();
+        out.best_calls = ws->best_calls;
+    }
+    std::promise<void> done;
+    boost::asio::post(ioc, [&] { srv->stop(); done.set_value(); });
+    done.get_future().wait();
+    guard.reset();
+    ioc.stop();
+    io.join();
+    return out;
+}
+
+bool ok(const nlohmann::json& r) { return r.contains("result") && r["result"].is_boolean() && r["result"].get<bool>(); }
+
+} // namespace
+
+TEST(StratumDuplicateSubmit, RepeatIsRefusedNotCountedNotDispatched)
+{
+    const auto r = run(true, {"00000001", "00000001", "00000002", "00000001"});
+    ASSERT_EQ(r.replies.size(), 4u);
+    EXPECT_TRUE(ok(r.replies[0])) << r.replies[0].dump();
+    EXPECT_FALSE(ok(r.replies[1])) << r.replies[1].dump();
+    ASSERT_TRUE(r.replies[1].contains("error") && r.replies[1]["error"].is_array());
+    EXPECT_EQ(r.replies[1]["error"][0].get<int>(), 22);
+    EXPECT_EQ(r.replies[1]["error"][1].get<std::string>(), "Duplicate share");
+    EXPECT_TRUE(ok(r.replies[2])) << "another nonce is not a duplicate";
+    EXPECT_FALSE(ok(r.replies[3])) << "a later repeat is still a duplicate";
+    EXPECT_EQ(r.dispatched, 2u) << "a duplicate reached the work source";
+    EXPECT_EQ(r.best_calls, 2) << "a duplicate was counted";
+}
+
+TEST(StratumDuplicateSubmit, OffKeepsTodaysBehaviour)
+{
+    const auto r = run(false, {"00000001", "00000001", "00000001"});
+    ASSERT_EQ(r.replies.size(), 3u);
+    for (const auto& x : r.replies)
+        EXPECT_TRUE(ok(x)) << x.dump();
+    EXPECT_EQ(r.dispatched, 3u);
+    EXPECT_EQ(r.best_calls, 3);
+}
+
+TEST(StratumDuplicateSubmit, HexCaseIsTheSameHeader)
+{
+    const auto r = run(true, {"0000abcd", "0000ABCD"});
+    ASSERT_EQ(r.replies.size(), 2u);
+    EXPECT_TRUE(ok(r.replies[0]));
+    EXPECT_FALSE(ok(r.replies[1])) << "upper-case hex of the same nonce passed as a new header";
+}
