@@ -497,7 +497,7 @@ C2P_PARAM("money.auto_detect_wallet", Money, TRISTATE_BOOL, MONEY_RESTART, C_LTC
   C2P_ALIAS("money.auto_detect_wallet", BIN_LTC, "--auto-detect-wallet", FLAG)
   C2P_ALIAS("money.auto_detect_wallet", BIN_LTC, "--no-auto-detect-wallet", FLAG_NO_PREFIX)
 
-C2P_PARAM("money.redistribute", Money, ENUM_STR, MONEY_RESTART, C_DASH|C_LTC|C_DGB, LIT, "pplns", ENUM_MEMBER, "unnamed-share redistribution")
+C2P_PARAM("money.redistribute", Money, ENUM_STR, MONEY_RESTART, C_DASH|C_LTC|C_DGB, LIT, "split", ENUM_MEMBER, "unattributable-share redistribution (split: 50% node owner / 50% donation)")
   C2P_ALIAS("money.redistribute", BIN_DASH, "--redistribute", VALUE)
   C2P_ALIAS("money.redistribute", BIN_LTC, "--redistribute", VALUE)
   C2P_ALIAS("money.redistribute", BIN_DGB, "--redistribute", VALUE)

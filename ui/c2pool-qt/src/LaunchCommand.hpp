@@ -87,7 +87,7 @@ struct PerCoinParams {
     bool        giveAuthorSet = false;          ///< operator explicitly overrides the binary default
     double      giveAuthor = 0.0;               ///< money.give_author_pct value
     bool        giveAuthorExplicitZeroAck = false; ///< required to emit an explicit 0
-    std::string redistribute;                   ///< money.redistribute (omit when "pplns")
+    std::string redistribute;                   ///< money.redistribute (omit when "split", the default)
 
     std::string messageBlob;                    ///< global.message_blob_hex
 
@@ -260,7 +260,7 @@ inline std::vector<std::string> build_percoin_argv(const PerCoinParams& p)
 
     {
         const std::string rd = trim(p.redistribute);
-        if (!rd.empty() && rd != "pplns")
+        if (!rd.empty() && rd != "split")
             emit_value(a, bin, "money.redistribute", rd);
     }
 

@@ -150,8 +150,11 @@ bad checksum is ignored the same way.
 
 An empty username, an invalid address or another coin's address is not
 refused: its shares are redistributed by the node's `--redistribute` mode (on
-LTC and on every merged chain), as p2pool does; the dashboard's workers list
-marks such logins "address invalid → redistributed".
+LTC and on every merged chain); the dashboard's workers list marks such logins
+"address invalid → redistributed". The default mode, `split`, pays each such
+share 50% to the node owner and 50% to the donation (the share pays the node
+owner with donation 32768/65535); a node without a node-owner address uses
+`pplns` (spread over the PPLNS window, as p2pool does).
 
 ### Which mode pays whom?
 

@@ -370,10 +370,11 @@ void PageLaunch::setupUi()
                 [this](int) { onBuildPreview(); });
 
         redistributeCombo_ = new QComboBox;
-        redistributeCombo_->addItems({"pplns", "fee", "boost", "donate"});
+        redistributeCombo_->addItems({"split", "pplns", "fee", "boost", "donate"});
         redistributeCombo_->setToolTip(
             "--redistribute MODE\n"
-            "  pplns  - distribute anonymised shares by PPLNS weight (default)\n"
+            "  split  - 50% node owner / 50% donation (default; pplns without a node owner address)\n"
+            "  pplns  - distribute anonymised shares by PPLNS weight\n"
             "  fee    - 100% of anonymous shares → node operator\n"
             "  boost  - give to active miners with zero PPLNS weight\n"
             "  donate - 100% to donation address");
@@ -816,7 +817,7 @@ QString PageLaunch::buildLegacyCommand() const
 
     // Redistribute (only if non-default)
     const QString redistribute = redistributeCombo_->currentText();
-    if (redistribute != "pplns")
+    if (redistribute != "split")
         parts << "--redistribute" << redistribute;
 
     // Merged mining
@@ -1467,7 +1468,7 @@ void PageLaunch::loadSettings()
     nodeOwnerAddrEdit_->setText(s.value("nodeOwnerAddr").toString());
     giveAuthorSpinBox_->setValue(s.value("giveAuthor", 0.0).toDouble());
     {
-        const int idx = redistributeCombo_->findText(s.value("redistribute", "pplns").toString());
+        const int idx = redistributeCombo_->findText(s.value("redistribute", "split").toString());
         redistributeCombo_->setCurrentIndex(idx >= 0 ? idx : 0);
     }
     maxConnsSpinBox_->setValue(s.value("maxConns", 0).toInt());

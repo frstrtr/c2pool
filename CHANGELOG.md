@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+### Unattributable work now pays 50% node owner / 50% donation (was spread over PPLNS)
+- `--redistribute split`, the new default (LTC with its merged chains, DASH,
+  DGB): a share of work the node cannot attribute to a payout address (an
+  empty, invalid or other-coin login; a P2WSH/P2TR LTC address; the job sent
+  right after `mining.subscribe`, built before the login, whose shares can
+  arrive after the authorize) pays the node owner (`--node-owner-address`; on
+  LTC else `--address`) with donation 32768/65535 instead of `--give-author`'s.
+  PPLNS splits each share's weight by its own donation field, so the owner and
+  the donation get half of it each, on LTC and on every merged chain (the
+  owner's merged address: `--node-owner-merged-address` for DOGE, else the
+  owner's key converted; an address the login names for a chain stays). Every
+  such share, deterministically; no consensus change.
+- Without a usable node-owner address the owner half cannot be paid: LTC and
+  DASH keep the old `pplns` behaviour, DGB binds no policy (as before), said
+  once at startup. `pplns`, `fee`, `boost` and `donate` are unchanged and
+  still selectable.
+
 ### With --stratum-http on, the REST API answers on the stratum port too
 - python p2pool served its web API on the worker port, and p2pool-aware
   trackers (miningpoolstats and others) poll `http://host:<worker port>/global_stats`.

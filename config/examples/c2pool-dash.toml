@@ -84,7 +84,7 @@ bind = "0.0.0.0:7903"       # Stratum (miner) listener [HOST:]PORT; default off 
 # give_author_pct = 0.1                        # [money] author donation, percent 0-100; default 0.1
 # node_owner_fee_pct = 1.0                     # [money] node-owner fee, percent 0-100; default 0 (off)
 # node_owner_address = "<your-DASH-address>"   # [money] where the node-owner fee is paid; default none
-# redistribute = "pplns"                       # [money] where shares of an empty or invalid login go: pplns, fee, boost or donate; default pplns
+# redistribute = "split"                       # [money] where shares of an empty or invalid login go: split (50% node owner / 50% donation; pplns without node_owner_address), pplns, fee, boost or donate; default split
 
 [dash.control]
 # token_file = "/etc/c2pool/control.token"     # [money] control-plane token file (mode 0600, owner-only, 32-128 char token) that unlocks POST /api/config/apply on loopback; default none (apply stays off)

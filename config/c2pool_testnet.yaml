@@ -24,7 +24,7 @@ ltc_rpc_password: ltctest123
 # donation_percentage: 0.0     # Developer donation %
 # node_owner_fee: 0.0          # Node owner fee %
 # node_owner_address: ""       # Node owner payout address
-# redistribute: pplns           # Redistribution mode: pplns, fee, boost, donate
+# redistribute: split           # Unattributable shares: split (default: 50% node owner / 50% donation), pplns, fee, boost, donate
 # payout_window_seconds: 86400  # PPLNS payout window (default: 24h)
 
 # ─── Stratum per-connection vardiff tuning ───────────────────────────────────

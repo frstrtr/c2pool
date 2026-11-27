@@ -150,7 +150,7 @@ bind = "0.0.0.0:9327"       # Stratum (miner) listener; default port 9327. c2poo
 #   node_owner_script [money] -- node-owner output script (CLI: --node-owner-script)
 #   merged_operator_address [money] -- merged (doge) fee address (CLI: --node-owner-merged-address / --merged-operator-address)
 #   auto_detect_wallet [money] -- auto-detect wallet (default on) (CLI: --auto-detect-wallet / --no-auto-detect-wallet)
-#   redistribute [money] -- unnamed-share redistribution (CLI: --redistribute)
+#   redistribute [money] -- unattributable-share redistribution (split: 50% node owner / 50% donation) (CLI: --redistribute)
 #   coinbase_text [money] -- coinbase attribution text (CLI: --coinbase-text)
 # [ltc.merged]
 #   spec -- merged-mining spec SYMBOL:CHAIN:HOST:PORT:USER:PASS (CLI: --merged)
