@@ -405,7 +405,7 @@ C2P_PARAM("web.explorer", WebOps, TRISTATE_BOOL, RESTART, C_DASH|C_BIP110, NONE,
 C2P_PARAM("web.cors_origin", WebOps, STRING, LIVE, C_LTC, LIT, "", NONE, "CORS origin")
   C2P_ALIAS("web.cors_origin", BIN_LTC, "--cors-origin", VALUE)
 
-C2P_PARAM("web.analytics_id", WebOps, STRING, LIVE, C_ALL, LIT, "", NONE, "Google Analytics measurement ID (G-XXXXXXXXXX): its tag and a consent bar (default denied) go into every HTML page the node serves; empty = off (default). A value that is not a measurement ID is refused on the command line and ignored with a warning in a settings file")
+C2P_PARAM("web.analytics_id", WebOps, STRING, LIVE, C_ALL, LIT, "", NONE, "Google Analytics (GA4) measurement ID, G-XXXXXXXXXX; empty = off (default). Every HTML page the node serves then shows a consent bar; only after a visitor accepts are GA4 page views sent, with addresses and query strings stripped. The operator is responsible for the privacy notice. A value that is not a measurement ID is refused on the command line and ignored with a warning in a settings file")
   C2P_ALIAS("web.analytics_id", BIN_DASH, "--analytics-id", VALUE)
   C2P_ALIAS("web.analytics_id", BIN_LTC, "--analytics-id", VALUE)
   C2P_ALIAS("web.analytics_id", BIN_BTC, "--analytics-id", VALUE)

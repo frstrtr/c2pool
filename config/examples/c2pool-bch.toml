@@ -64,7 +64,7 @@ discover = true             # daemonless Bitcoin Cash peer discovery; default fa
 
 [bch.web]
 port = 8085                 # dashboard TCP port; default 0 (off). For a specific bind address use the CLI: --http 127.0.0.1:8085
-# analytics_id = "G-XXXXXXXXXX"   # Google Analytics tag + consent bar (default denied) in every served HTML page; default "" (off). CLI --analytics-id wins
+# analytics_id = "G-XXXXXXXXXX"   # Google Analytics: GA4 page views only after the visitor accepts the consent bar, addresses and query strings stripped; you need your own privacy notice. Default "" (off). CLI --analytics-id wins
 
 [bch.embedded]
 anchor = 0                  # cold-start ABLA floor anchor, a block HEIGHT (integer); default 0. The catalog help text says H:HASH, but the binary reads a plain height

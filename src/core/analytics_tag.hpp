@@ -8,14 +8,26 @@
 //   Analytics "UA-<4..10 digits>-<1..4 digits>". A bad command-line value
 //   refuses the start; a bad settings-file value is warned about and ignored;
 //   inject_analytics_tag() checks it again and puts nothing in for a bad one.
-// - Consent Mode: every storage type defaults to denied (cookieless pings
-//   only). A small bar before </body> asks; Accept grants analytics_storage
-//   only (never an ad_* type), Decline keeps it denied. The choice is kept in
-//   localStorage under c2pool_ga_consent; a stored "granted" is restored in
-//   <head> before the config call, and a stored choice hides the bar.
+// - Consent Mode: every storage type defaults to denied. A small bar before
+//   </body> asks; Accept grants analytics_storage only (never an ad_* type),
+//   Decline keeps it denied. The choice is kept in localStorage under
+//   c2pool_ga_consent; a stored "granted" is restored on load, and a stored
+//   choice hides the bar.
+// - Page views only, after consent: the config call (send_page_view false)
+//   and the one page_view event run only once consent is granted. Before
+//   that nothing is sent to Google Analytics (gtag.js is fetched, with no
+//   referrer).
+// - No address reaches Google: page_location / page_path / page_referrer /
+//   page_title are sent explicitly, built from location.pathname with the
+//   query string and fragment dropped and every address-like path segment
+//   (or the segment after a per-miner route) replaced by ":addr"
+//   (analytics_sanitize_path is the same rule in C++). The page's referrer
+//   policy becomes no-referrer, so no request carries the raw URL either.
 // - A page without </head> is left unchanged. A page without </body> gets the
-//   <head> part only, with consent left denied (no bar, no restore). A page
-//   that already carries the tag (or its own gtag.js) is left unchanged.
+//   <head> part only, with consent left denied (no bar, no restore, nothing
+//   sent). A page that already carries the tag (or its own gtag.js) is left
+//   unchanged. analytics_allowed_target() keeps the tag off /control/*,
+//   /api/*, /web/log, /logs/* and any request that carries a token.
 //
 // explorer/explorer.py builds the same bytes for its generated pages
 // (core_test checks the two against each other).
@@ -71,6 +83,118 @@ inline std::size_t find_ci(std::string_view hay, std::string_view needle, bool l
 }
 
 } // namespace analytics_detail
+
+/// The path sanitizer the snippet runs in the browser (JavaScript). The C++
+/// port below is the same rule; core_test runs this text under node, when
+/// it is installed, and checks the two agree.
+inline constexpr std::string_view kAnalyticsPathJs =
+    "function c2poolGaPath(p){var s=String(p||'/').split('/');"
+    "for(var i=1;i<s.length;i++){"
+    "if(/[a-z0-9]{20,}/i.test(s[i])"
+    "||(s[i]!==''&&/miner|payout|addr|user|worker|patron/i.test(s[i-1]))){s[i]=':addr';}}"
+    "return s.join('/')||'/';}";
+
+namespace analytics_detail {
+
+inline bool is_alnum(char c)
+{
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+}
+
+inline std::size_t alnum_run(std::string_view s, std::size_t from)
+{
+    std::size_t n = 0;
+    while (from + n < s.size() && is_alnum(s[from + n]))
+        ++n;
+    return n;
+}
+
+// /[a-z0-9]{20,}/i : a run of 20 or more letters and digits anywhere in the
+// segment (base58, bech32, cashaddr after its "prefix:", "ADDR.worker").
+inline bool looks_like_address(std::string_view seg)
+{
+    for (std::size_t i = 0; i < seg.size(); ++i)
+        if (alnum_run(seg, i) >= 20)
+            return true;
+    return false;
+}
+
+// /miner|payout|addr|user|worker|patron/i
+inline bool names_miner_route(std::string_view seg)
+{
+    std::string l(seg);
+    for (auto& c : l)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    for (const char* w : {"miner", "payout", "addr", "user", "worker", "patron"})
+        if (l.find(w) != std::string::npos)
+            return true;
+    return false;
+}
+
+} // namespace analytics_detail
+
+/// The path GA is given for a page URL path: the query string and fragment
+/// dropped, and every segment that looks like an address (it holds a run of
+/// 20 or more letters and digits), or that follows a segment
+/// naming a per-miner route (miner, payout, addr, user, worker, patron),
+/// replaced by ":addr". "/miner_payouts/LVyp..." -> "/miner_payouts/:addr",
+/// "/miner.html?address=LVyp..." -> "/miner.html". Same rule as
+/// kAnalyticsPathJs.
+inline std::string analytics_sanitize_path(std::string_view path)
+{
+    using namespace analytics_detail;
+    const auto cut = path.find_first_of("?#");
+    if (cut != std::string_view::npos)
+        path = path.substr(0, cut);
+    if (path.empty())
+        return "/";
+    std::string out;
+    std::string_view prev;
+    std::size_t start = 0;
+    for (std::size_t i = 0;; ++i) {
+        const std::size_t slash = path.find('/', start);
+        const std::string_view seg = path.substr(start, slash == std::string_view::npos
+                                                            ? std::string_view::npos
+                                                            : slash - start);
+        if (i > 0)
+            out += '/';
+        // As in the script, the previous segment is tested as written out
+        // (so one after a replaced segment is replaced too).
+        const bool hide = i > 0 && (looks_like_address(seg) || (!seg.empty() && names_miner_route(prev)));
+        prev = hide ? std::string_view(":addr") : seg;
+        out += prev;
+        if (slash == std::string_view::npos)
+            break;
+        start = slash + 1;
+    }
+    return out.empty() ? std::string("/") : out;
+}
+
+/// Whether a request may get the tag at all: never on /control/*, /api/*
+/// (admin, config, tx-inject, explorer API), /web/log or /logs/*, and never
+/// on a request whose query carries a token (a page served behind the auth
+/// or control token). `path` is the request path, `query` the text after '?'.
+inline bool analytics_allowed_target(std::string_view path, std::string_view query)
+{
+    auto starts = [&](std::string_view p) { return path.substr(0, p.size()) == p; };
+    if (starts("/control/") || path == "/control" || starts("/api/") || path == "/api"
+        || path == "/web/log" || starts("/logs/") || path == "/logs")
+        return false;
+    std::size_t at = 0;
+    while (at <= query.size()) {
+        auto end = query.find('&', at);
+        if (end == std::string_view::npos)
+            end = query.size();
+        std::string key(query.substr(at, end - at));
+        key = key.substr(0, key.find('='));
+        for (auto& c : key)
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (key.find("token") != std::string::npos)
+            return false;
+        at = end + 1;
+    }
+    return true;
+}
 
 /// A measurement ID the node will put in a page: "G-" + 4..20 of [A-Z0-9],
 /// or "UA-" + 4..10 digits + "-" + 1..4 digits. Nothing else.
@@ -128,33 +252,50 @@ inline std::string& analytics_id_setting()
     return id;
 }
 
-/// The <head> part: consent defaults (all denied), the stored-choice restore
-/// when the page also gets the consent bar, gtag.js, then the config call.
-/// `id` must be valid (inject_analytics_tag checks it).
+/// The <head> part: the no-referrer policy, consent defaults (all denied),
+/// gtag.js, then the path sanitizer and the start function that, once
+/// consent is granted, makes the config call (send_page_view false) and
+/// sends the one page_view with the sanitized location, path, referrer and
+/// title. With `restore_choice` (the page also gets the consent bar) a
+/// stored "granted" starts it on load. `id` must be valid
+/// (inject_analytics_tag checks it).
 inline std::string analytics_head_snippet(const std::string& id, bool restore_choice)
 {
     std::string s;
     s += kAnalyticsMarker;
-    s += "\n<script>\n"
+    s += "\n<meta name=\"referrer\" content=\"no-referrer\">\n"
+         "<script>\n"
          "window.dataLayer=window.dataLayer||[];\n"
          "function gtag(){dataLayer.push(arguments);}\n"
          "gtag('consent','default',{analytics_storage:'denied',ad_storage:'denied',"
-         "ad_user_data:'denied',ad_personalization:'denied'});\n";
+         "ad_user_data:'denied',ad_personalization:'denied'});\n"
+         "gtag('js',new Date());\n"
+         "</script>\n"
+         "<script async src=\"https://www.googletagmanager.com/gtag/js?id=";
+    s += id;
+    s += "\" referrerpolicy=\"no-referrer\"></script>\n"
+         "<script>\n";
+    s += kAnalyticsPathJs;
+    s += "\n"
+         "function c2poolGaStart(){\n"
+         "if(window.c2poolGaStarted){return;}\n"
+         "window.c2poolGaStarted=true;\n"
+         "var p=c2poolGaPath(location.pathname),r='';\n"
+         "try{if(document.referrer){var u=new URL(document.referrer);r=u.origin+c2poolGaPath(u.pathname);}}"
+         "catch(e){r='(unknown)';}\n"
+         "var t=String(document.title||'').replace(/[a-z0-9]{20,}/ig,':addr');\n"
+         "var v={page_location:location.origin+p,page_path:p,page_referrer:r,page_title:t};\n"
+         "gtag('config','";
+    s += id;
+    s += "',{send_page_view:false,page_location:v.page_location,page_path:p,page_referrer:r,page_title:t});\n"
+         "gtag('event','page_view',v);\n"
+         "}\n";
     if (restore_choice) {
         s += "try{if(window.localStorage.getItem('";
         s += kAnalyticsConsentKey;
-        s += "')==='granted'){gtag('consent','update',{analytics_storage:'granted'});}}catch(e){}\n";
+        s += "')==='granted'){gtag('consent','update',{analytics_storage:'granted'});c2poolGaStart();}}catch(e){}\n";
     }
-    s += "</script>\n"
-         "<script async src=\"https://www.googletagmanager.com/gtag/js?id=";
-    s += id;
-    s += "\"></script>\n"
-         "<script>\n"
-         "gtag('js',new Date());\n"
-         "gtag('config','";
-    s += id;
-    s += "');\n"
-         "</script>\n";
+    s += "</script>\n";
     return s;
 }
 
@@ -193,7 +334,8 @@ inline std::string analytics_consent_banner()
          "if(v==='granted'||v==='denied'){bar.parentNode.removeChild(bar);return;}\n"
          "function pick(c){\n"
          "try{window.localStorage.setItem(k,c);}catch(e){}\n"
-         "if(c==='granted'&&typeof gtag==='function'){gtag('consent','update',{analytics_storage:'granted'});}\n"
+         "if(c==='granted'&&typeof gtag==='function'){gtag('consent','update',{analytics_storage:'granted'});"
+         "if(typeof c2poolGaStart==='function'){c2poolGaStart();}}\n"
          "if(pad&&pad.parentNode){pad.parentNode.removeChild(pad);}\n"
          "if(bar.parentNode){bar.parentNode.removeChild(bar);}\n"
          "}\n"

@@ -58,7 +58,7 @@
 [ltc.web]
 port = 8080                 # dashboard + JSON API TCP port; default 8080
 host = "0.0.0.0"            # dashboard bind address; default 0.0.0.0 (all interfaces); "127.0.0.1" = this host only
-# analytics_id = "G-XXXXXXXXXX"   # Google Analytics tag + consent bar (default denied) in every served HTML page; default "" (off). CLI --analytics-id wins
+# analytics_id = "G-XXXXXXXXXX"   # Google Analytics: GA4 page views only after the visitor accepts the consent bar, addresses and query strings stripped; you need your own privacy notice. Default "" (off). CLI --analytics-id wins
 
 [ltc.stratum]
 bind = "0.0.0.0:9327"       # Stratum (miner) listener; default port 9327. c2pool-ltc uses only the PORT part of this value

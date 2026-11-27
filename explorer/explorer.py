@@ -77,7 +77,8 @@ URL_PREFIX = ""
 # string = off (the default): every generated page is byte-identical to before
 # this option existed. When set, every HTML page gets the same tag and consent
 # bar the c2pool node puts in its own pages (src/core/analytics_tag.hpp; the
-# node's core_test checks the two produce the same bytes).
+# node's core_test checks the two produce the same bytes): page views only,
+# after consent, with the query string dropped and addresses replaced.
 ANALYTICS_ID = ""
 
 _ANALYTICS_ID_RE = re.compile(r"G-[A-Z0-9]{4,20}|UA-[0-9]{4,10}-[0-9]{1,4}", re.ASCII)
@@ -92,24 +93,47 @@ def is_valid_analytics_id(value):
     return isinstance(value, str) and _ANALYTICS_ID_RE.fullmatch(value) is not None
 
 
+_ANALYTICS_PATH_JS = (
+    "function c2poolGaPath(p){var s=String(p||'/').split('/');"
+    "for(var i=1;i<s.length;i++){"
+    "if(/[a-z0-9]{20,}/i.test(s[i])"
+    "||(s[i]!==''&&/miner|payout|addr|user|worker|patron/i.test(s[i-1]))){s[i]=':addr';}}"
+    "return s.join('/')||'/';}")
+
+
 def analytics_head_snippet(analytics_id, restore_choice):
-    """The <head> part: consent defaults (all denied), the stored-choice
-    restore when the page also gets the consent bar, gtag.js, then config."""
-    s = (_ANALYTICS_MARKER + "\n<script>\n"
+    """The <head> part: the no-referrer policy, consent defaults (all
+    denied), gtag.js, then the path sanitizer and the start function that,
+    once consent is granted, makes the config call (send_page_view false) and
+    sends the one page_view with the query string dropped and address-like
+    path segments replaced by ":addr"."""
+    s = (_ANALYTICS_MARKER + "\n<meta name=\"referrer\" content=\"no-referrer\">\n"
+         "<script>\n"
          "window.dataLayer=window.dataLayer||[];\n"
          "function gtag(){dataLayer.push(arguments);}\n"
          "gtag('consent','default',{analytics_storage:'denied',ad_storage:'denied',"
-         "ad_user_data:'denied',ad_personalization:'denied'});\n")
+         "ad_user_data:'denied',ad_personalization:'denied'});\n"
+         "gtag('js',new Date());\n"
+         "</script>\n"
+         "<script async src=\"https://www.googletagmanager.com/gtag/js?id=" + analytics_id +
+         "\" referrerpolicy=\"no-referrer\"></script>\n"
+         "<script>\n" + _ANALYTICS_PATH_JS + "\n"
+         "function c2poolGaStart(){\n"
+         "if(window.c2poolGaStarted){return;}\n"
+         "window.c2poolGaStarted=true;\n"
+         "var p=c2poolGaPath(location.pathname),r='';\n"
+         "try{if(document.referrer){var u=new URL(document.referrer);r=u.origin+c2poolGaPath(u.pathname);}}"
+         "catch(e){r='(unknown)';}\n"
+         "var t=String(document.title||'').replace(/[a-z0-9]{20,}/ig,':addr');\n"
+         "var v={page_location:location.origin+p,page_path:p,page_referrer:r,page_title:t};\n"
+         "gtag('config','" + analytics_id +
+         "',{send_page_view:false,page_location:v.page_location,page_path:p,page_referrer:r,page_title:t});\n"
+         "gtag('event','page_view',v);\n"
+         "}\n")
     if restore_choice:
         s += ("try{if(window.localStorage.getItem('" + _ANALYTICS_CONSENT_KEY +
-              "')==='granted'){gtag('consent','update',{analytics_storage:'granted'});}}catch(e){}\n")
-    s += ("</script>\n"
-          "<script async src=\"https://www.googletagmanager.com/gtag/js?id=" + analytics_id +
-          "\"></script>\n"
-          "<script>\n"
-          "gtag('js',new Date());\n"
-          "gtag('config','" + analytics_id + "');\n"
-          "</script>\n")
+              "')==='granted'){gtag('consent','update',{analytics_storage:'granted'});c2poolGaStart();}}catch(e){}\n")
+    s += "</script>\n"
     return s
 
 
@@ -143,7 +167,8 @@ def analytics_consent_banner():
             "if(v==='granted'||v==='denied'){bar.parentNode.removeChild(bar);return;}\n"
             "function pick(c){\n"
             "try{window.localStorage.setItem(k,c);}catch(e){}\n"
-            "if(c==='granted'&&typeof gtag==='function'){gtag('consent','update',{analytics_storage:'granted'});}\n"
+            "if(c==='granted'&&typeof gtag==='function'){gtag('consent','update',{analytics_storage:'granted'});"
+            "if(typeof c2poolGaStart==='function'){c2poolGaStart();}}\n"
             "if(pad&&pad.parentNode){pad.parentNode.removeChild(pad);}\n"
             "if(bar.parentNode){bar.parentNode.removeChild(bar);}\n"
             "}\n"
@@ -2375,9 +2400,11 @@ def main():
                              "proxy. Prepended to every generated link and stripped from "
                              "incoming request paths. Default \"\" = root (byte-identical).")
     parser.add_argument("--analytics-id", default="", metavar="ID",
-                        help="Google Analytics measurement ID (G-XXXXXXXXXX): its tag and a "
-                             "consent bar (default denied) go into every HTML page. "
-                             "Default \"\" = off.")
+                        help="Google Analytics (GA4) measurement ID, G-XXXXXXXXXX; off by "
+                             "default. Every HTML page then shows a consent bar; only after "
+                             "a visitor accepts are GA4 page views sent, with addresses and "
+                             "query strings stripped. You are responsible for your own "
+                             "privacy notice.")
     args = parser.parse_args()
     if args.analytics_id and not is_valid_analytics_id(args.analytics_id):
         parser.error("bad value: --analytics-id %s (expected a Google Analytics "

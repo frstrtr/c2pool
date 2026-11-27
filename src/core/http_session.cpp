@@ -1503,8 +1503,12 @@ void HttpSession::process_request()
                                              std::istreambuf_iterator<char>());
 
                         // Analytics tag + consent bar (core/analytics_tag.hpp), when
-                        // --analytics-id / web.analytics_id is set.
-                        if (ext == ".html" || ext == ".htm")
+                        // --analytics-id / web.analytics_id is set: HTML only, never
+                        // under /control/, /api/, /web/log, /logs/ or with a token.
+                        const auto qmark = raw_target.find('?');
+                        const std::string tag_query = qmark == std::string::npos ? std::string()
+                                                                                 : raw_target.substr(qmark + 1);
+                        if ((ext == ".html" || ext == ".htm") && core::analytics_allowed_target(target, tag_query))
                             core::inject_analytics_tag(contents, mining_interface_->get_analytics_id());
 
                         // Per-coin payout-scheme label (empty on every coin but

@@ -1099,7 +1099,7 @@ is `src/core/param_catalog.inc`. Commented example files for c2pool-ltc, -dash,
 | `--dump-resolved-config` | ltc, dash, btc, dgb, bch | Print the fully resolved config with the source of every key (compiled / file / CLI) between `=== RESOLVED CONFIG BEGIN ===` / `END` markers, then exit 0 **without starting the node**. Works with no coin endpoint configured. |
 | `--ack-money-settings` | ltc, dash, btc, dgb, bch | Compute and print the money-ack hash for the resolved settings file, then exit. Requires a settings file (`--settings PATH` or the data-dir default); exit 78 otherwise. |
 | `--data-dir PATH` | ltc, dash, btc, dgb, bch | Root all per-instance state (sharechain LevelDB, addr store, logs, …) under `PATH` (default `~/.c2pool`). Handled before the settings probe, so the default `c2pool.toml` is looked up under the final data dir. Requires a non-empty, non-flag argument (exit 1 otherwise). |
-| `--analytics-id ID` | ltc, dash, btc, dgb, bch, bip110 | Google Analytics tag with a consent bar in every HTML page the node serves; default off. Settings key `web.analytics_id` (`[<coin>.web] analytics_id`, not on bip110, which reads no settings file); the CLI wins. See [Google Analytics tag](#google-analytics-tag). |
+| `--analytics-id ID` | ltc, dash, btc, dgb, bch, bip110 | Off by default. Google Analytics (GA4) page views, only after the visitor accepts the consent bar, with addresses and query strings stripped; the operator is responsible for the privacy notice. Settings key `web.analytics_id` (`[<coin>.web] analytics_id`, not on bip110, which reads no settings file); the CLI wins. See [Google Analytics tag](#google-analytics-tag). |
 
 **Money gate.** A settings file can never silently arm a money-class key
 (`MONEY_*` rows in the catalog: fees, donation, payout addresses, network
@@ -1112,22 +1112,33 @@ invalidates the hash.
 
 #### Google Analytics tag
 
-Off by default. With `--analytics-id G-XXXXXXXXXX` (or `web.analytics_id` in the
-settings file) the node puts the Google Analytics (GA4) tag into every HTML page
-it serves (`src/core/analytics_tag.hpp`, one helper for every page):
+**Off by default.** Nothing is added to any page unless the operator sets
+`--analytics-id G-XXXXXXXXXX` (or `web.analytics_id` in the settings file). Then
+the node puts a Google Analytics (GA4) tag and a consent bar into the HTML pages
+it serves (`src/core/analytics_tag.hpp`, one helper for every page).
 
-- **Consent Mode, default denied.** Before the `gtag('config', ID)` call every
-  storage type (`analytics_storage`, `ad_storage`, `ad_user_data`,
-  `ad_personalization`) is set to `denied`, so Google Analytics sends cookieless
-  pings only and sets no cookie.
-- **Consent bar.** A small bar before `</body>` reads "This site uses Google
+- **What is collected: GA4 page views only, and only after consent.** Before a
+  visitor accepts, nothing is sent to Google Analytics and no cookie is set:
+  every Consent Mode type (`analytics_storage`, `ad_storage`, `ad_user_data`,
+  `ad_personalization`) starts `denied`, and the config call
+  (`send_page_view: false`) and the one `page_view` run only after Accept. The
+  page still fetches `gtag.js`, with no referrer.
+- **Addresses and query strings are stripped.** The page view carries an
+  explicit `page_location`, `page_path`, `page_referrer` and `page_title`, never
+  the raw URL: the query string and fragment are dropped, and any path segment
+  that holds 20 or more letters and digits in a row (an address), or follows a
+  per-miner route, becomes `:addr` (`/miner_payouts/<address>` →
+  `/miner_payouts/:addr`, `/miner.html?address=<address>` → `/miner.html`). The
+  page's referrer policy is `no-referrer`, so no request carries the raw URL.
+- **Consent bar.** A small bar at the bottom reads "This site uses Google
   Analytics cookies to count visits." with **Accept** and **Decline**. Accept
-  grants `analytics_storage` only (no `ad_*` type is ever granted); Decline keeps
-  it denied. The choice is kept in the browser's `localStorage`
-  (`c2pool_ga_consent`), the bar is not shown again, and a stored Accept applies
-  on later pages before the config call. A page without `</body>` gets the
-  `<head>` part only, with consent left denied; a page without `</head>`, or one
-  that already loads `gtag.js`, is left unchanged.
+  grants `analytics_storage` only (no `ad_*` type is ever granted); Decline sends
+  nothing. The choice is kept in the browser's `localStorage`
+  (`c2pool_ga_consent`) and the bar is not shown again. A page without `</body>`
+  gets no bar, so it never sends anything.
+- **Never on** `/control/*`, `/api/*` (admin, config, tx-inject), `/web/log`,
+  `/logs/*`, a request that carries a token, or a non-HTML response. A page
+  without `</head>`, or one that already loads `gtag.js`, is left unchanged.
 - **Only a measurement ID.** The value must be `G-` followed by 4–20 upper-case
   letters or digits (the legacy `UA-<digits>-<digits>` form is also accepted).
   A bad command-line value refuses the start (non-zero exit); a bad settings-file
@@ -1137,6 +1148,10 @@ it serves (`src/core/analytics_tag.hpp`, one helper for every page):
   [`explorer/explorer.py`](#api-endpoints), which takes the same
   `--analytics-id ID` flag: pass it there too, since the explorer is a separate
   process.
+- **The operator who enables it is responsible for their own privacy notice**
+  (and for the GA4 property's settings). Turn off Enhanced measurement in the
+  GA4 web stream: otherwise GA adds its own events after consent, and an
+  outbound-click event carries the link URL, which can hold an address.
 
 `c2pool-bip110` does not take `--settings` / `--data-dir` / `--dump-resolved-config`
 (no `BIN_BIP110` alias for those rows in `param_catalog.inc`); its money
@@ -1228,7 +1243,7 @@ legacy YAML key set.
 | `--payout-window` | `payout_window_seconds` | 86400 | PPLNS window (seconds) |
 | `--storage-save-interval` | `storage_save_interval` | 300 | Sharechain save interval |
 | `--dashboard-dir` | `dashboard_dir` | web-static | Static dashboard directory |
-| `--analytics-id` | `analytics_id` | -- (off) | Google Analytics measurement ID (`G-XXXXXXXXXX`): its tag and a consent bar (default denied) in every served HTML page (see [Google Analytics tag](#google-analytics-tag)); TOML `web.analytics_id` |
+| `--analytics-id` | `analytics_id` | -- (off) | Google Analytics measurement ID (`G-XXXXXXXXXX`): GA4 page views after the visitor accepts the consent bar, addresses and query strings stripped (see [Google Analytics tag](#google-analytics-tag)); TOML `web.analytics_id` |
 | -- | `address_explorer_prefix` | Blockchair | Custom address explorer URL prefix |
 | -- | `block_explorer_prefix` | Blockchair | Custom block explorer URL prefix |
 | -- | `tx_explorer_prefix` | Blockchair | Custom tx explorer URL prefix |
@@ -1410,7 +1425,7 @@ dashd-attached default OFF)
 | `--stratum-http-budget N` | 16 | HTTP requests in progress on the Stratum port at once, at most N and at most max_stratum_connections - 1; others are answered 503 (0 = every HTTP request on the Stratum port is answered 503). |
 | `--stratum-http-per-ip N` | 6 | HTTP requests in progress on the Stratum port at once from one address, one /64 for IPv6: at most N; others are answered 503 (0 = no limit below `--stratum-http-budget`). |
 | `--dashboard-dir PATH` | `web-static` | Static dashboard root. |
-| `--analytics-id ID` | off | Google Analytics tag and consent bar in every served HTML page ([Google Analytics tag](#google-analytics-tag)); settings key `web.analytics_id`. |
+| `--analytics-id ID` | off | GA4 page views after the visitor accepts the consent bar, addresses and query strings stripped ([Google Analytics tag](#google-analytics-tag)); settings key `web.analytics_id`. |
 | `--external-ip ADDR` (aliases `--stratum-advertise`, `--public-host`) | auto-detect | Miner-facing host shown in the dashboard Stratum URL (NAT). |
 | `--explorer` / `--no-explorer` | on | Loopback-only `/api/explorer` surface + raw-block retention. |
 | `--give-author PCT` (alias `--dev-donation`) | 0.1 | Author donation percent. |
@@ -1457,7 +1472,7 @@ usage and exits 1.
 | `--network-id HEX` (≤8 bytes), `--prefix HEX` | public BTC | Private sharechain identifier / prefix — two independent constants. Setting `--network-id` alone also suppresses the public seed list. |
 | `--stratum [HOST:]PORT` | off | Stratum listener. |
 | `--http [HOST:]PORT` | off | Operator dashboard (`web-static` relative to the working directory; parser only — not in the `--help` text). |
-| `--analytics-id ID` | off | Google Analytics tag and consent bar in every HTML page `--http` serves ([Google Analytics tag](#google-analytics-tag)); settings key `web.analytics_id`. |
+| `--analytics-id ID` | off | GA4 page views of the `--http` pages after the visitor accepts the consent bar, addresses and query strings stripped ([Google Analytics tag](#google-analytics-tag)); settings key `web.analytics_id`. |
 | `--coin-rpc HOST:PORT` | — | `submitblock` RPC backup endpoint (no secret on argv). |
 | `--coin-rpc-auth PATH` | `~/.bitcoin/bitcoin.conf` | `rpcuser`/`rpcpassword` file for the backup. Omit both to run daemonless. |
 | `--merged SYMBOL:CHAIN_ID:HOST:PORT:USER:PASS[:P2P_PORT]` (repeatable) | — | Embedded merged-mined aux chain (NMC under BTC). |
@@ -1489,7 +1504,7 @@ destination.
 | `--run` | | Stand up the run-loop (io_context + sharechain peer + Stratum). Without it (or with `--selftest`) the binary runs the self-test and exits. |
 | `--stratum [HOST:]PORT` | off | Stratum listener. |
 | `--http [HOST:]PORT` | off | Dashboard + stats persistence (`web-static` relative to the working directory). |
-| `--analytics-id ID` | off | Google Analytics tag and consent bar in every HTML page `--http` serves ([Google Analytics tag](#google-analytics-tag)); settings key `web.analytics_id`. |
+| `--analytics-id ID` | off | GA4 page views of the `--http` pages after the visitor accepts the consent bar, addresses and query strings stripped ([Google Analytics tag](#google-analytics-tag)); settings key `web.analytics_id`. |
 | `--sharechain-port P` | 5024 | Sharechain listener port. |
 | `--sharechain-addnode HOST:PORT` (repeatable) | public defaults | Pin sharechain peers; suppresses the default bootstrap list. `92.53.224.27:5024` is the live public DGB sharechain seed named in the source. |
 | `--coin-p2p-discover` | off | DGB-isolated scored, diverse coin-peer discovery — daemonless. |
@@ -1534,7 +1549,7 @@ loop. Unknown argument → `unknown argument: …`, exit 1. The pool mode is
 | `--anchor N` | 0 | Cold-start ABLA floor anchor height. |
 | `--stratum [HOST:]PORT` | off | Stratum listener. |
 | `--http [HOST:]PORT` | off | Dashboard. |
-| `--analytics-id ID` | off | Google Analytics tag and consent bar in every HTML page `--http` serves ([Google Analytics tag](#google-analytics-tag)); settings key `web.analytics_id`. |
+| `--analytics-id ID` | off | GA4 page views of the `--http` pages after the visitor accepts the consent bar, addresses and query strings stripped ([Google Analytics tag](#google-analytics-tag)); settings key `web.analytics_id`. |
 | `--rpc-conf PATH` | — | BCHN `bitcoin.conf` for the external-RPC fallback (`rpcuser`/`rpcpassword`; endpoint is `127.0.0.1:<rpcport>`). |
 | `--coin-p2p-discover` | off | Daemonless coin-peer discovery (CoinAddrMan); no `--peer` needed. |
 | `--sharechain-addnode HOST:PORT` (repeatable) | public defaults | Pin sharechain peers (`92.53.224.27:9349` is the live public BCH sharechain seed named in the source). |
@@ -1569,7 +1584,7 @@ cd /opt/c2pool-bip110 && ./c2pool-bip110 --run --coin-p2p-discover \
 | `--coin-externalip IP` | peer-echo auto | Operator-pinned reachable IP for self-advertisement (bare IP; port 8333 substituted). |
 | `--fork-checkpoint` | off | Seed the Knots 961640 checkpoint for a fast proof. |
 | `--http [HOST:]PORT` | off | Shared coin-generic dashboard (`/`, `/node_info`, `/api/node_topology`, `/broadcaster_status`). |
-| `--analytics-id ID` | off | Google Analytics tag and consent bar in every HTML page `--http` serves ([Google Analytics tag](#google-analytics-tag)); command line only (no settings file). |
+| `--analytics-id ID` | off | GA4 page views of the `--http` pages after the visitor accepts the consent bar, addresses and query strings stripped ([Google Analytics tag](#google-analytics-tag)); command line only (no settings file). |
 | `--stratum [HOST:]PORT` / `--no-stratum` | `0.0.0.0:9336` on | Stratum listener; `--no-stratum` disables. |
 | `--serve-mempool-txs` / `--no-serve-mempool-txs` | on | Include real network txs in served templates (M3 good-citizen); the `--no-` form is the coinbase-only escape hatch. |
 | `--bip110-sharechain` | off | Arm the M3 sharechain mint on `:9337` and dial the federation sharechain. First outbound is irreversible (params-freeze checkpoint). Absent → M2 header-follower only. |
@@ -1719,9 +1734,10 @@ explorer_url: "http://localhost:9090"
 python3 explorer/explorer.py --ltc-c2pool http://127.0.0.1:8080/api/explorer --web-port 9090
 ```
 
-`--analytics-id G-XXXXXXXXXX` puts the same Google Analytics tag and consent bar
-as the node's into every page the explorer generates (default off; a bad value
-exits 2). It is a separate process, so give it the flag as well as the node
+`--analytics-id G-XXXXXXXXXX` (off by default; a bad value exits 2) puts the same
+Google Analytics tag and consent bar as the node's into every page the explorer
+generates: GA4 page views only, after consent, with addresses and query strings
+stripped. It is a separate process, so give it the flag as well as the node
 (see [Google Analytics tag](#google-analytics-tag)).
 
 The explorer shows block details, decoded coinbase scripts, THE commitment proofs for c2pool-found blocks, and links to Blockchair for transactions/addresses outside the stored range.

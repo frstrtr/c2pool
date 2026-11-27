@@ -225,11 +225,12 @@ tx_explorer_prefix:      "https://your-explorer.example.com/tx/"
 ```
 
 - **Analytics:** set `--analytics-id G-XXXXXXXXXX` (settings key
-  `web.analytics_id`; LTC YAML `analytics_id`) on any coin binary to put the
-  Google Analytics tag into every HTML page the node serves, with Consent Mode
-  defaulting to denied and a small Accept / Decline bar; off by default. Pass the
-  same flag to `explorer/explorer.py` for its pages. See the README section
-  "Google Analytics tag".
+  `web.analytics_id`; LTC YAML `analytics_id`) on any coin binary; off by
+  default. Every HTML page then shows a small Accept / Decline bar, and only
+  after Accept are GA4 page views sent, with addresses and query strings
+  stripped. Pass the same flag to `explorer/explorer.py` for its pages. The
+  operator who enables it is responsible for their own privacy notice. See the
+  README section "Google Analytics tag".
 
 ---
 

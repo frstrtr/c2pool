@@ -720,9 +720,10 @@ void print_help() {
     std::cout << "  --payout-window N         PPLNS payout window in seconds (default: 86400)\n";
     std::cout << "  --storage-save-interval N Periodic sharechain save interval in seconds (default: 300)\n";
     std::cout << "  --dashboard-dir PATH      Dashboard static files directory (default: web-static)\n";
-    std::cout << "  --analytics-id ID         Google Analytics measurement ID (G-XXXXXXXXXX): its tag and a\n";
-    std::cout << "                            consent bar (default denied) go into every HTML page the\n";
-    std::cout << "                            node serves (default: off)\n\n";
+    std::cout << "  --analytics-id ID         Google Analytics (GA4) measurement ID, G-XXXXXXXXXX; off by default.\n";
+    std::cout << "                            Every HTML page then shows a consent bar; only after a visitor\n";
+    std::cout << "                            accepts are GA4 page views sent, with addresses and query\n";
+    std::cout << "                            strings stripped. You are responsible for your own privacy notice.\n\n";
 
     std::cout << "BLOCKCHAIN SUPPORT:\n";
     std::cout << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
