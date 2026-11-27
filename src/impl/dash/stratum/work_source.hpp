@@ -609,6 +609,14 @@ public:
     /// nSuperblockCycle of this work source's network.
     int superblock_cycle() const;
 
+    /// --regtest: a third network. DASH rides the testnet flag for it (regtest
+    /// reuses the testnet address bytes, so the payout-address set is the
+    /// testnet one either way), but its nSuperblockCycle is 10, not 24: the
+    /// store brake's skip rule must know it. Set once at wiring time, before
+    /// the first template is sourced.
+    void set_regtest(bool regtest) { is_regtest_ = regtest; }
+    bool is_regtest() const { return is_regtest_; }
+
     /// Drop the cached template snapshot + bump work_generation. Wired to the
     /// NodeRPC reconnect hook in main_dash.cpp (stale-payee fix, defect 3):
     /// a "CoindRPC reconnecting" churn means any cached template — and the

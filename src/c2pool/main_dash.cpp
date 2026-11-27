@@ -333,6 +333,11 @@ bool g_deferred_mint = dash::mint::kDeferredMintDefault;
 // runs that exercise the eviction tiers and the safety brake on real traffic.
 uint64_t g_frozen_job_cap_mb = 0;
 
+// --regtest: DASH rides the testnet identity for it (testnet = true), and this
+// remembers that it is regtest, for what differs: the work source's superblock
+// cycle (10, not testnet's 24), which the store brake's skip rule reads.
+bool g_regtest = false;
+
 // --embedded-mn-bridge-no-cursor (#91): DISABLE the bridge's resumable replay
 // cursor, so every process start replays the whole window from the pinned
 // anchor — exactly the behaviour before #91 existed.
@@ -4590,6 +4595,9 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     auto work_source = std::make_shared<dash::stratum::DASHWorkSource>(
         node_coin_state, std::move(dashd_fallback), std::move(stratum_submit_fn),
         core::stratum::StratumConfig{}, testnet);
+    // --regtest rides the testnet flag; the work source still needs to know
+    // (its superblock cycle is regtest's 10, read by the store brake).
+    work_source->set_regtest(g_regtest);
     // Gate-lift (v0.2.4): allow the daemonless embedded arm on mainnet when the
     // operator opts in via --embedded-mainnet. The CbTx is proven byte-identical
     // to real dashd (both merkle roots reproduced from the mnlistdiff wire); the
@@ -13141,8 +13149,8 @@ int main(int argc, char** argv)
             payout_pkh_hex = argv[++i];
         else if (std::strcmp(argv[i], "--max-nonce") == 0 && i + 1 < argc)
             max_nonce = std::strtoull(argv[++i], nullptr, 0);
-        else if (std::strcmp(argv[i], "--testnet") == 0 ||
-                 std::strcmp(argv[i], "--regtest") == 0)  testnet = true;
+        else if (std::strcmp(argv[i], "--testnet") == 0)  testnet = true;
+        else if (std::strcmp(argv[i], "--regtest") == 0) { testnet = true; g_regtest = true; }
         else if ((std::strcmp(argv[i], "--coin-rpc") == 0 ||
                   std::strcmp(argv[i], "--coin-daemon") == 0) && i + 1 < argc)
             rpc_endpoint = argv[++i];

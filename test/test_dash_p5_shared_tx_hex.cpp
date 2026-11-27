@@ -46,6 +46,9 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <iterator>
+#include <fstream>
+#include <cctype>
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -1381,4 +1384,57 @@ TEST(DashWorkSourceStoreBrake, PaymentOrPayloadChangeAtSameTipStores)
     EXPECT_EQ(ws.peek_template()->m_packed_payments.size(), 2u)
         << "the newly funded trigger reached the served template";
     EXPECT_EQ(ws.store_brake_skips(), 1u);
+}
+
+// --regtest rides the testnet flag on DASH, but its superblock cycle is 10,
+// not testnet's 24. The run wires it (main_dash: --regtest -> g_regtest ->
+// DASHWorkSource::set_regtest), so at a regtest superblock height the store
+// brake never skips a same-tip refresh; one height later it does.
+TEST(DashWorkSourceStoreBrake, RegtestSuperblockHeightNeverSkips)
+{
+    const uint32_t h = 151u * 10u;   // 1,510: a regtest superblock height, not a testnet (24) one
+    ASSERT_NE(h % 24u, 0u);
+    auto at = [](uint32_t height, unsigned char tag) {
+        return make_template(kPrev1, height, 165000000ULL, {{tag, 40}});
+    };
+    auto run = [&](uint32_t height, bool regtest) {
+        Source src;
+        src.set(at(height, 0x31));
+        DASHWorkSource ws(src.coin_state, src.fallback(), Source::submit(),
+                          core::stratum::StratumConfig{}, /*is_testnet=*/true);
+        ws.set_regtest(regtest);
+        std::atomic<bool> brake{true};
+        ws.set_store_brake_fn([&brake] { return brake.load(); });
+        (void)serve_once(ws);
+        src.set(at(height, 0x32));   // same tip and payees, another tx set
+        ws.bump_work_generation();
+        (void)serve_once(ws);
+        return std::make_pair(ws.superblock_cycle(), ws.store_brake_skips());
+    };
+    {
+        const auto [cycle, skips] = run(h, /*regtest=*/true);
+        EXPECT_EQ(cycle, dash::coin::DASH_SUPERBLOCK_CYCLE_REGTEST);
+        EXPECT_EQ(skips, 0u) << "a regtest superblock height was skipped";
+    }
+    {
+        const auto [cycle, skips] = run(h + 1, /*regtest=*/true);
+        EXPECT_EQ(cycle, 10);
+        EXPECT_EQ(skips, 1u) << "one height later the brake skips";
+    }
+    {
+        const auto [cycle, skips] = run(h, /*regtest=*/false);
+        EXPECT_EQ(cycle, dash::coin::DASH_SUPERBLOCK_CYCLE_TESTNET);
+        EXPECT_EQ(skips, 1u) << "without the regtest flag the testnet cycle applies";
+    }
+
+    // The run wires it: --regtest sets the flag, and the work source gets it.
+    std::ifstream in(DASH_MAIN_SRC);
+    ASSERT_TRUE(in.good()) << "cannot open " << DASH_MAIN_SRC;
+    std::string src((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    src.erase(std::remove_if(src.begin(), src.end(), [](unsigned char c) { return std::isspace(c); }),
+              src.end());
+    EXPECT_NE(src.find(R"("--regtest")==0){testnet=true;g_regtest=true;})"), std::string::npos)
+        << "--regtest does not set g_regtest";
+    EXPECT_NE(src.find("work_source->set_regtest(g_regtest);"), std::string::npos)
+        << "the DASH work source is not told about --regtest";
 }

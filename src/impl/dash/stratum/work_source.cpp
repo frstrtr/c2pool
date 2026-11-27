@@ -3387,7 +3387,7 @@ bool DASHWorkSource::store_brake_may_skip(const coin::DashWorkData& cached,
 int DASHWorkSource::superblock_cycle() const
 {
     // dashcore nSuperblockCycle: mainnet 16616, testnet 24, regtest 10.
-    if (is_regtest_) return 10;
+    if (is_regtest_) return coin::DASH_SUPERBLOCK_CYCLE_REGTEST;
     return is_testnet_ ? coin::DASH_SUPERBLOCK_CYCLE_TESTNET : coin::DASH_SUPERBLOCK_CYCLE_MAINNET;
 }
 
