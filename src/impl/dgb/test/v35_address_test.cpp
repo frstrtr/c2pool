@@ -109,6 +109,7 @@ TEST(DgbV35Address, ShareWithAnUnpayableAddressIsRejected)
         dgb::PaddingBugfixShare share;
         static_assert(dgb::PaddingBugfixShare::version == 35);
         share.m_coinbase.m_data = {0x03, 0x01, 0x02, 0x03};
+        share.m_segwit_data = dgb::SegwitData{};   // a V35 share carries it (9227fdc9f)
         const std::string a = v.addr;
         share.m_address.m_data.assign(a.begin(), a.end());
         try {
