@@ -49,7 +49,9 @@
 #include <ctime>
 #include <fstream>
 #include <functional>
+#include <map>
 #include <memory>
+#include <stdexcept>
 #include <optional>
 #include <set>
 #include <string>
@@ -356,4 +358,82 @@ TEST(DgbOracleVectors, MintedChainPassesOwnChecksAndIsDumped)
         std::printf("[oracle-vectors] wrote %zu shares + %zu negatives to %s\n", out["shares"].size(),
                     out["negatives"].size(), path);
     }
+}
+
+// The python -> c2pool direction (review 906a0e5e3 #8): shares minted by the
+// python oracle itself (scripts/dgb_oracle_harness/mint_vectors.py: its own
+// generate_transaction / get_share on a genesis-rooted tracker, every payout
+// case python accepts) must verify here with python's hash; the mutated ones
+// python refuses (a whitespace address, the segwit_data none-value,
+// far_share_hash / absheight / abswork) must be refused here too. Runs only
+// with DGB_ORACLE_PY_VECTORS=<file> (python 2.7 + twisted; not in CI).
+TEST(DgbOracleReverse, PythonMintedSharesVerifyHere)
+{
+    const char* path = std::getenv("DGB_ORACLE_PY_VECTORS");
+    if (!path)
+        GTEST_SKIP() << "DGB_ORACLE_PY_VECTORS not set (scripts/dgb_oracle_harness/mint_vectors.py writes it)";
+    std::ifstream f(path);
+    ASSERT_TRUE(f.good()) << path;
+    const nlohmann::json v = nlohmann::json::parse(f);
+    const auto params = oracle_params();
+    dgb::ShareTracker tracker;
+    std::map<int, std::vector<nlohmann::json>> negatives;
+    for (const auto& n : v["negatives"])
+        negatives[n["before"].get<int>()].push_back(n);
+
+    auto load = [](const nlohmann::json& rec) {
+        Bytes c = ParseHex(rec["contents"].get<std::string>());
+        PackStream ps(c);
+        return dgb::load_share(rec["type"].get<int64_t>(), ps, NetService{"oracle", 0});
+    };
+    // The init phase (the hash), then the full verification a peer runs.
+    auto verify = [&](dgb::ShareType& st) {
+        uint256 h;
+        st.invoke([&](auto* obj) {
+            h = dgb::share_init_verify(*obj, params, /*check_pow=*/false);
+            obj->m_hash = h;
+            const uint256 again = dgb::verify_share(*obj, tracker, params);
+            if (again != h)
+                throw std::runtime_error("verify_share hash " + again.GetHex() + " != init " + h.GetHex());
+        });
+        return h;
+    };
+    int verified = 0, refused = 0, fails = 0;
+    for (const auto& rec : v["shares"]) {
+        const int i = rec["index"].get<int>();
+        for (const auto& n : negatives[i]) {
+            std::string why;
+            try {
+                auto st = load(n);
+                verify(st);
+            } catch (const std::exception& e) {
+                why = e.what();
+            }
+            if (why.empty()) {
+                ADD_FAILURE() << "negative '" << n["name"].get<std::string>() << "' before share " << i
+                              << " passed this node's checks (python: " << n["python_refusal"] << ")";
+                ++fails;
+            } else {
+                ++refused;
+            }
+        }
+        try {
+            auto st = load(rec);
+            const uint256 h = verify(st);
+            if (h.GetHex() != rec["hash"].get<std::string>())
+                throw std::runtime_error("hash " + h.GetHex() + " != python's " + rec["hash"].get<std::string>());
+            tracker.add(st);
+            ++verified;
+        } catch (const std::exception& e) {
+            ADD_FAILURE() << "python share " << i << " (" << rec["address"].get<std::string>()
+                          << ") refused here: " << e.what();
+            ++fails;
+            break;   // the rest build on it
+        }
+    }
+    std::printf("[oracle-reverse] RESULT %s shares=%d/%zu negatives_refused=%d/%zu fails=%d oracle=%s\n",
+                fails == 0 ? "PASS" : "FAIL", verified, v["shares"].size(), refused, v["negatives"].size(), fails,
+                v.value("oracle", std::string("?")).c_str());
+    EXPECT_EQ(fails, 0);
+    EXPECT_EQ(static_cast<size_t>(verified), v["shares"].size());
 }
