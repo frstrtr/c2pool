@@ -34,6 +34,11 @@ def main():
     os.symlink(oracle, os.path.join(pkg_dir, 'p2pool'))
     sys.path.insert(0, pkg_dir)
 
+    # main.py sets these from its arguments; the oracle's code reads them.
+    import p2pool
+    p2pool.DEBUG = False
+    p2pool.BENCH = False
+
     from p2pool import data as p2pool_data
     from p2pool import networks
     from p2pool.bitcoin import data as bitcoin_data
