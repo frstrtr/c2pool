@@ -5457,15 +5457,12 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                                     // exact regardless: superblock payouts come
                                     // from the 20% carve-out already deducted
                                     // from every block's subsidy. Cycle is
-                                    // network-specific (mainnet 16616, tn 24).
+                                    // network-specific (mainnet 16616, tn 24,
+                                    // regtest 10: dash_superblock_cycle).
                                     info.superblock =
                                         dash::coin::is_superblock_height(
                                             height,
-                                            testnet
-                                                ? dash::coin::
-                                                      DASH_SUPERBLOCK_CYCLE_TESTNET
-                                                : dash::coin::
-                                                      DASH_SUPERBLOCK_CYCLE_MAINNET);
+                                            dash::coin::dash_superblock_cycle(testnet, g_regtest));
                                     info.coinbase_value_sat =
                                         static_cast<uint64_t>(reward);
                                     info.payment_amount_sat =
@@ -6771,11 +6768,10 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // governance/treasury outputs, which the embedded template does not
         // compute. Refuse the embedded arm on those heights and let the reward-
         // safe dashd fallback serve the correct superblock template. Cycle is
-        // network-specific (mainnet 16616, testnet 24).
+        // network-specific (mainnet 16616, testnet 24, regtest 10), from the
+        // same definition the work source's store brake reads.
         {
-            const int sb_cycle = testnet
-                ? dash::coin::DASH_SUPERBLOCK_CYCLE_TESTNET
-                : dash::coin::DASH_SUPERBLOCK_CYCLE_MAINNET;
+            const int sb_cycle = dash::coin::dash_superblock_cycle(testnet, g_regtest);
             node_coin_state.set_is_superblock_fn(
                 [sb_cycle](uint32_t next_height) {
                     return dash::coin::is_superblock_height(next_height, sb_cycle);
