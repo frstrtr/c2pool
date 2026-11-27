@@ -160,7 +160,8 @@ void print_banner(const char* argv0, const core::CoinParams& p)
         << " [--version] [--help] [--selftest] [--run] [--stratum [H:]P] [--http [H:]P]\n"
         << "       [--coin-daemon H:P] [--coin-magic HEX] [--regtest]\n"
         << "       [--regtest-force-won-share] [--no-p2p-relay]\n"
-        << "       [--redistribute SPEC] [--node-owner-address ADDR]\n"
+        << "       [--redistribute SPEC] [--node-owner-address ADDR]   (SPEC default split: work\n"
+        << "         with no usable payout address pays 50% node owner / 50% donation)\n"
         << "       [--give-author PCT] [-f|--fee PCT]\n"
         << "       [--sharechain-port P] [--sharechain-addnode HOST:PORT ...]\n"
         << "       [--embedded-serve-mempool-txs[=true|false]]\n"
@@ -1663,7 +1664,8 @@ int run_node(const core::CoinParams& params, bool testnet,
                 const uint256& prev_share_hash,
                 const std::string& /*extranonce1_hex*/,
                 const std::vector<unsigned char>& payout_script,
-                const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs)
+                const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs,
+                const std::optional<uint16_t>& share_donation)
                 -> std::optional<dgb::coin::ConnCoinbasePplnsInputs>
             {
                 // Non-blocking tracker read. Contended -> decline (empty job).
@@ -1796,7 +1798,9 @@ int run_node(const core::CoinParams& params, bool testnet,
                 rin.share_nonce     = 0;            // share commitment nonce (not block)
                 rin.payout_script   = payout_script;
                 rin.subsidy         = subsidy;
-                rin.donation        = donation_u16;  // author default 0.1% (u16 66); --give-author overrides
+                // author default 0.1% (u16 66); --give-author overrides; a
+                // split job (--redistribute split) carries its own instead.
+                rin.donation        = share_donation ? *share_donation : donation_u16;
                 rin.stale_info      = 0;
                 rin.has_segwit      = false;       // segwit populated by template-cache follow-on
                 rin.merged_addresses    = merged_addresses;
@@ -1886,9 +1890,11 @@ int run_node(const core::CoinParams& params, bool testnet,
 
                 uint256 share_hash;
                 try {
+                    // The job's donation (a split job), else --give-author's:
+                    // the one its coinbase's ref_hash committed to.
                     share_hash = dgb::mint_local_share_at_frozen_version(
                         in, *min_header, p2p_node.tracker(), params,
-                        /*donation=*/donation_u16);
+                        /*donation=*/in.donation ? *in.donation : donation_u16);
                 } catch (const std::exception& e) {
                     LOG_WARNING << "[DGB-MINT] create_local_share threw: " << e.what();
                     return uint256();
@@ -1913,12 +1919,44 @@ int run_node(const core::CoinParams& params, bool testnet,
     }
 
     // -- --redistribute: node-local payout policy (Redistribute V2, #307) ------
-    // Opt-in ONLY. Chooses the pubkey this node stamps onto shares minted from
-    // submissions whose stratum username carries no valid payout address. It
-    // touches NOTHING on the sharechain (validation/codec/PPLNS unchanged) -- it
-    // is node-local and consensus-safe. Absent --redistribute the fallback stays
-    // unbound and the empty-credential path is byte-identical to prior builds.
-    if (!redistribute_spec.empty()) {
+    // Chooses the pubkey this node stamps onto shares minted from submissions
+    // whose stratum username carries no valid payout address. It touches
+    // NOTHING on the sharechain (validation/codec/PPLNS unchanged) -- it is
+    // node-local and consensus-safe. pplns / fee / boost / donate are opt-in
+    // (--redistribute MODE): their fallback is bound below.
+    // --redistribute split (the default): a job with no payout script (an
+    // empty or broken login, the job sent before the login) pays the node
+    // owner with share donation core::kSplitShareDonation (32768/65535: the
+    // owner and the donation half and half), decided when the job is built
+    // (DGBWorkSource::decide_job_payout), so the minted share carries the
+    // payout and donation its coinbase committed to. The owner is
+    // --node-owner-address (an own-network DGB P2PKH/P2SH address). None
+    // usable: the owner half cannot be paid; this node keeps the previous
+    // default (no redistribute policy bound), said once here.
+    const bool split_mode = !redistribute_spec.empty()
+        && dgb::spec_selects_split(dgb::parse_redistribute_spec(redistribute_spec));
+    if (split_mode) {
+        std::vector<unsigned char> owner_script;
+        const bool own = !node_owner_address.empty()
+            && core::classify_address_for_coin(node_owner_address, dgb::address_acceptance(testnet, regtest),
+                                               owner_script) == core::AddressCoinMatch::Own;
+        const bool carried = (owner_script.size() == 25 && owner_script[0] == 0x76 && owner_script[1] == 0xa9)
+                             || (owner_script.size() == 23 && owner_script[0] == 0xa9 && owner_script[22] == 0x87);
+        if (own && carried) {
+            work_source->set_split_owner(owner_script);
+            std::cout << "[DGB] redistribute split: unattributable work pays the node owner \""
+                      << node_owner_address << "\" and the donation half and half (share donation "
+                      << core::kSplitShareDonation << "/65535 instead of --give-author's)" << std::endl;
+        } else {
+            std::cout << "[DGB] WARNING: --redistribute split: "
+                      << (node_owner_address.empty() ? std::string("no --node-owner-address")
+                                                     : "--node-owner-address \"" + node_owner_address
+                                                           + "\" is not an own-network DGB P2PKH/P2SH address")
+                      << " -- the owner half cannot be paid; no redistribute policy on this node "
+                         "(empty-credential shares are not credited, as before)" << std::endl;
+        }
+    }
+    if (!split_mode && !redistribute_spec.empty()) {
         auto redistributor = std::make_shared<dgb::Redistributor>();
         redistributor->set_hybrid_weights(dgb::parse_redistribute_spec(redistribute_spec));
         // "donate" identity: P2SH hash160 == COMBINED_DONATION_SCRIPT[2..22]
@@ -2847,7 +2885,7 @@ int main(int argc, char** argv)
     uint256 coin_genesis;                   // --coin-genesis HASH (initial getheaders locator base)
     std::string rpc_endpoint;               // --coin-rpc HOST:PORT (external digibyted submit arm)
     std::string rpc_conf_path;              // --coin-rpc-auth PATH to digibyte.conf (creds source)
-    std::string redistribute_spec;         // --redistribute SPEC (node-local payout policy, #307)
+    std::string redistribute_spec = dgb::kDefaultRedistributeMode;   // --redistribute SPEC (node-local payout policy, #307; default split)
     std::string node_owner_address;        // --node-owner-address ADDR (operator payout identity for --redistribute fee, #307; also -f/--fee destination)
     // Author/dev donation + node-owner fee (ported from BTC/DASH). The built-in
     // author default is HARD-PINNED at 0.1% (core::kAuthorFeeDefaultPct → u16 66);
@@ -2971,7 +3009,7 @@ int main(int argc, char** argv)
         else if (std::strcmp(argv[i], "--dev-relax-algo-softforks") == 0) dev_relax_algo_softforks = true;
         else if (std::strcmp(argv[i], "--coin-p2p-discover") == 0) coin_p2p_discover = true;
         else if (std::strcmp(argv[i], "--redistribute") == 0 && i + 1 < argc) {
-            redistribute_spec = argv[++i];     // pplns|fee|boost|donate or hybrid "boost:70,donate:20"
+            redistribute_spec = argv[++i];     // split|pplns|fee|boost|donate or hybrid "boost:70,donate:20"
         }
         else if (std::strcmp(argv[i], "--node-owner-address") == 0 && i + 1 < argc) {
             node_owner_address = argv[++i];    // operator payout addr -> "fee" identity (#307 fee arm + -f/--fee destination)

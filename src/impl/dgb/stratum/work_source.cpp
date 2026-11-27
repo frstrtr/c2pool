@@ -33,6 +33,7 @@
 #include <impl/dgb/coin/won_block_serialize.hpp>   // serialize_won_block SSOT (won-block framing)
 #include <impl/dgb/coin/header_sample_build.hpp>// compact_to_target (compact bits -> u256)
 
+#include <core/author_fee.hpp>                     // kSplitShareDonation (--redistribute split)
 #include <core/log.hpp>
 #include <core/hash.hpp>                        // Hash (sha256d) for coinbase txid + merkle pair
 #include <core/target_utils.hpp>            // chain::target_to_difficulty (vardiff/pool unit parity)
@@ -478,6 +479,41 @@ core::stratum::CoinbaseResult DGBWorkSource::build_connection_coinbase(
     const std::vector<unsigned char>& payout_script,
     const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs) const
 {
+    return build_connection_coinbase_for({}, prev_share_hash, extranonce1_hex, payout_script, merged_addrs,
+                                         std::nullopt);
+}
+
+void DGBWorkSource::set_split_owner(std::vector<unsigned char> script)
+{
+    std::lock_guard<std::mutex> lk(fallback_payout_mutex_);
+    split_owner_script_ = std::move(script);
+}
+
+std::optional<uint16_t> DGBWorkSource::decide_job_payout(
+    std::vector<unsigned char>& payout_script,
+    std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& /*merged*/) const
+{
+    if (!payout_script.empty())
+        return std::nullopt;
+    std::vector<unsigned char> owner;
+    {
+        std::lock_guard<std::mutex> lk(fallback_payout_mutex_);
+        owner = split_owner_script_;
+    }
+    if (owner.empty())
+        return std::nullopt;
+    payout_script = std::move(owner);
+    return core::kSplitShareDonation;
+}
+
+core::stratum::CoinbaseResult DGBWorkSource::build_connection_coinbase_for(
+    const core::stratum::PayoutKey& /*login_key*/,
+    const uint256& prev_share_hash,
+    const std::string& extranonce1_hex,
+    const std::vector<unsigned char>& payout_script,
+    const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs,
+    const std::optional<uint16_t>& share_donation) const
+{
     // Phase B live-wire: delegate to the PPLNS->coinbase SSOT
     // (build_connection_coinbase_from_pplns), which itself routes through the
     // single compute_pplns_payout_split() the verifier uses -- so the coinbase a
@@ -508,7 +544,7 @@ core::stratum::CoinbaseResult DGBWorkSource::build_connection_coinbase(
         effective_payout_script(payout_script, prev_share_hash, extranonce1_hex);
 
     std::optional<dgb::coin::ConnCoinbasePplnsInputs> inputs =
-        fn(prev_share_hash, extranonce1_hex, eff_payout_script, merged_addrs);
+        fn(prev_share_hash, extranonce1_hex, eff_payout_script, merged_addrs, share_donation);
     if (!inputs)
         return {};  // producer declined (e.g. tip not yet known) -> safe empty job.
 
@@ -749,6 +785,14 @@ nlohmann::json DGBWorkSource::mining_submit(
             // is untouched. Default (fee 0) => byte-identical to before.
             in.payout_script =
                 effective_payout_script(payout_script, job->prev_share_hash, extranonce1);
+            // A split job (decide_job_payout: no payout when it was built,
+            // e.g. the job sent before the login): the payout and the
+            // donation its coinbase committed to, whatever the login is now.
+            if (job->has_payout && job->share_donation) {
+                in.payout_script =
+                    effective_payout_script(job->payout_script, job->prev_share_hash, extranonce1);
+                in.donation = job->share_donation;
+            }
         }
         // Redistribute V2 (#307): a miner with empty/broken stratum creds
         // yields no payout script. When the operator opted into a
