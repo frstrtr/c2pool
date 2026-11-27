@@ -120,7 +120,8 @@ wire_header_ingest(::dgb::interfaces::Node& node, HeaderChain& chain)
                 auto packed = pack(h);
                 const uint256 id = Hash(packed.get_span());
                 const u256 block_hash = u256::from_le_bytes(reinterpret_cast<const unsigned char*>(id.begin()));
-                const u256 prev = u256::from_le_bytes(reinterpret_cast<const unsigned char*>(h.m_previous_block.begin()));
+                uint256 prev_id = h.m_previous_block;
+                const u256 prev = u256::from_le_bytes(reinterpret_cast<const unsigned char*>(prev_id.begin()));
                 const auto tip = chain.tip_hash();
                 if (tip && !prev.is_zero() && !(prev == *tip)) {
                     if (chain.find_index(block_hash))

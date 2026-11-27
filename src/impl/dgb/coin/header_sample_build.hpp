@@ -91,7 +91,8 @@ inline HeaderSample make_header_sample(const ::dgb::coin::BlockHeaderType& h)
     s.n_bits    = h.m_bits;
     // The parent's id, in the same little-endian shape as block_hash: the
     // ingest appends a header only onto its parent (header_ingest.hpp).
-    s.prev_hash = u256::from_le_bytes(reinterpret_cast<const unsigned char*>(h.m_previous_block.begin()));
+    uint256 prev = h.m_previous_block;
+    s.prev_hash = u256::from_le_bytes(reinterpret_cast<const unsigned char*>(prev.begin()));
 
     // Serialize once: the block-identity hash and the Scrypt PoW digest are
     // both pure functions of the same canonical 80-byte header.
