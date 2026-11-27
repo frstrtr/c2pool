@@ -33,6 +33,7 @@
 #include <impl/dgb/v35_address.hpp>   // v35_address_to_script: the python network's V34/V35 address rule
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <cstring>
 #include <stdexcept>
@@ -492,6 +493,15 @@ inline std::pair<uint256, uint64_t> compute_ref_hash_for_work(const RefHashParam
     return {ref_hash, nonce};
 }
 
+// Whether V36 shares are accepted (main_dgb: the --v36-ratchet opt-in; held at
+// V35 without it). The library default accepts them (tests, tools).
+inline std::atomic<bool>& v36_shares_accepted_flag()
+{
+    static std::atomic<bool> accepted{true};
+    return accepted;
+}
+inline bool v36_shares_accepted() { return v36_shares_accepted_flag().load(std::memory_order_relaxed); }
+
 // Thread-local state from share_init_verify — read by attempt_verify() without re-computing scrypt.
 inline thread_local bool g_last_init_is_block = false;
 inline thread_local uint256 g_last_pow_hash;  // scrypt hash of the share header
@@ -529,6 +539,12 @@ uint256 share_init_verify(const ShareT& share, const core::CoinParams& params, b
     // --- Basic validation ---
     if (share.m_coinbase.size() < 2 || share.m_coinbase.size() > 100)
         throw std::invalid_argument("bad coinbase size");
+
+    // While DGB is held at V35 (no --v36-ratchet), a V36 share is refused:
+    // the python V35 network cannot load one (review 906a0e5e3 #9).
+    if constexpr (core::version_gate::is_v36_active(ShareT::version))
+        if (!v36_shares_accepted())
+            throw std::invalid_argument("V36 share while DGB shares are held at V35");
 
     // V35 is segwit-activated on the python network: a V35 share without
     // segwit_data (python's None) fails there (Share.__init__ reads
@@ -1650,7 +1666,13 @@ void check_v35_share_info(const ShareT& share, TrackerT& tracker, const core::Co
 {
     if (share.m_prev_hash.IsNull() || !tracker.chain.contains(share.m_prev_hash))
         return;
-    auto [prev_height, last] = tracker.chain.get_height_and_last(share.m_prev_hash);
+    // One height source with attempt_verify (the accumulated height, which
+    // survives pruning; review 906a0e5e3 #6): python decides once the chain is
+    // rooted or REAL_CHAIN_LENGTH long, and so does attempt_verify before it
+    // gets here; a walk height cut short by a pruned tail no longer skips the
+    // check.
+    const int32_t prev_height = tracker.chain.get_acc_height(share.m_prev_hash);
+    const uint256 last = tracker.chain.get_last(share.m_prev_hash);
     if (!(prev_height >= static_cast<int32_t>(params.real_chain_length) || last.IsNull()))
         return;   // python has not decided either
 

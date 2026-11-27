@@ -296,6 +296,9 @@ int run_node(const core::CoinParams& params, bool testnet,
              // (off: DGB is held at V35, dgb::DgbVersionPolicy).
              bool v36_ratchet = false)
 {
+    // Held at V35 (no --v36-ratchet): V36 shares are refused too, from peers
+    // and from the store (share_init_verify), before any is loaded.
+    dgb::v36_shares_accepted_flag().store(v36_ratchet);
     io::io_context ioc;
 
     // Author/dev donation u16 (p2pool committed donation field). Built-in default

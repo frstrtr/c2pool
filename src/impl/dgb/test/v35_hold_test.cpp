@@ -12,7 +12,9 @@
 
 #include <impl/dgb/auto_ratchet_wire.hpp>
 #include <impl/dgb/config_pool.hpp>
+#include <impl/dgb/params.hpp>
 #include <impl/dgb/share.hpp>
+#include <impl/dgb/share_check.hpp>
 #include <impl/dgb/share_tracker.hpp>
 
 #include <core/uint256.hpp>
@@ -152,4 +154,37 @@ TEST(DgbV35Hold, MainDgbUsesThePolicy)
     EXPECT_EQ(src.find("std::make_shared<dgb::AutoRatchet>("), std::string::npos)
         << "main_dgb builds a ratchet outside the policy";
     EXPECT_NE(src.find("\"--v36-ratchet\""), std::string::npos);
+}
+
+// Review 906a0e5e3 #9: while held at V35, a V36 share (which the python V35
+// network cannot load) is refused at share_init_verify; with the opt-in it is
+// judged as before. main_dgb sets the flag before any share is loaded.
+TEST(DgbV35Hold, V36SharesAreRefusedWhileHeld)
+{
+    const auto params = dgb::make_coin_params(false);
+    dgb::MergedMiningShare s;
+    s.m_coinbase.m_data = {0x03, 0x01, 0x02, 0x03};
+    auto reason = [&]() -> std::string {
+        try {
+            dgb::share_init_verify(s, params, /*check_pow=*/false);
+        } catch (const std::exception& e) {
+            return e.what();
+        }
+        return {};
+    };
+    dgb::v36_shares_accepted_flag().store(false);
+    EXPECT_NE(reason().find("held at V35"), std::string::npos) << reason();
+    dgb::v36_shares_accepted_flag().store(true);
+    EXPECT_EQ(reason().find("held at V35"), std::string::npos) << reason();
+
+    std::ifstream f(DGB_MAIN_SRC);
+    std::stringstream ss;
+    ss << f.rdbuf();
+    const std::string src = ss.str();
+    const auto set = src.find("dgb::v36_shares_accepted_flag().store(v36_ratchet);");
+    ASSERT_NE(set, std::string::npos);
+    const auto sig = src.find("bool v36_ratchet = false)");
+    ASSERT_NE(sig, std::string::npos);
+    EXPECT_GT(set, sig);
+    EXPECT_LT(set, src.find("io::io_context ioc;", sig)) << "the flag must be set at the start of run_node";
 }
