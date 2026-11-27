@@ -84,6 +84,7 @@
 #include <core/filesystem.hpp>
 #include <core/stratum_server.hpp>
 #include <core/web_server.hpp>     // H-STATS.944: operator dashboard + graph_db persist
+#include <core/analytics_tag.hpp>  // --analytics-id / web.analytics_id
 #include <btclibs/util/strencodings.h>
 
 #include <boost/asio.hpp>
@@ -166,6 +167,7 @@ void print_banner(const char* argv0, const core::CoinParams& p)
         << "       [--embedded-serve-mempool-txs[=true|false]]\n"
         << "       [--stratum-http[=true|false|auto]]\n"
         << "       [--stratum-http-budget N] [--stratum-http-per-ip N]\n"
+        << "       [--analytics-id ID]\n"
         << "       [--data-dir PATH] [--dev-relax-algo-softforks]\n"
         << "       [--coin-p2p-discover]\n\n"
         << "  --data-dir PATH  root all per-instance state here (default ~/.c2pool);\n"
@@ -187,6 +189,10 @@ void print_banner(const char* argv0, const core::CoinParams& p)
         << "        stratum port at once from one address, one /64 for IPv6, at\n"
         << "        most N; others are answered 503 (default 6; 0 = no limit below\n"
         << "        --stratum-http-budget).\n"
+        << "        --analytics-id ID (Google Analytics GA4, G-XXXXXXXXXX), off by default:\n"
+        << "        every HTML page --http serves shows a consent bar; only after a visitor\n"
+        << "        accepts are GA4 page views sent, with addresses and query strings\n"
+        << "        stripped. You are responsible for your own privacy notice.\n"
         << "        Embedded P2P won-block relay + external digibyted\n"
         << "        RPC fallback land in the next slices.\n"
         << "        --regtest-force-won-share (regtest-ONLY; requires\n"
@@ -2244,6 +2250,7 @@ int run_node(const core::CoinParams& params, bool testnet,
         // static serving at web-static. Display-only — no share/reward/consensus.
         mi->set_dashboard_always_ready(true);
         web_server->set_dashboard_dir("web-static");
+        web_server->set_analytics_id(core::analytics_id_setting());   // --analytics-id (default off)
 
         // ── D-DGB dashboard data hooks (extend the #1051 WebServer seam) ──
         // Isolation: every source is a main_dgb-scope handle; NO src/core edit.
@@ -2946,6 +2953,13 @@ int main(int argc, char** argv)
                 http_port = static_cast<uint16_t>(std::stoi(ep.substr(colon + 1)));
             }
         }
+        else if (std::strcmp(argv[i], "--analytics-id") == 0 && i + 1 < argc) {
+            if (!core::parse_analytics_id(argv[++i], core::analytics_id_setting())) {
+                std::cerr << "bad value: --analytics-id " << argv[i]
+                          << " (expected a Google Analytics measurement ID, G-XXXXXXXXXX)\n";
+                return 1;
+            }
+        }
         else if (std::strcmp(argv[i], "--coin-daemon") == 0 && i + 1 < argc) {
             coin_daemon = argv[++i];               // embedded coin-daemon P2P endpoint
         }
@@ -3090,6 +3104,9 @@ int main(int argc, char** argv)
             c2pool::catalog::C_DGB, path);
         // Apply file-sourced (L1) values into the locals the node consumes.
         if (rc.file_set("web.port"))                 http_port = static_cast<uint16_t>(rc.get_u16("web.port").value_or(http_port));
+        if (rc.file_set("web.analytics_id"))   // --analytics-id: a bad value is warned about and ignored
+            core::apply_analytics_id_setting("web.analytics_id", rc.get_string("web.analytics_id").value_or(""),
+                                             core::analytics_id_setting());
         if (rc.file_set("stratum.http"))   // --stratum-http: true / false / auto
             core::apply_stratum_http_setting(rc.get_string("stratum.http").value_or(""),
                                              core::stratum_http_mode_setting());

@@ -3,6 +3,7 @@
 #include <core/host_port.hpp>
 #include "web_server.hpp"
 #include "stratum_server.hpp"
+#include "analytics_tag.hpp"   // set_analytics_id: only a measurement ID is served
 #include <cctype>     // rewrite_payout_scheme_label: identifier-character test
 #include <algorithm>   // std::max — authorship only ever climbs, never downgrades
 #include <cctype>      // std::tolower — /found_block/<hash> case-folding
@@ -14817,9 +14818,17 @@ void WebServer::set_dashboard_dir(const std::string& dir)
 
 void WebServer::set_analytics_id(const std::string& id)
 {
+    // The mains validate the ID at parse time; an ID that is not a
+    // measurement ID is never served (core/analytics_tag.hpp).
+    if (!id.empty() && !core::is_valid_analytics_id(id)) {
+        LOG_WARNING << "Analytics tag not enabled: '" << id
+                    << "' is not a Google Analytics measurement ID";
+        mining_interface_->set_analytics_id("");
+        return;
+    }
     mining_interface_->set_analytics_id(id);
     if (!id.empty())
-        LOG_INFO << "Analytics tag enabled: " << id;
+        LOG_INFO << "Analytics tag enabled: " << id << " (consent default denied)";
 }
 
 void WebServer::set_explorer_enabled(bool enabled)
