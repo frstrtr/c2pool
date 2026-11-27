@@ -948,3 +948,29 @@ TEST(DgbMintRoundTrip, ArmAWonV35BlockPassesTheWitnessCheckAndKeepsItsHash)
         [peer](const uint256&) { return peer; }, [&gentx, share](const uint256&) { return gentx(share); }, no_txs);
     EXPECT_FALSE(peer_closure(peer_hash).has_value()) << "a block with unknown transactions was relayed";
 }
+
+// Review 906a0e5e3 #7: the V35 mint declines a share whose own fields hash to
+// another ref than the one the mined coinbase committed to (before, it took
+// the coinbase's ref and broadcast a share python regenerates differently).
+TEST(DgbMintRoundTrip, V35MintDeclinesWhenItsRefIsNotTheCoinbases)
+{
+    RtRig rig;
+    rig.mint_version = 35;
+    size_t before = 0;
+    rig.ws->set_mint_share_fn([&rig, &before](const dgb::stratum::DGBWorkSource::MintShareInputs& got) -> uint256 {
+        auto in = got;
+        in.frozen_timestamp += 1;   // a field the job's ref did not commit to
+        auto hdr = dgb::parse_min_header_80(in.header_bytes);
+        if (!hdr)
+            return uint256();
+        before = rig.chain.tracker.chain.size();
+        rig.minted = dgb::mint_local_share_at_frozen_version(in, *hdr, rig.chain.tracker, rig.params, 66);
+        return rig.minted;
+    });
+    auto cbr = rig.ws->build_connection_coinbase(rig.chain.tip, "cafef00d", stratum_payout(miner_login()), {});
+    ASSERT_FALSE(cbr.held);
+    auto j = rig.job(cbr, 0x2100ffffu);
+    (void)rig.ws->mining_submit(miner_login(), "job", "cafef00d", "0000002f", "6a1b2c3d", "00c0ffee", "rid", {}, &j);
+    EXPECT_TRUE(rig.minted.IsNull()) << "a share with another ref than its coinbase's was minted";
+    EXPECT_EQ(rig.chain.tracker.chain.size(), before) << "and added to the chain";
+}

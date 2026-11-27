@@ -2349,12 +2349,22 @@ uint256 create_local_share_v35(
     uint256 hash_ref = Hash(ref_span_v);
     uint256 ref_hash = check_merkle_link(hash_ref, share.m_ref_merkle_link);
 
-    // Use ref_hash from actual coinbase if available
+    // The mined coinbase commits (its OP_RETURN) to the ref the job froze.
+    // The share made here must carry exactly that ref: when the ref computed
+    // from the share's own fields differs, the share is DECLINED (review
+    // 906a0e5e3 #7). Taking the coinbase's ref instead made a share whose
+    // fields python regenerates to another ref ("share PoW invalid", a
+    // PeerMisbehavingError there).
     if (!actual_coinbase_bytes.empty() && actual_coinbase_bytes.size() > 44) {
         uint256 coinbase_ref_hash;
         std::memcpy(coinbase_ref_hash.data(),
                      actual_coinbase_bytes.data() + actual_coinbase_bytes.size() - 44, 32);
-        ref_hash = coinbase_ref_hash;
+        if (coinbase_ref_hash != ref_hash) {
+            LOG_WARNING << "[DGB-MINT] V35 share DECLINED: the ref of its fields ("
+                        << ref_hash.GetHex().substr(0, 16) << ") is not the mined coinbase's ("
+                        << coinbase_ref_hash.GetHex().substr(0, 16) << ")";
+            return uint256();
+        }
     }
 
     // --- Derive hash_link (V35: HashLinkType, no extra_data) ---
