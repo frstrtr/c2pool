@@ -1263,7 +1263,11 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
         // another primary nothing of the previous login is carried over (its
         // auto-derived entries were that primary's hash160).
         merged_addresses_ = set_merged_addresses_;
-        post_auth_merged_.clear();
+        // The set_merged_addresses a login counts as its own (case 4): those
+        // received after the latest authorize; on a connection that never
+        // authorized, also those sent before its first authorize.
+        if (ever_authorized_)
+            post_auth_merged_.clear();
         std::string merged_addr_raw;
         std::set<uint32_t> named_now;   // the slash form's chains
         parse_address_separators(username_, merged_addr_raw, &named_now);
@@ -1388,10 +1392,10 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
         LOG_INFO << "[Stratum] Mining authorization successful for: " << username_;
         login_primary_ = username_;
         login_given_ = std::move(given_now);
-        // Case 4 from the addresses this login gave itself (a re-authorize
-        // starts again: set_merged_addresses before it do not count).
-        post_auth_merged_.clear();
-        update_case4_parent();
+        ever_authorized_ = true;
+        // Case 4 from the addresses this login gave itself (login_given_,
+        // post_auth_merged_).
+        update_case4_parent(/*at_authorize=*/true);
 
         // ─── Login difficulty ───
         // "+N" (INTERNAL units, as python p2pool and earlier c2pool read it)
@@ -1735,22 +1739,28 @@ std::vector<unsigned char> StratumSession::merged_script_for(uint32_t chain_id, 
 // p2pool's case 4 (extended): a login whose own address pays no share
 // (payout_unusable_) takes its parent payout from a merged address it named
 // itself -- the login's own (login_given_: comma or slash form, a swapped
-// pair, a re-authorize of the same primary) or one set with
-// mining.set_merged_addresses after this authorize (post_auth_merged_),
-// never one carried over from another login -- in its legacy form
-// (core::merged_addr::case4_parent), with the node's donation. None: the
-// work source redistributes it. Logs the outcome.
-void StratumSession::update_case4_parent()
+// pair, a re-authorize of the same primary, mining.set_merged_addresses
+// while it is accepted) or one set with mining.set_merged_addresses after
+// this authorize or before the first authorize of a fresh connection
+// (post_auth_merged_), never one carried over from another login -- of a
+// configured chain on this network, in its legacy form (P2PKH or P2SH:
+// core::merged_addr::case4_parent), with the node's donation. None: the
+// work source redistributes it. The worker label names the chain ("DOGE",
+// else "chain_id=N"). Returns whether the payout changed; logs at the
+// authorize, and afterwards only on a change.
+bool StratumSession::update_case4_parent(bool at_authorize)
 {
+    const auto before = parent_script_;
     parent_script_.clear();
     if (!payout_unusable_)
-        return;
+        return parent_script_ != before;
     std::map<uint32_t, std::string> named = login_given_;
     for (const auto& [id, addr] : post_auth_merged_)
         named[id] = addr;
     const auto c4 = core::merged_addr::case4_parent(
         named, merged_table(), [this](uint32_t id) { return mining_interface_ && mining_interface_->has_merged_chain(id); });
     parent_script_ = c4.script;
+    const bool changed = parent_script_ != before;
     const auto& acfg = mining_interface_->get_stratum_config();
     const std::string who = (username_.empty() ? std::string("(empty login)") : username_)
                             + (worker_name_.empty() ? "" : "." + worker_name_);
@@ -1759,6 +1769,8 @@ void StratumSession::update_case4_parent()
     if (payout_uncarried_) {
         payout_warning_ = !parent_script_.empty() ? "P2WSH/P2TR address → parent paid to the " + chain + " address's key"
                                                   : "P2WSH/P2TR address → redistributed";
+        if (!at_authorize && !changed)
+            return false;
         LOG_WARNING << "[Stratum] " << who
                     << ": a P2WSH/P2TR address cannot be carried by a V36 share (20-byte payout hash): "
                     << (!parent_script_.empty()
@@ -1769,11 +1781,13 @@ void StratumSession::update_case4_parent()
                                           "the donation), merged chains included; use a P2PKH or P2WPKH "
                                           "address, or give a DOGE address (LTC_ADDRESS,DOGE_ADDRESS) to be "
                                           "paid on both chains"));
-        return;
+        return changed;
     }
     payout_warning_ = !parent_script_.empty() ? "address invalid → parent paid to the " + chain + " address's key"
                       : username_.empty()     ? "no address → redistributed"
                                               : "address invalid → redistributed";
+    if (!at_authorize && !changed)
+        return false;
     LOG_WARNING << "[Stratum] " << who << ": "
                 << (username_.empty() ? std::string("no payout address")
                                       : "payout address is not a"
@@ -1783,6 +1797,7 @@ void StratumSession::update_case4_parent()
                         ? ": the parent payout uses the key of the " + chain + " address " + c4.address
                               + " the login gave (p2pool case 4)"
                         : std::string(": its shares are redistributed (--redistribute), merged chains included"));
+    return changed;
 }
 
 // mining.set_merged_addresses extension
@@ -1813,9 +1828,17 @@ nlohmann::json StratumSession::handle_set_merged_addresses(const nlohmann::json&
                 }
                 merged_addresses_[chain_id] = addr;
                 set_merged_addresses_[chain_id] = addr;
-                login_given_.erase(chain_id);       // superseded by the address set now
+                // Set by the accepted login: its own address for the chain,
+                // kept by a re-authorize of the same primary (login_given_),
+                // never by another login.
                 if (authorized_)
-                    post_auth_merged_[chain_id] = addr;   // this login's own (case 4)
+                    login_given_[chain_id] = addr;
+                else
+                    login_given_.erase(chain_id);   // superseded by the address set now
+                // This login's own for case 4: after its authorize, or before
+                // the first authorize of a fresh connection.
+                if (authorized_ || !ever_authorized_)
+                    post_auth_merged_[chain_id] = addr;
             } catch (...) {
                 // skip malformed
             }
@@ -1824,15 +1847,14 @@ nlohmann::json StratumSession::handle_set_merged_addresses(const nlohmann::json&
 
     LOG_INFO << "Set merged addresses for " << username_ << ": " << merged_addresses_.size() << " chain(s)";
 
-    // Case 4 does not depend on the order of mining.authorize and
-    // mining.set_merged_addresses: an accepted login whose own address pays
-    // no share takes its parent payout from an address set now, and is sent
-    // new work at once when that changes the payout.
-    if (authorized_ && payout_unusable_) {
-        const auto before = parent_script_;
-        update_case4_parent();
-        if (parent_script_ != before && mining_interface_)
-            send_notify_work(true);
+    // Case 4 takes an address set after the authorize as well as one set
+    // before the first authorize of a fresh connection: an accepted login
+    // whose own address pays no share takes its parent payout from an
+    // address set now; when that changes the payout, its worker label is
+    // updated and it is sent new work at once (nothing when it does not).
+    if (authorized_ && payout_unusable_ && update_case4_parent(/*at_authorize=*/false) && mining_interface_) {
+        mining_interface_->update_stratum_worker_payout_warning(session_id_, payout_warning_);
+        send_notify_work(true);
     }
 
     nlohmann::json response;

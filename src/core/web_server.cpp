@@ -11996,6 +11996,14 @@ void MiningInterface::update_stratum_worker(const std::string& session_id,
     }
 }
 
+void MiningInterface::update_stratum_worker_payout_warning(const std::string& session_id, const std::string& warning)
+{
+    std::lock_guard<std::mutex> lock(m_stratum_workers_mutex);
+    auto it = m_stratum_workers.find(session_id);
+    if (it != m_stratum_workers.end())
+        it->second.payout_warning = warning;
+}
+
 void MiningInterface::update_stratum_worker_rtt(const std::string& session_id, double rtt_ms)
 {
     std::lock_guard<std::mutex> lock(m_stratum_workers_mutex);

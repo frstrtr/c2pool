@@ -2291,6 +2291,12 @@ struct RecordingWorkSource : core::stratum::IWorkSource {
         return r;
     }
     mutable std::vector<std::optional<uint16_t>> build_donations;   // build_connection_coinbase_for
+    std::vector<std::string> warning_updates;   // update_stratum_worker_payout_warning
+    void update_stratum_worker_payout_warning(const std::string&, const std::string& w) override
+    {
+        std::lock_guard<std::mutex> l(mu);
+        warning_updates.push_back(w);
+    }
     core::stratum::CoinbaseResult build_connection_coinbase_for(
         const core::stratum::PayoutKey& login_key, const uint256& prev, const std::string& en1,
         const std::vector<unsigned char>& payout,
@@ -3259,6 +3265,126 @@ TEST(MergedAuxStratumSession, Case4ComesOnlyFromAnAddressTheLoginNamed)
         EXPECT_EQ(rig.ws->payouts.back(), owner) << "B named no address: the split";
         ASSERT_TRUE(rig.ws->build_donations.back().has_value());
         EXPECT_EQ(*rig.ws->build_donations.back(), 32768);
+    }
+}
+
+// Case 4 and the order of mining.set_merged_addresses: (1) on a fresh
+// connection an address set before the first authorize is the login's own;
+// after an authorize only one set after the latest authorize counts (an
+// earlier one, given while another login was accepted, never pays a later
+// login's parent); (2) a re-authorize of the same primary keeps the
+// addresses that login gave, a set_merged_addresses while it was accepted
+// included; (3) a merged address in a non-legacy form (a BELLS bech32) is
+// not a parent key: the split; (4) a set that does not change the payout
+// pushes no new work and leaves the worker's label, one that does updates it.
+TEST(MergedAuxStratumSession, Case4FollowsTheLoginsOwnSetMergedAddresses)
+{
+    using namespace std::chrono_literals;
+    const auto owner = core::address_to_script(b58(48, 0x0a));
+    const std::string garbage = b58(48, 0x06).substr(1);
+    const std::string p2wsh = bech32::encode_segwit("ltc", 0, std::vector<unsigned char>(32, 0x43));
+    const std::string d1 = b58(30, 0x21), d2 = b58(30, 0x22), pep = b58(56, 0x31);
+    const auto rig_for = [&](std::set<uint32_t> chains) {
+        auto rig = std::make_unique<SessionRig>(std::move(chains), /*redistribute=*/true);
+        rig->ws->split_owner = owner;
+        return rig;
+    };
+    const auto last_payout = [](SessionRig& rig) {
+        std::lock_guard<std::mutex> l(rig.ws->mu);
+        return rig.ws->payouts.back();
+    };
+    const auto last_donation = [](SessionRig& rig) {
+        std::lock_guard<std::mutex> l(rig.ws->mu);
+        return rig.ws->build_donations.back();
+    };
+    // (1a) a fresh connection: set before the first authorize counts
+    {
+        auto rig = rig_for({98});
+        LineClient c(rig->port);
+        ASSERT_GE(c.fd, 0);
+        rig->step(c, 1, "mining.subscribe", nlohmann::json::array());
+        c.send({{"id", 2}, {"method", "mining.set_merged_addresses"}, {"params", {{{"98", d1}}}}});
+        c.wait_id(2);
+        ASSERT_TRUE(rig->step(c, 3, "mining.authorize", {garbage, "x"}));
+        EXPECT_EQ(last_payout(*rig), core::address_to_script(d1)) << "the login's own, sent before its authorize";
+        EXPECT_FALSE(last_donation(*rig).has_value());
+    }
+    // (1b) after an authorize: a set before the re-authorize does not count
+    {
+        auto rig = rig_for({98});
+        LineClient c(rig->port);
+        ASSERT_GE(c.fd, 0);
+        rig->step(c, 1, "mining.subscribe", nlohmann::json::array());
+        ASSERT_TRUE(rig->step(c, 2, "mining.authorize", {b58(48, 0x01), "x"}));
+        ASSERT_TRUE(rig->step(c, 3, "mining.authorize", {garbage, "x"}));
+        c.send({{"id", 4}, {"method", "mining.set_merged_addresses"}, {"params", {{{"98", d1}}}}});
+        c.wait_id(4);
+        // set while `garbage` is accepted: its own (case 4); a new login does not inherit it
+        ASSERT_TRUE(rig->step(c, 5, "mining.authorize", {p2wsh, "x"}));
+        EXPECT_EQ(last_payout(*rig), owner) << "set before this authorize, for another login: the split";
+        ASSERT_TRUE(last_donation(*rig).has_value());
+        EXPECT_EQ(*last_donation(*rig), 32768);
+    }
+    // (2) a re-authorize of the same (unusable) primary keeps its addresses
+    {
+        auto rig = rig_for({98});
+        LineClient c(rig->port);
+        ASSERT_GE(c.fd, 0);
+        rig->step(c, 1, "mining.subscribe", nlohmann::json::array());
+        ASSERT_TRUE(rig->step(c, 2, "mining.authorize", {garbage + "," + d1, "x"}));
+        EXPECT_EQ(last_payout(*rig), core::address_to_script(d1));
+        ASSERT_TRUE(rig->step(c, 3, "mining.authorize", {garbage, "x"}));
+        EXPECT_EQ(last_payout(*rig), core::address_to_script(d1)) << "the same primary: its DOGE address carried";
+        rig->step(c, 4, "mining.set_merged_addresses", {{{"98", d2}}});
+        EXPECT_EQ(last_payout(*rig), core::address_to_script(d2));
+        ASSERT_TRUE(rig->step(c, 5, "mining.authorize", {garbage, "x"}));
+        EXPECT_EQ(last_payout(*rig), core::address_to_script(d2))
+            << "the address set while it was accepted, carried by the same primary";
+        EXPECT_FALSE(last_donation(*rig).has_value());
+    }
+    // (3) a BELLS bech32 (not a legacy form): not a parent key
+    {
+        auto rig = rig_for({16});
+        LineClient c(rig->port);
+        ASSERT_GE(c.fd, 0);
+        rig->step(c, 1, "mining.subscribe", nlohmann::json::array());
+        const std::string bells = bech32::encode_segwit("bel", 0, std::vector<unsigned char>(20, 0x51));
+        ASSERT_TRUE(rig->step(c, 2, "mining.authorize", {garbage + "/16:" + bells, "x"}));
+        EXPECT_EQ(last_payout(*rig), owner) << "a bech32 merged address is no parent key: the split";
+        ASSERT_TRUE(last_donation(*rig).has_value());
+        EXPECT_EQ(*last_donation(*rig), 32768);
+    }
+    // (4) push only on change; the worker label follows the payout
+    {
+        auto rig = rig_for({98, 63});
+        LineClient c(rig->port);
+        ASSERT_GE(c.fd, 0);
+        rig->step(c, 1, "mining.subscribe", nlohmann::json::array());
+        ASSERT_TRUE(rig->step(c, 2, "mining.authorize", {p2wsh, "x"}));
+        EXPECT_EQ(last_payout(*rig), owner);
+        rig->step(c, 3, "mining.set_merged_addresses", {{{"98", d1}}});
+        EXPECT_EQ(last_payout(*rig), core::address_to_script(d1));
+        {
+            std::lock_guard<std::mutex> l(rig->ws->mu);
+            ASSERT_EQ(rig->ws->warning_updates.size(), 1u);
+            EXPECT_EQ(rig->ws->warning_updates.back(), "P2WSH/P2TR address → parent paid to the DOGE address's key");
+        }
+        const size_t n = rig->ws->count();
+        for (int id = 4; id <= 5; ++id) {
+            // the same DOGE address again; a PEP address while DOGE is named
+            c.send({{"id", id}, {"method", "mining.set_merged_addresses"},
+                    {"params", {id == 4 ? nlohmann::json{{"98", d1}} : nlohmann::json{{"63", pep}}}}});
+            c.wait_id(id);
+        }
+        std::this_thread::sleep_for(200ms);
+        EXPECT_EQ(rig->ws->count(), n) << "the payout did not change: no new work";
+        {
+            std::lock_guard<std::mutex> l(rig->ws->mu);
+            EXPECT_EQ(rig->ws->warning_updates.size(), 1u) << "nor a label update";
+        }
+        rig->step(c, 6, "mining.set_merged_addresses", {{{"98", d2}}});
+        EXPECT_GT(rig->ws->count(), n);
+        EXPECT_EQ(last_payout(*rig), core::address_to_script(d2));
     }
 }
 

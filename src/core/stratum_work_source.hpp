@@ -129,6 +129,11 @@ public:
     virtual void update_stratum_worker_rtt(const std::string& /*session_id*/,
                                            double /*rtt_ms*/) {}
 
+    // Optional: the worker's payout label changed after its authorize (case
+    // 4 from a later mining.set_merged_addresses). Default no-op.
+    virtual void update_stratum_worker_payout_warning(const std::string& /*session_id*/,
+                                                      const std::string& /*warning*/) {}
+
     // ── Work generation ──────────────────────────────────────────────────
     // Called per-job-issue (when sending mining.notify). Implementors
     // must produce a snapshot consistent with their template state at

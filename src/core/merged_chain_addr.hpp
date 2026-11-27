@@ -328,12 +328,14 @@ inline bool share_carries(const std::vector<unsigned char>& spk)
 /// unusable (empty, invalid, another coin's) or one a share cannot carry
 /// (P2WSH / P2TR) -- from a merged address the login named itself (`named`:
 /// the comma or slash form, a swapped pair, a re-authorize of the same
-/// primary, mining.set_merged_addresses after its authorize; never one
-/// carried over from another login): DOGE's if named, else the lowest
-/// configured chain id named; that address's own hash160 in its legacy form
-/// (P2PKH stays P2PKH, P2SH stays P2SH), paid with the node's donation, the
-/// named entries kept. None (no usable address named on any chain): empty
-/// script, the work source redistributes the payout (--redistribute split).
+/// primary, mining.set_merged_addresses after its authorize or before the
+/// first authorize of a fresh connection; never one set while another login
+/// was accepted): of a configured chain, an address of that chain on this
+/// network, in a legacy form (P2PKH stays P2PKH, P2SH stays P2SH; a bech32
+/// one does not count): DOGE's if named, else the lowest configured chain id
+/// named; its own hash160, paid with the node's donation, the named entries
+/// kept. None (no usable address named on any chain): empty script, the work
+/// source redistributes the payout (--redistribute split).
 struct Case4Parent {
     std::vector<unsigned char> script;   // the parent payout script; empty: none
     uint32_t chain_id{0};

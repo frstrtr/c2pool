@@ -3160,6 +3160,7 @@ public:
                                double hashrate, double dead_hashrate, double difficulty,
                                uint64_t accepted, uint64_t rejected, uint64_t stale) override;
     void update_stratum_worker_rtt(const std::string& session_id, double rtt_ms) override;
+    void update_stratum_worker_payout_warning(const std::string& session_id, const std::string& warning) override;
     std::map<std::string, WorkerInfo> get_stratum_workers() const;
 
     // #959 worker liveness. An authorized Stratum session that stops sending

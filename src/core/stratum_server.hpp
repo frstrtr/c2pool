@@ -276,10 +276,13 @@ private:
     bool payout_unusable_{false};
     bool payout_uncarried_{false};
     std::vector<unsigned char> parent_script_;
-    // mining.set_merged_addresses received after the latest authorize: with
-    // login_given_, the addresses this login named itself (case 4).
+    // mining.set_merged_addresses received after the latest authorize, or
+    // before the first authorize of a connection that never authorized:
+    // with login_given_, the addresses this login named itself (case 4).
     std::map<uint32_t, std::string> post_auth_merged_;
-    void update_case4_parent();
+    bool ever_authorized_{false};   // a login was accepted on this connection
+    // Returns whether the payout changed (see stratum_server.cpp).
+    bool update_case4_parent(bool at_authorize);
     std::string payout_warning_;   // shown with the worker ("address invalid → redistributed")
     // The scriptPubKey a merged entry pays on its chain
     // (core::merged_addr::merged_payout_script).
