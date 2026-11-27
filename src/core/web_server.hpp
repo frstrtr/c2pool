@@ -589,7 +589,10 @@ public:
         bool segwit_active, const std::string& witness_commitment_hex,
         const uint256& witness_root,
         const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs,
-        const std::vector<uint256>& merkle_branches)>;
+        const std::vector<uint256>& merkle_branches,
+        // The job's share donation (decide_job_payout: a split job); none:
+        // the node's own. The ref_hash commits to the one the share carries.
+        const std::optional<uint16_t>& share_donation)>;
     void set_ref_hash_fn(ref_hash_fn_t fn) { m_ref_hash_fn = std::move(fn); }
 
     // Atomically snapshot work-related fields under m_work_mutex.
@@ -611,13 +614,15 @@ public:
         const std::vector<unsigned char>& payout_script,
         const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs) const override;
     // The same for the stratum connection whose login key is `login_key`:
-    // the share target is sized by the local rate of `login_key`.
+    // the share target is sized by the local rate of `login_key`, and the
+    // shares carry `share_donation` (decide_job_payout's; none: the node's).
     CoinbaseResult build_connection_coinbase_for(
         const core::stratum::PayoutKey& login_key,
         const uint256& prev_share_hash,
         const std::string& extranonce1_hex,
         const std::vector<unsigned char>& payout_script,
-        const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs) const override;
+        const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs,
+        const std::optional<uint16_t>& share_donation = std::nullopt) const override;
 
     // Hook: called by mining_submit() pool path to create a share in the tracker.
     // All block template data needed by create_local_share() is passed through.
@@ -661,6 +666,11 @@ public:
         // AutoRatchet share version (V35 or V36) — determined at template time
         int64_t  share_version{36};
         uint64_t desired_version{36};
+
+        // The share's donation when its job set one (decide_job_payout: a
+        // split job, core::kSplitShareDonation); none: the node's own
+        // (--give-author). The ref_hash of the job committed to it.
+        std::optional<uint16_t> share_donation;
     };
     /// Returns the hash of the share it minted, or a null hash when none was
     /// (#946: an own-find DOGE row names the share its submit produced).
@@ -916,6 +926,21 @@ public:
     void set_redistribute_fn(std::function<std::pair<std::string, uint8_t>()> fn) {
         std::lock_guard<std::mutex> l(m_redistribute_mu);
         m_redistribute_fn = std::move(fn);
+    }
+    // --redistribute split: work the node cannot attribute to a payout
+    // address (no usable login address, a payout a share cannot carry, the
+    // job built before the login) pays the node owner and the donation half
+    // and half. decide_job_payout gives such a job the owner's `script`
+    // (P2PKH / P2SH / P2WPKH) with core::kSplitShareDonation as its shares'
+    // donation, and, for every merged chain the job names no address for,
+    // the owner's script there (`merged_scripts` by chain id, else the
+    // owner's key converted). It replaces set_redistribute_fn for those
+    // jobs. An empty or unusable `script` turns it off (returns false).
+    bool set_split_owner(const std::vector<unsigned char>& script,
+                         std::map<uint32_t, std::vector<unsigned char>> merged_scripts);
+    bool has_split_owner() const {
+        std::lock_guard<std::mutex> l(m_redistribute_mu);
+        return !m_split_owner_script.empty();
     }
     // Donation script used by get_expected_payouts (p2pool protocol)
     void set_donation_script(const std::vector<unsigned char>& script) {
@@ -2409,7 +2434,8 @@ private:
     CoinbaseResult build_job_coinbase(const uint256& prev_share_hash, const std::string& extranonce1_hex,
                                       const std::vector<unsigned char>& payout_script,
                                       const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs,
-                                      const core::stratum::PayoutKey& rate_key) const;
+                                      const core::stratum::PayoutKey& rate_key,
+                                      const std::optional<uint16_t>& share_donation) const;
 public:
     uint64_t jobs_held() const { return m_jobs_held.load(std::memory_order_relaxed); }
     uint64_t refreshes_without_pplns() const { return m_refresh_without_pplns.load(std::memory_order_relaxed); }
@@ -2540,7 +2566,10 @@ private:
     std::string m_node_fee_address;                 // node operator address (display/logging)
     std::map<uint32_t, std::vector<unsigned char>> m_operator_merged_scripts;
     std::function<std::pair<std::string, uint8_t>()> m_redistribute_fn;
-    mutable std::mutex m_redistribute_mu;   // m_redistribute_fn, m_address_fallback_fn
+    // --redistribute split: the node owner's parent script and merged scripts.
+    std::vector<unsigned char> m_split_owner_script;
+    std::map<uint32_t, std::vector<unsigned char>> m_split_owner_merged_scripts;
+    mutable std::mutex m_redistribute_mu;   // m_redistribute_fn, m_address_fallback_fn, m_split_owner_*
     std::vector<unsigned char> m_donation_script;   // protocol donation scriptPubKey
     std::function<double()> m_stratum_hashrate_fn;  // callback to get stratum total hashrate
     std::function<RateStats()> m_stratum_rate_stats_fn;  // callback to get rate monitor stats
@@ -2601,8 +2630,9 @@ private:
 public:
     void set_stratum_config(const StratumConfig& cfg) { m_stratum_config = cfg; }
     bool merged_ready() const override { return !m_stratum_config.merged_chains_expected || m_mm_manager != nullptr; }
-    void decide_job_payout(std::vector<unsigned char>& payout_script,
-                           std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged) const override;
+    std::optional<uint16_t> decide_job_payout(
+        std::vector<unsigned char>& payout_script,
+        std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged) const override;
     const StratumConfig& get_stratum_config() const override { return m_stratum_config; }
     void set_cors_origin(const std::string& origin) { m_cors_origin = origin; }
     const std::string& get_cors_origin() const { return m_cors_origin; }

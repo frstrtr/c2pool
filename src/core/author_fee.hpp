@@ -27,6 +27,15 @@ inline uint16_t donation_percent_to_u16(double pct)
     return r > 65535 ? 65535 : static_cast<uint16_t>(r);
 }
 
+// The donation of a share minted for work the node cannot attribute to a
+// payout address (--redistribute split): the share pays the node owner, and
+// PPLNS gives (65535 - donation)/65535 of its weight to the owner and
+// donation/65535 to the donation script, on the parent chain and on every
+// merged chain. 32768 of 65535: half (the field is out of 65535, an odd
+// number: 32768 to the donation, 32767 to the owner). It replaces the node's
+// --give-author donation on such a share, it is not added to it.
+constexpr uint16_t kSplitShareDonation = 32768;
+
 } // namespace core
 
 #endif // C2POOL_CORE_AUTHOR_FEE_HPP

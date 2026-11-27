@@ -2,6 +2,9 @@
 #include <gtest/gtest.h>
 #include <impl/ltc/redistribute.hpp>
 #include <map>
+#include <string>
+#include <utility>
+#include <vector>
 
 using namespace ltc;
 
@@ -37,11 +40,59 @@ TEST(RedistributeV2, HybridParse_TwoModes)
     EXPECT_EQ(w[1].weight, 20);
 }
 
+// The default (an empty spec, main_ltc's --redistribute default) is split:
+// work the node cannot attribute pays the node owner and the donation half
+// and half (--redistribute split, 2026-11-27; was pplns).
 TEST(RedistributeV2, HybridParse_Empty)
 {
     auto w = parse_redistribute_spec("");
     ASSERT_EQ(w.size(), 1);
+    EXPECT_EQ(w[0].mode, RedistributeMode::SPLIT);
+}
+
+TEST(RedistributeSplit, TheDefaultModeIsSplit)
+{
+    EXPECT_STREQ(kDefaultRedistributeMode, "split");
+    auto w = parse_redistribute_spec(kDefaultRedistributeMode);
+    ASSERT_EQ(w.size(), 1u);
+    EXPECT_EQ(w[0].mode, RedistributeMode::SPLIT);
+    EXPECT_EQ(w[0].weight, 100u);
+    EXPECT_TRUE(spec_selects_split(w));
+    EXPECT_EQ(parse_single_mode("split"), RedistributeMode::SPLIT);
+    EXPECT_STREQ(redistribute_mode_str(RedistributeMode::SPLIT), "split");
+    EXPECT_EQ(format_hybrid_weights(w), "split");
+    // split in a hybrid spec selects split (it is not a weight)
+    EXPECT_TRUE(spec_selects_split(parse_redistribute_spec("boost:70,split:30")));
+}
+
+// The old modes parse and select as before, and select no split.
+TEST(RedistributeSplit, TheOldModesAreUnchanged)
+{
+    for (const auto& [spec, mode] : std::vector<std::pair<std::string, RedistributeMode>>{
+             {"pplns", RedistributeMode::PPLNS}, {"fee", RedistributeMode::FEE},
+             {"boost", RedistributeMode::BOOST}, {"donate", RedistributeMode::DONATE},
+             {"garbage", RedistributeMode::PPLNS}}) {
+        const auto w = parse_redistribute_spec(spec);
+        ASSERT_EQ(w.size(), 1u) << spec;
+        EXPECT_EQ(w[0].mode, mode) << spec;
+        EXPECT_FALSE(spec_selects_split(w)) << spec;
+    }
+    EXPECT_FALSE(spec_selects_split(parse_redistribute_spec("boost:70,donate:20,fee:10")));
+}
+
+// No node-owner address: split cannot pay the owner half; the Redistributor
+// runs the old pplns behaviour (main_ltc.cpp replaces split's weights with
+// these when MiningInterface::set_split_owner failed).
+TEST(RedistributeSplit, TheNoOwnerFallbackIsPplns)
+{
+    const auto w = split_fallback_weights();
+    ASSERT_EQ(w.size(), 1u);
     EXPECT_EQ(w[0].mode, RedistributeMode::PPLNS);
+    EXPECT_EQ(w[0].weight, 100u);
+    EXPECT_FALSE(spec_selects_split(w));
+    Redistributor r;
+    r.set_hybrid_weights(w);
+    EXPECT_EQ(r.mode(), RedistributeMode::PPLNS);
 }
 
 TEST(RedistributeV2, HybridParse_BackwardCompat)

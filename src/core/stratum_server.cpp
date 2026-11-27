@@ -1479,8 +1479,13 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
         // Resend work after a successful authorize. The job sent right after
         // subscribe was built before authorize ran, so it carried neither the
         // miner's primary payout address (username_ was empty -> empty
-        // payout_script -> degenerate value-0 OP_RETURN coinbase) nor any merged
-        // addresses. Two distinct primary classes need this resend, and NEITHER
+        // payout_script: the work source's decide_job_payout gives it its
+        // payout -- the LTC pool's --redistribute split: the node owner with the
+        // split donation -- or it stays empty and no share is minted from it)
+        // nor any merged addresses. Its job id stays active: a share found on it
+        // and submitted after this authorize is accepted and carries that job's
+        // decided payout and donation (JobEntry), as its ref_hash committed to.
+        // Two distinct primary classes need this resend, and NEITHER
         // populates merged_addresses_:
         //   (1) Standalone parent coins (BCH/BTC, no merged chains) never
         //       populate merged_addresses_ at all.
@@ -1984,6 +1989,7 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
     MiningInterface::JobSnapshot snapshot;
     snapshot.has_payout      = job.has_payout;
     snapshot.payout_script   = job.payout_script;
+    snapshot.share_donation  = job.share_donation;
     snapshot.coinb1          = job.payload->coinb1;
     snapshot.coinb2          = job.payload->coinb2;
     snapshot.gbt_prevhash    = job.gbt_prevhash;
@@ -2462,6 +2468,7 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
     bool job_has_payout = false;
     std::vector<unsigned char> job_payout_script;
     std::map<uint32_t, std::vector<unsigned char>> job_merged_scripts;
+    std::optional<uint16_t> job_share_donation;
     if (frozen_best_share)
         frozen_prev_share = *frozen_best_share;  // use cycle-frozen value (from notify_all)
     else if (auto fn = mining_interface_->get_best_share_hash_fn())
@@ -2543,7 +2550,11 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
                 merged_addrs.push_back({chain_id, std::move(script)});
         }
 
-        mining_interface_->decide_job_payout(payout_script, merged_addrs);
+        // A payout decided here is the job's for good: a share submitted
+        // for this job after a re-authorize (the job sent after subscribe,
+        // built with no login) carries this payout and donation, not the
+        // login's, as its ref_hash committed to them.
+        job_share_donation = mining_interface_->decide_job_payout(payout_script, merged_addrs);
         job_has_payout = true;
         job_payout_script = payout_script;
         job_merged_scripts = std::map<uint32_t, std::vector<unsigned char>>(merged_addrs.begin(), merged_addrs.end());
@@ -2551,7 +2562,7 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
         // pseudoshares' key, zero for a keyless login), not by the job's
         // payout: a node-fee job is its miner's job but for the payout.
         cbr = mining_interface_->build_connection_coinbase_for(
-            pubkey_hash_, frozen_prev_share, extranonce1_, payout_script, merged_addrs);
+            pubkey_hash_, frozen_prev_share, extranonce1_, payout_script, merged_addrs, job_share_donation);
         if (cbr.held) {
             // No coinbase its shares could verify (the sharechain is busy): no
             // job now — the miner keeps its last one — never the global
@@ -2790,6 +2801,7 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
         je.has_payout = job_has_payout;
         je.payout_script = std::move(job_payout_script);
         je.merged_scripts = std::move(job_merged_scripts);
+        je.share_donation = job_share_donation;
         active_jobs_[job_id] = std::move(je);
         job_order_.push_back(job_id);
     }

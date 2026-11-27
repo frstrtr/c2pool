@@ -30,6 +30,8 @@
 
 #include <gtest/gtest.h>
 
+#include <optional>
+
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -259,7 +261,8 @@ void stub_ref_hash(MiningInterface& mi)
                           uint64_t, uint32_t, uint32_t,
                           bool, const std::string&, const uint256&,
                           const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>&,
-                          const std::vector<uint256>&) {
+                          const std::vector<uint256>&,
+                          const std::optional<uint16_t>&) {
         MiningInterface::RefHashResult r;
         r.ref_hash.SetHex(std::string(64, '5'));
         r.bits = 0x207fffff;

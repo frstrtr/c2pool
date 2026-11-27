@@ -190,6 +190,9 @@ private:
         bool has_payout{false};
         std::vector<unsigned char> payout_script;
         std::map<uint32_t, std::vector<unsigned char>> merged_scripts;
+        // The donation its ref_hash committed to, when decide_job_payout set
+        // one (a split job); none: the node's own.
+        std::optional<uint16_t> share_donation;
     };
     std::unordered_map<std::string, JobEntry> active_jobs_;
     // Insertion-order companion to active_jobs_ (interim hardening fix #1).

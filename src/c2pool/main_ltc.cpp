@@ -326,6 +326,7 @@ static void segfault_handler(int sig) {
 #include <impl/ltc/pool_monitor.hpp>
 #include <impl/ltc/whale_departure.hpp>
 #include <impl/ltc/redistribute.hpp>
+#include <core/author_fee.hpp>   // kSplitShareDonation (--redistribute split)
 
 // Coin daemon RPC
 #include <impl/ltc/coin/rpc.hpp>
@@ -556,7 +557,9 @@ void print_help() {
     std::cout << "  --give-author PERCENT     Developer donation (alias: --dev-donation; default: 0.1%)\n";
     std::cout << "  -f / --fee PERCENT        Node owner fee (alias: --node-owner-fee; default: 0%)\n";
     std::cout << "  --node-owner-address ADDR Node owner payout address\n";
-    std::cout << "  --redistribute MODE       Redistribution mode: pplns, fee, boost, donate\n\n";
+    std::cout << "  --redistribute MODE       Where work with no usable payout address goes: split (default:\n";
+    std::cout << "                            50% node owner / 50% donation; pplns without an owner address),\n";
+    std::cout << "                            pplns, fee, boost, donate\n\n";
     
     std::cout << "PORT CONFIGURATION:\n";
     std::cout << "  --p2pool-port PORT        P2P sharechain port (alias: --p2p-port; default: 9326)\n";
@@ -1053,7 +1056,7 @@ int main(int argc, char* argv[]) {
     bool max_outgoing_conns_set = false;
 
     // Redistribute mode for shares from unnamed/broken miners
-    std::string redistribute_mode_str = "pplns";
+    std::string redistribute_mode_str = ltc::kDefaultRedistributeMode;   // --redistribute (split)
 
     // Stratum tuning (configurable via CLI or YAML). The compiled defaults --
     // coin tag, idle keepalive-notify, and the zombie-session protections
@@ -2770,9 +2773,11 @@ int main(int argc, char* argv[]) {
             // (--redistribute), as p2pool does, not refused.
             stratum_config.redistribute_unusable_logins = true;
             // The merged addresses of the operator's own shares (node-fee
-            // shares, redistributed shares landing on the operator's key):
-            // p2pool's --merged-operator-address cascade, per merged chain.
-            if (node_owner_fee > 0.0 && !node_owner_address.empty() && !merged_chain_specs.empty()) {
+            // shares, redistributed shares landing on the operator's key,
+            // split shares): p2pool's --merged-operator-address cascade, per
+            // merged chain.
+            const auto owner_merged_scripts = [&](const std::string& owner_address, const std::string& payout_what,
+                                                  const std::string& shares_what) {
                 std::map<uint32_t, std::vector<unsigned char>> op_scripts;
                 const std::vector<unsigned char> donation(ltc::PoolConfig::COMBINED_DONATION_SCRIPT.begin(),
                                                           ltc::PoolConfig::COMBINED_DONATION_SCRIPT.end());
@@ -2788,16 +2793,53 @@ int main(int argc, char* argv[]) {
                     const auto o = c2pool::merged::resolve_operator_merged_script(
                         sym, settings->m_testnet ? c2pool::merged::AuxNetwork::testnet
                                                  : c2pool::merged::AuxNetwork::mainnet,
-                        node_owner_address, node_owner_merged_address,
+                        owner_address, node_owner_merged_address,
                         ov != merged_payout_addresses.end() ? ov->second : std::string(), donation);
                     if (!o.warning.empty())
-                        LOG_WARNING << "[MM:" << sym << "] " << o.warning << ": the node fee's " << sym
+                        LOG_WARNING << "[MM:" << sym << "] " << o.warning << ": the " << payout_what << "'s " << sym
                                     << " payout uses " << o.source;
-                    LOG_INFO << "[MM:" << sym << "] node-fee shares pay " << sym << " to the operator ("
+                    LOG_INFO << "[MM:" << sym << "] " << shares_what << " shares pay " << sym << " to the operator ("
                              << o.source << ")";
                     op_scripts[cid] = o.script;
                 }
-                web_server.get_mining_interface()->set_operator_merged_scripts(std::move(op_scripts));
+                return op_scripts;
+            };
+            if (node_owner_fee > 0.0 && !node_owner_address.empty() && !merged_chain_specs.empty())
+                web_server.get_mining_interface()->set_operator_merged_scripts(
+                    owner_merged_scripts(node_owner_address, "node fee", "node-fee"));
+            // --redistribute split (the default): work the node cannot
+            // attribute to a payout address (no usable login address, a payout
+            // a share cannot carry, the job built before the login) pays the
+            // node owner and the donation half and half: the share pays the
+            // owner with donation core::kSplitShareDonation (32768 of 65535),
+            // on LTC and on every merged chain. The owner is the node fee's:
+            // --node-owner-address, else --address. None usable on LTC: the
+            // owner half cannot be paid, and this node keeps the old pplns
+            // behaviour (logged once, here).
+            if (ltc::spec_selects_split(ltc::parse_redistribute_spec(redistribute_mode_str))) {
+                if (ltc::parse_redistribute_spec(redistribute_mode_str).size() > 1)
+                    LOG_WARNING << "--redistribute " << redistribute_mode_str << ": split is not a hybrid weight"
+                                << " (it pays every such share half and half, not some of them): using split";
+                const std::string owner = !node_owner_address.empty() ? node_owner_address : payout_address;
+                std::vector<unsigned char> owner_script;
+                const bool own_coin = !owner.empty()
+                    && core::classify_address_for_coin(owner, ltc::address_acceptance(settings->m_testnet), owner_script)
+                           == core::AddressCoinMatch::Own;
+                if (own_coin && web_server.get_mining_interface()->set_split_owner(
+                        owner_script, merged_chain_specs.empty()
+                                          ? std::map<uint32_t, std::vector<unsigned char>>{}
+                                          : owner_merged_scripts(owner, "split owner", "split"))) {
+                    LOG_INFO << "Redistribute split: unattributable work pays the node owner " << owner
+                             << " and the donation half and half (share donation " << core::kSplitShareDonation
+                             << "/65535 instead of --give-author's), LTC and merged chains";
+                } else {
+                    LOG_WARNING << "--redistribute split: "
+                                << (owner.empty() ? std::string("no node-owner address (--node-owner-address or --address)")
+                                                  : "the node-owner address " + owner
+                                                        + " is not an LTC P2PKH/P2SH/P2WPKH address of this network")
+                                << ": the owner half cannot be paid; unattributable work falls back to pplns"
+                                << " (spread over the PPLNS window) on this node";
+                }
             }
             web_server.get_mining_interface()->set_stratum_config(stratum_config);
             if (fd_limit_known)
@@ -7397,7 +7439,8 @@ int main(int argc, char* argv[]) {
                     bool segwit_active, const std::string& witness_commitment_hex,
                     const uint256& witness_root,
                     const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs,
-                    const std::vector<uint256>& merkle_branches)
+                    const std::vector<uint256>& merkle_branches,
+                    const std::optional<uint16_t>& share_donation)
                     -> core::MiningInterface::RefHashResult
                 {
                     auto guard = p2p_node->read_tracker();
@@ -7440,7 +7483,11 @@ int main(int argc, char* argv[]) {
                     params.subsidy = subsidy;
                     // donation = round(65535 * percentage / 100)
                     // Matches p2pool: math.perfect_round(65535*self.donation_percentage/100)
-                    params.donation = static_cast<uint16_t>(std::round(65535.0 * dev_donation / 100.0));
+                    // A split job (decide_job_payout, --redistribute split)
+                    // carries its own: the share's donation, not added to it.
+                    params.donation = share_donation
+                        ? *share_donation
+                        : static_cast<uint16_t>(std::round(65535.0 * dev_donation / 100.0));
                     params.desired_version = desired_ver;
 
                     // Per-miner desired_target (p2pool-merged-v36 work.py get_work
@@ -7466,7 +7513,7 @@ int main(int argc, char* argv[]) {
                     target_in.local_hash_rate = local_hash_rate;
                     target_in.share_period = ltc::PoolConfig::share_period();
                     target_in.subsidy = subsidy;
-                    target_in.donation_percent = dev_donation;
+                    target_in.donation_percent = share_donation ? *share_donation * 100.0 / 65535.0 : dev_donation;
                     target_in.dust_threshold = ltc::PoolConfig::dust_threshold();
                     target_in.spread = ltc::PoolConfig::SPREAD;
                     target_in.block_bits = bits;
@@ -7825,7 +7872,10 @@ int main(int argc, char* argv[]) {
                         prev_share,
                         p.merkle_branches,
                         p.payout_script,
-                        static_cast<uint16_t>(std::round(65535.0 * dev_donation / 100.0)),  // donation from --give-author
+                        // The job's donation (a split job), else --give-author's:
+                        // the one its ref_hash committed to.
+                        p.share_donation ? *p.share_donation
+                                         : static_cast<uint16_t>(std::round(65535.0 * dev_donation / 100.0)),
                         merged_addrs,
                         stale,
                         p.segwit_active,
@@ -10337,9 +10387,16 @@ int main(int argc, char* argv[]) {
 
             // Redistribute mode for invalid/empty miner addresses (V2: hybrid support)
             auto hybrid_weights = ltc::parse_redistribute_spec(redistribute_mode_str);
+            // split: decided by the MiningInterface (set_split_owner above);
+            // the Redistributor is its pplns fallback, used when no owner
+            // could be set.
+            if (ltc::spec_selects_split(hybrid_weights))
+                hybrid_weights = ltc::split_fallback_weights();
             auto redistributor = std::make_unique<ltc::Redistributor>();
             redistributor->set_hybrid_weights(hybrid_weights);
-            LOG_INFO << "Redistribute mode: " << ltc::format_hybrid_weights(hybrid_weights);
+            LOG_INFO << "Redistribute mode: "
+                     << (web_server.get_mining_interface()->has_split_owner()
+                             ? std::string("split") : ltc::format_hybrid_weights(hybrid_weights));
 
             // Set operator identity for "fee" and "boost" modes.
             // get_node_fee_hash160() extracts the hash160 from the fee scriptPubKey

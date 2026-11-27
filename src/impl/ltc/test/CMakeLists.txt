@@ -406,6 +406,13 @@ if (BUILD_TESTING AND GTest_FOUND)
     # caller's guard when it holds one), driven on a REAL ltc::NodeImpl against
     # a compute thread moving the best share. Same folding rule.
     #
+    # redistribute_split_test.cpp: --redistribute split (the default): a share
+    # of work the node cannot attribute pays the node owner with donation
+    # 32768/65535, and PPLNS gives the owner and the donation half of its
+    # weight each, on the parent (V36 decayed weights) and on DOGE (flat
+    # merged weights, the share's merged address), for V36 and 3601 shares.
+    # REAL ShareTracker. Same folding rule.
+    #
     # redistribute_script_type_test.cpp: a redistribution recipient taken from
     # an address share keeps the (hash, type) the share carries; a P2WSH / P2TR
     # / bare script is not a recipient (never its first bytes as P2PKH). Same
@@ -526,6 +533,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         per_peer_ingest_test.cpp
         pool_rate_head_select_test.cpp
         redistribute_script_type_test.cpp
+        redistribute_split_test.cpp
         restart_reload_window_test.cpp
         restart_reorg_supersede_test.cpp
         self_connection_ban_test.cpp

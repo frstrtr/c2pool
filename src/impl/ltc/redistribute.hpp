@@ -4,8 +4,13 @@
 // Redistribute V2: advanced redistribution policy for shares from miners
 // with empty/invalid/broken stratum credentials.
 //
-// V1 modes (4):
-//   pplns  : distribute by PPLNS weight proportionally (default)
+// V1 modes (4), and split:
+//   split  : (default) the node owner and the donation half and half: the
+//            share pays the node owner with donation core::kSplitShareDonation
+//            (decided by core::MiningInterface::decide_job_payout, not here;
+//            this Redistributor is its pplns fallback when the node has no
+//            owner address)
+//   pplns  : distribute by PPLNS weight proportionally
 //   fee    : 100% to node operator
 //   boost  : give to active stratum miners with ZERO PPLNS shares
 //   donate : 100% to donation script
@@ -45,14 +50,20 @@ namespace ltc
 
 enum class RedistributeMode
 {
-    PPLNS,   // distribute by PPLNS weight proportionally (default)
+    PPLNS,   // distribute by PPLNS weight proportionally
     FEE,     // 100% to node operator
     BOOST,   // give to active miners with zero/low PPLNS shares
-    DONATE   // 100% to donation script
+    DONATE,  // 100% to donation script
+    SPLIT    // node owner / donation half and half (default)
 };
+
+// The --redistribute default (main_ltc.cpp, the param catalog's
+// money.redistribute).
+inline constexpr const char* kDefaultRedistributeMode = "split";
 
 inline RedistributeMode parse_single_mode(const std::string& s)
 {
+    if (s == "split")  return RedistributeMode::SPLIT;
     if (s == "fee")    return RedistributeMode::FEE;
     if (s == "boost")  return RedistributeMode::BOOST;
     if (s == "donate") return RedistributeMode::DONATE;
@@ -63,6 +74,7 @@ inline const char* redistribute_mode_str(RedistributeMode m)
 {
     switch (m)
     {
+    case RedistributeMode::SPLIT:  return "split";
     case RedistributeMode::FEE:    return "fee";
     case RedistributeMode::BOOST:  return "boost";
     case RedistributeMode::DONATE: return "donate";
@@ -83,7 +95,7 @@ inline std::vector<HybridWeight> parse_redistribute_spec(const std::string& spec
     std::vector<HybridWeight> result;
     if (spec.empty())
     {
-        result.push_back({RedistributeMode::PPLNS, 100});
+        result.push_back({parse_single_mode(kDefaultRedistributeMode), 100});
         return result;
     }
 
@@ -113,6 +125,22 @@ inline std::vector<HybridWeight> parse_redistribute_spec(const std::string& spec
         result.push_back({parse_single_mode(spec), 100});
 
     return result;
+}
+
+// split selected: alone, or anywhere in a hybrid spec (split pays every such
+// share half and half; it is not a weight among the other modes).
+inline bool spec_selects_split(const std::vector<HybridWeight>& weights)
+{
+    return std::any_of(weights.begin(), weights.end(),
+                       [](const HybridWeight& w) { return w.mode == RedistributeMode::SPLIT; });
+}
+
+// The Redistributor's weights under split: the old pplns behaviour, used only
+// for a node without an owner address (core::MiningInterface::set_split_owner
+// failed), whose owner half cannot be paid.
+inline std::vector<HybridWeight> split_fallback_weights()
+{
+    return {{RedistributeMode::PPLNS, 100}};
 }
 
 // Backward-compatible: returns the primary mode (first/only entry)
@@ -340,6 +368,9 @@ private:
         case RedistributeMode::BOOST:
             return pick_boost(tracker, best);
 
+        // SPLIT is decided by the MiningInterface (set_split_owner); here,
+        // with no owner, it is the pplns fallback (split_fallback_weights).
+        case RedistributeMode::SPLIT:
         case RedistributeMode::PPLNS:
         default:
             return pick_pplns(tracker, best);

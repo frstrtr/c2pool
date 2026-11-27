@@ -51,6 +51,7 @@
 #include <btclibs/crypto/sha256.h>
 #include <btclibs/bech32.h>
 #include <btclibs/util/strencodings.h>
+#include <core/author_fee.hpp>
 #include <core/hash.hpp>
 #include <core/pack.hpp>
 #include <core/uint256.hpp>
@@ -2220,6 +2221,7 @@ struct RecordingWorkSource : core::stratum::IWorkSource {
     std::vector<std::map<uint32_t, std::vector<unsigned char>>> submits;
     std::vector<std::vector<unsigned char>> submit_payouts;
     std::vector<uint32_t> submit_share_bits;   // the share bits each submit was handed
+    std::vector<std::optional<uint16_t>> submit_donations;   // the share donation each submit was handed
     // Node-fee and share-target knobs (set before a connection): every job
     // the operator's (decide_job_payout), the live share bits
     // (get_share_bits: the last job built), the jobs' frozen share bits, the
@@ -2231,11 +2233,19 @@ struct RecordingWorkSource : core::stratum::IWorkSource {
     std::string block_bits{"207fffff"};
     mutable std::vector<core::stratum::PayoutKey> login_keys;   // build_connection_coinbase_for
     bool merged_ready() const override { return ready.load(); }
-    void decide_job_payout(std::vector<unsigned char>& payout,
-                           std::vector<std::pair<uint32_t, std::vector<unsigned char>>>&) const override
+    // split_owner: a job with no payout pays it, with the split donation
+    // (MiningInterface::decide_job_payout under --redistribute split).
+    std::vector<unsigned char> split_owner;
+    std::optional<uint16_t> decide_job_payout(std::vector<unsigned char>& payout,
+                                              std::vector<std::pair<uint32_t, std::vector<unsigned char>>>&) const override
     {
         if (!fee_script.empty())
             payout = fee_script;
+        if (payout.empty() && !split_owner.empty()) {
+            payout = split_owner;
+            return core::kSplitShareDonation;
+        }
+        return std::nullopt;
     }
 
     const core::stratum::StratumConfig& get_stratum_config() const override { return cfg; }
@@ -2266,14 +2276,17 @@ struct RecordingWorkSource : core::stratum::IWorkSource {
         r.snapshot.frozen_ref.bits = frozen_bits;
         return r;
     }
+    mutable std::vector<std::optional<uint16_t>> build_donations;   // build_connection_coinbase_for
     core::stratum::CoinbaseResult build_connection_coinbase_for(
         const core::stratum::PayoutKey& login_key, const uint256& prev, const std::string& en1,
         const std::vector<unsigned char>& payout,
-        const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged) const override
+        const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged,
+        const std::optional<uint16_t>& share_donation) const override
     {
         {
             std::lock_guard<std::mutex> l(mu);
             login_keys.push_back(login_key);
+            build_donations.push_back(share_donation);
         }
         return build_connection_coinbase(prev, en1, payout, merged);
     }
@@ -2286,6 +2299,7 @@ struct RecordingWorkSource : core::stratum::IWorkSource {
         submits.push_back(merged);
         submit_payouts.push_back(job && job->has_payout ? job->payout_script : std::vector<unsigned char>{0xff});
         submit_share_bits.push_back(job ? job->share_bits : 0);
+        submit_donations.push_back(job ? job->share_donation : std::nullopt);
         return {{"result", true}};
     }
     uint32_t get_share_bits() const override { return live_bits; }
@@ -2816,6 +2830,134 @@ TEST(MergedAuxNodeFee, RedistributedJobCarriesTheRecipientsMergedAddresses)
     mi.decide_job_payout(payout, merged);
     EXPECT_EQ(payout, core::address_to_script(b58(48, 0x01)));
     EXPECT_TRUE(merged.empty());
+}
+
+// --redistribute split (the default): a payout a share cannot carry (an
+// empty login, a P2WSH primary, the job sent before the login) pays the node
+// owner with the split donation (core::kSplitShareDonation, 32768 of 65535).
+// On every merged chain the job names no address for, the owner's script
+// there: its merged address (--node-owner-merged-address, set_split_owner's
+// map), else its key converted (P2SH stays P2SH, else P2PKH), written into
+// the share (Tier 1), so the DOGE side of the share pays the owner and the
+// donation too. An address the login named stays (that chain's work is
+// attributable). The old --redistribute pick is not consulted.
+TEST(RedistributeSplit, TheJobPaysTheOwnerOnTheParentAndEveryMergedChain)
+{
+    using Merged = std::vector<std::pair<uint32_t, std::vector<unsigned char>>>;
+    Rig rig({{"DOGE", 98}, {"PEP", 63}});
+    core::MiningInterface mi(false, nullptr);
+    mi.set_merged_mining_manager(&rig.mm);
+    mi.set_redistribute_fn([] { return std::pair<std::string, uint8_t>{h160_of(b58(48, 0x07)), 0}; });
+    const auto owner = core::address_to_script(b58(48, 0x0a));       // a P2PKH owner
+    const auto owner_doge = core::address_to_script(b58(30, 0x0c));  // its DOGE address
+    const auto owner_floor = core::hash160_to_merged_script(h160_of(b58(48, 0x0a)), "p2pkh");
+    ASSERT_TRUE(mi.set_split_owner(owner, {{98, owner_doge}}));
+    // an empty login / the job built before the login
+    std::vector<unsigned char> payout;
+    Merged merged;
+    auto d = mi.decide_job_payout(payout, merged);
+    ASSERT_TRUE(d.has_value());
+    EXPECT_EQ(*d, 32768);
+    EXPECT_EQ(payout, owner);
+    EXPECT_EQ(merged, (Merged{{63, owner_floor}, {98, owner_doge}}));
+    // a P2WSH primary with a DOGE address: the LTC payout is the owner's, the
+    // DOGE address the miner named stays, PEP gets the owner's key
+    const auto miner_doge = core::address_to_script(b58(30, 0x21));
+    payout = core::address_to_script(bech32::encode_segwit("ltc", 0, std::vector<unsigned char>(32, 0x43)));
+    ASSERT_EQ(payout.size(), 34u);
+    merged = {{98, miner_doge}};
+    d = mi.decide_job_payout(payout, merged);
+    ASSERT_TRUE(d.has_value());
+    EXPECT_EQ(*d, 32768);
+    EXPECT_EQ(payout, owner);
+    EXPECT_EQ(merged, (Merged{{63, owner_floor}, {98, miner_doge}}));
+    // a usable payout: nothing changes, the node's donation
+    payout = core::address_to_script(b58(48, 0x01));
+    merged.clear();
+    EXPECT_FALSE(mi.decide_job_payout(payout, merged).has_value());
+    EXPECT_EQ(payout, core::address_to_script(b58(48, 0x01)));
+    EXPECT_TRUE(merged.empty());
+    // a P2SH owner without a DOGE address: P2SH on LTC and on the merged
+    // chains (its key converted, as the node fee's)
+    const auto owner_p2sh = core::address_to_script(b58(50, 0x0b));
+    const auto p2sh_floor = core::hash160_to_merged_script(h160_of(b58(50, 0x0b)), "p2sh");
+    ASSERT_TRUE(mi.set_split_owner(owner_p2sh, {}));
+    payout.clear();
+    merged.clear();
+    d = mi.decide_job_payout(payout, merged);
+    ASSERT_TRUE(d.has_value());
+    EXPECT_EQ(payout, owner_p2sh);
+    EXPECT_EQ(merged, (Merged{{63, p2sh_floor}, {98, p2sh_floor}}));
+    // a P2WPKH owner: P2WPKH on LTC, its key as P2PKH on the merged chains
+    const auto owner_wpkh = core::address_to_script(bech32::encode_segwit("ltc", 0, std::vector<unsigned char>(20, 0x2d)));
+    ASSERT_EQ(owner_wpkh.size(), 22u);
+    ASSERT_TRUE(mi.set_split_owner(owner_wpkh, {}));
+    payout.clear();
+    merged.clear();
+    d = mi.decide_job_payout(payout, merged);
+    ASSERT_TRUE(d.has_value());
+    EXPECT_EQ(payout, owner_wpkh);
+    std::string h;
+    for (int i = 0; i < 20; ++i) h += "2d";
+    const auto wpkh_floor = core::hash160_to_merged_script(h, "p2pkh");
+    EXPECT_EQ(merged, (Merged{{63, wpkh_floor}, {98, wpkh_floor}}));
+}
+
+// The reconnect race at the stratum session: the job sent right after
+// mining.subscribe is built before mining.authorize, with no payout, so the
+// work source gives it the split (here: the owner and the split donation).
+// Its job id stays active after the authorize: a share found on it and
+// submitted under the now-authorized login is accepted and carries the
+// payout and donation that job committed to (its ref_hash), never an empty
+// script, and the jobs after the authorize carry the login's payout and the
+// node's donation. (The MiningInterface side, the decision and the minted
+// share, is pinned in core_test: RedistributeSplit.TheJobBuiltBeforeTheLogin
+// MintsTheOwnerWithTheSplitDonation.)
+TEST(MergedAuxStratumSession, AJobBuiltBeforeTheLoginKeepsItsSplitThroughTheAuthorize)
+{
+    using namespace std::chrono_literals;
+    const std::string ltc = b58(48, 0x01);
+    const auto owner = core::address_to_script(b58(48, 0x0a));
+    SessionRig rig({98}, /*redistribute=*/true);
+    rig.ws->split_owner = owner;
+    LineClient c(rig.port);
+    ASSERT_GE(c.fd, 0);
+    rig.step(c, 1, "mining.subscribe", nlohmann::json::array());
+    ASSERT_FALSE(c.last_job.empty()) << "a job is sent right after subscribe";
+    const std::string before_login = c.last_job;
+    {
+        std::lock_guard<std::mutex> l(rig.ws->mu);
+        ASSERT_FALSE(rig.ws->build_donations.empty());
+        EXPECT_EQ(rig.ws->payouts.back(), owner) << "built with no login: the split";
+        ASSERT_TRUE(rig.ws->build_donations.back().has_value());
+        EXPECT_EQ(*rig.ws->build_donations.back(), 32768) << "the build commits to the split donation";
+    }
+    ASSERT_TRUE(rig.step(c, 2, "mining.authorize", {ltc, "x"}));
+    ASSERT_NE(c.last_job, before_login) << "the authorize sends a new job";
+    const std::string after_login = c.last_job;
+    {
+        std::lock_guard<std::mutex> l(rig.ws->mu);
+        EXPECT_EQ(rig.ws->payouts.back(), core::address_to_script(ltc));
+        EXPECT_FALSE(rig.ws->build_donations.back().has_value());
+    }
+    const auto nsub = [&rig] {
+        std::lock_guard<std::mutex> l(rig.ws->mu);
+        return rig.ws->submits.size();
+    };
+    c.send({{"id", 3}, {"method", "mining.submit"}, {"params", {"w", before_login, "00000000", "6ae2a090", "00000000"}}});
+    const auto r3 = c.wait_id(3);
+    ASSERT_TRUE(r3.has_value());
+    for (int i = 0; i < 100 && nsub() < 1; ++i) std::this_thread::sleep_for(5ms);
+    c.send({{"id", 4}, {"method", "mining.submit"}, {"params", {"w", after_login, "00000000", "6ae2a090", "00000001"}}});
+    c.wait_id(4);
+    for (int i = 0; i < 100 && nsub() < 2; ++i) std::this_thread::sleep_for(5ms);
+    std::lock_guard<std::mutex> l(rig.ws->mu);
+    ASSERT_EQ(rig.ws->submits.size(), 2u) << "the share on the job built before the login is not refused";
+    EXPECT_EQ(rig.ws->submit_payouts[0], owner) << "the payout that job committed to, not the login's";
+    ASSERT_TRUE(rig.ws->submit_donations[0].has_value());
+    EXPECT_EQ(*rig.ws->submit_donations[0], 32768);
+    EXPECT_EQ(rig.ws->submit_payouts[1], core::address_to_script(ltc));
+    EXPECT_FALSE(rig.ws->submit_donations[1].has_value());
 }
 
 // A P2SH primary: its merged chains are paid to the same P2SH script (as
