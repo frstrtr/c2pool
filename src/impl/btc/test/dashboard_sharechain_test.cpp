@@ -10,6 +10,8 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <fstream>
+#include <iterator>
 #include <string>
 #include <vector>
 
@@ -275,4 +277,33 @@ TEST(BtcDashboardSharechain, TipIsTheTallestHead)
     EXPECT_EQ(tip->hash, hashes.back().GetHex().substr(0, 16));
     EXPECT_EQ(tip->total, 4);
     EXPECT_EQ(tip->height, tracker.chain.get_height(hashes.back()));
+}
+
+// main_btc.cpp rebuilds the window when the best share changes (and on the
+// 30 s fallback), not on every cache pump tick, and unbinds that refresh
+// before the node and the dashboard are torn down.
+TEST(BtcDashboardSharechain, WindowRefreshesOnBestShareChange)
+{
+#ifndef BTC_MAIN_SRC
+    GTEST_SKIP() << "BTC_MAIN_SRC not defined";
+#else
+    std::ifstream f(BTC_MAIN_SRC, std::ios::binary);
+    const std::string src((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    ASSERT_FALSE(src.empty());
+    const auto window = src.find("mi->set_sharechain_window_fn(");
+    const auto tip    = src.find("mi->set_sharechain_tip_fn(", window);
+    ASSERT_NE(window, std::string::npos);
+    ASSERT_NE(tip, std::string::npos);
+    const std::string between = src.substr(window, tip - window);
+    EXPECT_NE(between.find("mi->mark_last_cache_tip_driven();"), std::string::npos)
+        << "the window cache is tip-driven";
+    EXPECT_NE(between.find("set_on_best_share_changed([mi]() { mi->refresh_tip_sensitive_caches(); });"),
+              std::string::npos)
+        << "a best-share change refreshes the tip-driven caches";
+    const auto unbind = src.find("p2p_node->set_on_best_share_changed(nullptr);");
+    const auto reset  = src.find("p2p_node.reset();");
+    ASSERT_NE(unbind, std::string::npos);
+    ASSERT_NE(reset, std::string::npos);
+    EXPECT_LT(unbind, reset) << "the refresh is unbound before the node goes";
+#endif
 }

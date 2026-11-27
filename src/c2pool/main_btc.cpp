@@ -3077,6 +3077,15 @@ int main(int argc, char* argv[])
             last_window->j = result;
             return result;
         });
+        // Two window walks (the split and the rows): rebuilt when the best
+        // share changes (below) and every 30 s otherwise, not on every pump
+        // tick. The explorer stays live through /sharechain/tip and
+        // /sharechain/delta.
+        mi->mark_last_cache_tip_driven();
+        // The tip-driven caches (this window, the sharechain stats) refresh on
+        // a best-share change. The node calls this on its IO thread with no
+        // tracker lock held; p2p_node is torn down before web_server.
+        p2p_node_raw->set_on_best_share_changed([mi]() { mi->refresh_tip_sensitive_caches(); });
 
         auto last_tip = std::make_shared<std::optional<core::SharechainTip>>();
         auto last_tip_mutex = std::make_shared<std::mutex>();
@@ -3671,6 +3680,8 @@ int main(int argc, char* argv[])
     // #995/#1155: unbind the found-block reporter before mi/web_server die.
     if (found_block_report) *found_block_report = nullptr;
     if (pool_late_connect) *pool_late_connect = nullptr;
+    // The dashboard's best-share refresh holds `mi` too.
+    if (p2p_node) p2p_node->set_on_best_share_changed(nullptr);
     stratum_server_for_shutdown.reset();
     work_source_for_shutdown.reset();
     p2p_node.reset();
