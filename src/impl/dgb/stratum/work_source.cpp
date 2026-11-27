@@ -428,9 +428,12 @@ nlohmann::json DGBWorkSource::get_current_work_template() const
     in.median_time_past  = chain_.median_time_past();
     in.curtime           = static_cast<int64_t>(std::time(nullptr));
     in.transactions      = tx_sel.transactions;
+    // The template's block: the embedded header chain's tip, or digibyted's
+    // getblocktemplate (the GBT fallback) when the chain is unfed or, during
+    // its initial sync, behind its tip.
+    bool from_gbt = false;
+    bool embedded_behind = false;
     if (auto th = chain_.tip_hash()) {
-        // Embedded chain carries a real tip -> source previousblockhash from it.
-        in.previousblockhash = u256_be_display_hex(*th);
         // #179: derive the block-template bits from the synced header chain via
         // DigiByte-Core MultiShield V4 (chain_.next_scrypt_bits()), replacing the
         // fabricated diff-1 (0x1d00ffff) that made every won block INVALID and
@@ -444,38 +447,55 @@ nlohmann::json DGBWorkSource::get_current_work_template() const
         auto nb = chain_.next_scrypt_bits();
         if (!nb)
             return nlohmann::json::object();  // hold work until the window fills.
-        char bits_buf[9];
-        std::snprintf(bits_buf, sizeof(bits_buf), "%08x", *nb);
-        in.bits = std::string(bits_buf);
-        // Hold work until the header chain is at its tip (review 906a0e5e3
-        // #4): while it syncs, the template is for an old height and prevhash.
-        if (const uint32_t recent = tip_recent_sec_.load(); recent > 0) {
+        // Work from the embedded chain only once it is at its tip (reviews
+        // 906a0e5e3 #4, dd1248abd #5): while it syncs, its template is for an
+        // old height and prevhash. A latch, as a node's initial block download:
+        // once at its tip it stays so (a quiet network never holds work again;
+        // a lost digibyted is the work gate's, stratum_work_gate.hpp). Behind:
+        // digibyted's template when the GBT fallback is bound, else no work.
+        if (const uint32_t recent = tip_recent_sec_.load(); recent > 0 && !tip_latched_.load()) {
             const int64_t age = static_cast<int64_t>(std::time(nullptr)) - chain_.median_time_past();
-            const int at_tip = age <= static_cast<int64_t>(recent) ? 1 : 0;
-            if (tip_state_.exchange(at_tip) != at_tip) {
-                if (at_tip)
+            if (age <= static_cast<int64_t>(recent)) {
+                tip_latched_.store(true);
+                if (tip_state_.exchange(1) != 1)
                     LOG_INFO << "[DGB-STRATUM] header chain at its tip (median time " << age
-                             << " s old): serving work";
-                else
-                    LOG_WARNING << "[DGB-STRATUM] header chain behind its tip (median time " << age
-                                << " s old > " << recent << " s): work held until it syncs";
+                             << " s old): serving work from it";
+            } else {
+                embedded_behind = true;
             }
-            if (!at_tip)
-                return nlohmann::json::object();
         }
-    } else if (auto tip = resolve_gbt_tip_fallback()) {
-        // Embedded HeaderChain unfed -> external-daemon GBT fallback (persist per
-        // V36). Sources previousblockhash, the daemon-authoritative bits AND the
-        // height from ONE getblocktemplate snapshot; the empty header chain has
-        // no height (next_block_height() would be its base, 0). No height: no
-        // work. Unbound / no creds / RPC failure -> all absent.
-        if (tip->height == 0)
-            return nlohmann::json::object();
-        in.previousblockhash = tip->previousblockhash;
-        in.bits              = tip->bits;
-        in.next_height       = tip->height;
-        in.coinbasevalue     = coinbase_value(tip->height, tx_sel.total_fees, std::nullopt);
+        if (!embedded_behind) {
+            // Embedded chain carries a real tip -> source previousblockhash from it.
+            in.previousblockhash = u256_be_display_hex(*th);
+            char bits_buf[9];
+            std::snprintf(bits_buf, sizeof(bits_buf), "%08x", *nb);
+            in.bits = std::string(bits_buf);
+        }
     }
+    if (!in.previousblockhash) {
+        // Embedded HeaderChain unfed (or behind) -> external-daemon GBT fallback
+        // (persist per V36). Sources previousblockhash, the daemon-authoritative
+        // bits AND the height from ONE getblocktemplate snapshot; the empty
+        // header chain has no height (next_block_height() would be its base, 0).
+        // No height: no work. Unbound / no creds / RPC failure -> all absent.
+        auto tip = resolve_gbt_tip_fallback();
+        if (tip && tip->height != 0) {
+            in.previousblockhash = tip->previousblockhash;
+            in.bits              = tip->bits;
+            in.next_height       = tip->height;
+            in.coinbasevalue     = coinbase_value(tip->height, tx_sel.total_fees, std::nullopt);
+            from_gbt = true;
+        } else if (tip || embedded_behind) {
+            if (embedded_behind && tip_state_.exchange(0) != 0)
+                LOG_WARNING << "[DGB-STRATUM] header chain behind its tip (median time "
+                            << (static_cast<int64_t>(std::time(nullptr)) - chain_.median_time_past())
+                            << " s old > " << tip_recent_sec_.load() << " s) and no digibyted template:"
+                               " work held until it syncs";
+            return nlohmann::json::object();
+        }
+    }
+    if (embedded_behind && from_gbt && tip_state_.exchange(2) != 2)
+        LOG_WARNING << "[DGB-STRATUM] header chain behind its tip: serving digibyted's template until it syncs";
 
     nlohmann::json t = dgb::coin::build_work_template(in);
     // The dashboard's summary of the template served (last_template_summary).

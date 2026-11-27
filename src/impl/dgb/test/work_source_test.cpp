@@ -34,6 +34,8 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <fstream>
+#include <sstream>
 #include <stdexcept>
 
 namespace {
@@ -843,8 +845,37 @@ TEST(DgbWorkSource, WorkTemplateServesRealV4BitsAndPrevhash)
     // no work; unchecked (0) it serves the template above.
     ws->set_tip_recent_sec(3600);
     EXPECT_FALSE(ws->get_current_work_template().contains("bits")) << "work served from a chain behind its tip";
+    // Review dd1248abd #5: behind its tip, digibyted's template when the GBT
+    // fallback is bound (its prevhash, bits and height).
+    ws->set_gbt_tip_fn([]() -> std::optional<dgb::stratum::DGBWorkSource::GbtTip> {
+        return dgb::stratum::DGBWorkSource::GbtTip{std::string(56, '0') + "0badf00d", "1a00ffff", 24200000};
+    });
+    const auto gbt = ws->get_current_work_template();
+    ASSERT_TRUE(gbt.contains("bits"));
+    EXPECT_EQ(gbt["bits"].get<std::string>(), "1a00ffff");
+    EXPECT_EQ(gbt["previousblockhash"].get<std::string>(), std::string(56, '0') + "0badf00d");
+    EXPECT_EQ(gbt["height"].get<uint32_t>(), 24200000u);
+    ws->set_gbt_tip_fn(nullptr);
     ws->set_tip_recent_sec(0);
     EXPECT_TRUE(ws->get_current_work_template().contains("bits"));
+    // A latch: once the chain has reached its tip, it is never behind again.
+    ws->set_tip_recent_sec(UINT32_MAX);
+    ASSERT_EQ(ws->get_current_work_template()["previousblockhash"].get<std::string>(), expected_prev);
+    ws->set_tip_recent_sec(3600);
+    const auto latched = ws->get_current_work_template();
+    ASSERT_TRUE(latched.contains("bits")) << "the tip latch let go";
+    EXPECT_EQ(latched["previousblockhash"].get<std::string>(), expected_prev);
+}
+
+// Review dd1248abd #5 / #8: main_dgb arms the tip check on mainnet only.
+TEST(DgbWorkSource, MainDgbArmsTheTipCheckOnMainnetOnly)
+{
+    std::ifstream f(DGB_MAIN_SRC);
+    ASSERT_TRUE(f.good()) << DGB_MAIN_SRC;
+    std::stringstream ss;
+    ss << f.rdbuf();
+    EXPECT_NE(ss.str().find("        if (!testnet && !regtest)\n            work_source->set_tip_recent_sec(3600);"),
+              std::string::npos);
 }
 
 

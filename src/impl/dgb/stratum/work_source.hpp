@@ -329,9 +329,12 @@ public:
     using GbtTipFn = std::function<std::optional<GbtTip>()>;
     void set_gbt_tip_fn(GbtTipFn fn);
 
-    /// Work is served only while the embedded header chain is at its tip: its
-    /// median time past at most `sec` old (0, the default: not checked). During
-    /// header sync the template would be for an old height and prevhash.
+    /// Work is served from the embedded header chain only once it has reached
+    /// its tip: its median time past at most `sec` old (0, the default: not
+    /// checked). A latch: once reached, never behind again. Until then the
+    /// GBT fallback's template is served when bound, else no work. During
+    /// header sync the embedded template would be for an old height and
+    /// prevhash.
     void set_tip_recent_sec(uint32_t sec) { tip_recent_sec_.store(sec); }
 
     /// The stratum work gate (stratum_work_gate.hpp): a non-empty reason holds
@@ -508,7 +511,8 @@ private:
     std::string                 work_hold_;      // under work_hold_mutex_
     mutable std::mutex          summary_mutex_;
     mutable std::optional<TemplateSummary> summary_;   // under summary_mutex_
-    mutable std::atomic<int>    tip_state_{-1};   // last logged: 1 at tip, 0 behind
+    mutable std::atomic<int>    tip_state_{-1};   // last logged: 1 at tip, 0 behind/held, 2 behind/GBT
+    mutable std::atomic<bool>   tip_latched_{false};   // reached its tip once: never behind again
     mutable std::mutex          local_rate_mutex_;
     LocalRateFn                 local_rate_fn_;
     std::function<double()>     node_rate_fn_;   // under local_rate_mutex_
