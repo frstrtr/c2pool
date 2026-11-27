@@ -855,6 +855,10 @@ TEST(DgbWorkSource, WorkTemplateServesRealV4BitsAndPrevhash)
     EXPECT_EQ(gbt["bits"].get<std::string>(), "1a00ffff");
     EXPECT_EQ(gbt["previousblockhash"].get<std::string>(), std::string(56, '0') + "0badf00d");
     EXPECT_EQ(gbt["height"].get<uint32_t>(), 24200000u);
+    // Review 7793bfb6c #2: the prevhash getter (the job push watches it)
+    // follows the same source.
+    EXPECT_EQ(ws->get_current_gbt_prevhash(), std::string(56, '0') + "0badf00d");
+    EXPECT_FALSE(ws->embedded_chain_serves());
     ws->set_gbt_tip_fn(nullptr);
     ws->set_tip_recent_sec(0);
     EXPECT_TRUE(ws->get_current_work_template().contains("bits"));

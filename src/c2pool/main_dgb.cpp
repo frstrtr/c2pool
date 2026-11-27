@@ -2019,10 +2019,11 @@ int run_node(const core::CoinParams& params, bool testnet,
     }
 
     // The stratum work gate (stratum_work_gate.hpp; python work.py
-    // preprocess_request): no work while the node has no sharechain peers
-    // (mainnet: PERSIST) or has lost contact with digibyted for more than
-    // 60 s; once a hold has lasted 15 s the live sessions are closed once, so
-    // rigs fail over. The share download and verification go on.
+    // preprocess_request / get_work): no work while the node has no
+    // sharechain peers or no best share (mainnet: PERSIST), or has lost
+    // contact with digibyted for more than 60 s while working from the
+    // embedded chain; once a hold has lasted 15 s the live sessions are closed
+    // once, so rigs fail over. The share download and verification go on.
     std::function<void()> stop_work_gate;
     if (stratum_server) {
         auto* srv = stratum_server.get();
@@ -2031,26 +2032,19 @@ int run_node(const core::CoinParams& params, bool testnet,
             return static_cast<int64_t>(std::chrono::duration_cast<std::chrono::seconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count());
         };
-        auto last_contact = std::make_shared<int64_t>(steady_sec());
-        auto watch = std::make_shared<dgb::WorkGateWatch>();
+        auto gate = std::make_shared<dgb::WorkGateState>();
+        gate->last_contact = steady_sec();
         stop_work_gate = dgb::start_periodic(ioc, dgb::kWorkGateTick,
-            [&p2p_node, &coin_p2p, srv, ws = work_source.get(), require_peers, steady_sec,
-             last_contact, watch]() {
-                const int64_t now = steady_sec();
-                if (coin_p2p && coin_p2p->is_handshake_complete())
-                    *last_contact = now;
-                dgb::WorkGateInputs in;
-                in.require_peers = require_peers;
-                in.sharechain_peers = p2p_node.get_peer_info_json().size();
-                in.coin_daemon = static_cast<bool>(coin_p2p);
-                in.coin_contact_age_sec = now - *last_contact;
-                const std::string reason = dgb::work_gate_reason(in);
-                ws->set_work_hold(reason);
-                if (watch->tick(reason, now) == dgb::WorkGateWatch::Action::drop_sessions) {
-                    const size_t n = srv->drop_sessions(srv->get_session_count());
-                    if (n)
-                        LOG_WARNING << "[DGB-STRATUM] closed " << n << " miner session(s): " << reason;
-                }
+            [&p2p_node, &coin_p2p, srv, ws = work_source.get(), cell = stratum_best_share, require_peers,
+             steady_sec, gate]() {
+                dgb::WorkGateObservation ob;
+                ob.require_peers = require_peers;
+                ob.sharechain_peers = p2p_node.get_peer_info_json().size();
+                ob.coin_dialled = static_cast<bool>(coin_p2p);
+                ob.coin_handshaken = coin_p2p && coin_p2p->is_handshake_complete();
+                ob.embedded_serves = ws->embedded_chain_serves();
+                ob.best_share_null = cell->get().IsNull();
+                dgb::work_gate_tick(*gate, ob, steady_sec(), *ws, *srv);
             });
     }
 

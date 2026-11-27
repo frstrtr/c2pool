@@ -14,7 +14,11 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <boost/asio/io_context.hpp>
+#include <chrono>
 #include <fstream>
+#include <functional>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -101,6 +105,115 @@ TEST(DgbWorkGate, HeldWorkSourceServesNoTemplateAndRefusesAuthorize)
     EXPECT_EQ(ws.authorize_refusal(login), "");
 }
 
+// Review 7793bfb6c #6: the tick itself, through fakes.
+namespace {
+struct FakeWs {
+    std::string hold;
+    void set_work_hold(const std::string& r) { hold = r; }
+};
+struct FakeSrv {
+    size_t sessions = 3;
+    int drops = 0;
+    size_t get_session_count() const { return sessions; }
+    size_t drop_sessions(size_t n)
+    {
+        ++drops;
+        const size_t k = std::min(n, sessions);
+        sessions -= k;
+        return k;
+    }
+};
+dgb::WorkGateObservation healthy()
+{
+    dgb::WorkGateObservation ob;
+    ob.require_peers = true;
+    ob.sharechain_peers = 3;
+    ob.coin_dialled = true;
+    ob.coin_handshaken = true;
+    ob.embedded_serves = true;
+    ob.best_share_null = false;
+    return ob;
+}
+} // namespace
+
+TEST(DgbWorkGate, TheTickHoldsReleasesAndClosesSessionsOnce)
+{
+    dgb::WorkGateState st;
+    st.last_contact = 1000;
+    FakeWs ws;
+    FakeSrv srv;
+    auto ob = healthy();
+    EXPECT_EQ(dgb::work_gate_tick(st, ob, 1000, ws, srv), "");
+    EXPECT_EQ(ws.hold, "");
+
+    // No peers on mainnet: held at once, sessions closed once after 15 s.
+    ob.sharechain_peers = 0;
+    EXPECT_EQ(dgb::work_gate_tick(st, ob, 1001, ws, srv), kNoPeers);
+    EXPECT_EQ(ws.hold, kNoPeers);
+    EXPECT_EQ(dgb::work_gate_tick(st, ob, 1015, ws, srv), kNoPeers);
+    EXPECT_EQ(srv.drops, 0);
+    dgb::work_gate_tick(st, ob, 1016, ws, srv);
+    EXPECT_EQ(srv.drops, 1);
+    EXPECT_EQ(srv.sessions, 0u) << "not every session was closed";
+    srv.sessions = 2;
+    dgb::work_gate_tick(st, ob, 1100, ws, srv);
+    EXPECT_EQ(srv.drops, 1) << "closed twice in one hold";
+    ob.sharechain_peers = 2;
+    EXPECT_EQ(dgb::work_gate_tick(st, ob, 1101, ws, srv), "");
+    EXPECT_EQ(ws.hold, "") << "the hold was not released";
+
+    // Testnet / regtest (not PERSIST): no peers and no best share are fine.
+    auto t = ob;
+    t.require_peers = false;
+    t.sharechain_peers = 0;
+    t.best_share_null = true;
+    EXPECT_EQ(dgb::work_gate_tick(st, t, 1102, ws, srv), "");
+
+    // No best share on mainnet (the revive): downloading shares.
+    ob.best_share_null = true;
+    EXPECT_EQ(dgb::work_gate_tick(st, ob, 1103, ws, srv), "p2pool is downloading shares");
+    ob.best_share_null = false;
+    EXPECT_EQ(dgb::work_gate_tick(st, ob, 1104, ws, srv), "");
+}
+
+TEST(DgbWorkGate, ContactCountsOnlyWhileWorkComesFromTheEmbeddedChain)
+{
+    dgb::WorkGateState st;
+    st.last_contact = 1000;
+    FakeWs ws;
+    FakeSrv srv;
+    auto ob = healthy();
+    dgb::work_gate_tick(st, ob, 1000, ws, srv);
+    ob.coin_handshaken = false;
+    EXPECT_EQ(dgb::work_gate_tick(st, ob, 1060, ws, srv), "") << "60 s is still contact";
+    EXPECT_EQ(dgb::work_gate_tick(st, ob, 1061, ws, srv), kLost);
+    // A handshake seen again restores contact.
+    ob.coin_handshaken = true;
+    EXPECT_EQ(dgb::work_gate_tick(st, ob, 1062, ws, srv), "");
+    // Work from digibyted's GBT (embedded chain behind or unfed): the coin
+    // P2P is not its contact; a failed GBT gives no work by itself.
+    ob.coin_handshaken = false;
+    ob.embedded_serves = false;
+    EXPECT_EQ(dgb::work_gate_tick(st, ob, 5000, ws, srv), "");
+    // No coin peer dialled at all (--coin-p2p-discover): no contact check.
+    ob.embedded_serves = true;
+    ob.coin_dialled = false;
+    EXPECT_EQ(dgb::work_gate_tick(st, ob, 9000, ws, srv), "");
+}
+
+TEST(DgbWorkGate, StartPeriodicRepeatsAndStops)
+{
+    boost::asio::io_context ioc;
+    int ticks = 0;
+    std::function<void()> stop;
+    stop = dgb::start_periodic(ioc, std::chrono::milliseconds(5), [&] {
+        if (++ticks == 3)
+            stop();
+    });
+    ioc.run_for(std::chrono::milliseconds(500));
+    EXPECT_EQ(ticks, 3) << "the periodic tick did not repeat, or did not stop";
+}
+
 TEST(DgbWorkGate, MainDgbRunsTheGate)
 {
     std::ifstream f(DGB_MAIN_SRC);
@@ -108,11 +221,19 @@ TEST(DgbWorkGate, MainDgbRunsTheGate)
     std::stringstream ss;
     ss << f.rdbuf();
     const std::string s = ss.str();
+    const auto at = s.find("stop_work_gate = dgb::start_periodic(ioc, dgb::kWorkGateTick,");
+    ASSERT_NE(at, std::string::npos);
+    const std::string body = s.substr(at, s.find("});", at) - at);
+    for (const char* line : {"ob.require_peers = require_peers;",
+                             "ob.sharechain_peers = p2p_node.get_peer_info_json().size();",
+                             "ob.coin_dialled = static_cast<bool>(coin_p2p);",
+                             "ob.coin_handshaken = coin_p2p && coin_p2p->is_handshake_complete();",
+                             "ob.embedded_serves = ws->embedded_chain_serves();",
+                             "ob.best_share_null = cell->get().IsNull();",
+                             "dgb::work_gate_tick(*gate, ob, steady_sec(), *ws, *srv);"})
+        EXPECT_NE(body.find(line), std::string::npos) << line;
     EXPECT_NE(s.find("const bool require_peers = !testnet && !regtest;"), std::string::npos);
-    EXPECT_NE(s.find("in.sharechain_peers = p2p_node.get_peer_info_json().size();"), std::string::npos);
-    EXPECT_NE(s.find("if (coin_p2p && coin_p2p->is_handshake_complete())"), std::string::npos);
-    EXPECT_NE(s.find("ws->set_work_hold(reason);"), std::string::npos);
-    EXPECT_NE(s.find("srv->drop_sessions(srv->get_session_count())"), std::string::npos);
+    EXPECT_NE(s.find("gate->last_contact = steady_sec();"), std::string::npos);
     // Stopped before the server it closes sessions on goes.
     const auto stop = s.find("if (stop_work_gate) stop_work_gate();");
     const auto reset = s.rfind("stratum_server.reset();");
