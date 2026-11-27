@@ -28,6 +28,7 @@
 #include <impl/dgb/coin/aux_doge_payout_provider.hpp>
 #include "doge_backend_fixture.hpp"
 #include <impl/dgb/run_loop_mint.hpp>
+#include <impl/dgb/coin/reconstruct_closure.hpp>
 #include <impl/dgb/share.hpp>
 #include <impl/dgb/share_check.hpp>
 #include <impl/dgb/share_tracker.hpp>
@@ -882,4 +883,68 @@ TEST(DgbMintRoundTrip, ShareTargetIsThePoolTargetCappedPerAddress)
     const auto floor30 = rig.chain.tracker.compute_share_target(rig.chain.tip, rig.last_inputs->frozen_timestamp,
                                                                 uint256(), 36);
     EXPECT_EQ(huge.snapshot.frozen_ref.bits, floor30.bits);
+}
+
+// Review 906a0e5e3 REQUIRED 1: the won-block ARM A (m_on_block_found ->
+// reconstruct_closure -> assemble_won_block) rebuilds the block from the share.
+// A V35 coinbase carries the P2Pool witness commitment, so the rebuilt block
+// must carry the '[P2Pool]'*4 coinbase witness (Core's CheckWitnessMalleation)
+// and keep the share's header hash; a share whose header commits to
+// transactions this node does not have (a peer's block) is not relayed.
+TEST(DgbMintRoundTrip, ArmAWonV35BlockPassesTheWitnessCheckAndKeepsItsHash)
+{
+    RtRig rig;
+    rig.mint_version = 35;
+    auto cbr = rig.ws->build_connection_coinbase(rig.chain.tip, "cafef00d", stratum_payout(miner_login()), {});
+    ASSERT_FALSE(cbr.held);
+    auto j = rig.job(cbr, 0x2100ffffu);
+    (void)rig.ws->mining_submit(miner_login(), "job", "cafef00d", "0000002e", "6a1b2c3d", "00c0ffee", "rid", {}, &j);
+    ASSERT_FALSE(rig.minted.IsNull());
+    const uint256 share = rig.minted;
+
+    auto fields = [&rig](const uint256& h) {
+        dgb::coin::WonShareInputs si{};
+        rig.chain.tracker.chain.get_share(h).invoke([&](auto* s) { si = dgb::coin::won_share_inputs(*s); });
+        return si;
+    };
+    auto gentx = [&rig](const uint256& h) {
+        dgb::coin::GentxCoinbase gc;
+        rig.chain.tracker.chain.get_share(h).invoke([&](auto* s) {
+            (void)dgb::generate_share_transaction(*s, rig.chain.tracker, rig.params, false, false, &gc);
+        });
+        return gc.bytes;
+    };
+    auto no_txs = [](const uint256&) { return std::vector<dgb::coin::MutableTransaction>{}; };
+    auto closure = dgb::coin::make_reconstruct_closure_from_template(fields, gentx, no_txs);
+    const auto blk = closure(share);
+    ASSERT_TRUE(blk.has_value()) << "the won V35 block was not rebuilt";
+    const Bytes& b = blk->first;
+    EXPECT_EQ(Hash(std::span<const unsigned char>(b.data(), 80)), share) << "the rebuilt block is another block";
+    ASSERT_EQ(b[80], 0x01);
+    ASSERT_EQ(b[81 + 4], 0x00) << "not in witness form (marker)";
+    ASSERT_EQ(b[81 + 5], 0x01) << "not in witness form (flag)";
+    const size_t wit = b.size() - 4 - 34;
+    ASSERT_EQ(b[wit], 0x01);
+    ASSERT_EQ(b[wit + 1], 0x20);
+    const Bytes reserved(b.begin() + static_cast<std::ptrdiff_t>(wit + 2), b.begin() + static_cast<std::ptrdiff_t>(wit + 34));
+    EXPECT_EQ(std::string(reserved.begin(), reserved.end()), "[P2Pool][P2Pool][P2Pool][P2Pool]");
+    const Bytes prefix{0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed};
+    auto it = std::search(b.begin() + 81, b.end(), prefix.begin(), prefix.end());
+    ASSERT_NE(it, b.end());
+    Bytes pre(32, 0x00);   // the witness root of a coinbase-only block
+    pre.insert(pre.end(), reserved.begin(), reserved.end());
+    const uint256 c = Hash(std::span<const unsigned char>(pre.data(), pre.size()));
+    EXPECT_EQ(Bytes(c.data(), c.data() + 32), Bytes(it + 6, it + 38)) << "CheckWitnessMalleation fails";
+
+    // A share whose header commits to more transactions (a merkle branch this
+    // node cannot fill): its rebuilt block would be another block.
+    dgb::coin::WonShareInputs peer = fields(share);
+    peer.merkle_link.m_branch.push_back(uint256(std::vector<unsigned char>(32, 0x42)));
+    const auto ug = dgb::coin::unpack_gentx_coinbase(gentx(share));
+    const auto hdr = dgb::coin::reconstruct_block_header(peer.small_header, ug.txid, peer.merkle_link);
+    auto hp = pack(hdr);
+    const uint256 peer_hash = Hash(hp.get_span());
+    auto peer_closure = dgb::coin::make_reconstruct_closure_from_template(
+        [peer](const uint256&) { return peer; }, [&gentx, share](const uint256&) { return gentx(share); }, no_txs);
+    EXPECT_FALSE(peer_closure(peer_hash).has_value()) << "a block with unknown transactions was relayed";
 }

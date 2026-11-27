@@ -48,10 +48,12 @@
 #include <functional>
 #include <iostream>
 #include <optional>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include <core/hash.hpp>
 #include <core/uint256.hpp>
 
 #include "reconstruct_won_block.hpp"   // reconstruct_won_block, ReconstructedWonBlock, SmallBlockHeaderType, MutableTransaction
@@ -160,11 +162,15 @@ inline WonBlockReconstructor
 make_reconstruct_closure_from_template(
     std::function<WonShareInputs(const uint256&)> won_share_fields_fn,
     std::function<std::vector<unsigned char>(const uint256&)> gentx_bytes_fn,
-    std::function<std::vector<MutableTransaction>(const uint256&)> template_other_txs_fn)
+    std::function<std::vector<MutableTransaction>(const uint256&)> template_other_txs_fn,
+    // false only for the regtest forced-won seam, whose synthetic share hash
+    // is not a header hash (its block is reground after the rebuild).
+    bool require_share_hash = true)
 {
     return [won_share_fields_fn = std::move(won_share_fields_fn),
             gentx_bytes_fn = std::move(gentx_bytes_fn),
-            template_other_txs_fn = std::move(template_other_txs_fn)](
+            template_other_txs_fn = std::move(template_other_txs_fn),
+            require_share_hash](
                const uint256& share_hash)
         -> std::optional<std::pair<std::vector<unsigned char>, std::string>>
     {
@@ -184,7 +190,18 @@ make_reconstruct_closure_from_template(
             //    SSOT (version-agnostic; empty other_txs => coinbase-only).
             ReconstructedWonBlock r = reconstruct_won_block_from_template(
                 si.small_header, si.merkle_link, ug.tx, ug.txid, other_txs);
-
+            // Relay only the block the share is: its header hash must be the
+            // share hash. A block rebuilt without its transactions (a peer's
+            // block whose transactions this node does not have) gets another
+            // merkle root, so another header: never relayed.
+            if (require_share_hash
+                && (r.bytes.size() < 80
+                    || Hash(std::span<const unsigned char>(r.bytes.data(), 80)) != share_hash)) {
+                std::cout << "[DGB-POOL-BLOCK] won share " << share_hash.GetHex().substr(0, 16)
+                          << " -- the rebuilt block's header hash is not the share's (its transactions"
+                             " are not known here); NOT relayed" << std::endl;
+                return std::nullopt;
+            }
             return std::make_pair(std::move(r.bytes), std::move(r.hex));
         }
         catch (const std::exception& e)

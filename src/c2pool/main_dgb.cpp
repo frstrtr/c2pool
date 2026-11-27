@@ -954,7 +954,10 @@ int run_node(const core::CoinParams& params, bool testnet,
         // #300/#299: replay the captured per-job template transactions[]
         // keyed by share_hash (TemplateCapture above feeds it at seed time);
         // a capture MISS decodes to an empty set -> valid coinbase-only block.
-        dgb::coin::make_template_other_txs_fn(template_capture.provider()));
+        dgb::coin::make_template_other_txs_fn(template_capture.provider()),
+        // Relay only a rebuilt block whose header hash is the share's; the
+        // regtest forced-won seam (a synthetic share, reground below) is exempt.
+        /*require_share_hash=*/!(regtest && force_won_share));
 
     // -- #82 forced-won PoW finalize -------------------------------------
     // A forced-won share (the regtest --regtest-force-won-share live seam)
