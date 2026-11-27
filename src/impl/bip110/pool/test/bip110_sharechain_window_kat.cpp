@@ -244,6 +244,25 @@ int main()
     expect_true("[3] every row V == 36 (native share version feed)", all_v36);
     expect_true("[3] every row s.m non-empty (address marker)", all_addr);
 
+    // [3b] the stale_info, fork and block marks the explorer reads.
+    bool all_stale = true;
+    for (const auto& s : w["shares"])
+        if (!(s.contains("s") && s["s"].is_number_integer())) all_stale = false;
+    expect_true("[3b] every row has s (stale_info)", all_stale);
+    expect_true("[3b] heads == [tip short hash]",
+                w["heads"].is_array() && w["heads"].size() == 1
+                    && w["heads"][0] == tip.GetHex().substr(0, 16));
+    {
+        const std::vector<std::string> found = {tip.GetHex(), std::string(64, 'e')};
+        nlohmann::json wf = sharechain_window_report(
+            tracker, tip, WIN, "", "", PoolConfig::is_testnet, found);
+        expect_true("[3b] block_hashes: the found blocks among the window's shares",
+                    wf["block_hashes"].is_array() && wf["block_hashes"].size() == 1
+                        && wf["block_hashes"][0] == tip.GetHex());
+        expect_true("[3b] blocks: every found block's short hash",
+                    wf["blocks"].is_array() && wf["blocks"].size() == 2);
+    }
+
     // [4] s.m addresses MATCH the /current_payouts keys — the client-side
     // getMinerVersion(addr) join (s.m === addr) that lights the V36? column.
     const std::vector<unsigned char> donation_script = PoolConfig::get_donation_script(36);
