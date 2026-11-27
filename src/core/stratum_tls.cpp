@@ -40,19 +40,25 @@ namespace net = boost::asio;
 
 #ifdef C2POOL_STRATUM_TLS
 
+// The server context, with protocols below TLS 1.2 switched off as asio
+// options (the loader also sets SSL_CTX_set_min_proto_version(TLS1_2_VERSION)).
+// tls_server, not tlsv12_server: the latter pins exactly TLS 1.2 and would
+// drop TLS 1.3.
+static net::ssl::context make_stratum_tls_server_context()
+{
+    net::ssl::context c(net::ssl::context::tls_server);
+    c.set_options(net::ssl::context::default_workarounds
+                  | net::ssl::context::no_sslv2
+                  | net::ssl::context::no_sslv3
+                  | net::ssl::context::no_tlsv1
+                  | net::ssl::context::no_tlsv1_1
+                  | net::ssl::context::single_dh_use);
+    return c;
+}
+
 class StratumTlsContext {
 public:
-    // Protocols below TLS 1.2 are switched off here as asio options and again
-    // by SSL_CTX_set_min_proto_version(TLS1_2_VERSION) in the loader.
-    StratumTlsContext() : ssl(net::ssl::context::tls_server)
-    {
-        ssl.set_options(net::ssl::context::default_workarounds
-                        | net::ssl::context::no_sslv2
-                        | net::ssl::context::no_sslv3
-                        | net::ssl::context::no_tlsv1
-                        | net::ssl::context::no_tlsv1_1
-                        | net::ssl::context::single_dh_use);
-    }
+    StratumTlsContext() : ssl(make_stratum_tls_server_context()) {}
     net::ssl::context ssl;
     std::string description;
     std::optional<std::string> validity_problem;   // "expired" / "not yet valid"
