@@ -167,6 +167,7 @@ void print_banner(const char* argv0, const core::CoinParams& p)
         << "       [--coin-daemon H:P] [--coin-magic HEX] [--regtest]\n"
         << "       [--regtest-force-won-share] [--no-p2p-relay]\n"
         << "       [--redistribute SPEC] [--node-owner-address ADDR] [--node-owner-merged-address DOGEADDR]\n"
+        << "       [--v36-ratchet]   enable the V36 share ratchet (default: shares held at V35)\n"
         << "       [--give-author PCT] [-f|--fee PCT]\n"
         << "       [--sharechain-port P] [--sharechain-addnode HOST:PORT ...]\n"
         << "       [--embedded-serve-mempool-txs[=true|false]]\n"
@@ -290,7 +291,10 @@ int run_node(const core::CoinParams& params, bool testnet,
              // --node-owner-merged-address / --merged-operator-address (LTC's
              // spelling): the node owner's DOGE address, for the owner half of
              // the P2SH split and the owner's node-fee shares (doge_owner_script).
-             const std::string& node_owner_merged_address = "")
+             const std::string& node_owner_merged_address = "",
+             // --v36-ratchet / sharechain.v36_ratchet: enable the V36 AutoRatchet
+             // (off: DGB is held at V35, dgb::DgbVersionPolicy).
+             bool v36_ratchet = false)
 {
     io::io_context ioc;
 
@@ -1726,23 +1730,31 @@ int run_node(const core::CoinParams& params, bool testnet,
     // VOTING (oracle p2pool-dgb-scrypt), v36 once the crossing ACTIVATES. State
     // persists per-coin under <net_subdir>/v36_ratchet.json so a crossed node
     // never regresses on restart.
+    //
+    // Operator decision (2026-11-27): DGB is HELD at V35 until a flag day
+    // (dgb::DgbVersionPolicy): without --v36-ratchet the node mints V35 and
+    // votes 35, and no ratchet state is read or written. With it, the
+    // AutoRatchet as above. The policy keeps its own mutex (stratum sessions
+    // build coinbases concurrently under the SHARED tracker lock).
     const std::string ratchet_path =
         (core::filesystem::config_path() / net_subdir / "v36_ratchet.json").string();
-    auto dgb_ratchet = std::make_shared<dgb::AutoRatchet>(
-        ratchet_path, dgb::DGB_TARGET_VERSION, dgb::DGB_BASE_VERSION);
-    // Stratum sessions build coinbases concurrently under the SHARED tracker
-    // lock; the ratchet's own state transitions need their own mutex.
-    auto dgb_ratchet_mutex = std::make_shared<std::mutex>();
-    LOG_INFO << "[AutoRatchet] Initialized: state="
-             << dgb::ratchet_state_str(dgb_ratchet->state())
-             << " base=V" << dgb::DGB_BASE_VERSION
-             << " target=V" << dgb::DGB_TARGET_VERSION
-             << " file=" << ratchet_path;
+    auto dgb_versions = std::make_shared<dgb::DgbVersionPolicy>(v36_ratchet, ratchet_path);
+    if (auto* r = dgb_versions->ratchet()) {
+        LOG_INFO << "[AutoRatchet] Initialized (--v36-ratchet): state="
+                 << dgb::ratchet_state_str(r->state())
+                 << " base=V" << dgb::DGB_BASE_VERSION
+                 << " target=V" << dgb::DGB_TARGET_VERSION
+                 << " file=" << ratchet_path;
+    } else {
+        LOG_INFO << "[AutoRatchet] OFF: DGB shares are V35, voting 35 (the V36 ratchet needs --v36-ratchet)";
+        if (dgb_versions->stale_state_file_ignored())
+            LOG_WARNING << "[AutoRatchet] a persisted ratchet state " << ratchet_path
+                        << " exists and is IGNORED while --v36-ratchet is off";
+    }
     {
         auto& pplns_tracker = p2p_node.tracker();
         work_source->set_pplns_inputs_fn(
-            [&pplns_tracker, &p2p_node, &params, donation_u16,
-             dgb_ratchet, dgb_ratchet_mutex](
+            [&pplns_tracker, &p2p_node, &params, donation_u16, dgb_versions](
                 const uint256& prev_share_hash,
                 const std::string& /*extranonce1_hex*/,
                 const std::vector<unsigned char>& payout_script,
@@ -1773,9 +1785,7 @@ int run_node(const core::CoinParams& params, bool testnet,
                 return dgb::build_conn_job_inputs(
                     pplns_tracker, params, req,
                     [&]() -> std::pair<int64_t, uint64_t> {
-                        std::lock_guard<std::mutex> rl(*dgb_ratchet_mutex);
-                        const auto [mv, vv] = dgb::dgb_select_mint_versions(
-                            *dgb_ratchet, pplns_tracker, prev_share_hash);
+                        const auto [mv, vv] = dgb_versions->select(pplns_tracker, prev_share_hash);
                         return {mv, static_cast<uint64_t>(vv)};
                     });
             });
@@ -2825,6 +2835,7 @@ int main(int argc, char** argv)
     std::string redistribute_spec;         // --redistribute SPEC (node-local payout policy, #307)
     std::string node_owner_address;        // --node-owner-address ADDR (operator payout identity for --redistribute fee, #307; also -f/--fee destination)
     std::string node_owner_merged_address; // --node-owner-merged-address / --merged-operator-address DOGEADDR (LTC spelling)
+    bool v36_ratchet = false;              // --v36-ratchet: enable the V36 AutoRatchet (default: held at V35)
     // Author/dev donation + node-owner fee (ported from BTC/DASH). The built-in
     // author default is HARD-PINNED at 0.1% (core::kAuthorFeeDefaultPct → u16 66);
     // --give-author overrides the AMOUNT only. Node-owner fee defaults 0 (off).
@@ -2952,6 +2963,7 @@ int main(int argc, char** argv)
         else if (std::strcmp(argv[i], "--node-owner-address") == 0 && i + 1 < argc) {
             node_owner_address = argv[++i];    // operator payout addr -> "fee" identity (#307 fee arm + -f/--fee destination)
         }
+        else if (std::strcmp(argv[i], "--v36-ratchet") == 0) v36_ratchet = true;
         else if ((std::strcmp(argv[i], "--node-owner-merged-address") == 0
                   || std::strcmp(argv[i], "--merged-operator-address") == 0) && i + 1 < argc) {
             node_owner_merged_address = argv[++i];   // the owner's DOGE address (P2SH split owner half, node-fee shares)
@@ -3093,6 +3105,8 @@ int main(int argc, char** argv)
         if (rc.file_set("money.node_owner_address")) node_owner_address = rc.get_string("money.node_owner_address").value_or(node_owner_address);
         if (rc.file_set("money.merged_operator_address"))
             node_owner_merged_address = rc.get_string("money.merged_operator_address").value_or(node_owner_merged_address);
+        if (rc.file_set("sharechain.v36_ratchet") && rc.get_string("sharechain.v36_ratchet").value_or("") == "true")
+            v36_ratchet = true;
         if (rc.file_set("money.give_author_pct"))    dev_donation       = rc.get_double("money.give_author_pct").value_or(dev_donation);
         if (rc.file_set("money.node_owner_fee_pct")) node_owner_fee     = rc.get_double("money.node_owner_fee_pct").value_or(node_owner_fee);
         // embedded.serve_mempool_txs (S1 fee-proof lane): a [dgb] settings-file
@@ -3131,7 +3145,8 @@ int main(int argc, char** argv)
                         serve_mempool_txs, serve_mempool_txs_off,
                         sharechain_addnodes,
                         coind_p2p_port,
-                        node_owner_merged_address);
+                        node_owner_merged_address,
+                        v36_ratchet);
 
     // --selftest, or a bare invocation: drive the live score path so the
     // binary exercises real consensus code, then exit cleanly.
