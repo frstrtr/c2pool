@@ -18,6 +18,7 @@
 #include "compact_blocks.hpp"
 #include "mempool.hpp"
 
+#include <map>
 #include <memory>
 
 #include <boost/asio.hpp>
@@ -90,6 +91,10 @@ private:
     std::chrono::steady_clock::time_point m_connected_at{std::chrono::steady_clock::now()};
     // BIP 35: request full mempool inventory after handshake
     bool m_request_mempool_on_connect{false};
+    // Unknown commands ignored, per command (at most kMaxUnknownCommands
+    // names; the rest counted under "other").
+    std::map<std::string, uint64_t> m_unknown_commands;
+    static constexpr std::size_t kMaxUnknownCommands = 64;
     // Compact block reconstruction state: pending compact block awaiting blocktxn
     std::unique_ptr<CompactBlock> m_pending_cmpct;
     std::vector<uint32_t> m_pending_missing_indexes;
@@ -250,9 +255,14 @@ public:
                       << rmsg->m_data.size() << " bytes): " << ec.what();
             // todo: error
             return;
-        } catch (const std::out_of_range& ec)
+        } catch (const std::out_of_range&)
         {
-            LOG_ERROR << "NodeP2P: " << ec.what();
+            // A command outside our handler set: newer DigiByte Core peers
+            // push their oracle traffic (oracleprice, oraclehb, getoracles,
+            // oramusnonce, ...) unsolicited. Ignored, as Core ignores an
+            // unknown command; counted, and logged once per command (it was
+            // an ERROR line per message: ~400 per 10 minutes on mainnet).
+            note_unknown_command(rmsg->m_command, rmsg->m_data.size());
             return;
         }
 
@@ -262,6 +272,19 @@ public:
     const std::vector<std::byte>& get_prefix() const override
     {
         return m_config->coin()->m_p2p.prefix;
+    }
+
+    /// Unknown commands ignored so far, per command name.
+    const std::map<std::string, uint64_t>& unknown_commands() const { return m_unknown_commands; }
+
+    void note_unknown_command(const std::string& command, std::size_t bytes)
+    {
+        const bool known_name = m_unknown_commands.count(command) != 0;
+        const std::string key =
+            known_name || m_unknown_commands.size() < kMaxUnknownCommands ? command : std::string("other");
+        if (++m_unknown_commands[key] == 1)
+            LOG_INFO << "[" << m_chain_label << "] ignoring unknown command '" << key << "' (" << bytes
+                     << " bytes; counted, logged once per command)";
     }
 
     void submit_block(BlockType& block)

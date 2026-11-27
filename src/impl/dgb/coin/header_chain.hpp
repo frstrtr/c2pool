@@ -92,6 +92,10 @@ struct HeaderSample {
     // 19-field positional brace-inits in the tests stay valid (each just omits
     // it, defaulting to 0). make_header_sample fills it from the wire header.
     uint32_t n_bits     = 0;
+    // The parent's block id (hashPrevBlock), little-endian as block_hash; 0 ==
+    // not populated. The ingest links on it (header_ingest.hpp): a header is
+    // appended only onto its parent. LAST field, for the positional inits.
+    u256     prev_hash  = 0;
 };
 
 // Outcome of validating + ingesting one header.
@@ -386,6 +390,54 @@ public:
     // fills it at the validate_and_append boundary, so until that lands this
     // returns nullopt and get_current_work_template holds previousblockhash
     // back -- a truthful absence, never a fabricated hash.
+    // The position (0 == oldest retained) of the header with block id `hash`
+    // in the retained window, searched from the tip back; none if not there.
+    std::optional<std::size_t> find_index(const u256& hash) const
+    {
+        if (hash.is_zero())
+            return std::nullopt;
+        for (std::size_t i = m_chain.size(); i-- > 0;)
+            if (m_chain[i].block_hash == hash)
+                return i;
+        return std::nullopt;
+    }
+
+    // Drops every header after position `index` (a reorg onto a fork from
+    // m_chain[index]): the header there becomes the tip. Heights stay
+    // positional (tip_height() == base + index). cumulative_work is the
+    // monotone proxy of credited work (see trim_to_window) and is not
+    // decremented.
+    void truncate_after(std::size_t index)
+    {
+        while (m_chain.size() > index + 1)
+            m_chain.pop_back();
+    }
+
+    // A getheaders block locator (DigiByte Core CChain::GetLocator shape):
+    // the tip, the 10 headers below it one by one, then steps doubling back
+    // to the oldest retained header. Only headers with a populated id. Empty
+    // for an empty chain. A peer finds the fork point from it, so a tip it
+    // does not have (a stale block) no longer makes it answer from genesis.
+    std::vector<u256> locator() const
+    {
+        std::vector<u256> out;
+        if (m_chain.empty())
+            return out;
+        // Core: push, step back by nStep, and double nStep once more than
+        // 10 are in.
+        std::size_t step = 1;
+        for (std::size_t i = m_chain.size() - 1;;) {
+            if (!m_chain[i].block_hash.is_zero())
+                out.push_back(m_chain[i].block_hash);
+            if (i == 0)
+                break;
+            i = i >= step ? i - step : 0;
+            if (out.size() > 10)
+                step *= 2;
+        }
+        return out;
+    }
+
     std::optional<u256> tip_hash() const
     {
         if (m_chain.empty() || m_chain.back().block_hash.is_zero())

@@ -1313,7 +1313,7 @@ int run_node(const core::CoinParams& params, bool testnet,
         // chain into validate_and_append. 3s mirrors main_btc.cpp's driver.
         coin_getheaders_timer.expires_after(std::chrono::seconds(3));
         coin_getheaders_timer.async_wait(
-            [&coin_p2p, coin_genesis]
+            [&coin_p2p, &header_chain, coin_genesis]
             (const boost::system::error_code& ec) {
                 if (ec) return;
                 if (!coin_p2p->is_handshake_complete()) {
@@ -1325,9 +1325,9 @@ int run_node(const core::CoinParams& params, bool testnet,
                 // Empty chain (fresh regtest) -> locator = [genesis]; one
                 // getheaders batch (<=2000) covers a short regtest chain. Walk-
                 // forward continuation for long chains is a follow-up slice.
-                std::vector<uint256> locator;
-                if (!coin_genesis.IsNull())
-                    locator.push_back(coin_genesis);
+                // The chain's locator (a restart with stored headers resumes
+                // from its tip), else [genesis].
+                const std::vector<uint256> locator = c2pool::dgb::getheaders_locator(header_chain, coin_genesis);
                 std::cout << "[DGB] coin-daemon handshake OK — sending initial "
                              "getheaders, locator="
                           << (locator.empty()
@@ -1473,17 +1473,12 @@ int run_node(const core::CoinParams& params, bool testnet,
                             // least significant) — the inverse of the
                             // from_le_bytes(uint256) the ingest builder used, so
                             // reversing the limbs reconstructs the wire uint256.
-                            std::vector<uint256> locator;
-                            if (auto tip = header_chain.tip_hash(); tip) {
-                                std::vector<unsigned char> b(32);
-                                for (int i = 0; i < 4; ++i)
-                                    for (int j = 0; j < 8; ++j)
-                                        b[i * 8 + j] = static_cast<unsigned char>(
-                                            (tip->limb[i] >> (8 * j)) & 0xffu);
-                                locator.emplace_back(b);
-                            } else {
-                                locator = genesis_locator;
-                            }
+                            // A full locator (the tip, 10 below, doubling steps,
+                            // genesis): a peer finds the fork point, so a tip it
+                            // does not have no longer makes it answer from
+                            // genesis (the dgb.voidbind wedge, 2026-11-27).
+                            const std::vector<uint256> locator = c2pool::dgb::getheaders_locator(
+                                header_chain, genesis_locator.empty() ? uint256() : genesis_locator.front());
                             std::cout << "[DGB] standalone header-sync getheaders "
                                          "locator="
                                       << (locator.empty()
