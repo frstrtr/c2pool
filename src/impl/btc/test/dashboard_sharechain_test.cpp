@@ -52,6 +52,7 @@ std::vector<uint256> build_v36_chain(btc::ShareTracker& tracker, int count) {
         s->m_max_bits        = kMaxBits;
         s->m_donation        = 655;
         s->m_desired_version = 36;
+        s->m_stale_info      = btc::StaleInfo::none;
         s->m_pubkey_type     = 0;
         s->m_pubkey_hash.SetNull();
         s->m_pubkey_hash.begin()[0] = static_cast<unsigned char>(0x20 + i);
@@ -83,6 +84,13 @@ uint256 add_v35_share(btc::ShareTracker& tracker, const uint256& prev, const std
     s->m_max_bits        = kMaxBits;
     s->m_desired_version = 36;
     s->m_stale_info      = btc::StaleInfo::orphan;
+    s->m_donation        = 0;
+    s->m_nonce           = 1;
+    s->m_last_txout_nonce = 0;
+    s->m_min_header.m_version   = 0x20000000;
+    s->m_min_header.m_bits      = kBits;
+    s->m_min_header.m_timestamp = 1790001000u;
+    s->m_min_header.m_nonce     = 2;
     const std::string addr = "1BoatSLRHtKNngkdXEeobR76b53LETtpyT";
     s->m_address.m_data.assign(addr.begin(), addr.end());
     s->m_timestamp = 1790001000u;

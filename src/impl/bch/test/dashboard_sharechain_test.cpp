@@ -55,6 +55,7 @@ std::vector<uint256> build_v36_chain(bch::ShareTracker& tracker, int count) {
         s->m_max_bits        = kBits;
         s->m_donation        = 655;
         s->m_desired_version = 36;
+        s->m_stale_info      = bch::StaleInfo::none;
         s->m_pubkey_type     = 0;
         s->m_pubkey_hash.SetNull();
         s->m_pubkey_hash.begin()[0] = static_cast<unsigned char>(0x30 + i);
@@ -66,6 +67,7 @@ std::vector<uint256> build_v36_chain(bch::ShareTracker& tracker, int count) {
         s->m_absheight  = 300 + i;
         s->m_nonce      = 7000u + i;
         s->m_subsidy    = kSubsidy;
+        s->m_last_txout_nonce = 0x1122334455667788ull;
         const std::string tag = "/c2pool-bch-test/";
         s->m_coinbase.m_data = {0x03, 0x01, 0x02, 0x03};
         s->m_coinbase.m_data.insert(s->m_coinbase.m_data.end(), tag.begin(), tag.end());
@@ -84,6 +86,13 @@ uint256 add_v35_share(bch::ShareTracker& tracker, const uint256& prev) {
     s->m_max_bits        = kBits;
     s->m_desired_version = 36;
     s->m_stale_info      = bch::StaleInfo::doa;
+    s->m_donation        = 0;
+    s->m_nonce           = 1;
+    s->m_last_txout_nonce = 0;
+    s->m_min_header.m_version   = 0x20000000;
+    s->m_min_header.m_bits      = kBits;
+    s->m_min_header.m_timestamp = 1790001000u;
+    s->m_min_header.m_nonce     = 2;
     const std::string addr = "1BoatSLRHtKNngkdXEeobR76b53LETtpyT";
     s->m_address.m_data.assign(addr.begin(), addr.end());
     s->m_timestamp = 1790001000u;
