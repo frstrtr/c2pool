@@ -1779,6 +1779,7 @@ int run_node(const core::CoinParams& params, bool testnet,
                 req.next_block_height = block.height;   // the job template's block
                 req.block_bits        = block.bits;
                 req.block_value       = block.value;
+                req.local_hash_rate   = block.local_hash_rate;
                 req.now               = static_cast<uint32_t>(std::time(nullptr));
                 req.donation          = donation_u16;
                 req.aux_mm_scriptsig  = aux_mm_scriptsig;
@@ -1961,6 +1962,15 @@ int run_node(const core::CoinParams& params, bool testnet,
             std::cout << "[DGB] stratum listening on " << stratum_addr << ":"
                       << stratum_port
                       << " (work source: DGBWorkSource — Scrypt-only)" << std::endl;
+            // A job's share target is sized by its login's local hash rate
+            // (the server's per-address pseudoshare rates, p2pool
+            // get_local_addr_rates): at most ~1.67% of the pool's shares.
+            work_source->set_local_rate_fn(
+                [srv = stratum_server.get()](const core::stratum::PayoutKey& key) -> double {
+                    const auto rates = srv->get_local_addr_rates();
+                    const auto it = rates.find(key);
+                    return it == rates.end() ? 0.0 : it->second;
+                });
         } else {
             std::cout << "[DGB] stratum FAILED to bind " << stratum_addr << ":"
                       << stratum_port << " — stratum disabled" << std::endl;
@@ -2793,6 +2803,7 @@ int run_node(const core::CoinParams& params, bool testnet,
     // declared first, so it would otherwise outlive them).
     if (found_block_report) *found_block_report = nullptr;  // #995: unbind before mi dies
     if (stop_job_push) stop_job_push();   // before the server it pushes to goes
+    if (work_source) work_source->set_local_rate_fn(nullptr);   // it reads the server's rates
     stratum_server.reset();
     web_server.reset();
 

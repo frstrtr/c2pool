@@ -182,6 +182,20 @@ public:
         const std::string& extranonce1_hex,
         const std::vector<unsigned char>& payout_script,
         const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs) const override;
+    // The same, for a connection's login key: the job's share target is
+    // sized by that login's local hash rate (set_local_rate_fn).
+    core::stratum::CoinbaseResult        build_connection_coinbase_for(
+        const core::stratum::PayoutKey& login_key,
+        const uint256& prev_share_hash,
+        const std::string& extranonce1_hex,
+        const std::vector<unsigned char>& payout_script,
+        const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs) const override;
+
+    /// The local hash rate (attempts/s) of a login key, from the stratum
+    /// server's per-address rates (main_dgb: get_local_addr_rates); unset or
+    /// unknown: 0.
+    using LocalRateFn = std::function<double(const core::stratum::PayoutKey&)>;
+    void set_local_rate_fn(LocalRateFn fn);
 
     // ── IWorkSource: share submission ────────────────────────────────────
     nlohmann::json mining_submit(
@@ -268,10 +282,13 @@ public:
     /// its height (the coinbase's BIP34 height), its bits (the share's header
     /// bits, so the PPLNS walk's block target, p2pool generate_transaction's
     /// block_target) and the value its coinbase may claim.
+    /// `local_hash_rate`: the login's local hash rate (attempts/s; 0 unknown),
+    /// which sizes the job's share target.
     struct JobBlock {
         uint32_t height = 0;
         uint32_t bits   = 0;
         uint64_t value  = 0;
+        double   local_hash_rate = 0.0;
     };
     using PplnsInputsFn = std::function<std::optional<dgb::coin::ConnCoinbasePplnsInputs>(
         const uint256& prev_share_hash,
@@ -457,6 +474,13 @@ private:
     // per-connection coinbase path returns an empty job (pre-wire behavior).
     mutable std::mutex          pplns_inputs_mutex_;
     PplnsInputsFn               pplns_inputs_fn_;
+    mutable std::mutex          local_rate_mutex_;
+    LocalRateFn                 local_rate_fn_;
+    core::stratum::CoinbaseResult build_coinbase(
+        const uint256& prev_share_hash, const std::string& extranonce1_hex,
+        const std::vector<unsigned char>& payout_script,
+        const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs,
+        double local_hash_rate) const;
 
     // Embedded DGB-as-DOGE-parent merged-mining manager (set_merged_mining_manager).
     // Non-owning; null unless a --merged DOGE spec armed the aux backend in

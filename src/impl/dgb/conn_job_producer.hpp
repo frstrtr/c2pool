@@ -22,7 +22,8 @@
 #include <impl/dgb/coin/coinbase_scriptsig.hpp>    // build_coinbase_scriptsig (BIP34 + tag, #902)
 #include <impl/dgb/coin/connection_coinbase.hpp>   // ConnCoinbasePplnsInputs
 #include <impl/dgb/coin/pplns_weight_walk.hpp>     // compute_pplns_weight_walk (PPLNS step-1 SSOT)
-#include <impl/dgb/coin/work_ref_hash.hpp>         // WorkRefHashInputs, make_work_ref_hash_params
+#include <impl/dgb/coin/work_ref_hash.hpp>
+#include <impl/dgb/config_pool.hpp>             // PoolConfig::share_period         // WorkRefHashInputs, make_work_ref_hash_params
 
 #include <core/coin_params.hpp>
 #include <core/target_utils.hpp>
@@ -31,8 +32,10 @@
 
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -45,6 +48,7 @@ struct ConnJobRequest {
     uint32_t next_block_height = 0;             // the job template's height (BIP34)
     uint32_t block_bits = 0;                    // the job template's bits (the share's header bits)
     uint64_t block_value = 0;                   // the value the job's coinbase claims
+    double local_hash_rate = 0.0;               // the login's local rate (attempts/s; 0 unknown)
     uint32_t now = 0;                           // wall clock (seconds)
     uint16_t donation = 0;                      // share donation (u16, --give-author)
     // The tagged DOGE merged-mining commitment ([0x2c][44 B], empty when merged
@@ -55,6 +59,41 @@ struct ConnJobRequest {
 /// {mint version, vote version} for the job, asked once (the AutoRatchet in
 /// production). Called at the point the lambda asked it before the lift.
 using ConnJobVersionsFn = std::function<std::pair<int64_t, uint64_t>()>;
+
+/// p2pool average_attempts_to_target: 2**256 / attempts - 1 (all ones at or
+/// below one attempt).
+inline uint256 average_attempts_to_target(double avg_attempts)
+{
+    uint256 all_ones;
+    all_ones.SetHex(std::string(64, 'f'));
+    if (!(avg_attempts > 1.0))
+        return all_ones;
+    constexpr double kTwo64 = 18446744073709551616.0;
+    const uint64_t avg = avg_attempts >= kTwo64 ? std::numeric_limits<uint64_t>::max()
+                                                : static_cast<uint64_t>(avg_attempts);
+    uint288 two_256;
+    two_256.SetHex("10000000000000000000000000000000000000000000000000000000000000000");
+    uint288 t = two_256 / uint288(avg);
+    if (t > uint288(1))
+        t = t - uint288(1);
+    uint256 out;
+    out.SetHex(t.GetHex());
+    return out;
+}
+
+/// The share target a job asks for (python work.py get_work, no "/N"):
+/// 2**256-1, capped at ~1.67% of the pool's shares for this login's rate.
+inline uint256 job_desired_share_target(double local_hash_rate, uint32_t share_period)
+{
+    uint256 desired;
+    desired.SetHex(std::string(64, 'f'));
+    if (local_hash_rate > 0.0) {
+        const uint256 cap = average_attempts_to_target(local_hash_rate * share_period / 0.0167);
+        if (cap < desired)
+            desired = cap;
+    }
+    return desired;
+}
 
 template <typename TrackerT>
 std::optional<coin::ConnCoinbasePplnsInputs> build_conn_job_inputs(
@@ -110,7 +149,16 @@ std::optional<coin::ConnCoinbasePplnsInputs> build_conn_job_inputs(
         timestamp = prev_ts + 1;
 
     // share target AFTER timestamp clip (== create_local_share order).
-    const auto desired_target = chain::bits_to_target(block_bits);
+    // The share target the job asks for, as the python network's work.py
+    // get_work: 2**256-1, capped so one address makes at most ~1.67% of the
+    // pool's shares (average_attempts_to_target(rate * SHARE_PERIOD /
+    // 0.0167)). Its dust cap is effectively off there (the local rate is
+    // scaled by DUMB_SCRYPT_DIFF = 2**16 before the dust comparison), so none
+    // here. compute_share_target clips it to [pre_target3//30, pre_target3].
+    // Before, the BLOCK target was asked for, which clips to pre_target3//30
+    // whenever the block is more than 30x harder than the pool target: every
+    // share 30x heavier than python's. Node-local: a share carries its bits.
+    const auto desired_target = job_desired_share_target(req.local_hash_rate, PoolConfig::share_period());
     const auto st = tracker.compute_share_target(prev_share_hash, timestamp, desired_target, mint_version);
     const uint32_t max_bits = st.max_bits;
     const uint32_t bits     = st.bits;

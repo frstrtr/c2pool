@@ -163,6 +163,7 @@ struct RtRig {
             req.next_block_height = block.height;   // main_dgb's producer
             req.block_bits = block.bits;
             req.block_value = block.value;
+            req.local_hash_rate = block.local_hash_rate;
             last_block = block;
             req.now = now ? now : chain.tip_ts + 15;
             req.donation = 66;
@@ -244,9 +245,10 @@ TEST(DgbMintRoundTrip, JobClassifiesWithTheTrackerShareTarget)
     ASSERT_FALSE(cbr.coinb1.empty());
     ASSERT_TRUE(rig.last_inputs.has_value());
     // The job freezes the producer's share bits, which are the tracker's
-    // share target for the next share at the job's timestamp.
+    // share target for the next share at the job's timestamp (no local rate:
+    // the job asks for 2**256-1, clipped to the pool target).
     const auto st = rig.chain.tracker.compute_share_target(
-        rig.chain.tip, rig.last_inputs->frozen_timestamp, chain::bits_to_target(0x1b0404cb), rig.mint_version);
+        rig.chain.tip, rig.last_inputs->frozen_timestamp, dgb::job_desired_share_target(0.0, 15), rig.mint_version);
     EXPECT_EQ(cbr.snapshot.frozen_ref.bits, st.bits);
     EXPECT_EQ(cbr.snapshot.frozen_ref.max_bits, st.max_bits);
     EXPECT_NE(cbr.snapshot.frozen_ref.bits, 0u) << "a job without frozen bits classifies at diff-1";
@@ -543,6 +545,7 @@ TEST(DgbMintRoundTrip, CommitmentAppendedAfterTheRefIsNotCredited)
         req.next_block_height = block.height;   // the job template's block
         req.block_bits = block.bits;
         req.block_value = block.value;
+        req.local_hash_rate = block.local_hash_rate;
         req.now = rig.chain.tip_ts + 15;
         req.donation = 66;
         auto in = dgb::build_conn_job_inputs(rig.chain.tracker, rig.params, req, []() {
@@ -829,4 +832,54 @@ TEST(DgbMintRoundTrip, WonV35BlockPassesTheWitnessCommitmentCheck)
     };
     EXPECT_EQ(recompute(reserved), commitment) << "the witness commitment does not verify";
     EXPECT_NE(recompute(Bytes(32, 0x00)), commitment) << "the check cannot tell the reserved values apart";
+}
+
+// VARDIFF item 1 (C2POOL, vs kr1z1s p2pool-dgb-scrypt work.py get_work): a
+// job asks for the share target 2**256-1, capped so one address makes at most
+// ~1.67% of the pool's shares (its local rate * SHARE_PERIOD / 0.0167
+// attempts); compute_share_target clips it to [pool/30, pool]. Before, the
+// job asked for the BLOCK target: pool/30 whenever the block was more than 30x
+// harder, every share 30x heavier than python's. The rate is the login key's
+// (build_connection_coinbase_for), not the job payout's.
+TEST(DgbMintRoundTrip, ShareTargetIsThePoolTargetCappedPerAddress)
+{
+    RtRig rig;
+    rig.tip_bits = "1a00ffff";   // a hard block: the old desired clipped to pool/30
+    auto plain = rig.ws->build_connection_coinbase(rig.chain.tip, "cafef00d", stratum_payout(miner_login()), {});
+    ASSERT_FALSE(plain.held);
+    EXPECT_EQ(rig.last_block.local_hash_rate, 0.0);
+    const uint32_t ts = rig.last_inputs->frozen_timestamp;
+    const auto pool = rig.chain.tracker.compute_share_target(rig.chain.tip, ts, dgb::job_desired_share_target(0.0, 15), 36);
+    EXPECT_EQ(plain.snapshot.frozen_ref.bits, plain.snapshot.frozen_ref.max_bits)
+        << "with no local rate the share target is the pool target";
+    EXPECT_EQ(plain.snapshot.frozen_ref.bits, pool.bits);
+    const auto old = rig.chain.tracker.compute_share_target(rig.chain.tip, ts, chain::bits_to_target(0x1a00ffff), 36);
+    EXPECT_NE(plain.snapshot.frozen_ref.bits, old.bits) << "still the block-target (pool/30) share";
+
+    // A login with a local rate: the 1.67% cap, inside [pool/30, pool].
+    core::stratum::PayoutKey key{};
+    key.fill(0xa1);
+    const double rate = 4670.0;   // attempts/s: cap ~ 2**256 / (rate*15/0.0167) ~ pool/4
+    rig.ws->set_local_rate_fn([key, rate](const core::stratum::PayoutKey& k) { return k == key ? rate : 0.0; });
+    auto capped = rig.ws->build_connection_coinbase_for(key, rig.chain.tip, "cafef00d", stratum_payout(miner_login()), {});
+    ASSERT_FALSE(capped.held);
+    EXPECT_EQ(rig.last_block.local_hash_rate, rate) << "the login's rate did not reach the producer";
+    const uint256 cap = dgb::average_attempts_to_target(rate * 15 / 0.0167);
+    const auto want = rig.chain.tracker.compute_share_target(rig.chain.tip, rig.last_inputs->frozen_timestamp, cap, 36);
+    EXPECT_EQ(capped.snapshot.frozen_ref.bits, want.bits);
+    EXPECT_NE(capped.snapshot.frozen_ref.bits, plain.snapshot.frozen_ref.bits) << "the cap did not apply";
+    EXPECT_EQ(capped.snapshot.frozen_ref.max_bits, plain.snapshot.frozen_ref.max_bits);
+
+    // Another login (no rate) keeps the pool target.
+    core::stratum::PayoutKey other{};
+    other.fill(0x07);
+    auto other_job = rig.ws->build_connection_coinbase_for(other, rig.chain.tip, "cafef00d", stratum_payout(miner_login()), {});
+    EXPECT_EQ(other_job.snapshot.frozen_ref.bits, plain.snapshot.frozen_ref.bits);
+
+    // A huge rate: clipped at pool/30, never harder.
+    rig.ws->set_local_rate_fn([](const core::stratum::PayoutKey&) { return 1e15; });
+    auto huge = rig.ws->build_connection_coinbase_for(key, rig.chain.tip, "cafef00d", stratum_payout(miner_login()), {});
+    const auto floor30 = rig.chain.tracker.compute_share_target(rig.chain.tip, rig.last_inputs->frozen_timestamp,
+                                                                uint256(), 36);
+    EXPECT_EQ(huge.snapshot.frozen_ref.bits, floor30.bits);
 }

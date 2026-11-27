@@ -575,6 +575,38 @@ core::stratum::CoinbaseResult DGBWorkSource::build_connection_coinbase(
     const std::vector<unsigned char>& payout_script,
     const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs) const
 {
+    return build_coinbase(prev_share_hash, extranonce1_hex, payout_script, merged_addrs, /*local_hash_rate=*/0.0);
+}
+
+core::stratum::CoinbaseResult DGBWorkSource::build_connection_coinbase_for(
+    const core::stratum::PayoutKey& login_key,
+    const uint256& prev_share_hash,
+    const std::string& extranonce1_hex,
+    const std::vector<unsigned char>& payout_script,
+    const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs) const
+{
+    LocalRateFn fn;
+    {
+        std::lock_guard<std::mutex> lk(local_rate_mutex_);
+        fn = local_rate_fn_;
+    }
+    const double rate = fn ? fn(login_key) : 0.0;
+    return build_coinbase(prev_share_hash, extranonce1_hex, payout_script, merged_addrs, rate);
+}
+
+void DGBWorkSource::set_local_rate_fn(LocalRateFn fn)
+{
+    std::lock_guard<std::mutex> lk(local_rate_mutex_);
+    local_rate_fn_ = std::move(fn);
+}
+
+core::stratum::CoinbaseResult DGBWorkSource::build_coinbase(
+    const uint256& prev_share_hash,
+    const std::string& extranonce1_hex,
+    const std::vector<unsigned char>& payout_script,
+    const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs,
+    double local_hash_rate) const
+{
     // Phase B live-wire: delegate to the PPLNS->coinbase SSOT
     // (build_connection_coinbase_from_pplns), which itself routes through the
     // single compute_pplns_payout_split() the verifier uses -- so the coinbase a
@@ -712,6 +744,7 @@ core::stratum::CoinbaseResult DGBWorkSource::build_connection_coinbase(
     if (block.bits == 0)
         return held();
     block.value = coinbase_value(block.height, /*total_fees=*/0, /*gbt_coinbasevalue=*/std::nullopt);
+    block.local_hash_rate = local_hash_rate;
 
     std::optional<dgb::coin::ConnCoinbasePplnsInputs> inputs =
         fn(prev_share_hash, extranonce1_hex, eff_payout_script, eff_merged_addrs, aux_mm_scriptsig, block);

@@ -45,6 +45,14 @@ TEST(DgbMainWiring, LiveSeamsAreBound)
     EXPECT_NE(at("work_source->set_owner_merged_scripts("), std::string::npos);
     EXPECT_NE(at("work_source->set_pplns_inputs_fn("), std::string::npos);
     EXPECT_NE(at("work_source->set_mint_share_fn("), std::string::npos);
+    // The share target is sized by the login's local rate (the server's
+    // per-address rates), unbound before the server goes.
+    const auto rate = at("work_source->set_local_rate_fn(");
+    ASSERT_NE(rate, std::string::npos) << "the share target ignores the login's rate";
+    EXPECT_NE(s.find("srv->get_local_addr_rates()", rate), std::string::npos);
+    const auto unbind = at("if (work_source) work_source->set_local_rate_fn(nullptr);");
+    ASSERT_NE(unbind, std::string::npos);
+    EXPECT_LT(unbind, s.find("    stratum_server.reset();", unbind));
 
     const auto doge = at("dgb::coin::wire_doge_merged_payouts(mm_manager.get(), p2p_node, work_source.get(), doge_p2sh_split,");
     const auto best = at("dgb::wire_best_share(p2p_node, stratum_best_share, work_source.get(), ioc,");

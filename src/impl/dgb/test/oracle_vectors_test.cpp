@@ -121,6 +121,7 @@ struct OracleRig {
             req.next_block_height = block.height;
             req.block_bits = block.bits;
             req.block_value = block.value;
+            req.local_hash_rate = block.local_hash_rate;
             req.now = now;
             req.donation = 66;
             req.aux_mm_scriptsig = aux;
