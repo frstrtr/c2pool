@@ -95,9 +95,11 @@ public:
                                    std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& /*merged*/) const {}
 
     // A payout address the coin accepts but whose shares the node cannot
-    // build (e.g. BCH v35 shares carry only a legacy P2PKH/P2SH address):
-    // non-empty = the reason mining.authorize is refused, so the miner is
-    // told instead of hashing for shares that are never minted. Default: none.
+    // build (e.g. BCH v35 shares carry only a legacy P2PKH/P2SH address), or
+    // an empty login (`username` empty) on a work source that does not
+    // redistribute one (DGB): non-empty = the reason mining.authorize is
+    // refused, so the miner is told instead of hashing for shares that are
+    // never minted. Default: none.
     virtual std::string authorize_refusal(const std::string& /*username*/) const { return {}; }
 
     // ── Per-connection bookkeeping ───────────────────────────────────────

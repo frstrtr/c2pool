@@ -1388,10 +1388,14 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
             }
         }
 
-        if (!username_.empty()) {
+        // Asked for an empty login too: a work source that cannot build shares
+        // for one (DGB) tells the miner why. The default and BCH have no
+        // reason for an empty login, so every other lane is unchanged.
+        if (mining_interface_) {
             const std::string why = mining_interface_->authorize_refusal(username_);
             if (!why.empty()) {
-                LOG_WARNING << "[Stratum] REJECTED mining.authorize: " << username_ << ": " << why;
+                LOG_WARNING << "[Stratum] REJECTED mining.authorize: "
+                            << (username_.empty() ? std::string("(empty login)") : username_) << ": " << why;
                 authorized_ = false;
                 nlohmann::json response;
                 response["id"] = request_id;
