@@ -124,16 +124,10 @@ struct LoginResolution {
     std::vector<uint32_t> from_login;            // chains the comma form / swap / case 5 named
     // The primary is the parent coin's address, or a configured merged
     // chain's (case 5: the parent payout uses its hash160). False (empty,
-    // invalid, another coin's): the parent payout is redistributed, or comes
-    // from case 4 (parent_script).
+    // invalid, another coin's): the parent payout comes from case 4
+    // (case4_parent, from a merged address the login named), else it is
+    // redistributed.
     bool usable_primary{false};
-    // Case 4 (p2pool work.py): an unusable primary with a valid DOGE address
-    // as the second one: the parent payout is that address's hash160 (P2SH
-    // stays P2SH). Also a parent address a share cannot carry (P2WSH / P2TR:
-    // a 32-byte witness program) with a DOGE address given for it (the comma
-    // or slash form, mining.set_merged_addresses): the miner is paid on both
-    // chains, with the node's donation.
-    std::vector<unsigned char> parent_script;
     // A P2SH primary's key was auto-derived for some configured chain (paid
     // as P2SH; unsafe if segwit-wrapped): shown with the worker.
     bool p2sh_derived{false};
@@ -158,9 +152,9 @@ struct LoginResolution {
 /// pre-change fallback (its hash160 goes to that chain).
 ///
 /// An unusable primary (empty, invalid, another coin's) gets no auto-derived
-/// address: its shares are redistributed by the work source, merged chains
-/// included, as p2pool does (its "Case 3"); with a valid DOGE address as the
-/// second address the parent payout is that address's key (p2pool's "Case 4").
+/// address: its parent payout is case 4's (case4_parent: a merged address the
+/// login named), else its shares are redistributed by the work source, merged
+/// chains included, as p2pool does (its "Case 3").
 inline LoginResolution resolve_merged_login(std::string primary, const std::string& merged_raw,
                                             std::map<uint32_t, std::string> explicit_addrs,
                                             const std::vector<ChainAddrInfo>& table,
@@ -314,44 +308,63 @@ inline LoginResolution resolve_merged_login(std::string primary, const std::stri
                                      "output becomes spendable by anyone once the redeem script is public");
             }
         }
-        // Case 4 for a parent address a share cannot carry (P2WSH / P2TR:
-        // a share's payout is a 20-byte hash) with a DOGE address given for
-        // it (no address is auto-derived from such a primary, so any DOGE
-        // entry is the miner's own): the parent payout is the DOGE address's
-        // key, P2PKH or P2SH, as for an unusable primary.
-        const auto spk = core::address_to_script(primary);
-        const bool carried = (spk.size() == 25 && spk[0] == 0x76) || (spk.size() == 23 && spk[0] == 0xa9)
-                             || (spk.size() == 22 && spk[0] == 0x00 && spk[1] == 0x14);
-        const auto* doge = find_chain(table, kDogeChainId);
-        const auto it = r.addresses.find(kDogeChainId);
-        if (!carried && is_parent(primary) && doge && configured(kDogeChainId) && it != r.addresses.end()) {
-            std::vector<unsigned char> script;
-            if (core::classify_address_for_coin(it->second, doge->p2pkh, doge->p2sh, doge->own_hrps, script)
-                    == core::AddressCoinMatch::Own
-                && (script.size() == 25 || script.size() == 23)) {
-                r.parent_script = script;   // P2PKH or P2SH of the DOGE address's hash160
-                r.notes.push_back("Case 4: primary " + primary + " cannot be carried by a share (a 32-byte witness"
-                                  " program); the parent payout uses the DOGE address " + it->second + "'s key");
-            }
-        }
-    } else if (!primary.empty()) {
-        // Case 4: a valid DOGE address of this network as the second address.
-        const auto* doge = find_chain(table, 98);
-        const auto it = r.addresses.find(98);
-        if (doge && it != r.addresses.end() && std::find(r.from_login.begin(), r.from_login.end(), 98u)
-                                                   != r.from_login.end()) {
-            std::vector<unsigned char> script;
-            if (core::classify_address_for_coin(it->second, doge->p2pkh, doge->p2sh, doge->own_hrps, script)
-                    == core::AddressCoinMatch::Own
-                && (script.size() == 25 || script.size() == 23)) {
-                r.parent_script = script;   // P2PKH or P2SH of the DOGE address's hash160
-                r.notes.push_back("Case 4: primary " + primary + " is not a usable address; the parent payout uses"
-                                  " the DOGE address " + it->second + "'s key");
-            }
-        }
     }
     r.primary = std::move(primary);
     return r;
+}
+
+/// A parent payout script a share carries: P2PKH, P2SH or P2WPKH (a share's
+/// payout is a 20-byte hash with its type; P2WSH / P2TR and the rest are not).
+inline bool share_carries(const std::vector<unsigned char>& spk)
+{
+    return (spk.size() == 25 && spk[0] == 0x76 && spk[1] == 0xa9 && spk[2] == 0x14 && spk[23] == 0x88
+            && spk[24] == 0xac)
+           || (spk.size() == 23 && spk[0] == 0xa9 && spk[1] == 0x14 && spk[22] == 0x87)
+           || (spk.size() == 22 && spk[0] == 0x00 && spk[1] == 0x14);
+}
+
+/// Case 4 (p2pool work.py, extended 2026-11-27: attributable work is never
+/// halved): the parent payout of a login whose own address pays no share --
+/// unusable (empty, invalid, another coin's) or one a share cannot carry
+/// (P2WSH / P2TR) -- from a merged address the login named itself (`named`:
+/// the comma or slash form, a swapped pair, a re-authorize of the same
+/// primary, mining.set_merged_addresses after its authorize; never one
+/// carried over from another login): DOGE's if named, else the lowest
+/// configured chain id named; that address's own hash160 in its legacy form
+/// (P2PKH stays P2PKH, P2SH stays P2SH), paid with the node's donation, the
+/// named entries kept. None (no usable address named on any chain): empty
+/// script, the work source redistributes the payout (--redistribute split).
+struct Case4Parent {
+    std::vector<unsigned char> script;   // the parent payout script; empty: none
+    uint32_t chain_id{0};
+    std::string address;
+};
+
+inline Case4Parent case4_parent(const std::map<uint32_t, std::string>& named,
+                                const std::vector<ChainAddrInfo>& table,
+                                const std::function<bool(uint32_t)>& configured)
+{
+    std::vector<uint32_t> order;
+    if (named.count(kDogeChainId))
+        order.push_back(kDogeChainId);
+    for (const auto& [id, addr] : named)   // ascending chain id
+        if (id != kDogeChainId)
+            order.push_back(id);
+    for (const uint32_t id : order) {
+        const auto* chain = find_chain(table, id);
+        if (!chain || !configured(id))
+            continue;
+        std::vector<unsigned char> script;
+        if (core::classify_address_for_coin(named.at(id), chain->p2pkh, chain->p2sh, chain->own_hrps, script)
+                != core::AddressCoinMatch::Own)
+            continue;
+        const bool legacy = (script.size() == 25 && script[0] == 0x76 && script[1] == 0xa9 && script[2] == 0x14
+                             && script[23] == 0x88 && script[24] == 0xac)
+                            || (script.size() == 23 && script[0] == 0xa9 && script[1] == 0x14 && script[22] == 0x87);
+        if (legacy)
+            return {std::move(script), id, named.at(id)};
+    }
+    return {};
 }
 
 } // namespace merged_addr

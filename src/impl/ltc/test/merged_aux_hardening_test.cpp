@@ -2160,10 +2160,12 @@ TEST(MergedAuxStratumLogin, TestnetSwappedLoginDoesNotCrossPay)
 }
 
 // An empty, invalid or other-coin primary is not usable: no merged address is
-// derived from it (p2pool never converts such a key), its shares are
-// redistributed by the work source; with a valid DOGE address of the node's
-// network as the comma second address, the parent payout is that address's
-// key (p2pool's case 4).
+// derived from it (p2pool never converts such a key). With a valid merged
+// address the login named (comma or slash form), the parent payout is that
+// address's key (p2pool's case 4, extended 2026-11-27: DOGE's, else the
+// lowest configured chain's; core::merged_addr::case4_parent over the
+// addresses the login named, which for an unusable primary are all of
+// r.addresses); with none its shares are redistributed by the work source.
 TEST(MergedAuxStratumLogin, UnusablePrimaryIsRedistributedOrCase4)
 {
     using namespace core::merged_addr;
@@ -2178,22 +2180,30 @@ TEST(MergedAuxStratumLogin, UnusablePrimaryIsRedistributedOrCase4)
         const auto r = login(u, "", {}, {98});
         EXPECT_FALSE(r.usable_primary) << "'" << u << "'";
         EXPECT_TRUE(r.addresses.empty()) << "'" << u << "'";
-        EXPECT_TRUE(r.parent_script.empty());
+        EXPECT_TRUE(case4_parent(r.addresses, table, [](uint32_t id) { return id == 98; }).script.empty());
     }
+    const auto c4 = [&](const LoginResolution& r, std::set<uint32_t> conf) {
+        return case4_parent(r.addresses, table, [conf](uint32_t id) { return conf.count(id) > 0; });
+    };
     // case 4: invalid primary, valid DOGE second (P2PKH and P2SH)
     auto r = login("notanaddress", b58(30, 0x21), {}, {98});
     EXPECT_FALSE(r.usable_primary);
-    EXPECT_EQ(r.parent_script, core::address_to_script(b58(30, 0x21)));
+    EXPECT_EQ(c4(r, {98}).script, core::address_to_script(b58(30, 0x21)));
+    EXPECT_EQ(c4(r, {98}).chain_id, 98u);
     EXPECT_EQ(r.addresses.at(98), b58(30, 0x21));
     r = login(b58(0, 0x61), b58(22, 0x22), {}, {98});
-    ASSERT_EQ(r.parent_script.size(), 23u) << "a DOGE P2SH gives an LTC P2SH";
-    // not case 4: a DOGE address of another network, the slash form, a PEP address
-    EXPECT_TRUE(login("notanaddress", b58(113, 0x21), {}, {98}).parent_script.empty());
-    EXPECT_TRUE(login("notanaddress", "", {{98, b58(30, 0x21)}}, {98}).parent_script.empty());
+    ASSERT_EQ(c4(r, {98}).script.size(), 23u) << "a DOGE P2SH gives an LTC P2SH";
+    // case 4 in the slash form too (garbage/98:D...)
+    r = login("notanaddress", "", {{98, b58(30, 0x21)}}, {98});
+    EXPECT_EQ(c4(r, {98}).script, core::address_to_script(b58(30, 0x21)));
+    // a PEP address alone: case 4 on the PEP key
     r = login("notanaddress", b58(56, 0x31), {}, {98, 63});
-    EXPECT_TRUE(r.parent_script.empty());
     EXPECT_EQ(r.addresses.at(63), b58(56, 0x31));
     EXPECT_FALSE(r.addresses.count(98)) << "no DOGE address derived from an unusable primary";
+    EXPECT_EQ(c4(r, {98, 63}).script, core::address_to_script(b58(56, 0x31)));
+    EXPECT_EQ(c4(r, {98, 63}).chain_id, 63u);
+    // not case 4: a DOGE address of another network
+    EXPECT_TRUE(c4(login("notanaddress", b58(113, 0x21), {}, {98}), {98}).script.empty());
     // a first address that is not an address before a valid LTC address: the
     // LTC address is the primary (as the pre-change server paid it)
     r = login(b58(30, 0x25).substr(1), b58(48, 0x01), {}, {98});
@@ -3087,54 +3097,49 @@ TEST(MergedAuxStratumSession, AJobBuiltBeforeTheLoginKeepsItsSplitThroughTheAuth
     EXPECT_FALSE(rig.ws->submit_donations[1].has_value());
 }
 
-// A P2SH primary: its merged chains are paid to the same P2SH script (as
-// before) and the login is warned to give its DOGE address if the P2SH is
-// segwit-wrapped (on DOGE such an output is anyone-can-spend once the redeem
-// script is public); a mistyped first address before a valid parent address
-// pays the parent address (as before); a merged chain's bech32 address as the
-// whole login warns.
-// p2pool's case 4 extended (operator decision 2026-11-27): an LTC address a
-// share cannot carry (P2WSH / P2TR: a 32-byte witness program) with a DOGE
-// address given for it (comma or slash form, mining.set_merged_addresses) has
-// its parent payout paid to that DOGE address's key (P2PKH stays P2PKH, P2SH
-// stays P2SH), and the DOGE address is kept as given: the miner is paid on
-// both chains, with the node's donation. Without a DOGE address nothing is
-// derived (the work source redistributes it).
-TEST(MergedAuxStratumLogin, AnUncarriedPrimaryWithADogeAddressPaysTheDogeKey)
+// p2pool's case 4 extended (2026-11-27: attributable work is never halved):
+// a login whose own address pays no share -- invalid / empty / another
+// coin's, or one a share cannot carry (P2WSH / P2TR: a 32-byte witness
+// program) -- with a merged address it named (comma or slash form,
+// mining.set_merged_addresses after its authorize) has its parent payout
+// paid to that address's own hash160 in its legacy form (P2PKH stays P2PKH,
+// P2SH stays P2SH): DOGE's if named, else the lowest configured chain's;
+// the named entries are kept. Nothing usable named: no parent script (the
+// work source redistributes it).
+TEST(MergedAuxStratumLogin, AnUncarriedPrimaryWithAMergedAddressPaysItsKey)
 {
     using namespace core::merged_addr;
     const auto table = merged_chain_table(false, kLtcAllNetworks);
-    const auto login = [&](const std::string& p, const std::string& m, std::map<uint32_t, std::string> e) {
-        return resolve_merged_login(p, m, std::move(e), table, [](uint32_t id) { return id == 98; },
-                                    ltc_versions(false), kLtcHrps);
-    };
+    const auto doge_and_pep = [](uint32_t id) { return id == 98 || id == 63; };
     const std::string p2wsh = bech32::encode_segwit("ltc", 0, std::vector<unsigned char>(32, 0x43));
     const std::string p2tr = bech32::encode_segwit("ltc", 1, std::vector<unsigned char>(32, 0x44));
-    ASSERT_EQ(core::address_to_script(p2wsh).size(), 34u);
-    ASSERT_EQ(core::address_to_script(p2tr).size(), 34u);
-    ASSERT_EQ(core::address_to_script(p2tr)[0], 0x51);
+    EXPECT_FALSE(share_carries(core::address_to_script(p2wsh)));
+    EXPECT_FALSE(share_carries(core::address_to_script(p2tr)));
+    EXPECT_TRUE(share_carries(core::address_to_script(b58(48, 0x01))));
+    EXPECT_TRUE(share_carries(core::address_to_script(b58(50, 0x02))));
+    EXPECT_TRUE(share_carries(core::address_to_script(bech32::encode_segwit("ltc", 0, std::vector<unsigned char>(20, 0x42)))));
+    // the resolution keeps the address the login gave for such a primary
     for (const auto& primary : {p2wsh, p2tr}) {
-        for (const std::string& doge : {b58(30, 0x21), b58(22, 0x23)}) {   // DOGE P2PKH, DOGE P2SH
-            const auto doge_script = core::address_to_script(doge);
-            ASSERT_TRUE(doge_script.size() == 25 || doge_script.size() == 23);
-            for (const auto& r : {login(primary, doge, {}), login(primary, "", {{98, doge}})}) {
-                EXPECT_TRUE(r.usable_primary) << primary;
-                EXPECT_EQ(r.primary, primary);
-                EXPECT_EQ(r.parent_script, doge_script) << primary << " + " << doge
-                    << ": the parent payout is the DOGE address's key, in its own type";
-                ASSERT_TRUE(r.addresses.count(98));
-                EXPECT_EQ(r.addresses.at(98), doge) << "the DOGE entry is unchanged";
-            }
-        }
-        // no DOGE address: nothing derived, no parent script
-        const auto r = login(primary, "", {});
-        EXPECT_TRUE(r.parent_script.empty()) << primary;
-        EXPECT_FALSE(r.addresses.count(98));
+        const auto r = resolve_merged_login(primary, b58(30, 0x21), {}, table, doge_and_pep, ltc_versions(false), kLtcHrps);
+        EXPECT_TRUE(r.usable_primary);
+        EXPECT_EQ(r.addresses.at(98), b58(30, 0x21)) << "the DOGE entry is unchanged";
+        EXPECT_FALSE(r.addresses.count(63)) << "nothing is derived from a 32-byte witness program";
     }
-    // a carried primary keeps its own payout (no parent script), as before
-    EXPECT_TRUE(login(b58(48, 0x01), b58(30, 0x21), {}).parent_script.empty());
-    EXPECT_TRUE(login(bech32::encode_segwit("ltc", 0, std::vector<unsigned char>(20, 0x42)), b58(30, 0x21), {})
-                    .parent_script.empty());
+    // DOGE first (P2PKH, P2SH), its own form
+    for (const std::string& doge : {b58(30, 0x21), b58(22, 0x23)}) {
+        const auto c = case4_parent({{98, doge}, {63, b58(56, 0x31)}}, table, doge_and_pep);
+        EXPECT_EQ(c.script, core::address_to_script(doge));
+        EXPECT_EQ(c.chain_id, 98u);
+        EXPECT_EQ(c.address, doge);
+    }
+    // PEP only: the PEP key
+    auto c = case4_parent({{63, b58(56, 0x31)}}, table, doge_and_pep);
+    EXPECT_EQ(c.script, core::address_to_script(b58(56, 0x31)));
+    EXPECT_EQ(c.chain_id, 63u);
+    // a chain that is not configured does not count
+    EXPECT_TRUE(case4_parent({{63, b58(56, 0x31)}}, table, [](uint32_t id) { return id == 98; }).script.empty());
+    // nothing named: none
+    EXPECT_TRUE(case4_parent({}, table, doge_and_pep).script.empty());
 }
 
 // The same at the stratum session: a P2WSH / P2TR login with a DOGE address
@@ -3176,6 +3181,93 @@ TEST(MergedAuxStratumSession, AnUncarriedPrimaryWithADogeAddressIsPaidOnBothChai
     }
 }
 
+// Case 4 at the session, in every form the login can name its address in,
+// and never from another login's: (1) authorize(P2WSH) then
+// mining.set_merged_addresses{98:DOGE}: the next job (sent at once) is case
+// 4, the parent on the DOGE key with the node's donation; (2) an invalid
+// primary in the slash form (garbage/98:DOGE): case 4; (3) a P2WSH primary
+// naming only a PEP address: case 4 on the PEP key; (4) worker A's
+// mining.set_merged_addresses, then a re-authorize as worker B (P2WSH):
+// B's parent is not paid to A's key (the split), whatever A's address still
+// pays on DOGE.
+TEST(MergedAuxStratumSession, Case4ComesOnlyFromAnAddressTheLoginNamed)
+{
+    using namespace std::chrono_literals;
+    const auto owner = core::address_to_script(b58(48, 0x0a));
+    const std::string p2wsh = bech32::encode_segwit("ltc", 0, std::vector<unsigned char>(32, 0x43));
+    const std::string doge = b58(30, 0x21), pep = b58(56, 0x31);
+    const auto doge_script = core::address_to_script(doge);
+    // (1) authorize, then set_merged_addresses
+    {
+        SessionRig rig({98}, /*redistribute=*/true);
+        rig.ws->split_owner = owner;
+        LineClient c(rig.port);
+        ASSERT_GE(c.fd, 0);
+        rig.step(c, 1, "mining.subscribe", nlohmann::json::array());
+        ASSERT_TRUE(rig.step(c, 2, "mining.authorize", {p2wsh, "x"}));
+        {
+            std::lock_guard<std::mutex> l(rig.ws->mu);
+            EXPECT_EQ(rig.ws->payouts.back(), owner) << "no merged address yet: the split";
+        }
+        const size_t n = rig.ws->count();
+        rig.step(c, 3, "mining.set_merged_addresses", {{{"98", doge}}});
+        ASSERT_GT(rig.ws->count(), n) << "the payout changed: new work at once";
+        std::lock_guard<std::mutex> l(rig.ws->mu);
+        EXPECT_EQ(rig.ws->payouts.back(), doge_script) << "case 4 after the authorize";
+        EXPECT_FALSE(rig.ws->build_donations.back().has_value()) << "the node's donation, not 32768";
+        EXPECT_EQ(rig.ws->builds.back().at(98), doge_script);
+    }
+    // (2) an invalid primary, slash form
+    {
+        SessionRig rig({98}, /*redistribute=*/true);
+        rig.ws->split_owner = owner;
+        LineClient c(rig.port);
+        ASSERT_GE(c.fd, 0);
+        rig.step(c, 1, "mining.subscribe", nlohmann::json::array());
+        ASSERT_TRUE(rig.step(c, 2, "mining.authorize", {b58(48, 0x06).substr(1) + "/98:" + doge, "x"}));
+        std::lock_guard<std::mutex> l(rig.ws->mu);
+        EXPECT_EQ(rig.ws->payouts.back(), doge_script) << "garbage/98:DOGE: case 4";
+        EXPECT_FALSE(rig.ws->build_donations.back().has_value());
+        EXPECT_EQ(rig.ws->builds.back().at(98), doge_script);
+    }
+    // (3) a P2WSH primary naming only PEP
+    {
+        SessionRig rig({98, 63}, /*redistribute=*/true);
+        rig.ws->split_owner = owner;
+        LineClient c(rig.port);
+        ASSERT_GE(c.fd, 0);
+        rig.step(c, 1, "mining.subscribe", nlohmann::json::array());
+        ASSERT_TRUE(rig.step(c, 2, "mining.authorize", {p2wsh + "/63:" + pep, "x"}));
+        std::lock_guard<std::mutex> l(rig.ws->mu);
+        EXPECT_EQ(rig.ws->payouts.back(), core::address_to_script(pep)) << "case 4 on the PEP key";
+        EXPECT_FALSE(rig.ws->build_donations.back().has_value());
+        EXPECT_EQ(rig.ws->builds.back().at(63), core::address_to_script(pep));
+    }
+    // (4) worker A's set_merged_addresses, then worker B (P2WSH)
+    {
+        SessionRig rig({98}, /*redistribute=*/true);
+        rig.ws->split_owner = owner;
+        LineClient c(rig.port);
+        ASSERT_GE(c.fd, 0);
+        rig.step(c, 1, "mining.subscribe", nlohmann::json::array());
+        ASSERT_TRUE(rig.step(c, 2, "mining.authorize", {b58(48, 0x01), "x"}));
+        c.send({{"id", 3}, {"method", "mining.set_merged_addresses"}, {"params", {{{"98", doge}}}}});
+        c.wait_id(3);
+        ASSERT_TRUE(rig.step(c, 4, "mining.authorize", {p2wsh + ".workerB", "x"}));
+        std::lock_guard<std::mutex> l(rig.ws->mu);
+        EXPECT_NE(rig.ws->payouts.back(), doge_script) << "B is never paid to A's key";
+        EXPECT_EQ(rig.ws->payouts.back(), owner) << "B named no address: the split";
+        ASSERT_TRUE(rig.ws->build_donations.back().has_value());
+        EXPECT_EQ(*rig.ws->build_donations.back(), 32768);
+    }
+}
+
+// A P2SH primary: its merged chains are paid to the same P2SH script (as
+// before) and the login is warned to give its DOGE address if the P2SH is
+// segwit-wrapped (on DOGE such an output is anyone-can-spend once the redeem
+// script is public); a mistyped first address before a valid parent address
+// pays the parent address (as before); a merged chain's bech32 address as the
+// whole login warns.
 TEST(MergedAuxStratumLogin, P2shPrimaryNeedsAMergedAddress)
 {
     using namespace core::merged_addr;

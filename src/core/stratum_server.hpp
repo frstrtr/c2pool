@@ -270,10 +270,16 @@ private:
     std::string login_primary_;
     std::map<uint32_t, std::string> login_given_;
     // The login has no payout address a share can carry (empty, invalid,
-    // another coin's) and the work source redistributes it: the jobs carry
-    // parent_script_ (p2pool's case 4) or an empty payout.
+    // another coin's: unusable; P2WSH / P2TR: uncarried) and the work source
+    // redistributes it: the jobs carry parent_script_ (p2pool's case 4,
+    // update_case4_parent) or an empty payout.
     bool payout_unusable_{false};
+    bool payout_uncarried_{false};
     std::vector<unsigned char> parent_script_;
+    // mining.set_merged_addresses received after the latest authorize: with
+    // login_given_, the addresses this login named itself (case 4).
+    std::map<uint32_t, std::string> post_auth_merged_;
+    void update_case4_parent();
     std::string payout_warning_;   // shown with the worker ("address invalid → redistributed")
     // The scriptPubKey a merged entry pays on its chain
     // (core::merged_addr::merged_payout_script).
