@@ -1807,24 +1807,28 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
         // Handshake completed -> disarm the authorize deadline (zombie-session fix).
         handshake_timer_.cancel();
 
-        // ─── Step 1: Strip fixed difficulty suffix (+N) before any parsing ───
-        // Format: "ADDRESS+1024" or "ADDR,ADDR+512": a fixed pseudoshare
-        // difficulty N in INTERNAL units, as python p2pool reads it
-        // (difficulty_to_target(float(N)); the miner is sent
-        // N * set_difficulty_multiplier), applied once the login is accepted
-        // (below).
-        // "+0", negatives, "+inf" and "+nan" set no difficulty (std::stod
-        // accepts inf/nan, so a bare "> 0" check let "+inf" through).
-        const std::optional<double> fixed_diff =
-            stratum_username::strip_fixed_diff_suffix(username_);
-
-        // ─── Step 2: Strip worker name suffix ───
-        // Separators: "." and "_" (Python compat)
-        // Worker name is always AFTER the last address, so strip from the end.
-        // A dot inside a valid "/<diff>" tail is not a worker, and only the
-        // ".worker" segment is cut, so "ADDR/1.5" and "ADDR.rig/1024" keep their diff.
-        if (auto worker = stratum_username::strip_worker_suffix(username_); !worker.empty())
-            worker_name_ = std::move(worker);
+        // ─── Steps 1-2: the login's parameters and worker name ───
+        // p2pool get_user_details (stratum_username.hpp): the text before the
+        // first '+' or '/' is the address (and worker), each "+X" / "/X"
+        // after it a parameter, in any order ("ADDR+1024/512" and
+        // "ADDR/512+1024" both give "+1024" and "/512").
+        //   "+N": a fixed pseudoshare difficulty in INTERNAL units, as python
+        //     p2pool reads it (difficulty_to_target(float(N)); the miner is
+        //     sent N * set_difficulty_multiplier), applied once the login is
+        //     accepted (below). "+0", negatives, "+inf" and "+nan" set no
+        //     difficulty (std::stod accepts inf/nan, so a bare "> 0" check let
+        //     "+inf" through).
+        //   "/N": this login's share difficulty (p2pool desired_share_target).
+        //     Set or cleared by every authorize.
+        // Worker: '.' or '_' (python compat; '_' wins), cut from the address.
+        const auto login = stratum_username::parse_login(username_);
+        username_ = login.user;
+        const std::optional<double> fixed_diff = login.pseudo_diff;
+        if (!login.worker.empty())
+            worker_name_ = login.worker;
+        share_difficulty_override_ = login.slash.share_diff;
+        if (share_difficulty_override_)
+            LOG_INFO << "[Stratum] Share difficulty from username: " << *share_difficulty_override_;
 
         // ─── Step 3: Parse multi-chain addresses ───
         // Supported separator formats for merged mining addresses:
@@ -1861,7 +1865,7 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
         merged_addresses_ = set_merged_addresses_;
         std::string merged_addr_raw;
         std::set<uint32_t> named_now;   // the slash form's chains
-        parse_address_separators(username_, merged_addr_raw, &named_now);
+        parse_address_separators(username_, merged_addr_raw, login.slash, login.merged_sep, &named_now);
         std::set<uint32_t> carried;
         if (!login_primary_.empty() && username_ == login_primary_)
             for (const auto& [id, a] : login_given_)
@@ -1882,7 +1886,7 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
             auto res = core::merged_addr::resolve_merged_login(
                 username_, merged_addr_raw, merged_addresses_, MERGED_CHAINS,
                 [this](uint32_t id) { return mining_interface_ && mining_interface_->has_merged_chain(id); },
-                LTC_VERSIONS, LTC_HRPS);
+                LTC_VERSIONS, LTC_HRPS, /*second_may_swap=*/!login.first_had_worker);
             const std::string who = username_.empty() ? std::string("(empty login)") : username_;
             for (const auto& n : res.notes)
                 LOG_INFO << "[Stratum] " << n;
@@ -3769,53 +3773,42 @@ void StratumSession::drop_stale(const char* reason)
     cancel_timers();
 }
 
-// Parse multi-chain addresses from username string.
+// Parse multi-chain addresses from the login (its "/" tokens already parsed
+// by stratum_username::parse_login into `slash`, its worker suffixes cut).
+// The two-address form splits at `sep_pos` (stratum_username::Login::
+// merged_sep: where parse_login found its separator, past index 20 of the
+// login as typed; npos: one address).
 // Tries multiple separator formats for maximum miner compatibility:
 //   1. Slash+colon: "LTC_ADDR/98:DOGE_ADDR"  (explicit chain ID)
-//      A colon-less numeric slash token ("ADDR/1024") is the per-miner share
-//      difficulty -> share_difficulty_override_.
 //   2. Comma:       "LTC_ADDR,DOGE_ADDR"      (standard)
 //   3. Pipe:        "LTC_ADDR|DOGE_ADDR"       (Vnish firmware)
 //   4. Semicolon:   "LTC_ADDR;DOGE_ADDR"       (alternative)
 //   5. Space:       "LTC_ADDR DOGE_ADDR"        (some web UIs)
 //
 // Slash format populates merged_addresses_ directly.
-// Simple formats extract merged_addr_raw for chain auto-detection.
+// Simple formats extract merged_addr_raw for chain auto-detection; they are
+// read whatever "/" tokens the login has ("LTC,DOGE/512", as p2pool reads it).
 void StratumSession::parse_address_separators(std::string& username, std::string& merged_addr_raw,
-                                              std::set<uint32_t>* slash_chains)
+                                              const stratum_username::SlashParse& slash,
+                                              size_t sep_pos, std::set<uint32_t>* slash_chains)
 {
-    // Priority 1: Slash format with explicit chain IDs and/or "/<share_diff>"
-    auto slash = stratum_username::parse_slash_tokens(username);
-    if (slash.had_slash) {
-        for (auto& [chain_id, addr] : slash.merged_addresses) {
-            merged_addresses_[chain_id] = std::move(addr);
-            if (slash_chains)
-                slash_chains->insert(chain_id);
-        }
-        if (slash.share_diff) {
-            share_difficulty_override_ = slash.share_diff;
-            LOG_INFO << "[Stratum] Share difficulty from username: " << *slash.share_diff;
-        }
-        return;
+    // Priority 1: Slash format with explicit chain IDs
+    for (const auto& [chain_id, addr] : slash.merged_addresses) {
+        merged_addresses_[chain_id] = addr;
+        if (slash_chains)
+            slash_chains->insert(chain_id);
     }
 
-    // Priority 2-5: Simple two-address separators (comma, pipe, semicolon, space)
-    // Try each in order; first match wins.
-    for (char sep : {',', '|', ';', ' '}) {
-        auto sep_pos = username.find(sep);
-        if (sep_pos != std::string::npos && sep_pos > 20) {
-            merged_addr_raw = username.substr(sep_pos + 1);
-            username = username.substr(0, sep_pos);
-            // Strip worker name from merged address too
-            auto mdot = merged_addr_raw.rfind('.');
-            if (mdot != std::string::npos && mdot > 20) merged_addr_raw = merged_addr_raw.substr(0, mdot);
-            auto mus = merged_addr_raw.rfind('_');
-            if (mus != std::string::npos && mus > 20) merged_addr_raw = merged_addr_raw.substr(0, mus);
-
-            if (sep != ',')
-                LOG_INFO << "[Stratum] Parsed merged address using '" << sep << "' separator";
-            return;
-        }
+    // Priority 2-5: Simple two-address separators (comma, pipe, semicolon, space),
+    // tried in order, first match wins (stratum_username::find_merged_separator),
+    // where parse_login found it.
+    if (sep_pos != std::string::npos && sep_pos < username.size()) {
+        // (parse_login already cut the worker suffixes: neither address has a '.' or a '_')
+        const char sep = username[sep_pos];
+        merged_addr_raw = username.substr(sep_pos + 1);
+        username = username.substr(0, sep_pos);
+        if (sep != ',')
+            LOG_INFO << "[Stratum] Parsed merged address using '" << sep << "' separator";
     }
 }
 

@@ -4,6 +4,7 @@
 #include "stratum_http.hpp"
 #include "stratum_refusal_log.hpp"
 #include "stratum_tls.hpp"
+#include "stratum_username.hpp"
 
 #include <memory>
 #include <string>
@@ -308,8 +309,8 @@ private:
     double suggested_difficulty_ = 0.0;
 
     // Per-miner SHARE difficulty from a colon-less "ADDR/<diff>" login token
-    // (p2pool desired_share_target). Unset when absent or not a finite
-    // value > 0. Parsed here only; consumers wire it per coin.
+    // (p2pool desired_share_target), set by every authorize. Unset when absent
+    // or not a finite value > 0. Parsed here only; consumers wire it per coin.
     std::optional<double> share_difficulty_override_;
 
     // Difficulty last sent with mining.set_difficulty (internal units; 0 =
@@ -509,6 +510,7 @@ private:
 
     std::string generate_extranonce1();
     void parse_address_separators(std::string& username, std::string& merged_addr_raw,
+                                  const stratum_username::SlashParse& slash, size_t sep_pos,
                                   std::set<uint32_t>* slash_chains = nullptr);
 };
 

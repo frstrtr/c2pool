@@ -2562,6 +2562,63 @@ TEST(MergedAuxStratumSession, SubmitCarriesWhatTheJobCommittedTo)
     }
 }
 
+// p2pool-merged-v36 at the LTC stratum: a '|', ';' or ' ' after a worker
+// suffix is the worker's (DOGE gets the LTC key, as before), and "D.rig,L"
+// does not swap (p2pool tests the swap on "D.rig"): the LTC payout is
+// hash160(D), DOGE D (case 5), as before; "D,L" still swaps.
+TEST(MergedAuxStratumSession, WorkerSuffixRulesMatchP2pool)
+{
+    const std::string ltc = b58(48, 0x01), doge = b58(30, 0x21);
+    const auto table = core::merged_addr::merged_chain_table(false, kLtcAllNetworks);
+    const auto sc = [&](const std::string& a) {
+        return core::merged_addr::merged_payout_script(core::merged_addr::find_chain(table, 98), a);
+    };
+    struct Case { std::string login; std::string payout; std::string doge_from; };
+    const std::vector<Case> cases = {
+        {ltc + ".rig|" + doge, ltc, ltc},
+        {ltc + ".rig " + doge, ltc, ltc},
+        {ltc + "_rig;" + doge, ltc, ltc},
+        {ltc + ".my rig", ltc, ltc},
+        {ltc + "|" + doge, ltc, doge},          // c2pool's '|' form without a suffix before it
+        {ltc + ".rig," + doge, ltc, doge},      // the comma form: p2pool-merged-v36
+        {doge + ".rig," + ltc, doge, doge},     // no swap: case 5
+        {doge + "," + ltc, ltc, doge},          // swapped order, auto-corrected
+    };
+    for (const auto& c : cases) {
+        SCOPED_TRACE(c.login);
+        SessionRig rig({98});
+        LineClient cl(rig.port);
+        ASSERT_GE(cl.fd, 0);
+        rig.step(cl, 1, "mining.subscribe", nlohmann::json::array());
+        ASSERT_TRUE(rig.step(cl, 2, "mining.authorize", {c.login, "x"}));
+        std::lock_guard<std::mutex> l(rig.ws->mu);
+        EXPECT_EQ(rig.ws->payouts.back(), core::address_to_script(c.payout));
+        ASSERT_TRUE(rig.ws->builds.back().count(98));
+        EXPECT_EQ(rig.ws->builds.back().at(98), sc(c.doge_from));
+    }
+    // A comma form whose first address is no address and is cut to index 20
+    // or before by its worker suffix: split at the comma as typed, the DOGE
+    // address stays named; the job is the one of any unusable first address
+    // beside it (the LTC payout from the DOGE key, case 4).
+    const std::string doge2 = b58(30, 0x22);
+    const auto job_of = [&](const std::string& login) {
+        SessionRig rig({98}, /*redistribute=*/true);
+        LineClient cl(rig.port);
+        rig.step(cl, 1, "mining.subscribe", nlohmann::json::array());
+        EXPECT_TRUE(rig.step(cl, 2, "mining.authorize", {login, "x"})) << login;
+        std::lock_guard<std::mutex> l(rig.ws->mu);
+        return std::make_pair(rig.ws->payouts.back(), rig.ws->builds.back());
+    };
+    const auto unusable_first = job_of(std::string(25, 'x') + "," + doge2);
+    ASSERT_TRUE(unusable_first.second.count(98));
+    EXPECT_EQ(unusable_first.second.at(98), sc(doge2));
+    EXPECT_FALSE(unusable_first.first.empty()) << "case 4";
+    for (const std::string& login : {".|" + doge + "," + doge2, "._x" + std::string(34, 'y') + ".a.b," + doge2}) {
+        SCOPED_TRACE(login);
+        EXPECT_EQ(job_of(login), unusable_first);
+    }
+}
+
 // --fee at the stratum session: the work source gives every job to the
 // operator (decide_job_payout); the session builds it for its login's key
 // (build_connection_coinbase_for), the key its pseudoshares are recorded
