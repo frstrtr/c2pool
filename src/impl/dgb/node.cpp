@@ -1437,7 +1437,7 @@ void NodeImpl::load_persisted_shares()
                 // Not verified again, so its block flag comes from its PoW hash and header
                 // bits here, with no found-block event (the block was recorded when the
                 // share was first verified; the found-block store survives the restart).
-                if (meta.is_verified) {
+                if (meta.is_verified && m_trust_stored_verified) {
                     if (auto* idx = m_tracker.chain.get_index(share.hash()))
                         share.ACTION({ core::restore_block_flag(*idx, *obj, idx->pow_hash); });
                     verified_hashes.push_back(share.hash());

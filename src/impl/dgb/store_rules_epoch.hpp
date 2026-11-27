@@ -1,23 +1,29 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 // ---------------------------------------------------------------------------
-// The DGB sharechain store is wiped once when the share rules it was written
-// under change (review 906a0e5e3 #5).
+// The DGB sharechain store is verified again once when the share rules it was
+// written under change (reviews 906a0e5e3 #5, dd1248abd REQUIRED 1-2).
 //
 // The store keeps each share's "verified" flag, and a restart reloads it
 // without verifying again (p2pool known_verified). After the V35 rule changes
 // (address decode, segwit_data and the P2Pool commitment, PPLNS by address
 // string, share_info), a store written by an older build holds shares
 // verified under the old rules, this node's own commitment-less V35 shares
-// among them, which the python network and this build reject. Such a store is
-// emptied once (its shares come back from peers, verified by these rules);
-// a marker file next to it records the rules epoch it was written under.
+// among them. Such a store has every verified flag cleared once: the shares
+// are KEPT (the dormant chain may exist only here, and the revive starts from
+// it) and are verified again under these rules; the ones that fail (our old
+// commitment-less shares, V36 shares while held) are not verified.
+//
+// A marker next to the store records the rules epoch. It is written only
+// after a re-scan of the index records confirms no share is still flagged
+// verified, and read back. On any failure the marker is not written (the
+// clear runs again on the next start) and this run trusts no stored flag.
 // ---------------------------------------------------------------------------
 
+#include <core/leveldb_store.hpp>
 #include <core/log.hpp>
 #include <core/uint256.hpp>
 
-#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -29,34 +35,68 @@ namespace dgb {
 /// Bump whenever a change makes shares verified by an older build untrustworthy.
 inline constexpr const char* kDgbShareRulesEpoch = "dgb-v35-python-exact-1";
 
-/// Empties `storage` (get_shares_by_height_range / remove_shares_batch) unless
-/// `marker` names kDgbShareRulesEpoch, then writes it. Returns the number of
-/// shares removed.
-template <typename StorageT>
-size_t wipe_store_if_rules_changed(StorageT& storage, const std::filesystem::path& marker)
+inline std::string read_rules_epoch(const std::filesystem::path& marker)
 {
     std::string epoch;
-    {
-        std::ifstream in(marker);
-        std::getline(in, epoch);
-    }
+    std::ifstream in(marker);
+    std::getline(in, epoch);
+    return epoch;
+}
+
+/// Returns true when the store's verified flags may be trusted on this load:
+/// the marker names kDgbShareRulesEpoch, or every flag was cleared (confirmed
+/// by a re-scan) and the marker written. False: load without trusting any
+/// stored flag. `storage`: scan_share_index / mark_shares_unverified.
+template <typename StorageT>
+bool reverify_store_if_rules_changed(StorageT& storage, const std::filesystem::path& marker)
+{
+    const std::string epoch = read_rules_epoch(marker);
     if (epoch == kDgbShareRulesEpoch)
-        return 0;
-    size_t removed = 0;
-    const std::vector<uint256> all = storage.get_shares_by_height_range(0, UINT64_MAX);
-    if (!all.empty()) {
-        LOG_WARNING << "[Pool] the DGB sharechain store was written under older share rules ("
-                    << (epoch.empty() ? std::string("no epoch") : epoch) << "): its " << all.size()
-                    << " shares are removed once and downloaded again from peers (rules "
+        return true;
+    const std::string was = epoch.empty() ? std::string("no epoch") : epoch;
+
+    auto flagged = [&](std::vector<uint256>& out) -> bool {
+        std::vector<core::SharechainLevelDBStore::IndexEntry> idx;
+        if (!storage.scan_share_index(idx))
+            return false;
+        out.clear();
+        for (const auto& e : idx)
+            if (e.is_verified)
+                out.push_back(e.hash);
+        return true;
+    };
+    std::vector<uint256> verified;
+    if (!flagged(verified)) {
+        LOG_ERROR << "[Pool] the DGB sharechain store was written under older share rules (" << was
+                  << ") and its index cannot be read: no stored share is trusted as verified this run;"
+                     " the store is checked again on the next start";
+        return false;
+    }
+    if (!verified.empty()) {
+        LOG_WARNING << "[Pool] the DGB sharechain store was written under older share rules (" << was
+                    << "): the verified flag of its " << verified.size()
+                    << " shares is cleared once; the shares are kept and verified again (rules "
                     << kDgbShareRulesEpoch << ")";
-        storage.remove_shares_batch(all);
-        removed = all.size();
+        std::vector<uint256> still;
+        if (!storage.mark_shares_unverified(verified) || !flagged(still) || !still.empty()) {
+            LOG_ERROR << "[Pool] clearing the DGB store's verified flags FAILED ("
+                      << (still.empty() ? std::string("write") : std::to_string(still.size()) + " still flagged")
+                      << "): no stored share is trusted as verified this run; retried on the next start";
+            return false;
+        }
     }
     std::error_code ec;
     std::filesystem::create_directories(marker.parent_path(), ec);
-    std::ofstream out(marker, std::ios::trunc);
-    out << kDgbShareRulesEpoch << "\n";
-    return removed;
+    {
+        std::ofstream out(marker, std::ios::trunc);
+        out << kDgbShareRulesEpoch << "\n";
+        out.flush();
+    }
+    if (read_rules_epoch(marker) != kDgbShareRulesEpoch)
+        LOG_ERROR << "[Pool] the DGB share rules marker " << marker.string()
+                  << " cannot be written: the store's flags are cleared, and are checked again on the next start";
+    // The flags are clear either way: nothing stored is trusted beyond them.
+    return true;
 }
 
 } // namespace dgb
