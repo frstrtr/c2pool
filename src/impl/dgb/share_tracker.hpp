@@ -1598,10 +1598,16 @@ public:
         uint32_t bits;
     };
 
+    // `share_version`: the version of the share being made. The emergency
+    // time-based decay (Step 3) is a V36 rule (p2pool-merged-v36, gated on
+    // v36_active); a V35 share's max target is the previous share's max
+    // target +-10% with no decay (the python V35 network, data.py
+    // generate_transaction), whatever the gap since the previous share.
     ShareTarget compute_share_target(
         const uint256& prev_share_hash,
         uint32_t desired_timestamp,
-        const uint256& desired_target)
+        const uint256& desired_target,
+        int64_t share_version)
     {
         // MAX_TARGET: network-specific share difficulty floor
         // Mainnet: 2^236 - 1, Testnet: 2^256/20 - 1  (from PoolConfig)
@@ -1737,7 +1743,7 @@ public:
             prev_max_target = chain::bits_to_target(obj->m_max_bits);
         });
 
-        // Step 3: Emergency time-based decay (death spiral prevention)
+        // Step 3: Emergency time-based decay (death spiral prevention), V36 only
         // Phase 1b from p2pool-v36: doubles target every SHARE_PERIOD * 10
         // seconds past the threshold of SHARE_PERIOD * 20 seconds since last share.
         uint256 clamp_ref_target = prev_max_target;
@@ -1746,7 +1752,7 @@ public:
             prev_ts = obj->m_timestamp;
         });
 
-        if (prev_ts > 0 && desired_timestamp > prev_ts)
+        if (core::version_gate::is_v36_active(share_version) && prev_ts > 0 && desired_timestamp > prev_ts)
         {
             auto time_since_share = desired_timestamp - prev_ts;
             auto emergency_threshold = PoolConfig::share_period() * 20;

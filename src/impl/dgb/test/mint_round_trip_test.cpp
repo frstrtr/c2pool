@@ -240,7 +240,7 @@ TEST(DgbMintRoundTrip, JobClassifiesWithTheTrackerShareTarget)
     // The job freezes the producer's share bits, which are the tracker's
     // share target for the next share at the job's timestamp.
     const auto st = rig.chain.tracker.compute_share_target(
-        rig.chain.tip, rig.last_inputs->frozen_timestamp, chain::bits_to_target(0x1b0404cb));
+        rig.chain.tip, rig.last_inputs->frozen_timestamp, chain::bits_to_target(0x1b0404cb), rig.mint_version);
     EXPECT_EQ(cbr.snapshot.frozen_ref.bits, st.bits);
     EXPECT_EQ(cbr.snapshot.frozen_ref.max_bits, st.max_bits);
     EXPECT_NE(cbr.snapshot.frozen_ref.bits, 0u) << "a job without frozen bits classifies at diff-1";

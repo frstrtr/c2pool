@@ -1718,7 +1718,8 @@ bool share_check(const ShareT& share,
                 static int target_diag = 0;
                 if (target_diag++ < 10) {
                     auto [cst_max_bits, cst_bits] = tracker.compute_share_target(
-                        share.m_prev_hash, share.m_timestamp, uint256());
+                        share.m_prev_hash, share.m_timestamp, uint256(),
+                        static_cast<int64_t>(ShareT::version));
                     auto share_aps = tracker.get_pool_attempts_per_second(
                         share.m_prev_hash, params.target_lookbehind, true);
                     LOG_WARNING << "[GENTX-TARGET] share_bits=0x" << std::hex << share.m_bits
@@ -2084,7 +2085,7 @@ uint256 create_local_share_v35(
     // Compute share target
     auto desired_target = chain::bits_to_target(min_header.m_bits);
     auto [share_max_bits, share_bits] = tracker.compute_share_target(
-        prev_share, share.m_timestamp, desired_target);
+        prev_share, share.m_timestamp, desired_target, /*share_version=*/35);
     share.m_max_bits   = share_max_bits;
     share.m_bits       = share_bits;
     share.m_nonce      = 0;
@@ -2499,7 +2500,7 @@ uint256 create_local_share(
     // Compute pool-level share target AFTER timestamp clipping (matches ref_hash_fn).
     auto desired_target = chain::bits_to_target(min_header.m_bits);
     auto [share_max_bits, share_bits] = tracker.compute_share_target(
-        prev_share, share.m_timestamp, desired_target);
+        prev_share, share.m_timestamp, desired_target, share_version);
     share.m_max_bits   = share_max_bits;
     share.m_bits       = share_bits;
 

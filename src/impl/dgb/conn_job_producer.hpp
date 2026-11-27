@@ -111,7 +111,7 @@ std::optional<coin::ConnCoinbasePplnsInputs> build_conn_job_inputs(
 
     // share target AFTER timestamp clip (== create_local_share order).
     const auto desired_target = chain::bits_to_target(block_bits);
-    const auto st = tracker.compute_share_target(prev_share_hash, timestamp, desired_target);
+    const auto st = tracker.compute_share_target(prev_share_hash, timestamp, desired_target, mint_version);
     const uint32_t max_bits = st.max_bits;
     const uint32_t bits     = st.bits;
 
