@@ -118,8 +118,10 @@ void ZmqHashblockSubscriber::run_loop()
             int r = zmq_msg_recv(&topic, sub, 0);
             if (r < 0) {
                 zmq_msg_close(&topic);
-                if (zmq_errno() == EAGAIN)
-                    continue;             // timeout: re-check stop_ and retry
+                // timeout, or a signal (SIGHUP with the TLS stratum
+                // listener on): re-check stop_ and retry
+                if (zmq_errno() == EAGAIN || zmq_errno() == EINTR)
+                    continue;
                 break;                    // real transport error: reconnect
             }
             std::string hex;

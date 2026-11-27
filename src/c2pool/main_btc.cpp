@@ -166,6 +166,21 @@ static void print_usage()
         "                  at once from one address, one /64 for IPv6: at most N;\n"
         "                  others are answered 503 (default 6; 0 = no limit below\n"
         "                  --stratum-http-budget).\n"
+        "  --stratum-tls [HOST:]PORT  a second stratum listener that speaks TLS\n"
+        "                  (stratum+ssl://), so miners can verify the pool's\n"
+        "                  certificate; PORT alone binds the --stratum host. Same\n"
+        "                  sessions, limits and miner list as the plain port; TLS\n"
+        "                  1.2+, no client certificates (default: off).\n"
+        "  --stratum-tls-cert FILE  PEM certificate chain (leaf first) for\n"
+        "                  --stratum-tls; re-read with the key when either file\n"
+        "                  changes, and on SIGHUP.\n"
+        "  --stratum-tls-key FILE  PEM private key for --stratum-tls (no passphrase).\n"
+        "  --stratum-tls-rate-per-ip R / --stratum-tls-burst-per-ip N  TLS accepts\n"
+        "                  a second from one address (IPv6: one /64) and how many\n"
+        "                  back to back (default 5 and 20; 0 = no limit).\n"
+        "  --stratum-tls-handshakes N / --stratum-tls-handshakes-per-ip N  TLS\n"
+        "                  handshakes in progress at once, in total and from one\n"
+        "                  address (default 32 and 8; 0 = no limit).\n"
         "  --analytics-id ID  Google Analytics (GA4) measurement ID, G-XXXXXXXXXX;\n"
         "                  off by default. Every HTML page --http serves then shows a\n"
         "                  consent bar; only after a visitor accepts are GA4 page views\n"
@@ -297,10 +312,12 @@ int main(int argc, char* argv[])
         }
         else if (arg == "--version")
         {
+            // tls=: the TLS stratum listener is built in (on) or not.
 #ifdef C2POOL_VERSION
-            std::cout << "c2pool-btc " << C2POOL_VERSION << "\n";
+            std::cout << "c2pool-btc " << C2POOL_VERSION
+                      << " tls=" << (core::stratum_tls_supported() ? "on" : "off") << "\n";
 #else
-            std::cout << "c2pool-btc dev\n";
+            std::cout << "c2pool-btc dev tls=" << (core::stratum_tls_supported() ? "on" : "off") << "\n";
 #endif
             return 0;
         }
@@ -511,6 +528,24 @@ int main(int argc, char* argv[])
                 return 1;
             }
         }
+        // --stratum-tls [HOST:]PORT / --stratum-tls-cert FILE / --stratum-tls-key
+        // FILE: the TLS stratum listener (core/stratum_tls.hpp); checked once
+        // every flag and setting is read (check_stratum_tls_settings).
+        else if (arg == "--stratum-tls" && i + 1 < argc)
+            core::stratum_tls_setting().bind = argv[++i];
+        else if (arg == "--stratum-tls-cert" && i + 1 < argc)
+            core::stratum_tls_setting().cert = argv[++i];
+        else if (arg == "--stratum-tls-key" && i + 1 < argc)
+            core::stratum_tls_setting().key = argv[++i];
+        else if ((arg == "--stratum-tls-rate-per-ip" || arg == "--stratum-tls-burst-per-ip"
+                  || arg == "--stratum-tls-handshakes" || arg == "--stratum-tls-handshakes-per-ip")
+                 && i + 1 < argc) {
+            std::string err;
+            if (!core::parse_stratum_tls_limit_flag(arg, argv[++i], core::stratum_tls_setting(), err)) {
+                std::cerr << "c2pool-btc: " << err << "\n";
+                return 1;
+            }
+        }
         else
         {
             std::cerr << "unknown arg: " << arg << "\n";
@@ -568,6 +603,8 @@ int main(int argc, char* argv[])
         if (rc.file_set("stratum.http_per_ip"))   // --stratum-http-per-ip
             core::apply_stratum_http_count_setting("stratum.http_per_ip", rc.get_i64("stratum.http_per_ip"),
                                                    core::stratum_http_limits_setting().per_ip);
+        // --stratum-tls, -cert, -key and the four TLS limits (stratum.tls_*).
+        core::apply_stratum_tls_file_settings(rc, core::stratum_tls_setting());
         if (rc.file_set("stratum.bind"))      split_hostport(rc.get_string("stratum.bind").value_or(""), stratum_addr, stratum_port);
         if (rc.file_set("sharechain.listen")) { std::string hh; split_hostport(rc.get_string("sharechain.listen").value_or(""), hh, sharechain_port); }
         if (rc.file_set("daemon_rpc.endpoint")) split_hostport(rc.get_string("daemon_rpc.endpoint").value_or(""), bitcoind_host, bitcoind_port);
@@ -579,6 +616,14 @@ int main(int argc, char* argv[])
         if (rc.file_set("money.node_owner_fee_pct")) node_owner_fee = rc.get_double("money.node_owner_fee_pct").value_or(node_owner_fee);
         if (rc.file_set("money.node_owner_address")) node_owner_address = rc.get_string("money.node_owner_address").value_or(node_owner_address);
         if (rc.file_set("money.give_author_pct")) { dev_donation = rc.get_double("money.give_author_pct").value_or(dev_donation); give_author_set = true; }
+    }
+
+    // --stratum-tls / --stratum-tls-cert / --stratum-tls-key (command line or
+    // settings file): a complete set this build supports, whose certificate
+    // and key load; else refused here, before anything starts.
+    if (auto why = core::check_stratum_tls_settings(core::stratum_tls_setting())) {
+        std::cerr << "c2pool-btc: " << *why << "\n";
+        return 1;
     }
 
     // The external-bitcoind endpoint is only mandatory when NOT running the
@@ -3530,6 +3575,8 @@ int main(int argc, char* argv[])
         core::configure_stratum_http(*stratum_server_for_shutdown, web_server.get(),
                                      core::stratum_http_mode_setting(),
                                      core::stratum_http_limits_setting());
+    // The TLS stratum listener (--stratum-tls), when set.
+    core::configure_stratum_tls(stratum_server_for_shutdown.get(), core::stratum_tls_setting());
 
     // Periodic think/clean tick (every 5s, safety net) — mirrors the LTC/dash
     // tick (main_ltc.cpp think_timer). Without it, think() fired only on share

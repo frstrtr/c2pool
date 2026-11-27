@@ -3,6 +3,7 @@
 #include "merged_chain_addr.hpp"
 #include "stratum_http.hpp"
 #include "stratum_refusal_log.hpp"
+#include "stratum_tls.hpp"
 
 #include <memory>
 #include <string>
@@ -105,7 +106,9 @@ public:
     static constexpr std::size_t kMaxStratumLineBytes = 16384;
 
 private:
-    tcp::socket socket_;
+    // The connection: the accepted socket, or a TLS stream over it on the TLS
+    // listener (core/stratum_tls.hpp). Everything below is the same for both.
+    StratumStream socket_;
     // Bounded line buffer: a peer whose line runs past kMaxStratumLineBytes
     // without a '\n' is dropped (see read_message()).
     boost::asio::streambuf buffer_{kMaxStratumLineBytes + 1};
@@ -324,6 +327,19 @@ private:
     // never authorizes (half-open / probe) is dropped when it fires.
     boost::asio::steady_timer handshake_timer_;
 
+    // TLS connections only: the TLS handshake runs before the first read and
+    // is bounded by the server's TLS handshake timeout (start_tls_handshake).
+    boost::asio::steady_timer tls_handshake_timer_;
+    bool tls_handshake_done_ = false;
+    bool tls_handshake_timed_out_ = false;
+    bool tls_handshake_evicted_ = false;    // closed by the gate for a newcomer
+    uint64_t tls_timer_generation_ = 0;     // bumped by each arm and at the end
+    bool tls_waiting_first_byte_ = false;   // no ClientHello byte yet
+    std::chrono::steady_clock::time_point tls_handshake_deadline_{};
+    // The TLS listener's in-flight handshake slot (StratumTlsHandshakeGate):
+    // held from the accept until the handshake ends.
+    std::shared_ptr<StratumTlsHandshakeGate::Slot> tls_handshake_slot_;
+
     // A held job (CoinbaseResult::held): one pending retry per session, for
     // at most StratumConfig::job_hold_limit_sec since the hold began; past it
     // the session stops retrying (the miner keeps its last valid job) until
@@ -350,11 +366,23 @@ private:
     bool template_retry_clean_ = false;
 
 public:
+    /// `tls` non-null: a connection from the TLS listener, served over TLS
+    /// with that certificate (the TLS handshake runs first, in start()).
     explicit StratumSession(tcp::socket socket, std::shared_ptr<IWorkSource> mining_interface,
-                            StratumServer* server = nullptr);
+                            StratumServer* server = nullptr,
+                            std::shared_ptr<StratumTlsContext> tls = nullptr);
     void start();
 
     bool is_connected() const { return socket_.is_open(); }
+    bool is_tls() const { return socket_.is_tls(); }
+    /// The TLS listener's in-flight handshake slot for this connection: held
+    /// until the TLS handshake ends (whatever the outcome) or the session
+    /// goes; the gate may evict it (evict_tls_handshake). Set before start(),
+    /// with the session owned by a shared_ptr.
+    void hold_tls_handshake_slot(std::shared_ptr<StratumTlsHandshakeGate::Slot> slot);
+    /// The gate needs this handshake's slot: close it (counted as a failed
+    /// handshake). No-op once the handshake is done or the session closed.
+    void evict_tls_handshake();
     bool is_subscribed() const { return subscribed_; }
     bool is_authorized() const { return authorized_; }
     // Seconds since the last inbound stratum line (zombie-session reaper).
@@ -456,6 +484,12 @@ private:
     void start_periodic_work_push();
     void schedule_work_push_timer();
     void cancel_timers();
+    // TLS connections: wait for the first byte, then the server side of the
+    // TLS handshake, then read_message(); closed when it fails, misses a
+    // deadline or is evicted.
+    void start_tls_handshake();
+    void arm_tls_handshake_timer(std::chrono::steady_clock::time_point at);
+    void finish_tls_handshake(const boost::system::error_code& ec);
     // Zombie-session fixes (all no-op unless the DASH-set StratumConfig knobs
     // enable them): apply OS TCP keepalive, arm the authorize deadline.
     void apply_socket_keepalive();
@@ -552,6 +586,7 @@ class StratumServer
     RefusalLogLimiter per_ip_refusal_log_;
     RefusalLogLimiter http_budget_refusal_log_;
     RefusalLogLimiter http_share_refusal_log_;
+    RefusalLogLimiter tls_refusal_log_;   // TLS accepts over the rate / handshake limits
     boost::asio::steady_timer refusal_log_timer_;
     std::optional<RefusalLogLimiter::clock::time_point> refusal_log_timer_due_;   // armed for
     std::atomic<uint64_t> refusal_lines_logged_{0};
@@ -707,9 +742,106 @@ public:
     uint16_t get_port() const { return port_; }
     bool is_running() const { return running_; }
 
+    /// The TLS stratum listener (core/stratum_tls.hpp): a second acceptor on
+    /// this server. Its connections are TLS on the wire and otherwise the
+    /// same sessions as the plain listener's: the same caps (counted
+    /// together), refusal log, drain gate, worker registry and dashboard rows.
+    struct TlsOptions {
+        std::string bind_address;   // empty: this server's bind address
+        uint16_t port = 0;          // 0: a free port (tests)
+        std::string cert_file;      // PEM, the full chain
+        std::string key_file;       // PEM
+        std::chrono::milliseconds handshake_timeout = kStratumTlsHandshakeTimeout;
+        std::chrono::milliseconds first_byte_timeout = kStratumTlsFirstByteTimeout;
+        std::chrono::milliseconds evict_after = kStratumTlsHandshakeEvictAfter;
+        // Accepts before the handshake (StratumTlsAcceptLimiter,
+        // StratumTlsHandshakeGate); 0 = no limit.
+        double accept_rate = kStratumTlsAcceptRate;
+        double accept_burst = kStratumTlsAcceptBurst;
+        double accept_rate_per_ip = kStratumTlsAcceptRatePerIp;
+        double accept_burst_per_ip = kStratumTlsAcceptBurstPerIp;
+        std::size_t max_handshakes = kStratumTlsMaxHandshakes;
+        std::size_t max_handshakes_per_ip = kStratumTlsMaxHandshakesPerIp;
+    };
+    /// Open the TLS listener. Call after start(), on the io thread or before
+    /// it runs, at most once. false and `error` set when this build has no
+    /// TLS, the certificate or key do not load, the address and port are the
+    /// plain listener's, or the bind fails. While it is open, SIGHUP (POSIX)
+    /// re-reads the certificate and key, as does a change to either file seen
+    /// at an accept.
+    bool start_tls(const TlsOptions& options, std::string* error = nullptr);
+    bool is_tls_running() const;
+    std::string get_tls_bind_address() const;
+    /// The port the TLS listener is bound to (0 when it is not open).
+    uint16_t get_tls_port() const;
+    /// Re-read the certificate and key now (what SIGHUP does). true: they
+    /// loaded and new connections use them; false (`error` set): the last
+    /// good pair stays in use. Any thread.
+    bool reload_tls(std::string* error = nullptr);
+    /// Successful re-reads after the first load / re-reads that failed.
+    uint64_t get_tls_reloads() const;
+    uint64_t get_tls_reload_failures() const;
+    /// TLS handshakes completed / failed (or timed out) since start_tls().
+    /// A connection closed by stop() or reaped during its handshake is
+    /// neither.
+    uint64_t get_tls_handshakes() const;
+    uint64_t get_tls_handshake_failures() const;
+    /// Failed-handshake log lines written (one per minute at most, full or
+    /// summary).
+    uint64_t get_tls_handshake_log_lines() const;
+    /// TLS accepts closed before the handshake: over the accept rate, over
+    /// one address's accept rate, over the handshakes in progress (total or
+    /// one address's).
+    uint64_t get_tls_refused_rate() const;
+    uint64_t get_tls_refused_rate_per_ip() const;
+    uint64_t get_tls_refused_handshakes() const;
+    /// Handshakes in progress evicted for a newcomer at the handshake bound.
+    uint64_t get_tls_handshake_evictions() const;
+    std::chrono::milliseconds tls_first_byte_timeout() const;
+    /// The options the TLS listener was opened with (defaults when it is not).
+    TlsOptions get_tls_options() const;
+    /// TLS handshakes in progress now.
+    std::size_t get_tls_handshakes_in_progress() const;
+    std::chrono::milliseconds tls_handshake_timeout() const;
+    /// The certificate new TLS connections get ("subject /CN=..., valid until
+    /// ..."; "" when the listener is not open).
+    std::string get_tls_certificate_summary() const;
+    /// "expired" / "not yet valid" for that certificate; nullopt when it is
+    /// within its validity period (or the listener is not open).
+    std::optional<std::string> get_tls_certificate_validity_problem() const;
+    /// A session's TLS handshake ended: counted; a failure is logged at most
+    /// once a minute (the others are counted into the next line). Call on the
+    /// io thread.
+    /// `peer_key`: per_ip_cap_key of the peer (what the log counts by),
+    /// `peer_ip`: its address (shown).
+    void record_tls_handshake(bool ok, const std::string& peer_key, const std::string& peer_ip,
+                              const std::string& what);
+
 private:
     void accept_connections();
     void handle_accept(boost::system::error_code ec, tcp::socket socket);
+    // The admission path both listeners share (drain gate, node cap, per-IP
+    // cap); `tls` non-null makes the session a TLS one.
+    // admit() would take a connection from `peer` now (drain gate, node cap,
+    // per-IP cap; read only).
+    bool would_admit(const boost::asio::ip::address& peer) const;
+    void admit(boost::system::error_code ec, tcp::socket socket,
+               std::shared_ptr<StratumTlsContext> tls,
+               std::shared_ptr<StratumTlsHandshakeGate::Slot> tls_slot = nullptr);
+
+    struct TlsListener;
+    std::unique_ptr<TlsListener> tls_;
+    void accept_tls_connections();
+    void handle_tls_accept(boost::system::error_code ec, tcp::socket socket);
+    void arm_tls_reload_signal();
+    void stop_tls_listener();
 };
+
+/// Start the TLS listener on `stratum` for the flags `s` and log the outcome
+/// ("stratum TLS: listening on 0.0.0.0:3334 ..."). Nothing happens and
+/// nothing is logged when --stratum-tls is not set. `stratum` null (the
+/// stratum listener is disabled or did not start): logged, not started. PORT
+/// alone binds the stratum listener's address. Returns whether it listens.
+bool configure_stratum_tls(StratumServer* stratum, const StratumTlsSettings& s);
 
 } // namespace core

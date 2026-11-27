@@ -14940,6 +14940,8 @@ bool WebServer::start_stratum_server()
             // HTTP on the stratum port (--stratum-http): this server's own
             // stratum acceptor binds the web server's address.
             configure_stratum_http(*stratum_server_, this, stratum_http_mode_, stratum_http_limits_);
+            // The TLS stratum listener (--stratum-tls), when set.
+            configure_stratum_tls(stratum_server_.get(), stratum_tls_);
             // Wire stratum hashrate callback to MiningInterface
             auto* ss = stratum_server_.get();
             mining_interface_->set_stratum_hashrate_fn([ss]() -> double {
@@ -14955,6 +14957,8 @@ bool WebServer::start_stratum_server()
             mining_interface_->set_local_rates_fn([ss]() {
                 return ss->get_local_rates();
             });
+        } else {
+            configure_stratum_tls(nullptr, stratum_tls_);   // logs "not started" when set
         }
         return started;
         
