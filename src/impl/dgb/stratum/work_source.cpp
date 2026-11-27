@@ -232,6 +232,29 @@ std::function<uint256()> DGBWorkSource::get_best_share_hash_fn() const
     return best_share_hash_fn_;  // empty function until set_best_share_hash_fn() called
 }
 
+bool DGBWorkSource::embedded_chain_serves() const
+{
+    // The one template-source choice (reviews 906a0e5e3 #4, dd1248abd #5,
+    // 7793bfb6c #2), read by the template, the prevhash getter and the work
+    // gate: the embedded header chain once it has a tip and has reached it.
+    // While it syncs, its template is for an old height and prevhash. A latch,
+    // as a node's initial block download: once at its tip it stays so (a
+    // quiet network never holds work again; a lost digibyted is the work
+    // gate's, stratum_work_gate.hpp).
+    if (!chain_.tip_hash())
+        return false;
+    const uint32_t recent = tip_recent_sec_.load();
+    if (recent == 0 || tip_latched_.load())
+        return true;
+    const int64_t age = static_cast<int64_t>(std::time(nullptr)) - chain_.median_time_past();
+    if (age > static_cast<int64_t>(recent))
+        return false;
+    tip_latched_.store(true);
+    if (tip_state_.exchange(1) != 1)
+        LOG_INFO << "[DGB-STRATUM] header chain at its tip (median time " << age << " s old): serving work from it";
+    return true;
+}
+
 std::string DGBWorkSource::get_current_gbt_prevhash() const
 {
     // The tip block id as GBT-conventional big-endian display hex, drawn from
@@ -242,9 +265,13 @@ std::string DGBWorkSource::get_current_gbt_prevhash() const
     // string when the chain carries no real tip hash (tip_hash() == nullopt:
     // an empty chain, or the block_hash==0 sentinel from the not-yet-wired
     // embedded P2P header ingest) -- a truthful absence, never a fabricated id.
-    if (auto th = chain_.tip_hash())
-        return u256_be_display_hex(*th);
-    // Embedded chain unfed -> external-daemon GBT fallback (the mining.notify
+    // The same source choice as the template (embedded_chain_serves): while
+    // the embedded chain is behind its tip, the job push follows digibyted's
+    // tip, not the syncing chain's.
+    if (embedded_chain_serves())
+        if (auto th = chain_.tip_hash())
+            return u256_be_display_hex(*th);
+    // Embedded chain unfed (or behind) -> external-daemon GBT fallback (the mining.notify
     // prevhash path: stratum_server.cpp get_current_gbt_prevhash caller). Drawn
     // from the SAME single GBT source as get_current_work_template()'s
     // previousblockhash, so the dedicated getter and the assembled template can
@@ -447,23 +474,10 @@ nlohmann::json DGBWorkSource::get_current_work_template() const
         auto nb = chain_.next_scrypt_bits();
         if (!nb)
             return nlohmann::json::object();  // hold work until the window fills.
-        // Work from the embedded chain only once it is at its tip (reviews
-        // 906a0e5e3 #4, dd1248abd #5): while it syncs, its template is for an
-        // old height and prevhash. A latch, as a node's initial block download:
-        // once at its tip it stays so (a quiet network never holds work again;
-        // a lost digibyted is the work gate's, stratum_work_gate.hpp). Behind:
-        // digibyted's template when the GBT fallback is bound, else no work.
-        if (const uint32_t recent = tip_recent_sec_.load(); recent > 0 && !tip_latched_.load()) {
-            const int64_t age = static_cast<int64_t>(std::time(nullptr)) - chain_.median_time_past();
-            if (age <= static_cast<int64_t>(recent)) {
-                tip_latched_.store(true);
-                if (tip_state_.exchange(1) != 1)
-                    LOG_INFO << "[DGB-STRATUM] header chain at its tip (median time " << age
-                             << " s old): serving work from it";
-            } else {
-                embedded_behind = true;
-            }
-        }
+        // Work from the embedded chain only once it is at its tip
+        // (embedded_chain_serves); behind: digibyted's template when the GBT
+        // fallback is bound, else no work.
+        embedded_behind = !embedded_chain_serves();
         if (!embedded_behind) {
             // Embedded chain carries a real tip -> source previousblockhash from it.
             in.previousblockhash = u256_be_display_hex(*th);

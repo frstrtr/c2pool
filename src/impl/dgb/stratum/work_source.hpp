@@ -337,6 +337,12 @@ public:
     /// prevhash.
     void set_tip_recent_sec(uint32_t sec) { tip_recent_sec_.store(sec); }
 
+    /// True when work comes from the embedded header chain: it has a tip and
+    /// has reached it (set_tip_recent_sec, latched); false: digibyted's GBT
+    /// template, or none. The one source choice of the template, the prevhash
+    /// getter and the work gate.
+    bool embedded_chain_serves() const;
+
     /// The stratum work gate (stratum_work_gate.hpp): a non-empty reason holds
     /// all work (no template, so no job) and refuses mining.authorize with it;
     /// empty serves work. Logged once per change.
