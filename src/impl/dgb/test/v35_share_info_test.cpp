@@ -77,7 +77,7 @@ struct V35Chain {
         s.m_timestamp = tip_ts + 15;
         s.m_absheight = tip_absheight + 1;
         auto [h, last] = tracker.chain.get_height_and_last(tip);
-        if (!(last.IsNull() && h < 99))
+        if (h >= 99)   // (a shorter chain: null when rooted; undecided when not)
             s.m_far_share_hash = tracker.chain.get_nth_parent_key(tip, 99);
         const auto st = tracker.compute_share_target(tip, s.m_timestamp, dgb::PoolConfig::max_target(), 35);
         s.m_max_bits = st.max_bits;

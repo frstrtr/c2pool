@@ -1980,8 +1980,8 @@ int run_node(const core::CoinParams& params, bool testnet,
         // after its bounded retries while the tracker stays busy; each tick
         // also re-reads the best share (non-blocking), and a change bumps the
         // work generation, which this tick then pushes.
-        stop_job_push = dgb::start_job_push_watch(
-            ioc, work_source.get(), [srv](bool clean) { srv->notify_all(clean); }, dgb::kJobPushTick,
+        stop_job_push = dgb::start_job_push_watch(ioc, work_source.get(),
+            [srv](bool clean) { srv->notify_all(clean); }, dgb::kJobPushTick,
             [&p2p_node, cell = stratum_best_share, ws = work_source.get()]() {
                 const uint256 before = cell->get();
                 if (dgb::refresh_best_share_cell(p2p_node, *cell) && cell->get() != before)

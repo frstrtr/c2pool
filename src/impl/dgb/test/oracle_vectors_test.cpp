@@ -4,7 +4,8 @@
 // dgb_work_source_test). Review 713dc77a0, C2POOL's gate before any canary.
 //
 // Mints a genesis-rooted chain of V35 shares the way a c2pool-dgb node does:
-// the first share by create_local_share_v35, every later one through the real
+// the first two shares by create_local_share_v35 (the job producer builds on a
+// non-empty PPLNS window only), every later one through the real
 // producer (build_conn_job_inputs on the job template), a DGBWorkSource job, a
 // miner's header, mining_submit and the frozen-field mint. The chain has more
 // than TARGET_LOOKBEHIND shares, gaps over 300 s (R4), equal-amount ties
@@ -165,6 +166,30 @@ struct OracleRig {
         order.push_back(g);
     }
 
+    // A share made directly by create_local_share_v35 on the tip (no stratum
+    // job): the second share of a new chain, which the job producer does not
+    // build (its PPLNS walk starts at the grandparent: empty there).
+    void direct(int i)
+    {
+        const uint32_t ts = tip_ts() + gap_before(i);
+        dgb::coin::SmallBlockHeaderType h;
+        h.m_version = 0x20000202;
+        h.m_previous_block.SetHex(std::string(56, '0') + "0badf00d");
+        h.m_timestamp = ts;
+        h.m_bits = 0x1b0404cb;
+        h.m_nonce = static_cast<uint32_t>(7 + i);
+        BaseScript cb;
+        cb.m_data = dgb::coin::build_coinbase_scriptsig(kHeight);
+        const auto commit = dgb::p2pool_witness_commitment_script(uint256());
+        const uint256 s = dgb::create_local_share_v35(tracker, params, h, cb, dgb::CoinParams::subsidy(kHeight),
+                                                      order.back(), {}, payout_of(i), 66, dgb::StaleInfo::none,
+                                                      /*segwit_active=*/true, hex(commit), {}, uint256(), 0, 0, 0,
+                                                      uint128(), uint256(), 0, false, {}, uint256(),
+                                                      /*desired_version=*/35);
+        ASSERT_FALSE(s.IsNull());
+        order.push_back(s);
+    }
+
     // One share by the stratum path; returns false if it was not minted.
     bool mine(int i)
     {
@@ -227,7 +252,8 @@ TEST(DgbOracleVectors, MintedChainPassesOwnChecksAndIsDumped)
     OracleRig rig;
     const uint32_t t0 = static_cast<uint32_t>(std::time(nullptr)) - 4u * 3600u;
     rig.genesis(t0);
-    for (int i = 1; i < kShares; ++i)
+    rig.direct(1);
+    for (int i = 2; i < kShares; ++i)
         ASSERT_TRUE(rig.mine(i)) << "share " << i << " was not minted";
     ASSERT_EQ(rig.order.size(), static_cast<size_t>(kShares));
 
