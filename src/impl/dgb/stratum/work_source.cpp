@@ -39,6 +39,7 @@
 #include <core/target_utils.hpp>            // chain::target_to_difficulty (vardiff/pool unit parity)
 #include <core/address_utils.hpp>              // address_to_script (share payout from username)
 
+#include <btclibs/base58.h>                      // DecodeBase58Check
 #include <btclibs/util/strencodings.h>          // ParseHex, HexStr
 #include <btclibs/span.h>                       // Span (HexStr arg)
 
@@ -521,8 +522,12 @@ std::string DGBWorkSource::authorize_refusal(const std::string& username) const
     // An UPPERCASE bech32 login: the python network keys V35 weights by the
     // address string as typed, so the same key typed in both cases would be
     // two outputs there and one here. The lowercase form is the same address.
+    // (A base58 P2PKH may itself start "DGB1": only a string that is not a
+    // valid base58check is read as an uppercase bech32 one.)
+    std::vector<unsigned char> b58;
+    const bool is_base58 = DecodeBase58Check(username, b58, 21);
     for (const char* hrp : {"DGB1", "DGBT1", "DGBRT1"})
-        if (username.rfind(hrp, 0) == 0) {
+        if (!is_base58 && username.rfind(hrp, 0) == 0) {
             std::string lower = username;
             for (auto& c : lower)
                 c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));

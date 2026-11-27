@@ -509,6 +509,8 @@ TEST(DgbStratumJobs, EmptyAndUncarriableLoginsAreRefusedAtAuthorize)
             ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
         EXPECT_NE(probe.ws->authorize_refusal(upper).find(lower), std::string::npos) << upper;
         EXPECT_TRUE(probe.ws->authorize_refusal(lower).empty()) << lower;
+        // A base58 P2PKH that happens to start "DGB1" is not an uppercase bech32.
+        EXPECT_TRUE(probe.ws->authorize_refusal("DGB118XCdypq2oDWpwiTpLjMAsWXz2PKNd").empty());
     }
     EXPECT_FALSE(probe.ws->authorize_refusal(p2wsh).empty()) << p2wsh;
     if (!p2tr.empty())
