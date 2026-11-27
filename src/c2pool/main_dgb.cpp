@@ -69,6 +69,7 @@
 #include <impl/dgb/coin/work_ref_hash.hpp>      // make_work_ref_hash_params (ref preimage SSOT)
 #include <impl/dgb/coin/coinbase_scriptsig.hpp>   // build_coinbase_scriptsig (BIP34 height + /c2pool-dgb/ tag, #902)
 #include <impl/dgb/run_loop_mint.hpp>              // parse_min_header_80 + mint_local_share_at_frozen_version (#884/#294)
+#include <impl/dgb/mint_retry.hpp>                // mint_with_retry (#11: no share dropped on a busy tracker)
 #include <impl/dgb/auto_ratchet_wire.hpp>          // dgb_select_mint_versions + DGB_BASE/TARGET_VERSION (#884)
 #include <impl/dgb/conn_pplns_producer.hpp>        // make_conn_pplns_inputs (ref-hash bind SSOT)
 #include <impl/dgb/conn_job_producer.hpp>          // build_conn_job_inputs (the job producer SSOT)
@@ -1811,7 +1812,7 @@ int run_node(const core::CoinParams& params, bool testnet,
     // (the producer emits a non-segwit coinbase).
     {
         work_source->set_mint_share_fn(
-            [&p2p_node, &params, donation_u16](
+            [&p2p_node, &params, donation_u16, &ioc](
                 const dgb::stratum::DGBWorkSource::MintShareInputs& in) -> uint256
             {
                 // in.coinbase_bytes is the coinbase scriptSig (BIP34 height +
@@ -1824,40 +1825,51 @@ int run_node(const core::CoinParams& params, bool testnet,
                     return uint256();
                 }
 
-                // Exclusive tracker lock, non-blocking: defer to the next
-                // submission if the compute thread is mid-think() rather than
-                // block the Stratum IO thread. Released BEFORE broadcast_share /
-                // notify_local_share, which take their own locks / post to io.
-                std::unique_lock<std::shared_mutex> lk(
-                    p2p_node.tracker_mutex(), std::try_to_lock);
-                if (!lk.owns_lock()) {
-                    LOG_INFO << "[DGB-MINT] tracker busy -- share deferred "
-                                "(retry on next submission)";
-                    return uint256();
-                }
-
-                uint256 share_hash;
-                try {
-                    share_hash = dgb::mint_local_share_at_frozen_version(
-                        in, *min_header, p2p_node.tracker(), params,
-                        /*donation=*/donation_u16);
-                } catch (const std::exception& e) {
-                    LOG_WARNING << "[DGB-MINT] create_local_share threw: " << e.what();
-                    return uint256();
-                }
-
-                lk.unlock();
-
-                if (!share_hash.IsNull()) {
-                    p2p_node.broadcast_share(share_hash);
-                    p2p_node.notify_local_share(share_hash);
-                    LOG_INFO << "[DGB-MINT] share "
-                             << share_hash.GetHex().substr(0, 16)
-                             << " v" << in.share_version
-                             << " minted onto the sharechain + broadcast (prev="
-                             << in.prev_share.GetHex().substr(0, 16) << ")";
-                }
-                return share_hash;
+                // Exclusive tracker lock, non-blocking: the Stratum IO thread
+                // is never blocked. While the tracker is busy (the compute
+                // thread mid-think, a payout provider's read guard) the mint is
+                // retried on the IO context, bounded (dgb::mint_with_retry):
+                // before, the share was dropped. The share carries the job's
+                // frozen fields, so a later mint makes the same share. The lock
+                // is released BEFORE broadcast_share / notify_local_share,
+                // which take their own locks / post to io.
+                auto attempt = [&p2p_node, &params, donation_u16, in,
+                                hdr = *min_header]() -> std::optional<uint256> {
+                    std::unique_lock<std::shared_mutex> lk(p2p_node.tracker_mutex(), std::try_to_lock);
+                    if (!lk.owns_lock())
+                        return std::nullopt;
+                    uint256 share_hash;
+                    try {
+                        share_hash = dgb::mint_local_share_at_frozen_version(
+                            in, hdr, p2p_node.tracker(), params, /*donation=*/donation_u16);
+                    } catch (const std::exception& e) {
+                        LOG_WARNING << "[DGB-MINT] create_local_share threw: " << e.what();
+                        return uint256();
+                    }
+                    lk.unlock();
+                    if (!share_hash.IsNull()) {
+                        p2p_node.broadcast_share(share_hash);
+                        p2p_node.notify_local_share(share_hash);
+                        LOG_INFO << "[DGB-MINT] share "
+                                 << share_hash.GetHex().substr(0, 16)
+                                 << " v" << in.share_version
+                                 << " minted onto the sharechain + broadcast (prev="
+                                 << in.prev_share.GetHex().substr(0, 16) << ")";
+                    }
+                    return share_hash;
+                };
+                bool queued = false;
+                const uint256 now_hash = dgb::mint_with_retry(
+                    ioc, attempt,
+                    [](const uint256& h, int tries) {
+                        if (!h.IsNull())
+                            LOG_INFO << "[DGB-MINT] share minted after " << tries
+                                     << " tries (the tracker was busy)";
+                    },
+                    &queued);
+                if (queued)
+                    LOG_INFO << "[DGB-MINT] tracker busy -- the mint is retried on the IO context";
+                return now_hash;
             });
         std::cout << "[DGB] sharechain mint seam BOUND (set_mint_share_fn -> "
                      "create_local_share at the job's AutoRatchet version -> broadcast_share + "
