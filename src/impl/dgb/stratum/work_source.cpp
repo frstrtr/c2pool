@@ -631,6 +631,17 @@ nlohmann::json DGBWorkSource::mining_submit(
         return reject(21, "Job not found");
     }
 
+    // Every coinbase this work source builds carries the producer's frozen ref
+    // (build_connection_coinbase sets frozen_ref.ref_hash). A job without one
+    // was not built here (e.g. the stratum server's own fallback coinbase): no
+    // share and no block mined on it can be credited, so it is refused before
+    // anything is reconstructed, classified or dispatched.
+    if (job->frozen_ref.ref_hash.IsNull()) {
+        LOG_WARNING << "[DGB-STRATUM] submit reject (job carries no frozen ref): user=" << username
+                    << " job=" << job_id;
+        return reject(21, "Job not found");
+    }
+
     // 1. coinbase = coinb1 || extranonce1 || extranonce2 || coinb2
     auto coinb1_bytes = ParseHex(job->coinb1);
     auto en1_bytes    = ParseHex(extranonce1);

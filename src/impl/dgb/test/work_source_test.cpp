@@ -259,6 +259,8 @@ core::stratum::JobSnapshot make_job(uint32_t share_bits, const std::string& bloc
     j.block_nbits   = block_nbits;
     j.subsidy       = 500000000ULL;
     j.segwit_active = false;
+    // A job this work source built carries the producer's frozen ref.
+    j.frozen_ref.ref_hash = uint256(std::vector<unsigned char>(32, 0x5a));
     return j;
 }
 const char* kEN1 = "00000000";
@@ -280,6 +282,31 @@ TEST(DgbWorkSource, MiningSubmitWonBlockDispatchesBroadcaster)
     ASSERT_TRUE(result.is_boolean());
     EXPECT_TRUE(result.get<bool>());     // won block -> accepted reply
     EXPECT_TRUE(fx.submit_called);       // broadcaster reached
+}
+
+// A job without the producer's frozen ref (a coinbase this work source did not
+// build, e.g. the stratum server's fallback) is refused before classification:
+// even a digest that clears every target reaches neither the block broadcaster
+// nor the mint.
+TEST(DgbWorkSource, MiningSubmitRefusesAJobWithoutFrozenRef)
+{
+    Fixture fx;
+    auto ws = fx.make();
+    bool minted = false;
+    ws->set_mint_share_fn([&](const dgb::stratum::DGBWorkSource::MintShareInputs&) -> uint256 {
+        minted = true;
+        return uint256(std::vector<unsigned char>(32, 0x01));
+    });
+    auto job = make_job(/*share_bits=*/0x2100ffffu, /*block_nbits=*/"2100ffff");
+    job.frozen_ref.ref_hash.SetNull();
+    auto result = ws->mining_submit("DGBaddr.worker1", "job-noref", kEN1, kEN2, kNT, kNON, "rid",
+                                    /*merged_addresses=*/{}, &job);
+    ASSERT_TRUE(result.is_array()) << result.dump();
+    ASSERT_GE(result.size(), 2u);
+    EXPECT_FALSE(result[0].get<bool>());
+    EXPECT_EQ(result[1][0].get<int>(), 21);
+    EXPECT_FALSE(fx.submit_called) << "no block may be dispatched from a job not built here";
+    EXPECT_FALSE(minted) << "no share may be minted from a job not built here";
 }
 
 TEST(DgbWorkSource, MiningSubmitShareAcceptDispatchesMint)
